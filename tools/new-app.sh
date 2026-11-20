@@ -23,6 +23,9 @@ test-*) fail "$name: test- names are the runtime's test apps" ;;
 template | lumen-app | testkit) fail "$name: that name is taken (apps/$name)" ;;
 esac
 [ ! -e "$apps/$name" ] || fail "apps/$name already exists"
+# A test app's module is named without its `test-` (apps/test-hello is
+# `hello`), and kernel/build.rs refuses a name in both sets.
+[ ! -e "$apps/test-$name" ] || fail "$name: a test app's name (apps/test-$name)"
 
 cp -R "$apps/template" "$apps/$name"
 # The package's name is the crate's (and the module's) name.

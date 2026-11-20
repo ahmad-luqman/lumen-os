@@ -3641,7 +3641,9 @@ SSE); #197 checks the results' bits.
   and renames the crate; it refuses a name `kernel/build.rs` wouldn't
   embed (lower case letters, digits, `-` and `_`, starting with a
   letter), a `test-` name, a taken one (`template`, `lumen-app`,
-  `testkit`) and an existing directory, making nothing
+  `testkit`, or a test app's module name: `hello` for `apps/test-hello`,
+  which `kernel/build.rs` would refuse in both sets) and an existing
+  directory, making nothing
   (`harness:test_make_app::*`). Nothing needs registering: the member
   glob takes the crate, `make apps` bundles its module, and the launcher
   lists it.

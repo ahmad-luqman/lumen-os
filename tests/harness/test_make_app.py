@@ -3,8 +3,9 @@ bundling"), in a temporary copy of the repository: it makes apps/foo from
 apps/template with the crate renamed, and that copy builds into a module
 the kernel would take (validated by wasmtime, `lumen` imports only,
 `memory` fixed at the template's size, `lumen_main`, the template's
-manifest). Names the kernel wouldn't embed, taken names and an existing
-directory are refused, making nothing."""
+manifest). Names the kernel wouldn't embed, taken names (a test app's
+module name among them) and an existing directory are refused, making
+nothing."""
 
 import os
 import shutil
@@ -67,9 +68,10 @@ def test_a_new_app_is_the_template_renamed_and_builds(repo):
         assert (repo / "apps" / "foo" / f).read_bytes() == (
             REPO_ROOT / "apps" / "template" / f
         ).read_bytes()
-    # Built like `make apps` builds it, sharing the real build's cache for
-    # the registry crates (the copy's own crates build afresh).
-    env = dict(os.environ, CARGO_TARGET_DIR=str(REPO_ROOT / "target-apps"))
+    # Built like `make apps` builds it, into the copy's own target
+    # directory (nothing left in the real one).
+    target = repo / "target-apps"
+    env = dict(os.environ, CARGO_TARGET_DIR=str(target))
     built = subprocess.run(
         ["cargo", "build", "--release", "-p", "foo"],
         cwd=repo / "apps",
@@ -79,9 +81,7 @@ def test_a_new_app_is_the_template_renamed_and_builds(repo):
         check=False,
     )
     assert built.returncode == 0, built.stderr
-    data = (
-        REPO_ROOT / "target-apps" / "wasm32-unknown-unknown" / "release" / "foo.wasm"
-    ).read_bytes()
+    data = (target / "wasm32-unknown-unknown" / "release" / "foo.wasm").read_bytes()
     module = compile_module(data, engine())
     assert {i.module for i in module.imports} == {"lumen"}
     exports = {e.name: e.type for e in module.exports}
@@ -104,6 +104,10 @@ def test_a_new_app_is_the_template_renamed_and_builds(repo):
         (("NAME=template",), "template: that name is taken"),
         (("NAME=testkit",), "testkit: that name is taken"),
         (("NAME=lumen-app",), "lumen-app: that name is taken"),
+        # A test app's module name (apps/test-hello is `hello`): the kernel
+        # refuses a name in both sets.
+        (("NAME=hello",), "hello: a test app's name (apps/test-hello)"),
+        (("NAME=window",), "window: a test app's name (apps/test-window)"),
     ],
 )
 def test_a_name_the_kernel_would_refuse_or_a_taken_one_makes_nothing(repo, args, said):
