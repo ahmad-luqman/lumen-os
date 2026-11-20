@@ -3892,7 +3892,7 @@ kernel (no SSE); #197 checks the results' bits.
   app. Manifest `time, desktop`: it runs on `run_until`, its one tick
   (`period()` set only while an image waits) the decode, so the request
   choosing an image is answered at once with `decoding <name>` (one
-  arriving during a decode waits for it, about 20 slices for the
+  arriving during a decode waits for it, about 350 slices for the
   wallpaper); the wait before that tick animates, so the desktop settles
   only once the image is shown.
   - **What it decodes:** `lumen_view::prepare`, its one call for an image:

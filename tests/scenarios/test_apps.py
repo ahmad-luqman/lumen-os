@@ -1165,8 +1165,8 @@ VIEWER_IMAGES = REPO_ROOT / "apps" / "viewer" / "images"
 # lumen-view's VIEW (client coordinates: x, y, w, h) and PAN_STEP.
 VIEW = (200, 0, 440, 480)
 PAN_STEP = 40
-# Decoding the wallpaper takes about 20 fuel slices: a bound before
-# failing, not a timing claim.
+# Decoding the wallpaper takes about 350 fuel slices (356 measured;
+# tiles.png 13): a bound before failing, not a timing claim.
 DECODE_TIMEOUT = 120
 # The viewer's images, in its list's order (apps/viewer's IMAGES).
 VIEWER_ITEMS = ["lumen.png", "tiles.png", "grey16.png", "broken.png", "costly.png"]
