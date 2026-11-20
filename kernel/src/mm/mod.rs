@@ -7,6 +7,7 @@ pub mod frame;
 pub mod heap;
 pub mod paging;
 pub mod stack;
+pub mod user_vm;
 mod window;
 
 use core::sync::atomic::{AtomicU64, Ordering};

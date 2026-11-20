@@ -19,3 +19,14 @@ tests = [
     "scenario:test_linux_user::test_non_canonical_sysret_does_not_crash_kernel",
     "audit:flags",
 ]
+
+[[feature]]
+name = "Per-thread user context switching (CR3, TSS.rsp0, PerCpu, IA32_FS_BASE TLS, and FXSAVE/XSAVE FPU state) preserving xmm0-xmm7 and %fs across concurrent same-CPU timer preemption (#237)"
+milestone = "M6"
+tests = [
+    "ktest:lumen_kernel::mm::user_vm::lazy_zero_fill_and_unmap",
+    "scenario:test_linux_user::test_bad_elf_rejected",
+    "scenario:test_linux_user::test_mmap_and_brk",
+    "scenario:test_linux_user::test_sse_and_tls_preserved_across_preemption",
+    "audit:flags",
+]

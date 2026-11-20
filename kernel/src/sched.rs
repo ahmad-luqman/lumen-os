@@ -77,7 +77,9 @@ use log::{info, warn};
 use lumen_mm::stacks::{StackKind, StackRange};
 
 use crate::arch::{self, MAX_CPUS};
+use crate::mm::paging;
 use crate::mm::stack::{KernelStack, STACK_SIZE, StackError};
+use crate::mm::user_vm::AddressSpace;
 use crate::sync::SpinLock;
 use crate::trace;
 use crate::{smp, time};
@@ -185,6 +187,83 @@ impl SavedRsp {
     }
 }
 
+/// Per-user-thread hardware and VM state carried across context switches.
+///
+/// Accessed only on the thread's home CPU with interrupts off (during
+/// `schedule`, `attach`/`detach`, or `arch_prctl`), or exclusively in `Drop`.
+struct UserThreadState {
+    address_space: Arc<AddressSpace>,
+    fpu: UnsafeCell<arch::fpu::UserFpuState>,
+    fs_base: AtomicU64,
+    kernel_rsp: AtomicU64,
+    user_exit_rsp: AtomicU64,
+    pending_debug_trap: AtomicBool,
+}
+
+impl UserThreadState {
+    fn new(address_space: Arc<AddressSpace>) -> Self {
+        Self {
+            address_space,
+            fpu: UnsafeCell::new(arch::fpu::UserFpuState::new()),
+            fs_base: AtomicU64::new(0),
+            kernel_rsp: AtomicU64::new(0),
+            user_exit_rsp: AtomicU64::new(0),
+            pending_debug_trap: AtomicBool::new(false),
+        }
+    }
+
+    /// Save the live CPU FPU/SSE/AVX registers into this thread's buffer.
+    ///
+    /// # Safety
+    /// Called on this thread's home CPU with interrupts disabled.
+    unsafe fn save_fpu(&self) {
+        // SAFETY: exclusive access on the home CPU with interrupts off.
+        unsafe { (*self.fpu.get()).save() };
+    }
+
+    /// Restore the CPU's FPU/SSE/AVX registers from this thread's buffer.
+    ///
+    /// # Safety
+    /// Called on this thread's home CPU with interrupts disabled.
+    unsafe fn restore_fpu(&self) {
+        // SAFETY: exclusive access on the home CPU with interrupts off.
+        unsafe { (*self.fpu.get()).restore() };
+    }
+}
+
+/// Thread-local slot for optional [`UserThreadState`].
+struct UserSlot(UnsafeCell<Option<UserThreadState>>);
+
+// SAFETY: a thread never migrates between CPUs (M6–M7 single-CPU invariant).
+// After the spawner publishes the thread via the run-queue lock, only the
+// thread's home CPU touches `UserSlot`, and only with interrupts disabled (or
+// in `Drop` when no other reference exists).
+unsafe impl Sync for UserSlot {}
+
+impl UserSlot {
+    fn new(state: Option<UserThreadState>) -> Self {
+        Self(UnsafeCell::new(state))
+    }
+
+    /// Borrow the inner `Option<UserThreadState>`.
+    ///
+    /// # Safety
+    /// Called on the thread's home CPU with interrupts disabled.
+    unsafe fn as_ref(&self) -> Option<&UserThreadState> {
+        // SAFETY: upheld by the caller.
+        unsafe { (*self.0.get()).as_ref() }
+    }
+
+    /// Raw mutable pointer to the inner `Option<UserThreadState>`.
+    ///
+    /// # Safety
+    /// Called on the thread's home CPU with interrupts disabled, with no
+    /// overlapping reference into this slot.
+    unsafe fn slot(&self) -> *mut Option<UserThreadState> {
+        self.0.get()
+    }
+}
+
 /// A kernel thread. Threads never move between CPUs: if that ever changes,
 /// `SavedRsp`'s `Sync` argument, a woken thread sitting on its queue while
 /// it still runs (see [`WaitQueue::wait_until`]), the callers that keep
@@ -197,6 +276,8 @@ pub struct Thread {
     cpu: usize,
     state: AtomicU8,
     rsp: SavedRsp,
+    /// Optional per-process user VM, FPU, TLS, and ring-3 stack state.
+    user: UserSlot,
     /// Its stack: `None` for a thread adopted from code that was already
     /// running on a stack it doesn't own (`main`, an AP's idle thread), and
     /// once freed after the thread died.
@@ -218,19 +299,25 @@ pub struct Thread {
 impl Thread {
     /// A ready thread on CPU `cpu` with a fresh stack of `stack_size` bytes,
     /// that starts by running `entry`.
-    fn spawned(name: &'static str, cpu: usize, stack_size: u64, entry: Entry) -> Result<Arc<Thread>, SpawnError> {
+    fn spawned(
+        name: &'static str,
+        cpu: usize,
+        stack_size: u64,
+        entry: Entry,
+        user: Option<UserThreadState>,
+    ) -> Result<Arc<Thread>, SpawnError> {
         let stack = KernelStack::new(stack_size, StackKind::Thread).map_err(SpawnError::Stack)?;
         // SAFETY: a fresh, mapped stack (page-aligned top) nothing runs on;
         // the thread owns it, and it is freed only after the thread has died
         // and its CPU has switched away from it.
         let rsp = unsafe { arch::context::prepare(stack.range().top, thread_entry) };
-        Ok(register(Arc::new(Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry)))))
+        Ok(register(Arc::new(Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry), user))))
     }
 
     /// A thread for the code running now on this CPU, on a stack it doesn't
     /// own.
     fn adopted(name: &'static str) -> Arc<Thread> {
-        register(Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None)))
+        register(Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None, None)))
     }
 
     fn new(
@@ -240,6 +327,7 @@ impl Thread {
         rsp: u64,
         stack: Option<KernelStack>,
         entry: Option<Entry>,
+        user: Option<UserThreadState>,
     ) -> Thread {
         Thread {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -247,6 +335,7 @@ impl Thread {
             cpu,
             state: AtomicU8::new(state as u8),
             rsp: SavedRsp(UnsafeCell::new(rsp)),
+            user: UserSlot::new(user),
             stack: SpinLock::new(stack),
             entry: SpinLock::new(entry),
             reaped: AtomicBool::new(false),
@@ -509,6 +598,8 @@ static HELD_NS: AtomicU64 = AtomicU64::new(0);
 /// than ticks.
 static TICKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Total context switches performed on each CPU (monotonic).
+static SWITCHES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// Ktests: the `now_ns` each CPU's last tick read, and the tick before
 /// that. [`tick`] stores them once that CPU's scheduler runs, so
@@ -717,6 +808,134 @@ pub fn running_here() -> Option<(u64, &'static str)> {
     (!t.is_null()).then(|| unsafe { ((*t).id, (*t).name) })
 }
 
+/// Total context switches performed on CPU `cpu` so far (0 for out-of-range CPU).
+pub fn switch_count(cpu: usize) -> u64 {
+    SWITCHES.get(cpu).map_or(0, |c| c.load(Ordering::Acquire))
+}
+
+/// The current thread's [`AddressSpace`], if it is a user thread (lock-free,
+/// safe from `#PF` and syscall handlers).
+pub fn current_address_space() -> Option<Arc<AddressSpace>> {
+    let _irq = arch::irq::push_off();
+    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
+    if t.is_null() {
+        return None;
+    }
+    // SAFETY: `t` is the running thread on this CPU and interrupts are off so
+    // `schedule()` cannot run or mutate `user`.
+    unsafe { (*t).user.as_ref().map(|u| u.address_space.clone()) }
+}
+
+/// The current user thread's `IA32_FS_BASE` (`0` for non-user threads).
+pub fn current_fs_base() -> u64 {
+    let _irq = arch::irq::push_off();
+    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
+    if t.is_null() {
+        return 0;
+    }
+    // SAFETY: `t` is the running thread on this CPU with interrupts off.
+    unsafe { (*t).user.as_ref().map_or(0, |u| u.fs_base.load(Ordering::Relaxed)) }
+}
+
+/// Update the current user thread's `fs_base` and load it into `IA32_FS_BASE`
+/// atomically (with interrupts off so a context switch cannot interleave).
+///
+/// Panics if `addr >= USER_MAX` or if the current thread has no `UserThreadState`.
+pub fn set_current_fs_base(addr: u64) {
+    let _irq = arch::irq::push_off();
+    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
+    assert!(!t.is_null(), "set_current_fs_base before sched::init");
+    // SAFETY: `t` is the running thread on this CPU with interrupts off.
+    let user = unsafe { (*t).user.as_ref() }.expect("set_current_fs_base on a kernel thread");
+    // SAFETY: interrupts are off on this thread's home CPU and `write_fs_base`
+    // asserts `addr < USER_MAX`.
+    unsafe { arch::fpu::write_fs_base(addr) };
+    user.fs_base.store(addr, Ordering::Relaxed);
+}
+
+/// Detach the current thread's [`UserThreadState`], switching `CR3` back to
+/// `kernel_root()` and clearing `TSS.rsp0`, `PerCpu`, and `IA32_FS_BASE`.
+///
+/// Returns the detached [`AddressSpace`] (if any) with interrupts restored so
+/// the caller can safely call [`AddressSpace::teardown`] with interrupts ON.
+pub fn detach_user_space() -> Option<Arc<AddressSpace>> {
+    let detached = {
+        let _irq = arch::irq::push_off();
+        let cpu = arch::cpu_index();
+        let t = CURRENT[cpu].load(Ordering::Acquire);
+        if t.is_null() {
+            return None;
+        }
+        // SAFETY: `t` is the running thread on `cpu` with interrupts off.
+        let prev = unsafe { (*(*t).user.slot()).take() };
+        if prev.is_some() {
+            let kroot = paging::kernel_root();
+            if arch::paging::active_root() != kroot {
+                // SAFETY: restoring the kernel's own page-table root.
+                unsafe { arch::paging::write_cr3(kroot.as_u64()) };
+            }
+            // SAFETY: interrupts are off on `cpu` and no user context is active.
+            unsafe {
+                arch::gdt::set_rsp0(cpu, 0);
+                arch::fpu::write_fs_base(0);
+            }
+            arch::percpu::set_kernel_rsp(0);
+            arch::percpu::set_user_exit_rsp(0);
+            arch::percpu::set_pending_debug_trap(false);
+        }
+        prev
+    };
+    // `UserFpuState` drops here with interrupts restored (heap dealloc safe).
+    detached.map(|u| u.address_space)
+}
+
+/// RAII guard attaching an [`AddressSpace`] to the current kernel thread (e.g.
+/// for in-kernel demand-paging and `.lumen_fixup` ktests) with full preemption
+/// safety. Detaches and restores `kernel_root()` on drop.
+#[cfg(feature = "ktest")]
+pub struct UserSpaceGuard {
+    _not_send: core::marker::PhantomData<*const ()>,
+}
+
+#[cfg(feature = "ktest")]
+impl UserSpaceGuard {
+    /// Attach `space` to the current thread and activate its `CR3`.
+    pub fn enter(space: Arc<AddressSpace>) -> Self {
+        // Allocate `UserFpuState` before disabling interrupts.
+        let state = UserThreadState::new(space);
+        {
+            let _irq = arch::irq::push_off();
+            let cpu = arch::cpu_index();
+            let t = CURRENT[cpu].load(Ordering::Acquire);
+            assert!(!t.is_null(), "UserSpaceGuard::enter before sched::init");
+            // SAFETY: `t` is the running thread on `cpu` with interrupts off.
+            let slot = unsafe { &mut *(*t).user.slot() };
+            assert!(slot.is_none(), "nested UserSpaceGuard on cpu {cpu}");
+            let root = state.address_space.root();
+            *slot = Some(state);
+            let installed = slot.as_ref().expect("just stored");
+            // SAFETY: `root` shares kernel `L4[256..512]` verbatim, interrupts are off.
+            unsafe {
+                arch::paging::write_cr3(root.as_u64());
+                arch::gdt::set_rsp0(cpu, 0);
+                arch::fpu::write_fs_base(0);
+                installed.restore_fpu();
+            }
+            arch::percpu::set_kernel_rsp(0);
+            arch::percpu::set_user_exit_rsp(0);
+            arch::percpu::set_pending_debug_trap(false);
+        }
+        Self { _not_send: core::marker::PhantomData }
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for UserSpaceGuard {
+    fn drop(&mut self) {
+        let _ = detach_user_space();
+    }
+}
+
 /// The running thread's id on this CPU and whether it is the CPU's idle
 /// thread, lock-free (for the profiler's timer-tick samples, `perf`): `None`
 /// before this CPU's threads are set up. Called with interrupts off, so the
@@ -917,11 +1136,37 @@ pub fn spawn_on(cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'stati
     spawn_with(cpu, name, STACK_SIZE, Box::new(f))
 }
 
+/// Start a pinned user thread on CPU `cpu` with its own [`AddressSpace`],
+/// clean [`arch::fpu::UserFpuState`], and `fs_base = 0`.
+///
+/// M6–M7 user threads are single-threaded and pinned to their home CPU `cpu`.
+/// When `f` returns, `thread_entry` detaches the address space (switching `CR3`
+/// back to `kernel_root()`) and calls `teardown()` with interrupts enabled if
+/// this thread holds the last reference.
+pub fn spawn_user_on(
+    cpu: usize,
+    name: &'static str,
+    address_space: Arc<AddressSpace>,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle, SpawnError> {
+    spawn_with_user(cpu, name, STACK_SIZE, Box::new(f), Some(UserThreadState::new(address_space)))
+}
+
 fn spawn_with(cpu: usize, name: &'static str, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
+    spawn_with_user(cpu, name, stack_size, f, None)
+}
+
+fn spawn_with_user(
+    cpu: usize,
+    name: &'static str,
+    stack_size: u64,
+    f: Entry,
+    user: Option<UserThreadState>,
+) -> Result<JoinHandle, SpawnError> {
     if !running_on(cpu) {
         return Err(SpawnError::NotRunning);
     }
-    let thread = Thread::spawned(name, cpu, stack_size, f)?;
+    let thread = Thread::spawned(name, cpu, stack_size, f, user)?;
     {
         let mut q = CPUS[cpu].lock();
         q.home();
@@ -954,6 +1199,14 @@ extern "C" fn thread_entry() -> ! {
     // returns, so it would never be dropped).
     let entry = current().expect("a thread runs on a CPU with a scheduler").entry.lock().take();
     entry.expect("a thread starts once")();
+    // If this was a user thread and its entry didn't already detach, switch
+    // CR3 back to `kernel_root()` and tear down user mappings with interrupts
+    // ON (so `AddressSpace::drop` in `finish_switch` only frees the bare L4).
+    if let Some(space) = detach_user_space()
+        && Arc::strong_count(&space) == 1
+    {
+        space.teardown();
+    }
     exit()
 }
 
@@ -1045,6 +1298,66 @@ pub fn exit() -> ! {
     unreachable!("a dead thread was switched back to")
 }
 
+/// Save `prev`'s user CPU state, switch `CR3` (`next`'s `AddressSpace` or
+/// `kernel_root()`), and restore `next`'s user CPU state (or clear it for a
+/// kernel/idle thread). Runs **before** `arch::context::switch` with
+/// interrupts off so freshly spawned user threads entering `thread_entry`
+/// already have their `CR3`, FPU, TLS, and `TSS.rsp0`/`PerCpu` installed.
+///
+/// # Safety
+/// Must be called on `cpu` with interrupts disabled, no locks held, `prev` and
+/// `next` homed on `cpu`, `prev != next`, and both pointers alive until
+/// `finish_switch` runs.
+unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thread) {
+    // SAFETY: upheld by caller; interrupts are off on `cpu` and both threads
+    // are kept alive by `CPUS[cpu].switched_from` and `CPUS[cpu].current`.
+    let prev_user = unsafe { (*prev).user.as_ref() };
+    // SAFETY: same as above.
+    let next_user = unsafe { (*next).user.as_ref() };
+
+    // 1. Save outgoing user thread's FPU and PerCpu ring-3 fields.
+    if let Some(pu) = prev_user {
+        // SAFETY: interrupts are off on `prev`'s home CPU.
+        unsafe { pu.save_fpu() };
+        pu.kernel_rsp.store(arch::percpu::kernel_rsp(), Ordering::Relaxed);
+        pu.user_exit_rsp.store(arch::percpu::user_exit_rsp(), Ordering::Relaxed);
+        pu.pending_debug_trap.store(arch::percpu::take_pending_debug_trap(), Ordering::Relaxed);
+    }
+
+    // 2. Switch CR3 to `next`'s AddressSpace root or back to `kernel_root()`.
+    let target_root = next_user.map_or_else(paging::kernel_root, |nu| nu.address_space.root());
+    if arch::paging::active_root() != target_root {
+        // SAFETY: `target_root` is either `kernel_root()` or a user L4 root
+        // copying kernel `L4[256..512]` verbatim.
+        unsafe { arch::paging::write_cr3(target_root.as_u64()) };
+    }
+
+    // 3. Restore incoming user thread's TSS.rsp0, PerCpu, IA32_FS_BASE, and FPU,
+    //    or clear all user CPU state for a kernel/idle thread.
+    if let Some(nu) = next_user {
+        let krsp = nu.kernel_rsp.load(Ordering::Relaxed);
+        // SAFETY: interrupts are off on `cpu`; `krsp` is `next`'s live ring-3
+        // kernel stack top (or 0 before `enter_ring3`), `fs_base < USER_MAX`.
+        unsafe {
+            arch::gdt::set_rsp0(cpu, krsp);
+            arch::fpu::write_fs_base(nu.fs_base.load(Ordering::Relaxed));
+            nu.restore_fpu();
+        }
+        arch::percpu::set_kernel_rsp(krsp);
+        arch::percpu::set_user_exit_rsp(nu.user_exit_rsp.load(Ordering::Relaxed));
+        arch::percpu::set_pending_debug_trap(nu.pending_debug_trap.load(Ordering::Relaxed));
+    } else {
+        // SAFETY: interrupts are off on `cpu`; clearing user state for kernel/idle.
+        unsafe {
+            arch::gdt::set_rsp0(cpu, 0);
+            arch::fpu::write_fs_base(0);
+        }
+        arch::percpu::set_kernel_rsp(0);
+        arch::percpu::set_user_exit_rsp(0);
+        arch::percpu::set_pending_debug_trap(false);
+    }
+}
+
 /// Switch from the running thread to the next ready one on CPU `cpu` (this
 /// one), or its idle thread, or keep running it. The running thread goes
 /// back on the queue only if it is still running and isn't the idle thread
@@ -1054,7 +1367,7 @@ pub fn exit() -> ! {
 /// thread is switched back to.
 fn schedule(cpu: usize) {
     assert!(!arch::irq::enabled() && arch::irq::depth() == 0, "switching threads with interrupts on or a lock held");
-    let (save, load) = {
+    let (save, load, prev_ptr, next_ptr) = {
         let mut q = CPUS[cpu].lock();
         assert!(q.switched_from.is_none(), "the last switch on cpu {cpu} wasn't finished");
         let prev = q.current.take().expect("a running scheduler has a current thread");
@@ -1092,11 +1405,19 @@ fn schedule(cpu: usize) {
         // whose stack it runs on.
         assert!(load != 0, "switching to thread {next:?}, which has no saved context");
         trace::record_switch(Switch { from: prev.id, to: next.id, state: prev.state().into() });
-        CURRENT[cpu].store(Arc::as_ptr(&next).cast_mut(), Ordering::Release);
+        SWITCHES[cpu].fetch_add(1, Ordering::Release);
+        let prev_ptr = Arc::as_ptr(&prev);
+        let next_ptr = Arc::as_ptr(&next);
+        CURRENT[cpu].store(next_ptr.cast_mut(), Ordering::Release);
         q.current = Some(next);
         q.switched_from = Some(prev);
-        (save, load)
+        (save, load, prev_ptr, next_ptr)
     };
+    // Switch user FPU, CR3, TSS.rsp0, PerCpu, and IA32_FS_BASE before switching
+    // kernel stacks (with interrupts off, no SpinLock held).
+    // SAFETY: interrupts are off, `prev_ptr` and `next_ptr` stay alive in
+    // `CPUS[cpu].switched_from` and `CPUS[cpu].current` until `finish_switch`.
+    unsafe { switch_user_context(cpu, prev_ptr, next_ptr) };
     // SAFETY: interrupts are off (asserted above); `save` is the running
     // thread's `rsp` slot, which `switched_from` keeps alive until the next
     // thread has finished the switch; `load` was saved by `switch` (or made
@@ -1403,7 +1724,7 @@ pub fn init() {
     assert_eq!(arch::cpu_index(), 0, "sched::init is for the boot CPU");
     assert!(time::timer_published(), "sched::init before time::init");
     assert!(arch::irq::enabled(), "sched::init with interrupts off: no tick could start a scheduler");
-    let idle = Thread::spawned("idle", 0, STACK_SIZE, Box::new(|| idle_loop(0, || false, || {})))
+    let idle = Thread::spawned("idle", 0, STACK_SIZE, Box::new(|| idle_loop(0, || false, || {})), None)
         .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
     install(0, Thread::adopted("main"), idle);
     CPUS[0].lock().home(); // `main`: it can sleep and block too
