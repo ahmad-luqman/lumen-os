@@ -943,6 +943,9 @@ INVOKE_BUSY = re.compile(
 # The second kind: an earlier request (one its asker cancelled, say) still
 # holds the window's slot until its owner takes it.
 INVOKE_HELD = re.compile(r"ui invoke: a request is still queued or running in window \d+$")
+# How long `invoke(animating=True)` tries a held slot again, counted from
+# the first held answer, before failing.
+INVOKE_HELD_TIMEOUT = 30
 # Taken but not answered by the second deadline (a stalled owner): it may
 # still run; the caller confirms its effect.
 INVOKE_STILL_RUNNING = re.compile(r"ui invoke: still running \(window \d+\)$")
@@ -1031,6 +1034,7 @@ def invoke(
     *args: str,
     tries: int = 5,
     allow: str | None = None,
+    animating: bool = False,
 ) -> Invoked:
     """`ui invoke <node> <action> [args]`: retried while cancelled at its
     deadline or refused busy (neither ran, so a retry can't act twice), up
@@ -1039,9 +1043,17 @@ def invoke(
     it) waits for that first, a confirmed state (`wait_settled`: every
     queue empty, its owner waiting), and isn't counted. "ran late" with its
     row or message counts as done (`Invoked.late`), and `Invoked.retries`
-    says how many were cancelled or busy first."""
+    says how many were cancelled or busy first.
+
+    `animating`: the window may be animating (an app ticking: the SDK's
+    `run_until`), so the desktop never settles; a held slot is then tried
+    again every 0.2 s instead (the slot frees once that request is
+    answered, or its owner, reading its events between ticks, skips a
+    cancelled one), not counted, failing `INVOKE_HELD_TIMEOUT` seconds after
+    the first held answer."""
     line = shlex.join(["ui", "invoke", str(node_id), action, *args])
     retries = 0
+    held_until: float | None = None
     while retries < tries:
         out = run(m, line, 10, allow=allow)
         got = parse_invoke(out)
@@ -1049,25 +1061,63 @@ def invoke(
             return replace(got, retries=retries)
         first = next((x for x in out.splitlines() if x.strip()), "")
         if INVOKE_HELD.match(first):
-            wait_settled(m, allow=allow)
+            if not animating:
+                wait_settled(m, allow=allow)
+                continue
+            now = time.monotonic()
+            if held_until is None:
+                held_until = now + INVOKE_HELD_TIMEOUT
+            elif now > held_until:
+                raise AssertionError(
+                    f"{line}: the window's slot stayed held for {INVOKE_HELD_TIMEOUT} s"
+                )
+            time.sleep(0.2)
             continue
         retries += 1
         time.sleep(0.2)
     raise AssertionError(f"{line} was cancelled or busy {tries} times")
 
 
-def press_buttons(m: Machine, rows: list[dict[str, str]], *names: str) -> None:
-    """`ui invoke <button> press` for each button named in `rows`, in turn:
-    each answered with its row, or still running (`Invoked.still_running`),
-    then waited for: the desktop settled, no request outstanding, so its
-    effect is in the tree the caller reads next."""
-    for name in names:
-        button = node(rows, "button", name)
-        got = invoke(m, button["id"], "press")
-        if got.still_running:
-            wait_settled(m)
-            continue
+def press_button(
+    m: Machine, rows: list[dict[str, str]], name: str, animating: bool = False
+) -> Invoked:
+    """`ui invoke <button> press` on the button named `name` in `rows`
+    (`invoke`, `animating` passed on): answered with that button's row, or
+    still running (`Invoked.still_running`: the caller confirms its
+    effect); anything else fails."""
+    button = node(rows, "button", name)
+    got = invoke(m, button["id"], "press", animating=animating)
+    if not got.still_running:
         assert got.row is not None and got.row["id"] == button["id"], (name, got)
+    return got
+
+
+def press_buttons(m: Machine, rows: list[dict[str, str]], *names: str) -> None:
+    """`press_button` for each button named in `rows`, in turn, one still
+    running then waited for: the desktop settled, no request outstanding,
+    so its effect is in the tree the caller reads next."""
+    for name in names:
+        if press_button(m, rows, name).still_running:
+            wait_settled(m)
+
+
+def press_animated(
+    m: Machine,
+    rows: list[dict[str, str]],
+    name: str,
+    what: str,
+    until: Callable[[list[dict[str, str]]], bool],
+    window: str | int | None = None,
+    timeout: float = 30,
+) -> list[dict[str, str]]:
+    """`press_button` on the button named `name` in `rows` in a window that
+    may be animating (never settling: see `invoke`'s `animating`), then
+    confirmed by the tree (`wait_ui` until `until` holds, `what` naming it
+    in a failure), never by `wait_settled`; the rows then. `until` must not
+    hold of `rows` already, so what it waits for counts from the press."""
+    assert not until(rows), f"{what} before pressing {name}"
+    press_button(m, rows, name, animating=True)
+    return wait_ui(m, what, until, window, timeout)
 
 
 # -- the desktop shell (#157) --------------------------------------------------

@@ -181,3 +181,94 @@ def test_invoke_waits_out_a_held_slot_without_counting_it(monkeypatch):
     got = gui.invoke(None, 17, "press", tries=2)
     assert got.row is not None and got.retries == 1
     assert len(settled) == 2 and len(shell.lines) == 4
+
+
+def test_invoke_on_an_animating_window_retries_a_held_slot_without_settling(monkeypatch):
+    # Animating: a held slot is tried again (not counted, never waiting for
+    # the desktop to settle, which it wouldn't), a busy one still counts.
+    held = "ui invoke: a request is still queued or running in window 3\n"
+    busy = "ui invoke: window 3 busy (try again)\n"
+    shell = FakeShell([held, held, busy, ROW])
+    monkeypatch.setattr(gui, "run", shell)
+    monkeypatch.setattr(gui.time, "sleep", lambda s: None)
+
+    def never(m, allow=None):
+        raise AssertionError("waited for the desktop to settle")
+
+    monkeypatch.setattr(gui, "wait_settled", never)
+    got = gui.invoke(None, 17, "press", tries=2, animating=True)
+    assert got.row is not None and got.retries == 1
+    assert len(shell.lines) == 4
+
+
+def test_invoke_on_an_animating_window_gives_up_on_a_slot_held_too_long(monkeypatch):
+    held = "ui invoke: a request is still queued or running in window 3\n"
+    t = gui.INVOKE_HELD_TIMEOUT
+    clock = iter([0.0, t / 3, t + 1, 1e9])
+    monkeypatch.setattr(gui, "run", FakeShell([held] * 4))
+    monkeypatch.setattr(gui.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gui.time, "monotonic", lambda: next(clock))
+    with pytest.raises(AssertionError, match=f"stayed held for {gui.INVOKE_HELD_TIMEOUT} s"):
+        gui.invoke(None, 17, "press", animating=True)
+
+
+def never_settle(m, allow=None):
+    raise AssertionError("waited for the desktop to settle")
+
+
+def test_press_animated_confirms_by_the_tree_not_by_settling(monkeypatch):
+    # A held slot is tried again (never settling), a row for the button
+    # accepted, then the tree waited on with the caller's own predicate and
+    # window.
+    held = "ui invoke: a request is still queued or running in window 3\n"
+    shell = FakeShell([held, ROW])
+    monkeypatch.setattr(gui, "run", shell)
+    monkeypatch.setattr(gui.time, "sleep", lambda s: None)
+    monkeypatch.setattr(gui, "wait_settled", never_settle)
+    waited = []
+
+    def wait_ui(m, what, done, window, timeout):
+        waited.append((what, done, window))
+        return ["ok"]
+
+    monkeypatch.setattr(gui, "wait_ui", wait_ui)
+    rows = gui.parse_records(TREE, "id")
+
+    def until(r):
+        return False
+
+    assert gui.press_animated(None, rows, "Add", "the count", until, "3") == ["ok"]
+    assert waited == [("the count", until, "3")]
+    assert shell.lines == ["ui invoke 17 press"] * 2
+
+
+def test_press_animated_accepts_still_running(monkeypatch):
+    monkeypatch.setattr(gui, "run", FakeShell(["ui invoke: still running (window 3)\n"]))
+    monkeypatch.setattr(gui, "wait_ui", lambda m, what, done, window, timeout: ["ok"])
+    rows = gui.parse_records(TREE, "id")
+    assert gui.press_animated(None, rows, "Add", "the count", lambda r: False) == ["ok"]
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        ROW.replace("   17 ", "   18 "),
+        "ui invoke: the node is disabled\n",
+        "ui invoke: no node 17\n",
+    ],
+)
+def test_press_animated_fails_on_another_row_or_a_refusal(monkeypatch, said):
+    monkeypatch.setattr(gui, "run", FakeShell([said]))
+    monkeypatch.setattr(gui, "wait_ui", lambda m, what, done, window, timeout: ["ok"])
+    rows = gui.parse_records(TREE, "id")
+    with pytest.raises(AssertionError):
+        gui.press_animated(None, rows, "Add", "the count", lambda r: False)
+
+
+def test_press_animated_refuses_a_predicate_already_true(monkeypatch):
+    shell = FakeShell([ROW])
+    monkeypatch.setattr(gui, "run", shell)
+    rows = gui.parse_records(TREE, "id")
+    with pytest.raises(AssertionError, match="before pressing Add"):
+        gui.press_animated(None, rows, "Add", "the count", lambda r: True)
+    assert shell.lines == []

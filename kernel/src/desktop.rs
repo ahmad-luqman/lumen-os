@@ -2673,9 +2673,9 @@ impl lumen_ui::App for Spin {
         }
     }
 
-    fn paint_over(&mut self, s: &mut Surface) {
+    fn paint_over(&mut self, over: &mut lumen_ui::Over<'_>) {
         const GREEN: u32 = 0x00ff00;
-        s.fill_rect(Rect::new(self.x, 20, 40, 20), GREEN);
+        over.surface.fill_rect(Rect::new(self.x, 20, 40, 20), GREEN);
     }
 }
 

@@ -43,6 +43,9 @@ pub use lumen_app_api as api;
 pub use lumen_app_api::event::{Button, Buttons, Event, KeyAction, KeyCode, Mods, Palette, ThemeId, mods};
 pub use lumen_app_api::layout::Rect;
 pub use lumen_app_api::{Error, Grant, LogLevel};
+/// `lumen-gfx`: the canvas's `Surface` and the `Rect`s an app's own drawing
+/// reports (`lumen_ui::App::take_drawn`) and paints in.
+pub use lumen_gfx as gfx;
 pub use lumen_gfx::Surface;
 
 use lumen_app_api::answer::AppAnswer;

@@ -34,7 +34,8 @@
 //!   `WINDOW_PIXELS` is `BadArgument` (not `OutOfMemory`), `Trace` (`cpus`
 //!   at least 1, a read whose count agrees with its header), `Desktop::
 //!   measure`, `Time::now_ns` and `wall`, `Window::wait` with a deadline,
-//!   animating and not; then `exit(7)`.
+//!   animating and not; a toolkit whose tree's area is off the client is
+//!   `BadArgument`; then `exit(7)`.
 //!
 //! The toolkit modes (#207), each its window titled `window`:
 //!
@@ -57,6 +58,33 @@
 //!   (`window: deaf: published; a bad tree then: -5`: the last one stays),
 //!   then sleeps for good, never reading its events: a request to it stays
 //!   queued, so its window's one request slot stays taken.
+//!
+//! The SDK's tick loop (`ui::Toolkit::run_until`), its window titled
+//! `window`, 320 × 160:
+//!
+//! - `tick [greedy|quit|slow]`: a tree on the left (`Ticks`, a fixed-width
+//!   label counting the ticks; `State`, `running` or `stopped`; buttons
+//!   `Stop` and `Start`) and the app's own area on the right, where a
+//!   16-pixel square in the palette's accent moves 8 pixels a tick (its own
+//!   damage, `take_drawn`; it paints only the square, the background being
+//!   the tree's). It ticks every 50 ms while running (an animating wait)
+//!   and not at all stopped (so the desktop settles). `n` and Space move
+//!   the square without a tick (taken by the app: its drawing committed,
+//!   the tree unchanged, a focused button never pressed by Space); Escape
+//!   quits (`Taken::Quit`). `greedy` also takes every other event offered
+//!   (doing nothing with it: requests, `Close`, `Theme`, focus and `Lost`
+//!   must still reach the toolkit); `quit` quits from its fifth tick
+//!   (`Flow::Quit`); `slow` makes each tick's work 75 ms, longer than its
+//!   period, and WARNs if a tick comes less than a period after the last
+//!   one's work ended (the pacer counts from the end of an overrunning
+//!   tick's work). It logs `window: tick: running`, `window: tick:
+//!   accent 0x<rrggbb>` each time its frame is drawn in a new accent, a
+//!   WARN if a tick comes less than a period after the one before (the
+//!   launch before the first: what the pacer guarantees, across Stop and
+//!   Start too), and `window: tick: <how> after <n> ticks, <ms> ms from the
+//!   first to the last` (`closed` or `quit`) when the loop returns, then
+//!   returns 0; with no time grant, it logs `window: tick: no time grant:
+//!   <e>` and returns 1.
 
 #![no_std]
 
@@ -71,10 +99,11 @@ use lumen_app::api::layout::Rect as WireRect;
 use lumen_app::api::limits::{TEXT_BYTES, TREE_NODES};
 use lumen_app::api::trace::{EVENT_SIZE, HEADER_SIZE, decode_header};
 use lumen_app::api::tree::{Common, Node, Text, Tree};
-use lumen_app::ui::Toolkit;
-use lumen_app::{Desktop, Error, Event, Rect, Time, Trace, log};
+use lumen_app::gfx::Rect as Area;
+use lumen_app::ui::{Ended, Flow, Taken, Ticking, Toolkit};
+use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode, Rect, Time, Trace, log};
 use lumen_ui::counter::Counter;
-use lumen_ui::{App, Then, Ui, UiEvent};
+use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
 
 lumen_app::manifest!(time, desktop, trace);
 lumen_app::main!(run);
@@ -115,6 +144,7 @@ fn run() -> i32 {
             return 0;
         }
         "sdk" => return sdk(),
+        "tick" => return tick(args.get(1).map_or("", |a| a.as_str())),
         "panic" => {
             let long: String = core::iter::repeat_n('p', 300).collect();
             panic!("{long}");
@@ -264,6 +294,18 @@ fn sdk() -> i32 {
         }
         Err(_) => check("a window", false),
     }
+    // A toolkit whose tree's area is off the client: BadArgument (its
+    // window dropped with it).
+    match desk.open_window("sdk", 40, 20) {
+        Ok(w) => {
+            let off = lumen_app::gfx::Rect::new(40, 0, 10, 10);
+            check(
+                "a tree's area off the client is BadArgument",
+                matches!(Toolkit::with_area(Grower::new(), w, off), Err(Error::BadArgument)),
+            );
+        }
+        Err(_) => check("a second window", false),
+    }
     log::info(&format!("window: sdk: {run} checks, {failed} failed"));
     lumen_app::exit(7)
 }
@@ -383,4 +425,258 @@ fn publish(mode: &str, w: &lumen_app::Window) -> Result<(), i32> {
     let bytes = tree.encode().map_or(0, |b| b.len());
     log::info(&format!("window: deep: published {count} nodes ({bytes} bytes)"));
     Ok(())
+}
+
+/// The `tick` mode's window, the tree's part of it (left) and the app's
+/// own (the rest).
+const TICK_W: u32 = 320;
+const TICK_H: u32 = 160;
+const TICK_TREE_W: u32 = 140;
+const TICK_TREE: Area = Area::new(0, 0, TICK_TREE_W, TICK_H);
+const TICK_OWN: Area = Area::new(TICK_TREE_W as i32, 0, TICK_W - TICK_TREE_W, TICK_H);
+/// Its ticks while running, and how far the square moves each one.
+const TICK_NS: u64 = 50_000_000;
+const STEP: i32 = 8;
+const SQUARE: u32 = 16;
+/// Where the square starts, and goes back to past the area's right edge.
+const SQUARE_HOME: i32 = TICK_OWN.x() + 10;
+/// The `Ticks` label's fixed width: its count changing width would move
+/// the widgets after it, repainting (and committing) the whole window.
+const TICKS_W: u32 = 60;
+/// `tick quit`: the tick that quits.
+const QUIT_AT: u64 = 5;
+/// `tick slow`: how long each tick's work takes, longer than its period.
+const SLOW_NS: u64 = 75_000_000;
+
+/// How the `tick` mode runs: plainly, taking every event offered
+/// (`greedy`), quitting from its fifth tick (`quit`), or with each tick's
+/// work longer than its period (`slow`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TickMode {
+    Plain,
+    Greedy,
+    Quit,
+    Slow,
+}
+
+/// The `tick` mode's app: see the crate's doc.
+struct Ticker {
+    ui: Ui,
+    count: Widget,
+    state: Widget,
+    stop: Widget,
+    start: Widget,
+    mode: TickMode,
+    ticks: u64,
+    running: bool,
+    /// The time of the last tick (the launch before the first), which the
+    /// next must come at least a period after (what the pacer guarantees,
+    /// across Stop and Start too): an earlier one logs a WARN; and the first
+    /// tick's time.
+    last_tick: u64,
+    first_tick: Option<u64>,
+    /// `slow`: the clock, and when the last tick's work ended (the next
+    /// must come at least a period after it, else a WARN).
+    time: Time,
+    work_ended: Option<u64>,
+    square: Area,
+    drawn: Vec<Area>,
+    /// The accent its frame was last drawn in (logged when it changes).
+    accent: Option<u32>,
+}
+
+impl Ticker {
+    fn new(time: Time, mode: TickMode) -> Ticker {
+        let mut ui = Ui::new();
+        let count = ui.fixed_label(None, "Ticks", "0", TICKS_W);
+        let state = ui.label(None, "State", "running");
+        let stop = ui.button(None, "Stop");
+        let start = ui.button(None, "Start");
+        let now = clock(&time);
+        Ticker {
+            ui,
+            count,
+            state,
+            stop,
+            start,
+            mode,
+            ticks: 0,
+            running: true,
+            last_tick: now,
+            first_tick: None,
+            time,
+            work_ended: None,
+            square: Area::new(SQUARE_HOME, 70, SQUARE, SQUARE),
+            drawn: Vec::new(),
+            accent: None,
+        }
+    }
+
+    /// The square moved `STEP` pixels right, back home past the area's
+    /// right edge; its old and new places are the app's damage.
+    fn move_square(&mut self) {
+        let mut x = self.square.x() + STEP;
+        if x + SQUARE as i32 > TICK_OWN.right() {
+            x = SQUARE_HOME;
+        }
+        let old = self.square;
+        self.square = Area::new(x, self.square.y(), SQUARE, SQUARE);
+        self.drawn.push(old);
+        self.drawn.push(self.square);
+    }
+
+    /// What `take` does with an event offered: Escape quits; `n` and Space
+    /// move the square (taken: the tree never sees them, so Space never
+    /// presses a focused button); in `greedy` mode everything else offered
+    /// is taken too (doing nothing).
+    fn take(&mut self, e: &Event) -> Taken {
+        match *e {
+            Event::Key { code: KeyCode::Escape, action: KeyAction::Press { .. }, .. } => Taken::Quit,
+            Event::Key { code: KeyCode::N | KeyCode::Spacebar, action: KeyAction::Press { .. }, .. } => {
+                self.move_square();
+                Taken::Took
+            }
+            _ if self.mode == TickMode::Greedy => Taken::Took,
+            _ => Taken::Pass,
+        }
+    }
+}
+
+impl App for Ticker {
+    fn ui_mut(&mut self) -> &mut Ui {
+        &mut self.ui
+    }
+
+    fn apply(&mut self, events: &[UiEvent]) -> Then {
+        for e in events {
+            match e {
+                UiEvent::Pressed(w) if *w == self.stop => {
+                    self.running = false;
+                    self.ui.set_text(self.state, "stopped");
+                }
+                UiEvent::Pressed(w) if *w == self.start => {
+                    self.running = true;
+                    self.ui.set_text(self.state, "running");
+                }
+                _ => {}
+            }
+        }
+        Then::Carry
+    }
+
+    fn paint_over(&mut self, over: &mut Over<'_>) {
+        // Only the foreground: each rect has the tree's background already.
+        for r in over.rects {
+            if let Some(part) = r.intersect(&self.square) {
+                over.surface.fill_rect(part, over.palette.accent);
+            }
+        }
+        if self.accent != Some(over.palette.accent) {
+            self.accent = Some(over.palette.accent);
+            log::info(&format!("window: tick: accent 0x{:06x}", over.palette.accent));
+        }
+    }
+
+    fn take_drawn(&mut self) -> Vec<Area> {
+        core::mem::take(&mut self.drawn)
+    }
+}
+
+impl Ticking for Ticker {
+    fn period(&self) -> Option<u64> {
+        self.running.then_some(TICK_NS)
+    }
+
+    fn tick(&mut self, now: u64) -> Flow {
+        self.ticks += 1;
+        let floor = self.last_tick + TICK_NS;
+        if now < floor {
+            log::warn(&format!("window: tick: tick {} came {} ns early", self.ticks, floor - now));
+        }
+        if let Some(ended) = self.work_ended
+            && now < ended + TICK_NS
+        {
+            log::warn(&format!(
+                "window: tick: tick {} came {} ns early after the last one's work",
+                self.ticks,
+                ended + TICK_NS - now
+            ));
+        }
+        self.last_tick = now;
+        self.first_tick.get_or_insert(now);
+        self.ui.set_text(self.count, &format!("{}", self.ticks));
+        self.move_square();
+        if self.mode == TickMode::Slow {
+            if let Err(e) = self.time.sleep(SLOW_NS) {
+                log::error(&format!("window: tick: slow: {e}"));
+            }
+            self.work_ended = Some(clock(&self.time));
+        }
+        if self.mode == TickMode::Quit && self.ticks == QUIT_AT { Flow::Quit } else { Flow::Carry }
+    }
+}
+
+/// The time now, or 0 once an ERROR is logged (a 0 would switch the floor
+/// checks off, so it isn't silent).
+fn clock(time: &Time) -> u64 {
+    time.now_ns().unwrap_or_else(|e| {
+        log::error(&format!("window: tick: no clock: {e}"));
+        0
+    })
+}
+
+/// The `tick` mode ([`Ticker`] in the SDK's `run_until`, until its window
+/// closes or it quits; 0 then), `mode` its argument after `tick`.
+fn tick(mode: &str) -> i32 {
+    let mode = match mode {
+        "" => TickMode::Plain,
+        "greedy" => TickMode::Greedy,
+        "quit" => TickMode::Quit,
+        "slow" => TickMode::Slow,
+        other => {
+            log::error(&format!("window: tick: no mode {other}"));
+            return 1;
+        }
+    };
+    let time = match Time::get() {
+        Ok(t) => t,
+        Err(e) => {
+            log::error(&format!("window: tick: no time grant: {e}"));
+            return 1;
+        }
+    };
+    let w = match Desktop::get().and_then(|d| d.open_window("window", TICK_W, TICK_H)) {
+        Ok(w) => w,
+        Err(e) => {
+            log::error(&format!("window: no window: {e}"));
+            return 1;
+        }
+    };
+    let mut tk = match Toolkit::with_area(Ticker::new(time, mode), w, TICK_TREE) {
+        Ok(tk) => tk,
+        Err(e) => {
+            log::error(&format!("window: no toolkit: {e}"));
+            return 1;
+        }
+    };
+    log::info("window: tick: running");
+    match tk.run_until(time, Ticker::take) {
+        Ok(how) => {
+            let t = tk.app_mut();
+            let elapsed_ms = t.first_tick.map_or(0, |first| (t.last_tick - first) / 1_000_000);
+            let how = match how {
+                Ended::Closed => "closed",
+                Ended::Quit => "quit",
+            };
+            log::info(&format!(
+                "window: tick: {how} after {} ticks, {elapsed_ms} ms from the first to the last",
+                t.ticks
+            ));
+            0
+        }
+        Err(e) => {
+            log::error(&format!("window: tick: {e}"));
+            2
+        }
+    }
 }

@@ -496,14 +496,14 @@ CLOSE_GRACE_SLICES = 4
 def test_sdk_wraps_its_other_calls(boot):
     # `window sdk`: open_window past WINDOW_PIXELS is BadArgument, Trace
     # (cpus, a read agreeing with its header), measure, the clocks, waits
-    # with a deadline (animating or not), animating without one refused;
-    # then exit(7).
+    # with a deadline (animating or not), animating without one refused, a
+    # toolkit's tree area off the client refused; then exit(7).
     m = boot_desktop(boot)
     app_id, mark = start(m, "window sdk")
     found = wait_for_output(
         m, mark, r"INFO  app: window: window: sdk: (\d+) checks, (\d+) failed\n", 30
     )
-    assert (int(found[1]), found[2]) == (10, "0"), m.output[mark:]
+    assert (int(found[1]), found[2]) == (11, "0"), m.output[mark:]
     end_line(m, mark, "window", app_id, "exited with 7")
 
 
@@ -765,3 +765,240 @@ def test_a_tree_the_sdk_cant_publish_answers_failed(boot):
     assert [r["name"] for r in below_root(gui.ui_tree(m, wid))] == ["Grow"]
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
+
+
+# -- the SDK's tick loop (`ui::Toolkit::run_until`): `window tick` -------------
+
+# test-window's `tick` mode (apps/test-window/src/lib.rs): its client's
+# width, its tree's (the app's own area is right of it) and its square's
+# side.
+TICK_W = 320
+TICK_TREE_W = 140
+SQUARE = 16
+TICK_RUNNING = r"INFO  app: window: window: tick: running\n"
+TICK_ACCENT = r"INFO  app: window: window: tick: accent 0x([0-9a-f]{6})\n"
+
+
+def ticks(rows: list[dict[str, str]]) -> int:
+    return int(gui.node(rows, "label", "Ticks")["value"])
+
+
+def tick_state(rows: list[dict[str, str]]) -> str:
+    return gui.node(rows, "label", "State")["value"]
+
+
+def start_ticker(m, mode: str = "") -> tuple[int, int, str, list[dict[str, str]]]:
+    """`run window tick [mode]`: its app id, the serial mark, its window's
+    id and its tree's rows."""
+    app_id, mark = start(m, f"window tick {mode}".strip())
+    wait_for_output(m, mark, TICK_RUNNING, 30)
+    wid, rows = wait_tree(m, "window", "Ticks")
+    return app_id, mark, wid, rows
+
+
+def stop_ticker(m, wid: str, rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Stop pressed while it ticks, confirmed by the tree; then settled (no
+    period: nothing animates). The rows then."""
+    gui.press_animated(m, rows, "Stop", "stopped", lambda r: tick_state(r) == "stopped", wid)
+    gui.wait_settled(m)
+    return gui.ui_tree(m, wid)
+
+
+TICK_PERIOD_MS = 50
+TICK_ENDED = (
+    r"INFO  app: window: window: tick: {how} after (\d+) ticks, "
+    r"(\d+) ms from the first to the last\n"
+)
+
+
+def tick_ended(m, mark: int, how: str = "closed") -> int:
+    """The tick app's end line (`closed` or `quit`): its tick count, once
+    the pacer's floor is checked: no tick came less than a period after the
+    one before (the app's WARN), and from the first tick to the last took
+    at least a period a tick."""
+    assert "ns early" not in m.output[mark:], m.output[mark:]
+    found = re.search(TICK_ENDED.format(how=how), m.output[mark:])
+    assert found, m.output[mark:]
+    count, elapsed = int(found[1]), int(found[2])
+    assert elapsed >= max(count - 1, 0) * TICK_PERIOD_MS, found[0]
+    return count
+
+
+def square_moved(m, accent: int, before: list[tuple[int, int]], name: str) -> None:
+    """Until the square is drawn one step on from `before` (test-window's
+    `move_square`: 8 to the right, back to the area's left edge + 10 past
+    its right one), seen on the screen."""
+    x0 = min(x for x, _ in before)
+    want = x0 + 8 if x0 + 8 + SQUARE <= TICK_W else TICK_TREE_W + 10
+    gui.wait_for(
+        m,
+        f"the square moved to x {want}",
+        lambda: accent_pixels(m, name, accent),
+        lambda p: len(p) == SQUARE * SQUARE and min(x for x, _ in p) == want,
+    )
+
+
+def accent_pixels(m, name: str, accent: int) -> list[tuple[int, int]]:
+    """The client pixels right of the tree in colour `accent`: the square."""
+    img = gui.client_pixels(m, "window", name)
+    rgb = ((accent >> 16) & 0xFF, (accent >> 8) & 0xFF, accent & 0xFF)
+    w, h = img.size
+    return [(x, y) for y in range(h) for x in range(TICK_TREE_W, w) if img.getpixel((x, y)) == rgb]
+
+
+def test_sdk_tick_loop_answers_requests_and_closes_while_ticking(boot):
+    # `run_until` ticks (the label's count grows: a floor, never a time)
+    # and still hands requests to the toolkit: Stop, pressed while it
+    # ticks, is answered (or still running, then seen in the tree); Start
+    # sets it ticking again (once the stop is confirmed: settled); the
+    # window's close, while it ticks, ends the loop: exit 0, its line
+    # counting at least the ticks seen (each tick at least a period after
+    # the one before), its thread joined.
+    m = boot_desktop(boot)
+    app_id, mark, wid, rows = start_ticker(m)
+    record = app(m, app_id)
+    rows = gui.wait_ui(m, "two ticks", lambda r: ticks(r) >= 2, wid, 30)
+    rows = stop_ticker(m, wid, rows)
+    seen = ticks(rows)
+    rows = gui.press_animated(m, rows, "Start", "ticking again", lambda r: ticks(r) > seen + 1, wid)
+    assert tick_state(rows) == "running"
+    seen = ticks(rows)
+    gui.close_window(m, "window")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    assert tick_ended(m, mark) >= seen
+    wait_gone(m, app_id, record["thread"])
+
+
+def test_sdk_tick_loop_stopped_lets_the_desktop_settle(boot):
+    # Ticking, its waits are an animation's (`Ticking::animating`): the
+    # desktop never reads settled, however often it is asked. With no
+    # period (Stop) the loop waits for events only: the desktop settles and
+    # the count stays put across two settled reads; Start resumes it.
+    m = boot_desktop(boot)
+    app_id, mark, wid, rows = start_ticker(m)
+    gui.wait_ui(m, "a tick", lambda r: ticks(r) >= 1, wid, 30)
+    for _ in range(5):
+        assert gui.desktop_status(m)["settled"] == "no"
+    rows = stop_ticker(m, wid, rows)
+    first = ticks(rows)
+    gui.wait_settled(m)
+    assert ticks(gui.ui_tree(m, wid)) == first
+    gui.press_animated(m, rows, "Start", "ticking again", lambda r: ticks(r) > first, wid)
+    gui.close_window(m, "window")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    tick_ended(m, mark)
+
+
+def test_sdk_app_takes_keys_draws_alone_and_quits(boot):
+    # Keys the app takes before the toolkit (`Taken`): `n` moves its square
+    # with no tick, the move committed (seen on the screen) and the tree
+    # unchanged; Space, with Start focused, moves it too and never reaches
+    # the tree (Start isn't pressed: still stopped, no tick); Escape quits
+    # the loop (`Taken::Quit`): exit 0, the window gone, its thread joined.
+    m = boot_desktop(boot)
+    app_id, mark, wid, rows = start_ticker(m)
+    record = app(m, app_id)
+    accent = int(wait_for_output(m, mark, TICK_ACCENT, 30)[1], 16)
+    rows = stop_ticker(m, wid, rows)
+    count = ticks(rows)
+    before = accent_pixels(m, "tick-before.png", accent)
+    assert len(before) == SQUARE * SQUARE, len(before)
+    gui.confirmed_keys(m, "n")
+    square_moved(m, accent, before, "tick-after-n.png")
+    gui.wait_settled(m)
+    assert ticks(gui.ui_tree(m, wid)) == count, "a key the app took is no tick"
+    start_button = gui.node(rows, "button", "Start")
+    focused = gui.invoke(m, start_button["id"], "focus")
+    assert focused.row is not None and "focused" in focused.row["state"], focused
+    before = accent_pixels(m, "tick-before-space.png", accent)
+    gui.confirmed_keys(m, " ")
+    square_moved(m, accent, before, "tick-after-space.png")
+    gui.wait_settled(m)
+    rows = gui.ui_tree(m, wid)
+    assert (tick_state(rows), ticks(rows)) == ("stopped", count), "Space reached the tree"
+    gui.confirmed_keys(m, ["esc"])
+    end_line(m, mark, "window", app_id, "exited with 0")
+    assert tick_ended(m, mark, "quit") == count
+    gui.wait_no_window(m, "window")
+    wait_gone(m, app_id, record["thread"])
+
+
+def test_sdk_custom_drawing_follows_the_theme(boot):
+    # The app's own drawing gets the palette: its square is in the light
+    # theme's accent, then (`theme dark`) the dark one's, at the same place,
+    # with no tick (stopped: the switch's full repaint draws it).
+    m = boot_desktop(boot)
+    app_id, mark, wid, rows = start_ticker(m)
+    light = int(wait_for_output(m, mark, TICK_ACCENT, 30)[1], 16)
+    stop_ticker(m, wid, rows)
+    recoloured(m, mark, light)
+    gui.close_window(m, "window")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    tick_ended(m, mark)
+
+
+def recoloured(m, mark: int, light: int) -> None:
+    """The stopped tick app's square in `light` (the light accent), then,
+    after `theme dark`, in the dark accent (a new accent logged) at the same
+    pixels."""
+    square = accent_pixels(m, "tick-light.png", light)
+    assert len(square) == SQUARE * SQUARE, len(square)
+    switched = len(m.output)
+    assert run(m, "theme dark") == "theme: dark\n"
+    dark = int(wait_for_output(m, switched, TICK_ACCENT, 30)[1], 16)
+    assert dark != light
+    gui.wait_for(
+        m,
+        "the square in the dark accent",
+        lambda: accent_pixels(m, "tick-dark.png", dark),
+        lambda p: sorted(p) == sorted(square),
+    )
+
+
+def test_sdk_a_greedy_take_still_leaves_the_toolkit_its_events(boot):
+    # `tick greedy` takes every event offered to it, yet requests, `Theme`
+    # and `Close` never reach its `take`, and the focus reaches the tree
+    # after it: a press is still answered and seen in the tree, a focused
+    # button shows focused, `theme dark` still recolours its square, and
+    # closing the window still ends it with 0.
+    m = boot_desktop(boot)
+    app_id, mark, wid, rows = start_ticker(m, "greedy")
+    record = app(m, app_id)
+    light = int(wait_for_output(m, mark, TICK_ACCENT, 30)[1], 16)
+    gui.wait_ui(m, "a tick", lambda r: ticks(r) >= 1, wid, 30)
+    rows = stop_ticker(m, wid, rows)
+    # Focused only with the window's focus, which the app's `take` took
+    # (`FocusGained`): it reached the tree through the `Notify` step.
+    focused = gui.invoke(m, gui.node(rows, "button", "Start")["id"], "focus")
+    assert focused.row is not None and "focused" in focused.row["state"], focused
+    recoloured(m, mark, light)
+    gui.close_window(m, "window")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    tick_ended(m, mark)
+    wait_gone(m, app_id, record["thread"])
+
+
+def test_sdk_a_tick_can_quit(boot):
+    # `tick quit`: its fifth tick says `Flow::Quit`: the loop returns
+    # (`quit after 5 ticks`), exit 0, the window gone.
+    m = boot_desktop(boot)
+    app_id, mark, _, _ = start_ticker(m, "quit")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    assert tick_ended(m, mark, "quit") == 5
+    gui.wait_no_window(m, "window")
+
+
+def test_sdk_an_overrunning_tick_still_waits_a_period(boot):
+    # `tick slow`: each tick's work (a 75 ms sleep) is longer than its
+    # 50 ms period, so the pacer's next deadline has always passed when the
+    # work ends: only its count from the end of the work (`Pacer::ticked`)
+    # keeps the next tick a period away. Deterministic: the work is longer
+    # than the period however fast the host. The app WARNs on a tick less
+    # than a period after the last one's work ended; a few ticks, then
+    # closed.
+    m = boot_desktop(boot)
+    app_id, mark, wid, _ = start_ticker(m, "slow")
+    gui.wait_ui(m, "four slow ticks", lambda r: ticks(r) >= 4, wid, 30)
+    gui.close_window(m, "window")
+    end_line(m, mark, "window", app_id, "exited with 0")
+    assert tick_ended(m, mark) >= 4

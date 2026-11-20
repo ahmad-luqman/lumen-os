@@ -14,7 +14,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::vec::Vec;
-use lumen_app::ui::Toolkit;
+use lumen_app::ui::{Taken, Toolkit};
 use lumen_app::{Desktop, Error, Event, KeyAction, KeyCode};
 use lumen_calc::{Calc, Key, Op};
 use lumen_ui::{App, Then, Ui, UiEvent, Widget};
@@ -111,10 +111,11 @@ fn app() -> Result<(), (&'static str, Error)> {
     // The calculator's keys go to it whichever button has the focus; the
     // others (Tab, Space) to the toolkit.
     tk.run_with(|calc, e| {
-        let Event::Key { code, action: KeyAction::Press { text }, .. } = *e else { return false };
-        let Some(key) = key_of(code, text) else { return false };
+        let Event::Key { code, action: KeyAction::Press { text }, .. } = *e else { return Taken::Pass };
+        let Some(key) = key_of(code, text) else { return Taken::Pass };
         calc.press(key);
-        true
+        Taken::Took
     })
+    .map(|_| ())
     .map_err(|e| ("toolkit", e))
 }
