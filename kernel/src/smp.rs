@@ -405,6 +405,7 @@ extern "C" fn ap_main() -> ! {
     // The checks `ap_entry` couldn't afford: a failure here is reported.
     arch::paging::enforce_nx_and_wp();
     arch::paging::check_pat();
+    arch::fpu::init_cpu();
     let lapic = arch::apic::lapic_id();
     assert_eq!(
         lapic,

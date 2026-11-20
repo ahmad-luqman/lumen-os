@@ -139,6 +139,7 @@ extern "C" fn kmain(stack_top: u64) -> ! {
     }
     log_memory_map();
     mm::init();
+    arch::fpu::init_cpu();
     ktrace!(Kind::BootPhase, BootPhase::Memory);
     let main_stack = install_stacks();
     ktrace!(Kind::BootPhase, BootPhase::Stacks);

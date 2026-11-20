@@ -31,6 +31,64 @@ def test_detects_avx512_and_state_instructions():
     assert [f.check for f in scan_disassembly(bad)] == ["simd", "simd"]
 
 
+def test_fpu_allowlist_rejects_simd_outside_named_stubs():
+    # Exact allowlisted save/restore mnemonics inside the two named stubs pass.
+    allowed_stubs = """
+ffffffff80002000 <lumen_fpu_save>:
+ffffffff80002000:      \ttestq\t%rsi, %rsi
+ffffffff80002003:      \tje\t0xffffffff80002010
+ffffffff80002005:      \txsave64\t(%rdi)
+ffffffff80002009:      \tretq
+ffffffff80002010:      \tfxsave64\t(%rdi)
+ffffffff80002014:      \tretq
+
+ffffffff80002020 <lumen_fpu_restore>:
+ffffffff80002020:      \ttestq\t%rsi, %rsi
+ffffffff80002023:      \tje\t0xffffffff80002030
+ffffffff80002025:      \txrstor64\t(%rdi)
+ffffffff80002029:      \tretq
+ffffffff80002030:      \tfxrstor64\t(%rdi)
+ffffffff80002034:      \tretq
+"""
+    assert scan_disassembly(allowed_stubs) == []
+
+    # Swapped save/restore mnemonics inside the two named stubs are rejected.
+    swapped_save = """
+ffffffff80002000 <lumen_fpu_save>:
+ffffffff80002000:      \tfxrstor64\t(%rdi)
+ffffffff80002004:      \txrstor64\t(%rdi)
+"""
+    assert [f.check for f in scan_disassembly(swapped_save)] == ["simd", "simd"]
+
+    swapped_restore = """
+ffffffff80002020 <lumen_fpu_restore>:
+ffffffff80002020:      \tfxsave64\t(%rdi)
+ffffffff80002024:      \txsave64\t(%rdi)
+"""
+    assert [f.check for f in scan_disassembly(swapped_restore)] == ["simd", "simd"]
+
+    # State instructions in any other symbol (including near-miss names) fail.
+    for sym in ("lumen_kernel::sched::switch", "lumen_fpu_save_helper"):
+        for insn in (
+            "fxsave64\t(%rdi)",
+            "xsave64\t(%rdi)",
+            "fxrstor64\t(%rdi)",
+            "xrstor64\t(%rdi)",
+        ):
+            bad = f"ffffffff80003000 <{sym}>:\nffffffff80003000:      \t{insn}\n"
+            assert [f.check for f in scan_disassembly(bad)] == ["simd"], (sym, insn)
+
+    # Vector/MMX/mask registers are banned everywhere, even inside the stubs.
+    for stub in ("lumen_fpu_save", "lumen_fpu_restore"):
+        for insn in (
+            "movaps\t%xmm0, (%rdi)",
+            "vmovdqu\t%ymm0, (%rdi)",
+            "kmovw\t%k1, %eax",
+        ):
+            bad = f"ffffffff80002000 <{stub}>:\nffffffff80002000:      \t{insn}\n"
+            assert [f.check for f in scan_disassembly(bad)] == ["simd"], (stub, insn)
+
+
 def test_detects_red_zone_access():
     bad = CLEAN + "ffffffff80001014:      \tmovq\t%rax, -0x18(%rsp)\n"
     findings = scan_disassembly(bad)

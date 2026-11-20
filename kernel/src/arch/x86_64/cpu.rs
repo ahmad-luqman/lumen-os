@@ -75,10 +75,15 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     }
 }
 
+/// `cpuid` leaf `leaf`, subleaf `subleaf`, as `(eax, ebx, ecx, edx)`.
+pub fn cpuid_count(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+    let r = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+    (r.eax, r.ebx, r.ecx, r.edx)
+}
+
 /// `cpuid` leaf `leaf`, subleaf 0, as `(eax, ebx, ecx, edx)`.
 pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
-    let r = core::arch::x86_64::__cpuid_count(leaf, 0);
-    (r.eax, r.ebx, r.ecx, r.edx)
+    cpuid_count(leaf, 0)
 }
 
 /// Wait until every earlier instruction has finished before any later one

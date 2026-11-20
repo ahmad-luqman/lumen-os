@@ -13,9 +13,11 @@ Binary checks (the built kernel ELFs):
     like `.got` once was) would be unmapped and unprotected. Writable
     sections must be in the data segment and executable ones in the text
     segment, which is how the page tables map them.
-  * No SSE/AVX/MMX/AVX-512 register or state instruction anywhere in the
-    disassembly. The kernel never saves vector state on interrupts, so one
-    stray `movaps` would corrupt user state later.
+  * No SSE/AVX/MMX/AVX-512 register anywhere in the disassembly, and no FP
+    state save/restore instruction outside the two user-thread assembly stubs
+    (`fxsave64`/`xsave64` in `lumen_fpu_save` and `fxrstor64`/`xrstor64` in
+    `lumen_fpu_restore`). The kernel never saves vector state on interrupts,
+    so one stray `movaps` would corrupt user state later.
   * No red-zone use: no memory access below %rsp (`-0x..(%rsp)`). Interrupts
     push onto the current stack and would clobber a red zone.
   * No 64-bit absolute kernel addresses materialized with `movabs` (a sign of
@@ -51,6 +53,14 @@ SIMD_MNEMONICS = {
     "xsavec", "xsaves", "xrstor", "xrstor64", "xrstors", "ldmxcsr", "stmxcsr",
     "vldmxcsr", "vstmxcsr", "emms", "femms", "vzeroupper", "vzeroall",
 }  # fmt: skip
+# M6 user-thread FPU save/restore stubs (docs/ARCHITECTURE.md §6): only these
+# exact mnemonics are exempt, and only inside these two raw assembly symbols.
+# Vector/MMX/mask registers (SIMD_REG) remain banned everywhere, including
+# inside these two symbols.
+ALLOWED_FPU_MNEMONICS: dict[str, frozenset[str]] = {
+    "lumen_fpu_save": frozenset({"fxsave64", "xsave64"}),
+    "lumen_fpu_restore": frozenset({"fxrstor64", "xrstor64"}),
+}
 RED_ZONE = re.compile(r"-0x[0-9a-f]+\(%rsp\)")
 MOVABS_KERNEL = re.compile(r"movabsq?\s+\$0xffffffff8[0-9a-f]{7}\b")
 INSN = re.compile(r"^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$")
@@ -88,7 +98,8 @@ def scan_disassembly(text: str) -> list[Finding]:
             continue
         addr, mnemonic, operands = m.groups()
         where = f"{func} @ {addr}: {mnemonic} {operands}".strip()
-        if mnemonic in SIMD_MNEMONICS or SIMD_REG.search(operands):
+        allowed = ALLOWED_FPU_MNEMONICS.get(func, frozenset())
+        if (mnemonic in SIMD_MNEMONICS and mnemonic not in allowed) or SIMD_REG.search(operands):
             findings.append(Finding("simd", where))
         if RED_ZONE.search(operands) and not mnemonic.startswith("lea"):
             findings.append(Finding("red-zone", where))
