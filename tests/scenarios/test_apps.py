@@ -1347,6 +1347,16 @@ def test_viewer_list_and_select(boot):
     rows = wait_info(m, wid, "the wallpaper decoded", lambda v: v == "lumen.png 1280x800")
     items = [r["name"] for r in rows if r["role"] == "listitem"]
     assert items == VIEWER_ITEMS, items
+    # Choosing the image already shown doesn't decode it again: its slices
+    # barely move (a request's answer), where a decode takes about 350.
+    gui.wait_settled(m)
+    before = app(m, app_id)
+    got = gui.invoke(m, gui.node(rows, "listitem", "lumen.png")["id"], "select")
+    assert got.row is not None or got.still_running, got
+    gui.wait_settled(m)
+    after = app(m, app_id)
+    assert before is not None and after is not None
+    assert int(after["slices"]) - int(before["slices"]) < 10, (before, after)
     tiles = gui.node(rows, "listitem", "tiles.png")
     got = gui.invoke(m, tiles["id"], "select")
     assert got.row is not None or got.still_running, got

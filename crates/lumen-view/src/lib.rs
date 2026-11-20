@@ -660,6 +660,15 @@ mod tests {
     }
 
     #[test]
+    fn prepare_fits_a_copy_of_fitted_s_size() {
+        let shown = prepare(include_bytes!("../../../apps/viewer/images/tiles.png")).expect("tiles.png shows");
+        assert_eq!((shown.image().width(), shown.image().height()), (96, 64));
+        let at = fitted(96, 64, VIEW);
+        assert_eq!(shown.fitted().at(), at);
+        assert_eq!((shown.fitted().pixels().width(), shown.fitted().pixels().height()), (at.w(), at.h()));
+    }
+
+    #[test]
     fn an_empty_view_fits_nothing() {
         assert_eq!(fitted(1280, 800, Rect::EMPTY), Rect::EMPTY);
         assert_eq!(fitted(1280, 800, Rect::new(5, 5, 0, 10)), Rect::EMPTY);
