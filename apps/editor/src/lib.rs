@@ -55,7 +55,7 @@ use lumen_app::api::text::prefix;
 use lumen_app::gfx::Rect;
 use lumen_app::ui::{Flow, Taken, Ticking, Toolkit};
 use lumen_app::{Desktop, Error, Event, KeyAction, Time, log};
-use lumen_edit::{Change, Command, Editor, Limits};
+use lumen_edit::{Change, Command, Editor, Limits, TAB};
 use lumen_ui::ui::{GAP, PAD};
 use lumen_ui::{App, Over, Then, Ui, UiEvent, Widget};
 
@@ -76,9 +76,11 @@ const BLINK_NS: u64 = 500_000_000;
 const LIMITS: Limits = Limits { text_bytes: 16 * 1024, line_bytes: 4 * 1024, undo_edits: 500, undo_bytes: 256 * 1024 };
 
 // A `set_value` (at most `SET_VALUE_BYTES`, the kernel's cap) always fits
-// the text's and a line's limits; undoing one keeps its history (twice the
+// the text's and a line's limits once normalised (each byte a tab at most,
+// which grows to `TAB`'s spaces); undoing one keeps its history (twice the
 // text: what it removed and inserted); and there is a history at all.
-const _: () = assert!(SET_VALUE_BYTES <= LIMITS.text_bytes && SET_VALUE_BYTES <= LIMITS.line_bytes);
+const SET_VALUE_NORMALISED: usize = SET_VALUE_BYTES * TAB.len();
+const _: () = assert!(SET_VALUE_NORMALISED <= LIMITS.text_bytes && SET_VALUE_NORMALISED <= LIMITS.line_bytes);
 const _: () = assert!(LIMITS.undo_bytes >= 2 * LIMITS.text_bytes && LIMITS.undo_edits > 0);
 
 /// Narrow glyphs: the narrowest of them bounds how many chars the view
@@ -375,7 +377,7 @@ impl App for EditorApp {
                 self.changed(change, old_cursor);
                 if change == Change::Refused {
                     // Past the editor's limits (a `set_value` fits them: the
-                    // assertions below), answered so, the text as it was.
+                    // assertions above), answered so, the text as it was.
                     then = Then::Failed(String::from("text too long"));
                 }
             }
