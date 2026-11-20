@@ -329,8 +329,10 @@ pub fn stub_entry_addr(vector: u8) -> u64 {
     &raw const lumen_isr_stubs as u64 + u64::from(vector) * STUB_STRIDE
 }
 
-/// Whether `rip` is the entry address of a non-NMI/DF/MC CPU exception stub
-/// (`vector < 32` and not `2 | 8 | 18`).
+/// Whether `rip` is the entry address of a non-IST CPU exception stub
+/// (`vector < 32` and not `1 | 2 | 8 | 18`). Vector 1 (`#DB`) uses `IST_DEBUG`
+/// and is handled separately so a nested `#DB` at `stub_entry_addr(1)` never
+/// `iretq`s into a self-overwriting IST loop.
 fn is_user_exception_stub_entry(rip: u64) -> bool {
     let base = &raw const lumen_isr_stubs as u64;
     let Some(off) = rip.checked_sub(base) else {
@@ -340,7 +342,7 @@ fn is_user_exception_stub_entry(rip: u64) -> bool {
         return false;
     }
     let vec = off / STUB_STRIDE;
-    vec < 32 && !matches!(vec, 2 | 8 | 18)
+    vec < 32 && !matches!(vec, 1 | 2 | 8 | 18)
 }
 
 // The vector map. 0-31 are the CPU's exceptions.
@@ -683,11 +685,16 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         //   `LSTAR` before `swapgs`. Clear `TF`, set `RF`, clear `DR6`, flag
         //   this CPU's pending debug trap, and `iretq` back to `LSTAR` so
         //   `lumen_syscall_entry` terminates cleanly on the normal kernel stack.
-        // - `MOV SS; INT3` / `MOV SS; <exception>` with `TF = 1` delivers `#DB`
-        //   on `IST_DEBUG` at the target exception stub's first instruction
-        //   (before `lumen_isr_common`'s `swapgs`). Clear `TF`, set `RF`, clear
-        //   `DR6`, and `iretq` back to the stub, which immediately runs
-        //   `lumen_isr_common` and terminates only the offending user process.
+        // - `MOV SS; INT3` / `MOV SS; <non-IST exception>` with `TF = 1`
+        //   delivers `#DB` on `IST_DEBUG` at the target exception stub's first
+        //   instruction (before `lumen_isr_common`'s `swapgs`). Clear `TF`, set
+        //   `RF`, clear `DR6`, and `iretq` back to the stub, which immediately
+        //   runs `lumen_isr_common` and terminates only the offending process.
+        // - `MOV SS; ICEBP (0xF1)` with `TF = 1` delivers a nested `#DB` at
+        //   `stub_entry_addr(1)`, overwriting the outer frame on `IST_DEBUG`.
+        //   Returning via `iretq` would loop forever, so when a ring-3 context
+        //   is active on this CPU (`user_exit_rsp() != 0`), clear `DR6` and
+        //   unwind directly off `IST_DEBUG` via `user::handle_user_exception`.
         if vector == 1 && !from_user {
             if frame.rip == super::syscall::entry_addr() {
                 frame.rflags &= !(1 << 8); // clear TF
@@ -696,6 +703,11 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
                 super::percpu::set_pending_debug_trap(true);
                 DEFERRED_LSTAR_DB.fetch_add(1, Ordering::Relaxed);
                 return;
+            }
+            if frame.rip == stub_entry_addr(1) && super::percpu::user_exit_rsp() != 0 {
+                super::cpu::write_dr6(0);
+                DEFERRED_STUB_DB.fetch_add(1, Ordering::Relaxed);
+                crate::user::handle_user_exception(frame, 0);
             }
             if is_user_exception_stub_entry(frame.rip) {
                 frame.rflags &= !(1 << 8); // clear TF

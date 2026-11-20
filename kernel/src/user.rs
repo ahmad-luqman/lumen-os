@@ -206,8 +206,9 @@ pub const fn user_range_valid(start: u64, len: usize) -> bool {
 /// Fault-safely copy `dst.len()` bytes from user virtual address `user_src`
 /// into kernel slice `dst`.
 ///
-/// Must be called with interrupts enabled and no `SpinLock` held
-/// (`debug_assert!(irq::enabled() && irq::depth() == 0)`).
+/// Must be called with interrupts enabled (unless `irq::disabled_for_good()`)
+/// and no `SpinLock` held
+/// (`debug_assert!((irq::enabled() || irq::disabled_for_good()) && irq::depth() == 0)`).
 pub fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), CopyError> {
     debug_assert!(
         (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
@@ -228,8 +229,9 @@ pub fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), CopyError> {
 
 /// Fault-safely copy `src` from kernel memory to user virtual address `user_dst`.
 ///
-/// Must be called with interrupts enabled and no `SpinLock` held
-/// (`debug_assert!(irq::enabled() && irq::depth() == 0)`).
+/// Must be called with interrupts enabled (unless `irq::disabled_for_good()`)
+/// and no `SpinLock` held
+/// (`debug_assert!((irq::enabled() || irq::disabled_for_good()) && irq::depth() == 0)`).
 #[allow(dead_code)] // HAL/kernel surface used by ktests and M6 syscalls
 pub fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), CopyError> {
     debug_assert!(
@@ -522,6 +524,33 @@ struct RunResult {
     deferred_stub_db: u64,
 }
 
+/// RAII guard for an armed `DR0` execution breakpoint used by the deferred
+/// `#DB` test modes; always disarms `DR7`/`DR0`/`DR6` on drop.
+struct Dr0Guard(bool);
+
+impl Dr0Guard {
+    fn arm(target: Option<u64>) -> Self {
+        if let Some(addr) = target {
+            arch::write_dr6(0);
+            arch::write_dr0(addr);
+            arch::write_dr7(0x0000_0001); // L0 = 1, execute breakpoint (RW0=00, LEN0=00)
+            Self(true)
+        } else {
+            Self(false)
+        }
+    }
+}
+
+impl Drop for Dr0Guard {
+    fn drop(&mut self) {
+        if self.0 {
+            arch::write_dr7(0);
+            arch::write_dr0(0);
+            arch::write_dr6(0);
+        }
+    }
+}
+
 /// Run raw x86-64 user machine code `code` (with optional `data` mapped at
 /// `TEST_DATA_VA`) in ring 3 inside a fresh temporary address space.
 ///
@@ -551,19 +580,11 @@ fn run_ring3_program(code: &[u8], data: &[u8], dr0_target: Option<u64>) -> Resul
     let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
     let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
     space.activate();
-    if let Some(addr) = dr0_target {
-        arch::write_dr6(0);
-        arch::write_dr0(addr);
-        arch::write_dr7(0x0000_0001); // L0 = 1, execute breakpoint (RW0=00, LEN0=00)
-    }
+    let _dr0 = Dr0Guard::arm(dr0_target);
     // SAFETY: `space` maps `TEST_CODE_VA` (USER_RX), `TEST_STACK_VA` (USER_RW),
     // and the full kernel upper half; `enter_ring3` checks interrupts/locks.
     unsafe { arch::syscall::enter_ring3(TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, 0x0202) };
-    if dr0_target.is_some() {
-        arch::write_dr7(0);
-        arch::write_dr0(0);
-        arch::write_dr6(0);
-    }
+    drop(_dr0);
     drop(space);
     let lstar_after = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
     let stub_after = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);

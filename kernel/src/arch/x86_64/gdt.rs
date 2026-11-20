@@ -107,8 +107,9 @@ pub(super) unsafe fn set_ist_stacks(cpu: usize, double_fault: u64, nmi: u64, mac
 ///
 /// # Safety
 /// Must be called on CPU `cpu` with interrupts disabled (or before `cpu`
-/// enters ring 3), and `rsp0` must be a valid 16-byte-aligned kernel stack
-/// top that remains mapped while ring 3 executes on `cpu`.
+/// enters ring 3). `rsp0` must be either a valid 16-byte-aligned kernel stack
+/// top that remains mapped while ring 3 executes on `cpu`, or `0` when no
+/// ring-3 context is active.
 pub unsafe fn set_rsp0(cpu: usize, rsp0: u64) {
     let tss = tss(cpu);
     // SAFETY: upheld by the caller; `TSS_SEGMENTS[cpu]` is owned by `cpu`.
