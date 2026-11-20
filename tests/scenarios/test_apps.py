@@ -628,26 +628,32 @@ def test_clock_golden(boot, artifacts, golden_dir):
     )
 
 
+def date_time(m) -> str:
+    """`date`'s time of day (`HH:MM:SS`, UTC)."""
+    found = re.fullmatch(r"date: \d{4}-\d\d-\d\d (\d\d:\d\d:\d\d) UTC\n", run(m, "date"))
+    assert found, "date's format"
+    return found[1]
+
+
 def test_clock_tree_matches_rtc(boot):
-    # The clock's `Time` label shows `date`'s time: polled until the hour
-    # and minute agree (as the taskbar clock's test does; the clock reads
-    # the RTC four times a second). It goes on (its value changes as the
-    # seconds pass), yet the desktop settles between its ticks (its waits
-    # aren't animating). Its close ends it with 0. Arguments it doesn't
-    # take end it with 2, an ERROR saying what was wrong.
+    # The clock's `Time` label shows `date`'s time to the second: `date`,
+    # the label, then `date` again, polled until the label equals one of
+    # the two (the clock reads the RTC four times a second, so on some
+    # poll it has the second `date` saw; whole strings, so midnight is
+    # no different). It goes on (its value changes as the seconds pass),
+    # yet the desktop settles between its ticks (its waits aren't
+    # animating). Its close ends it with 0. Arguments it doesn't take end
+    # it with 2, an ERROR saying what was wrong.
     m = boot_desktop(boot)
     app_id, mark = start(m, "clock")
     wid, _ = clock_tree(m)
 
-    def date_and_label() -> tuple[str, str]:
-        found = re.fullmatch(r"date: \d{4}-\d\d-\d\d (\d\d:\d\d:\d\d) UTC\n", run(m, "date"))
-        assert found, "date's format"
-        return found[1], clock_time(m, wid)
+    def around() -> tuple[str, str, str]:
+        before = date_time(m)
+        label = clock_time(m, wid)
+        return before, label, date_time(m)
 
-    agreed = gui.wait_for(
-        m, "the clock showing date's minute", date_and_label, lambda dl: dl[0][:5] == dl[1][:5]
-    )
-    assert re.fullmatch(r"\d\d:\d\d:\d\d", agreed[1]), agreed
+    gui.wait_for(m, "the clock showing date's time", around, lambda r: r[1] in (r[0], r[2]))
     first = clock_time(m, wid)
     gui.wait_ui(
         m, "the clock's next second", lambda r: gui.node(r, "label", "Time")["value"] != first, wid
