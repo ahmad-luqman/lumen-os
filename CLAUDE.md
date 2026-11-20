@@ -518,6 +518,13 @@ own PR that updates that doc first.
   worst trees against `TREE_COPIES_BYTES`, counting allocators).
 - `crates/lumen-calc`: the calculator app's logic (#207): keys in, the
   display out, left to right in exact decimal fixed point (host-tested).
+- `crates/lumen-clock`: the clock app's logic (#200): `TimeOfDay` (from
+  Unix seconds, `--at`'s `H[H]:MM[:SS]`, `HH:MM:SS` shown), an integer sine
+  table in half-degree steps (no floats), `Hands`, `point` and `line`
+  (Bresenham) on the face; `face::Face`, the clock's window as a
+  `lumen_ui::App` (its drawing and its hands' boxes as damage, checked
+  against full repaints); `args` (`run clock`'s arguments); `rtc` (what it
+  shows while RTC reads fail, as the taskbar's clock) (host-tested).
 - `crates/lumen-view`: the image viewer app's logic (#204): an image at 1:1
   (`actual`, `Pan`) or fitted (`fitted`, `scale`: nearest neighbour), what
   it decodes (`admit`: the file's length, then the size and inflated bytes
@@ -539,7 +546,8 @@ own PR that updates that doc first.
   `build/apps/tests/`, skipping libraries (`lumen-app`, the SDK, #206;
   `testkit`); `template`, the app `make app NAME=` copies
   (`tools/new-app.sh`); `calculator` (#207, the first app on the SDK's
-  `ui::Toolkit`, lumen-ui inside the app); `viewer` (#204, bundled images
+  `ui::Toolkit`, lumen-ui inside the app); `clock` (#200, an analog face
+  on `run_until`, `--at` freezing it); `viewer` (#204, bundled images
   decoded inside the app by `lumen-png`, `apps/viewer/images/` made by
   `tools/viewer-images.py`); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;

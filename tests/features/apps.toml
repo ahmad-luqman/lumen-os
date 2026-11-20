@@ -162,6 +162,15 @@ tests = [
 ]
 
 [[feature]]
+name = "Clock (#200): a bundled app showing an analog face and the time as a label, read from the RTC and agreeing with `date` to the second, its seconds going on while the desktop settles between its ticks, what it draws following its label (only the moved hands' boxes repainted, leaving what a full repaint does a second at a time over twelve hours and after 1,500 jumps); a failing RTC kept, then blank, as the taskbar's clock; frozen with `--at` for good (no ticks at all), refusing arguments it doesn't take with an ERROR naming each; its window matching a golden"
+milestone = "M5"
+tests = [
+    "cargo:lumen-clock",
+    "scenario:test_apps::test_clock_golden",
+    "scenario:test_apps::test_clock_tree_matches_rtc",
+]
+
+[[feature]]
 name = "Image viewer (#204): a bundled app showing images built into it, decoded inside the app (a corrupt one, and one too costly to decode refused from its header, each an error shown in the view, its label and one INFO line, the app going on; an image it doesn't have refused with one ERROR before its window); the wallpaper at 1:1 equal to the PNG's pixels and panned by the arrow keys all four ways, or fitted to the view by nearest neighbour; the image list, Previous and Next through `ui invoke`, going round at both ends, the label and list following without taking the focus; settled once an image is shown, then spending no fuel; files too long, images empty, too big or too costly to decode refused from their length and header; its allocations, the costliest PNG it takes and the longest file included, fitting its fixed memory through its own allocator logic"
 milestone = "M5"
 tests = [
