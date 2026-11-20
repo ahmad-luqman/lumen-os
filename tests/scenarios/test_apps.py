@@ -16,6 +16,7 @@ line and its thread's join.
 """
 
 import re
+import time
 
 from lumen_harness import REPO_ROOT, gui, klog
 from lumen_harness.gui import parse_records, poll
@@ -109,7 +110,9 @@ def test_hello_wasm(boot):
     wait_unlisted(m, app_id)
     # `run` alone: its usage and the bundled apps (not the test apps).
     out = run(m, "run")
-    assert out == "usage: run [--without <grant>] <app> [args...]\napps: calculator template\n", out
+    assert (
+        out == "usage: run [--without <grant>] <app> [args...]\napps: calculator life template\n"
+    ), out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.
     app_id, mark = start(m, "hello exit 7")
@@ -1002,3 +1005,135 @@ def test_sdk_an_overrunning_tick_still_waits_a_period(boot):
     gui.close_window(m, "window")
     end_line(m, mark, "window", app_id, "exited with 0")
     assert tick_ended(m, mark) >= 4
+
+
+# -- Life (#202) ----------------------------------------------------------------
+
+# apps/life's usage (logged with a refusal).
+LIFE_USAGE = "usage: life [--stopped] [pattern]"
+
+
+def generation(rows: list[dict[str, str]]) -> int:
+    return int(gui.node(rows, "label", "Generation")["value"])
+
+
+def life_state(rows: list[dict[str, str]]) -> str:
+    return gui.node(rows, "label", "State")["value"]
+
+
+def life_tree(m) -> tuple[str, list[dict[str, str]]]:
+    return wait_tree(m, "Life", "Generation")
+
+
+def launch_item(m, item: str) -> None:
+    """Choose launcher item `item` through `ui invoke`: the menu's `press`
+    unfolds it, its item's `press` launches it (and folds the menu, so the
+    item's node is gone after)."""
+    launcher = gui.node(gui.taskbar(m), "menu", "Launcher")
+    unfolded = gui.invoke(m, launcher["id"], "press")
+    assert unfolded.row is not None and unfolded.row["state"] == "expanded", unfolded
+    entry = gui.node(gui.taskbar(m), "menuitem", item)
+    got = gui.invoke(m, entry["id"], "press")
+    assert got.message == f"ui invoke: ran; node {entry['id']} is gone", got
+
+
+def test_life_golden(boot, artifacts, golden_dir):
+    # `run life --stopped`: no period, so the window settles. Acorn chosen
+    # in its list (a pattern starts it again at generation 0), then twelve
+    # presses of Step (each one generation: settled between them), against
+    # a golden of its client area. Then Start runs it (the generation grows
+    # while it animates) and Stop settles it again, the generation staying
+    # put. A pattern it doesn't know ends it with 2, the ERROR naming it.
+    m = boot_desktop(boot)
+    bad = r"ERROR app: life: no pattern 'nope'"
+    app_id, mark = start(m, "life nope", allow=bad)
+    wait_for_output(
+        m, mark, rf"ERROR app: life: no pattern 'nope' \(.*\) \({re.escape(LIFE_USAGE)}\)\n", 30
+    )
+    end_line(m, mark, "life", app_id, "exited with 2")
+    # (Its ERROR may come after `run`'s prompt: the next command reads it.)
+    app_id, mark = start(m, "life --stopped", allow=bad)
+    wid, rows = life_tree(m)
+    assert (life_state(rows), generation(rows)) == ("stopped", 0), rows
+    assert gui.node(rows, "label", "Pattern")["value"] == "gun"
+    acorn = gui.node(rows, "listitem", "acorn")
+    chosen = gui.invoke(m, acorn["id"], "select")
+    assert chosen.row is not None or chosen.still_running, chosen
+    gui.wait_settled(m)
+    rows = below_root(gui.ui_tree(m, wid))
+    assert gui.node(rows, "label", "Pattern")["value"] == "acorn"
+    assert gui.node(rows, "list", "Patterns")["value"] == "4", rows
+    gui.press_buttons(m, rows, *["Step"] * 12)
+    rows = below_root(gui.ui_tree(m, wid))
+    assert (life_state(rows), generation(rows)) == ("stopped", 12), rows
+    row = gui.window(m, "Life")
+    x0, y0, x1, y1 = gui.client_box(row)
+    shot = gui.settled_screendump(m, "life.png")
+    assert_matches_golden(
+        shot,
+        golden_dir / "app-life.png",
+        origin=(x0, y0),
+        size=(x1 - x0, y1 - y0),
+        artifacts=artifacts,
+    )
+    rows = gui.press_animated(m, rows, "Start", "running", lambda r: generation(r) > 12, wid)
+    assert life_state(rows) == "running", rows
+    rows = gui.press_animated(m, rows, "Stop", "stopped", lambda r: life_state(r) == "stopped", wid)
+    gui.wait_settled(m)
+    stopped_at = generation(gui.ui_tree(m, wid))
+    gui.wait_settled(m)
+    assert generation(gui.ui_tree(m, wid)) == stopped_at
+    gui.close_window(m, "Life")
+    end_line(m, mark, "life", app_id, "exited with 0")
+
+
+def test_life_runs_unfocused_and_stops_when_closed(boot):
+    # The launcher's Life item starts the Life app (#202; it replaced the
+    # kernel's window), running the gun: its generation (the tree's value)
+    # grows while another window has the focus, and its waits are an
+    # animation's (the desktop never reads settled). Minimized, it presents
+    # nothing (its commits queue no damage) yet still steps. Its close ends
+    # it with 0, its thread joined, and the desktop settles again.
+    m = boot_desktop(boot)
+    mark = len(m.output)
+    launch_item(m, "Life")
+    listed = gui.wait_for(
+        m,
+        "apps listing life",
+        lambda: apps(m),
+        lambda rows: any(r["name"] == "life" for r in rows),
+        30,
+    )
+    record = gui.one(listed, "life apps", name="life")
+    app_id = int(record["id"])
+    wid, rows = life_tree(m)
+    assert (life_state(rows), gui.node(rows, "label", "Pattern")["value"]) == ("running", "gun")
+    colours = gui.node(gui.ui_tree(m), "window", "Colours")
+    assert gui.invoke(m, colours["id"], "focus").row is not None
+    gui.wait_for(m, "Life unfocused", lambda: gui.window(m, "Life")["focused"], lambda f: f == "no")
+    seen = generation(gui.ui_tree(m, wid))
+    gui.wait_ui(m, "generations while unfocused", lambda r: generation(r) > seen + 2, wid, 30)
+    assert gui.window(m, "Life")["focused"] == "no"
+    for _ in range(5):
+        assert gui.desktop_status(m)["settled"] == "no"
+    # Minimized, it presents nothing (read again if something else
+    # presented: the minimize's own redraw, or the clock; Life presenting
+    # would show in every try), yet its generation still grows.
+    root = gui.node(gui.ui_tree(m), "window", "Life")
+    assert gui.invoke(m, root["id"], "minimize", animating=True).row is not None
+    tries = []
+    for _ in range(3):
+        before = gui.desktop_status(m)
+        time.sleep(0.5)
+        after = gui.desktop_status(m)
+        tries.append((before["frames"], after["frames"]))
+        if after["frames"] == before["frames"]:
+            break
+    else:
+        raise AssertionError(f"presented while Life was minimized: {tries}")
+    seen = generation(gui.ui_tree(m, wid))
+    gui.wait_ui(m, "generations while minimized", lambda r: generation(r) > seen, wid, 30)
+    gui.close_window(m, "Life")
+    end_line(m, mark, "life", app_id, "exited with 0")
+    wait_gone(m, app_id, record["thread"])
+    gui.wait_settled(m)
