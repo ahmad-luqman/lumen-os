@@ -104,7 +104,7 @@ impl EditorApp {
         let area = ui.text_area(None, "Text", prefix(ed.text(), TEXT_BYTES), w, h);
         let status = ui.fixed_label(None, "Status", "", w);
         // Inside the border, less the margin above and below.
-        let rows = ((h.saturating_sub(2) as i32 - 2 * TEXT_PAD).max(0) as u32 / line.max(1)).max(1) as usize;
+        let rows = (h.saturating_sub(2 + 2 * TEXT_PAD as u32) / line.max(1)).max(1) as usize;
         let mut app = EditorApp {
             ui,
             area,
@@ -203,6 +203,10 @@ impl EditorApp {
     /// Mark what `change` changed to repaint (`old_cursor`: where the
     /// cursor was drawn), scroll to the cursor, and update the tree.
     fn changed(&mut self, change: Change, old_cursor: Option<Rect>) {
+        // The tree's value follows the text: after an edit, and after a
+        // `set_value` the editor took in differently (its control
+        // characters but `\n` dropped) or not at all (the same text).
+        self.ui.set_text(self.area, prefix(self.ed.text(), TEXT_BYTES));
         // A key keeps the cursor solid through the next tick.
         self.keyed = true;
         let was_on = self.cursor_on;
@@ -231,7 +235,6 @@ impl EditorApp {
             Change::From(l) => self.damage_from(l),
             Change::None | Change::Refused => {}
         }
-        self.ui.set_text(self.area, prefix(self.ed.text(), TEXT_BYTES));
         self.show_status();
     }
 
@@ -320,9 +323,6 @@ impl App for EditorApp {
                 let text = String::from(self.ui.text(self.area).unwrap_or(""));
                 let change = self.ed.replace_all(&text);
                 self.changed(change, old_cursor);
-                // A text the editor took in differently (its control
-                // characters but `\n` dropped) shows as it holds it.
-                self.ui.set_text(self.area, prefix(self.ed.text(), TEXT_BYTES));
             }
         }
         Then::Carry
