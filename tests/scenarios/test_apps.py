@@ -110,7 +110,8 @@ def test_hello_wasm(boot):
     # `run` alone: its usage and the bundled apps (not the test apps).
     out = run(m, "run")
     assert (
-        out == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock editor template\n"
+        out
+        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock editor template\n"
     ), out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.
