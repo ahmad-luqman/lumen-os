@@ -185,8 +185,10 @@ pub fn needs_input(ctx: &mut Ctx<'_>, name: &str) {
     ));
 }
 
+/// `line` run on a console that captures what it writes, `keys` waiting:
+/// what it wrote, whether it ran out of keys, and the keys left.
 #[cfg(feature = "ktest")]
-fn run_line(line: &str, keys: &[Key]) -> (String, bool, usize) {
+pub(super) fn run_line(line: &str, keys: &[Key]) -> (String, bool, usize) {
     let mut console = super::Captured::default();
     console.keys.extend(keys.iter().copied());
     let history = lumen_shell::History::new(0);
@@ -353,7 +355,7 @@ crate::ktest!(
         let cases = [
             ("seq x | count", "usage: seq <n> (up to 10000)\n"),
             ("seq x | grep 1", "usage: seq <n> (up to 10000)\n"),
-            ("trace x | count", "usage: trace [n | runq [park <n>] | xray <cpu> [since]]\n"),
+            ("trace x | count", "usage: trace [n | runq [park <n> | spin <n> | spin stop] | xray <cpu> [since]]\n"),
             ("sleep x | count", "usage: sleep <ms> (up to 60000)\n"),
             ("top 0 | count", "usage: top [frames] (q or Ctrl-C quits)\n"),
             ("cpus x | where busy > 5", "usage: cpus\n"),

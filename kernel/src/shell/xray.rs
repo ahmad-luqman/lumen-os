@@ -18,25 +18,45 @@
 //!   are read, then interrupts come back on and the threads run and
 //!   finish. A count of what is queued that nothing moves under it, for
 //!   `test_xray`.
+//! - `trace runq spin <n>` / `trace runq spin stop`: `n` threads spinning
+//!   on the last CPU with a scheduler until stopped (interrupts on, so the
+//!   timer takes turns among them): a run queue that stays `n - 1` long,
+//!   apart from what else wakes there, for as long as a test needs to read
+//!   it (`test_xray::test_xray_matches_the_scheduler` and
+//!   `test_xray_pause_stops_its_reads`). One set in the slot at a time.
 
 use alloc::collections::TryReserveError;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use lumen_trace::kind::{RunQueue, RunQueueOp};
 use lumen_trace::{Event, Missing, Stream};
 
 use super::Ctx;
+use crate::sync::SpinLock;
 use crate::trace::{self, ReadError};
 use crate::{arch, sched, time};
 
-/// The most threads `trace runq park` queues.
-const MAX_PARKED: usize = 16;
+/// The most threads `trace runq park` queues or `trace runq spin` spins.
+const MAX_THREADS: usize = 16;
 /// How long `park` holds its CPU at least, past the spawns: two timer
 /// ticks, so a hold that didn't hold (interrupts on after all) would see a
 /// tick and say so. A floor on the hold, not a bound on anything.
 const HOLD_AT_LEAST_NS: u64 = 2_000_000;
+
+/// `trace runq spin`'s threads while they spin: their CPU, the flag that
+/// stops them, and their handles.
+struct Spinning {
+    cpu: usize,
+    stop: Arc<AtomicBool>,
+    threads: Vec<sched::JoinHandle>,
+}
+
+/// The one set of spinning threads, if any.
+static SPINNING: SpinLock<Option<Spinning>> = SpinLock::new(None);
 
 /// A buffer for one read of a whole ring, or why there is none (a 224 KiB
 /// allocation: refused rather than aborting the kernel).
@@ -47,9 +67,9 @@ fn ring_buffer() -> Result<Vec<Event>, TryReserveError> {
     Ok(out)
 }
 
-/// `trace runq [park <n>]`.
+/// `trace runq [park <n> | spin <n> | spin stop]`.
 pub fn runq(ctx: &mut Ctx<'_>, args: &[String]) {
-    const USAGE: &str = "usage: trace runq [park <n>]";
+    const USAGE: &str = "usage: trace runq [park <n> | spin <n> | spin stop]";
     match args {
         [] => {
             let mut t = String::from("runq: each run queue's length, by its X-ray ring and by the scheduler\n");
@@ -63,8 +83,13 @@ pub fn runq(ctx: &mut Ctx<'_>, args: &[String]) {
             }
         }
         [park, n] if park == "park" => match n.parse() {
-            Ok(n) if (1..=MAX_PARKED).contains(&n) => self::park(ctx, n),
-            _ => ctx.fail(format_args!("{USAGE} (1 to {MAX_PARKED} threads)")),
+            Ok(n) if (1..=MAX_THREADS).contains(&n) => self::park(ctx, n),
+            _ => ctx.fail(format_args!("{USAGE} (1 to {MAX_THREADS} threads)")),
+        },
+        [spin, stop] if spin == "spin" && stop == "stop" => spin_stop(ctx),
+        [spin, n] if spin == "spin" => match n.parse() {
+            Ok(n) if (1..=MAX_THREADS).contains(&n) => self::spin(ctx, n),
+            _ => ctx.fail(format_args!("{USAGE} (1 to {MAX_THREADS} threads)")),
         },
         _ => ctx.fail(USAGE),
     }
@@ -176,6 +201,67 @@ fn park(ctx: &mut Ctx<'_>, n: usize) {
     }
 }
 
+/// `trace runq spin <n>`: `n` threads spinning on the last CPU with a
+/// scheduler until `trace runq spin stop`.
+fn spin(ctx: &mut Ctx<'_>, n: usize) {
+    let cpu = crate::perf::last_cpu();
+    let stop = Arc::new(AtomicBool::new(false));
+    // Spawned under the slot's lock, as `perf burn` spawns under its own
+    // (nothing takes it under another lock): a second shell's spin waits,
+    // then finds the slot taken. Dropped before joining or printing.
+    let mut slot = SPINNING.lock();
+    if let Some(s) = slot.as_ref() {
+        let on = s.cpu;
+        drop(slot);
+        return ctx.fail(format_args!("runq spin: already spinning on cpu {on}"));
+    }
+    let mut threads = Vec::with_capacity(n);
+    let mut refused = None;
+    for _ in 0..n {
+        let flag = stop.clone();
+        match sched::spawn_on(cpu, "runq-spin", move || {
+            while !flag.load(Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }) {
+            Ok(h) => threads.push(h),
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = refused {
+        drop(slot);
+        stop.store(true, Ordering::Relaxed);
+        for h in threads {
+            h.join();
+        }
+        return ctx.fail(format_args!("runq spin: spawning failed: {e}"));
+    }
+    let mut t = alloc::format!("runq spin: {n} threads spinning on cpu {cpu}:");
+    for h in &threads {
+        let _ = write!(t, " {}", h.thread().id());
+    }
+    t.push('\n');
+    *slot = Some(Spinning { cpu, stop, threads });
+    drop(slot);
+    let _ = ctx.out.write_str(&t);
+}
+
+/// `trace runq spin stop`: the spinning threads told to stop, and joined.
+fn spin_stop(ctx: &mut Ctx<'_>) {
+    let Some(s) = SPINNING.lock().take() else {
+        return ctx.fail("runq spin: nothing is spinning");
+    };
+    s.stop.store(true, Ordering::Relaxed);
+    let n = s.threads.len();
+    for h in s.threads {
+        h.join();
+    }
+    let _ = writeln!(ctx.out, "runq spin: {n} threads stopped on cpu {}", s.cpu);
+}
+
 /// `<label> 1 2 3`, or `<label> none`, as a line.
 fn write_ids(t: &mut String, label: &str, ids: &[u64]) {
     t.push_str(label);
@@ -262,3 +348,39 @@ pub fn events(ctx: &mut Ctx<'_>, args: &[String]) {
     t.push('\n');
     let _ = ctx.out.write_str(&t);
 }
+
+crate::ktest!(
+    fn trace_runq_spin_keeps_one_set_and_joins_it() {
+        // `trace runq spin`'s contract, through the shell's own dispatch:
+        // one set at a time, its CPU named; stopped, its threads are
+        // joined (none of them left in `threads`); a stop with nothing
+        // spinning, and counts out of range, are refused. The spinners are
+        // stopped whatever the checks while they run say, so a failure
+        // here leaves no threads spinning for the tests after it.
+        use crate::{kassert, kassert_eq};
+        let run = |line: &str| super::pipe::run_line(line, &[]).0;
+        let usage =
+            alloc::format!("usage: trace runq [park <n> | spin <n> | spin stop] (1 to {MAX_THREADS} threads)\n");
+        for bad in ["trace runq spin 0", "trace runq spin 17", "trace runq spin x"] {
+            kassert_eq!(run(bad), usage);
+        }
+        kassert_eq!(run("trace runq spin stop").as_str(), "runq spin: nothing is spinning\n");
+        let cpu = crate::perf::last_cpu();
+        let started = run("trace runq spin 2");
+        let while_spinning = || -> crate::ktest::TestResult {
+            let head = alloc::format!("runq spin: 2 threads spinning on cpu {cpu}:");
+            kassert!(started.starts_with(&head));
+            kassert_eq!(started.split_whitespace().count(), head.split_whitespace().count() + 2);
+            kassert_eq!(run("trace runq spin 1"), alloc::format!("runq spin: already spinning on cpu {cpu}\n"));
+            Ok(())
+        };
+        let checked = while_spinning();
+        let stopped = run("trace runq spin stop");
+        checked?;
+        kassert_eq!(stopped, alloc::format!("runq spin: 2 threads stopped on cpu {cpu}\n"));
+        // Joined: their records are gone (no live `Arc` to upgrade).
+        kassert!(!sched::threads().iter().any(|t| t.name == "runq-spin"));
+        kassert_eq!(run("trace runq spin stop").as_str(), "runq spin: nothing is spinning\n");
+        Ok(())
+    }
+);

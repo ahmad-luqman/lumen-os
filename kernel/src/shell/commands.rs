@@ -38,7 +38,7 @@ pub static COMMANDS: Table<Run> = Table(&[
     Command {
         name: "trace",
         args: &[&["runq", "xray"]],
-        usage: "[n | runq [park <n>] | xray <cpu> [since]]",
+        usage: "[n | runq [park <n> | spin <n> | spin stop] | xray <cpu> [since]]",
         about: "this CPU's last n trace events (default 16), run queues by X-ray, a CPU's X-ray events",
         run: trace,
     },
@@ -442,7 +442,7 @@ fn trace(ctx: &mut Ctx<'_>, args: &[String]) {
     }
     let n = if args.is_empty() { Some(16) } else { number(args) };
     let Some(n) = n else {
-        return ctx.fail("usage: trace [n | runq [park <n>] | xray <cpu> [since]]");
+        return ctx.fail("usage: trace [n | runq [park <n> | spin <n> | spin stop] | xray <cpu> [since]]");
     };
     let out = &mut *ctx.out;
     let ring = crate::trace::ring();

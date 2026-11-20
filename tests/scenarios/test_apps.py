@@ -114,7 +114,7 @@ def test_hello_wasm(boot):
     out = run(m, "run")
     assert (
         out
-        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock comet editor life template viewer\n"
+        == "usage: run [--without <grant>] <app> [args...]\napps: calculator clock comet editor life template viewer xray\n"
     ), out
     assert "run: no app nope" in run(m, "run nope")
     # `exit(n)` is an ending like returning n.

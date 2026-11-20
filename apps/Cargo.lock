@@ -177,6 +177,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-xray"
+version = "0.0.1"
+dependencies = [
+ "lumen-trace",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,6 +372,16 @@ dependencies = [
  "lumen-app",
  "lumen-ui",
  "lumen-view",
+]
+
+[[package]]
+name = "xray"
+version = "0.0.1"
+dependencies = [
+ "lumen-app",
+ "lumen-trace",
+ "lumen-ui",
+ "lumen-xray",
 ]
 
 [[package]]

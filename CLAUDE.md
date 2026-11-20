@@ -172,7 +172,8 @@ own PR that updates that doc first.
   through `canvas`), their commands (`commands.rs`: each row carries its
   help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
   where busy > 50`), deliberate faults (`crash.rs`) and `trace runq`/`trace xray`
-  (`xray.rs`: run queues by X-ray and the scheduler, `park` holding the shell's CPU still). `fb.rs`:
+  (`xray.rs`: run queues by X-ray and the scheduler, `park` holding the shell's CPU still, `spin` keeping
+  threads spinning on the last CPU until stopped, #208). `fb.rs`:
   framebuffer pixels, the header (`draw_header`, again when the desktop is left) and the crash screen. `term.rs`: the
   terminals on the framebuffer (four virtual ones, one shown: log lines on the first, the screen shells, scrollback, `view_text`, and
   `Canvas`: the pixels below the header for one command, the terminals paused meanwhile;
@@ -555,6 +556,16 @@ own PR that updates that doc first.
   LFSR noise), ADSR envelopes, saturating mixing, the melody notation
   (`t=140 w=sine C4/8 r/8`), and `Source`s that fill interleaved 16-bit
   PCM buffers (host-tested).
+- `crates/lumen-xray`: the X-ray app's logic (#208): trace events read from
+  each CPU's main and X-ray rings into per-CPU state (`View`, `Cpu`:
+  `Presence` unread, online or offline; the run queue from the newest `runq`
+  event, the thread from the newest `switch`, counts known from a ring's
+  first read, numbers missed, odd events (undecodable, or a kind in the
+  wrong ring by `stream_of`), where each ring's next read starts; a ring's
+  backlog (its first read, after `resume`, after coming back online) giving
+  only the newest queue and thread) and the lanes'
+  columns (`Column`, `Span`: empty, counted, a backlog's gap, offline;
+  `COLUMNS`); `replay`, the fixed trace of the frozen view (host-tested).
 - `apps/`: the WASM apps (M5), their own cargo workspace (out of the root
   one; every directory but dot ones a member, named after its crate; output
   in `target-apps/`) for `wasm32-unknown-unknown`, `no_std`
@@ -568,7 +579,8 @@ own PR that updates that doc first.
   game on `run_until`, `--seed N --step` for tests); `editor` (#203, on `lumen-edit`); `life` (#202, Conway's Game of Life on
   `run_until`, lumen-demo's rules; the launcher's Life); `viewer` (#204, bundled images
   decoded inside the app by `lumen-png`, `apps/viewer/images/` made by
-  `tools/viewer-images.py`); the SDK's loops (`run_with`'s
+  `tools/viewer-images.py`); `xray` (#208, the trace rings
+  live, `--replay` frozen); the SDK's loops (`run_with`'s
   `Taken`, `run_until` for a `Ticking` app, both returning `Ended`;
   `Event::offer`; `with_area`, `palette`) for the animated apps; the
   layout, the SDK, the
