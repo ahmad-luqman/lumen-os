@@ -5070,6 +5070,24 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     (judged once, from the entries' end state, not per attempt). `create`,
     `mkdir` and `symlink` release the inode they allocated when linking it
     fails (e.g. `ENOSPC` growing the directory).
+  - **Rename over an existing target:** the target is held, not removed,
+    until the source has landed at its name. Its entry is taken out with
+    its `links_count` unchanged (`Dir::unlink` is handed one more than the
+    count it keeps), so its inode and data stay allocated; if linking the
+    source (or any later step before the move lands) fails, the entry is
+    put back with every count unchanged and the rename returns the error,
+    leaving the target as it was (POSIX). Once the move lands, the target
+    loses that link; if it was the last, its inode is freed through a
+    temporary entry `.lumen-rename-<ino>` in the target's directory (linked
+    and unlinked again, since `ext4plus` frees inodes only through
+    `Dir::unlink`; retried once while that entry survives) and an open
+    target is detached (Gate 6). A crash between taking the entry out and
+    the move landing leaves the target as an inode no entry points at
+    (`e2fsck` reattaches it in `lost+found`, data intact); one during the
+    free can leave the temporary entry. A free that fails inside `ext4plus`
+    leaves the inode for `e2fsck` (logged at `error`); the rename itself has
+    happened. Putting the entry back can only fail on a second fault; the
+    target then keeps its inode and data without an entry (logged).
   - **Names that aren't UTF-8:** VFS names are `&str`, so `readdir` skips an
     entry whose name isn't UTF-8 (logged once per directory); listing it
     lossily would give a name that doesn't round-trip, and `getcwd`, which

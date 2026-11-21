@@ -2588,6 +2588,7 @@ fn sweep_rename_dir_overwrite_io_recovery(base_img: &[u8], quota_before: usize) 
         let m = mount_test_ext4(snap.clone(), 23)?;
         let dst = resolve_path(&m.tables, None, b"/dst_d", rf).map_err(|_| "resolve dst_d")?.inode;
         let dst_orig_ino = dst.ino();
+        let src_ino = resolve_path(&m.tables, None, b"/src_d", rf).map_err(|_| "resolve src_d")?.inode.ino();
         let guard = OpenGuard::new(Arc::clone(&dst));
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/src_d", None, b"/dst_d", RenameFlags::default());
@@ -2609,6 +2610,11 @@ fn sweep_rename_dir_overwrite_io_recovery(base_img: &[u8], quota_before: usize) 
                         .map_err(|_| "retry ren dir")?;
                     kassert!(dst.is_detached());
                 } else {
+                    // The error came after the source landed: `/dst_d` is
+                    // the source now, never missing.
+                    let moved = resolve_path(&m.tables, None, b"/dst_d", rf).map_err(|_| "dst_d lost")?.inode;
+                    kassert_eq!(moved.ino(), src_ino);
+                    kassert!(matches!(resolve_path(&m.tables, None, b"/src_d", rf), Err(VfsError::NoEnt)));
                     kassert!(dst.is_detached());
                     kassert_ne_u64(dst.ino(), dst_orig_ino)?;
                     kassert_eq!(dst.stat().map_err(|_| "stat dst detached")?.nlink, 0);
@@ -2721,6 +2727,7 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
         let m = mount_test_ext4(snap_sym.clone(), 27)?;
         let sym = resolve_path(&m.tables, None, b"/sym_i", rf).map_err(|_| "resolve sym_i ren")?.inode;
         let sym_orig_ino = sym.ino();
+        let src_ino = resolve_path(&m.tables, None, b"/sym_s", rf).map_err(|_| "resolve sym_s ren")?.inode.ino();
         let guard = OpenGuard::new(Arc::clone(&sym));
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/sym_s", None, b"/sym_i", RenameFlags::default());
@@ -2741,6 +2748,9 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
                         .map_err(|_| "retry sym rename")?;
                     kassert!(sym.is_detached());
                 } else {
+                    // The error came after the source landed.
+                    let moved = resolve_path(&m.tables, None, b"/sym_i", rf).map_err(|_| "sym_i lost")?.inode;
+                    kassert_eq!(moved.ino(), src_ino);
                     kassert!(sym.is_detached());
                     kassert_eq!(sym.stat().map_err(|_| "sym ren detached")?.nlink, 0);
                     kassert!(m.fs.lookup_live_by_lock_id(sym.lock_id()).is_none());
@@ -4560,7 +4570,6 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
     drop(m);
 
     for &pinned_dd in &[false, true] {
-        let mut saw_step1_notfound = false;
         for fail_at in 1..=ov_writes {
             let m = mount_test_ext4(snap_ov.clone(), 93)?;
             let pinned = if pinned_dd {
@@ -4577,9 +4586,9 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
 
             let dst_ok = resolve_path(&m.tables, None, b"/dd/dst", rf).is_ok();
             let src_ok = resolve_path(&m.tables, None, b"/sd/src", rf).is_ok();
-            if res.is_err() && !dst_ok && src_ok {
-                saw_step1_notfound = true;
-            }
+            // A failed rename leaves its target in place; one that went
+            // through leaves the source there: `/dd/dst` is never lost.
+            kassert!(dst_ok);
             if dst_ok {
                 unlink_at(&m.tables, None, b"/dd/dst", true).map_err(|_| "cleanup dd/dst r9")?;
             }
@@ -4600,7 +4609,6 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
             drop(m);
             kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
         }
-        kassert!(saw_step1_notfound);
     }
 
     // (3) zero_inline_symlink_before_unlink under From(1), Pair(2, 3), and From(2):

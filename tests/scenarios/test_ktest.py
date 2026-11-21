@@ -175,8 +175,9 @@ def test_in_kernel_tests_pass(boot):
 # injects the failure (fault-injecting block caches, a hard page limit, a
 # quota over-release, a non-UTF-8 name, a read-only feature bit). The fault
 # sweeps' families (link counts kept in memory after a failed undo, rename
-# undos left inconsistent, unlinks whose outcome can't be read back) depend
-# on how many writes `ext4plus` makes, so they're counted as present; every
+# undos left inconsistent, unlinks whose outcome can't be read back, renames'
+# replaced targets whose free failed) depend on how many writes `ext4plus`
+# makes, so they're counted as present; every
 # other line is counted exactly, and a line matching none of these fails.
 _DEV = r"DevId\(\d+\)"
 VFS_SWEEP_LINES = (
@@ -191,6 +192,12 @@ VFS_SWEEP_LINES = (
     (
         rf"ERROR vfs: ext4 {_DEV} inode \d+: unlink failed and neither its directory nor the inode reads back; "
         r"assuming the entry survived; run e2fsck"
+    ),
+    # A rename's replaced target whose free failed inside `ext4plus` (left
+    # for e2fsck; the rename itself went through).
+    (
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: freeing inode \d+, replaced by a rename, failed: \w+; "
+        r"run e2fsck"
     ),
 )
 VFS_EXACT_LINES = {
