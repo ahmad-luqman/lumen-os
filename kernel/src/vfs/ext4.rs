@@ -740,6 +740,66 @@ impl Ext4Inode {
         pages.evict_clean_oldest(max_evict)
     }
 
+    /// The file's bytes of page `page_idx` below `file_size`, read from disk
+    /// (Lock 6 and below): at most a page, fewer for the file's last page.
+    /// The caller holds Lock 4 (`file_size` is its `meta.size`) and Lock 5,
+    /// and the page starts below `file_size`.
+    fn read_disk_page(&self, page_idx: u64, file_size: u64) -> Result<Vec<u8>, VfsError> {
+        let page_base = page_idx * PAGE_SIZE as u64;
+        let valid = (file_size - page_base).min(PAGE_SIZE as u64) as usize;
+        let mut tmp = vec![0u8; valid];
+        let inner = self.shared.state.lock();
+        let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+        ext4_read_full(&inner.ext4, &disk, &mut tmp, page_base).map_err(map_ext4_err)?;
+        Ok(tmp)
+    }
+
+    /// A new page, not yet in the cache, holding page `page_idx` as on disk
+    /// and zero past `file_size`: the one fill of a missing page for
+    /// `read_at` and `mmap_page`. Same locks as [`Self::read_disk_page`].
+    fn load_page(&self, page_idx: u64, file_size: u64) -> Result<Arc<CachePage>, VfsError> {
+        let tmp = self.read_disk_page(page_idx, file_size)?;
+        let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
+        cp.write_bytes(0, &tmp);
+        Ok(cp)
+    }
+
+    /// This file's cached page `index`, filled when missing: `ext4`'s side of
+    /// [`page_cache::mmap_page`] (its contract). A hole in a detached file
+    /// (whose pages were all read in when it was detached) gets a zero page,
+    /// counted against the detached quota.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+    pub(super) fn mmap_page(&self, index: u64) -> Result<page_cache::MappedPage, VfsError> {
+        if self.inode_type != InodeType::File {
+            return Err(VfsError::NoDev);
+        }
+        if !self.is_detached() {
+            page_cache::maybe_reclaim_ext4_pages();
+        }
+        let meta = self.meta.lock();
+        let detached = self.is_detached();
+        if !detached && meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
+        let file_size = meta.size;
+        page_cache::mmap_page_offset(index, file_size)?;
+        let mut pages = self.pages.lock();
+        let page = match pages.get(index) {
+            Some(page) => Arc::clone(page),
+            None => {
+                let page = if detached {
+                    Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?)
+                } else {
+                    self.load_page(index, file_size)?
+                };
+                pages.insert_new(index, Arc::clone(&page))?;
+                page
+            }
+        };
+        page.touch();
+        Ok(page_cache::MappedPage { page, file_size })
+    }
+
     /// A failed truncate couldn't put back the tail bytes it zeroed on disk:
     /// the file reads zeros there once its cached page is evicted.
     fn log_tail_restore_failure(&self) {
@@ -3719,16 +3779,7 @@ impl VfsInode for Ext4Inode {
             } else if detached {
                 buf[done..done + chunk].fill(0);
             } else {
-                let page_base = page_idx * PAGE_SIZE as u64;
-                let valid = (meta.size - page_base).min(PAGE_SIZE as u64) as usize;
-                let mut tmp = vec![0u8; valid];
-                {
-                    let inner = self.shared.state.lock();
-                    let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                    ext4_read_full(&inner.ext4, &disk, &mut tmp, page_base).map_err(map_ext4_err)?;
-                }
-                let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
-                cp.write_bytes(0, &tmp);
+                let cp = self.load_page(page_idx, meta.size)?;
                 cp.read_bytes(in_page, &mut buf[done..done + chunk]);
                 pages.insert_new(page_idx, cp)?;
             }
@@ -3813,21 +3864,15 @@ impl VfsInode for Ext4Inode {
                 let cp = Arc::new(raw);
                 let page_base = page_idx * PAGE_SIZE as u64;
                 if !detached && chunk < PAGE_SIZE && page_base < old_size {
-                    let valid = (old_size - page_base).min(PAGE_SIZE as u64) as usize;
-                    let mut tmp = vec![0u8; valid];
-                    let read_res: Result<(), VfsError> = (|| {
-                        let inner = self.shared.state.lock();
-                        let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                        ext4_read_full(&inner.ext4, &disk, &mut tmp, page_base).map_err(map_ext4_err)?;
-                        Ok(())
-                    })();
-                    if let Err(err) = read_res {
-                        if done > 0 {
-                            break;
+                    match self.read_disk_page(page_idx, old_size) {
+                        Ok(tmp) => cp.write_bytes(0, &tmp),
+                        Err(err) => {
+                            if done > 0 {
+                                break;
+                            }
+                            return Err(err);
                         }
-                        return Err(err);
                     }
-                    cp.write_bytes(0, &tmp);
                 }
                 cp.write_bytes(in_page, &buf[done..done + chunk]);
                 if !detached {
@@ -3884,6 +3929,11 @@ impl VfsInode for Ext4Inode {
         let mut meta = self.meta.lock();
         f(&mut meta.locks);
         Ok(())
+    }
+
+    /// For `vfs::mmap_page`.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 }
 
@@ -5009,6 +5059,102 @@ crate::ktest!(
         }
         crate::ktest::diag(format_args!("failed unlinks: {survived} kept the entry, {gone} removed it"));
         kassert!(survived >= 1 && gone >= 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mmap_page_hands_out_the_cached_page_filled_from_disk() {
+        // `vfs::mmap_page` on ext4: the page holding the file's bytes, read
+        // from disk when not cached; the same `Arc` again, and the one
+        // `read_at`/`write_at` use; pinned while held; `Range` past EOF and
+        // `NoDev` for a directory.
+        use self::ktest_util::*;
+        use crate::vfs::mmap_page;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 245)?;
+        let data = pattern(PAGE_SIZE + 1000, 3);
+        let f = m.root.create("map.bin", 0o644).map_err(|_| "create")?;
+        kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
+        f.sync(false).map_err(|_| "sync")?;
+        // A fresh mount of the disk: nothing cached, so the pages are filled
+        // from the disk.
+        let m2 = mount(image(&m)?, 246)?;
+        let g = m2.root.lookup("map.bin").map_err(|_| "lookup")?;
+        let e = g.as_any().and_then(|a| a.downcast_ref::<Ext4Inode>()).ok_or("not an ext4 inode")?;
+        kassert_eq!(e.pages.lock().len(), 0);
+        let first = mmap_page(&g, 0).map_err(|_| "map page 0")?;
+        kassert_eq!(first.file_size, data.len() as u64);
+        let mut got = [0u8; PAGE_SIZE];
+        first.page.read_bytes(0, &mut got);
+        kassert!(got[..] == data[..PAGE_SIZE]);
+        let last = mmap_page(&g, 1).map_err(|_| "map page 1")?;
+        last.page.read_bytes(0, &mut got);
+        kassert!(got[..1000] == data[PAGE_SIZE..]);
+        kassert!(got[1000..].iter().all(|&b| b == 0)); // past EOF: zero
+        kassert_eq!(e.pages.lock().len(), 2); // both cached
+        // The same page again, and the one the file's writes go to.
+        let again = mmap_page(&g, 0).map_err(|_| "map page 0 again")?;
+        kassert!(Arc::ptr_eq(&again.page, &first.page));
+        drop(again);
+        kassert_eq!(g.write_at(10, b"coherent").map_err(|_| "write_at")?, 8);
+        first.page.read_bytes(10, &mut got[..8]);
+        kassert!(&got[..8] == b"coherent");
+        // Held, a page is pinned: reclaim evicts the other (clean, unheld)
+        // one but not it.
+        g.sync(false).map_err(|_| "sync again")?;
+        drop(last);
+        e.reclaim_clean_pages(usize::MAX);
+        kassert_eq!(e.pages.lock().len(), 1);
+        kassert!(Arc::ptr_eq(&mmap_page(&g, 0).map_err(|_| "map pinned")?.page, &first.page));
+        // Past EOF there is no page; nor in a directory.
+        kassert_eq!(mmap_page(&g, 2).err(), Some(VfsError::Range));
+        kassert_eq!(mmap_page(&g, u64::MAX).err(), Some(VfsError::Range));
+        kassert_eq!(mmap_page(&m2.root, 0).err(), Some(VfsError::NoDev));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_shared_mapping_stores_reach_the_disk_after_the_last_unmap() {
+        // #266: a `MAP_SHARED` store sets nothing in the page; only the
+        // writable-mapping count keeps it dirty. Once the last writable
+        // mapping goes the page must still be dirty, so reclaim writes it
+        // back instead of dropping it as clean.
+        use self::ktest_util::*;
+        use crate::vfs::mmap_page;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 247)?;
+        let old = pattern(PAGE_SIZE, 11);
+        let f = m.root.create("shared.bin", 0o644).map_err(|_| "create")?;
+        kassert_eq!(f.write_at(0, &old).map_err(|_| "write")?, PAGE_SIZE);
+        f.sync(false).map_err(|_| "sync")?; // on disk, and the page clean
+        let mapped = mmap_page(&f, 0).map_err(|_| "map")?;
+        kassert!(!mapped.page.is_dirty());
+        // A write fault maps it writable (`set_dirty` and the count). A
+        // writeback while it is mapped clears `dirty`; then a store through
+        // the mapping, which only the CPU sees.
+        mapped.page.set_dirty();
+        mapped.page.inc_writable_maps();
+        f.sync(false).map_err(|_| "sync while mapped")?;
+        kassert_eq!(mapped.page.writable_maps(), 1);
+        let new = pattern(PAGE_SIZE, 97);
+        mapped.page.write_bytes(0, &new);
+        // `munmap`: the last writable mapping goes.
+        mapped.page.dec_writable_maps();
+        kassert_eq!(mapped.page.writable_maps(), 0);
+        let dirty_after_unmap = mapped.page.is_dirty();
+        drop(mapped);
+        // Reclaim: dirty pages written back, then clean unheld ones evicted,
+        // so what is read next comes from the disk. (Checked before the
+        // dirty bit, so losing the store shows as lost data.)
+        let e = f.as_any().and_then(|a| a.downcast_ref::<Ext4Inode>()).ok_or("not an ext4 inode")?;
+        e.reclaim_dirty_pages(usize::MAX);
+        kassert_eq!(e.pages.lock().len(), 0);
+        let ro = remount_ro(&m, 248)?;
+        kassert!(read_all(&ro.root_inode().lookup("shared.bin").map_err(|_| "ro lookup")?)? == new);
+        kassert!(read_all(&f)? == new); // read back from the disk
+        kassert!(dirty_after_unmap);
         Ok(())
     }
 );

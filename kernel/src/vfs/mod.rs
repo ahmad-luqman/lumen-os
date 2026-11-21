@@ -16,6 +16,9 @@ pub mod procfs;
 mod tests;
 pub mod tmpfs;
 
+#[allow(unused_imports)] // the file-backed VM's way in (#255); until then only ktests use it
+pub(crate) use page_cache::{MappedPage, mmap_page};
+
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;

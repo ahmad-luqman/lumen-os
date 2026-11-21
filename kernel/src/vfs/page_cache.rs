@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use lumen_mm::PhysFrame;
-use lumen_vfs::VfsError;
+use lumen_vfs::{VfsError, VfsInode};
 
 use crate::arch;
 use crate::mm;
@@ -233,7 +233,14 @@ impl CachePage {
     }
 
     /// Read bytes from `[off .. off + dst.len())` via raw HHDM pointer.
-    pub fn read_bytes(&self, off: usize, dst: &mut [u8]) {
+    ///
+    /// Lock 5 contract (as for [`write_bytes`](Self::write_bytes) and
+    /// [`zero_range`](Self::zero_range)): the caller holds the owning
+    /// inode's `PageCache` lock, or the page isn't published in a
+    /// `PageCache` yet. That is what keeps kernel readers and writers of a
+    /// page apart, so these stay inside `vfs`; code elsewhere copies a page
+    /// out with [`copy_to_frame`](Self::copy_to_frame).
+    pub(super) fn read_bytes(&self, off: usize, dst: &mut [u8]) {
         assert!(off.saturating_add(dst.len()) <= PAGE_SIZE);
         self.touch();
         if dst.is_empty() {
@@ -250,7 +257,8 @@ impl CachePage {
     }
 
     /// Write bytes into `[off .. off + src.len())` via raw HHDM pointer.
-    pub fn write_bytes(&self, off: usize, src: &[u8]) {
+    /// Lock 5 held by the caller, as for [`read_bytes`](Self::read_bytes).
+    pub(super) fn write_bytes(&self, off: usize, src: &[u8]) {
         assert!(off.saturating_add(src.len()) <= PAGE_SIZE);
         self.touch();
         if src.is_empty() {
@@ -266,8 +274,9 @@ impl CachePage {
         }
     }
 
-    /// Zero `[start .. end)` inside the 4 KiB frame.
-    pub fn zero_range(&self, start: usize, end: usize) {
+    /// Zero `[start .. end)` inside the 4 KiB frame. Lock 5 held by the
+    /// caller, as for [`read_bytes`](Self::read_bytes).
+    pub(super) fn zero_range(&self, start: usize, end: usize) {
         assert!(start <= end && end <= PAGE_SIZE);
         if start == end {
             return;
@@ -310,11 +319,111 @@ impl CachePage {
         self.writable_maps.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// One `PRESENT | WRITABLE | PTE_SHARED` mapping of this page is gone.
+    ///
+    /// The page is marked dirty first (#266): stores made through the
+    /// mapping never set `dirty` themselves (only the count kept the page
+    /// dirty while it was mapped), so the last unmap must leave `dirty` set,
+    /// or those stores look clean and reclaim drops them unwritten. Setting
+    /// it before the decrement, on every call, leaves no instant where the
+    /// count is 0 and `dirty` still false; while other writable mappings
+    /// remain, the page is dirty through the count anyway.
     #[allow(dead_code)]
     #[inline]
     pub fn dec_writable_maps(&self) {
+        self.dirty.store(true, Ordering::Release);
         let prev = self.writable_maps.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(prev > 0, "writable_maps underflow");
+    }
+
+    /// Copy the page's first `valid` bytes into `dst` and zero the rest of
+    /// `dst`: a `MAP_PRIVATE` copy-on-write split, where `valid` is what
+    /// lies below the file's size (`PAGE_SIZE` for a page wholly inside it).
+    ///
+    /// Unlike the byte accessors this needs no Lock 5, and is the one way to
+    /// a page's bytes from outside `vfs`: the page-fault path may not take
+    /// the `PageCache` lock. A kernel `write_at` or a `MAP_SHARED` store
+    /// racing the copy leaves some mix of old and new bytes in `dst`, as on
+    /// Linux (see the module's comment); nothing else can go wrong, since
+    /// the caller owns `dst`.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
+    pub(crate) fn copy_to_frame(&self, dst: &mut OwnedFrame, valid: usize) {
+        let valid = valid.min(PAGE_SIZE);
+        let dst_ptr = mm::phys_to_virt(dst.frame().start()).as_mut_ptr::<u8>();
+        // SAFETY: both frames are allocated 4 KiB RAM frames mapped RW through
+        // the HHDM and alive for the borrows; they are distinct (`dst` is the
+        // caller's, `self.frame` this page's), so the ranges don't overlap,
+        // and `valid <= PAGE_SIZE`. `&mut OwnedFrame` means nothing else uses
+        // `dst`'s frame.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.hhdm_ptr(), dst_ptr, valid);
+            core::ptr::write_bytes(dst_ptr.add(valid), 0, PAGE_SIZE - valid);
+        }
+        self.touch();
+    }
+}
+
+/// A file's cached page handed out for a mapping by [`mmap_page`].
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+pub(crate) struct MappedPage {
+    /// The inode's cached page itself (not a copy). Holding this `Arc` pins
+    /// it: reclaim evicts only pages whose strong count is 1.
+    pub page: Arc<CachePage>,
+    /// The file's size when the page was looked up (under the inode's Lock
+    /// 4). The page starts below it; the page's bytes past it are zero
+    /// unless a mapping stored there.
+    pub file_size: u64,
+}
+
+/// The cached page at `index` (file offset `index * 4096`) of a regular
+/// `ext4` or `tmpfs` file, for mapping into an address space: the same
+/// `Arc<CachePage>` that `read_at`/`write_at` use, so a mapping and the
+/// file's reads and writes stay coherent. Another call for the same page
+/// returns the same `Arc` while the page stays cached (which holding it
+/// guarantees, short of a truncate dropping it).
+///
+/// - **Filling:** a page not cached yet is read from disk (`ext4`, by the
+///   same code as `read_at`), or a zero page is allocated (a `tmpfs` hole,
+///   or a hole in a detached `ext4` file), and inserted. Unlike `read_at`, a
+///   hole costs a frame, so the `tmpfs` (or detached) quota can refuse it
+///   with `NoSpc`. `NoMem` when no frame is free, `Io` when the disk read
+///   fails.
+/// - **EOF:** `Range` when the page starts at or past the file's size
+///   (`index * 4096 >= file_size`, or the product overflows): there is no
+///   page to map, and the fault path raises `SIGBUS`. The page holding the
+///   end of the file is returned; its bytes past `file_size` are zero.
+/// - **Other inodes:** `NoDev` for anything but a regular file of `ext4`
+///   or `tmpfs` (directories, symlinks, `devfs`, `procfs`). `NoEnt` for an
+///   `ext4` inode unlinked and not open, as `read_at` says.
+/// - **Locking:** takes the inode's Lock 4 then Lock 5 (and Lock 6 and
+///   below to read the disk), after an `ext4` soft-limit reclaim run with
+///   none of them held, as `read_at` does. The caller may hold Lock 1
+///   (`AddressSpace::inner`) or Lock 2, nothing numbered 3 or higher, and
+///   no `SpinLock`.
+///
+/// It doesn't mark the page dirty or count a writable mapping: the caller
+/// does both (`set_dirty`, `inc_writable_maps`) when it maps the page
+/// writable.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+pub(crate) fn mmap_page(inode: &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError> {
+    let any = inode.as_any().ok_or(VfsError::NoDev)?;
+    if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
+        return ext4.mmap_page(index);
+    }
+    if let Some(tmpfs) = any.downcast_ref::<super::tmpfs::TmpfsInode>() {
+        return tmpfs.mmap_page(index);
+    }
+    Err(VfsError::NoDev)
+}
+
+/// Where page `index` starts, or `Range` when that is at or past
+/// `file_size` (or past any file): [`mmap_page`]'s EOF rule, for each
+/// filesystem's side of it.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+pub(super) fn mmap_page_offset(index: u64, file_size: u64) -> Result<u64, VfsError> {
+    match index.checked_mul(PAGE_SIZE as u64) {
+        Some(off) if off < file_size => Ok(off),
+        _ => Err(VfsError::Range),
     }
 }
 
@@ -592,6 +701,52 @@ crate::ktest!(
         kassert!(Arc::ptr_eq(pc.get(7).ok_or("page")?, &first)); // the dirty page kept
         drop(pc);
         kassert_eq!(ext4_cached_pages(), before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn mmap_page_refuses_inodes_of_other_filesystems() {
+        // Only ext4's and tmpfs's regular files have pages to map: a devfs
+        // device and a procfs file (a regular file, but not cached) don't.
+        use crate::kassert_eq;
+        use lumen_vfs::{DevId, FileSystem, InodeType};
+        let devfs = super::devfs::Devfs::new(DevId::makedev(0, 126));
+        let zero = devfs.root_inode().lookup("zero").map_err(|_| "lookup zero")?;
+        kassert_eq!(mmap_page(&zero, 0).err(), Some(VfsError::NoDev));
+        let procfs = super::procfs::Procfs::new(DevId::makedev(0, 127));
+        let version = procfs.root_inode().lookup("version").map_err(|_| "lookup version")?;
+        kassert_eq!(version.inode_type(), InodeType::File);
+        kassert_eq!(mmap_page(&version, 0).err(), Some(VfsError::NoDev));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn cache_page_copies_to_a_frame_zeroing_past_valid() {
+        // `copy_to_frame` (a copy-on-write split): the page's first `valid`
+        // bytes, zeros after them, whatever the frame held before.
+        use crate::kassert;
+        let page = CachePage::new_zeroed().ok_or("frame")?;
+        let bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        page.write_bytes(0, &bytes);
+        let mut dst = frame::alloc_owned().ok_or("dst frame")?;
+        let dst_ptr = mm::phys_to_virt(dst.frame().start()).as_mut_ptr::<u8>();
+        let read_dst = |out: &mut [u8; PAGE_SIZE]| {
+            // SAFETY: `dst` is an allocated frame this test owns, mapped
+            // through the HHDM; no reference to it is live while copying.
+            unsafe { core::ptr::copy_nonoverlapping(dst_ptr, out.as_mut_ptr(), PAGE_SIZE) };
+        };
+        // SAFETY: as above; filling it with junk first.
+        unsafe { core::ptr::write_bytes(dst_ptr, 0xa5, PAGE_SIZE) };
+        page.copy_to_frame(&mut dst, 1000);
+        let mut got = [0u8; PAGE_SIZE];
+        read_dst(&mut got);
+        kassert!(got[..1000] == bytes[..1000]);
+        kassert!(got[1000..].iter().all(|&b| b == 0));
+        page.copy_to_frame(&mut dst, PAGE_SIZE);
+        read_dst(&mut got);
+        kassert!(got[..] == bytes[..]);
         Ok(())
     }
 );

@@ -79,3 +79,14 @@ tests = [
     "ktest:lumen_kernel::vfs::procfs::procfs_per_process_nodes_are_never_cached",
     "cargo:lumen-vfs",
 ]
+
+[[feature]]
+name = "Page-cache pages for mmap (#255): vfs::mmap_page hands out an ext4 or tmpfs file's own cached page (read from disk, or a zero page for a hole; the same page again; Range past EOF, NoDev for other filesystems), CachePage::copy_to_frame for copy-on-write, and the last writable unmap leaving the page dirty so its stores reach the disk (#266)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_mmap_page_hands_out_the_cached_page_filled_from_disk",
+    "ktest:lumen_kernel::vfs::ext4::ext4_shared_mapping_stores_reach_the_disk_after_the_last_unmap",
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_mmap_page_hands_out_the_cached_page",
+    "ktest:lumen_kernel::vfs::page_cache::mmap_page_refuses_inodes_of_other_filesystems",
+    "ktest:lumen_kernel::vfs::page_cache::cache_page_copies_to_a_frame_zeroing_past_valid",
+]

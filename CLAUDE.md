@@ -346,7 +346,11 @@ one is its own PR that updates that doc first.
   in-memory block device those files' ktests use too, stays in `mod.rs`);
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
-  64 MiB hard cap, `QuotaCounter`, the detached-inode quota); `vfs/ext4.rs`
+  64 MiB hard cap, `QuotaCounter`, the detached-inode quota; `mmap_page`,
+  re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
+  for a mapping, through `VfsInode::as_any`, and `CachePage::copy_to_frame`
+  for copy-on-write, #255; the last writable unmap leaving a page dirty,
+  #266); `vfs/ext4.rs`
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, the

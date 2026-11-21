@@ -4970,6 +4970,50 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
     `PageCache`, zeroes `[old_size % 4096 .. 4096)` before exposing the new
     size so stale past-EOF `MAP_SHARED` stores never leak into extended regions.
+- **Pages for `mmap` (built in #255's first part):** the file-backed VM
+  takes a file's pages through one helper, `crate::vfs::mmap_page(inode:
+  &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError>`, where
+  `MappedPage { page: Arc<CachePage>, file_size: u64 }`. It returns the
+  inode's own cached page at `index` (offset `index * 4096`), the same
+  `Arc` `read_at`/`write_at` use (another call returns it again while it
+  stays cached), with the file's size read under the same Lock 4 hold.
+  Holding the `Arc` pins the page (reclaim evicts only `strong_count == 1`).
+  - *Filling:* a missing `ext4` page is read from disk by the same private
+    fill as `read_at` (`Ext4Inode::load_page`); a hole in a `tmpfs` file (or
+    a detached `ext4` one) gets a zero page through the same
+    get-or-insert as `write_at` (`tmpfs::page_or_new`). Unlike `read_at`,
+    which reads a hole as zeros without a frame, a mapped hole costs a
+    frame: the `tmpfs` or detached quota can refuse it (`NoSpc`). Also
+    `NoMem` and `Io`.
+  - *EOF:* `Range` when `index * 4096 >= file_size` (or the product
+    overflows): no page is mapped there, and the fault path raises
+    `SIGBUS` (section 5). The page holding EOF is returned; its bytes past
+    `file_size` are zero unless a mapping stored there.
+  - *Other inodes:* `NoDev` for directories, symlinks, and every inode of
+    another filesystem (`devfs`, `procfs`); `NoEnt` for an `ext4` inode
+    unlinked and not open.
+  - *Locking:* an `ext4` soft-limit reclaim first, with no lock held, then
+    Lock 4 → Lock 5 (→ 6 → 7 → 8 to read the disk), as `read_at`. The
+    caller may hold Lock 1 (`AddressSpace::inner`) or Lock 2, nothing
+    numbered 3 or higher, and no `SpinLock`. It neither dirties the page nor
+    counts a mapping: a writable fault does both.
+  - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
+    Option<&dyn Any>`, a default trait method returning `None`, overridden
+    by `Ext4Inode` and `TmpfsInode` to return themselves; `mmap_page`
+    downcasts. A kernel-side registry was the alternative, but `tmpfs` has
+    none, an unlinked (detached) file isn't reachable by walking a tree,
+    and the `ext4` one costs a scan per fault.
+  - *Bytes:* `CachePage::read_bytes`, `write_bytes` and `zero_range` are
+    `pub(super)` (inside `vfs` only): the caller holds the page's Lock 5, or
+    the page isn't published yet. Outside `vfs`, a copy-on-write split
+    copies with `CachePage::copy_to_frame(&mut OwnedFrame, valid)` (the
+    first `valid` bytes, zeros after), which takes no lock: a racing store
+    leaves a mix of old and new bytes, as on Linux.
+  - *The last writable unmap (#266):* `dec_writable_maps` sets `dirty`
+    (before decrementing, so the page never looks clean in between). A
+    store through a `MAP_SHARED` mapping sets nothing in the page, and a
+    writeback while it is mapped clears `dirty`, so without this the page
+    looked clean once unmapped and reclaim dropped the stores unwritten.
 
 ### Writable `ext4` driver (`ext4plus =0.1.0-rc.2`, pinned in #248)
 
