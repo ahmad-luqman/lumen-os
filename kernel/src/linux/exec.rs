@@ -484,15 +484,24 @@ crate::ktest!(
         let file = tmp.create(NAME, 0o755).map_err(|_| "create")?;
         let written = file.write_at(0, &[0x5a; 64 * 1024]);
         drop(file);
+        // And one past the 16 MiB cap is EFBIG from its size, before any
+        // buffer is asked for.
+        const HUGE: &str = "lumen-ktest-huge";
+        let huge = tmp.create(HUGE, 0o755).map_err(|_| "create huge")?;
+        let grown = huge.truncate((16 << 20) + 1);
+        drop(huge);
         heap::refuse_from(32 * 1024);
         let refused = Exec::from_path("/tmp/lumen-ktest-big").map(|_| ());
+        let too_big = vfs::read_executable("/tmp/lumen-ktest-huge").map(|b| b.len());
         heap::refuse_from(usize::MAX);
         let read = vfs::read_executable("/tmp/lumen-ktest-big").map(|b| b.len());
-        let unlinked = tmp.unlink(NAME);
+        let unlinked = (tmp.unlink(NAME), tmp.unlink(HUGE));
         kassert_eq!(written, Ok(64 * 1024));
+        kassert_eq!(grown, Ok(()));
+        kassert_eq!(too_big, Err(VfsError::FBig));
         kassert_eq!(refused, Err(ExecError::Read { path: String::from("/tmp/lumen-ktest-big"), err: VfsError::NoMem }));
         kassert_eq!(read, Ok(64 * 1024));
-        kassert_eq!(unlinked, Ok(()));
+        kassert_eq!(unlinked, (Ok(()), Ok(())));
         Ok(())
     }
 );
