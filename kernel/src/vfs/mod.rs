@@ -105,15 +105,15 @@ fn build_minimal_ext4_image() -> Vec<u8> {
     write_u32le(sb, 0x20, IMAGE_BLOCKS as u32); // s_blocks_per_group
     write_u32le(sb, 0x24, IMAGE_BLOCKS as u32); // s_clusters_per_group
     write_u32le(sb, 0x28, INODES_PER_GROUP); // s_inodes_per_group
-    write_u16le(sb, 0x34, u16::MAX); // s_max_mnt_count
+    write_u16le(sb, 0x36, u16::MAX); // s_max_mnt_count
     write_u16le(sb, 0x38, 0xef53); // s_magic
     write_u16le(sb, 0x3a, 1); // s_state (clean)
     write_u16le(sb, 0x3c, 1); // s_errors (continue)
     write_u32le(sb, 0x4c, 1); // s_rev_level (EXT4_DYNAMIC_REV)
     write_u32le(sb, 0x54, RESERVED_INODES + 1); // s_first_ino (11)
     write_u16le(sb, 0x58, INODE_SIZE as u16); // s_inode_size
-    // Compat: EXT_ATTR (0x8) | RESIZE_INODE (0x10) | DIR_INDEX (0x20), ^has_journal.
-    write_u32le(sb, 0x5c, 0x38);
+    // Compat: EXT_ATTR (0x8) | DIR_INDEX (0x20), ^has_journal (omit RESIZE_INODE without inode 7).
+    write_u32le(sb, 0x5c, 0x28);
     // Incompat: FILETYPE (0x2) | EXTENTS (0x40) | 64BIT (0x80) | FLEX_BG (0x200), ^metadata_csum_seed.
     write_u32le(sb, 0x60, 0x2c2);
     // RO-compat: SPARSE_SUPER (0x1) | LARGE_FILE (0x2) | HUGE_FILE (0x8) | DIR_NLINK (0x20) | EXTRA_ISIZE (0x40),
@@ -198,18 +198,20 @@ struct SmokeStats {
 /// read/write/dir/extent codegen for `make audit`) and [`ext4_crate_smoke`].
 fn exercise_ext4_smoke() -> Result<SmokeStats, &'static str> {
     let image = build_minimal_ext4_image();
-    let ro_dev = MemExt4Device::new(image.clone());
-    let ro_fs = Ext4::load_with_writer(Box::new(ro_dev), None).map_err(|_| "ext4 load ro failed")?;
-    let ro_err = ro_fs.create_inode(InodeCreationOptions {
-        file_type: FileType::Regular,
-        mode: InodeMode::S_IFREG | InodeMode::S_IRUSR | InodeMode::S_IWUSR,
-        uid: 0,
-        gid: 0,
-        time: Duration::ZERO,
-        flags: InodeFlags::empty(),
-    });
-    if !matches!(ro_err, Err(Ext4Error::Readonly)) {
-        return Err("read-only mount did not return Ext4Error::Readonly");
+    {
+        let ro_dev = MemExt4Device::new(image.clone());
+        let ro_fs = Ext4::load_with_writer(Box::new(ro_dev), None).map_err(|_| "ext4 load ro failed")?;
+        let ro_err = ro_fs.create_inode(InodeCreationOptions {
+            file_type: FileType::Regular,
+            mode: InodeMode::S_IFREG | InodeMode::S_IRUSR | InodeMode::S_IWUSR,
+            uid: 0,
+            gid: 0,
+            time: Duration::ZERO,
+            flags: InodeFlags::empty(),
+        });
+        if !matches!(ro_err, Err(Ext4Error::Readonly)) {
+            return Err("read-only mount did not return Ext4Error::Readonly");
+        }
     }
 
     let dev = MemExt4Device::new(image);

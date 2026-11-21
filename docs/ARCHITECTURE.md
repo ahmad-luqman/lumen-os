@@ -4990,17 +4990,22 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
         `Arc<VfsInode>` drops!
 
 - **Adapter invariants required in #253 (`kernel/src/vfs/ext4.rs`):**
-  - **Symlink 60-byte bug & inline-symlink unlink workarounds:**
-    `Ext4::symlink` stores targets `<= 60` bytes inline while
-    `Inode::symlink_target` enforces `MAX_INLINE_SYMLINK_LEN = 59`; #253 MUST
+  - **Symlink 60-byte bug & inline-symlink readlink/unlink workarounds:**
+    `Ext4::symlink` (and Linux/`mke2fs`) stores inline symlink targets `<= 60`
+    bytes in `i_block` (`!EXTENTS && i_blocks == 0 && i_size <= 60`) while
+    `Inode::symlink_target` enforces `MAX_INLINE_SYMLINK_LEN = 59` (falling back
+    to `read_inode_file` -> `BlockMap` on 60-byte inline symlinks). #253 MUST
     route `target.len() <= 59` to `Ext4::symlink` and `target.len() >= 60` to
     block symlinks via `create_inode(FileType::Symlink)` + `write_at` +
-    `Dir::link`. In addition, when unlinking the last link (`links_count == 1`)
-    of any inline symlink (`!EXTENTS`, `size <= 59`), `Ext4::delete_file`
-    calls `BlockMap::free_all()` on `i_block` and panics interpreting ASCII
-    target bytes as block numbers; #253 MUST zero `i_block` (`0x28..0x64`) and
-    `i_size` on disk (and re-read `Inode`) before `Dir::unlink` on inline
-    symlinks.
+    `Dir::link`, AND handle `!EXTENTS && i_blocks == 0 && i_size <= 60`
+    directly in `readlink` so pre-existing 60-byte `mke2fs`/Linux inline
+    symlinks in the Alpine minirootfs read cleanly. In addition, when unlinking
+    the last link (`links_count == 1`) of any inline symlink (`!EXTENTS &&
+    i_blocks == 0 && i_size <= 60`), `Ext4::delete_file` calls
+    `BlockMap::free_all()` on `i_block` and panics interpreting ASCII target
+    bytes as block numbers; because `Inode::set_inline_data` is `pub(crate)` in
+    `ext4plus`, #253 MUST zero `i_block` (`0x28..0x64`) and `i_size` on disk via
+    `BlockCache` (and re-read `Inode`) before `Dir::unlink` on inline symlinks.
   - **Truncate partial-block tail zeroing:** `ext4plus::file::truncate` does
     not zero `[new_size % 4096 .. 4096)` in the partial final block on shrink;
     #253's `PageCache` / truncate path MUST enforce the tail-zeroing rule above.
@@ -5011,9 +5016,11 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     `links_count` to `1` before `Dir::unlink` and decrement the parent's
     `links_count`, and on cross-dir directory `rename` must update `..` in
     block 0 and adjust both parents' `links_count`.
-  - **Writable check:** `Superblock::read_only()` is `pub(crate)`; check
-    `!fs.superblock().features().incompatible().contains(IncompatibleFeatures::RECOVERY)`
-    plus `VIRTIO_BLK_F_RO` rather than calling a crate helper.
+  - **Writable check:** `Superblock::read_only()` is `pub(crate)`; check both
+    `IncompatibleFeatures::RECOVERY` and `ReadOnlyCompatibleFeatures`
+    (`BTREE_DIR | GROUP_DESCRIPTOR_CHECKSUMS | QUOTA | PROJECT_QUOTAS |
+    BIG_ALLOC`, plus unknown bits via `from_bits_truncate`) alongside
+    `VIRTIO_BLK_F_RO` rather than calling a crate helper.
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
