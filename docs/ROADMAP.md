@@ -49,9 +49,9 @@ decisions:
   user-thread FP/SSE save/restore functions, plus a unit test proving SIMD
   anywhere else still fails `audit:flags`; the rest of the kernel stays
   SSE-free). A feature counts as done only when its automated test passes in
-  CI—starting in M6, including upstream Linux conformance suites (`musl`
-  `libc-test`, gVisor syscall tests, and targeted LTP cases) run in Lumen's
-  QEMU harness.
+  CI—starting in M6 with Linux ABI scenarios, and from M8 onward including
+  upstream Linux conformance suites (`musl` `libc-test`, gVisor syscall tests,
+  and targeted LTP cases) run in Lumen's QEMU harness.
 
 ### Reference Rust OSes and license policy (Lumen is MIT)
 

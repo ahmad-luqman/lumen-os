@@ -803,13 +803,15 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - Any other present fault returns `FaultResult::Invalid`.
   - **`mprotect`, `munmap`, `ftruncate` invalidation, and `msync` with `PTE_SHARED`:**
     - `protect_user_range` operates **per leaf**: for every leaf with
-      `PTE_SHARED = 1`, if it was `(PRESENT && WRITABLE)` and is leaving that
-      state, it propagates `PTE_DIRTY` and calls `dec_writable_maps()`; when
-      `vma.prot.write()` is requested, `PTE_SHARED = 1` leaves keep
-      `WRITABLE = 0` (preserving CoW on `MAP_PRIVATE` and dirty tracking on
-      `MAP_SHARED`, except when staying `(PRESENT && WRITABLE)` on `MAP_SHARED`
-      without clearing `WRITABLE`), whereas already CoW-split `PTE_SHARED = 0`
-      leaves restore `WRITABLE = 1` directly.
+      `PTE_SHARED = 1`, it **always** writes `WRITABLE = 0` (uniformly for both
+      `MAP_PRIVATE` and `MAP_SHARED`, preserving CoW on `MAP_PRIVATE` and
+      write-fault dirty tracking on `MAP_SHARED` without ever wiping hardware
+      `PTE_DIRTY` silently), propagating `PTE_DIRTY` and calling
+      `dec_writable_maps()` whenever the prior leaf was `(PRESENT && WRITABLE)`.
+      When `prot` is non-`PROT_NONE` (including write-only `PROT_WRITE`),
+      clearing `WRITABLE = 0` keeps `PRESENT = 1` (never turning a writable
+      mapping into `PTE_PROTNONE`). Already CoW-split `PTE_SHARED = 0` leaves
+      update `WRITABLE` directly from `vma.prot.write()`.
     - Because `fsync`/`fdatasync`/`sync`/`msync` treat a `CachePage` as dirty
       whenever `dirty || writable_maps > 0`, repeated `MAP_SHARED` stores
       followed by repeated `fsync` calls without intervening `munmap` always
@@ -850,15 +852,17 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   dropping `Arc<CachePage>` pins), and user page-table mappings (walking L4
   entries 0–255, freeing **only** non-`PTE_SHARED` leaf frames—decrementing
   refcounts from M8 onward—and user L1/L2/L3 tables). Removed `mapped_files`
-  `Arc<VfsInode>` entries (from `teardown()` or `munmap()`) are extracted and
-  dropped **after** releasing `AddressSpace::inner` so any deferred reclamation
-  when the last open/mapped reference disappears never holds `AddressSpace::inner`.
-  `AddressSpace::drop` (which may run inside `sched::finish_switch` with
-  interrupts off once no CPU holds its `CR3`) runs lock-free: if `!torn_down`
-  (error rollback or ktest), its `destroy_user_root` sweep still skips
-  `frame::free` on `PTE_SHARED` leaves and decrements `writable_maps`
-  atomically before dropping `pinned_pages`, and `VfsInode::drop` never takes a
-  sleeping lock. Kernel upper-half tables (256–511) are untouched.
+  `Arc<VfsInode>` entries (from `teardown()`, `munmap()`, or `MAP_FIXED`
+  replacement) are extracted and dropped **after** releasing
+  `AddressSpace::inner` (decrementing `inode.open_count` atomically via an RAII
+  guard) so any deferred reclamation when the last open/mapped reference
+  disappears never holds `AddressSpace::inner`. `AddressSpace::drop` (which may
+  run inside `sched::finish_switch` with interrupts off once no CPU holds its
+  `CR3`) runs lock-free: if `!torn_down` (error rollback or ktest), its
+  `destroy_user_root` sweep still skips `frame::free` on `PTE_SHARED` leaves
+  and propagates `PTE_DIRTY` + decrements `writable_maps` atomically before
+  dropping `pinned_pages`, and `VfsInode::drop` never takes a sleeping lock.
+  Kernel upper-half tables (256–511) are untouched.
 - **Lock ordering across VM and VFS (M7–M8):** Because `copy_from_user` and
   `copy_to_user` may fault into `#PF` → `AddressSpace` → `PageCache` →
   `BlockCache` → `BlockDevice`, syscall paths (`read`, `write`, `pread64`,
@@ -3454,7 +3458,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 95 | `umask(mask)` | atomically sets per-process `umask = mask & 0o777` (default `0o022`) and returns previous mask |
 | 162 | `sync()` | snapshots mounted filesystems and cached inodes (never holding `MountTable`/`InodeCache` across I/O), flushes every dirty `PageCache` page and `BlockCache` block followed by `BlockDevice::flush()`; always returns `0` |
 | 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor`; returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
-| 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on char devices, `-EISDIR` on dirs, `-EROFS` on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on symlink unless `O_PATH` is also set; `open("symlink/", O_NOFOLLOW)` → `-ELOOP`), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
+| 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on char devices—including on read-only `devfs`—`-EISDIR` on dirs, `-EROFS` on regular files on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on final symlink without trailing `/` unless `O_PATH` is also set; trailing `/` forces directory traversal even with `O_NOFOLLOW`, matching Linux), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
 | 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o7777) & !umask`, stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
 | 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`) |
 | 262 | `newfstatat(dirfd, path, buf, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; writes 144-byte Linux x86-64 `struct stat` with unique `(st_dev, st_ino)` per filesystem/inode |
@@ -3466,10 +3470,10 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 268 | `fchmodat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`, which `musl` leaves uninitialized); follows symlinks and updates mode bits and `ctime` (`-EROFS` on read-only fs) |
 | 269 | `faccessat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`); shim to `faccessat2(dirfd, path, mode, 0)` |
 | 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`), `AT_SYMLINK_NOFOLLOW`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`), rejecting invalid `tv_nsec >= 1_000_000_000` with `-EINVAL` |
-| 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); handles open-unlinked target overwrite via the same detach/orphan path as `unlink` (section 9); rejects unknown flags or both together (`-EINVAL`), cross-mount (`-EXDEV`), dir-over-non-dir or trailing `/` on non-dir (`-ENOTDIR`), non-dir-over-dir (`-EISDIR`), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
+| 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); same-inode `rename(a, a)` is a no-op (`0`, or `-EEXIST` with `RENAME_NOREPLACE`); handles open-unlinked file and empty-dir target overwrite via the same detach/orphan path as `unlink`/`rmdir` (section 9); rejects unknown flags or both together (`-EINVAL`), cross-mount (`-EXDEV`), mountpoint overwrite (`-EBUSY`), dir-over-non-dir or trailing `/` on non-dir (`-ENOTDIR`), non-dir-over-dir (`-EISDIR`), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
 | 332 | `statx(dirfd, path, flags, mask, buf)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `AT_NO_AUTOMOUNT`, and `AT_STATX_SYNC_TYPE` (`AS_STAT`/`FORCE_SYNC`/`DONT_SYNC`); fills `struct statx` (`stx_mask`, `stx_blksize`, `stx_nlink`, `stx_uid`, `stx_gid`, `stx_mode`, `stx_ino`, `stx_size`, `stx_blocks`, timestamps, `stx_rdev_*`, `stx_dev_*`) |
-| 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`; checks existence and permission bits (`F_OK \| R_OK \| W_OK \| X_OK`; root `uid == 0` satisfies `R_OK`/`W_OK` on writable fs and `X_OK` if any execute bit is set on regular files or always on dirs) |
-| 452 | `fchmodat2(dirfd, path, mode, flags)` | 4-argument Linux 6.6+ variant (`flags == 0`; `AT_SYMLINK_NOFOLLOW` → `-EOPNOTSUPP`, other flags → `-EINVAL`) |
+| 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`; checks existence and permission bits (`F_OK \| R_OK \| W_OK \| X_OK`; root `uid == 0` satisfies `R_OK`/`W_OK` on writable fs and on `S_ISCHR` device nodes on `devfs`, and `X_OK` if any execute bit is set on regular files or always on dirs) |
+| 452 | `fchmodat2(dirfd, path, mode, flags)` | 4-argument Linux 6.6+ variant accepting `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (unknown flags → `-EINVAL`); returns `-EOPNOTSUPP` **only when the resolved target is a symlink**, otherwise updates mode bits and `ctime` normally (`-EROFS` on read-only fs) |
 
 - **M8 (Processes, threads, signals, `futex`, PTYs):** `fork`/`vfork`/`clone`/
   `execve`/`wait4`, `futex`, real signals (`rt_sigreturn`, `sigaltstack`,
@@ -4877,16 +4881,20 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   stores during writeback, flushing clears `dirty` (`swap(false, AcqRel)`)
   **before** writing the page bytes to `ext4` (clamping the final page to
   `min(4096, file_size - page_off)`), and restores `dirty = true` on I/O error.
-- **Safe global budget and eviction:** M7 caps total `ext4` `PageCache` frames
-  at a configurable budget (e.g., 32 MiB on a 256 MiB guest; dynamic reclaim in
-  M10). Clean `ext4` pages are evictable **only** when
-  `Arc::strong_count(&page) == 1` (not pinned in any `AddressSpace` PTE or
-  in-flight I/O); dirty `ext4` pages exceeding the budget are written back
-  before eviction. Reclaim runs on the calling thread **outside** any inode's
-  `PageCache` lock (never inside `frame::alloc`, which holds an IRQ-off
-  `SpinLock`, and never holding another inode's `PageCache` lock). `tmpfs`
-  pages and `detached_unlinked` pages are never evicted until truncated or
-  dropped on last close.
+- **Safe global budget and eviction:** M7 configures a soft reclaim target for
+  total `ext4` `PageCache` frames (e.g., 32 MiB on a 256 MiB guest; allowing
+  temporary overshoot if all cached pages are actively pinned in
+  `AddressSpace::pinned_pages`; dynamic memory-pressure reclaim arrives in M10).
+  Clean `ext4` pages are evictable **only** when `Arc::strong_count(&page) == 1`
+  (not pinned in any `AddressSpace` PTE or in-flight I/O); dirty `ext4` pages
+  exceeding the target are written back before eviction. Global reclaim runs on
+  the calling thread **outside BOTH Lock 4 (`VfsInode`) and Lock 5 (`PageCache`)**
+  (pre-reclaiming before acquiring Lock 4, or releasing Lock 5 and Lock 4,
+  reclaiming victim inode B in strict global order `Lock 4(B) → Lock 5(B) →
+  Lock 6 → 7 → 8`, and retrying—never inside `frame::alloc`, which holds an
+  IRQ-off `SpinLock`, and never holding another inode's Lock 4 or Lock 5).
+  `tmpfs` pages and `detached_unlinked` pages are never evicted until truncated
+  or dropped on last close.
 - **Truncate & extend interaction:**
   - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`):
     acquires `AddressSpace::inner` (Lock 1) before `VfsInode` (Lock 4), unmaps
@@ -4924,28 +4932,37 @@ Every candidate is vetted against six hard gates before pinning:
 5. Routes all disk I/O through Lumen's `BlockCache` adapter, and either
    disables any internal write cache in the chosen crate or flushes it into
    `BlockCache` **before** `BlockCache::sync()` issues `BlockDevice::flush()`.
-6. **Unlink-while-open contract (covering both `unlink` and `rename` overwrite):**
-   when `unlink(path)` **or `rename`/`renameat2` overwriting an existing target**
-   removes the last directory link (`st_nlink == 1`) of a file whose explicit
-   atomic `open_count > 0` (sum of live `OpenFile` and `AddressSpace::mapped_files`
-   references, distinct from `Arc<VfsInode>` cache refs):
+6. **Unlink-while-open contract (covering `unlink`, `rmdir`, and `rename` overwrite):**
+   when `unlink(path)` or `rename`/`renameat2` removes the last link of a file
+   (`st_nlink == 1`), **or `rmdir(path)` / `rename` overwrites an empty
+   directory** (`st_nlink == 2`), while the target inode's explicit atomic
+   `open_count > 0` (sum of live `OpenFile`, `AddressSpace::mapped_files`, and
+   `ProcessState::cwd` references, maintained via RAII guards and distinct from
+   `Arc<VfsInode>` cache refs):
    - The directory entry is removed/replaced immediately (so `open(path)`/
-     `stat(path)` no longer find the old inode and a new file can be created at
-     `path`).
-   - `fstat(fd)` reports `st_nlink == 0`, and `read`/`write`/`ftruncate`/`mmap`
-     continue to work until `open_count` reaches 0.
+     `stat(path)` no longer find the old inode and a new file/dir can be
+     created at `path`).
+   - `fstat(fd)` reports `st_nlink == 0`, regular-file `read`/`write`/
+     `ftruncate`/`mmap` continue to work until `open_count` reaches 0, and
+     detached directories return `-ENOENT` on `lookup`/`create`/`mkdir`/`link`/
+     `symlink` and empty EOF on `getdents64` (while `getcwd` returns `-ENOENT`).
    - If the chosen `ext4` crate supports ext4's native orphan list (decoupling
-     dentry removal from inode/block deallocation), VFS uses it directly.
-     Otherwise, before mutating `ext4`:
-     1. Check a detached-memory quota (sharing/mirroring `tmpfs`'s 32 MiB cap)
-        and fault existing allocated/non-hole pages into the inode's `PageCache`
-        (aborting `unlink`/`rename` with `-ENOMEM` before touching `ext4` if
-        faulting fails).
+     dentry removal from inode/block deallocation), VFS uses it directly
+     (preserving POSIX `fstat` `st_ino` invariance across `unlink`). Otherwise,
+     before mutating `ext4`:
+     1. For regular files, check a separate non-evictable detached-memory quota
+        (sharing/mirroring `tmpfs`'s 32 MiB cap; never triggering `ext4`
+        `PageCache` reclaim while holding Lock 3/4) and fault existing
+        allocated/non-hole pages into the inode's `PageCache` (aborting
+        `unlink`/`rename` with `-ENOMEM` before touching `ext4` if faulting
+        fails). (Empty directories have 0 pages to fault.)
      2. Atomically remove `(dev_id, old_ino)` from `InodeCache` before backend
-        `unlink`/`rename` and assign the live `VfsInode` a synthetic
-        non-colliding `ino` (`(1u64 << 63) | detached_seq`) so on-disk `old_ino`
-        reuse by `ext4` can never alias `InodeCache` or break `ld-musl`
-        `(st_dev, st_ino)` deduplication.
+        `unlink`/`rmdir`/`rename` and assign the live `VfsInode`'s `st_ino` a
+        synthetic non-colliding value (`(1u64 << 63) | detached_seq`; Lock 4
+        ordering uses an **immutable** creation-time `lock_id: u64`, never the
+        mutable `st_ino`, and `/proc/self/maps` reads `inode.ino()` dynamically)
+        so on-disk `old_ino` reuse by `ext4` can never alias `InodeCache` or
+        break `ld-musl` `(st_dev, st_ino)` deduplication.
      3. Mark `detached_unlinked = true` (`st_nlink = 0`): `PageCache` treats
         its pages as non-evictable (like `tmpfs`), unfaulted hole pages read as
         zero, and `fsync`/`fdatasync`/`msync`/`fchmod`/`fchown`/`utimensat`/
@@ -4993,11 +5010,14 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     symlinks per lookup, returning `-ELOOP` on cycles or deeper chains.
     Relative symlink targets resolve relative to the symlink's parent directory
     (never `cwd`/`dirfd`).
-  - **No-follow and trailing slash rules:** `AT_SYMLINK_NOFOLLOW` suppresses
-    following the final component **unless** the path has a trailing `/` (per
-    POSIX: `lstat("symlink/")` follows `symlink` and requires a directory;
-    `"file/"` returns `-ENOTDIR`). For `openat`, `open("symlink", O_NOFOLLOW)`
-    and `open("symlink/", O_NOFOLLOW)` both return `-ELOOP`, **except**
+  - **No-follow and trailing slash rules:** `AT_SYMLINK_NOFOLLOW` and
+    `O_NOFOLLOW` suppress following the final component **unless** the path has
+    a trailing `/` (matching Linux: a trailing `/` forces directory traversal
+    through the symlink, so both `lstat("symlink/")` and
+    `open("symlink/", O_RDONLY | O_NOFOLLOW)` follow `symlink` and require the
+    target to be a directory, returning `-ENOTDIR` if it resolves to a
+    non-directory; `"file/"` returns `-ENOTDIR`). Without a trailing `/`,
+    `open("symlink", O_NOFOLLOW)` returns `-ELOOP`, **except**
     `open("symlink", O_PATH | O_NOFOLLOW)` which opens an `O_PATH` descriptor
     to the symlink itself.
 - **Open file descriptions vs FD table:**
@@ -5038,8 +5058,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   unlink-while-open via `Arc`, `renameat2`, `chmod`/`chown`/`utimensat`),
   bounded by a configurable memory quota (default 32 MiB in M7, returning
   `-ENOSPC` instead of exhausting kernel frames).
-- **`/dev` (`devfs`, `dev = 0:3`):** read-only directory of character devices
-  (`S_IFCHR`) with standard Linux `major:minor` `st_rdev` and permissions:
+- **`/dev` (`devfs`, `dev = 0:3`):** read-only directory (namespace mutations
+  such as `create`/`unlink`/`mkdir`/`rename`/`chmod` return `-EROFS`, while
+  `S_ISCHR` device nodes are exempt from `-EROFS` for `O_WRONLY`/`O_RDWR`/
+  `O_TRUNC`/`W_OK`, matching Linux `may_open`) of character devices (`S_IFCHR`)
+  with standard Linux `major:minor` `st_rdev` and permissions:
   - `/dev/null` (`1:3`, `0o666`): `read` → 0 (EOF), `write` → `count`, `lseek` → 0.
   - `/dev/zero` (`1:5`, `0o666`): `read` → zero bytes, `write` → `count`,
     `lseek` → 0, `mmap` → anonymous zeroed pages.
@@ -5106,8 +5129,8 @@ Every lock in the VM/storage/VFS stack obeys a strict acyclic total order:
  3. Per-filesystem rename_lock (SleepMutex)
  4. VfsInode metadata / directory / AdvisoryLocks lock (SleepMutex)
     — sub-order: directories strictly before non-directory children;
-      multiple directories (under rename_lock) in ascending (DevId, Ino);
-      multiple non-directory children in ascending (DevId, Ino)
+      multiple directories (under rename_lock) in ascending immutable lock_id;
+      multiple non-directory children in ascending immutable lock_id
  5. PageCache lock (SleepMutex)
  6. Ext4 / Tmpfs filesystem lock (SleepMutex)
  7. BlockCache lock (SleepMutex)
@@ -6687,23 +6710,31 @@ test server:
   symlinks (`/bin/ls`, `/bin/cp`, `/bin/mv`, `/bin/grep`, `/bin/sed`,
   `/bin/awk`, `/bin/tar`, `/bin/sh`), and `/etc/*`.
 - **Host-built M7 dynamic test binaries (`tools/linux-m7/`):** a `#![no_std]` +
-  `-C panic=abort` dynamically linked executable and a `cdylib` shared `.so`
-  library (exercising `dlopen`/`dlsym`, file-backed `MAP_SHARED`/`MAP_PRIVATE`
-  CoW, `SIGBUS` past EOF, `flock`/`F_SETLK`, `renameat2`, and POSIX VFS edge
-  cases), cross-compiled on both macOS and Ubuntu CI into `build/linux/` with
-  the pinned `rustc --target x86_64-unknown-linux-musl` + `rust-lld`—avoiding
+  `#![no_main]` + `-C panic=abort` dynamically linked executable (exposing
+  `#[unsafe(no_mangle)] pub extern "C" fn main(...) -> i32` called by musl's
+  `Scrt1.o` → `__libc_start_main`) and a `#![no_std]` + `-C panic=abort`
+  `cdylib` shared `.so` library (exercising `dlopen`/`dlsym`, file-backed
+  `MAP_SHARED`/`MAP_PRIVATE` CoW, `SIGBUS` past EOF, `flock`/`F_SETLK`,
+  `renameat2`, and POSIX VFS edge cases), cross-compiled on both macOS and
+  Ubuntu CI into `build/linux/` with the pinned
+  `rustc --target x86_64-unknown-linux-musl` + `rust-lld`—avoiding
   `libgcc_s.so.1` (absent from both `alpine-minirootfs` and rustup's musl
-  sysroot) and requiring **zero external C cross-compiler**—by passing
-  `-C linker=rust-lld -C linker-flavor=ld.lld -C link-self-contained=no -C default-linker-libraries=no`,
+  sysroot) and requiring **zero external C cross-compiler**. Using
+  `SYSROOT=$(rustc --print sysroot)` and `HOST=$(rustc --print host-tuple)`
+  (matching `Makefile`'s `build/linux/hello` recipe), both targets pass
+  `-C target-feature=-crt-static` (required to disable static-CRT linking on
+  `x86_64-unknown-linux-musl` and allow `cdylib` output),
+  `-C linker="$SYSROOT/lib/rustlib/$HOST/bin/rust-lld" -C linker-flavor=ld.lld -C link-self-contained=no -C default-linker-libraries=no`,
   explicit `$SYSROOT/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained/{Scrt1.o,crti.o,crtn.o}`
-  (`crti.o`/`crtn.o` for `cdylib`), direct linking against
-  `build/deps/alpine-minirootfs/lib/ld-musl-x86_64.so.1`, and
+  (`crti.o` before `crtn.o`, omitting `Scrt1.o` for `cdylib`), direct linking
+  against `build/deps/alpine-minirootfs/lib/ld-musl-x86_64.so.1`, and
   `-C link-arg=--dynamic-linker=/lib/ld-musl-x86_64.so.1` for the executable.
-  Build-time verification via the pinned `llvm-readobj -l -d` asserts
-  `PT_INTERP == /lib/ld-musl-x86_64.so.1` and that every `DT_NEEDED` entry
-  resolves inside the staged rootfs (no stray `libgcc_s.so.1` or `libc.so.6`).
-  The M7 sources in `tools/linux-m7/` are formatted and checked by `Makefile`'s
-  `fmt` and `fmt-check` targets alongside `tools/linux-hello/hello.rs`.
+  Build-time verification via `"$SYSROOT/lib/rustlib/$HOST/bin/llvm-readobj" -l -d`
+  asserts `PT_INTERP == /lib/ld-musl-x86_64.so.1` and that every `DT_NEEDED`
+  entry resolves inside the staged rootfs (no stray `libgcc_s.so.1` or
+  `libc.so.6`). The M7 sources in `tools/linux-m7/` are formatted and checked
+  by `Makefile`'s `fmt` and `fmt-check` targets alongside
+  `tools/linux-hello/hello.rs`.
 - **Rootless deterministic `ext4` assembly (`tools/mkrootfs.sh`, `make rootfs`):**
   assembles `build/deps/alpine-minirootfs/` + `build/linux/*` into
   **`build/alpine-rootfs.ext4`** (kept outside `build/deps/` so `actions/cache`
@@ -6713,18 +6744,24 @@ test server:
   `apt-get install e2fsprogs` in `.github/workflows/ci.yml` and Homebrew
   `brew install e2fsprogs` on macOS, noting that Android SDK `mke2fs` lacks
   `e2fsck` and Homebrew `e2fsprogs` is keg-only). Both `tools/mkrootfs.sh` and
-  `tests/scenarios/test_fs.py` locate `mke2fs`/`e2fsck` via
-  `LUMEN_E2FSPROGS_SBIN` → `$PATH` → `/opt/homebrew/opt/e2fsprogs/sbin` →
-  `/usr/local/opt/e2fsprogs/sbin` and fail loudly with an install hint if
-  absent. To eliminate host `mke2fs.conf` drift between macOS and Ubuntu 24.04
-  CI, `tools/mkrootfs.sh` passes explicit `-t ext4 -b 4096 -I 256 -m 0 -L
+  `tests/scenarios/test_fs.py` locate a **matched `(mke2fs, e2fsck)` pair from
+  a single directory** checking `LUMEN_E2FSPROGS_SBIN` →
+  `/opt/homebrew/opt/e2fsprogs/sbin` → `/usr/local/opt/e2fsprogs/sbin` →
+  `$PATH` (accepting a `$PATH` directory only when both `mke2fs` and `e2fsck`
+  exist side-by-side, so Android SDK's `mke2fs` cannot hijack Homebrew
+  `e2fsprogs`), failing loudly with an install hint if absent. To eliminate
+  host `mke2fs.conf` drift between macOS and Ubuntu 24.04 CI,
+  `tools/mkrootfs.sh` passes explicit `-t ext4 -b 4096 -I 256 -m 0 -L
   lumen-rootfs -U <fixed-uuid> -E hash_seed=<fixed-uuid>,root_owner=0:0,lazy_itable_init=0,no_copy_xattrs`,
   `E2FSPROGS_FAKE_TIME=<fixed-epoch>`, normalized staging mtimes, and explicit
   `-O` overrides (at minimum `^orphan_file,^metadata_csum_seed`, with the
   chosen `ext4` crate PR pinning `metadata_csum`/`has_journal` explicitly so
-  macOS and Ubuntu CI emit identical superblock feature masks). `e2fsck -fn`
-  validates every freshly built image and every guest-mutated disk image in
-  `test_fs.py` after QEMU exits.
+  macOS and Ubuntu CI emit identical superblock feature masks; note `-E
+  root_owner=0:0` owns `/` as `0:0` while `-d` staged files inherit host
+  UID/GID, so tests should not assert `st_uid == 0` on pre-populated staging
+  files unless explicitly normalized). `e2fsck -fn` validates every freshly
+  built image and every guest-mutated disk image in `test_fs.py` after QEMU
+  exits.
 - **Parallel scenario isolation:** `test_blk.py` uses per-test blank scratch
   disks via `Devices(blk_mib=...)` (with `VIRTIO_BLK_F_RO` host-tested in
   `cargo:lumen-bcache` and optionally scenario-tested via a `Devices.blk_readonly`
