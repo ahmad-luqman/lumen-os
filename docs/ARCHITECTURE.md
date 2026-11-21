@@ -669,10 +669,12 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   - Static ELF `PT_LOAD` segments map at their `p_vaddr`; PIE binaries map at
     `PIE_BASE = 0x0000_5555_5555_4000`, and M7's dynamic linker (`ld-musl`)
     maps upward at and above `INTERP_BASE = 0x0000_7f00_0000_0000` (disjoint
-    from `[..., MMAP_TOP)` and strictly below `USER_STACK_BOTTOM`).
+    from `[..., MMAP_TOP)` and wholly below the user stack's guard page,
+    which the loader enforces).
   - `brk` starts page-aligned immediately above the highest loaded main-binary
     ELF segment and tracks a byte-granular cursor upward up to the next VMA
-    (capped away from `mmap`).
+    (capped away from `mmap`, and, for a main binary above `MMAP_TOP`, below
+    the user stack's guard page).
   - Anonymous (M6) and file-backed (M7) `mmap` regions allocate top-down below
     `MMAP_TOP = 0x0000_7f00_0000_0000`.
   - Initial user stack top: `USER_STACK_TOP = 0x0000_7fff_f000_0000`, with an
@@ -3526,7 +3528,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
   `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64`, `sysinfo`,
   and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery.
 
-### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` loader built #255, designed in #246; file-backed segments and `dlopen` designed in #246, M7)
+### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` loader built #255; file-backed segments and `dlopen` designed in #246, M7)
 
 - **Validation (`crates/lumen-elf`, host-tested):**
   checks ELF64 little-endian `ET_EXEC` (or `ET_DYN` PIE), `EM_X86_64`, no
@@ -5315,8 +5317,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `DentryCache` or `InodeCache` (`cacheable()` is `false`), so each lookup
     asks `procfs` whether the process or fd still exists. Nor is `self`,
     which names whichever process asks.
-  - `/proc/<pid>/exe` → symlink to the process's canonical executable path
-    (e.g. `/bin/busybox`).
+  - `/proc/<pid>/exe` → symlink to the executable's path as given to
+    `linux /path` (e.g. `/bin/busybox`; not resolved: Linux's resolved path
+    once `readlink` lands, #254).
   - `/proc/<pid>/fd` → directory of **magic symlinks** `0`, `1`, `2`, ...:
     `readlink` returns each open FD's path (appending ` (deleted)` if
     unlinked), while traversing `/proc/<pid>/fd/<n>` (e.g. `open`/`stat`)
