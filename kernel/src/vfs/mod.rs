@@ -212,6 +212,9 @@ impl VfsCacheOps for KernelVfsTables {
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
         }
+        if !inode.cacheable() {
+            return Ok(inode);
+        }
         let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
         if !mounts.is_mountpoint(parent_dev, parent_ino) {
             let _ = dentries.insert_if_gen(
@@ -239,6 +242,9 @@ impl VfsCacheOps for KernelVfsTables {
         let mut inodes = self.inodes.lock();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
+        }
+        if !inode.cacheable() {
+            return Ok(inode);
         }
         let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
         let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
@@ -303,6 +309,9 @@ impl VfsCacheOps for KernelVfsTables {
     }
 
     fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
+        if !inode.cacheable() {
+            return inode;
+        }
         self.inodes.lock().get_or_insert(inode)
     }
 
@@ -318,6 +327,9 @@ impl VfsCacheOps for KernelVfsTables {
         if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
             return None;
         }
+        if !inode.cacheable() {
+            return Some(inode);
+        }
         Some(inodes.get_or_insert(inode))
     }
 
@@ -330,6 +342,9 @@ impl VfsCacheOps for KernelVfsTables {
         let mut inodes = self.inodes.lock();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
+        }
+        if !inode.cacheable() {
+            return Ok(inode);
         }
         inodes.get_or_insert_if_fresh(inode, since_gen)
     }

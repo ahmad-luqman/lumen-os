@@ -5115,9 +5115,27 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `set_mode/owner/times(...)`, plus `read_page`/`write_page` feeding
     `PageCache` and `sync()`. `VfsInode::drop` must never acquire a sleeping
     lock.
+  - `InodeCache`: the `(DevId, Ino)` → `Arc<VfsInode>` map above. It evicts
+    an entry only on `unlink`/`rmdir`/`rename`, a detach or `umount`, never
+    for size, so an inode whose existence the VFS can't follow must not
+    enter it: `VfsInode::cacheable()` (default `true`; answered from fixed
+    state, under Lock 9, without locking) is `false` for those, and every
+    `VfsCacheOps` method that would insert one (`publish_lookup_inode`,
+    `inode_get_or_insert_if_fresh`, ...: a lookup, `..`, a magic link's
+    target, `open(O_CREAT)` of an existing name) hands it back as its
+    success value instead, inserted into neither cache. A non-cacheable
+    directory's children are non-cacheable too (a dentry is keyed by its
+    parent). `procfs`'s `self`, `/proc/<pid>` and everything under it are
+    the only ones (#263): they go with their process or fd, and pids only
+    grow. Each lookup of one builds a fresh inode, so two opens of the same
+    `/proc/<pid>` file don't share advisory locks or an open count.
   - `DentryCache`: keyed by `(parent_dev, parent_ino, ComponentName)`, storing
     child `(DevId, Ino)` with immediate invalidation on `unlink`, `rmdir`,
-    `rename`, and `mount`/`umount`.
+    `rename`, and `mount`/`umount`, and bounded at 4096 entries (oldest
+    first out). A cached name is returned without asking the filesystem,
+    so a non-`cacheable()` child is never inserted: every lookup of it asks
+    the filesystem again (`/proc/<pid>` is `ENOENT` as soon as the process
+    ends).
   - `MountTable`: maps mount-point `(DevId, Ino)` to mounted `Arc<dyn FileSystem>`
     and tracks each mount's parent mountpoint so `..` at a mount root crosses
     cleanly back to the parent filesystem (and `..` at `/` stays at `/`).
@@ -5204,7 +5222,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 - **`/proc` (`procfs`, `dev = 0:4`):** read-only dynamically generated views
   (`st_size == 0` on virtual regular files, matching Linux):
   - `/proc/self` → symlink to `<current_pid>`; `/proc/<pid>` resolves for the
-    calling process's PID.
+    calling process's PID. None of these per-process nodes (nor `self`) is
+    ever in `DentryCache` or `InodeCache` (`cacheable()` is `false`), so
+    each lookup asks `procfs` whether the process or fd still exists.
   - `/proc/<pid>/exe` → symlink to the process's canonical executable path
     (e.g. `/bin/busybox`).
   - `/proc/<pid>/fd` → directory of **magic symlinks** `0`, `1`, `2`, ...:

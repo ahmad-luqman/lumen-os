@@ -246,6 +246,10 @@ impl MountTable {
 /// `InodeCache` in strict `MountTable -> DentryCache -> InodeCache` sub-order),
 /// returns an owned `Arc` or `Copy` value, and releases the Lock 9 guard(s)
 /// before returning so Locks 4–8 are never acquired while holding Lock 9.
+///
+/// No method inserts an inode whose [`VfsInode::cacheable`] is false into
+/// either cache: each one that would hands it back as its success value
+/// (`Ok(inode)`, `Some(inode)` or `inode`), unified with nothing.
 pub trait VfsCacheOps {
     fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn is_global_root(&self, dev: DevId, ino: Ino) -> bool;
@@ -267,7 +271,9 @@ pub trait VfsCacheOps {
     /// Unify a looked-up inode in `InodeCache` and publish its dentry under Lock 9.
     /// Implementations must insert into `DentryCache` only when
     /// `!mounts.is_mountpoint(parent_dev, parent_ino)` (so an active mountpoint's
-    /// shadowed children never pollute `DentryCache`).
+    /// shadowed children never pollute `DentryCache`), and must return a
+    /// mounted inode whose [`VfsInode::cacheable`] is false as `Ok(inode)`,
+    /// inserting it into neither cache (`Err` would make callers retry).
     fn publish_lookup_inode(
         &self,
         parent_dev: DevId,
@@ -321,6 +327,9 @@ pub trait VfsCacheOps {
         mount_id: u64,
         inode: Arc<dyn VfsInode>,
     ) -> Option<Arc<dyn VfsInode>>;
+    /// Unify `inode` in `InodeCache` if fresh (`InodeCache::get_or_insert_if_fresh`).
+    /// Like [`Self::publish_lookup_inode`], a mounted inode whose
+    /// [`VfsInode::cacheable`] is false comes back as `Ok(inode)`, uncached.
     fn inode_get_or_insert_if_fresh(
         &self,
         inode: Arc<dyn VfsInode>,
@@ -462,6 +471,9 @@ impl VfsCacheOps for SimpleVfsTables {
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
         }
+        if !inode.cacheable() {
+            return Ok(inode);
+        }
         let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
         if !mounts.is_mountpoint(parent_dev, parent_ino) {
             let _ = dentries.insert_if_gen(
@@ -489,6 +501,9 @@ impl VfsCacheOps for SimpleVfsTables {
         let mut inodes = self.inodes.borrow_mut();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
+        }
+        if !inode.cacheable() {
+            return Ok(inode);
         }
         let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
         let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
@@ -553,6 +568,9 @@ impl VfsCacheOps for SimpleVfsTables {
     }
 
     fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
+        if !inode.cacheable() {
+            return inode;
+        }
         self.inodes.borrow_mut().get_or_insert(inode)
     }
 
@@ -568,6 +586,9 @@ impl VfsCacheOps for SimpleVfsTables {
         if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
             return None;
         }
+        if !inode.cacheable() {
+            return Some(inode);
+        }
         Some(inodes.get_or_insert(inode))
     }
 
@@ -580,6 +601,9 @@ impl VfsCacheOps for SimpleVfsTables {
         let mut inodes = self.inodes.borrow_mut();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
+        }
+        if !inode.cacheable() {
+            return Ok(inode);
         }
         inodes.get_or_insert_if_fresh(inode, since_gen)
     }

@@ -7285,3 +7285,379 @@ fn concurrent_compute_cwd_path_vs_rename_at2_stress() {
     assert_eq!(compute_cwd_path(env.as_ref(), &cwd).unwrap(), "/p1/leaf");
     assert_no_zombies_in_cache(env.as_ref());
 }
+
+/// A `procfs`-like filesystem for `VfsInode::cacheable` (#263): `/<pid>`
+/// exists while `pid` is in `live`, holding `fd/0` (a magic link to `info`)
+/// and `info`; all of those are non-cacheable, `version` is cacheable.
+mod uncached {
+    use super::*;
+    use alloc::collections::BTreeSet;
+
+    type Live = Arc<Mutex<BTreeSet<u32>>>;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Node {
+        Root,
+        Version,
+        Pid(u32),
+        Fd(u32),
+        Info(u32),
+        FdLink(u32),
+    }
+
+    impl Node {
+        fn ino(self) -> Ino {
+            let per = |p: u32, tag: u64| (1u64 << 48) | (u64::from(p) << 16) | tag;
+            match self {
+                Self::Root => 1,
+                Self::Version => 2,
+                Self::Pid(p) => per(p, 0),
+                Self::Fd(p) => per(p, 1),
+                Self::Info(p) => per(p, 2),
+                Self::FdLink(p) => per(p, 3),
+            }
+        }
+
+        fn pid(self) -> Option<u32> {
+            match self {
+                Self::Root | Self::Version => None,
+                Self::Pid(p) | Self::Fd(p) | Self::Info(p) | Self::FdLink(p) => Some(p),
+            }
+        }
+
+        fn inode_type(self) -> InodeType {
+            match self {
+                Self::Root | Self::Pid(_) | Self::Fd(_) => InodeType::Dir,
+                Self::Version | Self::Info(_) => InodeType::File,
+                Self::FdLink(_) => InodeType::Symlink,
+            }
+        }
+    }
+
+    pub(super) struct DynFs {
+        dev: DevId,
+        pub(super) live: Live,
+        root: Arc<DynInode>,
+        /// Every `lookup` the filesystem answered, to show it was asked.
+        pub(super) lookups: Arc<AtomicU64>,
+    }
+
+    impl DynFs {
+        pub(super) fn new(dev: DevId) -> Arc<Self> {
+            let live: Live = Arc::new(Mutex::new(BTreeSet::new()));
+            let lookups = Arc::new(AtomicU64::new(0));
+            let root = DynInode::new(dev, Node::Root, Arc::clone(&live), Arc::clone(&lookups));
+            Arc::new(Self { dev, live, root, lookups })
+        }
+    }
+
+    impl FileSystem for DynFs {
+        fn dev_id(&self) -> DevId {
+            self.dev
+        }
+        fn name(&self) -> &'static str {
+            "dynfs"
+        }
+        fn root_inode(&self) -> Arc<dyn VfsInode> {
+            self.root.clone()
+        }
+        fn sync(&self) -> Result<(), VfsError> {
+            Ok(())
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+    }
+
+    struct DynInode {
+        lock_id: u64,
+        dev: DevId,
+        node: Node,
+        live: Live,
+        lookups: Arc<AtomicU64>,
+        open_count: AtomicU32,
+        locks: Mutex<AdvisoryLocks>,
+    }
+
+    impl DynInode {
+        fn new(dev: DevId, node: Node, live: Live, lookups: Arc<AtomicU64>) -> Arc<Self> {
+            Arc::new(Self {
+                lock_id: next_lock_id(),
+                dev,
+                node,
+                live,
+                lookups,
+                open_count: AtomicU32::new(0),
+                locks: Mutex::new(AdvisoryLocks::new()),
+            })
+        }
+
+        fn spawn(&self, node: Node) -> Arc<dyn VfsInode> {
+            Self::new(self.dev, node, Arc::clone(&self.live), Arc::clone(&self.lookups))
+        }
+
+        fn alive(&self, pid: u32) -> bool {
+            self.live.lock().unwrap().contains(&pid)
+        }
+
+        fn is_live(&self) -> bool {
+            self.node.pid().is_none_or(|p| self.alive(p))
+        }
+    }
+
+    impl VfsInode for DynInode {
+        fn lock_id(&self) -> u64 {
+            self.lock_id
+        }
+        fn dev_id(&self) -> DevId {
+            self.dev
+        }
+        fn ino(&self) -> Ino {
+            self.node.ino()
+        }
+        fn inode_type(&self) -> InodeType {
+            self.node.inode_type()
+        }
+        fn open_count(&self) -> u32 {
+            self.open_count.load(Ordering::Acquire)
+        }
+        fn inc_open_count(&self) {
+            self.open_count.fetch_add(1, Ordering::AcqRel);
+        }
+        fn dec_open_count(&self) -> u32 {
+            self.open_count.fetch_sub(1, Ordering::AcqRel) - 1
+        }
+        fn cacheable(&self) -> bool {
+            self.node.pid().is_none()
+        }
+        fn resolve_magic_link(&self) -> Option<Arc<dyn VfsInode>> {
+            match self.node {
+                Node::FdLink(p) if self.alive(p) => Some(self.spawn(Node::Info(p))),
+                _ => None,
+            }
+        }
+        fn stat(&self) -> Result<Metadata, VfsError> {
+            if !self.is_live() {
+                return Err(VfsError::NoEnt);
+            }
+            let itype = self.inode_type();
+            Ok(Metadata {
+                dev: self.dev,
+                ino: self.ino(),
+                inode_type: itype,
+                mode: 0o555,
+                nlink: if itype == InodeType::Dir { 2 } else { 1 },
+                uid: 0,
+                gid: 0,
+                rdev: DevId::default(),
+                size: 0,
+                blksize: 4096,
+                blocks: 0,
+                atime: Timespec::default(),
+                mtime: Timespec::default(),
+                ctime: Timespec::default(),
+            })
+        }
+        fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            if !self.is_live() {
+                return Err(VfsError::NoEnt);
+            }
+            match (self.node, name) {
+                (Node::Root, "version") => Ok(self.spawn(Node::Version)),
+                (Node::Root, other) => {
+                    let pid: u32 = other.parse().map_err(|_| VfsError::NoEnt)?;
+                    if !self.alive(pid) {
+                        return Err(VfsError::NoEnt);
+                    }
+                    Ok(self.spawn(Node::Pid(pid)))
+                }
+                (Node::Pid(_), "..") => Ok(self.spawn(Node::Root)),
+                (Node::Pid(p), "fd") => Ok(self.spawn(Node::Fd(p))),
+                (Node::Pid(p), "info") => Ok(self.spawn(Node::Info(p))),
+                (Node::Fd(p), "..") => Ok(self.spawn(Node::Pid(p))),
+                (Node::Fd(p), "0") => Ok(self.spawn(Node::FdLink(p))),
+                (Node::Pid(_) | Node::Fd(_), _) => Err(VfsError::NoEnt),
+                _ => Err(VfsError::NotDir),
+            }
+        }
+        fn create(&self, _name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn mkdir(&self, _name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn unlink(&self, _name: &str) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn rmdir(&self, _name: &str) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn link(&self, _name: &str, _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn readlink(&self) -> Result<Vec<u8>, VfsError> {
+            match self.node {
+                Node::FdLink(_) if self.is_live() => Ok(b"../info".to_vec()),
+                Node::FdLink(_) => Err(VfsError::NoEnt),
+                _ => Err(VfsError::Inval),
+            }
+        }
+        fn rename(
+            &self,
+            _old_name: &str,
+            _new_dir: &Arc<dyn VfsInode>,
+            _new_name: &str,
+            _flags: RenameFlags,
+        ) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn readdir(&self, _cursor: u64, _out: &mut Vec<DirEntry>, _max_entries: usize) -> Result<(), VfsError> {
+            if self.inode_type() == InodeType::Dir { Ok(()) } else { Err(VfsError::NotDir) }
+        }
+        fn truncate(&self, _size: u64) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn set_mode(&self, _mode: u16) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn set_times(&self, _atime: SetTime, _mtime: SetTime) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize, VfsError> {
+            Ok(0)
+        }
+        fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn read_page(&self, _page_index: u64, _buf: &mut [u8; 4096]) -> Result<usize, VfsError> {
+            Err(VfsError::Inval)
+        }
+        fn write_page(&self, _page_index: u64, _buf: &[u8]) -> Result<(), VfsError> {
+            Err(VfsError::RoFs)
+        }
+        fn sync(&self, _data_only: bool) -> Result<(), VfsError> {
+            Ok(())
+        }
+        fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {
+            f(&mut self.locks.lock().unwrap());
+            Ok(())
+        }
+    }
+}
+
+const DYNFS_DEV: DevId = DevId::makedev(0, 77);
+
+/// A root `MemFs` with a [`uncached::DynFs`] mounted at `/proc`.
+fn setup_dynfs() -> (SimpleVfsTables, Arc<uncached::DynFs>, Arc<dyn VfsInode>) {
+    let (env, _root_fs) = setup_vfs();
+    let mp = mkdir_at(&env, None, b"/proc", 0o555, 0).unwrap();
+    let dynfs = uncached::DynFs::new(DYNFS_DEV);
+    env.mount(mp, "/proc", dynfs.clone()).unwrap();
+    let proc_root = resolve_path(&env, None, b"/proc", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(proc_root.dev_id(), DYNFS_DEV);
+    (env, dynfs, proc_root)
+}
+
+/// How many per-pid entries `InodeCache` and `DentryCache` hold.
+fn dynfs_cached_per_pid(env: &SimpleVfsTables) -> (usize, usize) {
+    let per_pid = |ino: Ino| ino & (1u64 << 48) != 0;
+    let inodes =
+        env.inodes.borrow().snapshot_all().iter().filter(|i| i.dev_id() == DYNFS_DEV && per_pid(i.ino())).count();
+    let dentries = env
+        .dentries
+        .borrow()
+        .snapshot_all()
+        .iter()
+        .filter(|(pdev, pino, _, target)| {
+            (*pdev == DYNFS_DEV && per_pid(*pino)) || (target.dev == DYNFS_DEV && per_pid(target.ino))
+        })
+        .count();
+    (inodes, dentries)
+}
+
+#[test]
+fn non_cacheable_child_that_disappears_is_enoent_on_the_next_resolve() {
+    let (env, dynfs, proc_root) = setup_dynfs();
+    let nofollow = ResolveFlags { follow_final: false, ..ResolveFlags::default() };
+    let follow = ResolveFlags { follow_final: true, ..ResolveFlags::default() };
+    dynfs.live.lock().unwrap().insert(7);
+
+    // Each path takes one of the caches' doors: a plain lookup, `..` out of
+    // a non-cacheable directory, and a magic link's target.
+    let paths: [(&[u8], ResolveFlags); 5] = [
+        (b"/proc/7", nofollow),
+        (b"/proc/7/fd", nofollow),
+        (b"/proc/7/fd/..", nofollow),
+        (b"/proc/7/fd/0", nofollow),
+        (b"/proc/7/fd/0", follow),
+    ];
+    for (path, flags) in paths {
+        resolve_path(&env, None, path, flags).unwrap();
+    }
+    // A second resolve while it lives asks the filesystem again.
+    let before = dynfs.lookups.load(Ordering::Relaxed);
+    assert_eq!(resolve_path(&env, None, b"/proc/7", nofollow).unwrap().inode.ino(), (1u64 << 48) | (7 << 16));
+    assert!(dynfs.lookups.load(Ordering::Relaxed) > before, "/proc/7 came from a cache");
+    assert_eq!(env.dentry_get(DYNFS_DEV, proc_root.ino(), "7"), None);
+    assert_eq!(dynfs_cached_per_pid(&env), (0, 0));
+
+    // A cacheable sibling is still cached.
+    let version = resolve_path(&env, None, b"/proc/version", nofollow).unwrap().inode;
+    assert_eq!(env.dentry_get(DYNFS_DEV, proc_root.ino(), "version").map(|t| t.ino), Some(version.ino()));
+    assert!(Arc::ptr_eq(&env.inode_get(DYNFS_DEV, version.ino()).unwrap(), &version));
+
+    dynfs.live.lock().unwrap().remove(&7);
+    for (path, flags) in paths {
+        assert_eq!(
+            resolve_path(&env, None, path, flags).unwrap_err(),
+            VfsError::NoEnt,
+            "{} after its pid went",
+            String::from_utf8_lossy(path)
+        );
+    }
+    assert_eq!(
+        open_inode(&env, None, b"/proc/7/info", OpenFlags(OpenFlags::O_RDONLY), 0, 0).unwrap_err(),
+        VfsError::NoEnt
+    );
+}
+
+#[test]
+fn non_cacheable_lookups_leave_the_caches_flat() {
+    let (env, dynfs, _proc_root) = setup_dynfs();
+    let nofollow = ResolveFlags { follow_final: false, ..ResolveFlags::default() };
+    let follow = ResolveFlags { follow_final: true, ..ResolveFlags::default() };
+    resolve_path(&env, None, b"/proc/version", nofollow).unwrap();
+    let inodes_before = env.inodes.borrow().len();
+    let dentries_before = env.dentries.borrow().len();
+
+    for pid in 1..=2000u32 {
+        dynfs.live.lock().unwrap().insert(pid);
+        for (path, flags) in [
+            (format!("/proc/{pid}"), nofollow),
+            (format!("/proc/{pid}/info"), nofollow),
+            (format!("/proc/{pid}/fd/.."), nofollow),
+            (format!("/proc/{pid}/fd/0"), nofollow),
+            (format!("/proc/{pid}/fd/0"), follow),
+        ] {
+            resolve_path(&env, None, path.as_bytes(), flags).unwrap();
+        }
+        // `open(O_CREAT)` on an existing name publishes it too.
+        let path = format!("/proc/{pid}/info");
+        let (opened, _) =
+            open_inode(&env, None, path.as_bytes(), OpenFlags(OpenFlags::O_RDONLY | OpenFlags::O_CREAT), 0o444, 0)
+                .unwrap();
+        assert!(!opened.cacheable());
+        dynfs.live.lock().unwrap().remove(&pid);
+    }
+
+    assert_eq!(dynfs_cached_per_pid(&env), (0, 0));
+    assert_eq!(env.inodes.borrow().len(), inodes_before);
+    assert_eq!(env.dentries.borrow().len(), dentries_before);
+}
