@@ -7,8 +7,8 @@
 //! `s` when shared and `p` when private; an anonymous one is always `p`, even
 //! `MAP_SHARED | MAP_ANONYMOUS` (Linux prints `s`). A label (`[heap]` or
 //! `[stack]`) follows two spaces, where Linux pads the name to a fixed
-//! column. No device or inode is reported for a file-backed mapping
-//! (`00:00 0`).
+//! column. No device, inode or path is reported for a file-backed mapping
+//! (`00:00 0`, where Linux prints the file's device, inode and path).
 //!
 //! An anonymous VMA overlapping the heap (`[brk initial, brk mapped end)`) is
 //! printed split at the heap's edges, so a `.bss` coalesced with the first
@@ -107,10 +107,7 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
-    use crate::{
-        Brk, FileMapping, MapPlace, PAGE_SIZE, USER_MAX, USER_MIN, USER_STACK_BOTTOM as STACK_BOTTOM, USER_STACK_TOP,
-        VmaMap,
-    };
+    use crate::{Brk, FileMapping, MapPlace, PAGE_SIZE, USER_MAX, USER_MIN, USER_STACK_BOTTOM, USER_STACK_TOP, VmaMap};
 
     const P: u64 = PAGE_SIZE;
     const RW: Prot = Prot::READ.union(Prot::WRITE);
@@ -120,7 +117,7 @@ mod tests {
     const LAYOUT: MapsLayout = layout(0x40_4000, 0x40_5000);
 
     const fn layout(brk_initial: u64, brk_mapped_end: u64) -> MapsLayout {
-        MapsLayout { brk_initial, brk_mapped_end, stack_bottom: STACK_BOTTOM, stack_top: USER_STACK_TOP }
+        MapsLayout { brk_initial, brk_mapped_end, stack_bottom: USER_STACK_BOTTOM, stack_top: USER_STACK_TOP }
     }
 
     fn anon(start: u64, end: u64, prot: Prot) -> Vma {
@@ -224,21 +221,21 @@ mod tests {
     #[test]
     fn the_stack_is_labelled_only_inside_its_range() {
         assert_eq!(
-            maps(&[anon(STACK_BOTTOM, USER_STACK_TOP, RW)], &LAYOUT),
+            maps(&[anon(USER_STACK_BOTTOM, USER_STACK_TOP, RW)], &LAYOUT),
             "7fffef800000-7ffff0000000 rw-p 00000000 00:00 0  [stack]\n"
         );
         // A page in from either end is still the stack.
         assert_eq!(
-            maps(&[anon(STACK_BOTTOM + P, USER_STACK_TOP - P, RW)], &LAYOUT),
+            maps(&[anon(USER_STACK_BOTTOM + P, USER_STACK_TOP - P, RW)], &LAYOUT),
             "7fffef801000-7fffeffff000 rw-p 00000000 00:00 0  [stack]\n"
         );
         // A VMA reaching a page past either end is not.
         assert_eq!(
-            maps(&[anon(STACK_BOTTOM - P, USER_STACK_TOP, RW)], &LAYOUT),
+            maps(&[anon(USER_STACK_BOTTOM - P, USER_STACK_TOP, RW)], &LAYOUT),
             "7fffef7ff000-7ffff0000000 rw-p 00000000 00:00 0\n"
         );
         assert_eq!(
-            maps(&[anon(STACK_BOTTOM, USER_STACK_TOP + P, RW)], &LAYOUT),
+            maps(&[anon(USER_STACK_BOTTOM, USER_STACK_TOP + P, RW)], &LAYOUT),
             "7fffef800000-7ffff0001000 rw-p 00000000 00:00 0\n"
         );
     }
@@ -246,20 +243,20 @@ mod tests {
     #[test]
     fn the_stack_is_never_split_by_the_heap() {
         // A (made-up) break inside the stack range: the stack VMA keeps its label, whole.
-        let in_stack = layout(STACK_BOTTOM + P, STACK_BOTTOM + 2 * P);
+        let in_stack = layout(USER_STACK_BOTTOM + P, USER_STACK_BOTTOM + 2 * P);
         // Straddling the initial break.
         assert_eq!(
-            maps(&[anon(STACK_BOTTOM, USER_STACK_TOP, RW)], &in_stack),
+            maps(&[anon(USER_STACK_BOTTOM, USER_STACK_TOP, RW)], &in_stack),
             "7fffef800000-7ffff0000000 rw-p 00000000 00:00 0  [stack]\n"
         );
         // Starting at it and running past the heap's end.
         assert_eq!(
-            maps(&[anon(STACK_BOTTOM + P, USER_STACK_TOP, RW)], &in_stack),
+            maps(&[anon(USER_STACK_BOTTOM + P, USER_STACK_TOP, RW)], &in_stack),
             "7fffef801000-7ffff0000000 rw-p 00000000 00:00 0  [stack]\n"
         );
         // Exactly the heap.
         assert_eq!(
-            maps(&[anon(STACK_BOTTOM + P, STACK_BOTTOM + 2 * P, RW)], &in_stack),
+            maps(&[anon(USER_STACK_BOTTOM + P, USER_STACK_BOTTOM + 2 * P, RW)], &in_stack),
             "7fffef801000-7fffef802000 rw-p 00000000 00:00 0  [stack]\n"
         );
     }
@@ -287,7 +284,7 @@ mod tests {
                 &[
                     file(0x40_2000, 0x40_7000, RW, 0x1000, false),
                     file(0x40_4000, 0x40_5000, RW, 0, true),
-                    file(STACK_BOTTOM, USER_STACK_TOP, RW, 0, false),
+                    file(USER_STACK_BOTTOM, USER_STACK_TOP, RW, 0, false),
                 ],
                 &LAYOUT
             ),
@@ -348,7 +345,8 @@ mod tests {
         assert!(brk.set(&mut vmas, 0x40_5800).succeeded);
         let fm = FileMapping { file_id: 1, offset: 0x2000, shared: false, may_write: true };
         vmas.map_file(MapPlace::Fixed(0x7f00_0000_0000), P, Prot::READ, fm).unwrap();
-        vmas.map(MapPlace::Fixed(STACK_BOTTOM), USER_STACK_TOP - STACK_BOTTOM, RW, Backing::Anonymous).unwrap();
+        vmas.map(MapPlace::Fixed(USER_STACK_BOTTOM), USER_STACK_TOP - USER_STACK_BOTTOM, RW, Backing::Anonymous)
+            .unwrap();
         assert_eq!(
             maps(vmas.iter(), &layout(brk.initial(), brk.mapped_end())),
             "00400000-00402000 r-xp 00000000 00:00 0\n\

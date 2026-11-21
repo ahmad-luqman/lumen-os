@@ -21,8 +21,9 @@ use crate::linux::{errno, general};
 use crate::sync::SleepMutex;
 
 // The initial user stack's size and bottom live in `lumen_vm`, next to
-// `USER_STACK_TOP` (its maps listing labels them `[stack]`).
-pub use lumen_vm::{USER_STACK_BOTTOM, USER_STACK_SIZE};
+// `USER_STACK_TOP`: `[USER_STACK_BOTTOM, USER_STACK_TOP)` is the range that
+// the maps listing labels `[stack]`.
+use lumen_vm::{USER_STACK_BOTTOM, USER_STACK_SIZE};
 
 const _: () = {
     assert!(FRAME_SIZE == PAGE_SIZE);
