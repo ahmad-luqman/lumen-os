@@ -1,0 +1,9 @@
+[package]
+name = "lumen-bcache"
+description = "no_std BlockDevice trait, 4 KiB LRU block cache, and in-memory test device for the Lumen kernel, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

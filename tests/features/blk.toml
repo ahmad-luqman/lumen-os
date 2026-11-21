@@ -1,0 +1,21 @@
+# Features: block devices and block cache (M7). See tests/features/README.md for the format.
+
+[[feature]]
+name = "Block device trait and 4 KiB LRU block cache (`lumen-bcache`): geometry/capacity validation, RAII `PinnedBlock`/`PinnedBlockMut` (`CacheFull` when all slots pinned), `read_at`/`write_at` bounds and zero-length no-op checks, read-only guard before mutation, partial tail-block clamping on reads and writebacks, ascending `block_id` writeback ordering, `needs_device_flush` crash-consistency barrier across LRU eviction, and injected I/O error recovery"
+milestone = "M7"
+tests = [
+    "cargo:lumen-bcache",
+    "ktest:lumen_kernel::blk::block_cache_over_virtio_blk_persists_through_sync",
+    "audit:flags",
+]
+
+[[feature]]
+name = "`virtio-blk` MSI-X PCI driver (`kernel/src/blk/`) and `blk` shell command: bounded `MAX_BLK_DEVICES = 4` static doorbell pool (declining 5th+ device cleanly), `VERSION_1`/`RO`/`BLK_SIZE`/`FLUSH` negotiation, direct `VirtQueue` + `SleepMutex` + bounded `StatusHandle::wait_for` waits, `<= 4 KiB` multi-chunk transfers, `used_len` + status completion checks, sector read/write/flush persistence across QEMU reboots, and read-only enforcement"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::blk::virtio_blk_reads_writes_flushes_and_checks_bounds",
+    "scenario:test_blk::test_read_write_sectors",
+    "scenario:test_blk::test_readonly_device_rejects_writes",
+    "scenario:test_blk::test_max_blk_devices_declines_fifth",
+    "audit:flags",
+]

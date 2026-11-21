@@ -272,6 +272,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: sysinfo::lspci,
     },
     Command {
+        name: "blk",
+        args: &[&["read", "write", "flush"]],
+        usage: "[read <id> <lba> [sectors] | write <id> <lba> <hex> [sectors] | flush <id>]",
+        about: "block devices (read, write, flush: raw 512-byte sector I/O)",
+        run: crate::blk::command,
+    },
+    Command {
         name: "mouse",
         args: &[&["hold", "release", "events"]],
         usage: "[hold|release|events [n]]",

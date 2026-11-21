@@ -126,8 +126,10 @@ use crate::sync::SpinLock;
 
 /// Entries in the table of outstanding DMA runs. From the counts in
 /// section 7: input 36 (32 posted events and its rings) plus sound 40 idle
-/// plus rng about 3 is about 79 at boot; with sound's 96 buffers in flight
-/// and 3 for a control request, about 178 while it streams.
+/// plus rng about 3 plus virtio-blk 5 per bound device (2 persistent queue
+/// `Dma` runs + up to 3 transient `Bounce` runs, max 20 for `MAX_BLK_DEVICES = 4`)
+/// is about 99 at boot; with sound's 96 buffers in flight and 3 for a
+/// control request, about 198 worst-case while sound streams.
 const RUNS: usize = 256;
 
 /// What a run in the table was handed out as: `dma_dealloc` frees only a
@@ -1274,8 +1276,9 @@ crate::ktest!(
 );
 
 /// The ktest machine's first virtio device of `kind` (virtio 1.2 §5 device
-/// type: 1 network, 2 block, 3 console, 5 balloon, 8 SCSI, 9 9p, 18 input:
-/// keyboards and a mouse; no driver takes those in M3).
+/// type: 1 network, 2 block (bound by `virtio-blk`), 3 console, 5 balloon,
+/// 8 SCSI, 9 9p, 16 GPU, 18 input: keyboards and a mouse; no driver takes
+/// 1, 3, 5, 8, 9, 16, or 18 in M7).
 #[cfg(feature = "ktest")]
 pub fn ktest_device(kind: u16) -> Result<&'static DeviceInfo, &'static str> {
     crate::pci::devices()
@@ -1587,7 +1590,7 @@ crate::ktest!(
     fn transport_brings_up_a_virtio_device_through_the_hal() {
         use crate::pci::{self, Probed};
         use crate::{kassert, kassert_eq};
-        let d = ktest_device(2)?;
+        let d = ktest_device(16)?;
         let res = pci::claim(d.addr, "ktest").map_err(|_| "the claim failed")?;
         let runs = outstanding_runs();
         let mut t = transport(res, || {}).map_err(|e| {
@@ -1595,7 +1598,7 @@ crate::ktest!(
             "transport failed"
         })?;
         kassert!(PROBING.lock().is_none());
-        kassert_eq!(t.device_type(), DeviceType::Block);
+        kassert_eq!(t.device_type(), DeviceType::GPU);
         kassert_eq!(t.info().addr, d.addr);
         // The status handle reads what the transport does.
         let status = t.status();

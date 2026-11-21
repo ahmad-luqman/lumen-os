@@ -42,6 +42,7 @@ pub static DRIVERS: &[Driver] = &[
     Driver { name: crate::rng::DRIVER, matches: crate::rng::matches, probe: crate::rng::probe },
     crate::mouse::DRIVER,
     crate::sound::DRIVER,
+    crate::blk::DRIVER,
 ];
 
 static PROBED: AtomicBool = AtomicBool::new(false);
