@@ -251,8 +251,10 @@ impl MountTable {
 /// false into either cache: each one that would hands it back as its
 /// success value (`Ok(inode)`, `Some(inode)` or `inode`), unified with
 /// nothing. (`dentry_insert` and `dentry_insert_if_gen` take a bare
-/// [`DentryTarget`] and can't check: their callers, a created inode's
-/// re-publish and `link_at`, run only after a create or link succeeded.)
+/// [`DentryTarget`] and can't check. `ops`'s re-publish of a created inode
+/// calls them only when the inode was unified with an already cached one,
+/// which a non-cacheable inode never is; `link_at` is safe only because no
+/// writable filesystem has non-cacheable inodes.)
 pub trait VfsCacheOps {
     fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn is_global_root(&self, dev: DevId, ino: Ino) -> bool;

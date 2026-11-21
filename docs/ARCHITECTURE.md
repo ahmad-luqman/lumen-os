@@ -5125,11 +5125,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `VfsCacheOps` method that would insert one (`publish_lookup_inode`,
     `inode_get_or_insert_if_fresh`, ...: a lookup, `..`, a magic link's
     target, `open(O_CREAT)` of an existing name) hands it back as its
-    success value instead, inserted into neither cache (never `Err`, which
-    would make the caller retry). A non-cacheable directory's children are
+    success value instead, inserted into neither cache (a mounted one is
+    never refused as stale, the `Err` that makes the caller retry). A non-cacheable directory's children are
     non-cacheable too: a dentry is keyed by its parent's `(dev, ino)`, so a
     cached child's dentry would outlive its parent (a `debug_assert!` in
-    the resolver, on in the kernel's builds, checks it). `procfs`'s `self`,
+    the resolver, on in the kernel's builds, checks it on a plain lookup). `procfs`'s `self`,
     `/proc/<pid>` and everything under it are the only ones (#263): they go
     with their process or fd, and pids only grow. Each lookup of one builds
     a fresh inode, so two opens of the same `/proc/<pid>` file don't share

@@ -1553,8 +1553,8 @@ fn lock9_is_never_held_during_inode_calls() {
     }
 
     // Leaves out `SimpleVfsTables`'s `VfsInode::cacheable` checks: no
-    // filesystem mounted on these tables has a non-cacheable inode (#264's one
-    // generic tables type would remove this copy).
+    // filesystem mounted on these tables has a non-cacheable inode (#264's
+    // generic `KernelVfsTables` could let these share the check).
     impl VfsCacheOps for ProbeGuardEnv {
         fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
             let root_fs = self.mounts.lock().unwrap().root_fs().ok_or(VfsError::NoEnt)?;
@@ -2777,8 +2777,8 @@ fn lookup_component_does_not_resurrect_dentry_across_concurrent_rename_unlink_or
     }
 
     // Leaves out `SimpleVfsTables`'s `VfsInode::cacheable` checks: no
-    // filesystem mounted on these tables has a non-cacheable inode (#264's one
-    // generic tables type would remove this copy).
+    // filesystem mounted on these tables has a non-cacheable inode (#264's
+    // generic `KernelVfsTables` could let these share the check).
     impl VfsCacheOps for SyncTestEnv {
         fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
             let root_fs = self.mounts.lock().unwrap().root_fs().ok_or(VfsError::NoEnt)?;
@@ -3563,8 +3563,8 @@ impl SyncVfsTables {
 }
 
 // Leaves out `SimpleVfsTables`'s `VfsInode::cacheable` checks: no
-// filesystem mounted on these tables has a non-cacheable inode (#264's one
-// generic tables type would remove this copy).
+// filesystem mounted on these tables has a non-cacheable inode (#264's
+// generic `KernelVfsTables` could let these share the check).
 impl VfsCacheOps for SyncVfsTables {
     fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
         let root_fs = {
@@ -7298,8 +7298,9 @@ fn concurrent_compute_cwd_path_vs_rename_at2_stress() {
 /// A `procfs`-like filesystem for `VfsInode::cacheable` (#263): `/<pid>`
 /// exists while `pid` is in `live`, holding `fd/0` (a magic link to `info`,
 /// there until its pid is in `closed_fds`) and `info`; all of those are
-/// non-cacheable, `version` is cacheable. `/<pid>/cached` breaks the rule
-/// that a non-cacheable directory's children are non-cacheable.
+/// non-cacheable, `version` is cacheable. `/<pid>/ver` is a magic link to
+/// `version`. `/<pid>/cached` breaks the rule that a non-cacheable
+/// directory's children are non-cacheable.
 mod uncached {
     use super::*;
     use alloc::collections::BTreeSet;
@@ -7317,8 +7318,6 @@ mod uncached {
         pub(super) magic_resolves: AtomicU64,
     }
 
-    type Live = Arc<Shared>;
-
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Node {
         Root,
@@ -7327,6 +7326,7 @@ mod uncached {
         Fd(u32),
         Info(u32),
         FdLink(u32),
+        VerLink(u32),
     }
 
     impl Node {
@@ -7339,13 +7339,14 @@ mod uncached {
                 Self::Fd(p) => per(p, 1),
                 Self::Info(p) => per(p, 2),
                 Self::FdLink(p) => per(p, 3),
+                Self::VerLink(p) => per(p, 4),
             }
         }
 
         fn pid(self) -> Option<u32> {
             match self {
                 Self::Root | Self::Version => None,
-                Self::Pid(p) | Self::Fd(p) | Self::Info(p) | Self::FdLink(p) => Some(p),
+                Self::Pid(p) | Self::Fd(p) | Self::Info(p) | Self::FdLink(p) | Self::VerLink(p) => Some(p),
             }
         }
 
@@ -7353,20 +7354,20 @@ mod uncached {
             match self {
                 Self::Root | Self::Pid(_) | Self::Fd(_) => InodeType::Dir,
                 Self::Version | Self::Info(_) => InodeType::File,
-                Self::FdLink(_) => InodeType::Symlink,
+                Self::FdLink(_) | Self::VerLink(_) => InodeType::Symlink,
             }
         }
     }
 
     pub(super) struct DynFs {
         dev: DevId,
-        pub(super) shared: Live,
+        pub(super) shared: Arc<Shared>,
         root: Arc<DynInode>,
     }
 
     impl DynFs {
         pub(super) fn new(dev: DevId) -> Arc<Self> {
-            let shared: Live = Arc::new(Shared::default());
+            let shared = Arc::new(Shared::default());
             let root = DynInode::new(dev, Node::Root, Arc::clone(&shared));
             Arc::new(Self { dev, shared, root })
         }
@@ -7399,13 +7400,13 @@ mod uncached {
         lock_id: u64,
         dev: DevId,
         node: Node,
-        shared: Live,
+        shared: Arc<Shared>,
         open_count: AtomicU32,
         locks: Mutex<AdvisoryLocks>,
     }
 
     impl DynInode {
-        fn new(dev: DevId, node: Node, shared: Live) -> Arc<Self> {
+        fn new(dev: DevId, node: Node, shared: Arc<Shared>) -> Arc<Self> {
             Arc::new(Self {
                 lock_id: next_lock_id(),
                 dev,
@@ -7465,6 +7466,7 @@ mod uncached {
             self.shared.magic_resolves.fetch_add(1, Ordering::Relaxed);
             match self.node {
                 Node::FdLink(p) if self.fd_open(p) => Some(self.spawn(Node::Info(p))),
+                Node::VerLink(p) if self.alive(p) => Some(self.spawn(Node::Version)),
                 _ => None,
             }
         }
@@ -7508,6 +7510,7 @@ mod uncached {
                 (Node::Pid(p), "fd") => Ok(self.spawn(Node::Fd(p))),
                 (Node::Pid(p), "info") => Ok(self.spawn(Node::Info(p))),
                 (Node::Pid(_), "cached") => Ok(self.spawn(Node::Version)),
+                (Node::Pid(p), "ver") => Ok(self.spawn(Node::VerLink(p))),
                 (Node::Fd(p), "..") => Ok(self.spawn(Node::Pid(p))),
                 (Node::Fd(p), "0") if self.fd_open(p) => Ok(self.spawn(Node::FdLink(p))),
                 (Node::Pid(_) | Node::Fd(_), _) => Err(VfsError::NoEnt),
@@ -7535,7 +7538,8 @@ mod uncached {
         fn readlink(&self) -> Result<Vec<u8>, VfsError> {
             match self.node {
                 Node::FdLink(_) if self.is_live() => Ok(b"../info".to_vec()),
-                Node::FdLink(_) => Err(VfsError::NoEnt),
+                Node::VerLink(_) if self.is_live() => Ok(b"../version".to_vec()),
+                Node::FdLink(_) | Node::VerLink(_) => Err(VfsError::NoEnt),
                 _ => Err(VfsError::Inval),
             }
         }
@@ -7663,6 +7667,13 @@ fn non_cacheable_child_that_disappears_is_enoent_on_the_next_resolve() {
     let version = resolve_path(&env, None, b"/proc/version", nofollow).unwrap().inode;
     assert_eq!(env.dentry_get(DYNFS_DEV, proc_root.ino(), "version").map(|t| t.ino), Some(version.ino()));
     assert!(Arc::ptr_eq(&env.inode_get(DYNFS_DEV, version.ino()).unwrap(), &version));
+    // A non-cacheable magic link still lands on its cacheable target's
+    // cached inode, asking for the link once.
+    let (lookups, magic) = dynfs.asked();
+    let via_link = resolve_path(&env, None, b"/proc/7/ver", follow).unwrap().inode;
+    let (lookups_after, magic_after) = dynfs.asked();
+    assert!(Arc::ptr_eq(&via_link, &version));
+    assert_eq!((lookups_after - lookups, magic_after - magic), (2, 1));
 
     dynfs.shared.live.lock().unwrap().remove(&7);
     for (path, flags) in paths {
