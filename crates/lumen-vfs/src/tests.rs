@@ -2354,3 +2354,132 @@ fn unchallenged_edges_tmpfile_link_empty_path_and_access() {
     assert_eq!(check_access(&env, &non_exempt, AccessMask(AccessMask::W_OK), 0, 0), Err(VfsError::RoFs));
     assert_eq!(check_access(&env, &ro_exempt, AccessMask(AccessMask::W_OK), 0, 0), Ok(()));
 }
+
+#[test]
+fn open_creat_chained_trailing_slash_magic_depth_and_sym_dir_edges() {
+    let (env, _) = setup_vfs();
+    let sub = mkdir_at(&env, None, b"/sub", 0o755, 0).unwrap();
+    let (existing_file, _) =
+        open_inode(&env, None, b"/sub/existing_file", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+
+    // 1. Chained trailing-slash symlinks under O_CREAT must preserve trailing `/`.
+    symlink_at(&env, b"s2_missing/", None, b"/s1_missing").unwrap();
+    symlink_at(&env, b"missing", None, b"/s2_missing").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/s1_missing", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap_err(),
+        VfsError::IsDir
+    );
+    assert_eq!(resolve_path(&env, None, b"/missing", ResolveFlags::default()).unwrap_err(), VfsError::NoEnt);
+
+    symlink_at(&env, b"s2_file/", None, b"/s1_file").unwrap();
+    symlink_at(&env, b"/sub/existing_file", None, b"/s2_file").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/s1_file", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap_err(),
+        VfsError::NotDir
+    );
+    assert_eq!(
+        open_inode(&env, None, b"/s1_file", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0).unwrap_err(),
+        VfsError::NotDir
+    );
+
+    symlink_at(&env, b"s2_dir/", None, b"/s1_dir").unwrap();
+    symlink_at(&env, b"/sub", None, b"/s2_dir").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/s1_dir", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0).unwrap_err(),
+        VfsError::IsDir
+    );
+
+    // 2. Magic symlink to regular file with trailing `/` under O_CREAT -> ENOTDIR; to dir -> EISDIR.
+    let proc_mp = mkdir_at(&env, None, b"/proc", 0o755, 0).unwrap();
+    let proc_fs = MemFs::new(DevId::PROCFS, "procfs", false);
+    proc_fs.add_magic_link(&proc_fs.root, "fd0", "/sub/existing_file", Arc::clone(&existing_file));
+    proc_fs.add_magic_link(&proc_fs.root, "fd_dir", "/sub", Arc::clone(&sub));
+    env.mount(proc_mp, "/proc", proc_fs).unwrap();
+
+    symlink_at(&env, b"/proc/fd0/", None, b"/outer_magic_file").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/outer_magic_file", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::NotDir
+    );
+    assert_eq!(
+        open_inode(&env, None, b"/outer_magic_file", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap_err(),
+        VfsError::NotDir
+    );
+
+    symlink_at(&env, b"/proc/fd_dir/", None, b"/outer_magic_dir").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/outer_magic_dir", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::IsDir
+    );
+
+    // 3. Symlink prefix depth 21..=40 with `/.` and `/..` under O_CREAT -> EISDIR (and 41 -> ELOOP).
+    mkdir_at(&env, None, b"/chain", 0o755, 0).unwrap();
+    mkdir_at(&env, None, b"/chain/real", 0o755, 0).unwrap();
+    symlink_at(&env, b"real", None, b"/chain/d1").unwrap();
+    for i in 2..=41 {
+        let tgt = format!("d{}", i - 1);
+        let name = format!("/chain/d{i}");
+        symlink_at(&env, tgt.as_bytes(), None, name.as_bytes()).unwrap();
+    }
+    for path in [b"/chain/d21/." as &[u8], b"/chain/d40/.", b"/chain/d21/..", b"/chain/d40/.."] {
+        assert_eq!(
+            open_inode(&env, None, path, OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0).unwrap_err(),
+            VfsError::IsDir
+        );
+        assert_eq!(
+            open_inode(
+                &env,
+                None,
+                path,
+                OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDONLY),
+                0o644,
+                0
+            )
+            .unwrap_err(),
+            VfsError::Exist
+        );
+    }
+    for path in [b"/chain/d41/." as &[u8], b"/chain/d41/.."] {
+        assert_eq!(
+            open_inode(&env, None, path, OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0).unwrap_err(),
+            VfsError::Loop
+        );
+    }
+    assert_eq!(
+        open_inode(&env, None, b"/", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0).unwrap_err(),
+        VfsError::IsDir
+    );
+    assert_eq!(
+        open_inode(&env, None, b"/", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::Exist
+    );
+
+    // 4. Intermediate symlinked directory + existing regular file with trailing `/` -> EISDIR (consistent with real dir),
+    // while symlink target with trailing `/` to existing regular file still returns ENOTDIR.
+    mkdir_at(&env, None, b"/real_dir", 0o755, 0).unwrap();
+    open_inode(&env, None, b"/real_dir/f", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    symlink_at(&env, b"/real_dir", None, b"/sym_dir").unwrap();
+    symlink_at(&env, b"/real_dir/f/", None, b"/sym_to_file_slash").unwrap();
+
+    assert_eq!(
+        open_inode(&env, None, b"/real_dir/f/", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::IsDir
+    );
+    assert_eq!(
+        open_inode(&env, None, b"/sym_dir/f/", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::IsDir
+    );
+    assert_eq!(
+        open_inode(&env, None, b"/sym_to_file_slash", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::NotDir
+    );
+}

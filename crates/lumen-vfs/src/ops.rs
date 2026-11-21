@@ -47,25 +47,32 @@ pub fn open_inode(
 
     let inode = if flags.has_creat() {
         let mut symlink_depth = 0usize;
+        let mut first_hop = true;
         let mut cur_start_dir: Option<Arc<dyn VfsInode>> = start_dir.map(Arc::clone);
         let mut cur_path: Vec<u8> = path.to_vec();
 
         loop {
             let target = resolve_parent_with_depth(env, cur_start_dir.as_ref(), &cur_path, &mut symlink_depth)?;
-            if target.name == "/" || target.name == "." || target.name == ".." {
+            if target.name == "/" {
+                if flags.has_excl() {
+                    return Err(VfsError::Exist);
+                }
+                break cross_mounts_down(env, Arc::clone(&target.parent));
+            }
+            if target.name == "." || target.name == ".." {
                 if flags.has_excl() {
                     return Err(VfsError::Exist);
                 }
                 break resolve_path_with_depth(
                     env,
-                    cur_start_dir.as_ref(),
-                    &cur_path,
+                    Some(&target.parent),
+                    target.name.as_bytes(),
                     ResolveFlags { follow_final: !flags.has_nofollow(), empty_path: false, require_dir: true },
                     &mut symlink_depth,
                 )?
                 .inode;
             }
-            if symlink_depth == 0 && target.has_trailing_slash {
+            if first_hop && target.has_trailing_slash {
                 return Err(VfsError::IsDir);
             }
 
@@ -85,9 +92,13 @@ pub fn open_inode(
                         }
                         if let Some(magic_target) = existing.resolve_magic_link() {
                             let magic_target = env.inode_get_or_insert(magic_target);
-                            break cross_mounts_down(env, magic_target);
+                            let resolved = cross_mounts_down(env, magic_target);
+                            if target.has_trailing_slash && resolved.inode_type() != InodeType::Dir {
+                                return Err(VfsError::NotDir);
+                            }
+                            break resolved;
                         }
-                        let link_target = existing.readlink()?;
+                        let mut link_target = existing.readlink()?;
                         if link_target.is_empty() {
                             return Err(VfsError::NoEnt);
                         }
@@ -97,6 +108,13 @@ pub fn open_inode(
                         if link_target.len() >= PATH_MAX {
                             return Err(VfsError::NameTooLong);
                         }
+                        if target.has_trailing_slash && !link_target.ends_with(b"/") {
+                            if link_target.len() + 1 >= PATH_MAX {
+                                return Err(VfsError::NameTooLong);
+                            }
+                            link_target.push(b'/');
+                        }
+                        first_hop = false;
                         cur_start_dir =
                             if link_target.starts_with(b"/") { None } else { Some(Arc::clone(&target.parent)) };
                         cur_path = link_target;
