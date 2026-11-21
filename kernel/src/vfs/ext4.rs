@@ -317,6 +317,18 @@ fn is_inline_symlink(inode: &Inode) -> bool {
         && inode.size_in_bytes() <= 60
 }
 
+/// Whether `i_block` holds something other than block numbers that
+/// `ext4plus`'s `delete_file` would still free as blocks: an inline symlink's
+/// target text, or a character or block device's device number (Linux keeps
+/// `rdev` in `i_block` and allocates no blocks; old-style 1:3 is `0x0103`,
+/// i.e. block 259).
+fn i_block_holds_no_block_numbers(inode: &Inode) -> bool {
+    is_inline_symlink(inode)
+        || (matches!(inode.file_type(), FileType::CharacterDevice | FileType::BlockDevice)
+            && !inode.flags().contains(InodeFlags::EXTENTS)
+            && inode.blocks() == 0)
+}
+
 fn entry_name(name: &str) -> Result<DirEntryName<'_>, VfsError> {
     if name.len() > lumen_vfs::NAME_MAX {
         return Err(VfsError::NameTooLong);
@@ -911,12 +923,13 @@ impl Ext4Inode {
         Ok(buf)
     }
 
-    /// Zero an inline (fast) symlink's size and `i_block` on disk before the
-    /// unlink that frees it, and hand back the bytes to restore if the unlink
-    /// fails. `ext4plus`'s `delete_file` reads `i_block` as block numbers (it
-    /// has no fast-symlink case), so freeing an inode whose `i_block` holds
-    /// target text would free or panic on garbage "blocks". Only when this is
-    /// the last link: other links keep the target.
+    /// Zero an inline (fast) symlink's or a device node's size and `i_block`
+    /// on disk before the unlink that frees it, and hand back the bytes to
+    /// restore if the unlink fails. `ext4plus`'s `delete_file` reads `i_block`
+    /// as block numbers (it has no fast-symlink or device case), so freeing an
+    /// inode whose `i_block` holds target text or a device number would free
+    /// someone else's blocks or panic on garbage ones. Only when this is the
+    /// last link: other links keep the target or device number.
     fn zero_inline_symlink_before_unlink(
         inner: &Ext4FsInner,
         disk_ino: u32,
@@ -924,7 +937,7 @@ impl Ext4Inode {
         child_nlink: u32,
     ) -> Result<(Inode, Option<SavedInlineSymlink>), VfsError> {
         let idx = NonZeroU32::new(disk_ino).ok_or(VfsError::Inval)?;
-        if child_nlink <= 1 && disk.links_count() <= 1 && is_inline_symlink(&disk) {
+        if child_nlink <= 1 && disk.links_count() <= 1 && i_block_holds_no_block_numbers(&disk) {
             let off = inner.layout.inode_disk_offset(&inner.bcache, disk_ino)?;
             // Read the contiguous inode span `[0x04..0x70)` covering `size_lo` (0x04..0x08),
             // `inline_60` (0x28..0x64), and `size_hi` (0x6c..0x70) so we can zero all three
@@ -4124,6 +4137,46 @@ crate::ktest!(
         kassert_eq!(got, data);
         let link = ro.root_inode().lookup("long").map_err(|_| "ro lookup long")?;
         kassert_eq!(link.readlink().map_err(|_| "readlink")?, target.into_bytes());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_unlinking_a_device_node_frees_no_blocks() {
+        // A device node keeps its device number in `i_block` (Linux and
+        // mke2fs -d make them; the adapter can't). Here its "device number"
+        // is the block holding another file's data: unlinking the node must
+        // free its inode and nothing else.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        const BS: usize = 1024;
+        const ISZ: usize = 256;
+        let inode_off = |ino: u64| 5 * BS + (ino as usize - 1) * ISZ;
+        let m = mount(build_1k_blockmap_image(512), 202)?;
+        let keep = m.root.create("keep.bin", 0o644).map_err(|_| "create keep")?;
+        let data = pattern(BS, 3);
+        kassert_eq!(keep.write_at(0, &data).map_err(|_| "write keep")?, data.len());
+        keep.sync(false).map_err(|_| "sync keep")?;
+        let dev = m.root.create("null", 0o644).map_err(|_| "create node")?;
+        let (keep_ino, dev_ino) = (keep.ino(), dev.ino());
+        drop((keep, dev));
+        m.fs.sync().map_err(|_| "fs sync")?;
+        let mut img = image(&m)?;
+        drop(m);
+        let keep_block = u32::from_le_bytes(img[inode_off(keep_ino) + 0x28..][..4].try_into().unwrap());
+        kassert!(keep_block != 0);
+        let d = &mut img[inode_off(dev_ino)..][..ISZ];
+        d[0..2].copy_from_slice(&0o020666u16.to_le_bytes());
+        d[0x28..0x2c].copy_from_slice(&keep_block.to_le_bytes());
+
+        let m = mount(img, 203)?;
+        let (inodes, blocks) = (free_inodes(&m.fs), free_blocks(&m.fs));
+        m.root.unlink("null").map_err(|_| "unlink node")?;
+        kassert_eq!(free_inodes(&m.fs), inodes + 1);
+        kassert_eq!(free_blocks(&m.fs), blocks);
+        let ro = remount_ro(&m, 204)?;
+        kassert_eq!(free_blocks(&ro), blocks);
+        kassert_eq!(read_all(&ro.root_inode().lookup("keep.bin").map_err(|_| "ro lookup")?)?, data);
         Ok(())
     }
 );

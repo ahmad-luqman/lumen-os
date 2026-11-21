@@ -5031,6 +5031,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     bytes as block numbers; because `Inode::set_inline_data` is `pub(crate)` in
     `ext4plus`, #253 MUST zero `i_block` (`0x28..0x64`) and `i_size` on disk via
     `BlockCache` (and re-read `Inode`) before `Dir::unlink` on inline symlinks.
+    The same applies to character and block device nodes (which Linux and
+    `mke2fs -d` create): they keep `rdev` in `i_block` with no blocks
+    allocated, so the adapter zeroes it the same way before freeing them.
   - **Truncate partial-block tail zeroing:** `ext4plus::file::truncate` does
     not zero `[new_size % 4096 .. 4096)` in the partial final block on shrink;
     #253's `PageCache` / truncate path MUST enforce the tail-zeroing rule above.
