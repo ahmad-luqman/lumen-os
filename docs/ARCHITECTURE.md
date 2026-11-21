@@ -5011,6 +5011,20 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
      `ftruncate`/`mmap` continue to work until `open_count` reaches 0, and
      detached directories return `-ENOENT` on `lookup`/`create`/`mkdir`/`link`/
      `symlink` and empty EOF on `getdents64` (while `getcwd` returns `-ENOENT`).
+   - **An open racing the unlink (#262):** an open raises `open_count` (an
+     `OpenGuard`) *before* its last check that the inode is live, and Gate 6
+     reads `open_count` and then frees or detaches the inode within one hold
+     of the target's Lock 4, the lock `stat()` takes. The check
+     (`OpenGuard::try_new`: `stat()`, then `is_detached()`) fails with
+     `-ENOENT` when `st_nlink == 0` and the inode isn't detached, giving the
+     reference back. So an unlink racing an open either sees the reference
+     and detaches (the new descriptor reads the data) or freed the inode
+     first (the open fails as if its lookup had lost the race); never a
+     descriptor on a freed inode. An `O_CREAT` open that creates the file
+     takes its reference under Lock 3 right after `create`, before any unlink
+     can run, so it never fails this way. Every filesystem with Gate 6 keeps
+     both halves: the count read and the free or detach under the lock
+     `stat()` takes, and `st_nlink == 0` reported for a freed inode.
    - **`ext4plus` has no native `s_last_orphan` orphan list:** `Dir::unlink`
      immediately zeroes and frees the inode and blocks once `links_count == 0`.
      Therefore VFS (#253) always uses the `detached_unlinked = true`
@@ -5208,6 +5222,15 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `FdEntry { file: Arc<OpenFile>, cloexec: bool }` in per-process `FdTable`
     (capacity `MAX_FDS = 1024`).
   - `OpenFile { id: OpenFileId, inode: Arc<VfsInode>, path: Arc<str>, flags: OpenFlags, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64> }`.
+  - **Opening (#262):** `open_inode_guarded` returns the `OpenGuard` it took
+    before its last liveness check (Gate 6 above) and
+    `OpenFile::from_guard` takes that reference over (one count, never two);
+    `openat` uses this pair. `open_inode` (its signature unchanged) returns
+    the inode with that reference given back: an `OpenFile::new` built from
+    it takes a fresh one through `OpenGuard::try_new`, refused with
+    `-ENOENT` if an unlink freed the inode in between. The unchecked
+    `OpenGuard::new` is only for an inode another reference already keeps
+    open (a clone, an inherited `cwd`).
   - `O_PATH` descriptors ignore `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND` and
     access mode; I/O, `lseek`, `mmap`, `ftruncate`, `flock`, `F_SETLK*`,
     `fsync`, `fchmod`, `fchown`, and `getdents64` return `-EBADF`, while

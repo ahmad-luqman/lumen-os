@@ -44,6 +44,14 @@ tests = [
 ]
 
 [[feature]]
+name = "An open racing an unlink never leaves a descriptor on a freed inode: the open reference is taken before the last liveness check and carried into the open file description, so the data stays readable or the open fails with ENOENT (#262)"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::vfs::ext4::ext4_open_racing_unlink_keeps_the_data_or_fails_cleanly",
+]
+
+[[feature]]
 name = "Pseudo-filesystems (/tmp tmpfs, /dev devfs, /proc procfs), boot mount with a tmpfs fallback (quiet for a disk without ext4, a warning for an ext4 disk that won't mount), and mount/sync shell commands"
 milestone = "M7"
 tests = [

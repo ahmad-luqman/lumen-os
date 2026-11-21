@@ -5012,3 +5012,48 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn ext4_open_racing_unlink_keeps_the_data_or_fails_cleanly() {
+        // #262: an unlink landing between the path lookup of an open and the
+        // open file description it builds. Gate 6 frees an inode nobody has
+        // open, so the reference must already be up by then.
+        use self::ktest_util::*;
+        use crate::vfs::{KernelVfsLock, KernelVfsTables};
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::{OpenFile, OpenFlags, open_inode, open_inode_guarded, unlink_at};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 242)?;
+        let tables = KernelVfsTables::new();
+        tables.mount_root(Arc::clone(&m.fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+        let data = pattern(2 * PAGE_SIZE + 100, 9);
+        for name in ["kept", "freed"] {
+            let f = m.root.create(name, 0o644).map_err(|_| "create")?;
+            kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
+            f.sync(false).map_err(|_| "sync")?;
+        }
+        let rd = OpenFlags::from_bits_truncate(OpenFlags::O_RDONLY);
+
+        // The guarded open's reference carries into the open file
+        // description: the unlink sees it and detaches, and the file reads
+        // its data.
+        let (guard, path) = open_inode_guarded(&tables, None, b"/kept", rd, 0, 0).map_err(|_| "open kept")?;
+        unlink_at(&tables, None, b"/kept", false).map_err(|_| "unlink kept")?;
+        let of = OpenFile::<KernelVfsLock<u64>>::from_guard(guard, Arc::from(path.as_str()), rd)
+            .map_err(|_| "OpenFile::from_guard")?;
+        kassert!(of.inode.is_detached());
+        kassert_eq!(of.inode.open_count(), 1);
+        kassert_eq!(read_all(&of.inode)?, data);
+        drop(of);
+
+        // `open_inode` holds no reference once it returns: the unlink frees
+        // the inode, and an open file description for it is refused.
+        let (inode, path) = open_inode(&tables, None, b"/freed", rd, 0, 0).map_err(|_| "open freed")?;
+        kassert_eq!(inode.open_count(), 0);
+        unlink_at(&tables, None, b"/freed", false).map_err(|_| "unlink freed")?;
+        kassert!(!inode.is_detached());
+        let res = OpenFile::<KernelVfsLock<u64>>::new(Arc::clone(&inode), Arc::from(path.as_str()), rd);
+        kassert_eq!(res.err(), Some(VfsError::NoEnt));
+        kassert_eq!(inode.open_count(), 0);
+        Ok(())
+    }
+);

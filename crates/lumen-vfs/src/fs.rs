@@ -58,6 +58,14 @@ pub trait VfsInode: Send + Sync {
 
     /// Explicit atomic open-reference count (`OpenFile`, `cwd`, `mapped_files`),
     /// distinct from `Arc<dyn VfsInode>` cache strong refs.
+    ///
+    /// Gate 6 contract (ARCHITECTURE section 9): an `unlink`, `rmdir` or
+    /// rename-overwrite that removes the last link reads `open_count()` and
+    /// then either frees the inode (`stat().nlink == 0`, not detached) or
+    /// detaches it (`is_detached()`), all within one hold of the lock that
+    /// `stat()` takes. [`OpenGuard::try_new`] raises the count first and then
+    /// calls `stat()`, so either the remover sees the new reference and
+    /// detaches, or the opener sees the freed inode and fails with `ENOENT`.
     fn open_count(&self) -> u32;
 
     /// Increment explicit open-reference count.
@@ -169,16 +177,50 @@ pub struct OpenGuard {
 }
 
 impl OpenGuard {
-    /// Acquire an open reference on `inode`.
+    /// Acquire an open reference on `inode` without checking that it is
+    /// still linked or detached.
+    ///
+    /// Only for an inode some other reference already keeps open (a clone, a
+    /// `cwd` inherited by `fork`) or for tests: on an inode found by a path
+    /// lookup, an `unlink` landing between the lookup and this increment
+    /// frees the inode under the new reference. Opens go through
+    /// [`OpenGuard::try_new`] (or [`open_inode_guarded`](crate::ops::open_inode_guarded)).
     pub fn new(inode: Arc<dyn VfsInode>) -> Self {
         inode.inc_open_count();
         Self { inode }
+    }
+
+    /// Acquire an open reference on `inode`, then check that the inode
+    /// hasn't been freed: `ENOENT` (the reference given back) if
+    /// `stat().nlink == 0` and it isn't detached, or `stat()`'s own error.
+    ///
+    /// The count is raised before the check, and Gate 6 reads the count and
+    /// frees or detaches under the lock `stat()` takes, so an `unlink` racing
+    /// this call either detaches the inode (the data stays readable through
+    /// the guard) or has already freed it (this returns `ENOENT`); never a
+    /// guard on a freed inode. `stat()` takes the inode's Lock 4: never call
+    /// this holding it, or under Lock 9.
+    pub fn try_new(inode: Arc<dyn VfsInode>) -> Result<Self, VfsError> {
+        inode.inc_open_count();
+        let guard = Self { inode };
+        // On an error `guard` drops here and gives the reference back.
+        ensure_not_freed(&guard.inode)?;
+        Ok(guard)
     }
 
     /// Borrow the guarded inode.
     pub fn inode(&self) -> &Arc<dyn VfsInode> {
         &self.inode
     }
+}
+
+/// `ENOENT` if `inode` was freed by an unlink (`nlink == 0`, not detached).
+/// A detached inode (unlinked while open) is still live.
+fn ensure_not_freed(inode: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+    let meta = inode.stat()?;
+    // `is_detached` after `stat`: a detach sets both under the lock `stat`
+    // took, so a zero `nlink` seen there comes with its `detached` flag.
+    if meta.nlink == 0 && !inode.is_detached() { Err(VfsError::NoEnt) } else { Ok(()) }
 }
 
 impl Clone for OpenGuard {

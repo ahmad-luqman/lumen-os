@@ -69,15 +69,29 @@ pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
 }
 
 impl<L: VfsLock<u64>> OpenFile<L> {
-    /// Construct a new open file description with `fd_refs = 1` and an active [`OpenGuard`].
+    /// Construct a new open file description with `fd_refs = 1`, taking a
+    /// checked open reference ([`OpenGuard::try_new`]).
+    ///
+    /// `ENOENT` if `inode` was freed by an unlink since it was looked up
+    /// (between [`open_inode`](crate::ops::open_inode) returning and this
+    /// call, say). Opens should prefer
+    /// [`open_inode_guarded`](crate::ops::open_inode_guarded) and
+    /// [`OpenFile::from_guard`], which can't lose that race.
     pub fn new(inode: Arc<dyn VfsInode>, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
+        flags.access_mode()?;
+        Self::from_guard(OpenGuard::try_new(inode)?, path, flags)
+    }
+
+    /// Construct a new open file description with `fd_refs = 1` that takes
+    /// over `guard`'s open reference (no second count): the one
+    /// [`open_inode_guarded`](crate::ops::open_inode_guarded) returns.
+    pub fn from_guard(guard: OpenGuard, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
         let access_mode = flags.access_mode()?;
         let is_path = flags.is_path();
         let status_bits = if is_path { 0 } else { flags.status_bits() };
-        let open_guard = OpenGuard::new(Arc::clone(&inode));
         Ok(Self {
             id: next_open_file_id(),
-            inode,
+            inode: Arc::clone(guard.inode()),
             path,
             access_mode,
             is_path,
@@ -85,7 +99,7 @@ impl<L: VfsLock<u64>> OpenFile<L> {
             fd_refs: AtomicU32::new(1),
             offset: L::new(0),
             dir_cursor: L::new(0),
-            _open_guard: open_guard,
+            _open_guard: guard,
         })
     }
 

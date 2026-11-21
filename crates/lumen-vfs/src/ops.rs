@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use crate::cache::DentryTarget;
 use crate::error::VfsError;
-use crate::fs::VfsInode;
+use crate::fs::{OpenGuard, VfsInode};
 use crate::mount::VfsCacheOps;
 use crate::resolve::{
     MAX_INODE_RACE_RETRIES, ResolveFlags, cross_mounts_down, resolve_and_unify_magic_target, resolve_parent,
@@ -204,9 +204,15 @@ fn lookup_and_unify_inode(
 }
 
 /// Open or create a file/directory/device inode according to POSIX/`openat(2)`
-/// semantics.
+/// semantics, returning `(inode, normalized_path_string)` with no open
+/// reference held: [`open_inode_guarded`] with its guard given back.
 ///
-/// Returns `(inode, normalized_path_string)` ready for constructing an [`OpenFile`](crate::fd::OpenFile).
+/// The inode was live when the open checked it, but an `unlink` can free it
+/// once this returns. An open file description built from it with
+/// [`OpenFile::new`](crate::fd::OpenFile::new) then fails with `ENOENT`
+/// (that call checks again); an [`OpenGuard::new`] on it can hold a freed
+/// inode. File descriptors use [`open_inode_guarded`] and
+/// [`OpenFile::from_guard`](crate::fd::OpenFile::from_guard).
 pub fn open_inode(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
@@ -215,6 +221,26 @@ pub fn open_inode(
     mode: u16,
     umask: u16,
 ) -> Result<(Arc<dyn VfsInode>, String), VfsError> {
+    let (guard, path_str) = open_inode_guarded(env, start_dir, path, flags, mode, umask)?;
+    Ok((Arc::clone(guard.inode()), path_str))
+}
+
+/// [`open_inode`] returning the open reference it took: an [`OpenGuard`]
+/// for [`OpenFile::from_guard`](crate::fd::OpenFile::from_guard).
+///
+/// The reference is taken ([`OpenGuard::try_new`]) before the last check
+/// that the inode is live and before `O_TRUNC`'s truncate, so an `unlink`
+/// racing the open either detaches the inode (Gate 6 sees the reference;
+/// the data stays readable) or freed it first (`ENOENT`, as if the lookup
+/// had lost the race). Every error gives the reference back.
+pub fn open_inode_guarded(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    flags: OpenFlags,
+    mode: u16,
+    umask: u16,
+) -> Result<(OpenGuard, String), VfsError> {
     if flags.has_tmpfile() {
         return Err(VfsError::OpNotSupp);
     }
@@ -229,7 +255,7 @@ pub fn open_inode(
             path,
             ResolveFlags { follow_final: !flags.has_nofollow(), empty_path: false, require_dir: flags.has_directory() },
         )?;
-        return Ok((resolved.inode, path_str));
+        return Ok((OpenGuard::try_new(resolved.inode)?, path_str));
     }
 
     let inode = if flags.has_creat() {
@@ -266,7 +292,11 @@ pub fn open_inode(
             enum CreatStep {
                 Done(Arc<dyn VfsInode>),
                 FollowSymlink(Arc<dyn VfsInode>),
-                Created(Arc<dyn VfsInode>),
+                // The open reference, taken under Lock 3 right after the
+                // create: no unlink (also under Lock 3) can come between, so
+                // the file this open made is never freed under it, and the
+                // open succeeds even if an unlink follows at once (POSIX).
+                Created(OpenGuard),
             }
 
             let mut step: Option<CreatStep> = None;
@@ -349,7 +379,7 @@ pub fn open_inode(
                                         dentry_gen,
                                         inode_gen,
                                     );
-                                    step = Some(CreatStep::Created(created));
+                                    step = Some(CreatStep::Created(OpenGuard::new(created)));
                                     return Ok(());
                                 }
                                 Err(VfsError::Exist) if !flags.has_excl() => {
@@ -371,7 +401,7 @@ pub fn open_inode(
                 None => run_creat()?,
             }
             match step.expect("run_creat returns Ok only after setting step") {
-                CreatStep::Created(created) => return Ok((created, path_str)),
+                CreatStep::Created(guard) => return Ok((guard, path_str)),
                 CreatStep::Done(existing) => {
                     // Follow stacked mountpoints if `existing` is a mountpoint directory.
                     let existing = cross_mounts_down(env, existing);
@@ -437,11 +467,14 @@ pub fn open_inode(
     if !inode.exempt_from_rofs() && env.fs_read_only(inode.dev_id()) && (flags.is_writable() || flags.has_trunc()) {
         return Err(VfsError::RoFs);
     }
-    if flags.has_trunc() && inode.inode_type() == InodeType::File {
-        inode.truncate(0)?;
+    // The open reference, then the last liveness check (inside `try_new`),
+    // then the truncate: never a truncate of, or a guard on, a freed inode.
+    let guard = OpenGuard::try_new(inode)?;
+    if flags.has_trunc() && guard.inode().inode_type() == InodeType::File {
+        guard.inode().truncate(0)?;
     }
 
-    Ok((inode, path_str))
+    Ok((guard, path_str))
 }
 
 /// `mkdirat(2)`: create a directory with `(mode & 0o7777) & !umask`.
