@@ -714,6 +714,129 @@ impl Ext4Inode {
         meta_guard.nlink = 0;
         meta_guard.meta_dirty = false;
     }
+
+    fn unlink_nondir_with_recovery(
+        inner: &mut Ext4FsInner,
+        parent_ino: NonZeroU32,
+        dname: DirEntryName<'_>,
+        child_arc: &Arc<Ext4Inode>,
+        child_nlink: u32,
+    ) -> Result<UnlinkDiskOutcome, VfsError> {
+        let parent_disk = Inode::read(&inner.ext4, parent_ino).map_err(map_ext4_err)?;
+        let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
+        let (child_disk, saved_inline) = Self::zero_inline_symlink_before_unlink(inner, child_arc.disk_ino)?;
+        let orig_child_links = child_disk.links_count();
+        match parent_dir.unlink(dname, child_disk) {
+            Ok(rem) => {
+                if rem.is_none() {
+                    inner.live_inodes.remove(&child_arc.disk_ino);
+                }
+                Ok(UnlinkDiskOutcome::Completed { remaining: rem, post_err: None })
+            }
+            Err(e) => {
+                let err = map_ext4_err(e);
+                let probe = Inode::read(&inner.ext4, parent_ino)
+                    .and_then(|p| Dir::open_inode(&inner.ext4, p))
+                    .and_then(|d| d.get_entry(dname));
+                match probe {
+                    Ok(entry) if entry.index.get() == child_arc.disk_ino => {
+                        if let Some(saved) = saved_inline {
+                            saved.restore(inner);
+                        }
+                        let mut actual_nlink = None;
+                        if let Ok(mut cur) = Inode::read(&inner.ext4, child_arc.disk_inode_index()) {
+                            let disk_links = cur.links_count();
+                            if disk_links != orig_child_links {
+                                cur.set_links_count(orig_child_links);
+                                if cur.write(&inner.ext4).is_err() && disk_links > 0 {
+                                    actual_nlink = Some(u32::from(disk_links));
+                                }
+                            }
+                        }
+                        Ok(UnlinkDiskOutcome::Aborted { err, actual_nlink })
+                    }
+                    Err(Ext4Error::NotFound) => {
+                        // `remove_dir_entry` already committed on disk before
+                        // `delete_file` / `free_inode` failed. Do NOT write
+                        // `saved_inline` or `orig_child_links` onto the freed inode.
+                        let remaining = if child_nlink > 1 || orig_child_links > 1 {
+                            match Inode::read(&inner.ext4, child_arc.disk_inode_index()) {
+                                Ok(cur) if cur.links_count() > 0 => Some(cur),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if remaining.is_none() {
+                            inner.live_inodes.remove(&child_arc.disk_ino);
+                        }
+                        Ok(UnlinkDiskOutcome::Completed { remaining, post_err: Some(err) })
+                    }
+                    Ok(_) | Err(_) => Ok(UnlinkDiskOutcome::Aborted { err, actual_nlink: None }),
+                }
+            }
+        }
+    }
+
+    fn unlink_dir_with_recovery(
+        inner: &mut Ext4FsInner,
+        parent_ino: NonZeroU32,
+        dname: DirEntryName<'_>,
+        child_arc: &Arc<Ext4Inode>,
+    ) -> Result<RmdirDiskOutcome, VfsError> {
+        let mut child_disk = Inode::read(&inner.ext4, child_arc.disk_inode_index()).map_err(map_ext4_err)?;
+        let orig_child_links = child_disk.links_count();
+        child_disk.set_links_count(1);
+        child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
+
+        let unlink_res = (|| -> Result<(), Ext4Error> {
+            let parent_disk = Inode::read(&inner.ext4, parent_ino)?;
+            let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk)?;
+            let _ = parent_dir.unlink(dname, child_disk.clone())?;
+            Ok(())
+        })();
+
+        if let Err(e) = unlink_res {
+            let err = map_ext4_err(e);
+            let probe = Inode::read(&inner.ext4, parent_ino)
+                .and_then(|p| Dir::open_inode(&inner.ext4, p))
+                .and_then(|d| d.get_entry(dname));
+            return match probe {
+                Ok(entry) if entry.index.get() == child_arc.disk_ino => {
+                    child_disk.set_links_count(orig_child_links);
+                    let _ = child_disk.write(&inner.ext4);
+                    Ok(RmdirDiskOutcome::StillPresent { err })
+                }
+                Err(Ext4Error::NotFound) => {
+                    // `remove_dir_entry` already committed on disk before
+                    // `delete_file` / `free_inode` failed. Do NOT write
+                    // `orig_child_links` onto the freed inode.
+                    inner.live_inodes.remove(&child_arc.disk_ino);
+                    Ok(RmdirDiskOutcome::Removed { parent_updated: false, post_err: Some(err) })
+                }
+                Ok(_) | Err(_) => Ok(RmdirDiskOutcome::StillPresent { err }),
+            };
+        }
+
+        inner.live_inodes.remove(&child_arc.disk_ino);
+        let post_res = (|| -> Result<(), VfsError> {
+            let mut parent_after = Inode::read(&inner.ext4, parent_ino).map_err(map_ext4_err)?;
+            parent_after.set_links_count(parent_after.links_count().saturating_sub(1));
+            parent_after.write(&inner.ext4).map_err(map_ext4_err)?;
+            Ok(())
+        })();
+        Ok(RmdirDiskOutcome::Removed { parent_updated: post_res.is_ok(), post_err: post_res.err() })
+    }
+}
+
+enum UnlinkDiskOutcome {
+    Completed { remaining: Option<Inode>, post_err: Option<VfsError> },
+    Aborted { err: VfsError, actual_nlink: Option<u32> },
+}
+
+enum RmdirDiskOutcome {
+    Removed { parent_updated: bool, post_err: Option<VfsError> },
+    StillPresent { err: VfsError },
 }
 
 struct SavedInlineSymlink {
@@ -798,6 +921,70 @@ fn update_dir_dotdot(ext4: &Ext4, dir_ino: u32, new_parent_ino: u32) -> Result<(
         return Err(VfsError::Io);
     }
     Ok(())
+}
+
+fn read_disk_nlink(ext4: &Ext4, ino: NonZeroU32) -> Option<u32> {
+    Inode::read(ext4, ino).ok().map(|d| u32::from(d.links_count()))
+}
+
+fn dir_has_entry(
+    ext4: &Ext4,
+    parent_ino: NonZeroU32,
+    dname: DirEntryName<'_>,
+    expected_ino: u32,
+) -> Result<bool, Ext4Error> {
+    let parent = Inode::read(ext4, parent_ino)?;
+    let dir = Dir::open_inode(ext4, parent)?;
+    match dir.get_entry(dname) {
+        Ok(entry) => Ok(entry.index.get() == expected_ino),
+        Err(Ext4Error::NotFound) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn rollback_link_entry(
+    ext4: &Ext4,
+    parent_ino: NonZeroU32,
+    dname: DirEntryName<'_>,
+    child_ino: NonZeroU32,
+    min_links_before_unlink: u16,
+) {
+    if matches!(dir_has_entry(ext4, parent_ino, dname, child_ino.get()), Ok(true))
+        && let Ok(mut child_disk) = Inode::read(ext4, child_ino)
+    {
+        let needed = min_links_before_unlink.max(2);
+        if child_disk.links_count() < needed {
+            child_disk.set_links_count(needed);
+            if child_disk.write(ext4).is_err() {
+                return;
+            }
+        }
+        if child_disk.links_count() >= 2
+            && let Ok(parent_disk) = Inode::read(ext4, parent_ino)
+            && let Ok(mut parent_dir) = Dir::open_inode(ext4, parent_disk)
+        {
+            let _ = parent_dir.unlink(dname, child_disk);
+        }
+    }
+}
+
+fn rollback_restore_entry(ext4: &Ext4, parent_ino: NonZeroU32, dname: DirEntryName<'_>, child_ino: NonZeroU32) {
+    if matches!(dir_has_entry(ext4, parent_ino, dname, child_ino.get()), Ok(false))
+        && let Ok(mut child_disk) = Inode::read(ext4, child_ino)
+        && let Ok(parent_disk) = Inode::read(ext4, parent_ino)
+        && let Ok(mut parent_dir) = Dir::open_inode(ext4, parent_disk)
+    {
+        let _ = parent_dir.link(dname, &mut child_disk);
+    }
+}
+
+fn restore_disk_links_count(ext4: &Ext4, ino: NonZeroU32, target_links: u16) {
+    if let Ok(mut disk) = Inode::read(ext4, ino)
+        && disk.links_count() != target_links
+    {
+        disk.set_links_count(target_links);
+        let _ = disk.write(ext4);
+    }
 }
 
 impl VfsInode for Ext4Inode {
@@ -1019,40 +1206,49 @@ impl VfsInode for Ext4Inode {
             None
         };
 
-        {
+        let outcome = {
             let mut inner = self.shared.state.lock();
-            let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
-            let (child_disk, saved_inline) = Self::zero_inline_symlink_before_unlink(&inner, child_arc.disk_ino)?;
-            let remaining = match parent_dir.unlink(dname, child_disk) {
-                Ok(rem) => rem,
-                Err(e) => {
-                    if let Some(saved) = saved_inline {
-                        saved.restore(&inner);
-                    }
-                    return Err(map_ext4_err(e));
-                }
-            };
-            if remaining.is_none() {
-                inner.live_inodes.remove(&child_arc.disk_ino);
-            }
-        }
+            Self::unlink_nondir_with_recovery(&mut inner, self.disk_inode_index(), dname, &child_arc, child_nlink)?
+        };
 
-        let child_meta = find_guard_mut(&mut guards, &child_arc);
-        if let Some(prepared) = prepared_detach {
-            Self::commit_detach(prepared, child_meta);
-        } else if !child_arc.is_detached() {
-            child_meta.nlink = child_meta.nlink.saturating_sub(1);
-            child_meta.ctime = now_ts;
-            if child_meta.nlink > 0 {
-                child_meta.meta_dirty = true;
+        match outcome {
+            UnlinkDiskOutcome::Aborted { err, actual_nlink } => {
+                drop(prepared_detach);
+                if let Some(nlink) = actual_nlink
+                    && !child_arc.is_detached()
+                {
+                    find_guard_mut(&mut guards, &child_arc).nlink = nlink;
+                }
+                Err(err)
+            }
+            UnlinkDiskOutcome::Completed { remaining, post_err } => {
+                let child_meta = find_guard_mut(&mut guards, &child_arc);
+                if let Some(rem) = remaining {
+                    drop(prepared_detach);
+                    if !child_arc.is_detached() {
+                        child_meta.nlink = u32::from(rem.links_count());
+                        child_meta.ctime = now_ts;
+                        if child_meta.nlink > 0 {
+                            child_meta.meta_dirty = true;
+                        }
+                    }
+                } else if let Some(prepared) = prepared_detach {
+                    Self::commit_detach(prepared, child_meta);
+                } else if !child_arc.is_detached() {
+                    child_meta.nlink = 0;
+                    child_meta.ctime = now_ts;
+                    child_meta.meta_dirty = false;
+                }
+                let self_meta = find_guard_mut(&mut guards, &self_arc);
+                self_meta.mtime = now_ts;
+                self_meta.ctime = now_ts;
+                self_meta.meta_dirty = true;
+                match post_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
             }
         }
-        let self_meta = find_guard_mut(&mut guards, &self_arc);
-        self_meta.mtime = now_ts;
-        self_meta.ctime = now_ts;
-        self_meta.meta_dirty = true;
-        Ok(())
     }
 
     fn rmdir(&self, name: &str) -> Result<(), VfsError> {
@@ -1115,53 +1311,38 @@ impl VfsInode for Ext4Inode {
             None
         };
 
-        let post_res: Result<(), VfsError> = {
+        let outcome = {
             let mut inner = self.shared.state.lock();
-            let mut child_disk = Inode::read(&inner.ext4, child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-            let orig_child_links = child_disk.links_count();
-            child_disk.set_links_count(1);
-            child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-
-            let unlink_res = (|| -> Result<(), VfsError> {
-                let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
-                let _ = parent_dir.unlink(dname, child_disk.clone()).map_err(map_ext4_err)?;
-                Ok(())
-            })();
-            if let Err(e) = unlink_res {
-                child_disk.set_links_count(orig_child_links);
-                let _ = child_disk.write(&inner.ext4);
-                return Err(e);
-            }
-
-            // `parent_dir.unlink` already removed the entry and freed `child_arc.disk_ino`;
-            // remove from `live_inodes` and commit detach unconditionally even if the
-            // subsequent parent link-count update fails.
-            inner.live_inodes.remove(&child_arc.disk_ino);
-            (|| -> Result<(), VfsError> {
-                let mut self_after = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                let old_links = self_after.links_count();
-                self_after.set_links_count(old_links.saturating_sub(1));
-                self_after.write(&inner.ext4).map_err(map_ext4_err)?;
-                Ok(())
-            })()
+            Self::unlink_dir_with_recovery(&mut inner, self.disk_inode_index(), dname, &child_arc)?
         };
 
         let now_ts = duration_to_timespec(realtime_duration());
-        let child_meta = find_guard_mut(&mut guards, &child_arc);
-        if let Some(prepared) = prepared_detach {
-            Self::commit_detach(prepared, child_meta);
-        } else {
-            child_meta.nlink = 0;
+        match outcome {
+            RmdirDiskOutcome::StillPresent { err } => {
+                drop(prepared_detach);
+                Err(err)
+            }
+            RmdirDiskOutcome::Removed { parent_updated, post_err } => {
+                let child_meta = find_guard_mut(&mut guards, &child_arc);
+                if let Some(prepared) = prepared_detach {
+                    Self::commit_detach(prepared, child_meta);
+                } else {
+                    child_meta.nlink = 0;
+                    child_meta.meta_dirty = false;
+                }
+                if parent_updated {
+                    let self_meta = find_guard_mut(&mut guards, &self_arc);
+                    self_meta.nlink = self_meta.nlink.saturating_sub(1);
+                    self_meta.mtime = now_ts;
+                    self_meta.ctime = now_ts;
+                    self_meta.meta_dirty = true;
+                }
+                match post_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            }
         }
-        if post_res.is_ok() {
-            let self_meta = find_guard_mut(&mut guards, &self_arc);
-            self_meta.nlink = self_meta.nlink.saturating_sub(1);
-            self_meta.mtime = now_ts;
-            self_meta.ctime = now_ts;
-            self_meta.meta_dirty = true;
-        }
-        post_res
     }
 
     fn link(&self, name: &str, target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
@@ -1431,106 +1612,201 @@ impl VfsInode for Ext4Inode {
                 return Ok(());
             }
             let new_is_dir = new_child_arc.inode_type == InodeType::Dir;
-            {
+            struct ExchangeSync {
+                old_child_nlink: Option<u32>,
+                new_child_nlink: Option<u32>,
+                old_dir_nlink: Option<u32>,
+                new_dir_nlink: Option<u32>,
+                touch_timestamps: bool,
+                res: Result<(), VfsError>,
+            }
+            let outcome = {
                 let inner = self.shared.state.lock();
-                // 1. Bump both link counts so unlinking never deletes either inode.
-                let mut old_disk = Inode::read(&inner.ext4, old_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                let mut new_disk = Inode::read(&inner.ext4, new_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
+                let old_child_ino = old_child_arc.disk_inode_index();
+                let new_child_ino = new_child_arc.disk_inode_index();
+                let old_dir_ino = old_dir_arc.disk_inode_index();
+                let new_dir_ino = new_dir_arc.disk_inode_index();
+
+                let mut old_disk = Inode::read(&inner.ext4, old_child_ino).map_err(map_ext4_err)?;
+                let mut new_disk = Inode::read(&inner.ext4, new_child_ino).map_err(map_ext4_err)?;
+                let old_p_init = Inode::read(&inner.ext4, old_dir_ino).map_err(map_ext4_err)?;
+                let new_p_init = Inode::read(&inner.ext4, new_dir_ino).map_err(map_ext4_err)?;
+
                 let old_orig_links = old_disk.links_count();
                 let new_orig_links = new_disk.links_count();
+                let old_p_orig_links = old_p_init.links_count();
+                let new_p_orig_links = new_p_init.links_count();
+
+                let rollback_exchange = |ext4: &Ext4,
+                                         undo_old_at_new: bool,
+                                         undo_new_at_old: bool,
+                                         restore_old_entry: bool,
+                                         restore_new_entry: bool| {
+                    if undo_new_at_old {
+                        rollback_link_entry(ext4, old_dir_ino, old_dname, new_child_ino, 2);
+                    }
+                    if undo_old_at_new {
+                        rollback_link_entry(ext4, new_dir_ino, new_dname, old_child_ino, 2);
+                    }
+                    if restore_old_entry {
+                        rollback_restore_entry(ext4, old_dir_ino, old_dname, old_child_ino);
+                    }
+                    if restore_new_entry {
+                        rollback_restore_entry(ext4, new_dir_ino, new_dname, new_child_ino);
+                    }
+                    restore_disk_links_count(ext4, old_child_ino, old_orig_links);
+                    restore_disk_links_count(ext4, new_child_ino, new_orig_links);
+                    restore_disk_links_count(ext4, old_dir_ino, old_p_orig_links);
+                    if !same_parent {
+                        restore_disk_links_count(ext4, new_dir_ino, new_p_orig_links);
+                    }
+                };
+
+                // 1. Bump both link counts so unlinking never deletes either inode.
                 old_disk.set_links_count(old_orig_links.saturating_add(1));
                 old_disk.write(&inner.ext4).map_err(map_ext4_err)?;
                 new_disk.set_links_count(new_orig_links.saturating_add(1));
-                new_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-
-                // 2. Unlink both entries from their original directories.
-                let old_p = Inode::read(&inner.ext4, old_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                Dir::open_inode(&inner.ext4, old_p)
-                    .map_err(map_ext4_err)?
-                    .unlink(old_dname, old_disk)
-                    .map_err(map_ext4_err)?;
-
-                let new_p = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                Dir::open_inode(&inner.ext4, new_p)
-                    .map_err(map_ext4_err)?
-                    .unlink(new_dname, new_disk)
-                    .map_err(map_ext4_err)?;
-
-                // 3. Link each into its swapped destination.
-                let mut old_disk = Inode::read(&inner.ext4, old_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                let new_p = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                Dir::open_inode(&inner.ext4, new_p)
-                    .map_err(map_ext4_err)?
-                    .link(new_dname, &mut old_disk)
-                    .map_err(map_ext4_err)?;
-
-                let mut new_disk = Inode::read(&inner.ext4, new_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                let old_p = Inode::read(&inner.ext4, old_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                Dir::open_inode(&inner.ext4, old_p)
-                    .map_err(map_ext4_err)?
-                    .link(old_dname, &mut new_disk)
-                    .map_err(map_ext4_err)?;
-
-                // 4. Restore exact link counts on both swapped children.
-                let mut old_disk = Inode::read(&inner.ext4, old_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                old_disk.set_links_count(old_orig_links);
-                old_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-
-                let mut new_disk = Inode::read(&inner.ext4, new_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                new_disk.set_links_count(new_orig_links);
-                new_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-
-                // 5. Adjust parent link counts and `..` when moving directories.
-                if same_parent {
-                    let dir_delta = u16::from(old_is_dir) + u16::from(new_is_dir);
-                    if dir_delta > 0 {
-                        let mut p = Inode::read(&inner.ext4, old_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                        p.set_links_count(p.links_count().saturating_sub(dir_delta));
-                        p.write(&inner.ext4).map_err(map_ext4_err)?;
+                if let Err(e) = new_disk.write(&inner.ext4) {
+                    rollback_exchange(&inner.ext4, false, false, false, false);
+                    ExchangeSync {
+                        old_child_nlink: read_disk_nlink(&inner.ext4, old_child_ino),
+                        new_child_nlink: read_disk_nlink(&inner.ext4, new_child_ino),
+                        old_dir_nlink: read_disk_nlink(&inner.ext4, old_dir_ino),
+                        new_dir_nlink: read_disk_nlink(&inner.ext4, new_dir_ino),
+                        touch_timestamps: false,
+                        res: Err(map_ext4_err(e)),
+                    }
+                } else if let Err(e) = Inode::read(&inner.ext4, old_dir_ino)
+                    .and_then(|old_p| Dir::open_inode(&inner.ext4, old_p))
+                    .and_then(|mut d| d.unlink(old_dname, old_disk))
+                {
+                    // 2a failed.
+                    rollback_exchange(&inner.ext4, false, false, true, false);
+                    ExchangeSync {
+                        old_child_nlink: read_disk_nlink(&inner.ext4, old_child_ino),
+                        new_child_nlink: read_disk_nlink(&inner.ext4, new_child_ino),
+                        old_dir_nlink: read_disk_nlink(&inner.ext4, old_dir_ino),
+                        new_dir_nlink: read_disk_nlink(&inner.ext4, new_dir_ino),
+                        touch_timestamps: false,
+                        res: Err(map_ext4_err(e)),
+                    }
+                } else if let Err(e) = Inode::read(&inner.ext4, new_dir_ino)
+                    .and_then(|new_p| Dir::open_inode(&inner.ext4, new_p))
+                    .and_then(|mut d| d.unlink(new_dname, new_disk))
+                {
+                    // 2b failed.
+                    rollback_exchange(&inner.ext4, false, false, true, true);
+                    ExchangeSync {
+                        old_child_nlink: read_disk_nlink(&inner.ext4, old_child_ino),
+                        new_child_nlink: read_disk_nlink(&inner.ext4, new_child_ino),
+                        old_dir_nlink: read_disk_nlink(&inner.ext4, old_dir_ino),
+                        new_dir_nlink: read_disk_nlink(&inner.ext4, new_dir_ino),
+                        touch_timestamps: false,
+                        res: Err(map_ext4_err(e)),
+                    }
+                } else if let Err(e) = (|| -> Result<(), Ext4Error> {
+                    // 3a. Link `old_child` into `new_dir` at `new_dname`.
+                    let mut old_disk = Inode::read(&inner.ext4, old_child_ino)?;
+                    let new_p = Inode::read(&inner.ext4, new_dir_ino)?;
+                    Dir::open_inode(&inner.ext4, new_p)?.link(new_dname, &mut old_disk)
+                })() {
+                    rollback_exchange(&inner.ext4, true, false, true, true);
+                    ExchangeSync {
+                        old_child_nlink: read_disk_nlink(&inner.ext4, old_child_ino),
+                        new_child_nlink: read_disk_nlink(&inner.ext4, new_child_ino),
+                        old_dir_nlink: read_disk_nlink(&inner.ext4, old_dir_ino),
+                        new_dir_nlink: read_disk_nlink(&inner.ext4, new_dir_ino),
+                        touch_timestamps: false,
+                        res: Err(map_ext4_err(e)),
+                    }
+                } else if let Err(e) = (|| -> Result<(), Ext4Error> {
+                    // 3b. Link `new_child` into `old_dir` at `old_dname`.
+                    let mut new_disk = Inode::read(&inner.ext4, new_child_ino)?;
+                    let old_p = Inode::read(&inner.ext4, old_dir_ino)?;
+                    Dir::open_inode(&inner.ext4, old_p)?.link(old_dname, &mut new_disk)
+                })() {
+                    rollback_exchange(&inner.ext4, true, true, true, true);
+                    ExchangeSync {
+                        old_child_nlink: read_disk_nlink(&inner.ext4, old_child_ino),
+                        new_child_nlink: read_disk_nlink(&inner.ext4, new_child_ino),
+                        old_dir_nlink: read_disk_nlink(&inner.ext4, old_dir_ino),
+                        new_dir_nlink: read_disk_nlink(&inner.ext4, new_dir_ino),
+                        touch_timestamps: false,
+                        res: Err(map_ext4_err(e)),
                     }
                 } else {
-                    if old_is_dir {
-                        let mut old_p =
-                            Inode::read(&inner.ext4, old_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                        old_p.set_links_count(old_p.links_count().saturating_sub(1));
-                        old_p.write(&inner.ext4).map_err(map_ext4_err)?;
-                        update_dir_dotdot(&inner.ext4, old_child_arc.disk_ino, new_dir_arc.disk_ino)?;
-                    }
-                    if new_is_dir {
-                        let mut new_p =
-                            Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                        new_p.set_links_count(new_p.links_count().saturating_sub(1));
-                        new_p.write(&inner.ext4).map_err(map_ext4_err)?;
-                        update_dir_dotdot(&inner.ext4, new_child_arc.disk_ino, old_dir_arc.disk_ino)?;
-                    }
-                }
-            }
+                    // Both entries are now swapped on disk. Run steps 4 and 5,
+                    // capturing `post_res` and syncing all 4 `nlink`s from disk.
+                    let post_res = (|| -> Result<(), VfsError> {
+                        // 4. Restore exact link counts on both swapped children.
+                        let mut old_disk = Inode::read(&inner.ext4, old_child_ino).map_err(map_ext4_err)?;
+                        old_disk.set_links_count(old_orig_links);
+                        old_disk.write(&inner.ext4).map_err(map_ext4_err)?;
 
-            if !same_parent {
-                if old_is_dir {
-                    find_guard_mut(&mut guards, &old_dir_arc).nlink =
-                        find_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_sub(1);
-                    find_guard_mut(&mut guards, &new_dir_arc).nlink =
-                        find_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_add(1);
+                        let mut new_disk = Inode::read(&inner.ext4, new_child_ino).map_err(map_ext4_err)?;
+                        new_disk.set_links_count(new_orig_links);
+                        new_disk.write(&inner.ext4).map_err(map_ext4_err)?;
+
+                        // 5. Adjust parent link counts and `..` when moving directories.
+                        if same_parent {
+                            let dir_delta = u16::from(old_is_dir) + u16::from(new_is_dir);
+                            if dir_delta > 0 {
+                                let mut p = Inode::read(&inner.ext4, old_dir_ino).map_err(map_ext4_err)?;
+                                p.set_links_count(p.links_count().saturating_sub(dir_delta));
+                                p.write(&inner.ext4).map_err(map_ext4_err)?;
+                            }
+                        } else {
+                            if old_is_dir {
+                                let mut old_p = Inode::read(&inner.ext4, old_dir_ino).map_err(map_ext4_err)?;
+                                old_p.set_links_count(old_p.links_count().saturating_sub(1));
+                                old_p.write(&inner.ext4).map_err(map_ext4_err)?;
+                                update_dir_dotdot(&inner.ext4, old_child_arc.disk_ino, new_dir_arc.disk_ino)?;
+                            }
+                            if new_is_dir {
+                                let mut new_p = Inode::read(&inner.ext4, new_dir_ino).map_err(map_ext4_err)?;
+                                new_p.set_links_count(new_p.links_count().saturating_sub(1));
+                                new_p.write(&inner.ext4).map_err(map_ext4_err)?;
+                                update_dir_dotdot(&inner.ext4, new_child_arc.disk_ino, old_dir_arc.disk_ino)?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    ExchangeSync {
+                        old_child_nlink: read_disk_nlink(&inner.ext4, old_child_ino),
+                        new_child_nlink: read_disk_nlink(&inner.ext4, new_child_ino),
+                        old_dir_nlink: read_disk_nlink(&inner.ext4, old_dir_ino),
+                        new_dir_nlink: read_disk_nlink(&inner.ext4, new_dir_ino),
+                        touch_timestamps: true,
+                        res: post_res,
+                    }
                 }
-                if new_is_dir {
-                    find_guard_mut(&mut guards, &new_dir_arc).nlink =
-                        find_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_sub(1);
-                    find_guard_mut(&mut guards, &old_dir_arc).nlink =
-                        find_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_add(1);
-                }
+            };
+
+            if let Some(n) = outcome.old_child_nlink {
+                find_guard_mut(&mut guards, &old_child_arc).nlink = n;
             }
-            find_guard_mut(&mut guards, &old_dir_arc).mtime = now_ts;
-            find_guard_mut(&mut guards, &old_dir_arc).ctime = now_ts;
-            find_guard_mut(&mut guards, &old_dir_arc).meta_dirty = true;
-            find_guard_mut(&mut guards, &new_dir_arc).mtime = now_ts;
-            find_guard_mut(&mut guards, &new_dir_arc).ctime = now_ts;
-            find_guard_mut(&mut guards, &new_dir_arc).meta_dirty = true;
-            find_guard_mut(&mut guards, &old_child_arc).ctime = now_ts;
-            find_guard_mut(&mut guards, &old_child_arc).meta_dirty = true;
-            find_guard_mut(&mut guards, new_child_arc).ctime = now_ts;
-            find_guard_mut(&mut guards, new_child_arc).meta_dirty = true;
-            return Ok(());
+            if let Some(n) = outcome.new_child_nlink {
+                find_guard_mut(&mut guards, new_child_arc).nlink = n;
+            }
+            if let Some(n) = outcome.old_dir_nlink {
+                find_guard_mut(&mut guards, &old_dir_arc).nlink = n;
+            }
+            if let Some(n) = outcome.new_dir_nlink {
+                find_guard_mut(&mut guards, &new_dir_arc).nlink = n;
+            }
+            if outcome.touch_timestamps {
+                find_guard_mut(&mut guards, &old_dir_arc).mtime = now_ts;
+                find_guard_mut(&mut guards, &old_dir_arc).ctime = now_ts;
+                find_guard_mut(&mut guards, &old_dir_arc).meta_dirty = true;
+                find_guard_mut(&mut guards, &new_dir_arc).mtime = now_ts;
+                find_guard_mut(&mut guards, &new_dir_arc).ctime = now_ts;
+                find_guard_mut(&mut guards, &new_dir_arc).meta_dirty = true;
+                find_guard_mut(&mut guards, &old_child_arc).ctime = now_ts;
+                find_guard_mut(&mut guards, &old_child_arc).meta_dirty = true;
+                find_guard_mut(&mut guards, new_child_arc).ctime = now_ts;
+                find_guard_mut(&mut guards, new_child_arc).meta_dirty = true;
+            }
+            return outcome.res;
         }
 
         // Standard overwrite / move rename.
@@ -1544,126 +1820,267 @@ impl VfsInode for Ext4Inode {
                 None
             };
 
-            let post_res: Result<(), VfsError> = {
-                let mut inner = self.shared.state.lock();
-                if new_is_dir {
-                    let mut nc_disk =
-                        Inode::read(&inner.ext4, new_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                    let orig_nc_links = nc_disk.links_count();
-                    nc_disk.set_links_count(1);
-                    nc_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-                    let unlink_res = (|| -> Result<(), VfsError> {
-                        let np_disk = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                        let _ = Dir::open_inode(&inner.ext4, np_disk)
-                            .map_err(map_ext4_err)?
-                            .unlink(new_dname, nc_disk.clone())
-                            .map_err(map_ext4_err)?;
-                        Ok(())
-                    })();
-                    if let Err(e) = unlink_res {
-                        nc_disk.set_links_count(orig_nc_links);
-                        let _ = nc_disk.write(&inner.ext4);
-                        return Err(e);
+            if new_is_dir {
+                let outcome = {
+                    let mut inner = self.shared.state.lock();
+                    Self::unlink_dir_with_recovery(
+                        &mut inner,
+                        new_dir_arc.disk_inode_index(),
+                        new_dname,
+                        new_child_arc,
+                    )?
+                };
+                match outcome {
+                    RmdirDiskOutcome::StillPresent { err } => {
+                        drop(prepared_detach);
+                        return Err(err);
                     }
-                    // `unlink` already removed `new_dname` and freed `new_child_arc.disk_ino`;
-                    // remove from `live_inodes` and commit detach unconditionally even if the
-                    // subsequent parent link-count update fails.
-                    inner.live_inodes.remove(&new_child_arc.disk_ino);
-                    (|| -> Result<(), VfsError> {
-                        let mut np_after =
-                            Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                        np_after.set_links_count(np_after.links_count().saturating_sub(1));
-                        np_after.write(&inner.ext4).map_err(map_ext4_err)?;
-                        Ok(())
-                    })()
-                } else {
-                    let (nc_disk, saved_inline) =
-                        Self::zero_inline_symlink_before_unlink(&inner, new_child_arc.disk_ino)?;
-                    let rem_res = (|| -> Result<Option<Inode>, VfsError> {
-                        let np_disk = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                        Dir::open_inode(&inner.ext4, np_disk)
-                            .map_err(map_ext4_err)?
-                            .unlink(new_dname, nc_disk)
-                            .map_err(map_ext4_err)
-                    })();
-                    let rem = match rem_res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            if let Some(saved) = saved_inline {
-                                saved.restore(&inner);
-                            }
+                    RmdirDiskOutcome::Removed { parent_updated, post_err } => {
+                        let nc_meta = find_guard_mut(&mut guards, new_child_arc);
+                        if let Some(prepared) = prepared_detach {
+                            Self::commit_detach(prepared, nc_meta);
+                        } else {
+                            nc_meta.nlink = 0;
+                            nc_meta.meta_dirty = false;
+                        }
+                        if parent_updated {
+                            let np_meta = find_guard_mut(&mut guards, &new_dir_arc);
+                            np_meta.nlink = np_meta.nlink.saturating_sub(1);
+                            np_meta.mtime = now_ts;
+                            np_meta.ctime = now_ts;
+                            np_meta.meta_dirty = true;
+                        }
+                        if let Some(e) = post_err {
                             return Err(e);
                         }
-                    };
-                    if rem.is_none() {
-                        inner.live_inodes.remove(&new_child_arc.disk_ino);
                     }
-                    Ok(())
                 }
-            };
-
-            if let Some(prepared) = prepared_detach {
-                let nc_meta = find_guard_mut(&mut guards, new_child_arc);
-                Self::commit_detach(prepared, nc_meta);
+            } else {
+                let outcome = {
+                    let mut inner = self.shared.state.lock();
+                    Self::unlink_nondir_with_recovery(
+                        &mut inner,
+                        new_dir_arc.disk_inode_index(),
+                        new_dname,
+                        new_child_arc,
+                        new_nlink,
+                    )?
+                };
+                match outcome {
+                    UnlinkDiskOutcome::Aborted { err, actual_nlink } => {
+                        drop(prepared_detach);
+                        if let Some(nlink) = actual_nlink
+                            && !new_child_arc.is_detached()
+                        {
+                            find_guard_mut(&mut guards, new_child_arc).nlink = nlink;
+                        }
+                        return Err(err);
+                    }
+                    UnlinkDiskOutcome::Completed { remaining, post_err } => {
+                        let nc_meta = find_guard_mut(&mut guards, new_child_arc);
+                        if let Some(rem) = remaining {
+                            drop(prepared_detach);
+                            if !new_child_arc.is_detached() {
+                                nc_meta.nlink = u32::from(rem.links_count());
+                                nc_meta.ctime = now_ts;
+                                if nc_meta.nlink > 0 {
+                                    nc_meta.meta_dirty = true;
+                                }
+                            }
+                        } else if let Some(prepared) = prepared_detach {
+                            Self::commit_detach(prepared, nc_meta);
+                        } else if !new_child_arc.is_detached() {
+                            nc_meta.nlink = 0;
+                            nc_meta.ctime = now_ts;
+                            nc_meta.meta_dirty = false;
+                        }
+                        let np_meta = find_guard_mut(&mut guards, &new_dir_arc);
+                        np_meta.mtime = now_ts;
+                        np_meta.ctime = now_ts;
+                        np_meta.meta_dirty = true;
+                        if let Some(e) = post_err {
+                            return Err(e);
+                        }
+                    }
+                }
             }
-            if new_is_dir {
-                find_guard_mut(&mut guards, new_child_arc).nlink = 0;
-                if post_res.is_ok() {
-                    find_guard_mut(&mut guards, &new_dir_arc).nlink =
-                        find_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_sub(1);
-                }
-            } else if !new_child_arc.is_detached() {
-                let nc_meta = find_guard_mut(&mut guards, new_child_arc);
-                nc_meta.nlink = nc_meta.nlink.saturating_sub(1);
-                nc_meta.ctime = now_ts;
-                if nc_meta.nlink > 0 {
-                    nc_meta.meta_dirty = true;
-                }
-            }
-            post_res?;
         }
 
         // Link `old_child` at `new_name` in `new_dir` FIRST, then unlink `old_name` from `old_dir`.
-        {
+        struct Step2Outcome {
+            moved_on_disk: bool,
+            op_after_written: bool,
+            sync_old_child: Option<u32>,
+            sync_old_dir: Option<u32>,
+            sync_new_dir: Option<u32>,
+            res: Result<(), VfsError>,
+        }
+        let step2 = {
             let inner = self.shared.state.lock();
-            let mut old_disk = Inode::read(&inner.ext4, old_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-            let np_disk = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-            Dir::open_inode(&inner.ext4, np_disk)
-                .map_err(map_ext4_err)?
-                .link(new_dname, &mut old_disk)
-                .map_err(map_ext4_err)?;
+            let old_child_ino = old_child_arc.disk_inode_index();
+            let new_dir_ino = new_dir_arc.disk_inode_index();
+            let old_dir_ino = old_dir_arc.disk_inode_index();
 
-            let op_disk = Inode::read(&inner.ext4, old_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-            let _ = Dir::open_inode(&inner.ext4, op_disk)
-                .map_err(map_ext4_err)?
-                .unlink(old_dname, old_disk)
-                .map_err(map_ext4_err)?;
+            let mut old_disk = Inode::read(&inner.ext4, old_child_ino).map_err(map_ext4_err)?;
+            let orig_old_links = old_disk.links_count();
+            let np_disk = Inode::read(&inner.ext4, new_dir_ino).map_err(map_ext4_err)?;
+            let orig_np_links = np_disk.links_count();
 
-            if old_is_dir {
-                let mut op_after = Inode::read(&inner.ext4, old_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                op_after.set_links_count(op_after.links_count().saturating_sub(1));
-                op_after.write(&inner.ext4).map_err(map_ext4_err)?;
-                if !same_parent {
-                    update_dir_dotdot(&inner.ext4, old_child_arc.disk_ino, new_dir_arc.disk_ino)?;
+            let link_res = Dir::open_inode(&inner.ext4, np_disk).and_then(|mut d| d.link(new_dname, &mut old_disk));
+            if let Err(e) = link_res {
+                rollback_link_entry(
+                    &inner.ext4,
+                    new_dir_ino,
+                    new_dname,
+                    old_child_ino,
+                    orig_old_links.saturating_add(1),
+                );
+                restore_disk_links_count(&inner.ext4, old_child_ino, orig_old_links);
+                if old_is_dir {
+                    restore_disk_links_count(&inner.ext4, new_dir_ino, orig_np_links);
+                }
+                let both_present =
+                    matches!(dir_has_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino.get()), Ok(true))
+                        && matches!(dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get()), Ok(true));
+                let mut sync_old_child = read_disk_nlink(&inner.ext4, old_child_ino);
+                if both_present {
+                    let min_links = if old_is_dir { 3 } else { 2 };
+                    sync_old_child = Some(sync_old_child.unwrap_or(min_links).max(min_links));
+                }
+                Step2Outcome {
+                    moved_on_disk: false,
+                    op_after_written: false,
+                    sync_old_child,
+                    sync_old_dir: read_disk_nlink(&inner.ext4, old_dir_ino),
+                    sync_new_dir: read_disk_nlink(&inner.ext4, new_dir_ino),
+                    res: Err(map_ext4_err(e)),
+                }
+            } else {
+                let unlink_res = Inode::read(&inner.ext4, old_dir_ino)
+                    .and_then(|op_disk| Dir::open_inode(&inner.ext4, op_disk))
+                    .and_then(|mut d| d.unlink(old_dname, old_disk));
+                match unlink_res {
+                    Err(e) => {
+                        let err = map_ext4_err(e);
+                        let old_probe = Inode::read(&inner.ext4, old_dir_ino)
+                            .and_then(|op| Dir::open_inode(&inner.ext4, op))
+                            .and_then(|d| d.get_entry(old_dname));
+                        match old_probe {
+                            Ok(entry) if entry.index.get() == old_child_arc.disk_ino => {
+                                rollback_link_entry(
+                                    &inner.ext4,
+                                    new_dir_ino,
+                                    new_dname,
+                                    old_child_ino,
+                                    orig_old_links.saturating_add(1),
+                                );
+                                restore_disk_links_count(&inner.ext4, old_child_ino, orig_old_links);
+                                if old_is_dir {
+                                    restore_disk_links_count(&inner.ext4, new_dir_ino, orig_np_links);
+                                }
+                                let both_present = matches!(
+                                    dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get()),
+                                    Ok(true)
+                                );
+                                let mut sync_old_child = read_disk_nlink(&inner.ext4, old_child_ino);
+                                if both_present {
+                                    let min_links = if old_is_dir { 3 } else { 2 };
+                                    sync_old_child = Some(sync_old_child.unwrap_or(min_links).max(min_links));
+                                }
+                                Step2Outcome {
+                                    moved_on_disk: false,
+                                    op_after_written: false,
+                                    sync_old_child,
+                                    sync_old_dir: read_disk_nlink(&inner.ext4, old_dir_ino),
+                                    sync_new_dir: read_disk_nlink(&inner.ext4, new_dir_ino),
+                                    res: Err(err),
+                                }
+                            }
+                            Err(Ext4Error::NotFound) => {
+                                // `old_dname` is already gone on disk: the move committed.
+                                // Do NOT undo `link(new_dname)`; sync `nlink`s from disk.
+                                Step2Outcome {
+                                    moved_on_disk: true,
+                                    op_after_written: false,
+                                    sync_old_child: read_disk_nlink(&inner.ext4, old_child_ino),
+                                    sync_old_dir: read_disk_nlink(&inner.ext4, old_dir_ino),
+                                    sync_new_dir: read_disk_nlink(&inner.ext4, new_dir_ino),
+                                    res: Err(err),
+                                }
+                            }
+                            Ok(_) | Err(_) => Step2Outcome {
+                                moved_on_disk: false,
+                                op_after_written: false,
+                                sync_old_child: read_disk_nlink(&inner.ext4, old_child_ino),
+                                sync_old_dir: read_disk_nlink(&inner.ext4, old_dir_ino),
+                                sync_new_dir: read_disk_nlink(&inner.ext4, new_dir_ino),
+                                res: Err(err),
+                            },
+                        }
+                    }
+                    Ok(_) => {
+                        let mut op_after_written = false;
+                        let post_res = if old_is_dir {
+                            (|| -> Result<(), VfsError> {
+                                let mut op_after = Inode::read(&inner.ext4, old_dir_ino).map_err(map_ext4_err)?;
+                                op_after.set_links_count(op_after.links_count().saturating_sub(1));
+                                op_after.write(&inner.ext4).map_err(map_ext4_err)?;
+                                op_after_written = true;
+                                if !same_parent {
+                                    update_dir_dotdot(&inner.ext4, old_child_arc.disk_ino, new_dir_arc.disk_ino)?;
+                                }
+                                Ok(())
+                            })()
+                        } else {
+                            Ok(())
+                        };
+                        Step2Outcome {
+                            moved_on_disk: true,
+                            op_after_written,
+                            sync_old_child: None,
+                            sync_old_dir: None,
+                            sync_new_dir: None,
+                            res: post_res,
+                        }
+                    }
                 }
             }
+        };
+
+        if let Some(n) = step2.sync_old_child {
+            find_guard_mut(&mut guards, &old_child_arc).nlink = n;
+        }
+        if let Some(n) = step2.sync_old_dir {
+            find_guard_mut(&mut guards, &old_dir_arc).nlink = n;
+        }
+        if let Some(n) = step2.sync_new_dir {
+            find_guard_mut(&mut guards, &new_dir_arc).nlink = n;
         }
 
-        if old_is_dir && !same_parent {
-            find_guard_mut(&mut guards, &old_dir_arc).nlink =
-                find_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_sub(1);
-            find_guard_mut(&mut guards, &new_dir_arc).nlink =
-                find_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_add(1);
+        if step2.moved_on_disk {
+            if old_is_dir && step2.sync_old_dir.is_none() && step2.sync_new_dir.is_none() {
+                if !same_parent {
+                    if step2.op_after_written {
+                        find_guard_mut(&mut guards, &old_dir_arc).nlink =
+                            find_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_sub(1);
+                    }
+                    find_guard_mut(&mut guards, &new_dir_arc).nlink =
+                        find_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_add(1);
+                } else if !step2.op_after_written {
+                    find_guard_mut(&mut guards, &old_dir_arc).nlink =
+                        find_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_add(1);
+                }
+            }
+            find_guard_mut(&mut guards, &old_dir_arc).mtime = now_ts;
+            find_guard_mut(&mut guards, &old_dir_arc).ctime = now_ts;
+            find_guard_mut(&mut guards, &old_dir_arc).meta_dirty = true;
+            find_guard_mut(&mut guards, &new_dir_arc).mtime = now_ts;
+            find_guard_mut(&mut guards, &new_dir_arc).ctime = now_ts;
+            find_guard_mut(&mut guards, &new_dir_arc).meta_dirty = true;
+            find_guard_mut(&mut guards, &old_child_arc).ctime = now_ts;
+            find_guard_mut(&mut guards, &old_child_arc).meta_dirty = true;
         }
-        find_guard_mut(&mut guards, &old_dir_arc).mtime = now_ts;
-        find_guard_mut(&mut guards, &old_dir_arc).ctime = now_ts;
-        find_guard_mut(&mut guards, &old_dir_arc).meta_dirty = true;
-        find_guard_mut(&mut guards, &new_dir_arc).mtime = now_ts;
-        find_guard_mut(&mut guards, &new_dir_arc).ctime = now_ts;
-        find_guard_mut(&mut guards, &new_dir_arc).meta_dirty = true;
-        find_guard_mut(&mut guards, &old_child_arc).ctime = now_ts;
-        find_guard_mut(&mut guards, &old_child_arc).meta_dirty = true;
-        Ok(())
+        step2.res
     }
 
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
