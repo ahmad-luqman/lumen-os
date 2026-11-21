@@ -7,9 +7,10 @@
 //! owning inode's `PageCache` lock (Lock 5). A future `MAP_SHARED` user
 //! mapping (M8) writes the frame without that lock; such a store racing a
 //! kernel copy is accepted as it is on Linux (the bytes read are some mix of
-//! old and new, nothing else). `CachePage::drop` and `PageCache::drop` are
-//! strictly lock-free (`OwnedFrame::drop` takes only Lock 10, the `frame`
-//! `SpinLock`).
+//! old and new, nothing else). `CachePage::drop` and `PageCache::drop` take
+//! no sleeping lock (`OwnedFrame::drop` takes only Lock 10, the `frame`
+//! `SpinLock`); the one exception is a quota over-release, a bug elsewhere,
+//! whose `error!` takes the log's leaf lock.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -58,6 +59,24 @@ pub fn ext4_at_hard_limit() -> bool {
     EXT4_CACHED_PAGES.load(Ordering::Relaxed) >= EXT4_HARD_LIMIT.load(Ordering::Relaxed)
 }
 
+/// A write was refused a page at the hard limit since the cache last fell
+/// back under the soft limit: one warning per crossing.
+static HARD_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Log (once per crossing of the hard limit) that an `ext4` write was
+/// refused a new page: the cache is full of pages reclaim can't drop,
+/// usually because their writeback keeps failing (its own warning names the
+/// inode), so writes to any file now fail with `ENOSPC`.
+pub fn note_hard_limit_refusal() {
+    if !HARD_LIMIT_WARNED.swap(true, Ordering::AcqRel) {
+        log::warn!(
+            target: "vfs",
+            "ext4 page cache at its hard limit ({} pages): refusing new pages (ENOSPC) until writeback frees some",
+            EXT4_HARD_LIMIT.load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// Lower (or restore, with `None`) the soft and hard limits for a ktest.
 #[cfg(feature = "ktest")]
 pub fn set_ext4_limits_for_test(limits: Option<(usize, usize)>) {
@@ -85,15 +104,20 @@ pub fn detached_cached_pages() -> usize {
 /// Lock-free atomic page-frame quota counter (used by `tmpfs` and Gate 6 detach).
 #[derive(Debug)]
 pub struct QuotaCounter {
+    /// What the quota is for, named in its log lines.
+    name: &'static str,
     limit_pages: usize,
     used_pages: AtomicUsize,
 }
 
 impl QuotaCounter {
-    pub const fn new(limit_pages: usize) -> Self {
-        Self { limit_pages, used_pages: AtomicUsize::new(0) }
+    pub const fn new(name: &'static str, limit_pages: usize) -> Self {
+        Self { name, limit_pages, used_pages: AtomicUsize::new(0) }
     }
 
+    /// Reserve `pages`, or `false` if that would pass the limit. A `true`
+    /// must be released later, or the pages leak from the quota.
+    #[must_use]
     pub fn try_reserve(&self, pages: usize) -> bool {
         if pages == 0 {
             return true;
@@ -129,7 +153,12 @@ impl QuotaCounter {
             }
         }
         if pages > cur {
-            log::error!(target: "vfs", "page quota: released {pages} pages with only {cur} reserved");
+            log::error!(
+                target: "vfs",
+                "page quota {} ({} pages): released {pages} pages with only {cur} reserved",
+                self.name,
+                self.limit_pages
+            );
         }
     }
 
@@ -144,7 +173,7 @@ impl QuotaCounter {
 }
 
 /// Global Gate 6 quota for open-unlinked detached `ext4` inodes.
-pub static DETACHED_QUOTA: QuotaCounter = QuotaCounter::new(DETACHED_QUOTA_PAGES);
+pub static DETACHED_QUOTA: QuotaCounter = QuotaCounter::new("detached", DETACHED_QUOTA_PAGES);
 
 /// Ownership class controlling accounting and reclaim eligibility.
 #[derive(Clone, Debug)]
@@ -497,6 +526,7 @@ impl Drop for DetachedQuotaGuard {
 pub fn maybe_reclaim_ext4_pages() {
     let soft = ext4_soft_limit();
     if EXT4_CACHED_PAGES.load(Ordering::Relaxed) <= soft {
+        HARD_LIMIT_WARNED.store(false, Ordering::Release);
         return;
     }
     reclaim_ext4_to_target(soft);
@@ -563,7 +593,7 @@ crate::ktest!(
 crate::ktest!(
     fn page_quota_release_saturates_and_detached_quota_reports_nospc() {
         use crate::kassert_eq;
-        let q = QuotaCounter::new(4);
+        let q = QuotaCounter::new("ktest", 4);
         kassert_eq!(q.try_reserve(2), true);
         q.release(5); // a bug elsewhere: more than reserved
         kassert_eq!(q.used_pages(), 0);
@@ -577,7 +607,10 @@ crate::ktest!(
 crate::ktest!(
     fn page_cache_soft_limit_triggers_reclaim() {
         // Past the soft limit, the next ext4 read or write reclaims (writing
-        // dirty pages back) before it runs, through the global tables.
+        // dirty pages back) before it runs, through the global tables. The
+        // limits in force outside this test: 32 MiB soft, twice that hard.
+        crate::kassert_eq!(EXT4_SOFT_LIMIT_PAGES * PAGE_SIZE, 32 << 20);
+        crate::kassert_eq!(EXT4_HARD_LIMIT_PAGES, 2 * EXT4_SOFT_LIMIT_PAGES);
         use crate::vfs::{EXT4_FILESYSTEMS, TABLES, ext4};
         use crate::{kassert, kassert_eq};
         use lumen_bcache::BlockCache;
@@ -588,7 +621,7 @@ crate::ktest!(
         let bcache: Arc<dyn ext4::BlockCacheBackend> =
             Arc::new(crate::sync::SleepMutex::new(BlockCache::new(dev, 64).map_err(|_| "bcache")?));
         let devid = lumen_vfs::DevId::makedev(0, 231);
-        let fs = ext4::Ext4FileSystem::mount(bcache, devid, false).map_err(|_| "mount")?;
+        let fs = ext4::Ext4FileSystem::mount(Arc::clone(&bcache), devid, false).map_err(|_| "mount")?;
         let mp = mkdir_at(&TABLES, None, b"/tmp/soft_limit_mnt", 0o755, 0).map_err(|_| "mkdir mnt")?;
         let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
         EXT4_FILESYSTEMS.lock().push(Arc::clone(&fs));
@@ -615,14 +648,24 @@ crate::ktest!(
             set_ext4_limits_for_test(None);
             r.map_err(|_| "read")?;
             kassert!(after <= base - 4 + 1); // reclaimed, plus at most the page read back
+            // The file was never synced, and its pages were all dirty: the
+            // data is on the disk only if reclaim wrote it back. A read-only
+            // mount of the same block cache reads the disk, not the pages.
+            let ro = ext4::Ext4FileSystem::mount(Arc::clone(&bcache), lumen_vfs::DevId::makedev(0, 232), true)
+                .map_err(|_| "ro mount")?;
+            let on_disk = ro.root_inode().lookup("f").map_err(|_| "ro lookup")?;
+            let mut disk = alloc::vec![0u8; data.len()];
+            let n = on_disk.read_at(0, &mut disk).map_err(|_| "ro read")?;
+            kassert!(n >= (data.len() - 4 * PAGE_SIZE)); // at least the reclaimed pages
+            kassert_eq!(&disk[..n], &data[..n]);
             let mut back = alloc::vec![0u8; data.len()];
             kassert_eq!(f.read_at(0, &mut back).map_err(|_| "read back")?, data.len());
             kassert_eq!(back, data); // the dirty pages were written, not dropped
             Ok(())
         })();
-        let _ = TABLES.umount(mp_dev, mp_ino);
+        let umounted = TABLES.umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
         EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != devid);
-        let _ = unlink_at(&TABLES, None, b"/tmp/soft_limit_mnt", true);
-        result
+        let unlinked = unlink_at(&TABLES, None, b"/tmp/soft_limit_mnt", true).map(drop).map_err(|_| "rmdir mnt");
+        result.and(umounted).and(unlinked)
     }
 );

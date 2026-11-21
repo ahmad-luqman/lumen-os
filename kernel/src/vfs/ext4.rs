@@ -61,16 +61,22 @@ impl<B: BlockDevice + Send + Sync + 'static> BlockCacheBackend for SleepMutex<Bl
 
 type SharedBlockCache = Arc<dyn BlockCacheBackend>;
 
-/// `ro_compat` bits the adapter knows. Any other bit forces a read-only mount.
+/// `ro_compat` bits the adapter recognises (up to `ORPHAN_PRESENT`, 0x10000).
+/// Any other bit forces a read-only mount, and so do the recognised ones in
+/// [`DISALLOWED_RW_RO_COMPAT_BITS`].
 const KNOWN_RO_COMPAT_BITS: u32 = 0x1_bfff;
-/// Known `ro_compat` bits that still force a read-only mount (ARCHITECTURE
-/// §9's `mke2fs -O ^metadata_csum,...` mask is the writable profile):
-/// `BTREE_DIR` (0x4), `GDT_CSUM` (0x10), `QUOTA`
-/// (0x100), `BIGALLOC` (0x200), `METADATA_CSUM` (0x400: the adapter's raw
-/// inode and `..` writes, `zero_inline_symlink_before_unlink` and
-/// `update_dir_dotdot`, never update checksums), `READONLY` (0x1000) and
-/// `PROJECT` (0x2000).
-const DISALLOWED_RW_RO_COMPAT_BITS: u32 = 0x0004 | 0x0010 | 0x0100 | 0x0200 | 0x0400 | 0x1000 | 0x2000;
+/// Recognised `ro_compat` bits that still force a read-only mount
+/// (ARCHITECTURE §9's `mke2fs -O ^metadata_csum,...` mask is the writable
+/// profile): `BTREE_DIR` (0x4), `GDT_CSUM` (0x10), `QUOTA` (0x100),
+/// `BIGALLOC` (0x200), `METADATA_CSUM` (0x400: the adapter's raw inode-table
+/// and `..` writes (`zero_inline_symlink_before_unlink`,
+/// `write_inline_symlink_target`, `SavedInlineSymlink::restore`,
+/// `update_dir_dotdot`) never update checksums), `READONLY` (0x1000),
+/// `PROJECT` (0x2000) and `ORPHAN_PRESENT` (0x10000: the orphan file has
+/// entries, which `ext4plus` never processes).
+const DISALLOWED_RW_RO_COMPAT_BITS: u32 = 0x0004 | 0x0010 | 0x0100 | 0x0200 | 0x0400 | 0x1000 | 0x2000 | 0x1_0000;
+// A disallowed bit dropped from the known set would be reported as unknown.
+const _: () = assert!(DISALLOWED_RW_RO_COMPAT_BITS & !KNOWN_RO_COMPAT_BITS == 0);
 
 /// Why a filesystem's superblock forces a read-only mount, if it does.
 fn forced_read_only_reason(needs_recovery: bool, ro_compat_bits: u32) -> Option<&'static str> {
@@ -79,7 +85,7 @@ fn forced_read_only_reason(needs_recovery: bool, ro_compat_bits: u32) -> Option<
     } else if ro_compat_bits & !KNOWN_RO_COMPAT_BITS != 0 {
         Some("unknown ro_compat feature")
     } else if ro_compat_bits & DISALLOWED_RW_RO_COMPAT_BITS != 0 {
-        Some("ro_compat feature not supported for writing (metadata_csum, quota, bigalloc, ...)")
+        Some("ro_compat feature not supported for writing (metadata_csum, quota, bigalloc, orphan_present, ...)")
     } else {
         None
     }
@@ -92,6 +98,10 @@ fn forced_read_only_reason(needs_recovery: bool, ro_compat_bits: u32) -> Option<
 /// could fail with `ENOSPC` after the inode is allocated, and without a free
 /// directory slot that inode couldn't be released (`discard_orphan`).
 const CREATE_RESERVE_BLOCKS: u64 = 8;
+
+/// The most links an inode may have (Linux's `EXT4_LINK_MAX`): `mkdir` in a
+/// directory already at it is refused.
+const EXT4_LINK_MAX: u32 = 65_000;
 
 /// `ext4plus::file::write_at` writes at most one filesystem block per call on
 /// block-mapped files and may stop short (e.g. out of space): loop until all
@@ -131,13 +141,14 @@ fn ensure_absent(dir: &Dir, name: DirEntryName<'_>) -> Result<(), VfsError> {
     }
 }
 
-/// The largest file an `ext4` volume with `block_size` blocks can hold: with
-/// extents, 2^32 - 1 logical blocks; block-mapped, 12 direct blocks plus the
-/// single, double and triple indirect trees (the smaller of the two, as
-/// `i_blocks` is counted in 32 bits of 512-byte sectors without `HUGE_FILE`
-/// on block maps).
+/// The largest file `ext4plus` can map with `block_size` blocks: with
+/// extents, 2^32 - 1 logical blocks; block-mapped, the smallest of 12 direct
+/// blocks plus the single, double and triple indirect trees, that same
+/// logical-block limit, and 2^32 - 1 512-byte sectors (`i_blocks` without
+/// `HUGE_FILE`). Linux also caps extent files at 2^32 - 1 sectors without
+/// `huge_file`; this adapter follows `ext4plus`, which doesn't.
 fn max_file_size(block_size: u64, extents: bool) -> u64 {
-    let extent_limit = ((1u64 << 32) - 1).saturating_mul(block_size);
+    let extent_limit = u64::from(u32::MAX).saturating_mul(block_size);
     if extents {
         return extent_limit;
     }
@@ -146,7 +157,7 @@ fn max_file_size(block_size: u64, extents: bool) -> u64 {
         .saturating_add(per)
         .saturating_add(per.saturating_mul(per))
         .saturating_add(per.saturating_mul(per).saturating_mul(per));
-    blocks.saturating_mul(block_size).min(extent_limit).min(((1u64 << 32) - 1) * 512)
+    blocks.saturating_mul(block_size).min(extent_limit).min(u64::from(u32::MAX) * 512)
 }
 
 /// `NoSpc` unless at least [`CREATE_RESERVE_BLOCKS`] blocks are free.
@@ -183,6 +194,16 @@ impl Ext4Write for BcacheIo {
     }
 }
 
+/// A block-cache error as the filesystem reports it: `EROFS` for a
+/// read-only device, else `EIO` (an address past the device comes from the
+/// filesystem's own metadata, not from the caller's arguments).
+fn map_block_error(err: &BlockError) -> VfsError {
+    match err {
+        BlockError::ReadOnly => VfsError::RoFs,
+        _ => VfsError::Io,
+    }
+}
+
 fn map_ext4_err(err: Ext4Error) -> VfsError {
     match err {
         Ext4Error::NotFound => VfsError::NoEnt,
@@ -198,11 +219,8 @@ fn map_ext4_err(err: Ext4Error) -> VfsError {
         Ext4Error::TooManySymlinks => VfsError::Loop,
         Ext4Error::FileTooLarge => VfsError::FBig,
         Ext4Error::Io(ref inner) => match inner.downcast_ref::<BcacheIoError>() {
-            Some(BcacheIoError(BlockError::ReadOnly)) => VfsError::RoFs,
-            // A block address past the device or misaligned comes from the
-            // filesystem's own metadata (a corrupt extent), not from the
-            // caller's arguments: an I/O error, not `EINVAL`.
-            _ => VfsError::Io,
+            Some(BcacheIoError(e)) => map_block_error(e),
+            None => VfsError::Io,
         },
         _ => VfsError::Io,
     }
@@ -249,7 +267,7 @@ impl Ext4DiskLayout {
 
         let mut bgd = [0u8; 64];
         let read_len = usize::from(self.desc_size).min(bgd.len());
-        bcache.read_at(bgd_byte, &mut bgd[..read_len]).map_err(|_| VfsError::Io)?;
+        bcache.read_at(bgd_byte, &mut bgd[..read_len]).map_err(|e| map_block_error(&e))?;
 
         let lo = u32::from_le_bytes(bgd[0x8..0xc].try_into().unwrap());
         let hi =
@@ -325,7 +343,14 @@ const DETACHED_SCAN_LIMIT_PAGES: usize = 4 * page_cache::DETACHED_QUOTA_PAGES;
 /// as soon as a write of the right count lands. They live only in memory: if
 /// the volume is unmounted or the machine reboots first, the disk keeps the
 /// wrong count until `e2fsck` fixes it.
+///
+/// Setting a bound (`set_nlink_exact`, `record_nlink_floor`) first reads the
+/// disk count: if the disk already agrees there is nothing to keep, and if it
+/// doesn't (or can't be read) the bound is kept and logged at `error`, once
+/// per change of the bound, because that is the one place a failed undo of a
+/// `links_count` leaves the disk wrong.
 struct Ext4FsInner {
+    dev: DevId,
     ext4: Ext4,
     bcache: SharedBlockCache,
     layout: Ext4DiskLayout,
@@ -352,14 +377,41 @@ impl Ext4FsInner {
         }
     }
 
+    /// The on-disk `links_count` of `disk_ino`, if it can be read.
+    fn disk_links_count(&self, disk_ino: u32) -> Option<u32> {
+        let ino = NonZeroU32::new(disk_ino)?;
+        Inode::read(&self.ext4, ino).ok().map(|d| u32::from(d.links_count()))
+    }
+
+    fn log_kept_bound(&self, disk_ino: u32, disk: Option<u32>, kept: &str) {
+        let disk = disk.map_or_else(|| String::from("unreadable"), |n| alloc::format!("{n}"));
+        error!(
+            target: "vfs",
+            "ext4 {:?} inode {disk_ino}: links_count on disk is {disk}, keeping {kept} in memory until a write lands; \
+             run e2fsck if the volume is unmounted first",
+            self.dev
+        );
+    }
+
+    /// Require at least `min_nlink` links for `disk_ino` (a count that a
+    /// failed write may have left too low on disk). Nothing is kept when the
+    /// disk count is already at least that.
     fn record_nlink_floor(&mut self, disk_ino: u32, min_nlink: u32) {
         if min_nlink == 0 {
             return;
         }
+        let disk = self.disk_links_count(disk_ino);
+        if disk.is_some_and(|n| n >= min_nlink) {
+            return;
+        }
+        let old_floor = self.nlink_floor(disk_ino);
         let new_floor =
             *self.nlink_floors.entry(disk_ino).and_modify(|cur| *cur = (*cur).max(min_nlink)).or_insert(min_nlink);
         if self.nlink_ceilings.get(&disk_ino).is_some_and(|&c| c < new_floor) {
             self.nlink_ceilings.remove(&disk_ino);
+        }
+        if new_floor != old_floor {
+            self.log_kept_bound(disk_ino, disk, &alloc::format!("at least {new_floor}"));
         }
     }
 
@@ -381,9 +433,21 @@ impl Ext4FsInner {
         }
     }
 
+    /// Pin `disk_ino`'s link count to `exact` (the entries that really
+    /// exist) when a write of that count failed. Nothing is kept when the disk
+    /// already holds `exact`.
     fn set_nlink_exact(&mut self, disk_ino: u32, exact: u32) {
+        let disk = self.disk_links_count(disk_ino);
+        if disk == Some(exact) {
+            self.clear_nlink_bounds(disk_ino);
+            return;
+        }
+        let unchanged = self.nlink_floor(disk_ino) == exact && self.nlink_ceiling(disk_ino) == Some(exact);
         self.set_nlink_floor(disk_ino, exact);
         self.set_nlink_ceiling(disk_ino, exact);
+        if !unchanged {
+            self.log_kept_bound(disk_ino, disk, &alloc::format!("{exact}"));
+        }
     }
 
     fn clear_nlink_floor(&mut self, disk_ino: u32) {
@@ -444,20 +508,14 @@ struct Ext4Shared {
 
 impl Ext4Shared {
     /// Write the block cache back to the device and flush it (outside Lock 6:
-    /// the block cache has its own lock, 7). A failure is logged with its
-    /// cause and reported as `EIO` (`EROFS` for a read-only device).
-    fn sync_bcache(&self) -> Result<(), VfsError> {
+    /// the block cache has its own lock, 7). A failure comes back as the
+    /// errno to report and its cause, for the caller to log once.
+    fn sync_bcache(&self) -> Result<(), (VfsError, BlockError)> {
         let bcache = {
             let inner = self.state.lock();
             Arc::clone(&inner.bcache)
         };
-        bcache.sync().map_err(|e| {
-            warn!(target: "vfs", "sync: ext4 {:?} block cache: {e}", self.dev);
-            match e {
-                BlockError::ReadOnly => VfsError::RoFs,
-                _ => VfsError::Io,
-            }
-        })
+        bcache.sync().map_err(|e| (map_block_error(&e), e))
     }
 }
 
@@ -472,7 +530,7 @@ impl Ext4FileSystem {
     /// Probe and mount an `ext4` filesystem on `bcache` as `dev`.
     pub fn mount(bcache: SharedBlockCache, dev: DevId, hw_read_only: bool) -> Result<Arc<Self>, VfsError> {
         let mut raw_sb = [0u8; 1024];
-        bcache.read_at(1024, &mut raw_sb).map_err(|_| VfsError::Io)?;
+        bcache.read_at(1024, &mut raw_sb).map_err(|e| map_block_error(&e))?;
         let magic = u16::from_le_bytes(raw_sb[0x38..0x3a].try_into().unwrap());
         if magic != 0xef53 {
             return Err(VfsError::Inval);
@@ -507,6 +565,7 @@ impl Ext4FileSystem {
             read_only,
             max_file_size: max_file_size(layout.block_size, extents),
             state: SleepMutex::new(Ext4FsInner {
+                dev,
                 ext4,
                 bcache,
                 layout,
@@ -565,13 +624,11 @@ impl FileSystem for Ext4FileSystem {
                 first_err.get_or_insert(e);
             }
         }
-        if let Err(e) = self.shared.sync_bcache() {
+        if let Err((e, cause)) = self.shared.sync_bcache() {
+            warn!(target: "vfs", "sync: ext4 {:?} block cache: {cause}", self.shared.dev);
             first_err.get_or_insert(e);
         }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        first_err.map_or(Ok(()), Err)
     }
 
     fn read_only(&self) -> bool {
@@ -611,9 +668,12 @@ pub struct Ext4Inode {
     inode_type: InodeType,
     open_count: AtomicU32,
     detached: AtomicBool,
-    /// A writeback failure was logged and no writeback has succeeded since:
-    /// one warning per failing streak, not one per page or reclaim pass.
-    writeback_failing: AtomicBool,
+    /// The errno of the writeback failure last logged, 0 once a writeback
+    /// fully succeeds: one warning per failing streak and kind of error, not
+    /// one per page or reclaim pass.
+    writeback_errno: AtomicU32,
+    /// A directory listing skipped a name that isn't UTF-8 and said so.
+    warned_non_utf8: AtomicBool,
     meta: SleepMutex<Ext4InodeMeta>,
     pages: SleepMutex<PageCache>,
 }
@@ -644,7 +704,8 @@ impl Ext4Inode {
             inode_type: map_file_type(disk.file_type()),
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
-            writeback_failing: AtomicBool::new(false),
+            writeback_errno: AtomicU32::new(0),
+            warned_non_utf8: AtomicBool::new(false),
             meta: SleepMutex::new(meta),
             pages: SleepMutex::new(PageCache::new_ext4()),
         })
@@ -678,19 +739,25 @@ impl Ext4Inode {
         );
     }
 
-    /// Log a writeback failure once per failing streak.
-    fn note_writeback_error(&self, err: VfsError) {
-        if !self.writeback_failing.swap(true, Ordering::AcqRel) {
-            warn!(target: "vfs", "ext4 {:?} inode {}: writeback failed: {err:?}", self.shared.dev, self.disk_ino);
+    /// Log a writeback failure of `what` once per failing streak, and again
+    /// whenever the kind of error changes.
+    fn note_writeback_error(&self, err: VfsError, what: fmt::Arguments<'_>) {
+        if self.writeback_errno.swap(err.to_errno(), Ordering::AcqRel) != err.to_errno() {
+            warn!(target: "vfs", "ext4 {:?} inode {}: writeback of {what} failed: {err:?}", self.shared.dev, self.disk_ino);
         }
     }
 
     /// Write one dirty page's bytes below `file_size` back to disk (Lock 6
     /// and below), clearing its dirty bit first and setting it again if the
     /// write fails, so a failed writeback is retried and the page is never
-    /// evicted as clean. The new `i_blocks` on success.
-    fn write_back_page(&self, page_idx: u64, page: &CachePage, file_size: u64) -> Result<u64, VfsError> {
+    /// evicted as clean. The caller holds the inode's Lock 4 and Lock 5 (the
+    /// page's bytes are read under Lock 5). `Ok(None)` for a page wholly past
+    /// `file_size` (nothing to write), else the new `i_blocks`.
+    fn write_back_page(&self, page_idx: u64, page: &CachePage, file_size: u64) -> Result<Option<u64>, VfsError> {
         let page_off = page_idx * PAGE_SIZE as u64;
+        if page_off >= file_size {
+            return Ok(None);
+        }
         let valid = (file_size - page_off).min(PAGE_SIZE as u64) as usize;
         page.swap_dirty(false);
         let mut bounce = [0u8; PAGE_SIZE];
@@ -698,22 +765,24 @@ impl Ext4Inode {
         let res = {
             let inner = self.shared.state.lock();
             Inode::read(&inner.ext4, self.disk_inode_index())
-                .and_then(|mut disk| ext4_write_all(&inner.ext4, &mut disk, &bounce[..valid], page_off).map(|()| disk))
-                .map(|disk| disk.blocks())
+                .and_then(|mut disk| {
+                    ext4_write_all(&inner.ext4, &mut disk, &bounce[..valid], page_off)?;
+                    Ok(disk.blocks())
+                })
                 .map_err(map_ext4_err)
         };
         if let Err(e) = res {
             page.set_dirty();
-            self.note_writeback_error(e);
+            self.note_writeback_error(e, format_args!("page {page_idx} (offset {page_off})"));
         }
-        res
+        res.map(Some)
     }
 
     /// Write back every dirty page (Lock 4 -> Lock 5 -> Lock 6 -> 7 -> 8),
     /// then evict every page it wrote that is still clean and unpinned, then
-    /// up to `max_evict` minus those more clean pages, oldest first. On a
-    /// write error the page stays dirty, nothing is evicted and 0 is
-    /// returned. The number of pages evicted.
+    /// up to `max_evict` minus those more clean pages, oldest first. A page
+    /// whose write fails stays dirty (and is never evicted); the others are
+    /// still written. The number of pages evicted.
     pub fn reclaim_dirty_pages(&self, max_evict: usize) -> usize {
         if self.is_detached() || self.inode_type != InodeType::File || self.shared.read_only {
             return 0;
@@ -726,17 +795,20 @@ impl Ext4Inode {
         let mut pages = self.pages.lock();
         let dirty = pages.collect_dirty();
         let mut flushed_indices = Vec::new();
+        let mut failed = false;
         for (page_idx, page) in dirty {
-            if page_idx * PAGE_SIZE as u64 >= file_size {
-                continue;
-            }
             match self.write_back_page(page_idx, &page, file_size) {
-                Ok(blocks_512) => meta.blocks_512 = blocks_512,
-                Err(_) => return 0,
+                Ok(Some(blocks_512)) => {
+                    meta.blocks_512 = blocks_512;
+                    flushed_indices.push(page_idx);
+                }
+                Ok(None) => {}
+                Err(_) => failed = true,
             }
-            flushed_indices.push(page_idx);
         }
-        self.writeback_failing.store(false, Ordering::Release);
+        if !failed {
+            self.writeback_errno.store(0, Ordering::Release);
+        }
         let mut evicted = pages.evict_if_clean_unpinned(&flushed_indices);
         if evicted < max_evict {
             evicted += pages.evict_clean_oldest(max_evict - evicted);
@@ -747,7 +819,8 @@ impl Ext4Inode {
     /// Flush all dirty `PageCache` pages and authoritative metadata to `ext4`
     /// under `Lock 4 -> Lock 5 -> Lock 6 -> Lock 7 -> Lock 8`. A page whose
     /// write fails stays dirty, and `meta_dirty` stays set if the metadata
-    /// write fails, so a later sync retries both.
+    /// write fails, so a later sync retries both; every other page is still
+    /// written, and the first error is returned.
     fn flush_to_ext4(&self, data_only: bool) -> Result<(), VfsError> {
         if self.is_detached() || self.shared.read_only {
             return Ok(());
@@ -757,13 +830,17 @@ impl Ext4Inode {
             return Ok(());
         }
         let file_size = meta.size;
+        let mut first_err: Option<VfsError> = None;
         if self.inode_type == InodeType::File {
             let pages = self.pages.lock();
             for (page_idx, page) in pages.collect_dirty() {
-                if page_idx * PAGE_SIZE as u64 >= file_size {
-                    continue;
+                match self.write_back_page(page_idx, &page, file_size) {
+                    Ok(Some(blocks_512)) => meta.blocks_512 = blocks_512,
+                    Ok(None) => {}
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                    }
                 }
-                meta.blocks_512 = self.write_back_page(page_idx, &page, file_size)?;
             }
         }
 
@@ -789,16 +866,22 @@ impl Ext4Inode {
                 Ok(())
             })();
             if let Err(e) = res {
-                self.note_writeback_error(e);
-                return Err(e);
+                self.note_writeback_error(e, format_args!("its metadata"));
+                first_err.get_or_insert(e);
             }
         }
-        self.writeback_failing.store(false, Ordering::Release);
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => {
+                self.writeback_errno.store(0, Ordering::Release);
+                Ok(())
+            }
+        }
     }
 
     /// Make the new symlink inode `sym` a fast symlink to `target` (at most 60
-    /// bytes): no `EXTENTS` flag, `i_size = target.len()`, the target in
+    /// bytes fit in `i_block`; `symlink` passes at most 59, the most
+    /// `ext4plus` reads back inline): no `EXTENTS` flag, `i_size = target.len()`, the target in
     /// `i_block`. `ext4plus` keeps its inline-data setter private, so the
     /// bytes are written to the inode table directly (as
     /// `zero_inline_symlink_before_unlink` does), then the inode is re-read.
@@ -810,7 +893,7 @@ impl Ext4Inode {
         let off = inner.layout.inode_disk_offset(&inner.bcache, sym.index.get())?;
         let mut body = [0u8; 60];
         body[..target.len()].copy_from_slice(target);
-        inner.bcache.write_at(off + 0x28, &body).map_err(|_| VfsError::Io)?;
+        inner.bcache.write_at(off + 0x28, &body).map_err(|e| map_block_error(&e))?;
         Inode::read(&inner.ext4, sym.index).map_err(map_ext4_err)
     }
 
@@ -824,7 +907,7 @@ impl Ext4Inode {
         }
         let off = inner.layout.inode_disk_offset(&inner.bcache, disk.index.get())?;
         let mut buf = vec![0u8; len];
-        inner.bcache.read_at(off + 0x28, &mut buf).map_err(|_| VfsError::Io)?;
+        inner.bcache.read_at(off + 0x28, &mut buf).map_err(|e| map_block_error(&e))?;
         Ok(buf)
     }
 
@@ -848,14 +931,14 @@ impl Ext4Inode {
             // fields in a single `bcache.write_at` call without ever splitting `inline_60`
             // from `size_lo` on a write-cutoff fault.
             let mut span = [0u8; 0x6c];
-            inner.bcache.read_at(off + 0x04, &mut span).map_err(|_| VfsError::Io)?;
+            inner.bcache.read_at(off + 0x04, &mut span).map_err(|e| map_block_error(&e))?;
             let saved = SavedInlineSymlink { off, span };
 
             let mut zeroed_span = span;
             zeroed_span[0x00..0x04].fill(0);
             zeroed_span[0x24..0x60].fill(0);
             zeroed_span[0x68..0x6c].fill(0);
-            inner.bcache.write_at(off + 0x04, &zeroed_span).map_err(|_| VfsError::Io)?;
+            inner.bcache.write_at(off + 0x04, &zeroed_span).map_err(|e| map_block_error(&e))?;
 
             return match Inode::read(&inner.ext4, idx) {
                 Ok(zeroed_disk) => Ok((zeroed_disk, Some(saved))),
@@ -880,8 +963,11 @@ impl Ext4Inode {
     /// inode has allocated (so a large sparse file with its data near the
     /// start is cheap), and gives up with `NoSpc` after
     /// [`DETACHED_SCAN_LIMIT_PAGES`] uncached pages. The trade-off: unlinking
-    /// an open sparse file whose data lies beyond that scan fails, as one
-    /// with more data than the detached quota already does.
+    /// an open file fails whenever its allocated blocks aren't all accounted
+    /// for by non-zero data within that scan (data lying further out in a
+    /// sparse file, a long run of zero-filled blocks, or extent and
+    /// indirect blocks counted in `i_blocks`), as one with more data than
+    /// the detached quota already does.
     ///
     /// If the subsequent disk unlink/rmdir/rename fails, dropping the returned
     /// `PreparedDetach` automatically releases the `DETACHED_QUOTA` reservation.
@@ -923,14 +1009,16 @@ impl Ext4Inode {
                         let mut data_blocks_seen = 0u64;
                         let mut last_counted_block: Option<u64> = None;
                         let mut scanned = 0usize;
+                        let step = block_size.min(PAGE_SIZE);
                         for p in 0..num_pages {
                             if data_blocks_seen >= allocated_blocks {
                                 break;
                             }
                             // A cached page is authoritative and isn't copied,
                             // but the disk blocks under it still count toward
-                            // the allocated ones (read, at most one per cached
-                            // page, already within the quota reserved above).
+                            // the allocated ones. Those reads are bounded by
+                            // the cached page count, which the reservation
+                            // above caps at the detached quota.
                             let cached = pages.get(p).is_some();
                             if !cached {
                                 if scanned >= DETACHED_SCAN_LIMIT_PAGES {
@@ -948,7 +1036,6 @@ impl Ext4Inode {
                             }
                             // Count each filesystem block with a non-zero byte
                             // once (a block may span several pages).
-                            let step = block_size.min(PAGE_SIZE);
                             let mut any_nonzero = false;
                             for (i, sub) in tmp[..chunk].chunks(step).enumerate() {
                                 if sub.iter().any(|&x| x != 0) {
@@ -1117,10 +1204,42 @@ impl Ext4Inode {
                         Ok(UnlinkDiskOutcome::Aborted { err, actual_nlink: Some(effective_nlink) })
                     }
                     Err(_) => {
-                        // The directory can't be read back: assume the entry
-                        // survived (the unlink failed) and put the inline
-                        // target back, or a surviving symlink would read as
-                        // empty.
+                        // The directory can't be read back, so decide from
+                        // the child inode itself. `Dir::unlink` writes the
+                        // child's lowered count, removes the entry, and only
+                        // then (`delete_file`) zeroes the inode and frees it
+                        // in the bitmap. A zeroed mode means the entry is gone
+                        // and the inode may be free: restoring onto it would
+                        // revive a number another create can reuse.
+                        let child_now = Inode::read(&inner.ext4, child_arc.disk_inode_index());
+                        let zeroed = match &child_now {
+                            Ok(cur) => cur.mode().bits() == 0,
+                            // A zeroed inode may not parse; one that can't be
+                            // read at all leaves it unknown (treated as live,
+                            // below).
+                            Err(Ext4Error::Corrupt(_)) => true,
+                            Err(_) => false,
+                        };
+                        if zeroed {
+                            inner.live_inodes.remove(&child_arc.disk_ino);
+                            inner.clear_nlink_bounds(child_arc.disk_ino);
+                            return Ok(UnlinkDiskOutcome::Completed { remaining_nlink: None, post_err: Some(err) });
+                        }
+                        // Otherwise the inode is still allocated (the bitmap
+                        // is freed only after the zeroing): assume the entry
+                        // survived and put the inline target back, or a
+                        // surviving symlink would read as empty. If the entry
+                        // was in fact removed, the restored inode is an orphan
+                        // `e2fsck` reattaches, with its target intact.
+                        if child_now.is_err() {
+                            error!(
+                                target: "vfs",
+                                "ext4 {:?} inode {}: unlink failed and neither its directory nor the inode reads \
+                                 back; assuming the entry survived; run e2fsck",
+                                inner.dev,
+                                child_arc.disk_ino
+                            );
+                        }
                         if let Some(saved) = saved_inline {
                             saved.restore(inner, child_arc.disk_ino);
                         }
@@ -1336,13 +1455,8 @@ fn is_ext4_dir_empty(ext4: &Ext4, dir_inode: &Inode) -> Result<bool, VfsError> {
 fn update_dir_dotdot(ext4: &Ext4, dir_ino: u32, new_parent_ino: u32) -> Result<(), VfsError> {
     let mut dir_inode = Inode::read(ext4, NonZeroU32::new(dir_ino).ok_or(VfsError::Inval)?).map_err(map_ext4_err)?;
     let mut hdr = [0u8; 24];
-    let mut off = 0usize;
-    while off < hdr.len() {
-        let n = ext4_read_at(ext4, &dir_inode, &mut hdr[off..], off as u64).map_err(map_ext4_err)?;
-        if n == 0 {
-            return Err(VfsError::Io);
-        }
-        off += n;
+    if ext4_read_full(ext4, &dir_inode, &mut hdr, 0).map_err(map_ext4_err)? != hdr.len() {
+        return Err(VfsError::Io);
     }
     // Verify standard block-0 `..` entry at offset 12..22 (`name_len == 2`, `FT_DIR == 2`, `".."`).
     if hdr[18] != 2 || hdr[19] != 2 || &hdr[20..22] != b".." {
@@ -1371,14 +1485,15 @@ fn dir_has_entry(
     }
 }
 
-fn dir_entry_absent(ext4: &Ext4, parent_ino: NonZeroU32, dname: DirEntryName<'_>) -> bool {
-    let Ok(parent) = Inode::read(ext4, parent_ino) else {
-        return false;
-    };
-    let Ok(dir) = Dir::open_inode(ext4, parent) else {
-        return false;
-    };
-    matches!(dir.get_entry(dname), Err(Ext4Error::NotFound))
+/// Whether `parent_ino` has no entry `dname`; a read error is reported, not
+/// taken as either answer.
+fn dir_entry_absent(ext4: &Ext4, parent_ino: NonZeroU32, dname: DirEntryName<'_>) -> Result<bool, Ext4Error> {
+    let dir = Dir::open_inode(ext4, Inode::read(ext4, parent_ino)?)?;
+    match dir.get_entry(dname) {
+        Ok(_) => Ok(false),
+        Err(Ext4Error::NotFound) => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
 /// Release an inode that `create`/`mkdir`/`symlink` allocated when a later
@@ -1391,9 +1506,14 @@ fn dir_entry_absent(ext4: &Ext4, parent_ino: NonZeroU32, dname: DirEntryName<'_>
 /// orphan then stays until `e2fsck`); the caller reports its own error either
 /// way. Needs a free slot in the directory, which `CREATE_RESERVE_BLOCKS`
 /// keeps available when the failure was running out of space.
-fn discard_orphan(inner: &Ext4FsInner, parent_ino: NonZeroU32, dname: DirEntryName<'_>, orphan_ino: NonZeroU32) {
-    let ext4 = &inner.ext4;
+fn discard_orphan(inner: &mut Ext4FsInner, parent_ino: NonZeroU32, dname: DirEntryName<'_>, orphan_ino: NonZeroU32) {
+    // The parent's count to restore after a directory's unlink, once known.
+    let mut parent_restore: Option<u16> = None;
     let res = (|| -> Result<(), VfsError> {
+        let ext4 = &inner.ext4;
+        let open_parent = || -> Result<Dir, VfsError> {
+            Dir::open_inode(ext4, Inode::read(ext4, parent_ino).map_err(map_ext4_err)?).map_err(map_ext4_err)
+        };
         let parent_links = Inode::read(ext4, parent_ino).map_err(map_ext4_err)?.links_count();
         let mut orphan = Inode::read(ext4, orphan_ino).map_err(map_ext4_err)?;
         let is_dir = orphan.file_type().is_dir();
@@ -1405,26 +1525,30 @@ fn discard_orphan(inner: &Ext4FsInner, parent_ino: NonZeroU32, dname: DirEntryNa
         // A directory's link raised the parent's count; the unlink below
         // won't lower it. If the failed create's own link already landed (and
         // raised it), the parent ends one below the count read above.
-        let mut parent_links_after = parent_links;
-        if dir_has_entry(ext4, parent_ino, dname, orphan_ino.get()).map_err(map_ext4_err)? {
-            parent_links_after = parent_links.saturating_sub(1);
+        let parent_links_after = if dir_has_entry(ext4, parent_ino, dname, orphan_ino.get()).map_err(map_ext4_err)? {
+            parent_links.saturating_sub(1)
         } else {
-            let mut dir =
-                Dir::open_inode(ext4, Inode::read(ext4, parent_ino).map_err(map_ext4_err)?).map_err(map_ext4_err)?;
+            let mut dir = open_parent()?;
             ensure_absent(&dir, dname)?;
             orphan.set_links_count(0);
             dir.link(dname, &mut orphan).map_err(map_ext4_err)?;
-        }
+            parent_links
+        };
         let mut orphan = Inode::read(ext4, orphan_ino).map_err(map_ext4_err)?;
         orphan.set_links_count(1);
-        let mut dir =
-            Dir::open_inode(ext4, Inode::read(ext4, parent_ino).map_err(map_ext4_err)?).map_err(map_ext4_err)?;
-        dir.unlink(dname, orphan).map_err(map_ext4_err)?;
+        open_parent()?.unlink(dname, orphan).map_err(map_ext4_err)?;
         if is_dir {
+            parent_restore = Some(parent_links_after);
             restore_disk_links_count(ext4, parent_ino, parent_links_after)?;
+            parent_restore = None;
         }
         Ok(())
     })();
+    if let Some(links) = parent_restore {
+        // The orphan is gone but the parent's count couldn't be put back:
+        // keep the right count in memory (logged there).
+        inner.set_nlink_exact(parent_ino.get(), u32::from(links));
+    }
     if let Err(e) = res {
         error!(
             target: "vfs",
@@ -1435,7 +1559,8 @@ fn discard_orphan(inner: &Ext4FsInner, parent_ino: NonZeroU32, dname: DirEntryNa
 
 /// Undo a link of `child_ino` at `dname` in `parent_ino`, if it is there:
 /// raise the child's count so the unlink can't free it, then unlink. Best
-/// effort (the callers re-probe the entries afterwards); a failure is logged.
+/// effort and silent: the callers re-probe the entries afterwards (often
+/// retrying once writes succeed again) and log the end state if it is wrong.
 fn rollback_link_entry(
     ext4: &Ext4,
     parent_ino: NonZeroU32,
@@ -1446,7 +1571,7 @@ fn rollback_link_entry(
     if !matches!(dir_has_entry(ext4, parent_ino, dname, child_ino.get()), Ok(true)) {
         return;
     }
-    let res = (|| -> Result<(), Ext4Error> {
+    let _attempt = (|| -> Result<(), Ext4Error> {
         let mut child_disk = Inode::read(ext4, child_ino)?;
         let needed = min_links_before_unlink.max(2);
         if child_disk.links_count() < needed {
@@ -1457,31 +1582,29 @@ fn rollback_link_entry(
         Dir::open_inode(ext4, parent_disk)?.unlink(dname, child_disk)?;
         Ok(())
     })();
-    if let Err(e) = res {
-        error!(
-            target: "vfs",
-            "ext4: rollback: unlinking inode {child_ino} from directory {parent_ino} failed: {e}; run e2fsck"
-        );
-    }
 }
 
 /// Put back a removed entry `dname` -> `child_ino` in `parent_ino`, if the
-/// name is free. Best effort (the callers re-probe); a failure is logged.
+/// name is free. Best effort and silent, like [`rollback_link_entry`].
 fn rollback_restore_entry(ext4: &Ext4, parent_ino: NonZeroU32, dname: DirEntryName<'_>, child_ino: NonZeroU32) {
-    if !dir_entry_absent(ext4, parent_ino, dname) {
+    if !matches!(dir_entry_absent(ext4, parent_ino, dname), Ok(true)) {
         return;
     }
-    let res = (|| -> Result<(), Ext4Error> {
+    let _attempt = (|| -> Result<(), Ext4Error> {
         let mut child_disk = Inode::read(ext4, child_ino)?;
         let parent_disk = Inode::read(ext4, parent_ino)?;
         Dir::open_inode(ext4, parent_disk)?.link(dname, &mut child_disk)
     })();
-    if let Err(e) = res {
-        error!(
-            target: "vfs",
-            "ext4: rollback: relinking inode {child_ino} into directory {parent_ino} failed: {e}; run e2fsck"
-        );
-    }
+}
+
+/// Log that undoing a failed rename couldn't put the entries back as they
+/// were (or couldn't read them to check).
+fn log_rename_undo_failure(dev: DevId, what: &str, old_dir: NonZeroU32, new_dir: NonZeroU32) {
+    error!(
+        target: "vfs",
+        "ext4 {dev:?}: undoing a failed {what} between directories {old_dir} and {new_dir} left its entries \
+         inconsistent or unreadable; run e2fsck"
+    );
 }
 
 fn restore_disk_links_count(ext4: &Ext4, ino: NonZeroU32, target_links: u16) -> Result<(), VfsError> {
@@ -1614,7 +1737,7 @@ impl VfsInode for Ext4Inode {
             .map_err(map_ext4_err)?;
         inner.clear_nlink_bounds(child_disk.index.get());
         if let Err(e) = parent_dir.link(dname, &mut child_disk) {
-            discard_orphan(&inner, self.disk_inode_index(), dname, child_disk.index);
+            discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index);
             return Err(map_ext4_err(e));
         }
         let child = inner.get_or_create_inode(child_disk, &self.shared);
@@ -1655,6 +1778,13 @@ impl VfsInode for Ext4Inode {
         ensure_absent(&parent_check, dname)?;
         drop(parent_check);
         ensure_create_reserve(&inner.ext4)?;
+        // The new directory's `..` raises the parent's count; past ext4's
+        // link limit `Dir::link` would fail after the inode and its block are
+        // allocated (and so would `discard_orphan`'s own link). Refused before
+        // allocating anything (Linux says EMLINK, which `VfsError` lacks).
+        if parent_eff >= EXT4_LINK_MAX {
+            return Err(VfsError::NoSpc);
+        }
 
         let sub_raw = inner
             .ext4
@@ -1679,14 +1809,20 @@ impl VfsInode for Ext4Inode {
         let sub_inode = match linked {
             Ok(sub_inode) => sub_inode,
             Err(e) => {
-                if dir_entry_absent(&inner.ext4, self.disk_inode_index(), dname) {
-                    if restore_disk_links_count(&inner.ext4, self.disk_inode_index(), parent_eff_u16).is_ok() {
-                        inner.clear_nlink_bounds(self.disk_ino);
-                    } else {
-                        inner.set_nlink_exact(self.disk_ino, parent_eff);
+                match dir_entry_absent(&inner.ext4, self.disk_inode_index(), dname) {
+                    Ok(true) => {
+                        if restore_disk_links_count(&inner.ext4, self.disk_inode_index(), parent_eff_u16).is_ok() {
+                            inner.clear_nlink_bounds(self.disk_ino);
+                        } else {
+                            inner.set_nlink_exact(self.disk_ino, parent_eff);
+                        }
                     }
+                    Ok(false) => {}
+                    // Unknown whether the link landed: the parent's count
+                    // can't be judged; keep at least the count before mkdir.
+                    Err(_) => inner.record_nlink_floor(self.disk_ino, parent_eff),
                 }
-                discard_orphan(&inner, self.disk_inode_index(), dname, sub_ino);
+                discard_orphan(&mut inner, self.disk_inode_index(), dname, sub_ino);
                 return Err(map_ext4_err(e));
             }
         };
@@ -1960,12 +2096,19 @@ impl VfsInode for Ext4Inode {
                 target_disk.set_links_count(target_eff_u16);
             }
             if let Err(e) = parent_dir.link(dname, &mut target_disk) {
-                if dir_entry_absent(&inner.ext4, self.disk_inode_index(), dname) {
-                    if restore_disk_links_count(&inner.ext4, target_arc.disk_inode_index(), target_eff_u16).is_ok() {
-                        inner.clear_nlink_bounds(target_arc.disk_ino);
-                    } else {
-                        inner.set_nlink_exact(target_arc.disk_ino, target_eff);
+                match dir_entry_absent(&inner.ext4, self.disk_inode_index(), dname) {
+                    Ok(true) => {
+                        if restore_disk_links_count(&inner.ext4, target_arc.disk_inode_index(), target_eff_u16).is_ok()
+                        {
+                            inner.clear_nlink_bounds(target_arc.disk_ino);
+                        } else {
+                            inner.set_nlink_exact(target_arc.disk_ino, target_eff);
+                        }
                     }
+                    Ok(false) => {}
+                    // Unknown whether the link landed: keep at least the
+                    // target's count from before.
+                    Err(_) => inner.record_nlink_floor(target_arc.disk_ino, target_eff),
                 }
                 return Err(map_ext4_err(e));
             }
@@ -2041,7 +2184,7 @@ impl VfsInode for Ext4Inode {
             match built.and_then(|mut sym| parent_dir.link(dname, &mut sym).map(|()| sym).map_err(map_ext4_err)) {
                 Ok(sym) => sym,
                 Err(e) => {
-                    discard_orphan(&inner, self.disk_inode_index(), dname, sym_ino);
+                    discard_orphan(&mut inner, self.disk_inode_index(), dname, sym_ino);
                     return Err(e);
                 }
             };
@@ -2272,7 +2415,10 @@ impl VfsInode for Ext4Inode {
                     {
                         if !*oo {
                             if *no {
-                                if !*nn && !*on && dir_entry_absent(&inner.ext4, new_dir_ino, new_dname) {
+                                if !*nn
+                                    && !*on
+                                    && matches!(dir_entry_absent(&inner.ext4, new_dir_ino, new_dname), Ok(true))
+                                {
                                     rollback_restore_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino);
                                 }
                                 if matches!(
@@ -2299,7 +2445,8 @@ impl VfsInode for Ext4Inode {
                             matches!(dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get()), Ok(true));
                         if !nn_now {
                             if on_now {
-                                if !oo_now && dir_entry_absent(&inner.ext4, old_dir_ino, old_dname) {
+                                if !oo_now && matches!(dir_entry_absent(&inner.ext4, old_dir_ino, old_dname), Ok(true))
+                                {
                                     rollback_restore_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino);
                                 }
                                 if matches!(
@@ -2322,6 +2469,12 @@ impl VfsInode for Ext4Inode {
                         old_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get());
                         new_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get());
                         new_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, new_child_ino.get());
+                    }
+                    if !matches!(
+                        (&old_in_old_res, &old_in_new_res, &new_in_new_res, &new_in_old_res),
+                        (Ok(true), Ok(false), Ok(true), Ok(false))
+                    ) {
+                        log_rename_undo_failure(inner.dev, "exchange", old_dir_ino, new_dir_ino);
                     }
 
                     let restore_links_retry = |ext4: &Ext4, ino: NonZeroU32, target: u16| -> Result<(), VfsError> {
@@ -2831,6 +2984,9 @@ impl VfsInode for Ext4Inode {
                     orig_old_links.saturating_add(1),
                 );
                 let new_still_has = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get());
+                if !matches!(new_still_has, Ok(false)) {
+                    log_rename_undo_failure(inner.dev, "rename", old_dir_ino, new_dir_ino);
+                }
                 match new_still_has {
                     Ok(true) => {
                         let target_old = orig_old_links.saturating_add(1).max(if old_is_dir { 3 } else { 2 });
@@ -3054,8 +3210,9 @@ impl VfsInode for Ext4Inode {
         }
 
         if step2.moved_on_disk {
-            // Reached only on the paths that couldn't read either parent's
-            // count back (the old parent's decrement was never written).
+            // Reached only when neither parent's count could be read back:
+            // the adapter never wrote the old parent's decrement, so the
+            // parent that gained the directory keeps one more link.
             if old_is_dir && step2.sync_old_dir.is_none() && step2.sync_new_dir.is_none() {
                 let bumped = if same_parent { &old_dir_arc } else { &new_dir_arc };
                 find_guard_mut(&mut guards, bumped).nlink = find_guard_mut(&mut guards, bumped).nlink.saturating_add(1);
@@ -3096,11 +3253,25 @@ impl VfsInode for Ext4Inode {
             if cur_idx < cursor {
                 continue;
             }
-            // VFS names are UTF-8: a name that isn't is listed lossily (each
-            // bad sequence as U+FFFD) rather than hidden, so a directory
-            // `rmdir` calls non-empty never lists as empty. Such an entry
-            // can't be opened by its listed name.
-            let name = String::from_utf8_lossy(entry.file_name().as_ref()).into_owned();
+            // VFS names are UTF-8 (#268): a name that isn't is skipped, and
+            // logged once per directory. Listing it lossily would be worse:
+            // the lossy name doesn't round-trip, so nothing could open or
+            // remove it, and getcwd (which rebuilds paths from readdir names)
+            // could resolve it to a different directory.
+            let file_name = entry.file_name();
+            let Ok(name) = core::str::from_utf8(file_name.as_ref()) else {
+                if !self.warned_non_utf8.swap(true, Ordering::AcqRel) {
+                    warn!(
+                        target: "vfs",
+                        "ext4 {:?} directory {}: skipping entries whose names aren't UTF-8 (inode {})",
+                        self.shared.dev,
+                        self.disk_ino,
+                        entry.inode
+                    );
+                }
+                continue;
+            };
+            let name = String::from(name);
             let inode_type = match entry.file_type() {
                 Ok(ft) => map_file_type(ft),
                 Err(_) => InodeType::File,
@@ -3339,15 +3510,7 @@ impl VfsInode for Ext4Inode {
                 {
                     let inner = self.shared.state.lock();
                     let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                    let mut got = 0usize;
-                    while got < valid {
-                        let n = ext4_read_at(&inner.ext4, &disk, &mut tmp[got..valid], page_base + got as u64)
-                            .map_err(map_ext4_err)?;
-                        if n == 0 {
-                            break;
-                        }
-                        got += n;
-                    }
+                    ext4_read_full(&inner.ext4, &disk, &mut tmp, page_base).map_err(map_ext4_err)?;
                 }
                 let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
                 cp.write_bytes(0, &tmp);
@@ -3390,7 +3553,7 @@ impl VfsInode for Ext4Inode {
         if offset >= max {
             return Err(VfsError::FBig);
         }
-        let buf = &buf[..buf.len().min((max - offset).min(usize::MAX as u64) as usize)];
+        let buf = &buf[..buf.len().min(usize::try_from(max - offset).unwrap_or(usize::MAX))];
         if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
             let tail_page = old_size / PAGE_SIZE as u64;
             let tail_off = (old_size % PAGE_SIZE as u64) as usize;
@@ -3415,10 +3578,12 @@ impl VfsInode for Ext4Inode {
                     page.set_dirty();
                 }
             } else {
-                // Past the hard limit (reclaim, run before taking the locks,
-                // couldn't get below it) no more pages are added: the dirty
-                // data couldn't be written back.
+                // Past the hard limit no more pages are added: reclaim, run
+                // once before taking the locks, couldn't get below it (the
+                // dirty data can't be written back), or this one write added
+                // more pages than the gap.
                 if !detached && page_cache::ext4_at_hard_limit() {
+                    page_cache::note_hard_limit_refusal();
                     if done > 0 {
                         break;
                     }
@@ -3438,15 +3603,7 @@ impl VfsInode for Ext4Inode {
                     let read_res: Result<(), VfsError> = (|| {
                         let inner = self.shared.state.lock();
                         let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                        let mut got = 0usize;
-                        while got < valid {
-                            let n = ext4_read_at(&inner.ext4, &disk, &mut tmp[got..valid], page_base + got as u64)
-                                .map_err(map_ext4_err)?;
-                            if n == 0 {
-                                break;
-                            }
-                            got += n;
-                        }
+                        ext4_read_full(&inner.ext4, &disk, &mut tmp, page_base).map_err(map_ext4_err)?;
                         Ok(())
                     })();
                     if let Err(err) = read_res {
@@ -3500,7 +3657,12 @@ impl VfsInode for Ext4Inode {
             return Ok(());
         }
         self.flush_to_ext4(data_only)?;
-        self.shared.sync_bcache()
+        // The filesystem's own sync logs a block-cache failure (once, not
+        // once per inode a global sync visits); the caller reports this one.
+        self.shared.sync_bcache().map_err(|(e, cause)| {
+            log::debug!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);
+            e
+        })
     }
 
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {
@@ -3537,6 +3699,9 @@ mod ktest_util {
         fail_write_at: AtomicUsize,
         /// After that write fails, fail every read until cleared.
         pub reads_fail_after_write_fault: AtomicBool,
+        /// After that write fails, fail every read of the range set by
+        /// `fail_reads_in` until cleared.
+        pub range_reads_fail_after_write_fault: AtomicBool,
         pub fail_reads: AtomicBool,
         pub fail_writes: AtomicBool,
         /// Fail the next `fail_range_reads` reads overlapping `[lo, hi)`.
@@ -3560,6 +3725,7 @@ mod ktest_util {
         pub fn clear(&self) {
             self.fail_write_at.store(0, Ordering::Release);
             self.reads_fail_after_write_fault.store(false, Ordering::Release);
+            self.range_reads_fail_after_write_fault.store(false, Ordering::Release);
             self.fail_reads.store(false, Ordering::Release);
             self.fail_writes.store(false, Ordering::Release);
             self.fail_range_reads.store(0, Ordering::Release);
@@ -3591,6 +3757,9 @@ mod ktest_util {
                 if self.reads_fail_after_write_fault.load(Ordering::Acquire) {
                     self.fail_reads.store(true, Ordering::Release);
                 }
+                if self.range_reads_fail_after_write_fault.load(Ordering::Acquire) {
+                    self.fail_range_reads.store(usize::MAX, Ordering::Release);
+                }
                 return Err(BlockError::Io);
             }
             self.inner.lock().write_at(byte_off, src)
@@ -3619,6 +3788,7 @@ mod ktest_util {
             writes: AtomicUsize::new(0),
             fail_write_at: AtomicUsize::new(0),
             reads_fail_after_write_fault: AtomicBool::new(false),
+            range_reads_fail_after_write_fault: AtomicBool::new(false),
             fail_reads: AtomicBool::new(false),
             fail_writes: AtomicBool::new(false),
             range_lo: AtomicU64::new(0),
@@ -3664,32 +3834,25 @@ mod ktest_util {
         fs.shared.state.lock().ext4.superblock().free_blocks_count()
     }
 
+    /// Inode `ino`'s `(i_mode, i_links_count)` as stored, read raw (a zeroed
+    /// inode doesn't parse).
+    pub fn raw_mode_and_links(fs: &Ext4FileSystem, ino: u32) -> Result<(u16, u16), &'static str> {
+        let inner = fs.shared.state.lock();
+        let off = inner.layout.inode_disk_offset(&inner.bcache, ino).map_err(|_| "inode offset")?;
+        let mut raw = [0u8; 0x1c];
+        inner.bcache.read_at(off, &mut raw).map_err(|_| "inode read")?;
+        Ok((u16::from_le_bytes([raw[0], raw[1]]), u16::from_le_bytes([raw[0x1a], raw[0x1b]])))
+    }
+
     pub fn read_all(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, &'static str> {
-        let size = inode.stat().map_err(|_| "stat")?.size as usize;
-        let mut buf = vec![0u8; size];
-        let mut done = 0;
-        while done < size {
-            let n = inode.read_at(done as u64, &mut buf[done..]).map_err(|_| "read")?;
-            if n == 0 {
-                break;
-            }
-            done += n;
-        }
-        buf.truncate(done);
-        Ok(buf)
+        crate::vfs::read_all_inode(inode).map_err(|_| "read")
     }
 
     pub fn pattern(len: usize, seed: u8) -> Vec<u8> {
         (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed) | 1).collect()
     }
 
-    fn w16(b: &mut [u8], o: usize, v: u16) {
-        b[o..o + 2].copy_from_slice(&v.to_le_bytes());
-    }
-
-    fn w32(b: &mut [u8], o: usize, v: u32) {
-        b[o..o + 4].copy_from_slice(&v.to_le_bytes());
-    }
+    use crate::vfs::{write_u16le as w16, write_u32le as w32};
 
     /// An `e2fsck`-clean ext4 image with 1 KiB blocks and no `extents`
     /// feature, so files are block-mapped and `ext4plus` writes at most one
@@ -3800,6 +3963,8 @@ crate::ktest!(
         // update checksums. `readonly`: the volume asks not to be written.
         kassert!(forced_read_only_reason(false, 0x0400).is_some());
         kassert!(forced_read_only_reason(false, 0x1000).is_some());
+        // `orphan_present`: the orphan file has entries ext4plus won't process.
+        kassert!(forced_read_only_reason(false, 0x1_0000).is_some());
         // The writable profile's bits (sparse_super, large_file, huge_file,
         // dir_nlink, extra_isize) don't.
         kassert!(forced_read_only_reason(false, 0x6b).is_none());
@@ -3848,8 +4013,40 @@ crate::ktest!(
         kassert_eq!(m.root.mkdir("dup2", 0o755).err(), Some(VfsError::Io));
         m.cache.fail_reads_in(blk, blk + 4096, 1);
         kassert_eq!(m.root.symlink("dup3", "t").err(), Some(VfsError::Io));
+        // `link` adds no inode, but must not take the read error for "absent"
+        // either (ext4plus would then answer EEXIST, not EIO).
+        let target = m.root.lookup("dup").map_err(|_| "lookup dup")?;
+        m.root.link("dup_link", &target).map_err(|_| "link")?;
+        m.cache.fail_reads_in(blk, blk + 4096, 1);
+        kassert_eq!(m.root.link("dup_link", &target).err(), Some(VfsError::Io));
         m.cache.clear();
+        kassert_eq!(target.stat().map_err(|_| "stat dup")?.nlink, 2);
         kassert_eq!(free_inodes(&m.fs), before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mkdir_at_the_link_limit_allocates_nothing() {
+        // A parent at ext4's link limit can't take another subdirectory's
+        // `..`: mkdir is refused before allocating the inode and its block
+        // (at 65535, `Dir::link` itself would fail after both were taken).
+        use self::ktest_util::*;
+        use crate::kassert_eq;
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 238)?;
+        for links in [65_000u16, u16::MAX] {
+            {
+                let inner = m.fs.shared.state.lock();
+                let root_ino = NonZeroU32::new(2).ok_or("root")?;
+                let mut root = Inode::read(&inner.ext4, root_ino).map_err(|_| "read root")?;
+                root.set_links_count(links);
+                root.write(&inner.ext4).map_err(|_| "write root")?;
+            }
+            let (inodes, blocks) = (free_inodes(&m.fs), free_blocks(&m.fs));
+            kassert_eq!(m.root.mkdir("sub", 0o755).err(), Some(VfsError::NoSpc));
+            kassert_eq!((free_inodes(&m.fs), free_blocks(&m.fs)), (inodes, blocks));
+            kassert_eq!(m.root.lookup("sub").err(), Some(VfsError::NoEnt));
+        }
         Ok(())
     }
 );
@@ -3890,9 +4087,11 @@ crate::ktest!(
                 m.cache.writes.load(Ordering::Acquire)
             };
             let mut k = alloc_writes + 1;
+            let mut failed = 0;
             loop {
                 let m = mount(img.clone(), minor)?;
                 let before = free_inodes(&m.fs);
+                let before_blocks = free_blocks(&m.fs);
                 let root_nlink = m.root.stat().map_err(|_| "stat root")?.nlink;
                 m.cache.arm_write(k);
                 let res = match kind {
@@ -3908,17 +4107,29 @@ crate::ktest!(
                     break; // every write of this create has been failed once
                 }
                 if res.is_err() {
+                    failed += 1;
                     crate::ktest::diag(format_args!("{kind}: write {k} failed"));
                     kassert!(m.root.lookup("new").is_err());
                     kassert_eq!(free_inodes(&m.fs), before);
                     let ro = remount_ro(&m, minor + 1)?;
                     kassert_eq!(free_inodes(&ro), before);
+                    // A block leaks only when the write fails inside
+                    // `ext4plus`, between allocating the new directory's (or
+                    // long symlink's) block, three writes after the inode's,
+                    // and recording it in the inode: `ext4plus` frees blocks
+                    // only through ones an inode holds, out of the adapter's
+                    // reach. Every other failure gives the block back too.
+                    let inside_block_alloc =
+                        matches!(kind, "dir" | "long-symlink") && (alloc_writes + 4..=alloc_writes + 6).contains(&k);
+                    kassert_eq!(free_blocks(&ro), before_blocks - u64::from(inside_block_alloc));
                     kassert_eq!(ro.root_inode().stat().map_err(|_| "ro stat root")?.nlink, root_nlink);
                 } else {
                     kassert!(m.root.lookup("new").is_ok());
                 }
                 k += 1;
             }
+            crate::ktest::diag(format_args!("{kind}: {failed} failed creates checked"));
+            kassert!(failed >= 1); // a write after the allocation was reached
             minor += 2;
         }
         Ok(())
@@ -4042,6 +4253,19 @@ crate::ktest!(
         let mut b = [0u8; 2];
         kassert_eq!(f.read_at(0, &mut b).map_err(|_| "read")?, 2);
         kassert_eq!(&b, b"S\0");
+        // Larger than the scan limit, data only at the start: the stop once
+        // the data blocks are covered ends the scan long before the limit.
+        let big = m.root.create("sparse_big", 0o644).map_err(|_| "create big")?;
+        big.write_at(0, b"B").map_err(|_| "write big")?;
+        big.truncate((DETACHED_SCAN_LIMIT_PAGES as u64 + 1024) * PAGE_SIZE as u64).map_err(|_| "extend big")?;
+        big.sync(false).map_err(|_| "sync big")?;
+        m.fs.lookup_live_by_lock_id(big.lock_id()).ok_or("live big")?.reclaim_clean_pages(16);
+        big.inc_open_count();
+        m.root.unlink("sparse_big").map_err(|_| "unlink big")?;
+        kassert!(big.is_detached());
+        kassert_eq!(big.read_at(0, &mut b).map_err(|_| "read big")?, 2);
+        kassert_eq!(&b, b"B\0");
+        big.dec_open_count();
         f.dec_open_count();
 
         // Data past the scan limit: refused rather than scanned for good.
@@ -4061,7 +4285,7 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ext4_readdir_lists_names_that_are_not_utf8() {
+    fn ext4_readdir_skips_names_that_are_not_utf8() {
         use self::ktest_util::*;
         use crate::kassert;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 220)?;
@@ -4075,8 +4299,33 @@ crate::ktest!(
         let ro = mount_ro_image(img, 221)?;
         let mut out = Vec::new();
         ro.root_inode().readdir(0, &mut out, 16).map_err(|_| "readdir")?;
-        kassert!(out.len() == 3);
-        kassert!(out.iter().any(|e| e.name == "\u{fffd}\u{fffd}"));
+        kassert!(out.len() == 2); // "." and ".." only
+        kassert!(out.iter().all(|e| e.name == "." || e.name == ".."));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_writeback_continues_past_a_failing_page() {
+        // The first page's write fails: the other pages are still written
+        // (and the sync reports the error), so one bad block doesn't keep
+        // the rest of the file off the disk.
+        use self::ktest_util::*;
+        use crate::kassert_eq;
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 239)?;
+        let f = m.root.create("pages", 0o644).map_err(|_| "create")?;
+        let data = pattern(3 * PAGE_SIZE, 5);
+        f.write_at(0, &data).map_err(|_| "write")?;
+        m.cache.arm_write(1); // the first page's block allocation, as it happens
+        crate::kassert!(f.sync(false).is_err());
+        m.cache.clear();
+        let ro = remount_ro(&m, 240)?;
+        let on_disk = read_all(&ro.root_inode().lookup("pages").map_err(|_| "ro lookup")?)?;
+        kassert_eq!(on_disk.len(), data.len());
+        kassert_eq!(&on_disk[PAGE_SIZE..], &data[PAGE_SIZE..]); // pages 1 and 2 reached the disk
+        f.sync(false).map_err(|_| "retry sync")?; // the failed page stayed dirty
+        let ro = remount_ro(&m, 241)?;
+        kassert_eq!(read_all(&ro.root_inode().lookup("pages").map_err(|_| "ro lookup 2")?)?, data);
         Ok(())
     }
 );
@@ -4166,6 +4415,7 @@ crate::ktest!(
         use crate::kassert_eq;
         use core::sync::atomic::Ordering as O;
         let mut k = 1;
+        let mut survived = 0;
         loop {
             let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 228)?;
             m.root.symlink("s", "inline/target").map_err(|_| "symlink")?;
@@ -4181,12 +4431,58 @@ crate::ktest!(
             if res.is_err() {
                 let ro = remount_ro(&m, 229)?;
                 if let Ok(s) = ro.root_inode().lookup("s") {
-                    crate::ktest::diag(format_args!("write {k} failed; the entry survived"));
+                    survived += 1;
                     kassert_eq!(s.readlink().map_err(|_| "readlink")?, b"inline/target".to_vec());
                 }
             }
             k += 1;
         }
+        crate::ktest::diag(format_args!("entries that survived a failed unlink: {survived}"));
+        crate::kassert!(survived >= 1); // the case this test is about was reached
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_unlink_never_restores_onto_a_freed_inode() {
+        // Fail each write of the unlink once, with only the directory's
+        // reads failing after it, so the adapter decides from the inode
+        // itself: an entry that survived keeps its target, and an inode the
+        // unlink already zeroed (and maybe freed) gets nothing written back.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let dir_block = ktest_util::ROOT_DIR_BLOCK_4K * 4096;
+        let (mut k, mut survived, mut gone) = (1, 0, 0);
+        loop {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 236)?;
+            m.root.symlink("s", "inline/target").map_err(|_| "symlink")?;
+            let ino = u32::try_from(m.root.lookup("s").map_err(|_| "lookup")?.ino()).map_err(|_| "ino")?;
+            m.cache.fail_reads_in(dir_block, dir_block + 4096, 0);
+            m.cache.arm_write(k);
+            m.cache.range_reads_fail_after_write_fault.store(true, O::Release);
+            let res = m.root.unlink("s");
+            let reached = m.cache.writes.load(O::Acquire) >= k;
+            m.cache.clear();
+            if !reached {
+                res.map_err(|_| "unlink without a fault")?;
+                break;
+            }
+            if res.is_err() {
+                let ro = remount_ro(&m, 237)?;
+                if let Ok(s) = ro.root_inode().lookup("s") {
+                    survived += 1;
+                    kassert_eq!(s.readlink().map_err(|_| "readlink")?, b"inline/target".to_vec());
+                } else {
+                    gone += 1;
+                    let (mode, links) = raw_mode_and_links(&ro, ino)?;
+                    kassert!(!(mode == 0 && links > 0)); // nothing restored onto a zeroed inode
+                }
+            }
+            k += 1;
+        }
+        crate::ktest::diag(format_args!("failed unlinks: {survived} kept the entry, {gone} removed it"));
+        kassert!(survived >= 1 && gone >= 1);
         Ok(())
     }
 );

@@ -33,8 +33,11 @@ pub struct Tmpfs {
 impl Tmpfs {
     pub fn new(dev: DevId, quota_bytes: usize) -> Arc<Self> {
         let quota_pages = quota_bytes / PAGE_SIZE;
-        let shared =
-            Arc::new(TmpfsShared { dev, quota: Arc::new(QuotaCounter::new(quota_pages)), next_ino: AtomicU64::new(2) });
+        let shared = Arc::new(TmpfsShared {
+            dev,
+            quota: Arc::new(QuotaCounter::new("tmpfs", quota_pages)),
+            next_ino: AtomicU64::new(2),
+        });
         let now = time::realtime_timespec();
         let root = Arc::new_cyclic(|weak_self| TmpfsInode {
             lock_id: next_lock_id(),
