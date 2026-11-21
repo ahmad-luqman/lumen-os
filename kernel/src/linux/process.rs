@@ -127,8 +127,14 @@ pub struct ProcessState {
     pub allow_test_syscalls: bool,
     pub exit: Option<UserExit>,
     pub stdout: Vec<u8>,
+    /// The process's address space, for `/proc/<pid>/maps`.
     pub address_space: Option<Arc<AddressSpace>>,
+    /// The executable's path for `/proc/<pid>/exe`; nothing sets it outside
+    /// the ktests until `linux /path` loads from the VFS (#255).
     pub exe_path: Option<String>,
+    /// VFS files open on descriptors, with the path each was opened by, for
+    /// `/proc/<pid>/fd`: a stand-in for the 1024-entry FD table that #254
+    /// wires into the syscalls (only the ktests fill it today).
     pub vfs_fds: BTreeMap<i32, (Arc<dyn VfsInode>, String)>,
     stdin: Vec<u8>,
     stdin_pos: usize,

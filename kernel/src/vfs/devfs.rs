@@ -1,5 +1,11 @@
-//! Read-only `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes
-//! exempt from `-EROFS` for `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK`.
+//! Read-only `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes.
+//!
+//! Namespace changes (create, unlink, mkdir, rename, chmod) return `-EROFS`.
+//! The character nodes report `exempt_from_rofs()`, and `lumen-vfs`'s open
+//! and access checks use that to let `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK`
+//! through on a read-only mount; this file only answers the question.
+//! `random` and `urandom` read from `crate::rng` and return `-EAGAIN` while
+//! its pool has never been seeded (no RDRAND and no virtio-rng answer).
 
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};

@@ -1054,6 +1054,10 @@ static REALTIME_ANCHOR: SpinLock<Option<Option<(u64, u64)>>> = SpinLock::new(Non
 
 /// Current wall-clock time as `(unix_seconds, nanoseconds)`, anchored to the
 /// CMOS RTC on first call and advanced via the monotonic TSC clock.
+///
+/// The first call's RTC reading is kept for the rest of the boot, failed or
+/// not: if it failed, every later call returns the time since boot (dates in
+/// January 1970) rather than polling the RTC again.
 pub fn realtime_sec_nsec() -> (u64, u64) {
     let anchor = {
         let guard = REALTIME_ANCHOR.lock();
