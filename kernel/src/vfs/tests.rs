@@ -312,6 +312,10 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use lumen_bcache::BlockCache;
 
+        // The ext4 page count is global: pages another ktest left cached (in
+        // a cache reclaim can't reach, outside `TABLES`) count too, so every
+        // check is against the count before this test's mount.
+        let base = page_cache::ext4_cached_pages();
         let img = build_minimal_ext4_image_blocks(256);
         let mem_dev = MemBlkDev::new(img, false);
         let bcache: Arc<dyn ext4::BlockCacheBackend> =
@@ -325,62 +329,64 @@ crate::ktest!(
         EXT4_FILESYSTEMS.lock().push(Arc::clone(&fs));
         TABLES.mount(mp, "/tmp/reclaim_mnt", Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount")?;
 
-        let (f, _) = open_inode(
-            &TABLES,
-            None,
-            b"/tmp/reclaim_mnt/big.bin",
-            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-            0o644,
-            0,
-        )
-        .map_err(|_| "create big.bin")?;
+        let result = (|| -> Result<(), &'static str> {
+            let (f, _) = open_inode(
+                &TABLES,
+                None,
+                b"/tmp/reclaim_mnt/big.bin",
+                OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                0o644,
+                0,
+            )
+            .map_err(|_| "create big.bin")?;
 
-        // Write 6 pages (24 KiB) so 6 ext4 PageCache pages are dirty.
-        let mut buf = vec![0u8; 6 * 4096];
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = ((i * 73) ^ 0x19) as u8;
-        }
-        kassert_eq!(f.write_at(0, &buf).map_err(|_| "write big")?, buf.len());
-        kassert!(page_cache::ext4_cached_pages() >= 6);
+            // Write 6 pages (24 KiB) so 6 ext4 PageCache pages are dirty.
+            let mut buf = vec![0u8; 6 * 4096];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = ((i * 73) ^ 0x19) as u8;
+            }
+            kassert_eq!(f.write_at(0, &buf).map_err(|_| "write big")?, buf.len());
+            kassert!(page_cache::ext4_cached_pages() >= base + 6);
 
-        // Reclaim down to 1 page: dirty pages must be written back before eviction.
-        page_cache::reclaim_ext4_to_target(1);
-        kassert!(page_cache::ext4_cached_pages() <= 1);
+            // Reclaim down to 1 page past the baseline: dirty pages must be written back before eviction.
+            page_cache::reclaim_ext4_to_target(base + 1);
+            kassert!(page_cache::ext4_cached_pages() <= base + 1);
 
-        // Read back after eviction (re-faults from disk) and verify contents match.
-        let got = read_all_inode(&f).map_err(|_| "read after reclaim")?;
-        kassert_eq!(got, buf);
-        drop(f);
+            // Read back after eviction (re-faults from disk) and verify contents match.
+            let got = read_all_inode(&f).map_err(|_| "read after reclaim")?;
+            kassert_eq!(got, buf);
+            drop(f);
 
-        // Dirty pages reclaimed without a sync, then unlinked while open: the
-        // detached inode reads back what was written (write_at -> reclaim to 0 ->
-        // OpenGuard + unlink_at -> read_at).
-        let (victim, _) = open_inode(
-            &TABLES,
-            None,
-            b"/tmp/reclaim_mnt/victim.bin",
-            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-            0o644,
-            0,
-        )
-        .map_err(|_| "create victim.bin")?;
-        let victim_payload = vec![0x5Au8; 2 * 4096];
-        kassert_eq!(victim.write_at(0, &victim_payload).map_err(|_| "write victim")?, victim_payload.len());
-        page_cache::reclaim_ext4_to_target(0);
-        kassert_eq!(page_cache::ext4_cached_pages(), 0);
+            // Dirty pages reclaimed without a sync, then unlinked while open: the
+            // detached inode reads back what was written (write_at -> reclaim to the baseline ->
+            // OpenGuard + unlink_at -> read_at).
+            let (victim, _) = open_inode(
+                &TABLES,
+                None,
+                b"/tmp/reclaim_mnt/victim.bin",
+                OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                0o644,
+                0,
+            )
+            .map_err(|_| "create victim.bin")?;
+            let victim_payload = vec![0x5Au8; 2 * 4096];
+            kassert_eq!(victim.write_at(0, &victim_payload).map_err(|_| "write victim")?, victim_payload.len());
+            page_cache::reclaim_ext4_to_target(base);
+            kassert!(page_cache::ext4_cached_pages() <= base);
 
-        let guard = OpenGuard::new(Arc::clone(&victim));
-        unlink_at(&TABLES, None, b"/tmp/reclaim_mnt/victim.bin", false).map_err(|_| "unlink victim")?;
-        kassert!(victim.is_detached());
-        let got_victim = read_all_inode(&victim).map_err(|_| "read detached victim")?;
-        kassert_eq!(got_victim, victim_payload);
-        drop(guard);
-        drop(victim);
-
-        let _ = TABLES.umount(mp_dev, mp_ino).map_err(|_| "umount")?;
+            let guard = OpenGuard::new(Arc::clone(&victim));
+            unlink_at(&TABLES, None, b"/tmp/reclaim_mnt/victim.bin", false).map_err(|_| "unlink victim")?;
+            kassert!(victim.is_detached());
+            let got_victim = read_all_inode(&victim).map_err(|_| "read detached victim")?;
+            kassert_eq!(got_victim, victim_payload);
+            drop(guard);
+            drop(victim);
+            Ok(())
+        })();
+        let umounted = TABLES.umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
         EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != dev);
-        unlink_at(&TABLES, None, b"/tmp/reclaim_mnt", true).map_err(|_| "rmdir mnt")?;
-        Ok(())
+        let unlinked = unlink_at(&TABLES, None, b"/tmp/reclaim_mnt", true).map(drop).map_err(|_| "rmdir mnt");
+        result.and(umounted).and(unlinked)
     }
 );
 
