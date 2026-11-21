@@ -1,5 +1,7 @@
-"""Ring-3 entry/exit, syscall/sysretq, SWAPGS, IST_DEBUG (CVE-2018-8897), and
-non-fatal ring-3 exception handling (M6, issue #236)."""
+"""Linux x86-64 ring-3 ABI scenarios: entry/exit, syscall/sysretq, SWAPGS,
+IST_DEBUG (CVE-2018-8897), non-fatal ring-3 faults, per-process AddressSpace /
+demand paging / SSE+TLS preemption, 30-syscall table, static musl hello, and
+unmodified Alpine static musl busybox ash built-ins (M6, issues #236-#238)."""
 
 import re
 
@@ -231,18 +233,23 @@ def test_static_busybox_ash(boot):
 
     m.send_line("echo hello-from-ash")
     m.expect(re.compile(r"^hello-from-ash$", re.MULTILINE), 20)
+    m.expect(r"~ # ", 15)
 
     m.send_line("pwd")
     m.expect(re.compile(r"^/$", re.MULTILINE), 15)
+    m.expect(r"~ # ", 15)
 
     m.send_line("export FOO=bar; echo $FOO")
     m.expect(re.compile(r"^bar$", re.MULTILINE), 15)
+    m.expect(r"~ # ", 15)
 
     m.send_line("echo $((6 * 7))")
     m.expect(re.compile(r"^42$", re.MULTILINE), 15)
+    m.expect(r"~ # ", 15)
 
     m.send_line("for i in 1 2 3; do echo loop-$i; done")
     m.expect(re.compile(r"^loop-1\nloop-2\nloop-3$", re.MULTILINE), 15)
+    m.expect(r"~ # ", 15)
 
     m.send_line("exit 0")
     m.expect(r"linux: busybox exit=0 leaked_frames=0\n", 20)

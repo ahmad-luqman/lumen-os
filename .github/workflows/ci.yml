@@ -46,7 +46,7 @@ jobs:
             . -> target
             apps -> ../target-apps
 
-      - name: Cache boot dependencies (Limine, OVMF)
+      - name: Cache boot and userspace dependencies (Limine, OVMF, busybox)
         uses: actions/cache@v6
         with:
           path: build/deps

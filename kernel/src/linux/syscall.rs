@@ -24,9 +24,13 @@ const UIO_MAXIOV: isize = 1024;
 /// Maximum bytes transferred in one `write`/`getrandom` loop chunk (matches `shell::CHUNK`).
 const IO_CHUNK: usize = 512;
 
-/// Cap total bytes processed in a single `write`/`getrandom` call so one syscall
+/// Cap total bytes processed in a single `write`/`writev` call so one syscall
 /// cannot monopolize a CPU indefinitely.
 const MAX_SINGLE_IO: usize = 1024 * 1024;
+
+/// Cap bytes returned by a single `getrandom(2)` call to avoid issuing
+/// thousands of synchronous `virtio-rng` requests in one syscall.
+const MAX_GETRANDOM: usize = 4096;
 
 /// Default stack rlimit advertised by M6 `prlimit64` (8 MiB, matching `USER_STACK_SIZE`).
 const DEFAULT_RLIMIT_STACK: u64 = 8 * 1024 * 1024;
@@ -111,13 +115,19 @@ fn log_unknown_once(nr: u64) {
         return;
     }
     for slot in &UNKNOWN_HIGH_SLOTS {
-        let cur = slot.load(Ordering::Relaxed);
+        let cur = slot.load(Ordering::Acquire);
         if cur == nr {
             return;
         }
-        if cur == 0 && slot.compare_exchange(0, nr, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-            log::debug!(target: "linux", "unimplemented syscall #{nr}");
-            return;
+        if cur == 0 {
+            match slot.compare_exchange(0, nr, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    log::debug!(target: "linux", "unimplemented syscall #{nr}");
+                    return;
+                }
+                Err(actual) if actual == nr => return,
+                Err(_) => continue,
+            }
         }
     }
 }
@@ -218,8 +228,10 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         }
         n if n == u64::from(general::__NR_exit) || n == u64::from(general::__NR_exit_group) => {
             let status = (frame.rdi & 0xff) as i32;
-            let _ = record_exit(UserExit::Exited(status));
-            crate::user::note_exit_status(status);
+            let (_, is_test) = record_exit(UserExit::Exited(status));
+            if is_test {
+                crate::user::note_exit_status(status);
+            }
             // SAFETY: unwinds cleanly back to `enter_ring3`; no lock held and
             // no live Rust `Drop` values on this stack frame.
             unsafe { arch::syscall::unwind_to_kernel() }
@@ -293,11 +305,11 @@ fn read_into_user(io: ConsoleIo, user_buf: u64, count: u64) -> Result<usize, u32
     if count == 0 {
         return Ok(0);
     }
-    // Reject obviously invalid user addresses before blocking on stdin.
-    if !user_range_valid(user_buf, 1) {
+    let want = count.min(IO_CHUNK as u64) as usize;
+    // Validate the target chunk range before blocking on stdin.
+    if !user_range_valid(user_buf, want) {
         return Err(errno::EFAULT);
     }
-    let want = count.min(IO_CHUNK as u64) as usize;
     let mut kbuf = [0u8; IO_CHUNK];
     let n = crate::linux::process::read_console(io, &mut kbuf[..want]);
     if n == 0 {
@@ -415,17 +427,26 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
         return neg_errno(e.to_errno());
     }
 
-    let io = with_current(|p| p.io);
+    let (io, fds) = with_current(|p| (p.io, p.fds));
+    let fd_kind_of =
+        |fd: i32| -> FdKind { if fd >= 0 && (fd as usize) < fds.len() { fds[fd as usize] } else { FdKind::Closed } };
     let deadline = if timeout_ms > 0 {
         Some(crate::time::now_ns().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
     } else {
         None
     };
 
+    // Only touch stdin readiness if at least one entry actually asks for POLLIN on Stdin.
+    let needs_stdin = raw.as_chunks::<8>().0.iter().any(|chunk| {
+        let fd = i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes"));
+        let events = i16::from_le_bytes(chunk[4..6].try_into().expect("2 bytes"));
+        fd >= 0 && matches!(fd_kind_of(fd), FdKind::Stdin) && (events & (general::POLLIN as i16)) != 0
+    });
+
     let ready = loop {
         let mut ready = 0u64;
         let mut waiting_stdin = false;
-        let stdin_avail = crate::linux::process::stdin_ready(io);
+        let stdin_avail = if needs_stdin { crate::linux::process::stdin_ready(io) } else { false };
 
         for chunk in raw.as_chunks_mut::<8>().0 {
             let fd = i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes"));
@@ -433,8 +454,7 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
             let revents: i16 = if fd < 0 {
                 0
             } else {
-                let kind = with_current(|p| p.fd_kind(fd as u64));
-                match kind {
+                match fd_kind_of(fd) {
                     FdKind::Closed => general::POLLNVAL as i16,
                     FdKind::Stdout | FdKind::Stderr => events & (general::POLLOUT as i16),
                     FdKind::Stdin => {
@@ -457,15 +477,24 @@ fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
             chunk[6..8].copy_from_slice(&revents.to_le_bytes());
         }
 
-        if ready > 0 || timeout_ms == 0 || !waiting_stdin {
+        if ready > 0 || timeout_ms == 0 {
             break ready;
+        }
+        if !waiting_stdin {
+            if let Some(dl) = deadline {
+                let rem = dl.saturating_sub(crate::time::now_ns());
+                if rem > 0 {
+                    let _ = sched::sleep(rem);
+                }
+            }
+            break 0;
         }
         if let Some(dl) = deadline
             && crate::time::now_ns() >= dl
         {
             break 0;
         }
-        crate::linux::process::wait_stdin_step(io);
+        crate::linux::process::wait_stdin_step(io, deadline);
     };
 
     if let Err(e) = copy_to_user(fds_ptr, &raw) {
@@ -543,7 +572,8 @@ fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
             return neg_errno(e.to_errno());
         }
     }
-    if let Some(a) = new_action {
+    if let Some(mut a) = new_action {
+        a.mask &= !UNBLOCKABLE_SIGS;
         with_current_mut(|p| p.sigactions[idx] = a);
     }
     0
@@ -593,7 +623,8 @@ fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
     if !open {
         return neg_errno(errno::EBADF);
     }
-    if req == u64::from(ioctl::TCGETS) {
+    let cmd = req as u32;
+    if cmd == ioctl::TCGETS {
         let t = with_current(|p| p.termios);
         // SAFETY: `general::termios` is 36 bytes with zero implicit padding.
         return match unsafe { copy_pod_to_user(arg, &t) } {
@@ -601,7 +632,7 @@ fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             Err(e) => neg_errno(e.to_errno()),
         };
     }
-    if req == u64::from(ioctl::TCSETS) || req == u64::from(ioctl::TCSETSW) || req == u64::from(ioctl::TCSETSF) {
+    if cmd == ioctl::TCSETS || cmd == ioctl::TCSETSW || cmd == ioctl::TCSETSF {
         // SAFETY: `general::termios` is 36 integer bytes; all bit patterns are valid.
         return match unsafe { copy_pod_from_user::<general::termios>(arg) } {
             Ok(t) => {
@@ -611,7 +642,7 @@ fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
             Err(e) => neg_errno(e.to_errno()),
         };
     }
-    if req == u64::from(ioctl::TIOCGWINSZ) {
+    if cmd == ioctl::TIOCGWINSZ {
         let ws = general::winsize { ws_row: 25, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: `general::winsize` is 4 `u16`s (8 bytes) with zero padding.
         return match unsafe { copy_pod_to_user(arg, &ws) } {
@@ -635,9 +666,14 @@ fn copy_iovecs(user_iov: u64, iovcnt: u64) -> Result<alloc::vec::Vec<RawIovec>, 
     let mut raw = vec![0u8; byte_len];
     copy_from_user(&mut raw, user_iov).map_err(CopyError::to_errno)?;
     let mut iovs = alloc::vec::Vec::with_capacity(cnt);
+    let mut total_len = 0usize;
     for chunk in raw.as_chunks::<16>().0 {
         let base = u64::from_le_bytes(chunk[0..8].try_into().expect("8 bytes"));
         let len = u64::from_le_bytes(chunk[8..16].try_into().expect("8 bytes"));
+        if (len as isize) < 0 {
+            return Err(errno::EINVAL);
+        }
+        total_len = total_len.checked_add(len as usize).filter(|&t| t <= isize::MAX as usize).ok_or(errno::EINVAL)?;
         iovs.push(RawIovec { base, len });
     }
     Ok(iovs)
@@ -676,13 +712,24 @@ fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
         Ok(v) => v,
         Err(e) => return neg_errno(e),
     };
+    let mut remaining = MAX_SINGLE_IO;
     let mut total = 0usize;
     for span in iovs {
         if span.len == 0 {
             continue;
         }
-        match write_from_user(io, span.base, span.len) {
-            Ok(n) => total = total.saturating_add(n),
+        if remaining == 0 {
+            break;
+        }
+        let want = span.len.min(remaining as u64);
+        match write_from_user(io, span.base, want) {
+            Ok(n) => {
+                total = total.saturating_add(n);
+                remaining = remaining.saturating_sub(n);
+                if (n as u64) < want || (n as u64) < span.len {
+                    break;
+                }
+            }
             Err(e) => return if total == 0 { neg_errno(e) } else { total as u64 },
         }
     }
@@ -759,10 +806,12 @@ fn sys_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u64
         return neg_errno(errno::EINVAL);
     }
     if new_limit != 0 {
-        // Validate user pointer even though M6 limits are read-only.
+        // Validate user pointer and `rlim_cur <= rlim_max` even though M6 limits are read-only.
         // SAFETY: `general::rlimit64` is two `u64`s (16 bytes); all bit patterns valid.
-        if let Err(e) = unsafe { copy_pod_from_user::<general::rlimit64>(new_limit) } {
-            return neg_errno(e.to_errno());
+        match unsafe { copy_pod_from_user::<general::rlimit64>(new_limit) } {
+            Ok(rlim) if rlim.rlim_cur > rlim.rlim_max => return neg_errno(errno::EINVAL),
+            Ok(_) => {}
+            Err(e) => return neg_errno(e.to_errno()),
         }
     }
     if old_limit != 0 {
@@ -780,13 +829,12 @@ fn sys_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u64
     0
 }
 
-fn fill_insecure_fallback(dst: &mut [u8]) {
-    let mut state = crate::time::now_ns() ^ arch::rdtsc().rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
+fn fill_insecure_fallback(state: &mut u64, dst: &mut [u8]) {
     for chunk in dst.chunks_mut(8) {
         // SplitMix64 mixing step (non-cryptographic fallback only when GRND_INSECURE
         // is requested on a machine without hardware/virtio RNG).
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         z ^= z >> 31;
@@ -797,35 +845,41 @@ fn fill_insecure_fallback(dst: &mut [u8]) {
 
 fn sys_getrandom(buf: u64, buflen: u64, flags: u64) -> u64 {
     let allowed = u64::from(general::GRND_NONBLOCK | general::GRND_RANDOM | general::GRND_INSECURE);
-    if (flags & !allowed) != 0 {
+    let incompatible = u64::from(general::GRND_RANDOM | general::GRND_INSECURE);
+    if (flags & !allowed) != 0 || (flags & incompatible) == incompatible {
         return neg_errno(errno::EINVAL);
     }
     if buflen == 0 {
         return 0;
     }
-    let total = buflen.min(MAX_SINGLE_IO as u64) as usize;
+    let total = buflen.min(MAX_GETRANDOM as u64) as usize;
     if !user_range_valid(buf, 1) {
         return neg_errno(errno::EFAULT);
     }
     let mut kbuf = [0u8; IO_CHUNK];
+    let mut fallback_state = crate::time::now_ns() ^ arch::rdtsc().rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
     let mut written = 0usize;
-    while written < total {
+    let res = loop {
+        if written >= total {
+            break written as u64;
+        }
         let chunk = (total - written).min(IO_CHUNK);
         let addr = match buf.checked_add(written as u64) {
             Some(a) => a,
-            None => return if written == 0 { neg_errno(errno::EFAULT) } else { written as u64 },
+            None => break if written == 0 { neg_errno(errno::EFAULT) } else { written as u64 },
         };
         if crate::rng::fill(&mut kbuf[..chunk]).is_err() {
             if (flags & u64::from(general::GRND_INSECURE)) != 0 {
-                fill_insecure_fallback(&mut kbuf[..chunk]);
+                fill_insecure_fallback(&mut fallback_state, &mut kbuf[..chunk]);
             } else {
-                return if written == 0 { neg_errno(errno::EAGAIN) } else { written as u64 };
+                break if written == 0 { neg_errno(errno::EAGAIN) } else { written as u64 };
             }
         }
         if copy_to_user(addr, &kbuf[..chunk]).is_err() {
-            return if written == 0 { neg_errno(errno::EFAULT) } else { written as u64 };
+            break if written == 0 { neg_errno(errno::EFAULT) } else { written as u64 };
         }
         written += chunk;
-    }
-    written as u64
+    };
+    lumen_rand::clear(&mut kbuf);
+    res
 }

@@ -370,9 +370,11 @@ pub(crate) fn note_exit_status(status: i32) {
 /// Logs one `WARN` naming pid, vector, `rip`, and `cr2`, and unwinds cleanly
 /// back to the kernel ring-3 runner—never calling `crash::exception`.
 pub fn handle_user_exception(frame: &TrapFrame, cr2: u64) -> ! {
-    SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
     let exit = UserExit::Fault { vector: frame.vector, error_code: frame.error_code, rip: frame.rip, cr2 };
-    let pid = record_exit(exit);
+    let (pid, is_test) = record_exit(exit);
+    if is_test {
+        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
+    }
     warn!(
         target: "user",
         "pid {pid}: fatal user exception {} (vector {}, error {:#x}, rip {:#x}, cr2 {:#x})",
@@ -390,9 +392,11 @@ pub fn handle_user_exception(frame: &TrapFrame, cr2: u64) -> ! {
 /// Handle a deferred `#DB` trap caught at `LSTAR` (CVE-2018-8897 handoff),
 /// running on the thread's normal kernel stack inside `lumen_syscall_dispatch`.
 pub fn handle_deferred_debug_trap(frame: &SyscallFrame) -> ! {
-    SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
     let exit = UserExit::Fault { vector: 1, error_code: 0, rip: frame.rip, cr2: 0 };
-    let pid = record_exit(exit);
+    let (pid, is_test) = record_exit(exit);
+    if is_test {
+        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
+    }
     warn!(
         target: "user",
         "pid {pid}: fatal deferred #DB at LSTAR (vector 1, rip {:#x}, cr2 0x0)",
@@ -405,8 +409,10 @@ pub fn handle_deferred_debug_trap(frame: &SyscallFrame) -> ! {
 /// Terminate the active user context when the return `rip` is non-canonical or
 /// `>= USER_MAX`, before `swapgs` or `sysretq`/`iretq` ever runs.
 pub fn handle_non_canonical_return(rip: u64) -> ! {
-    SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
-    let pid = record_exit(UserExit::NonCanonicalRip(rip));
+    let (pid, is_test) = record_exit(UserExit::NonCanonicalRip(rip));
+    if is_test {
+        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
+    }
     warn!(target: "user", "pid {pid}: non-canonical user return rip {rip:#x}; terminating process");
     // SAFETY: called on the CPU running the active ring-3 context, no lock held.
     unsafe { arch::syscall::unwind_to_kernel() }
@@ -554,8 +560,9 @@ fn spawn_ring3_on(
     Ok((handle, result_slot))
 }
 
-/// Run a loaded Linux ELF64 process in ring 3 on the current CPU with the
-/// given interactive console target (`allow_test_syscalls == false`).
+/// Run a loaded Linux ELF64 process in ring 3 with the given interactive
+/// console target (`allow_test_syscalls == false`). Serial console processes
+/// are pinned to CPU 0 because `serial_in` drains COM1 IRQ 4 on the boot CPU.
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 pub fn run_elf_process(
     name: &'static str,
@@ -564,7 +571,8 @@ pub fn run_elf_process(
     rsp: u64,
     io: ConsoleIo,
 ) -> Result<UserExit, &'static str> {
-    let (handle, slot) = spawn_ring3_on(arch::cpu_index(), name, space, entry, rsp, None, io, false, Vec::new())?;
+    let cpu = if matches!(io, ConsoleIo::Serial) { 0 } else { arch::cpu_index() };
+    let (handle, slot) = spawn_ring3_on(cpu, name, space, entry, rsp, None, io, false, Vec::new())?;
     handle.join();
     let res = slot.lock().take().expect("linux process finished without RunResult");
     Ok(res.exit)
@@ -1466,21 +1474,37 @@ fn program_bad_ptrs() -> (Vec<u8>, Vec<u8>) {
     check_syscall(&mut c, general::__NR_writev, 1, iov_skip_zero, 2, 0, 4);
     check_syscall(&mut c, general::__NR_readv, 0, iov_skip_zero, 2, 0, 4);
 
-    // Unknown syscall returns -ENOSYS (-38).
+    // Writing through a syscall to a mapped read-only user page (TEST_CODE_VA, R-X)
+    // must fault via CR0.WP + `.lumen_fixup` and return -EFAULT.
+    check_syscall(&mut c, general::__NR_uname, TEST_CODE_VA, 0, 0, 0, efault);
+
+    // Unknown syscall returns -ENOSYS (-38), including on repeated calls (once-per-boot log).
+    check_syscall(&mut c, 999, 0, 0, 0, 0, enosys);
     check_syscall(&mut c, 999, 0, 0, 0, 0, enosys);
 
     // Invalid argument checks.
     check_syscall(&mut c, general::__NR_getcwd, valid_out, 1, 0, 0, erange);
     check_syscall(&mut c, general::__NR_getcwd, valid_out, 64, 0, 0, 2);
     check_syscall(&mut c, general::__NR_ioctl, 1, 0x9999, valid_out, 0, enotty);
+    check_syscall(&mut c, general::__NR_arch_prctl, u64::from(ARCH_SET_FS), KERNEL_VA, 0, 0, einval);
     check_syscall(&mut c, general::__NR_clock_gettime, 99, valid_out, 0, 0, einval);
     check_syscall(&mut c, general::__NR_clock_gettime, u64::from(general::CLOCK_REALTIME), valid_out, 0, 0, 0);
     check_syscall(&mut c, general::__NR_getrandom, valid_out, 8, 0x8000, 0, einval);
+    check_syscall(
+        &mut c,
+        general::__NR_getrandom,
+        valid_out,
+        8,
+        u64::from(general::GRND_RANDOM | general::GRND_INSECURE),
+        0,
+        einval,
+    );
     check_syscall(&mut c, general::__NR_getrandom, valid_out, 8, 0, 0, 8);
     check_syscall(&mut c, general::__NR_prlimit64, 999_999, u64::from(general::RLIMIT_STACK), 0, valid_out, esrch);
     check_syscall(&mut c, general::__NR_prlimit64, 0, u64::from(general::RLIM_NLIMITS), 0, valid_out, einval);
     check_syscall(&mut c, general::__NR_prlimit64, 0, u64::from(general::RLIMIT_STACK), 0, valid_out, 0);
     check_syscall(&mut c, general::__NR_rt_sigaction, u64::from(general::SIGKILL), valid_out, 0, 8, einval);
+    check_syscall(&mut c, general::__NR_rt_sigaction, u64::from(general::SIGSTOP), valid_out, 0, 8, einval);
 
     // Closed-fd checks: close(2) -> 0, then write/fstat/ioctl/read/close(2) -> -EBADF.
     check_syscall(&mut c, general::__NR_close, 2, 0, 0, 0, 0);

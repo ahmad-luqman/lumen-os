@@ -31,10 +31,21 @@ pub fn list() -> Vec<BootModule> {
             .filter(|s| !s.is_empty())
             .or_else(|| file.path().to_str().ok().and_then(|p| p.rsplit('/').next()).filter(|s| !s.is_empty()))
             .unwrap_or("module");
-        // SAFETY: Limine maps boot modules in the HHDM (`EXECUTABLE_AND_MODULES`
-        // or `BOOTLOADER_RECLAIMABLE`), both of which `mm::paging` maps for the
-        // kernel's entire lifetime and `mm::frame` reserves (non-usable).
-        let bytes = unsafe { core::slice::from_raw_parts(file.addr(), file.size() as usize) };
+        let bytes: &'static [u8] = if file.size() == 0 {
+            &[]
+        } else {
+            let Ok(len) = usize::try_from(file.size()) else {
+                continue;
+            };
+            if file.addr().is_null() || len > isize::MAX as usize {
+                continue;
+            }
+            // SAFETY: Limine maps boot modules in the HHDM (`EXECUTABLE_AND_MODULES`
+            // or `BOOTLOADER_RECLAIMABLE`), both of which `mm::paging` maps for the
+            // kernel's entire lifetime and `mm::frame` reserves (non-usable); `addr`
+            // is non-null and `len <= isize::MAX`.
+            unsafe { core::slice::from_raw_parts(file.addr(), len) }
+        };
         out.push(BootModule { name, bytes });
     }
     out

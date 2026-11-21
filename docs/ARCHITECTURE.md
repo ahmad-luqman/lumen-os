@@ -3160,6 +3160,11 @@ Lumen runs two kinds of user code:
 | 302 | `prlimit64(pid, res, new, old)` | validates `pid == 0 \|\| pid == current_pid` (`-ESRCH` otherwise) and `res < RLIM_NLIMITS` (16, `-EINVAL` otherwise); M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), and `RLIM_INFINITY` for other valid resources when `old` is non-null; writable per-process limit enforcement arrives in M10 |
 | 318 | `getrandom(buf, len, flags)` | rejects unknown flag bits (`-EINVAL`), fills user buffer from `crate::rng` (section 7) via `copy_to_user`, and returns bytes written |
 
+In addition to the 30 table entries above, M6 includes console `poll(2)` (syscall 7)
+to satisfy Rust `std`'s `sanitize_standard_fds` startup check (`poll([0, 1, 2], 3, 0)`)
+and `busybox` `lineedit` stdin readiness waits; full pipe/socket/PTY `poll`/`ppoll`/`select`
+arrives in M8.
+
 Because `musl` on `x86_64` invokes legacy non-`*at` / non-`*2` syscalls
 directly (unlike `aarch64`), later milestones wire both the `*at` and legacy
 x86-64 entry points (trivial shims over `*at(AT_FDCWD, ...)`):

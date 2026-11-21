@@ -37,7 +37,7 @@ $(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version $(BUILD)/deps/busybox/
 # from the pinned rustup sysroot (zero external C compiler required).
 $(BUILD)/linux/hello: tools/linux-hello/hello.rs rust-toolchain.toml
 	@mkdir -p $(BUILD)/linux
-	@SYSROOT=$$(rustc --print sysroot) && HOST=$$(rustc --print host-tuple) && \
+	SYSROOT=$$(rustc --print sysroot) && HOST=$$(rustc --print host-tuple) && \
 	rustc --edition 2024 -O --target x86_64-unknown-linux-musl \
 		-C linker="$$SYSROOT/lib/rustlib/$$HOST/bin/rust-lld" \
 		-C linker-flavor=ld.lld \
@@ -152,11 +152,13 @@ lint: ## clippy on host crates (incl. their tests), the kernel and the apps; ruf
 fmt: ## Format Rust and Python
 	cargo fmt --all
 	cd apps && cargo fmt --all
+	rustfmt --edition 2024 tools/linux-hello/hello.rs
 	uv run --frozen ruff format tools tests
 
 fmt-check: ## Check formatting
 	cargo fmt --all -- --check
 	cd apps && cargo fmt --all -- --check
+	rustfmt --edition 2024 --check tools/linux-hello/hello.rs
 	uv run --frozen ruff format --check tools tests
 
 status: ## Regenerate docs/STATUS.md from the last test results

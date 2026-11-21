@@ -37,6 +37,8 @@ add_module() {
             echo "    module_path: boot():/boot/linux/$name"
             echo "    module_string: $name"
         } >> "$STAGE/boot/limine/limine.conf"
+    else
+        echo "mkiso: warning: skipping missing module $name ($src)" >&2
     fi
 }
 

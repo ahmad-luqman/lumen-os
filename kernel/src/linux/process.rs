@@ -124,7 +124,13 @@ pub struct ProcessState {
     pub stdout: Vec<u8>,
     stdin: Vec<u8>,
     stdin_pos: usize,
-    unread_byte: Option<u8>,
+    /// Small lookahead / UTF-8 tail buffer for stdin (up to 4 bytes).
+    unread: [u8; 4],
+    unread_pos: u8,
+    unread_len: u8,
+    /// Incomplete trailing UTF-8 bytes pending across `write`/`writev` chunks on a VT.
+    vt_utf8: [u8; 4],
+    vt_utf8_len: u8,
 }
 
 impl ProcessState {
@@ -148,13 +154,45 @@ impl ProcessState {
             stdout: Vec::new(),
             stdin,
             stdin_pos: 0,
-            unread_byte: None,
+            unread: [0; 4],
+            unread_pos: 0,
+            unread_len: 0,
+            vt_utf8: [0; 4],
+            vt_utf8_len: 0,
         }
     }
 
     #[inline]
     pub fn fd_kind(&self, fd: u64) -> FdKind {
         if fd < MAX_FDS as u64 { self.fds[fd as usize] } else { FdKind::Closed }
+    }
+
+    #[inline]
+    fn has_unread(&self) -> bool {
+        self.unread_pos < self.unread_len
+    }
+
+    #[inline]
+    fn pop_unread(&mut self) -> Option<u8> {
+        if self.unread_pos < self.unread_len {
+            let b = self.unread[self.unread_pos as usize];
+            self.unread_pos += 1;
+            if self.unread_pos == self.unread_len {
+                self.unread_pos = 0;
+                self.unread_len = 0;
+            }
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    fn push_unread_bytes(&mut self, bytes: &[u8]) {
+        debug_assert!(!self.has_unread(), "push_unread_bytes called with unread bytes pending");
+        let n = bytes.len().min(self.unread.len());
+        self.unread[..n].copy_from_slice(&bytes[..n]);
+        self.unread_pos = 0;
+        self.unread_len = n as u8;
     }
 }
 
@@ -198,11 +236,11 @@ pub fn with_current_mut<R>(f: impl FnOnce(&mut ProcessState) -> R) -> R {
     f(proc)
 }
 
-/// Record the process's terminal [`UserExit`] and return its PID.
-pub fn record_exit(exit: UserExit) -> u32 {
+/// Record the process's terminal [`UserExit`] and return `(pid, allow_test_syscalls)`.
+pub fn record_exit(exit: UserExit) -> (u32, bool) {
     with_current_mut(|proc| {
         proc.exit = Some(exit);
-        proc.pid
+        (proc.pid, proc.allow_test_syscalls)
     })
 }
 
@@ -226,47 +264,82 @@ pub fn write_console(io: ConsoleIo, bytes: &[u8]) {
                 let _ = klog::burst_held(bytes);
             });
         }
-        ConsoleIo::Vt(vt) => {
-            // Render valid UTF-8 runs and replace invalid bytes with U+FFFD.
-            let mut rest = bytes;
-            while !rest.is_empty() {
-                match core::str::from_utf8(rest) {
-                    Ok(s) => {
+        ConsoleIo::Vt(vt) => write_vt_utf8(vt, bytes),
+    }
+}
+
+/// Stream `bytes` onto virtual terminal `vt`, preserving incomplete trailing
+/// multi-byte UTF-8 sequences across chunk/write boundaries and replacing only
+/// genuinely invalid byte sequences with U+FFFD.
+fn write_vt_utf8(vt: usize, bytes: &[u8]) {
+    let (mut tail, mut tail_len) = with_current_mut(|proc| {
+        let t = proc.vt_utf8;
+        let l = proc.vt_utf8_len as usize;
+        proc.vt_utf8_len = 0;
+        (t, l)
+    });
+
+    let mut scratch = [0u8; 516];
+    for chunk in bytes.chunks(512) {
+        scratch[..tail_len].copy_from_slice(&tail[..tail_len]);
+        let total = tail_len + chunk.len();
+        scratch[tail_len..total].copy_from_slice(chunk);
+        tail_len = 0;
+
+        let mut rest = &scratch[..total];
+        while !rest.is_empty() {
+            match core::str::from_utf8(rest) {
+                Ok(s) => {
+                    let _ = term::write_str_to(vt, s);
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0
+                        && let Ok(s) = core::str::from_utf8(&rest[..valid])
+                    {
                         let _ = term::write_str_to(vt, s);
-                        break;
                     }
-                    Err(e) => {
-                        let valid = e.valid_up_to();
-                        if valid > 0
-                            && let Ok(s) = core::str::from_utf8(&rest[..valid])
-                        {
-                            let _ = term::write_str_to(vt, s);
+                    match e.error_len() {
+                        Some(bad_len) => {
+                            let _ = term::write_str_to(vt, "\u{fffd}");
+                            rest = &rest[valid + bad_len..];
                         }
-                        let _ = term::write_str_to(vt, "\u{fffd}");
-                        let skip = e.error_len().unwrap_or(rest.len() - valid);
-                        rest = &rest[valid + skip..];
+                        None => {
+                            // Incomplete multi-byte UTF-8 sequence (1..=3 bytes) at chunk end.
+                            let rem = &rest[valid..];
+                            let n = rem.len().min(tail.len());
+                            tail[..n].copy_from_slice(&rem[..n]);
+                            tail_len = n;
+                            break;
+                        }
                     }
                 }
             }
         }
     }
+
+    with_current_mut(|proc| {
+        proc.vt_utf8 = tail;
+        proc.vt_utf8_len = tail_len as u8;
+    });
 }
 
 /// Whether stdin currently has data available without blocking (or EOF in capture mode).
 pub fn stdin_ready(io: ConsoleIo) -> bool {
     match io {
         ConsoleIo::Capture => true,
-        ConsoleIo::Serial => with_current(|p| p.unread_byte.is_some()) || serial_in::available(),
+        ConsoleIo::Serial => with_current(ProcessState::has_unread) || serial_in::available(),
         ConsoleIo::Vt(vt) => {
-            if with_current(|p| p.unread_byte.is_some()) {
+            if with_current(ProcessState::has_unread) {
                 return true;
             }
             while let Some(key) = crate::vt::read_key(vt) {
-                if let KbdKey::Char(ch) = key
-                    && ch.is_ascii()
-                {
-                    let b = if ch == '\r' { b'\n' } else { ch as u8 };
-                    with_current_mut(|p| p.unread_byte = Some(b));
+                if let KbdKey::Char(ch) = key {
+                    let mapped = if ch == '\r' { '\n' } else { ch };
+                    let mut enc = [0u8; 4];
+                    let bytes = mapped.encode_utf8(&mut enc).as_bytes();
+                    with_current_mut(|p| p.push_unread_bytes(bytes));
                     return true;
                 }
             }
@@ -275,14 +348,19 @@ pub fn stdin_ready(io: ConsoleIo) -> bool {
     }
 }
 
-/// Block briefly waiting for stdin input (at most one `serial_in::wait` slice,
-/// ~100 ms, or a short sleep on VT/Capture). Must be called with interrupts on
-/// and no `SpinLock` held.
-pub fn wait_stdin_step(io: ConsoleIo) {
+/// Block briefly waiting for stdin input up to optional monotonic `deadline` (ns).
+/// Must be called with interrupts on and no `SpinLock` held.
+pub fn wait_stdin_step(io: ConsoleIo, deadline: Option<u64>) {
     match io {
-        ConsoleIo::Serial => serial_in::wait(),
+        ConsoleIo::Serial => serial_in::wait_until(deadline),
         ConsoleIo::Vt(_) => {
-            let _ = crate::sched::sleep(5_000_000);
+            let slice = match deadline {
+                Some(dl) => dl.saturating_sub(crate::time::now_ns()).min(5_000_000),
+                None => 5_000_000,
+            };
+            if slice > 0 {
+                let _ = crate::sched::sleep(slice);
+            }
         }
         ConsoleIo::Capture => {}
     }
@@ -322,7 +400,7 @@ pub fn read_console(io: ConsoleIo, dst: &mut [u8]) -> usize {
 }
 
 fn read_serial(dst: &mut [u8]) -> usize {
-    let first = with_current_mut(|proc| proc.unread_byte.take()).unwrap_or_else(|| {
+    let first = with_current_mut(ProcessState::pop_unread).unwrap_or_else(|| {
         loop {
             if let Some(b) = serial_in::read_byte() {
                 return b;
@@ -346,7 +424,7 @@ fn read_serial(dst: &mut [u8]) -> usize {
             break;
         };
         if b == 0x04 {
-            with_current_mut(|proc| proc.unread_byte = Some(0x04));
+            with_current_mut(|proc| proc.push_unread_bytes(&[0x04]));
             break;
         }
         dst[n] = if b == b'\r' { b'\n' } else { b };
@@ -356,12 +434,20 @@ fn read_serial(dst: &mut [u8]) -> usize {
 }
 
 fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
-    if let Some(b) = with_current_mut(|p| p.unread_byte.take()) {
-        if b == 0x04 {
+    if let Some(first) = with_current_mut(ProcessState::pop_unread) {
+        if first == 0x04 {
             return 0;
         }
-        dst[0] = b;
-        return 1;
+        dst[0] = first;
+        let mut n = 1;
+        while n < dst.len() {
+            let Some(b) = with_current_mut(ProcessState::pop_unread) else {
+                break;
+            };
+            dst[n] = b;
+            n += 1;
+        }
+        return n;
     }
     loop {
         if let KbdKey::Char(ch) = crate::vt::wait_key(vt) {
@@ -370,9 +456,12 @@ fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
             }
             let mapped = if ch == '\r' { '\n' } else { ch };
             let mut enc = [0u8; 4];
-            let s = mapped.encode_utf8(&mut enc);
-            let n = s.len().min(dst.len());
-            dst[..n].copy_from_slice(&s.as_bytes()[..n]);
+            let bytes = mapped.encode_utf8(&mut enc).as_bytes();
+            let n = bytes.len().min(dst.len());
+            dst[..n].copy_from_slice(&bytes[..n]);
+            if n < bytes.len() {
+                with_current_mut(|proc| proc.push_unread_bytes(&bytes[n..]));
+            }
             return n;
         }
     }
