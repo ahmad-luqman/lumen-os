@@ -3310,6 +3310,266 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
     }
 
+    // (6) Cold-cache (open_count == 0, NO OpenGuard / no prior resolve_path) Pair(2, 3) & From(2)
+    //     regression tests across hardlinked files, hardlinked inline symlinks, hardlink
+    //     rename overwrites, dual-linked directories, and uncached step-2 file rename.
+
+    // (6a) Cold-cache hardlinked regular file unlink_at("/h1")
+    let m = mount_test_ext4(base_img.to_vec(), 58)?;
+    let (h1, _) = open_inode(
+        &m.tables,
+        None,
+        b"/h1",
+        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+        0o644,
+        0,
+    )
+    .map_err(|_| "create cold /h1")?;
+    let cold_hl_orig_ino = h1.ino();
+    kassert_eq!(h1.write_at(0, b"COLD_HL_DATA").map_err(|_| "write cold /h1")?, 12);
+    h1.sync(false).map_err(|_| "sync cold /h1")?;
+    drop(h1);
+    link_at(&m.tables, None, b"/h1", None, b"/h2", false, false).map_err(|_| "link cold /h2")?;
+    m.fs.sync().map_err(|_| "sync cold hl")?;
+    let snap_cold_hl = m.mem_dev.0.data.lock().clone();
+    drop(m);
+
+    for &use_from in &[false, true] {
+        let m = mount_test_ext4(snap_cold_hl.clone(), 59)?;
+        if use_from {
+            m.fault_cache.arm_write_fail_from(2);
+        } else {
+            m.fault_cache.arm_write_fail_pair(2, 3);
+        }
+        let res1 = unlink_at(&m.tables, None, b"/h1", false);
+        m.fault_cache.arm_write_fail_on(0);
+        kassert!(matches!(res1, Err(VfsError::Io)));
+
+        unlink_at(&m.tables, None, b"/h1", false).map_err(|_| "retry cold /h1 unlink")?;
+        kassert!(matches!(resolve_path(&m.tables, None, b"/h1", rf), Err(VfsError::NoEnt)));
+        let h2 = resolve_path(&m.tables, None, b"/h2", rf).map_err(|_| "resolve cold /h2")?.inode;
+        kassert_eq!(h2.ino(), cold_hl_orig_ino);
+        kassert_eq!(h2.stat().map_err(|_| "stat cold /h2")?.nlink, 1);
+        kassert_eq!(read_all_inode(&h2).map_err(|_| "read cold /h2")?, b"COLD_HL_DATA");
+        let (canary, _) = open_inode(
+            &m.tables,
+            None,
+            b"/canary",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create cold /canary")?;
+        kassert_ne_u64(canary.ino(), cold_hl_orig_ino)?;
+        drop((h2, canary));
+        unlink_at(&m.tables, None, b"/h2", false).map_err(|_| "cleanup cold /h2")?;
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+    }
+
+    // (6b) Cold-cache hardlinked inline symlink unlink_at("/sym1")
+    let m = mount_test_ext4(base_img.to_vec(), 60)?;
+    let sym1 = symlink_at(&m.tables, b"/cold/sym/target", None, b"/sym1").map_err(|_| "symlink cold /sym1")?;
+    let cold_sym_orig_ino = sym1.ino();
+    drop(sym1);
+    link_at(&m.tables, None, b"/sym1", None, b"/sym2", false, false).map_err(|_| "link cold /sym2")?;
+    m.fs.sync().map_err(|_| "sync cold sym")?;
+    let snap_cold_sym = m.mem_dev.0.data.lock().clone();
+    drop(m);
+
+    for &use_from in &[false, true] {
+        let m = mount_test_ext4(snap_cold_sym.clone(), 61)?;
+        if use_from {
+            m.fault_cache.arm_write_fail_from(2);
+        } else {
+            m.fault_cache.arm_write_fail_pair(2, 3);
+        }
+        let res1 = unlink_at(&m.tables, None, b"/sym1", false);
+        m.fault_cache.arm_write_fail_on(0);
+        kassert!(matches!(res1, Err(VfsError::Io)));
+
+        unlink_at(&m.tables, None, b"/sym1", false).map_err(|_| "retry cold /sym1 unlink")?;
+        kassert!(matches!(resolve_path(&m.tables, None, b"/sym1", rf), Err(VfsError::NoEnt)));
+        let sym2 = resolve_path(&m.tables, None, b"/sym2", rf).map_err(|_| "resolve cold /sym2")?.inode;
+        kassert_eq!(sym2.ino(), cold_sym_orig_ino);
+        kassert_eq!(sym2.stat().map_err(|_| "stat cold /sym2")?.nlink, 1);
+        kassert_eq!(sym2.readlink().map_err(|_| "readlink cold /sym2")?, b"/cold/sym/target");
+        kassert_eq!(readlink_at(&m.tables, None, b"/sym2").map_err(|_| "readlink_at cold /sym2")?, b"/cold/sym/target");
+        let canary_sym = symlink_at(&m.tables, b"/canary/target", None, b"/canary_sym").map_err(|_| "canary_sym")?;
+        kassert_ne_u64(canary_sym.ino(), cold_sym_orig_ino)?;
+        drop((sym2, canary_sym));
+        unlink_at(&m.tables, None, b"/sym2", false).map_err(|_| "cleanup cold /sym2")?;
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+    }
+
+    // (6c) Cold-cache hardlink overwrite rename_at2("/src", "/h1")
+    let m = mount_test_ext4(base_img.to_vec(), 62)?;
+    let (ow_h1, _) = open_inode(
+        &m.tables,
+        None,
+        b"/h1",
+        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+        0o644,
+        0,
+    )
+    .map_err(|_| "create cold ow /h1")?;
+    let cold_ow_orig_ino = ow_h1.ino();
+    kassert_eq!(ow_h1.write_at(0, b"OLD_HL_OW").map_err(|_| "write cold ow /h1")?, 9);
+    ow_h1.sync(false).map_err(|_| "sync cold ow /h1")?;
+    drop(ow_h1);
+    link_at(&m.tables, None, b"/h1", None, b"/h2", false, false).map_err(|_| "link cold ow /h2")?;
+    let (ow_src, _) = open_inode(
+        &m.tables,
+        None,
+        b"/src",
+        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+        0o644,
+        0,
+    )
+    .map_err(|_| "create cold ow /src")?;
+    let ow_src_ino = ow_src.ino();
+    kassert_eq!(ow_src.write_at(0, b"NEW_SRC_OW").map_err(|_| "write cold ow /src")?, 10);
+    ow_src.sync(false).map_err(|_| "sync cold ow /src")?;
+    drop(ow_src);
+    m.fs.sync().map_err(|_| "sync cold ow")?;
+    let snap_cold_ow = m.mem_dev.0.data.lock().clone();
+    drop(m);
+
+    for &use_from in &[false, true] {
+        let m = mount_test_ext4(snap_cold_ow.clone(), 63)?;
+        if use_from {
+            m.fault_cache.arm_write_fail_from(2);
+        } else {
+            m.fault_cache.arm_write_fail_pair(2, 3);
+        }
+        let res1 = rename_at2(&m.tables, None, b"/src", None, b"/h1", RenameFlags::default());
+        m.fault_cache.arm_write_fail_on(0);
+        kassert!(matches!(res1, Err(VfsError::Io)));
+
+        rename_at2(&m.tables, None, b"/src", None, b"/h1", RenameFlags::default())
+            .map_err(|_| "retry cold ow rename")?;
+        let new_h1 = resolve_path(&m.tables, None, b"/h1", rf).map_err(|_| "resolve new cold ow /h1")?.inode;
+        kassert_eq!(new_h1.ino(), ow_src_ino);
+        kassert_eq!(read_all_inode(&new_h1).map_err(|_| "read new cold ow /h1")?, b"NEW_SRC_OW");
+        let h2 = resolve_path(&m.tables, None, b"/h2", rf).map_err(|_| "resolve cold ow /h2")?.inode;
+        kassert_eq!(h2.ino(), cold_ow_orig_ino);
+        kassert_eq!(h2.stat().map_err(|_| "stat cold ow /h2")?.nlink, 1);
+        kassert_eq!(read_all_inode(&h2).map_err(|_| "read cold ow /h2")?, b"OLD_HL_OW");
+        let (canary_ow, _) = open_inode(
+            &m.tables,
+            None,
+            b"/canary_ow",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create cold /canary_ow")?;
+        kassert_ne_u64(canary_ow.ino(), cold_ow_orig_ino)?;
+        drop((new_h1, h2, canary_ow));
+        unlink_at(&m.tables, None, b"/h2", false).map_err(|_| "cleanup cold ow /h2")?;
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+    }
+
+    // (6d) Cold-cache dual-linked empty directory unlink_at("/sd/sub", true)
+    let mut snap_dual_dir_opt: Option<(Vec<u8>, u64)> = None;
+    'find_dual: for c1 in 1..=dir_ren_writes {
+        for c2 in (c1 + 1)..=(c1 + 5) {
+            let m = mount_test_ext4(snap_d.clone(), 64)?;
+            m.fault_cache.arm_write_fail_pair(c1, c2);
+            let _ = rename_at2(&m.tables, None, b"/sd/sub", None, b"/dd/sub", RenameFlags::default());
+            m.fault_cache.arm_write_fail_on(0);
+            if let (Ok(sd_r), Ok(dd_r)) =
+                (resolve_path(&m.tables, None, b"/sd/sub", rf), resolve_path(&m.tables, None, b"/dd/sub", rf))
+            {
+                let ino = sd_r.inode.ino();
+                if dd_r.inode.ino() == ino {
+                    drop((sd_r, dd_r));
+                    let ro_fs = mount_ro_snapshot(&m, 65)?;
+                    let ro_sub = ro_fs
+                        .root_inode()
+                        .lookup("dd")
+                        .and_then(|d| d.lookup("sub"))
+                        .map_err(|_| "ro lookup dual sub")?;
+                    if ro_sub.stat().map_err(|_| "ro stat dual sub")?.nlink >= 3 {
+                        drop(ro_sub);
+                        drop(ro_fs);
+                        m.fs.sync().map_err(|_| "sync dual dir snap")?;
+                        snap_dual_dir_opt = Some((m.mem_dev.0.data.lock().clone(), ino));
+                        drop(m);
+                        break 'find_dual;
+                    }
+                }
+            }
+            drop(m);
+        }
+    }
+    let (snap_dual_dir, dual_dir_orig_ino) = snap_dual_dir_opt.ok_or("missing dual dir snapshot")?;
+
+    for &use_from in &[false, true] {
+        let m = mount_test_ext4(snap_dual_dir.clone(), 66)?;
+        if use_from {
+            m.fault_cache.arm_write_fail_from(2);
+        } else {
+            m.fault_cache.arm_write_fail_pair(2, 3);
+        }
+        let res1 = unlink_at(&m.tables, None, b"/sd/sub", true);
+        m.fault_cache.arm_write_fail_on(0);
+        kassert!(matches!(res1, Err(VfsError::Io)));
+
+        unlink_at(&m.tables, None, b"/sd/sub", true).map_err(|_| "retry cold dual rmdir")?;
+        kassert!(matches!(resolve_path(&m.tables, None, b"/sd/sub", rf), Err(VfsError::NoEnt)));
+        let dd_sub = resolve_path(&m.tables, None, b"/dd/sub", rf).map_err(|_| "resolve cold /dd/sub")?.inode;
+        kassert_eq!(dd_sub.ino(), dual_dir_orig_ino);
+        kassert_eq!(dd_sub.stat().map_err(|_| "stat cold /dd/sub")?.nlink, 2);
+        let canary_dir = mkdir_at(&m.tables, None, b"/canary_dir", 0o755, 0).map_err(|_| "mkdir cold /canary_dir")?;
+        kassert_ne_u64(canary_dir.ino(), dual_dir_orig_ino)?;
+        drop((dd_sub, canary_dir));
+        unlink_at(&m.tables, None, b"/dd/sub", true).map_err(|_| "cleanup cold /dd/sub")?;
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+    }
+
+    // (6e) Cold-cache step-2 file rename From(4) / Pair(3, 4) without prior resolve_path
+    let snap_f_orig_ino = {
+        let ro_dev = MemBlkDev::new(snap_f.clone(), true);
+        let ro_bc: Arc<dyn ext4::BlockCacheBackend> =
+            Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(ro_dev, 32).map_err(|_| "ro bc snap_f")?));
+        let ro_fs = ext4::Ext4FileSystem::mount(ro_bc, DevId::makedev(0, 67), true).map_err(|_| "ro snap_f")?;
+        ro_fs.root_inode().lookup("sd").and_then(|d| d.lookup("f")).map_err(|_| "ro /sd/f")?.ino()
+    };
+    for &use_from in &[false, true] {
+        let m = mount_test_ext4(snap_f.clone(), 68)?;
+        if use_from {
+            m.fault_cache.arm_write_fail_from(4);
+        } else {
+            m.fault_cache.arm_write_fail_pair(3, 4);
+        }
+        let _ = rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default());
+        m.fault_cache.arm_write_fail_on(0);
+        if resolve_path(&m.tables, None, b"/sd/f", rf).is_ok() && resolve_path(&m.tables, None, b"/dd/f", rf).is_ok() {
+            unlink_at(&m.tables, None, b"/sd/f", false).map_err(|_| "cold s2 unlink /sd/f")?;
+            let dd_f = resolve_path(&m.tables, None, b"/dd/f", rf).map_err(|_| "cold s2 resolve /dd/f")?.inode;
+            kassert_eq!(dd_f.ino(), snap_f_orig_ino);
+            kassert_eq!(read_all_inode(&dd_f).map_err(|_| "cold s2 read /dd/f")?, b"FILE_DATA");
+            let (canary_s2, _) = open_inode(
+                &m.tables,
+                None,
+                b"/canary_s2",
+                OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                0o644,
+                0,
+            )
+            .map_err(|_| "create canary_s2")?;
+            kassert_ne_u64(canary_s2.ino(), snap_f_orig_ino)?;
+            drop((dd_f, canary_s2));
+            unlink_at(&m.tables, None, b"/dd/f", false).map_err(|_| "cleanup cold s2 /dd/f")?;
+        }
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+    }
+
     Ok(())
 }
 
