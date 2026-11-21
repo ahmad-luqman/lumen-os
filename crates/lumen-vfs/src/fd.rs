@@ -157,7 +157,7 @@ impl<L: VfsLock<u64>> OpenFile<L> {
     /// When this reaches `0`, the caller must release `flock(2)` locks for
     /// `self.id` outside `ACTIVE_PROCS`.
     pub fn dec_fd_ref(&self) -> u32 {
-        self.fd_refs.fetch_sub(1, Ordering::Release) - 1
+        self.fd_refs.fetch_sub(1, Ordering::AcqRel) - 1
     }
 
     /// Current FD reference count.

@@ -91,8 +91,9 @@ type DentryKey = (DevId, Ino, Box<str>);
 /// `unlink`, `rmdir`, `rename`, `mount`, and `umount`.
 pub struct DentryCache {
     max_entries: usize,
-    entries: BTreeMap<DentryKey, DentryTarget>,
-    order: VecDeque<DentryKey>,
+    next_gen: u64,
+    entries: BTreeMap<DentryKey, (DentryTarget, u64)>,
+    order: VecDeque<(DentryKey, u64)>,
 }
 
 impl DentryCache {
@@ -101,7 +102,12 @@ impl DentryCache {
 
     /// Create a dentry cache bounded to `max_entries`.
     pub const fn new(max_entries: usize) -> Self {
-        Self { max_entries, entries: BTreeMap::new(), order: VecDeque::new() }
+        Self { max_entries, next_gen: 0, entries: BTreeMap::new(), order: VecDeque::new() }
+    }
+
+    fn compact_order(&mut self) {
+        let entries = &self.entries;
+        self.order.retain(|(k, g)| entries.get(k).is_some_and(|&(_, cur_g)| cur_g == *g));
     }
 
     /// Look up a cached child target. Always returns `None` for `.` and `..`.
@@ -110,7 +116,7 @@ impl DentryCache {
             return None;
         }
         let key: DentryKey = (parent_dev, parent_ino, Box::from(name));
-        self.entries.get(&key).copied()
+        self.entries.get(&key).map(|&(target, _)| target)
     }
 
     /// Insert or update a dentry mapping. Never caches `.`, `..`, or empty names.
@@ -120,18 +126,25 @@ impl DentryCache {
         }
         let key: DentryKey = (parent_dev, parent_ino, Box::from(name));
         if let Some(existing) = self.entries.get_mut(&key) {
-            *existing = target;
+            existing.0 = target;
             return;
         }
         while self.entries.len() >= self.max_entries {
-            let Some(oldest) = self.order.pop_front() else {
+            let Some((oldest_key, oldest_gen)) = self.order.pop_front() else {
                 self.entries.clear();
                 break;
             };
-            self.entries.remove(&oldest);
+            if self.entries.get(&oldest_key).is_some_and(|&(_, cur_g)| cur_g == oldest_gen) {
+                self.entries.remove(&oldest_key);
+            }
         }
-        self.order.push_back(key.clone());
-        self.entries.insert(key, target);
+        if self.order.len() >= self.max_entries.saturating_mul(2) {
+            self.compact_order();
+        }
+        let gen_id = self.next_gen;
+        self.next_gen = self.next_gen.wrapping_add(1);
+        self.order.push_back((key.clone(), gen_id));
+        self.entries.insert(key, (target, gen_id));
     }
 
     /// Invalidate a single `(parent_dev, parent_ino, name)` entry.
@@ -157,7 +170,7 @@ impl DentryCache {
         let keys: Vec<DentryKey> = self
             .entries
             .iter()
-            .filter(|((pd, _, _), target)| *pd == dev || target.dev == dev)
+            .filter(|((pd, _, _), (target, _))| *pd == dev || target.dev == dev)
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys {
@@ -179,6 +192,11 @@ impl DentryCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn order_len(&self) -> usize {
+        self.order.len()
     }
 }
 

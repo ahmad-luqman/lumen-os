@@ -6,13 +6,15 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::PATH_MAX;
 use crate::cache::DentryTarget;
 use crate::error::VfsError;
 use crate::fs::VfsInode;
 use crate::mount::VfsCacheOps;
-use crate::resolve::{ResolveFlags, resolve_parent, resolve_path};
+use crate::resolve::{
+    ResolveFlags, cross_mounts_down, resolve_parent, resolve_parent_with_depth, resolve_path, resolve_path_with_depth,
+};
 use crate::types::{InodeType, OpenFlags, RenameFlags};
+use crate::{MAX_SYMLINK_DEPTH, PATH_MAX};
 
 /// Open or create a file/directory/device inode according to POSIX/`openat(2)`
 /// semantics.
@@ -44,22 +46,29 @@ pub fn open_inode(
     }
 
     let inode = if flags.has_creat() {
-        if path.ends_with(b"/") {
-            return Err(VfsError::IsDir);
-        }
-        let target = resolve_parent(env, start_dir, path)?;
-        if target.name == "/" || target.name == "." || target.name == ".." {
-            if flags.has_excl() {
-                return Err(VfsError::Exist);
+        let mut symlink_depth = 0usize;
+        let mut cur_start_dir: Option<Arc<dyn VfsInode>> = start_dir.map(Arc::clone);
+        let mut cur_path: Vec<u8> = path.to_vec();
+
+        loop {
+            let target = resolve_parent_with_depth(env, cur_start_dir.as_ref(), &cur_path, &mut symlink_depth)?;
+            if target.name == "/" || target.name == "." || target.name == ".." {
+                if flags.has_excl() {
+                    return Err(VfsError::Exist);
+                }
+                break resolve_path_with_depth(
+                    env,
+                    cur_start_dir.as_ref(),
+                    &cur_path,
+                    ResolveFlags { follow_final: !flags.has_nofollow(), empty_path: false, require_dir: true },
+                    &mut symlink_depth,
+                )?
+                .inode;
             }
-            resolve_path(
-                env,
-                start_dir,
-                path,
-                ResolveFlags { follow_final: !flags.has_nofollow(), empty_path: false, require_dir: true },
-            )?
-            .inode
-        } else {
+            if symlink_depth == 0 && target.has_trailing_slash {
+                return Err(VfsError::IsDir);
+            }
+
             match target.parent.lookup(&target.name) {
                 Ok(existing) => {
                     if flags.has_excl() {
@@ -67,26 +76,43 @@ pub fn open_inode(
                     }
                     let existing = env.inode_get_or_insert(existing);
                     if existing.inode_type() == InodeType::Symlink {
-                        if flags.has_nofollow() {
+                        if flags.has_nofollow() && !target.has_trailing_slash {
                             return Err(VfsError::Loop);
                         }
-                        resolve_path(
-                            env,
-                            start_dir,
-                            path,
-                            ResolveFlags { follow_final: true, empty_path: false, require_dir: flags.has_directory() },
-                        )?
-                        .inode
-                    } else {
-                        // Follow mountpoints if `existing` is a mountpoint directory.
-                        if let Some(fs) = env.mount_at(existing.dev_id(), existing.ino()) {
-                            fs.root_inode()
-                        } else {
-                            existing
+                        symlink_depth += 1;
+                        if symlink_depth > MAX_SYMLINK_DEPTH {
+                            return Err(VfsError::Loop);
                         }
+                        if let Some(magic_target) = existing.resolve_magic_link() {
+                            let magic_target = env.inode_get_or_insert(magic_target);
+                            break cross_mounts_down(env, magic_target);
+                        }
+                        let link_target = existing.readlink()?;
+                        if link_target.is_empty() {
+                            return Err(VfsError::NoEnt);
+                        }
+                        if link_target.contains(&0) {
+                            return Err(VfsError::Inval);
+                        }
+                        if link_target.len() >= PATH_MAX {
+                            return Err(VfsError::NameTooLong);
+                        }
+                        cur_start_dir =
+                            if link_target.starts_with(b"/") { None } else { Some(Arc::clone(&target.parent)) };
+                        cur_path = link_target;
+                    } else {
+                        // Follow stacked mountpoints if `existing` is a mountpoint directory.
+                        let existing = cross_mounts_down(env, existing);
+                        if target.has_trailing_slash && existing.inode_type() != InodeType::Dir {
+                            return Err(VfsError::NotDir);
+                        }
+                        break existing;
                     }
                 }
                 Err(VfsError::NoEnt) => {
+                    if target.has_trailing_slash {
+                        return Err(VfsError::IsDir);
+                    }
                     if flags.has_directory() {
                         return Err(VfsError::NotDir);
                     }
@@ -123,7 +149,7 @@ pub fn open_inode(
     if flags.has_directory() && inode.inode_type() != InodeType::Dir {
         return Err(VfsError::NotDir);
     }
-    if inode.inode_type() == InodeType::Dir && (flags.is_writable() || flags.has_trunc()) {
+    if inode.inode_type() == InodeType::Dir && (flags.is_writable() || flags.has_trunc() || flags.has_creat()) {
         return Err(VfsError::IsDir);
     }
     if !inode.exempt_from_rofs() && env.fs_read_only(inode.dev_id()) && (flags.is_writable() || flags.has_trunc()) {
@@ -226,6 +252,7 @@ pub fn unlink_at(
             }
             return Err(err);
         }
+        env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), &target.name);
         Ok(())
     } else {
         if child.inode_type() != InodeType::Dir {
@@ -247,6 +274,8 @@ pub fn unlink_at(
             }
             return Err(err);
         }
+        env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), &target.name);
+        env.dentry_invalidate_dir(old_dev, old_ino);
         Ok(())
     }
 }
@@ -318,22 +347,15 @@ pub fn symlink_at(
     }
     let target_str = core::str::from_utf8(target).map_err(|_| VfsError::Inval)?;
 
-    if linkpath.ends_with(b"/") {
-        return match resolve_path(
-            env,
-            new_dir,
-            linkpath,
-            ResolveFlags { follow_final: false, empty_path: false, require_dir: false },
-        ) {
-            Ok(_) => Err(VfsError::Exist),
-            Err(VfsError::NotDir) => Err(VfsError::Exist),
-            Err(e) => Err(e),
-        };
-    }
-
     let parent = resolve_parent(env, new_dir, linkpath)?;
     if parent.name == "/" || parent.name == "." || parent.name == ".." {
         return Err(VfsError::Exist);
+    }
+    if parent.has_trailing_slash {
+        return match parent.parent.lookup(&parent.name) {
+            Ok(_) => Err(VfsError::Exist),
+            Err(e) => Err(e),
+        };
     }
     if env.fs_read_only(parent.parent.dev_id()) {
         return Err(VfsError::RoFs);
@@ -506,6 +528,7 @@ pub fn rename_at2(
         }
 
         let mut removed_target_ino: Option<(Arc<dyn VfsInode>, u64)> = None;
+        let mut overwritten_dir_key: Option<(crate::types::DevId, crate::types::Ino)> = None;
         if let Some(ref new_inode) = new_inode_opt {
             let nlink = new_inode.stat()?.nlink;
             let last_link = if new_inode.inode_type() == InodeType::Dir { nlink <= 2 } else { nlink <= 1 };
@@ -515,7 +538,9 @@ pub fn rename_at2(
                 removed_target_ino = Some((Arc::clone(new_inode), old_ino));
             }
             if new_inode.inode_type() == InodeType::Dir {
-                env.dentry_invalidate_dir(new_inode.dev_id(), new_inode.ino());
+                let dir_key = (new_inode.dev_id(), new_inode.ino());
+                env.dentry_invalidate_dir(dir_key.0, dir_key.1);
+                overwritten_dir_key = Some(dir_key);
             }
         }
 
@@ -530,6 +555,12 @@ pub fn rename_at2(
                 let _ = env.inode_get_or_insert(inode);
             }
             return Err(err);
+        }
+
+        env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
+        env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
+        if let Some((d_dev, d_ino)) = overwritten_dir_key {
+            env.dentry_invalidate_dir(d_dev, d_ino);
         }
 
         Ok(())

@@ -1736,3 +1736,621 @@ fn lock9_is_never_held_during_inode_calls() {
     rename_at2(probe.as_ref(), Some(&checking_root), b"a/b", Some(&checking_root), b"a/c", RenameFlags(0)).unwrap();
     unlink_at(probe.as_ref(), Some(&checking_root), b"a/s", false).unwrap();
 }
+
+#[test]
+fn dotdot_unifies_through_inode_cache_and_crosses_stacked_mounts() {
+    /// Wrapper whose `lookup("..")` constructs a brand-new `Arc<FreshDotDotInode>`
+    /// (mimicking an on-disk filesystem like ext4 returning an uncached inode on `..`).
+    struct FreshDotDotInode {
+        inner: Arc<dyn VfsInode>,
+    }
+
+    impl VfsInode for FreshDotDotInode {
+        fn lock_id(&self) -> u64 {
+            self.inner.lock_id()
+        }
+        fn dev_id(&self) -> DevId {
+            self.inner.dev_id()
+        }
+        fn ino(&self) -> Ino {
+            self.inner.ino()
+        }
+        fn inode_type(&self) -> InodeType {
+            self.inner.inode_type()
+        }
+        fn open_count(&self) -> u32 {
+            self.inner.open_count()
+        }
+        fn inc_open_count(&self) {
+            self.inner.inc_open_count()
+        }
+        fn dec_open_count(&self) -> u32 {
+            self.inner.dec_open_count()
+        }
+        fn is_detached(&self) -> bool {
+            self.inner.is_detached()
+        }
+        fn stat(&self) -> Result<Metadata, VfsError> {
+            self.inner.stat()
+        }
+        fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+            let child = self.inner.lookup(name)?;
+            Ok(Arc::new(FreshDotDotInode { inner: child }))
+        }
+        fn create(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+            let child = self.inner.create(name, mode)?;
+            Ok(Arc::new(FreshDotDotInode { inner: child }))
+        }
+        fn mkdir(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+            let child = self.inner.mkdir(name, mode)?;
+            Ok(Arc::new(FreshDotDotInode { inner: child }))
+        }
+        fn unlink(&self, name: &str) -> Result<(), VfsError> {
+            self.inner.unlink(name)
+        }
+        fn rmdir(&self, name: &str) -> Result<(), VfsError> {
+            self.inner.rmdir(name)
+        }
+        fn link(&self, name: &str, target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+            self.inner.link(name, target)
+        }
+        fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+            let child = self.inner.symlink(name, target)?;
+            Ok(Arc::new(FreshDotDotInode { inner: child }))
+        }
+        fn readlink(&self) -> Result<Vec<u8>, VfsError> {
+            self.inner.readlink()
+        }
+        fn rename(
+            &self,
+            old_name: &str,
+            new_dir: &Arc<dyn VfsInode>,
+            new_name: &str,
+            flags: RenameFlags,
+        ) -> Result<(), VfsError> {
+            self.inner.rename(old_name, new_dir, new_name, flags)
+        }
+        fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
+            self.inner.readdir(cursor, out, max_entries)
+        }
+        fn truncate(&self, size: u64) -> Result<(), VfsError> {
+            self.inner.truncate(size)
+        }
+        fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
+            self.inner.set_mode(mode)
+        }
+        fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError> {
+            self.inner.set_owner(uid, gid)
+        }
+        fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
+            self.inner.set_times(atime, mtime)
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+            self.inner.read_at(offset, buf)
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
+            self.inner.write_at(offset, buf)
+        }
+        fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError> {
+            self.inner.read_page(page_index, buf)
+        }
+        fn write_page(&self, page_index: u64, buf: &[u8]) -> Result<(), VfsError> {
+            self.inner.write_page(page_index, buf)
+        }
+        fn sync(&self, data_only: bool) -> Result<(), VfsError> {
+            self.inner.sync(data_only)
+        }
+        fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {
+            self.inner.with_locks_mut(f)
+        }
+    }
+
+    struct FreshRootFs {
+        inner: Arc<MemFs>,
+    }
+
+    impl FileSystem for FreshRootFs {
+        fn dev_id(&self) -> DevId {
+            self.inner.dev_id()
+        }
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn root_inode(&self) -> Arc<dyn VfsInode> {
+            Arc::new(FreshDotDotInode { inner: self.inner.root_inode() })
+        }
+        fn sync(&self) -> Result<(), VfsError> {
+            self.inner.sync()
+        }
+        fn read_only(&self) -> bool {
+            self.inner.read_only()
+        }
+        fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
+            self.inner.with_rename_lock(f)
+        }
+    }
+
+    let env = SimpleVfsTables::new();
+    let mem_fs = MemFs::new(DevId::ROOT, "fresh", false);
+    let fresh_fs = Arc::new(FreshRootFs { inner: Arc::clone(&mem_fs) });
+    env.mount_root(fresh_fs).unwrap();
+
+    let dir = mkdir_at(&env, None, b"/dir", 0o755, 0).unwrap();
+    let sub = mkdir_at(&env, None, b"/dir/sub", 0o755, 0).unwrap();
+
+    // Verify `lookup("..")` on `sub` returns a distinct Arc pointer outside InodeCache.
+    let raw_parent = sub.lookup("..").unwrap();
+    assert!(!Arc::ptr_eq(&raw_parent, &dir));
+
+    // `resolve_path("/dir/sub/..")` must unify through InodeCache to the exact `dir` Arc.
+    let via_dotdot = resolve_path(&env, None, b"/dir/sub/..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&via_dotdot, &dir));
+
+    let guard = OpenGuard::new(via_dotdot);
+    assert_eq!(dir.open_count(), 1);
+    drop(guard);
+    assert_eq!(dir.open_count(), 0);
+
+    // `compute_cwd_path` also walks `..` cleanly.
+    assert_eq!(compute_cwd_path(&env, &sub).unwrap(), "/dir/sub");
+}
+
+#[test]
+fn overmounted_global_root_dotdot_clamps_and_stacked_step_up() {
+    let (env, root_fs) = setup_vfs();
+    open_inode(&env, None, b"/hidden_secret", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+
+    // Prepare an obscured subdirectory under `/mnt/sub` before mounting over `/mnt`.
+    let mnt = mkdir_at(&env, None, b"/mnt", 0o755, 0).unwrap();
+    let obscured_sub = mkdir_at(&env, None, b"/mnt/sub", 0o755, 0).unwrap();
+    let tmpfs = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    env.mount(mnt, "/mnt", tmpfs.clone()).unwrap();
+
+    // Stepping `..` from obscured `/mnt/sub` lands on the mounted `tmpfs` root!
+    let stepped = resolve_path(&env, Some(&obscured_sub), b"..", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(stepped.dev_id(), DevId::TMPFS);
+    assert_eq!(stepped.ino(), tmpfs.root_inode().ino());
+
+    // Now overmount global `/` itself with `overlay_root`.
+    let overlay_root = MemFs::new(DevId::makedev(0, 88), "overlay", false);
+    env.mount(root_fs.root_inode(), "/", overlay_root.clone()).unwrap();
+    open_inode(&env, None, b"/visible", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let overlay_sub = mkdir_at(&env, None, b"/sub", 0o755, 0).unwrap();
+
+    // `/..` must stay clamped on `overlay_root`, never escaping to `root_fs`.
+    let dotdot = resolve_path(&env, None, b"/..", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(dotdot.dev_id(), overlay_root.dev_id());
+    assert_eq!(dotdot.ino(), overlay_root.root_inode().ino());
+    assert_eq!(resolve_path(&env, None, b"/../hidden_secret", ResolveFlags::default()).unwrap_err(), VfsError::NoEnt);
+    assert!(resolve_path(&env, None, b"/../visible", ResolveFlags::default()).is_ok());
+
+    // `compute_cwd_path` on overmounted `/` and `/sub`.
+    assert_eq!(compute_cwd_path(&env, &overlay_root.root_inode()).unwrap(), "/");
+    assert_eq!(compute_cwd_path(&env, &overlay_sub).unwrap(), "/sub");
+}
+
+#[test]
+fn dentry_cache_churn_bounded_order_and_no_premature_eviction() {
+    // Challenger 1 Bug #5 reproducer: stale `order` entries must never evict freshly re-inserted keys.
+    let mut dc = DentryCache::new(2);
+    let t1 = DentryTarget { dev: DevId::ROOT, ino: 10 };
+    let t2 = DentryTarget { dev: DevId::ROOT, ino: 20 };
+    let t3 = DentryTarget { dev: DevId::ROOT, ino: 30 };
+    let t4 = DentryTarget { dev: DevId::ROOT, ino: 40 };
+
+    dc.insert(DevId::ROOT, 1, "a", t1);
+    dc.insert(DevId::ROOT, 1, "b", t2);
+    dc.invalidate(DevId::ROOT, 1, "a");
+    dc.insert(DevId::ROOT, 1, "a", t3);
+    // In-place update preserves generation without growing `order`.
+    let t3_updated = DentryTarget { dev: DevId::ROOT, ino: 31 };
+    dc.insert(DevId::ROOT, 1, "a", t3_updated);
+    dc.insert(DevId::ROOT, 1, "c", t4);
+
+    assert_eq!(dc.get(DevId::ROOT, 1, "a"), Some(t3_updated));
+    assert_eq!(dc.get(DevId::ROOT, 1, "b"), None);
+    assert_eq!(dc.get(DevId::ROOT, 1, "c"), Some(t4));
+
+    // Repeated create+invalidate churn below `max_entries` must keep `order` strictly bounded.
+    let mut churn = DentryCache::new(8);
+    for i in 0..5_000u64 {
+        let name = format!("tmp_{i}");
+        churn.insert(DevId::ROOT, 1, &name, DentryTarget { dev: DevId::ROOT, ino: i + 100 });
+        churn.invalidate(DevId::ROOT, 1, &name);
+        assert!(churn.order_len() <= 16, "order_len leaked to {}", churn.order_len());
+    }
+    assert_eq!(churn.len(), 0);
+
+    // `invalidate_dir` and `invalidate_fs` + re-insertion also avoid premature eviction.
+    let mut dc2 = DentryCache::new(2);
+    dc2.insert(DevId::ROOT, 1, "x", t1);
+    dc2.insert(DevId::ROOT, 2, "y", t2);
+    dc2.invalidate_dir(DevId::ROOT, 1);
+    dc2.insert(DevId::ROOT, 1, "x", t3);
+    dc2.insert(DevId::ROOT, 3, "z", t4);
+    assert_eq!(dc2.get(DevId::ROOT, 1, "x"), Some(t3));
+    assert_eq!(dc2.get(DevId::ROOT, 2, "y"), None);
+    assert_eq!(dc2.get(DevId::ROOT, 3, "z"), Some(t4));
+
+    dc2.invalidate_fs(DevId::ROOT);
+    assert_eq!(dc2.len(), 0);
+}
+
+#[test]
+fn open_creat_dangling_symlinks_and_existing_dir_edges() {
+    let (env, _) = setup_vfs();
+    mkdir_at(&env, None, b"/sub", 0o755, 0).unwrap();
+    let existing_dir = mkdir_at(&env, None, b"/existing_dir", 0o755, 0).unwrap();
+    let (existing_file, _) =
+        open_inode(&env, None, b"/sub/existing_file", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    existing_file.write_at(0, b"old-data").unwrap();
+
+    // 1. Single dangling symlink without O_EXCL creates target.
+    symlink_at(&env, b"/new_via_sym", None, b"/dangling").unwrap();
+    let (created, _) =
+        open_inode(&env, None, b"/dangling", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    created.write_at(0, b"via-sym").unwrap();
+    let resolved_target = resolve_path(&env, None, b"/new_via_sym", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(resolved_target.ino(), created.ino());
+
+    // 2. Relative dangling symlink resolves relative to symlink's parent `/sub`, not `/`.
+    symlink_at(&env, b"rel_created", None, b"/sub/rel_dangling").unwrap();
+    let (rel_created, _) =
+        open_inode(&env, None, b"/sub/rel_dangling", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    assert_eq!(
+        resolve_path(&env, None, b"/sub/rel_created", ResolveFlags::default()).unwrap().inode.ino(),
+        rel_created.ino()
+    );
+    assert_eq!(resolve_path(&env, None, b"/rel_created", ResolveFlags::default()).unwrap_err(), VfsError::NoEnt);
+
+    // 3. Chained dangling symlinks across directories.
+    symlink_at(&env, b"sub/s2", None, b"/s1").unwrap();
+    symlink_at(&env, b"../chain_final", None, b"/sub/s2").unwrap();
+    let (chain_final, _) =
+        open_inode(&env, None, b"/s1", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    assert_eq!(
+        resolve_path(&env, None, b"/chain_final", ResolveFlags::default()).unwrap().inode.ino(),
+        chain_final.ino()
+    );
+
+    // 4. Symlink to existing file with O_CREAT | O_RDWR | O_TRUNC opens & truncates.
+    symlink_at(&env, b"/sub/existing_file", None, b"/sym_existing").unwrap();
+    let (opened_existing, _) = open_inode(
+        &env,
+        None,
+        b"/sym_existing",
+        OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR | OpenFlags::O_TRUNC),
+        0o644,
+        0,
+    )
+    .unwrap();
+    assert_eq!(opened_existing.ino(), existing_file.ino());
+    assert_eq!(opened_existing.stat().unwrap().size, 0);
+
+    // 5. Symlink depth 40 succeeds, 41 returns ELOOP under O_CREAT.
+    mkdir_at(&env, None, b"/c", 0o755, 0).unwrap();
+    symlink_at(&env, b"final_target", None, b"/c/l1").unwrap();
+    for i in 2..=41 {
+        let tgt = format!("l{}", i - 1);
+        let name = format!("/c/l{i}");
+        symlink_at(&env, tgt.as_bytes(), None, name.as_bytes()).unwrap();
+    }
+    assert_eq!(
+        open_inode(&env, None, b"/c/l41", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap_err(),
+        VfsError::Loop
+    );
+    let (l40_file, _) =
+        open_inode(&env, None, b"/c/l40", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    assert_eq!(
+        resolve_path(&env, None, b"/c/final_target", ResolveFlags::default()).unwrap().inode.ino(),
+        l40_file.ino()
+    );
+
+    // 6. Dangling symlink target ending in `/` -> EISDIR; target ending in `/` pointing to file -> ENOTDIR.
+    symlink_at(&env, b"/sub/missing_dir/", None, b"/sym_missing_slash").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/sym_missing_slash", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap_err(),
+        VfsError::IsDir
+    );
+    symlink_at(&env, b"/sub/existing_file/", None, b"/sym_file_slash").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/sym_file_slash", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap_err(),
+        VfsError::NotDir
+    );
+
+    // 7. O_CREAT | O_EXCL on dangling symlink -> EEXIST; O_CREAT | O_NOFOLLOW -> ELOOP; O_PATH | O_CREAT | O_NOFOLLOW -> symlink fd.
+    symlink_at(&env, b"/never_created", None, b"/dangling2").unwrap();
+    assert_eq!(
+        open_inode(
+            &env,
+            None,
+            b"/dangling2",
+            OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDWR),
+            0o644,
+            0
+        )
+        .unwrap_err(),
+        VfsError::Exist
+    );
+    assert_eq!(
+        open_inode(
+            &env,
+            None,
+            b"/dangling2",
+            OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_NOFOLLOW | OpenFlags::O_RDWR),
+            0o644,
+            0
+        )
+        .unwrap_err(),
+        VfsError::Loop
+    );
+    let (opath_dangling, _) = open_inode(
+        &env,
+        None,
+        b"/dangling2",
+        OpenFlags(OpenFlags::O_PATH | OpenFlags::O_CREAT | OpenFlags::O_NOFOLLOW),
+        0o644,
+        0,
+    )
+    .unwrap();
+    assert_eq!(opath_dangling.inode_type(), InodeType::Symlink);
+
+    // 8. O_CREAT | O_DIRECTORY on dangling symlink -> ENOTDIR; O_CREAT into ROFS via symlink -> EROFS.
+    assert_eq!(
+        open_inode(
+            &env,
+            None,
+            b"/dangling2",
+            OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_DIRECTORY | OpenFlags::O_RDWR),
+            0o644,
+            0
+        )
+        .unwrap_err(),
+        VfsError::NotDir
+    );
+    let ro_mp = mkdir_at(&env, None, b"/ro", 0o755, 0).unwrap();
+    let ro_fs = MemFs::new(DevId::makedev(0, 70), "rofs", true);
+    env.mount(ro_mp, "/ro", ro_fs).unwrap();
+    symlink_at(&env, b"/ro/newfile", None, b"/sym_to_ro").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/sym_to_ro", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap_err(),
+        VfsError::RoFs
+    );
+
+    // 9. O_CREAT | O_RDONLY on existing dir, `/.`, and symlink-to-dir -> EISDIR; with O_EXCL -> EEXIST.
+    symlink_at(&env, b"/existing_dir", None, b"/sym_to_existing_dir").unwrap();
+    assert_eq!(
+        open_inode(&env, None, b"/existing_dir", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::IsDir
+    );
+    assert_eq!(
+        open_inode(&env, Some(&existing_dir), b".", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::IsDir
+    );
+    assert_eq!(
+        open_inode(&env, None, b"/sym_to_existing_dir", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap_err(),
+        VfsError::IsDir
+    );
+    assert_eq!(
+        open_inode(
+            &env,
+            None,
+            b"/existing_dir",
+            OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDONLY),
+            0o644,
+            0
+        )
+        .unwrap_err(),
+        VfsError::Exist
+    );
+
+    // 10. Stacked mounts: `open("/mnt", O_RDONLY)` crosses all layers; `open("/mnt", O_CREAT | O_RDONLY)` returns EISDIR.
+    let mnt = mkdir_at(&env, None, b"/mnt", 0o755, 0).unwrap();
+    let fs2 = MemFs::new(DevId::TMPFS, "tmpfs2", false);
+    let fs3 = MemFs::new(DevId::makedev(0, 77), "tmpfs3", false);
+    env.mount(mnt, "/mnt", fs2.clone()).unwrap();
+    env.mount(fs2.root_inode(), "/mnt", fs3.clone()).unwrap();
+    let (opened_mnt, _) = open_inode(&env, None, b"/mnt", OpenFlags(OpenFlags::O_RDONLY), 0, 0).unwrap();
+    assert_eq!(opened_mnt.dev_id(), fs3.dev_id());
+    assert_eq!(
+        open_inode(&env, None, b"/mnt", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0).unwrap_err(),
+        VfsError::IsDir
+    );
+}
+
+#[test]
+fn symlink_at_trailing_slash_preserves_intermediate_enotdir() {
+    let (env, _) = setup_vfs();
+    open_inode(&env, None, b"/existing_file", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+
+    assert_eq!(symlink_at(&env, b"t", None, b"/existing_file/sub/").unwrap_err(), VfsError::NotDir);
+    assert_eq!(symlink_at(&env, b"t", None, b"/missing/sub/").unwrap_err(), VfsError::NoEnt);
+    assert_eq!(symlink_at(&env, b"t", None, b"/existing_file/").unwrap_err(), VfsError::Exist);
+    assert_eq!(symlink_at(&env, b"t", None, b"/nonexistent/").unwrap_err(), VfsError::NoEnt);
+}
+
+#[test]
+fn post_mutation_dentry_invalidation_and_fd_ref_sync() {
+    struct SpyEnv {
+        inner: SimpleVfsTables,
+        invalidations: AtomicU32,
+        dir_invalidations: AtomicU32,
+    }
+
+    impl SpyEnv {
+        fn new(root: Arc<MemFs>) -> Self {
+            let inner = SimpleVfsTables::new();
+            inner.mount_root(root).unwrap();
+            Self { inner, invalidations: AtomicU32::new(0), dir_invalidations: AtomicU32::new(0) }
+        }
+        fn take_counts(&self) -> (u32, u32) {
+            (self.invalidations.swap(0, Ordering::AcqRel), self.dir_invalidations.swap(0, Ordering::AcqRel))
+        }
+    }
+
+    impl VfsCacheOps for SpyEnv {
+        fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.root_inode()
+        }
+        fn is_global_root(&self, dev: DevId, ino: Ino) -> bool {
+            self.inner.is_global_root(dev, ino)
+        }
+        fn mount_at(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn FileSystem>> {
+            self.inner.mount_at(dev, ino)
+        }
+        fn parent_mount(&self, mounted_dev: DevId) -> Option<Arc<dyn VfsInode>> {
+            self.inner.parent_mount(mounted_dev)
+        }
+        fn parent_mount_if_root(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
+            self.inner.parent_mount_if_root(dev, ino)
+        }
+        fn is_mountpoint(&self, dev: DevId, ino: Ino) -> bool {
+            self.inner.is_mountpoint(dev, ino)
+        }
+        fn fs_read_only(&self, dev: DevId) -> bool {
+            self.inner.fs_read_only(dev)
+        }
+        fn fs_by_dev(&self, dev: DevId) -> Option<Arc<dyn FileSystem>> {
+            self.inner.fs_by_dev(dev)
+        }
+        fn dentry_get(&self, pdev: DevId, pino: Ino, name: &str) -> Option<DentryTarget> {
+            self.inner.dentry_get(pdev, pino, name)
+        }
+        fn dentry_insert(&self, pdev: DevId, pino: Ino, name: &str, target: DentryTarget) {
+            self.inner.dentry_insert(pdev, pino, name, target)
+        }
+        fn dentry_invalidate(&self, pdev: DevId, pino: Ino, name: &str) {
+            self.invalidations.fetch_add(1, Ordering::AcqRel);
+            self.inner.dentry_invalidate(pdev, pino, name);
+        }
+        fn dentry_invalidate_dir(&self, pdev: DevId, pino: Ino) {
+            self.dir_invalidations.fetch_add(1, Ordering::AcqRel);
+            self.inner.dentry_invalidate_dir(pdev, pino);
+        }
+        fn inode_get(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
+            self.inner.inode_get(dev, ino)
+        }
+        fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
+            self.inner.inode_get_or_insert(inode)
+        }
+        fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
+            self.inner.inode_remove(dev, ino)
+        }
+    }
+
+    let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
+    let spy = SpyEnv::new(root_fs);
+
+    let (file, _) =
+        open_inode(&spy, None, b"/f1", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    mkdir_at(&spy, None, b"/d1", 0o755, 0).unwrap();
+    mkdir_at(&spy, None, b"/d2", 0o755, 0).unwrap();
+    let _ = spy.take_counts();
+
+    // unlink invokes both pre- and post-mutation `dentry_invalidate` (2 calls).
+    unlink_at(&spy, None, b"/f1", false).unwrap();
+    assert_eq!(spy.take_counts(), (2, 0));
+
+    // rmdir invokes both pre- and post-mutation `dentry_invalidate` and `dentry_invalidate_dir` (2, 2).
+    unlink_at(&spy, None, b"/d1", true).unwrap();
+    assert_eq!(spy.take_counts(), (2, 2));
+
+    // non-EXCHANGE rename over existing dir invokes pre- and post-mutation invalidation on both paths and overwritten dir (4, 2).
+    mkdir_at(&spy, None, b"/d1", 0o755, 0).unwrap();
+    let _ = spy.take_counts();
+    rename_at2(&spy, None, b"/d1", None, b"/d2", RenameFlags(0)).unwrap();
+    assert_eq!(spy.take_counts(), (4, 2));
+
+    // `OpenFile::dec_fd_ref` AcqRel reference counting transitions cleanly to 0.
+    let of = OpenFile::<StdLock<u64>>::new(file, Arc::from("/f1"), OpenFlags(OpenFlags::O_RDWR)).unwrap();
+    of.inc_fd_ref();
+    of.inc_fd_ref();
+    assert_eq!(of.fd_ref_count(), 3);
+    assert_eq!(of.dec_fd_ref(), 2);
+    assert_eq!(of.dec_fd_ref(), 1);
+    assert_eq!(of.dec_fd_ref(), 0);
+}
+
+#[test]
+fn unchallenged_edges_tmpfile_link_empty_path_and_access() {
+    let (env, _) = setup_vfs();
+    let dir = mkdir_at(&env, None, b"/dir", 0o755, 0).unwrap();
+
+    // 1. O_TMPFILE -> EOPNOTSUPP across access modes and flags.
+    for extra in [OpenFlags::O_RDONLY, OpenFlags::O_RDWR, OpenFlags::O_WRONLY | OpenFlags::O_EXCL] {
+        assert_eq!(
+            open_inode(&env, None, b"/dir", OpenFlags(OpenFlags::O_TMPFILE | extra), 0o600, 0).unwrap_err(),
+            VfsError::OpNotSupp
+        );
+    }
+
+    // 2. link_at with `empty_path: true` on live vs unlinked FDs.
+    let (live_file, _) =
+        open_inode(&env, None, b"/dir/live", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let guard = OpenGuard::new(Arc::clone(&live_file));
+    link_at(&env, Some(&live_file), b"", None, b"/dir/hardlink", false, true).unwrap();
+    assert_eq!(live_file.stat().unwrap().nlink, 2);
+
+    // Unlink both links while `guard` keeps inode open & detached; `link_at(..., empty_path: true)` must fail ENOENT.
+    unlink_at(&env, None, b"/dir/live", false).unwrap();
+    unlink_at(&env, None, b"/dir/hardlink", false).unwrap();
+    assert!(live_file.is_detached());
+    assert_eq!(live_file.stat().unwrap().nlink, 0);
+    assert_eq!(
+        link_at(&env, Some(&live_file), b"", None, b"/dir/resurrect", false, true).unwrap_err(),
+        VfsError::NoEnt
+    );
+    drop(guard);
+
+    // 3. check_access uid/gid/mode edges.
+    let (acc_file, _) =
+        open_inode(&env, None, b"/dir/acc", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o077, 0).unwrap();
+    acc_file.set_owner(Some(1000), Some(1000)).unwrap();
+
+    // Invalid mask -> EINVAL.
+    assert_eq!(check_access(&env, &acc_file, AccessMask(1 << 4), 1000, 1000), Err(VfsError::Inval));
+    // F_OK succeeds even with 0000 mode.
+    acc_file.set_mode(0o000).unwrap();
+    assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::F_OK), 2000, 2000), Ok(()));
+    // Owner bits take precedence over group/other even when group/other are 7.
+    acc_file.set_mode(0o077).unwrap();
+    assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::R_OK), 1000, 1000), Err(VfsError::Acces));
+    assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::W_OK), 1000, 2000), Err(VfsError::Acces));
+    assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::X_OK), 1000, 2000), Err(VfsError::Acces));
+    // Group bits take precedence over other bits when uid != owner && gid == file.gid.
+    acc_file.set_mode(0o707).unwrap();
+    assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::R_OK), 2000, 1000), Err(VfsError::Acces));
+    assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::R_OK), 2000, 2000), Ok(()));
+    // Root bypasses R_OK/W_OK on 0000 file and X_OK on 0000 dir, but fails X_OK on 0000 file.
+    acc_file.set_mode(0o000).unwrap();
+    dir.set_mode(0o000).unwrap();
+    assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::R_OK | AccessMask::W_OK), 0, 0), Ok(()));
+    assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::X_OK), 0, 0), Err(VfsError::Acces));
+    assert_eq!(check_access(&env, &dir, AccessMask(AccessMask::X_OK), 0, 0), Ok(()));
+    // ROFS blocks W_OK even for uid == 0 unless exempt.
+    let ro_mp = mkdir_at(&env, None, b"/ro_acc", 0o755, 0).unwrap();
+    let ro_fs = MemFs::new(DevId::DEVFS, "devfs", true);
+    let ro_reg = MemInode::new_char_dev(
+        DevId::DEVFS,
+        99,
+        0o666,
+        DevId::makedev(1, 3),
+        false,
+        Arc::clone(&ro_fs.registry),
+        Arc::clone(&ro_fs.next_ino),
+    );
+    ro_fs.root.inner.lock().unwrap().children.insert(String::from("non_exempt"), ro_reg);
+    let ro_exempt: Arc<dyn VfsInode> = ro_fs.add_char_device(&ro_fs.root, "exempt", 0o666, DevId::makedev(1, 3), true);
+    env.mount(ro_mp, "/ro_acc", ro_fs).unwrap();
+    let non_exempt = resolve_path(&env, None, b"/ro_acc/non_exempt", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(check_access(&env, &non_exempt, AccessMask(AccessMask::F_OK), 0, 0), Ok(()));
+    assert_eq!(check_access(&env, &non_exempt, AccessMask(AccessMask::W_OK), 0, 0), Err(VfsError::RoFs));
+    assert_eq!(check_access(&env, &ro_exempt, AccessMask(AccessMask::W_OK), 0, 0), Ok(()));
+}

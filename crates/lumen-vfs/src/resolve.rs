@@ -63,9 +63,9 @@ impl fmt::Debug for ParentTarget {
 }
 
 /// Cross downward through any stacked mounts at `cur`.
-fn cross_mounts_down(env: &dyn VfsCacheOps, mut cur: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
+pub(crate) fn cross_mounts_down(env: &dyn VfsCacheOps, mut cur: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
     while let Some(fs) = env.mount_at(cur.dev_id(), cur.ino()) {
-        let next = fs.root_inode();
+        let next = env.inode_get_or_insert(fs.root_inode());
         if next.dev_id() == cur.dev_id() && next.ino() == cur.ino() {
             break;
         }
@@ -119,6 +119,17 @@ pub fn resolve_path(
     path: &[u8],
     flags: ResolveFlags,
 ) -> Result<ResolvedPath, VfsError> {
+    let mut symlink_depth = 0usize;
+    resolve_path_with_depth(env, start_dir, path, flags, &mut symlink_depth)
+}
+
+pub(crate) fn resolve_path_with_depth(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    flags: ResolveFlags,
+    symlink_depth: &mut usize,
+) -> Result<ResolvedPath, VfsError> {
     if path.len() >= PATH_MAX {
         return Err(VfsError::NameTooLong);
     }
@@ -132,7 +143,7 @@ pub fn resolve_path(
         }
         let target = match start_dir {
             Some(d) => Arc::clone(d),
-            None => env.root_inode()?,
+            None => cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?)),
         };
         if flags.require_dir && target.inode_type() != InodeType::Dir {
             return Err(VfsError::NotDir);
@@ -142,17 +153,16 @@ pub fn resolve_path(
 
     let mut has_trailing_slash = path.ends_with(b"/");
     let mut cur = if path.starts_with(b"/") {
-        cross_mounts_down(env, env.root_inode()?)
+        cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?))
     } else {
         match start_dir {
             Some(d) => Arc::clone(d),
-            None => cross_mounts_down(env, env.root_inode()?),
+            None => cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?)),
         }
     };
 
     let mut rest_buf: Vec<u8> = path.to_vec();
     let mut cursor = 0usize;
-    let mut symlink_depth = 0usize;
 
     loop {
         while cursor < rest_buf.len() && rest_buf[cursor] == b'/' {
@@ -189,8 +199,9 @@ pub fn resolve_path(
         if comp == b".." {
             cur = cross_mounts_up(env, cur);
             if !env.is_global_root(cur.dev_id(), cur.ino()) {
-                cur = cur.lookup("..")?;
+                cur = env.inode_get_or_insert(cur.lookup("..")?);
             }
+            cur = cross_mounts_down(env, cur);
             cursor = tail_start;
             continue;
         }
@@ -202,13 +213,13 @@ pub fn resolve_path(
             child.inode_type() == InodeType::Symlink && (!is_last || flags.follow_final || trailing_after_comp);
 
         if should_follow {
-            symlink_depth += 1;
-            if symlink_depth > MAX_SYMLINK_DEPTH {
+            *symlink_depth += 1;
+            if *symlink_depth > MAX_SYMLINK_DEPTH {
                 return Err(VfsError::Loop);
             }
 
             if let Some(magic_target) = child.resolve_magic_link() {
-                cur = cross_mounts_down(env, magic_target);
+                cur = cross_mounts_down(env, env.inode_get_or_insert(magic_target));
                 cursor = tail_start;
                 continue;
             }
@@ -231,7 +242,7 @@ pub fn resolve_path(
             has_trailing_slash = next_buf.ends_with(b"/");
 
             if target.starts_with(b"/") {
-                cur = cross_mounts_down(env, env.root_inode()?);
+                cur = cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?));
             }
             rest_buf = next_buf;
             cursor = 0;
@@ -259,6 +270,16 @@ pub fn resolve_parent(
     start_dir: Option<&Arc<dyn VfsInode>>,
     path: &[u8],
 ) -> Result<ParentTarget, VfsError> {
+    let mut symlink_depth = 0usize;
+    resolve_parent_with_depth(env, start_dir, path, &mut symlink_depth)
+}
+
+pub(crate) fn resolve_parent_with_depth(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    symlink_depth: &mut usize,
+) -> Result<ParentTarget, VfsError> {
     if path.len() >= PATH_MAX {
         return Err(VfsError::NameTooLong);
     }
@@ -275,7 +296,7 @@ pub fn resolve_parent(
         trimmed_end -= 1;
     }
     if trimmed_end == 0 {
-        let root = cross_mounts_down(env, env.root_inode()?);
+        let root = cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?));
         return Ok(ParentTarget { parent: root, name: String::from("/"), has_trailing_slash: true });
     }
 
@@ -283,18 +304,19 @@ pub fn resolve_parent(
     let (parent, name_bytes) = match trimmed.iter().rposition(|&b| b == b'/') {
         Some(pos) => {
             let dir_part = if pos == 0 { b"/" as &[u8] } else { &trimmed[..pos] };
-            let resolved = resolve_path(
+            let resolved = resolve_path_with_depth(
                 env,
                 start_dir,
                 dir_part,
                 ResolveFlags { follow_final: true, empty_path: false, require_dir: true },
+                symlink_depth,
             )?;
             (resolved.inode, &trimmed[pos + 1..])
         }
         None => {
             let dir = match start_dir {
                 Some(d) => Arc::clone(d),
-                None => cross_mounts_down(env, env.root_inode()?),
+                None => cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?)),
             };
             if dir.inode_type() != InodeType::Dir {
                 return Err(VfsError::NotDir);
@@ -337,7 +359,7 @@ pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Resul
 
         let cur_dev = cur.dev_id();
         let cur_ino = cur.ino();
-        let parent = cur.lookup("..")?;
+        let parent = env.inode_get_or_insert(cur.lookup("..")?);
         if parent.dev_id() == cur_dev && parent.ino() == cur_ino {
             return Err(VfsError::NoEnt);
         }
