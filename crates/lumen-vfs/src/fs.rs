@@ -76,6 +76,31 @@ pub trait VfsInode: Send + Sync {
         false
     }
 
+    /// False for an inode whose existence the VFS can't hold on to, so it
+    /// must never enter `DentryCache` or `InodeCache` (e.g. `procfs`'s
+    /// `/proc/<pid>` and everything under it, which go when the process or
+    /// its fd does). A lookup of such a name always asks the filesystem
+    /// again.
+    ///
+    /// A non-cacheable directory's children must be non-cacheable too: a
+    /// dentry is keyed by its parent's `(dev, ino)`, so a cached child's
+    /// dentry would outlive its parent, one per parent for good. A
+    /// `debug_assert!` in the resolver checks it on a plain lookup (the
+    /// kernel's builds keep debug assertions on); `open(O_CREAT)` of an
+    /// existing name and a created inode's re-publish don't check.
+    ///
+    /// The tables never refuse a mounted non-cacheable inode as stale (the
+    /// `Err` a cache generation's change gives), so the VFS's race retries,
+    /// which look a name up again when an unlink or eviction raced its
+    /// caching, never run for it: a writable filesystem with non-cacheable
+    /// inodes must not rely on them.
+    ///
+    /// Called under Lock 9: must not lock or block, and answers from fixed
+    /// state (never changing for one inode).
+    fn cacheable(&self) -> bool {
+        true
+    }
+
     /// Magic symlink target override (e.g. `/proc/<pid>/fd/*` and `/proc/<pid>/exe`).
     /// When `Some`, path traversal jumps directly to the returned inode while
     /// `readlink()` continues to return the textual symlink path.

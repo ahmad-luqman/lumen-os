@@ -59,3 +59,11 @@ tests = [
     "scenario:test_fs::test_ext4_readonly_device_mounts_ro",
     "scenario:test_blk::test_read_write_sectors",
 ]
+
+[[feature]]
+name = "procfs's per-process nodes (/proc/<pid> and everything under it, /proc/self) are never cached: /proc/<pid> is ENOENT once its process ends, /proc/<pid>/fd/N once its fd closes, and the dentry and inode caches stay flat over many short processes"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::procfs::procfs_per_process_nodes_are_never_cached",
+    "cargo:lumen-vfs",
+]

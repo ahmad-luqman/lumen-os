@@ -134,6 +134,13 @@ impl KernelVfsTables {
         self.inodes.lock().snapshot_all()
     }
 
+    /// How many names `DentryCache` holds (procfs's ktest: flat over many
+    /// short processes, #263).
+    #[cfg(feature = "ktest")]
+    pub fn dentry_count(&self) -> usize {
+        self.dentries.lock().len()
+    }
+
     pub fn list_mounts(&self) -> Vec<MountInfo> {
         self.mounts.lock().list_mounts()
     }
@@ -212,6 +219,9 @@ impl VfsCacheOps for KernelVfsTables {
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
         }
+        if !inode.cacheable() {
+            return Ok(inode);
+        }
         let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
         if !mounts.is_mountpoint(parent_dev, parent_ino) {
             let _ = dentries.insert_if_gen(
@@ -239,6 +249,9 @@ impl VfsCacheOps for KernelVfsTables {
         let mut inodes = self.inodes.lock();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
+        }
+        if !inode.cacheable() {
+            return Ok(inode);
         }
         let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
         let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
@@ -303,6 +316,9 @@ impl VfsCacheOps for KernelVfsTables {
     }
 
     fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
+        if !inode.cacheable() {
+            return inode;
+        }
         self.inodes.lock().get_or_insert(inode)
     }
 
@@ -318,6 +334,9 @@ impl VfsCacheOps for KernelVfsTables {
         if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
             return None;
         }
+        if !inode.cacheable() {
+            return Some(inode);
+        }
         Some(inodes.get_or_insert(inode))
     }
 
@@ -330,6 +349,9 @@ impl VfsCacheOps for KernelVfsTables {
         let mut inodes = self.inodes.lock();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
+        }
+        if !inode.cacheable() {
+            return Ok(inode);
         }
         inodes.get_or_insert_if_fresh(inode, since_gen)
     }
@@ -977,8 +999,9 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         process::unregister_current_vfs_fd(3);
         let fd_link_after_close = proc_nodes.as_ref().map(|(_, fd)| fd.stat().err());
         let proc_state = process::take_current();
-        // The VFS caches these entries (#263); procfs itself must still say
-        // they are gone.
+        // These nodes were resolved while the process lived and are still
+        // held (the VFS no longer caches them, #263), so procfs's `stat` must
+        // say they are gone.
         let pid_dir_after_exit = proc_nodes.as_ref().map(|(dir, _)| dir.stat().err());
         drop(proc_nodes);
         let out = checks.and_then(|summary| {
