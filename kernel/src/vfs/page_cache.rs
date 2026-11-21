@@ -384,6 +384,12 @@ impl PageCache {
         count
     }
 
+    /// How many cached pages are dirty (written, or mapped writable, and not
+    /// yet written back).
+    pub fn dirty_count(&self) -> usize {
+        self.pages.values().filter(|p| p.is_dirty()).count()
+    }
+
     /// Collect `(page_index, Arc<CachePage>)` in ascending order for all dirty pages.
     pub fn collect_dirty(&self) -> Vec<(u64, Arc<CachePage>)> {
         self.pages.iter().filter(|(_, p)| p.is_dirty()).map(|(&idx, p)| (idx, Arc::clone(p))).collect()

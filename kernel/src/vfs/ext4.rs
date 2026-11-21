@@ -1929,8 +1929,14 @@ impl VfsInode for Ext4Inode {
 
     fn stat(&self) -> Result<Metadata, VfsError> {
         let meta = self.meta.lock();
-        let blocks = if meta.meta_dirty && self.inode_type == InodeType::File {
-            meta.blocks_512.max(meta.size.div_ceil(512))
+        // Blocks are allocated only at writeback, so until then the disk's
+        // count lags what was written. Dirty pages stand in for the data
+        // still to be allocated (each 8 sectors): never holes, which a
+        // size-based guess would count for a sparse file, and never more
+        // than was written. Lock 4 (meta) then Lock 5 (pages), in order.
+        let blocks = if self.inode_type == InodeType::File {
+            let dirty = self.pages.lock().dirty_count() as u64;
+            meta.blocks_512.max(dirty * (PAGE_SIZE as u64 / 512))
         } else {
             meta.blocks_512
         };
@@ -4221,6 +4227,30 @@ crate::ktest!(
         }
         let ro_d = ro.root_inode().lookup("d").map_err(|_| "ro lookup d")?;
         kassert_eq!(read_all(&ro_d.lookup(&own).map_err(|_| "ro lookup own")?)?, b"bee".to_vec());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_st_blocks_counts_written_data_not_holes() {
+        // `st_blocks` is allocated storage. Extending a file leaves a hole,
+        // which counts nothing before writeback or after; written but not
+        // yet written-back pages count as the blocks they will take.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image(), 207)?;
+        let f = m.root.create("sparse", 0o644).map_err(|_| "create")?;
+        let blocks = |f: &Arc<dyn VfsInode>| f.stat().map(|s| s.blocks).map_err(|_| "stat");
+        f.truncate(1 << 30).map_err(|_| "truncate")?;
+        kassert_eq!(blocks(&f)?, 0);
+        f.write_at(0, b"x").map_err(|_| "write")?;
+        kassert_eq!(blocks(&f)?, (PAGE_SIZE / 512) as u64);
+        f.sync(false).map_err(|_| "sync")?;
+        let after = blocks(&f)?;
+        kassert!(after > 0 && after <= 64);
+        let ro = remount_ro(&m, 208)?;
+        let ro_blocks = ro.root_inode().lookup("sparse").map_err(|_| "ro")?.stat().map_err(|_| "ro stat")?.blocks;
+        kassert_eq!(after, ro_blocks);
         Ok(())
     }
 );
