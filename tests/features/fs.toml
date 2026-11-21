@@ -16,12 +16,12 @@ tests = [
 ]
 
 [[feature]]
-name = "Unified 4 KiB frame-backed PageCache with write-back, global soft 32 MiB reclaim, and truncate tail zeroing"
+name = "Unified 4 KiB frame-backed PageCache with write-back, soft 32 MiB reclaim and a 64 MiB hard cap for ext4, quota accounting, and truncate tail zeroing"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4_adapter_pagecache_quirks_and_open_unlinked",
     "ktest:lumen_kernel::vfs::page_cache_global_reclaim_writes_back_and_evicts",
-    "ktest:lumen_kernel::vfs::*page_cache_soft_limit_triggers_reclaim",
+    "ktest:lumen_kernel::vfs::page_cache::*",
     "ktest:lumen_kernel::vfs::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
     "ktest:lumen_kernel::vfs::ext4_truncate_and_open_unlink_preserve_state_on_io_error",
     "ktest:lumen_kernel::vfs::ext4_partial_phase2_io_error_recovery",
@@ -56,4 +56,5 @@ tests = [
     "scenario:test_fs::test_unmountable_ext4_disk_warns_and_falls_back",
     "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
     "scenario:test_fs::test_ext4_readonly_device_mounts_ro",
+    "scenario:test_blk::test_read_write_sectors",
 ]

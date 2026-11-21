@@ -145,7 +145,8 @@ def test_ext4_readonly_device_mounts_ro(boot, tmp_path):
 
 
 def test_dev_tmp_proc_filesystems(boot):
-    # Boot without a disk: silently falls back to tmpfs root (0:1) + /tmp, /dev, /proc.
+    # Boot without a disk: falls back to a tmpfs root (0:1), with no warning,
+    # plus /tmp, /dev, /proc.
     m = shell(boot, devices=Devices(rng=True))
     assert_quiet_boot(m.output)
 

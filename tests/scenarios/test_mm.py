@@ -169,8 +169,8 @@ def test_heap_command_reports_usage(boot):
     # boot mounts (`/`, `/tmp`, `/dev` + 6 char nodes, `/proc`, and the
     # mount/inode tables), and the shells (their editors and histories, the
     # screen shells' threads and the keyboard's wait queue they block in) is
-    # in use (91 allocations, measured on #261; the ceiling leaves 9 for
-    # growth); the rest of what the heap mapped is free.
+    # in use (91 allocations when the VFS mounts arrived; the ceiling leaves
+    # 9 for growth); the rest of what the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
