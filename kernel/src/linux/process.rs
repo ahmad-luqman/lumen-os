@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::keyboard::Key as KbdKey;
+use crate::keyboard::{Key as KbdKey, KeyCode};
 use crate::klog;
 use crate::linux::general;
 use crate::sched;
@@ -325,6 +325,37 @@ fn write_vt_utf8(vt: usize, bytes: &[u8]) {
     });
 }
 
+/// Translate a framebuffer VT keyboard event into VT100/UTF-8 input bytes
+/// (up to 4 bytes). Returns `0` for keys that emit no terminal bytes (such as
+/// bare modifiers or unhandled function keys).
+fn vt_key_to_bytes(key: KbdKey, out: &mut [u8; 4]) -> usize {
+    match key {
+        KbdKey::Char(ch) => {
+            let mapped = if ch == '\r' { '\n' } else { ch };
+            let bytes = mapped.encode_utf8(out).as_bytes();
+            bytes.len()
+        }
+        KbdKey::Raw { code, .. } => {
+            let seq: &[u8] = match code {
+                KeyCode::ArrowUp => b"\x1b[A",
+                KeyCode::ArrowDown => b"\x1b[B",
+                KeyCode::ArrowRight => b"\x1b[C",
+                KeyCode::ArrowLeft => b"\x1b[D",
+                KeyCode::Home => b"\x1b[H",
+                KeyCode::End => b"\x1b[F",
+                KeyCode::Delete => b"\x1b[3~",
+                KeyCode::Insert => b"\x1b[2~",
+                KeyCode::PageUp => b"\x1b[5~",
+                KeyCode::PageDown => b"\x1b[6~",
+                KeyCode::Escape => b"\x1b",
+                _ => return 0,
+            };
+            out[..seq.len()].copy_from_slice(seq);
+            seq.len()
+        }
+    }
+}
+
 /// Whether stdin currently has data available without blocking (or EOF in capture mode).
 pub fn stdin_ready(io: ConsoleIo) -> bool {
     match io {
@@ -335,11 +366,10 @@ pub fn stdin_ready(io: ConsoleIo) -> bool {
                 return true;
             }
             while let Some(key) = crate::vt::read_key(vt) {
-                if let KbdKey::Char(ch) = key {
-                    let mapped = if ch == '\r' { '\n' } else { ch };
-                    let mut enc = [0u8; 4];
-                    let bytes = mapped.encode_utf8(&mut enc).as_bytes();
-                    with_current_mut(|p| p.push_unread_bytes(bytes));
+                let mut enc = [0u8; 4];
+                let n = vt_key_to_bytes(key, &mut enc);
+                if n > 0 {
+                    with_current_mut(|p| p.push_unread_bytes(&enc[..n]));
                     return true;
                 }
             }
@@ -441,7 +471,13 @@ fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
         dst[0] = first;
         let mut n = 1;
         while n < dst.len() {
-            let Some(b) = with_current_mut(ProcessState::pop_unread) else {
+            let next = with_current_mut(|proc| {
+                if proc.has_unread() && proc.unread[proc.unread_pos as usize] == 0x04 {
+                    return None;
+                }
+                proc.pop_unread()
+            });
+            let Some(b) = next else {
                 break;
             };
             dst[n] = b;
@@ -450,19 +486,20 @@ fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
         return n;
     }
     loop {
-        if let KbdKey::Char(ch) = crate::vt::wait_key(vt) {
-            if ch == '\u{04}' {
-                return 0;
-            }
-            let mapped = if ch == '\r' { '\n' } else { ch };
-            let mut enc = [0u8; 4];
-            let bytes = mapped.encode_utf8(&mut enc).as_bytes();
-            let n = bytes.len().min(dst.len());
-            dst[..n].copy_from_slice(&bytes[..n]);
-            if n < bytes.len() {
-                with_current_mut(|proc| proc.push_unread_bytes(&bytes[n..]));
-            }
-            return n;
+        let key = crate::vt::wait_key(vt);
+        let mut enc = [0u8; 4];
+        let len = vt_key_to_bytes(key, &mut enc);
+        if len == 0 {
+            continue;
         }
+        if len == 1 && enc[0] == 0x04 {
+            return 0;
+        }
+        let n = len.min(dst.len());
+        dst[..n].copy_from_slice(&enc[..n]);
+        if n < len {
+            with_current_mut(|proc| proc.push_unread_bytes(&enc[n..len]));
+        }
+        return n;
     }
 }

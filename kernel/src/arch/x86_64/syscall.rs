@@ -4,10 +4,12 @@
 //! See `docs/ARCHITECTURE.md` §6 ("Ring 3 entry, `syscall`/`sysretq`, user
 //! CPU state and safe copies").
 //!
-//! - `IA32_STAR = (0x0010 << 48) | (0x0008 << 32)`:
+//! - `IA32_STAR = ((0x0010 | 3) << 48) | (0x0008 << 32)` (`0x0013_0008_0000_0000`):
 //!   - `syscall` loads `CS = 0x08` (`KERNEL_CODE`), `SS = 0x10` (`KERNEL_DATA`).
-//!   - `sysretq` loads `SS = (0x10 + 8) | 3 = 0x1b` (`USER_DATA`),
-//!     `CS = (0x10 + 16) | 3 = 0x23` (`USER_CODE`).
+//!   - `sysretq` loads `SS = STAR[63:48] + 8 = 0x1b` (`USER_DATA`) and
+//!     `CS = STAR[63:48] + 16 = 0x23` (`USER_CODE`). Note: AMD64 `sysretq`
+//!     preserves `STAR[49:48]` verbatim in `SS.sel` (unlike Intel/QEMU TCG,
+//!     which force RPL=3), so `STAR[49:48]` MUST carry RPL=3 (`0x0013`).
 //! - `IA32_LSTAR = lumen_syscall_entry`.
 //! - `IA32_FMASK = 0x0005_7700` (`TF | IF | DF | IOPL | NT | RF | AC`).
 //! - `IA32_KERNEL_GS_BASE = 0` while in ring 0 (swapped with `&CPUS[cpu]`
@@ -39,7 +41,10 @@ const IA32_FMASK: u32 = 0xc000_0084;
 pub const EFER_SCE: u64 = 1 << 0;
 
 /// `IA32_STAR` value matching Lumen's GDT layout.
-pub const STAR_VALUE: u64 = (0x0010u64 << 48) | (0x0008u64 << 32);
+///
+/// Encodes RPL=3 in `STAR[49:48]` (`0x0010 | 3 = 0x0013`) because AMD64
+/// `sysretq` sets `SS.sel = STAR[63:48] + 8` without forcing `RPL = 3`.
+pub const STAR_VALUE: u64 = ((0x0010u64 | 3) << 48) | (0x0008u64 << 32);
 
 /// `IA32_FMASK` value: clears `TF | IF | DF | IOPL | NT | RF | AC` on `syscall`.
 pub const FMASK_VALUE: u64 = 0x0005_7700;
@@ -60,12 +65,16 @@ pub const CR4_SMAP: u64 = 1 << 21;
 const CPUID7_EBX_SMEP: u32 = 1 << 7;
 const CPUID7_EBX_SMAP: u32 = 1 << 20;
 
-// Pin GDT selectors and PerCpu offsets assumed by the assembly stubs below.
+// Pin GDT selectors, IA32_STAR user-selector arithmetic, and PerCpu offsets
+// assumed by the assembly stubs below.
 const _: () = {
     assert!(KERNEL_CODE == 0x08);
     assert!(KERNEL_DATA == 0x10);
     assert!(USER_DATA == 0x1b);
     assert!(USER_CODE == 0x23);
+    assert!(((STAR_VALUE >> 48) & 3) == 3);
+    assert!(((STAR_VALUE >> 48) + 8) == USER_DATA as u64);
+    assert!(((STAR_VALUE >> 48) + 16) == USER_CODE as u64);
     assert!(percpu::OFFSET_KERNEL_RSP == 8);
     assert!(percpu::OFFSET_USER_RSP_SCRATCH == 16);
     assert!(percpu::OFFSET_USER_EXIT_RSP == 24);

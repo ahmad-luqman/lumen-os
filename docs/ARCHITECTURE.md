@@ -1068,10 +1068,13 @@ weakening crash reporting or `make audit`.
   `ap_main`, once on kernel tables and guarded stack), the kernel enables
   `IA32_EFER.SCE` (bit 0, keeping `NXE` bit 11), keeps `CR4.FSGSBASE = 0`, and
   sets:
-  - `IA32_STAR = (0x0010u64 << 48) | (0x0008u64 << 32)`: `syscall` loads
-    `CS = 0x08` (`KERNEL_CODE`) and `SS = 0x10` (`KERNEL_DATA`); 64-bit
-    `sysretq` loads `SS = (0x10 + 8) | 3 = 0x18 | 3` (`USER_DATA`) and
-    `CS = (0x10 + 16) | 3 = 0x20 | 3` (`USER_CODE`).
+  - `IA32_STAR = ((0x0010u64 | 3) << 48) | (0x0008u64 << 32)`
+    (`0x0013_0008_0000_0000`): `syscall` loads `CS = 0x08` (`KERNEL_CODE`) and
+    `SS = 0x10` (`KERNEL_DATA`); 64-bit `sysretq` loads
+    `SS = STAR[63:48] + 8 = 0x18 | 3` (`USER_DATA`) and
+    `CS = STAR[63:48] + 16 = 0x20 | 3` (`USER_CODE`). Encoding RPL=3 in
+    `STAR[49:48]` is required on AMD64 CPUs, where `sysretq` preserves
+    `STAR[49:48]` verbatim in `SS.sel` instead of forcing RPL=3.
   - `IA32_LSTAR = lumen_syscall_entry`.
   - `IA32_FMASK = 0x0005_7700` (`TF | IF | DF | IOPL | NT | RF | AC`): clears
     interrupts, direction flag, single-step trap, IOPL, nested task, resume
