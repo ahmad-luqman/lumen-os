@@ -28,7 +28,7 @@ use ext4plus::file::{truncate, write_at};
 use ext4plus::inode::{Inode, InodeCreationOptions, InodeFlags, InodeMode};
 use ext4plus::path::PathBuf;
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
-use log::{debug, info};
+use log::{debug, error, info, warn};
 use lumen_bcache::BlockDevice;
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_vfs::{
@@ -416,18 +416,32 @@ pub(crate) fn reclaim_ext4_inode_dirty(inode: &Arc<dyn VfsInode>, max_evict: usi
 
 /// Flush all dirty `PageCache` pages, metadata, mounted filesystems, and
 /// `BlockCache`s to durable storage (`Lock 9 snapshot -> Lock 4 -> 5 -> 6 -> 7 -> 8`).
+///
+/// A failure doesn't stop the rest: every other inode and filesystem is still
+/// flushed, each failure is logged (`dev:ino` or the filesystem), and the
+/// first error is returned.
 pub fn sync_all() -> Result<(), VfsError> {
-    let inodes = TABLES.snapshot_inodes();
-    for inode in inodes {
-        if !inode.is_detached() {
-            inode.sync(false)?;
+    sync_tables(&TABLES)
+}
+
+fn sync_tables(tables: &KernelVfsTables) -> Result<(), VfsError> {
+    let mut first: Option<VfsError> = None;
+    for inode in tables.snapshot_inodes() {
+        if inode.is_detached() {
+            continue;
+        }
+        if let Err(e) = inode.sync(false) {
+            warn!(target: "vfs", "sync: inode {}:{} failed: {e:?}", inode.dev_id(), inode.ino());
+            first.get_or_insert(e);
         }
     }
-    let filesystems = TABLES.snapshot_filesystems();
-    for fs in filesystems {
-        fs.sync()?;
+    for fs in tables.snapshot_filesystems() {
+        if let Err(e) = fs.sync() {
+            warn!(target: "vfs", "sync: {} filesystem {} failed: {e:?}", fs.name(), fs.dev_id());
+            first.get_or_insert(e);
+        }
     }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 fn ensure_mountpoint(
@@ -443,12 +457,25 @@ fn ensure_mountpoint(
     }
 }
 
+/// Whether the bytes at offset 1024 of `cache` carry the ext4 superblock
+/// magic (`Ok(false)` for a blank or foreign disk).
+fn has_ext4_magic(cache: &dyn ext4::BlockCacheBackend) -> Result<bool, lumen_bcache::BlockError> {
+    let mut magic = [0u8; 2];
+    cache.read_at(1024 + 0x38, &mut magic)?;
+    Ok(u16::from_le_bytes(magic) == 0xef53)
+}
+
 /// Initialize the kernel VFS and mount `/`, `/tmp`, `/dev`, and `/proc`.
 ///
 /// Called from `kmain_on_kernel_stack` right after `drivers::probe_all()` and
 /// `rng::init()`. Scans bound `virtio-blk` devices in PCI address order and
-/// mounts the first valid `ext4` volume at `/`; if none is found (including
-/// blank scratch disks in `test_blk`), silently falls back to `tmpfs` at `/`.
+/// mounts the first valid `ext4` volume at `/`; if none is found, falls back
+/// to `tmpfs` at `/`. A disk without the ext4 magic (a blank scratch disk in
+/// `test_blk`) is skipped with only a `debug` line; a disk that has the magic
+/// but can't be read or mounted is a `WARN`, so a lost rootfs is never silent.
+/// Missing `/tmp`, `/dev` and `/proc` directories are created on any writable
+/// root (a writable ext4 disk included); the closing `INFO` line names only
+/// the mounts that succeeded.
 pub fn init() {
     let mut devs = crate::blk::devices();
     devs.sort_by_key(|e| e.dev.addr());
@@ -460,6 +487,17 @@ pub fn init() {
         }
         let hw_ro = entry.dev.info().read_only;
         let cache: Arc<dyn ext4::BlockCacheBackend> = entry.cache;
+        match has_ext4_magic(&*cache) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(target: "vfs", "blk{}: no ext4 superblock", entry.id);
+                continue;
+            }
+            Err(err) => {
+                warn!(target: "vfs", "blk{}: can't read the superblock: {err:?}", entry.id);
+                continue;
+            }
+        }
         match ext4::Ext4FileSystem::mount(cache, DevId::ROOT, hw_ro) {
             Ok(fs) => {
                 EXT4_FILESYSTEMS.lock().push(Arc::clone(&fs));
@@ -467,7 +505,7 @@ pub fn init() {
                 break;
             }
             Err(err) => {
-                debug!(target: "vfs", "blk{}: not ext4 ({err:?})", entry.id);
+                warn!(target: "vfs", "blk{}: has an ext4 superblock but won't mount: {err:?}", entry.id);
             }
         }
     }
@@ -484,7 +522,7 @@ pub fn init() {
     };
 
     if let Err(e) = TABLES.mount_root(Arc::clone(&root_fs)) {
-        debug!(target: "vfs", "mount_root failed: {e:?}");
+        error!(target: "vfs", "can't mount / ({}): {e:?}; no filesystem is mounted", root_fs.name());
         return;
     }
 
@@ -495,29 +533,26 @@ pub fn init() {
     let dev_fs = devfs::Devfs::new(DevId::DEVFS);
     let proc_fs = procfs::Procfs::new(DevId::PROCFS);
 
+    let mut mounted = String::new();
     for (name, path, mode, fs) in [
         ("tmp", "/tmp", 0o1777u16, tmp_fs as Arc<dyn FileSystem>),
         ("dev", "/dev", 0o755u16, dev_fs as Arc<dyn FileSystem>),
         ("proc", "/proc", 0o555u16, proc_fs as Arc<dyn FileSystem>),
     ] {
         match ensure_mountpoint(&root_inode, name, mode, root_ro) {
-            Ok(mp) => {
-                if let Err(e) = TABLES.mount(mp, path, fs) {
-                    debug!(target: "vfs", "mount {path} failed: {e:?}");
+            Ok(mp) => match TABLES.mount(mp, path, fs) {
+                Ok(()) => {
+                    mounted.push(' ');
+                    mounted.push_str(path);
                 }
-            }
-            Err(e) => {
-                debug!(target: "vfs", "mountpoint {path} unavailable: {e:?}");
-            }
+                Err(e) => warn!(target: "vfs", "can't mount {path}: {e:?}"),
+            },
+            Err(e) => warn!(target: "vfs", "no mountpoint for {path}: {e:?}"),
         }
     }
 
-    info!(
-        target: "vfs",
-        "mounted / ({}, {}) + /tmp /dev /proc",
-        root_fs.name(),
-        if root_ro { "ro" } else { "rw" }
-    );
+    let others = if mounted.is_empty() { String::new() } else { format!(" +{mounted}") };
+    info!(target: "vfs", "mounted / ({}, {}){others}", root_fs.name(), if root_ro { "ro" } else { "rw" });
 }
 
 /// Build `mount`'s records table for shell rendering and pipelines.
@@ -570,7 +605,7 @@ pub fn sync_command(ctx: &mut Ctx<'_>, args: &[String]) {
         Ok(()) => {
             let _ = ctx.out.write_str("sync: ok\n");
         }
-        Err(e) => ctx.fail(format_args!("sync: {e:?}")),
+        Err(e) => ctx.fail(format_args!("sync: {e:?} (each failing inode or filesystem is in the log)")),
     }
 }
 
@@ -578,6 +613,11 @@ pub fn sync_command(ctx: &mut Ctx<'_>, args: &[String]) {
 fn parse_octal(s: &str) -> Option<u16> {
     u16::from_str_radix(s, 8).ok()
 }
+
+/// The longest `vfstest write-pattern` buffer: the whole pattern is built on
+/// the heap first, and a length from the shell must not panic the kernel.
+#[cfg_attr(feature = "ktest", allow(dead_code))]
+const WRITE_PATTERN_MAX: usize = 16 << 20;
 
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 fn vfs_pattern_byte(idx: usize) -> u8 {
@@ -598,6 +638,43 @@ fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
         off += n as u64;
     }
     Ok(out)
+}
+
+/// Makes `run_dev_tmp_proc_checks`'s process fail its first check, for the
+/// ktest that it still unregisters the process.
+#[cfg(feature = "ktest")]
+static FAIL_PROC_CHECKS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether `line` has the shape of a `/proc/<pid>/maps` line:
+/// `start-end perms offset major:minor inode`, then `  [heap]`/`  [stack]` or
+/// nothing (no file-backed VMAs yet). Addresses are at least 8 lowercase hex
+/// digits, the offset exactly 8, the device numbers 2 each.
+#[cfg_attr(feature = "ktest", allow(dead_code))]
+fn is_maps_line(line: &str) -> bool {
+    fn hex(s: &str, min: usize, max: usize) -> bool {
+        (min..=max).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+    let (fields, label) = match line.split_once("  ") {
+        Some((f, l)) => (f, Some(l)),
+        None => (line, None),
+    };
+    if !matches!(label, None | Some("[heap]") | Some("[stack]")) {
+        return false;
+    }
+    let parts: Vec<&str> = fields.split(' ').collect();
+    let [range, perms, offset, devno, ino] = parts[..] else {
+        return false;
+    };
+    let range_ok = range.split_once('-').is_some_and(|(a, b)| hex(a, 8, 16) && hex(b, 8, 16));
+    let p = perms.as_bytes();
+    let perms_ok = p.len() == 4
+        && matches!(p[0], b'r' | b'-')
+        && matches!(p[1], b'w' | b'-')
+        && matches!(p[2], b'x' | b'-')
+        && matches!(p[3], b'p' | b's');
+    let dev_ok = devno.split_once(':').is_some_and(|(a, b)| hex(a, 2, 2) && hex(b, 2, 2));
+    let ino_ok = !ino.is_empty() && ino.bytes().all(|b| b.is_ascii_digit());
+    range_ok && perms_ok && hex(offset, 8, 8) && dev_ok && ino_ok
 }
 
 #[cfg_attr(feature = "ktest", allow(dead_code))]
@@ -658,6 +735,24 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         }
         drop(q_f);
         unlink_at(&TABLES, None, b"/tmp/quota.bin", false).map_err(|e| format!("unlink quota.bin: {e:?}"))?;
+
+        // The unlink gave the quota back: a full page fits again.
+        let (after, _) = open_inode(
+            &TABLES,
+            None,
+            b"/tmp/after_quota.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o600,
+            0,
+        )
+        .map_err(|e| format!("open /tmp/after_quota.bin: {e:?}"))?;
+        let wrote = after.write_at(0, &chunk).map_err(|e| format!("write after quota unlink: {e:?}"))?;
+        if wrote != chunk.len() {
+            return Err(format!("write after quota unlink was short: {wrote}"));
+        }
+        drop(after);
+        unlink_at(&TABLES, None, b"/tmp/after_quota.bin", false)
+            .map_err(|e| format!("unlink after_quota.bin: {e:?}"))?;
     }
 
     // 2. /dev namespace ROFS vs char dev exemptions + 6 nodes.
@@ -722,8 +817,22 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         return Err(String::from("/dev/urandom empty read non-zero"));
     }
 
-    // 3. /proc static virtual views (st_size == 0).
-    for path in ["/proc/cpuinfo", "/proc/meminfo", "/proc/mounts", "/proc/version", "/proc/self/mounts"] {
+    // 3. /proc static virtual views (st_size == 0). This kernel thread is no
+    // Linux process, so `/proc/self` dangles and no `/proc/<pid>` is invented.
+    match readlink_at(&TABLES, None, b"/proc/self") {
+        Err(VfsError::NoEnt) => {}
+        other => return Err(format!("/proc/self from a kernel thread: {other:?}, expected NoEnt")),
+    }
+    if process::active_pids().is_empty() {
+        let mut names = Vec::new();
+        resolve_path_from_root("/proc")
+            .and_then(|d| d.readdir(0, &mut names, 64))
+            .map_err(|e| format!("readdir /proc: {e:?}"))?;
+        if names.iter().any(|e| e.name.bytes().all(|b| b.is_ascii_digit())) {
+            return Err(String::from("/proc lists a pid while no process runs"));
+        }
+    }
+    for path in ["/proc/cpuinfo", "/proc/meminfo", "/proc/mounts", "/proc/version"] {
         let inode = resolve_path_from_root(path).map_err(|e| format!("{path}: {e:?}"))?;
         let st = inode.stat().map_err(|e| format!("{path} stat: {e:?}"))?;
         if st.size != 0 {
@@ -765,8 +874,23 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     let res_clone = Arc::clone(&result);
 
     let handle = sched::spawn_user_on(0, "vfstest-proc", space_for_thread, move || {
-        let out = (|| -> Result<String, String> {
-            let pid = process::register_current(ConsoleIo::Capture, false, Vec::new());
+        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new());
+        let checks = (|| -> Result<String, String> {
+            #[cfg(feature = "ktest")]
+            if FAIL_PROC_CHECKS.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(String::from("injected failure"));
+            }
+            // No executable path recorded yet: `exe` has no target.
+            match readlink_at(&TABLES, None, b"/proc/self/exe") {
+                Err(VfsError::NoEnt) => {}
+                other => return Err(format!("/proc/self/exe without a path: {other:?}, expected NoEnt")),
+            }
+            if read_all_inode(&resolve_path_from_root("/proc/self/mounts").map_err(|e| format!("self/mounts: {e:?}"))?)
+                .map_err(|e| format!("read /proc/self/mounts: {e:?}"))?
+                .is_empty()
+            {
+                return Err(String::from("/proc/self/mounts empty"));
+            }
             process::set_current_exe_path("/tmp");
             process::register_current_vfs_fd(3, Arc::clone(&fd_file), String::from("/tmp/proc_fd_test.txt"));
 
@@ -802,7 +926,7 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
             let maps_inode = resolve_path_from_root("/proc/self/maps").map_err(|e| format!("maps: {e:?}"))?;
             let maps_bytes = read_all_inode(&maps_inode).map_err(|e| format!("read maps: {e:?}"))?;
             let maps_str = core::str::from_utf8(&maps_bytes).map_err(|_| String::from("maps utf8"))?;
-            if !maps_str.contains("rw-p 00000000 00:00 0\n") {
+            if !maps_str.contains("rw-p 00000000 00:00 0\n") || !maps_str.lines().all(is_maps_line) {
                 return Err(format!("unexpected maps format:\n{maps_str}"));
             }
 
@@ -812,19 +936,25 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
             tty.write_at(0, b"tty-ok ").map_err(|e| format!("tty write: {e:?}"))?;
             con.write_at(0, b"con-ok").map_err(|e| format!("con write: {e:?}"))?;
 
-            process::unregister_current_vfs_fd(3);
-            let proc_state = process::take_current();
-            if proc_state.stdout != b"tty-ok con-ok" {
-                return Err(format!("console capture mismatch: {:?}", proc_state.stdout));
-            }
-            drop(proc_state);
-            if let Some(detached) = sched::detach_user_space()
-                && Arc::strong_count(&detached) == 1
-            {
-                detached.teardown();
-            }
             Ok(format!("pid={pid} maps_ok tty_ok quota_ok"))
         })();
+        // Always unregister, a failed check included: a `ProcessState` left in
+        // `ACTIVE_PROCS` would stay in `/proc` for good and pin its address space.
+        process::unregister_current_vfs_fd(3);
+        let proc_state = process::take_current();
+        let out = checks.and_then(|summary| {
+            if proc_state.stdout == b"tty-ok con-ok" {
+                Ok(summary)
+            } else {
+                Err(format!("console capture mismatch: {:?}", proc_state.stdout))
+            }
+        });
+        drop(proc_state);
+        if let Some(detached) = sched::detach_user_space()
+            && Arc::strong_count(&detached) == 1
+        {
+            detached.teardown();
+        }
         *res_clone.lock() = Some(out);
     })
     .map_err(|e| format!("spawn_user_on: {e:?}"))?;
@@ -860,8 +990,8 @@ pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
                     };
                     let _ = writeln!(
                         ctx.out,
-                        "dev={} ino={} type={kind} mode={:04o} nlink={} size={} rdev={}",
-                        st.dev, st.ino, st.mode, st.nlink, st.size, st.rdev
+                        "dev={} ino={} type={kind} mode={:04o} nlink={} size={} rdev={} mtime={}.{:09}",
+                        st.dev, st.ino, st.mode, st.nlink, st.size, st.rdev, st.mtime.sec, st.mtime.nsec
                     );
                 }
                 Err(e) => ctx.fail(format_args!("stat: {e:?}")),
@@ -938,6 +1068,9 @@ pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
             let Ok(len) = len_str.parse::<usize>() else {
                 return ctx.fail("usage: vfstest write-pattern <path> <bytes>");
             };
+            if len > WRITE_PATTERN_MAX {
+                return ctx.fail("write-pattern: length exceeds 16 MiB");
+            }
             match open_inode(
                 &TABLES,
                 None,
@@ -1075,7 +1208,7 @@ pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
-// #248 ext4plus smoke check (preserved for tests/features/fs.toml & make audit)
+// #248 ext4plus smoke check (`ext4_crate_smoke`)
 // ---------------------------------------------------------------------------
 
 const BLOCK_SIZE: usize = 4096;
@@ -1665,9 +1798,84 @@ crate::ktest!(
         kassert!(mounts.iter().any(|m| m.mount_path == "/dev" && m.dev_id == DevId::DEVFS && m.read_only));
         kassert!(mounts.iter().any(|m| m.mount_path == "/proc" && m.dev_id == DevId::PROCFS && m.read_only));
 
-        let summary = run_dev_tmp_proc_checks().map_err(|_| "dev_tmp_proc_checks failed")?;
+        let summary = match run_dev_tmp_proc_checks() {
+            Ok(summary) => summary,
+            Err(err) => {
+                log::error!(target: "vfs", "dev_tmp_proc_checks: {err}");
+                return Err("dev_tmp_proc_checks failed (its reason is logged above)");
+            }
+        };
         kassert!(summary.contains("maps_ok"));
         kassert_eq!(mounts.len() >= 4, true);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn vfs_proc_checks_unregister_their_process_on_failure() {
+        use crate::linux::process;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering;
+        let before = process::active_pids();
+        FAIL_PROC_CHECKS.store(true, Ordering::Release);
+        let res = run_dev_tmp_proc_checks();
+        FAIL_PROC_CHECKS.store(false, Ordering::Release);
+        kassert!(matches!(&res, Err(e) if e.contains("injected failure")));
+        kassert_eq!(process::active_pids(), before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tmpfs_truncate_returns_quota() {
+        use crate::{kassert, kassert_eq};
+        let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 121), page_cache::PAGE_SIZE);
+        let f = tfs.root_inode().create("q.bin", 0o644).map_err(|_| "tmpfs create q.bin")?;
+        let page = vec![0x5Au8; page_cache::PAGE_SIZE];
+        kassert_eq!(f.write_at(0, &page).map_err(|_| "write page 0")?, page.len());
+        kassert!(matches!(f.write_at(page.len() as u64, &page), Err(VfsError::NoSpc)));
+        // Shrinking to 0 frees the page, so it can be written again.
+        f.truncate(0).map_err(|_| "truncate 0")?;
+        kassert_eq!(f.write_at(0, &page).map_err(|_| "write after truncate")?, page.len());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn vfs_sync_continues_past_a_failing_inode() {
+        use crate::{kassert, kassert_eq};
+        let m = mount_test_ext4(build_minimal_ext4_image_blocks(256), 130)?;
+        let files = [("sync_a.bin", 0xA1u8), ("sync_b.bin", 0xB2u8)];
+        let mut held = Vec::new();
+        for (name, byte) in files {
+            let path = format!("/{name}");
+            let (f, _) = open_inode(
+                &m.tables,
+                None,
+                path.as_bytes(),
+                OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                0o644,
+                0,
+            )
+            .map_err(|_| "create sync file")?;
+            kassert_eq!(f.write_at(0, &[byte; 4096]).map_err(|_| "write sync file")?, 4096);
+            held.push(f);
+        }
+        let cached = m.tables.snapshot_inodes();
+        kassert!(held.iter().all(|f| cached.iter().any(|c| c.lock_id() == f.lock_id())));
+
+        // The sync's first block write fails, once: the sync reports it, and
+        // everything else (the other file, the filesystem) is still flushed.
+        m.fault_cache.arm_write_fail_on(1);
+        kassert!(matches!(sync_tables(&m.tables), Err(VfsError::Io)));
+        m.fault_cache.arm_write_fail_on(0);
+
+        let ro = mount_ro_snapshot(&m, 131)?;
+        let root = ro.root_inode();
+        for (name, byte) in files {
+            let f = root.lookup(name).map_err(|_| "ro lookup sync file")?;
+            kassert_eq!(read_all_inode(&f).map_err(|_| "ro read sync file")?, vec![byte; 4096]);
+        }
         Ok(())
     }
 );
@@ -1717,7 +1925,9 @@ crate::ktest!(
         kassert_eq!(got, buf);
         drop(f);
 
-        // Regression: write_at -> reclaim_ext4_to_target(0) (no sync) -> OpenGuard + unlink_at -> read_at.
+        // Dirty pages reclaimed without a sync, then unlinked while open: the
+        // detached inode reads back what was written (write_at -> reclaim to 0 ->
+        // OpenGuard + unlink_at -> read_at).
         let (victim, _) = open_inode(
             &TABLES,
             None,
@@ -1748,7 +1958,7 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn vfs_iteration1_regressions_tmpfs_maps_and_procfs() {
+    fn vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing() {
         use crate::{kassert, kassert_eq};
 
         // 1. tmpfs multi-page -ENOSPC short-write + truncate extend does not leak unwritten data.
@@ -1785,9 +1995,19 @@ crate::ktest!(
         let maps = space.format_maps();
         kassert!(maps.contains("00402000-00404000 rw-p 00000000 00:00 0\n"));
         kassert!(maps.contains("00404000-00405000 rw-p 00000000 00:00 0  [heap]\n"));
+        // Every line has the strict Linux shape, the text segment is r-xp,
+        // and the stack is labelled.
+        kassert!(maps.lines().all(is_maps_line));
+        kassert!(maps.lines().any(|l| l.split(' ').nth(1) == Some("r-xp")));
+        kassert!(maps.lines().any(|l| l.ends_with("  [stack]")));
+        kassert!(!is_maps_line("400000-401000 r-xp 00000000 00:00 0"));
+        kassert!(!is_maps_line("00400000-00401000 r-xp 0 00:00 0"));
+        kassert!(!is_maps_line("00400000-00401000 rwxq 00000000 00:00 0"));
+        kassert!(!is_maps_line("00400000-00401000 r-xp 00000000 00:00 0 "));
         space.teardown();
 
-        // 4. procfs pid_ino bit-32 collision fix and canonical numeric parsing.
+        // 4. procfs: pids above 2^16 get distinct inode numbers; numeric names
+        // must be canonical.
         kassert_ne_u64(procfs::pid_ino(1, 0), procfs::pid_ino(65537, 0))?;
         let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
         kassert!(matches!(resolve_path(&TABLES, None, b"/proc/+1", rf), Err(VfsError::NoEnt)));
@@ -2811,7 +3031,8 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
     kassert!(t200_writes >= 3);
     drop((sf, m));
 
-    // Sweep 1..=t8k_writes (hitting ext4_write_at at #1/#2 and ext4_truncate at #7).
+    // Fail each block write of the 8 KiB shrink in turn (the tail zeroing and
+    // `ext4plus::file::truncate`'s own writes).
     let mut saw_err_at_last_8k = false;
     for fail_at in 1..=t8k_writes {
         let m = mount_test_ext4(snap.clone(), 39)?;
@@ -2859,7 +3080,7 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
         drop((tf, m));
     }
 
-    // Sweep 1..=t200_writes (hitting ext4_write_at at #1/#2 and ext4_truncate at #3).
+    // Fail each block write of the 200-byte shrink in turn.
     let mut saw_err_at_last_200 = false;
     for fail_at in 1..=t200_writes {
         let m = mount_test_ext4(snap.clone(), 41)?;
@@ -2959,7 +3180,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
     }
 
-    // (2) Rename step-2 file move cascading From(k) (incl. From(4)) and Pair(c1, c2) (incl. (3,4)..(4,7))
+    // (2) Rename step-2 file move: every write failing from k on (From(k)), and every pair of failed writes (Pair(c1, c2)).
     let m = mount_test_ext4(base_img.to_vec(), 46)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd casc f")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd casc f")?;
@@ -3060,7 +3281,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         }
     }
 
-    // (3) Rename step-2 dir move cascading Pair(c1, c2) (incl. (4,5)..(5,8)) and From(k)
+    // (3) Rename step-2 dir move: every pair of failed writes (Pair(c1, c2)), and every write failing from k on (From(k)).
     let m = mount_test_ext4(base_img.to_vec(), 49)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd casc d")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd casc d")?;
@@ -3125,7 +3346,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         }
     }
 
-    // (4) RENAME_EXCHANGE file<->file single-write post_res checks + cascading Pair(c1, c2) (incl. (9,10)..(10,12))
+    // (4) RENAME_EXCHANGE file<->file: each single failed write's post_res checks, then pairs of failed writes.
     let m = mount_test_ext4(base_img.to_vec(), 52)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd ex f")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd ex f")?;
@@ -3194,7 +3415,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
     }
 
-    // Cascading Pair(c1, c2) on file<->file RENAME_EXCHANGE (covers Pair(5,6), Pair(7,10), Pair(9,10)..(10,12))
+    // Pairs of failed writes (c2 up to 6 writes after c1) on file<->file RENAME_EXCHANGE.
     for &pinned in &[false, true] {
         for c1 in 1..=exch_file_writes {
             for c2 in (c1 + 1)..=(c1 + 6) {
@@ -4210,8 +4431,8 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
         }
     }
 
-    // (2) unlink_dir_with_recovery Err(Ext4Error::NotFound) parent nlink leak regression:
-    //     (2a) rmdir("/dd/sub") across fail_at=1..=total_writes (covers fail_at=8..=13)
+    // (2) unlink_dir_with_recovery's Err(Ext4Error::NotFound) arm must not leak the parent's nlink:
+    //     (2a) rmdir("/dd/sub") with each of its writes failing in turn
     let m = mount_test_ext4(base_img.to_vec(), 90)?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd r9")?;
     let dd_orig_ino = dd.ino();
