@@ -121,6 +121,21 @@ impl InodeCache {
         gen_id
     }
 
+    /// If `(dev, ino)` is absent from the cache (or detached / `ino`-mismatched,
+    /// in which case it is evicted first), atomically record a removal generation
+    /// and return `Ok(gen_id)`. Otherwise return `Err(Arc::clone(&existing))` so
+    /// the caller can check `is_inode_dead` outside Lock 9.
+    pub fn record_removal_if_absent(&mut self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
+        let key = (dev, ino);
+        if let Some(existing) = self.inodes.get(&key) {
+            if !existing.inode.is_detached() && existing.inode.ino() == ino {
+                return Err(Arc::clone(&existing.inode));
+            }
+            let _ = self.inodes.remove(&key);
+        }
+        Ok(self.record_removal(dev, ino))
+    }
+
     fn was_removed_since(&self, dev: DevId, ino: Ino, since_gen: u64) -> bool {
         if self.removal_gen == since_gen {
             return false;

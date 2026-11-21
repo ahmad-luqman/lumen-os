@@ -27,9 +27,12 @@ pub trait FileSystem: Send + Sync {
 
     /// Execute `f` while holding this filesystem's Lock 3 (`rename_lock`).
     ///
-    /// Default implementation invokes `f` directly (for read-only/pseudo
-    /// filesystems or host tests). Writable kernel filesystems override this
-    /// to acquire their per-FS `SleepMutex<()>`.
+    /// **All concurrent multi-threaded writable filesystems MUST override this
+    /// method** to acquire their per-FS Lock 3 (`SleepMutex<()>`), serializing
+    /// all 6 namespace-mutating operations (`open_inode(O_CREAT)`, `mkdir_at`,
+    /// `unlink_at`, `link_at`, `symlink_at`, `rename_at2`) against directory-entry
+    /// TOCTOU races. The default no-op implementation is strictly for read-only /
+    /// pseudo filesystems or single-writer / non-overlapping host tests.
     fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
         f()
     }

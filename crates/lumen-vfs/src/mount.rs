@@ -264,6 +264,10 @@ pub trait VfsCacheOps {
         parent_ino: Ino,
         name: &str,
     ) -> (Option<Arc<dyn VfsInode>>, u64, u64);
+    /// Unify a looked-up inode in `InodeCache` and publish its dentry under Lock 9.
+    /// Implementations must insert into `DentryCache` only when
+    /// `!mounts.is_mountpoint(parent_dev, parent_ino)` (so an active mountpoint's
+    /// shadowed children never pollute `DentryCache`).
     fn publish_lookup_inode(
         &self,
         parent_dev: DevId,
@@ -275,6 +279,7 @@ pub trait VfsCacheOps {
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>>;
     /// Unify a newly created inode in `InodeCache` and publish its dentry
     /// under Lock 9. Implementations must insert into `DentryCache` only when
+    /// `!mounts.is_mountpoint(parent_dev, parent_ino)` and
     /// `(inode.dev_id(), inode.ino())` was not already cached in `InodeCache`
     /// prior to `get_or_insert_created_if_fresh`, so callers outside Lock 9
     /// can verify a pre-existing cached `Arc` is alive before caching its dentry.
@@ -292,6 +297,9 @@ pub trait VfsCacheOps {
     fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> Option<DentryTarget>;
     fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> (Option<DentryTarget>, u64);
     fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &str, target: DentryTarget);
+    /// Insert into `DentryCache` if `invalidation_gen == expected_gen` and
+    /// `!mounts.is_mountpoint(parent_dev, parent_ino)` (acquiring `MountTable`
+    /// before `DentryCache` per Lock-9 sub-order).
     fn dentry_insert_if_gen(
         &self,
         parent_dev: DevId,
@@ -325,6 +333,7 @@ pub trait VfsCacheOps {
     fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool;
     fn inode_remove_if_same(&self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>>;
     fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64;
+    fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>>;
 }
 
 /// Single-threaded `RefCell`-backed VFS lookup tables for host unit tests.
@@ -454,13 +463,15 @@ impl VfsCacheOps for SimpleVfsTables {
             return Err(inode);
         }
         let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
-        let _ = dentries.insert_if_gen(
-            parent_dev,
-            parent_ino,
-            name,
-            DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-            expected_dentry_gen,
-        );
+        if !mounts.is_mountpoint(parent_dev, parent_ino) {
+            let _ = dentries.insert_if_gen(
+                parent_dev,
+                parent_ino,
+                name,
+                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
+                expected_dentry_gen,
+            );
+        }
         Ok(unified)
     }
 
@@ -481,7 +492,7 @@ impl VfsCacheOps for SimpleVfsTables {
         }
         let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
         let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-        if !was_cached {
+        if !was_cached && !mounts.is_mountpoint(parent_dev, parent_ino) {
             let _ = dentries.insert_if_gen(
                 parent_dev,
                 parent_ino,
@@ -517,7 +528,12 @@ impl VfsCacheOps for SimpleVfsTables {
         target: DentryTarget,
         expected_gen: u64,
     ) -> bool {
-        self.dentries.borrow_mut().insert_if_gen(parent_dev, parent_ino, name, target, expected_gen)
+        let mounts = self.mounts.borrow();
+        let mut dentries = self.dentries.borrow_mut();
+        if mounts.is_mountpoint(parent_dev, parent_ino) {
+            return false;
+        }
+        dentries.insert_if_gen(parent_dev, parent_ino, name, target, expected_gen)
     }
 
     fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &str) {
@@ -594,5 +610,9 @@ impl VfsCacheOps for SimpleVfsTables {
 
     fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
         self.inodes.borrow_mut().record_removal(dev, ino)
+    }
+
+    fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
+        self.inodes.borrow_mut().record_removal_if_absent(dev, ino)
     }
 }
