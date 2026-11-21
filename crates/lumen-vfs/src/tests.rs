@@ -7164,3 +7164,124 @@ fn shadowed_mountpoint_never_pollutes_dentry_cache() {
         simple_env.dentry_gen(),
     ));
 }
+
+#[test]
+fn compute_cwd_path_retries_on_concurrent_rename_and_rejects_unlinked_cwd() {
+    // 1. Direct `cwd` rename between `lookup_dotdot` and `find_child_name_in_dir` (`readdir`).
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+
+    mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
+    mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
+    let cwd = mkdir_at(env.as_ref(), None, b"/p1/leaf", 0o755, 0).unwrap();
+    let guard = OpenGuard::new(Arc::clone(&cwd));
+
+    let env_h = Arc::clone(&env);
+    fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from(".."),
+        alloc::boxed::Box::new(move || {
+            rename_at2(env_h.as_ref(), None, b"/p1/leaf", None, b"/p2/leaf", RenameFlags(0)).unwrap();
+        }),
+    );
+    assert_eq!(compute_cwd_path(env.as_ref(), &cwd).unwrap(), "/p2/leaf");
+    assert!(!fs.inner.hooks.lock().unwrap().post_lookup.contains_key(".."));
+
+    // 2. Multi-hop ancestor rename after `components` already recorded `"deep"`,
+    //    verifying `components` is cleared on retry without duplicating components.
+    mkdir_at(env.as_ref(), None, b"/a1", 0o755, 0).unwrap();
+    mkdir_at(env.as_ref(), None, b"/a2", 0o755, 0).unwrap();
+    mkdir_at(env.as_ref(), None, b"/a1/sub", 0o755, 0).unwrap();
+    let deep = mkdir_at(env.as_ref(), None, b"/a1/sub/deep", 0o755, 0).unwrap();
+    let deep_guard = OpenGuard::new(Arc::clone(&deep));
+
+    let fs_h2 = Arc::clone(&fs);
+    let env_h2 = Arc::clone(&env);
+    fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from(".."),
+        alloc::boxed::Box::new(move || {
+            // Re-arm for the second `".."` lookup (`sub -> a1`), after `"deep"` is pushed.
+            fs_h2.inner.hooks.lock().unwrap().post_lookup.insert(
+                String::from(".."),
+                alloc::boxed::Box::new(move || {
+                    rename_at2(env_h2.as_ref(), None, b"/a1/sub", None, b"/a2/sub", RenameFlags(0)).unwrap();
+                }),
+            );
+        }),
+    );
+    assert_eq!(compute_cwd_path(env.as_ref(), &deep).unwrap(), "/a2/sub/deep");
+    assert!(!fs.inner.hooks.lock().unwrap().post_lookup.contains_key(".."));
+    drop(deep_guard);
+
+    // 3a. `cwd` unlinked mid-walk while open (`OpenGuard` held -> detached) returns `Err(NoEnt)`.
+    let env_u1 = Arc::clone(&env);
+    fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from(".."),
+        alloc::boxed::Box::new(move || {
+            unlink_at(env_u1.as_ref(), None, b"/p2/leaf", true).unwrap();
+        }),
+    );
+    assert_eq!(compute_cwd_path(env.as_ref(), &cwd).unwrap_err(), VfsError::NoEnt);
+    assert!(cwd.is_detached());
+    assert_eq!(compute_cwd_path(env.as_ref(), &cwd).unwrap_err(), VfsError::NoEnt);
+    drop(guard);
+
+    // 3b. `cwd` unlinked mid-walk without `OpenGuard` (`nlink == 0`) also returns `Err(NoEnt)`.
+    let unguarded = mkdir_at(env.as_ref(), None, b"/p1/unguarded", 0o755, 0).unwrap();
+    let env_u2 = Arc::clone(&env);
+    fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from(".."),
+        alloc::boxed::Box::new(move || {
+            unlink_at(env_u2.as_ref(), None, b"/p1/unguarded", true).unwrap();
+        }),
+    );
+    assert_eq!(compute_cwd_path(env.as_ref(), &unguarded).unwrap_err(), VfsError::NoEnt);
+    assert_no_zombies_in_cache(env.as_ref());
+}
+
+#[test]
+fn concurrent_compute_cwd_path_vs_rename_at2_stress() {
+    use core::sync::atomic::AtomicUsize;
+    use std::sync::Barrier;
+
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+
+    mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
+    mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
+    let cwd = mkdir_at(env.as_ref(), None, b"/p1/leaf", 0o755, 0).unwrap();
+    let _guard = OpenGuard::new(Arc::clone(&cwd));
+
+    const MIN_TOGGLES: usize = 1000;
+    const READER_ITERS: usize = 1000;
+    let start_barrier = Arc::new(Barrier::new(3));
+    let readers_done = Arc::new(AtomicUsize::new(0));
+
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            let env_r = Arc::clone(&env);
+            let cwd_r = Arc::clone(&cwd);
+            let barrier_r = Arc::clone(&start_barrier);
+            let done_r = Arc::clone(&readers_done);
+            s.spawn(move || {
+                barrier_r.wait();
+                for _ in 0..READER_ITERS {
+                    let path = compute_cwd_path(env_r.as_ref(), &cwd_r).unwrap();
+                    assert!(path == "/p1/leaf" || path == "/p2/leaf", "unexpected cwd path: {path}");
+                }
+                done_r.fetch_add(1, Ordering::Release);
+            });
+        }
+
+        start_barrier.wait();
+        let mut toggles = 0usize;
+        while readers_done.load(Ordering::Acquire) < 2 || toggles < MIN_TOGGLES {
+            rename_at2(env.as_ref(), None, b"/p1/leaf", None, b"/p2/leaf", RenameFlags(0)).unwrap();
+            rename_at2(env.as_ref(), None, b"/p2/leaf", None, b"/p1/leaf", RenameFlags(0)).unwrap();
+            toggles += 1;
+        }
+        assert!(toggles >= MIN_TOGGLES);
+    });
+
+    assert_eq!(compute_cwd_path(env.as_ref(), &cwd).unwrap(), "/p1/leaf");
+    assert_no_zombies_in_cache(env.as_ref());
+}

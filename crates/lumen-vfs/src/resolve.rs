@@ -15,6 +15,9 @@ use crate::{MAX_SYMLINK_DEPTH, NAME_MAX, PATH_MAX};
 /// Upper bound on bounded `InodeCache` race retries.
 pub(crate) const MAX_INODE_RACE_RETRIES: usize = 64;
 
+/// Upper bound on bounded `compute_cwd_path` retries across concurrent `rename` races.
+const MAX_CWD_RENAME_RETRIES: usize = 64;
+
 /// Options controlling [`resolve_path`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResolveFlags {
@@ -453,6 +456,10 @@ pub(crate) fn resolve_parent_with_depth(
 /// Reconstruct the canonical path of `cwd` by walking `".."` and crossing
 /// mountpoints up to the global root `/`.
 ///
+/// Retries from `cwd` up to [`MAX_CWD_RENAME_RETRIES`] times if a concurrent
+/// `rename` moves `cwd` or an ancestor between `".."` lookup and parent
+/// `readdir`, provided `cwd` itself remains live (`!is_detached() && nlink > 0`).
+///
 /// Returns `Err(NoEnt)` if `cwd` was unlinked (`st_nlink == 0` or detached).
 pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Result<String, VfsError> {
     if cwd.inode_type() != InodeType::Dir {
@@ -463,6 +470,29 @@ pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Resul
     }
 
     let mut components: Vec<String> = Vec::new();
+    for attempt in 0..=MAX_CWD_RENAME_RETRIES {
+        match compute_cwd_path_once(env, cwd, &mut components) {
+            Ok(path) => return Ok(path),
+            Err(VfsError::NoEnt) => {
+                if cwd.is_detached() || cwd.stat()?.nlink == 0 {
+                    return Err(VfsError::NoEnt);
+                }
+                if attempt == MAX_CWD_RENAME_RETRIES {
+                    return Err(VfsError::NoEnt);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(VfsError::NoEnt)
+}
+
+fn compute_cwd_path_once(
+    env: &dyn VfsCacheOps,
+    cwd: &Arc<dyn VfsInode>,
+    components: &mut Vec<String>,
+) -> Result<String, VfsError> {
+    components.clear();
     let mut cur = Arc::clone(cwd);
 
     for _ in 0..PATH_MAX {
