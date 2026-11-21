@@ -5081,7 +5081,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     put back with every count unchanged and the rename returns the error,
     leaving the target as it was (POSIX). Once the move lands, the target
     loses that link; if it was the last, its inode is freed through a
-    temporary entry `.lumen-rename-<ino>` in the target's directory (linked
+    temporary entry in the target's directory, the first free name of
+    `.lumen-rename-<ino>`, `.lumen-rename-<ino>-1`, ... (64 tries; a name a
+    user or the rename itself already took is skipped) (linked
     and unlinked again, since `ext4plus` frees inodes only through
     `Dir::unlink`; retried once while that entry survives) and an open
     target is detached (Gate 6). A crash between taking the entry out and

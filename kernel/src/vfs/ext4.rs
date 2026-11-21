@@ -1494,11 +1494,11 @@ impl Ext4Inode {
         let (remaining, parent_nlink) = {
             let mut inner = self.shared.state.lock();
             let remaining = if last {
-                let temp = alloc::format!(".lumen-rename-{}", target.arc.disk_ino);
                 // The parent's count before the temporary link, which both
                 // attempts put back.
                 let base = Inode::read(&inner.ext4, new_dir_ino).map(|d| d.links_count()).map_err(map_ext4_err);
-                let res = base.and_then(|base| {
+                let temp = base.and_then(|base| Ok((base, unused_temp_name(&inner.ext4, new_dir_ino, ino)?)));
+                let res = temp.and_then(|(base, temp)| {
                     let name = DirEntryName::try_from(temp.as_str()).map_err(|_| VfsError::Inval)?;
                     let first = try_discard_orphan(&mut inner, new_dir_ino, name, ino, Some(base));
                     // While the temporary entry is still there the inode is
@@ -1745,6 +1745,30 @@ fn discard_orphan(
             "ext4: freeing inode {orphan_ino} {why} in directory {parent_ino} failed: {e:?}; run e2fsck"
         );
     }
+}
+
+/// How many `.lumen-rename-<ino>[-n]` names [`unused_temp_name`] tries.
+const TEMP_NAME_TRIES: u32 = 64;
+
+/// A name in `dir_ino` to link `ino` at while freeing it: the first of
+/// `.lumen-rename-<ino>`, `.lumen-rename-<ino>-1`, ... that is free, or that
+/// already points at `ino` (left by an earlier free of it that crashed).
+/// Users can create these names too (or a rename can land on one), so a
+/// taken one is skipped rather than assumed free.
+fn unused_temp_name(ext4: &Ext4, dir_ino: NonZeroU32, ino: NonZeroU32) -> Result<alloc::string::String, VfsError> {
+    let dir = Dir::open_inode(ext4, Inode::read(ext4, dir_ino).map_err(map_ext4_err)?).map_err(map_ext4_err)?;
+    for n in 0..TEMP_NAME_TRIES {
+        let name =
+            if n == 0 { alloc::format!(".lumen-rename-{ino}") } else { alloc::format!(".lumen-rename-{ino}-{n}") };
+        let dname = DirEntryName::try_from(name.as_str()).map_err(|_| VfsError::Inval)?;
+        match dir.get_entry(dname) {
+            Err(Ext4Error::NotFound) => return Ok(name),
+            Ok(entry) if entry.index == ino => return Ok(name),
+            Ok(_) => continue,
+            Err(e) => return Err(map_ext4_err(e)),
+        }
+    }
+    Err(VfsError::Exist)
 }
 
 /// `discard_orphan` without the log: the error, for a caller that retries.
@@ -4137,6 +4161,66 @@ crate::ktest!(
         kassert_eq!(got, data);
         let link = ro.root_inode().lookup("long").map_err(|_| "ro lookup long")?;
         kassert_eq!(link.readlink().map_err(|_| "readlink")?, target.into_bytes());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_rename_over_frees_the_target_when_its_temporary_name_is_taken() {
+        // The replaced target is freed through a temporary `.lumen-rename-<ino>`
+        // entry. A user file already holding that name, or the rename landing
+        // on it, must not stop the free (the inode would leak until e2fsck).
+        use self::ktest_util::*;
+        use crate::kassert_eq;
+        let m = mount(build_1k_blockmap_image(512), 205)?;
+        let mut kept = alloc::vec::Vec::new();
+
+        // A bystander file takes the target's first temporary name.
+        let target = m.root.create("t", 0o644).map_err(|_| "create t")?;
+        target.write_at(0, b"old").map_err(|_| "write t")?;
+        let name = alloc::format!(".lumen-rename-{}", target.ino());
+        let bystander = m.root.create(&name, 0o644).map_err(|_| "create bystander")?;
+        bystander.write_at(0, b"mine").map_err(|_| "write bystander")?;
+        kept.push((name, b"mine".to_vec()));
+        let s = m.root.create("s", 0o644).map_err(|_| "create s")?;
+        s.write_at(0, b"new").map_err(|_| "write s")?;
+        // Outside the VFS's inode cache a dropped inode's dirty pages go
+        // with it, so each file is written back before its handle drops.
+        for f in [&target, &bystander, &s] {
+            f.sync(false).map_err(|_| "sync file")?;
+        }
+        drop((target, bystander, s));
+        let free = free_inodes(&m.fs);
+        m.root.rename("s", &m.root, "t", RenameFlags(0)).map_err(|_| "rename s over t")?;
+        kassert_eq!(free_inodes(&m.fs), free + 1);
+        kept.push(("t".into(), b"new".to_vec()));
+
+        // The rename's own destination is the target's temporary name. In
+        // a directory of its own: the freed target's number is reused, and
+        // its temporary name would be the bystander's above.
+        let d = m.root.mkdir("d", 0o755).map_err(|_| "mkdir d")?;
+        let a = d.create("a", 0o644).map_err(|_| "create a")?;
+        let own = alloc::format!(".lumen-rename-{}", a.ino());
+        drop(a);
+        d.rename("a", &d, &own, RenameFlags(0)).map_err(|_| "rename a")?;
+        let b = d.create("b", 0o644).map_err(|_| "create b")?;
+        b.write_at(0, b"bee").map_err(|_| "write b")?;
+        b.sync(false).map_err(|_| "sync b")?;
+        drop(b);
+        let free = free_inodes(&m.fs);
+        d.rename("b", &d, &own, RenameFlags(0)).map_err(|_| "rename b over own")?;
+        kassert_eq!(free_inodes(&m.fs), free + 1);
+        drop(d);
+
+        m.fs.sync().map_err(|_| "sync")?;
+        let ro = remount_ro(&m, 206)?;
+        kassert_eq!(free_inodes(&ro), free_inodes(&m.fs));
+        for (name, data) in kept {
+            let got = read_all(&ro.root_inode().lookup(&name).map_err(|_| "ro lookup")?)?;
+            kassert_eq!(got, data);
+        }
+        let ro_d = ro.root_inode().lookup("d").map_err(|_| "ro lookup d")?;
+        kassert_eq!(read_all(&ro_d.lookup(&own).map_err(|_| "ro lookup own")?)?, b"bee".to_vec());
         Ok(())
     }
 );
