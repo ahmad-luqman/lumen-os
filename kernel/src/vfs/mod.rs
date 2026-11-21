@@ -525,6 +525,11 @@ pub fn init() {
     let root_ro = root_fs.read_only();
 
     let tmp_fs = tmpfs::Tmpfs::new(DevId::TMPFS, page_cache::TMPFS_DEFAULT_QUOTA_PAGES * page_cache::PAGE_SIZE);
+    // `/tmp` shows the mounted root, not the mountpoint under it: world
+    // writable with the sticky bit, as on Linux.
+    if let Err(e) = tmp_fs.root_inode().set_mode(0o1777) {
+        warn!(target: "vfs", "can't make /tmp 1777: {e:?}");
+    }
     let dev_fs = devfs::Devfs::new(DevId::DEVFS);
     let proc_fs = procfs::Procfs::new(DevId::PROCFS);
 
@@ -686,7 +691,11 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     use crate::sched;
     use lumen_vm::Prot;
 
-    // 1. /tmp write, read, open-unlinked, and 32 MiB quota (-ENOSPC).
+    // 1. /tmp: mode 1777, write, read, open-unlinked, and 32 MiB quota (-ENOSPC).
+    let tmp_mode = resolve_path_from_root("/tmp").and_then(|t| t.stat()).map_err(|e| format!("stat /tmp: {e:?}"))?.mode;
+    if tmp_mode & 0o7777 != 0o1777 {
+        return Err(format!("/tmp mode {tmp_mode:o}, expected 1777"));
+    }
     let (tmp_f, _) = open_inode(
         &TABLES,
         None,
