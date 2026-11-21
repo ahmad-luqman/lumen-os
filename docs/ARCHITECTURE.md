@@ -4899,6 +4899,14 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   IRQ-off `SpinLock`, and never holding another inode's Lock 4 or Lock 5).
   `tmpfs` pages and `detached_unlinked` pages are never evicted until truncated
   or dropped on last close.
+  Because `ext4` blocks are allocated only at writeback, M7 also keeps a hard
+  cap of twice the soft target (64 MiB): an `ext4` `write` that cannot reclaim
+  below it returns a short count or `-ENOSPC` instead of growing the cache
+  until the kernel runs out of frames, and a write or truncate past the
+  volume's largest file size returns `-EFBIG`. `create`/`mkdir`/`symlink`
+  return `-ENOSPC` while fewer than 8 blocks are free, so a new entry can
+  always be linked (or its inode released) without the directory growing
+  into a full disk.
 - **Truncate & extend interaction:**
   - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`):
     acquires `AddressSpace::inner` (Lock 1) before `VfsInode` (Lock 4), unmaps
@@ -4972,7 +4980,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
         `PageCache` reclaim while holding Lock 3/4) and fault existing
         allocated/non-hole pages into the inode's `PageCache` (aborting
         `unlink`/`rename` with `-ENOMEM` before touching `ext4` if faulting
-        fails). (Empty directories have 0 pages to fault.)
+        fails). (Empty directories have 0 pages to fault.) The scan for
+        those pages reads the disk inode once, stops once the non-zero
+        blocks found cover the inode's allocated blocks, and gives up with
+        `-ENOSPC` after 128 MiB of uncached range, so unlinking an open,
+        mostly sparse file whose data lies further out is refused rather
+        than stalling every namespace operation.
      2. Atomically remove `(dev_id, old_ino)` from `InodeCache` and, only
         after the backend `unlink`/`rmdir`/`rename` has succeeded (an abort
         leaves the inode untouched), assign the live `VfsInode`'s `st_ino` a
