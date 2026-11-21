@@ -1049,6 +1049,42 @@ pub fn ticks() -> u64 {
     idt::ticks()
 }
 
+/// Cached `(unix_epoch_seconds, monotonic_anchor_ns)` sampled once from CMOS RTC.
+static REALTIME_ANCHOR: SpinLock<Option<Option<(u64, u64)>>> = SpinLock::new(None);
+
+/// Current wall-clock time as `(unix_seconds, nanoseconds)`, anchored to the
+/// CMOS RTC on first call and advanced via the monotonic TSC clock.
+pub fn realtime_sec_nsec() -> (u64, u64) {
+    let anchor = {
+        let guard = REALTIME_ANCHOR.lock();
+        *guard
+    };
+    let anchor = match anchor {
+        Some(cached) => cached,
+        None => {
+            // Read RTC outside the lock (`rtc::now_quiet` polls CMOS ports).
+            let sampled =
+                crate::rtc::now_quiet().ok().and_then(|dt| dt.unix_seconds()).map(|unix_sec| (unix_sec, now_ns()));
+            let mut guard = REALTIME_ANCHOR.lock();
+            *guard.get_or_insert(sampled)
+        }
+    };
+    let now = now_ns();
+    match anchor {
+        Some((base_sec, base_ns)) => {
+            let delta = now.saturating_sub(base_ns);
+            (base_sec.saturating_add(delta / 1_000_000_000), delta % 1_000_000_000)
+        }
+        None => (now / 1_000_000_000, now % 1_000_000_000),
+    }
+}
+
+/// Current wall-clock time as a VFS [`lumen_vfs::Timespec`].
+pub fn realtime_timespec() -> lumen_vfs::Timespec {
+    let (sec, nsec) = realtime_sec_nsec();
+    lumen_vfs::Timespec { sec: sec as i64, nsec: nsec as i64 }
+}
+
 /// Wait up to `ns` nanoseconds for [`ticks`] to move past `seen`; whether it
 /// did. Panics before [`init`] (the timer doesn't tick yet, and the wait
 /// couldn't be bounded).

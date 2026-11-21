@@ -14,3 +14,29 @@ milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
 ]
+
+[[feature]]
+name = "Unified 4 KiB frame-backed PageCache with write-back, global soft 32 MiB reclaim, and truncate tail zeroing"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4_adapter_pagecache_quirks_and_open_unlinked",
+    "ktest:lumen_kernel::vfs::page_cache_global_reclaim_writes_back_and_evicts",
+    "audit:flags",
+]
+
+[[feature]]
+name = "Writable ext4 rootfs VFS adapter over BlockCache with Gate 6 open-unlinked detach, symlinks, rmdir/rename, and reboot persistence"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4_adapter_pagecache_quirks_and_open_unlinked",
+    "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
+    "scenario:test_fs::test_ext4_readonly_device_mounts_ro",
+]
+
+[[feature]]
+name = "Pseudo-filesystems (/tmp tmpfs, /dev devfs, /proc procfs), boot mount with silent tmpfs fallback, and mount/sync shell commands"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::vfs_boot_mounts_tmp_dev_proc_work",
+    "scenario:test_fs::test_dev_tmp_proc_filesystems",
+]

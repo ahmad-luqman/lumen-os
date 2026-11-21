@@ -5,14 +5,17 @@
 //! See `docs/ARCHITECTURE.md` §5 ("Per-process address spaces and user VM")
 //! and §8 ("Static ELF64 loader and initial stack").
 
+use alloc::string::String;
 use alloc::vec;
-use core::fmt;
+use core::fmt::{self, Write as _};
 
 use lumen_elf::loader::{ElfLoadError, LoadedElf, PageAction, Perm};
 use lumen_elf::stack::{AuxvInfo, InitialStack, StackBuildError, build_initial_stack};
 use lumen_mm::paging::{Attrs, MapError, WalkEnd};
 use lumen_mm::{FRAME_SIZE, PhysFrame, VirtAddr};
-use lumen_vm::{Brk, MMAP_TOP, MapPlace, PAGE_SIZE, Prot, USER_MAX, USER_MIN, USER_STACK_TOP, VmError, VmaMap};
+use lumen_vm::{
+    Backing, Brk, MMAP_TOP, MapPlace, PAGE_SIZE, Prot, USER_MAX, USER_MIN, USER_STACK_TOP, VmError, VmaMap,
+};
 
 use super::{frame, paging};
 use crate::arch;
@@ -543,6 +546,49 @@ impl AddressSpace {
         // lock is held, and all lower-half leaves/tables belong exclusively to `self`.
         unsafe { paging::clear_user_lower_half(self.root, |_leaf| {}) };
         inner.torn_down = true;
+    }
+
+    /// Format `/proc/<pid>/maps` strictly under Lock 1 (`AddressSpace::inner`),
+    /// with no `ACTIVE_PROCS` or `VfsInode` locks held.
+    pub fn format_maps(&self) -> String {
+        let mut out = String::new();
+        let inner = self.inner.lock();
+        if inner.torn_down {
+            return out;
+        }
+        let brk_init = inner.brk.initial();
+        let brk_mapped = inner.brk.mapped_end();
+        for vma in inner.vmas.iter() {
+            let r = if vma.prot.read() { 'r' } else { '-' };
+            let w = if vma.prot.write() { 'w' } else { '-' };
+            let x = if vma.prot.exec() { 'x' } else { '-' };
+            let (sp, offset, maj, min, ino, label): (char, u64, u32, u32, u64, Option<&str>) = match vma.backing {
+                Backing::Anonymous => {
+                    let lbl = if vma.start >= USER_STACK_BOTTOM && vma.end <= USER_STACK_TOP {
+                        Some("[stack]")
+                    } else if brk_mapped > brk_init && vma.start >= brk_init && vma.end <= brk_mapped {
+                        Some("[heap]")
+                    } else {
+                        None
+                    };
+                    ('p', 0, 0, 0, 0, lbl)
+                }
+                Backing::File(fm) => {
+                    let sp = if fm.shared { 's' } else { 'p' };
+                    (sp, fm.offset, 0, 0, 0, None)
+                }
+            };
+            let _ = write!(
+                out,
+                "{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}",
+                vma.start, vma.end, r, w, x, sp, offset, maj, min, ino
+            );
+            if let Some(lbl) = label {
+                let _ = write!(out, "  {lbl}");
+            }
+            out.push('\n');
+        }
+        out
     }
 
     /// Copy `bytes` into already-mapped pages of `self.root` via the HHDM.
