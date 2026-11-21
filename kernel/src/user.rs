@@ -673,6 +673,10 @@ impl CodeBuf {
         self.bytes(&[0x41, 0xb9]);
         self.bytes(&imm.to_le_bytes());
     }
+    fn mov_rax_u64(&mut self, imm: u64) {
+        self.bytes(&[0x48, 0xb8]);
+        self.bytes(&imm.to_le_bytes());
+    }
     fn mov_rcx_u64(&mut self, imm: u64) {
         self.bytes(&[0x48, 0xb9]);
         self.bytes(&imm.to_le_bytes());
@@ -1521,6 +1525,17 @@ fn program_bad_ptrs() -> (Vec<u8>, Vec<u8>) {
     check_syscall(&mut c, general::__NR_close, 0, 0, 0, 0, 0);
     check_syscall(&mut c, general::__NR_read, 0, valid_out, 4, 0, ebadf);
     check_syscall(&mut c, general::__NR_readv, 0, iov_skip_zero, 2, 0, ebadf);
+
+    // A number past `u32::MAX` whose low 32 bits are `getpid`'s: -ENOSYS, not
+    // routed by its low half (`check_syscall` sets only `eax`).
+    c.mov_rax_u64((1 << 32) | u64::from(general::__NR_getpid));
+    c.mov_rdi_u64(0);
+    c.mov_rsi_u64(0);
+    c.mov_rdx_u64(0);
+    c.mov_r10_u64(0);
+    c.syscall();
+    c.mov_rcx_u64(enosys);
+    c.fail_if_rax_ne_rcx(step);
 
     c.exit_group_imm(0);
     c.ud2();
