@@ -338,3 +338,75 @@ def test_run_options_and_cmd_run_accept_rootfs(tmp_path, monkeypatch):
     )
     assert dry_run.returncode == 0, dry_run.stderr
     assert "--rootfs build/alpine-rootfs.ext4" in dry_run.stdout
+
+
+def test_copy_rootfs_rejects_invalid_names(tmp_path):
+    master = tmp_path / "master.ext4"
+    master.write_bytes(b"original-ext4-image-bytes")
+
+    for bad_name in (
+        "",
+        ".",
+        "..",
+        "../escape.ext4",
+        "sub/rootfs.ext4",
+        "sub\\rootfs.ext4",
+        "/abs.ext4",
+    ):
+        with pytest.raises(ValueError, match="invalid rootfs filename"):
+            rootfs.copy_rootfs(tmp_path / "worker", src=master, name=bad_name)
+
+    assert not (tmp_path / "escape.ext4").exists()
+    assert not (tmp_path / "worker").exists()
+
+
+def test_resolve_in_rootfs_rejects_non_directory_parent_traversal(tmp_path):
+    staged = tmp_path / "rootfs"
+    (staged / "bin").mkdir(parents=True)
+    (staged / "bin/sub").mkdir()
+    (staged / "lib").mkdir()
+    (staged / "bin/busybox").write_bytes(b"bb")
+    (staged / "bin/sh").symlink_to("busybox")
+    (staged / "lib/ld-musl-x86_64.so.1").write_bytes(b"ld")
+
+    assert rootfs._resolve_in_rootfs(staged, "/bin/busybox/../sh") is None
+    assert rootfs._resolve_in_rootfs(staged, "/bin/sh/../busybox") is None
+    assert rootfs._resolve_in_rootfs(staged, "/bin/sub/../busybox") == staged / "bin/busybox"
+    assert rootfs._resolve_in_rootfs(staged, "/../lib/ld-musl-x86_64.so.1") == (
+        staged / "lib/ld-musl-x86_64.so.1"
+    )
+
+
+def test_rootfs_cli_main_exit_codes(tmp_path, monkeypatch, capsys):
+    staged = tmp_path / "rootfs"
+    (staged / "lib").mkdir(parents=True)
+    (staged / "lib/ld-musl-x86_64.so.1").write_bytes(b"ld-musl")
+    (staged / "lib/libc.musl-x86_64.so.1").symlink_to("ld-musl-x86_64.so.1")
+
+    exe = tmp_path / "m7_test"
+    exe.write_bytes(b"\x7fELF")
+    so = tmp_path / "libm7.so"
+    so.write_bytes(b"\x7fELF")
+
+    readobj_out = tmp_path / "readobj_cli.txt"
+    stub_tool = _make_exec(
+        tmp_path / "llvm-readobj",
+        f'#!/bin/sh\ncat "{readobj_out}"\n',
+    )
+    monkeypatch.setattr(rootfs, "llvm_tool", lambda name: str(stub_tool))
+
+    readobj_out.write_text(_sample_readobj("/lib/ld-musl-x86_64.so.1", ["libc.musl-x86_64.so.1"]))
+    assert rootfs.main([str(exe), "--rootfs-dir", str(staged)]) == 0
+    out = capsys.readouterr().out
+    assert "m7_test ok (interp=/lib/ld-musl-x86_64.so.1" in out
+
+    readobj_out.write_text(_sample_readobj(None, []))
+    assert rootfs.main([str(so), "--rootfs-dir", str(staged), "--no-interp"]) == 0
+    out = capsys.readouterr().out
+    assert "libm7.so ok (interp=None, needed=[])" in out
+
+    # Missing expected PT_INTERP triggers non-zero exit code 1.
+    assert rootfs.main([str(exe), "--rootfs-dir", str(staged)]) == 1
+    err = capsys.readouterr().err
+    assert "rootfs check-elf:" in err
+    assert "expected PT_INTERP" in err

@@ -111,39 +111,42 @@ COPYFILE_DISABLE=1 E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$MKE2FS" -q -F \
     -E "hash_seed=${FIXED_UUID},root_owner=0:0,lazy_itable_init=0,no_copy_xattrs" \
     -d "$STAGE" "$TMP_IMG" "$ROOTFS_SIZE"
 
-# Normalize uid/gid (0:0) and i_ctime/ctime_extra on every allocated inode:
-# `mke2fs -d` copies host st_uid/st_gid and wall-clock st_ctime (updated by touch)
-# even when E2FSPROGS_FAKE_TIME is set, and `-E root_owner=0:0` only sets `/` and `lost+found`.
-# Keep E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" on `debugfs -w` so superblock wtime is preserved.
-"$DEBUGFS" -R "stats" "$TMP_IMG" > "$DBG_DIR/stats.out" 2> "$DBG_DIR/stats.err"
+# Normalize uid/gid (0:0), i_ctime/ctime_extra, and i_atime/atime_extra on every
+# allocated inode: `mke2fs -d` copies host st_uid/st_gid and wall-clock st_ctime
+# (updated by touch), and strictatime hosts can advance atime on read; `-E
+# root_owner=0:0` only sets `/` and `lost+found`. Keep
+# E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" on `debugfs -w` so superblock wtime is
+# preserved, and force `LC_ALL=C` so debugfs output is never localized.
+LC_ALL=C "$DEBUGFS" -R "stats" "$TMP_IMG" > "$DBG_DIR/stats.out" 2> "$DBG_DIR/stats.err"
 if grep -qvE '^(debugfs [0-9]|$)' "$DBG_DIR/stats.err"; then
     cat "$DBG_DIR/stats.err" >&2
     exit 1
 fi
-INODE_COUNT=$(awk '/^Inode count:/ { print $3; exit }' "$DBG_DIR/stats.out")
-FIRST_INODE=$(awk '/^First inode:/ { print $3; exit }' "$DBG_DIR/stats.out")
+INODE_COUNT=$(LC_ALL=C awk '/^Inode count:/ { print $3; exit }' "$DBG_DIR/stats.out")
+FIRST_INODE=$(LC_ALL=C awk '/^First inode:/ { print $3; exit }' "$DBG_DIR/stats.out")
 FIRST_INODE=${FIRST_INODE:-11}
 if [[ -z "$INODE_COUNT" || ! "$INODE_COUNT" =~ ^[0-9]+$ || ! "$FIRST_INODE" =~ ^[0-9]+$ ]]; then
     echo "mkrootfs: failed to parse inode bounds from debugfs stats" >&2
     exit 1
 fi
 
-awk -v first="$FIRST_INODE" -v n="$INODE_COUNT" \
+LC_ALL=C awk -v first="$FIRST_INODE" -v n="$INODE_COUNT" \
     'BEGIN { for (i = first; i <= n; i++) printf "testi <%d>\n", i }' > "$DBG_DIR/testi.cmd"
-"$DEBUGFS" -f "$DBG_DIR/testi.cmd" "$TMP_IMG" > "$DBG_DIR/testi.out" 2> "$DBG_DIR/testi.err"
+LC_ALL=C "$DEBUGFS" -f "$DBG_DIR/testi.cmd" "$TMP_IMG" > "$DBG_DIR/testi.out" 2> "$DBG_DIR/testi.err"
 if grep -qvE '^(debugfs [0-9]|$)' "$DBG_DIR/testi.err"; then
     cat "$DBG_DIR/testi.err" >&2
     exit 1
 fi
 
-awk -v epoch="$FIXED_EPOCH" '
+LC_ALL=C awk -v epoch="$FIXED_EPOCH" '
     BEGIN {
-        printf "sif <2> uid 0\nsif <2> gid 0\nsif <2> ctime @%s\nsif <2> ctime_extra 0\n", epoch
+        printf "sif <2> uid 0\nsif <2> gid 0\nsif <2> ctime @%s\nsif <2> ctime_extra 0\nsif <2> atime @%s\nsif <2> atime_extra 0\n",
+            epoch, epoch
     }
     /^Inode [0-9]+ is marked in use$/ {
         ino = $2
-        printf "sif <%s> uid 0\nsif <%s> gid 0\nsif <%s> ctime @%s\nsif <%s> ctime_extra 0\n",
-            ino, ino, ino, epoch, ino
+        printf "sif <%s> uid 0\nsif <%s> gid 0\nsif <%s> ctime @%s\nsif <%s> ctime_extra 0\nsif <%s> atime @%s\nsif <%s> atime_extra 0\n",
+            ino, ino, ino, epoch, ino, ino, epoch, ino
     }
 ' "$DBG_DIR/testi.out" > "$DBG_DIR/sif.cmd"
 
@@ -152,7 +155,7 @@ if [[ ! -s "$DBG_DIR/sif.cmd" ]]; then
     exit 1
 fi
 
-E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$DEBUGFS" -w -f "$DBG_DIR/sif.cmd" "$TMP_IMG" \
+LC_ALL=C E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$DEBUGFS" -w -f "$DBG_DIR/sif.cmd" "$TMP_IMG" \
     >/dev/null 2> "$DBG_DIR/sif.err"
 if grep -qvE '^(debugfs [0-9]|$)' "$DBG_DIR/sif.err"; then
     cat "$DBG_DIR/sif.err" >&2

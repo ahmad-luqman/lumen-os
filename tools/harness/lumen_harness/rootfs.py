@@ -90,6 +90,8 @@ def copy_rootfs(
     dest_dir: Path, *, src: Path | None = None, name: str = "alpine-rootfs.ext4"
 ) -> Path:
     """Copy the master `alpine-rootfs.ext4` into a writable per-test path."""
+    if not name or name in (".", "..") or Path(name).name != name or "/" in name or "\\" in name:
+        raise ValueError(f"invalid rootfs filename: {name!r}")
     master = BUILD_DIR / "alpine-rootfs.ext4" if src is None else src
     if not master.is_file():
         raise FileNotFoundError(f"rootfs image not found: {master} (run `make rootfs` first)")
@@ -160,6 +162,8 @@ def _resolve_in_rootfs(rootfs_dir: Path, rootfs_path: str, *, max_hops: int = 40
             continue
         if part == "..":
             if resolved:
+                if not rootfs_dir.joinpath(*resolved).is_dir():
+                    return None
                 resolved.pop()
             continue
         candidate = rootfs_dir.joinpath(*resolved, part)

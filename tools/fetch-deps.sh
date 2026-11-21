@@ -117,7 +117,7 @@ fetch_alpine_minirootfs() {
     # The tarball has no single top-level directory and includes /dev/* device nodes
     # that fail non-root mknod; exclude dev/* and recreate empty mountpoints below.
     COPYFILE_DISABLE=1 tar --no-same-owner --exclude='dev/*' --exclude='./dev/*' -xzf "$tarball" -C "$dir"
-    rm -rf "$dir/dev"
+    rm -rf "$dir/dev" "$dir/proc" "$dir/tmp"
     mkdir -p "$dir/dev" "$dir/proc" "$dir/tmp"
     chmod 0755 "$dir/dev"
     chmod 1777 "$dir/tmp"
