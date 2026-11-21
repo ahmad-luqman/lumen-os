@@ -1,53 +1,59 @@
-//! `/proc`'s node kinds, inode numbers and numeric names: the kernel's
-//! procfs (`kernel/src/vfs/procfs.rs`) without its live-process queries.
+//! `/proc`'s node kinds, inode numbers and numeric names: the pure parts of
+//! the kernel's procfs (`kernel/src/vfs/procfs.rs`).
 //!
 //! The fixed nodes have inode numbers 1..=6. A per-process node's is
-//! [`pid_ino`]: bit 48 marks it (`DETACHED_INO_BIT` is far above), bits
-//! 16..48 hold the pid and bits 0..16 the tag ([`TAG_PID_DIR`] and the
-//! others, or [`TAG_PID_FD_BASE`] plus the fd). So every pid is distinct, and
-//! an fd keeps its tag below 2^16 as long as
+//! `pid_ino`: bit 48 marks it (`DETACHED_INO_BIT` is far above), bits 16..48
+//! hold the pid and bits 0..16 the tag (`TAG_PID_DIR` and the others, or
+//! `TAG_PID_FD_BASE` plus the fd). So every pid is distinct, and an fd keeps
+//! its tag below 2^16 because a [`ProcFd`] is in `0..MAX_FDS` and
 //! `MAX_FDS <= 0x10000 - TAG_PID_FD_BASE`, which a compile-time assertion
-//! keeps.
+//! keeps. Only [`ProcKind::ino`] hands the numbers out.
 
+use crate::DETACHED_INO_BIT;
+use crate::MAX_FDS;
 use crate::types::InodeType;
 
 /// `/proc` itself.
-pub const INO_ROOT: u64 = 1;
+const INO_ROOT: u64 = 1;
 /// `/proc/cpuinfo`.
-pub const INO_CPUINFO: u64 = 2;
+const INO_CPUINFO: u64 = 2;
 /// `/proc/meminfo`.
-pub const INO_MEMINFO: u64 = 3;
+const INO_MEMINFO: u64 = 3;
 /// `/proc/mounts`.
-pub const INO_MOUNTS: u64 = 4;
+const INO_MOUNTS: u64 = 4;
 /// `/proc/version`.
-pub const INO_VERSION: u64 = 5;
+const INO_VERSION: u64 = 5;
 /// `/proc/self`.
-pub const INO_SELF: u64 = 6;
+const INO_SELF: u64 = 6;
 
 /// `/proc/<pid>`'s tag.
-pub const TAG_PID_DIR: u64 = 0;
+const TAG_PID_DIR: u64 = 0;
 /// `/proc/<pid>/exe`'s tag.
-pub const TAG_PID_EXE: u64 = 1;
+const TAG_PID_EXE: u64 = 1;
 /// `/proc/<pid>/maps`'s tag.
-pub const TAG_PID_MAPS: u64 = 2;
+const TAG_PID_MAPS: u64 = 2;
 /// `/proc/<pid>/fd`'s tag.
-pub const TAG_PID_FD_DIR: u64 = 3;
+const TAG_PID_FD_DIR: u64 = 3;
 /// `/proc/<pid>/mounts`'s tag.
-pub const TAG_PID_MOUNTS: u64 = 4;
+const TAG_PID_MOUNTS: u64 = 4;
 /// `/proc/<pid>/fd/<fd>`'s tag is this plus the fd.
-pub const TAG_PID_FD_BASE: u64 = 0x1000;
-
-// An fd's tag must stay below 2^16 (the kernel keeps fds in `0..MAX_FDS`).
-const _: () = assert!(crate::MAX_FDS as u64 <= 0x1_0000 - TAG_PID_FD_BASE);
+const TAG_PID_FD_BASE: u64 = 0x1000;
 
 /// The inode number of `pid`'s node with tag `tag` (see the module docs).
-///
-/// `tag` must be below 2^16 (a `TAG_PID_*`, or `TAG_PID_FD_BASE` plus an fd
-/// in `0..MAX_FDS`); a larger one runs into the pid's bits. The callers
-/// check names before they get here (`ProcKind::PidFdLink`'s fd too).
-pub const fn pid_ino(pid: u32, tag: u64) -> u64 {
+/// `tag` is below 2^16: a `TAG_PID_*`, or `TAG_PID_FD_BASE` plus a [`ProcFd`].
+const fn pid_ino(pid: u32, tag: u64) -> u64 {
     (1u64 << 48) | ((pid as u64) << 16) | tag
 }
+
+const _: () = {
+    // An fd's tag stays below 2^16, and apart from the other tags.
+    assert!(MAX_FDS as u64 <= 0x1_0000 - TAG_PID_FD_BASE);
+    assert!(TAG_PID_MOUNTS < TAG_PID_FD_BASE);
+    // The fixed nodes are below every per-process one, and the largest
+    // per-process one is below a detached inode's tag bit.
+    assert!(INO_SELF < pid_ino(0, 0));
+    assert!(pid_ino(u32::MAX, 0xffff) < DETACHED_INO_BIT);
+};
 
 /// A pid or fd name under `/proc`: ASCII digits only, without a sign or a
 /// leading zero (but `0` itself), that fit a `u32`. So each number has one
@@ -60,6 +66,35 @@ pub fn parse_canonical_u32(s: &str) -> Option<u32> {
         return None;
     }
     s.parse().ok()
+}
+
+/// An fd `/proc/<pid>/fd` can show: one in `0..MAX_FDS`, the range a
+/// process's fd table keeps. Made only by [`ProcFd::try_from`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProcFd(u16);
+
+/// An fd outside `0..MAX_FDS`, refused by [`ProcFd::try_from`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdOutOfRange(pub i32);
+
+const _: () = assert!(MAX_FDS <= u16::MAX as usize + 1);
+
+impl ProcFd {
+    /// The fd.
+    pub const fn get(self) -> i32 {
+        self.0 as i32
+    }
+}
+
+impl TryFrom<i32> for ProcFd {
+    type Error = FdOutOfRange;
+
+    fn try_from(fd: i32) -> Result<Self, FdOutOfRange> {
+        match u16::try_from(fd) {
+            Ok(v) if (v as usize) < MAX_FDS => Ok(Self(v)),
+            _ => Err(FdOutOfRange(fd)),
+        }
+    }
 }
 
 /// What a procfs node is.
@@ -87,13 +122,12 @@ pub enum ProcKind {
     PidFdDir(u32),
     /// `/proc/<pid>/mounts`.
     PidMounts(u32),
-    /// `/proc/<pid>/fd/<fd>`, `fd` in `0..MAX_FDS`.
-    PidFdLink(u32, i32),
+    /// `/proc/<pid>/fd/<fd>`.
+    PidFdLink(u32, ProcFd),
 }
 
 impl ProcKind {
-    /// The node's inode number. A `PidFdLink`'s fd must be in `0..MAX_FDS`
-    /// (see [`pid_ino`]).
+    /// The node's inode number (see the module docs).
     pub const fn ino(self) -> u64 {
         match self {
             Self::Root => INO_ROOT,
@@ -107,7 +141,7 @@ impl ProcKind {
             Self::PidMaps(p) => pid_ino(p, TAG_PID_MAPS),
             Self::PidFdDir(p) => pid_ino(p, TAG_PID_FD_DIR),
             Self::PidMounts(p) => pid_ino(p, TAG_PID_MOUNTS),
-            Self::PidFdLink(p, fd) => pid_ino(p, TAG_PID_FD_BASE + fd as u64),
+            Self::PidFdLink(p, fd) => pid_ino(p, TAG_PID_FD_BASE + fd.0 as u64),
         }
     }
 
@@ -119,6 +153,25 @@ impl ProcKind {
             Self::Cpuinfo | Self::Meminfo | Self::Mounts | Self::Version | Self::PidMaps(_) | Self::PidMounts(_) => {
                 InodeType::File
             }
+        }
+    }
+
+    /// Whether the VFS may keep this node in its dentry and inode caches.
+    /// A per-process node goes when its process or fd does, and pids only
+    /// grow, so caching them would keep stale names and gain an entry per
+    /// (pid, tag) for good (#263). `self` names a different process for
+    /// each caller, so it stays out too. Fixed per node: the VFS asks under
+    /// Lock 9.
+    pub const fn cacheable(self) -> bool {
+        match self {
+            Self::Root | Self::Cpuinfo | Self::Meminfo | Self::Mounts | Self::Version => true,
+            Self::SelfLink
+            | Self::PidDir(_)
+            | Self::PidExe(_)
+            | Self::PidMaps(_)
+            | Self::PidFdDir(_)
+            | Self::PidMounts(_)
+            | Self::PidFdLink(_, _) => false,
         }
     }
 
@@ -140,10 +193,13 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
-    use crate::{DETACHED_INO_BIT, MAX_FDS};
 
     const FIXED: [ProcKind; 6] =
         [ProcKind::Root, ProcKind::Cpuinfo, ProcKind::Meminfo, ProcKind::Mounts, ProcKind::Version, ProcKind::SelfLink];
+
+    fn fd(n: i32) -> ProcFd {
+        ProcFd::try_from(n).unwrap()
+    }
 
     #[test]
     fn the_fixed_nodes_are_inodes_one_to_six() {
@@ -157,8 +213,8 @@ mod tests {
         assert_eq!(pid_ino(1, 0), 0x0001_0000_0001_0000);
         assert_eq!(pid_ino(1, 4), 0x0001_0000_0001_0004);
         // Pids above 2^16 stay distinct (the kernel ktest's pair).
-        assert_eq!(pid_ino(65537, 0), 0x0001_0001_0001_0000);
-        assert_ne!(pid_ino(1, 0), pid_ino(65537, 0));
+        assert_eq!(ProcKind::PidDir(65537).ino(), 0x0001_0001_0001_0000);
+        assert_ne!(ProcKind::PidDir(1).ino(), ProcKind::PidDir(65537).ino());
         // The largest pid and tag fill bits 0..49, below DETACHED_INO_BIT.
         assert_eq!(pid_ino(u32::MAX, 0xffff), 0x0001_ffff_ffff_ffff);
         assert_eq!(pid_ino(u32::MAX, 0xffff) & DETACHED_INO_BIT, 0);
@@ -173,9 +229,9 @@ mod tests {
         assert_eq!(ProcKind::PidMaps(p).ino(), base + 2);
         assert_eq!(ProcKind::PidFdDir(p).ino(), base + 3);
         assert_eq!(ProcKind::PidMounts(p).ino(), base + 4);
-        assert_eq!(ProcKind::PidFdLink(p, 0).ino(), base + 0x1000);
-        assert_eq!(ProcKind::PidFdLink(p, 3).ino(), base + 0x1003);
-        assert_eq!(ProcKind::PidFdLink(p, 1023).ino(), base + 0x13ff);
+        assert_eq!(ProcKind::PidFdLink(p, fd(0)).ino(), base + 0x1000);
+        assert_eq!(ProcKind::PidFdLink(p, fd(3)).ino(), base + 0x1003);
+        assert_eq!(ProcKind::PidFdLink(p, fd(1023)).ino(), base + 0x13ff);
     }
 
     #[test]
@@ -188,17 +244,29 @@ mod tests {
         for tag in fixed_tags {
             assert!(seen.insert(pid_ino(pid, tag)));
         }
-        for fd in 0..MAX_FDS as i32 {
-            let ino = ProcKind::PidFdLink(pid, fd).ino();
+        for n in 0..MAX_FDS as i32 {
+            let ino = ProcKind::PidFdLink(pid, fd(n)).ino();
             // The pid's bits are untouched, and the tag reads back the fd.
-            assert_eq!(ino >> 16, pid_ino(pid, 0) >> 16, "fd {fd}");
-            assert_eq!(ino & 0xffff, TAG_PID_FD_BASE + fd as u64, "fd {fd}");
-            assert!(seen.insert(ino), "fd {fd}");
+            assert_eq!(ino >> 16, pid_ino(pid, 0) >> 16, "fd {n}");
+            assert_eq!(ino & 0xffff, TAG_PID_FD_BASE + n as u64, "fd {n}");
+            assert!(seen.insert(ino), "fd {n}");
         }
         // No per-process node is a fixed one.
         for kind in FIXED {
             assert!(!seen.contains(&kind.ino()));
         }
+    }
+
+    #[test]
+    fn a_proc_fd_is_only_one_in_the_fd_table_range() {
+        let last = MAX_FDS as i32 - 1;
+        assert_eq!(ProcFd::try_from(0).map(ProcFd::get), Ok(0));
+        assert_eq!(ProcFd::try_from(last).map(ProcFd::get), Ok(last));
+        assert_eq!(ProcFd::try_from(MAX_FDS as i32), Err(FdOutOfRange(MAX_FDS as i32)));
+        assert_eq!(ProcFd::try_from(-1), Err(FdOutOfRange(-1)));
+        assert_eq!(ProcFd::try_from(i32::MIN), Err(FdOutOfRange(i32::MIN)));
+        assert_eq!(ProcFd::try_from(0x1_0000), Err(FdOutOfRange(0x1_0000)));
+        assert_eq!(ProcFd::try_from(i32::MAX), Err(FdOutOfRange(i32::MAX)));
     }
 
     #[test]
@@ -216,10 +284,36 @@ mod tests {
             (ProcKind::PidMaps(p), InodeType::File, 0o444),
             (ProcKind::PidFdDir(p), InodeType::Dir, 0o555),
             (ProcKind::PidMounts(p), InodeType::File, 0o444),
-            (ProcKind::PidFdLink(p, 0), InodeType::Symlink, 0o777),
+            (ProcKind::PidFdLink(p, fd(0)), InodeType::Symlink, 0o777),
         ];
         for (kind, itype, mode) in expect {
             assert_eq!((kind.inode_type(), kind.mode()), (itype, mode), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_fixed_files_and_the_root_are_cacheable() {
+        let p = 9;
+        let expect = [
+            (ProcKind::Root, true),
+            (ProcKind::Cpuinfo, true),
+            (ProcKind::Meminfo, true),
+            (ProcKind::Mounts, true),
+            (ProcKind::Version, true),
+            (ProcKind::SelfLink, false),
+            (ProcKind::PidDir(p), false),
+            (ProcKind::PidExe(p), false),
+            (ProcKind::PidMaps(p), false),
+            (ProcKind::PidFdDir(p), false),
+            (ProcKind::PidMounts(p), false),
+            (ProcKind::PidFdLink(p, fd(0)), false),
+        ];
+        for (kind, cacheable) in expect {
+            assert_eq!(kind.cacheable(), cacheable, "{kind:?}");
+            // The kernel's ktest tells the uncacheable ones by number: `self`,
+            // or one numbered from `/proc/0`'s up.
+            let by_ino = kind.ino() == ProcKind::SelfLink.ino() || kind.ino() >= ProcKind::PidDir(0).ino();
+            assert_eq!(by_ino, !cacheable, "{kind:?}");
         }
     }
 
