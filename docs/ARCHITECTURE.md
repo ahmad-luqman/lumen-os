@@ -5106,8 +5106,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 
 - **Core abstractions:**
   - `FileSystem`: `dev_id()`, `root_inode()`, `sync()`, `read_only()`.
-  - `VfsInode` (cached by `(DevId, Ino)` as `Arc<VfsInode>` so hard links and
-    multiple open FDs share one inode, one `PageCache`, one `AdvisoryLocks`
+  - `VfsInode` (cached by `(DevId, Ino)` as `Arc<VfsInode>`, except a
+    non-`cacheable()` one (below), so hard links and multiple open FDs share
+    one inode, one `PageCache`, one `AdvisoryLocks`
     table protected under the inode lock or a leaf `SleepMutex`, and one
     metadata lock): `stat()`, `lookup(name)`, `create(...)`, `mkdir(...)`,
     `unlink(name)`, `rmdir(name)`, `link(name, target)`, `symlink(name,
@@ -5116,19 +5117,23 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `PageCache` and `sync()`. `VfsInode::drop` must never acquire a sleeping
     lock.
   - `InodeCache`: the `(DevId, Ino)` → `Arc<VfsInode>` map above. It evicts
-    an entry only on `unlink`/`rmdir`/`rename`, a detach or `umount`, never
-    for size, so an inode whose existence the VFS can't follow must not
+    an entry only on `unlink`/`rmdir`/`rename`, a detach or `umount`, or
+    when a lookup or open finds the cached entry dead (detached, `nlink ==
+    0`, `stat` saying `ENOENT`, or another `ino`), never for size, so an inode whose existence the VFS can't follow must not
     enter it: `VfsInode::cacheable()` (default `true`; answered from fixed
     state, under Lock 9, without locking) is `false` for those, and every
     `VfsCacheOps` method that would insert one (`publish_lookup_inode`,
     `inode_get_or_insert_if_fresh`, ...: a lookup, `..`, a magic link's
     target, `open(O_CREAT)` of an existing name) hands it back as its
-    success value instead, inserted into neither cache. A non-cacheable
-    directory's children are non-cacheable too (a dentry is keyed by its
-    parent). `procfs`'s `self`, `/proc/<pid>` and everything under it are
-    the only ones (#263): they go with their process or fd, and pids only
-    grow. Each lookup of one builds a fresh inode, so two opens of the same
-    `/proc/<pid>` file don't share advisory locks or an open count.
+    success value instead, inserted into neither cache (never `Err`, which
+    would make the caller retry). A non-cacheable directory's children are
+    non-cacheable too: a dentry is keyed by its parent's `(dev, ino)`, so a
+    cached child's dentry would outlive its parent (a `debug_assert!` in
+    the resolver, on in the kernel's builds, checks it). `procfs`'s `self`,
+    `/proc/<pid>` and everything under it are the only ones (#263): they go
+    with their process or fd, and pids only grow. Each lookup of one builds
+    a fresh inode, so two opens of the same `/proc/<pid>` file don't share
+    advisory locks or an open count.
   - `DentryCache`: keyed by `(parent_dev, parent_ino, ComponentName)`, storing
     child `(DevId, Ino)` with immediate invalidation on `unlink`, `rmdir`,
     `rename`, and `mount`/`umount`, and bounded at 4096 entries (oldest
@@ -5222,9 +5227,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 - **`/proc` (`procfs`, `dev = 0:4`):** read-only dynamically generated views
   (`st_size == 0` on virtual regular files, matching Linux):
   - `/proc/self` → symlink to `<current_pid>`; `/proc/<pid>` resolves for the
-    calling process's PID. None of these per-process nodes (nor `self`) is
-    ever in `DentryCache` or `InodeCache` (`cacheable()` is `false`), so
-    each lookup asks `procfs` whether the process or fd still exists.
+    calling process's PID. None of these per-process nodes is ever in
+    `DentryCache` or `InodeCache` (`cacheable()` is `false`), so each lookup
+    asks `procfs` whether the process or fd still exists. Nor is `self`,
+    which names whichever process asks.
   - `/proc/<pid>/exe` → symlink to the process's canonical executable path
     (e.g. `/bin/busybox`).
   - `/proc/<pid>/fd` → directory of **magic symlinks** `0`, `1`, `2`, ...:

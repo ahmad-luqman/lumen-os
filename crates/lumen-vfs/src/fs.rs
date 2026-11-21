@@ -80,11 +80,21 @@ pub trait VfsInode: Send + Sync {
     /// must never enter `DentryCache` or `InodeCache` (e.g. `procfs`'s
     /// `/proc/<pid>` and everything under it, which go when the process or
     /// its fd does). A lookup of such a name always asks the filesystem
-    /// again. A non-cacheable directory's children must be non-cacheable
-    /// too: a dentry is keyed by its parent's `(dev, ino)`, so a cached
-    /// child would keep its parent's key alive. Called under Lock 9: must
-    /// not lock or block, and answers from fixed state (never changing for
-    /// one inode).
+    /// again.
+    ///
+    /// A non-cacheable directory's children must be non-cacheable too: a
+    /// dentry is keyed by its parent's `(dev, ino)`, so a cached child's
+    /// dentry would outlive its parent, one per parent for good (a
+    /// `debug_assert!` in the resolver checks it; the kernel's builds keep
+    /// debug assertions on).
+    ///
+    /// The tables never refuse such an inode as stale (`Err`), so the VFS's
+    /// race retries, which look a name up again when an unlink or eviction
+    /// raced its caching, never run for it: a writable filesystem with
+    /// non-cacheable inodes must not rely on them.
+    ///
+    /// Called under Lock 9: must not lock or block, and answers from fixed
+    /// state (never changing for one inode).
     fn cacheable(&self) -> bool {
         true
     }

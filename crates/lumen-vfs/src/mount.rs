@@ -247,9 +247,12 @@ impl MountTable {
 /// returns an owned `Arc` or `Copy` value, and releases the Lock 9 guard(s)
 /// before returning so Locks 4–8 are never acquired while holding Lock 9.
 ///
-/// No method inserts an inode whose [`VfsInode::cacheable`] is false into
-/// either cache: each one that would hands it back as its success value
-/// (`Ok(inode)`, `Some(inode)` or `inode`), unified with nothing.
+/// No method taking an inode inserts one whose [`VfsInode::cacheable`] is
+/// false into either cache: each one that would hands it back as its
+/// success value (`Ok(inode)`, `Some(inode)` or `inode`), unified with
+/// nothing. (`dentry_insert` and `dentry_insert_if_gen` take a bare
+/// [`DentryTarget`] and can't check: their callers, a created inode's
+/// re-publish and `link_at`, run only after a create or link succeeded.)
 pub trait VfsCacheOps {
     fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn is_global_root(&self, dev: DevId, ino: Ino) -> bool;

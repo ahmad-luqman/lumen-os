@@ -193,6 +193,12 @@ fn lookup_component(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>, name: &str) 
             }
             Err(e) => return Err(e),
         };
+        // A cached child of a non-cacheable directory would leave a dentry
+        // keyed by a parent nobody can look up again (`VfsInode::cacheable`).
+        debug_assert!(
+            dir.cacheable() || !child.cacheable(),
+            "{name:?}: a cacheable child of a non-cacheable directory"
+        );
 
         let child_ino = child.ino();
         match env.publish_lookup_inode(pdev, pino, name, Arc::clone(&child), dentry_gen, inode_gen) {
