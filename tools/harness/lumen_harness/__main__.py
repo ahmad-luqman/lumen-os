@@ -21,9 +21,16 @@ def interactive(**options: Any) -> QemuOptions:
     return QemuOptions(virtio_tablet=True, **options)
 
 
-def run_options(iso: Path, vars_file: Path, headless: bool, sound: bool = False) -> QemuOptions:
+def run_options(
+    iso: Path,
+    vars_file: Path,
+    headless: bool,
+    sound: bool = False,
+    rootfs: Path | None = None,
+) -> QemuOptions:
     """`make run`'s machine: serial on the terminal (`interactive`), with
-    virtio-sound on the host's audio when `sound` (`make run SOUND=1`)."""
+    virtio-sound on the host's audio when `sound` (`make run SOUND=1`) and an
+    optional virtio-blk disk when `rootfs` (`make run ROOTFS=1`)."""
     return interactive(
         iso=iso,
         vars_file=vars_file,
@@ -34,6 +41,7 @@ def run_options(iso: Path, vars_file: Path, headless: bool, sound: bool = False)
         host_audio=host_audio_driver(sys.platform, os.environ) if sound else None,
         # So `random` works (QEMU's default CPU has no RDRAND).
         virtio_rng=True,
+        blk_image=rootfs,
     )
 
 
@@ -52,7 +60,16 @@ def debug_options(iso: Path, vars_file: Path, batch: bool) -> QemuOptions:
 
 
 def cmd_run(a: argparse.Namespace) -> int:
-    opts = run_options(a.iso, fresh_vars(BUILD_DIR / "run/OVMF_VARS.fd"), a.headless, a.sound)
+    rootfs = getattr(a, "rootfs", None)
+    if rootfs is not None and not rootfs.is_file():
+        raise SystemExit(f"rootfs image not found: {rootfs} (run `make rootfs` first)")
+    opts = run_options(
+        a.iso,
+        fresh_vars(BUILD_DIR / "run/OVMF_VARS.fd"),
+        a.headless,
+        a.sound,
+        rootfs=rootfs,
+    )
     args = qemu_args(opts)
     print("+", " ".join(args), file=sys.stderr)
     print("(serial is attached here; Ctrl-A x quits QEMU)", file=sys.stderr)
@@ -153,6 +170,7 @@ def main() -> int:
         action="store_true",
         help="virtio-sound through the host's audio (LUMEN_AUDIO: the QEMU audio driver)",
     )
+    r.add_argument("--rootfs", type=Path, help="attach a raw disk image via virtio-blk")
     r.set_defaults(func=cmd_run)
 
     d = sub.add_parser("debug", help="boot paused under gdb")

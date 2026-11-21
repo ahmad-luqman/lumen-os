@@ -226,3 +226,10 @@ tests = [
     "audit:flags",
     "harness:test_audit::test_fpu_allowlist_rejects_simd_outside_named_stubs",
 ]
+
+[[feature]]
+name = "Alpine minirootfs harness helpers: matched (mke2fs, e2fsck) discovery, per-test rootfs copy isolation, e2fsck -fn check, dynamic musl ELF PT_INTERP/DT_NEEDED validation, and `lumen_harness run --rootfs`"
+milestone = "M7"
+tests = [
+    "harness:test_rootfs::*",
+]

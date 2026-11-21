@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Download pinned, checksummed boot and userspace test dependencies into build/deps/.
 #
-#   build/deps/limine/   Limine bootloader binaries (BOOTX64.EFI, limine-uefi-cd.bin, ...)
-#   build/deps/ovmf/     OVMF UEFI firmware for QEMU (code.fd, vars.fd)
-#   build/deps/busybox/  Unmodified Alpine static musl busybox (GPL, never committed to repo)
+#   build/deps/limine/            Limine bootloader binaries (BOOTX64.EFI, limine-uefi-cd.bin, ...)
+#   build/deps/ovmf/              OVMF UEFI firmware for QEMU (code.fd, vars.fd)
+#   build/deps/busybox/           Unmodified Alpine static musl busybox (GPL, never committed to repo)
+#   build/deps/alpine-minirootfs/ Unmodified Alpine x86-64 minirootfs (never committed to repo)
 #
 # All dependencies are pinned by version and sha256 so that macOS and CI boot
 # the exact same firmware, bootloader, and userspace binaries (golden
@@ -28,6 +29,10 @@ OVMF_SHA256=8ae4d2d73161cc2335f5675d3b8b6edfa0642301679764a246940488ea3ce20d
 BUSYBOX_VERSION=1.37.0-r14
 BUSYBOX_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/busybox-static-${BUSYBOX_VERSION}.apk"
 BUSYBOX_SHA256=feef45f02f31ee30b6b47eed9b643a0f99e63a21a08a90e7c680066a712405bd
+
+ALPINE_MINIROOTFS_VERSION=3.21.10
+ALPINE_MINIROOTFS_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-${ALPINE_MINIROOTFS_VERSION}-x86_64.tar.gz"
+ALPINE_MINIROOTFS_SHA256=d225c786541b5ae5ba006ef541701d9ecc7e732bd16317c08adfb93212345efa
 
 sha256() {
     if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -92,6 +97,39 @@ fetch_busybox() {
     echo "$BUSYBOX_VERSION" > "$dir/.version"
 }
 
+fetch_alpine_minirootfs() {
+    local dir="$DEPS/alpine-minirootfs"
+    if [[ -f "$dir/.version" && "$(cat "$dir/.version")" == "$ALPINE_MINIROOTFS_VERSION" \
+        && -e "$dir/lib/ld-musl-x86_64.so.1" && -x "$dir/bin/busybox" ]]; then
+        return 0
+    fi
+    echo "fetch-deps: downloading alpine-minirootfs $ALPINE_MINIROOTFS_VERSION"
+    rm -rf "$dir" && mkdir -p "$dir"
+    local tarball="$DEPS/alpine-minirootfs.tar.gz"
+    trap 'rm -f "$DEPS/alpine-minirootfs.tar.gz"' EXIT
+    curl -fsSL --retry 3 -o "$tarball" "$ALPINE_MINIROOTFS_URL"
+    local got
+    got=$(sha256 "$tarball")
+    if [[ "$got" != "$ALPINE_MINIROOTFS_SHA256" ]]; then
+        echo "fetch-deps: checksum mismatch for alpine-minirootfs: expected $ALPINE_MINIROOTFS_SHA256, got $got" >&2
+        exit 1
+    fi
+    # The tarball has no single top-level directory and includes /dev/* device nodes
+    # that fail non-root mknod; exclude dev/* and recreate empty mountpoints below.
+    COPYFILE_DISABLE=1 tar --no-same-owner --exclude='dev/*' --exclude='./dev/*' -xzf "$tarball" -C "$dir"
+    rm -rf "$dir/dev"
+    mkdir -p "$dir/dev" "$dir/proc" "$dir/tmp"
+    chmod 0755 "$dir/dev"
+    chmod 1777 "$dir/tmp"
+    rm -f "$tarball"
+    trap - EXIT
+    if [[ ! -s "$dir/lib/ld-musl-x86_64.so.1" || ! -x "$dir/bin/busybox" ]]; then
+        echo "fetch-deps: failed to extract alpine-minirootfs (missing ld-musl-x86_64.so.1 or bin/busybox)" >&2
+        exit 1
+    fi
+    echo "$ALPINE_MINIROOTFS_VERSION" > "$dir/.version"
+}
+
 mkdir -p "$DEPS"
 fetch limine "$LIMINE_VERSION" "$LIMINE_URL" "$LIMINE_SHA256" limine.tar.gz
 fetch ovmf "$OVMF_VERSION" "$OVMF_URL" "$OVMF_SHA256" ovmf.tar.xz
@@ -101,3 +139,4 @@ if [[ -d "$DEPS/ovmf/x64" ]]; then
     cp "$DEPS/ovmf/x64/vars.fd" "$DEPS/ovmf/OVMF_VARS.fd"
 fi
 fetch_busybox
+fetch_alpine_minirootfs
