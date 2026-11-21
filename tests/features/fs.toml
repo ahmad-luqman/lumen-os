@@ -7,3 +7,10 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4_crate_smoke",
     "audit:flags",
 ]
+
+[[feature]]
+name = "POSIX VFS core traits, path/symlink resolver, mount table, caches, 1024-FD table, and advisory locks"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+]

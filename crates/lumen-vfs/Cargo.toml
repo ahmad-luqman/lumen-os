@@ -1,0 +1,9 @@
+[package]
+name = "lumen-vfs"
+description = "no_std POSIX VFS traits, path resolver, mount table, caches, FD table, and advisory locks for the Lumen kernel, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

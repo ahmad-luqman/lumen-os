@@ -40,6 +40,7 @@ lumen-time = { path = "crates/lumen-time" }
 lumen-trace = { path = "crates/lumen-trace" }
 lumen-uart = { path = "crates/lumen-uart" }
 lumen-ui = { path = "crates/lumen-ui" }
+lumen-vfs = { path = "crates/lumen-vfs" }
 lumen-view = { path = "crates/lumen-view" }
 lumen-vm = { path = "crates/lumen-vm" }
 lumen-wm = { path = "crates/lumen-wm" }
