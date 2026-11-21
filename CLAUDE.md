@@ -360,7 +360,11 @@ one is its own PR that updates that doc first.
   `linux-raw-sys` re-exports, `M6_SYSCALLS` and `M7_SYSCALLS` (the numbers,
   `syscall_name`; pinned by the `abi_constants_match_spec` and
   `m7_abi_constants_match_spec` ktests, the latter with M7's flags and
-  struct layouts), `uname`'s payload and the `linux` command;
+  struct layouts), `uname`'s payload and the `linux` command (`linux /path`
+  from the VFS, `run_exec`: load, run, count frames, the path as `exe`);
+  `linux/exec.rs` `Exec` (#255: a binary and its `PT_INTERP` interpreter
+  read and parsed once, `load` through `AddressSpace::from_images`;
+  `ExecError`, each read naming its file);
   `linux/process.rs` `ProcessState` (FD table, console bridge);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern) and the
