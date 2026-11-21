@@ -23,6 +23,7 @@ tests = [
     "ktest:lumen_kernel::vfs::page_cache_global_reclaim_writes_back_and_evicts",
     "ktest:lumen_kernel::vfs::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
     "ktest:lumen_kernel::vfs::ext4_truncate_and_open_unlink_preserve_state_on_io_error",
+    "ktest:lumen_kernel::vfs::ext4_partial_phase2_io_error_recovery",
     "audit:flags",
 ]
 
@@ -33,6 +34,7 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4_adapter_pagecache_quirks_and_open_unlinked",
     "ktest:lumen_kernel::vfs::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
     "ktest:lumen_kernel::vfs::ext4_truncate_and_open_unlink_preserve_state_on_io_error",
+    "ktest:lumen_kernel::vfs::ext4_partial_phase2_io_error_recovery",
     "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
     "scenario:test_fs::test_ext4_readonly_device_mounts_ro",
 ]

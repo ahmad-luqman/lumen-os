@@ -1801,6 +1801,26 @@ struct FaultInjectBlockCache {
     inner: SleepMutex<lumen_bcache::BlockCache<MemBlkDev>>,
     fail_reads: core::sync::atomic::AtomicBool,
     fail_writes: core::sync::atomic::AtomicBool,
+    fail_write_on_call: core::sync::atomic::AtomicUsize,
+    write_calls: core::sync::atomic::AtomicUsize,
+}
+
+#[cfg(feature = "ktest")]
+impl FaultInjectBlockCache {
+    fn new(inner: lumen_bcache::BlockCache<MemBlkDev>) -> Self {
+        Self {
+            inner: SleepMutex::new(inner),
+            fail_reads: core::sync::atomic::AtomicBool::new(false),
+            fail_writes: core::sync::atomic::AtomicBool::new(false),
+            fail_write_on_call: core::sync::atomic::AtomicUsize::new(0),
+            write_calls: core::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn arm_write_fail_on(&self, call_num: usize) {
+        self.write_calls.store(0, core::sync::atomic::Ordering::Release);
+        self.fail_write_on_call.store(call_num, core::sync::atomic::Ordering::Release);
+    }
 }
 
 #[cfg(feature = "ktest")]
@@ -1814,6 +1834,11 @@ impl ext4::BlockCacheBackend for FaultInjectBlockCache {
 
     fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), lumen_bcache::BlockError> {
         if self.fail_writes.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(lumen_bcache::BlockError::Io);
+        }
+        let call_idx = self.write_calls.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
+        let target = self.fail_write_on_call.load(core::sync::atomic::Ordering::Acquire);
+        if target != 0 && call_idx == target {
             return Err(lumen_bcache::BlockError::Io);
         }
         self.inner.lock().write_at(byte_off, src)
@@ -1830,17 +1855,13 @@ impl ext4::BlockCacheBackend for FaultInjectBlockCache {
 crate::ktest!(
     fn ext4_flush_and_reclaim_preserve_dirty_on_io_error() {
         use crate::{kassert, kassert_eq};
-        use core::sync::atomic::{AtomicBool, Ordering};
+        use core::sync::atomic::Ordering;
         use lumen_bcache::BlockCache;
 
         let img = build_minimal_ext4_image_blocks(256);
         let mem_dev = MemBlkDev::new(img, false);
         let bcache_raw = BlockCache::new(mem_dev.clone(), 64).map_err(|_| "bcache init")?;
-        let fault_cache = Arc::new(FaultInjectBlockCache {
-            inner: SleepMutex::new(bcache_raw),
-            fail_reads: AtomicBool::new(false),
-            fail_writes: AtomicBool::new(false),
-        });
+        let fault_cache = Arc::new(FaultInjectBlockCache::new(bcache_raw));
         let bcache: Arc<dyn ext4::BlockCacheBackend> = Arc::clone(&fault_cache) as Arc<dyn ext4::BlockCacheBackend>;
         let fs = ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, 13), false).map_err(|_| "ext4 mount")?;
 
@@ -1926,17 +1947,13 @@ crate::ktest!(
 crate::ktest!(
     fn ext4_truncate_and_open_unlink_preserve_state_on_io_error() {
         use crate::{kassert, kassert_eq};
-        use core::sync::atomic::{AtomicBool, Ordering};
+        use core::sync::atomic::Ordering;
         use lumen_bcache::BlockCache;
 
         let img = build_minimal_ext4_image_blocks(256);
         let mem_dev = MemBlkDev::new(img, false);
         let bcache_raw = BlockCache::new(mem_dev.clone(), 64).map_err(|_| "bcache init")?;
-        let fault_cache = Arc::new(FaultInjectBlockCache {
-            inner: SleepMutex::new(bcache_raw),
-            fail_reads: AtomicBool::new(false),
-            fail_writes: AtomicBool::new(false),
-        });
+        let fault_cache = Arc::new(FaultInjectBlockCache::new(bcache_raw));
         let bcache: Arc<dyn ext4::BlockCacheBackend> = Arc::clone(&fault_cache) as Arc<dyn ext4::BlockCacheBackend>;
         let fs = ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, 15), false).map_err(|_| "ext4 mount")?;
 
@@ -2117,6 +2134,228 @@ crate::ktest!(
         kassert_eq!(read_all_inode(&ro_trunc).map_err(|_| "ro read trunc_err")?, payload_2[..100]);
         let ro_ren = ro_root.lookup("ren_dst.bin").map_err(|_| "ro lookup ren_dst")?;
         kassert_eq!(read_all_inode(&ro_ren).map_err(|_| "ro read ren_dst")?, b"NEW");
+
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_partial_phase2_io_error_recovery() {
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering;
+        use lumen_bcache::BlockCache;
+
+        let img = build_minimal_ext4_image_blocks(256);
+        let mem_dev = MemBlkDev::new(img, false);
+        let bcache_raw = BlockCache::new(mem_dev.clone(), 64).map_err(|_| "bcache init")?;
+        let fault_cache = Arc::new(FaultInjectBlockCache::new(bcache_raw));
+        let bcache: Arc<dyn ext4::BlockCacheBackend> = Arc::clone(&fault_cache) as Arc<dyn ext4::BlockCacheBackend>;
+        let fs = ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, 17), false).map_err(|_| "ext4 mount")?;
+
+        let tables = KernelVfsTables::new();
+        tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+
+        let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
+        let quota_before = page_cache::DETACHED_QUOTA.used_pages();
+
+        // Measure write count for a clean rmdir (`child_disk.write` + `unlink` + `self_after.write`).
+        let probe_dir = mkdir_at(&tables, None, b"/probe_dir", 0o755, 0).map_err(|_| "mkdir probe_dir")?;
+        drop(probe_dir);
+        fault_cache.arm_write_fail_on(0);
+        unlink_at(&tables, None, b"/probe_dir", true).map_err(|_| "rmdir probe_dir")?;
+        let rmdir_writes = fault_cache.write_calls.load(Ordering::Acquire);
+        kassert!(rmdir_writes >= 2);
+
+        // (a1) rmdir post-unlink `self_after.write` EIO must still remove from `live_inodes`
+        //      and `commit_detach` so subsequent `create` never aliases the freed `Dir` inode.
+        let d1 = mkdir_at(&tables, None, b"/open_rmdir_eio", 0o755, 0).map_err(|_| "mkdir open_rmdir_eio")?;
+        let d1_guard = OpenGuard::new(Arc::clone(&d1));
+        let d1_orig_ino = d1.ino();
+        fault_cache.arm_write_fail_on(rmdir_writes);
+        kassert!(matches!(unlink_at(&tables, None, b"/open_rmdir_eio", true), Err(VfsError::Io)));
+        fault_cache.arm_write_fail_on(0);
+        kassert!(d1.is_detached());
+        kassert_ne_u64(d1.ino(), d1_orig_ino)?;
+        kassert_eq!(d1.stat().map_err(|_| "stat d1 detached")?.nlink, 0);
+        kassert!(fs.lookup_live_by_lock_id(d1.lock_id()).is_none());
+        kassert!(matches!(resolve_path(&tables, None, b"/open_rmdir_eio", rf), Err(VfsError::NoEnt)));
+
+        let (after_rmdir, _) = open_inode(
+            &tables,
+            None,
+            b"/after_rmdir.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create after_rmdir.bin")?;
+        kassert_eq!(after_rmdir.inode_type(), InodeType::File);
+        drop(after_rmdir);
+        unlink_at(&tables, None, b"/after_rmdir.bin", false).map_err(|_| "cleanup after_rmdir.bin")?;
+        drop(d1_guard);
+        drop(d1);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+
+        // rmdir mid-`unlink` EIO restores `child_disk.links_count` and keeps inode live.
+        let d2 = mkdir_at(&tables, None, b"/open_rmdir_mid", 0o755, 0).map_err(|_| "mkdir open_rmdir_mid")?;
+        let d2_guard = OpenGuard::new(Arc::clone(&d2));
+        fault_cache.arm_write_fail_on(2);
+        kassert!(matches!(unlink_at(&tables, None, b"/open_rmdir_mid", true), Err(VfsError::Io)));
+        fault_cache.arm_write_fail_on(0);
+        kassert!(!d2.is_detached());
+        kassert_eq!(d2.stat().map_err(|_| "stat d2 mid")?.nlink, 2);
+        kassert!(fs.lookup_live_by_lock_id(d2.lock_id()).is_some());
+        fs.sync().map_err(|_| "sync after rmdir mid")?;
+        {
+            let ro_dev = MemBlkDev::new(mem_dev.0.data.lock().clone(), true);
+            let ro_bcache: Arc<dyn ext4::BlockCacheBackend> =
+                Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache d2")?));
+            let ro_fs =
+                ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 18), true).map_err(|_| "ro mount d2")?;
+            let ro_d2 = ro_fs.root_inode().lookup("open_rmdir_mid").map_err(|_| "ro lookup open_rmdir_mid")?;
+            kassert_eq!(ro_d2.stat().map_err(|_| "ro stat d2")?.nlink, 2);
+        }
+        unlink_at(&tables, None, b"/open_rmdir_mid", true).map_err(|_| "retry rmdir d2")?;
+        kassert!(d2.is_detached());
+        drop(d2_guard);
+        drop(d2);
+
+        // (a2) rename dir overwrite post-unlink `np_after.write` EIO must remove from `live_inodes`
+        //      and `commit_detach` so subsequent `create` never aliases the freed `Dir` inode.
+        let src_dir = mkdir_at(&tables, None, b"/ren_src_dir", 0o755, 0).map_err(|_| "mkdir ren_src_dir")?;
+        drop(src_dir);
+        let dst_dir = mkdir_at(&tables, None, b"/ren_dst_dir", 0o755, 0).map_err(|_| "mkdir ren_dst_dir")?;
+        let dst_guard = OpenGuard::new(Arc::clone(&dst_dir));
+        let dst_orig_ino = dst_dir.ino();
+        fault_cache.arm_write_fail_on(rmdir_writes);
+        kassert!(matches!(
+            rename_at2(&tables, None, b"/ren_src_dir", None, b"/ren_dst_dir", RenameFlags::default()),
+            Err(VfsError::Io)
+        ));
+        fault_cache.arm_write_fail_on(0);
+        kassert!(dst_dir.is_detached());
+        kassert_ne_u64(dst_dir.ino(), dst_orig_ino)?;
+        kassert_eq!(dst_dir.stat().map_err(|_| "stat dst_dir detached")?.nlink, 0);
+        kassert!(fs.lookup_live_by_lock_id(dst_dir.lock_id()).is_none());
+        kassert!(matches!(resolve_path(&tables, None, b"/ren_dst_dir", rf), Err(VfsError::NoEnt)));
+
+        let (after_ren, _) = open_inode(
+            &tables,
+            None,
+            b"/after_ren.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create after_ren.bin")?;
+        kassert_eq!(after_ren.inode_type(), InodeType::File);
+        drop(after_ren);
+        unlink_at(&tables, None, b"/after_ren.bin", false).map_err(|_| "cleanup after_ren.bin")?;
+        drop(dst_guard);
+        drop(dst_dir);
+        unlink_at(&tables, None, b"/ren_src_dir", true).map_err(|_| "cleanup ren_src_dir")?;
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+
+        // (b) Inline symlink unlink / rename EIO inside `parent_dir.unlink` and inside
+        //     `zero_inline_symlink_before_unlink` must preserve the original `readlink()` target.
+        let sym = symlink_at(&tables, b"/real/target", None, b"/sym_inline").map_err(|_| "create sym_inline")?;
+        let sym_guard = OpenGuard::new(Arc::clone(&sym));
+
+        fault_cache.arm_write_fail_on(4);
+        kassert!(matches!(unlink_at(&tables, None, b"/sym_inline", false), Err(VfsError::Io)));
+        fault_cache.arm_write_fail_on(0);
+        kassert!(!sym.is_detached());
+        kassert_eq!(sym.stat().map_err(|_| "stat sym after unlink eio")?.nlink, 1);
+        kassert_eq!(sym.readlink().map_err(|_| "sym readlink after unlink eio")?, b"/real/target");
+        kassert_eq!(readlink_at(&tables, None, b"/sym_inline").map_err(|_| "path readlink")?, b"/real/target");
+
+        fault_cache.arm_write_fail_on(2);
+        kassert!(matches!(unlink_at(&tables, None, b"/sym_inline", false), Err(VfsError::Io)));
+        fault_cache.arm_write_fail_on(0);
+        kassert!(!sym.is_detached());
+        kassert_eq!(sym.readlink().map_err(|_| "sym readlink after zeroing eio")?, b"/real/target");
+
+        let sym_src = symlink_at(&tables, b"/other/target", None, b"/sym_src").map_err(|_| "create sym_src")?;
+        drop(sym_src);
+        fault_cache.arm_write_fail_on(4);
+        kassert!(matches!(
+            rename_at2(&tables, None, b"/sym_src", None, b"/sym_inline", RenameFlags::default()),
+            Err(VfsError::Io)
+        ));
+        fault_cache.arm_write_fail_on(0);
+        kassert!(!sym.is_detached());
+        kassert_eq!(sym.readlink().map_err(|_| "sym readlink after rename eio")?, b"/real/target");
+        unlink_at(&tables, None, b"/sym_src", false).map_err(|_| "cleanup sym_src")?;
+
+        unlink_at(&tables, None, b"/sym_inline", false).map_err(|_| "retry unlink sym_inline")?;
+        kassert!(sym.is_detached());
+        kassert_eq!(sym.readlink().map_err(|_| "detached sym readlink")?, b"/real/target");
+        drop(sym_guard);
+        drop(sym);
+
+        // (c) `truncate` shrink `ext4_truncate` EIO after `ext4_write_at` must restore
+        //     original disk bytes `[new_size..4096)` and confine `zeros` to `check_len`.
+        let (tf, _) = open_inode(
+            &tables,
+            None,
+            b"/trunc_partial.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create trunc_partial.bin")?;
+        let aa_8k = vec![0xAAu8; 2 * 4096];
+        kassert_eq!(tf.write_at(0, &aa_8k).map_err(|_| "write aa_8k")?, aa_8k.len());
+        tf.sync(false).map_err(|_| "sync aa_8k")?;
+        let tf_ext4 = fs.lookup_live_by_lock_id(tf.lock_id()).ok_or("lookup tf_ext4")?;
+        kassert_eq!(tf_ext4.reclaim_clean_pages(16), 2);
+
+        fault_cache.arm_write_fail_on(2);
+        kassert!(matches!(tf.truncate(100), Err(VfsError::Io)));
+        fault_cache.arm_write_fail_on(0);
+        kassert_eq!(tf.stat().map_err(|_| "stat tf after eio")?.size, 8192);
+        kassert_eq!(read_all_inode(&tf).map_err(|_| "read tf after eio")?, aa_8k);
+        drop(tf_ext4);
+        drop(tf);
+
+        // Sub-page synced file: `truncate(100)` failure must neither corrupt `[100..200)` nor
+        // extend `disk.size_in_bytes()` to 4096.
+        let (sf, _) = open_inode(
+            &tables,
+            None,
+            b"/trunc_subpage.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create trunc_subpage.bin")?;
+        let bb_200 = vec![0xBBu8; 200];
+        kassert_eq!(sf.write_at(0, &bb_200).map_err(|_| "write bb_200")?, bb_200.len());
+        sf.sync(false).map_err(|_| "sync bb_200")?;
+        let sf_ext4 = fs.lookup_live_by_lock_id(sf.lock_id()).ok_or("lookup sf_ext4")?;
+        kassert_eq!(sf_ext4.reclaim_clean_pages(16), 1);
+
+        fault_cache.arm_write_fail_on(2);
+        kassert!(matches!(sf.truncate(100), Err(VfsError::Io)));
+        fault_cache.arm_write_fail_on(0);
+        kassert_eq!(sf.stat().map_err(|_| "stat sf after eio")?.size, 200);
+        kassert_eq!(read_all_inode(&sf).map_err(|_| "read sf after eio")?, bb_200);
+        drop(sf_ext4);
+        drop(sf);
+
+        fs.sync().map_err(|_| "final sync")?;
+        let ro_dev = MemBlkDev::new(mem_dev.0.data.lock().clone(), true);
+        let ro_bcache: Arc<dyn ext4::BlockCacheBackend> =
+            Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache final")?));
+        let ro_fs =
+            ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 19), true).map_err(|_| "ro mount final")?;
+        let ro_root = ro_fs.root_inode();
+        let ro_tp = ro_root.lookup("trunc_partial.bin").map_err(|_| "ro lookup trunc_partial")?;
+        kassert_eq!(ro_tp.stat().map_err(|_| "ro stat trunc_partial")?.size, 8192);
+        kassert_eq!(read_all_inode(&ro_tp).map_err(|_| "ro read trunc_partial")?, aa_8k);
+        let ro_sp = ro_root.lookup("trunc_subpage.bin").map_err(|_| "ro lookup trunc_subpage")?;
+        kassert_eq!(ro_sp.stat().map_err(|_| "ro stat trunc_subpage")?.size, 200);
+        kassert_eq!(read_all_inode(&ro_sp).map_err(|_| "ro read trunc_subpage")?, bb_200);
 
         Ok(())
     }

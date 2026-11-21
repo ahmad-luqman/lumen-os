@@ -565,19 +565,40 @@ impl Ext4Inode {
         Ok(buf)
     }
 
-    fn zero_inline_symlink_before_unlink(inner: &Ext4FsInner, disk_ino: u32) -> Result<Inode, VfsError> {
+    fn zero_inline_symlink_before_unlink(
+        inner: &Ext4FsInner,
+        disk_ino: u32,
+    ) -> Result<(Inode, Option<SavedInlineSymlink>), VfsError> {
         let idx = NonZeroU32::new(disk_ino).ok_or(VfsError::Inval)?;
         let disk = Inode::read(&inner.ext4, idx).map_err(map_ext4_err)?;
         if disk.links_count() <= 1 && is_inline_symlink(&disk) {
             let off = inner.layout.inode_disk_offset(&inner.bcache, disk_ino)?;
+            let mut inline_60 = [0u8; 60];
+            let mut size_lo_4 = [0u8; 4];
+            let mut size_hi_4 = [0u8; 4];
+            inner.bcache.read_at(off + 0x28, &mut inline_60).map_err(|_| VfsError::Io)?;
+            inner.bcache.read_at(off + 0x04, &mut size_lo_4).map_err(|_| VfsError::Io)?;
+            inner.bcache.read_at(off + 0x6c, &mut size_hi_4).map_err(|_| VfsError::Io)?;
+            let saved = SavedInlineSymlink { off, inline_60, size_lo_4, size_hi_4 };
+
             let zeros60 = [0u8; 60];
             let zero4 = [0u8; 4];
-            inner.bcache.write_at(off + 0x28, &zeros60).map_err(|_| VfsError::Io)?;
-            inner.bcache.write_at(off + 0x04, &zero4).map_err(|_| VfsError::Io)?;
-            inner.bcache.write_at(off + 0x6c, &zero4).map_err(|_| VfsError::Io)?;
-            return Inode::read(&inner.ext4, idx).map_err(map_ext4_err);
+            if inner.bcache.write_at(off + 0x28, &zeros60).is_err()
+                || inner.bcache.write_at(off + 0x04, &zero4).is_err()
+                || inner.bcache.write_at(off + 0x6c, &zero4).is_err()
+            {
+                saved.restore(inner);
+                return Err(VfsError::Io);
+            }
+            return match Inode::read(&inner.ext4, idx) {
+                Ok(zeroed_disk) => Ok((zeroed_disk, Some(saved))),
+                Err(e) => {
+                    saved.restore(inner);
+                    Err(map_ext4_err(e))
+                }
+            };
         }
-        Ok(disk)
+        Ok((disk, None))
     }
 
     /// Phase 1 of Gate 6 detach-while-open: fault non-hole pages (or symlink
@@ -692,6 +713,21 @@ impl Ext4Inode {
         prepared.target.ino.store(next_detached_ino(), Ordering::Release);
         meta_guard.nlink = 0;
         meta_guard.meta_dirty = false;
+    }
+}
+
+struct SavedInlineSymlink {
+    off: u64,
+    inline_60: [u8; 60],
+    size_lo_4: [u8; 4],
+    size_hi_4: [u8; 4],
+}
+
+impl SavedInlineSymlink {
+    fn restore(&self, inner: &Ext4FsInner) {
+        let _ = inner.bcache.write_at(self.off + 0x28, &self.inline_60);
+        let _ = inner.bcache.write_at(self.off + 0x04, &self.size_lo_4);
+        let _ = inner.bcache.write_at(self.off + 0x6c, &self.size_hi_4);
     }
 }
 
@@ -987,8 +1023,16 @@ impl VfsInode for Ext4Inode {
             let mut inner = self.shared.state.lock();
             let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
             let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
-            let child_disk = Self::zero_inline_symlink_before_unlink(&inner, child_arc.disk_ino)?;
-            let remaining = parent_dir.unlink(dname, child_disk).map_err(map_ext4_err)?;
+            let (child_disk, saved_inline) = Self::zero_inline_symlink_before_unlink(&inner, child_arc.disk_ino)?;
+            let remaining = match parent_dir.unlink(dname, child_disk) {
+                Ok(rem) => rem,
+                Err(e) => {
+                    if let Some(saved) = saved_inline {
+                        saved.restore(&inner);
+                    }
+                    return Err(map_ext4_err(e));
+                }
+            };
             if remaining.is_none() {
                 inner.live_inodes.remove(&child_arc.disk_ino);
             }
@@ -1071,22 +1115,37 @@ impl VfsInode for Ext4Inode {
             None
         };
 
-        {
+        let post_res: Result<(), VfsError> = {
             let mut inner = self.shared.state.lock();
             let mut child_disk = Inode::read(&inner.ext4, child_arc.disk_inode_index()).map_err(map_ext4_err)?;
+            let orig_child_links = child_disk.links_count();
             child_disk.set_links_count(1);
             child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
 
-            let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
-            let _ = parent_dir.unlink(dname, child_disk).map_err(map_ext4_err)?;
+            let unlink_res = (|| -> Result<(), VfsError> {
+                let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
+                let _ = parent_dir.unlink(dname, child_disk.clone()).map_err(map_ext4_err)?;
+                Ok(())
+            })();
+            if let Err(e) = unlink_res {
+                child_disk.set_links_count(orig_child_links);
+                let _ = child_disk.write(&inner.ext4);
+                return Err(e);
+            }
 
-            let mut self_after = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let old_links = self_after.links_count();
-            self_after.set_links_count(old_links.saturating_sub(1));
-            self_after.write(&inner.ext4).map_err(map_ext4_err)?;
+            // `parent_dir.unlink` already removed the entry and freed `child_arc.disk_ino`;
+            // remove from `live_inodes` and commit detach unconditionally even if the
+            // subsequent parent link-count update fails.
             inner.live_inodes.remove(&child_arc.disk_ino);
-        }
+            (|| -> Result<(), VfsError> {
+                let mut self_after = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                let old_links = self_after.links_count();
+                self_after.set_links_count(old_links.saturating_sub(1));
+                self_after.write(&inner.ext4).map_err(map_ext4_err)?;
+                Ok(())
+            })()
+        };
 
         let now_ts = duration_to_timespec(realtime_duration());
         let child_meta = find_guard_mut(&mut guards, &child_arc);
@@ -1095,12 +1154,14 @@ impl VfsInode for Ext4Inode {
         } else {
             child_meta.nlink = 0;
         }
-        let self_meta = find_guard_mut(&mut guards, &self_arc);
-        self_meta.nlink = self_meta.nlink.saturating_sub(1);
-        self_meta.mtime = now_ts;
-        self_meta.ctime = now_ts;
-        self_meta.meta_dirty = true;
-        Ok(())
+        if post_res.is_ok() {
+            let self_meta = find_guard_mut(&mut guards, &self_arc);
+            self_meta.nlink = self_meta.nlink.saturating_sub(1);
+            self_meta.mtime = now_ts;
+            self_meta.ctime = now_ts;
+            self_meta.meta_dirty = true;
+        }
+        post_res
     }
 
     fn link(&self, name: &str, target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
@@ -1483,35 +1544,63 @@ impl VfsInode for Ext4Inode {
                 None
             };
 
-            {
+            let post_res: Result<(), VfsError> = {
                 let mut inner = self.shared.state.lock();
                 if new_is_dir {
                     let mut nc_disk =
                         Inode::read(&inner.ext4, new_child_arc.disk_inode_index()).map_err(map_ext4_err)?;
+                    let orig_nc_links = nc_disk.links_count();
                     nc_disk.set_links_count(1);
                     nc_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-                    let np_disk = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                    let _ = Dir::open_inode(&inner.ext4, np_disk)
-                        .map_err(map_ext4_err)?
-                        .unlink(new_dname, nc_disk)
-                        .map_err(map_ext4_err)?;
-                    let mut np_after =
-                        Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                    np_after.set_links_count(np_after.links_count().saturating_sub(1));
-                    np_after.write(&inner.ext4).map_err(map_ext4_err)?;
+                    let unlink_res = (|| -> Result<(), VfsError> {
+                        let np_disk = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
+                        let _ = Dir::open_inode(&inner.ext4, np_disk)
+                            .map_err(map_ext4_err)?
+                            .unlink(new_dname, nc_disk.clone())
+                            .map_err(map_ext4_err)?;
+                        Ok(())
+                    })();
+                    if let Err(e) = unlink_res {
+                        nc_disk.set_links_count(orig_nc_links);
+                        let _ = nc_disk.write(&inner.ext4);
+                        return Err(e);
+                    }
+                    // `unlink` already removed `new_dname` and freed `new_child_arc.disk_ino`;
+                    // remove from `live_inodes` and commit detach unconditionally even if the
+                    // subsequent parent link-count update fails.
                     inner.live_inodes.remove(&new_child_arc.disk_ino);
+                    (|| -> Result<(), VfsError> {
+                        let mut np_after =
+                            Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
+                        np_after.set_links_count(np_after.links_count().saturating_sub(1));
+                        np_after.write(&inner.ext4).map_err(map_ext4_err)?;
+                        Ok(())
+                    })()
                 } else {
-                    let nc_disk = Self::zero_inline_symlink_before_unlink(&inner, new_child_arc.disk_ino)?;
-                    let np_disk = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
-                    let rem = Dir::open_inode(&inner.ext4, np_disk)
-                        .map_err(map_ext4_err)?
-                        .unlink(new_dname, nc_disk)
-                        .map_err(map_ext4_err)?;
+                    let (nc_disk, saved_inline) =
+                        Self::zero_inline_symlink_before_unlink(&inner, new_child_arc.disk_ino)?;
+                    let rem_res = (|| -> Result<Option<Inode>, VfsError> {
+                        let np_disk = Inode::read(&inner.ext4, new_dir_arc.disk_inode_index()).map_err(map_ext4_err)?;
+                        Dir::open_inode(&inner.ext4, np_disk)
+                            .map_err(map_ext4_err)?
+                            .unlink(new_dname, nc_disk)
+                            .map_err(map_ext4_err)
+                    })();
+                    let rem = match rem_res {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if let Some(saved) = saved_inline {
+                                saved.restore(&inner);
+                            }
+                            return Err(e);
+                        }
+                    };
                     if rem.is_none() {
                         inner.live_inodes.remove(&new_child_arc.disk_ino);
                     }
+                    Ok(())
                 }
-            }
+            };
 
             if let Some(prepared) = prepared_detach {
                 let nc_meta = find_guard_mut(&mut guards, new_child_arc);
@@ -1519,8 +1608,10 @@ impl VfsInode for Ext4Inode {
             }
             if new_is_dir {
                 find_guard_mut(&mut guards, new_child_arc).nlink = 0;
-                find_guard_mut(&mut guards, &new_dir_arc).nlink =
-                    find_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_sub(1);
+                if post_res.is_ok() {
+                    find_guard_mut(&mut guards, &new_dir_arc).nlink =
+                        find_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_sub(1);
+                }
             } else if !new_child_arc.is_detached() {
                 let nc_meta = find_guard_mut(&mut guards, new_child_arc);
                 nc_meta.nlink = nc_meta.nlink.saturating_sub(1);
@@ -1529,6 +1620,7 @@ impl VfsInode for Ext4Inode {
                     nc_meta.meta_dirty = true;
                 }
             }
+            post_res?;
         }
 
         // Link `old_child` at `new_name` in `new_dir` FIRST, then unlink `old_name` from `old_dir`.
@@ -1642,21 +1734,42 @@ impl VfsInode for Ext4Inode {
                 let inner = self.shared.state.lock();
                 let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
                 // `ext4plus::truncate` does not zero `[new_size % 4096 .. 4096)`
-                // on disk; zero non-zero disk tail bytes before truncating so a
-                // future extend after cache eviction never leaks stale tail bytes.
+                // on disk; zero non-zero disk tail bytes (confined to `check_len`
+                // so sub-page files are never temporarily extended to 4096)
+                // before truncating, and restore them if `ext4_truncate` fails.
+                let mut saved_tail: Option<Vec<u8>> = None;
                 if tail_rem != 0 && disk.size_in_bytes() > new_size {
                     let tail_end = (new_size / PAGE_SIZE as u64 + 1) * PAGE_SIZE as u64;
                     let check_len = (disk.size_in_bytes().min(tail_end) - new_size) as usize;
                     if check_len > 0 {
                         let mut probe = vec![0u8; check_len];
-                        let n = ext4_read_at(&inner.ext4, &disk, &mut probe, new_size).map_err(map_ext4_err)?;
-                        if probe[..n].iter().any(|&b| b != 0) {
-                            let zeros = vec![0u8; PAGE_SIZE - tail_rem];
-                            let _ = ext4_write_at(&inner.ext4, &mut disk, &zeros, new_size).map_err(map_ext4_err)?;
+                        let mut got = 0usize;
+                        while got < check_len {
+                            let n = ext4_read_at(&inner.ext4, &disk, &mut probe[got..], new_size + got as u64)
+                                .map_err(map_ext4_err)?;
+                            if n == 0 {
+                                break;
+                            }
+                            got += n;
+                        }
+                        if probe[..got].iter().any(|&b| b != 0) {
+                            let zeros = vec![0u8; got];
+                            if let Err(e) = ext4_write_at(&inner.ext4, &mut disk, &zeros, new_size) {
+                                let _ = ext4_write_at(&inner.ext4, &mut disk, &probe[..got], new_size);
+                                return Err(map_ext4_err(e));
+                            }
+                            probe.truncate(got);
+                            saved_tail = Some(probe);
                         }
                     }
                 }
-                ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
+                if let Err(e) = ext4_truncate(&inner.ext4, &mut disk, new_size) {
+                    if let Some(orig_tail) = saved_tail {
+                        let mut restore_disk = Inode::read(&inner.ext4, self.disk_inode_index()).unwrap_or(disk);
+                        let _ = ext4_write_at(&inner.ext4, &mut restore_disk, &orig_tail, new_size);
+                    }
+                    return Err(map_ext4_err(e));
+                }
                 meta.blocks_512 = disk.blocks();
             }
             pages.remove_from(new_size.div_ceil(PAGE_SIZE as u64));
