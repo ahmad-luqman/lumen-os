@@ -4,6 +4,7 @@
 use alloc::vec;
 use core::mem::size_of;
 
+use super::at::{Dirfd, Fd, Mode, UserPtr};
 use super::{
     DEFAULT_RLIMIT_NOFILE, MAX_SINGLE_IO, copy_iovecs, copy_pod_from_user, copy_pod_to_user, neg_errno,
     not_implemented, read_into_user, write_from_user,
@@ -12,6 +13,7 @@ use crate::linux::process::{ConsoleIo, FdKind, with_current, with_current_mut};
 use crate::linux::{errno, general, ioctl};
 use crate::sched;
 use crate::user::{copy_from_user, copy_to_user};
+use lumen_vfs::OpenFlags;
 
 /// Raw Linux x86-64 `struct pollfd` layout (8 bytes, zero padding).
 #[repr(C)]
@@ -287,17 +289,17 @@ pub(super) fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
 }
 
 /// `open(path, flags, mode)` (2): M7 stub.
-pub(super) fn sys_open(_path: u64, _flags: u64, _mode: u64) -> u64 {
+pub(super) fn sys_open(_path: UserPtr, _flags: OpenFlags, _mode: Mode) -> u64 {
     not_implemented(general::__NR_open)
 }
 
 /// `openat(dirfd, path, flags, mode)` (257): M7 stub.
-pub(super) fn sys_openat(_dirfd: u64, _path: u64, _flags: u64, _mode: u64) -> u64 {
+pub(super) fn sys_openat(_dirfd: Dirfd, _path: UserPtr, _flags: OpenFlags, _mode: Mode) -> u64 {
     not_implemented(general::__NR_openat)
 }
 
 /// `lseek(fd, offset, whence)` (8): M7 stub.
-pub(super) fn sys_lseek(_fd: u64, _offset: u64, _whence: u64) -> u64 {
+pub(super) fn sys_lseek(_fd: Fd, _offset: u64, _whence: u32) -> u64 {
     not_implemented(general::__NR_lseek)
 }
 

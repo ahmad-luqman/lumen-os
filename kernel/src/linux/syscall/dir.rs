@@ -1,6 +1,7 @@
 //! Working directory and directory reads: `getcwd` (M6), and M7's
 //! `getdents64`, `chdir`, `fchdir`.
 
+use super::at::{Fd, UserPtr};
 use super::{neg_errno, not_implemented};
 use crate::linux::{errno, general};
 use crate::user::copy_to_user;
@@ -16,17 +17,17 @@ pub(super) fn sys_getcwd(buf: u64, size: u64) -> u64 {
 }
 
 /// `getdents64(fd, dirp, count)` (217): M7 stub.
-pub(super) fn sys_getdents64(_fd: u64, _dirp: u64, _count: u64) -> u64 {
+pub(super) fn sys_getdents64(_fd: Fd, _dirp: UserPtr, _count: u32) -> u64 {
     not_implemented(general::__NR_getdents64)
 }
 
 /// `chdir(path)` (80): M7 stub.
-pub(super) fn sys_chdir(_path: u64) -> u64 {
+pub(super) fn sys_chdir(_path: UserPtr) -> u64 {
     not_implemented(general::__NR_chdir)
 }
 
 /// `fchdir(fd)` (81): M7 stub.
-pub(super) fn sys_fchdir(_fd: u64) -> u64 {
+pub(super) fn sys_fchdir(_fd: Fd) -> u64 {
     not_implemented(general::__NR_fchdir)
 }
 

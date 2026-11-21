@@ -493,7 +493,11 @@ crate::ktest!(
         crate::kassert_eq!(general::PATH_MAX, 4096);
         //    `open` flags: `O_TMPFILE` includes `O_DIRECTORY`, so a check for
         //    `O_DIRECTORY` alone also matches it.
+        crate::kassert_eq!(general::O_RDONLY, 0);
+        crate::kassert_eq!(general::O_WRONLY, 1);
+        crate::kassert_eq!(general::O_RDWR, 2);
         crate::kassert_eq!(general::O_ACCMODE, 3);
+        crate::kassert_eq!(general::O_NOCTTY, 0o400);
         crate::kassert_eq!(general::O_DIRECTORY, 0o200_000);
         crate::kassert_eq!(general::O_NOFOLLOW, 0o400_000);
         crate::kassert_eq!(general::O_CLOEXEC, 0o2_000_000);
@@ -515,15 +519,18 @@ crate::ktest!(
         crate::kassert_eq!(general::F_SETLKW, 7);
         crate::kassert_eq!(general::F_DUPFD_CLOEXEC, 1030);
         crate::kassert_eq!(general::FD_CLOEXEC, 1);
+        crate::kassert_eq!(general::F_RDLCK, 0);
+        crate::kassert_eq!(general::F_WRLCK, 1);
+        crate::kassert_eq!(general::F_UNLCK, 2);
         crate::kassert_eq!(general::LOCK_SH, 1);
         crate::kassert_eq!(general::LOCK_EX, 2);
         crate::kassert_eq!(general::LOCK_NB, 4);
         crate::kassert_eq!(general::LOCK_UN, 8);
-        //    `utimensat`'s `tv_nsec` sentinels (and lumen-vfs's copies).
+        //    `utimensat`'s `tv_nsec` sentinels. (lumen-vfs's copies of these
+        //    and the other flags are checked against linux-raw-sys's at
+        //    compile time, in `syscall/at.rs`.)
         crate::kassert_eq!(general::UTIME_NOW, 0x3fff_ffff);
         crate::kassert_eq!(general::UTIME_OMIT, 0x3fff_fffe);
-        crate::kassert_eq!(i64::from(general::UTIME_NOW), lumen_vfs::SetTime::UTIME_NOW);
-        crate::kassert_eq!(i64::from(general::UTIME_OMIT), lumen_vfs::SetTime::UTIME_OMIT);
         //    `renameat2` flags: `RENAME_WHITEOUT` is one M7 rejects (`-EINVAL`).
         crate::kassert_eq!(general::RENAME_NOREPLACE, 1);
         crate::kassert_eq!(general::RENAME_EXCHANGE, 2);

@@ -1,8 +1,9 @@
 //! Linux x86-64 syscall dispatcher (`docs/ARCHITECTURE.md` §8).
 //!
-//! `dispatch` maps each syscall number to its handler, one `match` arm per
-//! number (a number's constant as the pattern, so the compiler refuses one
-//! routed twice), passing the registers of the syscall's Linux signature.
+//! `dispatch` maps each syscall number to its handler, each number in one
+//! `match` arm (its constant as the pattern, so the compiler refuses one
+//! routed twice), passing the registers of the syscall's Linux signature
+//! (an M7 handler's decoded by `at::reg` into its parameter types).
 //! The handlers live in one module per cluster, so the PRs that implement
 //! M7 (#254, #255) each change only their own module, not `dispatch`:
 //!
@@ -22,14 +23,16 @@
 //!   `getrandom` (M6).
 //!
 //! `at` holds what the M7 file syscalls share: their register decoders
-//! (`Fd`, `Dirfd`, `Mode`, the VFS's flag types, `UserPtr`), `UserPath`
-//! (a path argument copied in) and `stat_from_metadata`.
+//! (`reg`, `FromReg`: `Fd`, `Dirfd`, `Mode`, the VFS's flag types,
+//! `UserPtr`, `u32`/`i32`/`u64`), `UserPath` (a path argument copied in)
+//! and `stat_from_metadata`/`statx_from_metadata`.
 //!
 //! An M7 syscall not implemented yet has a stub that logs once per number
 //! (as an unknown one does, with its name) and returns `-ENOSYS`.
 //!
-//! All user pointers are copied via `.lumen_fixup`-protected `copy_from_user` /
-//! `copy_to_user` with interrupts enabled and no `SpinLock` held. Unknown
+//! All user pointers are copied via `.lumen_fixup`-protected `copy_from_user`,
+//! `copy_to_user` or `copy_cstr_from_user`, with interrupts enabled and no
+//! `SpinLock` held. Unknown
 //! syscalls return `-ENOSYS` and log once per syscall number per boot at
 //! `debug` level.
 
@@ -53,6 +56,7 @@ use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::linux::process::{ConsoleIo, KernelSigaction, record_exit, with_current, with_current_mut};
 use crate::linux::{Utsname, errno, general};
 use crate::user::{CopyError, UserExit, copy_from_user, copy_to_user, user_range_valid};
+use at::reg;
 
 /// Maximum `iovec` count accepted by `readv`/`writev` (POSIX `UIO_MAXIOV`).
 const UIO_MAXIOV: isize = 1024;
@@ -122,12 +126,16 @@ unsafe fn copy_pod_from_user<T: Copy>(user_src: u64) -> Result<T, CopyError> {
 static UNKNOWN_LOW_BITS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16]; // syscall numbers 0..1024
 static UNKNOWN_HIGH_SLOTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]; // up to 8 distinct numbers >= 1024
 
+/// Where syscall `nr`'s record is in `UNKNOWN_LOW_BITS` (word, bit), if it
+/// is below 1024.
+fn low_bit(nr: u64) -> Option<(usize, u64)> {
+    (nr < 1024).then(|| ((nr / 64) as usize, 1u64 << (nr % 64)))
+}
+
 /// Whether this is the first time this boot that syscall `nr` is reported
 /// as unimplemented (and so worth a log line); records it either way.
 fn first_report(nr: u64) -> bool {
-    if nr < 1024 {
-        let idx = (nr / 64) as usize;
-        let bit = 1u64 << (nr % 64);
+    if let Some((idx, bit)) = low_bit(nr) {
         return (UNKNOWN_LOW_BITS[idx].fetch_or(bit, Ordering::Relaxed) & bit) == 0;
     }
     for slot in &UNKNOWN_HIGH_SLOTS {
@@ -173,7 +181,9 @@ fn not_implemented(nr: u32) -> u64 {
 /// Dispatch one Linux x86-64 syscall (`rax` = nr, `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` = args).
 pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
     let nr = frame.rax;
-    // A number past `u32::MAX` is no syscall's: it falls through to the last arm.
+    // A number past `u32::MAX` falls through to the last arm, `-ENOSYS`, as it
+    // always has here. Recent Linux reads only `eax` (its low 32 bits); Lumen
+    // keeps refusing the whole value (`test_syscall_bad_pointers_return_efault`).
     match u32::try_from(nr) {
         // M6.
         Ok(general::__NR_read) => {
@@ -297,177 +307,180 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
 
         // M7 (`crate::linux::M7_SYSCALLS`): each arm passes the arguments of
         // the syscall's Linux x86-64 signature, and no more (`faccessat` and
-        // `fchmodat` take 3, never `r10`).
+        // `fchmodat` take 3, never `r10`), each decoded by `reg` into the
+        // handler's parameter type (`at.rs`).
         Ok(general::__NR_open) => {
-            frame.rax = fd::sys_open(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_open(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_openat) => {
-            frame.rax = fd::sys_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = fd::sys_openat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_lseek) => {
-            frame.rax = fd::sys_lseek(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_lseek(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_stat) => {
-            frame.rax = stat::sys_stat(frame.rdi, frame.rsi);
+            frame.rax = stat::sys_stat(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_lstat) => {
-            frame.rax = stat::sys_lstat(frame.rdi, frame.rsi);
+            frame.rax = stat::sys_lstat(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_newfstatat) => {
-            frame.rax = stat::sys_newfstatat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = stat::sys_newfstatat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_statx) => {
-            frame.rax = stat::sys_statx(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            frame.rax = stat::sys_statx(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_access) => {
-            frame.rax = stat::sys_access(frame.rdi, frame.rsi);
+            frame.rax = stat::sys_access(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_faccessat) => {
-            frame.rax = stat::sys_faccessat(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = stat::sys_faccessat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_faccessat2) => {
-            frame.rax = stat::sys_faccessat2(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = stat::sys_faccessat2(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_mkdir) => {
-            frame.rax = ns::sys_mkdir(frame.rdi, frame.rsi);
+            frame.rax = ns::sys_mkdir(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_mkdirat) => {
-            frame.rax = ns::sys_mkdirat(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = ns::sys_mkdirat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_rmdir) => {
-            frame.rax = ns::sys_rmdir(frame.rdi);
+            frame.rax = ns::sys_rmdir(reg(frame.rdi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_unlink) => {
-            frame.rax = ns::sys_unlink(frame.rdi);
+            frame.rax = ns::sys_unlink(reg(frame.rdi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_unlinkat) => {
-            frame.rax = ns::sys_unlinkat(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = ns::sys_unlinkat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_link) => {
-            frame.rax = ns::sys_link(frame.rdi, frame.rsi);
+            frame.rax = ns::sys_link(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_linkat) => {
-            frame.rax = ns::sys_linkat(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            frame.rax = ns::sys_linkat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_symlink) => {
-            frame.rax = ns::sys_symlink(frame.rdi, frame.rsi);
+            frame.rax = ns::sys_symlink(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_symlinkat) => {
-            frame.rax = ns::sys_symlinkat(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = ns::sys_symlinkat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_readlink) => {
-            frame.rax = ns::sys_readlink(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = ns::sys_readlink(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_readlinkat) => {
-            frame.rax = ns::sys_readlinkat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = ns::sys_readlinkat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_rename) => {
-            frame.rax = ns::sys_rename(frame.rdi, frame.rsi);
+            frame.rax = ns::sys_rename(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_renameat) => {
-            frame.rax = ns::sys_renameat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = ns::sys_renameat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_renameat2) => {
-            frame.rax = ns::sys_renameat2(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            frame.rax =
+                ns::sys_renameat2(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_getdents64) => {
-            frame.rax = dir::sys_getdents64(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = dir::sys_getdents64(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_chdir) => {
-            frame.rax = dir::sys_chdir(frame.rdi);
+            frame.rax = dir::sys_chdir(reg(frame.rdi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fchdir) => {
-            frame.rax = dir::sys_fchdir(frame.rdi);
+            frame.rax = dir::sys_fchdir(reg(frame.rdi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_chmod) => {
-            frame.rax = meta::sys_chmod(frame.rdi, frame.rsi);
+            frame.rax = meta::sys_chmod(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fchmod) => {
-            frame.rax = meta::sys_fchmod(frame.rdi, frame.rsi);
+            frame.rax = meta::sys_fchmod(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fchmodat) => {
-            frame.rax = meta::sys_fchmodat(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = meta::sys_fchmodat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fchmodat2) => {
-            frame.rax = meta::sys_fchmodat2(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = meta::sys_fchmodat2(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_chown) => {
-            frame.rax = meta::sys_chown(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = meta::sys_chown(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fchown) => {
-            frame.rax = meta::sys_fchown(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = meta::sys_fchown(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_lchown) => {
-            frame.rax = meta::sys_lchown(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = meta::sys_lchown(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fchownat) => {
-            frame.rax = meta::sys_fchownat(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            frame.rax =
+                meta::sys_fchownat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_umask) => {
-            frame.rax = meta::sys_umask(frame.rdi);
+            frame.rax = meta::sys_umask(reg(frame.rdi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_utimensat) => {
-            frame.rax = meta::sys_utimensat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = meta::sys_utimensat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_truncate) => {
-            frame.rax = meta::sys_truncate(frame.rdi, frame.rsi);
+            frame.rax = meta::sys_truncate(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_ftruncate) => {
-            frame.rax = meta::sys_ftruncate(frame.rdi, frame.rsi);
+            frame.rax = meta::sys_ftruncate(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_pread64) => {
-            frame.rax = io::sys_pread64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = io::sys_pread64(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_pwrite64) => {
-            frame.rax = io::sys_pwrite64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = io::sys_pwrite64(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fsync) => {
-            frame.rax = io::sys_fsync(frame.rdi);
+            frame.rax = io::sys_fsync(reg(frame.rdi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fdatasync) => {
-            frame.rax = io::sys_fdatasync(frame.rdi);
+            frame.rax = io::sys_fdatasync(reg(frame.rdi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_sync) => {
@@ -475,15 +488,15 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_msync) => {
-            frame.rax = io::sys_msync(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = io::sys_msync(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fcntl) => {
-            frame.rax = lock::sys_fcntl(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = lock::sys_fcntl(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_flock) => {
-            frame.rax = lock::sys_flock(frame.rdi, frame.rsi);
+            frame.rax = lock::sys_flock(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
 
@@ -580,8 +593,9 @@ fn check_stubs(numbers: &[u32]) -> crate::ktest::TestResult {
     for &nr in numbers {
         let name = crate::linux::syscall_name(nr).unwrap_or("?");
         crate::ktest::diag(format_args!("dispatching syscall #{nr} ({name})"));
-        crate::kassert!(nr < 1024);
-        let (idx, bit) = ((nr / 64) as usize, 1u64 << (nr % 64));
+        let Some((idx, bit)) = low_bit(u64::from(nr)) else {
+            return Err("an M7 stub's number is below 1024");
+        };
         let reported_before = UNKNOWN_LOW_BITS[idx].load(Ordering::Relaxed) & bit != 0;
         LAST_STUB.store(u32::MAX, Ordering::Relaxed);
         let mut frame = SyscallFrame { rax: u64::from(nr), ..SyscallFrame::default() };
