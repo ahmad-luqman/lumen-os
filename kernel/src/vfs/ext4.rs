@@ -759,11 +759,13 @@ impl Ext4Inode {
     }
 
     /// A new page, not yet in the cache, holding page `page_idx` as on disk
-    /// and zero past `file_size`: the one fill of a missing page for
-    /// `read_at` and `mmap_page`. Same locks as [`Self::read_disk_page`]. A
-    /// failed read is logged naming the device, inode and page (once per
-    /// failing streak and kind of error): a mapping's fault turns it into
-    /// `SIGBUS`, which says nothing of the disk.
+    /// and zero past `file_size`: the fill of a missing page for `read_at`
+    /// and `mmap_page`. (`write_at`'s partial-page fill calls
+    /// [`Self::read_disk_page`] itself and hands a failure to the writer,
+    /// unlogged.) Same locks as `read_disk_page`. A failed read is logged
+    /// naming the device, inode and page ([`Self::note_read_error`]): a
+    /// mapping's fault turns it into `SIGBUS`, which says nothing of the
+    /// disk.
     fn load_page(&self, page_idx: u64, file_size: u64) -> Result<Arc<CachePage>, VfsError> {
         let tmp = match self.read_disk_page(page_idx, file_size) {
             Ok(tmp) => {
@@ -771,15 +773,7 @@ impl Ext4Inode {
                 tmp
             }
             Err(e) => {
-                if self.read_errno.swap(e.to_errno(), Ordering::AcqRel) != e.to_errno() {
-                    warn!(
-                        target: "vfs",
-                        "ext4 {:?} inode {}: reading page {page_idx} (offset {}) failed: {e:?}",
-                        self.shared.dev,
-                        self.disk_ino,
-                        page_idx * PAGE_SIZE as u64
-                    );
-                }
+                self.note_read_error(e, page_idx);
                 return Err(e);
             }
         };
@@ -847,6 +841,21 @@ impl Ext4Inode {
     fn note_writeback_error(&self, err: VfsError, what: fmt::Arguments<'_>) {
         if self.writeback_errno.swap(err.to_errno(), Ordering::AcqRel) != err.to_errno() {
             warn!(target: "vfs", "ext4 {:?} inode {}: writeback of {what} failed: {err:?}", self.shared.dev, self.disk_ino);
+        }
+    }
+
+    /// Log a page fill's failed disk read once per failing streak (until a
+    /// fill succeeds), and again whenever the kind of error changes.
+    fn note_read_error(&self, err: VfsError, page_idx: u64) {
+        let errno = err.to_errno();
+        if self.read_errno.swap(errno, Ordering::AcqRel) != errno {
+            warn!(
+                target: "vfs",
+                "ext4 {:?} inode {}: reading page {page_idx} (offset {}) failed: {err:?}",
+                self.shared.dev,
+                self.disk_ino,
+                page_idx * PAGE_SIZE as u64
+            );
         }
     }
 
@@ -5194,29 +5203,94 @@ crate::ktest!(
         // A page fill whose disk read fails: `Io`, nothing cached, and one
         // warning naming the device, inode and page for the failing streak
         // (a mapping's fault turns the error into SIGBUS, which names
-        // nothing); the next fill reads the page.
+        // nothing); the next fill reads the page and ends the streak, so the
+        // next failure warns again. Page 1, so a wrong offset shows. (Two
+        // warnings in all, pinned by test_ktest.py.)
         use self::ktest_util::*;
         use crate::vfs::mmap_page;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 250)?;
-        let data = pattern(PAGE_SIZE, 9);
+        let data = pattern(2 * PAGE_SIZE, 9);
         let f = m.root.create("bad.bin", 0o644).map_err(|_| "create")?;
-        kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, PAGE_SIZE);
+        kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
         f.sync(false).map_err(|_| "sync")?;
         let e = ext4_inode(&f)?;
         e.pages.lock().remove_from(0); // filled from the disk next
         m.cache.fail_reads.store(true, O::Release);
-        let first = mmap_page(&f, 0).err();
-        let second = mmap_page(&f, 0).err(); // same streak: not logged again
+        let first = mmap_page(&f, 1).err(); // warns
+        let second = mmap_page(&f, 1).err(); // same streak: not logged again
         m.cache.clear();
         kassert_eq!(first, Some(VfsError::Io));
         kassert_eq!(second, Some(VfsError::Io));
         kassert_eq!(e.pages.lock().len(), 0);
-        let mapped = mmap_page(&f, 0).map_err(|_| "map after the fault")?;
+        let mapped = mmap_page(&f, 1).map_err(|_| "map after the fault")?;
         let mut got = [0u8; PAGE_SIZE];
         mapped.page().read_bytes(0, &mut got);
-        kassert!(got[..] == data[..]);
+        kassert!(got[..] == data[PAGE_SIZE..]);
+        drop(mapped);
+        e.pages.lock().remove_from(0);
+        m.cache.fail_reads.store(true, O::Release);
+        let third = mmap_page(&f, 1).err(); // a new streak: warns again
+        m.cache.clear();
+        kassert_eq!(third, Some(VfsError::Io));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mmap_page_maps_holes_in_linked_and_detached_files() {
+        // A hole in a linked, sparse ext4 file is read from the disk, as
+        // zeros. A hole in a detached file (unlinked while open: its blocks
+        // are freed, its data held in its pages) gets a zero page from the
+        // detached quota, never a read of the freed blocks; the ext4 hard
+        // limit doesn't apply to it, and the used-up quota refuses it.
+        use self::ktest_util::*;
+        use crate::vfs::mmap_page;
+        use crate::{kassert, kassert_eq};
+        use page_cache::{DETACHED_QUOTA, DETACHED_QUOTA_PAGES, DetachedQuotaGuard, detached_cached_pages};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 251)?;
+        let data = pattern(PAGE_SIZE, 13);
+        let f = m.root.create("sparse.bin", 0o644).map_err(|_| "create")?;
+        kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, PAGE_SIZE);
+        f.truncate(4 * PAGE_SIZE as u64).map_err(|_| "truncate")?; // pages 1-3: holes
+        f.sync(false).map_err(|_| "sync")?;
+        let e = ext4_inode(&f)?;
+        let mut got = [0xa5u8; PAGE_SIZE];
+        // Linked: page 3 is filled from the disk, as zeros.
+        kassert_eq!(e.pages.lock().len(), 1);
+        let hole = mmap_page(&f, 3).map_err(|_| "map a linked hole")?;
+        hole.page().read_bytes(0, &mut got);
+        kassert!(got.iter().all(|&b| b == 0));
+        drop(hole);
+        e.pages.lock().remove_from(1); // the holes uncached again
+        // Open, then unlink: detached, page 0 kept in memory.
+        let open = lumen_vfs::OpenGuard::new(Arc::clone(&f));
+        m.root.unlink("sparse.bin").map_err(|_| "unlink")?;
+        kassert!(f.is_detached());
+        kassert_eq!(e.pages.lock().len(), 1);
+        let before = detached_cached_pages();
+        // With the ext4 cache "at its hard limit" (any count is), a detached
+        // hole is still mapped: a zero page, counted as detached.
+        page_cache::set_ext4_limits_for_test(Some((usize::MAX, 0)));
+        let mapped = mmap_page(&f, 1);
+        page_cache::set_ext4_limits_for_test(None);
+        let mapped = mapped.map_err(|_| "map a detached hole")?;
+        got.fill(0xa5);
+        mapped.page().read_bytes(0, &mut got);
+        kassert!(got.iter().all(|&b| b == 0));
+        kassert_eq!(detached_cached_pages(), before + 1);
+        kassert_eq!(e.pages.lock().len(), 2);
+        // The detached quota used up: the next hole is refused.
+        let mut rest = DetachedQuotaGuard::new();
+        let reserved = rest.try_reserve(DETACHED_QUOTA_PAGES - DETACHED_QUOTA.used_pages());
+        let refused = mmap_page(&f, 2).err();
+        drop(rest);
+        reserved.map_err(|_| "reserve the rest of the detached quota")?;
+        kassert_eq!(refused, Some(VfsError::NoSpc));
+        kassert_eq!(detached_cached_pages(), before + 1);
+        drop(mapped);
+        drop(open);
         Ok(())
     }
 );

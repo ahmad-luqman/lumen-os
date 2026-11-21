@@ -212,8 +212,9 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 4,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 2,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
-    # ext4_mmap_page_reports_a_failed_disk_read: two failed fills, one streak.
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 0 \(offset 0\) failed: Io": 1,
+    # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
+    # fills, a good one, a third failed fill), one warning each.
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 2,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 1,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;

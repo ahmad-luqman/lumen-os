@@ -68,7 +68,8 @@ static HARD_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
 /// refused, to a write (`write_at`) or a mapping (`mmap_page`). The cache
 /// is full of pages reclaim can't drop: dirty pages whose writeback keeps
 /// failing (its own warning names the inode), or pages pinned by mappings,
-/// which only unmapping frees. Writes and new mapped pages of any file now
+/// which only unmapping frees. Writes and new mapped pages of any linked
+/// file (detached files use their own quota) now
 /// fail with `ENOSPC`.
 pub fn note_hard_limit_refusal() {
     if !HARD_LIMIT_WARNED.swap(true, Ordering::AcqRel) {
@@ -296,9 +297,10 @@ impl CachePage {
 
     /// True if explicitly dirtied or currently mapped writable via `MAP_SHARED`.
     ///
-    /// The count is loaded first (Acquire), then `dirty`. Reclaim calls this
-    /// holding only Lock 5, which an unmap's [`dec_writable_maps`] doesn't
-    /// take, and can be preempted between the loads. Read the other way
+    /// The count is loaded first (Acquire), then `dirty`. Reclaim (and
+    /// `fsync`'s `collect_dirty`) calls this holding Locks 4 and 5, neither
+    /// of which an unmap's [`dec_writable_maps`] takes, and can be preempted
+    /// between the loads. Read the other way
     /// round, it could see `dirty` still clear, then the count already 0,
     /// and evict a page whose mapped stores were never written. A count of
     /// 0 read with Acquire synchronises with that decrement, so the `dirty`
@@ -313,8 +315,8 @@ impl CachePage {
         mapped_writable || self.dirty.load(Ordering::Acquire)
     }
 
-    /// Mark the page dirty: a kernel write, or (crate-visible for #255's
-    /// page-fault path) a writable `MAP_SHARED` fault.
+    /// Mark the page dirty: a kernel write, or a writable `MAP_SHARED` fault
+    /// (#255's page-fault path, hence `pub` for now).
     #[inline]
     pub fn set_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
@@ -327,17 +329,19 @@ impl CachePage {
         self.dirty.swap(val, Ordering::AcqRel)
     }
 
-    #[allow(dead_code)]
+    /// How many `PRESENT | WRITABLE | PTE_SHARED` mappings the page has.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn writable_maps(&self) -> u32 {
         self.writable_maps.load(Ordering::Acquire)
     }
 
-    /// One more `PRESENT | WRITABLE | PTE_SHARED` mapping of this page.
-    /// Crate-visible for #255's page-fault path, which calls it with
-    /// [`set_dirty`](Self::set_dirty); #255's next part puts the pair behind
-    /// an RAII guard and makes this and `dec_writable_maps` `pub(super)`.
-    #[allow(dead_code)]
+    /// One more `PRESENT | WRITABLE | PTE_SHARED` mapping of this page, for
+    /// #255's page-fault path, which calls it with
+    /// [`set_dirty`](Self::set_dirty). `pub` is temporary: once #255's next
+    /// part puts the pair behind an RAII guard, this and
+    /// `dec_writable_maps` become `pub(super)`.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn inc_writable_maps(&self) {
         self.writable_maps.fetch_add(1, Ordering::AcqRel);
@@ -358,9 +362,9 @@ impl CachePage {
     /// still hold the writable entry is flushed (in M7, the one CPU's
     /// `invlpg`). A store landing later, through a stale entry, after a
     /// writeback cleared `dirty`, would be lost again (ARCHITECTURE section
-    /// 5's unmap order). Crate-visible for #255's unmap paths until the RAII
-    /// guard that [`inc_writable_maps`](Self::inc_writable_maps) mentions.
-    #[allow(dead_code)]
+    /// 5's unmap order). `pub` for #255's unmap paths, temporarily: see
+    /// [`inc_writable_maps`](Self::inc_writable_maps).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn dec_writable_maps(&self) {
         self.dirty.store(true, Ordering::Release);
@@ -373,8 +377,9 @@ impl CachePage {
     /// lies below the file's size (`PAGE_SIZE` for a page wholly inside it).
     ///
     /// The byte accessors are `vfs`-private and need the page's Lock 5, so
-    /// `mm` can't name them; this is its one way to a page's bytes, and it
-    /// needs no lock. A kernel `write_at` or a `MAP_SHARED` store racing the
+    /// `mm` can't name them; this is its one way to copy a page's bytes (it
+    /// maps a page zero-copy through [`phys_frame`](Self::phys_frame)), and
+    /// it needs no lock. A kernel `write_at` or a `MAP_SHARED` store racing the
     /// copy leaves some mix of old and new bytes in `dst`, as on Linux (see
     /// the module's comment); nothing else can go wrong, since the caller
     /// owns `dst`.
@@ -510,9 +515,7 @@ pub(super) mod ktest_hooks {
 
     pub(super) fn between_dirty_loads(page: &CachePage) {
         let me = core::ptr::from_ref(page).addr();
-        if DEC_BETWEEN_DIRTY_LOADS.load(Ordering::Relaxed) == me
-            && DEC_BETWEEN_DIRTY_LOADS.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()
-        {
+        if DEC_BETWEEN_DIRTY_LOADS.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
             page.dec_writable_maps();
         }
     }
