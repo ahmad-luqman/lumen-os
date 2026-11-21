@@ -2646,8 +2646,17 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
         let ro_fs = mount_ro_snapshot(&m, 34)?;
         let ro_sd = ro_fs.root_inode().lookup("sd").map_err(|_| "ro lookup sd")?;
         let ro_dd = ro_fs.root_inode().lookup("dd").map_err(|_| "ro lookup dd")?;
-        kassert_eq!(sd.stat().map_err(|_| "stat sd")?.nlink, ro_sd.stat().map_err(|_| "ro stat sd")?.nlink);
-        kassert_eq!(dd.stat().map_err(|_| "stat dd")?.nlink, ro_dd.stat().map_err(|_| "ro stat dd")?.nlink);
+        let sd_nlink = sd.stat().map_err(|_| "stat sd")?.nlink;
+        let dd_nlink = dd.stat().map_err(|_| "stat dd")?.nlink;
+        let ro_sd_nlink = ro_sd.stat().map_err(|_| "ro stat sd")?.nlink;
+        let ro_dd_nlink = ro_dd.stat().map_err(|_| "ro stat dd")?.nlink;
+        if res.is_ok() {
+            kassert_eq!(sd_nlink, ro_sd_nlink);
+            kassert_eq!(dd_nlink, ro_dd_nlink);
+        } else {
+            kassert!(sd_nlink <= ro_sd_nlink);
+            kassert!(dd_nlink <= ro_dd_nlink);
+        }
         drop(ro_fs);
 
         match (resolve_path(&m.tables, None, b"/sd/sub", rf), resolve_path(&m.tables, None, b"/dd/sub", rf)) {
@@ -2716,8 +2725,17 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
         let ro_fs = mount_ro_snapshot(&m, 37)?;
         let ro_sd = ro_fs.root_inode().lookup("sd").map_err(|_| "ro sd ex")?;
         let ro_dd = ro_fs.root_inode().lookup("dd").map_err(|_| "ro dd ex")?;
-        kassert_eq!(sd.stat().map_err(|_| "stat sd ex")?.nlink, ro_sd.stat().map_err(|_| "ro stat sd ex")?.nlink);
-        kassert_eq!(dd.stat().map_err(|_| "stat dd ex")?.nlink, ro_dd.stat().map_err(|_| "ro stat dd ex")?.nlink);
+        let sd_nlink = sd.stat().map_err(|_| "stat sd ex")?.nlink;
+        let dd_nlink = dd.stat().map_err(|_| "stat dd ex")?.nlink;
+        let ro_sd_nlink = ro_sd.stat().map_err(|_| "ro stat sd ex")?.nlink;
+        let ro_dd_nlink = ro_dd.stat().map_err(|_| "ro stat dd ex")?.nlink;
+        if res.is_ok() {
+            kassert_eq!(sd_nlink, ro_sd_nlink);
+            kassert_eq!(dd_nlink, ro_dd_nlink);
+        } else {
+            kassert!(sd_nlink <= ro_sd_nlink);
+            kassert!(dd_nlink <= ro_dd_nlink);
+        }
         drop(ro_fs);
 
         let a_at_sd = resolve_path(&m.tables, None, b"/sd/dir_a", rf).is_ok_and(|r| r.inode.ino() == da.ino());
@@ -3264,6 +3282,11 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         let da = resolve_path(&m.tables, None, b"/sd/da", rf).map_err(|_| "resolve da ex d")?.inode;
         let db = resolve_path(&m.tables, None, b"/dd/db", rf).map_err(|_| "resolve db ex d")?.inode;
 
+        let orig_da_ino = da.ino();
+        let orig_db_ino = db.ino();
+        let ga = OpenGuard::new(Arc::clone(&da));
+        let gb = OpenGuard::new(Arc::clone(&db));
+
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/da", None, b"/dd/db", RenameFlags(RenameFlags::EXCHANGE));
         m.fault_cache.arm_write_fail_on(0);
@@ -3271,42 +3294,60 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         let ro_fs = mount_ro_snapshot(&m, 57)?;
         let ro_sd = ro_fs.root_inode().lookup("sd").map_err(|_| "ro sd ex d")?;
         let ro_dd = ro_fs.root_inode().lookup("dd").map_err(|_| "ro dd ex d")?;
-        kassert_eq!(sd.stat().map_err(|_| "stat sd ex d")?.nlink, ro_sd.stat().map_err(|_| "ro stat sd ex d")?.nlink);
-        kassert_eq!(dd.stat().map_err(|_| "stat dd ex d")?.nlink, ro_dd.stat().map_err(|_| "ro stat dd ex d")?.nlink);
+        let sd_nlink = sd.stat().map_err(|_| "stat sd ex d")?.nlink;
+        let dd_nlink = dd.stat().map_err(|_| "stat dd ex d")?.nlink;
+        let ro_sd_nlink = ro_sd.stat().map_err(|_| "ro stat sd ex d")?.nlink;
+        let ro_dd_nlink = ro_dd.stat().map_err(|_| "ro stat dd ex d")?.nlink;
+        if res.is_ok() {
+            kassert_eq!(sd_nlink, ro_sd_nlink);
+            kassert_eq!(dd_nlink, ro_dd_nlink);
+        } else {
+            kassert!(sd_nlink <= ro_sd_nlink);
+            kassert!(dd_nlink <= ro_dd_nlink);
+        }
         drop(ro_fs);
 
-        let da_at_dd = resolve_path(&m.tables, None, b"/dd/db", rf).is_ok_and(|r| r.inode.ino() == da.ino());
-        let db_at_sd = resolve_path(&m.tables, None, b"/sd/da", rf).is_ok_and(|r| r.inode.ino() == db.ino());
+        let da_at_dd = resolve_path(&m.tables, None, b"/dd/db", rf).is_ok_and(|r| r.inode.ino() == orig_da_ino);
+        let db_at_sd = resolve_path(&m.tables, None, b"/sd/da", rf).is_ok_and(|r| r.inode.ino() == orig_db_ino);
         if da_at_dd && db_at_sd {
             let da_dotdot = resolve_path(&m.tables, None, b"/dd/db/..", rf).map_err(|_| "resolve da ..")?.inode;
             let db_dotdot = resolve_path(&m.tables, None, b"/sd/da/..", rf).map_err(|_| "resolve db ..")?.inode;
-            let mut mismatches = 0usize;
-            if da.stat().map_err(|_| "stat da post")?.nlink != 2 {
-                mismatches += 1;
-            }
-            if db.stat().map_err(|_| "stat db post")?.nlink != 2 {
-                mismatches += 1;
-            }
-            if sd.stat().map_err(|_| "stat sd post")?.nlink != 3 {
-                mismatches += 1;
-            }
-            if dd.stat().map_err(|_| "stat dd post")?.nlink != 3 {
-                mismatches += 1;
-            }
+            let mut dotdot_mismatches = 0usize;
+            kassert_eq!(da.stat().map_err(|_| "stat da post")?.nlink, 2);
+            kassert_eq!(db.stat().map_err(|_| "stat db post")?.nlink, 2);
+            kassert_eq!(sd.stat().map_err(|_| "stat sd post")?.nlink, 3);
+            kassert_eq!(dd.stat().map_err(|_| "stat dd post")?.nlink, 3);
             if da_dotdot.ino() != dd.ino() {
-                mismatches += 1;
+                dotdot_mismatches += 1;
             }
             if db_dotdot.ino() != sd.ino() {
-                mismatches += 1;
+                dotdot_mismatches += 1;
             }
             if res.is_ok() {
-                kassert_eq!(mismatches, 0);
+                kassert_eq!(dotdot_mismatches, 0);
             } else {
-                // Best-effort post_res: a single write failure may affect at most 1 of the 6 independent fixups.
-                kassert!(mismatches <= 1);
+                kassert!(dotdot_mismatches <= 1);
             }
+            drop((da_dotdot, db_dotdot));
+            unlink_at(&m.tables, None, b"/dd/db", true).map_err(|_| "rmdir swapped da")?;
+            unlink_at(&m.tables, None, b"/sd/da", true).map_err(|_| "rmdir swapped db")?;
+            kassert!(da.is_detached());
+            kassert!(db.is_detached());
+            kassert_eq!(da.stat().map_err(|_| "stat da detached")?.nlink, 0);
+            kassert_eq!(db.stat().map_err(|_| "stat db detached")?.nlink, 0);
+            kassert!(m.fs.lookup_live_by_lock_id(da.lock_id()).is_none());
+            kassert!(m.fs.lookup_live_by_lock_id(db.lock_id()).is_none());
+            drop((ga, gb, da, db));
+            let reuse_a = mkdir_at(&m.tables, None, b"/reuse_ex_a", 0o755, 0).map_err(|_| "mkdir reuse_ex_a")?.ino();
+            let reuse_b = mkdir_at(&m.tables, None, b"/reuse_ex_b", 0o755, 0).map_err(|_| "mkdir reuse_ex_b")?.ino();
+            kassert!(
+                (reuse_a == orig_da_ino && reuse_b == orig_db_ino)
+                    || (reuse_a == orig_db_ino && reuse_b == orig_da_ino)
+            );
+            drop((sd, dd, m));
+        } else {
+            drop((ga, gb, sd, dd, da, db, m));
         }
-        drop((sd, dd, da, db, m));
         kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
     }
 
@@ -3573,6 +3614,428 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     Ok(())
 }
 
+#[cfg(feature = "ktest")]
+#[inline(never)]
+fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
+    use crate::{kassert, kassert_eq};
+    use core::sync::atomic::Ordering;
+
+    let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
+
+    let ro_ino_at = |img: &[u8], dir_name: Option<&str>, name: &str, minor: u32| -> Result<u64, &'static str> {
+        let ro_dev = MemBlkDev::new(img.to_vec(), true);
+        let ro_bc: Arc<dyn ext4::BlockCacheBackend> =
+            Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(ro_dev, 32).map_err(|_| "ro bc")?));
+        let ro_fs = ext4::Ext4FileSystem::mount(ro_bc, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
+        let dir = match dir_name {
+            Some(d) => ro_fs.root_inode().lookup(d).map_err(|_| "ro lookup parent")?,
+            None => ro_fs.root_inode(),
+        };
+        Ok(dir.lookup(name).map_err(|_| "ro lookup child")?.ino())
+    };
+
+    // (A) rename_at2 step-2 Pair(2,3)/From(2) (and Pair(3,4)/From(3) for dir), cold-cache & pinned,
+    //     cross-dir & same-dir, across regular file, inline symlink, and directory.
+    #[derive(Clone, Copy)]
+    enum EntryKind {
+        File,
+        Symlink,
+        Dir,
+    }
+    for &kind in &[EntryKind::File, EntryKind::Symlink, EntryKind::Dir] {
+        for &same_dir in &[false, true] {
+            let m = mount_test_ext4(base_img.to_vec(), 70)?;
+            mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd A")?;
+            if !same_dir {
+                mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd A")?;
+            }
+            let src_path: &[u8] = b"/sd/item";
+            let dst_path: &[u8] = if same_dir { b"/sd/item2" } else { b"/dd/item" };
+            match kind {
+                EntryKind::File => {
+                    let (f, _) = open_inode(
+                        &m.tables,
+                        None,
+                        src_path,
+                        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                        0o644,
+                        0,
+                    )
+                    .map_err(|_| "create src file A")?;
+                    kassert_eq!(f.write_at(0, b"UP_FILE").map_err(|_| "write src file A")?, 7);
+                }
+                EntryKind::Symlink => {
+                    symlink_at(&m.tables, b"/up/sym/target", None, src_path).map_err(|_| "symlink src A")?;
+                }
+                EntryKind::Dir => {
+                    mkdir_at(&m.tables, None, src_path, 0o755, 0).map_err(|_| "mkdir src dir A")?;
+                }
+            }
+            m.fs.sync().map_err(|_| "sync A")?;
+            let snap = m.mem_dev.0.data.lock().clone();
+            let orig_ino = ro_ino_at(&snap, Some("sd"), "item", 71)?;
+            drop(m);
+
+            let faults: &[(usize, usize)] = match kind {
+                EntryKind::Dir => &[(2, 3), (3, 4), (2, 0), (3, 0)],
+                _ => &[(2, 3), (2, 0)],
+            };
+            for &pinned in &[false, true] {
+                for &(c1, c2) in faults {
+                    let m = mount_test_ext4(snap.clone(), 72)?;
+                    let pinned_inode = if pinned {
+                        Some(resolve_path(&m.tables, None, src_path, rf).map_err(|_| "pin src A")?.inode)
+                    } else {
+                        None
+                    };
+                    let pinned_guard = pinned_inode.as_ref().map(|n| OpenGuard::new(Arc::clone(n)));
+
+                    if c2 == 0 {
+                        m.fault_cache.arm_write_fail_from(c1);
+                    } else {
+                        m.fault_cache.arm_write_fail_pair(c1, c2);
+                    }
+                    let res = rename_at2(&m.tables, None, src_path, None, dst_path, RenameFlags::default());
+                    m.fault_cache.arm_write_fail_on(0);
+                    kassert!(matches!(res, Err(VfsError::Io)));
+
+                    let src_ok = resolve_path(&m.tables, None, src_path, rf).ok().map(|r| r.inode);
+                    let dst_ok = resolve_path(&m.tables, None, dst_path, rf).ok().map(|r| r.inode);
+                    let target = src_ok.as_ref().or(dst_ok.as_ref()).ok_or("missing item A")?;
+                    kassert_eq!(target.ino(), orig_ino);
+                    let g = OpenGuard::new(Arc::clone(target));
+                    let is_dir = matches!(kind, EntryKind::Dir);
+                    if src_ok.is_some() && dst_ok.is_some() {
+                        unlink_at(&m.tables, None, src_path, is_dir).map_err(|_| "unlink src dual A")?;
+                        kassert!(!target.is_detached());
+                        unlink_at(&m.tables, None, dst_path, is_dir).map_err(|_| "unlink dst dual A")?;
+                    } else if src_ok.is_some() {
+                        unlink_at(&m.tables, None, src_path, is_dir).map_err(|_| "unlink src A")?;
+                    } else {
+                        unlink_at(&m.tables, None, dst_path, is_dir).map_err(|_| "unlink dst A")?;
+                    }
+                    kassert!(target.is_detached());
+                    kassert_eq!(target.stat().map_err(|_| "stat detached A")?.nlink, 0);
+                    kassert!(m.fs.lookup_live_by_lock_id(target.lock_id()).is_none());
+                    let target_clone = Arc::clone(target);
+                    drop((g, src_ok, dst_ok, pinned_guard, pinned_inode));
+                    drop(target_clone);
+
+                    let reuse_ino = match kind {
+                        EntryKind::File => open_inode(
+                            &m.tables,
+                            None,
+                            b"/reuse_a",
+                            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                            0o644,
+                            0,
+                        )
+                        .map_err(|_| "reuse file A")?
+                        .0
+                        .ino(),
+                        EntryKind::Symlink => {
+                            symlink_at(&m.tables, b"/t", None, b"/reuse_a").map_err(|_| "reuse sym A")?.ino()
+                        }
+                        EntryKind::Dir => {
+                            mkdir_at(&m.tables, None, b"/reuse_a", 0o755, 0).map_err(|_| "reuse dir A")?.ino()
+                        }
+                    };
+                    kassert_eq!(reuse_ino, orig_ino);
+                    drop(m);
+                    kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+                }
+            }
+        }
+    }
+
+    // (B) RENAME_EXCHANGE Pair(2,3)/From(2), cold-cache & pinned, cross-dir & same-dir,
+    //     verifying detach (is_detached, nlink == 0, live_inodes cleared) and exact inode reuse.
+    struct ExCase {
+        same_dir: bool,
+        a_kind: EntryKind,
+        b_kind: EntryKind,
+    }
+    let ex_cases = [
+        ExCase { same_dir: false, a_kind: EntryKind::File, b_kind: EntryKind::File },
+        ExCase { same_dir: false, a_kind: EntryKind::Dir, b_kind: EntryKind::Symlink },
+        ExCase { same_dir: false, a_kind: EntryKind::Dir, b_kind: EntryKind::Dir },
+        ExCase { same_dir: true, a_kind: EntryKind::File, b_kind: EntryKind::File },
+        ExCase { same_dir: true, a_kind: EntryKind::Dir, b_kind: EntryKind::File },
+    ];
+    for case in &ex_cases {
+        let m = mount_test_ext4(base_img.to_vec(), 73)?;
+        mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd B")?;
+        if !case.same_dir {
+            mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd B")?;
+        }
+        let path_a: &[u8] = b"/sd/ea";
+        let path_b: &[u8] = if case.same_dir { b"/sd/eb" } else { b"/dd/eb" };
+        let make_entry = |path: &[u8], kind: EntryKind| -> Result<(), &'static str> {
+            match kind {
+                EntryKind::File => {
+                    let (f, _) = open_inode(
+                        &m.tables,
+                        None,
+                        path,
+                        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                        0o644,
+                        0,
+                    )
+                    .map_err(|_| "create ex B")?;
+                    kassert_eq!(f.write_at(0, b"EX_DATA").map_err(|_| "write ex B")?, 7);
+                }
+                EntryKind::Symlink => {
+                    symlink_at(&m.tables, b"/ex/sym/target", None, path).map_err(|_| "sym ex B")?;
+                }
+                EntryKind::Dir => {
+                    mkdir_at(&m.tables, None, path, 0o755, 0).map_err(|_| "mkdir ex B")?;
+                }
+            }
+            Ok(())
+        };
+        make_entry(path_a, case.a_kind)?;
+        make_entry(path_b, case.b_kind)?;
+        m.fs.sync().map_err(|_| "sync B")?;
+        let snap = m.mem_dev.0.data.lock().clone();
+        let orig_a_ino = ro_ino_at(&snap, Some("sd"), "ea", 74)?;
+        let orig_b_ino = ro_ino_at(&snap, Some(if case.same_dir { "sd" } else { "dd" }), "eb", 75)?;
+        drop(m);
+
+        for &pinned in &[false, true] {
+            for &use_from in &[false, true] {
+                let m = mount_test_ext4(snap.clone(), 76)?;
+                let pin_pair = if pinned {
+                    let na = resolve_path(&m.tables, None, path_a, rf).map_err(|_| "pin ea")?.inode;
+                    let nb = resolve_path(&m.tables, None, path_b, rf).map_err(|_| "pin eb")?.inode;
+                    let ga = OpenGuard::new(Arc::clone(&na));
+                    let gb = OpenGuard::new(Arc::clone(&nb));
+                    Some((na, nb, ga, gb))
+                } else {
+                    None
+                };
+
+                if use_from {
+                    m.fault_cache.arm_write_fail_from(2);
+                } else {
+                    m.fault_cache.arm_write_fail_pair(2, 3);
+                }
+                let res = rename_at2(&m.tables, None, path_a, None, path_b, RenameFlags(RenameFlags::EXCHANGE));
+                m.fault_cache.arm_write_fail_on(0);
+                kassert!(matches!(res, Err(VfsError::Io)));
+
+                let cur_a = resolve_path(&m.tables, None, path_a, rf).map_err(|_| "resolve post ea")?.inode;
+                let cur_b = resolve_path(&m.tables, None, path_b, rf).map_err(|_| "resolve post eb")?.inode;
+                let ga = OpenGuard::new(Arc::clone(&cur_a));
+                let gb = OpenGuard::new(Arc::clone(&cur_b));
+                let cur_a_is_dir = cur_a.inode_type() == InodeType::Dir;
+                let cur_b_is_dir = cur_b.inode_type() == InodeType::Dir;
+                unlink_at(&m.tables, None, path_a, cur_a_is_dir).map_err(|_| "unlink post ea")?;
+                unlink_at(&m.tables, None, path_b, cur_b_is_dir).map_err(|_| "unlink post eb")?;
+                kassert!(cur_a.is_detached());
+                kassert!(cur_b.is_detached());
+                kassert_eq!(cur_a.stat().map_err(|_| "stat detached ea")?.nlink, 0);
+                kassert_eq!(cur_b.stat().map_err(|_| "stat detached eb")?.nlink, 0);
+                kassert!(m.fs.lookup_live_by_lock_id(cur_a.lock_id()).is_none());
+                kassert!(m.fs.lookup_live_by_lock_id(cur_b.lock_id()).is_none());
+                drop((ga, gb, cur_a, cur_b, pin_pair));
+
+                let (ra, _) = open_inode(
+                    &m.tables,
+                    None,
+                    b"/reuse_b1",
+                    OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                    0o644,
+                    0,
+                )
+                .map_err(|_| "reuse b1")?;
+                let (rb, _) = open_inode(
+                    &m.tables,
+                    None,
+                    b"/reuse_b2",
+                    OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                    0o644,
+                    0,
+                )
+                .map_err(|_| "reuse b2")?;
+                let r1 = ra.ino();
+                let r2 = rb.ino();
+                kassert!((r1 == orig_a_ino && r2 == orig_b_ino) || (r1 == orig_b_ino && r2 == orig_a_ino));
+                drop((ra, rb, m));
+                kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+            }
+        }
+    }
+
+    // (C) Cold-cache directories carrying a pre-existing nlink_floor entering rename step-2
+    //     (!same_parent & same_parent) and RENAME_EXCHANGE, plus nlink_ceiling same_parent & !same_parent.
+    // (C1) !same_parent rename step-2 & RENAME_EXCHANGE with new_dir carrying nlink_floor = 2 (disk = 1)
+    let m = mount_test_ext4(base_img.to_vec(), 77)?;
+    let fd = mkdir_at(&m.tables, None, b"/floor_d", 0o755, 0).map_err(|_| "mkdir floor_d")?;
+    let fd_orig_ino = fd.ino();
+    drop(fd);
+    mkdir_at(&m.tables, None, b"/other", 0o755, 0).map_err(|_| "mkdir other")?;
+    mkdir_at(&m.tables, None, b"/other/mv_sub", 0o755, 0).map_err(|_| "mkdir mv_sub")?;
+    m.fs.sync().map_err(|_| "sync C1")?;
+    let snap_c1 = m.mem_dev.0.data.lock().clone();
+    drop(m);
+
+    // Arm Pair(2, 3) on rmdir("/floor_d") in cold cache -> /floor_d has disk links_count == 1, nlink_floor == 2.
+    {
+        let m = mount_test_ext4(snap_c1.clone(), 78)?;
+        m.fault_cache.arm_write_fail_pair(2, 3);
+        let res = unlink_at(&m.tables, None, b"/floor_d", true);
+        m.fault_cache.arm_write_fail_on(0);
+        kassert!(matches!(res, Err(VfsError::Io)));
+
+        rename_at2(&m.tables, None, b"/other/mv_sub", None, b"/floor_d/mv_sub", RenameFlags::default())
+            .map_err(|_| "rename into floor_d")?;
+        let ro_fs = mount_ro_snapshot(&m, 79)?;
+        let ro_fd = ro_fs.root_inode().lookup("floor_d").map_err(|_| "ro floor_d")?;
+        kassert_eq!(ro_fd.stat().map_err(|_| "ro stat floor_d")?.nlink, 3);
+        drop(ro_fs);
+
+        let floor_d = resolve_path(&m.tables, None, b"/floor_d", rf).map_err(|_| "resolve floor_d")?.inode;
+        kassert_eq!(floor_d.stat().map_err(|_| "stat floor_d")?.nlink, 3);
+        unlink_at(&m.tables, None, b"/floor_d/mv_sub", true).map_err(|_| "rmdir mv_sub")?;
+        kassert_eq!(floor_d.stat().map_err(|_| "stat floor_d empty")?.nlink, 2);
+        let g = OpenGuard::new(Arc::clone(&floor_d));
+        unlink_at(&m.tables, None, b"/floor_d", true).map_err(|_| "rmdir floor_d")?;
+        kassert!(floor_d.is_detached());
+        kassert_eq!(floor_d.stat().map_err(|_| "stat floor_d det")?.nlink, 0);
+        drop((g, floor_d));
+        let reuse = mkdir_at(&m.tables, None, b"/reuse_fd", 0o755, 0).map_err(|_| "reuse fd")?.ino();
+        kassert_eq!(reuse, fd_orig_ino);
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+    }
+
+    // (C2) same_parent rename step-2 with nlink_floor = 2 (disk = 1) & RENAME_EXCHANGE with new_dir nlink_floor = 2 (disk = 1)
+    {
+        let m = mount_test_ext4(snap_c1.clone(), 80)?;
+        m.fault_cache.arm_write_fail_pair(2, 3);
+        let res = unlink_at(&m.tables, None, b"/floor_d", true);
+        m.fault_cache.arm_write_fail_on(0);
+        kassert!(matches!(res, Err(VfsError::Io)));
+
+        let (f1, _) = open_inode(
+            &m.tables,
+            None,
+            b"/floor_d/f1",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create floor_d/f1")?;
+        drop(f1);
+        rename_at2(&m.tables, None, b"/floor_d/f1", None, b"/floor_d/f2", RenameFlags::default())
+            .map_err(|_| "same_parent file rename in floor_d")?;
+        rename_at2(&m.tables, None, b"/other/mv_sub", None, b"/floor_d/f2", RenameFlags(RenameFlags::EXCHANGE))
+            .map_err(|_| "exchange into floor_d")?;
+        let ro_fs = mount_ro_snapshot(&m, 81)?;
+        let ro_fd = ro_fs.root_inode().lookup("floor_d").map_err(|_| "ro floor_d ex")?;
+        kassert_eq!(ro_fd.stat().map_err(|_| "ro stat floor_d ex")?.nlink, 3);
+        drop(ro_fs);
+
+        let floor_d = resolve_path(&m.tables, None, b"/floor_d", rf).map_err(|_| "resolve floor_d ex")?.inode;
+        kassert_eq!(floor_d.stat().map_err(|_| "stat floor_d ex")?.nlink, 3);
+        unlink_at(&m.tables, None, b"/floor_d/f2", true).map_err(|_| "rmdir floor_d/f2")?;
+        let g = OpenGuard::new(Arc::clone(&floor_d));
+        unlink_at(&m.tables, None, b"/floor_d", true).map_err(|_| "rmdir floor_d ex")?;
+        kassert!(floor_d.is_detached());
+        drop((g, floor_d));
+        let reuse = mkdir_at(&m.tables, None, b"/reuse_fd2", 0o755, 0).map_err(|_| "reuse fd2")?.ino();
+        kassert_eq!(reuse, fd_orig_ino);
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+    }
+
+    // (C3) Cold-cache directory carrying pre-existing nlink_ceiling (disk = 4, ceiling = 3)
+    //      entering same_parent rename step-2 and RENAME_EXCHANGE.
+    let m = mount_test_ext4(base_img.to_vec(), 82)?;
+    let cp = mkdir_at(&m.tables, None, b"/ceil_p", 0o755, 0).map_err(|_| "mkdir ceil_p")?;
+    let cp_orig_ino = cp.ino();
+    drop(cp);
+    mkdir_at(&m.tables, None, b"/ceil_p/sub1", 0o755, 0).map_err(|_| "mkdir sub1")?;
+    mkdir_at(&m.tables, None, b"/ceil_p/sub2", 0o755, 0).map_err(|_| "mkdir sub2")?;
+    mkdir_at(&m.tables, None, b"/other", 0o755, 0).map_err(|_| "mkdir other C3")?;
+    let (of, _) = open_inode(
+        &m.tables,
+        None,
+        b"/other/f",
+        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+        0o644,
+        0,
+    )
+    .map_err(|_| "create other/f")?;
+    drop(of);
+    m.fs.sync().map_err(|_| "sync C3")?;
+    let snap_c3 = m.mem_dev.0.data.lock().clone();
+    m.fault_cache.arm_write_fail_on(0);
+    rename_at2(&m.tables, None, b"/ceil_p/sub1", None, b"/other/f", RenameFlags(RenameFlags::EXCHANGE))
+        .map_err(|_| "measure C3")?;
+    let c3_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    drop(m);
+
+    let mut tested_ceil_same_parent = false;
+    for fail_at in 1..=c3_writes {
+        let m = mount_test_ext4(snap_c3.clone(), 83)?;
+        m.fault_cache.arm_write_fail_on(fail_at);
+        let res = rename_at2(&m.tables, None, b"/ceil_p/sub1", None, b"/other/f", RenameFlags(RenameFlags::EXCHANGE));
+        m.fault_cache.arm_write_fail_on(0);
+        if res.is_err() {
+            let ro_fs = mount_ro_snapshot(&m, 84)?;
+            let ro_cp = ro_fs.root_inode().lookup("ceil_p").map_err(|_| "ro ceil_p")?;
+            let ro_nlink = ro_cp.stat().map_err(|_| "ro stat ceil_p")?.nlink;
+            let ro_swapped = ro_fs
+                .root_inode()
+                .lookup("other")
+                .and_then(|o| o.lookup("f"))
+                .is_ok_and(|f| f.inode_type() == InodeType::Dir);
+            drop((ro_cp, ro_fs));
+            if ro_swapped && ro_nlink == 4 {
+                tested_ceil_same_parent = true;
+                // Cold-cache same_parent dir rename on ceil_p (disk=4, nlink_ceiling=3).
+                rename_at2(&m.tables, None, b"/ceil_p/sub2", None, b"/ceil_p/sub2_mv", RenameFlags::default())
+                    .map_err(|_| "same_parent rename on ceil_p")?;
+                let ro_fs2 = mount_ro_snapshot(&m, 85)?;
+                let ro_cp2 = ro_fs2.root_inode().lookup("ceil_p").map_err(|_| "ro ceil_p 2")?;
+                kassert_eq!(ro_cp2.stat().map_err(|_| "ro stat ceil_p 2")?.nlink, 3);
+                drop(ro_fs2);
+
+                // same_parent RENAME_EXCHANGE on ceil_p (sub2_mv <-> sub1 which is file 'f').
+                rename_at2(
+                    &m.tables,
+                    None,
+                    b"/ceil_p/sub2_mv",
+                    None,
+                    b"/ceil_p/sub1",
+                    RenameFlags(RenameFlags::EXCHANGE),
+                )
+                .map_err(|_| "same_parent exchange on ceil_p")?;
+                let ceil_p = resolve_path(&m.tables, None, b"/ceil_p", rf).map_err(|_| "resolve ceil_p")?.inode;
+                kassert_eq!(ceil_p.stat().map_err(|_| "stat ceil_p after")?.nlink, 3);
+                unlink_at(&m.tables, None, b"/ceil_p/sub1", true).map_err(|_| "rmdir moved sub2_mv")?;
+                unlink_at(&m.tables, None, b"/ceil_p/sub2_mv", false).map_err(|_| "unlink swapped f")?;
+                kassert_eq!(ceil_p.stat().map_err(|_| "stat ceil_p empty")?.nlink, 2);
+                let g = OpenGuard::new(Arc::clone(&ceil_p));
+                unlink_at(&m.tables, None, b"/ceil_p", true).map_err(|_| "rmdir ceil_p")?;
+                kassert!(ceil_p.is_detached());
+                drop((g, ceil_p));
+                let reuse = mkdir_at(&m.tables, None, b"/reuse_cp", 0o755, 0).map_err(|_| "reuse cp")?.ino();
+                kassert_eq!(reuse, cp_orig_ino);
+                drop(m);
+                kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+                break;
+            }
+        }
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+    }
+    kassert!(tested_ceil_same_parent);
+
+    Ok(())
+}
+
 crate::ktest!(
     fn ext4_partial_phase2_io_error_recovery() {
         let base_img = build_minimal_ext4_image_blocks(256);
@@ -3584,6 +4047,7 @@ crate::ktest!(
         sweep_rename_step2_and_exchange_io_recovery(&base_img, quota_before)?;
         sweep_truncate_shrink_io_recovery(&base_img)?;
         sweep_cascading_eio_and_post_res_recovery(&base_img, quota_before)?;
+        sweep_upward_drift_and_dir_floor_recovery(&base_img, quota_before)?;
         crate::kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
 
         Ok(())
