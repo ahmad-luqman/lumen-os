@@ -354,7 +354,8 @@ one is its own PR that updates that doc first.
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
-  `AddressSpace::format_maps`).
+  `AddressSpace::format_maps`, its lines `lumen_vm::maps`'s; the node
+  kinds, inode numbers and numeric names host-tested in `lumen_vfs::procfs`).
   `linux/` (M6, M7; ARCHITECTURE section 8): `linux/mod.rs` the
   `linux-raw-sys` re-exports, `M6_SYSCALLS` and `M7_SYSCALLS` (the numbers,
   `syscall_name`; pinned by the `abi_constants_match_spec` and

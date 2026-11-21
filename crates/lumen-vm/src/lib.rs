@@ -11,11 +11,14 @@
 //!   PTE teardown) and atomic `protect` (refusing unmapped holes, supporting
 //!   `PROT_NONE` guard pages, splitting partial VMAs, and coalescing adjacent
 //!   identical VMAs);
-//! - byte-granular [`Brk`] cursor tracking over page-aligned backing VMAs.
+//! - byte-granular [`Brk`] cursor tracking over page-aligned backing VMAs;
+//! - `/proc/<pid>/maps` lines for the VMAs ([`maps::write_maps`]).
 
 #![no_std]
 
 extern crate alloc;
+
+pub mod maps;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
