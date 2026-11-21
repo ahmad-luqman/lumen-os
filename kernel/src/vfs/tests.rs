@@ -185,7 +185,6 @@ crate::ktest!(
     }
 );
 
-#[cfg(feature = "ktest")]
 fn kassert_ne_u64(a: u64, b: u64) -> Result<(), &'static str> {
     if a == b { Err("expected distinct u64 values") } else { Ok(()) }
 }
@@ -444,7 +443,6 @@ crate::ktest!(
     }
 );
 
-#[cfg(feature = "ktest")]
 struct FaultInjectBlockCache {
     inner: SleepMutex<lumen_bcache::BlockCache<MemBlkDev>>,
     fail_reads: core::sync::atomic::AtomicBool,
@@ -455,7 +453,6 @@ struct FaultInjectBlockCache {
     write_calls: core::sync::atomic::AtomicUsize,
 }
 
-#[cfg(feature = "ktest")]
 impl FaultInjectBlockCache {
     fn new(inner: lumen_bcache::BlockCache<MemBlkDev>) -> Self {
         Self {
@@ -491,7 +488,6 @@ impl FaultInjectBlockCache {
     }
 }
 
-#[cfg(feature = "ktest")]
 impl ext4::BlockCacheBackend for FaultInjectBlockCache {
     fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), lumen_bcache::BlockError> {
         if self.fail_reads.load(core::sync::atomic::Ordering::Acquire) {
@@ -812,7 +808,6 @@ crate::ktest!(
     }
 );
 
-#[cfg(feature = "ktest")]
 struct TestExt4Mount {
     mem_dev: MemBlkDev,
     fault_cache: Arc<FaultInjectBlockCache>,
@@ -820,7 +815,6 @@ struct TestExt4Mount {
     tables: KernelVfsTables,
 }
 
-#[cfg(feature = "ktest")]
 fn mount_test_ext4(img: Vec<u8>, dev_minor: u32) -> Result<TestExt4Mount, &'static str> {
     use lumen_bcache::BlockCache;
     let mem_dev = MemBlkDev::new(img, false);
@@ -833,7 +827,6 @@ fn mount_test_ext4(img: Vec<u8>, dev_minor: u32) -> Result<TestExt4Mount, &'stat
     Ok(TestExt4Mount { mem_dev, fault_cache, fs, tables })
 }
 
-#[cfg(feature = "ktest")]
 fn mount_ro_snapshot(m: &TestExt4Mount, dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
     use ext4::BlockCacheBackend;
     use lumen_bcache::BlockCache;
@@ -844,7 +837,6 @@ fn mount_ro_snapshot(m: &TestExt4Mount, dev_minor: u32) -> Result<Arc<ext4::Ext4
     ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, dev_minor), true).map_err(|_| "ro mount")
 }
 
-#[cfg(feature = "ktest")]
 #[inline(never)]
 fn sweep_rmdir_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -933,7 +925,6 @@ fn sweep_rmdir_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &
     Ok(())
 }
 
-#[cfg(feature = "ktest")]
 #[inline(never)]
 fn sweep_rename_dir_overwrite_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -1010,7 +1001,6 @@ fn sweep_rename_dir_overwrite_io_recovery(base_img: &[u8], quota_before: usize) 
     Ok(())
 }
 
-#[cfg(feature = "ktest")]
 #[inline(never)]
 fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -1199,7 +1189,6 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
     Ok(())
 }
 
-#[cfg(feature = "ktest")]
 #[inline(never)]
 fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -1415,7 +1404,6 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
     Ok(())
 }
 
-#[cfg(feature = "ktest")]
 #[inline(never)]
 fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -1552,7 +1540,6 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
     Ok(())
 }
 
-#[cfg(feature = "ktest")]
 #[inline(never)]
 fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -2290,7 +2277,6 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     Ok(())
 }
 
-#[cfg(feature = "ktest")]
 #[inline(never)]
 fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -2712,7 +2698,6 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
     Ok(())
 }
 
-#[cfg(feature = "ktest")]
 #[inline(never)]
 fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
