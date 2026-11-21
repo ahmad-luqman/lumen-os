@@ -32,7 +32,7 @@ is listed only in [STATUS.md](STATUS.md), which is generated from tests.
 | Bootloader | Limine 12.x (pinned binary release + sha256), `limine` crate **0.5.0** | Memory map, framebuffer, higher-half direct map, and our own ELF file for symbolization, with no loader to write. Crate 0.6.x requires nightly (`#![feature(ptr_metadata)]`), so we use 0.5.0 (base revision 3). | Custom UEFI loader (optional learning milestone), GRUB/multiboot2. |
 | Kernel shape | **Modular monolith** with message-shaped internal interfaces; Linux x86-64 syscall ABI from M6, wrapped in capability-scoped namespaces in M11 | One address space keeps early milestones fast and debuggable. Speaking the Linux x86-64 ABI lets Lumen run unmodified Alpine Linux (`musl`) compilers and runtimes without maintaining custom `libc`, `ld.so`, or runtime forks; per-process VFS mount namespaces and network policies still enforce Principle 2 around agents and sandboxed processes. | Microkernel (puts IPC overhead in front of every milestone); custom ring-3 syscall ABI + custom `libc` (multiplies porting and maintenance cost by an order of magnitude). |
 | Test harness | Python (`uv`, pytest) on the host; TAP from the kernel | Fast to write scenarios, mature tooling, and QMP/PIL are easy to use. | Rust `xtask`: one language, but slower iteration on test scripts. |
-| Third-party crates & upstream OS code | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX outside M6's two named FP save/restore stubs, no red zone, the kernel code model). Any PR that adopts a crate or adapts code from an upstream Rust OS (Lumen is MIT: see [ROADMAP.md](ROADMAP.md#reference-rust-oses-and-license-policy-lumen-is-mit)) must explicitly name the elected license (for multi-licensed projects such as ArceOS/Starry, elect `Apache-2.0`, retain any upstream `NOTICE` and license text, and mark modified files as changed; for BSD-3-Clause code such as Starnix, retain copyright and no-endorsement notices; keep MPL-2.0 code such as Asterinas crates in separate MPL-2.0-marked crates/files; never copy GPL-3.0 code) and preserve upstream copyright notices. Pre-baked Alpine Linux `ext4` test images (containing GPL userspace binaries) live only in the untracked `/build/` output tree (tarball cache in `build/deps/alpine-minirootfs/`, assembled image in `build/alpine-rootfs.ext4`) and are never committed to the MIT repository. Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time). `virtio-drivers` `=0.13.0` (#95: virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio` and `thiserror` (`bitflags` and `zerocopy` were already linked through `rhai`), plus the build-time proc macros `enumn`, `thiserror-impl` and `zerocopy-derive`), under the adapter rules in section 7, and `zerocopy` as a direct dependency, pinned to the lockfile's version (`=0.8.63`; the crate turns on `zerocopy`'s `derive` and `alloc` features for the whole kernel by feature unification, which `make audit` covers). `wasmi` `=2.0.1` (#197: the WASM interpreter for M5's apps; `default-features = false` with `validate` and `portable-dispatch`; brings `wasmi_core`, `wasmi_ir`, `wasmi_collections`, `wasmparser` and `spin`; its `libm` and `bitflags` were already linked through `rhai`). `portable-dispatch` is a stack-safety choice: our dependency line's `default-features = false` drops `auto-dispatch`, and wasmi then dispatches by tail calls, each instruction's handler calling the next and counting on LLVM to make those calls jumps, which its build script expects only without debug assertions; the kernel keeps them on, so a long loop overflowed a 64 KiB thread stack in #197 (`ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` runs one on such a stack). The loop dispatch keeps the native stack's depth constant however long a module runs (host calls aside), and wasmi's own call depth (1000 frames, on the heap) bounds a module's recursion. Functions are compiled with the module (`CompilationMode::Eager`, section 8's wasmi configuration): lazily, a body's compilation is charged (7 fuel a byte) to the fuel left in the slice of the first call to reach it, and one costing more ends that call with an error that can't be resumed (though wasmi's message calls it resumable); compiling eagerly isn't metered, and keeps the compiled code, about 13 bytes of heap per body byte, for the module's life. `postcard` `=1.1.3` and `serde` `=1.0.229` (the app interface's wire format, section 8, for the wire types #206 and #207 add to `lumen-app-api`: #199's host calls take none; postcard with `default-features = false` and `alloc`, so without its default `heapless-cas`; serde with `default-features = false`, `derive` and `alloc`; they bring `serde_core` and `cobs` (`thiserror` was already linked through `virtio-drivers`), plus the build-time proc macro `serde_derive` (`proc-macro2`, `quote` and `syn` 3, already built for `thiserror-impl`); two `embedded-io` versions are in `Cargo.lock` only, named weakly by postcard's `alloc` feature, and never built). `ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types` pins their encoding and decoding rules and links them into the ktest kernel, where `make audit`'s binary checks cover them; its IR checks read only the kernel crate's own IR, so once the wire types use them they see the generic code of these crates compiled into it, while their own non-generic code is covered by the binary checks alone, as wasmi's and rhai's is. `linux-raw-sys` `=0.12.1` (#232: Linux x86-64 UAPI syscall numbers, `errno`, `ioctl`, `prctl`, `auxvec`, and ABI structs for M6–M10 native ring-3 syscalls, section 8; multi-licensed `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, elected license **MIT**; `default-features = false` with `no_std`, `general`, `errno`, `ioctl`, `system`, `prctl` and `auxvec`; zero transitive dependencies; builds on stable `rustc 1.99.1` for `x86_64-unknown-none`). `kernel/src/linux/mod.rs` re-exports its modules and links its M6 syscall table and `new_utsname` helper into both kernels, and `ktest:lumen_kernel::linux::abi_constants_match_spec` pins all 30 M6 syscall numbers, core `errno` values, terminal `ioctl` / `arch_prctl` / `CLOCK_*` constants, and Linux x86-64 struct sizes with `make audit` passing. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
+| Third-party crates & upstream OS code | Prefer a maintained `no_std` crate over writing our own when it does the job: pinned with `=` in the workspace `Cargo.toml` (`Cargo.lock` committed), a PR adding only the crates its issue names (with their own dependencies), each checked first to build for `x86_64-unknown-none` on the pinned stable toolchain, and `make audit` must pass with it linked (no SSE/AVX outside M6's two named FP save/restore stubs, no red zone, the kernel code model). Any PR that adopts a crate or adapts code from an upstream Rust OS (Lumen is MIT: see [ROADMAP.md](ROADMAP.md#reference-rust-oses-and-license-policy-lumen-is-mit)) must explicitly name the elected license (for multi-licensed projects such as ArceOS/Starry, elect `Apache-2.0`, retain any upstream `NOTICE` and license text, and mark modified files as changed; for BSD-3-Clause code such as Starnix, retain copyright and no-endorsement notices; keep MPL-2.0 code such as Asterinas crates in separate MPL-2.0-marked crates/files; never copy GPL-3.0 code) and preserve upstream copyright notices. Pre-baked Alpine Linux `ext4` test images (containing GPL userspace binaries) live only in the untracked `/build/` output tree (tarball cache in `build/deps/alpine-minirootfs/`, assembled image in `build/alpine-rootfs.ext4`) and are never committed to the MIT repository. Kernel crates so far: `limine`, `rustc-demangle`, `noto-sans-mono-bitmap` and `log` (from M0, before this policy; `log` is still `0.4`, to be pinned in a PR of its own), `pc-keyboard` (scancode decoding and layouts, #58, the first under it), `vte` (terminal escape parsing; brings `arrayvec` and `memchr`) and `unicode-width` (character widths), both #59. `rhai` (scripting, #67; integers only, no modules, no time, closures that can't capture (`no_closure`), `curry` disabled; brings `ahash`, `hashbrown`, `allocator-api2`, `equivalent`, `foldhash`, `smallvec`, `smartstring`, `thin-vec`, `num-traits`, `libm`, `bitflags`, `once_cell`, `portable-atomic`, `zerocopy`, `static_assertions`, `cfg-if`, `no-std-compat` and `core-error`, plus `const-random`, whose compile-time random seed stays linked but unused (the kernel sets a fixed hashing seed before any script runs), and the proc macros `rhai_codegen` and `const-random-macro`, which run only at build time). `virtio-drivers` `=0.13.0` (#95: virtqueues and the virtio device protocols; `default-features = false` with `alloc`; brings `safe-mmio` and `thiserror` (`bitflags` and `zerocopy` were already linked through `rhai`), plus the build-time proc macros `enumn`, `thiserror-impl` and `zerocopy-derive`), under the adapter rules in section 7, and `zerocopy` as a direct dependency, pinned to the lockfile's version (`=0.8.63`; the crate turns on `zerocopy`'s `derive` and `alloc` features for the whole kernel by feature unification, which `make audit` covers). `wasmi` `=2.0.1` (#197: the WASM interpreter for M5's apps; `default-features = false` with `validate` and `portable-dispatch`; brings `wasmi_core`, `wasmi_ir`, `wasmi_collections`, `wasmparser` and `spin`; its `libm` and `bitflags` were already linked through `rhai`). `portable-dispatch` is a stack-safety choice: our dependency line's `default-features = false` drops `auto-dispatch`, and wasmi then dispatches by tail calls, each instruction's handler calling the next and counting on LLVM to make those calls jumps, which its build script expects only without debug assertions; the kernel keeps them on, so a long loop overflowed a 64 KiB thread stack in #197 (`ktest:lumen_kernel::app::wasmi_runs_a_long_loop_in_fuel_slices` runs one on such a stack). The loop dispatch keeps the native stack's depth constant however long a module runs (host calls aside), and wasmi's own call depth (1000 frames, on the heap) bounds a module's recursion. Functions are compiled with the module (`CompilationMode::Eager`, section 8's wasmi configuration): lazily, a body's compilation is charged (7 fuel a byte) to the fuel left in the slice of the first call to reach it, and one costing more ends that call with an error that can't be resumed (though wasmi's message calls it resumable); compiling eagerly isn't metered, and keeps the compiled code, about 13 bytes of heap per body byte, for the module's life. `postcard` `=1.1.3` and `serde` `=1.0.229` (the app interface's wire format, section 8, for the wire types #206 and #207 add to `lumen-app-api`: #199's host calls take none; postcard with `default-features = false` and `alloc`, so without its default `heapless-cas`; serde with `default-features = false`, `derive` and `alloc`; they bring `serde_core` and `cobs` (`thiserror` was already linked through `virtio-drivers`), plus the build-time proc macro `serde_derive` (`proc-macro2`, `quote` and `syn` 3, already built for `thiserror-impl`); two `embedded-io` versions are in `Cargo.lock` only, named weakly by postcard's `alloc` feature, and never built). `ktest:lumen_kernel::app::wire::postcard_round_trips_derived_types` pins their encoding and decoding rules and links them into the ktest kernel, where `make audit`'s binary checks cover them; its IR checks read only the kernel crate's own IR, so once the wire types use them they see the generic code of these crates compiled into it, while their own non-generic code is covered by the binary checks alone, as wasmi's and rhai's is. `linux-raw-sys` `=0.12.1` (#232: Linux x86-64 UAPI syscall numbers, `errno`, `ioctl`, `prctl`, `auxvec`, and ABI structs for M6–M10 native ring-3 syscalls, section 8; multi-licensed `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, elected license **MIT**; `default-features = false` with `no_std`, `general`, `errno`, `ioctl`, `system`, `prctl` and `auxvec`; zero transitive dependencies; builds on stable `rustc 1.99.1` for `x86_64-unknown-none`). `kernel/src/linux/mod.rs` re-exports its modules and links its M6 syscall table and `new_utsname` helper into both kernels, and `ktest:lumen_kernel::linux::abi_constants_match_spec` pins all 30 M6 syscall numbers, core `errno` values, terminal `ioctl` / `arch_prctl` / `CLOCK_*` constants, and Linux x86-64 struct sizes with `make audit` passing. `ext4plus` `=0.1.0-rc.2` (#248: pure-Rust `no_std + alloc` writable ext4 driver, section 9; multi-licensed `MIT OR Apache-2.0`, elected license **MIT**; `default-features = false` with `sync` and `multi-threaded`; brings target-linked `crc` `3.4.0` (`crc-catalog` `2.5.0`), `spin` `0.10.1` (`lock_api` `0.4.14`, `scopeguard` `1.2.0`), and `async-lock` `3.5.0` (`event-listener` `5.4.2`, `event-listener-strategy` `0.5.4`, `pin-project-lite` `0.2.17` already in `Cargo.lock`; unused at runtime with `sync` enabled), plus `bitflags` `2.13.2` already linked through `rhai`/`virtio-drivers`, and build-time proc macros `async-trait` `0.1.92` and `maybe-async` `0.2.11` (`proc-macro2`, `quote`, `syn`, `unicode-ident`); builds on stable `rustc 1.99.1` for `x86_64-unknown-none` with zero nightly features). `kernel/src/vfs/mod.rs` links `ext4plus` into both kernels via `log_ext4_crate_summary()`, and `ktest:lumen_kernel::vfs::ext4_crate_smoke` exercises mount, read, create, write, truncate, fast symlink, hard link, `mkdir`/`rmdir`, and `unlink` in memory with `make audit` passing. `shlex` (#62) is only a dev-dependency of `lumen-shell`, the word splitter's test oracle; `noline`, which #62 names, isn't used (no completion hook, escape codes always, and it queries the terminal for the cursor on every prompt). | Reach working, playable features sooner; crates with many users are better tested than a first version of our own. | Writing everything ourselves (more to learn, much slower); unpinned versions (a minor release could break the build or bring in SSE). |
 | Firmware for tests | OVMF `edk2-stable202605-r1` from rust-osdev/ovmf-prebuilt, pinned with sha256 | macOS and CI boot byte-identical firmware, so golden screenshots match. | Distro OVMF packages (paths and versions differ per OS). |
 
 ## 3. Layers
@@ -4911,31 +4911,44 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     `PageCache`, zeroes `[old_size % 4096 .. 4096)` before exposing the new
     size so stale past-EOF `MAP_SHARED` stores never leak into extended regions.
 
-### Writable `ext4` driver (crate chosen and pinned in its own dependency PR)
+### Writable `ext4` driver (`ext4plus =0.1.0-rc.2`, pinned in #248)
 
-Following section 2 (one new dependency crate per PR), M7 adopts a pure-Rust
-`no_std + alloc` writable `ext4` crate—evaluating **`ext4plus`** (`Apache-2.0
-OR MIT`, writable fork of `ext4-view`), **`another_ext4`** (`MIT`), and
-**`ext4_rs`** (`MIT`) in priority order (avoiding C FFI `lwext4` unless every
-pure-Rust candidate fails stability or correctness checks, so CI and macOS stay
-free of a C cross-compiler and `make audit` stays clean).
+Following section 2 (one new dependency crate per PR), M7 evaluated the three
+pure-Rust `no_std + alloc` writable `ext4` candidates in priority order and
+selected **`ext4plus = "=0.1.0-rc.2"`** (multi-licensed `MIT OR Apache-2.0`,
+elected license **`MIT`**, `default-features = false, features = ["sync",
+"multi-threaded"]`; transitive linked crates `crc` `3.4.0` -> `crc-catalog`
+`2.5.0`, `spin` `0.10.1` -> `lock_api` `0.4.14` -> `scopeguard` `1.2.0`,
+`bitflags` `2.13.2`, and `async-lock` `3.5.0` -> `event-listener` `5.4.2` /
+`event-listener-strategy` `0.5.4` / `pin-project-lite` `0.2.17`, plus build-time
+proc macros `async-trait` `0.1.92` and `maybe-async` `0.2.11`). Both lower-priority
+candidates failed evaluation: **`another_ext4`** is not published on crates.io
+(cannot be pinned under section 2), and **`ext4_rs` `1.3.3`** requires nightly
+`#![feature(error_in_core)]` (failing Gate 1). C FFI `lwext4` was not needed, so
+CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
 
-Every candidate is vetted against six hard gates before pinning:
+`ext4plus` `=0.1.0-rc.2` is vetted against all six hard gates:
 1. Compiles on pinned stable `rustc 1.99.1` for `x86_64-unknown-none` with
-   `default-features = false` and zero nightly features.
+   `default-features = false, features = ["sync", "multi-threaded"]` and zero
+   nightly features (`#![no_std]`, `#![forbid(unsafe_code)]`).
 2. Passes `make audit` (no SSE/AVX, no red zone, kernel code model) when linked
-   into both `lumen-kernel` and `lumen-kernel-ktest`.
-3. MIT or Apache-2.0 license compatible, explicitly elected and recorded in
+   into both `lumen-kernel` and `lumen-kernel-ktest` (`kernel/src/vfs/mod.rs`,
+   `ktest:lumen_kernel::vfs::ext4_crate_smoke`).
+3. Dual-licensed `MIT OR Apache-2.0` with elected license **`MIT`** recorded in
    section 2.
-4. Mounts and mutates images built with the pinned `mke2fs` feature set in
-   section 15 (`-t ext4 -b 4096 -I 256` with pinned `-O` flags recorded by the
-   crate PR: extents, 256-byte inodes, linear/htree directories, fast & block
-   symlinks, hard links with accurate `i_links_count`, `chmod`/`chown`/
-   `utimensat`, create/write/truncate/unlink/rename/mkdir/rmdir) and leaves the
-   image passing **`e2fsck -fn`** on the host after `sync` + QEMU shutdown/kill!
-5. Routes all disk I/O through Lumen's `BlockCache` adapter, and either
-   disables any internal write cache in the chosen crate or flushes it into
-   `BlockCache` **before** `BlockCache::sync()` issues `BlockDevice::flush()`.
+4. Mounts and mutates images built with section 15's pinned `mke2fs` flags
+   (**`-t ext4 -b 4096 -I 256 -O ^orphan_file,^metadata_csum_seed,^metadata_csum,^has_journal`**):
+   extents (including `depth >= 1` extent trees), 256-byte inodes, linear and
+   htree directories, fast & block symlinks, hard links with accurate
+   `i_links_count`, `chmod`/`chown`/`utimensat`, and
+   create/write/truncate/unlink/rename/mkdir/rmdir, leaving mutated images
+   passing **`e2fsck -fn`** on the host.
+5. **No internal write cache:** `ext4plus` holds no internal dirty block cache—every
+   mutation (`write_to_block`, `Inode::write`, `Superblock::write`,
+   `BlockGroupDescriptor::write`) writes synchronously through
+   `Ext4Write::write`. Routing all disk I/O through Lumen's `BlockCache` adapter
+   satisfies Gate 5 without needing a pre-flush of an internal crate cache
+   before `BlockCache::sync()` issues `BlockDevice::flush()`.
 6. **Unlink-while-open contract (covering `unlink`, `rmdir`, and `rename` overwrite):**
    when `unlink(path)` or `rename`/`renameat2` removes the last link of a file
    (`st_nlink == 1`), **or `rmdir(path)` / `rename` overwrites an empty
@@ -4950,10 +4963,10 @@ Every candidate is vetted against six hard gates before pinning:
      `ftruncate`/`mmap` continue to work until `open_count` reaches 0, and
      detached directories return `-ENOENT` on `lookup`/`create`/`mkdir`/`link`/
      `symlink` and empty EOF on `getdents64` (while `getcwd` returns `-ENOENT`).
-   - If the chosen `ext4` crate supports ext4's native orphan list (decoupling
-     dentry removal from inode/block deallocation), VFS uses it directly
-     (preserving POSIX `fstat` `st_ino` invariance across `unlink`). Otherwise,
-     before mutating `ext4`:
+   - **`ext4plus` has no native `s_last_orphan` orphan list:** `Dir::unlink`
+     immediately zeroes and frees the inode and blocks once `links_count == 0`.
+     Therefore VFS (#253) always uses the `detached_unlinked = true`
+     `PageCache` fallback—before mutating `ext4`:
      1. For regular files, check a separate non-evictable detached-memory quota
         (sharing/mirroring `tmpfs`'s 32 MiB cap; never triggering `ext4`
         `PageCache` reclaim while holding Lock 3/4) and fault existing
@@ -4975,6 +4988,32 @@ Every candidate is vetted against six hard gates before pinning:
         the freed inode number. On-disk `e2fsck -fn` stays 100% clean even
         across abrupt power loss, and all `CachePage`s free when the last
         `Arc<VfsInode>` drops!
+
+- **Adapter invariants required in #253 (`kernel/src/vfs/ext4.rs`):**
+  - **Symlink 60-byte bug & inline-symlink unlink workarounds:**
+    `Ext4::symlink` stores targets `<= 60` bytes inline while
+    `Inode::symlink_target` enforces `MAX_INLINE_SYMLINK_LEN = 59`; #253 MUST
+    route `target.len() <= 59` to `Ext4::symlink` and `target.len() >= 60` to
+    block symlinks via `create_inode(FileType::Symlink)` + `write_at` +
+    `Dir::link`. In addition, when unlinking the last link (`links_count == 1`)
+    of any inline symlink (`!EXTENTS`, `size <= 59`), `Ext4::delete_file`
+    calls `BlockMap::free_all()` on `i_block` and panics interpreting ASCII
+    target bytes as block numbers; #253 MUST zero `i_block` (`0x28..0x64`) and
+    `i_size` on disk (and re-read `Inode`) before `Dir::unlink` on inline
+    symlinks.
+  - **Truncate partial-block tail zeroing:** `ext4plus::file::truncate` does
+    not zero `[new_size % 4096 .. 4096)` in the partial final block on shrink;
+    #253's `PageCache` / truncate path MUST enforce the tail-zeroing rule above.
+  - **Fresh `Inode` reads:** `Dir` caches a copy of its `Inode`; always
+    re-read `Inode::read(&ext4, ino)` under Lock 6 before mutating/unlinking.
+  - **Explicit `rmdir` & cross-dir `rename` handling:** `ext4plus` lacks
+    dedicated `rmdir` and `rename` helpers; #253 must set a child directory's
+    `links_count` to `1` before `Dir::unlink` and decrement the parent's
+    `links_count`, and on cross-dir directory `rename` must update `..` in
+    block 0 and adjust both parents' `links_count`.
+  - **Writable check:** `Superblock::read_only()` is `pub(crate)`; check
+    `!fs.superblock().features().incompatible().contains(IncompatibleFeatures::RECOVERY)`
+    plus `VIRTIO_BLK_F_RO` rather than calling a crate helper.
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
@@ -6757,13 +6796,17 @@ test server:
   host `mke2fs.conf` drift between macOS and Ubuntu 24.04 CI,
   `tools/mkrootfs.sh` passes explicit `-t ext4 -b 4096 -I 256 -m 0 -L
   lumen-rootfs -U <fixed-uuid> -E hash_seed=<fixed-uuid>,root_owner=0:0,lazy_itable_init=0,no_copy_xattrs`,
-  `E2FSPROGS_FAKE_TIME=<fixed-epoch>`, normalized staging mtimes, and explicit
-  `-O` overrides (at minimum `^orphan_file,^metadata_csum_seed`, with the
-  chosen `ext4` crate PR pinning `metadata_csum`/`has_journal` explicitly so
-  macOS and Ubuntu CI emit identical superblock feature masks; note `-E
-  root_owner=0:0` owns `/` as `0:0` while `-d` staged files inherit host
-  UID/GID, so tests should not assert `st_uid == 0` on pre-populated staging
-  files unless explicitly normalized). `e2fsck -fn` validates every freshly
+  `E2FSPROGS_FAKE_TIME=<fixed-epoch>`, normalized staging mtimes, and the explicit
+  pinned `-O` feature mask **`^orphan_file,^metadata_csum_seed,^metadata_csum,^has_journal`**
+  (`-t ext4 -b 4096 -I 256 -O ^orphan_file,^metadata_csum_seed,^metadata_csum,^has_journal`,
+  eliminating `mke2fs.conf` drift between macOS and Ubuntu 24.04 CI; `^metadata_csum`
+  avoids `ext4plus 0.1.0-rc.2`'s `ExtentNode::to_bytes` checksum-offset bug on
+  `depth >= 1` extent trees and lets cross-dir `rename` update `..` in block 0
+  without private checksum helpers, while `^has_journal` avoids read-only
+  `INCOMPAT_RECOVER` fallback because `ext4plus` only replays journals read-only
+  and never writes journal transactions; note `-E root_owner=0:0` owns `/` as
+  `0:0` while `-d` staged files inherit host UID/GID, so tests should not assert
+  `st_uid == 0` on pre-populated staging files unless explicitly normalized). `e2fsck -fn` validates every freshly
   built image and every guest-mutated disk image in `test_fs.py` after QEMU
   exits.
 - **Parallel scenario isolation:** `test_blk.py` uses per-test blank scratch

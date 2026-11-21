@@ -68,6 +68,7 @@ mod time;
 mod trace;
 mod ui;
 mod user;
+mod vfs;
 mod virtio;
 mod vt;
 
@@ -239,6 +240,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     // Randomness: RDRAND, and the virtio-rng the probe brought up.
     rng::init();
     linux::log_abi_summary();
+    vfs::log_ext4_crate_summary();
 
     // Keep these three together and in this order (`boot complete`, the
     // complete mark, the timeline's line): test_boot_timeline_printed checks
