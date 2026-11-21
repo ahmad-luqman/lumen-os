@@ -445,6 +445,7 @@ dependencies = [
  "lumen-trace",
  "lumen-uart",
  "lumen-ui",
+ "lumen-vfs",
  "lumen-vm",
  "lumen-wm",
  "noto-sans-mono-bitmap",

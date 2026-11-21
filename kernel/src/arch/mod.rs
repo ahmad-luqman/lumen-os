@@ -11,8 +11,8 @@ mod x86_64;
 pub use self::x86_64::{
     apic, cmos, context,
     cpu::{
-        Rdrand, apic_id, enter_kernel_space, halt_forever, rdtsc, read_cr0, read_cr2, read_cr3, read_cr4, read_rbp,
-        read_rsp, serialize, switch_stack, write_dr0, write_dr6, write_dr7,
+        Rdrand, apic_id, cpuid, cpuid_count, enter_kernel_space, halt_forever, rdtsc, read_cr0, read_cr2, read_cr3,
+        read_cr4, read_rbp, read_rsp, serialize, switch_stack, write_dr0, write_dr6, write_dr7,
     },
     fpu, gdt, i8042, idt,
     idt::TrapFrame,

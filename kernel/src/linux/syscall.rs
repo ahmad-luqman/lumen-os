@@ -15,7 +15,6 @@ use crate::linux::process::{ConsoleIo, FdKind, KernelSigaction, record_exit, wit
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, Utsname, default_utsname, errno, general, ioctl};
 use crate::mm::user_vm::prot_from_linux;
 use crate::sched;
-use crate::sync::SpinLock;
 use crate::user::{CopyError, USER_MAX, UserExit, copy_from_user, copy_to_user, user_range_valid};
 
 /// Maximum `iovec` count accepted by `readv`/`writev` (POSIX `UIO_MAXIOV`).
@@ -129,36 +128,6 @@ fn log_unknown_once(nr: u64) {
                 Err(_) => continue,
             }
         }
-    }
-}
-
-/// Cached `(unix_epoch_seconds, monotonic_anchor_ns)` sampled once from CMOS RTC.
-static REALTIME_ANCHOR: SpinLock<Option<Option<(u64, u64)>>> = SpinLock::new(None);
-
-fn realtime_sec_nsec() -> (u64, u64) {
-    let anchor = {
-        let guard = REALTIME_ANCHOR.lock();
-        *guard
-    };
-    let anchor = match anchor {
-        Some(cached) => cached,
-        None => {
-            // Read RTC outside the lock (`rtc::now_quiet` polls CMOS ports).
-            let sampled = crate::rtc::now_quiet()
-                .ok()
-                .and_then(|dt| dt.unix_seconds())
-                .map(|unix_sec| (unix_sec, crate::time::now_ns()));
-            let mut guard = REALTIME_ANCHOR.lock();
-            *guard.get_or_insert(sampled)
-        }
-    };
-    let now_ns = crate::time::now_ns();
-    match anchor {
-        Some((base_sec, base_ns)) => {
-            let delta = now_ns.saturating_sub(base_ns);
-            (base_sec.saturating_add(delta / 1_000_000_000), delta % 1_000_000_000)
-        }
-        None => (now_ns / 1_000_000_000, now_ns % 1_000_000_000),
     }
 }
 
@@ -787,7 +756,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
 fn sys_clock_gettime(clockid: u64, tp: u64) -> u64 {
     let (sec, nsec) =
         if clockid == u64::from(general::CLOCK_REALTIME) || clockid == u64::from(general::CLOCK_REALTIME_COARSE) {
-            realtime_sec_nsec()
+            crate::time::realtime_sec_nsec()
         } else if clockid == u64::from(general::CLOCK_MONOTONIC)
             || clockid == u64::from(general::CLOCK_MONOTONIC_RAW)
             || clockid == u64::from(general::CLOCK_MONOTONIC_COARSE)

@@ -165,15 +165,17 @@ def test_heap_command_reports_usage(boot):
     m = boot_settled(boot)
     heap = shell_heap(m)
     # What boot keeps (`acpi::Info`, for one), the four virtual terminals
-    # (each grid's cells, scrollback, tab stops and dirty marks) and the
-    # shells (their editors and histories, the screen shells' threads and
-    # the keyboard's wait queue they block in) is in use: a few dozen
-    # allocations (the four terminals add about two dozen); the rest of what
-    # the heap mapped is free.
+    # (each grid's cells, scrollback, tab stops and dirty marks), the VFS
+    # boot mounts (`/`, `/tmp`, `/dev` + 6 char nodes, `/proc`, and the
+    # mount/inode tables), and the shells (their editors and histories, the
+    # screen shells' threads and the keyboard's wait queue they block in) is
+    # in use (~91 allocations total); the rest of what the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert 0 < heap["live"] <= 70, f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
+    assert 0 < heap["live"] <= 128, (
+        f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
+    )
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap
     # Running it again leaves the heap as it was (the line's allocations are
     # freed; a repeated line isn't kept in the history).

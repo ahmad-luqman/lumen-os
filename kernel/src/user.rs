@@ -541,11 +541,14 @@ fn spawn_ring3_on(
         let lstar_after = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
         let stub_after = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
 
-        let proc = take_current();
-        let exit = proc.exit.expect("ring-3 exited without recording UserExit");
+        let (exit, stdout) = {
+            let proc = take_current();
+            let exit = proc.exit.expect("ring-3 exited without recording UserExit");
+            (exit, proc.stdout)
+        };
         *out.lock() = Some(RunResult {
             exit,
-            stdout: proc.stdout,
+            stdout,
             deferred_lstar_db: lstar_after.saturating_sub(lstar_before),
             deferred_stub_db: stub_after.saturating_sub(stub_before),
         });
