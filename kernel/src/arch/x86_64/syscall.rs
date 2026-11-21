@@ -115,7 +115,7 @@ pub const fn sanitize_user_rflags(rflags: u64) -> u64 {
 /// frames) exit cleanly with zero red-zone use and 16-byte stack alignment
 /// (`size_of::<SyscallFrame>() == 160`).
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SyscallFrame {
     pub r15: u64,
     pub r14: u64,

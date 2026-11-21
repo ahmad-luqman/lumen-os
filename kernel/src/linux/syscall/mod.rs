@@ -116,38 +116,51 @@ unsafe fn copy_pod_from_user<T: Copy>(user_src: u64) -> Result<T, CopyError> {
 static UNKNOWN_LOW_BITS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16]; // syscall numbers 0..1024
 static UNKNOWN_HIGH_SLOTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8]; // up to 8 distinct numbers >= 1024
 
-fn log_unknown_once(nr: u64) {
+/// Whether this is the first time this boot that syscall `nr` is reported
+/// as unimplemented (and so worth a log line); records it either way.
+fn first_report(nr: u64) -> bool {
     if nr < 1024 {
         let idx = (nr / 64) as usize;
         let bit = 1u64 << (nr % 64);
-        if (UNKNOWN_LOW_BITS[idx].fetch_or(bit, Ordering::Relaxed) & bit) == 0 {
-            log::debug!(target: "linux", "unimplemented syscall #{nr}");
-        }
-        return;
+        return (UNKNOWN_LOW_BITS[idx].fetch_or(bit, Ordering::Relaxed) & bit) == 0;
     }
     for slot in &UNKNOWN_HIGH_SLOTS {
         let cur = slot.load(Ordering::Acquire);
         if cur == nr {
-            return;
+            return false;
         }
         if cur == 0 {
             match slot.compare_exchange(0, nr, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => {
-                    log::debug!(target: "linux", "unimplemented syscall #{nr}");
-                    return;
-                }
-                Err(actual) if actual == nr => return,
+                Ok(_) => return true,
+                Err(actual) if actual == nr => return false,
                 Err(_) => continue,
             }
         }
     }
+    false
 }
 
+fn log_unknown_once(nr: u64) {
+    if first_report(nr) {
+        log::debug!(target: "linux", "unimplemented syscall #{nr}");
+    }
+}
+
+/// The last number an M7 stub was called with, for the stub ktests to tell
+/// an arm calling its own stub from one calling another (`u32::MAX`: none).
+#[cfg(feature = "ktest")]
+static LAST_STUB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
 /// The body of an M7 syscall's stub until its cluster's PR implements it:
-/// log once per number, exactly as an unknown syscall does, and return
-/// `-ENOSYS`.
+/// log once per number, as an unknown syscall does but with its name, and
+/// return `-ENOSYS`.
 fn not_implemented(nr: u32) -> u64 {
-    log_unknown_once(u64::from(nr));
+    #[cfg(feature = "ktest")]
+    LAST_STUB.store(nr, Ordering::Relaxed);
+    if first_report(u64::from(nr)) {
+        let name = crate::linux::syscall_name(nr).unwrap_or("?");
+        log::debug!(target: "linux", "unimplemented syscall #{nr} ({name})");
+    }
     neg_errno(errno::ENOSYS)
 }
 
@@ -551,40 +564,29 @@ fn copy_iovecs(user_iov: u64, iovcnt: u64) -> Result<alloc::vec::Vec<RawIovec>, 
 }
 
 /// Dispatch each of `numbers` with zeroed arguments on a thread with no
-/// `ProcessState` and check it comes back as `-ENOSYS` by `sysret`: the
-/// per-cluster stub ktests' check.
+/// `ProcessState` and check that it reached its own stub (`LAST_STUB`) and
+/// came back as `-ENOSYS` by `sysret`: the per-cluster stub ktests' check.
 ///
 /// A number without its own `dispatch` arm can't pass: the fallthrough arm
-/// asks `with_current` for the process, which panics with none.
+/// asks `with_current` for the process, which panics with none (the `diag`
+/// line before each dispatch names the number in that crash's output).
+/// A number this check is the first to report is forgotten again, so a
+/// later call in the same boot still logs.
 #[cfg(feature = "ktest")]
 fn check_stubs(numbers: &[u32]) -> crate::ktest::TestResult {
     for &nr in numbers {
-        let mut frame = SyscallFrame {
-            r15: 0,
-            r14: 0,
-            r13: 0,
-            r12: 0,
-            r11: 0,
-            r10: 0,
-            r9: 0,
-            r8: 0,
-            rbp: 0,
-            rdi: 0,
-            rsi: 0,
-            rdx: 0,
-            rcx: 0,
-            rbx: 0,
-            rax: u64::from(nr),
-            rip: 0,
-            cs: 0,
-            rflags: 0,
-            rsp: 0,
-            ss: 0,
-        };
+        let name = crate::linux::syscall_name(nr).unwrap_or("?");
+        crate::ktest::diag(format_args!("dispatching syscall #{nr} ({name})"));
+        crate::kassert!(nr < 1024);
+        let (idx, bit) = ((nr / 64) as usize, 1u64 << (nr % 64));
+        let reported_before = UNKNOWN_LOW_BITS[idx].load(Ordering::Relaxed) & bit != 0;
+        LAST_STUB.store(u32::MAX, Ordering::Relaxed);
+        let mut frame = SyscallFrame { rax: u64::from(nr), ..SyscallFrame::default() };
         let ret = dispatch(core::hint::black_box(&mut frame));
-        if ret != SyscallReturn::Sysret || frame.rax != neg_errno(errno::ENOSYS) {
-            crate::ktest::diag(format_args!("syscall #{nr}"));
+        if !reported_before {
+            UNKNOWN_LOW_BITS[idx].fetch_and(!bit, Ordering::Relaxed);
         }
+        crate::kassert_eq!(LAST_STUB.load(Ordering::Relaxed), nr);
         crate::kassert_eq!(ret, SyscallReturn::Sysret);
         crate::kassert_eq!(frame.rax, neg_errno(errno::ENOSYS));
     }
