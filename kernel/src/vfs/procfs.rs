@@ -20,7 +20,6 @@ use lumen_vfs::{
 use crate::arch;
 use crate::linux::{self, process};
 use crate::mm::frame;
-use crate::sched;
 use crate::smp;
 use crate::sync::SleepMutex;
 use crate::time;
@@ -41,6 +40,11 @@ const TAG_PID_FD_DIR: u64 = 3;
 const TAG_PID_MOUNTS: u64 = 4;
 const TAG_PID_FD_BASE: u64 = 0x1000;
 
+/// The inode number of a per-process node: bit 48 marks it (the fixed nodes
+/// are 1..=6, and `DETACHED_INO_BIT` is far above), bits 16..48 hold the pid
+/// and bits 0..16 the tag (`TAG_PID_*`, or `TAG_PID_FD_BASE + fd`). So every
+/// pid is distinct, and an fd keeps its tag below 2^16 as long as
+/// `lumen_vfs::MAX_FDS <= 0x10000 - TAG_PID_FD_BASE`.
 pub(crate) const fn pid_ino(pid: u32, tag: u64) -> u64 {
     (1u64 << 48) | ((pid as u64) << 16) | tag
 }
@@ -175,11 +179,10 @@ impl ProcfsInode {
         })
     }
 
+    /// Whether `/proc/<pid>` exists: only for a registered Linux process
+    /// (none is invented for the shell's kernel threads).
     fn pid_exists(pid: u32) -> bool {
-        if process::has_pid(pid) {
-            return true;
-        }
-        pid == 1 && process::active_pids().is_empty()
+        process::has_pid(pid)
     }
 }
 
@@ -301,6 +304,8 @@ fn format_mounts() -> String {
     let mounts = super::list_mounts();
     let mut out = String::new();
     for m in mounts {
+        // The root ext4 is always the first virtio-blk disk `vfs::init` found;
+        // `/dev` has no block nodes yet, so the name follows Linux's.
         let source = if m.fs_name == "ext4" { "/dev/vda" } else { m.fs_name };
         let mode = if m.read_only { "ro" } else { "rw" };
         let _ = writeln!(out, "{source} {} {} {mode} 0 0", m.mount_path, m.fs_name);
@@ -472,17 +477,11 @@ impl VfsInode for ProcfsInode {
 
     fn readlink(&self) -> Result<Vec<u8>, VfsError> {
         match self.kind {
-            ProcKind::SelfLink => {
-                let pid = process::current_pid().unwrap_or(1);
-                Ok(format!("{pid}").into_bytes())
-            }
-            ProcKind::PidExe(pid) => {
-                if !Self::pid_exists(pid) {
-                    return Err(VfsError::NoEnt);
-                }
-                let path = process::process_exe_path(pid).unwrap_or_else(|| String::from("/bin/lumen"));
-                Ok(path.into_bytes())
-            }
+            // A kernel thread (the shell) has no pid: `/proc/self` dangles.
+            ProcKind::SelfLink => Ok(format!("{}", process::current_pid().ok_or(VfsError::NoEnt)?).into_bytes()),
+            // No path recorded (a process not loaded from the VFS): no target,
+            // the same answer `resolve_magic_link` gives.
+            ProcKind::PidExe(pid) => process::process_exe_path(pid).map(String::into_bytes).ok_or(VfsError::NoEnt),
             ProcKind::PidFdLink(pid, fd) => {
                 let (_, path) = process::process_fd_target(pid, fd).ok_or(VfsError::NoEnt)?;
                 Ok(path.into_bytes())
@@ -518,13 +517,8 @@ impl VfsInode for ProcfsInode {
                 entries.push((INO_MOUNTS, InodeType::File, String::from("mounts")));
                 entries.push((INO_SELF, InodeType::Symlink, String::from("self")));
                 entries.push((INO_VERSION, InodeType::File, String::from("version")));
-                let pids = process::active_pids();
-                if pids.is_empty() {
-                    entries.push((pid_ino(1, TAG_PID_DIR), InodeType::Dir, String::from("1")));
-                } else {
-                    for pid in pids {
-                        entries.push((pid_ino(pid, TAG_PID_DIR), InodeType::Dir, format!("{pid}")));
-                    }
+                for pid in process::active_pids() {
+                    entries.push((pid_ino(pid, TAG_PID_DIR), InodeType::Dir, format!("{pid}")));
                 }
             }
             ProcKind::PidDir(pid) => {
@@ -589,15 +583,10 @@ impl VfsInode for ProcfsInode {
             ProcKind::Meminfo => format_meminfo(),
             ProcKind::Mounts | ProcKind::PidMounts(_) => format_mounts(),
             ProcKind::Version => format_version(),
-            ProcKind::PidMaps(pid) => {
-                let space = process::process_address_space(pid).or_else(|| {
-                    (pid == 1 && process::active_pids().is_empty()).then(sched::current_address_space).flatten()
-                });
-                match space {
-                    Some(aspace) => aspace.format_maps(),
-                    None => return Err(VfsError::NoEnt),
-                }
-            }
+            ProcKind::PidMaps(pid) => match process::process_address_space(pid) {
+                Some(aspace) => aspace.format_maps(),
+                None => return Err(VfsError::NoEnt),
+            },
             _ => return Err(VfsError::Inval),
         };
         Ok(slice_read(text.as_bytes(), offset, buf))

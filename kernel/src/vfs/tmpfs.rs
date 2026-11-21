@@ -226,7 +226,7 @@ fn find_tmpfs_dir_arc(known_dir: &TmpfsInode, target_lock_id: u64, target_ino: I
             _ => break,
         }
     }
-    // BFS from root (`cur`) to locate `target_lock_id`.
+    // Depth-first search from the root (`cur`) for `target_lock_id`.
     let mut stack = alloc::vec![cur];
     while let Some(node) = stack.pop() {
         if node.lock_id == target_lock_id {
