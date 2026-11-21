@@ -124,6 +124,21 @@ def test_dev_tmp_proc_filesystems(boot):
 
     out = run(m, "vfstest dev-tmp-proc")
     assert out.startswith("dev-tmp-proc: ok ("), out
+    assert run(m, "vfstest read /dev/urandom 32") == "read: 32\n"
+
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    m.close()
+
+
+def test_dev_urandom_refuses_when_unseeded(boot):
+    # Boot default machine (qemu64, no virtio-rng): RNG pool is never seeded.
+    m = shell(boot)
+    assert "INFO  rng: no randomness source has answered" in m.output
+
+    assert run(m, "vfstest read /dev/random 32") == "read: Again\n"
+    assert run(m, "vfstest read /dev/urandom 32") == "read: Again\n"
+    assert run(m, "vfstest read /dev/urandom 0") == "read: 0\n"
 
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS

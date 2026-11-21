@@ -710,10 +710,16 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     let dev_rand = resolve_path_from_root("/dev/random").map_err(|e| format!("{e:?}"))?;
     let dev_urand = resolve_path_from_root("/dev/urandom").map_err(|e| format!("{e:?}"))?;
     let mut rbuf = [0u8; 32];
+    let mut ubuf1 = [0u8; 32];
+    let mut ubuf2 = [0u8; 32];
     dev_rand.read_at(0, &mut rbuf).map_err(|e| format!("/dev/random read: {e:?}"))?;
-    dev_urand.read_at(0, &mut rbuf).map_err(|e| format!("/dev/urandom read: {e:?}"))?;
-    if rbuf == [0u8; 32] {
-        return Err(String::from("/dev/urandom returned all zeroes"));
+    dev_urand.read_at(0, &mut ubuf1).map_err(|e| format!("/dev/urandom read 1: {e:?}"))?;
+    dev_urand.read_at(0, &mut ubuf2).map_err(|e| format!("/dev/urandom read 2: {e:?}"))?;
+    if ubuf1 == [0u8; 32] || ubuf1 == ubuf2 {
+        return Err(String::from("/dev/urandom output invalid when seeded"));
+    }
+    if dev_urand.read_at(0, &mut []).map_err(|e| format!("/dev/urandom empty read: {e:?}"))? != 0 {
+        return Err(String::from("/dev/urandom empty read non-zero"));
     }
 
     // 3. /proc static virtual views (st_size == 0).
@@ -882,6 +888,33 @@ pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
             },
             Err(e) => ctx.fail(format_args!("cat: {e:?}")),
         },
+        [sub, path, len_str] if sub == "read" => {
+            let Ok(len) = len_str.parse::<usize>() else {
+                return ctx.fail("usage: vfstest read <path> <bytes>");
+            };
+            if len > 64 * 1024 {
+                return ctx.fail("read: length exceeds 64 KiB");
+            }
+            match open_inode(
+                &TABLES,
+                None,
+                path.as_bytes(),
+                OpenFlags::from_bits_truncate(OpenFlags::O_RDONLY),
+                0,
+                0,
+            ) {
+                Ok((inode, _)) => {
+                    let mut buf = vec![0xA5u8; len];
+                    match inode.read_at(0, &mut buf) {
+                        Ok(n) => {
+                            let _ = writeln!(ctx.out, "read: {n}");
+                        }
+                        Err(e) => ctx.fail(format_args!("read: {e:?}")),
+                    }
+                }
+                Err(e) => ctx.fail(format_args!("read: {e:?}")),
+            }
+        }
         [sub, path, text @ ..] if sub == "write" && !text.is_empty() => {
             let payload = text.join(" ");
             match open_inode(
@@ -1037,7 +1070,7 @@ pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
             }
             Err(err) => ctx.fail(format_args!("dev-tmp-proc: {err}")),
         },
-        _ => ctx.fail("usage: vfstest <stat|cat|write|write-pattern|verify-pattern|mkdir|symlink|readlink|chmod|truncate|unlink|rmdir|rename|ls|dev-tmp-proc> ..."),
+        _ => ctx.fail("usage: vfstest <stat|cat|read|write|write-pattern|verify-pattern|mkdir|symlink|readlink|chmod|truncate|unlink|rmdir|rename|ls|dev-tmp-proc> ..."),
     }
 }
 
@@ -1759,6 +1792,133 @@ crate::ktest!(
         let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
         kassert!(matches!(resolve_path(&TABLES, None, b"/proc/+1", rf), Err(VfsError::NoEnt)));
         kassert!(matches!(resolve_path(&TABLES, None, b"/proc/01", rf), Err(VfsError::NoEnt)));
+        Ok(())
+    }
+);
+
+#[cfg(feature = "ktest")]
+struct FaultInjectBlockCache {
+    inner: SleepMutex<lumen_bcache::BlockCache<MemBlkDev>>,
+    fail_reads: core::sync::atomic::AtomicBool,
+    fail_writes: core::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "ktest")]
+impl ext4::BlockCacheBackend for FaultInjectBlockCache {
+    fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), lumen_bcache::BlockError> {
+        if self.fail_reads.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(lumen_bcache::BlockError::Io);
+        }
+        self.inner.lock().read_at(byte_off, dst)
+    }
+
+    fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), lumen_bcache::BlockError> {
+        if self.fail_writes.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(lumen_bcache::BlockError::Io);
+        }
+        self.inner.lock().write_at(byte_off, src)
+    }
+
+    fn sync(&self) -> Result<(), lumen_bcache::BlockError> {
+        if self.fail_writes.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(lumen_bcache::BlockError::Io);
+        }
+        self.inner.lock().sync()
+    }
+}
+
+crate::ktest!(
+    fn ext4_flush_and_reclaim_preserve_dirty_on_io_error() {
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use lumen_bcache::BlockCache;
+
+        let img = build_minimal_ext4_image_blocks(256);
+        let mem_dev = MemBlkDev::new(img, false);
+        let bcache_raw = BlockCache::new(mem_dev.clone(), 64).map_err(|_| "bcache init")?;
+        let fault_cache = Arc::new(FaultInjectBlockCache {
+            inner: SleepMutex::new(bcache_raw),
+            fail_reads: AtomicBool::new(false),
+            fail_writes: AtomicBool::new(false),
+        });
+        let bcache: Arc<dyn ext4::BlockCacheBackend> = Arc::clone(&fault_cache) as Arc<dyn ext4::BlockCacheBackend>;
+        let fs = ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, 13), false).map_err(|_| "ext4 mount")?;
+
+        let tables = KernelVfsTables::new();
+        tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+
+        // 1. Create a file and write 2 dirty pages in PageCache without syncing yet.
+        let (f, _) = open_inode(
+            &tables,
+            None,
+            b"/dirty_err.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create dirty_err.bin")?;
+        let mut payload = vec![0u8; 2 * 4096];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i * 37) ^ 0xA5) as u8;
+        }
+        kassert_eq!(f.write_at(0, &payload).map_err(|_| "write dirty_err")?, payload.len());
+        let ext4_inode = fs.lookup_live_by_lock_id(f.lock_id()).ok_or("lookup live inode")?;
+
+        // 2. Fail Inode::read during flush_to_ext4 (sync) and reclaim_dirty_pages:
+        //    both must preserve page dirty state so clean-page reclamation cannot drop
+        //    modified pages and a retry sync writes them to disk.
+        fault_cache.fail_reads.store(true, Ordering::Release);
+        kassert!(matches!(f.sync(false), Err(VfsError::Io)));
+        kassert_eq!(ext4_inode.reclaim_clean_pages(16), 0);
+        kassert_eq!(ext4_inode.reclaim_dirty_pages(16), 0);
+        kassert_eq!(ext4_inode.reclaim_clean_pages(16), 0);
+
+        // 3. Recover I/O: retry sync must succeed and persist both modified pages.
+        fault_cache.fail_reads.store(false, Ordering::Release);
+        f.sync(false).map_err(|_| "retry sync after read error")?;
+        kassert_eq!(ext4_inode.reclaim_clean_pages(16), 2);
+        kassert_eq!(read_all_inode(&f).map_err(|_| "re-fault dirty_err")?, payload);
+        drop(ext4_inode);
+        drop(f);
+
+        // 4. Also verify write-side failure during writeback preserves dirty state.
+        let (w_f, _) = open_inode(
+            &tables,
+            None,
+            b"/write_err.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create write_err.bin")?;
+        let old_data = vec![0x11u8; 4096];
+        let new_data = vec![0x22u8; 4096];
+        kassert_eq!(w_f.write_at(0, &old_data).map_err(|_| "write old_data")?, old_data.len());
+        w_f.sync(false).map_err(|_| "initial sync write_err")?;
+        kassert_eq!(w_f.write_at(0, &new_data).map_err(|_| "write new_data")?, new_data.len());
+
+        let w_ext4 = fs.lookup_live_by_lock_id(w_f.lock_id()).ok_or("lookup live write_err")?;
+        fault_cache.fail_writes.store(true, Ordering::Release);
+        kassert!(matches!(w_f.sync(false), Err(VfsError::Io)));
+        kassert_eq!(w_ext4.reclaim_clean_pages(16), 0);
+        fault_cache.fail_writes.store(false, Ordering::Release);
+        w_f.sync(false).map_err(|_| "retry sync after write error")?;
+        kassert_eq!(w_ext4.reclaim_clean_pages(16), 1);
+        kassert_eq!(read_all_inode(&w_f).map_err(|_| "re-fault write_err")?, new_data);
+        drop(w_ext4);
+        drop(w_f);
+
+        // 5. Verify persisted bytes on a fresh read-only mount of the backing image.
+        let ro_dev = MemBlkDev::new(mem_dev.0.data.lock().clone(), true);
+        let ro_bcache: Arc<dyn ext4::BlockCacheBackend> =
+            Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache")?));
+        let ro_fs = ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 14), true).map_err(|_| "ro mount")?;
+        let ro_root = ro_fs.root_inode();
+        let ro_dirty = ro_root.lookup("dirty_err.bin").map_err(|_| "ro lookup dirty_err")?;
+        kassert_eq!(read_all_inode(&ro_dirty).map_err(|_| "ro read dirty_err")?, payload);
+        let ro_write = ro_root.lookup("write_err.bin").map_err(|_| "ro lookup write_err")?;
+        kassert_eq!(read_all_inode(&ro_write).map_err(|_| "ro read write_err")?, new_data);
+
         Ok(())
     }
 );

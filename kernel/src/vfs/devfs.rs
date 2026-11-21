@@ -11,7 +11,6 @@ use lumen_vfs::{
     VfsInode, next_lock_id,
 };
 
-use crate::arch;
 use crate::klog;
 use crate::linux::process;
 use crate::rng;
@@ -128,21 +127,6 @@ pub struct DevfsInode {
     open_count: AtomicU32,
     nodes: Vec<(&'static str, Arc<DevfsInode>)>,
     locks: SleepMutex<AdvisoryLocks>,
-}
-
-fn fill_splitmix64(buf: &mut [u8]) {
-    let mut state = time::now_ns() ^ arch::rdtsc().rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
-    let mut off = 0usize;
-    while off < buf.len() {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        let chunk = (buf.len() - off).min(8);
-        buf[off..off + chunk].copy_from_slice(&z.to_le_bytes()[..chunk]);
-        off += chunk;
-    }
 }
 
 impl VfsInode for DevfsInode {
@@ -299,7 +283,7 @@ impl VfsInode for DevfsInode {
                 buf.fill(0);
                 Ok(buf.len())
             }
-            DevKind::Random => {
+            DevKind::Random | DevKind::Urandom => {
                 if buf.is_empty() {
                     return Ok(0);
                 }
@@ -307,15 +291,6 @@ impl VfsInode for DevfsInode {
                     Ok(()) => Ok(buf.len()),
                     Err(_) => Err(VfsError::Again),
                 }
-            }
-            DevKind::Urandom => {
-                if buf.is_empty() {
-                    return Ok(0);
-                }
-                if rng::fill(buf).is_err() {
-                    fill_splitmix64(buf);
-                }
-                Ok(buf.len())
             }
             DevKind::Tty => match process::try_current_io() {
                 Some(io) => Ok(process::read_console(io, buf)),

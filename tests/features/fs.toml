@@ -21,6 +21,7 @@ milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4_adapter_pagecache_quirks_and_open_unlinked",
     "ktest:lumen_kernel::vfs::page_cache_global_reclaim_writes_back_and_evicts",
+    "ktest:lumen_kernel::vfs::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
     "audit:flags",
 ]
 
@@ -29,6 +30,7 @@ name = "Writable ext4 rootfs VFS adapter over BlockCache with Gate 6 open-unlink
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4_adapter_pagecache_quirks_and_open_unlinked",
+    "ktest:lumen_kernel::vfs::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
     "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
     "scenario:test_fs::test_ext4_readonly_device_mounts_ro",
 ]
@@ -39,4 +41,5 @@ milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::vfs_boot_mounts_tmp_dev_proc_work",
     "scenario:test_fs::test_dev_tmp_proc_filesystems",
+    "scenario:test_fs::test_dev_urandom_refuses_when_unseeded",
 ]

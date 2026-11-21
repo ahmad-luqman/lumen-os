@@ -511,9 +511,10 @@ impl Ext4Inode {
 
                 let res = {
                     let inner = self.shared.state.lock();
-                    let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                    ext4_write_at(&inner.ext4, &mut disk, &bounce[..valid], page_off)
-                        .map(|_| disk.blocks())
+                    Inode::read(&inner.ext4, self.disk_inode_index())
+                        .and_then(|mut disk| {
+                            ext4_write_at(&inner.ext4, &mut disk, &bounce[..valid], page_off).map(|_| disk.blocks())
+                        })
                         .map_err(map_ext4_err)
                 };
                 match res {
