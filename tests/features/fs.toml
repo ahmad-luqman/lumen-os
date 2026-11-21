@@ -44,7 +44,7 @@ tests = [
 ]
 
 [[feature]]
-name = "open_inode_guarded + OpenFile::from_opened against an unlink placed at each step of the open (host model) and after the open (ext4, tmpfs): the data stays readable, the open fails with ENOENT, or O_CREAT opens a new file; never a descriptor on a freed inode (#262)"
+name = "open_inode_guarded + OpenFile::from_opened against an unlink placed at each step of the reference check (host model) and after the open (ext4, tmpfs): the data stays readable, the open fails with ENOENT, or O_CREAT opens a new file; never a descriptor on a freed inode (#262)"
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",

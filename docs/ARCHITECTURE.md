@@ -5022,15 +5022,20 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
      inode first (the open fails as if its lookup had lost the race); never
      a descriptor on a freed inode. `try_new` may sleep: through `stat()` it
      takes the inode's Lock 4 and, on ext4 and tmpfs, Lock 5; it is never
-     called holding that Lock 4, any of Locks 5 to 9, or a spinlock.
+     called holding that Lock 4 (or another inode's Lock 4 out of `lock_id`
+     order), any of Locks 5 to 9, or a spinlock.
      - An `O_CREAT` open that creates the file takes its reference right
        after `create`, inside `with_rename_lock`, with no check: on a
        filesystem with a rename lock (ext4, tmpfs; the trait's default takes
        none) no unlink can run before it, so that open never fails this way.
-     - An `O_CREAT` open that finds a file (an existing name, a followed
-       symlink, `/`, `.`) takes its reference after Lock 3, so an unlink can
-       still free the file first; it then opens again (POSIX: the old file
-       or a new one, never `-ENOENT`), a bounded number of times.
+     - An `O_CREAT` open that finds a file (an existing name, or a followed
+       symlink's target; a directory fails with `-EISDIR` first) takes its
+       reference after Lock 3, so an unlink can still free the file first;
+       it then opens again (POSIX: the old file or a new one, never
+       `-ENOENT`). Only that freed case is retried (a `stat()` error passes
+       through), and after `MAX_CREAT_RACE_RETRIES` (64) more lost races
+       the open fails with `-EEXIST`, the same error as the create loop's
+       own limit when the name keeps being taken.
      - Every filesystem with Gate 6 keeps both halves: the count read and
        the free or detach under the lock `stat()` takes, and `st_nlink == 0`
        reported for a freed inode.
@@ -5236,15 +5241,18 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     path, and the flags it checked) and `OpenFile::from_opened` takes that
     reference over (one count, never two) with those flags, which can't be
     changed in between. `openat` must use `OpenFile::from_opened(open_inode_guarded(..)?)`
-    when #254 wires it. `open_inode` (its signature unchanged) returns the
-    inode with that reference given back: an `OpenFile::new` built from it
-    takes a fresh one through `OpenGuard::try_new`, refused with `-ENOENT`
-    if an unlink freed the inode in between (only an inode reporting
-    `st_nlink >= 1`, or detached, can be opened). `OpenGuard::new_unchecked`
-    (named so the risk shows at each call) is only for an inode nothing can
-    free before the count goes up: one another reference already keeps open
-    (a clone, an inherited `cwd`), or a file just created under its
-    filesystem's Lock 3. The kernel's `vfstest` opens through
+    when #254 wires it. `OpenFile`'s access mode and `O_PATH` flag are
+    private (getters only). `open_inode` (its signature unchanged) returns
+    the inode with that reference given back: an
+    `OpenFile::new_unchecked_flags` built from it (not for `openat`: its
+    flags get none of the open's checks) takes a fresh one through
+    `OpenGuard::try_new`, refused with `-ENOENT` if an unlink freed the
+    inode in between (only an inode reporting `st_nlink >= 1`, or detached,
+    can be opened). `OpenGuard::new_unchecked` (named so the risk shows at
+    each call) is only for an inode nothing can free before the count goes
+    up: one another reference already keeps open (a clone, an inherited
+    `cwd`), or a file just created under its filesystem's Lock 3 on a
+    filesystem with a rename lock. The kernel's `vfstest` opens through
     `open_inode_guarded` + `OpenFile::from_opened`; the unchecked guards left
     in `kernel/src/vfs/tests.rs` are ktest set-up.
   - `O_PATH` descriptors ignore `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND` and
