@@ -4,7 +4,9 @@
 //! over [`lumen_bcache::BlockCache`], [`tmpfs::Tmpfs`], [`devfs::Devfs`],
 //! [`procfs::Procfs`], Lock-9 [`KernelVfsTables`] (`MountTable -> DentryCache ->
 //! InodeCache`), boot-time [`init()`] mounting, shell commands (`mount`, `sync`,
-//! `vfstest`), and the `#248` `ext4_crate_smoke` check.
+//! `vfstest`), and the `#248` `ext4plus` smoke check (`exercise_ext4_smoke`;
+//! its ktest, `ext4_crate_smoke`, is in `vfs/tests.rs` with the others of
+//! this file's code).
 
 pub mod devfs;
 pub mod ext4;
@@ -1252,7 +1254,8 @@ pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
-// #248 ext4plus smoke check (`ext4_crate_smoke`)
+// #248 ext4plus smoke check (`exercise_ext4_smoke`; its ktest,
+// `ext4_crate_smoke`, is in `vfs/tests.rs`)
 // ---------------------------------------------------------------------------
 
 const BLOCK_SIZE: usize = 4096;
@@ -1590,6 +1593,8 @@ pub fn log_ext4_crate_summary() {
     }
 }
 
+/// An in-memory block device for ktests. It stays here, not in
+/// `vfs/tests.rs`, because the `vfs/ext4.rs` and `vfs/page_cache.rs` ktests use it too.
 #[cfg(feature = "ktest")]
 #[derive(Clone)]
 struct MemBlkDev(Arc<MemBlkDevInner>);

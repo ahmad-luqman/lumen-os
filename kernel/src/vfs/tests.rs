@@ -1,9 +1,25 @@
 //! The vfs ktests: the `ext4plus` smoke check, the ext4 adapter over the
-//! page cache (open-unlinked files, global reclaim, flush and truncate
-//! under injected I/O errors, the partial phase-2 recovery sweeps), tmpfs's
-//! quota, `/dev`, `/tmp` and `/proc` at boot, and `sync` past a failing
-//! inode. `MemBlkDev` stays in `vfs/mod.rs`: the `ext4` and `page_cache`
-//! ktests use it too.
+//! The ktests of `vfs/mod.rs`'s code (`vfs/ext4.rs` and `vfs/page_cache.rs`
+//! keep their own), all twelve:
+//!
+//! - `ext4_crate_smoke`: the `ext4plus` smoke check (`exercise_ext4_smoke`);
+//! - `ext4_adapter_pagecache_quirks_and_open_unlinked`: the ext4 adapter over
+//!   the page cache, open-unlinked files included;
+//! - `vfs_boot_mounts_tmp_dev_proc_work`: `/tmp`, `/dev` and `/proc` at boot;
+//! - `vfs_proc_checks_unregister_their_process_on_failure`;
+//! - `tmpfs_truncate_returns_quota`;
+//! - `vfs_read_all_refuses_a_file_past_its_cap`;
+//! - `vfs_sync_continues_past_a_failing_inode`;
+//! - `page_cache_global_reclaim_writes_back_and_evicts`;
+//! - `vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing`: tmpfs's quota,
+//!   `rmdir`, the `maps` lines, the heap and procfs's parsing;
+//! - `ext4_flush_and_reclaim_preserve_dirty_on_io_error` and
+//!   `ext4_truncate_and_open_unlink_preserve_state_on_io_error`: injected I/O
+//!   errors;
+//! - `ext4_partial_phase2_io_error_recovery`: the recovery sweeps.
+//!
+//! `MemBlkDev` stays in `vfs/mod.rs`: the `vfs/ext4.rs` and
+//! `vfs/page_cache.rs` ktests use it too.
 
 use super::*;
 
