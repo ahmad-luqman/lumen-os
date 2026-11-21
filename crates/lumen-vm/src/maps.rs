@@ -1,11 +1,14 @@
 //! `/proc/<pid>/maps` lines for an address space's VMAs.
 //!
 //! The kernel's `AddressSpace::format_maps` takes its lock, reads the `brk`
-//! cursor and hands the VMAs here. Each line is Linux's shape:
+//! cursor and hands the VMAs here. Each line has Linux's fields:
 //! `start-end perms offset 00:00 0` with `start`, `end` and `offset` at least
-//! 8 hex digits, `perms` `rwx` then `p` (private) or `s` (shared), and two
-//! spaces before a `[heap]` or `[stack]` label. No device or inode is
-//! reported for a file-backed mapping (`00:00 0`).
+//! 8 hex digits, and `perms` `rwx` then `p` or `s`. A file-backed mapping is
+//! `s` when shared and `p` when private; an anonymous one is always `p`, even
+//! `MAP_SHARED | MAP_ANONYMOUS` (Linux prints `s`). A label (`[heap]` or
+//! `[stack]`) follows two spaces, where Linux pads the name to a fixed
+//! column. No device or inode is reported for a file-backed mapping
+//! (`00:00 0`).
 //!
 //! An anonymous VMA overlapping the heap (`[brk initial, brk mapped end)`) is
 //! printed split at the heap's edges, so a `.bss` coalesced with the first
@@ -60,6 +63,7 @@ pub fn write_maps<'a, W: fmt::Write>(
     vmas: impl IntoIterator<Item = &'a Vma>,
     layout: &MapsLayout,
 ) -> fmt::Result {
+    debug_assert!(layout.stack_bottom <= layout.stack_top, "stack range {layout:x?}");
     let brk_init = layout.brk_initial;
     let brk_mapped = layout.brk_mapped_end;
     let has_heap = brk_mapped > brk_init;
@@ -103,13 +107,14 @@ mod tests {
     use std::vec::Vec;
 
     use super::*;
-    use crate::{Brk, FileMapping, MapPlace, PAGE_SIZE, USER_MAX, USER_MIN, USER_STACK_TOP, VmaMap};
+    use crate::{
+        Brk, FileMapping, MapPlace, PAGE_SIZE, USER_MAX, USER_MIN, USER_STACK_BOTTOM as STACK_BOTTOM, USER_STACK_TOP,
+        VmaMap,
+    };
 
     const P: u64 = PAGE_SIZE;
     const RW: Prot = Prot::READ.union(Prot::WRITE);
     const RX: Prot = Prot::READ.union(Prot::EXEC);
-    /// The kernel's initial stack: 8 MiB below `USER_STACK_TOP`.
-    const STACK_BOTTOM: u64 = USER_STACK_TOP - 8 * 1024 * 1024;
 
     /// The kernel ktest's break: the initial break at 0x40_4000, one page mapped.
     const LAYOUT: MapsLayout = layout(0x40_4000, 0x40_5000);
@@ -127,7 +132,7 @@ mod tests {
         Vma { start, end, prot, backing: Backing::File(fm) }
     }
 
-    fn maps(vmas: &[Vma], layout: &MapsLayout) -> String {
+    fn maps<'a>(vmas: impl IntoIterator<Item = &'a Vma>, layout: &MapsLayout) -> String {
         let mut out = String::new();
         write_maps(&mut out, vmas, layout).unwrap();
         out
@@ -155,6 +160,17 @@ mod tests {
             "00402000-00404000 rw-p 00000000 00:00 0\n\
              00404000-00405000 rw-p 00000000 00:00 0  [heap]\n\
              00405000-00407000 rw-p 00000000 00:00 0\n"
+        );
+    }
+
+    #[test]
+    fn a_vma_crossing_the_initial_break_and_ending_inside_the_heap_splits_in_two() {
+        // What a partial `mprotect` or `munmap` of the heap leaves: the
+        // `[heap]` part ends at the VMA's end, not at the heap's.
+        assert_eq!(
+            maps(&[anon(0x40_2000, 0x40_5000, RW)], &layout(0x40_4000, 0x40_6000)),
+            "00402000-00404000 rw-p 00000000 00:00 0\n\
+             00404000-00405000 rw-p 00000000 00:00 0  [heap]\n"
         );
     }
 
@@ -216,7 +232,7 @@ mod tests {
             maps(&[anon(STACK_BOTTOM + P, USER_STACK_TOP - P, RW)], &LAYOUT),
             "7fffef801000-7fffeffff000 rw-p 00000000 00:00 0  [stack]\n"
         );
-        // A page past either end is not.
+        // A VMA reaching a page past either end is not.
         assert_eq!(
             maps(&[anon(STACK_BOTTOM - P, USER_STACK_TOP, RW)], &LAYOUT),
             "7fffef7ff000-7ffff0000000 rw-p 00000000 00:00 0\n"
@@ -333,16 +349,8 @@ mod tests {
         let fm = FileMapping { file_id: 1, offset: 0x2000, shared: false, may_write: true };
         vmas.map_file(MapPlace::Fixed(0x7f00_0000_0000), P, Prot::READ, fm).unwrap();
         vmas.map(MapPlace::Fixed(STACK_BOTTOM), USER_STACK_TOP - STACK_BOTTOM, RW, Backing::Anonymous).unwrap();
-        let layout = MapsLayout {
-            brk_initial: brk.initial(),
-            brk_mapped_end: brk.mapped_end(),
-            stack_bottom: STACK_BOTTOM,
-            stack_top: USER_STACK_TOP,
-        };
-        let mut out = String::new();
-        write_maps(&mut out, vmas.iter(), &layout).unwrap();
         assert_eq!(
-            out,
+            maps(vmas.iter(), &layout(brk.initial(), brk.mapped_end())),
             "00400000-00402000 r-xp 00000000 00:00 0\n\
              00402000-00404000 rw-p 00000000 00:00 0\n\
              00404000-00406000 rw-p 00000000 00:00 0  [heap]\n\

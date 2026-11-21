@@ -20,10 +20,9 @@ use crate::arch;
 use crate::linux::{errno, general};
 use crate::sync::SleepMutex;
 
-/// Initial user stack VMA size (8 MiB, matching M6 `RLIMIT_STACK`).
-pub const USER_STACK_SIZE: u64 = 8 * 1024 * 1024;
-/// Inclusive bottom of the initial demand-paged user stack VMA.
-pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
+// The initial user stack's size and bottom live in `lumen_vm`, next to
+// `USER_STACK_TOP` (its maps listing labels them `[stack]`).
+pub use lumen_vm::{USER_STACK_BOTTOM, USER_STACK_SIZE};
 
 const _: () = {
     assert!(FRAME_SIZE == PAGE_SIZE);
