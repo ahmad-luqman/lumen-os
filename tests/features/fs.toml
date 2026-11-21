@@ -44,11 +44,12 @@ tests = [
 ]
 
 [[feature]]
-name = "An open racing an unlink never leaves a descriptor on a freed inode: the open reference is taken before the last liveness check and carried into the open file description, so the data stays readable or the open fails with ENOENT (#262)"
+name = "open_inode_guarded + OpenFile::from_opened against an unlink placed at each step of the open (host model) and after the open (ext4, tmpfs): the data stays readable, the open fails with ENOENT, or O_CREAT opens a new file; never a descriptor on a freed inode (#262)"
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
     "ktest:lumen_kernel::vfs::ext4::ext4_open_racing_unlink_keeps_the_data_or_fails_cleanly",
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_open_racing_unlink_keeps_the_data_or_fails_cleanly",
 ]
 
 [[feature]]
