@@ -619,7 +619,7 @@ fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
 }
 
 fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
-    let open = with_current(|p| p.fd_kind(fd).is_open());
+    let (open, io) = with_current(|p| (p.fd_kind(fd).is_open(), p.io));
     if !open {
         return neg_errno(errno::EBADF);
     }
@@ -643,7 +643,17 @@ fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
         };
     }
     if cmd == ioctl::TIOCGWINSZ {
-        let ws = general::winsize { ws_row: 25, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+        let (ws_row, ws_col) = match io {
+            ConsoleIo::Vt(_) => crate::term::status()
+                .map(|t| {
+                    let rows = u16::try_from(t.rows).ok().filter(|&n| n > 0).unwrap_or(25);
+                    let cols = u16::try_from(t.cols).ok().filter(|&n| n > 0).unwrap_or(80);
+                    (rows, cols)
+                })
+                .unwrap_or((25, 80)),
+            ConsoleIo::Serial | ConsoleIo::Capture => (25, 80),
+        };
+        let ws = general::winsize { ws_row, ws_col, ws_xpixel: 0, ws_ypixel: 0 };
         // SAFETY: `general::winsize` is 4 `u16`s (8 bytes) with zero padding.
         return match unsafe { copy_pod_to_user(arg, &ws) } {
             Ok(()) => 0,
