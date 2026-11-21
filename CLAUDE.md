@@ -474,18 +474,19 @@ one is its own PR that updates that doc first.
 - `crates/lumen-vm`: a process's user address space as logic: the user
   layout (`USER_MIN`/`USER_MAX`, `PIE_BASE`, `MMAP_TOP`, the initial stack's
   `USER_STACK_TOP`/`USER_STACK_SIZE`/`USER_STACK_BOTTOM`), `Prot`, `Vma`s
-  anonymous or file-backed (`Backing`, `FileMapping`), the `VmaMap` interval
-  tree (`map` with `MapPlace` hint/fixed/no-replace, `unmap`, `protect`,
-  coalescing), the `Brk` cursor, and `maps` (`write_maps`: `/proc/<pid>/maps`
-  lines, the heap split at the break's edges, `[heap]`/`[stack]`)
-  (host-tested).
+  anonymous or file-backed (`Backing`, `FileMapping`), the `VmaMap` (sorted
+  by start in a `BTreeMap`: `map` with `MapPlace` hint/fixed/no-replace,
+  `unmap`, `protect`, coalescing), the `Brk` cursor, and `maps`
+  (`write_maps`: `/proc/<pid>/maps` lines, the heap split at the break's
+  edges, `[heap]`/`[stack]`) (host-tested).
 - `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
   `FileSystem`/`VfsInode` traits, the path and symlink resolver, the mount
-  table and the Lock-9 inode and dentry caches, `OpenFile` and the 1024-fd
-  `FdTable`, the namespace operations (`open_inode`, `mkdir_at`, `unlink_at`,
-  `rename_at2`, ...), `flock` and POSIX record locks, and `procfs` (`/proc`'s
-  `ProcKind`s, their inode numbers and types, `ProcFd`: an fd in
-  `0..MAX_FDS`, and `parse_canonical_u32`: one name per number) (host-tested).
+  table and the Lock-9 inode and dentry caches, `OpenFile` and the `FdTable`
+  (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
+  `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks, and
+  `procfs` (`/proc`'s `ProcKind`s, their inode numbers and types, `ProcFd`:
+  an fd in `0..MAX_FDS`, `ProcFd::parse`, and `parse_canonical_u32`: one
+  name per number) (host-tested).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
