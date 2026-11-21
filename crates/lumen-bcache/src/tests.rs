@@ -400,3 +400,116 @@ fn injected_io_errors_preserve_dirty_state_and_recover_cleanly() {
     assert_eq!(cache2.device().flush_calls(), 1);
     assert!(!cache2.needs_device_flush());
 }
+
+#[test]
+fn pinned_mut_deref_marks_dirty_immediately_and_blocks_sync_until_dropped() {
+    let dev = MemBlockDevice::new(512, 32); // 4 blocks
+    let cache = BlockCache::new(dev, 4).unwrap();
+
+    // Dirty block 1 first so we also cover mixed unpinned-dirty + pinned-dirty sync.
+    cache.write_at(BLOCK_SIZE as u64, &[0x11; 8]).unwrap();
+    assert_eq!(cache.stats().dirty, 1);
+
+    let mut p = cache.pin_mut(0).unwrap();
+    // Before DerefMut / mark_dirty, block 0 is still clean.
+    assert_eq!(cache.stats().dirty, 1);
+
+    // Mutably dereferencing marks block 0 dirty immediately.
+    p[0] = 0xAB;
+    assert_eq!(cache.stats().dirty, 2);
+
+    // While `p` is still alive, both `sync()` and `flush_blocks(&[0])` must fail with CacheFull
+    // and must NOT persist partial data or flush.
+    assert_eq!(cache.sync(), Err(BlockError::CacheFull));
+    assert_eq!(cache.flush_blocks(&[0]), Err(BlockError::CacheFull));
+    assert_eq!(cache.flush_blocks(&[0, 1]), Err(BlockError::CacheFull));
+    assert!(cache.device().write_log().is_empty());
+    assert_eq!(cache.device().flush_calls(), 0);
+    assert_eq!(cache.device().durable_snapshot()[0], 0);
+    assert_eq!(cache.stats().dirty, 2);
+
+    // Flushing an unrelated block (block 1) still succeeds.
+    cache.flush_blocks(&[1]).unwrap();
+    assert_eq!(cache.device().durable_snapshot()[BLOCK_SIZE], 0x11);
+    assert_eq!(cache.stats().dirty, 1);
+
+    drop(p);
+    assert_eq!(cache.stats().pinned, 0);
+    assert_eq!(cache.stats().dirty, 1);
+
+    cache.sync().unwrap();
+    assert_eq!(cache.stats().dirty, 0);
+    assert_eq!(cache.device().durable_snapshot()[0], 0xAB);
+}
+
+#[test]
+fn pinned_mut_mark_dirty_immediately_blocks_flush_and_sync_until_dropped() {
+    let dev = MemBlockDevice::new(512, 16); // 2 blocks
+    let cache = BlockCache::new(dev, 2).unwrap();
+
+    let mut p = cache.pin_mut(0).unwrap();
+    assert_eq!(cache.stats().dirty, 0);
+
+    // Call `mark_dirty()` directly without `DerefMut`.
+    p.mark_dirty();
+    assert_eq!(cache.stats().dirty, 1);
+    assert_eq!(cache.sync(), Err(BlockError::CacheFull));
+    assert_eq!(cache.flush_blocks(&[0]), Err(BlockError::CacheFull));
+    assert!(cache.device().write_log().is_empty());
+    assert_eq!(cache.device().flush_calls(), 0);
+
+    // Calling `mark_dirty()` repeatedly is idempotent.
+    p.mark_dirty();
+    assert_eq!(cache.stats().dirty, 1);
+
+    drop(p);
+    assert_eq!(cache.stats().pinned, 0);
+    assert_eq!(cache.stats().dirty, 1);
+
+    cache.flush_blocks(&[0]).unwrap();
+    assert_eq!(cache.stats().dirty, 0);
+    assert_eq!(cache.device().write_log(), vec![(0, BLOCK_SIZE)]);
+    assert_eq!(cache.device().flush_calls(), 1);
+}
+
+#[test]
+fn unmodified_pin_mut_stays_clean_and_allows_sync() {
+    let dev = MemBlockDevice::new(512, 16); // 2 blocks
+    let cache = BlockCache::new(dev, 2).unwrap();
+
+    {
+        let p = cache.pin_mut(0).unwrap();
+        // Reading through `Deref` (no `DerefMut` or `mark_dirty`) keeps the slot clean.
+        assert_eq!(p[0], 0);
+        assert_eq!(cache.stats().dirty, 0);
+        assert_eq!(cache.stats().pinned, 1);
+        cache.sync().unwrap();
+        cache.flush_blocks(&[0]).unwrap();
+        assert!(cache.device().write_log().is_empty());
+        assert_eq!(cache.device().flush_calls(), 0);
+    }
+    assert_eq!(cache.stats().dirty, 0);
+    assert_eq!(cache.stats().pinned, 0);
+
+    // An untouched `pin_mut` on an ALREADY-dirty block must still block sync/flush with CacheFull.
+    cache.write_at(0, &[0x55; 4]).unwrap();
+    assert_eq!(cache.stats().dirty, 1);
+    {
+        let p = cache.pin_mut(0).unwrap();
+        assert_eq!(p[0], 0x55);
+        assert_eq!(cache.sync(), Err(BlockError::CacheFull));
+        assert_eq!(cache.flush_blocks(&[0]), Err(BlockError::CacheFull));
+    }
+    cache.sync().unwrap();
+    assert_eq!(cache.stats().dirty, 0);
+    assert_eq!(cache.device().durable_snapshot()[0], 0x55);
+
+    // By contrast, a shared read `pin` on a dirty block still allows `sync()` to flush.
+    cache.write_at(0, &[0x66; 4]).unwrap();
+    {
+        let r = cache.pin(0).unwrap();
+        assert_eq!(r[0], 0x66);
+        cache.sync().unwrap();
+        assert_eq!(cache.device().durable_snapshot()[0], 0x66);
+    }
+}

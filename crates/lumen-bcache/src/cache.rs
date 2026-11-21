@@ -374,7 +374,14 @@ impl<B: BlockDevice> BlockCache<B> {
         // SAFETY: slot `Box` lives as long as `&self`, and `pin_count` prevents eviction/replacement.
         let guard = unsafe { &*data_ptr }.try_borrow_mut().map_err(|_| BlockError::CacheFull)?;
         inner.slots[slot_idx].pin_count += 1;
-        Ok(PinnedBlockMut { guard, cache: self, slot_idx, dirty: false })
+        Ok(PinnedBlockMut { guard, cache: self, slot_idx })
+    }
+
+    fn mark_slot_dirty(&self, slot_idx: usize) {
+        let mut inner = self.inner.borrow_mut();
+        if let SlotState::Occupied { dirty, .. } = &mut inner.slots[slot_idx].state {
+            *dirty = true;
+        }
     }
 
     /// Read `dst.len()` bytes starting at byte offset `byte_off`.
@@ -489,6 +496,17 @@ impl<B: BlockDevice> BlockCache<B> {
     }
 
     fn writeback_and_flush(&self, dirty_list: &[(u64, usize)]) -> Result<(), BlockError> {
+        {
+            let inner = self.inner.borrow();
+            for &(block_id, slot_idx) in dirty_list {
+                if matches!(inner.slots[slot_idx].state, SlotState::Occupied { block_id: b, dirty: true } if b == block_id)
+                    && inner.slots[slot_idx].data.try_borrow().is_err()
+                {
+                    return Err(BlockError::CacheFull);
+                }
+            }
+        }
+
         for &(block_id, slot_idx) in dirty_list {
             let (lba, valid_bytes) = self.block_extent(block_id)?;
             let data_ptr: *const RefCell<[u8; BLOCK_SIZE]> = {
@@ -562,13 +580,12 @@ pub struct PinnedBlockMut<'a, B: BlockDevice> {
     guard: RefMut<'a, [u8; BLOCK_SIZE]>,
     cache: &'a BlockCache<B>,
     slot_idx: usize,
-    dirty: bool,
 }
 
 impl<B: BlockDevice> PinnedBlockMut<'_, B> {
     /// Explicitly mark the pinned block dirty.
     pub fn mark_dirty(&mut self) {
-        self.dirty = true;
+        self.cache.mark_slot_dirty(self.slot_idx);
     }
 }
 
@@ -582,7 +599,7 @@ impl<B: BlockDevice> Deref for PinnedBlockMut<'_, B> {
 
 impl<B: BlockDevice> DerefMut for PinnedBlockMut<'_, B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.dirty = true;
+        self.cache.mark_slot_dirty(self.slot_idx);
         &mut self.guard
     }
 }
@@ -591,11 +608,6 @@ impl<B: BlockDevice> Drop for PinnedBlockMut<'_, B> {
     fn drop(&mut self) {
         let mut inner = self.cache.inner.borrow_mut();
         debug_assert!(inner.slots[self.slot_idx].pin_count > 0);
-        if self.dirty
-            && let SlotState::Occupied { block_id, .. } = inner.slots[self.slot_idx].state
-        {
-            inner.slots[self.slot_idx].state = SlotState::Occupied { block_id, dirty: true };
-        }
         inner.slots[self.slot_idx].pin_count -= 1;
     }
 }
