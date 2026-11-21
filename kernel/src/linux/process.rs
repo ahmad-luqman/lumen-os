@@ -1,0 +1,379 @@
+//! Per-process Linux x86-64 state, console I/O bridge, and exit tracking (M6).
+//!
+//! Each ring-3 run registers a [`ProcessState`] keyed by its kernel scheduler
+//! thread id in [`ACTIVE_PROCS`] and removes it cleanly when the thread exits
+//! or faults. Lock discipline: `ACTIVE_PROCS` is an IRQ-off [`SpinLock`] and
+//! must NEVER be held across `copy_from_user`, `copy_to_user`, blocking waits,
+//! or `AddressSpace` operations.
+
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use core::mem::{offset_of, size_of};
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::keyboard::Key as KbdKey;
+use crate::klog;
+use crate::linux::general;
+use crate::sched;
+use crate::serial_in;
+use crate::sync::SpinLock;
+use crate::term;
+use crate::user::UserExit;
+
+/// Maximum open file descriptors per M6 process.
+pub const MAX_FDS: usize = 64;
+
+/// Maximum captured stdout bytes for `usertest` runs.
+const CAPTURE_STDOUT_LIMIT: usize = 4096;
+
+/// Descriptor kind stored in the M6 per-process FD table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FdKind {
+    Closed,
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+impl FdKind {
+    #[inline]
+    pub const fn is_open(self) -> bool {
+        !matches!(self, FdKind::Closed)
+    }
+
+    #[inline]
+    pub const fn is_readable(self) -> bool {
+        matches!(self, FdKind::Stdin)
+    }
+
+    #[inline]
+    pub const fn is_writable(self) -> bool {
+        matches!(self, FdKind::Stdout | FdKind::Stderr)
+    }
+}
+
+/// Where a ring-3 process's console fds (0, 1, 2) connect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleIo {
+    /// `usertest` capture mode: stdout captured into `ProcessState::stdout`,
+    /// stdin served from pre-seeded `ProcessState::stdin`.
+    Capture,
+    /// Interactive serial console (`serial_in` + `klog::LockedSerial`).
+    Serial,
+    /// Interactive virtual terminal (`vt::wait_key` + `term::write_str_to`).
+    Vt(usize),
+}
+
+/// POD representation of Linux x86-64 `struct kernel_sigaction` (32 bytes,
+/// zero padding, `Send`/`Sync` safe without raw function pointers).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelSigaction {
+    pub handler: u64,
+    pub flags: u64,
+    pub restorer: u64,
+    pub mask: u64,
+}
+
+const _: () = {
+    assert!(size_of::<KernelSigaction>() == size_of::<general::kernel_sigaction>());
+    assert!(size_of::<KernelSigaction>() == 32);
+    assert!(offset_of!(KernelSigaction, handler) == offset_of!(general::kernel_sigaction, sa_handler_kernel));
+    assert!(offset_of!(KernelSigaction, flags) == offset_of!(general::kernel_sigaction, sa_flags));
+    assert!(offset_of!(KernelSigaction, restorer) == offset_of!(general::kernel_sigaction, sa_restorer));
+    assert!(offset_of!(KernelSigaction, mask) == offset_of!(general::kernel_sigaction, sa_mask));
+};
+
+/// Default console `struct termios` returned by `TCGETS` (canonical mode,
+/// CR->NL mapping, standard control characters).
+pub fn default_termios() -> general::termios {
+    let mut c_cc = [0u8; 19];
+    c_cc[general::VINTR as usize] = 3; // ^C
+    c_cc[general::VQUIT as usize] = 28; // ^\
+    c_cc[general::VERASE as usize] = 127; // DEL
+    c_cc[general::VKILL as usize] = 21; // ^U
+    c_cc[general::VEOF as usize] = 4; // ^D
+    c_cc[general::VTIME as usize] = 0;
+    c_cc[general::VMIN as usize] = 1;
+    c_cc[general::VSTART as usize] = 17; // ^Q
+    c_cc[general::VSTOP as usize] = 19; // ^S
+    c_cc[general::VSUSP as usize] = 26; // ^Z
+    general::termios {
+        c_iflag: general::ICRNL | general::IUTF8,
+        c_oflag: general::OPOST | general::ONLCR,
+        c_cflag: general::B38400 | general::CS8 | general::CREAD,
+        c_lflag: general::ISIG | general::ICANON | general::ECHO | general::ECHOE | general::ECHOK,
+        c_line: 0,
+        c_cc,
+    }
+}
+
+/// Per-process Linux state owned by one active ring-3 thread.
+pub struct ProcessState {
+    pub pid: u32,
+    pub ppid: u32,
+    pub tid: u32,
+    pub fds: [FdKind; MAX_FDS],
+    pub sigactions: [KernelSigaction; 64],
+    pub sigmask: u64,
+    pub clear_child_tid: u64,
+    pub termios: general::termios,
+    pub io: ConsoleIo,
+    pub allow_test_syscalls: bool,
+    pub exit: Option<UserExit>,
+    pub stdout: Vec<u8>,
+    stdin: Vec<u8>,
+    stdin_pos: usize,
+    unread_byte: Option<u8>,
+}
+
+impl ProcessState {
+    fn new(pid: u32, io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>) -> Self {
+        let mut fds = [FdKind::Closed; MAX_FDS];
+        fds[0] = FdKind::Stdin;
+        fds[1] = FdKind::Stdout;
+        fds[2] = FdKind::Stderr;
+        Self {
+            pid,
+            ppid: 0,
+            tid: pid,
+            fds,
+            sigactions: [KernelSigaction::default(); 64],
+            sigmask: 0,
+            clear_child_tid: 0,
+            termios: default_termios(),
+            io,
+            allow_test_syscalls,
+            exit: None,
+            stdout: Vec::new(),
+            stdin,
+            stdin_pos: 0,
+            unread_byte: None,
+        }
+    }
+
+    #[inline]
+    pub fn fd_kind(&self, fd: u64) -> FdKind {
+        if fd < MAX_FDS as u64 { self.fds[fd as usize] } else { FdKind::Closed }
+    }
+}
+
+static ACTIVE_PROCS: SpinLock<BTreeMap<u64, ProcessState>> = SpinLock::new(BTreeMap::new());
+static NEXT_PID: AtomicU32 = AtomicU32::new(1);
+
+#[inline]
+fn current_kernel_tid() -> u64 {
+    sched::running_here().expect("ring-3 syscall/exception requires a running thread").0
+}
+
+/// Register a fresh [`ProcessState`] for the current user thread and return its PID.
+pub fn register_current(io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>) -> u32 {
+    let ktid = current_kernel_tid();
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin);
+    let prev = ACTIVE_PROCS.lock().insert(ktid, state);
+    debug_assert!(prev.is_none(), "ring-3 process registered twice on thread {ktid}");
+    pid
+}
+
+/// Remove and return the current thread's [`ProcessState`] after ring-3 exits.
+pub fn take_current() -> ProcessState {
+    let ktid = current_kernel_tid();
+    ACTIVE_PROCS.lock().remove(&ktid).expect("active process state missing after ring-3 exit")
+}
+
+/// Run a short non-blocking closure with immutable access to the current process state.
+pub fn with_current<R>(f: impl FnOnce(&ProcessState) -> R) -> R {
+    let ktid = current_kernel_tid();
+    let guard = ACTIVE_PROCS.lock();
+    let proc = guard.get(&ktid).expect("ring-3 syscall with no active ProcessState");
+    f(proc)
+}
+
+/// Run a short non-blocking closure with mutable access to the current process state.
+pub fn with_current_mut<R>(f: impl FnOnce(&mut ProcessState) -> R) -> R {
+    let ktid = current_kernel_tid();
+    let mut guard = ACTIVE_PROCS.lock();
+    let proc = guard.get_mut(&ktid).expect("ring-3 syscall with no active ProcessState");
+    f(proc)
+}
+
+/// Record the process's terminal [`UserExit`] and return its PID.
+pub fn record_exit(exit: UserExit) -> u32 {
+    with_current_mut(|proc| {
+        proc.exit = Some(exit);
+        proc.pid
+    })
+}
+
+/// Write `bytes` (already copied from user space) to the process's console target.
+///
+/// Never called while holding `ACTIVE_PROCS` for `Serial` or `Vt`; for `Capture`
+/// it acquires `ACTIVE_PROCS` briefly to append up to `CAPTURE_STDOUT_LIMIT`.
+pub fn write_console(io: ConsoleIo, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    match io {
+        ConsoleIo::Capture => {
+            with_current_mut(|proc| {
+                let room = CAPTURE_STDOUT_LIMIT.saturating_sub(proc.stdout.len());
+                proc.stdout.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            });
+        }
+        ConsoleIo::Serial => {
+            klog::with_line_lock(|| {
+                let _ = klog::burst_held(bytes);
+            });
+        }
+        ConsoleIo::Vt(vt) => {
+            // Render valid UTF-8 runs and replace invalid bytes with U+FFFD.
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                match core::str::from_utf8(rest) {
+                    Ok(s) => {
+                        let _ = term::write_str_to(vt, s);
+                        break;
+                    }
+                    Err(e) => {
+                        let valid = e.valid_up_to();
+                        if valid > 0
+                            && let Ok(s) = core::str::from_utf8(&rest[..valid])
+                        {
+                            let _ = term::write_str_to(vt, s);
+                        }
+                        let _ = term::write_str_to(vt, "\u{fffd}");
+                        let skip = e.error_len().unwrap_or(rest.len() - valid);
+                        rest = &rest[valid + skip..];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether stdin currently has data available without blocking (or EOF in capture mode).
+pub fn stdin_ready(io: ConsoleIo) -> bool {
+    match io {
+        ConsoleIo::Capture => true,
+        ConsoleIo::Serial => with_current(|p| p.unread_byte.is_some()) || serial_in::available(),
+        ConsoleIo::Vt(vt) => {
+            if with_current(|p| p.unread_byte.is_some()) {
+                return true;
+            }
+            while let Some(key) = crate::vt::read_key(vt) {
+                if let KbdKey::Char(ch) = key
+                    && ch.is_ascii()
+                {
+                    let b = if ch == '\r' { b'\n' } else { ch as u8 };
+                    with_current_mut(|p| p.unread_byte = Some(b));
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Block briefly waiting for stdin input (at most one `serial_in::wait` slice,
+/// ~100 ms, or a short sleep on VT/Capture). Must be called with interrupts on
+/// and no `SpinLock` held.
+pub fn wait_stdin_step(io: ConsoleIo) {
+    match io {
+        ConsoleIo::Serial => serial_in::wait(),
+        ConsoleIo::Vt(_) => {
+            let _ = crate::sched::sleep(5_000_000);
+        }
+        ConsoleIo::Capture => {}
+    }
+}
+
+/// Read up to `dst.len()` bytes from the process's console stdin, blocking until
+/// at least 1 byte arrives (or returning `0` on EOF).
+///
+/// Must be called with interrupts enabled and no `SpinLock` held.
+pub fn read_console(io: ConsoleIo, dst: &mut [u8]) -> usize {
+    if dst.is_empty() {
+        return 0;
+    }
+    match io {
+        ConsoleIo::Capture => with_current_mut(|proc| {
+            let avail = &proc.stdin[proc.stdin_pos..];
+            if avail.is_empty() {
+                return 0;
+            }
+            let mut n = 0;
+            for &b in avail {
+                if n >= dst.len() {
+                    break;
+                }
+                dst[n] = b;
+                n += 1;
+                if b == b'\n' {
+                    break;
+                }
+            }
+            proc.stdin_pos += n;
+            n
+        }),
+        ConsoleIo::Serial => read_serial(dst),
+        ConsoleIo::Vt(vt) => read_vt(vt, dst),
+    }
+}
+
+fn read_serial(dst: &mut [u8]) -> usize {
+    let first = with_current_mut(|proc| proc.unread_byte.take()).unwrap_or_else(|| {
+        loop {
+            if let Some(b) = serial_in::read_byte() {
+                return b;
+            }
+            serial_in::wait();
+        }
+    });
+
+    // Ctrl-D at start of read -> EOF (0 bytes).
+    if first == 0x04 {
+        return 0;
+    }
+
+    dst[0] = if first == b'\r' { b'\n' } else { first };
+    let mut n = 1usize;
+
+    // Drain any immediately queued bytes up to `dst.len()` or `\n`, never
+    // blocking past the first available chunk (standard tty short-read).
+    while n < dst.len() && dst[n - 1] != b'\n' {
+        let Some(b) = serial_in::read_byte() else {
+            break;
+        };
+        if b == 0x04 {
+            with_current_mut(|proc| proc.unread_byte = Some(0x04));
+            break;
+        }
+        dst[n] = if b == b'\r' { b'\n' } else { b };
+        n += 1;
+    }
+    n
+}
+
+fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
+    if let Some(b) = with_current_mut(|p| p.unread_byte.take()) {
+        if b == 0x04 {
+            return 0;
+        }
+        dst[0] = b;
+        return 1;
+    }
+    loop {
+        if let KbdKey::Char(ch) = crate::vt::wait_key(vt) {
+            if ch == '\u{04}' {
+                return 0;
+            }
+            let mapped = if ch == '\r' { '\n' } else { ch };
+            let mut enc = [0u8; 4];
+            let s = mapped.encode_utf8(&mut enc);
+            let n = s.len().min(dst.len());
+            dst[..n].copy_from_slice(&s.as_bytes()[..n]);
+            return n;
+        }
+    }
+}

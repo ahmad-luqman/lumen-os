@@ -1,12 +1,30 @@
-//! Linux x86-64 UAPI constants, syscall numbers, and ABI structs (M6–M10).
+//! Linux x86-64 UAPI constants, syscall dispatcher, process state, boot module
+//! loader, and the `linux` shell command (M6–M10).
 //!
 //! Backed by the pinned `linux-raw-sys` crate (`=0.12.1`, elected license: MIT,
 //! zero transitive dependencies; see `docs/ARCHITECTURE.md` sections 2 and 8).
 //! Re-exports the UAPI modules so ring-3 syscall and ELF loader modules share
 //! one canonical ABI surface.
 
+pub mod modules;
+pub mod process;
+pub mod syscall;
+
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+
 #[allow(unused_imports)]
 pub use linux_raw_sys::{auxvec, ctypes, errno, general, ioctl, prctl, system};
+
+use crate::arch;
+use crate::linux::process::ConsoleIo;
+use crate::mm::frame;
+use crate::mm::user_vm::AddressSpace;
+use crate::shell::Ctx;
+use crate::term::Place;
+use crate::user::{UserExit, run_elf_process};
 
 /// Linux x86-64 `struct new_utsname` written by `uname(2)` (syscall 63).
 pub type Utsname = system::new_utsname;
@@ -19,7 +37,6 @@ pub use general::ARCH_SET_FS;
 ///
 /// `linux-raw-sys` 0.12.1 exports `ARCH_SET_FS` (`0x1002`) from `<asm/prctl.h>`
 /// but omits `ARCH_GET_FS` (`0x1003`), so we define it here beside `ARCH_SET_FS`.
-#[allow(dead_code)]
 pub const ARCH_GET_FS: u32 = 0x1003;
 
 /// The 30 initial M6 Linux x86-64 syscalls (`docs/ARCHITECTURE.md` section 8).
@@ -108,15 +125,103 @@ pub fn log_abi_summary() {
     let uts = default_utsname();
     let uname_nr = general::__NR_uname;
     let uname_name = syscall_name(uname_nr).unwrap_or("?");
+    let mods = modules::list();
     log::debug!(
         target: "linux",
-        "abi: {} M6 syscalls (#{uname_nr} {uname_name}: {} {} {}, -ENOSYS={})",
+        "abi: {} M6 syscalls (#{uname_nr} {uname_name}: {} {} {}, -ENOSYS={}), {} boot module(s)",
         M6_SYSCALLS.len(),
         read_uts_field(&uts.sysname),
         read_uts_field(&uts.release),
         read_uts_field(&uts.machine),
         -(errno::ENOSYS as i64),
+        mods.len(),
     );
+}
+
+/// Build 16 random bytes for `AT_RANDOM`, using `crate::rng::fill` when an
+/// entropy source is present and falling back to TSC/time mixing otherwise.
+fn at_random_bytes() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    if crate::rng::fill(&mut out).is_err() {
+        let a = crate::time::now_ns() ^ arch::rdtsc().rotate_left(13);
+        let b = arch::rdtsc().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ a.rotate_right(29);
+        out[0..8].copy_from_slice(&a.to_le_bytes());
+        out[8..16].copy_from_slice(&b.to_le_bytes());
+    }
+    out
+}
+
+/// Shell command: `linux` (list available Limine Linux binaries) or
+/// `linux <name> [args...]` (load and run a static Linux x86-64 ELF64 binary).
+#[cfg_attr(feature = "ktest", allow(dead_code))]
+pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
+    if args.is_empty() {
+        let mods = modules::list();
+        if mods.is_empty() {
+            let _ = writeln!(ctx.out, "linux: no boot modules loaded");
+            return;
+        }
+        let _ = writeln!(ctx.out, "linux: {} boot module(s):", mods.len());
+        for m in mods {
+            let kib = m.bytes.len().div_ceil(1024);
+            let _ = writeln!(ctx.out, "  {} ({kib} KiB)", m.name);
+        }
+        return;
+    }
+
+    if ctx.piped() {
+        return ctx.fail("linux: not in a pipeline");
+    }
+
+    let io = match ctx.out.place() {
+        Place::Anywhere => ConsoleIo::Serial,
+        Place::Vt(vt) => ConsoleIo::Vt(vt),
+        Place::Window(_) => return ctx.fail("linux: run from serial or a virtual terminal"),
+    };
+
+    let name = &args[0];
+    let Some(module) = modules::find(name) else {
+        return ctx.fail(format_args!("linux: unknown binary '{name}' (run 'linux' to list)"));
+    };
+
+    let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
+    let envp: [&[u8]; 3] = [b"PATH=/bin:/usr/bin", b"HOME=/", b"TERM=vt100"];
+    let execfn = name.as_bytes();
+    let random = at_random_bytes();
+
+    // Pre-warm kernel heap so process/VMA/stack metadata reuses mapped heap
+    // pages and physical frame accounting reflects only user-space frames.
+    let _warm: Vec<u8> = vec![0u8; 32 * 1024];
+    drop(_warm);
+
+    let frames_before = frame::free_frames();
+    let (space, prog) = match AddressSpace::from_elf(module.bytes, &argv, &envp, execfn, random) {
+        Ok(loaded) => loaded,
+        Err(e) => return ctx.fail(format_args!("linux: failed to load '{name}': {e}")),
+    };
+    let space = Arc::new(space);
+    let exit = match run_elf_process(module.name, space, prog.entry, prog.rsp, io) {
+        Ok(exit) => exit,
+        Err(e) => return ctx.fail(format_args!("linux: failed to run '{name}': {e}")),
+    };
+    let frames_after = frame::free_frames();
+    let leaked_frames = frames_before as i64 - frames_after as i64;
+
+    match exit {
+        UserExit::Exited(code) => {
+            let _ = writeln!(ctx.out, "linux: {name} exit={code} leaked_frames={leaked_frames}");
+        }
+        UserExit::Fault { vector, error_code, rip, cr2 } => {
+            let _ = writeln!(
+                ctx.out,
+                "linux: {name} fault vector={vector} ({}) error={error_code:#x} rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}",
+                arch::idt::exception_name(vector),
+            );
+        }
+        UserExit::NonCanonicalRip(rip) => {
+            let _ = writeln!(ctx.out, "linux: {name} non-canonical rip={rip:#x} leaked_frames={leaked_frames}");
+        }
+    }
 }
 
 crate::ktest!(
@@ -170,6 +275,7 @@ crate::ktest!(
         crate::kassert_eq!(errno::ESRCH, 3);
         crate::kassert_eq!(errno::EINTR, 4);
         crate::kassert_eq!(errno::EBADF, 9);
+        crate::kassert_eq!(errno::EAGAIN, 11);
         crate::kassert_eq!(errno::ENOMEM, 12);
         crate::kassert_eq!(errno::EFAULT, 14);
         crate::kassert_eq!(errno::EEXIST, 17);

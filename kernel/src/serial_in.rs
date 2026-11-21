@@ -178,7 +178,7 @@ fn queue_waiting() -> usize {
 }
 
 /// Whether a byte waits for [`read_byte`], in the queue or the UART.
-fn available() -> bool {
+pub fn available() -> bool {
     arch::serial::available(!QUEUE.is_empty())
 }
 

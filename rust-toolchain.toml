@@ -5,4 +5,5 @@ channel = "1.99.1"
 profile = "minimal"
 components = ["rustfmt", "clippy", "llvm-tools"]
 # wasm32-unknown-unknown: Lumen's apps (apps/, M5), to be run by the kernel's wasmi (#197).
-targets = ["x86_64-unknown-none", "wasm32-unknown-unknown"]
+# x86_64-unknown-linux-musl: static musl test binaries for Linux ring-3 ABI (M6, #238).
+targets = ["x86_64-unknown-none", "wasm32-unknown-unknown", "x86_64-unknown-linux-musl"]

@@ -4,13 +4,12 @@
 //! See `docs/ARCHITECTURE.md` §5 and §6 ("Ring 3 entry, `syscall`/`sysretq`,
 //! user CPU state and safe copies").
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use log::warn;
 use lumen_elf::loader::{
@@ -21,10 +20,11 @@ use lumen_vm::Prot;
 
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::arch::{self, TrapFrame};
-use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, errno, general};
+use crate::linux::process::{ConsoleIo, record_exit, register_current, take_current};
+use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, errno, general, ioctl, syscall as linux_syscall};
 #[cfg(feature = "ktest")]
 use crate::mm::paging;
-use crate::mm::user_vm::{AddressSpace, USER_STACK_BOTTOM, UserVmError, prot_from_linux};
+use crate::mm::user_vm::{AddressSpace, USER_STACK_BOTTOM, UserVmError};
 use crate::mm::{frame, heap};
 use crate::sched;
 use crate::shell::Ctx;
@@ -334,17 +334,6 @@ pub enum UserExit {
     NonCanonicalRip(u64),
 }
 
-/// Active ring-3 test-runner slot keyed by kernel thread id (so multiple
-/// independent user processes can run concurrently on the same CPU).
-struct RunSlot {
-    pid: u32,
-    exit: Option<UserExit>,
-    stdout: Vec<u8>,
-}
-
-static ACTIVE_RUNS: SpinLock<BTreeMap<u64, RunSlot>> = SpinLock::new(BTreeMap::new());
-static NEXT_PID: AtomicU32 = AtomicU32::new(1);
-
 /// Synchronization state for the concurrent same-CPU `sse_tls` preemption test.
 struct SseTlsSync {
     ready_mask: AtomicU8,
@@ -362,32 +351,18 @@ static SSE_TLS_SYNC: SseTlsSync = SseTlsSync {
 
 // Test-only syscall numbers used by `usertest` to exercise return-path
 // validation (canonical check on `sysretq`/`iretq`, rewritten-frame `iretq`,
-// and deterministic scheduler-switch counting for `sse_tls`).
+// and deterministic scheduler-switch counting for `sse_tls`). Never exposed to
+// normal `linux` processes (`allow_test_syscalls == false`).
 const SYS_TEST_NONCANON_SYSRET: u64 = 0x1000_0001;
 const SYS_TEST_NONCANON_IRET: u64 = 0x1000_0002;
 const SYS_TEST_IRET_RETURN: u64 = 0x1000_0003;
 const SYS_TEST_PREEMPT_COUNT: u64 = 0x1000_0004;
 
-#[inline]
-fn current_tid() -> u64 {
-    sched::running_here().expect("ring-3 syscall/exception requires a running thread").0
-}
-
-#[inline]
-fn neg_errno(code: u32) -> u64 {
-    -(code as i64) as u64
-}
-
-/// Record `exit` for the active ring-3 thread and return its pid.
-fn record_exit(exit: UserExit) -> u32 {
-    if !matches!(exit, UserExit::Exited(0)) {
+/// Abort any waiting `sse_tls` peer if a user process exits non-zero.
+pub(crate) fn note_exit_status(status: i32) {
+    if status != 0 {
         SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
     }
-    let tid = current_tid();
-    let mut guard = ACTIVE_RUNS.lock();
-    let slot = guard.get_mut(&tid).expect("user exit with no active ring-3 run");
-    slot.exit = Some(exit);
-    slot.pid
 }
 
 /// Handle a ring-3 exception (`(frame.cs & 3) != 0`) from `lumen_exception_dispatch`.
@@ -395,6 +370,7 @@ fn record_exit(exit: UserExit) -> u32 {
 /// Logs one `WARN` naming pid, vector, `rip`, and `cr2`, and unwinds cleanly
 /// back to the kernel ring-3 runner—never calling `crash::exception`.
 pub fn handle_user_exception(frame: &TrapFrame, cr2: u64) -> ! {
+    SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
     let exit = UserExit::Fault { vector: frame.vector, error_code: frame.error_code, rip: frame.rip, cr2 };
     let pid = record_exit(exit);
     warn!(
@@ -414,6 +390,7 @@ pub fn handle_user_exception(frame: &TrapFrame, cr2: u64) -> ! {
 /// Handle a deferred `#DB` trap caught at `LSTAR` (CVE-2018-8897 handoff),
 /// running on the thread's normal kernel stack inside `lumen_syscall_dispatch`.
 pub fn handle_deferred_debug_trap(frame: &SyscallFrame) -> ! {
+    SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
     let exit = UserExit::Fault { vector: 1, error_code: 0, rip: frame.rip, cr2: 0 };
     let pid = record_exit(exit);
     warn!(
@@ -428,132 +405,39 @@ pub fn handle_deferred_debug_trap(frame: &SyscallFrame) -> ! {
 /// Terminate the active user context when the return `rip` is non-canonical or
 /// `>= USER_MAX`, before `swapgs` or `sysretq`/`iretq` ever runs.
 pub fn handle_non_canonical_return(rip: u64) -> ! {
+    SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
     let pid = record_exit(UserExit::NonCanonicalRip(rip));
     warn!(target: "user", "pid {pid}: non-canonical user return rip {rip:#x}; terminating process");
     // SAFETY: called on the CPU running the active ring-3 context, no lock held.
     unsafe { arch::syscall::unwind_to_kernel() }
 }
 
-/// M6 wave-2 syscall dispatcher for ring-3 VM, TLS, I/O, and exit syscalls.
+/// Dispatch a Linux x86-64 ring-3 syscall through `crate::linux::syscall`.
 pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
-    let nr = frame.rax;
-    match nr {
-        n if n == u64::from(general::__NR_write) => {
-            let fd = frame.rdi;
-            let buf = frame.rsi;
-            let count = frame.rdx;
-            if fd != 1 && fd != 2 {
-                frame.rax = neg_errno(errno::EBADF);
-                return SyscallReturn::Sysret;
-            }
-            let n = count.min(4096) as usize;
-            let mut kbuf = [0u8; 4096];
-            if copy_from_user(&mut kbuf[..n], buf).is_err() {
-                frame.rax = neg_errno(errno::EFAULT);
-                return SyscallReturn::Sysret;
-            }
-            let tid = current_tid();
-            if let Some(slot) = ACTIVE_RUNS.lock().get_mut(&tid) {
-                let room = 4096usize.saturating_sub(slot.stdout.len());
-                slot.stdout.extend_from_slice(&kbuf[..n.min(room)]);
-            }
-            frame.rax = n as u64;
-            SyscallReturn::Sysret
-        }
-        n if n == u64::from(general::__NR_mmap) => {
-            let Some(prot) = prot_from_linux(frame.rdx) else {
-                frame.rax = neg_errno(errno::EINVAL);
-                return SyscallReturn::Sysret;
-            };
-            let Some(space) = sched::current_address_space() else {
-                frame.rax = neg_errno(errno::ENOMEM);
-                return SyscallReturn::Sysret;
-            };
-            frame.rax = match space.mmap_anon(frame.rdi, frame.rsi, prot, frame.r10) {
-                Ok(va) => va,
-                Err(e) => neg_errno(e.to_errno()),
-            };
-            SyscallReturn::Sysret
-        }
-        n if n == u64::from(general::__NR_mprotect) => {
-            let Some(prot) = prot_from_linux(frame.rdx) else {
-                frame.rax = neg_errno(errno::EINVAL);
-                return SyscallReturn::Sysret;
-            };
-            let Some(space) = sched::current_address_space() else {
-                frame.rax = neg_errno(errno::ENOMEM);
-                return SyscallReturn::Sysret;
-            };
-            frame.rax = match space.mprotect(frame.rdi, frame.rsi, prot) {
-                Ok(()) => 0,
-                Err(e) => neg_errno(e.to_mprotect_errno()),
-            };
-            SyscallReturn::Sysret
-        }
-        n if n == u64::from(general::__NR_munmap) => {
-            let Some(space) = sched::current_address_space() else {
-                frame.rax = neg_errno(errno::EINVAL);
-                return SyscallReturn::Sysret;
-            };
-            frame.rax = match space.munmap(frame.rdi, frame.rsi) {
-                Ok(()) => 0,
-                Err(e) => neg_errno(e.to_errno()),
-            };
-            SyscallReturn::Sysret
-        }
-        n if n == u64::from(general::__NR_brk) => {
-            let Some(space) = sched::current_address_space() else {
-                frame.rax = 0;
-                return SyscallReturn::Sysret;
-            };
-            frame.rax = space.brk(frame.rdi);
-            SyscallReturn::Sysret
-        }
-        n if n == u64::from(general::__NR_arch_prctl) => {
-            let code = frame.rdi;
-            let addr = frame.rsi;
-            if code == u64::from(ARCH_SET_FS) {
-                if addr >= USER_MAX {
-                    frame.rax = neg_errno(errno::EINVAL);
-                } else {
-                    sched::set_current_fs_base(addr);
-                    frame.rax = 0;
-                }
-            } else if code == u64::from(ARCH_GET_FS) {
-                let fs = sched::current_fs_base();
-                frame.rax = match copy_to_user(addr, &fs.to_le_bytes()) {
-                    Ok(()) => 0,
-                    Err(e) => neg_errno(e.to_errno()),
-                };
-            } else {
-                frame.rax = neg_errno(errno::EINVAL);
-            }
-            SyscallReturn::Sysret
-        }
-        n if n == u64::from(general::__NR_exit) || n == u64::from(general::__NR_exit_group) => {
-            let status = (frame.rdi & 0xff) as i32;
-            let _ = record_exit(UserExit::Exited(status));
-            // SAFETY: unwinds cleanly back to `enter_ring3`, no lock held and
-            // no live Rust `Drop` values on this stack frame.
-            unsafe { arch::syscall::unwind_to_kernel() }
-        }
+    linux_syscall::dispatch(frame)
+}
+
+/// Test-only syscall hooks invoked ONLY when `ProcessState::allow_test_syscalls`
+/// is set (`usertest` runs). Normal `linux` binaries never reach these hooks.
+pub(crate) fn dispatch_test_syscall(frame: &mut SyscallFrame) -> Option<SyscallReturn> {
+    match frame.rax {
         SYS_TEST_NONCANON_SYSRET => {
             // Non-canonical boundary address: bit 47 = 1, bits 48..63 = 0.
             frame.rip = 0x0000_8000_0000_0000;
-            SyscallReturn::Sysret
+            Some(SyscallReturn::Sysret)
         }
         SYS_TEST_NONCANON_IRET => {
             frame.rip = 0x0000_8000_0000_0000;
-            SyscallReturn::Iret
+            Some(SyscallReturn::Iret)
         }
         SYS_TEST_IRET_RETURN => {
             frame.rax = 0x1337;
-            SyscallReturn::Iret
+            Some(SyscallReturn::Iret)
         }
         SYS_TEST_PREEMPT_COUNT => {
             if SSE_TLS_SYNC.aborted.load(Ordering::Acquire) {
                 frame.rax = u64::MAX;
-                return SyscallReturn::Sysret;
+                return Some(SyscallReturn::Sysret);
             }
             let bit = (frame.rdi & 3) as u8;
             let now_mask = SSE_TLS_SYNC.ready_mask.fetch_or(bit, Ordering::AcqRel) | bit;
@@ -574,12 +458,9 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
                 };
                 frame.rax = cur.saturating_sub(base);
             }
-            SyscallReturn::Sysret
+            Some(SyscallReturn::Sysret)
         }
-        _ => {
-            frame.rax = neg_errno(errno::ENOSYS);
-            SyscallReturn::Sysret
-        }
+        _ => None,
     }
 }
 
@@ -627,6 +508,7 @@ type ResultSlot = Arc<SpinLock<Option<RunResult>>>;
 
 /// Spawn a pinned user thread on `cpu` executing `(entry, rsp)` inside `space`,
 /// returning `(JoinHandle, result_slot)`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_ring3_on(
     cpu: usize,
     name: &'static str,
@@ -634,13 +516,14 @@ fn spawn_ring3_on(
     entry: u64,
     rsp: u64,
     dr0_target: Option<u64>,
+    io: ConsoleIo,
+    allow_test_syscalls: bool,
+    stdin: Vec<u8>,
 ) -> Result<(sched::JoinHandle, ResultSlot), &'static str> {
     let result_slot: ResultSlot = Arc::new(SpinLock::new(None));
     let out = result_slot.clone();
     let handle = sched::spawn_user_on(cpu, name, space, move || {
-        let tid = current_tid();
-        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-        ACTIVE_RUNS.lock().insert(tid, RunSlot { pid, exit: None, stdout: Vec::new() });
+        let _pid = register_current(io, allow_test_syscalls, stdin);
 
         let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
         let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
@@ -652,11 +535,11 @@ fn spawn_ring3_on(
         let lstar_after = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
         let stub_after = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
 
-        let slot = ACTIVE_RUNS.lock().remove(&tid).expect("active run slot missing after ring-3 exit");
-        let exit = slot.exit.expect("ring-3 exited without recording UserExit");
+        let proc = take_current();
+        let exit = proc.exit.expect("ring-3 exited without recording UserExit");
         *out.lock() = Some(RunResult {
             exit,
-            stdout: slot.stdout,
+            stdout: proc.stdout,
             deferred_lstar_db: lstar_after.saturating_sub(lstar_before),
             deferred_stub_db: stub_after.saturating_sub(stub_before),
         });
@@ -671,16 +554,48 @@ fn spawn_ring3_on(
     Ok((handle, result_slot))
 }
 
+/// Run a loaded Linux ELF64 process in ring 3 on the current CPU with the
+/// given interactive console target (`allow_test_syscalls == false`).
+#[cfg_attr(feature = "ktest", allow(dead_code))]
+pub fn run_elf_process(
+    name: &'static str,
+    space: Arc<AddressSpace>,
+    entry: u64,
+    rsp: u64,
+    io: ConsoleIo,
+) -> Result<UserExit, &'static str> {
+    let (handle, slot) = spawn_ring3_on(arch::cpu_index(), name, space, entry, rsp, None, io, false, Vec::new())?;
+    handle.join();
+    let res = slot.lock().take().expect("linux process finished without RunResult");
+    Ok(res.exit)
+}
+
 /// Run raw x86-64 user machine code `code` (with optional `data` mapped at
 /// `TEST_DATA_VA`) in ring 3 inside a real [`AddressSpace`] on a user thread.
-fn run_ring3_program(code: &[u8], data: &[u8], dr0_target: Option<u64>) -> Result<RunResult, &'static str> {
+fn run_ring3_program(
+    code: &[u8],
+    data: &[u8],
+    dr0_target: Option<u64>,
+    stdin: Vec<u8>,
+) -> Result<RunResult, &'static str> {
     let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames for AddressSpace")?);
-    space.map_eager_with_bytes(TEST_CODE_VA, FRAME_SIZE, Prot::READ | Prot::EXEC, code).map_err(|_| "map code")?;
+    let code_len = (code.len() as u64).max(FRAME_SIZE);
+    let data_len = (data.len() as u64).max(FRAME_SIZE);
+    space.map_eager_with_bytes(TEST_CODE_VA, code_len, Prot::READ | Prot::EXEC, code).map_err(|_| "map code")?;
     space.map_eager_with_bytes(TEST_STACK_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[]).map_err(|_| "map stack")?;
-    space.map_eager_with_bytes(TEST_DATA_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, data).map_err(|_| "map data")?;
+    space.map_eager_with_bytes(TEST_DATA_VA, data_len, Prot::READ | Prot::WRITE, data).map_err(|_| "map data")?;
 
-    let (handle, slot) =
-        spawn_ring3_on(arch::cpu_index(), "usertest", space, TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, dr0_target)?;
+    let (handle, slot) = spawn_ring3_on(
+        arch::cpu_index(),
+        "usertest",
+        space,
+        TEST_CODE_VA,
+        TEST_STACK_VA + FRAME_SIZE,
+        dr0_target,
+        ConsoleIo::Capture,
+        true,
+        stdin,
+    )?;
     handle.join();
     Ok(slot.lock().take().expect("user thread finished without RunResult"))
 }
@@ -751,8 +666,20 @@ impl CodeBuf {
         self.bytes(&[0x48, 0xb9]);
         self.bytes(&imm.to_le_bytes());
     }
+    fn mov_rdi_u64(&mut self, imm: u64) {
+        self.bytes(&[0x48, 0xbf]);
+        self.bytes(&imm.to_le_bytes());
+    }
     fn mov_rsi_u64(&mut self, imm: u64) {
         self.bytes(&[0x48, 0xbe]);
+        self.bytes(&imm.to_le_bytes());
+    }
+    fn mov_rdx_u64(&mut self, imm: u64) {
+        self.bytes(&[0x48, 0xba]);
+        self.bytes(&imm.to_le_bytes());
+    }
+    fn mov_r10_u64(&mut self, imm: u64) {
+        self.bytes(&[0x49, 0xba]);
         self.bytes(&imm.to_le_bytes());
     }
     fn mov_rbp_u64(&mut self, imm: u64) {
@@ -1028,6 +955,11 @@ fn run_bad_elf_tests(ctx: &mut Ctx<'_>) {
         ("stack_overlap", &bad_stack_overlap, |e| matches!(e, UserVmError::Vm(lumen_vm::VmError::Exists))),
     ];
 
+    // Pre-warm kernel heap before measuring so first-time heap expansion is
+    // not counted as a loader leak.
+    let _warm: Vec<u8> = vec![0u8; 8192];
+    drop(_warm);
+
     let frames_before = frame::free_frames();
     let heap_before = heap::stats().used;
     let mut rejected = 0usize;
@@ -1205,7 +1137,17 @@ fn run_mmap_brk_test(ctx: &mut Ctx<'_>) {
         Err(e) => return ctx.fail(format_args!("usertest: mmap_brk load failed: {e}")),
     };
     let space = Arc::new(space);
-    let (handle, slot) = match spawn_ring3_on(arch::cpu_index(), "mmap-brk", space, prog.entry, prog.rsp, None) {
+    let (handle, slot) = match spawn_ring3_on(
+        arch::cpu_index(),
+        "mmap-brk",
+        space,
+        prog.entry,
+        prog.rsp,
+        None,
+        ConsoleIo::Capture,
+        true,
+        Vec::new(),
+    ) {
         Ok(pair) => pair,
         Err(e) => return ctx.fail(format_args!("usertest: mmap_brk spawn failed: {e}")),
     };
@@ -1362,19 +1304,38 @@ fn run_sse_tls_test(ctx: &mut Ctx<'_>) {
         Err(e) => return ctx.fail(format_args!("usertest: sse_tls space_b: {e}")),
     };
 
-    let (ha, slot_a) =
-        match spawn_ring3_on(target_cpu, "sse-tls-a", space_a, TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, None) {
-            Ok(p) => p,
-            Err(e) => return ctx.fail(format_args!("usertest: sse_tls spawn A: {e}")),
-        };
-    let (hb, slot_b) =
-        match spawn_ring3_on(target_cpu, "sse-tls-b", space_b, TEST_CODE_VA, TEST_STACK_VA + FRAME_SIZE, None) {
-            Ok(p) => p,
-            Err(e) => {
-                ha.join();
-                return ctx.fail(format_args!("usertest: sse_tls spawn B: {e}"));
-            }
-        };
+    let (ha, slot_a) = match spawn_ring3_on(
+        target_cpu,
+        "sse-tls-a",
+        space_a,
+        TEST_CODE_VA,
+        TEST_STACK_VA + FRAME_SIZE,
+        None,
+        ConsoleIo::Capture,
+        true,
+        Vec::new(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return ctx.fail(format_args!("usertest: sse_tls spawn A: {e}")),
+    };
+    let (hb, slot_b) = match spawn_ring3_on(
+        target_cpu,
+        "sse-tls-b",
+        space_b,
+        TEST_CODE_VA,
+        TEST_STACK_VA + FRAME_SIZE,
+        None,
+        ConsoleIo::Capture,
+        true,
+        Vec::new(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
+            ha.join();
+            return ctx.fail(format_args!("usertest: sse_tls spawn B: {e}"));
+        }
+    };
 
     ha.join();
     hb.join();
@@ -1404,9 +1365,170 @@ fn run_sse_tls_test(ctx: &mut Ctx<'_>) {
     }
 }
 
-/// Shell command: `usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret|bad_elf|mmap_brk|sse_tls>`.
+/// Ring-3 program exercising every pointer-taking M6 syscall with null,
+/// kernel-half, and unmapped user pointers (`-EFAULT`), plus unknown syscall
+/// (`-ENOSYS`), closed-fd operations (`-EBADF`), invalid arguments
+/// (`-EINVAL`/`-ERANGE`/`-ESRCH`/`-ENOTTY`), and zero-length iovec skipping.
+fn program_bad_ptrs() -> (Vec<u8>, Vec<u8>) {
+    const NULL_VA: u64 = 0;
+    const LOW_BAD_VA: u64 = 0x1000;
+    const KERNEL_VA: u64 = 0xffff_8000_0000_0000;
+    const UNMAPPED_VA: u64 = TEST_DATA_VA + FRAME_SIZE;
+
+    let valid_buf = TEST_DATA_VA;
+    let iov_bad_unmapped = TEST_DATA_VA + 0x20;
+    let iov_bad_kernel = TEST_DATA_VA + 0x30;
+    let iov_skip_zero = TEST_DATA_VA + 0x40;
+    let valid_out = TEST_DATA_VA + 0x100;
+
+    let mut data = vec![0u8; 0x300];
+    data[0..4].copy_from_slice(b"ok!\n");
+    // iov_bad_unmapped: { base = UNMAPPED_VA, len = 4 }
+    data[0x20..0x28].copy_from_slice(&UNMAPPED_VA.to_le_bytes());
+    data[0x28..0x30].copy_from_slice(&4u64.to_le_bytes());
+    // iov_bad_kernel: { base = KERNEL_VA, len = 4 }
+    data[0x30..0x38].copy_from_slice(&KERNEL_VA.to_le_bytes());
+    data[0x38..0x40].copy_from_slice(&4u64.to_le_bytes());
+    // iov_skip_zero: [ { base = 0, len = 0 }, { base = valid_buf, len = 4 } ]
+    data[0x40..0x48].copy_from_slice(&0u64.to_le_bytes());
+    data[0x48..0x50].copy_from_slice(&0u64.to_le_bytes());
+    data[0x50..0x58].copy_from_slice(&valid_buf.to_le_bytes());
+    data[0x58..0x60].copy_from_slice(&4u64.to_le_bytes());
+
+    let efault = -(errno::EFAULT as i64) as u64;
+    let enosys = -(errno::ENOSYS as i64) as u64;
+    let ebadf = -(errno::EBADF as i64) as u64;
+    let einval = -(errno::EINVAL as i64) as u64;
+    let erange = -(errno::ERANGE as i64) as u64;
+    let esrch = -(errno::ESRCH as i64) as u64;
+    let enotty = -(errno::ENOTTY as i64) as u64;
+
+    let mut c = CodeBuf::new();
+    let mut step = 1u32;
+    let mut check_syscall = |c: &mut CodeBuf, nr: u32, a1: u64, a2: u64, a3: u64, a4: u64, expect: u64| {
+        c.mov_eax(nr);
+        c.mov_rdi_u64(a1);
+        c.mov_rsi_u64(a2);
+        c.mov_rdx_u64(a3);
+        c.mov_r10_u64(a4);
+        c.syscall();
+        c.mov_rcx_u64(expect);
+        c.fail_if_rax_ne_rcx(step);
+        step += 1;
+    };
+
+    for bad in [NULL_VA, KERNEL_VA, UNMAPPED_VA] {
+        // 1. read / write
+        check_syscall(&mut c, general::__NR_read, 0, bad, 4, 0, efault);
+        check_syscall(&mut c, general::__NR_write, 1, bad, 4, 0, efault);
+        // 2. readv / writev (bad iov array pointer)
+        check_syscall(&mut c, general::__NR_readv, 0, bad, 1, 0, efault);
+        check_syscall(&mut c, general::__NR_writev, 1, bad, 1, 0, efault);
+        // 3. fstat
+        check_syscall(&mut c, general::__NR_fstat, 1, bad, 0, 0, efault);
+        // 4. ioctl TCGETS / TCSETS / TIOCGWINSZ
+        check_syscall(&mut c, general::__NR_ioctl, 1, u64::from(ioctl::TCGETS), bad, 0, efault);
+        check_syscall(&mut c, general::__NR_ioctl, 1, u64::from(ioctl::TCSETS), bad, 0, efault);
+        check_syscall(&mut c, general::__NR_ioctl, 1, u64::from(ioctl::TIOCGWINSZ), bad, 0, efault);
+        // 5. uname / getcwd
+        check_syscall(&mut c, general::__NR_uname, bad, 0, 0, 0, efault);
+        check_syscall(&mut c, general::__NR_getcwd, bad, 64, 0, 0, efault);
+        // 6. arch_prctl(ARCH_GET_FS)
+        check_syscall(&mut c, general::__NR_arch_prctl, u64::from(ARCH_GET_FS), bad, 0, 0, efault);
+        // 7. clock_gettime
+        check_syscall(&mut c, general::__NR_clock_gettime, u64::from(general::CLOCK_MONOTONIC), bad, 0, 0, efault);
+        // 8. getrandom / poll
+        check_syscall(&mut c, general::__NR_getrandom, bad, 8, 0, 0, efault);
+        check_syscall(&mut c, general::__NR_poll, bad, 1, 0, 0, efault);
+    }
+
+    // Optional-pointer syscalls (where NULL means "omitted"): test non-null
+    // invalid addresses below USER_MIN, in the kernel half, and unmapped user VA.
+    for bad in [LOW_BAD_VA, KERNEL_VA, UNMAPPED_VA] {
+        // 9. rt_sigaction (act and oldact)
+        check_syscall(&mut c, general::__NR_rt_sigaction, 15, bad, 0, 8, efault);
+        check_syscall(&mut c, general::__NR_rt_sigaction, 15, 0, bad, 8, efault);
+        // 10. rt_sigprocmask (set and oldset)
+        check_syscall(&mut c, general::__NR_rt_sigprocmask, u64::from(general::SIG_SETMASK), bad, 0, 8, efault);
+        check_syscall(&mut c, general::__NR_rt_sigprocmask, u64::from(general::SIG_SETMASK), 0, bad, 8, efault);
+        // 11. prlimit64 (new and old)
+        check_syscall(&mut c, general::__NR_prlimit64, 0, u64::from(general::RLIMIT_STACK), bad, 0, efault);
+        check_syscall(&mut c, general::__NR_prlimit64, 0, u64::from(general::RLIMIT_STACK), 0, bad, efault);
+    }
+
+    // Valid iov array with bad iov_base (both unmapped user page and kernel address).
+    check_syscall(&mut c, general::__NR_readv, 0, iov_bad_unmapped, 1, 0, efault);
+    check_syscall(&mut c, general::__NR_readv, 0, iov_bad_kernel, 1, 0, efault);
+    check_syscall(&mut c, general::__NR_writev, 1, iov_bad_unmapped, 1, 0, efault);
+    check_syscall(&mut c, general::__NR_writev, 1, iov_bad_kernel, 1, 0, efault);
+
+    // Zero-length iovec with null iov_base must be skipped cleanly.
+    check_syscall(&mut c, general::__NR_writev, 1, iov_skip_zero, 2, 0, 4);
+    check_syscall(&mut c, general::__NR_readv, 0, iov_skip_zero, 2, 0, 4);
+
+    // Unknown syscall returns -ENOSYS (-38).
+    check_syscall(&mut c, 999, 0, 0, 0, 0, enosys);
+
+    // Invalid argument checks.
+    check_syscall(&mut c, general::__NR_getcwd, valid_out, 1, 0, 0, erange);
+    check_syscall(&mut c, general::__NR_getcwd, valid_out, 64, 0, 0, 2);
+    check_syscall(&mut c, general::__NR_ioctl, 1, 0x9999, valid_out, 0, enotty);
+    check_syscall(&mut c, general::__NR_clock_gettime, 99, valid_out, 0, 0, einval);
+    check_syscall(&mut c, general::__NR_clock_gettime, u64::from(general::CLOCK_REALTIME), valid_out, 0, 0, 0);
+    check_syscall(&mut c, general::__NR_getrandom, valid_out, 8, 0x8000, 0, einval);
+    check_syscall(&mut c, general::__NR_getrandom, valid_out, 8, 0, 0, 8);
+    check_syscall(&mut c, general::__NR_prlimit64, 999_999, u64::from(general::RLIMIT_STACK), 0, valid_out, esrch);
+    check_syscall(&mut c, general::__NR_prlimit64, 0, u64::from(general::RLIM_NLIMITS), 0, valid_out, einval);
+    check_syscall(&mut c, general::__NR_prlimit64, 0, u64::from(general::RLIMIT_STACK), 0, valid_out, 0);
+    check_syscall(&mut c, general::__NR_rt_sigaction, u64::from(general::SIGKILL), valid_out, 0, 8, einval);
+
+    // Closed-fd checks: close(2) -> 0, then write/fstat/ioctl/read/close(2) -> -EBADF.
+    check_syscall(&mut c, general::__NR_close, 2, 0, 0, 0, 0);
+    check_syscall(&mut c, general::__NR_close, 2, 0, 0, 0, ebadf);
+    check_syscall(&mut c, general::__NR_write, 2, valid_buf, 4, 0, ebadf);
+    check_syscall(&mut c, general::__NR_fstat, 2, valid_out, 0, 0, ebadf);
+    check_syscall(&mut c, general::__NR_ioctl, 2, u64::from(ioctl::TCGETS), valid_out, 0, ebadf);
+    check_syscall(&mut c, general::__NR_read, 2, valid_out, 4, 0, ebadf);
+
+    // close(0) -> 0, then read/readv(0) -> -EBADF.
+    check_syscall(&mut c, general::__NR_close, 0, 0, 0, 0, 0);
+    check_syscall(&mut c, general::__NR_read, 0, valid_out, 4, 0, ebadf);
+    check_syscall(&mut c, general::__NR_readv, 0, iov_skip_zero, 2, 0, ebadf);
+
+    c.exit_group_imm(0);
+    c.ud2();
+    (c.0, data)
+}
+
+fn run_bad_ptrs_test(ctx: &mut Ctx<'_>) {
+    let (code, data) = program_bad_ptrs();
+    let _warm: Vec<u8> = vec![0u8; 16 * 1024];
+    drop(_warm);
+
+    let frames_before = frame::free_frames();
+    // Pre-seed stdin so read/readv bad-pointer cases attempt copy_to_user and
+    // exercise .lumen_fixup even on unmapped user pages.
+    let result = match run_ring3_program(&code, &data, None, vec![b'A'; 64]) {
+        Ok(r) => r,
+        Err(e) => return ctx.fail(format_args!("usertest: bad_ptrs {e}")),
+    };
+    let exit = result.exit;
+    drop(result);
+    let frames_after = frame::free_frames();
+    let leaked_frames = frames_before as i64 - frames_after as i64;
+    match exit {
+        UserExit::Exited(status) => {
+            let _ = writeln!(ctx.out, "usertest: bad_ptrs exit={status} leaked_frames={leaked_frames}");
+        }
+        other => {
+            ctx.fail(format_args!("usertest: bad_ptrs unexpected exit {other:?} leaked_frames={leaked_frames}"));
+        }
+    }
+}
+
+/// Shell command: `usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret|bad_elf|mmap_brk|sse_tls|bad_ptrs>`.
 pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
-    const USAGE: &str = "usage: usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret|bad_elf|mmap_brk|sse_tls>";
+    const USAGE: &str = "usage: usertest <ok|iret|pf|ud|gp|bp|db|cve_db|lstar_db|movss_bp|stub_db|noncanon|noncanon-iret|bad_elf|mmap_brk|sse_tls|bad_ptrs>";
     let [kind] = args else {
         return ctx.fail(USAGE);
     };
@@ -1414,6 +1536,7 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         "bad_elf" => return run_bad_elf_tests(ctx),
         "mmap_brk" => return run_mmap_brk_test(ctx),
         "sse_tls" => return run_sse_tls_test(ctx),
+        "bad_ptrs" => return run_bad_ptrs_test(ctx),
         _ => {}
     }
     let (code, data, dr0_target): (Vec<u8>, &[u8], Option<u64>) = match kind.as_str() {
@@ -1435,7 +1558,7 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         "noncanon-iret" => (program_noncanon(true), &[], None),
         _ => return ctx.fail(USAGE),
     };
-    let result = match run_ring3_program(&code, data, dr0_target) {
+    let result = match run_ring3_program(&code, data, dr0_target, Vec::new()) {
         Ok(r) => r,
         Err(e) => return ctx.fail(format_args!("usertest: {e}")),
     };
