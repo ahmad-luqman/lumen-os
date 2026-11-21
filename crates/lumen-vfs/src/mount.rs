@@ -273,6 +273,11 @@ pub trait VfsCacheOps {
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>>;
+    /// Unify a newly created inode in `InodeCache` and publish its dentry
+    /// under Lock 9. Implementations must insert into `DentryCache` only when
+    /// `(inode.dev_id(), inode.ino())` was not already cached in `InodeCache`
+    /// prior to `get_or_insert_created_if_fresh`, so callers outside Lock 9
+    /// can verify a pre-existing cached `Arc` is alive before caching its dentry.
     fn publish_created_inode(
         &self,
         parent_dev: DevId,
@@ -319,6 +324,7 @@ pub trait VfsCacheOps {
     fn inode_end_removal(&self, dev: DevId, ino: Ino) -> u64;
     fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool;
     fn inode_remove_if_same(&self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>>;
+    fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64;
 }
 
 /// Single-threaded `RefCell`-backed VFS lookup tables for host unit tests.
@@ -473,14 +479,17 @@ impl VfsCacheOps for SimpleVfsTables {
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
         }
+        let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
         let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-        let _ = dentries.insert_if_gen(
-            parent_dev,
-            parent_ino,
-            name,
-            DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-            expected_dentry_gen,
-        );
+        if !was_cached {
+            let _ = dentries.insert_if_gen(
+                parent_dev,
+                parent_ino,
+                name,
+                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
+                expected_dentry_gen,
+            );
+        }
         Ok(unified)
     }
 
@@ -581,5 +590,9 @@ impl VfsCacheOps for SimpleVfsTables {
 
     fn inode_remove_if_same(&self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
         self.inodes.borrow_mut().remove_if_same(dev, ino, expected)
+    }
+
+    fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
+        self.inodes.borrow_mut().record_removal(dev, ino)
     }
 }

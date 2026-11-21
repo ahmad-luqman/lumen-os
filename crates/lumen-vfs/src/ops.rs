@@ -11,8 +11,8 @@ use crate::error::VfsError;
 use crate::fs::VfsInode;
 use crate::mount::VfsCacheOps;
 use crate::resolve::{
-    MAX_INODE_RACE_RETRIES, ResolveFlags, cross_mounts_down, resolve_parent, resolve_parent_with_depth, resolve_path,
-    resolve_path_with_depth, unify_magic_target,
+    MAX_INODE_RACE_RETRIES, ResolveFlags, cross_mounts_down, resolve_and_unify_magic_target, resolve_parent,
+    resolve_parent_with_depth, resolve_path, resolve_path_with_depth,
 };
 use crate::types::{DevId, Ino, InodeType, OpenFlags, RenameFlags};
 use crate::{MAX_SYMLINK_DEPTH, PATH_MAX};
@@ -47,24 +47,41 @@ impl Drop for InodeRemovalGuard<'_> {
     }
 }
 
-fn evict_zombie_inode(env: &dyn VfsCacheOps, dev: DevId, ino: Ino) {
+pub(crate) fn is_inode_dead(inode: &Arc<dyn VfsInode>) -> bool {
+    inode.is_detached() || matches!(inode.stat(), Ok(m) if m.nlink == 0) || matches!(inode.stat(), Err(VfsError::NoEnt))
+}
+
+/// Evict any cached dead inode for `(dev, ino)` without recording a redundant
+/// removal if none is cached (used right after `InodeRemovalGuard::finish`).
+fn evict_if_cached_zombie(env: &dyn VfsCacheOps, dev: DevId, ino: Ino) {
     let _ = env.inode_evict_detached(dev, ino);
-    if let Some(cached) = env.inode_get(dev, ino) {
-        let is_dead = cached.is_detached()
-            || cached.ino() != ino
-            || matches!(cached.stat(), Ok(m) if m.nlink == 0)
-            || matches!(cached.stat(), Err(VfsError::NoEnt));
-        if is_dead {
-            let _ = env.inode_remove_if_same(dev, ino, &cached);
-        }
+    if let Some(cached) = env.inode_get(dev, ino)
+        && (is_inode_dead(&cached) || cached.ino() != ino)
+    {
+        let _ = env.inode_remove_if_same(dev, ino, &cached);
+    }
+}
+
+/// Evict any cached dead inode for `(dev, ino)` AND guarantee a removal
+/// generation is recorded even on `InodeCache` miss (fixes `PROBE 1D-2`).
+fn evict_zombie_inode(env: &dyn VfsCacheOps, dev: DevId, ino: Ino) {
+    let mut recorded = env.inode_evict_detached(dev, ino);
+    if let Some(cached) = env.inode_get(dev, ino)
+        && (is_inode_dead(&cached) || cached.ino() != ino)
+    {
+        recorded |= env.inode_remove_if_same(dev, ino, &cached).is_some();
+    }
+    if !recorded {
+        let _ = env.inode_record_removal(dev, ino);
     }
 }
 
 /// Publish a newly created inode into `InodeCache` and `DentryCache`. If an
 /// earlier unlink/eviction for the same `(dev, ino)` raced before `create`/
-/// `mkdir`/`symlink` (e.g. `ino` reuse right before creation), verify via
-/// `parent.lookup(name)` before unifying so live inodes still unify without
-/// ever aliasing an unlinked/replaced inode.
+/// `mkdir`/`symlink`, verify via `parent.lookup(name)` and `is_inode_dead`
+/// before retrying with `publish_lookup_inode` (which respects
+/// `pending_removals`) so live inodes unify without adopting an unlinked or
+/// replacement inode.
 fn publish_created_inode(
     env: &dyn VfsCacheOps,
     parent: &Arc<dyn VfsInode>,
@@ -73,28 +90,55 @@ fn publish_created_inode(
     dentry_gen: u64,
     inode_gen: u64,
 ) -> Arc<dyn VfsInode> {
-    match env.publish_created_inode(parent.dev_id(), parent.ino(), name, Arc::clone(&created), dentry_gen, inode_gen) {
-        Ok(unified) => unified,
-        Err(_) => {
-            let (retry_dentry_gen, retry_inode_gen) = env.cache_gens();
-            if let Ok(live) = parent.lookup(name)
-                && live.dev_id() == created.dev_id()
-                && live.ino() == created.ino()
-                && live.inode_type() == created.inode_type()
-                && let Ok(unified) = env.publish_created_inode(
-                    parent.dev_id(),
-                    parent.ino(),
-                    name,
-                    live,
-                    retry_dentry_gen,
-                    retry_inode_gen,
-                )
-            {
+    let pdev = parent.dev_id();
+    let pino = parent.ino();
+    let target_dev = created.dev_id();
+    let target_ino = created.ino();
+    let target_type = created.inode_type();
+
+    if let Ok(unified) = env.publish_created_inode(pdev, pino, name, Arc::clone(&created), dentry_gen, inode_gen) {
+        if Arc::ptr_eq(&unified, &created) {
+            return unified;
+        }
+        if !is_inode_dead(&unified) && unified.ino() == target_ino {
+            let _ = env.dentry_insert_if_gen(
+                pdev,
+                pino,
+                name,
+                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
+                dentry_gen,
+            );
+            return unified;
+        }
+        env.dentry_invalidate(pdev, pino, name);
+        let _ = env.inode_remove_if_same(unified.dev_id(), target_ino, &unified);
+    }
+
+    for _ in 0..MAX_INODE_RACE_RETRIES {
+        if is_inode_dead(&created) || created.ino() != target_ino {
+            return created;
+        }
+        let (retry_dentry_gen, retry_inode_gen) = env.cache_gens();
+        let Ok(live) = parent.lookup(name) else {
+            return created;
+        };
+        if live.dev_id() != target_dev || live.ino() != target_ino || live.inode_type() != target_type {
+            return created;
+        }
+        match env.publish_lookup_inode(pdev, pino, name, Arc::clone(&created), retry_dentry_gen, retry_inode_gen) {
+            Ok(unified) => {
+                if !Arc::ptr_eq(&unified, &created) && (is_inode_dead(&unified) || unified.ino() != target_ino) {
+                    env.dentry_invalidate(pdev, pino, name);
+                    let _ = env.inode_remove_if_same(unified.dev_id(), target_ino, &unified);
+                    continue;
+                }
                 return unified;
             }
-            created
+            Err(_) => continue,
         }
     }
+
+    created
 }
 
 fn lookup_and_unify_inode(
@@ -103,15 +147,25 @@ fn lookup_and_unify_inode(
     name: &str,
 ) -> Result<Arc<dyn VfsInode>, VfsError> {
     let mut first_inode: Option<Arc<dyn VfsInode>> = None;
-    for attempt in 0..=1 {
+    for attempt in 0..=MAX_INODE_RACE_RETRIES {
         let (_, since_gen) = env.cache_gens();
         let raw = match parent.lookup(name) {
             Ok(i) => i,
             Err(VfsError::NoEnt) if attempt > 0 => return Err(VfsError::NoEnt),
             Err(e) => return Err(e),
         };
-        match env.inode_get_or_insert_if_fresh(raw, since_gen) {
-            Ok(unified) => return Ok(unified),
+        let raw_ino = raw.ino();
+        match env.inode_get_or_insert_if_fresh(Arc::clone(&raw), since_gen) {
+            Ok(unified) => {
+                if !Arc::ptr_eq(&unified, &raw) && (is_inode_dead(&unified) || unified.ino() != raw_ino) {
+                    let _ = env.inode_remove_if_same(unified.dev_id(), raw_ino, &unified);
+                    if first_inode.is_none() {
+                        first_inode = Some(raw);
+                    }
+                    continue;
+                }
+                return Ok(unified);
+            }
             Err(stale) => {
                 if first_inode.is_none() {
                     first_inode = Some(stale);
@@ -191,15 +245,30 @@ pub fn open_inode(
                         if flags.has_excl() {
                             return Err(VfsError::Exist);
                         }
+                        let existing_ino = existing.ino();
                         let existing = match env.publish_lookup_inode(
                             target.parent.dev_id(),
                             target.parent.ino(),
                             &target.name,
-                            existing,
+                            Arc::clone(&existing),
                             dentry_gen,
                             inode_gen,
                         ) {
-                            Ok(unified) => unified,
+                            Ok(unified) => {
+                                if !Arc::ptr_eq(&unified, &existing)
+                                    && (is_inode_dead(&unified) || unified.ino() != existing_ino)
+                                {
+                                    env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), &target.name);
+                                    let _ = env.inode_remove_if_same(unified.dev_id(), existing_ino, &unified);
+                                    if inode_retries < MAX_INODE_RACE_RETRIES {
+                                        inode_retries += 1;
+                                        continue;
+                                    }
+                                    existing
+                                } else {
+                                    unified
+                                }
+                            }
                             Err(stale) => {
                                 if inode_retries < MAX_INODE_RACE_RETRIES {
                                     inode_retries += 1;
@@ -216,8 +285,7 @@ pub fn open_inode(
                             if symlink_depth > MAX_SYMLINK_DEPTH {
                                 return Err(VfsError::Loop);
                             }
-                            if let Some(magic_target) = existing.resolve_magic_link() {
-                                let magic_target = unify_magic_target(env, magic_target);
+                            if let Some(magic_target) = resolve_and_unify_magic_target(env, &existing) {
                                 let resolved = cross_mounts_down(env, magic_target);
                                 if target.has_trailing_slash && resolved.inode_type() != InodeType::Dir {
                                     return Err(VfsError::NotDir);
@@ -418,8 +486,11 @@ pub fn unlink_at(
                 return Err(err);
             }
 
-            if let Some((guard, _)) = removal_guard {
+            if let Some((guard, removed_arc)) = removal_guard {
                 let _ = guard.finish();
+                if removed_arc.is_none() {
+                    evict_if_cached_zombie(env, old_dev, old_ino);
+                }
             } else {
                 let last_gone = child.is_detached()
                     || child.ino() != old_ino
@@ -458,6 +529,9 @@ pub fn unlink_at(
                 return Err(err);
             }
             let _ = guard.finish();
+            if removed_arc_opt.is_none() {
+                evict_if_cached_zombie(env, old_dev, old_ino);
+            }
             env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), &target.name);
             env.dentry_invalidate_dir(old_dev, old_ino);
             Ok(())
@@ -776,7 +850,13 @@ pub fn rename_at2(
         }
 
         if let Some(pending) = removal_guard {
+            let removed_was_none = pending.removed_arc.is_none();
+            let pending_dev = pending.guard.dev;
+            let pending_ino = pending.orig_ino;
             let _ = pending.guard.finish();
+            if removed_was_none {
+                evict_if_cached_zombie(env, pending_dev, pending_ino);
+            }
         }
         if let Some((new_inode, orig_ino, false)) = last_link_info {
             let last_gone = new_inode.is_detached()

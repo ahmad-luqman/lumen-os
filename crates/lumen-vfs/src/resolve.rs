@@ -86,23 +86,58 @@ pub(crate) fn cross_mounts_down(env: &dyn VfsCacheOps, mut cur: Arc<dyn VfsInode
 /// Resolve the global root `/`, unify it in `InodeCache` if fresh, and cross
 /// any mounts stacked directly on `/`.
 pub(crate) fn resolve_global_root(env: &dyn VfsCacheOps) -> Result<Arc<dyn VfsInode>, VfsError> {
-    let (_, since_gen) = env.cache_gens();
-    let root = env.root_inode()?;
-    let unified = env.inode_get_or_insert_if_fresh(root, since_gen).unwrap_or_else(|r| r);
-    Ok(cross_mounts_down(env, unified))
+    let mut first_root: Option<Arc<dyn VfsInode>> = None;
+    for _ in 0..=MAX_INODE_RACE_RETRIES {
+        let (_, since_gen) = env.cache_gens();
+        let root = env.root_inode()?;
+        match env.inode_get_or_insert_if_fresh(root, since_gen) {
+            Ok(unified) => return Ok(cross_mounts_down(env, unified)),
+            Err(stale) => {
+                if first_root.is_none() {
+                    first_root = Some(stale);
+                }
+            }
+        }
+    }
+    Ok(cross_mounts_down(env, first_root.expect("loop ran at least once")))
 }
 
-/// Unify a magic symlink target into `InodeCache` if still mounted and fresh.
-pub(crate) fn unify_magic_target(env: &dyn VfsCacheOps, magic_target: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
-    let (_, since_gen) = env.cache_gens();
-    env.inode_get_or_insert_if_fresh(magic_target, since_gen).unwrap_or_else(|m| m)
+/// Resolve a magic symlink on `link_inode`, capturing `cache_gens()` before
+/// `resolve_magic_link()` so concurrent unlinks/`ino` reuse are detected, and
+/// unify the live target in `InodeCache` with bounded retries.
+pub(crate) fn resolve_and_unify_magic_target(
+    env: &dyn VfsCacheOps,
+    link_inode: &Arc<dyn VfsInode>,
+) -> Option<Arc<dyn VfsInode>> {
+    let mut first_target: Option<Arc<dyn VfsInode>> = None;
+    for attempt in 0..=MAX_INODE_RACE_RETRIES {
+        let (_, since_gen) = env.cache_gens();
+        let Some(magic_target) = link_inode.resolve_magic_link() else {
+            return if attempt > 0 { first_target } else { None };
+        };
+        if magic_target.is_detached() {
+            return Some(first_target.unwrap_or(magic_target));
+        }
+        match env.inode_get_or_insert_if_fresh(magic_target, since_gen) {
+            Ok(unified) => return Some(unified),
+            Err(stale) => {
+                if stale.is_detached() {
+                    return Some(first_target.unwrap_or(stale));
+                }
+                if first_target.is_none() {
+                    first_target = Some(stale);
+                }
+            }
+        }
+    }
+    first_target
 }
 
-/// Look up `".."` on `cur` and unify it in `InodeCache` when fresh, with one
-/// bounded retry so concurrent unlinks/`ino` reuse never alias a wrong inode.
+/// Look up `".."` on `cur` and unify it in `InodeCache` when fresh, with
+/// bounded retries so concurrent unlinks/`ino` reuse never alias a wrong inode.
 fn lookup_dotdot(env: &dyn VfsCacheOps, cur: &Arc<dyn VfsInode>) -> Result<Arc<dyn VfsInode>, VfsError> {
     let mut first_parent: Option<Arc<dyn VfsInode>> = None;
-    for attempt in 0..=1 {
+    for attempt in 0..=MAX_INODE_RACE_RETRIES {
         let (_, since_gen) = env.cache_gens();
         let parent = match cur.lookup("..") {
             Ok(p) => p,
@@ -156,8 +191,24 @@ fn lookup_component(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>, name: &str) 
             Err(e) => return Err(e),
         };
 
-        match env.publish_lookup_inode(pdev, pino, name, child, dentry_gen, inode_gen) {
-            Ok(unified) => return Ok(unified),
+        let child_ino = child.ino();
+        match env.publish_lookup_inode(pdev, pino, name, Arc::clone(&child), dentry_gen, inode_gen) {
+            Ok(unified) => {
+                if !Arc::ptr_eq(&unified, &child)
+                    && (unified.is_detached()
+                        || unified.ino() != child_ino
+                        || matches!(unified.stat(), Ok(m) if m.nlink == 0)
+                        || matches!(unified.stat(), Err(VfsError::NoEnt)))
+                {
+                    env.dentry_invalidate(pdev, pino, name);
+                    let _ = env.inode_remove_if_same(unified.dev_id(), child_ino, &unified);
+                    if first_child.is_none() {
+                        first_child = Some(child);
+                    }
+                    continue;
+                }
+                return Ok(unified);
+            }
             Err(stale) => {
                 if first_child.is_none() {
                     first_child = Some(stale);
@@ -284,8 +335,8 @@ pub(crate) fn resolve_path_with_depth(
                 return Err(VfsError::Loop);
             }
 
-            if let Some(magic_target) = child.resolve_magic_link() {
-                cur = cross_mounts_down(env, unify_magic_target(env, magic_target));
+            if let Some(magic_target) = resolve_and_unify_magic_target(env, &child) {
+                cur = cross_mounts_down(env, magic_target);
                 cursor = tail_start;
                 continue;
             }

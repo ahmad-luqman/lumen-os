@@ -1634,14 +1634,17 @@ fn lock9_is_never_held_during_inode_calls() {
             if !mounts.is_dev_mounted(inode.dev_id()) {
                 return Err(inode);
             }
+            let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
             let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-            let _ = dentries.insert_if_gen(
-                pdev,
-                pino,
-                name,
-                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                expected_dentry_gen,
-            );
+            if !was_cached {
+                let _ = dentries.insert_if_gen(
+                    pdev,
+                    pino,
+                    name,
+                    DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
+                    expected_dentry_gen,
+                );
+            }
             Ok(unified)
         }
         fn dentry_gen(&self) -> u64 {
@@ -1734,6 +1737,9 @@ fn lock9_is_never_held_during_inode_calls() {
             expected: &Arc<dyn VfsInode>,
         ) -> Option<Arc<dyn VfsInode>> {
             self.inodes.lock().unwrap().remove_if_same(dev, ino, expected)
+        }
+        fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
+            self.inodes.lock().unwrap().record_removal(dev, ino)
         }
     }
 
@@ -2471,6 +2477,9 @@ fn post_mutation_dentry_invalidation_and_fd_ref_sync() {
         ) -> Option<Arc<dyn VfsInode>> {
             self.inner.inode_remove_if_same(dev, ino, expected)
         }
+        fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
+            self.inner.inode_record_removal(dev, ino)
+        }
     }
 
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
@@ -2833,14 +2842,17 @@ fn lookup_component_does_not_resurrect_dentry_across_concurrent_rename_unlink_or
             if !mounts.is_dev_mounted(inode.dev_id()) {
                 return Err(inode);
             }
+            let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
             let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-            let _ = dentries.insert_if_gen(
-                pdev,
-                pino,
-                name,
-                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                expected_dentry_gen,
-            );
+            if !was_cached {
+                let _ = dentries.insert_if_gen(
+                    pdev,
+                    pino,
+                    name,
+                    DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
+                    expected_dentry_gen,
+                );
+            }
             Ok(unified)
         }
         fn dentry_gen(&self) -> u64 {
@@ -2933,6 +2945,9 @@ fn lookup_component_does_not_resurrect_dentry_across_concurrent_rename_unlink_or
             expected: &Arc<dyn VfsInode>,
         ) -> Option<Arc<dyn VfsInode>> {
             self.inodes.lock().unwrap().remove_if_same(dev, ino, expected)
+        }
+        fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
+            self.inodes.lock().unwrap().record_removal(dev, ino)
         }
     }
 
@@ -3455,10 +3470,14 @@ struct SyncVfsTables {
 
 impl SyncVfsTables {
     fn new(root: Arc<dyn FileSystem>) -> Arc<Self> {
+        Self::with_removal_history(root, InodeCache::DEFAULT_REMOVAL_HISTORY, DentryCache::DEFAULT_CAPACITY)
+    }
+
+    fn with_removal_history(root: Arc<dyn FileSystem>, max_history: usize, dentry_cap: usize) -> Arc<Self> {
         let env = Arc::new(Self {
             mounts: Mutex::new(MountTable::new()),
-            dentries: Mutex::new(DentryCache::default()),
-            inodes: Mutex::new(InodeCache::new()),
+            dentries: Mutex::new(DentryCache::new(dentry_cap)),
+            inodes: Mutex::new(InodeCache::with_removal_history(max_history)),
         });
         let root_inode = root.root_inode();
         let root_ino = root_inode.ino();
@@ -3611,14 +3630,17 @@ impl VfsCacheOps for SyncVfsTables {
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
         }
+        let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
         let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-        let _ = dentries.insert_if_gen(
-            pdev,
-            pino,
-            name,
-            DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-            expected_dentry_gen,
-        );
+        if !was_cached {
+            let _ = dentries.insert_if_gen(
+                pdev,
+                pino,
+                name,
+                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
+                expected_dentry_gen,
+            );
+        }
         Ok(unified)
     }
     fn dentry_gen(&self) -> u64 {
@@ -3720,6 +3742,10 @@ impl VfsCacheOps for SyncVfsTables {
         let _g = Lock9DepthGuard::enter();
         self.inodes.lock().unwrap().remove_if_same(dev, ino, expected)
     }
+    fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
+        let _g = Lock9DepthGuard::enter();
+        self.inodes.lock().unwrap().record_removal(dev, ino)
+    }
 }
 
 struct ReusingSharedMeta {
@@ -3763,7 +3789,10 @@ struct ReusingHooks {
     post_mkdir: BTreeMap<String, FsOpHook>,
     pre_symlink: BTreeMap<String, FsOpHook>,
     post_symlink: BTreeMap<String, FsOpHook>,
+    pre_unlink: BTreeMap<String, FsOpHook>,
+    post_unlink: BTreeMap<String, FsOpHook>,
     pre_rmdir: BTreeMap<String, FsOpHook>,
+    post_rename: BTreeMap<String, FsOpHook>,
     rmdir_override_err: BTreeMap<String, VfsError>,
 }
 
@@ -4125,23 +4154,34 @@ impl VfsInode for ReusingHandle {
         if self.meta.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
-        let mut state = self.inner.state.lock().unwrap();
-        let Some(dir_body) = state.inodes.get(&self.meta.orig_ino).filter(|b| b.meta.body_id == self.meta.body_id)
-        else {
-            return Err(VfsError::NoEnt);
-        };
-        let Some(&c_ino) = dir_body.children.get(name) else {
-            return Err(VfsError::NoEnt);
-        };
-        if state.inodes.get(&c_ino).is_some_and(|c| c.meta.inode_type == InodeType::Dir) {
-            return Err(VfsError::IsDir);
+        let hook = self.inner.hooks.lock().unwrap().pre_unlink.remove(name);
+        if let Some(hook) = hook {
+            hook();
         }
-        state.inodes.get_mut(&self.meta.orig_ino).unwrap().children.remove(name);
-        if let Some(c_body) = state.inodes.get_mut(&c_ino) {
-            c_body.nlink = c_body.nlink.saturating_sub(1);
+        let res = {
+            let mut state = self.inner.state.lock().unwrap();
+            let Some(dir_body) = state.inodes.get(&self.meta.orig_ino).filter(|b| b.meta.body_id == self.meta.body_id)
+            else {
+                return Err(VfsError::NoEnt);
+            };
+            let Some(&c_ino) = dir_body.children.get(name) else {
+                return Err(VfsError::NoEnt);
+            };
+            if state.inodes.get(&c_ino).is_some_and(|c| c.meta.inode_type == InodeType::Dir) {
+                return Err(VfsError::IsDir);
+            }
+            state.inodes.get_mut(&self.meta.orig_ino).unwrap().children.remove(name);
+            if let Some(c_body) = state.inodes.get_mut(&c_ino) {
+                c_body.nlink = c_body.nlink.saturating_sub(1);
+            }
+            FreshArcReusingFs::retire_if_unlinked(&mut state, c_ino);
+            Ok(())
+        };
+        let hook = self.inner.hooks.lock().unwrap().post_unlink.remove(name);
+        if let Some(hook) = hook {
+            hook();
         }
-        FreshArcReusingFs::retire_if_unlinked(&mut state, c_ino);
-        Ok(())
+        res
     }
     fn rmdir(&self, name: &str) -> Result<(), VfsError> {
         assert_test_lock9_free();
@@ -4288,84 +4328,91 @@ impl VfsInode for ReusingHandle {
         }
         let old_dir_ino = self.meta.orig_ino;
         let new_dir_ino = new_dir.ino();
-        let mut state = self.inner.state.lock().unwrap();
-        if !state.inodes.get(&old_dir_ino).is_some_and(|b| b.meta.body_id == self.meta.body_id)
-            || !state.inodes.contains_key(&new_dir_ino)
-        {
-            return Err(VfsError::NoEnt);
-        }
-        let old_child_ino = state.inodes.get(&old_dir_ino).and_then(|d| d.children.get(old_name).copied());
-        let Some(old_child_ino) = old_child_ino else {
-            return Err(VfsError::NoEnt);
-        };
-        let new_child_ino = state.inodes.get(&new_dir_ino).and_then(|d| d.children.get(new_name).copied());
-
-        if flags.has_exchange() {
-            let Some(dst_ino) = new_child_ino else {
+        let res = {
+            let mut state = self.inner.state.lock().unwrap();
+            if !state.inodes.get(&old_dir_ino).is_some_and(|b| b.meta.body_id == self.meta.body_id)
+                || !state.inodes.contains_key(&new_dir_ino)
+            {
+                return Err(VfsError::NoEnt);
+            }
+            let old_child_ino = state.inodes.get(&old_dir_ino).and_then(|d| d.children.get(old_name).copied());
+            let Some(old_child_ino) = old_child_ino else {
                 return Err(VfsError::NoEnt);
             };
-            if old_dir_ino == new_dir_ino && old_name == new_name {
-                return Ok(());
-            }
-            let old_is_dir = state.inodes.get(&old_child_ino).is_some_and(|b| b.meta.inode_type == InodeType::Dir);
-            let dst_is_dir = state.inodes.get(&dst_ino).is_some_and(|b| b.meta.inode_type == InodeType::Dir);
-            state.inodes.get_mut(&new_dir_ino).unwrap().children.insert(String::from(new_name), old_child_ino);
-            state.inodes.get_mut(&old_dir_ino).unwrap().children.insert(String::from(old_name), dst_ino);
-            if old_dir_ino != new_dir_ino {
-                if old_is_dir {
+            let new_child_ino = state.inodes.get(&new_dir_ino).and_then(|d| d.children.get(new_name).copied());
+
+            if flags.has_exchange() {
+                let Some(dst_ino) = new_child_ino else {
+                    return Err(VfsError::NoEnt);
+                };
+                if old_dir_ino == new_dir_ino && old_name == new_name {
+                    return Ok(());
+                }
+                let old_is_dir = state.inodes.get(&old_child_ino).is_some_and(|b| b.meta.inode_type == InodeType::Dir);
+                let dst_is_dir = state.inodes.get(&dst_ino).is_some_and(|b| b.meta.inode_type == InodeType::Dir);
+                state.inodes.get_mut(&new_dir_ino).unwrap().children.insert(String::from(new_name), old_child_ino);
+                state.inodes.get_mut(&old_dir_ino).unwrap().children.insert(String::from(old_name), dst_ino);
+                if old_dir_ino != new_dir_ino {
+                    if old_is_dir {
+                        state.inodes.get_mut(&old_child_ino).unwrap().parent = new_dir_ino;
+                        let od = state.inodes.get_mut(&old_dir_ino).unwrap();
+                        od.nlink = od.nlink.saturating_sub(1);
+                        state.inodes.get_mut(&new_dir_ino).unwrap().nlink += 1;
+                    }
+                    if dst_is_dir {
+                        state.inodes.get_mut(&dst_ino).unwrap().parent = old_dir_ino;
+                        let nd = state.inodes.get_mut(&new_dir_ino).unwrap();
+                        nd.nlink = nd.nlink.saturating_sub(1);
+                        state.inodes.get_mut(&old_dir_ino).unwrap().nlink += 1;
+                    }
+                }
+                Ok(())
+            } else {
+                if flags.has_noreplace() && new_child_ino.is_some() {
+                    return Err(VfsError::Exist);
+                }
+                if old_dir_ino == new_dir_ino && old_name == new_name {
+                    return Ok(());
+                }
+                if let Some(dst_ino) = new_child_ino
+                    && let Some(dst_body) = state.inodes.get(&dst_ino)
+                    && dst_body.meta.inode_type == InodeType::Dir
+                    && !dst_body.children.is_empty()
+                {
+                    return Err(VfsError::NotEmpty);
+                }
+
+                let old_is_dir = state.inodes.get(&old_child_ino).is_some_and(|b| b.meta.inode_type == InodeType::Dir);
+                state.inodes.get_mut(&old_dir_ino).unwrap().children.remove(old_name);
+                if old_dir_ino != new_dir_ino && old_is_dir {
                     state.inodes.get_mut(&old_child_ino).unwrap().parent = new_dir_ino;
                     let od = state.inodes.get_mut(&old_dir_ino).unwrap();
                     od.nlink = od.nlink.saturating_sub(1);
                     state.inodes.get_mut(&new_dir_ino).unwrap().nlink += 1;
                 }
-                if dst_is_dir {
-                    state.inodes.get_mut(&dst_ino).unwrap().parent = old_dir_ino;
-                    let nd = state.inodes.get_mut(&new_dir_ino).unwrap();
-                    nd.nlink = nd.nlink.saturating_sub(1);
-                    state.inodes.get_mut(&old_dir_ino).unwrap().nlink += 1;
+                let replaced =
+                    state.inodes.get_mut(&new_dir_ino).unwrap().children.insert(String::from(new_name), old_child_ino);
+                if let Some(dst_ino) = replaced
+                    && dst_ino != old_child_ino
+                {
+                    let dst_is_dir = state.inodes.get(&dst_ino).is_some_and(|b| b.meta.inode_type == InodeType::Dir);
+                    if dst_is_dir {
+                        let nd = state.inodes.get_mut(&new_dir_ino).unwrap();
+                        nd.nlink = nd.nlink.saturating_sub(1);
+                    }
+                    if let Some(dst_body) = state.inodes.get_mut(&dst_ino) {
+                        dst_body.nlink = if dst_is_dir { 0 } else { dst_body.nlink.saturating_sub(1) };
+                    }
+                    FreshArcReusingFs::retire_if_unlinked(&mut state, dst_ino);
                 }
+                Ok(())
             }
-            return Ok(());
+        };
+        let hook = self.inner.hooks.lock().unwrap().post_rename.remove(new_name);
+        if let Some(hook) = hook {
+            hook();
         }
-
-        if flags.has_noreplace() && new_child_ino.is_some() {
-            return Err(VfsError::Exist);
-        }
-        if old_dir_ino == new_dir_ino && old_name == new_name {
-            return Ok(());
-        }
-        if let Some(dst_ino) = new_child_ino
-            && let Some(dst_body) = state.inodes.get(&dst_ino)
-            && dst_body.meta.inode_type == InodeType::Dir
-            && !dst_body.children.is_empty()
-        {
-            return Err(VfsError::NotEmpty);
-        }
-
-        let old_is_dir = state.inodes.get(&old_child_ino).is_some_and(|b| b.meta.inode_type == InodeType::Dir);
-        state.inodes.get_mut(&old_dir_ino).unwrap().children.remove(old_name);
-        if old_dir_ino != new_dir_ino && old_is_dir {
-            state.inodes.get_mut(&old_child_ino).unwrap().parent = new_dir_ino;
-            let od = state.inodes.get_mut(&old_dir_ino).unwrap();
-            od.nlink = od.nlink.saturating_sub(1);
-            state.inodes.get_mut(&new_dir_ino).unwrap().nlink += 1;
-        }
-        let replaced =
-            state.inodes.get_mut(&new_dir_ino).unwrap().children.insert(String::from(new_name), old_child_ino);
-        if let Some(dst_ino) = replaced
-            && dst_ino != old_child_ino
-        {
-            let dst_is_dir = state.inodes.get(&dst_ino).is_some_and(|b| b.meta.inode_type == InodeType::Dir);
-            if dst_is_dir {
-                let nd = state.inodes.get_mut(&new_dir_ino).unwrap();
-                nd.nlink = nd.nlink.saturating_sub(1);
-            }
-            if let Some(dst_body) = state.inodes.get_mut(&dst_ino) {
-                dst_body.nlink = if dst_is_dir { 0 } else { dst_body.nlink.saturating_sub(1) };
-            }
-            FreshArcReusingFs::retire_if_unlinked(&mut state, dst_ino);
-        }
-        Ok(())
+        res
     }
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
         assert_test_lock9_free();
@@ -5082,11 +5129,10 @@ fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
     );
 }
 
-#[test]
-fn unhooked_4_thread_concurrent_vfs_stress_with_ino_reuse() {
-    let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usize, dentry_cap: usize) {
+    let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, use_rename_lock);
+    let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, use_rename_lock);
+    let env = SyncVfsTables::with_removal_history(Arc::clone(&root_fs) as Arc<dyn FileSystem>, hist, dentry_cap);
 
     for d in [b"/d0" as &[u8], b"/d1", b"/d0/sub", b"/mnt"] {
         mkdir_at(env.as_ref(), None, d, 0o755, 0).unwrap();
@@ -5228,11 +5274,24 @@ fn unhooked_4_thread_concurrent_vfs_stress_with_ino_reuse() {
     // At quiescence: check InodeCache invariants, 100% Arc::ptr_eq live tree unification, and 100% DentryCache match.
     assert_test_lock9_free();
     for cached in env.snapshot_inodes() {
-        assert!(!cached.is_detached(), "detached inode in InodeCache: {:?}", cached);
-        assert_eq!(cached.ino() & DETACHED_INO_BIT, 0, "DETACHED_INO_BIT in InodeCache: {:?}", cached);
-        assert!(env.is_dev_mounted(cached.dev_id()), "unmounted FS inode in InodeCache: {:?}", cached);
+        assert!(
+            !cached.is_detached(),
+            "rename_lock={use_rename_lock} hist={hist}: detached inode in InodeCache: {cached:?}"
+        );
+        assert_eq!(
+            cached.ino() & DETACHED_INO_BIT,
+            0,
+            "rename_lock={use_rename_lock} hist={hist}: DETACHED_INO_BIT in InodeCache: {cached:?}"
+        );
+        assert!(
+            env.is_dev_mounted(cached.dev_id()),
+            "rename_lock={use_rename_lock} hist={hist}: unmounted FS inode in InodeCache: {cached:?}"
+        );
         let meta = cached.stat().expect("cached inode must stat cleanly");
-        assert!(meta.nlink > 0, "nlink == 0 zombie inode in InodeCache: {:?}", cached);
+        assert!(
+            meta.nlink > 0,
+            "rename_lock={use_rename_lock} hist={hist}: nlink == 0 zombie in InodeCache: {cached:?}"
+        );
     }
 
     // Walk entire live tree from `/` and verify 100% Arc::ptr_eq unification and collect live `(pdev, pino, name) -> (dev, ino)`.
@@ -5295,4 +5354,1113 @@ fn unhooked_4_thread_concurrent_vfs_stress_with_ino_reuse() {
         env.umount(mnt_mp.dev_id(), mnt_mp.ino()).unwrap();
     }
     assert!(env.snapshot_inodes().into_iter().all(|i| i.dev_id() != DevId::TMPFS));
+}
+
+#[test]
+fn unhooked_4_thread_concurrent_vfs_stress_with_ino_reuse() {
+    for (use_rename_lock, hist, dentry_cap) in [
+        (true, InodeCache::DEFAULT_REMOVAL_HISTORY, DentryCache::DEFAULT_CAPACITY),
+        (true, 0, 0),
+        (false, InodeCache::DEFAULT_REMOVAL_HISTORY, DentryCache::DEFAULT_CAPACITY),
+    ] {
+        run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock, hist, dentry_cap);
+    }
+}
+
+fn assert_no_zombies_in_cache(env: &SyncVfsTables) {
+    for cached in env.snapshot_inodes() {
+        assert!(!cached.is_detached(), "detached inode in InodeCache: {cached:?}");
+        assert_eq!(cached.ino() & DETACHED_INO_BIT, 0, "DETACHED_INO_BIT in InodeCache: {cached:?}");
+        let meta = cached.stat().expect("cached inode must stat cleanly");
+        assert!(meta.nlink > 0, "nlink == 0 zombie inode in InodeCache: {cached:?}");
+    }
+}
+
+#[test]
+fn cross_fs_and_single_fs_overflow_never_skips_removal_or_leaves_zombie() {
+    // Part 1: Cross-FS overflow (`PROBE 3I`, `3I-rmdir`, `3I-rename`) at `DEFAULT_REMOVAL_HISTORY = 4096`.
+    let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
+    let env = SyncVfsTables::new(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+
+    let mnt_mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
+    env.mount(mnt_mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
+
+    let (victim, _) =
+        open_inode(env.as_ref(), None, b"/victim", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    victim.write_at(0, b"VICTIM_4096").unwrap();
+    let victim_ino = victim.ino();
+    drop(victim);
+    let vdir = mkdir_at(env.as_ref(), None, b"/vdir", 0o755, 0).unwrap();
+    let vdir_ino = vdir.ino();
+    drop(vdir);
+    let (r_src, _) =
+        open_inode(env.as_ref(), None, b"/r_src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    drop(r_src);
+    let (r_dst, _) =
+        open_inode(env.as_ref(), None, b"/r_dst", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    r_dst.write_at(0, b"R_DST_OLD").unwrap();
+    let r_dst_ino = r_dst.ino();
+    drop(r_dst);
+
+    assert!(env.inode_get(DevId::ROOT, victim_ino).is_some());
+    assert!(env.inode_get(DevId::ROOT, vdir_ino).is_some());
+    assert!(env.inode_get(DevId::ROOT, r_dst_ino).is_some());
+
+    let create_tmp_batch = |prefix: &str| {
+        for i in 0..4100usize {
+            let p = format!("/mnt/{prefix}_{i}");
+            open_inode(env.as_ref(), None, p.as_bytes(), OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+                .unwrap();
+        }
+    };
+
+    // 1a. `PROBE 3I` (`unlink_at` file)
+    create_tmp_batch("t");
+    let env_u = Arc::clone(&env);
+    root_fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from("victim"),
+        alloc::boxed::Box::new(move || {
+            for i in 0..4100usize {
+                let p = format!("/mnt/t_{i}");
+                unlink_at(env_u.as_ref(), None, p.as_bytes(), false).unwrap();
+            }
+        }),
+    );
+    unlink_at(env.as_ref(), None, b"/victim", false).unwrap();
+    assert!(env.inode_get(DevId::ROOT, victim_ino).is_none());
+
+    // 1b. `PROBE 3I-rmdir` (`unlink_at` dir)
+    create_tmp_batch("d");
+    let env_d = Arc::clone(&env);
+    root_fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from("vdir"),
+        alloc::boxed::Box::new(move || {
+            for i in 0..4100usize {
+                let p = format!("/mnt/d_{i}");
+                unlink_at(env_d.as_ref(), None, p.as_bytes(), false).unwrap();
+            }
+        }),
+    );
+    unlink_at(env.as_ref(), None, b"/vdir", true).unwrap();
+    assert!(env.inode_get(DevId::ROOT, vdir_ino).is_none());
+
+    // 1c. `PROBE 3I-rename` (overwriting `rename_at2`)
+    create_tmp_batch("r");
+    let env_r = Arc::clone(&env);
+    root_fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from("r_dst"),
+        alloc::boxed::Box::new(move || {
+            for i in 0..4100usize {
+                let p = format!("/mnt/r_{i}");
+                unlink_at(env_r.as_ref(), None, p.as_bytes(), false).unwrap();
+            }
+        }),
+    );
+    rename_at2(env.as_ref(), None, b"/r_src", None, b"/r_dst", RenameFlags(0)).unwrap();
+    assert!(env.inode_get(DevId::ROOT, r_dst_ino).is_none());
+    assert_no_zombies_in_cache(env.as_ref());
+
+    // LIFO freed ino order: `r_dst_ino`, then `vdir_ino`, then `victim_ino`.
+    // Create `/r_src2` (reuses `r_dst_ino`), `/fresh_dir_ino` (reuses `vdir_ino`), and `/fresh` (reuses `victim_ino`).
+    let (r_src2, _) =
+        open_inode(env.as_ref(), None, b"/r_src2", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    assert_eq!(r_src2.ino(), r_dst_ino);
+    assert_eq!(r_src2.stat().unwrap().nlink, 1);
+
+    let (fresh_from_vdir, _) =
+        open_inode(env.as_ref(), None, b"/fresh_vdir", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    assert_eq!(fresh_from_vdir.ino(), vdir_ino);
+    assert_eq!(fresh_from_vdir.inode_type(), InodeType::File);
+    rename_at2(env.as_ref(), None, b"/fresh_vdir", None, b"/r_dst2", RenameFlags(0)).unwrap();
+
+    let (fresh, _) =
+        open_inode(env.as_ref(), None, b"/fresh", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    assert_eq!(fresh.ino(), victim_ino);
+    assert_eq!(fresh.stat().unwrap().nlink, 1);
+    let mut buf = [0u8; 32];
+    assert_eq!(fresh.read_at(0, &mut buf).unwrap(), 0);
+    let fresh_res = resolve_path(env.as_ref(), None, b"/fresh", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&fresh, &fresh_res));
+
+    // Part 2a: Single-FS overflow on `DevId::ROOT` (`with_removal_history(4)`), pre-cached victim.
+    let fs2 = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env2 = SyncVfsTables::with_removal_history(Arc::clone(&fs2) as Arc<dyn FileSystem>, 4, 64);
+    let (s_pre, _) =
+        open_inode(env2.as_ref(), None, b"/s_pre", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let s_pre_ino = s_pre.ino();
+    drop(s_pre);
+    let mut other_inos = Vec::new();
+    for i in 0..5usize {
+        let p = format!("/s_other_{i}");
+        let (f, _) =
+            open_inode(env2.as_ref(), None, p.as_bytes(), OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+                .unwrap();
+        other_inos.push(f.ino());
+    }
+    let env2_h = Arc::clone(&env2);
+    let fs2_h = Arc::clone(&fs2);
+    fs2.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from("s_pre"),
+        alloc::boxed::Box::new(move || {
+            for (i, ino) in other_inos.into_iter().enumerate() {
+                let name = format!("s_other_{i}");
+                fs2_h.root_inode().unlink(&name).unwrap();
+                let _ = env2_h.inode_remove(DevId::ROOT, ino);
+            }
+        }),
+    );
+    unlink_at(env2.as_ref(), None, b"/s_pre", false).unwrap();
+    assert!(env2.inode_get(DevId::ROOT, s_pre_ino).is_none());
+    assert_no_zombies_in_cache(env2.as_ref());
+
+    // Part 2b: Single-FS overflow (`hist = 0`) with concurrent post-`since_gen` insertion before `begin_removal`.
+    let fs3 = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env3 = SyncVfsTables::with_removal_history(Arc::clone(&fs3) as Arc<dyn FileSystem>, 0, 0);
+    let (s_post, _) =
+        open_inode(env3.as_ref(), None, b"/s_post", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let s_post_ino = s_post.ino();
+    drop(s_post);
+    let (s_unrel, _) =
+        open_inode(env3.as_ref(), None, b"/s_unrel", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let s_unrel_ino = s_unrel.ino();
+    drop(s_unrel);
+    // Evict `s_post` from `InodeCache` so it is uncached at `since_gen`.
+    let _ = env3.inode_remove(DevId::ROOT, s_post_ino);
+    let env3_h = Arc::clone(&env3);
+    let fs3_h = Arc::clone(&fs3);
+    fs3.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from("s_post"),
+        alloc::boxed::Box::new(move || {
+            // Re-insert `s_post` into `InodeCache` AFTER `since_gen` and bump `dev_overflow_gen[ROOT]` via unrelated unlink.
+            let _ = resolve_path(env3_h.as_ref(), None, b"/s_post", ResolveFlags::default()).unwrap();
+            fs3_h.root_inode().unlink("s_unrel").unwrap();
+            let _ = env3_h.inode_remove(DevId::ROOT, s_unrel_ino);
+        }),
+    );
+    unlink_at(env3.as_ref(), None, b"/s_post", false).unwrap();
+    assert!(env3.inode_get(DevId::ROOT, s_post_ino).is_none());
+    assert_no_zombies_in_cache(env3.as_ref());
+}
+
+#[test]
+fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
+    use std::sync::Barrier;
+
+    // 1. Reviewer 10 Finding 1 across `open_inode(O_CREAT)`, `mkdir_at`, and `symlink_at`,
+    //    both while `pending_removals` remains active for all retries AND when `unlink`+`guard.finish()` completes mid-retry.
+    for finish_mid_retry in [false, true] {
+        // 1a. `open_inode(O_CREAT)` vs `unlink_at`
+        {
+            let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+            let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let b_created = Arc::new(Barrier::new(2));
+            let b_in_guard = Arc::new(Barrier::new(2));
+            let b_in_lookup = Arc::new(Barrier::new(2));
+            let b_release = Arc::new(Barrier::new(2));
+
+            let b1 = Arc::clone(&b_created);
+            let b2 = Arc::clone(&b_in_guard);
+            fs.inner.hooks.lock().unwrap().post_create.insert(
+                String::from("f_creat"),
+                alloc::boxed::Box::new(move || {
+                    b1.wait();
+                    b2.wait();
+                }),
+            );
+            let b2_u = Arc::clone(&b_in_guard);
+            let b_lu = Arc::clone(&b_in_lookup);
+            let b3_u = Arc::clone(&b_release);
+            let fs_u = Arc::clone(&fs);
+            fs.inner.hooks.lock().unwrap().pre_unlink.insert(
+                String::from("f_creat"),
+                alloc::boxed::Box::new(move || {
+                    if finish_mid_retry {
+                        let b_lu_c = Arc::clone(&b_lu);
+                        let b3_lookup = Arc::clone(&b3_u);
+                        fs_u.inner.hooks.lock().unwrap().pre_lookup.insert(
+                            String::from("f_creat"),
+                            alloc::boxed::Box::new(move || {
+                                b_lu_c.wait();
+                                b3_lookup.wait();
+                            }),
+                        );
+                        b2_u.wait();
+                        b_lu.wait();
+                    } else {
+                        b2_u.wait();
+                        b3_u.wait();
+                    }
+                }),
+            );
+
+            let created_ino = std::thread::scope(|s| {
+                let env_b = Arc::clone(&env);
+                let b1_b = Arc::clone(&b_created);
+                let b3_b = Arc::clone(&b_release);
+                let t_b = s.spawn(move || {
+                    b1_b.wait();
+                    unlink_at(env_b.as_ref(), None, b"/f_creat", false).unwrap();
+                    if finish_mid_retry {
+                        b3_b.wait();
+                    }
+                });
+
+                let (created, _) = open_inode(
+                    env.as_ref(),
+                    None,
+                    b"/f_creat",
+                    OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+                    0o644,
+                    0,
+                )
+                .unwrap();
+                let ino = created.ino();
+                if !finish_mid_retry {
+                    b_release.wait();
+                }
+                t_b.join().unwrap();
+                drop(created);
+                ino
+            });
+
+            assert!(env.inode_get(DevId::ROOT, created_ino).is_none());
+            assert_no_zombies_in_cache(env.as_ref());
+            let (reused, _) = open_inode(
+                env.as_ref(),
+                None,
+                b"/f_reused",
+                OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+                0o644,
+                0,
+            )
+            .unwrap();
+            assert_eq!(reused.ino(), created_ino);
+            assert_eq!(reused.stat().unwrap().nlink, 1);
+            assert!(Arc::ptr_eq(
+                &reused,
+                &resolve_path(env.as_ref(), None, b"/f_reused", ResolveFlags::default()).unwrap().inode
+            ));
+        }
+
+        // 1b. `mkdir_at` vs `unlink_at(..., true)` (`pre_rmdir`)
+        {
+            let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+            let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let b_created = Arc::new(Barrier::new(2));
+            let b_in_guard = Arc::new(Barrier::new(2));
+            let b_in_lookup = Arc::new(Barrier::new(2));
+            let b_release = Arc::new(Barrier::new(2));
+
+            let b1 = Arc::clone(&b_created);
+            let b2 = Arc::clone(&b_in_guard);
+            fs.inner.hooks.lock().unwrap().post_mkdir.insert(
+                String::from("d_mk"),
+                alloc::boxed::Box::new(move || {
+                    b1.wait();
+                    b2.wait();
+                }),
+            );
+            let b2_u = Arc::clone(&b_in_guard);
+            let b_lu = Arc::clone(&b_in_lookup);
+            let b3_u = Arc::clone(&b_release);
+            let fs_u = Arc::clone(&fs);
+            fs.inner.hooks.lock().unwrap().pre_rmdir.insert(
+                String::from("d_mk"),
+                alloc::boxed::Box::new(move || {
+                    if finish_mid_retry {
+                        let b_lu_c = Arc::clone(&b_lu);
+                        let b3_lookup = Arc::clone(&b3_u);
+                        fs_u.inner.hooks.lock().unwrap().pre_lookup.insert(
+                            String::from("d_mk"),
+                            alloc::boxed::Box::new(move || {
+                                b_lu_c.wait();
+                                b3_lookup.wait();
+                            }),
+                        );
+                        b2_u.wait();
+                        b_lu.wait();
+                    } else {
+                        b2_u.wait();
+                        b3_u.wait();
+                    }
+                }),
+            );
+
+            let created_ino = std::thread::scope(|s| {
+                let env_b = Arc::clone(&env);
+                let b1_b = Arc::clone(&b_created);
+                let b3_b = Arc::clone(&b_release);
+                let t_b = s.spawn(move || {
+                    b1_b.wait();
+                    unlink_at(env_b.as_ref(), None, b"/d_mk", true).unwrap();
+                    if finish_mid_retry {
+                        b3_b.wait();
+                    }
+                });
+
+                let dir = mkdir_at(env.as_ref(), None, b"/d_mk", 0o755, 0).unwrap();
+                let ino = dir.ino();
+                if !finish_mid_retry {
+                    b_release.wait();
+                }
+                t_b.join().unwrap();
+                drop(dir);
+                ino
+            });
+
+            assert!(env.inode_get(DevId::ROOT, created_ino).is_none());
+            assert_no_zombies_in_cache(env.as_ref());
+            let (reused, _) = open_inode(
+                env.as_ref(),
+                None,
+                b"/d_reused",
+                OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+                0o644,
+                0,
+            )
+            .unwrap();
+            assert_eq!(reused.ino(), created_ino);
+            assert_eq!(reused.inode_type(), InodeType::File);
+            assert_eq!(reused.stat().unwrap().nlink, 1);
+        }
+
+        // 1c. `symlink_at` vs `unlink_at(..., false)`
+        {
+            let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+            let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let b_created = Arc::new(Barrier::new(2));
+            let b_in_guard = Arc::new(Barrier::new(2));
+            let b_in_lookup = Arc::new(Barrier::new(2));
+            let b_release = Arc::new(Barrier::new(2));
+
+            let b1 = Arc::clone(&b_created);
+            let b2 = Arc::clone(&b_in_guard);
+            fs.inner.hooks.lock().unwrap().post_symlink.insert(
+                String::from("s_sym"),
+                alloc::boxed::Box::new(move || {
+                    b1.wait();
+                    b2.wait();
+                }),
+            );
+            let b2_u = Arc::clone(&b_in_guard);
+            let b_lu = Arc::clone(&b_in_lookup);
+            let b3_u = Arc::clone(&b_release);
+            let fs_u = Arc::clone(&fs);
+            fs.inner.hooks.lock().unwrap().pre_unlink.insert(
+                String::from("s_sym"),
+                alloc::boxed::Box::new(move || {
+                    if finish_mid_retry {
+                        let b_lu_c = Arc::clone(&b_lu);
+                        let b3_lookup = Arc::clone(&b3_u);
+                        fs_u.inner.hooks.lock().unwrap().pre_lookup.insert(
+                            String::from("s_sym"),
+                            alloc::boxed::Box::new(move || {
+                                b_lu_c.wait();
+                                b3_lookup.wait();
+                            }),
+                        );
+                        b2_u.wait();
+                        b_lu.wait();
+                    } else {
+                        b2_u.wait();
+                        b3_u.wait();
+                    }
+                }),
+            );
+
+            let created_ino = std::thread::scope(|s| {
+                let env_b = Arc::clone(&env);
+                let b1_b = Arc::clone(&b_created);
+                let b3_b = Arc::clone(&b_release);
+                let t_b = s.spawn(move || {
+                    b1_b.wait();
+                    unlink_at(env_b.as_ref(), None, b"/s_sym", false).unwrap();
+                    if finish_mid_retry {
+                        b3_b.wait();
+                    }
+                });
+
+                let sym = symlink_at(env.as_ref(), b"/target", None, b"/s_sym").unwrap();
+                let ino = sym.ino();
+                if !finish_mid_retry {
+                    b_release.wait();
+                }
+                t_b.join().unwrap();
+                drop(sym);
+                ino
+            });
+
+            assert!(env.inode_get(DevId::ROOT, created_ino).is_none());
+            assert_no_zombies_in_cache(env.as_ref());
+            let (reused, _) = open_inode(
+                env.as_ref(),
+                None,
+                b"/s_reused",
+                OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+                0o644,
+                0,
+            )
+            .unwrap();
+            assert_eq!(reused.ino(), created_ino);
+            assert_eq!(reused.inode_type(), InodeType::File);
+            assert_eq!(reused.stat().unwrap().nlink, 1);
+        }
+    }
+
+    // 2. `PROBE 3F` & Codex P1: `O_CREAT | O_EXCL` post-create unlink + recreate same name reusing `ino`.
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    mkdir_at(env.as_ref(), None, b"/a", 0o755, 0).unwrap();
+
+    let env_h = Arc::clone(&env);
+    let other_holder: Arc<Mutex<Option<Arc<dyn VfsInode>>>> = Arc::new(Mutex::new(None));
+    let other_holder_c = Arc::clone(&other_holder);
+    fs.inner.hooks.lock().unwrap().post_create.insert(
+        String::from("excl_f"),
+        alloc::boxed::Box::new(move || {
+            unlink_at(env_h.as_ref(), None, b"/a/excl_f", false).unwrap();
+            let (other, _) = open_inode(
+                env_h.as_ref(),
+                None,
+                b"/a/excl_f",
+                OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDWR),
+                0o644,
+                0,
+            )
+            .unwrap();
+            other.write_at(0, b"OTHER_SECRET").unwrap();
+            *other_holder_c.lock().unwrap() = Some(other);
+        }),
+    );
+
+    let (mine, _) = open_inode(
+        env.as_ref(),
+        None,
+        b"/a/excl_f",
+        OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDWR),
+        0o600,
+        0,
+    )
+    .unwrap();
+    let other = other_holder.lock().unwrap().take().unwrap();
+    assert_eq!(mine.ino(), other.ino());
+    assert!(!Arc::ptr_eq(&mine, &other));
+    assert_eq!(mine.stat().unwrap().nlink, 0);
+    let mut buf = [0u8; 32];
+    assert_eq!(mine.read_at(0, &mut buf).unwrap(), 0);
+    let resolved = resolve_path(env.as_ref(), None, b"/a/excl_f", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&resolved, &other));
+    assert_no_zombies_in_cache(env.as_ref());
+}
+
+#[test]
+fn noop_rename_lock_hardlink_unlink_and_rename_races_evict_zombies() {
+    // Part 1: `PROBE 1D-1` (`use_rename_lock = false`, `open_count == 0`, `/hl/a` & `/hl/b` cached).
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
+    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    mkdir_at(env.as_ref(), None, b"/hl", 0o755, 0).unwrap();
+
+    let (orig, _) =
+        open_inode(env.as_ref(), None, b"/hl/a", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let orig_ino = orig.ino();
+    orig.write_at(0, b"STALE_HL_DATA").unwrap();
+    drop(orig);
+    link_at(env.as_ref(), None, b"/hl/a", None, b"/hl/b", false, false).unwrap();
+    assert!(env.inode_get(DevId::ROOT, orig_ino).is_some());
+
+    // Simulate concurrent `unlink_at("/hl/a")` leaving `nlink == 1`, then `unlink_at("/hl/b")` hitting
+    // `nlink 1 -> 0` and reusing `orig_ino` right inside `post_unlink("b")` before `evict_zombie_inode`.
+    unlink_at(env.as_ref(), None, b"/hl/a", false).unwrap();
+    let env_h = Arc::clone(&env);
+    let new_holder: Arc<Mutex<Option<Arc<dyn VfsInode>>>> = Arc::new(Mutex::new(None));
+    let new_holder_c = Arc::clone(&new_holder);
+    fs.inner.hooks.lock().unwrap().post_unlink.insert(
+        String::from("b"),
+        alloc::boxed::Box::new(move || {
+            let (new_f, _) = open_inode(
+                env_h.as_ref(),
+                None,
+                b"/hl/new",
+                OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+                0o644,
+                0,
+            )
+            .unwrap();
+            new_f.write_at(0, b"FRESH_DATALINK_DATA").unwrap();
+            *new_holder_c.lock().unwrap() = Some(new_f);
+        }),
+    );
+    unlink_at(env.as_ref(), None, b"/hl/b", false).unwrap();
+    let new_f = new_holder.lock().unwrap().take().unwrap();
+    assert_eq!(new_f.ino(), orig_ino);
+    assert_eq!(new_f.stat().unwrap().nlink, 1);
+    let mut buf = [0u8; 32];
+    let n = new_f.read_at(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"FRESH_DATALINK_DATA");
+    let resolved_new = resolve_path(env.as_ref(), None, b"/hl/new", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&new_f, &resolved_new));
+    assert_no_zombies_in_cache(env.as_ref());
+
+    // Repeat `PROBE 1D-1` for `unlink_at("/hl2/a")` vs overwriting `rename_at2("/src", "/hl2/b")`.
+    mkdir_at(env.as_ref(), None, b"/hl2", 0o755, 0).unwrap();
+    let (orig2, _) =
+        open_inode(env.as_ref(), None, b"/hl2/a", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let orig2_ino = orig2.ino();
+    orig2.write_at(0, b"STALE_REN_HL").unwrap();
+    drop(orig2);
+    link_at(env.as_ref(), None, b"/hl2/a", None, b"/hl2/b", false, false).unwrap();
+    let (src, _) =
+        open_inode(env.as_ref(), None, b"/src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    src.write_at(0, b"SRC_PAYLOAD").unwrap();
+    drop(src);
+
+    // Pause `rename_at2` after `last_link_info` observed `nlink == 2` (`post_lookup("b")` unlinks `/hl2/a` -> `nlink == 1`),
+    // then `rename` drops `nlink 1 -> 0` and `post_rename("b")` reuses `orig2_ino` before `evict_zombie_inode`.
+    let env_u = Arc::clone(&env);
+    fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from("b"),
+        alloc::boxed::Box::new(move || {
+            unlink_at(env_u.as_ref(), None, b"/hl2/a", false).unwrap();
+        }),
+    );
+    let env_r = Arc::clone(&env);
+    let ren_new_holder: Arc<Mutex<Option<Arc<dyn VfsInode>>>> = Arc::new(Mutex::new(None));
+    let ren_new_holder_c = Arc::clone(&ren_new_holder);
+    fs.inner.hooks.lock().unwrap().post_rename.insert(
+        String::from("b"),
+        alloc::boxed::Box::new(move || {
+            let (new_f2, _) = open_inode(
+                env_r.as_ref(),
+                None,
+                b"/hl2/new2",
+                OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+                0o644,
+                0,
+            )
+            .unwrap();
+            new_f2.write_at(0, b"FRESH_REN_DATALINK").unwrap();
+            *ren_new_holder_c.lock().unwrap() = Some(new_f2);
+        }),
+    );
+    rename_at2(env.as_ref(), None, b"/src", None, b"/hl2/b", RenameFlags(0)).unwrap();
+    let new_f2 = ren_new_holder.lock().unwrap().take().unwrap();
+    assert_eq!(new_f2.ino(), orig2_ino);
+    assert_eq!(new_f2.stat().unwrap().nlink, 1);
+    let n2 = new_f2.read_at(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n2], b"FRESH_REN_DATALINK");
+    let resolved_new2 = resolve_path(env.as_ref(), None, b"/hl2/new2", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&new_f2, &resolved_new2));
+    assert_no_zombies_in_cache(env.as_ref());
+
+    // Part 2: `PROBE 1D-2` (`use_rename_lock = false`, `(ROOT, orig3_ino)` evicted from `InodeCache`).
+    mkdir_at(env.as_ref(), None, b"/hl3", 0o755, 0).unwrap();
+    let (orig3, _) =
+        open_inode(env.as_ref(), None, b"/hl3/a", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let orig3_ino = orig3.ino();
+    orig3.write_at(0, b"PRE_UNLINK_1D2").unwrap();
+    drop(orig3);
+    link_at(env.as_ref(), None, b"/hl3/a", None, b"/hl3/b", false, false).unwrap();
+
+    // Evict `(ROOT, orig3_ino)` and invalidate dentry `"a"` so `resolve_path("/hl3/a")` goes to `dir.lookup("a")`.
+    let _ = env.inode_remove(DevId::ROOT, orig3_ino);
+    let hl3_dir = resolve_path(env.as_ref(), None, b"/hl3", ResolveFlags::default()).unwrap().inode;
+    env.dentry_invalidate(DevId::ROOT, hl3_dir.ino(), "a");
+
+    let env_1d2 = Arc::clone(&env);
+    fs.inner.hooks.lock().unwrap().post_lookup.insert(
+        String::from("a"),
+        alloc::boxed::Box::new(move || {
+            unlink_at(env_1d2.as_ref(), None, b"/hl3/a", false).unwrap();
+            unlink_at(env_1d2.as_ref(), None, b"/hl3/b", false).unwrap();
+        }),
+    );
+    let pre_un = resolve_path(env.as_ref(), None, b"/hl3/a", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(pre_un.ino(), orig3_ino);
+    assert_eq!(pre_un.stat().unwrap().nlink, 0);
+    assert!(env.inode_get(DevId::ROOT, orig3_ino).is_none());
+    assert_no_zombies_in_cache(env.as_ref());
+}
+
+#[test]
+fn overflow_and_magic_link_race_retries_preserve_unification() {
+    // 1. `resolve_global_root` retry under `InodeCache::with_removal_history(2)` overflow.
+    struct HookRootFs {
+        inner: Arc<FreshArcReusingFs>,
+        on_root: Mutex<Option<FsOpHook>>,
+    }
+    impl FileSystem for HookRootFs {
+        fn dev_id(&self) -> DevId {
+            self.inner.dev_id()
+        }
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn root_inode(&self) -> Arc<dyn VfsInode> {
+            let hook = self.on_root.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.root_inode()
+        }
+        fn sync(&self) -> Result<(), VfsError> {
+            self.inner.sync()
+        }
+        fn read_only(&self) -> bool {
+            self.inner.read_only()
+        }
+        fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
+            self.inner.with_rename_lock(f)
+        }
+    }
+
+    let raw_root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let hook_root_fs = Arc::new(HookRootFs { inner: Arc::clone(&raw_root_fs), on_root: Mutex::new(None) });
+    let env = SyncVfsTables::with_removal_history(Arc::clone(&hook_root_fs) as Arc<dyn FileSystem>, 2, 64);
+    for i in 0..3usize {
+        let p = format!("/r_unrel_{i}");
+        open_inode(env.as_ref(), None, p.as_bytes(), OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    }
+    let _ = env.inode_remove(DevId::ROOT, 1);
+    let env_r = Arc::clone(&env);
+    *hook_root_fs.on_root.lock().unwrap() = Some(alloc::boxed::Box::new(move || {
+        for i in 0..3usize {
+            let p = format!("/r_unrel_{i}");
+            unlink_at(env_r.as_ref(), None, p.as_bytes(), false).unwrap();
+        }
+    }));
+    let r1 = resolve_path(env.as_ref(), None, b"/", ResolveFlags::default()).unwrap().inode;
+    let r2 = resolve_path(env.as_ref(), None, b"/", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&r1, &r2));
+    assert!(Arc::ptr_eq(&env.inode_get(DevId::ROOT, 1).unwrap(), &r1));
+
+    // 2. `lookup_dotdot` retry under `hist = 2` overflow.
+    mkdir_at(env.as_ref(), None, b"/sub", 0o755, 0).unwrap();
+    let sub = resolve_path(env.as_ref(), None, b"/sub", ResolveFlags::default()).unwrap().inode;
+    for i in 0..3usize {
+        let p = format!("/dd_unrel_{i}");
+        open_inode(env.as_ref(), None, p.as_bytes(), OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    }
+    let env_dd = Arc::clone(&env);
+    raw_root_fs.inner.hooks.lock().unwrap().pre_lookup.insert(
+        String::from(".."),
+        alloc::boxed::Box::new(move || {
+            for i in 0..3usize {
+                let p = format!("/dd_unrel_{i}");
+                unlink_at(env_dd.as_ref(), None, p.as_bytes(), false).unwrap();
+            }
+        }),
+    );
+    let dd = resolve_path(env.as_ref(), Some(&sub), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&dd, &r1));
+
+    // 3. `lookup_and_unify_inode` retry under `hist = 2` overflow (`rename_at2` unifies with live cached `Arc`).
+    let (ren_src, _) =
+        open_inode(env.as_ref(), None, b"/sub/ren_src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let ren_src_ino = ren_src.ino();
+    drop(ren_src);
+    let _ = env.inode_remove(DevId::ROOT, ren_src_ino);
+    env.dentry_invalidate(DevId::ROOT, sub.ino(), "ren_src");
+    let mut lu_inos = Vec::new();
+    for i in 0..3usize {
+        let p = format!("/lu_unrel_{i}");
+        let (f, _) =
+            open_inode(env.as_ref(), None, p.as_bytes(), OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+                .unwrap();
+        lu_inos.push(f.ino());
+    }
+    let live_holder: Arc<Mutex<Option<Arc<dyn VfsInode>>>> = Arc::new(Mutex::new(None));
+    let live_holder_c = Arc::clone(&live_holder);
+    let env_lu = Arc::clone(&env);
+    let raw_lu = Arc::clone(&raw_root_fs);
+    raw_root_fs.inner.hooks.lock().unwrap().pre_lookup.insert(
+        String::from("ren_src"),
+        alloc::boxed::Box::new(move || {
+            let live = resolve_path(env_lu.as_ref(), None, b"/sub/ren_src", ResolveFlags::default()).unwrap().inode;
+            *live_holder_c.lock().unwrap() = Some(live);
+            for (i, ino) in lu_inos.into_iter().enumerate() {
+                let name = format!("lu_unrel_{i}");
+                raw_lu.root_inode().unlink(&name).unwrap();
+                let _ = env_lu.inode_remove(DevId::ROOT, ino);
+            }
+        }),
+    );
+    rename_at2(env.as_ref(), None, b"/sub/ren_src", None, b"/sub/ren_dst", RenameFlags(0)).unwrap();
+    let live_arc = live_holder.lock().unwrap().take().unwrap();
+    let dst_arc = resolve_path(env.as_ref(), None, b"/sub/ren_dst", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&dst_arc, &live_arc));
+
+    // 4. `resolve_and_unify_magic_target` under overflow + target unlink+reuse *during* `resolve_magic_link()` + `PROBE 3B`.
+    type MagicResolveCb = alloc::boxed::Box<dyn FnMut() -> Option<Arc<dyn VfsInode>> + Send>;
+    struct HookMagicInode {
+        inner: Arc<dyn VfsInode>,
+        on_resolve: Mutex<Option<MagicResolveCb>>,
+    }
+    impl VfsInode for HookMagicInode {
+        fn lock_id(&self) -> u64 {
+            self.inner.lock_id()
+        }
+        fn dev_id(&self) -> DevId {
+            self.inner.dev_id()
+        }
+        fn ino(&self) -> Ino {
+            self.inner.ino()
+        }
+        fn inode_type(&self) -> InodeType {
+            self.inner.inode_type()
+        }
+        fn open_count(&self) -> u32 {
+            self.inner.open_count()
+        }
+        fn inc_open_count(&self) {
+            self.inner.inc_open_count()
+        }
+        fn dec_open_count(&self) -> u32 {
+            self.inner.dec_open_count()
+        }
+        fn is_detached(&self) -> bool {
+            self.inner.is_detached()
+        }
+        fn resolve_magic_link(&self) -> Option<Arc<dyn VfsInode>> {
+            self.on_resolve.lock().unwrap().as_mut().and_then(|cb| cb())
+        }
+        fn stat(&self) -> Result<Metadata, VfsError> {
+            self.inner.stat()
+        }
+        fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.lookup(name)
+        }
+        fn create(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.create(name, mode)
+        }
+        fn mkdir(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.mkdir(name, mode)
+        }
+        fn unlink(&self, name: &str) -> Result<(), VfsError> {
+            self.inner.unlink(name)
+        }
+        fn rmdir(&self, name: &str) -> Result<(), VfsError> {
+            self.inner.rmdir(name)
+        }
+        fn link(&self, name: &str, target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+            self.inner.link(name, target)
+        }
+        fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.symlink(name, target)
+        }
+        fn readlink(&self) -> Result<Vec<u8>, VfsError> {
+            self.inner.readlink()
+        }
+        fn rename(
+            &self,
+            old_name: &str,
+            new_dir: &Arc<dyn VfsInode>,
+            new_name: &str,
+            flags: RenameFlags,
+        ) -> Result<(), VfsError> {
+            self.inner.rename(old_name, new_dir, new_name, flags)
+        }
+        fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
+            self.inner.readdir(cursor, out, max_entries)
+        }
+        fn truncate(&self, size: u64) -> Result<(), VfsError> {
+            self.inner.truncate(size)
+        }
+        fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
+            self.inner.set_mode(mode)
+        }
+        fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError> {
+            self.inner.set_owner(uid, gid)
+        }
+        fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
+            self.inner.set_times(atime, mtime)
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+            self.inner.read_at(offset, buf)
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
+            self.inner.write_at(offset, buf)
+        }
+        fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError> {
+            self.inner.read_page(page_index, buf)
+        }
+        fn write_page(&self, page_index: u64, buf: &[u8]) -> Result<(), VfsError> {
+            self.inner.write_page(page_index, buf)
+        }
+        fn sync(&self, data_only: bool) -> Result<(), VfsError> {
+            self.inner.sync(data_only)
+        }
+        fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {
+            self.inner.with_locks_mut(f)
+        }
+    }
+    struct MagicDirFs {
+        dev: DevId,
+        root: Arc<dyn VfsInode>,
+    }
+    struct MagicRootDir {
+        inner: Arc<dyn VfsInode>,
+        children: Mutex<BTreeMap<String, Arc<dyn VfsInode>>>,
+    }
+    impl VfsInode for MagicRootDir {
+        fn lock_id(&self) -> u64 {
+            self.inner.lock_id()
+        }
+        fn dev_id(&self) -> DevId {
+            self.inner.dev_id()
+        }
+        fn ino(&self) -> Ino {
+            self.inner.ino()
+        }
+        fn inode_type(&self) -> InodeType {
+            self.inner.inode_type()
+        }
+        fn open_count(&self) -> u32 {
+            self.inner.open_count()
+        }
+        fn inc_open_count(&self) {
+            self.inner.inc_open_count()
+        }
+        fn dec_open_count(&self) -> u32 {
+            self.inner.dec_open_count()
+        }
+        fn is_detached(&self) -> bool {
+            self.inner.is_detached()
+        }
+        fn stat(&self) -> Result<Metadata, VfsError> {
+            self.inner.stat()
+        }
+        fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.children.lock().unwrap().get(name).cloned().ok_or(VfsError::NoEnt)
+        }
+        fn create(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.create(name, mode)
+        }
+        fn mkdir(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.mkdir(name, mode)
+        }
+        fn unlink(&self, name: &str) -> Result<(), VfsError> {
+            self.inner.unlink(name)
+        }
+        fn rmdir(&self, name: &str) -> Result<(), VfsError> {
+            self.inner.rmdir(name)
+        }
+        fn link(&self, name: &str, target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+            self.inner.link(name, target)
+        }
+        fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.symlink(name, target)
+        }
+        fn readlink(&self) -> Result<Vec<u8>, VfsError> {
+            self.inner.readlink()
+        }
+        fn rename(
+            &self,
+            old_name: &str,
+            new_dir: &Arc<dyn VfsInode>,
+            new_name: &str,
+            flags: RenameFlags,
+        ) -> Result<(), VfsError> {
+            self.inner.rename(old_name, new_dir, new_name, flags)
+        }
+        fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
+            self.inner.readdir(cursor, out, max_entries)
+        }
+        fn truncate(&self, size: u64) -> Result<(), VfsError> {
+            self.inner.truncate(size)
+        }
+        fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
+            self.inner.set_mode(mode)
+        }
+        fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError> {
+            self.inner.set_owner(uid, gid)
+        }
+        fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
+            self.inner.set_times(atime, mtime)
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+            self.inner.read_at(offset, buf)
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
+            self.inner.write_at(offset, buf)
+        }
+        fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError> {
+            self.inner.read_page(page_index, buf)
+        }
+        fn write_page(&self, page_index: u64, buf: &[u8]) -> Result<(), VfsError> {
+            self.inner.write_page(page_index, buf)
+        }
+        fn sync(&self, data_only: bool) -> Result<(), VfsError> {
+            self.inner.sync(data_only)
+        }
+        fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {
+            self.inner.with_locks_mut(f)
+        }
+    }
+    impl FileSystem for MagicDirFs {
+        fn dev_id(&self) -> DevId {
+            self.dev
+        }
+        fn name(&self) -> &'static str {
+            "procfs"
+        }
+        fn root_inode(&self) -> Arc<dyn VfsInode> {
+            Arc::clone(&self.root)
+        }
+        fn sync(&self) -> Result<(), VfsError> {
+            Ok(())
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+    }
+
+    let proc_backing = MemFs::new(DevId::PROCFS, "procfs", true);
+    let proc_mp = mkdir_at(env.as_ref(), None, b"/proc", 0o755, 0).unwrap();
+    let proc_root = Arc::new(MagicRootDir { inner: proc_backing.root_inode(), children: Mutex::new(BTreeMap::new()) });
+    let proc_fs = Arc::new(MagicDirFs { dev: DevId::PROCFS, root: Arc::clone(&proc_root) as Arc<dyn VfsInode> });
+    env.mount(proc_mp, "/proc", proc_fs).unwrap();
+
+    // 4a. Magic link overflow on first `resolve_magic_link` call retries and unifies.
+    let (m_target, _) =
+        open_inode(env.as_ref(), None, b"/m_target", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let m_target_ino = m_target.ino();
+    drop(m_target);
+    let _ = env.inode_remove(DevId::ROOT, m_target_ino);
+    for i in 0..3usize {
+        let p = format!("/mg_unrel_{i}");
+        open_inode(env.as_ref(), None, p.as_bytes(), OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    }
+    let env_m = Arc::clone(&env);
+    let raw_r = Arc::clone(&raw_root_fs);
+    let mut overflow_calls = 0usize;
+    let m_sym1 = proc_backing.root_inode().symlink("m_over", "/target").unwrap();
+    let m_link_overflow = Arc::new(HookMagicInode {
+        inner: m_sym1,
+        on_resolve: Mutex::new(Some(alloc::boxed::Box::new(move || {
+            overflow_calls += 1;
+            if overflow_calls == 1 {
+                for i in 0..3usize {
+                    let p = format!("/mg_unrel_{i}");
+                    unlink_at(env_m.as_ref(), None, p.as_bytes(), false).unwrap();
+                }
+            }
+            raw_r.root_inode().lookup("m_target").ok()
+        }))),
+    });
+    proc_root.children.lock().unwrap().insert(String::from("m_over"), m_link_overflow);
+    let (via_open, _) =
+        open_inode(env.as_ref(), None, b"/proc/m_over", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY), 0o644, 0)
+            .unwrap();
+    let via_resolve = resolve_path(
+        env.as_ref(),
+        None,
+        b"/proc/m_over",
+        ResolveFlags { follow_final: true, ..ResolveFlags::default() },
+    )
+    .unwrap()
+    .inode;
+    assert!(Arc::ptr_eq(&via_open, &via_resolve));
+    assert!(Arc::ptr_eq(&env.inode_get(DevId::ROOT, m_target_ino).unwrap(), &via_open));
+
+    // 4b. Target unlinked + `ino` reused *during* `resolve_magic_link()` (proves `cache_gens()` captured BEFORE `resolve_magic_link()`).
+    let (old_mt, _) =
+        open_inode(env.as_ref(), None, b"/old_mt", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let old_mt_ino = old_mt.ino();
+    old_mt.write_at(0, b"OLD_MT").unwrap();
+    drop(old_mt);
+    let _ = env.inode_remove(DevId::ROOT, old_mt_ino);
+
+    let env_m2 = Arc::clone(&env);
+    let raw_r2 = Arc::clone(&raw_root_fs);
+    let new_mt_holder: Arc<Mutex<Option<Arc<dyn VfsInode>>>> = Arc::new(Mutex::new(None));
+    let new_mt_holder_c = Arc::clone(&new_mt_holder);
+    let mut reuse_calls = 0usize;
+    let m_sym2 = proc_backing.root_inode().symlink("m_reuse", "/target").unwrap();
+    let m_link_reuse = Arc::new(HookMagicInode {
+        inner: m_sym2,
+        on_resolve: Mutex::new(Some(alloc::boxed::Box::new(move || {
+            reuse_calls += 1;
+            if reuse_calls == 1 {
+                let stale_old = raw_r2.root_inode().lookup("old_mt").unwrap();
+                unlink_at(env_m2.as_ref(), None, b"/old_mt", false).unwrap();
+                let (new_mt, _) = open_inode(
+                    env_m2.as_ref(),
+                    None,
+                    b"/new_mt",
+                    OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+                    0o644,
+                    0,
+                )
+                .unwrap();
+                new_mt.write_at(0, b"NEW_MT").unwrap();
+                *new_mt_holder_c.lock().unwrap() = Some(new_mt);
+                Some(stale_old)
+            } else {
+                None
+            }
+        }))),
+    });
+    proc_root.children.lock().unwrap().insert(String::from("m_reuse"), m_link_reuse);
+    let got_reuse = resolve_path(
+        env.as_ref(),
+        None,
+        b"/proc/m_reuse",
+        ResolveFlags { follow_final: true, ..ResolveFlags::default() },
+    )
+    .unwrap()
+    .inode;
+    let new_mt = new_mt_holder.lock().unwrap().take().unwrap();
+    assert_eq!(got_reuse.ino(), old_mt_ino);
+    assert_eq!(new_mt.ino(), old_mt_ino);
+    assert!(!Arc::ptr_eq(&got_reuse, &new_mt));
+    let mut buf = [0u8; 16];
+    let n = got_reuse.read_at(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], b"OLD_MT");
+    assert!(Arc::ptr_eq(&env.inode_get(DevId::ROOT, old_mt_ino).unwrap(), &new_mt));
+
+    // 4c. `PROBE 3B`: detached magic link target exits in 1 step without entering `InodeCache`.
+    let (det_mt, _) =
+        open_inode(env.as_ref(), None, b"/det_mt", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let det_guard = OpenGuard::new(Arc::clone(&det_mt));
+    unlink_at(env.as_ref(), None, b"/det_mt", false).unwrap();
+    assert!(det_mt.is_detached());
+    let det_calls = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+    let det_calls_c = Arc::clone(&det_calls);
+    let det_clone = Arc::clone(&det_mt);
+    let m_sym3 = proc_backing.root_inode().symlink("m_det", "/target").unwrap();
+    let m_link_det = Arc::new(HookMagicInode {
+        inner: m_sym3,
+        on_resolve: Mutex::new(Some(alloc::boxed::Box::new(move || {
+            det_calls_c.fetch_add(1, Ordering::AcqRel);
+            Some(Arc::clone(&det_clone))
+        }))),
+    });
+    proc_root.children.lock().unwrap().insert(String::from("m_det"), m_link_det);
+    let got_det = resolve_path(
+        env.as_ref(),
+        None,
+        b"/proc/m_det",
+        ResolveFlags { follow_final: true, ..ResolveFlags::default() },
+    )
+    .unwrap()
+    .inode;
+    assert_eq!(det_calls.load(Ordering::Acquire), 1);
+    assert!(got_det.is_detached());
+    assert!(Arc::ptr_eq(&got_det, &det_mt));
+    drop(det_guard);
+    assert_no_zombies_in_cache(env.as_ref());
 }
