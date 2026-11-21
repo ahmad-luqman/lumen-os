@@ -1,22 +1,8 @@
 //! The vfs ktests: the `ext4plus` smoke check, the ext4 adapter over the
 //! The ktests of `vfs/mod.rs`'s code (`vfs/ext4.rs` and `vfs/page_cache.rs`
-//! keep their own), all twelve:
-//!
-//! - `ext4_crate_smoke`: the `ext4plus` smoke check (`exercise_ext4_smoke`);
-//! - `ext4_adapter_pagecache_quirks_and_open_unlinked`: the ext4 adapter over
-//!   the page cache, open-unlinked files included;
-//! - `vfs_boot_mounts_tmp_dev_proc_work`: `/tmp`, `/dev` and `/proc` at boot;
-//! - `vfs_proc_checks_unregister_their_process_on_failure`;
-//! - `tmpfs_truncate_returns_quota`;
-//! - `vfs_read_all_refuses_a_file_past_its_cap`;
-//! - `vfs_sync_continues_past_a_failing_inode`;
-//! - `page_cache_global_reclaim_writes_back_and_evicts`;
-//! - `vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing`: tmpfs's quota,
-//!   `rmdir`, the `maps` lines, the heap and procfs's parsing;
-//! - `ext4_flush_and_reclaim_preserve_dirty_on_io_error` and
-//!   `ext4_truncate_and_open_unlink_preserve_state_on_io_error`: injected I/O
-//!   errors;
-//! - `ext4_partial_phase2_io_error_recovery`: the recovery sweeps.
+//! keep their own): the `ext4plus` smoke check, the ext4 adapter over the
+//! page cache, `/tmp`, `/dev` and `/proc`, tmpfs's quota, `sync`, global
+//! reclaim and recovery from injected I/O errors.
 //!
 //! `MemBlkDev` stays in `vfs/mod.rs`: the `vfs/ext4.rs` and
 //! `vfs/page_cache.rs` ktests use it too.
@@ -328,9 +314,12 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use lumen_bcache::BlockCache;
 
-        // The ext4 page count is global: pages another ktest left cached (in
-        // a cache reclaim can't reach, outside `TABLES`) count too, so every
-        // check is against the count before this test's mount.
+        // The ext4 page count is global: pages other ktests left cached, in
+        // caches that `snapshot_cached_inodes` doesn't see, count too, so
+        // every check is against the count before this test's mount. It
+        // assumes `base` holds only such pages, out of reclaim's reach (the
+        // ktest kernel's root is tmpfs): otherwise reclaim could evict them in
+        // place of this test's pages.
         let base = page_cache::ext4_cached_pages();
         let img = build_minimal_ext4_image_blocks(256);
         let mem_dev = MemBlkDev::new(img, false);
