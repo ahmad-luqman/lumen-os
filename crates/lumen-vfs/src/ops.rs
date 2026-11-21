@@ -242,7 +242,7 @@ impl Opened {
 /// The inode was live when the open checked it, but an `unlink` can free it
 /// once this returns. An open file description built from it with
 /// [`OpenFile::new`](crate::fd::OpenFile::new) then fails with `ENOENT`
-/// (that call checks again); an [`OpenGuard::new`] on it can hold a freed
+/// (that call checks again); an [`OpenGuard::new_unchecked`] on it can hold a freed
 /// inode. File descriptors use [`open_inode_guarded`] and
 /// [`OpenFile::from_opened`](crate::fd::OpenFile::from_opened).
 pub fn open_inode(
@@ -267,7 +267,7 @@ pub fn open_inode(
 /// had lost the race). Under `O_CREAT` a lost race opens again instead
 /// (POSIX: the old file or a new one, never `ENOENT`), at most
 /// `MAX_CREAT_RACE_RETRIES` times. A file this open creates takes an
-/// unchecked reference ([`OpenGuard::new`]) under its filesystem's Lock 3,
+/// unchecked reference ([`OpenGuard::new_unchecked`]) under its filesystem's Lock 3,
 /// by design: on a filesystem with a rename lock (ext4, tmpfs) no unlink can
 /// come between, and the open must succeed even if one follows at once.
 /// Every error gives the reference back.
@@ -437,7 +437,7 @@ fn open_once(
                                         dentry_gen,
                                         inode_gen,
                                     );
-                                    step = Some(CreatStep::Created(OpenGuard::new(created)));
+                                    step = Some(CreatStep::Created(OpenGuard::new_unchecked(created)));
                                     return Ok(());
                                 }
                                 Err(VfsError::Exist) if !flags.has_excl() => {

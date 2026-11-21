@@ -5240,10 +5240,13 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     inode with that reference given back: an `OpenFile::new` built from it
     takes a fresh one through `OpenGuard::try_new`, refused with `-ENOENT`
     if an unlink freed the inode in between (only an inode reporting
-    `st_nlink >= 1`, or detached, can be opened). The unchecked
-    `OpenGuard::new` is only for an inode nothing can free before the count
-    goes up: one another reference already keeps open (a clone, an
-    inherited `cwd`), or a file just created under its filesystem's Lock 3.
+    `st_nlink >= 1`, or detached, can be opened). `OpenGuard::new_unchecked`
+    (named so the risk shows at each call) is only for an inode nothing can
+    free before the count goes up: one another reference already keeps open
+    (a clone, an inherited `cwd`), or a file just created under its
+    filesystem's Lock 3. The kernel's `vfstest` opens through
+    `open_inode_guarded` + `OpenFile::from_opened`; the unchecked guards left
+    in `kernel/src/vfs/tests.rs` are ktest set-up.
   - `O_PATH` descriptors ignore `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND` and
     access mode; I/O, `lseek`, `mmap`, `ftruncate`, `flock`, `F_SETLK*`,
     `fsync`, `fchmod`, `fchown`, and `getdents64` return `-EBADF`, while

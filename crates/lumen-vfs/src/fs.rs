@@ -188,7 +188,7 @@ impl OpenGuard {
     /// an inode found by a path lookup, an `unlink` landing between the
     /// lookup and this increment frees the inode under the new reference.
     /// Opens go through [`OpenGuard::try_new`] (or `open_inode_guarded`).
-    pub fn new(inode: Arc<dyn VfsInode>) -> Self {
+    pub fn new_unchecked(inode: Arc<dyn VfsInode>) -> Self {
         inode.inc_open_count();
         Self { inode }
     }
@@ -231,7 +231,7 @@ impl OpenGuard {
 
 impl Clone for OpenGuard {
     fn clone(&self) -> Self {
-        Self::new(Arc::clone(&self.inode))
+        Self::new_unchecked(Arc::clone(&self.inode))
     }
 }
 

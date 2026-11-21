@@ -1184,7 +1184,7 @@ fn open_unlinked_file_dir_and_compute_cwd_after_rename() {
     let orig_lock_id = file_inode.lock_id();
     file_inode.write_at(0, b"payload").unwrap();
 
-    let open_guard = OpenGuard::new(Arc::clone(&file_inode));
+    let open_guard = OpenGuard::new_unchecked(Arc::clone(&file_inode));
     assert_eq!(file_inode.open_count(), 1);
 
     // 20. Unlink while open: dentry & InodeCache removed, synthetic ino, lock_id immutable, I/O continues
@@ -1206,7 +1206,7 @@ fn open_unlinked_file_dir_and_compute_cwd_after_rename() {
     // 21. compute_cwd_path updates after ancestor rename and returns ENOENT when cwd is rmdir'd
     mkdir_at(&env, None, b"/parent_old", 0o755, 0).unwrap();
     let cwd = mkdir_at(&env, None, b"/parent_old/work", 0o755, 0).unwrap();
-    let cwd_guard = OpenGuard::new(Arc::clone(&cwd));
+    let cwd_guard = OpenGuard::new_unchecked(Arc::clone(&cwd));
     assert_eq!(compute_cwd_path(&env, &cwd).unwrap(), "/parent_old/work");
 
     rename_at2(&env, None, b"/parent_old", None, b"/parent_new", RenameFlags(0)).unwrap();
@@ -2042,7 +2042,7 @@ fn dotdot_unifies_through_inode_cache_and_crosses_stacked_mounts() {
     let via_dotdot = resolve_path(&env, None, b"/dir/sub/..", ResolveFlags::default()).unwrap().inode;
     assert!(Arc::ptr_eq(&via_dotdot, &dir));
 
-    let guard = OpenGuard::new(via_dotdot);
+    let guard = OpenGuard::new_unchecked(via_dotdot);
     assert_eq!(dir.open_count(), 1);
     drop(guard);
     assert_eq!(dir.open_count(), 0);
@@ -2557,7 +2557,7 @@ fn unchallenged_edges_tmpfile_link_empty_path_and_access() {
     // 2. link_at with `empty_path: true` on live vs unlinked FDs.
     let (live_file, _) =
         open_inode(&env, None, b"/dir/live", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
-    let guard = OpenGuard::new(Arc::clone(&live_file));
+    let guard = OpenGuard::new_unchecked(Arc::clone(&live_file));
     link_at(&env, Some(&live_file), b"", None, b"/dir/hardlink", false, true).unwrap();
     assert_eq!(live_file.stat().unwrap().nlink, 2);
 
@@ -4608,7 +4608,7 @@ fn inode_cache_removal_ring_bounded_and_overflow_safe() {
     let mem = MemFs::new(DevId::makedev(0, 55), "mem", false);
     let mf = mem.root_inode().create("mf", 0o644).unwrap();
     let mf_ino = mf.ino();
-    let mf_guard = OpenGuard::new(Arc::clone(&mf));
+    let mf_guard = OpenGuard::new_unchecked(Arc::clone(&mf));
     let g_before_mf = cache.removal_gen();
     assert!(cache.get_or_insert_if_fresh(Arc::clone(&mf), g_before_mf).is_ok());
     mem.root_inode().unlink("mf").unwrap();
@@ -4622,7 +4622,7 @@ fn inode_cache_removal_ring_bounded_and_overflow_safe() {
     // Simulate a cached entry that becomes detached while still in `inodes` (e.g. direct backend detach).
     let mf2 = mem.root_inode().create("mf2", 0o644).unwrap();
     let mf2_ino = mf2.ino();
-    let mf2_guard = OpenGuard::new(Arc::clone(&mf2));
+    let mf2_guard = OpenGuard::new_unchecked(Arc::clone(&mf2));
     let g_mf2 = cache.removal_gen();
     assert!(cache.get_or_insert_if_fresh(Arc::clone(&mf2), g_mf2).is_ok());
     mem.root_inode().unlink("mf2").unwrap();
@@ -4633,7 +4633,7 @@ fn inode_cache_removal_ring_bounded_and_overflow_safe() {
     // Now `get_or_insert` on a fresh non-detached inode when a detached one was cached evicts the stale one.
     let mf3 = mem.root_inode().create("mf3", 0o644).unwrap();
     let mf3_ino = mf3.ino();
-    let mf3_guard = OpenGuard::new(Arc::clone(&mf3));
+    let mf3_guard = OpenGuard::new_unchecked(Arc::clone(&mf3));
     cache.get_or_insert(Arc::clone(&mf3));
     mem.root_inode().unlink("mf3").unwrap();
     // `mf3` is detached in `cache`; `get_or_insert_if_fresh` on a non-detached `f10`-style entry or checking `remove_if_fresh`:
@@ -5039,7 +5039,7 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
                 let orig_ino = orig.ino();
                 orig.write_at(0, b"stale_hl").unwrap();
                 link_at(env.as_ref(), None, b"/hl/a", None, b"/hl/b", false, false).unwrap();
-                let open_guard = if hold_open { Some(OpenGuard::new(Arc::clone(&orig))) } else { None };
+                let open_guard = if hold_open { Some(OpenGuard::new_unchecked(Arc::clone(&orig))) } else { None };
                 drop(orig);
 
                 let barrier = Barrier::new(2);
@@ -5285,7 +5285,7 @@ fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usiz
                             if let Ok((inode, _)) = open_inode(env_t.as_ref(), None, p, OpenFlags(raw_flags), 0o644, 0)
                             {
                                 if (step % 7 == 0) && held_guards.len() < 4 {
-                                    held_guards.push(OpenGuard::new(inode));
+                                    held_guards.push(OpenGuard::new_unchecked(inode));
                                 } else {
                                     let _ = inode.write_at(0, b"data");
                                 }
@@ -6569,7 +6569,7 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
     let (det_mt, _) =
         open_inode(env.as_ref(), None, b"/det_mt", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap();
-    let det_guard = OpenGuard::new(Arc::clone(&det_mt));
+    let det_guard = OpenGuard::new_unchecked(Arc::clone(&det_mt));
     unlink_at(env.as_ref(), None, b"/det_mt", false).unwrap();
     assert!(det_mt.is_detached());
     let det_calls = Arc::new(core::sync::atomic::AtomicUsize::new(0));
@@ -6634,7 +6634,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
                 open_inode(env.as_ref(), None, b"/src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
                     .unwrap();
             let src_ino = src.ino();
-            let _guard = if hold_open { Some(OpenGuard::new(src)) } else { None };
+            let _guard = if hold_open { Some(OpenGuard::new_unchecked(src)) } else { None };
 
             let sig = Arc::new((Mutex::new(false), Condvar::new()));
             let sig_hook = Arc::clone(&sig);
@@ -6750,7 +6750,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
                         OpKind::Symlink => symlink_at(env.as_ref(), b"/t", None, b"/dst").unwrap(),
                     };
                     let created_ino = created.ino();
-                    let _guard = if hold_open { Some(OpenGuard::new(created)) } else { None };
+                    let _guard = if hold_open { Some(OpenGuard::new_unchecked(created)) } else { None };
                     let ren_res = t_b.join().unwrap();
 
                     if rflags.has_noreplace() {
@@ -7193,7 +7193,7 @@ fn compute_cwd_path_retries_on_concurrent_rename_and_rejects_unlinked_cwd() {
     mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
     let cwd = mkdir_at(env.as_ref(), None, b"/p1/leaf", 0o755, 0).unwrap();
-    let guard = OpenGuard::new(Arc::clone(&cwd));
+    let guard = OpenGuard::new_unchecked(Arc::clone(&cwd));
 
     let env_h = Arc::clone(&env);
     fs.inner.hooks.lock().unwrap().post_lookup.insert(
@@ -7211,7 +7211,7 @@ fn compute_cwd_path_retries_on_concurrent_rename_and_rejects_unlinked_cwd() {
     mkdir_at(env.as_ref(), None, b"/a2", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/a1/sub", 0o755, 0).unwrap();
     let deep = mkdir_at(env.as_ref(), None, b"/a1/sub/deep", 0o755, 0).unwrap();
-    let deep_guard = OpenGuard::new(Arc::clone(&deep));
+    let deep_guard = OpenGuard::new_unchecked(Arc::clone(&deep));
 
     let fs_h2 = Arc::clone(&fs);
     let env_h2 = Arc::clone(&env);
@@ -7268,7 +7268,7 @@ fn concurrent_compute_cwd_path_vs_rename_at2_stress() {
     mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
     let cwd = mkdir_at(env.as_ref(), None, b"/p1/leaf", 0o755, 0).unwrap();
-    let _guard = OpenGuard::new(Arc::clone(&cwd));
+    let _guard = OpenGuard::new_unchecked(Arc::clone(&cwd));
 
     const MIN_TOGGLES: usize = 1000;
     const READER_ITERS: usize = 1000;
