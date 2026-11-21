@@ -787,7 +787,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       so the first write triggers CoW).
     - `MAP_SHARED` fault (`fm.shared`): fetch/pin the `Arc<CachePage>` from
       `PageCache` and store a clone in `pinned_pages[page_va]`. On a write
-      fault to a writable VMA, mark the `CachePage` dirty, call
+      fault to a writable VMA, call `CachePage::set_dirty()` and
       `inc_writable_maps()`, and map with `prot_to_attrs(vma.prot)` +
       `PTE_SHARED = 1` (`USER | WRITABLE | PTE_SHARED`, preserving
       `vma.prot.exec()`). On a read/exec fault, map with `WRITABLE = 0`,
@@ -822,7 +822,8 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       mapping into `PTE_PROTNONE`). Already CoW-split `PTE_SHARED = 0` leaves
       update `WRITABLE` directly from `vma.prot.write()`.
     - Because `fsync`/`fdatasync`/`sync`/`msync` treat a `CachePage` as dirty
-      whenever `dirty || writable_maps > 0`, repeated `MAP_SHARED` stores
+      whenever `writable_maps > 0 || dirty` (tested in that order, section
+      9), repeated `MAP_SHARED` stores
       followed by repeated `fsync` calls without intervening `munmap` always
       persist to `ext4` without requiring reverse-PTE walks in M7.
     - **Truncate shrink invalidation (`ftruncate`, `truncate`, `openat(O_TRUNC)`):**
@@ -859,7 +860,9 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   closes its FD table outside `ACTIVE_PROCS` (releasing `flock` and POSIX
   record locks), and tears down all VMAs, `pinned_pages` (sweeping `PTE_DIRTY`
   and decrementing `writable_maps` on `WRITABLE | PTE_SHARED` leaves, then
-  dropping `Arc<CachePage>` pins), and user page-table mappings (walking L4
+  dropping `Arc<CachePage>` pins; the earlier switch to `kernel_root()` is
+  the unmap order's flush step, since no CPU can still store through the
+  process's entries), and user page-table mappings (walking L4
   entries 0–255, freeing **only** non-`PTE_SHARED` leaf frames—decrementing
   refcounts from M8 onward—and user L1/L2/L3 tables). Removed `mapped_files`
   `Arc<VfsInode>` entries (from `teardown()`, `munmap()`, or `MAP_FIXED`
@@ -870,8 +873,9 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   run inside `sched::finish_switch` with interrupts off once no CPU holds its
   `CR3`) runs lock-free: if `!torn_down` (error rollback or ktest), its
   `destroy_user_root` sweep still skips `frame::free` on `PTE_SHARED` leaves
-  and propagates `PTE_DIRTY` + decrements `writable_maps` atomically before
-  dropping `pinned_pages`, and `VfsInode::drop` never takes a sleeping lock.
+  and propagates `PTE_DIRTY` + decrements `writable_maps` before dropping
+  `pinned_pages` (no CPU holding its `CR3` is the unmap order's flush
+  step), and `VfsInode::drop` never takes a sleeping lock.
   Kernel upper-half tables (256–511) are untouched.
 - **Lock ordering across VM and VFS (M7–M8):** Because `copy_from_user` and
   `copy_to_user` may fault into `#PF` → `AddressSpace` → `PageCache` →
@@ -4935,7 +4939,8 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
 - **Dirty and mapping tracking (race-free clear):** each `CachePage` carries an
   atomic `dirty: AtomicBool` and `writable_maps: AtomicU32` (exact count of
   `PRESENT | WRITABLE | PTE_SHARED` PTEs, section 5). Writeback treats a page
-  as dirty whenever `dirty || writable_maps > 0`. To avoid losing concurrent
+  as dirty whenever `writable_maps > 0 || dirty` (in that order: "Dirty
+  test order" below). To avoid losing concurrent
   stores during writeback, flushing clears `dirty` (`swap(false, AcqRel)`)
   **before** writing the page bytes to `ext4` (clamping the final page to
   `min(4096, file_size - page_off)`), and restores `dirty = true` on I/O error.
@@ -5034,12 +5039,13 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     `CachePage::copy_to_frame(&mut OwnedFrame, valid)` (the first `valid`
     bytes, zeros after), which needs no lock: a racing store leaves a mix
     of old and new bytes, as on Linux. `set_dirty`, `inc_writable_maps` and
-    `dec_writable_maps` stay crate-visible for the page-fault and unmap
-    paths (#255's next part).
+    `dec_writable_maps` are `pub` for now, for the page-fault and unmap
+    paths; that is temporary, until #255's next part puts them behind an
+    RAII guard and narrows them to `pub(super)`.
   - *Dirty test order:* `is_dirty` loads `writable_maps` (Acquire) before
-    `dirty`. Reclaim holds only Lock 5, which an unmap's
-    `dec_writable_maps` doesn't take, and may be preempted between the two
-    loads. Read the other way round, it could see `dirty` still clear, then
+    `dirty`. Reclaim (and `fsync`'s `collect_dirty`) holds Locks 4 and 5,
+    neither of which an unmap's `dec_writable_maps` takes, and may be
+    preempted between the two loads. Read the other way round, it could see `dirty` still clear, then
     the count already 0, and evict the page unwritten. The count's Acquire
     load synchronises with the decrement, so a count of 0 means the `dirty`
     set before the decrement is visible.
