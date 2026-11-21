@@ -361,6 +361,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-bcache"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-calc"
 version = "0.0.1"
 
@@ -421,6 +425,7 @@ dependencies = [
  "log",
  "lumen-acpi",
  "lumen-app-api",
+ "lumen-bcache",
  "lumen-demo",
  "lumen-elf",
  "lumen-font",

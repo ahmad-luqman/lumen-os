@@ -211,8 +211,10 @@ class QemuOptions:
     # driver (`make run SOUND=1`: `host_audio_driver()`). Not with
     # `sound_wav`.
     host_audio: str | None = None
-    # virtio-blk backed by this raw image (read-write).
+    # virtio-blk backed by this raw image (read-write unless `blk_readonly`).
     blk_image: Path | None = None
+    # Attach `blk_image` read-only (`readonly=on`).
+    blk_readonly: bool = False
     # virtio-net on user networking: guest TCP port -> host port forwarded
     # from the host's 127.0.0.1. None: no virtio-net; {}: no forwards.
     net_forwards: dict[int, int] | None = None
@@ -223,6 +225,8 @@ class QemuOptions:
     def __post_init__(self) -> None:
         if self.sound_wav and self.host_audio:
             raise ValueError("sound_wav and host_audio: one virtio-sound device, recorded or heard")
+        if self.blk_readonly and not self.blk_image:
+            raise ValueError("blk_readonly requires blk_image")
 
 
 # The 9p mount tag the device advertises (a guest driver mounts by it).
@@ -288,8 +292,9 @@ def device_args(o: QemuOptions) -> list[str]:
             "-device", f"virtio-sound-pci,id={ids['sound']},audiodev=lumen-audio,streams=1",
         ]  # fmt: skip
     if o.blk_image:
+        ro = ",readonly=on" if o.blk_readonly else ""
         args += [
-            "-drive", f"if=none,id=lumen-disk,format=raw,file={_opt(o.blk_image)}",
+            "-drive", f"if=none,id=lumen-disk,format=raw,file={_opt(o.blk_image)}{ro}",
             "-device", f"virtio-blk-pci,id={ids['blk']},drive=lumen-disk",
         ]  # fmt: skip
     if o.net_forwards is not None:
@@ -351,6 +356,8 @@ class Devices:
     # (QEMU takes a write lock on the image). Kept as an absolute path. Not
     # with `blk_mib`.
     blk_image: Path | None = None
+    # Attach the virtio-blk drive read-only (`readonly=on`); needs `blk_mib` or `blk_image`.
+    blk_readonly: bool = False
     # virtio-net on user networking (implied by `forward`).
     net: bool = False
     # Guest TCP ports reachable from the host, each on a free host port.
@@ -366,6 +373,8 @@ class Devices:
             raise ValueError(f"blk_mib={self.blk_mib!r}: expected a whole number of MiB above 0")
         if self.blk_image is not None:
             object.__setattr__(self, "blk_image", Path(self.blk_image).absolute())
+        if self.blk_readonly and not self.wants_blk:
+            raise ValueError("blk_readonly requires blk_mib or blk_image")
         if self.rng_rate is not None:
             rate = tuple(self.rng_rate)
             if len(rate) != 2 or not all(_is_int(v) and v > 0 for v in rate):
@@ -756,6 +765,7 @@ class Machine:
             virtio_rng_no_msix=d.rng_no_msix,
             sound_wav=self.wav_path if d.sound else None,
             blk_image=self.blk_image if d.wants_blk else None,
+            blk_readonly=d.blk_readonly,
             net_forwards=dict(self.forwards) if d.wants_net else None,
             share_dir=self.share_dir if d.share else None,
             extra=self.extra_args,

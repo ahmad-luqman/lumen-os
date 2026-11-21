@@ -191,6 +191,13 @@ def test_devices_come_before_extra_args():
             ],
         ),
         (
+            Devices(blk_image=Path("/keep/ro.img"), blk_readonly=True),
+            [
+                "-drive", "if=none,id=lumen-disk,format=raw,file=/keep/ro.img,readonly=on",
+                "-device", "virtio-blk-pci,id=lumen-blk,drive=lumen-disk",
+            ],
+        ),
+        (
             Devices(net=True),
             [
                 "-netdev", "user,id=lumen-net",
@@ -207,7 +214,7 @@ def test_devices_come_before_extra_args():
     ],
     ids=[
         "tablet", "keyboard", "rng", "rng_rate", "rng_no_msix", "sound", "blk_mib", "blk_image",
-        "net", "share",
+        "blk_readonly", "net", "share",
     ],
 )  # fmt: skip
 def test_one_device_attaches_exactly_its_own(tmp_path, devices, expected):
@@ -219,9 +226,9 @@ def test_one_device_attaches_exactly_its_own(tmp_path, devices, expected):
 def test_every_turns_every_device_on():
     every = Devices.every()
     for f in dataclasses.fields(Devices):
-        # blk_image: the alternative to blk_mib, which is on; rng_rate and
-        # rng_no_msix: changes to rng, which is on unlimited, with MSI-X.
-        if f.name in ("blk_image", "rng_rate", "rng_no_msix"):
+        # blk_image: the alternative to blk_mib, which is on; blk_readonly:
+        # read-only option on blk; rng_rate and rng_no_msix: changes to rng.
+        if f.name in ("blk_image", "blk_readonly", "rng_rate", "rng_no_msix"):
             continue
         assert getattr(every, f.name) != f.default, f.name
 
@@ -234,6 +241,7 @@ def test_every_turns_every_device_on():
         {"blk_mib": True},
         {"blk_mib": 1.5},
         {"blk_mib": 4, "blk_image": Path("/d.img")},
+        {"blk_readonly": True},
         {"forward": (80, 80)},
         {"forward": (0,)},
         {"forward": (65536,)},
