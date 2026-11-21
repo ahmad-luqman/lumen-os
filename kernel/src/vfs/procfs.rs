@@ -28,11 +28,12 @@ use super::page_cache;
 
 // The node kinds, their inode numbers and numeric names are host-tested in
 // `lumen_vfs::procfs`; what needs the live processes stays here.
+use log::warn;
 use lumen_vfs::procfs::{ProcFd, ProcKind, parse_canonical_u32};
 
 /// A `readdir` entry for `kind`, named `name`.
-fn dir_entry(kind: ProcKind, name: String) -> (u64, InodeType, String) {
-    (kind.ino(), kind.inode_type(), name)
+fn dir_entry(kind: ProcKind, name: impl Into<String>) -> (u64, InodeType, String) {
+    (kind.ino(), kind.inode_type(), name.into())
 }
 
 /// Whether the process (and, for an fd link, the fd) `kind` shows still
@@ -392,9 +393,7 @@ impl VfsInode for ProcfsInode {
                     "." => Ok(self.spawn(ProcKind::PidFdDir(pid)) as Arc<dyn VfsInode>),
                     ".." => Ok(self.spawn(ProcKind::PidDir(pid)) as Arc<dyn VfsInode>),
                     other => {
-                        let fd_u32 = parse_canonical_u32(other).ok_or(VfsError::NoEnt)?;
-                        let fd = i32::try_from(fd_u32).map_err(|_| VfsError::NoEnt)?;
-                        let fd = ProcFd::try_from(fd).map_err(|_| VfsError::NoEnt)?;
+                        let fd = ProcFd::parse(other).ok_or(VfsError::NoEnt)?;
                         if process::process_fd_target(pid, fd.get()).is_none() {
                             return Err(VfsError::NoEnt);
                         }
@@ -465,13 +464,13 @@ impl VfsInode for ProcfsInode {
         let mut entries: Vec<(u64, InodeType, String)> = Vec::new();
         match self.kind {
             ProcKind::Root => {
-                entries.push(dir_entry(ProcKind::Root, String::from(".")));
-                entries.push(dir_entry(ProcKind::Root, String::from("..")));
-                entries.push(dir_entry(ProcKind::Cpuinfo, String::from("cpuinfo")));
-                entries.push(dir_entry(ProcKind::Meminfo, String::from("meminfo")));
-                entries.push(dir_entry(ProcKind::Mounts, String::from("mounts")));
-                entries.push(dir_entry(ProcKind::SelfLink, String::from("self")));
-                entries.push(dir_entry(ProcKind::Version, String::from("version")));
+                entries.push(dir_entry(ProcKind::Root, "."));
+                entries.push(dir_entry(ProcKind::Root, ".."));
+                entries.push(dir_entry(ProcKind::Cpuinfo, "cpuinfo"));
+                entries.push(dir_entry(ProcKind::Meminfo, "meminfo"));
+                entries.push(dir_entry(ProcKind::Mounts, "mounts"));
+                entries.push(dir_entry(ProcKind::SelfLink, "self"));
+                entries.push(dir_entry(ProcKind::Version, "version"));
                 for pid in process::active_pids() {
                     entries.push(dir_entry(ProcKind::PidDir(pid), format!("{pid}")));
                 }
@@ -480,23 +479,27 @@ impl VfsInode for ProcfsInode {
                 if !Self::pid_exists(pid) {
                     return Err(VfsError::NoEnt);
                 }
-                entries.push(dir_entry(ProcKind::PidDir(pid), String::from(".")));
-                entries.push(dir_entry(ProcKind::Root, String::from("..")));
-                entries.push(dir_entry(ProcKind::PidExe(pid), String::from("exe")));
-                entries.push(dir_entry(ProcKind::PidFdDir(pid), String::from("fd")));
-                entries.push(dir_entry(ProcKind::PidMaps(pid), String::from("maps")));
-                entries.push(dir_entry(ProcKind::PidMounts(pid), String::from("mounts")));
+                entries.push(dir_entry(ProcKind::PidDir(pid), "."));
+                entries.push(dir_entry(ProcKind::Root, ".."));
+                entries.push(dir_entry(ProcKind::PidExe(pid), "exe"));
+                entries.push(dir_entry(ProcKind::PidFdDir(pid), "fd"));
+                entries.push(dir_entry(ProcKind::PidMaps(pid), "maps"));
+                entries.push(dir_entry(ProcKind::PidMounts(pid), "mounts"));
             }
             ProcKind::PidFdDir(pid) => {
                 if !Self::pid_exists(pid) {
                     return Err(VfsError::NoEnt);
                 }
-                entries.push(dir_entry(ProcKind::PidFdDir(pid), String::from(".")));
-                entries.push(dir_entry(ProcKind::PidDir(pid), String::from("..")));
+                entries.push(dir_entry(ProcKind::PidFdDir(pid), "."));
+                entries.push(dir_entry(ProcKind::PidDir(pid), ".."));
                 for fd in process::process_open_fds(pid) {
                     // The fd table keeps fds in `0..MAX_FDS`; one outside it
                     // couldn't be looked up either, so it isn't listed.
-                    let Ok(proc_fd) = ProcFd::try_from(fd) else { continue };
+                    let Ok(proc_fd) = ProcFd::try_from(fd) else {
+                        debug_assert!(false, "pid {pid} holds fd {fd}, outside 0..MAX_FDS");
+                        warn!(target: "procfs", "pid {pid} holds fd {fd}, outside 0..MAX_FDS: not listed");
+                        continue;
+                    };
                     entries.push(dir_entry(ProcKind::PidFdLink(pid, proc_fd), format!("{fd}")));
                 }
             }

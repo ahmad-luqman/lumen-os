@@ -50,7 +50,7 @@ const _: () = {
     assert!(MAX_FDS as u64 <= 0x1_0000 - TAG_PID_FD_BASE);
     assert!(TAG_PID_MOUNTS < TAG_PID_FD_BASE);
     // The fixed nodes are below every per-process one, and the largest
-    // per-process one is below a detached inode's tag bit.
+    // per-process one is below `DETACHED_INO_BIT`.
     assert!(INO_SELF < pid_ino(0, 0));
     assert!(pid_ino(u32::MAX, 0xffff) < DETACHED_INO_BIT);
 };
@@ -69,7 +69,8 @@ pub fn parse_canonical_u32(s: &str) -> Option<u32> {
 }
 
 /// An fd `/proc/<pid>/fd` can show: one in `0..MAX_FDS`, the range a
-/// process's fd table keeps. Made only by [`ProcFd::try_from`].
+/// process's fd table keeps. Made only by [`ProcFd::try_from`] (an fd) and
+/// [`ProcFd::parse`] (an fd's name).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcFd(u16);
 
@@ -77,12 +78,20 @@ pub struct ProcFd(u16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FdOutOfRange(pub i32);
 
+// Every fd in `0..MAX_FDS` fits the `u16`.
 const _: () = assert!(MAX_FDS <= u16::MAX as usize + 1);
 
 impl ProcFd {
     /// The fd.
     pub const fn get(self) -> i32 {
         self.0 as i32
+    }
+
+    /// The fd `name` names under `/proc/<pid>/fd`: a canonical number
+    /// ([`parse_canonical_u32`]) in `0..MAX_FDS`.
+    pub fn parse(name: &str) -> Option<Self> {
+        let fd = parse_canonical_u32(name)?;
+        if (fd as usize) < MAX_FDS { Some(Self(fd as u16)) } else { None }
     }
 }
 
@@ -267,6 +276,27 @@ mod tests {
         assert_eq!(ProcFd::try_from(i32::MIN), Err(FdOutOfRange(i32::MIN)));
         assert_eq!(ProcFd::try_from(0x1_0000), Err(FdOutOfRange(0x1_0000)));
         assert_eq!(ProcFd::try_from(i32::MAX), Err(FdOutOfRange(i32::MAX)));
+    }
+
+    #[test]
+    fn an_fd_name_parses_to_a_proc_fd_in_one_step() {
+        let last = MAX_FDS as i32 - 1;
+        assert_eq!(ProcFd::parse("0"), Some(fd(0)));
+        assert_eq!(ProcFd::parse("3"), Some(fd(3)));
+        assert_eq!(ProcFd::parse(&std::format!("{last}")), Some(fd(last)));
+        for name in [
+            &*std::format!("{MAX_FDS}"), // one past the last fd
+            "65536",                     // past the u16
+            "2147483648",                // past i32
+            "4294967295",                // u32::MAX
+            "4294967296",                // past u32
+            "",                          // empty
+            "03",                        // a leading zero
+            "+3",                        // a sign
+            "-1",                        // negative
+        ] {
+            assert_eq!(ProcFd::parse(name), None, "{name:?}");
+        }
     }
 
     #[test]
