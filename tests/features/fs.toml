@@ -50,6 +50,7 @@ tests = [
     "ktest:lumen_kernel::vfs::tests::vfs_boot_mounts_tmp_dev_proc_work",
     "ktest:lumen_kernel::vfs::tests::vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing",
     "ktest:lumen_kernel::vfs::tests::vfs_proc_checks_unregister_their_process_on_failure",
+    "ktest:lumen_kernel::vfs::tests::vfs_read_all_refuses_a_file_past_its_cap",
     "ktest:lumen_kernel::vfs::tests::vfs_sync_continues_past_a_failing_inode",
     "scenario:test_fs::test_dev_tmp_proc_filesystems",
     "scenario:test_fs::test_dev_urandom_refuses_when_unseeded",
