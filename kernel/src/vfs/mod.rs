@@ -1922,3 +1922,202 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn ext4_truncate_and_open_unlink_preserve_state_on_io_error() {
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use lumen_bcache::BlockCache;
+
+        let img = build_minimal_ext4_image_blocks(256);
+        let mem_dev = MemBlkDev::new(img, false);
+        let bcache_raw = BlockCache::new(mem_dev.clone(), 64).map_err(|_| "bcache init")?;
+        let fault_cache = Arc::new(FaultInjectBlockCache {
+            inner: SleepMutex::new(bcache_raw),
+            fail_reads: AtomicBool::new(false),
+            fail_writes: AtomicBool::new(false),
+        });
+        let bcache: Arc<dyn ext4::BlockCacheBackend> = Arc::clone(&fault_cache) as Arc<dyn ext4::BlockCacheBackend>;
+        let fs = ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, 15), false).map_err(|_| "ext4 mount")?;
+
+        let tables = KernelVfsTables::new();
+        tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+
+        // 1. truncate shrink under fail_reads and fail_writes preserves meta.size and dirty PageCache bytes.
+        let (tf, _) = open_inode(
+            &tables,
+            None,
+            b"/trunc_err.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create trunc_err.bin")?;
+        let mut payload_1 = vec![0u8; 2 * 4096];
+        let mut payload_2 = vec![0u8; 2 * 4096];
+        for i in 0..payload_1.len() {
+            payload_1[i] = ((i * 19) ^ 0x5A) as u8;
+            payload_2[i] = ((i * 41) ^ 0xC3) as u8;
+        }
+        kassert_eq!(tf.write_at(0, &payload_1).map_err(|_| "write payload_1")?, payload_1.len());
+
+        fault_cache.fail_reads.store(true, Ordering::Release);
+        kassert!(matches!(tf.truncate(100), Err(VfsError::Io)));
+        kassert_eq!(tf.stat().map_err(|_| "stat after read err")?.size, 8192);
+        kassert_eq!(read_all_inode(&tf).map_err(|_| "read after trunc read err")?, payload_1);
+        fault_cache.fail_reads.store(false, Ordering::Release);
+
+        tf.sync(false).map_err(|_| "sync payload_1")?;
+        kassert_eq!(tf.write_at(0, &payload_2).map_err(|_| "write payload_2")?, payload_2.len());
+        fault_cache.fail_writes.store(true, Ordering::Release);
+        kassert!(matches!(tf.truncate(100), Err(VfsError::Io)));
+        kassert_eq!(tf.stat().map_err(|_| "stat after write err")?.size, 8192);
+        kassert_eq!(read_all_inode(&tf).map_err(|_| "read after trunc write err")?, payload_2);
+        fault_cache.fail_writes.store(false, Ordering::Release);
+
+        tf.truncate(100).map_err(|_| "retry truncate shrink")?;
+        kassert_eq!(tf.stat().map_err(|_| "stat after shrink")?.size, 100);
+        kassert_eq!(read_all_inode(&tf).map_err(|_| "read after shrink")?, payload_2[..100]);
+
+        fault_cache.fail_reads.store(true, Ordering::Release);
+        kassert!(matches!(tf.truncate(200), Err(VfsError::Io)));
+        kassert_eq!(tf.stat().map_err(|_| "stat after extend err")?.size, 100);
+        fault_cache.fail_reads.store(false, Ordering::Release);
+
+        tf.truncate(200).map_err(|_| "retry truncate extend")?;
+        let extended = read_all_inode(&tf).map_err(|_| "read after extend")?;
+        kassert_eq!(extended.len(), 200);
+        kassert_eq!(&extended[..100], &payload_2[..100]);
+        kassert!(extended[100..200].iter().all(|&b| b == 0));
+        tf.truncate(100).map_err(|_| "final shrink 100")?;
+        tf.sync(false).map_err(|_| "sync trunc_err")?;
+        drop(tf);
+
+        // 2. unlink on open file (open_count > 0, nlink == 1) under disk I/O error preserves
+        //    nlink == 1, live_inodes/path lookup, meta_dirty/dirty contents, and DETACHED_QUOTA.
+        let (uf, _) = open_inode(
+            &tables,
+            None,
+            b"/open_unlink_err.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create open_unlink_err.bin")?;
+        kassert_eq!(uf.write_at(0, &payload_1).map_err(|_| "write u_payload")?, payload_1.len());
+        uf.sync(false).map_err(|_| "sync u_payload")?;
+        let u_ext4 = fs.lookup_live_by_lock_id(uf.lock_id()).ok_or("lookup live u_ext4")?;
+        kassert_eq!(u_ext4.reclaim_clean_pages(16), 2);
+        kassert_eq!(uf.write_at(8192, b"EXTRA").map_err(|_| "write extra tail")?, 5);
+
+        let ug = OpenGuard::new(Arc::clone(&uf));
+        let orig_ino = uf.ino();
+        let quota_before = page_cache::DETACHED_QUOTA.used_pages();
+        let detached_before = page_cache::detached_cached_pages();
+        let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
+
+        fault_cache.fail_writes.store(true, Ordering::Release);
+        kassert!(matches!(unlink_at(&tables, None, b"/open_unlink_err.bin", false), Err(VfsError::Io)));
+        kassert!(!uf.is_detached());
+        kassert_eq!(uf.ino(), orig_ino);
+        kassert_eq!(uf.stat().map_err(|_| "stat after unlink err")?.nlink, 1);
+        kassert!(fs.lookup_live_by_lock_id(uf.lock_id()).is_some());
+        kassert_eq!(
+            resolve_path(&tables, None, b"/open_unlink_err.bin", rf).map_err(|_| "still linked")?.inode.ino(),
+            orig_ino
+        );
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+        kassert_eq!(page_cache::detached_cached_pages(), detached_before);
+        kassert_eq!(u_ext4.reclaim_clean_pages(16), 0);
+        let mut expected_u = payload_1.clone();
+        expected_u.extend_from_slice(b"EXTRA");
+        kassert_eq!(read_all_inode(&uf).map_err(|_| "read after failed unlink")?, expected_u);
+        fault_cache.fail_writes.store(false, Ordering::Release);
+
+        // meta_dirty must still be true so fdatasync (sync(true)) writes page 2 and updates size.
+        uf.sync(true).map_err(|_| "sync(true) preserves meta_dirty")?;
+        unlink_at(&tables, None, b"/open_unlink_err.bin", false).map_err(|_| "retry open unlink")?;
+        kassert!(uf.is_detached());
+        kassert_ne_u64(uf.ino(), orig_ino)?;
+        kassert_eq!(uf.stat().map_err(|_| "stat detached")?.nlink, 0);
+        kassert!(fs.lookup_live_by_lock_id(uf.lock_id()).is_none());
+        kassert!(matches!(resolve_path(&tables, None, b"/open_unlink_err.bin", rf), Err(VfsError::NoEnt)));
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before + 3);
+        kassert_eq!(read_all_inode(&uf).map_err(|_| "read detached after unlink")?, expected_u);
+        drop(u_ext4);
+        drop(ug);
+        drop(uf);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+        kassert_eq!(page_cache::detached_cached_pages(), detached_before);
+
+        // 3. rmdir and rename overwrite on open targets under fail_writes preserve live state.
+        let dir_ino = mkdir_at(&tables, None, b"/open_rmdir", 0o755, 0).map_err(|_| "mkdir open_rmdir")?;
+        let dg = OpenGuard::new(Arc::clone(&dir_ino));
+        fault_cache.fail_writes.store(true, Ordering::Release);
+        kassert!(matches!(unlink_at(&tables, None, b"/open_rmdir", true), Err(VfsError::Io)));
+        kassert!(!dir_ino.is_detached());
+        kassert_eq!(dir_ino.stat().map_err(|_| "stat open_rmdir")?.nlink, 2);
+        kassert!(fs.lookup_live_by_lock_id(dir_ino.lock_id()).is_some());
+        fault_cache.fail_writes.store(false, Ordering::Release);
+        unlink_at(&tables, None, b"/open_rmdir", true).map_err(|_| "retry open rmdir")?;
+        kassert!(dir_ino.is_detached());
+        kassert_eq!(dir_ino.stat().map_err(|_| "stat detached rmdir")?.nlink, 0);
+        drop(dg);
+        drop(dir_ino);
+
+        let (rsrc, _) = open_inode(
+            &tables,
+            None,
+            b"/ren_src.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create ren_src")?;
+        kassert_eq!(rsrc.write_at(0, b"NEW").map_err(|_| "write ren_src")?, 3);
+        drop(rsrc);
+        let (rdst, _) = open_inode(
+            &tables,
+            None,
+            b"/ren_dst.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create ren_dst")?;
+        kassert_eq!(rdst.write_at(0, b"OLD").map_err(|_| "write ren_dst")?, 3);
+        let rg = OpenGuard::new(Arc::clone(&rdst));
+        fault_cache.fail_writes.store(true, Ordering::Release);
+        kassert!(matches!(
+            rename_at2(&tables, None, b"/ren_src.bin", None, b"/ren_dst.bin", RenameFlags::default()),
+            Err(VfsError::Io)
+        ));
+        kassert!(!rdst.is_detached());
+        kassert_eq!(rdst.stat().map_err(|_| "stat ren_dst")?.nlink, 1);
+        kassert!(fs.lookup_live_by_lock_id(rdst.lock_id()).is_some());
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+        fault_cache.fail_writes.store(false, Ordering::Release);
+        rename_at2(&tables, None, b"/ren_src.bin", None, b"/ren_dst.bin", RenameFlags::default())
+            .map_err(|_| "retry rename overwrite")?;
+        kassert!(rdst.is_detached());
+        kassert_eq!(rdst.stat().map_err(|_| "stat detached ren_dst")?.nlink, 0);
+        kassert_eq!(read_all_inode(&rdst).map_err(|_| "read detached ren_dst")?, b"OLD");
+        drop(rg);
+        drop(rdst);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+
+        // 4. Verify persisted truncated prefix and renamed file on fresh RO mount.
+        fs.sync().map_err(|_| "final fs.sync")?;
+        let ro_dev = MemBlkDev::new(mem_dev.0.data.lock().clone(), true);
+        let ro_bcache: Arc<dyn ext4::BlockCacheBackend> =
+            Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache")?));
+        let ro_fs = ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 16), true).map_err(|_| "ro mount")?;
+        let ro_root = ro_fs.root_inode();
+        let ro_trunc = ro_root.lookup("trunc_err.bin").map_err(|_| "ro lookup trunc_err")?;
+        kassert_eq!(read_all_inode(&ro_trunc).map_err(|_| "ro read trunc_err")?, payload_2[..100]);
+        let ro_ren = ro_root.lookup("ren_dst.bin").map_err(|_| "ro lookup ren_dst")?;
+        kassert_eq!(read_all_inode(&ro_ren).map_err(|_| "ro read ren_dst")?, b"NEW");
+
+        Ok(())
+    }
+);

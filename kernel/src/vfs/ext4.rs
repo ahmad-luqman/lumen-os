@@ -580,20 +580,27 @@ impl Ext4Inode {
         Ok(disk)
     }
 
-    /// Gate 6 detach-while-open: fault non-hole pages into `PageCache` (checked
-    /// against `DETACHED_QUOTA` before touching `ext4`), remove from `live_inodes`,
-    /// assign synthetic high-bit `ino`, and mark `detached = true` (`nlink = 0`).
+    /// Phase 1 of Gate 6 detach-while-open: fault non-hole pages (or symlink
+    /// target bytes) and reserve `DETACHED_QUOTA` WITHOUT mutating `detached`,
+    /// `nlink`, `meta_dirty`, `live_inodes`, or `PageCache` ownership yet.
     ///
-    /// Caller holds Lock 3 and ordered Lock 4 on `target` (`meta_guard`).
-    fn detach_while_open(target: &Arc<Ext4Inode>, meta_guard: &mut Ext4InodeMeta) -> Result<(), VfsError> {
+    /// If the subsequent disk unlink/rmdir/rename fails, dropping the returned
+    /// `PreparedDetach` automatically releases the `DETACHED_QUOTA` reservation.
+    ///
+    /// Caller holds Lock 3 and ordered Lock 4 on `target` (`_meta_guard`).
+    fn prepare_detach<'a>(
+        target: &'a Arc<Ext4Inode>,
+        meta_guard: &Ext4InodeMeta,
+    ) -> Result<Option<PreparedDetach<'a>>, VfsError> {
         if target.is_detached() {
-            return Ok(());
+            return Ok(None);
         }
-        match target.inode_type {
+        let payload = match target.inode_type {
             InodeType::File => {
-                let mut pages = target.pages.lock();
+                let pages = target.pages.lock();
+                let expected_existing_pages = pages.len();
                 let mut quota_guard = DetachedQuotaGuard::new();
-                quota_guard.try_reserve(pages.len())?;
+                quota_guard.try_reserve(expected_existing_pages)?;
 
                 let file_size = meta_guard.size;
                 let mut faulted: Vec<(u64, Arc<CachePage>)> = Vec::new();
@@ -640,8 +647,7 @@ impl Ext4Inode {
                         }
                     }
                 }
-                pages.commit_detached(faulted);
-                quota_guard.commit();
+                PreparedDetachPayload::File { expected_existing_pages, faulted, quota_guard }
             }
             InodeType::Symlink => {
                 let inner = target.shared.state.lock();
@@ -651,21 +657,53 @@ impl Ext4Inode {
                 } else {
                     inner.ext4.read_inode_file(&disk).map_err(map_ext4_err)?
                 };
+                PreparedDetachPayload::Symlink { target_bytes }
+            }
+            _ => PreparedDetachPayload::Other,
+        };
+        Ok(Some(PreparedDetach { target, payload }))
+    }
+
+    /// Phase 3 (infallible) of Gate 6 detach-while-open: commit `PageCache`
+    /// ownership, remove from `live_inodes`, assign synthetic high-bit `ino`,
+    /// and mark `detached = true` (`nlink = 0`, `meta_dirty = false`) AFTER
+    /// the disk unlink/rmdir/rename succeeds.
+    ///
+    /// Caller holds Lock 3 and ordered Lock 4 on `prepared.target` (`meta_guard`).
+    fn commit_detach(prepared: PreparedDetach<'_>, meta_guard: &mut Ext4InodeMeta) {
+        match prepared.payload {
+            PreparedDetachPayload::File { expected_existing_pages, faulted, quota_guard } => {
+                let mut pages = prepared.target.pages.lock();
+                debug_assert_eq!(pages.len(), expected_existing_pages);
+                pages.commit_detached(faulted);
+                quota_guard.commit();
+            }
+            PreparedDetachPayload::Symlink { target_bytes } => {
                 meta_guard.detached_symlink_target = target_bytes;
             }
-            _ => {}
+            PreparedDetachPayload::Other => {}
         }
 
         {
-            let mut inner = target.shared.state.lock();
-            inner.live_inodes.remove(&target.disk_ino);
+            let mut inner = prepared.target.shared.state.lock();
+            inner.live_inodes.remove(&prepared.target.disk_ino);
         }
-        target.detached.store(true, Ordering::Release);
-        target.ino.store(next_detached_ino(), Ordering::Release);
+        prepared.target.detached.store(true, Ordering::Release);
+        prepared.target.ino.store(next_detached_ino(), Ordering::Release);
         meta_guard.nlink = 0;
         meta_guard.meta_dirty = false;
-        Ok(())
     }
+}
+
+enum PreparedDetachPayload {
+    File { expected_existing_pages: usize, faulted: Vec<(u64, Arc<CachePage>)>, quota_guard: DetachedQuotaGuard },
+    Symlink { target_bytes: Vec<u8> },
+    Other,
+}
+
+struct PreparedDetach<'a> {
+    target: &'a Arc<Ext4Inode>,
+    payload: PreparedDetachPayload,
 }
 
 struct LockedInode<'a> {
@@ -938,10 +976,12 @@ impl VfsInode for Ext4Inode {
         if child_arc.is_detached() || child_nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if child_nlink <= 1 && child_arc.open_count() > 0 {
+        let prepared_detach = if child_nlink <= 1 && child_arc.open_count() > 0 {
             let child_meta = find_guard_mut(&mut guards, &child_arc);
-            Self::detach_while_open(&child_arc, child_meta)?;
-        }
+            Self::prepare_detach(&child_arc, child_meta)?
+        } else {
+            None
+        };
 
         {
             let mut inner = self.shared.state.lock();
@@ -955,7 +995,9 @@ impl VfsInode for Ext4Inode {
         }
 
         let child_meta = find_guard_mut(&mut guards, &child_arc);
-        if !child_arc.is_detached() {
+        if let Some(prepared) = prepared_detach {
+            Self::commit_detach(prepared, child_meta);
+        } else if !child_arc.is_detached() {
             child_meta.nlink = child_meta.nlink.saturating_sub(1);
             child_meta.ctime = now_ts;
             if child_meta.nlink > 0 {
@@ -1022,10 +1064,12 @@ impl VfsInode for Ext4Inode {
             }
         }
 
-        if child_arc.open_count() > 0 {
+        let prepared_detach = if child_arc.open_count() > 0 {
             let child_meta = find_guard_mut(&mut guards, &child_arc);
-            Self::detach_while_open(&child_arc, child_meta)?;
-        }
+            Self::prepare_detach(&child_arc, child_meta)?
+        } else {
+            None
+        };
 
         {
             let mut inner = self.shared.state.lock();
@@ -1046,7 +1090,11 @@ impl VfsInode for Ext4Inode {
 
         let now_ts = duration_to_timespec(realtime_duration());
         let child_meta = find_guard_mut(&mut guards, &child_arc);
-        child_meta.nlink = 0;
+        if let Some(prepared) = prepared_detach {
+            Self::commit_detach(prepared, child_meta);
+        } else {
+            child_meta.nlink = 0;
+        }
         let self_meta = find_guard_mut(&mut guards, &self_arc);
         self_meta.nlink = self_meta.nlink.saturating_sub(1);
         self_meta.mtime = now_ts;
@@ -1428,10 +1476,12 @@ impl VfsInode for Ext4Inode {
         if let Some(ref new_child_arc) = new_child_opt {
             let new_is_dir = new_child_arc.inode_type == InodeType::Dir;
             let new_nlink = find_guard_mut(&mut guards, new_child_arc).nlink;
-            if (new_is_dir || new_nlink <= 1) && new_child_arc.open_count() > 0 {
+            let prepared_detach = if (new_is_dir || new_nlink <= 1) && new_child_arc.open_count() > 0 {
                 let nc_meta = find_guard_mut(&mut guards, new_child_arc);
-                Self::detach_while_open(new_child_arc, nc_meta)?;
-            }
+                Self::prepare_detach(new_child_arc, nc_meta)?
+            } else {
+                None
+            };
 
             {
                 let mut inner = self.shared.state.lock();
@@ -1463,6 +1513,10 @@ impl VfsInode for Ext4Inode {
                 }
             }
 
+            if let Some(prepared) = prepared_detach {
+                let nc_meta = find_guard_mut(&mut guards, new_child_arc);
+                Self::commit_detach(prepared, nc_meta);
+            }
             if new_is_dir {
                 find_guard_mut(&mut guards, new_child_arc).nlink = 0;
                 find_guard_mut(&mut guards, &new_dir_arc).nlink =
@@ -1583,17 +1637,7 @@ impl VfsInode for Ext4Inode {
         let old_size = meta.size;
 
         if new_size < old_size {
-            pages.remove_from(new_size.div_ceil(PAGE_SIZE as u64));
             let tail_rem = (new_size % PAGE_SIZE as u64) as usize;
-            if tail_rem != 0 {
-                let tail_page = new_size / PAGE_SIZE as u64;
-                if let Some(page) = pages.get(tail_page) {
-                    page.zero_range(tail_rem, PAGE_SIZE);
-                    if !detached {
-                        page.set_dirty();
-                    }
-                }
-            }
             if !detached {
                 let inner = self.shared.state.lock();
                 let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
@@ -1615,8 +1659,24 @@ impl VfsInode for Ext4Inode {
                 ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
                 meta.blocks_512 = disk.blocks();
             }
+            pages.remove_from(new_size.div_ceil(PAGE_SIZE as u64));
+            if tail_rem != 0 {
+                let tail_page = new_size / PAGE_SIZE as u64;
+                if let Some(page) = pages.get(tail_page) {
+                    page.zero_range(tail_rem, PAGE_SIZE);
+                    if !detached {
+                        page.set_dirty();
+                    }
+                }
+            }
         } else if new_size > old_size {
             let tail_rem = (old_size % PAGE_SIZE as u64) as usize;
+            if !detached {
+                let inner = self.shared.state.lock();
+                let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
+                meta.blocks_512 = disk.blocks();
+            }
             if tail_rem != 0 {
                 let tail_page = old_size / PAGE_SIZE as u64;
                 if let Some(page) = pages.get(tail_page) {
@@ -1625,12 +1685,6 @@ impl VfsInode for Ext4Inode {
                         page.set_dirty();
                     }
                 }
-            }
-            if !detached {
-                let inner = self.shared.state.lock();
-                let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
-                meta.blocks_512 = disk.blocks();
             }
         }
 

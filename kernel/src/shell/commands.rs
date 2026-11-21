@@ -297,6 +297,7 @@ pub static COMMANDS: Table<Run> = Table(&[
         args: &[&[
             "stat",
             "cat",
+            "read",
             "write",
             "write-pattern",
             "verify-pattern",
