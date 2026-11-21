@@ -81,7 +81,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Page-cache pages for mmap (#255): vfs::mmap_page hands out an ext4 or tmpfs file's own cached page (read from disk, a hole in a linked ext4 file as zeros, a failed read Io and logged once per streak; a zero page for a hole in a tmpfs or detached ext4 file, from its quota, NoSpc once that is used up; the same page again; NoSpc for a new page of a linked ext4 file at the hard limit, which detached files are exempt from; Range past EOF, NoEnt for an unlinked ext4 file nobody has open, NoDev for directories, symlinks and other filesystems), CachePage::copy_to_frame for copy-on-write, and the last writable unmap leaving the page dirty so its stores reach the disk, including with an unmap between is_dirty's two loads (a test hook) (#266)"
+name = "Page-cache pages for mmap (#255): vfs::mmap_page hands out an ext4 or tmpfs file's own cached page (read from disk, a hole in a linked ext4 file as zeros, a failed read Io and logged once per streak; a zero page for a hole in a tmpfs or detached ext4 file, from its quota, NoSpc once that is used up; the same page again; NoSpc for a new page of a linked ext4 file at the hard limit, which detached files are exempt from; Range past EOF, NoEnt for an unlinked ext4 file nobody has open, NoDev for directories, symlinks and other filesystems), MappedPage::copy_to_frame for copy-on-write, under the owning inode's page-cache lock, and the last writable unmap leaving the page dirty so its stores reach the disk, including with an unmap between is_dirty's two loads (a test hook) (#266)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_mmap_page_hands_out_the_cached_page_filled_from_disk",
@@ -92,5 +92,5 @@ tests = [
     "ktest:lumen_kernel::vfs::page_cache::is_dirty_sees_an_unmap_landing_between_its_loads",
     "ktest:lumen_kernel::vfs::tmpfs::tmpfs_mmap_page_hands_out_the_cached_page",
     "ktest:lumen_kernel::vfs::page_cache::mmap_page_refuses_inodes_of_other_filesystems",
-    "ktest:lumen_kernel::vfs::page_cache::cache_page_copies_to_a_frame_zeroing_past_valid",
+    "ktest:lumen_kernel::vfs::page_cache::mapped_page_copies_to_a_frame_under_the_cache_lock",
 ]

@@ -348,7 +348,7 @@ one is its own PR that updates that doc first.
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
   64 MiB hard cap, `QuotaCounter`, the detached-inode quota; `mmap_page`,
   re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
-  for a mapping, through `VfsInode::as_any`, and `CachePage::copy_to_frame`
+  for a mapping, through `VfsInode::as_any`, and `MappedPage::copy_to_frame` (under the cache lock)
   for copy-on-write, #255; the last writable unmap leaving a page dirty,
   #266); `vfs/ext4.rs`
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,

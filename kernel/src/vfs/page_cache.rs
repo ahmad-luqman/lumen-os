@@ -4,11 +4,12 @@
 //! accessed through the HHDM with raw pointers, so no `&mut [u8]` to the
 //! frame ever exists. Raw pointers avoid reference aliasing, not data races:
 //! kernel readers and writers of a published page are serialized by the
-//! owning inode's `PageCache` lock (Lock 5). A `MAP_SHARED` user mapping
-//! (#255, through [`mmap_page`]) writes the frame without that lock, as a
-//! copy-on-write split reads it ([`CachePage::copy_to_frame`]); such a store racing a
-//! kernel copy is accepted as it is on Linux (the bytes read are some mix of
-//! old and new, nothing else). `CachePage::drop` and `PageCache::drop` take
+//! owning inode's `PageCache` lock (Lock 5), including a copy-on-write
+//! split's copy ([`MappedPage::copy_to_frame`] takes it). A `MAP_SHARED`
+//! user mapping (#255, through [`mmap_page`]) writes the frame from ring 3
+//! without that lock: those are hardware stores outside Rust's memory model,
+//! and a kernel copy racing one reads some mix of old and new bytes, as on
+//! Linux. Kernel accesses never race each other. `CachePage::drop` and `PageCache::drop` take
 //! no sleeping lock (`OwnedFrame::drop` takes only Lock 10, the `frame`
 //! `SpinLock`); the one exception is a quota over-release, a bug elsewhere,
 //! whose `error!` takes the log's leaf lock.
@@ -24,6 +25,7 @@ use lumen_vfs::{VfsError, VfsInode};
 use crate::arch;
 use crate::mm;
 use crate::mm::frame::{self, OwnedFrame};
+use crate::sync::SleepMutex;
 
 pub const PAGE_SIZE: usize = 4096;
 
@@ -376,22 +378,23 @@ impl CachePage {
     /// `dst`: a `MAP_PRIVATE` copy-on-write split, where `valid` is what
     /// lies below the file's size (`PAGE_SIZE` for a page wholly inside it).
     ///
-    /// The byte accessors are `vfs`-private and need the page's Lock 5, so
-    /// `mm` can't name them; this is its one way to copy a page's bytes (it
-    /// maps a page zero-copy through [`phys_frame`](Self::phys_frame)), and
-    /// it needs no lock. A kernel `write_at` or a `MAP_SHARED` store racing the
-    /// copy leaves some mix of old and new bytes in `dst`, as on Linux (see
-    /// the module's comment); nothing else can go wrong, since the caller
-    /// owns `dst`.
+    /// Lock 5 contract, as for [`read_bytes`](Self::read_bytes): the caller
+    /// holds the owning inode's `PageCache` lock, so no kernel `write_at`
+    /// writes the page meanwhile. Outside `vfs`,
+    /// [`MappedPage::copy_to_frame`] takes that lock and calls this. A
+    /// `MAP_SHARED` store from ring 3 racing the copy is a hardware write
+    /// outside Rust's memory model and leaves some mix of old and new bytes
+    /// in `dst`, as on Linux.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
-    pub(crate) fn copy_to_frame(&self, dst: &mut OwnedFrame, valid: usize) {
+    pub(super) fn copy_to_frame(&self, dst: &mut OwnedFrame, valid: usize) {
         let valid = valid.min(PAGE_SIZE);
         let dst_ptr = mm::phys_to_virt(dst.frame().start()).as_mut_ptr::<u8>();
         // SAFETY: both frames are allocated 4 KiB RAM frames mapped RW through
         // the HHDM and alive for the borrows; they are distinct (`dst` is the
         // caller's, `self.frame` this page's), so the ranges don't overlap,
         // and `valid <= PAGE_SIZE`. `&mut OwnedFrame` means nothing else uses
-        // `dst`'s frame.
+        // `dst`'s frame. Kernel writers of this page are excluded by the
+        // owning inode's Lock 5, which the caller holds.
         unsafe {
             core::ptr::copy_nonoverlapping(self.hhdm_ptr(), dst_ptr, valid);
             core::ptr::write_bytes(dst_ptr.add(valid), 0, PAGE_SIZE - valid);
@@ -405,13 +408,36 @@ impl CachePage {
 pub(crate) struct MappedPage {
     page: Arc<CachePage>,
     file_size: u64,
+    /// The inode whose cache holds `page`: an `ext4` or `tmpfs` inode, as
+    /// [`mmap_page`] checked, for [`Self::copy_to_frame`]'s lock.
+    owner: Arc<dyn VfsInode>,
 }
 
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
 impl MappedPage {
-    /// What a filesystem's side of [`mmap_page`] hands back.
-    pub(super) fn new(page: Arc<CachePage>, file_size: u64) -> Self {
-        Self { page, file_size }
+    /// Only [`mmap_page`] makes one, once `owner` has downcast to an `ext4`
+    /// or `tmpfs` inode.
+    fn new(page: Arc<CachePage>, file_size: u64, owner: Arc<dyn VfsInode>) -> Self {
+        Self { page, file_size, owner }
+    }
+
+    /// Copy the page's first `valid` bytes into `dst` and zero the rest of
+    /// `dst`: a `MAP_PRIVATE` copy-on-write split, where `valid` is what
+    /// lies below the file's size (`PAGE_SIZE` for a page wholly inside it).
+    ///
+    /// The copy holds the owning inode's Lock 5, as the kernel's writers of
+    /// the page (`write_at`, truncate's zeroing) do, so no kernel write
+    /// races it. A `MAP_SHARED` store from ring 3 is a hardware write
+    /// outside Rust's memory model; one racing the copy leaves some mix of
+    /// old and new bytes in `dst`, as on Linux. Lock order: the caller may
+    /// hold Lock 1 (`AddressSpace::inner`, as the fault path does) or Lock 2,
+    /// nothing numbered 3 or higher, and no `SpinLock`. This is `mm`'s one
+    /// way to copy a page's bytes; it maps a page zero-copy through
+    /// [`CachePage::phys_frame`].
+    pub(crate) fn copy_to_frame(&self, dst: &mut OwnedFrame, valid: usize) {
+        let lock = page_cache_lock(&*self.owner).expect("a MappedPage's owner is an ext4 or tmpfs inode");
+        let _cache = lock.lock();
+        self.page.copy_to_frame(dst, valid);
     }
 
     /// The inode's cached page itself (not a copy). Holding the `Arc` (a
@@ -475,13 +501,23 @@ impl MappedPage {
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
 pub(crate) fn mmap_page(inode: &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError> {
     let any = inode.as_any().ok_or(VfsError::NoDev)?;
+    let (page, file_size) = if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
+        ext4.mmap_page(index)?
+    } else if let Some(tmpfs) = any.downcast_ref::<super::tmpfs::TmpfsInode>() {
+        tmpfs.mmap_page(index)?
+    } else {
+        return Err(VfsError::NoDev);
+    };
+    Ok(MappedPage::new(page, file_size, Arc::clone(inode)))
+}
+
+/// The `PageCache` lock (Lock 5) of an `ext4` or `tmpfs` inode.
+fn page_cache_lock(inode: &dyn VfsInode) -> Option<&SleepMutex<PageCache>> {
+    let any = inode.as_any()?;
     if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
-        return ext4.mmap_page(index);
+        return Some(ext4.page_cache_lock());
     }
-    if let Some(tmpfs) = any.downcast_ref::<super::tmpfs::TmpfsInode>() {
-        return tmpfs.mmap_page(index);
-    }
-    Err(VfsError::NoDev)
+    any.downcast_ref::<super::tmpfs::TmpfsInode>().map(super::tmpfs::TmpfsInode::page_cache_lock)
 }
 
 /// `Range` unless page `index` starts below `file_size` (an overflowing
@@ -838,13 +874,20 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn cache_page_copies_to_a_frame_zeroing_past_valid() {
-        // `copy_to_frame` (a copy-on-write split): the page's first `valid`
-        // bytes, zeros after them, whatever the frame held before.
-        use crate::kassert;
-        let page = CachePage::new_zeroed().ok_or("frame")?;
+    fn mapped_page_copies_to_a_frame_under_the_cache_lock() {
+        // `MappedPage::copy_to_frame` (a copy-on-write split): the page's
+        // first `valid` bytes, zeros after them, whatever the frame held
+        // before; and the copy holds the owning inode's Lock 5, as the
+        // kernel's writers of the page do: while another thread holds that
+        // lock, a copy started meanwhile waits.
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::AtomicU8;
+        use lumen_vfs::{DevId, FileSystem};
+        let fs = super::tmpfs::Tmpfs::new(DevId::makedev(0, 128), 4 * PAGE_SIZE);
+        let f = fs.root_inode().create("cow.bin", 0o644).map_err(|_| "create")?;
         let bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8 | 1).collect();
-        page.write_bytes(0, &bytes);
+        kassert_eq!(f.write_at(0, &bytes).map_err(|_| "write")?, PAGE_SIZE);
+        let mapped = mmap_page(&f, 0).map_err(|_| "map")?;
         let mut dst = frame::alloc_owned().ok_or("dst frame")?;
         let dst_ptr = mm::phys_to_virt(dst.frame().start()).as_mut_ptr::<u8>();
         let read_dst = |out: &mut [u8; PAGE_SIZE]| {
@@ -854,14 +897,40 @@ crate::ktest!(
         };
         // SAFETY: as above; filling it with junk first.
         unsafe { core::ptr::write_bytes(dst_ptr, 0xa5, PAGE_SIZE) };
-        page.copy_to_frame(&mut dst, 1000);
+        mapped.copy_to_frame(&mut dst, 1000);
         let mut got = [0u8; PAGE_SIZE];
         read_dst(&mut got);
         kassert!(got[..1000] == bytes[..1000]);
         kassert!(got[1000..].iter().all(|&b| b == 0));
-        page.copy_to_frame(&mut dst, PAGE_SIZE);
+        mapped.copy_to_frame(&mut dst, PAGE_SIZE);
         read_dst(&mut got);
         kassert!(got[..] == bytes[..]);
+
+        // Hold the cache's lock, start a copy in a thread on this CPU, and
+        // let it run: it must still be waiting when the lock is let go.
+        let tmpfs = f.as_any().and_then(|a| a.downcast_ref::<super::tmpfs::TmpfsInode>()).ok_or("not tmpfs")?;
+        let state = Arc::new(AtomicU8::new(0)); // 1: copying, 2: copied
+        let held = tmpfs.page_cache_lock().lock();
+        let (st, mut dst2) = (Arc::clone(&state), frame::alloc_owned().ok_or("dst frame 2")?);
+        let copier = crate::sched::spawn("ktest-cow-copy", move || {
+            st.store(1, Ordering::Release);
+            mapped.copy_to_frame(&mut dst2, PAGE_SIZE);
+            st.store(2, Ordering::Release);
+        })
+        .map_err(|_| "spawn")?;
+        for _ in 0..100_000 {
+            if state.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            crate::sched::yield_now();
+        }
+        let slept = crate::sched::sleep(20_000_000); // time to finish, were it not waiting
+        let while_held = state.load(Ordering::Acquire);
+        drop(held);
+        copier.join();
+        kassert!(slept);
+        kassert_eq!(while_held, 1); // started, and waiting for the lock
+        kassert_eq!(state.load(Ordering::Acquire), 2);
         Ok(())
     }
 );

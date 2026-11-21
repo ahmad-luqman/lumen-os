@@ -782,8 +782,16 @@ impl Ext4Inode {
         Ok(cp)
     }
 
-    /// This file's cached page `index`, filled when missing: `ext4`'s side of
-    /// [`page_cache::mmap_page`] (its contract). A hole in a detached file
+    /// This file's page-cache lock (Lock 5), for
+    /// `page_cache::MappedPage::copy_to_frame`.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
+    pub(super) fn page_cache_lock(&self) -> &SleepMutex<PageCache> {
+        &self.pages
+    }
+
+    /// This file's cached page `index`, filled when missing, and its size
+    /// read with it: `ext4`'s side of [`page_cache::mmap_page`] (its
+    /// contract). A hole in a detached file
     /// (whose pages were all read in when it was detached) gets a zero page,
     /// counted against the detached quota (not the hard limit). For a linked
     /// file at the cache's hard limit a missing page is refused (`NoSpc`,
@@ -791,7 +799,7 @@ impl Ext4Inode {
     /// `write_at` refuses one: a mapping pins its pages, so reclaim can't
     /// keep the cache under the limit as it does for `read_at`'s pages.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
-    pub(super) fn mmap_page(&self, index: u64) -> Result<page_cache::MappedPage, VfsError> {
+    pub(super) fn mmap_page(&self, index: u64) -> Result<(Arc<CachePage>, u64), VfsError> {
         if self.inode_type != InodeType::File {
             return Err(VfsError::NoDev);
         }
@@ -822,7 +830,7 @@ impl Ext4Inode {
             }
         };
         page.touch();
-        Ok(page_cache::MappedPage::new(page, file_size))
+        Ok((page, file_size))
     }
 
     /// A failed truncate couldn't put back the tail bytes it zeroed on disk:

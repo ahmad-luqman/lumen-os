@@ -800,7 +800,9 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - If `vma.prot.write()` is true and the existing PTE has `PTE_SHARED = 1`
       and `WRITABLE = 0`:
       - For `MAP_PRIVATE`: **CoW split**—allocate a fresh private frame, copy
-        the 4 KiB page from `CachePage` (zeroing any tail past `file_size`),
+        the 4 KiB page into it with `MappedPage::copy_to_frame` (zeroing any
+        tail past `file_size`; it takes the inode's `PageCache` Lock 5 while
+        copying, which the fault, holding Lock 1, may take: section 9),
         replace the PTE with the private frame (`prot_to_attrs(vma.prot)`,
         preserving `vma.prot.exec()`, `PTE_SHARED = 0`), flush the local TLB
         (`invlpg`), and remove `page_va` from `pinned_pages`.
@@ -4986,7 +4988,8 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
 - **Pages for `mmap` (built in #255's first part):** the file-backed VM
   takes a file's pages through one helper, `crate::vfs::mmap_page(inode:
   &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError>`.
-  `MappedPage` has private fields and two getters: `page()`, the inode's
+  `MappedPage` has private fields, `copy_to_frame` (below) and two
+  getters: `page()`, the inode's
   own cached `Arc<CachePage>` at `index` (offset `index * 4096`), the same
   `Arc` `read_at`/`write_at` use (another call returns it again while it
   stays cached), and `file_size()`, read under the same Lock 4 hold.
@@ -5032,13 +5035,20 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     unlinked (detached) file isn't reachable by walking a tree, and the
     `ext4` one costs a scan per fault.
   - *Bytes and state:* `CachePage::read_bytes`, `write_bytes`,
-    `zero_range`, `swap_dirty`, `touch`, `last_access` and `new_zeroed` are
-    `pub(super)` (inside `vfs` only); the byte accessors need the page's
-    Lock 5 held (or the page not published yet), and `mm` can't name them.
-    A copy-on-write split copies with
-    `CachePage::copy_to_frame(&mut OwnedFrame, valid)` (the first `valid`
-    bytes, zeros after), which needs no lock: a racing store leaves a mix
-    of old and new bytes, as on Linux. `set_dirty`, `inc_writable_maps` and
+    `zero_range`, `copy_to_frame`, `swap_dirty`, `touch`, `last_access` and
+    `new_zeroed` are `pub(super)` (inside `vfs` only); the byte accessors
+    need the page's Lock 5 held (or the page not published yet), and `mm`
+    can't name them. A copy-on-write split copies with
+    `MappedPage::copy_to_frame(&mut OwnedFrame, valid)` (the first `valid`
+    bytes, zeros after). `MappedPage` keeps its owning inode (checked to be
+    `ext4` or `tmpfs` by `mmap_page`), and the copy holds that inode's
+    Lock 5, as the kernel's writers of the page do, so no kernel write
+    races it (unsynchronised, that would be a data race, undefined in
+    Rust). A store from ring 3 through a `MAP_SHARED` mapping is a
+    hardware write outside Rust's memory model; one racing the copy leaves
+    a mix of old and new bytes, as on Linux. #255's next part keeps the
+    `MappedPage` (not a bare `Arc<CachePage>`) wherever it may need a
+    copy-on-write copy later. `set_dirty`, `inc_writable_maps` and
     `dec_writable_maps` are `pub` for now, for the page-fault and unmap
     paths; that is temporary, until #255's next part puts them behind an
     RAII guard and narrows them to `pub(super)`.
