@@ -1,6 +1,5 @@
 //! Descriptor I/O: `read`, `write`, `close`, `fstat`, `poll`, `ioctl`,
-//! `readv`, `writev` (M6), and M7's `open`, `openat`, `lseek` (stubs until
-//! #254 implements them).
+//! `readv`, `writev` (M6), and M7's `open`, `openat`, `lseek`.
 
 use alloc::vec;
 use core::mem::size_of;

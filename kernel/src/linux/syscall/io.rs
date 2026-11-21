@@ -1,6 +1,5 @@
 //! Positional I/O and syncing (M7): `pread64`, `pwrite64`, `fsync`,
-//! `fdatasync`, `sync`, and `msync` (#255's, with file-backed `mmap`)
-//! (stubs until those PRs implement them).
+//! `fdatasync`, `sync` (#254), and `msync` (#255, with file-backed `mmap`).
 
 use super::not_implemented;
 use crate::linux::general;

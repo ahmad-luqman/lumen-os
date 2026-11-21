@@ -1,5 +1,4 @@
-//! Descriptor control and advisory locks (M7): `fcntl`, `flock` (stubs
-//! until #254 implements them).
+//! Descriptor control and advisory locks (M7): `fcntl`, `flock`.
 
 use super::not_implemented;
 use crate::linux::general;

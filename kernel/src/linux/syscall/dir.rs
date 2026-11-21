@@ -1,5 +1,5 @@
 //! Working directory and directory reads: `getcwd` (M6), and M7's
-//! `getdents64`, `chdir`, `fchdir` (stubs until #254 implements them).
+//! `getdents64`, `chdir`, `fchdir`.
 
 use super::{neg_errno, not_implemented};
 use crate::linux::{errno, general};

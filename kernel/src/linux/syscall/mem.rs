@@ -6,7 +6,9 @@ use crate::linux::errno;
 use crate::mm::user_vm::prot_from_linux;
 use crate::sched;
 
-pub(super) fn sys_mmap(addr: u64, len: u64, prot_raw: u64, flags: u64) -> u64 {
+/// `mmap(addr, len, prot, flags, fd, off)`: anonymous mappings only, so `fd`
+/// and `off` are ignored, as in M6 (#255: the file-backed path reads them).
+pub(super) fn sys_mmap(addr: u64, len: u64, prot_raw: u64, flags: u64, _fd: u64, _off: u64) -> u64 {
     let Some(prot) = prot_from_linux(prot_raw) else {
         return neg_errno(errno::EINVAL);
     };

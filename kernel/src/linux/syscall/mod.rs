@@ -1,9 +1,10 @@
-//! Linux x86-64 syscall dispatcher (M6 built, M7 numbers routed;
-//! `docs/ARCHITECTURE.md` §8).
+//! Linux x86-64 syscall dispatcher (`docs/ARCHITECTURE.md` §8).
 //!
 //! `dispatch` maps each syscall number to its handler, one `match` arm per
-//! number. The handlers live in one module per cluster, so the PRs that fill
-//! in M7 (#254) each touch only their own module, never `dispatch`:
+//! number (a number's constant as the pattern, so the compiler refuses one
+//! routed twice), passing the registers of the syscall's Linux signature.
+//! The handlers live in one module per cluster, so the PRs that implement
+//! M7 (#254, #255) each change only their own module, not `dispatch`:
 //!
 //! - `fd`: descriptor I/O (`read`, `write`, `close`, `fstat`, `poll`,
 //!   `ioctl`, `readv`, `writev`; M7: `open`, `openat`, `lseek`).
@@ -21,7 +22,7 @@
 //!   `getrandom` (M6).
 //!
 //! An M7 syscall not implemented yet has a stub that logs once per number
-//! (as an unknown one does) and returns `-ENOSYS`.
+//! (as an unknown one does, with its name) and returns `-ENOSYS`.
 //!
 //! All user pointers are copied via `.lumen_fixup`-protected `copy_from_user` /
 //! `copy_to_user` with interrupts enabled and no `SpinLock` held. Unknown
@@ -167,69 +168,70 @@ fn not_implemented(nr: u32) -> u64 {
 /// Dispatch one Linux x86-64 syscall (`rax` = nr, `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` = args).
 pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
     let nr = frame.rax;
-    match nr {
+    // A number past `u32::MAX` is no syscall's: it falls through to the last arm.
+    match u32::try_from(nr) {
         // M6.
-        n if n == u64::from(general::__NR_read) => {
+        Ok(general::__NR_read) => {
             frame.rax = fd::sys_read(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_write) => {
+        Ok(general::__NR_write) => {
             frame.rax = fd::sys_write(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_close) => {
+        Ok(general::__NR_close) => {
             frame.rax = fd::sys_close(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fstat) => {
+        Ok(general::__NR_fstat) => {
             frame.rax = fd::sys_fstat(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_poll) => {
+        Ok(general::__NR_poll) => {
             frame.rax = fd::sys_poll(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_mmap) => {
-            frame.rax = mem::sys_mmap(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+        Ok(general::__NR_mmap) => {
+            frame.rax = mem::sys_mmap(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_mprotect) => {
+        Ok(general::__NR_mprotect) => {
             frame.rax = mem::sys_mprotect(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_munmap) => {
+        Ok(general::__NR_munmap) => {
             frame.rax = mem::sys_munmap(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_brk) => {
+        Ok(general::__NR_brk) => {
             frame.rax = mem::sys_brk(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_rt_sigaction) => {
+        Ok(general::__NR_rt_sigaction) => {
             frame.rax = proc::sys_rt_sigaction(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_rt_sigprocmask) => {
+        Ok(general::__NR_rt_sigprocmask) => {
             frame.rax = proc::sys_rt_sigprocmask(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_ioctl) => {
+        Ok(general::__NR_ioctl) => {
             frame.rax = fd::sys_ioctl(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_readv) => {
+        Ok(general::__NR_readv) => {
             frame.rax = fd::sys_readv(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_writev) => {
+        Ok(general::__NR_writev) => {
             frame.rax = fd::sys_writev(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_getpid) => {
+        Ok(general::__NR_getpid) => {
             frame.rax = u64::from(with_current(|p| p.pid));
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_exit) || n == u64::from(general::__NR_exit_group) => {
+        Ok(general::__NR_exit | general::__NR_exit_group) => {
             let status = (frame.rdi & 0xff) as i32;
             let (_, is_test) = record_exit(UserExit::Exited(status));
             if is_test {
@@ -239,39 +241,35 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             // no live Rust `Drop` values on this stack frame.
             unsafe { arch::syscall::unwind_to_kernel() }
         }
-        n if n == u64::from(general::__NR_uname) => {
+        Ok(general::__NR_uname) => {
             frame.rax = proc::sys_uname(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_getcwd) => {
+        Ok(general::__NR_getcwd) => {
             frame.rax = dir::sys_getcwd(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_getuid)
-            || n == u64::from(general::__NR_getgid)
-            || n == u64::from(general::__NR_geteuid)
-            || n == u64::from(general::__NR_getegid) =>
-        {
+        Ok(general::__NR_getuid | general::__NR_getgid | general::__NR_geteuid | general::__NR_getegid) => {
             frame.rax = 0;
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_getppid) => {
+        Ok(general::__NR_getppid) => {
             frame.rax = u64::from(with_current(|p| p.ppid));
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_getpgrp) => {
+        Ok(general::__NR_getpgrp) => {
             frame.rax = u64::from(with_current(|p| p.pid));
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_arch_prctl) => {
+        Ok(general::__NR_arch_prctl) => {
             frame.rax = proc::sys_arch_prctl(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_gettid) => {
+        Ok(general::__NR_gettid) => {
             frame.rax = u64::from(with_current(|p| p.tid));
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_set_tid_address) => {
+        Ok(general::__NR_set_tid_address) => {
             let tidptr = frame.rdi;
             frame.rax = u64::from(with_current_mut(|p| {
                 p.clear_child_tid = tidptr;
@@ -279,15 +277,15 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             }));
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_clock_gettime) => {
+        Ok(general::__NR_clock_gettime) => {
             frame.rax = proc::sys_clock_gettime(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_prlimit64) => {
+        Ok(general::__NR_prlimit64) => {
             frame.rax = proc::sys_prlimit64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_getrandom) => {
+        Ok(general::__NR_getrandom) => {
             frame.rax = proc::sys_getrandom(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
@@ -295,191 +293,191 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         // M7 (`crate::linux::M7_SYSCALLS`): each arm passes the arguments of
         // the syscall's Linux x86-64 signature, and no more (`faccessat` and
         // `fchmodat` take 3, never `r10`).
-        n if n == u64::from(general::__NR_open) => {
+        Ok(general::__NR_open) => {
             frame.rax = fd::sys_open(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_openat) => {
+        Ok(general::__NR_openat) => {
             frame.rax = fd::sys_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_lseek) => {
+        Ok(general::__NR_lseek) => {
             frame.rax = fd::sys_lseek(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_stat) => {
+        Ok(general::__NR_stat) => {
             frame.rax = stat::sys_stat(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_lstat) => {
+        Ok(general::__NR_lstat) => {
             frame.rax = stat::sys_lstat(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_newfstatat) => {
+        Ok(general::__NR_newfstatat) => {
             frame.rax = stat::sys_newfstatat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_statx) => {
+        Ok(general::__NR_statx) => {
             frame.rax = stat::sys_statx(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_access) => {
+        Ok(general::__NR_access) => {
             frame.rax = stat::sys_access(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_faccessat) => {
+        Ok(general::__NR_faccessat) => {
             frame.rax = stat::sys_faccessat(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_faccessat2) => {
+        Ok(general::__NR_faccessat2) => {
             frame.rax = stat::sys_faccessat2(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_mkdir) => {
+        Ok(general::__NR_mkdir) => {
             frame.rax = ns::sys_mkdir(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_mkdirat) => {
+        Ok(general::__NR_mkdirat) => {
             frame.rax = ns::sys_mkdirat(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_rmdir) => {
+        Ok(general::__NR_rmdir) => {
             frame.rax = ns::sys_rmdir(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_unlink) => {
+        Ok(general::__NR_unlink) => {
             frame.rax = ns::sys_unlink(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_unlinkat) => {
+        Ok(general::__NR_unlinkat) => {
             frame.rax = ns::sys_unlinkat(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_link) => {
+        Ok(general::__NR_link) => {
             frame.rax = ns::sys_link(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_linkat) => {
+        Ok(general::__NR_linkat) => {
             frame.rax = ns::sys_linkat(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_symlink) => {
+        Ok(general::__NR_symlink) => {
             frame.rax = ns::sys_symlink(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_symlinkat) => {
+        Ok(general::__NR_symlinkat) => {
             frame.rax = ns::sys_symlinkat(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_readlink) => {
+        Ok(general::__NR_readlink) => {
             frame.rax = ns::sys_readlink(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_readlinkat) => {
+        Ok(general::__NR_readlinkat) => {
             frame.rax = ns::sys_readlinkat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_rename) => {
+        Ok(general::__NR_rename) => {
             frame.rax = ns::sys_rename(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_renameat) => {
+        Ok(general::__NR_renameat) => {
             frame.rax = ns::sys_renameat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_renameat2) => {
+        Ok(general::__NR_renameat2) => {
             frame.rax = ns::sys_renameat2(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_getdents64) => {
+        Ok(general::__NR_getdents64) => {
             frame.rax = dir::sys_getdents64(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_chdir) => {
+        Ok(general::__NR_chdir) => {
             frame.rax = dir::sys_chdir(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fchdir) => {
+        Ok(general::__NR_fchdir) => {
             frame.rax = dir::sys_fchdir(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_chmod) => {
+        Ok(general::__NR_chmod) => {
             frame.rax = meta::sys_chmod(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fchmod) => {
+        Ok(general::__NR_fchmod) => {
             frame.rax = meta::sys_fchmod(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fchmodat) => {
+        Ok(general::__NR_fchmodat) => {
             frame.rax = meta::sys_fchmodat(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fchmodat2) => {
+        Ok(general::__NR_fchmodat2) => {
             frame.rax = meta::sys_fchmodat2(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_chown) => {
+        Ok(general::__NR_chown) => {
             frame.rax = meta::sys_chown(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fchown) => {
+        Ok(general::__NR_fchown) => {
             frame.rax = meta::sys_fchown(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_lchown) => {
+        Ok(general::__NR_lchown) => {
             frame.rax = meta::sys_lchown(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fchownat) => {
+        Ok(general::__NR_fchownat) => {
             frame.rax = meta::sys_fchownat(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_umask) => {
+        Ok(general::__NR_umask) => {
             frame.rax = meta::sys_umask(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_utimensat) => {
+        Ok(general::__NR_utimensat) => {
             frame.rax = meta::sys_utimensat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_truncate) => {
+        Ok(general::__NR_truncate) => {
             frame.rax = meta::sys_truncate(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_ftruncate) => {
+        Ok(general::__NR_ftruncate) => {
             frame.rax = meta::sys_ftruncate(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_pread64) => {
+        Ok(general::__NR_pread64) => {
             frame.rax = io::sys_pread64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_pwrite64) => {
+        Ok(general::__NR_pwrite64) => {
             frame.rax = io::sys_pwrite64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fsync) => {
+        Ok(general::__NR_fsync) => {
             frame.rax = io::sys_fsync(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fdatasync) => {
+        Ok(general::__NR_fdatasync) => {
             frame.rax = io::sys_fdatasync(frame.rdi);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_sync) => {
+        Ok(general::__NR_sync) => {
             frame.rax = io::sys_sync();
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_msync) => {
+        Ok(general::__NR_msync) => {
             frame.rax = io::sys_msync(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_fcntl) => {
+        Ok(general::__NR_fcntl) => {
             frame.rax = lock::sys_fcntl(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
-        n if n == u64::from(general::__NR_flock) => {
+        Ok(general::__NR_flock) => {
             frame.rax = lock::sys_flock(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }

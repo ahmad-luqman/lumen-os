@@ -1,7 +1,6 @@
 //! Namespace changes (M7): `mkdir`, `mkdirat`, `rmdir`, `unlink`,
 //! `unlinkat`, `link`, `linkat`, `symlink`, `symlinkat`, `readlink`,
-//! `readlinkat`, `rename`, `renameat`, `renameat2` (stubs until #254
-//! implements them).
+//! `readlinkat`, `rename`, `renameat`, `renameat2`.
 
 use super::not_implemented;
 use crate::linux::general;

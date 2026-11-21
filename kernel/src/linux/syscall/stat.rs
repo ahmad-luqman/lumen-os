@@ -1,6 +1,5 @@
 //! File status and access checks (M7): `stat`, `lstat`, `newfstatat`,
-//! `statx`, `access`, `faccessat`, `faccessat2` (stubs until #254
-//! implements them).
+//! `statx`, `access`, `faccessat`, `faccessat2`.
 
 use super::not_implemented;
 use crate::linux::general;

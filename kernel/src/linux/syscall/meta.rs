@@ -1,6 +1,6 @@
 //! Inode metadata and size (M7): `chmod`, `fchmod`, `fchmodat`,
 //! `fchmodat2`, `chown`, `fchown`, `lchown`, `fchownat`, `umask`,
-//! `utimensat`, `truncate`, `ftruncate` (stubs until #254 implements them).
+//! `utimensat`, `truncate`, `ftruncate`.
 
 use super::not_implemented;
 use crate::linux::general;
