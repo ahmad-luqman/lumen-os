@@ -417,27 +417,21 @@ pub(crate) fn reclaim_ext4_inode_dirty(inode: &Arc<dyn VfsInode>, max_evict: usi
 /// Flush all dirty `PageCache` pages, metadata, mounted filesystems, and
 /// `BlockCache`s to durable storage (`Lock 9 snapshot -> Lock 4 -> 5 -> 6 -> 7 -> 8`).
 ///
-/// A failure doesn't stop the rest: every other inode and filesystem is still
-/// flushed, each failure is logged (`dev:ino` or the filesystem), and the
-/// first error is returned.
+/// Each mounted filesystem's `sync` flushes its own live inodes and then its
+/// block cache (ext4: `Ext4FileSystem::sync`; tmpfs, devfs and procfs have
+/// nothing to write), so the inodes aren't visited a second time here. A
+/// failure doesn't stop the rest: every other inode and filesystem is still
+/// flushed, each failure is logged once (by the filesystem, naming the inode
+/// or its block cache), and the first error is returned.
 pub fn sync_all() -> Result<(), VfsError> {
     sync_tables(&TABLES)
 }
 
 fn sync_tables(tables: &KernelVfsTables) -> Result<(), VfsError> {
     let mut first: Option<VfsError> = None;
-    for inode in tables.snapshot_inodes() {
-        if inode.is_detached() {
-            continue;
-        }
-        if let Err(e) = inode.sync(false) {
-            warn!(target: "vfs", "sync: inode {}:{} failed: {e:?}", inode.dev_id(), inode.ino());
-            first.get_or_insert(e);
-        }
-    }
     for fs in tables.snapshot_filesystems() {
         if let Err(e) = fs.sync() {
-            warn!(target: "vfs", "sync: {} filesystem {} failed: {e:?}", fs.name(), fs.dev_id());
+            log::debug!(target: "vfs", "sync: {} filesystem {} failed: {e:?}", fs.name(), fs.dev_id());
             first.get_or_insert(e);
         }
     }
@@ -471,8 +465,9 @@ fn has_ext4_magic(cache: &dyn ext4::BlockCacheBackend) -> Result<bool, lumen_bca
 /// `rng::init()`. Scans bound `virtio-blk` devices in PCI address order and
 /// mounts the first valid `ext4` volume at `/`; if none is found, falls back
 /// to `tmpfs` at `/`. A disk without the ext4 magic (a blank scratch disk in
-/// `test_blk`) is skipped with only a `debug` line; a disk that has the magic
-/// but can't be read or mounted is a `WARN`, so a lost rootfs is never silent.
+/// `test_blk`) is skipped with only a `debug` line; a disk whose superblock
+/// can't be read, or that has the magic but won't mount, is a `WARN`, so a
+/// lost rootfs is never silent.
 /// Missing `/tmp`, `/dev` and `/proc` directories are created on any writable
 /// root (a writable ext4 disk included); the closing `INFO` line names only
 /// the mounts that succeeded.
@@ -616,7 +611,6 @@ fn parse_octal(s: &str) -> Option<u16> {
 
 /// The longest `vfstest write-pattern` buffer: the whole pattern is built on
 /// the heap first, and a length from the shell must not panic the kernel.
-#[cfg_attr(feature = "ktest", allow(dead_code))]
 const WRITE_PATTERN_MAX: usize = 16 << 20;
 
 #[cfg_attr(feature = "ktest", allow(dead_code))]
@@ -624,7 +618,13 @@ fn vfs_pattern_byte(idx: usize) -> u8 {
     ((idx.wrapping_mul(131)) ^ (idx >> 8).wrapping_mul(17) ^ 0x5a) as u8
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))]
+/// The most `read_all_inode` reads (the same bound as `vfstest
+/// write-pattern`): `vfstest cat` and `verify-pattern` read a file of any size
+/// from the shell, and growing one buffer until the heap refuses would panic
+/// the kernel.
+const READ_ALL_MAX: usize = WRITE_PATTERN_MAX;
+
+/// A whole file's bytes, refused with `EFBIG` past [`READ_ALL_MAX`].
 fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
     let mut out = Vec::new();
     let mut off = 0u64;
@@ -633,6 +633,9 @@ fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
         let n = inode.read_at(off, &mut buf)?;
         if n == 0 {
             break;
+        }
+        if out.len() + n > READ_ALL_MAX {
+            return Err(VfsError::FBig);
         }
         out.extend_from_slice(&buf[..n]);
         off += n as u64;
@@ -647,9 +650,8 @@ static FAIL_PROC_CHECKS: core::sync::atomic::AtomicBool = core::sync::atomic::At
 
 /// Whether `line` has the shape of a `/proc/<pid>/maps` line:
 /// `start-end perms offset major:minor inode`, then `  [heap]`/`  [stack]` or
-/// nothing (no file-backed VMAs yet). Addresses are at least 8 lowercase hex
+/// nothing (no file-backed VMAs yet). Addresses are 8 to 16 lowercase hex
 /// digits, the offset exactly 8, the device numbers 2 each.
-#[cfg_attr(feature = "ktest", allow(dead_code))]
 fn is_maps_line(line: &str) -> bool {
     fn hex(s: &str, min: usize, max: usize) -> bool {
         (min..=max).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -875,6 +877,9 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
 
     let handle = sched::spawn_user_on(0, "vfstest-proc", space_for_thread, move || {
         let pid = process::register_current(ConsoleIo::Capture, false, Vec::new());
+        // `/proc/<pid>` and `/proc/<pid>/fd/3` as resolved while they exist,
+        // for checking what they say once the process and fd are gone.
+        let mut proc_nodes: Option<(Arc<dyn VfsInode>, Arc<dyn VfsInode>)> = None;
         let checks = (|| -> Result<String, String> {
             #[cfg(feature = "ktest")]
             if FAIL_PROC_CHECKS.load(core::sync::atomic::Ordering::Acquire) {
@@ -892,7 +897,15 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
                 return Err(String::from("/proc/self/mounts empty"));
             }
             process::set_current_exe_path("/tmp");
-            process::register_current_vfs_fd(3, Arc::clone(&fd_file), String::from("/tmp/proc_fd_test.txt"));
+            process::register_current_vfs_fd(3, Arc::clone(&fd_file), String::from("/tmp/proc_fd_test.txt"))
+                .map_err(|e| format!("register fd 3: {e:?}"))?;
+            // procfs builds an fd's inode number from it: out-of-range fds
+            // are refused.
+            for bad in [-1, lumen_vfs::MAX_FDS as i32] {
+                if process::register_current_vfs_fd(bad, Arc::clone(&fd_file), String::from("/bad")).is_ok() {
+                    return Err(format!("fd {bad} was registered"));
+                }
+            }
 
             let self_target =
                 readlink_at(&TABLES, None, b"/proc/self").map_err(|e| format!("readlink /proc/self: {e:?}"))?;
@@ -921,6 +934,14 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
             if read_all_inode(&magic_inode).map_err(|e| format!("read magic fd/3: {e:?}"))? != b"magic-fd-bytes" {
                 return Err(String::from("magic fd/3 content mismatch"));
             }
+            let nofollow = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
+            let pid_dir = resolve_path(&TABLES, None, format!("/proc/{pid}").as_bytes(), nofollow)
+                .map_err(|e| format!("resolve /proc/{pid}: {e:?}"))?
+                .inode;
+            let fd_link = resolve_path(&TABLES, None, b"/proc/self/fd/3", nofollow)
+                .map_err(|e| format!("resolve fd/3 link: {e:?}"))?
+                .inode;
+            proc_nodes = Some((pid_dir, fd_link));
 
             // /proc/self/maps
             let maps_inode = resolve_path_from_root("/proc/self/maps").map_err(|e| format!("maps: {e:?}"))?;
@@ -941,12 +962,24 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         // Always unregister, a failed check included: a `ProcessState` left in
         // `ACTIVE_PROCS` would stay in `/proc` for good and pin its address space.
         process::unregister_current_vfs_fd(3);
+        let fd_link_after_close = proc_nodes.as_ref().map(|(_, fd)| fd.stat().err());
         let proc_state = process::take_current();
+        // The VFS caches these entries (#263); procfs itself must still say
+        // they are gone.
+        let pid_dir_after_exit = proc_nodes.as_ref().map(|(dir, _)| dir.stat().err());
+        drop(proc_nodes);
         let out = checks.and_then(|summary| {
-            if proc_state.stdout == b"tty-ok con-ok" {
-                Ok(summary)
-            } else {
+            if proc_state.stdout != b"tty-ok con-ok" {
                 Err(format!("console capture mismatch: {:?}", proc_state.stdout))
+            } else if fd_link_after_close != Some(Some(VfsError::NoEnt))
+                || pid_dir_after_exit != Some(Some(VfsError::NoEnt))
+            {
+                Err(format!(
+                    "stale procfs nodes: fd/3 after close {fd_link_after_close:?}, /proc/{pid} after exit \
+                     {pid_dir_after_exit:?}"
+                ))
+            } else {
+                Ok(summary)
             }
         });
         drop(proc_state);
@@ -1838,6 +1871,32 @@ crate::ktest!(
         f.truncate(0).map_err(|_| "truncate 0")?;
         kassert_eq!(f.write_at(0, &page).map_err(|_| "write after truncate")?, page.len());
         Ok(())
+    }
+);
+
+crate::ktest!(
+    fn vfs_read_all_refuses_a_file_past_its_cap() {
+        // `vfstest cat` and `verify-pattern` read whole files from the shell:
+        // one past the cap is refused, not grown into until the heap panics.
+        use crate::kassert_eq;
+        let (f, _) = open_inode(
+            &TABLES,
+            None,
+            b"/tmp/read_all_cap.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create")?;
+        let res = (|| -> Result<(), &'static str> {
+            f.truncate(READ_ALL_MAX as u64).map_err(|_| "truncate to the cap")?;
+            kassert_eq!(read_all_inode(&f).map_err(|_| "read at the cap")?.len(), READ_ALL_MAX);
+            f.truncate(READ_ALL_MAX as u64 + 1).map_err(|_| "truncate past the cap")?;
+            kassert_eq!(read_all_inode(&f).err(), Some(VfsError::FBig));
+            Ok(())
+        })();
+        unlink_at(&TABLES, None, b"/tmp/read_all_cap.bin", false).map_err(|_| "unlink")?;
+        res
     }
 );
 

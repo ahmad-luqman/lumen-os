@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use lumen_vfs::VfsInode;
+use lumen_vfs::{VfsError, VfsInode};
 
 use crate::keyboard::{Key as KbdKey, KeyCode};
 use crate::klog;
@@ -129,12 +129,15 @@ pub struct ProcessState {
     pub stdout: Vec<u8>,
     /// The process's address space, for `/proc/<pid>/maps`.
     pub address_space: Option<Arc<AddressSpace>>,
-    /// The executable's path for `/proc/<pid>/exe`; nothing sets it outside
-    /// the ktests until `linux /path` loads from the VFS (#255).
+    /// The executable's path for `/proc/<pid>/exe`; only `vfstest
+    /// dev-tmp-proc`'s checks (and the ktests running them) set it until
+    /// `linux /path` loads from the VFS (#255).
     pub exe_path: Option<String>,
     /// VFS files open on descriptors, with the path each was opened by, for
     /// `/proc/<pid>/fd`: a stand-in for the 1024-entry FD table that #254
-    /// wires into the syscalls (only the ktests fill it today).
+    /// wires into the syscalls (only `vfstest dev-tmp-proc`'s checks, and the
+    /// ktests running them, fill it today). Keys are in `0..lumen_vfs::MAX_FDS`
+    /// (`register_current_vfs_fd` refuses others).
     pub vfs_fds: BTreeMap<i32, (Arc<dyn VfsInode>, String)>,
     stdin: Vec<u8>,
     stdin_pos: usize,
@@ -295,16 +298,22 @@ pub fn set_current_exe_path(path: &str) {
 }
 
 /// Attach a VFS inode/path to `fd` on the current [`ProcessState`] (extracting
-/// any displaced entry so `Arc` drops outside `ACTIVE_PROCS`).
-pub fn register_current_vfs_fd(fd: i32, inode: Arc<dyn VfsInode>, path: String) {
+/// any displaced entry so `Arc` drops outside `ACTIVE_PROCS`). `EBADF` for an
+/// fd outside `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s
+/// inode number from it and relies on that range.
+pub fn register_current_vfs_fd(fd: i32, inode: Arc<dyn VfsInode>, path: String) -> Result<(), VfsError> {
+    if usize::try_from(fd).map_or(true, |f| f >= lumen_vfs::MAX_FDS) {
+        return Err(VfsError::BadF);
+    }
     let Some(ktid) = sched::running_here().map(|id| id.0) else {
-        return;
+        return Ok(());
     };
     let displaced = {
         let mut guard = ACTIVE_PROCS.lock();
         guard.get_mut(&ktid).and_then(|proc| proc.vfs_fds.insert(fd, (inode, path)))
     };
     drop(displaced);
+    Ok(())
 }
 
 /// Detach a VFS descriptor from the current [`ProcessState`], dropping its

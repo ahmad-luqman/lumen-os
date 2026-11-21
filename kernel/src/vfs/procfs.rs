@@ -45,6 +45,10 @@ const TAG_PID_FD_BASE: u64 = 0x1000;
 /// and bits 0..16 the tag (`TAG_PID_*`, or `TAG_PID_FD_BASE + fd`). So every
 /// pid is distinct, and an fd keeps its tag below 2^16 as long as
 /// `lumen_vfs::MAX_FDS <= 0x10000 - TAG_PID_FD_BASE`.
+// An fd's tag must stay below 2^16 (`register_current_vfs_fd` keeps fds in
+// `0..MAX_FDS`).
+const _: () = assert!(lumen_vfs::MAX_FDS as u64 <= 0x1_0000 - TAG_PID_FD_BASE);
+
 pub(crate) const fn pid_ino(pid: u32, tag: u64) -> u64 {
     (1u64 << 48) | ((pid as u64) << 16) | tag
 }
@@ -100,6 +104,18 @@ impl ProcKind {
             Self::Cpuinfo | Self::Meminfo | Self::Mounts | Self::Version | Self::PidMaps(_) | Self::PidMounts(_) => {
                 InodeType::File
             }
+        }
+    }
+
+    /// Whether the process (and, for an fd link, the fd) this node shows
+    /// still exists. The fixed nodes always do.
+    fn is_live(self) -> bool {
+        match self {
+            Self::PidDir(p) | Self::PidExe(p) | Self::PidMaps(p) | Self::PidFdDir(p) | Self::PidMounts(p) => {
+                process::has_pid(p)
+            }
+            Self::PidFdLink(p, fd) => process::process_fd_target(p, fd).is_some(),
+            Self::Root | Self::Cpuinfo | Self::Meminfo | Self::Mounts | Self::Version | Self::SelfLink => true,
         }
     }
 
@@ -304,8 +320,9 @@ fn format_mounts() -> String {
     let mounts = super::list_mounts();
     let mut out = String::new();
     for m in mounts {
-        // The root ext4 is always the first virtio-blk disk `vfs::init` found;
-        // `/dev` has no block nodes yet, so the name follows Linux's.
+        // Outside the ktests the only ext4 mount is the root, always the first
+        // virtio-blk disk `vfs::init` found; `/dev` has no block nodes yet, so
+        // the name follows Linux's (a ktest's ext4 mount is labelled the same).
         let source = if m.fs_name == "ext4" { "/dev/vda" } else { m.fs_name };
         let mode = if m.read_only { "ro" } else { "rw" };
         let _ = writeln!(out, "{source} {} {} {mode} 0 0", m.mount_path, m.fs_name);
@@ -376,6 +393,12 @@ impl VfsInode for ProcfsInode {
     }
 
     fn stat(&self) -> Result<Metadata, VfsError> {
+        // The VFS caches a resolved `/proc/<pid>` entry and returns it without
+        // asking procfs again (#263): once its process or fd is gone, at
+        // least `stat` says so.
+        if !self.kind.is_live() {
+            return Err(VfsError::NoEnt);
+        }
         let itype = self.inode_type();
         Ok(Metadata {
             dev: self.dev,
