@@ -1,9 +1,13 @@
-//! Static ELF64 (`x86_64`) program-header parser, validator, and page planner.
+//! ELF64 (`x86_64`) program-header parser, validator, and page planner.
 //!
-//! Validates static `ET_EXEC` and static PIE `ET_DYN` images according to
+//! Validates static `ET_EXEC` / PIE `ET_DYN` executables, dynamic `PT_INTERP`
+//! executables, and `ET_DYN` dynamic interpreters according to
 //! `docs/ARCHITECTURE.md` §5 and §8:
 //! - ELF64 little-endian, version 1, `EM_X86_64`, `ET_EXEC` or `ET_DYN`
-//! - Rejects `PT_INTERP` (dynamic linking arrives in M7)
+//! - Static-only [`LoadedElf::parse`] rejects `PT_INTERP`; [`LoadedElf::parse_with_pie_base`]
+//!   parses optional single `PT_INTERP` and requires mapped `AT_PHDR` when present;
+//!   [`LoadedElf::parse_interp`] validates `ET_DYN` interpreters (`NestedInterp`,
+//!   `load_bias = base - align_down(min_vaddr)`)
 //! - Bounds-checks the program header table and every `PT_LOAD` file slice
 //! - Validates `p_filesz <= p_memsz`, `USER_MIN..USER_MAX` bounds, W^X (both
 //!   per-segment and across shared 4 KiB boundary pages), and non-overlapping
@@ -26,6 +30,10 @@ pub const USER_MIN: u64 = 0x0000_0000_0001_0000;
 pub const USER_MAX: u64 = 0x0000_7fff_ffff_f000;
 /// Default load bias for static PIE (`ET_DYN`) binaries.
 pub const PIE_BASE: u64 = 0x0000_5555_5555_4000;
+/// Default load base for the dynamic linker (`ld-musl`).
+pub const INTERP_BASE: u64 = 0x0000_7f00_0000_0000;
+/// Maximum byte length of a `PT_INTERP` interpreter path (including trailing NUL).
+pub const PATH_MAX: usize = 4096;
 
 /// ELF version (`EV_CURRENT`).
 pub const EV_CURRENT: u8 = 1;
@@ -44,7 +52,7 @@ pub const PT_NULL: u32 = 0;
 pub const PT_LOAD: u32 = 1;
 /// Dynamic linking information.
 pub const PT_DYNAMIC: u32 = 2;
-/// Path to dynamic interpreter (rejected in M6).
+/// Path to dynamic interpreter.
 pub const PT_INTERP: u32 = 3;
 /// Auxiliary information.
 pub const PT_NOTE: u32 = 4;
@@ -254,8 +262,20 @@ pub enum ElfLoadError {
     UnsupportedMachine(u16),
     /// `e_type` is neither `ET_EXEC` (`2`) nor `ET_DYN` (`3`).
     UnsupportedType(u16),
-    /// Image has a `PT_INTERP` segment; dynamic linking is not yet supported.
+    /// Image has a `PT_INTERP` segment; static-only loader refused it.
     DynamicInterpreterUnsupported,
+    /// Image contains more than one `PT_INTERP` program header.
+    DuplicateInterp,
+    /// `PT_INTERP` file slice overflows or extends past the end of the image.
+    InterpOutOfBounds,
+    /// `PT_INTERP` path is empty, exceeds [`PATH_MAX`], lacks trailing NUL, or has interior NUL.
+    InvalidInterp,
+    /// Dynamic ELF (`PT_INTERP` present) lacks a readable mapped `AT_PHDR`.
+    DynamicMissingPhdr,
+    /// Interpreter ELF itself contains a `PT_INTERP` segment.
+    NestedInterp,
+    /// Interpreter ELF is not `ET_DYN`.
+    InterpreterNotDynamic(u16),
     /// Program header table geometry (`e_phentsize < 56` or overflow) is invalid.
     BadProgramHeaderTable,
     /// Caller-provided `pie_base` is misaligned or outside `USER_MIN..USER_MAX`.
@@ -293,6 +313,12 @@ impl fmt::Display for ElfLoadError {
             Self::UnsupportedMachine(m) => write!(f, "unsupported ELF machine {m} (expected EM_X86_64)"),
             Self::UnsupportedType(t) => write!(f, "unsupported ELF type {t} (expected ET_EXEC or ET_DYN)"),
             Self::DynamicInterpreterUnsupported => f.write_str("dynamic interpreter (PT_INTERP) not supported"),
+            Self::DuplicateInterp => f.write_str("duplicate PT_INTERP program header"),
+            Self::InterpOutOfBounds => f.write_str("PT_INTERP slice out of bounds"),
+            Self::InvalidInterp => f.write_str("invalid PT_INTERP interpreter path"),
+            Self::DynamicMissingPhdr => f.write_str("dynamic ELF missing readable mapped AT_PHDR"),
+            Self::NestedInterp => f.write_str("interpreter ELF must not contain PT_INTERP"),
+            Self::InterpreterNotDynamic(t) => write!(f, "interpreter ELF type {t} is not ET_DYN"),
             Self::BadProgramHeaderTable => f.write_str("malformed ELF program header table"),
             Self::InvalidPieBase(b) => write!(f, "invalid PIE load base {b:#x}"),
             Self::FileSizeExceedsMemSize { index } => write!(f, "PT_LOAD[{index}]: p_filesz > p_memsz"),
@@ -317,10 +343,10 @@ impl fmt::Display for ElfLoadError {
     }
 }
 
-/// Validated static ELF64 program-header load plan.
+/// Validated ELF64 program-header load plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedElf {
-    /// `ET_EXEC` or static PIE `ET_DYN`.
+    /// `ET_EXEC` or `ET_DYN` (PIE / interpreter).
     pub elf_type: ElfType,
     /// Load bias applied to all virtual addresses (`0` for `ET_EXEC`, `PIE_BASE` for `ET_DYN`).
     pub load_bias: u64,
@@ -336,17 +362,42 @@ pub struct LoadedElf {
     /// Initial page-aligned `brk` immediately above the highest `PT_LOAD` page end.
     pub initial_brk: u64,
     segments: Vec<LoadSegment>,
+    /// Optional validated `(file_offset, len_without_nul)` of `PT_INTERP`.
+    interp: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParseMode {
+    /// Static-only (`LoadedElf::parse`): rejects `PT_INTERP` immediately.
+    StaticOnly,
+    /// Main executable (`LoadedElf::parse_with_pie_base`): accepts optional single `PT_INTERP`.
+    AllowInterp,
+    /// Dynamic interpreter (`LoadedElf::parse_interp`): requires `ET_DYN`, rejects `PT_INTERP`
+    /// with `NestedInterp`, and sets `load_bias = base.checked_sub(align_down(min_vaddr))`.
+    Interpreter,
 }
 
 impl LoadedElf {
     /// Validate and plan a static ELF64 image, using [`PIE_BASE`] for `ET_DYN`.
+    ///
+    /// Rejects `PT_INTERP` with [`ElfLoadError::DynamicInterpreterUnsupported`].
     pub fn parse(image: &[u8]) -> Result<Self, ElfLoadError> {
-        Self::parse_with_pie_base(image, PIE_BASE)
+        Self::parse_inner(image, PIE_BASE, ParseMode::StaticOnly)
     }
 
-    /// Validate and plan a static ELF64 image, using `pie_base` as the load
-    /// bias when the binary is `ET_DYN` (static PIE).
+    /// Validate and plan a static or dynamically linked (`PT_INTERP`) ELF64
+    /// image, using `pie_base` as the load bias when the binary is `ET_DYN`.
     pub fn parse_with_pie_base(image: &[u8], pie_base: u64) -> Result<Self, ElfLoadError> {
+        Self::parse_inner(image, pie_base, ParseMode::AllowInterp)
+    }
+
+    /// Validate and plan a dynamic interpreter (`ET_DYN` without `PT_INTERP`),
+    /// computing `load_bias = base.checked_sub(align_down(min_vaddr))`.
+    pub fn parse_interp(image: &[u8], base: u64) -> Result<Self, ElfLoadError> {
+        Self::parse_inner(image, base, ParseMode::Interpreter)
+    }
+
+    fn parse_inner(image: &[u8], base: u64, mode: ParseMode) -> Result<Self, ElfLoadError> {
         if image.len() < EHDR_SIZE {
             return Err(ElfLoadError::Truncated);
         }
@@ -378,15 +429,16 @@ impl LoadedElf {
             return Err(ElfLoadError::UnsupportedMachine(e_machine));
         }
 
-        let (elf_type, load_bias) = match e_type {
-            ET_EXEC => (ElfType::Exec, 0u64),
-            ET_DYN => {
-                if !(USER_MIN..USER_MAX).contains(&pie_base) || !pie_base.is_multiple_of(PAGE_SIZE) {
-                    return Err(ElfLoadError::InvalidPieBase(pie_base));
+        let (elf_type, raw_load_bias) = match (mode, e_type) {
+            (ParseMode::Interpreter, ET_DYN) | (ParseMode::StaticOnly | ParseMode::AllowInterp, ET_DYN) => {
+                if !(USER_MIN..USER_MAX).contains(&base) || !base.is_multiple_of(PAGE_SIZE) {
+                    return Err(ElfLoadError::InvalidPieBase(base));
                 }
-                (ElfType::Pie, pie_base)
+                (ElfType::Pie, base)
             }
-            other => return Err(ElfLoadError::UnsupportedType(other)),
+            (ParseMode::Interpreter, ET_EXEC) => return Err(ElfLoadError::InterpreterNotDynamic(ET_EXEC)),
+            (ParseMode::StaticOnly | ParseMode::AllowInterp, ET_EXEC) => (ElfType::Exec, 0u64),
+            (_, other) => return Err(ElfLoadError::UnsupportedType(other)),
         };
 
         if e_phnum == 0 {
@@ -406,14 +458,56 @@ impl LoadedElf {
         let phent_usize = usize::from(e_phentsize);
         let ph_bytes_usize = usize::try_from(ph_bytes).map_err(|_| ElfLoadError::Truncated)?;
 
+        let load_bias = if mode == ParseMode::Interpreter {
+            let mut min_vaddr: Option<u64> = None;
+            for index in 0..usize::from(e_phnum) {
+                let off = phoff_usize + index * phent_usize;
+                let ph = parse_phdr(image, off).ok_or(ElfLoadError::Truncated)?;
+                if ph.p_type == PT_INTERP {
+                    return Err(ElfLoadError::NestedInterp);
+                }
+                if ph.p_type == PT_LOAD && ph.p_memsz > 0 {
+                    min_vaddr = Some(min_vaddr.map_or(ph.p_vaddr, |m| m.min(ph.p_vaddr)));
+                }
+            }
+            let min_page = align_down(min_vaddr.unwrap_or(0));
+            base.checked_sub(min_page).ok_or(ElfLoadError::InvalidPieBase(base))?
+        } else {
+            raw_load_bias
+        };
+
         let mut pt_phdr: Option<ProgramHeader> = None;
+        let mut interp: Option<(usize, usize)> = None;
         let mut indexed: Vec<(usize, LoadSegment)> = Vec::new();
 
         for index in 0..usize::from(e_phnum) {
             let off = phoff_usize + index * phent_usize;
             let ph = parse_phdr(image, off).ok_or(ElfLoadError::Truncated)?;
             match ph.p_type {
-                PT_INTERP => return Err(ElfLoadError::DynamicInterpreterUnsupported),
+                PT_INTERP => match mode {
+                    ParseMode::StaticOnly => return Err(ElfLoadError::DynamicInterpreterUnsupported),
+                    ParseMode::Interpreter => return Err(ElfLoadError::NestedInterp),
+                    ParseMode::AllowInterp => {
+                        if interp.is_some() {
+                            return Err(ElfLoadError::DuplicateInterp);
+                        }
+                        if ph.p_filesz <= 1 || ph.p_filesz > PATH_MAX as u64 {
+                            return Err(ElfLoadError::InvalidInterp);
+                        }
+                        let interp_end = ph.p_offset.checked_add(ph.p_filesz).ok_or(ElfLoadError::InterpOutOfBounds)?;
+                        if interp_end > image.len() as u64 {
+                            return Err(ElfLoadError::InterpOutOfBounds);
+                        }
+                        let interp_off = usize::try_from(ph.p_offset).map_err(|_| ElfLoadError::InterpOutOfBounds)?;
+                        let interp_len = usize::try_from(ph.p_filesz).map_err(|_| ElfLoadError::InterpOutOfBounds)?;
+                        let bytes =
+                            image.get(interp_off..interp_off + interp_len).ok_or(ElfLoadError::InterpOutOfBounds)?;
+                        if *bytes.last().unwrap_or(&1) != 0 || bytes[..interp_len - 1].contains(&0) {
+                            return Err(ElfLoadError::InvalidInterp);
+                        }
+                        interp = Some((interp_off, interp_len - 1));
+                    }
+                },
                 PT_PHDR => {
                     if pt_phdr.is_none() {
                         pt_phdr = Some(ph);
@@ -504,16 +598,41 @@ impl LoadedElf {
         // Compute AT_PHDR: prefer PT_PHDR if it lies inside a loaded segment;
         // otherwise use the PT_LOAD whose file bytes cover `e_phoff..e_phoff+ph_bytes`.
         let phdr_vaddr = compute_at_phdr(&segments, load_bias, pt_phdr, phoff_usize, ph_bytes_usize);
+        if interp.is_some() && phdr_vaddr.is_none() {
+            return Err(ElfLoadError::DynamicMissingPhdr);
+        }
 
         // Highest page end across all PT_LOAD segments (already sorted and non-overlapping).
         let initial_brk = segments.last().map_or(USER_MIN, LoadSegment::page_end);
 
-        Ok(Self { elf_type, load_bias, entry, phdr_vaddr, phent: e_phentsize, phnum: e_phnum, initial_brk, segments })
+        Ok(Self {
+            elf_type,
+            load_bias,
+            entry,
+            phdr_vaddr,
+            phent: e_phentsize,
+            phnum: e_phnum,
+            initial_brk,
+            segments,
+            interp,
+        })
     }
 
     /// Validated `PT_LOAD` segments sorted by ascending virtual address.
     pub fn segments(&self) -> &[LoadSegment] {
         &self.segments
+    }
+
+    /// `true` if the ELF contains a validated `PT_INTERP` header.
+    pub const fn has_interp(&self) -> bool {
+        self.interp.is_some()
+    }
+
+    /// Slice of `image` holding the validated `PT_INTERP` path (without trailing NUL),
+    /// or `None` for static binaries.
+    pub fn interp_path<'a>(&self, image: &'a [u8]) -> Option<&'a [u8]> {
+        let (off, len) = self.interp?;
+        image.get(off..off.checked_add(len)?)
     }
 
     /// Mapped user VA of the program header table for `AT_PHDR`, or `0` if unmapped.
@@ -1333,9 +1452,233 @@ mod tests {
 
         let img = b.build_raw();
         let loaded = LoadedElf::parse(&img).unwrap();
+        assert!(!loaded.has_interp());
+        assert_eq!(loaded.interp_path(&img), None);
         assert_eq!(loaded.segments()[0].vaddr, USER_MIN);
         assert_eq!(loaded.segments()[1].end(), USER_MAX);
         assert_eq!(loaded.initial_brk, USER_MAX);
         assert_plan_matches_ranges(&loaded, &img);
+    }
+
+    fn make_dynamic_elf(e_type: u16, base_vaddr: u64, interp_bytes: &[u8]) -> Vec<u8> {
+        let mut b = ElfBuilder::new(e_type, base_vaddr + 0x1000);
+        let ph_size = 3 * usize::from(PHDR_MIN_SIZE);
+        let interp_off = EHDR_SIZE + ph_size + b.push_data(interp_bytes);
+        let pad_len = 0x1000 - (EHDR_SIZE + ph_size + interp_bytes.len());
+        b.push_data(&vec![0u8; pad_len]);
+        b.push_data(&[0xc3; 0x80]);
+
+        b.add_phdr(ProgramHeader {
+            p_type: PT_INTERP,
+            p_flags: PF_R,
+            p_offset: interp_off as u64,
+            p_vaddr: base_vaddr + interp_off as u64,
+            p_paddr: base_vaddr + interp_off as u64,
+            p_filesz: interp_bytes.len() as u64,
+            p_memsz: interp_bytes.len() as u64,
+            p_align: 1,
+        });
+        b.add_phdr(load_phdr(PF_R, 0, base_vaddr, 0x1000, 0x1000));
+        b.add_phdr(load_phdr(PF_R | PF_X, 0x1000, base_vaddr + 0x1000, 0x80, 0x80));
+        b.build_raw()
+    }
+
+    #[test]
+    fn valid_dynamic_et_exec_and_pie_with_pt_interp() {
+        let interp = b"/lib/ld-musl-x86_64.so.1\0";
+
+        // Dynamic ET_EXEC
+        let exec_img = make_dynamic_elf(ET_EXEC, 0x40_0000, interp);
+        assert_eq!(LoadedElf::parse(&exec_img), Err(ElfLoadError::DynamicInterpreterUnsupported));
+        let loaded_exec = LoadedElf::parse_with_pie_base(&exec_img, PIE_BASE).unwrap();
+        assert_eq!(loaded_exec.elf_type, ElfType::Exec);
+        assert_eq!(loaded_exec.load_bias, 0);
+        assert!(loaded_exec.has_interp());
+        assert_eq!(loaded_exec.interp_path(&exec_img), Some(b"/lib/ld-musl-x86_64.so.1".as_slice()));
+        assert_eq!(loaded_exec.phdr_vaddr, Some(0x40_0000 + EHDR_SIZE as u64));
+
+        // Dynamic ET_DYN (PIE)
+        let pie_img = make_dynamic_elf(ET_DYN, 0, interp);
+        assert_eq!(LoadedElf::parse(&pie_img), Err(ElfLoadError::DynamicInterpreterUnsupported));
+        let loaded_pie = LoadedElf::parse_with_pie_base(&pie_img, PIE_BASE).unwrap();
+        assert_eq!(loaded_pie.elf_type, ElfType::Pie);
+        assert_eq!(loaded_pie.load_bias, PIE_BASE);
+        assert!(loaded_pie.has_interp());
+        assert_eq!(loaded_pie.interp_path(&pie_img), Some(b"/lib/ld-musl-x86_64.so.1".as_slice()));
+        assert_eq!(loaded_pie.phdr_vaddr, Some(PIE_BASE + EHDR_SIZE as u64));
+        assert_eq!(loaded_pie.entry, PIE_BASE + 0x1000);
+        assert_plan_matches_ranges(&loaded_pie, &pie_img);
+    }
+
+    #[test]
+    fn pt_interp_rejects_malformed_headers_and_unmapped_phdr() {
+        let make_with_interp = |interp_data: &[u8], phdr_override: Option<(u64, u64)>| {
+            let ph_size = 3 * usize::from(PHDR_MIN_SIZE);
+            let off_est = EHDR_SIZE + ph_size;
+            let pad_to = (off_est + interp_data.len()).next_multiple_of(0x1000);
+            let mut b = ElfBuilder::new(ET_DYN, pad_to as u64);
+            let off = EHDR_SIZE + ph_size + b.push_data(interp_data);
+            b.push_data(&vec![0u8; pad_to - (off + interp_data.len())]);
+            b.push_data(&[0xc3; 0x80]);
+
+            let (p_offset, p_filesz) = phdr_override.unwrap_or((off as u64, interp_data.len() as u64));
+            b.add_phdr(ProgramHeader {
+                p_type: PT_INTERP,
+                p_flags: PF_R,
+                p_offset,
+                p_vaddr: p_offset,
+                p_paddr: p_offset,
+                p_filesz,
+                p_memsz: p_filesz,
+                p_align: 1,
+            });
+            b.add_phdr(load_phdr(PF_R, 0, 0, pad_to as u64, pad_to as u64));
+            b.add_phdr(load_phdr(PF_R | PF_X, pad_to as u64, pad_to as u64, 0x80, 0x80));
+            b
+        };
+
+        // Duplicate PT_INTERP
+        let mut dup = make_with_interp(b"/lib/ld.so\0", None);
+        // Adding a 4th phdr shifts payload by PHDR_MIN_SIZE, so adjust p_offset for the existing phdrs.
+        for ph in &mut dup.phdrs {
+            if ph.p_type == PT_INTERP || (ph.p_type == PT_LOAD && ph.p_offset > 0) {
+                ph.p_offset += u64::from(PHDR_MIN_SIZE);
+            }
+        }
+        let first_interp = dup.phdrs[0];
+        dup.add_phdr(first_interp);
+        assert_eq!(LoadedElf::parse_with_pie_base(&dup.build_raw(), PIE_BASE), Err(ElfLoadError::DuplicateInterp));
+
+        // Empty (filesz == 0) and NUL-only (filesz == 1)
+        let empty = make_with_interp(b"", Some((0, 0)));
+        assert_eq!(LoadedElf::parse_with_pie_base(&empty.build_raw(), PIE_BASE), Err(ElfLoadError::InvalidInterp));
+        let nul_only = make_with_interp(b"\0", None);
+        assert_eq!(LoadedElf::parse_with_pie_base(&nul_only.build_raw(), PIE_BASE), Err(ElfLoadError::InvalidInterp));
+
+        // Exactly PATH_MAX (4096 = 4095 bytes + NUL) succeeds; PATH_MAX + 1 fails.
+        let mut max_path = vec![b'a'; PATH_MAX - 1];
+        max_path.push(0);
+        let max_img = make_with_interp(&max_path, None).build_raw();
+        let ok = LoadedElf::parse_with_pie_base(&max_img, PIE_BASE).unwrap();
+        assert_eq!(ok.interp_path(&max_img).unwrap().len(), PATH_MAX - 1);
+
+        let mut too_long = vec![b'a'; PATH_MAX];
+        too_long.push(0);
+        let too_long_img = make_with_interp(&too_long, None).build_raw();
+        assert_eq!(LoadedElf::parse_with_pie_base(&too_long_img, PIE_BASE), Err(ElfLoadError::InvalidInterp));
+
+        // Out-of-bounds slice and arithmetic overflow
+        let oob = make_with_interp(b"/lib/ld\0", Some((0x10_0000, 16)));
+        assert_eq!(LoadedElf::parse_with_pie_base(&oob.build_raw(), PIE_BASE), Err(ElfLoadError::InterpOutOfBounds));
+        let ovf = make_with_interp(b"/lib/ld\0", Some((u64::MAX - 4, 16)));
+        assert_eq!(LoadedElf::parse_with_pie_base(&ovf.build_raw(), PIE_BASE), Err(ElfLoadError::InterpOutOfBounds));
+
+        // Missing trailing NUL and interior NUL
+        let no_nul = make_with_interp(b"/lib/ld.so", None);
+        assert_eq!(LoadedElf::parse_with_pie_base(&no_nul.build_raw(), PIE_BASE), Err(ElfLoadError::InvalidInterp));
+        let interior_nul = make_with_interp(b"/lib/\0ld.so\0", None);
+        assert_eq!(
+            LoadedElf::parse_with_pie_base(&interior_nul.build_raw(), PIE_BASE),
+            Err(ElfLoadError::InvalidInterp)
+        );
+
+        // PT_INTERP with unmapped AT_PHDR (no PT_LOAD covering e_phoff)
+        let mut b = ElfBuilder::new(ET_DYN, 0x1000);
+        let ph_size = 2 * usize::from(PHDR_MIN_SIZE);
+        let interp = b"/lib/ld-musl-x86_64.so.1\0";
+        let interp_off = EHDR_SIZE + ph_size + b.push_data(interp);
+        let pad = 0x1000 - (interp_off + interp.len());
+        b.push_data(&vec![0u8; pad]);
+        b.push_data(&[0xc3; 0x80]);
+        b.add_phdr(ProgramHeader {
+            p_type: PT_INTERP,
+            p_flags: PF_R,
+            p_offset: interp_off as u64,
+            p_vaddr: 0,
+            p_paddr: 0,
+            p_filesz: interp.len() as u64,
+            p_memsz: interp.len() as u64,
+            p_align: 1,
+        });
+        b.add_phdr(load_phdr(PF_R | PF_X, 0x1000, 0x1000, 0x80, 0x80));
+        assert_eq!(LoadedElf::parse_with_pie_base(&b.build_raw(), PIE_BASE), Err(ElfLoadError::DynamicMissingPhdr));
+
+        // PT_INTERP with execute-only (non-readable) PT_LOAD covering e_phoff -> DynamicMissingPhdr
+        let mut b_xo = ElfBuilder::new(ET_EXEC, 0x40_0200);
+        let ph_size = 2 * usize::from(PHDR_MIN_SIZE);
+        let interp_off = EHDR_SIZE + ph_size + b_xo.push_data(interp);
+        let pad = 0x200 - (interp_off + interp.len());
+        b_xo.push_data(&vec![0u8; pad]);
+        b_xo.push_data(&[0xc3; 0x200]);
+        b_xo.add_phdr(ProgramHeader {
+            p_type: PT_INTERP,
+            p_flags: PF_R,
+            p_offset: interp_off as u64,
+            p_vaddr: 0x40_0000 + interp_off as u64,
+            p_paddr: 0x40_0000 + interp_off as u64,
+            p_filesz: interp.len() as u64,
+            p_memsz: interp.len() as u64,
+            p_align: 1,
+        });
+        b_xo.add_phdr(load_phdr(PF_X, 0, 0x40_0000, 0x400, 0x400));
+        assert_eq!(LoadedElf::parse_with_pie_base(&b_xo.build_raw(), PIE_BASE), Err(ElfLoadError::DynamicMissingPhdr));
+    }
+
+    #[test]
+    fn parse_interp_validates_et_dyn_nested_interp_and_min_vaddr_bias() {
+        let make_interp = |min_vaddr: u64| {
+            let aligned_min = align_down(min_vaddr);
+            let mut b = ElfBuilder::new(ET_DYN, aligned_min + 0x1020);
+            let ph_size = 2 * usize::from(PHDR_MIN_SIZE);
+            let pad = 0x1000 - (EHDR_SIZE + ph_size);
+            b.push_data(&vec![0u8; pad]);
+            b.push_data(&[0xc3; 0x80]);
+            b.add_phdr(load_phdr(PF_R, 0, min_vaddr, 0x400, 0x400));
+            b.add_phdr(load_phdr(PF_R | PF_X, 0x1000, aligned_min + 0x1000, 0x80, 0x80));
+            b.build_raw()
+        };
+
+        // min_vaddr == 0 -> load_bias == INTERP_BASE
+        let img0 = make_interp(0);
+        let ld0 = LoadedElf::parse_interp(&img0, INTERP_BASE).unwrap();
+        assert_eq!(ld0.load_bias, INTERP_BASE);
+        assert_eq!(ld0.entry, INTERP_BASE + 0x1020);
+        assert_eq!(ld0.segments()[0].page_start(), INTERP_BASE);
+        assert!(!ld0.has_interp());
+
+        // min_vaddr == 0x2000 -> load_bias == INTERP_BASE - 0x2000, lowest page maps at INTERP_BASE.
+        let img2k = make_interp(0x2000);
+        let ld2k = LoadedElf::parse_interp(&img2k, INTERP_BASE).unwrap();
+        assert_eq!(ld2k.load_bias, INTERP_BASE - 0x2000);
+        assert_eq!(ld2k.segments()[0].vaddr, INTERP_BASE);
+        assert_eq!(ld2k.segments()[0].page_start(), INTERP_BASE);
+        assert_eq!(ld2k.entry, INTERP_BASE + 0x1020);
+
+        // Unaligned min_vaddr == 0x2100 -> align_down(0x2100) = 0x2000 -> lowest page starts at INTERP_BASE.
+        let img_unaligned = make_interp(0x2100);
+        let ld_unaligned = LoadedElf::parse_interp(&img_unaligned, INTERP_BASE).unwrap();
+        assert_eq!(ld_unaligned.load_bias, INTERP_BASE - 0x2000);
+        assert_eq!(ld_unaligned.segments()[0].vaddr, INTERP_BASE + 0x100);
+        assert_eq!(ld_unaligned.segments()[0].page_start(), INTERP_BASE);
+
+        // Nested PT_INTERP inside interpreter is rejected with NestedInterp.
+        let nested_img = make_dynamic_elf(ET_DYN, 0, b"/lib/other.so\0");
+        assert_eq!(LoadedElf::parse_interp(&nested_img, INTERP_BASE), Err(ElfLoadError::NestedInterp));
+
+        // ET_EXEC interpreter rejected with InterpreterNotDynamic.
+        let mut exec_b = ElfBuilder::new(ET_EXEC, 0x40_1000);
+        let off = EHDR_SIZE + usize::from(PHDR_MIN_SIZE);
+        exec_b.push_data(&[0xc3; 0x40]);
+        exec_b.add_phdr(load_phdr(PF_R | PF_X, off as u64, 0x40_1000, 0x40, 0x40));
+        assert_eq!(
+            LoadedElf::parse_interp(&exec_b.build_raw(), INTERP_BASE),
+            Err(ElfLoadError::InterpreterNotDynamic(ET_EXEC))
+        );
+
+        // Underflow when base < align_down(min_vaddr), plus invalid base alignment/bounds.
+        let high_min = make_interp(0x80_0000);
+        assert_eq!(LoadedElf::parse_interp(&high_min, 0x40_0000), Err(ElfLoadError::InvalidPieBase(0x40_0000)));
+        assert_eq!(LoadedElf::parse_interp(&img0, INTERP_BASE + 1), Err(ElfLoadError::InvalidPieBase(INTERP_BASE + 1)));
+        assert_eq!(LoadedElf::parse_interp(&img0, 0), Err(ElfLoadError::InvalidPieBase(0)));
     }
 }

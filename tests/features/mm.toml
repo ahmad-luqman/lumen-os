@@ -117,3 +117,15 @@ tests = [
     "scenario:test_linux_user::test_bad_elf_rejected",
     "scenario:test_linux_user::test_mmap_and_brk",
 ]
+
+[[feature]]
+name = "File-backed VMA primitives in lumen-vm (Backing::File, offset split, contiguous coalescing, may_write/VmError::Access -> -EACCES), PTE_SHARED (bit 10) + Mapping::{shared, dirty} in lumen-mm, and per-leaf protect/unmap/teardown helpers (#251)"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vm",
+    "cargo:lumen-mm",
+    "ktest:lumen_kernel::mm::paging::shared_user_pte_protect_unmap_and_teardown",
+    "ktest:lumen_kernel::mm::user_vm::lazy_zero_fill_and_unmap",
+    "scenario:test_linux_user::test_mmap_and_brk",
+    "audit:flags",
+]
