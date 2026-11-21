@@ -6,12 +6,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::cache::DentryTarget;
 use crate::error::VfsError;
 use crate::fs::VfsInode;
 use crate::mount::VfsCacheOps;
 use crate::types::{AccessMask, InodeType};
 use crate::{MAX_SYMLINK_DEPTH, NAME_MAX, PATH_MAX};
+
+/// Upper bound on bounded `InodeCache` race retries.
+pub(crate) const MAX_INODE_RACE_RETRIES: usize = 64;
 
 /// Options controlling [`resolve_path`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -62,16 +64,63 @@ impl fmt::Debug for ParentTarget {
     }
 }
 
-/// Cross downward through any stacked mounts at `cur`.
+/// Cross downward through any stacked mounts at `cur` without holding Lock 9
+/// across `FileSystem::root_inode()` or leaking unmounted root inodes.
 pub(crate) fn cross_mounts_down(env: &dyn VfsCacheOps, mut cur: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
-    while let Some(fs) = env.mount_at(cur.dev_id(), cur.ino()) {
-        let next = env.inode_get_or_insert(fs.root_inode());
+    for _ in 0..MAX_INODE_RACE_RETRIES {
+        let Some((fs, mount_id)) = env.mount_at_with_id(cur.dev_id(), cur.ino()) else {
+            break;
+        };
+        let raw_root = fs.root_inode();
+        let Some(next) = env.inode_get_or_insert_if_mounted(cur.dev_id(), cur.ino(), mount_id, raw_root) else {
+            continue;
+        };
         if next.dev_id() == cur.dev_id() && next.ino() == cur.ino() {
             break;
         }
         cur = next;
     }
     cur
+}
+
+/// Resolve the global root `/`, unify it in `InodeCache` if fresh, and cross
+/// any mounts stacked directly on `/`.
+pub(crate) fn resolve_global_root(env: &dyn VfsCacheOps) -> Result<Arc<dyn VfsInode>, VfsError> {
+    let (_, since_gen) = env.cache_gens();
+    let root = env.root_inode()?;
+    let unified = env.inode_get_or_insert_if_fresh(root, since_gen).unwrap_or_else(|r| r);
+    Ok(cross_mounts_down(env, unified))
+}
+
+/// Unify a magic symlink target into `InodeCache` if still mounted and fresh.
+pub(crate) fn unify_magic_target(env: &dyn VfsCacheOps, magic_target: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
+    let (_, since_gen) = env.cache_gens();
+    env.inode_get_or_insert_if_fresh(magic_target, since_gen).unwrap_or_else(|m| m)
+}
+
+/// Look up `".."` on `cur` and unify it in `InodeCache` when fresh, with one
+/// bounded retry so concurrent unlinks/`ino` reuse never alias a wrong inode.
+fn lookup_dotdot(env: &dyn VfsCacheOps, cur: &Arc<dyn VfsInode>) -> Result<Arc<dyn VfsInode>, VfsError> {
+    let mut first_parent: Option<Arc<dyn VfsInode>> = None;
+    for attempt in 0..=1 {
+        let (_, since_gen) = env.cache_gens();
+        let parent = match cur.lookup("..") {
+            Ok(p) => p,
+            Err(VfsError::NoEnt) if attempt > 0 => {
+                return Ok(first_parent.expect("first_parent set before retry"));
+            }
+            Err(e) => return Err(e),
+        };
+        match env.inode_get_or_insert_if_fresh(parent, since_gen) {
+            Ok(unified) => return Ok(unified),
+            Err(stale) => {
+                if first_parent.is_none() {
+                    first_parent = Some(stale);
+                }
+            }
+        }
+    }
+    Ok(first_parent.expect("loop ran at least once"))
 }
 
 /// Cross upward across stacked mount roots before `..` lookup.
@@ -85,26 +134,39 @@ fn cross_mounts_up(env: &dyn VfsCacheOps, mut cur: Arc<dyn VfsInode>) -> Arc<dyn
     cur
 }
 
-/// Resolve one normal component using brief Lock-9 probes (`DentryCache` +
-/// `InodeCache`) followed by Lock-4 `VfsInode::lookup` only on cache miss.
+/// Resolve one normal component using atomic Lock-9 probes (`DentryCache ->
+/// InodeCache`) followed by Lock-4 `VfsInode::lookup` only on cache miss, with
+/// bounded retry and `first_child` fallback on concurrent invalidation races.
 fn lookup_component(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
     let pdev = dir.dev_id();
     let pino = dir.ino();
+    let mut first_child: Option<Arc<dyn VfsInode>> = None;
 
-    let (cached, inv_gen) = env.dentry_get_with_gen(pdev, pino, name);
-    if let Some(target) = cached
-        && let Some(inode) = env.inode_get(target.dev, target.ino)
-    {
-        return Ok(inode);
+    for attempt in 0..=MAX_INODE_RACE_RETRIES {
+        let (cached_inode, dentry_gen, inode_gen) = env.dentry_lookup_inode(pdev, pino, name);
+        if let Some(inode) = cached_inode {
+            return Ok(inode);
+        }
+
+        let child = match dir.lookup(name) {
+            Ok(c) => c,
+            Err(VfsError::NoEnt) if attempt > 0 => {
+                return Ok(first_child.expect("first_child set before retry"));
+            }
+            Err(e) => return Err(e),
+        };
+
+        match env.publish_lookup_inode(pdev, pino, name, child, dentry_gen, inode_gen) {
+            Ok(unified) => return Ok(unified),
+            Err(stale) => {
+                if first_child.is_none() {
+                    first_child = Some(stale);
+                }
+            }
+        }
     }
 
-    let child = dir.lookup(name)?;
-    if env.dentry_gen() != inv_gen {
-        return Ok(env.inode_get(child.dev_id(), child.ino()).unwrap_or(child));
-    }
-    let child = env.inode_get_or_insert(child);
-    let _ = env.dentry_insert_if_gen(pdev, pino, name, DentryTarget { dev: child.dev_id(), ino: child.ino() }, inv_gen);
-    Ok(child)
+    Ok(first_child.expect("loop ran at least once"))
 }
 
 /// Resolve `path` relative to `start_dir` (or global root when `start_dir` is `None`).
@@ -147,7 +209,7 @@ pub(crate) fn resolve_path_with_depth(
         }
         let target = match start_dir {
             Some(d) => Arc::clone(d),
-            None => cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?)),
+            None => resolve_global_root(env)?,
         };
         if flags.require_dir && target.inode_type() != InodeType::Dir {
             return Err(VfsError::NotDir);
@@ -157,11 +219,11 @@ pub(crate) fn resolve_path_with_depth(
 
     let mut has_trailing_slash = path.ends_with(b"/");
     let mut cur = if path.starts_with(b"/") {
-        cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?))
+        resolve_global_root(env)?
     } else {
         match start_dir {
             Some(d) => Arc::clone(d),
-            None => cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?)),
+            None => resolve_global_root(env)?,
         }
     };
 
@@ -203,7 +265,7 @@ pub(crate) fn resolve_path_with_depth(
         if comp == b".." {
             cur = cross_mounts_up(env, cur);
             if !env.is_global_root(cur.dev_id(), cur.ino()) {
-                cur = env.inode_get_or_insert(cur.lookup("..")?);
+                cur = lookup_dotdot(env, &cur)?;
             }
             cur = cross_mounts_down(env, cur);
             cursor = tail_start;
@@ -223,7 +285,7 @@ pub(crate) fn resolve_path_with_depth(
             }
 
             if let Some(magic_target) = child.resolve_magic_link() {
-                cur = cross_mounts_down(env, env.inode_get_or_insert(magic_target));
+                cur = cross_mounts_down(env, unify_magic_target(env, magic_target));
                 cursor = tail_start;
                 continue;
             }
@@ -246,7 +308,7 @@ pub(crate) fn resolve_path_with_depth(
             has_trailing_slash = next_buf.ends_with(b"/");
 
             if target.starts_with(b"/") {
-                cur = cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?));
+                cur = resolve_global_root(env)?;
             }
             rest_buf = next_buf;
             cursor = 0;
@@ -300,7 +362,7 @@ pub(crate) fn resolve_parent_with_depth(
         trimmed_end -= 1;
     }
     if trimmed_end == 0 {
-        let root = cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?));
+        let root = resolve_global_root(env)?;
         return Ok(ParentTarget { parent: root, name: String::from("/"), has_trailing_slash: true });
     }
 
@@ -320,7 +382,7 @@ pub(crate) fn resolve_parent_with_depth(
         None => {
             let dir = match start_dir {
                 Some(d) => Arc::clone(d),
-                None => cross_mounts_down(env, env.inode_get_or_insert(env.root_inode()?)),
+                None => resolve_global_root(env)?,
             };
             if dir.inode_type() != InodeType::Dir {
                 return Err(VfsError::NotDir);
@@ -363,7 +425,7 @@ pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Resul
 
         let cur_dev = cur.dev_id();
         let cur_ino = cur.ino();
-        let parent = env.inode_get_or_insert(cur.lookup("..")?);
+        let parent = lookup_dotdot(env, &cur)?;
         if parent.dev_id() == cur_dev && parent.ino() == cur_ino {
             return Err(VfsError::NoEnt);
         }
