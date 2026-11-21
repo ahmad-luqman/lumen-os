@@ -652,23 +652,20 @@ impl Ext4Inode {
         let idx = NonZeroU32::new(disk_ino).ok_or(VfsError::Inval)?;
         if child_nlink <= 1 && disk.links_count() <= 1 && is_inline_symlink(&disk) {
             let off = inner.layout.inode_disk_offset(&inner.bcache, disk_ino)?;
-            let mut inline_60 = [0u8; 60];
-            let mut size_lo_4 = [0u8; 4];
-            let mut size_hi_4 = [0u8; 4];
-            inner.bcache.read_at(off + 0x28, &mut inline_60).map_err(|_| VfsError::Io)?;
-            inner.bcache.read_at(off + 0x04, &mut size_lo_4).map_err(|_| VfsError::Io)?;
-            inner.bcache.read_at(off + 0x6c, &mut size_hi_4).map_err(|_| VfsError::Io)?;
-            let saved = SavedInlineSymlink { off, inline_60, size_lo_4, size_hi_4 };
+            // Read the contiguous inode span `[0x04..0x70)` covering `size_lo` (0x04..0x08),
+            // `inline_60` (0x28..0x64), and `size_hi` (0x6c..0x70) so we can zero all three
+            // fields in a single `bcache.write_at` call without ever splitting `inline_60`
+            // from `size_lo` on a write-cutoff fault.
+            let mut span = [0u8; 0x6c];
+            inner.bcache.read_at(off + 0x04, &mut span).map_err(|_| VfsError::Io)?;
+            let saved = SavedInlineSymlink { off, span };
 
-            let zeros60 = [0u8; 60];
-            let zero4 = [0u8; 4];
-            if inner.bcache.write_at(off + 0x28, &zeros60).is_err()
-                || inner.bcache.write_at(off + 0x04, &zero4).is_err()
-                || inner.bcache.write_at(off + 0x6c, &zero4).is_err()
-            {
-                saved.restore(inner);
-                return Err(VfsError::Io);
-            }
+            let mut zeroed_span = span;
+            zeroed_span[0x00..0x04].fill(0);
+            zeroed_span[0x24..0x60].fill(0);
+            zeroed_span[0x68..0x6c].fill(0);
+            inner.bcache.write_at(off + 0x04, &zeroed_span).map_err(|_| VfsError::Io)?;
+
             return match Inode::read(&inner.ext4, idx) {
                 Ok(zeroed_disk) => Ok((zeroed_disk, Some(saved))),
                 Err(e) => {
@@ -895,6 +892,27 @@ impl Ext4Inode {
         }
     }
 
+    fn decrement_parent_nlink_after_rmdir(
+        inner: &mut Ext4FsInner,
+        parent_ino: NonZeroU32,
+    ) -> (Option<u32>, Option<VfsError>) {
+        let mut parent_nlink: Option<u32> = None;
+        let post_res = (|| -> Result<(), VfsError> {
+            let mut parent_after = Inode::read(&inner.ext4, parent_ino).map_err(map_ext4_err)?;
+            let p_cur = inner.apply_nlink_bounds(parent_ino.get(), u32::from(parent_after.links_count()));
+            let p_new = p_cur.saturating_sub(1);
+            parent_nlink = Some(p_new);
+            parent_after.set_links_count(u16::try_from(p_new).unwrap_or(u16::MAX));
+            if let Err(e) = parent_after.write(&inner.ext4) {
+                inner.set_nlink_exact(parent_ino.get(), p_new);
+                return Err(map_ext4_err(e));
+            }
+            inner.clear_nlink_bounds(parent_ino.get());
+            Ok(())
+        })();
+        (parent_nlink, post_res.err())
+    }
+
     fn unlink_dir_with_recovery(
         inner: &mut Ext4FsInner,
         parent_ino: NonZeroU32,
@@ -975,7 +993,8 @@ impl Ext4Inode {
                         inner.clear_nlink_bounds(child_arc.disk_ino);
                         None
                     };
-                    Ok(RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink: None, post_err: Some(err) })
+                    let (parent_nlink, _) = Self::decrement_parent_nlink_after_rmdir(inner, parent_ino);
+                    Ok(RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err: Some(err) })
                 }
                 Ok(_) | Err(_) => {
                     inner.set_nlink_exact(child_arc.disk_ino, effective_links);
@@ -993,21 +1012,8 @@ impl Ext4Inode {
             inner.clear_nlink_bounds(child_arc.disk_ino);
             None
         };
-        let mut parent_nlink: Option<u32> = None;
-        let post_res = (|| -> Result<(), VfsError> {
-            let mut parent_after = Inode::read(&inner.ext4, parent_ino).map_err(map_ext4_err)?;
-            let p_cur = inner.apply_nlink_bounds(parent_ino.get(), u32::from(parent_after.links_count()));
-            let p_new = p_cur.saturating_sub(1);
-            parent_nlink = Some(p_new);
-            parent_after.set_links_count(u16::try_from(p_new).unwrap_or(u16::MAX));
-            if let Err(e) = parent_after.write(&inner.ext4) {
-                inner.set_nlink_exact(parent_ino.get(), p_new);
-                return Err(map_ext4_err(e));
-            }
-            inner.clear_nlink_bounds(parent_ino.get());
-            Ok(())
-        })();
-        Ok(RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err: post_res.err() })
+        let (parent_nlink, post_err) = Self::decrement_parent_nlink_after_rmdir(inner, parent_ino);
+        Ok(RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err })
     }
 }
 
@@ -1023,16 +1029,14 @@ enum RmdirDiskOutcome {
 
 struct SavedInlineSymlink {
     off: u64,
-    inline_60: [u8; 60],
-    size_lo_4: [u8; 4],
-    size_hi_4: [u8; 4],
+    span: [u8; 0x6c],
 }
 
 impl SavedInlineSymlink {
     fn restore(&self, inner: &Ext4FsInner) {
-        let _ = inner.bcache.write_at(self.off + 0x28, &self.inline_60);
-        let _ = inner.bcache.write_at(self.off + 0x04, &self.size_lo_4);
-        let _ = inner.bcache.write_at(self.off + 0x6c, &self.size_hi_4);
+        if inner.bcache.write_at(self.off + 0x04, &self.span).is_err() {
+            let _ = inner.bcache.write_at(self.off + 0x04, &self.span);
+        }
     }
 }
 
@@ -1916,11 +1920,13 @@ impl VfsInode for Ext4Inode {
                                          restore_old_entry: bool,
                                          restore_new_entry: bool|
                  -> (Option<u32>, Option<u32>, Option<u32>, Option<u32>) {
+                    let old_min_unlink: u16 = if old_is_dir { 3 } else { 2 };
+                    let new_min_unlink: u16 = if new_is_dir { 3 } else { 2 };
                     if undo_new_at_old {
-                        rollback_link_entry(&inner.ext4, old_dir_ino, old_dname, new_child_ino, 2);
+                        rollback_link_entry(&inner.ext4, old_dir_ino, old_dname, new_child_ino, new_min_unlink);
                     }
                     if undo_old_at_new {
-                        rollback_link_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino, 2);
+                        rollback_link_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino, old_min_unlink);
                     }
                     if restore_old_entry {
                         rollback_restore_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino);
@@ -1929,10 +1935,77 @@ impl VfsInode for Ext4Inode {
                         rollback_restore_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino);
                     }
 
-                    let old_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino.get());
-                    let old_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get());
-                    let new_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get());
-                    let new_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, new_child_ino.get());
+                    let mut old_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino.get());
+                    let mut old_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get());
+                    let mut new_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get());
+                    let mut new_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, new_child_ino.get());
+
+                    // Post-undo verification & recovery pass: under transient 2-write faults
+                    // (`Pair(c1, c2)`), `c2` may strike one of the rollback writes above, leaving
+                    // either entry vanished (0 slots) or an intruder dual-linked in the other slot.
+                    // Once `c2` has passed, recover any missing/blocked entries back to `(old, new)`.
+                    if let (Ok(oo), Ok(on), Ok(nn), Ok(no)) =
+                        (&old_in_old_res, &old_in_new_res, &new_in_new_res, &new_in_old_res)
+                        && ((!*oo && !*on) || (!*nn && !*no))
+                    {
+                        if !*oo {
+                            if *no {
+                                if !*nn && !*on && dir_entry_absent(&inner.ext4, new_dir_ino, new_dname) {
+                                    rollback_restore_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino);
+                                }
+                                if matches!(
+                                    dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get()),
+                                    Ok(true)
+                                ) {
+                                    rollback_link_entry(
+                                        &inner.ext4,
+                                        old_dir_ino,
+                                        old_dname,
+                                        new_child_ino,
+                                        new_min_unlink,
+                                    );
+                                }
+                            }
+                            rollback_restore_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino);
+                        }
+
+                        let oo_now =
+                            matches!(dir_has_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino.get()), Ok(true));
+                        let on_now =
+                            matches!(dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get()), Ok(true));
+                        let nn_now =
+                            matches!(dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get()), Ok(true));
+                        if !nn_now {
+                            if on_now {
+                                if !oo_now && dir_entry_absent(&inner.ext4, old_dir_ino, old_dname) {
+                                    rollback_restore_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino);
+                                }
+                                if matches!(
+                                    dir_has_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino.get()),
+                                    Ok(true)
+                                ) {
+                                    rollback_link_entry(
+                                        &inner.ext4,
+                                        new_dir_ino,
+                                        new_dname,
+                                        old_child_ino,
+                                        old_min_unlink,
+                                    );
+                                }
+                            }
+                            rollback_restore_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino);
+                        }
+
+                        old_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino.get());
+                        old_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get());
+                        new_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get());
+                        new_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, new_child_ino.get());
+                    }
+
+                    let restore_links_retry = |ext4: &Ext4, ino: NonZeroU32, target: u16| -> Result<(), VfsError> {
+                        restore_disk_links_count(ext4, ino, target)
+                            .or_else(|_| restore_disk_links_count(ext4, ino, target))
+                    };
 
                     let mut min_old_child = None;
                     let mut min_new_child = None;
@@ -1943,7 +2016,7 @@ impl VfsInode for Ext4Inode {
                         let slots = u16::from(*oo) + u16::from(*on);
                         let target = old_orig_links.saturating_sub(1).saturating_add(slots);
                         let resolved = if slots >= 2 { target.max(if old_is_dir { 3 } else { 2 }) } else { target };
-                        if restore_disk_links_count(&inner.ext4, old_child_ino, resolved).is_ok() {
+                        if restore_links_retry(&inner.ext4, old_child_ino, resolved).is_ok() {
                             inner.clear_nlink_bounds(old_child_ino.get());
                         } else {
                             inner.set_nlink_exact(old_child_ino.get(), u32::from(resolved));
@@ -1964,7 +2037,7 @@ impl VfsInode for Ext4Inode {
                         let slots = u16::from(*nn) + u16::from(*no);
                         let target = new_orig_links.saturating_sub(1).saturating_add(slots);
                         let resolved = if slots >= 2 { target.max(if new_is_dir { 3 } else { 2 }) } else { target };
-                        if restore_disk_links_count(&inner.ext4, new_child_ino, resolved).is_ok() {
+                        if restore_links_retry(&inner.ext4, new_child_ino, resolved).is_ok() {
                             inner.clear_nlink_bounds(new_child_ino.get());
                         } else {
                             inner.set_nlink_exact(new_child_ino.get(), u32::from(resolved));
@@ -1990,7 +2063,7 @@ impl VfsInode for Ext4Inode {
                             let expected_p = old_p_orig_links
                                 .saturating_sub(u16::from(old_is_dir) + u16::from(new_is_dir))
                                 .saturating_add(u16::from(old_slot_has_dir) + u16::from(new_slot_has_dir));
-                            let restored = restore_disk_links_count(&inner.ext4, old_dir_ino, expected_p).is_ok();
+                            let restored = restore_links_retry(&inner.ext4, old_dir_ino, expected_p).is_ok();
                             if restored {
                                 inner.clear_nlink_bounds(old_dir_ino.get());
                             } else {
@@ -2007,15 +2080,13 @@ impl VfsInode for Ext4Inode {
                             let expected_new_p = new_p_orig_links
                                 .saturating_sub(u16::from(new_is_dir))
                                 .saturating_add(u16::from(new_slot_has_dir));
-                            let restored_old =
-                                restore_disk_links_count(&inner.ext4, old_dir_ino, expected_old_p).is_ok();
+                            let restored_old = restore_links_retry(&inner.ext4, old_dir_ino, expected_old_p).is_ok();
                             if restored_old {
                                 inner.clear_nlink_bounds(old_dir_ino.get());
                             } else {
                                 inner.set_nlink_exact(old_dir_ino.get(), u32::from(expected_old_p));
                             }
-                            let restored_new =
-                                restore_disk_links_count(&inner.ext4, new_dir_ino, expected_new_p).is_ok();
+                            let restored_new = restore_links_retry(&inner.ext4, new_dir_ino, expected_new_p).is_ok();
                             if restored_new {
                                 inner.clear_nlink_bounds(new_dir_ino.get());
                             } else {
@@ -2202,6 +2273,24 @@ impl VfsInode for Ext4Inode {
                         Some(e) => Err(e),
                         None => Ok(()),
                     };
+                    let expected_old_dir_nlink = if same_parent {
+                        old_p_orig_links
+                    } else if old_is_dir {
+                        old_p_orig_links.saturating_sub(1).saturating_add(u16::from(new_is_dir))
+                    } else if new_is_dir {
+                        old_p_orig_links.saturating_add(1)
+                    } else {
+                        old_p_orig_links
+                    };
+                    let expected_new_dir_nlink = if same_parent {
+                        old_p_orig_links
+                    } else if new_is_dir {
+                        new_p_orig_links.saturating_sub(1).saturating_add(u16::from(old_is_dir))
+                    } else if old_is_dir {
+                        new_p_orig_links.saturating_add(1)
+                    } else {
+                        new_p_orig_links
+                    };
                     ExchangeSync {
                         old_child_nlink: read_disk_nlink(&inner.ext4, old_child_ino)
                             .map(|d| inner.apply_nlink_bounds(old_child_ino.get(), d))
@@ -2210,9 +2299,11 @@ impl VfsInode for Ext4Inode {
                             .map(|d| inner.apply_nlink_bounds(new_child_ino.get(), d))
                             .or(Some(u32::from(new_orig_links))),
                         old_dir_nlink: read_disk_nlink(&inner.ext4, old_dir_ino)
-                            .map(|d| inner.apply_nlink_bounds(old_dir_ino.get(), d)),
+                            .map(|d| inner.apply_nlink_bounds(old_dir_ino.get(), d))
+                            .or(Some(u32::from(expected_old_dir_nlink))),
                         new_dir_nlink: read_disk_nlink(&inner.ext4, new_dir_ino)
-                            .map(|d| inner.apply_nlink_bounds(new_dir_ino.get(), d)),
+                            .map(|d| inner.apply_nlink_bounds(new_dir_ino.get(), d))
+                            .or(Some(u32::from(expected_new_dir_nlink))),
                         touch_timestamps: true,
                         res: post_res,
                     }
