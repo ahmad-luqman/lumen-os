@@ -734,18 +734,17 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         .map_err(|e| format!("open /tmp/hello_tmp.txt: {e:?}"))?,
     )
     .map_err(|e| format!("open file /tmp/hello_tmp.txt: {e:?}"))?;
-    let tmp_f = Arc::clone(&tmp_of.inode);
+    let tmp_f = &tmp_of.inode;
     tmp_f.write_at(0, b"tmpfs-payload").map_err(|e| format!("write /tmp: {e:?}"))?;
     unlink_at(&TABLES, None, b"/tmp/hello_tmp.txt", false).map_err(|e| format!("unlink /tmp: {e:?}"))?;
     if !tmp_f.is_detached() || tmp_f.stat().map_err(|e| format!("stat detached: {e:?}"))?.nlink != 0 {
         return Err(String::from("/tmp open-unlinked did not detach"));
     }
-    let got_tmp = read_all_inode(&tmp_f).map_err(|e| format!("read detached /tmp: {e:?}"))?;
+    let got_tmp = read_all_inode(tmp_f).map_err(|e| format!("read detached /tmp: {e:?}"))?;
     if got_tmp != b"tmpfs-payload" {
         return Err(String::from("/tmp open-unlinked payload mismatch"));
     }
     drop(tmp_of);
-    drop(tmp_f);
 
     // Test 32 MiB /tmp quota enforcement (-ENOSPC) and release on unlink.
     {

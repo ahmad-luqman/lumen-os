@@ -46,12 +46,12 @@ crate::ktest!(
             0,
         )
         .map_err(|_| "create tail.bin")?;
-        let of = OpenFile::<KernelVfsLock<u64>>::new(
+        let of = OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(
             Arc::clone(&f),
             Arc::from(path_str.as_str()),
             OpenFlags::from_bits_truncate(OpenFlags::O_RDWR),
         )
-        .map_err(|_| "OpenFile::new")?;
+        .map_err(|_| "OpenFile::new_unchecked_flags")?;
         *of.offset.lock() = 123;
         kassert_eq!(*of.offset.lock(), 123);
         drop(of);

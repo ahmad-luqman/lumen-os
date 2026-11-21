@@ -176,6 +176,26 @@ pub struct OpenGuard {
     inode: Arc<dyn VfsInode>,
 }
 
+/// Why [`OpenGuard::try_new`] refused a reference, kept apart inside the
+/// crate so an `O_CREAT` open retries only a lost race, never a `stat()`
+/// error that happens to be `ENOENT` (a vanished procfs entry).
+pub(crate) enum Refused {
+    /// An unlink freed the inode before the count went up (`nlink == 0`,
+    /// not detached): `ENOENT` to callers.
+    Freed,
+    /// `stat()` failed: its error, unchanged.
+    Stat(VfsError),
+}
+
+impl From<Refused> for VfsError {
+    fn from(r: Refused) -> Self {
+        match r {
+            Refused::Freed => VfsError::NoEnt,
+            Refused::Stat(e) => e,
+        }
+    }
+}
+
 impl OpenGuard {
     /// Acquire an open reference on `inode` without checking that it is
     /// still linked or detached.
@@ -183,7 +203,7 @@ impl OpenGuard {
     /// Only where nothing can free the inode before the count goes up: an
     /// inode some other reference already keeps open (a clone, a `cwd`
     /// inherited by `fork`), a file just created under its filesystem's
-    /// Lock 3 (the `O_CREAT` path of
+    /// Lock 3 on a filesystem with a rename lock (the `O_CREAT` path of
     /// [`open_inode_guarded`](crate::ops::open_inode_guarded)), or tests. On
     /// an inode found by a path lookup, an `unlink` landing between the
     /// lookup and this increment frees the inode under the new reference.
@@ -207,18 +227,24 @@ impl OpenGuard {
     ///
     /// May sleep: through `stat()` it takes the inode's Lock 4 and, on ext4
     /// and tmpfs, its Lock 5 (pages). Never call it holding this inode's
-    /// Lock 4, any of Locks 5 to 9, or a spinlock.
+    /// Lock 4 (or another inode's Lock 4 out of `lock_id` order), any of
+    /// Locks 5 to 9, or a spinlock.
     pub fn try_new(inode: Arc<dyn VfsInode>) -> Result<Self, VfsError> {
+        Self::try_new_or_refused(inode).map_err(VfsError::from)
+    }
+
+    /// [`OpenGuard::try_new`] saying why it refused.
+    pub(crate) fn try_new_or_refused(inode: Arc<dyn VfsInode>) -> Result<Self, Refused> {
         inode.inc_open_count();
         // On an error `guard` drops and gives the reference back.
         let guard = Self { inode };
-        let meta = guard.inode.stat()?;
+        let meta = guard.inode.stat().map_err(Refused::Stat)?;
         // `is_detached` after `stat`, never before: a detach sets both under
         // the lock `stat` took, so a zero `nlink` read there comes with its
         // `detached` flag, while a flag read first could predate a detach
         // that `stat` then sees as `nlink == 0`.
         if meta.nlink == 0 && !guard.inode.is_detached() {
-            return Err(VfsError::NoEnt);
+            return Err(Refused::Freed);
         }
         Ok(guard)
     }
@@ -239,7 +265,12 @@ impl Drop for OpenGuard {
     fn drop(&mut self) {
         // This guard's own reference is still counted, so the count is at
         // least 1 here unless a reference was given back twice.
-        debug_assert!(self.inode.open_count() > 0, "open count already 0 before an OpenGuard's drop");
+        debug_assert!(
+            self.inode.open_count() > 0,
+            "open count of inode {:?}:{} already 0 before an OpenGuard's drop",
+            self.inode.dev_id(),
+            self.inode.ino()
+        );
         let _ = self.inode.dec_open_count();
     }
 }

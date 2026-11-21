@@ -1230,14 +1230,14 @@ fn fd_table_capacity_dup_and_opath_matrix() {
 
     // 23. O_PATH checks
     let of_path = Arc::new(
-        OpenFile::<StdLock<u64>>::new(
+        OpenFile::<StdLock<u64>>::new_unchecked_flags(
             opath,
             Arc::from("/fdtest"),
             OpenFlags(OpenFlags::O_PATH | OpenFlags::O_WRONLY | OpenFlags::O_APPEND),
         )
         .unwrap(),
     );
-    assert!(of_path.is_path);
+    assert!(of_path.is_path());
     assert_eq!(of_path.require_non_path(), Err(VfsError::BadF));
     assert_eq!(of_path.require_readable(), Err(VfsError::BadF));
     assert_eq!(of_path.require_writable(), Err(VfsError::BadF));
@@ -1247,8 +1247,12 @@ fn fd_table_capacity_dup_and_opath_matrix() {
 
     // Normal OpenFile
     let of_rw = Arc::new(
-        OpenFile::<StdLock<u64>>::new(file, Arc::from("/fdtest"), OpenFlags(OpenFlags::O_RDWR | OpenFlags::O_APPEND))
-            .unwrap(),
+        OpenFile::<StdLock<u64>>::new_unchecked_flags(
+            file,
+            Arc::from("/fdtest"),
+            OpenFlags(OpenFlags::O_RDWR | OpenFlags::O_APPEND),
+        )
+        .unwrap(),
     );
     assert_eq!(of_rw.require_non_path(), Ok(()));
     assert_eq!(of_rw.require_readable(), Ok(()));
@@ -2524,7 +2528,12 @@ fn post_mutation_dentry_invalidation_and_fd_ref_sync() {
     // `/f1` was unlinked with no open reference: an open file description
     // for it is refused (#262), and gives its reference back.
     assert_eq!(
-        OpenFile::<StdLock<u64>>::new(Arc::clone(&file), Arc::from("/f1"), OpenFlags(OpenFlags::O_RDWR)).unwrap_err(),
+        OpenFile::<StdLock<u64>>::new_unchecked_flags(
+            Arc::clone(&file),
+            Arc::from("/f1"),
+            OpenFlags(OpenFlags::O_RDWR)
+        )
+        .unwrap_err(),
         VfsError::NoEnt
     );
     assert_eq!(file.open_count(), 0);
@@ -2532,7 +2541,8 @@ fn post_mutation_dentry_invalidation_and_fd_ref_sync() {
     // `OpenFile::dec_fd_ref` AcqRel reference counting transitions cleanly to 0.
     let (live, _) =
         open_inode(&spy, None, b"/f2", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
-    let of = OpenFile::<StdLock<u64>>::new(live, Arc::from("/f2"), OpenFlags(OpenFlags::O_RDWR)).unwrap();
+    let of =
+        OpenFile::<StdLock<u64>>::new_unchecked_flags(live, Arc::from("/f2"), OpenFlags(OpenFlags::O_RDWR)).unwrap();
     of.inc_fd_ref();
     of.inc_fd_ref();
     assert_eq!(of.fd_ref_count(), 3);
@@ -7911,10 +7921,7 @@ impl VfsInode for GateInode {
     }
     fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
         let found = self.child(name);
-        self.run(|h| match &h.after_lookup {
-            Some((n, _)) if n == name => h.after_lookup.take().map(|(_, hook)| hook),
-            _ => None,
-        });
+        self.run(|h| h.after_lookup.take_if(|(n, _)| n == name).map(|(_, hook)| hook));
         found.map(|c| c as Arc<dyn VfsInode>).ok_or(VfsError::NoEnt)
     }
     fn create(&self, name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
@@ -8096,7 +8103,7 @@ fn open_file_new_refuses_an_inode_freed_since_open_inode() {
     let (inode, path) = open_inode(&g.env, None, b"/a", RDONLY, 0, 0).unwrap();
     assert_eq!(g.files[0].open_count(), 0, "open_inode returns holding no reference");
     unlink_at(&g.env, None, b"/a", false).unwrap();
-    match OpenFile::<StdLock<u64>>::new(inode, Arc::from(path.as_str()), RDONLY) {
+    match OpenFile::<StdLock<u64>>::new_unchecked_flags(inode, Arc::from(path.as_str()), RDONLY) {
         Ok(of) => panic!("an open file description on a freed inode, reading {:?}", read_gate(&of)),
         Err(e) => assert_eq!(e, VfsError::NoEnt),
     }
@@ -8183,7 +8190,7 @@ fn o_path_open_racing_unlink_detaches_or_fails_cleanly() {
     f[0].arm(|h| h.after_inc = Some(hook));
     let of = gate_file(open_inode_guarded(&g.env, None, b"/between", OPATH, 0, 0).unwrap());
     assert!(f[0].all_hooks_ran());
-    assert!(of.is_path);
+    assert!(of.is_path());
     assert!(f[0].is_detached());
     assert_eq!(f[0].open_count(), 1);
     drop(of);
@@ -8243,7 +8250,11 @@ fn failed_opens_give_their_reference_back() {
     assert_eq!(open_inode_guarded(&g.env, None, b"/stat", RDONLY, 0, 0).err(), Some(VfsError::Io));
     assert_eq!(f[0].open_count(), 0);
     f[1].arm(|h| h.stat_error = Some(VfsError::Io));
-    let res = OpenFile::<StdLock<u64>>::new(Arc::clone(&f[1]) as Arc<dyn VfsInode>, Arc::from("/stat_new"), RDONLY);
+    let res = OpenFile::<StdLock<u64>>::new_unchecked_flags(
+        Arc::clone(&f[1]) as Arc<dyn VfsInode>,
+        Arc::from("/stat_new"),
+        RDONLY,
+    );
     assert_eq!(res.err(), Some(VfsError::Io));
     assert_eq!(f[1].open_count(), 0);
 
@@ -8252,4 +8263,72 @@ fn failed_opens_give_their_reference_back() {
     let trunc = OpenFlags(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC);
     assert_eq!(open_inode_guarded(&g.env, None, b"/trunc", trunc, 0, 0).err(), Some(VfsError::Io));
     assert_eq!(f[2].open_count(), 0);
+}
+
+#[test]
+fn o_creat_retries_only_a_freed_file_and_stops_with_eexist() {
+    // `stat()` failing with `ENOENT` (a vanished procfs entry, say) is not a
+    // lost race: passed through at once, not retried (a retry would find
+    // `stat` working again and succeed).
+    let g = gate_vfs(&["s"]);
+    g.files[0].arm(|h| h.stat_error = Some(VfsError::NoEnt));
+    let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR);
+    assert_eq!(open_inode_guarded(&g.env, None, b"/s", creat, 0o644, 0).err(), Some(VfsError::NoEnt));
+    assert_eq!(g.files[0].open_count(), 0);
+
+    // Churn: every round finds a `/churn` that is unlinked (and replaced)
+    // before the reference goes up. After `MAX_CREAT_RACE_RETRIES` more
+    // rounds than the first the open gives up with `EEXIST`, the same error
+    // as the create loop's own limit; no reference left anywhere.
+    fn arm_churn(root: &Arc<GateInode>, lock: &Arc<Mutex<()>>, seen: &Arc<Mutex<Vec<Arc<GateInode>>>>) {
+        let f = GateInode::new(&root.next_ino, InodeType::File, 1, Some(GATE_DATA.to_vec()));
+        let (r, l, n) = (Arc::clone(root), Arc::clone(lock), Arc::clone(seen));
+        f.arm(|h| {
+            h.at_rofs_check = Some(alloc::boxed::Box::new(move || {
+                {
+                    let _held = l.try_lock().expect("the hook runs outside Lock 3");
+                    r.unlink("churn").unwrap();
+                }
+                arm_churn(&r, &l, &n);
+            }))
+        });
+        seen.lock().unwrap().push(Arc::clone(&f));
+        root.state.lock().unwrap().children.insert(String::from("churn"), f);
+    }
+    let g = gate_vfs(&[]);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    arm_churn(&g.root, &g.rename_lock, &seen);
+    assert_eq!(open_inode_guarded(&g.env, None, b"/churn", creat, 0o644, 0).err(), Some(VfsError::Exist));
+    let seen = seen.lock().unwrap();
+    // Each round's file, plus the one armed for a round that never came.
+    assert_eq!(seen.len(), crate::ops::MAX_CREAT_RACE_RETRIES + 2);
+    assert!(seen.iter().all(|f| f.open_count() == 0));
+    assert!(seen[..seen.len() - 1].iter().all(|f| f.all_hooks_ran() && f.state.lock().unwrap().data.is_none()));
+}
+
+#[test]
+fn o_trunc_truncates_only_after_the_reference_is_checked() {
+    // The file `O_CREAT | O_TRUNC` finds is freed before the reference goes
+    // up: the open makes a new `/c` instead of failing on the freed one.
+    let g = gate_vfs(&["c"]);
+    let old = Arc::clone(&g.files[0]);
+    let hook = g.unlink_hook("c");
+    old.arm(|h| h.at_rofs_check = Some(hook));
+    let flags = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_TRUNC | OpenFlags::O_RDWR);
+    let of = gate_file(open_inode_guarded(&g.env, None, b"/c", flags, 0o644, 0).unwrap());
+    assert!(old.all_hooks_ran());
+    let new = g.root.child("c").expect("a new /c");
+    assert_eq!(of.inode.lock_id(), new.lock_id());
+    assert_eq!(old.open_count(), 0);
+    drop(of);
+
+    // The check fails (`stat` errors): nothing is truncated.
+    let g = gate_vfs(&["t"]);
+    g.files[0].arm(|h| h.stat_error = Some(VfsError::Io));
+    let trunc = OpenFlags(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC);
+    assert_eq!(open_inode_guarded(&g.env, None, b"/t", trunc, 0, 0).err(), Some(VfsError::Io));
+    assert_eq!(g.files[0].open_count(), 0);
+    let mut buf = [0u8; 32];
+    let n = g.files[0].read_at(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], GATE_DATA, "the data is intact");
 }
