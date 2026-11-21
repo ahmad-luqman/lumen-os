@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::error::VfsError;
 use crate::fs::{OpenGuard, VfsInode};
+use crate::ops::Opened;
 use crate::types::{AccessMode, OpenFlags};
 use crate::{MAX_FDS, next_open_file_id};
 
@@ -74,18 +75,27 @@ impl<L: VfsLock<u64>> OpenFile<L> {
     ///
     /// `ENOENT` if `inode` was freed by an unlink since it was looked up
     /// (between [`open_inode`](crate::ops::open_inode) returning and this
-    /// call, say). Opens should prefer
-    /// [`open_inode_guarded`](crate::ops::open_inode_guarded) and
-    /// [`OpenFile::from_guard`], which can't lose that race.
+    /// call, say): only an inode that reports `nlink >= 1`, or is detached,
+    /// can be opened. May sleep, as `try_new` does (the inode's Lock 4 and,
+    /// on ext4 and tmpfs, Lock 5 through `stat()`): never call it holding
+    /// this inode's Lock 4, any of Locks 5 to 9, or a spinlock. Opens should
+    /// prefer [`open_inode_guarded`](crate::ops::open_inode_guarded) and
+    /// [`OpenFile::from_opened`], which can't lose that race.
     pub fn new(inode: Arc<dyn VfsInode>, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
         flags.access_mode()?;
-        Self::from_guard(OpenGuard::try_new(inode)?, path, flags)
+        Self::build(OpenGuard::try_new(inode)?, path, flags)
     }
 
-    /// Construct a new open file description with `fd_refs = 1` that takes
-    /// over `guard`'s open reference (no second count): the one
-    /// [`open_inode_guarded`](crate::ops::open_inode_guarded) returns.
-    pub fn from_guard(guard: OpenGuard, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
+    /// Construct a new open file description with `fd_refs = 1` from what
+    /// [`open_inode_guarded`](crate::ops::open_inode_guarded) opened: it
+    /// takes that open's reference over (no second count) and its checked
+    /// flags. Never sleeps.
+    pub fn from_opened(opened: Opened) -> Result<Self, VfsError> {
+        let (guard, path, flags) = opened.into_parts();
+        Self::build(guard, Arc::from(path.as_str()), flags)
+    }
+
+    fn build(guard: OpenGuard, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
         let access_mode = flags.access_mode()?;
         let is_path = flags.is_path();
         let status_bits = if is_path { 0 } else { flags.status_bits() };

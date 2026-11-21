@@ -5036,10 +5036,9 @@ crate::ktest!(
         // The guarded open's reference carries into the open file
         // description: the unlink sees it and detaches, and the file reads
         // its data.
-        let (guard, path) = open_inode_guarded(&tables, None, b"/kept", rd, 0, 0).map_err(|_| "open kept")?;
+        let opened = open_inode_guarded(&tables, None, b"/kept", rd, 0, 0).map_err(|_| "open kept")?;
         unlink_at(&tables, None, b"/kept", false).map_err(|_| "unlink kept")?;
-        let of = OpenFile::<KernelVfsLock<u64>>::from_guard(guard, Arc::from(path.as_str()), rd)
-            .map_err(|_| "OpenFile::from_guard")?;
+        let of = OpenFile::<KernelVfsLock<u64>>::from_opened(opened).map_err(|_| "OpenFile::from_opened")?;
         kassert!(of.inode.is_detached());
         kassert_eq!(of.inode.open_count(), 1);
         kassert_eq!(read_all(&of.inode)?, data);
