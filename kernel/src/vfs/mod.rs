@@ -710,6 +710,35 @@ fn is_maps_line(line: &str) -> bool {
     range_ok && perms_ok && hex(offset, 8, 8) && dev_ok && ino_ok
 }
 
+/// Check that `dir`'s listing agrees with lookup: each entry named in `names`
+/// (all of them if `None`) has the inode number and type that looking its
+/// name up and `stat`ing it gives, as `ls -i` and `find` expect. Every name in
+/// `names` must be listed.
+fn check_listing_agrees_with_lookup(dir: &Arc<dyn VfsInode>, what: &str, names: Option<&[&str]>) -> Result<(), String> {
+    let mut entries = Vec::new();
+    dir.readdir(0, &mut entries, 1024).map_err(|e| format!("readdir {what}: {e:?}"))?;
+    if let Some(names) = names {
+        for name in names {
+            if !entries.iter().any(|e| e.name == *name) {
+                return Err(format!("{what} doesn't list {name:?}"));
+            }
+        }
+    }
+    for entry in entries.iter().filter(|e| names.is_none_or(|n| n.contains(&e.name.as_str()))) {
+        let st = dir
+            .lookup(&entry.name)
+            .and_then(|n| n.stat())
+            .map_err(|e| format!("lookup and stat {what}/{}: {e:?}", entry.name))?;
+        if (st.ino, st.inode_type) != (entry.ino, entry.inode_type) {
+            return Err(format!(
+                "{what}/{} listed as ({}, {:?}) but stat says ({}, {:?})",
+                entry.name, entry.ino, entry.inode_type, st.ino, st.inode_type
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 fn run_dev_tmp_proc_checks() -> Result<String, String> {
     use crate::linux::process::{self, ConsoleIo};
@@ -957,6 +986,18 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
             if fd_target_live != b"/tmp/proc_fd_test.txt" {
                 return Err(format!("fd/3 live mismatch: {fd_target_live:?}"));
             }
+            // getdents' inode numbers and types agree with stat's: this
+            // process's entry in `/proc`, everything in `/proc/<pid>`, and
+            // `/proc/<pid>/fd`'s `.`, `..` and `3`.
+            let pid_name = format!("{pid}");
+            let proc_root = resolve_path_from_root("/proc").map_err(|e| format!("resolve /proc: {e:?}"))?;
+            check_listing_agrees_with_lookup(&proc_root, "/proc", Some(&[pid_name.as_str()]))?;
+            let pid_path = format!("/proc/{pid}");
+            let pid_listed = resolve_path_from_root(&pid_path).map_err(|e| format!("resolve {pid_path}: {e:?}"))?;
+            check_listing_agrees_with_lookup(&pid_listed, &pid_path, None)?;
+            let fd_path = format!("/proc/{pid}/fd");
+            let fd_dir = resolve_path_from_root(&fd_path).map_err(|e| format!("resolve {fd_path}: {e:?}"))?;
+            check_listing_agrees_with_lookup(&fd_dir, &fd_path, Some(&[".", "..", "3"]))?;
 
             // Magic symlink traversal reads the live inode directly even after unlink!
             unlink_at(&TABLES, None, b"/tmp/proc_fd_test.txt", false).map_err(|e| format!("unlink fd_test: {e:?}"))?;
