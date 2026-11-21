@@ -3413,8 +3413,12 @@ route through the VFS and real process working directory:
 - **`readv` (19):** loops across all non-empty `iov` spans for regular files
   (stopping early only on EOF or error), while keeping single-read early return
   on console/tty FDs.
-- **`poll` (7):** regular files and `/dev/*` report `POLLIN | POLLOUT`
-  immediately (matching Linux).
+- **`poll` (7):** regular files, directories, `/proc/*`, and always-ready
+  character devices (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`)
+  report `POLLIN | POLLOUT` immediately (matching Linux), while console FDs
+  0/1/2, `/dev/tty`, and `/dev/console` preserve M6's readiness-driven polling
+  (`POLLOUT` immediately; `POLLIN` gated on `stdin_ready(io)` with
+  timeout-aware blocking wait).
 - **`mmap` (9):** M7 widens `sys_mmap` dispatch from M6's 4 arguments to all 6
   Linux arguments `(rdi, rsi, rdx, r10, r8 = fd, r9 = off)`.
 
