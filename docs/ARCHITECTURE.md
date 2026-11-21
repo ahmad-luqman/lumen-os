@@ -3355,18 +3355,40 @@ Lumen runs two kinds of user code:
   `sigaction` layouts match Linux x86-64 verbatim.
 - **Unknown syscalls:** return `-ENOSYS` (`-38`) and log once per syscall
   number per boot at `debug` level (never panic or kill the process).
-- **Handlers (`kernel/src/linux/syscall/`, #254):** `dispatch` has one arm
-  per number (its constant as the pattern), passing the registers of the
-  syscall's Linux signature to a handler in its cluster's module (`fd`,
-  `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem` and `proc`). An M7
-  syscall not yet implemented is a stub logging like an unknown one (with
-  its name) and returning `-ENOSYS`. The file syscalls decode their
-  registers through `syscall/at.rs`, as Linux reads them: an `int`,
-  `mode_t` or flags argument is the register's low 32 bits (`AT_FDCWD`
-  sign- or zero-extended is the same `Dirfd::Cwd`). `at.rs` also copies
-  a path argument in (`UserPath`: `PATH_MAX` with its NUL, else
-  `-ENAMETOOLONG`; empty `-ENOENT` unless `AT_EMPTY_PATH`; non-UTF-8
-  `-ENOENT` until #268) and fills `struct stat` from VFS `Metadata`.
+- **Handlers (`kernel/src/linux/syscall/`, #254):** `dispatch` has each
+  number in one arm (its constant as the pattern; a number past `u32::MAX`
+  is `-ENOSYS`, though recent Linux reads only `eax`), passing the
+  registers of the syscall's Linux signature, in order, to a handler in its
+  cluster's module (`fd`, `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's
+  `mem` and `proc`). An M7 syscall not yet implemented is a stub logging
+  like an unknown one (with its name) and returning `-ENOSYS`. Wave 3's
+  handlers follow three rules:
+  1. **Decode first.** An M7 arm decodes each register with
+     `syscall/at.rs`'s `reg` into the handler's parameter type, as Linux
+     reads it: an `int`, `mode_t` or flags argument is the register's low
+     32 bits (`Fd`, `Dirfd`, where `AT_FDCWD` sign- or zero-extended is the
+     same `Dirfd::Cwd`, `Mode`, lumen-vfs's `AtFlags`/`OpenFlags`/
+     `RenameFlags`/`AccessMask`, `u32`, `i32`); a size, offset or pointer
+     is a whole `u64` or `UserPtr`. A handler never compares a raw register.
+  2. **One dirfd resolution.** Turning a `Dirfd` into the directory a path
+     starts from lives in `at.rs`, added by the FD-table PR (#254b). Its
+     traps: lumen-vfs's `start_dir: None` means the global root, so
+     `Dirfd::Cwd` resolves to the cwd's inode; an absolute path ignores the
+     dirfd, even a bad one; `AT_EMPTY_PATH` with `Dirfd::Fd` accepts a
+     descriptor that isn't a directory.
+  3. **Positive errnos inside, negated once.** Helpers return
+     `Result<_, u32>` holding a positive errno (`errno::ENOENT`, as
+     `VfsError::to_errno` gives); the handler applies `neg_errno` once, on
+     its way out (a private `fn inner(..) -> Result<u64, u32>` wrapped once,
+     as `read_into_user` is).
+
+  `at.rs` also copies a path argument in (`UserPath`: `PATH_MAX` with its
+  NUL, else `-ENAMETOOLONG`; empty `-ENOENT` unless `AT_EMPTY_PATH`; a bad
+  or `NULL` pointer `-EFAULT`; non-UTF-8 `-ENOENT` until #268) and fills
+  `struct stat` and `struct statx` from VFS `Metadata`. The per-cluster
+  stub ktests (`check_stubs`) dispatch with every argument zero, so they
+  can't see an arm passing registers out of order: each cluster's own tests
+  must, with distinct values in each argument.
 
 #### M6 initial syscall table (30 syscalls: static `musl` & `busybox ash` built-ins)
 
