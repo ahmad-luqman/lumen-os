@@ -655,9 +655,13 @@ fn vfs_pattern_byte(idx: usize) -> u8 {
 /// the kernel.
 const READ_ALL_MAX: usize = WRITE_PATTERN_MAX;
 
-/// A whole file's bytes, refused with `EFBIG` past [`READ_ALL_MAX`].
+/// A whole file's bytes, refused with `EFBIG` past [`READ_ALL_MAX`] and
+/// with `ENOMEM` when the heap can't hold them (reserved up front from the
+/// file's size, then grown fallibly).
 fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
     let mut out = Vec::new();
+    let size = inode.stat().map_or(0, |m| usize::try_from(m.size).unwrap_or(usize::MAX)).min(READ_ALL_MAX);
+    out.try_reserve_exact(size).map_err(|_| VfsError::NoMem)?;
     let mut off = 0u64;
     let mut buf = [0u8; 4096];
     loop {
@@ -668,6 +672,7 @@ fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
         if out.len() + n > READ_ALL_MAX {
             return Err(VfsError::FBig);
         }
+        out.try_reserve(n).map_err(|_| VfsError::NoMem)?;
         out.extend_from_slice(&buf[..n]);
         off += n as u64;
     }
@@ -957,7 +962,7 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     let res_clone = Arc::clone(&result);
 
     let handle = sched::spawn_user_on(0, "vfstest-proc", space_for_thread, move || {
-        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new());
+        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None);
         // `/proc/<pid>` and `/proc/<pid>/fd/3` as resolved while they exist,
         // for checking what they say once the process and fd are gone.
         let mut proc_nodes: Option<(Arc<dyn VfsInode>, Arc<dyn VfsInode>)> = None;

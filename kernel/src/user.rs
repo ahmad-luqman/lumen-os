@@ -20,7 +20,7 @@ use lumen_vm::{Prot, USER_STACK_BOTTOM};
 
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::arch::{self, TrapFrame};
-use crate::linux::process::{ConsoleIo, record_exit, register_current, set_current_exe_path, take_current};
+use crate::linux::process::{ConsoleIo, record_exit, register_current, take_current};
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, errno, general, ioctl, syscall as linux_syscall};
 #[cfg(feature = "ktest")]
 use crate::mm::paging;
@@ -530,10 +530,7 @@ fn spawn_ring3_on(
     let result_slot: ResultSlot = Arc::new(SpinLock::new(None));
     let out = result_slot.clone();
     let handle = sched::spawn_user_on(cpu, name, space, move || {
-        let _pid = register_current(io, allow_test_syscalls, stdin);
-        if let Some(path) = exe_path {
-            set_current_exe_path(&path);
-        }
+        let _pid = register_current(io, allow_test_syscalls, stdin, exe_path);
 
         let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
         let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
@@ -890,19 +887,22 @@ fn program_noncanon(iret_path: bool) -> Vec<u8> {
     c.0
 }
 
-/// Build a minimal static ELF64 (`ET_EXEC`) with custom program headers.
-fn build_elf_with_phdrs(
+/// A little-endian x86-64 ELF64 image of `len` bytes for tests: an `e_type`
+/// header, `phdrs` (`(p_type, p_flags, p_offset, p_vaddr, p_filesz,
+/// p_memsz)`) right after it, then each `(offset, bytes)` patch.
+pub(crate) fn build_elf_with_phdrs(
+    e_type: u16,
     entry: u64,
     phdrs: &[(u32, u32, u64, u64, u64, u64)],
-    payload_at_page: Option<&[u8]>,
+    len: usize,
+    patches: &[(usize, &[u8])],
 ) -> Vec<u8> {
-    let total_len = if payload_at_page.is_some() { 0x2000 } else { 0x1000 };
-    let mut img = vec![0u8; total_len];
+    let mut img = vec![0u8; len];
     img[0..4].copy_from_slice(&ELF_MAGIC);
     img[4] = ELFCLASS64;
     img[5] = ELFDATA2LSB;
     img[6] = EV_CURRENT;
-    img[0x10..0x12].copy_from_slice(&ET_EXEC.to_le_bytes());
+    img[0x10..0x12].copy_from_slice(&e_type.to_le_bytes());
     img[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
     img[0x14..0x18].copy_from_slice(&u32::from(EV_CURRENT).to_le_bytes());
     img[0x18..0x20].copy_from_slice(&entry.to_le_bytes());
@@ -922,8 +922,8 @@ fn build_elf_with_phdrs(
         img[o + 40..o + 48].copy_from_slice(&memsz.to_le_bytes());
         img[o + 48..o + 56].copy_from_slice(&FRAME_SIZE.to_le_bytes());
     }
-    if let Some(code) = payload_at_page {
-        img[0x1000..0x1000 + code.len()].copy_from_slice(code);
+    for &(off, bytes) in patches {
+        img[off..off + bytes.len()].copy_from_slice(bytes);
     }
     img
 }
@@ -935,34 +935,53 @@ fn run_bad_elf_tests(ctx: &mut Ctx<'_>) {
     // Pre-build all bad ELF images before measuring frames/heap so test fixture
     // allocation itself isn't counted as a loader leak.
     let bad_truncated = b"\x7fELF\x02\x01\x01".to_vec();
-    let bad_wx = build_elf_with_phdrs(0x40_1000, &[(PT_LOAD, PF_R | PF_W | PF_X, 0x100, 0x40_1000, 0x10, 0x10)], None);
+    let bad_wx = build_elf_with_phdrs(
+        ET_EXEC,
+        0x40_1000,
+        &[(PT_LOAD, PF_R | PF_W | PF_X, 0x100, 0x40_1000, 0x10, 0x10)],
+        0x1000,
+        &[],
+    );
     let bad_overlap = build_elf_with_phdrs(
+        ET_EXEC,
         0x40_1000,
         &[(PT_LOAD, PF_R | PF_X, 0x100, 0x40_1000, 0x200, 0x200), (PT_LOAD, PF_R, 0x200, 0x40_1100, 0x200, 0x200)],
-        None,
+        0x1000,
+        &[],
     );
     let bad_kernel_half = build_elf_with_phdrs(
+        ET_EXEC,
         0xffff_8000_0000_1000,
         &[(PT_LOAD, PF_R | PF_X, 0x100, 0xffff_8000_0000_1000, 0x10, 0x10)],
-        None,
+        0x1000,
+        &[],
     );
     let bad_interp = build_elf_with_phdrs(
+        ET_EXEC,
         0x40_1000,
         &[(PT_INTERP, PF_R, 0x100, 0x40_0100, 0x20, 0x20), (PT_LOAD, PF_R | PF_X, 0x100, 0x40_1000, 0x10, 0x10)],
-        None,
+        0x1000,
+        &[],
     );
     let bad_shared_wx = build_elf_with_phdrs(
+        ET_EXEC,
         0x40_1000,
         &[
             (PT_LOAD, PF_R | PF_X, 0x100, 0x40_1000, 0x400, 0x400),
             (PT_LOAD, PF_R | PF_W, 0x500, 0x40_1400, 0x400, 0x400),
         ],
-        None,
+        0x1000,
+        &[],
     );
     // Passes `LoadedElf::parse` but places PT_LOAD inside the reserved stack +
     // guard region, exercising `commit_loaded_elf` rejection + AddressSpace::drop.
-    let bad_stack_overlap =
-        build_elf_with_phdrs(USER_STACK_BOTTOM, &[(PT_LOAD, PF_R | PF_X, 0x100, USER_STACK_BOTTOM, 0x10, 0x10)], None);
+    let bad_stack_overlap = build_elf_with_phdrs(
+        ET_EXEC,
+        USER_STACK_BOTTOM,
+        &[(PT_LOAD, PF_R | PF_X, 0x100, USER_STACK_BOTTOM, 0x10, 0x10)],
+        0x1000,
+        &[],
+    );
 
     type BadElfCase<'a> = (&'static str, &'a [u8], fn(&UserVmError) -> bool);
     let cases: [BadElfCase<'_>; 7] = [
@@ -974,7 +993,9 @@ fn run_bad_elf_tests(ctx: &mut Ctx<'_>) {
         ("shared_wx", &bad_shared_wx, |e| {
             matches!(e, UserVmError::Elf(ElfLoadError::SharedPageWritableAndExecutable { .. }))
         }),
-        ("stack_overlap", &bad_stack_overlap, |e| matches!(e, UserVmError::Vm(lumen_vm::VmError::Exists))),
+        ("stack_overlap", &bad_stack_overlap, |e| {
+            matches!(e, UserVmError::Layout(crate::mm::user_vm::LayoutClash::MainOnStack))
+        }),
     ];
 
     // Pre-warm kernel heap before measuring so first-time heap expansion is
@@ -1145,9 +1166,11 @@ fn program_mmap_brk() -> Vec<u8> {
 fn run_mmap_brk_test(ctx: &mut Ctx<'_>) {
     let code = program_mmap_brk();
     let elf = build_elf_with_phdrs(
+        ET_EXEC,
         0x40_1000,
         &[(PT_LOAD, PF_R | PF_X, 0x1000, 0x40_1000, code.len() as u64, code.len() as u64)],
-        Some(&code),
+        0x2000,
+        &[(0x1000, &code)],
     );
     // Pre-warm heap so thread/slot metadata reuses existing heap pages.
     let _warm: Vec<u8> = vec![0u8; 8192];
@@ -1745,6 +1768,70 @@ crate::ktest!(
         // Kernel root restored and zero leaked frames/tables.
         kassert_eq!(arch::paging::active_root(), paging::kernel_root());
         kassert_eq!(frame::free_frames(), free_before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn exe_path_reaches_the_process() {
+        use crate::linux::process::{active_pids, process_exe_path};
+        use crate::{kassert, kassert_eq};
+
+        const PATH: &str = "/ktest/exe-path";
+        // Spin until the kernel writes a non-zero word at TEST_DATA_VA, then exit 0.
+        let mut c = CodeBuf::new();
+        c.bytes(&[0xf3, 0x90]); // loop: pause
+        c.bytes(&[0x48, 0xb8]); // mov rax, TEST_DATA_VA
+        c.bytes(&TEST_DATA_VA.to_le_bytes());
+        c.bytes(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+        c.bytes(&[0x48, 0x85, 0xc0]); // test rax, rax
+        c.bytes(&[0x74, 0xec]); // jz loop (-20)
+        c.exit_group_imm(0);
+        c.ud2();
+
+        let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames for AddressSpace")?);
+        space.map_eager_with_bytes(TEST_CODE_VA, FRAME_SIZE, Prot::READ | Prot::EXEC, &c.0).map_err(|_| "map code")?;
+        space
+            .map_eager_with_bytes(TEST_STACK_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[])
+            .map_err(|_| "map stack")?;
+        space.map_eager_with_bytes(TEST_DATA_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[]).map_err(|_| "map data")?;
+        let (handle, slot) = spawn_ring3_on(
+            arch::cpu_index(),
+            "exe-path",
+            space.clone(),
+            TEST_CODE_VA,
+            TEST_STACK_VA + FRAME_SIZE,
+            None,
+            ConsoleIo::Capture,
+            true,
+            Vec::new(),
+            Some(String::from(PATH)),
+        )?;
+
+        // While it spins, its process (the only one) carries the path, read
+        // from the kernel side.
+        let deadline = crate::time::now_ns() + 5_000_000_000;
+        let mut seen = None;
+        while seen.is_none() && crate::time::now_ns() < deadline {
+            let pids = active_pids();
+            seen = pids.first().map(|&pid| (pid, process_exe_path(pid)));
+            if seen.is_none() {
+                sched::yield_now();
+            }
+        }
+        // Let it exit whatever was seen, so the thread always ends.
+        let released = {
+            let _active = sched::UserSpaceGuard::enter(space.clone());
+            copy_to_user(TEST_DATA_VA, &1u64.to_le_bytes())
+        };
+        handle.join();
+        let exit = slot.lock().take().map(|r| r.exit);
+        kassert_eq!(released, Ok(()));
+        let (pid, path) = seen.ok_or("the process never registered")?;
+        kassert_eq!(path.as_deref(), Some(PATH));
+        kassert!(matches!(exit, Some(UserExit::Exited(0))));
+        kassert_eq!(process_exe_path(pid), None);
+        space.teardown();
         Ok(())
     }
 );
