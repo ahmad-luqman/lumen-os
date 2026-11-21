@@ -107,6 +107,11 @@ serde = { version = "=1.0.229", default-features = false, features = ["derive", 
 # LLVM-exception OR Apache-2.0 OR MIT`; Lumen elects MIT. Zero transitive
 # dependencies (`default-features = false`, `no_std`).
 linux-raw-sys = { version = "=0.12.1", default-features = false, features = ["no_std", "general", "errno", "ioctl", "system", "prctl", "auxvec"] }
+# Pure-Rust no_std + alloc writable ext4 driver (#248; ARCHITECTURE sections 2 and 9).
+# Multi-licensed `MIT OR Apache-2.0`; Lumen elects MIT. `sync` + `multi-threaded`
+# select synchronous `Send + Sync` `Ext4Read`/`Ext4Write` traits backed by `Arc`
+# and `spin`, matching Lumen's SMP SleepMutex + BlockCache adapter.
+ext4plus = { version = "=0.1.0-rc.2", default-features = false, features = ["sync", "multi-threaded"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

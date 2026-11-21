@@ -1,0 +1,9 @@
+# Features: storage, writable ext4, and POSIX VFS (M7+). See tests/features/README.md for the format.
+
+[[feature]]
+name = "ext4plus 0.1.0-rc.2 (MIT elected, sync + multi-threaded) pinned and linked into both kernels (#248) with the flag audit passing and in-memory ext4 read/write/truncate/symlink/hardlink/mkdir/rmdir/unlink smoke check"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4_crate_smoke",
+    "audit:flags",
+]
