@@ -7,13 +7,18 @@
 //! or `AddressSpace` operations.
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use lumen_vfs::{VfsError, VfsInode};
+
 use crate::keyboard::{Key as KbdKey, KeyCode};
 use crate::klog;
 use crate::linux::general;
+use crate::mm::user_vm::AddressSpace;
 use crate::sched;
 use crate::serial_in;
 use crate::sync::SpinLock;
@@ -122,6 +127,18 @@ pub struct ProcessState {
     pub allow_test_syscalls: bool,
     pub exit: Option<UserExit>,
     pub stdout: Vec<u8>,
+    /// The process's address space, for `/proc/<pid>/maps`.
+    pub address_space: Option<Arc<AddressSpace>>,
+    /// The executable's path for `/proc/<pid>/exe`; only `vfstest
+    /// dev-tmp-proc`'s checks (and the ktests running them) set it until
+    /// `linux /path` loads from the VFS (#255).
+    pub exe_path: Option<String>,
+    /// VFS files open on descriptors, with the path each was opened by, for
+    /// `/proc/<pid>/fd`: a stand-in for the 1024-entry FD table that #254
+    /// wires into the syscalls (only `vfstest dev-tmp-proc`'s checks, and the
+    /// ktests running them, fill it today). Keys are in `0..lumen_vfs::MAX_FDS`
+    /// (`register_current_vfs_fd` refuses others).
+    pub vfs_fds: BTreeMap<i32, (Arc<dyn VfsInode>, String)>,
     stdin: Vec<u8>,
     stdin_pos: usize,
     /// Small lookahead / UTF-8 tail buffer for stdin (up to 4 bytes).
@@ -134,7 +151,13 @@ pub struct ProcessState {
 }
 
 impl ProcessState {
-    fn new(pid: u32, io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>) -> Self {
+    fn new(
+        pid: u32,
+        io: ConsoleIo,
+        allow_test_syscalls: bool,
+        stdin: Vec<u8>,
+        address_space: Option<Arc<AddressSpace>>,
+    ) -> Self {
         let mut fds = [FdKind::Closed; MAX_FDS];
         fds[0] = FdKind::Stdin;
         fds[1] = FdKind::Stdout;
@@ -152,6 +175,9 @@ impl ProcessState {
             allow_test_syscalls,
             exit: None,
             stdout: Vec::new(),
+            address_space,
+            exe_path: None,
+            vfs_fds: BTreeMap::new(),
             stdin,
             stdin_pos: 0,
             unread: [0; 4],
@@ -208,7 +234,8 @@ fn current_kernel_tid() -> u64 {
 pub fn register_current(io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>) -> u32 {
     let ktid = current_kernel_tid();
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin);
+    let address_space = sched::current_address_space();
+    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin, address_space);
     let prev = ACTIVE_PROCS.lock().insert(ktid, state);
     debug_assert!(prev.is_none(), "ring-3 process registered twice on thread {ktid}");
     pid
@@ -218,6 +245,147 @@ pub fn register_current(io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>
 pub fn take_current() -> ProcessState {
     let ktid = current_kernel_tid();
     ACTIVE_PROCS.lock().remove(&ktid).expect("active process state missing after ring-3 exit")
+}
+
+/// Non-panicking lookup of the current thread's [`ConsoleIo`], returning `None`
+/// if called outside an active ring-3 [`ProcessState`] (e.g., from a kernel thread).
+pub fn try_current_io() -> Option<ConsoleIo> {
+    let ktid = sched::running_here()?.0;
+    ACTIVE_PROCS.lock().get(&ktid).map(|p| p.io)
+}
+
+/// Non-panicking lookup of the current thread's Linux PID.
+pub fn current_pid() -> Option<u32> {
+    let ktid = sched::running_here()?.0;
+    ACTIVE_PROCS.lock().get(&ktid).map(|p| p.pid)
+}
+
+/// Snapshot all active Linux PIDs (sorted).
+pub fn active_pids() -> Vec<u32> {
+    let guard = ACTIVE_PROCS.lock();
+    let mut pids: Vec<u32> = guard.values().map(|p| p.pid).collect();
+    pids.sort_unstable();
+    pids
+}
+
+/// True if `pid` corresponds to an active [`ProcessState`].
+pub fn has_pid(pid: u32) -> bool {
+    ACTIVE_PROCS.lock().values().any(|p| p.pid == pid)
+}
+
+/// Clone the `Arc<AddressSpace>` for `pid` and release `ACTIVE_PROCS` before returning.
+pub fn process_address_space(pid: u32) -> Option<Arc<AddressSpace>> {
+    let guard = ACTIVE_PROCS.lock();
+    guard.values().find(|p| p.pid == pid).and_then(|p| p.address_space.as_ref().map(Arc::clone))
+}
+
+/// Snapshot the executable path recorded for `pid`, if any.
+pub fn process_exe_path(pid: u32) -> Option<String> {
+    let guard = ACTIVE_PROCS.lock();
+    guard.values().find(|p| p.pid == pid).and_then(|p| p.exe_path.clone())
+}
+
+/// Set the canonical executable path on the current [`ProcessState`].
+pub fn set_current_exe_path(path: &str) {
+    let Some(ktid) = sched::running_here().map(|id| id.0) else {
+        return;
+    };
+    let path = String::from(path);
+    let mut guard = ACTIVE_PROCS.lock();
+    if let Some(proc) = guard.get_mut(&ktid) {
+        proc.exe_path = Some(path);
+    }
+}
+
+/// Attach a VFS inode/path to `fd` on the current [`ProcessState`] (extracting
+/// any displaced entry so `Arc` drops outside `ACTIVE_PROCS`). `EBADF` for an
+/// fd outside `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s
+/// inode number from it and relies on that range.
+pub fn register_current_vfs_fd(fd: i32, inode: Arc<dyn VfsInode>, path: String) -> Result<(), VfsError> {
+    if usize::try_from(fd).map_or(true, |f| f >= lumen_vfs::MAX_FDS) {
+        return Err(VfsError::BadF);
+    }
+    let Some(ktid) = sched::running_here().map(|id| id.0) else {
+        return Ok(());
+    };
+    let displaced = {
+        let mut guard = ACTIVE_PROCS.lock();
+        guard.get_mut(&ktid).and_then(|proc| proc.vfs_fds.insert(fd, (inode, path)))
+    };
+    drop(displaced);
+    Ok(())
+}
+
+/// Detach a VFS descriptor from the current [`ProcessState`], dropping its
+/// `Arc<dyn VfsInode>` outside `ACTIVE_PROCS`.
+pub fn unregister_current_vfs_fd(fd: i32) {
+    let Some(ktid) = sched::running_here().map(|id| id.0) else {
+        return;
+    };
+    let removed = {
+        let mut guard = ACTIVE_PROCS.lock();
+        guard.get_mut(&ktid).and_then(|proc| proc.vfs_fds.remove(&fd))
+    };
+    drop(removed);
+}
+
+/// Return sorted open descriptor numbers for `pid`.
+pub fn process_open_fds(pid: u32) -> Vec<i32> {
+    let guard = ACTIVE_PROCS.lock();
+    let Some(proc) = guard.values().find(|p| p.pid == pid) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (idx, kind) in proc.fds.iter().enumerate() {
+        let fd = idx as i32;
+        if kind.is_open() || proc.vfs_fds.contains_key(&fd) {
+            out.push(fd);
+        }
+    }
+    for &fd in proc.vfs_fds.keys() {
+        let open_in_array = usize::try_from(fd).ok().is_some_and(|i| i < MAX_FDS && proc.fds[i].is_open());
+        if !open_in_array && !out.contains(&fd) {
+            out.push(fd);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Snapshot `(Option<Arc<dyn VfsInode>>, display_path)` for `/proc/<pid>/fd/<fd>`.
+///
+/// Releases `ACTIVE_PROCS` before inspecting `VfsInode::stat()` or resolving `/dev/console`.
+pub fn process_fd_target(pid: u32, fd: i32) -> Option<(Option<Arc<dyn VfsInode>>, String)> {
+    enum Snapshot {
+        Vfs(Arc<dyn VfsInode>, String),
+        Console,
+    }
+
+    let snap = {
+        let guard = ACTIVE_PROCS.lock();
+        let proc = guard.values().find(|p| p.pid == pid)?;
+        if let Some((inode, path)) = proc.vfs_fds.get(&fd) {
+            Snapshot::Vfs(Arc::clone(inode), path.clone())
+        } else if fd >= 0 && (fd as usize) < MAX_FDS && proc.fds[fd as usize].is_open() {
+            Snapshot::Console
+        } else {
+            return None;
+        }
+    };
+
+    match snap {
+        Snapshot::Vfs(inode, mut path) => {
+            let unlinked = inode.is_detached() || inode.stat().ok().is_some_and(|m| m.nlink == 0);
+            if unlinked && !path.ends_with(" (deleted)") {
+                path.push_str(" (deleted)");
+            }
+            Some((Some(inode), path))
+        }
+        Snapshot::Console => {
+            let inode = crate::vfs::resolve_path_from_root("/dev/console").ok();
+            Some((inode, String::from("/dev/console")))
+        }
+    }
 }
 
 /// Run a short non-blocking closure with immutable access to the current process state.

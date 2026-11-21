@@ -14,3 +14,47 @@ milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
 ]
+
+[[feature]]
+name = "Unified 4 KiB frame-backed PageCache with write-back, soft 32 MiB reclaim and a 64 MiB hard cap for ext4, quota accounting, and truncate tail zeroing"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4_adapter_pagecache_quirks_and_open_unlinked",
+    "ktest:lumen_kernel::vfs::page_cache_global_reclaim_writes_back_and_evicts",
+    "ktest:lumen_kernel::vfs::page_cache::*",
+    "ktest:lumen_kernel::vfs::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
+    "ktest:lumen_kernel::vfs::ext4_truncate_and_open_unlink_preserve_state_on_io_error",
+    "ktest:lumen_kernel::vfs::ext4_partial_phase2_io_error_recovery",
+    "ktest:lumen_kernel::vfs::tmpfs_truncate_returns_quota",
+    "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
+]
+
+[[feature]]
+name = "Writable ext4 rootfs VFS adapter over BlockCache with Gate 6 open-unlinked detach, symlinks, rmdir/rename, write-error undo, and reboot persistence"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4_adapter_pagecache_quirks_and_open_unlinked",
+    "ktest:lumen_kernel::vfs::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
+    "ktest:lumen_kernel::vfs::ext4_truncate_and_open_unlink_preserve_state_on_io_error",
+    "ktest:lumen_kernel::vfs::ext4_partial_phase2_io_error_recovery",
+    "ktest:lumen_kernel::vfs::ext4::*",
+    "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
+    "scenario:test_fs::test_ext4_deletions_and_renames_fsck_clean",
+    "scenario:test_fs::test_ext4_readonly_device_mounts_ro",
+]
+
+[[feature]]
+name = "Pseudo-filesystems (/tmp tmpfs, /dev devfs, /proc procfs), boot mount with a tmpfs fallback (quiet for a disk without ext4, a warning for an ext4 disk that won't mount), and mount/sync shell commands"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::vfs_boot_mounts_tmp_dev_proc_work",
+    "ktest:lumen_kernel::vfs::vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing",
+    "ktest:lumen_kernel::vfs::vfs_proc_checks_unregister_their_process_on_failure",
+    "ktest:lumen_kernel::vfs::vfs_sync_continues_past_a_failing_inode",
+    "scenario:test_fs::test_dev_tmp_proc_filesystems",
+    "scenario:test_fs::test_dev_urandom_refuses_when_unseeded",
+    "scenario:test_fs::test_unmountable_ext4_disk_warns_and_falls_back",
+    "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
+    "scenario:test_fs::test_ext4_readonly_device_mounts_ro",
+    "scenario:test_blk::test_read_write_sectors",
+]

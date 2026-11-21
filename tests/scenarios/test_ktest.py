@@ -161,6 +161,7 @@ def test_in_kernel_tests_pass(boot):
     assert counts == refusals and len(errors) == sum(refusals.values()), errors
     # Every transport dropped in the ktests reset its device.
     assert "after a reset" not in out
+    check_vfs_log_lines(out)
     # Issue #3: the trace cost per event is printed as a TAP diagnostic.
     assert re.search(r"^# trace: \d+ TSC ticks per event", out, re.MULTILINE), (
         "no trace cost diagnostic"
@@ -168,6 +169,80 @@ def test_in_kernel_tests_pass(boot):
     # #117: the clock cross-checks report their brackets, retries and
     # placement tries on passing runs too, where nobody reads the TAP.
     check_clock_diags(report, out)
+
+
+# The vfs ktests' deliberate warnings and errors, each made by a ktest that
+# injects the failure (fault-injecting block caches, a hard page limit, a
+# quota over-release, a non-UTF-8 name, a read-only feature bit). The fault
+# sweeps' families (link counts kept in memory after a failed undo, rename
+# undos left inconsistent, unlinks whose outcome can't be read back, renames'
+# replaced targets whose free failed) depend on how many writes `ext4plus`
+# makes, so they're counted as present; every
+# other line is counted exactly, and a line matching none of these fails.
+_DEV = r"DevId\(\d+\)"
+VFS_SWEEP_LINES = (
+    (
+        rf"ERROR vfs: ext4 {_DEV} inode \d+: links_count on disk is (\d+|unreadable), keeping (at least )?\d+ "
+        r"in memory until a write lands; run e2fsck if the volume is unmounted first"
+    ),
+    (
+        rf"ERROR vfs: ext4 {_DEV}: undoing a failed (rename|exchange) between directories \d+ and \d+ left its "
+        r"entries inconsistent or unreadable; run e2fsck"
+    ),
+    (
+        rf"ERROR vfs: ext4 {_DEV} inode \d+: unlink failed and neither its directory nor the inode reads back; "
+        r"assuming the entry survived; run e2fsck"
+    ),
+    # A rename's replaced target whose free failed inside `ext4plus` (left
+    # for e2fsck; the rename itself went through).
+    (
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: freeing inode \d+, replaced by a rename, failed: \w+; "
+        r"run e2fsck"
+    ),
+)
+VFS_EXACT_LINES = {
+    # page_quota_release_saturates_and_detached_quota_reports_nospc
+    r"ERROR vfs: page quota ktest \(4 pages\): released 5 pages with only 2 reserved": 1,
+    # ext4_unlink_restores_an_inline_symlink_when_the_directory_cant_be_read_back
+    r"ERROR vfs: ext4 inode \d+: restoring the inline symlink target failed; run e2fsck": 1,
+    # ext4_truncate_and_open_unlink_preserve_state_on_io_error
+    rf"ERROR vfs: ext4 {_DEV} inode \d+: truncate failed and its tail bytes couldn't be restored on disk": 1,
+    # The writeback-error ktests (reclaim, sync, full disk, failing device,
+    # a failing page among good ones).
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 4,
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 2,
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
+    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
+    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 1,
+    # ext4_writes_past_the_hard_page_limit_fail: two writes refused.
+    (
+        r"WARN  vfs: ext4 page cache at its hard limit \(\d+ pages\): refusing new pages \(ENOSPC\) until "
+        r"writeback frees some"
+    ): 2,
+    # ext4_unwritable_ro_compat_features_force_read_only
+    (
+        rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: ro_compat feature not supported for writing "
+        r"\(metadata_csum, quota, bigalloc, orphan_present, \.\.\.\) \(ro_compat 0x[0-9a-f]+\)"
+    ): 1,
+    # ext4_readdir_skips_names_that_are_not_utf8
+    rf"WARN  vfs: ext4 {_DEV} directory \d+: skipping entries whose names aren't UTF-8 \(inode \d+\)": 1,
+}
+
+
+def check_vfs_log_lines(out):
+    """Pin the vfs ktests' WARN and ERROR lines (see VFS_EXACT_LINES)."""
+    lines = re.findall(r"((?:WARN |ERROR) vfs: .*)\n", out)
+    counts = {
+        want: sum(1 for line in lines if re.fullmatch(want, line)) for want in VFS_EXACT_LINES
+    }
+    assert counts == VFS_EXACT_LINES, counts
+    sweeps = {
+        want: sum(1 for line in lines if re.fullmatch(want, line)) for want in VFS_SWEEP_LINES
+    }
+    assert all(sweeps.values()), sweeps
+    known = (*VFS_EXACT_LINES, *VFS_SWEEP_LINES)
+    unknown = [line for line in lines if not any(re.fullmatch(want, line) for want in known)]
+    assert not unknown, unknown
 
 
 # The modules holding the ktests whose claims are tight to the boot's
