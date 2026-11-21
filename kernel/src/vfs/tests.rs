@@ -331,8 +331,13 @@ crate::ktest!(
         let mp = mkdir_at(&TABLES, None, b"/tmp/reclaim_mnt", 0o755, 0).map_err(|_| "mkdir mnt")?;
         let mp_dev = mp.dev_id();
         let mp_ino = mp.ino();
+        if TABLES.mount(mp, "/tmp/reclaim_mnt", Arc::clone(&fs) as Arc<dyn FileSystem>).is_err() {
+            if let Err(e) = unlink_at(&TABLES, None, b"/tmp/reclaim_mnt", true) {
+                crate::ktest::diag(format_args!("rmdir /tmp/reclaim_mnt after the failed mount: {e:?}"));
+            }
+            return Err("mount");
+        }
         EXT4_FILESYSTEMS.lock().push(Arc::clone(&fs));
-        TABLES.mount(mp, "/tmp/reclaim_mnt", Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount")?;
 
         let result = (|| -> Result<(), &'static str> {
             let (f, _) = open_inode(
@@ -391,7 +396,13 @@ crate::ktest!(
         let umounted = TABLES.umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
         EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != dev);
         let unlinked = unlink_at(&TABLES, None, b"/tmp/reclaim_mnt", true).map(drop).map_err(|_| "rmdir mnt");
-        result.and(umounted).and(unlinked)
+        let cleanup = umounted.and(unlinked);
+        if let (Err(_), Err(e)) = (&result, &cleanup) {
+            // The body's error is returned; a mount left behind could still
+            // break later ktests, so say so.
+            crate::ktest::diag(format_args!("cleanup after the failure failed too: {e}"));
+        }
+        result.and(cleanup)
     }
 );
 
