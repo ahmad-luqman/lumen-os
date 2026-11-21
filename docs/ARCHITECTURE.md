@@ -5225,7 +5225,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - **Opening (#262):** `open_inode_guarded` returns the `OpenGuard` it took
     before its last liveness check (Gate 6 above) and
     `OpenFile::from_guard` takes that reference over (one count, never two);
-    `openat` uses this pair. `open_inode` (its signature unchanged) returns
+    `openat` must use this pair when #254 wires it. `open_inode` (its signature unchanged) returns
     the inode with that reference given back: an `OpenFile::new` built from
     it takes a fresh one through `OpenGuard::try_new`, refused with
     `-ENOENT` if an unlink freed the inode in between. The unchecked
