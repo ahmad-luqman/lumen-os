@@ -519,21 +519,34 @@ pub unsafe fn protect_user_page(root: PhysFrame, virt: VirtAddr, attrs: Attrs) -
     pt::protect(&mut Hhdm, root, virt, attrs)
 }
 
+/// Per-leaf snapshot reported to callbacks of [`unmap_user_range`],
+/// [`protect_user_range`], [`clear_user_lower_half`], and [`destroy_user_root`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserLeaf {
+    /// Page-aligned lower-half user virtual address.
+    pub va: VirtAddr,
+    /// Mapped (or `PTE_PROTNONE`-preserved) physical frame.
+    pub phys: PhysFrame,
+    /// Whether the leaf was hardware-present (`PRESENT = 1`) prior to the operation.
+    pub was_present: bool,
+    /// Whether the leaf was effectively writable prior to the operation.
+    pub was_writable: bool,
+    /// Whether software bit [`pt::bits::PTE_SHARED`] (bit 10) was set on the leaf.
+    pub was_shared: bool,
+    /// Whether hardware [`pt::bits::DIRTY`] (bit 6) was set on the leaf prior to the operation.
+    pub was_dirty: bool,
+}
+
 /// Unmap every mapped leaf (present or `PTE_PROTNONE`) in lower-half
 /// page-aligned `[start, end)` under `root`, skipping empty subtrees in O(1)
-/// and invoking `on_unmapped(va, phys, was_present)` for each removed leaf.
+/// and invoking `on_unmapped(leaf)` for each removed leaf.
 ///
 /// # Safety
 /// `root` must be an L4 root allocated by [`new_user_root`] (never
 /// [`kernel_root`]), `[start, end)` must be page-aligned and strictly in the
 /// lower half, and the caller must have exclusive write access to `root`'s
-/// lower half and flush the TLB / free each returned physical frame.
-pub unsafe fn unmap_user_range(
-    root: PhysFrame,
-    start: u64,
-    end: u64,
-    mut on_unmapped: impl FnMut(VirtAddr, PhysFrame, bool),
-) {
+/// lower half, flush the TLB, and free non-shared (`!leaf.was_shared`) frames.
+pub unsafe fn unmap_user_range(root: PhysFrame, start: u64, end: u64, mut on_unmapped: impl FnMut(UserLeaf)) {
     assert_ne!(root, kernel_root(), "unmap_user_range must never mutate kernel_root()");
     assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
     let mut addr = start;
@@ -545,7 +558,14 @@ pub unsafe fn unmap_user_range(
             WalkEnd::Mapped(_) | WalkEnd::ProtNone(_) => {
                 let m = pt::unmap(&mut Hhdm, root, va).expect("walk just found mapped user leaf");
                 debug_assert_eq!(m.size, PageSize::Size4K);
-                on_unmapped(va, m.phys, m.present);
+                on_unmapped(UserLeaf {
+                    va,
+                    phys: m.phys,
+                    was_present: m.present,
+                    was_writable: m.writable,
+                    was_shared: m.shared,
+                    was_dirty: m.dirty,
+                });
                 addr += FRAME_SIZE;
             }
             WalkEnd::NotPresent(level) => {
@@ -563,7 +583,12 @@ pub unsafe fn unmap_user_range(
 /// Update attributes of every already-mapped leaf (present or `PTE_PROTNONE`)
 /// in lower-half page-aligned `[start, end)` under `root` to `attrs` via
 /// `lumen_mm::paging::protect`, preserving physical frames and skipping empty
-/// subtrees in O(1). Invokes `on_protected(va, was_present)` for each leaf.
+/// subtrees in O(1).
+///
+/// For `PTE_SHARED` leaves, clears `WRITABLE` (`attrs.without_writable().with_shared(true)`)
+/// while keeping `PRESENT = 1` for non-`PROT_NONE` protections (including
+/// write-only `PROT_WRITE`) so dirty/CoW fault tracking and `writable_maps`
+/// stay exact. Invokes `on_protected(leaf)` with the pre-update leaf snapshot.
 ///
 /// # Safety
 /// `root` must be an L4 root allocated by [`new_user_root`] (never
@@ -575,7 +600,7 @@ pub unsafe fn protect_user_range(
     start: u64,
     end: u64,
     attrs: Attrs,
-    mut on_protected: impl FnMut(VirtAddr, bool),
+    mut on_protected: impl FnMut(UserLeaf),
 ) {
     assert_ne!(root, kernel_root(), "protect_user_range must never mutate kernel_root()");
     assert!(attrs.user(), "protect_user_range requires user-mode attributes");
@@ -586,10 +611,18 @@ pub unsafe fn protect_user_range(
         assert!(va.is_lower_half(), "protect_user_range called on upper-half {va}");
         let w = pt::walk(&Hhdm, root, va);
         match w.end() {
-            WalkEnd::Mapped(_) | WalkEnd::ProtNone(_) => {
-                let prev = pt::protect(&mut Hhdm, root, va, attrs).expect("walk just found mapped user leaf");
+            WalkEnd::Mapped(m) | WalkEnd::ProtNone(m) => {
+                let leaf_attrs = if m.shared { attrs.without_writable().with_shared(true) } else { attrs };
+                let prev = pt::protect(&mut Hhdm, root, va, leaf_attrs).expect("walk just found mapped user leaf");
                 debug_assert_eq!(prev.size, PageSize::Size4K);
-                on_protected(va, prev.present);
+                on_protected(UserLeaf {
+                    va,
+                    phys: prev.phys,
+                    was_present: prev.present,
+                    was_writable: prev.writable,
+                    was_shared: prev.shared,
+                    was_dirty: prev.dirty,
+                });
                 addr += FRAME_SIZE;
             }
             WalkEnd::NotPresent(level) => {
@@ -604,43 +637,69 @@ pub unsafe fn protect_user_range(
     }
 }
 
-/// Recursively free all lower-half leaf frames (present or `PTE_PROTNONE`) and
+/// Recursively sweep all lower-half leaves (present or `PTE_PROTNONE`),
+/// invoking `on_leaf` for each, freeing non-shared leaf frames and all
 /// intermediate L3/L2/L1 tables under a user L4 subtree.
 ///
 /// # Safety
-/// Every leaf and table frame in `table`'s subtree must be exclusively owned
-/// by an inactive user address space.
-unsafe fn free_user_subtree(table: PhysFrame, level: pt::Level) {
+/// Every table frame and non-`PTE_SHARED` leaf frame in `table`'s subtree
+/// must be exclusively owned by an inactive user address space.
+unsafe fn free_user_subtree(
+    table: PhysFrame,
+    level: pt::Level,
+    base: u64,
+    path_writable: bool,
+    on_leaf: &mut impl FnMut(UserLeaf),
+) {
+    let shift = 12 + 9 * (u32::from(level.number()) - 1);
     for index in 0..ENTRIES {
         let Some(raw) = Hhdm.read(table, index) else {
             continue;
         };
         let entry = pt::Entry::from_raw(raw);
+        let entry_base = base | ((index as u64) << shift);
         if level == pt::Level::L1 {
             if entry.is_present() || entry.is_prot_none() {
-                // SAFETY: leaf frame belongs exclusively to this user address space.
-                unsafe { frame::free(entry.page(PageSize::Size4K)) }.expect("freeing owned user leaf frame");
+                let phys = entry.page(PageSize::Size4K);
+                let was_present = entry.is_present();
+                let was_writable = was_present && path_writable && entry.has(pt::bits::WRITABLE);
+                let was_shared = entry.is_shared();
+                let was_dirty = entry.is_dirty();
+                let va = VirtAddr::new(entry_base).expect("lower-half leaf VA is canonical");
+                on_leaf(UserLeaf { va, phys, was_present, was_writable, was_shared, was_dirty });
+                if !was_shared {
+                    // SAFETY: non-shared leaf frame belongs exclusively to this user address space.
+                    unsafe { frame::free(phys) }.expect("freeing owned user leaf frame");
+                }
             }
         } else if entry.is_present() && !entry.is_leaf(level) {
             let child = entry.table();
+            let child_writable = path_writable && entry.has(pt::bits::WRITABLE);
             // SAFETY: lower-half child table belongs exclusively to this user address space.
             unsafe {
-                free_user_subtree(child, level.below().expect("L3/L2 have a level below"));
+                free_user_subtree(
+                    child,
+                    level.below().expect("L3/L2 have a level below"),
+                    entry_base,
+                    child_writable,
+                    on_leaf,
+                );
                 frame::free(child).expect("freeing owned user page-table frame");
             }
         }
     }
 }
 
-/// Free all lower-half (`L4[0..256]`) leaf frames (present and `PTE_PROTNONE`)
-/// and intermediate L3/L2/L1 tables under `root` and zero `L4[0..256]`, keeping
+/// Sweep all lower-half (`L4[0..256]`) leaf frames (present and `PTE_PROTNONE`),
+/// invoking `on_leaf` for each, free non-`PTE_SHARED` leaf frames and all
+/// intermediate L3/L2/L1 tables under `root`, and zero `L4[0..256]`, keeping
 /// `root` itself allocated (and leaving kernel `L4[256..512]` untouched).
 ///
 /// # Safety
-/// `root` must not be loaded in `CR3` on any CPU, and every lower-half leaf
-/// and intermediate table under `root` must be exclusively owned by this
-/// address space.
-pub unsafe fn clear_user_lower_half(root: PhysFrame) {
+/// `root` must not be loaded in `CR3` on any CPU, and every intermediate table
+/// and non-`PTE_SHARED` lower-half leaf under `root` must be exclusively owned
+/// by this address space.
+pub unsafe fn clear_user_lower_half(root: PhysFrame, mut on_leaf: impl FnMut(UserLeaf)) {
     assert_ne!(root, kernel_root(), "clear_user_lower_half must never mutate kernel_root()");
     assert_ne!(hw::active_root(), root, "cannot clear active CR3 root {root}");
     for index in 0..(ENTRIES / 2) {
@@ -650,26 +709,30 @@ pub unsafe fn clear_user_lower_half(root: PhysFrame) {
         let entry = pt::Entry::from_raw(raw);
         if entry.is_present() && !entry.is_leaf(pt::Level::L4) {
             let child = entry.table();
+            let l3_base = (index as u64) << 39;
+            let l3_writable = entry.has(pt::bits::WRITABLE);
             Hhdm.write(root, index, 0);
             // SAFETY: lower-half L3 subtree belongs exclusively to `root`.
             unsafe {
-                free_user_subtree(child, pt::Level::L3);
+                free_user_subtree(child, pt::Level::L3, l3_base, l3_writable, &mut on_leaf);
                 frame::free(child).expect("freeing owned user L3 table frame");
             }
         }
     }
 }
 
-/// Tear down a user L4 root created by [`new_user_root`]: frees all lower-half
-/// leaf frames, all lower-half L3/L2/L1 page-table frames, and `root` itself,
-/// without modifying the shared kernel upper half (`L4[256..512]`).
+/// Tear down a user L4 root created by [`new_user_root`]: sweeps all lower-half
+/// leaf frames via `on_leaf`, frees non-`PTE_SHARED` leaf frames, all
+/// lower-half L3/L2/L1 page-table frames, and `root` itself, without modifying
+/// the shared kernel upper half (`L4[256..512]`).
 ///
 /// # Safety
-/// `root` must not be loaded in `CR3` on any CPU, and every lower-half leaf
-/// mapped in `root` must be exclusively owned by this address space.
-pub unsafe fn destroy_user_root(root: PhysFrame) {
+/// `root` must not be loaded in `CR3` on any CPU, and every intermediate table
+/// and non-`PTE_SHARED` lower-half leaf mapped in `root` must be exclusively
+/// owned by this address space.
+pub unsafe fn destroy_user_root(root: PhysFrame, on_leaf: impl FnMut(UserLeaf)) {
     // SAFETY: upheld by the caller.
-    unsafe { clear_user_lower_half(root) };
+    unsafe { clear_user_lower_half(root, on_leaf) };
     // SAFETY: `root` is no longer active in CR3 and was allocated by `new_user_root`.
     unsafe { frame::free(root) }.expect("freeing owned user L4 root frame");
 }
@@ -1720,6 +1783,168 @@ crate::ktest!(
         // SAFETY: `root` is the active kernel hierarchy, mapping the running kernel.
         unsafe { hw::write_cr3(root.as_u64()) };
         kassert_eq!(hw::active_root(), root);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn shared_user_pte_protect_unmap_and_teardown() {
+        use crate::{kassert, kassert_eq};
+        use alloc::vec::Vec;
+
+        // Warm heap slightly so Vec allocations below reuse heap pages and frame accounting stays exact.
+        let _warm: Vec<UserLeaf> = Vec::with_capacity(16);
+        drop(_warm);
+
+        let free_before = frame::free_frames();
+        let shared_f0 = frame::alloc_zeroed().ok_or("out of frames")?;
+        let shared_f1 = frame::alloc_zeroed().ok_or("out of frames")?;
+        let priv_f2 = frame::alloc_zeroed().ok_or("out of frames")?;
+        let root = new_user_root().ok_or("out of frames for user root")?;
+
+        let va0 = VirtAddr::new(0x0000_0000_0080_0000).ok_or("va0")?;
+        let va1 = VirtAddr::new(0x0000_0000_0080_1000).ok_or("va1")?;
+        let va2 = VirtAddr::new(0x0000_0000_0080_2000).ok_or("va2")?;
+
+        // SAFETY: `root` is a freshly allocated inactive user root; frames are not shared until mapped.
+        unsafe {
+            map_user_page(root, va0, shared_f0, Attrs::USER_RW.with_shared(true)).map_err(|_| "map va0")?;
+            map_user_page(root, va1, shared_f1, Attrs::USER_RW.with_shared(true)).map_err(|_| "map va1")?;
+            map_user_page(root, va2, priv_f2, Attrs::USER_RO).map_err(|_| "map va2")?;
+        }
+
+        // Plant hardware DIRTY bit on va0 to verify protect_user_range reports and clears it.
+        let w0 = walk_user(root, va0);
+        let step0 = *w0.steps().last().ok_or("missing leaf for va0")?;
+        Hhdm.write(step0.table, step0.index, step0.entry.raw() | pt::bits::DIRTY);
+
+        // Protect all 3 pages with write-only PROT_WRITE:
+        // - PTE_SHARED leaves MUST strip WRITABLE while staying PRESENT = 1 (never PTE_PROTNONE).
+        // - Private (non-shared) leaf MUST gain WRITABLE = 1.
+        let mut protected = Vec::new();
+        // SAFETY: `root` is exclusively owned by this test and inactive.
+        unsafe {
+            protect_user_range(
+                root,
+                va0.as_u64(),
+                va2.as_u64() + FRAME_SIZE,
+                Attrs::for_user(false, true, false),
+                |leaf| protected.push(leaf),
+            );
+        }
+        kassert_eq!(
+            protected.as_slice(),
+            &[
+                UserLeaf {
+                    va: va0,
+                    phys: shared_f0,
+                    was_present: true,
+                    was_writable: true,
+                    was_shared: true,
+                    was_dirty: true,
+                },
+                UserLeaf {
+                    va: va1,
+                    phys: shared_f1,
+                    was_present: true,
+                    was_writable: true,
+                    was_shared: true,
+                    was_dirty: false,
+                },
+                UserLeaf {
+                    va: va2,
+                    phys: priv_f2,
+                    was_present: true,
+                    was_writable: false,
+                    was_shared: false,
+                    was_dirty: false,
+                },
+            ]
+        );
+
+        let m0 = walk_user(root, va0).mapping().ok_or("va0 must stay PRESENT after PROT_WRITE on PTE_SHARED")?;
+        kassert!(m0.present && !m0.writable && m0.shared && !m0.dirty);
+        let m1 = walk_user(root, va1).mapping().ok_or("va1 must stay PRESENT")?;
+        kassert!(m1.present && !m1.writable && m1.shared && !m1.dirty);
+        let m2 = walk_user(root, va2).mapping().ok_or("va2 must stay PRESENT")?;
+        kassert!(m2.present && m2.writable && !m2.shared);
+
+        // Transition va0 to PROT_NONE: PTE_SHARED must be preserved across Present -> PTE_PROTNONE.
+        // SAFETY: `root` is exclusively owned by this test and inactive.
+        unsafe {
+            protect_user_range(root, va0.as_u64(), va0.as_u64() + FRAME_SIZE, Attrs::USER_NONE, |_| {});
+        }
+        let pn0 = walk_user(root, va0).prot_none_mapping().ok_or("va0 must be ProtNone")?;
+        kassert!(!pn0.present && pn0.shared && pn0.phys == shared_f0);
+
+        // Plant hardware DIRTY on va1 and unmap_user_range: must report dirty+shared and leave shared_f1 allocated.
+        let w1 = walk_user(root, va1);
+        let step1 = *w1.steps().last().ok_or("missing leaf for va1")?;
+        Hhdm.write(step1.table, step1.index, step1.entry.raw() | pt::bits::DIRTY);
+
+        let mut unmapped = Vec::new();
+        let frames_before_unmap = frame::free_frames();
+        // SAFETY: `root` is exclusively owned by this test and inactive.
+        unsafe {
+            unmap_user_range(root, va1.as_u64(), va1.as_u64() + FRAME_SIZE, |leaf| unmapped.push(leaf));
+        }
+        kassert_eq!(
+            unmapped.as_slice(),
+            &[UserLeaf {
+                va: va1,
+                phys: shared_f1,
+                was_present: true,
+                was_writable: false,
+                was_shared: true,
+                was_dirty: true,
+            }]
+        );
+        kassert_eq!(frame::free_frames(), frames_before_unmap);
+        kassert!(frame::is_allocated(shared_f1));
+
+        // Plant hardware DIRTY on private va2 and destroy_user_root:
+        // - Must report va0 (PTE_PROTNONE | PTE_SHARED) and skip frame::free(shared_f0).
+        // - Must report va2 (PRESENT | WRITABLE | DIRTY) and free priv_f2.
+        let w2 = walk_user(root, va2);
+        let step2 = *w2.steps().last().ok_or("missing leaf for va2")?;
+        Hhdm.write(step2.table, step2.index, step2.entry.raw() | pt::bits::DIRTY);
+
+        let mut swept = Vec::new();
+        // SAFETY: `root` is inactive and exclusively owned by this test.
+        unsafe {
+            destroy_user_root(root, |leaf| swept.push(leaf));
+        }
+        kassert_eq!(
+            swept.as_slice(),
+            &[
+                UserLeaf {
+                    va: va0,
+                    phys: shared_f0,
+                    was_present: false,
+                    was_writable: false,
+                    was_shared: true,
+                    was_dirty: false,
+                },
+                UserLeaf {
+                    va: va2,
+                    phys: priv_f2,
+                    was_present: true,
+                    was_writable: true,
+                    was_shared: false,
+                    was_dirty: true,
+                },
+            ]
+        );
+        kassert!(frame::is_allocated(shared_f0));
+        kassert!(!frame::is_allocated(priv_f2));
+
+        // Release the two simulated PageCache frames we held across teardown.
+        // SAFETY: `shared_f0` and `shared_f1` are no longer mapped anywhere and were allocated by this test.
+        unsafe {
+            frame::free(shared_f0).map_err(|_| "free shared_f0")?;
+            frame::free(shared_f1).map_err(|_| "free shared_f1")?;
+        }
+        kassert_eq!(frame::free_frames(), free_before);
         Ok(())
     }
 );

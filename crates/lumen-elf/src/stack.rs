@@ -105,6 +105,15 @@ impl AuxvInfo {
             clktck: DEFAULT_CLKTCK,
         }
     }
+
+    /// Construct `auxv` metadata for a dynamically linked (`PT_INTERP`) binary,
+    /// keeping `AT_PHDR`/`AT_PHENT`/`AT_PHNUM`/`AT_ENTRY` from `main` while
+    /// setting `AT_BASE` to `Some(interp_load_bias)`.
+    pub const fn from_loaded_with_interp(main: &LoadedElf, interp_load_bias: u64) -> Self {
+        let mut info = Self::from_loaded(main);
+        info.base = Some(interp_load_bias);
+        info
+    }
 }
 
 /// Output addresses produced by [`build_initial_stack`].
@@ -675,5 +684,116 @@ mod tests {
         }
         assert!(saw_phdr_zero);
         assert!(saw_phnum_zero);
+    }
+
+    #[test]
+    fn auxv_from_loaded_with_interp_emits_at_base_and_main_program_headers() {
+        use crate::loader::{
+            EM_X86_64, ET_DYN, EV_CURRENT, INTERP_BASE, PF_R, PF_X, PHDR_MIN_SIZE, PIE_BASE, PT_INTERP, PT_LOAD,
+        };
+
+        let build_phdr =
+            |buf: &mut [u8], idx: usize, p_type: u32, flags: u32, off: u64, va: u64, fsz: u64, msz: u64| {
+                let o = crate::EHDR_SIZE + idx * usize::from(PHDR_MIN_SIZE);
+                buf[o..o + 4].copy_from_slice(&p_type.to_le_bytes());
+                buf[o + 4..o + 8].copy_from_slice(&flags.to_le_bytes());
+                buf[o + 8..o + 16].copy_from_slice(&off.to_le_bytes());
+                buf[o + 16..o + 24].copy_from_slice(&va.to_le_bytes());
+                buf[o + 24..o + 32].copy_from_slice(&va.to_le_bytes());
+                buf[o + 32..o + 40].copy_from_slice(&fsz.to_le_bytes());
+                buf[o + 40..o + 48].copy_from_slice(&msz.to_le_bytes());
+                buf[o + 48..o + 56].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+            };
+
+        // Main ET_DYN binary with PT_INTERP at offset 0x200.
+        let interp_str = b"/lib/ld-musl-x86_64.so.1\0";
+        let mut main_img = vec![0u8; 0x2000];
+        main_img[0..4].copy_from_slice(&crate::ELF_MAGIC);
+        main_img[4] = crate::ELFCLASS64;
+        main_img[5] = crate::ELFDATA2LSB;
+        main_img[6] = EV_CURRENT;
+        main_img[0x10..0x12].copy_from_slice(&ET_DYN.to_le_bytes());
+        main_img[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
+        main_img[0x14..0x18].copy_from_slice(&u32::from(EV_CURRENT).to_le_bytes());
+        main_img[0x18..0x20].copy_from_slice(&0x1040u64.to_le_bytes());
+        main_img[0x20..0x28].copy_from_slice(&(crate::EHDR_SIZE as u64).to_le_bytes());
+        main_img[0x36..0x38].copy_from_slice(&PHDR_MIN_SIZE.to_le_bytes());
+        main_img[0x38..0x3a].copy_from_slice(&3u16.to_le_bytes());
+        main_img[0x200..0x200 + interp_str.len()].copy_from_slice(interp_str);
+        build_phdr(&mut main_img, 0, PT_INTERP, PF_R, 0x200, 0x200, interp_str.len() as u64, interp_str.len() as u64);
+        build_phdr(&mut main_img, 1, PT_LOAD, PF_R, 0, 0, 0x400, 0x400);
+        build_phdr(&mut main_img, 2, PT_LOAD, PF_R | PF_X, 0x1000, 0x1000, 0x100, 0x100);
+
+        let main = LoadedElf::parse_with_pie_base(&main_img, PIE_BASE).unwrap();
+        assert_eq!(main.interp_path(&main_img), Some(b"/lib/ld-musl-x86_64.so.1".as_slice()));
+
+        // ET_DYN interpreter with min_vaddr = 0x2000 -> load_bias = INTERP_BASE - 0x2000.
+        let mut interp_img = vec![0u8; 0x2000];
+        interp_img[0..4].copy_from_slice(&crate::ELF_MAGIC);
+        interp_img[4] = crate::ELFCLASS64;
+        interp_img[5] = crate::ELFDATA2LSB;
+        interp_img[6] = EV_CURRENT;
+        interp_img[0x10..0x12].copy_from_slice(&ET_DYN.to_le_bytes());
+        interp_img[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
+        interp_img[0x14..0x18].copy_from_slice(&u32::from(EV_CURRENT).to_le_bytes());
+        interp_img[0x18..0x20].copy_from_slice(&0x3080u64.to_le_bytes());
+        interp_img[0x20..0x28].copy_from_slice(&(crate::EHDR_SIZE as u64).to_le_bytes());
+        interp_img[0x36..0x38].copy_from_slice(&PHDR_MIN_SIZE.to_le_bytes());
+        interp_img[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes());
+        build_phdr(&mut interp_img, 0, PT_LOAD, PF_R, 0, 0x2000, 0x200, 0x200);
+        build_phdr(&mut interp_img, 1, PT_LOAD, PF_R | PF_X, 0x1000, 0x3000, 0x100, 0x100);
+
+        let interp = LoadedElf::parse_interp(&interp_img, INTERP_BASE).unwrap();
+        assert_eq!(interp.load_bias, INTERP_BASE - 0x2000);
+
+        let auxv = AuxvInfo::from_loaded_with_interp(&main, interp.load_bias);
+        assert_eq!(auxv.base, Some(INTERP_BASE - 0x2000));
+        assert_eq!(auxv.phdr, PIE_BASE + 64);
+        assert_eq!(auxv.phnum, 3);
+        assert_eq!(auxv.entry, PIE_BASE + 0x1040);
+
+        let all_args: [&[u8]; 3] = [b"/bin/busybox", b"ls", b"-la"];
+        let all_envs: [&[u8]; 2] = [b"PATH=/bin", b"HOME=/root"];
+        for argc in 0..=3 {
+            for envc in 0..=2 {
+                let mut buf = vec![0u8; 4096];
+                let stack_bottom = USER_STACK_TOP - buf.len() as u64;
+                let info = build_initial_stack(
+                    &mut buf,
+                    USER_STACK_TOP,
+                    &all_args[..argc],
+                    &all_envs[..envc],
+                    b"/bin/busybox",
+                    [0x11; 16],
+                    &auxv,
+                )
+                .unwrap();
+                assert_eq!(info.rsp % 16, 0);
+
+                // Skip argc, argv + NULL, envp + NULL to reach auxv.
+                let mut cur = info.rsp + (1 + argc as u64 + 1 + envc as u64 + 1) * 8;
+                let mut got_base = None;
+                let mut got_phdr = None;
+                let mut got_phnum = None;
+                let mut got_entry = None;
+                loop {
+                    let k = read_u64_at(&buf, stack_bottom, cur);
+                    let v = read_u64_at(&buf, stack_bottom, cur + 8);
+                    cur += 16;
+                    match k {
+                        AT_BASE => got_base = Some(v),
+                        AT_PHDR => got_phdr = Some(v),
+                        AT_PHNUM => got_phnum = Some(v),
+                        AT_ENTRY => got_entry = Some(v),
+                        AT_NULL => break,
+                        _ => {}
+                    }
+                }
+                assert_eq!(got_base, Some(INTERP_BASE - 0x2000));
+                assert_eq!(got_phdr, Some(PIE_BASE + 64));
+                assert_eq!(got_phnum, Some(3));
+                assert_eq!(got_entry, Some(PIE_BASE + 0x1040));
+            }
+        }
     }
 }

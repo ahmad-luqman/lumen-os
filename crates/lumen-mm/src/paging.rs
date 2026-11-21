@@ -69,6 +69,12 @@ pub mod bits {
     /// user mapping, so `mprotect` back to readable preserves data and
     /// teardown still frees the frame.
     pub const PTE_PROTNONE: u64 = 1 << 9;
+    /// Software bit (bit 10, ignored by hardware): marks a leaf (present or
+    /// `PTE_PROTNONE`) whose physical frame belongs to a shared `PageCache`
+    /// entry pinned in `AddressSpace::pinned_pages` rather than being
+    /// exclusively owned by one process, so unmap and teardown must NOT call
+    /// `frame::free`.
+    pub const PTE_SHARED: u64 = 1 << 10;
     /// PAT index bit 2, in a 2 MiB or 1 GiB entry.
     pub const PAT_HUGE: u64 = 1 << 12;
     pub const NO_EXECUTE: u64 = 1 << 63;
@@ -220,39 +226,58 @@ pub struct Attrs {
     executable: bool,
     user: bool,
     present: bool,
+    shared: bool,
     cache: Cache,
 }
 
 impl Attrs {
     /// Kernel code: read and execute.
     pub const CODE: Attrs =
-        Attrs { writable: false, executable: true, user: false, present: true, cache: Cache::WriteBack };
+        Attrs { writable: false, executable: true, user: false, present: true, shared: false, cache: Cache::WriteBack };
     /// Kernel read-only data.
-    pub const RODATA: Attrs =
-        Attrs { writable: false, executable: false, user: false, present: true, cache: Cache::WriteBack };
+    pub const RODATA: Attrs = Attrs {
+        writable: false,
+        executable: false,
+        user: false,
+        present: true,
+        shared: false,
+        cache: Cache::WriteBack,
+    };
     /// Kernel read-write data.
     pub const DATA: Attrs =
-        Attrs { writable: true, executable: false, user: false, present: true, cache: Cache::WriteBack };
+        Attrs { writable: true, executable: false, user: false, present: true, shared: false, cache: Cache::WriteBack };
     /// Device registers: read-write, uncached.
     pub const MMIO: Attrs =
-        Attrs { writable: true, executable: false, user: false, present: true, cache: Cache::Uncached };
+        Attrs { writable: true, executable: false, user: false, present: true, shared: false, cache: Cache::Uncached };
     /// A framebuffer: read-write, write-combining.
-    pub const FRAMEBUFFER: Attrs =
-        Attrs { writable: true, executable: false, user: false, present: true, cache: Cache::WriteCombining };
+    pub const FRAMEBUFFER: Attrs = Attrs {
+        writable: true,
+        executable: false,
+        user: false,
+        present: true,
+        shared: false,
+        cache: Cache::WriteCombining,
+    };
 
     /// User `PROT_NONE`: non-present (`PRESENT = 0`, `PTE_PROTNONE = 1`) so
     /// hardware faults on access while preserving the underlying physical frame.
-    pub const USER_NONE: Attrs =
-        Attrs { writable: false, executable: false, user: true, present: false, cache: Cache::WriteBack };
+    pub const USER_NONE: Attrs = Attrs {
+        writable: false,
+        executable: false,
+        user: true,
+        present: false,
+        shared: false,
+        cache: Cache::WriteBack,
+    };
     /// User read-only data (`PROT_READ`).
     pub const USER_RO: Attrs =
-        Attrs { writable: false, executable: false, user: true, present: true, cache: Cache::WriteBack };
+        Attrs { writable: false, executable: false, user: true, present: true, shared: false, cache: Cache::WriteBack };
     /// User read-write data (`PROT_READ | PROT_WRITE`).
     pub const USER_RW: Attrs =
-        Attrs { writable: true, executable: false, user: true, present: true, cache: Cache::WriteBack };
+        Attrs { writable: true, executable: false, user: true, present: true, shared: false, cache: Cache::WriteBack };
     /// User read-execute code (`PROT_READ | PROT_EXEC`).
     pub const USER_RX: Attrs =
-        Attrs { writable: false, executable: true, user: true, present: true, cache: Cache::WriteBack };
+        Attrs { writable: false, executable: true, user: true, present: true, shared: false, cache: Cache::WriteBack };
 
     /// Build user-mode page attributes from Linux `PROT_READ`/`PROT_WRITE`/
     /// `PROT_EXEC` flags.
@@ -264,7 +289,7 @@ impl Attrs {
         if !readable && !writable && !executable {
             Self::USER_NONE
         } else {
-            Attrs { writable, executable, user: true, present: true, cache: Cache::WriteBack }
+            Attrs { writable, executable, user: true, present: true, shared: false, cache: Cache::WriteBack }
         }
     }
 
@@ -286,6 +311,25 @@ impl Attrs {
         !self.present
     }
 
+    /// Is this a `PTE_SHARED` mapping whose frame belongs to `PageCache`?
+    pub const fn shared(self) -> bool {
+        self.shared
+    }
+
+    /// Return a copy of `self` with `PTE_SHARED` set or cleared.
+    pub const fn with_shared(mut self, shared: bool) -> Self {
+        self.shared = shared;
+        self
+    }
+
+    /// Return a copy of `self` with `WRITABLE` cleared while preserving
+    /// `present` (so write-only `PROT_WRITE` stays `PRESENT = 1` instead of
+    /// collapsing to `PTE_PROTNONE`).
+    pub const fn without_writable(mut self) -> Self {
+        self.writable = false;
+        self
+    }
+
     pub const fn cache(self) -> Cache {
         self.cache
     }
@@ -295,6 +339,9 @@ impl Attrs {
         let mut e = frame.as_u64() | self.cache.bits(size);
         if size != PageSize::Size4K {
             e |= HUGE;
+        }
+        if self.shared {
+            e |= PTE_SHARED;
         }
         if !self.present {
             e |= PTE_PROTNONE | NO_EXECUTE;
@@ -349,6 +396,16 @@ impl Entry {
     /// Is this a software `PROT_NONE` leaf (`PRESENT = 0`, `PTE_PROTNONE = 1`)?
     pub const fn is_prot_none(self) -> bool {
         !self.is_present() && self.has(PTE_PROTNONE)
+    }
+
+    /// Does this leaf carry software bit [`PTE_SHARED`] (bit 10)?
+    pub const fn is_shared(self) -> bool {
+        self.has(PTE_SHARED)
+    }
+
+    /// Does this leaf carry hardware [`DIRTY`] (bit 6)?
+    pub const fn is_dirty(self) -> bool {
+        self.has(DIRTY)
     }
 
     /// The size of the page this present entry maps at `level`, or `None` if
@@ -442,6 +499,10 @@ pub struct Mapping {
     pub executable: bool,
     /// Combined over every level.
     pub user: bool,
+    /// Software bit `PTE_SHARED` (bit 10): backing frame is shared via `PageCache`.
+    pub shared: bool,
+    /// Hardware `DIRTY` bit (bit 6) observed on the leaf PTE.
+    pub dirty: bool,
     /// The PAT slot of the leaf (see [`Cache::from_pat_slot`]).
     pub pat_slot: u8,
 }
@@ -494,6 +555,8 @@ impl PathRights {
             writable: rights.writable,
             executable: rights.executable,
             user: rights.user,
+            shared: e.has(PTE_SHARED),
+            dirty: e.has(DIRTY),
             pat_slot: e.pat_slot(size),
         }
     }
@@ -510,6 +573,8 @@ impl PathRights {
             writable: false,
             executable: false,
             user: rights.user,
+            shared: e.has(PTE_SHARED),
+            dirty: e.has(DIRTY),
             pat_slot: e.pat_slot(size),
         }
     }
@@ -806,9 +871,10 @@ impl fmt::Display for ProtectError {
 }
 
 /// Update the attributes of an existing mapped page (present or `PTE_PROTNONE`)
-/// at `virt` in place, preserving its physical frame. Returns the previous
-/// [`Mapping`]. The caller must invalidate the TLB entry for `virt` if the
-/// previous mapping was present.
+/// at `virt` in place, preserving its physical frame and `PTE_SHARED` bit
+/// across `Present <-> PTE_PROTNONE` transitions. Returns the previous
+/// [`Mapping`] (including hardware `dirty`). The caller must invalidate the
+/// TLB entry for `virt` if the previous mapping was present.
 pub fn protect(
     mem: &mut impl TableMemoryMut,
     root: PhysFrame,
@@ -836,7 +902,8 @@ pub fn protect(
         }
     }
     let leaf = *steps.last().expect("a mapped walk read its leaf");
-    mem.write(leaf.table, leaf.index, attrs.leaf(m.phys, m.size));
+    let effective = if m.shared { attrs.with_shared(true) } else { attrs };
+    mem.write(leaf.table, leaf.index, effective.leaf(m.phys, m.size));
     Ok(m)
 }
 
@@ -1659,5 +1726,150 @@ mod tests {
         let l3 = m.alloc_table().unwrap();
         m.set(root, 384, PRESENT | WRITABLE | USER | l3.as_u64());
         let _ = ensure_l3_table(&mut m, root, 384);
+    }
+
+    #[test]
+    fn pte_shared_round_trip_and_prot_none_preservation() {
+        let (mut m, root) = FakeMem::new();
+        let va = v(0x0000_0000_0070_0000);
+        let frame = f(0x70_0000);
+
+        let attrs = Attrs::USER_RO.with_shared(true);
+        assert!(attrs.shared());
+        map(&mut m, root, va, frame, PageSize::Size4K, attrs).unwrap();
+
+        let mp = walk(&m, root, va).mapping().unwrap();
+        assert!(mp.present && mp.shared && !mp.dirty && !mp.writable && mp.user);
+        let raw = walk(&m, root, va).steps()[3].entry;
+        assert!(raw.is_shared() && raw.has(PTE_SHARED));
+
+        // Transition Present | PTE_SHARED -> PTE_PROTNONE | PTE_SHARED even when
+        // caller passes Attrs::USER_NONE (which has shared == false).
+        let prev = protect(&mut m, root, va, Attrs::USER_NONE).unwrap();
+        assert!(prev.present && prev.shared);
+        let pn = walk(&m, root, va).prot_none_mapping().unwrap();
+        assert!(!pn.present && pn.is_prot_none() && pn.shared && pn.phys == frame);
+        let raw_pn = walk(&m, root, va).steps()[3].entry;
+        assert!(!raw_pn.is_present() && raw_pn.is_prot_none() && raw_pn.is_shared());
+
+        // Transition back to Present (USER_RW without explicit with_shared): PTE_SHARED stays set.
+        let prev_pn = protect(&mut m, root, va, Attrs::USER_RW).unwrap();
+        assert!(!prev_pn.present && prev_pn.shared);
+        let restored = walk(&m, root, va).mapping().unwrap();
+        assert!(restored.present && restored.writable && restored.shared && restored.phys == frame);
+
+        // Unmap reports shared: true so caller knows not to free the PageCache frame.
+        let removed = unmap(&mut m, root, va).unwrap();
+        assert!(removed.shared && removed.phys == frame);
+
+        // Mapping directly with USER_NONE.with_shared(true) also emits PTE_SHARED.
+        let va2 = v(0x0000_0000_0070_1000);
+        map(&mut m, root, va2, frame, PageSize::Size4K, Attrs::USER_NONE.with_shared(true)).unwrap();
+        let pn2 = walk(&m, root, va2).prot_none_mapping().unwrap();
+        assert!(!pn2.present && pn2.shared);
+    }
+
+    #[test]
+    fn mapping_reports_hardware_dirty_and_protect_clears_it() {
+        let (mut m, root) = FakeMem::new();
+        let va = v(0x0000_0000_0071_0000);
+        let frame = f(0x71_0000);
+
+        map(&mut m, root, va, frame, PageSize::Size4K, Attrs::USER_RW.with_shared(true)).unwrap();
+        assert!(!walk(&m, root, va).mapping().unwrap().dirty);
+
+        // Simulate CPU setting hardware DIRTY bit (bit 6) on leaf PTE.
+        let l1 = m.table_at(root, va, Level::L1);
+        let idx = Level::L1.index_of(va);
+        m.set(l1, idx, m.entry(l1, idx) | DIRTY);
+        assert!(Entry::from_raw(m.entry(l1, idx)).is_dirty());
+
+        // walk, for_each_mapping, and for_each_leaf_in all report dirty == true.
+        assert!(walk(&m, root, va).mapping().unwrap().dirty);
+        let mut swept = Vec::new();
+        for_each_mapping(&m, root, |mp| swept.push(mp)).unwrap();
+        assert_eq!(swept.len(), 1);
+        assert!(swept[0].dirty && swept[0].shared);
+
+        let mut leaves = Vec::new();
+        for_each_leaf_in(&m, root, 0..256, |mp| leaves.push(mp)).unwrap();
+        assert_eq!(leaves.len(), 1);
+        assert!(leaves[0].dirty && leaves[0].shared);
+
+        // protect returns pre-write Mapping (dirty == true) and clears hardware DIRTY.
+        let prev = protect(&mut m, root, va, Attrs::USER_RO).unwrap();
+        assert!(prev.dirty && prev.shared && prev.writable);
+        let after = walk(&m, root, va).mapping().unwrap();
+        assert!(!after.dirty && after.shared && !after.writable);
+
+        // Set DIRTY again and verify unmap reports it.
+        m.set(l1, idx, m.entry(l1, idx) | DIRTY);
+        let removed = unmap(&mut m, root, va).unwrap();
+        assert!(removed.dirty && removed.shared);
+    }
+
+    #[test]
+    fn without_writable_keeps_write_only_present() {
+        let (mut m, root) = FakeMem::new();
+        let va = v(0x0000_0000_0072_0000);
+        let frame = f(0x72_0000);
+
+        // Write-only PROT_WRITE: for_user(false, true, false) is present = true, writable = true.
+        let write_only = Attrs::for_user(false, true, false);
+        assert!(!write_only.is_prot_none() && write_only.writable());
+
+        // Stripping writable for a PTE_SHARED leaf MUST keep present = true (NOT PTE_PROTNONE!).
+        let shared_write_only = write_only.without_writable().with_shared(true);
+        assert!(!shared_write_only.is_prot_none());
+        assert!(!shared_write_only.writable());
+        assert!(shared_write_only.shared());
+        assert!(shared_write_only.user());
+
+        map(&mut m, root, va, frame, PageSize::Size4K, shared_write_only).unwrap();
+        let mp = walk(&m, root, va).mapping().expect("write-only shared leaf must stay PRESENT");
+        assert!(mp.present && !mp.writable && !mp.executable && mp.shared && mp.user);
+        let raw = walk(&m, root, va).steps()[3].entry;
+        assert!(raw.is_present() && !raw.is_prot_none() && raw.is_shared() && !raw.has(WRITABLE));
+
+        // Calling without_writable on USER_NONE keeps it PROT_NONE.
+        let none = Attrs::USER_NONE.without_writable().with_shared(true);
+        assert!(none.is_prot_none() && none.shared());
+    }
+
+    #[test]
+    fn for_each_leaf_in_reports_shared_and_dirty_across_mixed_leaves() {
+        let (mut m, root) = FakeMem::new();
+        let va_priv_dirty = v(0x0000_0000_0073_0000);
+        let va_shared_clean = v(0x0000_0000_0073_1000);
+        let va_shared_dirty = v(0x0000_0000_0073_2000);
+        let va_shared_pn = v(0x0000_0000_0073_3000);
+
+        map(&mut m, root, va_priv_dirty, f(0x73_0000), PageSize::Size4K, Attrs::USER_RW).unwrap();
+        map(&mut m, root, va_shared_clean, f(0x73_1000), PageSize::Size4K, Attrs::USER_RO.with_shared(true)).unwrap();
+        map(&mut m, root, va_shared_dirty, f(0x73_2000), PageSize::Size4K, Attrs::USER_RW.with_shared(true)).unwrap();
+        map(&mut m, root, va_shared_pn, f(0x73_3000), PageSize::Size4K, Attrs::USER_NONE.with_shared(true)).unwrap();
+        // Kernel upper-half page must be excluded from 0..256 sweep.
+        map(&mut m, root, v(KERNEL), f(0x90_0000), PageSize::Size4K, Attrs::DATA).unwrap();
+
+        let l1 = m.table_at(root, va_priv_dirty, Level::L1);
+        for va in [va_priv_dirty, va_shared_dirty] {
+            let idx = Level::L1.index_of(va);
+            m.set(l1, idx, m.entry(l1, idx) | DIRTY);
+        }
+
+        let mut seen = Vec::new();
+        for_each_leaf_in(&m, root, 0..256, |mp| {
+            seen.push((mp.virt, mp.present, mp.writable, mp.shared, mp.dirty));
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            [
+                (va_priv_dirty, true, true, false, true),
+                (va_shared_clean, true, false, true, false),
+                (va_shared_dirty, true, true, true, true),
+                (va_shared_pn, false, false, true, false),
+            ]
+        );
     }
 }

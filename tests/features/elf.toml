@@ -6,3 +6,11 @@ milestone = "M6"
 tests = [
     "cargo:lumen-elf",
 ]
+
+[[feature]]
+name = "Dynamic ELF64 PT_INTERP parser (optional single PT_INTERP, PATH_MAX/NUL/bounds/AT_PHDR validation, lifetime-free interp_path), ET_DYN interpreter validation (NestedInterp, min_vaddr load_bias), and dynamic AuxvInfo (AT_BASE) (#251)"
+milestone = "M7"
+tests = [
+    "cargo:lumen-elf",
+    "scenario:test_linux_user::test_bad_elf_rejected",
+]

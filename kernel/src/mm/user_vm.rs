@@ -68,6 +68,7 @@ impl UserVmError {
         match self {
             UserVmError::OutOfMemory | UserVmError::Vm(VmError::NoMem) => errno::ENOMEM,
             UserVmError::Vm(VmError::Exists) => errno::EEXIST,
+            UserVmError::Vm(VmError::Access) => errno::EACCES,
             UserVmError::Vm(VmError::Misaligned | VmError::InvalidRange) | UserVmError::InvalidArg => errno::EINVAL,
             UserVmError::Elf(_) => errno::ENOEXEC,
             UserVmError::Stack(_) => errno::E2BIG,
@@ -422,9 +423,9 @@ impl AddressSpace {
         // SAFETY: `self.root` is owned by `self`, `inner` lock is held, and
         // `[addr, end)` is page-aligned and strictly in `USER_MIN..USER_MAX`.
         unsafe {
-            paging::protect_user_range(self.root, addr, end, attrs, |va, _was_present| {
+            paging::protect_user_range(self.root, addr, end, attrs, |leaf| {
                 if active {
-                    arch::paging::invalidate(va);
+                    arch::paging::invalidate(leaf.va);
                 }
             });
         }
@@ -540,7 +541,7 @@ impl AddressSpace {
         inner.vmas = VmaMap::new();
         // SAFETY: `self.root` is not active in CR3 (asserted above), `inner`
         // lock is held, and all lower-half leaves/tables belong exclusively to `self`.
-        unsafe { paging::clear_user_lower_half(self.root) };
+        unsafe { paging::clear_user_lower_half(self.root, |_leaf| {}) };
         inner.torn_down = true;
     }
 
@@ -571,13 +572,15 @@ impl AddressSpace {
         // SAFETY: `self.root` is owned by `self`, `inner` lock is held, and
         // `[start, end)` is page-aligned and strictly in the lower half.
         unsafe {
-            paging::unmap_user_range(self.root, start, end, |va, phys, _was_present| {
+            paging::unmap_user_range(self.root, start, end, |leaf| {
                 if active {
-                    arch::paging::invalidate(va);
+                    arch::paging::invalidate(leaf.va);
                 }
-                // SAFETY: leaf frame belonged exclusively to this address space
-                // and has been unmapped and invalidated from the local TLB.
-                frame::free(phys).expect("freeing unmapped user leaf frame");
+                if !leaf.was_shared {
+                    // SAFETY: non-shared leaf frame belonged exclusively to this address space
+                    // and has been unmapped and invalidated from the local TLB.
+                    frame::free(leaf.phys).expect("freeing unmapped user leaf frame");
+                }
             });
         }
     }
@@ -596,7 +599,7 @@ impl Drop for AddressSpace {
         } else {
             // SAFETY: `self.root` is not active in CR3 and exclusively owns its
             // lower-half subtree.
-            unsafe { paging::destroy_user_root(self.root) };
+            unsafe { paging::destroy_user_root(self.root, |_leaf| {}) };
         }
     }
 }
@@ -772,6 +775,8 @@ crate::ktest!(
                 Err(errno::ENOMEM)
             );
             kassert_eq!(space.mprotect(base, 0, Prot::READ), Ok(()));
+            kassert_eq!(UserVmError::Vm(VmError::Access).to_errno(), errno::EACCES);
+            kassert_eq!(UserVmError::Vm(VmError::Access).to_mprotect_errno(), errno::EACCES);
             // Defensive RSVD bit check never maps a frame.
             kassert_eq!(space.handle_page_fault(base + 2 * PAGE_SIZE, 1 << 3), FaultResult::Invalid);
 
