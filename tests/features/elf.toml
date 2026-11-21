@@ -16,11 +16,12 @@ tests = [
 ]
 
 [[feature]]
-name = "Dynamic ELF64 loader (#255): `linux /path` loads a binary from the VFS (symlinks followed), and one with `PT_INTERP` maps its interpreter, read through the VFS (ENOENT when absent, EACCES when not a regular file with an execute bit, ELIBBAD when not an ET_DYN or nested), at INTERP_BASE with AT_BASE its load bias, AT_PHDR/AT_ENTRY and brk the main binary's, and the interpreter's entry as the first instruction, refusing images that overlap each other or reach the stack's guard page with no frames taken; Alpine's dynamic `/bin/busybox echo` runs off the ext4 rootfs through `/lib/ld-musl-x86_64.so.1`, and a static binary by path, with zero leaked frames"
+name = "Dynamic ELF64 loader (#255): `linux /path` loads a binary from the VFS (symlinks followed; EACCES for a file without an execute bit) and records the path for `/proc/<pid>/exe`, and one with `PT_INTERP` maps its interpreter, read through the VFS (ENOENT when absent, EACCES when not a regular file with an execute bit, ELIBBAD when not an ET_DYN or nested), at INTERP_BASE with AT_BASE its load bias, AT_PHDR/AT_ENTRY and brk the main binary's, and the interpreter's entry as the first instruction, refusing images that overlap each other, a binary reaching the stack or its guard page, or an interpreter not below that guard page, with no frames taken; Alpine's dynamic `/bin/busybox echo` runs off the ext4 rootfs through `/lib/ld-musl-x86_64.so.1`, and a static binary by path, with zero leaked frames"
 milestone = "M7"
 tests = [
-    "ktest:lumen_kernel::linux::dynamic_elf_maps_interp_and_sets_auxv",
-    "ktest:lumen_kernel::linux::dynamic_elf_layout_rejected",
-    "ktest:lumen_kernel::linux::missing_interpreter_is_enoent",
+    "ktest:lumen_kernel::linux::exec::dynamic_elf_maps_interp_and_sets_auxv",
+    "ktest:lumen_kernel::linux::exec::dynamic_elf_layout_rejected",
+    "ktest:lumen_kernel::linux::exec::missing_interpreter_is_enoent",
+    "ktest:lumen_kernel::user::exe_path_reaches_the_process",
     "scenario:test_linux_user::test_dynamic_busybox_from_rootfs",
 ]

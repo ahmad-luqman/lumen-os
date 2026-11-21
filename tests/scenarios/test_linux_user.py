@@ -269,8 +269,8 @@ def test_dynamic_busybox_from_rootfs(boot, tmp_path):
     and the static `hello` (`build/linux/hello`, copied into the rootfs's
     `/usr/local/bin`) runs by path too, each exiting 0 with zero leaked
     frames; a symlink to the interpreter is followed and runs it directly
-    (no PT_INTERP: no AT_BASE); a path naming no file is refused with
-    ENOENT."""
+    (no PT_INTERP: no AT_BASE); a path naming no file is refused with ENOENT,
+    and a file without an execute bit with EACCES."""
     disk = copy_rootfs(tmp_path)
     m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
 
@@ -281,6 +281,11 @@ def test_dynamic_busybox_from_rootfs(boot, tmp_path):
 
     m.send_line("linux /bin/no-such-binary")
     m.expect(r"linux: cannot read '/bin/no-such-binary': ENOENT \(2\)\n", 10)
+    m.expect(r"lumen> ", 10)
+
+    # A regular file without an execute bit (0644) is refused, as execve(2).
+    m.send_line("linux /etc/passwd")
+    m.expect(r"linux: cannot read '/etc/passwd': EACCES \(13\)\n", 10)
     m.expect(r"lumen> ", 10)
 
     m.send_line("linux /usr/local/bin/hello")
