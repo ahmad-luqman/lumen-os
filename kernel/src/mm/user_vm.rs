@@ -298,7 +298,16 @@ impl AddressSpace {
         new_vmas.map_fixed_noreplace(USER_STACK_BOTTOM, USER_STACK_SIZE, Prot::READ | Prot::WRITE)?;
 
         let initial_brk = main.plan.initial_brk;
-        let brk_limit = if initial_brk <= MMAP_TOP { MMAP_TOP } else { USER_MAX };
+        // `brk` grows up to the mmap area, or, for an image above it, up to
+        // the stack's guard page (never over it: `Brk::set` stops only at
+        // VMAs, and the guard page is none), or to the top of user space.
+        let brk_limit = if initial_brk <= MMAP_TOP {
+            MMAP_TOP
+        } else if initial_brk < USER_STACK_BOTTOM {
+            USER_STACK_BOTTOM - PAGE_SIZE
+        } else {
+            USER_MAX
+        };
         let new_brk = Brk::with_limit(initial_brk, brk_limit)?;
 
         let stack_buf = stack.buf.as_slice();
