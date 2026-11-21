@@ -129,9 +129,9 @@ pub struct ProcessState {
     pub stdout: Vec<u8>,
     /// The process's address space, for `/proc/<pid>/maps`.
     pub address_space: Option<Arc<AddressSpace>>,
-    /// The executable's path for `/proc/<pid>/exe`; only `vfstest
-    /// dev-tmp-proc`'s checks (and the ktests running them) set it until
-    /// `linux /path` loads from the VFS (#255).
+    /// The executable's path for `/proc/<pid>/exe`: set by `linux /path`
+    /// (the path as typed) and by `vfstest dev-tmp-proc`'s checks (and the
+    /// ktests running them).
     pub exe_path: Option<String>,
     /// VFS files open on descriptors, with the path each was opened by, for
     /// `/proc/<pid>/fd`: a stand-in for the 1024-entry FD table that #254

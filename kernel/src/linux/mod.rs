@@ -18,13 +18,20 @@ use alloc::vec::Vec;
 #[allow(unused_imports)]
 pub use linux_raw_sys::{auxvec, ctypes, errno, general, ioctl, prctl, system};
 
+use core::fmt;
+
+use lumen_elf::loader::LoadedElf;
+use lumen_vfs::VfsError;
+use lumen_vm::PIE_BASE;
+
 use crate::arch;
 use crate::linux::process::ConsoleIo;
 use crate::mm::frame;
-use crate::mm::user_vm::AddressSpace;
+use crate::mm::user_vm::{AddressSpace, UserVmError};
 use crate::shell::Ctx;
 use crate::term::Place;
 use crate::user::{UserExit, run_elf_process};
+use crate::vfs;
 
 /// Linux x86-64 `struct new_utsname` written by `uname(2)` (syscall 63).
 pub type Utsname = system::new_utsname;
@@ -206,8 +213,53 @@ fn at_random_bytes() -> [u8; 16] {
     out
 }
 
-/// Shell command: `linux` (list available Limine Linux binaries) or
-/// `linux <name> [args...]` (load and run a static Linux x86-64 ELF64 binary).
+/// Why `linux` could not load a binary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecError {
+    /// The interpreter its `PT_INTERP` names could not be read (`ENOENT`
+    /// when it is absent).
+    Interp(VfsError),
+    /// The binary, or its interpreter (`ELIBBAD`), could not be loaded.
+    Load(UserVmError),
+}
+
+impl ExecError {
+    /// The Linux `errno` an `execve(2)` failing this way returns.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+    const fn to_errno(self) -> u32 {
+        match self {
+            ExecError::Interp(e) => e.to_errno(),
+            ExecError::Load(e) => e.to_errno(),
+        }
+    }
+}
+
+impl fmt::Display for ExecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecError::Interp(e) => write!(f, "cannot read its interpreter: {e}"),
+            ExecError::Load(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// The interpreter file `image`'s `PT_INTERP` names, read through the VFS
+/// (`None` for a static binary), so that `linux` reads every file before
+/// counting frames.
+fn read_interp(image: &[u8]) -> Result<Option<Vec<u8>>, ExecError> {
+    let main = LoadedElf::parse_with_pie_base(image, PIE_BASE).map_err(|e| ExecError::Load(UserVmError::Elf(e)))?;
+    let Some(path) = main.interp_path(image) else {
+        return Ok(None);
+    };
+    // The VFS resolves UTF-8 paths only; no other path can name a file in it.
+    let path = core::str::from_utf8(path).map_err(|_| ExecError::Interp(VfsError::NoEnt))?;
+    vfs::read_executable(path).map(Some).map_err(ExecError::Interp)
+}
+
+/// Shell command: `linux` (list available Limine Linux binaries),
+/// `linux <name> [args...]` (load and run a Linux x86-64 ELF64 boot module),
+/// or `linux /path [args...]` (load and run a static or dynamically linked
+/// ELF64 binary from the VFS, its `PT_INTERP` interpreter too).
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     if args.is_empty() {
@@ -235,8 +287,22 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     };
 
     let name = &args[0];
-    let Some(module) = modules::find(name) else {
-        return ctx.fail(format_args!("linux: unknown binary '{name}' (run 'linux' to list)"));
+    let file: Vec<u8>;
+    let (image, thread_name, exe_path): (&[u8], &'static str, Option<String>) = if name.starts_with('/') {
+        file = match vfs::read_executable(name) {
+            Ok(bytes) => bytes,
+            Err(e) => return ctx.fail(format_args!("linux: cannot read '{name}': {e}")),
+        };
+        (&file, "linux", Some(name.clone()))
+    } else {
+        let Some(module) = modules::find(name) else {
+            return ctx.fail(format_args!("linux: unknown binary '{name}' (run 'linux' to list)"));
+        };
+        (module.bytes, module.name, None)
+    };
+    let interp = match read_interp(image) {
+        Ok(interp) => interp,
+        Err(e) => return ctx.fail(format_args!("linux: failed to load '{name}': {e}")),
     };
 
     let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
@@ -246,16 +312,18 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
 
     // Pre-warm kernel heap so process/VMA/stack metadata reuses mapped heap
     // pages and physical frame accounting reflects only user-space frames.
+    // Every file was read above, so the page cache's frames are not counted.
     let _warm: Vec<u8> = vec![0u8; 32 * 1024];
     drop(_warm);
 
     let frames_before = frame::free_frames();
-    let (space, prog) = match AddressSpace::from_elf(module.bytes, &argv, &envp, execfn, random) {
+    let loaded = AddressSpace::from_elf_with_interp(image, interp.as_deref(), &argv, &envp, execfn, random);
+    let (space, prog) = match loaded {
         Ok(loaded) => loaded,
         Err(e) => return ctx.fail(format_args!("linux: failed to load '{name}': {e}")),
     };
     let space = Arc::new(space);
-    let exit = match run_elf_process(module.name, space, prog.entry, prog.rsp, io) {
+    let exit = match run_elf_process(thread_name, space, prog.entry, prog.rsp, io, exe_path) {
         Ok(exit) => exit,
         Err(e) => return ctx.fail(format_args!("linux: failed to run '{name}': {e}")),
     };
@@ -582,6 +650,284 @@ crate::ktest!(
         crate::kassert_eq!(offset_of!(general::flock, l_len), 16);
         crate::kassert_eq!(offset_of!(general::flock, l_pid), 24);
 
+        Ok(())
+    }
+);
+
+/// One program header for the ktests' crafted ELF64 images.
+#[cfg(feature = "ktest")]
+#[derive(Clone, Copy)]
+struct TestPhdr {
+    p_type: u32,
+    flags: u32,
+    offset: u64,
+    vaddr: u64,
+    filesz: u64,
+    memsz: u64,
+}
+
+/// A little-endian x86-64 ELF64 image of `len` bytes: the header, `phdrs`
+/// right after it, then each `(offset, bytes)` patch.
+#[cfg(feature = "ktest")]
+fn build_test_elf(e_type: u16, entry: u64, phdrs: &[TestPhdr], len: usize, patches: &[(usize, &[u8])]) -> Vec<u8> {
+    use lumen_elf::loader::{EM_X86_64, EV_CURRENT, PHDR_MIN_SIZE};
+    const EHDR_SIZE: usize = 64;
+    let mut img = vec![0u8; len];
+    img[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    img[4] = 2; // ELFCLASS64
+    img[5] = 1; // ELFDATA2LSB
+    img[6] = EV_CURRENT;
+    img[0x10..0x12].copy_from_slice(&e_type.to_le_bytes());
+    img[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
+    img[0x14..0x18].copy_from_slice(&u32::from(EV_CURRENT).to_le_bytes());
+    img[0x18..0x20].copy_from_slice(&entry.to_le_bytes());
+    img[0x20..0x28].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes());
+    img[0x34..0x36].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes());
+    img[0x36..0x38].copy_from_slice(&PHDR_MIN_SIZE.to_le_bytes());
+    img[0x38..0x3a].copy_from_slice(&(phdrs.len() as u16).to_le_bytes());
+    for (i, ph) in phdrs.iter().enumerate() {
+        let o = EHDR_SIZE + i * usize::from(PHDR_MIN_SIZE);
+        img[o..o + 4].copy_from_slice(&ph.p_type.to_le_bytes());
+        img[o + 4..o + 8].copy_from_slice(&ph.flags.to_le_bytes());
+        img[o + 8..o + 16].copy_from_slice(&ph.offset.to_le_bytes());
+        img[o + 16..o + 24].copy_from_slice(&ph.vaddr.to_le_bytes());
+        img[o + 24..o + 32].copy_from_slice(&ph.vaddr.to_le_bytes());
+        img[o + 32..o + 40].copy_from_slice(&ph.filesz.to_le_bytes());
+        img[o + 40..o + 48].copy_from_slice(&ph.memsz.to_le_bytes());
+        img[o + 48..o + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    }
+    for &(off, bytes) in patches {
+        img[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+    img
+}
+
+/// A dynamically linked main image naming `interp`: `PT_PHDR`, `PT_INTERP`,
+/// an `R--` page at `vbase` holding the headers and an `R-X` page above it
+/// starting `MAIN-TXT`, with its entry at `vbase + 0x1010` (an `ET_DYN`
+/// gets `PIE_BASE` added).
+#[cfg(feature = "ktest")]
+fn test_dynamic_main(e_type: u16, vbase: u64, interp: &[u8]) -> Vec<u8> {
+    use lumen_elf::loader::{PF_R, PF_X, PT_INTERP, PT_LOAD, PT_PHDR};
+    let mut path = Vec::from(interp);
+    path.push(0);
+    let phdrs = [
+        TestPhdr { p_type: PT_PHDR, flags: PF_R, offset: 0x40, vaddr: vbase + 0x40, filesz: 4 * 56, memsz: 4 * 56 },
+        TestPhdr {
+            p_type: PT_INTERP,
+            flags: PF_R,
+            offset: 0x200,
+            vaddr: vbase + 0x200,
+            filesz: path.len() as u64,
+            memsz: path.len() as u64,
+        },
+        TestPhdr { p_type: PT_LOAD, flags: PF_R, offset: 0, vaddr: vbase, filesz: 0x1000, memsz: 0x1000 },
+        TestPhdr {
+            p_type: PT_LOAD,
+            flags: PF_R | PF_X,
+            offset: 0x1000,
+            vaddr: vbase + 0x1000,
+            filesz: 0x100,
+            memsz: 0x100,
+        },
+    ];
+    build_test_elf(e_type, vbase + 0x1010, &phdrs, 0x2000, &[(0x200, &path), (0x1000, b"MAIN-TXT")])
+}
+
+/// An interpreter: an `R--` page at `vbase` and an `R-X` segment of
+/// `text_memsz` bytes above it starting `INTERP!!`, its entry at
+/// `vbase + 0x1020`, plus `extra` program headers.
+#[cfg(feature = "ktest")]
+fn test_interp(e_type: u16, vbase: u64, text_memsz: u64, extra: &[TestPhdr]) -> Vec<u8> {
+    use lumen_elf::loader::{PF_R, PF_X, PT_LOAD};
+    let mut phdrs = vec![
+        TestPhdr { p_type: PT_LOAD, flags: PF_R, offset: 0, vaddr: vbase, filesz: 0x400, memsz: 0x1000 },
+        TestPhdr {
+            p_type: PT_LOAD,
+            flags: PF_R | PF_X,
+            offset: 0x1000,
+            vaddr: vbase + 0x1000,
+            filesz: 0x100,
+            memsz: text_memsz,
+        },
+    ];
+    phdrs.extend_from_slice(extra);
+    build_test_elf(e_type, vbase + 0x1020, &phdrs, 0x2000, &[(0x1000, b"INTERP!!")])
+}
+
+/// The auxiliary vector on a freshly built initial stack at `rsp` (past
+/// `argc`, `argv` and `envp`), read through the current address space.
+#[cfg(feature = "ktest")]
+fn read_test_auxv(rsp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
+    use crate::user::copy_from_user;
+    let word = |va: u64| -> Result<u64, &'static str> {
+        let mut b = [0u8; 8];
+        copy_from_user(&mut b, va).map_err(|_| "initial stack unreadable")?;
+        Ok(u64::from_le_bytes(b))
+    };
+    let argc = word(rsp)?;
+    let mut va = rsp + 8 * (argc + 2); // argc, argv[..], NULL
+    while word(va)? != 0 {
+        va += 8; // envp[..]
+    }
+    va += 8;
+    let mut auxv = Vec::new();
+    loop {
+        let (key, val) = (word(va)?, word(va + 8)?);
+        if key == lumen_elf::stack::AT_NULL {
+            return Ok(auxv);
+        }
+        auxv.push((key, val));
+        va += 16;
+        if auxv.len() > 64 {
+            return Err("auxv not terminated");
+        }
+    }
+}
+
+crate::ktest!(
+    fn dynamic_elf_maps_interp_and_sets_auxv() {
+        use crate::user::copy_from_user;
+        use crate::{kassert, kassert_eq};
+        use lumen_elf::loader::ET_DYN;
+        use lumen_elf::stack::{AT_BASE, AT_ENTRY, AT_PHDR, AT_PHNUM};
+        use lumen_vm::INTERP_BASE;
+
+        const NAME: &str = "ld-lumen-ktest.so";
+        // The interpreter is linked at 0x10000, so its load bias (AT_BASE)
+        // is INTERP_BASE - 0x10000 while its pages start at INTERP_BASE.
+        let interp_img = test_interp(ET_DYN, 0x10000, 0x100, &[]);
+        let main = test_dynamic_main(ET_DYN, 0, b"/tmp/ld-lumen-ktest.so");
+
+        // Write the interpreter to tmpfs and read it back the way `linux`
+        // does, then without its execute bits (EACCES, as execve(2)), and
+        // remove it before checking anything or counting frames (tmpfs
+        // pages hold frames).
+        let tmp = vfs::resolve_path_from_root("/tmp").map_err(|_| "no /tmp")?;
+        let file = tmp.create(NAME, 0o755).map_err(|_| "create interpreter")?;
+        let written = file.write_at(0, &interp_img);
+        let read = read_interp(&main);
+        let mode = file.set_mode(0o644);
+        let not_executable = read_interp(&main);
+        drop(file);
+        tmp.unlink(NAME).map_err(|_| "unlink interpreter")?;
+        kassert_eq!(written, Ok(interp_img.len()));
+        kassert_eq!(mode, Ok(()));
+        kassert_eq!(not_executable.map_err(ExecError::to_errno), Err(errno::EACCES));
+        let interp = read.map_err(|_| "read_interp failed")?.ok_or("no interpreter read")?;
+        kassert_eq!(interp, interp_img);
+
+        let _warm: Vec<u8> = vec![0u8; 64 * 1024];
+        drop(_warm);
+        let free_before = frame::free_frames();
+        {
+            let (space, prog) =
+                AddressSpace::from_elf_with_interp(&main, Some(&interp), &[b"/t"], &[b"K=V"], b"/t", [7; 16])
+                    .map_err(|_| "dynamic load failed")?;
+            kassert_eq!(prog.entry, INTERP_BASE + 0x1020);
+            kassert_eq!(prog.initial_brk, PIE_BASE + 0x2000);
+            let space = Arc::new(space);
+            let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+            let auxv = read_test_auxv(prog.rsp)?;
+            let aux = |key: u64| auxv.iter().find(|&&(k, _)| k == key).map(|&(_, v)| v);
+            kassert_eq!(aux(AT_BASE), Some(INTERP_BASE - 0x10000));
+            kassert_eq!(aux(AT_ENTRY), Some(PIE_BASE + 0x1010));
+            kassert_eq!(aux(AT_PHDR), Some(PIE_BASE + 0x40));
+            kassert_eq!(aux(AT_PHNUM), Some(4));
+            // Both images are mapped where their headers say.
+            let mut text = [0u8; 8];
+            kassert_eq!(copy_from_user(&mut text, PIE_BASE + 0x1000), Ok(()));
+            kassert_eq!(&text, b"MAIN-TXT");
+            kassert_eq!(copy_from_user(&mut text, INTERP_BASE + 0x1000), Ok(()));
+            kassert_eq!(&text, b"INTERP!!");
+            drop(_active);
+            space.teardown();
+        }
+        kassert_eq!(frame::free_frames(), free_before);
+
+        // A static image through the same call: its own entry, no AT_BASE.
+        {
+            let elf = crate::mm::user_vm::build_relro_test_elf();
+            let (space, prog) = AddressSpace::from_elf_with_interp(&elf, None, &[b"/s"], &[], b"/s", [7; 16])
+                .map_err(|_| "static load failed")?;
+            kassert_eq!(prog.entry, 0x40_1000);
+            kassert_eq!(prog.initial_brk, 0x40_4000);
+            let space = Arc::new(space);
+            let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+            let auxv = read_test_auxv(prog.rsp)?;
+            kassert!(auxv.iter().all(|&(k, _)| k != AT_BASE));
+            kassert_eq!(auxv.iter().find(|&&(k, _)| k == AT_ENTRY).map(|&(_, v)| v), Some(0x40_1000));
+            drop(_active);
+            space.teardown();
+
+            // An interpreter must be given exactly when the image names one.
+            let mismatch = AddressSpace::from_elf_with_interp(&elf, Some(&interp), &[], &[], b"/s", [7; 16]);
+            kassert!(matches!(mismatch, Err(UserVmError::InvalidArg)));
+            let mismatch = AddressSpace::from_elf_with_interp(&main, None, &[], &[], b"/t", [7; 16]);
+            kassert!(matches!(mismatch, Err(UserVmError::InvalidArg)));
+        }
+        kassert_eq!(frame::free_frames(), free_before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn dynamic_elf_layout_rejected() {
+        use crate::mm::user_vm::USER_STACK_BOTTOM;
+        use crate::{kassert, kassert_eq};
+        use lumen_elf::loader::{ET_DYN, ET_EXEC, ElfLoadError, PF_R, PT_INTERP};
+        use lumen_vm::{INTERP_BASE, USER_MAX, VmError};
+
+        let main = test_dynamic_main(ET_DYN, 0, b"/lib/ld-musl-x86_64.so.1");
+        let interp = test_interp(ET_DYN, 0, 0x100, &[]);
+        let load = |main: &[u8], interp: &[u8]| {
+            AddressSpace::from_elf_with_interp(main, Some(interp), &[b"/t"], &[], b"/t", [0; 16]).map(|_| ())
+        };
+
+        let _warm: Vec<u8> = vec![0u8; 64 * 1024];
+        drop(_warm);
+        let free_before = frame::free_frames();
+
+        // An ET_EXEC main image placed over the interpreter's pages.
+        let over = test_dynamic_main(ET_EXEC, INTERP_BASE, b"/lib/ld-musl-x86_64.so.1");
+        kassert_eq!(load(&over, &interp), Err(UserVmError::Vm(VmError::Exists)));
+        // An interpreter reaching the stack's guard page (its last page is
+        // the guard page; refused before anything is mapped).
+        let long = test_interp(ET_DYN, 0, USER_STACK_BOTTOM - INTERP_BASE - 0x1000, &[]);
+        kassert_eq!(load(&main, &long), Err(UserVmError::Vm(VmError::Exists)));
+        // An interpreter past the top of user space.
+        let past = load(&main, &test_interp(ET_DYN, 0, USER_MAX - INTERP_BASE, &[]));
+        kassert!(matches!(past, Err(UserVmError::BadInterp(ElfLoadError::AddressOutOfRange { .. }))));
+        kassert_eq!(past.map_err(UserVmError::to_errno), Err(errno::ELIBBAD));
+        // An interpreter with its own interpreter, or not an ET_DYN.
+        let nested_ph = TestPhdr { p_type: PT_INTERP, flags: PF_R, offset: 0x400, vaddr: 0x400, filesz: 2, memsz: 2 };
+        let nested = test_interp(ET_DYN, 0, 0x100, &[nested_ph]);
+        kassert_eq!(load(&main, &nested), Err(UserVmError::BadInterp(ElfLoadError::NestedInterp)));
+        let exec = test_interp(ET_EXEC, 0x40_0000, 0x100, &[]);
+        kassert_eq!(load(&main, &exec), Err(UserVmError::BadInterp(ElfLoadError::InterpreterNotDynamic(ET_EXEC))));
+
+        kassert_eq!(frame::free_frames(), free_before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn missing_interpreter_is_enoent() {
+        use crate::{kassert, kassert_eq};
+        use lumen_elf::loader::ET_DYN;
+
+        let missing = test_dynamic_main(ET_DYN, 0, b"/no/such/ld-lumen.so");
+        let err = read_interp(&missing);
+        kassert_eq!(err, Err(ExecError::Interp(VfsError::NoEnt)));
+        kassert_eq!(err.map_err(ExecError::to_errno), Err(errno::ENOENT));
+        // A directory is not an interpreter.
+        let dir = test_dynamic_main(ET_DYN, 0, b"/");
+        kassert_eq!(read_interp(&dir).map_err(ExecError::to_errno), Err(errno::EACCES));
+        // A static image names none; a malformed one is refused as ENOEXEC.
+        let elf = crate::mm::user_vm::build_relro_test_elf();
+        kassert_eq!(read_interp(&elf), Ok(None));
+        kassert!(matches!(read_interp(b"not an elf"), Err(ExecError::Load(UserVmError::Elf(_)))));
+        kassert_eq!(read_interp(b"not an elf").map_err(ExecError::to_errno), Err(errno::ENOEXEC));
         Ok(())
     }
 );

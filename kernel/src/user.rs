@@ -20,7 +20,7 @@ use lumen_vm::{Prot, USER_STACK_BOTTOM};
 
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::arch::{self, TrapFrame};
-use crate::linux::process::{ConsoleIo, record_exit, register_current, take_current};
+use crate::linux::process::{ConsoleIo, record_exit, register_current, set_current_exe_path, take_current};
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, errno, general, ioctl, syscall as linux_syscall};
 #[cfg(feature = "ktest")]
 use crate::mm::paging;
@@ -525,11 +525,15 @@ fn spawn_ring3_on(
     io: ConsoleIo,
     allow_test_syscalls: bool,
     stdin: Vec<u8>,
+    exe_path: Option<String>,
 ) -> Result<(sched::JoinHandle, ResultSlot), &'static str> {
     let result_slot: ResultSlot = Arc::new(SpinLock::new(None));
     let out = result_slot.clone();
     let handle = sched::spawn_user_on(cpu, name, space, move || {
         let _pid = register_current(io, allow_test_syscalls, stdin);
+        if let Some(path) = exe_path {
+            set_current_exe_path(&path);
+        }
 
         let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
         let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);
@@ -566,6 +570,7 @@ fn spawn_ring3_on(
 /// Run a loaded Linux ELF64 process in ring 3 with the given interactive
 /// console target (`allow_test_syscalls == false`). Serial console processes
 /// are pinned to CPU 0 because `serial_in` drains COM1 IRQ 4 on the boot CPU.
+/// `exe_path` is recorded for `/proc/<pid>/exe` (a binary loaded by path).
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 pub fn run_elf_process(
     name: &'static str,
@@ -573,9 +578,10 @@ pub fn run_elf_process(
     entry: u64,
     rsp: u64,
     io: ConsoleIo,
+    exe_path: Option<String>,
 ) -> Result<UserExit, &'static str> {
     let cpu = if matches!(io, ConsoleIo::Serial) { 0 } else { arch::cpu_index() };
-    let (handle, slot) = spawn_ring3_on(cpu, name, space, entry, rsp, None, io, false, Vec::new())?;
+    let (handle, slot) = spawn_ring3_on(cpu, name, space, entry, rsp, None, io, false, Vec::new(), exe_path)?;
     handle.join();
     let res = slot.lock().take().expect("linux process finished without RunResult");
     Ok(res.exit)
@@ -606,6 +612,7 @@ fn run_ring3_program(
         ConsoleIo::Capture,
         true,
         stdin,
+        None,
     )?;
     handle.join();
     Ok(slot.lock().take().expect("user thread finished without RunResult"))
@@ -1162,6 +1169,7 @@ fn run_mmap_brk_test(ctx: &mut Ctx<'_>) {
         ConsoleIo::Capture,
         true,
         Vec::new(),
+        None,
     ) {
         Ok(pair) => pair,
         Err(e) => return ctx.fail(format_args!("usertest: mmap_brk spawn failed: {e}")),
@@ -1329,6 +1337,7 @@ fn run_sse_tls_test(ctx: &mut Ctx<'_>) {
         ConsoleIo::Capture,
         true,
         Vec::new(),
+        None,
     ) {
         Ok(p) => p,
         Err(e) => return ctx.fail(format_args!("usertest: sse_tls spawn A: {e}")),
@@ -1343,6 +1352,7 @@ fn run_sse_tls_test(ctx: &mut Ctx<'_>) {
         ConsoleIo::Capture,
         true,
         Vec::new(),
+        None,
     ) {
         Ok(p) => p,
         Err(e) => {
