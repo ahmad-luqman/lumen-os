@@ -655,13 +655,17 @@ fn vfs_pattern_byte(idx: usize) -> u8 {
 /// the kernel.
 const READ_ALL_MAX: usize = WRITE_PATTERN_MAX;
 
-/// A whole file's bytes, refused with `EFBIG` past [`READ_ALL_MAX`] and
-/// with `ENOMEM` when the heap can't hold them (reserved up front from the
-/// file's size, then grown fallibly).
+/// A whole file's bytes, refused with `EFBIG` past [`READ_ALL_MAX`] (by its
+/// size before reading, and again if it grows while read) and with `ENOMEM`
+/// when the heap can't hold them: the buffer is reserved from the file's
+/// size (nothing for one that reports 0, as procfs's do) and grown fallibly.
 fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
+    let size = inode.stat()?.size;
+    if size > READ_ALL_MAX as u64 {
+        return Err(VfsError::FBig);
+    }
     let mut out = Vec::new();
-    let size = inode.stat().map_or(0, |m| usize::try_from(m.size).unwrap_or(usize::MAX)).min(READ_ALL_MAX);
-    out.try_reserve_exact(size).map_err(|_| VfsError::NoMem)?;
+    out.try_reserve_exact(size as usize).map_err(|_| VfsError::NoMem)?;
     let mut off = 0u64;
     let mut buf = [0u8; 4096];
     loop {
@@ -682,7 +686,8 @@ fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
 /// An executable file's bytes by absolute path from `/` (symlinks
 /// followed), for `linux /path` and the interpreter its binary names:
 /// `EACCES` for anything but a regular file with an execute bit (as
-/// `execve(2)`, where root too needs one), `EFBIG` past [`READ_ALL_MAX`].
+/// `execve(2)`, where root too needs one), `EFBIG` past [`READ_ALL_MAX`],
+/// `ENOMEM` when the heap can't hold it.
 pub(crate) fn read_executable(path: &str) -> Result<Vec<u8>, VfsError> {
     let inode = resolve_path_from_root(path)?;
     if inode.inode_type() != InodeType::File || inode.stat()?.mode & 0o111 == 0 {
