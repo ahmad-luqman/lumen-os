@@ -23,14 +23,14 @@ KERNEL_SRCS := $(shell find kernel crates apps -name '*.rs' -o -name '*.toml' -o
 # their recipes must never run concurrently (`make -j`).
 .NOTPARALLEL:
 
-.PHONY: help deps build app apps iso run debug test test-host test-scenarios audit lint fmt fmt-check status status-check census golden clean
+.PHONY: help deps build app apps iso rootfs run debug test test-host test-scenarios audit lint fmt fmt-check status status-check census golden clean
 
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-15s %s\n", $$1, $$2}'
 
-deps: $(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version $(BUILD)/deps/busybox/.version ## Download pinned Limine + OVMF + Alpine busybox (checksummed)
+deps: $(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version $(BUILD)/deps/busybox/.version $(BUILD)/deps/alpine-minirootfs/.version ## Download pinned Limine + OVMF + Alpine busybox + Alpine minirootfs (checksummed)
 
-$(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version $(BUILD)/deps/busybox/.version: tools/fetch-deps.sh
+$(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version $(BUILD)/deps/busybox/.version $(BUILD)/deps/alpine-minirootfs/.version: tools/fetch-deps.sh
 	tools/fetch-deps.sh
 
 # Static musl x86-64 hello binary (M6, #238): cross-compiled with rustc + rust-lld
@@ -45,6 +45,46 @@ $(BUILD)/linux/hello: tools/linux-hello/hello.rs rust-toolchain.toml
 		-C strip=symbols \
 		$< -o $@
 
+# Dynamic musl x86-64 M7 test library and executable (#252): cross-compiled with
+# rustc + rust-lld against Alpine's ld-musl-x86_64.so.1 (no C cross-compiler).
+$(BUILD)/linux/libm7.so: tools/linux-m7/libm7.rs $(BUILD)/deps/alpine-minirootfs/.version rust-toolchain.toml
+	@mkdir -p $(BUILD)/linux
+	SYSROOT=$$(rustc --print sysroot) && HOST=$$(rustc --print host-tuple) && \
+	MUSL_SC="$$SYSROOT/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained" && \
+	rustc --edition 2024 -O --crate-type cdylib --target x86_64-unknown-linux-musl \
+		-C panic=abort \
+		-C strip=symbols \
+		-C target-feature=-crt-static \
+		-C linker="$$SYSROOT/lib/rustlib/$$HOST/bin/rust-lld" \
+		-C linker-flavor=ld.lld \
+		-C link-self-contained=no \
+		-C default-linker-libraries=no \
+		-C link-arg="$$MUSL_SC/crti.o" \
+		-C link-arg="$$MUSL_SC/crtn.o" \
+		-C link-arg="$(BUILD)/deps/alpine-minirootfs/lib/ld-musl-x86_64.so.1" \
+		$< -o $@
+	PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness.rootfs $@ --rootfs-dir $(BUILD)/deps/alpine-minirootfs --no-interp
+
+$(BUILD)/linux/m7_test: tools/linux-m7/m7_test.rs $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/libm7.so rust-toolchain.toml
+	@mkdir -p $(BUILD)/linux
+	SYSROOT=$$(rustc --print sysroot) && HOST=$$(rustc --print host-tuple) && \
+	MUSL_SC="$$SYSROOT/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained" && \
+	rustc --edition 2024 -O --target x86_64-unknown-linux-musl \
+		-C panic=abort \
+		-C strip=symbols \
+		-C target-feature=-crt-static \
+		-C linker="$$SYSROOT/lib/rustlib/$$HOST/bin/rust-lld" \
+		-C linker-flavor=ld.lld \
+		-C link-self-contained=no \
+		-C default-linker-libraries=no \
+		-C link-arg="$$MUSL_SC/Scrt1.o" \
+		-C link-arg="$$MUSL_SC/crti.o" \
+		-C link-arg="$$MUSL_SC/crtn.o" \
+		-C link-arg="$(BUILD)/deps/alpine-minirootfs/lib/ld-musl-x86_64.so.1" \
+		-C link-arg=--dynamic-linker=/lib/ld-musl-x86_64.so.1 \
+		$< -o $@
+	PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness.rootfs $@ --rootfs-dir $(BUILD)/deps/alpine-minirootfs
+
 # Two kernels: the normal one (the shells) and the in-kernel test build.
 # `| apps`: built first (order-only: the kernel rebuilds when cargo says).
 $(BUILD)/lumen-kernel: $(KERNEL_SRCS) | apps
@@ -55,7 +95,7 @@ $(BUILD)/lumen-kernel-ktest: $(KERNEL_SRCS) | apps
 	$(CARGO_KERNEL) --features ktest
 	@mkdir -p $(BUILD) && cp $(KERNEL_OUT) $@
 
-build: apps $(BUILD)/linux/hello $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps, static musl hello, and both kernels
+build: apps $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/libm7.so $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps, Linux test binaries, and both kernels
 
 # Apps (M5; the layout: ARCHITECTURE section 8, "Building and bundling"):
 # apps/ is its own workspace, and its crates that build a `cdylib` are WASM
@@ -101,12 +141,18 @@ $(BUILD)/lumen-ktest.iso: $(BUILD)/lumen-kernel-ktest $(ISO_DEPS)
 
 iso: $(BUILD)/lumen.iso $(BUILD)/lumen-qemutest.iso $(BUILD)/lumen-ktest.iso ## Build all bootable ISOs
 
+$(BUILD)/alpine-rootfs.ext4: tools/mkrootfs.sh $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/libm7.so
+	tools/mkrootfs.sh $@
+
+rootfs: $(BUILD)/alpine-rootfs.ext4 ## Build deterministic Alpine minirootfs ext4 image
+
 # `make run DESKTOP=1`: the same kernel with `lumen.desktop` (the desktop
 # shown from the boot on).
 RUN_ISO := $(if $(DESKTOP),$(BUILD)/lumen-desktop.iso,$(BUILD)/lumen.iso)
+RUN_ROOTFS := $(if $(ROOTFS),$(BUILD)/alpine-rootfs.ext4)
 
-run: $(RUN_ISO) ## Boot in QEMU with a window; serial on this terminal (HEADLESS=1: no window; SOUND=1: virtio-sound on the host's audio; DESKTOP=1: start the desktop; any value counts, 0 too)
-	$(HARNESS) run --iso $< $(if $(HEADLESS),--headless) $(if $(SOUND),--sound)
+run: $(RUN_ISO) $(RUN_ROOTFS) ## Boot in QEMU with a window; serial on this terminal (HEADLESS=1: no window; SOUND=1: virtio-sound on the host's audio; DESKTOP=1: start the desktop; ROOTFS=1: attach build/alpine-rootfs.ext4 via virtio-blk; any value counts, 0 too)
+	$(HARNESS) run --iso $< $(if $(HEADLESS),--headless) $(if $(SOUND),--sound) $(if $(ROOTFS),--rootfs $(RUN_ROOTFS))
 
 debug: $(BUILD)/lumen.iso ## Boot paused with a gdb stub on :1234, then attach gdb (stops at kmain)
 	$(HARNESS) debug --iso $< --kernel $(BUILD)/lumen-kernel
@@ -134,7 +180,7 @@ test-host: ## Host-side unit tests (Rust crates + harness self-tests)
 # guest loses local APIC timer ticks, and test_time and test_acpi count them.
 SCENARIO_JOBS ?= auto
 
-test-scenarios: iso ## Boot QEMU headless and run every scenario (incl. in-kernel tests; SCENARIO_JOBS=0: serially)
+test-scenarios: iso rootfs ## Boot QEMU headless and run every scenario (incl. in-kernel tests; SCENARIO_JOBS=0: serially)
 	@mkdir -p $(RESULTS) && rm -f $(RESULTS)/scenarios.xml $(RESULTS)/ktest.tap
 	uv run --frozen pytest tests/scenarios -v -n $(SCENARIO_JOBS) --junitxml=$(RESULTS)/scenarios.xml
 
@@ -152,13 +198,13 @@ lint: ## clippy on host crates (incl. their tests), the kernel and the apps; ruf
 fmt: ## Format Rust and Python
 	cargo fmt --all
 	cd apps && cargo fmt --all
-	rustfmt --edition 2024 tools/linux-hello/hello.rs
+	rustfmt --edition 2024 tools/linux-hello/hello.rs tools/linux-m7/*.rs
 	uv run --frozen ruff format tools tests
 
 fmt-check: ## Check formatting
 	cargo fmt --all -- --check
 	cd apps && cargo fmt --all -- --check
-	rustfmt --edition 2024 --check tools/linux-hello/hello.rs
+	rustfmt --edition 2024 --check tools/linux-hello/hello.rs tools/linux-m7/*.rs
 	uv run --frozen ruff format --check tools tests
 
 status: ## Regenerate docs/STATUS.md from the last test results

@@ -7,10 +7,11 @@ milestones with test-based exit criteria; `docs/STATUS.md` is generated.
 ## Commands
 
 ```bash
-make deps            # pinned Limine + OVMF into build/deps (sha256-checked)
-make build           # the apps (build/apps/<name>.wasm, test apps build/apps/tests/), then both kernels: build/lumen-kernel, build/lumen-kernel-ktest
+make deps            # pinned Limine + OVMF + Alpine busybox + Alpine minirootfs into build/deps (sha256-checked)
+make build           # the apps (build/apps/<name>.wasm, test apps build/apps/tests/), Linux binaries, then both kernels
+make rootfs          # deterministic Alpine minirootfs ext4 image (build/alpine-rootfs.ext4) + M7 dynamic binaries
 make app NAME=foo    # a new app: apps/foo copied from apps/template (tools/new-app.sh); `make build` bundles it
-make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play; DESKTOP=1 starts the desktop)
+make run             # QEMU with a window, serial on your terminal (Ctrl-A x quits; HEADLESS=1; SOUND=1 for beep/play; DESKTOP=1 starts the desktop; ROOTFS=1 attaches build/alpine-rootfs.ext4 via virtio-blk)
 make debug           # QEMU paused + gdb attached, stopped at kmain
 make test            # everything CI runs: host tests, flag audit, QEMU scenarios
 make test-host       # cargo test + harness self-tests (fast, no QEMU)
@@ -37,7 +38,12 @@ first run: the ktests' TAP then goes there too, not to
 says why).
 
 Prerequisites: rustup (the toolchain installs itself from
-`rust-toolchain.toml`), `qemu-system-x86_64`, `xorriso`, `uv`, `make`, `curl`, and `gdb` for `make debug`
+`rust-toolchain.toml`), `qemu-system-x86_64`, `xorriso`, `e2fsprogs` (`mke2fs`
+and `e2fsck` in the same directory; on macOS `brew install e2fsprogs` is
+keg-only and discovered via `/opt/homebrew/opt/e2fsprogs/sbin`,
+`/usr/local/opt/e2fsprogs/sbin`, or `LUMEN_E2FSPROGS_SBIN` so a partial
+`mke2fs`-only `$PATH` entry like Android SDK never hijacks it; on Ubuntu/Debian
+`apt-get install e2fsprogs`), `uv`, `make`, `curl`, and `gdb` for `make debug`
 (its scenario is skipped without it; a `LUMEN_GDB` that can't be found fails it).
 
 ## Hard rules
@@ -629,8 +635,13 @@ one is its own PR that updates that doc first.
   `PROMPT`), `klog.py` (the kernel log line's format, as kernel/src/klog.rs
   prints it; `HOST_TIMED`, the warnings a loaded host can cause on its own,
   each tied to the kernel's text, and `unexpected_warnings`, a run's "no
-  warning" check without them).
-- `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests,
+  warning" check without them), `rootfs.py` (matched `e2fsprogs` discovery,
+  per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, and
+  `llvm-readobj` dynamic musl ELF checks).
+- `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
+  assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, `libm7.so`).
+- `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests
+  (incl. `test_rootfs.py`),
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs
   `# unconfirmed: <why>`, and lumen_harness types raw only where it
   implements it.
