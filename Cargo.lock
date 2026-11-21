@@ -540,6 +540,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-vfs"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-view"
 version = "0.0.1"
 dependencies = [
