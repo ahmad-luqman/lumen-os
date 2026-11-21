@@ -3355,6 +3355,18 @@ Lumen runs two kinds of user code:
   `sigaction` layouts match Linux x86-64 verbatim.
 - **Unknown syscalls:** return `-ENOSYS` (`-38`) and log once per syscall
   number per boot at `debug` level (never panic or kill the process).
+- **Handlers (`kernel/src/linux/syscall/`, #254):** `dispatch` has one arm
+  per number (its constant as the pattern), passing the registers of the
+  syscall's Linux signature to a handler in its cluster's module (`fd`,
+  `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem` and `proc`). An M7
+  syscall not yet implemented is a stub logging like an unknown one (with
+  its name) and returning `-ENOSYS`. The file syscalls decode their
+  registers through `syscall/at.rs`, as Linux reads them: an `int`,
+  `mode_t` or flags argument is the register's low 32 bits (`AT_FDCWD`
+  sign- or zero-extended is the same `Dirfd::Cwd`). `at.rs` also copies
+  a path argument in (`UserPath`: `PATH_MAX` with its NUL, else
+  `-ENAMETOOLONG`; empty `-ENOENT` unless `AT_EMPTY_PATH`; non-UTF-8
+  `-ENOENT` until #268) and fills `struct stat` from VFS `Metadata`.
 
 #### M6 initial syscall table (30 syscalls: static `musl` & `busybox ash` built-ins)
 
@@ -6974,7 +6986,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/drivers.rs   the driver table and probe_all
   src/blk/         (M7, designed in #246) virtio-blk driver implementing BlockDevice, block-device registry, `blk` shell command
   src/vfs/         (M7, designed in #246) POSIX VFS kernel integration, unified PageCache, writable ext4 adapter, tmpfs, devfs, procfs, `mount`/`sync` commands
-  src/linux/       Linux x86-64 ABI (M6 built #232–#238; M7 extends #246): UAPI re-exports (mod.rs), Limine boot-module loader (modules.rs), ProcessState + FD table + console bridge (process.rs), syscall dispatcher (syscall/mod.rs; handlers by cluster in syscall/{fd,stat,ns,dir,meta,io,lock,mem,proc}.rs)
+  src/linux/       Linux x86-64 ABI (M6 built #232–#238; M7 extends #246): UAPI re-exports (mod.rs), Limine boot-module loader (modules.rs), ProcessState + FD table + console bridge (process.rs), syscall dispatcher (syscall/mod.rs; handlers by cluster in syscall/{fd,stat,ns,dir,meta,io,lock,mem,proc}.rs; the file syscalls' shared argument decoding, path copy and stat fill in syscall/at.rs)
   src/user.rs      ring-3 entry/exit runner, `.lumen_fixup` safe user copies (`copy_from_user`/`copy_to_user`/`copy_cstr_from_user`), user exception handling (M6)
   src/sound.rs     the virtio-sound driver (its thread owns the device), beep, play, volume, sound
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport

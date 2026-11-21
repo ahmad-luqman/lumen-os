@@ -21,6 +21,10 @@
 //! - `proc`: signals, `arch_prctl`, `prlimit64`, `uname`, `clock_gettime`,
 //!   `getrandom` (M6).
 //!
+//! `at` holds what the M7 file syscalls share: their register decoders
+//! (`Fd`, `Dirfd`, `Mode`, the VFS's flag types, `UserPtr`), `UserPath`
+//! (a path argument copied in) and `stat_from_metadata`.
+//!
 //! An M7 syscall not implemented yet has a stub that logs once per number
 //! (as an unknown one does, with its name) and returns `-ENOSYS`.
 //!
@@ -29,6 +33,7 @@
 //! syscalls return `-ENOSYS` and log once per syscall number per boot at
 //! `debug` level.
 
+mod at;
 mod dir;
 mod fd;
 mod io;
