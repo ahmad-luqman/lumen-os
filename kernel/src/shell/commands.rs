@@ -129,8 +129,8 @@ pub static COMMANDS: Table<Run> = Table(&[
     Command {
         name: "linux",
         args: &[&["hello", "busybox"]],
-        usage: "[name] [args...]",
-        about: "list or run a static Linux x86-64 binary loaded as a Limine boot module",
+        usage: "[name|/path] [args...]",
+        about: "list boot modules, or run a Linux x86-64 binary (a boot module, or a static or dynamic ELF by path from the VFS)",
         run: crate::linux::command,
     },
     Command {
