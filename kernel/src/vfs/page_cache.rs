@@ -1,10 +1,15 @@
 //! Unified 4 KiB frame-backed file `PageCache` (shared by `ext4` and `tmpfs`).
 //!
 //! Each cached page wraps an [`OwnedFrame`](crate::mm::frame::OwnedFrame)
-//! accessed RW via the HHDM through raw pointers (avoiding Rust aliasing UB
-//! under future `MAP_SHARED` concurrent user writes). `CachePage::drop` and
-//! `PageCache::drop` are strictly lock-free (`OwnedFrame::drop` takes only Lock
-//! 10 `frame` `SpinLock`).
+//! accessed through the HHDM with raw pointers, so no `&mut [u8]` to the
+//! frame ever exists. Raw pointers avoid reference aliasing, not data races:
+//! kernel readers and writers of a published page are serialized by the
+//! owning inode's `PageCache` lock (Lock 5). A future `MAP_SHARED` user
+//! mapping (M8) writes the frame without that lock; such a store racing a
+//! kernel copy is accepted as it is on Linux (the bytes read are some mix of
+//! old and new, nothing else). `CachePage::drop` and `PageCache::drop` are
+//! strictly lock-free (`OwnedFrame::drop` takes only Lock 10, the `frame`
+//! `SpinLock`).
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -22,6 +27,12 @@ pub const PAGE_SIZE: usize = 4096;
 
 /// Soft global reclaim target for live `ext4` page-cache frames (32 MiB = 8192 pages).
 pub const EXT4_SOFT_LIMIT_PAGES: usize = 8192;
+/// Hard limit on live `ext4` page-cache frames (64 MiB): past it, after a
+/// reclaim attempt, `ext4` writes that need a new page fail with `-ENOSPC`
+/// (or return short). Reclaim can only stay above it when writeback keeps
+/// failing (a full or failing disk) or pages are pinned, so this bounds the
+/// memory a writer can fill with pages that never reach the disk.
+pub const EXT4_HARD_LIMIT_PAGES: usize = 2 * EXT4_SOFT_LIMIT_PAGES;
 /// Default `tmpfs` memory quota (32 MiB = 8192 pages).
 pub const TMPFS_DEFAULT_QUOTA_PAGES: usize = 8192;
 /// Non-evictable quota for open-unlinked detached `ext4` inodes (32 MiB = 8192 pages).
@@ -31,6 +42,29 @@ static EXT4_CACHED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_CACHED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static DETACHED_CACHED_PAGES: AtomicUsize = AtomicUsize::new(0);
 static ACCESS_SEQ: AtomicU64 = AtomicU64::new(1);
+/// The soft and hard limits in force: the constants above, lowered only by
+/// ktests (`set_ext4_limits_for_test`) so a test needn't fill 32 MiB.
+static EXT4_SOFT_LIMIT: AtomicUsize = AtomicUsize::new(EXT4_SOFT_LIMIT_PAGES);
+static EXT4_HARD_LIMIT: AtomicUsize = AtomicUsize::new(EXT4_HARD_LIMIT_PAGES);
+
+/// The soft reclaim target in force (see [`EXT4_SOFT_LIMIT_PAGES`]).
+pub fn ext4_soft_limit() -> usize {
+    EXT4_SOFT_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Whether the live `ext4` pages have reached the hard limit
+/// ([`EXT4_HARD_LIMIT_PAGES`]), so no new page may be added.
+pub fn ext4_at_hard_limit() -> bool {
+    EXT4_CACHED_PAGES.load(Ordering::Relaxed) >= EXT4_HARD_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Lower (or restore, with `None`) the soft and hard limits for a ktest.
+#[cfg(feature = "ktest")]
+pub fn set_ext4_limits_for_test(limits: Option<(usize, usize)>) {
+    let (soft, hard) = limits.unwrap_or((EXT4_SOFT_LIMIT_PAGES, EXT4_HARD_LIMIT_PAGES));
+    EXT4_SOFT_LIMIT.store(soft, Ordering::Relaxed);
+    EXT4_HARD_LIMIT.store(hard, Ordering::Relaxed);
+}
 
 /// Current number of live `ext4` `PageCache` pages.
 pub fn ext4_cached_pages() -> usize {
@@ -79,9 +113,23 @@ impl QuotaCounter {
         }
     }
 
+    /// Return `pages` to the quota. Releasing more than is reserved is a
+    /// bug elsewhere: the count saturates at zero (logged) rather than
+    /// wrapping, which would make every later reservation fail.
     pub fn release(&self, pages: usize) {
-        if pages > 0 {
-            self.used_pages.fetch_sub(pages, Ordering::AcqRel);
+        if pages == 0 {
+            return;
+        }
+        let mut cur = self.used_pages.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(pages);
+            match self.used_pages.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        if pages > cur {
+            log::error!(target: "vfs", "page quota: released {pages} pages with only {cur} reserved");
         }
     }
 
@@ -162,8 +210,11 @@ impl CachePage {
         if dst.is_empty() {
             return;
         }
-        // SAFETY: `self.frame` stays alive for `&self`, HHDM maps the entire
-        // 4 KiB frame RW, and `off + dst.len() <= PAGE_SIZE`.
+        // SAFETY: `self.frame` stays alive for `&self`, the HHDM maps the
+        // whole 4 KiB frame RW, and `off + dst.len() <= PAGE_SIZE`. `dst` is a
+        // separate kernel buffer, so the ranges don't overlap. Kernel writers
+        // of this page are excluded by the owning inode's Lock 5 (the caller
+        // holds it, or the page isn't published in a `PageCache` yet).
         unsafe {
             core::ptr::copy_nonoverlapping(self.hhdm_ptr().add(off), dst.as_mut_ptr(), dst.len());
         }
@@ -176,8 +227,11 @@ impl CachePage {
         if src.is_empty() {
             return;
         }
-        // SAFETY: `self.frame` stays alive for `&self`, HHDM maps the entire
-        // 4 KiB frame RW, and `off + src.len() <= PAGE_SIZE`.
+        // SAFETY: `self.frame` stays alive for `&self`, the HHDM maps the
+        // whole 4 KiB frame RW, and `off + src.len() <= PAGE_SIZE`. `src` is a
+        // separate kernel buffer. Other kernel readers and writers of this
+        // page are excluded by the owning inode's Lock 5 (the caller holds
+        // it, or the page isn't published in a `PageCache` yet).
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), self.hhdm_ptr().add(off), src.len());
         }
@@ -189,8 +243,10 @@ impl CachePage {
         if start == end {
             return;
         }
-        // SAFETY: `self.frame` stays alive for `&self`, HHDM maps the entire
-        // 4 KiB frame RW, and `end <= PAGE_SIZE`.
+        // SAFETY: `self.frame` stays alive for `&self`, the HHDM maps the
+        // whole 4 KiB frame RW, and `start <= end <= PAGE_SIZE`. Other kernel
+        // readers and writers are excluded by the owning inode's Lock 5,
+        // which the caller holds.
         unsafe {
             core::ptr::write_bytes(self.hhdm_ptr().add(start), 0, end - start);
         }
@@ -258,10 +314,14 @@ impl PageCache {
         self.pages.get(&page_index)
     }
 
-    /// Insert a newly allocated page at `page_index` (must not already exist),
-    /// reserving `tmpfs`/`detached` quota if applicable.
+    /// Insert a newly allocated page at `page_index`, reserving `tmpfs`/
+    /// `detached` quota if applicable. A page already cached at that index is
+    /// left as it is (it may hold dirty data) and `Exist` returned, before
+    /// any quota or count changes.
     pub fn insert_new(&mut self, page_index: u64, page: Arc<CachePage>) -> Result<(), VfsError> {
-        debug_assert!(!self.pages.contains_key(&page_index));
+        if self.pages.contains_key(&page_index) {
+            return Err(VfsError::Exist);
+        }
         match &self.owner {
             CacheOwner::Ext4 => {
                 EXT4_CACHED_PAGES.fetch_add(1, Ordering::Relaxed);
@@ -404,12 +464,14 @@ impl DetachedQuotaGuard {
         Self { reserved: 0 }
     }
 
+    /// Reserve `pages` more; `NoSpc` (as [`PageCache::insert_new`] reports
+    /// the same quota) when it is used up.
     pub fn try_reserve(&mut self, pages: usize) -> Result<(), VfsError> {
         if DETACHED_QUOTA.try_reserve(pages) {
             self.reserved += pages;
             Ok(())
         } else {
-            Err(VfsError::NoMem)
+            Err(VfsError::NoSpc)
         }
     }
 
@@ -427,18 +489,21 @@ impl Drop for DetachedQuotaGuard {
     }
 }
 
-/// Soft global reclaim for `ext4` `PageCache` frames when above 32 MiB.
+/// Soft global reclaim for `ext4` `PageCache` frames when above the soft
+/// limit ([`EXT4_SOFT_LIMIT_PAGES`]).
 ///
-/// MUST ONLY be called with interrupts enabled, `irq::depth() == 0`, and NO
-/// Lock 3, Lock 4, Lock 5, or Lock 10 held.
+/// The caller holds no lock at level 3 or above (§9: reclaim takes Lock 9's
+/// snapshot, then 4 -> 5 -> 6 -> 7 -> 8), with interrupts enabled.
 pub fn maybe_reclaim_ext4_pages() {
-    if EXT4_CACHED_PAGES.load(Ordering::Relaxed) <= EXT4_SOFT_LIMIT_PAGES {
+    let soft = ext4_soft_limit();
+    if EXT4_CACHED_PAGES.load(Ordering::Relaxed) <= soft {
         return;
     }
-    reclaim_ext4_to_target(EXT4_SOFT_LIMIT_PAGES);
+    reclaim_ext4_to_target(soft);
 }
 
-/// Reclaim unpinned `ext4` `PageCache` frames down to `target_pages` outside Lock 4/5.
+/// Reclaim unpinned `ext4` `PageCache` frames down to `target_pages`. Same
+/// precondition as [`maybe_reclaim_ext4_pages`].
 pub fn reclaim_ext4_to_target(target_pages: usize) {
     if EXT4_CACHED_PAGES.load(Ordering::Relaxed) <= target_pages {
         return;
@@ -475,3 +540,89 @@ pub fn reclaim_ext4_to_target(target_pages: usize) {
         super::reclaim_ext4_inode_dirty(inode, excess);
     }
 }
+
+crate::ktest!(
+    fn page_cache_refuses_a_second_page_at_one_index() {
+        use crate::{kassert, kassert_eq};
+        let mut pc = PageCache::new_ext4();
+        let before = ext4_cached_pages();
+        let first = Arc::new(CachePage::new_zeroed().ok_or("frame")?);
+        first.write_bytes(0, b"dirty");
+        first.set_dirty();
+        pc.insert_new(7, Arc::clone(&first)).map_err(|_| "insert")?;
+        let second = Arc::new(CachePage::new_zeroed().ok_or("frame")?);
+        kassert_eq!(pc.insert_new(7, second).err(), Some(VfsError::Exist));
+        kassert_eq!(ext4_cached_pages(), before + 1); // counted once
+        kassert!(Arc::ptr_eq(pc.get(7).ok_or("page")?, &first)); // the dirty page kept
+        drop(pc);
+        kassert_eq!(ext4_cached_pages(), before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_quota_release_saturates_and_detached_quota_reports_nospc() {
+        use crate::kassert_eq;
+        let q = QuotaCounter::new(4);
+        kassert_eq!(q.try_reserve(2), true);
+        q.release(5); // a bug elsewhere: more than reserved
+        kassert_eq!(q.used_pages(), 0);
+        kassert_eq!(q.try_reserve(4), true); // not wrapped to "full"
+        let mut g = DetachedQuotaGuard::new();
+        kassert_eq!(g.try_reserve(DETACHED_QUOTA_PAGES + 1).err(), Some(VfsError::NoSpc));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_soft_limit_triggers_reclaim() {
+        // Past the soft limit, the next ext4 read or write reclaims (writing
+        // dirty pages back) before it runs, through the global tables.
+        use crate::vfs::{EXT4_FILESYSTEMS, TABLES, ext4};
+        use crate::{kassert, kassert_eq};
+        use lumen_bcache::BlockCache;
+        use lumen_vfs::{FileSystem, OpenFlags, mkdir_at, open_inode, unlink_at};
+
+        let img = crate::vfs::build_minimal_ext4_image_blocks(256);
+        let dev = crate::vfs::MemBlkDev::new(img, false);
+        let bcache: Arc<dyn ext4::BlockCacheBackend> =
+            Arc::new(crate::sync::SleepMutex::new(BlockCache::new(dev, 64).map_err(|_| "bcache")?));
+        let devid = lumen_vfs::DevId::makedev(0, 231);
+        let fs = ext4::Ext4FileSystem::mount(bcache, devid, false).map_err(|_| "mount")?;
+        let mp = mkdir_at(&TABLES, None, b"/tmp/soft_limit_mnt", 0o755, 0).map_err(|_| "mkdir mnt")?;
+        let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
+        EXT4_FILESYSTEMS.lock().push(Arc::clone(&fs));
+        TABLES.mount(mp, "/tmp/soft_limit_mnt", Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount")?;
+
+        let result = (|| -> Result<(), &'static str> {
+            let (f, _) = open_inode(
+                &TABLES,
+                None,
+                b"/tmp/soft_limit_mnt/f",
+                OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                0o644,
+                0,
+            )
+            .map_err(|_| "create")?;
+            let data: Vec<u8> = (0..6 * PAGE_SIZE).map(|i| (i % 251) as u8 | 1).collect();
+            kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
+            let base = ext4_cached_pages();
+            kassert!(base >= 6);
+            set_ext4_limits_for_test(Some((base - 4, usize::MAX)));
+            let mut b = [0u8; 1];
+            let r = f.read_at(0, &mut b);
+            let after = ext4_cached_pages();
+            set_ext4_limits_for_test(None);
+            r.map_err(|_| "read")?;
+            kassert!(after <= base - 4 + 1); // reclaimed, plus at most the page read back
+            let mut back = alloc::vec![0u8; data.len()];
+            kassert_eq!(f.read_at(0, &mut back).map_err(|_| "read back")?, data.len());
+            kassert_eq!(back, data); // the dirty pages were written, not dropped
+            Ok(())
+        })();
+        let _ = TABLES.umount(mp_dev, mp_ino);
+        EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != devid);
+        let _ = unlink_at(&TABLES, None, b"/tmp/soft_limit_mnt", true);
+        result
+    }
+);
