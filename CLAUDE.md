@@ -341,6 +341,9 @@ one is its own PR that updates that doc first.
   `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
   and the `mount`, `sync` and `vfstest` commands (`vfstest`: file
   operations for the scenarios until #254 wires the syscalls);
+  `vfs/tests.rs` its ktests (`lumen_kernel::vfs::tests::`; `MemBlkDev`,
+  the in-memory block device the ext4 and page-cache ktests share, stays
+  in `mod.rs`);
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
   64 MiB hard cap, `QuotaCounter`, the detached-inode quota); `vfs/ext4.rs`
