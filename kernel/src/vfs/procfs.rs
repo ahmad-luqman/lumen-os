@@ -679,9 +679,11 @@ fn cached_procfs_inodes() -> (usize, usize) {
 }
 
 /// One short Linux process on a user thread (as `run_dev_tmp_proc_checks`
-/// spawns one): it opens fd 3 on `/dev/null`, resolves its `/proc` nodes
-/// (a plain lookup, `..` out of `fd`, `self`, the fd's magic link), checks
-/// that neither cache kept any of them, and ends. Returns its pid.
+/// spawns one). It opens fd 3 on `/dev/null`, resolves its `/proc` nodes (a
+/// plain lookup, `..` out of `fd`, `self`, the fd's magic link) and hands
+/// `/proc/<pid>` to the tables' other insert paths, checks that neither
+/// cache kept any of them, then closes fd 3 and checks that `fd/3` is gone
+/// while `/proc/<pid>` is not. Returns its pid.
 #[cfg(feature = "ktest")]
 fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
     use lumen_vfs::{ResolveFlags, VfsCacheOps, resolve_path};
@@ -698,32 +700,37 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
     let handle = sched::spawn_user_on(0, "procfs-uncached", Arc::clone(&space), move || {
         let pid = process::register_current(ConsoleIo::Capture, false, Vec::new());
         let checks = (|| -> Result<(), String> {
-            process::register_current_vfs_fd(3, dev_null, String::from("/dev/null"))
-                .map_err(|e| format!("register fd 3: {e:?}"))?;
+            let tables = super::tables();
+            let name = format!("{pid}");
             let nofollow = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
             let follow = ResolveFlags { follow_final: true, ..nofollow };
+            let resolve = |path: &str, flags| resolve_path(tables, None, path.as_bytes(), flags).map(|r| r.inode);
+
+            process::register_current_vfs_fd(3, dev_null, String::from("/dev/null"))
+                .map_err(|e| format!("register fd 3: {e:?}"))?;
             for (path, flags) in [
                 (format!("/proc/{pid}"), nofollow),
                 (format!("/proc/{pid}/fd"), nofollow),
                 (format!("/proc/{pid}/fd/.."), nofollow),
                 (format!("/proc/{pid}/fd/3"), nofollow),
                 (format!("/proc/{pid}/fd/3"), follow),
+                (format!("/proc/{pid}/exe"), nofollow),
                 (format!("/proc/{pid}/maps"), nofollow),
+                (format!("/proc/{pid}/mounts"), nofollow),
                 (String::from("/proc/self"), nofollow),
                 (String::from("/proc/self/fd"), nofollow),
             ] {
-                resolve_path(super::tables(), None, path.as_bytes(), flags)
-                    .map_err(|e| format!("resolve {path} while pid {pid} lives: {e:?}"))?;
+                resolve(&path, flags).map_err(|e| format!("resolve {path} while pid {pid} lives: {e:?}"))?;
             }
+
             // The tables' other insert paths hand `/proc/<pid>` back uncached.
-            let tables = super::tables();
-            let proc_root = super::resolve_path_from_root("/proc").map_err(|e| format!("/proc: {e:?}"))?;
-            let pid_dir = proc_root.lookup(&format!("{pid}")).map_err(|e| format!("lookup {pid}: {e:?}"))?;
+            let proc_root = resolve("/proc", follow).map_err(|e| format!("/proc: {e:?}"))?;
+            let pid_dir = proc_root.lookup(&name).map_err(|e| format!("lookup {pid}: {e:?}"))?;
             let (dentry_gen, inode_gen) = tables.cache_gens();
             let created = tables.publish_created_inode(
                 DevId::PROCFS,
                 INO_ROOT,
-                &format!("{pid}"),
+                &name,
                 Arc::clone(&pid_dir),
                 dentry_gen,
                 inode_gen,
@@ -739,13 +746,27 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
             {
                 return Err(format!("/proc/{pid} was unified with a cached inode"));
             }
-            if let Some(target) = super::tables().dentry_get(DevId::PROCFS, INO_ROOT, &format!("{pid}")) {
+
+            if let Some(target) = tables.dentry_get(DevId::PROCFS, INO_ROOT, &name) {
                 return Err(format!("/proc/{pid} is in the dentry cache: {target:?}"));
             }
-            match cached_procfs_inodes() {
-                (_, 0) => Ok(()),
-                (_, n) => Err(format!("{n} per-process procfs inodes in the inode cache")),
+            let (_, uncacheable) = cached_procfs_inodes();
+            if uncacheable != 0 {
+                return Err(format!("{uncacheable} per-process procfs inodes in the inode cache"));
             }
+
+            // fd 3 closes while the process lives: only `fd/3` goes.
+            process::unregister_current_vfs_fd(3);
+            for flags in [nofollow, follow] {
+                let res = resolve(&format!("/proc/{pid}/fd/3"), flags);
+                if !matches!(res, Err(VfsError::NoEnt)) {
+                    return Err(format!("/proc/{pid}/fd/3 after fd 3 closed: {res:?}"));
+                }
+            }
+            for path in [format!("/proc/{pid}"), format!("/proc/{pid}/fd")] {
+                resolve(&path, nofollow).map_err(|e| format!("resolve {path} after fd 3 closed: {e:?}"))?;
+            }
+            Ok(())
         })();
         // Always end the process, a failed check included: one left in
         // `ACTIVE_PROCS` stays in `/proc` for good.
@@ -767,8 +788,9 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
 crate::ktest!(
     fn procfs_per_process_nodes_are_never_cached() {
         use crate::{kassert, kassert_eq};
-        use lumen_vfs::{ResolveFlags, resolve_path};
+        use lumen_vfs::{ResolveFlags, VfsCacheOps, resolve_path};
 
+        let tables = super::tables();
         let nofollow = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
         let run = || {
             short_process_resolving_its_proc_nodes().map_err(|err| {
@@ -776,26 +798,34 @@ crate::ktest!(
                 "a short process's /proc checks failed (its reason is logged above)"
             })
         };
-        // The first process caches the fixed nodes it passes (`/proc`'s
-        // root); every later one must leave the cache as it found it.
+        // The first process caches the fixed names it passes (`/proc`,
+        // `/dev/null`); every later one must leave both caches as it found
+        // them.
         run()?;
-        let (before, _) = cached_procfs_inodes();
+        // A fixed node is still cached.
+        let version =
+            resolve_path(tables, None, b"/proc/version", nofollow).map_err(|_| "resolve /proc/version")?.inode;
+        kassert!(tables.dentry_get(DevId::PROCFS, INO_ROOT, "version").is_some_and(|t| t.ino == INO_VERSION));
+        kassert!(tables.inode_get(DevId::PROCFS, INO_VERSION).is_some_and(|i| Arc::ptr_eq(&i, &version)));
+
+        let (inodes_before, _) = cached_procfs_inodes();
+        let dentries_before = tables.dentry_count();
         for _ in 0..32 {
             let pid = run()?;
             // Gone with its process: the resolve itself says so, not just
             // the node's `stat`.
             for path in [format!("/proc/{pid}"), format!("/proc/{pid}/fd"), format!("/proc/{pid}/fd/3")] {
-                let res = resolve_path(super::tables(), None, path.as_bytes(), nofollow);
+                let res = resolve_path(tables, None, path.as_bytes(), nofollow);
                 if !matches!(res, Err(VfsError::NoEnt)) {
                     log::error!(target: "vfs", "{path} after its process ended: {:?}", res.map(|r| r.inode));
                     return Err("a /proc/<pid> path resolved after its process ended");
                 }
             }
         }
-        let (after, uncacheable) = cached_procfs_inodes();
+        let (inodes_after, uncacheable) = cached_procfs_inodes();
         kassert_eq!(uncacheable, 0);
-        kassert_eq!(after, before);
-        kassert!(after > 0);
+        kassert_eq!(inodes_after, inodes_before);
+        kassert_eq!(tables.dentry_count(), dentries_before);
         Ok(())
     }
 );

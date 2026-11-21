@@ -134,6 +134,13 @@ impl KernelVfsTables {
         self.inodes.lock().snapshot_all()
     }
 
+    /// How many names `DentryCache` holds (procfs's ktest: flat over many
+    /// short processes, #263).
+    #[cfg(feature = "ktest")]
+    pub fn dentry_count(&self) -> usize {
+        self.dentries.lock().len()
+    }
+
     pub fn list_mounts(&self) -> Vec<MountInfo> {
         self.mounts.lock().list_mounts()
     }
@@ -992,8 +999,9 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         process::unregister_current_vfs_fd(3);
         let fd_link_after_close = proc_nodes.as_ref().map(|(_, fd)| fd.stat().err());
         let proc_state = process::take_current();
-        // The VFS caches these entries (#263); procfs itself must still say
-        // they are gone.
+        // These nodes were resolved while the process lived and are still
+        // held (the VFS no longer caches them, #263), so procfs's `stat` must
+        // say they are gone.
         let pid_dir_after_exit = proc_nodes.as_ref().map(|(dir, _)| dir.stat().err());
         drop(proc_nodes);
         let out = checks.and_then(|summary| {

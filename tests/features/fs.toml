@@ -50,7 +50,6 @@ tests = [
     "ktest:lumen_kernel::vfs::tests::vfs_boot_mounts_tmp_dev_proc_work",
     "ktest:lumen_kernel::vfs::tests::vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing",
     "ktest:lumen_kernel::vfs::tests::vfs_proc_checks_unregister_their_process_on_failure",
-    "ktest:lumen_kernel::vfs::procfs::procfs_per_process_nodes_are_never_cached",
     "ktest:lumen_kernel::vfs::tests::vfs_read_all_refuses_a_file_past_its_cap",
     "ktest:lumen_kernel::vfs::tests::vfs_sync_continues_past_a_failing_inode",
     "scenario:test_fs::test_dev_tmp_proc_filesystems",
@@ -59,4 +58,12 @@ tests = [
     "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
     "scenario:test_fs::test_ext4_readonly_device_mounts_ro",
     "scenario:test_blk::test_read_write_sectors",
+]
+
+[[feature]]
+name = "procfs's per-process nodes (/proc/<pid> and everything under it, /proc/self) are never cached: /proc/<pid> is ENOENT once its process ends, /proc/<pid>/fd/N once its fd closes, and the dentry and inode caches stay flat over many short processes"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::procfs::procfs_per_process_nodes_are_never_cached",
+    "cargo:lumen-vfs",
 ]
