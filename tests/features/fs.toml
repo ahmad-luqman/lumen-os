@@ -81,7 +81,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Page-cache pages for mmap (#255): vfs::mmap_page hands out an ext4 or tmpfs file's own cached page (read from disk, or a zero page for a hole; the same page again; Range past EOF, NoDev for other filesystems), CachePage::copy_to_frame for copy-on-write, and the last writable unmap leaving the page dirty so its stores reach the disk (#266)"
+name = "Page-cache pages for mmap (#255): vfs::mmap_page hands out an ext4 or tmpfs file's own cached page (read from disk, or a zero page for a hole; the same page again; NoSpc for a new ext4 page at the hard limit, Range past EOF, NoDev for other filesystems), CachePage::copy_to_frame for copy-on-write, and the last writable unmap leaving the page dirty so its stores reach the disk (#266)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_mmap_page_hands_out_the_cached_page_filled_from_disk",

@@ -961,7 +961,8 @@ crate::ktest!(
         // same `Arc` again, coherent with `read_at`/`write_at` both ways; a
         // hole gets a zero page from the quota (`NoSpc` past it), which a
         // `read_at` of a hole never takes; `Range` past EOF, `NoDev` for a
-        // directory.
+        // directory. (The pages' bytes are used here without Lock 5, as a
+        // mapping would: nothing else uses this mount.)
         use crate::vfs::mmap_page;
         use crate::{kassert, kassert_eq};
         let fs = Tmpfs::new(DevId::makedev(0, 125), 4 * PAGE_SIZE);

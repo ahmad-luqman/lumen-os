@@ -767,7 +767,10 @@ impl Ext4Inode {
     /// This file's cached page `index`, filled when missing: `ext4`'s side of
     /// [`page_cache::mmap_page`] (its contract). A hole in a detached file
     /// (whose pages were all read in when it was detached) gets a zero page,
-    /// counted against the detached quota.
+    /// counted against the detached quota. At the cache's hard limit a
+    /// missing page is refused (`NoSpc`, logged once per crossing), as
+    /// `write_at` refuses one: a mapping pins its pages, so reclaim can't
+    /// keep the cache under the limit as it does for `read_at`'s pages.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     pub(super) fn mmap_page(&self, index: u64) -> Result<page_cache::MappedPage, VfsError> {
         if self.inode_type != InodeType::File {
@@ -789,6 +792,9 @@ impl Ext4Inode {
             None => {
                 let page = if detached {
                     Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?)
+                } else if page_cache::ext4_at_hard_limit() {
+                    page_cache::note_hard_limit_refusal();
+                    return Err(VfsError::NoSpc);
                 } else {
                     self.load_page(index, file_size)?
                 };
@@ -5067,8 +5073,9 @@ crate::ktest!(
     fn ext4_mmap_page_hands_out_the_cached_page_filled_from_disk() {
         // `vfs::mmap_page` on ext4: the page holding the file's bytes, read
         // from disk when not cached; the same `Arc` again, and the one
-        // `read_at`/`write_at` use; pinned while held; `Range` past EOF and
-        // `NoDev` for a directory.
+        // `read_at`/`write_at` use; pinned while held; refused at the hard
+        // limit; `Range` past EOF and `NoDev` for a directory. (The pages'
+        // bytes are read here without Lock 5: nothing else uses this mount.)
         use self::ktest_util::*;
         use crate::vfs::mmap_page;
         use crate::{kassert, kassert_eq};
@@ -5107,6 +5114,16 @@ crate::ktest!(
         e.reclaim_clean_pages(usize::MAX);
         kassert_eq!(e.pages.lock().len(), 1);
         kassert!(Arc::ptr_eq(&mmap_page(&g, 0).map_err(|_| "map pinned")?.page, &first.page));
+        // At the cache's hard limit no page is added (mapped pages are
+        // pinned, so reclaim couldn't get back under it); a cached one is
+        // still handed out. (One warning, the limit crossed.)
+        page_cache::set_ext4_limits_for_test(Some((usize::MAX, page_cache::ext4_cached_pages())));
+        let missing = mmap_page(&g, 1).err();
+        let cached = mmap_page(&g, 0).map(|p| Arc::ptr_eq(&p.page, &first.page));
+        page_cache::set_ext4_limits_for_test(None);
+        kassert_eq!(missing, Some(VfsError::NoSpc));
+        kassert!(matches!(cached, Ok(true)));
+        kassert_eq!(e.pages.lock().len(), 1);
         // Past EOF there is no page; nor in a directory.
         kassert_eq!(mmap_page(&g, 2).err(), Some(VfsError::Range));
         kassert_eq!(mmap_page(&g, u64::MAX).err(), Some(VfsError::Range));
@@ -5133,7 +5150,7 @@ crate::ktest!(
         kassert!(!mapped.page.is_dirty());
         // A write fault maps it writable (`set_dirty` and the count). A
         // writeback while it is mapped clears `dirty`; then a store through
-        // the mapping, which only the CPU sees.
+        // the mapping, which only the CPU sees (and which takes no lock).
         mapped.page.set_dirty();
         mapped.page.inc_writable_maps();
         f.sync(false).map_err(|_| "sync while mapped")?;

@@ -4,8 +4,9 @@
 //! accessed through the HHDM with raw pointers, so no `&mut [u8]` to the
 //! frame ever exists. Raw pointers avoid reference aliasing, not data races:
 //! kernel readers and writers of a published page are serialized by the
-//! owning inode's `PageCache` lock (Lock 5). A future `MAP_SHARED` user
-//! mapping (M8) writes the frame without that lock; such a store racing a
+//! owning inode's `PageCache` lock (Lock 5). A `MAP_SHARED` user mapping
+//! (#255, through [`mmap_page`]) writes the frame without that lock, as a
+//! copy-on-write split reads it ([`CachePage::copy_to_frame`]); such a store racing a
 //! kernel copy is accepted as it is on Linux (the bytes read are some mix of
 //! old and new, nothing else). `CachePage::drop` and `PageCache::drop` take
 //! no sleeping lock (`OwnedFrame::drop` takes only Lock 10, the `frame`
@@ -328,6 +329,12 @@ impl CachePage {
     /// it before the decrement, on every call, leaves no instant where the
     /// count is 0 and `dirty` still false; while other writable mappings
     /// remain, the page is dirty through the count anyway.
+    ///
+    /// Call it only once no store can reach the page through that mapping:
+    /// after its PTE is cleared (or made read-only) and every TLB that may
+    /// still hold the writable entry is flushed (in M7, the one CPU's
+    /// `invlpg`). A store landing later, through a stale entry, after a
+    /// writeback cleared `dirty`, would be lost again.
     #[allow(dead_code)]
     #[inline]
     pub fn dec_writable_maps(&self) {
@@ -371,7 +378,11 @@ pub(crate) struct MappedPage {
     pub page: Arc<CachePage>,
     /// The file's size when the page was looked up (under the inode's Lock
     /// 4). The page starts below it; the page's bytes past it are zero
-    /// unless a mapping stored there.
+    /// unless a mapping stored there. A snapshot: a truncate may change the
+    /// size once Lock 4 is released. A shrink takes `AddressSpace::inner`
+    /// (Lock 1) before Lock 4 to invalidate mappings (ARCHITECTURE section
+    /// 5), so a fault holding Lock 1 across the call and the mapping can
+    /// rely on it; one that doesn't must look again.
     pub file_size: u64,
 }
 
@@ -387,7 +398,9 @@ pub(crate) struct MappedPage {
 ///   or a hole in a detached `ext4` file), and inserted. Unlike `read_at`, a
 ///   hole costs a frame, so the `tmpfs` (or detached) quota can refuse it
 ///   with `NoSpc`. `NoMem` when no frame is free, `Io` when the disk read
-///   fails.
+///   fails, and `NoSpc` for a missing `ext4` page while the `ext4` cache is
+///   at its hard limit (a mapping pins its pages, so reclaim can't make
+///   room), as `write_at` refuses one.
 /// - **EOF:** `Range` when the page starts at or past the file's size
 ///   (`index * 4096 >= file_size`, or the product overflows): there is no
 ///   page to map, and the fault path raises `SIGBUS`. The page holding the

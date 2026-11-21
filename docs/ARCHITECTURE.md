@@ -4983,8 +4983,11 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     a detached `ext4` one) gets a zero page through the same
     get-or-insert as `write_at` (`tmpfs::page_or_new`). Unlike `read_at`,
     which reads a hole as zeros without a frame, a mapped hole costs a
-    frame: the `tmpfs` or detached quota can refuse it (`NoSpc`). Also
-    `NoMem` and `Io`.
+    frame: the `tmpfs` or detached quota can refuse it (`NoSpc`). A missing
+    `ext4` page is refused (`NoSpc`, the hard-limit warning) while the
+    `ext4` cache is at its hard limit, as `write_at` refuses one: mapped
+    pages are pinned, so reclaim can't keep them under it. Also `NoMem`
+    and `Io`.
   - *EOF:* `Range` when `index * 4096 >= file_size` (or the product
     overflows): no page is mapped there, and the fault path raises
     `SIGBUS` (section 5). The page holding EOF is returned; its bytes past
@@ -4996,7 +4999,9 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     Lock 4 → Lock 5 (→ 6 → 7 → 8 to read the disk), as `read_at`. The
     caller may hold Lock 1 (`AddressSpace::inner`) or Lock 2, nothing
     numbered 3 or higher, and no `SpinLock`. It neither dirties the page nor
-    counts a mapping: a writable fault does both.
+    counts a mapping: a writable fault does both. `file_size` is a snapshot;
+    a fault holding Lock 1 across the call and the mapping can rely on it,
+    since a shrink takes Lock 1 first to invalidate mappings.
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
     Option<&dyn Any>`, a default trait method returning `None`, overridden
     by `Ext4Inode` and `TmpfsInode` to return themselves; `mmap_page`
@@ -5014,6 +5019,8 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     store through a `MAP_SHARED` mapping sets nothing in the page, and a
     writeback while it is mapped clears `dirty`, so without this the page
     looked clean once unmapped and reclaim dropped the stores unwritten.
+    The caller decrements only after the PTE is cleared or made read-only
+    and the TLB flushed, so no store can follow through a stale entry.
 
 ### Writable `ext4` driver (`ext4plus =0.1.0-rc.2`, pinned in #248)
 
