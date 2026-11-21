@@ -73,9 +73,63 @@ pub const M6_SYSCALLS: &[(u32, &str)] = &[
     (general::__NR_getrandom, "getrandom"),
 ];
 
-/// Look up the name of an M6 Linux x86-64 syscall by number.
+/// The 47 Linux x86-64 syscalls M7 adds (`docs/ARCHITECTURE.md` section 8's
+/// M7 table, less `mmap` (9) and `getcwd` (79), which M6 already has and M7
+/// extends). Each has its own arm in `syscall::dispatch`; one not yet
+/// implemented is a stub returning `-ENOSYS`.
+pub const M7_SYSCALLS: &[(u32, &str)] = &[
+    (general::__NR_open, "open"),
+    (general::__NR_stat, "stat"),
+    (general::__NR_lstat, "lstat"),
+    (general::__NR_lseek, "lseek"),
+    (general::__NR_pread64, "pread64"),
+    (general::__NR_pwrite64, "pwrite64"),
+    (general::__NR_access, "access"),
+    (general::__NR_msync, "msync"),
+    (general::__NR_fcntl, "fcntl"),
+    (general::__NR_flock, "flock"),
+    (general::__NR_fsync, "fsync"),
+    (general::__NR_fdatasync, "fdatasync"),
+    (general::__NR_truncate, "truncate"),
+    (general::__NR_ftruncate, "ftruncate"),
+    (general::__NR_chdir, "chdir"),
+    (general::__NR_fchdir, "fchdir"),
+    (general::__NR_rename, "rename"),
+    (general::__NR_mkdir, "mkdir"),
+    (general::__NR_rmdir, "rmdir"),
+    (general::__NR_link, "link"),
+    (general::__NR_unlink, "unlink"),
+    (general::__NR_symlink, "symlink"),
+    (general::__NR_readlink, "readlink"),
+    (general::__NR_chmod, "chmod"),
+    (general::__NR_fchmod, "fchmod"),
+    (general::__NR_chown, "chown"),
+    (general::__NR_fchown, "fchown"),
+    (general::__NR_lchown, "lchown"),
+    (general::__NR_umask, "umask"),
+    (general::__NR_sync, "sync"),
+    (general::__NR_getdents64, "getdents64"),
+    (general::__NR_openat, "openat"),
+    (general::__NR_mkdirat, "mkdirat"),
+    (general::__NR_fchownat, "fchownat"),
+    (general::__NR_newfstatat, "newfstatat"),
+    (general::__NR_unlinkat, "unlinkat"),
+    (general::__NR_renameat, "renameat"),
+    (general::__NR_linkat, "linkat"),
+    (general::__NR_symlinkat, "symlinkat"),
+    (general::__NR_readlinkat, "readlinkat"),
+    (general::__NR_fchmodat, "fchmodat"),
+    (general::__NR_faccessat, "faccessat"),
+    (general::__NR_utimensat, "utimensat"),
+    (general::__NR_renameat2, "renameat2"),
+    (general::__NR_statx, "statx"),
+    (general::__NR_faccessat2, "faccessat2"),
+    (general::__NR_fchmodat2, "fchmodat2"),
+];
+
+/// Look up the name of an M6 or M7 Linux x86-64 syscall by number.
 pub fn syscall_name(nr: u32) -> Option<&'static str> {
-    M6_SYSCALLS.iter().find_map(|&(num, name)| (num == nr).then_some(name))
+    M6_SYSCALLS.iter().chain(M7_SYSCALLS).find_map(|&(num, name)| (num == nr).then_some(name))
 }
 
 /// Copy an ASCII string into a fixed-size NUL-terminated `c_char` field,
@@ -128,8 +182,9 @@ pub fn log_abi_summary() {
     let mods = modules::list();
     log::debug!(
         target: "linux",
-        "abi: {} M6 syscalls (#{uname_nr} {uname_name}: {} {} {}, -ENOSYS={}), {} boot module(s)",
+        "abi: {} M6 syscalls, {} M7 (#{uname_nr} {uname_name}: {} {} {}, -ENOSYS={}), {} boot module(s)",
         M6_SYSCALLS.len(),
+        M7_SYSCALLS.len(),
         read_uts_field(&uts.sysname),
         read_uts_field(&uts.release),
         read_uts_field(&uts.machine),
@@ -338,6 +393,194 @@ crate::ktest!(
         crate::kassert_eq!(read_uts_field(&uts.sysname), "Linux");
         crate::kassert_eq!(read_uts_field(&uts.release), "6.6.0-lumen");
         crate::kassert_eq!(read_uts_field(&uts.machine), "x86_64");
+
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn m7_abi_constants_match_spec() {
+        use core::mem::{offset_of, size_of};
+
+        // 1. All 49 rows of ARCHITECTURE.md §8's M7 syscall table, by number.
+        //    Two are M6's (`mmap` 9, `getcwd` 79: extended in M7, still in
+        //    `M6_SYSCALLS`); the other 47 are `M7_SYSCALLS`, whose
+        //    `linux-raw-sys` constants `syscall_name` checks against these.
+        let m6_rows: &[(u32, &str)] = &[(9, "mmap"), (79, "getcwd")];
+        let m7_rows: &[(u32, &str)] = &[
+            (2, "open"),
+            (4, "stat"),
+            (6, "lstat"),
+            (8, "lseek"),
+            (17, "pread64"),
+            (18, "pwrite64"),
+            (21, "access"),
+            (26, "msync"),
+            (72, "fcntl"),
+            (73, "flock"),
+            (74, "fsync"),
+            (75, "fdatasync"),
+            (76, "truncate"),
+            (77, "ftruncate"),
+            (80, "chdir"),
+            (81, "fchdir"),
+            (82, "rename"),
+            (83, "mkdir"),
+            (84, "rmdir"),
+            (86, "link"),
+            (87, "unlink"),
+            (88, "symlink"),
+            (89, "readlink"),
+            (90, "chmod"),
+            (91, "fchmod"),
+            (92, "chown"),
+            (93, "fchown"),
+            (94, "lchown"),
+            (95, "umask"),
+            (162, "sync"),
+            (217, "getdents64"),
+            (257, "openat"),
+            (258, "mkdirat"),
+            (260, "fchownat"),
+            (262, "newfstatat"),
+            (263, "unlinkat"),
+            (264, "renameat"),
+            (265, "linkat"),
+            (266, "symlinkat"),
+            (267, "readlinkat"),
+            (268, "fchmodat"),
+            (269, "faccessat"),
+            (280, "utimensat"),
+            (316, "renameat2"),
+            (332, "statx"),
+            (439, "faccessat2"),
+            (452, "fchmodat2"),
+        ];
+        crate::kassert_eq!(m6_rows.len() + m7_rows.len(), 49);
+        crate::kassert_eq!(M7_SYSCALLS.len(), 47);
+        crate::kassert_eq!(m7_rows.len(), M7_SYSCALLS.len());
+        let in_m6 = |nr: u32| M6_SYSCALLS.iter().any(|&(n, _)| n == nr);
+        let in_m7 = |nr: u32| M7_SYSCALLS.iter().any(|&(n, _)| n == nr);
+        for &(nr, name) in m6_rows {
+            crate::kassert!(in_m6(nr) && !in_m7(nr));
+            crate::kassert_eq!(syscall_name(nr), Some(name));
+        }
+        for &(nr, name) in m7_rows {
+            crate::kassert!(in_m7(nr) && !in_m6(nr));
+            crate::kassert_eq!(syscall_name(nr), Some(name));
+        }
+        // No number twice: with the lengths above, `M7_SYSCALLS` is exactly
+        // the 47 rows.
+        for (i, &(nr, _)) in M7_SYSCALLS.iter().enumerate() {
+            crate::kassert!(M7_SYSCALLS[i + 1..].iter().all(|&(other, _)| other != nr));
+        }
+
+        // 2. The flags and commands the M7 syscalls take (Linux x86-64 values).
+        //    `*at` flags: `AT_EACCESS` (faccessat2) and `AT_REMOVEDIR`
+        //    (unlinkat) share a bit, so each syscall reads only its own.
+        crate::kassert_eq!(general::AT_FDCWD, -100);
+        crate::kassert_eq!(general::AT_SYMLINK_NOFOLLOW, 0x100);
+        crate::kassert_eq!(general::AT_EACCESS, 0x200);
+        crate::kassert_eq!(general::AT_REMOVEDIR, 0x200);
+        crate::kassert_eq!(general::AT_SYMLINK_FOLLOW, 0x400);
+        crate::kassert_eq!(general::AT_NO_AUTOMOUNT, 0x800);
+        crate::kassert_eq!(general::AT_EMPTY_PATH, 0x1000);
+        crate::kassert_eq!(general::AT_STATX_SYNC_TYPE, 0x6000);
+        crate::kassert_eq!(general::AT_STATX_SYNC_AS_STAT, 0);
+        crate::kassert_eq!(general::AT_STATX_FORCE_SYNC, 0x2000);
+        crate::kassert_eq!(general::AT_STATX_DONT_SYNC, 0x4000);
+        crate::kassert_eq!(general::STATX_BASIC_STATS, 0x7ff);
+        crate::kassert_eq!(general::PATH_MAX, 4096);
+        //    `open` flags: `O_TMPFILE` includes `O_DIRECTORY`, so a check for
+        //    `O_DIRECTORY` alone also matches it.
+        crate::kassert_eq!(general::O_RDONLY, 0);
+        crate::kassert_eq!(general::O_WRONLY, 1);
+        crate::kassert_eq!(general::O_RDWR, 2);
+        crate::kassert_eq!(general::O_ACCMODE, 3);
+        crate::kassert_eq!(general::O_NOCTTY, 0o400);
+        crate::kassert_eq!(general::O_DIRECTORY, 0o200_000);
+        crate::kassert_eq!(general::O_NOFOLLOW, 0o400_000);
+        crate::kassert_eq!(general::O_CLOEXEC, 0o2_000_000);
+        crate::kassert_eq!(general::O_PATH, 0o10_000_000);
+        crate::kassert_eq!(general::O_TMPFILE, 0o20_000_000 | general::O_DIRECTORY);
+        //    `access` modes.
+        crate::kassert_eq!(general::F_OK, 0);
+        crate::kassert_eq!(general::X_OK, 1);
+        crate::kassert_eq!(general::W_OK, 2);
+        crate::kassert_eq!(general::R_OK, 4);
+        //    `fcntl` commands and `flock` operations.
+        crate::kassert_eq!(general::F_DUPFD, 0);
+        crate::kassert_eq!(general::F_GETFD, 1);
+        crate::kassert_eq!(general::F_SETFD, 2);
+        crate::kassert_eq!(general::F_GETFL, 3);
+        crate::kassert_eq!(general::F_SETFL, 4);
+        crate::kassert_eq!(general::F_GETLK, 5);
+        crate::kassert_eq!(general::F_SETLK, 6);
+        crate::kassert_eq!(general::F_SETLKW, 7);
+        crate::kassert_eq!(general::F_DUPFD_CLOEXEC, 1030);
+        crate::kassert_eq!(general::FD_CLOEXEC, 1);
+        crate::kassert_eq!(general::F_RDLCK, 0);
+        crate::kassert_eq!(general::F_WRLCK, 1);
+        crate::kassert_eq!(general::F_UNLCK, 2);
+        crate::kassert_eq!(general::LOCK_SH, 1);
+        crate::kassert_eq!(general::LOCK_EX, 2);
+        crate::kassert_eq!(general::LOCK_NB, 4);
+        crate::kassert_eq!(general::LOCK_UN, 8);
+        //    `utimensat`'s `tv_nsec` sentinels. (lumen-vfs's copies of these
+        //    and the other flags are checked against linux-raw-sys's at
+        //    compile time, in `syscall/at.rs`.)
+        crate::kassert_eq!(general::UTIME_NOW, 0x3fff_ffff);
+        crate::kassert_eq!(general::UTIME_OMIT, 0x3fff_fffe);
+        //    `renameat2` flags: `RENAME_WHITEOUT` is one M7 rejects (`-EINVAL`).
+        crate::kassert_eq!(general::RENAME_NOREPLACE, 1);
+        crate::kassert_eq!(general::RENAME_EXCHANGE, 2);
+        crate::kassert_eq!(general::RENAME_WHITEOUT, 4);
+        //    `lseek` whences and `msync` flags.
+        crate::kassert_eq!(general::SEEK_SET, 0);
+        crate::kassert_eq!(general::SEEK_CUR, 1);
+        crate::kassert_eq!(general::SEEK_END, 2);
+        crate::kassert_eq!(general::SEEK_DATA, 3);
+        crate::kassert_eq!(general::SEEK_HOLE, 4);
+        crate::kassert_eq!(general::MS_ASYNC, 1);
+        crate::kassert_eq!(general::MS_INVALIDATE, 2);
+        crate::kassert_eq!(general::MS_SYNC, 4);
+
+        // 3. The user-visible M7 structs' Linux x86-64 sizes and key offsets.
+        //    `stat`: x86-64 puts `st_nlink` (8 bytes) before `st_mode`.
+        crate::kassert_eq!(size_of::<general::stat>(), 144);
+        crate::kassert_eq!(offset_of!(general::stat, st_nlink), 16);
+        crate::kassert_eq!(offset_of!(general::stat, st_mode), 24);
+        crate::kassert_eq!(offset_of!(general::stat, st_rdev), 40);
+        crate::kassert_eq!(offset_of!(general::stat, st_size), 48);
+        crate::kassert_eq!(offset_of!(general::stat, st_blocks), 64);
+        crate::kassert_eq!(offset_of!(general::stat, st_atime), 72);
+        crate::kassert_eq!(offset_of!(general::stat, st_mtime), 88);
+        crate::kassert_eq!(offset_of!(general::stat, st_ctime), 104);
+        //    `statx`.
+        crate::kassert_eq!(size_of::<general::statx>(), 256);
+        crate::kassert_eq!(size_of::<general::statx_timestamp>(), 16);
+        crate::kassert_eq!(offset_of!(general::statx, stx_mode), 28);
+        crate::kassert_eq!(offset_of!(general::statx, stx_ino), 32);
+        crate::kassert_eq!(offset_of!(general::statx, stx_size), 40);
+        crate::kassert_eq!(offset_of!(general::statx, stx_blocks), 48);
+        crate::kassert_eq!(offset_of!(general::statx, stx_atime), 64);
+        crate::kassert_eq!(offset_of!(general::statx, stx_mtime), 112);
+        crate::kassert_eq!(offset_of!(general::statx, stx_rdev_major), 128);
+        //    `linux_dirent64`: a 19-byte header (`d_ino`, `d_off`, `d_reclen`,
+        //    `d_type`), then the NUL-terminated name. `size_of` says 24 (the
+        //    header padded to 8), which is not a record's length: a record is
+        //    the header plus the name and its NUL, rounded up to 8.
+        crate::kassert_eq!(offset_of!(general::linux_dirent64, d_off), 8);
+        crate::kassert_eq!(offset_of!(general::linux_dirent64, d_reclen), 16);
+        crate::kassert_eq!(offset_of!(general::linux_dirent64, d_type), 18);
+        crate::kassert_eq!(offset_of!(general::linux_dirent64, d_name), 19);
+        crate::kassert_eq!(size_of::<general::linux_dirent64>(), 24);
+        //    `struct flock` (`fcntl`'s `F_GETLK`/`F_SETLK`/`F_SETLKW`).
+        crate::kassert_eq!(size_of::<general::flock>(), 32);
+        crate::kassert_eq!(offset_of!(general::flock, l_whence), 2);
+        crate::kassert_eq!(offset_of!(general::flock, l_start), 8);
+        crate::kassert_eq!(offset_of!(general::flock, l_len), 16);
+        crate::kassert_eq!(offset_of!(general::flock, l_pid), 24);
 
         Ok(())
     }

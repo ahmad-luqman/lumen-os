@@ -355,6 +355,23 @@ one is its own PR that updates that doc first.
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
   `AddressSpace::format_maps`).
+  `linux/` (M6, M7; ARCHITECTURE section 8): `linux/mod.rs` the
+  `linux-raw-sys` re-exports, `M6_SYSCALLS` and `M7_SYSCALLS` (the numbers,
+  `syscall_name`; pinned by the `abi_constants_match_spec` and
+  `m7_abi_constants_match_spec` ktests, the latter with M7's flags and
+  struct layouts), `uname`'s payload and the `linux` command;
+  `linux/process.rs` `ProcessState` (FD table, console bridge);
+  `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
+  `dispatch` (each number in one arm, its constant as the pattern) and the
+  shared copy helpers, a module per cluster holding its handlers (`fd`,
+  `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, `proc`), an M7
+  syscall not yet implemented a stub (`not_implemented`: logged once,
+  `-ENOSYS`; each cluster's `*_m7_stubs_return_enosys` ktest), and `at.rs`
+  the file syscalls' shared parts: `reg`/`FromReg`, decoding a register into
+  a handler's parameter type (`Fd`, `Dirfd`, `Mode`, the VFS flags, `UserPtr`,
+  `u32`/`i32`: the low 32 bits), `UserPath` (a path argument copied in) and
+  `stat_from_metadata`/`statx_from_metadata`; the handlers' rules are in
+  ARCHITECTURE section 8, "Handlers".
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested; the `life`
   command's and the Life app's, a path dependency of `apps/`, #202).

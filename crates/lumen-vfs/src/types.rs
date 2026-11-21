@@ -226,9 +226,15 @@ impl OpenFlags {
     pub const O_PATH: u32 = 0o10000000;
     pub const O_TMPFILE: u32 = 0o20200000;
 
-    /// Construct from raw bits.
-    pub const fn from_bits_truncate(bits: u32) -> Self {
+    /// Construct from raw bits, kept as given (unknown bits included).
+    pub const fn from_bits(bits: u32) -> Self {
         Self(bits)
+    }
+
+    /// The same as [`Self::from_bits`]: it truncates nothing, despite its
+    /// name. Kept until its callers in `kernel/src/vfs` move to `from_bits`.
+    pub const fn from_bits_truncate(bits: u32) -> Self {
+        Self::from_bits(bits)
     }
 
     /// Raw bitmask.
