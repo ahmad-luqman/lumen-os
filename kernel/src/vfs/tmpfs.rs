@@ -198,11 +198,11 @@ impl TmpfsInode {
         }
         let meta = self.meta.lock();
         let file_size = meta.size;
-        page_cache::mmap_page_offset(index, file_size)?;
+        page_cache::mmap_page_in_file(index, file_size)?;
         let mut pages = self.pages.lock();
         let page = page_or_new(&mut pages, index)?;
         page.touch();
-        Ok(page_cache::MappedPage { page, file_size })
+        Ok(page_cache::MappedPage::new(page, file_size))
     }
 }
 
@@ -972,23 +972,23 @@ crate::ktest!(
         kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
         kassert_eq!(fs.used_pages(), 2);
         let first = mmap_page(&f, 0).map_err(|_| "map page 0")?;
-        kassert_eq!(first.file_size, data.len() as u64);
+        kassert_eq!(first.file_size(), data.len() as u64);
         let mut got = [0u8; PAGE_SIZE];
-        first.page.read_bytes(0, &mut got);
+        first.page().read_bytes(0, &mut got);
         kassert!(got[..] == data[..PAGE_SIZE]);
         let last = mmap_page(&f, 1).map_err(|_| "map page 1")?;
-        last.page.read_bytes(0, &mut got);
+        last.page().read_bytes(0, &mut got);
         kassert!(got[..100] == data[PAGE_SIZE..]);
         kassert!(got[100..].iter().all(|&b| b == 0)); // past EOF: zero
         let again = mmap_page(&f, 0).map_err(|_| "map page 0 again")?;
-        kassert!(Arc::ptr_eq(&again.page, &first.page));
+        kassert!(Arc::ptr_eq(again.page(), first.page()));
         kassert_eq!(fs.used_pages(), 2); // no page added for either
         // Coherent both ways: a write shows in the page, a store in the
         // page shows in a read.
         kassert_eq!(f.write_at(5, b"written").map_err(|_| "write_at")?, 7);
-        first.page.read_bytes(5, &mut got[..7]);
+        first.page().read_bytes(5, &mut got[..7]);
         kassert!(&got[..7] == b"written");
-        first.page.write_bytes(20, b"stored");
+        first.page().write_bytes(20, b"stored");
         let mut back = [0u8; 6];
         kassert_eq!(f.read_at(20, &mut back).map_err(|_| "read_at")?, 6);
         kassert!(&back == b"stored");
@@ -999,16 +999,21 @@ crate::ktest!(
         kassert_eq!(fs.used_pages(), 2);
         let hole = mmap_page(&f, 3).map_err(|_| "map hole")?;
         kassert_eq!(fs.used_pages(), 3);
-        hole.page.read_bytes(0, &mut got);
+        hole.page().read_bytes(0, &mut got);
         kassert!(got.iter().all(|&b| b == 0));
-        kassert!(Arc::ptr_eq(&mmap_page(&f, 3).map_err(|_| "map hole again")?.page, &hole.page));
+        kassert!(Arc::ptr_eq(mmap_page(&f, 3).map_err(|_| "map hole again")?.page(), hole.page()));
         mmap_page(&f, 2).map_err(|_| "map last page of the quota")?;
         kassert_eq!(fs.used_pages(), 4);
         kassert_eq!(mmap_page(&f, 4).err(), Some(VfsError::NoSpc));
-        // Past EOF there is no page; nor in a directory.
+        // Past EOF there is no page: `1 << 52` pages is 2^64 bytes, which a
+        // plain multiplication wraps to offset 0. Nor in a directory or a
+        // symlink.
         kassert_eq!(mmap_page(&f, 5).err(), Some(VfsError::Range));
+        kassert_eq!(mmap_page(&f, 1 << 52).err(), Some(VfsError::Range));
         kassert_eq!(mmap_page(&f, u64::MAX).err(), Some(VfsError::Range));
         kassert_eq!(mmap_page(&root, 0).err(), Some(VfsError::NoDev));
+        let link = root.symlink("link", "map.bin").map_err(|_| "symlink")?;
+        kassert_eq!(mmap_page(&link, 0).err(), Some(VfsError::NoDev));
         Ok(())
     }
 );

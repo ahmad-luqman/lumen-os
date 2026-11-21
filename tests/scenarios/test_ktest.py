@@ -212,13 +212,15 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 4,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 2,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
+    # ext4_mmap_page_reports_a_failed_disk_read: two failed fills, one streak.
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 0 \(offset 0\) failed: Io": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 1,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
     # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page.
     (
         r"WARN  vfs: ext4 page cache at its hard limit \(\d+ pages\): refusing new pages \(ENOSPC\) until "
-        r"writeback frees some"
+        r"writeback or unmapping frees some"
     ): 3,
     # ext4_unwritable_ro_compat_features_force_read_only
     (

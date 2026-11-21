@@ -765,9 +765,15 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - **Every** transition of a `PTE_SHARED` leaf out of `(PRESENT && WRITABLE)`
       —whether via `mprotect` (to any new prot, including `RW -> RWX` or
       idempotent `RW -> RW` if `WRITABLE` is cleared), `munmap`, `MAP_FIXED`
-      replacement, `ftruncate` invalidation, `teardown`, or `Drop`—checks
-      hardware `PTE_DIRTY` (bit 6), calls `CachePage::mark_dirty()` if set, and
-      calls `CachePage::dec_writable_maps()`.
+      replacement, `ftruncate` invalidation, `teardown`, or `Drop`—follows
+      the **unmap order**, in this order: (1) clear the leaf or downgrade it
+      to `WRITABLE = 0`, reading hardware `PTE_DIRTY` (bit 6) as it goes,
+      and call `CachePage::set_dirty()` if it was set; (2) flush every TLB
+      that may still hold the writable entry (`invlpg` on the one CPU in
+      M7, a shootdown in M8); (3) only then call
+      `CachePage::dec_writable_maps()`. Writeback clears `dirty` before
+      copying a page (section 9), so a decrement before the flush would let
+      a store through a stale TLB entry land on a page that looks clean.
   - **Not-present fault (`error_code & 1 == 0`) on `Backing::File`:**
     - `MAP_PRIVATE` write fault (`!fm.shared && is_write`): read the page via
       the inode's `PageCache` into a freshly allocated private frame
@@ -798,7 +804,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
         replace the PTE with the private frame (`prot_to_attrs(vma.prot)`,
         preserving `vma.prot.exec()`, `PTE_SHARED = 0`), flush the local TLB
         (`invlpg`), and remove `page_va` from `pinned_pages`.
-      - For `MAP_SHARED`: **dirty promotion**—call `CachePage::mark_dirty()`
+      - For `MAP_SHARED`: **dirty promotion**—call `CachePage::set_dirty()`
         and `CachePage::inc_writable_maps()`, upgrade the PTE to
         `prot_to_attrs(vma.prot)` + `PTE_SHARED = 1` (preserving
         `vma.prot.exec()`), and flush the local TLB (`invlpg`).
@@ -808,8 +814,9 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       `PTE_SHARED = 1`, it **always** writes `WRITABLE = 0` (uniformly for both
       `MAP_PRIVATE` and `MAP_SHARED`, preserving CoW on `MAP_PRIVATE` and
       write-fault dirty tracking on `MAP_SHARED` without ever wiping hardware
-      `PTE_DIRTY` silently), propagating `PTE_DIRTY` and calling
-      `dec_writable_maps()` whenever the prior leaf was `(PRESENT && WRITABLE)`.
+      `PTE_DIRTY` silently), and whenever the prior leaf was
+      `(PRESENT && WRITABLE)` follows the unmap order above (propagate
+      `PTE_DIRTY`, flush the TLB, then `dec_writable_maps()`).
       When `prot` is non-`PROT_NONE` (including write-only `PROT_WRITE`),
       clearing `WRITABLE = 0` keeps `PRESENT = 1` (never turning a writable
       mapping into `PTE_PROTNONE`). Already CoW-split `PTE_SHARED = 0` leaves
@@ -821,9 +828,10 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - **Truncate shrink invalidation (`ftruncate`, `truncate`, `openat(O_TRUNC)`):**
       shrinking a file to `new_size` acquires `AddressSpace::inner` (Lock 1)
       **before** `VfsInode` (Lock 4) and unmaps all file-VMA PTEs covering
-      `file_off >= align_up_page(new_size)` (propagating `PTE_DIRTY`, calling
-      `dec_writable_maps()`, removing `pinned_pages` entries, freeing private
-      CoW frames, and issuing `invlpg`) alongside dropping `PageCache` entries
+      `file_off >= align_up_page(new_size)` (in the unmap order above:
+      propagating `PTE_DIRTY`, issuing `invlpg`, then `dec_writable_maps()`;
+      then removing `pinned_pages` entries and freeing private CoW frames)
+      alongside dropping `PageCache` entries
       `>= new_size.div_ceil(4096)`. Subsequent accesses fault into `BusError` /
       `SIGBUS`, and later file growth can never split-brain against stale
       mapped frames. (In M8, multi-process mappings snapshot active
@@ -832,7 +840,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - `msync(addr, len, flags)` (syscall 26) returns `0` immediately on
       `len == 0` (after validating page-aligned `addr` and valid `flags`),
       succeeds as a no-op on `MAP_PRIVATE`/anonymous VMAs, and for `MAP_SHARED`
-      VMAs sweeps `PTE_DIRTY` into `CachePage::mark_dirty()` and (for `MS_SYNC`)
+      VMAs sweeps `PTE_DIRTY` into `CachePage::set_dirty()` and (for `MS_SYNC`)
       flushes those inodes' dirty pages through `ext4` and
       `BlockDevice::flush()`.
 
@@ -4972,26 +4980,33 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     size so stale past-EOF `MAP_SHARED` stores never leak into extended regions.
 - **Pages for `mmap` (built in #255's first part):** the file-backed VM
   takes a file's pages through one helper, `crate::vfs::mmap_page(inode:
-  &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError>`, where
-  `MappedPage { page: Arc<CachePage>, file_size: u64 }`. It returns the
-  inode's own cached page at `index` (offset `index * 4096`), the same
+  &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError>`.
+  `MappedPage` has private fields and two getters: `page()`, the inode's
+  own cached `Arc<CachePage>` at `index` (offset `index * 4096`), the same
   `Arc` `read_at`/`write_at` use (another call returns it again while it
-  stays cached), with the file's size read under the same Lock 4 hold.
+  stays cached), and `file_size()`, read under the same Lock 4 hold.
   Holding the `Arc` pins the page (reclaim evicts only `strong_count == 1`).
   - *Filling:* a missing `ext4` page is read from disk by the same private
-    fill as `read_at` (`Ext4Inode::load_page`); a hole in a `tmpfs` file (or
-    a detached `ext4` one) gets a zero page through the same
-    get-or-insert as `write_at` (`tmpfs::page_or_new`). Unlike `read_at`,
-    which reads a hole as zeros without a frame, a mapped hole costs a
-    frame: the `tmpfs` or detached quota can refuse it (`NoSpc`). A missing
-    `ext4` page is refused (`NoSpc`, the hard-limit warning) while the
-    `ext4` cache is at its hard limit, as `write_at` refuses one: mapped
-    pages are pinned, so reclaim can't keep them under it. Also `NoMem`
-    and `Io`.
+    fill as `read_at` (`Ext4Inode::load_page`, which logs a failed read
+    naming the device, inode and page, once per streak of the same error).
+    A hole in a `tmpfs` file (or a detached `ext4` one) gets a zero page
+    through the same get-or-insert as `write_at` (`tmpfs::page_or_new`).
+    Unlike `read_at`, which reads a hole as zeros without a frame, a mapped
+    hole costs a frame: the `tmpfs` or detached quota can refuse it
+    (`NoSpc`). A missing page of a linked `ext4` file is refused (`NoSpc`,
+    the hard-limit warning) while the `ext4` cache is at its hard limit, as
+    `write_at` refuses one: mapped pages are pinned, so reclaim can't keep
+    them under it. A detached `ext4` file's pages count against the
+    detached quota instead of the hard limit. Also `NoMem` and `Io`.
   - *EOF:* `Range` when `index * 4096 >= file_size` (or the product
     overflows): no page is mapped there, and the fault path raises
     `SIGBUS` (section 5). The page holding EOF is returned; its bytes past
     `file_size` are zero unless a mapping stored there.
+  - *Truncate:* a shrink's `remove_from` drops the cache's own reference
+    to pages past the new size and stops counting them, even if a mapping
+    still holds one. That is sound only because section 5's truncate
+    invalidation (Lock 1 before Lock 4) unmaps those pages in the same
+    shrink, so no mapping keeps using a page the cache has let go.
   - *Other inodes:* `NoDev` for directories, symlinks, and every inode of
     another filesystem (`devfs`, `procfs`); `NoEnt` for an `ext4` inode
     unlinked and not open.
@@ -4999,28 +5014,43 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     Lock 4 → Lock 5 (→ 6 → 7 → 8 to read the disk), as `read_at`. The
     caller may hold Lock 1 (`AddressSpace::inner`) or Lock 2, nothing
     numbered 3 or higher, and no `SpinLock`. It neither dirties the page nor
-    counts a mapping: a writable fault does both. `file_size` is a snapshot;
-    a fault holding Lock 1 across the call and the mapping can rely on it,
-    since a shrink takes Lock 1 first to invalidate mappings.
+    counts a mapping: a writable fault does both (`set_dirty`,
+    `inc_writable_maps`). `file_size` is a snapshot; a fault holding Lock 1
+    across the call and the mapping can rely on it, since a shrink takes
+    Lock 1 first to invalidate mappings.
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
     Option<&dyn Any>`, a default trait method returning `None`, overridden
     by `Ext4Inode` and `TmpfsInode` to return themselves; `mmap_page`
-    downcasts. A kernel-side registry was the alternative, but `tmpfs` has
-    none, an unlinked (detached) file isn't reachable by walking a tree,
-    and the `ext4` one costs a scan per fault.
-  - *Bytes:* `CachePage::read_bytes`, `write_bytes` and `zero_range` are
-    `pub(super)` (inside `vfs` only): the caller holds the page's Lock 5, or
-    the page isn't published yet. Outside `vfs`, a copy-on-write split
-    copies with `CachePage::copy_to_frame(&mut OwnedFrame, valid)` (the
-    first `valid` bytes, zeros after), which takes no lock: a racing store
-    leaves a mix of old and new bytes, as on Linux.
+    downcasts. It exists for `mmap_page` alone, so another cached
+    filesystem that overrides it also needs its own branch there. A
+    kernel-side registry was the alternative, but `tmpfs` has none, an
+    unlinked (detached) file isn't reachable by walking a tree, and the
+    `ext4` one costs a scan per fault.
+  - *Bytes and state:* `CachePage::read_bytes`, `write_bytes`,
+    `zero_range`, `swap_dirty`, `touch`, `last_access` and `new_zeroed` are
+    `pub(super)` (inside `vfs` only); the byte accessors need the page's
+    Lock 5 held (or the page not published yet), and `mm` can't name them.
+    A copy-on-write split copies with
+    `CachePage::copy_to_frame(&mut OwnedFrame, valid)` (the first `valid`
+    bytes, zeros after), which needs no lock: a racing store leaves a mix
+    of old and new bytes, as on Linux. `set_dirty`, `inc_writable_maps` and
+    `dec_writable_maps` stay crate-visible for the page-fault and unmap
+    paths (#255's next part).
+  - *Dirty test order:* `is_dirty` loads `writable_maps` (Acquire) before
+    `dirty`. Reclaim holds only Lock 5, which an unmap's
+    `dec_writable_maps` doesn't take, and may be preempted between the two
+    loads. Read the other way round, it could see `dirty` still clear, then
+    the count already 0, and evict the page unwritten. The count's Acquire
+    load synchronises with the decrement, so a count of 0 means the `dirty`
+    set before the decrement is visible.
   - *The last writable unmap (#266):* `dec_writable_maps` sets `dirty`
     (before decrementing, so the page never looks clean in between). A
     store through a `MAP_SHARED` mapping sets nothing in the page, and a
     writeback while it is mapped clears `dirty`, so without this the page
     looked clean once unmapped and reclaim dropped the stores unwritten.
     The caller decrements only after the PTE is cleared or made read-only
-    and the TLB flushed, so no store can follow through a stale entry.
+    and the TLB flushed (section 5's unmap order), so no store can follow
+    through a stale entry.
 
 ### Writable `ext4` driver (`ext4plus =0.1.0-rc.2`, pinned in #248)
 

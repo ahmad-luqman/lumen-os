@@ -146,11 +146,12 @@ pub trait VfsInode: Send + Sync {
     /// Execute `f` with mutable access to this inode's Lock-4-protected `AdvisoryLocks`.
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError>;
 
-    /// The concrete inode, for a kernel helper that needs more than this
-    /// trait offers: `vfs::mmap_page` downcasts to the `ext4` and `tmpfs`
-    /// inodes to hand out their cached pages, which this crate's types can't
-    /// name. `None` (the default) for every filesystem that has no such
-    /// helper.
+    /// The concrete inode, for the kernel's `vfs::mmap_page` alone: it
+    /// downcasts to the `ext4` and `tmpfs` inodes to hand out their cached
+    /// pages, which this crate's types can't name. `None` (the default) for
+    /// every other filesystem. A new filesystem with a page cache that
+    /// overrides this also needs its own branch in `mmap_page`, or its
+    /// inodes are still refused with `NoDev`.
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         None
     }
