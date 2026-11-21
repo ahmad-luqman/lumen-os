@@ -201,8 +201,18 @@ pub trait VfsCacheOps {
     fn fs_read_only(&self, dev: DevId) -> bool;
     fn fs_by_dev(&self, dev: DevId) -> Option<Arc<dyn FileSystem>>;
 
+    fn dentry_gen(&self) -> u64;
     fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> Option<DentryTarget>;
+    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> (Option<DentryTarget>, u64);
     fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &str, target: DentryTarget);
+    fn dentry_insert_if_gen(
+        &self,
+        parent_dev: DevId,
+        parent_ino: Ino,
+        name: &str,
+        target: DentryTarget,
+        expected_gen: u64,
+    ) -> bool;
     fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &str);
     fn dentry_invalidate_dir(&self, parent_dev: DevId, parent_ino: Ino);
 
@@ -289,12 +299,31 @@ impl VfsCacheOps for SimpleVfsTables {
         self.mounts.borrow().fs_by_dev(dev)
     }
 
+    fn dentry_gen(&self) -> u64 {
+        self.dentries.borrow().invalidation_gen()
+    }
+
     fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> Option<DentryTarget> {
         self.dentries.borrow().get(parent_dev, parent_ino, name)
     }
 
+    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> (Option<DentryTarget>, u64) {
+        self.dentries.borrow().get_with_gen(parent_dev, parent_ino, name)
+    }
+
     fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &str, target: DentryTarget) {
         self.dentries.borrow_mut().insert(parent_dev, parent_ino, name, target);
+    }
+
+    fn dentry_insert_if_gen(
+        &self,
+        parent_dev: DevId,
+        parent_ino: Ino,
+        name: &str,
+        target: DentryTarget,
+        expected_gen: u64,
+    ) -> bool {
+        self.dentries.borrow_mut().insert_if_gen(parent_dev, parent_ino, name, target, expected_gen)
     }
 
     fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &str) {

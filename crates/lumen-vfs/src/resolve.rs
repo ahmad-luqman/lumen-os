@@ -91,15 +91,19 @@ fn lookup_component(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>, name: &str) 
     let pdev = dir.dev_id();
     let pino = dir.ino();
 
-    if let Some(target) = env.dentry_get(pdev, pino, name)
+    let (cached, inv_gen) = env.dentry_get_with_gen(pdev, pino, name);
+    if let Some(target) = cached
         && let Some(inode) = env.inode_get(target.dev, target.ino)
     {
         return Ok(inode);
     }
 
     let child = dir.lookup(name)?;
+    if env.dentry_gen() != inv_gen {
+        return Ok(env.inode_get(child.dev_id(), child.ino()).unwrap_or(child));
+    }
     let child = env.inode_get_or_insert(child);
-    env.dentry_insert(pdev, pino, name, DentryTarget { dev: child.dev_id(), ino: child.ino() });
+    let _ = env.dentry_insert_if_gen(pdev, pino, name, DentryTarget { dev: child.dev_id(), ino: child.ino() }, inv_gen);
     Ok(child)
 }
 

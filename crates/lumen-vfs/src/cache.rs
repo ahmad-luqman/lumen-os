@@ -92,6 +92,7 @@ type DentryKey = (DevId, Ino, Box<str>);
 pub struct DentryCache {
     max_entries: usize,
     next_gen: u64,
+    invalidation_gen: u64,
     entries: BTreeMap<DentryKey, (DentryTarget, u64)>,
     order: VecDeque<(DentryKey, u64)>,
 }
@@ -102,12 +103,17 @@ impl DentryCache {
 
     /// Create a dentry cache bounded to `max_entries`.
     pub const fn new(max_entries: usize) -> Self {
-        Self { max_entries, next_gen: 0, entries: BTreeMap::new(), order: VecDeque::new() }
+        Self { max_entries, next_gen: 0, invalidation_gen: 0, entries: BTreeMap::new(), order: VecDeque::new() }
     }
 
     fn compact_order(&mut self) {
         let entries = &self.entries;
         self.order.retain(|(k, g)| entries.get(k).is_some_and(|&(_, cur_g)| cur_g == *g));
+    }
+
+    /// Monotonic invalidation generation incremented on every invalidation or clear.
+    pub fn invalidation_gen(&self) -> u64 {
+        self.invalidation_gen
     }
 
     /// Look up a cached child target. Always returns `None` for `.` and `..`.
@@ -117,6 +123,29 @@ impl DentryCache {
         }
         let key: DentryKey = (parent_dev, parent_ino, Box::from(name));
         self.entries.get(&key).map(|&(target, _)| target)
+    }
+
+    /// Atomically read a cached child target together with the current
+    /// invalidation generation.
+    pub fn get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> (Option<DentryTarget>, u64) {
+        (self.get(parent_dev, parent_ino, name), self.invalidation_gen)
+    }
+
+    /// Insert or update a dentry mapping only if `invalidation_gen` still matches
+    /// `expected_gen`. Returns `true` if `expected_gen` matched.
+    pub fn insert_if_gen(
+        &mut self,
+        parent_dev: DevId,
+        parent_ino: Ino,
+        name: &str,
+        target: DentryTarget,
+        expected_gen: u64,
+    ) -> bool {
+        if self.invalidation_gen != expected_gen {
+            return false;
+        }
+        self.insert(parent_dev, parent_ino, name, target);
+        true
     }
 
     /// Insert or update a dentry mapping. Never caches `.`, `..`, or empty names.
@@ -152,12 +181,14 @@ impl DentryCache {
         if name == "." || name == ".." || name.is_empty() {
             return;
         }
+        self.invalidation_gen = self.invalidation_gen.wrapping_add(1);
         let key: DentryKey = (parent_dev, parent_ino, Box::from(name));
         self.entries.remove(&key);
     }
 
     /// Invalidate all cached children under `(parent_dev, parent_ino)`.
     pub fn invalidate_dir(&mut self, parent_dev: DevId, parent_ino: Ino) {
+        self.invalidation_gen = self.invalidation_gen.wrapping_add(1);
         let keys: Vec<DentryKey> =
             self.entries.keys().filter(|(d, i, _)| *d == parent_dev && *i == parent_ino).cloned().collect();
         for key in keys {
@@ -167,6 +198,7 @@ impl DentryCache {
 
     /// Invalidate all entries whose parent or target belongs to filesystem `dev`.
     pub fn invalidate_fs(&mut self, dev: DevId) {
+        self.invalidation_gen = self.invalidation_gen.wrapping_add(1);
         let keys: Vec<DentryKey> = self
             .entries
             .iter()
@@ -190,6 +222,7 @@ impl DentryCache {
 
     /// Remove all cached dentries.
     pub fn clear(&mut self) {
+        self.invalidation_gen = self.invalidation_gen.wrapping_add(1);
         self.entries.clear();
         self.order.clear();
     }

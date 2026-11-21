@@ -16,6 +16,9 @@ use crate::resolve::{
 use crate::types::{InodeType, OpenFlags, RenameFlags};
 use crate::{MAX_SYMLINK_DEPTH, PATH_MAX};
 
+/// Upper bound on non-exclusive `O_CREAT` lookup-vs-create race retries.
+const MAX_CREAT_RACE_RETRIES: usize = 64;
+
 /// Open or create a file/directory/device inode according to POSIX/`openat(2)`
 /// semantics.
 ///
@@ -51,19 +54,19 @@ pub fn open_inode(
         let mut cur_start_dir: Option<Arc<dyn VfsInode>> = start_dir.map(Arc::clone);
         let mut cur_path: Vec<u8> = path.to_vec();
 
-        loop {
+        'follow: loop {
             let target = resolve_parent_with_depth(env, cur_start_dir.as_ref(), &cur_path, &mut symlink_depth)?;
             if target.name == "/" {
                 if flags.has_excl() {
                     return Err(VfsError::Exist);
                 }
-                break cross_mounts_down(env, Arc::clone(&target.parent));
+                break 'follow cross_mounts_down(env, Arc::clone(&target.parent));
             }
             if target.name == "." || target.name == ".." {
                 if flags.has_excl() {
                     return Err(VfsError::Exist);
                 }
-                break resolve_path_with_depth(
+                break 'follow resolve_path_with_depth(
                     env,
                     Some(&target.parent),
                     target.name.as_bytes(),
@@ -76,79 +79,102 @@ pub fn open_inode(
                 return Err(VfsError::IsDir);
             }
 
-            match target.parent.lookup(&target.name) {
-                Ok(existing) => {
-                    if flags.has_excl() {
-                        return Err(VfsError::Exist);
-                    }
-                    let existing = env.inode_get_or_insert(existing);
-                    if existing.inode_type() == InodeType::Symlink {
-                        if flags.has_nofollow() && !target.has_trailing_slash {
-                            return Err(VfsError::Loop);
+            let mut creat_retries = 0usize;
+            loop {
+                match target.parent.lookup(&target.name) {
+                    Ok(existing) => {
+                        if flags.has_excl() {
+                            return Err(VfsError::Exist);
                         }
-                        symlink_depth += 1;
-                        if symlink_depth > MAX_SYMLINK_DEPTH {
-                            return Err(VfsError::Loop);
-                        }
-                        if let Some(magic_target) = existing.resolve_magic_link() {
-                            let magic_target = env.inode_get_or_insert(magic_target);
-                            let resolved = cross_mounts_down(env, magic_target);
-                            if target.has_trailing_slash && resolved.inode_type() != InodeType::Dir {
-                                return Err(VfsError::NotDir);
+                        let existing = env.inode_get_or_insert(existing);
+                        if existing.inode_type() == InodeType::Symlink {
+                            if flags.has_nofollow() && !target.has_trailing_slash {
+                                return Err(VfsError::Loop);
                             }
-                            break resolved;
-                        }
-                        let mut link_target = existing.readlink()?;
-                        if link_target.is_empty() {
-                            return Err(VfsError::NoEnt);
-                        }
-                        if link_target.contains(&0) {
-                            return Err(VfsError::Inval);
-                        }
-                        if link_target.len() >= PATH_MAX {
-                            return Err(VfsError::NameTooLong);
-                        }
-                        if target.has_trailing_slash && !link_target.ends_with(b"/") {
-                            if link_target.len() + 1 >= PATH_MAX {
+                            symlink_depth += 1;
+                            if symlink_depth > MAX_SYMLINK_DEPTH {
+                                return Err(VfsError::Loop);
+                            }
+                            if let Some(magic_target) = existing.resolve_magic_link() {
+                                let magic_target = env.inode_get_or_insert(magic_target);
+                                let resolved = cross_mounts_down(env, magic_target);
+                                if target.has_trailing_slash && resolved.inode_type() != InodeType::Dir {
+                                    return Err(VfsError::NotDir);
+                                }
+                                break 'follow resolved;
+                            }
+                            let mut link_target = existing.readlink()?;
+                            if link_target.is_empty() {
+                                return Err(VfsError::NoEnt);
+                            }
+                            if link_target.contains(&0) {
+                                return Err(VfsError::Inval);
+                            }
+                            if link_target.len() >= PATH_MAX {
                                 return Err(VfsError::NameTooLong);
                             }
-                            link_target.push(b'/');
+                            if target.has_trailing_slash && !link_target.ends_with(b"/") {
+                                if link_target.len() + 1 >= PATH_MAX {
+                                    return Err(VfsError::NameTooLong);
+                                }
+                                link_target.push(b'/');
+                            }
+                            first_hop = false;
+                            cur_start_dir =
+                                if link_target.starts_with(b"/") { None } else { Some(Arc::clone(&target.parent)) };
+                            cur_path = link_target;
+                            continue 'follow;
+                        } else {
+                            // Follow stacked mountpoints if `existing` is a mountpoint directory.
+                            let existing = cross_mounts_down(env, existing);
+                            if target.has_trailing_slash && existing.inode_type() != InodeType::Dir {
+                                return Err(VfsError::NotDir);
+                            }
+                            break 'follow existing;
                         }
-                        first_hop = false;
-                        cur_start_dir =
-                            if link_target.starts_with(b"/") { None } else { Some(Arc::clone(&target.parent)) };
-                        cur_path = link_target;
-                    } else {
-                        // Follow stacked mountpoints if `existing` is a mountpoint directory.
-                        let existing = cross_mounts_down(env, existing);
-                        if target.has_trailing_slash && existing.inode_type() != InodeType::Dir {
+                    }
+                    Err(VfsError::NoEnt) => {
+                        if target.has_trailing_slash {
+                            return Err(VfsError::IsDir);
+                        }
+                        if flags.has_directory() {
                             return Err(VfsError::NotDir);
                         }
-                        break existing;
+                        if env.fs_read_only(target.parent.dev_id()) {
+                            return Err(VfsError::RoFs);
+                        }
+                        let eff_mode = (mode & 0o7777) & !umask;
+                        let inv_gen = env.dentry_gen();
+                        match target.parent.create(&target.name, eff_mode) {
+                            Ok(created) => {
+                                if env.dentry_gen() != inv_gen {
+                                    return Ok((
+                                        env.inode_get(created.dev_id(), created.ino()).unwrap_or(created),
+                                        path_str,
+                                    ));
+                                }
+                                let created = env.inode_get_or_insert(created);
+                                let _ = env.dentry_insert_if_gen(
+                                    target.parent.dev_id(),
+                                    target.parent.ino(),
+                                    &target.name,
+                                    DentryTarget { dev: created.dev_id(), ino: created.ino() },
+                                    inv_gen,
+                                );
+                                return Ok((created, path_str));
+                            }
+                            Err(VfsError::Exist) if !flags.has_excl() => {
+                                if creat_retries >= MAX_CREAT_RACE_RETRIES {
+                                    return Err(VfsError::Exist);
+                                }
+                                creat_retries += 1;
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
+                    Err(e) => return Err(e),
                 }
-                Err(VfsError::NoEnt) => {
-                    if target.has_trailing_slash {
-                        return Err(VfsError::IsDir);
-                    }
-                    if flags.has_directory() {
-                        return Err(VfsError::NotDir);
-                    }
-                    if env.fs_read_only(target.parent.dev_id()) {
-                        return Err(VfsError::RoFs);
-                    }
-                    let eff_mode = (mode & 0o7777) & !umask;
-                    let created = target.parent.create(&target.name, eff_mode)?;
-                    let created = env.inode_get_or_insert(created);
-                    env.dentry_insert(
-                        target.parent.dev_id(),
-                        target.parent.ino(),
-                        &target.name,
-                        DentryTarget { dev: created.dev_id(), ino: created.ino() },
-                    );
-                    return Ok((created, path_str));
-                }
-                Err(e) => return Err(e),
             }
         }
     } else {
@@ -196,13 +222,18 @@ pub fn mkdir_at(
         return Err(VfsError::RoFs);
     }
     let eff_mode = (mode & 0o7777) & !umask;
+    let inv_gen = env.dentry_gen();
     let dir = target.parent.mkdir(&target.name, eff_mode)?;
+    if env.dentry_gen() != inv_gen {
+        return Ok(env.inode_get(dir.dev_id(), dir.ino()).unwrap_or(dir));
+    }
     let dir = env.inode_get_or_insert(dir);
-    env.dentry_insert(
+    let _ = env.dentry_insert_if_gen(
         target.parent.dev_id(),
         target.parent.ino(),
         &target.name,
         DentryTarget { dev: dir.dev_id(), ino: dir.ino() },
+        inv_gen,
     );
     Ok(dir)
 }
@@ -337,12 +368,14 @@ pub fn link_at(
         return Err(VfsError::NoEnt);
     }
 
+    let inv_gen = env.dentry_gen();
     new_target.parent.link(&new_target.name, &old.inode)?;
-    env.dentry_insert(
+    let _ = env.dentry_insert_if_gen(
         new_target.parent.dev_id(),
         new_target.parent.ino(),
         &new_target.name,
         DentryTarget { dev: old.inode.dev_id(), ino: old.inode.ino() },
+        inv_gen,
     );
     Ok(())
 }
@@ -379,13 +412,18 @@ pub fn symlink_at(
         return Err(VfsError::RoFs);
     }
 
+    let inv_gen = env.dentry_gen();
     let sym = parent.parent.symlink(&parent.name, target_str)?;
+    if env.dentry_gen() != inv_gen {
+        return Ok(env.inode_get(sym.dev_id(), sym.ino()).unwrap_or(sym));
+    }
     let sym = env.inode_get_or_insert(sym);
-    env.dentry_insert(
+    let _ = env.dentry_insert_if_gen(
         parent.parent.dev_id(),
         parent.parent.ino(),
         &parent.name,
         DentryTarget { dev: sym.dev_id(), ino: sym.ino() },
+        inv_gen,
     );
     Ok(sym)
 }
@@ -547,23 +585,29 @@ pub fn rename_at2(
 
         let mut removed_target_ino: Option<(Arc<dyn VfsInode>, u64)> = None;
         let mut overwritten_dir_key: Option<(crate::types::DevId, crate::types::Ino)> = None;
-        if let Some(ref new_inode) = new_inode_opt {
+        let last_link_info = if let Some(ref new_inode) = new_inode_opt {
             let nlink = new_inode.stat()?.nlink;
             let last_link = if new_inode.inode_type() == InodeType::Dir { nlink <= 2 } else { nlink <= 1 };
-            if last_link {
-                let old_ino = new_inode.ino();
-                let _ = env.inode_remove(new_inode.dev_id(), old_ino);
-                removed_target_ino = Some((Arc::clone(new_inode), old_ino));
-            }
+            Some((Arc::clone(new_inode), last_link))
+        } else {
+            None
+        };
+
+        env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
+        env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
+
+        if let Some((new_inode, last_link)) = last_link_info {
             if new_inode.inode_type() == InodeType::Dir {
                 let dir_key = (new_inode.dev_id(), new_inode.ino());
                 env.dentry_invalidate_dir(dir_key.0, dir_key.1);
                 overwritten_dir_key = Some(dir_key);
             }
+            if last_link {
+                let old_ino = new_inode.ino();
+                let _ = env.inode_remove(new_inode.dev_id(), old_ino);
+                removed_target_ino = Some((new_inode, old_ino));
+            }
         }
-
-        env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
-        env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
 
         if let Err(err) = old_target.parent.rename(&old_target.name, &new_target.parent, &new_target.name, flags) {
             if let Some((inode, old_ino)) = removed_target_ino
