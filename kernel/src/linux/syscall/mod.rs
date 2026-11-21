@@ -1,9 +1,42 @@
-//! Linux x86-64 30-syscall dispatcher (M6, `docs/ARCHITECTURE.md` §8).
+//! Linux x86-64 syscall dispatcher (M6 built, M7 numbers routed;
+//! `docs/ARCHITECTURE.md` §8).
+//!
+//! `dispatch` maps each syscall number to its handler, one `match` arm per
+//! number. The handlers live in one module per cluster, so the PRs that fill
+//! in M7 (#254) each touch only their own module, never `dispatch`:
+//!
+//! - `fd`: descriptor I/O (`read`, `write`, `close`, `fstat`, `poll`,
+//!   `ioctl`, `readv`, `writev`; M7: `open`, `openat`, `lseek`).
+//! - `stat`: `stat`, `lstat`, `newfstatat`, `statx`, `access`, `faccessat`,
+//!   `faccessat2` (M7).
+//! - `ns`: namespace changes (`mkdir*`, `rmdir`, `unlink*`, `link*`,
+//!   `symlink*`, `readlink*`, `rename*`; M7).
+//! - `dir`: `getcwd` (M6); `getdents64`, `chdir`, `fchdir` (M7).
+//! - `meta`: `chmod*`, `chown*`, `umask`, `utimensat`, `truncate`,
+//!   `ftruncate` (M7).
+//! - `io`: `pread64`, `pwrite64`, `fsync`, `fdatasync`, `sync`, `msync` (M7).
+//! - `lock`: `fcntl`, `flock` (M7).
+//! - `mem`: `mmap`, `mprotect`, `munmap`, `brk` (M6).
+//! - `proc`: signals, `arch_prctl`, `prlimit64`, `uname`, `clock_gettime`,
+//!   `getrandom` (M6).
+//!
+//! An M7 syscall not implemented yet has a stub that logs once per number
+//! (as an unknown one does) and returns `-ENOSYS`.
 //!
 //! All user pointers are copied via `.lumen_fixup`-protected `copy_from_user` /
 //! `copy_to_user` with interrupts enabled and no `SpinLock` held. Unknown
 //! syscalls return `-ENOSYS` and log once per syscall number per boot at
 //! `debug` level.
+
+mod dir;
+mod fd;
+mod io;
+mod lock;
+mod mem;
+mod meta;
+mod ns;
+mod proc;
+mod stat;
 
 use alloc::vec;
 use core::mem::{MaybeUninit, size_of};
@@ -11,11 +44,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch;
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
-use crate::linux::process::{ConsoleIo, FdKind, KernelSigaction, record_exit, with_current, with_current_mut};
-use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, Utsname, default_utsname, errno, general, ioctl};
-use crate::mm::user_vm::prot_from_linux;
-use crate::sched;
-use crate::user::{CopyError, USER_MAX, UserExit, copy_from_user, copy_to_user, user_range_valid};
+use crate::linux::process::{ConsoleIo, KernelSigaction, record_exit, with_current, with_current_mut};
+use crate::linux::{Utsname, errno, general};
+use crate::user::{CopyError, UserExit, copy_from_user, copy_to_user, user_range_valid};
 
 /// Maximum `iovec` count accepted by `readv`/`writev` (POSIX `UIO_MAXIOV`).
 const UIO_MAXIOV: isize = 1024;
@@ -27,18 +58,8 @@ const IO_CHUNK: usize = 512;
 /// cannot monopolize a CPU indefinitely.
 const MAX_SINGLE_IO: usize = 1024 * 1024;
 
-/// Cap bytes returned by a single `getrandom(2)` call to avoid issuing
-/// thousands of synchronous `virtio-rng` requests in one syscall.
-const MAX_GETRANDOM: usize = 4096;
-
-/// Default stack rlimit advertised by M6 `prlimit64` (8 MiB, matching `USER_STACK_SIZE`).
-const DEFAULT_RLIMIT_STACK: u64 = 8 * 1024 * 1024;
-
 /// Default open-file rlimit advertised by M6 `prlimit64`.
 const DEFAULT_RLIMIT_NOFILE: u64 = 1024;
-
-/// Mask of unblockable signals (`SIGKILL` = 9, `SIGSTOP` = 19, 1-indexed).
-const UNBLOCKABLE_SIGS: u64 = (1u64 << (general::SIGKILL - 1)) | (1u64 << (general::SIGSTOP - 1));
 
 /// Raw Linux x86-64 `struct iovec` layout (16 bytes, zero padding).
 #[repr(C)]
@@ -48,19 +69,10 @@ struct RawIovec {
     len: u64,
 }
 
-/// Raw Linux x86-64 `struct pollfd` layout (8 bytes, zero padding).
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct RawPollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
 // Compile-time zero-padding verification for every POD ABI struct copied to/from user space.
 const _: () = {
     assert!(size_of::<RawIovec>() == size_of::<general::iovec>() && size_of::<RawIovec>() == 16);
-    assert!(size_of::<RawPollFd>() == size_of::<general::pollfd>() && size_of::<RawPollFd>() == 8);
+    assert!(size_of::<fd::RawPollFd>() == size_of::<general::pollfd>() && size_of::<fd::RawPollFd>() == 8);
     assert!(size_of::<general::stat>() == 144);
     assert!(size_of::<general::termios>() == 36);
     assert!(size_of::<general::winsize>() == 8);
@@ -131,64 +143,73 @@ fn log_unknown_once(nr: u64) {
     }
 }
 
+/// The body of an M7 syscall's stub until its cluster's PR implements it:
+/// log once per number, exactly as an unknown syscall does, and return
+/// `-ENOSYS`.
+fn not_implemented(nr: u32) -> u64 {
+    log_unknown_once(u64::from(nr));
+    neg_errno(errno::ENOSYS)
+}
+
 /// Dispatch one Linux x86-64 syscall (`rax` = nr, `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` = args).
 pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
     let nr = frame.rax;
     match nr {
+        // M6.
         n if n == u64::from(general::__NR_read) => {
-            frame.rax = sys_read(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_read(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_write) => {
-            frame.rax = sys_write(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_write(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_close) => {
-            frame.rax = sys_close(frame.rdi);
+            frame.rax = fd::sys_close(frame.rdi);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_fstat) => {
-            frame.rax = sys_fstat(frame.rdi, frame.rsi);
+            frame.rax = fd::sys_fstat(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_poll) => {
-            frame.rax = sys_poll(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_poll(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_mmap) => {
-            frame.rax = sys_mmap(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = mem::sys_mmap(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_mprotect) => {
-            frame.rax = sys_mprotect(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = mem::sys_mprotect(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_munmap) => {
-            frame.rax = sys_munmap(frame.rdi, frame.rsi);
+            frame.rax = mem::sys_munmap(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_brk) => {
-            frame.rax = sys_brk(frame.rdi);
+            frame.rax = mem::sys_brk(frame.rdi);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_rt_sigaction) => {
-            frame.rax = sys_rt_sigaction(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = proc::sys_rt_sigaction(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_rt_sigprocmask) => {
-            frame.rax = sys_rt_sigprocmask(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = proc::sys_rt_sigprocmask(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_ioctl) => {
-            frame.rax = sys_ioctl(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_ioctl(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_readv) => {
-            frame.rax = sys_readv(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_readv(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_writev) => {
-            frame.rax = sys_writev(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_writev(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_getpid) => {
@@ -206,11 +227,11 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             unsafe { arch::syscall::unwind_to_kernel() }
         }
         n if n == u64::from(general::__NR_uname) => {
-            frame.rax = sys_uname(frame.rdi);
+            frame.rax = proc::sys_uname(frame.rdi);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_getcwd) => {
-            frame.rax = sys_getcwd(frame.rdi, frame.rsi);
+            frame.rax = dir::sys_getcwd(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_getuid)
@@ -230,7 +251,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_arch_prctl) => {
-            frame.rax = sys_arch_prctl(frame.rdi, frame.rsi);
+            frame.rax = proc::sys_arch_prctl(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_gettid) => {
@@ -246,17 +267,210 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_clock_gettime) => {
-            frame.rax = sys_clock_gettime(frame.rdi, frame.rsi);
+            frame.rax = proc::sys_clock_gettime(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_prlimit64) => {
-            frame.rax = sys_prlimit64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = proc::sys_prlimit64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
         n if n == u64::from(general::__NR_getrandom) => {
-            frame.rax = sys_getrandom(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = proc::sys_getrandom(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
+
+        // M7 (`crate::linux::M7_SYSCALLS`): each arm passes the arguments of
+        // the syscall's Linux x86-64 signature, and no more (`faccessat` and
+        // `fchmodat` take 3, never `r10`).
+        n if n == u64::from(general::__NR_open) => {
+            frame.rax = fd::sys_open(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_openat) => {
+            frame.rax = fd::sys_openat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_lseek) => {
+            frame.rax = fd::sys_lseek(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_stat) => {
+            frame.rax = stat::sys_stat(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_lstat) => {
+            frame.rax = stat::sys_lstat(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_newfstatat) => {
+            frame.rax = stat::sys_newfstatat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_statx) => {
+            frame.rax = stat::sys_statx(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_access) => {
+            frame.rax = stat::sys_access(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_faccessat) => {
+            frame.rax = stat::sys_faccessat(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_faccessat2) => {
+            frame.rax = stat::sys_faccessat2(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_mkdir) => {
+            frame.rax = ns::sys_mkdir(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_mkdirat) => {
+            frame.rax = ns::sys_mkdirat(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_rmdir) => {
+            frame.rax = ns::sys_rmdir(frame.rdi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_unlink) => {
+            frame.rax = ns::sys_unlink(frame.rdi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_unlinkat) => {
+            frame.rax = ns::sys_unlinkat(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_link) => {
+            frame.rax = ns::sys_link(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_linkat) => {
+            frame.rax = ns::sys_linkat(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_symlink) => {
+            frame.rax = ns::sys_symlink(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_symlinkat) => {
+            frame.rax = ns::sys_symlinkat(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_readlink) => {
+            frame.rax = ns::sys_readlink(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_readlinkat) => {
+            frame.rax = ns::sys_readlinkat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_rename) => {
+            frame.rax = ns::sys_rename(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_renameat) => {
+            frame.rax = ns::sys_renameat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_renameat2) => {
+            frame.rax = ns::sys_renameat2(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_getdents64) => {
+            frame.rax = dir::sys_getdents64(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_chdir) => {
+            frame.rax = dir::sys_chdir(frame.rdi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fchdir) => {
+            frame.rax = dir::sys_fchdir(frame.rdi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_chmod) => {
+            frame.rax = meta::sys_chmod(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fchmod) => {
+            frame.rax = meta::sys_fchmod(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fchmodat) => {
+            frame.rax = meta::sys_fchmodat(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fchmodat2) => {
+            frame.rax = meta::sys_fchmodat2(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_chown) => {
+            frame.rax = meta::sys_chown(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fchown) => {
+            frame.rax = meta::sys_fchown(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_lchown) => {
+            frame.rax = meta::sys_lchown(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fchownat) => {
+            frame.rax = meta::sys_fchownat(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_umask) => {
+            frame.rax = meta::sys_umask(frame.rdi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_utimensat) => {
+            frame.rax = meta::sys_utimensat(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_truncate) => {
+            frame.rax = meta::sys_truncate(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_ftruncate) => {
+            frame.rax = meta::sys_ftruncate(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_pread64) => {
+            frame.rax = io::sys_pread64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_pwrite64) => {
+            frame.rax = io::sys_pwrite64(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fsync) => {
+            frame.rax = io::sys_fsync(frame.rdi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fdatasync) => {
+            frame.rax = io::sys_fdatasync(frame.rdi);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_sync) => {
+            frame.rax = io::sys_sync();
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_msync) => {
+            frame.rax = io::sys_msync(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_fcntl) => {
+            frame.rax = lock::sys_fcntl(frame.rdi, frame.rsi, frame.rdx);
+            SyscallReturn::Sysret
+        }
+        n if n == u64::from(general::__NR_flock) => {
+            frame.rax = lock::sys_flock(frame.rdi, frame.rsi);
+            SyscallReturn::Sysret
+        }
+
         _ => {
             if with_current(|p| p.allow_test_syscalls)
                 && let Some(ret) = crate::user::dispatch_test_syscall(frame)
@@ -310,328 +524,6 @@ fn write_from_user(io: ConsoleIo, user_buf: u64, count: u64) -> Result<usize, u3
     Ok(written)
 }
 
-fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
-    let (kind, io) = with_current(|p| (p.fd_kind(fd), p.io));
-    if !kind.is_readable() {
-        return neg_errno(errno::EBADF);
-    }
-    match read_into_user(io, buf, count) {
-        Ok(n) => n as u64,
-        Err(e) => neg_errno(e),
-    }
-}
-
-fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
-    let (kind, io) = with_current(|p| (p.fd_kind(fd), p.io));
-    if !kind.is_writable() {
-        return neg_errno(errno::EBADF);
-    }
-    match write_from_user(io, buf, count) {
-        Ok(n) => n as u64,
-        Err(e) => neg_errno(e),
-    }
-}
-
-fn sys_close(fd: u64) -> u64 {
-    with_current_mut(|p| {
-        if p.fd_kind(fd).is_open() {
-            p.fds[fd as usize] = FdKind::Closed;
-            0
-        } else {
-            neg_errno(errno::EBADF)
-        }
-    })
-}
-
-fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    let open = with_current(|p| p.fd_kind(fd).is_open());
-    if !open {
-        return neg_errno(errno::EBADF);
-    }
-    let st = general::stat {
-        st_dev: 0,
-        st_ino: fd + 1,
-        st_nlink: 1,
-        st_mode: general::S_IFCHR | 0o620,
-        st_uid: 0,
-        st_gid: 0,
-        __pad0: 0,
-        st_rdev: (5 << 8) | 1,
-        st_size: 0,
-        st_blksize: 4096,
-        st_blocks: 0,
-        st_atime: 0,
-        st_atime_nsec: 0,
-        st_mtime: 0,
-        st_mtime_nsec: 0,
-        st_ctime: 0,
-        st_ctime_nsec: 0,
-        __unused: [0; 3],
-    };
-    // SAFETY: `general::stat` is 144 bytes with explicit `__pad0` and zero implicit padding.
-    match unsafe { copy_pod_to_user(statbuf, &st) } {
-        Ok(()) => 0,
-        Err(e) => neg_errno(e.to_errno()),
-    }
-}
-
-/// Console `poll(2)` supporting Rust `std` startup's `sanitize_standard_fds`
-/// (`poll([0, 1, 2], 3, 0)`) and `busybox` `lineedit` stdin readiness waits.
-/// Full multi-fd blocking `poll`/`ppoll` with pipes/PTYs arrives in M8.
-fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
-    if nfds > DEFAULT_RLIMIT_NOFILE {
-        return neg_errno(errno::EINVAL);
-    }
-    let timeout_ms = timeout_raw as i32;
-    let cnt = nfds as usize;
-    if cnt == 0 {
-        if timeout_ms > 0 {
-            let _ = sched::sleep((timeout_ms as u64).saturating_mul(1_000_000));
-        }
-        return 0;
-    }
-    let byte_len = cnt * size_of::<RawPollFd>();
-    let mut raw = vec![0u8; byte_len];
-    if let Err(e) = copy_from_user(&mut raw, fds_ptr) {
-        return neg_errno(e.to_errno());
-    }
-
-    let (io, fds) = with_current(|p| (p.io, p.fds));
-    let fd_kind_of =
-        |fd: i32| -> FdKind { if fd >= 0 && (fd as usize) < fds.len() { fds[fd as usize] } else { FdKind::Closed } };
-    let deadline = if timeout_ms > 0 {
-        Some(crate::time::now_ns().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
-    } else {
-        None
-    };
-
-    // Only touch stdin readiness if at least one entry actually asks for POLLIN on Stdin.
-    let needs_stdin = raw.as_chunks::<8>().0.iter().any(|chunk| {
-        let fd = i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes"));
-        let events = i16::from_le_bytes(chunk[4..6].try_into().expect("2 bytes"));
-        fd >= 0 && matches!(fd_kind_of(fd), FdKind::Stdin) && (events & (general::POLLIN as i16)) != 0
-    });
-
-    let ready = loop {
-        let mut ready = 0u64;
-        let mut waiting_stdin = false;
-        let stdin_avail = if needs_stdin { crate::linux::process::stdin_ready(io) } else { false };
-
-        for chunk in raw.as_chunks_mut::<8>().0 {
-            let fd = i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes"));
-            let events = i16::from_le_bytes(chunk[4..6].try_into().expect("2 bytes"));
-            let revents: i16 = if fd < 0 {
-                0
-            } else {
-                match fd_kind_of(fd) {
-                    FdKind::Closed => general::POLLNVAL as i16,
-                    FdKind::Stdout | FdKind::Stderr => events & (general::POLLOUT as i16),
-                    FdKind::Stdin => {
-                        if (events & (general::POLLIN as i16)) != 0 {
-                            if stdin_avail {
-                                general::POLLIN as i16
-                            } else {
-                                waiting_stdin = true;
-                                0
-                            }
-                        } else {
-                            0
-                        }
-                    }
-                }
-            };
-            if revents != 0 {
-                ready += 1;
-            }
-            chunk[6..8].copy_from_slice(&revents.to_le_bytes());
-        }
-
-        if ready > 0 || timeout_ms == 0 {
-            break ready;
-        }
-        if !waiting_stdin {
-            if let Some(dl) = deadline {
-                let rem = dl.saturating_sub(crate::time::now_ns());
-                if rem > 0 {
-                    let _ = sched::sleep(rem);
-                }
-            }
-            break 0;
-        }
-        if let Some(dl) = deadline
-            && crate::time::now_ns() >= dl
-        {
-            break 0;
-        }
-        crate::linux::process::wait_stdin_step(io, deadline);
-    };
-
-    if let Err(e) = copy_to_user(fds_ptr, &raw) {
-        return neg_errno(e.to_errno());
-    }
-    ready
-}
-
-fn sys_mmap(addr: u64, len: u64, prot_raw: u64, flags: u64) -> u64 {
-    let Some(prot) = prot_from_linux(prot_raw) else {
-        return neg_errno(errno::EINVAL);
-    };
-    let Some(space) = sched::current_address_space() else {
-        return neg_errno(errno::ENOMEM);
-    };
-    match space.mmap_anon(addr, len, prot, flags) {
-        Ok(va) => va,
-        Err(e) => neg_errno(e.to_errno()),
-    }
-}
-
-fn sys_mprotect(addr: u64, len: u64, prot_raw: u64) -> u64 {
-    let Some(prot) = prot_from_linux(prot_raw) else {
-        return neg_errno(errno::EINVAL);
-    };
-    let Some(space) = sched::current_address_space() else {
-        return neg_errno(errno::ENOMEM);
-    };
-    match space.mprotect(addr, len, prot) {
-        Ok(()) => 0,
-        Err(e) => neg_errno(e.to_mprotect_errno()),
-    }
-}
-
-fn sys_munmap(addr: u64, len: u64) -> u64 {
-    let Some(space) = sched::current_address_space() else {
-        return neg_errno(errno::EINVAL);
-    };
-    match space.munmap(addr, len) {
-        Ok(()) => 0,
-        Err(e) => neg_errno(e.to_errno()),
-    }
-}
-
-fn sys_brk(addr: u64) -> u64 {
-    let Some(space) = sched::current_address_space() else {
-        return 0;
-    };
-    space.brk(addr)
-}
-
-fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
-    if sigsetsize != 8 || !(1..=64).contains(&sig) {
-        return neg_errno(errno::EINVAL);
-    }
-    if act != 0 && (sig == u64::from(general::SIGKILL) || sig == u64::from(general::SIGSTOP)) {
-        return neg_errno(errno::EINVAL);
-    }
-    let new_action = if act != 0 {
-        // SAFETY: `KernelSigaction` is 4 `u64`s (32 bytes); all bit patterns are valid.
-        match unsafe { copy_pod_from_user::<KernelSigaction>(act) } {
-            Ok(a) => Some(a),
-            Err(e) => return neg_errno(e.to_errno()),
-        }
-    } else {
-        None
-    };
-
-    let idx = (sig - 1) as usize;
-    let prev = with_current(|p| p.sigactions[idx]);
-    if oldact != 0 {
-        // Write `oldact` BEFORE mutating the table so a faulting `oldact` leaves state intact.
-        // SAFETY: `KernelSigaction` has zero padding bytes.
-        if let Err(e) = unsafe { copy_pod_to_user(oldact, &prev) } {
-            return neg_errno(e.to_errno());
-        }
-    }
-    if let Some(mut a) = new_action {
-        a.mask &= !UNBLOCKABLE_SIGS;
-        with_current_mut(|p| p.sigactions[idx] = a);
-    }
-    0
-}
-
-fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
-    if sigsetsize != 8 {
-        return neg_errno(errno::EINVAL);
-    }
-    let new_mask = if set != 0 {
-        if how != u64::from(general::SIG_BLOCK)
-            && how != u64::from(general::SIG_UNBLOCK)
-            && how != u64::from(general::SIG_SETMASK)
-        {
-            return neg_errno(errno::EINVAL);
-        }
-        let mut raw = [0u8; 8];
-        if let Err(e) = copy_from_user(&mut raw, set) {
-            return neg_errno(e.to_errno());
-        }
-        Some(u64::from_le_bytes(raw))
-    } else {
-        None
-    };
-
-    let prev = with_current(|p| p.sigmask);
-    if oldset != 0
-        && let Err(e) = copy_to_user(oldset, &prev.to_le_bytes())
-    {
-        return neg_errno(e.to_errno());
-    }
-    if let Some(mask) = new_mask {
-        let updated = if how == u64::from(general::SIG_BLOCK) {
-            prev | mask
-        } else if how == u64::from(general::SIG_UNBLOCK) {
-            prev & !mask
-        } else {
-            mask
-        };
-        with_current_mut(|p| p.sigmask = updated & !UNBLOCKABLE_SIGS);
-    }
-    0
-}
-
-fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
-    let (open, io) = with_current(|p| (p.fd_kind(fd).is_open(), p.io));
-    if !open {
-        return neg_errno(errno::EBADF);
-    }
-    let cmd = req as u32;
-    if cmd == ioctl::TCGETS {
-        let t = with_current(|p| p.termios);
-        // SAFETY: `general::termios` is 36 bytes with zero implicit padding.
-        return match unsafe { copy_pod_to_user(arg, &t) } {
-            Ok(()) => 0,
-            Err(e) => neg_errno(e.to_errno()),
-        };
-    }
-    if cmd == ioctl::TCSETS || cmd == ioctl::TCSETSW || cmd == ioctl::TCSETSF {
-        // SAFETY: `general::termios` is 36 integer bytes; all bit patterns are valid.
-        return match unsafe { copy_pod_from_user::<general::termios>(arg) } {
-            Ok(t) => {
-                with_current_mut(|p| p.termios = t);
-                0
-            }
-            Err(e) => neg_errno(e.to_errno()),
-        };
-    }
-    if cmd == ioctl::TIOCGWINSZ {
-        let (ws_row, ws_col) = match io {
-            ConsoleIo::Vt(_) => crate::term::status()
-                .map(|t| {
-                    let rows = u16::try_from(t.rows).ok().filter(|&n| n > 0).unwrap_or(25);
-                    let cols = u16::try_from(t.cols).ok().filter(|&n| n > 0).unwrap_or(80);
-                    (rows, cols)
-                })
-                .unwrap_or((25, 80)),
-            ConsoleIo::Serial | ConsoleIo::Capture => (25, 80),
-        };
-        let ws = general::winsize { ws_row, ws_col, ws_xpixel: 0, ws_ypixel: 0 };
-        // SAFETY: `general::winsize` is 4 `u16`s (8 bytes) with zero padding.
-        return match unsafe { copy_pod_to_user(arg, &ws) } {
-            Ok(()) => 0,
-            Err(e) => neg_errno(e.to_errno()),
-        };
-    }
-    neg_errno(errno::ENOTTY)
-}
-
 fn copy_iovecs(user_iov: u64, iovcnt: u64) -> Result<alloc::vec::Vec<RawIovec>, u32> {
     let cnt = iovcnt as isize;
     if !(0..=UIO_MAXIOV).contains(&cnt) {
@@ -658,207 +550,43 @@ fn copy_iovecs(user_iov: u64, iovcnt: u64) -> Result<alloc::vec::Vec<RawIovec>, 
     Ok(iovs)
 }
 
-fn sys_readv(fd: u64, iov: u64, iovcnt: u64) -> u64 {
-    let (kind, io) = with_current(|p| (p.fd_kind(fd), p.io));
-    if !kind.is_readable() {
-        return neg_errno(errno::EBADF);
-    }
-    let iovs = match copy_iovecs(iov, iovcnt) {
-        Ok(v) => v,
-        Err(e) => return neg_errno(e),
-    };
-    for span in iovs {
-        if span.len == 0 {
-            continue;
-        }
-        // Standard tty short-read semantics: return as soon as the first non-empty
-        // span receives data (or EOF/error) so musl `__stdio_read` never hangs
-        // trying to fill trailing iovecs.
-        return match read_into_user(io, span.base, span.len) {
-            Ok(n) => n as u64,
-            Err(e) => neg_errno(e),
+/// Dispatch each of `numbers` with zeroed arguments on a thread with no
+/// `ProcessState` and check it comes back as `-ENOSYS` by `sysret`: the
+/// per-cluster stub ktests' check.
+///
+/// A number without its own `dispatch` arm can't pass: the fallthrough arm
+/// asks `with_current` for the process, which panics with none.
+#[cfg(feature = "ktest")]
+fn check_stubs(numbers: &[u32]) -> crate::ktest::TestResult {
+    for &nr in numbers {
+        let mut frame = SyscallFrame {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: 0,
+            rsi: 0,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: u64::from(nr),
+            rip: 0,
+            cs: 0,
+            rflags: 0,
+            rsp: 0,
+            ss: 0,
         };
-    }
-    0
-}
-
-fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
-    let (kind, io) = with_current(|p| (p.fd_kind(fd), p.io));
-    if !kind.is_writable() {
-        return neg_errno(errno::EBADF);
-    }
-    let iovs = match copy_iovecs(iov, iovcnt) {
-        Ok(v) => v,
-        Err(e) => return neg_errno(e),
-    };
-    let mut remaining = MAX_SINGLE_IO;
-    let mut total = 0usize;
-    for span in iovs {
-        if span.len == 0 {
-            continue;
+        let ret = dispatch(core::hint::black_box(&mut frame));
+        if ret != SyscallReturn::Sysret || frame.rax != neg_errno(errno::ENOSYS) {
+            crate::ktest::diag(format_args!("syscall #{nr}"));
         }
-        if remaining == 0 {
-            break;
-        }
-        let want = span.len.min(remaining as u64);
-        match write_from_user(io, span.base, want) {
-            Ok(n) => {
-                total = total.saturating_add(n);
-                remaining = remaining.saturating_sub(n);
-                if (n as u64) < want || (n as u64) < span.len {
-                    break;
-                }
-            }
-            Err(e) => return if total == 0 { neg_errno(e) } else { total as u64 },
-        }
+        crate::kassert_eq!(ret, SyscallReturn::Sysret);
+        crate::kassert_eq!(frame.rax, neg_errno(errno::ENOSYS));
     }
-    total as u64
-}
-
-fn sys_uname(buf: u64) -> u64 {
-    let uts = default_utsname();
-    // SAFETY: `Utsname` (`system::new_utsname`) is 6 x `[c_char; 65]` (390 bytes), zero padding.
-    match unsafe { copy_pod_to_user(buf, &uts) } {
-        Ok(()) => 0,
-        Err(e) => neg_errno(e.to_errno()),
-    }
-}
-
-fn sys_getcwd(buf: u64, size: u64) -> u64 {
-    if size < 2 {
-        return neg_errno(errno::ERANGE);
-    }
-    match copy_to_user(buf, b"/\0") {
-        Ok(()) => 2,
-        Err(e) => neg_errno(e.to_errno()),
-    }
-}
-
-fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
-    if code == u64::from(ARCH_SET_FS) {
-        if addr >= USER_MAX {
-            neg_errno(errno::EINVAL)
-        } else {
-            sched::set_current_fs_base(addr);
-            0
-        }
-    } else if code == u64::from(ARCH_GET_FS) {
-        let fs = sched::current_fs_base();
-        match copy_to_user(addr, &fs.to_le_bytes()) {
-            Ok(()) => 0,
-            Err(e) => neg_errno(e.to_errno()),
-        }
-    } else {
-        neg_errno(errno::EINVAL)
-    }
-}
-
-fn sys_clock_gettime(clockid: u64, tp: u64) -> u64 {
-    let (sec, nsec) =
-        if clockid == u64::from(general::CLOCK_REALTIME) || clockid == u64::from(general::CLOCK_REALTIME_COARSE) {
-            crate::time::realtime_sec_nsec()
-        } else if clockid == u64::from(general::CLOCK_MONOTONIC)
-            || clockid == u64::from(general::CLOCK_MONOTONIC_RAW)
-            || clockid == u64::from(general::CLOCK_MONOTONIC_COARSE)
-            || clockid == u64::from(general::CLOCK_BOOTTIME)
-        {
-            let ns = crate::time::now_ns();
-            (ns / 1_000_000_000, ns % 1_000_000_000)
-        } else {
-            return neg_errno(errno::EINVAL);
-        };
-
-    let ts = general::timespec { tv_sec: sec as i64, tv_nsec: nsec as i64 };
-    // SAFETY: `general::timespec` is two `i64`s (16 bytes) with zero padding.
-    match unsafe { copy_pod_to_user(tp, &ts) } {
-        Ok(()) => 0,
-        Err(e) => neg_errno(e.to_errno()),
-    }
-}
-
-fn sys_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u64 {
-    let current_pid = with_current(|p| p.pid);
-    if pid != 0 && pid != u64::from(current_pid) {
-        return neg_errno(errno::ESRCH);
-    }
-    if resource >= u64::from(general::RLIM_NLIMITS) {
-        return neg_errno(errno::EINVAL);
-    }
-    if new_limit != 0 {
-        // Validate user pointer and `rlim_cur <= rlim_max` even though M6 limits are read-only.
-        // SAFETY: `general::rlimit64` is two `u64`s (16 bytes); all bit patterns valid.
-        match unsafe { copy_pod_from_user::<general::rlimit64>(new_limit) } {
-            Ok(rlim) if rlim.rlim_cur > rlim.rlim_max => return neg_errno(errno::EINVAL),
-            Ok(_) => {}
-            Err(e) => return neg_errno(e.to_errno()),
-        }
-    }
-    if old_limit != 0 {
-        let limit = match resource as u32 {
-            general::RLIMIT_STACK => DEFAULT_RLIMIT_STACK,
-            general::RLIMIT_NOFILE => DEFAULT_RLIMIT_NOFILE,
-            _ => u64::MAX,
-        };
-        let rlim = general::rlimit64 { rlim_cur: limit, rlim_max: limit };
-        // SAFETY: `general::rlimit64` is two `u64`s (16 bytes) with zero padding.
-        if let Err(e) = unsafe { copy_pod_to_user(old_limit, &rlim) } {
-            return neg_errno(e.to_errno());
-        }
-    }
-    0
-}
-
-fn fill_insecure_fallback(state: &mut u64, dst: &mut [u8]) {
-    for chunk in dst.chunks_mut(8) {
-        // SplitMix64 mixing step (non-cryptographic fallback only when GRND_INSECURE
-        // is requested on a machine without hardware/virtio RNG).
-        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        let bytes = z.to_le_bytes();
-        chunk.copy_from_slice(&bytes[..chunk.len()]);
-    }
-}
-
-fn sys_getrandom(buf: u64, buflen: u64, flags: u64) -> u64 {
-    let allowed = u64::from(general::GRND_NONBLOCK | general::GRND_RANDOM | general::GRND_INSECURE);
-    let incompatible = u64::from(general::GRND_RANDOM | general::GRND_INSECURE);
-    if (flags & !allowed) != 0 || (flags & incompatible) == incompatible {
-        return neg_errno(errno::EINVAL);
-    }
-    if buflen == 0 {
-        return 0;
-    }
-    let total = buflen.min(MAX_GETRANDOM as u64) as usize;
-    if !user_range_valid(buf, 1) {
-        return neg_errno(errno::EFAULT);
-    }
-    let mut kbuf = [0u8; IO_CHUNK];
-    let mut fallback_state = crate::time::now_ns() ^ arch::rdtsc().rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
-    let mut written = 0usize;
-    let res = loop {
-        if written >= total {
-            break written as u64;
-        }
-        let chunk = (total - written).min(IO_CHUNK);
-        let addr = match buf.checked_add(written as u64) {
-            Some(a) => a,
-            None => break if written == 0 { neg_errno(errno::EFAULT) } else { written as u64 },
-        };
-        if crate::rng::fill(&mut kbuf[..chunk]).is_err() {
-            if (flags & u64::from(general::GRND_INSECURE)) != 0 {
-                fill_insecure_fallback(&mut fallback_state, &mut kbuf[..chunk]);
-            } else {
-                break if written == 0 { neg_errno(errno::EAGAIN) } else { written as u64 };
-            }
-        }
-        if copy_to_user(addr, &kbuf[..chunk]).is_err() {
-            break if written == 0 { neg_errno(errno::EFAULT) } else { written as u64 };
-        }
-        written += chunk;
-    };
-    lumen_rand::clear(&mut kbuf);
-    res
+    Ok(())
 }

@@ -6974,7 +6974,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/drivers.rs   the driver table and probe_all
   src/blk/         (M7, designed in #246) virtio-blk driver implementing BlockDevice, block-device registry, `blk` shell command
   src/vfs/         (M7, designed in #246) POSIX VFS kernel integration, unified PageCache, writable ext4 adapter, tmpfs, devfs, procfs, `mount`/`sync` commands
-  src/linux/       Linux x86-64 ABI (M6 built #232–#238; M7 extends #246): UAPI re-exports (mod.rs), Limine boot-module loader (modules.rs), ProcessState + FD table + console bridge (process.rs), syscall dispatcher (syscall.rs)
+  src/linux/       Linux x86-64 ABI (M6 built #232–#238; M7 extends #246): UAPI re-exports (mod.rs), Limine boot-module loader (modules.rs), ProcessState + FD table + console bridge (process.rs), syscall dispatcher (syscall/mod.rs; handlers by cluster in syscall/{fd,stat,ns,dir,meta,io,lock,mem,proc}.rs)
   src/user.rs      ring-3 entry/exit runner, `.lumen_fixup` safe user copies (`copy_from_user`/`copy_to_user`/`copy_cstr_from_user`), user exception handling (M6)
   src/sound.rs     the virtio-sound driver (its thread owns the device), beep, play, volume, sound
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport
