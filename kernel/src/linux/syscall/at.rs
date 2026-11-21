@@ -386,7 +386,7 @@ crate::ktest!(
         crate::kassert_eq!(reg::<Mode>(0o170_000).perm(), 0);
         crate::kassert_eq!(reg::<Mode>(0o107_777).dir_perm(), 0o1777);
         crate::kassert_eq!(reg::<Mode>(0o6755).dir_perm(), 0o755);
-        crate::kassert_eq!(reg::<Mode>(0x1_0000_0022).bits(), 0o22);
+        crate::kassert_eq!(reg::<Mode>(0x1_0000_0012).bits(), 0o22);
         // Flags and `int`/`unsigned int` arguments are the low 32 bits; a
         // size, offset or pointer is the whole register.
         crate::kassert_eq!(reg::<AtFlags>(0xffff_ffff_0000_0100), AtFlags(general::AT_SYMLINK_NOFOLLOW));
