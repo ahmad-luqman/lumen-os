@@ -564,7 +564,47 @@ impl AddressSpace {
             let x = if vma.prot.exec() { 'x' } else { '-' };
             let (sp, offset, maj, min, ino, label): (char, u64, u32, u32, u64, Option<&str>) = match vma.backing {
                 Backing::Anonymous => {
-                    let lbl = if vma.start >= USER_STACK_BOTTOM && vma.end <= USER_STACK_TOP {
+                    let is_stack = vma.start >= USER_STACK_BOTTOM && vma.end <= USER_STACK_TOP;
+                    if !is_stack && brk_mapped > brk_init && vma.start < brk_init && vma.end > brk_init {
+                        let _ = writeln!(
+                            out,
+                            "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}",
+                            vma.start, brk_init, r, w, x, 0u64, 0u32, 0u32, 0u64
+                        );
+                        let heap_end = vma.end.min(brk_mapped);
+                        let _ = writeln!(
+                            out,
+                            "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}  [heap]",
+                            brk_init, heap_end, r, w, x, 0u64, 0u32, 0u32, 0u64
+                        );
+                        if vma.end > heap_end {
+                            let _ = writeln!(
+                                out,
+                                "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}",
+                                heap_end, vma.end, r, w, x, 0u64, 0u32, 0u32, 0u64
+                            );
+                        }
+                        continue;
+                    }
+                    if !is_stack
+                        && brk_mapped > brk_init
+                        && vma.start >= brk_init
+                        && vma.start < brk_mapped
+                        && vma.end > brk_mapped
+                    {
+                        let _ = writeln!(
+                            out,
+                            "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}  [heap]",
+                            vma.start, brk_mapped, r, w, x, 0u64, 0u32, 0u32, 0u64
+                        );
+                        let _ = writeln!(
+                            out,
+                            "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}",
+                            brk_mapped, vma.end, r, w, x, 0u64, 0u32, 0u32, 0u64
+                        );
+                        continue;
+                    }
+                    let lbl = if is_stack {
                         Some("[stack]")
                     } else if brk_mapped > brk_init && vma.start >= brk_init && vma.end <= brk_mapped {
                         Some("[heap]")
@@ -682,7 +722,7 @@ fn prepare_elf_and_stack(
 }
 
 #[cfg(feature = "ktest")]
-fn build_relro_test_elf() -> alloc::vec::Vec<u8> {
+pub(crate) fn build_relro_test_elf() -> alloc::vec::Vec<u8> {
     use lumen_elf::loader::{EM_X86_64, ET_EXEC, EV_CURRENT, PF_R, PF_W, PF_X, PHDR_MIN_SIZE, PT_LOAD};
 
     const EHDR_SIZE: usize = 64;

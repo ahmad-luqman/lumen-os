@@ -133,7 +133,7 @@ impl Ext4DiskLayout {
         let incompat = u32::from_le_bytes(sb[0x60..0x64].try_into().unwrap());
         let is_64bit = (incompat & 0x80) != 0;
         let desc_size = if is_64bit { u16::from_le_bytes(sb[0xfe..0x100].try_into().unwrap()) } else { 32 };
-        if desc_size < 32 {
+        if desc_size < 32 || (is_64bit && desc_size != 64) {
             return Err(VfsError::Inval);
         }
         Ok(Self { block_size, inode_size, inodes_per_group, desc_size, is_64bit })
@@ -425,8 +425,8 @@ impl Ext4Inode {
         if self.is_detached() || self.inode_type != InodeType::File {
             return 0;
         }
-        let _meta = self.meta.lock();
-        if self.is_detached() {
+        let meta = self.meta.lock();
+        if self.is_detached() || meta.nlink == 0 {
             return 0;
         }
         let mut pages = self.pages.lock();
@@ -439,8 +439,8 @@ impl Ext4Inode {
         if self.is_detached() || self.inode_type != InodeType::File || self.shared.read_only {
             return 0;
         }
-        let meta = self.meta.lock();
-        if self.is_detached() {
+        let mut meta = self.meta.lock();
+        if self.is_detached() || meta.nlink == 0 {
             return 0;
         }
         let file_size = meta.size;
@@ -465,11 +465,16 @@ impl Ext4Inode {
                         return 0;
                     }
                 };
-                ext4_write_at(&inner.ext4, &mut disk, &bounce[..valid], page_off)
+                ext4_write_at(&inner.ext4, &mut disk, &bounce[..valid], page_off).map(|_| disk.blocks())
             };
-            if write_res.is_err() {
-                page.set_dirty();
-                return 0;
+            match write_res {
+                Ok(blocks_512) => {
+                    meta.blocks_512 = blocks_512;
+                }
+                Err(_) => {
+                    page.set_dirty();
+                    return 0;
+                }
             }
             flushed_indices.push(page_idx);
         }
@@ -487,7 +492,7 @@ impl Ext4Inode {
             return Ok(());
         }
         let mut meta = self.meta.lock();
-        if self.is_detached() {
+        if self.is_detached() || meta.nlink == 0 {
             return Ok(());
         }
         let file_size = meta.size;
@@ -507,11 +512,18 @@ impl Ext4Inode {
                 let res = {
                     let inner = self.shared.state.lock();
                     let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                    ext4_write_at(&inner.ext4, &mut disk, &bounce[..valid], page_off).map_err(map_ext4_err)
+                    ext4_write_at(&inner.ext4, &mut disk, &bounce[..valid], page_off)
+                        .map(|_| disk.blocks())
+                        .map_err(map_ext4_err)
                 };
-                if let Err(e) = res {
-                    page.set_dirty();
-                    return Err(e);
+                match res {
+                    Ok(blocks_512) => {
+                        meta.blocks_512 = blocks_512;
+                    }
+                    Err(e) => {
+                        page.set_dirty();
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -555,7 +567,7 @@ impl Ext4Inode {
     fn zero_inline_symlink_before_unlink(inner: &Ext4FsInner, disk_ino: u32) -> Result<Inode, VfsError> {
         let idx = NonZeroU32::new(disk_ino).ok_or(VfsError::Inval)?;
         let disk = Inode::read(&inner.ext4, idx).map_err(map_ext4_err)?;
-        if is_inline_symlink(&disk) {
+        if disk.links_count() <= 1 && is_inline_symlink(&disk) {
             let off = inner.layout.inode_disk_offset(&inner.bcache, disk_ino)?;
             let zeros60 = [0u8; 60];
             let zero4 = [0u8; 4];
@@ -584,39 +596,46 @@ impl Ext4Inode {
 
                 let file_size = meta_guard.size;
                 let mut faulted: Vec<(u64, Arc<CachePage>)> = Vec::new();
-                if file_size > 0 && meta_guard.blocks_512 > 0 {
-                    let num_pages = file_size.div_ceil(PAGE_SIZE as u64);
-                    let mut tmp = vec![0u8; PAGE_SIZE];
-                    for p in 0..num_pages {
-                        if pages.get(p).is_some() {
-                            continue;
-                        }
-                        let page_off = p * PAGE_SIZE as u64;
-                        let chunk = (file_size - page_off).min(PAGE_SIZE as u64) as usize;
-                        tmp[..chunk].fill(0);
-                        {
-                            let inner = target.shared.state.lock();
-                            let disk = Inode::read(&inner.ext4, target.disk_inode_index()).map_err(map_ext4_err)?;
-                            let mut read_off = 0usize;
-                            while read_off < chunk {
-                                let n = ext4_read_at(
-                                    &inner.ext4,
-                                    &disk,
-                                    &mut tmp[read_off..chunk],
-                                    page_off + read_off as u64,
-                                )
-                                .map_err(map_ext4_err)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                read_off += n;
+                if file_size > 0 {
+                    let disk_has_data = {
+                        let inner = target.shared.state.lock();
+                        let disk = Inode::read(&inner.ext4, target.disk_inode_index()).map_err(map_ext4_err)?;
+                        disk.blocks() > 0 && disk.size_in_bytes() > 0
+                    };
+                    if disk_has_data {
+                        let num_pages = file_size.div_ceil(PAGE_SIZE as u64);
+                        let mut tmp = vec![0u8; PAGE_SIZE];
+                        for p in 0..num_pages {
+                            if pages.get(p).is_some() {
+                                continue;
                             }
-                        }
-                        if tmp[..chunk].iter().any(|&b| b != 0) {
-                            quota_guard.try_reserve(1)?;
-                            let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
-                            cp.write_bytes(0, &tmp[..chunk]);
-                            faulted.push((p, cp));
+                            let page_off = p * PAGE_SIZE as u64;
+                            let chunk = (file_size - page_off).min(PAGE_SIZE as u64) as usize;
+                            tmp[..chunk].fill(0);
+                            {
+                                let inner = target.shared.state.lock();
+                                let disk = Inode::read(&inner.ext4, target.disk_inode_index()).map_err(map_ext4_err)?;
+                                let mut read_off = 0usize;
+                                while read_off < chunk {
+                                    let n = ext4_read_at(
+                                        &inner.ext4,
+                                        &disk,
+                                        &mut tmp[read_off..chunk],
+                                        page_off + read_off as u64,
+                                    )
+                                    .map_err(map_ext4_err)?;
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    read_off += n;
+                                }
+                            }
+                            if tmp[..chunk].iter().any(|&b| b != 0) {
+                                quota_guard.try_reserve(1)?;
+                                let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
+                                cp.write_bytes(0, &tmp[..chunk]);
+                                faulted.push((p, cp));
+                            }
                         }
                     }
                 }
@@ -768,8 +787,8 @@ impl VfsInode for Ext4Inode {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
-        let _meta = self.meta.lock();
-        if self.is_detached() {
+        let meta = self.meta.lock();
+        if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
         let dname = entry_name(name)?;
@@ -792,7 +811,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
-        if self.is_detached() {
+        if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
         let dname = entry_name(name)?;
@@ -821,6 +840,7 @@ impl VfsInode for Ext4Inode {
         let child = inner.get_or_create_inode(child_disk, &self.shared);
         meta.mtime = now_ts;
         meta.ctime = now_ts;
+        meta.meta_dirty = true;
         Ok(child as Arc<dyn VfsInode>)
     }
 
@@ -835,7 +855,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
-        if self.is_detached() {
+        if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
         let dname = entry_name(name)?;
@@ -874,6 +894,7 @@ impl VfsInode for Ext4Inode {
         meta.nlink = meta.nlink.saturating_add(1);
         meta.mtime = now_ts;
         meta.ctime = now_ts;
+        meta.meta_dirty = true;
         Ok(child as Arc<dyn VfsInode>)
     }
 
@@ -890,8 +911,8 @@ impl VfsInode for Ext4Inode {
         let dname = entry_name(name)?;
 
         let (self_arc, child_arc) = {
-            let _self_meta = self.meta.lock();
-            if self.is_detached() {
+            let self_meta = self.meta.lock();
+            if self.is_detached() || self_meta.nlink == 0 {
                 return Err(VfsError::NoEnt);
             }
             let mut inner = self.shared.state.lock();
@@ -907,12 +928,15 @@ impl VfsInode for Ext4Inode {
         };
 
         let mut guards = lock_inodes_ordered(&[&self_arc, &child_arc]);
-        if self_arc.is_detached() {
+        if self_arc.is_detached() || find_guard_mut(&mut guards, &self_arc).nlink == 0 {
             return Err(VfsError::NoEnt);
         }
 
         let now_ts = duration_to_timespec(realtime_duration());
         let child_nlink = find_guard_mut(&mut guards, &child_arc).nlink;
+        if child_arc.is_detached() || child_nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
         if child_nlink <= 1 && child_arc.open_count() > 0 {
             let child_meta = find_guard_mut(&mut guards, &child_arc);
             Self::detach_while_open(&child_arc, child_meta)?;
@@ -933,10 +957,14 @@ impl VfsInode for Ext4Inode {
         if !child_arc.is_detached() {
             child_meta.nlink = child_meta.nlink.saturating_sub(1);
             child_meta.ctime = now_ts;
+            if child_meta.nlink > 0 {
+                child_meta.meta_dirty = true;
+            }
         }
         let self_meta = find_guard_mut(&mut guards, &self_arc);
         self_meta.mtime = now_ts;
         self_meta.ctime = now_ts;
+        self_meta.meta_dirty = true;
         Ok(())
     }
 
@@ -956,8 +984,8 @@ impl VfsInode for Ext4Inode {
         let dname = entry_name(name)?;
 
         let (self_arc, child_arc) = {
-            let _self_meta = self.meta.lock();
-            if self.is_detached() {
+            let self_meta = self.meta.lock();
+            if self.is_detached() || self_meta.nlink == 0 {
                 return Err(VfsError::NoEnt);
             }
             let mut inner = self.shared.state.lock();
@@ -976,7 +1004,11 @@ impl VfsInode for Ext4Inode {
         };
 
         let mut guards = lock_inodes_ordered(&[&self_arc, &child_arc]);
-        if self_arc.is_detached() {
+        if self_arc.is_detached()
+            || find_guard_mut(&mut guards, &self_arc).nlink == 0
+            || child_arc.is_detached()
+            || find_guard_mut(&mut guards, &child_arc).nlink == 0
+        {
             return Err(VfsError::NoEnt);
         }
 
@@ -1018,6 +1050,7 @@ impl VfsInode for Ext4Inode {
         self_meta.nlink = self_meta.nlink.saturating_sub(1);
         self_meta.mtime = now_ts;
         self_meta.ctime = now_ts;
+        self_meta.meta_dirty = true;
         Ok(())
     }
 
@@ -1044,8 +1077,8 @@ impl VfsInode for Ext4Inode {
         let target_ino = u32::try_from(target.ino()).map_err(|_| VfsError::NoEnt)?;
 
         let (self_arc, target_arc) = {
-            let _self_meta = self.meta.lock();
-            if self.is_detached() {
+            let self_meta = self.meta.lock();
+            if self.is_detached() || self_meta.nlink == 0 {
                 return Err(VfsError::NoEnt);
             }
             let mut inner = self.shared.state.lock();
@@ -1058,7 +1091,11 @@ impl VfsInode for Ext4Inode {
         };
 
         let mut guards = lock_inodes_ordered(&[&self_arc, &target_arc]);
-        if self_arc.is_detached() || target_arc.is_detached() {
+        if self_arc.is_detached()
+            || target_arc.is_detached()
+            || find_guard_mut(&mut guards, &self_arc).nlink == 0
+            || find_guard_mut(&mut guards, &target_arc).nlink == 0
+        {
             return Err(VfsError::NoEnt);
         }
 
@@ -1077,9 +1114,11 @@ impl VfsInode for Ext4Inode {
         let t_meta = find_guard_mut(&mut guards, &target_arc);
         t_meta.nlink = t_meta.nlink.saturating_add(1);
         t_meta.ctime = now_ts;
+        t_meta.meta_dirty = true;
         let p_meta = find_guard_mut(&mut guards, &self_arc);
         p_meta.mtime = now_ts;
         p_meta.ctime = now_ts;
+        p_meta.meta_dirty = true;
         Ok(())
     }
 
@@ -1100,7 +1139,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
-        if self.is_detached() {
+        if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
         let dname = entry_name(name)?;
@@ -1132,14 +1171,21 @@ impl VfsInode for Ext4Inode {
                     flags: InodeFlags::empty(),
                 })
                 .map_err(map_ext4_err)?;
-            ext4_write_at(&inner.ext4, &mut sym, target.as_bytes(), 0).map_err(map_ext4_err)?;
-            parent_dir.link(dname, &mut sym).map_err(map_ext4_err)?;
+            if let Err(e) = ext4_write_at(&inner.ext4, &mut sym, target.as_bytes(), 0) {
+                let _ = ext4_truncate(&inner.ext4, &mut sym, 0);
+                return Err(map_ext4_err(e));
+            }
+            if let Err(e) = parent_dir.link(dname, &mut sym) {
+                let _ = ext4_truncate(&inner.ext4, &mut sym, 0);
+                return Err(map_ext4_err(e));
+            }
             sym
         };
 
         let child = inner.get_or_create_inode(sym_disk, &self.shared);
         meta.mtime = now_ts;
         meta.ctime = now_ts;
+        meta.meta_dirty = true;
         Ok(child as Arc<dyn VfsInode>)
     }
 
@@ -1150,6 +1196,9 @@ impl VfsInode for Ext4Inode {
         let meta = self.meta.lock();
         if self.is_detached() {
             return Ok(meta.detached_symlink_target.clone());
+        }
+        if meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
         }
         let inner = self.shared.state.lock();
         let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
@@ -1254,7 +1303,11 @@ impl VfsInode for Ext4Inode {
             to_lock.push(nc);
         }
         let mut guards = lock_inodes_ordered(&to_lock);
-        if old_dir_arc.is_detached() || new_dir_arc.is_detached() {
+        if old_dir_arc.is_detached()
+            || new_dir_arc.is_detached()
+            || find_guard_mut(&mut guards, &old_dir_arc).nlink == 0
+            || find_guard_mut(&mut guards, &new_dir_arc).nlink == 0
+        {
             return Err(VfsError::NoEnt);
         }
 
@@ -1359,10 +1412,14 @@ impl VfsInode for Ext4Inode {
             }
             find_guard_mut(&mut guards, &old_dir_arc).mtime = now_ts;
             find_guard_mut(&mut guards, &old_dir_arc).ctime = now_ts;
+            find_guard_mut(&mut guards, &old_dir_arc).meta_dirty = true;
             find_guard_mut(&mut guards, &new_dir_arc).mtime = now_ts;
             find_guard_mut(&mut guards, &new_dir_arc).ctime = now_ts;
+            find_guard_mut(&mut guards, &new_dir_arc).meta_dirty = true;
             find_guard_mut(&mut guards, &old_child_arc).ctime = now_ts;
+            find_guard_mut(&mut guards, &old_child_arc).meta_dirty = true;
             find_guard_mut(&mut guards, new_child_arc).ctime = now_ts;
+            find_guard_mut(&mut guards, new_child_arc).meta_dirty = true;
             return Ok(());
         }
 
@@ -1413,6 +1470,9 @@ impl VfsInode for Ext4Inode {
                 let nc_meta = find_guard_mut(&mut guards, new_child_arc);
                 nc_meta.nlink = nc_meta.nlink.saturating_sub(1);
                 nc_meta.ctime = now_ts;
+                if nc_meta.nlink > 0 {
+                    nc_meta.meta_dirty = true;
+                }
             }
         }
 
@@ -1450,9 +1510,12 @@ impl VfsInode for Ext4Inode {
         }
         find_guard_mut(&mut guards, &old_dir_arc).mtime = now_ts;
         find_guard_mut(&mut guards, &old_dir_arc).ctime = now_ts;
+        find_guard_mut(&mut guards, &old_dir_arc).meta_dirty = true;
         find_guard_mut(&mut guards, &new_dir_arc).mtime = now_ts;
         find_guard_mut(&mut guards, &new_dir_arc).ctime = now_ts;
+        find_guard_mut(&mut guards, &new_dir_arc).meta_dirty = true;
         find_guard_mut(&mut guards, &old_child_arc).ctime = now_ts;
+        find_guard_mut(&mut guards, &old_child_arc).meta_dirty = true;
         Ok(())
     }
 
@@ -1460,9 +1523,12 @@ impl VfsInode for Ext4Inode {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
-        let _meta = self.meta.lock();
+        let meta = self.meta.lock();
         if self.is_detached() {
             return Ok(());
+        }
+        if meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
         }
         if max_entries == 0 {
             return Ok(());
@@ -1508,9 +1574,12 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::RoFs);
         }
         let mut meta = self.meta.lock();
+        let detached = self.is_detached();
+        if !detached && meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
         let mut pages = self.pages.lock();
         let old_size = meta.size;
-        let detached = self.is_detached();
 
         if new_size < old_size {
             pages.remove_from(new_size.div_ceil(PAGE_SIZE as u64));
@@ -1579,6 +1648,9 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::RoFs);
         }
         let mut meta = self.meta.lock();
+        if !self.is_detached() && meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
         let now_dur = realtime_duration();
         let now_ts = duration_to_timespec(now_dur);
         let perm = mode & 0o7777;
@@ -1600,6 +1672,9 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::RoFs);
         }
         let mut meta = self.meta.lock();
+        if !self.is_detached() && meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
         let now_dur = realtime_duration();
         let now_ts = duration_to_timespec(now_dur);
         let new_uid = uid.unwrap_or(meta.uid);
@@ -1623,6 +1698,9 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::RoFs);
         }
         let mut meta = self.meta.lock();
+        if !self.is_detached() && meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
         let now_ts = duration_to_timespec(realtime_duration());
         let new_atime = match atime {
             SetTime::Omit => meta.atime,
@@ -1663,12 +1741,15 @@ impl VfsInode for Ext4Inode {
         }
 
         let meta = self.meta.lock();
+        let detached = self.is_detached();
+        if !detached && meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
         if offset >= meta.size {
             return Ok(0);
         }
         let to_read = buf.len().min((meta.size - offset) as usize);
         let mut pages = self.pages.lock();
-        let detached = self.is_detached();
 
         let mut done = 0usize;
         while done < to_read {
@@ -1726,11 +1807,14 @@ impl VfsInode for Ext4Inode {
         }
 
         let mut meta = self.meta.lock();
+        let detached = self.is_detached();
+        if !detached && meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
         let mut pages = self.pages.lock();
         let old_size = meta.size;
-        let detached = self.is_detached();
 
-        let end_off = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
+        let _ = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
         if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
             let tail_page = old_size / PAGE_SIZE as u64;
             let tail_off = (old_size % PAGE_SIZE as u64) as usize;
@@ -1755,12 +1839,18 @@ impl VfsInode for Ext4Inode {
                     page.set_dirty();
                 }
             } else {
-                let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
+                let Some(raw) = CachePage::new_zeroed() else {
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(VfsError::NoMem);
+                };
+                let cp = Arc::new(raw);
                 let page_base = page_idx * PAGE_SIZE as u64;
                 if !detached && chunk < PAGE_SIZE && page_base < old_size {
                     let valid = (old_size - page_base).min(PAGE_SIZE as u64) as usize;
                     let mut tmp = vec![0u8; valid];
-                    {
+                    let read_res: Result<(), VfsError> = (|| {
                         let inner = self.shared.state.lock();
                         let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
                         let mut got = 0usize;
@@ -1772,6 +1862,13 @@ impl VfsInode for Ext4Inode {
                             }
                             got += n;
                         }
+                        Ok(())
+                    })();
+                    if let Err(err) = read_res {
+                        if done > 0 {
+                            break;
+                        }
+                        return Err(err);
                     }
                     cp.write_bytes(0, &tmp);
                 }
@@ -1779,21 +1876,27 @@ impl VfsInode for Ext4Inode {
                 if !detached {
                     cp.set_dirty();
                 }
-                pages.insert_new(page_idx, cp)?;
+                if let Err(err) = pages.insert_new(page_idx, cp) {
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(err);
+                }
             }
             done += chunk;
         }
 
+        let written_end = offset + done as u64;
         let now_ts = duration_to_timespec(realtime_duration());
-        if end_off > meta.size {
-            meta.size = end_off;
+        if written_end > meta.size {
+            meta.size = written_end;
         }
         meta.mtime = now_ts;
         meta.ctime = now_ts;
         if !detached {
             meta.meta_dirty = true;
         }
-        Ok(buf.len())
+        Ok(done)
     }
 
     fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError> {

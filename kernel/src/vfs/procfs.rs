@@ -41,8 +41,18 @@ const TAG_PID_FD_DIR: u64 = 3;
 const TAG_PID_MOUNTS: u64 = 4;
 const TAG_PID_FD_BASE: u64 = 0x1000;
 
-const fn pid_ino(pid: u32, tag: u64) -> u64 {
-    (1u64 << 32) | (pid as u64) << 16 | tag
+pub(crate) const fn pid_ino(pid: u32, tag: u64) -> u64 {
+    (1u64 << 48) | ((pid as u64) << 16) | tag
+}
+
+fn parse_canonical_u32(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        return None;
+    }
+    s.parse().ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,7 +401,7 @@ impl VfsInode for ProcfsInode {
                 "version" => Ok(self.spawn(ProcKind::Version) as Arc<dyn VfsInode>),
                 "self" => Ok(self.spawn(ProcKind::SelfLink) as Arc<dyn VfsInode>),
                 other => {
-                    let pid: u32 = other.parse().map_err(|_| VfsError::NoEnt)?;
+                    let pid: u32 = parse_canonical_u32(other).ok_or(VfsError::NoEnt)?;
                     if pid == 0 || !Self::pid_exists(pid) {
                         return Err(VfsError::NoEnt);
                     }
@@ -420,8 +430,9 @@ impl VfsInode for ProcfsInode {
                     "." => Ok(self.spawn(ProcKind::PidFdDir(pid)) as Arc<dyn VfsInode>),
                     ".." => Ok(self.spawn(ProcKind::PidDir(pid)) as Arc<dyn VfsInode>),
                     other => {
-                        let fd: i32 = other.parse().map_err(|_| VfsError::NoEnt)?;
-                        if fd < 0 || fd >= lumen_vfs::MAX_FDS as i32 {
+                        let fd_u32 = parse_canonical_u32(other).ok_or(VfsError::NoEnt)?;
+                        let fd = i32::try_from(fd_u32).map_err(|_| VfsError::NoEnt)?;
+                        if fd >= lumen_vfs::MAX_FDS as i32 {
                             return Err(VfsError::NoEnt);
                         }
                         if process::process_fd_target(pid, fd).is_none() {

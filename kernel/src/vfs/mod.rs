@@ -1499,7 +1499,8 @@ crate::ktest!(
         kassert_eq!(&check[..10], b"0123456789");
         kassert!(check[100..200].iter().all(|&b| b == 0));
 
-        // 2. Inline symlink <= 59B, 60B, and >= 60B block symlink + unlink inline symlink.
+        // 2. Inline symlink <= 59B, 60B, and >= 60B block symlink + unlink inline symlink
+        //    + hard-linked inline symlink unlink preserves surviving link.
         let target60 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
         kassert_eq!(target60.len(), 60);
         let _ = symlink_at(&tables, target60.as_bytes(), None, b"/sym60").map_err(|_| "sym60")?;
@@ -1507,6 +1508,17 @@ crate::ktest!(
         let _ = symlink_at(&tables, b"/tail.bin", None, b"/sym_short").map_err(|_| "sym_short")?;
         kassert_eq!(readlink_at(&tables, None, b"/sym_short").map_err(|_| "readlink sym_short")?, b"/tail.bin");
         unlink_at(&tables, None, b"/sym_short", false).map_err(|_| "unlink inline symlink")?;
+
+        let _ = symlink_at(&tables, b"/tail.bin", None, b"/sym_hl_1").map_err(|_| "sym_hl_1")?;
+        lumen_vfs::link_at(&tables, None, b"/sym_hl_1", None, b"/sym_hl_2", false, false)
+            .map_err(|_| "link inline symlink")?;
+        unlink_at(&tables, None, b"/sym_hl_1", false).map_err(|_| "unlink first inline symlink link")?;
+        kassert_eq!(
+            readlink_at(&tables, None, b"/sym_hl_2").map_err(|_| "readlink surviving inline symlink")?,
+            b"/tail.bin"
+        );
+        unlink_at(&tables, None, b"/sym_hl_2", false).map_err(|_| "unlink second inline symlink link")?;
+        kassert!(matches!(readlink_at(&tables, None, b"/sym_hl_2"), Err(VfsError::NoEnt)));
 
         // 3. Gate 6 open-unlinked contract on ext4 file & directory.
         let g = OpenGuard::new(Arc::clone(&f));
@@ -1585,6 +1597,22 @@ crate::ktest!(
         let ro_fs = ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 11), true).map_err(|_| "ro mount")?;
         kassert!(ro_fs.read_only());
 
+        // Stale unlinked inode with open_count == 0 returns NoEnt (not freed disk reuse).
+        let dead_dir = mkdir_at(&tables, None, b"/dead_dir", 0o755, 0).map_err(|_| "mkdir dead_dir")?;
+        unlink_at(&tables, None, b"/dead_dir", true).map_err(|_| "rmdir dead_dir")?;
+        kassert!(matches!(dead_dir.create("child", 0o644), Err(VfsError::NoEnt)));
+        kassert!(matches!(dead_dir.lookup("child"), Err(VfsError::NoEnt)));
+        let mut dead_entries = Vec::new();
+        kassert!(matches!(dead_dir.readdir(0, &mut dead_entries, 16), Err(VfsError::NoEnt)));
+
+        // Malformed 64-bit superblock with desc_size != 64 returns Err(Inval) without panic.
+        let mut bad_img = build_minimal_ext4_image_blocks(64);
+        bad_img[1024 + 0xfe..1024 + 0x100].copy_from_slice(&32u16.to_le_bytes());
+        let bad_dev = MemBlkDev::new(bad_img, true);
+        let bad_bcache: Arc<dyn ext4::BlockCacheBackend> =
+            Arc::new(SleepMutex::new(BlockCache::new(bad_dev, 16).map_err(|_| "bad bcache")?));
+        kassert!(matches!(ext4::Ext4FileSystem::mount(bad_bcache, DevId::makedev(0, 12), true), Err(VfsError::Inval)));
+
         Ok(())
     }
 );
@@ -1656,9 +1684,81 @@ crate::ktest!(
         kassert_eq!(got, buf);
         drop(f);
 
+        // Regression: write_at -> reclaim_ext4_to_target(0) (no sync) -> OpenGuard + unlink_at -> read_at.
+        let (victim, _) = open_inode(
+            &TABLES,
+            None,
+            b"/tmp/reclaim_mnt/victim.bin",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|_| "create victim.bin")?;
+        let victim_payload = vec![0x5Au8; 2 * 4096];
+        kassert_eq!(victim.write_at(0, &victim_payload).map_err(|_| "write victim")?, victim_payload.len());
+        page_cache::reclaim_ext4_to_target(0);
+        kassert_eq!(page_cache::ext4_cached_pages(), 0);
+
+        let guard = OpenGuard::new(Arc::clone(&victim));
+        unlink_at(&TABLES, None, b"/tmp/reclaim_mnt/victim.bin", false).map_err(|_| "unlink victim")?;
+        kassert!(victim.is_detached());
+        let got_victim = read_all_inode(&victim).map_err(|_| "read detached victim")?;
+        kassert_eq!(got_victim, victim_payload);
+        drop(guard);
+        drop(victim);
+
         let _ = TABLES.umount(mp_dev, mp_ino).map_err(|_| "umount")?;
         EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != dev);
         unlink_at(&TABLES, None, b"/tmp/reclaim_mnt", true).map_err(|_| "rmdir mnt")?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn vfs_iteration1_regressions_tmpfs_maps_and_procfs() {
+        use crate::{kassert, kassert_eq};
+
+        // 1. tmpfs multi-page -ENOSPC short-write + truncate extend does not leak unwritten data.
+        let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 120), page_cache::PAGE_SIZE);
+        let root = tfs.root_inode();
+        let f = root.create("short.bin", 0o644).map_err(|_| "tmpfs create short.bin")?;
+        let two_pages = vec![0xA5u8; 2 * page_cache::PAGE_SIZE];
+        kassert_eq!(f.write_at(0, &two_pages).map_err(|_| "short write")?, page_cache::PAGE_SIZE);
+        kassert_eq!(f.stat().map_err(|_| "stat short")?.size, page_cache::PAGE_SIZE as u64);
+        kassert!(matches!(f.write_at(page_cache::PAGE_SIZE as u64, &[0xBBu8; 64]), Err(VfsError::NoSpc)));
+
+        // Free quota by truncating to 0, then extend past 2 pages: must read all zeroes.
+        f.truncate(0).map_err(|_| "truncate 0")?;
+        f.truncate((2 * page_cache::PAGE_SIZE) as u64).map_err(|_| "truncate extend")?;
+        let extended = read_all_inode(&f).map_err(|_| "read extended")?;
+        kassert_eq!(extended.len(), 2 * page_cache::PAGE_SIZE);
+        kassert!(extended.iter().all(|&b| b == 0));
+
+        // 2. tmpfs rmdir (open_count == 0) blocks subsequent create/mkdir/symlink with NoEnt.
+        let d = root.mkdir("gone_dir", 0o755).map_err(|_| "mkdir gone_dir")?;
+        kassert_eq!(d.open_count(), 0);
+        root.rmdir("gone_dir").map_err(|_| "rmdir gone_dir")?;
+        kassert!(matches!(d.create("f", 0o644), Err(VfsError::NoEnt)));
+        kassert!(matches!(d.mkdir("sub", 0o755), Err(VfsError::NoEnt)));
+        kassert!(matches!(d.symlink("sym", "/x"), Err(VfsError::NoEnt)));
+        kassert!(matches!(d.lookup("f"), Err(VfsError::NoEnt)));
+
+        // 3. AddressSpace::format_maps coalesced .bss + brk emits [heap] at brk_init.
+        let elf_img = crate::mm::user_vm::build_relro_test_elf();
+        let (space, prog) = crate::mm::user_vm::AddressSpace::from_elf(&elf_img, &[b"/t"], &[], b"/t", [0; 16])
+            .map_err(|_| "from_elf")?;
+        kassert_eq!(prog.initial_brk, 0x40_4000);
+        kassert_eq!(space.brk(0x40_5000), 0x40_5000);
+        let maps = space.format_maps();
+        kassert!(maps.contains("00402000-00404000 rw-p 00000000 00:00 0\n"));
+        kassert!(maps.contains("00404000-00405000 rw-p 00000000 00:00 0  [heap]\n"));
+        space.teardown();
+
+        // 4. procfs pid_ino bit-32 collision fix and canonical numeric parsing.
+        kassert_ne_u64(procfs::pid_ino(1, 0), procfs::pid_ino(65537, 0))?;
+        let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
+        kassert!(matches!(resolve_path(&TABLES, None, b"/proc/+1", rf), Err(VfsError::NoEnt)));
+        kassert!(matches!(resolve_path(&TABLES, None, b"/proc/01", rf), Err(VfsError::NoEnt)));
         Ok(())
     }
 );

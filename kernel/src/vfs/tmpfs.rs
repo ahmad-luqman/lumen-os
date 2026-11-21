@@ -310,7 +310,7 @@ impl VfsInode for TmpfsInode {
         }
         Self::validate_name(name)?;
         let meta = self.meta.lock();
-        if self.is_detached() {
+        if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
         if name == "." {
@@ -332,7 +332,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
-        if self.is_detached() {
+        if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
         if meta.children.contains_key(name) {
@@ -356,7 +356,7 @@ impl VfsInode for TmpfsInode {
         }
         let self_arc = find_tmpfs_dir_arc(self, self.lock_id, self.ino()).ok_or(VfsError::NoEnt)?;
         let mut meta = self.meta.lock();
-        if self.is_detached() {
+        if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
         if meta.children.contains_key(name) {
@@ -383,7 +383,7 @@ impl VfsInode for TmpfsInode {
         let self_arc = find_tmpfs_dir_arc(self, self.lock_id, self.ino()).ok_or(VfsError::NoEnt)?;
         let child_arc = {
             let meta = self_arc.meta.lock();
-            if self_arc.is_detached() {
+            if self_arc.is_detached() || meta.nlink == 0 {
                 return Err(VfsError::NoEnt);
             }
             let c = meta.children.get(name).ok_or(VfsError::NoEnt)?;
@@ -397,7 +397,7 @@ impl VfsInode for TmpfsInode {
         let now = time::realtime_timespec();
         {
             let p_meta = tmpfs_guard_mut(&mut guards, &self_arc);
-            if self_arc.is_detached() || !p_meta.children.contains_key(name) {
+            if self_arc.is_detached() || p_meta.nlink == 0 || !p_meta.children.contains_key(name) {
                 return Err(VfsError::NoEnt);
             }
             p_meta.children.remove(name);
@@ -407,6 +407,7 @@ impl VfsInode for TmpfsInode {
         let c_meta = tmpfs_guard_mut(&mut guards, &child_arc);
         if c_meta.nlink <= 1 {
             Self::detach_if_open(&child_arc, c_meta);
+            c_meta.ctime = now;
         } else {
             c_meta.nlink -= 1;
             c_meta.ctime = now;
@@ -428,7 +429,7 @@ impl VfsInode for TmpfsInode {
         let self_arc = find_tmpfs_dir_arc(self, self.lock_id, self.ino()).ok_or(VfsError::NoEnt)?;
         let child_arc = {
             let meta = self_arc.meta.lock();
-            if self_arc.is_detached() {
+            if self_arc.is_detached() || meta.nlink == 0 {
                 return Err(VfsError::NoEnt);
             }
             let c = meta.children.get(name).ok_or(VfsError::NoEnt)?;
@@ -445,7 +446,7 @@ impl VfsInode for TmpfsInode {
         let now = time::realtime_timespec();
         {
             let p_meta = tmpfs_guard_mut(&mut guards, &self_arc);
-            if self_arc.is_detached() || !p_meta.children.contains_key(name) {
+            if self_arc.is_detached() || p_meta.nlink == 0 || !p_meta.children.contains_key(name) {
                 return Err(VfsError::NoEnt);
             }
             p_meta.children.remove(name);
@@ -455,6 +456,7 @@ impl VfsInode for TmpfsInode {
         }
         let c_meta = tmpfs_guard_mut(&mut guards, &child_arc);
         Self::detach_if_open(&child_arc, c_meta);
+        c_meta.ctime = now;
         Ok(())
     }
 
@@ -479,7 +481,11 @@ impl VfsInode for TmpfsInode {
         // Locate target `Arc<TmpfsInode>` from root tree.
         let target_arc = find_tmpfs_non_dir(&self_arc, target.lock_id()).ok_or(VfsError::NoEnt)?;
         let mut guards = lock_tmpfs_ordered(&[&self_arc, &target_arc]);
-        if self_arc.is_detached() || target_arc.is_detached() {
+        if self_arc.is_detached()
+            || target_arc.is_detached()
+            || tmpfs_guard_mut(&mut guards, &self_arc).nlink == 0
+            || tmpfs_guard_mut(&mut guards, &target_arc).nlink == 0
+        {
             return Err(VfsError::NoEnt);
         }
         let now = time::realtime_timespec();
@@ -513,7 +519,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
-        if self.is_detached() {
+        if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
         if meta.children.contains_key(name) {
@@ -563,7 +569,11 @@ impl VfsInode for TmpfsInode {
 
         let (old_child_arc, new_child_opt) = {
             let mut dir_guards = lock_tmpfs_ordered(&[&old_dir_arc, &new_dir_arc]);
-            if old_dir_arc.is_detached() || new_dir_arc.is_detached() {
+            if old_dir_arc.is_detached()
+                || new_dir_arc.is_detached()
+                || tmpfs_guard_mut(&mut dir_guards, &old_dir_arc).nlink == 0
+                || tmpfs_guard_mut(&mut dir_guards, &new_dir_arc).nlink == 0
+            {
                 return Err(VfsError::NoEnt);
             }
             let old_c = tmpfs_guard_mut(&mut dir_guards, &old_dir_arc)
@@ -590,7 +600,11 @@ impl VfsInode for TmpfsInode {
             to_lock.push(nc);
         }
         let mut guards = lock_tmpfs_ordered(&to_lock);
-        if old_dir_arc.is_detached() || new_dir_arc.is_detached() {
+        if old_dir_arc.is_detached()
+            || new_dir_arc.is_detached()
+            || tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink == 0
+            || tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink == 0
+        {
             return Err(VfsError::NoEnt);
         }
 
@@ -684,7 +698,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::NotDir);
         }
         let meta = self.meta.lock();
-        if self.is_detached() || max_entries == 0 {
+        if self.is_detached() || meta.nlink == 0 || max_entries == 0 {
             return Ok(());
         }
         let parent_ino = meta.parent.as_ref().and_then(Weak::upgrade).map_or(self.ino(), |p| p.ino());
@@ -819,7 +833,7 @@ impl VfsInode for TmpfsInode {
         let mut meta = self.meta.lock();
         let mut pages = self.pages.lock();
         let old_size = meta.size;
-        let end_off = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
+        let _ = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
         if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
             let tail_page = old_size / PAGE_SIZE as u64;
             let tail_off = (old_size % PAGE_SIZE as u64) as usize;
@@ -836,19 +850,31 @@ impl VfsInode for TmpfsInode {
             if let Some(page) = pages.get(page_idx) {
                 page.write_bytes(in_page, &buf[done..done + chunk]);
             } else {
-                let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
+                let Some(raw) = CachePage::new_zeroed() else {
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(VfsError::NoMem);
+                };
+                let cp = Arc::new(raw);
                 cp.write_bytes(in_page, &buf[done..done + chunk]);
-                pages.insert_new(page_idx, cp)?;
+                if let Err(err) = pages.insert_new(page_idx, cp) {
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(err);
+                }
             }
             done += chunk;
         }
+        let written_end = offset + done as u64;
         let now = time::realtime_timespec();
-        if end_off > meta.size {
-            meta.size = end_off;
+        if written_end > meta.size {
+            meta.size = written_end;
         }
         meta.mtime = now;
         meta.ctime = now;
-        Ok(buf.len())
+        Ok(done)
     }
 
     fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError> {
