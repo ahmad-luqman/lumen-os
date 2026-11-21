@@ -28,10 +28,22 @@ KERNEL_SRCS := $(shell find kernel crates apps -name '*.rs' -o -name '*.toml' -o
 help: ## Show this help
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  make %-15s %s\n", $$1, $$2}'
 
-deps: $(BUILD)/deps/limine/.version ## Download pinned Limine + OVMF (checksummed)
+deps: $(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version $(BUILD)/deps/busybox/.version ## Download pinned Limine + OVMF + Alpine busybox (checksummed)
 
-$(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version: tools/fetch-deps.sh
+$(BUILD)/deps/limine/.version $(BUILD)/deps/ovmf/.version $(BUILD)/deps/busybox/.version: tools/fetch-deps.sh
 	tools/fetch-deps.sh
+
+# Static musl x86-64 hello binary (M6, #238): cross-compiled with rustc + rust-lld
+# from the pinned rustup sysroot (zero external C compiler required).
+$(BUILD)/linux/hello: tools/linux-hello/hello.rs rust-toolchain.toml
+	@mkdir -p $(BUILD)/linux
+	SYSROOT=$$(rustc --print sysroot) && HOST=$$(rustc --print host-tuple) && \
+	rustc --edition 2024 -O --target x86_64-unknown-linux-musl \
+		-C linker="$$SYSROOT/lib/rustlib/$$HOST/bin/rust-lld" \
+		-C linker-flavor=ld.lld \
+		-C target-feature=+crt-static \
+		-C strip=symbols \
+		$< -o $@
 
 # Two kernels: the normal one (the shells) and the in-kernel test build.
 # `| apps`: built first (order-only: the kernel rebuilds when cargo says).
@@ -43,7 +55,7 @@ $(BUILD)/lumen-kernel-ktest: $(KERNEL_SRCS) | apps
 	$(CARGO_KERNEL) --features ktest
 	@mkdir -p $(BUILD) && cp $(KERNEL_OUT) $@
 
-build: apps $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps and both kernels
+build: apps $(BUILD)/linux/hello $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps, static musl hello, and both kernels
 
 # Apps (M5; the layout: ARCHITECTURE section 8, "Building and bundling"):
 # apps/ is its own workspace, and its crates that build a `cdylib` are WASM
@@ -77,7 +89,7 @@ apps: ## Build the WASM apps into build/apps/ (the test apps into build/apps/tes
 #   lumen.iso           interactive (`make run`)
 #   lumen-qemutest.iso  normal kernel, may exit QEMU (crash -> exit 37)
 #   lumen-ktest.iso     in-kernel test runner
-ISO_DEPS := tools/mkiso.sh boot/limine.conf $(BUILD)/deps/limine/.version
+ISO_DEPS := tools/mkiso.sh boot/limine.conf $(BUILD)/deps/limine/.version $(BUILD)/deps/busybox/.version $(BUILD)/linux/hello
 $(BUILD)/lumen.iso: $(BUILD)/lumen-kernel $(ISO_DEPS)
 	tools/mkiso.sh $< $@ $(CMDLINE)
 $(BUILD)/lumen-desktop.iso: $(BUILD)/lumen-kernel $(ISO_DEPS)
@@ -140,11 +152,13 @@ lint: ## clippy on host crates (incl. their tests), the kernel and the apps; ruf
 fmt: ## Format Rust and Python
 	cargo fmt --all
 	cd apps && cargo fmt --all
+	rustfmt --edition 2024 tools/linux-hello/hello.rs
 	uv run --frozen ruff format tools tests
 
 fmt-check: ## Check formatting
 	cargo fmt --all -- --check
 	cd apps && cargo fmt --all -- --check
+	rustfmt --edition 2024 --check tools/linux-hello/hello.rs
 	uv run --frozen ruff format --check tools tests
 
 status: ## Regenerate docs/STATUS.md from the last test results

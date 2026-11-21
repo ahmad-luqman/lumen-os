@@ -178,8 +178,16 @@ fn queue_waiting() -> usize {
 }
 
 /// Whether a byte waits for [`read_byte`], in the queue or the UART.
-fn available() -> bool {
+/// Caller must hold interrupts off on the boot CPU so IRQ 4 cannot drain
+/// between checking the queue and reading LSR.
+fn available_locked() -> bool {
     arch::serial::available(!QUEUE.is_empty())
+}
+
+/// Whether a byte waits for [`read_byte`], in the queue or the UART.
+pub fn available() -> bool {
+    let _off = arch::irq::push_off();
+    available_locked()
 }
 
 /// The next received byte, if one is waiting: the queue's, else the UART's
@@ -196,12 +204,37 @@ pub fn read_byte() -> Option<u8> {
 /// block for good, or yield once. The serial shell's only, on the boot
 /// CPU.
 pub fn wait() {
+    wait_until(None);
+}
+
+/// Wait for a received byte up to an optional monotonic `deadline` (ns).
+///
+/// When `deadline` is `None`, preserves the serial shell's full safety-net
+/// accounting and missed-interrupt warning (`wait_with_deadline`). When
+/// `deadline` is `Some(dl)`, caps the wait to `dl` (without an extra grace
+/// period past `dl`, and sleeping until `dl` rather than forever when no UART
+/// is present) so Linux `poll(2)` timeouts remain accurate.
+pub fn wait_until(deadline: Option<u64>) {
     debug_assert!(arch::cpu_index() == 0, "the serial shell waits on the boot CPU");
     let present = arch::serial::present();
     let by_interrupt = BY_INTERRUPT.load(Ordering::Acquire);
     match lumen_uart::wait_mode(present, by_interrupt, crate::sched::can_block_now()) {
-        WaitMode::Forever => WAITING.wait_until(|| false),
-        WaitMode::Deadline => wait_with_deadline(),
+        WaitMode::Forever => match deadline {
+            Some(dl) => {
+                let rem = dl.saturating_sub(crate::time::now_ns());
+                if rem > 0 {
+                    let _ = crate::sched::sleep(rem);
+                }
+            }
+            None => WAITING.wait_until(|| false),
+        },
+        WaitMode::Deadline => match deadline {
+            Some(dl) => {
+                let cap = crate::time::now_ns().saturating_add(WAIT_NS);
+                let _ = WAITING.wait_until_or_deadline(dl.min(cap), available_locked);
+            }
+            None => wait_with_deadline(),
+        },
         WaitMode::Yield => crate::sched::yield_now(),
     }
 }
@@ -212,7 +245,7 @@ fn wait_with_deadline() {
     let woken_before = READER_WOKEN.load(Ordering::Relaxed);
     FIRST_INPUT_IRQ_NS.store(u64::MAX, Ordering::Relaxed);
     let deadline = crate::time::now_ns() + WAIT_NS;
-    let found = WAITING.wait_until_or_deadline(deadline, available);
+    let found = WAITING.wait_until_or_deadline(deadline, available_locked);
     let woken = || READER_WOKEN.load(Ordering::Relaxed) != woken_before;
     let past_deadline = crate::time::now_ns() >= deadline;
     if lumen_uart::another_period(found, woken(), !QUEUE.is_empty(), past_deadline) {

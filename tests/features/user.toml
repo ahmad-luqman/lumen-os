@@ -30,3 +30,13 @@ tests = [
     "scenario:test_linux_user::test_sse_and_tls_preserved_across_preemption",
     "audit:flags",
 ]
+
+[[feature]]
+name = "30-syscall Linux x86-64 ABI dispatcher, Limine boot-module loader (`linux` shell command), unmodified static `musl` `hello`, and unmodified Alpine static `musl` `busybox ash -s` built-ins with `-EFAULT` / `-ENOSYS` / `-EBADF` verification and zero frame leaks (#238)"
+milestone = "M6"
+tests = [
+    "scenario:test_linux_user::test_syscall_bad_pointers_return_efault",
+    "scenario:test_linux_user::test_static_musl_hello",
+    "scenario:test_linux_user::test_static_busybox_ash",
+    "audit:flags",
+]

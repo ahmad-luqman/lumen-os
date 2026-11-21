@@ -10,7 +10,7 @@ use limine::BaseRevision;
 use limine::memory_map::EntryType;
 use limine::request::{
     ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest, FramebufferRequest, HhdmRequest,
-    MemoryMapRequest, MpRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
+    MemoryMapRequest, ModuleRequest, MpRequest, RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
 };
 use lumen_time::handoff::{BeforeKmain, LimineTimes, Unknown};
 
@@ -66,6 +66,11 @@ pub static RSDP: RsdpRequest = RsdpRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 pub static MP: MpRequest = MpRequest::new();
+
+/// Boot modules loaded by Limine (static Linux ELF64 binaries in M6).
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MODULES: ModuleRequest = ModuleRequest::new();
 
 /// The TSC's frequency as Limine calibrated it: what its bootloader times
 /// are in.

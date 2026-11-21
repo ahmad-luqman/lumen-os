@@ -1,16 +1,23 @@
-"""Ring-3 entry/exit, syscall/sysretq, SWAPGS, IST_DEBUG (CVE-2018-8897), and
-non-fatal ring-3 exception handling (M6, issue #236)."""
+"""Linux x86-64 ring-3 ABI scenarios: entry/exit, syscall/sysretq, SWAPGS,
+IST_DEBUG (CVE-2018-8897), non-fatal ring-3 faults, per-process AddressSpace /
+demand paging / SSE+TLS preemption, 30-syscall table, static musl hello, and
+unmodified Alpine static musl busybox ash built-ins (M6, issues #236-#238)."""
 
 import re
 
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
-from lumen_harness.qemu import EXIT_SUCCESS
+from lumen_harness.qemu import EXIT_SUCCESS, Devices
 
 BOOT_TIMEOUT = 60
 
 
-def boot_shell(boot):
-    m = boot("qemutest")
+def boot_shell(boot, *, devices=None, cmdline=None):
+    kwargs = {}
+    if devices is not None:
+        kwargs["devices"] = devices
+    if cmdline is not None:
+        kwargs["cmdline"] = cmdline
+    m = boot("qemutest", **kwargs)
     m.expect(r"lumen> ", BOOT_TIMEOUT)
     return m
 
@@ -173,6 +180,80 @@ def test_sse_and_tls_preserved_across_preemption(boot):
     )
     m.expect(r"lumen> ", 10)
     assert int(line.group(1)) >= 6, f"expected >= 6 preemptive switches, got {line.group(0)}"
+
+    assert CRASH_BEGIN not in m.output
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_syscall_bad_pointers_return_efault(boot):
+    """Every pointer-taking M6 syscall rejects null, kernel-half, and unmapped
+    user pointers with -EFAULT without panicking; unknown syscalls return
+    -ENOSYS and closed-fd calls return -EBADF, with zero leaked frames."""
+    m = boot_shell(boot, devices=Devices(rng=True))
+
+    m.send_line("usertest bad_ptrs")
+    m.expect(r"usertest: bad_ptrs exit=0 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
+
+    assert CRASH_BEGIN not in m.output
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_static_musl_hello(boot):
+    """Unmodified static musl x86-64 ELF (`hello` loaded as a Limine boot
+    module) prints its greeting, exits 0, and leaks zero physical frames."""
+    m = boot_shell(boot, devices=Devices(rng=True))
+
+    m.send_line("linux")
+    m.expect(r"linux: \d+ boot module\(s\):", 10)
+    m.expect(r"  hello \(\d+ KiB\)\n", 10)
+    m.expect(r"  busybox \(\d+ KiB\)\n", 10)
+    m.expect(r"lumen> ", 10)
+
+    m.send_line("linux hello")
+    m.expect(r"hello from static musl on lumen\n", 20)
+    m.expect(r"linux: hello exit=0 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
+
+    assert CRASH_BEGIN not in m.output
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_static_busybox_ash(boot):
+    """Unmodified Alpine static musl `busybox ash -s` executes shell built-ins
+    (echo, pwd, export, arithmetic, for loop, exit 0) interactively over serial
+    and returns cleanly to the Lumen shell with zero leaked frames."""
+    m = boot_shell(boot, devices=Devices(rng=True))
+
+    m.send_line("linux busybox ash -s")
+    m.expect(r"~ # ", 20)
+
+    m.send_line("echo hello-from-ash")
+    m.expect(re.compile(r"^hello-from-ash$", re.MULTILINE), 20)
+    m.expect(r"~ # ", 15)
+
+    m.send_line("pwd")
+    m.expect(re.compile(r"^/$", re.MULTILINE), 15)
+    m.expect(r"~ # ", 15)
+
+    m.send_line("export FOO=bar; echo $FOO")
+    m.expect(re.compile(r"^bar$", re.MULTILINE), 15)
+    m.expect(r"~ # ", 15)
+
+    m.send_line("echo $((6 * 7))")
+    m.expect(re.compile(r"^42$", re.MULTILINE), 15)
+    m.expect(r"~ # ", 15)
+
+    m.send_line("for i in 1 2 3; do echo loop-$i; done")
+    m.expect(re.compile(r"^loop-1\nloop-2\nloop-3$", re.MULTILINE), 15)
+    m.expect(r"~ # ", 15)
+
+    m.send_line("exit 0")
+    m.expect(r"linux: busybox exit=0 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
 
     assert CRASH_BEGIN not in m.output
     m.send_line("exit")

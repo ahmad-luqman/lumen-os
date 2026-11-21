@@ -1068,10 +1068,13 @@ weakening crash reporting or `make audit`.
   `ap_main`, once on kernel tables and guarded stack), the kernel enables
   `IA32_EFER.SCE` (bit 0, keeping `NXE` bit 11), keeps `CR4.FSGSBASE = 0`, and
   sets:
-  - `IA32_STAR = (0x0010u64 << 48) | (0x0008u64 << 32)`: `syscall` loads
-    `CS = 0x08` (`KERNEL_CODE`) and `SS = 0x10` (`KERNEL_DATA`); 64-bit
-    `sysretq` loads `SS = (0x10 + 8) | 3 = 0x18 | 3` (`USER_DATA`) and
-    `CS = (0x10 + 16) | 3 = 0x20 | 3` (`USER_CODE`).
+  - `IA32_STAR = ((0x0010u64 | 3) << 48) | (0x0008u64 << 32)`
+    (`0x0013_0008_0000_0000`): `syscall` loads `CS = 0x08` (`KERNEL_CODE`) and
+    `SS = 0x10` (`KERNEL_DATA`); 64-bit `sysretq` loads
+    `SS = STAR[63:48] + 8 = 0x18 | 3` (`USER_DATA`) and
+    `CS = STAR[63:48] + 16 = 0x20 | 3` (`USER_CODE`). Encoding RPL=3 in
+    `STAR[49:48]` is required on AMD64 CPUs, where `sysretq` preserves
+    `STAR[49:48]` verbatim in `SS.sel` instead of forcing RPL=3.
   - `IA32_LSTAR = lumen_syscall_entry`.
   - `IA32_FMASK = 0x0005_7700` (`TF | IF | DF | IOPL | NT | RF | AC`): clears
     interrupts, direction flag, single-step trap, IOPL, nested task, resume
@@ -3159,6 +3162,11 @@ Lumen runs two kinds of user code:
 | 231 | `exit_group(status)` | terminates the process and frees its `AddressSpace` and FD table |
 | 302 | `prlimit64(pid, res, new, old)` | validates `pid == 0 \|\| pid == current_pid` (`-ESRCH` otherwise) and `res < RLIM_NLIMITS` (16, `-EINVAL` otherwise); M6 read-only defaults for `RLIMIT_STACK` (8 MiB), `RLIMIT_NOFILE` (1024), and `RLIM_INFINITY` for other valid resources when `old` is non-null; writable per-process limit enforcement arrives in M10 |
 | 318 | `getrandom(buf, len, flags)` | rejects unknown flag bits (`-EINVAL`), fills user buffer from `crate::rng` (section 7) via `copy_to_user`, and returns bytes written |
+
+In addition to the 30 table entries above, M6 includes console `poll(2)` (syscall 7)
+to satisfy Rust `std`'s `sanitize_standard_fds` startup check (`poll([0, 1, 2], 3, 0)`)
+and `busybox` `lineedit` stdin readiness waits; full pipe/socket/PTY `poll`/`ppoll`/`select`
+arrives in M8.
 
 Because `musl` on `x86_64` invokes legacy non-`*at` / non-`*2` syscalls
 directly (unlike `aarch64`), later milestones wire both the `*at` and legacy
