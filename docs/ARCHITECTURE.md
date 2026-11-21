@@ -4973,8 +4973,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
         allocated/non-hole pages into the inode's `PageCache` (aborting
         `unlink`/`rename` with `-ENOMEM` before touching `ext4` if faulting
         fails). (Empty directories have 0 pages to fault.)
-     2. Atomically remove `(dev_id, old_ino)` from `InodeCache` before backend
-        `unlink`/`rmdir`/`rename` and assign the live `VfsInode`'s `st_ino` a
+     2. Atomically remove `(dev_id, old_ino)` from `InodeCache` and, only
+        after the backend `unlink`/`rmdir`/`rename` has succeeded (an abort
+        leaves the inode untouched), assign the live `VfsInode`'s `st_ino` a
         synthetic non-colliding value (`(1u64 << 63) | detached_seq`; Lock 4
         ordering uses an **immutable** creation-time `lock_id: u64`, never the
         mutable `st_ino`, and `/proc/self/maps` reads `inode.ino()` dynamically)
@@ -5019,8 +5020,24 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
   - **Writable check:** `Superblock::read_only()` is `pub(crate)`; check both
     `IncompatibleFeatures::RECOVERY` and `ReadOnlyCompatibleFeatures`
     (`BTREE_DIR | GROUP_DESCRIPTOR_CHECKSUMS | QUOTA | PROJECT_QUOTAS |
-    BIG_ALLOC`, plus unknown bits via `from_bits_truncate`) alongside
-    `VIRTIO_BLK_F_RO` rather than calling a crate helper.
+    BIG_ALLOC | METADATA_CSUM | READONLY`, plus unknown bits via
+    `from_bits_truncate`) alongside `VIRTIO_BLK_F_RO` rather than calling a
+    crate helper. Any of them mounts the volume read-only: `METADATA_CSUM`
+    because the adapter's raw `BlockCache` writes (`..` updates, inline-symlink
+    zeroing) never recompute checksums, `READONLY` because the volume says so.
+    A forced read-only mount is logged with its reason.
+  - **Write errors part-way through a namespace operation:** `unlink`,
+    `rmdir`, `link` and `rename` (all three flavours) undo the disk changes
+    they already made when a later `ext4` write fails (re-linking entries,
+    restoring `links_count` and saved inline-symlink bytes) and return the
+    error. When an undo write itself fails, the adapter keeps in-memory
+    `links_count` bounds (`nlink_floors` / `nlink_ceilings`) so `stat` and
+    later operations see the true link count, and repairs the disk count the
+    next time an operation writes that inode; the bounds are not persisted,
+    so an undo that never lands leaves work for `e2fsck` after a reboot, and
+    each failed undo is logged at `error`. `create`, `mkdir` and `symlink`
+    release the inode they allocated when linking it fails (e.g. `ENOSPC`
+    growing the directory).
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
@@ -5117,7 +5134,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `/dev/zero` (`1:5`, `0o666`): `read` → zero bytes, `write` → `count`,
     `lseek` → 0, `mmap` → anonymous zeroed pages.
   - `/dev/random` (`1:8`, `0o666`) and `/dev/urandom` (`1:9`, `0o666`):
-    `read` → `crate::rng`, `write` → `count`, `lseek` → 0.
+    `read` → `crate::rng` (`-EAGAIN` while the pool is unseeded: neither
+    RDRAND nor virtio-rng has fed it, never a clock-seeded fallback),
+    `write` → `count`, `lseek` → 0.
   - `/dev/tty` (`5:0`, `0o666`) and `/dev/console` (`5:1`, `0o620`): route to
     the calling process's `ConsoleIo` (supporting `read`/`write`/`ioctl`
     `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`poll`; `/dev/ptmx` and `/dev/pts/*` join
@@ -5138,7 +5157,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `  {pathname}` only when named, omitting the trailing space on unnamed
     anonymous VMAs; `p` for private/anonymous, `s` for `MAP_SHARED`, `[heap]`,
     `[stack]`, or file/executable/interpreter path + `dev_major:dev_minor` +
-    `ino`), enabling `musl`'s `pthread_getattr_np` and runtime stack/mapping
+    `ino`; until file-backed `mmap` lands in #255, file-backed VMAs print
+    `00:00 0` with no path), enabling `musl`'s `pthread_getattr_np` and runtime stack/mapping
     discovery. Generated lock-order-safely by cloning `Arc<AddressSpace>` under
     `ACTIVE_PROCS`, releasing `ACTIVE_PROCS`, locking `AddressSpace::inner`
     (Lock 1) with no `VfsInode` lock held, formatting into a kernel buffer,
@@ -5155,14 +5175,24 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   `ext4` superblock at `/` (read-write, or read-only if `VIRTIO_BLK_F_RO` is
   set); if none is present (including all M0–M6 scenarios without a disk
   attached, or a blank scratch disk in `test_blk`), it mounts a `tmpfs` root at
-  `/` without warning so all prior scenarios remain green. `/tmp`, `/dev`, and
-  `/proc` are then mounted (creating their mountpoint directories on a `tmpfs`
-  root if absent).
+  `/` without warning (a `debug` line) so all prior scenarios remain green. A
+  disk whose superblock magic matches but which fails to mount (a read error,
+  an unsupported feature, corruption) is logged at `warn` before the fallback.
+  `/tmp`, `/dev`, and `/proc` are then mounted, creating their mountpoint
+  directories if absent on any writable root (a `tmpfs` root, or a read-write
+  `ext4` root, where they persist); a mount that fails is logged at `warn`.
 - **Shell commands:**
   - `blk`: lists bound block devices (PCI addr, capacity, read-only, flush
     support, `BlockCache` hit/miss/dirty stats).
-  - `mount`: lists active mounts (`fs_type`, target, options).
-  - `sync`: flushes all filesystems and block devices.
+  - `mount`: lists active mounts as records (target, fs, dev, mode `ro`/`rw`).
+  - `sync`: flushes all filesystems and block devices, continuing past a
+    failing inode or filesystem and reporting the first error (each failure
+    logged at `warn`).
+  - `vfstest <op> ...`: test-facing file operations over the VFS (`stat`,
+    `cat`/`read`, `ls`, `write`, `write-pattern`/`verify-pattern`,
+    `truncate`, `chmod`, `mkdir`, `rmdir`, `unlink`, `rename`, `symlink`,
+    `readlink`, `dev-tmp-proc`) that
+    the scenarios drive until the Linux syscalls are wired (#254).
   - `linux /path/to/bin [args...]`: when `args[0]` begins with `/`, loads the
     static or dynamic (`PT_INTERP`) ELF from VFS (resolving symlinks and
     recording `exe_path` for `/proc/self/exe` and `/proc/self/maps`) and runs
@@ -5187,6 +5217,8 @@ Every lock in the VM/storage/VFS stack obeys a strict acyclic total order:
  8. BlockDevice request lock (SleepMutex)
  9. Short-held VFS lookup tables (never held across locks 1–8 or I/O):
     MountTable -> DentryCache -> InodeCache
+    (the kernel's mounted-ext4 registry, `vfs::EXT4_FILESYSTEMS`, is held
+    the same way: cloned out and released before any lock 4-8)
 10. Leaf IRQ-off SpinLocks (ACTIVE_PROCS, VirtioHal::TABLE, frame, heap, sched)
 ```
 
