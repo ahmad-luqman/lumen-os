@@ -4900,13 +4900,19 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   `tmpfs` pages and `detached_unlinked` pages are never evicted until truncated
   or dropped on last close.
   Because `ext4` blocks are allocated only at writeback, M7 also keeps a hard
-  cap of twice the soft target (64 MiB): an `ext4` `write` that cannot reclaim
-  below it returns a short count or `-ENOSPC` instead of growing the cache
-  until the kernel runs out of frames, and a write or truncate past the
+  cap of twice the soft target (64 MiB): an `ext4` `write` that finds the cache
+  at the cap (reclaim, run once before the write takes its locks, couldn't get
+  below it, or this one write added more pages than the gap) returns a short
+  count or `-ENOSPC` instead of growing the cache until the kernel runs out of
+  frames, logged once per crossing; and a write or truncate past the
   volume's largest file size returns `-EFBIG`. `create`/`mkdir`/`symlink`
   return `-ENOSPC` while fewer than 8 blocks are free, so a new entry can
   always be linked (or its inode released) without the directory growing
-  into a full disk.
+  into a full disk; `mkdir` in a directory at ext4's link limit (65000) is
+  refused the same way before anything is allocated (`VfsError` has no
+  `EMLINK`). A write failing inside `ext4plus` between allocating a block and
+  recording it in the inode leaks that block (its free is crate-private):
+  `e2fsck` reclaims it.
 - **Truncate & extend interaction:**
   - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`):
     acquires `AddressSpace::inner` (Lock 1) before `VfsInode` (Lock 4), unmaps
@@ -4977,18 +4983,23 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
      `PageCache` fallback—before mutating `ext4`:
      1. For regular files, check a separate non-evictable detached-memory quota
         (sharing/mirroring `tmpfs`'s 32 MiB cap; never triggering `ext4`
-        `PageCache` reclaim while holding Lock 3/4) and fault existing
-        allocated/non-hole pages into the inode's `PageCache` (aborting
-        `unlink`/`rename` with `-ENOMEM` before touching `ext4` if faulting
-        fails). (Empty directories have 0 pages to fault.) The scan for
+        `PageCache` reclaim while holding Lock 3/4) and copy the on-disk
+        pages that aren't all zero into the inode's `PageCache` (aborting
+        `unlink`/`rename` before touching `ext4` with `-ENOSPC` when the
+        detached quota is used up, `-ENOMEM` when a frame can't be
+        allocated). (Empty directories have 0 pages to fault.) The scan for
         those pages reads the disk inode once, stops once the non-zero
         blocks found cover the inode's allocated blocks, and gives up with
-        `-ENOSPC` after 128 MiB of uncached range, so unlinking an open,
-        mostly sparse file whose data lies further out is refused rather
-        than stalling every namespace operation.
-     2. Atomically remove `(dev_id, old_ino)` from `InodeCache` and, only
-        after the backend `unlink`/`rmdir`/`rename` has succeeded (an abort
-        leaves the inode untouched), assign the live `VfsInode`'s `st_ino` a
+        `-ENOSPC` after 128 MiB of uncached range: unlinking an open file
+        whose allocated blocks aren't all covered by non-zero data within
+        that range (data lying further out in a sparse file, a long run of
+        zero-filled blocks, extent or indirect blocks counted in `i_blocks`)
+        is refused rather than stalling every namespace operation.
+     2. The VFS removes `(dev_id, old_ino)` from `InodeCache` before the
+        backend `unlink`/`rmdir`/`rename` (putting it back if that call
+        fails), and only after the backend call has succeeded (an abort
+        leaves the inode untouched) does the adapter assign the live
+        `VfsInode`'s `st_ino` a
         synthetic non-colliding value (`(1u64 << 63) | detached_seq`; Lock 4
         ordering uses an **immutable** creation-time `lock_id: u64`, never the
         mutable `st_ino`, and `/proc/self/maps` reads `inode.ino()` dynamically)
@@ -5033,24 +5044,37 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
   - **Writable check:** `Superblock::read_only()` is `pub(crate)`; check both
     `IncompatibleFeatures::RECOVERY` and `ReadOnlyCompatibleFeatures`
     (`BTREE_DIR | GROUP_DESCRIPTOR_CHECKSUMS | QUOTA | PROJECT_QUOTAS |
-    BIG_ALLOC | METADATA_CSUM | READONLY`, plus unknown bits via
-    `from_bits_truncate`) alongside `VIRTIO_BLK_F_RO` rather than calling a
-    crate helper. Any of them mounts the volume read-only: `METADATA_CSUM`
-    because the adapter's raw `BlockCache` writes (`..` updates, inline-symlink
-    zeroing) never recompute checksums, `READONLY` because the volume says so.
-    A forced read-only mount is logged with its reason.
-  - **Write errors part-way through a namespace operation:** `unlink`,
-    `rmdir`, `link` and `rename` (all three flavours) undo the disk changes
-    they already made when a later `ext4` write fails (re-linking entries,
+    BIG_ALLOC | METADATA_CSUM | READONLY | ORPHAN_PRESENT`, plus any bit past
+    `ORPHAN_PRESENT`, which `ext4plus` keeps with `from_bits_retain` and the
+    adapter masks) alongside `VIRTIO_BLK_F_RO` rather than calling a crate
+    helper. Any of them mounts the volume read-only: `METADATA_CSUM` because
+    the adapter's raw `BlockCache` writes (`..` updates, inline-symlink
+    zeroing, writing and restoring an inline target) never recompute
+    checksums, `READONLY` because the volume says so, `ORPHAN_PRESENT`
+    because `ext4plus` never processes the orphan file's entries. A forced
+    read-only mount is logged with its reason.
+  - **Write errors part-way through a namespace operation:** when a later
+    `ext4` write fails, `unlink`, `rmdir`, `link` and `rename` (all three
+    flavours) undo the disk changes they already made (re-linking entries,
     restoring `links_count` and saved inline-symlink bytes) and return the
-    error. When an undo write itself fails, the adapter keeps in-memory
-    `links_count` bounds (`nlink_floors` / `nlink_ceilings`) so `stat` and
-    later operations see the true link count, and repairs the disk count the
-    next time an operation writes that inode; the bounds are not persisted,
-    so an undo that never lands leaves work for `e2fsck` after a reboot, and
-    each failed undo is logged at `error`. `create`, `mkdir` and `symlink`
-    release the inode they allocated when linking it fails (e.g. `ENOSPC`
-    growing the directory).
+    error; once the entry change itself has landed (the name is gone on
+    disk), they finish the operation instead and return the later error.
+    When an undo write of a `links_count` fails, the adapter keeps in-memory
+    bounds (`nlink_floors` / `nlink_ceilings`) so `stat` and later
+    operations see the true link count, and the next namespace operation on
+    that inode writes the corrected count (writeback never writes
+    `links_count`); the bounds are not persisted, so an undo that never lands
+    leaves work for `e2fsck` after a reboot. Each kept bound is logged at
+    `error` (once per change, naming the inode and its disk count), and so
+    is a rename undo that leaves its entries inconsistent or unreadable
+    (judged once, from the entries' end state, not per attempt). `create`,
+    `mkdir` and `symlink` release the inode they allocated when linking it
+    fails (e.g. `ENOSPC` growing the directory).
+  - **Names that aren't UTF-8:** VFS names are `&str`, so `readdir` skips an
+    entry whose name isn't UTF-8 (logged once per directory); listing it
+    lossily would give a name that doesn't round-trip, and `getcwd`, which
+    rebuilds paths from `readdir` names, could resolve it to another
+    directory. Byte-string names are #268.
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
@@ -5189,8 +5213,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   set); if none is present (including all M0–M6 scenarios without a disk
   attached, or a blank scratch disk in `test_blk`), it mounts a `tmpfs` root at
   `/` without warning (a `debug` line) so all prior scenarios remain green. A
-  disk whose superblock magic matches but which fails to mount (a read error,
-  an unsupported feature, corruption) is logged at `warn` before the fallback.
+  disk whose superblock can't be read, or whose magic matches but which fails
+  to mount (an unsupported feature, corruption), is logged at `warn` before
+  the fallback.
   `/tmp`, `/dev`, and `/proc` are then mounted, creating their mountpoint
   directories if absent on any writable root (a `tmpfs` root, or a read-write
   `ext4` root, where they persist); a mount that fails is logged at `warn`.
@@ -5198,9 +5223,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `blk`: lists bound block devices (PCI addr, capacity, read-only, flush
     support, `BlockCache` hit/miss/dirty stats).
   - `mount`: lists active mounts as records (target, fs, dev, mode `ro`/`rw`).
-  - `sync`: flushes all filesystems and block devices, continuing past a
-    failing inode or filesystem and reporting the first error (each failure
-    logged at `warn`).
+  - `sync`: flushes every mounted filesystem (each flushing its own live
+    inodes, then its block cache), continuing past a failing inode or
+    filesystem and reporting the first error (each failure logged once at
+    `warn`, naming the inode or the block cache).
   - `vfstest <op> ...`: test-facing file operations over the VFS (`stat`,
     `cat`/`read`, `ls`, `write`, `write-pattern`/`verify-pattern`,
     `truncate`, `chmod`, `mkdir`, `rmdir`, `unlink`, `rename`, `symlink`,
@@ -5231,7 +5257,7 @@ Every lock in the VM/storage/VFS stack obeys a strict acyclic total order:
  9. Short-held VFS lookup tables (never held across locks 1–8 or I/O):
     MountTable -> DentryCache -> InodeCache
     (the kernel's mounted-ext4 registry, `vfs::EXT4_FILESYSTEMS`, is held
-    the same way: cloned out and released before any lock 4-8)
+    the same way: cloned out and released before any lock 1-8)
 10. Leaf IRQ-off SpinLocks (ACTIVE_PROCS, VirtioHal::TABLE, frame, heap, sched)
 ```
 

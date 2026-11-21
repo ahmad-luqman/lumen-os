@@ -335,20 +335,23 @@ one is its own PR that updates that doc first.
   `sound.rs`: the virtio-sound driver (its `sound` thread owns the device,
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
   `volume` and `sound`.
-  `vfs/` (M7, #253; ARCHITECTURE section 9): `mod.rs` the kernel's VFS
+  `vfs/` (M7, #253; ARCHITECTURE section 9): `vfs/mod.rs` the kernel's VFS
   tables (`KernelVfsTables`: mounts, dentries, inodes, lock 9), `init` (the
   first ext4 virtio-blk volume at `/`, else a tmpfs root; `/tmp`, `/dev`,
-  `/proc` over it), `sync_all`, and the `mount`, `sync` and `vfstest`
-  commands (`vfstest`: file operations for the scenarios until #254 wires
-  the syscalls); `page_cache.rs` the frame-backed `PageCache` shared by ext4
-  and tmpfs (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim,
-  `QuotaCounter`, the detached-inode quota); `ext4.rs` the writable adapter
-  over `ext4plus` and the `BlockCache` (writeback, Gate 6 open-unlinked
-  detach, `rmdir`/`rename`/inline-symlink workarounds, undoing a namespace
-  operation's disk changes after a write error); `tmpfs.rs`, `devfs.rs`
-  (`null`, `zero`, `random`, `urandom`, `tty`, `console`) and `procfs.rs`
-  (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`, `meminfo`, `mounts`,
-  `version`; `/proc/<pid>/maps` from `AddressSpace::format_maps`).
+  `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
+  and the `mount`, `sync` and `vfstest` commands (`vfstest`: file
+  operations for the scenarios until #254 wires the syscalls);
+  `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
+  (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
+  64 MiB hard cap, `QuotaCounter`, the detached-inode quota); `vfs/ext4.rs`
+  the writable adapter over `ext4plus` and the `BlockCache` (writeback,
+  Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
+  undoing a namespace operation's disk changes after a write error, the
+  link counts kept in memory when an undo fails); `vfs/tmpfs.rs`,
+  `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
+  and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
+  `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
+  `AddressSpace::format_maps`).
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested; the `life`
   command's and the Life app's, a path dependency of `apps/`, #202).
