@@ -80,8 +80,8 @@ adopts any crate proves it builds and passes `make audit`.
 | Devices | `virtio-drivers` (blk, net, gpu, input, console, rng, sound) | Linked in M3 (`pci_types` only if needed for M12) |
 | Graphics | `tiny-skia` (`no-std-float`), `embedded-graphics`, `fontdue`, `zune-png` | `fontdue` and `zune-png` linked in M4 |
 | Apps & data | `wasmi`, `serde`, `serde_json`, `postcard`, `hashbrown` | `wasmi`, `serde`, `postcard` linked in M5 |
-| Linux ABI & ELF | `linux-raw-sys` or `syscalls`, `xmas-elf` or `goblin` **(to verify)** | Exact x86-64 Linux syscall numbers/structs and ELF64/`PT_INTERP` parsing |
-| Filesystems | `ext4plus` (writable fork of `ext4-view`), `rust-fs-ext4`, or `lwext4` C FFI **(to verify)**; `ext4-view` (read-only, verified) | Need writable `ext4` for Alpine rootfs in M7; pick the cleanest stable `no_std` option in its own PR |
+| Linux ABI & ELF | `linux-raw-sys` (linked in M6, `=0.12.1`, MIT elected); `lumen-elf` (extended in M6/M7) | Exact x86-64 Linux syscall numbers/structs and ELF64/`PT_INTERP` parsing |
+| Filesystems | `ext4plus` (`Apache-2.0 OR MIT`), `another_ext4` (`MIT`), or `ext4_rs` (`MIT`) **(to verify)**; `lwext4` C FFI only as last resort | Pure-Rust `no_std + alloc` writable `ext4` for Alpine rootfs in M7; chosen and verified (incl. `make audit` and `e2fsck -fn`) in its own PR |
 | Network | `smoltcp` (verified), optionally `aster-bigtcp` (MPL-2.0) **(to verify)** | BSD sockets + loopback + IPv6 in M9; TLS moves to userspace OpenSSL/rustls |
 | Memory alloc | `buddy_system_allocator` or `talc` **(to verify)** | Optional upgrade if heavy `fork`/`mmap` workloads stress the M1 allocator |
 | Conformance suites | gVisor syscall tests, `musl` `libc-test`, LTP (host-built Linux binaries on test disk) | Driven from `tests/scenarios/` starting in M6 |
@@ -231,17 +231,18 @@ M8 adds SMP migration and cross-CPU TLB shootdowns.
 ## M7: Writable ext4, POSIX VFS and dynamic linking
 
 Boot an unmodified, pinned **Alpine Linux `x86_64` (`musl`) `ext4` rootfs**
-(pre-baked deterministically on the host in `build/deps/`, never committed to
-the MIT repo and never fetched live in CI) and execute dynamically linked
-binaries via `/lib/ld-musl-x86_64.so.1`.
+(assembled deterministically and rootlessly on the host via `mke2fs -t ext4 -d`
+in `build/deps/`, never committed to the MIT repo and never fetched live in CI)
+and execute dynamically linked binaries via `/lib/ld-musl-x86_64.so.1`. Designed
+in #246 (ARCHITECTURE sections 5, 7, 8, 9, and 15).
 
 | Feature | Exit criteria (tests) |
 |---|---|
-| `virtio-blk` behind `BlockDevice` + unified block/page cache | `cargo:lumen-bcache` (eviction, dirty writeback, ordering), `scenario:test_blk::test_read_write_sectors` |
-| Writable `ext4` driver (`ext4plus`, `rust-fs-ext4`, or `lwext4` FFI; crate chosen and verified in its own PR) | `scenario:test_fs::test_ext4_read_write_persists_across_reboot` (write, `fsync`/`sync`, kill QEMU, reboot on the same disk image, verify) |
-| POSIX VFS + mount table (design adapted from `Starry`/`axfs_vfs`): dentry/inode caches, symlinks (`symlink`/`readlink`/`lstat` with `ELOOP`), hard links and unlink-while-open, both `*at` and legacy x86-64 syscalls `musl` calls (`open`, `access`, `stat`, `lstat`, `newfstatat`, `statx`, `pread64`/`pwrite64`, `getdents64`, `fsync`/`fdatasync`/`sync`, `rename`/`renameat2`, `mkdir`/`rmdir`, `link`/`unlink`, `truncate`/`ftruncate`, `chmod`/`chown`/`umask`, `utimensat`, `chdir`/`getcwd`, `fcntl`, `flock`/`F_SETLK`) | `cargo:lumen-vfs` (path resolution, symlink loops, mount crossings, open-unlinked inodes), `scenario:test_fs::test_posix_vfs_semantics`, `scenario:test_fs::test_flock_and_atomic_rename` |
-| Virtual filesystems: `/tmp` (`tmpfs`), `/dev` (`null`, `zero`, `urandom`, `random`, `tty`), `/proc` (`self/exe`, `self/fd`, `self/maps` in strict Linux format, `cpuinfo`, `meminfo`) | `scenario:test_fs::test_dev_tmp_proc_filesystems` |
-| Dynamic ELF loader (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`, `AT_BASE`/`AT_ENTRY`) and file-backed `mmap` (`MAP_PRIVATE` CoW and `MAP_SHARED`) | `scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen` (loads a shared `.so` via `dlopen`/`dlsym`), `scenario:test_alpine::test_alpine_minirootfs_coreutils` (direct invocation of unmodified Alpine `busybox` `ls`, `cp`, `mv`, `grep`, `sed`, `awk`, uncompressed `tar -cf/-xf`, and built-ins-only `ash -s`; multi-command `ash` scripts/pipelines come in M8) |
+| `virtio-blk` behind `BlockDevice` (bounded MSI-X `Doorbell` waits for read, write, and `VIRTIO_BLK_T_FLUSH`) + block cache (`lumen-bcache`) | `cargo:lumen-bcache` (LRU eviction, pinning, dirty writeback, flush ordering, read-only guard, I/O error recovery), `scenario:test_blk::test_read_write_sectors` |
+| Writable `ext4` driver (pure-Rust `no_std + alloc` crate—`ext4plus`, `another_ext4`, or `ext4_rs`—chosen, pinned, and audited in its own PR) | `audit:flags` with the crate linked, `scenario:test_fs::test_ext4_read_write_persists_across_reboot` (write, `fsync`/`sync`, kill QEMU, verify `e2fsck -fn` on host, reboot on the same disk image, verify) |
+| POSIX VFS + mount table (`lumen-vfs`, design adapted from `Starry`/`axfs_vfs`) + unified `PageCache`: dentry/inode caches, symlinks (`symlink`/`readlink`/`lstat` with `MAX_SYMLINK_DEPTH = 40` / `ELOOP`), hard links and unlink-while-open, both `*at` and legacy x86-64 syscalls `musl` calls (`open`/`openat`, `access`/`faccessat`/`faccessat2`, `stat`/`lstat`/`newfstatat`/`statx`, `lseek`, `pread64`/`pwrite64`, `getdents64`, `fsync`/`fdatasync`/`sync`, `msync`, `rename`/`renameat`/`renameat2`, `mkdir`/`mkdirat`/`rmdir`, `link`/`linkat`/`unlink`/`unlinkat`, `truncate`/`ftruncate`, `chmod`/`fchmod`/`fchmodat`/`chown`/`fchown`/`lchown`/`fchownat`/`umask`, `utimensat`, `chdir`/`fchdir`/`getcwd`, `fcntl`, `flock`/`F_SETLK`) | `cargo:lumen-vfs` (path resolution, symlink loops, trailing slash rules, mount crossings/`-EXDEV`, open-unlinked inodes, `flock` vs POSIX record locks), `scenario:test_fs::test_posix_vfs_semantics`, `scenario:test_fs::test_flock_and_atomic_rename` |
+| Virtual filesystems: `/tmp` (`tmpfs` with quota & `PageCache` `mmap`), `/dev` (`null`, `zero`, `urandom`, `random`, `tty`, `console`), `/proc` (`self`, `self/exe`, `self/fd`, `self/maps` in strict Linux format, `cpuinfo`, `meminfo`, `mounts`, `version`) | `scenario:test_fs::test_dev_tmp_proc_filesystems` |
+| Dynamic ELF64 loader (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`, `AT_BASE`/`AT_ENTRY`, `INTERP_BASE`) and file-backed `mmap` (`MAP_PRIVATE` CoW and `MAP_SHARED` coherent with `read`/`write` via `PTE_SHARED` + `PageCache`) | `cargo:lumen-vm` (file-backed VMA offset splitting & contiguous merging), `cargo:lumen-elf` (`PT_INTERP`, nested-interp rejection, dynamic `auxv`), `scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen` (loads a shared `.so` via `dlopen`/`dlsym`, verifies `MAP_SHARED`/`MAP_PRIVATE` CoW and `SIGBUS` past EOF), `scenario:test_alpine::test_alpine_minirootfs_coreutils` (direct invocation of unmodified Alpine `busybox` `ls`, `cp`, `mv`, `grep`, `sed`, `awk`, uncompressed `tar -cf/-xf`, and built-ins-only `ash -s`; multi-command `ash` scripts/pipelines come in M8) |
 
 ## M8: Processes, threads, TLB shootdowns, signals, `futex` and PTYs
 

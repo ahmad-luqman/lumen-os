@@ -639,10 +639,10 @@ read, then the page and its rights, or the level that is not present. It
 takes no locks; a table outside HHDM-mapped RAM ends the walk instead of
 being read, and if the walk itself faults the report still ends properly.
 
-### Per-process address spaces and user VM (designed in #230, built in M6; CoW and shootdowns in M8)
+### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, M7; CoW `fork` and shootdowns in M8)
 
 Each user process owns an `AddressSpace` protected by a **sleeping,
-interrupt-enabled `Mutex`/`RwLock`** (not an IRQ-off `SpinLock`—needed both for
+interrupt-enabled `SleepMutex`** (not an IRQ-off `SpinLock`—needed both for
 M7 blocking file-backed `#PF` I/O and to prevent M8 `TLB_SHOOTDOWN` IPI
 deadlocks, below). It holds a dedicated 4-level page-table root (L4 frame,
 loaded into `CR3` when switching to one of its threads) and a VMA interval tree
@@ -666,26 +666,42 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   - `USER_MIN = 0x0000_0000_0001_0000` (64 KiB null guard below).
   - `USER_MAX = 0x0000_7fff_ffff_f000` (top 4 KiB canonical user page unmapped
     so no valid user slice can wrap past the canonical boundary).
-  - Static ELF `PT_LOAD` segments map at their `p_vaddr`; PIE binaries (and
-    M7's dynamic linker `ld-musl`) map at `PIE_BASE = 0x0000_5555_5555_4000`
-    and `INTERP_BASE = 0x0000_7f00_0000_0000` (or top-down from `MMAP_TOP`).
-  - `brk` starts page-aligned immediately above the highest loaded ELF segment
-    and tracks a byte-granular cursor upward up to the next VMA (capped away
-    from `mmap`).
-  - Anonymous (M6) and file-backed (M7) `mmap` regions allocate top-down from
+  - Static ELF `PT_LOAD` segments map at their `p_vaddr`; PIE binaries map at
+    `PIE_BASE = 0x0000_5555_5555_4000`, and M7's dynamic linker (`ld-musl`)
+    maps upward from `INTERP_BASE = 0x0000_7f00_0000_0000` (strictly above
+    `MMAP_TOP` and below `USER_STACK_BOTTOM`).
+  - `brk` starts page-aligned immediately above the highest loaded main-binary
+    ELF segment and tracks a byte-granular cursor upward up to the next VMA
+    (capped away from `mmap`).
+  - Anonymous (M6) and file-backed (M7) `mmap` regions allocate top-down below
     `MMAP_TOP = 0x0000_7f00_0000_0000`.
   - Initial user stack top: `USER_STACK_TOP = 0x0000_7fff_f000_0000`, with an
-    8 MiB demand-paged VMA and an unmapped guard page below it.
+    8 MiB demand-paged VMA (`USER_STACK_BOTTOM = 0x0000_7fff_ef80_0000`) and an
+    unmapped guard page below it.
 - **VMA interval tree (`crates/lumen-vm`, host-tested):** tracks non-overlapping
   page-aligned virtual ranges (`start..end`), protection flags (`R`, `W`, `X`,
-  or `PROT_NONE`), and backing (`Anonymous`, plus `File` in M7). Supports
-  exact-range lookup, top-down free-gap search, `MAP_FIXED` unmap-and-replace
-  (and `MAP_FIXED_NOREPLACE` returning `-EEXIST`), partial-range
-  `munmap`/`mprotect` sub-VMA splitting (required from M6 for `musl` `mallocng`
-  `PROT_NONE` guard pages and from M7 for `ld-musl` `PT_GNU_RELRO`), and
-  adjacent same-attribute merging. Every range validates `start >= USER_MIN`,
-  `end <= USER_MAX`, page alignment, and no overflow.
-- **Demand paging, `#PF` interrupt protocol and `PROT_NONE` (M6):**
+  or `PROT_NONE`), and backing:
+  - `Backing::Anonymous` (M6): demand-zeroed private or shared anonymous pages.
+  - `Backing::File(FileMapping { file_id: u64, offset: u64, shared: bool })`
+    (M7, designed in #246): `file_id` keys the inode + canonical path entry held
+    in `AddressSpace::mapped_files` (kept alive until no VMA references it, so
+    closing the `fd` after `mmap` keeps the mapping valid per POSIX); `offset`
+    is the page-aligned file byte offset at `Vma::start`; `shared` distinguishes
+    `MAP_SHARED` (`true`) from `MAP_PRIVATE` CoW (`false`).
+  - **Sub-VMA splitting and coalescing invariants for file VMAs (M7):**
+    - Splitting `[start, end)` at page-aligned `mid` preserves `offset` on the
+      left piece `[start, mid)` and sets the right piece `[mid, end)`'s offset
+      to `offset + (mid - start)` (checked against `u64` overflow).
+    - Adjacent file VMAs `a` and `b` coalesce **only** when
+      `a.end == b.start && a.prot == b.prot && a.file_id == b.file_id && a.shared == b.shared && b.offset == a.offset + (a.end - a.start)`.
+  - Supports exact-range lookup, top-down free-gap search, `MAP_FIXED`
+    unmap-and-replace (and `MAP_FIXED_NOREPLACE` returning `-EEXIST`),
+    partial-range `munmap`/`mprotect` sub-VMA splitting (required from M6 for
+    `musl` `mallocng` `PROT_NONE` guard pages and from M7 for `ld-musl`
+    `PT_GNU_RELRO` and `.so` segment overlays), and adjacent same-attribute
+    merging. Every range validates `start >= USER_MIN`, `end <= USER_MAX`, page
+    alignment, and no overflow.
+- **Demand paging, `#PF` interrupt protocol, `PROT_NONE`, and M7 file-backed CoW / `MAP_SHARED`:**
   `mmap(MAP_ANONYMOUS)` and `brk` growth record VMAs without eagerly allocating
   physical frames. Because `idt.rs` installs all 256 IDT entries as 64-bit
   interrupt gates (`IF = 0` on entry) while `AddressSpace` uses a sleeping
@@ -698,35 +714,103 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
      ring-3 `#PF` and by `copy_from_user`'s lock-ordering precondition), then
      re-enable interrupts via `irq::restore(true)` (respecting
      `irq::disabled_for_good()`).
-  3. Acquire `AddressSpace`'s sleeping lock, resolve demand paging / CoW /
-     M7 file I/O / M8 shootdown, and release the lock. If the faulting address
-     lies in a permitted VMA (not `PROT_NONE`) and the access matches its
-     rights, allocate one zeroed frame and map it with `USER` + the VMA's
-     `W`/`NX` flags.
+  3. Acquire `AddressSpace`'s sleeping lock, resolve demand paging / M7 file
+     I/O & CoW / M8 shootdown, and release the lock.
   4. Call `irq::disable()` (`IF = 0`, `depth == 0`) **before** returning to
      `lumen_isr_common` (keeping `swapgs; iretq` atomic with respect to IRQs)
      or calling `sched::exit()` on a fatal fault.
 
+  **Software PTE bits (`crates/lumen-mm/src/paging.rs`):**
+  - `PTE_PROTNONE` (bit 9, M6): marks a non-present leaf (`PRESENT = 0`) whose
+    physical frame is retained across `mprotect(..., PROT_NONE)`.
+  - `PTE_SHARED` (bit 10, M7, designed in #246): marks a leaf (present or
+    `PTE_PROTNONE`) whose physical frame belongs to a unified `PageCache`
+    `Arc<CachePage>` pinned in `AddressSpace::pinned_pages: BTreeMap<u64, Arc<CachePage>>`
+    (keyed by page-aligned user VA) rather than being exclusively owned by the
+    process. `munmap`, `MAP_FIXED` replacement, and `teardown` **never** call
+    `frame::free` on a `PTE_SHARED` leaf; instead they remove `va` from
+    `pinned_pages` (releasing the `Arc<CachePage>` pin).
+
+  **File-backed `#PF` and coherence protocol (M7, designed in #246):**
+  - **EOF and `SIGBUS`:** for a `Backing::File(fm)` VMA, let
+    `file_off = fm.offset + (page_va - vma.start)` and `file_size` be the
+    inode's current byte length. If `file_off >= align_up_page(file_size)`, the
+    fault returns `FaultResult::BusError` (terminating the process with a
+    distinct bus-error reason in M7; delivering `SIGBUS` in M8). For a partial
+    final page (`file_off < file_size < file_off + 4096`), bytes past
+    `file_size` are zero-filled; writes past `file_size` never extend the file.
+  - **Not-present fault (`error_code & 1 == 0`) on `Backing::File`:**
+    - `MAP_PRIVATE` write fault (`!fm.shared && is_write`): read the page via
+      the inode's `PageCache` into a freshly allocated private frame (`frame::alloc`),
+      zero any bytes past `file_size`, and map it with `USER | WRITABLE`
+      (`PTE_SHARED = 0`).
+    - `MAP_PRIVATE` read/exec fault (`!fm.shared && !is_write`): fetch/pin the
+      `Arc<CachePage>` from `PageCache`, store a clone in `pinned_pages[page_va]`,
+      and map its frame **read-only** (`WRITABLE = 0`, `PTE_SHARED = 1`, even
+      when `vma.prot.write()` is true so the first write triggers CoW).
+    - `MAP_SHARED` fault (`fm.shared`): fetch/pin the `Arc<CachePage>` from
+      `PageCache` and store a clone in `pinned_pages[page_va]`. On a write
+      fault to a writable VMA, mark the `CachePage` dirty, increment
+      `CachePage::writable_maps`, and map with `USER | WRITABLE | PTE_SHARED`.
+      On a read/exec fault, map with `WRITABLE = 0, PTE_SHARED = 1` so the
+      first store faults into dirty tracking.
+  - **Present write fault (`error_code & 1 == 1 && is_write`) on `PTE_SHARED`:**
+    - Valid only when `vma.prot.write()` is true and the existing PTE has
+      `PTE_SHARED = 1` and `WRITABLE = 0` (any other present fault is
+      `FaultResult::Invalid`).
+    - For `MAP_PRIVATE`: **CoW split**—allocate a fresh private frame, copy the
+      4 KiB page from `CachePage` (zeroing any tail past `file_size`), replace
+      the PTE with the private frame (`WRITABLE = 1`, `PTE_SHARED = 0`), flush
+      the local TLB (`invlpg`), and remove `page_va` from `pinned_pages`.
+    - For `MAP_SHARED`: **dirty promotion**—call `CachePage::mark_dirty()` and
+      `CachePage::inc_writable_maps()`, upgrade the PTE to `WRITABLE = 1`
+      (keeping `PTE_SHARED = 1`), and flush the local TLB (`invlpg`).
+  - **`mprotect`, `munmap`, and `msync` with `PTE_SHARED`:**
+    - `mprotect` adding `PROT_WRITE` to a VMA **must keep `WRITABLE = 0`** on
+      every existing PTE with `PTE_SHARED = 1`, preserving CoW (`MAP_PRIVATE`)
+      and write-fault dirty tracking (`MAP_SHARED`).
+    - `mprotect` removing `PROT_WRITE` (or setting `PROT_NONE`), `munmap`,
+      `MAP_FIXED` replacement, or `teardown` on a `MAP_SHARED` PTE whose
+      `WRITABLE` bit was `1` checks hardware `PTE_DIRTY` (bit 6), marks the
+      `CachePage` dirty if set, and calls `CachePage::dec_writable_maps()`.
+    - Because `fsync`/`fdatasync`/`sync`/`msync` treat a `CachePage` as dirty
+      whenever `dirty == true || writable_maps > 0`, repeated `MAP_SHARED`
+      stores followed by repeated `fsync` calls without intervening `munmap`
+      always persist to `ext4` without requiring reverse-PTE walks in M7.
+    - `msync(addr, len, flags)` (syscall 26) sweeps `MAP_SHARED` VMAs in
+      `[addr, align_up_page(addr + len))`, propagating hardware `PTE_DIRTY`
+      bits to `CachePage::mark_dirty()` and (for `MS_SYNC`) flushing those
+      inodes' dirty pages through `ext4` and `BlockDevice::flush()`.
+
   `PROT_NONE` VMAs reserve VA space without demand-paging on fault;
   `mprotect(..., PROT_NONE)` on already-populated pages preserves their
-  physical frames (clearing `PTE_PRESENT` and setting a software `PTE_PROTNONE`
-  bit while retaining the frame address so a later `mprotect` back to
-  `PROT_READ` preserves data and teardown still frees the frame). If no frame
-  is available or the access violates VMA rights (or hits an unmapped address),
-  the process is terminated (M6) or sent `SIGSEGV`/`SIGBUS` (M8). Note on W^X:
-  ELF `PT_LOAD` segments enforce W^X at load; `mmap`/`mprotect` support
-  switching pages between `RW-` and `R-X` and permit explicit
+  physical frames (`PTE_PROTNONE`, preserving `PTE_SHARED` as well so teardown
+  releases cached pins without freeing them). If no frame is available or the
+  access violates VMA rights (or hits an unmapped address), the process is
+  terminated (M6–M7) or sent `SIGSEGV`/`SIGBUS` (M8). Note on W^X: ELF
+  `PT_LOAD` segments enforce W^X at load; `mmap`/`mprotect` support switching
+  pages between `RW-` and `R-X` and permit explicit
   `PROT_READ | PROT_WRITE | PROT_EXEC` when a Linux binary requests it (needed
   by Python `ctypes`/`libffi`, Ruby, and JITs).
 - **Teardown:** When a process's last thread exits (`exit_group`, running with
   interrupts ON), it switches `CR3` back to `kernel_root()`, closes its FD
-  table, and tears down all VMAs and user mappings (walking L4 entries 0–255,
-  freeing leaf frames including `PTE_PROTNONE` frames—decrementing refcounts
-  from M8 onward—and user L1/L2/L3 tables) while sleeping VFS locks are
-  permitted. `AddressSpace::drop` (which may run inside `sched::finish_switch`
-  with interrupts off once no CPU holds its `CR3`) then frees at most the bare
-  L4 root frame without taking any sleeping lock. Kernel upper-half tables
+  table (releasing `flock` and POSIX record locks and triggering deferred
+  unlinked-inode reclamation), and tears down all VMAs, `pinned_pages`
+  (flushing `writable_maps` counts and dropping `Arc<CachePage>` pins),
+  `mapped_files`, and user page-table mappings (walking L4 entries 0–255,
+  freeing only non-`PTE_SHARED` leaf frames—decrementing refcounts from M8
+  onward—and user L1/L2/L3 tables) while sleeping VFS locks are permitted.
+  `AddressSpace::drop` (which may run inside `sched::finish_switch` with
+  interrupts off once no CPU holds its `CR3`) then frees at most the bare L4
+  root frame without taking any sleeping lock. Kernel upper-half tables
   (256–511) are untouched.
+- **Lock ordering across VM and VFS (M7–M8):** Because `copy_from_user` and
+  `copy_to_user` may fault into `#PF` → `AddressSpace` → `PageCache` →
+  `BlockCache` → `BlockDevice`, syscall paths (`read`, `write`, `pread64`,
+  `pwrite64`, `getdents64`, `stat*`, `readlink*`, etc.) **never** hold any VFS,
+  inode, `PageCache`, `BlockCache`, or `BlockDevice` lock across a user-memory
+  copy; they transfer via bounded kernel bounce buffers (`IO_CHUNK`, e.g. 4 KiB).
+  See section 9 ("Global lock ordering") for the complete acyclic hierarchy.
 - **Cross-CPU TLB shootdowns (M8; M6–M7 single-CPU invariant):** In M6 and M7,
   every user process is single-threaded and pinned to its home CPU (as all
   threads are today in `sched.rs`), so local `invlpg` is exact and no other CPU
@@ -2813,27 +2897,83 @@ is tested by taking the device).
   unmask: otherwise the probe fails too (not tested: QEMU echoes the
   entry or `NO_VECTOR`, and honours the mask).
 
-### Device classes (later)
+### Device classes (`InputDevice` built in M4; `BlockDevice` designed in #246, M7; `NetDevice` M9)
 
-`BlockDevice` (M7), `NetDevice` (send/receive frames, M9), `InputDevice`
-(event stream: the keyboard and the tablet), `Display` (framebuffer +
-flush rectangles), `Console`: traits whose methods are the messages above,
-added when a class has a second implementation and a consumer that needs
-the common interface (`InputDevice`: M4's desktop, below, designed in
-#146 and built in #151). `Display` stays later: M4 has one display (the
-GOP framebuffer Limine hands over) and one consumer at a time (the
-terminals or the compositor, section 11), so it becomes a trait with a
-second display (virtio-gpu, or real hardware in M12). The shape, for
-the block device:
+`BlockDevice` (M7, designed in #246), `NetDevice` (send/receive frames, M9),
+`InputDevice` (event stream: the keyboard and the tablet, designed in #146 and
+built in #151), `Display` (framebuffer + flush rectangles), `Console`: traits
+whose methods are the subsystem boundaries. `Display` stays later: M4 has one
+display (the GOP framebuffer Limine hands over) and one consumer at a time (the
+terminals or the compositor, section 11), so it becomes a trait with a second
+display (virtio-gpu, or real hardware in M12).
+
+**`BlockDevice` and `virtio-blk` (designed in #246, M7).** Defined in the
+host-tested `crates/lumen-bcache` crate so both host block-cache tests
+(`MemBlockDevice`, fault/crash injection) and the kernel's `virtio-blk` driver
+implement the exact same synchronous, blocking interface (callers always run on
+preemptible kernel threads with interrupts enabled, never holding a `SpinLock`):
 
 ```rust
-pub trait BlockDevice: Send + Sync {
-    fn info(&self) -> BlockInfo;                       // sector size, count, read-only?
-    fn submit(&self, req: BlockRequest) -> Ticket;     // non-blocking
-    fn poll(&self, t: Ticket) -> Poll<BlockResult>;    // or a completion queue
+pub const SECTOR_SIZE: usize = 512;
+pub const BLOCK_SIZE: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockInfo {
+    pub sector_size: u32,       // 512 for virtio-blk baseline
+    pub sector_count: u64,      // capacity in 512-byte sectors (> 0)
+    pub read_only: bool,        // VIRTIO_BLK_F_RO
+    pub flush_supported: bool,  // VIRTIO_BLK_F_FLUSH
 }
-pub struct BlockRequest { pub op: BlockOp, pub lba: u64, pub buf: DmaBuffer }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockError {
+    OutOfRange,     // lba + sectors > sector_count or overflow
+    Unaligned,      // buf.len() == 0 or !buf.len().is_multiple_of(sector_size)
+    ReadOnly,       // write to a read-only device
+    Io,             // device returned VIRTIO_BLK_S_IOERR / UNSUPP / failed
+    Timeout,        // bounded MSI-X wait expired (device marked failed_after_bind)
+    DeviceFailed,   // device was already retired after a prior fatal error
+}
+
+pub trait BlockDevice: Send + Sync {
+    fn info(&self) -> BlockInfo;
+    fn read_sectors(&self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError>;
+    fn write_sectors(&self, lba: u64, buf: &[u8]) -> Result<(), BlockError>;
+    fn flush(&self) -> Result<(), BlockError>;
+}
 ```
+
+- **`virtio-blk` driver (`kernel/src/blk/virtio_blk.rs`, added to `DRIVERS`):**
+  - Matches PCI virtio device type `2` (`d.virtio_type() == Some(2)`), brings
+    up its transport via `virtio::transport` (MSI-X vector required, ringing a
+    per-device `Doorbell`), negotiates `Feature::VERSION_1`, `VIRTIO_BLK_F_RO`
+    (bit 5), `VIRTIO_BLK_F_BLK_SIZE` (bit 6, verifying logical sector size is
+    `512`), and `VIRTIO_BLK_F_FLUSH` (bit 9). Rejects a 0-sector device or an
+    unsupported sector size during probe.
+  - **Bounded interrupt-driven I/O (no unbounded crate spins):** `virtio-drivers`
+    `0.13.0`'s synchronous `VirtIOBlk::read_blocks`/`write_blocks`/`flush`
+    spin unboundedly on `can_pop()`. Following `rng.rs` (#97), the driver drives
+    its own `VirtQueue` directly (one `SleepMutex`-serialized request at a time
+    in M7) for `VIRTIO_BLK_T_IN` (0), `VIRTIO_BLK_T_OUT` (1), and
+    `VIRTIO_BLK_T_FLUSH` (4, no-op `Ok(())` when `VIRTIO_BLK_F_FLUSH` was not
+    negotiated), waiting on the MSI-X `Doorbell` via `StatusHandle::wait_for`
+    with a bounded deadline (`BLK_REQUEST_TIMEOUT_NS = 5_000_000_000`, 5 s for
+    loaded TCG hosts). Multi-sector transfers are chunked at `<= 64 KiB` per
+    descriptor chain, keeping outstanding bounce runs bounded (at most 3 runs
+    in `VirtioHal::TABLE` per active device, well within `RUNS = 256`).
+  - **Drop order & failure handling:** the transport field precedes the
+    `VirtQueue` field so device reset always runs before queue DMA teardown. If
+    a request times out or the device sets `DEVICE_NEEDS_RESET`/`FAILED`, the
+    driver retires the device, logs once, calls `pci::failed_after_bind`, and
+    returns `BlockError::Timeout`/`DeviceFailed` on all subsequent calls.
+  - **Probe interaction with existing M3 tests:** `virtio-blk` joins `DRIVERS`
+    in `kernel/src/drivers.rs`. The PR that adds it updates
+    `tests/scenarios/test_pci.py` (expecting `virtio-blk: bound` and 4 bound
+    devices when `Devices::every()` runs), `tests/scenarios/test_ktest.py`
+    (driver count when `blk_mib=1` is attached), and
+    `kernel/src/virtio.rs::transport_brings_up_a_virtio_device_through_the_hal`
+    (switching from `ktest_device(2)`—now claimed by `virtio-blk`—to an
+    unclaimed virtio device attached in `test_ktest.py`).
 
 **`InputDevice`** (its messages defined with #98, the tablet; the PS/2
 keyboard is the first implementation; the trait, below, is designed for
@@ -3098,21 +3238,21 @@ pub enum InputEvent { Key(KeyEvent), Pointer(PointerEvent) }
 QEMU; real-hardware drivers (NVMe, AHCI, xHCI HID, a common NIC) in M12
 behind the same traits.
 
-## 8. Processes, syscalls and capabilities (WASM apps M5: built, #195; Linux x86-64 ABI M6–M10: designed in #230; capability namespaces M11)
+## 8. Processes, syscalls and capabilities (WASM apps M5: built, #195; Linux x86-64 ABI M6 built #230/#232–#238, M7 designed in #246; capability namespaces M11)
 
 Lumen runs two kinds of user code:
 
 1. **Sandboxed WASM apps (M5, built):** run by `wasmi` on kernel threads with
    explicit capability handles (`Log`, `Time`, `Desktop`, `Window`, `Trace`),
    described in "Apps: WASM modules in the kernel" below.
-2. **Native ring-3 Linux x86-64 processes (M6–M10, designed in #230):**
+2. **Native ring-3 Linux x86-64 processes (M6 built, M7–M10 planned):**
    unmodified Linux `x86_64` ELF binaries (targeting Alpine Linux `musl`)
    entering through the standard Linux `syscall` ABI. Starting in M11, each
    Linux process/sandbox can be confined by capability-scoped VFS mount
    namespaces and network allowlists, preserving Principle 2 (no ambient
    authority for agents) without requiring custom `libc` or runtime forks.
 
-### Linux x86-64 syscall ABI (M6–M10, designed in #230)
+### Linux x86-64 syscall ABI (M6 built #232–#238; M7 designed in #246)
 
 - **Register convention:** identical to Linux x86-64. Syscall number in `rax`;
   up to 6 arguments in `rdi`, `rsi`, `rdx`, `r10`, `r8`, `r9` (`r10` replaces
@@ -3168,22 +3308,73 @@ to satisfy Rust `std`'s `sanitize_standard_fds` startup check (`poll([0, 1, 2], 
 and `busybox` `lineedit` stdin readiness waits; full pipe/socket/PTY `poll`/`ppoll`/`select`
 arrives in M8.
 
-Because `musl` on `x86_64` invokes legacy non-`*at` / non-`*2` syscalls
-directly (unlike `aarch64`), later milestones wire both the `*at` and legacy
-x86-64 entry points (trivial shims over `*at(AT_FDCWD, ...)`):
+#### M7 POSIX VFS, file-backed `mmap`, and dynamic-linking syscalls (designed in #246)
 
-- **M7 (POSIX VFS & dynamic linking):** `open` (2) (called by `ld-musl`
-  `dynlink.c`), `openat` (257), `stat` (4), `lstat` (6), `newfstatat` (262),
-  `statx` (332), `access` (21), `faccessat` (269), `lseek` (8), `pread64`
-  (17), `pwrite64` (18), `getdents64` (217), `fsync` (74), `fdatasync` (75),
-  `sync` (162), `truncate` (76), `ftruncate` (77), `rename` (82), `renameat`
-  (264), `renameat2` (316), `mkdir` (83), `mkdirat` (258), `rmdir` (84),
-  `link` (86), `linkat` (265), `unlink` (87), `unlinkat` (263), `symlink`
-  (88), `symlinkat` (266), `readlink` (89), `readlinkat` (267), `chmod` (90),
-  `fchmod` (91), `fchmodat` (268), `chown` (92), `fchown` (93), `lchown` (94),
-  `fchownat` (260), `umask` (95), `utimensat` (280),
-  `chdir` (80), `fchdir` (81), `fcntl` (72), `flock` (73), and file-backed
-  `mmap`.
+In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (matching
+`RLIMIT_NOFILE`), storing `Option<FdEntry { file: Arc<OpenFile>, cloexec: bool }>`.
+Console FDs 0/1/2 become `OpenFile` entries backed by the process's `ConsoleIo`
+device node (preserving all M6 serial, framebuffer VT, and `usertest` capture
+semantics), and M6's `read` (0), `write` (1), `close` (3), `fstat` (5), `poll`
+(7), `ioctl` (16), `readv` (19), `writev` (20), `mmap` (9), and `getcwd` (79)
+route through the VFS and real process working directory. Regular-file `poll`
+returns `POLLIN | POLLOUT` immediately (matching Linux).
+
+Because `musl` on `x86_64` invokes legacy non-`*at` / non-`*2` syscalls
+directly (for example `open(2)` in `ldso/dynlink.c`), M7 wires **both** the
+`*at` and legacy entry points (every legacy syscall is a thin shim over the
+corresponding `*at(AT_FDCWD, ...)` handler):
+
+| # | Syscall | M7 behaviour (designed in #246) |
+|---|---|---|
+| 2 | `open(path, flags, mode)` | shim to `openat(AT_FDCWD, path, flags, mode)` |
+| 4 | `stat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, 0)` |
+| 6 | `lstat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW)` |
+| 8 | `lseek(fd, off, whence)` | `SEEK_SET` (0), `SEEK_CUR` (1), `SEEK_END` (2) on regular files, `/proc`, and `/dev/null`/`/dev/zero` (returning 0); `-ESPIPE` on console/tty; rejects resulting negative offset with `-EINVAL` |
+| 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); validates `off & 0xfff == 0`, `off + aligned_len` no overflow, `fd` open & readable (`-EACCES` for `MAP_SHARED | PROT_WRITE` on `O_RDONLY`), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); accepts `MAP_SHARED_VALIDATE` (rejecting unknown bits with `-EOPNOTSUPP`) and ignores advisory `MAP_DENYWRITE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_STACK` |
+| 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `-EINVAL` if `off < 0`, `-ESPIPE` on console/tty, `-EISDIR` on directories |
+| 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); `-EINVAL` if `off < 0`, `-ESPIPE` on console/tty, `-EBADF` if not opened for writing |
+| 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
+| 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), `-ENOMEM` on any unmapped hole; sweeps `MAP_SHARED` PTE dirty bits into `PageCache` and, for `MS_SYNC`, writes back and issues `BlockDevice::flush()` |
+| 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0), `F_DUPFD_CLOEXEC` (1030), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped, section 9); unknown `cmd` returns `-EINVAL` |
+| 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`); atomic upgrade/downgrade on same `OpenFileId`, `-EWOULDBLOCK` on conflict with `LOCK_NB`, released when last FD to the `OpenFile` closes |
+| 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs and `-EINVAL` on non-syncable special devices (console/tty, `/dev/*`) |
+| 75 | `fdatasync(fd)` | flushes file data pages and size-changing metadata through `BlockCache` + `BlockDevice::flush()` |
+| 76 | `truncate(path, len)` | resolves `path` (following symlinks), validates `len >= 0` (`-EINVAL`), writable regular file (`-EISDIR`/`-EACCES`), resizes via `ftruncate` logic |
+| 77 | `ftruncate(fd, len)` | validates `fd` open for writing and regular file (`-EINVAL` if `len < 0` or not regular), zeroes partial last page tail on shrink, drops cached pages past new page count, updates `st_size` and `mtime`/`ctime` |
+| 79 | `getcwd(buf, size)` | returns canonical NUL-terminated path of the process's current working directory (length including NUL, or `-ERANGE` if `size` too small, `-ENOENT` if cwd was unlinked) |
+| 80 | `chdir(path)` | resolves `path` (following symlinks), requires directory (`-ENOTDIR`), updates process `cwd` inode and canonical path |
+| 81 | `fchdir(fd)` | validates `fd` refers to an open directory (`-ENOTDIR`/`-EBADF`), updates process `cwd` |
+| 82 | `rename(old, new)` | shim to `renameat2(AT_FDCWD, old, AT_FDCWD, new, 0)` |
+| 83 | `mkdir(path, mode)` | shim to `mkdirat(AT_FDCWD, path, mode)` |
+| 84 | `rmdir(path)` | shim to `unlinkat(AT_FDCWD, path, AT_REMOVEDIR)` |
+| 86 | `link(old, new)` | shim to `linkat(AT_FDCWD, old, AT_FDCWD, new, 0)` |
+| 87 | `unlink(path)` | shim to `unlinkat(AT_FDCWD, path, 0)` |
+| 88 | `symlink(target, linkpath)` | shim to `symlinkat(target, AT_FDCWD, linkpath)` |
+| 89 | `readlink(path, buf, bufsiz)` | shim to `readlinkat(AT_FDCWD, path, buf, bufsiz)` |
+| 90 | `chmod(path, mode)` | shim to `fchmodat(AT_FDCWD, path, mode, 0)` |
+| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EROFS` on read-only fs) |
+| 92 | `chown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, 0)` |
+| 93 | `fchown(fd, uid, gid)` | updates `uid`/`gid` (`u32::MAX` = leave unchanged) and `ctime` on open `fd`'s inode |
+| 94 | `lchown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)` |
+| 95 | `umask(mask)` | atomically sets per-process `umask = mask & 0o777` (default `0o022`) and returns previous mask |
+| 162 | `sync()` | flushes every dirty `PageCache` page and `BlockCache` block on all mounted filesystems, followed by `BlockDevice::flush()`; always returns `0` |
+| 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor`; returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
+| 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`), `O_EXCL` (`-EEXIST`), `O_TRUNC`, `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP`), `O_CLOEXEC`, `O_NONBLOCK`, `O_PATH`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
+| 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o7777) & !umask`, stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
+| 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`) |
+| 262 | `newfstatat(dirfd, path, buf, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; writes 144-byte Linux x86-64 `struct stat` with unique `(st_dev, st_ino)` per filesystem/inode |
+| 263 | `unlinkat(dirfd, path, flags)` | `flags == 0`: unlinks non-directory (`-EISDIR` on dir), handling open-unlinked inodes cleanly (section 9); `flags == AT_REMOVEDIR`: removes empty directory (`-ENOTEMPTY`, `-EINVAL` for `.`, `-EBUSY` for mount point); unknown flags `-EINVAL` |
+| 264 | `renameat(olddirfd, old, newdirfd, new)` | shim to `renameat2(olddirfd, old, newdirfd, new, 0)` |
+| 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | creates hard link (`AT_SYMLINK_FOLLOW` / `AT_EMPTY_PATH`); rejects directories (`-EPERM`), cross-mount (`-EXDEV`), existing target (`-EEXIST`), incrementing `st_nlink` |
+| 266 | `symlinkat(target, newdirfd, linkpath)` | creates symlink with verbatim non-empty `target` (`-ENOENT` if `target` is empty, `-EEXIST` if `linkpath` exists) |
+| 267 | `readlinkat(dirfd, path, buf, bufsiz)` | does not follow final symlink (`-EINVAL` if target is not a symlink or `bufsiz <= 0`); copies `min(target.len(), bufsiz)` bytes **without** trailing NUL and returns bytes copied |
+| 268 | `fchmodat(dirfd, path, mode, flags)` | supports `flags == 0` (Linux `fchmodat` rejects `AT_SYMLINK_NOFOLLOW` with `-EOPNOTSUPP`); updates mode bits and `ctime` |
+| 269 | `faccessat(dirfd, path, mode, flags)` | shim to `faccessat2(dirfd, path, mode, 0)` (Linux's 3-arg `faccessat` ignores `flags`; validates `mode` in `F_OK \| R_OK \| W_OK \| X_OK`) |
+| 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`), `AT_SYMLINK_NOFOLLOW`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`), rejecting invalid `tv_nsec >= 1_000_000_000` with `-EINVAL` |
+| 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); rejects unknown flags or both together (`-EINVAL`), cross-mount (`-EXDEV`), dir-over-non-dir (`-ENOTDIR`), non-dir-over-dir (`-EISDIR`), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
+| 332 | `statx(dirfd, path, flags, mask, buf)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; fills `struct statx` (`stx_mask`, `stx_blksize`, `stx_nlink`, `stx_uid`, `stx_gid`, `stx_mode`, `stx_ino`, `stx_size`, `stx_blocks`, timestamps, `stx_rdev_*`, `stx_dev_*`) |
+| 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`; checks existence and permission bits (root `uid == 0` satisfies `R_OK`/`W_OK` on writable fs and `X_OK` if any execute bit is set on regular files or always on dirs) |
+
 - **M8 (Processes, threads, signals, `futex`, PTYs):** `fork`/`vfork`/`clone`/
   `execve`/`wait4`, `futex`, real signals (`rt_sigreturn`, `sigaltstack`,
   `kill`/`tgkill`, `si_addr = CR2`), `pipe` (22) + `pipe2` (293),
@@ -3197,9 +3388,9 @@ x86-64 entry points (trivial shims over `*at(AT_FDCWD, ...)`):
   `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64`, `sysinfo`,
   and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery.
 
-### Static ELF64 loader and initial stack (designed in #230, M6; dynamic `PT_INTERP` in M7)
+### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` designed in #246, M7)
 
-- **Validation (`crates/lumen-elf`, host-tested, or `xmas-elf`/`goblin`):**
+- **Validation (`crates/lumen-elf`, host-tested):**
   checks ELF64 little-endian `ET_EXEC` (or `ET_DYN` PIE), `EM_X86_64`, no
   overlapping `PT_LOAD` byte ranges (`p_vaddr..p_vaddr + p_memsz`),
   `p_filesz <= p_memsz`, every mapped range within `USER_MIN..USER_MAX`, and no
@@ -3232,10 +3423,48 @@ x86-64 entry points (trivial shims over `*at(AT_FDCWD, ...)`):
   `pwd`, `export`, arithmetic, loops, and `exit` over serial without job
   control). Interactive `lineedit`, pipes, and external subprocesses require
   `fork`/`pipe`/`dup2`/`wait4`/PTYs and arrive in M8.
-- **Dynamic linking (M7):** when `PT_INTERP` is present (e.g.
-  `/lib/ld-musl-x86_64.so.1`), the loader maps the interpreter at
-  `INTERP_BASE`, sets `AT_BASE` to the interpreter base and `AT_ENTRY` to the
-  main binary's entry, and enters the interpreter's entry point.
+- **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`, designed in #246, M7):**
+  - **`crates/lumen-elf` parser extension:** `LoadedElf::parse_with_base(image, pie_base)`
+    accepts an optional `PT_INTERP` header (at most one; rejects duplicate
+    `PT_INTERP`, `p_filesz == 0`, `p_filesz > PATH_MAX`, out-of-bounds slice,
+    missing trailing NUL, or interior NUL before the final byte) and exposes
+    `interp_path: Option<&[u8]>`. Main dynamic executables may be `ET_DYN`
+    (PIE, mapped at `PIE_BASE = 0x0000_5555_5555_4000`, which Alpine ships by
+    default) or `ET_EXEC` (`load_bias = 0`).
+  - **Interpreter loading:** when `interp_path` is `Some(path)` (e.g.
+    `"/lib/ld-musl-x86_64.so.1"`), the kernel resolves and reads the interpreter
+    file from VFS (returning `-ENOENT`/`-ELIBBAD` if absent or invalid) and
+    parses it with `load_bias = INTERP_BASE` (`0x0000_7f00_0000_0000`, strictly
+    above `MMAP_TOP` so top-down `mmap` never collides with the interpreter, and
+    strictly below `USER_STACK_BOTTOM`). The interpreter must be `ET_DYN` and
+    must **not** itself carry `PT_INTERP` (rejected with `NestedInterp`). Both
+    the main binary's and the interpreter's mapped page ranges are verified to
+    be pairwise disjoint and disjoint from the user stack + guard page before
+    committing any frames.
+  - **Auxiliary vector and entry point for dynamic binaries:**
+    - `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, and `AT_ENTRY` describe the **main
+      binary** (never the interpreter).
+    - `AT_BASE` is set to `Some(interp_load_bias)` (`INTERP_BASE`) so `ld-musl`
+      relocates itself before loading `DT_NEEDED` libraries.
+    - Initial `brk` is page-aligned above the **main binary's** highest
+      `PT_LOAD` segment.
+    - Initial ring-3 `%rip` is set to the **interpreter's** mapped entry point
+      (`INTERP_BASE + interp.e_entry`), while direct invocation of
+      `/lib/ld-musl-x86_64.so.1 <prog>` (an `ET_DYN` without `PT_INTERP`)
+      continues to load at `PIE_BASE` with `AT_BASE` omitted.
+  - **`ld-musl` & `dlopen`/`dlsym` invariants:** `ld-musl` deduplicates shared
+    libraries by `(st_dev, st_ino)` from `fstat(2)`, reserves contiguous VA
+    ranges via `mmap(..., PROT_NONE, MAP_PRIVATE, fd, 0)` followed by
+    `MAP_FIXED` file-backed segment overlays and `MAP_ANONYMOUS | MAP_FIXED`
+    `.bss` tails, protects `PT_GNU_RELRO` pages via sub-VMA `mprotect`, and
+    reads `/proc/self/exe` for `$ORIGIN`. All of these invariants are satisfied
+    directly by section 5 (`lumen-vm` + `PTE_SHARED` CoW) and section 9 (VFS
+    unique `(st_dev, st_ino)` + `/proc/self/exe`).
+  - **M7 scope for Alpine minirootfs:** M7 executes unmodified dynamic Alpine
+    `/bin/busybox` directly (`ls`, `cp`, `mv`, `grep`, `sed`, `awk`,
+    uncompressed `tar -cf/-xf`, and built-ins-only `ash -s`) plus dynamic
+    `dlopen`/`dlsym` test binaries via `linux /path/to/bin [args...]`. Multi-command
+    `ash` scripts and pipelines arrive with `fork`/`execve`/`pipe2` in M8.
 
 ### Capabilities and sandboxing (WASM M5; Linux namespaces M11)
 
@@ -4463,40 +4692,249 @@ kernel (no SSE); #197 checks the results' bits.
   and the bundled apps' names.
 - `kill <id>`.
 
-## 9. Storage: POSIX VFS, writable `ext4` and snapshots (VFS and `ext4` planned, M7; OverlayFS/CoW snapshots planned, M11)
+## 9. Storage: POSIX VFS, writable `ext4` and snapshots (VFS, block/page cache, and `ext4` designed in #246, M7; OverlayFS/CoW snapshots planned, M11)
 
-- **Block layer & unified page cache (M7):** `virtio-blk` behind
-  `BlockDevice` (section 7), feeding a unified block/page cache (`lumen-bcache`)
-  shared by regular file I/O and file-backed `mmap` (so `read`/`write` and
-  `MAP_SHARED` stay coherent without double buffering).
-- **Writable `ext4` rootfs (M7):** boots an unmodified Alpine Linux `x86_64`
-  (`musl`) `ext4` disk image through a pinned `no_std` driver (`ext4plus`,
-  `rust-fs-ext4`, or `lwext4` FFI; chosen in its own dependency PR). Persistence
-  is tested directly on `ext4`: write, sync, kill QEMU, reboot against the same
-  disk image, and verify.
-- **POSIX VFS & pseudo-filesystems (M7; adapted from `Starry`/`axfs_vfs`):**
-  - Mount table plus dentry and inode caches (`crates/lumen-vfs`, host-tested).
-  - Full POSIX metadata and operations (both `*at` and legacy x86-64 shims
-    called by `musl`, section 8): `open`/`openat`,
-    `read`/`write`/`pread64`/`pwrite64`, `lseek`, `getdents64`,
-    `stat`/`lstat`/`fstat`/`newfstatat`/`statx`, `access`/`faccessat`,
-    `fsync`/`fdatasync`/`sync`, symlinks (`symlink`/`symlinkat`/
-    `readlink`/`readlinkat` with `ELOOP`), hard links (`link`/`linkat`) and
-    unlink-while-open inode refcounting, atomic `rename`/`renameat2`,
-    `truncate`/`ftruncate`, `chmod`/`fchmod`/`chown`/`fchown`/`lchown`/
-    `umask`, `utimensat`, `fcntl`, and advisory file locks (`flock` and
-    `F_SETLK`—required by SQLite, Cargo, and Git).
-  - Pseudo-filesystems: `/tmp` (`tmpfs`), `/dev` (`null`, `zero`, `urandom`,
-    `random`, `tty`, plus `/dev/ptmx` and `/dev/pts/*` in M8), `/proc`
-    (`self/exe`, `self/fd`, `self/maps` in strict Linux `start-end rwxp offset
-    dev:dev ino path` format so `musl`'s `pthread_getattr_np` parses main-stack
-    bounds, `cpuinfo`, `meminfo`).
-- **Snapshots, namespaces & agent undo (M11):** per-process VFS mount
-  namespaces confine sandboxed processes and agents to explicitly granted
-  subtrees (`..` cannot escape a mount root). OverlayFS or block-level CoW
-  snapshots (or an optional LumenFS volume) back `snap`/`undo`, so an agent
-  session still takes an O(1) snapshot before each step and supports "Undo
-  step" and "Undo all" (Principle 3).
+Milestone M7 introduces real persistent storage and the POSIX filesystem stack
+needed to boot an unmodified Alpine Linux `x86_64` (`musl`) `ext4` rootfs and
+execute dynamically linked binaries via `/lib/ld-musl-x86_64.so.1`. Pure logic
+lives in two host-testable `no_std + alloc` crates (`crates/lumen-bcache` and
+`crates/lumen-vfs`); hardware, frame-backed page caching, and syscall dispatch
+live in `kernel/src/blk/`, `kernel/src/vfs/`, and `kernel/src/linux/`.
+
+### Block cache (`crates/lumen-bcache`, host-tested)
+
+`BlockCache<B: BlockDevice>` sits directly above `BlockDevice` (section 7) and
+serves 4 KiB blocks (`BLOCK_SIZE = 4096`, 8 × 512-byte sectors) to filesystem
+drivers (`ext4` superblock, group descriptors, bitmaps, inode tables, directory
+blocks, extent trees, and file data writeback):
+
+- **Addressing and sub-block reads:** keyed by 4 KiB `block_id: u64`
+  (translating to `lba = block_id * 8`; partial tail blocks near device end are
+  clamped to `sector_count`). Provides byte-range `read_at(byte_off, dst)` and
+  `write_at(byte_off, src)` helpers so 1 KiB, 2 KiB, and 4 KiB `ext4` block
+  sizes all work cleanly through the same 4 KiB cache without alignment bugs.
+- **Bounded LRU eviction and pinning:** fixed entry budget (default 1024 blocks
+  = 4 MiB in M7, configurable for host tests and M10 memory-pressure reclaim).
+  Callers may pin a block while mutating it; **pinned blocks are never
+  evicted**. Evicting a dirty unpinned block writes it back to `BlockDevice`
+  first; if writeback fails, the block remains dirty and cached and the error
+  propagates to the caller (never silently discarding dirty data).
+- **Read-only guard:** writes to a cache wrapping a `read_only` `BlockDevice`
+  return `BlockError::ReadOnly` immediately before modifying or dirtying any
+  cache entry.
+- **Writeback ordering and flush barriers:** `sync()` and `flush_blocks(ids)`
+  write all dirty blocks in ascending `block_id` order and then call
+  `BlockDevice::flush()` (`VIRTIO_BLK_T_FLUSH`), clearing each block's dirty
+  flag **only** after its `write_sectors` succeeds. If `write_sectors` or
+  `flush` fails, the error is returned and un-flushed blocks stay dirty.
+- **Host tests (`cargo:lumen-bcache`):** verified against an in-memory
+  `MemBlockDevice` with LRU eviction order, dirty writeback, pin refusal,
+  read-only rejection, crash-before-flush vs crash-after-sync simulation, and
+  injected I/O error recovery.
+
+### Unified file `PageCache` (`kernel/src/vfs/page_cache.rs`)
+
+To keep regular-file `read`/`write`/`pread64`/`pwrite64` and file-backed
+`MAP_SHARED` / `MAP_PRIVATE` `mmap` **100% coherent without double buffering**,
+every regular file (on both `ext4` and `tmpfs`) routes its data through a
+per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
+`page_index: u64` (`file_offset / 4096`):
+
+- **Zero-copy physical frames:** each `CachePage` owns one physical
+  `OwnedFrame` (mapped RW through the HHDM for O(1) kernel `read`/`write`, and
+  mappable directly into user `AddressSpace` PTEs with `PTE_SHARED = 1` as
+  specified in section 5). `CachePage::drop` frees its `OwnedFrame` without
+  taking any sleeping lock.
+- **Dirty and mapping tracking:** each `CachePage` carries an atomic `dirty`
+  flag and `writable_maps: AtomicU32` (incremented when a `MAP_SHARED` PTE is
+  promoted to `WRITABLE = 1`, decremented on downgrade/`munmap`/`teardown`).
+  Writeback treats a page as dirty whenever `dirty || writable_maps > 0`, so
+  repeated `MAP_SHARED` writes + `fsync` calls always reach disk.
+- **Safe eviction:** clean pages on `ext4` are eligible for eviction **only**
+  when `Arc::strong_count(&page) == 1` (neither pinned in any `AddressSpace`
+  PTE nor held by an in-flight read/write). `tmpfs` pages are never evicted
+  until truncated or unlinked-and-closed.
+- **Truncate interaction:** shrinking a file to `new_size` zeroes bytes
+  `[new_size % 4096 .. 4096)` of the new final page (if present in `PageCache`)
+  and drops cached pages with `page_index >= new_size.div_ceil(4096)`.
+
+### Writable `ext4` driver (crate chosen and pinned in its own dependency PR)
+
+Following section 2 (one new dependency crate per PR), M7 adopts a pure-Rust
+`no_std + alloc` writable `ext4` crate—evaluating **`ext4plus`** (`Apache-2.0
+OR MIT`, writable fork of `ext4-view`), **`another_ext4`** (`MIT`), and
+**`ext4_rs`** (`MIT`) in priority order (avoiding C FFI `lwext4` unless every
+pure-Rust candidate fails stability or correctness checks, so CI and macOS stay
+free of a C cross-compiler and `make audit` stays clean).
+
+Every candidate is vetted against six hard gates before pinning:
+1. Compiles on pinned stable `rustc 1.99.1` for `x86_64-unknown-none` with
+   `default-features = false` and zero nightly features.
+2. Passes `make audit` (no SSE/AVX, no red zone, kernel code model) when linked
+   into both `lumen-kernel` and `lumen-kernel-ktest`.
+3. MIT or Apache-2.0 license compatible, explicitly elected and recorded in
+   section 2.
+4. Mounts and mutates real `mke2fs -t ext4 -b 4096` images (extents, 256-byte
+   inodes, linear/htree directories, fast & block symlinks, hard links with
+   accurate `i_links_count`, `chmod`/`chown`/`utimensat`, create/write/truncate/
+   unlink/rename/mkdir/rmdir) and leaves the image passing **`e2fsck -fn`** on
+   the host after `sync` + QEMU shutdown/kill!
+5. Routes all disk I/O through Lumen's `BlockCache` adapter (never bypassing
+   `BlockCache` or skipping `BlockDevice::flush()` on `fsync`/`sync`).
+6. **Unlink-while-open contract:** when `unlink(path)` removes the last link to
+   an inode with `open_count > 0` or active `mmap` references:
+   - The directory entry is removed immediately (so `open(path)`/`stat(path)`
+     return `-ENOENT` and a new file can be created at `path`).
+   - `fstat(fd)` reports `st_nlink == 0`, and `read`/`write`/`ftruncate`/`mmap`
+     continue to work until the last open FD and mapping close.
+   - If the chosen `ext4` crate supports ext4's orphan list (decoupling dentry
+     removal from inode/block deallocation), VFS uses it directly. Otherwise,
+     before invoking backend `unlink`, VFS faults all existing file pages up to
+     `file_size` into the inode's `PageCache`, marks the live `VfsInode`
+     `detached_unlinked = true` (`st_nlink = 0`), and lets the backend unlink
+     and free on-disk blocks immediately (keeping on-disk `e2fsck -fn` 100%
+     clean even across abrupt power loss) while the open FD operates seamlessly
+     on its in-memory `PageCache` until the last `Arc<VfsInode>` drops!
+
+### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
+
+Architecture adapted conceptually from Starry / `axfs_vfs` (any directly
+adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
+
+- **Core abstractions:**
+  - `FileSystem`: `dev_id()`, `root_inode()`, `sync()`, `read_only()`.
+  - `VfsInode` (cached by `(DevId, Ino)` as `Arc<VfsInode>` so hard links and
+    multiple open FDs share one inode, one `PageCache`, one `AdvisoryLocks`
+    table, and one metadata lock): `stat()`, `lookup(name)`, `create(...)`,
+    `mkdir(...)`, `unlink(name)`, `rmdir(name)`, `link(name, target)`,
+    `symlink(name, target)`, `readlink()`, `rename(...)`, `readdir(cursor)`,
+    `truncate(size)`, `set_mode/owner/times(...)`, plus `read_page`/`write_page`
+    feeding `PageCache` and `sync()`.
+  - `DentryCache`: keyed by `(parent_dev, parent_ino, ComponentName)`, storing
+    child `(DevId, Ino)` with immediate invalidation on `unlink`, `rmdir`,
+    `rename`, and `mount`/`umount`.
+  - `MountTable`: maps mount-point `(DevId, Ino)` to mounted `Arc<dyn FileSystem>`
+    and tracks each mount's parent mountpoint so `..` at a mount root crosses
+    cleanly back to the parent filesystem (and `..` at `/` stays at `/`).
+    Each mounted filesystem receives a distinct `DevId` (`1` for root `ext4` or
+    fallback `tmpfs`, `2` for `/tmp`, `3` for `/dev`, `4` for `/proc`), so
+    `st_dev` is unique and cross-mount `rename`/`link` returns `-EXDEV`.
+- **Path & symlink resolution (`resolve_path`, host-tested):**
+  - Handles absolute paths, `dirfd`/`AT_FDCWD` relative paths, `.`, `..`,
+    collapsed `///`, `PATH_MAX = 4096`, `NAME_MAX = 255` (`-ENAMETOOLONG`).
+  - **Symlink loop protection:** follows at most `MAX_SYMLINK_DEPTH = 40`
+    symlinks per lookup, returning `-ELOOP` on cycles or deeper chains.
+  - **No-follow and trailing slash rules:** `AT_SYMLINK_NOFOLLOW`/`O_NOFOLLOW`
+    suppresses following the final component **unless** the path has a trailing
+    `/` (per POSIX: `"symlink/"` resolves the symlink and requires a directory;
+    `"file/"` returns `-ENOTDIR`; `open("link", O_NOFOLLOW)` returns `-ELOOP`).
+- **Open file descriptions vs FD table:**
+  - `FdEntry { file: Arc<OpenFile>, cloexec: bool }` in per-process `FdTable`
+    (capacity `MAX_FDS = 1024`).
+  - `OpenFile { id: OpenFileId, inode: Arc<VfsInode>, path: Arc<str>, flags: OpenFlags, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64> }`.
+  - `F_DUPFD`/`F_DUPFD_CLOEXEC` share the same `Arc<OpenFile>` (shared offset,
+    status flags, and `flock` ownership) while keeping independent `FD_CLOEXEC`.
+- **Advisory file locks (`crates/lumen-vfs::locks`, host-tested):**
+  - **`flock(2)` locks:** keyed by `OpenFileId` (`LOCK_SH`, `LOCK_EX`,
+    `LOCK_UN`, `LOCK_NB`). Same `OpenFileId` upgrades/downgrades atomically;
+    released automatically when the last FD referencing that `OpenFile` closes.
+  - **`fcntl` POSIX record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW`):** keyed by
+    `(pid, start..end)` byte ranges (`len == 0` means to `i64::MAX`), supporting
+    split, coalesce, and overwrite within the same `pid`, returning `-EAGAIN`
+    on conflict for `F_SETLK`, and releasing **all** POSIX record locks held by
+    `pid` on that inode when `pid` closes **any** FD referencing that inode
+    (POSIX requirement relied on by SQLite, Cargo, and Git). (In M8
+    multi-process execution, `F_SETLKW` and blocking `flock` sleep on a
+    per-inode `WaitQueue`.)
+
+### Pseudo-filesystems (`/tmp`, `/dev`, `/proc`)
+
+- **`/tmp` (`tmpfs`, `dev_id = 2`):** full in-memory writable POSIX filesystem
+  (regular files backed by `PageCache` frames so `MAP_SHARED`/`MAP_PRIVATE`
+  work identically to `ext4`, directories, symlinks, hard links, native
+  unlink-while-open via `Arc`, `renameat2`, `chmod`/`chown`/`utimensat`),
+  bounded by a configurable memory quota (default 32 MiB in M7, returning
+  `-ENOSPC` instead of exhausting kernel frames).
+- **`/dev` (`devfs`, `dev_id = 3`):** read-only directory of character devices
+  (`S_IFCHR`) with standard Linux `major:minor` `st_rdev`:
+  - `/dev/null` (`1:3`): `read` → 0 (EOF), `write` → `count`, `lseek` → 0.
+  - `/dev/zero` (`1:5`): `read` → zero bytes, `write` → `count`, `lseek` → 0,
+    `mmap` → anonymous zeroed pages.
+  - `/dev/random` (`1:8`) and `/dev/urandom` (`1:9`): `read` → `crate::rng`,
+    `write` → `count`.
+  - `/dev/tty` (`5:0`) and `/dev/console` (`5:1`): route to the calling
+    process's `ConsoleIo` (supporting `read`/`write`/`ioctl` `TCGETS`/`TCSETS*`/
+    `TIOCGWINSZ`/`poll`; `/dev/ptmx` and `/dev/pts/*` join in M8).
+- **`/proc` (`procfs`, `dev_id = 4`):** read-only dynamically generated views
+  (`st_size == 0` on virtual regular files, matching Linux):
+  - `/proc/self` → symlink to `<current_pid>`; `/proc/<pid>` resolves for the
+    calling process's PID.
+  - `/proc/<pid>/exe` → symlink to the process's canonical executable path
+    (e.g. `/bin/busybox`).
+  - `/proc/<pid>/fd` → directory of symlinks `0`, `1`, `2`, ... pointing to
+    each open FD's resolved path (appending ` (deleted)` if unlinked).
+  - `/proc/<pid>/maps` → strict Linux format
+    `{:012x}-{:012x} {}{}{}{} {:08x} {:02x}:{:02x} {} {}\n` (`p` for private/
+    anonymous, `s` for `MAP_SHARED`, `[heap]`, `[stack]`, or file path +
+    `dev_major:dev_minor` + `ino`), enabling `musl`'s `pthread_getattr_np` and
+    runtime stack/mapping discovery.
+  - `/proc/cpuinfo`, `/proc/meminfo` (live `MemTotal`/`MemFree`/`MemAvailable`/
+    `Cached` in kB from `mm::frame` + `PageCache`), `/proc/mounts` (and
+    `/proc/self/mounts`), and `/proc/version`.
+
+### Boot mount sequence and shell commands (M7)
+
+- **Boot (`kernel/src/main.rs`, right after `drivers::probe_all()` and `rng::init()`):**
+  `vfs::init()` initializes the mount table. If a `virtio-blk` device was bound
+  and carries a valid `ext4` superblock, it mounts it read-write at `/` (or
+  read-only if `VIRTIO_BLK_F_RO` is set); otherwise (including all M0–M6
+  scenarios without a disk attached, or a blank scratch disk in `test_blk`), it
+  mounts a `tmpfs` root at `/` without warning so all prior scenarios remain
+  green. `/tmp`, `/dev`, and `/proc` are then mounted (creating their mountpoint
+  directories on a `tmpfs` root if absent).
+- **Shell commands:**
+  - `blk`: lists bound block devices (PCI addr, capacity, read-only, flush
+    support, `BlockCache` hit/miss/dirty stats).
+  - `mount`: lists active mounts (`fs_type`, target, options).
+  - `sync`: flushes all filesystems and block devices.
+  - `linux /path/to/bin [args...]`: when `args[0]` begins with `/`, loads the
+    static or dynamic (`PT_INTERP`) ELF from VFS (resolving symlinks and
+    recording `exe_path` for `/proc/self/exe`) and runs it in ring 3. Commands
+    without a leading `/` continue to use M6's Limine boot-module lookup
+    (`linux hello`, `linux busybox ash -s`).
+
+### Global lock ordering (M7–M8)
+
+Every sleeping lock in the storage/VM stack obeys a strict acyclic order:
+
+```text
+1. AddressSpace::inner (SleepMutex)
+2. VFS MountTable / DentryCache (SleepMutex)
+3. VfsInode metadata / directory lock (SleepMutex)
+4. PageCache lock (SleepMutex)
+5. Ext4 / Tmpfs filesystem lock (SleepMutex)
+6. BlockCache lock (SleepMutex)
+7. BlockDevice request lock (SleepMutex)
+8. Leaf IRQ-off SpinLocks (ACTIVE_PROCS, VirtioHal::TABLE, frame, heap, sched)
+```
+
+**Invariants:**
+- Never acquire a `SleepMutex` while holding any `SpinLock` (enforced by
+  `SleepMutex::lock`'s `irq::enabled() && irq::depth() == 0` assertion).
+- Never hold locks 2–7 across `copy_from_user` / `copy_to_user` (which may
+  trigger `#PF` and acquire lock 1 `AddressSpace::inner`).
+- On `rename` involving two distinct directory inodes on the same filesystem,
+  always acquire directory locks in ascending `(DevId, Ino)` order (or under a
+  per-filesystem `rename_lock` taken before directory inode locks) to prevent
+  AB-BA deadlock.
+
+### Snapshots, namespaces & agent undo (M11)
+
+Per-process VFS mount namespaces confine sandboxed processes and agents to
+explicitly granted subtrees (`..` cannot escape a mount root). OverlayFS or
+block-level CoW snapshots (or an optional LumenFS volume) back `snap`/`undo`,
+so an agent session still takes an O(1) snapshot before each step and supports
+"Undo step" and "Undo all" (Principle 3).
 
 ## 10. IPC (pipes and PTYs planned, M8; `AF_UNIX` and `epoll` planned, M9)
 
@@ -6022,12 +6460,39 @@ kernel. The kernel is the trusted computing base.
 | Feature gate | every feature in `tests/features/*.toml` must pass (CI); `docs/STATUS.md` generated from the same data | `make status-check`, `make status` |
 | Linux ABI conformance (M6+) | upstream `musl` `libc-test`, gVisor syscall suites, and targeted LTP cases plus unmodified Alpine `ext4` runtime tests | `tests/scenarios/test_linux_*`, `test_alpine.py`, `test_conformance.py`, `test_runtimes.py` |
 
-**CI tiers, `status.py` feature gate, and deterministic disk images (M7–M10, #230).**
+**CI tiers, `status.py` feature gate, and deterministic disk images (M7–M10, #230, #246).**
 Starting in M7, Linux-userspace tests run against a deterministic, pre-baked
-Alpine Linux `x86_64` (`musl`) `ext4` disk image built/fetched on the host into
-`build/deps/` and pinned by sha256 (just like Limine and OVMF, never committed
-to the MIT repo)—CI scenarios never depend on live external package mirrors;
-M9's `apk`/HTTPS test talks to a local host test server.
+Alpine Linux `x86_64` (`musl`) `ext4` disk image built on the host into
+`build/deps/` (never committed to the MIT repo)—CI scenarios never depend on
+live external package mirrors; M9's `apk`/HTTPS test talks to a local host test
+server:
+
+- **Pinned Alpine minirootfs (`tools/fetch-deps.sh`):** downloads an exact
+  sha256-pinned `alpine-minirootfs-<version>-x86_64.tar.gz` into
+  `build/deps/alpine-minirootfs/` (containing unmodified `/lib/ld-musl-x86_64.so.1`,
+  dynamically linked `/bin/busybox`, standard symlinks `/bin/ls`, `/bin/cp`,
+  `/bin/mv`, `/bin/grep`, `/bin/sed`, `/bin/awk`, `/bin/tar`, `/bin/sh`, and
+  `/etc/*`).
+- **Rootless `ext4` image assembly (`tools/mkrootfs.sh`, `make rootfs`):**
+  stages the extracted minirootfs plus Lumen's tiny host-built M7 dynamic test
+  binaries (a dynamically linked test binary + a shared `.so` library exercising
+  `dlopen`/`dlsym`, file-backed `MAP_SHARED`/`MAP_PRIVATE` CoW, `flock`/`F_SETLK`,
+  `renameat2`, and POSIX VFS edge cases—cross-compiled on macOS and Ubuntu CI
+  using the pinned `rustc --target x86_64-unknown-linux-musl` + `rust-lld`
+  against the extracted `/lib/ld-musl-x86_64.so.1`, with zero external C
+  cross-compiler required) into a deterministic `build/deps/alpine-rootfs.ext4`
+  (e.g. 32 MiB, `-b 4096`) using **`mke2fs -t ext4 -b 4096 -d <staging>`**
+  (rootless—no `sudo` or `mount -o loop` required on either Ubuntu 24.04 CI or
+  macOS with `e2fsprogs` / Android SDK `mke2fs`; CI installs `e2fsprogs`
+  alongside QEMU). Fixed UUID and timestamps keep image generation
+  reproducible, and `e2fsck -fn` validates every newly built image (and is also
+  run on guest-mutated disk images in `test_fs.py` after QEMU exits!).
+- **Parallel scenario isolation:** every pytest scenario (`test_blk.py`,
+  `test_fs.py`, `test_linux_user.py`, `test_alpine.py`) copies the read-only
+  master `build/deps/alpine-rootfs.ext4` into its own per-test artifact/temp
+  path before passing `Devices(blk_image=...)` to QEMU, so parallel
+  `pytest-xdist` workers never collide and the cached master image stays
+  immutable.
 
 Because M10's full compiler/runtime tests (multi-file C++20 builds, `go build`,
 `rustc`/`cargo` with proc-macros, `node` V8 + `npm`, 2–4 GiB page-cache
@@ -6079,10 +6544,14 @@ run's, which the job summary was built from) survives.
 
 ```
 kernel/            the kernel (bin crate, x86_64-unknown-none)
-  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), apic, pic, pit, i8042 and cmos (ports), reset (reset and PM1 registers), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
+  src/arch/        HAL; x86_64/ has gdt, idt, irq, context (thread switch), fpu (FXSAVE64/XSAVE64), syscall (SWAPGS, LSTAR, sysretq), apic, pic, pit, i8042 and cmos (ports), reset (reset and PM1 registers), serial, stacks (registry), cpu, qemu, paging, percpu (GS base)
   src/acpi.rs      ACPI discovery (MADT, HPET, MCFG, FADT and the DSDT's _S5_) through lumen-acpi
   src/pci/         PCI discovery over ECAM (lumen-pci): pci::devices, the registry (BARs, claims), pci::claim, DeviceResources (mod.rs); MSI-X, DeviceResources::msix (msix.rs)
   src/drivers.rs   the driver table and probe_all
+  src/blk/         (M7, designed in #246) virtio-blk driver implementing BlockDevice, block-device registry, `blk` shell command
+  src/vfs/         (M7, designed in #246) POSIX VFS kernel integration, unified PageCache, writable ext4 adapter, tmpfs, devfs, procfs, `mount`/`sync` commands
+  src/linux/       Linux x86-64 ABI (M6 built #232–#238; M7 extends #246): UAPI re-exports (mod.rs), Limine boot-module loader (modules.rs), ProcessState + FD table + console bridge (process.rs), syscall dispatcher (syscall.rs)
+  src/user.rs      ring-3 entry/exit runner, `.lumen_fixup` safe user copies (`copy_from_user`/`copy_to_user`/`copy_cstr_from_user`), user exception handling (M6)
   src/sound.rs     the virtio-sound driver (its thread owns the device), beep, play, volume, sound
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport
   src/power.rs     reboot (0xCF9, 8042, triple fault) and ACPI S5 power-off
@@ -6094,7 +6563,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/sched.rs     kernel threads: per-CPU run queues (each change an X-ray runq event), preemption, sleep, wait queues
   src/boot.rs      Limine requests
   src/cmdline.rs   kernel command line (flags, key=value)
-  src/sync.rs      SpinLock (interrupts off while held; a wait an X-ray lock event)
+  src/sync.rs      SpinLock (interrupts off while held; a wait an X-ray lock event) and SleepMutex (interrupt-enabled sleeping mutex, M6)
   src/klog.rs      logger (levels, subsystem tags, serial timestamps, the ring dmesg reads)
   src/rtc.rs       the CMOS RTC: date and time (taken as UTC) for `date`
   src/fb.rs        framebuffer: pixels, glyphs, the hello screen (draw_header), the crash screen
@@ -6108,13 +6577,13 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/crash.rs     crash reporter
   src/ktest.rs     in-kernel test registry and runner
   src/shell/       the shells (lumen-shell): serial and the virtual terminals' consoles, the commands, system commands (sysinfo.rs), deliberate faults (crash.rs), trace runq/xray (xray.rs)
-  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs)
-  linker.ld        layout at -2 GiB, .ktests section (M6 adds .lumen_fixup in :rodata)
-crates/            no_std, host-testable libraries (lumen-acpi, lumen-app-api, lumen-calc, lumen-clock, lumen-demo, lumen-edit, lumen-elf, lumen-font, lumen-gfx, lumen-heap, lumen-input, lumen-mm, lumen-pci, lumen-perf, lumen-png, lumen-queue, lumen-rand, lumen-shell, lumen-snake, lumen-synth, lumen-term, lumen-time, lumen-trace, lumen-uart, lumen-ui, lumen-view, lumen-wm, lumen-xray; M6 adds lumen-vm)
+  src/mm/          memory management: frame allocator (frame.rs), page tables (paging.rs), heap (heap.rs), kernel stacks (stack.rs), window mapping (window.rs), user AddressSpace & demand paging (user_vm.rs, M6)
+  linker.ld        layout at -2 GiB, .ktests section, .lumen_fixup in :rodata (M6)
+crates/            no_std, host-testable libraries (lumen-acpi, lumen-app-api, lumen-calc, lumen-clock, lumen-demo, lumen-edit, lumen-elf, lumen-font, lumen-gfx, lumen-heap, lumen-input, lumen-mm, lumen-pci, lumen-perf, lumen-png, lumen-queue, lumen-rand, lumen-shell, lumen-snake, lumen-synth, lumen-term, lumen-time, lumen-trace, lumen-uart, lumen-ui, lumen-view, lumen-vm, lumen-wm, lumen-xray; M7 adds lumen-bcache and lumen-vfs)
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template
-tools/             fetch-deps.sh, mkiso.sh, wallpaper.py (makes the wallpaper), harness/ (Python package)
+tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), linux-hello/ (M6), wallpaper.py (makes the wallpaper), harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
 apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs for wasm32-unknown-unknown, built by `make build` into build/apps/<name>.wasm (the runtime's test apps, test-<name>, into build/apps/tests/<name>.wasm; testkit, the library they share)
