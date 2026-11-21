@@ -7605,6 +7605,17 @@ fn non_cacheable_child_that_disappears_is_enoent_on_the_next_resolve() {
     let before = dynfs.lookups.load(Ordering::Relaxed);
     assert_eq!(resolve_path(&env, None, b"/proc/7", nofollow).unwrap().inode.ino(), (1u64 << 48) | (7 << 16));
     assert!(dynfs.lookups.load(Ordering::Relaxed) > before, "/proc/7 came from a cache");
+    // The other insert paths hand a non-cacheable inode back uncached too.
+    let pid_dir = proc_root.lookup("7").unwrap();
+    let (dentry_gen, inode_gen) = env.cache_gens();
+    let created =
+        env.publish_created_inode(DYNFS_DEV, proc_root.ino(), "7", Arc::clone(&pid_dir), dentry_gen, inode_gen);
+    assert!(Arc::ptr_eq(&created.unwrap(), &pid_dir));
+    assert!(Arc::ptr_eq(&env.inode_get_or_insert(Arc::clone(&pid_dir)), &pid_dir));
+    let mp = env.parent_mount(DYNFS_DEV).unwrap();
+    let (_, mount_id) = env.mount_at_with_id(mp.dev_id(), mp.ino()).unwrap();
+    let mounted = env.inode_get_or_insert_if_mounted(mp.dev_id(), mp.ino(), mount_id, Arc::clone(&pid_dir));
+    assert!(Arc::ptr_eq(&mounted.unwrap(), &pid_dir));
     assert_eq!(env.dentry_get(DYNFS_DEV, proc_root.ino(), "7"), None);
     assert_eq!(dynfs_cached_per_pid(&env), (0, 0));
 

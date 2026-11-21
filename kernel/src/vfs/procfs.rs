@@ -715,6 +715,30 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
                 resolve_path(super::tables(), None, path.as_bytes(), flags)
                     .map_err(|e| format!("resolve {path} while pid {pid} lives: {e:?}"))?;
             }
+            // The tables' other insert paths hand `/proc/<pid>` back uncached.
+            let tables = super::tables();
+            let proc_root = super::resolve_path_from_root("/proc").map_err(|e| format!("/proc: {e:?}"))?;
+            let pid_dir = proc_root.lookup(&format!("{pid}")).map_err(|e| format!("lookup {pid}: {e:?}"))?;
+            let (dentry_gen, inode_gen) = tables.cache_gens();
+            let created = tables.publish_created_inode(
+                DevId::PROCFS,
+                INO_ROOT,
+                &format!("{pid}"),
+                Arc::clone(&pid_dir),
+                dentry_gen,
+                inode_gen,
+            );
+            let mp = tables.parent_mount(DevId::PROCFS).ok_or_else(|| String::from("/proc's mountpoint"))?;
+            let (_, mount_id) =
+                tables.mount_at_with_id(mp.dev_id(), mp.ino()).ok_or_else(|| String::from("/proc's mount id"))?;
+            let mounted = tables.inode_get_or_insert_if_mounted(mp.dev_id(), mp.ino(), mount_id, Arc::clone(&pid_dir));
+            let inserted = tables.inode_get_or_insert(Arc::clone(&pid_dir));
+            if !created.is_ok_and(|c| Arc::ptr_eq(&c, &pid_dir))
+                || !mounted.is_some_and(|m| Arc::ptr_eq(&m, &pid_dir))
+                || !Arc::ptr_eq(&inserted, &pid_dir)
+            {
+                return Err(format!("/proc/{pid} was unified with a cached inode"));
+            }
             if let Some(target) = super::tables().dentry_get(DevId::PROCFS, INO_ROOT, &format!("{pid}")) {
                 return Err(format!("/proc/{pid} is in the dentry cache: {target:?}"));
             }
