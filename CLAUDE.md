@@ -355,6 +355,19 @@ one is its own PR that updates that doc first.
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
   `AddressSpace::format_maps`).
+  `linux/` (M6, M7; ARCHITECTURE section 8): `linux/mod.rs` the
+  `linux-raw-sys` re-exports, `M6_SYSCALLS` and `M7_SYSCALLS` (the numbers,
+  `syscall_name`, pinned by the `abi_constants_match_spec` ktests), `uname`'s
+  payload and the `linux` command; `linux/process.rs` `ProcessState` (FD
+  table, console bridge); `linux/modules.rs` the Limine boot modules;
+  `linux/syscall/`: `mod.rs` `dispatch` (one arm per number, its constant as
+  the pattern) and the shared copy helpers, a module per cluster holding its
+  handlers (`fd`, `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`,
+  `proc`), an M7 syscall not yet implemented a stub (`not_implemented`:
+  logged once, `-ENOSYS`; each cluster's `*_m7_stubs_return_enosys` ktest),
+  and `at.rs` the file syscalls' register decoders (`FromReg`: `Fd`,
+  `Dirfd`, `Mode`, the VFS flags, `UserPtr`; the low 32 bits), `UserPath`
+  and `stat_from_metadata`.
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested; the `life`
   command's and the Life app's, a path dependency of `apps/`, #202).
