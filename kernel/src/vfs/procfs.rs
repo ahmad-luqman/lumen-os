@@ -789,3 +789,35 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn procfs_root_listing_keeps_its_inodes_and_agrees_with_lookup() {
+        // `readdir` builds its entries from `ProcKind` (#265): `/proc`'s fixed
+        // entries keep their numbers, types and order, and each agrees with
+        // what looking the name up and `stat`ing it says.
+        use crate::kassert_eq;
+        let fs = Procfs::new(DevId::makedev(0, 140));
+        let root = fs.root_inode();
+        let mut entries = Vec::new();
+        root.readdir(0, &mut entries, 64).map_err(|_| "readdir /proc")?;
+        let fixed: Vec<(u64, InodeType, &str)> =
+            entries.iter().take(7).map(|e| (e.ino, e.inode_type, e.name.as_str())).collect();
+        kassert_eq!(
+            fixed,
+            [
+                (1, InodeType::Dir, "."),
+                (1, InodeType::Dir, ".."),
+                (2, InodeType::File, "cpuinfo"),
+                (3, InodeType::File, "meminfo"),
+                (4, InodeType::File, "mounts"),
+                (6, InodeType::Symlink, "self"),
+                (5, InodeType::File, "version"),
+            ]
+        );
+        for (ino, itype, name) in fixed {
+            let st = root.lookup(name).and_then(|n| n.stat()).map_err(|_| "lookup and stat a fixed entry")?;
+            kassert_eq!((st.ino, st.inode_type), (ino, itype));
+        }
+        Ok(())
+    }
+);
