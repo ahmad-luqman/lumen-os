@@ -3636,15 +3636,15 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 88 | `symlink(target, linkpath)` | shim to `symlinkat(target, AT_FDCWD, linkpath)` |
 | 89 | `readlink(path, buf, bufsiz)` | shim to `readlinkat(AT_FDCWD, path, buf, bufsiz)` |
 | 90 | `chmod(path, mode)` | shim to `fchmodat(AT_FDCWD, path, mode)` |
-| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on a read-only mount) |
+| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on a read-only mount, devfs's nodes excepted: see below) |
 | 92 | `chown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, 0)` |
-| 93 | `fchown(fd, uid, gid)` | updates `uid`/`gid` (`u32::MAX` = leave unchanged) and `ctime` on open `fd`'s inode, dropping setuid (and setgid with group-execute) on a non-directory in the same `set_owner` (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs) |
+| 93 | `fchown(fd, uid, gid)` | updates `uid`/`gid` (`u32::MAX` = leave unchanged) and `ctime` on open `fd`'s inode, dropping setuid (and setgid with group-execute) on a non-directory in the same `set_owner` (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs, devfs's nodes excepted: see below) |
 | 94 | `lchown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)` |
-| — | *`chmod`, `chown` and `utimensat` families on `devfs`* | `-EROFS` (a read-only mount, devfs included). A divergence: Linux's devtmpfs accepts these on its nodes; accepting them takes devfs's setters and `writable_mount` (with `exempt_from_rofs`, as `open_inode` uses) |
+| — | *`chmod`, `chown` and `utimensat` families on `devfs`* | devfs's mount (`DevId::DEVFS`) skips the read-only-mount `-EROFS` (#293): Linux's devtmpfs is a writable mount. Its nodes' setters keep the new mode, owner and times in memory until reboot, and `stat` shows them. `/dev` itself stays `-EROFS`, its setters refusing (a divergence: Lumen's `/dev` namespace is read-only, and Linux's devtmpfs takes these on `/dev` too). A special file on any other read-only mount is `-EROFS`, as Linux's `mnt_want_write` |
 | 95 | `umask(mask)` | atomically sets per-process `umask = mask & 0o777` (default `0o022`) and returns previous mask |
 | 162 | `sync()` | snapshots mounted filesystems and cached inodes (never holding `MountTable`/`InodeCache` across I/O), flushes every dirty `PageCache` page and `BlockCache` block followed by `BlockDevice::flush()`; always returns `0` |
 | 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor` (the filesystem's `readdir` cursor, stable as entries come and go, with ext4's exceptions in section 9; `d_off` the cursor past each record); returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
-| 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on char devices—including on read-only `devfs`—`-EISDIR` on dirs, `-EROFS` on regular files on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on final symlink without trailing `/` unless `O_PATH` is also set; trailing `/` forces directory traversal even with `O_NOFOLLOW`, matching Linux), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
+| 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR` (a write open of a special file is never `-EROFS`, #291), `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on special files, `-EISDIR` on dirs, `-EROFS` on regular files on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on final symlink without trailing `/` unless `O_PATH` is also set; trailing `/` forces directory traversal even with `O_NOFOLLOW`, matching Linux), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
 | 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o1777) & !umask` (setuid/setgid dropped, sticky kept, as Linux's `vfs_mkdir`), stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
 | 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`); drops setuid (and setgid with group-execute) on a non-directory, as `fchown` |
 | 262 | `newfstatat(dirfd, path, buf, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (a `NULL` path with it is `""`, whatever the dirfd and other flags: Linux 6.11 for an fd dirfd with exactly that flag, 6.13 generally), and accepts and ignores `AT_NO_AUTOMOUNT` and the `AT_STATX_SYNC_TYPE` bits (as Linux's `vfs_statx`); writes 144-byte Linux x86-64 `struct stat` with unique `(st_dev, st_ino)` per filesystem/inode |
@@ -3653,13 +3653,13 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | creates hard link (`AT_SYMLINK_FOLLOW` / `AT_EMPTY_PATH`); rejects existing target (`-EEXIST`, a trailing `/` too; `-ENOENT` for a trailing `/` on a free name), then a read-only filesystem (`-EROFS`), then cross-mount (`-EXDEV`), then directories (`-EPERM`), Linux's order, incrementing `st_nlink` |
 | 266 | `symlinkat(target, newdirfd, linkpath)` | creates symlink with verbatim non-empty `target` (`-ENOENT` if `target` is empty, `-EEXIST` if `linkpath` exists, `-ENOENT`/`-EEXIST` on trailing `/`; a target that isn't UTF-8 `-EINVAL` until #268) |
 | 267 | `readlinkat(dirfd, path, buf, bufsiz)` | does not follow final symlink (`-EINVAL` if target is not a symlink or `bufsiz <= 0`); accepts empty `path == ""` on an `O_PATH` symlink `dirfd` (`-ENOENT` if that file is not a symlink, as Linux); copies `min(target.len(), bufsiz)` bytes **without** trailing NUL and returns bytes copied |
-| 268 | `fchmodat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`, which `musl` leaves uninitialized); follows symlinks and updates mode bits and `ctime` (`-EROFS` on read-only fs) |
+| 268 | `fchmodat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`, which `musl` leaves uninitialized); follows symlinks and updates mode bits and `ctime` (`-EROFS` on read-only fs, devfs's nodes excepted) |
 | 269 | `faccessat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`); shim to `faccessat2(dirfd, path, mode, 0)` |
-| 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`: any flag `-EINVAL`, an `O_PATH` or closed fd `-EBADF`; with `AT_FDCWD`, `-EFAULT`), `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`; both omitted returns `0` before the path or fd is looked at); an invalid `tv_nsec` (negative, or `>= 1_000_000_000`, and not a sentinel) is `-EINVAL`, checked after the lookup and before `-EROFS` |
+| 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`: any flag `-EINVAL`, an `O_PATH` or closed fd `-EBADF`; with `AT_FDCWD`, `-EFAULT`), `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`; both omitted returns `0` before the path or fd is looked at); an invalid `tv_nsec` (negative, or `>= 1_000_000_000`, and not a sentinel) is `-EINVAL`, checked after the lookup and before `-EROFS` (devfs's nodes excepted) |
 | 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); same-inode `rename(a, a)` is a no-op (`0`, or `-EEXIST` with `RENAME_NOREPLACE`); handles open-unlinked file and empty-dir target overwrite via the same detach/orphan path as `unlink`/`rmdir` (section 9); rejects unknown flags, `RENAME_WHITEOUT` or both together (`-EINVAL`, before the paths), cross-mount (`-EXDEV`, ahead of the `-EBUSY` below), `/`, `.` or `..` as either name (`-EBUSY`; `-EEXIST` on the new side with `RENAME_NOREPLACE`), mountpoint overwrite (`-EBUSY`), dir-over-non-dir, or a trailing `/` on either name when the source isn't a directory (`-ENOTDIR`, the slash checked before the types), non-dir-over-dir (`-EISDIR`), a new name that is an ancestor of the source's directory (`-ENOTEMPTY`); the checks in `do_renameat2`'s order (section 9), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
 | 332 | `statx(dirfd, path, flags, mask, buf)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH` (a `NULL` path with it is `""`, as for `newfstatat`), `AT_NO_AUTOMOUNT`, and `AT_STATX_SYNC_TYPE` (`AS_STAT`/`FORCE_SYNC`/`DONT_SYNC`, ignored); `-EINVAL` for both sync bits together or for `STATX__RESERVED` in `mask`; fills `struct statx` (`stx_blksize`, `stx_nlink`, `stx_uid`, `stx_gid`, `stx_mode`, `stx_ino`, `stx_size`, `stx_blocks`, `stx_atime`/`stx_mtime`/`stx_ctime`, `stx_rdev_*`, `stx_dev_*`; no `stx_btime`), `stx_mask` always `STATX_BASIC_STATS` whatever `mask` asks |
-| 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EACCESS` and `AT_EMPTY_PATH` (the three flags it has taken since Linux 5.8 added it; a `NULL` path is `-EFAULT`, even with `AT_EMPTY_PATH`); checks existence (`F_OK`) and permission bits as root (`uid == 0`): `R_OK` always; `W_OK` too, except `-EROFS` on a read-only mount (devfs `S_ISCHR` nodes exempt); `X_OK` if any execute bit is set, or always on a directory; an invalid mode or flag is `-EINVAL` before the path is looked at |
-| 452 | `fchmodat2(dirfd, path, mode, flags)` | 4-argument Linux 6.6+ variant accepting `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (unknown flags → `-EINVAL`); returns `-EOPNOTSUPP` **only when the resolved target is a symlink**, otherwise updates mode bits and `ctime` normally (`-EROFS` on read-only fs) |
+| 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EACCESS` and `AT_EMPTY_PATH` (the three flags it has taken since Linux 5.8 added it; a `NULL` path is `-EFAULT`, even with `AT_EMPTY_PATH`); checks existence (`F_OK`) and permission bits as root (`uid == 0`): `R_OK` always; `W_OK` too, except `-EROFS` on a read-only mount (special files exempt: `InodeType::is_special`, as `openat` agrees; #291); `X_OK` if any execute bit is set, or always on a directory; an invalid mode or flag is `-EINVAL` before the path is looked at |
+| 452 | `fchmodat2(dirfd, path, mode, flags)` | 4-argument Linux 6.6+ variant accepting `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (unknown flags → `-EINVAL`); returns `-EOPNOTSUPP` **only when the resolved target is a symlink**, otherwise updates mode bits and `ctime` normally (`-EROFS` on read-only fs, devfs's nodes excepted) |
 
 - **M8 (Processes, threads, signals, `futex`, PTYs):** `fork`/`vfork`/`clone`/
   `execve`/`wait4`, `futex`, real signals (`rt_sigreturn`, `sigaltstack`,
@@ -5520,6 +5520,20 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     console (reads, writes, the tty `ioctl`s, readiness `poll`, `-ESPIPE`
     on `lseek`) and gives every other `-ENOTTY` for the tty `ioctl`s (#254b). `VfsInode::drop` must never acquire a sleeping
     lock.
+  - **Read-only mounts and special files (#291):** `open_inode` (a write
+    open: `O_WRONLY`, `O_RDWR`, `O_TRUNC`) and `check_access` (`W_OK`)
+    skip their `-EROFS` for a special file, by its type alone
+    (`InodeType::is_special()`: character and block devices, FIFOs,
+    sockets), as Linux's `special_file()` in `do_dentry_open` and
+    `do_faccessat` (and `may_open`'s `sb_permission`, which refuses only
+    regular files, directories and symlinks); no filesystem can answer
+    otherwise. `chmod`/`chown`/`utimensat` keep the mount check whatever
+    the type, as Linux's `mnt_want_write`, except on devfs (section 8,
+    #293). A deviation until pipes and device routing by `rdev` exist: a
+    special file stored on ext4 (none in M7's image) opens for writing on
+    a read-only mount, as on a writable one, and its reads and writes are
+    `-EINVAL` (Linux: a FIFO waits for its peer, a socket node is
+    `-ENXIO`, a device node reaches its driver).
   - `InodeCache`: the `(DevId, Ino)` → `Arc<VfsInode>` map above. It evicts
     an entry only on `unlink`/`rmdir`/`rename`, a detach or `umount`, or
     when a lookup or open finds the cached entry dead (detached, `nlink ==
@@ -5705,10 +5719,13 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   bounded by a configurable memory quota (default 32 MiB in M7, returning
   `-ENOSPC` instead of exhausting kernel frames).
 - **`/dev` (`devfs`, `dev = 0:3`):** read-only directory (namespace mutations
-  such as `create`/`unlink`/`mkdir`/`rename`/`chmod` return `-EROFS`, while
-  `S_ISCHR` device nodes are exempt from `-EROFS` for `O_WRONLY`/`O_RDWR`/
-  `O_TRUNC`/`W_OK`, matching Linux `may_open`) of character devices (`S_IFCHR`)
-  with standard Linux `major:minor` `st_rdev` and permissions:
+  such as `create`/`unlink`/`mkdir`/`rename`, and a `chmod`/`chown`/`utimensat`
+  of `/dev` itself, return `-EROFS`, while the device nodes, special files, are
+  exempt from `-EROFS` for `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK`, matching Linux
+  `may_open` and `do_faccessat`) of character devices (`S_IFCHR`). A node's
+  `chmod`/`chown`/`utimensat` is taken, as devtmpfs takes it: devfs keeps
+  the new mode, owner and times in memory until reboot (#293). The nodes,
+  with standard Linux `major:minor` `st_rdev` and these permissions at boot:
   - `/dev/null` (`1:3`, `0o666`): `read` → 0 (EOF), `write` → `count`, `lseek` → 0.
   - `/dev/zero` (`1:5`, `0o666`): `read` → zero bytes, `write` → `count`,
     `lseek` → 0, `mmap` → anonymous zeroed pages.
