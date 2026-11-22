@@ -1,24 +1,27 @@
 //! File status and access checks (M7): `stat`, `lstat`, `newfstatat`,
 //! `statx`, `access`, `faccessat`, `faccessat2`.
 //!
-//! Each resolves its path once, through `at::start_dir` and
-//! `Start::resolve` (following the final symlink unless
-//! `AT_SYMLINK_NOFOLLOW`), and takes the inode's `Metadata` by value: no VFS
-//! lock is held, nor the inode kept, across the copy to user memory.
-//! `stat`, `lstat`, `access` and `faccessat` are shims over `newfstatat` and
-//! `faccessat2` with `AT_FDCWD` and fixed flags.
+//! Each resolves its path once, through `at::lookup` (`start_dir`, then
+//! `Start::resolve`, following the final symlink unless
+//! `AT_SYMLINK_NOFOLLOW`). The stat calls take the inode's `Metadata` by
+//! value and drop the inode before the copy to user memory, so no VFS lock
+//! is held, nor the inode kept, across it. `stat` and `lstat` are shims over
+//! `newfstatat` with `AT_FDCWD` and fixed flags, `access` one over
+//! `faccessat2` with `AT_FDCWD` and no flags, and `faccessat` one over
+//! `faccessat2` with its own dirfd and no flags.
 //!
 //! Every Lumen process runs as uid and gid 0, so `access` follows Linux's
-//! rules for root (`lumen_vfs::check_access`): `R_OK` and `W_OK` pass (but
-//! `W_OK` on a read-only mount is `-EROFS`, a devfs device node excepted),
-//! `X_OK` needs an execute bit or a directory, `F_OK` is existence alone.
+//! rules for root (`lumen_vfs::check_access`): `R_OK` passes; `W_OK` too,
+//! but on a read-only mount it is `-EROFS`; `X_OK` needs an execute bit or a
+//! directory; `F_OK` is existence alone. Linux exempts every device node,
+//! FIFO and socket from that `-EROFS`; Lumen, for now, only devfs's nodes.
 //! With the real and effective ids the same, `AT_EACCESS` changes nothing.
 
-use super::at::{Dirfd, UserPath, UserPtr, start_dir, stat_from_metadata, statx_from_metadata};
+use super::at::{Dirfd, UserPath, UserPtr, lookup, statx_from_metadata, write_stat};
 use super::{copy_pod_to_user, finish};
 use crate::linux::general;
 use crate::user::CopyError;
-use lumen_vfs::{AccessMask, AtFlags, Metadata, ResolveFlags, VfsError, check_access};
+use lumen_vfs::{AccessMask, AtFlags, Metadata, VfsError, check_access};
 
 /// The uid and gid every Lumen process runs as (no credentials yet).
 const ROOT_ID: u32 = 0;
@@ -30,7 +33,8 @@ const ROOT_ID: u32 = 0;
 const STAT_FLAGS: u32 =
     general::AT_SYMLINK_NOFOLLOW | general::AT_EMPTY_PATH | general::AT_NO_AUTOMOUNT | general::AT_STATX_SYNC_TYPE;
 
-/// The flags `faccessat2` takes, as Linux's (`AT_EMPTY_PATH` since 5.8).
+/// The flags `faccessat2` takes: all three it has taken since Linux 5.8,
+/// which added it.
 const FACCESSAT_FLAGS: u32 = general::AT_EACCESS | general::AT_SYMLINK_NOFOLLOW | general::AT_EMPTY_PATH;
 
 /// `stat(path, buf)` (4): `newfstatat(AT_FDCWD, path, buf, 0)`.
@@ -51,24 +55,23 @@ pub(super) fn sys_newfstatat(dirfd: Dirfd, path: UserPtr, buf: UserPtr, flags: A
 
 fn newfstatat(dirfd: Dirfd, path: UserPtr, buf: UserPtr, flags: AtFlags) -> Result<u64, u32> {
     let flags = flags.validate(STAT_FLAGS).map_err(VfsError::to_errno)?;
-    let st = stat_from_metadata(&metadata_at(dirfd, path, flags)?);
-    // SAFETY: `general::stat` is 144 bytes of integers with an explicit
-    // `__pad0` and no implicit padding, all initialized.
-    unsafe { copy_pod_to_user(buf.addr(), &st) }.map_err(CopyError::to_errno)?;
+    write_stat(buf, &metadata_at(dirfd, path, flags)?)?;
     Ok(0)
 }
 
 /// `statx(dirfd, path, flags, mask, buf)` (332): the 256-byte `struct
-/// statx`. Whatever `mask` asks for, the basic fields are filled, and
-/// `stx_mask` says so (`STATX_BASIC_STATS`), as Linux may answer.
+/// statx`. Whatever `mask` asks for (except `STATX__RESERVED`: `-EINVAL`),
+/// the basic fields are filled, and `stx_mask` says so
+/// (`STATX_BASIC_STATS`), as Linux may answer.
 pub(super) fn sys_statx(dirfd: Dirfd, path: UserPtr, flags: AtFlags, mask: u32, buf: UserPtr) -> u64 {
     finish(statx(dirfd, path, flags, mask, buf))
 }
 
 fn statx(dirfd: Dirfd, path: UserPtr, flags: AtFlags, mask: u32, buf: UserPtr) -> Result<u64, u32> {
     let flags = flags.validate(STAT_FLAGS).map_err(VfsError::to_errno)?;
-    // Both sync bits at once ask for two things (`statx`'s `-EINVAL`, not
-    // `newfstatat`'s), as does the bit reserved for extending `struct statx`.
+    // `-EINVAL` for both sync bits at once (`statx` refuses them, though
+    // `newfstatat` takes them) and for the mask bit reserved for a larger
+    // `struct statx`.
     if flags.0 & general::AT_STATX_SYNC_TYPE == general::AT_STATX_SYNC_TYPE || mask & general::STATX__RESERVED != 0 {
         return Err(VfsError::Inval.to_errno());
     }
@@ -81,18 +84,16 @@ fn statx(dirfd: Dirfd, path: UserPtr, flags: AtFlags, mask: u32, buf: UserPtr) -
 
 /// The metadata of what `path` names from `dirfd` (`flags` already
 /// validated): the file itself for an empty path with `AT_EMPTY_PATH`, the
-/// final symlink itself with `AT_SYMLINK_NOFOLLOW`. The resolved inode is
-/// dropped before this returns.
+/// final symlink itself with `AT_SYMLINK_NOFOLLOW`. With `AT_EMPTY_PATH` a
+/// `NULL` path is `""` (Linux 6.11's rule for `fstatat` and `statx`, not
+/// `faccessat2`'s). The resolved inode is dropped before this returns.
 fn metadata_at(dirfd: Dirfd, path: UserPtr, flags: AtFlags) -> Result<Metadata, u32> {
-    let path = UserPath::copy_in(path, flags.has_empty_path())?;
-    let start = start_dir(dirfd, &path)?;
-    let how = ResolveFlags {
-        follow_final: !flags.has_symlink_nofollow(),
-        empty_path: flags.has_empty_path(),
-        require_dir: false,
+    let path = if path.is_null() && flags.has_empty_path() {
+        UserPath::empty()
+    } else {
+        UserPath::copy_in(path, flags.has_empty_path())?
     };
-    let found = start.resolve(&path, how)?;
-    found.inode.stat().map_err(VfsError::to_errno)
+    lookup(dirfd, &path, flags)?.stat().map_err(VfsError::to_errno)
 }
 
 /// `access(path, mode)` (21): `faccessat2(AT_FDCWD, path, mode, 0)`.
@@ -116,15 +117,11 @@ fn faccessat2(dirfd: Dirfd, path: UserPtr, mode: AccessMask, flags: AtFlags) -> 
     // The mode and flags first: an invalid one is `-EINVAL` whatever the path.
     let mode = mode.validate().map_err(VfsError::to_errno)?;
     let flags = flags.validate(FACCESSAT_FLAGS).map_err(VfsError::to_errno)?;
+    // A `NULL` path is `-EFAULT`, `AT_EMPTY_PATH` or not: Linux 6.11 made it
+    // `""` only for `fstatat` and `statx`.
     let path = UserPath::copy_in(path, flags.has_empty_path())?;
-    let start = start_dir(dirfd, &path)?;
-    let how = ResolveFlags {
-        follow_final: !flags.has_symlink_nofollow(),
-        empty_path: flags.has_empty_path(),
-        require_dir: false,
-    };
-    let found = start.resolve(&path, how)?;
-    check_access(crate::vfs::tables(), &found.inode, mode, ROOT_ID, ROOT_ID).map_err(VfsError::to_errno)?;
+    let inode = lookup(dirfd, &path, flags)?;
+    check_access(crate::vfs::tables(), &inode, mode, ROOT_ID, ROOT_ID).map_err(VfsError::to_errno)?;
     Ok(0)
 }
 
@@ -137,12 +134,13 @@ mod tests {
     use super::*;
     use crate::linux::errno;
     use crate::linux::process::{self, KTEST_USER_LEN, KTEST_USER_VA};
-    use crate::linux::syscall::at::{Fd, reg};
+    use crate::linux::syscall::at::{Fd, reg, stat_from_metadata};
+    use crate::linux::syscall::copy_pod_from_user;
     use crate::linux::syscall::fd::ktest_user_path;
     use crate::linux::syscall::neg_errno;
     use crate::user::{copy_from_user, copy_to_user};
     use crate::{kassert, kassert_eq};
-    use lumen_vfs::{OpenFlags, resolve_path, symlink_at, unlink_at};
+    use lumen_vfs::{DevId, OpenFlags, ResolveFlags, resolve_path, symlink_at, unlink_at};
 
     /// The user buffers the tests copy into: past the path slots (the first
     /// page), one `struct stat` or `struct statx` each.
@@ -178,11 +176,13 @@ mod tests {
         found.inode.stat().map_err(|_| "stat kernel-side")
     }
 
-    /// The `struct stat` Linux would write for `path`.
+    /// `stat_from_metadata` of the inode `path` names, resolved kernel-side:
+    /// what the handlers must have written.
     fn want_stat(path: &[u8], follow: bool) -> Result<Vec<u8>, &'static str> {
         Ok(bytes_of(&stat_from_metadata(&meta(path, follow)?)))
     }
 
+    /// `statx_from_metadata` of the inode `path` names, resolved kernel-side.
     fn want_statx(path: &[u8], follow: bool) -> Result<Vec<u8>, &'static str> {
         Ok(bytes_of(&statx_from_metadata(&meta(path, follow)?)))
     }
@@ -207,24 +207,20 @@ mod tests {
         process::install_current_fd(file, false).map(|n| reg::<Fd>(n as u64)).map_err(|_| "install the fd")
     }
 
-    /// Remove what a test made, the deepest first; whatever is missing is
-    /// skipped (a failed test may not have made it).
-    fn clean(files: &[&[u8]], dirs: &[&[u8]]) {
+    /// Remove what a test made, the deepest first. Only what is missing is
+    /// skipped (a failed test may not have made it); any other error fails
+    /// the test, once it has run every removal.
+    fn clean(files: &[&[u8]], dirs: &[&[u8]]) -> Result<(), &'static str> {
         let tables = crate::vfs::tables();
+        let removed = |r: Result<(), VfsError>| matches!(r, Ok(()) | Err(VfsError::NoEnt));
+        let mut ok = true;
         for f in files {
-            let _ = unlink_at(tables, None, f, false);
+            ok &= removed(unlink_at(tables, None, f, false));
         }
         for d in dirs {
-            let _ = unlink_at(tables, None, d, true);
+            ok &= removed(unlink_at(tables, None, d, true));
         }
-    }
-
-    fn at(flags: u32) -> AtFlags {
-        reg(u64::from(flags))
-    }
-
-    fn mode(bits: u32) -> AccessMask {
-        reg(u64::from(bits))
+        if ok { Ok(()) } else { Err("cleaning up the test's files failed") }
     }
 
     crate::ktest!(
@@ -268,9 +264,9 @@ mod tests {
                 kassert_eq!(meta(LINK, false)?.st_mode() & 0o170_000, 0o120_000);
                 kassert!(stat_at(BUF_A)? != stat_at(BUF_B)?);
                 // `newfstatat` alike, `AT_SYMLINK_NOFOLLOW` being `lstat`.
-                kassert_eq!(sys_newfstatat(Dirfd::Cwd, link, reg(BUF_A), at(0)), 0);
+                kassert_eq!(sys_newfstatat(Dirfd::Cwd, link, reg(BUF_A), AtFlags(0)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(FILE, true)?);
-                kassert_eq!(sys_newfstatat(Dirfd::Cwd, link, reg(BUF_A), at(general::AT_SYMLINK_NOFOLLOW)), 0);
+                kassert_eq!(sys_newfstatat(Dirfd::Cwd, link, reg(BUF_A), AtFlags(general::AT_SYMLINK_NOFOLLOW)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(LINK, false)?);
                 // A trailing slash follows even `lstat`'s final symlink.
                 kassert_eq!(sys_lstat(dir_link_slash, reg(BUF_A)), 0);
@@ -279,9 +275,9 @@ mod tests {
                 // Relative to a directory fd, names that mean nothing from `/`.
                 let dir_fd = Dirfd::Fd(open_fd(DIR, OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?);
                 let rel_link = ktest_user_path(4, b"l")?;
-                kassert_eq!(sys_newfstatat(dir_fd, rel_link, reg(BUF_A), at(0)), 0);
+                kassert_eq!(sys_newfstatat(dir_fd, rel_link, reg(BUF_A), AtFlags(0)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(FILE, true)?);
-                kassert_eq!(sys_newfstatat(dir_fd, rel_link, reg(BUF_A), at(general::AT_SYMLINK_NOFOLLOW)), 0);
+                kassert_eq!(sys_newfstatat(dir_fd, rel_link, reg(BUF_A), AtFlags(general::AT_SYMLINK_NOFOLLOW)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(LINK, false)?);
                 kassert_eq!(sys_stat(rel_link, reg(BUF_A)), neg_errno(errno::ENOENT));
                 // ... and relative to the cwd, once it is that directory.
@@ -296,25 +292,50 @@ mod tests {
                 // `AT_EMPTY_PATH` with an empty path: the dirfd's file itself,
                 // a directory, a regular file, or the cwd.
                 let empty = ktest_user_path(5, b"")?;
-                kassert_eq!(sys_newfstatat(dir_fd, empty, reg(BUF_A), at(general::AT_EMPTY_PATH)), 0);
+                kassert_eq!(sys_newfstatat(dir_fd, empty, reg(BUF_A), AtFlags(general::AT_EMPTY_PATH)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(DIR, true)?);
                 let file_fd = Dirfd::Fd(open_fd(FILE, OpenFlags::O_RDONLY)?);
-                kassert_eq!(sys_newfstatat(file_fd, empty, reg(BUF_A), at(general::AT_EMPTY_PATH)), 0);
+                kassert_eq!(sys_newfstatat(file_fd, empty, reg(BUF_A), AtFlags(general::AT_EMPTY_PATH)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(FILE, true)?);
-                kassert_eq!(sys_newfstatat(Dirfd::Cwd, empty, reg(BUF_A), at(general::AT_EMPTY_PATH)), 0);
+                kassert_eq!(sys_newfstatat(Dirfd::Cwd, empty, reg(BUF_A), AtFlags(general::AT_EMPTY_PATH)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(DIR, true)?);
                 // An `O_PATH` fd on the symlink itself, with both flags: the link.
                 let link_fd = Dirfd::Fd(open_fd(LINK, OpenFlags::O_PATH | OpenFlags::O_NOFOLLOW)?);
                 let both = general::AT_EMPTY_PATH | general::AT_SYMLINK_NOFOLLOW;
-                kassert_eq!(sys_newfstatat(link_fd, empty, reg(BUF_A), at(both)), 0);
+                kassert_eq!(sys_newfstatat(link_fd, empty, reg(BUF_A), AtFlags(both)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(LINK, false)?);
                 // `AT_EMPTY_PATH` with a path that isn't empty changes nothing.
-                kassert_eq!(sys_newfstatat(dir_fd, rel_link, reg(BUF_A), at(general::AT_EMPTY_PATH)), 0);
+                kassert_eq!(sys_newfstatat(dir_fd, rel_link, reg(BUF_A), AtFlags(general::AT_EMPTY_PATH)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(FILE, true)?);
+
+                // A `NULL` path with `AT_EMPTY_PATH` is `""` for `newfstatat`
+                // and `statx` (Linux 6.11): the fd's file, or the cwd. Not for
+                // `faccessat2`, nor without the flag: `-EFAULT`.
+                let null: UserPtr = reg(0);
+                let empty_path = AtFlags(general::AT_EMPTY_PATH);
+                scribble(BUF_A, size_of::<general::stat>())?;
+                kassert_eq!(sys_newfstatat(file_fd, null, reg(BUF_A), empty_path), 0);
+                kassert_eq!(stat_at(BUF_A)?, want_stat(FILE, true)?);
+                kassert_eq!(sys_newfstatat(link_fd, null, reg(BUF_A), AtFlags(both)), 0);
+                kassert_eq!(stat_at(BUF_A)?, want_stat(LINK, false)?);
+                kassert_eq!(sys_newfstatat(Dirfd::Cwd, null, reg(BUF_A), empty_path), 0);
+                kassert_eq!(stat_at(BUF_A)?, want_stat(DIR, true)?);
+                scribble(BUF_B, size_of::<general::statx>())?;
+                kassert_eq!(sys_statx(file_fd, null, empty_path, 0, reg(BUF_B)), 0);
+                kassert_eq!(statx_at(BUF_B)?, want_statx(FILE, true)?);
+                kassert_eq!(sys_statx(dir_fd, null, empty_path, 0, reg(BUF_B)), 0);
+                kassert_eq!(statx_at(BUF_B)?, want_statx(DIR, true)?);
+                kassert_eq!(sys_newfstatat(Dirfd::Fd(reg(999)), null, reg(BUF_A), empty_path), neg_errno(errno::EBADF));
+                kassert_eq!(sys_newfstatat(file_fd, null, reg(BUF_A), AtFlags(0)), neg_errno(errno::EFAULT));
+                kassert_eq!(sys_statx(file_fd, null, AtFlags(0), 0, reg(BUF_B)), neg_errno(errno::EFAULT));
+                let f_ok = AccessMask(general::F_OK);
+                kassert_eq!(sys_faccessat2(file_fd, null, f_ok, empty_path), neg_errno(errno::EFAULT));
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, null, f_ok, empty_path), neg_errno(errno::EFAULT));
                 Ok(())
             });
-            clean(&[LINK, DIR_LINK, FILE], &[DIR]);
-            result?
+            let cleaned = clean(&[LINK, DIR_LINK, FILE], &[DIR]);
+            result??;
+            cleaned
         }
     );
 
@@ -340,54 +361,52 @@ mod tests {
                 // Whatever the mask asks (nothing, a field, everything): the
                 // basic fields, said so in `stx_mask`.
                 for mask in [0, general::STATX_SIZE, general::STATX_ALL, 0x7fff_ffff] {
-                    scribble(BUF_B, 256)?;
-                    kassert_eq!(sys_statx(Dirfd::Cwd, file, at(0), mask, reg(BUF_B)), 0);
+                    scribble(BUF_B, size_of::<general::statx>())?;
+                    kassert_eq!(sys_statx(Dirfd::Cwd, file, AtFlags(0), mask, reg(BUF_B)), 0);
                     kassert_eq!(statx_at(BUF_B)?, want_statx(FILE, true)?);
                 }
                 // Field by field against `stat`'s answer.
                 kassert_eq!(sys_stat(file, reg(BUF_A)), 0);
-                let st = stat_at(BUF_A)?;
-                let stx = statx_at(BUF_B)?;
-                let u64_of = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8 bytes"));
-                let u32_of = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().expect("4 bytes"));
-                let u16_of = |b: &[u8], o: usize| u16::from_le_bytes(b[o..o + 2].try_into().expect("2 bytes"));
-                kassert_eq!(u32_of(&stx, 0), general::STATX_BASIC_STATS); // stx_mask
-                kassert_eq!(u64::from(u32_of(&stx, 4)), u64_of(&st, 56)); // blksize
-                kassert_eq!(u64::from(u32_of(&stx, 16)), u64_of(&st, 16)); // nlink
-                kassert_eq!(u32_of(&stx, 20), u32_of(&st, 28)); // uid
-                kassert_eq!(u32_of(&stx, 24), u32_of(&st, 32)); // gid
-                kassert_eq!(u32::from(u16_of(&stx, 28)), u32_of(&st, 24)); // mode
-                kassert_eq!(u32_of(&st, 24), 0o100_604);
-                kassert_eq!(u64_of(&stx, 32), u64_of(&st, 8)); // ino
-                kassert_eq!(u64_of(&stx, 40), u64_of(&st, 48)); // size
-                kassert_eq!(u64_of(&st, 48), 5000);
-                kassert_eq!(u64_of(&stx, 48), u64_of(&st, 64)); // blocks
-                kassert_eq!(u64_of(&stx, 64), u64_of(&st, 72)); // atime
-                kassert_eq!(u64::from(u32_of(&stx, 72)), u64_of(&st, 80));
-                kassert_eq!(u64_of(&stx, 96), u64_of(&st, 104)); // ctime
-                kassert_eq!(u64::from(u32_of(&stx, 104)), u64_of(&st, 112));
-                kassert_eq!(u64_of(&stx, 112), u64_of(&st, 88)); // mtime
-                kassert_eq!(u64::from(u32_of(&stx, 120)), u64_of(&st, 96));
-                let dev = lumen_vfs::DevId::makedev(u32_of(&stx, 136), u32_of(&stx, 140));
-                kassert_eq!(dev.raw(), u64_of(&st, 0)); // dev
-                let rdev = lumen_vfs::DevId::makedev(u32_of(&stx, 128), u32_of(&stx, 132));
-                kassert_eq!(rdev.raw(), u64_of(&st, 40)); // rdev
+                // SAFETY: every bit pattern is a valid `stat` and `statx`
+                // (integers only).
+                let st = unsafe { copy_pod_from_user::<general::stat>(BUF_A) }.map_err(|_| "copy the stat")?;
+                // SAFETY: as above.
+                let stx = unsafe { copy_pod_from_user::<general::statx>(BUF_B) }.map_err(|_| "copy the statx")?;
+                kassert_eq!(stx.stx_mask, general::STATX_BASIC_STATS);
+                kassert_eq!(i64::from(stx.stx_blksize), st.st_blksize);
+                kassert_eq!(u64::from(stx.stx_nlink), st.st_nlink);
+                kassert_eq!(stx.stx_uid, st.st_uid);
+                kassert_eq!(stx.stx_gid, st.st_gid);
+                kassert_eq!(u32::from(stx.stx_mode), st.st_mode);
+                kassert_eq!(st.st_mode, 0o100_604);
+                kassert_eq!(stx.stx_ino, st.st_ino);
+                kassert_eq!(stx.stx_size as i64, st.st_size);
+                kassert_eq!(st.st_size, 5000);
+                kassert_eq!(stx.stx_blocks as i64, st.st_blocks);
+                kassert_eq!(stx.stx_atime.tv_sec as u64, st.st_atime);
+                kassert_eq!(u64::from(stx.stx_atime.tv_nsec), st.st_atime_nsec);
+                kassert_eq!(stx.stx_ctime.tv_sec as u64, st.st_ctime);
+                kassert_eq!(u64::from(stx.stx_ctime.tv_nsec), st.st_ctime_nsec);
+                kassert_eq!(stx.stx_mtime.tv_sec as u64, st.st_mtime);
+                kassert_eq!(u64::from(stx.stx_mtime.tv_nsec), st.st_mtime_nsec);
+                kassert_eq!(DevId::makedev(stx.stx_dev_major, stx.stx_dev_minor).raw(), st.st_dev);
+                kassert_eq!(DevId::makedev(stx.stx_rdev_major, stx.stx_rdev_minor).raw(), st.st_rdev);
 
                 // A symlink followed, or not; a directory; `AT_EMPTY_PATH` on an fd.
-                kassert_eq!(sys_statx(Dirfd::Cwd, link, at(0), 0, reg(BUF_B)), 0);
+                kassert_eq!(sys_statx(Dirfd::Cwd, link, AtFlags(0), 0, reg(BUF_B)), 0);
                 kassert_eq!(statx_at(BUF_B)?, want_statx(FILE, true)?);
-                kassert_eq!(sys_statx(Dirfd::Cwd, link, at(general::AT_SYMLINK_NOFOLLOW), 0, reg(BUF_B)), 0);
+                kassert_eq!(sys_statx(Dirfd::Cwd, link, AtFlags(general::AT_SYMLINK_NOFOLLOW), 0, reg(BUF_B)), 0);
                 kassert_eq!(statx_at(BUF_B)?, want_statx(LINK, false)?);
-                kassert_eq!(sys_statx(Dirfd::Cwd, dir, at(0), 0, reg(BUF_B)), 0);
+                kassert_eq!(sys_statx(Dirfd::Cwd, dir, AtFlags(0), 0, reg(BUF_B)), 0);
                 kassert_eq!(statx_at(BUF_B)?, want_statx(DIR, true)?);
                 let dir_fd = Dirfd::Fd(open_fd(DIR, OpenFlags::O_RDONLY)?);
-                kassert_eq!(sys_statx(dir_fd, empty, at(general::AT_EMPTY_PATH), 0, reg(BUF_B)), 0);
+                kassert_eq!(sys_statx(dir_fd, empty, AtFlags(general::AT_EMPTY_PATH), 0, reg(BUF_B)), 0);
                 kassert_eq!(statx_at(BUF_B)?, want_statx(DIR, true)?);
                 let rel = ktest_user_path(4, b"l")?;
-                kassert_eq!(sys_statx(dir_fd, rel, at(0), 0, reg(BUF_B)), 0);
+                kassert_eq!(sys_statx(dir_fd, rel, AtFlags(0), 0, reg(BUF_B)), 0);
                 kassert_eq!(statx_at(BUF_B)?, want_statx(FILE, true)?);
 
-                // `AT_NO_AUTOMOUNT` and either sync type: accepted, ignored.
+                // `AT_NO_AUTOMOUNT` and either sync bit: accepted, ignored.
                 for flags in [
                     general::AT_NO_AUTOMOUNT,
                     general::AT_STATX_SYNC_AS_STAT,
@@ -395,24 +414,25 @@ mod tests {
                     general::AT_STATX_DONT_SYNC,
                     general::AT_NO_AUTOMOUNT | general::AT_STATX_DONT_SYNC | general::AT_SYMLINK_NOFOLLOW,
                 ] {
-                    scribble(BUF_B, 256)?;
-                    kassert_eq!(sys_statx(Dirfd::Cwd, link, at(flags), 0, reg(BUF_B)), 0);
+                    scribble(BUF_B, size_of::<general::statx>())?;
+                    kassert_eq!(sys_statx(Dirfd::Cwd, link, AtFlags(flags), 0, reg(BUF_B)), 0);
                     let follow = flags & general::AT_SYMLINK_NOFOLLOW == 0;
                     kassert_eq!(statx_at(BUF_B)?, want_statx(if follow { FILE } else { LINK }, follow)?);
                 }
-                // Both sync types, the reserved mask bit or an unknown flag:
+                // Both sync bits, the reserved mask bit or an unknown flag:
                 // `-EINVAL`, the buffer untouched.
-                scribble(BUF_B, 256)?;
+                scribble(BUF_B, size_of::<general::statx>())?;
                 let einval = neg_errno(errno::EINVAL);
-                kassert_eq!(sys_statx(Dirfd::Cwd, file, at(general::AT_STATX_SYNC_TYPE), 0, reg(BUF_B)), einval);
-                kassert_eq!(sys_statx(Dirfd::Cwd, file, at(0), general::STATX__RESERVED, reg(BUF_B)), einval);
-                kassert_eq!(sys_statx(Dirfd::Cwd, file, at(general::AT_REMOVEDIR), 0, reg(BUF_B)), einval);
-                kassert_eq!(sys_statx(Dirfd::Cwd, file, at(0x1), 0, reg(BUF_B)), einval);
+                kassert_eq!(sys_statx(Dirfd::Cwd, file, AtFlags(general::AT_STATX_SYNC_TYPE), 0, reg(BUF_B)), einval);
+                kassert_eq!(sys_statx(Dirfd::Cwd, file, AtFlags(0), general::STATX__RESERVED, reg(BUF_B)), einval);
+                kassert_eq!(sys_statx(Dirfd::Cwd, file, AtFlags(general::AT_REMOVEDIR), 0, reg(BUF_B)), einval);
+                kassert_eq!(sys_statx(Dirfd::Cwd, file, AtFlags(0x1), 0, reg(BUF_B)), einval);
                 kassert!(statx_at(BUF_B)?.iter().all(|&b| b == 0xa5));
                 Ok(())
             });
-            clean(&[LINK, FILE], &[DIR]);
-            result?
+            let cleaned = clean(&[LINK, FILE], &[DIR]);
+            result??;
+            cleaned
         }
     );
 
@@ -438,7 +458,7 @@ mod tests {
                 symlink_at(tables, b"missing", None, DANGLING).map_err(|_| "symlink")?;
                 let (f, r, w, x) = (general::F_OK, general::R_OK, general::W_OK, general::X_OK);
                 let check = |slot: u64, path: &[u8], bits: u32| -> Result<u64, &'static str> {
-                    Ok(sys_access(ktest_user_path(slot, path)?, mode(bits)))
+                    Ok(sys_access(ktest_user_path(slot, path)?, AccessMask(bits)))
                 };
                 let eacces = neg_errno(errno::EACCES);
 
@@ -465,7 +485,7 @@ mod tests {
                 for bits in [8, 0x10, 0xffff_ffff] {
                     kassert_eq!(check(0, PLAIN, bits)?, neg_errno(errno::EINVAL));
                     kassert_eq!(check(0, b"/tmp/stat-ktest-access/missing", bits)?, neg_errno(errno::EINVAL));
-                    kassert_eq!(sys_access(reg(0), mode(bits)), neg_errno(errno::EINVAL));
+                    kassert_eq!(sys_access(reg(0), AccessMask(bits)), neg_errno(errno::EINVAL));
                 }
 
                 // A read-only mount: `W_OK` is `-EROFS` (the check comes
@@ -485,53 +505,63 @@ mod tests {
                 // `AT_SYMLINK_NOFOLLOW` the link itself (0o777).
                 let link = ktest_user_path(1, LINK)?;
                 let dangling = ktest_user_path(2, DANGLING)?;
-                let nofollow = at(general::AT_SYMLINK_NOFOLLOW);
-                kassert_eq!(sys_access(link, mode(x)), eacces);
-                kassert_eq!(sys_faccessat2(Dirfd::Cwd, link, mode(x), at(0)), eacces);
-                kassert_eq!(sys_faccessat2(Dirfd::Cwd, link, mode(x), nofollow), 0);
-                kassert_eq!(sys_access(dangling, mode(f)), neg_errno(errno::ENOENT));
-                kassert_eq!(sys_faccessat2(Dirfd::Cwd, dangling, mode(f), nofollow), 0);
+                let nofollow = AtFlags(general::AT_SYMLINK_NOFOLLOW);
+                kassert_eq!(sys_access(link, AccessMask(x)), eacces);
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, link, AccessMask(x), AtFlags(0)), eacces);
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, link, AccessMask(x), nofollow), 0);
+                kassert_eq!(sys_access(dangling, AccessMask(f)), neg_errno(errno::ENOENT));
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, dangling, AccessMask(f), nofollow), 0);
                 // `AT_EACCESS`: the same answers (real and effective ids are 0).
-                let eaccess = at(general::AT_EACCESS);
-                kassert_eq!(sys_faccessat2(Dirfd::Cwd, link, mode(r | w), eaccess), 0);
-                kassert_eq!(sys_faccessat2(Dirfd::Cwd, link, mode(x), eaccess), eacces);
+                let eaccess = AtFlags(general::AT_EACCESS);
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, link, AccessMask(r | w), eaccess), 0);
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, link, AccessMask(x), eaccess), eacces);
                 let exec = ktest_user_path(3, EXEC)?;
-                kassert_eq!(sys_faccessat2(Dirfd::Cwd, exec, mode(x), eaccess), 0);
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, exec, AccessMask(x), eaccess), 0);
                 // Any other flag: `-EINVAL`, even on a missing path.
                 let missing = ktest_user_path(4, b"/tmp/stat-ktest-access/missing")?;
                 for bad in [general::AT_SYMLINK_FOLLOW, general::AT_NO_AUTOMOUNT, general::AT_STATX_DONT_SYNC, 0x1] {
-                    kassert_eq!(sys_faccessat2(Dirfd::Cwd, exec, mode(f), at(bad)), neg_errno(errno::EINVAL));
-                    kassert_eq!(sys_faccessat2(Dirfd::Cwd, missing, mode(f), at(bad)), neg_errno(errno::EINVAL));
+                    kassert_eq!(
+                        sys_faccessat2(Dirfd::Cwd, exec, AccessMask(f), AtFlags(bad)),
+                        neg_errno(errno::EINVAL)
+                    );
+                    kassert_eq!(
+                        sys_faccessat2(Dirfd::Cwd, missing, AccessMask(f), AtFlags(bad)),
+                        neg_errno(errno::EINVAL)
+                    );
                 }
 
                 // Relative to a directory fd, through `faccessat` and `faccessat2`.
                 let dir_fd = Dirfd::Fd(open_fd(DIR, OpenFlags::O_RDONLY)?);
                 let rel_exec = ktest_user_path(5, b"exec")?;
                 let rel_plain = ktest_user_path(6, b"plain")?;
-                kassert_eq!(sys_faccessat(dir_fd, rel_exec, mode(x)), 0);
-                kassert_eq!(sys_faccessat(dir_fd, rel_plain, mode(x)), eacces);
-                kassert_eq!(sys_faccessat(dir_fd, rel_plain, mode(r | w)), 0);
-                kassert_eq!(sys_faccessat2(dir_fd, rel_exec, mode(x), at(0)), 0);
-                kassert_eq!(sys_faccessat(Dirfd::Cwd, rel_exec, mode(f)), neg_errno(errno::ENOENT));
-                kassert_eq!(sys_faccessat(dir_fd, exec, mode(x)), 0);
+                kassert_eq!(sys_faccessat(dir_fd, rel_exec, AccessMask(x)), 0);
+                kassert_eq!(sys_faccessat(dir_fd, rel_plain, AccessMask(x)), eacces);
+                kassert_eq!(sys_faccessat(dir_fd, rel_plain, AccessMask(r | w)), 0);
+                kassert_eq!(sys_faccessat2(dir_fd, rel_exec, AccessMask(x), AtFlags(0)), 0);
+                kassert_eq!(sys_faccessat(Dirfd::Cwd, rel_exec, AccessMask(f)), neg_errno(errno::ENOENT));
+                kassert_eq!(sys_faccessat(dir_fd, exec, AccessMask(x)), 0);
 
                 // `AT_EMPTY_PATH` with an empty path: the dirfd's file itself
                 // (or the cwd); without it, an empty path is `-ENOENT`.
                 let empty = ktest_user_path(7, b"")?;
-                let empty_path = at(general::AT_EMPTY_PATH);
+                let empty_path = AtFlags(general::AT_EMPTY_PATH);
                 let plain_fd = Dirfd::Fd(open_fd(PLAIN, OpenFlags::O_RDONLY)?);
                 let exec_fd = Dirfd::Fd(open_fd(EXEC, OpenFlags::O_PATH)?);
-                kassert_eq!(sys_faccessat2(plain_fd, empty, mode(r | w), empty_path), 0);
-                kassert_eq!(sys_faccessat2(plain_fd, empty, mode(x), empty_path), eacces);
-                kassert_eq!(sys_faccessat2(exec_fd, empty, mode(x), empty_path), 0);
-                kassert_eq!(sys_faccessat2(dir_fd, empty, mode(x), empty_path), 0);
-                kassert_eq!(sys_faccessat2(Dirfd::Cwd, empty, mode(x), empty_path), 0);
-                kassert_eq!(sys_faccessat2(plain_fd, empty, mode(f), at(0)), neg_errno(errno::ENOENT));
-                kassert_eq!(sys_faccessat2(Dirfd::Fd(reg(999)), empty, mode(f), empty_path), neg_errno(errno::EBADF));
+                kassert_eq!(sys_faccessat2(plain_fd, empty, AccessMask(r | w), empty_path), 0);
+                kassert_eq!(sys_faccessat2(plain_fd, empty, AccessMask(x), empty_path), eacces);
+                kassert_eq!(sys_faccessat2(exec_fd, empty, AccessMask(x), empty_path), 0);
+                kassert_eq!(sys_faccessat2(dir_fd, empty, AccessMask(x), empty_path), 0);
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, empty, AccessMask(x), empty_path), 0);
+                kassert_eq!(sys_faccessat2(plain_fd, empty, AccessMask(f), AtFlags(0)), neg_errno(errno::ENOENT));
+                kassert_eq!(
+                    sys_faccessat2(Dirfd::Fd(reg(999)), empty, AccessMask(f), empty_path),
+                    neg_errno(errno::EBADF)
+                );
                 Ok(())
             });
-            clean(&[LINK, DANGLING, PLAIN, EXEC, OTHER_X, NONE], &[SUBDIR, DIR]);
-            result?
+            let cleaned = clean(&[LINK, DANGLING, PLAIN, EXEC, OTHER_X, NONE], &[SUBDIR, DIR]);
+            result??;
+            cleaned
         }
     );
 
@@ -569,11 +599,11 @@ mod tests {
                     [
                         sys_stat(path, buf),
                         sys_lstat(path, buf),
-                        sys_newfstatat(Dirfd::Cwd, path, buf, at(0)),
-                        sys_statx(Dirfd::Cwd, path, at(0), 0, buf),
-                        sys_access(path, mode(general::F_OK)),
-                        sys_faccessat(Dirfd::Cwd, path, mode(general::F_OK)),
-                        sys_faccessat2(Dirfd::Cwd, path, mode(general::F_OK), at(0)),
+                        sys_newfstatat(Dirfd::Cwd, path, buf, AtFlags(0)),
+                        sys_statx(Dirfd::Cwd, path, AtFlags(0), 0, buf),
+                        sys_access(path, AccessMask(general::F_OK)),
+                        sys_faccessat(Dirfd::Cwd, path, AccessMask(general::F_OK)),
+                        sys_faccessat2(Dirfd::Cwd, path, AccessMask(general::F_OK), AtFlags(0)),
                     ]
                 };
                 let every = |e: u32| [neg_errno(e); 7];
@@ -591,10 +621,10 @@ mod tests {
                 kassert_eq!([r[0], r[2], r[3], r[4], r[5], r[6]], [neg_errno(errno::ELOOP); 6]);
                 kassert_eq!(r[1], 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(LOOP_A, false)?);
-                let nofollow = at(general::AT_SYMLINK_NOFOLLOW);
+                let nofollow = AtFlags(general::AT_SYMLINK_NOFOLLOW);
                 kassert_eq!(sys_newfstatat(Dirfd::Cwd, looped, buf, nofollow), 0);
                 kassert_eq!(sys_statx(Dirfd::Cwd, looped, nofollow, 0, buf), 0);
-                kassert_eq!(sys_faccessat2(Dirfd::Cwd, looped, mode(general::F_OK), nofollow), 0);
+                kassert_eq!(sys_faccessat2(Dirfd::Cwd, looped, AccessMask(general::F_OK), nofollow), 0);
                 // Through a loop, a component: `-ELOOP` even for `lstat`.
                 let via_loop = ktest_user_path(7, b"/tmp/stat-ktest-errno/a/x")?;
                 kassert_eq!(sys_lstat(via_loop, buf), neg_errno(errno::ELOOP));
@@ -603,31 +633,37 @@ mod tests {
                 for bad in [reg(0), edge, reg(0xffff_8000_0000_0000)] {
                     kassert_eq!(sys_stat(file, bad), neg_errno(errno::EFAULT));
                     kassert_eq!(sys_lstat(file, bad), neg_errno(errno::EFAULT));
-                    kassert_eq!(sys_newfstatat(Dirfd::Cwd, file, bad, at(0)), neg_errno(errno::EFAULT));
-                    kassert_eq!(sys_statx(Dirfd::Cwd, file, at(0), 0, bad), neg_errno(errno::EFAULT));
+                    kassert_eq!(sys_newfstatat(Dirfd::Cwd, file, bad, AtFlags(0)), neg_errno(errno::EFAULT));
+                    kassert_eq!(sys_statx(Dirfd::Cwd, file, AtFlags(0), 0, bad), neg_errno(errno::EFAULT));
                 }
-                // ... but a path's error comes first.
+                // ... but a path's error comes first, and a bad flag's before it.
                 kassert_eq!(sys_stat(missing, reg(0)), neg_errno(errno::ENOENT));
+                kassert_eq!(sys_statx(Dirfd::Cwd, missing, AtFlags(0), 0, reg(0)), neg_errno(errno::ENOENT));
+                kassert_eq!(sys_statx(Dirfd::Cwd, file, AtFlags(0x1), 0, reg(0)), neg_errno(errno::EINVAL));
+                kassert_eq!(sys_newfstatat(Dirfd::Cwd, file, reg(0), AtFlags(0x1)), neg_errno(errno::EINVAL));
 
                 // A bad dirfd with a relative path, or with `AT_EMPTY_PATH`:
                 // `-EBADF`; with an absolute path it isn't looked at.
                 for fd in [999u64, u64::MAX, 0x8000_0000] {
                     let bad = Dirfd::Fd(reg(fd));
-                    kassert_eq!(sys_newfstatat(bad, rel, buf, at(0)), neg_errno(errno::EBADF));
-                    kassert_eq!(sys_statx(bad, rel, at(0), 0, buf), neg_errno(errno::EBADF));
-                    kassert_eq!(sys_faccessat(bad, rel, mode(general::F_OK)), neg_errno(errno::EBADF));
-                    kassert_eq!(sys_faccessat2(bad, rel, mode(general::F_OK), at(0)), neg_errno(errno::EBADF));
-                    let empty_path = at(general::AT_EMPTY_PATH);
+                    kassert_eq!(sys_newfstatat(bad, rel, buf, AtFlags(0)), neg_errno(errno::EBADF));
+                    kassert_eq!(sys_statx(bad, rel, AtFlags(0), 0, buf), neg_errno(errno::EBADF));
+                    kassert_eq!(sys_faccessat(bad, rel, AccessMask(general::F_OK)), neg_errno(errno::EBADF));
+                    kassert_eq!(
+                        sys_faccessat2(bad, rel, AccessMask(general::F_OK), AtFlags(0)),
+                        neg_errno(errno::EBADF)
+                    );
+                    let empty_path = AtFlags(general::AT_EMPTY_PATH);
                     kassert_eq!(sys_newfstatat(bad, empty, buf, empty_path), neg_errno(errno::EBADF));
                     kassert_eq!(sys_statx(bad, empty, empty_path, 0, buf), neg_errno(errno::EBADF));
-                    kassert_eq!(sys_newfstatat(bad, file, buf, at(0)), 0);
-                    kassert_eq!(sys_faccessat(bad, file, mode(general::F_OK)), 0);
+                    kassert_eq!(sys_newfstatat(bad, file, buf, AtFlags(0)), 0);
+                    kassert_eq!(sys_faccessat(bad, file, AccessMask(general::F_OK)), 0);
                 }
                 // A relative path through a regular file's fd: `-ENOTDIR`.
                 let file_fd = Dirfd::Fd(open_fd(FILE, OpenFlags::O_RDONLY)?);
-                kassert_eq!(sys_newfstatat(file_fd, rel, buf, at(0)), neg_errno(errno::ENOTDIR));
-                kassert_eq!(sys_statx(file_fd, rel, at(0), 0, buf), neg_errno(errno::ENOTDIR));
-                kassert_eq!(sys_faccessat(file_fd, rel, mode(general::F_OK)), neg_errno(errno::ENOTDIR));
+                kassert_eq!(sys_newfstatat(file_fd, rel, buf, AtFlags(0)), neg_errno(errno::ENOTDIR));
+                kassert_eq!(sys_statx(file_fd, rel, AtFlags(0), 0, buf), neg_errno(errno::ENOTDIR));
+                kassert_eq!(sys_faccessat(file_fd, rel, AccessMask(general::F_OK)), neg_errno(errno::ENOTDIR));
 
                 // `AT_NO_AUTOMOUNT` and the sync bits, both of them too (only
                 // `statx` refuses those together): accepted, ignored.
@@ -637,26 +673,27 @@ mod tests {
                     general::AT_STATX_DONT_SYNC,
                     general::AT_STATX_SYNC_TYPE,
                 ] {
-                    scribble(BUF_A, 144)?;
-                    kassert_eq!(sys_newfstatat(Dirfd::Cwd, file, buf, at(ignored)), 0);
+                    scribble(BUF_A, size_of::<general::stat>())?;
+                    kassert_eq!(sys_newfstatat(Dirfd::Cwd, file, buf, AtFlags(ignored)), 0);
                     kassert_eq!(stat_at(BUF_A)?, want_stat(FILE, true)?);
                 }
                 // `newfstatat`'s other flags: `-EINVAL`, before the path.
                 for bad in [general::AT_REMOVEDIR, general::AT_SYMLINK_FOLLOW, 0x1, 0x8000_0000] {
-                    kassert_eq!(sys_newfstatat(Dirfd::Cwd, file, buf, at(bad)), neg_errno(errno::EINVAL));
-                    kassert_eq!(sys_newfstatat(Dirfd::Cwd, missing, buf, at(bad)), neg_errno(errno::EINVAL));
-                    kassert_eq!(sys_statx(Dirfd::Cwd, missing, at(bad), 0, buf), neg_errno(errno::EINVAL));
+                    kassert_eq!(sys_newfstatat(Dirfd::Cwd, file, buf, AtFlags(bad)), neg_errno(errno::EINVAL));
+                    kassert_eq!(sys_newfstatat(Dirfd::Cwd, missing, buf, AtFlags(bad)), neg_errno(errno::EINVAL));
+                    kassert_eq!(sys_statx(Dirfd::Cwd, missing, AtFlags(bad), 0, buf), neg_errno(errno::EINVAL));
                 }
-                // Both sync types, or the reserved mask bit: `-EINVAL` before
+                // Both sync bits, or the reserved mask bit: `-EINVAL` before
                 // the path too.
-                let sync_both = at(general::AT_STATX_SYNC_TYPE);
+                let sync_both = AtFlags(general::AT_STATX_SYNC_TYPE);
                 kassert_eq!(sys_statx(Dirfd::Cwd, missing, sync_both, 0, buf), neg_errno(errno::EINVAL));
                 let reserved = general::STATX__RESERVED;
-                kassert_eq!(sys_statx(Dirfd::Cwd, missing, at(0), reserved, buf), neg_errno(errno::EINVAL));
+                kassert_eq!(sys_statx(Dirfd::Cwd, missing, AtFlags(0), reserved, buf), neg_errno(errno::EINVAL));
                 Ok(())
             });
-            clean(&[LOOP_A, LOOP_B, FILE], &[DIR]);
-            result?
+            let cleaned = clean(&[LOOP_A, LOOP_B, FILE], &[DIR]);
+            result??;
+            cleaned
         }
     );
 
@@ -693,7 +730,7 @@ mod tests {
                 kassert_eq!(call(general::__NR_lstat, link, BUF_A, high, high, high), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(LINK, false)?);
                 // newfstatat(dirfd, path, buf, flags).
-                scribble(BUF_A, 144)?;
+                scribble(BUF_A, size_of::<general::stat>())?;
                 kassert_eq!(call(general::__NR_newfstatat, high | dir_fd, rel, BUF_A, high | nofollow, high), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(LINK, false)?);
                 // statx(dirfd, path, flags, mask, buf).
@@ -725,8 +762,9 @@ mod tests {
                 );
                 Ok(())
             });
-            clean(&[LINK, FILE], &[DIR]);
-            result?
+            let cleaned = clean(&[LINK, FILE], &[DIR]);
+            result??;
+            cleaned
         }
     );
 }

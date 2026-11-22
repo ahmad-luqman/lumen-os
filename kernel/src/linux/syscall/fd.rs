@@ -213,10 +213,9 @@ pub(super) fn sys_fstat(fd: Fd, statbuf: UserPtr) -> u64 {
 
 fn fstat(fd: Fd, statbuf: UserPtr) -> Result<u64, u32> {
     let file = fd.file()?;
-    let st = at::stat_from_metadata(&file.inode.stat().map_err(vfs)?);
+    let m = file.inode.stat().map_err(vfs)?;
     drop(file);
-    // SAFETY: `general::stat` is 144 bytes with explicit `__pad0` and zero implicit padding.
-    unsafe { copy_pod_to_user(statbuf.addr(), &st) }.map_err(CopyError::to_errno)?;
+    at::write_stat(statbuf, &m)?;
     Ok(0)
 }
 

@@ -179,7 +179,6 @@ impl FromReg for AccessMask {
 pub(super) struct UserPtr(u64);
 
 impl UserPtr {
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `utimensat` (wave 3) calls it; the ktests until then
     pub(super) fn is_null(self) -> bool {
         self.0 == 0
     }
@@ -214,6 +213,12 @@ impl UserPath {
         let max_len = general::PATH_MAX as usize - 1;
         let bytes = copy_cstr_from_user(ptr.addr(), max_len).map_err(CopyError::to_errno)?;
         Self::from_bytes(bytes, allow_empty)
+    }
+
+    /// The empty path, for a caller that reads `NULL` as `""`
+    /// (`newfstatat` and `statx` with `AT_EMPTY_PATH`, from Linux 6.11).
+    pub(super) fn empty() -> Self {
+        Self(Vec::new())
     }
 
     fn from_bytes(bytes: Vec<u8>, allow_empty: bool) -> Result<Self, u32> {
@@ -371,6 +376,31 @@ pub(super) fn start_dir(dirfd: Dirfd, path: &UserPath) -> Result<Start, u32> {
         return Err(errno::ENOTDIR);
     }
     Ok(Start { dir: Some(inode), base: Some(base) })
+}
+
+/// The inode `path` names from `dirfd`, as a `*at` syscall's `flags` (the
+/// caller validated them) say: the final symlink followed unless
+/// `AT_SYMLINK_NOFOLLOW`; with `AT_EMPTY_PATH`, an empty path naming the
+/// start itself. Without that flag an empty path is `-ENOENT` here too,
+/// however `path` was copied in. Not for `linkat`, whose
+/// `AT_SYMLINK_FOLLOW` runs the other way.
+pub(super) fn lookup(dirfd: Dirfd, path: &UserPath, flags: AtFlags) -> Result<Arc<dyn VfsInode>, u32> {
+    let start = start_dir(dirfd, path)?;
+    let how = ResolveFlags {
+        follow_final: !flags.has_symlink_nofollow(),
+        empty_path: flags.has_empty_path(),
+        ..ResolveFlags::default()
+    };
+    Ok(start.resolve(path, how)?.inode)
+}
+
+/// Write `m` as Linux's `struct stat` to `buf` (`fstat`, the `stat`
+/// family): `-EFAULT` for a bad buffer. Must be called with no lock held.
+pub(super) fn write_stat(buf: UserPtr, m: &Metadata) -> Result<(), u32> {
+    let st = stat_from_metadata(m);
+    // SAFETY: `general::stat` is 144 bytes of integers with an explicit
+    // `__pad0` and no implicit padding, all initialized.
+    unsafe { super::copy_pod_to_user(buf.addr(), &st) }.map_err(CopyError::to_errno)
 }
 
 /// A timestamp's nanoseconds, within `0..1_000_000_000` whatever a
