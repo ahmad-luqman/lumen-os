@@ -351,7 +351,8 @@ one is its own PR that updates that doc first.
   first ext4 virtio-blk volume at `/`, else a tmpfs root; `/tmp`, `/dev`,
   `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
   and the `mount`, `sync` and `vfstest` commands (`vfstest`: file
-  operations for the scenarios until #254 wires the syscalls);
+  operations from the kernel shell, for the scenarios to set up and inspect
+  files around ring-3 programs);
   `vfs/tests.rs` the ktests of `mod.rs`'s code (`lumen_kernel::vfs::tests::`;
   `vfs/ext4.rs` and `vfs/page_cache.rs` keep their own; `MemBlkDev`, the
   in-memory block device those files' ktests use too, stays in `mod.rs`);
@@ -744,10 +745,20 @@ one is its own PR that updates that doc first.
   prints it; `HOST_TIMED`, the warnings a loaded host can cause on its own,
   each tied to the kernel's text, and `unexpected_warnings`, a run's "no
   warning" check without them), `rootfs.py` (matched `e2fsprogs` discovery,
-  per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, and
-  `llvm-readobj` dynamic musl ELF checks).
+  per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, `debugfs`
+  and `debugfs_names` (reading an image back, any error line failing), and
+  `llvm-readobj` dynamic musl ELF checks), `leaks.py` (exact `leaked_frames`
+  around #300's stack-window page tables, one every `STACK_TABLE_EVERY`
+  processes: `start_stack_table` runs `busybox true` until one maps it;
+  `CleanRuns.run`, a machine's `linux` commands, starting a table before the
+  first and once `CLEAN_RUNS` runs have followed one, each where the last
+  puts it, and `finish` checking the next after the last run).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
-  assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, `libm7.so`).
+  assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
+  for #255's exit scenarios, and `libm7.so`;
+  `m7_vfs`, #254's exit scenarios' program: `posix`, `locks`, `keep` (a
+  tree left for fsck), and `lock-hold`/`lock-probe`, two processes at once,
+  every check a raw syscall by number).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests
   (incl. `test_rootfs.py`),
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs

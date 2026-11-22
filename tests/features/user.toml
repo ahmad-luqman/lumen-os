@@ -202,3 +202,38 @@ tests = [
     "ktest:lumen_kernel::linux::exec::dynamic_elf_maps_interp_and_sets_auxv",
     "ktest:lumen_kernel::vfs::tests::vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing",
 ]
+
+[[feature]]
+name = "Unmodified Alpine busybox ash -s off the ext4 rootfs (#255): a script of built-ins fed line by line over serial (arithmetic, cd and $PWD, for, [, case, read from stdin), its exit 3 the process's exit code, leaking no frames (the runs kept clear of #300's kernel stack-window page tables)"
+milestone = "M7"
+tests = [
+    "scenario:test_alpine::test_alpine_minirootfs_coreutils",
+]
+
+[[feature]]
+name = "/proc/self/maps from ring 3 (#255): a dynamic musl program reads its maps: its own, libm7.so's (mapped by ld-musl through mmap) and ld-musl's lines name the files' device and inode (as the kernel's vfstest stat gives them) and paths from column 73, each file's lines private and its code executable, and a [stack] line"
+milestone = "M7"
+tests = [
+    "scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen",
+]
+
+[[feature]]
+name = "ARCHITECTURE section 8's M7 syscall table pinned by number (its 49 rows: the 47 M7 syscalls, the VFS ones and msync, plus M6's mmap and getcwd, extended in M7) and M7's flags and struct layouts (statx, flock, linux_dirent64) against linux-raw-sys (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::m7_abi_constants_match_spec",
+]
+
+[[feature]]
+name = "POSIX file semantics from ring 3 (#254): a dynamic musl program on the Alpine rootfs (m7_vfs posix), every check on ext4 and again on tmpfs: symlinks and ELOOP (a loop, 40 links followed and 41 not, O_NOFOLLOW), a trailing slash following a final symlink under O_NOFOLLOW, O_PATH descriptors (-EBADF for I/O, fstat, a dirfd, readlinkat of a link), hard links and linkat AT_SYMLINK_FOLLOW, unlink while open (st_ino a detached one) and rmdir while open, getdents64 (d_type, d_ino as lstat's, one entry a call, an entry held back for the next call, a moved directory's ..), pread64/pwrite64 leaving the offset alone, stat/lstat/newfstatat/statx agreeing (owner too), chmod/chown/umask/utimensat (UTIME_NOW, UTIME_OMIT, a NULL path, a link), chdir/fchdir/getcwd (through a link, a renamed and a removed cwd), -EXDEV between tmpfs and ext4, -ENOTTY from a tty ioctl on a file; everything made removed (a second run leaking no frame)"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_posix_vfs_semantics",
+]
+
+[[feature]]
+name = "Advisory locks and renames from ring 3 (#254): flock between two open file descriptions in one process (-EWOULDBLOCK, a dup sharing its lock, released by LOCK_UN and the description's last close, not a dup's), renameat2 RENAME_NOREPLACE (-EEXIST, also onto a hard link of the same file and a file onto a directory) and RENAME_EXCHANGE, rename over an open file (the descriptor reading the old data) on ext4 and tmpfs; fcntl record locks seen by a second process running meanwhile (F_GETLK's type, range and the holder's pid, F_SETLK -EAGAIN): a range split by an unlock, coalesced by a relock, and released by closing any descriptor of the file and by the holder's exit; no warning or error logged meanwhile"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_flock_and_atomic_rename",
+]

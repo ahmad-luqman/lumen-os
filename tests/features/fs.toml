@@ -96,6 +96,20 @@ tests = [
 ]
 
 [[feature]]
+name = "msync(MS_SYNC) puts a ring-3 MAP_SHARED mapping's stores on the disk (#255): the shell exiting without a sync after it, the ext4 image passes the host's e2fsck -fn and the next boot reads the stores back"
+milestone = "M7"
+tests = [
+    "scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen",
+]
+
+[[feature]]
+name = "Unmodified Alpine minirootfs coreutils on the writable ext4 root (#255): dynamic /bin/busybox ls, cat, cp, mv of a file and of a tree across mounts both ways (/tmp to / and back, the source gone and cmp equal), grep, sed (-n with p, -i over an ext4 file), awk, uncompressed tar -cf onto tmpfs and -xf onto ext4 (the files equal), each run leaking exactly the pages of the files it creates, less those it frees (the runs kept clear of #300's kernel stack-window page tables); then sync and exit, the mutated image passes the host's e2fsck -fn, and the host's debugfs finds the changes on the disk (the sed -i edit, the extracted files equal to the host's, / holding exactly the image's names and the test's new ones, nothing under /tmp)"
+milestone = "M7"
+tests = [
+    "scenario:test_alpine::test_alpine_minirootfs_coreutils",
+]
+
+[[feature]]
 name = "Read-only mounts exempt every special file (character and block devices, FIFOs, sockets) from -EROFS, as Linux's special_file(): access(W_OK) and a write open (O_WRONLY, O_RDWR, O_TRUNC) agree, while a regular file, directory or symlink gets EROFS from access (#291)"
 milestone = "M7"
 tests = ["cargo:lumen-vfs"]
@@ -110,4 +124,12 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_a_special_file_on_another_read_only_mount_stays_erofs",
     "ktest:lumen_kernel::vfs::devfs::devfs_nodes_start_with_their_boot_metadata",
     "ktest:lumen_kernel::vfs::tests::vfs_dev_checks_pass_after_a_chmod_of_a_dev_node",
+]
+
+[[feature]]
+name = "ext4 rootfs fsck-clean after Linux programs' file syscalls (#254): with nothing left once the programs remove what they made (unlink and rmdir while open, renames over open files, record locks), and with a tree they leave (a hard link, a short and a long symlink, two files' mode, owner and times, one written by a sync and one set on a clean inode after it, a file and a directory exchanged, a directory moved to another parent with its ..), all of it read back from the disk on a second boot"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_posix_vfs_semantics",
+    "scenario:test_fs::test_flock_and_atomic_rename",
 ]

@@ -3684,7 +3684,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
   `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64`, `sysinfo`,
   and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery.
 
-### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` loader built #255; file-backed segments and `dlopen` designed in #246, M7)
+### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` loader built #255, designed in #246; `dlopen` through ld-musl's file `mmap` built #255, M7)
 
 - **Validation (`crates/lumen-elf`, host-tested):**
   checks ELF64 little-endian `ET_EXEC` (or `ET_DYN` PIE), `EM_X86_64`, no
@@ -3719,7 +3719,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
   `pwd`, `export`, arithmetic, loops, and `exit` over serial without job
   control). Interactive `lineedit`, pipes, and external subprocesses require
   `fork`/`pipe`/`dup2`/`wait4`/PTYs and arrive in M8.
-- **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`; the loader built in #255, designed in #246; file-backed mappings and `dlopen` still designed, M7):**
+- **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`; designed in #246, built in #255 (the loader copies segment bytes; the file-backed part is ld-musl's `mmap(fd)` of libraries); `dlopen` of `libm7.so` checked by `test_linux_user::test_dynamic_musl_binary_and_dlopen`, M7):**
   - **`crates/lumen-elf` parser extension:** `LoadedElf::parse_with_pie_base(image, pie_base)`
     accepts an optional `PT_INTERP` header (at most one; rejects duplicate
     `PT_INTERP`, `p_filesz <= 1` (empty or NUL-only), `p_filesz > PATH_MAX`,
@@ -3773,8 +3773,11 @@ corresponding `*at(AT_FDCWD, ...)` handler):
   - **M7 scope for Alpine minirootfs:** M7 executes unmodified dynamic Alpine
     `/bin/busybox` directly (`ls`, `cp`, `mv`, `grep`, `sed`, `awk`,
     uncompressed `tar -cf/-xf`, and built-ins-only `ash -s`) plus dynamic
-    `dlopen`/`dlsym` test binaries via `linux /path/to/bin [args...]`. Multi-command
-    `ash` scripts, shell redirections (`dup`/`dup2`), and pipelines arrive in M8.
+    `dlopen`/`dlsym` test binaries via `linux /path/to/bin [args...]`, one
+    applet per `linux` line (`test_alpine::test_alpine_minirootfs_coreutils`;
+    `tools/linux-m7/m7_test.rs` with `libm7.so` for `dlopen` and file `mmap`
+    from ring 3). `ash` scripts running external commands, shell
+    redirections (`dup`/`dup2`), and pipelines arrive in M8.
 
 ### Capabilities and sandboxing (WASM M5; Linux namespaces M11)
 
@@ -5295,6 +5298,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
      `ftruncate`/`mmap` continue to work until `open_count` reaches 0, and
      detached directories return `-ENOENT` on `lookup`/`create`/`mkdir`/`link`/
      `symlink` and empty EOF on `getdents64` (while `getcwd` returns `-ENOENT`).
+   - `fstat(fd)`'s `st_ino` changes when the inode is detached, on ext4 and
+     tmpfs alike: both give it a synthetic number with bit 63 set
+     (`lumen_vfs::next_detached_ino`, ext4's reasons in step 2 of its list
+     below), never a number a new inode could take. Linux keeps the number
+     (a deliberate difference); `m7_vfs`'s `detached_ino` (#254) checks
+     Lumen's: a new number, bit 63 set.
    - **An open racing the unlink (#262):** an open raises `open_count` (an
      `OpenGuard`) *before* its last check that the inode is live, and Gate 6
      reads `open_count` and then frees or detaches the inode within one hold
@@ -5779,8 +5788,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `vfstest <op> ...`: test-facing file operations over the VFS (`stat`,
     `cat`/`read`, `ls`, `write`, `write-pattern`/`verify-pattern`,
     `truncate`, `chmod`, `mkdir`, `rmdir`, `unlink`, `rename`, `symlink`,
-    `readlink`, `dev-tmp-proc`) that
-    the scenarios drive until the Linux syscalls are wired (#254).
+    `readlink`, `dev-tmp-proc`) from the kernel shell, which the scenarios
+    use to set up and inspect files around ring-3 programs.
   - `linux /path/to/bin [args...]` (built in #255): when `args[0]` begins
     with `/`, loads the static or dynamic (`PT_INTERP`) ELF from VFS
     (following symlinks; a regular file with an execute bit, else `EACCES`),
@@ -7443,7 +7452,15 @@ test server:
   entry resolves inside the staged rootfs (no stray `libgcc_s.so.1` or
   `libc.so.6`). The M7 sources in `tools/linux-m7/` are formatted and checked
   by `Makefile`'s `fmt` and `fmt-check` targets alongside
-  `tools/linux-hello/hello.rs`.
+  `tools/linux-hello/hello.rs`. `m7_vfs` (#254) is the POSIX VFS exit
+  scenarios' program (`tests/scenarios/test_fs.py`): it calls the kernel by
+  syscall number (inline `syscall`, raw `-errno`), so each check is about the
+  syscall it names, not a libc wrapper's choice; musl only starts it and
+  ends it (`exit` once `main` returns). Its modes: `posix` and `locks` (one `ok <check>` line per check, the
+  first failure named, exiting with its number), `keep` (a small tree left
+  on the disk for fsck), and `lock-hold` (record locks taken a step per
+  read of its terminal, one key) with `lock-probe` (`F_GETLK`/`F_SETLK`
+  from a second process meanwhile).
 - **Rootless deterministic `ext4` assembly (`tools/mkrootfs.sh`, `make rootfs`):**
   assembles `build/deps/alpine-minirootfs/` + `build/linux/*` into
   **`build/alpine-rootfs.ext4`** (kept outside `build/deps/` so `actions/cache`
@@ -7473,8 +7490,9 @@ test server:
   and never writes journal transactions; note `-E root_owner=0:0` owns `/` as
   `0:0` while `-d` staged files inherit host UID/GID, so tests should not assert
   `st_uid == 0` on pre-populated staging files unless explicitly normalized). `e2fsck -fn` validates every freshly
-  built image and every guest-mutated disk image in `test_fs.py` after QEMU
-  exits.
+  built image and every guest-mutated disk image in `test_fs.py`,
+  `test_linux_user.py::test_dynamic_musl_binary_and_dlopen` and
+  `test_alpine.py` after QEMU exits.
 - **Parallel scenario isolation:** `test_blk.py` uses per-test blank scratch
   disks via `Devices(blk_mib=...)` (with `VIRTIO_BLK_F_RO` host-tested in
   `cargo:lumen-bcache` and optionally scenario-tested via a `Devices.blk_readonly`

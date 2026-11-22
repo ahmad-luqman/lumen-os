@@ -65,7 +65,9 @@ $(BUILD)/linux/libm7.so: tools/linux-m7/libm7.rs $(BUILD)/deps/alpine-minirootfs
 		$< -o $@
 	PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness.rootfs $@ --rootfs-dir $(BUILD)/deps/alpine-minirootfs --no-interp
 
-$(BUILD)/linux/m7_test: tools/linux-m7/m7_test.rs $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/libm7.so rust-toolchain.toml
+# The M7 dynamic musl executables, one recipe: m7_test (dlopen of libm7.so)
+# and m7_vfs (#254's VFS exit scenarios, tests/scenarios/test_fs.py).
+$(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs: $(BUILD)/linux/%: tools/linux-m7/%.rs $(BUILD)/deps/alpine-minirootfs/.version rust-toolchain.toml
 	@mkdir -p $(BUILD)/linux
 	SYSROOT=$$(rustc --print sysroot) && HOST=$$(rustc --print host-tuple) && \
 	MUSL_SC="$$SYSROOT/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained" && \
@@ -85,6 +87,8 @@ $(BUILD)/linux/m7_test: tools/linux-m7/m7_test.rs $(BUILD)/deps/alpine-minirootf
 		$< -o $@
 	PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness.rootfs $@ --rootfs-dir $(BUILD)/deps/alpine-minirootfs
 
+$(BUILD)/linux/m7_test: $(BUILD)/linux/libm7.so
+
 # Two kernels: the normal one (the shells) and the in-kernel test build.
 # `| apps`: built first (order-only: the kernel rebuilds when cargo says).
 $(BUILD)/lumen-kernel: $(KERNEL_SRCS) | apps
@@ -95,7 +99,7 @@ $(BUILD)/lumen-kernel-ktest: $(KERNEL_SRCS) | apps
 	$(CARGO_KERNEL) --features ktest
 	@mkdir -p $(BUILD) && cp $(KERNEL_OUT) $@
 
-build: apps $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/libm7.so $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps, Linux test binaries, and both kernels
+build: apps $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps, Linux test binaries, and both kernels
 
 # Apps (M5; the layout: ARCHITECTURE section 8, "Building and bundling"):
 # apps/ is its own workspace, and its crates that build a `cdylib` are WASM
@@ -141,7 +145,7 @@ $(BUILD)/lumen-ktest.iso: $(BUILD)/lumen-kernel-ktest $(ISO_DEPS)
 
 iso: $(BUILD)/lumen.iso $(BUILD)/lumen-qemutest.iso $(BUILD)/lumen-ktest.iso ## Build all bootable ISOs
 
-$(BUILD)/alpine-rootfs.ext4: tools/mkrootfs.sh $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/libm7.so
+$(BUILD)/alpine-rootfs.ext4: tools/mkrootfs.sh $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so
 	tools/mkrootfs.sh $@
 
 rootfs: $(BUILD)/alpine-rootfs.ext4 ## Build deterministic Alpine minirootfs ext4 image
