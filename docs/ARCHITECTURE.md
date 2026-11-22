@@ -3756,8 +3756,9 @@ their sum is at most `APP_OVERHEAD`, which `APP_WORST` charges.
 
 `lumen_app_api::limits::APP_WORST` is their sum, and a `const`
 assertion checks `MAX_APPS × APP_WORST <= APP_BUDGET`, so there is no
-runtime counter: holding a slot is holding its worst case. `APP_BUDGET`
-is below the guests' RAM, but not with `KERNEL_RESERVE` beside it:
+runtime counter: holding a slot is holding its worst case.
+`KERNEL_RESERVE` plus four worst cases is not below what the frame
+allocator owns on the guests, though:
 `qemu.py`'s default and `make run` give 256 MiB, which left the frame
 allocator 39,393 to 39,444 frames in #278 (the kernel's ELF, debug info
 and embedded apps included, is reserved), right at the 39,440 (154.06
