@@ -588,7 +588,8 @@ crate::ktest!(
             let after = space.format_maps();
             let noreplace = u64::from(general::MAP_ANONYMOUS | general::MAP_PRIVATE | general::MAP_FIXED_NOREPLACE);
             let unmapped = space.munmap(0x40_2000, P);
-            let again = space.mmap_anon(0x40_2000, P, lumen_vm::Prot::READ, noreplace);
+            // Read and exec, so it coalesces with neither neighbour.
+            let again = space.mmap_anon(0x40_2000, P, lumen_vm::Prot::READ | lumen_vm::Prot::EXEC, noreplace);
             (replaced, after, unmapped.and(again), space.format_maps())
         })?;
         let (maps, ino, (replaced, after, again, last)) = relro;
@@ -606,7 +607,7 @@ crate::ktest!(
             return Err("a mapping over the executable's text is named after it");
         }
         kassert_eq!(again, Ok(0x40_2000));
-        if !last.contains("00402000-00403000 r--p 00000000 00:00 0\n") {
+        if !last.contains("00402000-00403000 r-xp 00000000 00:00 0\n") {
             crate::ktest::diag(format_args!("maps after munmap and a new mapping over the data:\n{last}"));
             return Err("a mapping where the executable's data was unmapped is named after it");
         }
