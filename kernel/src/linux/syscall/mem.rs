@@ -619,6 +619,11 @@ crate::ktest!(
         kassert!(unlinked.is_ok());
         let (space, _) = loaded?;
         let maps = space.format_maps();
+        // Anonymous memory mapped over the text (`MAP_FIXED`) isn't named
+        // after the file; the data page beside it still is.
+        let anon = u64::from(general::MAP_ANONYMOUS | general::MAP_PRIVATE | general::MAP_FIXED);
+        let replaced = space.mmap_anon(0x40_1000, PAGE_SIZE, lumen_vm::Prot::READ, anon);
+        let after = space.format_maps();
         space.teardown();
         let named = |fields: alloc::string::String| alloc::format!("{:<72} /tmp/mem-ktest-exe\n", fields + " ");
         let text = named(alloc::format!("00401000-00402000 r-xp 00001000 00:02 {ino}"));
@@ -627,6 +632,11 @@ crate::ktest!(
         {
             crate::ktest::diag(format_args!("maps:\n{maps}"));
             return Err("the executable's lines don't name it");
+        }
+        kassert_eq!(replaced, Ok(0x40_1000));
+        if !(after.contains("00401000-00402000 r--p 00000000 00:00 0\n") && after.contains(&data)) {
+            crate::ktest::diag(format_args!("maps after MAP_FIXED over the text:\n{after}"));
+            return Err("a mapping over the executable's text is named after it");
         }
         Ok(())
     }
