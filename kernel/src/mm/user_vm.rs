@@ -630,20 +630,21 @@ impl AddressSpace {
     /// `align_up_page(new_size)`, in every VMA mapping it: the cache's pages
     /// released and private copies freed, in the unmap order. The VMAs stay,
     /// so a later access past the new end faults into
-    /// [`FaultResult::BusError`]. Wave 3's truncate-shrink calls it, holding
-    /// no VFS lock (Lock 1 before Lock 4), before dropping the cache's pages
-    /// past the new size. Returns how many leaves (present or `PROT_NONE`)
-    /// were unmapped; pages never faulted in count for nothing.
+    /// [`FaultResult::BusError`]. `truncate` and `ftruncate` (`syscall::meta`)
+    /// call it once the inode's truncate has returned, holding no VFS lock
+    /// (Lock 1 and Lock 4 never nested): a page the cache has dropped stays
+    /// alive, pinned by the mapping, until this unmaps it. Returns how many
+    /// leaves (present or `PROT_NONE`) were unmapped; pages never faulted in
+    /// count for nothing.
     ///
     /// **The current process's address space only, until M8's shootdowns:**
     /// the flush is a local `invlpg`, which reaches only a space loaded on
     /// this CPU. Another process's space, running elsewhere, could keep a
     /// stale writable entry to a cache frame that the truncate then frees
     /// (hard rule 2). Debug-asserted, before even the `torn_down` check:
-    /// wave 3's design for other processes' spaces (shootdowns, or holding
+    /// M8's design for other processes' spaces (shootdowns, or holding
     /// their pins until their CPUs flush) must replace this assertion, not
     /// extend it.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: ftruncate (#255, wave 3)
     pub fn invalidate_file_from(&self, file_id: u64, new_size: u64) -> usize {
         debug_assert_eq!(
             arch::paging::active_root(),
