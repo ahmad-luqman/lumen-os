@@ -14,13 +14,13 @@
 //! rules for root (`lumen_vfs::check_access`): `R_OK` passes; `W_OK` too,
 //! but on a read-only mount it is `-EROFS`; `X_OK` needs an execute bit or a
 //! directory; `F_OK` is existence alone. Linux exempts every device node,
-//! FIFO and socket from that `-EROFS`; Lumen, for now, only devfs's nodes.
+//! FIFO and socket from that `-EROFS`; Lumen, for now, only devfs's device
+//! nodes (not `/dev` itself).
 //! With the real and effective ids the same, `AT_EACCESS` changes nothing.
 
-use super::at::{Dirfd, UserPath, UserPtr, lookup, statx_from_metadata, write_stat};
-use super::{copy_pod_to_user, finish};
+use super::at::{Dirfd, UserPath, UserPtr, lookup, write_stat, write_statx};
+use super::finish;
 use crate::linux::general;
-use crate::user::CopyError;
 use lumen_vfs::{AccessMask, AtFlags, Metadata, VfsError, check_access};
 
 /// The uid and gid every Lumen process runs as (no credentials yet).
@@ -75,18 +75,15 @@ fn statx(dirfd: Dirfd, path: UserPtr, flags: AtFlags, mask: u32, buf: UserPtr) -
     if flags.0 & general::AT_STATX_SYNC_TYPE == general::AT_STATX_SYNC_TYPE || mask & general::STATX__RESERVED != 0 {
         return Err(VfsError::Inval.to_errno());
     }
-    let stx = statx_from_metadata(&metadata_at(dirfd, path, flags)?);
-    // SAFETY: `general::statx` is 256 bytes of integers with explicit spare
-    // fields and no implicit padding, all initialized.
-    unsafe { copy_pod_to_user(buf.addr(), &stx) }.map_err(CopyError::to_errno)?;
+    write_statx(buf, &metadata_at(dirfd, path, flags)?)?;
     Ok(0)
 }
 
 /// The metadata of what `path` names from `dirfd` (`flags` already
-/// validated): the file itself for an empty path with `AT_EMPTY_PATH`, the
-/// final symlink itself with `AT_SYMLINK_NOFOLLOW`. With `AT_EMPTY_PATH` a
-/// `NULL` path is `""` (Linux 6.11's rule for `fstatat` and `statx`, not
-/// `faccessat2`'s). The resolved inode is dropped before this returns.
+/// validated): the file itself (or the cwd) for an empty path with
+/// `AT_EMPTY_PATH`, the final symlink itself with `AT_SYMLINK_NOFOLLOW`.
+/// Lumen reads a `NULL` path as `""` whenever `AT_EMPTY_PATH` is set (Linux 6.11 does so only for an fd dirfd with exactly that flag; 6.13 generally);
+/// never `faccessat2`. The resolved inode is dropped before this returns.
 fn metadata_at(dirfd: Dirfd, path: UserPtr, flags: AtFlags) -> Result<Metadata, u32> {
     let path = if path.is_null() && flags.has_empty_path() {
         UserPath::empty()
@@ -117,7 +114,7 @@ fn faccessat2(dirfd: Dirfd, path: UserPtr, mode: AccessMask, flags: AtFlags) -> 
     // The mode and flags first: an invalid one is `-EINVAL` whatever the path.
     let mode = mode.validate().map_err(VfsError::to_errno)?;
     let flags = flags.validate(FACCESSAT_FLAGS).map_err(VfsError::to_errno)?;
-    // A `NULL` path is `-EFAULT`, `AT_EMPTY_PATH` or not: Linux 6.11 made it
+    // A `NULL` path is `-EFAULT`, `AT_EMPTY_PATH` or not: Linux reads it as
     // `""` only for `fstatat` and `statx`.
     let path = UserPath::copy_in(path, flags.has_empty_path())?;
     let inode = lookup(dirfd, &path, flags)?;
@@ -134,7 +131,7 @@ mod tests {
     use super::*;
     use crate::linux::errno;
     use crate::linux::process::{self, KTEST_USER_LEN, KTEST_USER_VA};
-    use crate::linux::syscall::at::{Fd, reg, stat_from_metadata};
+    use crate::linux::syscall::at::{Fd, reg, stat_from_metadata, statx_from_metadata};
     use crate::linux::syscall::copy_pod_from_user;
     use crate::linux::syscall::fd::ktest_user_path;
     use crate::linux::syscall::neg_errno;
@@ -212,13 +209,22 @@ mod tests {
     /// the test, once it has run every removal.
     fn clean(files: &[&[u8]], dirs: &[&[u8]]) -> Result<(), &'static str> {
         let tables = crate::vfs::tables();
-        let removed = |r: Result<(), VfsError>| matches!(r, Ok(()) | Err(VfsError::NoEnt));
+        // A failure is reported here as well as returned: a failed test
+        // returns its own error first, dropping this one.
+        let removed = |path: &[u8], r: Result<(), VfsError>| match r {
+            Ok(()) | Err(VfsError::NoEnt) => true,
+            Err(e) => {
+                let path = core::str::from_utf8(path).unwrap_or("?");
+                crate::ktest::diag(format_args!("cleanup: removing {path} failed: {e:?}"));
+                false
+            }
+        };
         let mut ok = true;
         for f in files {
-            ok &= removed(unlink_at(tables, None, f, false));
+            ok &= removed(f, unlink_at(tables, None, f, false));
         }
         for d in dirs {
-            ok &= removed(unlink_at(tables, None, d, true));
+            ok &= removed(d, unlink_at(tables, None, d, true));
         }
         if ok { Ok(()) } else { Err("cleaning up the test's files failed") }
     }
@@ -307,9 +313,22 @@ mod tests {
                 // `AT_EMPTY_PATH` with a path that isn't empty changes nothing.
                 kassert_eq!(sys_newfstatat(dir_fd, rel_link, reg(BUF_A), AtFlags(general::AT_EMPTY_PATH)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(FILE, true)?);
+                // ... nor does it stop `AT_SYMLINK_NOFOLLOW` keeping to the
+                // link: `stat` gives the link, and `X_OK` passes on it (0o777)
+                // where its target (0o640) would be `-EACCES`.
+                kassert_eq!(sys_newfstatat(dir_fd, rel_link, reg(BUF_A), AtFlags(both)), 0);
+                kassert_eq!(stat_at(BUF_A)?, want_stat(LINK, false)?);
+                kassert_eq!(sys_faccessat2(dir_fd, rel_link, AccessMask(general::X_OK), AtFlags(both)), 0);
+                let empty_only = AtFlags(general::AT_EMPTY_PATH);
+                kassert_eq!(
+                    sys_faccessat2(dir_fd, rel_link, AccessMask(general::X_OK), empty_only),
+                    neg_errno(errno::EACCES)
+                );
 
                 // A `NULL` path with `AT_EMPTY_PATH` is `""` for `newfstatat`
-                // and `statx` (Linux 6.11): the fd's file, or the cwd. Not for
+                // and `statx`, whatever the dirfd and other flags (Linux 6.11:
+                // an fd with exactly that flag; 6.13: generally): the fd's
+                // file, or the cwd. Not for
                 // `faccessat2`, nor without the flag: `-EFAULT`.
                 let null: UserPtr = reg(0);
                 let empty_path = AtFlags(general::AT_EMPTY_PATH);

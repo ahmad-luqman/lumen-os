@@ -28,8 +28,10 @@
 //! `at` holds what the M7 file syscalls share: their register decoders
 //! (`reg`, `FromReg`: `Fd`, `Dirfd`, `Mode`, the VFS's flag types,
 //! `UserPtr`, `u32`/`i32`/`u64`), `UserPath` (a path argument copied in),
-//! `start_dir` (the directory a path starts from, a `Dirfd` resolved) and
-//! `stat_from_metadata`/`statx_from_metadata`.
+//! `start_dir` (the directory a path starts from, a `Dirfd` resolved),
+//! `lookup` (the inode a path names, as a `*at` syscall's flags say),
+//! `stat_from_metadata`/`statx_from_metadata` and `write_stat`/`write_statx`
+//! (those structs written to user memory).
 //!
 //! An M7 syscall not implemented yet has a stub that logs once per number
 //! (as an unknown one does, with its name) and returns `-ENOSYS`.

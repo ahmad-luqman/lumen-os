@@ -1,7 +1,9 @@
 //! What the M7 file syscalls share (#254's clusters): decoding their
 //! register arguments, copying a path argument in, resolving a `dirfd` into
-//! the directory a path starts from, and filling Linux's `struct stat` and
-//! `struct statx` from VFS metadata.
+//! the directory a path starts from (and, through it, the inode a path
+//! names: [`lookup`]), and filling Linux's `struct stat` and `struct statx`
+//! from VFS metadata and writing them to user memory ([`write_stat`],
+//! [`write_statx`]).
 //!
 //! `dispatch` decodes each register into the handler's parameter type with
 //! [`reg`], as Linux reads it: an `int`, `mode_t` or `unsigned int` is the
@@ -205,8 +207,10 @@ impl UserPath {
     /// unless `allow_empty` (`AT_EMPTY_PATH`).
     ///
     /// `NULL` is `-EFAULT` too. A caller for which `NULL` means something
-    /// checks first: `utimensat`'s path, and, from Linux 6.11, `fstatat`'s and
-    /// `statx`'s with `AT_EMPTY_PATH` (the same as `""`).
+    /// checks first: `utimensat`'s path, and `newfstatat`'s and `statx`'s
+    /// with `AT_EMPTY_PATH` (`""`, through [`UserPath::empty`]; Lumen reads
+    /// it so whenever that flag is set, where Linux 6.11 does only for an fd
+    /// dirfd with exactly that flag, 6.13 generally).
     ///
     /// Must be called with interrupts enabled and no lock held.
     pub(super) fn copy_in(ptr: UserPtr, allow_empty: bool) -> Result<Self, u32> {
@@ -215,8 +219,8 @@ impl UserPath {
         Self::from_bytes(bytes, allow_empty)
     }
 
-    /// The empty path, for a caller that reads `NULL` as `""`
-    /// (`newfstatat` and `statx` with `AT_EMPTY_PATH`, from Linux 6.11).
+    /// The empty path, for a caller that reads a `NULL` path argument as
+    /// `""` instead of copying it in.
     pub(super) fn empty() -> Self {
         Self(Vec::new())
     }
@@ -354,8 +358,8 @@ impl Start {
 /// - An absolute path starts at the root whatever `dirfd` is: the dirfd is
 ///   never looked at (a bad one is no error).
 /// - An empty path (`UserPath::copy_in` let one through only with
-///   `AT_EMPTY_PATH`) names the dirfd's file itself, a directory or not, or
-///   the cwd.
+///   `AT_EMPTY_PATH`, or `UserPath::empty()`) names the dirfd's file
+///   itself, a directory or not, or the cwd.
 /// - A relative path starts at the cwd's inode for `Dirfd::Cwd`, or at the
 ///   dirfd's file: `-EBADF` if it isn't open, `-ENOTDIR` if it isn't a
 ///   directory (an `O_PATH` one is fine).
@@ -382,8 +386,9 @@ pub(super) fn start_dir(dirfd: Dirfd, path: &UserPath) -> Result<Start, u32> {
 /// caller validated them) say: the final symlink followed unless
 /// `AT_SYMLINK_NOFOLLOW`; with `AT_EMPTY_PATH`, an empty path naming the
 /// start itself. Without that flag an empty path is `-ENOENT` here too,
-/// however `path` was copied in. Not for `linkat`, whose
-/// `AT_SYMLINK_FOLLOW` runs the other way.
+/// however `path` was copied in, once `start_dir` has checked the dirfd (a
+/// bad one is `-EBADF` first). Not for `linkat`, whose `AT_SYMLINK_FOLLOW`
+/// runs the other way.
 pub(super) fn lookup(dirfd: Dirfd, path: &UserPath, flags: AtFlags) -> Result<Arc<dyn VfsInode>, u32> {
     let start = start_dir(dirfd, path)?;
     let how = ResolveFlags {
@@ -401,6 +406,15 @@ pub(super) fn write_stat(buf: UserPtr, m: &Metadata) -> Result<(), u32> {
     // SAFETY: `general::stat` is 144 bytes of integers with an explicit
     // `__pad0` and no implicit padding, all initialized.
     unsafe { super::copy_pod_to_user(buf.addr(), &st) }.map_err(CopyError::to_errno)
+}
+
+/// Write `m` as Linux's `struct statx` to `buf` (`statx`): `-EFAULT` for a
+/// bad buffer. Must be called with no lock held.
+pub(super) fn write_statx(buf: UserPtr, m: &Metadata) -> Result<(), u32> {
+    let stx = statx_from_metadata(m);
+    // SAFETY: `general::statx` is 256 bytes of integers with explicit spare
+    // fields and no implicit padding, all initialized.
+    unsafe { super::copy_pod_to_user(buf.addr(), &stx) }.map_err(CopyError::to_errno)
 }
 
 /// A timestamp's nanoseconds, within `0..1_000_000_000` whatever a

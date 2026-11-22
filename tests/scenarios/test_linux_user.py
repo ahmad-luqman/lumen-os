@@ -280,7 +280,8 @@ def test_busybox_file_syscalls(boot):
     then `lseek` back), `tail -c` (`lseek` to `SEEK_END` and back), `od`
     (`readv` on a file), `uuencode` (`fstat`'s mode), `tee` (`open` with
     `O_TRUNC` of an existing file, a `write` to it) and `cat` of a missing file (ENOENT);
-    `stat` (musl's `lstat`, `stat` with `-L`, through `newfstatat`) of a
+    `stat` (musl's `lstat`, and `stat` with `-L`: `SYS_lstat` and
+    `SYS_stat`, both shims over `newfstatat`) of a
     file and of a symlink to it, and `which` of a path (`access` with
     `X_OK`, then `stat`) on a file with and without an execute bit;
     console stdio unchanged throughout."""
