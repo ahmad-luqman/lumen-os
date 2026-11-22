@@ -15,7 +15,7 @@ use lumen_vfs::{
 use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
-use super::page_cache::{CachePage, PAGE_SIZE, PageCache, QuotaCounter};
+use super::page_cache::{self, CachePage, PAGE_SIZE, PageCache, QuotaCounter};
 
 struct TmpfsShared {
     dev: DevId,
@@ -187,6 +187,44 @@ impl TmpfsInode {
         }
         Ok(())
     }
+
+    /// This file's page-cache lock (Lock 5), for
+    /// `page_cache::MappedPage::copy_to_frame`.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
+    pub(super) fn page_cache_lock(&self) -> &SleepMutex<PageCache> {
+        &self.pages
+    }
+
+    /// This file's page `index`, a zero page allocated for a hole, and its
+    /// size read with it: `tmpfs`'s side of [`page_cache::mmap_page`] (its
+    /// contract). The hole's page
+    /// counts against the mount's quota, as a write's would.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+    pub(super) fn mmap_page(&self, index: u64) -> Result<(Arc<CachePage>, u64), VfsError> {
+        if self.inode_type != InodeType::File {
+            return Err(VfsError::NoDev);
+        }
+        let meta = self.meta.lock();
+        let file_size = meta.size;
+        page_cache::mmap_page_in_file(index, file_size)?;
+        let mut pages = self.pages.lock();
+        let page = page_or_new(&mut pages, index)?;
+        page.touch();
+        Ok((page, file_size))
+    }
+}
+
+/// The cached page `index`, or a new zero page inserted there (`NoMem`, or
+/// `NoSpc` past the quota): the one way `write_at` and `mmap_page` get a
+/// page. (`read_at` reads a hole as zeros without one.) The caller holds
+/// the inode's Lock 4 and the `pages` lock (Lock 5).
+fn page_or_new(pages: &mut PageCache, index: u64) -> Result<Arc<CachePage>, VfsError> {
+    if let Some(page) = pages.get(index) {
+        return Ok(Arc::clone(page));
+    }
+    let page = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
+    pages.insert_new(index, Arc::clone(&page))?;
+    Ok(page)
 }
 
 struct LockedTmpfs<'a> {
@@ -850,18 +888,9 @@ impl VfsInode for TmpfsInode {
             let page_idx = cur_off / PAGE_SIZE as u64;
             let in_page = (cur_off % PAGE_SIZE as u64) as usize;
             let chunk = (PAGE_SIZE - in_page).min(buf.len() - done);
-            if let Some(page) = pages.get(page_idx) {
-                page.write_bytes(in_page, &buf[done..done + chunk]);
-            } else {
-                let Some(raw) = CachePage::new_zeroed() else {
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(VfsError::NoMem);
-                };
-                let cp = Arc::new(raw);
-                cp.write_bytes(in_page, &buf[done..done + chunk]);
-                if let Err(err) = pages.insert_new(page_idx, cp) {
+            match page_or_new(&mut pages, page_idx) {
+                Ok(page) => page.write_bytes(in_page, &buf[done..done + chunk]),
+                Err(err) => {
                     if done > 0 {
                         break;
                     }
@@ -900,6 +929,11 @@ impl VfsInode for TmpfsInode {
         f(&mut meta.locks);
         Ok(())
     }
+
+    /// For `vfs::mmap_page`.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 fn find_tmpfs_non_dir(known_dir: &Arc<TmpfsInode>, target_lock_id: u64) -> Option<Arc<TmpfsInode>> {
@@ -928,6 +962,69 @@ fn find_tmpfs_non_dir(known_dir: &Arc<TmpfsInode>, target_lock_id: u64) -> Optio
     }
     None
 }
+
+crate::ktest!(
+    fn tmpfs_mmap_page_hands_out_the_cached_page() {
+        // `vfs::mmap_page` on tmpfs: the page holding the file's bytes, the
+        // same `Arc` again, coherent with `read_at`/`write_at` both ways; a
+        // hole gets a zero page from the quota (`NoSpc` past it), which a
+        // `read_at` of a hole never takes; `Range` past EOF, `NoDev` for a
+        // directory. (The pages' bytes are used here without Lock 5, as a
+        // mapping would: nothing else uses this mount.)
+        use crate::vfs::mmap_page;
+        use crate::{kassert, kassert_eq};
+        let fs = Tmpfs::new(DevId::makedev(0, 125), 4 * PAGE_SIZE);
+        let root = fs.root_inode();
+        let f = root.create("map.bin", 0o644).map_err(|_| "create")?;
+        let data: Vec<u8> = (0..PAGE_SIZE + 100).map(|i| (i % 251) as u8 | 1).collect();
+        kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
+        kassert_eq!(fs.used_pages(), 2);
+        let first = mmap_page(&f, 0).map_err(|_| "map page 0")?;
+        kassert_eq!(first.file_size(), data.len() as u64);
+        let mut got = [0u8; PAGE_SIZE];
+        first.page().read_bytes(0, &mut got);
+        kassert!(got[..] == data[..PAGE_SIZE]);
+        let last = mmap_page(&f, 1).map_err(|_| "map page 1")?;
+        last.page().read_bytes(0, &mut got);
+        kassert!(got[..100] == data[PAGE_SIZE..]);
+        kassert!(got[100..].iter().all(|&b| b == 0)); // past EOF: zero
+        let again = mmap_page(&f, 0).map_err(|_| "map page 0 again")?;
+        kassert!(Arc::ptr_eq(again.page(), first.page()));
+        kassert_eq!(fs.used_pages(), 2); // no page added for either
+        // Coherent both ways: a write shows in the page, a store in the
+        // page shows in a read.
+        kassert_eq!(f.write_at(5, b"written").map_err(|_| "write_at")?, 7);
+        first.page().read_bytes(5, &mut got[..7]);
+        kassert!(&got[..7] == b"written");
+        first.page().write_bytes(20, b"stored");
+        let mut back = [0u8; 6];
+        kassert_eq!(f.read_at(20, &mut back).map_err(|_| "read_at")?, 6);
+        kassert!(&back == b"stored");
+        // Holes: a read leaves them be, a mapping takes a page each until
+        // the quota (4 pages) refuses.
+        f.truncate(5 * PAGE_SIZE as u64).map_err(|_| "truncate")?;
+        kassert_eq!(f.read_at(2 * PAGE_SIZE as u64, &mut back).map_err(|_| "read hole")?, 6);
+        kassert_eq!(fs.used_pages(), 2);
+        let hole = mmap_page(&f, 3).map_err(|_| "map hole")?;
+        kassert_eq!(fs.used_pages(), 3);
+        hole.page().read_bytes(0, &mut got);
+        kassert!(got.iter().all(|&b| b == 0));
+        kassert!(Arc::ptr_eq(mmap_page(&f, 3).map_err(|_| "map hole again")?.page(), hole.page()));
+        mmap_page(&f, 2).map_err(|_| "map last page of the quota")?;
+        kassert_eq!(fs.used_pages(), 4);
+        kassert_eq!(mmap_page(&f, 4).err(), Some(VfsError::NoSpc));
+        // Past EOF there is no page: `1 << 52` pages is 2^64 bytes, which a
+        // plain multiplication wraps to offset 0. Nor in a directory or a
+        // symlink.
+        kassert_eq!(mmap_page(&f, 5).err(), Some(VfsError::Range));
+        kassert_eq!(mmap_page(&f, 1 << 52).err(), Some(VfsError::Range));
+        kassert_eq!(mmap_page(&f, u64::MAX).err(), Some(VfsError::Range));
+        kassert_eq!(mmap_page(&root, 0).err(), Some(VfsError::NoDev));
+        let link = root.symlink("link", "map.bin").map_err(|_| "symlink")?;
+        kassert_eq!(mmap_page(&link, 0).err(), Some(VfsError::NoDev));
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn tmpfs_open_racing_unlink_keeps_the_data_or_fails_cleanly() {

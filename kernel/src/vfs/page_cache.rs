@@ -4,10 +4,12 @@
 //! accessed through the HHDM with raw pointers, so no `&mut [u8]` to the
 //! frame ever exists. Raw pointers avoid reference aliasing, not data races:
 //! kernel readers and writers of a published page are serialized by the
-//! owning inode's `PageCache` lock (Lock 5). A future `MAP_SHARED` user
-//! mapping (M8) writes the frame without that lock; such a store racing a
-//! kernel copy is accepted as it is on Linux (the bytes read are some mix of
-//! old and new, nothing else). `CachePage::drop` and `PageCache::drop` take
+//! owning inode's `PageCache` lock (Lock 5), including a copy-on-write
+//! split's copy ([`MappedPage::copy_to_frame`] takes it). A `MAP_SHARED`
+//! user mapping (#255, through [`mmap_page`]) writes the frame from ring 3
+//! without that lock: those are hardware stores outside Rust's memory model,
+//! and a kernel copy racing one reads some mix of old and new bytes, as on
+//! Linux. Kernel accesses never race each other. `CachePage::drop` and `PageCache::drop` take
 //! no sleeping lock (`OwnedFrame::drop` takes only Lock 10, the `frame`
 //! `SpinLock`); the one exception is a quota over-release, a bug elsewhere,
 //! whose `error!` takes the log's leaf lock.
@@ -18,11 +20,12 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use lumen_mm::PhysFrame;
-use lumen_vfs::VfsError;
+use lumen_vfs::{VfsError, VfsInode};
 
 use crate::arch;
 use crate::mm;
 use crate::mm::frame::{self, OwnedFrame};
+use crate::sync::SleepMutex;
 
 pub const PAGE_SIZE: usize = 4096;
 
@@ -59,19 +62,22 @@ pub fn ext4_at_hard_limit() -> bool {
     EXT4_CACHED_PAGES.load(Ordering::Relaxed) >= EXT4_HARD_LIMIT.load(Ordering::Relaxed)
 }
 
-/// A write was refused a page at the hard limit since the cache last fell
-/// back under the soft limit: one warning per crossing.
+/// A new page was refused at the hard limit since the cache last fell back
+/// under the soft limit: one warning per crossing.
 static HARD_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Log (once per crossing of the hard limit) that an `ext4` write was
-/// refused a new page: the cache is full of pages reclaim can't drop,
-/// usually because their writeback keeps failing (its own warning names the
-/// inode), so writes to any file now fail with `ENOSPC`.
+/// Log (once per crossing of the hard limit) that an `ext4` page was
+/// refused, to a write (`write_at`) or a mapping (`mmap_page`). The cache
+/// is full of pages reclaim can't drop: dirty pages whose writeback keeps
+/// failing (its own warning names the inode), or pages pinned by mappings,
+/// which only unmapping frees. Writes and new mapped pages of any linked
+/// file (detached files use their own quota) now
+/// fail with `ENOSPC`.
 pub fn note_hard_limit_refusal() {
     if !HARD_LIMIT_WARNED.swap(true, Ordering::AcqRel) {
         log::warn!(
             target: "vfs",
-            "ext4 page cache at its hard limit ({} pages): refusing new pages (ENOSPC) until writeback frees some",
+            "ext4 page cache at its hard limit ({} pages): refusing new pages (ENOSPC) until writeback or unmapping frees some",
             EXT4_HARD_LIMIT.load(Ordering::Relaxed)
         );
     }
@@ -195,7 +201,7 @@ pub struct CachePage {
 
 impl CachePage {
     /// Allocate and zero a fresh 4 KiB [`CachePage`].
-    pub fn new_zeroed() -> Option<Self> {
+    pub(super) fn new_zeroed() -> Option<Self> {
         let frame = frame::alloc_owned()?;
         let ptr = mm::phys_to_virt(frame.frame().start()).as_mut_ptr::<u8>();
         // SAFETY: `frame` is a freshly allocated, uniquely owned 4 KiB RAM frame
@@ -209,8 +215,9 @@ impl CachePage {
         })
     }
 
-    /// Underlying physical frame (for zero-copy `PTE_SHARED` user mappings in M8).
-    #[allow(dead_code)]
+    /// Underlying physical frame, for a zero-copy `PTE_SHARED` user mapping
+    /// of the page (#255).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn phys_frame(&self) -> PhysFrame {
         self.frame.frame()
@@ -223,17 +230,24 @@ impl CachePage {
 
     /// Update LRU access stamp.
     #[inline]
-    pub fn touch(&self) {
+    pub(super) fn touch(&self) {
         self.last_access.store(ACCESS_SEQ.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
     }
 
     #[inline]
-    pub fn last_access(&self) -> u64 {
+    pub(super) fn last_access(&self) -> u64 {
         self.last_access.load(Ordering::Relaxed)
     }
 
     /// Read bytes from `[off .. off + dst.len())` via raw HHDM pointer.
-    pub fn read_bytes(&self, off: usize, dst: &mut [u8]) {
+    ///
+    /// Lock 5 contract (as for [`write_bytes`](Self::write_bytes) and
+    /// [`zero_range`](Self::zero_range)): the caller holds the owning
+    /// inode's `PageCache` lock, or the page isn't published in a
+    /// `PageCache` yet. That is what keeps kernel readers and writers of a
+    /// page apart, so these stay inside `vfs`; code elsewhere copies a page
+    /// out with [`copy_to_frame`](Self::copy_to_frame).
+    pub(super) fn read_bytes(&self, off: usize, dst: &mut [u8]) {
         assert!(off.saturating_add(dst.len()) <= PAGE_SIZE);
         self.touch();
         if dst.is_empty() {
@@ -250,7 +264,8 @@ impl CachePage {
     }
 
     /// Write bytes into `[off .. off + src.len())` via raw HHDM pointer.
-    pub fn write_bytes(&self, off: usize, src: &[u8]) {
+    /// Lock 5 held by the caller, as for [`read_bytes`](Self::read_bytes).
+    pub(super) fn write_bytes(&self, off: usize, src: &[u8]) {
         assert!(off.saturating_add(src.len()) <= PAGE_SIZE);
         self.touch();
         if src.is_empty() {
@@ -266,8 +281,9 @@ impl CachePage {
         }
     }
 
-    /// Zero `[start .. end)` inside the 4 KiB frame.
-    pub fn zero_range(&self, start: usize, end: usize) {
+    /// Zero `[start .. end)` inside the 4 KiB frame. Lock 5 held by the
+    /// caller, as for [`read_bytes`](Self::read_bytes).
+    pub(super) fn zero_range(&self, start: usize, end: usize) {
         assert!(start <= end && end <= PAGE_SIZE);
         if start == end {
             return;
@@ -282,39 +298,262 @@ impl CachePage {
     }
 
     /// True if explicitly dirtied or currently mapped writable via `MAP_SHARED`.
+    ///
+    /// The count is loaded first (Acquire), then `dirty`. Reclaim (and
+    /// `fsync`'s `collect_dirty`) calls this holding Locks 4 and 5, neither
+    /// of which an unmap's [`dec_writable_maps`] takes, and can be preempted
+    /// between the loads. Read the other way
+    /// round, it could see `dirty` still clear, then the count already 0,
+    /// and evict a page whose mapped stores were never written. A count of
+    /// 0 read with Acquire synchronises with that decrement, so the `dirty`
+    /// it set first is then visible.
+    ///
+    /// [`dec_writable_maps`]: Self::dec_writable_maps
     #[inline]
     pub fn is_dirty(&self) -> bool {
-        self.dirty.load(Ordering::Acquire) || self.writable_maps.load(Ordering::Acquire) > 0
+        let mapped_writable = self.writable_maps.load(Ordering::Acquire) > 0;
+        #[cfg(feature = "ktest")]
+        ktest_hooks::between_dirty_loads(self);
+        mapped_writable || self.dirty.load(Ordering::Acquire)
     }
 
+    /// Mark the page dirty: a kernel write, or a writable `MAP_SHARED` fault
+    /// (#255's page-fault path, hence `pub` for now).
     #[inline]
     pub fn set_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
     }
 
-    /// Atomically swap `dirty`, returning the previous value.
+    /// Atomically swap `dirty`, returning the previous value: writeback's
+    /// clear, `vfs` only.
     #[inline]
-    pub fn swap_dirty(&self, val: bool) -> bool {
+    pub(super) fn swap_dirty(&self, val: bool) -> bool {
         self.dirty.swap(val, Ordering::AcqRel)
     }
 
-    #[allow(dead_code)]
+    /// How many `PRESENT | WRITABLE | PTE_SHARED` mappings the page has.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn writable_maps(&self) -> u32 {
         self.writable_maps.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)]
+    /// One more `PRESENT | WRITABLE | PTE_SHARED` mapping of this page, for
+    /// #255's page-fault path, which calls it with
+    /// [`set_dirty`](Self::set_dirty). `pub` is temporary: once #255's next
+    /// part puts the pair behind an RAII guard, this and
+    /// `dec_writable_maps` become `pub(super)`.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn inc_writable_maps(&self) {
         self.writable_maps.fetch_add(1, Ordering::AcqRel);
     }
 
-    #[allow(dead_code)]
+    /// One `PRESENT | WRITABLE | PTE_SHARED` mapping of this page is gone.
+    ///
+    /// The page is marked dirty first (#266): stores made through the
+    /// mapping never set `dirty` themselves (only the count kept the page
+    /// dirty while it was mapped), so the last unmap must leave `dirty` set,
+    /// or those stores look clean and reclaim drops them unwritten. Setting
+    /// it before the decrement, on every call, leaves no instant where the
+    /// count is 0 and `dirty` still false; while other writable mappings
+    /// remain, the page is dirty through the count anyway.
+    ///
+    /// Call it only once no store can reach the page through that mapping:
+    /// after its PTE is cleared (or made read-only) and every TLB that may
+    /// still hold the writable entry is flushed (in M7, the one CPU's
+    /// `invlpg`). A store landing later, through a stale entry, after a
+    /// writeback cleared `dirty`, would be lost again (ARCHITECTURE section
+    /// 5's unmap order). `pub` for #255's unmap paths, temporarily: see
+    /// [`inc_writable_maps`](Self::inc_writable_maps).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn dec_writable_maps(&self) {
+        self.dirty.store(true, Ordering::Release);
         let prev = self.writable_maps.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(prev > 0, "writable_maps underflow");
+    }
+
+    /// Copy the page's first `valid` bytes into `dst` and zero the rest of
+    /// `dst`: a `MAP_PRIVATE` copy-on-write split, where `valid` is what
+    /// lies below the file's size (`PAGE_SIZE` for a page wholly inside it).
+    ///
+    /// Lock 5 contract, as for [`read_bytes`](Self::read_bytes): the caller
+    /// holds the owning inode's `PageCache` lock, so no kernel `write_at`
+    /// writes the page meanwhile. Outside `vfs`,
+    /// [`MappedPage::copy_to_frame`] takes that lock and calls this. A
+    /// `MAP_SHARED` store from ring 3 racing the copy is a hardware write
+    /// outside Rust's memory model and leaves some mix of old and new bytes
+    /// in `dst`, as on Linux.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
+    pub(super) fn copy_to_frame(&self, dst: &mut OwnedFrame, valid: usize) {
+        let valid = valid.min(PAGE_SIZE);
+        let dst_ptr = mm::phys_to_virt(dst.frame().start()).as_mut_ptr::<u8>();
+        // SAFETY: both frames are allocated 4 KiB RAM frames mapped RW through
+        // the HHDM and alive for the borrows; they are distinct (`dst` is the
+        // caller's, `self.frame` this page's), so the ranges don't overlap,
+        // and `valid <= PAGE_SIZE`. `&mut OwnedFrame` means nothing else uses
+        // `dst`'s frame. Kernel writers of this page are excluded by the
+        // owning inode's Lock 5, which the caller holds.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.hhdm_ptr(), dst_ptr, valid);
+            core::ptr::write_bytes(dst_ptr.add(valid), 0, PAGE_SIZE - valid);
+        }
+        self.touch();
+    }
+}
+
+/// A file's cached page handed out for a mapping by [`mmap_page`].
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+pub(crate) struct MappedPage {
+    page: Arc<CachePage>,
+    file_size: u64,
+    /// The inode whose cache holds `page`: an `ext4` or `tmpfs` inode, as
+    /// [`mmap_page`] checked, for [`Self::copy_to_frame`]'s lock.
+    owner: Arc<dyn VfsInode>,
+}
+
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+impl MappedPage {
+    /// Only [`mmap_page`] makes one, once `owner` has downcast to an `ext4`
+    /// or `tmpfs` inode.
+    fn new(page: Arc<CachePage>, file_size: u64, owner: Arc<dyn VfsInode>) -> Self {
+        Self { page, file_size, owner }
+    }
+
+    /// Copy the page's first `valid` bytes into `dst` and zero the rest of
+    /// `dst`: a `MAP_PRIVATE` copy-on-write split, where `valid` is what
+    /// lies below the file's size (`PAGE_SIZE` for a page wholly inside it).
+    ///
+    /// The copy holds the owning inode's Lock 5, as the kernel's writers of
+    /// the page (`write_at`, truncate's zeroing) do, so no kernel write
+    /// races it. A `MAP_SHARED` store from ring 3 is a hardware write
+    /// outside Rust's memory model; one racing the copy leaves some mix of
+    /// old and new bytes in `dst`, as on Linux. Lock order: the caller may
+    /// hold Lock 1 (`AddressSpace::inner`, as the fault path does) or Lock 2,
+    /// nothing numbered 3 or higher, and no `SpinLock`. This is `mm`'s one
+    /// way to copy a page's bytes; it maps a page zero-copy through
+    /// [`CachePage::phys_frame`].
+    pub(crate) fn copy_to_frame(&self, dst: &mut OwnedFrame, valid: usize) {
+        let lock = page_cache_lock(&*self.owner).expect("a MappedPage's owner is an ext4 or tmpfs inode");
+        let _cache = lock.lock();
+        self.page.copy_to_frame(dst, valid);
+    }
+
+    /// The inode's cached page itself (not a copy). Holding the `Arc` (a
+    /// clone of it) pins the page: reclaim evicts only pages whose strong
+    /// count is 1.
+    pub(crate) fn page(&self) -> &Arc<CachePage> {
+        &self.page
+    }
+
+    /// The file's size when the page was looked up (under the inode's Lock
+    /// 4). The page starts below it; the page's bytes past it are zero
+    /// unless a mapping stored there. A snapshot: a truncate may change the
+    /// size once Lock 4 is released. A shrink takes `AddressSpace::inner`
+    /// (Lock 1) before Lock 4 to invalidate mappings (ARCHITECTURE section
+    /// 5), so a fault holding Lock 1 across the call and the mapping can
+    /// rely on it; one that doesn't must look again.
+    pub(crate) fn file_size(&self) -> u64 {
+        self.file_size
+    }
+}
+
+/// The cached page at `index` (file offset `index * 4096`) of a regular
+/// `ext4` or `tmpfs` file, for mapping into an address space: the same
+/// `Arc<CachePage>` that `read_at`/`write_at` use, so a mapping and the
+/// file's reads and writes stay coherent. Another call for the same page
+/// returns the same `Arc` while the page stays cached (which holding it
+/// guarantees, short of a truncate dropping it).
+///
+/// - **Filling:** a page not cached yet is read from disk (`ext4`, by the
+///   same code as `read_at`), or a zero page is allocated (a `tmpfs` hole,
+///   or a hole in a detached `ext4` file), and inserted. Unlike `read_at`, a
+///   hole costs a frame, so the `tmpfs` (or detached) quota can refuse it
+///   with `NoSpc`. `NoMem` when no frame is free, `Io` when the disk read
+///   fails (logged, naming the page), and `NoSpc` for a missing page of a
+///   linked `ext4` file while the `ext4` cache is at its hard limit (a
+///   mapping pins its pages, so reclaim can't make room), as `write_at`
+///   refuses one. A detached `ext4` file's pages count against the
+///   detached quota instead of the hard limit.
+/// - **EOF:** `Range` when the page starts at or past the file's size
+///   (`index * 4096 >= file_size`, or the product overflows): there is no
+///   page to map, and the fault path raises `SIGBUS`. The page holding the
+///   end of the file is returned; its bytes past `file_size` are zero
+///   unless a mapping stored there.
+/// - **Truncate:** a shrink's `remove_from` drops the cache's reference to
+///   the pages past the new size and stops counting them, even one a
+///   mapping still holds. That is sound only because ARCHITECTURE section
+///   5's truncate invalidation (Lock 1 before Lock 4) unmaps those pages in
+///   the same shrink, so no mapping keeps a page the cache has let go.
+/// - **Other inodes:** `NoDev` for anything but a regular file of `ext4`
+///   or `tmpfs` (directories, symlinks, `devfs`, `procfs`). `NoEnt` for an
+///   `ext4` inode unlinked and not open, as `read_at` says.
+/// - **Locking:** takes the inode's Lock 4 then Lock 5 (and Locks 6–8 to
+///   read the disk), after an `ext4` soft-limit reclaim run with
+///   none of them held, as `read_at` does. The caller may hold Lock 1
+///   (`AddressSpace::inner`) or Lock 2, nothing numbered 3 or higher, and
+///   no `SpinLock`.
+///
+/// It doesn't mark the page dirty or count a writable mapping: the caller
+/// does both (`set_dirty`, `inc_writable_maps`) when it maps the page
+/// writable.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+pub(crate) fn mmap_page(inode: &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError> {
+    let any = inode.as_any().ok_or(VfsError::NoDev)?;
+    let (page, file_size) = if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
+        ext4.mmap_page(index)?
+    } else if let Some(tmpfs) = any.downcast_ref::<super::tmpfs::TmpfsInode>() {
+        tmpfs.mmap_page(index)?
+    } else {
+        return Err(VfsError::NoDev);
+    };
+    Ok(MappedPage::new(page, file_size, Arc::clone(inode)))
+}
+
+/// The `PageCache` lock (Lock 5) of an `ext4` or `tmpfs` inode.
+fn page_cache_lock(inode: &dyn VfsInode) -> Option<&SleepMutex<PageCache>> {
+    let any = inode.as_any()?;
+    if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
+        return Some(ext4.page_cache_lock());
+    }
+    any.downcast_ref::<super::tmpfs::TmpfsInode>().map(super::tmpfs::TmpfsInode::page_cache_lock)
+}
+
+/// `Range` unless page `index` starts below `file_size` (an overflowing
+/// offset is past any file): [`mmap_page`]'s EOF rule, for each
+/// filesystem's side of it.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+pub(super) fn mmap_page_in_file(index: u64, file_size: u64) -> Result<(), VfsError> {
+    match index.checked_mul(PAGE_SIZE as u64) {
+        Some(off) if off < file_size => Ok(()),
+        _ => Err(VfsError::Range),
+    }
+}
+
+/// Test seams for the ktests (none in the real kernel).
+#[cfg(feature = "ktest")]
+pub(super) mod ktest_hooks {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::CachePage;
+
+    /// The page (its address) whose next `is_dirty` drops one writable
+    /// mapping between its two loads, as an unmap preempting reclaim there
+    /// would; 0 for none.
+    static DEC_BETWEEN_DIRTY_LOADS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Make `page`'s next `is_dirty` call `dec_writable_maps` between its
+    /// loads. Only that page is affected, whatever else runs meanwhile.
+    pub fn dec_between_dirty_loads(page: &CachePage) {
+        DEC_BETWEEN_DIRTY_LOADS.store(core::ptr::from_ref(page).addr(), Ordering::Release);
+    }
+
+    pub(super) fn between_dirty_loads(page: &CachePage) {
+        let me = core::ptr::from_ref(page).addr();
+        if DEC_BETWEEN_DIRTY_LOADS.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            page.dec_writable_maps();
+        }
     }
 }
 
@@ -592,6 +831,106 @@ crate::ktest!(
         kassert!(Arc::ptr_eq(pc.get(7).ok_or("page")?, &first)); // the dirty page kept
         drop(pc);
         kassert_eq!(ext4_cached_pages(), before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn mmap_page_refuses_inodes_of_other_filesystems() {
+        // Only ext4's and tmpfs's regular files have pages to map: a devfs
+        // device and a procfs file (a regular file, but not cached) don't.
+        use crate::kassert_eq;
+        use lumen_vfs::{DevId, FileSystem, InodeType};
+        let devfs = super::devfs::Devfs::new(DevId::makedev(0, 126));
+        let zero = devfs.root_inode().lookup("zero").map_err(|_| "lookup zero")?;
+        kassert_eq!(mmap_page(&zero, 0).err(), Some(VfsError::NoDev));
+        let procfs = super::procfs::Procfs::new(DevId::makedev(0, 127));
+        let version = procfs.root_inode().lookup("version").map_err(|_| "lookup version")?;
+        kassert_eq!(version.inode_type(), InodeType::File);
+        kassert_eq!(mmap_page(&version, 0).err(), Some(VfsError::NoDev));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn is_dirty_sees_an_unmap_landing_between_its_loads() {
+        // Reclaim's `is_dirty` can be preempted between its two loads, and
+        // an unmap's `dec_writable_maps` (which takes no lock) can run
+        // there. The page was mapped writable and a writeback cleared
+        // `dirty`: whichever way the unmap falls, the page must read dirty,
+        // or reclaim evicts its mapped stores unwritten.
+        use crate::{kassert, kassert_eq};
+        let page = CachePage::new_zeroed().ok_or("frame")?;
+        page.set_dirty();
+        page.inc_writable_maps();
+        kassert!(page.swap_dirty(false)); // a writeback while mapped
+        kassert!(page.is_dirty()); // through the count
+        ktest_hooks::dec_between_dirty_loads(&page);
+        kassert!(page.is_dirty()); // the unmap landed between the loads
+        kassert_eq!(page.writable_maps(), 0); // (it did run)
+        kassert!(page.is_dirty()); // and after it, through `dirty`
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn mapped_page_copies_to_a_frame_under_the_cache_lock() {
+        // `MappedPage::copy_to_frame` (a copy-on-write split): the page's
+        // first `valid` bytes, zeros after them, whatever the frame held
+        // before; and the copy holds the owning inode's Lock 5, as the
+        // kernel's writers of the page do: while another thread holds that
+        // lock, a copy started meanwhile waits.
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::AtomicU8;
+        use lumen_vfs::{DevId, FileSystem};
+        let fs = super::tmpfs::Tmpfs::new(DevId::makedev(0, 128), 4 * PAGE_SIZE);
+        let f = fs.root_inode().create("cow.bin", 0o644).map_err(|_| "create")?;
+        let bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8 | 1).collect();
+        kassert_eq!(f.write_at(0, &bytes).map_err(|_| "write")?, PAGE_SIZE);
+        let mapped = mmap_page(&f, 0).map_err(|_| "map")?;
+        let mut dst = frame::alloc_owned().ok_or("dst frame")?;
+        let dst_ptr = mm::phys_to_virt(dst.frame().start()).as_mut_ptr::<u8>();
+        let read_dst = |out: &mut [u8; PAGE_SIZE]| {
+            // SAFETY: `dst` is an allocated frame this test owns, mapped
+            // through the HHDM; no reference to it is live while copying.
+            unsafe { core::ptr::copy_nonoverlapping(dst_ptr, out.as_mut_ptr(), PAGE_SIZE) };
+        };
+        // SAFETY: as above; filling it with junk first.
+        unsafe { core::ptr::write_bytes(dst_ptr, 0xa5, PAGE_SIZE) };
+        mapped.copy_to_frame(&mut dst, 1000);
+        let mut got = [0u8; PAGE_SIZE];
+        read_dst(&mut got);
+        kassert!(got[..1000] == bytes[..1000]);
+        kassert!(got[1000..].iter().all(|&b| b == 0));
+        mapped.copy_to_frame(&mut dst, PAGE_SIZE);
+        read_dst(&mut got);
+        kassert!(got[..] == bytes[..]);
+
+        // Hold the cache's lock, start a copy in a thread on this CPU, and
+        // let it run: it must still be waiting when the lock is let go.
+        let tmpfs = f.as_any().and_then(|a| a.downcast_ref::<super::tmpfs::TmpfsInode>()).ok_or("not tmpfs")?;
+        let state = Arc::new(AtomicU8::new(0)); // 1: copying, 2: copied
+        let held = tmpfs.page_cache_lock().lock();
+        let (st, mut dst2) = (Arc::clone(&state), frame::alloc_owned().ok_or("dst frame 2")?);
+        let copier = crate::sched::spawn("ktest-cow-copy", move || {
+            st.store(1, Ordering::Release);
+            mapped.copy_to_frame(&mut dst2, PAGE_SIZE);
+            st.store(2, Ordering::Release);
+        })
+        .map_err(|_| "spawn")?;
+        for _ in 0..100_000 {
+            if state.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            crate::sched::yield_now();
+        }
+        let slept = crate::sched::sleep(20_000_000); // time to finish, were it not waiting
+        let while_held = state.load(Ordering::Acquire);
+        drop(held);
+        copier.join();
+        kassert!(slept);
+        kassert_eq!(while_held, 1); // started, and waiting for the lock
+        kassert_eq!(state.load(Ordering::Acquire), 2);
         Ok(())
     }
 );
