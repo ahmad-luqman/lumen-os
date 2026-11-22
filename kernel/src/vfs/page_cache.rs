@@ -475,10 +475,11 @@ impl MappedPage {
     /// `AddressSpace::inner` (Lock 1), since the truncate takes Lock 4 alone.
     /// A page mapped from a stale snapshot is unmapped all the same: the
     /// shrinking syscall's `invalidate_file_from` takes Lock 1 after the
-    /// truncate, so after that mapping (ARCHITECTURE section 5); in the
-    /// caller's own space only until M8, and not after `O_TRUNC` (#289). A
-    /// private copy-on-write copy of the end page made from a stale snapshot
-    /// can keep bytes past the new end. (The fault path needs only
+    /// truncate, and so runs once that fault's mapping is in place
+    /// (ARCHITECTURE section 5's rules: the caller's own space only until
+    /// M8, not after `O_TRUNC`). A private copy-on-write copy of the end
+    /// page made from a stale snapshot can keep bytes past the new end
+    /// (bytes a shared mapping stored past it). (The fault path needs only
     /// [`valid_len`](Self::valid_len), through `copy_to_frame`.)
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests' check of the snapshot
     pub(crate) fn file_size(&self) -> u64 {
@@ -547,9 +548,9 @@ impl Drop for WritableMap {
 ///   the pages past the new size and stops counting them, even one a
 ///   mapping still holds. The page stays alive, pinned by that mapping,
 ///   until ARCHITECTURE section 5's truncate invalidation, which the
-///   shrinking syscall runs once the truncate has returned (the syscall
-///   never holds Lock 1 and Lock 4 together), unmaps it: in the caller's
-///   own address space only until M8, and not yet after `O_TRUNC` (#289).
+///   shrinking syscall runs once the truncate has returned, unmaps it (with
+///   section 5's limits: the caller's own space only until M8, not yet
+///   after `O_TRUNC`).
 /// - **Other inodes:** `NoDev` for anything but a regular file of `ext4`
 ///   or `tmpfs` (directories, symlinks, `devfs`, `procfs`). `NoEnt` for an
 ///   `ext4` inode unlinked and not open, as `read_at` says.
@@ -701,6 +702,13 @@ pub(crate) mod ktest_files {
         pub(crate) fn fail_reads(&self, fail: bool) {
             self.cache.fail_reads.store(fail, Ordering::Release);
         }
+    }
+
+    /// A fresh writable `ext4` volume (1 MiB) over `ext4::ktest_util`'s
+    /// `FaultCache`, which counts the filesystem's writes and fails a chosen
+    /// one (`arm_write`) or all (`fail_writes`).
+    pub(crate) fn fault_ext4(minor: u32) -> Result<super::super::ext4::ktest_util::Mnt, &'static str> {
+        super::super::ext4::ktest_util::mount(build_minimal_ext4_image_blocks(256), minor)
     }
 
     /// A fresh `tmpfs` holding `quota_bytes`.

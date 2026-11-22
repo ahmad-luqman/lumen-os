@@ -3598,10 +3598,11 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 88 | `symlink(target, linkpath)` | shim to `symlinkat(target, AT_FDCWD, linkpath)` |
 | 89 | `readlink(path, buf, bufsiz)` | shim to `readlinkat(AT_FDCWD, path, buf, bufsiz)` |
 | 90 | `chmod(path, mode)` | shim to `fchmodat(AT_FDCWD, path, mode)` |
-| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs; on `devfs` nodes too, which Linux's devtmpfs allows, as for `chown` and `utimensat`) |
+| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on a read-only mount) |
 | 92 | `chown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, 0)` |
 | 93 | `fchown(fd, uid, gid)` | updates `uid`/`gid` (`u32::MAX` = leave unchanged) and `ctime` on open `fd`'s inode, dropping setuid (and setgid with group-execute) on a non-directory in the same `set_owner` (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs) |
 | 94 | `lchown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)` |
+| — | *`chmod`, `chown` and `utimensat` families on `devfs`* | `-EROFS` (a read-only mount, devfs included). A divergence: Linux's devtmpfs accepts these on its nodes; accepting them takes devfs's setters and `writable_mount` (with `exempt_from_rofs`, as `open_inode` uses) |
 | 95 | `umask(mask)` | atomically sets per-process `umask = mask & 0o777` (default `0o022`) and returns previous mask |
 | 162 | `sync()` | snapshots mounted filesystems and cached inodes (never holding `MountTable`/`InodeCache` across I/O), flushes every dirty `PageCache` page and `BlockCache` block followed by `BlockDevice::flush()`; always returns `0` |
 | 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor`; returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
@@ -5114,9 +5115,9 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     to pages past the new size and stops counting them, even if a mapping
     still holds one. The page stays alive, pinned by that mapping, until
     section 5's truncate invalidation, run by the shrinking syscall once
-    the truncate has returned (the syscall never holding Lock 1 and Lock 4
-    together), unmaps it: in the caller's own address space only until M8,
-    and not yet after `O_TRUNC` (#289).
+    the truncate has returned, unmaps it (section 5's rules: the syscall
+    never holds Lock 1 and Lock 4 together, the caller's space only until
+    M8, not yet after `O_TRUNC`).
   - *Other inodes:* `NoDev` for directories, symlinks, and every inode of
     another filesystem (`devfs`, `procfs`); `NoEnt` for an `ext4` inode
     unlinked and not open.
@@ -5132,7 +5133,8 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     after the truncate, so it runs after that fault's mapping is in place.
     This holds for the caller's own space only until M8, and not after
     `O_TRUNC` (#289). A private copy-on-write copy of the end page made from
-    a stale snapshot can keep bytes past the new end.
+    a stale snapshot can keep bytes past the new end (bytes a shared mapping
+    stored past it).
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
     Option<&dyn Any>`, a default trait method returning `None`, overridden
     by `Ext4Inode` and `TmpfsInode` to return themselves; `mmap_page`

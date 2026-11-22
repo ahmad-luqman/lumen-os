@@ -715,6 +715,10 @@ impl VfsInode for MemInode {
         if let Some(gid_val) = gid {
             g.gid = gid_val;
         }
+        // `VfsInode::set_owner`'s contract: the set-id bits a chown drops,
+        // and ctime, in the same hold (this fake's "now" is 100 s).
+        g.mode = crate::types::mode_after_chown(self.inode_type, g.mode);
+        g.ctime = Timespec { sec: 100, nsec: 0 };
         Ok(())
     }
 
@@ -8371,6 +8375,7 @@ fn mode_after_chown_drops_setuid_and_group_exec_setgid_off_directories() {
         assert_eq!(mode_after_chown(t, 0o6745), 0o2745); // no group-execute: setgid stays
         assert_eq!(mode_after_chown(t, 0o2711), 0o0711);
         assert_eq!(mode_after_chown(t, 0o4700), 0o0700);
+        assert_eq!(mode_after_chown(t, 0o4644), 0o0644); // setuid goes without u+x too
         assert_eq!(mode_after_chown(t, 0o1644), 0o1644); // sticky stays
         assert_eq!(mode_after_chown(t, 0o0777), 0o0777);
     }

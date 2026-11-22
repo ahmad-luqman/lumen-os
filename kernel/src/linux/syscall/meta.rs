@@ -215,8 +215,10 @@ fn length(raw: u64) -> Result<u64, u32> {
 /// then unmap the current process's pages of it past the new end. The
 /// truncate has released Lock 4 before `invalidate_file_from` takes
 /// Lock 1: this syscall never holds both. A later access past the end
-/// faults into a bus error. On a grow there is nothing to unmap in the
-/// caller's space: a fault refuses a page wholly past the old end.
+/// faults into a bus error. A grow usually finds nothing to unmap (a fault
+/// refuses a page wholly past the old end), but leaves a non-invalidating
+/// `O_TRUNC` (#289) left past the old end are cleared here past the new
+/// one.
 ///
 /// Only the current process's address space, loaded on this CPU
 /// (`invalidate_file_from`'s debug assertion): another process mapping the
@@ -224,8 +226,9 @@ fn length(raw: u64) -> Result<u64, u32> {
 /// shoots their TLB entries down (#255).
 fn resize(inode: &dyn VfsInode, len: u64) -> Result<u64, u32> {
     writable_mount(inode)?;
-    inode.truncate(len).map_err(vfs)?;
+    // Taken first, so a caller without one panics before the file changes.
     let space = sched::current_address_space().expect("a truncate syscall runs on a thread with an address space");
+    inode.truncate(len).map_err(vfs)?;
     space.invalidate_file_from(file_id_of(inode), len);
     Ok(0)
 }
@@ -757,36 +760,49 @@ mod tests {
 
     crate::ktest!(
         fn meta_chown_on_ext4_drops_set_id_bits_in_its_one_write_and_a_failed_one_changes_nothing() {
-            // ext4's `set_owner` drops setuid (and group-exec setgid) in the
-            // same disk write as the owner: a read-only remount of the disk
-            // sees both. A chown whose disk read fails changes neither,
-            // in memory or on disk.
-            use crate::vfs::page_cache::ktest_files::Ext4Volume;
+            // ext4's `set_owner` changes the owner and drops setuid (and
+            // group-exec setgid) in one disk write: with the second write
+            // armed to fail, the chown still succeeds, both applied, one
+            // write made (a two-step chown fails there, owner changed and
+            // setuid kept), and a read-only remount sees both. With every
+            // write failing, the chown is `-EIO` and changes nothing, in
+            // memory or on disk.
+            use crate::vfs::ext4::ktest_util::remount_ro;
+            use crate::vfs::page_cache::ktest_files::fault_ext4;
+            use core::sync::atomic::Ordering;
+            use lumen_vfs::FileSystem;
             process::in_test_process(|_| {
-                let vol = Ext4Volume::new(203)?;
-                let f = vol.root.create("suid", 0o644).map_err(|_| "create on ext4")?;
-                f.set_mode(0o6755).map_err(|_| "set_mode")?;
+                let m = fault_ext4(203)?;
+                let f = m.root.create("suid", 0o644).map_err(|_| "create on ext4")?;
+                f.set_mode(0o4755).map_err(|_| "set_mode")?;
                 let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
                 let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from("/suid"), rw)
                     .map_err(|_| "open on ext4")?;
                 let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
-                kassert_eq!(sys_fchown(fd, 5, u32::MAX), 0);
-                let m = f.stat().map_err(|_| "stat")?;
-                kassert_eq!((m.uid, m.gid, m.mode), (5, 0, 0o0755));
-                let on_disk = vol.remount_ro(204)?.lookup("suid").map_err(|_| "lookup on the remount")?;
-                let d = on_disk.stat().map_err(|_| "stat on the remount")?;
+                let disk = |minor| {
+                    remount_ro(&m, minor)?.root_inode().lookup("suid").and_then(|i| i.stat()).map_err(|_| "remount")
+                };
+                m.cache.arm_write(2);
+                let chown = sys_fchown(fd, 5, u32::MAX);
+                let writes = m.cache.writes.load(Ordering::Acquire);
+                m.cache.clear();
+                kassert_eq!(chown, 0);
+                kassert_eq!(writes, 1);
+                let st = f.stat().map_err(|_| "stat")?;
+                kassert_eq!((st.uid, st.gid, st.mode), (5, 0, 0o0755));
+                let d = disk(204)?;
                 kassert_eq!((d.uid, d.gid, d.mode), (5, 0, 0o0755));
-                // A failing disk: `-EIO`, and nothing changed.
+                // Every write failing: `-EIO`, and nothing changed.
                 f.set_mode(0o4755).map_err(|_| "set_mode")?;
                 let before = f.stat().map_err(|_| "stat")?;
-                vol.fail_reads(true);
+                m.cache.fail_writes.store(true, Ordering::Release);
                 let failed = sys_fchown(fd, 7, 8);
-                vol.fail_reads(false);
+                m.cache.clear();
                 kassert_eq!(failed, neg_errno(errno::EIO));
                 let after = f.stat().map_err(|_| "stat")?;
                 kassert_eq!((after.uid, after.gid, after.mode), (5, 0, 0o4755));
                 kassert_eq!(after.ctime, before.ctime);
-                let d = vol.remount_ro(205)?.lookup("suid").and_then(|i| i.stat()).map_err(|_| "remount")?;
+                let d = disk(205)?;
                 kassert_eq!((d.uid, d.gid, d.mode), (5, 0, 0o4755));
                 kassert_eq!(sys_close(fd), 0);
                 Ok(())

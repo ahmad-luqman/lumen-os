@@ -4013,7 +4013,7 @@ impl VfsInode for Ext4Inode {
 /// Test seams for the ktests below: a block cache that counts and injects
 /// faults, and mount, remount and image helpers.
 #[cfg(feature = "ktest")]
-pub(super) mod ktest_util {
+pub(crate) mod ktest_util {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -4030,7 +4030,7 @@ pub(super) mod ktest_util {
     /// and fails them on request.
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
-        pub dev: MemBlkDev,
+        pub(in crate::vfs) dev: MemBlkDev,
         pub reads: AtomicUsize,
         pub writes: AtomicUsize,
         /// Fail the write with this number (counting from `arm_write`), once.
