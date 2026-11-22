@@ -5375,10 +5375,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     non-zero, else new in `i_block[1]`), keeping it for the inode's life. Times
     go through `lumen_vfs::ext4::time_to_disk`/`time_from_disk`: Linux's signed
     second plus two epoch bits (1901 to 2446), clamped outside that range
-    (`timestamp_truncate`), and whole 32-bit seconds for an inode whose
-    `i_extra_isize` leaves out `i_crtime` (taken to have no extra time
-    fields). After every write of an inode's times, memory takes back what the
-    disk holds, so `stat` before and after a remount agree.
+    (`timestamp_truncate`), and whole 32-bit seconds for a time whose extra
+    field the inode's `i_extra_isize` leaves out (`i_ctime_extra` needs 8,
+    `i_mtime_extra` 12, `i_atime_extra` 16; found once per load by asking a
+    copy of the `ext4plus` inode, `ExtraTimes::of`). Every time is set in
+    memory already truncated that way (`truncate_time`), so `stat` before and
+    after a flush or a remount agree.
   - **Truncate partial-block tail zeroing:** `ext4plus::file::truncate` does
     not zero `[new_size % 4096 .. 4096)` in the partial final block on shrink;
     #253's `PageCache` / truncate path MUST enforce the tail-zeroing rule above.

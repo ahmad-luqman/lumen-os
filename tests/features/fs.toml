@@ -102,5 +102,5 @@ tests = [
     "cargo:lumen-vfs",
     "ktest:lumen_kernel::vfs::ext4::ext4_device_nodes_report_their_device_numbers",
     "ktest:lumen_kernel::vfs::ext4::ext4_times_before_1970_and_past_2038_survive_a_remount",
-    "ktest:lumen_kernel::vfs::ext4::ext4_an_inode_without_extra_time_fields_keeps_whole_seconds",
+    "ktest:lumen_kernel::vfs::ext4::ext4_times_follow_the_extra_fields_an_inode_has",
 ]
