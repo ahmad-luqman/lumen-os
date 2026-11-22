@@ -2,8 +2,8 @@
 //!
 //! Provides unified [`page_cache::PageCache`], writable [`ext4::Ext4FileSystem`]
 //! over [`lumen_bcache::BlockCache`], [`tmpfs::Tmpfs`], [`devfs::Devfs`],
-//! [`procfs::Procfs`], Lock-9 [`KernelVfsTables`] (`MountTable -> DentryCache ->
-//! InodeCache`), boot-time [`init()`] mounting, shell commands (`mount`, `sync`,
+//! [`procfs::Procfs`], Lock-9 [`KernelVfsTables`] (lumen-vfs's `VfsTables`
+//! over `SleepMutex`: `MountTable -> DentryCache -> InodeCache`), boot-time [`init()`] mounting, shell commands (`mount`, `sync`,
 //! `vfstest`), and the `#248` `ext4plus` smoke check (`exercise_ext4_smoke`;
 //! its ktest, `ext4_crate_smoke`, is in `vfs/tests.rs` with the others of
 //! this file's code).
@@ -39,8 +39,8 @@ use log::{debug, error, info, warn};
 use lumen_bcache::BlockDevice;
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_vfs::{
-    DentryCache, DentryTarget, DevId, Escaped, FileSystem, Ino, InodeCache, InodeType, MountInfo, MountTable, OpenFile,
-    OpenFlags, RenameFlags, ResolveFlags, VfsCacheOps, VfsError, VfsInode, VfsLock, mkdir_at, open_inode,
+    DentryCache, DevId, Escaped, FileSystem, InodeCache, InodeType, LockFamily, MountInfo, MountTable, OpenFile,
+    OpenFlags, RenameFlags, ResolveFlags, VfsError, VfsInode, VfsLock, VfsTables, mkdir_at, open_inode,
     open_inode_guarded, readlink_at, rename_at2, resolve_path, symlink_at, unlink_at,
 };
 
@@ -69,329 +69,29 @@ impl<T> VfsLock<T> for KernelVfsLock<T> {
     }
 }
 
-/// Lock-9 VFS lookup tables enforcing strict sub-order
-/// `MountTable -> DentryCache -> InodeCache`.
-///
-/// Never holds any Lock-9 mutex across `FileSystem::root_inode()`, Locks 1–8,
-/// or `Arc` drops after `umount`.
-pub struct KernelVfsTables {
-    mounts: SleepMutex<MountTable>,
-    dentries: SleepMutex<DentryCache>,
-    inodes: SleepMutex<InodeCache>,
-}
-
-impl KernelVfsTables {
-    pub const fn new() -> Self {
-        Self {
-            mounts: SleepMutex::new(MountTable::new()),
-            dentries: SleepMutex::new(DentryCache::new(DentryCache::DEFAULT_CAPACITY)),
-            inodes: SleepMutex::new(InodeCache::new()),
-        }
-    }
-
-    pub fn mount_root(&self, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
-        let root = fs.root_inode();
-        let root_ino = root.ino();
-        self.mounts.lock().mount_root_with_ino(fs, root_ino)?;
-        let _ = self.inodes.lock().get_or_insert(root);
-        Ok(())
-    }
-
-    pub fn mount(&self, mountpoint: Arc<dyn VfsInode>, path: &str, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
-        let mp_dev = mountpoint.dev_id();
-        let mp_ino = mountpoint.ino();
-        let root = fs.root_inode();
-        let root_ino = root.ino();
-        let mut mounts = self.mounts.lock();
-        let mut dentries = self.dentries.lock();
-        let mut inodes = self.inodes.lock();
-        mounts.mount_with_ino(mountpoint, path, fs, root_ino)?;
-        dentries.invalidate_dir(mp_dev, mp_ino);
-        let _ = inodes.get_or_insert(root);
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn umount(&self, mountpoint_dev: DevId, mountpoint_ino: Ino) -> Result<Arc<dyn FileSystem>, VfsError> {
-        let (fs, evicted) = {
-            let mut mounts = self.mounts.lock();
-            let mut dentries = self.dentries.lock();
-            let mut inodes = self.inodes.lock();
-            let fs = mounts.umount(mountpoint_dev, mountpoint_ino)?;
-            let dev = fs.dev_id();
-            dentries.invalidate_fs(dev);
-            dentries.invalidate_dir(mountpoint_dev, mountpoint_ino);
-            let evicted = inodes.evict_fs(dev);
-            (fs, evicted)
-        };
-        drop(evicted);
-        Ok(fs)
-    }
-
-    pub fn snapshot_filesystems(&self) -> Vec<Arc<dyn FileSystem>> {
-        self.mounts.lock().snapshot_filesystems()
-    }
-
-    pub fn snapshot_inodes(&self) -> Vec<Arc<dyn VfsInode>> {
-        self.inodes.lock().snapshot_all()
-    }
-
-    /// How many names `DentryCache` holds (procfs's ktest: flat over many
-    /// short processes, #263).
-    #[cfg(feature = "ktest")]
-    pub fn dentry_count(&self) -> usize {
-        self.dentries.lock().len()
-    }
-
-    pub fn list_mounts(&self) -> Vec<MountInfo> {
-        self.mounts.lock().list_mounts()
+impl<T> KernelVfsLock<T> {
+    /// [`VfsLock::new`] as a `const fn`, for [`TABLES`].
+    pub const fn new_const(val: T) -> Self {
+        Self(SleepMutex::new(val))
     }
 }
 
-impl VfsCacheOps for KernelVfsTables {
-    fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
-        let root_fs = self.mounts.lock().root_fs().ok_or(VfsError::NoEnt)?;
-        Ok(root_fs.root_inode())
-    }
+/// The kernel's [`LockFamily`]: [`KernelVfsLock`] (`SleepMutex`).
+pub struct KernelLocks;
 
-    fn is_global_root(&self, dev: DevId, ino: Ino) -> bool {
-        self.mounts.lock().is_global_root(dev, ino)
-    }
-
-    fn mount_at(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn FileSystem>> {
-        self.mounts.lock().mount_at(dev, ino)
-    }
-
-    fn mount_at_with_id(&self, dev: DevId, ino: Ino) -> Option<(Arc<dyn FileSystem>, u64)> {
-        self.mounts.lock().mount_at_with_id(dev, ino)
-    }
-
-    fn parent_mount(&self, mounted_dev: DevId) -> Option<Arc<dyn VfsInode>> {
-        self.mounts.lock().parent_mount(mounted_dev)
-    }
-
-    fn parent_mount_if_root(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        self.mounts.lock().parent_mount_if_root(dev, ino)
-    }
-
-    fn is_mountpoint(&self, dev: DevId, ino: Ino) -> bool {
-        self.mounts.lock().is_mountpoint(dev, ino)
-    }
-
-    fn fs_read_only(&self, dev: DevId) -> bool {
-        self.mounts.lock().fs_by_dev(dev).is_some_and(|fs| fs.read_only())
-    }
-
-    fn fs_by_dev(&self, dev: DevId) -> Option<Arc<dyn FileSystem>> {
-        self.mounts.lock().fs_by_dev(dev)
-    }
-
-    fn cache_gens(&self) -> (u64, u64) {
-        let dentries = self.dentries.lock();
-        let inodes = self.inodes.lock();
-        (dentries.invalidation_gen(), inodes.removal_gen())
-    }
-
-    fn dentry_lookup_inode(
-        &self,
-        parent_dev: DevId,
-        parent_ino: Ino,
-        name: &[u8],
-    ) -> (Option<Arc<dyn VfsInode>>, u64, u64) {
-        let dentries = self.dentries.lock();
-        let inodes = self.inodes.lock();
-        let (target_opt, dentry_gen) = dentries.get_with_gen(parent_dev, parent_ino, name);
-        let inode_gen = inodes.removal_gen();
-        let inode = target_opt.and_then(|t| inodes.get(t.dev, t.ino));
-        (inode, dentry_gen, inode_gen)
-    }
-
-    fn publish_lookup_inode(
-        &self,
-        parent_dev: DevId,
-        parent_ino: Ino,
-        name: &[u8],
-        inode: Arc<dyn VfsInode>,
-        expected_dentry_gen: u64,
-        expected_inode_gen: u64,
-    ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let mounts = self.mounts.lock();
-        let mut dentries = self.dentries.lock();
-        let mut inodes = self.inodes.lock();
-        if !mounts.is_dev_mounted(inode.dev_id()) {
-            return Err(inode);
-        }
-        if !inode.cacheable() {
-            return Ok(inode);
-        }
-        let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
-        if !mounts.is_mountpoint(parent_dev, parent_ino) {
-            let _ = dentries.insert_if_gen(
-                parent_dev,
-                parent_ino,
-                name,
-                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                expected_dentry_gen,
-            );
-        }
-        Ok(unified)
-    }
-
-    fn publish_created_inode(
-        &self,
-        parent_dev: DevId,
-        parent_ino: Ino,
-        name: &[u8],
-        inode: Arc<dyn VfsInode>,
-        expected_dentry_gen: u64,
-        expected_inode_gen: u64,
-    ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let mounts = self.mounts.lock();
-        let mut dentries = self.dentries.lock();
-        let mut inodes = self.inodes.lock();
-        if !mounts.is_dev_mounted(inode.dev_id()) {
-            return Err(inode);
-        }
-        if !inode.cacheable() {
-            return Ok(inode);
-        }
-        let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
-        let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-        if !was_cached && !mounts.is_mountpoint(parent_dev, parent_ino) {
-            let _ = dentries.insert_if_gen(
-                parent_dev,
-                parent_ino,
-                name,
-                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                expected_dentry_gen,
-            );
-        }
-        Ok(unified)
-    }
-
-    fn dentry_gen(&self) -> u64 {
-        self.dentries.lock().invalidation_gen()
-    }
-
-    fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> Option<DentryTarget> {
-        self.dentries.lock().get(parent_dev, parent_ino, name)
-    }
-
-    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64) {
-        self.dentries.lock().get_with_gen(parent_dev, parent_ino, name)
-    }
-
-    fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8], target: DentryTarget) {
-        self.dentries.lock().insert(parent_dev, parent_ino, name, target);
-    }
-
-    fn dentry_insert_if_gen(
-        &self,
-        parent_dev: DevId,
-        parent_ino: Ino,
-        name: &[u8],
-        target: DentryTarget,
-        expected_gen: u64,
-    ) -> bool {
-        let mounts = self.mounts.lock();
-        let mut dentries = self.dentries.lock();
-        if mounts.is_mountpoint(parent_dev, parent_ino) {
-            return false;
-        }
-        dentries.insert_if_gen(parent_dev, parent_ino, name, target, expected_gen)
-    }
-
-    fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) {
-        self.dentries.lock().invalidate(parent_dev, parent_ino, name);
-    }
-
-    fn dentry_invalidate_dir(&self, parent_dev: DevId, parent_ino: Ino) {
-        self.dentries.lock().invalidate_dir(parent_dev, parent_ino);
-    }
-
-    fn inode_get(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.lock().get(dev, ino)
-    }
-
-    fn inode_get_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.lock().get_if_fresh(dev, ino, since_gen)
-    }
-
-    fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
-        if !inode.cacheable() {
-            return inode;
-        }
-        self.inodes.lock().get_or_insert(inode)
-    }
-
-    fn inode_get_or_insert_if_mounted(
-        &self,
-        mp_dev: DevId,
-        mp_ino: Ino,
-        mount_id: u64,
-        inode: Arc<dyn VfsInode>,
-    ) -> Option<Arc<dyn VfsInode>> {
-        let mounts = self.mounts.lock();
-        let mut inodes = self.inodes.lock();
-        if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
-            return None;
-        }
-        if !inode.cacheable() {
-            return Some(inode);
-        }
-        Some(inodes.get_or_insert(inode))
-    }
-
-    fn inode_get_or_insert_if_fresh(
-        &self,
-        inode: Arc<dyn VfsInode>,
-        since_gen: u64,
-    ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let mounts = self.mounts.lock();
-        let mut inodes = self.inodes.lock();
-        if !mounts.is_dev_mounted(inode.dev_id()) {
-            return Err(inode);
-        }
-        if !inode.cacheable() {
-            return Ok(inode);
-        }
-        inodes.get_or_insert_if_fresh(inode, since_gen)
-    }
-
-    fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.lock().remove(dev, ino)
-    }
-
-    fn inode_remove_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-        self.inodes.lock().remove_if_fresh(dev, ino, since_gen)
-    }
-
-    fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
-        self.inodes.lock().begin_removal_if_fresh(dev, ino, since_gen)
-    }
-
-    fn inode_end_removal(&self, dev: DevId, ino: Ino) -> u64 {
-        self.inodes.lock().end_removal(dev, ino)
-    }
-
-    fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool {
-        self.inodes.lock().evict_detached(dev, ino)
-    }
-
-    fn inode_remove_if_same(&self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.lock().remove_if_same(dev, ino, expected)
-    }
-
-    fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
-        self.inodes.lock().record_removal(dev, ino)
-    }
-
-    fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
-        self.inodes.lock().record_removal_if_absent(dev, ino)
-    }
+impl LockFamily for KernelLocks {
+    type Lock<T> = KernelVfsLock<T>;
 }
 
-static TABLES: KernelVfsTables = KernelVfsTables::new();
+/// The kernel's Lock-9 VFS lookup tables: lumen-vfs's [`VfsTables`] (the
+/// ones its host tests run) over `SleepMutex`.
+pub type KernelVfsTables = VfsTables<KernelLocks>;
+
+static TABLES: KernelVfsTables = KernelVfsTables::from_locks(
+    KernelVfsLock::new_const(MountTable::new()),
+    KernelVfsLock::new_const(DentryCache::new(DentryCache::DEFAULT_CAPACITY)),
+    KernelVfsLock::new_const(InodeCache::new()),
+);
 static EXT4_FILESYSTEMS: SleepMutex<Vec<Arc<ext4::Ext4FileSystem>>> = SleepMutex::new(Vec::new());
 
 /// Global kernel VFS tables (`VfsCacheOps`).

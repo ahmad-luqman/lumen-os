@@ -28,6 +28,14 @@ pub trait VfsLock<T> {
     fn get_mut(&mut self) -> &mut T;
 }
 
+/// A family of [`VfsLock`]s, one lock type for any `T`: what
+/// [`VfsTables`](crate::VfsTables) is generic over (#264). The kernel's is
+/// `vfs::KernelLocks` (`SleepMutex`); the host tests' a `std` mutex counting
+/// how many Lock-9 guards a thread holds.
+pub trait LockFamily {
+    type Lock<T>: VfsLock<T>;
+}
+
 /// Zero-`unsafe` single-threaded `VfsLock` backed by `core::cell::RefCell`.
 #[derive(Debug, Default)]
 pub struct LocalLock<T>(RefCell<T>);
