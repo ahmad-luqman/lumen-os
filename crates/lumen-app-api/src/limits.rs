@@ -19,9 +19,9 @@ pub const MAX_APPS: usize = 4;
 /// Memory left to the kernel when a smaller machine gets fewer slots.
 /// [`MAX_APPS`] slots need the frame allocator to own this plus four worst
 /// cases (154.06 MiB, 39,440 frames). The guests' default 256 MiB leave it
-/// right at that line (39,393 to 39,444 frames measured in #278; the
-/// kernel's ELF file, its debug info and embedded apps included, the boot
-/// structures and the firmware's reservations aside), 3 slots or 4 as the
+/// right at that line (39,393 to 39,444 frames measured in #278; aside: the
+/// kernel's ELF file (debug info and embedded apps with it), the boot
+/// structures and the firmware's reservations), 3 slots or 4 as the
 /// kernel's image moves, so the max-apps scenario boots with 384 MiB
 /// (72,210 frames owned, 282.07 MiB).
 pub const KERNEL_RESERVE: u64 = 32 * MIB;

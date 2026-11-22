@@ -184,10 +184,9 @@ def test_machine_memory_is_its_one_dash_m(tmp_path):
         late.extra_args += spelling
         with pytest.raises(ValueError, match="not `-m` in extra args"):
             qemu_args(late.options(Path("v.fd")))
-    # Options that only start with an m are not it.
-    assert dash_m(qemu_args(opts(extra=["-machine", "q35,hpet=off", "-mem-prealloc"]))) == [
-        DEFAULT_MEMORY
-    ]
+    # Options that only start with an m are not it, nor `-M` (`-machine`).
+    others = ["-machine", "q35,hpet=off", "-mem-prealloc", "-M", "q35"]
+    assert dash_m(qemu_args(opts(extra=others))) == [DEFAULT_MEMORY]
 
 
 def test_trace_events_go_to_the_log_file(tmp_path):
