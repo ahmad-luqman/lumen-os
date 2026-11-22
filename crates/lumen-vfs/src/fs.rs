@@ -84,6 +84,15 @@ pub trait VfsInode: Send + Sync {
         false
     }
 
+    /// True for a terminal (`devfs`'s `tty` and `console`): a descriptor on
+    /// one reads and writes the calling process's console, takes the tty
+    /// `ioctl`s (`-ENOTTY` on anything else), polls on the console's
+    /// readiness and can't seek (`-ESPIPE`). Answers from fixed state,
+    /// without locking.
+    fn is_tty(&self) -> bool {
+        false
+    }
+
     /// False for an inode whose existence the VFS can't hold on to, so it
     /// must never enter `DentryCache` or `InodeCache` (e.g. `procfs`'s
     /// `/proc/<pid>` and everything under it, which go when the process or

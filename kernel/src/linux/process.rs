@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use lumen_vfs::{VfsError, VfsInode};
+use lumen_vfs::{FdTable, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded};
 
 use crate::keyboard::{Key as KbdKey, KeyCode};
 use crate::klog;
@@ -24,36 +24,42 @@ use crate::serial_in;
 use crate::sync::SpinLock;
 use crate::term;
 use crate::user::UserExit;
+use crate::vfs::KernelVfsLock;
 
-/// Maximum open file descriptors per M6 process.
-pub const MAX_FDS: usize = 64;
+/// An open file description as the kernel's FD tables hold it (Lock 2 its
+/// offset and directory cursor).
+pub type KernelFile = OpenFile<KernelVfsLock<u64>>;
+
+/// A descriptor's open file description: shared by the slots `dup` (M8)
+/// fills, its `fd_refs` counting them.
+pub type FileRef = Arc<KernelFile>;
+
+/// A new process's file mode creation mask (`umask`).
+pub const DEFAULT_UMASK: u16 = 0o022;
 
 /// Maximum captured stdout bytes for `usertest` runs.
 const CAPTURE_STDOUT_LIMIT: usize = 4096;
 
-/// Descriptor kind stored in the M6 per-process FD table.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FdKind {
-    Closed,
-    Stdin,
-    Stdout,
-    Stderr,
+/// A process's working directory: an open reference on its inode (so an
+/// `rmdir` detaches it rather than freeing it) and the path it was set by.
+/// `getcwd` computes the path afresh from the inode (`compute_cwd_path`);
+/// the stored one names it for a relative open's `/proc/<pid>/fd` path.
+pub struct Cwd {
+    guard: OpenGuard,
+    path: String,
 }
 
-impl FdKind {
-    #[inline]
-    pub const fn is_open(self) -> bool {
-        !matches!(self, FdKind::Closed)
+impl Cwd {
+    pub fn new(guard: OpenGuard, path: String) -> Self {
+        Self { guard, path }
     }
 
-    #[inline]
-    pub const fn is_readable(self) -> bool {
-        matches!(self, FdKind::Stdin)
+    pub fn inode(&self) -> &Arc<dyn VfsInode> {
+        self.guard.inode()
     }
 
-    #[inline]
-    pub const fn is_writable(self) -> bool {
-        matches!(self, FdKind::Stdout | FdKind::Stderr)
+    pub fn path(&self) -> &str {
+        &self.path
     }
 }
 
@@ -118,7 +124,13 @@ pub struct ProcessState {
     pub pid: u32,
     pub ppid: u32,
     pub tid: u32,
-    pub fds: [FdKind; MAX_FDS],
+    /// Open descriptors (`lumen_vfs::MAX_FDS` slots): 0, 1 and 2 on
+    /// `/dev/console` at the start.
+    pub fds: FdTable<FileRef>,
+    /// The working directory (`None` only if `/` couldn't be opened).
+    pub cwd: Option<Cwd>,
+    /// The file mode creation mask (`0o777` bits).
+    pub umask: u16,
     pub sigactions: [KernelSigaction; 64],
     pub sigmask: u64,
     pub clear_child_tid: u64,
@@ -133,12 +145,6 @@ pub struct ProcessState {
     /// (the path as typed) and by `vfstest dev-tmp-proc`'s checks (and the
     /// ktests running them).
     pub exe_path: Option<String>,
-    /// VFS files open on descriptors, with the path each was opened by, for
-    /// `/proc/<pid>/fd`: a stand-in for the 1024-entry FD table that #254
-    /// wires into the syscalls (only `vfstest dev-tmp-proc`'s checks, and the
-    /// ktests running them, fill it today). Keys are in `0..lumen_vfs::MAX_FDS`
-    /// (`register_current_vfs_fd` refuses others).
-    pub vfs_fds: BTreeMap<i32, (Arc<dyn VfsInode>, String)>,
     stdin: Vec<u8>,
     stdin_pos: usize,
     /// Small lookahead / UTF-8 tail buffer for stdin (up to 4 bytes).
@@ -151,6 +157,7 @@ pub struct ProcessState {
 }
 
 impl ProcessState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         pid: u32,
         io: ConsoleIo,
@@ -158,16 +165,16 @@ impl ProcessState {
         stdin: Vec<u8>,
         address_space: Option<Arc<AddressSpace>>,
         exe_path: Option<String>,
+        fds: FdTable<FileRef>,
+        cwd: Option<Cwd>,
     ) -> Self {
-        let mut fds = [FdKind::Closed; MAX_FDS];
-        fds[0] = FdKind::Stdin;
-        fds[1] = FdKind::Stdout;
-        fds[2] = FdKind::Stderr;
         Self {
             pid,
             ppid: 0,
             tid: pid,
             fds,
+            cwd,
+            umask: DEFAULT_UMASK,
             sigactions: [KernelSigaction::default(); 64],
             sigmask: 0,
             clear_child_tid: 0,
@@ -178,7 +185,6 @@ impl ProcessState {
             stdout: Vec::new(),
             address_space,
             exe_path,
-            vfs_fds: BTreeMap::new(),
             stdin,
             stdin_pos: 0,
             unread: [0; 4],
@@ -187,11 +193,6 @@ impl ProcessState {
             vt_utf8: [0; 4],
             vt_utf8_len: 0,
         }
-    }
-
-    #[inline]
-    pub fn fd_kind(&self, fd: u64) -> FdKind {
-        if fd < MAX_FDS as u64 { self.fds[fd as usize] } else { FdKind::Closed }
     }
 
     #[inline]
@@ -231,6 +232,37 @@ fn current_kernel_tid() -> u64 {
     sched::running_here().expect("ring-3 syscall/exception requires a running thread").0
 }
 
+/// Open `/dev/console` for a new process's console descriptor, with `flags`
+/// (the access mode). The guarded open, as `openat`'s.
+fn open_console(flags: u32) -> Result<FileRef, VfsError> {
+    let opened = open_inode_guarded(crate::vfs::tables(), None, b"/dev/console", OpenFlags::from_bits(flags), 0, 0)?;
+    Ok(Arc::new(OpenFile::from_opened(opened)?))
+}
+
+/// What a new process starts with: fd 0 on `/dev/console` read-only, fds 1
+/// and 2 write-only (so `read(1)` and `write(0)` are `-EBADF`, as in M6),
+/// and `/` as its working directory. Opens files, so may sleep: never call
+/// it holding `ACTIVE_PROCS`. A failure is logged and leaves that slot
+/// closed (the VFS mounts `/dev` at boot, before anything runs).
+fn initial_files() -> (FdTable<FileRef>, Option<Cwd>) {
+    let mut fds = FdTable::new();
+    for (fd, flags) in [(0, OpenFlags::O_RDONLY), (1, OpenFlags::O_WRONLY), (2, OpenFlags::O_WRONLY)] {
+        match open_console(flags) {
+            // A fresh table: nothing is displaced.
+            Ok(file) => drop(fds.insert_at(fd, file, false)),
+            Err(e) => log::warn!(target: "linux", "fd {fd}: cannot open /dev/console: {e:?}"),
+        }
+    }
+    let cwd = match crate::vfs::resolve_path_from_root("/").and_then(OpenGuard::try_new) {
+        Ok(guard) => Some(Cwd::new(guard, String::from("/"))),
+        Err(e) => {
+            log::warn!(target: "linux", "cannot open / as the working directory: {e:?}");
+            None
+        }
+    };
+    (fds, cwd)
+}
+
 /// Register a fresh [`ProcessState`] for the current user thread, with the
 /// executable's path for `/proc/<pid>/exe` if it was loaded by path, and
 /// return its PID.
@@ -238,16 +270,101 @@ pub fn register_current(io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>
     let ktid = current_kernel_tid();
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let address_space = sched::current_address_space();
-    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin, address_space, exe_path);
+    let (fds, cwd) = initial_files();
+    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin, address_space, exe_path, fds, cwd);
     let prev = ACTIVE_PROCS.lock().insert(ktid, state);
     debug_assert!(prev.is_none(), "ring-3 process registered twice on thread {ktid}");
     pid
 }
 
-/// Remove and return the current thread's [`ProcessState`] after ring-3 exits.
+/// Remove and return the current thread's [`ProcessState`] after ring-3
+/// exits, its descriptors closed (each lock released as `close` does, outside
+/// `ACTIVE_PROCS`); its working directory goes when it drops.
 pub fn take_current() -> ProcessState {
     let ktid = current_kernel_tid();
-    ACTIVE_PROCS.lock().remove(&ktid).expect("active process state missing after ring-3 exit")
+    let mut proc = ACTIVE_PROCS.lock().remove(&ktid).expect("active process state missing after ring-3 exit");
+    for entry in proc.fds.drain_all() {
+        release_fd(proc.pid, entry.file);
+    }
+    proc
+}
+
+/// Give back one descriptor's slot on `file`: `pid`'s POSIX record locks on
+/// its inode go on any close (as Linux), and its `flock` locks with the last
+/// slot of the open file description. Takes the inode's Lock 4: never call
+/// it holding `ACTIVE_PROCS` (or any spinlock).
+fn release_fd(pid: u32, file: FileRef) {
+    let last = file.dec_fd_ref() == 0;
+    let id = file.id;
+    // An inode without lock state has nothing to release.
+    let _ = file.inode.with_locks_mut(&mut |locks| {
+        locks.release_posix_for_pid(pid);
+        if last {
+            locks.release_flock(id);
+        }
+    });
+}
+
+/// The current process's open file on `fd` (a clone, taken and released
+/// under `ACTIVE_PROCS`), or `None` if `fd` isn't open.
+pub fn current_file(fd: i32) -> Option<FileRef> {
+    with_current(|p| p.fds.get(fd).map(|e| Arc::clone(&e.file)))
+}
+
+/// Whether the current process has a free descriptor slot (`openat` checks
+/// before it opens, as Linux reserves the slot first: a full table is
+/// `-EMFILE` before any file is created).
+pub fn current_has_free_fd() -> bool {
+    with_current(|p| p.fds.open_count() < lumen_vfs::MAX_FDS)
+}
+
+/// Put `file` (a fresh open file description, its `fd_refs` 1) in the
+/// current process's lowest free slot: the descriptor, or `EMFILE`.
+pub fn install_current_fd(file: FileRef, cloexec: bool) -> Result<i32, VfsError> {
+    // A clone goes in, so a refused one drops under `ACTIVE_PROCS` without
+    // being the last reference; `file` drops after the lock is released.
+    with_current_mut(|p| p.fds.alloc(Arc::clone(&file), cloexec))
+}
+
+/// Put `file` on descriptor `fd` of the current process, closing what was
+/// there (its locks released outside `ACTIVE_PROCS`). `file`'s `fd_refs` must
+/// already count this slot (a fresh open file's 1 does). `EBADF` for an fd
+/// outside `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s
+/// inode number from it and relies on that range.
+pub fn insert_current_fd(fd: i32, file: FileRef) -> Result<(), VfsError> {
+    let (pid, displaced) = with_current_mut(|p| (p.pid, p.fds.insert_at(fd, Arc::clone(&file), false)));
+    if let Some(old) = displaced? {
+        release_fd(pid, old.file);
+    }
+    Ok(())
+}
+
+/// Close descriptor `fd` of the current process (`close`): `EBADF` if it
+/// isn't open. The entry is taken out under `ACTIVE_PROCS` and released after.
+pub fn close_current_fd(fd: i32) -> Result<(), VfsError> {
+    let (pid, removed) = with_current_mut(|p| (p.pid, p.fds.remove(fd)));
+    release_fd(pid, removed?.file);
+    Ok(())
+}
+
+/// The current process's working directory: its inode and the path it was
+/// set by (clones), or `None` if it has none.
+pub fn current_cwd() -> Option<(Arc<dyn VfsInode>, String)> {
+    with_current(|p| p.cwd.as_ref().map(|c| (Arc::clone(c.inode()), String::from(c.path()))))
+}
+
+/// Make `cwd` the current process's working directory; the old one drops
+/// after `ACTIVE_PROCS` is released. (`chdir` and `fchdir` once they land;
+/// the ktests until then.)
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `chdir`/`fchdir` (#254's wave 3) call it
+pub fn set_current_cwd(cwd: Cwd) {
+    let old = with_current_mut(|p| p.cwd.replace(cwd));
+    drop(old);
+}
+
+/// The current process's file mode creation mask.
+pub fn current_umask() -> u16 {
+    with_current(|p| p.umask)
 }
 
 /// Non-panicking lookup of the current thread's [`ConsoleIo`], returning `None`
@@ -301,95 +418,32 @@ pub fn set_current_exe_path(path: &str) {
     }
 }
 
-/// Attach a VFS inode/path to `fd` on the current [`ProcessState`] (extracting
-/// any displaced entry so `Arc` drops outside `ACTIVE_PROCS`). `EBADF` for an
-/// fd outside `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s
-/// inode number from it and relies on that range.
-pub fn register_current_vfs_fd(fd: i32, inode: Arc<dyn VfsInode>, path: String) -> Result<(), VfsError> {
-    if usize::try_from(fd).map_or(true, |f| f >= lumen_vfs::MAX_FDS) {
-        return Err(VfsError::BadF);
-    }
-    let Some(ktid) = sched::running_here().map(|id| id.0) else {
-        return Ok(());
-    };
-    let displaced = {
-        let mut guard = ACTIVE_PROCS.lock();
-        guard.get_mut(&ktid).and_then(|proc| proc.vfs_fds.insert(fd, (inode, path)))
-    };
-    drop(displaced);
-    Ok(())
-}
-
-/// Detach a VFS descriptor from the current [`ProcessState`], dropping its
-/// `Arc<dyn VfsInode>` outside `ACTIVE_PROCS`.
-pub fn unregister_current_vfs_fd(fd: i32) {
-    let Some(ktid) = sched::running_here().map(|id| id.0) else {
-        return;
-    };
-    let removed = {
-        let mut guard = ACTIVE_PROCS.lock();
-        guard.get_mut(&ktid).and_then(|proc| proc.vfs_fds.remove(&fd))
-    };
-    drop(removed);
-}
-
 /// Return sorted open descriptor numbers for `pid`.
 pub fn process_open_fds(pid: u32) -> Vec<i32> {
     let guard = ACTIVE_PROCS.lock();
-    let Some(proc) = guard.values().find(|p| p.pid == pid) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for (idx, kind) in proc.fds.iter().enumerate() {
-        let fd = idx as i32;
-        if kind.is_open() || proc.vfs_fds.contains_key(&fd) {
-            out.push(fd);
-        }
-    }
-    for &fd in proc.vfs_fds.keys() {
-        let open_in_array = usize::try_from(fd).ok().is_some_and(|i| i < MAX_FDS && proc.fds[i].is_open());
-        if !open_in_array && !out.contains(&fd) {
-            out.push(fd);
-        }
-    }
-    out.sort_unstable();
-    out
+    guard.values().find(|p| p.pid == pid).map(|p| p.fds.iter_open().map(|(fd, _)| fd).collect()).unwrap_or_default()
 }
 
-/// Snapshot `(Option<Arc<dyn VfsInode>>, display_path)` for `/proc/<pid>/fd/<fd>`.
+/// Snapshot `(Option<Arc<dyn VfsInode>>, display_path)` for `/proc/<pid>/fd/<fd>`:
+/// the open file's inode and the path it was opened by, ` (deleted)` added
+/// once unlinked.
 ///
-/// Releases `ACTIVE_PROCS` before inspecting `VfsInode::stat()` or resolving `/dev/console`.
+/// Releases `ACTIVE_PROCS` before inspecting `VfsInode::stat()` or dropping
+/// the file it cloned.
 pub fn process_fd_target(pid: u32, fd: i32) -> Option<(Option<Arc<dyn VfsInode>>, String)> {
-    enum Snapshot {
-        Vfs(Arc<dyn VfsInode>, String),
-        Console,
-    }
-
-    let snap = {
+    let file = {
         let guard = ACTIVE_PROCS.lock();
         let proc = guard.values().find(|p| p.pid == pid)?;
-        if let Some((inode, path)) = proc.vfs_fds.get(&fd) {
-            Snapshot::Vfs(Arc::clone(inode), path.clone())
-        } else if fd >= 0 && (fd as usize) < MAX_FDS && proc.fds[fd as usize].is_open() {
-            Snapshot::Console
-        } else {
-            return None;
-        }
+        Arc::clone(&proc.fds.get(fd)?.file)
     };
-
-    match snap {
-        Snapshot::Vfs(inode, mut path) => {
-            let unlinked = inode.is_detached() || inode.stat().ok().is_some_and(|m| m.nlink == 0);
-            if unlinked && !path.ends_with(" (deleted)") {
-                path.push_str(" (deleted)");
-            }
-            Some((Some(inode), path))
-        }
-        Snapshot::Console => {
-            let inode = crate::vfs::resolve_path_from_root("/dev/console").ok();
-            Some((inode, String::from("/dev/console")))
-        }
+    let inode = Arc::clone(&file.inode);
+    let mut path = String::from(&*file.path);
+    drop(file);
+    let unlinked = inode.is_detached() || inode.stat().ok().is_some_and(|m| m.nlink == 0);
+    if unlinked && !path.ends_with(" (deleted)") {
+        path.push_str(" (deleted)");
     }
+    Some((Some(inode), path))
 }
 
 /// Run a short non-blocking closure with immutable access to the current process state.
@@ -675,3 +729,150 @@ fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
         return n;
     }
 }
+
+/// Where [`in_test_process`] maps user memory for a ktest (read-write).
+#[cfg(feature = "ktest")]
+pub(crate) const KTEST_USER_VA: u64 = 0x0000_0000_0060_0000;
+
+/// How much user memory [`in_test_process`] maps at [`KTEST_USER_VA`].
+#[cfg(feature = "ktest")]
+pub(crate) const KTEST_USER_LEN: u64 = 4 * 4096;
+
+/// Run `f` as a Linux process for a ktest: on a user thread with its own
+/// address space ([`KTEST_USER_LEN`] bytes mapped at [`KTEST_USER_VA`], so
+/// handlers can copy to and from user memory) and a registered
+/// [`ProcessState`] (`ConsoleIo::Capture`), handed its pid. The process is
+/// taken down (`take_current`, closing its descriptors) when `f` returns,
+/// whatever it returned, and `f`'s result comes back.
+#[cfg(feature = "ktest")]
+pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send + 'static) -> Result<R, &'static str> {
+    use lumen_vm::Prot;
+
+    let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames for AddressSpace")?);
+    if space.map_eager_with_bytes(KTEST_USER_VA, KTEST_USER_LEN, Prot::READ | Prot::WRITE, &[]).is_err() {
+        space.teardown();
+        return Err("map the test process's user memory");
+    }
+    let slot: Arc<SpinLock<Option<R>>> = Arc::new(SpinLock::new(None));
+    let out = Arc::clone(&slot);
+    let spawned = sched::spawn_user_on(crate::arch::cpu_index(), "ktest-process", Arc::clone(&space), move || {
+        let pid = register_current(ConsoleIo::Capture, false, Vec::new(), None);
+        let result = f(pid);
+        drop(take_current());
+        drop(sched::detach_user_space());
+        *out.lock() = Some(result);
+    });
+    let result = match spawned {
+        Ok(handle) => {
+            handle.join();
+            slot.lock().take().ok_or("the test process ended without a result")
+        }
+        Err(_) => Err("spawn the test process"),
+    };
+    space.teardown();
+    result
+}
+
+crate::ktest!(
+    fn process_starts_with_console_fds_and_root_cwd() {
+        use crate::{kassert, kassert_eq};
+        in_test_process(|pid| {
+            // fds 0, 1 and 2 on `/dev/console`: 0 read-only, 1 and 2
+            // write-only (M6's `EBADF` directions), none close-on-exec;
+            // nothing else open.
+            kassert_eq!(process_open_fds(pid), [0, 1, 2]);
+            for (fd, readable, writable) in [(0, true, false), (1, false, true), (2, false, true)] {
+                let file = current_file(fd).ok_or("a console fd isn't open")?;
+                kassert!(file.inode.is_tty());
+                kassert_eq!(&*file.path, "/dev/console");
+                kassert_eq!((file.is_readable(), file.is_writable()), (readable, writable));
+                kassert_eq!(with_current(|p| p.fds.get_cloexec(fd)), Ok(false));
+            }
+            // `/` is the working directory, with the default umask.
+            let (cwd, path) = current_cwd().ok_or("no working directory")?;
+            let root = crate::vfs::resolve_path_from_root("/").map_err(|_| "resolve /")?;
+            kassert!(Arc::ptr_eq(&cwd, &root));
+            kassert_eq!(path.as_str(), "/");
+            kassert_eq!(current_umask(), 0o022);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn process_close_releases_flock_on_last_slot_and_posix_locks_on_any() {
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::{FlockKind, FlockOp, FlockSpec, LockContext};
+
+        const PATH: &[u8] = b"/tmp/process-ktest-locks";
+        const OTHER: &[u8] = b"/tmp/process-ktest-locks-other";
+        fn open(path: &[u8]) -> Result<FileRef, VfsError> {
+            let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_CREAT);
+            let opened = open_inode_guarded(crate::vfs::tables(), None, path, flags, 0o644, 0)?;
+            Ok(Arc::new(OpenFile::from_opened(opened)?))
+        }
+        // The `flock` and `pid`'s POSIX record-lock counts on `file`'s inode.
+        fn counts(file: &FileRef, pid: u32) -> (usize, usize) {
+            let mut got = (usize::MAX, usize::MAX);
+            let _ = file.inode.with_locks_mut(&mut |l| got = (l.flock_count(), l.posix_lock_count(pid)));
+            got
+        }
+        fn posix_lock(file: &FileRef, pid: u32) -> Result<(), VfsError> {
+            let spec = FlockSpec { l_type: general::F_WRLCK as i16, l_whence: 0, l_start: 0, l_len: 10, l_pid: 0 };
+            let ctx = LockContext { cur_offset: 0, file_size: 0, readable: true, writable: true };
+            let mut res = Err(VfsError::Io);
+            file.inode.with_locks_mut(&mut |l| res = l.setlk(pid, spec, ctx, false).map(drop))?;
+            res
+        }
+        fn flock_ex(file: &FileRef) -> Result<(), VfsError> {
+            let ex = FlockOp { kind: Some(FlockKind::Exclusive), nonblock: true };
+            let mut res = Err(VfsError::Io);
+            file.inode.with_locks_mut(&mut |l| res = l.flock(file.id, ex).map(drop))?;
+            res
+        }
+
+        let (pid, held) = in_test_process(|pid| -> Result<(u32, FileRef), &'static str> {
+            // A holds an exclusive `flock` and sits on fds 3 and 4 (a `dup`:
+            // one open file description, two slots).
+            let a = open(PATH).map_err(|_| "open A")?;
+            flock_ex(&a).map_err(|_| "flock A")?;
+            insert_current_fd(3, Arc::clone(&a)).map_err(|_| "install fd 3")?;
+            a.inc_fd_ref();
+            insert_current_fd(4, Arc::clone(&a)).map_err(|_| "install fd 4")?;
+            // B, another open of the same file, on fd 5 holds a POSIX lock;
+            // a file on another inode on fd 6.
+            let b = open(PATH).map_err(|_| "open B")?;
+            kassert_eq!(install_current_fd(Arc::clone(&b), false), Ok(5));
+            kassert_eq!(install_current_fd(open(OTHER).map_err(|_| "open other")?, false), Ok(6));
+            posix_lock(&b, pid).map_err(|_| "take the POSIX lock")?;
+            kassert_eq!(counts(&a, pid), (1, 1));
+
+            // Closing another inode's fd releases nothing here.
+            kassert_eq!(close_current_fd(6), Ok(()));
+            kassert_eq!(counts(&a, pid), (1, 1));
+            // Closing fd 3 (A's first slot) drops the POSIX lock B took (any
+            // close of the inode), not A's `flock` (fd 4 still holds A).
+            kassert_eq!(close_current_fd(3), Ok(()));
+            kassert_eq!(counts(&a, pid), (1, 0));
+            kassert_eq!(a.fd_ref_count(), 1);
+            // Its last slot closed, A's `flock` goes too.
+            posix_lock(&b, pid).map_err(|_| "take the POSIX lock again")?;
+            kassert_eq!(close_current_fd(4), Ok(()));
+            kassert_eq!(counts(&a, pid), (0, 0));
+            kassert_eq!(close_current_fd(4), Err(VfsError::BadF));
+
+            // B keeps a `flock` and a POSIX lock to the end: exit closes it.
+            flock_ex(&b).map_err(|_| "flock B")?;
+            posix_lock(&b, pid).map_err(|_| "take the POSIX lock at exit")?;
+            kassert_eq!(counts(&b, pid), (1, 1));
+            Ok((pid, b))
+        })??;
+        // The process's exit released both.
+        kassert_eq!(counts(&held, pid), (0, 0));
+        drop(held);
+        for path in [PATH, OTHER] {
+            kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false).is_ok());
+        }
+        Ok(())
+    }
+);

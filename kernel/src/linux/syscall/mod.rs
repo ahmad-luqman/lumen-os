@@ -8,7 +8,8 @@
 //! M7 (#254, #255) each change only their own module, not `dispatch`:
 //!
 //! - `fd`: descriptor I/O (`read`, `write`, `close`, `fstat`, `poll`,
-//!   `ioctl`, `readv`, `writev`; M7: `open`, `openat`, `lseek`).
+//!   `ioctl`, `readv`, `writev`; M7: `open`, `openat`, `lseek`), over the
+//!   process's FD table (#254).
 //! - `stat`: `stat`, `lstat`, `newfstatat`, `statx`, `access`, `faccessat`,
 //!   `faccessat2` (M7).
 //! - `ns`: namespace changes (`mkdir*`, `rmdir`, `unlink*`, `link*`,
@@ -24,8 +25,9 @@
 //!
 //! `at` holds what the M7 file syscalls share: their register decoders
 //! (`reg`, `FromReg`: `Fd`, `Dirfd`, `Mode`, the VFS's flag types,
-//! `UserPtr`, `u32`/`i32`/`u64`), `UserPath` (a path argument copied in)
-//! and `stat_from_metadata`/`statx_from_metadata`.
+//! `UserPtr`, `u32`/`i32`/`u64`), `UserPath` (a path argument copied in),
+//! `start_dir` (the directory a path starts from, a `Dirfd` resolved) and
+//! `stat_from_metadata`/`statx_from_metadata`.
 //!
 //! An M7 syscall not implemented yet has a stub that logs once per number
 //! (as an unknown one does, with its name) and returns `-ENOSYS`.
@@ -95,6 +97,13 @@ const _: () = {
 #[inline]
 const fn neg_errno(code: u32) -> u64 {
     -(code as i64) as u64
+}
+
+/// A handler's result as `rax`: the value, or its positive errno negated
+/// (once, here: ARCHITECTURE section 8's rule 3).
+#[inline]
+fn finish(result: Result<u64, u32>) -> u64 {
+    result.unwrap_or_else(neg_errno)
 }
 
 /// Copy a zero-padding POD ABI struct `T` to `user_dst`.
@@ -187,19 +196,19 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
     match u32::try_from(nr) {
         // M6.
         Ok(general::__NR_read) => {
-            frame.rax = fd::sys_read(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_read(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_write) => {
-            frame.rax = fd::sys_write(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_write(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_close) => {
-            frame.rax = fd::sys_close(frame.rdi);
+            frame.rax = fd::sys_close(reg(frame.rdi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fstat) => {
-            frame.rax = fd::sys_fstat(frame.rdi, frame.rsi);
+            frame.rax = fd::sys_fstat(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_poll) => {
@@ -231,15 +240,15 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_ioctl) => {
-            frame.rax = fd::sys_ioctl(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_ioctl(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_readv) => {
-            frame.rax = fd::sys_readv(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_readv(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_writev) => {
-            frame.rax = fd::sys_writev(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = fd::sys_writev(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_getpid) => {
@@ -261,7 +270,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_getcwd) => {
-            frame.rax = dir::sys_getcwd(frame.rdi, frame.rsi);
+            frame.rax = dir::sys_getcwd(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_getuid | general::__NR_getgid | general::__NR_geteuid | general::__NR_getegid) => {

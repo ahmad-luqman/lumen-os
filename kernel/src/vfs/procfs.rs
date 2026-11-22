@@ -623,7 +623,6 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
     use crate::sched;
 
     let space = Arc::new(AddressSpace::new().map_err(|e| format!("AddressSpace::new: {e}"))?);
-    let dev_null = super::resolve_path_from_root("/dev/null").map_err(|e| format!("/dev/null: {e:?}"))?;
     let result: Arc<SleepMutex<Option<Result<u32, String>>>> = Arc::new(SleepMutex::new(None));
     let res_clone = Arc::clone(&result);
 
@@ -637,8 +636,17 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
             let resolve = |path: &str, flags| resolve_path(tables, None, path.as_bytes(), flags).map(|r| r.inode);
             let fd3 = format!("/proc/{pid}/fd/3");
 
-            process::register_current_vfs_fd(3, dev_null, String::from("/dev/null"))
-                .map_err(|e| format!("register fd 3: {e:?}"))?;
+            let null_file = lumen_vfs::open_inode_guarded(
+                tables,
+                None,
+                b"/dev/null",
+                lumen_vfs::OpenFlags::from_bits(lumen_vfs::OpenFlags::O_RDWR),
+                0,
+                0,
+            )
+            .and_then(lumen_vfs::OpenFile::from_opened)
+            .map_err(|e| format!("open /dev/null: {e:?}"))?;
+            process::insert_current_fd(3, Arc::new(null_file)).map_err(|e| format!("install fd 3: {e:?}"))?;
             for (path, flags) in [
                 (format!("/proc/{pid}"), nofollow),
                 (format!("/proc/{pid}/fd"), nofollow),
@@ -706,7 +714,7 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
             }
 
             // fd 3 closes while the process lives: only `fd/3` goes.
-            process::unregister_current_vfs_fd(3);
+            process::close_current_fd(3).map_err(|e| format!("close fd 3: {e:?}"))?;
             for flags in [nofollow, follow] {
                 let res = resolve(&fd3, flags);
                 if !matches!(res, Err(VfsError::NoEnt)) {
@@ -822,5 +830,51 @@ crate::ktest!(
             kassert_eq!((st.ino, st.inode_type), (ino, itype));
         }
         Ok(())
+    }
+);
+
+crate::ktest!(
+    fn procfs_fd_listing_and_targets_follow_the_fd_table() {
+        // `/proc/<pid>/fd` lists the process's FD table (#254): the console
+        // fds a process starts with, a file installed, a slot closed; each
+        // link's target is the open file's path, its inode the file's.
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::{OpenFile, OpenFlags, open_inode_guarded, readlink_at, unlink_at};
+
+        const PATH: &[u8] = b"/tmp/procfs-ktest-fd";
+        let tables = super::tables();
+        process::in_test_process(move |pid| {
+            let listed = || -> Result<Vec<String>, &'static str> {
+                let dir = super::resolve_path_from_root(&format!("/proc/{pid}/fd")).map_err(|_| "resolve fd dir")?;
+                let mut entries = Vec::new();
+                dir.readdir(0, &mut entries, 64).map_err(|_| "readdir fd dir")?;
+                Ok(entries.into_iter().map(|e| e.name).filter(|n| n != "." && n != "..").collect())
+            };
+            let link = |fd: i32| readlink_at(tables, None, format!("/proc/{pid}/fd/{fd}").as_bytes());
+            kassert_eq!(listed()?, ["0", "1", "2"]);
+            kassert_eq!(process::process_open_fds(pid), [0, 1, 2]);
+            for fd in 0..3 {
+                kassert_eq!(link(fd), Ok(b"/dev/console".to_vec()));
+            }
+            let console = super::resolve_path_from_root("/dev/console").map_err(|_| "resolve /dev/console")?;
+            let fd0 = super::resolve_path_from_root(&format!("/proc/{pid}/fd/0")).map_err(|_| "resolve fd/0")?;
+            kassert!(Arc::ptr_eq(&fd0, &console));
+
+            let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_CREAT);
+            let file = open_inode_guarded(tables, None, PATH, flags, 0o644, 0)
+                .and_then(OpenFile::from_opened)
+                .map_err(|_| "open the file")?;
+            let inode = Arc::clone(&file.inode);
+            kassert_eq!(process::install_current_fd(Arc::new(file), false), Ok(3));
+            process::close_current_fd(1).map_err(|_| "close fd 1")?;
+            kassert_eq!(listed()?, ["0", "2", "3"]);
+            kassert_eq!(link(1), Err(VfsError::NoEnt));
+            kassert_eq!(link(3), Ok(PATH.to_vec()));
+            let fd3 = super::resolve_path_from_root(&format!("/proc/{pid}/fd/3")).map_err(|_| "resolve fd/3")?;
+            kassert!(Arc::ptr_eq(&fd3, &inode));
+            kassert!(unlink_at(tables, None, PATH, false).is_ok());
+            kassert_eq!(link(3), Ok(b"/tmp/procfs-ktest-fd (deleted)".to_vec()));
+            Ok(())
+        })?
     }
 );
