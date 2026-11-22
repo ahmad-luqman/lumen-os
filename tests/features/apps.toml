@@ -47,6 +47,7 @@ tests = [
     "scenario:test_apps::test_hello_wasm",
     "scenario:test_apps::test_busy_app_is_preempted",
     "scenario:test_apps::test_run_refuses_past_max_apps",
+    "harness:test_app_limits::*",
 ]
 
 [[feature]]
