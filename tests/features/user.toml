@@ -75,3 +75,16 @@ tests = [
     "scenario:test_linux_user::test_static_busybox_ash",
     "scenario:test_linux_user::test_syscall_bad_pointers_return_efault",
 ]
+
+[[feature]]
+name = "pread64/pwrite64 at a given offset without moving the fd's (across a page and over 4 KiB, a hole past EOF reading as zeros, O_APPEND appending whatever the offset, also across chunks, a fault mid-transfer returning what moved, a disk read error as -EIO, a full tmpfs as a short write then -ENOSPC; in Linux's errno order: -EINVAL negative offsets, -EBADF, -ESPIPE on terminals, -EBADF directions, -EFAULT outside user space, -EINVAL past i64::MAX, -EISDIR), fsync/fdatasync writing an ext4 file through the block cache to the device (-EIO when writes or the cache's sync fail, the data written by the next sync; 0 on an open unlinked file; -EINVAL on terminals, devices and procfs; -EBADF on O_PATH), sync flushing every mounted filesystem and returning 0 though one fails, a filesystem over-reporting a chunk taken as -EIO, and their dispatch registers (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::io::io_pread_pwrite_at_offsets_leave_the_offset_alone",
+    "ktest:lumen_kernel::linux::syscall::io::io_pwrite_appends_on_o_append_and_positional_errnos",
+    "ktest:lumen_kernel::linux::syscall::io::io_pread_pwrite_report_filesystem_errors",
+    "ktest:lumen_kernel::linux::syscall::io::io_fsync_writes_an_ext4_file_back_and_reports_eio",
+    "ktest:lumen_kernel::linux::syscall::io::io_fsync_refuses_terminals_devices_and_procfs",
+    "ktest:lumen_kernel::linux::syscall::io::io_sync_flushes_every_mounted_filesystem",
+    "ktest:lumen_kernel::linux::syscall::io::io_a_filesystem_reporting_more_than_its_chunk_is_eio",
+]

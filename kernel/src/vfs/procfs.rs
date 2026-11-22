@@ -565,8 +565,9 @@ impl VfsInode for ProcfsInode {
         Err(VfsError::RoFs)
     }
 
+    /// Nothing on procfs has an `fsync` (Linux's has none): `EINVAL`.
     fn sync(&self, _data_only: bool) -> Result<(), VfsError> {
-        Ok(())
+        Err(VfsError::Inval)
     }
 
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {
