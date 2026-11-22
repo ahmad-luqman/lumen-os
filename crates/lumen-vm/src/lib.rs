@@ -11,11 +11,14 @@
 //!   PTE teardown) and atomic `protect` (refusing unmapped holes, supporting
 //!   `PROT_NONE` guard pages, splitting partial VMAs, and coalescing adjacent
 //!   identical VMAs);
-//! - byte-granular [`Brk`] cursor tracking over page-aligned backing VMAs.
+//! - byte-granular [`Brk`] cursor tracking over page-aligned backing VMAs;
+//! - `/proc/<pid>/maps` lines for the VMAs ([`maps::write_maps`]).
 
 #![no_std]
 
 extern crate alloc;
+
+pub mod maps;
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -37,6 +40,10 @@ pub const INTERP_BASE: u64 = 0x0000_7f00_0000_0000;
 pub const MMAP_TOP: u64 = 0x0000_7f00_0000_0000;
 /// Initial top of the user stack.
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_f000_0000;
+/// Initial user stack VMA size (8 MiB, matching M6 `RLIMIT_STACK`).
+pub const USER_STACK_SIZE: u64 = 8 * 1024 * 1024;
+/// Inclusive bottom of the initial demand-paged user stack VMA.
+pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
 
 const _: () = {
     assert!(PAGE_SIZE.is_power_of_two());
@@ -48,6 +55,8 @@ const _: () = {
     assert!(USER_STACK_TOP.is_multiple_of(PAGE_SIZE));
     assert!(USER_MIN < PIE_BASE && PIE_BASE < MMAP_TOP);
     assert!(MMAP_TOP < USER_STACK_TOP && USER_STACK_TOP < USER_MAX);
+    assert!(USER_STACK_SIZE.is_multiple_of(PAGE_SIZE));
+    assert!(MMAP_TOP <= USER_STACK_BOTTOM && USER_STACK_BOTTOM < USER_STACK_TOP);
 };
 
 /// Is `addr` a multiple of [`PAGE_SIZE`]?

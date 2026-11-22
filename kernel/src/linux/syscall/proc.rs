@@ -12,8 +12,9 @@ use crate::user::{USER_MAX, copy_from_user, copy_to_user, user_range_valid};
 /// thousands of synchronous `virtio-rng` requests in one syscall.
 const MAX_GETRANDOM: usize = 4096;
 
-/// Default stack rlimit advertised by M6 `prlimit64` (8 MiB, matching `USER_STACK_SIZE`).
-const DEFAULT_RLIMIT_STACK: u64 = 8 * 1024 * 1024;
+/// Default stack rlimit advertised by M6 `prlimit64`: the initial user
+/// stack's size (8 MiB).
+const DEFAULT_RLIMIT_STACK: u64 = lumen_vm::USER_STACK_SIZE;
 
 /// Mask of unblockable signals (`SIGKILL` = 9, `SIGSTOP` = 19, 1-indexed).
 const UNBLOCKABLE_SIGS: u64 = (1u64 << (general::SIGKILL - 1)) | (1u64 << (general::SIGSTOP - 1));

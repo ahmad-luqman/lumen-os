@@ -354,7 +354,8 @@ one is its own PR that updates that doc first.
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
-  `AddressSpace::format_maps`).
+  `AddressSpace::format_maps`, its lines `lumen_vm::maps`'s; the node
+  kinds, inode numbers, fds and numeric names `lumen_vfs::procfs`'s).
   `linux/` (M6, M7; ARCHITECTURE section 8): `linux/mod.rs` the
   `linux-raw-sys` re-exports, `M6_SYSCALLS` and `M7_SYSCALLS` (the numbers,
   `syscall_name`; pinned by the `abi_constants_match_spec` and
@@ -470,6 +471,22 @@ one is its own PR that updates that doc first.
   lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
+- `crates/lumen-vm`: a process's user address space as logic: the user
+  layout (`USER_MIN`/`USER_MAX`, `PIE_BASE`, `MMAP_TOP`, the initial stack's
+  `USER_STACK_TOP`/`USER_STACK_SIZE`/`USER_STACK_BOTTOM`), `Prot`, `Vma`s
+  anonymous or file-backed (`Backing`, `FileMapping`), the `VmaMap` (sorted
+  by start in a `BTreeMap`: `map` with `MapPlace` hint/fixed/no-replace,
+  `unmap`, `protect`, coalescing), the `Brk` cursor, and `maps`
+  (`write_maps`: `/proc/<pid>/maps` lines, the heap split at the break's
+  edges, `[heap]`/`[stack]`) (host-tested).
+- `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
+  `FileSystem`/`VfsInode` traits, the path and symlink resolver, the mount
+  table and the Lock-9 inode and dentry caches, `OpenFile` and the `FdTable`
+  (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
+  `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks, and
+  `procfs` (`/proc`'s `ProcKind`s, their inode numbers and types, `ProcFd`:
+  an fd in `0..MAX_FDS`, `ProcFd::parse`, and `parse_canonical_u32`: one
+  name per number) (host-tested).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and

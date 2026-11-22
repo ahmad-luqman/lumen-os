@@ -455,9 +455,8 @@ crate::ktest!(
         kassert!(!is_maps_line("00400000-00401000 r-xp 00000000 00:00 0 "));
         space.teardown();
 
-        // 4. procfs: pids above 2^16 get distinct inode numbers; numeric names
-        // must be canonical.
-        kassert_ne_u64(procfs::pid_ino(1, 0), procfs::pid_ino(65537, 0))?;
+        // 4. procfs: numeric names must be canonical. (That pids above 2^16
+        // get distinct inode numbers is host-tested in `lumen_vfs::procfs`.)
         let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
         kassert!(matches!(resolve_path(&TABLES, None, b"/proc/+1", rf), Err(VfsError::NoEnt)));
         kassert!(matches!(resolve_path(&TABLES, None, b"/proc/01", rf), Err(VfsError::NoEnt)));

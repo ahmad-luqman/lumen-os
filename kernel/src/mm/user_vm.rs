@@ -7,25 +7,23 @@
 
 use alloc::string::String;
 use alloc::vec;
-use core::fmt::{self, Write as _};
+use core::fmt;
 
 use lumen_elf::loader::{ElfLoadError, LoadedElf, PageAction, Perm};
 use lumen_elf::stack::{AuxvInfo, InitialStack, StackBuildError, build_initial_stack};
 use lumen_mm::paging::{Attrs, MapError, WalkEnd};
 use lumen_mm::{FRAME_SIZE, PhysFrame, VirtAddr};
-use lumen_vm::{
-    Backing, Brk, MMAP_TOP, MapPlace, PAGE_SIZE, Prot, USER_MAX, USER_MIN, USER_STACK_TOP, VmError, VmaMap,
-};
+use lumen_vm::{Brk, MMAP_TOP, MapPlace, PAGE_SIZE, Prot, USER_MAX, USER_MIN, USER_STACK_TOP, VmError, VmaMap};
 
 use super::{frame, paging};
 use crate::arch;
 use crate::linux::{errno, general};
 use crate::sync::SleepMutex;
 
-/// Initial user stack VMA size (8 MiB, matching M6 `RLIMIT_STACK`).
-pub const USER_STACK_SIZE: u64 = 8 * 1024 * 1024;
-/// Inclusive bottom of the initial demand-paged user stack VMA.
-pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
+// The initial user stack's size and bottom live in `lumen_vm`, next to
+// `USER_STACK_TOP`: `[USER_STACK_BOTTOM, USER_STACK_TOP)` is the range that
+// the maps listing labels `[stack]`.
+use lumen_vm::{USER_STACK_BOTTOM, USER_STACK_SIZE};
 
 const _: () = {
     assert!(FRAME_SIZE == PAGE_SIZE);
@@ -549,85 +547,22 @@ impl AddressSpace {
     }
 
     /// Format `/proc/<pid>/maps` strictly under Lock 1 (`AddressSpace::inner`),
-    /// with no `ACTIVE_PROCS` or `VfsInode` locks held.
+    /// with no `ACTIVE_PROCS` or `VfsInode` locks held. The lines themselves
+    /// are `lumen_vm::maps::write_maps`'s.
     pub fn format_maps(&self) -> String {
         let mut out = String::new();
         let inner = self.inner.lock();
         if inner.torn_down {
             return out;
         }
-        let brk_init = inner.brk.initial();
-        let brk_mapped = inner.brk.mapped_end();
-        for vma in inner.vmas.iter() {
-            let r = if vma.prot.read() { 'r' } else { '-' };
-            let w = if vma.prot.write() { 'w' } else { '-' };
-            let x = if vma.prot.exec() { 'x' } else { '-' };
-            let (sp, offset, maj, min, ino, label): (char, u64, u32, u32, u64, Option<&str>) = match vma.backing {
-                Backing::Anonymous => {
-                    let is_stack = vma.start >= USER_STACK_BOTTOM && vma.end <= USER_STACK_TOP;
-                    if !is_stack && brk_mapped > brk_init && vma.start < brk_init && vma.end > brk_init {
-                        let _ = writeln!(
-                            out,
-                            "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}",
-                            vma.start, brk_init, r, w, x, 0u64, 0u32, 0u32, 0u64
-                        );
-                        let heap_end = vma.end.min(brk_mapped);
-                        let _ = writeln!(
-                            out,
-                            "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}  [heap]",
-                            brk_init, heap_end, r, w, x, 0u64, 0u32, 0u32, 0u64
-                        );
-                        if vma.end > heap_end {
-                            let _ = writeln!(
-                                out,
-                                "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}",
-                                heap_end, vma.end, r, w, x, 0u64, 0u32, 0u32, 0u64
-                            );
-                        }
-                        continue;
-                    }
-                    if !is_stack
-                        && brk_mapped > brk_init
-                        && vma.start >= brk_init
-                        && vma.start < brk_mapped
-                        && vma.end > brk_mapped
-                    {
-                        let _ = writeln!(
-                            out,
-                            "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}  [heap]",
-                            vma.start, brk_mapped, r, w, x, 0u64, 0u32, 0u32, 0u64
-                        );
-                        let _ = writeln!(
-                            out,
-                            "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {}",
-                            brk_mapped, vma.end, r, w, x, 0u64, 0u32, 0u32, 0u64
-                        );
-                        continue;
-                    }
-                    let lbl = if is_stack {
-                        Some("[stack]")
-                    } else if brk_mapped > brk_init && vma.start >= brk_init && vma.end <= brk_mapped {
-                        Some("[heap]")
-                    } else {
-                        None
-                    };
-                    ('p', 0, 0, 0, 0, lbl)
-                }
-                Backing::File(fm) => {
-                    let sp = if fm.shared { 's' } else { 'p' };
-                    (sp, fm.offset, 0, 0, 0, None)
-                }
-            };
-            let _ = write!(
-                out,
-                "{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}",
-                vma.start, vma.end, r, w, x, sp, offset, maj, min, ino
-            );
-            if let Some(lbl) = label {
-                let _ = write!(out, "  {lbl}");
-            }
-            out.push('\n');
-        }
+        let layout = lumen_vm::maps::MapsLayout {
+            brk_initial: inner.brk.initial(),
+            brk_mapped_end: inner.brk.mapped_end(),
+            stack_bottom: USER_STACK_BOTTOM,
+            stack_top: USER_STACK_TOP,
+        };
+        // Writing to a `String` cannot fail.
+        let _ = lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout);
         out
     }
 

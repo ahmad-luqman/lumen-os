@@ -16,7 +16,7 @@ use lumen_elf::loader::{
     EM_X86_64, ET_EXEC, EV_CURRENT, ElfLoadError, PF_R, PF_W, PF_X, PHDR_MIN_SIZE, PT_INTERP, PT_LOAD,
 };
 use lumen_mm::FRAME_SIZE;
-use lumen_vm::Prot;
+use lumen_vm::{Prot, USER_STACK_BOTTOM};
 
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::arch::{self, TrapFrame};
@@ -24,7 +24,7 @@ use crate::linux::process::{ConsoleIo, record_exit, register_current, take_curre
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, errno, general, ioctl, syscall as linux_syscall};
 #[cfg(feature = "ktest")]
 use crate::mm::paging;
-use crate::mm::user_vm::{AddressSpace, USER_STACK_BOTTOM, UserVmError};
+use crate::mm::user_vm::{AddressSpace, UserVmError};
 use crate::mm::{frame, heap};
 use crate::sched;
 use crate::shell::Ctx;

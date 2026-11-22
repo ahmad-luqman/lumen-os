@@ -26,124 +26,32 @@ use crate::time;
 
 use super::page_cache;
 
-const INO_ROOT: u64 = 1;
-const INO_CPUINFO: u64 = 2;
-const INO_MEMINFO: u64 = 3;
-const INO_MOUNTS: u64 = 4;
-const INO_VERSION: u64 = 5;
-const INO_SELF: u64 = 6;
+// The node kinds, their inode numbers and numeric names are host-tested in
+// `lumen_vfs::procfs`; what needs the live processes stays here.
+use log::warn;
+use lumen_vfs::procfs::{ProcFd, ProcKind, parse_canonical_u32};
 
-const TAG_PID_DIR: u64 = 0;
-const TAG_PID_EXE: u64 = 1;
-const TAG_PID_MAPS: u64 = 2;
-const TAG_PID_FD_DIR: u64 = 3;
-const TAG_PID_MOUNTS: u64 = 4;
-const TAG_PID_FD_BASE: u64 = 0x1000;
-
-/// The inode number of a per-process node: bit 48 marks it (the fixed nodes
-/// are 1..=6, and `DETACHED_INO_BIT` is far above), bits 16..48 hold the pid
-/// and bits 0..16 the tag (`TAG_PID_*`, or `TAG_PID_FD_BASE + fd`). So every
-/// pid is distinct, and an fd keeps its tag below 2^16 as long as
-/// `lumen_vfs::MAX_FDS <= 0x10000 - TAG_PID_FD_BASE`.
-// An fd's tag must stay below 2^16 (`register_current_vfs_fd` keeps fds in
-// `0..MAX_FDS`).
-const _: () = assert!(lumen_vfs::MAX_FDS as u64 <= 0x1_0000 - TAG_PID_FD_BASE);
-
-pub(crate) const fn pid_ino(pid: u32, tag: u64) -> u64 {
-    (1u64 << 48) | ((pid as u64) << 16) | tag
+/// A `readdir` entry for `kind`, named `name`.
+fn dir_entry(kind: ProcKind, name: impl Into<String>) -> (u64, InodeType, String) {
+    (kind.ino(), kind.inode_type(), name.into())
 }
 
-fn parse_canonical_u32(s: &str) -> Option<u32> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if s.len() > 1 && s.starts_with('0') {
-        return None;
-    }
-    s.parse().ok()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProcKind {
-    Root,
-    Cpuinfo,
-    Meminfo,
-    Mounts,
-    Version,
-    SelfLink,
-    PidDir(u32),
-    PidExe(u32),
-    PidMaps(u32),
-    PidFdDir(u32),
-    PidMounts(u32),
-    PidFdLink(u32, i32),
-}
-
-impl ProcKind {
-    const fn ino(self) -> u64 {
-        match self {
-            Self::Root => INO_ROOT,
-            Self::Cpuinfo => INO_CPUINFO,
-            Self::Meminfo => INO_MEMINFO,
-            Self::Mounts => INO_MOUNTS,
-            Self::Version => INO_VERSION,
-            Self::SelfLink => INO_SELF,
-            Self::PidDir(p) => pid_ino(p, TAG_PID_DIR),
-            Self::PidExe(p) => pid_ino(p, TAG_PID_EXE),
-            Self::PidMaps(p) => pid_ino(p, TAG_PID_MAPS),
-            Self::PidFdDir(p) => pid_ino(p, TAG_PID_FD_DIR),
-            Self::PidMounts(p) => pid_ino(p, TAG_PID_MOUNTS),
-            Self::PidFdLink(p, fd) => pid_ino(p, TAG_PID_FD_BASE + fd as u64),
-        }
-    }
-
-    const fn inode_type(self) -> InodeType {
-        match self {
-            Self::Root | Self::PidDir(_) | Self::PidFdDir(_) => InodeType::Dir,
-            Self::SelfLink | Self::PidExe(_) | Self::PidFdLink(_, _) => InodeType::Symlink,
-            Self::Cpuinfo | Self::Meminfo | Self::Mounts | Self::Version | Self::PidMaps(_) | Self::PidMounts(_) => {
-                InodeType::File
-            }
-        }
-    }
-
-    /// Whether the process (and, for an fd link, the fd) this node shows
-    /// still exists. The fixed nodes always do.
-    fn is_live(self) -> bool {
-        match self {
-            Self::PidDir(p) | Self::PidExe(p) | Self::PidMaps(p) | Self::PidFdDir(p) | Self::PidMounts(p) => {
-                process::has_pid(p)
-            }
-            Self::PidFdLink(p, fd) => process::process_fd_target(p, fd).is_some(),
-            Self::Root | Self::Cpuinfo | Self::Meminfo | Self::Mounts | Self::Version | Self::SelfLink => true,
-        }
-    }
-
-    /// Whether the VFS may keep this node in its dentry and inode caches.
-    /// A per-process node goes when its process or fd does, and pids only
-    /// grow, so caching them would keep stale names and gain an entry per
-    /// (pid, tag) for good (#263). `self` names a different process for
-    /// each caller, so it stays out too. Fixed per node: the VFS asks under
-    /// Lock 9.
-    const fn cacheable(self) -> bool {
-        match self {
-            Self::Root | Self::Cpuinfo | Self::Meminfo | Self::Mounts | Self::Version => true,
-            Self::SelfLink
-            | Self::PidDir(_)
-            | Self::PidExe(_)
-            | Self::PidMaps(_)
-            | Self::PidFdDir(_)
-            | Self::PidMounts(_)
-            | Self::PidFdLink(_, _) => false,
-        }
-    }
-
-    const fn mode(self) -> u16 {
-        match self.inode_type() {
-            InodeType::Dir => 0o555,
-            InodeType::Symlink => 0o777,
-            _ => 0o444,
-        }
+/// Whether the process (and, for an fd link, the fd) `kind` shows still
+/// exists. The fixed nodes always do.
+fn is_live(kind: ProcKind) -> bool {
+    match kind {
+        ProcKind::PidDir(p)
+        | ProcKind::PidExe(p)
+        | ProcKind::PidMaps(p)
+        | ProcKind::PidFdDir(p)
+        | ProcKind::PidMounts(p) => process::has_pid(p),
+        ProcKind::PidFdLink(p, fd) => process::process_fd_target(p, fd.get()).is_some(),
+        ProcKind::Root
+        | ProcKind::Cpuinfo
+        | ProcKind::Meminfo
+        | ProcKind::Mounts
+        | ProcKind::Version
+        | ProcKind::SelfLink => true,
     }
 }
 
@@ -412,7 +320,7 @@ impl VfsInode for ProcfsInode {
                 let path = process::process_exe_path(pid)?;
                 super::resolve_path_from_root(&path).ok()
             }
-            ProcKind::PidFdLink(pid, fd) => process::process_fd_target(pid, fd).and_then(|(inode, _)| inode),
+            ProcKind::PidFdLink(pid, fd) => process::process_fd_target(pid, fd.get()).and_then(|(inode, _)| inode),
             _ => None,
         }
     }
@@ -421,7 +329,7 @@ impl VfsInode for ProcfsInode {
         // The VFS never caches a per-process node (`cacheable`, #263), but
         // one already resolved can still be held (an open fd, a cwd): once
         // its process or fd is gone, `stat` says so.
-        if !self.kind.is_live() {
+        if !is_live(self.kind) {
             return Err(VfsError::NoEnt);
         }
         let itype = self.inode_type();
@@ -485,12 +393,8 @@ impl VfsInode for ProcfsInode {
                     "." => Ok(self.spawn(ProcKind::PidFdDir(pid)) as Arc<dyn VfsInode>),
                     ".." => Ok(self.spawn(ProcKind::PidDir(pid)) as Arc<dyn VfsInode>),
                     other => {
-                        let fd_u32 = parse_canonical_u32(other).ok_or(VfsError::NoEnt)?;
-                        let fd = i32::try_from(fd_u32).map_err(|_| VfsError::NoEnt)?;
-                        if fd >= lumen_vfs::MAX_FDS as i32 {
-                            return Err(VfsError::NoEnt);
-                        }
-                        if process::process_fd_target(pid, fd).is_none() {
+                        let fd = ProcFd::parse(other).ok_or(VfsError::NoEnt)?;
+                        if process::process_fd_target(pid, fd.get()).is_none() {
                             return Err(VfsError::NoEnt);
                         }
                         Ok(self.spawn(ProcKind::PidFdLink(pid, fd)) as Arc<dyn VfsInode>)
@@ -533,7 +437,7 @@ impl VfsInode for ProcfsInode {
             // the same answer `resolve_magic_link` gives.
             ProcKind::PidExe(pid) => process::process_exe_path(pid).map(String::into_bytes).ok_or(VfsError::NoEnt),
             ProcKind::PidFdLink(pid, fd) => {
-                let (_, path) = process::process_fd_target(pid, fd).ok_or(VfsError::NoEnt)?;
+                let (_, path) = process::process_fd_target(pid, fd.get()).ok_or(VfsError::NoEnt)?;
                 Ok(path.into_bytes())
             }
             _ => Err(VfsError::Inval),
@@ -560,36 +464,43 @@ impl VfsInode for ProcfsInode {
         let mut entries: Vec<(u64, InodeType, String)> = Vec::new();
         match self.kind {
             ProcKind::Root => {
-                entries.push((INO_ROOT, InodeType::Dir, String::from(".")));
-                entries.push((INO_ROOT, InodeType::Dir, String::from("..")));
-                entries.push((INO_CPUINFO, InodeType::File, String::from("cpuinfo")));
-                entries.push((INO_MEMINFO, InodeType::File, String::from("meminfo")));
-                entries.push((INO_MOUNTS, InodeType::File, String::from("mounts")));
-                entries.push((INO_SELF, InodeType::Symlink, String::from("self")));
-                entries.push((INO_VERSION, InodeType::File, String::from("version")));
+                entries.push(dir_entry(ProcKind::Root, "."));
+                entries.push(dir_entry(ProcKind::Root, ".."));
+                entries.push(dir_entry(ProcKind::Cpuinfo, "cpuinfo"));
+                entries.push(dir_entry(ProcKind::Meminfo, "meminfo"));
+                entries.push(dir_entry(ProcKind::Mounts, "mounts"));
+                entries.push(dir_entry(ProcKind::SelfLink, "self"));
+                entries.push(dir_entry(ProcKind::Version, "version"));
                 for pid in process::active_pids() {
-                    entries.push((pid_ino(pid, TAG_PID_DIR), InodeType::Dir, format!("{pid}")));
+                    entries.push(dir_entry(ProcKind::PidDir(pid), format!("{pid}")));
                 }
             }
             ProcKind::PidDir(pid) => {
                 if !Self::pid_exists(pid) {
                     return Err(VfsError::NoEnt);
                 }
-                entries.push((pid_ino(pid, TAG_PID_DIR), InodeType::Dir, String::from(".")));
-                entries.push((INO_ROOT, InodeType::Dir, String::from("..")));
-                entries.push((pid_ino(pid, TAG_PID_EXE), InodeType::Symlink, String::from("exe")));
-                entries.push((pid_ino(pid, TAG_PID_FD_DIR), InodeType::Dir, String::from("fd")));
-                entries.push((pid_ino(pid, TAG_PID_MAPS), InodeType::File, String::from("maps")));
-                entries.push((pid_ino(pid, TAG_PID_MOUNTS), InodeType::File, String::from("mounts")));
+                entries.push(dir_entry(ProcKind::PidDir(pid), "."));
+                entries.push(dir_entry(ProcKind::Root, ".."));
+                entries.push(dir_entry(ProcKind::PidExe(pid), "exe"));
+                entries.push(dir_entry(ProcKind::PidFdDir(pid), "fd"));
+                entries.push(dir_entry(ProcKind::PidMaps(pid), "maps"));
+                entries.push(dir_entry(ProcKind::PidMounts(pid), "mounts"));
             }
             ProcKind::PidFdDir(pid) => {
                 if !Self::pid_exists(pid) {
                     return Err(VfsError::NoEnt);
                 }
-                entries.push((pid_ino(pid, TAG_PID_FD_DIR), InodeType::Dir, String::from(".")));
-                entries.push((pid_ino(pid, TAG_PID_DIR), InodeType::Dir, String::from("..")));
+                entries.push(dir_entry(ProcKind::PidFdDir(pid), "."));
+                entries.push(dir_entry(ProcKind::PidDir(pid), ".."));
                 for fd in process::process_open_fds(pid) {
-                    entries.push((pid_ino(pid, TAG_PID_FD_BASE + fd as u64), InodeType::Symlink, format!("{fd}")));
+                    // The fd table keeps fds in `0..MAX_FDS`; one outside it
+                    // couldn't be looked up either, so it isn't listed.
+                    let Ok(proc_fd) = ProcFd::try_from(fd) else {
+                        debug_assert!(false, "pid {pid} holds fd {fd}, outside 0..MAX_FDS");
+                        warn!(target: "procfs", "pid {pid} holds fd {fd}, outside 0..MAX_FDS: not listed");
+                        continue;
+                    };
+                    entries.push(dir_entry(ProcKind::PidFdLink(pid, proc_fd), format!("{fd}")));
                 }
             }
             _ => return Err(VfsError::NotDir),
@@ -666,10 +577,11 @@ impl VfsInode for ProcfsInode {
 }
 
 /// Whether `ino` is one of the nodes [`ProcKind::cacheable`] keeps out of
-/// the VFS caches: `self` or a per-process node (bit 48, see [`pid_ino`]).
+/// the VFS caches: `self`, or a per-process node (every one numbered from
+/// `/proc/0`'s up, above all the fixed nodes).
 #[cfg(feature = "ktest")]
 fn uncacheable_ino(ino: Ino) -> bool {
-    ino == INO_SELF || ino & (1u64 << 48) != 0
+    ino == ProcKind::SelfLink.ino() || ino >= ProcKind::PidDir(0).ino()
 }
 
 /// Every `lookup` procfs answered (the ktest: one per uncached step).
@@ -767,7 +679,7 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
             let (dentry_gen, inode_gen) = tables.cache_gens();
             let created = tables.publish_created_inode(
                 DevId::PROCFS,
-                INO_ROOT,
+                ProcKind::Root.ino(),
                 &name,
                 Arc::clone(&pid_dir),
                 dentry_gen,
@@ -785,7 +697,7 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
                 return Err(format!("/proc/{pid} was unified with a cached inode"));
             }
 
-            if let Some(target) = tables.dentry_get(DevId::PROCFS, INO_ROOT, &name) {
+            if let Some(target) = tables.dentry_get(DevId::PROCFS, ProcKind::Root.ino(), &name) {
                 return Err(format!("/proc/{pid} is in the dentry cache: {target:?}"));
             }
             let (_, uncacheable) = cached_procfs_inodes();
@@ -842,15 +754,18 @@ crate::ktest!(
         run()?;
         // Every fixed node is still cached: the root (by the mount), and each
         // file by name and inode.
-        kassert!(tables.inode_get(DevId::PROCFS, INO_ROOT).is_some());
-        for (name, ino) in
-            [("cpuinfo", INO_CPUINFO), ("meminfo", INO_MEMINFO), ("mounts", INO_MOUNTS), ("version", INO_VERSION)]
-        {
+        kassert!(tables.inode_get(DevId::PROCFS, ProcKind::Root.ino()).is_some());
+        for (name, kind) in [
+            ("cpuinfo", ProcKind::Cpuinfo),
+            ("meminfo", ProcKind::Meminfo),
+            ("mounts", ProcKind::Mounts),
+            ("version", ProcKind::Version),
+        ] {
             let path = format!("/proc/{name}");
             let inode =
                 resolve_path(tables, None, path.as_bytes(), nofollow).map_err(|_| "resolve a fixed node")?.inode;
-            kassert!(tables.dentry_get(DevId::PROCFS, INO_ROOT, name).is_some_and(|t| t.ino == ino));
-            kassert!(tables.inode_get(DevId::PROCFS, ino).is_some_and(|i| Arc::ptr_eq(&i, &inode)));
+            kassert!(tables.dentry_get(DevId::PROCFS, ProcKind::Root.ino(), name).is_some_and(|t| t.ino == kind.ino()));
+            kassert!(tables.inode_get(DevId::PROCFS, kind.ino()).is_some_and(|i| Arc::ptr_eq(&i, &inode)));
         }
 
         let (inodes_before, _) = cached_procfs_inodes();
@@ -874,6 +789,38 @@ crate::ktest!(
         kassert_eq!(uncacheable, 0);
         kassert_eq!(inodes_after, inodes_before);
         kassert_eq!(tables.dentry_count(), dentries_before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn procfs_root_listing_keeps_its_inodes_and_agrees_with_lookup() {
+        // `readdir` builds its entries from `ProcKind` (#265): `/proc`'s fixed
+        // entries keep their numbers, types and order, and each agrees with
+        // what looking the name up and `stat`ing it says.
+        use crate::kassert_eq;
+        let fs = Procfs::new(DevId::makedev(0, 140));
+        let root = fs.root_inode();
+        let mut entries = Vec::new();
+        root.readdir(0, &mut entries, 64).map_err(|_| "readdir /proc")?;
+        let fixed: Vec<(u64, InodeType, &str)> =
+            entries.iter().take(7).map(|e| (e.ino, e.inode_type, e.name.as_str())).collect();
+        kassert_eq!(
+            fixed,
+            [
+                (1, InodeType::Dir, "."),
+                (1, InodeType::Dir, ".."),
+                (2, InodeType::File, "cpuinfo"),
+                (3, InodeType::File, "meminfo"),
+                (4, InodeType::File, "mounts"),
+                (6, InodeType::Symlink, "self"),
+                (5, InodeType::File, "version"),
+            ]
+        );
+        for (ino, itype, name) in fixed {
+            let st = root.lookup(name).and_then(|n| n.stat()).map_err(|_| "lookup and stat a fixed entry")?;
+            kassert_eq!((st.ino, st.inode_type), (ino, itype));
+        }
         Ok(())
     }
 );
