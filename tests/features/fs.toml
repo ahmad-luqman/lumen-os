@@ -96,7 +96,7 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4 rootfs fsck-clean after Linux programs' file syscalls (#254): symlinks, hard links, unlink and rmdir while open, renames over open files, RENAME_EXCHANGE of a file and a directory, metadata changes and record locks from ring 3, then sync"
+name = "ext4 rootfs fsck-clean after Linux programs' file syscalls (#254): with nothing left once the programs remove what they made (unlink and rmdir while open, renames over open files, record locks), and with a tree they leave (a hard link, a short and a long symlink, a file's mode, owner and times, a file and a directory exchanged, a directory moved to another parent with its ..), the kernel's view agreeing after sync"
 milestone = "M7"
 tests = [
     "scenario:test_fs::test_posix_vfs_semantics",

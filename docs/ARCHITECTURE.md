@@ -5281,6 +5281,11 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
      `ftruncate`/`mmap` continue to work until `open_count` reaches 0, and
      detached directories return `-ENOENT` on `lookup`/`create`/`mkdir`/`link`/
      `symlink` and empty EOF on `getdents64` (while `getcwd` returns `-ENOENT`).
+   - `fstat(fd)`'s `st_ino` changes when the inode is detached, on ext4 and
+     tmpfs alike: both give it a synthetic number with bit 63 set
+     (`lumen_vfs::next_detached_ino`, ext4's reasons in step 2 of its list
+     below), never a number a new inode could take. Linux keeps the number;
+     a check from user space accepts either (`m7_vfs`'s `detached_ino`, #254).
    - **An open racing the unlink (#262):** an open raises `open_count` (an
      `OpenGuard`) *before* its last check that the inode is live, and Gate 6
      reads `open_count` and then frees or detaches the inode within one hold
@@ -5748,8 +5753,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `vfstest <op> ...`: test-facing file operations over the VFS (`stat`,
     `cat`/`read`, `ls`, `write`, `write-pattern`/`verify-pattern`,
     `truncate`, `chmod`, `mkdir`, `rmdir`, `unlink`, `rename`, `symlink`,
-    `readlink`, `dev-tmp-proc`) that
-    the scenarios drive until the Linux syscalls are wired (#254).
+    `readlink`, `dev-tmp-proc`) from the kernel shell, which the scenarios
+    use to set up and inspect files around ring-3 programs.
   - `linux /path/to/bin [args...]` (built in #255): when `args[0]` begins
     with `/`, loads the static or dynamic (`PT_INTERP`) ELF from VFS
     (following symlinks; a regular file with an execute bit, else `EACCES`),
@@ -7411,11 +7416,12 @@ test server:
   `tools/linux-hello/hello.rs`. `m7_vfs` (#254) is the POSIX VFS exit
   scenarios' program (`tests/scenarios/test_fs.py`): it calls the kernel by
   syscall number (inline `syscall`, raw `-errno`), so each check is about the
-  syscall it names, not a libc wrapper's choice; musl only starts and ends
-  it. Its modes: `posix` and `locks` (one `ok <check>` line per check, the
-  first failure named, exiting with its number), and `lock-hold` (record
-  locks taken a step per byte read from its terminal) with `lock-probe`
-  (`F_GETLK`/`F_SETLK` from a second process meanwhile).
+  syscall it names, not a libc wrapper's choice; musl only starts it and
+  ends it (`exit` once `main` returns). Its modes: `posix` and `locks` (one `ok <check>` line per check, the
+  first failure named, exiting with its number), `keep` (a small tree left
+  on the disk for fsck), and `lock-hold` (record locks taken a step per
+  read of its terminal, one key) with `lock-probe` (`F_GETLK`/`F_SETLK`
+  from a second process meanwhile).
 - **Rootless deterministic `ext4` assembly (`tools/mkrootfs.sh`, `make rootfs`):**
   assembles `build/deps/alpine-minirootfs/` + `build/linux/*` into
   **`build/alpine-rootfs.ext4`** (kept outside `build/deps/` so `actions/cache`
