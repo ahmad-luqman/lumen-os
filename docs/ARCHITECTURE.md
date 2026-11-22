@@ -5736,7 +5736,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     component, `final_component()`, is a `Final`: `Root` (a path of only
     slashes), `Dot`, `DotDot` or `Name(&[u8])` (borrowed from the path;
     never empty, `.` or `..`). A name's bytes come only out of a match on
-    it, with no wildcard arm, so each namespace operation (`open` with
+    it, with no wildcard arm (`ops.rs` denies
+    `clippy::wildcard_enum_match_arm`), so each namespace operation (`open` with
     `O_CREAT`, `mkdir`, `unlink`/`rmdir`, `link`, `symlink`, `rename`)
     states its own errno for the other three (below; `-EEXIST` for
     `mkdir`, `link` and `symlink`, and for `O_CREAT | O_EXCL`), ahead of

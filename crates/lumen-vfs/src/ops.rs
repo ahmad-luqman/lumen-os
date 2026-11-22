@@ -2,6 +2,11 @@
 //! `link`, `symlink`, `readlink`, `renameat2`) coordinating `resolve_path`,
 //! Lock-9 cache invalidation, Lock-3 `rename_lock`, and Gate 6 detach rules.
 
+// Every match on a `resolve::Final` here names each case, so an operation
+// that leaves one out doesn't compile, and `make lint` refuses a `_` arm
+// that would answer them all alike (#309).
+#![deny(clippy::wildcard_enum_match_arm)]
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 

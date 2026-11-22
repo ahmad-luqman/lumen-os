@@ -65,9 +65,10 @@ pub struct ParentTarget<'a> {
 /// rename; for the other three each namespace operation has its own errno
 /// (`mkdirat`'s `-EEXIST`; `rmdir`'s `-EBUSY`, `-EINVAL` and `-ENOTEMPTY`;
 /// ...). A name's bytes come only out of a match, so an operation that
-/// leaves a case out doesn't compile (stable rustdoc doesn't check the
-/// error code, so the passing twin after it, one arm apart, keeps the rest
-/// honest):
+/// leaves a case out doesn't compile, unless it answers them with a `_`
+/// arm, which `ops.rs` refuses (`clippy::wildcard_enum_match_arm`, denied
+/// there). Stable rustdoc doesn't check a `compile_fail` example's error
+/// code, so each passing twin below, a line apart, keeps the rest honest:
 ///
 /// ```compile_fail
 /// use lumen_vfs::resolve::{Final, ParentTarget};
@@ -91,11 +92,18 @@ pub struct ParentTarget<'a> {
 /// }
 /// ```
 ///
-/// Nor is there a field to take the bytes from instead:
+/// Nor is there a field to take the bytes from instead (this would
+/// compile were the name a public `Vec<u8>` or `&[u8]`):
 ///
 /// ```compile_fail
-/// fn name<'a>(target: &lumen_vfs::resolve::ParentTarget<'a>) -> &'a [u8] {
-///     &target.name
+/// fn is_empty(target: &lumen_vfs::resolve::ParentTarget<'_>) -> bool {
+///     target.name.is_empty()
+/// }
+/// ```
+///
+/// ```
+/// fn trailing_slash(target: &lumen_vfs::resolve::ParentTarget<'_>) -> bool {
+///     target.has_trailing_slash
 /// }
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
