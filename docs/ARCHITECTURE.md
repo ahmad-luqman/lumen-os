@@ -869,7 +869,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       `WritableMap`s and `pinned_pages` entries)
       alongside dropping `PageCache` entries
       `>= new_size.div_ceil(4096)`. `invalidate_file_from` works only on
-      the address space loaded on the calling CPU (asserted: the flush is a
+      the address space loaded on the calling CPU (debug-asserted: the flush is a
       local `invlpg`) until M8's shootdowns. Subsequent accesses fault into `BusError` /
       `SIGBUS`, and later file growth can never split-brain against stale
       mapped frames. (In M8, multi-process mappings snapshot active

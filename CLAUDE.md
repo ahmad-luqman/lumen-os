@@ -230,7 +230,14 @@ one is its own PR that updates that doc first.
   holds their registry (backtraces, overflow reports).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
-  PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
+  PAT.
+  `mm/user_vm.rs`: per-process address spaces (`AddressSpace`: VMAs,
+  ELF loading, anonymous and file-backed `mmap` (`mmap_file`, `Sharing`,
+  #255), `munmap`/`mprotect`/`brk`, the page-fault paths (zero-fill, the
+  page cache's pages, copy-on-write, dirty promotion, `FaultResult::BusError`),
+  `invalidate_file_from`, teardown; `pinned_pages`, `writable_maps` and
+  `mapped_files`; `release_order`, the ktests' unmap-order recorder).
+  `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`), and X-ray's rings (#198: one per CPU; typed recorders for run-queue
   changes, handled device interrupts and `SpinLock`s that waited; `read`: either ring
   of an online CPU, events since a sequence number with the gap counted; `cpus`). `acpi.rs`: ACPI
@@ -344,12 +351,6 @@ one is its own PR that updates that doc first.
   `vfs/tests.rs` the ktests of `mod.rs`'s code (`lumen_kernel::vfs::tests::`;
   `vfs/ext4.rs` and `vfs/page_cache.rs` keep their own; `MemBlkDev`, the
   in-memory block device those files' ktests use too, stays in `mod.rs`);
-  `mm/user_vm.rs`: per-process address spaces (`AddressSpace`: VMAs,
-  ELF loading, anonymous and file-backed `mmap` (`mmap_file`, `Sharing`,
-  #255), `munmap`/`mprotect`/`brk`, the page-fault paths (zero-fill, the
-  page cache's pages, copy-on-write, dirty promotion, `FaultResult::BusError`),
-  `invalidate_file_from`, teardown; `pinned_pages`, `writable_maps` and
-  `mapped_files`; `release_order`, the ktests' unmap-order recorder);
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
   64 MiB hard cap, `QuotaCounter`, the detached-inode quota; `mmap_page`,

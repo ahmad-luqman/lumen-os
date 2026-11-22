@@ -2438,11 +2438,12 @@ crate::ktest!(
         let base = base.map_err(|_| "map")?;
         kassert_eq!(space.handle_page_fault(base, USER_STORE), FaultResult::Resolved);
         kassert_eq!(space.handle_page_fault(base + P, USER_STORE), FaultResult::Resolved);
+        // A kernel copy's fault, with no streak yet: debug only.
+        kassert_eq!(space.handle_page_fault(base + 2 * P, KERNEL_STORE), FaultResult::BusError);
+        kassert_eq!(count(), before);
         kassert_eq!(space.handle_page_fault(base + 2 * P, USER_STORE), FaultResult::BusError);
         kassert_eq!(space.handle_page_fault(base + 3 * P, USER_STORE), FaultResult::BusError);
         kassert_eq!(count(), before + 1); // one streak, one warning
-        kassert_eq!(space.handle_page_fault(base + 2 * P, KERNEL_STORE), FaultResult::BusError);
-        kassert_eq!(count(), before + 1); // a kernel copy's fault: debug only
         kassert!(file_vm_leaf(&space, base + 2 * P).is_none());
         // A second mapping of page 0 faults in fine: the streak is over.
         let again = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(&f), 0, SHARED_RW);
