@@ -243,7 +243,10 @@ one is its own PR that updates that doc first.
   #255), `munmap`/`mprotect`/`brk`, the page-fault paths (zero-fill, the
   page cache's pages, copy-on-write, dirty promotion, `FaultResult::BusError`),
   `invalidate_file_from`, teardown; `pinned_pages`, `writable_maps` and
-  `mapped_files` (`MappedFile`: a mapping's open reference and path);
+  `mapped_files` (`KeptFile`: a mapping's open reference and path; the
+  `MappedFile` that `mmap_file` takes also carries its description's
+  shared-write right, `O_RDWR` or not, which only `mmap_file` reads, into
+  the VMA's `may_write`);
   `map_place` and `map_anon_at`; `msync_files`, what `msync` writes back,
   found under the lock; the images' maps names, `ImageFile`s recorded by
   `commit_loaded_elf` and trimmed by unmaps; `format_maps`;
