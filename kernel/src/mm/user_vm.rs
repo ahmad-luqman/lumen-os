@@ -251,8 +251,12 @@ pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
 /// A file an address space maps: the open reference that keeps it (and
 /// the mapping) valid after its descriptor is closed and its name
 /// unlinked, and the path it was opened by, which `/proc/<pid>/maps`
-/// shows (Linux's `d_path` of the mapping's file: a later rename isn't
-/// seen; an unlink is, as ` (deleted)`).
+/// shows. Where Linux prints the file's `d_path` (canonical, following
+/// renames), this is the descriptor's path as `/proc/<pid>/fd` shows it
+/// (a relative open's joined to its directory's, not normalised; a later
+/// rename isn't seen; an unlink is, as ` (deleted)`), and the first
+/// mapping's for every later mapping of the same file while any maps it
+/// (`mapped_files` keeps one per file).
 #[derive(Clone)]
 pub struct MappedFile {
     pub guard: OpenGuard,
@@ -260,7 +264,10 @@ pub struct MappedFile {
 }
 
 /// A file as `/proc/<pid>/maps` names an ELF image's lines: its device,
-/// inode number and path when it was loaded.
+/// inode number and path when it was loaded. A snapshot, holding no
+/// reference: unlike a file mapping's, an image's lines don't show
+/// ` (deleted)` once the file is unlinked, and keep the inode number it
+/// had (Linux maps the segments from the file, so it shows both).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageFile {
     pub dev: DevId,

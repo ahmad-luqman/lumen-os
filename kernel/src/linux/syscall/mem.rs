@@ -5,8 +5,9 @@
 //! `do_mmap` do, in their order: the offset page-aligned (`EINVAL`), the
 //! descriptor open and not `O_PATH` (`EBADF`), no `MAP_HUGETLB` (`EINVAL`:
 //! no file is on hugetlbfs), a non-zero length (`EINVAL`) whose page
-//! rounding fits (`ENOMEM`) and whose end in the file does too
-//! (`EOVERFLOW`), then the type in `flags & MAP_TYPE`:
+//! rounding fits (`ENOMEM`) and whose end in the file is at most
+//! `i64::MAX`, the largest `loff_t` (`EOVERFLOW`, Linux's `file_mmap_ok`
+//! for a regular file), then the type in `flags & MAP_TYPE`:
 //! - `MAP_SHARED`: flags Linux doesn't know are ignored;
 //!   `MAP_SHARED_VALIDATE` refuses them (`EOPNOTSUPP`), and `MAP_SYNC`
 //!   with them (no file here is on DAX). Either way `PROT_WRITE` needs the
@@ -27,6 +28,10 @@
 //! (`MAP_FIXED`, `MAP_FIXED_NOREPLACE`, a hint) is the anonymous path's
 //! (`user_vm::map_place`). The mapping holds its own open reference on the
 //! file, so it outlives the descriptor's `close` and the name's `unlink`.
+//!
+//! Not as Linux: a shared `/dev/zero` mapping made through a read-only
+//! descriptor can later be made writable with `mprotect` (Linux refuses,
+//! `EACCES`): anonymous VMAs carry no `may_write`.
 
 use alloc::sync::Arc;
 
@@ -102,7 +107,7 @@ fn mmap_fd(addr: u64, len: u64, prot: lumen_vm::Prot, flags: u64, fd: Fd, off: u
         return Err(errno::EINVAL);
     }
     let aligned_len = lumen_vm::align_up_page(len).ok_or(errno::ENOMEM)?;
-    if off.checked_add(aligned_len).is_none() {
+    if off.checked_add(aligned_len).is_none_or(|end| end > i64::MAX as u64) {
         return Err(errno::EOVERFLOW);
     }
     let mode = file.access_mode();
@@ -174,6 +179,8 @@ pub(super) fn sys_brk(addr: u64) -> u64 {
 /// - `EINVAL` for a flag other than `MS_ASYNC`, `MS_INVALIDATE` and
 ///   `MS_SYNC`, `addr` not page-aligned, or `MS_ASYNC` with `MS_SYNC`;
 ///   `ENOMEM` if `addr + length` rounded up to a page overflows; 0 for an
+///   empty range, or a `length` within a page of 2^64 (Linux's rounding
+///   wraps it to 0);
 ///   empty range (no mapping needed).
 /// - `MS_SYNC` writes back every file a `MAP_SHARED` VMA in the range maps
 ///   and waits (`VfsInode::sync` with `data_only`, Linux's
@@ -204,7 +211,9 @@ fn msync(addr: u64, length: u64, flags: i32) -> Result<(), u32> {
     if flags & !known != 0 || !addr.is_multiple_of(PAGE_SIZE) || flags & both == both {
         return Err(errno::EINVAL);
     }
-    let end = lumen_vm::align_up_page(length).and_then(|len| addr.checked_add(len)).ok_or(errno::ENOMEM)?;
+    // Linux's `(len + ~PAGE_MASK) & PAGE_MASK`, wrapping.
+    let len = length.wrapping_add(PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let end = addr.checked_add(len).ok_or(errno::ENOMEM)?;
     if end == addr {
         return Ok(());
     }
@@ -467,9 +476,11 @@ crate::ktest!(
             kassert_eq!(sys_mmap(0, p, read, 0, raw(ro), 0), e(errno::EINVAL));
             kassert_eq!(sys_mmap(0, p, read, 0xf, raw(ro), 0), e(errno::EINVAL));
             // ENOMEM: a length whose page rounding overflows; EOVERFLOW: an
-            // end in the file past 2^64.
+            // end in the file past i64::MAX (and past 2^64).
             kassert_eq!(sys_mmap(0, u64::MAX, read, PRIVATE, raw(ro), 0), e(errno::ENOMEM));
             kassert_eq!(sys_mmap(0, 2 * p, read, PRIVATE, raw(ro), !0xfff_u64), e(errno::EOVERFLOW));
+            kassert_eq!(sys_mmap(0, p, read, PRIVATE, raw(ro), 1 << 63), e(errno::EOVERFLOW));
+            kassert_eq!(sys_mmap(0, 2 * p, read, PRIVATE, raw(ro), (1 << 63) - p), e(errno::EOVERFLOW));
             // MAP_SHARED_VALIDATE refuses flags it doesn't know, and
             // MAP_SYNC; MAP_SHARED ignores them.
             let validate = general::MAP_SHARED_VALIDATE as u64;
@@ -499,6 +510,8 @@ crate::ktest!(
             // ENODEV: a directory, the console (fd 0), /dev/null.
             let dir = ktest_open(b"/tmp", OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_mmap(0, p, read, PRIVATE, raw(dir), 0), e(errno::ENODEV));
+            // ... after the access checks, as Linux's order has them.
+            kassert_eq!(sys_mmap(0, p, RW, SHARED, raw(dir), 0), e(errno::EACCES));
             kassert_eq!(sys_mmap(0, p, read, PRIVATE, 0, 0), e(errno::ENODEV));
             let null = ktest_open(b"/dev/null", OpenFlags::O_RDWR)?;
             kassert_eq!(sys_mmap(0, p, read, SHARED, raw(null), 0), e(errno::ENODEV));
@@ -571,6 +584,7 @@ crate::ktest!(
             // An empty range is 0, mapped or not; an anonymous one is 0,
             // its length rounded up to a page.
             kassert_eq!(sys_msync(unmapped, 0, sync), 0);
+            kassert_eq!(sys_msync(unmapped, u64::MAX, sync), 0); // rounds to 0, as Linux's
             kassert_eq!(sys_msync(at, len - 100, sync), 0);
             kassert_eq!(sys_msync(at, len, general::MS_ASYNC as i32), 0);
             kassert_eq!(sys_msync(at, len, 0), 0);
@@ -614,17 +628,20 @@ crate::ktest!(
             .map_err(|_| "Exec::from_path")
             .and_then(|e| e.load(&[b"/x"], &[], b"/x", [0; 16]).map_err(|_| "load"));
         let ino = exe.ino();
+        let listed = loaded.map(|(space, _)| {
+            let maps = space.format_maps();
+            // Anonymous memory mapped over the text (`MAP_FIXED`) isn't named
+            // after the file; the data page beside it still is.
+            let anon = u64::from(general::MAP_ANONYMOUS | general::MAP_PRIVATE | general::MAP_FIXED);
+            let replaced = space.mmap_anon(0x40_1000, PAGE_SIZE, lumen_vm::Prot::READ, anon);
+            let after = space.format_maps();
+            space.teardown();
+            (maps, replaced, after)
+        });
         let unlinked = tmp.unlink("mem-ktest-exe");
         kassert_eq!(written, Ok(image.len()));
         kassert!(unlinked.is_ok());
-        let (space, _) = loaded?;
-        let maps = space.format_maps();
-        // Anonymous memory mapped over the text (`MAP_FIXED`) isn't named
-        // after the file; the data page beside it still is.
-        let anon = u64::from(general::MAP_ANONYMOUS | general::MAP_PRIVATE | general::MAP_FIXED);
-        let replaced = space.mmap_anon(0x40_1000, PAGE_SIZE, lumen_vm::Prot::READ, anon);
-        let after = space.format_maps();
-        space.teardown();
+        let (maps, replaced, after) = listed?;
         let named = |fields: alloc::string::String| alloc::format!("{:<72} /tmp/mem-ktest-exe\n", fields + " ");
         let text = named(alloc::format!("00401000-00402000 r-xp 00001000 00:02 {ino}"));
         let data = named(alloc::format!("00402000-00403000 rw-p 00002000 00:02 {ino}"));
