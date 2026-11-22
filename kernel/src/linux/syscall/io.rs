@@ -182,7 +182,9 @@ pub(super) fn sys_sync() -> u64 {
 #[cfg(feature = "ktest")]
 use super::at::{self, Mode};
 #[cfg(feature = "ktest")]
-use super::fd::{ktest_fd, ktest_flags, ktest_user_path, sys_close, sys_lseek, sys_open, sys_write};
+use super::fd::{
+    ktest_fd, ktest_flags, ktest_install, ktest_open, ktest_user_path, sys_close, sys_lseek, sys_open, sys_write,
+};
 #[cfg(feature = "ktest")]
 use super::neg_errno;
 #[cfg(feature = "ktest")]
@@ -204,19 +206,10 @@ fn ktest_pattern(len: usize, seed: u8) -> alloc::vec::Vec<u8> {
     (0..len).map(|i| ((i * 7 + usize::from(seed)) % 251) as u8 | 1).collect()
 }
 
-/// Open `inode` (on a volume no path reaches) on a new descriptor of the
-/// current process, with access `flags` (ktests).
+/// The path a ktest's descriptor on a volume no path reaches shows
+/// ([`ktest_install`]).
 #[cfg(feature = "ktest")]
-fn ktest_install(inode: &alloc::sync::Arc<dyn VfsInode>, flags: u32) -> Result<Fd, &'static str> {
-    let file = process::KernelFile::new_unchecked_flags(
-        alloc::sync::Arc::clone(inode),
-        alloc::sync::Arc::from(*b"/io-ktest-volume/file"),
-        ktest_flags(flags),
-    )
-    .map_err(|_| "open the volume's file")?;
-    let raw = process::install_current_fd(file, false).map_err(|_| "install the fd")?;
-    Ok(at::reg(u64::from(raw as u32)))
-}
+const KTEST_VOLUME_FILE: &[u8] = b"/io-ktest-volume/file";
 
 /// The file `name` at the root of a read-only mount of `vol`'s device bytes
 /// (`Ext4Volume::mount_device_copy_ro` on device `0:minor`): `None` if the
@@ -476,7 +469,7 @@ crate::ktest!(
             // Read through a fresh read-only mount, so the pages come from
             // the disk: page 1 (offset 4096) with every disk read failing.
             let ro = vol.remount_ro(194)?.lookup(b"f").map_err(|_| "lookup on the read-only mount")?;
-            let fd = ktest_install(&ro, OpenFlags::O_RDONLY)?;
+            let fd = ktest_install(&ro, KTEST_VOLUME_FILE, OpenFlags::O_RDONLY)?;
             vol.fail_reads(true);
             let failed = sys_pread64(fd, at::reg(base), 4, 4096);
             vol.fail_reads(false);
@@ -488,7 +481,7 @@ crate::ktest!(
             // whole chunks), then nothing fits.
             let tmpfs = TmpfsVolume::new(195, 2 * 4096);
             let small = tmpfs.root.create(b"f", 0o644).map_err(|_| "tmpfs create")?;
-            let fd = ktest_install(&small, OpenFlags::O_RDWR)?;
+            let fd = ktest_install(&small, KTEST_VOLUME_FILE, OpenFlags::O_RDWR)?;
             let big = ktest_pattern(12_000, 2);
             copy_to_user(base, &big).map_err(|_| "copy the pattern")?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 12_000, 0), 8192);
@@ -517,7 +510,7 @@ crate::ktest!(
             let base = process::KTEST_USER_VA;
             let vol = Ext4Volume::new(186)?;
             let inode = vol.root.create(b"f", 0o644).map_err(|_| "ext4 create")?;
-            let fd = ktest_install(&inode, OpenFlags::O_RDWR)?;
+            let fd = ktest_install(&inode, KTEST_VOLUME_FILE, OpenFlags::O_RDWR)?;
             let on_device = |minor: u32| ktest_on_device(&vol, minor, "f");
             let pattern = ktest_pattern(LEN, 9);
             copy_to_user(base, &pattern).map_err(|_| "copy the pattern")?;
@@ -555,7 +548,7 @@ crate::ktest!(
             // Open, written, then unlinked: detached, so `fsync` has nothing
             // to write and is 0 (ARCHITECTURE section 8, `fsync`).
             let gone = vol.root.create(b"g", 0o644).map_err(|_| "ext4 create g")?;
-            let fd = ktest_install(&gone, OpenFlags::O_RDWR)?;
+            let fd = ktest_install(&gone, KTEST_VOLUME_FILE, OpenFlags::O_RDWR)?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 100, 0), 100);
             vol.root.unlink(b"g").map_err(|_| "unlink g")?;
             kassert_eq!(sys_fsync(fd), 0);
@@ -622,12 +615,12 @@ crate::ktest!(
             let good = Ext4Volume::new(196)?;
             ktest_with_mounted(&bad, "/tmp/io-sync-bad", || {
                 ktest_with_mounted(&good, "/tmp/io-sync-good", || {
-                    let creat = ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT);
+                    let creat = OpenFlags::O_RDWR | OpenFlags::O_CREAT;
                     let pattern = ktest_pattern(5000, 4);
                     copy_to_user(base, &pattern).map_err(|_| "copy the pattern")?;
                     let mut fds = alloc::vec::Vec::new();
                     for path in [&b"/tmp/io-sync-bad/f"[..], b"/tmp/io-sync-good/f"] {
-                        let fd = ktest_fd(sys_open(ktest_user_path(0, path)?, creat, at::reg(0o644)))?;
+                        let fd = ktest_open(0, path, creat, 0o644)?;
                         kassert_eq!(sys_pwrite64(fd, at::reg(base), 5000, 0), 5000);
                         fds.push(fd);
                     }

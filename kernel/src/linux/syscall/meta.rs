@@ -267,11 +267,11 @@ mod tests {
     use lumen_vm::{MapPlace, Prot};
 
     use super::super::at::{self, Dirfd, Fd, UserPtr};
-    use super::super::fd::{ktest_fd, ktest_user_path, sys_close, sys_open, sys_openat};
+    use super::super::fd::{ktest_fd, ktest_install, ktest_user_path, sys_close, sys_open, sys_openat};
     use super::super::neg_errno;
     use super::*;
     use crate::linux::general;
-    use crate::linux::process::{self, KernelFile};
+    use crate::linux::process;
     use crate::mm::user_vm::{FaultResult, Sharing};
     use crate::user::copy_to_user;
     use crate::{kassert, kassert_eq};
@@ -721,17 +721,16 @@ mod tests {
                 // read-only mount, `-EROFS`.
                 let vol = Ext4Volume::new(200)?;
                 let big = vol.root.create(b"big", 0o644).map_err(|_| "create on ext4")?;
-                let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file = KernelFile::new_unchecked_flags(big, Arc::from(*b"/big"), rw).map_err(|_| "open on ext4")?;
-                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                let fd = ktest_install(&big, b"/big", OpenFlags::O_RDWR)?;
+                drop(big);
                 kassert_eq!(sys_ftruncate(fd, i64::MAX as u64), neg_errno(errno::EFBIG));
                 kassert_eq!(sys_ftruncate(fd, 5000), 0);
                 kassert_eq!(fd.file().map(|f| f.inode.stat().map(|m| m.size)), Ok(Ok(5000)));
                 kassert_eq!(sys_close(fd), 0);
                 let ro_root = vol.remount_ro(201)?;
                 let ro_big = ro_root.lookup(b"big").map_err(|_| "lookup on the ro mount")?;
-                let file = KernelFile::new_unchecked_flags(ro_big, Arc::from(*b"/big"), rw).map_err(|_| "open ro")?;
-                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                let fd = ktest_install(&ro_big, b"/big", OpenFlags::O_RDWR)?;
+                drop(ro_big);
                 kassert_eq!(sys_ftruncate(fd, 0), neg_errno(errno::EROFS));
                 kassert_eq!(sys_close(fd), 0);
                 remove(&[b"/tmp/meta-ktest-terr"]);
@@ -757,10 +756,7 @@ mod tests {
                 let m = fault_ext4(203)?;
                 let f = m.root.create(b"suid", 0o644).map_err(|_| "create on ext4")?;
                 f.set_mode(0o4755).map_err(|_| "set_mode")?;
-                let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(*b"/suid"), rw)
-                    .map_err(|_| "open on ext4")?;
-                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                let fd = ktest_install(&f, b"/suid", OpenFlags::O_RDWR)?;
                 let disk = |minor| {
                     remount_ro(&m, minor)?.root_inode().lookup(b"suid").and_then(|i| i.stat()).map_err(|_| "remount")
                 };
@@ -842,10 +838,7 @@ mod tests {
                 let vol = Ext4Volume::new(202)?;
                 let f = vol.root.create(b"map", 0o644).map_err(|_| "create on ext4")?;
                 kassert_eq!(f.write_at(0, &data), Ok(data.len()));
-                let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(*b"/map"), rw)
-                    .map_err(|_| "open on ext4")?;
-                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                let fd = ktest_install(&f, b"/map", OpenFlags::O_RDWR)?;
                 shrink_unmaps(&f, || sys_ftruncate(fd, P + 10))
                     .inspect_err(|_| crate::ktest::diag(format_args!("ftruncate on ext4")))?;
                 kassert_eq!(sys_close(fd), 0);

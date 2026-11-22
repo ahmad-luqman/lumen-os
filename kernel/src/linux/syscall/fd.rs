@@ -621,6 +621,74 @@ pub(super) fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
     if ret < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(ret)) } else { Err("the open failed") }
 }
 
+/// `open(path, flags, mode)` through the handler, `path` copied into path
+/// slot `slot` of the test process's user memory: the descriptor.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_open(slot: u64, path: &[u8], flags: u32, mode: u16) -> Result<Fd, &'static str> {
+    ktest_fd(sys_open(ktest_user_path(slot, path)?, ktest_flags(flags), at::reg(u64::from(mode))))
+}
+
+/// A new descriptor of the current process on `inode` with `flags`, with
+/// no lookup (`OpenFile::new_unchecked_flags`): how ktests reach a volume
+/// no mount holds. `path` is the open file's path, as `/proc/<pid>/maps`
+/// and `/proc/<pid>/fd` show it.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_install(
+    inode: &alloc::sync::Arc<dyn VfsInode>,
+    path: &[u8],
+    flags: u32,
+) -> Result<Fd, &'static str> {
+    // The path in a diagnostic: which of a ktest's installs failed.
+    let failed = |why: &'static str, e: VfsError| {
+        crate::ktest::diag(format_args!("{why} at {}: {e:?}", lumen_vfs::Escaped(path)));
+        why
+    };
+    let file = KernelFile::new_unchecked_flags(
+        alloc::sync::Arc::clone(inode),
+        alloc::sync::Arc::from(path),
+        ktest_flags(flags),
+    )
+    .map_err(|e| failed("open the inode", e))?;
+    let raw = process::install_current_fd(file, false).map_err(|e| failed("install the fd", e))?;
+    Ok(at::reg(u64::from(raw as u32)))
+}
+
+/// A file at `path` (in `/tmp`) holding `data`, open `O_RDWR` as `fd`
+/// (through `open`, path slot 3): removed again when dropped, so a failing
+/// check, which returns early, leaves no file behind for the next run.
+#[cfg(feature = "ktest")]
+pub(super) struct KtestTmpFile {
+    pub(super) path: &'static [u8],
+    pub(super) fd: Fd,
+    pub(super) inode: alloc::sync::Arc<dyn VfsInode>,
+}
+
+#[cfg(feature = "ktest")]
+impl KtestTmpFile {
+    pub(super) fn new(path: &'static [u8], data: &[u8]) -> Result<Self, &'static str> {
+        let _ = ktest_unlink(path); // an earlier run's, if it crashed
+        let fd = ktest_open(3, path, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+        let inode = alloc::sync::Arc::clone(&fd.file().map_err(|_| "fd")?.inode);
+        if inode.write_at(0, data) != Ok(data.len()) {
+            return Err("write");
+        }
+        Ok(Self { path, fd, inode })
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for KtestTmpFile {
+    fn drop(&mut self) {
+        let _ = ktest_unlink(self.path); // gone already where a test unlinks it
+    }
+}
+
+/// Remove the file `path` (from `/`).
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_unlink(path: &[u8]) -> Result<(), &'static str> {
+    lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false).map_err(|_| "unlink")
+}
+
 crate::ktest!(
     fn fd_openat_takes_the_lowest_free_slot_and_refuses_past_1024() {
         use crate::{kassert, kassert_eq};
