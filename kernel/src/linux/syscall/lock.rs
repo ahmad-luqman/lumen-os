@@ -111,7 +111,7 @@ struct Try {
 fn lock_or_wait(
     file: &FileRef,
     mut attempt: impl FnMut(&mut lumen_vfs::AdvisoryLocks) -> Result<Try, VfsError>,
-    mut before_wait: impl FnMut() -> Result<(), u32>,
+    mut before_wait: impl FnMut(u64) -> Result<(), u32>,
     mut after_wait: impl FnMut(),
 ) -> Result<u64, u32> {
     loop {
@@ -123,7 +123,7 @@ fn lock_or_wait(
         match outcome {
             LockOutcome::Granted => return Ok(0),
             LockOutcome::WouldBlock => {
-                before_wait()?;
+                before_wait(seen)?;
                 process::wait_for_lock_release(seen);
                 after_wait();
             }
@@ -135,29 +135,48 @@ fn lock_or_wait(
 /// Linux's `MAX_DEADLK_ITERATIONS`: a longer cycle isn't found.
 const MAX_DEADLOCK_CHAIN: usize = 10;
 
-/// The processes blocked in `F_SETLKW`: each waiter's pid and the pid of
-/// the process holding the lock it conflicts with (the first `F_GETLK`
-/// would report). A leaf lock: taken only outside the inode's lock.
-static POSIX_WAITERS: SpinLock<BTreeMap<u32, u32>> = SpinLock::new(BTreeMap::new());
+/// A process blocked in `F_SETLKW`: the pid of the process holding the
+/// lock it conflicts with (the first `F_GETLK` would report), and the
+/// release count its wait ends past (`process::lock_releases`).
+#[derive(Clone, Copy)]
+struct Waiting {
+    holder: u32,
+    seen: u64,
+}
 
-/// Record that `pid` is about to wait for `holder`'s POSIX lock, unless
-/// that closes a cycle (`holder` waiting, through at most
-/// `MAX_DEADLOCK_CHAIN` processes, for `pid`): `EDEADLK` then, as Linux.
-/// The check and the record are one hold of `POSIX_WAITERS`, so of two
-/// processes about to wait for each other the second is refused.
-fn would_deadlock(pid: u32, holder: u32) -> Result<(), u32> {
+/// The processes blocked in `F_SETLKW`, by pid. A leaf lock: taken only
+/// outside the inode's lock.
+static POSIX_WAITERS: SpinLock<BTreeMap<u32, Waiting>> = SpinLock::new(BTreeMap::new());
+
+/// Record that `pid` is about to wait for `holder`'s POSIX lock (its wait
+/// ending once the release count is past `seen`), unless that closes a
+/// cycle (`holder` waiting, through at most `MAX_DEADLOCK_CHAIN`
+/// processes, for `pid`): `EDEADLK` then, as Linux.
+///
+/// Only entries stamped with the current release count are followed: any
+/// release since an entry was made has woken its waiter (whose wait ends
+/// when the count moves), which may now get its lock rather than wait, so
+/// the entry no longer says who it waits for. A waiter that still
+/// conflicts records itself again, with the new count, before it waits.
+/// So a real cycle is found by whichever of its processes records last,
+/// and a holder that has just let go of the lock its waiter wanted isn't
+/// refused for waiting on that waiter in turn. The check and the record
+/// are one hold of `POSIX_WAITERS`, so of two processes about to wait for
+/// each other the second is refused.
+fn would_deadlock(pid: u32, holder: u32, seen: u64) -> Result<(), u32> {
     let mut waiters = POSIX_WAITERS.lock();
+    let now = process::lock_releases();
     let mut next = holder;
     for _ in 0..MAX_DEADLOCK_CHAIN {
         if next == pid {
             return Err(errno::EDEADLK);
         }
         match waiters.get(&next) {
-            Some(&further) => next = further,
-            None => break,
+            Some(w) if w.seen == now => next = w.holder,
+            _ => break,
         }
     }
-    waiters.insert(pid, holder);
+    waiters.insert(pid, Waiting { holder, seen });
     Ok(())
 }
 
@@ -248,7 +267,7 @@ fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
             }
             Ok(Try { outcome, gave_up: held && outcome == LockOutcome::Granted })
         },
-        || holder.get().map_or(Ok(()), |h| would_deadlock(pid, h)),
+        |seen| holder.get().map_or(Ok(()), |h| would_deadlock(pid, h, seen)),
         || {
             POSIX_WAITERS.lock().remove(&pid);
         },
@@ -287,7 +306,7 @@ fn flock(fd: Fd, operation: u32) -> Result<u64, u32> {
             };
             Ok(Try { outcome, gave_up })
         },
-        || Ok(()),
+        |_| Ok(()),
         || {},
     )
 }
@@ -866,7 +885,8 @@ crate::ktest!(
     fn lock_fcntl_setlkw_refuses_a_deadlock() {
         // A holds [0, 10) and B [10, 20); B waits for A's range; A asking
         // to wait for B's would close the cycle: `-EDEADLK` (F_SETLK still
-        // `-EAGAIN`), and B gets A's range once A lets go.
+        // `-EAGAIN`), and B gets A's range once A lets go; A then waiting
+        // for B's range (B's stale record notwithstanding) is no deadlock.
         const PATH: &[u8] = b"/tmp/lock-ktest-deadlock";
         let (set, setw, wr, un) = (general::F_SETLK, general::F_SETLKW, general::F_WRLCK, general::F_UNLCK);
         let seek_set = general::SEEK_SET;
@@ -885,6 +905,11 @@ crate::ktest!(
                 baton.b_stays_blocked()?;
                 baton.releasing.store(true, Ordering::SeqCst);
                 crate::kassert_eq!(ktest_lk(fd, set, un, seek_set, 0, 10)?, 0);
+                // B, just woken, is about to take [0, 10), not waiting for
+                // A any more: waiting for B's range now is no deadlock (it
+                // waits until B's exit lets go of it).
+                crate::kassert_eq!(ktest_lk(fd, setw, wr, seek_set, 10, 10)?, 0);
+                crate::kassert!(baton.b_done.load(Ordering::SeqCst));
                 Ok(())
             },
             move |_, baton| {

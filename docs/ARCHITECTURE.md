@@ -3575,8 +3575,8 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); `-EINVAL` if `off < 0`, `-ESPIPE` on console/tty, `-EBADF` on `O_PATH` or non-writable fd |
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
 | 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` on any unmapped hole; sweeps `MAP_SHARED` PTE dirty bits into `PageCache` and, for `MS_SYNC`, writes back and issues `BlockDevice::flush()` |
-| 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0) / `F_DUPFD_CLOEXEC` (1030) (`-EINVAL` if `arg < 0 \|\| arg >= MAX_FDS`, `-EMFILE` if no free slot in `[arg, MAX_FDS)`), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`; `-EBADF` on `O_PATH`), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped, checking open mode `F_WRLCK` → writable / `F_RDLCK` → readable else `-EBADF`, normalizing `l_len < 0`, section 9); unknown `cmd` returns `-EINVAL` |
-| 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; `-EBADF` on `O_PATH`; independent of `fcntl` POSIX locks); atomic upgrade/downgrade on same `OpenFileId`, `-EWOULDBLOCK` on conflict with `LOCK_NB`, released when last FD to the `OpenFile` closes |
+| 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0) / `F_DUPFD_CLOEXEC` (1030) (`-EINVAL` if `arg < 0 \|\| arg >= MAX_FDS`, `-EMFILE` if no free slot in `[arg, MAX_FDS)`), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`; `-EBADF` on `O_PATH`), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped, checking open mode `F_WRLCK` → writable / `F_RDLCK` → readable else `-EBADF`, normalizing `l_len < 0`; `F_SETLKW` is `-EDEADLK` where its wait would close a cycle of waiting processes, section 9); unknown `cmd` returns `-EINVAL` |
+| 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; `-EBADF` on `O_PATH`; independent of `fcntl` POSIX locks); atomic upgrade/downgrade on same `OpenFileId` when nothing conflicts (a blocking request that conflicts gives the held lock up first, as Linux; section 9), `-EWOULDBLOCK` on conflict with `LOCK_NB`, released when last FD to the `OpenFile` closes |
 | 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs (and detached unlinked inodes as a no-op), `-EBADF` on `O_PATH`, and `-EINVAL` on non-syncable special devices (console/tty, `/dev/*`) |
 | 75 | `fdatasync(fd)` | flushes file data pages and size-changing metadata through `BlockCache` + `BlockDevice::flush()` (same `-EBADF`/`-EINVAL` rules as `fsync`) |
 | 76 | `truncate(path, len)` | resolves `path` (following symlinks), validates `len >= 0` (`-EINVAL`), writable regular file (`-EISDIR`/`-EACCES`/`-EROFS`), resizes via `ftruncate` logic |
@@ -5489,7 +5489,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     namespaces** (matching Linux).
   - **`flock(2)` locks:** keyed by `OpenFileId` (`LOCK_SH`, `LOCK_EX`,
     `LOCK_UN`, `LOCK_NB`; allowed on `O_RDONLY` fds, `-EBADF` on `O_PATH`).
-    Same `OpenFileId` upgrades/downgrades atomically; released automatically
+    Same `OpenFileId` upgrades/downgrades atomically when nothing conflicts (see "Blocking" below); released automatically
     when the last FD referencing that `OpenFile` closes.
   - **`fcntl` POSIX record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW`):** keyed by
     `(pid, start..end)` byte ranges (`l_len == 0` means to `i64::MAX`; negative
@@ -5514,7 +5514,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     (`process::locks_released`), after Lock 4 is released. `F_SETLKW`
     records who it waits for (the holder `F_GETLK` would report) and is
     `-EDEADLK` where that closes a cycle of waiters (followed through at
-    most 10, as Linux); `flock` detects no deadlock (nor does Linux). No
+    most 10, as Linux; a record stamped with an older release count is not
+    followed, since that release woke its waiter, which records itself
+    again if it still waits); `flock` detects no deadlock (nor does Linux). No
     signal ends a wait (no `EINTR` until signals are delivered).
 
 ### Pseudo-filesystems (`/tmp`, `/dev`, `/proc`)
