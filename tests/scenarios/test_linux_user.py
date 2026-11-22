@@ -8,9 +8,8 @@ and a dynamic musl program's dlopen and file mmap from ring 3 (#255)."""
 import re
 
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
-from lumen_harness.leaks import CleanRuns
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import copy_rootfs, e2fsck_check
+from lumen_harness.rootfs import copy_rootfs, e2fsck_check, warm_up
 from lumen_harness.shell import run
 
 BOOT_TIMEOUT = 60
@@ -424,12 +423,11 @@ MAPS_LINE = re.compile(
 )
 
 
-def m7_run(clean, args):
-    """`linux /usr/local/bin/m7_test <args>` on `clean`'s machine (a
-    `lumen_harness.leaks.CleanRuns`): its output between its first line and
-    the closing `linux:` line, which must say it exited 0 with no frames
-    leaked."""
-    out = clean.run(f"linux {M7_TEST} {args}".rstrip())
+def m7_run(m, args):
+    """`linux /usr/local/bin/m7_test <args>` on `m`: its output between its
+    first line and the closing `linux:` line, which must say it exited 0
+    with no frames leaked."""
+    out = run(m, f"linux {M7_TEST} {args}".rstrip(), 60)
     lines = out.splitlines()
     assert lines and lines[0] == "m7_test: dynamic musl start", out
     assert lines[-1] == f"linux: {M7_TEST} exit=0 leaked_frames=0", out
@@ -468,30 +466,31 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
       reads them back.
 
     Every run leaks zero frames, but the bus error's -1: the page the
-    truncation freed. The runs are kept clear of #300's kernel stack-window
-    page tables (`lumen_harness.leaks.CleanRuns`, whose `finish` checks the
-    next table comes where the last one puts it), so every count is exact.
+    truncation freed: every count exact, the kernel stack's page tables
+    included (#300: after a warm-up run, each run's stack reuses the last
+    one's addresses, so no run maps a new table).
     The data files (and `libm7.so`'s one page) are in the page cache before
     the first run, so no run counts a cached page."""
     disk = copy_rootfs(tmp_path)
     m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
-    clean = CleanRuns(m)
-
     assert run(m, "vfstest write-pattern /m7-shared 8192") == "wrote 8192\n"
     assert run(m, "vfstest write-pattern /m7-data 8192") == "wrote 8192\n"
     assert run(m, "vfstest write-pattern /tmp/m7-bus 8192") == "wrote 8192\n"
     assert re.fullmatch(r"read: \d+\n", run(m, "vfstest read /usr/local/lib/libm7.so 8192"))
     # The files' blocks on the disk before the stores, for the reboot.
     assert run(m, "sync", 30) == "sync: ok\n"
+    warm_up(m)
 
-    assert m7_run(clean, "") == ["m7_test: dlopen/dlsym ok"]
-    assert m7_run(clean, "private /m7-data") == ["m7_test: private ok"]
-    assert m7_run(clean, "mprotect /m7-data") == ["m7_test: mprotect ok"]
-    assert m7_run(clean, "truncate /m7-data") == ["m7_test: truncate ok"]
+    assert m7_run(m, "") == ["m7_test: dlopen/dlsym ok"]
+    assert m7_run(m, "private /m7-data") == ["m7_test: private ok"]
+    assert m7_run(m, "mprotect /m7-data") == ["m7_test: mprotect ok"]
+    assert m7_run(m, "truncate /m7-data") == ["m7_test: truncate ok"]
 
     # A bus error: the WARN it logs is the point here.
-    out = clean.run(
+    out = run(
+        m,
         f"linux {M7_TEST} sigbus /tmp/m7-bus",
+        60,
         allow=r"WARN  user: pid \d+: bus error \(SIGBUS\)",
     )
     touched = re.search(r"^m7_test: sigbus: touching (0x[0-9a-f]+) past EOF$", out, re.MULTILINE)
@@ -505,7 +504,7 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
     assert bus, out
     assert vfs_stat(m, "/tmp/m7-bus")["size"] == "4096"
 
-    lines = m7_run(clean, "maps")
+    lines = m7_run(m, "maps")
     assert lines[0] == "m7_test: maps begin" and lines[-2:] == [
         "m7_test: maps end",
         "m7_test: maps ok",
@@ -530,9 +529,7 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
         assert any(row.group(3) == "r-xp" for row in rows), f"{path}: no code line"
     assert "[stack]" in by_name, "\n".join(maps)
 
-    assert m7_run(clean, "shared /m7-shared") == ["m7_test: shared ok"]
-    # The runs since the last stack-window table made one stack each.
-    clean.finish()
+    assert m7_run(m, "shared /m7-shared") == ["m7_test: shared ok"]
     assert CRASH_BEGIN not in m.output
     # No `sync` (and `exit` makes none): only msync(MS_SYNC) wrote the stores.
     m.send_line("exit")
@@ -541,8 +538,8 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
 
     m2 = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
     assert run(m2, "vfstest read /m7-shared 8192") == "read: 8192\n"
-    clean2 = CleanRuns(m2)
-    out = clean2.run("linux /bin/busybox strings -n 8 /m7-shared")
+    warm_up(m2)
+    out = run(m2, "linux /bin/busybox strings -n 8 /m7-shared", 60)
     # A printable pattern byte may run on before a store: matched, not split.
     assert re.findall(r"m7 [a-z ]+", out) == [
         "m7 shared store via mapping",
@@ -550,6 +547,5 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
         "m7 shared page one",
     ], out
     assert out.endswith("linux: /bin/busybox exit=0 leaked_frames=0\n"), out
-    clean2.finish()
     m2.send_line("exit")
     assert m2.wait_exit(10) == EXIT_SUCCESS

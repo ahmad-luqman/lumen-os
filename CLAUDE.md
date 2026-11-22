@@ -226,8 +226,15 @@ one is its own PR that updates that doc first.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
   `mm/heap.rs`: the `#[global_allocator]`, growing in the heap window.
-  `mm/stack.rs`: kernel stacks with guard pages; `arch/x86_64/stacks.rs`
-  holds their registry (backtraces, overflow reports).
+  `mm/stack.rs`: kernel stacks with guard pages, a dropped one's slot
+  reused (#300; a stack that couldn't wait for its range's TLB flush
+  counted by `Fallback` reason, shown in `mem`); `arch/x86_64/stacks.rs`
+  holds their registry (backtraces, overflow reports). `mm/tlb.rs`: retiring dropped stacks' pages from every
+  CPU's TLB before reuse (`unsafe fn retire` giving a `Generation`,
+  `flushed_through` the one maker of a `Flushed`, `catch_up` at the timer
+  (`on_tick`; `TickFlushesOff` for the ktests) and `WAKEUP` interrupts,
+  `join` at the top of `smp::ap_main`, `sync`: IPIs and a bounded wait,
+  only outside critical sections, `still_stuck` after a timeout).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT.
@@ -516,8 +523,11 @@ one is its own PR that updates that doc first.
   check) (host-tested).
 - `crates/lumen-mm`: frame-allocator logic (bitmap), typed addresses, the
   page-table format and mapper (host-tested, incl. a model comparison), the
-  window tokens that confine `paging::map`, and the kernel-stack layout and
-  lock-free stack registry.
+  window tokens that confine `paging::map` (`Window::join`), and the
+  kernel-stack layout (`StackWindow`: `StackSlot`s, freed ones kept as
+  joined free ranges tagged with a TLB `Generation`, first fit once a
+  `Flushed` covers it, #300; a model with out-of-order give-backs and a
+  page-table count host-test it) and lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-vm`: a process's user address space as logic: the user
@@ -757,12 +767,8 @@ one is its own PR that updates that doc first.
   warning" check without them), `rootfs.py` (matched `e2fsprogs` discovery,
   per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, `debugfs`
   and `debugfs_names` (reading an image back, any error line failing), and
-  `llvm-readobj` dynamic musl ELF checks), `leaks.py` (exact `leaked_frames`
-  around #300's stack-window page tables, one every `STACK_TABLE_EVERY`
-  processes: `start_stack_table` runs `busybox true` until one maps it;
-  `CleanRuns.run`, a machine's `linux` commands, starting a table before the
-  first and once `CLEAN_RUNS` runs have followed one, each where the last
-  puts it, and `finish` checking the next after the last run).
+  `llvm-readobj` dynamic musl ELF checks, and `warm_up`: one uncounted
+  `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
   assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
   for #255's exit scenarios, and `libm7.so`;

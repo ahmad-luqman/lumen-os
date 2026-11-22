@@ -10,9 +10,15 @@ import re
 from lumen_harness import BUILD_DIR
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.klog import unexpected_warnings
-from lumen_harness.leaks import BUSYBOX_EXIT, CleanRuns
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import copy_rootfs, debugfs, debugfs_names, e2fsck_check
+from lumen_harness.rootfs import (
+    BUSYBOX_EXIT,
+    copy_rootfs,
+    debugfs,
+    debugfs_names,
+    e2fsck_check,
+    warm_up,
+)
 from lumen_harness.shell import PROMPT, run
 
 BOOT_TIMEOUT = 60
@@ -22,17 +28,16 @@ ASH_PROMPT = r"[~/][^\n]* # "
 
 class Busybox:
     """Runs `/bin/busybox` applets, each one's leaked frames exactly the
-    page-cache pages of the files it creates (or frees): `clean` keeps the
-    runs clear of #300's stack-window page tables (`lumen_harness.leaks`)."""
+    page-cache pages of the files it creates (or frees)."""
 
     def __init__(self, m):
         self.m = m
-        self.clean = CleanRuns(m)
+        warm_up(m)
 
     def __call__(self, args, *, status=0, leaked=0):
         """`/bin/busybox <args>`'s output, less the `linux:` line, which must
         give `status` as its exit code and `leaked` frames."""
-        out = self.clean.run(f"linux /bin/busybox {args}")
+        out = run(self.m, f"linux /bin/busybox {args}", 60)
         lines = out.splitlines()
         assert lines, out
         done = BUSYBOX_EXIT.fullmatch(lines[-1])
@@ -65,8 +70,8 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
       serial (arithmetic, `cd` and `$PWD`, `for`, `[`, `case`, `read`), and
       its `exit 3` is the process's exit code.
 
-    Each run leaks exactly the pages of the files it makes (or frees), the
-    runs kept clear of #300's stack-window page tables. Then `sync` and
+    Each run leaks exactly the pages of the files it makes (or frees),
+    every kernel stack's page tables included (#300). Then `sync` and
     `exit`; the image passes the host's `e2fsck -fn`, and its `debugfs`
     finds the changes on the disk: `/group.sed` edited, `/untar`'s files
     equal to the host's, `/` holding exactly the image's names plus the
@@ -147,7 +152,6 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
     # prints text its typed line doesn't contain, so the terminal's echo of
     # that line can't match the pattern.
     ash_from = len(m.output)
-    busybox.clean.before_run()
     m.send_line("linux /bin/busybox ash -s")
     m.expect(ASH_PROMPT, 30)
     script = [
@@ -172,7 +176,6 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
     m.expect(PROMPT, 10)
     assert CRASH_BEGIN not in m.output
     assert unexpected_warnings(m.output[ash_from:]) == []
-    busybox.clean.finish()
 
     assert run(m, "sync", 60) == "sync: ok\n"
     m.send_line("exit")

@@ -61,6 +61,16 @@ pub unsafe fn load_root(root: PhysFrame) {
     }
 }
 
+/// Drop every non-global translation this CPU has cached, by writing CR3
+/// its own value back (no PCIDs in use). That covers the kernel's heap and
+/// stack windows: the kernel's tables never set the global bit
+/// (`lumen_mm::paging::Attrs` has none).
+pub fn flush_local() {
+    // SAFETY: CR3 keeps its value, so the same tables stay in use; only
+    // cached translations go, and the walker refills them from the tables.
+    unsafe { write_cr3_raw(read_cr3()) }
+}
+
 /// Write `root` directly to CR3 (`CR4.PCIDE = 0`), without toggling `CR4.PGE`.
 ///
 /// Used on per-process address-space switches: flushes non-global TLB entries

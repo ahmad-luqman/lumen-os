@@ -234,10 +234,3 @@ milestone = "M7"
 tests = [
     "harness:test_rootfs::*",
 ]
-
-[[feature]]
-name = "Exact leaked-frame counts around #300 (lumen_harness.leaks): its copies of the kernel's STACK_SIZE and GUARD_SIZE (and FRAME_SIZE) agree with the Rust sources; start_stack_table runs busybox true until one maps a stack-window page table (at most 32 runs; a boot's first may take 31), refusing any other count and failing when none comes; CleanRuns.run starts a table before a machine's first run and again once CLEAN_RUNS runs have followed one, refusing a table not 30 or 31 processes after the last, and finish checks the next table's place after the last run"
-milestone = "M7"
-tests = [
-    "harness:test_leaks::*",
-]

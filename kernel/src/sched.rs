@@ -36,9 +36,11 @@
 //! A thread that returns from its entry point (or calls [`exit`]) is dead;
 //! the next thread to run on its CPU frees its stack and is done with it
 //! ([`FINISHING`]), and only then does [`JoinHandle::join`] return. The unmap's TLB flush is local: the home CPU
-//! ran on the stack; a spawner on another CPU wrote its first frame and may
-//! keep a stale entry for that page, which nothing uses again (stack
-//! addresses are never reused).
+//! ran on the stack; a spawner on another CPU wrote its first frame (and a
+//! [`scope`]d thread may have borrowed from it) and may keep stale entries
+//! for its pages. Nothing uses them until the stack's addresses are
+//! reused, and they are reused only once every CPU has flushed them
+//! (`mm::tlb`, #300).
 //!
 //! Lock order: a wait queue's lock, then a CPU's run queue (only
 //! [`WaitQueue::wait_until_or_deadline`] nests them, to put the thread on
@@ -273,7 +275,7 @@ impl UserSlot {
 /// `SavedRsp`'s `Sync` argument, a woken thread sitting on its queue while
 /// it still runs (see [`WaitQueue::wait_until`]), the callers that keep
 /// `cpu_index()` across a switch, and freeing stacks with a local TLB flush
-/// all have to be revisited.
+/// (their reuse waits for every CPU's, `mm::tlb`) all have to be revisited.
 pub struct Thread {
     id: u64,
     /// Set once, when it is made (the crash report reads it lock-free).
@@ -1816,7 +1818,7 @@ fn idle_loop(cpu: usize, has_job: impl Fn() -> bool, run_job: impl Fn()) {
 
 /// The CPUs whose scheduler runs.
 #[cfg(feature = "ktest")]
-fn running_cpus() -> Vec<usize> {
+pub(crate) fn running_cpus() -> Vec<usize> {
     (0..MAX_CPUS).filter(|&c| running_on(c)).collect()
 }
 

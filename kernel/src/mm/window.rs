@@ -65,6 +65,8 @@ pub fn map_fresh(window: &mut Window, pages: Range<u64>) -> Result<(), WindowErr
 ///
 /// # Safety
 /// `pages` are mapped and nothing refers to memory through them any more.
+/// Only this CPU's TLB is flushed: `pages` aren't mapped again until every
+/// CPU has flushed them (`mm::tlb`), as for [`paging::unmap`].
 pub unsafe fn unmap_and_free(window: &mut Window, pages: Range<u64>) {
     // SAFETY: upheld by the caller.
     unsafe { release(window, pages, None) }

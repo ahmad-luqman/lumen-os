@@ -376,7 +376,9 @@ pub const MSI_LAST: u8 = 0xef;
 /// Free: no source uses 0x30-0x3e (ktests raise 0x30 and 0x31 by `int`).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub const UNUSED: u8 = 0x30;
-/// An IPI that only wakes its CPU (`smp::run_on`): handled by an EOI.
+/// An IPI that wakes its CPU (`smp::run_on`, `smp::wake`) and has it catch
+/// up retired TLB generations (`mm::tlb::sync`): handled by
+/// `mm::tlb::catch_up` and an EOI.
 pub const WAKEUP: u8 = 0x3f;
 /// Local APIC errors.
 pub const LAPIC_ERROR: u8 = 0xfe;
@@ -819,6 +821,8 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
             let cpu = super::percpu::index();
             let tick = TICKS[cpu].fetch_add(1, Ordering::Relaxed) + 1;
             crate::perf::on_tick(frame.rip);
+            // Retired kernel-window pages out of this CPU's TLB (#300).
+            crate::mm::tlb::on_tick();
             // Before the scheduler may switch threads: the next tick must be
             // able to arrive on whatever runs next.
             super::apic::eoi();
@@ -833,6 +837,8 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         WAKEUP => {
             #[cfg(feature = "ktest")]
             WAKEUPS[super::percpu::index()].fetch_add(1, Ordering::Relaxed);
+            // `mm::tlb::sync` sends WAKEUP to have this CPU flush (#300).
+            crate::mm::tlb::catch_up();
             super::apic::eoi();
         }
         v @ PIC_BASE..=PIC_LAST if super::apic::in_service(v) => {

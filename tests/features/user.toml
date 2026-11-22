@@ -204,7 +204,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Unmodified Alpine busybox ash -s off the ext4 rootfs (#255): a script of built-ins fed line by line over serial (arithmetic, cd and $PWD, for, [, case, read from stdin), its exit 3 the process's exit code, leaking no frames (the runs kept clear of #300's kernel stack-window page tables)"
+name = "Unmodified Alpine busybox ash -s off the ext4 rootfs (#255): a script of built-ins fed line by line over serial (arithmetic, cd and $PWD, for, [, case, read from stdin), its exit 3 the process's exit code, leaking no frames"
 milestone = "M7"
 tests = [
     "scenario:test_alpine::test_alpine_minirootfs_coreutils",
