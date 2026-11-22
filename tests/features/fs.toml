@@ -122,3 +122,11 @@ tests = [
     "ktest:lumen_kernel::vfs::devfs::devfs_nodes_start_with_their_boot_metadata",
     "ktest:lumen_kernel::vfs::tests::vfs_dev_checks_pass_after_a_chmod_of_a_dev_node",
 ]
+
+[[feature]]
+name = "ext4 rootfs fsck-clean after Linux programs' file syscalls (#254): with nothing left once the programs remove what they made (unlink and rmdir while open, renames over open files, record locks), and with a tree they leave (a hard link, a short and a long symlink, two files' mode, owner and times, one written by a sync and one set on a clean inode after it, a file and a directory exchanged, a directory moved to another parent with its ..), all of it read back from the disk on a second boot"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_posix_vfs_semantics",
+    "scenario:test_fs::test_flock_and_atomic_rename",
+]
