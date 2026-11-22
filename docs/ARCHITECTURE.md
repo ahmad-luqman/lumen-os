@@ -341,7 +341,7 @@ get IPIs. The in-kernel tests boot with 4 CPUs online.
 
 **Running something on an AP.** `smp::run_on(cpu, job)` puts a `fn()` in the
 AP's mailbox and sends it the `WAKEUP` IPI (vector 0x3f, handled by an
-EOI). The idle loop checks the mailbox (and its run queue) with interrupts
+EOI, after `mm::tlb::catch_up`: see "Retiring stack pages" below). The idle loop checks the mailbox (and its run queue) with interrupts
 off and only then `sti; hlt` (`arch::irq::wait_unless`), so a wakeup can't
 land between the check and the halt; the job runs on the idle thread, in
 `ap_main`'s frames, and can't block. The shell's `crash <kind> [cpu]` uses it. The scheduler
@@ -357,10 +357,32 @@ map a thread's stack, from a thread or a `run_on` job there). The only
 pages unmapped are dropped kernel stacks (test stacks, on the boot CPU; a
 dead thread's, on its home CPU), the paging ktests' scratch pages (boot
 CPU, other CPUs idle) and the rollback of a failed `map_fresh`, which
-undoes pages its own CPU just mapped. Apart from a thread's spawner, which
-wrote its first frame (so it may keep an entry for that page; harmless,
-since stack addresses are never reused), no other CPU has accessed any of
-them; stale entries from speculative fills aren't ruled out (not tested).
+undoes pages its own CPU just mapped. A dropped stack's pages may be in
+other CPUs' TLBs (a thread's spawner wrote its first frame; a
+`sched::scope` thread may have borrowed from it; speculative fills), so
+its addresses are reused only after every CPU has flushed them:
+
+**Retiring stack pages (#300).** `mm::tlb` numbers each dropped stack's
+unmapping as a generation (`retire`, after the unmap) and keeps, per CPU,
+the newest generation it has flushed through: a CPU catches up (`catch_up`:
+reads the newest generation, reloads CR3, which drops every kernel-window
+translation since the kernel's tables set no global bit, then records it)
+at each timer tick and each `WAKEUP` IPI. The stack window hands a free
+range out only once every counted CPU has flushed through its generation
+(`flushed_through`); `KernelStack::new` first calls `sync(generation)`,
+which catches up its own CPU, sends `WAKEUP` to each online CPU behind, and
+spins until they have caught up. It waits only from a thread with
+interrupts on and no critical section open (the M8 shootdown's locking
+rule: a CPU spinning, interrupts off, on a lock the waiter held could never
+answer), at most 2 s (warned about); otherwise, or past that, the stack
+takes other addresses (a fresh range may map a page table). The boot CPU
+is counted from the start, an AP from `mm::tlb::join` just before it goes
+online (counted as behind everything, then reading the generation,
+flushing and recording it, so a `sync` that saw it uncounted retired its
+pages before that flush); CPUs past the cap are never counted (they never
+load the kernel's tables). Tested by `a_reused_stack_is_flushed_from_every_cpu`
+(another CPU reading the old stack, then the reused one, sees the new
+frame) and `every_cpu_flushes_through_a_retired_generation`.
 
 ### ACPI (built in M1)
 
@@ -968,13 +990,27 @@ Every stack the kernel runs on once `kmain` switches stacks (right after
 `mm::init`) comes from the allocator
 (`kernel/src/mm/stack.rs`; layout and registry in the host-tested
 `lumen_mm::stacks`). `KernelStack::new` takes addresses from the stack
-window (`StackWindow` holds its token and splits off a sub-window for each
-stack, covering the stack alone; the guard page's range is dropped, so it
-has no token), upward, with an unmapped guard page below each
-stack (so the page above a stack is the next one's guard), maps fresh frames
-there through its own sub-window (RW, NX, write-back; all or nothing,
-shared with the heap in `mm/window.rs`) and registers the stack. Dropping one retracts it from the registry, then
-unmaps it and frees its frames; addresses are never reused. Each CPU's
+window (`StackWindow` holds its token and hands each stack a `StackSlot`:
+the stack's own sub-window, which maps it, and its guard page's, kept
+inside the slot so no one can map it), with an unmapped guard page below
+each stack (slots tile the window upward, so the page above a stack is the
+next slot's guard, or the first page of a free range or of the untouched
+rest, which becomes a guard when taken), maps fresh frames there through
+its own sub-window (RW, NX, write-back; all or nothing, shared with the
+heap in `mm/window.rs`) and registers the stack. Dropping one retracts it
+from the registry, then unmaps it, frees its frames and gives its slot
+back (#300): the slot joins the window's free ranges (up to
+`FREE_RANGES`, 256; adjacent ones joined, so there is at most one more
+than the slots taken), tagged with the generation its pages were retired
+at (section 4, "Retiring stack pages"). `new` takes the lowest free range
+that fits, carved from its bottom, once every CPU has flushed through its
+generation (waiting for that where it can), and the untouched rest of the
+window only when none fits. So steady-state spawning and exiting reuses
+the same addresses and their page tables: before, every stack's addresses
+were new and `unmap` frees no table, so about every 30th spawn mapped an
+L1 table for good (a frame each; RAM ran out after about 2M spawns). A
+failed `new` (out of frames, or the registry full) gives its slot back
+too. Each CPU's
 main and IST stacks are leaked so they can't be dropped; a thread's stack
 is dropped only once the thread is dead and its CPU has switched away from
 it.
@@ -1073,8 +1109,8 @@ reserves room in its queues so the timer never allocates.
 - **Vector map** (`arch/x86_64/idt.rs`): 0-31 CPU exceptions; 0x20-0x2f the
   8259 PICs, remapped there and masked (only a spurious IRQ 7 or 15 should
   arrive); 0x30-0x3d unused (ktests raise 0x30 and 0x31); 0x3e reserved for
-  the `TLB_SHOOTDOWN` IPI (M8); 0x3f the `WAKEUP` IPI
-  (section 4, "Other CPUs"); 0x40 the local APIC
+  the `TLB_SHOOTDOWN` IPI (M8); 0x3f the `WAKEUP` IPI, whose handler also
+  catches up a retired-stack TLB flush (section 4, "Other CPUs"); 0x40 the local APIC
   timer; 0x50 + n global system interrupt n (GSIs 0-63, up to 0x8f),
   once a driver routes it (`interrupts::route_isa_irq`; every other I/O
   APIC input stays masked); 0x90-0xef message-signalled interrupts (MSI and

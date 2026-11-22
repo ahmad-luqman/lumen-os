@@ -83,6 +83,20 @@ tests = [
 ]
 
 [[feature]]
+name = "Kernel stack addresses reused (#300): a dropped stack's slot (guard page and stack) is taken again by the next stack that fits, at the same addresses with its guard page still unmapped, so threads spawned and joined over and over leak no frame (no page table mapped for good every 2 MiB of new addresses); a freed slot is handed out only once every CPU has flushed it from its TLB (mm::tlb: a retired generation, CPUs catching up at their timer and WAKEUP interrupts, sync IPIs and waits), so another CPU that read the old stack reads the new one's frame"
+milestone = "M7"
+tests = [
+    "cargo:lumen-mm",
+    "ktest:lumen_kernel::mm::stack::guard_page_unmapped",
+    "ktest:lumen_kernel::mm::stack::a_full_registry_leaves_nothing_behind",
+    "ktest:lumen_kernel::mm::stack::spawned_threads_reuse_stacks_and_leak_no_frames",
+    "ktest:lumen_kernel::mm::stack::a_reused_stack_is_flushed_from_every_cpu",
+    "ktest:lumen_kernel::mm::tlb::every_cpu_flushes_through_a_retired_generation",
+    "scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen",
+    "scenario:test_alpine::test_alpine_minirootfs_coreutils",
+]
+
+[[feature]]
 name = "Window owner tokens and owned frames: map is safe for the holder of a page's window, which is handed out once ever; unmap gives the frame back"
 milestone = "M1"
 tests = [
@@ -153,7 +167,7 @@ tests = [
 ]
 
 [[feature]]
-name = "File-backed mmap from ring 3 (#255): a dynamic musl program's MAP_SHARED mapping agrees with pread and pwrite both ways; MAP_PRIVATE stores stay the mapping's (the file and a shared mapping unchanged, a later pwrite not reaching the copied page); an O_RDONLY descriptor's MAP_SHARED mapping refused PROT_WRITE (mmap and mprotect EACCES) where a private one may become writable; ftruncate shrinking a mapped file unmaps the page past the new end (regrown, it reads zeroes through the mapping), and touching a mapped page truncated away is a bus error (exit 135, cr2 that page, its frame freed); every other run leaks zero frames (the runs kept clear of #300's kernel stack-window page tables)"
+name = "File-backed mmap from ring 3 (#255): a dynamic musl program's MAP_SHARED mapping agrees with pread and pwrite both ways; MAP_PRIVATE stores stay the mapping's (the file and a shared mapping unchanged, a later pwrite not reaching the copied page); an O_RDONLY descriptor's MAP_SHARED mapping refused PROT_WRITE (mmap and mprotect EACCES) where a private one may become writable; ftruncate shrinking a mapped file unmaps the page past the new end (regrown, it reads zeroes through the mapping), and touching a mapped page truncated away is a bus error (exit 135, cr2 that page, its frame freed); every other run leaks zero frames"
 milestone = "M7"
 tests = [
     "scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen",

@@ -12,7 +12,9 @@
 //! tables check that its pages lie in the heap and stack windows.
 //!
 //! Claims are never released: a dropped window's range is gone for good,
-//! because sub-windows split off it may still be in use.
+//! because sub-windows split off it may still be in use. A holder of two
+//! windows that meet can join them back into one ([`Window::join`]): both
+//! were its own, so the joined one is too.
 
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +82,14 @@ impl Window {
         let low = Window { start: self.start, end: self.start + len };
         self.start += len;
         Some(low)
+    }
+
+    /// One window over `self` and `upper`, the window that starts where this
+    /// one ends (the reverse of [`split_off`](Self::split_off)). Both are
+    /// given back unchanged if they don't meet.
+    #[must_use = "dropping the joined window gives its range up for good"]
+    pub fn join(self, upper: Window) -> Result<Window, (Window, Window)> {
+        if self.end == upper.start { Ok(Window { start: self.start, end: upper.end }) } else { Err((self, upper)) }
     }
 }
 
@@ -180,6 +190,22 @@ mod tests {
         let rest = w.split_off(11 * P).unwrap();
         assert!(w.is_empty() && rest.len() == 11 * P);
         assert_eq!(w.split_off(0).map(|z| z.is_empty()), Some(true));
+    }
+
+    #[test]
+    fn join_undoes_split_off_and_refuses_windows_that_dont_meet() {
+        let mut w = table().claim(0).unwrap();
+        let a = w.split_off(2 * P).unwrap();
+        let b = w.split_off(3 * P).unwrap();
+        let ab = a.join(b).unwrap();
+        assert_eq!(ab.range(), BASE..BASE + 5 * P);
+        // `w` starts where `ab` ends, not the other way round.
+        let (w, ab) = w.join(ab).unwrap_err();
+        assert_eq!((w.range(), ab.range()), (BASE + 5 * P..BASE + 16 * P, BASE..BASE + 5 * P));
+        let gap = table().claim(1).unwrap();
+        let (ab, gap) = ab.join(gap).unwrap_err();
+        assert_eq!(ab.join(w).unwrap().range(), BASE..BASE + 16 * P);
+        assert_eq!(gap.range(), BASE + 16 * P..BASE + 20 * P);
     }
 
     #[test]

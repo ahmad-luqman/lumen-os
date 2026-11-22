@@ -819,6 +819,8 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
             let cpu = super::percpu::index();
             let tick = TICKS[cpu].fetch_add(1, Ordering::Relaxed) + 1;
             crate::perf::on_tick(frame.rip);
+            // Retired kernel-window pages out of this CPU's TLB (#300).
+            crate::mm::tlb::catch_up();
             // Before the scheduler may switch threads: the next tick must be
             // able to arrive on whatever runs next.
             super::apic::eoi();
@@ -833,6 +835,8 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
         WAKEUP => {
             #[cfg(feature = "ktest")]
             WAKEUPS[super::percpu::index()].fetch_add(1, Ordering::Relaxed);
+            // `mm::tlb::sync` sends WAKEUP to have this CPU flush (#300).
+            crate::mm::tlb::catch_up();
             super::apic::eoi();
         }
         v @ PIC_BASE..=PIC_LAST if super::apic::in_service(v) => {

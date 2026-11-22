@@ -7,6 +7,7 @@ pub mod frame;
 pub mod heap;
 pub mod paging;
 pub mod stack;
+pub mod tlb;
 pub mod user_vm;
 mod window;
 

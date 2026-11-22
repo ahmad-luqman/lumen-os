@@ -416,6 +416,8 @@ extern "C" fn ap_main() -> ! {
         "cpu {index}'s local APIC id isn't the one Limine reported"
     );
     info!(target: "smp", "cpu {index} online (lapic id {lapic})");
+    // Interrupts are still off: `sync` counts this CPU from here on.
+    crate::mm::tlb::join();
     slot.set(State::Online);
     // From here this context is the CPU's idle thread: it starts the CPU's
     // timer and scheduler, and runs `run_on`'s jobs (checked with interrupts

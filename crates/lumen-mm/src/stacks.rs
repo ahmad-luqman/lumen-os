@@ -4,8 +4,9 @@
 //!
 //! Each stack gets an unmapped guard page directly below it. Stacks are laid
 //! out upward, guard then stack, so the page directly above a stack is the
-//! next stack's guard (or never handed out): running off either end faults
-//! instead of silently corrupting a neighbour.
+//! next stack's guard (or not handed out): running off either end faults
+//! instead of silently corrupting a neighbour. Freed stacks' addresses are
+//! taken again (#300), once every CPU has flushed them from its TLB.
 //!
 //! The registry is what the backtrace walker trusts ([`Registry::contains`]:
 //! a frame pointer is only followed into a registered stack) and what names
@@ -111,41 +112,213 @@ impl StackRange {
     }
 }
 
-/// Hands out stack addresses in the stack window, upward, a guard page below
-/// each and the page above the last one left free. It holds the window's
-/// [`Window`] token and splits off a sub-window for each stack, so each
-/// stack's holder owns its pages. Guard pages get no token: a guard page's
-/// range is split off and dropped when its stack is taken (the page above the
-/// newest stack stays in this window until the next stack takes it as its
-/// guard), so no one can ever map one. Addresses are never
-/// reused; the caller sizes the window so that doesn't run out (the kernel's
-/// is about 1 TiB).
+/// How many free ranges a [`StackWindow`] keeps. Adjacent free ranges are
+/// joined, so taken slots separate any two of them: there are at most one
+/// more than the slots taken, which the registry caps at [`MAX_STACKS`] (plus
+/// the few being set up or given back at a time). Twice that leaves room.
+pub const FREE_RANGES: usize = 2 * MAX_STACKS;
+
+/// A stack's addresses from [`StackWindow::take`]: its guard page and the
+/// stack above it, each owned by a [`Window`]. Only the stack's window is
+/// handed out ([`StackSlot::window`]): the guard page's stays in here, so no
+/// one can ever map it, and goes back with the slot
+/// ([`StackWindow::give_back`]). Dropping a slot gives its addresses up for
+/// good (its guard page still never mapped).
+#[derive(Debug)]
+#[must_use = "dropping a stack slot gives its addresses up for good"]
+pub struct StackSlot {
+    guard: Window,
+    stack: Window,
+}
+
+impl StackSlot {
+    /// The stack's addresses (its guard page is just below).
+    pub fn range(&self) -> StackRange {
+        let r = self.stack.range();
+        StackRange { bottom: r.start, top: r.end }
+    }
+
+    /// The window of the stack's own pages (not the guard page): what maps
+    /// and unmaps them.
+    pub fn window(&mut self) -> &mut Window {
+        &mut self.stack
+    }
+
+    /// [`window`](Self::window), read-only.
+    pub fn stack_window(&self) -> &Window {
+        &self.stack
+    }
+}
+
+/// A free range of the stack window, and the retirement generation of the
+/// newest stack given back into it ([`StackWindow::give_back`]).
+#[derive(Debug)]
+struct Free {
+    window: Window,
+    retired: u64,
+}
+
+/// Hands out stack addresses in the stack window, a guard page below each,
+/// and takes them back for reuse.
+///
+/// **Layout.** Slots tile the window from its bottom up: each is a guard
+/// page, then the stack. So the page directly above a stack is the next
+/// slot's guard page, or the first page of a free range or of the untouched
+/// rest of the window, which becomes a guard page when it is taken: running
+/// off either end of a stack faults instead of silently corrupting a
+/// neighbour. A guard page is never mapped: its window stays inside the
+/// [`StackSlot`].
+///
+/// **Reuse (#300).** A stack given back ([`give_back`](Self::give_back))
+/// joins the free ranges, merged with its free neighbours, and a freed slot
+/// is taken again before the untouched rest of the window is: steady-state
+/// spawning and exiting reuses the same addresses, whose page tables are
+/// already there, instead of mapping a new table every 2 MiB for good. A
+/// freed stack's pages may still be cached in other CPUs' TLBs (its unmap
+/// flushes only the CPU that ran it), so a free range carries the
+/// generation it was retired at, and [`take`](Self::take) hands it out only
+/// once every CPU has flushed through that generation (`flushed`): the
+/// kernel's `mm::tlb` counts the generations and makes the CPUs flush.
+/// Taking is first fit: the lowest free range that fits and has been
+/// flushed through, carved from its bottom (an exact fit's page above is a
+/// taken slot's guard page, or the untouched rest's first page), else the
+/// untouched rest, keeping the page above the newest stack free.
 #[derive(Debug)]
 pub struct StackWindow {
-    window: Window,
+    /// The untouched rest of the window (`None` until [`claim`](Self::claim)).
+    rest: Option<Window>,
+    free: [Option<Free>; FREE_RANGES],
+}
+
+impl Default for StackWindow {
+    fn default() -> Self {
+        Self::empty()
+    }
 }
 
 impl StackWindow {
-    pub fn new(window: Window) -> StackWindow {
-        StackWindow { window }
+    /// A stack window with no addresses yet ([`claim`](Self::claim) gives
+    /// it some): constant, so the kernel's can be a static.
+    pub const fn empty() -> StackWindow {
+        StackWindow { rest: None, free: [const { None }; FREE_RANGES] }
     }
 
-    /// Addresses for the next stack of `size` bytes (a nonzero multiple of
-    /// the page size), with its guard page below it, and the sub-window that
-    /// owns the stack (not the guard page); `None` once the window is full.
-    pub fn take(&mut self, size: u64) -> Option<(StackRange, Window)> {
+    /// A stack window over `window`.
+    pub fn new(window: Window) -> StackWindow {
+        let mut w = StackWindow::empty();
+        w.claim(window);
+        w
+    }
+
+    /// Hand stacks out of `window` from now on.
+    ///
+    /// # Panics
+    /// If this already has a window (a caller bug).
+    pub fn claim(&mut self, window: Window) {
+        assert!(self.rest.is_none(), "the stack window is claimed twice");
+        self.rest = Some(window);
+    }
+
+    /// Has [`claim`](Self::claim) given this its window?
+    pub fn is_claimed(&self) -> bool {
+        self.rest.is_some()
+    }
+
+    /// The lowest free range a stack of `size` bytes fits in, among those
+    /// every CPU has flushed through if `flushed` is given.
+    fn lowest_fit(&self, size: u64, flushed: Option<u64>) -> Option<usize> {
+        let need = GUARD_SIZE.checked_add(size)?;
+        self.free
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| f.as_ref().map(|f| (i, f)))
+            .filter(|(_, f)| f.window.len() >= need && flushed.is_none_or(|g| f.retired <= g))
+            .min_by_key(|(_, f)| f.window.range().start)
+            .map(|(i, _)| i)
+    }
+
+    /// The generation every CPU must have flushed through before the lowest
+    /// free range a stack of `size` bytes fits in may be handed out, if they
+    /// haven't yet (`flushed`); `None` if no free range fits or the lowest
+    /// one is ready.
+    pub fn wait_for(&self, size: u64, flushed: u64) -> Option<u64> {
+        let i = self.lowest_fit(size, None)?;
+        let retired = self.free[i].as_ref().expect("lowest_fit names a free range").retired;
+        (retired > flushed).then_some(retired)
+    }
+
+    /// Addresses for a stack of `size` bytes (a nonzero multiple of the page
+    /// size), with its guard page below it: from the lowest free range that
+    /// fits and that every CPU has flushed through (`flushed`), else from
+    /// the untouched rest of the window; `None` once neither has room.
+    pub fn take(&mut self, size: u64, flushed: u64) -> Option<StackSlot> {
         assert!(size != 0 && size.is_multiple_of(FRAME_SIZE), "stack size {size:#x} is not whole pages");
         let len = GUARD_SIZE.checked_add(size)?;
+        if let Some(i) = self.lowest_fit(size, Some(flushed)) {
+            let Free { mut window, retired } = self.free[i].take().expect("lowest_fit names a free range");
+            let slot = carve(&mut window, size);
+            if !window.is_empty() {
+                // The rest of the range, where it came from.
+                self.free[i] = Some(Free { window, retired });
+            }
+            return slot;
+        }
+        let rest = self.rest.as_mut()?;
         // The page above the stack must be free too (the next guard).
-        if len.checked_add(GUARD_SIZE)? > self.window.len() {
+        if len.checked_add(GUARD_SIZE)? > rest.len() {
             return None;
         }
-        // The guard page's range is given up for good: no token, no mapping.
-        drop(self.window.split_off(GUARD_SIZE)?);
-        let own = self.window.split_off(size)?;
-        let r = own.range();
-        Some((StackRange { bottom: r.start, top: r.end }, own))
+        carve(rest, size)
     }
+
+    /// Take back `slot`, whose pages are all unmapped, retired at
+    /// generation `retired` (a CPU that has flushed through it holds none of
+    /// its pages in its TLB): it joins its free neighbours. False if it
+    /// couldn't be kept (more than [`FREE_RANGES`] free ranges, which can't
+    /// happen while at most [`MAX_STACKS`] slots are taken): its addresses
+    /// are then given up for good, as dropping it would.
+    #[must_use = "a slot that couldn't be kept is lost for good"]
+    pub fn give_back(&mut self, slot: StackSlot, retired: u64) -> bool {
+        let StackSlot { guard, stack } = slot;
+        let mut window = guard.join(stack).unwrap_or_else(|_| unreachable!("a guard page is just below its stack"));
+        let mut retired = retired;
+        // Join the free range just below, then the one just above.
+        let start = window.range().start;
+        if let Some(below) = self.free.iter_mut().find(|f| f.as_ref().is_some_and(|f| f.window.range().end == start)) {
+            let below = below.take().expect("found");
+            retired = retired.max(below.retired);
+            window = below.window.join(window).unwrap_or_else(|_| unreachable!("they meet"));
+        }
+        let end = window.range().end;
+        if let Some(above) = self.free.iter_mut().find(|f| f.as_ref().is_some_and(|f| f.window.range().start == end)) {
+            let above = above.take().expect("found");
+            retired = retired.max(above.retired);
+            window = window.join(above.window).unwrap_or_else(|_| unreachable!("they meet"));
+        }
+        match self.free.iter_mut().find(|f| f.is_none()) {
+            Some(empty) => {
+                *empty = Some(Free { window, retired });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How many free ranges there are.
+    pub fn free_ranges(&self) -> usize {
+        self.free.iter().flatten().count()
+    }
+}
+
+/// A slot for a stack of `size` bytes from the bottom of `window`, if it has
+/// room for the guard page and the stack.
+fn carve(window: &mut Window, size: u64) -> Option<StackSlot> {
+    if window.len() < GUARD_SIZE.checked_add(size)? {
+        return None;
+    }
+    let guard = window.split_off(GUARD_SIZE)?;
+    let stack = window.split_off(size)?;
+    Some(StackSlot { guard, stack })
 }
 
 /// A registered stack.
@@ -324,9 +497,10 @@ mod tests {
         unsafe { Claims::new([(start, end)]) }.claim(0).unwrap()
     }
 
-    /// The next stack's range from `w`.
+    /// The next stack's range from `w` (from the untouched rest, or a free
+    /// range every CPU has flushed through; nothing is given back here).
     fn take(w: &mut StackWindow, size: u64) -> Option<StackRange> {
-        w.take(size).map(|(range, _)| range)
+        w.take(size, u64::MAX).map(|slot| slot.range())
     }
 
     /// Register `range` (host tests: nothing is dereferenced).
@@ -338,13 +512,210 @@ mod tests {
     #[test]
     fn each_stack_gets_its_own_sub_window() {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
-        let (a, own_a) = w.take(64 * K).unwrap();
-        let (b, own_b) = w.take(16 * K).unwrap();
-        // Each sub-window is the stack alone: the guard page has no token.
-        assert_eq!(own_a.range(), a.span());
-        assert_eq!(own_b.range(), b.span());
-        assert!(!own_a.owns_page(a.guard()) && !own_b.owns_page(b.guard()));
-        assert!(own_a.range().end <= own_b.range().start);
+        let a = w.take(64 * K, 0).unwrap();
+        let b = w.take(16 * K, 0).unwrap();
+        // Each stack's window is the stack alone, not its guard page.
+        assert_eq!(a.stack_window().range(), a.range().span());
+        assert_eq!(b.stack_window().range(), b.range().span());
+        assert!(!a.stack_window().owns_page(a.range().guard()) && !b.stack_window().owns_page(b.range().guard()));
+        assert!(a.range().top <= b.range().guard());
+    }
+
+    /// A freed slot is taken again, once every CPU has flushed through the
+    /// generation it was retired at, at the same addresses and with the same
+    /// guard page below it (and the next slot's guard page above it); until
+    /// then the untouched rest of the window is used.
+    #[test]
+    fn a_freed_slot_is_reused_with_its_guard_page_once_flushed() {
+        let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
+        let a = w.take(64 * K, 0).unwrap();
+        let b = w.take(64 * K, 0).unwrap();
+        let (ra, rb) = (a.range(), b.range());
+        assert_eq!(w.wait_for(64 * K, 0), None, "nothing to wait for: nothing is free");
+        assert!(w.give_back(a, 5));
+        assert_eq!(w.free_ranges(), 1);
+        // Not yet flushed through generation 5: wait for it, or go on above.
+        assert_eq!(w.wait_for(64 * K, 4), Some(5));
+        assert_eq!(w.wait_for(64 * K, 5), None);
+        let c = w.take(64 * K, 4).unwrap();
+        assert_eq!(c.range().guard(), rb.top, "past the pending slot");
+        // Flushed: the freed slot comes back whole.
+        let mut again = w.take(64 * K, 5).unwrap();
+        assert_eq!(again.range(), ra);
+        assert_eq!(again.window().range(), ra.span());
+        assert!(!again.stack_window().owns_page(ra.guard()), "the guard page stays unowned");
+        assert_eq!(rb.guard(), ra.top, "the page above is the next slot's guard");
+        assert_eq!(w.free_ranges(), 0);
+        drop((b, c));
+    }
+
+    /// Free neighbours are joined (the generation the newest one's), so a
+    /// bigger stack fits where smaller ones were, and a smaller one is
+    /// carved from the bottom of a bigger free range, the rest kept.
+    #[test]
+    fn free_neighbours_join_and_big_ranges_are_carved() {
+        let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
+        let slots: Vec<_> = (0..3).map(|_| w.take(16 * K, 0).unwrap()).collect();
+        let first = slots[0].range();
+        let [a, b, c] = <[StackSlot; 3]>::try_from(slots).unwrap();
+        assert!(w.give_back(a, 1));
+        assert!(w.give_back(c, 3));
+        assert_eq!(w.free_ranges(), 2);
+        assert!(w.give_back(b, 2), "joins both neighbours");
+        assert_eq!(w.free_ranges(), 1);
+        // Three 16 KiB slots and their guards: room for a 56 KiB stack.
+        assert_eq!(w.wait_for(56 * K, 2), Some(3), "the newest generation counts");
+        let big = w.take(56 * K, 3).unwrap();
+        assert_eq!(big.range().guard(), first.guard());
+        assert_eq!(w.free_ranges(), 0);
+        assert!(w.give_back(big, 4));
+        let small = w.take(4 * K, 4).unwrap();
+        assert_eq!(small.range(), StackRange { bottom: first.bottom, top: first.bottom + 4 * K });
+        assert_eq!(w.free_ranges(), 1, "the rest of the range stays free");
+        let next = w.take(4 * K, 4).unwrap();
+        assert_eq!(next.range().guard(), small.range().top);
+        drop((small, next));
+    }
+
+    /// Free ranges past `FREE_RANGES` can't be kept: `give_back` says so.
+    #[test]
+    fn free_ranges_past_the_limit_are_refused() {
+        let mut w = StackWindow::new(window(BASE, BASE + 2 * (FREE_RANGES as u64 + 2) * 2 * FRAME_SIZE));
+        let slots: Vec<_> = (0..2 * (FREE_RANGES + 1)).map(|_| w.take(FRAME_SIZE, 0).unwrap()).collect();
+        // Every other one: no two free ranges meet.
+        let mut kept = Vec::new();
+        for (i, s) in slots.into_iter().enumerate() {
+            if i % 2 == 0 { kept.push(w.give_back(s, 1)) } else { drop(s) }
+        }
+        assert_eq!(kept.iter().filter(|&&k| k).count(), FREE_RANGES);
+        assert_eq!(kept.last(), Some(&false));
+    }
+
+    /// Page-table frames in a map, counted (a fake for the table counts).
+    #[derive(Default)]
+    struct Tables {
+        tables: std::collections::BTreeMap<u64, [u64; crate::paging::ENTRIES]>,
+    }
+
+    impl crate::paging::TableMemory for Tables {
+        fn read(&self, table: crate::PhysFrame, index: usize) -> Option<u64> {
+            Some(self.tables[&table.as_u64()][index])
+        }
+    }
+
+    impl crate::paging::TableMemoryMut for Tables {
+        fn write(&mut self, table: crate::PhysFrame, index: usize, value: u64) {
+            self.tables.get_mut(&table.as_u64()).unwrap()[index] = value;
+        }
+
+        fn alloc_table(&mut self) -> Option<crate::PhysFrame> {
+            let f = crate::PhysFrame::from_u64(0x10_0000 + self.tables.len() as u64 * FRAME_SIZE).unwrap();
+            self.tables.insert(f.as_u64(), [0; crate::paging::ENTRIES]);
+            Some(f)
+        }
+    }
+
+    /// #300: threads spawned and exiting, their stacks mapped and unmapped
+    /// through the real page-table code, map a bounded number of page tables
+    /// however many come and go (without reuse, 4000 64 KiB stacks walk
+    /// 266 MiB of the window and map an L1 table every 2 MiB of it, for
+    /// good). Up to 8 live at a time, freed out of order, each retired at
+    /// its own generation and every CPU flushed through it before the next
+    /// spawn (as `mm::tlb::sync` makes sure).
+    #[test]
+    fn spawning_and_exiting_maps_a_bounded_number_of_tables() {
+        use crate::paging::{self, Attrs, PageSize};
+        let mut w = StackWindow::new(window(BASE, BASE + (1 << 40)));
+        let mut mem = Tables::default();
+        let root = paging::TableMemoryMut::alloc_table(&mut mem).unwrap();
+        let frame = crate::PhysFrame::from_u64(0x8000_0000).unwrap();
+        let v = |a: u64| crate::VirtAddr::new(a).unwrap();
+        let (mut live, mut generation, mut seed) = (Vec::new(), 0u64, 0x2545_f491_4f6c_dd1du64);
+        let mut tables_after_warmup = 0;
+        for spawn in 0..4000 {
+            let slot = w.take(64 * K, generation).expect("the window has room");
+            for page in slot.range().span().step_by(FRAME_SIZE as usize) {
+                paging::map(&mut mem, root, v(page), frame, PageSize::Size4K, Attrs::DATA).unwrap();
+            }
+            live.push(slot);
+            if live.len() == 8 || spawn == 3999 {
+                // Some exit, oldest or not.
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let exiting = live.swap_remove(seed as usize % live.len());
+                for page in exiting.range().span().step_by(FRAME_SIZE as usize) {
+                    paging::unmap(&mut mem, root, v(page)).unwrap();
+                }
+                generation += 1;
+                assert!(w.give_back(exiting, generation));
+            }
+            if spawn == 100 {
+                tables_after_warmup = mem.tables.len();
+            }
+        }
+        // The root, an L3 and an L2 table, and the L1 tables 8 live stacks
+        // can straddle: their slots stay within the lowest 9 x 68 KiB.
+        assert!(mem.tables.len() <= 5, "{} tables", mem.tables.len());
+        assert_eq!(mem.tables.len(), tables_after_warmup, "a table mapped after the first 100 spawns");
+        assert!(w.free_ranges() <= live.len() + 1);
+    }
+
+    /// A randomized model: stacks of mixed sizes taken and given back, every
+    /// CPU flushing at random times. Live stacks never overlap each other or
+    /// each other's guard pages; the page above each live stack is in no
+    /// live stack; a free range is never handed out before every CPU has
+    /// flushed through its newest stack's generation; and the free ranges
+    /// stay at most one more than the slots taken.
+    #[test]
+    fn mixed_sizes_keep_guards_and_wait_for_flushes() {
+        let mut w = StackWindow::new(window(BASE, BASE + (1 << 30)));
+        // Live slots, and every page's retirement generation once freed.
+        let mut live: Vec<StackSlot> = Vec::new();
+        let mut retired_at: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+        let (mut generation, mut flushed, mut seed) = (0u64, 0u64, 0x9e37_79b9_7f4a_7c15u64);
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut reused = 0;
+        for _ in 0..20_000 {
+            let r = next();
+            if r % 7 == 0 {
+                flushed = generation;
+            }
+            if live.len() < 64 && (live.is_empty() || r % 3 != 0) {
+                let size = [1, 2, 4, 16, 17, 64][(next() % 6) as usize] * FRAME_SIZE;
+                let slot = w.take(size, flushed).expect("room");
+                let range = slot.range();
+                assert_eq!(range.size(), size);
+                for page in (range.guard()..range.top).step_by(FRAME_SIZE as usize) {
+                    if let Some(g) = retired_at.remove(&page) {
+                        assert!(g <= flushed, "page {page:#x} retired at {g}, handed out with {flushed} flushed");
+                        reused += 1;
+                    }
+                }
+                for other in &live {
+                    let o = other.range();
+                    assert!(range.top <= o.guard() || o.top <= range.guard(), "{range:?} overlaps {o:?}");
+                    assert!(!o.span().contains(&range.top), "the page above {range:?} is in {o:?}");
+                    assert!(!range.span().contains(&o.top), "the page above {o:?} is in {range:?}");
+                }
+                live.push(slot);
+            } else {
+                let slot = live.swap_remove((next() as usize) % live.len());
+                generation += 1;
+                let range = slot.range();
+                for page in (range.guard()..range.top).step_by(FRAME_SIZE as usize) {
+                    retired_at.insert(page, generation);
+                }
+                assert!(w.give_back(slot, generation));
+            }
+            assert!(w.free_ranges() <= live.len() + 1, "{} free ranges, {} live", w.free_ranges(), live.len());
+        }
+        assert!(reused > 10_000, "only {reused} pages reused");
     }
 
     #[test]

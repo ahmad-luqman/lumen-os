@@ -103,7 +103,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Unmodified Alpine minirootfs coreutils on the writable ext4 root (#255): dynamic /bin/busybox ls, cat, cp, mv of a file and of a tree across mounts both ways (/tmp to / and back, the source gone and cmp equal), grep, sed (-n with p, -i over an ext4 file), awk, uncompressed tar -cf onto tmpfs and -xf onto ext4 (the files equal), each run leaking exactly the pages of the files it creates, less those it frees (the runs kept clear of #300's kernel stack-window page tables); then sync and exit, the mutated image passes the host's e2fsck -fn, and the host's debugfs finds the changes on the disk (the sed -i edit, the extracted files equal to the host's, / holding exactly the image's names and the test's new ones, nothing under /tmp)"
+name = "Unmodified Alpine minirootfs coreutils on the writable ext4 root (#255): dynamic /bin/busybox ls, cat, cp, mv of a file and of a tree across mounts both ways (/tmp to / and back, the source gone and cmp equal), grep, sed (-n with p, -i over an ext4 file), awk, uncompressed tar -cf onto tmpfs and -xf onto ext4 (the files equal), each run leaking exactly the pages of the files it creates, less those it frees; then sync and exit, the mutated image passes the host's e2fsck -fn, and the host's debugfs finds the changes on the disk (the sed -i edit, the extracted files equal to the host's, / holding exactly the image's names and the test's new ones, nothing under /tmp)"
 milestone = "M7"
 tests = [
     "scenario:test_alpine::test_alpine_minirootfs_coreutils",
