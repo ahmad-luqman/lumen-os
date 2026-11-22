@@ -163,15 +163,31 @@ def test_machine_appends_extra_args_last(tmp_path):
     assert "-smp" not in plain
 
 
+def dash_m(args: list[str]) -> list[str]:
+    """Every `-m` value in a command line."""
+    return [args[i + 1] for i, a in enumerate(args) if a == "-m"]
+
+
 def test_machine_memory_is_its_one_dash_m(tmp_path):
-    # (#278) A scenario asks for more RAM through `memory`: QEMU's one `-m`,
-    # never a second one appended; every other machine keeps the default.
-    args = qemu_args(Machine(Path("x.iso"), tmp_path, memory="384M").options(Path("v.fd")))
-    assert args.count("-m") == 1 and args[args.index("-m") + 1] == "384M"
+    # (#278) A scenario sets the guest's RAM through `memory`: QEMU's one
+    # `-m`, never a second one appended; every other machine keeps the default.
+    m = Machine(Path("x.iso"), tmp_path, memory="384M")
+    assert dash_m(qemu_args(m.options(Path("v.fd")))) == ["384M"]
     plain = qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
-    assert plain.count("-m") == 1 and plain[plain.index("-m") + 1] == DEFAULT_MEMORY == "256M"
-    with pytest.raises(ValueError, match="not `-m` in extra_args"):
-        Machine(Path("x.iso"), tmp_path, extra_args=["-m", "512M"])
+    assert dash_m(plain) == [DEFAULT_MEMORY] == ["256M"]
+    # A `-m` in the extra args, in any spelling QEMU takes, is refused where
+    # the command line is built (`extra_args` is a public list).
+    for spelling in (["-m", "512M"], ["--m", "512M"], ["-m=512M"], ["--m=512M"]):
+        with pytest.raises(ValueError, match="not `-m` in extra args"):
+            qemu_args(opts(extra=spelling))
+        late = Machine(Path("x.iso"), tmp_path)
+        late.extra_args += spelling
+        with pytest.raises(ValueError, match="not `-m` in extra args"):
+            qemu_args(late.options(Path("v.fd")))
+    # Options that only start with an m are not it.
+    assert dash_m(qemu_args(opts(extra=["-machine", "q35,hpet=off", "-mem-prealloc"]))) == [
+        DEFAULT_MEMORY
+    ]
 
 
 def test_trace_events_go_to_the_log_file(tmp_path):

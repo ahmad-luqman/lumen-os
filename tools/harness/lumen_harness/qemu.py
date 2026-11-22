@@ -164,9 +164,15 @@ def timeout_scale() -> float:
     return scale
 
 
-# The guest's RAM (`-m`) unless a scenario asks for more (`Machine`'s
-# `memory`, the `boot` fixture's).
+# The guest's RAM (`-m`) unless set otherwise (`Machine`'s `memory`, the
+# `boot` fixture's).
 DEFAULT_MEMORY = "256M"
+
+
+def sets_memory(arg: str) -> bool:
+    """Is `arg` QEMU's `-m` option, in any of the spellings QEMU takes
+    (`-m`, `--m`, fused with `=`)?"""
+    return arg in ("-m", "--m") or arg.startswith(("-m=", "--m="))
 
 
 @dataclass
@@ -475,6 +481,10 @@ def _serial_args(o: QemuOptions) -> list[str]:
 
 
 def qemu_args(o: QemuOptions) -> list[str]:
+    # The guest's RAM is `o.memory`, QEMU's one `-m`: a second one in
+    # `extra` would win silently.
+    if any(sets_memory(a) for a in o.extra):
+        raise ValueError("the guest's RAM goes in `memory`, not `-m` in extra args")
     args = [
         qemu_binary(),
         "-machine", "q35",
@@ -570,10 +580,8 @@ class Machine:
         self.trace_interrupts = trace_interrupts
         # Appended to the command line, e.g. ["-smp", "2"].
         self.extra_args = list(extra_args)
-        # The guest's RAM, QEMU's `-m` (e.g. "384M"): set here, never with a
-        # second `-m` in `extra_args` (QEMU would take the last one silently).
-        if "-m" in self.extra_args:
-            raise ValueError("the guest's RAM goes in `memory`, not `-m` in extra_args")
+        # The guest's RAM, QEMU's `-m` (e.g. "384M"; default `DEFAULT_MEMORY`):
+        # set here, never with a `-m` in `extra_args` (`qemu_args` refuses one).
         self.memory = memory
         # False: no serial port at all (`-serial none`: q35 then has no COM1),
         # so nothing from the guest arrives for expect() (QEMU's own messages

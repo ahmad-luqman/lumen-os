@@ -83,8 +83,8 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     lets a reset boot the machine again (no `-no-reboot`). `devices` attaches
     virtio devices (`Devices(rng=True)`, `Devices.every()`), `cpu` sets the
     CPU model (`cpu="max"`), `com1_irq` puts COM1 on another ISA IRQ
-    (`com1_irq=3`), `memory` gives the guest more RAM than `DEFAULT_MEMORY`
-    (`memory="384M"`)."""
+    (`com1_irq=3`), `memory` sets the guest's RAM (default `DEFAULT_MEMORY`,
+    e.g. `memory="384M"`)."""
     machines: list[Machine] = []
 
     def _boot(
