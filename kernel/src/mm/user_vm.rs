@@ -246,8 +246,9 @@ pub enum Sharing {
 
 /// The `FileMapping::file_id` of a file mapped from `inode`: its `lock_id`,
 /// unique among all inodes of every filesystem and fixed for its lifetime
-/// (unlike `ino`, which a detached unlink changes). `openat(O_TRUNC)` and the truncates
-/// name the file to [`AddressSpace::invalidate_file_from`] by it.
+/// (unlike `ino`, which a detached unlink changes). `truncate`,
+/// `ftruncate` and `openat(O_TRUNC)` name the file to
+/// [`AddressSpace::invalidate_file_from`] by it.
 pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
     inode.lock_id()
 }
@@ -749,20 +750,21 @@ impl AddressSpace {
     /// `align_up_page(new_size)`, in every VMA mapping it: the cache's pages
     /// released and private copies freed, in the unmap order. The VMAs stay,
     /// so a later access past the new end faults into
-    /// [`FaultResult::BusError`]. A shrinking syscall calls it once the
-    /// inode's truncate has returned, holding no VFS lock (`openat(O_TRUNC)`;
-    /// the truncates, #254): until then a page the cache dropped stays
-    /// alive, pinned by the mapping. Returns how many leaves (present or `PROT_NONE`)
-    /// were unmapped; pages never faulted in count for nothing.
+    /// [`FaultResult::BusError`]. `truncate` and `ftruncate`
+    /// (`syscall::meta`) and `openat(O_TRUNC)` (`syscall::fd`) call it once
+    /// the inode's truncate has returned, holding no VFS lock (ARCHITECTURE
+    /// section 5): a page the cache has dropped stays alive, pinned by the
+    /// mapping, until this unmaps it. Returns how many leaves (present or
+    /// `PROT_NONE`) were unmapped; pages never faulted in count for nothing.
     ///
     /// **The current process's address space only, until M8's shootdowns:**
     /// the flush is a local `invlpg`, which reaches only a space loaded on
-    /// this CPU. Another process's space, running elsewhere, could keep a
-    /// stale writable entry to a cache frame that the truncate then frees
-    /// (hard rule 2). Debug-asserted, before even the `torn_down` check:
-    /// wave 3's design for other processes' spaces (shootdowns, or holding
-    /// their pins until their CPUs flush) must replace this assertion, not
-    /// extend it.
+    /// this CPU. Called on another process's space running elsewhere, it
+    /// could leave that CPU a stale writable entry to a cache frame whose
+    /// last pin this unmap releases (hard rule 2). Debug-asserted, before
+    /// even the `torn_down` check: M8's design for other processes' spaces
+    /// (shootdowns, or holding their pins until their CPUs flush) must
+    /// replace this assertion, not extend it.
     pub fn invalidate_file_from(&self, file_id: u64, new_size: u64) -> usize {
         debug_assert_eq!(
             arch::paging::active_root(),
@@ -2494,10 +2496,11 @@ crate::ktest!(
 crate::ktest!(
     fn file_vm_store_after_a_truncate_maps_the_files_current_page() {
         // A truncate that doesn't invalidate mappings (`VfsInode::truncate`
-        // until wave 3) lets the cache drop a page a read-only leaf still
-        // maps. A store before it regrows is a bus error that drops the
-        // leaf; after it regrows, a store maps the file's current page
-        // (`MAP_SHARED`) or copies it (`MAP_PRIVATE`), not the dropped one.
+        // called directly; another process's mapping until M8) lets the cache
+        // drop a page a read-only leaf still maps. A store before it
+        // regrows is a bus error that drops the leaf; after it regrows, a
+        // store maps the file's current page (`MAP_SHARED`) or copies it
+        // (`MAP_PRIVATE`), not the dropped one.
         use crate::user::{copy_from_user, copy_to_user};
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;

@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, next_detached_ino, next_lock_id,
+    VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
 use crate::sync::{SleepMutex, SleepMutexGuard};
@@ -859,6 +859,8 @@ impl VfsInode for TmpfsInode {
         if let Some(g) = gid {
             meta.gid = g;
         }
+        // In the same hold (`VfsInode::set_owner`'s contract).
+        meta.mode = mode_after_chown(self.inode_type, meta.mode);
         meta.ctime = time::realtime_timespec();
         Ok(())
     }

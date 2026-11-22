@@ -19,7 +19,7 @@ use super::{sys_mmap, sys_mprotect, sys_msync, sys_munmap};
 use crate::linux::process::{self, KTEST_USER_LEN, KTEST_USER_VA, in_test_process};
 use crate::linux::{errno, general};
 use crate::user::{copy_from_user, copy_to_user};
-use crate::vfs::page_cache::ktest_files::FaultVolume;
+use crate::vfs::page_cache::ktest_files::Ext4Volume;
 use crate::{kassert, kassert_eq};
 
 const P: u64 = PAGE_SIZE;
@@ -129,8 +129,8 @@ fn named(fields: &str, name: &str) -> String {
 
 /// The bytes of `name` in the root of a read-only mount of what `vol`'s
 /// disk holds now (device `0:minor`), `len` of them.
-fn on_disk(vol: &FaultVolume, minor: u32, name: &str, len: usize) -> Result<Vec<u8>, &'static str> {
-    let root = vol.on_device(minor)?;
+fn on_disk(vol: &Ext4Volume, minor: u32, name: &str, len: usize) -> Result<Vec<u8>, &'static str> {
+    let root = vol.mount_device_copy_ro(minor)?;
     read(&root.lookup(name).map_err(|_| "lookup on the disk")?, 0, len)
 }
 
@@ -145,7 +145,7 @@ crate::ktest!(
         // allocates one); a second file is mapped right after the first,
         // and one range over both, starting a page below them, writes both
         // back and is `ENOMEM` for that page.
-        let vol = Arc::new(FaultVolume::new(180)?);
+        let vol = Arc::new(Ext4Volume::new(230)?);
         let mut original = pattern(3);
         let f = file(&vol.root, "shared.bin", &original)?;
         f.truncate(3 * P).map_err(|_| "truncate")?;
@@ -173,10 +173,10 @@ crate::ktest!(
             kassert!(read(&f2, 0, 3 * P as usize)? == expected);
             kassert_eq!(sys_msync(at, 4 * P, MS_ASYNC), 0);
             kassert_eq!(sys_msync(at, 4 * P, MS_INVALIDATE), 0);
-            kassert!(on_disk(&vol2, 181, "shared.bin", 3 * P as usize)? == original);
+            kassert!(on_disk(&vol2, 231, "shared.bin", 3 * P as usize)? == original);
             kassert_eq!(sys_msync(at - P, 5 * P, MS_SYNC | MS_INVALIDATE), e(errno::ENOMEM));
-            kassert!(on_disk(&vol2, 182, "shared.bin", 3 * P as usize)? == expected);
-            kassert!(on_disk(&vol2, 183, "other.bin", P as usize)? == other);
+            kassert!(on_disk(&vol2, 232, "shared.bin", 3 * P as usize)? == expected);
+            kassert!(on_disk(&vol2, 233, "other.bin", P as usize)? == other);
             kassert_eq!(sys_munmap(at, 4 * P), 0);
             Ok::<(), &'static str>(())
         })??;
@@ -205,7 +205,7 @@ crate::ktest!(
         // and a hole below it returns the writeback's `EIO`, not `ENOMEM`;
         // with them working again, it writes the stores (still dirty: the
         // page is mapped writable) and the disk holds them.
-        let vol = Arc::new(FaultVolume::new(186)?);
+        let vol = Arc::new(Ext4Volume::new(236)?);
         let f = file(&vol.root, "failing.bin", &pattern(6)[..P as usize])?;
         f.sync(false).map_err(|_| "sync")?;
         let mut expected = pattern(6)[..P as usize].to_vec();
@@ -224,7 +224,7 @@ crate::ktest!(
         })??;
         kassert_eq!(failed, e(errno::EIO));
         kassert_eq!(retried, 0);
-        kassert!(on_disk(&vol, 187, "failing.bin", P as usize)? == expected);
+        kassert!(on_disk(&vol, 237, "failing.bin", P as usize)? == expected);
         Ok(())
     }
 );
@@ -236,7 +236,7 @@ crate::ktest!(
         // bytes (an `msync(MS_SYNC)` of the range writes nothing either,
         // to the cache or the disk), and a shared mapping of the same page
         // doesn't see it.
-        let vol = FaultVolume::new(184)?;
+        let vol = Ext4Volume::new(234)?;
         let original = pattern(5);
         let f = file(&vol.root, "private.bin", &original)?;
         let mapped = Arc::clone(&f);
@@ -258,7 +258,7 @@ crate::ktest!(
             Ok::<(), &'static str>(())
         })??;
         f.sync(false).map_err(|_| "sync")?;
-        kassert!(on_disk(&vol, 185, "private.bin", original.len())? == original);
+        kassert!(on_disk(&vol, 235, "private.bin", original.len())? == original);
         Ok(())
     }
 );

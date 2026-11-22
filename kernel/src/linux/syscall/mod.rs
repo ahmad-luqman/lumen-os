@@ -29,8 +29,10 @@
 //! `at` holds what the M7 file syscalls share: their register decoders
 //! (`reg`, `FromReg`: `Fd`, `Dirfd`, `Mode`, the VFS's flag types,
 //! `UserPtr`, `u32`/`i32`/`u64`), `UserPath` (a path argument copied in),
-//! `start_dir` (the directory a path starts from, a `Dirfd` resolved) and
-//! `stat_from_metadata`/`statx_from_metadata`.
+//! `start_dir` (the directory a path starts from, a `Dirfd` resolved),
+//! `lookup` (the inode a path names, as a `*at` syscall's flags say),
+//! `stat_from_metadata`/`statx_from_metadata` and `write_stat`/`write_statx`
+//! (those structs written to user memory).
 //!
 //! An M7 syscall not implemented yet has a stub that logs once per number
 //! (as an unknown one does, with its name) and returns `-ENOSYS`.
@@ -69,8 +71,9 @@ const UIO_MAXIOV: isize = 1024;
 /// Maximum bytes transferred in one `write`/`getrandom` loop chunk (matches `shell::CHUNK`).
 const IO_CHUNK: usize = 512;
 
-/// Cap total bytes processed in a single `write`/`writev` call so one syscall
-/// cannot monopolize a CPU indefinitely.
+/// Cap total bytes processed in a single read/write-family call (`read`,
+/// `write`, `readv`, `writev`, `pread64`, `pwrite64`) so one syscall cannot
+/// monopolize a CPU indefinitely.
 const MAX_SINGLE_IO: usize = 1024 * 1024;
 
 /// Default open-file rlimit advertised by M6 `prlimit64`.

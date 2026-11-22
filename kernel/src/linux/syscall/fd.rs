@@ -28,7 +28,7 @@ use lumen_vfs::{DevId, InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsIn
 
 /// Bytes moved per step between a file and user memory: the bounce buffer,
 /// on the stack (no heap, so a run's frame count is unchanged).
-const FILE_CHUNK: usize = 4096;
+pub(super) const FILE_CHUNK: usize = 4096;
 
 /// Raw Linux x86-64 `struct pollfd` layout (8 bytes, zero padding).
 #[repr(C)]
@@ -40,7 +40,7 @@ pub(super) struct RawPollFd {
 }
 
 /// A VFS error as the positive errno a handler returns.
-fn vfs(e: VfsError) -> u32 {
+pub(super) fn vfs(e: VfsError) -> u32 {
     e.to_errno()
 }
 
@@ -49,7 +49,7 @@ fn current_io() -> ConsoleIo {
 }
 
 /// `n` bytes moved before an error: the count if any, else the error.
-fn partial(done: usize, err: u32) -> Result<u64, u32> {
+pub(super) fn partial(done: usize, err: u32) -> Result<u64, u32> {
     if done > 0 { Ok(done as u64) } else { Err(err) }
 }
 
@@ -60,6 +60,20 @@ fn offset_lock_across_read(inode: &dyn VfsInode) -> bool {
     inode.dev_id() != DevId::PROCFS
 }
 
+/// `n`, the bytes a filesystem says it moved of a `want`-byte chunk,
+/// checked: more than it was given is a filesystem bug, logged and taken as
+/// `EIO` (never passed on to the caller, nor a panic: the kernel's builds
+/// keep debug assertions on, and a user's read or write must not bring it
+/// down). Every chunk loop's (`read`'s, `write`'s, `pread64`'s,
+/// `pwrite64`'s), before it moves an offset or a count by `n`.
+pub(super) fn checked_len(n: usize, want: usize) -> Result<usize, VfsError> {
+    if n > want {
+        log::error!(target: "linux", "a filesystem reported {n} bytes moved of a {want}-byte chunk (a bug)");
+        return Err(VfsError::Io);
+    }
+    Ok(n)
+}
+
 /// Read one chunk into `kbuf` at `file`'s offset and move the offset past
 /// it: `(where it began, where it ended)`. Under the offset's lock across
 /// the `read_at` where [`offset_lock_across_read`] allows; else from a
@@ -68,12 +82,12 @@ fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError
     if offset_lock_across_read(&*file.inode) {
         let mut off = file.offset.lock();
         let pos = *off;
-        let end = pos.saturating_add(file.inode.read_at(pos, kbuf)? as u64);
+        let end = pos.saturating_add(checked_len(file.inode.read_at(pos, kbuf)?, kbuf.len())? as u64);
         *off = end;
         return Ok((pos, end));
     }
     let pos = *file.offset.lock();
-    let end = pos.saturating_add(file.inode.read_at(pos, kbuf)? as u64);
+    let end = pos.saturating_add(checked_len(file.inode.read_at(pos, kbuf)?, kbuf.len())? as u64);
     let mut off = file.offset.lock();
     if *off == pos {
         *off = end;
@@ -132,6 +146,7 @@ fn write_chunk(file: &KernelFile, chunk: &[u8]) -> Result<(u64, usize), VfsError
     } else {
         (*off, file.inode.write_at(*off, chunk)?)
     };
+    let n = checked_len(n, chunk.len())?;
     *off = pos.saturating_add(n as u64);
     Ok((pos, n))
 }
@@ -145,6 +160,21 @@ fn write_chunk(file: &KernelFile, chunk: &[u8]) -> Result<(u64, usize), VfsError
 /// appender's data land between its chunks.
 pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     let limit = count.min(MAX_SINGLE_IO as u64) as usize;
+    write_chunks_from_user(user_buf, limit, |_, chunk| write_chunk(file, chunk).map(|(_, n)| n))
+}
+
+/// The write side's chunk loop (`write`'s and `pwrite64`'s): copy up to
+/// `limit` bytes in from user memory at `user_buf`, a chunk (4 KiB) at a
+/// time into a bounce buffer on the stack, and hand each to `write(done,
+/// chunk)` (`done`: the bytes written before it), which says how many it
+/// wrote. Until all of it, a short write, a copy that faults or an error:
+/// the bytes written by then if any, else the errno. No lock is held
+/// across a copy in.
+pub(super) fn write_chunks_from_user(
+    user_buf: u64,
+    limit: usize,
+    mut write: impl FnMut(usize, &[u8]) -> Result<usize, VfsError>,
+) -> Result<u64, u32> {
     let mut kbuf = [0u8; FILE_CHUNK];
     let mut done = 0usize;
     while done < limit {
@@ -155,8 +185,8 @@ pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result
         if copy_from_user(&mut kbuf[..want], addr).is_err() {
             return partial(done, errno::EFAULT);
         }
-        let n = match write_chunk(file, &kbuf[..want]) {
-            Ok((_, n)) => n,
+        let n = match write(done, &kbuf[..want]).and_then(|n| checked_len(n, want)) {
+            Ok(n) => n,
             Err(e) => return partial(done, vfs(e)),
         };
         done += n;
@@ -214,10 +244,9 @@ pub(super) fn sys_fstat(fd: Fd, statbuf: UserPtr) -> u64 {
 
 fn fstat(fd: Fd, statbuf: UserPtr) -> Result<u64, u32> {
     let file = fd.file()?;
-    let st = at::stat_from_metadata(&file.inode.stat().map_err(vfs)?);
+    let m = file.inode.stat().map_err(vfs)?;
     drop(file);
-    // SAFETY: `general::stat` is 144 bytes with explicit `__pad0` and zero implicit padding.
-    unsafe { copy_pod_to_user(statbuf.addr(), &st) }.map_err(CopyError::to_errno)?;
+    at::write_stat(statbuf, &m)?;
     Ok(0)
 }
 
@@ -582,13 +611,13 @@ pub(super) fn ktest_user_path(slot: u64, path: &[u8]) -> Result<UserPtr, &'stati
 }
 
 #[cfg(feature = "ktest")]
-fn ktest_flags(bits: u32) -> OpenFlags {
+pub(super) fn ktest_flags(bits: u32) -> OpenFlags {
     OpenFlags::from_bits(bits)
 }
 
 /// A handler's return value as the fd it opened.
 #[cfg(feature = "ktest")]
-fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
+pub(super) fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
     if ret < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(ret)) } else { Err("the open failed") }
 }
 
@@ -761,6 +790,10 @@ crate::ktest!(
             let (st_mode, _, st_size) = ktest_stat(out)?;
             kassert_eq!(st_mode, general::S_IFREG | 0o644);
             kassert_eq!(st_size, 16);
+            // A bad buffer, or one running off the end of user memory: `-EFAULT`.
+            kassert_eq!(sys_fstat(fd, at::reg(0)), neg_errno(errno::EFAULT));
+            let edge = process::KTEST_USER_VA + process::KTEST_USER_LEN - 8;
+            kassert_eq!(sys_fstat(fd, at::reg(edge)), neg_errno(errno::EFAULT));
             // `O_APPEND` writes at the end on every write, wherever the
             // offset was put: twice, an `lseek` to 0 between.
             let app = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_APPEND), at::reg(0)))?;
