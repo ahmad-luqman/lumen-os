@@ -156,10 +156,12 @@ pub trait VfsInode: Send + Sync {
     /// write as `write_at`'s).
     ///
     /// Every filesystem with regular files must override it (ext4 and tmpfs
-    /// do). The default is for inodes without an end (devices, which ignore
-    /// the offset): `write_at(0, buf)`, at position 0.
+    /// do). The default is [`append_without_end`]: `EINVAL` for a regular
+    /// file (never a write at 0 over its first bytes), and for an inode
+    /// without an end (a device, which ignores the offset) `write_at(0,
+    /// buf)` at position 0, so the caller's offset becomes `n`.
     fn append(&self, buf: &[u8]) -> Result<(u64, usize), VfsError> {
-        self.write_at(0, buf).map(|n| (0, n))
+        append_without_end(self, buf)
     }
     fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError>;
     fn write_page(&self, page_index: u64, buf: &[u8]) -> Result<(), VfsError>;
@@ -198,6 +200,16 @@ impl fmt::Debug for dyn VfsInode {
             .field("type", &self.inode_type())
             .finish()
     }
+}
+
+/// [`VfsInode::append`]'s default: `EINVAL` for a regular file, whose
+/// filesystem must override `append`; for anything else (a device: no end,
+/// the offset ignored) `write_at(0, buf)`, reported at position 0.
+pub fn append_without_end<I: VfsInode + ?Sized>(inode: &I, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+    if inode.inode_type() == InodeType::File {
+        return Err(VfsError::Inval);
+    }
+    inode.write_at(0, buf).map(|n| (0, n))
 }
 
 /// RAII open-reference guard held by `OpenFile`, `cwd`, and `mapped_files`.
