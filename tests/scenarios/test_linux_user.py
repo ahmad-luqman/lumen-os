@@ -279,7 +279,7 @@ def test_busybox_file_syscalls(boot):
     the cwd, `read`, `close`) and of `/proc/version`, `head -c` (`read`,
     then `lseek` back), `tail -c` (`lseek` to `SEEK_END` and back), `od`
     (`readv` on a file), `uuencode` (`fstat`'s mode), `tee` (`open` with
-    `O_CREAT`, a `write` to the file) and `cat` of a missing file (ENOENT);
+    `O_TRUNC` of an existing file, a `write` to it) and `cat` of a missing file (ENOENT);
     console stdio unchanged throughout."""
     m = boot_shell(boot, devices=Devices(rng=True))
 
@@ -314,16 +314,19 @@ def test_busybox_file_syscalls(boot):
     run("linux busybox uuencode /tmp/w w", re.compile(r"^begin 640 w\r?\n", re.MULTILINE))
 
     # `tee` copies its input (a line, then Ctrl-D) to stdout and to the
-    # file it creates, which keeps a page.
+    # file, which it opens `O_TRUNC`: the longer text there before goes, and
+    # the page the file already held is all it keeps.
+    m.send_line("vfstest write /tmp/t this-text-is-longer-than-the-line-tee-writes")
+    m.expect(r"wrote 44\n", 10)
+    m.expect(r"lumen> ", 10)
     m.send_line("linux busybox tee /tmp/t")
     m.send_line("tee-line-one")
     m.expect(re.compile(r"^tee-line-one\r?\n", re.MULTILINE), 20)
     m.send("\x04")
-    m.expect(r"linux: busybox exit=0 leaked_frames=\d+\n", 20)
+    m.expect(r"linux: busybox exit=0 leaked_frames=0\n", 20)
     m.expect(r"lumen> ", 10)
     m.send_line("vfstest cat /tmp/t")
-    m.expect(re.compile(r"^tee-line-one\n", re.MULTILINE), 10)
-    m.expect(r"lumen> ", 10)
+    m.expect(re.compile(r"cat /tmp/t\r?\ntee-line-one\r?\nlumen> "), 10)
 
     m.send_line("linux busybox cat /no-such-file")
     m.expect(r"cat: can't open '/no-such-file': No such file or directory", 20)

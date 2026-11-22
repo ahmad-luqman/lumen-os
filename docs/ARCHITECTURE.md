@@ -3387,21 +3387,24 @@ Lumen runs two kinds of user code:
      `RenameFlags`/`AccessMask`, `u32`, `i32`); a size, offset or pointer
      is a whole `u64` or `UserPtr`. A handler never compares a raw register.
   2. **One dirfd resolution.** Turning a `Dirfd` into the directory a path
-     starts from is `at::start_dir(dirfd, &UserPath, allow_empty) ->
-     Result<Start, u32>` (built in #254b); every `*at` handler (and each
-     legacy shim, as `Dirfd::Cwd`) calls it once, after `UserPath::copy_in`,
-     and hands `Start::dir()` to lumen-vfs as its `start_dir`. Its contract,
-     the traps included: an absolute path is `Start::dir() == None` (the
-     global root) and the dirfd is never looked at, so a closed, negative or
+     starts from is `at::start_dir(dirfd, &UserPath) -> Result<Start, u32>`
+     (built in #254b); every `*at` handler (and each legacy shim, as
+     `Dirfd::Cwd`) calls it once, after `UserPath::copy_in`, and reaches
+     lumen-vfs's path operations only through `Start`'s wrappers
+     (`Start::open`, `Start::resolve`; wave 3 adds the others beside them).
+     `Start`'s directory is private, so no handler can hand lumen-vfs a raw
+     `start_dir` (where `None` means the global root, never the cwd). Its
+     contract, the traps included: an absolute path starts at the global
+     root and the dirfd is never looked at, so a closed, negative or
      non-directory one is no error; for a relative path, `Dirfd::Cwd` is the
-     cwd's inode, a concrete `Arc` (lumen-vfs's `start_dir: None` means the
-     global root, never the cwd; `-ENOENT` if the process has no cwd), and
-     `Dirfd::Fd` the descriptor's inode (`-EBADF` if it isn't open,
-     `-ENOTDIR` if it isn't a directory; an `O_PATH` directory is fine); an
-     empty path is `-ENOENT` unless `allow_empty` (`AT_EMPTY_PATH`), then
-     the descriptor's file itself, a directory or not (or the cwd).
-     `Start::display_path` joins a relative path to the start's own (the
-     cwd's, or the dirfd's open file's) for `/proc/<pid>/fd`.
+     cwd's inode, a concrete `Arc`, and `Dirfd::Fd` the descriptor's inode
+     (`-EBADF` if it isn't open, `-ENOTDIR` if it isn't a directory; an
+     `O_PATH` directory is fine); an empty path (which `copy_in` lets
+     through only with `AT_EMPTY_PATH`) names the descriptor's file itself,
+     a directory or not (or the cwd). `Fd::file()` is every handler's
+     descriptor lookup (`-EBADF`). `Start::display_path` joins a relative
+     path to the start's own (the cwd's, or the dirfd's open file's) for
+     `/proc/<pid>/fd`; it is lexical and doesn't follow a later rename.
   3. **Positive errnos inside, negated once.** Helpers return
      `Result<_, u32>` holding a positive errno (`errno::ENOENT`, as
      `VfsError::to_errno` gives); the handler applies `neg_errno` once, on
@@ -3462,18 +3465,30 @@ In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (matching
 `RLIMIT_NOFILE`), storing `Option<FdEntry { file: Arc<OpenFile>, cloexec: bool }>`.
 
 **Built in #254b** (`kernel/src/linux/process.rs`, `syscall/fd.rs`,
-`syscall/dir.rs`): `ProcessState` holds `fds: FdTable<Arc<OpenFile<KernelVfsLock<u64>>>>`,
-`cwd: Option<Cwd>` (an `OpenGuard` on the directory and the path it was
-set by) and `umask` (`0o022`). A process starts with fd 0 on
-`/dev/console` `O_RDONLY` and fds 1 and 2 `O_WRONLY` (each opened through
-`open_inode_guarded`, so M6's `-EBADF` for `read(1)` and `write(0)` stays)
-and `/` as its cwd, all opened before `ACTIVE_PROCS` is taken. A descriptor
+`syscall/dir.rs`): `ProcessState` holds `fds: FdTable<Arc<OpenFile<KernelVfsLock<u64>>>>`
+(private: a slot leaves it only through `close_current_fd`, a displacing
+`insert_current_fd`/`dup_current_fd` or `take_current`, which release its
+locks; `install_current_fd` and `insert_current_fd` take a fresh
+`OpenFile` by value, and `dup_current_fd` counts the slot it shares),
+`cwd: Cwd` (an `OpenGuard` on a directory and the path it was set by) and
+`umask` (`0o022`). A process starts with `Stdio`, opened by the caller
+before the process's thread is spawned: fd 0 on `/dev/console` `O_RDONLY`
+and fds 1 and 2 `O_WRONLY` (three open file descriptions, each through
+`open_inode_guarded`, so M6's `-EBADF` for `read(1)` and `write(0)` stays,
+and `FIONBIO` on one doesn't reach the others) and `/` as its cwd. If any
+can't be opened the run is refused (an `error!` line): a process never
+starts with an empty stdio slot. A descriptor
 on a terminal (`VfsInode::is_tty`: devfs's `tty` and `console`) reads and
 writes the process's `ConsoleIo` exactly as M6 did; any other reads and
 writes its inode at `OpenFile::offset` through a 4 KiB bounce buffer on the
 stack, the offset's lock (Lock 2) held across each chunk's `read_at`/
 `write_at` but never across the copy (a chunk the copy out refuses is
-given back to the offset). `close` takes the entry out under `ACTIVE_PROCS`
+given back to the offset). On procfs the offset's lock isn't held across
+`read_at` (`/proc/<pid>/maps` takes Lock 1 there): the chunk is read at a
+snapshot of the offset, which moves after only if nothing moved it
+meanwhile. An `O_APPEND` write goes through `VfsInode::append`, one chunk
+at a time (a write over 4 KiB can have another appender's data land
+between its chunks). `close` takes the entry out under `ACTIVE_PROCS`
 and, after it, releases the closing pid's POSIX record locks on the inode
 (any close) and, on the open file description's last `dec_fd_ref`, its
 `flock` locks; `take_current` does the same for every descriptor when the
@@ -3481,6 +3496,8 @@ process ends. `openat` checks for a free slot before it opens (a full
 table is `-EMFILE` before anything is created), and `getcwd` computes the
 path from the cwd's inode (`compute_cwd_path`). `chdir`, `fchdir`, `umask`
 and the other M7 numbers are still stubs (wave 3).
+
+The design #246 set out for this, and the behaviour of each rerouted call:
 Console FDs 0/1/2 become `OpenFile` entries backed by the process's `ConsoleIo`
 device node (preserving all M6 serial, framebuffer VT, and `usertest` capture
 semantics), and M6's `read` (0), `write` (1), `close` (3), `fstat` (5), `poll`
@@ -3498,7 +3515,7 @@ route through the VFS and real process working directory:
   character devices (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`)
   report `POLLIN | POLLOUT` immediately (matching Linux), while console FDs
   0/1/2, `/dev/tty`, and `/dev/console` preserve M6's readiness-driven polling
-  (`POLLOUT` immediately; `POLLIN` gated on `stdin_ready(io)` with
+  (`POLLOUT` immediately on a writable one; `POLLIN` on a readable one, gated on `stdin_ready(io)` with
   timeout-aware blocking wait).
 - **`mmap` (9):** M7 widens `sys_mmap` dispatch from M6's 4 arguments to all 6
   Linux arguments `(rdi, rsi, rdx, r10, r8 = fd, r9 = off)`.
@@ -5316,7 +5333,12 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `unlink(name)`, `rmdir(name)`, `link(name, target)`, `symlink(name,
     target)`, `readlink()`, `rename(...)`, `readdir(cursor)`, `truncate(size)`,
     `set_mode/owner/times(...)`, plus `read_page`/`write_page` feeding
-    `PageCache` and `sync()`, and `is_tty()` (default `false`; `true` for
+    `PageCache` and `sync()`, `append(buf) -> (pos, n)` (#254b: `O_APPEND`'s
+    write, the end read and the write made in one hold of the inode's
+    Lock 4, so appenders through separate open file descriptions never
+    write at the same old end; ext4 and tmpfs implement it, and any
+    filesystem with regular files must, the default being `write_at(0, ..)`
+    for devices), and `is_tty()` (default `false`; `true` for
     devfs's `tty` and `console`, answered from fixed state without
     locking): the FD layer routes a terminal's descriptor to the process's
     console (reads, writes, the tty `ioctl`s, readiness `poll`, `-ESPIPE`
@@ -5537,6 +5559,11 @@ Every lock in the VM/storage/VFS stack obeys a strict acyclic total order:
     the same way: cloned out and released before any lock 1-8)
 10. Leaf IRQ-off SpinLocks (ACTIVE_PROCS, VirtioHal::TABLE, frame, heap, sched)
 ```
+
+Lock 2 is held across a regular file's `read_at`/`write_at` (#254b), but
+not across procfs's `read_at`: `/proc/<pid>/maps` takes the address
+space's Lock 1 there, which comes first, so `read` reads procfs at a
+snapshot of the offset and moves it after, under a fresh hold.
 
 **Invariants:**
 - Never acquire any `SleepMutex` while holding any `SpinLock` (enforced by

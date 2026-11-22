@@ -51,15 +51,19 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::fd::fd_cloexec_follows_o_cloexec_and_fioclex",
     "ktest:lumen_kernel::linux::syscall::fd::fd_handlers_take_their_registers_in_order",
     "ktest:lumen_kernel::linux::syscall::at::at_start_dir_resolves_dirfd_with_its_traps",
+    "ktest:lumen_kernel::linux::syscall::fd::fd_open_relative_to_a_cwd_other_than_root",
     "ktest:lumen_kernel::vfs::procfs::procfs_fd_listing_and_targets_follow_the_fd_table",
     "scenario:test_linux_user::test_busybox_file_syscalls",
 ]
 
 [[feature]]
-name = "read/write/readv/writev/fstat/poll/ioctl/lseek on VFS files through the FD table (offsets, O_APPEND, EOF, -EISDIR, -EBADF directions, -ENOTTY off terminals, -ESPIPE on them) and getcwd from the cwd inode (-ENOENT once unlinked), with M6 console stdio unchanged (#254)"
+name = "read/write/readv/writev/fstat/poll/ioctl/lseek on VFS files through the FD table (offsets across 4 KiB chunks, a fault mid-transfer returning what moved, O_APPEND through VfsInode::append, EOF, -EISDIR, -EBADF directions, -ENOTTY off terminals, -ESPIPE on them) and getcwd from the cwd inode (-ENOENT once unlinked), with M6 console stdio unchanged (#254)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::syscall::fd::fd_read_write_readv_writev_and_fstat_on_a_file",
+    "ktest:lumen_kernel::linux::syscall::fd::fd_transfers_span_chunks_and_stop_at_a_fault",
+    "ktest:lumen_kernel::linux::syscall::fd::fd_cloexec_follows_o_cloexec_and_fioclex",
+    "ktest:lumen_kernel::vfs::tests::vfs_append_writes_at_the_end_in_one_inode_lock_hold",
     "ktest:lumen_kernel::linux::syscall::fd::fd_poll_reports_files_ready_terminals_by_direction_and_the_rest_invalid",
     "ktest:lumen_kernel::linux::syscall::fd::fd_lseek_edges",
     "ktest:lumen_kernel::linux::syscall::dir::dir_getcwd_follows_the_cwd_inode_and_fails_once_unlinked",

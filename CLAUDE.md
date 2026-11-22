@@ -369,16 +369,26 @@ one is its own PR that updates that doc first.
   `linux/exec.rs` `Exec` (#255: a binary and its `PT_INTERP` interpreter
   read and parsed once, `load` through `AddressSpace::from_images`;
   `ExecError`, each read naming its file);
-  `linux/process.rs` `ProcessState` (FD table, console bridge);
+  `linux/process.rs` `ProcessState` (#254: the private 1024-slot FD table
+  of `OpenFile`s, `install_current_fd`/`insert_current_fd`/`dup_current_fd`/
+  `close_current_fd`, close and exit releasing POSIX and `flock` locks
+  outside `ACTIVE_PROCS`; `Stdio`: fds 0/1/2 on `/dev/console` and `/` as
+  cwd, opened before a run or it is refused; `Cwd`, `umask`;
+  `open_kernel_file`; the console bridge; `in_test_process` for ktests);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern) and the
   shared copy helpers, a module per cluster holding its handlers (`fd`,
-  `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, `proc`), an M7
+  `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, `proc`; `fd`
+  holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
+  terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`), an M7
   syscall not yet implemented a stub (`not_implemented`: logged once,
-  `-ENOSYS`; each cluster's `*_m7_stubs_return_enosys` ktest), and `at.rs`
-  the file syscalls' shared parts: `reg`/`FromReg`, decoding a register into
-  a handler's parameter type (`Fd`, `Dirfd`, `Mode`, the VFS flags, `UserPtr`,
-  `u32`/`i32`: the low 32 bits), `UserPath` (a path argument copied in) and
+  `-ENOSYS`; each cluster's `*_m7_stubs_return_enosys` ktest while it has
+  stubs), and `at.rs` the file syscalls' shared parts: `reg`/`FromReg`,
+  decoding a register into a handler's parameter type (`Fd`, with `Fd::file`
+  the descriptor lookup, `Dirfd`, `Mode`, the VFS flags, `UserPtr`,
+  `u32`/`i32`: the low 32 bits), `UserPath` (a path argument copied in),
+  `start_dir` and its `Start` (the one dirfd resolution, and the only way
+  to lumen-vfs's path operations: `Start::open`, `Start::resolve`) and
   `stat_from_metadata`/`statx_from_metadata`; the handlers' rules are in
   ARCHITECTURE section 8, "Handlers".
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
