@@ -7,6 +7,12 @@ from lumen_harness import save_ktest_tap, tap
 from lumen_harness.clock_diags import check_clock_diags
 from lumen_harness.qemu import EXIT_CRASH, EXIT_FAILURE, EXIT_SUCCESS, Devices
 
+# kernel/src/ktest.rs's `FIRST`: the tests run before every other.
+KTEST_FIRST = (
+    "lumen_kernel::trace::boot_phases_recorded_in_order",
+    "lumen_kernel::trace::log_stamps_count_from_the_timelines_origin",
+)
+
 
 def boot_ktests(boot, cmdline=None):
     """The ktest machine: with other CPUs online (idle), so the per-CPU
@@ -61,6 +67,12 @@ def test_in_kernel_tests_pass(boot):
     # The other CPUs really were online while the tests ran.
     assert "INFO  smp: 4 CPUs online\n" in out, "the APs didn't come online"
     assert len(report.cases) >= 7
+    # `ktest::FIRST` runs first, whatever the link order (they read the boot
+    # CPU's trace ring back to boot, which the tests before them could wrap),
+    # and every test runs once.
+    assert [c.name for c in report.cases[:2]] == list(KTEST_FIRST), report.cases[:2]
+    names = [c.name for c in report.cases]
+    assert len(set(names)) == len(names), sorted(n for n in set(names) if names.count(n) > 1)
     # `device_vectors_are_not_fatal` raises the unused vector twice: one
     # warning, not one per interrupt.
     assert out.count("unexpected interrupt on vector 0x30") == 1, "warn-once"
@@ -149,7 +161,8 @@ def test_in_kernel_tests_pass(boot):
     # The only virtio errors are the refused frees the DMA ktests make on
     # purpose, each saying why.
     errors = re.findall(r"ERROR virtio: (.*)\n", out)
-    # (Counted, in any order: the ktests' order is the linker's.)
+    # (Counted, in any order: after `ktest::FIRST`, the ktests' order is the
+    # linker's.)
     refusals = {
         r"dma_dealloc\(0x[0-9a-f]+, 0x[0-9a-f]+, 2 pages\) refused: the run there is Dma \{ pages: 3 \}": 1,
         # Another address inside the run, and the second free.

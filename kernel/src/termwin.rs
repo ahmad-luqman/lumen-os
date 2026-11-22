@@ -514,7 +514,7 @@ fn test_shared(d: &desktop::Desktop) -> Result<(Arc<Shared>, WindowHandle), &'st
 #[cfg(feature = "ktest")]
 fn test_shell(shared: &Arc<Shared>) -> Result<sched::JoinHandle, &'static str> {
     let console = WindowConsole { shared: shared.clone() };
-    sched::spawn("ktest-term-shell", move || crate::shell::run_in_window(console, COLS)).map_err(|_| "spawn failed")
+    sched::spawn("ktest-term-sh", move || crate::shell::run_in_window(console, COLS)).map_err(|_| "spawn failed")
 }
 
 /// Hand the shell `text`'s keys, as the owner does.
@@ -666,7 +666,7 @@ crate::ktest!(
         let _close = CloseAfter(shared.clone());
         let release = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
         let r = release.clone();
-        let shell = sched::spawn("ktest-busy-shell", move || r.0.wait_until(|| r.1.load(Ordering::Acquire)))
+        let shell = sched::spawn("ktest-busy-sh", move || r.0.wait_until(|| r.1.load(Ordering::Acquire)))
             .map_err(|_| "spawn failed")?;
         let id = h.id();
         let o = shared.clone();

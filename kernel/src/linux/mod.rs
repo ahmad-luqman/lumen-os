@@ -27,6 +27,7 @@ use crate::mm::frame;
 use crate::shell::Ctx;
 use crate::term::Place;
 use crate::user::{UserExit, run_elf_process};
+use lumen_trace::ThreadName;
 
 /// Linux x86-64 `struct new_utsname` written by `uname(2)` (syscall 63).
 pub type Utsname = system::new_utsname;
@@ -218,13 +219,16 @@ enum RunError {
 }
 
 /// Load `exec` and run it in ring 3 on `io` until it ends, on a thread named
-/// `thread_name`, with its path (when it was read by path) recorded for
+/// after the file it was read from (its path's last component, cut as
+/// [`ThreadName`] cuts, as Linux names a process: `/usr/local/bin/hello`
+/// runs as `hello`), or `module_name` for a boot module, with its path
+/// (when it was read by path) recorded for
 /// `/proc/<pid>/exe`: how it ended and how many frames it leaked, counted
 /// around the load and the run (every file was read when `exec` was made,
 /// so the page cache's frames are not counted).
 fn run_exec(
     exec: &Exec,
-    thread_name: &'static str,
+    module_name: &'static str,
     argv: &[&[u8]],
     execfn: &[u8],
     io: ConsoleIo,
@@ -240,7 +244,9 @@ fn run_exec(
     let frames_before = frame::free_frames();
     let (space, prog) = exec.load(argv, &envp, execfn, random).map_err(RunError::Load)?;
     let space = Arc::new(space);
-    let exe_path = exec.exe_path().map(String::from);
+    let exe_path = exec.exe_path();
+    let thread_name = exe_path.map_or(ThreadName::new(module_name), ThreadName::from_path);
+    let exe_path = exe_path.map(String::from);
     let exit = run_elf_process(thread_name, space, prog.entry, prog.rsp, io, exe_path).map_err(RunError::Run)?;
     let frames_after = frame::free_frames();
     Ok((exit, frames_before as i64 - frames_after as i64))
@@ -278,7 +284,10 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
 
     let name = &args[0];
     // Every file, the interpreter's too, is read here, before frames are counted.
-    let (exec, thread_name) = if name.starts_with('/') {
+    // A binary read by path runs under its file's name (`run_exec`), a
+    // boot module under the module's. The path arm's `"linux"` is never
+    // used: `Exec::from_path` always records the path.
+    let (exec, module_name) = if name.starts_with('/') {
         (Exec::from_path(name), "linux")
     } else {
         let Some(module) = modules::find(name) else {
@@ -293,7 +302,7 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     };
 
     let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
-    let (exit, leaked_frames) = match run_exec(&exec, thread_name, &argv, name.as_bytes(), io) {
+    let (exit, leaked_frames) = match run_exec(&exec, module_name, &argv, name.as_bytes(), io) {
         Ok(ran) => ran,
         Err(RunError::Load(e)) => return ctx.fail(format_args!("linux: failed to load '{name}': {e}")),
         Err(RunError::Run(e)) => return ctx.fail(format_args!("linux: failed to run '{name}': {e}")),
@@ -630,36 +639,108 @@ crate::ktest!(
     }
 );
 
+/// Where the spinning test binary ([`spin_elf`]) polls: it spins until the
+/// word here is non-zero.
+#[cfg(feature = "ktest")]
+const SPIN_FLAG: u64 = 0x40_2000;
+
+/// A static binary that spins until the word at [`SPIN_FLAG`] is non-zero,
+/// then calls `exit_group(0)`.
+#[cfg(feature = "ktest")]
+fn spin_elf() -> Vec<u8> {
+    use lumen_elf::loader::{ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD};
+    let mut code = vec![0xf3, 0x90, 0x48, 0xb8]; // loop: pause; mov rax, SPIN_FLAG
+    code.extend_from_slice(&SPIN_FLAG.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x8b, 0x00, 0x48, 0x85, 0xc0, 0x74, 0xec]); // mov rax, [rax]; test; jz loop
+    code.extend_from_slice(&[0xb8, 0xe7, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, 0x0f, 0x0b]); // exit_group(0); ud2
+    crate::user::build_elf_with_phdrs(
+        ET_EXEC,
+        0x40_1000,
+        &[
+            (PT_LOAD, PF_R | PF_X, 0x1000, 0x40_1000, code.len() as u64, code.len() as u64),
+            (PT_LOAD, PF_R | PF_W, 0x2000, SPIN_FLAG, 0, 0x1000),
+        ],
+        0x2000,
+        &[(0x1000, &code)],
+    )
+}
+
+/// What `run_exec` gave back.
+#[cfg(feature = "ktest")]
+type Ran = Result<(UserExit, i64), RunError>;
+
+/// What [`run_spinning`] saw while the binary spun, and how it ended.
+#[cfg(feature = "ktest")]
+struct Spun {
+    pid: u32,
+    /// The process's recorded path (`/proc/<pid>/exe`).
+    exe_path: Option<String>,
+    /// Its thread's row in `threads`' table (thread, id, ...).
+    row: Option<Vec<lumen_shell::pipe::Value>>,
+    /// Whether the flag was set, letting it exit.
+    released: bool,
+    ran: Option<Ran>,
+}
+
+/// Run `exec` (a [`spin_elf`]) through `run_exec` with `module_name`, on a
+/// thread of its own, and while it spins read its process and its thread's
+/// `threads` row; then let it exit (whatever was seen, so the threads
+/// always end) and join it.
+#[cfg(feature = "ktest")]
+fn run_spinning(exec: Exec, module_name: &'static str, argv0: &'static str) -> Result<Spun, &'static str> {
+    use crate::linux::process::{active_pids, process_address_space, process_exe_path, process_thread_id};
+    use crate::sync::SpinLock;
+    use crate::user::copy_to_user;
+
+    let slot: Arc<SpinLock<Option<Ran>>> = Arc::new(SpinLock::new(None));
+    let out = slot.clone();
+    let runner = crate::sched::spawn("exe-route", move || {
+        let ran = run_exec(&exec, module_name, &[argv0.as_bytes()], argv0.as_bytes(), ConsoleIo::Capture);
+        *out.lock() = Some(ran);
+    })
+    .map_err(|_| "spawn")?;
+
+    let deadline = crate::time::now_ns() + 5_000_000_000;
+    let mut seen = None;
+    while seen.is_none() && crate::time::now_ns() < deadline {
+        seen = active_pids().first().map(|&pid| (pid, process_exe_path(pid), process_address_space(pid)));
+        if seen.is_none() {
+            crate::sched::yield_now();
+        }
+    }
+    let row = seen.as_ref().and_then(|&(pid, _, _)| process_thread_id(pid)).and_then(|ktid| {
+        let id = crate::shell::sysinfo::int(ktid);
+        crate::shell::sysinfo::thread_table().rows().iter().find(|r| r.get(1) == Some(&id)).cloned()
+    });
+    let released = match seen.as_ref().and_then(|(_, _, space)| space.clone()) {
+        Some(space) => {
+            let _active = crate::sched::UserSpaceGuard::enter(space);
+            copy_to_user(SPIN_FLAG, &1u64.to_le_bytes()).is_ok()
+        }
+        None => false,
+    };
+    runner.join();
+    let ran = slot.lock().take();
+    let (pid, exe_path, _) = seen.ok_or("the process never registered")?;
+    Ok(Spun { pid, exe_path, row, released, ran })
+}
+
 crate::ktest!(
     fn linux_path_route_records_exe_path() {
         // `linux /path`'s route (`Exec::from_path`, `run_exec`,
         // `run_elf_process`, `spawn_ring3_on`, `register_current`): while the
         // program runs, its process carries the path, read from the kernel
-        // side; then it exits 0.
-        use crate::linux::process::{active_pids, process_address_space, process_exe_path};
-        use crate::sync::SpinLock;
-        use crate::user::copy_to_user;
+        // side, and its thread, as `threads` lists it, is named after the
+        // path's last component (cut to 15 bytes: #276), not `run_exec`'s
+        // boot-module name; then it exits 0.
+        use crate::linux::process::process_exe_path;
+        use crate::shell::sysinfo::text;
         use crate::{kassert, kassert_eq};
-        use lumen_elf::loader::{ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD};
 
+        // 16 bytes: the thread's name keeps 15, as Linux's comm.
         const NAME: &str = "lumen-ktest-spin";
         const PATH: &str = "/tmp/lumen-ktest-spin";
-        const FLAG: u64 = 0x40_2000;
-        // Spin until the word at FLAG is non-zero, then exit_group(0).
-        let mut code = vec![0xf3, 0x90, 0x48, 0xb8]; // loop: pause; mov rax, FLAG
-        code.extend_from_slice(&FLAG.to_le_bytes());
-        code.extend_from_slice(&[0x48, 0x8b, 0x00, 0x48, 0x85, 0xc0, 0x74, 0xec]); // mov rax, [rax]; test; jz loop
-        code.extend_from_slice(&[0xb8, 0xe7, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, 0x0f, 0x0b]); // exit_group(0); ud2
-        let elf = crate::user::build_elf_with_phdrs(
-            ET_EXEC,
-            0x40_1000,
-            &[
-                (PT_LOAD, PF_R | PF_X, 0x1000, 0x40_1000, code.len() as u64, code.len() as u64),
-                (PT_LOAD, PF_R | PF_W, 0x2000, FLAG, 0, 0x1000),
-            ],
-            0x2000,
-            &[(0x1000, &code)],
-        );
+        let elf = spin_elf();
         let tmp = crate::vfs::resolve_path_from_root("/tmp").map_err(|_| "no /tmp")?;
         let file = tmp.create(NAME, 0o755).map_err(|_| "create")?;
         let written = file.write_at(0, &elf);
@@ -670,38 +751,32 @@ crate::ktest!(
         kassert_eq!(unlinked, Ok(()));
         let exec = exec.map_err(|_| "Exec::from_path failed")?;
 
-        type Ran = Result<(UserExit, i64), RunError>;
-        let slot: Arc<SpinLock<Option<Ran>>> = Arc::new(SpinLock::new(None));
-        let out = slot.clone();
-        let runner = crate::sched::spawn("exe-route", move || {
-            let ran = run_exec(&exec, "exe-route", &[PATH.as_bytes()], PATH.as_bytes(), ConsoleIo::Capture);
-            *out.lock() = Some(ran);
-        })
-        .map_err(|_| "spawn")?;
+        let spun = run_spinning(exec, "exe-route", PATH)?;
+        kassert!(spun.released);
+        kassert_eq!(spun.exe_path.as_deref(), Some(PATH));
+        let row = spun.row.ok_or("the process's thread isn't in `threads`")?;
+        kassert_eq!(row.first(), Some(&text("lumen-ktest-spi")));
+        kassert!(matches!(spun.ran, Some(Ok((UserExit::Exited(0), _)))));
+        kassert_eq!(process_exe_path(spun.pid), None);
+        Ok(())
+    }
+);
 
-        let deadline = crate::time::now_ns() + 5_000_000_000;
-        let mut seen = None;
-        while seen.is_none() && crate::time::now_ns() < deadline {
-            seen = active_pids().first().map(|&pid| (pid, process_exe_path(pid), process_address_space(pid)));
-            if seen.is_none() {
-                crate::sched::yield_now();
-            }
-        }
-        // Let it exit whatever was seen, so the threads always end.
-        let released = match seen.as_ref().and_then(|(_, _, space)| space.clone()) {
-            Some(space) => {
-                let _active = crate::sched::UserSpaceGuard::enter(space);
-                copy_to_user(FLAG, &1u64.to_le_bytes()).is_ok()
-            }
-            None => false,
-        };
-        runner.join();
-        let ran = slot.lock().take();
-        let (pid, path, _) = seen.ok_or("the process never registered")?;
-        kassert!(released);
-        kassert_eq!(path.as_deref(), Some(PATH));
-        kassert!(matches!(ran, Some(Ok((UserExit::Exited(0), _)))));
-        kassert_eq!(process_exe_path(pid), None);
+crate::ktest!(
+    fn a_boot_module_runs_under_its_module_name() {
+        // `linux <module>`'s route (`Exec::from_image`, no path): its
+        // thread, as `threads` lists it, is named `run_exec`'s module name
+        // (#276), and no path is recorded; then it exits 0.
+        use crate::shell::sysinfo::text;
+        use crate::{kassert, kassert_eq};
+
+        let exec = Exec::from_image(Cow::Owned(spin_elf())).map_err(|_| "Exec::from_image failed")?;
+        let spun = run_spinning(exec, "ktest-module", "ktest-module")?;
+        kassert!(spun.released);
+        kassert_eq!(spun.exe_path, None);
+        let row = spun.row.ok_or("the process's thread isn't in `threads`")?;
+        kassert_eq!(row.first(), Some(&text("ktest-module")));
+        kassert!(matches!(spun.ran, Some(Ok((UserExit::Exited(0), _)))));
         Ok(())
     }
 );

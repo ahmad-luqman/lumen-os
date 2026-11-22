@@ -1206,6 +1206,8 @@ MANDEL_WINDOW = re.compile(
     r"INFO  demo: mandelbrot window (\d+): (\d+) CPUs? in \d+ ms, rows by CPU:((?: cpu\d+=\d+)+)\n"
 )
 MANDEL_CLIENT = (480, 320)
+# kernel/src/demo.rs `open_mandelbrot_window`'s thread (a name keeps 15 bytes).
+MANDEL_OWNER = "desk-mandelbrot"
 
 
 def taskbar_buttons(m: Machine) -> list[str]:
@@ -1396,11 +1398,11 @@ def test_mandelbrot_window_golden(boot, artifacts, golden_dir):
         artifacts=artifacts,
     )
     assert gui.desktop_check(m) == (0, 0)
+    # Its owner thread is listed (by its whole name) until the window closes.
+    assert MANDEL_OWNER in thread_names(m)
     root = gui.node(gui.ui_tree(m), "window", "Mandelbrot")
     assert run(m, f"ui invoke {root['id']} close") == f"ui invoke: window {found[1]} closed\n"
-    gui.wait_for(
-        m, "its owner gone", lambda: thread_names(m), lambda t: "desktop-mandelbrot" not in t
-    )
+    gui.wait_for(m, "its owner gone", lambda: thread_names(m), lambda t: MANDEL_OWNER not in t)
     assert "Mandelbrot" not in taskbar_buttons(m)
 
 

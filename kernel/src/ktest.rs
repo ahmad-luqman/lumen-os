@@ -118,15 +118,38 @@ fn selected(name: &str, only: Option<&str>) -> bool {
     only.is_none_or(|prefixes| prefixes.split(',').any(|p| !p.is_empty() && name.starts_with(p)))
 }
 
+/// The tests run before every other, in this order: they read the boot
+/// CPU's trace ring back to its boot events, which the ring holds only
+/// until it has taken `trace::EVENTS` events. In link order (the linker's,
+/// changing with any change to the kernel) the tests before them once took
+/// more than that on a TCG run, and the ring wrapped before they ran. Each
+/// must be registered: a renamed one fails the run, loudly, rather than
+/// quietly losing its place.
+#[cfg(feature = "ktest")]
+const FIRST: [&str; 2] = [
+    "lumen_kernel::trace::boot_phases_recorded_in_order",
+    "lumen_kernel::trace::log_stamps_count_from_the_timelines_origin",
+];
+
+/// `all` in the order run: [`FIRST`]'s tests, then the rest in link order.
+/// Panics if one of `FIRST` isn't in `all`.
+#[cfg(feature = "ktest")]
+fn in_run_order(all: &[KTest]) -> impl Iterator<Item = &KTest> {
+    let first = FIRST.map(|name| {
+        all.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("ktest: {name} (ktest::FIRST) isn't registered"))
+    });
+    first.into_iter().chain(all.iter().filter(|t| !FIRST.contains(&t.name)))
+}
+
 /// Run every registered test, or only those `lumen.ktest=` selects (for a
 /// scenario that checks only some, so the rest don't run under conditions
-/// they don't claim to hold up in). Returns true if at least one test ran
-/// and every one that ran passed.
+/// they don't claim to hold up in), [`FIRST`]'s first. Returns true if at
+/// least one test ran and every one that ran passed.
 #[cfg(feature = "ktest")]
 pub fn run_all() -> bool {
     let only = crate::cmdline::value("lumen.ktest");
     let all = registered();
-    let tests = || all.iter().filter(move |t| selected(t.name, only));
+    let tests = || in_run_order(all).filter(move |t| selected(t.name, only));
     let count = tests().count();
     // Each line whole, under the log's line lock.
     let mut out = LockedSerial;

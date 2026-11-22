@@ -63,6 +63,7 @@ use lumen_gfx::{Damage, Mask, Rect, Surface, Target};
 use lumen_input::cursor::{SPRITE_H, SPRITE_W, draw_arrow};
 use lumen_input::{Button, Buttons, KeyAction, KeyEvent, PointerEvent, Read, Reader, Seq};
 use lumen_png::encode::Rows;
+use lumen_trace::ThreadName;
 use lumen_ui::AutomationNode;
 use lumen_wm::{
     Entry, EventQueue, Interruption, Metrics, Next, Outcome, Pointer, PointerEntry, Pushed, QueueCounts, Theme,
@@ -364,7 +365,7 @@ struct WindowInner {
     committed: Surface,
     queue: Queue,
     /// The thread that last read its events (the opener's until then).
-    owner: &'static str,
+    owner: ThreadName,
     /// Its toolkit's tree as last published ([`WindowHandle::publish`]):
     /// the root's children, and every node below it with its depth (from
     /// 1), client coordinates. Empty for a window without a toolkit.
@@ -915,7 +916,7 @@ impl Desktop {
         // theme's colour now. A switch before the lock is fixed by the
         // first `Theme` the owner gets, whatever it says.
         committed.fill(theme().client);
-        let owner = crate::sched::running_here().map_or("boot", |(_, name)| name);
+        let owner = crate::sched::running_here().map_or(ThreadName::new("boot"), |(_, name)| name);
         let mut after = After::default();
         let win = {
             let mut g = self.home.lock();
@@ -2753,7 +2754,7 @@ struct WindowRow {
     z: usize,
     focused: bool,
     minimized: bool,
-    owner: &'static str,
+    owner: ThreadName,
     lost: u64,
     keys: u64,
 }
@@ -2814,7 +2815,7 @@ pub fn windows_table() -> Result<pipe::Table, String> {
             int(r.z as u64),
             yes(r.focused),
             yes(r.minimized),
-            text(r.owner),
+            text(r.owner.as_str()),
             int(r.lost),
             int(r.keys),
         ]);
