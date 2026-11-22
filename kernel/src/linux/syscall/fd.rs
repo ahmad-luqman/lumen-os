@@ -21,6 +21,7 @@ use super::{
 };
 use crate::linux::process::{self, ConsoleIo, FileRef, KernelFile, with_current, with_current_mut};
 use crate::linux::{errno, general, ioctl};
+use crate::mm::user_vm::file_id_of;
 use crate::sched;
 use crate::user::{CopyError, copy_from_user, copy_to_user};
 use lumen_vfs::{DevId, InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsInode, VfsLock};
@@ -502,6 +503,16 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     let start = at::start_dir(dirfd, &path)?;
     let opened = start.open(&path, flags, mode)?;
     let mut file = OpenFile::from_opened(opened).map_err(vfs)?;
+    if flags.has_trunc() && file.inode.inode_type() == InodeType::File {
+        // The open truncated the file to 0 (Lock 4, released): unmap the
+        // caller's pages of it, as `truncate` does (ARCHITECTURE section 5),
+        // so a later access is a bus error, not the old bytes or a store
+        // to a page the cache let go. The caller's address space only,
+        // until M8 (#255).
+        if let Some(space) = sched::current_address_space() {
+            space.invalidate_file_from(file_id_of(&*file.inode), 0);
+        }
+    }
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
     }
