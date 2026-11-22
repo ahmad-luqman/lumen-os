@@ -77,7 +77,7 @@ tests = [
 ]
 
 [[feature]]
-name = "chmod/fchmod/fchmodat/fchmodat2 (07777 only, -EOPNOTSUPP on a symlink with AT_SYMLINK_NOFOLLOW), chown/fchown/lchown/fchownat (-1 unchanged, setuid and group-exec setgid dropped on non-directories), umask (& 0o777, applied by openat O_CREAT), utimensat (NULL times, UTIME_NOW/UTIME_OMIT, NULL path as futimens, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, -EINVAL nsec) and truncate/ftruncate (tail zeroed, mtime/ctime, the caller's mapped pages past the new end unmapped; -EINVAL, -EISDIR, -EBADF, -EFBIG, -EROFS) (#254)"
+name = "chmod/fchmod/fchmodat/fchmodat2 (07777 only, -EOPNOTSUPP on a symlink with AT_SYMLINK_NOFOLLOW), chown/fchown/lchown/fchownat (-1 unchanged, setuid and group-exec setgid dropped on non-directories in the same set_owner write, a failed chown changing nothing), umask (& 0o777, applied by openat O_CREAT), utimensat (NULL times, UTIME_NOW/UTIME_OMIT, NULL path as futimens, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, -EINVAL nsec) and truncate/ftruncate (tail zeroed, mtime/ctime, the caller's mapped pages past the new end unmapped; -EINVAL, -EISDIR, -EBADF, -EFBIG, -EROFS) (#254)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chmod_family_sets_the_permission_and_special_bits",
@@ -87,5 +87,7 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_resizes_zeroing_the_tail_and_updates_mtime_and_ctime",
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_errnos",
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_shrink_unmaps_mapped_pages_past_the_new_end",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chown_on_ext4_drops_set_id_bits_in_its_one_write_and_a_failed_one_changes_nothing",
+    "cargo:lumen-vfs",
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_handlers_take_their_registers_in_order",
 ]

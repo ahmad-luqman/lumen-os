@@ -639,7 +639,7 @@ read, then the page and its rights, or the level that is not present. It
 takes no locks; a table outside HHDM-mapped RAM ends the walk instead of
 being read, and if the walk itself faults the report still ends properly.
 
-### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, its core built in #255 (the in-kernel API: `AddressSpace::mmap_file`, the fault paths, `invalidate_file_from`; the `mmap(fd)` syscall, `msync` and `ftruncate`'s call come next), M7; CoW `fork` and shootdowns in M8)
+### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, its core built in #255 (the in-kernel API: `AddressSpace::mmap_file`, the fault paths, `invalidate_file_from`; `truncate`/`ftruncate` call `invalidate_file_from` since #254's `meta` cluster; the `mmap(fd)` syscall and `msync` come next), M7; CoW `fork` and shootdowns in M8)
 
 Each user process owns an `AddressSpace` protected by a **sleeping,
 interrupt-enabled `SleepMutex`** (not an IRQ-off `SpinLock`—needed both for
@@ -861,21 +861,25 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - **Truncate shrink invalidation (`ftruncate`, `truncate`, `openat(O_TRUNC)`):**
       `AddressSpace::invalidate_file_from(file_id, new_size)` (built in
       #255; `truncate` and `ftruncate` call it, `syscall/meta.rs`, #254;
-      `openat(O_TRUNC)` doesn't yet);
-      once the inode's truncate has returned (Lock 4 released; Lock 1 and
-      Lock 4 are never nested), the syscall unmaps all file-VMA PTEs covering
+      `openat(O_TRUNC)` doesn't yet: #289);
+      once the inode's truncate has returned, having dropped the `PageCache`
+      entries `>= new_size.div_ceil(4096)` under Lock 4, the syscall takes
+      Lock 1 and unmaps all file-VMA PTEs covering
       `file_off >= align_up_page(new_size)` (in the unmap order above:
       per leaf, propagating `PTE_DIRTY`, issuing `invlpg` and freeing a
       private CoW frame; once the walk is done, dropping the range's
-      `WritableMap`s and `pinned_pages` entries)
-      alongside dropping `PageCache` entries
-      `>= new_size.div_ceil(4096)`. `invalidate_file_from` works only on
+      `WritableMap`s and `pinned_pages` entries). The truncate syscall never
+      holds Lock 1 and Lock 4 together (the fault path does, Lock 1 then
+      Lock 4, through `mmap_page`); a dropped page stays alive, pinned by its
+      mapping, until the unmap. `invalidate_file_from` works only on
       the address space loaded on the calling CPU (debug-asserted: the flush is a
-      local `invlpg`) until M8's shootdowns. Subsequent accesses fault into `BusError` /
-      `SIGBUS`, and later file growth can never split-brain against stale
-      mapped frames. (In M8, multi-process mappings snapshot active
-      `Weak<AddressSpace>` holders outside the inode lock and invalidate each in
-      Lock 1 → Lock 4 order.)
+      local `invlpg`) until M8's shootdowns. Subsequent accesses in the
+      caller's space fault into `BusError` / `SIGBUS`, so its later file
+      growth can't split-brain against stale mapped frames; another process's
+      mappings, and the caller's after `O_TRUNC` (#289), still can until those
+      land. (In M8, multi-process mappings snapshot active
+      `Weak<AddressSpace>` holders outside the inode lock and invalidate each
+      after the truncate, as the caller's own space is.)
     - `msync(addr, len, flags)` (syscall 26) returns `0` immediately on
       `len == 0` (after validating page-aligned `addr` and valid `flags`),
       succeeds as a no-op on `MAP_PRIVATE`/anonymous VMAs, and for `MAP_SHARED`
@@ -3534,8 +3538,9 @@ and, after it, releases the closing pid's POSIX record locks on the inode
 `flock` locks; `take_current` does the same for every descriptor when the
 process ends. `openat` checks for a free slot before it opens (a full
 table is `-EMFILE` before anything is created), and `getcwd` computes the
-path from the cwd's inode (`compute_cwd_path`). `chdir`, `fchdir`, `umask`
-and the other M7 numbers are still stubs (wave 3).
+path from the cwd's inode (`compute_cwd_path`). `umask` sets the mask
+(`syscall/meta.rs`); `chdir`, `fchdir` and the other M7 numbers not yet
+implemented are stubs (wave 3).
 
 The design #246 set out for this, and the behaviour of each rerouted call:
 Console FDs 0/1/2 become `OpenFile` entries backed by the process's `ConsoleIo`
@@ -3580,8 +3585,8 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; `-EBADF` on `O_PATH`; independent of `fcntl` POSIX locks); atomic upgrade/downgrade on same `OpenFileId`, `-EWOULDBLOCK` on conflict with `LOCK_NB`, released when last FD to the `OpenFile` closes |
 | 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs (and detached unlinked inodes as a no-op), `-EBADF` on `O_PATH`, and `-EINVAL` on non-syncable special devices (console/tty, `/dev/*`) |
 | 75 | `fdatasync(fd)` | flushes file data pages and size-changing metadata through `BlockCache` + `BlockDevice::flush()` (same `-EBADF`/`-EINVAL` rules as `fsync`) |
-| 76 | `truncate(path, len)` | resolves `path` (following symlinks), validates `len >= 0` (`-EINVAL`), writable regular file (`-EISDIR`/`-EACCES`/`-EROFS`), resizes via `ftruncate` logic |
-| 77 | `ftruncate(fd, len)` | validates `fd` open for writing and regular file (`-EBADF` if closed or `O_PATH`, `-EINVAL` if `O_RDONLY`, `len < 0`, or not regular, `-EROFS` on read-only fs); invalidates active mapped PTEs past `align_up_page(len)` (section 5), zeroes partial final page tail when `len % 4096 != 0` on shrink (or old tail on grow), drops cached pages past `len.div_ceil(4096)`, updates `st_size` and `mtime`/`ctime` |
+| 76 | `truncate(path, len)` | validates `len >= 0` (`-EINVAL`) before resolving `path` (following symlinks); a directory `-EISDIR`, any other non-regular file `-EINVAL`, a read-only mount `-EROFS`; then resizes as `ftruncate` does |
+| 77 | `ftruncate(fd, len)` | validates `len >= 0` and `fd` open for writing on a regular file (`-EINVAL` for `len < 0` first, `-EBADF` if closed or `O_PATH`, `-EINVAL` if not open for writing or not regular, `-EROFS` on a read-only mount, `-EFBIG` past the filesystem's largest file); the inode's truncate zeroes the partial final page's tail when `len % 4096 != 0` on shrink (or the old tail on grow), drops cached pages past `len.div_ceil(4096)` and updates `st_size` and `mtime`/`ctime`; then `invalidate_file_from` unmaps the caller's mapped PTEs past `align_up_page(len)` (section 5; the caller's space only until M8) |
 | 79 | `getcwd(buf, size)` | returns canonical NUL-terminated path of the process's current working directory (computed/maintained across ancestor `rename`, length including NUL, `-ERANGE` if `size` too small, `-ENOENT` if cwd was unlinked / `st_nlink == 0`) |
 | 80 | `chdir(path)` | resolves `path` (following symlinks), requires directory (`-ENOTDIR`), updates process `cwd` inode and path (extracting and dropping the old `Arc<VfsInode>` outside `ACTIVE_PROCS`) |
 | 81 | `fchdir(fd)` | validates `fd` refers to an open directory (`-ENOTDIR`/`-EBADF`; `O_PATH` dirs allowed), updates process `cwd` |
@@ -3593,16 +3598,16 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 88 | `symlink(target, linkpath)` | shim to `symlinkat(target, AT_FDCWD, linkpath)` |
 | 89 | `readlink(path, buf, bufsiz)` | shim to `readlinkat(AT_FDCWD, path, buf, bufsiz)` |
 | 90 | `chmod(path, mode)` | shim to `fchmodat(AT_FDCWD, path, mode)` |
-| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs) |
+| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs; on `devfs` nodes too, which Linux's devtmpfs allows, as for `chown` and `utimensat`) |
 | 92 | `chown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, 0)` |
-| 93 | `fchown(fd, uid, gid)` | updates `uid`/`gid` (`u32::MAX` = leave unchanged) and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs) |
+| 93 | `fchown(fd, uid, gid)` | updates `uid`/`gid` (`u32::MAX` = leave unchanged) and `ctime` on open `fd`'s inode, dropping setuid (and setgid with group-execute) on a non-directory in the same `set_owner` (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs) |
 | 94 | `lchown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)` |
 | 95 | `umask(mask)` | atomically sets per-process `umask = mask & 0o777` (default `0o022`) and returns previous mask |
 | 162 | `sync()` | snapshots mounted filesystems and cached inodes (never holding `MountTable`/`InodeCache` across I/O), flushes every dirty `PageCache` page and `BlockCache` block followed by `BlockDevice::flush()`; always returns `0` |
 | 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor`; returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
 | 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on char devices—including on read-only `devfs`—`-EISDIR` on dirs, `-EROFS` on regular files on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on final symlink without trailing `/` unless `O_PATH` is also set; trailing `/` forces directory traversal even with `O_NOFOLLOW`, matching Linux), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
 | 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o7777) & !umask`, stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
-| 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`) |
+| 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`); drops setuid (and setgid with group-execute) on a non-directory, as `fchown` |
 | 262 | `newfstatat(dirfd, path, buf, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; writes 144-byte Linux x86-64 `struct stat` with unique `(st_dev, st_ino)` per filesystem/inode |
 | 263 | `unlinkat(dirfd, path, flags)` | `flags == 0`: unlinks non-directory (`-EISDIR` on dir, `-ENOTDIR` on trailing `/`), handling open-unlinked inodes cleanly (section 9); `flags == AT_REMOVEDIR`: removes empty directory (`-ENOTEMPTY`, `-EINVAL` for `.`, `-EBUSY` for mount point); unknown flags `-EINVAL` |
 | 264 | `renameat(olddirfd, old, newdirfd, new)` | shim to `renameat2(olddirfd, old, newdirfd, new, 0)` |
@@ -3611,7 +3616,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 267 | `readlinkat(dirfd, path, buf, bufsiz)` | does not follow final symlink (`-EINVAL` if target is not a symlink or `bufsiz <= 0`); accepts empty `path == ""` on an `O_PATH` symlink `dirfd`; copies `min(target.len(), bufsiz)` bytes **without** trailing NUL and returns bytes copied |
 | 268 | `fchmodat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`, which `musl` leaves uninitialized); follows symlinks and updates mode bits and `ctime` (`-EROFS` on read-only fs) |
 | 269 | `faccessat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`); shim to `faccessat2(dirfd, path, mode, 0)` |
-| 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`), `AT_SYMLINK_NOFOLLOW`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`), rejecting invalid `tv_nsec >= 1_000_000_000` with `-EINVAL` |
+| 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`: any flag `-EINVAL`, an `O_PATH` or closed fd `-EBADF`; with `AT_FDCWD`, `-EFAULT`), `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`; both omitted returns `0` before the path or fd is looked at); an invalid `tv_nsec` (negative, or `>= 1_000_000_000`, and not a sentinel) is `-EINVAL`, checked after the lookup and before `-EROFS` |
 | 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); same-inode `rename(a, a)` is a no-op (`0`, or `-EEXIST` with `RENAME_NOREPLACE`); handles open-unlinked file and empty-dir target overwrite via the same detach/orphan path as `unlink`/`rmdir` (section 9); rejects unknown flags or both together (`-EINVAL`), cross-mount (`-EXDEV`), mountpoint overwrite (`-EBUSY`), dir-over-non-dir or trailing `/` on non-dir (`-ENOTDIR`), non-dir-over-dir (`-EISDIR`), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
 | 332 | `statx(dirfd, path, flags, mask, buf)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `AT_NO_AUTOMOUNT`, and `AT_STATX_SYNC_TYPE` (`AS_STAT`/`FORCE_SYNC`/`DONT_SYNC`); fills `struct statx` (`stx_mask`, `stx_blksize`, `stx_nlink`, `stx_uid`, `stx_gid`, `stx_mode`, `stx_ino`, `stx_size`, `stx_blocks`, timestamps, `stx_rdev_*`, `stx_dev_*`) |
 | 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`; checks existence and permission bits (`F_OK \| R_OK \| W_OK \| X_OK`; root `uid == 0` satisfies `R_OK`/`W_OK` on writable fs and on `S_ISCHR` device nodes on `devfs`, and `X_OK` if any execute bit is set on regular files or always on dirs) |
@@ -5063,14 +5068,18 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   recording it in the inode leaks that block (its free is crate-private):
   `e2fsck` reclaims it.
 - **Truncate & extend interaction:**
-  - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`):
-    the inode's `truncate` (Lock 4) and, after it returns, the caller's
-    `AddressSpace::invalidate_file_from` (Lock 1; never nested with Lock 4,
-    the caller's space only until M8, and not yet on `O_TRUNC`) unmap
-    all file-VMA PTEs covering `file_off >= align_up_page(new_size)` (section
-    5), zero `[new_size % 4096 .. 4096)` of `page_index = new_size / 4096`
-    and mark it dirty **only when `new_size % 4096 != 0`**, and drop all
-    cached pages with `page_index >= new_size.div_ceil(4096)`.
+  - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`),
+    in this order:
+    1. the inode's `truncate`, under Lock 4: zeroes
+       `[new_size % 4096 .. 4096)` of `page_index = new_size / 4096` and marks
+       it dirty **only when `new_size % 4096 != 0`**, drops all cached pages
+       with `page_index >= new_size.div_ceil(4096)`, and sets the size;
+    2. once it has returned, the caller's
+       `AddressSpace::invalidate_file_from`, under Lock 1, unmaps all
+       file-VMA PTEs covering `file_off >= align_up_page(new_size)` (section
+       5). The truncate syscall never holds both locks. This reaches the
+       caller's space only until M8, and doesn't yet run after `O_TRUNC`
+       (#289).
   - Extending a file (`ftruncate` grow or `write`/`pwrite64` past `old_size`):
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
     `PageCache`, zeroes `[old_size % 4096 .. 4096)` before exposing the new
@@ -5105,9 +5114,9 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     to pages past the new size and stops counting them, even if a mapping
     still holds one. The page stays alive, pinned by that mapping, until
     section 5's truncate invalidation, run by the shrinking syscall once
-    the truncate has returned (Lock 1 and Lock 4 never nested), unmaps it:
-    in the caller's own address space only until M8, and not yet after
-    `O_TRUNC`.
+    the truncate has returned (the syscall never holding Lock 1 and Lock 4
+    together), unmaps it: in the caller's own address space only until M8,
+    and not yet after `O_TRUNC` (#289).
   - *Other inodes:* `NoDev` for directories, symlinks, and every inode of
     another filesystem (`devfs`, `procfs`); `NoEnt` for an `ext4` inode
     unlinked and not open.
@@ -5116,9 +5125,14 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     caller may hold Lock 1 (`AddressSpace::inner`) or Lock 2, nothing
     numbered 3 or higher, and no `SpinLock`. It neither dirties the page nor
     counts a mapping: a writable fault does both through
-    `MappedPage::map_writable` (below). `file_size` is a snapshot; a fault
-    holding Lock 1 across the call and the mapping can rely on it, since a
-    shrink takes Lock 1 first to invalidate mappings.
+    `MappedPage::map_writable` (below). `file_size` is a snapshot, which a
+    truncate may make stale even while the fault holds Lock 1 (the truncate
+    takes Lock 4 alone). A page mapped from a stale snapshot is still
+    unmapped: the shrinking syscall's `invalidate_file_from` takes Lock 1
+    after the truncate, so it runs after that fault's mapping is in place.
+    This holds for the caller's own space only until M8, and not after
+    `O_TRUNC` (#289). A private copy-on-write copy of the end page made from
+    a stale snapshot can keep bytes past the new end.
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
     Option<&dyn Any>`, a default trait method returning `None`, overridden
     by `Ext4Inode` and `TmpfsInode` to return themselves; `mmap_page`
@@ -5392,7 +5406,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     metadata lock): `stat()`, `lookup(name)`, `create(...)`, `mkdir(...)`,
     `unlink(name)`, `rmdir(name)`, `link(name, target)`, `symlink(name,
     target)`, `readlink()`, `rename(...)`, `readdir(cursor)`, `truncate(size)`,
-    `set_mode/owner/times(...)`, plus `read_page`/`write_page` feeding
+    `set_mode/owner/times(...)` (`set_owner` also leaves the mode
+    `lumen_vfs::mode_after_chown` gives: setuid dropped on a non-directory,
+    setgid too with group-execute, in the same metadata-lock hold and
+    inode write, #254), plus `read_page`/`write_page` feeding
     `PageCache` and `sync()`, `append(buf) -> (pos, n)` (#254b: `O_APPEND`'s
     write, the end read and the write made in one hold of the inode's
     Lock 4, so appenders through separate open file descriptions never

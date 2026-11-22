@@ -471,11 +471,15 @@ impl MappedPage {
     /// The file's size when the page was looked up (under the inode's Lock
     /// 4). The page starts below it; the page's bytes past it are zero
     /// unless a mapping stored there. A snapshot: a truncate may change the
-    /// size once Lock 4 is released. A shrink takes `AddressSpace::inner`
-    /// (Lock 1) before Lock 4 to invalidate mappings (ARCHITECTURE section
-    /// 5), so a fault holding Lock 1 across the call and the mapping can
-    /// rely on it; one that doesn't must look again. (The fault path needs
-    /// only [`valid_len`](Self::valid_len), through `copy_to_frame`.)
+    /// size once Lock 4 is released, even while the fault holds
+    /// `AddressSpace::inner` (Lock 1), since the truncate takes Lock 4 alone.
+    /// A page mapped from a stale snapshot is unmapped all the same: the
+    /// shrinking syscall's `invalidate_file_from` takes Lock 1 after the
+    /// truncate, so after that mapping (ARCHITECTURE section 5); in the
+    /// caller's own space only until M8, and not after `O_TRUNC` (#289). A
+    /// private copy-on-write copy of the end page made from a stale snapshot
+    /// can keep bytes past the new end. (The fault path needs only
+    /// [`valid_len`](Self::valid_len), through `copy_to_frame`.)
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests' check of the snapshot
     pub(crate) fn file_size(&self) -> u64 {
         self.file_size
@@ -543,9 +547,9 @@ impl Drop for WritableMap {
 ///   the pages past the new size and stops counting them, even one a
 ///   mapping still holds. The page stays alive, pinned by that mapping,
 ///   until ARCHITECTURE section 5's truncate invalidation, which the
-///   shrinking syscall runs once the truncate has returned (Lock 1 and
-///   Lock 4 never nested), unmaps it in the same syscall: in the caller's
-///   own address space only until M8, and not yet after `O_TRUNC`.
+///   shrinking syscall runs once the truncate has returned (the syscall
+///   never holds Lock 1 and Lock 4 together), unmaps it: in the caller's
+///   own address space only until M8, and not yet after `O_TRUNC` (#289).
 /// - **Other inodes:** `NoDev` for anything but a regular file of `ext4`
 ///   or `tmpfs` (directories, symlinks, `devfs`, `procfs`). `NoEnt` for an
 ///   `ext4` inode unlinked and not open, as `read_at` says.
