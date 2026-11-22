@@ -75,3 +75,26 @@ tests = [
     "scenario:test_linux_user::test_static_busybox_ash",
     "scenario:test_linux_user::test_syscall_bad_pointers_return_efault",
 ]
+
+[[feature]]
+name = "mmap of a file descriptor and msync (#255): MAP_SHARED stores reaching the file, and the disk through msync(MS_SYNC) (MS_ASYNC accepted, writing nothing; MS_INVALIDATE accepted), on ext4 and tmpfs; MAP_PRIVATE copy-on-write through a read-only descriptor leaving the file alone; a mapping outliving close and unlink; Linux's errnos (EBADF for a bad or O_PATH descriptor; EINVAL for an unaligned offset, no length, MAP_HUGETLB or a bad map type; ENOMEM and EOVERFLOW for lengths past 2^64; EOPNOTSUPP for MAP_SHARED_VALIDATE with unknown flags or MAP_SYNC; EACCES for a descriptor not open for reading and for shared PROT_WRITE, mmap or mprotect, without O_RDWR; ENODEV for a directory, the console and /dev/null; EEXIST for MAP_FIXED_NOREPLACE over a mapping); /dev/zero as anonymous memory; msync's EINVAL and ENOMEM (unmapped parts) and 0 for empty and anonymous ranges; the anonymous path unchanged"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_shared_fd_stores_reach_the_file_through_msync",
+    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_private_fd_copies_on_write_and_leaves_the_file_alone",
+    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_fd_outlives_close_and_unlink",
+    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_fd_refuses_with_linuxs_errnos",
+    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_dev_zero_is_anonymous_memory",
+    "ktest:lumen_kernel::linux::syscall::mem::mem_msync_checks_its_arguments_and_the_range",
+    "scenario:test_linux_user::test_static_busybox_ash",
+]
+
+[[feature]]
+name = "/proc/<pid>/maps names files (#255): a file mapping's line shows the file's device (major:minor in hex), inode number and path, ' (deleted)' once unlinked, a newline in the path as \\012; an executable loaded from a file names its segments' lines after it at their file offsets, its .bss past the file's bytes anonymous; names ([heap], [stack], paths) at column 73 as Linux pads them"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vm",
+    "ktest:lumen_kernel::linux::syscall::mem::mem_proc_maps_names_mapped_files_and_the_executable",
+    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_fd_outlives_close_and_unlink",
+    "ktest:lumen_kernel::vfs::tests::vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing",
+]

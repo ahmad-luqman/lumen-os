@@ -17,7 +17,7 @@ use lumen_elf::loader::{ElfLoadError, LoadedElf, MappedRange, PageAction, Perm};
 use lumen_elf::stack::{AuxvInfo, InitialStack, StackBuildError, build_initial_stack};
 use lumen_mm::paging::{Attrs, MapError, WalkEnd};
 use lumen_mm::{FRAME_SIZE, PhysFrame, VirtAddr};
-use lumen_vfs::{OpenGuard, VfsError, VfsInode};
+use lumen_vfs::{DevId, Ino, OpenGuard, VfsError, VfsInode};
 use lumen_vm::{
     Backing, Brk, FileMapping, MMAP_TOP, MapPlace, PAGE_SIZE, Prot, USER_MAX, USER_MIN, USER_STACK_TOP, VmError, Vma,
     VmaMap,
@@ -206,7 +206,12 @@ struct AddressSpaceInner {
     /// piece of one split by `mprotect` or `munmap`) references it, so
     /// closing the descriptor after `mmap` keeps the mapping valid. Entries
     /// removed are dropped only after `inner` is released.
-    mapped_files: BTreeMap<u64, OpenGuard>,
+    mapped_files: BTreeMap<u64, MappedFile>,
+    /// The ELF images' file-backed parts, loaded by copying into anonymous
+    /// VMAs, as `/proc/<pid>/maps` names them ([`Self::name_image`]):
+    /// trimmed wherever their VMAs are unmapped or replaced, so a later
+    /// mapping in their place isn't named after them.
+    images: Vec<ImageRange>,
     /// The cache page under every `PTE_SHARED` leaf (present or
     /// `PTE_PROTNONE`), keyed by its page-aligned user address: the pin that
     /// keeps the page cached, and its frame allocated, while the PTE maps
@@ -226,7 +231,6 @@ struct AddressSpaceInner {
 /// How a file mapping shares its pages (`mmap(2)`'s `MAP_SHARED` or
 /// `MAP_PRIVATE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: mmap(fd) (#255, wave 3)
 pub enum Sharing {
     /// `MAP_PRIVATE`: copy-on-write; may always be made writable.
     Private,
@@ -240,9 +244,90 @@ pub enum Sharing {
 /// unique among all inodes of every filesystem and fixed for its lifetime
 /// (unlike `ino`, which a detached unlink changes). Wave 3's `ftruncate`
 /// names the file to [`AddressSpace::invalidate_file_from`] by it.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: mmap(fd), ftruncate (#255)
 pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
     inode.lock_id()
+}
+
+/// A file an address space maps: the open reference that keeps it (and
+/// the mapping) valid after its descriptor is closed and its name
+/// unlinked, and the path it was opened by, which `/proc/<pid>/maps`
+/// shows (Linux's `d_path` of the mapping's file: a later rename isn't
+/// seen; an unlink is, as ` (deleted)`).
+#[derive(Clone)]
+pub struct MappedFile {
+    pub guard: OpenGuard,
+    pub path: Arc<str>,
+}
+
+/// A file as `/proc/<pid>/maps` names an ELF image's lines: its device,
+/// inode number and path when it was loaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageFile {
+    pub dev: DevId,
+    pub ino: Ino,
+    pub path: Arc<str>,
+}
+
+impl ImageFile {
+    /// `inode`, read from `path`, as its maps lines name it.
+    pub fn of(inode: &dyn VfsInode, path: &str) -> Self {
+        Self { dev: inode.dev_id(), ino: inode.ino(), path: Arc::from(path) }
+    }
+}
+
+/// Part of an ELF image's file copied into anonymous VMAs: `[start, end)`
+/// holds the file's bytes from `offset`.
+#[derive(Clone, Debug)]
+struct ImageRange {
+    start: u64,
+    end: u64,
+    offset: u64,
+    file: Arc<ImageFile>,
+}
+
+/// `ranges` less `[start, end)`: a range overlapping it is cut back, or
+/// split in two around it, its offset following its start.
+fn trim_images(ranges: &mut Vec<ImageRange>, start: u64, end: u64) {
+    let mut kept = Vec::with_capacity(ranges.len() + 1);
+    for r in ranges.drain(..) {
+        if r.end <= start || r.start >= end {
+            kept.push(r);
+            continue;
+        }
+        if r.start < start {
+            kept.push(ImageRange { end: start, ..r.clone() });
+        }
+        if r.end > end {
+            kept.push(ImageRange { start: end, offset: r.offset + (end - r.start), ..r });
+        }
+    }
+    *ranges = kept;
+}
+
+/// Where `mmap(2)`'s `flags` and `hint` place a new mapping:
+/// `MAP_FIXED_NOREPLACE` before `MAP_FIXED` (Linux sets both for the
+/// former), else `hint` as a hint (0: none). The anonymous and file paths
+/// place alike through this.
+pub fn map_place(hint: u64, flags: u64) -> MapPlace {
+    if (flags & u64::from(general::MAP_FIXED_NOREPLACE)) != 0 {
+        MapPlace::FixedNoReplace(hint)
+    } else if (flags & u64::from(general::MAP_FIXED)) != 0 {
+        MapPlace::Fixed(hint)
+    } else {
+        MapPlace::Hint((hint != 0).then_some(hint))
+    }
+}
+
+/// What `msync(MS_SYNC)` must write back over a range, found under the
+/// address space's lock and used after it is released
+/// ([`AddressSpace::msync_files`]).
+pub struct MsyncFiles {
+    /// An open reference on each file a `MAP_SHARED` VMA in the range maps,
+    /// once each.
+    pub shared: Vec<OpenGuard>,
+    /// Whether part of the range is mapped by no VMA (`ENOMEM`, after the
+    /// mapped parts are written back, as Linux).
+    pub hole: bool,
 }
 
 /// Remove every entry of `map` keyed in `[start, end)` (dropping it), with
@@ -276,6 +361,7 @@ impl AddressSpace {
                 brk,
                 torn_down: false,
                 mapped_files: BTreeMap::new(),
+                images: Vec::new(),
                 pinned_pages: BTreeMap::new(),
                 writable_maps: BTreeMap::new(),
                 fault_warned: None,
@@ -540,13 +626,7 @@ impl AddressSpace {
         if share_bits != priv_flag && share_bits != shared_flag {
             return Err(UserVmError::InvalidArg);
         }
-        let place = if (flags & u64::from(general::MAP_FIXED_NOREPLACE)) != 0 {
-            MapPlace::FixedNoReplace(hint)
-        } else if (flags & u64::from(general::MAP_FIXED)) != 0 {
-            MapPlace::Fixed(hint)
-        } else {
-            MapPlace::Hint((hint != 0).then_some(hint))
-        };
+        let place = map_place(hint, flags);
 
         // Declared before `inner`, so dropped after it is released.
         let mut gone_files = Vec::new();
@@ -561,27 +641,25 @@ impl AddressSpace {
 
     /// Register a lazy file-backed VMA over `[offset, offset + len)` of the
     /// file `file` holds open (`mmap(2)` of a file descriptor, whose open
-    /// reference it is; wave 3's syscall calls it), shared or private as
-    /// `sharing` says. `PROT_WRITE` on a `Shared { may_write: false }`
+    /// reference it is), shared or private as `sharing` says. `PROT_WRITE` on a `Shared { may_write: false }`
     /// mapping is refused (`Access`), and a file with no pages to map
     /// (anything but a regular `ext4` or `tmpfs` file) with `NoDev`.
     /// `offset` must be page-aligned (`Misaligned`).
     ///
     /// It doesn't check that the descriptor is open for reading: Linux
-    /// refuses `mmap` of one that isn't (`EACCES`), and wave 3's syscall
-    /// must check that before calling this.
+    /// refuses `mmap` of one that isn't (`EACCES`), and the syscall checks
+    /// that before calling this.
     ///
     /// Nothing is mapped until a fault ([`Self::handle_page_fault`]). The
     /// address space keeps its own open reference (a clone of `file`) while
     /// any VMA maps the file, so closing the descriptor keeps the mapping
     /// valid. `MAP_FIXED` releases what it replaces as `munmap` does.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: mmap(fd) (#255, wave 3)
     pub fn mmap_file(
         &self,
         place: MapPlace,
         len: u64,
         prot: Prot,
-        file: &OpenGuard,
+        file: &MappedFile,
         offset: u64,
         sharing: Sharing,
     ) -> Result<u64, UserVmError> {
@@ -589,7 +667,7 @@ impl AddressSpace {
             Sharing::Private => (false, true),
             Sharing::Shared { may_write } => (true, may_write),
         };
-        let inode = file.inode();
+        let inode = file.guard.inode();
         if !page_cache::mappable(&**inode) {
             return Err(UserVmError::NoDev);
         }
@@ -1007,6 +1085,7 @@ impl AddressSpace {
         unsafe { paging::clear_user_lower_half(self.root, |leaf| note_shared_leaf(writable, &leaf)) };
         inner.writable_maps.clear();
         inner.pinned_pages.clear();
+        inner.images.clear();
         gone_files = core::mem::take(&mut inner.mapped_files);
         inner.torn_down = true;
         drop(inner);
@@ -1015,22 +1094,126 @@ impl AddressSpace {
 
     /// Format `/proc/<pid>/maps` strictly under Lock 1 (`AddressSpace::inner`),
     /// with no `ACTIVE_PROCS` or `VfsInode` locks held. The lines themselves
-    /// are `lumen_vm::maps::write_maps`'s.
+    /// are `lumen_vm::maps::write_maps`'s; the files they name are resolved
+    /// here: a file mapping's from `mapped_files` (its inode's device and
+    /// number now, which read no lock, deleted once detached by an unlink,
+    /// and the path it was opened by), an ELF image's from
+    /// [`Self::name_image`]'s ranges.
     pub fn format_maps(&self) -> String {
+        use lumen_vm::maps::{FileInfo, ImageRange as MapsImage, MapsLayout};
         let mut out = String::new();
         let inner = self.inner.lock();
         if inner.torn_down {
             return out;
         }
-        let layout = lumen_vm::maps::MapsLayout {
+        let layout = MapsLayout {
             brk_initial: inner.brk.initial(),
             brk_mapped_end: inner.brk.mapped_end(),
             stack_bottom: USER_STACK_BOTTOM,
             stack_top: USER_STACK_TOP,
         };
+        let images: Vec<MapsImage<'_>> = inner
+            .images
+            .iter()
+            .map(|r| MapsImage {
+                start: r.start,
+                end: r.end,
+                offset: r.offset,
+                file: FileInfo {
+                    major: r.file.dev.major(),
+                    minor: r.file.dev.minor(),
+                    ino: r.file.ino,
+                    path: &r.file.path,
+                    deleted: false,
+                },
+            })
+            .collect();
+        let files = |id: u64| {
+            inner.mapped_files.get(&id).map(|m| {
+                let inode = m.guard.inode();
+                let dev = inode.dev_id();
+                FileInfo {
+                    major: dev.major(),
+                    minor: dev.minor(),
+                    ino: inode.ino(),
+                    path: &m.path,
+                    deleted: inode.is_detached(),
+                }
+            })
+        };
         // Writing to a `String` cannot fail.
-        let _ = lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout);
+        let _ = lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout, &images, files);
         out
+    }
+
+    /// Name the file-backed part of each `PT_LOAD` segment of `plan`, an
+    /// image [`Self::from_images`] loaded into this space, as `file`'s in
+    /// `/proc/<pid>/maps` (Linux maps segments from the file, so its lines
+    /// show the file; Lumen copies them into anonymous memory, so names
+    /// them by range): from the segment's first page to the end of the page
+    /// holding its last file byte, at the segment's file offset less its
+    /// start's offset in that page. Its `.bss` pages past that are
+    /// anonymous, as on Linux. The names go where the VMAs go: an unmap or
+    /// `MAP_FIXED` over them takes them away.
+    pub fn name_image(&self, plan: &LoadedElf, file: ImageFile) {
+        let file = Arc::new(file);
+        let mut inner = self.inner.lock();
+        if inner.torn_down {
+            return;
+        }
+        for seg in plan.segments() {
+            let start = lumen_vm::align_down_page(seg.vaddr);
+            let file_end = seg.vaddr.checked_add(seg.filesz as u64).and_then(lumen_vm::align_up_page);
+            let offset = (seg.file_offset as u64).checked_sub(seg.vaddr - start);
+            if let (Some(end), Some(offset)) = (file_end, offset)
+                && seg.filesz > 0
+            {
+                inner.images.push(ImageRange { start, end, offset, file: Arc::clone(&file) });
+            }
+        }
+    }
+
+    /// What `msync(2)` over page-aligned `[start, end)` (`start < end`)
+    /// must write back: an open reference on each file a `MAP_SHARED` VMA
+    /// overlapping it maps, once each, and whether part of the range is
+    /// mapped by no VMA. Private file mappings and anonymous memory have
+    /// nothing to write.
+    ///
+    /// The references are cloned under Lock 1 and the caller writes back
+    /// after it is released: writeback takes the inode's Locks 4 and 5 and
+    /// the filesystem's and block cache's below them, which Lock 1 may be
+    /// held across (ARCHITECTURE section 9's order), but holding it through
+    /// disk writes would stall every fault and `mmap` of the process
+    /// meanwhile, as Linux's `msync` avoids by dropping `mmap_lock` around
+    /// `vfs_fsync_range`. A file unmapped meanwhile stays valid through its
+    /// reference.
+    pub fn msync_files(&self, start: u64, end: u64) -> MsyncFiles {
+        let mut found = MsyncFiles { shared: Vec::new(), hole: false };
+        let inner = self.inner.lock();
+        if inner.torn_down {
+            found.hole = true;
+            return found;
+        }
+        let mut seen: Vec<u64> = Vec::new();
+        let mut covered = start;
+        for vma in inner.vmas.overlapping(start, end) {
+            if vma.start > covered {
+                found.hole = true;
+            }
+            covered = vma.end;
+            if let Backing::File(fm) = vma.backing
+                && fm.shared
+                && !seen.contains(&fm.file_id)
+                && let Some(mapped) = inner.mapped_files.get(&fm.file_id)
+            {
+                seen.push(fm.file_id);
+                found.shared.push(mapped.guard.clone());
+            }
+        }
+        if covered < end {
+            found.hole = true;
+        }
+        found
     }
 
     /// Copy `bytes` into already-mapped pages of `self.root` via the HHDM.
@@ -1056,9 +1239,12 @@ impl AddressSpace {
 
     /// Unmap the PTEs of `removed` (VMAs `VmaMap` just took out) and move
     /// the open references of files no VMA maps any more into `gone`.
-    fn unmap_vmas_locked(&self, inner: &mut AddressSpaceInner, removed: &[Vma], gone: &mut Vec<OpenGuard>) {
+    fn unmap_vmas_locked(&self, inner: &mut AddressSpaceInner, removed: &[Vma], gone: &mut Vec<MappedFile>) {
         for vma in removed {
             self.unmap_range_locked(inner, vma.start, vma.end);
+            if !inner.images.is_empty() {
+                trim_images(&mut inner.images, vma.start, vma.end);
+            }
         }
         release_unmapped_files(inner, gone);
     }
@@ -1160,7 +1346,7 @@ fn file_page(
     let file = inner.mapped_files.get(&fm.file_id).expect("a mapped file stays in mapped_files while a VMA maps it");
     let offset = fm.offset + (page_va.as_u64() - vma.start); // `VmaMap` checked it can't overflow
     let index = offset / PAGE_SIZE;
-    let result = mmap_page(file.inode(), index);
+    let result = mmap_page(file.guard.inode(), index);
     let err = match result {
         Err(e) if !matches!(e, VfsError::NoMem | VfsError::Range | VfsError::Io) => e,
         other => {
@@ -1172,7 +1358,7 @@ fn file_page(
             });
         }
     };
-    let inode = file.inode();
+    let inode = file.guard.inode();
     let (dev, ino) = (inode.dev_id(), inode.ino());
     let warn = from_user && inner.fault_warned != Some((fm.file_id, err));
     if warn {
@@ -1279,7 +1465,7 @@ fn map_error_fault(err: MapError) -> FaultResult {
 /// `mapped_files` into `gone`, which the caller drops once `inner` is
 /// released. Liveness is read from the VMAs as they are now, so a
 /// `MAP_FIXED` replace by the same file keeps its reference.
-fn release_unmapped_files(inner: &mut AddressSpaceInner, gone: &mut Vec<OpenGuard>) {
+fn release_unmapped_files(inner: &mut AddressSpaceInner, gone: &mut Vec<MappedFile>) {
     if inner.mapped_files.is_empty() {
         return;
     }
@@ -1660,8 +1846,8 @@ fn file_vm_logged(text: &str) -> usize {
 
 /// An open reference on `f`, standing in for a descriptor's.
 #[cfg(feature = "ktest")]
-fn file_vm_open(f: &Arc<dyn VfsInode>) -> OpenGuard {
-    OpenGuard::new_unchecked(Arc::clone(f))
+fn file_vm_open(f: &Arc<dyn VfsInode>) -> MappedFile {
+    MappedFile { guard: OpenGuard::new_unchecked(Arc::clone(f)), path: Arc::from("/ktest/file") }
 }
 
 #[cfg(feature = "ktest")]

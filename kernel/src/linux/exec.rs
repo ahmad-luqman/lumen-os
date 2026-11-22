@@ -13,7 +13,7 @@ use lumen_vfs::VfsError;
 use lumen_vm::{INTERP_BASE, PIE_BASE};
 
 use crate::linux::errno;
-use crate::mm::user_vm::{AddressSpace, ElfImage, LoadedProgram, UserVmError};
+use crate::mm::user_vm::{AddressSpace, ElfImage, ImageFile, LoadedProgram, UserVmError};
 use crate::vfs;
 
 /// Why a binary could not be loaded. The read and interpreter errors name
@@ -66,10 +66,16 @@ impl fmt::Display for ExecError {
     }
 }
 
-/// One ELF file: its bytes and its plan, parsed once.
+/// An executable file as `vfs::read_executable` reads it: its bytes
+/// and its inode.
+type ExecFile = (Vec<u8>, alloc::sync::Arc<dyn lumen_vfs::VfsInode>);
+
+/// One ELF file: its bytes and its plan, parsed once, and the file it was
+/// read from (none for a boot module), which names its maps lines.
 struct Image {
     bytes: Cow<'static, [u8]>,
     plan: LoadedElf,
+    file: Option<ImageFile>,
 }
 
 impl Image {
@@ -87,17 +93,20 @@ struct Interp {
 
 impl Interp {
     /// The interpreter at `raw` (the `PT_INTERP` path), read with `read`.
-    fn read(raw: &[u8], read: impl FnOnce(&str) -> Result<Vec<u8>, VfsError>) -> Result<Self, ExecError> {
+    fn read(raw: &[u8], read: impl FnOnce(&str) -> Result<ExecFile, VfsError>) -> Result<Self, ExecError> {
         let Ok(path) = core::str::from_utf8(raw) else {
             return Err(ExecError::InterpPathNotUtf8 { path: String::from_utf8_lossy(raw).into_owned() });
         };
         let path = String::from(path);
-        let bytes = match read(&path) {
-            Ok(bytes) => bytes,
+        let (bytes, inode) = match read(&path) {
+            Ok(read) => read,
             Err(err) => return Err(ExecError::InterpRead { path, err }),
         };
         match LoadedElf::parse_interp(&bytes, INTERP_BASE) {
-            Ok(plan) => Ok(Self { path, image: Image { bytes: Cow::Owned(bytes), plan } }),
+            Ok(plan) => {
+                let file = Some(ImageFile::of(&*inode, &path));
+                Ok(Self { path, image: Image { bytes: Cow::Owned(bytes), plan, file } })
+            }
             Err(err) => Err(ExecError::InterpBad { path, err }),
         }
     }
@@ -117,8 +126,11 @@ impl Exec {
     /// The executable at absolute `path` in the VFS (symlinks followed), its
     /// interpreter read through the VFS too; `exe_path` is `path` as given.
     pub fn from_path(path: &str) -> Result<Self, ExecError> {
-        let bytes = vfs::read_executable(path).map_err(|err| ExecError::Read { path: String::from(path), err })?;
-        Self::new(Cow::Owned(bytes), Some(String::from(path)), vfs::read_executable)
+        let (bytes, inode) =
+            vfs::read_executable(path).map_err(|err| ExecError::Read { path: String::from(path), err })?;
+        let mut exec = Self::new(Cow::Owned(bytes), Some(String::from(path)), vfs::read_executable)?;
+        exec.main.file = Some(ImageFile::of(&*inode, path));
+        Ok(exec)
     }
 
     /// A binary already in memory (a boot module), its interpreter, if it
@@ -132,12 +144,12 @@ impl Exec {
     fn new(
         bytes: Cow<'static, [u8]>,
         exe_path: Option<String>,
-        read_interp: impl FnOnce(&str) -> Result<Vec<u8>, VfsError>,
+        read_interp: impl FnOnce(&str) -> Result<ExecFile, VfsError>,
     ) -> Result<Self, ExecError> {
         let plan =
             LoadedElf::parse_with_pie_base(&bytes, PIE_BASE).map_err(|e| ExecError::Load(UserVmError::Elf(e)))?;
         let interp = plan.interp_path(&bytes).map(|raw| Interp::read(raw, read_interp)).transpose()?;
-        Ok(Self { main: Image { bytes, plan }, exe_path, interp })
+        Ok(Self { main: Image { bytes, plan, file: None }, exe_path, interp })
     }
 
     /// The path the binary was read from, as given, for `/proc/<pid>/exe`.
@@ -158,7 +170,8 @@ impl Exec {
     }
 
     /// Load the binary and its interpreter into a brand-new address space
-    /// ([`AddressSpace::from_images`]).
+    /// ([`AddressSpace::from_images`]), each image read from a file named
+    /// after that file in `/proc/<pid>/maps` ([`AddressSpace::name_image`]).
     pub fn load(
         &self,
         argv: &[&[u8]],
@@ -167,7 +180,14 @@ impl Exec {
         random: [u8; 16],
     ) -> Result<(AddressSpace, LoadedProgram), ExecError> {
         let (main, interp) = self.images();
-        AddressSpace::from_images(main, interp, argv, envp, execfn, random).map_err(ExecError::Load)
+        let (space, prog) =
+            AddressSpace::from_images(main, interp, argv, envp, execfn, random).map_err(ExecError::Load)?;
+        for image in core::iter::once(&self.main).chain(self.interp.as_ref().map(|i| &i.image)) {
+            if let Some(file) = &image.file {
+                space.name_image(&image.plan, file.clone());
+            }
+        }
+        Ok((space, prog))
     }
 }
 
@@ -247,10 +267,12 @@ fn read_test_auxv(rsp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
 }
 
 /// An `Exec` of `main` whose interpreter read gives `interp`, for the
-/// ktests that need no file.
+/// ktests that need no file (the interpreter's maps lines are named after
+/// `/`, a stand-in inode these ktests don't look at).
 #[cfg(feature = "ktest")]
 fn test_exec(main: Vec<u8>, interp: Result<Vec<u8>, VfsError>) -> Result<Exec, ExecError> {
-    Exec::new(Cow::Owned(main), None, |_| interp)
+    let root = vfs::resolve_path_from_root("/").map_err(|err| ExecError::Read { path: String::from("/"), err })?;
+    Exec::new(Cow::Owned(main), None, |_| interp.map(|bytes| (bytes, root)))
 }
 
 crate::ktest!(
@@ -492,9 +514,9 @@ crate::ktest!(
         drop(huge);
         heap::refuse_from(32 * 1024);
         let refused = Exec::from_path("/tmp/lumen-ktest-big").map(|_| ());
-        let too_big = vfs::read_executable("/tmp/lumen-ktest-huge").map(|b| b.len());
+        let too_big = vfs::read_executable("/tmp/lumen-ktest-huge").map(|(b, _)| b.len());
         heap::refuse_from(usize::MAX);
-        let read = vfs::read_executable("/tmp/lumen-ktest-big").map(|b| b.len());
+        let read = vfs::read_executable("/tmp/lumen-ktest-big").map(|(b, _)| b.len());
         let unlinked = (tmp.unlink(NAME), tmp.unlink(HUGE));
         kassert_eq!(written, Ok(64 * 1024));
         kassert_eq!(grown, Ok(()));

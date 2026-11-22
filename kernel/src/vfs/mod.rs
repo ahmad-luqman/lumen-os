@@ -689,12 +689,14 @@ fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
 /// `EACCES` for anything but a regular file with an execute bit (as
 /// `execve(2)`, where root too needs one), `EFBIG` past [`READ_ALL_MAX`],
 /// `ENOMEM` when the heap can't hold it.
-pub(crate) fn read_executable(path: &str) -> Result<Vec<u8>, VfsError> {
+/// The inode comes back with the bytes: the loader names the image's
+/// `/proc/<pid>/maps` lines after it (#255).
+pub(crate) fn read_executable(path: &str) -> Result<(Vec<u8>, Arc<dyn VfsInode>), VfsError> {
     let inode = resolve_path_from_root(path)?;
     if inode.inode_type() != InodeType::File || inode.stat()?.mode & 0o111 == 0 {
         return Err(VfsError::Acces);
     }
-    read_all_inode(&inode)
+    Ok((read_all_inode(&inode)?, inode))
 }
 
 /// Makes `run_dev_tmp_proc_checks`'s process fail its first check, for the
@@ -703,19 +705,24 @@ pub(crate) fn read_executable(path: &str) -> Result<Vec<u8>, VfsError> {
 static FAIL_PROC_CHECKS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether `line` has the shape of a `/proc/<pid>/maps` line:
-/// `start-end perms offset major:minor inode`, then `  [heap]`/`  [stack]` or
-/// nothing (no file-backed VMAs yet). Addresses are 8 to 16 lowercase hex
-/// digits, the offset exactly 8, the device numbers 2 each.
+/// `start-end perms offset major:minor inode`, then nothing or a name
+/// (`[heap]`, `[stack]` or an absolute path) at column 73, where Linux pads
+/// it (two spaces after the inode when the fields are wider). Addresses are
+/// 8 to 16 lowercase hex digits, the offset exactly 8, the device numbers
+/// at least 2 each.
 fn is_maps_line(line: &str) -> bool {
     fn hex(s: &str, min: usize, max: usize) -> bool {
         (min..=max).contains(&s.len()) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     }
     let (fields, label) = match line.split_once("  ") {
-        Some((f, l)) => (f, Some(l)),
+        Some((f, l)) => (f, Some(l.trim_start_matches(' '))),
         None => (line, None),
     };
-    if !matches!(label, None | Some("[heap]") | Some("[stack]")) {
-        return false;
+    if let Some(label) = label {
+        let named = matches!(label, "[heap]" | "[stack]") || label.starts_with('/');
+        if !named || line.len() - label.len() != fields.len().max(lumen_vm::maps::NAME_PAD - 1) + 2 {
+            return false;
+        }
     }
     let parts: Vec<&str> = fields.split(' ').collect();
     let [range, perms, offset, devno, ino] = parts[..] else {
@@ -728,7 +735,7 @@ fn is_maps_line(line: &str) -> bool {
         && matches!(p[1], b'w' | b'-')
         && matches!(p[2], b'x' | b'-')
         && matches!(p[3], b'p' | b's');
-    let dev_ok = devno.split_once(':').is_some_and(|(a, b)| hex(a, 2, 2) && hex(b, 2, 2));
+    let dev_ok = devno.split_once(':').is_some_and(|(a, b)| hex(a, 2, 8) && hex(b, 2, 8));
     let ino_ok = !ino.is_empty() && ino.bytes().all(|b| b.is_ascii_digit());
     range_ok && perms_ok && hex(offset, 8, 8) && dev_ok && ino_ok
 }

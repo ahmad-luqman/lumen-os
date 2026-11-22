@@ -19,9 +19,10 @@
 //! - `dir`: `getcwd` (M6); `getdents64`, `chdir`, `fchdir` (M7).
 //! - `meta`: `chmod*`, `chown*`, `umask`, `utimensat`, `truncate`,
 //!   `ftruncate` (M7).
-//! - `io`: `pread64`, `pwrite64`, `fsync`, `fdatasync`, `sync`, `msync` (M7).
+//! - `io`: `pread64`, `pwrite64`, `fsync`, `fdatasync`, `sync` (M7).
 //! - `lock`: `fcntl`, `flock` (M7).
-//! - `mem`: `mmap`, `mprotect`, `munmap`, `brk` (M6).
+//! - `mem`: `mmap`, `mprotect`, `munmap`, `brk` (M6); `mmap` of a file and
+//!   `msync` (M7).
 //! - `proc`: signals, `arch_prctl`, `prlimit64`, `uname`, `clock_gettime`,
 //!   `getrandom` (M6).
 //!
@@ -499,7 +500,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_msync) => {
-            frame.rax = io::sys_msync(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            frame.rax = mem::sys_msync(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fcntl) => {

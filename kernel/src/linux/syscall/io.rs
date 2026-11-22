@@ -30,11 +30,6 @@ pub(super) fn sys_sync() -> u64 {
     not_implemented(general::__NR_sync)
 }
 
-/// `msync(addr, length, flags)` (26): M7 stub (#255).
-pub(super) fn sys_msync(_addr: u64, _length: u64, _flags: i32) -> u64 {
-    not_implemented(general::__NR_msync)
-}
-
 crate::ktest!(
     fn io_m7_stubs_return_enosys() {
         super::check_stubs(&[
@@ -43,7 +38,6 @@ crate::ktest!(
             general::__NR_fsync,
             general::__NR_fdatasync,
             general::__NR_sync,
-            general::__NR_msync,
         ])
     }
 );
