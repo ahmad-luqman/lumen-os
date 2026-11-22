@@ -40,6 +40,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lumen_perf::{Buffer, FnIndex, Ranking, Sample, Silence, Taken, TopArgs};
 use lumen_shell::Key;
 use lumen_shell::pipe::{self, Align, Column, Kind};
+use lumen_trace::ThreadName;
 
 /// The most samples a profile takes per CPU (`perf top --samples`):
 /// about 2 s of ticks at 1 kHz. 16 bytes a sample: 256 KiB for 8 CPUs.
@@ -276,13 +277,13 @@ fn thread_table(p: &Profile, rows: usize) -> pipe::Table {
         Column::new("samples", Kind::Int, Align::Right, 7),
         Column::new("share", Kind::Percent, Align::Right, 5),
     ];
-    let names: BTreeMap<u64, &'static str> = sched::threads().into_iter().map(|t| (t.id, t.name)).collect();
+    let names: BTreeMap<u64, ThreadName> = sched::threads().into_iter().map(|t| (t.id, t.name)).collect();
     let r = lumen_perf::by_thread(&p.samples);
     let mut t = pipe::Table::new(&COLUMNS);
     for row in r.rows().iter().take(rows) {
         // `-` (absent): the scheduler has no record of the thread any more
         // (it ended and was dropped since its samples).
-        let name = names.get(&row.key).map_or(DASH, |n| text(n));
+        let name = names.get(&row.key).map_or(DASH, |n| text(n.as_str()));
         t.push(vec![name, int(row.key), int(row.samples), int(r.share(row))]);
     }
     t

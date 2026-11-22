@@ -41,8 +41,12 @@ pub struct App {
 }
 
 // `BUNDLED` (build/apps/*.wasm) and `TEST_APPS` (build/apps/tests/*.wasm),
-// each sorted by name: written by kernel/build.rs.
+// each sorted by name, and `MAX_APP_NAME`: written by kernel/build.rs.
 include!(concat!(env!("OUT_DIR"), "/apps.rs"));
+
+// build.rs refuses an app name past `MAX_APP_NAME` bytes, so its thread's
+// name, `app:<name>`, is never cut (#276).
+const _: () = assert!("app:".len() + MAX_APP_NAME == lumen_trace::ThreadName::MAX_LEN);
 
 use crate::shell::Ctx;
 use alloc::format;
