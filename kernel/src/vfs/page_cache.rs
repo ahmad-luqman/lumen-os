@@ -623,7 +623,8 @@ pub(super) mod ktest_hooks {
 /// Scratch files on fresh `tmpfs` and `ext4` volumes for the file-backed VM's
 /// ktests (`mm::user_vm`) and the positional I/O and `fsync` ktests
 /// (`linux::syscall::io`), which can't reach `vfs`'s in-memory block device
-/// themselves. Nothing here is mounted in the global tables.
+/// themselves. Nothing here mounts itself in the global tables (a ktest
+/// that wants one there mounts `Ext4Volume::fs` itself, and unmounts it).
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest_files {
     use alloc::sync::Arc;
@@ -649,13 +650,16 @@ pub(crate) mod ktest_files {
         }
 
         /// The mounted filesystem (to mount it in the global tables).
-        pub(crate) fn fs(&self) -> Arc<Ext4FileSystem> {
-            Arc::clone(&self.mnt.fs)
+        pub(crate) fn fs(&self) -> Arc<dyn FileSystem> {
+            Arc::clone(&self.mnt.fs) as Arc<dyn FileSystem>
         }
 
         /// The root of a read-only mount of the same disk (through the same
         /// block cache): what it reads is on the disk, not in the first
-        /// mount's page cache.
+        /// mount's page cache. (`ext4::ktest_util::remount_ro`, by contrast,
+        /// syncs the block cache and mounts a copy of the device; see also
+        /// [`Self::mount_device_copy_ro`], which mounts a copy without
+        /// syncing.)
         pub(crate) fn remount_ro(&self, minor: u32) -> Result<Arc<dyn VfsInode>, &'static str> {
             let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&self.mnt.cache) as Arc<dyn BlockCacheBackend>;
             let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;

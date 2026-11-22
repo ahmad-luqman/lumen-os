@@ -515,6 +515,10 @@ struct Ext4Shared {
     read_only: bool,
     /// The largest file size the filesystem can map ([`max_file_size`]).
     max_file_size: u64,
+    /// The errno of the last per-inode sync's (`fsync`/`fdatasync`) failed
+    /// block-cache sync, 0 after one that worked: its warning is logged
+    /// once per failing streak, as a page's writeback is.
+    bcache_sync_errno: AtomicU32,
     state: SleepMutex<Ext4FsInner>,
 }
 
@@ -576,6 +580,7 @@ impl Ext4FileSystem {
             dev,
             read_only,
             max_file_size: max_file_size(layout.block_size, extents),
+            bcache_sync_errno: AtomicU32::new(0),
             state: SleepMutex::new(Ext4FsInner {
                 dev,
                 ext4,
@@ -3984,11 +3989,20 @@ impl VfsInode for Ext4Inode {
         self.flush_to_ext4(data_only)?;
         // A global sync goes through the filesystem's own `sync` (which logs
         // a block-cache failure once, not once per inode), never through
-        // here: this is `fsync`'s, so it logs its own failure.
-        self.shared.sync_bcache().map_err(|(e, cause)| {
-            warn!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);
-            e
-        })
+        // here: a per-inode sync (`fsync`/`fdatasync`) logs its own, once
+        // per failing streak.
+        match self.shared.sync_bcache() {
+            Ok(()) => {
+                self.shared.bcache_sync_errno.store(0, Ordering::Release);
+                Ok(())
+            }
+            Err((e, cause)) => {
+                if self.shared.bcache_sync_errno.swap(e.to_errno(), Ordering::AcqRel) != e.to_errno() {
+                    warn!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);
+                }
+                Err(e)
+            }
+        }
     }
 
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {

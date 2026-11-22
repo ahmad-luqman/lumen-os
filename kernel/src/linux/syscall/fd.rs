@@ -59,6 +59,20 @@ fn offset_lock_across_read(inode: &dyn VfsInode) -> bool {
     inode.dev_id() != DevId::PROCFS
 }
 
+/// `n`, the bytes a filesystem says it moved of a `want`-byte chunk,
+/// checked: more than it was given is a filesystem bug, logged and taken as
+/// `EIO` (never passed on to the caller, nor a panic: the kernel's builds
+/// keep debug assertions on, and a user's read or write must not bring it
+/// down). Every chunk loop's (`read`'s, `write`'s, `pread64`'s,
+/// `pwrite64`'s), before it moves an offset or a count by `n`.
+pub(super) fn checked_len(n: usize, want: usize) -> Result<usize, VfsError> {
+    if n > want {
+        log::error!(target: "linux", "a filesystem reported {n} bytes moved of a {want}-byte chunk (a bug)");
+        return Err(VfsError::Io);
+    }
+    Ok(n)
+}
+
 /// Read one chunk into `kbuf` at `file`'s offset and move the offset past
 /// it: `(where it began, where it ended)`. Under the offset's lock across
 /// the `read_at` where [`offset_lock_across_read`] allows; else from a
@@ -67,12 +81,12 @@ fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError
     if offset_lock_across_read(&*file.inode) {
         let mut off = file.offset.lock();
         let pos = *off;
-        let end = pos.saturating_add(file.inode.read_at(pos, kbuf)? as u64);
+        let end = pos.saturating_add(checked_len(file.inode.read_at(pos, kbuf)?, kbuf.len())? as u64);
         *off = end;
         return Ok((pos, end));
     }
     let pos = *file.offset.lock();
-    let end = pos.saturating_add(file.inode.read_at(pos, kbuf)? as u64);
+    let end = pos.saturating_add(checked_len(file.inode.read_at(pos, kbuf)?, kbuf.len())? as u64);
     let mut off = file.offset.lock();
     if *off == pos {
         *off = end;
@@ -131,6 +145,7 @@ fn write_chunk(file: &KernelFile, chunk: &[u8]) -> Result<(u64, usize), VfsError
     } else {
         (*off, file.inode.write_at(*off, chunk)?)
     };
+    let n = checked_len(n, chunk.len())?;
     *off = pos.saturating_add(n as u64);
     Ok((pos, n))
 }
@@ -169,14 +184,10 @@ pub(super) fn write_chunks_from_user(
         if copy_from_user(&mut kbuf[..want], addr).is_err() {
             return partial(done, errno::EFAULT);
         }
-        let n = match write(done, &kbuf[..want]) {
+        let n = match write(done, &kbuf[..want]).and_then(|n| checked_len(n, want)) {
             Ok(n) => n,
             Err(e) => return partial(done, vfs(e)),
         };
-        // A filesystem never reports more than it was given; if one did,
-        // the caller still never hears of more than it asked for.
-        debug_assert!(n <= want, "wrote {n} of a {want}-byte chunk");
-        let n = n.min(want);
         done += n;
         if n < want {
             break;

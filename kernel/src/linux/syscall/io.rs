@@ -11,7 +11,7 @@
 //! `sync` is `vfs::sync_all`.
 
 use super::at::{Fd, UserPtr};
-use super::fd::{FILE_CHUNK, partial, vfs, write_chunks_from_user};
+use super::fd::{FILE_CHUNK, checked_len, partial, vfs, write_chunks_from_user};
 use super::{MAX_SINGLE_IO, finish, not_implemented};
 use crate::linux::process::FileRef;
 use crate::linux::{errno, general};
@@ -49,7 +49,7 @@ fn positional_file(fd: Fd) -> Result<FileRef, u32> {
 /// How much of `count` bytes at `buf`, from `pos`, to move.
 ///
 /// `EFAULT` if the buffer isn't wholly inside user space (`user_range_valid`:
-/// Linux's `access_ok`, which also refuses addresses below `USER_MIN`). Inside
+/// like Linux's `access_ok`, but it also refuses addresses below `USER_MIN`). Inside
 /// it, a chunk (4 KiB of the transfer) whose copy faults ends the transfer
 /// there, the chunks before it counted. `EINVAL` if the transfer would end
 /// past `i64::MAX` (`rw_verify_area`, on the whole count). Then `count`
@@ -92,13 +92,10 @@ fn read_at_into_user(inode: &dyn VfsInode, pos: u64, user_buf: u64, limit: usize
         let Some(addr) = user_buf.checked_add(done as u64) else {
             return partial(done, errno::EFAULT);
         };
-        let n = match inode.read_at(pos + done as u64, &mut kbuf[..want]) {
+        let n = match inode.read_at(pos + done as u64, &mut kbuf[..want]).and_then(|n| checked_len(n, want)) {
             Ok(n) => n,
             Err(e) => return partial(done, vfs(e)),
         };
-        // As `write_chunks_from_user`: never more than asked for.
-        debug_assert!(n <= want, "read {n} into a {want}-byte chunk");
-        let n = n.min(want);
         if n == 0 {
             break;
         }
@@ -249,6 +246,32 @@ fn ktest_on_device(
     let mut data = alloc::vec![0u8; size];
     crate::kassert_eq!(f.read_at(0, &mut data), Ok(size));
     Ok(Some(data))
+}
+
+/// Mount `vol` at `path` (a new directory) in the global tables for `f`,
+/// then unmount it and remove the directory, whatever `f` returned
+/// (ktests). A cleanup that fails is reported after `f`'s own failure.
+#[cfg(feature = "ktest")]
+fn ktest_with_mounted(
+    vol: &crate::vfs::page_cache::ktest_files::Ext4Volume,
+    path: &str,
+    f: impl FnOnce() -> crate::ktest::TestResult,
+) -> crate::ktest::TestResult {
+    use lumen_vfs::{mkdir_at, unlink_at};
+    let tables = crate::vfs::tables();
+    let mp = mkdir_at(tables, None, path.as_bytes(), 0o755, 0).map_err(|_| "mkdir the mountpoint")?;
+    let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
+    if let Err(e) = tables.mount(mp, path, vol.fs()) {
+        crate::ktest::diag(format_args!("mount at {path}: {e:?}"));
+        if let Err(e) = unlink_at(tables, None, path.as_bytes(), true) {
+            crate::ktest::diag(format_args!("rmdir {path} after the failed mount: {e:?}"));
+        }
+        return Err("mount the volume");
+    }
+    let result = f();
+    let unmounted = tables.umount(mp_dev, mp_ino).map(drop).map_err(|_| "unmount the volume");
+    let removed = unlink_at(tables, None, path.as_bytes(), true).map_err(|_| "rmdir the mountpoint");
+    result.and(unmounted).and(removed)
 }
 
 crate::ktest!(
@@ -528,10 +551,11 @@ crate::ktest!(
             // into the cache, which keeps it; the next `fsync` flushes it.
             copy_to_user(base, b"YY").map_err(|_| "copy data")?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 2, 4096), 2);
+            // Twice: one warning for the streak (test_ktest pins the count).
             vol.fail_syncs(true);
-            let failed = sys_fsync(fd);
+            let failed = (sys_fsync(fd), sys_fdatasync(fd));
             vol.fail_syncs(false);
-            kassert_eq!(failed, neg_errno(errno::EIO));
+            kassert_eq!(failed, (neg_errno(errno::EIO), neg_errno(errno::EIO)));
             kassert_eq!(on_device(191)?, Some(want.clone()));
             kassert_eq!(sys_fsync(fd), 0);
             want[4096..4098].copy_from_slice(b"YY");
@@ -553,7 +577,7 @@ crate::ktest!(
 
 crate::ktest!(
     fn io_fsync_refuses_terminals_devices_and_procfs() {
-        // A file or directory on tmpfs syncs (`0`, read-only too); a
+        // A file or directory on tmpfs syncs (`0`, on a read-only fd too); a
         // terminal, a device node, a procfs file and a procfs directory are
         // `EINVAL`; `O_PATH` and a closed fd `EBADF`.
         use crate::kassert_eq;
@@ -590,49 +614,28 @@ crate::ktest!(
     }
 );
 
-/// Mount `vol` at `path` (a new directory) in the global tables for `f`,
-/// then unmount it and remove the directory, whatever `f` returned
-/// (ktests).
-#[cfg(feature = "ktest")]
-fn ktest_with_mounted(
-    vol: &crate::vfs::page_cache::ktest_files::Ext4Volume,
-    path: &str,
-    f: impl FnOnce() -> crate::ktest::TestResult,
-) -> crate::ktest::TestResult {
-    use lumen_vfs::{FileSystem, mkdir_at, unlink_at};
-    let tables = crate::vfs::tables();
-    let mp = mkdir_at(tables, None, path.as_bytes(), 0o755, 0).map_err(|_| "mkdir the mountpoint")?;
-    let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
-    let fs = vol.fs() as alloc::sync::Arc<dyn FileSystem>;
-    if tables.mount(mp, path, fs).is_err() {
-        let _ = unlink_at(tables, None, path.as_bytes(), true);
-        return Err("mount the volume");
-    }
-    let result = f();
-    let unmounted = tables.umount(mp_dev, mp_ino).map(drop).map_err(|_| "unmount the volume");
-    let removed = unlink_at(tables, None, path.as_bytes(), true).map_err(|_| "rmdir the mountpoint");
-    result.and(unmounted).and(removed)
-}
-
 crate::ktest!(
     fn io_sync_flushes_every_mounted_filesystem() {
         // Two ext4 volumes mounted in the global tables, a file written on
-        // each without `fsync`: `sync` puts the first's on its device, and
-        // is 0 though the second's block cache can't sync (its data stays
-        // off its device).
+        // each without `fsync`: `sync` is 0 though the failing volume's block
+        // cache can't sync (its data stays off its device), and still puts
+        // the good volume's on its device. The failing one must be synced
+        // first (`snapshot_filesystems` goes by mountpoint inode, so it is
+        // mounted first, outermost) or a sync that stopped at a failure would
+        // pass too.
         use crate::vfs::page_cache::ktest_files::Ext4Volume;
         use crate::{kassert, kassert_eq};
         process::in_test_process(|_| {
             let base = process::KTEST_USER_VA + 2048;
-            let good = Ext4Volume::new(196)?;
             let bad = Ext4Volume::new(197)?;
-            ktest_with_mounted(&good, "/tmp/io-sync-good", || {
-                ktest_with_mounted(&bad, "/tmp/io-sync-bad", || {
+            let good = Ext4Volume::new(196)?;
+            ktest_with_mounted(&bad, "/tmp/io-sync-bad", || {
+                ktest_with_mounted(&good, "/tmp/io-sync-good", || {
                     let creat = ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT);
                     let pattern = ktest_pattern(5000, 4);
                     copy_to_user(base, &pattern).map_err(|_| "copy the pattern")?;
                     let mut fds = alloc::vec::Vec::new();
-                    for path in [&b"/tmp/io-sync-good/f"[..], b"/tmp/io-sync-bad/f"] {
+                    for path in [&b"/tmp/io-sync-bad/f"[..], b"/tmp/io-sync-good/f"] {
                         let fd = ktest_fd(sys_open(ktest_user_path(0, path)?, creat, at::reg(0o644)))?;
                         kassert_eq!(sys_pwrite64(fd, at::reg(base), 5000, 0), 5000);
                         fds.push(fd);
@@ -651,5 +654,19 @@ crate::ktest!(
                 })
             })
         })?
+    }
+);
+
+crate::ktest!(
+    fn io_a_filesystem_reporting_more_than_its_chunk_is_eio() {
+        // `checked_len`, every chunk loop's check on what a filesystem says
+        // it moved: up to the chunk passes, more is `EIO` (logged as a bug),
+        // never a larger count nor a panic.
+        use crate::kassert_eq;
+        kassert_eq!(checked_len(0, 4096), Ok(0));
+        kassert_eq!(checked_len(4096, 4096), Ok(4096));
+        kassert_eq!(checked_len(4097, 4096), Err(lumen_vfs::VfsError::Io));
+        kassert_eq!(checked_len(1, 0), Err(lumen_vfs::VfsError::Io));
+        Ok(())
     }
 );

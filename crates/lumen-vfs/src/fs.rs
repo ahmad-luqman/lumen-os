@@ -22,8 +22,10 @@ pub trait FileSystem: Send + Sync {
     /// Flush filesystem metadata and dirty state.
     ///
     /// Logs its own failures at `warn` (ext4: each inode and the block
-    /// cache that failed): `sync(2)` returns 0 whatever this returns, so
-    /// its log lines are the only report of a failed global sync.
+    /// cache that failed). Nothing above it reports them: `sync(2)` returns
+    /// 0 whatever this returns, and the kernel's `vfs::sync_all` logs a
+    /// failed filesystem only at `debug`, so these lines are the only
+    /// report of a failed global sync.
     fn sync(&self) -> Result<(), VfsError>;
 
     /// True if the filesystem is mounted read-only.
