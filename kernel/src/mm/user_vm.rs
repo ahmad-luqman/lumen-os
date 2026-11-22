@@ -239,8 +239,11 @@ pub enum Sharing {
     /// `MAP_PRIVATE`: copy-on-write; may always be made writable.
     Private,
     /// `MAP_SHARED`: stores reach the file. `may_write` is `VM_MAYWRITE`
-    /// (the descriptor is open for writing on a writable mount), not
-    /// `PROT_WRITE`: it says whether `PROT_WRITE` may ever be asked for.
+    /// (the descriptor is open `O_RDWR`, which a read-only mount refuses
+    /// with `EROFS`), not `PROT_WRITE`: it says whether `PROT_WRITE` may
+    /// ever be asked for. Without it the mapping is shared only as Linux's
+    /// without `VM_SHARED` is: stores can't reach the file, and `msync`
+    /// writes nothing back for it.
     Shared { may_write: bool },
 }
 
@@ -270,8 +273,10 @@ pub struct MappedFile {
 impl MappedFile {
     /// The file open description `file` has open, by its path: a clone of
     /// the description's own open reference, so never refused and never on
-    /// a freed inode.
+    /// a freed inode. Never an `O_PATH` description: `mmap` refuses one
+    /// (`EBADF`) before getting here.
     pub fn of<L: VfsLock<u64>>(file: &OpenFile<L>) -> Self {
+        debug_assert!(!file.is_path(), "a mapping of an O_PATH description");
         Self { guard: file.open_guard().clone(), path: Arc::clone(&file.path) }
     }
 
@@ -342,8 +347,9 @@ static MAPS_MISS_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::At
 /// bytes as `file`'s, for `/proc/<pid>/maps` (Linux maps the segments from
 /// the file, so its lines show the file; Lumen copies them into anonymous
 /// memory, so names them by range: [`ImageRange::from_segment`]). A
-/// segment whose file offset and address lie at different offsets in their
-/// pages (which Linux couldn't map) is left unnamed, logged at `debug`.
+/// segment `from_segment` refuses, one whose file offset and address lie at
+/// different offsets in their pages (which Linux couldn't map) or whose end
+/// overflows, is left unnamed, logged at `debug`.
 fn name_image_locked(images: &mut Vec<ImageRange<Arc<ImageFile>>>, plan: &LoadedElf, file: &ImageFile) {
     let file = Arc::new(file.clone());
     for seg in plan.segments() {
@@ -484,6 +490,7 @@ impl AddressSpace {
         if inner.torn_down || !inner.vmas.is_empty() {
             return Err(UserVmError::InvalidArg);
         }
+        debug_assert!(inner.images.is_empty(), "image names in an address space with no VMAs");
 
         let main_ranges = main.plan.mapped_ranges();
         let interp_ranges = interp.map(|i| i.plan.mapped_ranges()).unwrap_or_default();
@@ -688,7 +695,10 @@ impl AddressSpace {
     ///
     /// It doesn't check that the descriptor is open for reading: Linux
     /// refuses `mmap` of one that isn't (`EACCES`), and the syscall checks
-    /// that before calling this.
+    /// that before calling this. Nor does it check `sharing`'s `may_write`,
+    /// which must come from the open file description `file` was made from
+    /// (`MappedFile::of`): `O_RDWR` or not, the one right here that lets a
+    /// shared mapping store to the file.
     ///
     /// Nothing is mapped until a fault ([`Self::handle_page_fault`]). The
     /// address space keeps `file`'s open reference while any VMA maps the
@@ -1162,10 +1172,10 @@ impl AddressSpace {
             let Some(m) = inner.mapped_files.get(&id) else {
                 // Every VMA's file is in `mapped_files` (`file_page` relies
                 // on it too): a miss is a bug, shown as `00:00 0`.
-                debug_assert!(false, "a mapped file missing from mapped_files: {id}");
                 if !MAPS_MISS_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
                     log::error!(target: "mm", "maps: file {id} of a VMA isn't in mapped_files (a bug)");
                 }
+                debug_assert!(false, "a mapped file missing from mapped_files: {id}");
                 return None;
             };
             let inode = m.inode();
@@ -1185,7 +1195,9 @@ impl AddressSpace {
 
     /// What `msync(2)` over page-aligned `[start, end)` (`start < end`)
     /// must write back: an open reference on each file a `MAP_SHARED` VMA
-    /// overlapping it maps, once each, and whether part of the range is
+    /// with `may_write` overlapping it maps, once each (one made through a
+    /// read-only descriptor stores nothing to write), and whether part of
+    /// the range is
     /// mapped by no VMA. Private file mappings and anonymous memory have
     /// nothing to write.
     ///
@@ -1211,8 +1223,12 @@ impl AddressSpace {
                 found.hole = true;
             }
             covered = vma.end;
+            // Shared through a descriptor open for writing: Linux's
+            // `VM_SHARED`, which `do_mmap` clears without `FMODE_WRITE`, and
+            // the only mappings its `msync` writes back.
             if let Backing::File(fm) = vma.backing
                 && fm.shared
+                && fm.may_write
                 && !seen.contains(&fm.file_id)
             {
                 // As `file_page`'s: every VMA's file is in `mapped_files`.
@@ -1783,35 +1799,13 @@ crate::ktest!(
 // copy) or calling `handle_page_fault` directly, over files on a fresh
 // `tmpfs` and a fresh `ext4` volume (`vfs::page_cache::ktest_files`).
 
-/// A test file's bytes: never zero, so a zero read back is a hole or a tail.
 #[cfg(feature = "ktest")]
-fn file_vm_pattern(len: usize, seed: u8) -> Vec<u8> {
-    (0..len).map(|i| ((i % 251) as u8).wrapping_add(seed) | 1).collect()
-}
-
-/// `len` bytes of `f` at `off` (short at EOF).
-#[cfg(feature = "ktest")]
-fn file_vm_read(f: &Arc<dyn VfsInode>, off: u64, len: usize) -> Result<Vec<u8>, &'static str> {
-    let mut buf = vec![0u8; len];
-    let n = f.read_at(off, &mut buf).map_err(|_| "read_at")?;
-    buf.truncate(n);
-    Ok(buf)
-}
+use crate::vfs::page_cache::ktest_files;
 
 /// The present leaf at `va`, if any.
 #[cfg(feature = "ktest")]
 fn file_vm_leaf(space: &AddressSpace, va: u64) -> Option<lumen_mm::paging::Mapping> {
     paging::walk_user(space.root(), VirtAddr::new(va)?).mapping()
-}
-
-/// A file named `name` in `dir` holding `data`.
-#[cfg(feature = "ktest")]
-fn file_vm_file(dir: &Arc<dyn VfsInode>, name: &str, data: &[u8]) -> Result<Arc<dyn VfsInode>, &'static str> {
-    let f = dir.create(name, 0o644).map_err(|_| "create")?;
-    if f.write_at(0, data).map_err(|_| "write_at")? != data.len() {
-        return Err("short write");
-    }
-    Ok(f)
 }
 
 /// Run `check` in a fresh `tmpfs`'s root, then in a fresh `ext4` volume's
@@ -1880,8 +1874,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(150, |dir| {
-            let data = file_vm_pattern(2 * P as usize + 100, 3);
-            let f = file_vm_file(dir, "shared.bin", &data)?;
+            let data = ktest_files::pattern(2 * P as usize + 100, 3);
+            let f = ktest_files::file(dir, "shared.bin", &data)?;
             let opens = f.open_count();
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let base = space
@@ -1923,8 +1917,8 @@ crate::ktest!(
                 kassert_eq!(space.file_page_counts(), (3, 2));
                 kassert_eq!((p0.page().writable_maps(), p1.page().writable_maps()), (1, 0));
                 kassert_eq!(p2.page().writable_maps(), 1);
-                kassert!(file_vm_read(&f, 100, 15)? == b"through-the-pte");
-                kassert!(file_vm_read(&f, 2 * P + 10, 9)? == b"last-page");
+                kassert!(ktest_files::read(&f, 100, 15)? == b"through-the-pte");
+                kassert!(ktest_files::read(&f, 2 * P + 10, 9)? == b"last-page");
                 kassert_eq!(f.stat().map_err(|_| "stat")?.size, data.len() as u64); // never extended
                 // The last page's bytes past EOF read as zeros.
                 kassert_eq!(copy_from_user(&mut buf, base + 2 * P + 200), Ok(()));
@@ -1954,8 +1948,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(152, |dir| {
-            let data = file_vm_pattern(2 * P as usize, 5);
-            let f = file_vm_file(dir, "private.bin", &data)?;
+            let data = ktest_files::pattern(2 * P as usize, 5);
+            let f = ktest_files::file(dir, "private.bin", &data)?;
             let opens = f.open_count();
             let cache0 = mmap_page(&f, 0).map_err(|_| "mmap_page 0")?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
@@ -1984,7 +1978,7 @@ crate::ktest!(
                 kassert!(frame::is_allocated(copy_a));
                 kassert_eq!(space.file_page_counts(), (0, 0)); // the pin went with the leaf
                 kassert_eq!(cache0.page().writable_maps(), 0);
-                kassert!(file_vm_read(&f, 0, data.len())? == data);
+                kassert!(ktest_files::read(&f, 0, data.len())? == data);
                 kassert_eq!(copy_from_user(&mut buf, b + 5), Ok(()));
                 kassert!(buf[..] == data[5..14]);
                 kassert_eq!(copy_from_user(&mut buf, a), Ok(()));
@@ -1995,7 +1989,7 @@ crate::ktest!(
                 let m = file_vm_leaf(&space, b + P).ok_or("b page 1 not mapped")?;
                 kassert!(!m.shared && m.writable);
                 copy_b = m.phys;
-                kassert!(file_vm_read(&f, 0, data.len())? == data);
+                kassert!(ktest_files::read(&f, 0, data.len())? == data);
                 kassert_eq!(copy_from_user(&mut buf, a + P + 7), Ok(()));
                 kassert!(buf[..] == data[P as usize + 7..P as usize + 16]);
 
@@ -2028,7 +2022,7 @@ crate::ktest!(
         use crate::kassert_eq;
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(154, |dir| {
-            let f = file_vm_file(dir, "ro.bin", &file_vm_pattern(P as usize, 7))?;
+            let f = ktest_files::file(dir, "ro.bin", &ktest_files::pattern(P as usize, 7))?;
             let opens = f.open_count();
             let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
             let refused = space.mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f), 0, SHARED_RO);
@@ -2064,7 +2058,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(156, |dir| {
-            let f = file_vm_file(dir, "short.bin", &file_vm_pattern(100, 9))?;
+            let f = ktest_files::file(dir, "short.bin", &ktest_files::pattern(100, 9))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let s = space
                 .mmap_file(MapPlace::Hint(None), 3 * P, RW, file_vm_open(&f), 0, SHARED_RW)
@@ -2099,8 +2093,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         let vol = Ext4Volume::new(158)?;
-        let data = file_vm_pattern(3 * P as usize, 11);
-        let f = file_vm_file(&vol.root, "unreadable.bin", &data)?;
+        let data = ktest_files::pattern(3 * P as usize, 11);
+        let f = ktest_files::file(&vol.root, "unreadable.bin", &data)?;
         f.sync(false).map_err(|_| "sync")?;
         kassert_eq!(reclaim_ext4(&f)?, 0); // nothing cached: a fault reads the disk
         let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
@@ -2130,8 +2124,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         let vol = Ext4Volume::new(160)?;
-        let mut expected = file_vm_pattern(2 * P as usize, 13);
-        let f = file_vm_file(&vol.root, "persist.bin", &expected)?;
+        let mut expected = ktest_files::pattern(2 * P as usize, 13);
+        let f = ktest_files::file(&vol.root, "persist.bin", &expected)?;
         f.sync(false).map_err(|_| "sync")?;
         let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
         let base =
@@ -2149,8 +2143,8 @@ crate::ktest!(
         expected[P as usize + 1..P as usize + 9].copy_from_slice(b"page-two");
         kassert_eq!(reclaim_ext4(&f)?, 0); // written back and evicted
         let ro = vol.remount_ro(161)?.lookup("persist.bin").map_err(|_| "ro lookup")?;
-        kassert!(file_vm_read(&ro, 0, expected.len())? == expected);
-        kassert!(file_vm_read(&f, 0, expected.len())? == expected);
+        kassert!(ktest_files::read(&ro, 0, expected.len())? == expected);
+        kassert!(ktest_files::read(&f, 0, expected.len())? == expected);
         Ok(())
     }
 );
@@ -2165,8 +2159,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(162, |dir| {
-            let f = file_vm_file(dir, "shrink.bin", &file_vm_pattern(4 * P as usize, 15))?;
-            let g = file_vm_file(dir, "other.bin", &file_vm_pattern(P as usize, 17))?;
+            let f = ktest_files::file(dir, "shrink.bin", &ktest_files::pattern(4 * P as usize, 15))?;
+            let g = ktest_files::file(dir, "other.bin", &ktest_files::pattern(P as usize, 17))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let a = space
                 .mmap_file(MapPlace::Hint(None), 4 * P, RW, file_vm_open(&f), 0, SHARED_RW)
@@ -2234,7 +2228,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(164, |dir| {
-            let f = file_vm_file(dir, "balance.bin", &file_vm_pattern(2 * P as usize, 19))?;
+            let f = ktest_files::file(dir, "balance.bin", &ktest_files::pattern(2 * P as usize, 19))?;
             let opens = f.open_count();
             let (Ok(p0), Ok(p1)) = (mmap_page(&f, 0), mmap_page(&f, 1)) else {
                 return Err("mmap_page");
@@ -2297,7 +2291,7 @@ crate::ktest!(
                 let _active = crate::sched::UserSpaceGuard::enter(space.clone());
                 let mut head = [0u8; 8];
                 kassert_eq!(copy_from_user(&mut head, base), Ok(()));
-                kassert!(head[..] == file_vm_read(&f, P, 8)?[..]); // file page 1 now
+                kassert!(head[..] == ktest_files::read(&f, P, 8)?[..]); // file page 1 now
             }
 
             // A `brk` shrink over a file mapped inside the heap: released.
@@ -2348,7 +2342,7 @@ crate::ktest!(
         const P: u64 = PAGE_SIZE;
         const MAP: u64 = 0x1000_0000;
         let vol = TmpfsVolume::new(166, 4 * P as usize);
-        let f = file_vm_file(&vol.root, "sigbus.bin", &file_vm_pattern(100, 21))?;
+        let f = ktest_files::file(&vol.root, "sigbus.bin", &ktest_files::pattern(100, 21))?;
         let run = |addr: u64| -> Result<UserExit, &'static str> {
             // mov rax, addr; mov al, [rax]; exit_group(0); ud2
             let mut code = vec![0x48, 0xb8];
@@ -2388,8 +2382,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         let vol = Ext4Volume::new(168)?;
-        let mut expected = file_vm_pattern(P as usize, 23);
-        let f = file_vm_file(&vol.root, "synced.bin", &expected)?;
+        let mut expected = ktest_files::pattern(P as usize, 23);
+        let f = ktest_files::file(&vol.root, "synced.bin", &expected)?;
         f.sync(false).map_err(|_| "sync")?;
         let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
         let base = space.mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
@@ -2401,7 +2395,7 @@ crate::ktest!(
         expected[10..15].copy_from_slice(b"first");
         expected[100..106].copy_from_slice(b"second");
         let ro = vol.remount_ro(169)?.lookup("synced.bin").map_err(|_| "ro lookup")?;
-        kassert!(file_vm_read(&ro, 0, expected.len())? == expected);
+        kassert!(ktest_files::read(&ro, 0, expected.len())? == expected);
         space.munmap(base, P).map_err(|_| "munmap")?;
         Ok(())
     }
@@ -2420,7 +2414,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         fn check(dir: &Arc<dyn VfsInode>) -> Result<(), &'static str> {
-            let f = file_vm_file(dir, "gone.bin", &file_vm_pattern(P as usize, 25))?;
+            let f = ktest_files::file(dir, "gone.bin", &ktest_files::pattern(P as usize, 25))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             // The descriptor's reference goes at the end of this statement.
             let base =
@@ -2436,7 +2430,7 @@ crate::ktest!(
                 let mut buf = [0u8; 12];
                 kassert_eq!(copy_from_user(&mut buf, base + 5), Ok(()));
                 kassert_eq!(&buf, b"after-unlink");
-                kassert!(file_vm_read(&f, 5, 12)? == b"after-unlink");
+                kassert!(ktest_files::read(&f, 5, 12)? == b"after-unlink");
                 space.munmap(base, P).map_err(|_| "munmap")?;
             }
             kassert_eq!((space.mapped_file_count(), f.open_count()), (0, 0));
@@ -2463,8 +2457,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(172, |dir| {
-            let data = file_vm_pattern(P as usize + 100, 27);
-            let f = file_vm_file(dir, "tail.bin", &data)?;
+            let data = ktest_files::pattern(P as usize + 100, 27);
+            let f = ktest_files::file(dir, "tail.bin", &data)?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let map = |sharing| {
                 space.mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, sharing).map_err(|_| "map")
@@ -2505,7 +2499,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(174, |dir| {
-            let f = file_vm_file(dir, "regrown.bin", &file_vm_pattern(2 * P as usize, 29))?;
+            let f = ktest_files::file(dir, "regrown.bin", &ktest_files::pattern(2 * P as usize, 29))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let map = |sharing| {
                 space.mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, sharing).map_err(|_| "map")
@@ -2541,7 +2535,7 @@ crate::ktest!(
             kassert!(m.shared && m.writable);
             kassert_eq!(m.phys, current.page().phys_frame());
             kassert!(m.phys != old);
-            kassert!(file_vm_read(&f, P + 8, 5)? == b"fresh");
+            kassert!(ktest_files::read(&f, P + 8, 5)? == b"fresh");
 
             kassert_eq!(copy_to_user(q + P + 16, b"copy"), Ok(()));
             let mut head = [0u8; 32];
@@ -2569,7 +2563,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         let vol = TmpfsVolume::new(176, 8 * P as usize);
-        let f = file_vm_file(&vol.root, "order.bin", &file_vm_pattern(2 * P as usize, 31))?;
+        let f = ktest_files::file(&vol.root, "order.bin", &ktest_files::pattern(2 * P as usize, 31))?;
         let (Ok(p0), Ok(p1)) = (mmap_page(&f, 0), mmap_page(&f, 1)) else {
             return Err("mmap_page");
         };

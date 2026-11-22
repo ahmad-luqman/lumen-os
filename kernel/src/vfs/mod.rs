@@ -704,6 +704,15 @@ pub(crate) fn read_executable(path: &str) -> Result<(Vec<u8>, Arc<dyn VfsInode>)
 #[cfg(feature = "ktest")]
 static FAIL_PROC_CHECKS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// `fields` and `name` as a `/proc/<pid>/maps` line puts them (with its
+/// `\n`): the name after 73 characters, where Linux pads it, the width
+/// written out (72, then a space) rather than taken from `lumen_vm::maps`,
+/// so a ktest comparing against it checks that width too.
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_maps_line(fields: &str, name: &str) -> String {
+    format!("{:<72} {name}\n", format!("{fields} "))
+}
+
 /// Whether `line` has the shape of a `/proc/<pid>/maps` line:
 /// `start-end perms offset major:minor inode`, then nothing or a name
 /// (`[heap]`, `[stack]` or an absolute path) after 73 characters, where Linux pads

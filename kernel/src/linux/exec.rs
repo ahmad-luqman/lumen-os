@@ -317,8 +317,8 @@ crate::ktest!(
             // INTERP_BASE.
             let maps = space.format_maps();
             let line = |start: u64, perms: &str, off: u64, ino: u64, path: &str| {
-                let fields = alloc::format!("{start:08x}-{:08x} {perms} {off:08x} 00:02 {ino} ", start + 0x1000);
-                alloc::format!("{fields:<72} {path}\n")
+                let fields = alloc::format!("{start:08x}-{:08x} {perms} {off:08x} 00:02 {ino}", start + 0x1000);
+                vfs::ktest_maps_line(&fields, path)
             };
             let (main_ino, interp_ino) = inos;
             let expected = [

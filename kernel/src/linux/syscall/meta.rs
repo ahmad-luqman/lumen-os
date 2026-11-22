@@ -27,8 +27,6 @@ use super::fd::vfs;
 use super::finish;
 use crate::linux::errno;
 use crate::linux::process::{FileRef, with_current_mut};
-use crate::mm::user_vm::file_id_of;
-use crate::sched;
 use crate::user::{CopyError, copy_from_user};
 use crate::vfs::tables;
 
@@ -204,24 +202,16 @@ fn length(raw: u64) -> Result<u64, u32> {
 }
 
 /// Resize `inode` (a regular file) on a writable mount (`-EROFS`) to `len`,
-/// then unmap the current process's pages of it past the new end. The
-/// truncate has released Lock 4 before `invalidate_file_from` takes
-/// Lock 1: this syscall never holds both. A later access past the end
-/// faults into a bus error. A grow finds nothing to unmap: a fault refuses
-/// a page wholly past the old end, and every shrink of the caller's
+/// then unmap the current process's pages of it past the new end
+/// (`super::unmap_past`). A grow finds nothing to unmap: a fault refuses a
+/// page wholly past the old end, and every shrink of the caller's
 /// (`truncate`, `ftruncate`, `openat(O_TRUNC)`) unmapped its own pages
 /// past the end it made; any leaf past the new end is cleared all the same.
-///
-/// Only the current process's address space, loaded on this CPU
-/// (`invalidate_file_from`'s debug assertion): another process mapping the
-/// file keeps its pages, holding them alive, until M8 finds the mappers and
-/// shoots their TLB entries down (#255).
 fn resize(inode: &dyn VfsInode, len: u64) -> Result<u64, u32> {
     writable_mount(inode)?;
-    // Taken first, so a caller without one panics before the file changes.
-    let space = sched::current_address_space().expect("a truncate syscall runs on a thread with an address space");
+    let space = super::shrinking_space();
     inode.truncate(len).map_err(vfs)?;
-    space.invalidate_file_from(file_id_of(inode), len);
+    super::unmap_past(&space, inode, len);
     Ok(0)
 }
 
@@ -806,7 +796,7 @@ mod tests {
     /// a fresh zero page.
     fn shrink_unmaps(f: &Arc<dyn VfsInode>, shrink: impl FnOnce() -> u64) -> Result<(), &'static str> {
         use crate::user::copy_from_user;
-        let space = sched::current_address_space().ok_or("no address space")?;
+        let space = crate::sched::current_address_space().ok_or("no address space")?;
         let guard = OpenGuard::try_new(Arc::clone(f)).map_err(|_| "guard")?;
         let file = crate::mm::user_vm::MappedFile::new(guard, "/ktest/shrunk");
         let rw = Prot::READ | Prot::WRITE;

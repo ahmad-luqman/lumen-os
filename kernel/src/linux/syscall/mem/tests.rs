@@ -13,13 +13,14 @@ use lumen_vfs::{OpenFlags, VfsInode};
 use lumen_vm::PAGE_SIZE;
 
 use super::super::at::{Fd, reg};
-use super::super::fd::{ktest_user_path, sys_close, sys_open};
+use super::super::fd::{ktest_fd, ktest_user_path, sys_close, sys_open};
 use super::super::neg_errno;
 use super::{sys_mmap, sys_mprotect, sys_msync, sys_munmap};
 use crate::linux::process::{self, KTEST_USER_LEN, KTEST_USER_VA, in_test_process};
 use crate::linux::{errno, general};
 use crate::user::{copy_from_user, copy_to_user};
-use crate::vfs::page_cache::ktest_files::Ext4Volume;
+use crate::vfs::ktest_maps_line as named;
+use crate::vfs::page_cache::ktest_files::{self, Ext4Volume, file, read};
 use crate::{kassert, kassert_eq};
 
 const P: u64 = PAGE_SIZE;
@@ -63,9 +64,7 @@ fn map(len: u64, prot: u64, flags: u64, fd: Fd, off: u64) -> Result<u64, &'stati
 /// Open `path` (from `/`) with `flags` (creating it `0o644`) as a
 /// descriptor of the current process.
 fn open(path: &[u8], flags: u32) -> Result<Fd, &'static str> {
-    let user = ktest_user_path(3, path)?;
-    let fd = sys_open(user, OpenFlags::from_bits(flags), reg(0o644));
-    if fd < lumen_vfs::MAX_FDS as u64 { Ok(reg(fd)) } else { Err("open failed") }
+    ktest_fd(sys_open(ktest_user_path(3, path)?, OpenFlags::from_bits(flags), reg(0o644)))
 }
 
 /// A descriptor of the current process on `inode` (opened by `path`) with
@@ -83,31 +82,39 @@ fn inode_of(fd: Fd) -> Result<Inode, &'static str> {
     Ok(Arc::clone(&fd.file().map_err(|_| "fd")?.inode))
 }
 
-/// `len` bytes of `inode` from `off`, through the VFS's read path.
-fn read(inode: &Inode, off: u64, len: usize) -> Result<Vec<u8>, &'static str> {
-    let mut buf = alloc::vec![0u8; len];
-    let n = inode.read_at(off, &mut buf).map_err(|_| "read_at")?;
-    buf.truncate(n);
-    Ok(buf)
-}
-
-/// A file named `name` in `dir` holding `data`.
-fn file(dir: &Inode, name: &str, data: &[u8]) -> Result<Inode, &'static str> {
-    let f = dir.create(name, 0o644).map_err(|_| "create")?;
-    if f.write_at(0, data).map_err(|_| "write_at")? != data.len() {
-        return Err("short write");
-    }
-    Ok(f)
-}
-
-/// Two pages of a pattern with no zero byte.
+/// Two pages of `ktest_files::pattern` (no zero byte).
 fn pattern(seed: u8) -> Vec<u8> {
-    (0..2 * P as usize).map(|i| ((i % 251) as u8).wrapping_add(seed) | 1).collect()
+    ktest_files::pattern(2 * P as usize, seed)
 }
 
-/// Remove `/tmp`'s `path`.
+/// Remove `path` (from `/`).
 fn unlink(path: &[u8]) -> Result<(), &'static str> {
     lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false).map_err(|_| "unlink")
+}
+
+/// A file at `path` (in `/tmp`) holding two pages of `pattern(seed)`, open
+/// `O_RDWR` as `fd`: removed again when dropped, so a failing check, which
+/// returns early, leaves no file behind for the next run.
+struct TmpFile {
+    path: &'static [u8],
+    fd: Fd,
+    inode: Inode,
+}
+
+impl TmpFile {
+    fn new(path: &'static [u8], seed: u8) -> Result<Self, &'static str> {
+        let _ = unlink(path); // an earlier run's, if it crashed
+        let fd = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+        let inode = inode_of(fd)?;
+        inode.write_at(0, &pattern(seed)).map_err(|_| "write")?;
+        Ok(Self { path, fd, inode })
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        let _ = unlink(self.path); // gone already where a test unlinks it
+    }
 }
 
 /// The current process's `/proc/self/maps`, read through the VFS.
@@ -120,11 +127,6 @@ fn maps() -> Result<String, &'static str> {
 fn line(maps: &str, va: u64) -> Result<&str, &'static str> {
     let start = format!("{va:08x}-");
     maps.lines().find(|l| l.starts_with(&start)).ok_or("no maps line at the mapping")
-}
-
-/// `fields` and `name` as a maps line puts them (with its `\n`).
-fn named(fields: &str, name: &str) -> String {
-    format!("{:<72} {name}\n", format!("{fields} "))
 }
 
 /// The bytes of `name` in the root of a read-only mount of what `vol`'s
@@ -184,16 +186,12 @@ crate::ktest!(
         // On `/tmp` (tmpfs: nothing to write back; `msync` is still 0), from
         // a file offset of one page.
         in_test_process(|_| {
-            let path = b"/tmp/mem-ktest-shared";
-            let fd = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
-            let inode = inode_of(fd)?;
-            inode.write_at(0, &pattern(9)).map_err(|_| "write")?;
-            let va = map(P, RW, SHARED, fd, P)?;
+            let tmp = TmpFile::new(b"/tmp/mem-ktest-shared", 9)?;
+            let va = map(P, RW, SHARED, tmp.fd, P)?;
             copy_to_user(va, b"tmpfs-store").map_err(|_| "store")?;
             kassert_eq!(sys_msync(va, P, MS_SYNC), 0);
-            kassert_eq!(read(&inode, P, 11)?, b"tmpfs-store");
+            kassert_eq!(read(&tmp.inode, P, 11)?, b"tmpfs-store");
             kassert_eq!(sys_munmap(va, P), 0);
-            unlink(path)?;
             Ok::<(), &'static str>(())
         })?
     }
@@ -225,6 +223,32 @@ crate::ktest!(
         kassert_eq!(failed, e(errno::EIO));
         kassert_eq!(retried, 0);
         kassert!(on_disk(&vol, 237, "failing.bin", P as usize)? == expected);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn mem_msync_writes_nothing_back_for_a_shared_mapping_made_read_only() {
+        // A `MAP_SHARED` mapping through a descriptor open only for reading
+        // can't store to the file (Linux clears its `VM_SHARED`), so
+        // `msync(MS_SYNC)` writes nothing back for it: another writer's
+        // dirty page in the file, which a writeback would fail on here (the
+        // disk's writes failing), doesn't fail this `msync`.
+        let vol = Arc::new(Ext4Volume::new(238)?);
+        let f = file(&vol.root, "read-only.bin", &pattern(4)[..P as usize])?;
+        f.sync(false).map_err(|_| "sync")?;
+        let (vol2, f2) = (Arc::clone(&vol), Arc::clone(&f));
+        let synced = in_test_process(move |_| {
+            let fd = fd_on(&f2, "/ext4/read-only.bin", OpenFlags::O_RDONLY)?;
+            let va = map(P, READ, SHARED, fd, 0)?;
+            f2.write_at(5, b"another writer").map_err(|_| "write")?;
+            vol2.fail_writes(true);
+            let synced = sys_msync(va, P, MS_SYNC);
+            vol2.fail_writes(false);
+            kassert_eq!(sys_munmap(va, P), 0);
+            Ok::<_, &'static str>(synced)
+        })??;
+        kassert_eq!(synced, 0);
         Ok(())
     }
 );
@@ -269,16 +293,22 @@ crate::ktest!(
         // both faulted in (the private one copied on write): the truncate
         // drops the cache's pages, and the open unmaps the caller's, so a
         // later touch is a bus error (`EFAULT` for a kernel copy), not the
-        // old bytes or a store to a page the file no longer has.
+        // old bytes or a store to a page the file no longer has. A reopen
+        // without `O_TRUNC` first unmaps nothing: the private copy keeps
+        // its bytes and the shared page still reads the file.
         in_test_process(|_| {
-            let path = b"/tmp/mem-ktest-trunc";
-            let fd = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
-            inode_of(fd)?.write_at(0, &pattern(8)).map_err(|_| "write")?;
+            let tmp = TmpFile::new(b"/tmp/mem-ktest-trunc", 8)?;
+            let (path, fd) = (tmp.path, tmp.fd);
             let shared = map(2 * P, RW, SHARED, fd, 0)?;
             let private = map(2 * P, RW, PRIVATE, fd, 0)?;
             let mut seen = [0u8; 4];
             copy_from_user(&mut seen, shared + P).map_err(|_| "fault in")?;
             copy_to_user(private + 8, b"copy").map_err(|_| "copy on write")?;
+            let _reopened = open(path, OpenFlags::O_RDWR)?;
+            copy_from_user(&mut seen, private + 8).map_err(|_| "the private page is gone")?;
+            kassert_eq!(&seen, b"copy");
+            copy_from_user(&mut seen, shared + P).map_err(|_| "the shared page is gone")?;
+            kassert_eq!(&seen[..], &pattern(8)[P as usize..P as usize + 4]);
             let again = open(path, OpenFlags::O_RDWR | OpenFlags::O_TRUNC)?;
             kassert!(copy_from_user(&mut seen, shared + P).is_err());
             kassert!(copy_to_user(shared, b"lost").is_err());
@@ -286,7 +316,6 @@ crate::ktest!(
             kassert_eq!(inode_of(again)?.stat().map(|m| m.size), Ok(0));
             kassert_eq!(sys_munmap(shared, 2 * P), 0);
             kassert_eq!(sys_munmap(private, 2 * P), 0);
-            unlink(path)?;
             Ok::<(), &'static str>(())
         })?
     }
@@ -298,10 +327,8 @@ crate::ktest!(
         // file for I/O), so it unmaps nothing: a private copy-on-write page
         // keeps its bytes, a shared page stays mapped, and the file its size.
         in_test_process(|_| {
-            let path = b"/tmp/mem-ktest-path-trunc";
-            let fd = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
-            let inode = inode_of(fd)?;
-            inode.write_at(0, &pattern(9)).map_err(|_| "write")?;
+            let tmp = TmpFile::new(b"/tmp/mem-ktest-path-trunc", 9)?;
+            let (path, fd, inode) = (tmp.path, tmp.fd, &tmp.inode);
             let private = map(2 * P, RW, PRIVATE, fd, 0)?;
             let shared = map(2 * P, READ, SHARED, fd, 0)?;
             copy_to_user(private + 8, b"private!").map_err(|_| "copy on write")?;
@@ -315,7 +342,6 @@ crate::ktest!(
             kassert_eq!(&seen[..], &pattern(9)[P as usize..P as usize + 8]);
             kassert_eq!(sys_munmap(private, 2 * P), 0);
             kassert_eq!(sys_munmap(shared, 2 * P), 0);
-            unlink(path)?;
             Ok::<(), &'static str>(())
         })?
     }
@@ -328,10 +354,8 @@ crate::ktest!(
         // `/proc/self/maps` shows its path ` (deleted)`, and `munmap` gives
         // the last reference back.
         in_test_process(|_| {
-            let path = b"/tmp/mem-ktest-gone";
-            let fd = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
-            let inode = inode_of(fd)?;
-            inode.write_at(0, &pattern(7)).map_err(|_| "write")?;
+            let tmp = TmpFile::new(b"/tmp/mem-ktest-gone", 7)?;
+            let (path, fd, inode) = (tmp.path, tmp.fd, Arc::clone(&tmp.inode));
             let va = map(P, RW, SHARED, fd, 0)?;
             kassert_eq!(sys_close(fd), 0);
             kassert_eq!(inode.open_count(), 1); // the mapping's
@@ -345,6 +369,7 @@ crate::ktest!(
             let maps = maps()?;
             kassert!(line(&maps, va)?.ends_with(" /tmp/mem-ktest-gone (deleted)"));
             kassert_eq!(sys_munmap(va, P), 0);
+            drop(tmp);
             kassert_eq!(inode.open_count(), 0);
             Ok::<(), &'static str>(())
         })?
@@ -354,9 +379,8 @@ crate::ktest!(
 crate::ktest!(
     fn mem_mmap_fd_refuses_with_linuxs_errnos() {
         in_test_process(|_| {
-            let path = b"/tmp/mem-ktest-errnos";
-            let rw = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
-            inode_of(rw)?.write_at(0, &pattern(1)).map_err(|_| "write")?;
+            let tmp = TmpFile::new(b"/tmp/mem-ktest-errnos", 1)?;
+            let (path, rw) = (tmp.path, tmp.fd);
             let ro = open(path, OpenFlags::O_RDONLY)?;
             let wo = open(path, OpenFlags::O_WRONLY)?;
             // EBADF: not open, or O_PATH.
@@ -423,7 +447,6 @@ crate::ktest!(
             kassert_eq!(sys_mmap(fixed_at, P, READ, PRIVATE | FIXED, raw(ro), P), fixed_at);
             kassert_eq!(sys_mmap(fixed_at + P, P, READ, PRIVATE | NOREPLACE, raw(ro), 0), fixed_at + P);
             kassert_eq!(sys_munmap(fixed_at, 2 * P), 0);
-            unlink(path)?;
             // The anonymous path is as it was: `fd` and `off` ignored.
             let va = sys_mmap(0, P, RW, PRIVATE | general::MAP_ANONYMOUS as u64, 99, 0x123);
             kassert!(va < u64::MAX - 4095);
@@ -437,8 +460,8 @@ crate::ktest!(
     fn mem_mmap_dev_zero_is_anonymous_memory() {
         // `/dev/zero` maps zero-filled anonymous memory, private or shared,
         // writable through a read-only descriptor when private, placed as
-        // asked, at any offset a device can have; its maps line names no
-        // file.
+        // asked, at an offset past i64::MAX (below 2^64, as a device's may
+        // be); its maps line names no file.
         in_test_process(|_| {
             let zero = open(b"/dev/zero", OpenFlags::O_RDONLY)?;
             let va = map(2 * P, RW, PRIVATE, zero, 0)?;
@@ -515,10 +538,8 @@ crate::ktest!(
                 frame.rax
             };
             let high = 0xdead_beef_0000_0000u64;
-            let path = b"/tmp/mem-ktest-dispatch";
-            let fd = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
-            let inode = inode_of(fd)?;
-            inode.write_at(0, &pattern(2)).map_err(|_| "write")?;
+            let tmp = TmpFile::new(b"/tmp/mem-ktest-dispatch", 2)?;
+            let (fd, inode) = (tmp.fd, &tmp.inode);
             let at = 0x7000_0000_0000;
             kassert_eq!(call(general::__NR_mmap, [at, P, RW, SHARED | FIXED, high | raw(fd), P]), at);
             let mut seen = [0u8; 8];
@@ -526,12 +547,11 @@ crate::ktest!(
             kassert_eq!(&seen[..], &pattern(2)[P as usize..P as usize + 8]);
             copy_to_user(at, b"syscall!").map_err(|_| "store")?;
             kassert_eq!(call(general::__NR_msync, [at, P, high | u64::from(general::MS_SYNC), 0, 0, 0]), 0);
-            kassert_eq!(read(&inode, P, 8)?, b"syscall!");
+            kassert_eq!(read(inode, P, 8)?, b"syscall!");
             kassert_eq!(call(general::__NR_msync, [at, 0, 0, 0, 0, 0]), 0);
             kassert_eq!(call(general::__NR_msync, [at + 1, P, 0, 0, 0, 0]), e(errno::EINVAL));
             kassert_eq!(call(general::__NR_munmap, [at, P, 0, 0, 0, 0]), 0);
             kassert_eq!(call(general::__NR_msync, [at, P, u64::from(general::MS_SYNC), 0, 0, 0]), e(errno::ENOMEM));
-            unlink(path)?;
             Ok::<(), &'static str>(())
         })?
     }
@@ -544,19 +564,15 @@ crate::ktest!(
         // from a file names its segments' lines after it, at their file
         // offsets, its `.bss` past the file's bytes anonymous.
         in_test_process(|_| {
-            let path = b"/tmp/mem-ktest-maps";
-            let fd = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
-            let inode = inode_of(fd)?;
-            inode.write_at(0, &pattern(2)).map_err(|_| "write")?;
-            let ino = inode.stat().map_err(|_| "stat")?.ino;
-            let va = map(P, RW, SHARED, fd, P)?;
+            let tmp = TmpFile::new(b"/tmp/mem-ktest-maps", 2)?;
+            let ino = tmp.inode.stat().map_err(|_| "stat")?.ino;
+            let va = map(P, RW, SHARED, tmp.fd, P)?;
             let maps = maps()?;
             let line = line(&maps, va)?;
             let fields = format!("{va:08x}-{:08x} rw-s 00001000 00:02 {ino}", va + P);
             kassert_eq!(format!("{line}\n"), named(&fields, "/tmp/mem-ktest-maps"));
             kassert_eq!(line.find('/'), Some(73));
             kassert_eq!(sys_munmap(va, P), 0);
-            unlink(path)?;
             Ok::<(), &'static str>(())
         })??;
 
@@ -564,13 +580,18 @@ crate::ktest!(
         // its rodata and data sharing page 0x402000 (file offset 0x2000),
         // and a .bss page at 0x403000. Anonymous memory mapped over the text
         // (`MAP_FIXED`) isn't named after the file; the data page beside it
-        // still is.
+        // still is, until it is unmapped: memory mapped there again
+        // (`MAP_FIXED_NOREPLACE`, replacing nothing) isn't named either.
         let relro = load_and_list("mem-ktest-exe", &crate::mm::user_vm::build_relro_test_elf(), |space| {
             let anon = u64::from(general::MAP_ANONYMOUS | general::MAP_PRIVATE | general::MAP_FIXED);
             let replaced = space.mmap_anon(0x40_1000, P, lumen_vm::Prot::READ, anon);
-            (replaced, space.format_maps())
+            let after = space.format_maps();
+            let noreplace = u64::from(general::MAP_ANONYMOUS | general::MAP_PRIVATE | general::MAP_FIXED_NOREPLACE);
+            let unmapped = space.munmap(0x40_2000, P);
+            let again = space.mmap_anon(0x40_2000, P, lumen_vm::Prot::READ, noreplace);
+            (replaced, after, unmapped.and(again), space.format_maps())
         })?;
-        let (maps, ino, (replaced, after)) = relro;
+        let (maps, ino, (replaced, after, again, last)) = relro;
         let at = |fields: &str| named(&format!("{fields} 00:02 {ino}"), "/tmp/mem-ktest-exe");
         let text = at("00401000-00402000 r-xp 00001000");
         let data = at("00402000-00403000 rw-p 00002000");
@@ -583,6 +604,11 @@ crate::ktest!(
         if !(after.contains("00401000-00402000 r--p 00000000 00:00 0\n") && after.contains(&data)) {
             crate::ktest::diag(format_args!("maps after MAP_FIXED over the text:\n{after}"));
             return Err("a mapping over the executable's text is named after it");
+        }
+        kassert_eq!(again, Ok(0x40_2000));
+        if !last.contains("00402000-00403000 r--p 00000000 00:00 0\n") {
+            crate::ktest::diag(format_args!("maps after munmap and a new mapping over the data:\n{last}"));
+            return Err("a mapping where the executable's data was unmapped is named after it");
         }
 
         // A segment starting mid-page, its first page its own: its line

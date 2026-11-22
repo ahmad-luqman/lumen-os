@@ -639,7 +639,7 @@ read, then the page and its rights, or the level that is not present. It
 takes no locks; a table outside HHDM-mapped RAM ends the walk instead of
 being read, and if the walk itself faults the report still ends properly.
 
-### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, its core built in #255 (the in-kernel API: `AddressSpace::mmap_file`, the fault paths, `invalidate_file_from`; `truncate`/`ftruncate` call `invalidate_file_from` since #254's `meta` cluster, `openat(O_TRUNC)` since #255's `mmap(fd)` and `msync`), M7; CoW `fork` and shootdowns in M8)
+### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, its core built in #255 (the in-kernel API: `AddressSpace::mmap_file`, the fault paths, `invalidate_file_from`), the `mmap(fd)` and `msync` syscalls built in #255 too; `truncate`/`ftruncate` (#254's `meta` cluster) and `openat(O_TRUNC)` (#255) call `invalidate_file_from`; M7; CoW `fork` and shootdowns in M8)
 
 Each user process owns an `AddressSpace` protected by a **sleeping,
 interrupt-enabled `SleepMutex`** (not an IRQ-off `SpinLock`—needed both for
@@ -3614,7 +3614,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 4 | `stat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, 0)` |
 | 6 | `lstat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW)` |
 | 8 | `lseek(fd, off, whence)` | `SEEK_SET` (0), `SEEK_CUR` (1), `SEEK_END` (2) on regular files, `/proc`, and `/dev/{null,zero,random,urandom}` (returning 0); on directories updates `OpenFile::dir_cursor` (`SEEK_SET` for `musl` `rewinddir`/`seekdir`); `-ESPIPE` on console/tty; `-EBADF` on `O_PATH`; rejects resulting negative offset with `-EINVAL` |
-| 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); masks `flags & MAP_TYPE` (`0x0f`) to select `MAP_SHARED` (1), `MAP_PRIVATE` (2), or `MAP_SHARED_VALIDATE` (3, rejecting unknown flags with `-EOPNOTSUPP`; any other `MAP_TYPE` → `-EINVAL`); `MAP_SYNC` and `MAP_FIXED_NOREPLACE` with `MAP_SHARED_VALIDATE` → `-EOPNOTSUPP`, as Linux's `LEGACY_MAP_MASK`; ignores advisory `MAP_DENYWRITE`/`MAP_EXECUTABLE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_NONBLOCK`/`MAP_STACK`/`MAP_LOCKED`/`MAP_UNINITIALIZED` and `MAP_32BIT`/`MAP_ABOVE4G`; `MAP_HUGETLB` → `-EINVAL`, and `MAP_GROWSDOWN` on a file → `-EINVAL`; validates `off & 0xfff == 0`, `len != 0` (`-EINVAL`), `len`'s page rounding (`-ENOMEM`), `off + aligned_len` at most `i64::MAX` for a regular file, 2^64 for a device (`-EOVERFLOW`), `fd` open & readable (`-EBADF` if closed or `O_PATH`, `-EACCES` on `O_WRONLY` or `MAP_SHARED \| PROT_WRITE` without `O_RDWR`), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); records `may_write` on `FileMapping` |
+| 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); masks `flags & MAP_TYPE` (`0x0f`) to select `MAP_SHARED` (1), `MAP_PRIVATE` (2), or `MAP_SHARED_VALIDATE` (3, rejecting unknown flags with `-EOPNOTSUPP`; any other `MAP_TYPE` → `-EINVAL`); `MAP_SYNC` and `MAP_FIXED_NOREPLACE` with `MAP_SHARED_VALIDATE` → `-EOPNOTSUPP`, as Linux's `LEGACY_MAP_MASK`; ignores advisory `MAP_DENYWRITE`/`MAP_EXECUTABLE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_NONBLOCK`/`MAP_STACK`/`MAP_LOCKED`/`MAP_UNINITIALIZED` and `MAP_32BIT`/`MAP_ABOVE4G`; `MAP_HUGETLB` → `-EINVAL`, and `MAP_GROWSDOWN` on a file → `-EINVAL`; validates `off & 0xfff == 0`, `len != 0` (`-EINVAL`), `len`'s page rounding (`-ENOMEM`), `off + aligned_len` at most `i64::MAX` for a regular file, below 2^64 otherwise (Linux's `ULONG_MAX` for a character device) (`-EOVERFLOW`), `fd` open & readable (`-EBADF` if closed or `O_PATH`, `-EACCES` on `O_WRONLY` or `MAP_SHARED \| PROT_WRITE` without `O_RDWR`), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); records `may_write` on `FileMapping` |
 | 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `count` capped at 1 MiB (`MAX_SINGLE_IO`), and a fault or filesystem error after the first 4 KiB chunk returns the bytes moved. Errors in this order: `-EINVAL` if `off < 0`; `-EBADF` if not open or `O_PATH`; `-ESPIPE` on console/tty and FIFO/socket nodes; `-EBADF` if not readable; `-EFAULT` if the buffer isn't wholly in user space; `-EINVAL` if `off + count` passes `i64::MAX`; `-EISDIR` on directories (even for 0 bytes) |
 | 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); same cap and the same errors in the same order as `pread64` (`-EBADF` if not writable; no `-EISDIR`, as a directory can't be open for writing) |
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
@@ -5207,8 +5207,9 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     VM core keeps each guard beside its PTE (`AddressSpace::writable_maps`)
     and drops it only after clearing or downgrading the PTE and flushing
     (section 5's unmap order). `WritableMap::note_pte_dirty` marks the page
-    dirty from a PTE's hardware `DIRTY` bit, for a sweep that keeps the
-    mapping. `set_dirty`, `inc_writable_maps` and `dec_writable_maps` are
+    dirty from a PTE's hardware `DIRTY` bit, for a walk that downgrades or
+    clears the PTE (`mprotect`, `munmap`, truncate invalidation,
+    teardown). `set_dirty`, `inc_writable_maps` and `dec_writable_maps` are
     `pub(super)`: inside `vfs`, only the guard and the ktests count
     mappings. A `fork` copying a writable shared PTE would take a second
     guard of its own.

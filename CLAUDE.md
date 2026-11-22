@@ -381,8 +381,8 @@ one is its own PR that updates that doc first.
   struct layouts), `uname`'s payload and the `linux` command (`linux /path`
   from the VFS, `run_exec`: load, run, count frames, the path as `exe`);
   `linux/exec.rs` `Exec` (#255: a binary and its `PT_INTERP` interpreter
-  read and parsed once, each with the `ImageFile` naming its maps lines
-  and giving its path, `load` through `AddressSpace::from_images`;
+  read and parsed once, each read from a file with its `ImageFile` (none
+  for a boot module), naming its maps lines and giving its path, `load` through `AddressSpace::from_images`;
   `ExecError`, each read naming its file);
   `linux/process.rs` `ProcessState` (#254: the private 1024-slot FD table
   of `OpenFile`s, `install_current_fd`/`insert_current_fd`/`dup_current_fd`(`_from`)/
@@ -398,8 +398,7 @@ one is its own PR that updates that doc first.
   shared copy helpers, a module per cluster holding its handlers (`fd`,
   `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, with #255's
   `mmap` of a descriptor and `msync` (ktests in `mem/tests.rs`), `proc`;
-  `fd`
-  holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
+  `fd` holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
   terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`,
   `getdents64` (the filesystem's `readdir` cursor in `dir_cursor`), `chdir`
   and `fchdir`; every M7 syscall implemented, the stubs gone with #255's

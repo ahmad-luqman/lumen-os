@@ -6,8 +6,9 @@
 //! offset page-aligned (`EINVAL`), the descriptor open and not `O_PATH`
 //! (`EBADF`), no `MAP_HUGETLB` (`EINVAL`: no file is on hugetlbfs), a
 //! non-zero length (`EINVAL`) whose page rounding fits (`ENOMEM`), an end
-//! in the file a regular file can have (`EOVERFLOW`: at most `i64::MAX`, the
-//! largest `loff_t`; a device's up to 2^64, Linux's `file_mmap_ok`), then
+//! in the file the inode can have (`EOVERFLOW`: at most `i64::MAX`, the
+//! largest `loff_t`, for a regular file, below 2^64 otherwise, Linux's
+//! `ULONG_MAX` for a character device: `file_mmap_ok`), then
 //! the type in `flags & MAP_TYPE`:
 //! - `MAP_SHARED`: flags Linux doesn't know are ignored;
 //!   `MAP_SHARED_VALIDATE` refuses them (`EOPNOTSUPP`), and `MAP_SYNC` and
@@ -35,7 +36,8 @@
 //! **Not as Linux:**
 //! - Placement's errors (`MAP_FIXED_NOREPLACE`'s `EEXIST`, no room's
 //!   `ENOMEM`) come after every check above; Linux finds the address (in
-//!   `get_unmapped_area`) before `EOVERFLOW` and the access checks.
+//!   `get_unmapped_area`) before `EOVERFLOW`, the map type and every check
+//!   after it.
 //! - `MAP_32BIT` and `MAP_ABOVE4G` are taken and ignored: the mapping is
 //!   placed as without them.
 //! - A shared `/dev/zero` mapping is plain anonymous memory: its maps line
@@ -43,12 +45,14 @@
 //!   and one made through a read-only descriptor can later be made
 //!   writable with `mprotect` (Linux refuses, `EACCES`): anonymous VMAs
 //!   carry no `may_write`. Harmless until M8's `fork` shares one.
-//! - `/proc/<pid>/maps`' file columns differ in a few ways, listed on
-//!   `user_vm::MappedFile` and `user_vm::ImageFile`: the descriptor's path
-//!   (not normalised, nor a symlink's target, nor following a rename), the
-//!   first mapping's for every mapping of a file, ` (deleted)` only once
-//!   the file's last link is gone (with the synthetic inode number a
-//!   detached ext4 inode gets), and none of that for an executable's lines.
+//! - `/proc/<pid>/maps`' file columns differ in a few ways, each listed
+//!   on `user_vm::MappedFile` (a file mapping's: the descriptor's path, not
+//!   normalised nor following a rename; the first mapping's for every
+//!   mapping of a file; ` (deleted)` only once the file's last link is
+//!   gone, then with the synthetic inode number a detached ext4 inode gets)
+//!   and `user_vm::ImageFile` (an executable's: the path it was run by, a
+//!   symlink in it unresolved; never ` (deleted)`; the inode number from
+//!   load time).
 
 use lumen_vfs::{AccessMode, DevId, InodeType};
 use lumen_vm::PAGE_SIZE;
@@ -205,12 +209,16 @@ pub(super) fn sys_brk(addr: u64) -> u64 {
 ///   (`AddressSpace::msync_files`). A writable shared page is dirty for as
 ///   long as it is mapped writable, so stores made through the mapping
 ///   reach the disk without the PTEs' dirty bits being read.
-/// - `MS_ASYNC` writes nothing: Linux's has started no I/O since 2.6.19
+/// - `MS_ASYNC` writes nothing: Linux's has done nothing since 2.6.19 (no
+///   I/O since 2.5.67)
 ///   either; the pages are already dirty in the page cache, which a
 ///   writeback (`fsync`, `sync`, reclaim) writes. `MS_INVALIDATE` is
 ///   accepted and does nothing: a `MAP_SHARED` mapping is the page cache's
 ///   own pages, so nothing is stale.
-/// - Private and anonymous ranges have nothing to write.
+/// - Private and anonymous ranges have nothing to write, nor a shared one
+///   made through a read-only descriptor (Linux's `do_mmap` clears its
+///   `VM_SHARED`): another writer's dirty pages in that file are left to
+///   its own writeback, so its error can't fail this `msync`.
 /// - Part of the range mapped by no VMA is `ENOMEM` (with `MS_SYNC`, after
 ///   the mapped parts are written back).
 pub(super) fn sys_msync(addr: u64, length: u64, flags: i32) -> u64 {

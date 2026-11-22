@@ -711,6 +711,30 @@ pub(crate) mod ktest_files {
         ktest_util::mount(build_minimal_ext4_image_blocks(256), minor)
     }
 
+    /// `len` bytes of a test pattern for a file, seeded by `seed`: never
+    /// zero, so a zero read back is a hole or a tail.
+    pub(crate) fn pattern(len: usize, seed: u8) -> alloc::vec::Vec<u8> {
+        (0..len).map(|i| ((i % 251) as u8).wrapping_add(seed) | 1).collect()
+    }
+
+    /// `len` bytes of `f` at `off` (short at EOF), through the VFS's read
+    /// path.
+    pub(crate) fn read(f: &Arc<dyn VfsInode>, off: u64, len: usize) -> Result<alloc::vec::Vec<u8>, &'static str> {
+        let mut buf = alloc::vec![0u8; len];
+        let n = f.read_at(off, &mut buf).map_err(|_| "read_at")?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// A file named `name` in `dir` holding `data`.
+    pub(crate) fn file(dir: &Arc<dyn VfsInode>, name: &str, data: &[u8]) -> Result<Arc<dyn VfsInode>, &'static str> {
+        let f = dir.create(name, 0o644).map_err(|_| "create")?;
+        if f.write_at(0, data).map_err(|_| "write_at")? != data.len() {
+            return Err("short write");
+        }
+        Ok(f)
+    }
+
     /// A fresh `tmpfs` holding `quota_bytes`.
     pub(crate) struct TmpfsVolume {
         _fs: Arc<super::super::tmpfs::Tmpfs>,

@@ -33,8 +33,8 @@
 //! printed split at the heap's edges, so a `.bss` coalesced with the first
 //! `brk` pages still shows `[heap]` from the initial break. An anonymous VMA
 //! inside the stack range is `[stack]`, and never split. Where names
-//! overlap, `[stack]` wins, then `[heap]`, then an image range (the first
-//! of overlapping ones).
+//! overlap, `[stack]` wins, then `[heap]`, then an image range (one of the
+//! overlapping ones: a trim's split reorders them).
 
 use alloc::vec::Vec;
 use core::fmt::{self, Write as _};
@@ -98,6 +98,7 @@ impl<F> ImageRange<F> {
         let start = align_down_page(vaddr);
         let end = align_up_page(vaddr.checked_add(filesz)?)?;
         let offset = align_down_page(file_offset);
+        // The file bytes must end inside the file's offsets too.
         file_offset.checked_add(filesz)?;
         Some(Self { start, end, offset, file })
     }
@@ -109,6 +110,7 @@ impl<F: Clone> ImageRange<F> {
     /// split in two around it, the tail's offset following its new start;
     /// one inside it goes. In place, the split tails appended.
     pub fn trim(ranges: &mut Vec<Self>, start: u64, end: u64) {
+        debug_assert!(start < end, "trimming an empty range {start:#x}..{end:#x}");
         let mut tails = Vec::new();
         ranges.retain_mut(|r| {
             if r.end <= start || r.start >= end {
