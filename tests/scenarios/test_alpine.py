@@ -6,19 +6,17 @@ neither the Lumen shell nor ash can pipe one Linux process into another, and
 ash can't start external commands (fork, exec, pipe and dup2 arrive in M8)."""
 
 import re
-import subprocess
 
 from lumen_harness import BUILD_DIR
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.klog import unexpected_warnings
-from lumen_harness.leaks import CleanRuns
+from lumen_harness.leaks import BUSYBOX_EXIT, CleanRuns
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import copy_rootfs, e2fsck_check, find_e2fsprogs
+from lumen_harness.rootfs import copy_rootfs, debugfs, debugfs_names, e2fsck_check
 from lumen_harness.shell import PROMPT, run
 
 BOOT_TIMEOUT = 60
 MINIROOTFS = BUILD_DIR / "deps" / "alpine-minirootfs"
-EXIT_LINE = re.compile(r"linux: /bin/busybox exit=(\d+) leaked_frames=(-?\d+)")
 ASH_PROMPT = r"[~/][^\n]* # "
 
 
@@ -34,31 +32,18 @@ class Busybox:
     def __call__(self, args, *, status=0, leaked=0):
         """`/bin/busybox <args>`'s output, less the `linux:` line, which must
         give `status` as its exit code and `leaked` frames."""
-        self.clean.before_run()
-        out = run(self.m, f"linux /bin/busybox {args}", 60).replace("\r\n", "\n")
+        out = self.clean.run(f"linux /bin/busybox {args}")
         lines = out.splitlines()
         assert lines, out
-        done = EXIT_LINE.fullmatch(lines[-1])
+        done = BUSYBOX_EXIT.fullmatch(lines[-1])
         assert done and int(done.group(1)) == status, out
         assert int(done.group(2)) == leaked, f"expected leaked_frames={leaked}:\n{out}"
         return "".join(line + "\n" for line in lines[:-1])
 
-
-def debugfs(image, request):
-    """What the host's `debugfs -R <request>` prints for `image` (read-only)."""
-    tool = find_e2fsprogs()[1].parent / "debugfs"
-    proc = subprocess.run(
-        [str(tool), "-R", request, str(image)], capture_output=True, text=True, check=False
-    )
-    assert proc.returncode == 0, f"debugfs -R {request!r}: {proc.stderr}"
-    return proc.stdout
-
-
-def names(image, directory):
-    """The names in `directory` on `image`, by `debugfs`'s `ls -p`
-    (`/inode/mode/uid/gid/name/size/` lines), without `.` and `..`."""
-    rows = [line.split("/") for line in debugfs(image, f"ls -p {directory}").splitlines() if line]
-    return {row[5] for row in rows if len(row) > 5} - {".", ".."}
+    def assert_gone(self, path):
+        """`ls <path>` fails: no such file or directory."""
+        out = self("ls " + path, status=1)
+        assert "No such file or directory" in out, out
 
 
 def test_alpine_minirootfs_coreutils(boot, tmp_path):
@@ -84,8 +69,9 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
     runs kept clear of #300's stack-window page tables. Then `sync` and
     `exit`; the image passes the host's `e2fsck -fn`, and its `debugfs`
     finds the changes on the disk: `/group.sed` edited, `/untar`'s files
-    equal to the host's, the moved file and tree gone from `/`, and `/tmp`
-    (a tmpfs mount over it) empty there."""
+    equal to the host's, `/` holding exactly the image's names plus the
+    test's (the moved file and tree gone, no temporary file left), and
+    `/tmp` (a tmpfs mount over it) empty there."""
     passwd = (MINIROOTFS / "etc" / "passwd").read_text()
     group = (MINIROOTFS / "etc" / "group").read_text()
     release = (MINIROOTFS / "etc" / "alpine-release").read_text()
@@ -115,23 +101,19 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
     assert busybox("cmp /etc/passwd /tmp/passwd") == ""
     assert busybox("mv /tmp/passwd /passwd.moved") == ""
     assert busybox("cat /passwd.moved") == passwd
-    gone = busybox("ls /tmp/passwd", status=1)
-    assert "No such file or directory" in gone, gone
+    busybox.assert_gone("/tmp/passwd")
     assert busybox("mv /passwd.moved /tmp/passwd.back") == ""
     assert busybox("cmp /etc/passwd /tmp/passwd.back") == ""
-    gone = busybox("ls /passwd.moved", status=1)
-    assert "No such file or directory" in gone, gone
+    busybox.assert_gone("/passwd.moved")
 
     assert busybox("mkdir -p /tmp/tree/sub") == ""
     assert busybox("cp /etc/group /tmp/tree/sub/group", leaked=1) == ""
     assert busybox("mv /tmp/tree /tree") == ""
     assert busybox("cmp /etc/group /tree/sub/group") == ""
-    gone = busybox("ls /tmp/tree", status=1)
-    assert "No such file or directory" in gone, gone
+    busybox.assert_gone("/tmp/tree")
     assert busybox("mv /tree /tmp/tree2") == ""
     assert busybox("cmp /etc/group /tmp/tree2/sub/group") == ""
-    gone = busybox("ls /tree", status=1)
-    assert "No such file or directory" in gone, gone
+    busybox.assert_gone("/tree")
 
     # grep, sed, awk, against the host's copies of the files.
     lines = passwd.splitlines()
@@ -161,8 +143,9 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
     assert busybox("cmp /etc/passwd /untar/passwd") == ""
     assert busybox("cmp /etc/group /untar/group") == ""
 
-    # ash -s: built-ins only, the script fed a line at a time. Each echo
-    # prints what its input line doesn't spell out, so its echo can't match.
+    # ash -s: built-ins only, the script fed a line at a time. Each `echo`
+    # prints text its typed line doesn't contain, so the terminal's echo of
+    # that line can't match the pattern.
     ash_from = len(m.output)
     busybox.clean.before_run()
     m.send_line("linux /bin/busybox ash -s")
@@ -189,16 +172,18 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
     m.expect(PROMPT, 10)
     assert CRASH_BEGIN not in m.output
     assert unexpected_warnings(m.output[ash_from:]) == []
+    busybox.clean.finish()
 
     assert run(m, "sync", 60) == "sync: ok\n"
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
     e2fsck_check(disk)
 
-    root = names(disk, "/")
-    assert {"group.sed", "untar"} <= root and not {"passwd.moved", "tree"} & root, root
-    assert names(disk, "/tmp") == set()
-    assert names(disk, "/untar") == {"passwd", "group"}
+    pristine = debugfs_names(BUILD_DIR / "alpine-rootfs.ext4", "/")
+    assert "tmp" in pristine, pristine
+    assert debugfs_names(disk, "/") == pristine | {".ash_history", "group.sed", "untar"}
+    assert debugfs_names(disk, "/tmp") == set()
+    assert debugfs_names(disk, "/untar") == {"passwd", "group"}
     assert debugfs(disk, "cat /group.sed") == edited
     assert debugfs(disk, "cat /untar/passwd") == passwd
     assert debugfs(disk, "cat /untar/group") == group

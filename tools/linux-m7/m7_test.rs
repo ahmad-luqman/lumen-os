@@ -27,7 +27,8 @@
 //!   between `m7_test: maps begin` and `m7_test: maps end`.
 //!
 //! A mode's success ends in `m7_test: <mode> ok` and exit 0. A failed mode
-//! check prints `m7_test: FAIL <check>` (with `errno=<n>` when a call failed)
+//! check prints `m7_test: FAIL <check>` (with `errno=<n>` when a call failed;
+//! a short `pread`/`pwrite` says so and how many bytes moved)
 //! and exits with a code naming it (10 and up); a `dlopen`, `dlsym` or
 //! `dlclose` failure prints its own line and exits 1 to 5; bad arguments
 //! exit 6 (too long) or 7 (usage).
@@ -142,7 +143,9 @@ fn write_hex(fd: c_int, n: usize) {
     write_all(fd, &buf[i..]);
 }
 
-/// Print `m7_test: FAIL <what>` and give back `code`: a check on the data.
+/// Print `m7_test: FAIL <what>` and give back `code`: a check with no errno
+/// to show (the data, a short transfer, or a call that should have failed
+/// succeeding).
 fn fail(code: c_int, what: &[u8]) -> c_int {
     write_all(2, b"m7_test: FAIL ");
     write_all(2, what);
@@ -151,7 +154,7 @@ fn fail(code: c_int, what: &[u8]) -> c_int {
 }
 
 /// Print `m7_test: FAIL <what> errno=<errno>` and give back `code`: a call
-/// that failed, or didn't fail as it should.
+/// that failed (or failed with the wrong errno).
 fn fail_os(code: c_int, what: &[u8]) -> c_int {
     let e = errno();
     write_all(2, b"m7_test: FAIL ");
@@ -159,6 +162,44 @@ fn fail_os(code: c_int, what: &[u8]) -> c_int {
     write_all(2, b" errno=");
     write_num(2, e);
     write_all(2, b"\n");
+    code
+}
+
+/// A call that should fail with errno `want` (`failed`: whether it returned
+/// its failure value): `None` if it did, else `code` after printing
+/// `<what> succeeded` or `<what> not <want_name> errno=<n>`.
+fn refused(code: c_int, what: &[u8], failed: bool, want: c_int, want_name: &[u8]) -> Option<c_int> {
+    if !failed {
+        write_all(2, b"m7_test: FAIL ");
+        write_all(2, what);
+        write_all(2, b" succeeded\n");
+        return Some(code);
+    }
+    let e = errno();
+    if e == want {
+        return None;
+    }
+    write_all(2, b"m7_test: FAIL ");
+    write_all(2, what);
+    write_all(2, b" not ");
+    write_all(2, want_name);
+    write_all(2, b" errno=");
+    write_num(2, e);
+    write_all(2, b"\n");
+    Some(code)
+}
+
+/// A `pread`/`pwrite` that moved `n` bytes, not all: `<what> errno=<n>`
+/// for a failed call, `<what>: short, <n> bytes` for a short one.
+fn fail_transfer(code: c_int, what: &[u8], n: isize) -> c_int {
+    if n < 0 {
+        return fail_os(code, what);
+    }
+    write_all(2, b"m7_test: FAIL ");
+    write_all(2, what);
+    write_all(2, b": short, ");
+    write_num(2, n as c_int);
+    write_all(2, b" bytes\n");
     code
 }
 
@@ -194,15 +235,20 @@ fn open_path(path: &CPath, flags: c_int) -> c_int {
     unsafe { open(path.ptr(), flags) }
 }
 
-/// `len` bytes of `fd` from `off` into `buf`, whole or not at all.
-fn pread_exact(fd: c_int, buf: &mut [u8], off: i64) -> bool {
+/// `buf.len()` bytes of `fd` from `off` into `buf`: `Err` with what `pread`
+/// returned (-1, or a short count) unless it read them all.
+fn pread_all(fd: c_int, buf: &mut [u8], off: i64) -> Result<(), isize> {
     // SAFETY: `buf` is valid for `buf.len()` bytes of writes.
-    unsafe { pread(fd, buf.as_mut_ptr(), buf.len(), off) == buf.len() as isize }
+    let n = unsafe { pread(fd, buf.as_mut_ptr(), buf.len(), off) };
+    if n == buf.len() as isize { Ok(()) } else { Err(n) }
 }
 
-fn pwrite_exact(fd: c_int, buf: &[u8], off: i64) -> bool {
+/// `buf` to `fd` at `off`: `Err` with what `pwrite` returned unless it
+/// wrote it all.
+fn pwrite_all(fd: c_int, buf: &[u8], off: i64) -> Result<(), isize> {
     // SAFETY: `buf` is valid for `buf.len()` bytes of reads.
-    unsafe { pwrite(fd, buf.as_ptr(), buf.len(), off) == buf.len() as isize }
+    let n = unsafe { pwrite(fd, buf.as_ptr(), buf.len(), off) };
+    if n == buf.len() as isize { Ok(()) } else { Err(n) }
 }
 
 fn map(len: usize, prot: c_int, flags: c_int, fd: c_int) -> *mut u8 {
@@ -289,8 +335,8 @@ fn mode_shared(path: &CPath) -> c_int {
         return fail_os(11, b"shared: mmap");
     }
     let mut buf = [0u8; 2 * PAGE];
-    if !pread_exact(fd, &mut buf, 0) {
-        return fail_os(12, b"shared: pread");
+    if let Err(n) = pread_all(fd, &mut buf, 0) {
+        return fail_transfer(12, b"shared: pread", n);
     }
     if !mapping_is(p, 0, &buf) {
         return fail(13, b"shared: mapping differs from pread");
@@ -303,21 +349,21 @@ fn mode_shared(path: &CPath) -> c_int {
         poke(p, PAGE + i, b);
     }
     let mut got = [0u8; 64];
-    if !pread_exact(fd, &mut got[..SHARED_STORE.len()], 0) {
-        return fail_os(21, b"shared: pread of page 0");
+    if let Err(n) = pread_all(fd, &mut got[..SHARED_STORE.len()], 0) {
+        return fail_transfer(21, b"shared: pread of page 0", n);
     }
     if &got[..SHARED_STORE.len()] != SHARED_STORE {
         return fail(14, b"shared: pread misses a store through the mapping");
     }
-    if !pread_exact(fd, &mut got[..SHARED_STORE_1.len()], PAGE as i64) {
-        return fail_os(22, b"shared: pread of page 1");
+    if let Err(n) = pread_all(fd, &mut got[..SHARED_STORE_1.len()], PAGE as i64) {
+        return fail_transfer(22, b"shared: pread of page 1", n);
     }
     if &got[..SHARED_STORE_1.len()] != SHARED_STORE_1 {
         return fail(15, b"shared: pread misses a store to page 1");
     }
     // `pwrite`, then the mapping sees it.
-    if !pwrite_exact(fd, SHARED_PWRITE, 512) {
-        return fail_os(16, b"shared: pwrite");
+    if let Err(n) = pwrite_all(fd, SHARED_PWRITE, 512) {
+        return fail_transfer(16, b"shared: pwrite", n);
     }
     if !mapping_is(p, 512, SHARED_PWRITE) {
         return fail(17, b"shared: mapping misses a pwrite");
@@ -327,11 +373,9 @@ fn mode_shared(path: &CPath) -> c_int {
         return fail_os(18, b"shared: msync(MS_SYNC)");
     }
     // SAFETY: as above; an address off a page boundary is refused.
-    if unsafe { msync(p.add(1).cast(), PAGE, MS_SYNC) } == 0 {
-        return fail(19, b"shared: msync of an unaligned address succeeded");
-    }
-    if errno() != EINVAL {
-        return fail_os(19, b"shared: msync of an unaligned address not EINVAL");
+    let ret = unsafe { msync(p.add(1).cast(), PAGE, MS_SYNC) };
+    if let Some(code) = refused(19, b"shared: msync of an unaligned address", ret != 0, EINVAL, b"EINVAL") {
+        return code;
     }
     if !unmap(p, 2 * PAGE) {
         return fail_os(20, b"shared: munmap");
@@ -347,8 +391,8 @@ fn mode_private(path: &CPath) -> c_int {
         return fail_os(30, b"private: open");
     }
     let mut orig = [0u8; 2 * PAGE];
-    if !pread_exact(fd, &mut orig, 0) {
-        return fail_os(31, b"private: pread");
+    if let Err(n) = pread_all(fd, &mut orig, 0) {
+        return fail_transfer(31, b"private: pread", n);
     }
     let p = map(2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd);
     if p.cast() == MAP_FAILED {
@@ -368,8 +412,8 @@ fn mode_private(path: &CPath) -> c_int {
         return fail(35, b"private: store lost");
     }
     let mut now = [0u8; 2 * PAGE];
-    if !pread_exact(fd, &mut now, 0) {
-        return fail_os(43, b"private: pread after the store");
+    if let Err(n) = pread_all(fd, &mut now, 0) {
+        return fail_transfer(43, b"private: pread after the store", n);
     }
     if now != orig {
         return fail(36, b"private: a private store reached the file");
@@ -379,8 +423,8 @@ fn mode_private(path: &CPath) -> c_int {
     }
     // The file written after the copy: the copied page keeps its own bytes.
     let other = [!orig[200]];
-    if !pwrite_exact(fd, &other, 200) {
-        return fail_os(38, b"private: pwrite");
+    if let Err(n) = pwrite_all(fd, &other, 200) {
+        return fail_transfer(38, b"private: pwrite", n);
     }
     if peek(p, 200) != orig[200] || peek(p, 100) != stored {
         return fail(39, b"private: the copied page changed with the file");
@@ -389,8 +433,8 @@ fn mode_private(path: &CPath) -> c_int {
         return fail(40, b"private: shared mapping misses a pwrite");
     }
     // Put the file back as it was.
-    if !pwrite_exact(fd, &orig[200..201], 200) {
-        return fail_os(41, b"private: pwrite back");
+    if let Err(n) = pwrite_all(fd, &orig[200..201], 200) {
+        return fail_transfer(41, b"private: pwrite back", n);
     }
     if !unmap(p, 2 * PAGE) || !unmap(s, 2 * PAGE) {
         return fail_os(42, b"private: munmap");
@@ -410,19 +454,16 @@ fn mode_mprotect(path: &CPath) -> c_int {
         return fail_os(51, b"mprotect: shared read-only mmap");
     }
     // SAFETY: `s` is this mode's live mapping of one page.
-    if unsafe { mprotect(s.cast(), PAGE, PROT_READ | PROT_WRITE) } == 0 {
-        return fail(52, b"mprotect: PROT_WRITE on an O_RDONLY MAP_SHARED mapping succeeded");
-    }
-    if errno() != EACCES {
-        return fail_os(52, b"mprotect: PROT_WRITE on an O_RDONLY MAP_SHARED mapping not EACCES");
+    let ret = unsafe { mprotect(s.cast(), PAGE, PROT_READ | PROT_WRITE) };
+    let what = b"mprotect: PROT_WRITE on an O_RDONLY MAP_SHARED mapping";
+    if let Some(code) = refused(52, what, ret != 0, EACCES, b"EACCES") {
+        return code;
     }
     let first = peek(s, 0);
     let w = map(PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd);
-    if w.cast() != MAP_FAILED {
-        return fail(53, b"mprotect: writable MAP_SHARED mmap of O_RDONLY succeeded");
-    }
-    if errno() != EACCES {
-        return fail_os(53, b"mprotect: writable MAP_SHARED mmap of O_RDONLY not EACCES");
+    let what = b"mprotect: writable MAP_SHARED mmap of O_RDONLY";
+    if let Some(code) = refused(53, what, w.cast() == MAP_FAILED, EACCES, b"EACCES") {
+        return code;
     }
     // A private mapping of the same descriptor may become writable.
     let p = map(PAGE, PROT_READ, MAP_PRIVATE, fd);
@@ -451,8 +492,8 @@ fn mode_truncate(path: &CPath) -> c_int {
         return fail_os(60, b"truncate: open");
     }
     let mut orig = [0u8; 2 * PAGE];
-    if !pread_exact(fd, &mut orig, 0) {
-        return fail_os(61, b"truncate: pread");
+    if let Err(n) = pread_all(fd, &mut orig, 0) {
+        return fail_transfer(61, b"truncate: pread", n);
     }
     if orig[PAGE..].iter().all(|&b| b == 0) {
         return fail(62, b"truncate: page 1 is all zeroes before the test");
@@ -481,8 +522,8 @@ fn mode_truncate(path: &CPath) -> c_int {
     if (0..PAGE).any(|i| peek(p, PAGE + i) != 0) {
         return fail(68, b"truncate: mapping shows page 1's old bytes after shrink and regrow");
     }
-    if !pwrite_exact(fd, &orig[PAGE..], PAGE as i64) {
-        return fail_os(69, b"truncate: pwrite back");
+    if let Err(n) = pwrite_all(fd, &orig[PAGE..], PAGE as i64) {
+        return fail_transfer(69, b"truncate: pwrite back", n);
     }
     if !mapping_is(p, PAGE, &orig[PAGE..]) {
         return fail(70, b"truncate: mapping misses the pwrite back");
@@ -505,8 +546,8 @@ fn mode_sigbus(path: &CPath) -> c_int {
         return fail_os(81, b"sigbus: mmap");
     }
     let mut first = [0u8; 1];
-    if !pread_exact(fd, &mut first, PAGE as i64) {
-        return fail_os(85, b"sigbus: pread");
+    if let Err(n) = pread_all(fd, &mut first, PAGE as i64) {
+        return fail_transfer(85, b"sigbus: pread", n);
     }
     if peek(p, PAGE) != first[0] {
         return fail(82, b"sigbus: page 1 differs from pread");

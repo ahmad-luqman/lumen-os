@@ -127,6 +127,32 @@ def test_e2fsck_check_passes_and_reports_failures(tmp_path):
         rootfs.e2fsck_check(img, e2fsck=bad_tool)
 
 
+def test_debugfs_reads_and_fails_on_any_error_line(tmp_path):
+    img = tmp_path / "disk.ext4"
+    img.write_bytes(b"\x00" * 16)
+    args_log = tmp_path / "debugfs.args"
+    banner = "debugfs 1.47.4 (6-Mar-2025)"
+    listing = "/2/040755/0/0/.//\\n/2/040755/0/0/..//\\n/12/0100644/0/0/group.sed/510/\\n/13/040755/0/0/untar//\\n"
+    ok_tool = _make_exec(
+        tmp_path / "debugfs_ok",
+        f'#!/bin/sh\nprintf "%s\\n" "$*" > "{args_log}"\necho "{banner}" >&2\nprintf "{listing}"\n',
+    )
+    assert rootfs.debugfs_names(img, "/", tool=ok_tool) == {"group.sed", "untar"}
+    assert args_log.read_text().strip() == f"-R ls -p / {img}"
+
+    # debugfs exits 0 when a lookup fails, or when the image won't open.
+    for error in ("/tmp: File not found by ext2_lookup ", "ls: Filesystem not open"):
+        bad_tool = _make_exec(
+            tmp_path / "debugfs_bad",
+            f'#!/bin/sh\necho "{banner}" >&2\necho "{error}" >&2\nexit 0\n',
+        )
+        with pytest.raises(RuntimeError, match=error.split(":")[1].strip()):
+            rootfs.debugfs(img, "ls -p /tmp", tool=bad_tool)
+    failed = _make_exec(tmp_path / "debugfs_exit", "#!/bin/sh\nexit 1\n")
+    with pytest.raises(RuntimeError, match="exit 1"):
+        rootfs.debugfs(img, "cat /x", tool=failed)
+
+
 def _sample_readobj(interp: str | None, needed: list[str]) -> str:
     lines = [
         "Program Headers:",

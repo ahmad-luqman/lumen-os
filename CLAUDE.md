@@ -739,12 +739,14 @@ one is its own PR that updates that doc first.
   prints it; `HOST_TIMED`, the warnings a loaded host can cause on its own,
   each tied to the kernel's text, and `unexpected_warnings`, a run's "no
   warning" check without them), `rootfs.py` (matched `e2fsprogs` discovery,
-  per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, and
+  per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, `debugfs`
+  and `debugfs_names` (reading an image back, any error line failing), and
   `llvm-readobj` dynamic musl ELF checks), `leaks.py` (exact `leaked_frames`
   around #300's stack-window page tables, one every `STACK_TABLE_EVERY`
-  processes: `start_stack_table` runs `busybox true` until one maps it,
-  `CleanRuns` does that before a machine's first `linux` run and every
-  `CLEAN_RUNS`th).
+  processes: `start_stack_table` runs `busybox true` until one maps it;
+  `CleanRuns.run`, a machine's `linux` commands, starting a table before the
+  first and once `CLEAN_RUNS` runs have followed one, each where the last
+  puts it, and `finish` checking the next after the last run).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
   assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
   for #255's exit scenarios, and `libm7.so`).
