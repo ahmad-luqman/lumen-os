@@ -47,7 +47,7 @@
 //!   writable with `mprotect` (Linux refuses, `EACCES`): anonymous VMAs
 //!   carry no `may_write`. Harmless until M8's `fork` shares one.
 //! - `/proc/<pid>/maps`' file columns differ in a few ways, each listed
-//!   on `user_vm::MappedFile` (a file mapping's: the descriptor's path, not
+//!   on `user_vm::KeptFile` (a file mapping's: the descriptor's path, not
 //!   normalised nor following a rename; the first mapping's for every
 //!   mapping of a file; ` (deleted)` only once the file's last link is
 //!   gone, then with the synthetic inode number a detached ext4 inode gets)

@@ -255,22 +255,13 @@ pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
     inode.lock_id()
 }
 
-/// A file an address space maps: the open reference that keeps it (and
-/// the mapping) valid after its descriptor is closed and its name
-/// unlinked, and the path it was opened by, which `/proc/<pid>/maps`
-/// shows. Where Linux prints the file's `d_path` (canonical, following
-/// renames), this is the descriptor's path as `/proc/<pid>/fd` shows it
-/// (a relative open's joined to its directory's, not normalised; a later
-/// rename isn't seen; an unlink is, as ` (deleted)`), and the first
-/// mapping's for every later mapping of the same file while any maps it
-/// (`mapped_files` keeps one per file).
-///
-/// It also carries the description's shared-write right (`VM_MAYWRITE`),
-/// which [`AddressSpace::mmap_file`] copies into the new VMA's
-/// `FileMapping::may_write`.
+/// A file description as [`AddressSpace::mmap_file`] maps it: what the
+/// address space keeps of the file (a [`KeptFile`]: its open reference and
+/// path) and the description's shared-write right (`VM_MAYWRITE`), which
+/// `mmap_file` copies into the new VMA's `FileMapping::may_write` and
+/// keeps nowhere else.
 pub struct MappedFile {
-    guard: OpenGuard,
-    path: Arc<str>,
+    kept: KeptFile,
     /// The description is open `O_RDWR`: a `MAP_SHARED` mapping of it may
     /// be made writable, and its stores reach the file. (`openat` refuses
     /// `O_RDWR` on a read-only mount with `EROFS`, so a descriptor's also
@@ -287,20 +278,21 @@ impl MappedFile {
     /// before getting here.
     pub fn of<L: VfsLock<u64>>(file: &OpenFile<L>) -> Self {
         debug_assert!(!file.is_path(), "a mapping of an O_PATH description");
-        Self {
-            guard: file.open_guard().clone(),
-            path: Arc::clone(&file.path),
-            may_write: file.access_mode() == AccessMode::ReadWrite,
-        }
+        let kept = KeptFile { guard: file.open_guard().clone(), path: Arc::clone(&file.path) };
+        Self { kept, may_write: file.access_mode() == AccessMode::ReadWrite }
     }
 }
 
-/// What `mapped_files` keeps of a file's first mapping (its
-/// [`MappedFile`]): the open reference and the path, but not the
-/// shared-write right. That was the first mapping's description's, and
-/// a later mapping of the file may be through a description of another
-/// mode; each VMA's own right is its `FileMapping::may_write`, the only one
-/// faults, `mprotect` and `msync` read.
+/// A file an address space maps, as `mapped_files` keeps one per file
+/// (the first mapping's [`MappedFile`], without its right: each VMA's is
+/// its own `FileMapping::may_write`): the open reference that keeps the
+/// file (and the mapping) valid after its descriptor is closed and its
+/// name unlinked, and the path it was opened by, which `/proc/<pid>/maps`
+/// shows. Where Linux prints the file's `d_path` (canonical, following
+/// renames), this is the descriptor's path as `/proc/<pid>/fd` shows it
+/// (a relative open's joined to its directory's, not normalised; a later
+/// rename isn't seen; an unlink is, as ` (deleted)`), and the first
+/// mapping's for every later mapping of the same file while any maps it.
 struct KeptFile {
     guard: OpenGuard,
     path: Arc<str>,
@@ -724,8 +716,8 @@ impl AddressSpace {
     /// file, so closing the descriptor keeps the mapping valid; when the
     /// file is mapped already, the first mapping's reference (and so its
     /// path, for `/proc/<pid>/maps`) is the one kept ([`KeptFile`]), and
-    /// `file`'s is dropped once `inner` is released. `MAP_FIXED` releases what it replaces as
-    /// `munmap` does.
+    /// `file`'s is dropped once `inner` is released. `MAP_FIXED` releases
+    /// what it replaces as `munmap` does.
     pub fn mmap_file(
         &self,
         place: MapPlace,
@@ -735,19 +727,19 @@ impl AddressSpace {
         offset: u64,
         sharing: Sharing,
     ) -> Result<u64, UserVmError> {
-        let MappedFile { guard, path, may_write } = file;
+        let MappedFile { kept, may_write } = file;
         let (shared, may_write) = match sharing {
             Sharing::Private => (false, true),
             Sharing::Shared => (true, may_write),
         };
-        let inode = guard.inode();
+        let inode = kept.inode();
         if !page_cache::mappable(&**inode) {
             return Err(UserVmError::NoDev);
         }
         let file_id = file_id_of(&**inode);
         let mapping = FileMapping { file_id, offset, shared, may_write };
         // Declared before `inner`, so dropped after it is released.
-        let mut spare = Some(KeptFile { guard, path });
+        let mut spare = Some(kept);
         let mut gone_files = Vec::new();
         let mut inner = self.inner.lock();
         if inner.torn_down {
@@ -2089,7 +2081,8 @@ crate::ktest!(
         // description it maps, not from the first mapping of the file (the
         // one whose open reference the address space keeps), in either
         // order: only the `O_RDWR` mapping may be made writable, maps a
-        // store's page writable, and is one `msync` writes back.
+        // store's page writable, and is one `msync` writes back. A private
+        // mapping, which may always be made writable, is never written back.
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(180, |dir| {
@@ -2100,10 +2093,12 @@ crate::ktest!(
             for rw_first in [true, false] {
                 let (rw, ro) = if rw_first {
                     let rw = shared(file_vm_open(&f)?).map_err(|_| "map rw")?;
-                    (rw, shared(file_vm_open_ro(&f)?).map_err(|_| "map ro")?)
+                    let ro = shared(file_vm_open_ro(&f)?).map_err(|_| "map ro")?;
+                    (rw, ro)
                 } else {
                     let ro = shared(file_vm_open_ro(&f)?).map_err(|_| "map ro")?;
-                    (shared(file_vm_open(&f)?).map_err(|_| "map rw")?, ro)
+                    let rw = shared(file_vm_open(&f)?).map_err(|_| "map rw")?;
+                    (rw, ro)
                 };
                 kassert_eq!(space.mapped_file_count(), 1); // the first one's kept
                 kassert_eq!((synced(rw), synced(ro)), (1, 0));
@@ -2113,6 +2108,12 @@ crate::ktest!(
                 let leaf = file_vm_leaf(&space, rw).ok_or("rw not mapped")?;
                 kassert!(leaf.shared && leaf.writable);
                 kassert_eq!((synced(rw), synced(ro)), (1, 0));
+                let private = space
+                    .mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f)?, 0, Sharing::Private)
+                    .map_err(|_| "map private")?;
+                kassert_eq!(space.handle_page_fault(private, 1 << 1), FaultResult::Resolved); // a copy
+                kassert_eq!(synced(private), 0);
+                space.munmap(private, P).map_err(|_| "munmap private")?;
                 space.munmap(rw, P).map_err(|_| "munmap rw")?;
                 space.munmap(ro, P).map_err(|_| "munmap ro")?;
                 kassert_eq!(space.mapped_file_count(), 0);
