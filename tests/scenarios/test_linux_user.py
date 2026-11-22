@@ -423,6 +423,15 @@ MAPS_LINE = re.compile(
 )
 
 
+def warm_up(m):
+    """One `linux /bin/busybox true`, its leaked frames not counted: the
+    first process's kernel stack may be the first of its size since boot,
+    on fresh addresses that can map a page table; every later one reuses its
+    slot (#300), so its count is exact."""
+    out = run(m, "linux /bin/busybox true", 60)
+    assert re.search(r"^linux: /bin/busybox exit=0 leaked_frames=-?\d+$", out, re.MULTILINE), out
+
+
 def m7_run(m, args):
     """`linux /usr/local/bin/m7_test <args>` on `m`: its output between its
     first line and the closing `linux:` line, which must say it exited 0
@@ -467,7 +476,8 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
 
     Every run leaks zero frames, but the bus error's -1: the page the
     truncation freed: every count exact, the kernel stack's page tables
-    included (#300: its addresses are reused, so no run maps a new one).
+    included (#300: after a warm-up run, each run's stack reuses the last
+    one's addresses, so no run maps a new table).
     The data files (and `libm7.so`'s one page) are in the page cache before
     the first run, so no run counts a cached page."""
     disk = copy_rootfs(tmp_path)
@@ -478,6 +488,7 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
     assert re.fullmatch(r"read: \d+\n", run(m, "vfstest read /usr/local/lib/libm7.so 8192"))
     # The files' blocks on the disk before the stores, for the reboot.
     assert run(m, "sync", 30) == "sync: ok\n"
+    warm_up(m)
 
     assert m7_run(m, "") == ["m7_test: dlopen/dlsym ok"]
     assert m7_run(m, "private /m7-data") == ["m7_test: private ok"]
@@ -536,6 +547,7 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
 
     m2 = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
     assert run(m2, "vfstest read /m7-shared 8192") == "read: 8192\n"
+    warm_up(m2)
     out = run(m2, "linux /bin/busybox strings -n 8 /m7-shared", 60)
     # A printable pattern byte may run on before a store: matched, not split.
     assert re.findall(r"m7 [a-z ]+", out) == [

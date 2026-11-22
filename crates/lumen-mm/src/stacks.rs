@@ -275,12 +275,15 @@ impl StackWindow {
     /// generation `retired` (a CPU that has flushed through it holds none of
     /// its pages in its TLB): it joins its free neighbours. False if it
     /// couldn't be kept (more than [`FREE_RANGES`] free ranges, which can't
-    /// happen while at most [`MAX_STACKS`] slots are taken): its addresses
-    /// are then given up for good, as dropping it would.
+    /// happen while at most [`MAX_STACKS`] slots are taken, or its stack
+    /// window no longer starts at its guard page's end): its addresses are
+    /// then given up for good, as dropping it would.
     #[must_use = "a slot that couldn't be kept is lost for good"]
     pub fn give_back(&mut self, slot: StackSlot, retired: u64) -> bool {
         let StackSlot { guard, stack } = slot;
-        let mut window = guard.join(stack).unwrap_or_else(|_| unreachable!("a guard page is just below its stack"));
+        // A stack window its holder changed (`window` lends it mutably) no
+        // longer meets its guard page: given up, never mapped again.
+        let Ok(mut window) = guard.join(stack) else { return false };
         let mut retired = retired;
         // Join the free range just below, then the one just above.
         let start = window.range().start;
@@ -589,6 +592,18 @@ mod tests {
         }
         assert_eq!(kept.iter().filter(|&&k| k).count(), FREE_RANGES);
         assert_eq!(kept.last(), Some(&false));
+    }
+
+    /// A slot whose stack window was changed no longer meets its guard page:
+    /// `give_back` refuses it (its addresses given up) instead of panicking.
+    #[test]
+    fn a_slot_whose_window_changed_is_given_up() {
+        let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
+        let mut slot = w.take(2 * FRAME_SIZE, 0).unwrap();
+        let low = slot.window().split_off(FRAME_SIZE).unwrap();
+        assert!(!w.give_back(slot, 1));
+        assert_eq!(w.free_ranges(), 0);
+        drop(low);
     }
 
     /// Page-table frames in a map, counted (a fake for the table counts).

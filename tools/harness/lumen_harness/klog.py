@@ -178,6 +178,17 @@ HOST_TIMED = (
         "still assert it never comes)",
     ),
     HostTimed(
+        r"WARN  mm: cpus 0x[0-9a-f]+ didn't flush their TLBs within 2 s: freed stack addresses wait for them$",
+        "kernel/src/mm/tlb.rs",
+        "didn't flush their TLBs within 2 s: freed stack addresses wait for them",
+        (
+            "WARN  mm: cpus 0x4 didn't flush their TLBs within 2 s: freed stack addresses wait for them",
+        ),
+        ("WARN  mm: too many free stack ranges: the stack at 0xffffd00000001000 is never reused",),
+        "a vCPU stalled past the 2 s a spawn waits for every CPU to flush a freed stack's pages (#300); "
+        "nothing is lost but that stack's reuse, and a leaked_frames count it changes fails on its own",
+    ),
+    HostTimed(
         UNDERRUN_WARNING + "$",
         "kernel/src/sound.rs",
         "a sound found the queue empty {} times (underruns)",

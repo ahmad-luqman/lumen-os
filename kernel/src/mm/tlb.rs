@@ -50,6 +50,9 @@ static FLUSHED: [AtomicU64; MAX_CPUS] = {
 /// reuse the pages).
 const SYNC_TIMEOUT_NS: u64 = 2_000_000_000;
 
+/// The generation the last timed-out [`sync`] waited for (0 if none).
+static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+
 /// Number the pages just unmapped (on this CPU, by the caller) as a new
 /// generation, which [`sync`] makes every CPU flush through. Call it after
 /// the unmapping.
@@ -91,52 +94,61 @@ pub fn join() {
     flushed.store(newest, Ordering::SeqCst);
 }
 
-/// Make every counted CPU flush through generation `generation`: this one
-/// at once, the others at their next interrupt, sent a `WAKEUP` IPI now.
-/// Waits for them only from a thread outside every critical section with
+/// Make every counted CPU flush through generation `generation`, and say
+/// whether they all have: this one at once, the others at their next
+/// interrupt. Only from a thread outside every critical section with
 /// interrupts on (a CPU spinning on a lock this caller held, interrupts
-/// off, could never answer), at most [`SYNC_TIMEOUT_NS`] (warned about);
-/// whether they all got there.
+/// off, could never answer) does it send the ones behind a `WAKEUP` IPI and
+/// wait for them, at most [`SYNC_TIMEOUT_NS`] (warned about); after a wait
+/// gave up, none waits again until every CPU has got past that one's
+/// generation. Otherwise the others catch up at their next tick.
 pub fn sync(generation: u64) -> bool {
     {
         let _off = arch::irq::push_off();
         catch_up();
     }
-    let here = arch::cpu_index();
-    let mut woken = 0u64;
-    let lagging = kick(generation, here, &mut woken);
+    let behind = || lagging(generation) != 0;
+    if !behind() {
+        return true;
+    }
     let free = arch::irq::depth() == 0 && arch::irq::enabled();
     // Before the clocks are calibrated there is no deadline to wait for.
     let start = time::now_ns();
-    if lagging == 0 || !free || start == 0 {
-        return lagging == 0;
+    // Until every CPU has got past the generation a wait gave up on, none
+    // waits again: a stuck CPU costs one timeout, not one per spawn.
+    let gave_up = GAVE_UP.load(Ordering::SeqCst);
+    if !free || start == 0 || (gave_up != 0 && flushed_through() < gave_up) {
+        // Left to the other CPUs' ticks.
+        return false;
     }
+    let here = arch::cpu_index();
     let deadline = start.saturating_add(SYNC_TIMEOUT_NS);
+    let mut woken = 0u64;
     loop {
-        let lagging = kick(generation, here, &mut woken);
+        let lagging = lagging(generation);
         if lagging == 0 {
             return true;
         }
+        // Each online one behind, once (one that couldn't be sent is left to
+        // its next tick): including one that came online meanwhile.
+        let unwoken = lagging & !woken & !(1 << here);
+        for i in (0..MAX_CPUS).filter(|&i| unwoken & 1 << i != 0) {
+            if smp::online_lapic_id(i).is_some() && smp::wake(i) {
+                woken |= 1 << i;
+            }
+        }
         if time::now_ns() >= deadline {
-            warn!(target: "mm", "cpus {lagging:#x} didn't flush their TLBs in time: freed stack addresses aren't reused");
+            GAVE_UP.store(generation, Ordering::SeqCst);
+            warn!(target: "mm", "cpus {lagging:#x} didn't flush their TLBs within 2 s: freed stack addresses wait for them");
             return false;
         }
         core::hint::spin_loop();
     }
 }
 
-/// The CPUs (a bit each) not yet flushed through `generation`; each online
-/// one but `here` that isn't in `woken` yet is sent a `WAKEUP` IPI and
-/// added to it (one that couldn't be sent is left to its next tick).
-fn kick(generation: u64, here: usize, woken: &mut u64) -> u64 {
-    let mut lagging = 0;
-    for i in (0..MAX_CPUS).filter(|&i| FLUSHED[i].load(Ordering::SeqCst) < generation) {
-        lagging |= 1 << i;
-        if i != here && *woken & 1 << i == 0 && smp::online_lapic_id(i).is_some() && smp::wake(i) {
-            *woken |= 1 << i;
-        }
-    }
-    lagging
+/// The counted CPUs (a bit each) not yet flushed through `generation`.
+fn lagging(generation: u64) -> u64 {
+    (0..MAX_CPUS).filter(|&i| FLUSHED[i].load(Ordering::SeqCst) < generation).fold(0, |m, i| m | 1 << i)
 }
 
 crate::ktest!(
@@ -145,8 +157,8 @@ crate::ktest!(
         // given, the idle ones woken by IPI; a later `retire` puts them all
         // behind again.
         use crate::{kassert, kassert_eq};
+        // (Not checked behind first: a stall here lets every CPU tick.)
         let generation = retire();
-        kassert!(flushed_through() < generation);
         kassert!(sync(generation));
         kassert!(flushed_through() >= generation);
         for (i, flushed) in FLUSHED.iter().enumerate() {

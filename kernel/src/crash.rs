@@ -772,7 +772,7 @@ crate::ktest!(
         use lumen_mm::stacks::StackKind;
         let other = crate::mm::stack::KernelStack::new(4 * lumen_mm::FRAME_SIZE, StackKind::Test)
             .map_err(|_| "allocating a stack")?;
-        let a = other.range().bottom; // above the main stack (allocated later)
+        let a = other.range().bottom; // another registered stack
         let ret = write_backtrace as *const () as u64 + 1; // inside kernel text
         let mut local = core::hint::black_box([0u64; 2]); // a record on the main stack
         let on_main = local.as_mut_ptr();

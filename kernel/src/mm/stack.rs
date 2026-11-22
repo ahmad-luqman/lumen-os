@@ -54,14 +54,18 @@ pub fn init() {
 /// Addresses for a stack of `size` bytes: the lowest freed ones that fit,
 /// once every CPU has flushed them ([`tlb::sync`]), else fresh ones.
 fn take(size: u64) -> Option<StackSlot> {
-    let wait = {
-        let w = WINDOW.lock();
+    // A few rounds: a stack freed next to the range while this waited joins
+    // it, and its newer generation is waited for too.
+    for _ in 0..4 {
+        let mut w = WINDOW.lock();
         assert!(w.is_claimed(), "mm::init claims the stack window");
-        w.wait_for(size, tlb::flushed_through())
-    };
-    if let Some(generation) = wait {
+        let flushed = tlb::flushed_through();
+        let Some(generation) = w.wait_for(size, flushed) else { return w.take(size, flushed) };
+        drop(w);
         // Outside the lock: the other CPUs' interrupts answer this.
-        tlb::sync(generation);
+        if !tlb::sync(generation) {
+            break;
+        }
     }
     WINDOW.lock().take(size, tlb::flushed_through())
 }
@@ -453,11 +457,22 @@ crate::ktest!(
         .map_err(|_| "spawn failed")?;
         kassert!(crate::sched::yield_until(|| shared.0.load(Ordering::SeqCst) == 1));
         kassert_eq!(shared.1.load(Ordering::SeqCst), OLD);
+        let old_frame = mapping(range.bottom).ok_or("the stack's bottom isn't mapped")?.phys;
         drop(first);
-        // Most likely the old page's frame: kept out of the new stack, so a
-        // stale translation would read it, not the new frame.
-        let held = super::frame::alloc_owned().ok_or("out of frames")?;
+        // The old page's frame, kept out of the new stack (frames taken until
+        // it comes, if it does), so a stale translation would read it, not
+        // the new frame.
+        let mut held = alloc::vec::Vec::new();
+        while held.len() < 256 {
+            let f = super::frame::alloc_owned().ok_or("out of frames")?;
+            let found = f.frame() == old_frame;
+            held.push(f);
+            if found {
+                break;
+            }
+        }
         let second = KernelStack::new(size, StackKind::Test).map_err(|_| "allocating a stack")?;
+        let new_frame = mapping(range.bottom).map(|m| m.phys);
         let reused = second.range() == range;
         if reused {
             // SAFETY: inside the new stack, which this test owns.
@@ -468,6 +483,7 @@ crate::ktest!(
         crate::sched::join_bounded(reader)?;
         drop(held);
         kassert_eq!(second.range(), range);
+        kassert!(new_frame.is_some_and(|f| f != old_frame));
         kassert_eq!(shared.2.load(Ordering::SeqCst), NEW);
         Ok(())
     }
