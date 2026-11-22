@@ -801,10 +801,7 @@ mod tests {
     fn shrink_unmaps(f: &Arc<dyn VfsInode>, shrink: impl FnOnce() -> u64) -> Result<(), &'static str> {
         use crate::user::copy_from_user;
         let space = crate::sched::current_address_space().ok_or("no address space")?;
-        let flags = OpenFlags::from_bits(OpenFlags::O_RDWR);
-        let file = KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from("/ktest/shrunk"), flags)
-            .map_err(|_| "open the file")?;
-        let file = crate::mm::user_vm::MappedFile::of(&file);
+        let file = crate::mm::user_vm::file_vm_open(f)?;
         let rw = Prot::READ | Prot::WRITE;
         let va = space.mmap_file(MapPlace::Hint(None), 3 * P, rw, file, 0, Sharing::Shared).map_err(|_| "mmap_file")?;
         let mut byte = [0u8; 1];

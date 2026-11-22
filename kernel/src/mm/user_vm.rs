@@ -209,7 +209,7 @@ struct AddressSpaceInner {
     /// piece of one split by `mprotect` or `munmap`) references it, so
     /// closing the descriptor after `mmap` keeps the mapping valid. Entries
     /// removed are dropped only after `inner` is released.
-    mapped_files: BTreeMap<u64, MappedFile>,
+    mapped_files: BTreeMap<u64, KeptFile>,
     /// The ELF images' file-backed parts, loaded by copying into anonymous
     /// VMAs, as `/proc/<pid>/maps` names them (recorded by
     /// `commit_loaded_elf` with the pages they name): trimmed wherever their
@@ -266,11 +266,8 @@ pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
 /// (`mapped_files` keeps one per file).
 ///
 /// It also carries the description's shared-write right (`VM_MAYWRITE`),
-/// so a `MAP_SHARED` mapping's right can only come from the description
-/// it maps. Only [`AddressSpace::mmap_file`] reads it, into the new VMA's
-/// `FileMapping::may_write`: that, not the `MappedFile` kept in
-/// `mapped_files` (the first mapping's, whatever its mode), is what every
-/// later fault, `mprotect` and `msync` checks.
+/// which [`AddressSpace::mmap_file`] copies into the new VMA's
+/// `FileMapping::may_write`.
 pub struct MappedFile {
     guard: OpenGuard,
     path: Arc<str>,
@@ -285,9 +282,9 @@ pub struct MappedFile {
 impl MappedFile {
     /// The file open description `file` has open, by its path: a clone of
     /// the description's own open reference, so never refused and never on
-    /// a freed inode, and the shared-write right its access mode gives
-    /// (`O_RDWR`). Never an `O_PATH` description: `mmap` refuses one
-    /// (`EBADF`) before getting here.
+    /// a freed inode. Its shared-write right is the description's: `O_RDWR`
+    /// or not. Never an `O_PATH` description: `mmap` refuses one (`EBADF`)
+    /// before getting here.
     pub fn of<L: VfsLock<u64>>(file: &OpenFile<L>) -> Self {
         debug_assert!(!file.is_path(), "a mapping of an O_PATH description");
         Self {
@@ -296,9 +293,22 @@ impl MappedFile {
             may_write: file.access_mode() == AccessMode::ReadWrite,
         }
     }
+}
 
+/// What `mapped_files` keeps of a file's first mapping (its
+/// [`MappedFile`]): the open reference and the path, but not the
+/// shared-write right. That was the first mapping's description's, and
+/// a later mapping of the file may be through a description of another
+/// mode; each VMA's own right is its `FileMapping::may_write`, the only one
+/// faults, `mprotect` and `msync` read.
+struct KeptFile {
+    guard: OpenGuard,
+    path: Arc<str>,
+}
+
+impl KeptFile {
     /// The mapped file's inode.
-    pub fn inode(&self) -> &Arc<dyn VfsInode> {
+    fn inode(&self) -> &Arc<dyn VfsInode> {
         self.guard.inode()
     }
 }
@@ -712,9 +722,9 @@ impl AddressSpace {
     /// Nothing is mapped until a fault ([`Self::handle_page_fault`]). The
     /// address space keeps `file`'s open reference while any VMA maps the
     /// file, so closing the descriptor keeps the mapping valid; when the
-    /// file is mapped already, the first mapping's `MappedFile` (and so its
-    /// path, for `/proc/<pid>/maps`) is the one kept, and `file` is dropped
-    /// once `inner` is released. `MAP_FIXED` releases what it replaces as
+    /// file is mapped already, the first mapping's reference (and so its
+    /// path, for `/proc/<pid>/maps`) is the one kept ([`KeptFile`]), and
+    /// `file`'s is dropped once `inner` is released. `MAP_FIXED` releases what it replaces as
     /// `munmap` does.
     pub fn mmap_file(
         &self,
@@ -725,20 +735,19 @@ impl AddressSpace {
         offset: u64,
         sharing: Sharing,
     ) -> Result<u64, UserVmError> {
-        // `file`'s own right, never the `mapped_files` entry's: that is the
-        // first mapping's, maybe through a description of another mode.
+        let MappedFile { guard, path, may_write } = file;
         let (shared, may_write) = match sharing {
             Sharing::Private => (false, true),
-            Sharing::Shared => (true, file.may_write),
+            Sharing::Shared => (true, may_write),
         };
-        let inode = file.guard.inode();
+        let inode = guard.inode();
         if !page_cache::mappable(&**inode) {
             return Err(UserVmError::NoDev);
         }
         let file_id = file_id_of(&**inode);
         let mapping = FileMapping { file_id, offset, shared, may_write };
         // Declared before `inner`, so dropped after it is released.
-        let mut spare = Some(file);
+        let mut spare = Some(KeptFile { guard, path });
         let mut gone_files = Vec::new();
         let mut inner = self.inner.lock();
         if inner.torn_down {
@@ -1280,7 +1289,7 @@ impl AddressSpace {
 
     /// Unmap the PTEs of `removed` (VMAs `VmaMap` just took out) and move
     /// the open references of files no VMA maps any more into `gone`.
-    fn unmap_vmas_locked(&self, inner: &mut AddressSpaceInner, removed: &[Vma], gone: &mut Vec<MappedFile>) {
+    fn unmap_vmas_locked(&self, inner: &mut AddressSpaceInner, removed: &[Vma], gone: &mut Vec<KeptFile>) {
         for vma in removed {
             self.unmap_range_locked(inner, vma.start, vma.end);
             ImageRange::trim(&mut inner.images, vma.start, vma.end);
@@ -1504,7 +1513,7 @@ fn map_error_fault(err: MapError) -> FaultResult {
 /// `mapped_files` into `gone`, which the caller drops once `inner` is
 /// released. Liveness is read from the VMAs as they are now, so a
 /// `MAP_FIXED` replace by the same file keeps its reference.
-fn release_unmapped_files(inner: &mut AddressSpaceInner, gone: &mut Vec<MappedFile>) {
+fn release_unmapped_files(inner: &mut AddressSpaceInner, gone: &mut Vec<KeptFile>) {
     if inner.mapped_files.is_empty() {
         return;
     }
@@ -1867,7 +1876,7 @@ fn file_vm_logged(text: &str) -> usize {
 /// it takes `OpenGuard::try_new`: it may sleep (no spinlock held), and
 /// refuses (`"open the file"`) an inode an unlink has freed.
 #[cfg(feature = "ktest")]
-fn file_vm_open(f: &Arc<dyn VfsInode>) -> Result<MappedFile, &'static str> {
+pub(crate) fn file_vm_open(f: &Arc<dyn VfsInode>) -> Result<MappedFile, &'static str> {
     file_vm_open_as(f, lumen_vfs::OpenFlags::O_RDWR)
 }
 
@@ -2076,35 +2085,38 @@ crate::ktest!(
 
 crate::ktest!(
     fn file_vm_shared_write_right_is_each_descriptions_own() {
-        // A `MAP_SHARED` mapping's right to be made writable comes from the
-        // description it maps, not from the first mapping of the file (whose
-        // `MappedFile` the address space keeps): an `O_RDONLY` mapping after
-        // an `O_RDWR` one stays read-only, and an `O_RDWR` one after an
-        // `O_RDONLY` one may be made writable.
+        // A `MAP_SHARED` mapping's right to store to the file comes from the
+        // description it maps, not from the first mapping of the file (the
+        // one whose open reference the address space keeps), in either
+        // order: only the `O_RDWR` mapping may be made writable, maps a
+        // store's page writable, and is one `msync` writes back.
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(180, |dir| {
             let f = ktest_files::file(dir, "modes.bin", &ktest_files::pattern(P as usize, 9))?;
             let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
             let shared = |file| space.mmap_file(MapPlace::Hint(None), P, Prot::READ, file, 0, Sharing::Shared);
-            let rw = shared(file_vm_open(&f)?).map_err(|_| "map rw")?;
-            let ro = shared(file_vm_open_ro(&f)?).map_err(|_| "map ro")?;
-            kassert_eq!(space.mapped_file_count(), 1); // the O_RDWR one's kept
-            kassert_eq!(space.mprotect(ro, P, RW), Err(UserVmError::Vm(VmError::Access)));
-            kassert_eq!(space.mprotect(rw, P, RW), Ok(()));
-            space.munmap(rw, P).map_err(|_| "munmap rw")?;
-            space.munmap(ro, P).map_err(|_| "munmap ro")?;
-            kassert_eq!(space.mapped_file_count(), 0);
-            let ro = shared(file_vm_open_ro(&f)?).map_err(|_| "map ro again")?;
-            let rw = shared(file_vm_open(&f)?).map_err(|_| "map rw again")?;
-            kassert_eq!(space.mprotect(rw, P, RW), Ok(())); // the O_RDONLY one's kept
-            kassert_eq!(space.mprotect(ro, P, RW), Err(UserVmError::Vm(VmError::Access)));
-            // A store maps the cache's page writable through the O_RDWR
-            // mapping only.
-            kassert_eq!(space.handle_page_fault(rw, 1 << 1), FaultResult::Resolved);
-            let leaf = file_vm_leaf(&space, rw).ok_or("rw not mapped")?;
-            kassert!(leaf.shared && leaf.writable);
-            kassert_eq!(space.handle_page_fault(ro, 1 << 1), FaultResult::Invalid);
+            let synced = |va: u64| space.msync_files(va, va + P).shared.len();
+            for rw_first in [true, false] {
+                let (rw, ro) = if rw_first {
+                    let rw = shared(file_vm_open(&f)?).map_err(|_| "map rw")?;
+                    (rw, shared(file_vm_open_ro(&f)?).map_err(|_| "map ro")?)
+                } else {
+                    let ro = shared(file_vm_open_ro(&f)?).map_err(|_| "map ro")?;
+                    (shared(file_vm_open(&f)?).map_err(|_| "map rw")?, ro)
+                };
+                kassert_eq!(space.mapped_file_count(), 1); // the first one's kept
+                kassert_eq!((synced(rw), synced(ro)), (1, 0));
+                kassert_eq!(space.mprotect(ro, P, RW), Err(UserVmError::Vm(VmError::Access)));
+                kassert_eq!(space.mprotect(rw, P, RW), Ok(()));
+                kassert_eq!(space.handle_page_fault(rw, 1 << 1), FaultResult::Resolved); // a store
+                let leaf = file_vm_leaf(&space, rw).ok_or("rw not mapped")?;
+                kassert!(leaf.shared && leaf.writable);
+                kassert_eq!((synced(rw), synced(ro)), (1, 0));
+                space.munmap(rw, P).map_err(|_| "munmap rw")?;
+                space.munmap(ro, P).map_err(|_| "munmap ro")?;
+                kassert_eq!(space.mapped_file_count(), 0);
+            }
             Ok(())
         })
     }

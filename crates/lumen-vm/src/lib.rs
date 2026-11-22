@@ -181,7 +181,10 @@ pub struct FileMapping {
     pub offset: u64,
     /// `true` for `MAP_SHARED`, `false` for `MAP_PRIVATE` (CoW).
     pub shared: bool,
-    /// `VM_MAYWRITE`: `true` for `MAP_PRIVATE`, or `open_flags.writable() && !fs.read_only()` for `MAP_SHARED`.
+    /// `VM_MAYWRITE`: `true` for `MAP_PRIVATE`; for `MAP_SHARED`, whether
+    /// the mapped description is open `O_RDWR` (the kernel's
+    /// `user_vm::MappedFile::of`; `openat` refuses `O_RDWR` on a read-only
+    /// mount).
     pub may_write: bool,
 }
 

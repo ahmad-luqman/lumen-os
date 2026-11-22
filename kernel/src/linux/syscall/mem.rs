@@ -141,7 +141,7 @@ fn mmap_fd(addr: u64, len: u64, prot: lumen_vm::Prot, flags: u64, fd: Fd, off: u
             if prot.write() && mode == AccessMode::ReadOnly {
                 return Err(errno::EACCES);
             }
-            Sharing::Shared // `MappedFile::of` records `O_RDWR` or not
+            Sharing::Shared
         }
         general::MAP_PRIVATE => Sharing::Private,
         _ => return Err(errno::EINVAL),
