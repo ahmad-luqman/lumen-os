@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ext4plus::dir::Dir;
 use ext4plus::error::Ext4Error;
 use ext4plus::file::{read_at as ext4_read_at, truncate as ext4_truncate, write_at as ext4_write_at};
-use ext4plus::inode::{Inode, InodeCreationOptions, InodeFlags, InodeMode};
+use ext4plus::inode::{Inode, InodeFlags, InodeMode};
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
 use lumen_vfs::ext4::rdev_from_i_block;
@@ -5222,7 +5222,7 @@ crate::ktest!(
                 let inner = m.fs.shared.state.lock();
                 inner
                     .ext4
-                    .create_inode(InodeCreationOptions {
+                    .create_inode(ext4plus::inode::InodeCreationOptions {
                         file_type: ft,
                         mode: type_bits | InodeMode::from_bits_retain(0o644),
                         uid: 0,
