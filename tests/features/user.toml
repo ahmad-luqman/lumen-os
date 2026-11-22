@@ -77,7 +77,7 @@ tests = [
 ]
 
 [[feature]]
-name = "chmod/fchmod/fchmodat/fchmodat2 (07777 only, -EOPNOTSUPP on a symlink with AT_SYMLINK_NOFOLLOW), chown/fchown/lchown/fchownat (-1 unchanged), umask (& 0o777, applied by openat O_CREAT), utimensat (NULL times, UTIME_NOW/UTIME_OMIT, NULL path as futimens, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, -EINVAL nsec) and truncate/ftruncate (tail zeroed, mtime/ctime, the caller's mapped pages past the new end unmapped; -EINVAL, -EISDIR, -EBADF, -EFBIG, -EROFS) (#254)"
+name = "chmod/fchmod/fchmodat/fchmodat2 (07777 only, -EOPNOTSUPP on a symlink with AT_SYMLINK_NOFOLLOW), chown/fchown/lchown/fchownat (-1 unchanged, setuid and group-exec setgid dropped on non-directories), umask (& 0o777, applied by openat O_CREAT), utimensat (NULL times, UTIME_NOW/UTIME_OMIT, NULL path as futimens, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, -EINVAL nsec) and truncate/ftruncate (tail zeroed, mtime/ctime, the caller's mapped pages past the new end unmapped; -EINVAL, -EISDIR, -EBADF, -EFBIG, -EROFS) (#254)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chmod_family_sets_the_permission_and_special_bits",

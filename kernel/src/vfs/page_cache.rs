@@ -541,9 +541,11 @@ impl Drop for WritableMap {
 ///   unless a mapping stored there.
 /// - **Truncate:** a shrink's `remove_from` drops the cache's reference to
 ///   the pages past the new size and stops counting them, even one a
-///   mapping still holds. That is sound only because ARCHITECTURE section
-///   5's truncate invalidation (Lock 1 before Lock 4) unmaps those pages in
-///   the same shrink, so no mapping keeps a page the cache has let go.
+///   mapping still holds. The page stays alive, pinned by that mapping,
+///   until ARCHITECTURE section 5's truncate invalidation, which the
+///   shrinking syscall runs once the truncate has returned (Lock 1 and
+///   Lock 4 never nested), unmaps it in the same syscall: in the caller's
+///   own address space only until M8, and not yet after `O_TRUNC`.
 /// - **Other inodes:** `NoDev` for anything but a regular file of `ext4`
 ///   or `tmpfs` (directories, symlinks, `devfs`, `procfs`). `NoEnt` for an
 ///   `ext4` inode unlinked and not open, as `read_at` says.

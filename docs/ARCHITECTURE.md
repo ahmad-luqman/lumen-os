@@ -5103,9 +5103,11 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     `file_size` are zero unless a mapping stored there.
   - *Truncate:* a shrink's `remove_from` drops the cache's own reference
     to pages past the new size and stops counting them, even if a mapping
-    still holds one. That is sound only because section 5's truncate
-    invalidation (Lock 1 before Lock 4) unmaps those pages in the same
-    shrink, so no mapping keeps using a page the cache has let go.
+    still holds one. The page stays alive, pinned by that mapping, until
+    section 5's truncate invalidation, run by the shrinking syscall once
+    the truncate has returned (Lock 1 and Lock 4 never nested), unmaps it:
+    in the caller's own address space only until M8, and not yet after
+    `O_TRUNC`.
   - *Other inodes:* `NoDev` for directories, symlinks, and every inode of
     another filesystem (`devfs`, `procfs`); `NoEnt` for an `ext4` inode
     unlinked and not open.

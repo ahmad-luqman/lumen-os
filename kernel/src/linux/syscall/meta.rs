@@ -106,10 +106,32 @@ fn id(raw: u32) -> Option<u32> {
 }
 
 /// Set `inode`'s owner and group. The process is root, so any id goes.
+/// On anything but a directory, setuid goes too, and setgid when
+/// group-execute is set (Linux's `chown_common` asks `notify_change` for
+/// `ATTR_KILL_SUID | ATTR_KILL_SGID`, whoever calls, `-1` ids too).
 fn chown(inode: &dyn VfsInode, uid: u32, gid: u32) -> Result<u64, u32> {
     writable_mount(inode)?;
     inode.set_owner(id(uid), id(gid)).map_err(vfs)?;
+    if inode.inode_type() != InodeType::Dir {
+        let mode = inode.stat().map_err(vfs)?.mode;
+        let kept = kill_suid_sgid(mode);
+        if kept != mode {
+            inode.set_mode(kept).map_err(vfs)?;
+        }
+    }
     Ok(0)
+}
+
+/// `mode` less setuid, and less setgid if group-execute is set.
+fn kill_suid_sgid(mode: u16) -> u16 {
+    const S_ISUID: u16 = 0o4000;
+    const S_ISGID: u16 = 0o2000;
+    const S_IXGRP: u16 = 0o010;
+    let mut kept = mode & !S_ISUID;
+    if mode & (S_ISGID | S_IXGRP) == S_ISGID | S_IXGRP {
+        kept &= !S_ISGID;
+    }
+    kept
 }
 
 fn fchownat(dirfd: Dirfd, path: UserPtr, uid: u32, gid: u32, flags: AtFlags) -> Result<u64, u32> {
@@ -155,35 +177,42 @@ fn copy_times(times: UserPtr) -> Result<[(i64, i64); 2], u32> {
 }
 
 /// `utimensat`, in Linux's order: the times copied in (`-EFAULT`); both
-/// `UTIME_OMIT` is done before even the path is looked at; an invalid
-/// `tv_nsec` `-EINVAL`; then a `NULL` path with a descriptor is `futimens`
-/// on it (no flags allowed), any other a path (`NULL` there `-EFAULT`).
+/// `UTIME_OMIT` is done before even the path is looked at; then a `NULL`
+/// path with a descriptor is `futimens` on it (any flag `-EINVAL`), any
+/// other a path (unknown flags `-EINVAL`, `NULL` `-EFAULT`); then an
+/// invalid `tv_nsec` is `-EINVAL` (`vfs_utimes`), and a read-only mount
+/// `-EROFS`.
 fn utimensat(dirfd: Dirfd, path: UserPtr, times: UserPtr, flags: AtFlags) -> Result<u64, u32> {
-    let (atime, mtime) = if times.is_null() {
-        (SetTime::Now, SetTime::Now)
-    } else {
-        let [(asec, ansec), (msec, mnsec)] = copy_times(times)?;
-        if ansec == SetTime::UTIME_OMIT && mnsec == SetTime::UTIME_OMIT {
-            return Ok(0);
-        }
-        (SetTime::from_raw(asec, ansec).map_err(vfs)?, SetTime::from_raw(msec, mnsec).map_err(vfs)?)
-    };
-    let set = |inode: &dyn VfsInode| {
-        writable_mount(inode)?;
-        inode.set_times(atime, mtime).map_err(vfs).map(|()| 0)
-    };
-    match dirfd {
+    let raw = if times.is_null() { None } else { Some(copy_times(times)?) };
+    if let Some([(_, a), (_, m)]) = raw
+        && a == SetTime::UTIME_OMIT
+        && m == SetTime::UTIME_OMIT
+    {
+        return Ok(0);
+    }
+    // The open file, for `futimens`, held while its inode changes.
+    let (inode, _file) = match dirfd {
         Dirfd::Fd(fd) if path.is_null() => {
             if flags.0 != 0 {
                 return Err(errno::EINVAL);
             }
-            set(&*open_file(fd)?.inode)
+            let file = open_file(fd)?;
+            (Arc::clone(&file.inode), Some(file))
         }
         _ => {
             let flags = flags.validate(PATH_FLAGS).map_err(vfs)?;
-            set(&*lookup(dirfd, path, flags)?)
+            (lookup(dirfd, path, flags)?, None)
         }
-    }
+    };
+    let (atime, mtime) = match raw {
+        None => (SetTime::Now, SetTime::Now),
+        Some([(asec, ansec), (msec, mnsec)]) => {
+            (SetTime::from_raw(asec, ansec).map_err(vfs)?, SetTime::from_raw(msec, mnsec).map_err(vfs)?)
+        }
+    };
+    writable_mount(&*inode)?;
+    inode.set_times(atime, mtime).map_err(vfs)?;
+    Ok(0)
 }
 
 /// `utimensat(dirfd, path, times, flags)` (280): a `NULL` `times` sets both
@@ -238,6 +267,7 @@ fn ftruncate(fd: Fd, len: u64) -> Result<u64, u32> {
     if !file.is_writable() || file.inode.inode_type() != InodeType::File {
         return Err(errno::EINVAL);
     }
+    writable_mount(&*file.inode)?;
     resize(&*file.inode, len)
 }
 
@@ -437,6 +467,21 @@ mod tests {
                 kassert_eq!(owner("/tmp/meta-ktest-chown")?, (1000, 2000));
                 kassert_eq!(sys_chown(path, u32::MAX, u32::MAX), 0);
                 kassert_eq!(owner("/tmp/meta-ktest-chown")?, (1000, 2000));
+                // On a regular file, chown (even with -1, -1) drops setuid,
+                // and setgid only with group-execute; a directory keeps both.
+                let mode = || meta_of("/tmp/meta-ktest-chown").map(|m| m.mode);
+                for (before, after) in [(0o6755, 0o0755), (0o6745, 0o2745), (0o2711, 0o0711), (0o1644, 0o1644)] {
+                    kassert_eq!(sys_chmod(path, at::reg(before)), 0);
+                    kassert_eq!(sys_chown(path, u32::MAX, u32::MAX), 0);
+                    kassert_eq!(mode()?, after);
+                }
+                let dir = ktest_user_path(7, b"/tmp/meta-ktest-chown-dir")?;
+                lumen_vfs::mkdir_at(crate::vfs::tables(), None, b"/tmp/meta-ktest-chown-dir", 0o755, 0)
+                    .map_err(|_| "mkdir")?;
+                kassert_eq!(sys_chmod(dir, at::reg(0o6775)), 0);
+                kassert_eq!(sys_chown(dir, 1, 1), 0);
+                kassert_eq!(meta_of("/tmp/meta-ktest-chown-dir")?.mode, 0o6775);
+                let _ = lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/meta-ktest-chown-dir", true);
                 // chown follows the symlink; lchown and fchownat with
                 // AT_SYMLINK_NOFOLLOW change the link itself.
                 kassert_eq!(sys_chown(link, 3, 4), 0);
@@ -577,6 +622,11 @@ mod tests {
                     kassert_eq!(sys_utimensat(Dirfd::Cwd, path, t, flags(0)), neg_errno(errno::EINVAL));
                 }
                 kassert_eq!(times("/tmp/meta-ktest-utime")?, ((90, 7), (100, 8)));
+                // ... checked after the path and descriptor, as Linux does.
+                let t = put_times(times_at, [(1, 1_000_000_000), (2, 0)])?;
+                let gone = ktest_user_path(5, b"/tmp/meta-ktest-no-such")?;
+                kassert_eq!(sys_utimensat(Dirfd::Cwd, gone, t, flags(0)), neg_errno(errno::ENOENT));
+                kassert_eq!(sys_utimensat(Dirfd::Fd(at::reg(900)), null, t, flags(0)), neg_errno(errno::EBADF));
                 // Unknown flags `-EINVAL`; a bad `times` pointer `-EFAULT`.
                 let t = put_times(times_at, [(1, 0), (2, 0)])?;
                 kassert_eq!(sys_utimensat(Dirfd::Cwd, path, t, flags(AtFlags::AT_REMOVEDIR)), neg_errno(errno::EINVAL));
