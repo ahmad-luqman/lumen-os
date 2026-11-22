@@ -8855,3 +8855,70 @@ fn mode_after_chown_drops_setuid_and_group_exec_setgid_off_directories() {
     }
     assert_eq!(mode_after_chown(InodeType::Dir, 0o6775), 0o6775);
 }
+
+/// #309: `resolve_parent`'s last component: only slashes is `Root`, `.` and
+/// `..` (a trailing slash or not) are `Dot` and `DotDot`, anything else a
+/// `Name`, borrowed from the path.
+#[test]
+fn resolve_parent_classifies_the_final_component() {
+    let (env, _) = setup_vfs();
+    mkdir_at(&env, None, b"/d", 0o755, 0).unwrap();
+    for (path, want, slash) in [
+        (&b"/"[..], Final::Root, true),
+        (b"///", Final::Root, true),
+        (b".", Final::Dot, false),
+        (b"/d/./", Final::Dot, true),
+        (b"..", Final::DotDot, false),
+        (b"/d/..//", Final::DotDot, true),
+        (b"...", Final::Name(b"..."), false),
+        (b".x", Final::Name(b".x"), false),
+        (b"/d/x/", Final::Name(b"x"), true),
+        (b"/d/\xff", Final::Name(b"\xff"), false),
+    ] {
+        let target = resolve_parent(&env, None, path).unwrap();
+        assert_eq!(target.final_component(), want, "{}", Escaped(path));
+        assert_eq!(target.has_trailing_slash, slash, "{}", Escaped(path));
+    }
+}
+
+/// #309: each namespace operation's errno for a last component that isn't
+/// a name (`/`, `.`, `..`), ahead of a read-only filesystem's `EROFS`.
+#[test]
+fn not_a_name_errno_per_operation_ahead_of_erofs() {
+    let (env, _) = setup_vfs();
+    mkdir_at(&env, None, b"/d", 0o755, 0).unwrap();
+    open_inode(&env, None, b"/f", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let ro_mp = mkdir_at(&env, None, b"/ro", 0o755, 0).unwrap();
+    env.mount(ro_mp, "/ro", MemFs::new(DevId::makedev(0, 72), "rofs", true)).unwrap();
+    let ro_root = SimpleVfsTables::new();
+    ro_root.mount_root(MemFs::new(DevId::ROOT, "ext4", true)).unwrap();
+
+    let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY);
+    let excl = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDONLY);
+    let noreplace = RenameFlags(RenameFlags::NOREPLACE);
+    // (tables, path, a name in the same directory, rmdir's errno)
+    let rows: [(&SimpleVfsTables, &[u8], &[u8], VfsError); 8] = [
+        (&env, b"/", b"/f", VfsError::Busy),
+        (&env, b".", b"/f", VfsError::Inval),
+        (&env, b"/d/.", b"/d/x", VfsError::Inval),
+        (&env, b"/d/..", b"/d/x", VfsError::NotEmpty),
+        (&env, b"/ro/.", b"/ro/x", VfsError::Inval),
+        (&env, b"/ro/..", b"/ro/x", VfsError::NotEmpty),
+        (&ro_root, b"//", b"/x", VfsError::Busy),
+        (&ro_root, b"..", b"/x", VfsError::NotEmpty),
+    ];
+    for (env, path, sibling, rmdir) in rows {
+        let at = Escaped(path);
+        assert_eq!(mkdir_at(env, None, path, 0o755, 0).unwrap_err(), VfsError::Exist, "mkdir {at}");
+        assert_eq!(symlink_at(env, b"/f", None, path).unwrap_err(), VfsError::Exist, "symlink {at}");
+        assert_eq!(link_at(env, None, b"/", None, path, false, false).unwrap_err(), VfsError::Exist, "link {at}");
+        assert_eq!(open_inode(env, None, path, excl, 0o644, 0).unwrap_err(), VfsError::Exist, "O_EXCL {at}");
+        assert_eq!(open_inode(env, None, path, creat, 0o644, 0).unwrap_err(), VfsError::IsDir, "O_CREAT {at}");
+        assert_eq!(unlink_at(env, None, path, false).unwrap_err(), VfsError::IsDir, "unlink {at}");
+        assert_eq!(unlink_at(env, None, path, true).unwrap_err(), rmdir, "rmdir {at}");
+        let rename = |old: &[u8], new: &[u8], flags| rename_at2(env, None, old, None, new, flags).unwrap_err();
+        assert_eq!(rename(path, sibling, RenameFlags(0)), VfsError::Busy, "rename from {at}");
+        assert_eq!(rename(sibling, path, RenameFlags(0)), VfsError::Busy, "rename onto {at}");
+        assert_eq!(rename(sibling, path, noreplace), VfsError::Exist, "rename NOREPLACE onto {at}");
+    }
+}

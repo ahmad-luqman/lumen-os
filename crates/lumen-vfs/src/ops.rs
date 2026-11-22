@@ -10,7 +10,7 @@ use crate::error::VfsError;
 use crate::fs::{OpenGuard, Refused, VfsInode};
 use crate::mount::VfsCacheOps;
 use crate::resolve::{
-    MAX_INODE_RACE_RETRIES, ResolveFlags, cross_mounts_down, resolve_and_unify_magic_target, resolve_parent,
+    Final, MAX_INODE_RACE_RETRIES, ResolveFlags, cross_mounts_down, resolve_and_unify_magic_target, resolve_parent,
     resolve_parent_with_depth, resolve_path, resolve_path_with_depth,
 };
 use crate::types::{DevId, Ino, InodeType, OpenFlags, RenameFlags};
@@ -334,25 +334,31 @@ fn open_once(
 
         'follow: loop {
             let target = resolve_parent_with_depth(env, cur_start_dir.as_ref(), &cur_path, &mut symlink_depth)?;
-            if target.name == b"/" {
+            // `.` or `..`: the directory it names, or `EEXIST` with `O_EXCL`.
+            let mut dots_dir = |dots: &[u8]| -> Result<Arc<dyn VfsInode>, VfsError> {
                 if flags.has_excl() {
                     return Err(VfsError::Exist);
                 }
-                break 'follow cross_mounts_down(env, Arc::clone(&target.parent));
-            }
-            if target.name == b"." || target.name == b".." {
-                if flags.has_excl() {
-                    return Err(VfsError::Exist);
-                }
-                break 'follow resolve_path_with_depth(
+                Ok(resolve_path_with_depth(
                     env,
                     Some(&target.parent),
-                    &target.name,
+                    dots,
                     ResolveFlags { follow_final: !flags.has_nofollow(), empty_path: false, require_dir: true },
                     &mut symlink_depth,
                 )?
-                .inode;
-            }
+                .inode)
+            };
+            let name = match target.final_component() {
+                Final::Root => {
+                    if flags.has_excl() {
+                        return Err(VfsError::Exist);
+                    }
+                    break 'follow cross_mounts_down(env, Arc::clone(&target.parent));
+                }
+                Final::Dot => break 'follow dots_dir(b".")?,
+                Final::DotDot => break 'follow dots_dir(b"..")?,
+                Final::Name(name) => name,
+            };
             if first_hop && target.has_trailing_slash {
                 return Err(VfsError::IsDir);
             }
@@ -376,7 +382,7 @@ fn open_once(
                 let mut inode_retries = 0usize;
                 loop {
                     let (dentry_gen, inode_gen) = env.cache_gens();
-                    match target.parent.lookup(&target.name) {
+                    match target.parent.lookup(name) {
                         Ok(existing) => {
                             if flags.has_excl() {
                                 return Err(VfsError::Exist);
@@ -385,7 +391,7 @@ fn open_once(
                             let existing = match env.publish_lookup_inode(
                                 target.parent.dev_id(),
                                 target.parent.ino(),
-                                &target.name,
+                                name,
                                 Arc::clone(&existing),
                                 dentry_gen,
                                 inode_gen,
@@ -394,11 +400,7 @@ fn open_once(
                                     if !Arc::ptr_eq(&unified, &existing)
                                         && (is_inode_dead(&unified) || unified.ino() != existing_ino)
                                     {
-                                        env.dentry_invalidate(
-                                            target.parent.dev_id(),
-                                            target.parent.ino(),
-                                            &target.name,
-                                        );
+                                        env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), name);
                                         let _ = env.inode_remove_if_same(unified.dev_id(), existing_ino, &unified);
                                         if inode_retries < MAX_INODE_RACE_RETRIES {
                                             inode_retries += 1;
@@ -439,12 +441,12 @@ fn open_once(
                             }
                             let eff_mode = (mode & 0o7777) & !umask;
                             let (dentry_gen, inode_gen) = env.cache_gens();
-                            match target.parent.create(&target.name, eff_mode) {
+                            match target.parent.create(name, eff_mode) {
                                 Ok(created) => {
                                     let created = publish_created_inode(
                                         env,
                                         &target.parent,
-                                        &target.name,
+                                        name,
                                         created,
                                         dentry_gen,
                                         inode_gen,
@@ -576,9 +578,10 @@ pub fn mkdir_at(
     umask: u16,
 ) -> Result<Arc<dyn VfsInode>, VfsError> {
     let target = resolve_parent(env, start_dir, path)?;
-    if target.name == b"/" || target.name == b"." || target.name == b".." {
-        return Err(VfsError::Exist);
-    }
+    let name = match target.final_component() {
+        Final::Root | Final::Dot | Final::DotDot => return Err(VfsError::Exist),
+        Final::Name(name) => name,
+    };
     if env.fs_read_only(target.parent.dev_id()) {
         return Err(VfsError::RoFs);
     }
@@ -587,8 +590,8 @@ pub fn mkdir_at(
     let mut created_dir: Option<Arc<dyn VfsInode>> = None;
     let mut run = || -> Result<(), VfsError> {
         let (dentry_gen, inode_gen) = env.cache_gens();
-        let dir = target.parent.mkdir(&target.name, eff_mode)?;
-        created_dir = Some(publish_created_inode(env, &target.parent, &target.name, dir, dentry_gen, inode_gen));
+        let dir = target.parent.mkdir(name, eff_mode)?;
+        created_dir = Some(publish_created_inode(env, &target.parent, name, dir, dentry_gen, inode_gen));
         Ok(())
     };
     match fs_opt {
@@ -614,18 +617,13 @@ pub fn unlink_at(
     let target = resolve_parent(env, start_dir, path)?;
     // A last component that isn't a name: Linux's `do_unlinkat` says
     // `-EISDIR` for all three; `do_rmdir` tells them apart.
-    if !remove_dir && matches!(target.name.as_slice(), b"/" | b"." | b"..") {
-        return Err(VfsError::IsDir);
-    }
-    if target.name == b"/" {
-        return Err(VfsError::Busy);
-    }
-    if target.name == b"." {
-        return Err(VfsError::Inval);
-    }
-    if target.name == b".." {
-        return Err(VfsError::NotEmpty);
-    }
+    let name = match (target.final_component(), remove_dir) {
+        (Final::Root | Final::Dot | Final::DotDot, false) => return Err(VfsError::IsDir),
+        (Final::Root, true) => return Err(VfsError::Busy),
+        (Final::Dot, true) => return Err(VfsError::Inval),
+        (Final::DotDot, true) => return Err(VfsError::NotEmpty),
+        (Final::Name(name), _) => name,
+    };
     if env.fs_read_only(target.parent.dev_id()) {
         return Err(VfsError::RoFs);
     }
@@ -633,7 +631,7 @@ pub fn unlink_at(
     let fs_opt = env.fs_by_dev(target.parent.dev_id());
     let mut run = || -> Result<(), VfsError> {
         let (_, since_gen) = env.cache_gens();
-        let raw_child = target.parent.lookup(&target.name)?;
+        let raw_child = target.parent.lookup(name)?;
         let child = env.inode_get_if_fresh(raw_child.dev_id(), raw_child.ino(), since_gen).unwrap_or(raw_child);
 
         if !remove_dir {
@@ -651,14 +649,14 @@ pub fn unlink_at(
             let old_ino = child.ino();
             let removing_last_link = child.stat()?.nlink <= 1;
 
-            env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), &target.name);
+            env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), name);
             let removal_guard = if removing_last_link {
                 Some(InodeRemovalGuard::begin(env, old_dev, old_ino, since_gen))
             } else {
                 None
             };
 
-            if let Err(err) = target.parent.unlink(&target.name) {
+            if let Err(err) = target.parent.unlink(name) {
                 if let Some((guard, Some(removed_arc))) = removal_guard {
                     let end_gen = guard.finish();
                     if !removed_arc.is_detached()
@@ -686,7 +684,7 @@ pub fn unlink_at(
                 }
             }
 
-            env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), &target.name);
+            env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), name);
             Ok(())
         } else {
             if child.inode_type() != InodeType::Dir {
@@ -698,11 +696,11 @@ pub fn unlink_at(
 
             let old_dev = child.dev_id();
             let old_ino = child.ino();
-            env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), &target.name);
+            env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), name);
             env.dentry_invalidate_dir(old_dev, old_ino);
             let (guard, removed_arc_opt) = InodeRemovalGuard::begin(env, old_dev, old_ino, since_gen);
 
-            if let Err(err) = target.parent.rmdir(&target.name) {
+            if let Err(err) = target.parent.rmdir(name) {
                 let end_gen = guard.finish();
                 if let Some(removed_arc) = removed_arc_opt
                     && !removed_arc.is_detached()
@@ -717,7 +715,7 @@ pub fn unlink_at(
             if removed_arc_opt.is_none() {
                 evict_if_cached_zombie(env, old_dev, old_ino);
             }
-            env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), &target.name);
+            env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), name);
             env.dentry_invalidate_dir(old_dev, old_ino);
             Ok(())
         }
@@ -754,10 +752,11 @@ pub fn link_at(
     // `-ENOENT` (a trailing slash on a free one), then `-EROFS`, then
     // `-EXDEV`, then a directory's `-EPERM`.
     let new_target = resolve_parent(env, new_dir, new_path)?;
-    if new_target.name == b"/" || new_target.name == b"." || new_target.name == b".." {
-        return Err(VfsError::Exist);
-    }
-    match new_target.parent.lookup(&new_target.name) {
+    let new_name = match new_target.final_component() {
+        Final::Root | Final::Dot | Final::DotDot => return Err(VfsError::Exist),
+        Final::Name(name) => name,
+    };
+    match new_target.parent.lookup(new_name) {
         Ok(_) => return Err(VfsError::Exist),
         Err(VfsError::NoEnt) if new_target.has_trailing_slash => return Err(VfsError::NoEnt),
         Err(VfsError::NoEnt) => {}
@@ -780,11 +779,11 @@ pub fn link_at(
         }
 
         let inv_gen = env.dentry_gen();
-        new_target.parent.link(&new_target.name, &old.inode)?;
+        new_target.parent.link(new_name, &old.inode)?;
         let _ = env.dentry_insert_if_gen(
             new_target.parent.dev_id(),
             new_target.parent.ino(),
-            &new_target.name,
+            new_name,
             DentryTarget { dev: old.inode.dev_id(), ino: old.inode.ino() },
             inv_gen,
         );
@@ -815,11 +814,12 @@ pub fn symlink_at(
     }
 
     let parent = resolve_parent(env, new_dir, linkpath)?;
-    if parent.name == b"/" || parent.name == b"." || parent.name == b".." {
-        return Err(VfsError::Exist);
-    }
+    let name = match parent.final_component() {
+        Final::Root | Final::Dot | Final::DotDot => return Err(VfsError::Exist),
+        Final::Name(name) => name,
+    };
     if parent.has_trailing_slash {
-        return match parent.parent.lookup(&parent.name) {
+        return match parent.parent.lookup(name) {
             Ok(_) => Err(VfsError::Exist),
             Err(e) => Err(e),
         };
@@ -832,8 +832,8 @@ pub fn symlink_at(
     let mut created_sym: Option<Arc<dyn VfsInode>> = None;
     let mut run = || -> Result<(), VfsError> {
         let (dentry_gen, inode_gen) = env.cache_gens();
-        let sym = parent.parent.symlink(&parent.name, target)?;
-        created_sym = Some(publish_created_inode(env, &parent.parent, &parent.name, sym, dentry_gen, inode_gen));
+        let sym = parent.parent.symlink(name, target)?;
+        created_sym = Some(publish_created_inode(env, &parent.parent, name, sym, dentry_gen, inode_gen));
         Ok(())
     };
     match fs_opt {
@@ -912,13 +912,16 @@ pub fn rename_at2(
     if dev != new_target.parent.dev_id() {
         return Err(VfsError::XDev);
     }
-    let not_a_name = |name: &[u8]| matches!(name, b"/" | b"." | b"..");
-    if not_a_name(&old_target.name) {
-        return Err(VfsError::Busy);
-    }
-    if not_a_name(&new_target.name) {
-        return Err(if flags.has_noreplace() { VfsError::Exist } else { VfsError::Busy });
-    }
+    let old_name = match old_target.final_component() {
+        Final::Root | Final::Dot | Final::DotDot => return Err(VfsError::Busy),
+        Final::Name(name) => name,
+    };
+    let new_name = match new_target.final_component() {
+        Final::Root | Final::Dot | Final::DotDot => {
+            return Err(if flags.has_noreplace() { VfsError::Exist } else { VfsError::Busy });
+        }
+        Final::Name(name) => name,
+    };
     if env.fs_read_only(dev) {
         return Err(VfsError::RoFs);
     }
@@ -932,18 +935,18 @@ pub fn rename_at2(
         // directory, a trailing slash on either name (`-ENOTDIR`); the
         // ancestry traps (`lock_rename`); the same inode both sides (a
         // no-op); the types (`may_delete`); a mountpoint (`-EBUSY`).
-        let old_inode = lookup_and_unify_inode(env, &old_target.parent, &old_target.name)?;
+        let old_inode = lookup_and_unify_inode(env, &old_target.parent, old_name)?;
         let old_is_dir = old_inode.inode_type() == InodeType::Dir;
 
         let (_, new_since_gen) = env.cache_gens();
         let new_inode_opt = if flags.has_exchange() {
-            match lookup_and_unify_inode(env, &new_target.parent, &new_target.name) {
+            match lookup_and_unify_inode(env, &new_target.parent, new_name) {
                 Ok(i) => Some(i),
                 Err(VfsError::NoEnt) => None,
                 Err(e) => return Err(e),
             }
         } else {
-            match new_target.parent.lookup(&new_target.name) {
+            match new_target.parent.lookup(new_name) {
                 Ok(i) => Some(env.inode_get_if_fresh(i.dev_id(), i.ino(), new_since_gen).unwrap_or(i)),
                 Err(VfsError::NoEnt) => None,
                 Err(e) => return Err(e),
@@ -1003,13 +1006,13 @@ pub fn rename_at2(
         }
 
         if flags.has_exchange() {
-            env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
-            env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
+            env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), old_name);
+            env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), new_name);
 
-            old_target.parent.rename(&old_target.name, &new_target.parent, &new_target.name, flags)?;
+            old_target.parent.rename(old_name, &new_target.parent, new_name, flags)?;
 
-            env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
-            env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
+            env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), old_name);
+            env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), new_name);
             return Ok(());
         }
 
@@ -1029,8 +1032,8 @@ pub fn rename_at2(
             None
         };
 
-        env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
-        env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
+        env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), old_name);
+        env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), new_name);
 
         if let Some((ref new_inode, orig_ino, last_link)) = last_link_info {
             if new_inode.inode_type() == InodeType::Dir {
@@ -1044,7 +1047,7 @@ pub fn rename_at2(
             }
         }
 
-        if let Err(err) = old_target.parent.rename(&old_target.name, &new_target.parent, &new_target.name, flags) {
+        if let Err(err) = old_target.parent.rename(old_name, &new_target.parent, new_name, flags) {
             if let Some(pending) = removal_guard {
                 let end_gen = pending.guard.finish();
                 if let Some(removed_arc) = pending.removed_arc
@@ -1077,8 +1080,8 @@ pub fn rename_at2(
             }
         }
 
-        env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
-        env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
+        env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), old_name);
+        env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), new_name);
         if let Some((d_dev, d_ino)) = overwritten_dir_key {
             env.dentry_invalidate_dir(d_dev, d_ino);
         }
