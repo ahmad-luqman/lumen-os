@@ -19,9 +19,12 @@ use core::fmt;
 /// (`thread: <name> (id N)`) stays on that line.
 ///
 /// The cut is for names from outside the kernel's source (a path given to
-/// `linux /path`): every name written in the source fits, which
-/// `tests/harness/test_thread_names.py` checks, and an app's name is at
-/// most 11 bytes (`app:<name>`; `kernel/build.rs`).
+/// `linux /path`), made with [`ThreadName::new`] or
+/// [`ThreadName::from_path`]. The kernel's own names come through
+/// `From<&str>`, which refuses one that wouldn't fit (a debug assertion);
+/// `tests/harness/test_thread_names.py` checks each name written as a
+/// literal at a call that names a thread, before the kernel runs; and an
+/// app's name is at most 11 bytes (`app:<name>`; `kernel/build.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ThreadName([u8; 16]);
 
@@ -37,26 +40,20 @@ impl ThreadName {
         let (mut i, mut o) = (0, 0);
         while i < len {
             let b = bytes[i];
-            // The UTF-8 length of a control character or a separator
-            // starting at `i` (0: neither). Each is whole inside `len`: it
-            // ends on a character boundary.
-            let unsafe_len = if b < 0x20 || b == 0x7f {
-                1
-            } else if b == 0xc2 && i + 1 < len && bytes[i + 1] >= 0x80 && bytes[i + 1] <= 0x9f {
-                2 // C1: U+0080..=U+009F, NEL among them
-            } else if b == 0xe2 && i + 2 < len && bytes[i + 1] == 0x80 && (bytes[i + 2] == 0xa8 || bytes[i + 2] == 0xa9)
-            {
-                3 // U+2028, U+2029
+            // The byte written for the character at `i`, and the character's
+            // length. `len` is a character boundary of a `&str`, so a lead
+            // byte before it has its whole character before it too.
+            let (byte, step) = if b < 0x20 || b == 0x7f {
+                (b'?', 1)
+            } else if b == 0xc2 && bytes[i + 1] <= 0x9f {
+                (b'?', 2) // C1: U+0080..=U+009F (C2 80..=C2 9F), NEL among them
+            } else if b == 0xe2 && bytes[i + 1] == 0x80 && (bytes[i + 2] == 0xa8 || bytes[i + 2] == 0xa9) {
+                (b'?', 3) // U+2028, U+2029
             } else {
-                0
+                (b, 1)
             };
-            if unsafe_len == 0 {
-                out[o] = b;
-                i += 1;
-            } else {
-                out[o] = b'?';
-                i += unsafe_len;
-            }
+            out[o] = byte;
+            i += step;
             o += 1;
         }
         ThreadName(out)
@@ -85,9 +82,16 @@ impl ThreadName {
     }
 }
 
+/// The kernel's own names (every spawn function takes `impl
+/// Into<ThreadName>`): one that would be cut or changed is a bug, caught by
+/// a debug assertion (the kernel keeps them). Text from outside the kernel
+/// (a path, a future `execve`'s name) goes through [`ThreadName::new`] or
+/// [`ThreadName::from_path`], never `.into()`.
 impl From<&str> for ThreadName {
     fn from(name: &str) -> Self {
-        Self::new(name)
+        let made = Self::new(name);
+        debug_assert!(made == name, "thread name {name:?} is over 15 bytes or holds a character `new` replaces");
+        made
     }
 }
 
@@ -163,7 +167,8 @@ mod tests {
         assert_eq!(ThreadName::new("a\0b").as_str(), "a?b");
         assert_eq!(ThreadName::new("a\x1fb").as_str(), "a?b");
         assert_eq!(ThreadName::new("my prog").as_str(), "my prog");
-        assert_eq!(ThreadName::new("~\x7e").as_str(), "~~");
+        // 0x7e, just below DEL, stays.
+        assert_eq!(ThreadName::new("a\x7eb").as_str(), "a~b");
     }
 
     #[test]
@@ -173,8 +178,13 @@ mod tests {
         assert_eq!(ThreadName::new("\u{80}\u{9f}").as_str(), "??");
         assert_eq!(ThreadName::new("a\u{2028}b\u{2029}c").as_str(), "a?b?c");
         // Their neighbours stay: U+00A0 (after C1), U+00E9, U+2027 and
-        // U+202A (around the separators), U+20AC (E2 82 AC).
-        for kept in ["\u{a0}", "\u{e9}", "\u{2027}", "\u{202a}", "\u{20ac}"] {
+        // U+202A (around the separators), U+20AC (E2 82 AC); and the
+        // characters sharing a byte with them: U+00C0 and U+00DF (lead
+        // bytes C3, C3), U+20A8 (E2 82 A8: the separators' last byte after
+        // another second byte), U+3028 (E3 80 A8: the same two bytes after
+        // another lead).
+        for kept in ["\u{a0}", "\u{e9}", "\u{2027}", "\u{202a}", "\u{20ac}", "\u{c0}", "\u{df}", "\u{20a8}", "\u{3028}"]
+        {
             assert_eq!(ThreadName::new(kept).as_str(), kept, "{kept:?}");
         }
         // Cut first (at byte 15, on a character), then replaced: the name
@@ -220,6 +230,24 @@ mod tests {
         assert!(ThreadName::new("sleep-mutex-waiter") == "sleep-mutex-wai");
         assert!(ThreadName::new("a\nb") != "a\nb");
         assert!(ThreadName::new("a\nb") == "a?b");
+    }
+
+    #[test]
+    fn from_a_str_takes_a_name_that_fits_as_it_is() {
+        assert_eq!(ThreadName::from("exactly-15-byte"), "exactly-15-byte");
+        assert_eq!(ThreadName::from("idle"), ThreadName::new("idle"));
+    }
+
+    #[test]
+    #[should_panic(expected = "over 15 bytes")]
+    fn from_a_str_refuses_a_name_that_would_be_cut() {
+        let _ = ThreadName::from("exactly-16-bytes");
+    }
+
+    #[test]
+    #[should_panic(expected = "holds a character")]
+    fn from_a_str_refuses_a_name_that_would_be_changed() {
+        let _ = ThreadName::from("a\nb");
     }
 
     #[test]

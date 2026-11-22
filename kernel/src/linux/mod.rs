@@ -665,6 +665,10 @@ fn spin_elf() -> Vec<u8> {
     )
 }
 
+/// What `run_exec` gave back.
+#[cfg(feature = "ktest")]
+type Ran = Result<(UserExit, i64), RunError>;
+
 /// What [`run_spinning`] saw while the binary spun, and how it ended.
 #[cfg(feature = "ktest")]
 struct Spun {
@@ -675,7 +679,7 @@ struct Spun {
     row: Option<Vec<lumen_shell::pipe::Value>>,
     /// Whether the flag was set, letting it exit.
     released: bool,
-    ran: Option<Result<(UserExit, i64), RunError>>,
+    ran: Option<Ran>,
 }
 
 /// Run `exec` (a [`spin_elf`]) through `run_exec` with `module_name`, on a
@@ -688,7 +692,6 @@ fn run_spinning(exec: Exec, module_name: &'static str, argv0: &'static str) -> R
     use crate::sync::SpinLock;
     use crate::user::copy_to_user;
 
-    type Ran = Result<(UserExit, i64), RunError>;
     let slot: Arc<SpinLock<Option<Ran>>> = Arc::new(SpinLock::new(None));
     let out = slot.clone();
     let runner = crate::sched::spawn("exe-route", move || {

@@ -1449,9 +1449,11 @@ report's `thread:` line): at most 15 bytes, a longer name cut to the
 longest prefix ending on a character, then each control character (C0, DEL,
 C1) and U+2028/U+2029 replaced by one `?`. The spawn functions take any
 `Into<ThreadName>` (a `&str`). The cut is for names from outside the source
-(`linux /path`, section 9): every literal name the kernel passes fits
-(`tests/harness/test_thread_names.py`), and an app's name is at most 11
-bytes (section 8). `sched::spawn(name, f)` starts one on this CPU and `spawn_on(cpu, ..)`
+(`linux /path`, section 9): every name written as a literal at a call
+that names a thread fits (`tests/harness/test_thread_names.py`; names
+kept in a table or a variable aren't read there, and `From<&str>`, the
+spawn functions' conversion, refuses one that wouldn't fit with a debug
+assertion), and an app's name is at most 11 bytes (section 8). `sched::spawn(name, f)` starts one on this CPU and `spawn_on(cpu, ..)`
 on another; both return a `JoinHandle`, whose `join` blocks until the
 thread has finished and its CPU's `finish_switch` is done with it (its
 stack and joiners' list freed, its reference dropped), so nothing that CPU
@@ -4635,7 +4637,9 @@ kernel (no SSE); #197 checks the results' bits.
   `kernel/build.rs` embeds both sets in both kernels, sorted by name, as
   `app::BUNDLED` and `app::TEST_APPS` (`&[App]`, `App { name, thread,
   module }`, `thread` the `app:<name>` string); it refuses a stem
-  outside `[a-z0-9_-]` or one in both sets, and a missing `build/apps`
+  outside `[a-z0-9_-]`, one over 11 bytes (`MAX_APP_NAME`: `app:<name>`
+  must fit in a thread's 15-byte name, section 6, "Kernel threads") or
+  one in both sets, and a missing `build/apps`
   (`make lint` runs before `make build` in CI) gives empty lists, said
   in a build warning (as does a directory that can't be read). Every dependency in `apps/` is pinned with `=`.
   Crates the apps share with the kernel (`lumen-app-api`, `lumen-ui`,
@@ -4669,7 +4673,8 @@ kernel (no SSE); #197 checks the results' bits.
   `a_b` would overwrite `a-b`'s module): a directory, or a package of
   `apps/Cargo.lock` (a path dependency, what it pulls in, a registry
   crate: `cargo build -p` would be ambiguous; a lock file naming none
-  fails closed). The copy is made in a dot directory (not a member) and
+  fails closed); a name over 11 bytes (`kernel/build.rs`'s
+  `MAX_APP_NAME`, for the same reason). The copy is made in a dot directory (not a member) and
   moved into place only once finished, `apps/<name>` checked again just
   before. Nothing needs registering: the member
   glob takes the crate, `make apps` bundles its module, and the launcher

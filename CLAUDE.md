@@ -539,8 +539,9 @@ one is its own PR that updates that doc first.
   `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free),
   and `ThreadName` (#276: a thread's name, 16 bytes inline like Linux's `comm`: at most 15 bytes cut
   at a character boundary, control characters (C0, DEL, C1) and U+2028/U+2029 as `?`; `from_path`,
-  a path's last component, the name a binary run by `linux /path` gets; every literal name in the
-  kernel fits, `tests/harness/test_thread_names.py`, and app names are at most 11 bytes).
+  a path's last component, the name a binary run by `linux /path` gets; `From<&str>`, the kernel's
+  names, refuses one that wouldn't fit by a debug assertion; names written as literals at a call
+  naming a thread are linted, `tests/harness/test_thread_names.py`; app names are at most 11 bytes).
 - `crates/lumen-time`: timekeeping arithmetic: calibration (windows'
   steadiness, the ones with the smallest bounds filling in, how far off a
   median can be for either rate, `tsc_error_ppm`, a window slow to read
@@ -751,6 +752,8 @@ one is its own PR that updates that doc first.
   (incl. `test_rootfs.py`),
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs
   `# unconfirmed: <why>`, and lumen_harness types raw only where it
-  implements it; `test_thread_names.py`, a lint: every literal thread name
-  in kernel/src fits in a `ThreadName` (15 bytes, #276).
+  implements it; `test_thread_names.py`, a lint: every thread name written
+  as a literal at a call naming a thread in kernel/src fits in a
+  `ThreadName` (15 bytes, #276), failing on a name argument it can't read
+  and on a function taking a `ThreadName` it doesn't list.
   `tests/features/*.toml`: feature → test map (the CI feature gate and STATUS.md).

@@ -14,19 +14,19 @@ fn main() {
     embed_apps(Path::new(&dir).join("../build/apps").as_path());
 }
 
-/// Embed the WASM apps `make apps` built (the layout: ARCHITECTURE section
-/// 8, "Building and bundling") as `app::BUNDLED` and `app::TEST_APPS`, each
-/// sorted by name, each an `App { name, thread, module }` (`thread` the
-/// `app:<name>` string its thread is named with, made once here). A name
-/// outside `[a-z0-9_-]`, longer than [`MAX_APP_NAME`] bytes, or in both
-/// sets, fails the build; no
-/// build/apps at all (`make lint` runs before `make build` in CI) gives
-/// empty lists, said in a warning, as does a directory that can't be read.
 /// The longest app name: `app:<name>` fits in a thread's name
 /// (`lumen_trace::ThreadName::MAX_LEN`, 15 bytes; `kernel/src/app.rs`
 /// checks the two agree at compile time, `tools/new-app.sh` refuses longer).
 const MAX_APP_NAME: usize = 11;
 
+/// Embed the WASM apps `make apps` built (the layout: ARCHITECTURE section
+/// 8, "Building and bundling") as `app::BUNDLED` and `app::TEST_APPS`, each
+/// sorted by name, each an `App { name, thread, module }` (`thread` the
+/// `app:<name>` string its thread is named with, made once here). A name
+/// outside `[a-z0-9_-]`, longer than [`MAX_APP_NAME`] bytes, or in both
+/// sets, fails the build; no build/apps at all (`make lint` runs before
+/// `make build` in CI) gives empty lists, said in a warning, as does a
+/// directory that can't be read.
 fn embed_apps(apps: &Path) {
     println!("cargo:rerun-if-changed={}", apps.display());
     println!("cargo:rerun-if-changed={}", apps.join("tests").display());

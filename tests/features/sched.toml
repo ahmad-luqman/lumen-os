@@ -120,7 +120,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Per-thread names (#276): a thread's name is a `ThreadName`, 16 bytes inline like Linux's `comm` (no heap; at most 15 bytes, cut at a character boundary, each control character (C0 with NUL, DEL, C1) and U+2028/U+2029 as one `?`, padded like a `&str`); every literal thread name in the kernel's source fits (a lint), and an app name over 11 bytes is refused by `make app` (`app:<name>` must fit); a binary run by path (`linux /path`) runs on a thread named after the path's last component (cut to 15 bytes), a boot module on one named after the module, as the shell's `threads` table lists them"
+name = "Per-thread names (#276): a thread's name is a `ThreadName`, 16 bytes inline like Linux's `comm` (no heap; at most 15 bytes, cut at a character boundary, each control character (C0 with NUL, DEL, C1) and U+2028/U+2029 as one `?`, padded like a `&str`); every thread name written as a literal at a call naming a thread fits (a lint that fails on what it can't read), a kernel name converted with `From<&str>` that wouldn't fit is refused, and an app name over 11 bytes is refused by `make app` (`app:<name>` must fit); a binary run by path (`linux /path`) runs on a thread named after the path's last component (cut to 15 bytes), a boot module on one named after the module, as the shell's `threads` table lists them"
 milestone = "M7"
 tests = [
     "cargo:lumen-trace",
