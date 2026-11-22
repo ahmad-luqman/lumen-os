@@ -2366,6 +2366,11 @@ fn open_creat_dangling_symlinks_and_existing_dir_edges() {
         open_inode(&env, None, b"/sym_to_ro", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap_err(),
         VfsError::RoFs
     );
+    // A link onto a read-only filesystem: EROFS ahead of EXDEV, after the new
+    // name's ENOENT (Linux's `filename_create`).
+    open_inode(&env, None, b"/ro_src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    assert_eq!(link_at(&env, None, b"/ro_src", None, b"/ro/hl", false, false).unwrap_err(), VfsError::RoFs);
+    assert_eq!(link_at(&env, None, b"/ro_src", None, b"/ro/hl/", false, false).unwrap_err(), VfsError::NoEnt);
 
     // 9. O_CREAT | O_RDONLY on existing dir, `/.`, and symlink-to-dir -> EISDIR; with O_EXCL -> EEXIST.
     symlink_at(&env, b"/existing_dir", None, b"/sym_to_existing_dir").unwrap();
