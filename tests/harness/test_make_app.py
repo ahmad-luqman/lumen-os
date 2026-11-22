@@ -6,7 +6,8 @@ the kernel would take (validated by wasmtime, `lumen` imports only,
 manifest). Refused, making nothing: names the kernel wouldn't embed or
 not starting with a letter, `test-`/`test_` names and test apps' module
 names, names the workspace has once `-` and `_` are alike (a directory,
-any package of apps/Cargo.lock), an existing directory; a lock file
+any package of apps/Cargo.lock), names over 11 bytes (`app:<name>`
+must fit in a thread's 15-byte name), an existing directory; a lock file
 naming no package fails closed, and a copy that fails leaves nothing
 behind."""
 
@@ -132,6 +133,11 @@ def test_a_new_app_is_the_template_renamed_and_builds(repo):
         # refuses a name in both sets.
         (("NAME=hello",), "hello: a test app's name (apps/test-hello)"),
         (("NAME=window",), "window: a test app's name (apps/test-window)"),
+        # `app:<name>` must fit in a thread's name (15 bytes, #276).
+        (
+            ("NAME=abcdefghijkl",),
+            "abcdefghijkl: over 11 bytes (its thread, app:abcdefghijkl, must fit",
+        ),
     ],
 )
 def test_a_name_the_kernel_would_refuse_or_a_taken_one_makes_nothing(repo, args, said):
@@ -140,6 +146,12 @@ def test_a_name_the_kernel_would_refuse_or_a_taken_one_makes_nothing(repo, args,
     assert made.returncode != 0
     assert f"make app: {said}" in made.stderr, made.stderr
     assert app_dirs(repo) == before
+
+
+def test_a_name_of_11_bytes_is_made(repo):
+    made = make_app(repo, "NAME=abcdefghijk")
+    assert made.returncode == 0, made.stderr
+    assert (repo / "apps" / "abcdefghijk" / "Cargo.toml").is_file()
 
 
 def test_an_existing_app_is_not_overwritten(repo):

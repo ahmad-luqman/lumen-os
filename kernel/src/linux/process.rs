@@ -555,6 +555,13 @@ pub fn process_address_space(pid: u32) -> Option<Arc<AddressSpace>> {
     guard.values().find(|p| p.pid == pid).and_then(|p| p.address_space.as_ref().map(Arc::clone))
 }
 
+/// The kernel thread `pid` runs on (its id in `sched::threads()`, which
+/// the shell's `threads` lists), while it runs.
+#[cfg(feature = "ktest")]
+pub fn process_thread_id(pid: u32) -> Option<u64> {
+    ACTIVE_PROCS.lock().iter().find(|(_, p)| p.pid == pid).map(|(&ktid, _)| ktid)
+}
+
 /// Snapshot the executable path recorded for `pid`, if any.
 pub fn process_exe_path(pid: u32) -> Option<String> {
     let guard = ACTIVE_PROCS.lock();

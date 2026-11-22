@@ -17,7 +17,9 @@
 #   pulls in, `lumen-gfx`; a crate from the registry, `serde`: `cargo build
 #   -p` would be ambiguous), each the same once `-` and `_` are alike
 #   (cargo's output file is named with `_`: `a-b` and `a_b` would overwrite
-#   each other's module).
+#   each other's module);
+# - a name over 11 bytes (kernel/build.rs's MAX_APP_NAME): the app's
+#   thread, `app:<name>`, has to fit in a thread's name (15 bytes, #276).
 # The copy is made in a dot directory (not a member) and moved into place
 # only once it is finished, so a failure leaves nothing behind.
 set -euo pipefail
@@ -63,6 +65,8 @@ packages="$(sed -n 's/^name = "\([^"]*\)"$/\1/p' "$apps/Cargo.lock")"
 while IFS= read -r package; do
 	[ "$(crate_file "$package")" != "$want" ] || fail "$name: that name is taken (a package of apps/Cargo.lock)"
 done <<<"$packages"
+# Last, so a name refused for another reason says that reason.
+[ "${#name}" -le 11 ] || fail "$name: over 11 bytes (its thread, app:$name, must fit in a thread's 15-byte name)"
 
 tmp="$(mktemp -d "$apps/.new-$name.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT

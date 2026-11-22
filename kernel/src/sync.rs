@@ -575,7 +575,7 @@ crate::ktest!(
         let m2 = mutex.clone();
         let e2 = entered.clone();
         let d2 = done.clone();
-        let handle = crate::sched::spawn("sleep-mutex-waiter", move || {
+        let handle = crate::sched::spawn("sleep-mtx-wait", move || {
             e2.store(true, Ordering::Release);
             let mut guard = m2.lock();
             assert!(arch::irq::enabled() && arch::irq::depth() == 0);

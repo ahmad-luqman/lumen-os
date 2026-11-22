@@ -443,13 +443,14 @@ fn draw_bands(bands: Vec<lumen_gfx::BandMut<'_>>, view: View, others: &[usize]) 
 }
 
 /// The launcher's `Mandelbrot`: a window drawn once by every CPU, by its
-/// owner thread `desktop-mandelbrot`; its id.
+/// owner thread `desk-mandelbrot` (15 bytes: a thread's name keeps no
+/// more, `lumen_trace::ThreadName`); its id.
 pub fn open_mandelbrot_window() -> Result<u32, String> {
     let (w, h) = MANDEL_WINDOW;
     let handle = crate::desktop::open_window("Mandelbrot", w, h).map_err(|e| format!("no window: {e}"))?;
     let id = handle.id();
     let _detached =
-        sched::spawn("desktop-mandelbrot", move || mandelbrot_owner(handle)).map_err(|e| format!("no thread: {e}"))?;
+        sched::spawn("desk-mandelbrot", move || mandelbrot_owner(handle)).map_err(|e| format!("no thread: {e}"))?;
     Ok(id)
 }
 
