@@ -240,10 +240,7 @@ crate::ktest!(
         console.set_mode(0o600).map_err(|_| "set_mode")?;
         let res = run_dev_tmp_proc_checks();
         let restored = console.set_mode(mode);
-        if let Err(err) = &res {
-            log::error!(target: "vfs", "dev_tmp_proc_checks: {err}");
-        }
-        kassert_eq!(res.is_ok(), true);
+        kassert_eq!(res.as_ref().err(), None);
         kassert_eq!(restored, Ok(()));
         Ok(())
     }

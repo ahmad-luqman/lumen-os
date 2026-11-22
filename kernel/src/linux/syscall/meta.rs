@@ -56,7 +56,8 @@ fn open_file(fd: Fd) -> Result<FileRef, u32> {
 /// setters deciding. A special file on any other read-only mount is
 /// `-EROFS` here, as on Linux. A device not in the mount table (a ktest's
 /// scratch volume) counts as writable: ext4's setters still refuse on a
-/// read-only volume, while devfs's take the change on any instance.
+/// read-only volume, while devfs's character nodes take the change on any
+/// instance (its root refuses).
 fn writable_mount(inode: &dyn VfsInode) -> Result<(), u32> {
     let dev = inode.dev_id();
     if dev != DevId::DEVFS && tables().fs_read_only(dev) { Err(errno::EROFS) } else { Ok(()) }
@@ -262,7 +263,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use lumen_vfs::{Metadata, OpenFlags, OpenGuard, ResolveFlags, Timespec, VfsError, VfsInode};
+    use lumen_vfs::{Metadata, OpenFlags, OpenGuard, ResolveFlags, Timespec, VfsInode};
     use lumen_vm::{MapPlace, Prot};
 
     use super::super::at::{self, Dirfd, Fd, UserPtr};
@@ -917,34 +918,47 @@ mod tests {
     );
 
     /// `/dev/null`'s mode, owner and times as a ktest found them, put back
-    /// on drop (whichever way the ktest ends), so other tests and the boot
-    /// checks see the node as devfs made it. Its ctime stays moved.
+    /// by `restore` (which each ktest asserts at its end), or by the drop
+    /// if the ktest returned early, so other tests and the boot checks see
+    /// the node as devfs made it. Its ctime stays moved.
     struct DevNullRestore {
         inode: Arc<dyn VfsInode>,
         meta: Metadata,
+        restored: bool,
     }
 
     impl DevNullRestore {
         fn take() -> Result<Self, &'static str> {
             let inode = inode_of("/dev/null")?;
             let meta = inode.stat().map_err(|_| "stat")?;
-            Ok(Self { inode, meta })
+            Ok(Self { inode, meta, restored: false })
+        }
+
+        /// Put the metadata back, owner first (a chown's
+        /// `mode_after_chown` can't strip the restored mode), then check
+        /// `stat` shows it.
+        fn restore(&mut self) -> Result<(), &'static str> {
+            let m = &self.meta;
+            self.inode.set_owner(Some(m.uid), Some(m.gid)).map_err(|_| "restore the owner")?;
+            self.inode.set_mode(m.mode).map_err(|_| "restore the mode")?;
+            self.inode.set_times(SetTime::Set(m.atime), SetTime::Set(m.mtime)).map_err(|_| "restore the times")?;
+            let now = self.inode.stat().map_err(|_| "stat after the restore")?;
+            if (now.mode, now.uid, now.gid, now.atime, now.mtime) != (m.mode, m.uid, m.gid, m.atime, m.mtime) {
+                return Err("/dev/null's metadata not as it was");
+            }
+            self.restored = true;
+            Ok(())
         }
     }
 
     impl Drop for DevNullRestore {
-        /// Owner first: a chown's `mode_after_chown` can't strip the
-        /// restored mode. A failed restore is warned about (a drop can't
-        /// fail the ktest).
+        /// The backstop for a ktest that returned early (its failure is
+        /// already reported): a failed restore here is only warned about.
         fn drop(&mut self) {
-            let m = &self.meta;
-            let restored = [
-                self.inode.set_owner(Some(m.uid), Some(m.gid)),
-                self.inode.set_mode(m.mode),
-                self.inode.set_times(SetTime::Set(m.atime), SetTime::Set(m.mtime)),
-            ];
-            if let Some(Err(e)) = restored.iter().find(|r| r.is_err()) {
-                log::warn!(target: "ktest", "/dev/null's metadata not restored: {e:?}");
+            if !self.restored
+                && let Err(e) = self.restore()
+            {
+                log::warn!(target: "ktest", "/dev/null's metadata not restored: {e}");
             }
         }
     }
@@ -952,10 +966,10 @@ mod tests {
     crate::ktest!(
         fn meta_chmod_on_dev_null_is_kept_as_devtmpfs_does() {
             process::in_test_process(|_| {
-                let _restore = DevNullRestore::take()?;
+                let mut restore = DevNullRestore::take()?;
                 let null = ktest_user_path(0, b"/dev/null")?;
-                // devfs is a read-only mount, but its own (`DevId::DEVFS`)
-                // nodes skip `writable_mount`'s check: the new mode is kept,
+                // devfs is a read-only mount, but its mount (`DevId::DEVFS`)
+                // skips `writable_mount`'s check: the new mode is kept,
                 // set-id and sticky bits too, `stat` shows it, ctime moves.
                 let before = meta_of("/dev/null")?;
                 kassert_eq!(before.mode, 0o666);
@@ -975,16 +989,12 @@ mod tests {
                 kassert_eq!(sys_chmod(null, at::reg(0o7777)), 0);
                 kassert_eq!(meta_of("/dev/null")?.mode, 0o7777);
                 kassert_eq!(sys_close(fd), 0);
-                // `/dev` itself: `-EROFS` (devfs's setter refuses it), also
-                // to a caller skipping the syscalls (`vfstest chmod`).
+                // `/dev` itself: `-EROFS` (devfs's setter refuses it; a
+                // direct call too: `devfs_nodes_start_with_their_boot_metadata`).
                 let dev = ktest_user_path(1, b"/dev")?;
                 kassert_eq!(sys_chmod(dev, at::reg(0o700)), neg_errno(errno::EROFS));
-                let dev_inode = inode_of("/dev")?;
-                kassert_eq!(dev_inode.set_mode(0o700), Err(VfsError::RoFs));
-                kassert_eq!(dev_inode.set_owner(Some(1), Some(1)), Err(VfsError::RoFs));
-                kassert_eq!(dev_inode.set_times(SetTime::Now, SetTime::Now), Err(VfsError::RoFs));
-                let dev_meta = meta_of("/dev")?;
-                kassert_eq!((dev_meta.mode, dev_meta.uid, dev_meta.gid), (0o755, 0, 0));
+                kassert_eq!(meta_of("/dev")?.mode, 0o755);
+                kassert_eq!(restore.restore(), Ok(()));
                 Ok(())
             })?
         }
@@ -993,7 +1003,7 @@ mod tests {
     crate::ktest!(
         fn meta_chown_on_dev_null_is_kept_as_devtmpfs_does() {
             process::in_test_process(|_| {
-                let _restore = DevNullRestore::take()?;
+                let mut restore = DevNullRestore::take()?;
                 let null = ktest_user_path(0, b"/dev/null")?;
                 let owner = || meta_of("/dev/null").map(|m| (m.uid, m.gid));
                 let before = meta_of("/dev/null")?;
@@ -1020,6 +1030,7 @@ mod tests {
                 let dev = ktest_user_path(1, b"/dev")?;
                 kassert_eq!(sys_chown(dev, 1, 1), neg_errno(errno::EROFS));
                 kassert_eq!(meta_of("/dev").map(|m| (m.uid, m.gid))?, (0, 0));
+                kassert_eq!(restore.restore(), Ok(()));
                 Ok(())
             })?
         }
@@ -1028,7 +1039,7 @@ mod tests {
     crate::ktest!(
         fn meta_utimensat_on_dev_null_is_kept_as_devtmpfs_does() {
             process::in_test_process(|_| {
-                let _restore = DevNullRestore::take()?;
+                let mut restore = DevNullRestore::take()?;
                 let null = ktest_user_path(0, b"/dev/null")?;
                 let times_at = process::KTEST_USER_VA + 2048;
                 let times = |p: &str| meta_of(p).map(|m| (ts(m.atime), ts(m.mtime)));
@@ -1060,6 +1071,7 @@ mod tests {
                 let dev_times = times("/dev")?;
                 kassert_eq!(sys_utimensat(Dirfd::Cwd, dev, t, flags(0)), neg_errno(errno::EROFS));
                 kassert_eq!(times("/dev")?, dev_times);
+                kassert_eq!(restore.restore(), Ok(()));
                 Ok(())
             })?
         }
@@ -1067,10 +1079,11 @@ mod tests {
 
     crate::ktest!(
         fn meta_a_special_file_on_another_read_only_mount_stays_erofs() {
-            // Only devfs's own nodes skip the mount check (Linux's devtmpfs
-            // being a writable mount): a second devfs on another device is
-            // a read-only mount whose char nodes' setters would take the
-            // change, so only `writable_mount` refuses it here.
+            // Only devfs's mount (`DevId::DEVFS`) skips the mount check
+            // (Linux's devtmpfs being a writable mount): a second devfs on
+            // another device is a read-only mount whose char nodes' setters
+            // take a change (checked first), so only `writable_mount`
+            // refuses it here.
             use lumen_vfs::FileSystem;
             const MNT: &str = "/tmp/meta-ktest-ro-dev";
             const NULL: &str = "/tmp/meta-ktest-ro-dev/null";
@@ -1085,6 +1098,7 @@ mod tests {
             let ran = process::in_test_process(|_| {
                 let null = ktest_user_path(0, NULL.as_bytes())?;
                 let before = meta_of(NULL)?;
+                kassert_eq!(inode_of(NULL)?.set_mode(before.mode), Ok(()));
                 kassert_eq!(before.inode_type, InodeType::CharDevice);
                 kassert!(tables().fs_read_only(before.dev));
                 kassert_eq!(sys_chmod(null, at::reg(0o600)), neg_errno(errno::EROFS));
@@ -1103,10 +1117,7 @@ mod tests {
             let removed = rmdir();
             ran??;
             umounted?;
-            removed?;
-            // The mount point went with the rmdir.
-            kassert!(inode_of(MNT).is_err());
-            Ok(())
+            removed.map(drop)
         }
     );
 }

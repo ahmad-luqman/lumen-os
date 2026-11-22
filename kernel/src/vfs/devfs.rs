@@ -162,8 +162,10 @@ pub struct DevfsInode {
 impl DevfsInode {
     /// The metadata, held for a change: a character node's, as Linux's
     /// devtmpfs takes `chmod`, `chown` and `utimensat` on its nodes. `/dev`
-    /// itself is `-EROFS`, as the syscall layer's mount check already says
-    /// for it (a directory isn't exempt).
+    /// itself is `-EROFS` (a divergence: devtmpfs takes these on `/dev`
+    /// too), and this is the only refusal: the syscall layer's
+    /// `writable_mount` lets every `DevId::DEVFS` inode through, and
+    /// `vfstest chmod` calls the setters directly.
     fn changeable_meta(&self) -> Result<SleepMutexGuard<'_, DevfsMeta>, VfsError> {
         if self.kind == DevKind::Root {
             return Err(VfsError::RoFs);
@@ -422,7 +424,7 @@ crate::ktest!(
     fn devfs_nodes_start_with_their_boot_metadata() {
         // A fresh instance (not `/dev`'s, whose nodes a `chmod` may have
         // changed): each node's Linux mode, number and type, owned by root.
-        use crate::{kassert, kassert_eq};
+        use crate::kassert_eq;
         let fs = Devfs::new(DevId::makedev(0, 134));
         let root = fs.root_inode();
         let st = root.stat().map_err(|_| "stat /")?;
@@ -447,7 +449,7 @@ crate::ktest!(
         kassert_eq!(root.set_times(SetTime::Now, SetTime::Now), Err(VfsError::RoFs));
         let after = root.stat().map_err(|_| "stat / after")?;
         kassert_eq!((after.mode, after.uid, after.gid), (0o755, 0, 0));
-        kassert!(after.mtime == st.mtime && after.ctime == st.ctime);
+        kassert_eq!((after.mtime, after.ctime), (st.mtime, st.ctime));
         Ok(())
     }
 );
