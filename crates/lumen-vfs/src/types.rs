@@ -495,9 +495,11 @@ impl AccessMask {
 }
 
 /// A name's or a path's bytes shown as text, never lossily (#268): UTF-8
-/// as it is, except `\` as `\\` and an ASCII control character as `\xNN`,
-/// and each byte that isn't UTF-8 as `\xNN`, so two names never show the
-/// same. `{:?}` puts it in quotes, a `"` in it as `\"`.
+/// as it is, except `\` as `\\`, an ASCII control character as `\xNN`, any
+/// other character `char::escape_debug` escapes (a C1 control, a bidi
+/// override, ...) as `\u{..}`, and each byte that isn't UTF-8 as `\xNN`.
+/// So two names never show the same, and a name can't drive a terminal or
+/// reorder a log line. `{:?}` puts it in quotes, a `"` in it as `\"`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Escaped<'a>(pub &'a [u8]);
 
@@ -509,8 +511,9 @@ impl Escaped<'_> {
                 match c {
                     '\\' => f.write_str("\\\\")?,
                     '"' if quoted => f.write_str("\\\"")?,
+                    '"' | '\'' => f.write_char(c)?,
                     c if c.is_ascii_control() => write!(f, "\\x{:02x}", c as u8)?,
-                    c => f.write_char(c)?,
+                    c => write!(f, "{}", c.escape_debug())?,
                 }
             }
             for b in chunk.invalid() {

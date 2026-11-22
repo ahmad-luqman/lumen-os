@@ -1169,6 +1169,10 @@ fn escaped_shows_every_name_apart() {
     assert_eq!(format!("{}", Escaped(b"a\xff\xfeb")), "a\\xff\\xfeb");
     assert_eq!(format!("{}", Escaped(b"tab\tnl\n\x7f")), "tab\\x09nl\\x0a\\x7f");
     assert_eq!(format!("{}", Escaped(b"back\\slash")), "back\\\\slash");
+    // A C1 control (8-bit CSI) and a bidi override are valid UTF-8 that
+    // would drive a terminal or reorder the line: escaped too.
+    assert_eq!(format!("{}", Escaped("csi\u{9b}2J rlo\u{202e}".as_bytes())), "csi\\u{9b}2J rlo\\u{202e}");
+    assert_eq!(format!("{}", Escaped(b"it's")), "it's");
     // The escape itself can't pass for a byte that needs one.
     assert_ne!(format!("{}", Escaped(b"\\xff")), format!("{}", Escaped(b"\xff")));
     assert_eq!(format!("{:?}", Escaped(b"say \"hi\"\xff")), "\"say \\\"hi\\\"\\xff\"");
@@ -5868,11 +5872,11 @@ fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usiz
 
     // Walk entire live tree from `/` and verify 100% Arc::ptr_eq unification and collect live `(pdev, pino, name) -> (dev, ino)`.
     let mut live_edges: BTreeMap<(DevId, Ino, Vec<u8>), DentryTarget> = BTreeMap::new();
-    let mut queue: Vec<String> = vec![String::from("/")];
+    let mut queue: Vec<Vec<u8>> = vec![b"/".to_vec()];
     while let Some(dir_path) = queue.pop() {
-        let r1 = resolve_path(env.as_ref(), None, dir_path.as_bytes(), ResolveFlags::default()).unwrap().inode;
-        let r2 = resolve_path(env.as_ref(), None, dir_path.as_bytes(), ResolveFlags::default()).unwrap().inode;
-        assert!(Arc::ptr_eq(&r1, &r2), "split Arc for live dir {dir_path}");
+        let r1 = resolve_path(env.as_ref(), None, &dir_path, ResolveFlags::default()).unwrap().inode;
+        let r2 = resolve_path(env.as_ref(), None, &dir_path, ResolveFlags::default()).unwrap().inode;
+        assert!(Arc::ptr_eq(&r1, &r2), "split Arc for live dir {}", Escaped(&dir_path));
         assert!(Arc::ptr_eq(&env.inode_get(r1.dev_id(), r1.ino()).unwrap(), &r1));
 
         let mut cursor = 0u64;
@@ -5889,16 +5893,11 @@ fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usiz
                 if e.name == b"." || e.name == b".." {
                     continue;
                 }
-                let child_path = if dir_path == "/" {
-                    format!("/{}", Escaped(&e.name))
-                } else {
-                    format!("{}/{}", dir_path, Escaped(&e.name))
-                };
-                let c1 =
-                    resolve_path(env.as_ref(), None, child_path.as_bytes(), ResolveFlags::default()).unwrap().inode;
-                let c2 =
-                    resolve_path(env.as_ref(), None, child_path.as_bytes(), ResolveFlags::default()).unwrap().inode;
-                assert!(Arc::ptr_eq(&c1, &c2), "split Arc for live path {child_path}");
+                let sep: &[u8] = if dir_path == b"/" { b"" } else { b"/" };
+                let child_path = [dir_path.as_slice(), sep, &e.name].concat();
+                let c1 = resolve_path(env.as_ref(), None, &child_path, ResolveFlags::default()).unwrap().inode;
+                let c2 = resolve_path(env.as_ref(), None, &child_path, ResolveFlags::default()).unwrap().inode;
+                assert!(Arc::ptr_eq(&c1, &c2), "split Arc for live path {}", Escaped(&child_path));
                 assert!(Arc::ptr_eq(&env.inode_get(c1.dev_id(), c1.ino()).unwrap(), &c1));
 
                 // Direct physical child on `r1` (before mount crossing, for DentryCache match).

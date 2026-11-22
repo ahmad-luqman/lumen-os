@@ -1138,6 +1138,9 @@ crate::ktest!(
             root.readdir(0, &mut truth, 10_000).map_err(|_| "readdir")?;
             let want: [&[u8]; 7] = [b".", b"..", b"a0", b"a1", b"a2", b"a4", b"a5"];
             kassert!(truth.iter().map(|e| e.name.as_slice()).eq(want));
+            // The gap is there to list across: a2's cursor to a4's spans a3's
+            // old record too.
+            kassert!(truth[2..].windows(2).any(|w| w[1].next_cursor - w[0].next_cursor >= 24));
             let fd = ktest_open_inode(&root, "/ktest-gap")?;
             // One record a call.
             let got = ktest_list(fd, 24)?;

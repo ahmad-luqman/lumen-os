@@ -5634,8 +5634,12 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     any other byte, a control character and `\` as `\xNN`, `\\`): logs,
     `vfstest` and `ls` output; never lossily (U+FFFD would name another
     file). `/proc/<pid>/maps` prints the raw bytes, a newline as `\012`
-    (Linux's `seq_path`). Mount paths (`MountTable::mount`, `/proc/mounts`)
-    stay `&str`: only the kernel mounts, at `/`, `/tmp`, `/dev` and `/proc`.
+    (Linux's `seq_path`). Two exceptions stay text: mount paths
+    (`MountTable::mount`, `/proc/mounts`; only the kernel mounts, at `/`,
+    `/tmp`, `/dev` and `/proc`), and the paths a binary is loaded by
+    (`Exec::from_path`, `ImageFile::path`, `/proc/<pid>/exe`): `linux /path`
+    takes the shell's argument, and a `PT_INTERP` path that isn't UTF-8 is
+    refused (`ExecError::InterpPathNotUtf8`); there is no `execve` yet.
   - **Read-only mounts and special files (#291):** `open_inode` (a write
     open: `O_WRONLY`, `O_RDWR`, `O_TRUNC`) and `check_access` (`W_OK`)
     skip their `-EROFS` for a special file, by its type alone
