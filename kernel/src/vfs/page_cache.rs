@@ -492,7 +492,8 @@ impl MappedPage {
 /// drops it only after clearing or downgrading the PTE and flushing
 /// (ARCHITECTURE section 5's unmap order). A `fork` that copies a
 /// writable shared PTE would count it again with a second guard of its
-/// own. `Drop` takes no lock.
+/// own. `Drop` takes no lock (in the ktests, it takes the release-order
+/// recorder's only while a test records).
 pub(crate) struct WritableMap {
     page: Arc<CachePage>,
 }
@@ -660,7 +661,7 @@ pub(crate) mod ktest_files {
     /// A fresh writable `ext4` volume (1 MiB) on an in-memory disk.
     pub(crate) struct Ext4Volume {
         cache: Arc<FlakyCache>,
-        _fs: Arc<Ext4FileSystem>,
+        fs: Arc<Ext4FileSystem>,
         pub(crate) root: Arc<dyn VfsInode>,
     }
 
@@ -673,7 +674,7 @@ pub(crate) mod ktest_files {
             });
             let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&cache) as Arc<dyn BlockCacheBackend>;
             let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "ext4 mount")?;
-            Ok(Self { cache, root: fs.root_inode(), _fs: fs })
+            Ok(Self { cache, root: fs.root_inode(), fs })
         }
 
         /// The root of a read-only mount of the same disk (through the same
@@ -683,6 +684,11 @@ pub(crate) mod ktest_files {
             let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&self.cache) as Arc<dyn BlockCacheBackend>;
             let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
             Ok(fs.root_inode())
+        }
+
+        /// The volume's free inodes, as its superblock counts them.
+        pub(crate) fn free_inodes(&self) -> u32 {
+            super::super::ext4::ktest_util::free_inodes(&self.fs)
         }
 
         /// Make every disk read fail (`true`) or work again.

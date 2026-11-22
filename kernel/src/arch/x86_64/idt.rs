@@ -765,6 +765,13 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
                 // A kernel user copy fails with `-EFAULT` whatever the
                 // reason, a bus error included.
                 if let Some(target) = fixup_rip {
+                    if fault == Some(crate::mm::user_vm::FaultResult::OutOfMemory) {
+                        // The caller only sees `-EFAULT`: say why.
+                        log::warn!(
+                            target: "mm",
+                            "out of memory resolving a kernel user copy's fault at cr2 {cr2:#x}; returning EFAULT"
+                        );
+                    }
                     frame.rip = target;
                     frame.rflags &= !(1 << 18); // clear RFLAGS.AC
                     return;
