@@ -7,7 +7,6 @@
 //! and §8 ("Static ELF64 loader and initial stack").
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -295,7 +294,7 @@ impl MappedFile {
 /// mapping's for every later mapping of the same file while any maps it.
 struct KeptFile {
     guard: OpenGuard,
-    path: Arc<str>,
+    path: Arc<[u8]>,
 }
 
 impl KeptFile {
@@ -1157,16 +1156,24 @@ impl AddressSpace {
         drop(gone_files);
     }
 
+    /// [`format_maps`](Self::format_maps) as text, for the ktests that
+    /// match its lines (their paths are UTF-8).
+    #[cfg(feature = "ktest")]
+    pub fn format_maps_text(&self) -> alloc::string::String {
+        alloc::string::String::from_utf8_lossy(&self.format_maps()).into_owned()
+    }
+
     /// Format `/proc/<pid>/maps` strictly under Lock 1 (`AddressSpace::inner`),
     /// with no `ACTIVE_PROCS` or `VfsInode` locks held. The lines themselves
     /// are `lumen_vm::maps::write_maps`'s; the files they name are resolved
     /// here: a file mapping's from `mapped_files` (its inode's device and
     /// number now, which read no lock, deleted once detached by an unlink,
     /// and the path it was opened by), an ELF image's from the ranges
-    /// `commit_loaded_elf` recorded.
-    pub fn format_maps(&self) -> String {
+    /// `commit_loaded_elf` recorded. Bytes: a path is its bytes, UTF-8 or
+    /// not (#268).
+    pub fn format_maps(&self) -> Vec<u8> {
         use lumen_vm::maps::{FileInfo, MapsLayout};
-        let mut out = String::new();
+        let mut out = Vec::new();
         let inner = self.inner.lock();
         if inner.torn_down {
             return out;
@@ -1178,7 +1185,7 @@ impl AddressSpace {
             stack_top: USER_STACK_TOP,
         };
         fn image_file(f: &Arc<ImageFile>) -> FileInfo<'_> {
-            FileInfo { major: f.dev.major(), minor: f.dev.minor(), ino: f.ino, path: &f.path, deleted: false }
+            FileInfo { major: f.dev.major(), minor: f.dev.minor(), ino: f.ino, path: f.path.as_bytes(), deleted: false }
         }
         let files = |id: u64| {
             let Some(m) = inner.mapped_files.get(&id) else {
@@ -1200,8 +1207,7 @@ impl AddressSpace {
                 deleted: inode.is_detached(),
             })
         };
-        // Writing to a `String` cannot fail.
-        let _ = lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout, &inner.images, image_file, files);
+        lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout, &inner.images, image_file, files);
         out
     }
 
@@ -1880,14 +1886,47 @@ fn file_vm_open_ro(f: &Arc<dyn VfsInode>) -> Result<MappedFile, &'static str> {
 
 #[cfg(feature = "ktest")]
 fn file_vm_open_as(f: &Arc<dyn VfsInode>, flags: u32) -> Result<MappedFile, &'static str> {
+    file_vm_open_path(f, b"/ktest/file", flags)
+}
+
+/// `f` opened with `flags` by `path` (its bytes, as `/proc/<pid>/maps`
+/// shows them), as a mapping keeps it.
+#[cfg(feature = "ktest")]
+fn file_vm_open_path(f: &Arc<dyn VfsInode>, path: &[u8], flags: u32) -> Result<MappedFile, &'static str> {
     let flags = lumen_vfs::OpenFlags::from_bits(flags);
-    let file = crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from("/ktest/file"), flags)
+    let file = crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from(path), flags)
         .map_err(|_| "open the file")?;
     Ok(MappedFile::of(&file))
 }
 
 #[cfg(feature = "ktest")]
 const RW: Prot = Prot::READ.union(Prot::WRITE);
+
+crate::ktest!(
+    fn file_vm_maps_names_a_mapped_file_by_its_path_bytes() {
+        // #268: a file mapped through a descriptor opened by a path that
+        // isn't UTF-8 and holds two newlines is named in `format_maps` by
+        // the path's bytes, each newline as `\012`: the listing stays one
+        // line, which a name can't split.
+        use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        use crate::{kassert, kassert_eq};
+        let vol = TmpfsVolume::new(272, 16 * PAGE_SIZE as usize);
+        let f = ktest_files::file(&vol.root, "maps.bin", &ktest_files::pattern(PAGE_SIZE as usize, 1))?;
+        let file = file_vm_open_path(&f, b"/k/\xff\nf\n", lumen_vfs::OpenFlags::O_RDONLY)?;
+        let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
+        let mapped = space.mmap_file(MapPlace::Hint(None), PAGE_SIZE, Prot::READ, file, 0, Sharing::Private);
+        let maps = space.format_maps();
+        space.teardown();
+        mapped.map_err(|_| "mmap_file")?;
+        let named = maps.ends_with(b" /k/\xff\\012f\\012\n");
+        if !named {
+            crate::ktest::diag(format_args!("maps: {:?}", lumen_vfs::Escaped(&maps)));
+        }
+        kassert!(named);
+        kassert_eq!(maps.iter().filter(|&&b| b == b'\n').count(), 1);
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn file_vm_shared_mapping_is_coherent_both_ways() {
@@ -2217,7 +2256,7 @@ crate::ktest!(
         expected[3000..3012].copy_from_slice(b"second-store");
         expected[P as usize + 1..P as usize + 9].copy_from_slice(b"page-two");
         kassert_eq!(reclaim_ext4(&f)?, 0); // written back and evicted
-        let ro = vol.remount_ro(161)?.lookup("persist.bin").map_err(|_| "ro lookup")?;
+        let ro = vol.remount_ro(161)?.lookup(b"persist.bin").map_err(|_| "ro lookup")?;
         kassert!(ktest_files::read(&ro, 0, expected.len())? == expected);
         kassert!(ktest_files::read(&f, 0, expected.len())? == expected);
         Ok(())
@@ -2478,7 +2517,7 @@ crate::ktest!(
         f.sync(false).map_err(|_| "second sync")?;
         expected[10..15].copy_from_slice(b"first");
         expected[100..106].copy_from_slice(b"second");
-        let ro = vol.remount_ro(169)?.lookup("synced.bin").map_err(|_| "ro lookup")?;
+        let ro = vol.remount_ro(169)?.lookup(b"synced.bin").map_err(|_| "ro lookup")?;
         kassert!(ktest_files::read(&ro, 0, expected.len())? == expected);
         space.munmap(base, P).map_err(|_| "munmap")?;
         Ok(())
@@ -2505,8 +2544,8 @@ crate::ktest!(
                 .mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f)?, 0, Sharing::Shared)
                 .map_err(|_| "map")?;
             kassert_eq!(f.open_count(), 1); // the mapping's
-            dir.unlink("gone.bin").map_err(|_| "unlink")?;
-            kassert!(dir.lookup("gone.bin").is_err());
+            dir.unlink(b"gone.bin").map_err(|_| "unlink")?;
+            kassert!(dir.lookup(b"gone.bin").is_err());
             kassert_eq!(f.stat().map_err(|_| "stat")?.nlink, 0);
             kassert!(f.is_detached()); // kept by the mapping's reference, not freed
             {
@@ -2706,7 +2745,7 @@ crate::ktest!(
         const KERNEL_STORE: u64 = 1 << 1;
         const USER_LOAD: u64 = 1 << 2;
         let vol = TmpfsVolume::new(178, 2 * P as usize);
-        let f = vol.root.create("holes.bin", 0o644).map_err(|_| "create")?;
+        let f = vol.root.create(b"holes.bin", 0o644).map_err(|_| "create")?;
         f.truncate(4 * P).map_err(|_| "truncate")?; // four holes, room for two pages
         let ino = f.ino();
         let warning = alloc::format!("inode {:?}:{ino} can't be mapped (NoSpc): bus error", f.dev_id());

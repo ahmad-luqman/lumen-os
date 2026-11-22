@@ -47,8 +47,8 @@ pub use resolve::{
     ParentTarget, ResolveFlags, ResolvedPath, check_access, compute_cwd_path, resolve_parent, resolve_path,
 };
 pub use types::{
-    AccessMask, AccessMode, AtFlags, DevId, DirEntry, Ino, InodeType, Metadata, OpenFlags, RenameFlags, SeekFrom,
-    SetTime, Timespec, mode_after_chown,
+    AccessMask, AccessMode, AtFlags, DevId, DirEntry, Escaped, Ino, InodeType, Metadata, OpenFlags, RenameFlags,
+    SeekFrom, SetTime, Timespec, mode_after_chown,
 };
 
 /// Maximum POSIX path length including NUL (`PATH_MAX`).

@@ -210,7 +210,7 @@ fn ktest_pattern(len: usize, seed: u8) -> alloc::vec::Vec<u8> {
 fn ktest_install(inode: &alloc::sync::Arc<dyn VfsInode>, flags: u32) -> Result<Fd, &'static str> {
     let file = process::KernelFile::new_unchecked_flags(
         alloc::sync::Arc::clone(inode),
-        "/io-ktest-volume/file".into(),
+        alloc::sync::Arc::from(*b"/io-ktest-volume/file"),
         ktest_flags(flags),
     )
     .map_err(|_| "open the volume's file")?;
@@ -228,7 +228,7 @@ fn ktest_on_device(
     name: &str,
 ) -> Result<Option<alloc::vec::Vec<u8>>, &'static str> {
     let root = vol.mount_device_copy_ro(minor)?;
-    let f = match root.lookup(name) {
+    let f = match root.lookup(name.as_bytes()) {
         Ok(f) => f,
         Err(lumen_vfs::VfsError::NoEnt) => return Ok(None),
         Err(_) => return Err("lookup on the device copy"),
@@ -469,13 +469,13 @@ crate::ktest!(
         process::in_test_process(|_| {
             let base = process::KTEST_USER_VA;
             let vol = Ext4Volume::new(193)?;
-            let inode = vol.root.create("f", 0o644).map_err(|_| "ext4 create")?;
+            let inode = vol.root.create(b"f", 0o644).map_err(|_| "ext4 create")?;
             let pattern = ktest_pattern(8192, 1);
             kassert_eq!(inode.write_at(0, &pattern), Ok(8192));
             inode.sync(false).map_err(|_| "sync the ext4 file")?;
             // Read through a fresh read-only mount, so the pages come from
             // the disk: page 1 (offset 4096) with every disk read failing.
-            let ro = vol.remount_ro(194)?.lookup("f").map_err(|_| "lookup on the read-only mount")?;
+            let ro = vol.remount_ro(194)?.lookup(b"f").map_err(|_| "lookup on the read-only mount")?;
             let fd = ktest_install(&ro, OpenFlags::O_RDONLY)?;
             vol.fail_reads(true);
             let failed = sys_pread64(fd, at::reg(base), 4, 4096);
@@ -487,7 +487,7 @@ crate::ktest!(
             // A tmpfs of two pages: 12000 bytes write the first 8192 (two
             // whole chunks), then nothing fits.
             let tmpfs = TmpfsVolume::new(195, 2 * 4096);
-            let small = tmpfs.root.create("f", 0o644).map_err(|_| "tmpfs create")?;
+            let small = tmpfs.root.create(b"f", 0o644).map_err(|_| "tmpfs create")?;
             let fd = ktest_install(&small, OpenFlags::O_RDWR)?;
             let big = ktest_pattern(12_000, 2);
             copy_to_user(base, &big).map_err(|_| "copy the pattern")?;
@@ -516,7 +516,7 @@ crate::ktest!(
         process::in_test_process(|_| {
             let base = process::KTEST_USER_VA;
             let vol = Ext4Volume::new(186)?;
-            let inode = vol.root.create("f", 0o644).map_err(|_| "ext4 create")?;
+            let inode = vol.root.create(b"f", 0o644).map_err(|_| "ext4 create")?;
             let fd = ktest_install(&inode, OpenFlags::O_RDWR)?;
             let on_device = |minor: u32| ktest_on_device(&vol, minor, "f");
             let pattern = ktest_pattern(LEN, 9);
@@ -554,10 +554,10 @@ crate::ktest!(
             kassert_eq!(sys_close(fd), 0);
             // Open, written, then unlinked: detached, so `fsync` has nothing
             // to write and is 0 (ARCHITECTURE section 8, `fsync`).
-            let gone = vol.root.create("g", 0o644).map_err(|_| "ext4 create g")?;
+            let gone = vol.root.create(b"g", 0o644).map_err(|_| "ext4 create g")?;
             let fd = ktest_install(&gone, OpenFlags::O_RDWR)?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 100, 0), 100);
-            vol.root.unlink("g").map_err(|_| "unlink g")?;
+            vol.root.unlink(b"g").map_err(|_| "unlink g")?;
             kassert_eq!(sys_fsync(fd), 0);
             kassert_eq!(sys_fdatasync(fd), 0);
             kassert_eq!(sys_close(fd), 0);

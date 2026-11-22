@@ -271,7 +271,7 @@ pub trait VfsCacheOps {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
     ) -> (Option<Arc<dyn VfsInode>>, u64, u64);
     /// Unify a looked-up inode in `InodeCache` and publish its dentry under Lock 9.
     /// Implementations must insert into `DentryCache` only when
@@ -283,7 +283,7 @@ pub trait VfsCacheOps {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         inode: Arc<dyn VfsInode>,
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
@@ -298,16 +298,16 @@ pub trait VfsCacheOps {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         inode: Arc<dyn VfsInode>,
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>>;
 
     fn dentry_gen(&self) -> u64;
-    fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> Option<DentryTarget>;
-    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> (Option<DentryTarget>, u64);
-    fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &str, target: DentryTarget);
+    fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> Option<DentryTarget>;
+    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64);
+    fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8], target: DentryTarget);
     /// Insert into `DentryCache` if `invalidation_gen == expected_gen` and
     /// `!mounts.is_mountpoint(parent_dev, parent_ino)` (acquiring `MountTable`
     /// before `DentryCache` per Lock-9 sub-order).
@@ -315,11 +315,11 @@ pub trait VfsCacheOps {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         target: DentryTarget,
         expected_gen: u64,
     ) -> bool;
-    fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &str);
+    fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]);
     fn dentry_invalidate_dir(&self, parent_dev: DevId, parent_ino: Ino);
 
     fn inode_get(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>>;
@@ -451,7 +451,7 @@ impl VfsCacheOps for SimpleVfsTables {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
     ) -> (Option<Arc<dyn VfsInode>>, u64, u64) {
         let dentries = self.dentries.borrow();
         let inodes = self.inodes.borrow();
@@ -465,7 +465,7 @@ impl VfsCacheOps for SimpleVfsTables {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         inode: Arc<dyn VfsInode>,
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
@@ -496,7 +496,7 @@ impl VfsCacheOps for SimpleVfsTables {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         inode: Arc<dyn VfsInode>,
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
@@ -528,15 +528,15 @@ impl VfsCacheOps for SimpleVfsTables {
         self.dentries.borrow().invalidation_gen()
     }
 
-    fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> Option<DentryTarget> {
+    fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> Option<DentryTarget> {
         self.dentries.borrow().get(parent_dev, parent_ino, name)
     }
 
-    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> (Option<DentryTarget>, u64) {
+    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64) {
         self.dentries.borrow().get_with_gen(parent_dev, parent_ino, name)
     }
 
-    fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &str, target: DentryTarget) {
+    fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8], target: DentryTarget) {
         self.dentries.borrow_mut().insert(parent_dev, parent_ino, name, target);
     }
 
@@ -544,7 +544,7 @@ impl VfsCacheOps for SimpleVfsTables {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         target: DentryTarget,
         expected_gen: u64,
     ) -> bool {
@@ -556,7 +556,7 @@ impl VfsCacheOps for SimpleVfsTables {
         dentries.insert_if_gen(parent_dev, parent_ino, name, target, expected_gen)
     }
 
-    fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &str) {
+    fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) {
         self.dentries.borrow_mut().invalidate(parent_dev, parent_ino, name);
     }
 

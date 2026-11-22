@@ -298,6 +298,7 @@ POSIX_CHECKS = [
     "unlink-while-open",
     "rmdir-while-open",
     "getdents64",
+    "non-utf8-names",
     "pread64-pwrite64",
     "stat-lstat-newfstatat-statx",
     "chmod-chown-umask-utimensat",
@@ -313,6 +314,7 @@ KEEP_CHECKS = [
     "metadata",
     "exchanged-file-and-directory",
     "moved-directory",
+    "non-utf8-names",
 ]
 
 
@@ -326,7 +328,10 @@ def test_posix_vfs_semantics(boot, tmp_path):
     not, O_NOFOLLOW), a trailing slash following a final symlink under
     O_NOFOLLOW, O_PATH descriptors, hard links and linkat's
     AT_SYMLINK_FOLLOW, unlink and rmdir while open, getdents64 (types,
-    d_ino, a small buffer's cursor, a moved directory's ".."),
+    d_ino, a small buffer's cursor, a moved directory's ".."), names that
+    aren't UTF-8 (#268: a file, a directory and a symlink target made,
+    listed, renamed, hard-linked, read back by getcwd and /proc/self/fd, and
+    removed),
     pread64/pwrite64 leaving the offset alone, stat/lstat/newfstatat/statx
     agreeing, chmod/chown/umask/utimensat (UTIME_NOW, UTIME_OMIT, a NULL
     path, a link), chdir/fchdir/getcwd (through a link, a renamed and a
@@ -335,8 +340,9 @@ def test_posix_vfs_semantics(boot, tmp_path):
     small tree on ext4 (a hard link, a short and a long symlink, two files'
     mode, owner and times, one set before an in-program `sync` and one
     after it, an exchanged file and directory, a directory moved to another
-    parent): the disk passes e2fsck with it there, and a second boot on the
-    disk reads it all back (`m7_vfs keep-check`)."""
+    parent, a file and a symlink whose names and target aren't UTF-8, which
+    `vfstest ls` shows escaped): the disk passes e2fsck with it there, and a
+    second boot on the disk reads it all back (`m7_vfs keep-check`)."""
     disk = copy_rootfs(tmp_path)
     m = shell(boot, devices=Devices(blk_image=disk, rng=True))
     m7_vfs(m, "posix /m7v /tmp/m7v", POSIX_CHECKS)
@@ -354,6 +360,9 @@ def test_posix_vfs_semantics(boot, tmp_path):
     assert stat_fields(m, "/m7k/xd")["type"] == "file"
     assert (stat_fields(m, "/m7k/p1")["nlink"], stat_fields(m, "/m7k/p2")["nlink"]) == ("2", "3")
     assert run(m, "vfstest readlink /m7k/sl").strip() == "f"
+    # `vfstest ls` shows the names that aren't UTF-8 escaped, byte by byte.
+    listed = run(m, "vfstest ls /m7k").splitlines()
+    assert "\\xff\\xfe-kept" in listed and "\\xc3(-sl" in listed, listed
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
     m.close()

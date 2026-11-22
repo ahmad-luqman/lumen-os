@@ -18,17 +18,18 @@ use crate::vfs;
 
 /// Why a binary could not be loaded. The read and interpreter errors name
 /// the file they are about; `Load` is about the binary, which the caller
-/// names.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// names. Its `Debug` shows a path that isn't UTF-8 `Escaped`.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ExecError {
     /// The binary could not be read (`ENOENT`, `EACCES` when it is not a
     /// regular file with an execute bit, `ENOMEM`, ...).
     Read { path: String, err: VfsError },
     /// The interpreter its `PT_INTERP` names could not be read.
     InterpRead { path: String, err: VfsError },
-    /// The interpreter's path is not UTF-8, so it names no file in the VFS
-    /// (`ENOENT`); `path` shows it lossily.
-    InterpPathNotUtf8 { path: String },
+    /// The interpreter's path is not UTF-8: exec paths stay text (the VFS
+    /// takes any bytes since #268, ARCHITECTURE section 9), so it is refused
+    /// as `ENOENT`; `path` is its bytes, shown `Escaped`.
+    InterpPathNotUtf8 { path: Vec<u8> },
     /// The interpreter is not a loadable `ET_DYN` without its own
     /// `PT_INTERP` (`ELIBBAD`).
     InterpBad { path: String, err: ElfLoadError },
@@ -50,13 +51,31 @@ impl ExecError {
     }
 }
 
+impl fmt::Debug for ExecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecError::Read { path, err } => f.debug_struct("Read").field("path", path).field("err", err).finish(),
+            ExecError::InterpRead { path, err } => {
+                f.debug_struct("InterpRead").field("path", path).field("err", err).finish()
+            }
+            ExecError::InterpPathNotUtf8 { path } => {
+                f.debug_struct("InterpPathNotUtf8").field("path", &lumen_vfs::Escaped(path)).finish()
+            }
+            ExecError::InterpBad { path, err } => {
+                f.debug_struct("InterpBad").field("path", path).field("err", err).finish()
+            }
+            ExecError::Load(e) => f.debug_tuple("Load").field(e).finish(),
+        }
+    }
+}
+
 impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExecError::Read { path, err } => write!(f, "cannot read '{path}': {err}"),
             ExecError::InterpRead { path, err } => write!(f, "cannot read its interpreter '{path}': {err}"),
             ExecError::InterpPathNotUtf8 { path } => {
-                write!(f, "cannot read its interpreter '{path}' (not UTF-8): {}", VfsError::NoEnt)
+                write!(f, "cannot read its interpreter '{}' (not UTF-8): {}", lumen_vfs::Escaped(path), VfsError::NoEnt)
             }
             ExecError::InterpBad { path, err } => {
                 write!(f, "bad interpreter '{path}': {err}: ELIBBAD ({})", errno::ELIBBAD)
@@ -97,7 +116,7 @@ impl Image {
     /// and planned at `INTERP_BASE`.
     fn read_interp(raw: &[u8], read: impl FnOnce(&str) -> Result<ExecFile, VfsError>) -> Result<Self, ExecError> {
         let Ok(path) = core::str::from_utf8(raw) else {
-            return Err(ExecError::InterpPathNotUtf8 { path: String::from_utf8_lossy(raw).into_owned() });
+            return Err(ExecError::InterpPathNotUtf8 { path: raw.to_vec() });
         };
         let (bytes, file) = match read(path) {
             Ok(read) => read,
@@ -284,15 +303,15 @@ crate::ktest!(
         // removed before checking anything or counting frames (tmpfs pages
         // hold frames).
         let tmp = vfs::resolve_path_from_root("/tmp").map_err(|_| "no /tmp")?;
-        let main_file = tmp.create(MAIN, 0o755).map_err(|_| "create main")?;
-        let interp_file = tmp.create(INTERP, 0o755).map_err(|_| "create interpreter")?;
+        let main_file = tmp.create(MAIN.as_bytes(), 0o755).map_err(|_| "create main")?;
+        let interp_file = tmp.create(INTERP.as_bytes(), 0o755).map_err(|_| "create interpreter")?;
         let written = (main_file.write_at(0, &main_img), interp_file.write_at(0, &interp_img));
         let exec = Exec::from_path("/tmp/lumen-ktest-main");
         let mode = interp_file.set_mode(0o644);
         let not_executable = Exec::from_path("/tmp/lumen-ktest-main").map(|_| ());
         let inos = (main_file.ino(), interp_file.ino());
         drop((main_file, interp_file));
-        let unlinked = (tmp.unlink(MAIN), tmp.unlink(INTERP));
+        let unlinked = (tmp.unlink(MAIN.as_bytes()), tmp.unlink(INTERP.as_bytes()));
         kassert_eq!(written, (Ok(main_img.len()), Ok(interp_img.len())));
         kassert_eq!(unlinked, (Ok(()), Ok(())));
         kassert_eq!(mode, Ok(()));
@@ -315,7 +334,7 @@ crate::ktest!(
             // image's lines name its file (tmpfs, 0:2) at its pages' file
             // offsets: the PIE main image at PIE_BASE, the interpreter at
             // INTERP_BASE.
-            let maps = space.format_maps();
+            let maps = space.format_maps_text();
             let line = |start: u64, perms: &str, off: u64, ino: u64, path: &str| {
                 let fields = alloc::format!("{start:08x}-{:08x} {perms} {off:08x} 00:02 {ino}", start + 0x1000);
                 vfs::ktest_maps_line(&fields, path)
@@ -478,13 +497,16 @@ crate::ktest!(
         kassert_eq!(shown, Err(String::from("cannot read its interpreter '/no/such/ld-lumen.so': ENOENT (2)")));
         let dir = Exec::from_image(Cow::Owned(test_dynamic_main(ET_DYN, 0, b"/"))).map(|_| ());
         kassert_eq!(dir, Err(ExecError::InterpRead { path: String::from("/"), err: VfsError::Acces }));
-        // A path that is not UTF-8 names no file in the VFS, and says so.
+        // A path that is not UTF-8 is refused (exec paths stay text), and says
+        // so with its bytes escaped: two such paths never show the same.
         let odd = test_exec(test_dynamic_main(ET_DYN, 0, b"/lib/\xffld.so"), Ok(Vec::new())).map(|_| ());
-        kassert_eq!(odd, Err(ExecError::InterpPathNotUtf8 { path: String::from("/lib/\u{fffd}ld.so") }));
+        kassert_eq!(odd, Err(ExecError::InterpPathNotUtf8 { path: b"/lib/\xffld.so".to_vec() }));
         kassert_eq!(odd.as_ref().map_err(ExecError::to_errno), Err(errno::ENOENT));
+        let debug = odd.as_ref().map_err(|e| alloc::format!("{e:?}"));
+        kassert_eq!(debug, Err(String::from("InterpPathNotUtf8 { path: \"/lib/\\xffld.so\" }")));
         kassert_eq!(
             odd.map_err(|e| alloc::format!("{e}")),
-            Err(String::from("cannot read its interpreter '/lib/\u{fffd}ld.so' (not UTF-8): ENOENT (2)"))
+            Err(String::from("cannot read its interpreter '/lib/\\xffld.so' (not UTF-8): ENOENT (2)"))
         );
         // The binary itself missing, by path.
         let gone = Exec::from_path("/no/such/binary").map(|_| ());
@@ -506,13 +528,13 @@ crate::ktest!(
         // ENOMEM, not a heap panic, and readable again once it gives.
         const NAME: &str = "lumen-ktest-big";
         let tmp = vfs::resolve_path_from_root("/tmp").map_err(|_| "no /tmp")?;
-        let file = tmp.create(NAME, 0o755).map_err(|_| "create")?;
+        let file = tmp.create(NAME.as_bytes(), 0o755).map_err(|_| "create")?;
         let written = file.write_at(0, &[0x5a; 64 * 1024]);
         drop(file);
         // And one past the 16 MiB cap is EFBIG from its size, before any
         // buffer is asked for.
         const HUGE: &str = "lumen-ktest-huge";
-        let huge = tmp.create(HUGE, 0o755).map_err(|_| "create huge")?;
+        let huge = tmp.create(HUGE.as_bytes(), 0o755).map_err(|_| "create huge")?;
         let grown = huge.truncate((16 << 20) + 1);
         drop(huge);
         heap::refuse_from(32 * 1024);
@@ -520,7 +542,7 @@ crate::ktest!(
         let too_big = vfs::read_executable("/tmp/lumen-ktest-huge").map(|(b, _)| b.len());
         heap::refuse_from(usize::MAX);
         let read = vfs::read_executable("/tmp/lumen-ktest-big").map(|(b, _)| b.len());
-        let unlinked = (tmp.unlink(NAME), tmp.unlink(HUGE));
+        let unlinked = (tmp.unlink(NAME.as_bytes()), tmp.unlink(HUGE.as_bytes()));
         kassert_eq!(written, Ok(64 * 1024));
         kassert_eq!(grown, Ok(()));
         kassert_eq!(too_big, Err(VfsError::FBig));

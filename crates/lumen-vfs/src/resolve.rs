@@ -1,7 +1,6 @@
 //! Physical component-by-component path & symlink resolution, `cwd` path
 //! reconstruction, and `access(2)` permission checks.
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
@@ -9,7 +8,7 @@ use core::fmt;
 use crate::error::VfsError;
 use crate::fs::VfsInode;
 use crate::mount::VfsCacheOps;
-use crate::types::{AccessMask, InodeType};
+use crate::types::{AccessMask, Escaped, InodeType};
 use crate::{MAX_SYMLINK_DEPTH, NAME_MAX, PATH_MAX};
 
 /// Upper bound on bounded `InodeCache` race retries.
@@ -52,7 +51,7 @@ impl fmt::Debug for ResolvedPath {
 #[derive(Clone)]
 pub struct ParentTarget {
     pub parent: Arc<dyn VfsInode>,
-    pub name: String,
+    pub name: Vec<u8>,
     pub has_trailing_slash: bool,
 }
 
@@ -61,7 +60,7 @@ impl fmt::Debug for ParentTarget {
         f.debug_struct("ParentTarget")
             .field("parent_dev", &self.parent.dev_id())
             .field("parent_ino", &self.parent.ino())
-            .field("name", &self.name)
+            .field("name", &Escaped(&self.name))
             .field("has_trailing_slash", &self.has_trailing_slash)
             .finish()
     }
@@ -142,7 +141,7 @@ fn lookup_dotdot(env: &dyn VfsCacheOps, cur: &Arc<dyn VfsInode>) -> Result<Arc<d
     let mut first_parent: Option<Arc<dyn VfsInode>> = None;
     for attempt in 0..=MAX_INODE_RACE_RETRIES {
         let (_, since_gen) = env.cache_gens();
-        let parent = match cur.lookup("..") {
+        let parent = match cur.lookup(b"..") {
             Ok(p) => p,
             Err(VfsError::NoEnt) if attempt > 0 => {
                 return Ok(first_parent.expect("first_parent set before retry"));
@@ -175,7 +174,11 @@ fn cross_mounts_up(env: &dyn VfsCacheOps, mut cur: Arc<dyn VfsInode>) -> Arc<dyn
 /// Resolve one normal component using atomic Lock-9 probes (`DentryCache ->
 /// InodeCache`) followed by Lock-4 `VfsInode::lookup` only on cache miss, with
 /// bounded retry and `first_child` fallback on concurrent invalidation races.
-fn lookup_component(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+fn lookup_component(
+    env: &dyn VfsCacheOps,
+    dir: &Arc<dyn VfsInode>,
+    name: &[u8],
+) -> Result<Arc<dyn VfsInode>, VfsError> {
     let pdev = dir.dev_id();
     let pino = dir.ino();
     let mut first_child: Option<Arc<dyn VfsInode>> = None;
@@ -197,7 +200,8 @@ fn lookup_component(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>, name: &str) 
         // keyed by its parent that outlives the parent (`VfsInode::cacheable`).
         debug_assert!(
             dir.cacheable() || !child.cacheable(),
-            "{name:?}: a cacheable child of a non-cacheable directory"
+            "{:?}: a cacheable child of a non-cacheable directory",
+            Escaped(name)
         );
 
         let child_ino = child.ino();
@@ -332,8 +336,7 @@ pub(crate) fn resolve_path_with_depth(
             continue;
         }
 
-        let name = core::str::from_utf8(comp).map_err(|_| VfsError::NoEnt)?;
-        let child = lookup_component(env, &cur, name)?;
+        let child = lookup_component(env, &cur, comp)?;
 
         let should_follow =
             child.inode_type() == InodeType::Symlink && (!is_last || flags.follow_final || trailing_after_comp);
@@ -391,9 +394,7 @@ pub(crate) fn resolve_path_with_depth(
 
 /// Resolve the parent directory and final component name for namespace-mutating
 /// operations (`open(O_CREAT)`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`, `rename`).
-///
-/// A final name that isn't UTF-8 is `NoEnt`, as `resolve_path` says for any
-/// other component: VFS names are `&str` until #268.
+/// The name is the final component's bytes, UTF-8 or not (#268).
 pub fn resolve_parent(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
@@ -426,7 +427,7 @@ pub(crate) fn resolve_parent_with_depth(
     }
     if trimmed_end == 0 {
         let root = resolve_global_root(env)?;
-        return Ok(ParentTarget { parent: root, name: String::from("/"), has_trailing_slash: true });
+        return Ok(ParentTarget { parent: root, name: b"/".to_vec(), has_trailing_slash: true });
     }
 
     let trimmed = &path[..trimmed_end];
@@ -457,11 +458,7 @@ pub(crate) fn resolve_parent_with_depth(
     if name_bytes.len() > NAME_MAX {
         return Err(VfsError::NameTooLong);
     }
-    // A name that isn't UTF-8 names nothing the VFS can hold yet: `-ENOENT`,
-    // as for any other component (#268 makes names byte strings).
-    let name = core::str::from_utf8(name_bytes).map_err(|_| VfsError::NoEnt)?;
-
-    Ok(ParentTarget { parent, name: String::from(name), has_trailing_slash })
+    Ok(ParentTarget { parent, name: name_bytes.to_vec(), has_trailing_slash })
 }
 
 /// Reconstruct the canonical path of `cwd` by walking `".."` and crossing
@@ -472,7 +469,8 @@ pub(crate) fn resolve_parent_with_depth(
 /// `readdir`, provided `cwd` itself remains live (`!is_detached() && nlink > 0`).
 ///
 /// Returns `Err(NoEnt)` if `cwd` was unlinked (`st_nlink == 0` or detached).
-pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Result<String, VfsError> {
+/// The path is bytes, each component the name `readdir` lists (#268).
+pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
     if cwd.inode_type() != InodeType::Dir {
         return Err(VfsError::NotDir);
     }
@@ -480,7 +478,7 @@ pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Resul
         return Err(VfsError::NoEnt);
     }
 
-    let mut components: Vec<String> = Vec::new();
+    let mut components: Vec<Vec<u8>> = Vec::new();
     for attempt in 0..=MAX_CWD_RENAME_RETRIES {
         match compute_cwd_path_once(env, cwd, &mut components) {
             Ok(path) => return Ok(path),
@@ -501,8 +499,8 @@ pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Resul
 fn compute_cwd_path_once(
     env: &dyn VfsCacheOps,
     cwd: &Arc<dyn VfsInode>,
-    components: &mut Vec<String>,
-) -> Result<String, VfsError> {
+    components: &mut Vec<Vec<u8>>,
+) -> Result<Vec<u8>, VfsError> {
     components.clear();
     let mut cur = Arc::clone(cwd);
 
@@ -532,13 +530,13 @@ fn compute_cwd_path_once(
     }
 
     if components.is_empty() {
-        return Ok(String::from("/"));
+        return Ok(b"/".to_vec());
     }
 
-    let mut out = String::new();
+    let mut out = Vec::new();
     for comp in components.iter().rev() {
-        out.push('/');
-        out.push_str(comp);
+        out.push(b'/');
+        out.extend_from_slice(comp);
     }
     if out.len() >= PATH_MAX {
         return Err(VfsError::NameTooLong);
@@ -546,7 +544,7 @@ fn compute_cwd_path_once(
     Ok(out)
 }
 
-fn find_child_name_in_dir(parent: &Arc<dyn VfsInode>, target_ino: u64) -> Result<String, VfsError> {
+fn find_child_name_in_dir(parent: &Arc<dyn VfsInode>, target_ino: u64) -> Result<Vec<u8>, VfsError> {
     let mut cursor = 0u64;
     let mut entries = Vec::new();
     loop {
@@ -558,7 +556,7 @@ fn find_child_name_in_dir(parent: &Arc<dyn VfsInode>, target_ino: u64) -> Result
         let mut next_cursor = cursor;
         for entry in &entries {
             next_cursor = entry.next_cursor;
-            if entry.name != "." && entry.name != ".." && entry.ino == target_ino {
+            if entry.name != b"." && entry.name != b".." && entry.ino == target_ino {
                 return Ok(entry.name.clone());
             }
         }

@@ -70,9 +70,12 @@ fn open(path: &[u8], flags: u32) -> Result<Fd, &'static str> {
 /// A descriptor of the current process on `inode` (opened by `path`) with
 /// `flags`: how the ktests reach an ext4 volume no mount holds.
 fn fd_on(inode: &Inode, path: &str, flags: u32) -> Result<Fd, &'static str> {
-    let file =
-        lumen_vfs::OpenFile::new_unchecked_flags(Arc::clone(inode), Arc::from(path), OpenFlags::from_bits(flags))
-            .map_err(|_| "open the inode")?;
+    let file = lumen_vfs::OpenFile::new_unchecked_flags(
+        Arc::clone(inode),
+        Arc::from(path.as_bytes()),
+        OpenFlags::from_bits(flags),
+    )
+    .map_err(|_| "open the inode")?;
     let fd = process::install_current_fd(file, false).map_err(|_| "install the fd")?;
     Ok(reg(fd as u32 as u64))
 }
@@ -133,7 +136,7 @@ fn line(maps: &str, va: u64) -> Result<&str, &'static str> {
 /// disk holds now (device `0:minor`), `len` of them.
 fn on_disk(vol: &Ext4Volume, minor: u32, name: &str, len: usize) -> Result<Vec<u8>, &'static str> {
     let root = vol.mount_device_copy_ro(minor)?;
-    read(&root.lookup(name).map_err(|_| "lookup on the disk")?, 0, len)
+    read(&root.lookup(name.as_bytes()).map_err(|_| "lookup on the disk")?, 0, len)
 }
 
 crate::ktest!(
@@ -585,12 +588,12 @@ crate::ktest!(
         let relro = load_and_list("mem-ktest-exe", &crate::mm::user_vm::build_relro_test_elf(), |space| {
             let anon = u64::from(general::MAP_ANONYMOUS | general::MAP_PRIVATE | general::MAP_FIXED);
             let replaced = space.mmap_anon(0x40_1000, P, lumen_vm::Prot::READ, anon);
-            let after = space.format_maps();
+            let after = space.format_maps_text();
             let noreplace = u64::from(general::MAP_ANONYMOUS | general::MAP_PRIVATE | general::MAP_FIXED_NOREPLACE);
             let unmapped = space.munmap(0x40_2000, P);
             // Read and exec, so it coalesces with neither neighbour.
             let again = space.mmap_anon(0x40_2000, P, lumen_vm::Prot::READ | lumen_vm::Prot::EXEC, noreplace);
-            (replaced, after, unmapped.and(again), space.format_maps())
+            (replaced, after, unmapped.and(again), space.format_maps_text())
         })?;
         let (maps, ino, (replaced, after, again, last)) = relro;
         let at = |fields: &str| named(&format!("{fields} 00:02 {ino}"), "/tmp/mem-ktest-exe");
@@ -646,19 +649,19 @@ fn load_and_list<T>(
     then: impl FnOnce(&crate::mm::user_vm::AddressSpace) -> T,
 ) -> Result<(String, u64, T), &'static str> {
     let tmp = crate::vfs::resolve_path_from_root("/tmp").map_err(|_| "/tmp")?;
-    let exe = tmp.create(name, 0o755).map_err(|_| "create")?;
+    let exe = tmp.create(name.as_bytes(), 0o755).map_err(|_| "create")?;
     let written = exe.write_at(0, image);
     let loaded = crate::linux::exec::Exec::from_path(&format!("/tmp/{name}"))
         .map_err(|_| "Exec::from_path")
         .and_then(|e| e.load(&[b"/x"], &[], b"/x", [0; 16]).map_err(|_| "load"));
     let ino = exe.ino();
     let listed = loaded.map(|(space, _)| {
-        let maps = space.format_maps();
+        let maps = space.format_maps_text();
         let made = then(&space);
         space.teardown();
         (maps, made)
     });
-    let unlinked = tmp.unlink(name);
+    let unlinked = tmp.unlink(name.as_bytes());
     kassert_eq!(written, Ok(image.len()));
     kassert!(unlinked.is_ok());
     let (maps, made) = listed?;

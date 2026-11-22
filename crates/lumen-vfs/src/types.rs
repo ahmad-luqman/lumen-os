@@ -1,6 +1,6 @@
 //! Core POSIX VFS value types, bitflags, and device/inode identifiers.
 
-use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -211,18 +211,33 @@ pub const fn mode_after_chown(inode_type: InodeType, mode: u16) -> u16 {
     kept
 }
 
-/// Directory entry yielded by `VfsInode::readdir()`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Directory entry yielded by `VfsInode::readdir()`. Its `Debug` shows the
+/// name [`Escaped`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct DirEntry {
     pub ino: Ino,
     pub inode_type: InodeType,
-    pub name: String,
+    /// The name's bytes: any but `/` and NUL, UTF-8 or not (#268).
+    pub name: Vec<u8>,
     /// The cursor just past this entry: `readdir` from it resumes with the
     /// next entry. Opaque, greater than the cursor the listing started at,
     /// and stable as other entries come and go (the contract on
     /// [`VfsInode::readdir`](crate::VfsInode::readdir)). `getdents64` hands
     /// it to user space as `d_off`.
     pub next_cursor: u64,
+}
+
+impl fmt::Debug for DirEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured, so a new field can't be left out of the output.
+        let Self { ino, inode_type, name, next_cursor } = self;
+        f.debug_struct("DirEntry")
+            .field("ino", ino)
+            .field("inode_type", inode_type)
+            .field("name", &Escaped(name))
+            .field("next_cursor", next_cursor)
+            .finish()
+    }
 }
 
 /// File access mode (`O_RDONLY`, `O_WRONLY`, `O_RDWR`).
@@ -490,5 +505,52 @@ impl AccessMask {
 
     pub const fn wants_exec(self) -> bool {
         (self.0 & Self::X_OK) != 0
+    }
+}
+
+/// A name's or a path's bytes shown as text, never lossily (#268): UTF-8
+/// as it is, except `\` as `\\`, an ASCII control character as `\xNN`, any
+/// other character `char::escape_debug` escapes (a C1 control, a bidi
+/// override, and also a nonspacing or enclosing mark, the `Grapheme_Extend`
+/// set, U+00A0 and U+00AD, so a decomposed accent shows apart from its
+/// precomposed letter; a spacing mark or decomposed Hangul passes as it is)
+/// as `\u{..}`, and each byte that isn't UTF-8 as `\xNN`.
+/// So two names never show the same, and a name can't drive a terminal or
+/// reorder a log line. `{:?}` puts it in quotes, a `"` in it as `\"`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Escaped<'a>(pub &'a [u8]);
+
+impl Escaped<'_> {
+    fn write(&self, f: &mut fmt::Formatter<'_>, quoted: bool) -> fmt::Result {
+        use fmt::Write as _;
+        for chunk in self.0.utf8_chunks() {
+            for c in chunk.valid().chars() {
+                match c {
+                    '\\' => f.write_str("\\\\")?,
+                    '"' if quoted => f.write_str("\\\"")?,
+                    '"' | '\'' => f.write_char(c)?,
+                    c if c.is_ascii_control() => write!(f, "\\x{:02x}", c as u8)?,
+                    c => write!(f, "{}", c.escape_debug())?,
+                }
+            }
+            for b in chunk.invalid() {
+                write!(f, "\\x{b:02x}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Escaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write(f, false)
+    }
+}
+
+impl fmt::Debug for Escaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"")?;
+        self.write(f, true)?;
+        f.write_str("\"")
     }
 }

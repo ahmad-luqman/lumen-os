@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::mem::offset_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use lumen_vfs::{DirEntry, InodeType, OpenGuard, ResolveFlags, VfsError, VfsInode, VfsLock};
+use lumen_vfs::{DirEntry, Escaped, InodeType, OpenGuard, ResolveFlags, VfsError, VfsInode, VfsLock};
 
 use super::at::{Dirfd, Fd, UserPath, UserPtr, start_dir};
 use super::finish;
@@ -25,15 +25,14 @@ pub(super) fn sys_getcwd(buf: UserPtr, size: u64) -> u64 {
 
 fn getcwd(buf: UserPtr, size: u64) -> Result<u64, u32> {
     let (cwd, _) = process::current_cwd();
-    let path = lumen_vfs::compute_cwd_path(crate::vfs::tables(), &cwd).map_err(lumen_vfs::VfsError::to_errno)?;
+    let mut path = lumen_vfs::compute_cwd_path(crate::vfs::tables(), &cwd).map_err(lumen_vfs::VfsError::to_errno)?;
     drop(cwd);
-    let mut bytes: Vec<u8> = path.into_bytes();
-    bytes.push(0);
-    if (bytes.len() as u64) > size {
+    path.push(0);
+    if (path.len() as u64) > size {
         return Err(errno::ERANGE);
     }
-    copy_to_user(buf.addr(), &bytes).map_err(CopyError::to_errno)?;
-    Ok(bytes.len() as u64)
+    copy_to_user(buf.addr(), &path).map_err(CopyError::to_errno)?;
+    Ok(path.len() as u64)
 }
 
 /// `struct linux_dirent64`'s fixed part: `d_ino` (8 bytes), `d_off` (8),
@@ -100,7 +99,7 @@ fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
     // `limit`, at most `GETDENTS_MAX` (checked above), so it fits a `u16`.
     buf.extend_from_slice(&(reclen as u16).to_le_bytes());
     buf.push(d_type(entry.inode_type));
-    buf.extend_from_slice(entry.name.as_bytes());
+    buf.extend_from_slice(&entry.name);
     buf.resize(start + reclen, 0);
     true
 }
@@ -267,11 +266,11 @@ fn pack_listed(
 /// retries) and `ENAMETOOLONG` (a tree deeper than `PATH_MAX`, which user
 /// space builds without help).
 fn kept_cwd_path(
-    computed: Result<alloc::string::String, VfsError>,
-    fallback: impl FnOnce() -> Arc<str>,
-) -> (Arc<str>, Option<VfsError>) {
+    computed: Result<Vec<u8>, VfsError>,
+    fallback: impl FnOnce() -> Arc<[u8]>,
+) -> (Arc<[u8]>, Option<VfsError>) {
     match computed {
-        Ok(path) => (Arc::from(path.as_str()), None),
+        Ok(path) => (Arc::from(path), None),
         Err(VfsError::NoEnt | VfsError::NameTooLong) => (fallback(), None),
         Err(e) => (fallback(), Some(e)),
     }
@@ -293,7 +292,7 @@ static CWD_PATH_WARNED: AtomicU64 = AtomicU64::new(0);
 /// kept instead ([`kept_cwd_path`]): quietly for a directory removed by now
 /// or a path too long, with a warning (once a boot per errno) for anything
 /// else (`EIO`).
-fn set_cwd(guard: OpenGuard, fallback: impl FnOnce() -> Arc<str>) -> Result<u64, u32> {
+fn set_cwd(guard: OpenGuard, fallback: impl FnOnce() -> Arc<[u8]>) -> Result<u64, u32> {
     if guard.inode().inode_type() != InodeType::Dir {
         return Err(errno::ENOTDIR);
     }
@@ -302,7 +301,7 @@ fn set_cwd(guard: OpenGuard, fallback: impl FnOnce() -> Arc<str>) -> Result<u64,
     if let Some(e) = unexpected
         && CWD_PATH_WARNED.fetch_or(1 << e.to_errno().min(63), Ordering::Relaxed) & (1 << e.to_errno().min(63)) == 0
     {
-        log::warn!(target: "linux", "chdir: the new cwd's path can't be computed ({e:?}): keeping {path:?}");
+        log::warn!(target: "linux", "chdir: the new cwd's path can't be computed ({e:?}): keeping {:?}", Escaped(&path));
     }
     let cwd = process::Cwd::new(guard, &path).map_err(VfsError::to_errno)?;
     process::set_current_cwd(cwd);
@@ -332,8 +331,8 @@ fn chdir(path: UserPtr) -> Result<u64, u32> {
     let guard = OpenGuard::try_new(resolved.inode).map_err(VfsError::to_errno)?;
     // If its path can't be computed: the path as given, joined to the old
     // cwd's if relative.
-    let text = path.as_str()?;
-    set_cwd(guard, || start.display_path(text).unwrap_or_else(|| Arc::from(text)))
+    let given = path.as_bytes();
+    set_cwd(guard, || start.display_path(given).unwrap_or_else(|| Arc::from(given)))
 }
 
 /// `fchdir(fd)` (81): the directory open on `fd` (plain, `O_DIRECTORY` or
@@ -359,7 +358,10 @@ struct KtestDirent {
     ino: u64,
     off: i64,
     ty: u8,
+    /// The name as text, `Escaped` (the name itself when it is plain ASCII).
     name: alloc::string::String,
+    /// The name's bytes.
+    raw: Vec<u8>,
 }
 
 /// Where the ktests' `getdents64` records go in the test process's user
@@ -403,12 +405,13 @@ fn ktest_records(n: u64) -> Result<Vec<KtestDirent>, &'static str> {
         if dirent_reclen(nul) != reclen {
             return Err("a record longer than its name needs");
         }
-        let name = core::str::from_utf8(&name_area[..nul]).map_err(|_| "a name that isn't UTF-8")?;
+        let raw = name_area[..nul].to_vec();
         out.push(KtestDirent {
             ino: u64::from_le_bytes(field(rec, 0)?),
             off: i64::from_le_bytes(field(rec, 8)?),
             ty: rec[18],
-            name: name.into(),
+            name: alloc::format!("{}", Escaped(&raw)),
+            raw,
         });
         at += reclen;
     }
@@ -506,6 +509,13 @@ fn ktest_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
 #[cfg(feature = "ktest")]
 fn ktest_remove(path: &str, dir: bool) -> Result<(), &'static str> {
     lumen_vfs::unlink_at(crate::vfs::tables(), None, path.as_bytes(), dir).map_err(|_| "remove a test entry")
+}
+
+/// Remove the file `name` (its bytes, as listed) from the directory `dir`.
+#[cfg(feature = "ktest")]
+fn ktest_remove_in(dir: &str, name: &[u8]) -> Result<(), &'static str> {
+    let path = [dir.as_bytes(), b"/", name].concat();
+    lumen_vfs::unlink_at(crate::vfs::tables(), None, &path, false).map_err(|_| "remove a listed entry")
 }
 
 /// Make the directory `path` (from `/`).
@@ -612,20 +622,20 @@ crate::ktest!(
             // ext4: a fresh volume (not mounted), its root opened directly.
             let efs = crate::vfs::ktest_ext4(252)?;
             let root = efs.root_inode();
-            root.create("file", 0o644).map_err(|_| "ext4 create")?;
-            root.mkdir("sub", 0o755).map_err(|_| "ext4 mkdir")?;
-            root.symlink("link", "file").map_err(|_| "ext4 symlink")?;
+            root.create(b"file", 0o644).map_err(|_| "ext4 create")?;
+            root.mkdir(b"sub", 0o755).map_err(|_| "ext4 mkdir")?;
+            root.symlink(b"link", b"file").map_err(|_| "ext4 symlink")?;
             // Names of 2 to 9 bytes: more than one call's worth, within the
             // test volume's one directory block.
             for i in 0..12usize {
-                root.create(&format!("e{i}{}", "y".repeat(i % 8)), 0o644).map_err(|_| "ext4 create")?;
+                root.create(format!("e{i}{}", "y".repeat(i % 8)).as_bytes(), 0o644).map_err(|_| "ext4 create")?;
             }
             let mut truth = Vec::new();
             root.readdir(0, &mut truth, 10_000).map_err(|_| "ext4 readdir")?;
             kassert!(truth.len() >= 17);
             let file = lumen_vfs::OpenFile::new_unchecked_flags(
                 alloc::sync::Arc::clone(&root),
-                alloc::sync::Arc::from("/ktest-ext4"),
+                alloc::sync::Arc::from(*b"/ktest-ext4"),
                 OpenFlags::from_bits(dir),
             )
             .map_err(|_| "open the ext4 root")?;
@@ -634,7 +644,9 @@ crate::ktest!(
             // 80 bytes a call: the listing whole, once, in the volume's order.
             let got = ktest_list(fd, 80)?;
             kassert!(ktest_unique(&got));
-            kassert!(got.iter().map(|r| (r.name.as_str(), r.ino)).eq(truth.iter().map(|e| (e.name.as_str(), e.ino))));
+            kassert!(
+                got.iter().map(|r| (r.raw.as_slice(), r.ino)).eq(truth.iter().map(|e| (e.name.as_slice(), e.ino)))
+            );
             kassert_eq!(ktest_type_of(&got, "."), Some(general::DT_DIR));
             kassert_eq!(ktest_type_of(&got, ".."), Some(general::DT_DIR));
             kassert_eq!(ktest_type_of(&got, "file"), Some(general::DT_REG));
@@ -748,7 +760,7 @@ crate::ktest!(
                     kassert!(r.name == "." || r.name == ".." || r.name.starts_with('c') || r.name.starts_with('n'));
                 }
                 if let Some(r) = recs.iter().find(|r| u32::from(r.ty) == general::DT_REG) {
-                    ktest_remove(&format!("{DIR}/{}", r.name), false)?;
+                    ktest_remove_in(DIR, &r.raw)?;
                 }
                 if added < 40 {
                     ktest_file(&format!("{DIR}/n{added:02}"), b"")?;
@@ -763,14 +775,14 @@ crate::ktest!(
                 kassert!(passes < 20);
                 kassert_eq!(super::fd::sys_lseek(fd, 0, general::SEEK_SET), 0);
                 let recs = ktest_list(fd, 64)?;
-                let files: Vec<&str> =
-                    recs.iter().filter(|r| r.name != "." && r.name != "..").map(|r| r.name.as_str()).collect();
+                let files: Vec<&[u8]> =
+                    recs.iter().filter(|r| r.raw != b"." && r.raw != b"..").map(|r| r.raw.as_slice()).collect();
                 if files.is_empty() {
                     kassert_eq!(recs.len(), 2);
                     break;
                 }
                 for name in files {
-                    ktest_remove(&format!("{DIR}/{name}"), false)?;
+                    ktest_remove_in(DIR, name)?;
                 }
             }
             kassert_eq!(super::fd::sys_close(fd), 0);
@@ -805,7 +817,7 @@ crate::ktest!(
             crate::user::copy_from_user(&mut got, KTEST_DIRENTS).map_err(|_| "copy out")?;
             kassert_eq!(&got, b"hello");
             let shown = process::current_file(fd.raw()).map(|f| alloc::sync::Arc::clone(&f.path));
-            kassert_eq!(shown.as_deref(), Some("/tmp/dir-ktest-cd/sub/f"));
+            kassert_eq!(shown.as_deref(), Some(&b"/tmp/dir-ktest-cd/sub/f"[..]));
             kassert_eq!(super::fd::sys_close(fd), 0);
             // "..", a symlink to a directory, a trailing slash.
             kassert_eq!(ktest_chdir(b"..")?, 0);
@@ -815,15 +827,15 @@ crate::ktest!(
             // The path kept for `/proc` is the directory's own, not the
             // link's, and relative `chdir`s back and forth never grow it.
             let kept = || process::current_cwd().1;
-            kassert_eq!(&*kept(), "/tmp/dir-ktest-cd/sub");
+            kassert_eq!(&*kept(), b"/tmp/dir-ktest-cd/sub");
             for _ in 0..50 {
                 kassert_eq!(ktest_chdir(b"..")?, 0);
                 kassert_eq!(ktest_chdir(b"./sub")?, 0);
             }
-            kassert_eq!(&*kept(), "/tmp/dir-ktest-cd/sub");
+            kassert_eq!(&*kept(), b"/tmp/dir-ktest-cd/sub");
             let fd = ktest_open(0, b"f", OpenFlags::O_RDONLY)?;
             let shown = process::current_file(fd.raw()).map(|f| alloc::sync::Arc::clone(&f.path));
-            kassert_eq!(shown.as_deref(), Some("/tmp/dir-ktest-cd/sub/f"));
+            kassert_eq!(shown.as_deref(), Some(&b"/tmp/dir-ktest-cd/sub/f"[..]));
             kassert_eq!(super::fd::sys_close(fd), 0);
             kassert_eq!(ktest_chdir(b"/")?, 0);
             kassert_eq!(ktest_chdir(b"tmp/dir-ktest-cd/sub/")?, 0);
@@ -871,7 +883,7 @@ crate::ktest!(
             kassert_eq!(ktest_cwd()?.as_str(), "/tmp/dir-ktest-fcd/sub");
             let g = ktest_open(1, b"g", OpenFlags::O_RDONLY)?;
             let shown = process::current_file(g.raw()).map(|f| alloc::sync::Arc::clone(&f.path));
-            kassert_eq!(shown.as_deref(), Some("/tmp/dir-ktest-fcd/sub/g"));
+            kassert_eq!(shown.as_deref(), Some(&b"/tmp/dir-ktest-fcd/sub/g"[..]));
             // A plain `O_RDONLY` directory.
             let rfd = ktest_open(2, b"/", OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_fchdir(rfd), 0);
@@ -948,7 +960,7 @@ crate::ktest!(
 fn ktest_open_inode(dir: &Arc<dyn VfsInode>, path: &str) -> Result<Fd, &'static str> {
     use lumen_vfs::OpenFlags;
     let flags = OpenFlags::from_bits(OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY);
-    let file = lumen_vfs::OpenFile::new_unchecked_flags(Arc::clone(dir), Arc::from(path), flags)
+    let file = lumen_vfs::OpenFile::new_unchecked_flags(Arc::clone(dir), Arc::from(path.as_bytes()), flags)
         .map_err(|_| "open a test volume's directory")?;
     let fd = process::install_current_fd(file, false).map_err(|_| "install a test volume's directory")?;
     Ok(super::at::reg(fd as u64))
@@ -969,10 +981,10 @@ type KtestDirAndFile = (Arc<dyn VfsInode>, Arc<dyn VfsInode>);
 #[cfg(feature = "ktest")]
 fn ktest_churn_dir(parent: &Arc<dyn VfsInode>, name: &str) -> Result<KtestDirAndFile, &'static str> {
     use alloc::format;
-    let dir = parent.mkdir(name, 0o755).map_err(|_| "mkdir")?;
-    let file = dir.create("entry-000", 0o644).map_err(|_| "create")?;
+    let dir = parent.mkdir(name.as_bytes(), 0o755).map_err(|_| "mkdir")?;
+    let file = dir.create(b"entry-000", 0o644).map_err(|_| "create")?;
     for i in 1..KTEST_CHURN_ENTRIES {
-        dir.link(&format!("entry-{i:03}"), &file).map_err(|_| "link")?;
+        dir.link(format!("entry-{i:03}").as_bytes(), &file).map_err(|_| "link")?;
     }
     Ok((dir, file))
 }
@@ -997,7 +1009,7 @@ fn ktest_rm_r_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &'stat
         }
         for r in ktest_records(ret)? {
             if r.name != "." && r.name != ".." {
-                dir.unlink(&r.name).map_err(|_| "unlink a listed entry")?;
+                dir.unlink(&r.raw).map_err(|_| "unlink a listed entry")?;
                 removed += 1;
             }
         }
@@ -1009,7 +1021,7 @@ fn ktest_rm_r_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &'stat
         crate::ktest::diag(format_args!("rm -r removed {removed} of {KTEST_CHURN_ENTRIES}"));
         return Err("rm -r skipped entries that stayed in the directory");
     }
-    parent.rmdir(name).map_err(|_| "rmdir after rm -r's loop")
+    parent.rmdir(name.as_bytes()).map_err(|_| "rmdir after rm -r's loop")
 }
 
 /// A listing of a fresh directory `name` in `parent`, 2048 bytes at a
@@ -1048,11 +1060,11 @@ fn ktest_survivors_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &
         let behind: Vec<String> =
             seen.iter().rev().filter(|n| n.starts_with("entry-") && !gone.contains(*n)).take(2).cloned().collect();
         for victim in ahead.into_iter().chain(behind) {
-            dir.unlink(&victim).map_err(|_| "unlink between calls")?;
+            dir.unlink(victim.as_bytes()).map_err(|_| "unlink between calls")?;
             gone.insert(victim);
         }
         if round % 2 == 1 && added < 20 {
-            dir.link(&format!("new-{added:02}"), &file).map_err(|_| "link between calls")?;
+            dir.link(format!("new-{added:02}").as_bytes(), &file).map_err(|_| "link between calls")?;
             added += 1;
         }
     }
@@ -1079,10 +1091,10 @@ fn ktest_survivors_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &
     // Empty it and remove it.
     let mut rest = Vec::new();
     dir.readdir(0, &mut rest, 10_000).map_err(|_| "readdir")?;
-    for e in rest.iter().filter(|e| e.name != "." && e.name != "..") {
+    for e in rest.iter().filter(|e| e.name != b"." && e.name != b"..") {
         dir.unlink(&e.name).map_err(|_| "unlink the rest")?;
     }
-    parent.rmdir(name).map_err(|_| "rmdir")
+    parent.rmdir(name.as_bytes()).map_err(|_| "rmdir")
 }
 
 crate::ktest!(
@@ -1115,8 +1127,46 @@ crate::ktest!(
 
 crate::ktest!(
     fn dir_getdents64_lists_across_a_gap_in_ext4_cursors() {
-        // A name that isn't UTF-8 is skipped: the cursors after it have a
-        // gap, which a cursor counted as `pos + 1` per entry would miss.
+        // An unlinked name's record merges into the one before it: the
+        // cursors after it have a gap, which a cursor counted as `pos + 1`
+        // per entry would miss.
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::FileSystem;
+        process::in_test_process(|_| {
+            let efs = crate::vfs::ktest_ext4(243)?;
+            let root = efs.root_inode();
+            let file = root.create(b"a0", 0o644).map_err(|_| "create a0")?;
+            for name in [b"a1", b"a2", b"a3", b"a4", b"a5"] {
+                root.link(name, &file).map_err(|_| "link")?;
+            }
+            root.unlink(b"a3").map_err(|_| "unlink a3")?;
+            let mut truth = Vec::new();
+            root.readdir(0, &mut truth, 10_000).map_err(|_| "readdir")?;
+            let want: [&[u8]; 7] = [b".", b"..", b"a0", b"a1", b"a2", b"a4", b"a5"];
+            kassert!(truth.iter().map(|e| e.name.as_slice()).eq(want));
+            // The gap is there to list across: a2's cursor to a4's spans a3's
+            // old record too.
+            kassert!(truth[2..].windows(2).any(|w| w[1].next_cursor - w[0].next_cursor >= 24));
+            let fd = ktest_open_inode(&root, "/ktest-gap")?;
+            // One record a call.
+            let got = ktest_list(fd, 24)?;
+            kassert!(ktest_unique(&got));
+            kassert!(got.iter().map(|r| r.raw.as_slice()).eq(want));
+            kassert!(got.iter().map(|r| r.off as u64).eq(truth.iter().map(|e| e.next_cursor)));
+            // Byte positions: after `..`, each step at least ext4's smallest
+            // record (12 bytes), and the removed name's record a step of 24.
+            kassert!(got[2..].windows(2).all(|w| w[1].off - w[0].off >= 12));
+            kassert!(got[2..].windows(2).any(|w| w[1].off - w[0].off >= 24));
+            kassert_eq!(super::fd::sys_close(fd), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn dir_getdents64_lists_names_that_are_not_utf8() {
+        // #268: an ext4 name that isn't UTF-8 is listed by its bytes, each
+        // record's `d_off` the cursor after it, as for any other name.
         use crate::{kassert, kassert_eq};
         use lumen_vfs::FileSystem;
         process::in_test_process(|_| {
@@ -1124,17 +1174,15 @@ crate::ktest!(
             let root = ro.root_inode();
             let mut truth = Vec::new();
             root.readdir(0, &mut truth, 10_000).map_err(|_| "readdir")?;
-            kassert!(truth.iter().map(|e| e.name.as_str()).eq([".", "..", "a0", "a1", "a2", "a4", "a5"]));
-            let fd = ktest_open_inode(&root, "/ktest-gap")?;
-            // One record a call.
-            let got = ktest_list(fd, 24)?;
-            kassert!(ktest_unique(&got));
-            kassert!(got.iter().map(|r| r.name.as_str()).eq(truth.iter().map(|e| e.name.as_str())));
-            kassert!(got.iter().map(|r| r.off as u64).eq(truth.iter().map(|e| e.next_cursor)));
-            // Byte positions: after `..`, each step at least ext4's smallest
-            // record (12 bytes), and the skipped name's record a step of 24.
-            kassert!(got[2..].windows(2).all(|w| w[1].off - w[0].off >= 12));
-            kassert!(got[2..].windows(2).any(|w| w[1].off - w[0].off >= 24));
+            let want: [&[u8]; 8] = [b".", b"..", b"a0", b"a1", b"a2", b"\xff\xfe", b"a4", b"a5"];
+            kassert!(truth.iter().map(|e| e.name.as_slice()).eq(want));
+            let fd = ktest_open_inode(&root, "/ktest-non-utf8")?;
+            for chunk in [24, 4096] {
+                kassert_eq!(super::fd::sys_lseek(fd, 0, 0), 0);
+                let got = ktest_list(fd, chunk)?;
+                kassert!(got.iter().map(|r| r.raw.as_slice()).eq(want));
+                kassert!(got.iter().map(|r| r.off as u64).eq(truth.iter().map(|e| e.next_cursor)));
+            }
             kassert_eq!(super::fd::sys_close(fd), 0);
             Ok(())
         })?
@@ -1159,9 +1207,9 @@ crate::ktest!(
 
             let efs = crate::vfs::ktest_ext4(255)?;
             let root = efs.root_inode();
-            let gone = root.mkdir("gone", 0o755).map_err(|_| "ext4 mkdir")?;
+            let gone = root.mkdir(b"gone", 0o755).map_err(|_| "ext4 mkdir")?;
             let fd = ktest_open_inode(&gone, "/gone")?;
-            root.rmdir("gone").map_err(|_| "ext4 rmdir")?;
+            root.rmdir(b"gone").map_err(|_| "ext4 rmdir")?;
             kassert_eq!(ktest_getdents(fd, 4096), 0);
             kassert_eq!(super::fd::sys_close(fd), 0);
             Ok::<(), &'static str>(())
@@ -1201,10 +1249,10 @@ crate::ktest!(
             // the cwd's is the directory's own.
             let lfd = ktest_open(0, b"/tmp/dir-ktest-fln/ln", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
             kassert_eq!(sys_fchdir(lfd), 0);
-            kassert_eq!(&*process::current_cwd().1, "/tmp/dir-ktest-fln/sub");
+            kassert_eq!(&*process::current_cwd().1, b"/tmp/dir-ktest-fln/sub");
             let g = ktest_open(1, b"g", OpenFlags::O_RDONLY)?;
             let shown = process::current_file(g.raw()).map(|f| Arc::clone(&f.path));
-            kassert_eq!(shown.as_deref(), Some("/tmp/dir-ktest-fln/sub/g"));
+            kassert_eq!(shown.as_deref(), Some(&b"/tmp/dir-ktest-fln/sub/g"[..]));
             kassert_eq!(ktest_chdir(b"/")?, 0);
             for f in [lfd, g] {
                 kassert_eq!(super::fd::sys_close(f), 0);
@@ -1252,10 +1300,10 @@ crate::ktest!(
 crate::ktest!(
     fn dir_kept_cwd_path_falls_back_quietly_for_a_removed_directory_or_a_long_path() {
         use crate::kassert_eq;
-        let fallback = || Arc::<str>::from("/as/given");
+        let fallback = || Arc::<[u8]>::from(&b"/as/given"[..]);
         let kept = |computed| {
             let (path, warn) = kept_cwd_path(computed, fallback);
-            (alloc::string::String::from(&*path), warn)
+            (alloc::string::String::from_utf8_lossy(&path).into_owned(), warn)
         };
         kassert_eq!(kept(Ok("/real".into())), ("/real".into(), None));
         kassert_eq!(kept(Err(VfsError::NoEnt)), ("/as/given".into(), None));
@@ -1338,9 +1386,9 @@ crate::ktest!(
         process::in_test_process(|_| {
             let tmpfs = TmpfsVolume::new(260, 64 * 4096);
             let root = &tmpfs.root;
-            root.create("x", 0o644).map_err(|_| "create")?;
-            root.unlink("x").map_err(|_| "unlink")?;
-            root.create("x", 0o644).map_err(|_| "create again")?;
+            root.create(b"x", 0o644).map_err(|_| "create")?;
+            root.unlink(b"x").map_err(|_| "unlink")?;
+            root.create(b"x", 0o644).map_err(|_| "create again")?;
             let fd = ktest_open_inode(root, "/again")?;
             let got = ktest_list(fd, 4096)?;
             kassert_eq!(got.iter().filter(|r| r.name == "x").count(), 1);
@@ -1364,7 +1412,7 @@ crate::ktest!(
                 let tmpfs = TmpfsVolume::new(minor, 64 * 4096);
                 let root = &tmpfs.root;
                 for name in ["a", "b", "c", "d", "e"] {
-                    root.create(name, 0o644).map_err(|_| "create")?;
+                    root.create(name.as_bytes(), 0o644).map_err(|_| "create")?;
                 }
                 let fd = ktest_open_inode(root, "/renames")?;
                 // ".", "..", "a", "b": past "b".
@@ -1372,7 +1420,7 @@ crate::ktest!(
                 kassert_eq!(first.last().map(|r| r.name.as_str()), Some("b"));
                 // "d" (not listed yet) over "b" (listed), or the two swapped.
                 let flags = RenameFlags(if exchange { RenameFlags::EXCHANGE } else { 0 });
-                root.rename("d", root, "b", flags).map_err(|_| "rename")?;
+                root.rename(b"d", root, b"b", flags).map_err(|_| "rename")?;
                 let rest = ktest_list(fd, 4096)?;
                 let names: Vec<&str> = rest.iter().map(|r| r.name.as_str()).collect();
                 if exchange {
@@ -1410,7 +1458,7 @@ crate::ktest!(
             // with the NUL.
             let dir = mkdir_at(tables, None, b"/tmp/dir-ktest-cwd", 0o755, 0).map_err(|_| "mkdir")?;
             let guard = OpenGuard::try_new(dir).map_err(|_| "guard")?;
-            process::set_current_cwd(process::Cwd::new(guard, "/tmp/dir-ktest-cwd").map_err(|_| "cwd")?);
+            process::set_current_cwd(process::Cwd::new(guard, b"/tmp/dir-ktest-cwd").map_err(|_| "cwd")?);
             kassert_eq!(getcwd(64), 19);
             kassert_eq!(read_back(19)?, b"/tmp/dir-ktest-cwd\0");
             kassert_eq!(getcwd(18), super::neg_errno(errno::ERANGE));

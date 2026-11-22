@@ -58,14 +58,14 @@ const _: () = {
 /// A pid or fd name under `/proc`: ASCII digits only, without a sign or a
 /// leading zero (but `0` itself), that fit a `u32`. So each number has one
 /// name.
-pub fn parse_canonical_u32(s: &str) -> Option<u32> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+pub fn parse_canonical_u32(s: &[u8]) -> Option<u32> {
+    if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    if s.len() > 1 && s.starts_with('0') {
+    if s.len() > 1 && s[0] == b'0' {
         return None;
     }
-    s.parse().ok()
+    core::str::from_utf8(s).ok()?.parse().ok()
 }
 
 /// An fd `/proc/<pid>/fd` can show: one in `0..MAX_FDS`, the range a
@@ -89,7 +89,7 @@ impl ProcFd {
 
     /// The fd `name` names under `/proc/<pid>/fd`: a canonical number
     /// ([`parse_canonical_u32`]) in `0..MAX_FDS`.
-    pub fn parse(name: &str) -> Option<Self> {
+    pub fn parse(name: &[u8]) -> Option<Self> {
         let fd = parse_canonical_u32(name)?;
         if (fd as usize) < MAX_FDS { Some(Self(fd as u16)) } else { None }
     }
@@ -281,9 +281,9 @@ mod tests {
     #[test]
     fn an_fd_name_parses_to_a_proc_fd_in_one_step() {
         let last = MAX_FDS as i32 - 1;
-        assert_eq!(ProcFd::parse("0"), Some(fd(0)));
-        assert_eq!(ProcFd::parse("3"), Some(fd(3)));
-        assert_eq!(ProcFd::parse(&std::format!("{last}")), Some(fd(last)));
+        assert_eq!(ProcFd::parse(b"0"), Some(fd(0)));
+        assert_eq!(ProcFd::parse(b"3"), Some(fd(3)));
+        assert_eq!(ProcFd::parse(std::format!("{last}").as_bytes()), Some(fd(last)));
         for name in [
             &*std::format!("{MAX_FDS}"), // one past the last fd
             "65536",                     // past the u16
@@ -295,7 +295,7 @@ mod tests {
             "+3",                        // a sign
             "-1",                        // negative
         ] {
-            assert_eq!(ProcFd::parse(name), None, "{name:?}");
+            assert_eq!(ProcFd::parse(name.as_bytes()), None, "{name:?}");
         }
     }
 
@@ -349,11 +349,11 @@ mod tests {
 
     #[test]
     fn canonical_numbers_parse() {
-        assert_eq!(parse_canonical_u32("0"), Some(0));
-        assert_eq!(parse_canonical_u32("7"), Some(7));
-        assert_eq!(parse_canonical_u32("10"), Some(10));
-        assert_eq!(parse_canonical_u32("1023"), Some(1023));
-        assert_eq!(parse_canonical_u32("4294967295"), Some(u32::MAX));
+        assert_eq!(parse_canonical_u32(b"0"), Some(0));
+        assert_eq!(parse_canonical_u32(b"7"), Some(7));
+        assert_eq!(parse_canonical_u32(b"10"), Some(10));
+        assert_eq!(parse_canonical_u32(b"1023"), Some(1023));
+        assert_eq!(parse_canonical_u32(b"4294967295"), Some(u32::MAX));
     }
 
     #[test]
@@ -375,6 +375,11 @@ mod tests {
             "\u{0661}",    // a non-ASCII digit (Arabic-Indic one)
             "self",        // a fixed name
         ] {
+            assert_eq!(parse_canonical_u32(name.as_bytes()), None, "{name:?}");
+        }
+        // Names are bytes (#268): bytes that aren't UTF-8 don't pass, nor does
+        // a non-ASCII character.
+        for name in [b"1\xff" as &[u8], b"\xff", b"\xc3\xa1"] {
             assert_eq!(parse_canonical_u32(name), None, "{name:?}");
         }
     }

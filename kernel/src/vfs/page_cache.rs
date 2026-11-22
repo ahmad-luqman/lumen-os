@@ -728,7 +728,7 @@ pub(crate) mod ktest_files {
 
     /// A file named `name` in `dir` holding `data`.
     pub(crate) fn file(dir: &Arc<dyn VfsInode>, name: &str, data: &[u8]) -> Result<Arc<dyn VfsInode>, &'static str> {
-        let f = dir.create(name, 0o644).map_err(|_| "create")?;
+        let f = dir.create(name.as_bytes(), 0o644).map_err(|_| "create")?;
         if f.write_at(0, data).map_err(|_| "write_at")? != data.len() {
             return Err("short write");
         }
@@ -1042,10 +1042,10 @@ crate::ktest!(
         use crate::kassert_eq;
         use lumen_vfs::{DevId, FileSystem, InodeType};
         let devfs = super::devfs::Devfs::new(DevId::makedev(0, 126));
-        let zero = devfs.root_inode().lookup("zero").map_err(|_| "lookup zero")?;
+        let zero = devfs.root_inode().lookup(b"zero").map_err(|_| "lookup zero")?;
         kassert_eq!(mmap_page(&zero, 0).err(), Some(VfsError::NoDev));
         let procfs = super::procfs::Procfs::new(DevId::makedev(0, 127));
-        let version = procfs.root_inode().lookup("version").map_err(|_| "lookup version")?;
+        let version = procfs.root_inode().lookup(b"version").map_err(|_| "lookup version")?;
         kassert_eq!(version.inode_type(), InodeType::File);
         kassert_eq!(mmap_page(&version, 0).err(), Some(VfsError::NoDev));
         Ok(())
@@ -1085,7 +1085,7 @@ crate::ktest!(
         use core::sync::atomic::AtomicU8;
         use lumen_vfs::{DevId, FileSystem};
         let fs = super::tmpfs::Tmpfs::new(DevId::makedev(0, 128), 4 * PAGE_SIZE);
-        let f = fs.root_inode().create("cow.bin", 0o644).map_err(|_| "create")?;
+        let f = fs.root_inode().create(b"cow.bin", 0o644).map_err(|_| "create")?;
         let bytes: Vec<u8> = (0..PAGE_SIZE + 1000).map(|i| (i % 251) as u8 | 1).collect();
         kassert_eq!(f.write_at(0, &bytes).map_err(|_| "write")?, bytes.len());
         let mapped = mmap_page(&f, 0).map_err(|_| "map")?;
@@ -1203,7 +1203,7 @@ crate::ktest!(
             // mount of the same block cache reads the disk, not the pages.
             let ro = ext4::Ext4FileSystem::mount(Arc::clone(&bcache), lumen_vfs::DevId::makedev(0, 232), true)
                 .map_err(|_| "ro mount")?;
-            let on_disk = ro.root_inode().lookup("f").map_err(|_| "ro lookup")?;
+            let on_disk = ro.root_inode().lookup(b"f").map_err(|_| "ro lookup")?;
             let mut disk = alloc::vec![0u8; data.len()];
             let n = on_disk.read_at(0, &mut disk).map_err(|_| "ro read")?;
             kassert!(n >= (data.len() - 4 * PAGE_SIZE)); // at least the reclaimed pages

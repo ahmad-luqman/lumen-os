@@ -39,7 +39,7 @@ use log::{debug, error, info, warn};
 use lumen_bcache::BlockDevice;
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_vfs::{
-    DentryCache, DentryTarget, DevId, FileSystem, Ino, InodeCache, InodeType, MountInfo, MountTable, OpenFile,
+    DentryCache, DentryTarget, DevId, Escaped, FileSystem, Ino, InodeCache, InodeType, MountInfo, MountTable, OpenFile,
     OpenFlags, RenameFlags, ResolveFlags, VfsCacheOps, VfsError, VfsInode, VfsLock, mkdir_at, open_inode,
     open_inode_guarded, readlink_at, rename_at2, resolve_path, symlink_at, unlink_at,
 };
@@ -196,7 +196,7 @@ impl VfsCacheOps for KernelVfsTables {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
     ) -> (Option<Arc<dyn VfsInode>>, u64, u64) {
         let dentries = self.dentries.lock();
         let inodes = self.inodes.lock();
@@ -210,7 +210,7 @@ impl VfsCacheOps for KernelVfsTables {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         inode: Arc<dyn VfsInode>,
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
@@ -241,7 +241,7 @@ impl VfsCacheOps for KernelVfsTables {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         inode: Arc<dyn VfsInode>,
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
@@ -273,15 +273,15 @@ impl VfsCacheOps for KernelVfsTables {
         self.dentries.lock().invalidation_gen()
     }
 
-    fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> Option<DentryTarget> {
+    fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> Option<DentryTarget> {
         self.dentries.lock().get(parent_dev, parent_ino, name)
     }
 
-    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> (Option<DentryTarget>, u64) {
+    fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64) {
         self.dentries.lock().get_with_gen(parent_dev, parent_ino, name)
     }
 
-    fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &str, target: DentryTarget) {
+    fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8], target: DentryTarget) {
         self.dentries.lock().insert(parent_dev, parent_ino, name, target);
     }
 
@@ -289,7 +289,7 @@ impl VfsCacheOps for KernelVfsTables {
         &self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         target: DentryTarget,
         expected_gen: u64,
     ) -> bool {
@@ -301,7 +301,7 @@ impl VfsCacheOps for KernelVfsTables {
         dentries.insert_if_gen(parent_dev, parent_ino, name, target, expected_gen)
     }
 
-    fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &str) {
+    fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) {
         self.dentries.lock().invalidate(parent_dev, parent_ino, name);
     }
 
@@ -467,7 +467,7 @@ fn sync_tables(tables: &KernelVfsTables) -> Result<(), VfsError> {
 
 fn ensure_mountpoint(
     root: &Arc<dyn VfsInode>,
-    name: &str,
+    name: &[u8],
     mode: u16,
     root_ro: bool,
 ) -> Result<Arc<dyn VfsInode>, VfsError> {
@@ -566,7 +566,7 @@ pub fn init() {
         ("dev", "/dev", 0o755u16, dev_fs as Arc<dyn FileSystem>),
         ("proc", "/proc", 0o555u16, proc_fs as Arc<dyn FileSystem>),
     ] {
-        match ensure_mountpoint(&root_inode, name, mode, root_ro) {
+        match ensure_mountpoint(&root_inode, name.as_bytes(), mode, root_ro) {
             Ok(mp) => match TABLES.mount(mp, path, fs) {
                 Ok(()) => {
                     mounted.push(' ');
@@ -758,20 +758,24 @@ fn check_listing_agrees_with_lookup(dir: &Arc<dyn VfsInode>, what: &str, names: 
     dir.readdir(0, &mut entries, 1024).map_err(|e| format!("readdir {what}: {e:?}"))?;
     if let Some(names) = names {
         for name in names {
-            if !entries.iter().any(|e| e.name == *name) {
+            if !entries.iter().any(|e| e.name == name.as_bytes()) {
                 return Err(format!("{what} doesn't list {name:?}"));
             }
         }
     }
-    for entry in entries.iter().filter(|e| names.is_none_or(|n| n.contains(&e.name.as_str()))) {
+    for entry in entries.iter().filter(|e| names.is_none_or(|n| n.iter().any(|n| n.as_bytes() == e.name))) {
         let st = dir
             .lookup(&entry.name)
             .and_then(|n| n.stat())
-            .map_err(|e| format!("lookup and stat {what}/{}: {e:?}", entry.name))?;
+            .map_err(|e| format!("lookup and stat {what}/{}: {e:?}", Escaped(&entry.name)))?;
         if (st.ino, st.inode_type) != (entry.ino, entry.inode_type) {
             return Err(format!(
                 "{what}/{} listed as ({}, {:?}) but stat says ({}, {:?})",
-                entry.name, entry.ino, entry.inode_type, st.ino, st.inode_type
+                Escaped(&entry.name),
+                entry.ino,
+                entry.inode_type,
+                st.ino,
+                st.inode_type
             ));
         }
     }
@@ -935,7 +939,7 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         resolve_path_from_root("/proc")
             .and_then(|d| d.readdir(0, &mut names, 64))
             .map_err(|e| format!("readdir /proc: {e:?}"))?;
-        if names.iter().any(|e| e.name.bytes().all(|b| b.is_ascii_digit())) {
+        if names.iter().any(|e| e.name.iter().all(u8::is_ascii_digit)) {
             return Err(String::from("/proc lists a pid while no process runs"));
         }
     }
@@ -1288,7 +1292,7 @@ pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
         }
         [sub, path] if sub == "readlink" => match readlink_at(&TABLES, None, path.as_bytes()) {
             Ok(bytes) => {
-                let _ = writeln!(ctx.out, "{}", String::from_utf8_lossy(&bytes));
+                let _ = writeln!(ctx.out, "{}", Escaped(&bytes));
             }
             Err(e) => ctx.fail(format_args!("readlink: {e:?}")),
         },
@@ -1341,7 +1345,7 @@ pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
                     return ctx.fail(format_args!("ls: {e:?}"));
                 }
                 for e in entries {
-                    let _ = writeln!(ctx.out, "{}", e.name);
+                    let _ = writeln!(ctx.out, "{}", Escaped(&e.name));
                 }
             }
             Err(e) => ctx.fail(format_args!("ls: {e:?}")),
@@ -1709,15 +1713,15 @@ pub(crate) fn ktest_ext4(dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'
 /// A read-only in-memory ext4 filesystem (devices `0:minor` for the
 /// writable mount it is made on and `0:minor+1`) whose root holds, after
 /// `.` and `..`, the names `a0` to `a5` (hard links to one file) with `a3`
-/// renamed on disk to the bytes `ff fe`, not UTF-8: `readdir` skips it,
-/// leaving a gap in its cursors, for the FD layer's ktests.
+/// renamed on disk to the bytes `ff fe`, not UTF-8, which `readdir` lists
+/// as any other name (#268), for the ktests (ext4's and the FD layer's).
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_ext4_non_utf8(minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
     use ext4::ktest_util::{ROOT_DIR_BLOCK_4K, image, mount, mount_ro_image};
     let m = mount(build_minimal_ext4_image_blocks(256), minor)?;
-    let file = m.root.create("a0", 0o644).map_err(|_| "create a0")?;
+    let file = m.root.create(b"a0", 0o644).map_err(|_| "create a0")?;
     for name in ["a1", "a2", "a3", "a4", "a5"] {
-        m.root.link(name, &file).map_err(|_| "link")?;
+        m.root.link(name.as_bytes(), &file).map_err(|_| "link")?;
     }
     let mut img = image(&m)?;
     let dir = &mut img[(ROOT_DIR_BLOCK_4K as usize) * BLOCK_SIZE..][..BLOCK_SIZE];

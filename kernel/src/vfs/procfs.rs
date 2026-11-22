@@ -39,7 +39,10 @@ const PROC_PID_CURSOR: u64 = 0x100;
 /// `/proc/<pid>/fd`'s `readdir` cursor for fd 0, past `.` and `..`.
 const PROC_FD_CURSOR: u64 = 2;
 
-fn dir_entry(kind: ProcKind, name: impl Into<String>) -> (u64, InodeType, String) {
+/// A listed entry: its inode number, type and name.
+type Listed = (u64, InodeType, Vec<u8>);
+
+fn dir_entry(kind: ProcKind, name: impl Into<Vec<u8>>) -> Listed {
     (kind.ino(), kind.inode_type(), name.into())
 }
 
@@ -358,18 +361,18 @@ impl VfsInode for ProcfsInode {
         })
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
         #[cfg(feature = "ktest")]
         ASKED_LOOKUPS.fetch_add(1, Ordering::Relaxed);
         let root_arc = self.root_weak.upgrade().ok_or(VfsError::NoEnt)?;
         match self.kind {
             ProcKind::Root => match name {
-                "." | ".." => Ok(root_arc as Arc<dyn VfsInode>),
-                "cpuinfo" => Ok(self.spawn(ProcKind::Cpuinfo) as Arc<dyn VfsInode>),
-                "meminfo" => Ok(self.spawn(ProcKind::Meminfo) as Arc<dyn VfsInode>),
-                "mounts" => Ok(self.spawn(ProcKind::Mounts) as Arc<dyn VfsInode>),
-                "version" => Ok(self.spawn(ProcKind::Version) as Arc<dyn VfsInode>),
-                "self" => Ok(self.spawn(ProcKind::SelfLink) as Arc<dyn VfsInode>),
+                b"." | b".." => Ok(root_arc as Arc<dyn VfsInode>),
+                b"cpuinfo" => Ok(self.spawn(ProcKind::Cpuinfo) as Arc<dyn VfsInode>),
+                b"meminfo" => Ok(self.spawn(ProcKind::Meminfo) as Arc<dyn VfsInode>),
+                b"mounts" => Ok(self.spawn(ProcKind::Mounts) as Arc<dyn VfsInode>),
+                b"version" => Ok(self.spawn(ProcKind::Version) as Arc<dyn VfsInode>),
+                b"self" => Ok(self.spawn(ProcKind::SelfLink) as Arc<dyn VfsInode>),
                 other => {
                     let pid: u32 = parse_canonical_u32(other).ok_or(VfsError::NoEnt)?;
                     if pid == 0 || !Self::pid_exists(pid) {
@@ -383,12 +386,12 @@ impl VfsInode for ProcfsInode {
                     return Err(VfsError::NoEnt);
                 }
                 match name {
-                    "." => Ok(self.spawn(ProcKind::PidDir(pid)) as Arc<dyn VfsInode>),
-                    ".." => Ok(root_arc as Arc<dyn VfsInode>),
-                    "exe" => Ok(self.spawn(ProcKind::PidExe(pid)) as Arc<dyn VfsInode>),
-                    "maps" => Ok(self.spawn(ProcKind::PidMaps(pid)) as Arc<dyn VfsInode>),
-                    "fd" => Ok(self.spawn(ProcKind::PidFdDir(pid)) as Arc<dyn VfsInode>),
-                    "mounts" => Ok(self.spawn(ProcKind::PidMounts(pid)) as Arc<dyn VfsInode>),
+                    b"." => Ok(self.spawn(ProcKind::PidDir(pid)) as Arc<dyn VfsInode>),
+                    b".." => Ok(root_arc as Arc<dyn VfsInode>),
+                    b"exe" => Ok(self.spawn(ProcKind::PidExe(pid)) as Arc<dyn VfsInode>),
+                    b"maps" => Ok(self.spawn(ProcKind::PidMaps(pid)) as Arc<dyn VfsInode>),
+                    b"fd" => Ok(self.spawn(ProcKind::PidFdDir(pid)) as Arc<dyn VfsInode>),
+                    b"mounts" => Ok(self.spawn(ProcKind::PidMounts(pid)) as Arc<dyn VfsInode>),
                     _ => Err(VfsError::NoEnt),
                 }
             }
@@ -397,8 +400,8 @@ impl VfsInode for ProcfsInode {
                     return Err(VfsError::NoEnt);
                 }
                 match name {
-                    "." => Ok(self.spawn(ProcKind::PidFdDir(pid)) as Arc<dyn VfsInode>),
-                    ".." => Ok(self.spawn(ProcKind::PidDir(pid)) as Arc<dyn VfsInode>),
+                    b"." => Ok(self.spawn(ProcKind::PidFdDir(pid)) as Arc<dyn VfsInode>),
+                    b".." => Ok(self.spawn(ProcKind::PidDir(pid)) as Arc<dyn VfsInode>),
                     other => {
                         let fd = ProcFd::parse(other).ok_or(VfsError::NoEnt)?;
                         if process::process_fd_target(pid, fd.get()).is_none() {
@@ -412,27 +415,27 @@ impl VfsInode for ProcfsInode {
         }
     }
 
-    fn create(&self, _name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn create(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn mkdir(&self, _name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn mkdir(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), VfsError> {
+    fn unlink(&self, _name: &[u8]) -> Result<(), VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn rmdir(&self, _name: &str) -> Result<(), VfsError> {
+    fn rmdir(&self, _name: &[u8]) -> Result<(), VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn link(&self, _name: &str, _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+    fn link(&self, _name: &[u8], _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn symlink(&self, _name: &[u8], _target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
         Err(VfsError::RoFs)
     }
 
@@ -444,8 +447,7 @@ impl VfsInode for ProcfsInode {
             // the same answer `resolve_magic_link` gives.
             ProcKind::PidExe(pid) => process::process_exe_path(pid).map(String::into_bytes).ok_or(VfsError::NoEnt),
             ProcKind::PidFdLink(pid, fd) => {
-                let (_, path) = process::process_fd_target(pid, fd.get()).ok_or(VfsError::NoEnt)?;
-                Ok(path.into_bytes())
+                process::process_fd_target(pid, fd.get()).map(|(_, path)| path).ok_or(VfsError::NoEnt)
             }
             _ => Err(VfsError::Inval),
         }
@@ -453,9 +455,9 @@ impl VfsInode for ProcfsInode {
 
     fn rename(
         &self,
-        _old_name: &str,
+        _old_name: &[u8],
         _new_dir: &Arc<dyn VfsInode>,
-        _new_name: &str,
+        _new_name: &[u8],
         _flags: RenameFlags,
     ) -> Result<(), VfsError> {
         Err(VfsError::RoFs)
@@ -477,7 +479,7 @@ impl VfsInode for ProcfsInode {
             return Ok(());
         }
         // (key, (ino, type, name)), keys ascending.
-        let mut entries: Vec<(u64, (u64, InodeType, String))> = Vec::new();
+        let mut entries: Vec<(u64, Listed)> = Vec::new();
         match self.kind {
             ProcKind::Root => {
                 let fixed = [
@@ -566,17 +568,17 @@ impl VfsInode for ProcfsInode {
             return Err(VfsError::Inval);
         }
         let text = match self.kind {
-            ProcKind::Cpuinfo => format_cpuinfo(),
-            ProcKind::Meminfo => format_meminfo(),
-            ProcKind::Mounts | ProcKind::PidMounts(_) => format_mounts(),
-            ProcKind::Version => format_version(),
+            ProcKind::Cpuinfo => format_cpuinfo().into_bytes(),
+            ProcKind::Meminfo => format_meminfo().into_bytes(),
+            ProcKind::Mounts | ProcKind::PidMounts(_) => format_mounts().into_bytes(),
+            ProcKind::Version => format_version().into_bytes(),
             ProcKind::PidMaps(pid) => match process::process_address_space(pid) {
                 Some(aspace) => aspace.format_maps(),
                 None => return Err(VfsError::NoEnt),
             },
             _ => return Err(VfsError::Inval),
         };
-        Ok(slice_read(text.as_bytes(), offset, buf))
+        Ok(slice_read(&text, offset, buf))
     }
 
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, VfsError> {
@@ -703,12 +705,12 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
 
             // The tables' other insert paths hand `/proc/<pid>` back uncached.
             let proc_root = resolve("/proc", follow).map_err(|e| format!("/proc: {e:?}"))?;
-            let pid_dir = proc_root.lookup(&name).map_err(|e| format!("lookup {pid}: {e:?}"))?;
+            let pid_dir = proc_root.lookup(name.as_bytes()).map_err(|e| format!("lookup {pid}: {e:?}"))?;
             let (dentry_gen, inode_gen) = tables.cache_gens();
             let created = tables.publish_created_inode(
                 DevId::PROCFS,
                 ProcKind::Root.ino(),
-                &name,
+                name.as_bytes(),
                 Arc::clone(&pid_dir),
                 dentry_gen,
                 inode_gen,
@@ -725,7 +727,7 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
                 return Err(format!("/proc/{pid} was unified with a cached inode"));
             }
 
-            if let Some(target) = tables.dentry_get(DevId::PROCFS, ProcKind::Root.ino(), &name) {
+            if let Some(target) = tables.dentry_get(DevId::PROCFS, ProcKind::Root.ino(), name.as_bytes()) {
                 return Err(format!("/proc/{pid} is in the dentry cache: {target:?}"));
             }
             let (_, uncacheable) = cached_procfs_inodes();
@@ -792,7 +794,11 @@ crate::ktest!(
             let path = format!("/proc/{name}");
             let inode =
                 resolve_path(tables, None, path.as_bytes(), nofollow).map_err(|_| "resolve a fixed node")?.inode;
-            kassert!(tables.dentry_get(DevId::PROCFS, ProcKind::Root.ino(), name).is_some_and(|t| t.ino == kind.ino()));
+            kassert!(
+                tables
+                    .dentry_get(DevId::PROCFS, ProcKind::Root.ino(), name.as_bytes())
+                    .is_some_and(|t| t.ino == kind.ino())
+            );
             kassert!(tables.inode_get(DevId::PROCFS, kind.ino()).is_some_and(|i| Arc::ptr_eq(&i, &inode)));
         }
 
@@ -831,8 +837,11 @@ crate::ktest!(
         let root = fs.root_inode();
         let mut entries = Vec::new();
         root.readdir(0, &mut entries, 64).map_err(|_| "readdir /proc")?;
-        let fixed: Vec<(u64, InodeType, &str)> =
-            entries.iter().take(7).map(|e| (e.ino, e.inode_type, e.name.as_str())).collect();
+        let fixed: Vec<(u64, InodeType, &str)> = entries
+            .iter()
+            .take(7)
+            .map(|e| (e.ino, e.inode_type, core::str::from_utf8(&e.name).unwrap_or("?")))
+            .collect();
         kassert_eq!(
             fixed,
             [
@@ -846,7 +855,8 @@ crate::ktest!(
             ]
         );
         for (ino, itype, name) in fixed {
-            let st = root.lookup(name).and_then(|n| n.stat()).map_err(|_| "lookup and stat a fixed entry")?;
+            let st =
+                root.lookup(name.as_bytes()).and_then(|n| n.stat()).map_err(|_| "lookup and stat a fixed entry")?;
             kassert_eq!((st.ino, st.inode_type), (ino, itype));
         }
         Ok(())
@@ -868,7 +878,11 @@ crate::ktest!(
                 let dir = super::resolve_path_from_root(&format!("/proc/{pid}/fd")).map_err(|_| "resolve fd dir")?;
                 let mut entries = Vec::new();
                 dir.readdir(0, &mut entries, 64).map_err(|_| "readdir fd dir")?;
-                Ok(entries.into_iter().map(|e| e.name).filter(|n| n != "." && n != "..").collect())
+                Ok(entries
+                    .into_iter()
+                    .filter(|e| e.name != b"." && e.name != b"..")
+                    .map(|e| String::from_utf8_lossy(&e.name).into_owned())
+                    .collect())
             };
             let link = |fd: i32| readlink_at(tables, None, format!("/proc/{pid}/fd/{fd}").as_bytes());
             kassert_eq!(listed()?, ["0", "1", "2"]);

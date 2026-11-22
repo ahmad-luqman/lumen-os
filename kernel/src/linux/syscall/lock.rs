@@ -26,8 +26,8 @@ use crate::sync::SpinLock;
 use crate::user::{copy_from_user, copy_to_user};
 use lumen_vfs::locks::{MAX_DEADLOCK_CHAIN, fcntl_const};
 use lumen_vfs::{
-    AdvisoryLocks, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixWaitGraph, RecordLockOutcome, VfsError, VfsLock,
-    WaitSearch,
+    AdvisoryLocks, Escaped, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixWaitGraph, RecordLockOutcome, VfsError,
+    VfsLock, WaitSearch,
 };
 
 /// The size of Linux x86-64's `struct flock` (its offsets pinned by
@@ -92,12 +92,12 @@ fn with_locks<T>(file: &FileRef, mut f: impl FnMut(&mut AdvisoryLocks) -> Result
     match (out, called) {
         (Some(out), Ok(())) => out.map_err(vfs),
         (Some(out), Err(e)) => {
-            log::error!(target: "linux", "{}: with_locks_mut ran its closure but returned {e:?}", file.path);
+            log::error!(target: "linux", "{}: with_locks_mut ran its closure but returned {e:?}", Escaped(&file.path));
             out.map_err(vfs)
         }
         (None, Err(e)) => Err(vfs(e)),
         (None, Ok(())) => {
-            log::error!(target: "linux", "{}: with_locks_mut returned without running its closure", file.path);
+            log::error!(target: "linux", "{}: with_locks_mut returned without running its closure", Escaped(&file.path));
             Err(errno::EIO)
         }
     }
@@ -194,13 +194,13 @@ fn log_wait_decision(
                 );
             }
             if *logged != Some(holder) {
-                log::debug!(target: "linux", "pid {pid}: F_SETLKW on {} waits for pid {holder}", file.path);
+                log::debug!(target: "linux", "pid {pid}: F_SETLKW on {} waits for pid {holder}", Escaped(&file.path));
                 *logged = Some(holder);
             }
             Ok(())
         }
         Err(e) => {
-            log::debug!(target: "linux", "pid {pid}: F_SETLKW on {}: EDEADLK (pid {holder} waits for it)", file.path);
+            log::debug!(target: "linux", "pid {pid}: F_SETLKW on {}: EDEADLK (pid {holder} waits for it)", Escaped(&file.path));
             Err(e)
         }
     }
@@ -344,7 +344,7 @@ fn flock(fd: Fd, operation: u32) -> Result<u64, u32> {
         |(), _| {
             if !logged {
                 let pid = with_current(|p| p.pid);
-                log::debug!(target: "linux", "pid {pid}: flock on {} waits", file.path);
+                log::debug!(target: "linux", "pid {pid}: flock on {} waits", Escaped(&file.path));
                 logged = true;
             }
             Ok(())

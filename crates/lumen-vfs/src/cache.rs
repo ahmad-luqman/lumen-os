@@ -422,7 +422,7 @@ impl Default for InodeCache {
     }
 }
 
-type DentryKey = (DevId, Ino, Box<str>);
+type DentryKey = (DevId, Ino, Box<[u8]>);
 
 /// Bounded dentry cache keyed by `(parent_dev, parent_ino, component_name)`.
 ///
@@ -456,8 +456,8 @@ impl DentryCache {
     }
 
     /// Look up a cached child target. Always returns `None` for `.` and `..`.
-    pub fn get(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> Option<DentryTarget> {
-        if name == "." || name == ".." || name.is_empty() {
+    pub fn get(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> Option<DentryTarget> {
+        if name == b"." || name == b".." || name.is_empty() {
             return None;
         }
         let key: DentryKey = (parent_dev, parent_ino, Box::from(name));
@@ -466,7 +466,7 @@ impl DentryCache {
 
     /// Atomically read a cached child target together with the current
     /// invalidation generation.
-    pub fn get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &str) -> (Option<DentryTarget>, u64) {
+    pub fn get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64) {
         (self.get(parent_dev, parent_ino, name), self.invalidation_gen)
     }
 
@@ -476,7 +476,7 @@ impl DentryCache {
         &mut self,
         parent_dev: DevId,
         parent_ino: Ino,
-        name: &str,
+        name: &[u8],
         target: DentryTarget,
         expected_gen: u64,
     ) -> bool {
@@ -488,8 +488,8 @@ impl DentryCache {
     }
 
     /// Insert or update a dentry mapping. Never caches `.`, `..`, or empty names.
-    pub fn insert(&mut self, parent_dev: DevId, parent_ino: Ino, name: &str, target: DentryTarget) {
-        if self.max_entries == 0 || name == "." || name == ".." || name.is_empty() {
+    pub fn insert(&mut self, parent_dev: DevId, parent_ino: Ino, name: &[u8], target: DentryTarget) {
+        if self.max_entries == 0 || name == b"." || name == b".." || name.is_empty() {
             return;
         }
         let key: DentryKey = (parent_dev, parent_ino, Box::from(name));
@@ -516,8 +516,8 @@ impl DentryCache {
     }
 
     /// Invalidate a single `(parent_dev, parent_ino, name)` entry.
-    pub fn invalidate(&mut self, parent_dev: DevId, parent_ino: Ino, name: &str) {
-        if name == "." || name == ".." || name.is_empty() {
+    pub fn invalidate(&mut self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) {
+        if name == b"." || name == b".." || name.is_empty() {
             return;
         }
         self.invalidation_gen = self.invalidation_gen.wrapping_add(1);
@@ -572,13 +572,8 @@ impl DentryCache {
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot_all(&self) -> Vec<(DevId, Ino, alloc::string::String, DentryTarget)> {
-        self.entries
-            .iter()
-            .map(|((pdev, pino, name), &(target, _))| {
-                (*pdev, *pino, alloc::string::String::from(name.as_ref()), target)
-            })
-            .collect()
+    pub(crate) fn snapshot_all(&self) -> Vec<(DevId, Ino, Vec<u8>, DentryTarget)> {
+        self.entries.iter().map(|((pdev, pino, name), &(target, _))| (*pdev, *pino, name.to_vec(), target)).collect()
     }
 }
 

@@ -291,7 +291,7 @@ mod tests {
                     crate::vfs::resolve_path_from_root("/tmp/stat-ktest-kinds").map_err(|_| "resolve")?,
                 )
                 .map_err(|_| "guard")?;
-                process::set_current_cwd(process::Cwd::new(guard, "/tmp/stat-ktest-kinds").map_err(|_| "cwd")?);
+                process::set_current_cwd(process::Cwd::new(guard, b"/tmp/stat-ktest-kinds").map_err(|_| "cwd")?);
                 kassert_eq!(sys_stat(rel_link, reg(BUF_A)), 0);
                 kassert_eq!(stat_at(BUF_A)?, want_stat(FILE, true)?);
 

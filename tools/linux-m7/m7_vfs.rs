@@ -619,7 +619,7 @@ fn rm_tree(path: &P) -> R {
 /// target. (The scenario runs it both ways round, so each filesystem gets
 /// every check.)
 fn posix(dir: &[u8], other: &[u8]) -> c_int {
-    let checks: [(&str, &dyn Fn() -> R); 14] = [
+    let checks: [(&str, &dyn Fn() -> R); 15] = [
         ("setup", &|| setup(dir, other)),
         ("symlinks-and-eloop", &|| symlinks(dir)),
         ("trailing-slash-nofollow", &|| trailing_slash(dir)),
@@ -628,6 +628,7 @@ fn posix(dir: &[u8], other: &[u8]) -> c_int {
         ("unlink-while-open", &|| unlink_open(dir)),
         ("rmdir-while-open", &|| rmdir_open(dir)),
         ("getdents64", &|| getdents(dir)),
+        ("non-utf8-names", &|| non_utf8(dir)),
         ("pread64-pwrite64", &|| positional(dir)),
         ("stat-lstat-newfstatat-statx", &|| stat_family(dir, other)),
         ("chmod-chown-umask-utimensat", &|| metadata(dir)),
@@ -965,6 +966,90 @@ fn getdents(d: &[u8]) -> R {
     eq("getdents64 on a file", n, -ENOTDIR)
 }
 
+/// `readlink(path)` gives exactly `want`.
+fn link_is(what: &'static str, path: &P, want: &[u8]) -> R {
+    let mut buf = [0u8; 256];
+    let n = s3(nr::READLINK, path.at(), mptr(&mut buf[..]), buf.len() as u64);
+    ensure(what, n >= 0 && &buf[..n as usize] == want, n)
+}
+
+/// `/proc/self/fd/<fd>`.
+fn proc_fd(fd: i64) -> P {
+    let mut digits = [0u8; 20];
+    let (mut n, mut at) = (fd as u64, digits.len());
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    P::new(&[b"/proc/self/fd/", &digits[at..]])
+}
+
+/// Names are bytes (#268): a file, a directory and a symlink target that
+/// aren't UTF-8 are made, listed, looked up, renamed, hard-linked, read
+/// back through getcwd and `/proc/self/fd`, and removed.
+fn non_utf8(d: &[u8]) -> R {
+    const FILE: &[u8] = b"\xff\xfe-file";
+    const RENAMED: &[u8] = b"\x80-renamed";
+    const DIR: &[u8] = b"\xc3(-dir";
+    const TARGET: &[u8] = b"\xe2\x28\xa1";
+    let u = j(d, b"u");
+    eq("mkdir u", s2(nr::MKDIR, u.at(), 0o755), 0)?;
+    let file = j(u.bytes(), FILE);
+    put(&file, b"x")?;
+    let dir = j(u.bytes(), DIR);
+    eq("mkdir a non-UTF-8 directory", s2(nr::MKDIR, dir.at(), 0o755), 0)?;
+    let ln = j(u.bytes(), b"ln");
+    eq("symlink to a non-UTF-8 target", s2(nr::SYMLINK, P::new(&[TARGET]).at(), ln.at()), 0)?;
+    link_is("readlink gives the target's bytes", &ln, TARGET)?;
+    // Listed under their own bytes, each once, with the inode lstat sees.
+    let fd = ok("open u", open(&u, O_RDONLY | O_DIRECTORY, 0))?;
+    let mut got = no_entries::<8>();
+    let n = list(fd, 1024, &mut got);
+    close(fd);
+    let n = n?;
+    eq("u's entries", n as i64, 5)?;
+    for name in [FILE, DIR] {
+        let times = got[..n].iter().filter(|e| &e.name[..e.len] == name).count();
+        eq("a non-UTF-8 name listed once", times as i64, 1)?;
+        let Some(found) = got[..n].iter().find(|e| &e.name[..e.len] == name) else {
+            return Err(Fail { what: "a non-UTF-8 name listed", got: name.len() as i64 });
+        };
+        let ino = st("lstat a listed non-UTF-8 name", lstat(&j(u.bytes(), name)))?.ino();
+        eq("its d_ino", found.ino as i64, ino as i64)?;
+    }
+    // Its open file's path in /proc/self/fd is the bytes it was opened by.
+    let fd = ok("open the file", open(&file, O_RDONLY, 0))?;
+    let r = link_is("/proc/self/fd names the file by its bytes", &proc_fd(fd), file.bytes());
+    close(fd);
+    r?;
+    // getcwd inside the directory gives its name's bytes.
+    let r = (|| {
+        eq("chdir into it", s1(nr::CHDIR, dir.at()), 0)?;
+        cwd_is("getcwd in a non-UTF-8 directory", dir.bytes())
+    })();
+    s1(nr::CHDIR, ptr(&b"/\0"[..]));
+    r?;
+    let renamed = j(u.bytes(), RENAMED);
+    eq("rename to another non-UTF-8 name", s2(nr::RENAME, file.at(), renamed.at()), 0)?;
+    eq("the old name gone", st_err(lstat(&file)), -ENOENT)?;
+    holds(&renamed, b"x")?;
+    // A hard link at another such name: the same inode, two links.
+    let hard = j(u.bytes(), b"\xe2\x82-link");
+    eq("link at a non-UTF-8 name", s2(nr::LINK, renamed.at(), hard.at()), 0)?;
+    let (a, b) = (st("lstat the file", lstat(&renamed))?, st("lstat its link", lstat(&hard))?);
+    eq("the link's inode", b.ino() as i64, a.ino() as i64)?;
+    eq("two links", a.nlink() as i64, 2)?;
+    eq("unlink the hard link", s1(nr::UNLINK, hard.at()), 0)?;
+    eq("unlink it", s1(nr::UNLINK, renamed.at()), 0)?;
+    eq("unlink the link", s1(nr::UNLINK, ln.at()), 0)?;
+    eq("rmdir the non-UTF-8 directory", s1(nr::RMDIR, dir.at()), 0)?;
+    eq("rmdir u once empty", s1(nr::RMDIR, u.at()), 0)
+}
+
 fn positional(d: &[u8]) -> R {
     let p = j(d, b"pp");
     let fd = ok("open pp", open(&p, O_CREAT | O_RDWR | O_TRUNC, 0o644))?;
@@ -1298,26 +1383,29 @@ fn locks(d: &[u8]) -> c_int {
 /// short and a long symlink, two files' new mode, owner and times (`f`'s
 /// set while it has unwritten changes, written by a `sync`; `t2`'s set
 /// after that `sync`, on a clean inode), a file and a directory exchanged,
-/// and a directory moved to another parent. Each check reads back what it
+/// a directory moved to another parent, and a file and a symlink whose names
+/// (and the link's target) aren't UTF-8. Each check reads back what it
 /// made, as `keep-check` does on a later boot, from the disk.
 fn keep(d: &[u8]) -> c_int {
-    let checks: [(&str, &dyn Fn() -> R); 5] = [
+    let checks: [(&str, &dyn Fn() -> R); 6] = [
         ("setup", &|| eq("mkdir the directory", s2(nr::MKDIR, P::new(&[d]).at(), 0o755), 0)),
         ("hard-link-and-symlinks", &|| keep_links(d).and_then(|()| kept_links(d))),
         ("metadata", &|| keep_metadata(d).and_then(|()| kept_metadata(d))),
         ("exchanged-file-and-directory", &|| keep_exchange(d).and_then(|()| kept_exchange(d))),
         ("moved-directory", &|| keep_moved(d).and_then(|()| kept_moved(d))),
+        ("non-utf8-names", &|| keep_odd(d).and_then(|()| kept_odd(d))),
     ];
     run_checks(&checks)
 }
 
 /// `keep-check <dir>`: what `keep` left in `<dir>`, read on a later boot.
 fn keep_check(d: &[u8]) -> c_int {
-    let checks: [(&str, &dyn Fn() -> R); 4] = [
+    let checks: [(&str, &dyn Fn() -> R); 5] = [
         ("hard-link-and-symlinks", &|| kept_links(d)),
         ("metadata", &|| kept_metadata(d)),
         ("exchanged-file-and-directory", &|| kept_exchange(d)),
         ("moved-directory", &|| kept_moved(d)),
+        ("non-utf8-names", &|| kept_odd(d)),
     ];
     run_checks(&checks)
 }
@@ -1402,6 +1490,33 @@ fn kept_moved(d: &[u8]) -> R {
     let in_p2 = st("stat p2", stat(&p2))?;
     eq("p2's links", in_p2.nlink() as i64, 3)?;
     eq("m's ..", st("stat p2/m/..", stat(&P::new(&[p2.bytes(), b"/m/.."])))?.ino() as i64, in_p2.ino() as i64)
+}
+
+/// A file and a symlink whose names (and the link's target) aren't UTF-8
+/// (#268), left on the disk for e2fsck and a cold read on the next boot.
+const ODD_FILE: &[u8] = b"\xff\xfe-kept";
+const ODD_LINK: &[u8] = b"\xc3(-sl";
+const ODD_TARGET: &[u8] = b"\xe2\x28\xa1-target";
+
+fn keep_odd(d: &[u8]) -> R {
+    put(&j(d, ODD_FILE), b"odd")?;
+    eq("symlink at a non-UTF-8 name", s2(nr::SYMLINK, P::new(&[ODD_TARGET]).at(), j(d, ODD_LINK).at()), 0)
+}
+
+fn kept_odd(d: &[u8]) -> R {
+    holds(&j(d, ODD_FILE), b"odd")?;
+    link_is("the non-UTF-8 link's target", &j(d, ODD_LINK), ODD_TARGET)?;
+    // Listed by getdents64 under its own bytes.
+    let fd = ok("open the directory", open(&P::new(&[d]), O_RDONLY | O_DIRECTORY, 0))?;
+    let mut got = no_entries::<32>();
+    let n = list(fd, 1024, &mut got);
+    close(fd);
+    let n = n?;
+    for name in [ODD_FILE, ODD_LINK] {
+        let times = got[..n].iter().filter(|e| &e.name[..e.len] == name).count();
+        eq("a kept non-UTF-8 name listed once", times as i64, 1)?;
+    }
+    Ok(())
 }
 
 fn flk(fd: i64, op: u64) -> i64 {

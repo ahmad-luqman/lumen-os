@@ -2,14 +2,13 @@
 //! and bounded by an atomic per-mount memory quota (default 32 MiB).
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use lumen_vfs::{
-    AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
+    AdvisoryLocks, DevId, DirEntry, Escaped, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec,
+    VfsError, VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
 use crate::sync::{SleepMutex, SleepMutexGuard};
@@ -56,7 +55,7 @@ impl Tmpfs {
                 atime: now,
                 mtime: now,
                 ctime: now,
-                symlink_target: String::new(),
+                symlink_target: Vec::new(),
                 children: Children::new(),
                 parent: Some(Weak::clone(weak_self)),
                 locks: AdvisoryLocks::new(),
@@ -108,7 +107,7 @@ struct TmpfsMeta {
     atime: Timespec,
     mtime: Timespec,
     ctime: Timespec,
-    symlink_target: String,
+    symlink_target: Vec<u8>,
     children: Children,
     parent: Option<Weak<TmpfsInode>>,
     locks: AdvisoryLocks,
@@ -125,9 +124,9 @@ const FIRST_CHILD_CURSOR: u64 = 2;
 /// starts where it did, whatever was added or removed meanwhile.
 struct Children {
     /// The entries by number: what `readdir` walks.
-    by_seq: BTreeMap<u64, (String, Arc<TmpfsInode>)>,
+    by_seq: BTreeMap<u64, (Vec<u8>, Arc<TmpfsInode>)>,
     /// Each name's number, for lookups; always the same names as `by_seq`.
-    by_name: BTreeMap<String, u64>,
+    by_name: BTreeMap<Vec<u8>, u64>,
     /// The next name's number, from [`FIRST_CHILD_CURSOR`].
     next_seq: u64,
 }
@@ -137,14 +136,18 @@ impl Children {
         Self { by_seq: BTreeMap::new(), by_name: BTreeMap::new(), next_seq: FIRST_CHILD_CURSOR }
     }
 
-    fn get(&self, name: &str) -> Option<&Arc<TmpfsInode>> {
+    fn get(&self, name: &[u8]) -> Option<&Arc<TmpfsInode>> {
         let seq = self.by_name.get(name)?;
         let entry = self.by_seq.get(seq);
-        debug_assert!(entry.is_some_and(|(n, _)| n == name), "tmpfs: {name:?}'s number {seq} lists another entry");
+        debug_assert!(
+            entry.is_some_and(|(n, _)| n == name),
+            "tmpfs: {:?}'s number {seq} lists another entry",
+            Escaped(name)
+        );
         entry.map(|(_, child)| child)
     }
 
-    fn contains_key(&self, name: &str) -> bool {
+    fn contains_key(&self, name: &[u8]) -> bool {
         self.by_name.contains_key(name)
     }
 
@@ -159,13 +162,13 @@ impl Children {
 
     /// Point `name` at `child`: an existing name keeps its number, a new one
     /// takes the next.
-    fn insert(&mut self, name: String, child: Arc<TmpfsInode>) {
+    fn insert(&mut self, name: Vec<u8>, child: Arc<TmpfsInode>) {
         if let Some(&seq) = self.by_name.get(&name) {
             if let Some(slot) = self.by_seq.get_mut(&seq) {
                 slot.1 = child;
                 return;
             }
-            debug_assert!(false, "tmpfs: {name:?}'s number {seq} has no entry");
+            debug_assert!(false, "tmpfs: {:?}'s number {seq} has no entry", Escaped(&name));
         }
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -173,17 +176,17 @@ impl Children {
         self.by_seq.insert(seq, (name, child));
     }
 
-    fn remove(&mut self, name: &str) -> Option<Arc<TmpfsInode>> {
+    fn remove(&mut self, name: &[u8]) -> Option<Arc<TmpfsInode>> {
         let seq = self.by_name.remove(name)?;
         let entry = self.by_seq.remove(&seq);
-        debug_assert!(entry.is_some(), "tmpfs: {name:?}'s number {seq} had no entry");
+        debug_assert!(entry.is_some(), "tmpfs: {:?}'s number {seq} had no entry", Escaped(name));
         entry.map(|(_, child)| child)
     }
 
     /// The entries numbered `from` or more, in number order (the order they
     /// were added in): `(number, name, inode)`.
-    fn listed_from(&self, from: u64) -> impl Iterator<Item = (u64, &str, &Arc<TmpfsInode>)> {
-        self.by_seq.range(from..).map(|(&seq, (name, child))| (seq, name.as_str(), child))
+    fn listed_from(&self, from: u64) -> impl Iterator<Item = (u64, &[u8], &Arc<TmpfsInode>)> {
+        self.by_seq.range(from..).map(|(&seq, (name, child))| (seq, name.as_slice(), child))
     }
 }
 
@@ -260,7 +263,7 @@ impl TmpfsInode {
         inode_type: InodeType,
         mode: u16,
         nlink: u32,
-        symlink_target: String,
+        symlink_target: Vec<u8>,
         parent: Option<Weak<TmpfsInode>>,
     ) -> Arc<Self> {
         let now = time::realtime_timespec();
@@ -303,8 +306,8 @@ impl TmpfsInode {
         self.self_weak.upgrade()
     }
 
-    fn validate_name(name: &str) -> Result<(), VfsError> {
-        if name.is_empty() || name.contains('/') || name.as_bytes().contains(&0) {
+    fn validate_name(name: &[u8]) -> Result<(), VfsError> {
+        if name.is_empty() || name.contains(&b'/') || name.contains(&0) {
             return Err(VfsError::Inval);
         }
         if name.len() > lumen_vfs::NAME_MAX {
@@ -470,7 +473,7 @@ impl VfsInode for TmpfsInode {
         })
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -479,22 +482,22 @@ impl VfsInode for TmpfsInode {
         if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if name == "." {
+        if name == b"." {
             return self.self_arc().map(|a| a as Arc<dyn VfsInode>).ok_or(VfsError::NoEnt);
         }
-        if name == ".." {
+        if name == b".." {
             let p = meta.parent.as_ref().and_then(Weak::upgrade).ok_or(VfsError::NoEnt)?;
             return Ok(p as Arc<dyn VfsInode>);
         }
         meta.children.get(name).map(|c| Arc::clone(c) as Arc<dyn VfsInode>).ok_or(VfsError::NoEnt)
     }
 
-    fn create(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
         Self::validate_name(name)?;
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
@@ -504,20 +507,20 @@ impl VfsInode for TmpfsInode {
         if meta.children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let child = Self::new_child(&self.shared, InodeType::File, mode, 1, String::new(), None);
-        meta.children.insert(String::from(name), Arc::clone(&child));
+        let child = Self::new_child(&self.shared, InodeType::File, mode, 1, Vec::new(), None);
+        meta.children.insert(name.to_vec(), Arc::clone(&child));
         let now = time::realtime_timespec();
         meta.mtime = now;
         meta.ctime = now;
         Ok(child as Arc<dyn VfsInode>)
     }
 
-    fn mkdir(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
         Self::validate_name(name)?;
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::Exist);
         }
         let self_arc = find_tmpfs_dir_arc(self, self.lock_id, self.ino()).ok_or(VfsError::NoEnt)?;
@@ -528,9 +531,8 @@ impl VfsInode for TmpfsInode {
         if meta.children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let child =
-            Self::new_child(&self.shared, InodeType::Dir, mode, 2, String::new(), Some(Arc::downgrade(&self_arc)));
-        meta.children.insert(String::from(name), Arc::clone(&child));
+        let child = Self::new_child(&self.shared, InodeType::Dir, mode, 2, Vec::new(), Some(Arc::downgrade(&self_arc)));
+        meta.children.insert(name.to_vec(), Arc::clone(&child));
         meta.nlink = meta.nlink.saturating_add(1);
         let now = time::realtime_timespec();
         meta.mtime = now;
@@ -538,12 +540,12 @@ impl VfsInode for TmpfsInode {
         Ok(child as Arc<dyn VfsInode>)
     }
 
-    fn unlink(&self, name: &str) -> Result<(), VfsError> {
+    fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
         Self::validate_name(name)?;
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::IsDir);
         }
         let self_arc = find_tmpfs_dir_arc(self, self.lock_id, self.ino()).ok_or(VfsError::NoEnt)?;
@@ -581,15 +583,15 @@ impl VfsInode for TmpfsInode {
         Ok(())
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), VfsError> {
+    fn rmdir(&self, name: &[u8]) -> Result<(), VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
         Self::validate_name(name)?;
-        if name == "." {
+        if name == b"." {
             return Err(VfsError::Inval);
         }
-        if name == ".." {
+        if name == b".." {
             return Err(VfsError::NotEmpty);
         }
         let self_arc = find_tmpfs_dir_arc(self, self.lock_id, self.ino()).ok_or(VfsError::NoEnt)?;
@@ -626,7 +628,7 @@ impl VfsInode for TmpfsInode {
         Ok(())
     }
 
-    fn link(&self, name: &str, target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+    fn link(&self, name: &[u8], target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -640,7 +642,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::NoEnt);
         }
         Self::validate_name(name)?;
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::Exist);
         }
         let self_arc = find_tmpfs_dir_arc(self, self.lock_id, self.ino()).ok_or(VfsError::NoEnt)?;
@@ -660,7 +662,7 @@ impl VfsInode for TmpfsInode {
             if p_meta.children.contains_key(name) {
                 return Err(VfsError::Exist);
             }
-            p_meta.children.insert(String::from(name), Arc::clone(&target_arc));
+            p_meta.children.insert(name.to_vec(), Arc::clone(&target_arc));
             p_meta.mtime = now;
             p_meta.ctime = now;
         }
@@ -670,7 +672,7 @@ impl VfsInode for TmpfsInode {
         Ok(())
     }
 
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn symlink(&self, name: &[u8], target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -681,7 +683,7 @@ impl VfsInode for TmpfsInode {
         if target.len() >= lumen_vfs::PATH_MAX {
             return Err(VfsError::NameTooLong);
         }
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
@@ -691,8 +693,8 @@ impl VfsInode for TmpfsInode {
         if meta.children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let child = Self::new_child(&self.shared, InodeType::Symlink, 0o777, 1, String::from(target), None);
-        meta.children.insert(String::from(name), Arc::clone(&child));
+        let child = Self::new_child(&self.shared, InodeType::Symlink, 0o777, 1, target.to_vec(), None);
+        meta.children.insert(name.to_vec(), Arc::clone(&child));
         let now = time::realtime_timespec();
         meta.mtime = now;
         meta.ctime = now;
@@ -704,14 +706,14 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::Inval);
         }
         let meta = self.meta.lock();
-        Ok(meta.symlink_target.as_bytes().to_vec())
+        Ok(meta.symlink_target.clone())
     }
 
     fn rename(
         &self,
-        old_name: &str,
+        old_name: &[u8],
         new_dir: &Arc<dyn VfsInode>,
-        new_name: &str,
+        new_name: &[u8],
         flags: RenameFlags,
     ) -> Result<(), VfsError> {
         let flags = flags.validate()?;
@@ -726,7 +728,7 @@ impl VfsInode for TmpfsInode {
         }
         Self::validate_name(old_name)?;
         Self::validate_name(new_name)?;
-        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+        if old_name == b"." || old_name == b".." || new_name == b"." || new_name == b".." {
             return Err(VfsError::Inval);
         }
 
@@ -783,13 +785,13 @@ impl VfsInode for TmpfsInode {
             let new_is_dir = new_child_arc.inode_type == InodeType::Dir;
             {
                 let old_p = tmpfs_guard_mut(&mut guards, &old_dir_arc);
-                old_p.children.insert(String::from(old_name), Arc::clone(new_child_arc));
+                old_p.children.insert(old_name.to_vec(), Arc::clone(new_child_arc));
                 old_p.mtime = now;
                 old_p.ctime = now;
             }
             {
                 let new_p = tmpfs_guard_mut(&mut guards, &new_dir_arc);
-                new_p.children.insert(String::from(new_name), Arc::clone(&old_child_arc));
+                new_p.children.insert(new_name.to_vec(), Arc::clone(&old_child_arc));
                 new_p.mtime = now;
                 new_p.ctime = now;
             }
@@ -842,7 +844,7 @@ impl VfsInode for TmpfsInode {
         }
 
         tmpfs_guard_mut(&mut guards, &old_dir_arc).children.remove(old_name);
-        tmpfs_guard_mut(&mut guards, &new_dir_arc).children.insert(String::from(new_name), Arc::clone(&old_child_arc));
+        tmpfs_guard_mut(&mut guards, &new_dir_arc).children.insert(new_name.to_vec(), Arc::clone(&old_child_arc));
 
         if old_is_dir && !same_parent {
             tmpfs_guard_mut(&mut guards, &old_child_arc).parent = Some(Arc::downgrade(&new_dir_arc));
@@ -872,7 +874,7 @@ impl VfsInode for TmpfsInode {
             return Ok(());
         }
         let parent_ino = meta.parent.as_ref().and_then(Weak::upgrade).map_or(self.ino(), |p| p.ino());
-        let dots = [(0, self.ino(), InodeType::Dir, "."), (1, parent_ino, InodeType::Dir, "..")];
+        let dots = [(0, self.ino(), InodeType::Dir, &b"."[..]), (1, parent_ino, InodeType::Dir, &b".."[..])];
         let children = meta
             .children
             .listed_from(cursor.max(FIRST_CHILD_CURSOR))
@@ -881,7 +883,7 @@ impl VfsInode for TmpfsInode {
             if out.len() >= max_entries {
                 break;
             }
-            out.push(DirEntry { ino, inode_type, name: String::from(name), next_cursor: seq + 1 });
+            out.push(DirEntry { ino, inode_type, name: name.to_vec(), next_cursor: seq + 1 });
         }
         Ok(())
     }
@@ -1064,7 +1066,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let fs = Tmpfs::new(DevId::makedev(0, 125), 4 * PAGE_SIZE);
         let root = fs.root_inode();
-        let f = root.create("map.bin", 0o644).map_err(|_| "create")?;
+        let f = root.create(b"map.bin", 0o644).map_err(|_| "create")?;
         let data: Vec<u8> = (0..PAGE_SIZE + 100).map(|i| (i % 251) as u8 | 1).collect();
         kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
         kassert_eq!(fs.used_pages(), 2);
@@ -1109,7 +1111,7 @@ crate::ktest!(
         kassert_eq!(mmap_page(&f, 1 << 52).err(), Some(VfsError::Range));
         kassert_eq!(mmap_page(&f, u64::MAX).err(), Some(VfsError::Range));
         kassert_eq!(mmap_page(&root, 0).err(), Some(VfsError::NoDev));
-        let link = root.symlink("link", "map.bin").map_err(|_| "symlink")?;
+        let link = root.symlink(b"link", b"map.bin").map_err(|_| "symlink")?;
         kassert_eq!(mmap_page(&link, 0).err(), Some(VfsError::NoDev));
         Ok(())
     }
@@ -1137,7 +1139,7 @@ crate::ktest!(
         tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(why("mount_root"))?;
         let data: Vec<u8> = (0..2 * PAGE_SIZE + 100).map(|i| (i as u8).wrapping_mul(31) | 1).collect();
         for name in ["kept", "freed"] {
-            let f = fs.root_inode().create(name, 0o644).map_err(why("create"))?;
+            let f = fs.root_inode().create(name.as_bytes(), 0o644).map_err(why("create"))?;
             kassert_eq!(f.write_at(0, &data).map_err(why("write"))?, data.len());
         }
         let rd = OpenFlags::from_bits_truncate(OpenFlags::O_RDONLY);
@@ -1158,7 +1160,8 @@ crate::ktest!(
         unlink_at(&tables, None, b"/freed", false).map_err(why("unlink freed"))?;
         kassert!(!inode.is_detached());
         kassert_eq!(inode.stat().map_err(why("stat freed"))?.nlink, 0);
-        let res = OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(Arc::clone(&inode), Arc::from(path.as_str()), rd);
+        let res =
+            OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(Arc::clone(&inode), Arc::from(path.as_slice()), rd);
         kassert_eq!(res.err(), Some(VfsError::NoEnt));
         kassert_eq!(inode.open_count(), 0);
         Ok(())

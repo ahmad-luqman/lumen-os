@@ -231,22 +231,14 @@ impl UserPath {
         Ok(Self(bytes))
     }
 
-    /// The path's bytes, as the VFS's resolution takes them.
+    /// The path's bytes, as the VFS takes them: any but NUL, UTF-8 or not
+    /// (#268).
     pub(super) fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    /// The path as text, for the calls that take a `&str`. A path that isn't
-    /// UTF-8 names nothing the VFS can hold yet, so `-ENOENT` (#268 makes VFS
-    /// names byte strings). The same rule lives in lumen-vfs's resolver, for
-    /// a middle component (`resolve_path`) and a final name
-    /// (`resolve_parent`): #268 changes all three.
-    pub(super) fn as_str(&self) -> Result<&str, u32> {
-        core::str::from_utf8(&self.0).map_err(|_| errno::ENOENT)
     }
 }
 
@@ -259,7 +251,7 @@ pub(super) struct Start {
     dir: Option<Arc<dyn VfsInode>>,
     /// The path `dir` was opened or set by (the cwd's, or the dirfd's open
     /// file's), for the path a relative open shows in `/proc/<pid>/fd`.
-    base: Option<Arc<str>>,
+    base: Option<Arc<[u8]>>,
 }
 
 impl Start {
@@ -337,13 +329,13 @@ impl Start {
     /// base is the path as it was when the cwd was set or the dirfd opened,
     /// so a rename since then isn't followed (Linux's `d_path` would be;
     /// `getcwd` is, computing the cwd's path from its inode).
-    pub(super) fn display_path(&self, path: &str) -> Option<Arc<str>> {
+    pub(super) fn display_path(&self, path: &[u8]) -> Option<Arc<[u8]>> {
         let base = self.base.as_deref()?;
-        if path.is_empty() || path.starts_with('/') {
+        if path.is_empty() || path.starts_with(b"/") {
             return None;
         }
-        let sep = if base.ends_with('/') { "" } else { "/" };
-        Some(Arc::from(alloc::format!("{base}{sep}{path}").as_str()))
+        let sep: &[u8] = if base.ends_with(b"/") { b"" } else { b"/" };
+        Some(Arc::from([base, sep, path].concat()))
     }
 }
 
@@ -602,12 +594,11 @@ crate::ktest!(
         // Empty: `-ENOENT`, unless the caller allows it (`AT_EMPTY_PATH`).
         crate::kassert_eq!(UserPath::from_bytes(Vec::new(), false), Err(errno::ENOENT));
         crate::kassert!(UserPath::from_bytes(Vec::new(), true).is_ok_and(|p| p.is_empty()));
-        // Text: UTF-8 reads as itself; anything else names nothing (#268).
+        // Bytes: UTF-8 or not, kept as given (#268).
         let p = UserPath::from_bytes(b"/tmp/a".to_vec(), false);
         crate::kassert_eq!(p.as_ref().map(|p| p.as_bytes()), Ok(&b"/tmp/a"[..]));
-        crate::kassert_eq!(p.as_ref().map(|p| p.as_str()), Ok(Ok("/tmp/a")));
         let p = UserPath::from_bytes(vec![b'/', 0xff, b'x'], false);
-        crate::kassert_eq!(p.as_ref().map(|p| p.as_str()), Ok(Err(errno::ENOENT)));
+        crate::kassert_eq!(p.as_ref().map(|p| p.as_bytes()), Ok(&b"/\xffx"[..]));
         // Pointers: `NULL` and a kernel address are `-EFAULT`, never read.
         crate::kassert_eq!(UserPath::copy_in(UserPtr(0), false), Err(errno::EFAULT));
         crate::kassert_eq!(UserPath::copy_in(UserPtr(0), true), Err(errno::EFAULT));
@@ -649,12 +640,11 @@ crate::ktest!(
             crate::kassert_eq!(copy_to_user(empty, b"\0"), Ok(()));
             crate::kassert_eq!(UserPath::copy_in(UserPtr(empty), false), Err(errno::ENOENT));
             crate::kassert!(UserPath::copy_in(UserPtr(empty), true).is_ok_and(|p| p.is_empty()));
-            // Bytes that aren't UTF-8 copy in; as text they name nothing.
+            // Bytes that aren't UTF-8 copy in as they are (#268).
             let odd = base + FRAME_SIZE + 32;
             crate::kassert_eq!(copy_to_user(odd, b"/\xff\xfe\0"), Ok(()));
             let p = UserPath::copy_in(UserPtr(odd), false);
             crate::kassert_eq!(p.as_ref().map(|p| p.as_bytes()), Ok(&b"/\xff\xfe"[..]));
-            crate::kassert_eq!(p.as_ref().map(|p| p.as_str()), Ok(Err(errno::ENOENT)));
             // A string running into the unmapped page: `-EFAULT`.
             let edge = base + 2 * FRAME_SIZE - 4;
             crate::kassert_eq!(copy_to_user(edge, b"ABCD"), Ok(()));
@@ -816,14 +806,14 @@ crate::ktest!(
             let s = must(start(Dirfd::Cwd, b"f", false))?;
             kassert!(is(&s, &root));
             let guard = OpenGuard::try_new(Arc::clone(&dir)).map_err(|_| "guard")?;
-            process::set_current_cwd(process::Cwd::new(guard, "/tmp/at-ktest").map_err(|_| "cwd")?);
+            process::set_current_cwd(process::Cwd::new(guard, b"/tmp/at-ktest").map_err(|_| "cwd")?);
             let s = must(start(Dirfd::Cwd, b"f", false))?;
             kassert!(is(&s, &dir));
             let follow = ResolveFlags { follow_final: true, empty_path: false, require_dir: false };
             let f = UserPath::from_bytes(b"f".to_vec(), false).map_err(|_| "path")?;
             let found = s.resolve(&f, follow).map_err(|_| "resolve f from the cwd")?;
             kassert!(Arc::ptr_eq(&found.inode, &file_inode));
-            kassert_eq!(s.display_path("f").as_deref(), Some("/tmp/at-ktest/f"));
+            kassert_eq!(s.display_path(b"f").as_deref(), Some(&b"/tmp/at-ktest/f"[..]));
             let from_root = resolve_path(tables, None, b"f", follow).err();
             kassert_eq!(from_root, Some(lumen_vfs::VfsError::NoEnt));
             // An empty path with `AT_EMPTY_PATH`: the cwd.
@@ -832,14 +822,17 @@ crate::ktest!(
             // A directory fd (an `O_PATH` one too) with a relative path.
             kassert!(is(&must(start(fd(dir_fd), b"f", false))?, &dir));
             kassert!(is(&must(start(fd(path_fd), b"f", false))?, &dir));
-            kassert_eq!(must(start(fd(dir_fd), b"f", false))?.display_path("f").as_deref(), Some("/tmp/at-ktest/f"));
+            kassert_eq!(
+                must(start(fd(dir_fd), b"f", false))?.display_path(b"f").as_deref(),
+                Some(&b"/tmp/at-ktest/f"[..])
+            );
 
             // An absolute path ignores the dirfd: a closed, negative or
             // non-directory one is no error, and it starts at the root.
             for d in [fd(999), fd(-5), fd(file_fd), fd(dir_fd), Dirfd::Cwd] {
                 let s = must(start(d, b"/tmp", false))?;
                 kassert!(s.dir().is_none());
-                kassert!(s.display_path("/tmp").is_none());
+                kassert!(s.display_path(b"/tmp").is_none());
             }
 
             // A relative or empty path through a bad fd: `-EBADF`.
@@ -878,7 +871,7 @@ crate::ktest!(
         process::in_test_process(move |_| {
             let base = mkdir_at(tables, None, DIR, 0o755, 0).map_err(|_| "mkdir")?;
             let guard = OpenGuard::try_new(Arc::clone(&base)).map_err(|_| "guard")?;
-            process::set_current_cwd(process::Cwd::new(guard, "/tmp/at-ktest-ops").map_err(|_| "cwd")?);
+            process::set_current_cwd(process::Cwd::new(guard, b"/tmp/at-ktest-ops").map_err(|_| "cwd")?);
             let path = |p: &[u8]| UserPath::from_bytes(p.to_vec(), false).map_err(|_| "path");
             let start = |d: Dirfd, p: &UserPath| start_dir(d, p).map_err(|_| "start_dir");
             let mode = |m: u64| reg::<Mode>(m);
@@ -912,6 +905,48 @@ crate::ktest!(
             kassert_eq!(cwd.unlink(&f, false), Ok(()));
             kassert_eq!(cwd.unlink(&d, true), Ok(()));
             kassert!(mode_of("/tmp/at-ktest-ops/d").is_err());
+            Ok(())
+        })??;
+        kassert!(lumen_vfs::unlink_at(tables, None, DIR, true).is_ok());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn at_start_operations_take_names_that_are_not_utf8() {
+        // #268: a path is bytes. Names that aren't UTF-8 are made, resolved,
+        // renamed and removed from a start, and a relative open's shown path
+        // joins the bytes as they are.
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::{OpenGuard, mkdir_at};
+
+        const DIR: &[u8] = b"/tmp/at-ktest-\xff";
+        let tables = crate::vfs::tables();
+        process::in_test_process(move |_| {
+            let base = mkdir_at(tables, None, DIR, 0o755, 0).map_err(|_| "mkdir a non-UTF-8 directory")?;
+            let guard = OpenGuard::try_new(Arc::clone(&base)).map_err(|_| "guard")?;
+            process::set_current_cwd(process::Cwd::new(guard, DIR).map_err(|_| "cwd")?);
+            let path = |p: &[u8]| UserPath::from_bytes(p.to_vec(), false).map_err(|_| "path");
+            let start = |p: &UserPath| start_dir(Dirfd::Cwd, p).map_err(|_| "start_dir");
+            let follow = ResolveFlags { follow_final: true, empty_path: false, require_dir: false };
+
+            let d = path(b"d\xfe")?;
+            let cwd = start(&d)?;
+            kassert!(cwd.mkdir(&d, reg::<Mode>(0o755)).is_ok());
+            let f = path(b"d\xfe/f\x80")?;
+            let flags = OpenFlags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT);
+            let opened = cwd.open(&f, flags, reg::<Mode>(0o644)).map_err(|_| "create a non-UTF-8 name")?;
+            kassert_eq!(opened.path(), b"d\xfe/f\x80");
+            drop(opened);
+            kassert_eq!(cwd.display_path(f.as_bytes()).as_deref(), Some(&b"/tmp/at-ktest-\xff/d\xfe/f\x80"[..]));
+            let found = cwd.resolve(&f, follow).map_err(|_| "resolve a non-UTF-8 path")?;
+            kassert_eq!(found.inode.inode_type(), InodeType::File);
+            let g = path(b"d\xfe/g\xc3")?;
+            kassert_eq!(Start::rename(&cwd, &f, &cwd, &g, RenameFlags(0)), Ok(()));
+            kassert_eq!(cwd.resolve(&f, follow).err(), Some(errno::ENOENT));
+            kassert!(cwd.resolve(&g, follow).is_ok_and(|r| Arc::ptr_eq(&r.inode, &found.inode)));
+            kassert_eq!(cwd.unlink(&g, false), Ok(()));
+            kassert_eq!(cwd.unlink(&d, true), Ok(()));
             Ok(())
         })??;
         kassert!(lumen_vfs::unlink_at(tables, None, DIR, true).is_ok());

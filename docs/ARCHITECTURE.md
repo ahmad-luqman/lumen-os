@@ -3569,8 +3569,8 @@ Lumen runs two kinds of user code:
 
   `at.rs` also copies a path argument in (`UserPath`: `PATH_MAX` with its
   NUL, else `-ENAMETOOLONG`; empty `-ENOENT` unless `AT_EMPTY_PATH` (or for `readlinkat`); a bad
-  or `NULL` pointer `-EFAULT`, `UserPath::empty()` aside; non-UTF-8
-  `-ENOENT` until #268), fills `struct stat` and `struct statx` from VFS
+  or `NULL` pointer `-EFAULT`, `UserPath::empty()` aside; any bytes but
+  NUL, UTF-8 or not, #268), fills `struct stat` and `struct statx` from VFS
   `Metadata` and writes them to user memory (`write_stat`, `write_statx`:
   `-EFAULT` for a bad buffer). Each cluster's tests check its arms take
   their registers in order, with distinct values in each argument (the
@@ -3738,7 +3738,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 263 | `unlinkat(dirfd, path, flags)` | `flags == 0`: unlinks non-directory (`-EISDIR` on dir and on `/`, `.` or `..`, `-ENOTDIR` on trailing `/`, a symlink to a directory included), handling open-unlinked inodes cleanly (section 9); `flags == AT_REMOVEDIR`: removes empty directory (`-ENOTEMPTY`, also for `..`, `-EINVAL` for `.`, `-EBUSY` for `/` and a mount point); unknown flags `-EINVAL`, checked before the path |
 | 264 | `renameat(olddirfd, old, newdirfd, new)` | shim to `renameat2(olddirfd, old, newdirfd, new, 0)` |
 | 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | creates hard link (`AT_SYMLINK_FOLLOW` / `AT_EMPTY_PATH`); rejects existing target (`-EEXIST`, a trailing `/` too; `-ENOENT` for a trailing `/` on a free name), then a read-only filesystem (`-EROFS`), then cross-mount (`-EXDEV`), then directories (`-EPERM`), Linux's order, incrementing `st_nlink` |
-| 266 | `symlinkat(target, newdirfd, linkpath)` | creates symlink with verbatim non-empty `target` (`-ENOENT` if `target` is empty, `-EEXIST` if `linkpath` exists, `-ENOENT`/`-EEXIST` on trailing `/`; a target that isn't UTF-8 `-EINVAL` until #268) |
+| 266 | `symlinkat(target, newdirfd, linkpath)` | creates symlink with verbatim non-empty `target` (`-ENOENT` if `target` is empty, `-EEXIST` if `linkpath` exists, `-ENOENT`/`-EEXIST` on trailing `/`; the target's bytes stored as given, UTF-8 or not, #268) |
 | 267 | `readlinkat(dirfd, path, buf, bufsiz)` | does not follow final symlink (`-EINVAL` if target is not a symlink or `bufsiz <= 0`); accepts empty `path == ""` on an `O_PATH` symlink `dirfd` (`-ENOENT` if that file is not a symlink, as Linux); copies `min(target.len(), bufsiz)` bytes **without** trailing NUL and returns bytes copied |
 | 268 | `fchmodat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`, which `musl` leaves uninitialized); follows symlinks and updates mode bits and `ctime` (`-EROFS` on read-only fs, devfs's nodes excepted) |
 | 269 | `faccessat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`); shim to `faccessat2(dirfd, path, mode, 0)` |
@@ -5566,17 +5566,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     leaves the inode for `e2fsck` (logged at `error`); the rename itself has
     happened. Putting the entry back can only fail on a second fault; the
     target then keeps its inode and data without an entry (logged).
-  - **Names that aren't UTF-8:** VFS names are `&str`, so `readdir` skips an
-    entry whose name isn't UTF-8 (logged once per directory); listing it
-    lossily would give a name that doesn't round-trip, and `getcwd`, which
-    rebuilds paths from `readdir` names, could resolve it to another
-    directory. A path component that isn't UTF-8 is `-ENOENT` (Linux takes
-    any bytes but `/` and NUL): a middle one in `resolve_path`, a final name
-    in `resolve_parent`, so for every operation that creates, removes or
-    renames a name (`open(O_CREAT)`, `mkdir`, `unlink`, `rmdir`, `link`,
-    `symlink`, `rename`), and in the kernel's `UserPath::as_str`. A symlink
-    target that isn't UTF-8 is `-EINVAL` (it is stored, not looked up).
-    Byte-string names are #268.
+  - **Names that aren't UTF-8** are listed, looked up, unlinked and
+    renamed as any other (#268: VFS names are bytes, "Core abstractions"
+    below), except on a volume with unsigned directory hashes, where a
+    hashed directory's lookups can miss a name with a byte of 0x80 or
+    more, and such a name Lumen adds there is filed where Linux won't find
+    it (#308, the caveat below).
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
@@ -5628,6 +5623,46 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     console (reads, writes, the tty `ioctl`s, readiness `poll`, `-ESPIPE`
     on `lseek`) and gives every other `-ENOTTY` for the tty `ioctl`s (#254b). `VfsInode::drop` must never acquire a sleeping
     lock.
+  - **Names are byte strings (#268):** a name is any bytes but `/` and
+    NUL, as on Linux, and goes through the VFS as `&[u8]` (owned:
+    `Box<[u8]>` or `Vec<u8>`): `VfsInode`'s `lookup`, `create`, `mkdir`,
+    `unlink`, `rmdir`, `link`, `symlink`, `rename` (a symlink's target is
+    any bytes but NUL, `/` included), `DirEntry::name`, the `DentryCache`'s
+    key, `ParentTarget::name`, `compute_cwd_path`'s result, `OpenFile::path`
+    (`Arc<[u8]>`: the path `/proc/<pid>/fd` reads back, the base of a
+    relative open's, and the cwd's fallback), and the paths
+    `/proc/<pid>/maps` names for file mappings. No layer checks a name for
+    UTF-8, so an ext4 entry whose name isn't is listed, looked up,
+    unlinked and renamed like any other (but see #308 below), and `getcwd`
+    under it gives its bytes. Text shows a name or path through
+    `lumen_vfs::Escaped`, never lossily (U+FFFD would name another file):
+    UTF-8 as it is, except an ASCII control character and a byte that
+    isn't UTF-8 as `\xNN`, `\` as `\\`, and any other character
+    `char::escape_debug` escapes as `\u{..}` (C1 controls, bidi overrides,
+    and also nonspacing and enclosing marks, the `Grapheme_Extend` set,
+    U+00A0 and U+00AD, so a decomposed accent shows apart from its
+    precomposed letter; a spacing mark or decomposed Hangul passes as it
+    is, still in bytes of its own). Its users: log lines, `vfstest ls` and
+    `vfstest readlink` output, and an exec error's `PT_INTERP` path.
+    `/proc/<pid>/maps` prints the raw bytes, a newline as `\012` (Linux's
+    `seq_path`). Two exceptions stay text: mount paths
+    (`MountTable::mount`, `/proc/mounts`; only the kernel mounts, at `/`,
+    `/tmp`, `/dev` and `/proc`), and the paths a binary is loaded by
+    (`Exec::from_path`, `ImageFile::path`, so an ELF image's maps lines,
+    and `/proc/<pid>/exe`, read from `exe_path`): `linux /path` takes the
+    shell's argument, and a `PT_INTERP` path that isn't UTF-8 is refused
+    (`ExecError::InterpPathNotUtf8`); there is no `execve` yet.
+    **Caveat (#308):** `ext4plus` hashes a hashed (htree) directory's names
+    with signed bytes and never reads the superblock's unsigned-hash flag,
+    and an htree lookup has no linear fallback. On a volume made where
+    `char` is unsigned (`mke2fs` on aarch64 Linux), a name with a byte of
+    0x80 or more (UTF-8 or not) in such a directory is listed by `readdir`
+    but can be missed by `lookup`, `unlink`, `rmdir` or `rename` (when its
+    signed hash picks another leaf than its real one); and an entry Lumen
+    creates or renames to there is filed under the signed hash, where Linux
+    won't find it (Lumen's own `readdir` still lists it) until `e2fsck -fD`
+    reindexes the directory. Lumen's images are made where `char` is
+    signed, so no test meets it.
   - **Read-only mounts and special files (#291):** `open_inode` (a write
     open: `O_WRONLY`, `O_RDWR`, `O_TRUNC`) and `check_access` (`W_OK`)
     skip their `-EROFS` for a special file, by its type alone
@@ -5660,7 +5695,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     with their process or fd, and pids only grow. Each lookup of one builds
     a fresh inode, so two opens of the same `/proc/<pid>` file don't share
     advisory locks or an open count.
-  - `DentryCache`: keyed by `(parent_dev, parent_ino, ComponentName)`, storing
+  - `DentryCache`: keyed by `(parent_dev, parent_ino, name)` (the name a `Box<[u8]>`), storing
     child `(DevId, Ino)` with immediate invalidation on `unlink`, `rmdir`,
     `rename`, and `mount`/`umount`, and bounded at 4096 entries (oldest
     first out). A cached name is returned without asking the filesystem,
@@ -5721,7 +5756,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 - **Open file descriptions vs FD table:**
   - `FdEntry { file: Arc<OpenFile>, cloexec: bool }` in per-process `FdTable`
     (capacity `MAX_FDS = 1024`).
-  - `OpenFile { id: OpenFileId, inode: Arc<VfsInode>, path: Arc<str>, flags: OpenFlags, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64> }`.
+  - `OpenFile { id: OpenFileId, inode: Arc<VfsInode>, path: Arc<[u8]>, flags: OpenFlags, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64> }`.
   - **Opening (#262):** `open_inode_guarded` returns an `Opened` (the
     `OpenGuard` it took before its last liveness check, Gate 6 above, the
     path, and the flags it checked) and `OpenFile::from_opened` takes that

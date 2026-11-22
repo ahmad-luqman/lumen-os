@@ -581,7 +581,7 @@ fn i_block_holds_no_block_numbers(inode: &Inode) -> bool {
             && inode.blocks() == 0)
 }
 
-fn entry_name(name: &str) -> Result<DirEntryName<'_>, VfsError> {
+fn entry_name(name: &[u8]) -> Result<DirEntryName<'_>, VfsError> {
     if name.len() > lumen_vfs::NAME_MAX {
         return Err(VfsError::NameTooLong);
     }
@@ -995,8 +995,6 @@ pub struct Ext4Inode {
     /// The errno of the page-fill read failure last logged, 0 once a fill
     /// succeeds: one warning per failing streak and kind of error.
     read_errno: AtomicU32,
-    /// A directory listing skipped a name that isn't UTF-8 and said so.
-    warned_non_utf8: AtomicBool,
     /// A listing found the directory's records and `ReadDir` disagreeing,
     /// or a malformed record, and said so (once).
     warned_bad_listing: AtomicBool,
@@ -1158,7 +1156,6 @@ impl Ext4Inode {
             detached: AtomicBool::new(false),
             writeback_errno: AtomicU32::new(0),
             read_errno: AtomicU32::new(0),
-            warned_non_utf8: AtomicBool::new(false),
             warned_bad_listing: AtomicBool::new(false),
             meta: SleepMutex::new(meta),
             pages: SleepMutex::new(PageCache::new_ext4()),
@@ -2521,7 +2518,7 @@ impl VfsInode for Ext4Inode {
         })
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -2538,14 +2535,14 @@ impl VfsInode for Ext4Inode {
         Ok(child as Arc<dyn VfsInode>)
     }
 
-    fn create(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.shared.read_only {
             return Err(VfsError::RoFs);
         }
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
@@ -2574,14 +2571,14 @@ impl VfsInode for Ext4Inode {
         Ok(child as Arc<dyn VfsInode>)
     }
 
-    fn mkdir(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.shared.read_only {
             return Err(VfsError::RoFs);
         }
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
@@ -2653,14 +2650,14 @@ impl VfsInode for Ext4Inode {
         Ok(child as Arc<dyn VfsInode>)
     }
 
-    fn unlink(&self, name: &str) -> Result<(), VfsError> {
+    fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
         if self.shared.read_only {
             return Err(VfsError::RoFs);
         }
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::IsDir);
         }
         let dname = entry_name(name)?;
@@ -2743,17 +2740,17 @@ impl VfsInode for Ext4Inode {
         }
     }
 
-    fn rmdir(&self, name: &str) -> Result<(), VfsError> {
+    fn rmdir(&self, name: &[u8]) -> Result<(), VfsError> {
         if self.shared.read_only {
             return Err(VfsError::RoFs);
         }
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
-        if name == "." {
+        if name == b"." {
             return Err(VfsError::Inval);
         }
-        if name == ".." {
+        if name == b".." {
             return Err(VfsError::NotEmpty);
         }
         let dname = entry_name(name)?;
@@ -2853,7 +2850,7 @@ impl VfsInode for Ext4Inode {
         }
     }
 
-    fn link(&self, name: &str, target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+    fn link(&self, name: &[u8], target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
         if self.shared.read_only {
             return Err(VfsError::RoFs);
         }
@@ -2869,7 +2866,7 @@ impl VfsInode for Ext4Inode {
         if target.is_detached() {
             return Err(VfsError::NoEnt);
         }
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::Exist);
         }
         let dname = entry_name(name)?;
@@ -2940,7 +2937,7 @@ impl VfsInode for Ext4Inode {
         Ok(())
     }
 
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn symlink(&self, name: &[u8], target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.shared.read_only {
             return Err(VfsError::RoFs);
         }
@@ -2953,7 +2950,7 @@ impl VfsInode for Ext4Inode {
         if target.len() >= lumen_vfs::PATH_MAX {
             return Err(VfsError::NameTooLong);
         }
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return Err(VfsError::Exist);
         }
         let mut meta = self.meta.lock();
@@ -2979,9 +2976,9 @@ impl VfsInode for Ext4Inode {
         // fails it doesn't hand back the inode it allocated, which then
         // couldn't be freed.
         let built = if target.len() <= 59 {
-            Self::write_inline_symlink_target(&inner, sym, target.as_bytes())
+            Self::write_inline_symlink_target(&inner, sym, target)
         } else {
-            ext4_write_all(&inner.ext4, &mut sym, target.as_bytes(), 0).map_err(map_ext4_err).map(|()| sym)
+            ext4_write_all(&inner.ext4, &mut sym, target, 0).map_err(map_ext4_err).map(|()| sym)
         };
         let sym_disk =
             match built.and_then(|mut sym| parent_dir.link(dname, &mut sym).map(|()| sym).map_err(map_ext4_err)) {
@@ -3020,9 +3017,9 @@ impl VfsInode for Ext4Inode {
 
     fn rename(
         &self,
-        old_name: &str,
+        old_name: &[u8],
         new_dir: &Arc<dyn VfsInode>,
-        new_name: &str,
+        new_name: &[u8],
         flags: RenameFlags,
     ) -> Result<(), VfsError> {
         let flags = flags.validate()?;
@@ -3041,7 +3038,7 @@ impl VfsInode for Ext4Inode {
         if new_dir.is_detached() {
             return Err(VfsError::NoEnt);
         }
-        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+        if old_name == b"." || old_name == b".." || new_name == b"." || new_name == b".." {
             return Err(VfsError::Inval);
         }
         let old_dname = entry_name(old_name)?;
@@ -4033,25 +4030,8 @@ impl VfsInode for Ext4Inode {
             if pos < cursor {
                 continue;
             }
-            // VFS names are UTF-8 (#268): a name that isn't is skipped, and
-            // logged once per directory. Listing it lossily would be worse:
-            // the lossy name doesn't round-trip, so nothing could open or
-            // remove it, and getcwd (which rebuilds paths from readdir names)
-            // could resolve it to a different directory.
-            let file_name = entry.file_name();
-            let Ok(name) = core::str::from_utf8(file_name.as_ref()) else {
-                if !self.warned_non_utf8.swap(true, Ordering::AcqRel) {
-                    warn!(
-                        target: "vfs",
-                        "ext4 {:?} directory {}: skipping entries whose names aren't UTF-8 (inode {})",
-                        self.shared.dev,
-                        self.disk_ino,
-                        entry.inode
-                    );
-                }
-                continue;
-            };
-            let name = String::from(name);
+            // The name's bytes, UTF-8 or not (#268).
+            let name = entry.file_name().as_ref().to_vec();
             let inode_type = match entry.file_type() {
                 Ok(ft) => map_file_type(ft),
                 Err(_) => InodeType::File,
@@ -4664,16 +4644,16 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::kassert_eq;
         let m = mount(build_1k_blockmap_image(512), 200)?;
-        let f = m.root.create("pages.bin", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"pages.bin", 0o644).map_err(|_| "create")?;
         let data = pattern(2 * PAGE_SIZE + 300, 7);
         kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
         f.sync(false).map_err(|_| "sync")?;
         let target: alloc::string::String = core::iter::repeat_n('t', 2000).collect();
-        m.root.symlink("long", &target).map_err(|_| "symlink")?;
+        m.root.symlink(b"long", target.as_bytes()).map_err(|_| "symlink")?;
         let ro = remount_ro(&m, 201)?;
-        let got = read_all(&ro.root_inode().lookup("pages.bin").map_err(|_| "ro lookup")?)?;
+        let got = read_all(&ro.root_inode().lookup(b"pages.bin").map_err(|_| "ro lookup")?)?;
         kassert_eq!(got, data);
-        let link = ro.root_inode().lookup("long").map_err(|_| "ro lookup long")?;
+        let link = ro.root_inode().lookup(b"long").map_err(|_| "ro lookup long")?;
         kassert_eq!(link.readlink().map_err(|_| "readlink")?, target.into_bytes());
         Ok(())
     }
@@ -4690,13 +4670,13 @@ crate::ktest!(
         let mut kept = alloc::vec::Vec::new();
 
         // A bystander file takes the target's first temporary name.
-        let target = m.root.create("t", 0o644).map_err(|_| "create t")?;
+        let target = m.root.create(b"t", 0o644).map_err(|_| "create t")?;
         target.write_at(0, b"old").map_err(|_| "write t")?;
         let name = alloc::format!(".lumen-rename-{}", target.ino());
-        let bystander = m.root.create(&name, 0o644).map_err(|_| "create bystander")?;
+        let bystander = m.root.create(name.as_bytes(), 0o644).map_err(|_| "create bystander")?;
         bystander.write_at(0, b"mine").map_err(|_| "write bystander")?;
         kept.push((name, b"mine".to_vec()));
-        let s = m.root.create("s", 0o644).map_err(|_| "create s")?;
+        let s = m.root.create(b"s", 0o644).map_err(|_| "create s")?;
         s.write_at(0, b"new").map_err(|_| "write s")?;
         // Outside the VFS's inode cache a dropped inode's dirty pages go
         // with it, so each file is written back before its handle drops.
@@ -4705,24 +4685,24 @@ crate::ktest!(
         }
         drop((target, bystander, s));
         let free = free_inodes(&m.fs);
-        m.root.rename("s", &m.root, "t", RenameFlags(0)).map_err(|_| "rename s over t")?;
+        m.root.rename(b"s", &m.root, b"t", RenameFlags(0)).map_err(|_| "rename s over t")?;
         kassert_eq!(free_inodes(&m.fs), free + 1);
         kept.push(("t".into(), b"new".to_vec()));
 
         // The rename's own destination is the target's temporary name. In
         // a directory of its own: the freed target's number is reused, and
         // its temporary name would be the bystander's above.
-        let d = m.root.mkdir("d", 0o755).map_err(|_| "mkdir d")?;
-        let a = d.create("a", 0o644).map_err(|_| "create a")?;
+        let d = m.root.mkdir(b"d", 0o755).map_err(|_| "mkdir d")?;
+        let a = d.create(b"a", 0o644).map_err(|_| "create a")?;
         let own = alloc::format!(".lumen-rename-{}", a.ino());
         drop(a);
-        d.rename("a", &d, &own, RenameFlags(0)).map_err(|_| "rename a")?;
-        let b = d.create("b", 0o644).map_err(|_| "create b")?;
+        d.rename(b"a", &d, own.as_bytes(), RenameFlags(0)).map_err(|_| "rename a")?;
+        let b = d.create(b"b", 0o644).map_err(|_| "create b")?;
         b.write_at(0, b"bee").map_err(|_| "write b")?;
         b.sync(false).map_err(|_| "sync b")?;
         drop(b);
         let free = free_inodes(&m.fs);
-        d.rename("b", &d, &own, RenameFlags(0)).map_err(|_| "rename b over own")?;
+        d.rename(b"b", &d, own.as_bytes(), RenameFlags(0)).map_err(|_| "rename b over own")?;
         kassert_eq!(free_inodes(&m.fs), free + 1);
         drop(d);
 
@@ -4730,11 +4710,11 @@ crate::ktest!(
         let ro = remount_ro(&m, 206)?;
         kassert_eq!(free_inodes(&ro), free_inodes(&m.fs));
         for (name, data) in kept {
-            let got = read_all(&ro.root_inode().lookup(&name).map_err(|_| "ro lookup")?)?;
+            let got = read_all(&ro.root_inode().lookup(name.as_bytes()).map_err(|_| "ro lookup")?)?;
             kassert_eq!(got, data);
         }
-        let ro_d = ro.root_inode().lookup("d").map_err(|_| "ro lookup d")?;
-        kassert_eq!(read_all(&ro_d.lookup(&own).map_err(|_| "ro lookup own")?)?, b"bee".to_vec());
+        let ro_d = ro.root_inode().lookup(b"d").map_err(|_| "ro lookup d")?;
+        kassert_eq!(read_all(&ro_d.lookup(own.as_bytes()).map_err(|_| "ro lookup own")?)?, b"bee".to_vec());
         Ok(())
     }
 );
@@ -4747,7 +4727,7 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         let m = mount(crate::vfs::build_minimal_ext4_image(), 207)?;
-        let f = m.root.create("sparse", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"sparse", 0o644).map_err(|_| "create")?;
         let blocks = |f: &Arc<dyn VfsInode>| f.stat().map(|s| s.blocks).map_err(|_| "stat");
         f.truncate(1 << 30).map_err(|_| "truncate")?;
         kassert_eq!(blocks(&f)?, 0);
@@ -4757,7 +4737,7 @@ crate::ktest!(
         let after = blocks(&f)?;
         kassert!(after > 0 && after <= 64);
         let ro = remount_ro(&m, 208)?;
-        let ro_blocks = ro.root_inode().lookup("sparse").map_err(|_| "ro")?.stat().map_err(|_| "ro stat")?.blocks;
+        let ro_blocks = ro.root_inode().lookup(b"sparse").map_err(|_| "ro")?.stat().map_err(|_| "ro stat")?.blocks;
         kassert_eq!(after, ro_blocks);
         Ok(())
     }
@@ -4772,11 +4752,11 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         let m = mount(build_1k_blockmap_image(512), 202)?;
-        let keep = m.root.create("keep.bin", 0o644).map_err(|_| "create keep")?;
+        let keep = m.root.create(b"keep.bin", 0o644).map_err(|_| "create keep")?;
         let data = pattern(BS, 3);
         kassert_eq!(keep.write_at(0, &data).map_err(|_| "write keep")?, data.len());
         keep.sync(false).map_err(|_| "sync keep")?;
-        let dev = m.root.create("null", 0o644).map_err(|_| "create node")?;
+        let dev = m.root.create(b"null", 0o644).map_err(|_| "create node")?;
         let (keep_ino, dev_ino) = (keep.ino(), dev.ino());
         drop((keep, dev));
         m.fs.sync().map_err(|_| "fs sync")?;
@@ -4790,12 +4770,12 @@ crate::ktest!(
 
         let m = mount(img, 203)?;
         let (inodes, blocks) = (free_inodes(&m.fs), free_blocks(&m.fs));
-        m.root.unlink("null").map_err(|_| "unlink node")?;
+        m.root.unlink(b"null").map_err(|_| "unlink node")?;
         kassert_eq!(free_inodes(&m.fs), inodes + 1);
         kassert_eq!(free_blocks(&m.fs), blocks);
         let ro = remount_ro(&m, 204)?;
         kassert_eq!(free_blocks(&ro), blocks);
-        kassert_eq!(read_all(&ro.root_inode().lookup("keep.bin").map_err(|_| "ro lookup")?)?, data);
+        kassert_eq!(read_all(&ro.root_inode().lookup(b"keep.bin").map_err(|_| "ro lookup")?)?, data);
         Ok(())
     }
 );
@@ -4812,9 +4792,9 @@ crate::ktest!(
         let m = mount(build_1k_blockmap_image(128), 205)?;
         let mut inos = Vec::new();
         for name in ["null", "wide", "sda1", "plain"] {
-            inos.push(m.root.create(name, 0o644).map_err(|_| "create")?.ino());
+            inos.push(m.root.create(name.as_bytes(), 0o644).map_err(|_| "create")?.ino());
         }
-        let plain = m.root.lookup("plain").map_err(|_| "lookup plain")?;
+        let plain = m.root.lookup(b"plain").map_err(|_| "lookup plain")?;
         plain.write_at(0, b"x").map_err(|_| "write plain")?;
         plain.sync(false).map_err(|_| "sync plain")?;
         drop(plain);
@@ -4842,24 +4822,24 @@ crate::ktest!(
         let m = mount(img.clone(), 206)?;
         kassert_eq!(m.root.stat().map_err(|_| "root stat")?.rdev, DevId::default());
         for (name, ty, rdev) in expect {
-            let st = m.root.lookup(name).map_err(|_| "lookup")?.stat().map_err(|_| "stat")?;
+            let st = m.root.lookup(name.as_bytes()).map_err(|_| "lookup")?.stat().map_err(|_| "stat")?;
             kassert_eq!(st.inode_type, ty);
             kassert_eq!(st.rdev, rdev);
         }
         let ro = mount_ro_image(img, 207)?;
         kassert_eq!(ro.root_inode().stat().map_err(|_| "ro root stat")?.rdev, DevId::default());
         for (name, _, rdev) in expect {
-            let st = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
+            let st = ro.root_inode().lookup(name.as_bytes()).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
             kassert_eq!(st.rdev, rdev);
         }
         // Unlinking the last link zeroes `i_block` on disk and frees the
         // inode; a node still held keeps the number it was loaded with.
-        let held = m.root.lookup("null").map_err(|_| "lookup null")?;
-        m.root.unlink("null").map_err(|_| "unlink null")?;
+        let held = m.root.lookup(b"null").map_err(|_| "lookup null")?;
+        m.root.unlink(b"null").map_err(|_| "unlink null")?;
         let st = held.stat().map_err(|_| "stat held")?;
         kassert_eq!(st.nlink, 0);
         kassert_eq!(st.rdev, DevId::makedev(1, 3));
-        kassert!(m.root.lookup("null").is_err());
+        kassert!(m.root.lookup(b"null").is_err());
         Ok(())
     }
 );
@@ -4885,33 +4865,34 @@ crate::ktest!(
             ("e", (ts(TIME_MIN, 9), ts(TIME_MAX_EXTRA, 9)), None),
         ];
         for (name, (atime, mtime), held) in cases {
-            let f = m.root.create(name, 0o644).map_err(|_| "create")?;
+            let f = m.root.create(name.as_bytes(), 0o644).map_err(|_| "create")?;
             f.set_times(SetTime::Set(atime), SetTime::Set(mtime)).map_err(|_| "set_times")?;
             kassert_eq!(times(&f)?, held.unwrap_or((atime, mtime)));
         }
         let ro = remount_ro(&m, 209)?;
         for (name, (atime, mtime), held) in cases {
-            let back = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?;
+            let back = ro.root_inode().lookup(name.as_bytes()).map_err(|_| "ro lookup")?;
             kassert_eq!(times(&back)?, held.unwrap_or((atime, mtime)));
         }
 
         // The metadata flush rewrites every time from memory: after a write,
         // the write's mtime and ctime and the atime set before it; after a
         // link (ctime alone), the atime and mtime set before it.
-        let f = m.root.lookup("a").map_err(|_| "lookup")?;
+        let f = m.root.lookup(b"a").map_err(|_| "lookup")?;
         let atime = ts(-2_000_000_000, 500);
         f.set_times(SetTime::Set(atime), SetTime::Omit).map_err(|_| "set atime")?;
         f.write_at(0, b"x").map_err(|_| "write")?;
         f.sync(false).map_err(|_| "sync")?;
-        let g = m.root.lookup("c").map_err(|_| "lookup c")?;
+        let g = m.root.lookup(b"c").map_err(|_| "lookup c")?;
         let (g_atime, g_mtime) = (ts(0x2_8000_0001, 3), ts(-1_234_567_890, 999_999_999));
         g.set_times(SetTime::Set(g_atime), SetTime::Set(g_mtime)).map_err(|_| "set c")?;
-        m.root.link("c2", &g).map_err(|_| "link")?;
+        m.root.link(b"c2", &g).map_err(|_| "link")?;
         m.fs.sync().map_err(|_| "fs sync")?;
         let ro = remount_ro(&m, 210)?;
         for (name, file) in [("a", &f), ("c", &g)] {
             let before = file.stat().map_err(|_| "stat")?;
-            let after = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
+            let after =
+                ro.root_inode().lookup(name.as_bytes()).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
             kassert_eq!((after.atime, after.mtime, after.ctime), (before.atime, before.mtime, before.ctime));
         }
         kassert_eq!(f.stat().map_err(|_| "stat a")?.atime, atime);
@@ -4940,7 +4921,10 @@ crate::ktest!(
         let mut inos = Vec::new();
         for extra_isize in sizes {
             for k in 0..cases.len() {
-                inos.push((extra_isize, m.root.create(&name(extra_isize, k), 0o644).map_err(|_| "create")?.ino()));
+                inos.push((
+                    extra_isize,
+                    m.root.create(name(extra_isize, k).as_bytes(), 0o644).map_err(|_| "create")?.ino(),
+                ));
             }
         }
         m.fs.sync().map_err(|_| "fs sync")?;
@@ -4957,7 +4941,7 @@ crate::ktest!(
         for extra_isize in sizes {
             let (ex_c, ex_m, ex_a) = (extra_isize >= 8, extra_isize >= 12, extra_isize >= 16);
             for (k, (atime, mtime)) in cases.into_iter().enumerate() {
-                let f = m.root.lookup(&name(extra_isize, k)).map_err(|_| "lookup")?;
+                let f = m.root.lookup(name(extra_isize, k).as_bytes()).map_err(|_| "lookup")?;
                 f.set_times(SetTime::Set(atime), SetTime::Set(mtime)).map_err(|_| "set_times")?;
                 let st = f.stat().map_err(|_| "stat")?;
                 kassert_eq!((st.atime, st.mtime), (truncate_time(atime, ex_a), truncate_time(mtime, ex_m)));
@@ -4968,14 +4952,15 @@ crate::ktest!(
         let ro = remount_ro(&m, 213)?;
         for (name, inode) in &set {
             let st = inode.stat().map_err(|_| "stat")?;
-            let back = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
+            let back =
+                ro.root_inode().lookup(name.as_bytes()).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
             kassert_eq!((back.atime, back.mtime, back.ctime), (st.atime, st.mtime, st.ctime));
         }
 
         // A write sets mtime and ctime in memory only: as the inode will hold
         // them, so the flush changes nothing `stat` shows.
         for extra_isize in sizes {
-            let f = m.root.lookup(&name(extra_isize, 0)).map_err(|_| "lookup")?;
+            let f = m.root.lookup(name(extra_isize, 0).as_bytes()).map_err(|_| "lookup")?;
             f.write_at(0, b"x").map_err(|_| "write")?;
             let written = f.stat().map_err(|_| "stat written")?;
             kassert_eq!(written.mtime.nsec != 0, extra_isize >= 12);
@@ -5003,15 +4988,15 @@ crate::ktest!(
         let m = mount(build_1k_blockmap_image(128), 216)?;
         let mut inos = Vec::new();
         for name in files {
-            inos.push(m.root.create(name, 0o644).map_err(|_| "create")?.ino());
+            inos.push(m.root.create(name.as_bytes(), 0o644).map_err(|_| "create")?.ino());
         }
         for name in dirs {
-            inos.push(m.root.mkdir(name, 0o755).map_err(|_| "mkdir")?.ino());
+            inos.push(m.root.mkdir(name.as_bytes(), 0o755).map_err(|_| "mkdir")?.ino());
         }
         // What the rename, unlink and rmdir steps take away.
-        m.root.lookup("rename").and_then(|d| d.create("c", 0o644)).map_err(|_| "create rename/c")?;
-        m.root.lookup("unlink").and_then(|d| d.create("c", 0o644)).map_err(|_| "create unlink/c")?;
-        m.root.lookup("rmdir").and_then(|d| d.mkdir("sub", 0o755)).map_err(|_| "mkdir rmdir/sub")?;
+        m.root.lookup(b"rename").and_then(|d| d.create(b"c", 0o644)).map_err(|_| "create rename/c")?;
+        m.root.lookup(b"unlink").and_then(|d| d.create(b"c", 0o644)).map_err(|_| "create unlink/c")?;
+        m.root.lookup(b"rmdir").and_then(|d| d.mkdir(b"sub", 0o755)).map_err(|_| "mkdir rmdir/sub")?;
         m.fs.sync().map_err(|_| "fs sync")?;
         let mut img = image(&m)?;
         drop(m);
@@ -5027,20 +5012,20 @@ crate::ktest!(
             ("chmod", false, &|i| i.set_mode(0o600)),
             ("chown", false, &|i| i.set_owner(Some(1), Some(1))),
             ("truncate", true, &|i| i.truncate(3)),
-            ("link", false, &|i| m.root.link("linked", i)),
-            ("create", true, &|d| d.create("c", 0o644).map(drop)),
-            ("rename", true, &|d| d.rename("c", d, "c2", RenameFlags(0))),
-            ("unlink", true, &|d| d.unlink("c")),
-            ("mkdir", true, &|d| d.mkdir("sub", 0o755).map(drop)),
-            ("rmdir", true, &|d| d.rmdir("sub")),
-            ("symlink", true, &|d| d.symlink("s", "c").map(drop)),
+            ("link", false, &|i| m.root.link(b"linked", i)),
+            ("create", true, &|d| d.create(b"c", 0o644).map(drop)),
+            ("rename", true, &|d| d.rename(b"c", d, b"c2", RenameFlags(0))),
+            ("unlink", true, &|d| d.unlink(b"c")),
+            ("mkdir", true, &|d| d.mkdir(b"sub", 0o755).map(drop)),
+            ("rmdir", true, &|d| d.rmdir(b"sub")),
+            ("symlink", true, &|d| d.symlink(b"s", b"c").map(drop)),
         ];
         let mut done = Vec::new();
         let mut wrong: Vec<&str> = Vec::new();
         for (k, (name, sets_mtime, step)) in steps.into_iter().enumerate() {
             let now = Timespec { sec: 1_800_000_000 + 10 * k as i64, nsec: 123_456_789 };
             set_clock(&m.fs, Some(now));
-            let inode = m.root.lookup(name).map_err(|_| "lookup")?;
+            let inode = m.root.lookup(name.as_bytes()).map_err(|_| "lookup")?;
             step(&inode).map_err(|_| "step")?;
             let st = inode.stat().map_err(|_| "stat")?;
             let held = Timespec { sec: now.sec, nsec: 0 };
@@ -5056,7 +5041,8 @@ crate::ktest!(
         let mut lost: Vec<&str> = Vec::new();
         for (name, inode) in &done {
             let st = inode.stat().map_err(|_| "stat")?;
-            let back = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
+            let back =
+                ro.root_inode().lookup(name.as_bytes()).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
             if (back.atime, back.mtime, back.ctime) != (st.atime, st.mtime, st.ctime) {
                 lost.push(name);
             }
@@ -5080,10 +5066,10 @@ crate::ktest!(
         set_clock(&m.fs, Some(now));
         let long: alloc::string::String = core::iter::repeat_n('t', 100).collect();
         let made = [
-            ("f", m.root.create("f", 0o644).map_err(|_| "create")?),
-            ("d", m.root.mkdir("d", 0o755).map_err(|_| "mkdir")?),
-            ("s", m.root.symlink("s", "f").map_err(|_| "symlink")?),
-            ("l", m.root.symlink("l", &long).map_err(|_| "long symlink")?),
+            ("f", m.root.create(b"f", 0o644).map_err(|_| "create")?),
+            ("d", m.root.mkdir(b"d", 0o755).map_err(|_| "mkdir")?),
+            ("s", m.root.symlink(b"s", b"f").map_err(|_| "symlink")?),
+            ("l", m.root.symlink(b"l", long.as_bytes()).map_err(|_| "long symlink")?),
         ];
         for (_, inode) in &made {
             let st = inode.stat().map_err(|_| "stat")?;
@@ -5094,7 +5080,7 @@ crate::ktest!(
         m.fs.sync().map_err(|_| "fs sync")?;
         let ro = remount_ro(&m, 215)?;
         for (name, _) in &made {
-            let st = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
+            let st = ro.root_inode().lookup(name.as_bytes()).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
             kassert_eq!((st.atime, st.mtime, st.ctime), (now, now, now));
         }
         let root = ro.root_inode().stat().map_err(|_| "ro root stat")?;
@@ -5120,7 +5106,7 @@ crate::ktest!(
         img[1024 + 0x64..1024 + 0x68].copy_from_slice(&(ro_compat | 0x1000).to_le_bytes());
         let m = self::ktest_util::mount(img, 202)?;
         kassert!(m.fs.read_only());
-        kassert_eq!(m.root.create("x", 0o644).err(), Some(VfsError::RoFs));
+        kassert_eq!(m.root.create(b"x", 0o644).err(), Some(VfsError::RoFs));
         Ok(())
     }
 );
@@ -5130,16 +5116,16 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 203)?;
-        m.root.create("f", 0o644).map_err(|_| "create f")?;
-        let d = m.root.mkdir("d", 0o755).map_err(|_| "mkdir d")?;
+        m.root.create(b"f", 0o644).map_err(|_| "create f")?;
+        let d = m.root.mkdir(b"d", 0o755).map_err(|_| "mkdir d")?;
         let d_ino = d.ino();
-        m.root.rmdir("d").map_err(|_| "rmdir d")?;
-        let e = m.root.mkdir("e", 0o755).map_err(|_| "mkdir e")?;
+        m.root.rmdir(b"d").map_err(|_| "rmdir d")?;
+        let e = m.root.mkdir(b"e", 0o755).map_err(|_| "mkdir e")?;
         kassert_eq!(e.ino(), d_ino); // the number was reused
         // A rename resolved against the old `/d` must not land in `/e`.
-        kassert_eq!(m.root.rename("f", &d, "g", RenameFlags(0)).err(), Some(VfsError::NoEnt));
-        kassert!(e.lookup("g").is_err());
-        kassert!(m.root.lookup("f").is_ok());
+        kassert_eq!(m.root.rename(b"f", &d, b"g", RenameFlags(0)).err(), Some(VfsError::NoEnt));
+        kassert!(e.lookup(b"g").is_err());
+        kassert!(m.root.lookup(b"f").is_ok());
         Ok(())
     }
 );
@@ -5151,21 +5137,21 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::kassert_eq;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 204)?;
-        m.root.create("dup", 0o644).map_err(|_| "create dup")?;
+        m.root.create(b"dup", 0o644).map_err(|_| "create dup")?;
         let before = free_inodes(&m.fs);
         let blk = ROOT_DIR_BLOCK_4K * 4096;
         m.cache.fail_reads_in(blk, blk + 4096, 1);
-        kassert_eq!(m.root.create("dup", 0o644).err(), Some(VfsError::Io));
+        kassert_eq!(m.root.create(b"dup", 0o644).err(), Some(VfsError::Io));
         m.cache.fail_reads_in(blk, blk + 4096, 1);
-        kassert_eq!(m.root.mkdir("dup2", 0o755).err(), Some(VfsError::Io));
+        kassert_eq!(m.root.mkdir(b"dup2", 0o755).err(), Some(VfsError::Io));
         m.cache.fail_reads_in(blk, blk + 4096, 1);
-        kassert_eq!(m.root.symlink("dup3", "t").err(), Some(VfsError::Io));
+        kassert_eq!(m.root.symlink(b"dup3", b"t").err(), Some(VfsError::Io));
         // `link` adds no inode, but must not take the read error for "absent"
         // either (ext4plus would then answer EEXIST, not EIO).
-        let target = m.root.lookup("dup").map_err(|_| "lookup dup")?;
-        m.root.link("dup_link", &target).map_err(|_| "link")?;
+        let target = m.root.lookup(b"dup").map_err(|_| "lookup dup")?;
+        m.root.link(b"dup_link", &target).map_err(|_| "link")?;
         m.cache.fail_reads_in(blk, blk + 4096, 1);
-        kassert_eq!(m.root.link("dup_link", &target).err(), Some(VfsError::Io));
+        kassert_eq!(m.root.link(b"dup_link", &target).err(), Some(VfsError::Io));
         m.cache.clear();
         kassert_eq!(target.stat().map_err(|_| "stat dup")?.nlink, 2);
         kassert_eq!(free_inodes(&m.fs), before);
@@ -5190,9 +5176,9 @@ crate::ktest!(
                 root.write(&inner.ext4).map_err(|_| "write root")?;
             }
             let (inodes, blocks) = (free_inodes(&m.fs), free_blocks(&m.fs));
-            kassert_eq!(m.root.mkdir("sub", 0o755).err(), Some(VfsError::NoSpc));
+            kassert_eq!(m.root.mkdir(b"sub", 0o755).err(), Some(VfsError::NoSpc));
             kassert_eq!((free_inodes(&m.fs), free_blocks(&m.fs)), (inodes, blocks));
-            kassert_eq!(m.root.lookup("sub").err(), Some(VfsError::NoEnt));
+            kassert_eq!(m.root.lookup(b"sub").err(), Some(VfsError::NoEnt));
         }
         Ok(())
     }
@@ -5242,10 +5228,10 @@ crate::ktest!(
                 let root_nlink = m.root.stat().map_err(|_| "stat root")?.nlink;
                 m.cache.arm_write(k);
                 let res = match kind {
-                    "file" => m.root.create("new", 0o644).map(drop),
-                    "dir" => m.root.mkdir("new", 0o755).map(drop),
-                    "short-symlink" => m.root.symlink("new", "short/target").map(drop),
-                    _ => m.root.symlink("new", &long).map(drop),
+                    "file" => m.root.create(b"new", 0o644).map(drop),
+                    "dir" => m.root.mkdir(b"new", 0o755).map(drop),
+                    "short-symlink" => m.root.symlink(b"new", b"short/target").map(drop),
+                    _ => m.root.symlink(b"new", long.as_bytes()).map(drop),
                 };
                 let reached = m.cache.writes.load(Ordering::Acquire) >= k;
                 m.cache.clear();
@@ -5256,7 +5242,7 @@ crate::ktest!(
                 if res.is_err() {
                     failed += 1;
                     crate::ktest::diag(format_args!("{kind}: write {k} failed"));
-                    kassert!(m.root.lookup("new").is_err());
+                    kassert!(m.root.lookup(b"new").is_err());
                     kassert_eq!(free_inodes(&m.fs), before);
                     let ro = remount_ro(&m, minor + 1)?;
                     kassert_eq!(free_inodes(&ro), before);
@@ -5271,7 +5257,7 @@ crate::ktest!(
                     kassert_eq!(free_blocks(&ro), before_blocks - u64::from(inside_block_alloc));
                     kassert_eq!(ro.root_inode().stat().map_err(|_| "ro stat root")?.nlink, root_nlink);
                 } else {
-                    kassert!(m.root.lookup("new").is_ok());
+                    kassert!(m.root.lookup(b"new").is_ok());
                 }
                 k += 1;
             }
@@ -5291,7 +5277,7 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 215)?;
-        let big = m.root.create("big", 0o644).map_err(|_| "create big")?;
+        let big = m.root.create(b"big", 0o644).map_err(|_| "create big")?;
         let long = |i: u8| -> alloc::string::String {
             let mut s: alloc::string::String = core::iter::repeat_n('n', 254).collect();
             s.push((b'a' + i) as char);
@@ -5300,7 +5286,7 @@ crate::ktest!(
         // 15 entries of 255-byte names fill the root's 4 KiB block (as hard
         // links: the image has only 22 free inodes).
         for i in 0..15 {
-            m.root.link(&long(i), &big).map_err(|_| "link")?;
+            m.root.link(long(i).as_bytes(), &big).map_err(|_| "link")?;
         }
         let chunk = pattern(PAGE_SIZE, 3);
         for p in 0..256u64 {
@@ -5309,8 +5295,8 @@ crate::ktest!(
         kassert!(big.sync(false).is_err()); // out of space part-way
         kassert!(free_blocks(&m.fs) < CREATE_RESERVE_BLOCKS);
         let before = free_inodes(&m.fs);
-        kassert_eq!(m.root.create(&long(20), 0o644).err(), Some(VfsError::NoSpc));
-        kassert_eq!(m.root.mkdir(&long(21), 0o755).err(), Some(VfsError::NoSpc));
+        kassert_eq!(m.root.create(long(20).as_bytes(), 0o644).err(), Some(VfsError::NoSpc));
+        kassert_eq!(m.root.mkdir(long(21).as_bytes(), 0o755).err(), Some(VfsError::NoSpc));
         kassert_eq!(free_inodes(&m.fs), before);
         Ok(())
     }
@@ -5322,8 +5308,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 216)?;
-        let a = m.root.create("a", 0o644).map_err(|_| "create a")?;
-        let b = m.root.create("b", 0o644).map_err(|_| "create b")?;
+        let a = m.root.create(b"a", 0o644).map_err(|_| "create a")?;
+        let b = m.root.create(b"b", 0o644).map_err(|_| "create b")?;
         kassert!(a.ino() < b.ino()); // `a` is flushed first
         m.fs.sync().map_err(|_| "first sync")?; // nothing else (the root) left to write
         a.write_at(0, &pattern(PAGE_SIZE, 1)).map_err(|_| "write a")?;
@@ -5346,7 +5332,7 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::kassert_eq;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 217)?;
-        let f = m.root.create("edge", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"edge", 0o644).map_err(|_| "create")?;
         let max = m.fs.shared.max_file_size;
         kassert_eq!(max, ((1u64 << 32) - 1) * 4096);
         kassert_eq!(f.write_at(max, b"x").err(), Some(VfsError::FBig));
@@ -5363,7 +5349,7 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::kassert_eq;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 218)?;
-        let f = m.root.create("capped", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"capped", 0o644).map_err(|_| "create")?;
         // This mount isn't in the global tables, so reclaim can't free its
         // pages: three more pages reach the limit.
         let cur = page_cache::ext4_cached_pages();
@@ -5384,7 +5370,7 @@ crate::ktest!(
         use core::sync::atomic::Ordering as O;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 219)?;
         // 64 MiB apparent, one byte of data at the start.
-        let f = m.root.create("sparse", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"sparse", 0o644).map_err(|_| "create")?;
         f.write_at(0, b"S").map_err(|_| "write")?;
         f.truncate(64 << 20).map_err(|_| "extend")?;
         f.sync(false).map_err(|_| "sync")?;
@@ -5392,7 +5378,7 @@ crate::ktest!(
         f4.reclaim_clean_pages(16);
         f.inc_open_count();
         m.cache.reads.store(0, O::Release);
-        m.root.unlink("sparse").map_err(|_| "unlink")?;
+        m.root.unlink(b"sparse").map_err(|_| "unlink")?;
         let reads = m.cache.reads.load(O::Acquire);
         crate::ktest::diag(format_args!("reads during the unlink: {reads}"));
         kassert!(reads < 200); // not one per page of the 16384
@@ -5402,13 +5388,13 @@ crate::ktest!(
         kassert_eq!(&b, b"S\0");
         // Larger than the scan limit, data only at the start: the stop once
         // the data blocks are covered ends the scan long before the limit.
-        let big = m.root.create("sparse_big", 0o644).map_err(|_| "create big")?;
+        let big = m.root.create(b"sparse_big", 0o644).map_err(|_| "create big")?;
         big.write_at(0, b"B").map_err(|_| "write big")?;
         big.truncate((DETACHED_SCAN_LIMIT_PAGES as u64 + 1024) * PAGE_SIZE as u64).map_err(|_| "extend big")?;
         big.sync(false).map_err(|_| "sync big")?;
         m.fs.lookup_live_by_lock_id(big.lock_id()).ok_or("live big")?.reclaim_clean_pages(16);
         big.inc_open_count();
-        m.root.unlink("sparse_big").map_err(|_| "unlink big")?;
+        m.root.unlink(b"sparse_big").map_err(|_| "unlink big")?;
         kassert!(big.is_detached());
         kassert_eq!(big.read_at(0, &mut b).map_err(|_| "read big")?, 2);
         kassert_eq!(&b, b"B\0");
@@ -5416,16 +5402,16 @@ crate::ktest!(
         f.dec_open_count();
 
         // Data past the scan limit: refused rather than scanned for good.
-        let g = m.root.create("far", 0o644).map_err(|_| "create far")?;
+        let g = m.root.create(b"far", 0o644).map_err(|_| "create far")?;
         let far = (DETACHED_SCAN_LIMIT_PAGES as u64 + 16) * PAGE_SIZE as u64;
         g.write_at(far, b"F").map_err(|_| "write far")?;
         g.sync(false).map_err(|_| "sync far")?;
         let g4 = m.fs.lookup_live_by_lock_id(g.lock_id()).ok_or("live far")?;
         g4.reclaim_clean_pages(16);
         g.inc_open_count();
-        kassert_eq!(m.root.unlink("far").err(), Some(VfsError::NoSpc));
+        kassert_eq!(m.root.unlink(b"far").err(), Some(VfsError::NoSpc));
         kassert!(!g.is_detached());
-        kassert!(m.root.lookup("far").is_ok());
+        kassert!(m.root.lookup(b"far").is_ok());
         g.dec_open_count();
         Ok(())
     }
@@ -5469,22 +5455,54 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ext4_readdir_skips_names_that_are_not_utf8() {
+    fn ext4_names_that_are_not_utf8_are_listed_looked_up_renamed_and_removed() {
+        // #268: names are bytes. On `ktest_ext4_non_utf8`'s image, the name
+        // made not UTF-8 on disk is listed and looked up like its siblings;
+        // on a writable volume with one, it is renamed (to another name that
+        // isn't UTF-8, which reaches the disk), unlinked, and its directory
+        // then removes as empty.
         use self::ktest_util::*;
-        use crate::kassert;
-        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 220)?;
-        m.root.create("ab", 0o644).map_err(|_| "create")?;
-        let mut img = image(&m)?;
-        // Rename the entry on disk to the bytes ff fe (not UTF-8).
-        let dir = &mut img[(ktest_util::ROOT_DIR_BLOCK_4K as usize) * 4096..][..4096];
-        let at = dir.windows(2).position(|w| w == b"ab").ok_or("entry")?;
-        dir[at] = 0xff;
-        dir[at + 1] = 0xfe;
-        let ro = mount_ro_image(img, 221)?;
+        use crate::{kassert, kassert_eq};
+        let ro = crate::vfs::ktest_ext4_non_utf8(220)?;
+        let root = ro.root_inode();
         let mut out = Vec::new();
-        ro.root_inode().readdir(0, &mut out, 16).map_err(|_| "readdir")?;
-        kassert!(out.len() == 2); // "." and ".." only
-        kassert!(out.iter().all(|e| e.name == "." || e.name == ".."));
+        root.readdir(0, &mut out, 16).map_err(|_| "readdir")?;
+        let listed = out.iter().find(|e| e.name == b"\xff\xfe").ok_or("the name that isn't UTF-8 is listed")?;
+        let a0 = root.lookup(b"a0").map_err(|_| "lookup a0")?;
+        kassert_eq!(listed.ino, a0.ino());
+        kassert_eq!(root.lookup(b"\xff\xfe").map_err(|_| "lookup ff fe")?.ino(), a0.ino());
+        kassert_eq!(root.lookup(b"a3").err(), Some(VfsError::NoEnt));
+
+        // A writable volume whose `d/zqxj` is renamed on disk to `ff fe x j`.
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 244)?;
+        let d = m.root.mkdir(b"d", 0o755).map_err(|_| "mkdir d")?;
+        let f = d.create(b"zqxj", 0o644).map_err(|_| "create")?;
+        f.write_at(0, b"odd").map_err(|_| "write")?;
+        f.sync(false).map_err(|_| "sync")?;
+        drop((f, d));
+        let mut img = image(&m)?;
+        drop(m);
+        let at = img.windows(4).position(|w| w == b"zqxj").ok_or("the entry on disk")?;
+        kassert!(img.windows(4).filter(|w| *w == b"zqxj").count() == 1);
+        img[at] = 0xff;
+        img[at + 1] = 0xfe;
+        let m = mount(img, 270)?;
+        let d = m.root.lookup(b"d").map_err(|_| "lookup d")?;
+        let mut out = Vec::new();
+        d.readdir(0, &mut out, 16).map_err(|_| "readdir d")?;
+        kassert!(out.iter().map(|e| e.name.as_slice()).eq([&b"."[..], b"..", b"\xff\xfexj"]));
+        kassert_eq!(read_all(&d.lookup(b"\xff\xfexj").map_err(|_| "lookup ff fe x j")?)?, b"odd".to_vec());
+        // Non-empty: rmdir refuses.
+        kassert_eq!(m.root.rmdir(b"d").err(), Some(VfsError::NotEmpty));
+        d.rename(b"\xff\xfexj", &d, b"\x80\xc3", RenameFlags(0)).map_err(|_| "rename")?;
+        kassert_eq!(d.lookup(b"\xff\xfexj").err(), Some(VfsError::NoEnt));
+        let on_disk = remount_ro(&m, 271)?;
+        let ro_d = on_disk.root_inode().lookup(b"d").map_err(|_| "ro lookup d")?;
+        kassert_eq!(read_all(&ro_d.lookup(b"\x80\xc3").map_err(|_| "ro lookup the new name")?)?, b"odd".to_vec());
+        d.unlink(b"\x80\xc3").map_err(|_| "unlink")?;
+        drop(d);
+        m.root.rmdir(b"d").map_err(|_| "rmdir once empty")?;
+        kassert_eq!(m.root.lookup(b"d").err(), Some(VfsError::NoEnt));
         Ok(())
     }
 );
@@ -5497,19 +5515,19 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::kassert_eq;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 239)?;
-        let f = m.root.create("pages", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"pages", 0o644).map_err(|_| "create")?;
         let data = pattern(3 * PAGE_SIZE, 5);
         f.write_at(0, &data).map_err(|_| "write")?;
         m.cache.arm_write(1); // the first page's block allocation, as it happens
         crate::kassert!(f.sync(false).is_err());
         m.cache.clear();
         let ro = remount_ro(&m, 240)?;
-        let on_disk = read_all(&ro.root_inode().lookup("pages").map_err(|_| "ro lookup")?)?;
+        let on_disk = read_all(&ro.root_inode().lookup(b"pages").map_err(|_| "ro lookup")?)?;
         kassert_eq!(on_disk.len(), data.len());
         kassert_eq!(&on_disk[PAGE_SIZE..], &data[PAGE_SIZE..]); // pages 1 and 2 reached the disk
         f.sync(false).map_err(|_| "retry sync")?; // the failed page stayed dirty
         let ro = remount_ro(&m, 241)?;
-        kassert_eq!(read_all(&ro.root_inode().lookup("pages").map_err(|_| "ro lookup 2")?)?, data);
+        kassert_eq!(read_all(&ro.root_inode().lookup(b"pages").map_err(|_| "ro lookup 2")?)?, data);
         Ok(())
     }
 );
@@ -5531,7 +5549,7 @@ crate::ktest!(
         use crate::kassert_eq;
         use core::sync::atomic::Ordering as O;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 222)?;
-        let f = m.root.create("r", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"r", 0o644).map_err(|_| "create")?;
         let data = pattern(2 * PAGE_SIZE, 9);
         f.write_at(0, &data).map_err(|_| "write")?;
         let f4 = m.fs.lookup_live_by_lock_id(f.lock_id()).ok_or("live")?;
@@ -5541,7 +5559,7 @@ crate::ktest!(
         m.cache.clear();
         f.sync(false).map_err(|_| "sync")?;
         let ro = remount_ro(&m, 223)?;
-        kassert_eq!(read_all(&ro.root_inode().lookup("r").map_err(|_| "ro lookup")?)?, data);
+        kassert_eq!(read_all(&ro.root_inode().lookup(b"r").map_err(|_| "ro lookup")?)?, data);
         Ok(())
     }
 );
@@ -5551,7 +5569,7 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 224)?;
-        let f = m.root.create("t", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"t", 0o644).map_err(|_| "create")?;
         f.sync(false).map_err(|_| "sync 1")?;
         let created = f.stat().map_err(|_| "stat 1")?.mtime;
         crate::time::sleep(2_000_000);
@@ -5560,7 +5578,7 @@ crate::ktest!(
         kassert!(written != created);
         f.sync(false).map_err(|_| "sync 2")?;
         let ro = remount_ro(&m, 225)?;
-        let on_disk = ro.root_inode().lookup("t").map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?.mtime;
+        let on_disk = ro.root_inode().lookup(b"t").map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?.mtime;
         kassert_eq!(on_disk, written);
         Ok(())
     }
@@ -5571,21 +5589,21 @@ crate::ktest!(
         use self::ktest_util::*;
         use crate::kassert_eq;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 226)?;
-        let a = m.root.mkdir("a", 0o755).map_err(|_| "mkdir a")?;
-        let b = m.root.mkdir("b", 0o755).map_err(|_| "mkdir b")?;
-        a.mkdir("sub", 0o755).map_err(|_| "mkdir sub")?;
+        let a = m.root.mkdir(b"a", 0o755).map_err(|_| "mkdir a")?;
+        let b = m.root.mkdir(b"b", 0o755).map_err(|_| "mkdir b")?;
+        a.mkdir(b"sub", 0o755).map_err(|_| "mkdir sub")?;
         kassert_eq!(a.stat().map_err(|_| "stat a")?.nlink, 3);
-        a.rename("sub", &b, "sub", RenameFlags(0)).map_err(|_| "rename")?;
+        a.rename(b"sub", &b, b"sub", RenameFlags(0)).map_err(|_| "rename")?;
         kassert_eq!(a.stat().map_err(|_| "stat a")?.nlink, 2);
         kassert_eq!(b.stat().map_err(|_| "stat b")?.nlink, 3);
         m.fs.sync().map_err(|_| "sync")?;
         let ro = remount_ro(&m, 227)?;
         let ro_root = ro.root_inode();
-        kassert_eq!(ro_root.lookup("a").map_err(|_| "ro a")?.stat().map_err(|_| "ro stat a")?.nlink, 2);
-        let ro_b = ro_root.lookup("b").map_err(|_| "ro b")?;
+        kassert_eq!(ro_root.lookup(b"a").map_err(|_| "ro a")?.stat().map_err(|_| "ro stat a")?.nlink, 2);
+        let ro_b = ro_root.lookup(b"b").map_err(|_| "ro b")?;
         kassert_eq!(ro_b.stat().map_err(|_| "ro stat b")?.nlink, 3);
-        let ro_sub = ro_b.lookup("sub").map_err(|_| "ro sub")?;
-        kassert_eq!(ro_sub.lookup("..").map_err(|_| "ro ..")?.ino(), ro_b.ino());
+        let ro_sub = ro_b.lookup(b"sub").map_err(|_| "ro sub")?;
+        kassert_eq!(ro_sub.lookup(b"..").map_err(|_| "ro ..")?.ino(), ro_b.ino());
         Ok(())
     }
 );
@@ -5612,7 +5630,7 @@ crate::ktest!(
             data: &[u8],
             keep: &mut Vec<Arc<dyn VfsInode>>,
         ) -> Result<(), &'static str> {
-            let f = dir.create(name, 0o644).map_err(|_| "create")?;
+            let f = dir.create(name.as_bytes(), 0o644).map_err(|_| "create")?;
             kassert_eq!(f.write_at(0, data).map_err(|_| "write")?, data.len());
             keep.push(f);
             Ok(())
@@ -5622,7 +5640,7 @@ crate::ktest!(
         // for the cross-directory kinds, else the root for both.
         fn parents(root: &Arc<dyn VfsInode>, kind: &str) -> Result<Parents, &'static str> {
             if kind.starts_with("cross") {
-                Ok((root.lookup("a").map_err(|_| "a")?, root.lookup("b").map_err(|_| "b")?))
+                Ok((root.lookup(b"a").map_err(|_| "a")?, root.lookup(b"b").map_err(|_| "b")?))
             } else {
                 Ok((Arc::clone(root), Arc::clone(root)))
             }
@@ -5630,13 +5648,13 @@ crate::ktest!(
         fn is_target(inode: &Arc<dyn VfsInode>, kind: &str) -> Result<bool, &'static str> {
             Ok(match kind {
                 "symlink" => inode.readlink().map_err(|_| "readlink")? == LINK,
-                "dir" | "crossdir" => inode.inode_type() == InodeType::Dir && inode.lookup("inner").is_err(),
+                "dir" | "crossdir" => inode.inode_type() == InodeType::Dir && inode.lookup(b"inner").is_err(),
                 _ => read_all(inode)? == DST,
             })
         }
         fn is_source(inode: &Arc<dyn VfsInode>, kind: &str) -> Result<bool, &'static str> {
             Ok(match kind {
-                "dir" | "crossdir" => read_all(&inode.lookup("inner").map_err(|_| "inner")?)? == SRC,
+                "dir" | "crossdir" => read_all(&inode.lookup(b"inner").map_err(|_| "inner")?)? == SRC,
                 _ => read_all(inode)? == SRC,
             })
         }
@@ -5653,25 +5671,25 @@ crate::ktest!(
             let img = {
                 let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), minor)?;
                 if kind.starts_with("cross") {
-                    m.root.mkdir("a", 0o755).map_err(|_| "mkdir a")?;
-                    m.root.mkdir("b", 0o755).map_err(|_| "mkdir b")?;
+                    m.root.mkdir(b"a", 0o755).map_err(|_| "mkdir a")?;
+                    m.root.mkdir(b"b", 0o755).map_err(|_| "mkdir b")?;
                 }
                 let (sp, dp) = parents(&m.root, kind)?;
                 let mut keep = Vec::new();
                 if is_dir {
-                    let src = sp.mkdir("src", 0o755).map_err(|_| "mkdir src")?;
+                    let src = sp.mkdir(b"src", 0o755).map_err(|_| "mkdir src")?;
                     file(&src, "inner", SRC, &mut keep)?;
-                    dp.mkdir("dst", 0o755).map_err(|_| "mkdir dst")?;
+                    dp.mkdir(b"dst", 0o755).map_err(|_| "mkdir dst")?;
                 } else {
                     file(&sp, "src", SRC, &mut keep)?;
                     if kind == "symlink" {
-                        dp.symlink("dst", core::str::from_utf8(LINK).map_err(|_| "utf8")?).map_err(|_| "symlink")?;
+                        dp.symlink(b"dst", LINK).map_err(|_| "symlink")?;
                     } else {
                         file(&dp, "dst", DST, &mut keep)?;
                     }
                     if kind == "linked" {
-                        let dst = dp.lookup("dst").map_err(|_| "dst")?;
-                        dp.link("dst2", &dst).map_err(|_| "link dst2")?;
+                        let dst = dp.lookup(b"dst").map_err(|_| "dst")?;
+                        dp.link(b"dst2", &dst).map_err(|_| "link dst2")?;
                     }
                 }
                 m.fs.sync().map_err(|_| "sync")?;
@@ -5684,20 +5702,20 @@ crate::ktest!(
                 loop {
                     let m = mount(img.clone(), minor)?;
                     let (sp, dp) = parents(&m.root, kind)?;
-                    let src = sp.lookup("src").map_err(|_| "src")?;
-                    let dst = dp.lookup("dst").map_err(|_| "dst")?;
+                    let src = sp.lookup(b"src").map_err(|_| "src")?;
+                    let dst = dp.lookup(b"dst").map_err(|_| "dst")?;
                     let (src_ino, dst_ino) = (src.ino(), dst.ino());
                     if open {
                         dst.inc_open_count();
                     }
                     let before = (free_inodes(&m.fs), free_blocks(&m.fs));
                     m.cache.arm_write(k);
-                    let res = sp.rename("src", &dp, "dst", RenameFlags(0));
+                    let res = sp.rename(b"src", &dp, b"dst", RenameFlags(0));
                     let reached = m.cache.writes.load(O::Acquire) >= k;
                     m.cache.clear();
                     let ro = remount_ro(&m, minor + 1)?;
                     let (ro_sp, ro_dp) = parents(&ro.root_inode(), kind)?;
-                    let at_dst = ro_dp.lookup("dst").map_err(|_| "ro dst")?;
+                    let at_dst = ro_dp.lookup(b"dst").map_err(|_| "ro dst")?;
                     if at_dst.ino() == dst_ino {
                         // The source didn't land: an error, and nothing changed.
                         kassert!(res.is_err());
@@ -5709,7 +5727,7 @@ crate::ktest!(
                             ));
                         }
                         kassert!(is_target(&at_dst, kind)?);
-                        let ro_src = ro_sp.lookup("src").map_err(|_| "ro src")?;
+                        let ro_src = ro_sp.lookup(b"src").map_err(|_| "ro src")?;
                         kassert_eq!(ro_src.ino(), src_ino);
                         kassert!(is_source(&ro_src, kind)?);
                         kassert_eq!((free_inodes(&ro), free_blocks(&ro)), before);
@@ -5718,18 +5736,18 @@ crate::ktest!(
                         kassert_eq!(src.stat().map_err(|_| "stat src")?.nlink, ro_src.stat().map_err(|_| "ro")?.nlink);
                         kassert_eq!(sp.stat().map_err(|_| "stat sp")?.nlink, ro_sp.stat().map_err(|_| "ro")?.nlink);
                         kassert_eq!(dp.stat().map_err(|_| "stat dp")?.nlink, ro_dp.stat().map_err(|_| "ro")?.nlink);
-                        kassert_eq!(dp.lookup("dst").map_err(|_| "live dst")?.ino(), dst_ino);
+                        kassert_eq!(dp.lookup(b"dst").map_err(|_| "live dst")?.ino(), dst_ino);
                     } else {
                         // The source landed (`Ok`, or an error after it did).
                         kassert_eq!(at_dst.ino(), src_ino);
                         kassert!(is_source(&at_dst, kind)?);
-                        kassert!(ro_sp.lookup("src").is_err());
+                        kassert!(ro_sp.lookup(b"src").is_err());
                         if kind == "linked" {
-                            let other = ro_dp.lookup("dst2").map_err(|_| "ro dst2")?;
+                            let other = ro_dp.lookup(b"dst2").map_err(|_| "ro dst2")?;
                             kassert_eq!(other.ino(), dst_ino);
                             kassert!(is_target(&other, kind)?);
                             kassert_eq!(dst.stat().map_err(|_| "stat dst")?.nlink, 1);
-                            kassert_eq!(dp.lookup("dst2").map_err(|_| "dst2")?.stat().map_err(|_| "stat")?.nlink, 1);
+                            kassert_eq!(dp.lookup(b"dst2").map_err(|_| "dst2")?.stat().map_err(|_| "stat")?.nlink, 1);
                             // A fault on the count's own write leaves the disk
                             // one high until the next namespace operation
                             // (the true count is kept in memory, and logged).
@@ -5789,10 +5807,10 @@ crate::ktest!(
         let mut survived = 0;
         loop {
             let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 228)?;
-            m.root.symlink("s", "inline/target").map_err(|_| "symlink")?;
+            m.root.symlink(b"s", b"inline/target").map_err(|_| "symlink")?;
             m.cache.arm_write(k);
             m.cache.reads_fail_after_write_fault.store(true, O::Release);
-            let res = m.root.unlink("s");
+            let res = m.root.unlink(b"s");
             let reached = m.cache.writes.load(O::Acquire) >= k;
             m.cache.clear();
             if !reached {
@@ -5801,7 +5819,7 @@ crate::ktest!(
             }
             if res.is_err() {
                 let ro = remount_ro(&m, 229)?;
-                if let Ok(s) = ro.root_inode().lookup("s") {
+                if let Ok(s) = ro.root_inode().lookup(b"s") {
                     survived += 1;
                     kassert_eq!(s.readlink().map_err(|_| "readlink")?, b"inline/target".to_vec());
                 }
@@ -5827,12 +5845,12 @@ crate::ktest!(
         let (mut k, mut survived, mut gone) = (1, 0, 0);
         loop {
             let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 236)?;
-            m.root.symlink("s", "inline/target").map_err(|_| "symlink")?;
-            let ino = u32::try_from(m.root.lookup("s").map_err(|_| "lookup")?.ino()).map_err(|_| "ino")?;
+            m.root.symlink(b"s", b"inline/target").map_err(|_| "symlink")?;
+            let ino = u32::try_from(m.root.lookup(b"s").map_err(|_| "lookup")?.ino()).map_err(|_| "ino")?;
             m.cache.fail_reads_in(dir_block, dir_block + 4096, 0);
             m.cache.arm_write(k);
             m.cache.range_reads_fail_after_write_fault.store(true, O::Release);
-            let res = m.root.unlink("s");
+            let res = m.root.unlink(b"s");
             let reached = m.cache.writes.load(O::Acquire) >= k;
             m.cache.clear();
             if !reached {
@@ -5841,7 +5859,7 @@ crate::ktest!(
             }
             if res.is_err() {
                 let ro = remount_ro(&m, 237)?;
-                if let Ok(s) = ro.root_inode().lookup("s") {
+                if let Ok(s) = ro.root_inode().lookup(b"s") {
                     survived += 1;
                     kassert_eq!(s.readlink().map_err(|_| "readlink")?, b"inline/target".to_vec());
                 } else {
@@ -5870,13 +5888,13 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 245)?;
         let data = pattern(PAGE_SIZE + 1000, 3);
-        let f = m.root.create("map.bin", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"map.bin", 0o644).map_err(|_| "create")?;
         kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
         f.sync(false).map_err(|_| "sync")?;
         // A fresh mount of the disk: nothing cached, so the pages are filled
         // from the disk.
         let m2 = mount(image(&m)?, 246)?;
-        let g = m2.root.lookup("map.bin").map_err(|_| "lookup")?;
+        let g = m2.root.lookup(b"map.bin").map_err(|_| "lookup")?;
         let e = ext4_inode(&g)?;
         kassert_eq!(e.pages.lock().len(), 0);
         let first = mmap_page(&g, 0).map_err(|_| "map page 0")?;
@@ -5921,7 +5939,7 @@ crate::ktest!(
         kassert_eq!(mmap_page(&g, 1 << 52).err(), Some(VfsError::Range));
         kassert_eq!(mmap_page(&g, u64::MAX).err(), Some(VfsError::Range));
         kassert_eq!(mmap_page(&m2.root, 0).err(), Some(VfsError::NoDev));
-        let link = m2.root.symlink("link", "map.bin").map_err(|_| "symlink")?;
+        let link = m2.root.symlink(b"link", b"map.bin").map_err(|_| "symlink")?;
         kassert_eq!(mmap_page(&link, 0).err(), Some(VfsError::NoDev));
         Ok(())
     }
@@ -5936,12 +5954,12 @@ crate::ktest!(
         use crate::vfs::mmap_page;
         use crate::{kassert, kassert_eq};
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 249)?;
-        let f = m.root.create("gone.bin", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"gone.bin", 0o644).map_err(|_| "create")?;
         kassert_eq!(f.write_at(0, &pattern(PAGE_SIZE, 5)).map_err(|_| "write")?, PAGE_SIZE);
         f.sync(false).map_err(|_| "sync")?;
         ext4_inode(&f)?.pages.lock().remove_from(0); // nothing cached to hand out
         kassert_eq!(f.open_count(), 0);
-        m.root.unlink("gone.bin").map_err(|_| "unlink")?;
+        m.root.unlink(b"gone.bin").map_err(|_| "unlink")?;
         kassert!(!f.is_detached());
         kassert_eq!(mmap_page(&f, 0).err(), Some(VfsError::NoEnt));
         Ok(())
@@ -5962,7 +5980,7 @@ crate::ktest!(
         use core::sync::atomic::Ordering as O;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 250)?;
         let data = pattern(2 * PAGE_SIZE, 9);
-        let f = m.root.create("bad.bin", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"bad.bin", 0o644).map_err(|_| "create")?;
         kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
         f.sync(false).map_err(|_| "sync")?;
         let e = ext4_inode(&f)?;
@@ -6001,7 +6019,7 @@ crate::ktest!(
         use page_cache::{DETACHED_QUOTA, DETACHED_QUOTA_PAGES, DetachedQuotaGuard, detached_cached_pages};
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 251)?;
         let data = pattern(PAGE_SIZE, 13);
-        let f = m.root.create("sparse.bin", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"sparse.bin", 0o644).map_err(|_| "create")?;
         kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, PAGE_SIZE);
         f.truncate(4 * PAGE_SIZE as u64).map_err(|_| "truncate")?; // pages 1-3: holes
         f.sync(false).map_err(|_| "sync")?;
@@ -6017,7 +6035,7 @@ crate::ktest!(
         // Open (the checked open reference an open file holds), then unlink:
         // detached, page 0 kept in memory.
         let open = lumen_vfs::OpenGuard::try_new(Arc::clone(&f)).map_err(|_| "open")?;
-        m.root.unlink("sparse.bin").map_err(|_| "unlink")?;
+        m.root.unlink(b"sparse.bin").map_err(|_| "unlink")?;
         kassert!(f.is_detached());
         kassert_eq!(e.pages.lock().len(), 1);
         let before = detached_cached_pages();
@@ -6057,7 +6075,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 247)?;
         let old = pattern(PAGE_SIZE, 11);
-        let f = m.root.create("shared.bin", 0o644).map_err(|_| "create")?;
+        let f = m.root.create(b"shared.bin", 0o644).map_err(|_| "create")?;
         kassert_eq!(f.write_at(0, &old).map_err(|_| "write")?, PAGE_SIZE);
         f.sync(false).map_err(|_| "sync")?; // on disk, and the page clean
         let mapped = mmap_page(&f, 0).map_err(|_| "map")?;
@@ -6086,7 +6104,7 @@ crate::ktest!(
         e.reclaim_dirty_pages(usize::MAX);
         kassert_eq!(e.pages.lock().len(), 0);
         let ro = remount_ro(&m, 248)?;
-        kassert!(read_all(&ro.root_inode().lookup("shared.bin").map_err(|_| "ro lookup")?)? == new);
+        kassert!(read_all(&ro.root_inode().lookup(b"shared.bin").map_err(|_| "ro lookup")?)? == new);
         kassert!(read_all(&f)? == new); // read back from the disk
         kassert!(dirty_after_unmap);
         Ok(())
@@ -6114,7 +6132,7 @@ crate::ktest!(
         tables.mount_root(Arc::clone(&m.fs) as Arc<dyn FileSystem>).map_err(why("mount_root"))?;
         let data = pattern(2 * PAGE_SIZE + 100, 9);
         for name in ["kept", "freed"] {
-            let f = m.root.create(name, 0o644).map_err(why("create"))?;
+            let f = m.root.create(name.as_bytes(), 0o644).map_err(why("create"))?;
             kassert_eq!(f.write_at(0, &data).map_err(why("write"))?, data.len());
             f.sync(false).map_err(why("sync"))?;
         }
@@ -6139,7 +6157,8 @@ crate::ktest!(
         kassert_eq!(inode.open_count(), 0);
         unlink_at(&tables, None, b"/freed", false).map_err(why("unlink freed"))?;
         kassert!(!inode.is_detached());
-        let res = OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(Arc::clone(&inode), Arc::from(path.as_str()), rd);
+        let res =
+            OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(Arc::clone(&inode), Arc::from(path.as_slice()), rd);
         kassert_eq!(res.err(), Some(VfsError::NoEnt));
         kassert_eq!(inode.open_count(), 0);
         Ok(())

@@ -13,7 +13,6 @@
 //! `random` and `urandom` read from `crate::rng` and return `-EAGAIN` while
 //! its pool has never been seeded (no RDRAND and no virtio-rng answer).
 
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -230,41 +229,41 @@ impl VfsInode for DevfsInode {
         })
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
         if self.kind != DevKind::Root {
             return Err(VfsError::NotDir);
         }
-        if name == "." || name == ".." {
+        if name == b"." || name == b".." {
             return self.self_weak.upgrade().map(|a| a as Arc<dyn VfsInode>).ok_or(VfsError::NoEnt);
         }
         self.nodes
             .iter()
-            .find(|&&(n, _)| n == name)
+            .find(|&&(n, _)| n.as_bytes() == name)
             .map(|(_, inode)| Arc::clone(inode) as Arc<dyn VfsInode>)
             .ok_or(VfsError::NoEnt)
     }
 
-    fn create(&self, _name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn create(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn mkdir(&self, _name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn mkdir(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn unlink(&self, _name: &str) -> Result<(), VfsError> {
+    fn unlink(&self, _name: &[u8]) -> Result<(), VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn rmdir(&self, _name: &str) -> Result<(), VfsError> {
+    fn rmdir(&self, _name: &[u8]) -> Result<(), VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn link(&self, _name: &str, _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+    fn link(&self, _name: &[u8], _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
         Err(VfsError::RoFs)
     }
 
-    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    fn symlink(&self, _name: &[u8], _target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
         Err(VfsError::RoFs)
     }
 
@@ -274,9 +273,9 @@ impl VfsInode for DevfsInode {
 
     fn rename(
         &self,
-        _old_name: &str,
+        _old_name: &[u8],
         _new_dir: &Arc<dyn VfsInode>,
-        _new_name: &str,
+        _new_name: &[u8],
         _flags: RenameFlags,
     ) -> Result<(), VfsError> {
         Err(VfsError::RoFs)
@@ -299,7 +298,7 @@ impl VfsInode for DevfsInode {
             }
             let cur_idx = idx as u64;
             if cur_idx >= cursor {
-                out.push(DirEntry { ino, inode_type: itype, name: String::from(name), next_cursor: cur_idx + 1 });
+                out.push(DirEntry { ino, inode_type: itype, name: name.as_bytes().to_vec(), next_cursor: cur_idx + 1 });
             }
         }
         Ok(())
@@ -437,7 +436,7 @@ crate::ktest!(
             ("tty", 5, 0, 0o666),
             ("console", 5, 1, 0o620),
         ] {
-            let node = root.lookup(name).map_err(|_| "lookup")?.stat().map_err(|_| "stat")?;
+            let node = root.lookup(name.as_bytes()).map_err(|_| "lookup")?.stat().map_err(|_| "stat")?;
             kassert_eq!(node.inode_type, InodeType::CharDevice);
             kassert_eq!((node.rdev, node.mode, node.uid, node.gid), (DevId::makedev(maj, min), mode, 0, 0));
         }
