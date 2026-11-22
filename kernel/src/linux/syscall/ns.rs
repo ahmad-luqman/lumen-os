@@ -16,8 +16,8 @@
 //!   does for a caller with `CAP_DAC_READ_SEARCH` (every process here runs
 //!   as root); a file with no links left is `-ENOENT`.
 //! - `readlinkat` of an empty path names the descriptor's file (or the
-//!   cwd): not a symlink is `-EINVAL`, as since Linux 5.x (older kernels
-//!   said `-ENOENT`).
+//!   cwd): one that isn't a symlink is `-ENOENT`, as Linux's
+//!   `do_readlinkat` says for an empty name (`-EINVAL` for any other).
 //! - A symlink target that isn't UTF-8 is `-EINVAL` (#268).
 
 use super::at::{self, Dirfd, Mode, Start, UserPath, UserPtr};
@@ -125,15 +125,19 @@ pub(super) fn sys_readlinkat(dirfd: Dirfd, path: UserPtr, buf: UserPtr, bufsiz: 
 /// The final symlink's target, never followed, cut to `bufsiz` bytes with
 /// no NUL added; returns how many were copied. `bufsiz <= 0` is `-EINVAL`
 /// before the path is looked at. An empty path names `dirfd`'s file (an
-/// `O_PATH | O_NOFOLLOW` symlink), as Linux always allows here. The target
-/// is a copy, so no VFS lock is held across the copy out.
+/// `O_PATH | O_NOFOLLOW` symlink), as Linux always allows here; not a
+/// symlink is then `-ENOENT`, not `-EINVAL`. The target is a copy, so no
+/// VFS lock is held across the copy out.
 fn readlinkat(dirfd: Dirfd, path: UserPtr, buf: UserPtr, bufsiz: i32) -> Result<u64, u32> {
     if bufsiz <= 0 {
         return Err(errno::EINVAL);
     }
     let path = UserPath::copy_in(path, true)?;
     let start = at::start_dir(dirfd, &path)?;
-    let target = start.readlink(&path)?;
+    let target = start.readlink(&path).map_err(|e| match e {
+        errno::EINVAL if path.is_empty() => errno::ENOENT,
+        e => e,
+    })?;
     let n = target.len().min(bufsiz as usize);
     copy_to_user(buf.addr(), &target[..n]).map_err(CopyError::to_errno)?;
     Ok(n as u64)
@@ -599,15 +603,18 @@ fn ktest_symlink_and_readlink(base: &str) -> kt::R {
     kassert_eq!(sys_readlinkat(Dirfd::Fd(dfd), up(4, "rel")?, ptr(BUF), 64), 4);
     kassert_eq!(user(BUF, 4)?, b"../t".to_vec());
     // An empty path names the dirfd's own file: an `O_PATH | O_NOFOLLOW`
-    // symlink reads; a directory (the dirfd, the cwd) is EINVAL.
+    // symlink reads; anything else (a directory dirfd, a file's, the cwd)
+    // is ENOENT, as on Linux.
     let sfd = open(5, &p("s"), O::O_PATH | O::O_NOFOLLOW)?;
     smudge()?;
     kassert_eq!(sys_readlinkat(Dirfd::Fd(sfd), up(0, "")?, ptr(BUF), 64), 6);
     kassert_eq!(user(BUF, 6)?, b"abcdef".to_vec());
-    kassert_eq!(sys_readlinkat(Dirfd::Fd(dfd), up(0, "")?, ptr(BUF), 64), e(errno::EINVAL));
-    kassert_eq!(sys_readlink(up(0, "")?, ptr(BUF), 64), e(errno::EINVAL));
+    kassert_eq!(sys_readlinkat(Dirfd::Fd(dfd), up(0, "")?, ptr(BUF), 64), e(errno::ENOENT));
+    kassert_eq!(sys_readlink(up(0, "")?, ptr(BUF), 64), e(errno::ENOENT));
     // Not a symlink: EINVAL. A symlink to a symlink: the final one is read.
     kt::file(&p("f"), b"x")?;
+    let ffd = open(6, &p("f"), O::O_RDONLY)?;
+    kassert_eq!(sys_readlinkat(Dirfd::Fd(ffd), up(0, "")?, ptr(BUF), 64), e(errno::ENOENT));
     kassert_eq!(sys_readlink(up(0, &p("f"))?, ptr(BUF), 64), e(errno::EINVAL));
     kassert_eq!(sys_readlink(up(0, &p("d"))?, ptr(BUF), 64), e(errno::EINVAL));
     kt::symlink("s", &p("s2"))?;
@@ -635,6 +642,7 @@ fn ktest_symlink_and_readlink(base: &str) -> kt::R {
     kassert!(lstat(&p("x")).is_err());
     kassert_eq!(super::fd::sys_close(dfd), 0);
     kassert_eq!(super::fd::sys_close(sfd), 0);
+    kassert_eq!(super::fd::sys_close(ffd), 0);
     kt::remove(&[&p("s"), &p("s2"), &p("d/rel"), &p("d"), &p("f"), &p("loop")])
 }
 
@@ -652,7 +660,9 @@ crate::ktest!(
             smudge()?;
             kassert_eq!(sys_readlink(up(0, "/proc/self/exe")?, ptr(BUF), 64), exe.len() as u64);
             kassert_eq!(user(BUF, exe.len() + 1)?, [exe.as_bytes(), &[0xaa]].concat());
+            smudge()?;
             kassert_eq!(sys_readlink(up(0, "/proc/self/exe")?, ptr(BUF), 4), 4);
+            kassert_eq!(user(BUF, 5)?, b"/bin\xaa".to_vec());
             let fd = open(1, "/dev/null", lumen_vfs::OpenFlags::O_RDONLY)?;
             for path in [alloc::format!("/proc/{pid}/fd/{}", fd.raw()), alloc::format!("/proc/self/fd/{}", fd.raw())] {
                 smudge()?;
@@ -840,6 +850,8 @@ crate::ktest!(
             kt::remove(&[&p("d/s")])?;
             kassert_eq!(call(general::__NR_rmdir, addr(9, &p("d"))?, 0, 0, 0, 0), 0);
             kassert_eq!(lstat(&p("d")).map(drop), Err(VfsError::NoEnt));
+            kassert_eq!(super::fd::sys_close(super::at::reg(sub)), 0);
+            kassert_eq!(super::fd::sys_close(super::at::reg(top)), 0);
             kt::remove(&[&p("s2"), &p("f"), &p("sf"), base])
         })?
     }
