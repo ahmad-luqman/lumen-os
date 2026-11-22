@@ -369,7 +369,12 @@ one is its own PR that updates that doc first.
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, the
-  link counts kept in memory when an undo fails); `vfs/tmpfs.rs`,
+  link counts kept in memory when an undo fails; a device's number read
+  raw from `i_block`, `read_rdev`, #292; the times through `times`'
+  `InodeTimes`, clamped on load and by every setter and stored by `store`/
+  `store_ctime`, and `new_inode`, the one way to make an inode, #294;
+  `ktest_util::set_clock`, the ktests' clock, `Ext4Shared::now`);
+  `vfs/tmpfs.rs`,
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
@@ -529,10 +534,12 @@ one is its own PR that updates that doc first.
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
   call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,
   whose `WouldBlock` alone names the holder; `PosixWaitGraph`, who waits
-  for whom, for `EDEADLK`, its search's `WaitSearch`), and
+  for whom, for `EDEADLK`, its search's `WaitSearch`),
   `procfs` (`/proc`'s `ProcKind`s, their inode numbers and types, `ProcFd`:
   an fd in `0..MAX_FDS`, `ProcFd::parse`, and `parse_canonical_u32`: one
-  name per number) (host-tested).
+  name per number), and `ext4` (#292, #294: what the ext4 adapter encodes and
+  decodes itself, a device node's `i_block` as `st_rdev` and Linux's signed times
+  with their epoch bits, clamped as `timestamp_truncate` does) (host-tested).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
