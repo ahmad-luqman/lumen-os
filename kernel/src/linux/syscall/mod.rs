@@ -68,8 +68,9 @@ const UIO_MAXIOV: isize = 1024;
 /// Maximum bytes transferred in one `write`/`getrandom` loop chunk (matches `shell::CHUNK`).
 const IO_CHUNK: usize = 512;
 
-/// Cap total bytes processed in a single `write`/`writev` call so one syscall
-/// cannot monopolize a CPU indefinitely.
+/// Cap total bytes processed in a single read/write-family call (`read`,
+/// `write`, `readv`, `writev`, `pread64`, `pwrite64`) so one syscall cannot
+/// monopolize a CPU indefinitely.
 const MAX_SINGLE_IO: usize = 1024 * 1024;
 
 /// Default open-file rlimit advertised by M6 `prlimit64`.

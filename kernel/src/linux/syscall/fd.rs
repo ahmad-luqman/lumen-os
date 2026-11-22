@@ -144,6 +144,21 @@ fn write_chunk(file: &KernelFile, chunk: &[u8]) -> Result<(u64, usize), VfsError
 /// appender's data land between its chunks.
 pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     let limit = count.min(MAX_SINGLE_IO as u64) as usize;
+    write_chunks_from_user(user_buf, limit, |_, chunk| write_chunk(file, chunk).map(|(_, n)| n))
+}
+
+/// The write side's chunk loop (`write`'s and `pwrite64`'s): copy up to
+/// `limit` bytes in from user memory at `user_buf`, a chunk (4 KiB) at a
+/// time into a bounce buffer on the stack, and hand each to `write(done,
+/// chunk)` (`done`: the bytes written before it), which says how many it
+/// wrote. Until all of it, a short write, a copy that faults or an error:
+/// the bytes written by then if any, else the errno. No lock is held
+/// across a copy in.
+pub(super) fn write_chunks_from_user(
+    user_buf: u64,
+    limit: usize,
+    mut write: impl FnMut(usize, &[u8]) -> Result<usize, VfsError>,
+) -> Result<u64, u32> {
     let mut kbuf = [0u8; FILE_CHUNK];
     let mut done = 0usize;
     while done < limit {
@@ -154,10 +169,14 @@ pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result
         if copy_from_user(&mut kbuf[..want], addr).is_err() {
             return partial(done, errno::EFAULT);
         }
-        let n = match write_chunk(file, &kbuf[..want]) {
-            Ok((_, n)) => n,
+        let n = match write(done, &kbuf[..want]) {
+            Ok(n) => n,
             Err(e) => return partial(done, vfs(e)),
         };
+        // A filesystem never reports more than it was given; if one did,
+        // the caller still never hears of more than it asked for.
+        debug_assert!(n <= want, "wrote {n} of a {want}-byte chunk");
+        let n = n.min(want);
         done += n;
         if n < want {
             break;

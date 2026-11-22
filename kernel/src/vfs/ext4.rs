@@ -3982,10 +3982,11 @@ impl VfsInode for Ext4Inode {
             return Ok(());
         }
         self.flush_to_ext4(data_only)?;
-        // The filesystem's own sync logs a block-cache failure (once, not
-        // once per inode a global sync visits); the caller reports this one.
+        // A global sync goes through the filesystem's own `sync` (which logs
+        // a block-cache failure once, not once per inode), never through
+        // here: this is `fsync`'s, so it logs its own failure.
         self.shared.sync_bcache().map_err(|(e, cause)| {
-            log::debug!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);
+            warn!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);
             e
         })
     }
@@ -4034,6 +4035,8 @@ pub(super) mod ktest_util {
         pub range_reads_fail_after_write_fault: AtomicBool,
         pub fail_reads: AtomicBool,
         pub fail_writes: AtomicBool,
+        /// Fail only `sync` (written blocks stay in the cache, dirty).
+        pub fail_syncs: AtomicBool,
         /// Fail the next `fail_range_reads` reads overlapping `[lo, hi)`.
         range_lo: AtomicU64,
         range_hi: AtomicU64,
@@ -4058,6 +4061,7 @@ pub(super) mod ktest_util {
             self.range_reads_fail_after_write_fault.store(false, Ordering::Release);
             self.fail_reads.store(false, Ordering::Release);
             self.fail_writes.store(false, Ordering::Release);
+            self.fail_syncs.store(false, Ordering::Release);
             self.fail_range_reads.store(0, Ordering::Release);
         }
     }
@@ -4096,7 +4100,7 @@ pub(super) mod ktest_util {
         }
 
         fn sync(&self) -> Result<(), BlockError> {
-            if self.fail_writes.load(Ordering::Acquire) {
+            if self.fail_writes.load(Ordering::Acquire) || self.fail_syncs.load(Ordering::Acquire) {
                 return Err(BlockError::Io);
             }
             self.inner.lock().sync()
@@ -4121,6 +4125,7 @@ pub(super) mod ktest_util {
             range_reads_fail_after_write_fault: AtomicBool::new(false),
             fail_reads: AtomicBool::new(false),
             fail_writes: AtomicBool::new(false),
+            fail_syncs: AtomicBool::new(false),
             range_lo: AtomicU64::new(0),
             range_hi: AtomicU64::new(0),
             fail_range_reads: AtomicUsize::new(0),
@@ -4138,7 +4143,8 @@ pub(super) mod ktest_util {
     }
 
     impl Mnt {
-        fn dev_bytes(&self) -> Vec<u8> {
+        /// The device's bytes as they are, under the block cache.
+        pub fn dev_bytes(&self) -> Vec<u8> {
             self.cache.dev.0.data.lock().clone()
         }
     }
