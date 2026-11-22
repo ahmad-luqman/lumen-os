@@ -367,12 +367,15 @@ unmapping as a generation (`retire`, after the unmap) and keeps, per CPU,
 the newest generation it has flushed through: a CPU catches up (`catch_up`:
 reads the newest generation, reloads CR3, which drops every kernel-window
 translation since the kernel's tables set no global bit, then records it)
-at each timer tick and each `WAKEUP` IPI (not while `sync` spins: it
-catches up its own CPU once, at its start). The stack window hands a free
+at each timer tick and each `WAKEUP` IPI (those go on while `sync` spins
+with interrupts on; it catches up its own CPU once, at its start). The stack window hands a free
 range out only once every counted CPU has flushed through its generation:
 `StackWindow::take` takes a `Flushed`, which only `tlb::flushed_through`
 makes (`unsafe fn Flushed::vouch`, like `Claims::new`), and a give-back's
-`Generation` comes from `tlb::retire`. When the lowest fitting range isn't
+`Generation` (neither `Copy` nor `Clone`) only from `unsafe fn
+tlb::retire`, whose caller vouches the pages are unmapped (the private
+`stack::give_back`, itself `unsafe`); `wait_for` names the generation to
+wait for as a number, never a `Generation`. When the lowest fitting range isn't
 flushed through yet, `KernelStack::new` calls `sync(generation)`, which
 catches up its own CPU, sends `WAKEUP` to each online CPU behind (again on
 the next pass if an IPI couldn't be sent), and spins until they have
@@ -380,22 +383,28 @@ caught up. It waits only from a thread with interrupts on and no critical
 section open (the M8 shootdown's locking rule: a CPU spinning, interrupts
 off, on a lock the waiter held could never answer), once the clocks are
 calibrated, at most 2 s (warned about, host-timed); after a timeout no
-`sync` waits again until every CPU has got past that generation (warned
-about again every 10 s while one hasn't, logged when they have). Where it
+`sync` waits again until every CPU has got past that generation (a
+`sync` meanwhile warns again at most every 10 s, and the first one after
+they have logs it). Where it
 didn't wait, or gave up, the stack takes other addresses (a higher freed
 range already flushed, else the untouched rest, which may map a page
 table), counted by reason in `mem` (`no-wait`, `gave-up`, `timed-out`,
-`raced`: a stack freed meanwhile joined the range at a newer generation),
+`raced`: the lowest fitting range changed while `sync` ran, a stack freed
+meanwhile joining it at a newer generation or leaving a new lower one),
 with the CPUs still behind. Each spawn that needs a flush costs an IPI to
 each CPU behind and a wait for its interrupt (microseconds; none when the
-CPUs' ticks have flushed already), and each retired generation costs every
-CPU one CR3 reload at its next tick. The boot CPU
-is counted from the start, an AP from `mm::tlb::join` just before it goes
-online (counted as behind everything, then reading the generation,
-flushing and recording it, so a `sync` that saw it uncounted retired its
-pages before that flush); CPUs past the cap are never counted (they never
-load the kernel's tables). Tested, with a ktest-only switch stopping the
-timer's flushes (`tlb::TickFlushesOff`) so only `sync`'s IPIs flush, by
+CPUs' ticks have flushed already), and every CPU behind reloads CR3 once
+at its next tick or `WAKEUP` (catching up to the newest generation, however
+many were retired since). The boot CPU
+is counted from the start, an AP from `mm::tlb::join` at the top of
+`smp::ap_main`, the first thing it does on the kernel's tables and its own
+stack (counted as behind everything, then reading the generation,
+flushing and recording it): before that it has run only `ap_entry`'s
+switch onto its own main stack, never retired, so it uses no translation
+of a retired page, and that flush drops whatever its walker cached. CPUs
+past the cap are never counted (they never load the kernel's tables). Tested, with a ktest-only switch stopping the
+timer's flushes (`tlb::TickFlushesOff`) so only a `WAKEUP` (`sync`'s)
+flushes the other CPUs, by
 `every_cpu_flushes_through_a_retired_generation` and
 `a_reused_stack_is_flushed_from_every_cpu` (another CPU reading the old
 stack, then the reused one, sees the new frame; it can't always tell a
@@ -2097,8 +2106,11 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`; `trace runq` and
     tested). An idle boot CPU reads nearly 100% busy only where the serial
     shell polls serial: without COM1's interrupt (`serial_in`, #120).
   - `mem`: frames used of those the allocator owns, the heap's counters,
-    and the kernel stacks registered, by kind (sizes without their guard
-    pages).
+    the kernel stacks registered, by kind (sizes without their guard
+    pages), and a `reuse` line: the stacks that took other addresses than
+    the lowest freed range that fits, by reason (`no-wait`, `gave-up`,
+    `timed-out`, `raced`; section 4, "Retiring stack pages"), and the CPUs
+    still behind the TLB flushes (the pipeline table leaves it out).
   - `irqs`: every I/O APIC input decoded (vector, delivery, trigger,
     polarity, destination, masked; an input no driver routed is shown only
     as masked; `no I/O APIC` without any, not tested), then the interrupts

@@ -122,8 +122,27 @@ pub const FREE_RANGES: usize = 2 * MAX_STACKS;
 /// slot's pages were unmapped, and a CPU that has flushed through it holds
 /// none of their translations ([`Flushed`]). The kernel's `mm::tlb::retire`
 /// numbers them; making one up is `unsafe`, as a too-old one would let the
-/// slot be reused while another CPU still caches its pages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// slot be reused while another CPU still caches its pages. Neither `Copy`
+/// nor `Clone`, so one is given back once, with the pages it was made for,
+/// and nothing else hands one out ([`StackWindow::wait_for`] says what to
+/// wait for as a number):
+///
+/// ```compile_fail
+/// fn twice(g: lumen_mm::stacks::Generation) -> (lumen_mm::stacks::Generation, lumen_mm::stacks::Generation) {
+///     (g, g)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// let forged = lumen_mm::stacks::Generation(1);
+/// ```
+///
+/// ```
+/// fn once(g: lumen_mm::stacks::Generation) -> u64 {
+///     g.get()
+/// }
+/// ```
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Generation(u64);
 
 impl Generation {
@@ -138,7 +157,7 @@ impl Generation {
     }
 
     /// Its number.
-    pub const fn get(self) -> u64 {
+    pub const fn get(&self) -> u64 {
         self.0
     }
 }
@@ -165,7 +184,7 @@ impl Flushed {
     }
 
     /// Is a range retired at `g` safe to hand out?
-    fn covers(self, g: Generation) -> bool {
+    fn covers(self, g: &Generation) -> bool {
         g.0 <= self.0
     }
 }
@@ -292,19 +311,20 @@ impl StackWindow {
             .iter()
             .enumerate()
             .filter_map(|(i, f)| f.as_ref().map(|f| (i, f)))
-            .filter(|(_, f)| f.window.len() >= need && flushed.is_none_or(|g| g.covers(f.retired)))
+            .filter(|(_, f)| f.window.len() >= need && flushed.is_none_or(|g| g.covers(&f.retired)))
             .min_by_key(|(_, f)| f.window.range().start)
             .map(|(i, _)| i)
     }
 
-    /// The generation every CPU must have flushed through before the lowest
-    /// free range a stack of `size` bytes fits in may be handed out, if
-    /// `flushed` doesn't cover it yet; `None` if no free range fits or the
-    /// lowest one is ready.
-    pub fn wait_for(&self, size: u64, flushed: Flushed) -> Option<Generation> {
+    /// The generation (its number: a target to wait for, not a
+    /// [`Generation`] to give back) every CPU must have flushed through
+    /// before the lowest free range a stack of `size` bytes fits in may be
+    /// handed out, if `flushed` doesn't cover it yet; `None` if no free
+    /// range fits or the lowest one is ready.
+    pub fn wait_for(&self, size: u64, flushed: Flushed) -> Option<u64> {
         let i = self.lowest_fit(size, None)?;
-        let retired = self.free[i].as_ref().expect("lowest_fit names a free range").retired;
-        (!flushed.covers(retired)).then_some(retired)
+        let retired = &self.free[i].as_ref().expect("lowest_fit names a free range").retired;
+        (!flushed.covers(retired)).then_some(retired.get())
     }
 
     /// Addresses for a stack of `size` bytes (a nonzero multiple of the page
@@ -602,7 +622,7 @@ mod tests {
         assert_eq!(w.give_back(a, g(5)), Ok(()));
         assert_eq!(w.free_ranges(), 1);
         // Not yet flushed through generation 5: wait for it, or go on above.
-        assert_eq!(w.wait_for(64 * K, flushed(4)), Some(g(5)));
+        assert_eq!(w.wait_for(64 * K, flushed(4)), Some(5));
         assert_eq!(w.wait_for(64 * K, flushed(5)), None);
         let c = w.take(64 * K, flushed(4)).unwrap();
         assert_eq!(c.range().guard(), rb.top, "past the pending slot");
@@ -631,7 +651,7 @@ mod tests {
         assert_eq!(w.give_back(b, g(2)), Ok(()), "joins both neighbours");
         assert_eq!(w.free_ranges(), 1);
         // Three 16 KiB slots and their guards: room for a 56 KiB stack.
-        assert_eq!(w.wait_for(56 * K, flushed(2)), Some(g(3)), "the newest generation counts");
+        assert_eq!(w.wait_for(56 * K, flushed(2)), Some(3), "the newest generation counts");
         let big = w.take(56 * K, flushed(3)).unwrap();
         assert_eq!(big.range().guard(), first.guard());
         assert_eq!(w.free_ranges(), 0);
@@ -823,28 +843,37 @@ mod tests {
         assert_eq!(w.give_back(b, g(3)), Ok(()));
         assert_eq!(w.give_back(c, g(2)), Ok(()));
         assert_eq!(w.free_ranges(), 1);
-        assert_eq!(w.wait_for(16 * K, flushed(2)), Some(g(3)));
+        assert_eq!(w.wait_for(16 * K, flushed(2)), Some(3));
         assert_ne!(w.take(16 * K, flushed(2)).map(|s| s.range()), Some(rb), "handed out before 3");
         assert_eq!(w.take(16 * K, flushed(3)).map(|s| s.range()), Some(rb));
         drop(a);
     }
 
     /// `take` is first fit by address, whatever order the free ranges came
-    /// back in.
+    /// back in and however big they are: a lower range that fits is taken
+    /// over a bigger one above it.
     #[test]
     fn the_lowest_fitting_range_is_taken() {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
-        let slots: Vec<_> = (0..4).map(|_| w.take(16 * K, flushed(0)).unwrap()).collect();
-        let [s0, s1, s2, s3] = <[StackSlot; 4]>::try_from(slots).unwrap();
+        let slots: Vec<_> = (0..5).map(|_| w.take(16 * K, flushed(0)).unwrap()).collect();
+        let [s0, s1, s2, s3, s4] = <[StackSlot; 5]>::try_from(slots).unwrap();
         let (r0, r2) = (s0.range(), s2.range());
-        // The higher one first: it goes first in the list too.
+        // The higher ones first (joined: a 40 KiB range), so they go first
+        // in the list too; then the lower 20 KiB one.
         assert_eq!(w.give_back(s2, g(1)), Ok(()));
+        assert_eq!(w.give_back(s3, g(1)), Ok(()));
         assert_eq!(w.give_back(s0, g(1)), Ok(()));
+        assert_eq!(w.free_ranges(), 2);
+        // A small stack while both fit: from the lower one.
+        let small = w.take(4 * K, flushed(1)).unwrap();
+        assert_eq!(small.range().guard(), r0.guard());
+        assert_eq!(w.give_back(small, g(1)), Ok(()));
         assert_eq!(w.take(16 * K, flushed(1)).map(|s| s.range()), Some(r0));
-        // A smaller stack: carved from the lower of the fitting ranges too.
-        assert_eq!(w.take(4 * K, flushed(1)).map(|s| s.range().guard()), Some(r2.guard()));
-        drop((s1, s3));
+        // Only the higher one fits now.
+        assert_eq!(w.take(16 * K, flushed(1)).map(|s| s.range()), Some(r2));
+        drop((s1, s4));
     }
+
     #[test]
     fn window_puts_a_guard_page_below_each_stack() {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));

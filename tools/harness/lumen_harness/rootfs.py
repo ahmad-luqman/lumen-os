@@ -88,6 +88,23 @@ def find_e2fsprogs(env: Mapping[str, str] | None = None) -> tuple[Path, Path]:
     )
 
 
+# A `linux /bin/busybox ...` run's last line: its exit code and leaked frames.
+BUSYBOX_EXIT = re.compile(r"linux: /bin/busybox exit=(\d+) leaked_frames=(-?\d+)")
+
+
+def warm_up(m) -> None:
+    """On machine `m` (booted with a rootfs), one `linux /bin/busybox true`, leaking 0 frames or 1: the first
+    process's kernel stack may find no freed slot to reuse and take fresh
+    addresses, whose 68 KiB can cross into one new 2 MiB page table; every
+    later one reuses the last one's slot (#300), so its count is exact."""
+    from .shell import run
+
+    out = run(m, "linux /bin/busybox true", 60)
+    lines = out.splitlines()
+    done = BUSYBOX_EXIT.fullmatch(lines[-1]) if lines else None
+    assert done and done.group(1) == "0" and done.group(2) in ("0", "1"), out
+
+
 def copy_rootfs(
     dest_dir: Path, *, src: Path | None = None, name: str = "alpine-rootfs.ext4"
 ) -> Path:

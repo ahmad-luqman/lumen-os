@@ -65,7 +65,9 @@ pub enum Fallback {
     GaveUp,
     /// `sync` waited 2 s and gave up.
     TimedOut,
-    /// A stack freed meanwhile joined the range with a newer generation.
+    /// The lowest fitting range changed while `sync` ran (or before, with
+    /// nothing to wait for): a stack freed meanwhile joined it at a newer
+    /// generation, or left a new lower one not flushed yet.
     Raced,
 }
 
@@ -80,15 +82,33 @@ impl Fallback {
             Fallback::Raced => "raced",
         }
     }
+
+    /// Its place in [`Fallback::ALL`] (and [`FALLBACKS`]).
+    const fn index(self) -> usize {
+        match self {
+            Fallback::NoWait => 0,
+            Fallback::GaveUp => 1,
+            Fallback::TimedOut => 2,
+            Fallback::Raced => 3,
+        }
+    }
 }
 
-/// [`Fallback`]s so far, by reason (in [`Fallback::ALL`]'s order).
-static FALLBACKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+const _: () = {
+    let mut i = 0;
+    while i < Fallback::ALL.len() {
+        assert!(Fallback::ALL[i].index() == i, "Fallback::ALL is in index order");
+        i += 1;
+    }
+};
 
-/// How many new stacks took other addresses for each [`Fallback`] reason,
-/// in [`Fallback::ALL`]'s order (the shell's `mem`).
-pub fn fallbacks() -> [u64; 4] {
-    FALLBACKS.each_ref().map(|c| c.load(Ordering::Relaxed))
+/// [`Fallback`]s so far, by reason ([`Fallback::index`]).
+static FALLBACKS: [AtomicU64; Fallback::ALL.len()] = [const { AtomicU64::new(0) }; Fallback::ALL.len()];
+
+/// How many new stacks took other addresses for `why` so far (the shell's
+/// `mem`).
+pub fn fallback_count(why: Fallback) -> u64 {
+    FALLBACKS[why.index()].load(Ordering::Relaxed)
 }
 
 /// Addresses for a stack of `size` bytes: the lowest freed ones that fit,
@@ -115,17 +135,22 @@ fn take(size: u64) -> Option<StackSlot> {
             Some(tlb::Synced::TimedOut) => Fallback::TimedOut,
             Some(tlb::Synced::Done) | None => Fallback::Raced,
         };
-        FALLBACKS[why as usize].fetch_add(1, Ordering::Relaxed);
+        FALLBACKS[why.index()].fetch_add(1, Ordering::Relaxed);
     }
     slot
 }
 
-/// Hand `slot` back for reuse, its pages all unmapped (by this CPU, just
-/// now): retired at a new generation.
-fn give_back(slot: StackSlot) {
+/// Hand `slot` back for reuse, retired at a new generation.
+///
+/// # Safety
+/// Every page of `slot`'s stack is unmapped (by this CPU, before this call).
+unsafe fn give_back(slot: StackSlot) {
     let bottom = slot.range().bottom;
-    let retired = tlb::retire();
-    match WINDOW.lock().give_back(slot, retired) {
+    // SAFETY: the caller unmapped every page given back with it.
+    let retired = unsafe { tlb::retire() };
+    // The lock dropped before logging.
+    let kept = WINDOW.lock().give_back(slot, retired);
+    match kept {
         Ok(()) => {}
         Err(Lost::Full) => {
             warn!(target: "mm", "too many free stack ranges: the stack at {bottom:#x} is never reused")
@@ -135,11 +160,13 @@ fn give_back(slot: StackSlot) {
         }
     }
 }
+
 /// Why [`KernelStack::new`] failed (nothing is left mapped or registered).
 /// A mapping failure other than running out is a kernel bug and panics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StackError {
-    /// No room left in the stack window.
+    /// No room left in the stack window (or only in freed ranges not
+    /// every CPU has flushed yet, past its 1 TiB).
     WindowFull,
     /// No frame for the stack or for a page table.
     OutOfMemory,
@@ -179,8 +206,8 @@ impl KernelStack {
         match window::map_fresh(slot.window(), range.span()) {
             Ok(()) => {}
             Err(e) if e.is_exhaustion() => {
-                // `map_fresh` unmapped whatever it had mapped.
-                give_back(slot);
+                // SAFETY: `map_fresh` unmapped whatever it had mapped.
+                unsafe { give_back(slot) };
                 return Err(StackError::OutOfMemory);
             }
             Err(e) => panic!("mm: mapping a {} stack at {:#x} failed: {e}", kind.name(), range.bottom),
@@ -189,7 +216,8 @@ impl KernelStack {
         let Some(handle) = (unsafe { stacks::REGISTRY.register(kind, range) }) else {
             // SAFETY: mapped just above; nothing has used it.
             unsafe { window::unmap_and_free(slot.window(), range.span()) };
-            give_back(slot);
+            // SAFETY: unmapped just above.
+            unsafe { give_back(slot) };
             return Err(StackError::RegistryFull);
         };
         Ok(KernelStack { slot: Some(slot), handle: Some(handle) })
@@ -228,18 +256,17 @@ impl Drop for KernelStack {
         // addresses are reused only once every CPU has flushed through the
         // generation `give_back` retires it at (`mm::tlb`).
         unsafe { window::unmap_and_free(slot.window(), span) };
-        // Unmapped (just above, on this CPU) before it is retired.
-        give_back(slot);
+        // SAFETY: unmapped just above, on this CPU.
+        unsafe { give_back(slot) };
     }
 }
 
 /// Is `range`'s guard page unmapped (one walk of the kernel's tables)?
 fn guard_unmapped(range: StackRange) -> bool {
-    paging::walk(lumen_mm::VirtAddr::new(range.guard()).expect("canonical")).mapping().is_none()
+    mapping(range.guard()).is_none()
 }
 
-/// The page-table walk of `virt`, as the stack tests check it.
-#[cfg(feature = "ktest")]
+/// The page-table walk of `virt` (the guard check, and the stack tests).
 fn mapping(virt: u64) -> Option<lumen_mm::paging::Mapping> {
     paging::walk(lumen_mm::VirtAddr::new(virt).expect("canonical")).mapping()
 }
@@ -373,17 +400,17 @@ crate::ktest!(
         // behind.
         use crate::{kassert, kassert_eq};
         drop(fill_registry()?);
-        let first: alloc::vec::Vec<StackRange> = fill_registry()?.iter().map(KernelStack::range).collect();
+        let second: alloc::vec::Vec<StackRange> = fill_registry()?.iter().map(KernelStack::range).collect();
         let free0 = super::frame::free_frames();
         let held = fill_registry()?;
         let free1 = super::frame::free_frames();
         kassert!(!held.is_empty());
-        kassert!(held.iter().map(KernelStack::range).eq(first.iter().copied()));
+        kassert!(held.iter().map(KernelStack::range).eq(second.iter().copied()));
         kassert_eq!(free1 + held.len(), free0);
         drop(held);
         kassert_eq!(super::frame::free_frames(), free0);
         // All of them unmapped again.
-        kassert!(first.iter().all(|r| mapping(r.bottom).is_none()));
+        kassert!(second.iter().all(|r| mapping(r.bottom).is_none()));
         Ok(())
     }
 );
@@ -499,11 +526,15 @@ crate::ktest!(
             crate::ktest::diag(format_args!("one CPU: nothing to flush elsewhere"));
             return Ok(());
         };
-        // No other stack may be taken between `first`'s drop and `second`
-        // (none is in the ktest kernel): first fit would carve it from these
-        // addresses. Only IPIs flush the other CPUs meanwhile.
-        let _ticks_off = super::tlb::TickFlushesOff::new();
         let size = 37 * lumen_mm::FRAME_SIZE;
+        // One stack of the size first, untested: its range takes in any
+        // smaller free range just below, so `first` comes from the bottom of
+        // that and its drop can only join upward. And no other stack may be
+        // taken between `first`'s drop and `second` (none is in the ktest
+        // kernel): first fit would carve it from these addresses.
+        drop(KernelStack::new(size, StackKind::Test).map_err(|_| "allocating a stack")?);
+        // The timer doesn't flush the other CPUs meanwhile (a `WAKEUP` does).
+        let _ticks_off = super::tlb::TickFlushesOff::new();
         let first = KernelStack::new(size, StackKind::Test).map_err(|_| "allocating a stack")?;
         let range = first.range();
         let word = range.bottom as *mut u64;
@@ -574,24 +605,47 @@ crate::ktest!(
             return Ok(());
         }
         let size = 23 * lumen_mm::FRAME_SIZE;
-        let no_wait = |f: [u64; 4]| f[Fallback::NoWait as usize];
-        let (freed, before, other) = {
+        let counts = || Fallback::ALL.map(fallback_count);
+        // One stack of the size first, untested: its range takes in any
+        // smaller free range just below, so the tested one comes from the
+        // bottom of that and its drop can only join upward.
+        drop(KernelStack::new(size, StackKind::Test).map_err(|_| "allocating a stack")?);
+        let (freed, before, other, behind) = {
             // The other CPUs stay behind until the timer flushes again.
             let _ticks_off = super::tlb::TickFlushesOff::new();
             let freed = KernelStack::new(size, StackKind::Test).map_err(|_| "allocating a stack")?.range();
-            let before = fallbacks();
+            let before = counts();
             let were_on = crate::arch::irq::disable();
             let other = KernelStack::new(size, StackKind::Test).map(|s| s.range());
             crate::arch::irq::restore(were_on);
-            (freed, before, other)
+            (freed, before, other, super::tlb::behind())
         };
         let other = other.map_err(|_| "allocating a stack with interrupts off")?;
         kassert!(other != freed);
-        kassert_eq!(no_wait(fallbacks()), no_wait(before) + 1);
+        kassert!(behind != 0);
+        let mut expected = before;
+        expected[Fallback::NoWait.index()] += 1;
+        kassert_eq!(counts(), expected);
         // The timer's flushes are back on: every CPU catches up.
         kassert!(crate::sched::yield_until(|| super::tlb::behind() == 0));
+        let before = counts();
         let again = KernelStack::new(size, StackKind::Test).map_err(|_| "allocating a stack")?;
+        kassert_eq!(counts(), before);
         kassert_eq!(again.range(), freed);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn the_guard_check_looks_at_the_guard_page() {
+        // `new`'s assert: true for a live stack's range, false for that
+        // range shifted up a page, whose "guard" is the stack's mapped
+        // bottom page.
+        use crate::kassert;
+        let stack = KernelStack::new(2 * lumen_mm::FRAME_SIZE, StackKind::Test).map_err(|_| "allocating a stack")?;
+        let range = stack.range();
+        kassert!(guard_unmapped(range));
+        kassert!(!guard_unmapped(StackRange { bottom: range.bottom + lumen_mm::FRAME_SIZE, top: range.top }));
         Ok(())
     }
 );

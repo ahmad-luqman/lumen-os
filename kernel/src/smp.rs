@@ -402,6 +402,9 @@ unsafe extern "C" fn ap_entry(cpu: &Cpu) -> ! {
 
 /// An AP's life on the kernel's tables and its own stack.
 extern "C" fn ap_main() -> ! {
+    // First on the kernel's tables and this AP's own stack: `mm::tlb`
+    // counts this CPU from here (interrupts are off).
+    crate::mm::tlb::join();
     let index = arch::cpu_index();
     let slot = &SLOTS[index];
     arch::apic::enable_local();
@@ -417,8 +420,6 @@ extern "C" fn ap_main() -> ! {
         "cpu {index}'s local APIC id isn't the one Limine reported"
     );
     info!(target: "smp", "cpu {index} online (lapic id {lapic})");
-    // Interrupts are still off: `sync` counts this CPU from here on.
-    crate::mm::tlb::join();
     slot.set(State::Online);
     // From here this context is the CPU's idle thread: it starts the CPU's
     // timer and scheduler, and runs `run_on`'s jobs (checked with interrupts

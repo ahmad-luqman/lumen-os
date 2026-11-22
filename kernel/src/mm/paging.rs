@@ -823,9 +823,10 @@ pub fn map(window: &mut Window, virt: VirtAddr, frame: OwnedFrame, attrs: Attrs)
 /// # Safety
 /// Nothing refers to memory through the page any more (a reference into it
 /// would afterwards fault, or, once the page is mapped again, read someone
-/// else's memory). Other CPUs may still cache its translation: the page's
-/// window isn't handed on to be mapped again until every CPU has flushed it
-/// (`mm::tlb`: retire it, and take it back only once flushed through).
+/// else's memory). Other CPUs may still cache its translation: the page
+/// isn't mapped again, by the holder itself or by whoever its window is
+/// handed on to, until every CPU has flushed it (`mm::tlb`: retire it, and
+/// map it only once flushed through).
 ///
 /// # Panics
 /// If the page wasn't mapped by `map` (not a 4 KiB leaf, or its frame isn't

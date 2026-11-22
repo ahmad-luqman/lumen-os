@@ -227,14 +227,14 @@ one is its own PR that updates that doc first.
   (heap and stacks), through `paging::map` with a `Window` token.
   `mm/heap.rs`: the `#[global_allocator]`, growing in the heap window.
   `mm/stack.rs`: kernel stacks with guard pages, a dropped one's slot
-  reused (#300); `arch/x86_64/stacks.rs` holds their registry (backtraces,
-  overflow reports). `mm/tlb.rs`: retiring dropped stacks' pages from every
-  CPU's TLB before reuse (`retire` giving a `Generation`, `flushed_through`
-  the one maker of a `Flushed`, `catch_up` at the timer (`on_tick`;
-  `TickFlushesOff` for the ktests) and `WAKEUP` interrupts, `join` for an AP
-  going online, `sync`: IPIs and a bounded wait, only outside critical
-  sections; a stack that couldn't wait counted by `Fallback` reason, shown
-  in `mem`).
+  reused (#300; a stack that couldn't wait for its range's TLB flush
+  counted by `Fallback` reason, shown in `mem`); `arch/x86_64/stacks.rs`
+  holds their registry (backtraces, overflow reports). `mm/tlb.rs`: retiring dropped stacks' pages from every
+  CPU's TLB before reuse (`unsafe fn retire` giving a `Generation`,
+  `flushed_through` the one maker of a `Flushed`, `catch_up` at the timer
+  (`on_tick`; `TickFlushesOff` for the ktests) and `WAKEUP` interrupts,
+  `join` at the top of `smp::ap_main`, `sync`: IPIs and a bounded wait,
+  only outside critical sections, `still_stuck` after a timeout).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT.
@@ -767,7 +767,8 @@ one is its own PR that updates that doc first.
   warning" check without them), `rootfs.py` (matched `e2fsprogs` discovery,
   per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, `debugfs`
   and `debugfs_names` (reading an image back, any error line failing), and
-  `llvm-readobj` dynamic musl ELF checks).
+  `llvm-readobj` dynamic musl ELF checks, and `warm_up`: one uncounted
+  `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
   assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
   for #255's exit scenarios, and `libm7.so`;

@@ -9,7 +9,7 @@ import re
 
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import copy_rootfs, e2fsck_check
+from lumen_harness.rootfs import copy_rootfs, e2fsck_check, warm_up
 from lumen_harness.shell import run
 
 BOOT_TIMEOUT = 60
@@ -421,15 +421,6 @@ MAPS_LINE = re.compile(
     r"([0-9a-f]{8,})-([0-9a-f]{8,}) ([r-][w-][x-][ps]) ([0-9a-f]{8}) "
     r"([0-9a-f]{2}:[0-9a-f]{2}) (\d+)(?: +(\S.*))?"
 )
-
-
-def warm_up(m):
-    """One `linux /bin/busybox true`, leaking 0 frames or 1: the first
-    process's kernel stack may find no freed slot to reuse and take fresh
-    addresses, whose 68 KiB can cross into one new 2 MiB page table; every
-    later one reuses the last one's slot (#300), so its count is exact."""
-    out = run(m, "linux /bin/busybox true", 60)
-    assert re.search(r"^linux: /bin/busybox exit=0 leaked_frames=[01]$", out, re.MULTILINE), out
 
 
 def m7_run(m, args):

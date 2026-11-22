@@ -413,8 +413,8 @@ pub fn mem(ctx: &mut Ctx<'_>, args: &[String]) {
     t.push('\n');
     // Stacks that couldn't wait for a freed range's TLB flush (#300).
     let _ = write!(t, "  reuse   stacks on other addresses:");
-    for (why, n) in crate::mm::stack::Fallback::ALL.iter().zip(crate::mm::stack::fallbacks()) {
-        let _ = write!(t, " {} {n}", why.name());
+    for why in crate::mm::stack::Fallback::ALL {
+        let _ = write!(t, " {} {}", why.name(), crate::mm::stack::fallback_count(why));
     }
     let _ = writeln!(t, "; cpus behind the TLB flushes {:#x}", crate::mm::tlb::behind());
     emit(ctx, &t);

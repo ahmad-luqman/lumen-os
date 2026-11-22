@@ -184,10 +184,14 @@ HOST_TIMED = (
         (
             "WARN  mm: cpus 0x4 didn't flush their TLBs within 2 s: freed stack addresses wait for them",
         ),
-        ("WARN  mm: too many free stack ranges: the stack at 0xffffd00000001000 is never reused",),
+        (
+            "WARN  mm: too many free stack ranges: the stack at 0xffffd00000001000 is never reused",
+            "WARN  mm: cpus 0x4 still haven't flushed their TLBs: freed stack addresses wait for them",
+        ),
         "a vCPU stalled past the 2 s a spawn waits for every CPU to flush a freed stack's pages (#300): "
         "the spawn takes other addresses instead (at worst one page table mapped for good), and later "
-        "spawns don't wait until that CPU catches up (mem counts them; a CPU still behind 10 s on is "
+        "spawns don't wait until that CPU catches up, each of those that finds its range not flushed "
+        "taking other addresses too (maybe a table each; mem counts them; a CPU still behind 10 s on is "
         "warned about again, not host-timed); a leaked_frames count it changes fails on its own",
     ),
     HostTimed(
