@@ -275,9 +275,10 @@ pub struct MappedFile {
     guard: OpenGuard,
     path: Arc<str>,
     /// The description is open `O_RDWR`: a `MAP_SHARED` mapping of it may
-    /// be made writable, and its stores reach the file. (A read-only mount
-    /// refuses an `O_RDWR` open with `EROFS`, so this also says the mount
-    /// is writable.)
+    /// be made writable, and its stores reach the file. (`openat` refuses
+    /// `O_RDWR` on a read-only mount with `EROFS`, so a descriptor's also
+    /// says the mount is writable; `OpenFile::new_unchecked_flags`, which
+    /// skips that check, is the ktests' alone.)
     may_write: bool,
 }
 
@@ -1861,8 +1862,10 @@ fn file_vm_logged(text: &str) -> usize {
 }
 
 /// `f` as `mmap` of a descriptor open `O_RDWR` maps it: through an open
-/// file description of its own (dropped once the mapping holds its
-/// reference), standing in for a descriptor's.
+/// file description of its own, standing in for a descriptor's, dropped on
+/// return (the `MappedFile` keeps a clone of its open reference). Opening
+/// it takes `OpenGuard::try_new`: it may sleep (no spinlock held), and
+/// refuses (`"open the file"`) an inode an unlink has freed.
 #[cfg(feature = "ktest")]
 fn file_vm_open(f: &Arc<dyn VfsInode>) -> Result<MappedFile, &'static str> {
     file_vm_open_as(f, lumen_vfs::OpenFlags::O_RDWR)
@@ -2078,7 +2081,7 @@ crate::ktest!(
         // `MappedFile` the address space keeps): an `O_RDONLY` mapping after
         // an `O_RDWR` one stays read-only, and an `O_RDWR` one after an
         // `O_RDONLY` one may be made writable.
-        use crate::kassert_eq;
+        use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(180, |dir| {
             let f = ktest_files::file(dir, "modes.bin", &ktest_files::pattern(P as usize, 9))?;
@@ -2096,6 +2099,12 @@ crate::ktest!(
             let rw = shared(file_vm_open(&f)?).map_err(|_| "map rw again")?;
             kassert_eq!(space.mprotect(rw, P, RW), Ok(())); // the O_RDONLY one's kept
             kassert_eq!(space.mprotect(ro, P, RW), Err(UserVmError::Vm(VmError::Access)));
+            // A store maps the cache's page writable through the O_RDWR
+            // mapping only.
+            kassert_eq!(space.handle_page_fault(rw, 1 << 1), FaultResult::Resolved);
+            let leaf = file_vm_leaf(&space, rw).ok_or("rw not mapped")?;
+            kassert!(leaf.shared && leaf.writable);
+            kassert_eq!(space.handle_page_fault(ro, 1 << 1), FaultResult::Invalid);
             Ok(())
         })
     }
