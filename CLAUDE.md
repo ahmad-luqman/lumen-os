@@ -359,7 +359,8 @@ one is its own PR that updates that doc first.
   for copy-on-write, #255; `WritableMap`, the guard counting a writable
   shared PTE, made by `MappedPage::map_writable`; the last writable unmap
   leaving a page dirty, #266; `ktest_files`, scratch tmpfs and ext4 volumes
-  for `mm::user_vm`'s file-backed ktests); `vfs/ext4.rs`
+  for `mm::user_vm`'s file-backed ktests and `linux::syscall::io`'s
+  positional I/O, `fsync` and `sync` ktests); `vfs/ext4.rs`
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, the
