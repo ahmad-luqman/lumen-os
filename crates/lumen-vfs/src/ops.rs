@@ -554,7 +554,10 @@ fn open_once(
     Ok(Some((guard, path_str)))
 }
 
-/// `mkdirat(2)`: create a directory with `(mode & 0o7777) & !umask`.
+/// `mkdirat(2)`: create a directory with `(mode & 0o7777) & !umask`. The
+/// kernel's `mkdirat` hands it `Mode::dir_perm` (`mode & 0o1777`: no setuid
+/// or setgid, as Linux's `vfs_mkdir`), so only sticky survives of the
+/// special bits there.
 pub fn mkdir_at(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
@@ -599,6 +602,11 @@ pub fn unlink_at(
     remove_dir: bool,
 ) -> Result<(), VfsError> {
     let target = resolve_parent(env, start_dir, path)?;
+    // A last component that isn't a name: Linux's `do_unlinkat` says
+    // `-EISDIR` for all three; `do_rmdir` tells them apart.
+    if !remove_dir && matches!(target.name.as_str(), "/" | "." | "..") {
+        return Err(VfsError::IsDir);
+    }
     if target.name == "/" {
         return Err(VfsError::Busy);
     }
@@ -622,18 +630,10 @@ pub fn unlink_at(
             if child.inode_type() == InodeType::Dir {
                 return Err(VfsError::IsDir);
             }
+            // A trailing slash on anything but a directory: `-ENOTDIR`, the
+            // last component looked at as it is (a symlink to a directory
+            // included), as Linux's `do_unlinkat`.
             if target.has_trailing_slash {
-                if child.inode_type() == InodeType::Symlink {
-                    let followed = resolve_path(
-                        env,
-                        start_dir,
-                        path,
-                        ResolveFlags { follow_final: true, empty_path: false, require_dir: false },
-                    )?;
-                    if followed.inode.inode_type() == InodeType::Dir {
-                        return Err(VfsError::IsDir);
-                    }
-                }
                 return Err(VfsError::NotDir);
             }
 
@@ -719,8 +719,10 @@ pub fn unlink_at(
     }
 }
 
-/// `linkat(2)`: create a hard link, rejecting directories (`-EPERM`) and
-/// cross-mount targets (`-EXDEV`).
+/// `linkat(2)`: create a hard link. A new name in use is `-EEXIST` (with a
+/// trailing slash too) and a trailing slash on a free one `-ENOENT`, before
+/// a read-only filesystem (`-EROFS`), a cross-mount target (`-EXDEV`) and a
+/// directory (`-EPERM`), in Linux's order.
 pub fn link_at(
     env: &dyn VfsCacheOps,
     old_dir: Option<&Arc<dyn VfsInode>>,
@@ -737,22 +739,28 @@ pub fn link_at(
         ResolveFlags { follow_final: follow_symlinks, empty_path, require_dir: false },
     )?;
 
-    if old.inode.inode_type() == InodeType::Dir {
-        return Err(VfsError::Perm);
-    }
-
+    // Linux's order (`do_linkat`, `filename_create`, `vfs_link`): the new
+    // name's `-EEXIST` (a name in use, with a trailing slash too) or
+    // `-ENOENT` (a trailing slash on a free one), then `-EROFS`, then
+    // `-EXDEV`, then a directory's `-EPERM`.
     let new_target = resolve_parent(env, new_dir, new_path)?;
     if new_target.name == "/" || new_target.name == "." || new_target.name == ".." {
         return Err(VfsError::Exist);
     }
-    if new_target.has_trailing_slash {
-        return Err(VfsError::NoEnt);
+    match new_target.parent.lookup(&new_target.name) {
+        Ok(_) => return Err(VfsError::Exist),
+        Err(VfsError::NoEnt) if new_target.has_trailing_slash => return Err(VfsError::NoEnt),
+        Err(VfsError::NoEnt) => {}
+        Err(e) => return Err(e),
+    }
+    if env.fs_read_only(new_target.parent.dev_id()) {
+        return Err(VfsError::RoFs);
     }
     if old.inode.dev_id() != new_target.parent.dev_id() {
         return Err(VfsError::XDev);
     }
-    if env.fs_read_only(new_target.parent.dev_id()) {
-        return Err(VfsError::RoFs);
+    if old.inode.inode_type() == InodeType::Dir {
+        return Err(VfsError::Perm);
     }
 
     let fs_opt = env.fs_by_dev(new_target.parent.dev_id());
@@ -827,7 +835,9 @@ pub fn symlink_at(
 }
 
 /// `readlinkat(2)`: read symlink target without following the final component.
-/// Supports `path == b""` on an `O_PATH | O_NOFOLLOW` symlink descriptor.
+/// Supports `path == b""` on an `O_PATH | O_NOFOLLOW` symlink descriptor. Not
+/// a symlink: `-EINVAL`, or `-ENOENT` for an empty path (Linux's
+/// `do_readlinkat`, `fs/stat.c`).
 pub fn readlink_at(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
@@ -839,8 +849,10 @@ pub fn readlink_at(
         path,
         ResolveFlags { follow_final: false, empty_path: path.is_empty(), require_dir: false },
     )?;
+    // Not a symlink: `-EINVAL`, but `-ENOENT` for an empty path (Linux's
+    // `do_readlinkat`).
     if resolved.inode.inode_type() != InodeType::Symlink {
-        return Err(VfsError::Inval);
+        return Err(if path.is_empty() { VfsError::NoEnt } else { VfsError::Inval });
     }
     resolved.inode.readlink()
 }
@@ -883,16 +895,20 @@ pub fn rename_at2(
     let old_target = resolve_parent(env, old_dir, old_path)?;
     let new_target = resolve_parent(env, new_dir, new_path)?;
 
-    if old_target.name == "/" || new_target.name == "/" {
-        return Err(VfsError::Busy);
-    }
-    if old_target.name == "." || old_target.name == ".." || new_target.name == "." || new_target.name == ".." {
-        return Err(VfsError::Inval);
-    }
-
+    // Linux's order (`do_renameat2`): `-EXDEV` across mounts, ahead of the
+    // `-EBUSY` a last component that isn't a name (`/`, `.`, `..`) gives on
+    // the old side; on the new side such a name is `-EEXIST` with
+    // `RENAME_NOREPLACE`, else `-EBUSY`.
     let dev = old_target.parent.dev_id();
     if dev != new_target.parent.dev_id() {
         return Err(VfsError::XDev);
+    }
+    let not_a_name = |name: &str| matches!(name, "/" | "." | "..");
+    if not_a_name(&old_target.name) {
+        return Err(VfsError::Busy);
+    }
+    if not_a_name(&new_target.name) {
+        return Err(if flags.has_noreplace() { VfsError::Exist } else { VfsError::Busy });
     }
     if env.fs_read_only(dev) {
         return Err(VfsError::RoFs);
@@ -900,14 +916,15 @@ pub fn rename_at2(
 
     let fs_opt = env.fs_by_dev(dev);
     let mut run = || -> Result<(), VfsError> {
+        // The checks below follow Linux's `do_renameat2` and `vfs_rename`, in
+        // their order: the old name's `-ENOENT`; `RENAME_NOREPLACE`'s
+        // `-EEXIST`; `RENAME_EXCHANGE`'s missing (`-ENOENT`) or slashed
+        // non-directory (`-ENOTDIR`) new name; when the source isn't a
+        // directory, a trailing slash on either name (`-ENOTDIR`); the
+        // ancestry traps (`lock_rename`); the same inode both sides (a
+        // no-op); the types (`may_delete`); a mountpoint (`-EBUSY`).
         let old_inode = lookup_and_unify_inode(env, &old_target.parent, &old_target.name)?;
-
-        if env.is_mountpoint(old_inode.dev_id(), old_inode.ino()) {
-            return Err(VfsError::Busy);
-        }
-        if old_target.has_trailing_slash && old_inode.inode_type() != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
+        let old_is_dir = old_inode.inode_type() == InodeType::Dir;
 
         let (_, new_since_gen) = env.cache_gens();
         let new_inode_opt = if flags.has_exchange() {
@@ -924,40 +941,59 @@ pub fn rename_at2(
             }
         };
 
-        if let Some(ref new_inode) = new_inode_opt
-            && old_inode.dev_id() == new_inode.dev_id()
-            && old_inode.ino() == new_inode.ino()
-        {
-            if new_target.has_trailing_slash && old_inode.inode_type() != InodeType::Dir {
-                return Err(VfsError::NotDir);
-            }
-            if flags.has_noreplace() {
-                return Err(VfsError::Exist);
-            }
-            return Ok(());
-        }
-
         if flags.has_noreplace() && new_inode_opt.is_some() {
             return Err(VfsError::Exist);
         }
-
         if flags.has_exchange() {
             let Some(ref new_inode) = new_inode_opt else {
                 return Err(VfsError::NoEnt);
             };
-            if env.is_mountpoint(new_inode.dev_id(), new_inode.ino()) {
-                return Err(VfsError::Busy);
-            }
             if new_target.has_trailing_slash && new_inode.inode_type() != InodeType::Dir {
                 return Err(VfsError::NotDir);
             }
-            if old_inode.inode_type() == InodeType::Dir && is_same_or_descendant(&old_inode, &new_target.parent)? {
-                return Err(VfsError::Inval);
+        }
+        // When the source isn't a directory, a trailing slash on its name, or
+        // (unless exchanging) on the new name, is `-ENOTDIR`, whatever the
+        // new name is.
+        if !old_is_dir && (old_target.has_trailing_slash || (!flags.has_exchange() && new_target.has_trailing_slash)) {
+            return Err(VfsError::NotDir);
+        }
+        // The source an ancestor of the new name's directory: `-EINVAL`. The
+        // new name an ancestor of the source's directory: `-ENOTEMPTY`
+        // (`-EINVAL` when exchanging).
+        if old_is_dir && is_same_or_descendant(&old_inode, &new_target.parent)? {
+            return Err(VfsError::Inval);
+        }
+        if let Some(ref new_inode) = new_inode_opt
+            && new_inode.inode_type() == InodeType::Dir
+            && is_same_or_descendant(new_inode, &old_target.parent)?
+        {
+            return Err(if flags.has_exchange() { VfsError::Inval } else { VfsError::NotEmpty });
+        }
+        if let Some(ref new_inode) = new_inode_opt
+            && old_inode.dev_id() == new_inode.dev_id()
+            && old_inode.ino() == new_inode.ino()
+        {
+            return Ok(());
+        }
+        if !flags.has_exchange()
+            && let Some(ref new_inode) = new_inode_opt
+        {
+            let new_is_dir = new_inode.inode_type() == InodeType::Dir;
+            if old_is_dir && !new_is_dir {
+                return Err(VfsError::NotDir);
             }
-            if new_inode.inode_type() == InodeType::Dir && is_same_or_descendant(new_inode, &old_target.parent)? {
-                return Err(VfsError::Inval);
+            if !old_is_dir && new_is_dir {
+                return Err(VfsError::IsDir);
             }
+        }
+        if env.is_mountpoint(old_inode.dev_id(), old_inode.ino())
+            || new_inode_opt.as_ref().is_some_and(|n| env.is_mountpoint(n.dev_id(), n.ino()))
+        {
+            return Err(VfsError::Busy);
+        }
 
+        if flags.has_exchange() {
             env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
             env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
 
@@ -966,27 +1002,6 @@ pub fn rename_at2(
             env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), &old_target.name);
             env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), &new_target.name);
             return Ok(());
-        }
-
-        if let Some(ref new_inode) = new_inode_opt {
-            if env.is_mountpoint(new_inode.dev_id(), new_inode.ino()) {
-                return Err(VfsError::Busy);
-            }
-            if old_inode.inode_type() == InodeType::Dir && new_inode.inode_type() != InodeType::Dir {
-                return Err(VfsError::NotDir);
-            }
-            if old_inode.inode_type() != InodeType::Dir && new_inode.inode_type() == InodeType::Dir {
-                return Err(VfsError::IsDir);
-            }
-            if new_target.has_trailing_slash && new_inode.inode_type() != InodeType::Dir {
-                return Err(VfsError::NotDir);
-            }
-        } else if new_target.has_trailing_slash && old_inode.inode_type() != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-
-        if old_inode.inode_type() == InodeType::Dir && is_same_or_descendant(&old_inode, &new_target.parent)? {
-            return Err(VfsError::Inval);
         }
 
         struct PendingRenameRemoval<'a> {

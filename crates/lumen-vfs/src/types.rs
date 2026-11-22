@@ -206,6 +206,11 @@ pub struct DirEntry {
     pub ino: Ino,
     pub inode_type: InodeType,
     pub name: String,
+    /// The cursor just past this entry: `readdir` from it resumes with the
+    /// next entry. Opaque, greater than the cursor the listing started at,
+    /// and stable as other entries come and go (the contract on
+    /// [`VfsInode::readdir`](crate::VfsInode::readdir)). `getdents64` hands
+    /// it to user space as `d_off`.
     pub next_cursor: u64,
 }
 

@@ -128,7 +128,6 @@ impl Mode {
 
     /// What `mkdir` keeps (`mode & 0o1777`, Linux's `vfs_mkdir`): the
     /// permission bits and sticky, never setuid or setgid.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `mkdirat` (wave 3) calls it; the ktests until then
     pub(super) fn dir_perm(self) -> u16 {
         (self.0 & 0o1777) as u16
     }
@@ -203,7 +202,8 @@ pub(super) struct UserPath(Vec<u8>);
 impl UserPath {
     /// Copy the NUL-terminated path at `ptr`: `-EFAULT` for a bad pointer,
     /// `-ENAMETOOLONG` past `PATH_MAX` bytes with its NUL, `-ENOENT` if empty
-    /// unless `allow_empty` (`AT_EMPTY_PATH`).
+    /// unless `allow_empty` (`AT_EMPTY_PATH`, or `readlinkat`, which takes an
+    /// empty path without it).
     ///
     /// `NULL` is `-EFAULT` too. A caller for which `NULL` means something
     /// checks first: `utimensat`'s path, and `newfstatat`'s and `statx`'s
@@ -240,10 +240,11 @@ impl UserPath {
         self.0.is_empty()
     }
 
-    /// The path as text, for the calls that take a `&str`. The one place the
-    /// rule lives: a path that isn't UTF-8 names nothing the VFS can hold
-    /// yet, so `-ENOENT` (#268 makes VFS names byte strings).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // for wave 3's `&str` VFS calls; the ktests until then
+    /// The path as text, for the calls that take a `&str`. A path that isn't
+    /// UTF-8 names nothing the VFS can hold yet, so `-ENOENT` (#268 makes VFS
+    /// names byte strings). The same rule lives in lumen-vfs's resolver, for
+    /// a middle component (`resolve_path`) and a final name
+    /// (`resolve_parent`): #268 changes all three.
     pub(super) fn as_str(&self) -> Result<&str, u32> {
         core::str::from_utf8(&self.0).map_err(|_| errno::ENOENT)
     }
@@ -251,9 +252,10 @@ impl UserPath {
 
 /// Where a path argument starts, as [`start_dir`] resolved its `dirfd`.
 pub(super) struct Start {
-    /// The directory a relative path starts from (with `AT_EMPTY_PATH` and
-    /// an empty path, the file itself); `None` only for an absolute path,
-    /// which lumen-vfs starts at the global root whatever it is handed.
+    /// The directory a relative path starts from (with an empty path, which
+    /// `AT_EMPTY_PATH` or `readlinkat` allows, the file itself); `None` only
+    /// for an absolute path, which lumen-vfs starts at the global root
+    /// whatever it is handed.
     dir: Option<Arc<dyn VfsInode>>,
     /// The path `dir` was opened or set by (the cwd's, or the dirfd's open
     /// file's), for the path a relative open shows in `/proc/<pid>/fd`.
@@ -281,7 +283,6 @@ impl Start {
 
     /// `mkdir_at` from this start (`mkdirat`): `mode`'s directory bits, less
     /// the process's umask.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `mkdirat` calls it
     pub(super) fn mkdir(&self, path: &UserPath, mode: Mode) -> Result<Arc<dyn VfsInode>, u32> {
         let umask = process::current_umask();
         mkdir_at(tables(), self.dir(), path.as_bytes(), mode.dir_perm(), umask).map_err(VfsError::to_errno)
@@ -289,27 +290,23 @@ impl Start {
 
     /// `unlink_at` from this start (`unlinkat`; `remove_dir` for
     /// `AT_REMOVEDIR`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `unlinkat` calls it
     pub(super) fn unlink(&self, path: &UserPath, remove_dir: bool) -> Result<(), u32> {
         unlink_at(tables(), self.dir(), path.as_bytes(), remove_dir).map_err(VfsError::to_errno)
     }
 
     /// `readlink_at` from this start (`readlinkat`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `readlinkat` calls it
     pub(super) fn readlink(&self, path: &UserPath) -> Result<Vec<u8>, u32> {
         readlink_at(tables(), self.dir(), path.as_bytes()).map_err(VfsError::to_errno)
     }
 
     /// `symlink_at` at `linkpath` from this start (`symlinkat`): `target` is
     /// stored as given, never resolved, so it takes no start.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `symlinkat` calls it
     pub(super) fn symlink(&self, target: &[u8], linkpath: &UserPath) -> Result<Arc<dyn VfsInode>, u32> {
         symlink_at(tables(), target, self.dir(), linkpath.as_bytes()).map_err(VfsError::to_errno)
     }
 
     /// `link_at` from `old`'s start to `new`'s (`linkat`; `follow` for
     /// `AT_SYMLINK_FOLLOW`, `empty` for `AT_EMPTY_PATH`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `linkat` calls it
     pub(super) fn link(
         old: &Start,
         old_path: &UserPath,
@@ -323,7 +320,6 @@ impl Start {
     }
 
     /// `rename_at2` from `old`'s start to `new`'s (`renameat2`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `renameat2` calls it
     pub(super) fn rename(
         old: &Start,
         old_path: &UserPath,
@@ -357,8 +353,8 @@ impl Start {
 /// - An absolute path starts at the root whatever `dirfd` is: the dirfd is
 ///   never looked at (a bad one is no error).
 /// - An empty path (`UserPath::copy_in` let one through only with
-///   `AT_EMPTY_PATH`, or `UserPath::empty()`) names the dirfd's file
-///   itself, a directory or not, or the cwd.
+///   `AT_EMPTY_PATH`, `UserPath::empty()`, or for `readlinkat`) names the
+///   dirfd's file itself, a directory or not, or the cwd.
 /// - A relative path starts at the cwd's inode for `Dirfd::Cwd`, or at the
 ///   dirfd's file: `-EBADF` if it isn't open, `-ENOTDIR` if it isn't a
 ///   directory (an `O_PATH` one is fine).

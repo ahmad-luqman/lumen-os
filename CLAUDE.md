@@ -400,10 +400,10 @@ one is its own PR that updates that doc first.
   `mmap` of a descriptor and `msync` (ktests in `mem/tests.rs`), `proc`;
   `fd`
   holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
-  terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`), an M7
-  syscall not yet implemented a stub (`not_implemented`: logged once,
-  `-ENOSYS`; each cluster's `*_m7_stubs_return_enosys` ktest while it has
-  stubs; `lock` holds `fcntl` and `flock`: `lock_or_wait`, the retry loop
+  terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`,
+  `getdents64` (the filesystem's `readdir` cursor in `dir_cursor`), `chdir`
+  and `fchdir`; every M7 syscall implemented, the stubs gone with #255's
+  `msync`; `lock` holds `fcntl` and `flock`: `lock_or_wait`, the retry loop
   over the wait queue, and `POSIX_WAITERS`, `F_SETLKW`'s `EDEADLK`
   records), and `at.rs` the file syscalls' shared parts: `reg`/`FromReg`,
   decoding a register into a handler's parameter type (`Fd`, with `Fd::file`

@@ -239,8 +239,10 @@ VFS_EXACT_LINES = {
         rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: ro_compat feature not supported for writing "
         r"\(metadata_csum, quota, bigalloc, orphan_present, \.\.\.\) \(ro_compat 0x[0-9a-f]+\)"
     ): 1,
-    # ext4_readdir_skips_names_that_are_not_utf8
-    rf"WARN  vfs: ext4 {_DEV} directory \d+: skipping entries whose names aren't UTF-8 \(inode \d+\)": 1,
+    # ext4_readdir_skips_names_that_are_not_utf8 and
+    # linux::syscall::dir::dir_getdents64_lists_across_a_gap_in_ext4_cursors:
+    # one directory each.
+    rf"WARN  vfs: ext4 {_DEV} directory \d+: skipping entries whose names aren't UTF-8 \(inode \d+\)": 2,
 }
 
 

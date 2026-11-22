@@ -34,9 +34,6 @@
 //! `stat_from_metadata`/`statx_from_metadata` and `write_stat`/`write_statx`
 //! (those structs written to user memory).
 //!
-//! An M7 syscall not implemented yet has a stub that logs once per number
-//! (as an unknown one does, with its name) and returns `-ENOSYS`.
-//!
 //! All user pointers are copied via `.lumen_fixup`-protected `copy_from_user`,
 //! `copy_to_user` or `copy_cstr_from_user`, with interrupts enabled and no
 //! `SpinLock` held. Unknown
@@ -173,24 +170,6 @@ fn log_unknown_once(nr: u64) {
     if first_report(nr) {
         log::debug!(target: "linux", "unimplemented syscall #{nr}");
     }
-}
-
-/// The last number an M7 stub was called with, for the stub ktests to tell
-/// an arm calling its own stub from one calling another (`u32::MAX`: none).
-#[cfg(feature = "ktest")]
-static LAST_STUB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// The body of an M7 syscall's stub until its cluster's PR implements it:
-/// log once per number, as an unknown syscall does but with its name, and
-/// return `-ENOSYS`.
-fn not_implemented(nr: u32) -> u64 {
-    #[cfg(feature = "ktest")]
-    LAST_STUB.store(nr, Ordering::Relaxed);
-    if first_report(u64::from(nr)) {
-        let name = crate::linux::syscall_name(nr).unwrap_or("?");
-        log::debug!(target: "linux", "unimplemented syscall #{nr} ({name})");
-    }
-    neg_errno(errno::ENOSYS)
 }
 
 /// Dispatch one Linux x86-64 syscall (`rax` = nr, `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` = args).
@@ -592,35 +571,4 @@ fn copy_iovecs(user_iov: u64, iovcnt: u64) -> Result<alloc::vec::Vec<RawIovec>, 
         iovs.push(RawIovec { base, len });
     }
     Ok(iovs)
-}
-
-/// Dispatch each of `numbers` with zeroed arguments on a thread with no
-/// `ProcessState` and check that it reached its own stub (`LAST_STUB`) and
-/// came back as `-ENOSYS` by `sysret`: the per-cluster stub ktests' check.
-///
-/// A number without its own `dispatch` arm can't pass: the fallthrough arm
-/// asks `with_current` for the process, which panics with none (the `diag`
-/// line before each dispatch names the number in that crash's output).
-/// A number this check is the first to report is forgotten again, so a
-/// later call in the same boot still logs.
-#[cfg(feature = "ktest")]
-fn check_stubs(numbers: &[u32]) -> crate::ktest::TestResult {
-    for &nr in numbers {
-        let name = crate::linux::syscall_name(nr).unwrap_or("?");
-        crate::ktest::diag(format_args!("dispatching syscall #{nr} ({name})"));
-        let Some((idx, bit)) = low_bit(u64::from(nr)) else {
-            return Err("an M7 stub's number is below 1024");
-        };
-        let reported_before = UNKNOWN_LOW_BITS[idx].load(Ordering::Relaxed) & bit != 0;
-        LAST_STUB.store(u32::MAX, Ordering::Relaxed);
-        let mut frame = SyscallFrame { rax: u64::from(nr), ..SyscallFrame::default() };
-        let ret = dispatch(core::hint::black_box(&mut frame));
-        if !reported_before {
-            UNKNOWN_LOW_BITS[idx].fetch_and(!bit, Ordering::Relaxed);
-        }
-        crate::kassert_eq!(LAST_STUB.load(Ordering::Relaxed), nr);
-        crate::kassert_eq!(ret, SyscallReturn::Sysret);
-        crate::kassert_eq!(frame.rax, neg_errno(errno::ENOSYS));
-    }
-    Ok(())
 }

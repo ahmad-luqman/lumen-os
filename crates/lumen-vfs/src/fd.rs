@@ -65,6 +65,11 @@ pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
     status_flags: AtomicU32,
     fd_refs: AtomicU32,
     pub offset: L,
+    /// A directory's position (Lock 2): the `readdir` cursor `getdents64`
+    /// resumes at, `0` at the start; `lseek` sets it. Opaque: `0` or a
+    /// [`DirEntry::next_cursor`](crate::DirEntry::next_cursor) the
+    /// directory returned, or whatever `lseek` was given (any value: the
+    /// contract on [`VfsInode::readdir`](crate::VfsInode::readdir)).
     pub dir_cursor: L,
     open_guard: OpenGuard,
 }
@@ -120,9 +125,9 @@ impl<L: VfsLock<u64>> OpenFile<L> {
     }
 
     /// The open reference this description holds on its inode: clone it
-    /// for another holder (a file mapping, `AddressSpace::mmap_file`) that
-    /// must keep the inode open as long as the description does, with no
-    /// fresh [`OpenGuard::try_new`] that could be refused.
+    /// for another holder (`fchdir`'s cwd, a file mapping) that must not
+    /// be refused the way a fresh [`OpenGuard::try_new`] can be: a procfs
+    /// inode whose process has ended (its `stat()` says `ENOENT`).
     pub fn open_guard(&self) -> &OpenGuard {
         &self.open_guard
     }
