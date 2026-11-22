@@ -284,7 +284,7 @@ mod kt {
     /// `open(path, flags)` through the syscall, in path slot `slot`.
     pub(super) fn open(slot: u64, path: &str, flags: u32) -> Result<Fd, &'static str> {
         let ret = fd::sys_open(up(slot, path)?, OpenFlags::from_bits(flags), mode(0));
-        if ret < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(ret)) } else { Err(failed("an open", ret as i64)) }
+        fd::ktest_fd(ret).map_err(|what| failed(what, ret as i64))
     }
 
     /// What `read(fd)` gives, at most 64 bytes.

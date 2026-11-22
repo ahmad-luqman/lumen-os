@@ -20,6 +20,12 @@ pub trait FileSystem: Send + Sync {
     fn root_inode(&self) -> Arc<dyn VfsInode>;
 
     /// Flush filesystem metadata and dirty state.
+    ///
+    /// Logs its own failures at `warn` (ext4: each inode and the block
+    /// cache that failed). Nothing above it reports them: `sync(2)` returns
+    /// 0 whatever this returns, and the kernel's `vfs::sync_all` logs a
+    /// failed filesystem only at `debug`, so these lines are the only
+    /// report of a failed global sync.
     fn sync(&self) -> Result<(), VfsError>;
 
     /// True if the filesystem is mounted read-only.
@@ -144,6 +150,12 @@ pub trait VfsInode: Send + Sync {
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError>;
     fn truncate(&self, size: u64) -> Result<(), VfsError>;
     fn set_mode(&self, mode: u16) -> Result<(), VfsError>;
+    /// Set the owner and group (`None` leaves either as it is), update
+    /// `ctime`, and leave the mode [`mode_after_chown`](crate::mode_after_chown)
+    /// gives (setuid dropped on anything but a directory, setgid too with
+    /// group-execute), all in one hold of the inode's metadata lock and, on
+    /// disk, one inode write: a failure changes nothing, and no `set_mode`
+    /// can land between the owner change and the mode's.
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError>;
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError>;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError>;
@@ -168,6 +180,10 @@ pub trait VfsInode: Send + Sync {
     fn sync(&self, data_only: bool) -> Result<(), VfsError>;
 
     /// Execute `f` with mutable access to this inode's Lock-4-protected `AdvisoryLocks`.
+    ///
+    /// `Err` only if `f` did not run (a filesystem keeping no lock state):
+    /// once `f` has run, its changes stand and the call is `Ok`, so a caller
+    /// never loses a release `f` made (and must wake waiters for).
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError>;
 
     /// The concrete inode, for the kernel's `vfs::mmap_page` alone: it

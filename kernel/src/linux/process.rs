@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use lumen_vfs::{FdTable, InodeType, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded};
 
@@ -316,17 +316,20 @@ pub fn take_current() -> ProcessState {
     proc
 }
 
-/// Give back one descriptor's slot on `file`: `pid`'s POSIX record locks on
-/// its inode go on any close (as Linux), and its `flock` locks with the last
-/// slot of the open file description. Takes the inode's Lock 4: never call
-/// it holding `ACTIVE_PROCS` (or any spinlock).
+/// Give back one descriptor's slot on `file` (`close`, exit, `dup2`
+/// displacing it): `pid`'s POSIX record locks on its inode go on any close
+/// (as Linux), and its `flock` locks with the last slot of the open file
+/// description; if any went, the blocked lockers are woken to retry
+/// ([`locks_released`]). Takes the inode's Lock 4: never call it holding
+/// `ACTIVE_PROCS` (or any spinlock).
 fn release_fd(pid: u32, file: FileRef) {
     let last = file.dec_fd_ref() == 0;
     let id = file.id;
+    let mut freed = false;
     let released = file.inode.with_locks_mut(&mut |locks| {
-        locks.release_posix_for_pid(pid);
+        freed = locks.release_posix_for_pid(pid);
         if last {
-            locks.release_flock(id);
+            freed |= locks.release_flock(id);
         }
     });
     // Every filesystem keeps lock state today; one that refused would keep
@@ -334,6 +337,59 @@ fn release_fd(pid: u32, file: FileRef) {
     if let Err(e) = released {
         log::error!(target: "linux", "pid {pid}: closing {}: its locks weren't released: {e:?}", file.path);
     }
+    if freed {
+        locks_released();
+    }
+}
+
+/// How many times an advisory lock may have been given up (see
+/// [`locks_released`]): a blocking `F_SETLKW` or `flock` reads it before
+/// each attempt and waits for it to change ([`wait_for_lock_release`]).
+static LOCK_RELEASES: AtomicU64 = AtomicU64::new(0);
+
+/// The threads in a blocking `F_SETLKW` or `flock`, waiting for a lock to
+/// be given up: one queue for every inode (a release anywhere wakes them
+/// all, and each retries its own lock), so no `VfsInode` needs a queue of
+/// its own.
+static LOCK_WAITERS: sched::WaitQueue = sched::WaitQueue::new();
+
+/// How many threads are in [`wait_for_lock_release`] now (the lock
+/// ktests' sign that a blocking call is waiting).
+#[cfg(feature = "ktest")]
+static LOCK_WAITING: AtomicU32 = AtomicU32::new(0);
+
+/// The release count a blocking lock call reads before each attempt.
+pub fn lock_releases() -> u64 {
+    LOCK_RELEASES.load(Ordering::SeqCst)
+}
+
+/// Say that an advisory lock (`flock` or a POSIX record lock) may have been
+/// given up or weakened, waking every blocked locker to retry. Call it
+/// after the inode's lock state is released, never under it, under
+/// `ACTIVE_PROCS` or under another spinlock: `wake_all` takes the wait
+/// queue's lock and each woken thread's run-queue lock.
+pub fn locks_released() {
+    LOCK_RELEASES.fetch_add(1, Ordering::SeqCst);
+    LOCK_WAITERS.wake_all();
+}
+
+/// Block until [`locks_released`] has been called since [`lock_releases`]
+/// read `seen` (at once if it already has, so a release between a failed
+/// attempt and this wait isn't missed). No signal ends the wait (M7 has no
+/// signal delivery): a caller refuses a wait that would never end
+/// beforehand (`F_SETLKW`'s `EDEADLK`), if it can tell.
+pub fn wait_for_lock_release(seen: u64) {
+    #[cfg(feature = "ktest")]
+    LOCK_WAITING.fetch_add(1, Ordering::SeqCst);
+    LOCK_WAITERS.wait_until(|| LOCK_RELEASES.load(Ordering::SeqCst) != seen);
+    #[cfg(feature = "ktest")]
+    LOCK_WAITING.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// How many threads are blocked in a lock call now (ktests).
+#[cfg(feature = "ktest")]
+pub(crate) fn lock_waiters() -> u32 {
+    LOCK_WAITING.load(Ordering::SeqCst)
 }
 
 /// The current process's open file on `fd` (a clone, taken and released
@@ -405,7 +461,6 @@ pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError
 /// `F_DUPFD_CLOEXEC`, `dup`): the descriptor. `EBADF` if `old` isn't open,
 /// `EINVAL` if `min` is out of range, `EMFILE` if no slot at or above it is
 /// free. Two holds of `ACTIVE_PROCS`, as [`dup_current_fd`].
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `fcntl(F_DUPFD*)` calls it; the ktests until then
 pub fn dup_current_fd_from(old: i32, min: i32, cloexec: bool) -> Result<i32, VfsError> {
     let file = current_file(old).ok_or(VfsError::BadF)?;
     file.inc_fd_ref();
@@ -438,7 +493,6 @@ pub fn close_current_fd(fd: i32) -> Result<(), VfsError> {
 
 /// Whether descriptor `fd` of the current process is close-on-exec, or
 /// `EBADF`.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `fcntl(F_GETFD)` (wave 3) calls it; the ktests until then
 pub fn current_cloexec(fd: i32) -> Result<bool, VfsError> {
     with_current(|p| p.fds.get_cloexec(fd))
 }

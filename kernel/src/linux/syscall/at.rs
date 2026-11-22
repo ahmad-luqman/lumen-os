@@ -1,7 +1,9 @@
 //! What the M7 file syscalls share (#254's clusters): decoding their
 //! register arguments, copying a path argument in, resolving a `dirfd` into
-//! the directory a path starts from, and filling Linux's `struct stat` and
-//! `struct statx` from VFS metadata.
+//! the directory a path starts from (and, through it, the inode a path
+//! names: [`lookup`]), and filling Linux's `struct stat` and `struct statx`
+//! from VFS metadata and writing them to user memory ([`write_stat`],
+//! [`write_statx`]).
 //!
 //! `dispatch` decodes each register into the handler's parameter type with
 //! [`reg`], as Linux reads it: an `int`, `mode_t` or `unsigned int` is the
@@ -131,7 +133,6 @@ impl Mode {
     }
 
     /// The low 32 bits as given (`umask` keeps `& 0o777` of them).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `umask` (wave 3) calls it; the ktests until then
     pub(super) fn bits(self) -> u32 {
         self.0
     }
@@ -178,7 +179,6 @@ impl FromReg for AccessMask {
 pub(super) struct UserPtr(u64);
 
 impl UserPtr {
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `utimensat` (wave 3) calls it; the ktests until then
     pub(super) fn is_null(self) -> bool {
         self.0 == 0
     }
@@ -206,14 +206,22 @@ impl UserPath {
     /// empty path without it).
     ///
     /// `NULL` is `-EFAULT` too. A caller for which `NULL` means something
-    /// checks first: `utimensat`'s path, and, from Linux 6.11, `fstatat`'s and
-    /// `statx`'s with `AT_EMPTY_PATH` (the same as `""`).
+    /// checks first: `utimensat`'s path, and `newfstatat`'s and `statx`'s
+    /// with `AT_EMPTY_PATH` (`""`, through [`UserPath::empty`]; Lumen reads
+    /// it so whenever that flag is set, where Linux 6.11 does only for an fd
+    /// dirfd with exactly that flag, 6.13 generally).
     ///
     /// Must be called with interrupts enabled and no lock held.
     pub(super) fn copy_in(ptr: UserPtr, allow_empty: bool) -> Result<Self, u32> {
         let max_len = general::PATH_MAX as usize - 1;
         let bytes = copy_cstr_from_user(ptr.addr(), max_len).map_err(CopyError::to_errno)?;
         Self::from_bytes(bytes, allow_empty)
+    }
+
+    /// The empty path, for a caller that reads a `NULL` path argument as
+    /// `""` instead of copying it in.
+    pub(super) fn empty() -> Self {
+        Self(Vec::new())
     }
 
     fn from_bytes(bytes: Vec<u8>, allow_empty: bool) -> Result<Self, u32> {
@@ -270,7 +278,6 @@ impl Start {
     }
 
     /// `resolve_path` from this start (the `stat` family, `access`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `newfstatat`/`statx`/`faccessat2` call it
     pub(super) fn resolve(&self, path: &UserPath, flags: ResolveFlags) -> Result<ResolvedPath, u32> {
         resolve_path(tables(), self.dir(), path.as_bytes(), flags).map_err(VfsError::to_errno)
     }
@@ -347,8 +354,8 @@ impl Start {
 /// - An absolute path starts at the root whatever `dirfd` is: the dirfd is
 ///   never looked at (a bad one is no error).
 /// - An empty path (`UserPath::copy_in` let one through only with
-///   `AT_EMPTY_PATH`, or for `readlinkat`) names the dirfd's file itself, a
-///   directory or not, or the cwd.
+///   `AT_EMPTY_PATH`, `UserPath::empty()`, or for `readlinkat`) names the
+///   dirfd's file itself, a directory or not, or the cwd.
 /// - A relative path starts at the cwd's inode for `Dirfd::Cwd`, or at the
 ///   dirfd's file: `-EBADF` if it isn't open, `-ENOTDIR` if it isn't a
 ///   directory (an `O_PATH` one is fine).
@@ -369,6 +376,41 @@ pub(super) fn start_dir(dirfd: Dirfd, path: &UserPath) -> Result<Start, u32> {
         return Err(errno::ENOTDIR);
     }
     Ok(Start { dir: Some(inode), base: Some(base) })
+}
+
+/// The inode `path` names from `dirfd`, as a `*at` syscall's `flags` (the
+/// caller validated them) say: the final symlink followed unless
+/// `AT_SYMLINK_NOFOLLOW`; with `AT_EMPTY_PATH`, an empty path naming the
+/// start itself. Without that flag an empty path is `-ENOENT` here too,
+/// however `path` was copied in, once `start_dir` has checked the dirfd (a
+/// bad one is `-EBADF` first). Not for `linkat`, whose `AT_SYMLINK_FOLLOW`
+/// runs the other way.
+pub(super) fn lookup(dirfd: Dirfd, path: &UserPath, flags: AtFlags) -> Result<Arc<dyn VfsInode>, u32> {
+    let start = start_dir(dirfd, path)?;
+    let how = ResolveFlags {
+        follow_final: !flags.has_symlink_nofollow(),
+        empty_path: flags.has_empty_path(),
+        ..ResolveFlags::default()
+    };
+    Ok(start.resolve(path, how)?.inode)
+}
+
+/// Write `m` as Linux's `struct stat` to `buf` (`fstat`, the `stat`
+/// family): `-EFAULT` for a bad buffer. Must be called with no lock held.
+pub(super) fn write_stat(buf: UserPtr, m: &Metadata) -> Result<(), u32> {
+    let st = stat_from_metadata(m);
+    // SAFETY: `general::stat` is 144 bytes of integers with an explicit
+    // `__pad0` and no implicit padding, all initialized.
+    unsafe { super::copy_pod_to_user(buf.addr(), &st) }.map_err(CopyError::to_errno)
+}
+
+/// Write `m` as Linux's `struct statx` to `buf` (`statx`): `-EFAULT` for a
+/// bad buffer. Must be called with no lock held.
+pub(super) fn write_statx(buf: UserPtr, m: &Metadata) -> Result<(), u32> {
+    let stx = statx_from_metadata(m);
+    // SAFETY: `general::statx` is 256 bytes of integers with explicit spare
+    // fields and no implicit padding, all initialized.
+    unsafe { super::copy_pod_to_user(buf.addr(), &stx) }.map_err(CopyError::to_errno)
 }
 
 /// A timestamp's nanoseconds, within `0..1_000_000_000` whatever a
@@ -411,7 +453,6 @@ pub(super) fn stat_from_metadata(m: &Metadata) -> general::stat {
     }
 }
 
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `statx` (wave 3) calls it; the ktests until then
 fn statx_time(t: Timespec) -> general::statx_timestamp {
     general::statx_timestamp { tv_sec: t.sec, tv_nsec: nsec(t), __reserved: 0 }
 }
@@ -419,7 +460,6 @@ fn statx_time(t: Timespec) -> general::statx_timestamp {
 /// The Linux `struct statx` for `m` (`statx`): the basic fields
 /// (`STATX_BASIC_STATS` in `stx_mask`, whatever was asked, as Linux may),
 /// no birth time, no mount id, no attributes.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `statx` (wave 3) calls it; the ktests until then
 pub(super) fn statx_from_metadata(m: &Metadata) -> general::statx {
     let zero_time = general::statx_timestamp { tv_sec: 0, tv_nsec: 0, __reserved: 0 };
     general::statx {

@@ -208,17 +208,24 @@ VFS_EXACT_LINES = {
     # ext4_truncate_and_open_unlink_preserve_state_on_io_error
     rf"ERROR vfs: ext4 {_DEV} inode \d+: truncate failed and its tail bytes couldn't be restored on disk": 1,
     # The writeback-error ktests (reclaim, sync, full disk, failing device,
-    # a failing page among good ones).
+    # a failing page among good ones; linux::syscall::io's
+    # io_fsync_writes_an_ext4_file_back_and_reports_eio: one failed page).
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 4,
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 2,
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 3,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
     # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
-    # fills, a good one, a third failed fill), one warning each.
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 2,
+    # fills, a good one, a third failed fill), one warning each; and
+    # linux::syscall::io's io_pread_pwrite_report_filesystem_errors: one.
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 3,
     # mm::user_vm::file_vm_disk_read_error_is_a_bus_error: a fault's fill.
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 2 \(offset 8192\) failed: Io": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 1,
+    # linux::syscall::io: io_fsync_writes_an_ext4_file_back_and_reports_eio's
+    # `fsync` with the block cache's sync failing, and
+    # io_sync_flushes_every_mounted_filesystem's `sync` with one volume's.
+    rf"WARN  vfs: fsync: ext4 {_DEV} inode \d+: block cache: block device I/O error": 1,
+    rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 1,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
     # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page.
     (

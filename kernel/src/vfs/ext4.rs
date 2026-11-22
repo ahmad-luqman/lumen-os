@@ -27,7 +27,7 @@ use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFe
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, next_detached_ino, next_lock_id,
+    VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
 use log::{error, warn};
@@ -515,6 +515,10 @@ struct Ext4Shared {
     read_only: bool,
     /// The largest file size the filesystem can map ([`max_file_size`]).
     max_file_size: u64,
+    /// The errno of the last per-inode sync's (`fsync`/`fdatasync`) failed
+    /// block-cache sync, 0 after one that worked: its warning is logged
+    /// once per failing streak, as a page's writeback is.
+    bcache_sync_errno: AtomicU32,
     state: SleepMutex<Ext4FsInner>,
 }
 
@@ -576,6 +580,7 @@ impl Ext4FileSystem {
             dev,
             read_only,
             max_file_size: max_file_size(layout.block_size, extents),
+            bcache_sync_errno: AtomicU32::new(0),
             state: SleepMutex::new(Ext4FsInner {
                 dev,
                 ext4,
@@ -3865,16 +3870,24 @@ impl VfsInode for Ext4Inode {
         let now_ts = duration_to_timespec(now_dur);
         let new_uid = uid.unwrap_or(meta.uid);
         let new_gid = gid.unwrap_or(meta.gid);
+        // The set-id bits a chown drops, in the same hold and disk write as
+        // the owner (`VfsInode::set_owner`'s contract).
+        let new_mode = mode_after_chown(self.inode_type, meta.mode);
         if !self.is_detached() {
             let inner = self.shared.state.lock();
             let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
             disk.set_uid(new_uid);
             disk.set_gid(new_gid);
+            if new_mode != meta.mode {
+                let full_mode = (self.inode_type.to_mode_bits() as u16) | new_mode;
+                disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
+            }
             disk.set_ctime(now_dur);
             disk.write(&inner.ext4).map_err(map_ext4_err)?;
         }
         meta.uid = new_uid;
         meta.gid = new_gid;
+        meta.mode = new_mode;
         meta.ctime = now_ts;
         Ok(())
     }
@@ -3982,12 +3995,22 @@ impl VfsInode for Ext4Inode {
             return Ok(());
         }
         self.flush_to_ext4(data_only)?;
-        // The filesystem's own sync logs a block-cache failure (once, not
-        // once per inode a global sync visits); the caller reports this one.
-        self.shared.sync_bcache().map_err(|(e, cause)| {
-            log::debug!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);
-            e
-        })
+        // A global sync goes through the filesystem's own `sync` (which logs
+        // a block-cache failure once, not once per inode), never through
+        // here: a per-inode sync (`fsync`/`fdatasync`) logs its own, once
+        // per failing streak.
+        match self.shared.sync_bcache() {
+            Ok(()) => {
+                self.shared.bcache_sync_errno.store(0, Ordering::Release);
+                Ok(())
+            }
+            Err((e, cause)) => {
+                if self.shared.bcache_sync_errno.swap(e.to_errno(), Ordering::AcqRel) != e.to_errno() {
+                    warn!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);
+                }
+                Err(e)
+            }
+        }
     }
 
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {
@@ -4005,7 +4028,7 @@ impl VfsInode for Ext4Inode {
 /// Test seams for the ktests below: a block cache that counts and injects
 /// faults, and mount, remount and image helpers.
 #[cfg(feature = "ktest")]
-pub(super) mod ktest_util {
+pub(crate) mod ktest_util {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -4022,7 +4045,7 @@ pub(super) mod ktest_util {
     /// and fails them on request.
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
-        pub dev: MemBlkDev,
+        pub(in crate::vfs) dev: MemBlkDev,
         pub reads: AtomicUsize,
         pub writes: AtomicUsize,
         /// Fail the write with this number (counting from `arm_write`), once.
@@ -4034,6 +4057,8 @@ pub(super) mod ktest_util {
         pub range_reads_fail_after_write_fault: AtomicBool,
         pub fail_reads: AtomicBool,
         pub fail_writes: AtomicBool,
+        /// Fail only `sync` (written blocks stay in the cache, dirty).
+        pub fail_syncs: AtomicBool,
         /// Fail the next `fail_range_reads` reads overlapping `[lo, hi)`.
         range_lo: AtomicU64,
         range_hi: AtomicU64,
@@ -4058,6 +4083,7 @@ pub(super) mod ktest_util {
             self.range_reads_fail_after_write_fault.store(false, Ordering::Release);
             self.fail_reads.store(false, Ordering::Release);
             self.fail_writes.store(false, Ordering::Release);
+            self.fail_syncs.store(false, Ordering::Release);
             self.fail_range_reads.store(0, Ordering::Release);
         }
     }
@@ -4096,7 +4122,7 @@ pub(super) mod ktest_util {
         }
 
         fn sync(&self) -> Result<(), BlockError> {
-            if self.fail_writes.load(Ordering::Acquire) {
+            if self.fail_writes.load(Ordering::Acquire) || self.fail_syncs.load(Ordering::Acquire) {
                 return Err(BlockError::Io);
             }
             self.inner.lock().sync()
@@ -4121,6 +4147,7 @@ pub(super) mod ktest_util {
             range_reads_fail_after_write_fault: AtomicBool::new(false),
             fail_reads: AtomicBool::new(false),
             fail_writes: AtomicBool::new(false),
+            fail_syncs: AtomicBool::new(false),
             range_lo: AtomicU64::new(0),
             range_hi: AtomicU64::new(0),
             fail_range_reads: AtomicUsize::new(0),
@@ -4138,7 +4165,8 @@ pub(super) mod ktest_util {
     }
 
     impl Mnt {
-        fn dev_bytes(&self) -> Vec<u8> {
+        /// The device's bytes as they are, under the block cache.
+        pub fn dev_bytes(&self) -> Vec<u8> {
             self.cache.dev.0.data.lock().clone()
         }
     }

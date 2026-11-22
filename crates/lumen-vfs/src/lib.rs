@@ -34,7 +34,10 @@ pub use cache::{DentryCache, DentryTarget, InodeCache};
 pub use error::VfsError;
 pub use fd::{FdEntry, FdTable, LocalLock, OpenFile, OpenFileId, VfsLock};
 pub use fs::{FileSystem, OpenGuard, VfsInode};
-pub use locks::{AdvisoryLocks, FlockKind, FlockOp, FlockSpec, LockContext, LockOutcome, PosixLockType};
+pub use locks::{
+    AdvisoryLocks, Deadlock, FlockKind, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixLockType, PosixWaitGraph,
+    RecordLockOutcome, WaitSearch,
+};
 pub use mount::{MountInfo, MountTable, SimpleVfsTables, VfsCacheOps};
 pub use ops::{
     Opened, link_at, mkdir_at, open_inode, open_inode_guarded, readlink_at, rename_at2, symlink_at, unlink_at,
@@ -44,7 +47,7 @@ pub use resolve::{
 };
 pub use types::{
     AccessMask, AccessMode, AtFlags, DevId, DirEntry, Ino, InodeType, Metadata, OpenFlags, RenameFlags, SeekFrom,
-    SetTime, Timespec,
+    SetTime, Timespec, mode_after_chown,
 };
 
 /// Maximum POSIX path length including NUL (`PATH_MAX`).
