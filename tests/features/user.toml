@@ -77,7 +77,7 @@ tests = [
 ]
 
 [[feature]]
-name = "pread64/pwrite64 at a given offset without moving the fd's (across a page and over 4 KiB, a hole past EOF reading as zeros, O_APPEND appending whatever the offset, -EINVAL negative offsets, -ESPIPE on terminals before -EBADF directions, -EISDIR, a fault mid-transfer returning what moved), fsync/fdatasync writing an ext4 file's dirty pages to disk (-EIO from a failing disk, the pages kept for the next sync; -EINVAL on terminals, devices and procfs; -EBADF on O_PATH) and sync returning 0 (#254)"
+name = "pread64/pwrite64 at a given offset without moving the fd's (across a page and over 4 KiB, a hole past EOF reading as zeros, O_APPEND appending whatever the offset, a fault mid-transfer returning what moved; in Linux's errno order: -EINVAL negative offsets, -EBADF, -ESPIPE on terminals, -EBADF directions, -EFAULT outside user space, -EINVAL past i64::MAX, -EISDIR), fsync/fdatasync writing an ext4 file through the block cache to the device (-EIO when writes or the cache's sync fail, the data written by the next sync; -EINVAL on terminals, devices and procfs; -EBADF on O_PATH) and sync returning 0 (#254)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::syscall::io::io_pread_pwrite_at_offsets_leave_the_offset_alone",

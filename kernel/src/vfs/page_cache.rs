@@ -635,12 +635,17 @@ pub(crate) mod ktest_files {
     use super::super::{MemBlkDev, build_minimal_ext4_image_blocks};
     use crate::sync::SleepMutex;
 
-    /// A block cache over an in-memory disk whose reads, or writes and
-    /// syncs, fail on request.
+    /// A block cache over an in-memory disk whose reads, writes or syncs
+    /// fail on request.
     struct FlakyCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
+        /// The disk under the cache, to read what reached it.
+        dev: MemBlkDev,
         fail_reads: AtomicBool,
+        /// Writes into the cache, and its syncs.
         fail_writes: AtomicBool,
+        /// Syncs alone: written blocks stay in the cache, dirty.
+        fail_syncs: AtomicBool,
     }
 
     impl BlockCacheBackend for FlakyCache {
@@ -659,7 +664,7 @@ pub(crate) mod ktest_files {
         }
 
         fn sync(&self) -> Result<(), BlockError> {
-            if self.fail_writes.load(Ordering::Acquire) {
+            if self.fail_writes.load(Ordering::Acquire) || self.fail_syncs.load(Ordering::Acquire) {
                 return Err(BlockError::Io);
             }
             self.inner.lock().sync()
@@ -677,9 +682,11 @@ pub(crate) mod ktest_files {
         pub(crate) fn new(minor: u32) -> Result<Self, &'static str> {
             let dev = MemBlkDev::new(build_minimal_ext4_image_blocks(256), false);
             let cache = Arc::new(FlakyCache {
-                inner: SleepMutex::new(BlockCache::new(dev, 64).map_err(|_| "block cache")?),
+                inner: SleepMutex::new(BlockCache::new(dev.clone(), 64).map_err(|_| "block cache")?),
+                dev,
                 fail_reads: AtomicBool::new(false),
                 fail_writes: AtomicBool::new(false),
+                fail_syncs: AtomicBool::new(false),
             });
             let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&cache) as Arc<dyn BlockCacheBackend>;
             let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "ext4 mount")?;
@@ -705,10 +712,24 @@ pub(crate) mod ktest_files {
             self.cache.fail_reads.store(fail, Ordering::Release);
         }
 
-        /// Make every disk write and block-cache sync fail (`true`) or work
-        /// again (`fsync`'s `-EIO`, #254).
+        /// Make every write into the block cache, and its syncs, fail
+        /// (`true`) or work again (`fsync`'s `-EIO`, #254).
         pub(crate) fn fail_writes(&self, fail: bool) {
             self.cache.fail_writes.store(fail, Ordering::Release);
+        }
+
+        /// Make the block cache's syncs alone fail (`true`) or work again:
+        /// writes still land in the cache, which keeps them dirty.
+        pub(crate) fn fail_syncs(&self, fail: bool) {
+            self.cache.fail_syncs.store(fail, Ordering::Release);
+        }
+
+        /// The root of a read-only mount of a copy of the disk's bytes as
+        /// they are now, not through the block cache: what it reads reached
+        /// the device.
+        pub(crate) fn mount_device_copy_ro(&self, minor: u32) -> Result<Arc<dyn VfsInode>, &'static str> {
+            let bytes = self.cache.dev.0.data.lock().clone();
+            Ok(super::super::ext4::ktest_util::mount_ro_image(bytes, minor)?.root_inode())
         }
     }
 

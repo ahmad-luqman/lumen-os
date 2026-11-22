@@ -14,34 +14,47 @@ use super::fd::{FILE_CHUNK, partial, vfs};
 use super::{MAX_SINGLE_IO, finish, not_implemented};
 use crate::linux::process::FileRef;
 use crate::linux::{errno, general};
-use crate::user::{copy_from_user, copy_to_user};
+use crate::user::{copy_from_user, copy_to_user, user_range_valid};
 use lumen_vfs::{DevId, InodeType, OpenFlags, VfsInode};
 
-/// A positional transfer's start and length: `count` capped at
-/// `MAX_SINGLE_IO`, as `read`/`write` cap it. `EINVAL` if `offset` is
-/// negative as an `loff_t`, or the transfer would end past `i64::MAX`
-/// (Linux's `rw_verify_area`, which checks the uncapped count; a count over
-/// 1 MiB is capped first here).
-fn positional_range(offset: u64, count: u64) -> Result<(u64, usize), u32> {
-    let limit = count.min(MAX_SINGLE_IO as u64);
-    // No overflow: `offset <= i64::MAX` is checked first and `limit` is at most 1 MiB.
-    if offset > i64::MAX as u64 || offset + limit > i64::MAX as u64 {
-        return Err(errno::EINVAL);
-    }
-    Ok((offset, limit as usize))
+// A positional transfer's checks come in Linux's order (`ksys_pread64`,
+// `vfs_read`; `pwrite64` the same): a negative offset (`EINVAL`), the fd
+// (`EBADF`: not open, or `O_PATH`), whether it has a position (`ESPIPE`),
+// its access mode (`EBADF`), the buffer's range (`EFAULT`), then the end
+// past `i64::MAX` (`EINVAL`).
+
+/// `EINVAL` for an offset negative as an `loff_t`: checked before the fd.
+fn nonnegative(offset: u64) -> Result<u64, u32> {
+    if offset > i64::MAX as u64 { Err(errno::EINVAL) } else { Ok(offset) }
 }
 
 /// The open file on `fd` for a positional transfer: `EBADF` if it isn't
-/// open or is `O_PATH`, `ESPIPE` on a terminal (which has no position).
-/// Linux's order: this comes before the access mode's check, so a
-/// `pread64` on the write-only fd 1 is `ESPIPE`, not `EBADF`.
+/// open or is `O_PATH`, `ESPIPE` if it has no position (a terminal; a FIFO
+/// or socket node, which ext4 can hold). Before the access mode's check, so
+/// a `pread64` on the write-only fd 1 is `ESPIPE`, not `EBADF`.
 fn positional_file(fd: Fd) -> Result<FileRef, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
-    if file.inode.is_tty() {
+    if file.inode.is_tty() || matches!(file.inode.inode_type(), InodeType::Fifo | InodeType::Socket) {
         return Err(errno::ESPIPE);
     }
     Ok(file)
+}
+
+/// How much of `count` bytes at `buf`, from `pos`, to move: `EFAULT` if the
+/// buffer runs out of user space (Linux's `access_ok`; within it, a page
+/// that isn't mapped ends the transfer there instead), `EINVAL` if the
+/// transfer would end past `i64::MAX` (`rw_verify_area`'s `loff_t` sum, on
+/// the whole count), then `count` capped at `MAX_SINGLE_IO`, as `read` and
+/// `write` cap it.
+fn transfer_len(buf: UserPtr, pos: u64, count: u64) -> Result<usize, u32> {
+    if !user_range_valid(buf.addr(), usize::try_from(count).unwrap_or(usize::MAX)) {
+        return Err(errno::EFAULT);
+    }
+    if (pos as i64).wrapping_add(count as i64) < 0 {
+        return Err(errno::EINVAL);
+    }
+    Ok(count.min(MAX_SINGLE_IO as u64) as usize)
 }
 
 /// `pread64(fd, buf, count, offset)` (17).
@@ -50,9 +63,10 @@ pub(super) fn sys_pread64(fd: Fd, buf: UserPtr, count: u64, offset: u64) -> u64 
 }
 
 fn pread64(fd: Fd, buf: UserPtr, count: u64, offset: u64) -> Result<u64, u32> {
-    let (pos, limit) = positional_range(offset, count)?;
+    let pos = nonnegative(offset)?;
     let file = positional_file(fd)?;
     file.require_readable().map_err(vfs)?;
+    let limit = transfer_len(buf, pos, count)?;
     if file.inode.inode_type() == InodeType::Dir {
         return Err(errno::EISDIR);
     }
@@ -98,9 +112,10 @@ pub(super) fn sys_pwrite64(fd: Fd, buf: UserPtr, count: u64, offset: u64) -> u64
 }
 
 fn pwrite64(fd: Fd, buf: UserPtr, count: u64, offset: u64) -> Result<u64, u32> {
-    let (pos, limit) = positional_range(offset, count)?;
+    let pos = nonnegative(offset)?;
     let file = positional_file(fd)?;
     file.require_writable().map_err(vfs)?;
+    let limit = transfer_len(buf, pos, count)?;
     let append = file.status_flags() & OpenFlags::O_APPEND != 0;
     let mut kbuf = [0u8; FILE_CHUNK];
     let mut done = 0usize;
@@ -255,14 +270,23 @@ crate::ktest!(
             kassert_eq!(super::fd::sys_read(fd, at::reg(back), 3), 3);
             kassert_eq!(ktest_user_bytes(back, 3)?, b"\0\0\0");
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 13);
-            // A negative offset, or one whose end passes `i64::MAX`:
-            // `EINVAL`, even on a closed fd (checked first, as Linux).
+            // A negative offset: `EINVAL`, even on a closed fd (checked
+            // first, as Linux).
             let neg = -1i64 as u64;
+            let max = i64::MAX as u64;
+            let kernel_half = 0xffff_8000_0000_0000u64;
             kassert_eq!(sys_pread64(fd, at::reg(back), 1, neg), neg_errno(errno::EINVAL));
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 1, neg), neg_errno(errno::EINVAL));
             kassert_eq!(sys_pread64(at::reg(99), at::reg(back), 1, neg), neg_errno(errno::EINVAL));
-            kassert_eq!(sys_pread64(fd, at::reg(back), 1, i64::MAX as u64), neg_errno(errno::EINVAL));
-            kassert_eq!(sys_pread64(fd, at::reg(back), 0, i64::MAX as u64), 0);
+            // An end past `i64::MAX`: `EINVAL`, but after the fd's checks
+            // and the buffer's range (a closed fd `EBADF`, a buffer out of
+            // user space `EFAULT`); 0 bytes at `i64::MAX` are fine.
+            kassert_eq!(sys_pread64(fd, at::reg(back), 1, max), neg_errno(errno::EINVAL));
+            kassert_eq!(sys_pwrite64(fd, at::reg(base), 1, max), neg_errno(errno::EINVAL));
+            kassert_eq!(sys_pread64(at::reg(99), at::reg(back), 1, max), neg_errno(errno::EBADF));
+            kassert_eq!(sys_pread64(fd, at::reg(kernel_half), 1, max), neg_errno(errno::EFAULT));
+            kassert_eq!(sys_pread64(fd, at::reg(back), 1 << 62, 1 << 62), neg_errno(errno::EFAULT));
+            kassert_eq!(sys_pread64(fd, at::reg(back), 0, max), 0);
             kassert_eq!(size(), Ok(20_003));
             // The last mapped page, then nothing: the first chunk moves, the
             // second faults; the offset stays put.
@@ -272,9 +296,13 @@ crate::ktest!(
             kassert_eq!(size(), Ok(34_096));
             kassert_eq!(sys_pread64(fd, at::reg(back), 4096, 30_000), 4096);
             kassert!(ktest_user_bytes(back, 4096)?[..] == pattern[..4096]);
-            // A first chunk that faults: `EFAULT`, nothing written.
-            kassert_eq!(sys_pread64(fd, at::reg(0xffff_8000_0000_0000), 4, 4000), neg_errno(errno::EFAULT));
-            kassert_eq!(sys_pwrite64(fd, at::reg(0xffff_8000_0000_0000), 4, 40_000), neg_errno(errno::EFAULT));
+            // A first chunk that faults (unmapped, or out of user space):
+            // `EFAULT`, nothing written.
+            let unmapped = last_page + 4096;
+            for bad in [unmapped, kernel_half] {
+                kassert_eq!(sys_pread64(fd, at::reg(bad), 4, 4000), neg_errno(errno::EFAULT));
+                kassert_eq!(sys_pwrite64(fd, at::reg(bad), 4, 40_000), neg_errno(errno::EFAULT));
+            }
             kassert_eq!(size(), Ok(34_096));
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 13);
             kassert_eq!(sys_close(fd), 0);
@@ -360,9 +388,10 @@ crate::ktest!(
 crate::ktest!(
     fn io_fsync_writes_an_ext4_file_back_and_reports_eio() {
         // On a fresh ext4 volume: what a write left in the page cache is not
-        // on the disk until `fsync`, and is after it (read back through a
-        // read-only mount of the same disk); a failing disk is `EIO`, the
-        // pages kept dirty for the next sync.
+        // on the device until `fsync`, and is after it (read back through a
+        // read-only mount of a copy of the device's bytes, under the block
+        // cache). Writes into the block cache failing, or its sync alone:
+        // `EIO`, the device unchanged, and the next sync writes it all.
         use crate::vfs::page_cache::ktest_files::Ext4Volume;
         use crate::{kassert, kassert_eq};
         const LEN: usize = 6000;
@@ -378,33 +407,48 @@ crate::ktest!(
             .map_err(|_| "open the ext4 file")?;
             let raw = process::install_current_fd(file, false).map_err(|_| "install the fd")?;
             let fd: Fd = at::reg(u64::from(raw as u32));
-            let on_disk = |minor: u32| -> Result<alloc::vec::Vec<u8>, &'static str> {
-                let root = vol.remount_ro(minor)?;
-                let f = root.lookup("f").map_err(|_| "lookup on the read-only mount")?;
+            // The file as the device holds it: `None` if it isn't there yet.
+            let on_device = |minor: u32| -> Result<Option<alloc::vec::Vec<u8>>, &'static str> {
+                let root = vol.mount_device_copy_ro(minor)?;
+                let Ok(f) = root.lookup("f") else {
+                    return Ok(None);
+                };
                 let size = f.stat().map_err(|_| "stat")?.size as usize;
                 let mut data = alloc::vec![0u8; size];
                 kassert_eq!(f.read_at(0, &mut data), Ok(size));
-                Ok(data)
+                Ok(Some(data))
             };
             let pattern = ktest_pattern(LEN, 9);
             copy_to_user(base, &pattern).map_err(|_| "copy the pattern")?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), LEN as u64, 0), LEN as u64);
-            kassert_eq!(on_disk(187)?.len(), 0);
+            kassert!(on_device(187)?.is_none_or(|d| d.is_empty()));
             kassert_eq!(sys_fsync(fd), 0);
-            kassert!(on_disk(188)? == pattern);
-            // Overwrite the start with the disk failing: `EIO` from both, the
-            // disk unchanged; once it works, `fdatasync` writes it.
+            kassert_eq!(on_device(188)?, Some(pattern.clone()));
+            // Overwrite the start with writes failing: `EIO` from both, the
+            // device unchanged; once they work, `fdatasync` writes it.
             copy_to_user(base, b"ZZZZ").map_err(|_| "copy data")?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 4, 0), 4);
             vol.fail_writes(true);
             let failed = (sys_fsync(fd), sys_fdatasync(fd));
             vol.fail_writes(false);
             kassert_eq!(failed, (neg_errno(errno::EIO), neg_errno(errno::EIO)));
-            kassert!(on_disk(189)? == pattern);
+            kassert_eq!(on_device(189)?, Some(pattern.clone()));
             kassert_eq!(sys_fdatasync(fd), 0);
             let mut want = pattern.clone();
             want[..4].copy_from_slice(b"ZZZZ");
-            kassert!(on_disk(190)? == want);
+            kassert_eq!(on_device(190)?, Some(want.clone()));
+            // Again with only the block cache's sync failing: the page goes
+            // into the cache, which keeps it; the next `fsync` flushes it.
+            copy_to_user(base, b"YY").map_err(|_| "copy data")?;
+            kassert_eq!(sys_pwrite64(fd, at::reg(base), 2, 4096), 2);
+            vol.fail_syncs(true);
+            let failed = sys_fsync(fd);
+            vol.fail_syncs(false);
+            kassert_eq!(failed, neg_errno(errno::EIO));
+            kassert_eq!(on_device(191)?, Some(want.clone()));
+            kassert_eq!(sys_fsync(fd), 0);
+            want[4096..4098].copy_from_slice(b"YY");
+            kassert_eq!(on_device(192)?, Some(want));
             kassert_eq!(sys_close(fd), 0);
             Ok(())
         })?
