@@ -1680,6 +1680,16 @@ pub fn log_ext4_crate_summary() {
     }
 }
 
+/// A fresh, writable in-memory ext4 filesystem (a 256-block image) for
+/// ktests outside `vfs` (the FD layer's), on device `0:dev_minor`.
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_ext4(dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
+    let mem_dev = MemBlkDev::new(build_minimal_ext4_image_blocks(256), false);
+    let bcache: Arc<dyn ext4::BlockCacheBackend> =
+        Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(mem_dev, 64).map_err(|_| "bcache init")?));
+    ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, dev_minor), false).map_err(|_| "ext4 mount")
+}
+
 /// An in-memory block device for ktests. It stays here, not in
 /// `vfs/tests.rs`, because the `vfs/ext4.rs` and `vfs/page_cache.rs` ktests use it too.
 #[cfg(feature = "ktest")]

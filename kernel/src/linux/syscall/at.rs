@@ -12,8 +12,9 @@
 //! **Turning a [`Dirfd`] into the directory a path starts from** is
 //! [`start_dir`], the one place it happens, and its [`Start`] is the only
 //! way a handler reaches lumen-vfs's path operations (`Start::open`,
-//! `Start::resolve`; wave 3 adds the rest here): a handler never hands
-//! lumen-vfs a raw `start_dir`. Its traps:
+//! `resolve`, `mkdir`, `unlink`, `readlink`, `symlink`, and `Start::link`
+//! and `Start::rename` across two starts): a handler never hands lumen-vfs
+//! a raw `start_dir`. Its traps:
 //! - lumen-vfs's `resolve_path(start_dir: None, ..)` starts at the global
 //!   root, not the working directory: `Dirfd::Cwd` resolves to the
 //!   process's cwd inode, a concrete `Arc`, never `None`;
@@ -28,8 +29,11 @@ use alloc::vec::Vec;
 
 use lumen_vfs::{
     AccessMask, AtFlags, InodeType, Metadata, OpenFlags, Opened, RenameFlags, ResolveFlags, ResolvedPath, Timespec,
-    VfsError, VfsInode, open_inode_guarded, resolve_path,
+    VfsError, VfsInode, link_at, mkdir_at, open_inode_guarded, readlink_at, rename_at2, resolve_path, symlink_at,
+    unlink_at,
 };
+
+use crate::vfs::tables;
 
 use crate::linux::process::{self, FileRef};
 use crate::linux::{errno, general};
@@ -231,7 +235,7 @@ impl UserPath {
     /// The path as text, for the calls that take a `&str`. The one place the
     /// rule lives: a path that isn't UTF-8 names nothing the VFS can hold
     /// yet, so `-ENOENT` (#268 makes VFS names byte strings).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the `&str` VFS calls (wave 3) calls it; the ktests until then
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // for wave 3's `&str` VFS calls; the ktests until then
     pub(super) fn as_str(&self) -> Result<&str, u32> {
         core::str::from_utf8(&self.0).map_err(|_| errno::ENOENT)
     }
@@ -255,16 +259,73 @@ impl Start {
         self.dir.as_ref()
     }
 
-    /// `open_inode_guarded` from this start (`openat`).
-    pub(super) fn open(&self, path: &UserPath, flags: OpenFlags, mode: u16, umask: u16) -> Result<Opened, u32> {
-        open_inode_guarded(crate::vfs::tables(), self.dir(), path.as_bytes(), flags, mode, umask)
+    /// `open_inode_guarded` from this start (`openat`): `mode`'s permission
+    /// bits, less the process's umask, for a file it creates.
+    pub(super) fn open(&self, path: &UserPath, flags: OpenFlags, mode: Mode) -> Result<Opened, u32> {
+        let umask = process::current_umask();
+        open_inode_guarded(tables(), self.dir(), path.as_bytes(), flags, mode.perm(), umask).map_err(VfsError::to_errno)
+    }
+
+    /// `resolve_path` from this start (the `stat` family, `access`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `newfstatat`/`statx`/`faccessat2` call it
+    pub(super) fn resolve(&self, path: &UserPath, flags: ResolveFlags) -> Result<ResolvedPath, u32> {
+        resolve_path(tables(), self.dir(), path.as_bytes(), flags).map_err(VfsError::to_errno)
+    }
+
+    /// `mkdir_at` from this start (`mkdirat`): `mode`'s directory bits, less
+    /// the process's umask.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `mkdirat` calls it
+    pub(super) fn mkdir(&self, path: &UserPath, mode: Mode) -> Result<Arc<dyn VfsInode>, u32> {
+        let umask = process::current_umask();
+        mkdir_at(tables(), self.dir(), path.as_bytes(), mode.dir_perm(), umask).map_err(VfsError::to_errno)
+    }
+
+    /// `unlink_at` from this start (`unlinkat`; `remove_dir` for
+    /// `AT_REMOVEDIR`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `unlinkat` calls it
+    pub(super) fn unlink(&self, path: &UserPath, remove_dir: bool) -> Result<(), u32> {
+        unlink_at(tables(), self.dir(), path.as_bytes(), remove_dir).map_err(VfsError::to_errno)
+    }
+
+    /// `readlink_at` from this start (`readlinkat`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `readlinkat` calls it
+    pub(super) fn readlink(&self, path: &UserPath) -> Result<Vec<u8>, u32> {
+        readlink_at(tables(), self.dir(), path.as_bytes()).map_err(VfsError::to_errno)
+    }
+
+    /// `symlink_at` at `linkpath` from this start (`symlinkat`): `target` is
+    /// stored as given, never resolved, so it takes no start.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `symlinkat` calls it
+    pub(super) fn symlink(&self, target: &[u8], linkpath: &UserPath) -> Result<Arc<dyn VfsInode>, u32> {
+        symlink_at(tables(), target, self.dir(), linkpath.as_bytes()).map_err(VfsError::to_errno)
+    }
+
+    /// `link_at` from `old`'s start to `new`'s (`linkat`; `follow` for
+    /// `AT_SYMLINK_FOLLOW`, `empty` for `AT_EMPTY_PATH`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `linkat` calls it
+    pub(super) fn link(
+        old: &Start,
+        old_path: &UserPath,
+        new: &Start,
+        new_path: &UserPath,
+        follow: bool,
+        empty: bool,
+    ) -> Result<(), u32> {
+        link_at(tables(), old.dir(), old_path.as_bytes(), new.dir(), new_path.as_bytes(), follow, empty)
             .map_err(VfsError::to_errno)
     }
 
-    /// `resolve_path` from this start (the `stat` family, wave 3).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `newfstatat`/`statx` call it
-    pub(super) fn resolve(&self, path: &UserPath, flags: ResolveFlags) -> Result<ResolvedPath, u32> {
-        resolve_path(crate::vfs::tables(), self.dir(), path.as_bytes(), flags).map_err(VfsError::to_errno)
+    /// `rename_at2` from `old`'s start to `new`'s (`renameat2`).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `renameat2` calls it
+    pub(super) fn rename(
+        old: &Start,
+        old_path: &UserPath,
+        new: &Start,
+        new_path: &UserPath,
+        flags: RenameFlags,
+    ) -> Result<(), u32> {
+        rename_at2(tables(), old.dir(), old_path.as_bytes(), new.dir(), new_path.as_bytes(), flags)
+            .map_err(VfsError::to_errno)
     }
 
     /// `path` (as given, relative) joined to the path the start was opened
@@ -274,7 +335,7 @@ impl Start {
     /// so a rename since then isn't followed (Linux's `d_path` would be;
     /// `getcwd` is, computing the cwd's path from its inode).
     pub(super) fn display_path(&self, path: &str) -> Option<Arc<str>> {
-        let base: &str = self.base.as_deref()?;
+        let base = self.base.as_deref()?;
         if path.is_empty() || path.starts_with('/') {
             return None;
         }
@@ -763,6 +824,60 @@ crate::ktest!(
             Ok(())
         })??;
         kassert!(lumen_vfs::unlink_at(tables, None, FILE, false).is_ok());
+        kassert!(lumen_vfs::unlink_at(tables, None, DIR, true).is_ok());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn at_start_operations_run_from_their_start() {
+        // Each of `Start`'s lumen-vfs operations, from a cwd off `/` and from
+        // a dirfd, with relative paths that name nothing from `/`: `mkdir`
+        // and `open` take `Mode` and apply the umask themselves.
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::{OpenGuard, mkdir_at};
+
+        const DIR: &[u8] = b"/tmp/at-ktest-ops";
+        let tables = crate::vfs::tables();
+        process::in_test_process(move |_| {
+            let base = mkdir_at(tables, None, DIR, 0o755, 0).map_err(|_| "mkdir")?;
+            let guard = OpenGuard::try_new(Arc::clone(&base)).map_err(|_| "guard")?;
+            process::set_current_cwd(process::Cwd::new(guard, "/tmp/at-ktest-ops").map_err(|_| "cwd")?);
+            let path = |p: &[u8]| UserPath::from_bytes(p.to_vec(), false).map_err(|_| "path");
+            let start = |d: Dirfd, p: &UserPath| start_dir(d, p).map_err(|_| "start_dir");
+            let mode = |m: u64| reg::<Mode>(m);
+            let mode_of = |p: &str| crate::vfs::resolve_path_from_root(p).and_then(|i| i.stat()).map(|m| m.mode);
+
+            let d = path(b"d")?;
+            let cwd = start(Dirfd::Cwd, &d)?;
+            kassert!(cwd.mkdir(&d, mode(0o6777)).is_ok());
+            kassert_eq!(mode_of("/tmp/at-ktest-ops/d"), Ok(0o755));
+            let f = path(b"d/f")?;
+            let flags = OpenFlags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT);
+            kassert!(cwd.open(&f, flags, mode(0o666)).is_ok());
+            kassert_eq!(mode_of("/tmp/at-ktest-ops/d/f"), Ok(0o644));
+            let s = path(b"d/s")?;
+            kassert!(cwd.symlink(b"f", &s).is_ok());
+            kassert_eq!(cwd.readlink(&s), Ok(b"f".to_vec()));
+            let h = path(b"d/h")?;
+            kassert_eq!(Start::link(&cwd, &f, &cwd, &h, false, false), Ok(()));
+            kassert_eq!(mode_of("/tmp/at-ktest-ops/d/h"), Ok(0o644));
+            // Across two starts: the cwd's "d/h" to "r" in a dirfd on "d".
+            let d_file =
+                process::open_kernel_file(b"/tmp/at-ktest-ops/d", OpenFlags::O_RDONLY, 0).map_err(|_| "open d")?;
+            let d_fd = process::install_current_fd(d_file, false).map_err(|_| "fd")?;
+            let r = path(b"r")?;
+            let in_d = start(Dirfd::Fd(Fd(d_fd)), &r)?;
+            kassert_eq!(Start::rename(&cwd, &h, &in_d, &r, RenameFlags(0)), Ok(()));
+            kassert!(mode_of("/tmp/at-ktest-ops/d/r").is_ok());
+            kassert!(mode_of("/tmp/at-ktest-ops/d/h").is_err());
+            kassert_eq!(in_d.unlink(&r, false), Ok(()));
+            kassert_eq!(cwd.unlink(&s, false), Ok(()));
+            kassert_eq!(cwd.unlink(&f, false), Ok(()));
+            kassert_eq!(cwd.unlink(&d, true), Ok(()));
+            kassert!(mode_of("/tmp/at-ktest-ops/d").is_err());
+            Ok(())
+        })??;
         kassert!(lumen_vfs::unlink_at(tables, None, DIR, true).is_ok());
         Ok(())
     }

@@ -370,7 +370,7 @@ one is its own PR that updates that doc first.
   read and parsed once, `load` through `AddressSpace::from_images`;
   `ExecError`, each read naming its file);
   `linux/process.rs` `ProcessState` (#254: the private 1024-slot FD table
-  of `OpenFile`s, `install_current_fd`/`insert_current_fd`/`dup_current_fd`/
+  of `OpenFile`s, `install_current_fd`/`insert_current_fd`/`dup_current_fd`(`_from`)/
   `close_current_fd`, close and exit releasing POSIX and `flock` locks
   outside `ACTIVE_PROCS`; `Stdio`: fds 0/1/2 on `/dev/console` and `/` as
   cwd, opened before a run or it is refused; `Cwd`, `umask`;
@@ -388,7 +388,8 @@ one is its own PR that updates that doc first.
   the descriptor lookup, `Dirfd`, `Mode`, the VFS flags, `UserPtr`,
   `u32`/`i32`: the low 32 bits), `UserPath` (a path argument copied in),
   `start_dir` and its `Start` (the one dirfd resolution, and the only way
-  to lumen-vfs's path operations: `Start::open`, `Start::resolve`) and
+  to lumen-vfs's path operations: `open`, `resolve`, `mkdir`, `unlink`,
+  `readlink`, `symlink`, `Start::link`, `Start::rename`) and
   `stat_from_metadata`/`statx_from_metadata`; the handlers' rules are in
   ARCHITECTURE section 8, "Handlers".
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs

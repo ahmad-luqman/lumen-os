@@ -94,20 +94,24 @@ impl Stdio {
     /// VFS mounts `/dev` at boot, so only a broken boot sees one). Opens
     /// files, so may sleep: never call it holding a spinlock.
     pub fn open() -> Result<Self, VfsError> {
-        let opened = (|| {
-            let mut fds = FdTable::new();
-            for (fd, flags) in [(0, OpenFlags::O_RDONLY), (1, OpenFlags::O_WRONLY), (2, OpenFlags::O_WRONLY)] {
-                let file = Arc::new(open_kernel_file(b"/dev/console", flags, 0)?);
-                // A fresh table: nothing is displaced.
-                drop(fds.insert_at(fd, file, false)?);
-            }
-            let root = crate::vfs::resolve_path_from_root("/")?;
-            Ok(Self { fds, cwd: Cwd::new(OpenGuard::try_new(root)?, "/")? })
-        })();
+        let opened = Self::open_from(b"/dev/console");
         if let Err(e) = &opened {
             log::error!(target: "linux", "cannot open a process's stdio (/dev/console) and working directory (/): {e:?}");
         }
         opened
+    }
+
+    /// [`Stdio::open`] with `console` for the console's path, not logged:
+    /// the seam the refusal's ktest opens a missing path through.
+    fn open_from(console: &[u8]) -> Result<Self, VfsError> {
+        let mut fds = FdTable::new();
+        for (fd, flags) in [(0, OpenFlags::O_RDONLY), (1, OpenFlags::O_WRONLY), (2, OpenFlags::O_WRONLY)] {
+            let file = Arc::new(open_kernel_file(console, flags, 0)?);
+            // A fresh table: nothing is displaced.
+            drop(fds.insert_at(fd, file, false)?);
+        }
+        let root = crate::vfs::resolve_path_from_root("/")?;
+        Ok(Self { fds, cwd: Cwd::new(OpenGuard::try_new(root)?, "/")? })
     }
 }
 
@@ -328,7 +332,7 @@ fn release_fd(pid: u32, file: FileRef) {
     // Every filesystem keeps lock state today; one that refused would keep
     // this process's locks held.
     if let Err(e) = released {
-        log::warn!(target: "linux", "pid {pid}: closing {}: its locks weren't released: {e:?}", file.path);
+        log::error!(target: "linux", "pid {pid}: closing {}: its locks weren't released: {e:?}", file.path);
     }
 }
 
@@ -368,21 +372,25 @@ pub fn install_current_fd(file: KernelFile, cloexec: bool) -> Result<i32, VfsErr
 /// procfs builds `/proc/<pid>/fd/<fd>`'s inode number from it and relies on
 /// that range.
 pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
-    place_current_fd(fd, Arc::new(file))
+    place_current_fd(fd, Arc::new(file), false)
 }
 
-/// Make descriptor `new` share `old`'s open file description (`dup2`'s
-/// slot work, M8's `dup`/`dup2`/`dup3`): its `fd_refs` counts the new slot,
-/// and what `new` held is closed. `EBADF` if `old` isn't open or `new` is
-/// out of range; `old == new` changes nothing.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // M8's `dup2` calls it; the ktests until then
-pub fn dup_current_fd(old: i32, new: i32) -> Result<i32, VfsError> {
+/// Make descriptor `new` share `old`'s open file description, close-on-exec
+/// as `cloexec` says (`dup2`/`dup3`'s slot work, M8): its `fd_refs` counts
+/// the new slot, and what `new` held is closed. `EBADF` if `old` isn't open
+/// or `new` is out of range; `old == new` changes nothing.
+///
+/// `old`'s lookup and `new`'s install are two holds of `ACTIVE_PROCS`: from
+/// M8, another thread could close `old` between them (the file stays alive
+/// through this call's reference, so the dup still succeeds).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // M8's `dup2`/`dup3` call it; the ktests until then
+pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError> {
     let file = current_file(old).ok_or(VfsError::BadF)?;
     if old == new {
         return Ok(new);
     }
     file.inc_fd_ref();
-    match place_current_fd(new, Arc::clone(&file)) {
+    match place_current_fd(new, Arc::clone(&file), cloexec) {
         Ok(()) => Ok(new),
         Err(e) => {
             // The slot was never filled: give its count back.
@@ -392,10 +400,28 @@ pub fn dup_current_fd(old: i32, new: i32) -> Result<i32, VfsError> {
     }
 }
 
+/// Make the lowest free descriptor at or above `min` share `old`'s open
+/// file description, close-on-exec as `cloexec` says (`fcntl(F_DUPFD)`,
+/// `F_DUPFD_CLOEXEC`, `dup`): the descriptor. `EBADF` if `old` isn't open,
+/// `EINVAL` if `min` is out of range, `EMFILE` if no slot at or above it is
+/// free. Two holds of `ACTIVE_PROCS`, as [`dup_current_fd`].
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `fcntl(F_DUPFD*)` calls it; the ktests until then
+pub fn dup_current_fd_from(old: i32, min: i32, cloexec: bool) -> Result<i32, VfsError> {
+    let file = current_file(old).ok_or(VfsError::BadF)?;
+    file.inc_fd_ref();
+    // A clone goes in, so a refused one never drops the last reference
+    // under `ACTIVE_PROCS`.
+    let placed = with_current_mut(|p| p.fds.alloc_from(min, Arc::clone(&file), cloexec));
+    if placed.is_err() {
+        file.dec_fd_ref();
+    }
+    placed
+}
+
 /// Put `file` (its `fd_refs` already counting this slot) on `fd`, releasing
 /// what it displaces outside `ACTIVE_PROCS`.
-fn place_current_fd(fd: i32, file: FileRef) -> Result<(), VfsError> {
-    let (pid, displaced) = with_current_mut(|p| (p.pid, p.fds.insert_at(fd, Arc::clone(&file), false)));
+fn place_current_fd(fd: i32, file: FileRef, cloexec: bool) -> Result<(), VfsError> {
+    let (pid, displaced) = with_current_mut(|p| (p.pid, p.fds.insert_at(fd, Arc::clone(&file), cloexec)));
     if let Some(old) = displaced? {
         release_fd(pid, old.file);
     }
@@ -874,6 +900,8 @@ crate::ktest!(
             kassert!(Arc::ptr_eq(&cwd, &root));
             kassert_eq!(&*path, "/");
             kassert_eq!(current_umask(), 0o022);
+            // A missing console refuses the whole set (the run's refusal).
+            kassert!(matches!(Stdio::open_from(b"/dev/no-such-console"), Err(VfsError::NoEnt)));
             // A working directory must be a directory.
             let console = crate::vfs::resolve_path_from_root("/dev/console").map_err(|_| "resolve the console")?;
             let guard = OpenGuard::try_new(console).map_err(|_| "guard")?;
@@ -919,12 +947,25 @@ crate::ktest!(
             insert_current_fd(3, open(PATH)?).map_err(|_| "install fd 3")?;
             let a = current_file(3).ok_or("fd 3")?;
             flock_ex(&a).map_err(|_| "flock A")?;
-            kassert_eq!(dup_current_fd(3, 4), Ok(4));
+            kassert_eq!(dup_current_fd(3, 4, false), Ok(4));
+            kassert_eq!(current_cloexec(4), Ok(false));
             kassert_eq!(a.fd_ref_count(), 2);
             // `dup` onto itself or from a closed fd changes nothing.
-            kassert_eq!(dup_current_fd(4, 4), Ok(4));
-            kassert_eq!(dup_current_fd(77, 8), Err(VfsError::BadF));
-            kassert_eq!(dup_current_fd(3, lumen_vfs::MAX_FDS as i32), Err(VfsError::BadF));
+            kassert_eq!(dup_current_fd(4, 4, true), Ok(4));
+            kassert_eq!(dup_current_fd(77, 8, false), Err(VfsError::BadF));
+            kassert_eq!(dup_current_fd(3, lumen_vfs::MAX_FDS as i32, false), Err(VfsError::BadF));
+            kassert_eq!(a.fd_ref_count(), 2);
+            // The lowest free slot at or above a minimum (`F_DUPFD_CLOEXEC`):
+            // 10 here; a minimum out of range or a closed `old` refused,
+            // counting nothing.
+            kassert_eq!(dup_current_fd_from(3, 10, true), Ok(10));
+            kassert_eq!(current_cloexec(10), Ok(true));
+            kassert_eq!(a.fd_ref_count(), 3);
+            kassert_eq!(dup_current_fd_from(3, -1, false), Err(VfsError::Inval));
+            kassert_eq!(dup_current_fd_from(3, lumen_vfs::MAX_FDS as i32, false), Err(VfsError::Inval));
+            kassert_eq!(dup_current_fd_from(77, 0, false), Err(VfsError::BadF));
+            kassert_eq!(a.fd_ref_count(), 3);
+            kassert_eq!(close_current_fd(10), Ok(()));
             kassert_eq!(a.fd_ref_count(), 2);
             // B, another open of the same file, on fd 5 holds a POSIX lock;
             // a file on another inode on fd 6.

@@ -3081,19 +3081,23 @@ crate::ktest!(
         let shared = tfs.root_inode().create("shared", 0o644).map_err(|_| "tmpfs create shared")?;
         let cpus: Vec<usize> =
             (0..crate::arch::MAX_CPUS).filter(|&c| crate::smp::online_lapic_id(c).is_some()).collect();
-        let shared_ref = &shared;
+        let refused = core::sync::atomic::AtomicU32::new(0);
+        let (shared_ref, refused_ref) = (&shared, &refused);
         let spawned = crate::sched::scope(|scope| {
             for (n, &cpu) in cpus.iter().enumerate() {
                 scope.spawn_on(cpu, "append-ktest", move || {
                     for i in 0..PER_THREAD {
                         let rec = alloc::format!("{n:02}:{i:04}\n");
-                        let _ = shared_ref.append(rec.as_bytes());
+                        if shared_ref.append(rec.as_bytes()).map(|(_, n)| n) != Ok(RECORD) {
+                            refused_ref.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 })?;
             }
             Ok::<(), crate::sched::SpawnError>(())
         });
-        kassert!(matches!(spawned, Ok(Ok(()))));
+        spawned.map_err(|_| "spawn")?.map_err(|_| "spawn an appender")?;
+        kassert_eq!(refused.load(core::sync::atomic::Ordering::Relaxed), 0);
         let all = read_all_inode(&shared).map_err(|_| "read shared")?;
         kassert_eq!(all.len(), cpus.len() * PER_THREAD * RECORD);
         let mut seen = alloc::vec![0u32; cpus.len() * PER_THREAD];

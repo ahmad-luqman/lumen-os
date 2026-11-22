@@ -119,6 +119,22 @@ pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<
     Ok(done as u64)
 }
 
+/// Write one chunk (already in kernel memory) to `file` under its offset's
+/// lock: at the offset, or with `O_APPEND` at the end through
+/// `VfsInode::append` (the end found and written in one hold of the inode's
+/// lock). The offset moves past what was written; returns where it began
+/// and how much.
+fn write_chunk(file: &KernelFile, chunk: &[u8]) -> Result<(u64, usize), VfsError> {
+    let mut off = file.offset.lock();
+    let (pos, n) = if file.status_flags() & OpenFlags::O_APPEND != 0 {
+        file.inode.append(chunk)?
+    } else {
+        (*off, file.inode.write_at(*off, chunk)?)
+    };
+    *off = pos.saturating_add(n as u64);
+    Ok((pos, n))
+}
+
 /// Write up to `count` bytes (at most `MAX_SINGLE_IO`) from user memory at
 /// `user_buf` to `file` at its offset, a chunk at a time: each copied in
 /// first, then written under the offset's lock. With `O_APPEND` each chunk
@@ -128,7 +144,6 @@ pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<
 /// appender's data land between its chunks.
 pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     let limit = count.min(MAX_SINGLE_IO as u64) as usize;
-    let append = file.status_flags() & OpenFlags::O_APPEND != 0;
     let mut kbuf = [0u8; FILE_CHUNK];
     let mut done = 0usize;
     while done < limit {
@@ -139,19 +154,9 @@ pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result
         if copy_from_user(&mut kbuf[..want], addr).is_err() {
             return partial(done, errno::EFAULT);
         }
-        let n = {
-            let mut off = file.offset.lock();
-            let wrote = if append {
-                file.inode.append(&kbuf[..want])
-            } else {
-                file.inode.write_at(*off, &kbuf[..want]).map(|n| (*off, n))
-            };
-            let (pos, n) = match wrote {
-                Ok(at) => at,
-                Err(e) => return partial(done, vfs(e)),
-            };
-            *off = pos.saturating_add(n as u64);
-            n
+        let n = match write_chunk(file, &kbuf[..want]) {
+            Ok((_, n)) => n,
+            Err(e) => return partial(done, vfs(e)),
         };
         done += n;
         if n < want {
@@ -261,8 +266,8 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
     let fd_at = |chunk: &[u8; 8]| i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes"));
     let events_at = |chunk: &[u8; 8]| i16::from_le_bytes(chunk[4..6].try_into().expect("2 bytes"));
 
-    // The polled files, cloned out in one hold of `ACTIVE_PROCS` and
-    // classified (and dropped) after it.
+    // The console's `io`, then the polled files, all cloned out in one more
+    // hold of `ACTIVE_PROCS`, classified (and dropped) after it.
     let io = current_io();
     let polled: Vec<i32> = raw.as_chunks::<8>().0.iter().map(fd_at).collect();
     let files = process::current_files(&polled);
@@ -495,7 +500,7 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
         return Err(errno::EMFILE);
     }
     let start = at::start_dir(dirfd, &path)?;
-    let opened = start.open(&path, flags, mode.perm(), process::current_umask())?;
+    let opened = start.open(&path, flags, mode)?;
     let mut file = OpenFile::from_opened(opened).map_err(vfs)?;
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
@@ -704,7 +709,7 @@ fn ktest_iovs(at: u64, spans: &[(u64, u64)]) -> Result<UserPtr, &'static str> {
 #[cfg(feature = "ktest")]
 fn ktest_stat(at: u64) -> Result<(u32, u64, u64), &'static str> {
     let mut st = [0u8; 144];
-    crate::user::copy_from_user(&mut st, at).map_err(|_| "copy the stat")?;
+    copy_from_user(&mut st, at).map_err(|_| "copy the stat")?;
     let u64_at = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().expect("8 bytes"));
     Ok((u32::from_le_bytes(st[24..28].try_into().expect("4 bytes")), u64_at(40), u64_at(48)))
 }
@@ -817,7 +822,7 @@ crate::ktest!(
             kassert_eq!(sys_read(fd, at::reg(buf), LEN as u64), LEN as u64);
             let mut back = alloc::vec![0u8; LEN];
             copy_from_user(&mut back, buf).map_err(|_| "copy back")?;
-            kassert_eq!(back == pattern, true);
+            crate::kassert!(back == pattern);
             // The last mapped page, then nothing: the first chunk reaches it,
             // the second faults.
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_SET), 0);
@@ -825,12 +830,93 @@ crate::ktest!(
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 4096);
             let mut page = alloc::vec![0u8; 4096];
             copy_from_user(&mut page, last_page).map_err(|_| "copy the page")?;
-            kassert_eq!(page[..] == pattern[..4096], true);
+            crate::kassert!(page[..] == pattern[..4096]);
             kassert_eq!(sys_write(fd, at::reg(last_page), 8192), 4096);
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 8192);
             crate::kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/fd-ktest-big", false).is_ok());
             Ok(())
         })?
+    }
+);
+
+/// Append 8-byte records to `inode` from every online CPU at once, through
+/// two `O_APPEND` open files on it (alternate CPUs on each) and the syscall
+/// path's `write_chunk`, then check every record landed whole, once.
+#[cfg(feature = "ktest")]
+fn ktest_append_from_every_cpu(inode: &alloc::sync::Arc<dyn VfsInode>) -> crate::ktest::TestResult {
+    use crate::{kassert, kassert_eq};
+    use core::sync::atomic::{AtomicU32, Ordering};
+    const RECORD: usize = 8;
+    const PER_CPU: usize = 256;
+
+    let flags = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_APPEND);
+    let open = || KernelFile::new_unchecked_flags(alloc::sync::Arc::clone(inode), "/append".into(), flags);
+    let files = [open().map_err(|_| "open A")?, open().map_err(|_| "open B")?];
+    let cpus: Vec<usize> = (0..crate::arch::MAX_CPUS).filter(|&c| crate::smp::online_lapic_id(c).is_some()).collect();
+    let refused = AtomicU32::new(0);
+    let (files, refused_ref) = (&files, &refused);
+    let spawned = crate::sched::scope(|scope| {
+        for (n, &cpu) in cpus.iter().enumerate() {
+            scope.spawn_on(cpu, "append-ktest", move || {
+                for i in 0..PER_CPU {
+                    let rec = alloc::format!("{n:02}:{i:04}\n");
+                    if write_chunk(&files[n % 2], rec.as_bytes()).map(|(_, w)| w) != Ok(RECORD) {
+                        refused_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })?;
+        }
+        Ok::<(), crate::sched::SpawnError>(())
+    });
+    spawned.map_err(|_| "spawn")?.map_err(|_| "spawn an appender")?;
+    kassert_eq!(refused.load(Ordering::Relaxed), 0);
+    let size = inode.stat().map_err(|_| "stat")?.size as usize;
+    kassert_eq!(size, cpus.len() * PER_CPU * RECORD);
+    let mut all = alloc::vec![0u8; size];
+    kassert_eq!(inode.read_at(0, &mut all), Ok(size));
+    let mut seen = alloc::vec![0u32; cpus.len() * PER_CPU];
+    for rec in all.chunks(RECORD) {
+        let text = core::str::from_utf8(rec).map_err(|_| "a torn record")?;
+        let (n, i) = text.trim_end().split_once(':').ok_or("a torn record")?;
+        let n: usize = n.parse().map_err(|_| "a torn record")?;
+        let i: usize = i.parse().map_err(|_| "a torn record")?;
+        kassert!(n < cpus.len() && i < PER_CPU && rec[RECORD - 1] == b'\n');
+        seen[n * PER_CPU + i] += 1;
+    }
+    kassert!(seen.iter().all(|&c| c == 1));
+    // Each file's offset is past its own last record: an end of the file.
+    for f in files {
+        let off = *f.offset.lock();
+        kassert!(off >= RECORD as u64 && off <= size as u64 && off % RECORD as u64 == 0);
+    }
+    Ok(())
+}
+
+crate::ktest!(
+    fn fd_o_append_from_every_cpu_through_two_open_files() {
+        // `O_APPEND` on the syscall path (`write_chunk`): every CPU at once,
+        // two open file descriptions on one inode, on tmpfs and on ext4.
+        use lumen_vfs::FileSystem;
+        let tfs = crate::vfs::tmpfs::Tmpfs::new(DevId::makedev(0, 124), 64 * 4096);
+        let t = tfs.root_inode().create("append", 0o644).map_err(|_| "tmpfs create")?;
+        ktest_append_from_every_cpu(&t)?;
+        let efs = crate::vfs::ktest_ext4(142)?;
+        let e = efs.root_inode().create("append", 0o644).map_err(|_| "ext4 create")?;
+        ktest_append_from_every_cpu(&e)
+    }
+);
+
+crate::ktest!(
+    fn fd_offset_lock_is_held_across_reads_but_not_on_procfs() {
+        // procfs's `maps` takes Lock 1 in `read_at`: no Lock 2 across it.
+        use crate::kassert;
+        let proc_version = crate::vfs::resolve_path_from_root("/proc/version").map_err(|_| "/proc/version")?;
+        let tmp = crate::vfs::resolve_path_from_root("/tmp").map_err(|_| "/tmp")?;
+        let null = crate::vfs::resolve_path_from_root("/dev/null").map_err(|_| "/dev/null")?;
+        kassert!(!offset_lock_across_read(&*proc_version));
+        kassert!(offset_lock_across_read(&*tmp));
+        kassert!(offset_lock_across_read(&*null));
+        Ok(())
     }
 );
 
@@ -963,7 +1049,7 @@ crate::ktest!(
             kassert_eq!(sys_lseek(fd, 7, general::SEEK_SET), 7);
             kassert_eq!(sys_read(fd, at::reg(data), 10), 3);
             let mut got = [0u8; 3];
-            crate::user::copy_from_user(&mut got, data).map_err(|_| "copy out")?;
+            copy_from_user(&mut got, data).map_err(|_| "copy out")?;
             kassert_eq!(&got, b"789");
             // A terminal can't seek; nor can what isn't open, or `O_PATH`.
             kassert_eq!(sys_lseek(at::reg(0), 0, general::SEEK_SET), neg_errno(errno::ESPIPE));

@@ -707,7 +707,9 @@ impl Ext4Inode {
         if self.shared.read_only && !self.is_detached() {
             return Err(VfsError::RoFs);
         }
-        if let (Some(at), true) = (offset, buf.is_empty()) {
+        if let Some(at) = offset
+            && buf.is_empty()
+        {
             return Ok((at, 0));
         }
         if !self.is_detached() {

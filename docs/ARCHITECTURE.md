@@ -3391,7 +3391,9 @@ Lumen runs two kinds of user code:
      (built in #254b); every `*at` handler (and each legacy shim, as
      `Dirfd::Cwd`) calls it once, after `UserPath::copy_in`, and reaches
      lumen-vfs's path operations only through `Start`'s wrappers
-     (`Start::open`, `Start::resolve`; wave 3 adds the others beside them).
+     (`open` and `mkdir`, which take `Mode` and apply the process's umask
+     themselves, `resolve`, `unlink`, `readlink`, `symlink`, and the
+     associated `Start::link` and `Start::rename` across two starts).
      `Start`'s directory is private, so no handler can hand lumen-vfs a raw
      `start_dir` (where `None` means the global root, never the cwd). Its
      contract, the traps included: an absolute path starts at the global
@@ -3469,7 +3471,9 @@ In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (matching
 (private: a slot leaves it only through `close_current_fd`, a displacing
 `insert_current_fd`/`dup_current_fd` or `take_current`, which release its
 locks; `install_current_fd` and `insert_current_fd` take a fresh
-`OpenFile` by value, and `dup_current_fd` counts the slot it shares),
+`OpenFile` by value, and `dup_current_fd` (`dup2`/`dup3`) and
+`dup_current_fd_from` (`F_DUPFD*`), each with a close-on-exec flag, count
+the slot they share),
 `cwd: Cwd` (an `OpenGuard` on a directory and the path it was set by) and
 `umask` (`0o022`). A process starts with `Stdio`, opened by the caller
 before the process's thread is spawned: fd 0 on `/dev/console` `O_RDONLY`
@@ -5337,8 +5341,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     write, the end read and the write made in one hold of the inode's
     Lock 4, so appenders through separate open file descriptions never
     write at the same old end; ext4 and tmpfs implement it, and any
-    filesystem with regular files must, the default being `write_at(0, ..)`
-    for devices), and `is_tty()` (default `false`; `true` for
+    filesystem with regular files must: the default, `append_without_end`,
+    is `-EINVAL` for a regular file and `write_at(0, ..)` at position 0 for
+    a device), and `is_tty()` (default `false`; `true` for
     devfs's `tty` and `console`, answered from fixed state without
     locking): the FD layer routes a terminal's descriptor to the process's
     console (reads, writes, the tty `ioctl`s, readiness `poll`, `-ESPIPE`
@@ -5563,7 +5568,22 @@ Every lock in the VM/storage/VFS stack obeys a strict acyclic total order:
 Lock 2 is held across a regular file's `read_at`/`write_at` (#254b), but
 not across procfs's `read_at`: `/proc/<pid>/maps` takes the address
 space's Lock 1 there, which comes first, so `read` reads procfs at a
-snapshot of the offset and moves it after, under a fresh hold.
+snapshot of the offset and moves it after, under a fresh hold, only if it
+is unchanged.
+
+**M8 hazards** (none can happen while each open file description has one
+thread, as in M7; each needs fixing when M8 shares them through threads,
+`fork` or `dup` across threads):
+- a procfs `read` racing another reader of the same open file description
+  drops its own offset update (the offset moved meanwhile), so both
+  readers get the same bytes;
+- a copy-out fault gives its chunk back only if the offset is still at the
+  chunk's end, but a reader that moved it there in between has its move
+  undone;
+- `dup_current_fd`/`dup_current_fd_from` look `old` up and install the new
+  slot in two holds of `ACTIVE_PROCS`, and `openat`'s free-slot check comes
+  before its open and install (another thread can fill the table after an
+  `O_CREAT` has created the file: `-EMFILE` with the file left behind).
 
 **Invariants:**
 - Never acquire any `SleepMutex` while holding any `SpinLock` (enforced by
