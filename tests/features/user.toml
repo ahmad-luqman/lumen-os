@@ -148,3 +148,28 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::ns::ns_rename_renameat2_over_open_files_exchange_and_errnos",
     "ktest:lumen_kernel::linux::syscall::ns::ns_handlers_take_their_registers_in_order",
 ]
+
+[[feature]]
+name = "getdents64, chdir and fchdir (#254): linux_dirent64 records (8-byte aligned, d_type for every inode type, . and ..) resuming at the open file's dir_cursor, the filesystem's readdir cursor, stable as entries come and go (a model of busybox rm -r's loop empties a directory on tmpfs and ext4; every survivor listed once; procfs keyed by pid and fd; tmpfs names keep their place through a rename over them or an exchange), d_off for seekdir, lseek rewinding, a partial fill stopping before the entry that doesn't fit, -EINVAL for a buffer too small for one, -EFAULT keeping the position, -EBADF/-ENOTDIR, a removed directory listing as empty, the cursor contract checked; on tmpfs, ext4 (across a gap), /proc and /dev; chdir and fchdir (O_PATH, O_DIRECTORY, through a symlink, an ended /proc/<pid>) moving relative paths and getcwd, the kept cwd path computed from the inode"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_lists_a_tmpfs_directory_exactly_once_across_small_buffers",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_types_on_proc_dev_and_ext4",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_refuses_bad_fds_buffers_and_small_counts",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_ends_while_entries_come_and_go",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_chdir_then_a_relative_open_and_getcwd",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_fchdir_takes_plain_o_directory_and_o_path_fds",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_handlers_take_their_registers_in_order",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_busybox_rm_r_empties_a_directory_on_tmpfs_and_ext4",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_lists_each_survivor_once_while_others_come_and_go",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_lists_across_a_gap_in_ext4_cursors",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_on_a_removed_directory_lists_nothing",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_fchdir_through_a_symlink_keeps_the_directory_s_own_path",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_pack_listed_checks_the_cursor_contract_and_hands_on_entries_before_an_error",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_kept_cwd_path_falls_back_quietly_for_a_removed_directory_or_a_long_path",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_d_type_maps_every_inode_type",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_lists_each_open_fd_once_while_listed_ones_close",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_tmpfs_lists_a_name_made_again_once",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_tmpfs_rename_over_and_exchange_keep_the_names_place",
+    "ktest:lumen_kernel::vfs::ext4::ext4_dir_record_reads_each_kind_of_record_and_refuses_malformed_ones",
+]

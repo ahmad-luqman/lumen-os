@@ -32,6 +32,13 @@ use log::warn;
 use lumen_vfs::procfs::{ProcFd, ProcKind, parse_canonical_u32};
 
 /// A `readdir` entry for `kind`, named `name`.
+/// `/proc`'s `readdir` cursor for pid 0: a process's directory is keyed
+/// by this plus its pid, past the fixed entries' 0 to 6.
+const PROC_PID_CURSOR: u64 = 0x100;
+
+/// `/proc/<pid>/fd`'s `readdir` cursor for fd 0, past `.` and `..`.
+const PROC_FD_CURSOR: u64 = 2;
+
 fn dir_entry(kind: ProcKind, name: impl Into<String>) -> (u64, InodeType, String) {
     (kind.ino(), kind.inode_type(), name.into())
 }
@@ -454,6 +461,14 @@ impl VfsInode for ProcfsInode {
         Err(VfsError::RoFs)
     }
 
+    /// Each entry's cursor is a key, not its index in today's listing, so
+    /// a listing resumed after processes came and went (`/proc`) or fds were
+    /// opened and closed (`/proc/<pid>/fd`) lists every entry that stayed
+    /// exactly once (`VfsInode::readdir`'s contract), as Linux's procfs:
+    /// `/proc`'s fixed entries 0 to 6, then [`PROC_PID_CURSOR`] plus the pid
+    /// (`active_pids` is sorted); `/proc/<pid>/fd`'s `.` and `..` 0 and 1,
+    /// then 2 plus the fd (`process_open_fds` ascends); a `/proc/<pid>`'s
+    /// fixed entries their index. An entry's `next_cursor` is its key plus 1.
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
         if self.inode_type() != InodeType::Dir {
             return Err(VfsError::NotDir);
@@ -461,37 +476,46 @@ impl VfsInode for ProcfsInode {
         if max_entries == 0 {
             return Ok(());
         }
-        let mut entries: Vec<(u64, InodeType, String)> = Vec::new();
+        // (key, (ino, type, name)), keys ascending.
+        let mut entries: Vec<(u64, (u64, InodeType, String))> = Vec::new();
         match self.kind {
             ProcKind::Root => {
-                entries.push(dir_entry(ProcKind::Root, "."));
-                entries.push(dir_entry(ProcKind::Root, ".."));
-                entries.push(dir_entry(ProcKind::Cpuinfo, "cpuinfo"));
-                entries.push(dir_entry(ProcKind::Meminfo, "meminfo"));
-                entries.push(dir_entry(ProcKind::Mounts, "mounts"));
-                entries.push(dir_entry(ProcKind::SelfLink, "self"));
-                entries.push(dir_entry(ProcKind::Version, "version"));
+                let fixed = [
+                    dir_entry(ProcKind::Root, "."),
+                    dir_entry(ProcKind::Root, ".."),
+                    dir_entry(ProcKind::Cpuinfo, "cpuinfo"),
+                    dir_entry(ProcKind::Meminfo, "meminfo"),
+                    dir_entry(ProcKind::Mounts, "mounts"),
+                    dir_entry(ProcKind::SelfLink, "self"),
+                    dir_entry(ProcKind::Version, "version"),
+                ];
+                debug_assert!(fixed.len() as u64 <= PROC_PID_CURSOR);
+                entries.extend((0u64..).zip(fixed));
                 for pid in process::active_pids() {
-                    entries.push(dir_entry(ProcKind::PidDir(pid), format!("{pid}")));
+                    entries
+                        .push((PROC_PID_CURSOR + u64::from(pid), dir_entry(ProcKind::PidDir(pid), format!("{pid}"))));
                 }
             }
             ProcKind::PidDir(pid) => {
                 if !Self::pid_exists(pid) {
                     return Err(VfsError::NoEnt);
                 }
-                entries.push(dir_entry(ProcKind::PidDir(pid), "."));
-                entries.push(dir_entry(ProcKind::Root, ".."));
-                entries.push(dir_entry(ProcKind::PidExe(pid), "exe"));
-                entries.push(dir_entry(ProcKind::PidFdDir(pid), "fd"));
-                entries.push(dir_entry(ProcKind::PidMaps(pid), "maps"));
-                entries.push(dir_entry(ProcKind::PidMounts(pid), "mounts"));
+                let fixed = [
+                    dir_entry(ProcKind::PidDir(pid), "."),
+                    dir_entry(ProcKind::Root, ".."),
+                    dir_entry(ProcKind::PidExe(pid), "exe"),
+                    dir_entry(ProcKind::PidFdDir(pid), "fd"),
+                    dir_entry(ProcKind::PidMaps(pid), "maps"),
+                    dir_entry(ProcKind::PidMounts(pid), "mounts"),
+                ];
+                entries.extend((0u64..).zip(fixed));
             }
             ProcKind::PidFdDir(pid) => {
                 if !Self::pid_exists(pid) {
                     return Err(VfsError::NoEnt);
                 }
-                entries.push(dir_entry(ProcKind::PidFdDir(pid), "."));
-                entries.push(dir_entry(ProcKind::PidDir(pid), ".."));
+                entries.push((0, dir_entry(ProcKind::PidFdDir(pid), ".")));
+                entries.push((1, dir_entry(ProcKind::PidDir(pid), "..")));
                 for fd in process::process_open_fds(pid) {
                     // The fd table keeps fds in `0..MAX_FDS`; one outside it
                     // couldn't be looked up either, so it isn't listed.
@@ -500,18 +524,20 @@ impl VfsInode for ProcfsInode {
                         warn!(target: "procfs", "pid {pid} holds fd {fd}, outside 0..MAX_FDS: not listed");
                         continue;
                     };
-                    entries.push(dir_entry(ProcKind::PidFdLink(pid, proc_fd), format!("{fd}")));
+                    // `try_from` accepted it: `0..MAX_FDS`, not negative.
+                    let key = PROC_FD_CURSOR + fd as u64;
+                    entries.push((key, dir_entry(ProcKind::PidFdLink(pid, proc_fd), format!("{fd}"))));
                 }
             }
             _ => return Err(VfsError::NotDir),
         }
+        debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "procfs readdir keys not ascending");
 
-        let start = usize::try_from(cursor).unwrap_or(entries.len());
-        for (idx, (ino, itype, name)) in entries.into_iter().enumerate().skip(start) {
+        for (key, (ino, itype, name)) in entries.into_iter().filter(|&(key, _)| key >= cursor) {
             if out.len() >= max_entries {
                 break;
             }
-            out.push(DirEntry { ino, inode_type: itype, name, next_cursor: (idx + 1) as u64 });
+            out.push(DirEntry { ino, inode_type: itype, name, next_cursor: key + 1 });
         }
         Ok(())
     }

@@ -57,7 +57,7 @@ impl Tmpfs {
                 mtime: now,
                 ctime: now,
                 symlink_target: String::new(),
-                children: BTreeMap::new(),
+                children: Children::new(),
                 parent: Some(Weak::clone(weak_self)),
                 locks: AdvisoryLocks::new(),
             }),
@@ -109,9 +109,82 @@ struct TmpfsMeta {
     mtime: Timespec,
     ctime: Timespec,
     symlink_target: String,
-    children: BTreeMap<String, Arc<TmpfsInode>>,
+    children: Children,
     parent: Option<Weak<TmpfsInode>>,
     locks: AdvisoryLocks,
+}
+
+/// `readdir`'s cursor for the first entry after `.` (0) and `..` (1).
+const FIRST_CHILD_CURSOR: u64 = 2;
+
+/// A directory's entries, each under the sequence number it was added
+/// with: `readdir`'s cursor. An entry keeps its number until it is removed
+/// (replacing what a name points to, a `rename` over it or a
+/// `RENAME_EXCHANGE`, keeps the name's number), and a new name takes the
+/// next number, never one used before; so a cursor between two calls still
+/// starts where it did, whatever was added or removed meanwhile.
+struct Children {
+    /// The entries by number: what `readdir` walks.
+    by_seq: BTreeMap<u64, (String, Arc<TmpfsInode>)>,
+    /// Each name's number, for lookups; always the same names as `by_seq`.
+    by_name: BTreeMap<String, u64>,
+    /// The next name's number, from [`FIRST_CHILD_CURSOR`].
+    next_seq: u64,
+}
+
+impl Children {
+    fn new() -> Self {
+        Self { by_seq: BTreeMap::new(), by_name: BTreeMap::new(), next_seq: FIRST_CHILD_CURSOR }
+    }
+
+    fn get(&self, name: &str) -> Option<&Arc<TmpfsInode>> {
+        let seq = self.by_name.get(name)?;
+        let entry = self.by_seq.get(seq);
+        debug_assert!(entry.is_some_and(|(n, _)| n == name), "tmpfs: {name:?}'s number {seq} lists another entry");
+        entry.map(|(_, child)| child)
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    fn is_empty(&self) -> bool {
+        debug_assert_eq!(self.by_seq.len(), self.by_name.len());
+        self.by_seq.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Arc<TmpfsInode>> {
+        self.by_seq.values().map(|(_, child)| child)
+    }
+
+    /// Point `name` at `child`: an existing name keeps its number, a new one
+    /// takes the next.
+    fn insert(&mut self, name: String, child: Arc<TmpfsInode>) {
+        if let Some(&seq) = self.by_name.get(&name) {
+            if let Some(slot) = self.by_seq.get_mut(&seq) {
+                slot.1 = child;
+                return;
+            }
+            debug_assert!(false, "tmpfs: {name:?}'s number {seq} has no entry");
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.by_name.insert(name.clone(), seq);
+        self.by_seq.insert(seq, (name, child));
+    }
+
+    fn remove(&mut self, name: &str) -> Option<Arc<TmpfsInode>> {
+        let seq = self.by_name.remove(name)?;
+        let entry = self.by_seq.remove(&seq);
+        debug_assert!(entry.is_some(), "tmpfs: {name:?}'s number {seq} had no entry");
+        entry.map(|(_, child)| child)
+    }
+
+    /// The entries numbered `from` or more, in number order (the order they
+    /// were added in): `(number, name, inode)`.
+    fn listed_from(&self, from: u64) -> impl Iterator<Item = (u64, &str, &Arc<TmpfsInode>)> {
+        self.by_seq.range(from..).map(|(&seq, (name, child))| (seq, name.as_str(), child))
+    }
 }
 
 /// Inode belonging to a [`Tmpfs`] mount.
@@ -210,7 +283,7 @@ impl TmpfsInode {
                 mtime: now,
                 ctime: now,
                 symlink_target,
-                children: BTreeMap::new(),
+                children: Children::new(),
                 parent,
                 locks: AdvisoryLocks::new(),
             }),
@@ -786,6 +859,10 @@ impl VfsInode for TmpfsInode {
         Ok(())
     }
 
+    /// The cursor is `.` (0), `..` (1), then each entry's sequence number
+    /// ([`Children`]): stable as entries come and go, so a listing across
+    /// removals lists every entry that stayed exactly once, in the order
+    /// they were added.
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
@@ -795,18 +872,16 @@ impl VfsInode for TmpfsInode {
             return Ok(());
         }
         let parent_ino = meta.parent.as_ref().and_then(Weak::upgrade).map_or(self.ino(), |p| p.ino());
-        for (idx, (ino, inode_type, name)) in [(self.ino(), InodeType::Dir, "."), (parent_ino, InodeType::Dir, "..")]
-            .into_iter()
-            .chain(meta.children.iter().map(|(name, child)| (child.ino(), child.inode_type, name.as_str())))
-            .enumerate()
-        {
+        let dots = [(0, self.ino(), InodeType::Dir, "."), (1, parent_ino, InodeType::Dir, "..")];
+        let children = meta
+            .children
+            .listed_from(cursor.max(FIRST_CHILD_CURSOR))
+            .map(|(seq, name, child)| (seq, child.ino(), child.inode_type, name));
+        for (seq, ino, inode_type, name) in dots.into_iter().filter(|&(seq, ..)| seq >= cursor).chain(children) {
             if out.len() >= max_entries {
                 break;
             }
-            let cur_idx = idx as u64;
-            if cur_idx >= cursor {
-                out.push(DirEntry { ino, inode_type, name: String::from(name), next_cursor: cur_idx + 1 });
-            }
+            out.push(DirEntry { ino, inode_type, name: String::from(name), next_cursor: seq + 1 });
         }
         Ok(())
     }

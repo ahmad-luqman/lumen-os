@@ -393,7 +393,9 @@ one is its own PR that updates that doc first.
   shared copy helpers, a module per cluster holding its handlers (`fd`,
   `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, `proc`; `fd`
   holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
-  terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`), an M7
+  terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`,
+  `getdents64` (the filesystem's `readdir` cursor in `dir_cursor`), `chdir`
+  and `fchdir`), an M7
   syscall not yet implemented a stub (`not_implemented`: logged once,
   `-ENOSYS`; each cluster's `*_m7_stubs_return_enosys` ktest while it has
   stubs; `lock` holds `fcntl` and `flock`: `lock_or_wait`, the retry loop

@@ -44,16 +44,18 @@ pub const DEFAULT_UMASK: u16 = 0o022;
 const CAPTURE_STDOUT_LIMIT: usize = 4096;
 
 /// A process's working directory: an open reference on a directory inode
-/// (so an `rmdir` detaches it rather than freeing it) and the path it was set
-/// by. `getcwd` computes the path afresh from the inode (`compute_cwd_path`);
-/// the stored one names it for a relative open's `/proc/<pid>/fd` path.
+/// (so an `rmdir` detaches it rather than freeing it) and its path, as
+/// `chdir`/`fchdir` computed it from the inode when they set it (`/` for a
+/// new process). `getcwd` computes the path afresh from the inode
+/// (`compute_cwd_path`); the stored one is what a relative open's
+/// `/proc/<pid>/fd` path is joined to.
 pub struct Cwd {
     guard: OpenGuard,
     path: Arc<str>,
 }
 
 impl Cwd {
-    /// The working directory `guard` holds open, set by `path`: `ENOTDIR`
+    /// The working directory `guard` holds open, its path `path`: `ENOTDIR`
     /// unless it is a directory.
     pub fn new(guard: OpenGuard, path: &str) -> Result<Self, VfsError> {
         if guard.inode().inode_type() != InodeType::Dir {
@@ -503,16 +505,14 @@ pub fn set_current_cloexec(fd: i32, cloexec: bool) -> Result<(), VfsError> {
     with_current_mut(|p| p.fds.set_cloexec(fd, cloexec))
 }
 
-/// The current process's working directory: its inode and the path it was
-/// set by (clones).
+/// The current process's working directory: its inode and its stored path
+/// (clones).
 pub fn current_cwd() -> (Arc<dyn VfsInode>, Arc<str>) {
     with_current(|p| (Arc::clone(p.cwd.inode()), Arc::clone(p.cwd.path())))
 }
 
 /// Make `cwd` the current process's working directory; the old one drops
-/// after `ACTIVE_PROCS` is released. (`chdir` and `fchdir` once they land;
-/// the ktests until then.)
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `chdir`/`fchdir` (#254's wave 3) call it
+/// after `ACTIVE_PROCS` is released (`chdir`, `fchdir`).
 pub fn set_current_cwd(cwd: Cwd) {
     let old = with_current_mut(|p| core::mem::replace(&mut p.cwd, cwd));
     drop(old);

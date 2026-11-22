@@ -924,7 +924,9 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   `BlockCache` → `BlockDevice`, syscall paths (`read`, `write`, `pread64`,
   `pwrite64`, `getdents64`, `stat*`, `readlink*`, etc.) **never** hold any VFS,
   inode, `PageCache`, `BlockCache`, or `BlockDevice` lock across a user-memory
-  copy; they transfer via bounded kernel bounce buffers (`IO_CHUNK`, e.g. 4 KiB).
+  copy; they transfer via bounded kernel bounce buffers (`IO_CHUNK`, e.g. 4 KiB;
+  `getdents64` packs its records in a heap buffer of at most `GETDENTS_MAX`,
+  32 KiB, holding only Lock 2 while it fills it).
   See section 9 ("Global lock ordering") for the complete acyclic hierarchy.
 - **Cross-CPU TLB shootdowns (M8; M6–M7 single-CPU invariant):** In M6 and M7,
   every user process is single-threaded and pinned to its home CPU (as all
@@ -3526,7 +3528,9 @@ locks; `install_current_fd` and `insert_current_fd` take a fresh
 `OpenFile` by value, and `dup_current_fd` (`dup2`/`dup3`) and
 `dup_current_fd_from` (`F_DUPFD*`), each with a close-on-exec flag, count
 the slot they share),
-`cwd: Cwd` (an `OpenGuard` on a directory and the path it was set by) and
+`cwd: Cwd` (an `OpenGuard` on a directory and its path, computed from the
+inode when `chdir`/`fchdir` set it, which a relative open's
+`/proc/<pid>/fd` path is joined to) and
 `umask` (`0o022`). A process starts with `Stdio`, opened by the caller
 before the process's thread is spawned: fd 0 on `/dev/console` `O_RDONLY`
 and fds 1 and 2 `O_WRONLY` (three open file descriptions, each through
@@ -3553,8 +3557,14 @@ through `process::release_fd`, which wakes blocked lockers when anything
 went). `openat` checks for a free slot before it opens (a full
 table is `-EMFILE` before anything is created), and `getcwd` computes the
 path from the cwd's inode (`compute_cwd_path`). `umask` sets the mask
-(`syscall/meta.rs`); `chdir`, `fchdir` and the other M7 numbers not yet
-implemented are stubs (wave 3).
+(`syscall/meta.rs`). `chdir` and `fchdir` set the cwd (its kept path
+computed from the inode too, so relative `chdir`s never grow it), and
+`getdents64` lists a directory from its open file's `dir_cursor`, the
+filesystem's own `readdir` cursor (`d_off`: the cursor past each entry),
+which stays stable as entries come and go (section 9, with ext4's two
+exceptions there), so a model of busybox `rm -r`'s loop, reading on while
+it unlinks, empties a directory; the other M7 numbers not yet implemented
+are stubs (wave 3).
 
 The design #246 set out for this, and the behaviour of each rerouted call:
 Console FDs 0/1/2 become `OpenFile` entries backed by the process's `ConsoleIo`
@@ -3619,7 +3629,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | — | *`chmod`, `chown` and `utimensat` families on `devfs`* | `-EROFS` (a read-only mount, devfs included). A divergence: Linux's devtmpfs accepts these on its nodes; accepting them takes devfs's setters and `writable_mount` (with `exempt_from_rofs`, as `open_inode` uses) |
 | 95 | `umask(mask)` | atomically sets per-process `umask = mask & 0o777` (default `0o022`) and returns previous mask |
 | 162 | `sync()` | snapshots mounted filesystems and cached inodes (never holding `MountTable`/`InodeCache` across I/O), flushes every dirty `PageCache` page and `BlockCache` block followed by `BlockDevice::flush()`; always returns `0` |
-| 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor`; returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
+| 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor` (the filesystem's `readdir` cursor, stable as entries come and go, with ext4's exceptions in section 9; `d_off` the cursor past each record); returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
 | 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on char devices—including on read-only `devfs`—`-EISDIR` on dirs, `-EROFS` on regular files on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on final symlink without trailing `/` unless `O_PATH` is also set; trailing `/` forces directory traversal even with `O_NOFOLLOW`, matching Linux), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
 | 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o1777) & !umask` (setuid/setgid dropped, sticky kept, as Linux's `vfs_mkdir`), stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
 | 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`); drops setuid (and setgid with group-execute) on a non-directory, as `fchown` |
@@ -5427,7 +5437,27 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     table protected under the inode lock or a leaf `SleepMutex`, and one
     metadata lock): `stat()`, `lookup(name)`, `create(...)`, `mkdir(...)`,
     `unlink(name)`, `rmdir(name)`, `link(name, target)`, `symlink(name,
-    target)`, `readlink()`, `rename(...)`, `readdir(cursor)`, `truncate(size)`,
+    target)`, `readlink()`, `rename(...)`, `readdir(cursor)` (the cursor
+    opaque, any value taken without harm, each entry's `next_cursor` past
+    the one before, and **stable as entries come and go**: a listing
+    resumed after removals or additions lists every entry that stayed
+    exactly once. tmpfs numbers entries as they are added (a name keeps
+    its number through a rename over it or an exchange); procfs keys them
+    as Linux does (`/proc`'s pids past its fixed entries, `/proc/<pid>/fd`
+    by fd); devfs, whose entries never change, uses an index; ext4 uses an
+    entry's byte position, as Linux does for a linear directory, which
+    holds because `ext4plus` never moves a record there (a removal merges
+    or zeroes it, an insert takes the first slack with room or a new
+    block), with two exceptions: a rename over a name, or an exchange, is
+    an unlink and a link, so the name that stayed may move behind the
+    cursor (skipped) or ahead (listed again); and in a hashed (htree)
+    directory an insert repacks a leaf block, split or not, moving its
+    records (`ext4plus` never makes one, so only directories made outside
+    Lumen, such as the Alpine image's large ones, are affected). A
+    directory removed while open lists as empty (Linux: `ENOENT`,
+    `IS_DEADDIR`; a deliberate difference); entries pushed before an `Err`
+    are valid),
+    `truncate(size)`,
     `set_mode/owner/times(...)` (`set_owner` also leaves the mode
     `lumen_vfs::mode_after_chown` gives: setuid dropped on a non-directory,
     setgid too with group-execute, in the same metadata-lock hold and
@@ -5741,7 +5771,9 @@ Lock 2 is held across a regular file's `read_at`/`write_at` (#254b), but
 not across procfs's `read_at`: `/proc/<pid>/maps` takes the address
 space's Lock 1 there, which comes first, so `read` reads procfs at a
 snapshot of the offset and moves it after, under a fresh hold, only if it
-is unchanged.
+is unchanged. `dir_cursor` (Lock 2) is held across every filesystem's
+`readdir`, procfs's included (it takes only the leaf `ACTIVE_PROCS`), and
+moved before it is released; never across `getdents64`'s copy out.
 
 **M8 hazards** (none can happen while each open file description has one
 thread, as in M7; each needs fixing when M8 shares them through threads,
@@ -5752,6 +5784,10 @@ thread, as in M7; each needs fixing when M8 shares them through threads,
 - a copy-out fault gives its chunk back only if the offset is still at the
   chunk's end, but a reader that moved it there in between has its move
   undone;
+- likewise `getdents64`: a copy-out fault puts `dir_cursor` back only if
+  it is still past the records it packed, but another caller's listing
+  that ended at exactly that cursor has its move undone, and lists its
+  records again;
 - `dup_current_fd`/`dup_current_fd_from` look `old` up and install the new
   slot in two holds of `ACTIVE_PROCS`, and `openat`'s free-slot check comes
   before its open and install (another thread can fill the table after an

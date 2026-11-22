@@ -1690,6 +1690,27 @@ pub(crate) fn ktest_ext4(dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'
     ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, dev_minor), false).map_err(|_| "ext4 mount")
 }
 
+/// A read-only in-memory ext4 filesystem (devices `0:minor` for the
+/// writable mount it is made on and `0:minor+1`) whose root holds, after
+/// `.` and `..`, the names `a0` to `a5` (hard links to one file) with `a3`
+/// renamed on disk to the bytes `ff fe`, not UTF-8: `readdir` skips it,
+/// leaving a gap in its cursors, for the FD layer's ktests.
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_ext4_non_utf8(minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
+    use ext4::ktest_util::{ROOT_DIR_BLOCK_4K, image, mount, mount_ro_image};
+    let m = mount(build_minimal_ext4_image_blocks(256), minor)?;
+    let file = m.root.create("a0", 0o644).map_err(|_| "create a0")?;
+    for name in ["a1", "a2", "a3", "a4", "a5"] {
+        m.root.link(name, &file).map_err(|_| "link")?;
+    }
+    let mut img = image(&m)?;
+    let dir = &mut img[(ROOT_DIR_BLOCK_4K as usize) * BLOCK_SIZE..][..BLOCK_SIZE];
+    let at = dir.windows(2).position(|w| w == b"a3").ok_or("a3's entry")?;
+    dir[at] = 0xff;
+    dir[at + 1] = 0xfe;
+    mount_ro_image(img, minor + 1)
+}
+
 /// An in-memory block device for ktests. It stays here, not in
 /// `vfs/tests.rs`, because the `vfs/ext4.rs` and `vfs/page_cache.rs` ktests use it too.
 #[cfg(feature = "ktest")]
