@@ -29,7 +29,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Dynamic musl program with a shared library loaded at run time (#255): `m7_test` runs off the ext4 rootfs through `/lib/ld-musl-x86_64.so.1`, which maps `libm7.so` from its descriptor (the first ring-3 mmap of a file) for `dlopen`, `dlsym` finding its functions, `dlclose` returning 0, with zero leaked frames"
+name = "Dynamic musl program with a shared library loaded at run time (#255): `m7_test` runs off the ext4 rootfs through `/lib/ld-musl-x86_64.so.1`, which maps `libm7.so` from its descriptor for `dlopen`, `dlsym` finding its functions, `dlclose` returning 0, with zero leaked frames (the runs kept clear of #300's kernel stack-window page tables)"
 milestone = "M7"
 tests = [
     "scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen",

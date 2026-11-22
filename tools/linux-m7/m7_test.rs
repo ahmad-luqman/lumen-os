@@ -8,8 +8,9 @@
 //!
 //! - none: `dlclose`, then `m7_test: dlopen/dlsym ok`;
 //! - `shared PATH`: a `MAP_SHARED` mapping of a two-page file agrees with
-//!   `pread`/`pwrite` both ways, then `msync(MS_SYNC)` (stores made through
-//!   the mapping, left in the file for the host to read back);
+//!   `pread`/`pwrite` both ways, then `msync(MS_SYNC)` (two stores made
+//!   through the mapping and one `pwrite`, left in the file, where the
+//!   scenario's next boot reads them back);
 //! - `private PATH`: a `MAP_PRIVATE` mapping's stores stay its own (the file
 //!   and a shared mapping of it unchanged), and a `pwrite` to a page it
 //!   copied doesn't reach it;
@@ -20,14 +21,16 @@
 //!   new end (regrown, it reads zeroes, not the old bytes), then the page is
 //!   written back as it was;
 //! - `sigbus PATH`: a mapped, touched page truncated away is touched again:
-//!   the process dies of a bus error (`m7_test: sigbus: touching <addr> past
-//!   EOF` before it names the address);
+//!   the process dies of a bus error, first printing `m7_test: sigbus:
+//!   touching <addr> past EOF`, the address the report's `cr2` must match;
 //! - `maps`: `/proc/self/maps` copied to stdout while `libm7.so` is loaded,
 //!   between `m7_test: maps begin` and `m7_test: maps end`.
 //!
-//! A mode's success ends in `m7_test: <mode> ok` and exit 0; a failed check
-//! prints `m7_test: FAIL <check>` (with `errno=<n>` after a call) and exits
-//! with a code naming it.
+//! A mode's success ends in `m7_test: <mode> ok` and exit 0. A failed mode
+//! check prints `m7_test: FAIL <check>` (with `errno=<n>` when a call failed)
+//! and exits with a code naming it (10 and up); a `dlopen`, `dlsym` or
+//! `dlclose` failure prints its own line and exits 1 to 5; bad arguments
+//! exit 6 (too long) or 7 (usage).
 
 #![no_std]
 #![no_main]
@@ -269,8 +272,9 @@ fn load_libm7() -> Result<*mut c_void, c_int> {
     Ok(handle)
 }
 
-/// The bytes the shared mode stores through its mapping (page 0 and page 1),
-/// which the host reads back from the disk after `msync`.
+/// What the shared mode leaves in the file for the scenario's next boot to
+/// read back after `msync`: a store through the mapping at the start of
+/// page 0, one at the start of page 1, and a `pwrite` at byte 512.
 const SHARED_STORE: &[u8] = b"m7 shared store via mapping\n";
 const SHARED_STORE_1: &[u8] = b"m7 shared page one\n";
 const SHARED_PWRITE: &[u8] = b"m7 pwrite into mapped page\n";
@@ -289,9 +293,9 @@ fn mode_shared(path: &CPath) -> c_int {
         return fail_os(12, b"shared: pread");
     }
     if !mapping_is(p, 0, &buf) {
-        return fail(13, b"shared: mapping differs from read");
+        return fail(13, b"shared: mapping differs from pread");
     }
-    // Stores through the mapping, then read(2) sees them.
+    // Stores through the mapping, then `pread` sees them.
     for (i, &b) in SHARED_STORE.iter().enumerate() {
         poke(p, i, b);
     }
@@ -299,14 +303,19 @@ fn mode_shared(path: &CPath) -> c_int {
         poke(p, PAGE + i, b);
     }
     let mut got = [0u8; 64];
-    if !pread_exact(fd, &mut got[..SHARED_STORE.len()], 0) || &got[..SHARED_STORE.len()] != SHARED_STORE {
-        return fail(14, b"shared: read misses a store through the mapping");
+    if !pread_exact(fd, &mut got[..SHARED_STORE.len()], 0) {
+        return fail_os(21, b"shared: pread of page 0");
     }
-    if !pread_exact(fd, &mut got[..SHARED_STORE_1.len()], PAGE as i64) || &got[..SHARED_STORE_1.len()] != SHARED_STORE_1
-    {
-        return fail(15, b"shared: read misses a store to page 1");
+    if &got[..SHARED_STORE.len()] != SHARED_STORE {
+        return fail(14, b"shared: pread misses a store through the mapping");
     }
-    // write(2), then the mapping sees it.
+    if !pread_exact(fd, &mut got[..SHARED_STORE_1.len()], PAGE as i64) {
+        return fail_os(22, b"shared: pread of page 1");
+    }
+    if &got[..SHARED_STORE_1.len()] != SHARED_STORE_1 {
+        return fail(15, b"shared: pread misses a store to page 1");
+    }
+    // `pwrite`, then the mapping sees it.
     if !pwrite_exact(fd, SHARED_PWRITE, 512) {
         return fail_os(16, b"shared: pwrite");
     }
@@ -318,7 +327,10 @@ fn mode_shared(path: &CPath) -> c_int {
         return fail_os(18, b"shared: msync(MS_SYNC)");
     }
     // SAFETY: as above; an address off a page boundary is refused.
-    if unsafe { msync(p.add(1).cast(), PAGE, MS_SYNC) } == 0 || errno() != EINVAL {
+    if unsafe { msync(p.add(1).cast(), PAGE, MS_SYNC) } == 0 {
+        return fail(19, b"shared: msync of an unaligned address succeeded");
+    }
+    if errno() != EINVAL {
         return fail_os(19, b"shared: msync of an unaligned address not EINVAL");
     }
     if !unmap(p, 2 * PAGE) {
@@ -347,7 +359,7 @@ fn mode_private(path: &CPath) -> c_int {
         return fail_os(33, b"private: shared mmap");
     }
     if !mapping_is(p, 0, &orig) {
-        return fail(34, b"private: mapping differs from read");
+        return fail(34, b"private: mapping differs from pread");
     }
     // Copy-on-write: the store is the private mapping's alone.
     let stored = !orig[100];
@@ -356,7 +368,10 @@ fn mode_private(path: &CPath) -> c_int {
         return fail(35, b"private: store lost");
     }
     let mut now = [0u8; 2 * PAGE];
-    if !pread_exact(fd, &mut now, 0) || now != orig {
+    if !pread_exact(fd, &mut now, 0) {
+        return fail_os(43, b"private: pread after the store");
+    }
+    if now != orig {
         return fail(36, b"private: a private store reached the file");
     }
     if !mapping_is(s, 0, &orig) {
@@ -395,12 +410,18 @@ fn mode_mprotect(path: &CPath) -> c_int {
         return fail_os(51, b"mprotect: shared read-only mmap");
     }
     // SAFETY: `s` is this mode's live mapping of one page.
-    if unsafe { mprotect(s.cast(), PAGE, PROT_READ | PROT_WRITE) } == 0 || errno() != EACCES {
+    if unsafe { mprotect(s.cast(), PAGE, PROT_READ | PROT_WRITE) } == 0 {
+        return fail(52, b"mprotect: PROT_WRITE on an O_RDONLY MAP_SHARED mapping succeeded");
+    }
+    if errno() != EACCES {
         return fail_os(52, b"mprotect: PROT_WRITE on an O_RDONLY MAP_SHARED mapping not EACCES");
     }
     let first = peek(s, 0);
     let w = map(PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd);
-    if w.cast() != MAP_FAILED || errno() != EACCES {
+    if w.cast() != MAP_FAILED {
+        return fail(53, b"mprotect: writable MAP_SHARED mmap of O_RDONLY succeeded");
+    }
+    if errno() != EACCES {
         return fail_os(53, b"mprotect: writable MAP_SHARED mmap of O_RDONLY not EACCES");
     }
     // A private mapping of the same descriptor may become writable.
@@ -442,7 +463,7 @@ fn mode_truncate(path: &CPath) -> c_int {
     }
     // Both pages mapped (their PTEs present) before the shrink.
     if !mapping_is(p, 0, &orig) {
-        return fail(64, b"truncate: mapping differs from read");
+        return fail(64, b"truncate: mapping differs from pread");
     }
     // SAFETY: `fd` is an open writable descriptor.
     if unsafe { ftruncate(fd, PAGE as i64) } != 0 {
@@ -484,8 +505,11 @@ fn mode_sigbus(path: &CPath) -> c_int {
         return fail_os(81, b"sigbus: mmap");
     }
     let mut first = [0u8; 1];
-    if !pread_exact(fd, &mut first, PAGE as i64) || peek(p, PAGE) != first[0] {
-        return fail(82, b"sigbus: page 1 differs from read");
+    if !pread_exact(fd, &mut first, PAGE as i64) {
+        return fail_os(85, b"sigbus: pread");
+    }
+    if peek(p, PAGE) != first[0] {
+        return fail(82, b"sigbus: page 1 differs from pread");
     }
     // SAFETY: `fd` is an open writable descriptor.
     if unsafe { ftruncate(fd, PAGE as i64) } != 0 {
