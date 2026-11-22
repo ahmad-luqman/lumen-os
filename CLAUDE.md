@@ -351,7 +351,8 @@ one is its own PR that updates that doc first.
   first ext4 virtio-blk volume at `/`, else a tmpfs root; `/tmp`, `/dev`,
   `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
   and the `mount`, `sync` and `vfstest` commands (`vfstest`: file
-  operations for the scenarios until #254 wires the syscalls);
+  operations from the kernel shell, for the scenarios to set up and inspect
+  files around ring-3 programs);
   `vfs/tests.rs` the ktests of `mod.rs`'s code (`lumen_kernel::vfs::tests::`;
   `vfs/ext4.rs` and `vfs/page_cache.rs` keep their own; `MemBlkDev`, the
   in-memory block device those files' ktests use too, stays in `mod.rs`);
@@ -749,7 +750,10 @@ one is its own PR that updates that doc first.
   puts it, and `finish` checking the next after the last run).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
   assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
-  for #255's exit scenarios, and `libm7.so`).
+  for #255's exit scenarios, and `libm7.so`;
+  `m7_vfs`, #254's exit scenarios' program: `posix`, `locks`, `keep` (a
+  tree left for fsck), and `lock-hold`/`lock-probe`, two processes at once,
+  every check a raw syscall by number).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests
   (incl. `test_rootfs.py`),
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs
