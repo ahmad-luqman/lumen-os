@@ -22,13 +22,13 @@ BUSYBOX_EXIT = re.compile(r"linux: /bin/busybox exit=(\d+) leaked_frames=(-?\d+)
 
 
 def warm_up(m):
-    """One `linux /bin/busybox true`, its leaked frames not counted: the
-    first process's kernel stack may be the first of its size since boot,
-    on fresh addresses that can map a page table; every later one reuses its
-    slot (#300), so its count is exact."""
+    """One `linux /bin/busybox true`, leaking 0 frames or 1: the first
+    process's kernel stack may find no freed slot to reuse and take fresh
+    addresses, whose 68 KiB can cross into one new 2 MiB page table; every
+    later one reuses the last one's slot (#300), so its count is exact."""
     out = run(m, "linux /bin/busybox true", 60)
     done = BUSYBOX_EXIT.fullmatch(out.splitlines()[-1]) if out else None
-    assert done and done.group(1) == "0", out
+    assert done and done.group(1) == "0" and done.group(2) in ("0", "1"), out
 
 
 class Busybox:

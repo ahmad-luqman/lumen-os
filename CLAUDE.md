@@ -229,9 +229,12 @@ one is its own PR that updates that doc first.
   `mm/stack.rs`: kernel stacks with guard pages, a dropped one's slot
   reused (#300); `arch/x86_64/stacks.rs` holds their registry (backtraces,
   overflow reports). `mm/tlb.rs`: retiring dropped stacks' pages from every
-  CPU's TLB before reuse (`retire`, `catch_up` at the timer and `WAKEUP`
-  interrupts, `join` for an AP going online, `sync`: IPIs and a bounded
-  wait, only outside critical sections).
+  CPU's TLB before reuse (`retire` giving a `Generation`, `flushed_through`
+  the one maker of a `Flushed`, `catch_up` at the timer (`on_tick`;
+  `TickFlushesOff` for the ktests) and `WAKEUP` interrupts, `join` for an AP
+  going online, `sync`: IPIs and a bounded wait, only outside critical
+  sections; a stack that couldn't wait counted by `Fallback` reason, shown
+  in `mem`).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT.
@@ -519,9 +522,9 @@ one is its own PR that updates that doc first.
   page-table format and mapper (host-tested, incl. a model comparison), the
   window tokens that confine `paging::map` (`Window::join`), and the
   kernel-stack layout (`StackWindow`: `StackSlot`s, freed ones kept as
-  joined free ranges tagged with a TLB generation, first fit once flushed,
-  #300; a model and a page-table count host-test it) and lock-free stack
-  registry.
+  joined free ranges tagged with a TLB `Generation`, first fit once a
+  `Flushed` covers it, #300; a model with out-of-order give-backs and a
+  page-table count host-test it) and lock-free stack registry.
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-vm`: a process's user address space as logic: the user

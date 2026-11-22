@@ -455,6 +455,12 @@ def test_system_commands(boot):
     ), out
     assert re.search(r"^  heap    .* used in \d+ allocations, .* free$", out, re.MULTILINE), out
     assert re.search(r"^  stacks  \d+ \(.*\): .*\d+ thread", out, re.MULTILINE), out
+    assert re.search(
+        r"^  reuse   stacks on other addresses: no-wait \d+ gave-up \d+ timed-out \d+ raced \d+; "
+        r"cpus behind the TLB flushes 0x[0-9a-f]+$",
+        out,
+        re.MULTILINE,
+    ), out
 
     out = run(m, "irqs")
     assert re.match(r"irqs: \d+ I/O APIC inputs", out), out

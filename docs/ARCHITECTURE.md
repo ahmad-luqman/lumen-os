@@ -335,8 +335,8 @@ GS-relative load, usable from interrupt and crash paths. Indexed by it: the
 GDT and TSS (`ltr` marks a TSS busy), interrupt nesting (`arch::irq`), and
 the trace ring. The IDT and the local APIC's mapping are shared (every
 CPU's local APIC answers at the same address). The stack registry holds 128
-stacks: four per CPU, and the rest for threads and tests (a build-time
-assert keeps the four per CPU below it). Each CPU's `smp` slot is empty, starting or online; only online CPUs
+stacks: five per CPU (main, #DF, NMI, #MC, #DB), and the rest for threads
+and tests (a build-time assert keeps the five per CPU below it). Each CPU's `smp` slot is empty, starting or online; only online CPUs
 get IPIs. The in-kernel tests boot with 4 CPUs online.
 
 **Running something on an AP.** `smp::run_on(cpu, job)` puts a `fn()` in the
@@ -367,22 +367,41 @@ unmapping as a generation (`retire`, after the unmap) and keeps, per CPU,
 the newest generation it has flushed through: a CPU catches up (`catch_up`:
 reads the newest generation, reloads CR3, which drops every kernel-window
 translation since the kernel's tables set no global bit, then records it)
-at each timer tick and each `WAKEUP` IPI. The stack window hands a free
-range out only once every counted CPU has flushed through its generation
-(`flushed_through`); `KernelStack::new` first calls `sync(generation)`,
-which catches up its own CPU, sends `WAKEUP` to each online CPU behind, and
-spins until they have caught up. It waits only from a thread with
-interrupts on and no critical section open (the M8 shootdown's locking
-rule: a CPU spinning, interrupts off, on a lock the waiter held could never
-answer), at most 2 s (warned about); otherwise, or past that, the stack
-takes other addresses (a fresh range may map a page table). The boot CPU
+at each timer tick and each `WAKEUP` IPI (not while `sync` spins: it
+catches up its own CPU once, at its start). The stack window hands a free
+range out only once every counted CPU has flushed through its generation:
+`StackWindow::take` takes a `Flushed`, which only `tlb::flushed_through`
+makes (`unsafe fn Flushed::vouch`, like `Claims::new`), and a give-back's
+`Generation` comes from `tlb::retire`. When the lowest fitting range isn't
+flushed through yet, `KernelStack::new` calls `sync(generation)`, which
+catches up its own CPU, sends `WAKEUP` to each online CPU behind (again on
+the next pass if an IPI couldn't be sent), and spins until they have
+caught up. It waits only from a thread with interrupts on and no critical
+section open (the M8 shootdown's locking rule: a CPU spinning, interrupts
+off, on a lock the waiter held could never answer), once the clocks are
+calibrated, at most 2 s (warned about, host-timed); after a timeout no
+`sync` waits again until every CPU has got past that generation (warned
+about again every 10 s while one hasn't, logged when they have). Where it
+didn't wait, or gave up, the stack takes other addresses (a higher freed
+range already flushed, else the untouched rest, which may map a page
+table), counted by reason in `mem` (`no-wait`, `gave-up`, `timed-out`,
+`raced`: a stack freed meanwhile joined the range at a newer generation),
+with the CPUs still behind. Each spawn that needs a flush costs an IPI to
+each CPU behind and a wait for its interrupt (microseconds; none when the
+CPUs' ticks have flushed already), and each retired generation costs every
+CPU one CR3 reload at its next tick. The boot CPU
 is counted from the start, an AP from `mm::tlb::join` just before it goes
 online (counted as behind everything, then reading the generation,
 flushing and recording it, so a `sync` that saw it uncounted retired its
 pages before that flush); CPUs past the cap are never counted (they never
-load the kernel's tables). Tested by `a_reused_stack_is_flushed_from_every_cpu`
-(another CPU reading the old stack, then the reused one, sees the new
-frame) and `every_cpu_flushes_through_a_retired_generation`.
+load the kernel's tables). Tested, with a ktest-only switch stopping the
+timer's flushes (`tlb::TickFlushesOff`) so only `sync`'s IPIs flush, by
+`every_cpu_flushes_through_a_retired_generation` and
+`a_reused_stack_is_flushed_from_every_cpu` (another CPU reading the old
+stack, then the reused one, sees the new frame; it can't always tell a
+missing flush, as the other CPU may not have kept the translation), and
+the no-wait fallback by
+`a_stack_that_cant_wait_takes_other_addresses_and_counts_it`.
 
 ### ACPI (built in M1)
 
@@ -631,7 +650,9 @@ page. The kernel API:
   Paging hands each window out once ever (`claim_heap_window`,
   `claim_stack_window`, and two test windows at the top GiB of each for the
   ktests); a holder can split off disjoint sub-windows (each kernel stack
-  gets its own; guard pages get none, so they can never be mapped), and no
+  gets its own; a guard page's window stays inside its `StackSlot`, so it
+  can never be mapped; a window handed on after an unmap is only safe once
+  every CPU has flushed the pages, `mm::tlb`), and no
   safe code can forge or copy one (building a claims table is `unsafe`). Frames come as `OwnedFrame`s
   (move-only, freed on drop; the raw `frame::free` is `unsafe`). With both
   proven, `map(&mut window, virt, frame, attrs)` is safe: it consumes the
@@ -1002,10 +1023,14 @@ from the registry, then unmaps it, frees its frames and gives its slot
 back (#300): the slot joins the window's free ranges (up to
 `FREE_RANGES`, 256; adjacent ones joined, so there is at most one more
 than the slots taken), tagged with the generation its pages were retired
-at (section 4, "Retiring stack pages"). `new` takes the lowest free range
+at (section 4, "Retiring stack pages"; the newest of a joined range's
+parts, which may come back out of order). `new` takes the lowest free range
 that fits, carved from its bottom, once every CPU has flushed through its
-generation (waiting for that where it can), and the untouched rest of the
-window only when none fits. So steady-state spawning and exiting reuses
+generation (waiting for that where it can); otherwise (none fits, or the
+lowest one's flush can't be waited for) a higher free range already
+flushed, else the untouched rest of the window. It asserts the slot's
+guard page is unmapped (a reused range's page can become a smaller
+stack's guard). So steady-state spawning and exiting reuses
 the same addresses and their page tables: before, every stack's addresses
 were new and `unmap` frees no table, so about every 30th spawn mapped an
 L1 table for good (a frame each; RAM ran out after about 2M spawns). A

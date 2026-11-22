@@ -15,6 +15,12 @@
 //! because sub-windows split off it may still be in use. A holder of two
 //! windows that meet can join them back into one ([`Window::join`]): both
 //! were its own, so the joined one is too.
+//!
+//! A window only proves whose pages are; it says nothing about TLBs. A
+//! holder that unmaps pages (which flushes only its own CPU's TLB) and then
+//! hands their window on to be mapped again must first have every CPU flush
+//! them: the kernel's `mm::tlb` (as `stacks::StackWindow` requires with
+//! [`Flushed`](crate::stacks::Flushed)).
 
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};

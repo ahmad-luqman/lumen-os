@@ -246,7 +246,8 @@ pub(crate) fn job_reached(index: usize, done: impl Fn() -> bool) -> bool {
 
 /// Wake CPU `index` if it is online and isn't this one: send it the
 /// `WAKEUP` IPI, which ends its idle loop's halt (the scheduler, after
-/// queueing a thread there, or to start its timer). False only if an IPI
+/// queueing a thread there, or to start its timer) and has it catch up
+/// retired TLB generations (`mm::tlb::sync`). False only if an IPI
 /// was due and couldn't be sent (this CPU's local APIC stayed busy); true
 /// if there was nothing to do (this CPU, or one that isn't online).
 #[must_use = "an IPI that wasn't sent woke nothing"]

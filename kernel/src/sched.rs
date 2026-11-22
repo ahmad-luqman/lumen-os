@@ -37,8 +37,8 @@
 //! the next thread to run on its CPU frees its stack and is done with it
 //! ([`FINISHING`]), and only then does [`JoinHandle::join`] return. The unmap's TLB flush is local: the home CPU
 //! ran on the stack; a spawner on another CPU wrote its first frame (and a
-//! [`scope`]d thread may have borrowed from it) and may keep a stale entry
-//! for that page. Nothing uses it until the stack's addresses are reused,
+//! [`scope`]d thread may have borrowed from it) and may keep stale entries
+//! for its pages. Nothing uses it until the stack's addresses are reused,
 //! and they are reused only once every CPU has flushed them
 //! (`mm::tlb`, #300).
 //!

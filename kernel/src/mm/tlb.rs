@@ -8,12 +8,13 @@
 //! is harmless while nothing uses the address, and a hazard once it is
 //! mapped again to another frame: that CPU would read and write the old
 //! frame, by then someone else's. So whoever unmaps pages it will hand out
-//! again [`retire`]s them, which numbers a generation, and before handing
-//! them out makes every CPU flush through it ([`sync`]): each CPU records
-//! the newest generation it has flushed through ([`catch_up`], from its
-//! timer and `WAKEUP` interrupts), and [`sync`] sends `WAKEUP` IPIs to the
-//! CPUs behind and waits for them. The kernel stacks ([`super::stack`]) are
-//! the one user.
+//! again [`retire`]s them, which numbers a [`Generation`], and hands them out
+//! only once every CPU has flushed through it ([`flushed_through`], the one
+//! maker of a [`Flushed`]): each CPU records the newest generation it has
+//! flushed through ([`catch_up`], from its timer and `WAKEUP` interrupts and
+//! once at the start of [`sync`]), and [`sync`] sends `WAKEUP` IPIs to the
+//! CPUs behind and waits for them where it can. The kernel stacks
+//! ([`super::stack`]) are the one user.
 //!
 //! A CPU counts from the moment it first loads the kernel's tables: the
 //! boot CPU from the start, an AP from just before it goes online
@@ -25,7 +26,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use log::warn;
+use log::{info, warn};
+use lumen_mm::stacks::{Flushed, Generation};
 
 use crate::arch::{self, MAX_CPUS};
 use crate::{smp, time};
@@ -47,28 +49,45 @@ static FLUSHED: [AtomicU64; MAX_CPUS] = {
 
 /// How long [`sync`] waits for the other CPUs before giving up (a CPU that
 /// keeps its interrupts off this long is stuck; the caller then doesn't
-/// reuse the pages).
+/// reuse the pages yet).
 const SYNC_TIMEOUT_NS: u64 = 2_000_000_000;
 
-/// The generation the last timed-out [`sync`] waited for (0 if none).
+/// How often a [`sync`] that doesn't wait, because CPUs are still behind a
+/// wait that gave up, warns again.
+const STILL_STUCK_NS: u64 = 10_000_000_000;
+
+/// The generation the last timed-out [`sync`] waited for (0 if none, or
+/// once every CPU has got past it).
 static GAVE_UP: AtomicU64 = AtomicU64::new(0);
+/// When a CPU's being stuck was last warned about (`time::now_ns`).
+static STUCK_WARNED: AtomicU64 = AtomicU64::new(0);
 
 /// Number the pages just unmapped (on this CPU, by the caller) as a new
 /// generation, which [`sync`] makes every CPU flush through. Call it after
 /// the unmapping.
-pub fn retire() -> u64 {
-    RETIRED.fetch_add(1, Ordering::SeqCst) + 1
+pub fn retire() -> Generation {
+    let n = RETIRED.fetch_add(1, Ordering::SeqCst) + 1;
+    // SAFETY: the caller unmapped the pages it gives back with this before
+    // the count above, and `catch_up` reads the count before it flushes.
+    unsafe { Generation::retired(n) }
 }
 
 /// The newest generation every counted CPU has flushed through: pages
 /// retired at it or before are in no CPU's TLB.
-pub fn flushed_through() -> u64 {
-    FLUSHED.iter().map(|f| f.load(Ordering::SeqCst)).min().unwrap_or(0).min(RETIRED.load(Ordering::SeqCst))
+pub fn flushed_through() -> Flushed {
+    let n = FLUSHED.iter().map(|f| f.load(Ordering::SeqCst)).min().unwrap_or(0).min(RETIRED.load(Ordering::SeqCst));
+    // SAFETY: each counted CPU stored a generation in `FLUSHED` only after
+    // a CR3 reload that came after it read that generation (`catch_up`,
+    // `join`), and every translation is non-global; a CPU not counted
+    // hasn't loaded the kernel's tables since (`join` counts it before its
+    // flush). So every CPU has flushed since anything retired at `n` or
+    // before was unmapped.
+    unsafe { Flushed::vouch(n) }
 }
 
 /// Flush this CPU through the newest generation, if it is behind (and
-/// counted). From the timer and `WAKEUP` interrupts, and [`sync`]'s waits;
-/// interrupts off, so the CPU index holds.
+/// counted). From the `WAKEUP` interrupt, the timer's ([`on_tick`]) and
+/// [`sync`]'s start; interrupts off, so the CPU index holds.
 pub fn catch_up() {
     let flushed = &FLUSHED[arch::cpu_index()];
     let mine = flushed.load(Ordering::SeqCst);
@@ -77,6 +96,39 @@ pub fn catch_up() {
     if mine < newest && mine != NOT_COUNTED {
         arch::paging::flush_local();
         flushed.store(newest, Ordering::SeqCst);
+    }
+}
+
+/// The ktests' switch: off, the timer doesn't [`catch_up`], so only
+/// [`sync`]'s IPIs flush the other CPUs ([`TickFlushesOff`]).
+#[cfg(feature = "ktest")]
+static TICK_FLUSHES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// The timer interrupt's part: [`catch_up`].
+pub fn on_tick() {
+    #[cfg(feature = "ktest")]
+    if !TICK_FLUSHES.load(Ordering::SeqCst) {
+        return;
+    }
+    catch_up();
+}
+
+/// While held, the CPUs' timer interrupts don't [`catch_up`] (ktests).
+#[cfg(feature = "ktest")]
+pub(crate) struct TickFlushesOff(());
+
+#[cfg(feature = "ktest")]
+impl TickFlushesOff {
+    pub(crate) fn new() -> TickFlushesOff {
+        TICK_FLUSHES.store(false, Ordering::SeqCst);
+        TickFlushesOff(())
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for TickFlushesOff {
+    fn drop(&mut self) {
+        TICK_FLUSHES.store(true, Ordering::SeqCst);
     }
 }
 
@@ -94,53 +146,82 @@ pub fn join() {
     flushed.store(newest, Ordering::SeqCst);
 }
 
-/// Make every counted CPU flush through generation `generation`, and say
-/// whether they all have: this one at once, the others at their next
-/// interrupt. Only from a thread outside every critical section with
-/// interrupts on (a CPU spinning on a lock this caller held, interrupts
-/// off, could never answer) does it send the ones behind a `WAKEUP` IPI and
-/// wait for them, at most [`SYNC_TIMEOUT_NS`] (warned about); after a wait
-/// gave up, none waits again until every CPU has got past that one's
-/// generation. Otherwise the others catch up at their next tick.
-pub fn sync(generation: u64) -> bool {
+/// What [`sync`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Synced {
+    /// Every counted CPU has flushed through the generation.
+    Done,
+    /// It couldn't wait (interrupts off, a critical section open, or the
+    /// clocks not calibrated yet): left to the other CPUs' ticks.
+    NoWait,
+    /// It didn't wait: CPUs are still behind a wait that timed out.
+    GaveUp,
+    /// It waited [`SYNC_TIMEOUT_NS`] and they didn't all get there.
+    TimedOut,
+}
+
+/// Make every counted CPU flush through `generation`: this one at once, the
+/// others at their next interrupt. Only from a thread outside every
+/// critical section with interrupts on, and once the clocks are calibrated,
+/// does it send the ones behind a `WAKEUP` IPI and wait for them (a CPU
+/// spinning on a lock this caller held, interrupts off, could never
+/// answer), at most [`SYNC_TIMEOUT_NS`] (warned about). After a wait gave
+/// up, none waits again until every CPU has got past that one's
+/// generation (warned about again every [`STILL_STUCK_NS`] meanwhile, and
+/// logged when they have).
+pub fn sync(generation: Generation) -> Synced {
     {
         let _off = arch::irq::push_off();
         catch_up();
     }
-    let behind = || lagging(generation) != 0;
-    if !behind() {
-        return true;
-    }
-    let free = arch::irq::depth() == 0 && arch::irq::enabled();
-    // Before the clocks are calibrated there is no deadline to wait for.
-    let start = time::now_ns();
-    // Until every CPU has got past the generation a wait gave up on, none
-    // waits again: a stuck CPU costs one timeout, not one per spawn.
+    let generation = generation.get();
     let gave_up = GAVE_UP.load(Ordering::SeqCst);
-    if !free || start == 0 || (gave_up != 0 && flushed_through() < gave_up) {
-        // Left to the other CPUs' ticks.
-        return false;
+    let now = time::now_ns();
+    if gave_up != 0 {
+        let stuck = lagging(gave_up);
+        if stuck == 0 {
+            if GAVE_UP.compare_exchange(gave_up, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                info!(target: "mm", "every cpu flushed its TLB at last: freed stack addresses are reused again");
+            }
+        } else {
+            let last = STUCK_WARNED.load(Ordering::SeqCst);
+            if now.saturating_sub(last) >= STILL_STUCK_NS
+                && STUCK_WARNED.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+            {
+                warn!(target: "mm", "cpus {stuck:#x} still haven't flushed their TLBs: freed stack addresses wait for them");
+            }
+            return if lagging(generation) == 0 { Synced::Done } else { Synced::GaveUp };
+        }
+    }
+    if lagging(generation) == 0 {
+        return Synced::Done;
+    }
+    if arch::irq::depth() != 0 || !arch::irq::enabled() || now == 0 {
+        return Synced::NoWait;
     }
     let here = arch::cpu_index();
-    let deadline = start.saturating_add(SYNC_TIMEOUT_NS);
+    let deadline = now.saturating_add(SYNC_TIMEOUT_NS);
     let mut woken = 0u64;
     loop {
         let lagging = lagging(generation);
         if lagging == 0 {
-            return true;
+            return Synced::Done;
         }
-        // Each online one behind, once (one that couldn't be sent is left to
-        // its next tick): including one that came online meanwhile.
+        // Each online one behind, until its IPI is sent (one that couldn't
+        // be is tried again on the next pass): including one that came
+        // online meanwhile.
         let unwoken = lagging & !woken & !(1 << here);
         for i in (0..MAX_CPUS).filter(|&i| unwoken & 1 << i != 0) {
             if smp::online_lapic_id(i).is_some() && smp::wake(i) {
                 woken |= 1 << i;
             }
         }
-        if time::now_ns() >= deadline {
+        let now = time::now_ns();
+        if now >= deadline {
             GAVE_UP.store(generation, Ordering::SeqCst);
+            STUCK_WARNED.store(now, Ordering::SeqCst);
             warn!(target: "mm", "cpus {lagging:#x} didn't flush their TLBs within 2 s: freed stack addresses wait for them");
-            return false;
+            return Synced::TimedOut;
         }
         core::hint::spin_loop();
     }
@@ -151,20 +232,25 @@ fn lagging(generation: u64) -> u64 {
     (0..MAX_CPUS).filter(|&i| FLUSHED[i].load(Ordering::SeqCst) < generation).fold(0, |m, i| m | 1 << i)
 }
 
+/// The counted CPUs (a bit each) not yet flushed through the newest
+/// generation retired.
+pub fn behind() -> u64 {
+    lagging(RETIRED.load(Ordering::SeqCst))
+}
+
 crate::ktest!(
     fn every_cpu_flushes_through_a_retired_generation() {
-        // `sync` brings every online CPU's count to the generation it was
-        // given, the idle ones woken by IPI; a later `retire` puts them all
-        // behind again.
+        // With the timer's flushes off, `sync` brings every online CPU's
+        // count to the generation it was given by IPI alone.
         use crate::{kassert, kassert_eq};
-        // (Not checked behind first: a stall here lets every CPU tick.)
+        let _ticks_off = TickFlushesOff::new();
         let generation = retire();
-        kassert!(sync(generation));
-        kassert!(flushed_through() >= generation);
+        kassert_eq!(sync(generation), Synced::Done);
+        kassert!(lagging(generation.get()) == 0);
         for (i, flushed) in FLUSHED.iter().enumerate() {
             let f = flushed.load(Ordering::SeqCst);
             kassert_eq!(f == NOT_COUNTED, i != 0 && smp::online_lapic_id(i).is_none());
-            kassert!(f >= generation);
+            kassert!(f >= generation.get());
         }
         Ok(())
     }

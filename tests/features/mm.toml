@@ -83,7 +83,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Kernel stack addresses reused (#300): a dropped stack's slot (guard page and stack) is taken again by the next stack that fits, at the same addresses with its guard page still unmapped, so threads spawned and joined over and over leak no frame (no page table mapped for good every 2 MiB of new addresses); a freed slot is handed out only once every CPU has flushed it from its TLB (mm::tlb: a retired generation, CPUs catching up at their timer and WAKEUP interrupts, sync IPIs and waits), so another CPU that read the old stack reads the new one's frame"
+name = "Kernel stack addresses reused (#300): a dropped stack's slot (guard page and stack) is taken again by the next stack that fits, at the same addresses with its guard page still unmapped, so threads spawned and joined over and over leak no frame (no page table mapped for good every 2 MiB of new addresses); a freed slot is handed out only once every CPU has flushed it from its TLB (mm::tlb: a retired generation, CPUs catching up at their timer and WAKEUP interrupts, sync's IPIs flushing them with the timer's flushes off), so another CPU that read the old stack reads the new one's frame; a stack made with interrupts off takes other addresses, counted as a no-wait fallback, and the freed range is reused once the CPUs' timers have flushed it"
 milestone = "M7"
 tests = [
     "cargo:lumen-mm",
@@ -92,6 +92,7 @@ tests = [
     "ktest:lumen_kernel::mm::stack::spawned_threads_reuse_stacks_and_leak_no_frames",
     "ktest:lumen_kernel::mm::stack::a_reused_stack_is_flushed_from_every_cpu",
     "ktest:lumen_kernel::mm::tlb::every_cpu_flushes_through_a_retired_generation",
+    "ktest:lumen_kernel::mm::stack::a_stack_that_cant_wait_takes_other_addresses_and_counts_it",
     "scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen",
     "scenario:test_alpine::test_alpine_minirootfs_coreutils",
 ]

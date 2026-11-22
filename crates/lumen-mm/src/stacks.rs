@@ -118,6 +118,70 @@ impl StackRange {
 /// the few being set up or given back at a time). Twice that leaves room.
 pub const FREE_RANGES: usize = 2 * MAX_STACKS;
 
+/// A TLB retirement generation: given back with a slot, it says when the
+/// slot's pages were unmapped, and a CPU that has flushed through it holds
+/// none of their translations ([`Flushed`]). The kernel's `mm::tlb::retire`
+/// numbers them; making one up is `unsafe`, as a too-old one would let the
+/// slot be reused while another CPU still caches its pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Generation(u64);
+
+impl Generation {
+    /// Generation `n`.
+    ///
+    /// # Safety
+    /// The pages it is given back with ([`StackWindow::give_back`]) were
+    /// all unmapped before generation `n` was numbered: every CPU that
+    /// flushes its TLB through `n` afterwards holds none of them.
+    pub const unsafe fn retired(n: u64) -> Generation {
+        Generation(n)
+    }
+
+    /// Its number.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Proof that every CPU that may cache a kernel-window translation has
+/// flushed its TLB through a [`Generation`]: what [`StackWindow::take`]
+/// needs before it hands out a freed range retired at or before it. Only
+/// [`vouch`](Flushed::vouch) makes one (the kernel's `mm::tlb::flushed_through`),
+/// in the way [`Claims::new`](crate::window::Claims::new) vouches for its
+/// ranges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Flushed(u64);
+
+impl Flushed {
+    /// Every CPU has flushed through generation `n`.
+    ///
+    /// # Safety
+    /// Every CPU that may hold a translation of a page given back at a
+    /// generation at or before `n` has flushed its TLB since that page was
+    /// unmapped (so none holds one now, nor can it again until the page is
+    /// mapped anew).
+    pub const unsafe fn vouch(n: u64) -> Flushed {
+        Flushed(n)
+    }
+
+    /// Is a range retired at `g` safe to hand out?
+    fn covers(self, g: Generation) -> bool {
+        g.0 <= self.0
+    }
+}
+
+/// Why [`StackWindow::give_back`] couldn't keep a slot (its addresses are
+/// then given up for good, as dropping the slot would; never mapped again).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lost {
+    /// More than [`FREE_RANGES`] free ranges (impossible while at most
+    /// [`MAX_STACKS`] slots are taken).
+    Full,
+    /// Its stack window was changed (it no longer starts where the guard
+    /// page ends): a bug in its holder.
+    Changed,
+}
+
 /// A stack's addresses from [`StackWindow::take`]: its guard page and the
 /// stack above it, each owned by a [`Window`]. Only the stack's window is
 /// handed out ([`StackSlot::window`]): the guard page's stays in here, so no
@@ -155,7 +219,7 @@ impl StackSlot {
 #[derive(Debug)]
 struct Free {
     window: Window,
-    retired: u64,
+    retired: Generation,
 }
 
 /// Hands out stack addresses in the stack window, a guard page below each,
@@ -167,7 +231,8 @@ struct Free {
 /// rest of the window, which becomes a guard page when it is taken: running
 /// off either end of a stack faults instead of silently corrupting a
 /// neighbour. A guard page is never mapped: its window stays inside the
-/// [`StackSlot`].
+/// [`StackSlot`]. (A reused range's page can become a smaller stack's guard
+/// page; it was unmapped when the range was given back.)
 ///
 /// **Reuse (#300).** A stack given back ([`give_back`](Self::give_back))
 /// joins the free ranges, merged with its free neighbours, and a freed slot
@@ -175,10 +240,10 @@ struct Free {
 /// spawning and exiting reuses the same addresses, whose page tables are
 /// already there, instead of mapping a new table every 2 MiB for good. A
 /// freed stack's pages may still be cached in other CPUs' TLBs (its unmap
-/// flushes only the CPU that ran it), so a free range carries the
-/// generation it was retired at, and [`take`](Self::take) hands it out only
-/// once every CPU has flushed through that generation (`flushed`): the
-/// kernel's `mm::tlb` counts the generations and makes the CPUs flush.
+/// flushes only the CPU that ran it), so a free range carries the newest
+/// [`Generation`] given back into it, and [`take`](Self::take) hands it out
+/// only once every CPU has flushed through that generation ([`Flushed`]):
+/// the kernel's `mm::tlb` counts the generations and makes the CPUs flush.
 /// Taking is first fit: the lowest free range that fits and has been
 /// flushed through, carved from its bottom (an exact fit's page above is a
 /// taken slot's guard page, or the untouched rest's first page), else the
@@ -190,12 +255,6 @@ pub struct StackWindow {
     free: [Option<Free>; FREE_RANGES],
 }
 
-impl Default for StackWindow {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
 impl StackWindow {
     /// A stack window with no addresses yet ([`claim`](Self::claim) gives
     /// it some): constant, so the kernel's can be a static.
@@ -203,8 +262,9 @@ impl StackWindow {
         StackWindow { rest: None, free: [const { None }; FREE_RANGES] }
     }
 
-    /// A stack window over `window`.
-    pub fn new(window: Window) -> StackWindow {
+    /// A stack window over `window` (host tests).
+    #[cfg(test)]
+    fn new(window: Window) -> StackWindow {
         let mut w = StackWindow::empty();
         w.claim(window);
         w
@@ -225,33 +285,34 @@ impl StackWindow {
     }
 
     /// The lowest free range a stack of `size` bytes fits in, among those
-    /// every CPU has flushed through if `flushed` is given.
-    fn lowest_fit(&self, size: u64, flushed: Option<u64>) -> Option<usize> {
+    /// `flushed` covers if it is given.
+    fn lowest_fit(&self, size: u64, flushed: Option<Flushed>) -> Option<usize> {
         let need = GUARD_SIZE.checked_add(size)?;
         self.free
             .iter()
             .enumerate()
             .filter_map(|(i, f)| f.as_ref().map(|f| (i, f)))
-            .filter(|(_, f)| f.window.len() >= need && flushed.is_none_or(|g| f.retired <= g))
+            .filter(|(_, f)| f.window.len() >= need && flushed.is_none_or(|g| g.covers(f.retired)))
             .min_by_key(|(_, f)| f.window.range().start)
             .map(|(i, _)| i)
     }
 
     /// The generation every CPU must have flushed through before the lowest
-    /// free range a stack of `size` bytes fits in may be handed out, if they
-    /// haven't yet (`flushed`); `None` if no free range fits or the lowest
-    /// one is ready.
-    pub fn wait_for(&self, size: u64, flushed: u64) -> Option<u64> {
+    /// free range a stack of `size` bytes fits in may be handed out, if
+    /// `flushed` doesn't cover it yet; `None` if no free range fits or the
+    /// lowest one is ready.
+    pub fn wait_for(&self, size: u64, flushed: Flushed) -> Option<Generation> {
         let i = self.lowest_fit(size, None)?;
         let retired = self.free[i].as_ref().expect("lowest_fit names a free range").retired;
-        (retired > flushed).then_some(retired)
+        (!flushed.covers(retired)).then_some(retired)
     }
 
     /// Addresses for a stack of `size` bytes (a nonzero multiple of the page
     /// size), with its guard page below it: from the lowest free range that
-    /// fits and that every CPU has flushed through (`flushed`), else from
-    /// the untouched rest of the window; `None` once neither has room.
-    pub fn take(&mut self, size: u64, flushed: u64) -> Option<StackSlot> {
+    /// fits and that `flushed` covers, else from the untouched rest of the
+    /// window; `None` if no such free range fits and the rest has no room
+    /// (a fitting range may still be waiting for a flush).
+    pub fn take(&mut self, size: u64, flushed: Flushed) -> Option<StackSlot> {
         assert!(size != 0 && size.is_multiple_of(FRAME_SIZE), "stack size {size:#x} is not whole pages");
         let len = GUARD_SIZE.checked_add(size)?;
         if let Some(i) = self.lowest_fit(size, Some(flushed)) {
@@ -271,19 +332,13 @@ impl StackWindow {
         carve(rest, size)
     }
 
-    /// Take back `slot`, whose pages are all unmapped, retired at
-    /// generation `retired` (a CPU that has flushed through it holds none of
-    /// its pages in its TLB): it joins its free neighbours. False if it
-    /// couldn't be kept (more than [`FREE_RANGES`] free ranges, which can't
-    /// happen while at most [`MAX_STACKS`] slots are taken, or its stack
-    /// window no longer starts at its guard page's end): its addresses are
-    /// then given up for good, as dropping it would.
-    #[must_use = "a slot that couldn't be kept is lost for good"]
-    pub fn give_back(&mut self, slot: StackSlot, retired: u64) -> bool {
+    /// Take back `slot`, whose pages are all unmapped, retired at `retired`:
+    /// it joins its free neighbours (the joined range keeps the newest
+    /// generation of its parts, which may come back in any order). `Err` if
+    /// it couldn't be kept: its addresses are then given up for good.
+    pub fn give_back(&mut self, slot: StackSlot, retired: Generation) -> Result<(), Lost> {
         let StackSlot { guard, stack } = slot;
-        // A stack window its holder changed (`window` lends it mutably) no
-        // longer meets its guard page: given up, never mapped again.
-        let Ok(mut window) = guard.join(stack) else { return false };
+        let Ok(mut window) = guard.join(stack) else { return Err(Lost::Changed) };
         let mut retired = retired;
         // Join the free range just below, then the one just above.
         let start = window.range().start;
@@ -298,13 +353,9 @@ impl StackWindow {
             retired = retired.max(above.retired);
             window = window.join(above.window).unwrap_or_else(|_| unreachable!("they meet"));
         }
-        match self.free.iter_mut().find(|f| f.is_none()) {
-            Some(empty) => {
-                *empty = Some(Free { window, retired });
-                true
-            }
-            None => false,
-        }
+        let empty = self.free.iter_mut().find(|f| f.is_none()).ok_or(Lost::Full)?;
+        *empty = Some(Free { window, retired });
+        Ok(())
     }
 
     /// How many free ranges there are.
@@ -500,10 +551,23 @@ mod tests {
         unsafe { Claims::new([(start, end)]) }.claim(0).unwrap()
     }
 
-    /// The next stack's range from `w` (from the untouched rest, or a free
-    /// range every CPU has flushed through; nothing is given back here).
+    /// Generation `n` (host tests: nothing is mapped, so no TLB holds any
+    /// page).
+    fn g(n: u64) -> Generation {
+        // SAFETY: as above.
+        unsafe { Generation::retired(n) }
+    }
+
+    /// Every CPU flushed through `n` (host tests: as for `g`).
+    fn flushed(n: u64) -> Flushed {
+        // SAFETY: as for `g`.
+        unsafe { Flushed::vouch(n) }
+    }
+
+    /// The next stack's range from `w` (from the untouched rest, or any free
+    /// range; nothing is given back here).
     fn take(w: &mut StackWindow, size: u64) -> Option<StackRange> {
-        w.take(size, u64::MAX).map(|slot| slot.range())
+        w.take(size, flushed(u64::MAX)).map(|slot| slot.range())
     }
 
     /// Register `range` (host tests: nothing is dereferenced).
@@ -515,8 +579,8 @@ mod tests {
     #[test]
     fn each_stack_gets_its_own_sub_window() {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
-        let a = w.take(64 * K, 0).unwrap();
-        let b = w.take(16 * K, 0).unwrap();
+        let a = w.take(64 * K, flushed(0)).unwrap();
+        let b = w.take(16 * K, flushed(0)).unwrap();
         // Each stack's window is the stack alone, not its guard page.
         assert_eq!(a.stack_window().range(), a.range().span());
         assert_eq!(b.stack_window().range(), b.range().span());
@@ -531,19 +595,19 @@ mod tests {
     #[test]
     fn a_freed_slot_is_reused_with_its_guard_page_once_flushed() {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
-        let a = w.take(64 * K, 0).unwrap();
-        let b = w.take(64 * K, 0).unwrap();
+        let a = w.take(64 * K, flushed(0)).unwrap();
+        let b = w.take(64 * K, flushed(0)).unwrap();
         let (ra, rb) = (a.range(), b.range());
-        assert_eq!(w.wait_for(64 * K, 0), None, "nothing to wait for: nothing is free");
-        assert!(w.give_back(a, 5));
+        assert_eq!(w.wait_for(64 * K, flushed(0)), None, "nothing to wait for: nothing is free");
+        assert_eq!(w.give_back(a, g(5)), Ok(()));
         assert_eq!(w.free_ranges(), 1);
         // Not yet flushed through generation 5: wait for it, or go on above.
-        assert_eq!(w.wait_for(64 * K, 4), Some(5));
-        assert_eq!(w.wait_for(64 * K, 5), None);
-        let c = w.take(64 * K, 4).unwrap();
+        assert_eq!(w.wait_for(64 * K, flushed(4)), Some(g(5)));
+        assert_eq!(w.wait_for(64 * K, flushed(5)), None);
+        let c = w.take(64 * K, flushed(4)).unwrap();
         assert_eq!(c.range().guard(), rb.top, "past the pending slot");
         // Flushed: the freed slot comes back whole.
-        let mut again = w.take(64 * K, 5).unwrap();
+        let mut again = w.take(64 * K, flushed(5)).unwrap();
         assert_eq!(again.range(), ra);
         assert_eq!(again.window().range(), ra.span());
         assert!(!again.stack_window().owns_page(ra.guard()), "the guard page stays unowned");
@@ -558,24 +622,24 @@ mod tests {
     #[test]
     fn free_neighbours_join_and_big_ranges_are_carved() {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
-        let slots: Vec<_> = (0..3).map(|_| w.take(16 * K, 0).unwrap()).collect();
+        let slots: Vec<_> = (0..3).map(|_| w.take(16 * K, flushed(0)).unwrap()).collect();
         let first = slots[0].range();
         let [a, b, c] = <[StackSlot; 3]>::try_from(slots).unwrap();
-        assert!(w.give_back(a, 1));
-        assert!(w.give_back(c, 3));
+        assert_eq!(w.give_back(a, g(1)), Ok(()));
+        assert_eq!(w.give_back(c, g(3)), Ok(()));
         assert_eq!(w.free_ranges(), 2);
-        assert!(w.give_back(b, 2), "joins both neighbours");
+        assert_eq!(w.give_back(b, g(2)), Ok(()), "joins both neighbours");
         assert_eq!(w.free_ranges(), 1);
         // Three 16 KiB slots and their guards: room for a 56 KiB stack.
-        assert_eq!(w.wait_for(56 * K, 2), Some(3), "the newest generation counts");
-        let big = w.take(56 * K, 3).unwrap();
+        assert_eq!(w.wait_for(56 * K, flushed(2)), Some(g(3)), "the newest generation counts");
+        let big = w.take(56 * K, flushed(3)).unwrap();
         assert_eq!(big.range().guard(), first.guard());
         assert_eq!(w.free_ranges(), 0);
-        assert!(w.give_back(big, 4));
-        let small = w.take(4 * K, 4).unwrap();
+        assert_eq!(w.give_back(big, g(4)), Ok(()));
+        let small = w.take(4 * K, flushed(4)).unwrap();
         assert_eq!(small.range(), StackRange { bottom: first.bottom, top: first.bottom + 4 * K });
         assert_eq!(w.free_ranges(), 1, "the rest of the range stays free");
-        let next = w.take(4 * K, 4).unwrap();
+        let next = w.take(4 * K, flushed(4)).unwrap();
         assert_eq!(next.range().guard(), small.range().top);
         drop((small, next));
     }
@@ -584,14 +648,14 @@ mod tests {
     #[test]
     fn free_ranges_past_the_limit_are_refused() {
         let mut w = StackWindow::new(window(BASE, BASE + 2 * (FREE_RANGES as u64 + 2) * 2 * FRAME_SIZE));
-        let slots: Vec<_> = (0..2 * (FREE_RANGES + 1)).map(|_| w.take(FRAME_SIZE, 0).unwrap()).collect();
+        let slots: Vec<_> = (0..2 * (FREE_RANGES + 1)).map(|_| w.take(FRAME_SIZE, flushed(0)).unwrap()).collect();
         // Every other one: no two free ranges meet.
         let mut kept = Vec::new();
         for (i, s) in slots.into_iter().enumerate() {
-            if i % 2 == 0 { kept.push(w.give_back(s, 1)) } else { drop(s) }
+            if i % 2 == 0 { kept.push(w.give_back(s, g(1))) } else { drop(s) }
         }
-        assert_eq!(kept.iter().filter(|&&k| k).count(), FREE_RANGES);
-        assert_eq!(kept.last(), Some(&false));
+        assert_eq!(kept.iter().filter(|k| k.is_ok()).count(), FREE_RANGES);
+        assert_eq!(kept.last(), Some(&Err(Lost::Full)));
     }
 
     /// A slot whose stack window was changed no longer meets its guard page:
@@ -599,9 +663,9 @@ mod tests {
     #[test]
     fn a_slot_whose_window_changed_is_given_up() {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
-        let mut slot = w.take(2 * FRAME_SIZE, 0).unwrap();
+        let mut slot = w.take(2 * FRAME_SIZE, flushed(0)).unwrap();
         let low = slot.window().split_off(FRAME_SIZE).unwrap();
-        assert!(!w.give_back(slot, 1));
+        assert_eq!(w.give_back(slot, g(1)), Err(Lost::Changed));
         assert_eq!(w.free_ranges(), 0);
         drop(low);
     }
@@ -648,7 +712,7 @@ mod tests {
         let (mut live, mut generation, mut seed) = (Vec::new(), 0u64, 0x2545_f491_4f6c_dd1du64);
         let mut tables_after_warmup = 0;
         for spawn in 0..4000 {
-            let slot = w.take(64 * K, generation).expect("the window has room");
+            let slot = w.take(64 * K, flushed(generation)).expect("the window has room");
             for page in slot.range().span().step_by(FRAME_SIZE as usize) {
                 paging::map(&mut mem, root, v(page), frame, PageSize::Size4K, Attrs::DATA).unwrap();
             }
@@ -663,7 +727,7 @@ mod tests {
                     paging::unmap(&mut mem, root, v(page)).unwrap();
                 }
                 generation += 1;
-                assert!(w.give_back(exiting, generation));
+                assert_eq!(w.give_back(exiting, g(generation)), Ok(()));
             }
             if spawn == 100 {
                 tables_after_warmup = mem.tables.len();
@@ -677,62 +741,110 @@ mod tests {
     }
 
     /// A randomized model: stacks of mixed sizes taken and given back, every
-    /// CPU flushing at random times. Live stacks never overlap each other or
-    /// each other's guard pages; the page above each live stack is in no
-    /// live stack; a free range is never handed out before every CPU has
-    /// flushed through its newest stack's generation; and the free ranges
-    /// stay at most one more than the slots taken.
+    /// CPU flushing at random times. A stack is retired (numbered) when it
+    /// is unmapped, but given back some steps later and out of order, as the
+    /// kernel's retire-then-lock allows. Live stacks never overlap each
+    /// other or each other's guard pages; the page above each live stack is
+    /// in no live stack; a page is never handed out before every CPU has
+    /// flushed through the generation it was retired at; and the free ranges
+    /// stay at most one more than the slots taken or retired.
     #[test]
     fn mixed_sizes_keep_guards_and_wait_for_flushes() {
         let mut w = StackWindow::new(window(BASE, BASE + (1 << 30)));
-        // Live slots, and every page's retirement generation once freed.
+        // Live slots; slots retired but not given back yet; every page's
+        // retirement generation once given back.
         let mut live: Vec<StackSlot> = Vec::new();
+        let mut retiring: Vec<(StackSlot, u64)> = Vec::new();
         let mut retired_at: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-        let (mut generation, mut flushed, mut seed) = (0u64, 0u64, 0x9e37_79b9_7f4a_7c15u64);
+        let (mut generation, mut flushed_at, mut seed) = (0u64, 0u64, 0x9e37_79b9_7f4a_7c15u64);
         let mut next = || {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
             seed
         };
-        let mut reused = 0;
-        for _ in 0..20_000 {
+        let (mut reused, mut out_of_order) = (0, 0);
+        for _ in 0..40_000 {
             let r = next();
             if r % 7 == 0 {
-                flushed = generation;
+                flushed_at = generation;
             }
-            if live.len() < 64 && (live.is_empty() || r % 3 != 0) {
+            let op = next() % 8;
+            if op < 4 && live.len() + retiring.len() < 64 {
                 let size = [1, 2, 4, 16, 17, 64][(next() % 6) as usize] * FRAME_SIZE;
-                let slot = w.take(size, flushed).expect("room");
+                let slot = w.take(size, flushed(flushed_at)).expect("room");
                 let range = slot.range();
                 assert_eq!(range.size(), size);
                 for page in (range.guard()..range.top).step_by(FRAME_SIZE as usize) {
                     if let Some(g) = retired_at.remove(&page) {
-                        assert!(g <= flushed, "page {page:#x} retired at {g}, handed out with {flushed} flushed");
+                        assert!(g <= flushed_at, "page {page:#x} retired at {g}, handed out with {flushed_at} flushed");
                         reused += 1;
                     }
                 }
-                for other in &live {
+                for other in live.iter().chain(retiring.iter().map(|(s, _)| s)) {
                     let o = other.range();
                     assert!(range.top <= o.guard() || o.top <= range.guard(), "{range:?} overlaps {o:?}");
                     assert!(!o.span().contains(&range.top), "the page above {range:?} is in {o:?}");
                     assert!(!range.span().contains(&o.top), "the page above {o:?} is in {range:?}");
                 }
                 live.push(slot);
-            } else {
+            } else if op < 6 && !live.is_empty() {
+                // Unmapped and retired; given back later.
                 let slot = live.swap_remove((next() as usize) % live.len());
                 generation += 1;
+                retiring.push((slot, generation));
+            } else if !retiring.is_empty() {
+                let (slot, at) = retiring.swap_remove((next() as usize) % retiring.len());
+                if at < generation {
+                    out_of_order += 1;
+                }
                 let range = slot.range();
                 for page in (range.guard()..range.top).step_by(FRAME_SIZE as usize) {
-                    retired_at.insert(page, generation);
+                    retired_at.insert(page, at);
                 }
-                assert!(w.give_back(slot, generation));
+                assert_eq!(w.give_back(slot, g(at)), Ok(()));
             }
-            assert!(w.free_ranges() <= live.len() + 1, "{} free ranges, {} live", w.free_ranges(), live.len());
+            let taken = live.len() + retiring.len();
+            assert!(w.free_ranges() <= taken + 1, "{} free ranges, {taken} taken", w.free_ranges());
         }
         assert!(reused > 10_000, "only {reused} pages reused");
+        assert!(out_of_order > 1_000, "only {out_of_order} given back out of order");
     }
 
+    /// A slot given back with an older generation than the free range below
+    /// it (retired first, given back second) joins it at the newer one.
+    #[test]
+    fn a_join_keeps_the_newest_generation_whichever_comes_back_first() {
+        let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
+        let slots: Vec<_> = (0..3).map(|_| w.take(16 * K, flushed(0)).unwrap()).collect();
+        let [a, b, c] = <[StackSlot; 3]>::try_from(slots).unwrap();
+        let rb = b.range();
+        // Below, newer: b at 3, then c (above it) at 2.
+        assert_eq!(w.give_back(b, g(3)), Ok(()));
+        assert_eq!(w.give_back(c, g(2)), Ok(()));
+        assert_eq!(w.free_ranges(), 1);
+        assert_eq!(w.wait_for(16 * K, flushed(2)), Some(g(3)));
+        assert_ne!(w.take(16 * K, flushed(2)).map(|s| s.range()), Some(rb), "handed out before 3");
+        assert_eq!(w.take(16 * K, flushed(3)).map(|s| s.range()), Some(rb));
+        drop(a);
+    }
+
+    /// `take` is first fit by address, whatever order the free ranges came
+    /// back in.
+    #[test]
+    fn the_lowest_fitting_range_is_taken() {
+        let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
+        let slots: Vec<_> = (0..4).map(|_| w.take(16 * K, flushed(0)).unwrap()).collect();
+        let [s0, s1, s2, s3] = <[StackSlot; 4]>::try_from(slots).unwrap();
+        let (r0, r2) = (s0.range(), s2.range());
+        // The higher one first: it goes first in the list too.
+        assert_eq!(w.give_back(s2, g(1)), Ok(()));
+        assert_eq!(w.give_back(s0, g(1)), Ok(()));
+        assert_eq!(w.take(16 * K, flushed(1)).map(|s| s.range()), Some(r0));
+        // A smaller stack: carved from the lower of the fitting ranges too.
+        assert_eq!(w.take(4 * K, flushed(1)).map(|s| s.range().guard()), Some(r2.guard()));
+        drop((s1, s3));
+    }
     #[test]
     fn window_puts_a_guard_page_below_each_stack() {
         let mut w = StackWindow::new(window(BASE, BASE + 1024 * K));
