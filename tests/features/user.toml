@@ -136,3 +136,15 @@ tests = [
     "cargo:lumen-vfs",
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_handlers_take_their_registers_in_order",
 ]
+
+[[feature]]
+name = "mkdir(at)/rmdir/unlink(at)/link(at)/symlink(at)/readlink(at)/rename/renameat/renameat2 on tmpfs and ext4 through dirfds and the cwd: the umask and dir_perm on mkdir, AT_REMOVEDIR, AT_SYMLINK_FOLLOW and AT_EMPTY_PATH on linkat, readlink cut to bufsiz with no NUL (/proc/self/exe, /proc/<pid>/fd/N, an O_PATH symlink fd), rename over an open file, RENAME_NOREPLACE/RENAME_EXCHANGE, flags checked before paths, and EEXIST/ENOENT/ENOTDIR/EISDIR/ENOTEMPTY/EXDEV/EINVAL/EBUSY/EPERM/EFAULT/EBADF/ELOOP (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::ns::ns_mkdir_rmdir_with_the_umask_dirfds_and_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_unlink_unlinkat_and_their_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_link_linkat_follow_empty_path_and_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_symlink_readlink_truncation_proc_links_and_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_rename_renameat2_over_open_files_exchange_and_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_handlers_take_their_registers_in_order",
+]
