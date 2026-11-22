@@ -267,7 +267,6 @@ impl Start {
     }
 
     /// `resolve_path` from this start (the `stat` family, `access`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `newfstatat`/`statx`/`faccessat2` call it
     pub(super) fn resolve(&self, path: &UserPath, flags: ResolveFlags) -> Result<ResolvedPath, u32> {
         resolve_path(tables(), self.dir(), path.as_bytes(), flags).map_err(VfsError::to_errno)
     }
@@ -414,7 +413,6 @@ pub(super) fn stat_from_metadata(m: &Metadata) -> general::stat {
     }
 }
 
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `statx` (wave 3) calls it; the ktests until then
 fn statx_time(t: Timespec) -> general::statx_timestamp {
     general::statx_timestamp { tv_sec: t.sec, tv_nsec: nsec(t), __reserved: 0 }
 }
@@ -422,7 +420,6 @@ fn statx_time(t: Timespec) -> general::statx_timestamp {
 /// The Linux `struct statx` for `m` (`statx`): the basic fields
 /// (`STATX_BASIC_STATS` in `stx_mask`, whatever was asked, as Linux may),
 /// no birth time, no mount id, no attributes.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `statx` (wave 3) calls it; the ktests until then
 pub(super) fn statx_from_metadata(m: &Metadata) -> general::statx {
     let zero_time = general::statx_timestamp { tv_sec: 0, tv_nsec: 0, __reserved: 0 };
     general::statx {
