@@ -358,10 +358,10 @@ crate::ktest!(
 crate::ktest!(
     fn dynamic_elf_layout_rejected() {
         use crate::mm::frame;
-        use crate::mm::user_vm::{LayoutClash, USER_STACK_BOTTOM};
+        use crate::mm::user_vm::LayoutClash;
         use crate::{kassert, kassert_eq};
         use lumen_elf::loader::{ET_DYN, ET_EXEC, PF_R, PT_INTERP};
-        use lumen_vm::{PAGE_SIZE, USER_MAX, USER_STACK_TOP};
+        use lumen_vm::{PAGE_SIZE, USER_MAX, USER_STACK_BOTTOM, USER_STACK_TOP};
 
         const LD: &[u8] = b"/lib/ld-musl-x86_64.so.1";
         let interp = || -> Result<Vec<u8>, VfsError> { Ok(test_interp(ET_DYN, 0, 0x1000, 0x100, &[])) };

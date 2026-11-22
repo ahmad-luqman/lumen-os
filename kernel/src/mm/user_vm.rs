@@ -13,9 +13,7 @@ use lumen_elf::loader::{ElfLoadError, LoadedElf, MappedRange, PageAction, Perm};
 use lumen_elf::stack::{AuxvInfo, InitialStack, StackBuildError, build_initial_stack};
 use lumen_mm::paging::{Attrs, MapError, WalkEnd};
 use lumen_mm::{FRAME_SIZE, PhysFrame, VirtAddr};
-use lumen_vm::{
-    Brk, MMAP_TOP, MapPlace, PAGE_SIZE, Prot, USER_MAX, USER_MIN, USER_STACK_TOP, VmError, VmaMap,
-};
+use lumen_vm::{Brk, MMAP_TOP, MapPlace, PAGE_SIZE, Prot, USER_MAX, USER_MIN, USER_STACK_TOP, VmError, VmaMap};
 
 use super::{frame, paging};
 use crate::arch;
