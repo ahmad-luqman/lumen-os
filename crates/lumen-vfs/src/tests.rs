@@ -849,7 +849,10 @@ fn path_empty_slashes_and_limits() {
     let empty_ok =
         resolve_path(&env, Some(&file), b"", ResolveFlags { empty_path: true, ..Default::default() }).unwrap();
     assert_eq!(empty_ok.inode.ino(), file.ino());
-    assert_eq!(readlink_at(&env, Some(&file), b"").unwrap_err(), VfsError::Inval);
+    // Not a symlink: ENOENT for an empty path (Linux's `do_readlinkat`),
+    // EINVAL for any other.
+    assert_eq!(readlink_at(&env, Some(&file), b"").unwrap_err(), VfsError::NoEnt);
+    assert_eq!(readlink_at(&env, None, b"/dir/file").unwrap_err(), VfsError::Inval);
 
     // 2. Slash collapsing
     let r1 = resolve_path(&env, None, b"///", ResolveFlags::default()).unwrap();
@@ -1069,6 +1072,11 @@ fn mount_table_dotdot_crossing_stacked_mounts_and_exdev() {
     open_inode(&env, None, b"/src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
     assert_eq!(rename_at2(&env, None, b"/src", None, b"/mnt/dst", RenameFlags(0)).unwrap_err(), VfsError::XDev);
     assert_eq!(link_at(&env, None, b"/src", None, b"/mnt/hl", true, false).unwrap_err(), VfsError::XDev);
+    // EXDEV comes first: before rename's EBUSY for `/` or `.`, and before
+    // link's EPERM for a directory (Linux's order).
+    assert_eq!(rename_at2(&env, None, b"/", None, b"/mnt/dst", RenameFlags(0)).unwrap_err(), VfsError::XDev);
+    assert_eq!(rename_at2(&env, None, b"/src", None, b"/mnt/.", RenameFlags(0)).unwrap_err(), VfsError::XDev);
+    assert_eq!(link_at(&env, None, b"/", None, b"/mnt/hl", true, false).unwrap_err(), VfsError::XDev);
 
     // Busy mountpoint cannot be rmdir'd or overwritten by rename
     assert_eq!(unlink_at(&env, None, b"/mnt", true).unwrap_err(), VfsError::Busy);
@@ -1121,8 +1129,24 @@ fn unlink_rmdir_and_renameat2_error_matrix() {
     assert_eq!(unlink_at(&env, None, b"/d", false).unwrap_err(), VfsError::IsDir);
     assert_eq!(unlink_at(&env, None, b"/d/", false).unwrap_err(), VfsError::IsDir);
     assert_eq!(unlink_at(&env, None, b"/f/", false).unwrap_err(), VfsError::NotDir);
-    assert_eq!(unlink_at(&env, None, b"/.", false).unwrap_err(), VfsError::Inval);
-    assert_eq!(unlink_at(&env, None, b"/..", false).unwrap_err(), VfsError::NotEmpty);
+    // A last component that isn't a name: EISDIR for unlink (Linux's
+    // `do_unlinkat`), told apart by rmdir.
+    for not_a_name in [&b"/"[..], b"/.", b"/..", b"/d/.", b"/d/.."] {
+        assert_eq!(unlink_at(&env, None, not_a_name, false).unwrap_err(), VfsError::IsDir);
+    }
+    assert_eq!(unlink_at(&env, None, b"/", true).unwrap_err(), VfsError::Busy);
+    assert_eq!(unlink_at(&env, None, b"/d/.", true).unwrap_err(), VfsError::Inval);
+    assert_eq!(unlink_at(&env, None, b"/d/..", true).unwrap_err(), VfsError::NotEmpty);
+    // A trailing slash on a symlink to a directory: ENOTDIR, the link not
+    // followed; on a missing name, ENOENT.
+    symlink_at(&env, b"/d", None, b"/to_d").unwrap();
+    assert_eq!(unlink_at(&env, None, b"/to_d/", false).unwrap_err(), VfsError::NotDir);
+    assert_eq!(unlink_at(&env, None, b"/missing/", false).unwrap_err(), VfsError::NoEnt);
+    unlink_at(&env, None, b"/to_d", false).unwrap();
+    assert!(resolve_path(&env, None, b"/d", ResolveFlags::default()).is_ok());
+    // A last name that isn't UTF-8 names nothing: ENOENT (until #268).
+    assert_eq!(unlink_at(&env, None, b"/\xff", false).unwrap_err(), VfsError::NoEnt);
+    assert_eq!(mkdir_at(&env, None, b"/d/\xff", 0o755, 0).unwrap_err(), VfsError::NoEnt);
 
     // 18. rmdir error matrix
     assert_eq!(unlink_at(&env, None, b"/f", true).unwrap_err(), VfsError::NotDir);
@@ -1161,9 +1185,21 @@ fn unlink_rmdir_and_renameat2_error_matrix() {
     // Swap back so `/f` is File and `/d` is Dir
     rename_at2(&env, None, b"/f", None, b"/d", RenameFlags(RenameFlags::EXCHANGE)).unwrap();
 
-    // Dir-over-file -> ENOTDIR; file-over-dir -> EISDIR
+    // Dir-over-file -> ENOTDIR; file-over-dir -> EISDIR, but ENOTDIR with a
+    // trailing slash on the new name (checked before the types).
     assert_eq!(rename_at2(&env, None, b"/d", None, b"/f", RenameFlags(0)).unwrap_err(), VfsError::NotDir);
+    assert_eq!(rename_at2(&env, None, b"/d", None, b"/f/", RenameFlags(0)).unwrap_err(), VfsError::NotDir);
     assert_eq!(rename_at2(&env, None, b"/f", None, b"/d", RenameFlags(0)).unwrap_err(), VfsError::IsDir);
+    assert_eq!(rename_at2(&env, None, b"/f", None, b"/d/", RenameFlags(0)).unwrap_err(), VfsError::NotDir);
+    assert_eq!(rename_at2(&env, None, b"/f", None, b"/none/", RenameFlags(0)).unwrap_err(), VfsError::NotDir);
+    // Not a name: EBUSY on the old side; on the new side EBUSY, or EEXIST
+    // with NOREPLACE.
+    for not_a_name in [&b"/"[..], b"/d/.", b"/d/.."] {
+        assert_eq!(rename_at2(&env, None, not_a_name, None, b"/x", RenameFlags(0)).unwrap_err(), VfsError::Busy);
+        assert_eq!(rename_at2(&env, None, b"/f", None, not_a_name, RenameFlags(0)).unwrap_err(), VfsError::Busy);
+        let noreplace = RenameFlags(RenameFlags::NOREPLACE);
+        assert_eq!(rename_at2(&env, None, b"/f", None, not_a_name, noreplace).unwrap_err(), VfsError::Exist);
+    }
 
     // Non-empty dir overwrite -> ENOTEMPTY
     mkdir_at(&env, None, b"/d/child", 0o755, 0).unwrap();
@@ -1521,8 +1557,14 @@ fn hard_links_access_checks_and_symlink_creation_edges() {
     let via_alias = resolve_path(&env, None, b"/sub/alias", ResolveFlags::default()).unwrap().inode;
     assert_eq!(via_alias.ino(), orig.ino());
 
-    // Directory hard link rejected with EPERM.
+    // Directory hard link rejected with EPERM, but only after the new name's
+    // EEXIST and ENOENT (Linux's order).
     assert_eq!(link_at(&env, None, b"/sub", None, b"/sub_link", false, false).unwrap_err(), VfsError::Perm);
+    assert_eq!(link_at(&env, None, b"/sub", None, b"/sub/alias", false, false).unwrap_err(), VfsError::Exist);
+    assert_eq!(link_at(&env, None, b"/sub", None, b"/none/x", false, false).unwrap_err(), VfsError::NoEnt);
+    // A trailing slash: EEXIST on a name in use, ENOENT on a free one.
+    assert_eq!(link_at(&env, None, b"/sub/alias", None, b"/sub/", false, false).unwrap_err(), VfsError::Exist);
+    assert_eq!(link_at(&env, None, b"/sub/alias", None, b"/free/", false, false).unwrap_err(), VfsError::NoEnt);
 
     // symlinkat empty target -> ENOENT; trailing slash on missing/existing -> ENOENT/EEXIST
     assert_eq!(symlink_at(&env, b"", None, b"/empty_sym").unwrap_err(), VfsError::NoEnt);

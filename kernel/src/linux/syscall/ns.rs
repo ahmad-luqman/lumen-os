@@ -7,18 +7,26 @@
 //! a flags argument (and `readlinkat`'s `bufsiz`) is checked before any path
 //! is copied in, so a bad flag is `-EINVAL` even with a bad pointer.
 //!
-//! The errnos lumen-vfs gives where Linux's differ or vary (ARCHITECTURE
-//! section 8's table):
-//! - `/` as the name to remove or rename is `-EBUSY` for `rmdir`, `rename`
-//!   and `unlink` alike (Linux's `unlink("/")` is `-EISDIR`); `mkdir("/")`
-//!   and `link(_, "/")` are `-EEXIST`.
+//! Where Lumen differs from Linux:
+//! - `RENAME_WHITEOUT` is `-EINVAL` (Linux allows it for root on tmpfs and
+//!   ext4; there are no whiteouts here).
+//! - A name that isn't UTF-8 is `-ENOENT`, as a path component anywhere
+//!   (#268 makes names byte strings), and a symlink target that isn't
+//!   UTF-8 is `-EINVAL`: a target is stored, not looked up, and lumen-vfs
+//!   stores text.
+//!
+//! Matching Linux, and worth knowing:
+//! - A last component that isn't a name (`/`, `.`, `..`): `unlink` says
+//!   `-EISDIR` for all three, `rmdir` `-EBUSY`, `-EINVAL` and `-ENOTEMPTY`,
+//!   `rename` `-EBUSY` (`-EEXIST` on the new side with
+//!   `RENAME_NOREPLACE`), after `-EXDEV`; `mkdir` and `link` onto one say
+//!   `-EEXIST`.
 //! - `linkat`'s `AT_EMPTY_PATH` links the descriptor's own file, as Linux
 //!   does for a caller with `CAP_DAC_READ_SEARCH` (every process here runs
 //!   as root); a file with no links left is `-ENOENT`.
-//! - `readlinkat` of an empty path names the descriptor's file (or the
-//!   cwd): one that isn't a symlink is `-ENOENT`, as Linux's
-//!   `do_readlinkat` says for an empty name (`-EINVAL` for any other).
-//! - A symlink target that isn't UTF-8 is `-EINVAL` (#268).
+//! - `readlinkat` takes an empty path without `AT_EMPTY_PATH`, naming the
+//!   descriptor's file (or the cwd): one that isn't a symlink is `-ENOENT`
+//!   (`-EINVAL` for any other path), decided in lumen-vfs's `readlink_at`.
 
 use super::at::{self, Dirfd, Mode, Start, UserPath, UserPtr};
 use super::finish;
@@ -126,18 +134,15 @@ pub(super) fn sys_readlinkat(dirfd: Dirfd, path: UserPtr, buf: UserPtr, bufsiz: 
 /// no NUL added; returns how many were copied. `bufsiz <= 0` is `-EINVAL`
 /// before the path is looked at. An empty path names `dirfd`'s file (an
 /// `O_PATH | O_NOFOLLOW` symlink), as Linux always allows here; not a
-/// symlink is then `-ENOENT`, not `-EINVAL`. The target is a copy, so no
-/// VFS lock is held across the copy out.
+/// symlink is then `-ENOENT` (lumen-vfs's `readlink_at`). The target is a
+/// copy, so no VFS lock is held across the copy out.
 fn readlinkat(dirfd: Dirfd, path: UserPtr, buf: UserPtr, bufsiz: i32) -> Result<u64, u32> {
     if bufsiz <= 0 {
         return Err(errno::EINVAL);
     }
     let path = UserPath::copy_in(path, true)?;
     let start = at::start_dir(dirfd, &path)?;
-    let target = start.readlink(&path).map_err(|e| match e {
-        errno::EINVAL if path.is_empty() => errno::ENOENT,
-        e => e,
-    })?;
+    let target = start.readlink(&path)?;
     let n = target.len().min(bufsiz as usize);
     copy_to_user(buf.addr(), &target[..n]).map_err(CopyError::to_errno)?;
     Ok(n as u64)
@@ -179,6 +184,7 @@ mod kt {
     use alloc::format;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use core::fmt::Debug;
 
     use lumen_vfs::{FileSystem, InodeType, OpenFlags, OpenGuard, ResolveFlags, VfsError};
 
@@ -190,15 +196,26 @@ mod kt {
 
     pub(super) type R = crate::ktest::TestResult;
 
-    /// A user buffer clear of `fd::ktest_user_path`'s path slots (16 of 256
-    /// bytes in the first page).
+    /// A user buffer clear of `fd::ktest_user_path`'s path slots (16 slots
+    /// of 256 bytes, the first page).
     pub(super) const BUF: u64 = process::KTEST_USER_VA + 8192;
     /// An address no user copy may touch: `-EFAULT`.
     pub(super) const BAD: u64 = 0xffff_8000_0000_0000;
 
+    /// `what` failed with `err`: say so in the TAP output, and fail with it.
+    pub(super) fn failed(what: &'static str, err: impl Debug) -> &'static str {
+        crate::ktest::diag(format_args!("{what}: {err:?}"));
+        what
+    }
+
     /// `path` and a NUL in user memory, in path slot `slot`.
     pub(super) fn up(slot: u64, path: &str) -> Result<UserPtr, &'static str> {
         fd::ktest_user_path(slot, path.as_bytes())
+    }
+
+    /// `up` for a path that isn't UTF-8.
+    pub(super) fn up_bytes(slot: u64, path: &[u8]) -> Result<UserPtr, &'static str> {
+        fd::ktest_user_path(slot, path)
     }
 
     pub(super) fn ptr(addr: u64) -> UserPtr {
@@ -216,18 +233,20 @@ mod kt {
     /// Create (or truncate) the file at `path` holding `data`.
     pub(super) fn file(path: &str, data: &[u8]) -> R {
         let flags = OpenFlags::from_bits(OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-        let (inode, _) =
-            lumen_vfs::open_inode(tables(), None, path.as_bytes(), flags, 0o644, 0).map_err(|_| "create a file")?;
+        let (inode, _) = lumen_vfs::open_inode(tables(), None, path.as_bytes(), flags, 0o644, 0)
+            .map_err(|e| failed("create a file", e))?;
         crate::kassert_eq!(inode.write_at(0, data), Ok(data.len()));
         Ok(())
     }
 
     pub(super) fn mkdir(path: &str) -> R {
-        lumen_vfs::mkdir_at(tables(), None, path.as_bytes(), 0o755, 0).map(drop).map_err(|_| "mkdir")
+        lumen_vfs::mkdir_at(tables(), None, path.as_bytes(), 0o755, 0).map(drop).map_err(|e| failed("mkdir", e))
     }
 
     pub(super) fn symlink(target: &str, path: &str) -> R {
-        lumen_vfs::symlink_at(tables(), target.as_bytes(), None, path.as_bytes()).map(drop).map_err(|_| "symlink")
+        lumen_vfs::symlink_at(tables(), target.as_bytes(), None, path.as_bytes())
+            .map(drop)
+            .map_err(|e| failed("symlink", e))
     }
 
     /// The first 64 bytes of the file at `path`, symlinks followed.
@@ -245,10 +264,15 @@ mod kt {
         Ok((m.inode_type, m.mode, m.nlink, m.ino))
     }
 
+    /// Nothing is at `path` (`ENOENT`, not some other failure).
+    pub(super) fn gone(path: &str) -> bool {
+        lstat(path).map(drop) == Err(VfsError::NoEnt)
+    }
+
     /// `open(path, flags)` through the syscall, in path slot `slot`.
     pub(super) fn open(slot: u64, path: &str, flags: u32) -> Result<Fd, &'static str> {
         let ret = fd::sys_open(up(slot, path)?, OpenFlags::from_bits(flags), mode(0));
-        if ret < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(ret)) } else { Err("an open failed") }
+        if ret < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(ret)) } else { Err(failed("an open", ret as i64)) }
     }
 
     /// What `read(fd)` gives, at most 64 bytes.
@@ -256,7 +280,7 @@ mod kt {
         let at = BUF + 1024;
         let n = fd::sys_read(fd, ptr(at), 64);
         if n > 64 {
-            return Err("a read failed");
+            return Err(failed("a read", n as i64));
         }
         user(at, n as usize)
     }
@@ -264,74 +288,88 @@ mod kt {
     /// `n` bytes of user memory at `at`.
     pub(super) fn user(at: u64, n: usize) -> Result<Vec<u8>, &'static str> {
         let mut out = alloc::vec![0u8; n];
-        copy_from_user(&mut out, at).map_err(|_| "copy from user memory")?;
+        copy_from_user(&mut out, at).map_err(|e| failed("copy from user memory", e))?;
         Ok(out)
     }
 
-    /// Fill the first 64 bytes of `BUF` with `0xaa`, to see what a copy out
-    /// left alone.
+    /// Fill the first 128 bytes of `BUF` with `0xaa`, to see what a copy
+    /// out left alone.
     pub(super) fn smudge() -> R {
-        copy_to_user(BUF, &[0xaa; 64]).map_err(|_| "fill the buffer")
+        copy_to_user(BUF, &[0xaa; 128]).map_err(|e| failed("fill the buffer", e))
     }
 
     /// Move the test process's working directory to `path`.
     pub(super) fn set_cwd(path: &str) -> R {
-        let dir = crate::vfs::resolve_path_from_root(path).map_err(|_| "resolve the new cwd")?;
-        let guard = OpenGuard::try_new(dir).map_err(|_| "guard the new cwd")?;
-        process::set_current_cwd(process::Cwd::new(guard, path).map_err(|_| "the cwd")?);
+        let dir = crate::vfs::resolve_path_from_root(path).map_err(|e| failed("resolve the new cwd", e))?;
+        let guard = OpenGuard::try_new(dir).map_err(|e| failed("guard the new cwd", e))?;
+        process::set_current_cwd(process::Cwd::new(guard, path).map_err(|e| failed("the cwd", e))?);
         Ok(())
+    }
+
+    /// `f` run with the working directory at `dir`, then back at `/`
+    /// whatever `f` gave.
+    pub(super) fn in_cwd<T>(dir: &str, f: impl FnOnce() -> T) -> Result<T, &'static str> {
+        set_cwd(dir)?;
+        let out = f();
+        set_cwd("/")?;
+        Ok(out)
     }
 
     /// Remove each path in turn (directories empty by then).
     pub(super) fn remove(paths: &[&str]) -> R {
         for path in paths {
             let dir = matches!(lstat(path), Ok((InodeType::Dir, ..)));
-            if lumen_vfs::unlink_at(tables(), None, path.as_bytes(), dir).is_err() {
-                crate::ktest::diag(format_args!("removing {path}"));
+            if let Err(err) = lumen_vfs::unlink_at(tables(), None, path.as_bytes(), dir) {
+                crate::ktest::diag(format_args!("removing {path}: {err:?}"));
                 return Err("clean up");
             }
         }
         Ok(())
     }
 
-    fn close_all_but_stdio() {
+    /// Close fds 3 to 63, all a suite opens (anything past 63 stays open).
+    fn close_fds_3_to_63() {
         for fd in 3..64u64 {
             let _ = fd::sys_close(at::reg(fd));
         }
     }
 
+    /// `body` on `base`, then fds 3 to 63 closed; a failure says where.
+    fn run_on(fs: &str, base: &str, body: fn(&str) -> R) -> R {
+        let ran = body(base);
+        close_fds_3_to_63();
+        if ran.is_err() {
+            crate::ktest::diag(format_args!("on {fs}, in {base}"));
+        }
+        ran
+    }
+
     /// Run `body` on a fresh directory in `/tmp` (tmpfs), which it must
     /// leave empty, then on the root of a fresh ext4 volume mounted at
     /// `/tmp/ns-ktest-ext4-<name>` (block device minor `minor`), which
-    /// `rmdir` can't remove while mounted (`-EBUSY`). Every fd it left open
-    /// is closed after each.
+    /// `rmdir` can't remove while mounted (`-EBUSY`: the one handler called
+    /// here). The mountpoint is unmounted and removed whatever `body` gave.
     pub(super) fn on_tmpfs_and_ext4(name: &str, minor: u32, body: fn(&str) -> R) -> R {
         let tmp = format!("/tmp/ns-ktest-{name}");
         mkdir(&tmp)?;
-        let ran = body(&tmp);
-        close_all_but_stdio();
-        if ran.is_err() {
-            crate::ktest::diag(format_args!("on tmpfs, in {tmp}"));
-        }
-        ran?;
-        lumen_vfs::unlink_at(tables(), None, tmp.as_bytes(), true).map_err(|_| "the tmpfs run left files behind")?;
+        run_on("tmpfs", &tmp, body)?;
+        lumen_vfs::unlink_at(tables(), None, tmp.as_bytes(), true)
+            .map_err(|e| failed("the tmpfs run left files behind", e))?;
 
         let fs = crate::vfs::ktest_ext4(minor)?;
         let mnt = format!("/tmp/ns-ktest-ext4-{name}");
-        let mp = lumen_vfs::mkdir_at(tables(), None, mnt.as_bytes(), 0o755, 0).map_err(|_| "mkdir the mountpoint")?;
+        let mp = lumen_vfs::mkdir_at(tables(), None, mnt.as_bytes(), 0o755, 0)
+            .map_err(|e| failed("mkdir the mountpoint", e))?;
         let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
-        if tables().mount(mp, &mnt, fs as Arc<dyn FileSystem>).is_err() {
+        if let Err(err) = tables().mount(mp, &mnt, fs as Arc<dyn FileSystem>) {
             let _ = lumen_vfs::unlink_at(tables(), None, mnt.as_bytes(), true);
-            return Err("mount the ext4 volume");
+            return Err(failed("mount the ext4 volume", err));
         }
-        let ran = body(&mnt);
-        close_all_but_stdio();
-        if ran.is_err() {
-            crate::ktest::diag(format_args!("on ext4, in {mnt}"));
-        }
+        let ran = run_on("ext4", &mnt, body);
         let busy = up(15, &mnt).map(super::sys_rmdir);
-        let umounted = tables().umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
-        let removed = lumen_vfs::unlink_at(tables(), None, mnt.as_bytes(), true).map_err(|_| "rmdir the mountpoint");
+        let umounted = tables().umount(mp_dev, mp_ino).map(drop).map_err(|e| failed("umount", e));
+        let removed =
+            lumen_vfs::unlink_at(tables(), None, mnt.as_bytes(), true).map_err(|e| failed("rmdir the mountpoint", e));
         ran?;
         crate::kassert_eq!(busy, Ok(e(crate::linux::errno::EBUSY)));
         umounted?;
@@ -389,6 +427,8 @@ fn ktest_mkdir_and_rmdir(base: &str) -> kt::R {
     // ELOOP: through a symlink to itself.
     kt::symlink("loop", &p("loop"))?;
     kassert_eq!(sys_mkdir(up(0, &p("loop/x"))?, mode(0o755)), e(errno::ELOOP));
+    // A name that isn't UTF-8: ENOENT (until #268), nothing made.
+    kassert_eq!(sys_mkdir(kt::up_bytes(0, &[base.as_bytes(), b"/\xff"].concat())?, mode(0o755)), e(errno::ENOENT));
 
     // `rmdir`: ENOTEMPTY (and for `..`), ENOTDIR on a file, EINVAL for `.`,
     // EBUSY for `/`, ENOENT, EFAULT, ELOOP.
@@ -436,7 +476,7 @@ fn ktest_unlink(base: &str) -> kt::R {
     kt::file(&p("f"), b"data")?;
     let fd = open(0, &p("f"), O::O_RDONLY)?;
     kassert_eq!(sys_unlink(up(1, &p("f"))?), 0);
-    kassert_eq!(lstat(&p("f")).map(drop), Err(VfsError::NoEnt));
+    kassert!(kt::gone(&p("f")));
     kassert_eq!(kt::fd_read(fd)?, b"data".to_vec());
     kassert_eq!(sys_unlink(up(1, &p("f"))?), e(errno::ENOENT));
     // From a dirfd.
@@ -458,15 +498,27 @@ fn ktest_unlink(base: &str) -> kt::R {
     kassert_eq!(sys_unlinkat(Dirfd::Cwd, up(1, &p("t"))?, AtFlags(AtFlags::AT_REMOVEDIR)), e(errno::ENOTDIR));
     kassert_eq!(sys_unlink(up(1, &p("t/"))?), e(errno::ENOTDIR));
     kassert_eq!(sys_unlink(up(1, &p("t/x"))?), e(errno::ENOTDIR));
+    // A trailing slash on a symlink to a directory: ENOTDIR, the link looked
+    // at, not followed; the link and the directory both stay.
+    kt::symlink("d", &p("to-d"))?;
+    kassert_eq!(sys_unlink(up(1, &p("to-d/"))?), e(errno::ENOTDIR));
+    kassert!(lstat(&p("to-d")).is_ok() && lstat(&p("d")).is_ok());
+    kassert_eq!(sys_unlink(up(1, &p("to-d"))?), 0);
+    // A name that isn't UTF-8 names nothing: ENOENT (until #268).
+    kassert_eq!(sys_unlink(kt::up_bytes(1, &[base.as_bytes(), b"/\xff"].concat())?), e(errno::ENOENT));
     // EINVAL: any flag but AT_REMOVEDIR, before the path is read.
     for bad in [AtFlags::AT_SYMLINK_NOFOLLOW, AtFlags::AT_EMPTY_PATH, AtFlags::AT_REMOVEDIR | 1, 0x8000_0000] {
         kassert_eq!(sys_unlinkat(Dirfd::Cwd, up(1, &p("t"))?, AtFlags(bad)), e(errno::EINVAL));
         kassert_eq!(sys_unlinkat(Dirfd::Cwd, ptr(0), AtFlags(bad)), e(errno::EINVAL));
     }
     kassert!(lstat(&p("t")).is_ok());
-    // `/` is EBUSY (Linux says EISDIR); EBADF, EFAULT, ENOENT for an empty
-    // path, ELOOP through a looping symlink (which itself goes).
-    kassert_eq!(sys_unlink(up(1, "/")?), e(errno::EBUSY));
+    // A last component that isn't a name (`/`, `.`, `..`): EISDIR, as Linux's
+    // `do_unlinkat`. EBADF, EFAULT, ENOENT for an empty path, ELOOP through a
+    // looping symlink (which itself goes).
+    for not_a_name in ["/".into(), p("d/."), p("d/..")] {
+        kassert_eq!(sys_unlink(up(1, &not_a_name)?), e(errno::EISDIR));
+    }
+    kassert!(lstat(&p("d")).is_ok());
     kassert_eq!(sys_unlinkat(Dirfd::Fd(reg(99)), up(1, "t")?, AtFlags(0)), e(errno::EBADF));
     kassert_eq!(sys_unlink(ptr(BAD)), e(errno::EFAULT));
     kassert_eq!(sys_unlink(up(1, "")?), e(errno::ENOENT));
@@ -506,10 +558,18 @@ fn ktest_link(base: &str) -> kt::R {
     let dfd = open(2, base, O::O_PATH | O::O_DIRECTORY)?;
     kassert_eq!(sys_linkat(Dirfd::Fd(dfd), up(3, "f")?, Dirfd::Fd(dfd), up(4, "i")?, AtFlags(0)), 0);
     kassert_eq!(lstat(&p("f")).map(|s| s.2), Ok(3));
+    // Relative paths from the cwd.
+    let (rel_f, rel_c) = (up(0, "f")?, up(1, "c-link")?);
+    let linked = kt::in_cwd(base, || sys_link(rel_f, rel_c))?;
+    kassert_eq!(linked, 0);
+    kassert_eq!(lstat(&p("c-link")).map(|s| s.3), Ok(ino));
     // A final symlink: linked itself, or with AT_SYMLINK_FOLLOW what it names.
     kt::symlink("f", &p("s"))?;
     kassert_eq!(sys_linkat(cwd, up(0, &p("s"))?, cwd, up(1, &p("s-link"))?, AtFlags(0)), 0);
     kassert_eq!(lstat(&p("s-link")).map(|s| s.0), Ok(InodeType::Symlink));
+    // `link` never follows the final symlink either.
+    kassert_eq!(sys_link(up(0, &p("s"))?, up(1, &p("s-l2"))?), 0);
+    kassert_eq!(lstat(&p("s-l2")).map(|s| s.0), Ok(InodeType::Symlink));
     let follow = AtFlags(AtFlags::AT_SYMLINK_FOLLOW);
     kassert_eq!(sys_linkat(cwd, up(0, &p("s"))?, cwd, up(1, &p("s-follow"))?, follow), 0);
     kassert_eq!(lstat(&p("s-follow")).map(|s| (s.0, s.3)), Ok((InodeType::File, ino)));
@@ -527,19 +587,26 @@ fn ktest_link(base: &str) -> kt::R {
     let gfd = open(6, &p("gone"), O::O_RDONLY)?;
     kt::remove(&[&p("gone")])?;
     kassert_eq!(sys_linkat(Dirfd::Fd(gfd), up(0, "")?, cwd, up(1, &p("back"))?, empty), e(errno::ENOENT));
-    // EPERM: a directory, by path or as the dirfd's file.
+    // EPERM: a directory, by path or as the dirfd's file; but only after
+    // the new name's EEXIST and ENOENT and EXDEV (Linux's order).
     kt::mkdir(&p("d"))?;
     kassert_eq!(sys_link(up(0, &p("d"))?, up(1, &p("dl"))?), e(errno::EPERM));
     kassert_eq!(sys_linkat(Dirfd::Fd(dfd), up(0, "")?, cwd, up(1, &p("dl"))?, empty), e(errno::EPERM));
-    // EEXIST: a file, a directory, `/`.
+    kassert_eq!(sys_link(up(0, &p("d"))?, up(1, &p("h"))?), e(errno::EEXIST));
+    kassert_eq!(sys_link(up(0, &p("d"))?, up(1, &p("none/x"))?), e(errno::ENOENT));
+    kassert_eq!(sys_link(up(0, &p("d"))?, up(1, "/ns-ktest-xdev")?), e(errno::EXDEV));
+    // EEXIST: a file, a directory (with a trailing slash too), `/`.
     kassert_eq!(sys_link(up(0, &p("f"))?, up(1, &p("h"))?), e(errno::EEXIST));
     kassert_eq!(sys_link(up(0, &p("f"))?, up(1, &p("d"))?), e(errno::EEXIST));
+    kassert_eq!(sys_link(up(0, &p("f"))?, up(1, &p("d/"))?), e(errno::EEXIST));
     kassert_eq!(sys_link(up(0, &p("f"))?, up(1, "/")?), e(errno::EEXIST));
-    // EXDEV: onto the root filesystem.
+    // EXDEV: onto the root filesystem, which gets nothing.
     kassert_eq!(sys_link(up(0, &p("f"))?, up(1, "/ns-ktest-xdev")?), e(errno::EXDEV));
-    // ENOENT, ENOTDIR.
+    kassert!(kt::gone("/ns-ktest-xdev"));
+    // ENOENT (a trailing slash on a free name too), ENOTDIR.
     kassert_eq!(sys_link(up(0, &p("none"))?, up(1, &p("x"))?), e(errno::ENOENT));
     kassert_eq!(sys_link(up(0, &p("f"))?, up(1, &p("none/x"))?), e(errno::ENOENT));
+    kassert_eq!(sys_link(up(0, &p("f"))?, up(1, &p("free/"))?), e(errno::ENOENT));
     kassert_eq!(sys_link(up(0, &p("f/x"))?, up(1, &p("x"))?), e(errno::ENOTDIR));
     // EINVAL: a flag linkat doesn't take, before the paths are read.
     for bad in [AtFlags::AT_SYMLINK_NOFOLLOW, AtFlags::AT_REMOVEDIR, 0x8000_0000] {
@@ -554,13 +621,13 @@ fn ktest_link(base: &str) -> kt::R {
     kt::symlink("loop", &p("loop"))?;
     kassert_eq!(sys_linkat(cwd, up(0, &p("loop"))?, cwd, up(1, &p("x"))?, follow), e(errno::ELOOP));
     kassert_eq!(sys_link(up(0, &p("loop/x"))?, up(1, &p("x"))?), e(errno::ELOOP));
-    kassert!(lstat(&p("x")).is_err() && lstat(&p("dl")).is_err() && lstat(&p("e2")).is_err());
+    kassert!(["x", "dl", "e2", "back", "free"].iter().all(|n| kt::gone(&p(n))));
     // Each name removed takes one off the count.
-    kassert_eq!(lstat(&p("f")).map(|s| s.2), Ok(5));
-    kt::remove(&[&p("f"), &p("h"), &p("i"), &p("s-follow")])?;
+    kassert_eq!(lstat(&p("f")).map(|s| s.2), Ok(6));
+    kt::remove(&[&p("f"), &p("h"), &p("i"), &p("s-follow"), &p("c-link")])?;
     kassert_eq!(lstat(&p("e")).map(|s| (s.3, s.2)), Ok((ino, 1)));
     kassert_eq!(read(&p("e")), Ok(b"data".to_vec()));
-    kt::remove(&[&p("e"), &p("s"), &p("s-link"), &p("d"), &p("loop")])
+    kt::remove(&[&p("e"), &p("s"), &p("s-link"), &p("s-l2"), &p("d"), &p("loop")])
 }
 
 crate::ktest!(
@@ -602,6 +669,29 @@ fn ktest_symlink_and_readlink(base: &str) -> kt::R {
     kassert_eq!(lstat(&p("d/rel")).map(|s| s.0), Ok(InodeType::Symlink));
     kassert_eq!(sys_readlinkat(Dirfd::Fd(dfd), up(4, "rel")?, ptr(BUF), 64), 4);
     kassert_eq!(user(BUF, 4)?, b"../t".to_vec());
+    // The dirfd places the link, never the target: an absolute target is
+    // stored as given; an absolute link path ignores even a bad dirfd.
+    kassert_eq!(sys_symlinkat(up(3, "/abs/t")?, Dirfd::Fd(dfd), up(4, "abs")?), 0);
+    kassert_eq!(lstat(&p("d/abs")).map(|s| s.0), Ok(InodeType::Symlink));
+    kassert_eq!(sys_readlinkat(Dirfd::Fd(dfd), up(4, "abs")?, ptr(BUF), 64), 6);
+    kassert_eq!(user(BUF, 6)?, b"/abs/t".to_vec());
+    kassert!(kt::gone("/abs"));
+    kassert_eq!(sys_symlinkat(up(3, "t")?, Dirfd::Fd(reg(99)), up(4, &p("d/abs2"))?), 0);
+    kassert_eq!(lstat(&p("d/abs2")).map(|s| s.0), Ok(InodeType::Symlink));
+    // Relative paths from the cwd, both ways.
+    let (target, rel) = (up(3, "tt")?, up(4, "c-sym")?);
+    let from_cwd = kt::in_cwd(base, || (sys_symlink(target, rel), sys_readlink(rel, ptr(BUF), 64)))?;
+    kassert_eq!(from_cwd, (0, 2));
+    kassert_eq!(user(BUF, 2)?, b"tt".to_vec());
+    // A target longer than ext4 keeps in the inode (60 bytes), cut too.
+    let long: alloc::string::String = (0..100).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+    kassert_eq!(sys_symlink(up(3, &long)?, up(4, &p("long"))?), 0);
+    smudge()?;
+    kassert_eq!(sys_readlink(up(4, &p("long"))?, ptr(BUF), 128), 100);
+    kassert_eq!(user(BUF, 101)?, [long.as_bytes(), b"\xaa"].concat());
+    smudge()?;
+    kassert_eq!(sys_readlink(up(4, &p("long"))?, ptr(BUF), 70), 70);
+    kassert_eq!(user(BUF, 71)?, [&long.as_bytes()[..70], b"\xaa"].concat());
     // An empty path names the dirfd's own file: an `O_PATH | O_NOFOLLOW`
     // symlink reads; anything else (a directory dirfd, a file's, the cwd)
     // is ENOENT, as on Linux.
@@ -611,10 +701,11 @@ fn ktest_symlink_and_readlink(base: &str) -> kt::R {
     kassert_eq!(user(BUF, 6)?, b"abcdef".to_vec());
     kassert_eq!(sys_readlinkat(Dirfd::Fd(dfd), up(0, "")?, ptr(BUF), 64), e(errno::ENOENT));
     kassert_eq!(sys_readlink(up(0, "")?, ptr(BUF), 64), e(errno::ENOENT));
-    // Not a symlink: EINVAL. A symlink to a symlink: the final one is read.
     kt::file(&p("f"), b"x")?;
     let ffd = open(6, &p("f"), O::O_RDONLY)?;
     kassert_eq!(sys_readlinkat(Dirfd::Fd(ffd), up(0, "")?, ptr(BUF), 64), e(errno::ENOENT));
+    // Not a symlink by a path: EINVAL. A symlink to a symlink: the final one
+    // is read.
     kassert_eq!(sys_readlink(up(0, &p("f"))?, ptr(BUF), 64), e(errno::EINVAL));
     kassert_eq!(sys_readlink(up(0, &p("d"))?, ptr(BUF), 64), e(errno::EINVAL));
     kt::symlink("s", &p("s2"))?;
@@ -634,16 +725,23 @@ fn ktest_symlink_and_readlink(base: &str) -> kt::R {
     kassert_eq!(sys_symlink(ptr(BAD), up(1, &p("x"))?), e(errno::EFAULT));
     kassert_eq!(sys_symlink(up(0, "t")?, ptr(BAD)), e(errno::EFAULT));
     kassert_eq!(sys_symlinkat(up(0, "t")?, Dirfd::Fd(reg(99)), up(1, "x")?), e(errno::EBADF));
+    // Not UTF-8: a name names nothing (ENOENT, until #268); a target can't
+    // be stored (EINVAL).
+    let bad_name = [base.as_bytes(), b"/\xff"].concat();
+    kassert_eq!(sys_readlink(kt::up_bytes(0, &bad_name)?, ptr(BUF), 64), e(errno::ENOENT));
+    kassert_eq!(sys_symlink(up(0, "t")?, kt::up_bytes(1, &bad_name)?), e(errno::ENOENT));
+    kassert_eq!(sys_symlink(kt::up_bytes(0, b"t\xff")?, up(1, &p("x"))?), e(errno::EINVAL));
     // ELOOP: a looping symlink reads as itself, but nothing resolves through it.
     kt::symlink("loop", &p("loop"))?;
     kassert_eq!(sys_readlink(up(0, &p("loop"))?, ptr(BUF), 64), 4);
     kassert_eq!(sys_readlink(up(0, &p("loop/x"))?, ptr(BUF), 64), e(errno::ELOOP));
     kassert_eq!(sys_symlink(up(0, "t")?, up(1, &p("loop/x"))?), e(errno::ELOOP));
-    kassert!(lstat(&p("x")).is_err());
+    kassert!(kt::gone(&p("x")));
     kassert_eq!(super::fd::sys_close(dfd), 0);
     kassert_eq!(super::fd::sys_close(sfd), 0);
     kassert_eq!(super::fd::sys_close(ffd), 0);
-    kt::remove(&[&p("s"), &p("s2"), &p("d/rel"), &p("d"), &p("f"), &p("loop")])
+    let made = ["s", "s2", "d/rel", "d/abs", "d/abs2", "d", "c-sym", "long", "f", "loop"];
+    kt::remove(&made.map(p).iter().map(|s| s.as_str()).collect::<alloc::vec::Vec<_>>())
 }
 
 crate::ktest!(
@@ -680,15 +778,15 @@ fn ktest_rename(base: &str) -> kt::R {
     use crate::linux::{errno, general};
     use crate::{kassert, kassert_eq};
     use kt::{BAD, e, lstat, open, ptr, read, up};
-    use lumen_vfs::{InodeType, OpenFlags as O, VfsError};
+    use lumen_vfs::{InodeType, OpenFlags as O};
     let p = |s: &str| alloc::format!("{base}/{s}");
     let cwd = Dirfd::Cwd;
-    let gone = |s: &str| lstat(&p(s)).map(drop) == Err(VfsError::NoEnt);
+    let gone = |s: &str| kt::gone(&p(s));
     let noreplace = RenameFlags(RenameFlags::NOREPLACE);
     let exchange = RenameFlags(RenameFlags::EXCHANGE);
 
-    // Over an existing file: atomic, and the old target's open fd still
-    // reads the old data.
+    // Over an existing file: it is replaced, and the old target's open fd
+    // still reads the old data.
     kt::file(&p("a"), b"AAA")?;
     kt::file(&p("b"), b"BBB")?;
     let bfd = open(0, &p("b"), O::O_RDONLY)?;
@@ -701,9 +799,14 @@ fn ktest_rename(base: &str) -> kt::R {
     kassert_eq!(sys_renameat(Dirfd::Fd(dfd), up(4, "b")?, Dirfd::Fd(dfd), up(5, "c")?), 0);
     kassert!(gone("b"));
     kassert_eq!(read(&p("c")), Ok(b"AAA".to_vec()));
+    // `renameat` replaces a name in use too (it passes no flag).
+    kt::file(&p("n"), b"OLD")?;
+    kt::file(&p("o"), b"NNN")?;
+    kassert_eq!(sys_renameat(Dirfd::Fd(dfd), up(4, "o")?, Dirfd::Fd(dfd), up(5, "n")?), 0);
+    kassert!(gone("o"));
+    kassert_eq!(read(&p("n")), Ok(b"NNN".to_vec()));
     // RENAME_NOREPLACE: EEXIST onto a name in use (nothing moves); a free
     // one renames.
-    kt::file(&p("n"), b"NNN")?;
     kassert_eq!(sys_renameat2(cwd, up(1, &p("c"))?, cwd, up(2, &p("n"))?, noreplace), e(errno::EEXIST));
     kassert_eq!((read(&p("c")), read(&p("n"))), (Ok(b"AAA".to_vec()), Ok(b"NNN".to_vec())));
     kassert_eq!(sys_renameat2(cwd, up(1, &p("c"))?, cwd, up(2, &p("c2"))?, noreplace), 0);
@@ -712,6 +815,11 @@ fn ktest_rename(base: &str) -> kt::R {
     kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, &p("c2"))?), 0);
     kassert_eq!(sys_renameat2(cwd, up(1, &p("c2"))?, cwd, up(2, &p("c2"))?, noreplace), e(errno::EEXIST));
     kassert_eq!(read(&p("c2")), Ok(b"AAA".to_vec()));
+    // Relative paths from the cwd.
+    let (rel_c2, rel_c3) = (up(1, "c2")?, up(2, "c3")?);
+    kassert_eq!(kt::in_cwd(base, || sys_rename(rel_c2, rel_c3))?, 0);
+    kassert!(gone("c2"));
+    kassert_eq!(sys_rename(up(1, &p("c3"))?, up(2, &p("c2"))?), 0);
     // RENAME_EXCHANGE: two files swap, then a file and a directory; ENOENT
     // if either side is missing.
     kassert_eq!(sys_renameat2(cwd, up(1, &p("c2"))?, cwd, up(2, &p("n"))?, exchange), 0);
@@ -742,13 +850,25 @@ fn ktest_rename(base: &str) -> kt::R {
     kt::mkdir(&p("empty"))?;
     kassert_eq!(sys_rename(up(1, &p("p"))?, up(2, &p("empty"))?), 0);
     kassert!(gone("p") && lstat(&p("empty/q")).is_ok());
-    // EISDIR: a file onto a directory; ENOTDIR: a directory onto a file.
+    // EISDIR: a file onto a directory, but ENOTDIR with a trailing slash
+    // (checked first); ENOTDIR: a directory onto a file.
     kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, &p("empty"))?), e(errno::EISDIR));
+    kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, &p("empty/"))?), e(errno::ENOTDIR));
     kassert_eq!(sys_rename(up(1, &p("empty"))?, up(2, &p("c2"))?), e(errno::ENOTDIR));
-    // EXDEV: onto the root filesystem. EBUSY: `/` either side.
+    // EXDEV: onto the root filesystem (which gets nothing), and before
+    // anything else, `/` on either side included.
     kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, "/ns-ktest-xdev")?), e(errno::EXDEV));
-    kassert_eq!(sys_rename(up(1, "/")?, up(2, &p("x"))?), e(errno::EBUSY));
-    kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, "/")?), e(errno::EBUSY));
+    kassert!(kt::gone("/ns-ktest-xdev"));
+    kassert_eq!(sys_rename(up(1, "/")?, up(2, &p("x"))?), e(errno::EXDEV));
+    kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, "/")?), e(errno::EXDEV));
+    // A last component that isn't a name: EBUSY on the old side; on the new
+    // side EBUSY, or EEXIST with RENAME_NOREPLACE.
+    for not_a_name in [p("."), p("..")] {
+        kassert_eq!(sys_rename(up(1, &not_a_name)?, up(2, &p("x"))?), e(errno::EBUSY));
+        kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, &not_a_name)?), e(errno::EBUSY));
+        let not_a_name = up(2, &not_a_name)?;
+        kassert_eq!(sys_renameat2(cwd, up(1, &p("c2"))?, cwd, not_a_name, noreplace), e(errno::EEXIST));
+    }
     // ENOENT, ENOTDIR, EFAULT (either pointer), EBADF (either dirfd), ELOOP.
     kassert_eq!(sys_rename(up(1, &p("none"))?, up(2, &p("x"))?), e(errno::ENOENT));
     kassert_eq!(sys_rename(up(1, &p("c2/x"))?, up(2, &p("x"))?), e(errno::ENOTDIR));
@@ -758,7 +878,10 @@ fn ktest_rename(base: &str) -> kt::R {
     kassert_eq!(sys_renameat(cwd, up(1, &p("c2"))?, Dirfd::Fd(reg(99)), up(2, "x")?), e(errno::EBADF));
     kt::symlink("loop", &p("loop"))?;
     kassert_eq!(sys_rename(up(1, &p("loop/x"))?, up(2, &p("x"))?), e(errno::ELOOP));
+    // None of the failed renames moved anything.
     kassert!(gone("x"));
+    kassert_eq!(read(&p("c2")), Ok(b"NNN".to_vec()));
+    kassert_eq!(lstat(&p("empty/q")).map(|s| s.0), Ok(InodeType::Dir));
     kassert_eq!(super::fd::sys_close(bfd), 0);
     kassert_eq!(super::fd::sys_close(dfd), 0);
     kt::remove(&[&p("n/in"), &p("n"), &p("dd"), &p("empty/q"), &p("empty"), &p("c2"), &p("loop")])

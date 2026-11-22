@@ -3437,7 +3437,8 @@ Lumen runs two kinds of user code:
      cwd's inode, a concrete `Arc`, and `Dirfd::Fd` the descriptor's inode
      (`-EBADF` if it isn't open, `-ENOTDIR` if it isn't a directory; an
      `O_PATH` directory is fine); an empty path (which `copy_in` lets
-     through only with `AT_EMPTY_PATH`) names the descriptor's file itself,
+     through only with `AT_EMPTY_PATH`, or for `readlinkat`, which takes
+     one without it) names the descriptor's file itself,
      a directory or not (or the cwd). `Fd::file()` is every handler's
      descriptor lookup (`-EBADF`). `Start::display_path` joins a relative
      path to the start's own (the cwd's, or the dirfd's open file's) for
@@ -3449,7 +3450,7 @@ Lumen runs two kinds of user code:
      as `read_into_user` is).
 
   `at.rs` also copies a path argument in (`UserPath`: `PATH_MAX` with its
-  NUL, else `-ENAMETOOLONG`; empty `-ENOENT` unless `AT_EMPTY_PATH`; a bad
+  NUL, else `-ENAMETOOLONG`; empty `-ENOENT` unless `AT_EMPTY_PATH` (or for `readlinkat`); a bad
   or `NULL` pointer `-EFAULT`; non-UTF-8 `-ENOENT` until #268) and fills
   `struct stat` and `struct statx` from VFS `Metadata`. The per-cluster
   stub ktests (`check_stubs`) dispatch with every argument zero, so they
@@ -3600,18 +3601,18 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 162 | `sync()` | snapshots mounted filesystems and cached inodes (never holding `MountTable`/`InodeCache` across I/O), flushes every dirty `PageCache` page and `BlockCache` block followed by `BlockDevice::flush()`; always returns `0` |
 | 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor`; returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
 | 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on char devices—including on read-only `devfs`—`-EISDIR` on dirs, `-EROFS` on regular files on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on final symlink without trailing `/` unless `O_PATH` is also set; trailing `/` forces directory traversal even with `O_NOFOLLOW`, matching Linux), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
-| 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o7777) & !umask`, stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
+| 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o1777) & !umask` (setuid/setgid dropped, sticky kept, as Linux's `vfs_mkdir`), stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
 | 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`) |
 | 262 | `newfstatat(dirfd, path, buf, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; writes 144-byte Linux x86-64 `struct stat` with unique `(st_dev, st_ino)` per filesystem/inode |
-| 263 | `unlinkat(dirfd, path, flags)` | `flags == 0`: unlinks non-directory (`-EISDIR` on dir, `-ENOTDIR` on trailing `/`), handling open-unlinked inodes cleanly (section 9); `flags == AT_REMOVEDIR`: removes empty directory (`-ENOTEMPTY`, `-EINVAL` for `.`, `-EBUSY` for mount point); unknown flags `-EINVAL` |
+| 263 | `unlinkat(dirfd, path, flags)` | `flags == 0`: unlinks non-directory (`-EISDIR` on dir and on `/`, `.` or `..`, `-ENOTDIR` on trailing `/`, a symlink to a directory included), handling open-unlinked inodes cleanly (section 9); `flags == AT_REMOVEDIR`: removes empty directory (`-ENOTEMPTY`, also for `..`, `-EINVAL` for `.`, `-EBUSY` for `/` and a mount point); unknown flags `-EINVAL`, checked before the path |
 | 264 | `renameat(olddirfd, old, newdirfd, new)` | shim to `renameat2(olddirfd, old, newdirfd, new, 0)` |
-| 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | creates hard link (`AT_SYMLINK_FOLLOW` / `AT_EMPTY_PATH`); rejects directories (`-EPERM`), cross-mount (`-EXDEV`), existing target (`-EEXIST`), incrementing `st_nlink` |
-| 266 | `symlinkat(target, newdirfd, linkpath)` | creates symlink with verbatim non-empty `target` (`-ENOENT` if `target` is empty, `-EEXIST` if `linkpath` exists, `-ENOENT`/`-EEXIST` on trailing `/`) |
+| 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | creates hard link (`AT_SYMLINK_FOLLOW` / `AT_EMPTY_PATH`); rejects existing target (`-EEXIST`, a trailing `/` too; `-ENOENT` for a trailing `/` on a free name), then cross-mount (`-EXDEV`), then directories (`-EPERM`), Linux's order, incrementing `st_nlink` |
+| 266 | `symlinkat(target, newdirfd, linkpath)` | creates symlink with verbatim non-empty `target` (`-ENOENT` if `target` is empty, `-EEXIST` if `linkpath` exists, `-ENOENT`/`-EEXIST` on trailing `/`; a target that isn't UTF-8 `-EINVAL` until #268) |
 | 267 | `readlinkat(dirfd, path, buf, bufsiz)` | does not follow final symlink (`-EINVAL` if target is not a symlink or `bufsiz <= 0`); accepts empty `path == ""` on an `O_PATH` symlink `dirfd` (`-ENOENT` if that file is not a symlink, as Linux); copies `min(target.len(), bufsiz)` bytes **without** trailing NUL and returns bytes copied |
 | 268 | `fchmodat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`, which `musl` leaves uninitialized); follows symlinks and updates mode bits and `ctime` (`-EROFS` on read-only fs) |
 | 269 | `faccessat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`); shim to `faccessat2(dirfd, path, mode, 0)` |
 | 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`), `AT_SYMLINK_NOFOLLOW`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`), rejecting invalid `tv_nsec >= 1_000_000_000` with `-EINVAL` |
-| 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); same-inode `rename(a, a)` is a no-op (`0`, or `-EEXIST` with `RENAME_NOREPLACE`); handles open-unlinked file and empty-dir target overwrite via the same detach/orphan path as `unlink`/`rmdir` (section 9); rejects unknown flags or both together (`-EINVAL`), cross-mount (`-EXDEV`), mountpoint overwrite (`-EBUSY`), dir-over-non-dir or trailing `/` on non-dir (`-ENOTDIR`), non-dir-over-dir (`-EISDIR`), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
+| 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); same-inode `rename(a, a)` is a no-op (`0`, or `-EEXIST` with `RENAME_NOREPLACE`); handles open-unlinked file and empty-dir target overwrite via the same detach/orphan path as `unlink`/`rmdir` (section 9); rejects unknown flags, `RENAME_WHITEOUT` or both together (`-EINVAL`, before the paths), cross-mount (`-EXDEV`, checked first), `/`, `.` or `..` as either name (`-EBUSY`; `-EEXIST` on the new side with `RENAME_NOREPLACE`), mountpoint overwrite (`-EBUSY`), dir-over-non-dir or trailing `/` on non-dir (`-ENOTDIR`, the slash checked before the types), non-dir-over-dir (`-EISDIR`), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
 | 332 | `statx(dirfd, path, flags, mask, buf)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `AT_NO_AUTOMOUNT`, and `AT_STATX_SYNC_TYPE` (`AS_STAT`/`FORCE_SYNC`/`DONT_SYNC`); fills `struct statx` (`stx_mask`, `stx_blksize`, `stx_nlink`, `stx_uid`, `stx_gid`, `stx_mode`, `stx_ino`, `stx_size`, `stx_blocks`, timestamps, `stx_rdev_*`, `stx_dev_*`) |
 | 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`; checks existence and permission bits (`F_OK \| R_OK \| W_OK \| X_OK`; root `uid == 0` satisfies `R_OK`/`W_OK` on writable fs and on `S_ISCHR` device nodes on `devfs`, and `X_OK` if any execute bit is set on regular files or always on dirs) |
 | 452 | `fchmodat2(dirfd, path, mode, flags)` | 4-argument Linux 6.6+ variant accepting `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (unknown flags → `-EINVAL`); returns `-EOPNOTSUPP` **only when the resolved target is a symlink**, otherwise updates mode bits and `ctime` normally (`-EROFS` on read-only fs) |
@@ -5454,6 +5455,18 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `open("symlink", O_NOFOLLOW)` returns `-ELOOP`, **except**
     `open("symlink", O_PATH | O_NOFOLLOW)` which opens an `O_PATH` descriptor
     to the symlink itself.
+  - **Namespace operations look at the last component as Linux's
+    `fs/namei.c` does** (`unlink_at`, `rename_at2`, `link_at`, `readlink_at`;
+    #254): `unlink("symlink/")` is `-ENOTDIR`, the link not followed (unlike
+    `lstat`); a last component that isn't a name (`/`, `.`, `..`) is
+    `-EISDIR` for unlink and `-EBUSY`/`-EINVAL`/`-ENOTEMPTY` for rmdir;
+    `rename` checks `-EXDEV` first, then `-EBUSY` for such a name (`-EEXIST`
+    on the new side with `RENAME_NOREPLACE`), and a trailing `/` on a
+    non-directory's new name before comparing types (`-ENOTDIR`); `link`
+    gives the new name's `-EEXIST`/`-ENOENT`, then `-EXDEV`, then a
+    directory's `-EPERM`; `readlink_at` of an empty path on a non-symlink is
+    `-ENOENT` (`-EINVAL` for any other path); a last name that isn't UTF-8 is
+    `-ENOENT`, like any other component (#268).
 - **Open file descriptions vs FD table:**
   - `FdEntry { file: Arc<OpenFile>, cloexec: bool }` in per-process `FdTable`
     (capacity `MAX_FDS = 1024`).

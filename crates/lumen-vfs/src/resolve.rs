@@ -454,7 +454,9 @@ pub(crate) fn resolve_parent_with_depth(
     if name_bytes.len() > NAME_MAX {
         return Err(VfsError::NameTooLong);
     }
-    let name = core::str::from_utf8(name_bytes).map_err(|_| VfsError::Inval)?;
+    // A name that isn't UTF-8 names nothing the VFS can hold yet: `-ENOENT`,
+    // as for any other component (#268 makes names byte strings).
+    let name = core::str::from_utf8(name_bytes).map_err(|_| VfsError::NoEnt)?;
 
     Ok(ParentTarget { parent, name: String::from(name), has_trailing_slash })
 }

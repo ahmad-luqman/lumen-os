@@ -202,7 +202,8 @@ pub(super) struct UserPath(Vec<u8>);
 impl UserPath {
     /// Copy the NUL-terminated path at `ptr`: `-EFAULT` for a bad pointer,
     /// `-ENAMETOOLONG` past `PATH_MAX` bytes with its NUL, `-ENOENT` if empty
-    /// unless `allow_empty` (`AT_EMPTY_PATH`).
+    /// unless `allow_empty` (`AT_EMPTY_PATH`, or `readlinkat`, which takes an
+    /// empty path without it).
     ///
     /// `NULL` is `-EFAULT` too. A caller for which `NULL` means something
     /// checks first: `utimensat`'s path, and, from Linux 6.11, `fstatat`'s and
@@ -242,9 +243,10 @@ impl UserPath {
 
 /// Where a path argument starts, as [`start_dir`] resolved its `dirfd`.
 pub(super) struct Start {
-    /// The directory a relative path starts from (with `AT_EMPTY_PATH` and
-    /// an empty path, the file itself); `None` only for an absolute path,
-    /// which lumen-vfs starts at the global root whatever it is handed.
+    /// The directory a relative path starts from (with an empty path, which
+    /// `AT_EMPTY_PATH` or `readlinkat` allows, the file itself); `None` only
+    /// for an absolute path, which lumen-vfs starts at the global root
+    /// whatever it is handed.
     dir: Option<Arc<dyn VfsInode>>,
     /// The path `dir` was opened or set by (the cwd's, or the dirfd's open
     /// file's), for the path a relative open shows in `/proc/<pid>/fd`.
@@ -343,8 +345,8 @@ impl Start {
 /// - An absolute path starts at the root whatever `dirfd` is: the dirfd is
 ///   never looked at (a bad one is no error).
 /// - An empty path (`UserPath::copy_in` let one through only with
-///   `AT_EMPTY_PATH`) names the dirfd's file itself, a directory or not, or
-///   the cwd.
+///   `AT_EMPTY_PATH`, or for `readlinkat`) names the dirfd's file itself, a
+///   directory or not, or the cwd.
 /// - A relative path starts at the cwd's inode for `Dirfd::Cwd`, or at the
 ///   dirfd's file: `-EBADF` if it isn't open, `-ENOTDIR` if it isn't a
 ///   directory (an `O_PATH` one is fine).
