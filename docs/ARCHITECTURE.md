@@ -3578,7 +3578,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
 | 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` on any unmapped hole; sweeps `MAP_SHARED` PTE dirty bits into `PageCache` and, for `MS_SYNC`, writes back and issues `BlockDevice::flush()` |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0) / `F_DUPFD_CLOEXEC` (1030) (`-EINVAL` if `arg < 0 \|\| arg >= MAX_FDS`, `-EMFILE` if no free slot in `[arg, MAX_FDS)`), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`; the access mode and creation flags ignored, as on Linux, and `O_ASYNC`/`O_DIRECT`/`O_NOATIME` too, which Linux would change and Lumen doesn't track), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped; a bad `l_type`/`l_whence` or negative start `-EINVAL`, a range past `OFFSET_MAX` `-EOVERFLOW`, then the open mode `F_WRLCK` → writable / `F_RDLCK` → readable else `-EBADF`; normalizing `l_len < 0`; `F_SETLKW` is `-EDEADLK` where its wait would close a cycle of waiting processes, section 9); on an `O_PATH` fd every `cmd` but `F_DUPFD*`/`F_GETFD`/`F_SETFD`/`F_GETFL` is `-EBADF`, unknown ones included; on any other fd an unknown `cmd` is `-EINVAL` |
-| 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; independent of `fcntl` POSIX locks); as Linux since 5.17, `LOCK_MAND` is ignored (returns 0) and `op` is checked (`-EINVAL`) before `fd` (`-EBADF`, `O_PATH` too); atomic upgrade/downgrade on same `OpenFileId` when nothing conflicts (a blocking request that conflicts gives the held lock up first, as Linux; section 9), `-EWOULDBLOCK` on conflict with `LOCK_NB` (the held lock kept: a deviation, Linux drops it), released when last FD to the `OpenFile` closes |
+| 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; independent of `fcntl` POSIX locks); as Linux 6.0+, `LOCK_MAND` is ignored (returns 0; reported once a boot, at info) and `op` is checked (`-EINVAL`) before `fd` (`-EBADF`, `O_PATH` too); atomic upgrade/downgrade on same `OpenFileId` when nothing conflicts (a blocking request that conflicts gives the held lock up first, as Linux; section 9), `-EWOULDBLOCK` on conflict with `LOCK_NB` (the held lock kept: a deviation, Linux drops it), released when last FD to the `OpenFile` closes |
 | 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs (and detached unlinked inodes as a no-op), `-EBADF` on `O_PATH`, and `-EINVAL` on console/tty, `/dev/*`, character-device, FIFO and socket nodes and anything on procfs, as Linux (no `->fsync`); also on block-device nodes, an M7 deviation (Linux's `blkdev_fsync` syncs the device, which M7 can't open) |
 | 75 | `fdatasync(fd)` | flushes file data pages and size-changing metadata (ext4: all dirty metadata) through `BlockCache` + `BlockDevice::flush()` (same `-EBADF`/`-EINVAL` rules as `fsync`) |
 | 76 | `truncate(path, len)` | resolves `path` (following symlinks), validates `len >= 0` (`-EINVAL`), writable regular file (`-EISDIR`/`-EACCES`/`-EROFS`), resizes via `ftruncate` logic |
@@ -5496,14 +5496,17 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     conflicts; released automatically when the last FD referencing that
     `OpenFile` closes. A blocking request that conflicts drops the lock its
     description holds first, as Linux's `flock_lock_inode`
-    (`LockOutcome::WouldBlock { released }`); a `LOCK_NB` one keeps it and
+    (`FlockOutcome::WouldBlock { released }`); a `LOCK_NB` one keeps it and
     fails with `-EWOULDBLOCK` (a deviation: Linux drops it there too).
   - **`fcntl` POSIX record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW`):** keyed by
     `(pid, start..end)` byte ranges (`l_len == 0` means to `i64::MAX`;
-    negative `l_len < 0` normalizes to `[base + l_len, base)`). Checked in
-    Linux's order: an invalid `l_type`/`l_whence` or a computed `start < 0`
-    is `-EINVAL`, a range past `i64::MAX` (`OFFSET_MAX`) `-EOVERFLOW`
-    (`VfsError::Overflow`), and only then the open mode (`F_WRLCK` requires
+    negative `l_len < 0` normalizes to `[base + l_len, base)`). `F_SETLK*`
+    checks in Linux's order (`flock64_to_posix_lock`, `assign_type` last,
+    then `check_fmode_for_setlk`): the range first (an invalid `l_whence`
+    or a computed `start < 0` is `-EINVAL`, a range past `i64::MAX`
+    (`OFFSET_MAX`) `-EOVERFLOW`, `VfsError::Overflow`), then an invalid
+    `l_type` (`-EINVAL`; `F_GETLK` checks the type first, as Linux's
+    `fcntl_getlk`), and only then the open mode (`F_WRLCK` requires
     a writable fd, `F_RDLCK` a readable one, else `-EBADF`; `O_PATH` →
     `-EBADF` in the kernel first). Supports split, coalesce, overwrite, and
     non-conflict within the same `pid`, returns `-EAGAIN` on conflict for
@@ -5511,7 +5514,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     inode when `pid` closes **any** FD referencing that inode (POSIX
     requirement relied on by SQLite, Cargo, and Git).
   - **What a call released, and who blocks it:** `flock` answers
-    `LockOutcome::{Granted, WouldBlock} { released }` and `setlk`
+    `FlockOutcome::{Granted, WouldBlock} { released }` and `setlk`
     `RecordLockOutcome::{Granted { released }, WouldBlock { holder }}`.
     `released` is exact: an unlock that removed a lock, an `EX` → `SH`
     downgrade (an `F_RDLCK` over a held write lock), or a blocking `flock`
@@ -5526,20 +5529,28 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     lock call that `released` something and every `close`/exit/`dup2`
     displacement that gave a lock up (`process::release_fd`) bumps it and
     wakes every waiter (`process::locks_released`), after Lock 4 is
-    released. No signal ends a wait (no `EINTR` until signals are
+    released. `released` and the release functions are `#[must_use]`, and
+    `VfsInode::with_locks_mut` is `Err` only when its closure didn't run,
+    so no release is dropped on the way. No signal ends a wait (no `EINTR` until signals are
     delivered).
   - **`EDEADLK` (`PosixWaitGraph`, host-tested):** before it waits,
     `F_SETLKW` records that its pid waits for `holder`, stamped with the
     release count it read before its try, in the kernel's `POSIX_WAITERS`
     (a `PosixWaitGraph` behind a spinlock, the count passed in as `now`).
     The wait is refused with `-EDEADLK` where following the holder's
-    record, its holder's, and so on (at most `MAX_DEADLOCK_CHAIN` = 10
-    records, as Linux's `MAX_DEADLK_ITERATIONS`) leads back to the caller.
-    Records stamped before the last release are never followed (that
+    record, its holder's, and so on leads back to the caller, through at
+    most `MAX_DEADLOCK_CHAIN` = 11 records: Linux's loop checks
+    `i++ > MAX_DEADLK_ITERATIONS` (10) before each comparison, so it
+    compares 11 blockers too. A search cut off there says so
+    (`WaitSearch::Truncated`) and the kernel warns once a boot: with no
+    signals, a longer cycle would hang every process in it. A record is
+    stamped with its waiter's `seen` and followed only while that equals
+    the caller's `now`: records stamped before the last release are never
+    followed (that
     release woke their waiter, which records itself again if it still
     waits), and a caller whose own stamp is stale (a release came after its
-    try) is neither checked nor recorded: its wait ends at once and it
-    retries with a fresh view. **Approximation:** each waiter records one
+    try) is neither checked nor recorded (its old record removed): its
+    wait ends at once and it retries with a fresh view. **Approximation:** each waiter records one
     holder, as Linux's `posix_locks_deadlock` follows each waiter's single
     `fl_blocker`, so a cycle through a second holder of the same range
     isn't found (that waiter waits, as on Linux). `flock` detects no

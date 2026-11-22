@@ -518,9 +518,9 @@ one is its own PR that updates that doc first.
   table and the Lock-9 inode and dentry caches, `OpenFile` and the `FdTable`
   (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
-  call saying what it `released` and, blocked, who holds the lock:
-  `LockOutcome`, `RecordLockOutcome`; `PosixWaitGraph`, who waits for
-  whom, for `EDEADLK`), and
+  call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,
+  whose `WouldBlock` alone names the holder; `PosixWaitGraph`, who waits
+  for whom, for `EDEADLK`, its search's `WaitSearch`), and
   `procfs` (`/proc`'s `ProcKind`s, their inode numbers and types, `ProcFd`:
   an fd in `0..MAX_FDS`, `ProcFd::parse`, and `parse_canonical_u32`: one
   name per number) (host-tested).
