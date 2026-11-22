@@ -332,6 +332,18 @@ pub enum UserExit {
     /// Kernel refused to execute `sysretq`/`iretq` to a non-canonical or
     /// kernel-half return `rip`.
     NonCanonicalRip(u64),
+    /// A ring-3 access to a file-backed page that can't be had
+    /// (`FaultResult::BusError`): wholly past the file's end, unreadable, or
+    /// refused by the page cache (a quota, the `ext4` hard limit, an
+    /// unlinked inode). Linux sends `SIGBUS`; Lumen ends the process
+    /// (signals arrive in M8).
+    BusError { rip: u64, cr2: u64 },
+}
+
+impl UserExit {
+    /// The status a shell reports for a process killed by `SIGBUS`
+    /// (`128 + 7`).
+    pub const BUS_ERROR_STATUS: i32 = 128 + general::SIGBUS as i32;
 }
 
 /// Synchronization state for the concurrent same-CPU `sse_tls` preemption test.
@@ -383,6 +395,25 @@ pub fn handle_user_exception(frame: &TrapFrame, cr2: u64) -> ! {
         frame.error_code,
         frame.rip,
         cr2
+    );
+    // SAFETY: called on the CPU running the active ring-3 context; lock guard
+    // from `record_exit` is already dropped (`irq::depth() == 0`).
+    unsafe { arch::syscall::unwind_to_kernel() }
+}
+
+/// End the active ring-3 context for a page fault that resolved to a bus
+/// error (`FaultResult::BusError`): one `WARN` naming the pid, `rip` and
+/// `cr2`, then back to the kernel ring-3 runner, as
+/// [`handle_user_exception`].
+pub fn handle_user_bus_error(frame: &TrapFrame, cr2: u64) -> ! {
+    let (pid, is_test) = record_exit(UserExit::BusError { rip: frame.rip, cr2 });
+    if is_test {
+        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
+    }
+    warn!(
+        target: "user",
+        "pid {pid}: bus error (SIGBUS): file page unavailable (past EOF, unreadable or refused) at cr2 {cr2:#x} (rip {:#x}); terminating process",
+        frame.rip
     );
     // SAFETY: called on the CPU running the active ring-3 context; lock guard
     // from `record_exit` is already dropped (`irq::depth() == 0`).
@@ -1655,6 +1686,9 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         }
         UserExit::NonCanonicalRip(rip) => {
             let _ = writeln!(ctx.out, "usertest: non-canonical rip={rip:#x}");
+        }
+        UserExit::BusError { rip, cr2 } => {
+            let _ = writeln!(ctx.out, "usertest: bus error rip={rip:#x} cr2={cr2:#x}");
         }
     }
 }

@@ -4005,7 +4005,7 @@ impl VfsInode for Ext4Inode {
 /// Test seams for the ktests below: a block cache that counts and injects
 /// faults, and mount, remount and image helpers.
 #[cfg(feature = "ktest")]
-mod ktest_util {
+pub(super) mod ktest_util {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;

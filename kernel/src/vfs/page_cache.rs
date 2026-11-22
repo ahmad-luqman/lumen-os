@@ -217,7 +217,6 @@ impl CachePage {
 
     /// Underlying physical frame, for a zero-copy `PTE_SHARED` user mapping
     /// of the page (#255).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn phys_frame(&self) -> PhysFrame {
         self.frame.frame()
@@ -317,10 +316,10 @@ impl CachePage {
         mapped_writable || self.dirty.load(Ordering::Acquire)
     }
 
-    /// Mark the page dirty: a kernel write, or a writable `MAP_SHARED` fault
-    /// (#255's page-fault path, hence `pub` for now).
+    /// Mark the page dirty: a kernel write, or (through [`WritableMap`]) a
+    /// writable `MAP_SHARED` mapping made or found dirty.
     #[inline]
-    pub fn set_dirty(&self) {
+    pub(super) fn set_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
     }
 
@@ -332,20 +331,17 @@ impl CachePage {
     }
 
     /// How many `PRESENT | WRITABLE | PTE_SHARED` mappings the page has.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn writable_maps(&self) -> u32 {
         self.writable_maps.load(Ordering::Acquire)
     }
 
-    /// One more `PRESENT | WRITABLE | PTE_SHARED` mapping of this page, for
-    /// #255's page-fault path, which calls it with
-    /// [`set_dirty`](Self::set_dirty). `pub` is temporary: once #255's next
-    /// part puts the pair behind an RAII guard, this and
-    /// `dec_writable_maps` become `pub(super)`.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+    /// One more `PRESENT | WRITABLE | PTE_SHARED` mapping of this page.
+    /// Outside the ktests only [`MappedPage::map_writable`] calls it, with
+    /// [`set_dirty`](Self::set_dirty), and the [`WritableMap`] it returns
+    /// makes the matching [`dec_writable_maps`](Self::dec_writable_maps).
     #[inline]
-    pub fn inc_writable_maps(&self) {
+    pub(super) fn inc_writable_maps(&self) {
         self.writable_maps.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -364,11 +360,10 @@ impl CachePage {
     /// still hold the writable entry is flushed (in M7, the one CPU's
     /// `invlpg`). A store landing later, through a stale entry, after a
     /// writeback cleared `dirty`, would be lost again (ARCHITECTURE section
-    /// 5's unmap order). `pub` for #255's unmap paths, temporarily: see
-    /// [`inc_writable_maps`](Self::inc_writable_maps).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
+    /// 5's unmap order). Outside the ktests only [`WritableMap`]'s `Drop`
+    /// calls it, and the VM core drops one only after that flush.
     #[inline]
-    pub fn dec_writable_maps(&self) {
+    pub(super) fn dec_writable_maps(&self) {
         self.dirty.store(true, Ordering::Release);
         let prev = self.writable_maps.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(prev > 0, "writable_maps underflow");
@@ -385,7 +380,6 @@ impl CachePage {
     /// `MAP_SHARED` store from ring 3 racing the copy is a hardware write
     /// outside Rust's memory model and leaves some mix of old and new bytes
     /// in `dst`, as on Linux.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
     pub(super) fn copy_to_frame(&self, dst: &mut OwnedFrame, valid: usize) {
         let valid = valid.min(PAGE_SIZE);
         let dst_ptr = mm::phys_to_virt(dst.frame().start()).as_mut_ptr::<u8>();
@@ -404,26 +398,40 @@ impl CachePage {
 }
 
 /// A file's cached page handed out for a mapping by [`mmap_page`].
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
 pub(crate) struct MappedPage {
     page: Arc<CachePage>,
+    /// The page's index in the file (file offset `index * 4096`).
+    index: u64,
     file_size: u64,
     /// The inode whose cache holds `page`: an `ext4` or `tmpfs` inode, as
     /// [`mmap_page`] checked, for [`Self::copy_to_frame`]'s lock.
     owner: Arc<dyn VfsInode>,
 }
 
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
 impl MappedPage {
     /// Only [`mmap_page`] makes one, once `owner` has downcast to an `ext4`
     /// or `tmpfs` inode.
-    fn new(page: Arc<CachePage>, file_size: u64, owner: Arc<dyn VfsInode>) -> Self {
-        Self { page, file_size, owner }
+    fn new(page: Arc<CachePage>, index: u64, file_size: u64, owner: Arc<dyn VfsInode>) -> Self {
+        Self { page, index, file_size, owner }
     }
 
-    /// Copy the page's first `valid` bytes into `dst` and zero the rest of
-    /// `dst`: a `MAP_PRIVATE` copy-on-write split, where `valid` is what
-    /// lies below the file's size (`PAGE_SIZE` for a page wholly inside it).
+    /// How many of the page's bytes lie below [`file_size`](Self::file_size):
+    /// `PAGE_SIZE` for a page wholly inside the file, fewer for the page
+    /// holding its end ([`mmap_page`] hands out no page starting at or past
+    /// it).
+    pub(crate) fn valid_len(&self) -> usize {
+        let start = self.index.saturating_mul(PAGE_SIZE as u64);
+        self.file_size.saturating_sub(start).min(PAGE_SIZE as u64) as usize
+    }
+
+    /// Copy the page's bytes below the file's size ([`valid_len`]) into
+    /// `dst` and zero the rest of `dst`: a `MAP_PRIVATE` copy-on-write
+    /// split. The length comes from the page's own index and the size read
+    /// with it, so a caller can't pass a wrong one; a fault that needs the
+    /// size as it is now (the file may have grown since the page was
+    /// mapped) looks the page up again with [`mmap_page`] first.
+    ///
+    /// [`valid_len`]: Self::valid_len
     ///
     /// The copy holds the owning inode's Lock 5, as the kernel's writers of
     /// the page (`write_at`, truncate's zeroing) do, so no kernel write
@@ -434,10 +442,23 @@ impl MappedPage {
     /// nothing numbered 3 or higher, and no `SpinLock`. This is `mm`'s one
     /// way to copy a page's bytes; it maps a page zero-copy through
     /// [`CachePage::phys_frame`].
-    pub(crate) fn copy_to_frame(&self, dst: &mut OwnedFrame, valid: usize) {
+    pub(crate) fn copy_to_frame(&self, dst: &mut OwnedFrame) {
         let lock = page_cache_lock(&*self.owner).expect("a MappedPage's owner is an ext4 or tmpfs inode");
         let _cache = lock.lock();
-        self.page.copy_to_frame(dst, valid);
+        self.page.copy_to_frame(dst, self.valid_len());
+    }
+
+    /// Count one `PRESENT | WRITABLE | PTE_SHARED` mapping of the page: mark
+    /// it dirty and raise its writable-mapping count together, before the
+    /// caller makes the PTE writable. The returned [`WritableMap`] lowers
+    /// the count again when dropped, which the VM core does only after the
+    /// PTE is cleared or made read-only and the TLB flushed (ARCHITECTURE
+    /// section 5's unmap order). This is the one way to count a mapping.
+    #[must_use = "dropping the guard uncounts the mapping at once"]
+    pub(crate) fn map_writable(&self) -> WritableMap {
+        self.page.set_dirty();
+        self.page.inc_writable_maps();
+        WritableMap { page: Arc::clone(&self.page) }
     }
 
     /// The inode's cached page itself (not a copy). Holding the `Arc` (a
@@ -453,9 +474,46 @@ impl MappedPage {
     /// size once Lock 4 is released. A shrink takes `AddressSpace::inner`
     /// (Lock 1) before Lock 4 to invalidate mappings (ARCHITECTURE section
     /// 5), so a fault holding Lock 1 across the call and the mapping can
-    /// rely on it; one that doesn't must look again.
+    /// rely on it; one that doesn't must look again. (The fault path needs
+    /// only [`valid_len`](Self::valid_len), through `copy_to_frame`.)
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests' check of the snapshot
     pub(crate) fn file_size(&self) -> u64 {
         self.file_size
+    }
+}
+
+/// One `PRESENT | WRITABLE | PTE_SHARED` user mapping of a cached page,
+/// counted in its `writable_maps` while the guard lives (#255).
+///
+/// Only [`MappedPage::map_writable`] makes one, marking the page dirty and
+/// raising the count together; `Drop` lowers the count (which marks the
+/// page dirty first, #266). `Drop` can't know whether the PTE is gone and
+/// the TLB flushed, so the VM core keeps each guard beside its PTE and
+/// drops it only after clearing or downgrading the PTE and flushing
+/// (ARCHITECTURE section 5's unmap order). A `fork` that copies a
+/// writable shared PTE would count it again with a second guard of its
+/// own. `Drop` takes no lock (in the ktests, it takes the release-order
+/// recorder's only while a test records).
+pub(crate) struct WritableMap {
+    page: Arc<CachePage>,
+}
+
+impl WritableMap {
+    /// The PTE's hardware `DIRTY` bit was found set: mark the page dirty.
+    /// (The guard marks it when made and when dropped as well, so this only
+    /// says it sooner, for a sweep that keeps the mapping, like `msync`'s.)
+    pub(crate) fn note_pte_dirty(&self) {
+        self.page.set_dirty();
+    }
+}
+
+impl Drop for WritableMap {
+    fn drop(&mut self) {
+        self.page.dec_writable_maps();
+        crate::mm::user_vm::release_order::record(
+            self.page.phys_frame().as_u64(),
+            crate::mm::user_vm::release_order::Step::Released,
+        );
     }
 }
 
@@ -496,9 +554,8 @@ impl MappedPage {
 ///   no `SpinLock`.
 ///
 /// It doesn't mark the page dirty or count a writable mapping: the caller
-/// does both (`set_dirty`, `inc_writable_maps`) when it maps the page
+/// does both, through [`MappedPage::map_writable`], when it maps the page
 /// writable.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
 pub(crate) fn mmap_page(inode: &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError> {
     let any = inode.as_any().ok_or(VfsError::NoDev)?;
     let (page, file_size) = if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
@@ -508,7 +565,14 @@ pub(crate) fn mmap_page(inode: &Arc<dyn VfsInode>, index: u64) -> Result<MappedP
     } else {
         return Err(VfsError::NoDev);
     };
-    Ok(MappedPage::new(page, file_size, Arc::clone(inode)))
+    Ok(MappedPage::new(page, index, file_size, Arc::clone(inode)))
+}
+
+/// Whether [`mmap_page`] can hand out pages of `inode`: a regular file of
+/// `ext4` or `tmpfs`. (`mmap` refuses anything else with `ENODEV` up front,
+/// instead of a `SIGBUS` at the first fault.)
+pub(crate) fn mappable(inode: &dyn VfsInode) -> bool {
+    inode.inode_type() == lumen_vfs::InodeType::File && page_cache_lock(inode).is_some()
 }
 
 /// The `PageCache` lock (Lock 5) of an `ext4` or `tmpfs` inode.
@@ -523,7 +587,6 @@ fn page_cache_lock(inode: &dyn VfsInode) -> Option<&SleepMutex<PageCache>> {
 /// `Range` unless page `index` starts below `file_size` (an overflowing
 /// offset is past any file): [`mmap_page`]'s EOF rule, for each
 /// filesystem's side of it.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
 pub(super) fn mmap_page_in_file(index: u64, file_size: u64) -> Result<(), VfsError> {
     match index.checked_mul(PAGE_SIZE as u64) {
         Some(off) if off < file_size => Ok(()),
@@ -554,6 +617,105 @@ pub(super) mod ktest_hooks {
         if DEC_BETWEEN_DIRTY_LOADS.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
             page.dec_writable_maps();
         }
+    }
+}
+
+/// Scratch files on fresh `tmpfs` and `ext4` volumes for the file-backed VM's
+/// ktests (`mm::user_vm`), which can't reach `vfs`'s in-memory block device
+/// themselves. Nothing here is mounted in the global tables.
+#[cfg(feature = "ktest")]
+pub(crate) mod ktest_files {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use lumen_bcache::{BlockCache, BlockError};
+    use lumen_vfs::{DevId, FileSystem, VfsInode};
+
+    use super::super::ext4::{BlockCacheBackend, Ext4FileSystem, Ext4Inode};
+    use super::super::{MemBlkDev, build_minimal_ext4_image_blocks};
+    use crate::sync::SleepMutex;
+
+    /// A block cache over an in-memory disk whose reads fail on request.
+    struct FlakyCache {
+        inner: SleepMutex<BlockCache<MemBlkDev>>,
+        fail_reads: AtomicBool,
+    }
+
+    impl BlockCacheBackend for FlakyCache {
+        fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+            if self.fail_reads.load(Ordering::Acquire) {
+                return Err(BlockError::Io);
+            }
+            self.inner.lock().read_at(byte_off, dst)
+        }
+
+        fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError> {
+            self.inner.lock().write_at(byte_off, src)
+        }
+
+        fn sync(&self) -> Result<(), BlockError> {
+            self.inner.lock().sync()
+        }
+    }
+
+    /// A fresh writable `ext4` volume (1 MiB) on an in-memory disk.
+    pub(crate) struct Ext4Volume {
+        cache: Arc<FlakyCache>,
+        fs: Arc<Ext4FileSystem>,
+        pub(crate) root: Arc<dyn VfsInode>,
+    }
+
+    impl Ext4Volume {
+        pub(crate) fn new(minor: u32) -> Result<Self, &'static str> {
+            let dev = MemBlkDev::new(build_minimal_ext4_image_blocks(256), false);
+            let cache = Arc::new(FlakyCache {
+                inner: SleepMutex::new(BlockCache::new(dev, 64).map_err(|_| "block cache")?),
+                fail_reads: AtomicBool::new(false),
+            });
+            let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&cache) as Arc<dyn BlockCacheBackend>;
+            let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "ext4 mount")?;
+            Ok(Self { cache, root: fs.root_inode(), fs })
+        }
+
+        /// The root of a read-only mount of the same disk (through the same
+        /// block cache): what it reads is on the disk, not in the first
+        /// mount's page cache.
+        pub(crate) fn remount_ro(&self, minor: u32) -> Result<Arc<dyn VfsInode>, &'static str> {
+            let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&self.cache) as Arc<dyn BlockCacheBackend>;
+            let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
+            Ok(fs.root_inode())
+        }
+
+        /// The volume's free inodes, as its superblock counts them.
+        pub(crate) fn free_inodes(&self) -> u32 {
+            super::super::ext4::ktest_util::free_inodes(&self.fs)
+        }
+
+        /// Make every disk read fail (`true`) or work again.
+        pub(crate) fn fail_reads(&self, fail: bool) {
+            self.cache.fail_reads.store(fail, Ordering::Release);
+        }
+    }
+
+    /// A fresh `tmpfs` holding `quota_bytes`.
+    pub(crate) struct TmpfsVolume {
+        _fs: Arc<super::super::tmpfs::Tmpfs>,
+        pub(crate) root: Arc<dyn VfsInode>,
+    }
+
+    impl TmpfsVolume {
+        pub(crate) fn new(minor: u32, quota_bytes: usize) -> Self {
+            let fs = super::super::tmpfs::Tmpfs::new(DevId::makedev(0, minor), quota_bytes);
+            Self { root: fs.root_inode(), _fs: fs }
+        }
+    }
+
+    /// Reclaim an `ext4` file's pages: write every dirty one back, then
+    /// evict every page nothing else holds. The number still cached.
+    pub(crate) fn reclaim_ext4(file: &Arc<dyn VfsInode>) -> Result<usize, &'static str> {
+        let ext4 = file.as_any().and_then(|a| a.downcast_ref::<Ext4Inode>()).ok_or("not an ext4 inode")?;
+        ext4.reclaim_dirty_pages(usize::MAX);
+        Ok(ext4.page_cache_lock().lock().len())
     }
 }
 
@@ -876,18 +1038,23 @@ crate::ktest!(
 crate::ktest!(
     fn mapped_page_copies_to_a_frame_under_the_cache_lock() {
         // `MappedPage::copy_to_frame` (a copy-on-write split): the page's
-        // first `valid` bytes, zeros after them, whatever the frame held
-        // before; and the copy holds the owning inode's Lock 5, as the
-        // kernel's writers of the page do: while another thread holds that
-        // lock, a copy started meanwhile waits.
+        // bytes below the file's size, zeros after them (even where a
+        // mapping stored past EOF), whatever the frame held before; and the
+        // copy holds the owning inode's Lock 5, as the kernel's writers of
+        // the page do: while another thread holds that lock, a copy started
+        // meanwhile waits.
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::AtomicU8;
         use lumen_vfs::{DevId, FileSystem};
         let fs = super::tmpfs::Tmpfs::new(DevId::makedev(0, 128), 4 * PAGE_SIZE);
         let f = fs.root_inode().create("cow.bin", 0o644).map_err(|_| "create")?;
-        let bytes: Vec<u8> = (0..PAGE_SIZE).map(|i| (i % 251) as u8 | 1).collect();
-        kassert_eq!(f.write_at(0, &bytes).map_err(|_| "write")?, PAGE_SIZE);
+        let bytes: Vec<u8> = (0..PAGE_SIZE + 1000).map(|i| (i % 251) as u8 | 1).collect();
+        kassert_eq!(f.write_at(0, &bytes).map_err(|_| "write")?, bytes.len());
         let mapped = mmap_page(&f, 0).map_err(|_| "map")?;
+        let tail = mmap_page(&f, 1).map_err(|_| "map tail")?;
+        kassert_eq!((mapped.valid_len(), tail.valid_len()), (PAGE_SIZE, 1000));
+        // A store through a mapping past EOF: in the page, never in a copy.
+        tail.page().write_bytes(1000, &[0x77; 64]);
         let mut dst = frame::alloc_owned().ok_or("dst frame")?;
         let dst_ptr = mm::phys_to_virt(dst.frame().start()).as_mut_ptr::<u8>();
         let read_dst = |out: &mut [u8; PAGE_SIZE]| {
@@ -897,14 +1064,14 @@ crate::ktest!(
         };
         // SAFETY: as above; filling it with junk first.
         unsafe { core::ptr::write_bytes(dst_ptr, 0xa5, PAGE_SIZE) };
-        mapped.copy_to_frame(&mut dst, 1000);
+        tail.copy_to_frame(&mut dst);
         let mut got = [0u8; PAGE_SIZE];
         read_dst(&mut got);
-        kassert!(got[..1000] == bytes[..1000]);
+        kassert!(got[..1000] == bytes[PAGE_SIZE..]);
         kassert!(got[1000..].iter().all(|&b| b == 0));
-        mapped.copy_to_frame(&mut dst, PAGE_SIZE);
+        mapped.copy_to_frame(&mut dst);
         read_dst(&mut got);
-        kassert!(got[..] == bytes[..]);
+        kassert!(got[..] == bytes[..PAGE_SIZE]);
 
         // Hold the cache's lock, start a copy in a thread on this CPU, and
         // let it run: it must still be waiting when the lock is let go.
@@ -914,7 +1081,7 @@ crate::ktest!(
         let (st, mut dst2) = (Arc::clone(&state), frame::alloc_owned().ok_or("dst frame 2")?);
         let copier = crate::sched::spawn("ktest-cow-copy", move || {
             st.store(1, Ordering::Release);
-            mapped.copy_to_frame(&mut dst2, PAGE_SIZE);
+            mapped.copy_to_frame(&mut dst2);
             st.store(2, Ordering::Release);
         })
         .map_err(|_| "spawn")?;

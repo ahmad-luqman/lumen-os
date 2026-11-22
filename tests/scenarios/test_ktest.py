@@ -215,6 +215,8 @@ VFS_EXACT_LINES = {
     # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
     # fills, a good one, a third failed fill), one warning each.
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 2,
+    # mm::user_vm::file_vm_disk_read_error_is_a_bus_error: a fault's fill.
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 2 \(offset 8192\) failed: Io": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 1,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
