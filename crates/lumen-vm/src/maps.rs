@@ -311,7 +311,7 @@ mod tests {
     }
 
     /// Files 7 and 1 resolve; any other id to nothing.
-    fn resolve(id: u64) -> Option<FileInfo<'static>> {
+    fn resolve<'a>(id: u64) -> Option<FileInfo<'a>> {
         match id {
             7 => Some(TMP_FILE),
             1 => Some(DISK_FILE),
@@ -329,7 +329,7 @@ mod tests {
         images: &[ImageRange<FileInfo<'static>>],
     ) -> String {
         let mut out = String::new();
-        write_maps(&mut out, vmas, layout, images, |f| *f, |id| resolve(id)).unwrap();
+        write_maps(&mut out, vmas, layout, images, |f| *f, resolve).unwrap();
         out
     }
 
