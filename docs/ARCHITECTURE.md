@@ -5284,8 +5284,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
    - `fstat(fd)`'s `st_ino` changes when the inode is detached, on ext4 and
      tmpfs alike: both give it a synthetic number with bit 63 set
      (`lumen_vfs::next_detached_ino`, ext4's reasons in step 2 of its list
-     below), never a number a new inode could take. Linux keeps the number;
-     a check from user space accepts either (`m7_vfs`'s `detached_ino`, #254).
+     below), never a number a new inode could take. Linux keeps the number
+     (a deliberate difference); `m7_vfs`'s `detached_ino` (#254) checks
+     Lumen's: a new number, bit 63 set.
    - **An open racing the unlink (#262):** an open raises `open_count` (an
      `OpenGuard`) *before* its last check that the inode is live, and Gate 6
      reads `open_count` and then frees or detaches the inode within one hold
