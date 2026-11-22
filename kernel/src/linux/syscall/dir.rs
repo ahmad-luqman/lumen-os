@@ -987,8 +987,9 @@ fn ktest_churn_dir(parent: &Arc<dyn VfsInode>, name: &str) -> Result<KtestDirAnd
     Ok((dir, file))
 }
 
-/// Busybox `rm -r` over a fresh directory `name` in `parent`
-/// (`libbb/remove_file.c`): `getdents64` 2048 bytes at a time, each entry
+/// A model of busybox `rm -r`'s loop (`libbb/remove_file.c`; busybox
+/// itself can't run it until `unlink` and `lstat` land) over a fresh
+/// directory `name` in `parent`: `getdents64` 2048 bytes at a time, each entry
 /// unlinked as soon as it is read, never a rewind; then `rmdir`, which
 /// fails if an entry was skipped.
 #[cfg(feature = "ktest")]

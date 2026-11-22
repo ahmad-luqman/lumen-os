@@ -3541,8 +3541,9 @@ path from the cwd's inode (`compute_cwd_path`). `chdir` and `fchdir` set
 the cwd (its kept path computed from the inode too, so relative `chdir`s
 never grow it), and `getdents64` lists a directory from its open file's
 `dir_cursor`, the filesystem's own `readdir` cursor (`d_off`: the cursor
-past each entry), which stays stable as entries come and go (section 9),
-so busybox's `rm -r`, reading on while it unlinks, empties a directory;
+past each entry), which stays stable as entries come and go (section 9,
+with ext4's two exceptions there), so a model of busybox `rm -r`'s loop,
+reading on while it unlinks, empties a directory;
 the other M7 numbers not yet wired are stubs (wave 3).
 
 The design #246 set out for this, and the behaviour of each rerouted call:
@@ -3607,7 +3608,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 94 | `lchown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)` |
 | 95 | `umask(mask)` | atomically sets per-process `umask = mask & 0o777` (default `0o022`) and returns previous mask |
 | 162 | `sync()` | snapshots mounted filesystems and cached inodes (never holding `MountTable`/`InodeCache` across I/O), flushes every dirty `PageCache` page and `BlockCache` block followed by `BlockDevice::flush()`; always returns `0` |
-| 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor` (the filesystem's `readdir` cursor, stable as entries come and go; `d_off` the cursor past each record); returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
+| 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor` (the filesystem's `readdir` cursor, stable as entries come and go, with ext4's exceptions in section 9; `d_off` the cursor past each record); returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
 | 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on char devices—including on read-only `devfs`—`-EISDIR` on dirs, `-EROFS` on regular files on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on final symlink without trailing `/` unless `O_PATH` is also set; trailing `/` forces directory traversal even with `O_NOFOLLOW`, matching Linux), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
 | 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o7777) & !umask`, stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
 | 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`) |
@@ -5396,12 +5397,25 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     metadata lock): `stat()`, `lookup(name)`, `create(...)`, `mkdir(...)`,
     `unlink(name)`, `rmdir(name)`, `link(name, target)`, `symlink(name,
     target)`, `readlink()`, `rename(...)`, `readdir(cursor)` (the cursor
-    opaque, each entry's `next_cursor` past the one before, and **stable as
-    entries come and go**: a listing resumed after removals or additions
-    lists every entry that stayed exactly once; tmpfs numbers entries as
-    they are added, ext4 uses an entry's byte position in the directory,
-    procfs and devfs, which nothing writes, an index; a directory removed
-    while open lists as empty; entries pushed before an `Err` are valid),
+    opaque, any value taken without harm, each entry's `next_cursor` past
+    the one before, and **stable as entries come and go**: a listing
+    resumed after removals or additions lists every entry that stayed
+    exactly once. tmpfs numbers entries as they are added (a name keeps
+    its number through a rename over it or an exchange); procfs keys them
+    as Linux does (`/proc`'s pids past its fixed entries, `/proc/<pid>/fd`
+    by fd); devfs, whose entries never change, uses an index; ext4 uses an
+    entry's byte position, as Linux does for a linear directory, which
+    holds because `ext4plus` never moves a record there (a removal merges
+    or zeroes it, an insert takes the first slack with room or a new
+    block), with two exceptions: a rename over a name, or an exchange, is
+    an unlink and a link, so the name that stayed may move behind the
+    cursor (skipped) or ahead (listed again); and in a hashed (htree)
+    directory an insert repacks a leaf block, split or not, moving its
+    records (`ext4plus` never makes one, so only directories made outside
+    Lumen, such as the Alpine image's large ones, are affected). A
+    directory removed while open lists as empty (Linux: `ENOENT`,
+    `IS_DEADDIR`; a deliberate difference); entries pushed before an `Err`
+    are valid),
     `truncate(size)`,
     `set_mode/owner/times(...)`, plus `read_page`/`write_page` feeding
     `PageCache` and `sync()`, `append(buf) -> (pos, n)` (#254b: `O_APPEND`'s

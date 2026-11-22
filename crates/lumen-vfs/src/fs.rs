@@ -143,10 +143,15 @@ pub trait VfsInode: Send + Sync {
     ) -> Result<(), VfsError>;
     /// Push up to `max_entries` of this directory's entries onto `out`,
     /// starting with the first at or after `cursor` (`0`: the start; `.`
-    /// and `..` are listed as entries). Nothing pushed means the end.
+    /// and `..` are listed as entries). With room for one (`max_entries`
+    /// above 0 and `out` not already that long), nothing pushed means the
+    /// end.
     ///
     /// **The cursor** is the filesystem's own, opaque to callers: `0`, or a
-    /// [`DirEntry::next_cursor`] this directory returned. Each entry's
+    /// [`DirEntry::next_cursor`] this directory returned, or any value at
+    /// all (`lseek` lets user space set one): a filesystem must take any
+    /// cursor without harm, listing from the first entry at or past it
+    /// as it orders them. Each entry's
     /// `next_cursor` is greater than `cursor` and than the one before it,
     /// and resumes with the entry after it. It must stay **stable as other
     /// entries come and go**: a listing resumed after entries were removed
@@ -155,11 +160,15 @@ pub trait VfsInode: Send + Sync {
     /// meanwhile). `getdents64` keeps it in `OpenFile::dir_cursor` between
     /// calls, and `lseek` and `d_off` hand it to user space. An index into
     /// the current listing is not enough: a removal before it would shift
-    /// the rest and skip an entry (busybox `rm -r` would leave one behind).
+    /// the rest and skip an entry (busybox `rm -r`'s loop would leave one
+    /// behind). tmpfs numbers entries as they are added, ext4 uses their
+    /// byte positions (with two exceptions, ARCHITECTURE section 9), procfs
+    /// keys them by pid or fd.
     ///
     /// On an `Err`, the entries already pushed are valid: a caller may hand
     /// them on and report the error on its next call. A directory removed
-    /// while open lists as empty.
+    /// while open (detached) lists as empty; a `/proc/<pid>` whose process
+    /// has ended says `ENOENT`.
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError>;
     fn truncate(&self, size: u64) -> Result<(), VfsError>;
     fn set_mode(&self, mode: u16) -> Result<(), VfsError>;
@@ -312,13 +321,14 @@ impl OpenGuard {
         Ok(guard)
     }
 
-    /// Borrow the guarded inode. A clone of the guard (`Clone`) is another
-    /// open reference on it, never refused: the inode is already open.
+    /// Borrow the guarded inode.
     pub fn inode(&self) -> &Arc<dyn VfsInode> {
         &self.inode
     }
 }
 
+/// A clone is another open reference on the same inode, never refused
+/// (unlike [`OpenGuard::try_new`]): the inode is already open.
 impl Clone for OpenGuard {
     fn clone(&self) -> Self {
         Self::new_unchecked(Arc::clone(&self.inode))
