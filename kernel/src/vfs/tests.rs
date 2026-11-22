@@ -48,7 +48,7 @@ crate::ktest!(
         .map_err(|_| "create tail.bin")?;
         let of = OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(
             Arc::clone(&f),
-            Arc::from(path_str.as_str()),
+            Arc::from(path_str),
             OpenFlags::from_bits_truncate(OpenFlags::O_RDWR),
         )
         .map_err(|_| "OpenFile::new_unchecked_flags")?;
@@ -171,8 +171,8 @@ crate::ktest!(
         // Stale unlinked inode with open_count == 0 returns NoEnt (not freed disk reuse).
         let dead_dir = mkdir_at(&tables, None, b"/dead_dir", 0o755, 0).map_err(|_| "mkdir dead_dir")?;
         unlink_at(&tables, None, b"/dead_dir", true).map_err(|_| "rmdir dead_dir")?;
-        kassert!(matches!(dead_dir.create("child", 0o644), Err(VfsError::NoEnt)));
-        kassert!(matches!(dead_dir.lookup("child"), Err(VfsError::NoEnt)));
+        kassert!(matches!(dead_dir.create(b"child", 0o644), Err(VfsError::NoEnt)));
+        kassert!(matches!(dead_dir.lookup(b"child"), Err(VfsError::NoEnt)));
         let mut dead_entries = Vec::new();
         kassert!(matches!(dead_dir.readdir(0, &mut dead_entries, 16), Err(VfsError::NoEnt)));
 
@@ -250,7 +250,7 @@ crate::ktest!(
     fn tmpfs_truncate_returns_quota() {
         use crate::{kassert, kassert_eq};
         let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 121), page_cache::PAGE_SIZE);
-        let f = tfs.root_inode().create("q.bin", 0o644).map_err(|_| "tmpfs create q.bin")?;
+        let f = tfs.root_inode().create(b"q.bin", 0o644).map_err(|_| "tmpfs create q.bin")?;
         let page = vec![0x5Au8; page_cache::PAGE_SIZE];
         kassert_eq!(f.write_at(0, &page).map_err(|_| "write page 0")?, page.len());
         kassert!(matches!(f.write_at(page.len() as u64, &page), Err(VfsError::NoSpc)));
@@ -319,7 +319,7 @@ crate::ktest!(
         let ro = mount_ro_snapshot(&m, 131)?;
         let root = ro.root_inode();
         for (name, byte) in files {
-            let f = root.lookup(name).map_err(|_| "ro lookup sync file")?;
+            let f = root.lookup(name.as_bytes()).map_err(|_| "ro lookup sync file")?;
             kassert_eq!(read_all_inode(&f).map_err(|_| "ro read sync file")?, vec![byte; 4096]);
         }
         Ok(())
@@ -430,7 +430,7 @@ crate::ktest!(
         // 1. tmpfs multi-page -ENOSPC short-write + truncate extend does not leak unwritten data.
         let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 120), page_cache::PAGE_SIZE);
         let root = tfs.root_inode();
-        let f = root.create("short.bin", 0o644).map_err(|_| "tmpfs create short.bin")?;
+        let f = root.create(b"short.bin", 0o644).map_err(|_| "tmpfs create short.bin")?;
         let two_pages = vec![0xA5u8; 2 * page_cache::PAGE_SIZE];
         kassert_eq!(f.write_at(0, &two_pages).map_err(|_| "short write")?, page_cache::PAGE_SIZE);
         kassert_eq!(f.stat().map_err(|_| "stat short")?.size, page_cache::PAGE_SIZE as u64);
@@ -444,13 +444,13 @@ crate::ktest!(
         kassert!(extended.iter().all(|&b| b == 0));
 
         // 2. tmpfs rmdir (open_count == 0) blocks subsequent create/mkdir/symlink with NoEnt.
-        let d = root.mkdir("gone_dir", 0o755).map_err(|_| "mkdir gone_dir")?;
+        let d = root.mkdir(b"gone_dir", 0o755).map_err(|_| "mkdir gone_dir")?;
         kassert_eq!(d.open_count(), 0);
-        root.rmdir("gone_dir").map_err(|_| "rmdir gone_dir")?;
-        kassert!(matches!(d.create("f", 0o644), Err(VfsError::NoEnt)));
-        kassert!(matches!(d.mkdir("sub", 0o755), Err(VfsError::NoEnt)));
-        kassert!(matches!(d.symlink("sym", "/x"), Err(VfsError::NoEnt)));
-        kassert!(matches!(d.lookup("f"), Err(VfsError::NoEnt)));
+        root.rmdir(b"gone_dir").map_err(|_| "rmdir gone_dir")?;
+        kassert!(matches!(d.create(b"f", 0o644), Err(VfsError::NoEnt)));
+        kassert!(matches!(d.mkdir(b"sub", 0o755), Err(VfsError::NoEnt)));
+        kassert!(matches!(d.symlink(b"sym", b"/x"), Err(VfsError::NoEnt)));
+        kassert!(matches!(d.lookup(b"f"), Err(VfsError::NoEnt)));
 
         // 3. AddressSpace::format_maps coalesced .bss + brk emits [heap] at brk_init.
         let elf_img = crate::mm::user_vm::build_relro_test_elf();
@@ -458,7 +458,7 @@ crate::ktest!(
             .map_err(|_| "from_elf")?;
         kassert_eq!(prog.initial_brk, 0x40_4000);
         kassert_eq!(space.brk(0x40_5000), 0x40_5000);
-        let maps = space.format_maps();
+        let maps = space.format_maps_text();
         kassert!(maps.contains("00402000-00404000 rw-p 00000000 00:00 0\n"));
         // `[heap]` after 73 characters, where Linux pads a name to.
         let heap = super::ktest_maps_line("00404000-00405000 rw-p 00000000 00:00 0", "[heap]");
@@ -647,9 +647,9 @@ crate::ktest!(
             Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache")?));
         let ro_fs = ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 14), true).map_err(|_| "ro mount")?;
         let ro_root = ro_fs.root_inode();
-        let ro_dirty = ro_root.lookup("dirty_err.bin").map_err(|_| "ro lookup dirty_err")?;
+        let ro_dirty = ro_root.lookup(b"dirty_err.bin").map_err(|_| "ro lookup dirty_err")?;
         kassert_eq!(read_all_inode(&ro_dirty).map_err(|_| "ro read dirty_err")?, payload);
-        let ro_write = ro_root.lookup("write_err.bin").map_err(|_| "ro lookup write_err")?;
+        let ro_write = ro_root.lookup(b"write_err.bin").map_err(|_| "ro lookup write_err")?;
         kassert_eq!(read_all_inode(&ro_write).map_err(|_| "ro read write_err")?, new_data);
 
         Ok(())
@@ -842,9 +842,9 @@ crate::ktest!(
             Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache")?));
         let ro_fs = ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 16), true).map_err(|_| "ro mount")?;
         let ro_root = ro_fs.root_inode();
-        let ro_trunc = ro_root.lookup("trunc_err.bin").map_err(|_| "ro lookup trunc_err")?;
+        let ro_trunc = ro_root.lookup(b"trunc_err.bin").map_err(|_| "ro lookup trunc_err")?;
         kassert_eq!(read_all_inode(&ro_trunc).map_err(|_| "ro read trunc_err")?, payload_2[..100]);
-        let ro_ren = ro_root.lookup("ren_dst.bin").map_err(|_| "ro lookup ren_dst")?;
+        let ro_ren = ro_root.lookup(b"ren_dst.bin").map_err(|_| "ro lookup ren_dst")?;
         kassert_eq!(read_all_inode(&ro_ren).map_err(|_| "ro read ren_dst")?, b"NEW");
 
         Ok(())
@@ -1334,8 +1334,8 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
         m.fault_cache.arm_write_fail_on(0);
 
         let ro_fs = mount_ro_snapshot(&m, 34)?;
-        let ro_sd = ro_fs.root_inode().lookup("sd").map_err(|_| "ro lookup sd")?;
-        let ro_dd = ro_fs.root_inode().lookup("dd").map_err(|_| "ro lookup dd")?;
+        let ro_sd = ro_fs.root_inode().lookup(b"sd").map_err(|_| "ro lookup sd")?;
+        let ro_dd = ro_fs.root_inode().lookup(b"dd").map_err(|_| "ro lookup dd")?;
         let sd_nlink = sd.stat().map_err(|_| "stat sd")?.nlink;
         let dd_nlink = dd.stat().map_err(|_| "stat dd")?.nlink;
         let ro_sd_nlink = ro_sd.stat().map_err(|_| "ro stat sd")?.nlink;
@@ -1413,8 +1413,8 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
         kassert_eq!(sb.readlink().map_err(|_| "sym_b readlink ex")?, b"/exch/target");
 
         let ro_fs = mount_ro_snapshot(&m, 37)?;
-        let ro_sd = ro_fs.root_inode().lookup("sd").map_err(|_| "ro sd ex")?;
-        let ro_dd = ro_fs.root_inode().lookup("dd").map_err(|_| "ro dd ex")?;
+        let ro_sd = ro_fs.root_inode().lookup(b"sd").map_err(|_| "ro sd ex")?;
+        let ro_dd = ro_fs.root_inode().lookup(b"dd").map_err(|_| "ro dd ex")?;
         let sd_nlink = sd.stat().map_err(|_| "stat sd ex")?.nlink;
         let dd_nlink = dd.stat().map_err(|_| "stat dd ex")?.nlink;
         let ro_sd_nlink = ro_sd.stat().map_err(|_| "ro stat sd ex")?.nlink;
@@ -1511,7 +1511,7 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
         m.fault_cache.arm_write_fail_on(0);
 
         let ro_fs = mount_ro_snapshot(&m, 40)?;
-        let ro_tf = ro_fs.root_inode().lookup("t8k.bin").map_err(|_| "ro t8k")?;
+        let ro_tf = ro_fs.root_inode().lookup(b"t8k.bin").map_err(|_| "ro t8k")?;
         match res {
             Ok(()) => {
                 kassert_eq!(tf.stat().map_err(|_| "stat t8k ok")?.size, 100);
@@ -1559,7 +1559,7 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
         m.fault_cache.arm_write_fail_on(0);
 
         let ro_fs = mount_ro_snapshot(&m, 42)?;
-        let ro_sf = ro_fs.root_inode().lookup("t200.bin").map_err(|_| "ro t200")?;
+        let ro_sf = ro_fs.root_inode().lookup(b"t200.bin").map_err(|_| "ro t200")?;
         match res {
             Ok(()) => {
                 kassert_eq!(sf.stat().map_err(|_| "stat t200 ok")?.size, 100);
@@ -1899,9 +1899,9 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
                 } else {
                     let ro_fs = mount_ro_snapshot(&m, 54)?;
                     let a_ino =
-                        ro_fs.root_inode().lookup("sd").and_then(|d| d.lookup("fa")).map_err(|_| "ro fa pair")?.ino();
+                        ro_fs.root_inode().lookup(b"sd").and_then(|d| d.lookup(b"fa")).map_err(|_| "ro fa pair")?.ino();
                     let b_ino =
-                        ro_fs.root_inode().lookup("dd").and_then(|d| d.lookup("fb")).map_err(|_| "ro fb pair")?.ino();
+                        ro_fs.root_inode().lookup(b"dd").and_then(|d| d.lookup(b"fb")).map_err(|_| "ro fb pair")?.ino();
                     (a_ino, b_ino, None)
                 };
 
@@ -1998,8 +1998,8 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         m.fault_cache.arm_write_fail_on(0);
 
         let ro_fs = mount_ro_snapshot(&m, 57)?;
-        let ro_sd = ro_fs.root_inode().lookup("sd").map_err(|_| "ro sd ex d")?;
-        let ro_dd = ro_fs.root_inode().lookup("dd").map_err(|_| "ro dd ex d")?;
+        let ro_sd = ro_fs.root_inode().lookup(b"sd").map_err(|_| "ro sd ex d")?;
+        let ro_dd = ro_fs.root_inode().lookup(b"dd").map_err(|_| "ro dd ex d")?;
         let sd_nlink = sd.stat().map_err(|_| "stat sd ex d")?.nlink;
         let dd_nlink = dd.stat().map_err(|_| "stat dd ex d")?.nlink;
         let ro_sd_nlink = ro_sd.stat().map_err(|_| "ro stat sd ex d")?.nlink;
@@ -2236,8 +2236,8 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
                     let ro_fs = mount_ro_snapshot(&m, 65)?;
                     let ro_sub = ro_fs
                         .root_inode()
-                        .lookup("dd")
-                        .and_then(|d| d.lookup("sub"))
+                        .lookup(b"dd")
+                        .and_then(|d| d.lookup(b"sub"))
                         .map_err(|_| "ro lookup dual sub")?;
                     if ro_sub.stat().map_err(|_| "ro stat dual sub")?.nlink >= 3 {
                         drop(ro_sub);
@@ -2284,7 +2284,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         let ro_bc: Arc<dyn ext4::BlockCacheBackend> =
             Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(ro_dev, 32).map_err(|_| "ro bc snap_f")?));
         let ro_fs = ext4::Ext4FileSystem::mount(ro_bc, DevId::makedev(0, 67), true).map_err(|_| "ro snap_f")?;
-        ro_fs.root_inode().lookup("sd").and_then(|d| d.lookup("f")).map_err(|_| "ro /sd/f")?.ino()
+        ro_fs.root_inode().lookup(b"sd").and_then(|d| d.lookup(b"f")).map_err(|_| "ro /sd/f")?.ino()
     };
     for &use_from in &[false, true] {
         let m = mount_test_ext4(snap_f.clone(), 68)?;
@@ -2333,10 +2333,10 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
             Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(ro_dev, 32).map_err(|_| "ro bc")?));
         let ro_fs = ext4::Ext4FileSystem::mount(ro_bc, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
         let dir = match dir_name {
-            Some(d) => ro_fs.root_inode().lookup(d).map_err(|_| "ro lookup parent")?,
+            Some(d) => ro_fs.root_inode().lookup(d.as_bytes()).map_err(|_| "ro lookup parent")?,
             None => ro_fs.root_inode(),
         };
-        Ok(dir.lookup(name).map_err(|_| "ro lookup child")?.ino())
+        Ok(dir.lookup(name.as_bytes()).map_err(|_| "ro lookup child")?.ino())
     };
 
     // (A) rename_at2 step-2 Pair(2,3)/From(2) (and Pair(3,4)/From(3) for dir), cold-cache & pinned,
@@ -2595,7 +2595,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
         rename_at2(&m.tables, None, b"/other/mv_sub", None, b"/floor_d/mv_sub", RenameFlags::default())
             .map_err(|_| "rename into floor_d")?;
         let ro_fs = mount_ro_snapshot(&m, 79)?;
-        let ro_fd = ro_fs.root_inode().lookup("floor_d").map_err(|_| "ro floor_d")?;
+        let ro_fd = ro_fs.root_inode().lookup(b"floor_d").map_err(|_| "ro floor_d")?;
         kassert_eq!(ro_fd.stat().map_err(|_| "ro stat floor_d")?.nlink, 3);
         drop(ro_fs);
 
@@ -2637,7 +2637,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
         rename_at2(&m.tables, None, b"/other/mv_sub", None, b"/floor_d/f2", RenameFlags(RenameFlags::EXCHANGE))
             .map_err(|_| "exchange into floor_d")?;
         let ro_fs = mount_ro_snapshot(&m, 81)?;
-        let ro_fd = ro_fs.root_inode().lookup("floor_d").map_err(|_| "ro floor_d ex")?;
+        let ro_fd = ro_fs.root_inode().lookup(b"floor_d").map_err(|_| "ro floor_d ex")?;
         kassert_eq!(ro_fd.stat().map_err(|_| "ro stat floor_d ex")?.nlink, 3);
         drop(ro_fs);
 
@@ -2689,12 +2689,12 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
         m.fault_cache.arm_write_fail_on(0);
         if res.is_err() {
             let ro_fs = mount_ro_snapshot(&m, 84)?;
-            let ro_cp = ro_fs.root_inode().lookup("ceil_p").map_err(|_| "ro ceil_p")?;
+            let ro_cp = ro_fs.root_inode().lookup(b"ceil_p").map_err(|_| "ro ceil_p")?;
             let ro_nlink = ro_cp.stat().map_err(|_| "ro stat ceil_p")?.nlink;
             let ro_swapped = ro_fs
                 .root_inode()
-                .lookup("other")
-                .and_then(|o| o.lookup("f"))
+                .lookup(b"other")
+                .and_then(|o| o.lookup(b"f"))
                 .is_ok_and(|f| f.inode_type() == InodeType::Dir);
             drop((ro_cp, ro_fs));
             if ro_swapped && ro_nlink == 4 {
@@ -2703,7 +2703,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                 rename_at2(&m.tables, None, b"/ceil_p/sub2", None, b"/ceil_p/sub2_mv", RenameFlags::default())
                     .map_err(|_| "same_parent rename on ceil_p")?;
                 let ro_fs2 = mount_ro_snapshot(&m, 85)?;
-                let ro_cp2 = ro_fs2.root_inode().lookup("ceil_p").map_err(|_| "ro ceil_p 2")?;
+                let ro_cp2 = ro_fs2.root_inode().lookup(b"ceil_p").map_err(|_| "ro ceil_p 2")?;
                 kassert_eq!(ro_cp2.stat().map_err(|_| "ro stat ceil_p 2")?.nlink, 3);
                 drop(ro_fs2);
 
@@ -2754,10 +2754,10 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
             Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(ro_dev, 32).map_err(|_| "ro bc")?));
         let ro_fs = ext4::Ext4FileSystem::mount(ro_bc, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
         let dir = match dir_name {
-            Some(d) => ro_fs.root_inode().lookup(d).map_err(|_| "ro lookup parent")?,
+            Some(d) => ro_fs.root_inode().lookup(d.as_bytes()).map_err(|_| "ro lookup parent")?,
             None => ro_fs.root_inode(),
         };
-        Ok(dir.lookup(name).map_err(|_| "ro lookup child")?.ino())
+        Ok(dir.lookup(name.as_bytes()).map_err(|_| "ro lookup child")?.ino())
     };
 
     // (1) Exhaustive Pair(c1, c2) on RENAME_EXCHANGE across dir<->dir, dir<->sym, dir<->file
@@ -3084,14 +3084,14 @@ crate::ktest!(
         const PER_THREAD: usize = 256;
 
         let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 123), 64 * page_cache::PAGE_SIZE);
-        let t = tfs.root_inode().create("a", 0o644).map_err(|_| "tmpfs create")?;
+        let t = tfs.root_inode().create(b"a", 0o644).map_err(|_| "tmpfs create")?;
         kassert_eq!(t.write_at(0, b"xyz"), Ok(3));
         kassert_eq!(t.append(b"12"), Ok((3, 2)));
         kassert_eq!(t.append(b""), Ok((5, 0)));
         kassert_eq!(read_all_inode(&t).map_err(|_| "read tmpfs")?, b"xyz12");
 
         let m = mount_test_ext4(build_minimal_ext4_image_blocks(256), 141)?;
-        let e = m.fs.root_inode().create("ap", 0o644).map_err(|_| "ext4 create")?;
+        let e = m.fs.root_inode().create(b"ap", 0o644).map_err(|_| "ext4 create")?;
         kassert_eq!(e.write_at(0, b"abc"), Ok(3));
         kassert_eq!(e.append(b"de"), Ok((3, 2)));
         kassert_eq!(e.append(b""), Ok((5, 0)));
@@ -3099,7 +3099,7 @@ crate::ktest!(
         drop(e);
         drop(m);
 
-        let shared = tfs.root_inode().create("shared", 0o644).map_err(|_| "tmpfs create shared")?;
+        let shared = tfs.root_inode().create(b"shared", 0o644).map_err(|_| "tmpfs create shared")?;
         let cpus: Vec<usize> =
             (0..crate::arch::MAX_CPUS).filter(|&c| crate::smp::online_lapic_id(c).is_some()).collect();
         let refused = core::sync::atomic::AtomicU32::new(0);

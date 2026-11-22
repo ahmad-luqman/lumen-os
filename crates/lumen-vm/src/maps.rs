@@ -63,8 +63,8 @@ pub struct FileInfo<'a> {
     pub minor: u32,
     /// The file's inode number (`st_ino`).
     pub ino: u64,
-    /// The path it was opened by.
-    pub path: &'a str,
+    /// The path it was opened by, its bytes (#268).
+    pub path: &'a [u8],
     /// Unlinked since: ` (deleted)` follows the path.
     pub deleted: bool,
 }
@@ -157,22 +157,30 @@ struct Line<'a> {
     name: Name<'a>,
 }
 
-/// A writer counting the bytes written through it, for the padding.
-struct Counted<'w, W> {
-    out: &'w mut W,
+/// A line's bytes appended to the listing, counted for the padding: text
+/// through `fmt::Write`, a path's raw bytes through [`Counted::bytes`].
+struct Counted<'w> {
+    out: &'w mut Vec<u8>,
     written: usize,
 }
 
-impl<W: fmt::Write> fmt::Write for Counted<'_, W> {
+impl Counted<'_> {
+    fn bytes(&mut self, b: &[u8]) {
+        self.written += b.len();
+        self.out.extend_from_slice(b);
+    }
+}
+
+impl fmt::Write for Counted<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.written += s.len();
-        self.out.write_str(s)
+        self.bytes(s.as_bytes());
+        Ok(())
     }
 }
 
 impl Line<'_> {
     /// Write the line (with its `\n`).
-    fn write<W: fmt::Write>(&self, out: &mut W) -> fmt::Result {
+    fn write(&self, out: &mut Vec<u8>) -> fmt::Result {
         let (start, end, offset) = (self.start, self.end, self.offset);
         let r = if self.prot.read() { 'r' } else { '-' };
         let w = if self.prot.write() { 'w' } else { '-' };
@@ -192,12 +200,13 @@ impl Line<'_> {
             }
             Name::File(f) => {
                 pad(&mut out)?;
-                // `seq_path(.., "\n")`: a newline in the path as `\012`.
-                for (i, part) in f.path.split('\n').enumerate() {
+                // `seq_path(.., "\n")`: the path's bytes as they are,
+                // UTF-8 or not (#268), but a newline as `\012`.
+                for (i, part) in f.path.split(|&b| b == b'\n').enumerate() {
                     if i > 0 {
                         out.write_str("\\012")?;
                     }
-                    out.write_str(part)?;
+                    out.bytes(part);
                 }
                 if f.deleted {
                     out.write_str(" (deleted)")?;
@@ -210,7 +219,7 @@ impl Line<'_> {
 
 /// The space after the inode, padding to [`NAME_PAD`], and the space
 /// before the name.
-fn pad<W: fmt::Write>(out: &mut Counted<'_, W>) -> fmt::Result {
+fn pad(out: &mut Counted<'_>) -> fmt::Result {
     out.write_char(' ')?;
     while out.written < NAME_PAD {
         out.write_char(' ')?;
@@ -221,9 +230,11 @@ fn pad<W: fmt::Write>(out: &mut Counted<'_, W>) -> fmt::Result {
 /// Write the maps lines of `vmas` (in address order) to `out`: a
 /// file-backed VMA named by `files` (its `file_id` to the file, or `None`),
 /// an anonymous one by `layout` (`[heap]`, `[stack]`) or `images` (each
-/// range's file as `image_file` shows it).
-pub fn write_maps<'a, 'n, W, F, I, R>(
-    out: &mut W,
+/// range's file as `image_file` shows it). Bytes, not text: a path is
+/// written as its bytes, UTF-8 or not. Appending to `out` can't fail: the
+/// result is `Ok`.
+pub fn write_maps<'a, 'n, F, I, R>(
+    out: &mut Vec<u8>,
     vmas: impl IntoIterator<Item = &'a Vma>,
     layout: &MapsLayout,
     images: &'n [ImageRange<F>],
@@ -231,7 +242,6 @@ pub fn write_maps<'a, 'n, W, F, I, R>(
     files: R,
 ) -> fmt::Result
 where
-    W: fmt::Write,
     I: Fn(&'n F) -> FileInfo<'n>,
     R: Fn(u64) -> Option<FileInfo<'n>>,
 {
@@ -287,10 +297,11 @@ mod tests {
     const LAYOUT: MapsLayout = layout(0x40_4000, 0x40_5000);
 
     /// File 7: a file on `/tmp` (device 0:2).
-    const TMP_FILE: FileInfo<'static> = FileInfo { major: 0, minor: 2, ino: 12, path: "/tmp/data.bin", deleted: false };
+    const TMP_FILE: FileInfo<'static> =
+        FileInfo { major: 0, minor: 2, ino: 12, path: b"/tmp/data.bin", deleted: false };
     /// File 1: a file on a disk (device 0xfd:0x101, as Linux prints dm-257).
     const DISK_FILE: FileInfo<'static> =
-        FileInfo { major: 0xfd, minor: 0x101, ino: 1_572_898, path: "/usr/lib/libc.so", deleted: false };
+        FileInfo { major: 0xfd, minor: 0x101, ino: 1_572_898, path: b"/usr/lib/libc.so", deleted: false };
 
     /// No image ranges.
     const NO_IMAGES: &[ImageRange<FileInfo<'static>>] = &[];
@@ -330,9 +341,9 @@ mod tests {
         layout: &MapsLayout,
         images: &[ImageRange<FileInfo<'static>>],
     ) -> String {
-        let mut out = String::new();
+        let mut out = Vec::new();
         write_maps(&mut out, vmas, layout, images, |f| *f, resolve).unwrap();
-        out
+        String::from_utf8(out).unwrap()
     }
 
     /// `fields` followed by `name` at Linux's column (the rule restated, for
@@ -406,9 +417,10 @@ mod tests {
         // A line from a real Linux `cat /proc/self/maps` (64-bit addresses,
         // a 7-digit inode): 53 characters of fields, then 20 spaces.
         let vma = file_id(1, 0x55d0_c5a3_b000, 0x55d0_c5a3_d000, Prot::READ, 0, false);
-        let mut out = String::new();
-        let cat = FileInfo { major: 8, minor: 2, ino: 1_572_898, path: "/usr/bin/cat", deleted: false };
+        let mut out = Vec::new();
+        let cat = FileInfo { major: 8, minor: 2, ino: 1_572_898, path: b"/usr/bin/cat", deleted: false };
         write_maps(&mut out, &[vma], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(cat)).unwrap();
+        let out = String::from_utf8(out).unwrap();
         assert_eq!(out, "55d0c5a3b000-55d0c5a3d000 r--p 00000000 08:02 1572898                    /usr/bin/cat\n");
         assert_eq!(out.find('/'), Some(73));
         // The rule restated agrees.
@@ -419,8 +431,9 @@ mod tests {
     fn fields_wider_than_the_pad_keep_two_spaces_before_the_name() {
         let wide = FileInfo { major: 0xfff, minor: 0xf_ffff, ino: u64::MAX, ..TMP_FILE };
         let vma = file(0x7fff_ffff_e000, 0x7fff_ffff_f000, RW, 0xffff_ffff_ffff_f000, true);
-        let mut out = String::new();
+        let mut out = Vec::new();
         write_maps(&mut out, &[vma], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(wide)).unwrap();
+        let out = String::from_utf8(out).unwrap();
         assert_eq!(
             out,
             "7fffffffe000-7ffffffff000 rw-s fffffffffffff000 fff:fffff 18446744073709551615  /tmp/data.bin\n"
@@ -565,8 +578,8 @@ mod tests {
 
     #[test]
     fn an_unlinked_file_is_deleted_and_a_newline_in_its_path_escaped() {
-        let gone = FileInfo { path: "/tmp/a\nb", deleted: true, ..TMP_FILE };
-        let mut out = String::new();
+        let gone = FileInfo { path: b"/tmp/a\nb", deleted: true, ..TMP_FILE };
+        let mut out = Vec::new();
         write_maps(
             &mut out,
             &[file(0x1000_0000, 0x1000_1000, RW, 0, true)],
@@ -576,7 +589,21 @@ mod tests {
             |_| Some(gone),
         )
         .unwrap();
-        assert_eq!(out, named("10000000-10001000 rw-s 00000000 00:02 12", "/tmp/a\\012b (deleted)"));
+        assert_eq!(out, named("10000000-10001000 rw-s 00000000 00:02 12", "/tmp/a\\012b (deleted)").as_bytes());
+    }
+
+    #[test]
+    fn a_path_that_is_not_utf8_is_written_as_its_bytes() {
+        // #268: the path's bytes as they are (Linux's `seq_path` escapes
+        // only the newline), never a lossy U+FFFD.
+        let odd = FileInfo { path: b"/tmp/\xff\xfe\nx", ..TMP_FILE };
+        let mut out = Vec::new();
+        write_maps(&mut out, &[file(0x1000_0000, 0x1000_1000, RW, 0, true)], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(odd))
+            .unwrap();
+        let mut want = named("10000000-10001000 rw-s 00000000 00:02 12", "").into_bytes();
+        want.pop(); // the newline after the name
+        want.extend_from_slice(b"/tmp/\xff\xfe\\012x\n");
+        assert_eq!(out, want);
     }
 
     #[test]
@@ -705,7 +732,7 @@ mod tests {
         vmas.map_file(MapPlace::Fixed(0x7f00_0000_0000), P, Prot::READ, fm).unwrap();
         vmas.map(MapPlace::Fixed(USER_STACK_BOTTOM), USER_STACK_TOP - USER_STACK_BOTTOM, RW, Backing::Anonymous)
             .unwrap();
-        let exe = FileInfo { major: 0, minor: 1, ino: 33, path: "/bin/prog", deleted: false };
+        let exe = FileInfo { major: 0, minor: 1, ino: 33, path: b"/bin/prog", deleted: false };
         let images = [
             ImageRange { start: 0x40_0000, end: 0x40_2000, offset: 0, file: exe },
             ImageRange { start: 0x40_2000, end: 0x40_3000, offset: 0x1000, file: exe },

@@ -742,11 +742,11 @@ crate::ktest!(
         const PATH: &str = "/tmp/lumen-ktest-spin";
         let elf = spin_elf();
         let tmp = crate::vfs::resolve_path_from_root("/tmp").map_err(|_| "no /tmp")?;
-        let file = tmp.create(NAME, 0o755).map_err(|_| "create")?;
+        let file = tmp.create(NAME.as_bytes(), 0o755).map_err(|_| "create")?;
         let written = file.write_at(0, &elf);
         drop(file);
         let exec = Exec::from_path(PATH);
-        let unlinked = tmp.unlink(NAME);
+        let unlinked = tmp.unlink(NAME.as_bytes());
         kassert_eq!(written, Ok(elf.len()));
         kassert_eq!(unlinked, Ok(()));
         let exec = exec.map_err(|_| "Exec::from_path failed")?;

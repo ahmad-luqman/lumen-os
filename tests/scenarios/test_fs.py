@@ -298,6 +298,7 @@ POSIX_CHECKS = [
     "unlink-while-open",
     "rmdir-while-open",
     "getdents64",
+    "non-utf8-names",
     "pread64-pwrite64",
     "stat-lstat-newfstatat-statx",
     "chmod-chown-umask-utimensat",

@@ -894,7 +894,9 @@ fn ktest_append_from_every_cpu(inode: &alloc::sync::Arc<dyn VfsInode>) -> crate:
     const PER_CPU: usize = 256;
 
     let flags = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_APPEND);
-    let open = || KernelFile::new_unchecked_flags(alloc::sync::Arc::clone(inode), "/append".into(), flags);
+    let open = || {
+        KernelFile::new_unchecked_flags(alloc::sync::Arc::clone(inode), alloc::sync::Arc::from(&b"/append"[..]), flags)
+    };
     let files = [open().map_err(|_| "open A")?, open().map_err(|_| "open B")?];
     let cpus: Vec<usize> = (0..crate::arch::MAX_CPUS).filter(|&c| crate::smp::online_lapic_id(c).is_some()).collect();
     let refused = AtomicU32::new(0);
@@ -942,10 +944,10 @@ crate::ktest!(
         // two open file descriptions on one inode, on tmpfs and on ext4.
         use lumen_vfs::FileSystem;
         let tfs = crate::vfs::tmpfs::Tmpfs::new(DevId::makedev(0, 124), 64 * 4096);
-        let t = tfs.root_inode().create("append", 0o644).map_err(|_| "tmpfs create")?;
+        let t = tfs.root_inode().create(b"append", 0o644).map_err(|_| "tmpfs create")?;
         ktest_append_from_every_cpu(&t)?;
         let efs = crate::vfs::ktest_ext4(142)?;
-        let e = efs.root_inode().create("append", 0o644).map_err(|_| "ext4 create")?;
+        let e = efs.root_inode().create(b"append", 0o644).map_err(|_| "ext4 create")?;
         ktest_append_from_every_cpu(&e)
     }
 );
@@ -975,7 +977,7 @@ crate::ktest!(
         process::in_test_process(move |pid| {
             let dir = mkdir_at(tables, None, b"/tmp/fd-ktest-cwd", 0o755, 0).map_err(|_| "mkdir")?;
             let guard = OpenGuard::try_new(dir).map_err(|_| "guard")?;
-            process::set_current_cwd(process::Cwd::new(guard, "/tmp/fd-ktest-cwd").map_err(|_| "cwd")?);
+            process::set_current_cwd(process::Cwd::new(guard, b"/tmp/fd-ktest-cwd").map_err(|_| "cwd")?);
             let rel = ktest_user_path(0, b"made-here")?;
             let creat = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT);
             let fd = ktest_fd(sys_open(rel, creat, at::reg(0o600)))?;
@@ -1146,7 +1148,7 @@ crate::ktest!(
             let st = crate::vfs::resolve_path_from_root("/tmp/fd-ktest-reg").and_then(|i| i.stat());
             kassert_eq!(st.map(|m| m.mode), Ok(0o644));
             // Its path for `/proc/<pid>/fd`: the dirfd's joined to it.
-            kassert_eq!(current_file(at::reg(4)).map(|f| f.path.clone()).as_deref(), Some("/tmp/fd-ktest-reg"));
+            kassert_eq!(current_file(at::reg(4)).map(|f| f.path.clone()).as_deref(), Some(&b"/tmp/fd-ktest-reg"[..]));
             // lseek(fd, 7, SEEK_CUR) twice: 7, then 14 (swapped, either is
             // `-EINVAL` or `-EBADF`).
             kassert_eq!(call(general::__NR_lseek, high | fd, 7, high | u64::from(general::SEEK_CUR), 0), 7);

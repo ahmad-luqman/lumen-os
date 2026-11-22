@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use lumen_vfs::{FdTable, InodeType, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded};
+use lumen_vfs::{Escaped, FdTable, InodeType, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded};
 
 use crate::keyboard::{Key as KbdKey, KeyCode};
 use crate::klog;
@@ -51,13 +51,13 @@ const CAPTURE_STDOUT_LIMIT: usize = 4096;
 /// `/proc/<pid>/fd` path is joined to.
 pub struct Cwd {
     guard: OpenGuard,
-    path: Arc<str>,
+    path: Arc<[u8]>,
 }
 
 impl Cwd {
     /// The working directory `guard` holds open, its path `path`: `ENOTDIR`
     /// unless it is a directory.
-    pub fn new(guard: OpenGuard, path: &str) -> Result<Self, VfsError> {
+    pub fn new(guard: OpenGuard, path: &[u8]) -> Result<Self, VfsError> {
         if guard.inode().inode_type() != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -68,7 +68,7 @@ impl Cwd {
         self.guard.inode()
     }
 
-    pub fn path(&self) -> &Arc<str> {
+    pub fn path(&self) -> &Arc<[u8]> {
         &self.path
     }
 }
@@ -113,7 +113,7 @@ impl Stdio {
             drop(fds.insert_at(fd, file, false)?);
         }
         let root = crate::vfs::resolve_path_from_root("/")?;
-        Ok(Self { fds, cwd: Cwd::new(OpenGuard::try_new(root)?, "/")? })
+        Ok(Self { fds, cwd: Cwd::new(OpenGuard::try_new(root)?, b"/")? })
     }
 }
 
@@ -337,7 +337,7 @@ fn release_fd(pid: u32, file: FileRef) {
     // Every filesystem keeps lock state today; one that refused would keep
     // this process's locks held.
     if let Err(e) = released {
-        log::error!(target: "linux", "pid {pid}: closing {}: its locks weren't released: {e:?}", file.path);
+        log::error!(target: "linux", "pid {pid}: closing {}: its locks weren't released: {e:?}", Escaped(&file.path));
     }
     if freed {
         locks_released();
@@ -507,7 +507,7 @@ pub fn set_current_cloexec(fd: i32, cloexec: bool) -> Result<(), VfsError> {
 
 /// The current process's working directory: its inode and its stored path
 /// (clones).
-pub fn current_cwd() -> (Arc<dyn VfsInode>, Arc<str>) {
+pub fn current_cwd() -> (Arc<dyn VfsInode>, Arc<[u8]>) {
     with_current(|p| (Arc::clone(p.cwd.inode()), Arc::clone(p.cwd.path())))
 }
 
@@ -587,24 +587,28 @@ pub fn process_open_fds(pid: u32) -> Vec<i32> {
     guard.values().find(|p| p.pid == pid).map(|p| p.fds.iter_open().map(|(fd, _)| fd).collect()).unwrap_or_default()
 }
 
+/// What `/proc/<pid>/fd/<fd>` points at: the open file's inode and the path
+/// it shows, its bytes.
+pub type FdTarget = (Option<Arc<dyn VfsInode>>, Vec<u8>);
+
 /// Snapshot `(Option<Arc<dyn VfsInode>>, display_path)` for `/proc/<pid>/fd/<fd>`:
 /// the open file's inode and the path it was opened by, ` (deleted)` added
 /// once unlinked.
 ///
 /// Releases `ACTIVE_PROCS` before inspecting `VfsInode::stat()` or dropping
 /// the file it cloned.
-pub fn process_fd_target(pid: u32, fd: i32) -> Option<(Option<Arc<dyn VfsInode>>, String)> {
+pub fn process_fd_target(pid: u32, fd: i32) -> Option<FdTarget> {
     let file = {
         let guard = ACTIVE_PROCS.lock();
         let proc = guard.values().find(|p| p.pid == pid)?;
         Arc::clone(&proc.fds.get(fd)?.file)
     };
     let inode = Arc::clone(&file.inode);
-    let mut path = String::from(&*file.path);
+    let mut path = file.path.to_vec();
     drop(file);
     let unlinked = inode.is_detached() || inode.stat().ok().is_some_and(|m| m.nlink == 0);
-    if unlinked && !path.ends_with(" (deleted)") {
-        path.push_str(" (deleted)");
+    if unlinked && !path.ends_with(b" (deleted)") {
+        path.extend_from_slice(b" (deleted)");
     }
     Some((Some(inode), path))
 }
@@ -951,7 +955,7 @@ crate::ktest!(
             for (fd, readable, writable) in [(0, true, false), (1, false, true), (2, false, true)] {
                 let file = current_file(fd).ok_or("a console fd isn't open")?;
                 kassert!(file.inode.is_tty());
-                kassert_eq!(&*file.path, "/dev/console");
+                kassert_eq!(&*file.path, b"/dev/console");
                 kassert_eq!((file.is_readable(), file.is_writable()), (readable, writable));
                 kassert_eq!(current_cloexec(fd), Ok(false));
             }
@@ -959,14 +963,14 @@ crate::ktest!(
             let (cwd, path) = current_cwd();
             let root = crate::vfs::resolve_path_from_root("/").map_err(|_| "resolve /")?;
             kassert!(Arc::ptr_eq(&cwd, &root));
-            kassert_eq!(&*path, "/");
+            kassert_eq!(&*path, b"/");
             kassert_eq!(current_umask(), 0o022);
             // A missing console refuses the whole set (the run's refusal).
             kassert!(matches!(Stdio::open_from(b"/dev/no-such-console"), Err(VfsError::NoEnt)));
             // A working directory must be a directory.
             let console = crate::vfs::resolve_path_from_root("/dev/console").map_err(|_| "resolve the console")?;
             let guard = OpenGuard::try_new(console).map_err(|_| "guard")?;
-            kassert!(matches!(Cwd::new(guard, "/dev/console"), Err(VfsError::NotDir)));
+            kassert!(matches!(Cwd::new(guard, b"/dev/console"), Err(VfsError::NotDir)));
             Ok(())
         })?
     }

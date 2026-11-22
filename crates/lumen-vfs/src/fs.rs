@@ -133,19 +133,22 @@ pub trait VfsInode: Send + Sync {
     }
 
     fn stat(&self) -> Result<Metadata, VfsError>;
-    fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError>;
-    fn create(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError>;
-    fn mkdir(&self, name: &str, mode: u16) -> Result<Arc<dyn VfsInode>, VfsError>;
-    fn unlink(&self, name: &str) -> Result<(), VfsError>;
-    fn rmdir(&self, name: &str) -> Result<(), VfsError>;
-    fn link(&self, name: &str, target: &Arc<dyn VfsInode>) -> Result<(), VfsError>;
-    fn symlink(&self, name: &str, target: &str) -> Result<Arc<dyn VfsInode>, VfsError>;
+    /// Names, here and in `create` to `rename` (and `symlink`'s target),
+    /// are bytes (#268): any but `/` and NUL, UTF-8 or not. A filesystem
+    /// stores and compares them as given, never through a lossy conversion.
+    fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError>;
+    fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError>;
+    fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError>;
+    fn unlink(&self, name: &[u8]) -> Result<(), VfsError>;
+    fn rmdir(&self, name: &[u8]) -> Result<(), VfsError>;
+    fn link(&self, name: &[u8], target: &Arc<dyn VfsInode>) -> Result<(), VfsError>;
+    fn symlink(&self, name: &[u8], target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn readlink(&self) -> Result<Vec<u8>, VfsError>;
     fn rename(
         &self,
-        old_name: &str,
+        old_name: &[u8],
         new_dir: &Arc<dyn VfsInode>,
-        new_name: &str,
+        new_name: &[u8],
         flags: RenameFlags,
     ) -> Result<(), VfsError>;
     /// Push up to `max_entries` of this directory's entries onto `out`,

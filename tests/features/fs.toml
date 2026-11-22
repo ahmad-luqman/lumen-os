@@ -145,3 +145,16 @@ tests = [
     "scenario:test_fs::test_posix_vfs_semantics",
     "scenario:test_fs::test_flock_and_atomic_rename",
 ]
+
+[[feature]]
+name = "Byte-string names through the VFS (#268): a name that is not UTF-8 (on ext4 and tmpfs) is created, listed by readdir and getdents64, looked up, renamed, hard-linked, unlinked and its directory removed once empty, getcwd under it and /proc/<pid>/fd give its bytes, a symlink target that is not UTF-8 is stored as given, /proc/<pid>/maps writes a path as its bytes (a newline as \\012), and text shows a name escaped, never lossily"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+    "cargo:lumen-vm",
+    "ktest:lumen_kernel::vfs::ext4::ext4_names_that_are_not_utf8_are_listed_looked_up_renamed_and_removed",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_lists_names_that_are_not_utf8",
+    "ktest:lumen_kernel::linux::syscall::at::at_start_operations_take_names_that_are_not_utf8",
+    "ktest:lumen_kernel::linux::syscall::at::at_user_path_rules",
+    "scenario:test_fs::test_posix_vfs_semantics",
+]

@@ -314,7 +314,7 @@ mod kt {
     pub(super) fn set_cwd(path: &str) -> R {
         let dir = crate::vfs::resolve_path_from_root(path).map_err(|e| failed("resolve the new cwd", e))?;
         let guard = OpenGuard::try_new(dir).map_err(|e| failed("guard the new cwd", e))?;
-        process::set_current_cwd(process::Cwd::new(guard, path).map_err(|e| failed("the cwd", e))?);
+        process::set_current_cwd(process::Cwd::new(guard, path.as_bytes()).map_err(|e| failed("the cwd", e))?);
         Ok(())
     }
 

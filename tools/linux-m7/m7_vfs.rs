@@ -619,7 +619,7 @@ fn rm_tree(path: &P) -> R {
 /// target. (The scenario runs it both ways round, so each filesystem gets
 /// every check.)
 fn posix(dir: &[u8], other: &[u8]) -> c_int {
-    let checks: [(&str, &dyn Fn() -> R); 14] = [
+    let checks: [(&str, &dyn Fn() -> R); 15] = [
         ("setup", &|| setup(dir, other)),
         ("symlinks-and-eloop", &|| symlinks(dir)),
         ("trailing-slash-nofollow", &|| trailing_slash(dir)),
@@ -628,6 +628,7 @@ fn posix(dir: &[u8], other: &[u8]) -> c_int {
         ("unlink-while-open", &|| unlink_open(dir)),
         ("rmdir-while-open", &|| rmdir_open(dir)),
         ("getdents64", &|| getdents(dir)),
+        ("non-utf8-names", &|| non_utf8(dir)),
         ("pread64-pwrite64", &|| positional(dir)),
         ("stat-lstat-newfstatat-statx", &|| stat_family(dir, other)),
         ("chmod-chown-umask-utimensat", &|| metadata(dir)),
@@ -963,6 +964,82 @@ fn getdents(d: &[u8]) -> R {
     let n = s3(nr::GETDENTS64, f as u64, mptr(&mut buf[..]), 256);
     close(f);
     eq("getdents64 on a file", n, -ENOTDIR)
+}
+
+/// `readlink(path)` gives exactly `want`.
+fn link_is(what: &'static str, path: &P, want: &[u8]) -> R {
+    let mut buf = [0u8; 256];
+    let n = s3(nr::READLINK, path.at(), mptr(&mut buf[..]), buf.len() as u64);
+    ensure(what, n >= 0 && &buf[..n as usize] == want, n)
+}
+
+/// `/proc/self/fd/<fd>`.
+fn proc_fd(fd: i64) -> P {
+    let mut digits = [0u8; 20];
+    let (mut n, mut at) = (fd as u64, digits.len());
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    P::new(&[b"/proc/self/fd/", &digits[at..]])
+}
+
+/// Names are bytes (#268): a file, a directory and a symlink target that
+/// aren't UTF-8 are made, listed, looked up, renamed, read back through
+/// getcwd and `/proc/self/fd`, and removed.
+fn non_utf8(d: &[u8]) -> R {
+    const FILE: &[u8] = b"\xff\xfe-file";
+    const RENAMED: &[u8] = b"\x80-renamed";
+    const DIR: &[u8] = b"\xc3(-dir";
+    const TARGET: &[u8] = b"\xe2\x28\xa1";
+    let u = j(d, b"u");
+    eq("mkdir u", s2(nr::MKDIR, u.at(), 0o755), 0)?;
+    let file = j(u.bytes(), FILE);
+    put(&file, b"x")?;
+    eq("mkdir a non-UTF-8 directory", s2(nr::MKDIR, j(u.bytes(), DIR).at(), 0o755), 0)?;
+    let ln = j(u.bytes(), b"ln");
+    eq("symlink to a non-UTF-8 target", s2(nr::SYMLINK, P::new(&[TARGET]).at(), ln.at()), 0)?;
+    link_is("readlink gives the target's bytes", &ln, TARGET)?;
+    // Listed under their own bytes, each once, with the inode lstat sees.
+    let fd = ok("open u", open(&u, O_RDONLY | O_DIRECTORY, 0))?;
+    let mut got = no_entries::<8>();
+    let n = list(fd, 1024, &mut got);
+    close(fd);
+    let n = n?;
+    eq("u's entries", n as i64, 5)?;
+    for name in [FILE, DIR] {
+        let times = got[..n].iter().filter(|e| &e.name[..e.len] == name).count();
+        eq("a non-UTF-8 name listed once", times as i64, 1)?;
+        let Some(found) = got[..n].iter().find(|e| &e.name[..e.len] == name) else {
+            return Err(Fail { what: "a non-UTF-8 name listed", got: name.len() as i64 });
+        };
+        let ino = st("lstat a listed non-UTF-8 name", lstat(&j(u.bytes(), name)))?.ino();
+        eq("its d_ino", found.ino as i64, ino as i64)?;
+    }
+    // Its open file's path in /proc/self/fd is the bytes it was opened by.
+    let fd = ok("open the file", open(&file, O_RDONLY, 0))?;
+    let r = link_is("/proc/self/fd names the file by its bytes", &proc_fd(fd), file.bytes());
+    close(fd);
+    r?;
+    // getcwd inside the directory gives its name's bytes.
+    let r = (|| {
+        eq("chdir into it", s1(nr::CHDIR, j(u.bytes(), DIR).at()), 0)?;
+        cwd_is("getcwd in a non-UTF-8 directory", j(u.bytes(), DIR).bytes())
+    })();
+    s1(nr::CHDIR, ptr(&b"/\0"[..]));
+    r?;
+    let renamed = j(u.bytes(), RENAMED);
+    eq("rename to another non-UTF-8 name", s2(nr::RENAME, file.at(), renamed.at()), 0)?;
+    eq("the old name gone", st_err(lstat(&file)), -ENOENT)?;
+    holds(&renamed, b"x")?;
+    eq("unlink it", s1(nr::UNLINK, renamed.at()), 0)?;
+    eq("unlink the link", s1(nr::UNLINK, ln.at()), 0)?;
+    eq("rmdir the non-UTF-8 directory", s1(nr::RMDIR, j(u.bytes(), DIR).at()), 0)?;
+    eq("rmdir u once empty", s1(nr::RMDIR, u.at()), 0)
 }
 
 fn positional(d: &[u8]) -> R {

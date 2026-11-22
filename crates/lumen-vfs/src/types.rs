@@ -1,6 +1,6 @@
 //! Core POSIX VFS value types, bitflags, and device/inode identifiers.
 
-use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt;
 use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign};
 
@@ -216,7 +216,8 @@ pub const fn mode_after_chown(inode_type: InodeType, mode: u16) -> u16 {
 pub struct DirEntry {
     pub ino: Ino,
     pub inode_type: InodeType,
-    pub name: String,
+    /// The name's bytes: any but `/` and NUL, UTF-8 or not (#268).
+    pub name: Vec<u8>,
     /// The cursor just past this entry: `readdir` from it resumes with the
     /// next entry. Opaque, greater than the cursor the listing started at,
     /// and stable as other entries come and go (the contract on
@@ -490,5 +491,46 @@ impl AccessMask {
 
     pub const fn wants_exec(self) -> bool {
         (self.0 & Self::X_OK) != 0
+    }
+}
+
+/// A name's or a path's bytes shown as text, never lossily (#268): UTF-8
+/// as it is, except `\` as `\\` and an ASCII control character as `\xNN`,
+/// and each byte that isn't UTF-8 as `\xNN`, so two names never show the
+/// same. `{:?}` puts it in quotes, a `"` in it as `\"`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Escaped<'a>(pub &'a [u8]);
+
+impl Escaped<'_> {
+    fn write(&self, f: &mut fmt::Formatter<'_>, quoted: bool) -> fmt::Result {
+        use fmt::Write as _;
+        for chunk in self.0.utf8_chunks() {
+            for c in chunk.valid().chars() {
+                match c {
+                    '\\' => f.write_str("\\\\")?,
+                    '"' if quoted => f.write_str("\\\"")?,
+                    c if c.is_ascii_control() => write!(f, "\\x{:02x}", c as u8)?,
+                    c => f.write_char(c)?,
+                }
+            }
+            for b in chunk.invalid() {
+                write!(f, "\\x{b:02x}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Escaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write(f, false)
+    }
+}
+
+impl fmt::Debug for Escaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"")?;
+        self.write(f, true)?;
+        f.write_str("\"")
     }
 }

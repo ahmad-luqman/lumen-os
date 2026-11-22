@@ -2,7 +2,6 @@
 //! `link`, `symlink`, `readlink`, `renameat2`) coordinating `resolve_path`,
 //! Lock-9 cache invalidation, Lock-3 `rename_lock`, and Gate 6 detach rules.
 
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -95,7 +94,7 @@ fn evict_zombie_inode(env: &dyn VfsCacheOps, dev: DevId, ino: Ino) {
 fn publish_created_inode(
     env: &dyn VfsCacheOps,
     parent: &Arc<dyn VfsInode>,
-    name: &str,
+    name: &[u8],
     created: Arc<dyn VfsInode>,
     dentry_gen: u64,
     inode_gen: u64,
@@ -174,7 +173,7 @@ fn publish_created_inode(
 fn lookup_and_unify_inode(
     env: &dyn VfsCacheOps,
     parent: &Arc<dyn VfsInode>,
-    name: &str,
+    name: &[u8],
 ) -> Result<Arc<dyn VfsInode>, VfsError> {
     let mut first_inode: Option<Arc<dyn VfsInode>> = None;
     for attempt in 0..=MAX_INODE_RACE_RETRIES {
@@ -214,7 +213,7 @@ fn lookup_and_unify_inode(
 #[must_use = "dropping an Opened gives its open reference back"]
 pub struct Opened {
     guard: OpenGuard,
-    path: Arc<str>,
+    path: Arc<[u8]>,
     flags: OpenFlags,
 }
 
@@ -224,8 +223,8 @@ impl Opened {
         self.guard.inode()
     }
 
-    /// The path as given (lossy: empty if not UTF-8).
-    pub fn path(&self) -> &str {
+    /// The path as given, its bytes (#268).
+    pub fn path(&self) -> &[u8] {
         &self.path
     }
 
@@ -234,7 +233,7 @@ impl Opened {
         self.flags
     }
 
-    pub(crate) fn into_parts(self) -> (OpenGuard, Arc<str>, OpenFlags) {
+    pub(crate) fn into_parts(self) -> (OpenGuard, Arc<[u8]>, OpenFlags) {
         (self.guard, self.path, self.flags)
     }
 }
@@ -260,9 +259,9 @@ pub fn open_inode(
     flags: OpenFlags,
     mode: u16,
     umask: u16,
-) -> Result<(Arc<dyn VfsInode>, String), VfsError> {
+) -> Result<(Arc<dyn VfsInode>, Vec<u8>), VfsError> {
     let (guard, path_str, _) = open_inode_guarded(env, start_dir, path, flags, mode, umask)?.into_parts();
-    Ok((Arc::clone(guard.inode()), String::from(&*path_str)))
+    Ok((Arc::clone(guard.inode()), path_str.to_vec()))
 }
 
 /// [`open_inode`] returning the open reference it took, as an [`Opened`] for
@@ -297,6 +296,9 @@ pub fn open_inode_guarded(
     Err(VfsError::Exist)
 }
 
+/// What one attempt of [`open_inode_guarded`] opened: the reference and the path.
+type OpenedOnce = (OpenGuard, Arc<[u8]>);
+
 /// One attempt of [`open_inode_guarded`]: `Ok(None)` when an `O_CREAT` open
 /// found a file that an unlink freed before the reference went up.
 fn open_once(
@@ -306,13 +308,13 @@ fn open_once(
     flags: OpenFlags,
     mode: u16,
     umask: u16,
-) -> Result<Option<(OpenGuard, Arc<str>)>, VfsError> {
+) -> Result<Option<OpenedOnce>, VfsError> {
     if flags.has_tmpfile() {
         return Err(VfsError::OpNotSupp);
     }
     let _ = flags.access_mode()?;
 
-    let path_str: Arc<str> = Arc::from(core::str::from_utf8(path).unwrap_or_default());
+    let path_str: Arc<[u8]> = Arc::from(path);
 
     if flags.is_path() {
         let resolved = resolve_path(
@@ -332,20 +334,20 @@ fn open_once(
 
         'follow: loop {
             let target = resolve_parent_with_depth(env, cur_start_dir.as_ref(), &cur_path, &mut symlink_depth)?;
-            if target.name == "/" {
+            if target.name == b"/" {
                 if flags.has_excl() {
                     return Err(VfsError::Exist);
                 }
                 break 'follow cross_mounts_down(env, Arc::clone(&target.parent));
             }
-            if target.name == "." || target.name == ".." {
+            if target.name == b"." || target.name == b".." {
                 if flags.has_excl() {
                     return Err(VfsError::Exist);
                 }
                 break 'follow resolve_path_with_depth(
                     env,
                     Some(&target.parent),
-                    target.name.as_bytes(),
+                    &target.name,
                     ResolveFlags { follow_final: !flags.has_nofollow(), empty_path: false, require_dir: true },
                     &mut symlink_depth,
                 )?
@@ -574,7 +576,7 @@ pub fn mkdir_at(
     umask: u16,
 ) -> Result<Arc<dyn VfsInode>, VfsError> {
     let target = resolve_parent(env, start_dir, path)?;
-    if target.name == "/" || target.name == "." || target.name == ".." {
+    if target.name == b"/" || target.name == b"." || target.name == b".." {
         return Err(VfsError::Exist);
     }
     if env.fs_read_only(target.parent.dev_id()) {
@@ -612,16 +614,16 @@ pub fn unlink_at(
     let target = resolve_parent(env, start_dir, path)?;
     // A last component that isn't a name: Linux's `do_unlinkat` says
     // `-EISDIR` for all three; `do_rmdir` tells them apart.
-    if !remove_dir && matches!(target.name.as_str(), "/" | "." | "..") {
+    if !remove_dir && matches!(target.name.as_slice(), b"/" | b"." | b"..") {
         return Err(VfsError::IsDir);
     }
-    if target.name == "/" {
+    if target.name == b"/" {
         return Err(VfsError::Busy);
     }
-    if target.name == "." {
+    if target.name == b"." {
         return Err(VfsError::Inval);
     }
-    if target.name == ".." {
+    if target.name == b".." {
         return Err(VfsError::NotEmpty);
     }
     if env.fs_read_only(target.parent.dev_id()) {
@@ -752,7 +754,7 @@ pub fn link_at(
     // `-ENOENT` (a trailing slash on a free one), then `-EROFS`, then
     // `-EXDEV`, then a directory's `-EPERM`.
     let new_target = resolve_parent(env, new_dir, new_path)?;
-    if new_target.name == "/" || new_target.name == "." || new_target.name == ".." {
+    if new_target.name == b"/" || new_target.name == b"." || new_target.name == b".." {
         return Err(VfsError::Exist);
     }
     match new_target.parent.lookup(&new_target.name) {
@@ -811,10 +813,9 @@ pub fn symlink_at(
     if target.contains(&0) {
         return Err(VfsError::Inval);
     }
-    let target_str = core::str::from_utf8(target).map_err(|_| VfsError::Inval)?;
 
     let parent = resolve_parent(env, new_dir, linkpath)?;
-    if parent.name == "/" || parent.name == "." || parent.name == ".." {
+    if parent.name == b"/" || parent.name == b"." || parent.name == b".." {
         return Err(VfsError::Exist);
     }
     if parent.has_trailing_slash {
@@ -831,7 +832,7 @@ pub fn symlink_at(
     let mut created_sym: Option<Arc<dyn VfsInode>> = None;
     let mut run = || -> Result<(), VfsError> {
         let (dentry_gen, inode_gen) = env.cache_gens();
-        let sym = parent.parent.symlink(&parent.name, target_str)?;
+        let sym = parent.parent.symlink(&parent.name, target)?;
         created_sym = Some(publish_created_inode(env, &parent.parent, &parent.name, sym, dentry_gen, inode_gen));
         Ok(())
     };
@@ -879,7 +880,7 @@ fn is_same_or_descendant(ancestor: &Arc<dyn VfsInode>, candidate: &Arc<dyn VfsIn
         if cur.ino() == target_ino {
             return Ok(true);
         }
-        let parent = cur.lookup("..")?;
+        let parent = cur.lookup(b"..")?;
         if parent.dev_id() == cur.dev_id() && parent.ino() == cur.ino() {
             return Ok(false);
         }
@@ -911,7 +912,7 @@ pub fn rename_at2(
     if dev != new_target.parent.dev_id() {
         return Err(VfsError::XDev);
     }
-    let not_a_name = |name: &str| matches!(name, "/" | "." | "..");
+    let not_a_name = |name: &[u8]| matches!(name, b"/" | b"." | b"..");
     if not_a_name(&old_target.name) {
         return Err(VfsError::Busy);
     }

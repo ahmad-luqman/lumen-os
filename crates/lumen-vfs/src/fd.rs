@@ -59,7 +59,9 @@ pub struct OpenFileId(pub u64);
 pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
     pub id: OpenFileId,
     pub inode: Arc<dyn VfsInode>,
-    pub path: Arc<str>,
+    /// The path it was opened by, its bytes (#268): what `/proc/<pid>/fd`
+    /// reads back, never a lossy copy (that would name another file).
+    pub path: Arc<[u8]>,
     access_mode: AccessMode,
     is_path: bool,
     status_flags: AtomicU32,
@@ -92,7 +94,7 @@ impl<L: VfsLock<u64>> OpenFile<L> {
     /// on ext4 and tmpfs, Lock 5 through `stat()`): never call it holding
     /// this inode's Lock 4 (or another inode's Lock 4 out of `lock_id`
     /// order), any of Locks 5 to 9, or a spinlock.
-    pub fn new_unchecked_flags(inode: Arc<dyn VfsInode>, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
+    pub fn new_unchecked_flags(inode: Arc<dyn VfsInode>, path: Arc<[u8]>, flags: OpenFlags) -> Result<Self, VfsError> {
         flags.access_mode()?;
         Self::build(OpenGuard::try_new(inode)?, path, flags)
     }
@@ -106,7 +108,7 @@ impl<L: VfsLock<u64>> OpenFile<L> {
         Self::build(guard, path, flags)
     }
 
-    fn build(guard: OpenGuard, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
+    fn build(guard: OpenGuard, path: Arc<[u8]>, flags: OpenFlags) -> Result<Self, VfsError> {
         let access_mode = flags.access_mode()?;
         let is_path = flags.is_path();
         let status_bits = if is_path { 0 } else { flags.status_bits() };
@@ -225,7 +227,7 @@ impl<L: VfsLock<u64>> fmt::Debug for OpenFile<L> {
             .field("id", &self.id)
             .field("dev", &self.inode.dev_id())
             .field("ino", &self.inode.ino())
-            .field("path", &self.path)
+            .field("path", &crate::Escaped(&self.path))
             .field("access_mode", &self.access_mode)
             .field("is_path", &self.is_path)
             .finish()
