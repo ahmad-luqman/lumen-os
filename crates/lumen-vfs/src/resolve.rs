@@ -584,7 +584,9 @@ pub fn check_access(
         return Ok(());
     }
 
-    if mask.wants_write() && !inode.exempt_from_rofs() && env.fs_read_only(inode.dev_id()) {
+    // A special file passes on a read-only mount, as `open_inode` agrees
+    // (`InodeType::is_special`, as Linux's `do_faccessat`).
+    if mask.wants_write() && !inode.inode_type().is_special() && env.fs_read_only(inode.dev_id()) {
         return Err(VfsError::RoFs);
     }
 
