@@ -1,12 +1,14 @@
 """Linux x86-64 ring-3 ABI scenarios: entry/exit, syscall/sysretq, SWAPGS,
 IST_DEBUG (CVE-2018-8897), non-fatal ring-3 faults, per-process AddressSpace /
 demand paging / SSE+TLS preemption, 30-syscall table, static musl hello, and
-unmodified Alpine static musl busybox ash built-ins (M6, issues #236-#238)."""
+unmodified Alpine static musl busybox ash built-ins (M6, issues #236-#238), and
+binaries loaded by path from the ext4 rootfs, dynamic ones through PT_INTERP (#255)."""
 
 import re
 
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
+from lumen_harness.rootfs import copy_rootfs
 
 BOOT_TIMEOUT = 60
 
@@ -253,6 +255,50 @@ def test_static_busybox_ash(boot):
 
     m.send_line("exit 0")
     m.expect(r"linux: busybox exit=0 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
+
+    assert CRASH_BEGIN not in m.output
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_dynamic_busybox_from_rootfs(boot, tmp_path):
+    """`linux /path` loads binaries from the ext4 rootfs: Alpine's dynamic
+    `/bin/busybox` runs through its `PT_INTERP` interpreter
+    (`/lib/ld-musl-x86_64.so.1`, mapped at INTERP_BASE with AT_BASE set),
+    and the static `hello` (`build/linux/hello`, copied into the rootfs's
+    `/usr/local/bin`) runs by path too, each exiting 0 with zero leaked
+    frames; a symlink to the interpreter is followed and runs it directly
+    (no PT_INTERP: no AT_BASE); a path naming no file is refused with ENOENT,
+    and a file without an execute bit with EACCES."""
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+
+    m.send_line("linux /bin/busybox echo hi from ld-musl")
+    m.expect(re.compile(r"^hi from ld-musl\r?$", re.MULTILINE), 30)
+    m.expect(r"linux: /bin/busybox exit=0 leaked_frames=0\n", 30)
+    m.expect(r"lumen> ", 10)
+
+    m.send_line("linux /bin/no-such-binary")
+    m.expect(r"linux: cannot read '/bin/no-such-binary': ENOENT \(2\)\n", 10)
+    m.expect(r"lumen> ", 10)
+
+    # A regular file without an execute bit (0644) is refused, as execve(2).
+    m.send_line("linux /etc/passwd")
+    m.expect(r"linux: cannot read '/etc/passwd': EACCES \(13\)\n", 10)
+    m.expect(r"lumen> ", 10)
+
+    m.send_line("linux /usr/local/bin/hello")
+    m.expect(r"hello from static musl on lumen\n", 20)
+    m.expect(r"linux: /usr/local/bin/hello exit=0 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
+
+    # A symlink to the interpreter (Alpine's libc.musl -> ld-musl), followed
+    # and run directly: an ET_DYN without PT_INTERP, so ld-musl starts as a
+    # program, with no program to load it prints its usage and exits 1.
+    m.send_line("linux /lib/libc.musl-x86_64.so.1")
+    m.expect(r"musl libc \(x86_64\)", 20)
+    m.expect(r"linux: /lib/libc.musl-x86_64.so.1 exit=1 leaked_frames=0\n", 20)
     m.expect(r"lumen> ", 10)
 
     assert CRASH_BEGIN not in m.output

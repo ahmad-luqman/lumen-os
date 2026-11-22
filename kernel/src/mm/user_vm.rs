@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec;
 use core::fmt;
 
-use lumen_elf::loader::{ElfLoadError, LoadedElf, PageAction, Perm};
+use lumen_elf::loader::{ElfLoadError, LoadedElf, MappedRange, PageAction, Perm};
 use lumen_elf::stack::{AuxvInfo, InitialStack, StackBuildError, build_initial_stack};
 use lumen_mm::paging::{Attrs, MapError, WalkEnd};
 use lumen_mm::{FRAME_SIZE, PhysFrame, VirtAddr};
@@ -42,6 +42,35 @@ pub struct LoadedProgram {
     pub initial_brk: u64,
 }
 
+/// One ELF image to map: its validated plan and the file bytes its segments
+/// copy from.
+#[derive(Clone, Copy)]
+pub struct ElfImage<'a> {
+    pub plan: &'a LoadedElf,
+    pub bytes: &'a [u8],
+}
+
+/// Which parts of a program's layout collide ([`UserVmError::Layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutClash {
+    /// The main image reaches the user stack or its guard page.
+    MainOnStack,
+    /// The interpreter is not wholly below the user stack's guard page.
+    InterpNotBelowStack,
+    /// The main image and its interpreter overlap.
+    ImagesOverlap,
+}
+
+impl fmt::Display for LayoutClash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            LayoutClash::MainOnStack => "the binary reaches the user stack or its guard page",
+            LayoutClash::InterpNotBelowStack => "the interpreter is not below the user stack's guard page",
+            LayoutClash::ImagesOverlap => "the binary and its interpreter overlap",
+        })
+    }
+}
+
 /// Outcome of [`AddressSpace::handle_page_fault`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultResult {
@@ -59,6 +88,9 @@ pub enum UserVmError {
     OutOfMemory,
     Elf(ElfLoadError),
     Stack(StackBuildError),
+    /// The program's images and stack collide (`EEXIST`, as Linux's
+    /// `MAP_FIXED_NOREPLACE` ELF mappings).
+    Layout(LayoutClash),
     Vm(VmError),
     InvalidArg,
 }
@@ -68,7 +100,7 @@ impl UserVmError {
     pub const fn to_errno(self) -> u32 {
         match self {
             UserVmError::OutOfMemory | UserVmError::Vm(VmError::NoMem) => errno::ENOMEM,
-            UserVmError::Vm(VmError::Exists) => errno::EEXIST,
+            UserVmError::Vm(VmError::Exists) | UserVmError::Layout(_) => errno::EEXIST,
             UserVmError::Vm(VmError::Access) => errno::EACCES,
             UserVmError::Vm(VmError::Misaligned | VmError::InvalidRange) | UserVmError::InvalidArg => errno::EINVAL,
             UserVmError::Elf(_) => errno::ENOEXEC,
@@ -98,6 +130,7 @@ impl fmt::Display for UserVmError {
         match *self {
             UserVmError::OutOfMemory => f.write_str("out of physical frames"),
             UserVmError::Elf(e) => write!(f, "ELF load error: {e}"),
+            UserVmError::Layout(c) => write!(f, "layout error: {c}"),
             UserVmError::Stack(e) => write!(f, "initial stack error: {e}"),
             UserVmError::Vm(e) => write!(f, "VM error: {e}"),
             UserVmError::InvalidArg => f.write_str("invalid argument"),
@@ -165,7 +198,8 @@ impl AddressSpace {
         Ok(Self { root, inner: SleepMutex::new(AddressSpaceInner { vmas: VmaMap::new(), brk, torn_down: false }) })
     }
 
-    /// Parse and load a static ELF64 image into a brand-new [`AddressSpace`].
+    /// Parse and load a static ELF64 image into a brand-new [`AddressSpace`]
+    /// (`PT_INTERP` refused, as in M6).
     ///
     /// On any validation or allocation error, leaves kernel frames unchanged.
     pub fn from_elf(
@@ -175,10 +209,35 @@ impl AddressSpace {
         execfn: &[u8],
         random: [u8; 16],
     ) -> Result<(Self, LoadedProgram), UserVmError> {
-        // Validate ELF and initial stack layout before allocating any page-table root.
-        let (loaded, stack_buf, initial_stack) = prepare_elf_and_stack(image, argv, envp, execfn, random)?;
+        let plan = LoadedElf::parse(image).map_err(UserVmError::Elf)?;
+        Self::from_images(ElfImage { plan: &plan, bytes: image }, None, argv, envp, execfn, random)
+    }
+
+    /// Load a main image and, when it names one, its interpreter into a
+    /// brand-new [`AddressSpace`] (ARCHITECTURE section 8, "Dynamic linking").
+    ///
+    /// `main` is planned by `LoadedElf::parse` or `parse_with_pie_base`
+    /// (`ET_DYN` at `PIE_BASE`, `ET_EXEC` where it says); `interp` by
+    /// `LoadedElf::parse_interp` at `INTERP_BASE`, given exactly when `main`
+    /// has `PT_INTERP` (`InvalidArg` otherwise). With an interpreter,
+    /// `AT_BASE` is its load bias, `AT_PHDR`/`AT_ENTRY` stay the main image's,
+    /// and the process starts at the interpreter's entry; `brk` is always the
+    /// main image's. The images and the user stack with its guard page are
+    /// checked to be disjoint ([`LayoutClash`]) before any frame is mapped.
+    ///
+    /// On any validation or allocation error, leaves kernel frames unchanged.
+    pub fn from_images(
+        main: ElfImage<'_>,
+        interp: Option<ElfImage<'_>>,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        execfn: &[u8],
+        random: [u8; 16],
+    ) -> Result<(Self, LoadedProgram), UserVmError> {
+        // Validate the initial stack before allocating any page-table root.
+        let stack = StackPages::build(main, interp, argv, envp, execfn, random)?;
         let space = Self::new()?;
-        let prog = space.commit_loaded_elf(&loaded, image, &stack_buf, initial_stack)?;
+        let prog = space.commit_loaded_elf(main, interp, &stack)?;
         Ok((space, prog))
     }
 
@@ -201,29 +260,34 @@ impl AddressSpace {
         execfn: &[u8],
         random: [u8; 16],
     ) -> Result<LoadedProgram, UserVmError> {
-        let (loaded, stack_buf, initial_stack) = prepare_elf_and_stack(image, argv, envp, execfn, random)?;
-        self.commit_loaded_elf(&loaded, image, &stack_buf, initial_stack)
+        let plan = LoadedElf::parse(image).map_err(UserVmError::Elf)?;
+        let main = ElfImage { plan: &plan, bytes: image };
+        let stack = StackPages::build(main, None, argv, envp, execfn, random)?;
+        self.commit_loaded_elf(main, None, &stack)
     }
 
+    /// Map `main`, its interpreter if any, and the initial stack into this
+    /// empty address space, starting at the interpreter's entry if there is
+    /// one (else the main image's) with the main image's `brk`.
+    ///
+    /// The images' page ranges and the user stack with its guard page are
+    /// checked to be disjoint before any frame is mapped; on any later error
+    /// every image's pages and the stack's are unmapped and freed.
     fn commit_loaded_elf(
         &self,
-        loaded: &LoadedElf,
-        image: &[u8],
-        stack_buf: &[u8],
-        initial_stack: InitialStack,
+        main: ElfImage<'_>,
+        interp: Option<ElfImage<'_>>,
+        stack: &StackPages,
     ) -> Result<LoadedProgram, UserVmError> {
         let mut inner = self.inner.lock();
         if inner.torn_down || !inner.vmas.is_empty() {
             return Err(UserVmError::InvalidArg);
         }
 
-        let mapped_ranges = loaded.mapped_ranges();
-        let stack_guard_bottom = USER_STACK_BOTTOM - PAGE_SIZE;
-        for range in &mapped_ranges {
-            if range.end > stack_guard_bottom && range.start < USER_STACK_TOP {
-                return Err(UserVmError::Vm(VmError::Exists));
-            }
-        }
+        let main_ranges = main.plan.mapped_ranges();
+        let interp_ranges = interp.map(|i| i.plan.mapped_ranges()).unwrap_or_default();
+        check_layout(&main_ranges, &interp_ranges)?;
+        let mapped_ranges: alloc::vec::Vec<MappedRange> = main_ranges.into_iter().chain(interp_ranges).collect();
 
         let mut new_vmas = VmaMap::new();
         for range in &mapped_ranges {
@@ -231,46 +295,24 @@ impl AddressSpace {
         }
         new_vmas.map_fixed_noreplace(USER_STACK_BOTTOM, USER_STACK_SIZE, Prot::READ | Prot::WRITE)?;
 
-        let brk_limit = if loaded.initial_brk <= MMAP_TOP { MMAP_TOP } else { USER_MAX };
-        let new_brk = Brk::with_limit(loaded.initial_brk, brk_limit)?;
+        let initial_brk = main.plan.initial_brk;
+        // `brk` grows up to the mmap area, or, for an image above it, up to
+        // the stack's guard page (never over it: `Brk::set` stops only at
+        // VMAs, and the guard page is none), or to the top of user space.
+        let brk_limit = if initial_brk <= MMAP_TOP {
+            MMAP_TOP
+        } else if initial_brk < USER_STACK_BOTTOM {
+            USER_STACK_BOTTOM - PAGE_SIZE
+        } else {
+            USER_MAX
+        };
+        let new_brk = Brk::with_limit(initial_brk, brk_limit)?;
 
-        let actions = loaded.plan_pages();
+        let stack_buf = stack.buf.as_slice();
         let active = arch::paging::active_root() == self.root;
         let load_result = (|| -> Result<(), UserVmError> {
-            for action in actions {
-                match action {
-                    PageAction::MapZero { vaddr, page_count, perm } => {
-                        let attrs = prot_to_attrs(perm_to_prot(perm));
-                        for i in 0..page_count {
-                            let va = VirtAddr::new(vaddr + i * PAGE_SIZE).ok_or(UserVmError::InvalidArg)?;
-                            let phys = frame::alloc_zeroed().ok_or(UserVmError::OutOfMemory)?;
-                            // SAFETY: `self.root` is owned by `self`, `inner` lock is held,
-                            // `va` is a fresh lower-half page, and `phys` transfers ownership.
-                            if let Err(err) = unsafe { paging::map_user_page(self.root, va, phys, attrs) } {
-                                // SAFETY: `phys` was never mapped.
-                                unsafe { frame::free(phys) }.expect("freeing unmapped ELF frame");
-                                return Err(match err {
-                                    MapError::OutOfMemory => UserVmError::OutOfMemory,
-                                    _ => UserVmError::InvalidArg,
-                                });
-                            }
-                        }
-                    }
-                    PageAction::UpdatePerm { vaddr, perm } => {
-                        let va = VirtAddr::new(vaddr).ok_or(UserVmError::InvalidArg)?;
-                        let attrs = prot_to_attrs(perm_to_prot(perm));
-                        // SAFETY: `self.root` is owned by `self` and `inner` lock is held.
-                        unsafe { paging::protect_user_page(self.root, va, attrs) }
-                            .map_err(|_| UserVmError::InvalidArg)?;
-                        if active {
-                            arch::paging::invalidate(va);
-                        }
-                    }
-                    PageAction::CopyBytes { vaddr, file_offset, len } => {
-                        let bytes = image.get(file_offset..file_offset + len).ok_or(UserVmError::InvalidArg)?;
-                        self.write_mapped_bytes_locked(vaddr, bytes)?;
-                    }
-                }
+            for image in core::iter::once(main).chain(interp) {
+                self.map_elf_image_locked(image, active)?;
             }
 
             // Eagerly map ONLY the top pages required by `build_initial_stack`.
@@ -307,7 +349,49 @@ impl AddressSpace {
 
         inner.vmas = new_vmas;
         inner.brk = new_brk;
-        Ok(LoadedProgram { entry: loaded.entry, rsp: initial_stack.rsp, initial_brk: loaded.initial_brk })
+        let entry = interp.map_or(main.plan.entry, |i| i.plan.entry);
+        Ok(LoadedProgram { entry, rsp: stack.initial.rsp, initial_brk })
+    }
+
+    /// Map one validated ELF image's pages (`plan.plan_pages()`), copying its
+    /// file bytes from `image.bytes`. The caller holds `inner` and has checked
+    /// the image's ranges are free; on error it unmaps what was mapped.
+    fn map_elf_image_locked(&self, image: ElfImage<'_>, active: bool) -> Result<(), UserVmError> {
+        for action in image.plan.plan_pages() {
+            match action {
+                PageAction::MapZero { vaddr, page_count, perm } => {
+                    let attrs = prot_to_attrs(perm_to_prot(perm));
+                    for i in 0..page_count {
+                        let va = VirtAddr::new(vaddr + i * PAGE_SIZE).ok_or(UserVmError::InvalidArg)?;
+                        let phys = frame::alloc_zeroed().ok_or(UserVmError::OutOfMemory)?;
+                        // SAFETY: `self.root` is owned by `self`, `inner` lock is held,
+                        // `va` is a fresh lower-half page, and `phys` transfers ownership.
+                        if let Err(err) = unsafe { paging::map_user_page(self.root, va, phys, attrs) } {
+                            // SAFETY: `phys` was never mapped.
+                            unsafe { frame::free(phys) }.expect("freeing unmapped ELF frame");
+                            return Err(match err {
+                                MapError::OutOfMemory => UserVmError::OutOfMemory,
+                                _ => UserVmError::InvalidArg,
+                            });
+                        }
+                    }
+                }
+                PageAction::UpdatePerm { vaddr, perm } => {
+                    let va = VirtAddr::new(vaddr).ok_or(UserVmError::InvalidArg)?;
+                    let attrs = prot_to_attrs(perm_to_prot(perm));
+                    // SAFETY: `self.root` is owned by `self` and `inner` lock is held.
+                    unsafe { paging::protect_user_page(self.root, va, attrs) }.map_err(|_| UserVmError::InvalidArg)?;
+                    if active {
+                        arch::paging::invalidate(va);
+                    }
+                }
+                PageAction::CopyBytes { vaddr, file_offset, len } => {
+                    let bytes = image.bytes.get(file_offset..file_offset + len).ok_or(UserVmError::InvalidArg)?;
+                    self.write_mapped_bytes_locked(vaddr, bytes)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Eagerly map a fixed page-aligned user region `[start, start + aligned_len)`
@@ -625,85 +709,88 @@ impl Drop for AddressSpace {
     }
 }
 
-/// Validate ELF64 image and build the exact top stack pages buffer before
-/// allocating any page tables or physical frames.
-fn prepare_elf_and_stack(
-    image: &[u8],
-    argv: &[&[u8]],
-    envp: &[&[u8]],
-    execfn: &[u8],
-    random: [u8; 16],
-) -> Result<(LoadedElf, alloc::vec::Vec<u8>, InitialStack), UserVmError> {
-    let loaded = LoadedElf::parse(image).map_err(UserVmError::Elf)?;
-    let auxv = AuxvInfo::from_loaded(&loaded);
+/// The initial stack's top pages (`argv`, `envp`, `execfn`, `AT_RANDOM`'s
+/// bytes and `auxv`), built before any page table or frame is allocated.
+struct StackPages {
+    buf: alloc::vec::Vec<u8>,
+    initial: InitialStack,
+}
 
-    // Probe required initial stack bytes (and validate no interior NULs) without allocating.
-    let required = match build_initial_stack(&mut [], USER_STACK_TOP, argv, envp, execfn, random, &auxv) {
-        Err(StackBuildError::BufferTooSmall { required, .. }) => required,
-        Err(e) => return Err(UserVmError::Stack(e)),
-        Ok(info) => info.bytes_written,
-    };
-    if (required as u64) > USER_STACK_SIZE {
-        return Err(UserVmError::Stack(StackBuildError::BufferTooSmall {
-            required,
-            available: USER_STACK_SIZE as usize,
-        }));
+impl StackPages {
+    /// The stack for `main` and its interpreter: `AT_BASE` is the
+    /// interpreter's load bias when there is one; `InvalidArg` unless an
+    /// interpreter is given exactly when `main` names one.
+    fn build(
+        main: ElfImage<'_>,
+        interp: Option<ElfImage<'_>>,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        execfn: &[u8],
+        random: [u8; 16],
+    ) -> Result<Self, UserVmError> {
+        let auxv = match (main.plan.has_interp(), interp) {
+            (false, None) => AuxvInfo::from_loaded(main.plan),
+            (true, Some(interp)) => AuxvInfo::from_loaded_with_interp(main.plan, interp.plan.load_bias),
+            _ => return Err(UserVmError::InvalidArg),
+        };
+        // Probe required initial stack bytes (and validate no interior NULs) without allocating.
+        let required = match build_initial_stack(&mut [], USER_STACK_TOP, argv, envp, execfn, random, &auxv) {
+            Err(StackBuildError::BufferTooSmall { required, .. }) => required,
+            Err(e) => return Err(UserVmError::Stack(e)),
+            Ok(info) => info.bytes_written,
+        };
+        if (required as u64) > USER_STACK_SIZE {
+            return Err(UserVmError::Stack(StackBuildError::BufferTooSmall {
+                required,
+                available: USER_STACK_SIZE as usize,
+            }));
+        }
+        let buf_len = lumen_vm::align_up_page((required as u64).max(1)).ok_or(UserVmError::InvalidArg)? as usize;
+        let mut buf = vec![0u8; buf_len];
+        let initial = build_initial_stack(&mut buf, USER_STACK_TOP, argv, envp, execfn, random, &auxv)
+            .map_err(UserVmError::Stack)?;
+        Ok(Self { buf, initial })
     }
-    let buf_len = lumen_vm::align_up_page((required as u64).max(1)).ok_or(UserVmError::InvalidArg)? as usize;
-    let mut stack_buf = vec![0u8; buf_len];
-    let initial_stack = build_initial_stack(&mut stack_buf, USER_STACK_TOP, argv, envp, execfn, random, &auxv)
-        .map_err(UserVmError::Stack)?;
-    Ok((loaded, stack_buf, initial_stack))
+}
+
+/// Refuse a layout where the main image reaches the user stack or its guard
+/// page, the interpreter is not wholly below the guard page (ARCHITECTURE
+/// section 8), or the two overlap (each is already disjoint within itself),
+/// before anything is mapped.
+fn check_layout(main: &[MappedRange], interp: &[MappedRange]) -> Result<(), UserVmError> {
+    let stack_guard_bottom = USER_STACK_BOTTOM - PAGE_SIZE;
+    if main.iter().any(|a| a.end > stack_guard_bottom && a.start < USER_STACK_TOP) {
+        return Err(UserVmError::Layout(LayoutClash::MainOnStack));
+    }
+    if interp.iter().any(|b| b.end > stack_guard_bottom) {
+        return Err(UserVmError::Layout(LayoutClash::InterpNotBelowStack));
+    }
+    if main.iter().any(|a| interp.iter().any(|b| a.start < b.end && b.start < a.end)) {
+        return Err(UserVmError::Layout(LayoutClash::ImagesOverlap));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "ktest")]
 pub(crate) fn build_relro_test_elf() -> alloc::vec::Vec<u8> {
-    use lumen_elf::loader::{EM_X86_64, ET_EXEC, EV_CURRENT, PF_R, PF_W, PF_X, PHDR_MIN_SIZE, PT_LOAD};
-
-    const EHDR_SIZE: usize = 64;
-    const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-    const ELFCLASS64: u8 = 2;
-    const ELFDATA2LSB: u8 = 1;
+    use lumen_elf::loader::{ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD};
 
     // 3 PT_LOAD segments:
     //  0: R-X code at 0x401000..0x401020 (file offset 0x1000, 32 bytes)
     //  1: R-- rodata at 0x402000..0x402800 (file offset 0x2000, 0x800 bytes)
     //  2: RW- data+bss at 0x402800..0x403200 (file offset 0x2800, filesz 0x100, memsz 0xa00)
     // Segments 1 and 2 share boundary page 0x402000 (RELRO union: RW-, neither clobbered).
-    let mut img = vec![0u8; 0x3000];
-    img[0..4].copy_from_slice(&ELF_MAGIC);
-    img[4] = ELFCLASS64;
-    img[5] = ELFDATA2LSB;
-    img[6] = EV_CURRENT;
-    img[0x10..0x12].copy_from_slice(&ET_EXEC.to_le_bytes());
-    img[0x12..0x14].copy_from_slice(&EM_X86_64.to_le_bytes());
-    img[0x14..0x18].copy_from_slice(&u32::from(EV_CURRENT).to_le_bytes());
-    img[0x18..0x20].copy_from_slice(&0x40_1000u64.to_le_bytes());
-    img[0x20..0x28].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes());
-    img[0x34..0x36].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes());
-    img[0x36..0x38].copy_from_slice(&PHDR_MIN_SIZE.to_le_bytes());
-    img[0x38..0x3a].copy_from_slice(&3u16.to_le_bytes());
-
-    let write_phdr = |buf: &mut [u8], idx: usize, flags: u32, off: u64, va: u64, fsz: u64, msz: u64| {
-        let o = EHDR_SIZE + idx * usize::from(PHDR_MIN_SIZE);
-        buf[o..o + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
-        buf[o + 4..o + 8].copy_from_slice(&flags.to_le_bytes());
-        buf[o + 8..o + 16].copy_from_slice(&off.to_le_bytes());
-        buf[o + 16..o + 24].copy_from_slice(&va.to_le_bytes());
-        buf[o + 24..o + 32].copy_from_slice(&va.to_le_bytes());
-        buf[o + 32..o + 40].copy_from_slice(&fsz.to_le_bytes());
-        buf[o + 40..o + 48].copy_from_slice(&msz.to_le_bytes());
-        buf[o + 48..o + 56].copy_from_slice(&PAGE_SIZE.to_le_bytes());
-    };
-
-    write_phdr(&mut img, 0, PF_R | PF_X, 0x1000, 0x40_1000, 0x20, 0x20);
-    write_phdr(&mut img, 1, PF_R, 0x2000, 0x40_2000, 0x800, 0x800);
-    write_phdr(&mut img, 2, PF_R | PF_W, 0x2800, 0x40_2800, 0x100, 0xa00);
-
-    img[0x1000..0x1004].copy_from_slice(&[0x90, 0x90, 0x90, 0xc3]);
-    img[0x2000..0x2008].copy_from_slice(b"RO_PART!");
-    img[0x2800..0x2808].copy_from_slice(b"RW_PART!");
-    img
+    crate::user::build_elf_with_phdrs(
+        ET_EXEC,
+        0x40_1000,
+        &[
+            (PT_LOAD, PF_R | PF_X, 0x1000, 0x40_1000, 0x20, 0x20),
+            (PT_LOAD, PF_R, 0x2000, 0x40_2000, 0x800, 0x800),
+            (PT_LOAD, PF_R | PF_W, 0x2800, 0x40_2800, 0x100, 0xa00),
+        ],
+        0x3000,
+        &[(0x1000, &[0x90, 0x90, 0x90, 0xc3]), (0x2000, b"RO_PART!"), (0x2800, b"RW_PART!")],
+    )
 }
 
 crate::ktest!(

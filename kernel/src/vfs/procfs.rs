@@ -628,7 +628,7 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
     let res_clone = Arc::clone(&result);
 
     let handle = sched::spawn_user_on(0, "procfs-uncached", Arc::clone(&space), move || {
-        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new());
+        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None);
         let checks = (|| -> Result<(), String> {
             let tables = super::tables();
             let name = format!("{pid}");

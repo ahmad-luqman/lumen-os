@@ -129,9 +129,9 @@ pub struct ProcessState {
     pub stdout: Vec<u8>,
     /// The process's address space, for `/proc/<pid>/maps`.
     pub address_space: Option<Arc<AddressSpace>>,
-    /// The executable's path for `/proc/<pid>/exe`; only `vfstest
-    /// dev-tmp-proc`'s checks (and the ktests running them) set it until
-    /// `linux /path` loads from the VFS (#255).
+    /// The executable's path for `/proc/<pid>/exe`: set by `linux /path`
+    /// (the path as typed) and by `vfstest dev-tmp-proc`'s checks (and the
+    /// ktests running them).
     pub exe_path: Option<String>,
     /// VFS files open on descriptors, with the path each was opened by, for
     /// `/proc/<pid>/fd`: a stand-in for the 1024-entry FD table that #254
@@ -157,6 +157,7 @@ impl ProcessState {
         allow_test_syscalls: bool,
         stdin: Vec<u8>,
         address_space: Option<Arc<AddressSpace>>,
+        exe_path: Option<String>,
     ) -> Self {
         let mut fds = [FdKind::Closed; MAX_FDS];
         fds[0] = FdKind::Stdin;
@@ -176,7 +177,7 @@ impl ProcessState {
             exit: None,
             stdout: Vec::new(),
             address_space,
-            exe_path: None,
+            exe_path,
             vfs_fds: BTreeMap::new(),
             stdin,
             stdin_pos: 0,
@@ -230,12 +231,14 @@ fn current_kernel_tid() -> u64 {
     sched::running_here().expect("ring-3 syscall/exception requires a running thread").0
 }
 
-/// Register a fresh [`ProcessState`] for the current user thread and return its PID.
-pub fn register_current(io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>) -> u32 {
+/// Register a fresh [`ProcessState`] for the current user thread, with the
+/// executable's path for `/proc/<pid>/exe` if it was loaded by path, and
+/// return its PID.
+pub fn register_current(io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>, exe_path: Option<String>) -> u32 {
     let ktid = current_kernel_tid();
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let address_space = sched::current_address_space();
-    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin, address_space);
+    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin, address_space, exe_path);
     let prev = ACTIVE_PROCS.lock().insert(ktid, state);
     debug_assert!(prev.is_none(), "ring-3 process registered twice on thread {ktid}");
     pid
@@ -285,7 +288,8 @@ pub fn process_exe_path(pid: u32) -> Option<String> {
     guard.values().find(|p| p.pid == pid).and_then(|p| p.exe_path.clone())
 }
 
-/// Set the canonical executable path on the current [`ProcessState`].
+/// Set the executable's path on the current [`ProcessState`], as given (not
+/// resolved: symlinks and `..` stay).
 pub fn set_current_exe_path(path: &str) {
     let Some(ktid) = sched::running_here().map(|id| id.0) else {
         return;

@@ -6,10 +6,12 @@
 //! Re-exports the UAPI modules so ring-3 syscall and ELF loader modules share
 //! one canonical ABI surface.
 
+pub mod exec;
 pub mod modules;
 pub mod process;
 pub mod syscall;
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -19,9 +21,9 @@ use alloc::vec::Vec;
 pub use linux_raw_sys::{auxvec, ctypes, errno, general, ioctl, prctl, system};
 
 use crate::arch;
+use crate::linux::exec::{Exec, ExecError};
 use crate::linux::process::ConsoleIo;
 use crate::mm::frame;
-use crate::mm::user_vm::AddressSpace;
 use crate::shell::Ctx;
 use crate::term::Place;
 use crate::user::{UserExit, run_elf_process};
@@ -206,8 +208,48 @@ fn at_random_bytes() -> [u8; 16] {
     out
 }
 
-/// Shell command: `linux` (list available Limine Linux binaries) or
-/// `linux <name> [args...]` (load and run a static Linux x86-64 ELF64 binary).
+/// Why [`run_exec`] did not run a program to its end.
+#[derive(Debug)]
+enum RunError {
+    /// It could not be loaded.
+    Load(ExecError),
+    /// Its thread could not be started.
+    Run(&'static str),
+}
+
+/// Load `exec` and run it in ring 3 on `io` until it ends, on a thread named
+/// `thread_name`, with its path (when it was read by path) recorded for
+/// `/proc/<pid>/exe`: how it ended and how many frames it leaked, counted
+/// around the load and the run (every file was read when `exec` was made,
+/// so the page cache's frames are not counted).
+fn run_exec(
+    exec: &Exec,
+    thread_name: &'static str,
+    argv: &[&[u8]],
+    execfn: &[u8],
+    io: ConsoleIo,
+) -> Result<(UserExit, i64), RunError> {
+    let envp: [&[u8]; 3] = [b"PATH=/bin:/usr/bin", b"HOME=/", b"TERM=vt100"];
+    let random = at_random_bytes();
+
+    // Pre-warm kernel heap so process/VMA/stack metadata reuses mapped heap
+    // pages and physical frame accounting reflects only user-space frames.
+    let _warm: Vec<u8> = vec![0u8; 32 * 1024];
+    drop(_warm);
+
+    let frames_before = frame::free_frames();
+    let (space, prog) = exec.load(argv, &envp, execfn, random).map_err(RunError::Load)?;
+    let space = Arc::new(space);
+    let exe_path = exec.exe_path().map(String::from);
+    let exit = run_elf_process(thread_name, space, prog.entry, prog.rsp, io, exe_path).map_err(RunError::Run)?;
+    let frames_after = frame::free_frames();
+    Ok((exit, frames_before as i64 - frames_after as i64))
+}
+
+/// Shell command: `linux` (list available Limine Linux binaries),
+/// `linux <name> [args...]` (load and run a Linux x86-64 ELF64 boot module),
+/// or `linux /path [args...]` (load and run a static or dynamically linked
+/// ELF64 binary from the VFS, its `PT_INTERP` interpreter too).
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     if args.is_empty() {
@@ -235,32 +277,27 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     };
 
     let name = &args[0];
-    let Some(module) = modules::find(name) else {
-        return ctx.fail(format_args!("linux: unknown binary '{name}' (run 'linux' to list)"));
+    // Every file, the interpreter's too, is read here, before frames are counted.
+    let (exec, thread_name) = if name.starts_with('/') {
+        (Exec::from_path(name), "linux")
+    } else {
+        let Some(module) = modules::find(name) else {
+            return ctx.fail(format_args!("linux: unknown binary '{name}' (run 'linux' to list)"));
+        };
+        (Exec::from_image(Cow::Borrowed(module.bytes)), module.name)
+    };
+    let exec = match exec {
+        Ok(exec) => exec,
+        Err(e @ ExecError::Read { .. }) => return ctx.fail(format_args!("linux: {e}")),
+        Err(e) => return ctx.fail(format_args!("linux: failed to load '{name}': {e}")),
     };
 
     let argv: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
-    let envp: [&[u8]; 3] = [b"PATH=/bin:/usr/bin", b"HOME=/", b"TERM=vt100"];
-    let execfn = name.as_bytes();
-    let random = at_random_bytes();
-
-    // Pre-warm kernel heap so process/VMA/stack metadata reuses mapped heap
-    // pages and physical frame accounting reflects only user-space frames.
-    let _warm: Vec<u8> = vec![0u8; 32 * 1024];
-    drop(_warm);
-
-    let frames_before = frame::free_frames();
-    let (space, prog) = match AddressSpace::from_elf(module.bytes, &argv, &envp, execfn, random) {
-        Ok(loaded) => loaded,
-        Err(e) => return ctx.fail(format_args!("linux: failed to load '{name}': {e}")),
+    let (exit, leaked_frames) = match run_exec(&exec, thread_name, &argv, name.as_bytes(), io) {
+        Ok(ran) => ran,
+        Err(RunError::Load(e)) => return ctx.fail(format_args!("linux: failed to load '{name}': {e}")),
+        Err(RunError::Run(e)) => return ctx.fail(format_args!("linux: failed to run '{name}': {e}")),
     };
-    let space = Arc::new(space);
-    let exit = match run_elf_process(module.name, space, prog.entry, prog.rsp, io) {
-        Ok(exit) => exit,
-        Err(e) => return ctx.fail(format_args!("linux: failed to run '{name}': {e}")),
-    };
-    let frames_after = frame::free_frames();
-    let leaked_frames = frames_before as i64 - frames_after as i64;
 
     match exit {
         UserExit::Exited(code) => {
@@ -582,6 +619,82 @@ crate::ktest!(
         crate::kassert_eq!(offset_of!(general::flock, l_len), 16);
         crate::kassert_eq!(offset_of!(general::flock, l_pid), 24);
 
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn linux_path_route_records_exe_path() {
+        // `linux /path`'s route (`Exec::from_path`, `run_exec`,
+        // `run_elf_process`, `spawn_ring3_on`, `register_current`): while the
+        // program runs, its process carries the path, read from the kernel
+        // side; then it exits 0.
+        use crate::linux::process::{active_pids, process_address_space, process_exe_path};
+        use crate::sync::SpinLock;
+        use crate::user::copy_to_user;
+        use crate::{kassert, kassert_eq};
+        use lumen_elf::loader::{ET_EXEC, PF_R, PF_W, PF_X, PT_LOAD};
+
+        const NAME: &str = "lumen-ktest-spin";
+        const PATH: &str = "/tmp/lumen-ktest-spin";
+        const FLAG: u64 = 0x40_2000;
+        // Spin until the word at FLAG is non-zero, then exit_group(0).
+        let mut code = vec![0xf3, 0x90, 0x48, 0xb8]; // loop: pause; mov rax, FLAG
+        code.extend_from_slice(&FLAG.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x8b, 0x00, 0x48, 0x85, 0xc0, 0x74, 0xec]); // mov rax, [rax]; test; jz loop
+        code.extend_from_slice(&[0xb8, 0xe7, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, 0x0f, 0x0b]); // exit_group(0); ud2
+        let elf = crate::user::build_elf_with_phdrs(
+            ET_EXEC,
+            0x40_1000,
+            &[
+                (PT_LOAD, PF_R | PF_X, 0x1000, 0x40_1000, code.len() as u64, code.len() as u64),
+                (PT_LOAD, PF_R | PF_W, 0x2000, FLAG, 0, 0x1000),
+            ],
+            0x2000,
+            &[(0x1000, &code)],
+        );
+        let tmp = crate::vfs::resolve_path_from_root("/tmp").map_err(|_| "no /tmp")?;
+        let file = tmp.create(NAME, 0o755).map_err(|_| "create")?;
+        let written = file.write_at(0, &elf);
+        drop(file);
+        let exec = Exec::from_path(PATH);
+        let unlinked = tmp.unlink(NAME);
+        kassert_eq!(written, Ok(elf.len()));
+        kassert_eq!(unlinked, Ok(()));
+        let exec = exec.map_err(|_| "Exec::from_path failed")?;
+
+        type Ran = Result<(UserExit, i64), RunError>;
+        let slot: Arc<SpinLock<Option<Ran>>> = Arc::new(SpinLock::new(None));
+        let out = slot.clone();
+        let runner = crate::sched::spawn("exe-route", move || {
+            let ran = run_exec(&exec, "exe-route", &[PATH.as_bytes()], PATH.as_bytes(), ConsoleIo::Capture);
+            *out.lock() = Some(ran);
+        })
+        .map_err(|_| "spawn")?;
+
+        let deadline = crate::time::now_ns() + 5_000_000_000;
+        let mut seen = None;
+        while seen.is_none() && crate::time::now_ns() < deadline {
+            seen = active_pids().first().map(|&pid| (pid, process_exe_path(pid), process_address_space(pid)));
+            if seen.is_none() {
+                crate::sched::yield_now();
+            }
+        }
+        // Let it exit whatever was seen, so the threads always end.
+        let released = match seen.as_ref().and_then(|(_, _, space)| space.clone()) {
+            Some(space) => {
+                let _active = crate::sched::UserSpaceGuard::enter(space);
+                copy_to_user(FLAG, &1u64.to_le_bytes()).is_ok()
+            }
+            None => false,
+        };
+        runner.join();
+        let ran = slot.lock().take();
+        let (pid, path, _) = seen.ok_or("the process never registered")?;
+        kassert!(released);
+        kassert_eq!(path.as_deref(), Some(PATH));
+        kassert!(matches!(ran, Some(Ok((UserExit::Exited(0), _)))));
+        kassert_eq!(process_exe_path(pid), None);
         Ok(())
     }
 );

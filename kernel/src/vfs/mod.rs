@@ -655,9 +655,17 @@ fn vfs_pattern_byte(idx: usize) -> u8 {
 /// the kernel.
 const READ_ALL_MAX: usize = WRITE_PATTERN_MAX;
 
-/// A whole file's bytes, refused with `EFBIG` past [`READ_ALL_MAX`].
+/// A whole file's bytes, refused with `EFBIG` past [`READ_ALL_MAX`] (by its
+/// size before reading, and again if it grows while read) and with `ENOMEM`
+/// when the heap can't hold them: the buffer is reserved from the file's
+/// size (nothing for one that reports 0, as procfs's do) and grown fallibly.
 fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
+    let size = inode.stat()?.size;
+    if size > READ_ALL_MAX as u64 {
+        return Err(VfsError::FBig);
+    }
     let mut out = Vec::new();
+    out.try_reserve_exact(size as usize).map_err(|_| VfsError::NoMem)?;
     let mut off = 0u64;
     let mut buf = [0u8; 4096];
     loop {
@@ -668,10 +676,24 @@ fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
         if out.len() + n > READ_ALL_MAX {
             return Err(VfsError::FBig);
         }
+        out.try_reserve(n).map_err(|_| VfsError::NoMem)?;
         out.extend_from_slice(&buf[..n]);
         off += n as u64;
     }
     Ok(out)
+}
+
+/// An executable file's bytes by absolute path from `/` (symlinks
+/// followed), for `linux /path` and the interpreter its binary names:
+/// `EACCES` for anything but a regular file with an execute bit (as
+/// `execve(2)`, where root too needs one), `EFBIG` past [`READ_ALL_MAX`],
+/// `ENOMEM` when the heap can't hold it.
+pub(crate) fn read_executable(path: &str) -> Result<Vec<u8>, VfsError> {
+    let inode = resolve_path_from_root(path)?;
+    if inode.inode_type() != InodeType::File || inode.stat()?.mode & 0o111 == 0 {
+        return Err(VfsError::Acces);
+    }
+    read_all_inode(&inode)
 }
 
 /// Makes `run_dev_tmp_proc_checks`'s process fail its first check, for the
@@ -945,7 +967,7 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     let res_clone = Arc::clone(&result);
 
     let handle = sched::spawn_user_on(0, "vfstest-proc", space_for_thread, move || {
-        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new());
+        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None);
         // `/proc/<pid>` and `/proc/<pid>/fd/3` as resolved while they exist,
         // for checking what they say once the process and fd are gone.
         let mut proc_nodes: Option<(Arc<dyn VfsInode>, Arc<dyn VfsInode>)> = None;

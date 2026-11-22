@@ -669,10 +669,12 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   - Static ELF `PT_LOAD` segments map at their `p_vaddr`; PIE binaries map at
     `PIE_BASE = 0x0000_5555_5555_4000`, and M7's dynamic linker (`ld-musl`)
     maps upward at and above `INTERP_BASE = 0x0000_7f00_0000_0000` (disjoint
-    from `[..., MMAP_TOP)` and strictly below `USER_STACK_BOTTOM`).
+    from `[..., MMAP_TOP)` and wholly below the user stack's guard page,
+    which the loader enforces).
   - `brk` starts page-aligned immediately above the highest loaded main-binary
     ELF segment and tracks a byte-granular cursor upward up to the next VMA
-    (capped away from `mmap`).
+    (capped away from `mmap`, and, for a main binary above `MMAP_TOP`, below
+    the user stack's guard page).
   - Anonymous (M6) and file-backed (M7) `mmap` regions allocate top-down below
     `MMAP_TOP = 0x0000_7f00_0000_0000`.
   - Initial user stack top: `USER_STACK_TOP = 0x0000_7fff_f000_0000`, with an
@@ -3526,7 +3528,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
   `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64`, `sysinfo`,
   and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery.
 
-### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` designed in #246, M7)
+### ELF64 loader and initial stack (static M6 built #234/#237; dynamic `PT_INTERP` loader built #255; file-backed segments and `dlopen` designed in #246, M7)
 
 - **Validation (`crates/lumen-elf`, host-tested):**
   checks ELF64 little-endian `ET_EXEC` (or `ET_DYN` PIE), `EM_X86_64`, no
@@ -3561,7 +3563,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
   `pwd`, `export`, arithmetic, loops, and `exit` over serial without job
   control). Interactive `lineedit`, pipes, and external subprocesses require
   `fork`/`pipe`/`dup2`/`wait4`/PTYs and arrive in M8.
-- **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`, designed in #246, M7):**
+- **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`; the loader built in #255, designed in #246; file-backed mappings and `dlopen` still designed, M7):**
   - **`crates/lumen-elf` parser extension:** `LoadedElf::parse_with_pie_base(image, pie_base)`
     accepts an optional `PT_INTERP` header (at most one; rejects duplicate
     `PT_INTERP`, `p_filesz <= 1` (empty or NUL-only), `p_filesz > PATH_MAX`,
@@ -3574,22 +3576,25 @@ corresponding `*at(AT_FDCWD, ...)` handler):
     (`phdr_vaddr.is_some()`, required by `ld-musl` to locate `PT_DYNAMIC`).
   - **Interpreter loading:** when `interp_path` is `Some(path)` (e.g.
     `"/lib/ld-musl-x86_64.so.1"`), the kernel resolves and reads the interpreter
-    file from VFS (returning `-ENOENT`/`-ELIBBAD` if absent or invalid) and
+    file from VFS (returning `-ENOENT` if absent, `-EACCES` if it is not a
+    regular file with an execute bit, `-ELIBBAD` if invalid) and
     parses it with `ET_DYN` base `INTERP_BASE = 0x0000_7f00_0000_0000` (computing
     `load_bias = base.checked_sub(align_down(min_vaddr))`, matching Linux
     `load_elf_interp`; equals `INTERP_BASE` when `min_vaddr == 0`, as in
-    `ld-musl`, placing it at and above `MMAP_TOP` and strictly below
-    `USER_STACK_BOTTOM`). The interpreter must be `ET_DYN` and must **not**
-    itself carry `PT_INTERP` (rejected with `NestedInterp`). Both the main
-    binary's and the interpreter's mapped page ranges are verified to be
-    pairwise disjoint and disjoint from the user stack + guard page before
-    committing any frames.
+    `ld-musl`, placing it at and above `MMAP_TOP` and strictly below the
+    user stack's guard page, which the loader enforces). The interpreter must
+    be `ET_DYN` and must **not** itself carry `PT_INTERP` (rejected with
+    `NestedInterp`). Both the main binary's and the interpreter's mapped page
+    ranges are verified to be pairwise disjoint and disjoint from the user
+    stack + guard page before committing any frames (`LayoutClash`,
+    `-EEXIST`, as Linux's `MAP_FIXED_NOREPLACE` ELF mappings).
   - **M6 `test_bad_elf_rejected` compatibility:** static-only
     `AddressSpace::from_elf` continues to reject `PT_INTERP` (returning
     `ElfLoadError::DynamicInterpreterUnsupported`) so M6's `usertest bad_elf` /
-    `test_bad_elf_rejected` passes unchanged, while the new VFS-backed
-    `AddressSpace::from_elf_with_interp` loads dynamic executables and M7 adds
-    tests for malformed/duplicate/empty/nested `PT_INTERP`.
+    `test_bad_elf_rejected` passes unchanged, while `linux::exec::Exec` (#255)
+    reads the binary and its interpreter from the VFS, parses each once, and
+    loads both with `AddressSpace::from_images(main, interp)`; M7 adds tests
+    for malformed/duplicate/empty/nested `PT_INTERP`.
   - **Auxiliary vector and entry point for dynamic binaries:**
     - `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, and `AT_ENTRY` describe the **main
       binary** (never the interpreter).
@@ -5312,8 +5317,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `DentryCache` or `InodeCache` (`cacheable()` is `false`), so each lookup
     asks `procfs` whether the process or fd still exists. Nor is `self`,
     which names whichever process asks.
-  - `/proc/<pid>/exe` → symlink to the process's canonical executable path
-    (e.g. `/bin/busybox`).
+  - `/proc/<pid>/exe` → symlink to the executable's path as given to
+    `linux /path` (e.g. `/bin/busybox`; not resolved: Linux's resolved path
+    once `readlink` lands, #254).
   - `/proc/<pid>/fd` → directory of **magic symlinks** `0`, `1`, `2`, ...:
     `readlink` returns each open FD's path (appending ` (deleted)` if
     unlinked), while traversing `/proc/<pid>/fd/<n>` (e.g. `open`/`stat`)
@@ -5362,11 +5368,13 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `truncate`, `chmod`, `mkdir`, `rmdir`, `unlink`, `rename`, `symlink`,
     `readlink`, `dev-tmp-proc`) that
     the scenarios drive until the Linux syscalls are wired (#254).
-  - `linux /path/to/bin [args...]`: when `args[0]` begins with `/`, loads the
-    static or dynamic (`PT_INTERP`) ELF from VFS (resolving symlinks and
-    recording `exe_path` for `/proc/self/exe` and `/proc/self/maps`) and runs
-    it in ring 3. Commands without a leading `/` continue to use M6's Limine
-    boot-module lookup (`linux hello`, `linux busybox ash -s`).
+  - `linux /path/to/bin [args...]` (built in #255): when `args[0]` begins
+    with `/`, loads the static or dynamic (`PT_INTERP`) ELF from VFS
+    (following symlinks; a regular file with an execute bit, else `EACCES`),
+    records the path as given (not resolved) as `exe_path`, which
+    `/proc/<pid>/exe` reads, and runs it in ring 3. Commands without a leading
+    `/` continue to use M6's Limine boot-module lookup (`linux hello`,
+    `linux busybox ash -s`).
 
 ### Global lock ordering (M7–M8)
 
