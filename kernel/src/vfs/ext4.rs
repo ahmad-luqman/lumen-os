@@ -5,7 +5,9 @@
 //! PageCache -> Lock 6 Ext4 -> Lock 7 BlockCache -> Lock 8 BlockDevice`),
 //! Gate 6 open-unlinked detach to `PageCache`, `>= 60B` block symlinks +
 //! `<= 60B` inline symlink `readlink`/`unlink` workarounds, truncate tail
-//! zeroing, and explicit `rmdir` / `rename` (`0`, `NOREPLACE`, `EXCHANGE`).
+//! zeroing, explicit `rmdir` / `rename` (`0`, `NOREPLACE`, `EXCHANGE`), and
+//! device numbers and signed times read and written past `ext4plus`
+//! (`lumen_vfs::ext4`, [`InodeTimes`]).
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -17,7 +19,6 @@ use core::error::Error;
 use core::fmt;
 use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use core::time::Duration;
 
 use ext4plus::dir::Dir;
 use ext4plus::error::Ext4Error;
@@ -25,7 +26,7 @@ use ext4plus::file::{read_at as ext4_read_at, truncate as ext4_truncate, write_a
 use ext4plus::inode::{Inode, InodeCreationOptions, InodeFlags, InodeMode};
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
-use lumen_vfs::ext4::{rdev_from_i_block, time_from_disk, time_to_disk, truncate_time};
+use lumen_vfs::ext4::{rdev_from_i_block, time_to_disk};
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
     VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
@@ -282,42 +283,146 @@ impl Ext4DiskLayout {
     }
 }
 
-fn duration_to_timespec(d: Duration) -> Timespec {
-    Timespec { sec: d.as_secs() as i64, nsec: i64::from(d.subsec_nanos()) }
-}
+/// Where `i_block` (60 bytes: block numbers, an extent tree, a fast
+/// symlink's target or a device's number) starts in an on-disk inode.
+const I_BLOCK_OFFSET: u64 = 0x28;
 
-/// Which of an inode's times have their extra field (nanoseconds and the
-/// epoch bits that carry a time past 2038): `ext4plus` reads and writes each
-/// one only when the inode's `i_extra_isize` reaches it (`i_ctime_extra`
-/// first, then `i_mtime_extra`, then `i_atime_extra`). Times go to disk
-/// through [`time_to_disk`] with these, back into memory through
-/// [`time_from_disk`], and are set in memory through [`truncate_time`] with
-/// them, so `stat` reports what the disk holds or will.
-#[derive(Clone, Copy)]
-struct ExtraTimes {
-    atime: bool,
-    mtime: bool,
-    ctime: bool,
-}
+pub(super) use self::times::InodeTimes;
 
-impl ExtraTimes {
-    /// `ext4plus` doesn't say how big an inode's `i_extra_isize` is, so ask
-    /// it: a copy of `disk` keeps a time's nanoseconds exactly when that
-    /// time's extra field is there. `i_extra_isize` is set when an inode is
-    /// made and never changes after, so this is asked once per load.
-    fn of(disk: &Inode) -> Self {
-        let mut probe = disk.clone();
-        let one = Duration::new(0, 1);
-        probe.set_atime(one);
-        probe.set_mtime(one);
-        probe.set_ctime(one);
-        Self { atime: probe.atime() == one, mtime: probe.mtime() == one, ctime: probe.ctime() == one }
+/// An inode's three times, kept as the inode holds them on disk. The fields
+/// are private, so every time goes in through [`InodeTimes::from_disk`] or a
+/// setter, which clamp it to what this inode can hold, and out to the disk
+/// through [`InodeTimes::store`]: `stat` then shows what the disk holds or
+/// will hold, before and after a flush or a remount (#294).
+mod times {
+    use core::time::Duration;
+
+    use ext4plus::inode::Inode;
+    use lumen_vfs::Timespec;
+    use lumen_vfs::ext4::{time_from_disk, time_to_disk, truncate_time};
+
+    /// Which of an inode's times have their extra field (nanoseconds and the
+    /// epoch bits that carry a time past 2038).
+    ///
+    /// `ext4plus` reads and writes each one only when the inode's
+    /// `i_extra_isize` reaches it (`i_ctime_extra` from 8, `i_mtime_extra`
+    /// from 12, `i_atime_extra` from 16), as Linux's `EXT4_FITS_IN_INODE`
+    /// does. Two differences from Linux, both because `ext4plus` never grows
+    /// `i_extra_isize`: an `i_extra_isize` of 0 on a volume with large
+    /// inodes means no extra fields here, where Linux's `__ext4_iget` takes
+    /// it as 32 (and writes 32 back); and a time a field is missing for is
+    /// clamped here for good, where Linux grows the inode
+    /// (`ext4_try_to_expand_extra_isize`) or, failing that, stores the time
+    /// clamped while keeping it whole in memory.
+    #[derive(Clone, Copy)]
+    struct ExtraTimes {
+        atime: bool,
+        mtime: bool,
+        ctime: bool,
     }
-}
 
-fn realtime_duration() -> Duration {
-    let (sec, nsec) = time::realtime_sec_nsec();
-    Duration::new(sec, (nsec as u32).min(999_999_999))
+    impl ExtraTimes {
+        /// `ext4plus` doesn't say how big an inode's `i_extra_isize` is, so
+        /// ask it: a copy of `disk` keeps a time's nanoseconds exactly when
+        /// that time's extra field is there. `ext4plus` sets `i_extra_isize`
+        /// only when it creates an inode; Linux may grow it on a later mount,
+        /// but not while this mount owns the volume, so once per load is
+        /// enough.
+        fn of(disk: &Inode) -> Self {
+            let mut probe = disk.clone();
+            let one = Duration::new(0, 1);
+            probe.set_atime(one);
+            probe.set_mtime(one);
+            probe.set_ctime(one);
+            Self { atime: probe.atime() == one, mtime: probe.mtime() == one, ctime: probe.ctime() == one }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub(in crate::vfs) struct InodeTimes {
+        atime: Timespec,
+        mtime: Timespec,
+        ctime: Timespec,
+        extra: ExtraTimes,
+    }
+
+    impl InodeTimes {
+        /// `disk`'s times, clamped to what it holds (a hand-made image can
+        /// hold a time past what its fields can express).
+        pub(in crate::vfs) fn from_disk(disk: &Inode) -> Self {
+            let extra = ExtraTimes::of(disk);
+            Self {
+                atime: truncate_time(time_from_disk(disk.atime()), extra.atime),
+                mtime: truncate_time(time_from_disk(disk.mtime()), extra.mtime),
+                ctime: truncate_time(time_from_disk(disk.ctime()), extra.ctime),
+                extra,
+            }
+        }
+
+        /// Give an inode `ext4plus` has just made all three times `now`, as
+        /// it holds them. `create_inode` sets them before `i_extra_isize`,
+        /// so it writes only their low 32 bits: no epoch (a time past 2038
+        /// would read as 1901 to 1970) and no nanoseconds. The caller's next
+        /// write of `disk` stores these.
+        pub(in crate::vfs) fn stamp_new(disk: &mut Inode, now: Timespec) {
+            let mut times = Self::from_disk(disk);
+            times.set_atime(now);
+            times.modified(now);
+            times.store(disk);
+        }
+
+        pub(in crate::vfs) fn atime(&self) -> Timespec {
+            self.atime
+        }
+
+        pub(in crate::vfs) fn mtime(&self) -> Timespec {
+            self.mtime
+        }
+
+        pub(in crate::vfs) fn ctime(&self) -> Timespec {
+            self.ctime
+        }
+
+        /// Each setter keeps the time as this inode holds it: Linux's
+        /// `timestamp_truncate` (seconds clamped to the range, nanoseconds
+        /// gone if that changed the second, whole seconds without the extra
+        /// field), applied per field from `i_extra_isize`; see
+        /// [`ExtraTimes`] for how that differs from Linux.
+        pub(in crate::vfs) fn set_atime(&mut self, ts: Timespec) {
+            self.atime = truncate_time(ts, self.extra.atime);
+        }
+
+        pub(in crate::vfs) fn set_mtime(&mut self, ts: Timespec) {
+            self.mtime = truncate_time(ts, self.extra.mtime);
+        }
+
+        pub(in crate::vfs) fn set_ctime(&mut self, ts: Timespec) {
+            self.ctime = truncate_time(ts, self.extra.ctime);
+        }
+
+        /// The contents changed at `now`: mtime and ctime.
+        pub(in crate::vfs) fn modified(&mut self, now: Timespec) {
+            self.set_mtime(now);
+            self.set_ctime(now);
+        }
+
+        /// Write all three to `disk` (not yet to the device). Each is already
+        /// what the inode holds, so it reads back unchanged.
+        pub(in crate::vfs) fn store(&self, disk: &mut Inode) {
+            disk.set_atime(time_to_disk(self.atime, self.extra.atime));
+            self.store_mtime_ctime(disk);
+        }
+
+        /// Write ctime alone to `disk`.
+        pub(in crate::vfs) fn store_ctime(&self, disk: &mut Inode) {
+            disk.set_ctime(time_to_disk(self.ctime, self.extra.ctime));
+        }
+
+        fn store_mtime_ctime(&self, disk: &mut Inode) {
+            disk.set_mtime(time_to_disk(self.mtime, self.extra.mtime));
+            self.store_ctime(disk);
+        }
+    }
 }
 
 /// A live directory record's inode number and name bytes.
@@ -627,10 +732,7 @@ impl Ext4FsInner {
     /// where the operation can fail.
     fn created_inode(&mut self, disk: Inode, shared: &Arc<Ext4Shared>) -> Arc<Ext4Inode> {
         debug_assert!(!matches!(disk.file_type(), FileType::CharacterDevice | FileType::BlockDevice));
-        if let Some(existing) = self.live_inode(disk.index.get()) {
-            return existing;
-        }
-        self.insert_inode(disk, shared, DevId::default())
+        self.live_inode(disk.index.get()).unwrap_or_else(|| self.insert_inode(disk, shared, DevId::default()))
     }
 
     fn insert_inode(&mut self, disk: Inode, shared: &Arc<Ext4Shared>, rdev: DevId) -> Arc<Ext4Inode> {
@@ -648,15 +750,14 @@ impl Ext4FsInner {
 
     /// A character or block device's number (`st_rdev`), 0:0 for any other
     /// type. Linux keeps it in `i_block[0..2]`, which `ext4plus` doesn't
-    /// expose, so the two words are read from the inode table directly (as
-    /// `read_inline_symlink_unlocked` reads a fast symlink's target).
+    /// expose, so the two words are read from the inode table directly.
     fn read_rdev(&self, disk: &Inode) -> Result<DevId, VfsError> {
         if !matches!(disk.file_type(), FileType::CharacterDevice | FileType::BlockDevice) {
             return Ok(DevId::default());
         }
         let off = self.layout.inode_disk_offset(&self.bcache, disk.index.get())?;
         let mut i_block = [0u8; 8];
-        self.bcache.read_at(off + 0x28, &mut i_block).map_err(|e| map_block_error(&e))?;
+        self.bcache.read_at(off + I_BLOCK_OFFSET, &mut i_block).map_err(|e| map_block_error(&e))?;
         let word = |i: usize| u32::from_le_bytes(i_block[i * 4..i * 4 + 4].try_into().unwrap());
         Ok(rdev_from_i_block(word(0), word(1)))
     }
@@ -685,9 +786,22 @@ struct Ext4Shared {
     /// once per failing streak, as a page's writeback is.
     bcache_sync_errno: AtomicU32,
     state: SleepMutex<Ext4FsInner>,
+    /// The ktests' clock: when set, [`Ext4Shared::now`] reads it.
+    #[cfg(feature = "ktest")]
+    clock: SleepMutex<Option<Timespec>>,
 }
 
 impl Ext4Shared {
+    /// The wall clock, for times this filesystem sets.
+    fn now(&self) -> Timespec {
+        #[cfg(feature = "ktest")]
+        if let Some(now) = *self.clock.lock() {
+            return now;
+        }
+        let (sec, nsec) = time::realtime_sec_nsec();
+        Timespec { sec: sec as i64, nsec: nsec.min(999_999_999) as i64 }
+    }
+
     /// Write the block cache back to the device and flush it (outside Lock 6:
     /// the block cache has its own lock, 7). A failure comes back as the
     /// errno to report and its cause, for the caller to log once.
@@ -755,6 +869,8 @@ impl Ext4FileSystem {
                 nlink_floors: BTreeMap::new(),
                 nlink_ceilings: BTreeMap::new(),
             }),
+            #[cfg(feature = "ktest")]
+            clock: SleepMutex::new(None),
         });
 
         let root = {
@@ -831,37 +947,11 @@ struct Ext4InodeMeta {
     size: u64,
     blksize: u32,
     blocks_512: u64,
-    /// The times, as the inode holds them: read from the disk, set through
-    /// `set_mtime` and `set_ctime`, or (`set_times`, `set_mode`,
-    /// `set_owner`) through `truncate_time` with `extra`.
-    atime: Timespec,
-    mtime: Timespec,
-    ctime: Timespec,
-    /// Which times the inode keeps nanoseconds and epoch bits for.
-    extra: ExtraTimes,
+    /// The times, as the inode holds them.
+    times: InodeTimes,
     meta_dirty: bool,
     detached_symlink_target: Vec<u8>,
     locks: AdvisoryLocks,
-}
-
-impl Ext4InodeMeta {
-    /// Set a time as the inode will hold it (Linux's `timestamp_truncate`):
-    /// clamped to its range, without nanoseconds if it has no extra field.
-    fn set_mtime(&mut self, ts: Timespec) {
-        self.mtime = truncate_time(ts, self.extra.mtime);
-    }
-
-    fn set_ctime(&mut self, ts: Timespec) {
-        self.ctime = truncate_time(ts, self.extra.ctime);
-    }
-
-    /// Write the times to `disk` (not yet to the device). Each is already
-    /// what the inode holds, so it reads back unchanged.
-    fn store_times(&self, disk: &mut Inode) {
-        disk.set_atime(time_to_disk(self.atime, self.extra.atime));
-        disk.set_mtime(time_to_disk(self.mtime, self.extra.mtime));
-        disk.set_ctime(time_to_disk(self.ctime, self.extra.ctime));
-    }
 }
 
 /// VFS inode backed by `ext4` + unified `PageCache`.
@@ -1005,12 +1095,11 @@ impl Ext4Inode {
         }
 
         let written_end = offset + done as u64;
-        let now_ts = duration_to_timespec(realtime_duration());
+        let now_ts = self.shared.now();
         if written_end > meta.size {
             meta.size = written_end;
         }
-        meta.set_mtime(now_ts);
-        meta.set_ctime(now_ts);
+        meta.times.modified(now_ts);
         if !detached {
             meta.meta_dirty = true;
         }
@@ -1033,10 +1122,7 @@ impl Ext4Inode {
             size: disk.size_in_bytes(),
             blksize,
             blocks_512: disk.blocks(),
-            atime: time_from_disk(disk.atime()),
-            mtime: time_from_disk(disk.mtime()),
-            ctime: time_from_disk(disk.ctime()),
-            extra: ExtraTimes::of(disk),
+            times: InodeTimes::from_disk(disk),
             meta_dirty: false,
             detached_symlink_target: Vec::new(),
             locks: AdvisoryLocks::new(),
@@ -1327,7 +1413,7 @@ impl Ext4Inode {
                     disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
                     disk.set_uid(meta.uid);
                     disk.set_gid(meta.gid);
-                    meta.store_times(&mut disk);
+                    meta.times.store(&mut disk);
                     disk.write(&inner.ext4).map_err(map_ext4_err)?;
                     meta.blocks_512 = disk.blocks();
                     meta.meta_dirty = false;
@@ -1362,7 +1448,7 @@ impl Ext4Inode {
         let off = inner.layout.inode_disk_offset(&inner.bcache, sym.index.get())?;
         let mut body = [0u8; 60];
         body[..target.len()].copy_from_slice(target);
-        inner.bcache.write_at(off + 0x28, &body).map_err(|e| map_block_error(&e))?;
+        inner.bcache.write_at(off + I_BLOCK_OFFSET, &body).map_err(|e| map_block_error(&e))?;
         Inode::read(&inner.ext4, sym.index).map_err(map_ext4_err)
     }
 
@@ -1376,7 +1462,7 @@ impl Ext4Inode {
         }
         let off = inner.layout.inode_disk_offset(&inner.bcache, disk.index.get())?;
         let mut buf = vec![0u8; len];
-        inner.bcache.read_at(off + 0x28, &mut buf).map_err(|e| map_block_error(&e))?;
+        inner.bcache.read_at(off + I_BLOCK_OFFSET, &mut buf).map_err(|e| map_block_error(&e))?;
         Ok(buf)
     }
 
@@ -2007,7 +2093,7 @@ impl Ext4Inode {
                 drop(prepared);
                 if !target.arc.is_detached() {
                     meta.nlink = rem;
-                    meta.set_ctime(now);
+                    meta.times.set_ctime(now);
                     meta.meta_dirty = true;
                 }
             }
@@ -2015,7 +2101,7 @@ impl Ext4Inode {
             (None, None) => {
                 if !target.arc.is_detached() {
                     meta.nlink = 0;
-                    meta.set_ctime(now);
+                    meta.times.set_ctime(now);
                     meta.meta_dirty = false;
                 }
             }
@@ -2409,9 +2495,9 @@ impl VfsInode for Ext4Inode {
             size: meta.size,
             blksize: meta.blksize,
             blocks,
-            atime: meta.atime,
-            mtime: meta.mtime,
-            ctime: meta.ctime,
+            atime: meta.times.atime(),
+            mtime: meta.times.mtime(),
+            ctime: meta.times.ctime(),
         })
     }
 
@@ -2447,8 +2533,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::NoEnt);
         }
         let dname = entry_name(name)?;
-        let now_dur = realtime_duration();
-        let now_ts = duration_to_timespec(now_dur);
+        let now_ts = self.shared.now();
 
         let mut inner = self.shared.state.lock();
         let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
@@ -2463,18 +2548,18 @@ impl VfsInode for Ext4Inode {
                 mode: InodeMode::S_IFREG | InodeMode::from_bits_retain(mode & 0o7777),
                 uid: 0,
                 gid: 0,
-                time: now_dur,
+                time: time_to_disk(now_ts, true),
                 flags: InodeFlags::empty(),
             })
             .map_err(map_ext4_err)?;
+        InodeTimes::stamp_new(&mut child_disk, now_ts);
         inner.clear_nlink_bounds(child_disk.index.get());
         if let Err(e) = parent_dir.link(dname, &mut child_disk) {
             discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed create");
             return Err(map_ext4_err(e));
         }
         let child = inner.created_inode(child_disk, &self.shared);
-        meta.set_mtime(now_ts);
-        meta.set_ctime(now_ts);
+        meta.times.modified(now_ts);
         meta.meta_dirty = true;
         Ok(child as Arc<dyn VfsInode>)
     }
@@ -2494,8 +2579,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::NoEnt);
         }
         let dname = entry_name(name)?;
-        let now_dur = realtime_duration();
-        let now_ts = duration_to_timespec(now_dur);
+        let now_ts = self.shared.now();
 
         let mut inner = self.shared.state.lock();
         let mut parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
@@ -2525,7 +2609,7 @@ impl VfsInode for Ext4Inode {
                 mode: InodeMode::S_IFDIR | InodeMode::from_bits_retain(mode & 0o7777),
                 uid: 0,
                 gid: 0,
-                time: now_dur,
+                time: time_to_disk(now_ts, true),
                 flags: InodeFlags::empty(),
             })
             .map_err(map_ext4_err)?;
@@ -2534,6 +2618,7 @@ impl VfsInode for Ext4Inode {
         let linked = Dir::init(inner.ext4.clone(), sub_raw, self.disk_inode_index()).and_then(|sub_dir| {
             drop(sub_dir);
             let mut sub_inode = Inode::read(&inner.ext4, sub_ino)?;
+            InodeTimes::stamp_new(&mut sub_inode, now_ts);
             let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index())?;
             Dir::open_inode(&inner.ext4, parent_disk)?.link(dname, &mut sub_inode)?;
             Ok(sub_inode)
@@ -2563,8 +2648,7 @@ impl VfsInode for Ext4Inode {
         // `link` wrote is the current one.
         let child = inner.created_inode(sub_inode, &self.shared);
         meta.nlink = meta.nlink.saturating_add(1);
-        meta.set_mtime(now_ts);
-        meta.set_ctime(now_ts);
+        meta.times.modified(now_ts);
         meta.meta_dirty = true;
         Ok(child as Arc<dyn VfsInode>)
     }
@@ -2603,7 +2687,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::NoEnt);
         }
 
-        let now_ts = duration_to_timespec(realtime_duration());
+        let now_ts = self.shared.now();
         let child_nlink = find_guard_mut(&mut guards, &child_arc).nlink;
         if child_arc.is_detached() || child_nlink == 0 {
             return Err(VfsError::NoEnt);
@@ -2636,7 +2720,7 @@ impl VfsInode for Ext4Inode {
                     drop(prepared_detach);
                     if !child_arc.is_detached() {
                         child_meta.nlink = rem_nlink;
-                        child_meta.set_ctime(now_ts);
+                        child_meta.times.set_ctime(now_ts);
                         if child_meta.nlink > 0 {
                             child_meta.meta_dirty = true;
                         }
@@ -2645,12 +2729,11 @@ impl VfsInode for Ext4Inode {
                     Self::commit_detach(prepared, child_meta);
                 } else if !child_arc.is_detached() {
                     child_meta.nlink = 0;
-                    child_meta.set_ctime(now_ts);
+                    child_meta.times.set_ctime(now_ts);
                     child_meta.meta_dirty = false;
                 }
                 let self_meta = find_guard_mut(&mut guards, &self_arc);
-                self_meta.set_mtime(now_ts);
-                self_meta.set_ctime(now_ts);
+                self_meta.times.modified(now_ts);
                 self_meta.meta_dirty = true;
                 match post_err {
                     Some(e) => Err(e),
@@ -2726,7 +2809,7 @@ impl VfsInode for Ext4Inode {
             Self::unlink_dir_with_recovery(&mut inner, self.disk_inode_index(), dname, &child_arc, child_nlink)?
         };
 
-        let now_ts = duration_to_timespec(realtime_duration());
+        let now_ts = self.shared.now();
         match outcome {
             RmdirDiskOutcome::StillPresent { err, actual_nlink } => {
                 drop(prepared_detach);
@@ -2743,7 +2826,7 @@ impl VfsInode for Ext4Inode {
                     drop(prepared_detach);
                     if !child_arc.is_detached() {
                         child_meta.nlink = rem_nlink;
-                        child_meta.set_ctime(now_ts);
+                        child_meta.times.set_ctime(now_ts);
                         if child_meta.nlink > 0 {
                             child_meta.meta_dirty = true;
                         }
@@ -2758,8 +2841,7 @@ impl VfsInode for Ext4Inode {
                     let self_meta = find_guard_mut(&mut guards, &self_arc);
                     self_meta.nlink = p_nlink;
                     if post_err.is_none() {
-                        self_meta.set_mtime(now_ts);
-                        self_meta.set_ctime(now_ts);
+                        self_meta.times.modified(now_ts);
                         self_meta.meta_dirty = true;
                     }
                 }
@@ -2847,14 +2929,13 @@ impl VfsInode for Ext4Inode {
             inner.clear_nlink_bounds(target_arc.disk_ino);
         }
 
-        let now_ts = duration_to_timespec(realtime_duration());
+        let now_ts = self.shared.now();
         let t_meta = find_guard_mut(&mut guards, &target_arc);
         t_meta.nlink = t_meta.nlink.saturating_add(1);
-        t_meta.set_ctime(now_ts);
+        t_meta.times.set_ctime(now_ts);
         t_meta.meta_dirty = true;
         let p_meta = find_guard_mut(&mut guards, &self_arc);
-        p_meta.set_mtime(now_ts);
-        p_meta.set_ctime(now_ts);
+        p_meta.times.modified(now_ts);
         p_meta.meta_dirty = true;
         Ok(())
     }
@@ -2880,8 +2961,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::NoEnt);
         }
         let dname = entry_name(name)?;
-        let now_dur = realtime_duration();
-        let now_ts = duration_to_timespec(now_dur);
+        let now_ts = self.shared.now();
 
         let mut inner = self.shared.state.lock();
         let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
@@ -2896,10 +2976,11 @@ impl VfsInode for Ext4Inode {
                 mode: InodeMode::S_IFLNK | InodeMode::from_bits_retain(0o777),
                 uid: 0,
                 gid: 0,
-                time: now_dur,
+                time: time_to_disk(now_ts, true),
                 flags: InodeFlags::empty(),
             })
             .map_err(map_ext4_err)?;
+        InodeTimes::stamp_new(&mut sym, now_ts);
         let sym_ino = sym.index;
         inner.clear_nlink_bounds(sym_ino.get());
         // A target of up to 59 bytes is stored inline in `i_block` (a fast
@@ -2922,8 +3003,7 @@ impl VfsInode for Ext4Inode {
             };
 
         let child = inner.created_inode(sym_disk, &self.shared);
-        meta.set_mtime(now_ts);
-        meta.set_ctime(now_ts);
+        meta.times.modified(now_ts);
         meta.meta_dirty = true;
         Ok(child as Arc<dyn VfsInode>)
     }
@@ -3058,7 +3138,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::NoEnt);
         }
 
-        let now_ts = duration_to_timespec(realtime_duration());
+        let now_ts = self.shared.now();
         let same_parent = old_dir_arc.disk_ino == new_dir_arc.disk_ino;
         let old_is_dir = old_child_arc.inode_type == InodeType::Dir;
 
@@ -3530,15 +3610,13 @@ impl VfsInode for Ext4Inode {
                 find_guard_mut(&mut guards, &new_dir_arc).nlink = n;
             }
             if outcome.touch_timestamps {
-                find_guard_mut(&mut guards, &old_dir_arc).set_mtime(now_ts);
-                find_guard_mut(&mut guards, &old_dir_arc).set_ctime(now_ts);
+                find_guard_mut(&mut guards, &old_dir_arc).times.modified(now_ts);
                 find_guard_mut(&mut guards, &old_dir_arc).meta_dirty = true;
-                find_guard_mut(&mut guards, &new_dir_arc).set_mtime(now_ts);
-                find_guard_mut(&mut guards, &new_dir_arc).set_ctime(now_ts);
+                find_guard_mut(&mut guards, &new_dir_arc).times.modified(now_ts);
                 find_guard_mut(&mut guards, &new_dir_arc).meta_dirty = true;
-                find_guard_mut(&mut guards, &old_child_arc).set_ctime(now_ts);
+                find_guard_mut(&mut guards, &old_child_arc).times.set_ctime(now_ts);
                 find_guard_mut(&mut guards, &old_child_arc).meta_dirty = true;
-                find_guard_mut(&mut guards, new_child_arc).set_ctime(now_ts);
+                find_guard_mut(&mut guards, new_child_arc).times.set_ctime(now_ts);
                 find_guard_mut(&mut guards, new_child_arc).meta_dirty = true;
             }
             return outcome.res;
@@ -3889,13 +3967,11 @@ impl VfsInode for Ext4Inode {
                 let bumped = if same_parent { &old_dir_arc } else { &new_dir_arc };
                 find_guard_mut(&mut guards, bumped).nlink = find_guard_mut(&mut guards, bumped).nlink.saturating_add(1);
             }
-            find_guard_mut(&mut guards, &old_dir_arc).set_mtime(now_ts);
-            find_guard_mut(&mut guards, &old_dir_arc).set_ctime(now_ts);
+            find_guard_mut(&mut guards, &old_dir_arc).times.modified(now_ts);
             find_guard_mut(&mut guards, &old_dir_arc).meta_dirty = true;
-            find_guard_mut(&mut guards, &new_dir_arc).set_mtime(now_ts);
-            find_guard_mut(&mut guards, &new_dir_arc).set_ctime(now_ts);
+            find_guard_mut(&mut guards, &new_dir_arc).times.modified(now_ts);
             find_guard_mut(&mut guards, &new_dir_arc).meta_dirty = true;
-            find_guard_mut(&mut guards, &old_child_arc).set_ctime(now_ts);
+            find_guard_mut(&mut guards, &old_child_arc).times.set_ctime(now_ts);
             find_guard_mut(&mut guards, &old_child_arc).meta_dirty = true;
         }
         step2.res
@@ -4095,10 +4171,9 @@ impl VfsInode for Ext4Inode {
             }
         }
 
-        let now_ts = duration_to_timespec(realtime_duration());
+        let now_ts = self.shared.now();
         meta.size = new_size;
-        meta.set_mtime(now_ts);
-        meta.set_ctime(now_ts);
+        meta.times.modified(now_ts);
         if !detached {
             meta.meta_dirty = true;
         }
@@ -4113,18 +4188,19 @@ impl VfsInode for Ext4Inode {
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        let ctime = truncate_time(duration_to_timespec(realtime_duration()), meta.extra.ctime);
+        let mut times = meta.times;
+        times.set_ctime(self.shared.now());
         let perm = mode & 0o7777;
         if !self.is_detached() {
             let inner = self.shared.state.lock();
             let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
             let full_mode = (self.inode_type.to_mode_bits() as u16) | perm;
             disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
-            disk.set_ctime(time_to_disk(ctime, meta.extra.ctime));
+            times.store_ctime(&mut disk);
             disk.write(&inner.ext4).map_err(map_ext4_err)?;
         }
         meta.mode = perm;
-        meta.ctime = ctime;
+        meta.times = times;
         Ok(())
     }
 
@@ -4136,7 +4212,8 @@ impl VfsInode for Ext4Inode {
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        let ctime = truncate_time(duration_to_timespec(realtime_duration()), meta.extra.ctime);
+        let mut times = meta.times;
+        times.set_ctime(self.shared.now());
         let new_uid = uid.unwrap_or(meta.uid);
         let new_gid = gid.unwrap_or(meta.gid);
         // The set-id bits a chown drops, in the same hold and disk write as
@@ -4151,13 +4228,13 @@ impl VfsInode for Ext4Inode {
                 let full_mode = (self.inode_type.to_mode_bits() as u16) | new_mode;
                 disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
             }
-            disk.set_ctime(time_to_disk(ctime, meta.extra.ctime));
+            times.store_ctime(&mut disk);
             disk.write(&inner.ext4).map_err(map_ext4_err)?;
         }
         meta.uid = new_uid;
         meta.gid = new_gid;
         meta.mode = new_mode;
-        meta.ctime = ctime;
+        meta.times = times;
         Ok(())
     }
 
@@ -4169,39 +4246,27 @@ impl VfsInode for Ext4Inode {
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        let now_ts = duration_to_timespec(realtime_duration());
-        // Each as the inode holds it (Linux's `timestamp_truncate`): a time
-        // before 1901 or past 2446 clamped, nanoseconds only with the extra
-        // field. Set in memory only once the disk holds them.
-        let extra = meta.extra;
-        let new_atime = truncate_time(
-            match atime {
-                SetTime::Omit => meta.atime,
-                SetTime::Now => now_ts,
-                SetTime::Set(ts) => ts,
-            },
-            extra.atime,
-        );
-        let new_mtime = truncate_time(
-            match mtime {
-                SetTime::Omit => meta.mtime,
-                SetTime::Now => now_ts,
-                SetTime::Set(ts) => ts,
-            },
-            extra.mtime,
-        );
-        let new_ctime = truncate_time(now_ts, extra.ctime);
+        let now_ts = self.shared.now();
+        // Set in memory only once the disk holds them.
+        let mut times = meta.times;
+        match atime {
+            SetTime::Omit => {}
+            SetTime::Now => times.set_atime(now_ts),
+            SetTime::Set(ts) => times.set_atime(ts),
+        }
+        match mtime {
+            SetTime::Omit => {}
+            SetTime::Now => times.set_mtime(now_ts),
+            SetTime::Set(ts) => times.set_mtime(ts),
+        }
+        times.set_ctime(now_ts);
         if !self.is_detached() {
             let inner = self.shared.state.lock();
             let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            disk.set_atime(time_to_disk(new_atime, extra.atime));
-            disk.set_mtime(time_to_disk(new_mtime, extra.mtime));
-            disk.set_ctime(time_to_disk(new_ctime, extra.ctime));
+            times.store(&mut disk);
             disk.write(&inner.ext4).map_err(map_ext4_err)?;
         }
-        meta.atime = new_atime;
-        meta.mtime = new_mtime;
-        meta.ctime = new_ctime;
+        meta.times = times;
         Ok(())
     }
 
@@ -4497,6 +4562,24 @@ pub(crate) mod ktest_util {
 
     use crate::vfs::{write_u16le as w16, write_u32le as w32};
 
+    /// [`build_1k_blockmap_image`]'s block size and inode size; its inode
+    /// table starts at block 5.
+    pub const BS: usize = 1024;
+    pub const ISZ: usize = 256;
+    /// Where an on-disk inode's `i_block` and `i_extra_isize` are.
+    pub const I_BLOCK: usize = super::I_BLOCK_OFFSET as usize;
+    pub const I_EXTRA_ISIZE: usize = 0x80;
+
+    /// Where inode `ino` starts in a [`build_1k_blockmap_image`].
+    pub fn inode_off(ino: u64) -> usize {
+        5 * BS + (ino as usize - 1) * ISZ
+    }
+
+    /// Set the clock `fs` stamps times with (`None`: the wall clock).
+    pub fn set_clock(fs: &Ext4FileSystem, now: Option<lumen_vfs::Timespec>) {
+        *fs.shared.clock.lock() = now;
+    }
+
     /// An `e2fsck`-clean ext4 image with 1 KiB blocks and no `extents`
     /// feature, so files are block-mapped and `ext4plus` writes at most one
     /// 1 KiB block per `write_at` call. 32 inodes; the root directory in
@@ -4606,7 +4689,7 @@ crate::ktest!(
         // on it, must not stop the free (the inode would leak until e2fsck).
         use self::ktest_util::*;
         use crate::kassert_eq;
-        let m = mount(build_1k_blockmap_image(128), 205)?;
+        let m = mount(build_1k_blockmap_image(512), 205)?;
         let mut kept = alloc::vec::Vec::new();
 
         // A bystander file takes the target's first temporary name.
@@ -4691,9 +4774,6 @@ crate::ktest!(
         // free its inode and nothing else.
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
-        const BS: usize = 1024;
-        const ISZ: usize = 256;
-        let inode_off = |ino: u64| 5 * BS + (ino as usize - 1) * ISZ;
         let m = mount(build_1k_blockmap_image(512), 202)?;
         let keep = m.root.create("keep.bin", 0o644).map_err(|_| "create keep")?;
         let data = pattern(BS, 3);
@@ -4705,11 +4785,11 @@ crate::ktest!(
         m.fs.sync().map_err(|_| "fs sync")?;
         let mut img = image(&m)?;
         drop(m);
-        let keep_block = u32::from_le_bytes(img[inode_off(keep_ino) + 0x28..][..4].try_into().unwrap());
+        let keep_block = u32::from_le_bytes(img[inode_off(keep_ino) + I_BLOCK..][..4].try_into().unwrap());
         kassert!(keep_block != 0);
         let d = &mut img[inode_off(dev_ino)..][..ISZ];
         d[0..2].copy_from_slice(&0o020666u16.to_le_bytes());
-        d[0x28..0x2c].copy_from_slice(&keep_block.to_le_bytes());
+        d[I_BLOCK..I_BLOCK + 4].copy_from_slice(&keep_block.to_le_bytes());
 
         let m = mount(img, 203)?;
         let (inodes, blocks) = (free_inodes(&m.fs), free_blocks(&m.fs));
@@ -4728,20 +4808,23 @@ crate::ktest!(
         // `mke2fs -d` and Linux keep a device's number in `i_block`: the old
         // 16-bit encoding in `i_block[0]`, or (when that is 0) the new 32-bit
         // one in `i_block[1]` (#292). The adapter can't make device nodes, so
-        // regular files are turned into them on the image.
+        // regular files are turned into them on the image. A file with data
+        // and a directory have block numbers there, and no device number.
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
-        const BS: usize = 1024;
-        const ISZ: usize = 256;
-        let inode_off = |ino: u64| 5 * BS + (ino as usize - 1) * ISZ;
         let m = mount(build_1k_blockmap_image(128), 205)?;
         let mut inos = Vec::new();
         for name in ["null", "wide", "sda1", "plain"] {
             inos.push(m.root.create(name, 0o644).map_err(|_| "create")?.ino());
         }
+        let plain = m.root.lookup("plain").map_err(|_| "lookup plain")?;
+        plain.write_at(0, b"x").map_err(|_| "write plain")?;
+        plain.sync(false).map_err(|_| "sync plain")?;
+        drop(plain);
         m.fs.sync().map_err(|_| "fs sync")?;
         let mut img = image(&m)?;
         drop(m);
+        kassert!(img[inode_off(inos[3]) + I_BLOCK..][..4] != [0; 4]);
         // `new_encode_dev(259, 300)`: a minor past 255 and a major past 255.
         let wide: u32 = (300 & 0xff) | (259 << 8) | ((300 & !0xff) << 12);
         for (ino, mode, i_block0, i_block1) in
@@ -4749,8 +4832,8 @@ crate::ktest!(
         {
             let d = &mut img[inode_off(ino)..][..ISZ];
             d[0..2].copy_from_slice(&mode.to_le_bytes());
-            d[0x28..0x2c].copy_from_slice(&i_block0.to_le_bytes());
-            d[0x2c..0x30].copy_from_slice(&i_block1.to_le_bytes());
+            d[I_BLOCK..I_BLOCK + 4].copy_from_slice(&i_block0.to_le_bytes());
+            d[I_BLOCK + 4..I_BLOCK + 8].copy_from_slice(&i_block1.to_le_bytes());
         }
 
         let expect = [
@@ -4760,12 +4843,14 @@ crate::ktest!(
             ("plain", InodeType::File, DevId::default()),
         ];
         let m = mount(img.clone(), 206)?;
+        kassert_eq!(m.root.stat().map_err(|_| "root stat")?.rdev, DevId::default());
         for (name, ty, rdev) in expect {
             let st = m.root.lookup(name).map_err(|_| "lookup")?.stat().map_err(|_| "stat")?;
             kassert_eq!(st.inode_type, ty);
             kassert_eq!(st.rdev, rdev);
         }
         let ro = mount_ro_image(img, 207)?;
+        kassert_eq!(ro.root_inode().stat().map_err(|_| "ro root stat")?.rdev, DevId::default());
         for (name, _, rdev) in expect {
             let st = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
             kassert_eq!(st.rdev, rdev);
@@ -4800,7 +4885,7 @@ crate::ktest!(
             ("b", (ts(0, 1), ts(-1, 0)), None),
             ("c", (ts(0x2_0000_0005, 42), ts(0x0_8000_0000, 7)), None),
             ("d", (ts(-(1 << 40), 5), ts(1 << 40, 5)), Some((ts(TIME_MIN, 0), ts(TIME_MAX_EXTRA, 0)))),
-            ("e", (ts(TIME_MIN + 1, 9), ts(TIME_MAX_EXTRA - 1, 9)), None),
+            ("e", (ts(TIME_MIN, 9), ts(TIME_MAX_EXTRA, 9)), None),
         ];
         for (name, (atime, mtime), held) in cases {
             let f = m.root.create(name, 0o644).map_err(|_| "create")?;
@@ -4809,41 +4894,46 @@ crate::ktest!(
         }
         let ro = remount_ro(&m, 209)?;
         for (name, (atime, mtime), held) in cases {
-            kassert_eq!(
-                times(&ro.root_inode().lookup(name).map_err(|_| "ro lookup")?)?,
-                held.unwrap_or((atime, mtime))
-            );
+            let back = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?;
+            kassert_eq!(times(&back)?, held.unwrap_or((atime, mtime)));
         }
 
-        // The flush after a write rewrites every time from memory: the
-        // write's mtime and ctime, and the atime set before it.
+        // The metadata flush rewrites every time from memory: after a write,
+        // the write's mtime and ctime and the atime set before it; after a
+        // link (ctime alone), the atime and mtime set before it.
         let f = m.root.lookup("a").map_err(|_| "lookup")?;
         let atime = ts(-2_000_000_000, 500);
         f.set_times(SetTime::Set(atime), SetTime::Omit).map_err(|_| "set atime")?;
         f.write_at(0, b"x").map_err(|_| "write")?;
         f.sync(false).map_err(|_| "sync")?;
-        let before = f.stat().map_err(|_| "stat")?;
-        kassert_eq!(before.atime, atime);
+        let g = m.root.lookup("c").map_err(|_| "lookup c")?;
+        let (g_atime, g_mtime) = (ts(0x2_8000_0001, 3), ts(-1_234_567_890, 999_999_999));
+        g.set_times(SetTime::Set(g_atime), SetTime::Set(g_mtime)).map_err(|_| "set c")?;
+        m.root.link("c2", &g).map_err(|_| "link")?;
+        m.fs.sync().map_err(|_| "fs sync")?;
         let ro = remount_ro(&m, 210)?;
-        let after = ro.root_inode().lookup("a").map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
-        kassert_eq!((after.atime, after.mtime, after.ctime), (before.atime, before.mtime, before.ctime));
+        for (name, file) in [("a", &f), ("c", &g)] {
+            let before = file.stat().map_err(|_| "stat")?;
+            let after = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
+            kassert_eq!((after.atime, after.mtime, after.ctime), (before.atime, before.mtime, before.ctime));
+        }
+        kassert_eq!(f.stat().map_err(|_| "stat a")?.atime, atime);
+        kassert_eq!(times(&g)?, (g_atime, g_mtime));
         Ok(())
     }
 );
 
 crate::ktest!(
     fn ext4_times_follow_the_extra_fields_an_inode_has() {
-        // `i_extra_isize` decides which times have their extra field
-        // (`i_ctime_extra` from 8, `i_mtime_extra` from 12, `i_atime_extra`
-        // from 16). A time without one holds whole signed 32-bit seconds
-        // (1901 to 2038): memory keeps that too, whether set by `set_times`
-        // or by a write, not nanoseconds or an epoch the disk can't hold
-        // (#294).
+        // `i_extra_isize` decides which times have their extra field, as
+        // `ext4plus` reads them (`i_ctime_extra` from 8, `i_mtime_extra` from
+        // 12, `i_atime_extra` from 16; 0 is none, where Linux would take it as
+        // 32). A time without one holds whole signed 32-bit seconds (1901 to
+        // 2038): memory keeps that too, however the time was set, not
+        // nanoseconds or an epoch the disk can't hold (#294).
         use self::ktest_util::*;
         use crate::kassert_eq;
-        use lumen_vfs::ext4::{TIME_MAX_NO_EXTRA, TIME_MIN};
-        const BS: usize = 1024;
-        const ISZ: usize = 256;
+        use lumen_vfs::ext4::{TIME_MAX_NO_EXTRA, TIME_MIN, truncate_time};
         let ts = |sec: i64, nsec: i64| Timespec { sec, nsec };
         // Each `i_extra_isize`, twice: a file per case.
         let cases = [(ts(-5, 7), ts(0x2_0000_0005, 42)), (ts(TIME_MIN - 1, 0), ts(1_700_000_000, 999))];
@@ -4856,15 +4946,17 @@ crate::ktest!(
                 inos.push((extra_isize, m.root.create(&name(extra_isize, k), 0o644).map_err(|_| "create")?.ino()));
             }
         }
+        inos.push((0, m.root.mkdir("d0", 0o755).map_err(|_| "mkdir")?.ino()));
         m.fs.sync().map_err(|_| "fs sync")?;
         let mut img = image(&m)?;
         drop(m);
         for (extra_isize, ino) in inos {
-            let off = 5 * BS + (ino as usize - 1) * ISZ;
-            img[off + 0x80..off + 0x82].copy_from_slice(&extra_isize.to_le_bytes());
+            img[inode_off(ino) + I_EXTRA_ISIZE..][..2].copy_from_slice(&extra_isize.to_le_bytes());
         }
 
         let m = mount(img, 212)?;
+        // A clock with nanoseconds, for the times the adapter stamps.
+        set_clock(&m.fs, Some(ts(1_800_000_000, 123_456_789)));
         let mut set = Vec::new();
         for extra_isize in sizes {
             let (ex_c, ex_m, ex_a) = (extra_isize >= 8, extra_isize >= 12, extra_isize >= 16);
@@ -4872,17 +4964,63 @@ crate::ktest!(
                 let f = m.root.lookup(&name(extra_isize, k)).map_err(|_| "lookup")?;
                 f.set_times(SetTime::Set(atime), SetTime::Set(mtime)).map_err(|_| "set_times")?;
                 let st = f.stat().map_err(|_| "stat")?;
-                let want_a = if ex_a { truncate_time(atime, true) } else { ts(atime.sec.max(TIME_MIN), 0) };
+                let want_a = truncate_time(atime, ex_a);
                 let want_m = if ex_m { mtime } else { ts(mtime.sec.min(TIME_MAX_NO_EXTRA), 0) };
                 kassert_eq!((st.atime, st.mtime), (want_a, want_m));
-                if !ex_c {
-                    kassert_eq!(st.ctime.nsec, 0);
-                }
-                set.push((name(extra_isize, k), st));
+                kassert_eq!(st.ctime.nsec != 0, ex_c);
+                set.push((name(extra_isize, k), f));
             }
         }
+
+        // Every other way a time is set, on an inode without the extra
+        // fields: none may leave nanoseconds in memory. Collected, so one
+        // look shows every path that does.
+        let mut kept: Vec<&str> = Vec::new();
+        let f = m.root.lookup(&name(0, 1)).map_err(|_| "lookup x0-1")?;
+        let ctime_ns = |i: &Arc<dyn VfsInode>| i.stat().map(|st| st.ctime.nsec).map_err(|_| "stat");
+        let mtime_ns = |i: &Arc<dyn VfsInode>| i.stat().map(|st| st.mtime.nsec).map_err(|_| "stat");
+        f.set_mode(0o600).map_err(|_| "set_mode")?;
+        if ctime_ns(&f)? != 0 {
+            kept.push("set_mode ctime");
+        }
+        f.set_owner(Some(1), Some(1)).map_err(|_| "set_owner")?;
+        if ctime_ns(&f)? != 0 {
+            kept.push("set_owner ctime");
+        }
+        f.truncate(3).map_err(|_| "truncate")?;
+        if ctime_ns(&f)? != 0 {
+            kept.push("truncate ctime");
+        }
+        if mtime_ns(&f)? != 0 {
+            kept.push("truncate mtime");
+        }
+        m.root.link("x0-1-link", &f).map_err(|_| "link")?;
+        if ctime_ns(&f)? != 0 {
+            kept.push("link target ctime");
+        }
+        let d = m.root.lookup("d0").map_err(|_| "lookup d0")?;
+        for (step, what) in [(0, "create"), (1, "rename"), (2, "unlink"), (3, "mkdir"), (4, "rmdir"), (5, "symlink")] {
+            match step {
+                0 => d.create("c", 0o644).map(drop),
+                1 => d.rename("c", &d, "c2", RenameFlags(0)),
+                2 => d.unlink("c2"),
+                3 => d.mkdir("sub", 0o755).map(drop),
+                4 => d.rmdir("sub"),
+                _ => d.symlink("s", "c").map(drop),
+            }
+            .map_err(|_| "a step in d0")?;
+            if ctime_ns(&d)? != 0 || mtime_ns(&d)? != 0 {
+                kept.push(what);
+            }
+        }
+        kassert_eq!(kept, Vec::<&str>::new());
+
+        m.fs.sync().map_err(|_| "fs sync")?;
         let ro = remount_ro(&m, 213)?;
-        for (name, st) in &set {
+        let mut all: Vec<(alloc::string::String, Arc<dyn VfsInode>)> = set;
+        all.push(("d0".into(), d));
+        for (name, inode) in &all {
+            let st = inode.stat().map_err(|_| "stat")?;
             let back = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
             kassert_eq!((back.atime, back.mtime, back.ctime), (st.atime, st.mtime, st.ctime));
         }
@@ -4893,16 +5031,48 @@ crate::ktest!(
             let f = m.root.lookup(&name(extra_isize, 0)).map_err(|_| "lookup")?;
             f.write_at(0, b"x").map_err(|_| "write")?;
             let written = f.stat().map_err(|_| "stat written")?;
-            if extra_isize < 12 {
-                kassert_eq!(written.mtime.nsec, 0);
-            }
-            if extra_isize < 8 {
-                kassert_eq!(written.ctime.nsec, 0);
-            }
+            kassert_eq!(written.mtime.nsec != 0, extra_isize >= 12);
+            kassert_eq!(written.ctime.nsec != 0, extra_isize >= 8);
             f.sync(false).map_err(|_| "sync")?;
             let synced = f.stat().map_err(|_| "stat synced")?;
             kassert_eq!((synced.atime, synced.mtime, synced.ctime), (written.atime, written.mtime, written.ctime));
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_files_made_past_2038_keep_their_times() {
+        // `ext4plus`'s `create_inode` sets a new inode's times before its
+        // `i_extra_isize`, so only their low 32 bits land: a file made in
+        // 2040 would read as 1903. The adapter sets them again, whole,
+        // before the inode is linked (#294 review).
+        use self::ktest_util::*;
+        use crate::kassert_eq;
+        let now = Timespec { sec: 2_208_988_800, nsec: 987_654_321 }; // 2040-01-01
+        let m = mount(build_1k_blockmap_image(128), 214)?;
+        set_clock(&m.fs, Some(now));
+        let long: alloc::string::String = core::iter::repeat_n('t', 100).collect();
+        let made = [
+            ("f", m.root.create("f", 0o644).map_err(|_| "create")?),
+            ("d", m.root.mkdir("d", 0o755).map_err(|_| "mkdir")?),
+            ("s", m.root.symlink("s", "f").map_err(|_| "symlink")?),
+            ("l", m.root.symlink("l", &long).map_err(|_| "long symlink")?),
+        ];
+        for (_, inode) in &made {
+            let st = inode.stat().map_err(|_| "stat")?;
+            kassert_eq!((st.atime, st.mtime, st.ctime), (now, now, now));
+        }
+        let root = m.root.stat().map_err(|_| "root stat")?;
+        kassert_eq!((root.mtime, root.ctime), (now, now));
+        m.fs.sync().map_err(|_| "fs sync")?;
+        let ro = remount_ro(&m, 215)?;
+        for (name, _) in &made {
+            let st = ro.root_inode().lookup(name).map_err(|_| "ro lookup")?.stat().map_err(|_| "ro stat")?;
+            kassert_eq!((st.atime, st.mtime, st.ctime), (now, now, now));
+        }
+        let root = ro.root_inode().stat().map_err(|_| "ro root stat")?;
+        kassert_eq!((root.mtime, root.ctime), (now, now));
         Ok(())
     }
 );
@@ -5031,7 +5201,7 @@ crate::ktest!(
                         mode: type_bits | InodeMode::from_bits_retain(0o644),
                         uid: 0,
                         gid: 0,
-                        time: Duration::from_secs(0),
+                        time: core::time::Duration::from_secs(0),
                         flags: InodeFlags::empty(),
                     })
                     .map_err(|_| "create_inode")?;

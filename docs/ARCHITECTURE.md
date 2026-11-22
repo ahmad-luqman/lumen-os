@@ -5366,21 +5366,39 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     The same applies to character and block device nodes (which Linux and
     `mke2fs -d` create): they keep `rdev` in `i_block` with no blocks
     allocated, so the adapter zeroes it the same way before freeing them.
-  - **Device numbers and timestamps decoded by the adapter (#292, #294):**
-    `ext4plus` exposes neither a device node's `i_block` nor signed times
-    (it reads a time's low 32 bits as unsigned, so 1969 reads as 2106). The
-    adapter reads a character or block device's `i_block[0..2]` raw when the
-    inode is first loaded and decodes it as `ext4_iget` does
-    (`lumen_vfs::ext4::rdev_from_i_block`: old encoding in `i_block[0]` when
-    non-zero, else new in `i_block[1]`), keeping it for the inode's life. Times
-    go through `lumen_vfs::ext4::time_to_disk`/`time_from_disk`: Linux's signed
-    second plus two epoch bits (1901 to 2446), clamped outside that range
-    (`timestamp_truncate`), and whole 32-bit seconds for a time whose extra
-    field the inode's `i_extra_isize` leaves out (`i_ctime_extra` needs 8,
-    `i_mtime_extra` 12, `i_atime_extra` 16; found once per load by asking a
-    copy of the `ext4plus` inode, `ExtraTimes::of`). Every time is set in
-    memory already truncated that way (`truncate_time`), so `stat` before and
-    after a flush or a remount agree.
+  - **Device numbers and timestamps encoded and decoded by the adapter
+    (#292, #294):** `ext4plus` exposes neither a device node's `i_block` nor
+    signed times (it reads a time's low 32 bits as unsigned, so 1969 reads as
+    2106).
+    - A character or block device's `i_block[0..2]` is read raw when the inode
+      is first loaded and decoded as `ext4_iget` does
+      (`lumen_vfs::ext4::rdev_from_i_block`: the old encoding in `i_block[0]`
+      when non-zero, else the new one in `i_block[1]`), and kept for the
+      inode's life.
+    - Times go through `lumen_vfs::ext4::time_to_disk`/`time_from_disk`:
+      Linux's signed second plus two epoch bits and nanoseconds (1901 to 2446).
+    - Which times have their extra field follows `i_extra_isize` as `ext4plus`
+      reads it (`i_ctime_extra` needs 8, `i_mtime_extra` 12, `i_atime_extra`
+      16, as Linux's `EXT4_FITS_IN_INODE`), found once per load by asking a
+      copy of the `ext4plus` inode. A deviation `ext4plus` causes: an
+      `i_extra_isize` of 0 on a volume with large inodes means no extra
+      fields here, where Linux's `__ext4_iget` takes it as 32 and writes 32
+      back; mke2fs never writes 0 (`s_min_extra_isize` is 32), but `ext4plus`
+      gives inodes it creates `min(32, s_min_extra_isize)`.
+    - Every time is held in memory as the inode holds it, through
+      `InodeTimes`, whose fields are private: clamped on load and by every
+      setter with `truncate_time` (Linux's `timestamp_truncate` for a range:
+      seconds clamped, nanoseconds dropped if that changed the second, whole
+      seconds without the extra field). Linux decides the range per
+      filesystem and grows an inode that lacks the fields
+      (`ext4_try_to_expand_extra_isize`), or else stores the time clamped
+      while keeping it whole in memory. Applying it per inode and per field,
+      in memory, is Lumen's design, since `ext4plus` can't grow
+      `i_extra_isize`. So `stat` before and after a flush or a remount agree.
+    - `ext4plus`'s `create_inode` sets a new inode's times before its
+      `i_extra_isize`, so only their low 32 bits land. `create`, `mkdir` and
+      `symlink` set them again (`InodeTimes::stamp_new`) before the inode is
+      linked.
   - **Truncate partial-block tail zeroing:** `ext4plus::file::truncate` does
     not zero `[new_size % 4096 .. 4096)` in the partial final block on shrink;
     #253's `PageCache` / truncate path MUST enforce the tail-zeroing rule above.

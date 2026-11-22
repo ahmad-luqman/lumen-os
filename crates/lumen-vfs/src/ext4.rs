@@ -1,7 +1,7 @@
-//! ext4's on-disk encodings that the kernel's adapter decodes itself, because
-//! `ext4plus` doesn't: a device node's number in `i_block`, and timestamps
-//! before 1970 or past 2038 (`ext4plus` reads the low 32 bits of a time as
-//! unsigned).
+//! ext4's on-disk encodings that the kernel's adapter encodes and decodes
+//! itself, because `ext4plus` doesn't: a device node's number in `i_block`,
+//! and timestamps before 1970 or past 2038 (`ext4plus` reads the low 32 bits
+//! of a time as unsigned).
 //!
 //! Both follow Linux (`fs/ext4/inode.c`'s `ext4_iget`, `fs/ext4/ext4.h`'s
 //! `ext4_encode_extra_time`/`ext4_decode_extra_time`, `include/linux/kdev_t.h`).
@@ -39,14 +39,17 @@ pub const TIME_MAX_EXTRA: i64 = (1 << 34) - 1 + i32::MIN as i64;
 /// (`EXT4_NON_EXTRA_TIMESTAMP_MAX`, 2038-01-19).
 pub const TIME_MAX_NO_EXTRA: i64 = i32::MAX as i64;
 
-/// `ts` as an inode stores it, as Linux's `timestamp_truncate` makes it:
-/// seconds clamped to the inode's range (no nanoseconds at either end), and
-/// nanoseconds dropped without the extra fields (a second's granularity).
-/// `extra`: the inode has the extra time fields.
+/// `ts` clamped and rounded as Linux's `timestamp_truncate` does on a
+/// filesystem whose inodes have (`extra`) or lack the extra time fields:
+/// seconds clamped to the range, nanoseconds dropped if that changed the
+/// second, and whole seconds without the extra fields. Linux decides this per
+/// filesystem; the kernel's adapter applies it per inode and per field, from
+/// `i_extra_isize`, because `ext4plus` can't grow an inode's extra fields as
+/// Linux does.
 pub fn truncate_time(ts: Timespec, extra: bool) -> Timespec {
     let max = if extra { TIME_MAX_EXTRA } else { TIME_MAX_NO_EXTRA };
     let sec = ts.sec.clamp(TIME_MIN, max);
-    let nsec = if !extra || sec == TIME_MIN || sec == max { 0 } else { ts.nsec.clamp(0, 999_999_999) };
+    let nsec = if !extra || sec != ts.sec { 0 } else { ts.nsec.clamp(0, 999_999_999) };
     Timespec { sec, nsec }
 }
 
@@ -113,8 +116,10 @@ mod tests {
         // Old encoding: 1:3 (`/dev/null`) is 0x0103.
         assert_eq!(rdev_from_i_block(0x0103, 0), DevId::makedev(1, 3));
         assert_eq!(rdev_from_i_block(0x0103, 0xdead_beef), DevId::makedev(1, 3));
-        // Only the low 16 bits of i_block[0] count.
+        // Only the low 16 bits of i_block[0] count, but all 32 choose the
+        // old encoding.
         assert_eq!(rdev_from_i_block(0xffff_0801, 0), DevId::makedev(8, 1));
+        assert_eq!(rdev_from_i_block(0xffff_0000, 0x0801), DevId::makedev(0, 0));
         assert_eq!(rdev_from_i_block(0xffff, 0), DevId::makedev(255, 255));
         // New encoding: major 259, minor 300 (`new_encode_dev`: minor's low
         // byte, major << 8, the rest of minor << 12).
@@ -142,9 +147,7 @@ mod tests {
         ];
         for (first, last, epoch, msb) in rows {
             for sec in [first, first + 1, last - 1, last] {
-                // Not at the clamp's edges, where nanoseconds go.
-                let nsec = if sec == TIME_MIN || sec == TIME_MAX_EXTRA { 0 } else { 123_456_789 };
-                let t = ts(sec, nsec);
+                let t = ts(sec, 123_456_789);
                 let d = time_to_disk(t, true);
                 let (base, extra) = ext4plus_words(d);
                 assert_eq!((base, extra), linux_words(t), "{sec:#x}");
@@ -169,17 +172,19 @@ mod tests {
         assert_eq!(time_from_disk(Duration::from_secs(0xffff_ffff)), ts(-1, 0));
     }
 
+    /// Linux's `timestamp_truncate` (current master: nanoseconds go only when
+    /// the clamp changed the second) for one filesystem's range.
     #[test]
     fn out_of_range_times_clamp_as_timestamp_truncate_does() {
         let at_min = ts(TIME_MIN, 0);
         let at_max = ts(TIME_MAX_EXTRA, 0);
         assert_eq!(truncate_time(ts(TIME_MIN - 1, 5), true), at_min);
         assert_eq!(truncate_time(ts(i64::MIN, 5), true), at_min);
-        assert_eq!(truncate_time(ts(TIME_MIN, 5), true), at_min);
+        assert_eq!(truncate_time(ts(TIME_MIN, 5), true), ts(TIME_MIN, 5));
         assert_eq!(truncate_time(ts(TIME_MIN + 1, 5), true), ts(TIME_MIN + 1, 5));
         assert_eq!(truncate_time(ts(TIME_MAX_EXTRA + 1, 5), true), at_max);
         assert_eq!(truncate_time(ts(i64::MAX, 5), true), at_max);
-        assert_eq!(truncate_time(ts(TIME_MAX_EXTRA, 5), true), at_max);
+        assert_eq!(truncate_time(ts(TIME_MAX_EXTRA, 5), true), ts(TIME_MAX_EXTRA, 5));
         assert_eq!(truncate_time(ts(TIME_MAX_EXTRA - 1, 5), true), ts(TIME_MAX_EXTRA - 1, 5));
         for t in [ts(i64::MIN, 0), ts(i64::MAX, 999_999_999)] {
             let stored = truncate_time(t, true);
