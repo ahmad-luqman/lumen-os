@@ -56,6 +56,7 @@ milestone = "M1"
 tests = [
     "harness:test_qemu::test_args_include_extra",
     "harness:test_qemu::test_machine_appends_extra_args_last",
+    "harness:test_qemu::test_machine_memory_is_its_one_dash_m",
     "scenario:test_acpi::test_cpu_count_matches_qemu[*]",
     "scenario:test_acpi::test_no_hpet_is_a_warning",
     "scenario:test_acpi::test_no_madt_boots_without_acpi",

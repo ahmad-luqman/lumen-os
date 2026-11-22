@@ -164,13 +164,18 @@ def timeout_scale() -> float:
     return scale
 
 
+# The guest's RAM (`-m`) unless a scenario asks for more (`Machine`'s
+# `memory`, the `boot` fixture's).
+DEFAULT_MEMORY = "256M"
+
+
 @dataclass
 class QemuOptions:
     iso: Path
     vars_file: Path
     headless: bool = True
     accel: str = field(default_factory=default_accel)
-    memory: str = "256M"
+    memory: str = DEFAULT_MEMORY
     serial: str = "stdio"
     # COM1 on this ISA IRQ instead of its own 4 (QEMU's `isa-serial` with
     # `irq=`; with `serial="stdio"` only): the interrupt never reaches the
@@ -554,6 +559,7 @@ class Machine:
         cpu: str | None = None,
         com1_irq: int | None = None,
         trace_events: Sequence[str] = (),
+        memory: str = DEFAULT_MEMORY,
     ):
         # Read once, before anything starts: a value timeout_scale() rejects fails
         # here, not in the first expect() or wait_exit(). (One so large that it
@@ -564,6 +570,11 @@ class Machine:
         self.trace_interrupts = trace_interrupts
         # Appended to the command line, e.g. ["-smp", "2"].
         self.extra_args = list(extra_args)
+        # The guest's RAM, QEMU's `-m` (e.g. "384M"): set here, never with a
+        # second `-m` in `extra_args` (QEMU would take the last one silently).
+        if "-m" in self.extra_args:
+            raise ValueError("the guest's RAM goes in `memory`, not `-m` in extra_args")
+        self.memory = memory
         # False: no serial port at all (`-serial none`: q35 then has no COM1),
         # so nothing from the guest arrives for expect() (QEMU's own messages
         # still do); drive it with the keyboard and read the screen through
@@ -750,6 +761,7 @@ class Machine:
         return QemuOptions(
             iso=self.iso,
             vars_file=vars_file,
+            memory=self.memory,
             qmp_socket=self.qmp_path,
             log_file=self.artifacts / "qemu.log",
             trace=trace,

@@ -14,6 +14,7 @@ import pytest
 from lumen_harness import REPO_ROOT, qemu
 from lumen_harness.__main__ import debug_options, find_gdb, gdb_binary, gdb_command, run_options
 from lumen_harness.qemu import (
+    DEFAULT_MEMORY,
     Devices,
     ExpectTimeout,
     Machine,
@@ -160,6 +161,17 @@ def test_machine_appends_extra_args_last(tmp_path):
     assert args[args.index("-qmp") + 1] == f"unix:{m.qmp_path},server=on,wait=off"
     plain = qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
     assert "-smp" not in plain
+
+
+def test_machine_memory_is_its_one_dash_m(tmp_path):
+    # (#278) A scenario asks for more RAM through `memory`: QEMU's one `-m`,
+    # never a second one appended; every other machine keeps the default.
+    args = qemu_args(Machine(Path("x.iso"), tmp_path, memory="384M").options(Path("v.fd")))
+    assert args.count("-m") == 1 and args[args.index("-m") + 1] == "384M"
+    plain = qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
+    assert plain.count("-m") == 1 and plain[plain.index("-m") + 1] == DEFAULT_MEMORY == "256M"
+    with pytest.raises(ValueError, match="not `-m` in extra_args"):
+        Machine(Path("x.iso"), tmp_path, extra_args=["-m", "512M"])
 
 
 def test_trace_events_go_to_the_log_file(tmp_path):
