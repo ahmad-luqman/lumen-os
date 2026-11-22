@@ -382,7 +382,10 @@ one is its own PR that updates that doc first.
   `linux/process.rs` `ProcessState` (#254: the private 1024-slot FD table
   of `OpenFile`s, `install_current_fd`/`insert_current_fd`/`dup_current_fd`(`_from`)/
   `close_current_fd`, close and exit releasing POSIX and `flock` locks
-  outside `ACTIVE_PROCS`; `Stdio`: fds 0/1/2 on `/dev/console` and `/` as
+  outside `ACTIVE_PROCS` (`release_fd`); the advisory locks' one wait
+  queue and release count (`lock_releases`, `locks_released`,
+  `wait_for_lock_release`: `F_SETLKW` and blocking `flock`, #254);
+  `Stdio`: fds 0/1/2 on `/dev/console` and `/` as
   cwd, opened before a run or it is refused; `Cwd`, `umask`;
   `open_kernel_file`; the console bridge; `in_test_process` for ktests);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
@@ -393,7 +396,9 @@ one is its own PR that updates that doc first.
   terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`), an M7
   syscall not yet implemented a stub (`not_implemented`: logged once,
   `-ENOSYS`; each cluster's `*_m7_stubs_return_enosys` ktest while it has
-  stubs), and `at.rs` the file syscalls' shared parts: `reg`/`FromReg`,
+  stubs; `lock` holds `fcntl` and `flock`: `lock_or_wait`, the retry loop
+  over the wait queue, and `POSIX_WAITERS`, `F_SETLKW`'s `EDEADLK`
+  records), and `at.rs` the file syscalls' shared parts: `reg`/`FromReg`,
   decoding a register into a handler's parameter type (`Fd`, with `Fd::file`
   the descriptor lookup, `Dirfd`, `Mode`, the VFS flags, `UserPtr`,
   `u32`/`i32`: the low 32 bits), `UserPath` (a path argument copied in),
@@ -512,7 +517,10 @@ one is its own PR that updates that doc first.
   `FileSystem`/`VfsInode` traits, the path and symlink resolver, the mount
   table and the Lock-9 inode and dentry caches, `OpenFile` and the `FdTable`
   (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
-  `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks, and
+  `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
+  call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,
+  whose `WouldBlock` alone names the holder; `PosixWaitGraph`, who waits
+  for whom, for `EDEADLK`, its search's `WaitSearch`), and
   `procfs` (`/proc`'s `ProcKind`s, their inode numbers and types, `ProcFd`:
   an fd in `0..MAX_FDS`, `ProcFd::parse`, and `parse_canonical_u32`: one
   name per number) (host-tested).

@@ -180,6 +180,10 @@ pub trait VfsInode: Send + Sync {
     fn sync(&self, data_only: bool) -> Result<(), VfsError>;
 
     /// Execute `f` with mutable access to this inode's Lock-4-protected `AdvisoryLocks`.
+    ///
+    /// `Err` only if `f` did not run (a filesystem keeping no lock state):
+    /// once `f` has run, its changes stand and the call is `Ok`, so a caller
+    /// never loses a release `f` made (and must wake waiters for).
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError>;
 
     /// The concrete inode, for the kernel's `vfs::mmap_page` alone: it
