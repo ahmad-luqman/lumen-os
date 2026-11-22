@@ -873,6 +873,14 @@ impl Ext4FileSystem {
         Ok(Arc::new(Self { shared, rename_lock: SleepMutex::new(()), root }))
     }
 
+    /// Every live inode, for reclaim; Lock 6 is held only while copying.
+    pub fn snapshot_live(&self) -> Vec<Arc<Ext4Inode>> {
+        self.shared.state.lock().snapshot_live()
+    }
+
+    /// The live inode whose `lock_id` is `lock_id`, for the ktests: a scan
+    /// of every live inode.
+    #[cfg(feature = "ktest")]
     pub fn lookup_live_by_lock_id(&self, lock_id: u64) -> Option<Arc<Ext4Inode>> {
         let inner = self.shared.state.lock();
         inner.live_inodes.values().filter_map(Weak::upgrade).find(|n| n.lock_id == lock_id)
@@ -900,10 +908,7 @@ impl FileSystem for Ext4FileSystem {
         if self.shared.read_only {
             return Ok(());
         }
-        let live = {
-            let mut inner = self.shared.state.lock();
-            inner.snapshot_live()
-        };
+        let live = self.snapshot_live();
         let mut first_err: Option<VfsError> = None;
         for inode in live {
             if inode.is_detached() {
@@ -5080,7 +5085,7 @@ crate::ktest!(
         use crate::kassert_eq;
         use lumen_vfs::ext4::time_from_disk;
         let now = Timespec { sec: 2_208_988_800, nsec: 987_654_321 }; // 2040-01-01
-        let m = mount(build_1k_blockmap_image(128), 219)?;
+        let m = mount(build_1k_blockmap_image(128), 252)?;
         set_clock(&m.fs, Some(now));
         let long: alloc::string::String = core::iter::repeat_n('t', 100).collect();
         let made = [
@@ -5111,7 +5116,7 @@ crate::ktest!(
         m.root.link(b"f2", &f).map_err(|_| "link")?;
         m.fs.sync().map_err(|_| "fs sync again")?;
         let img = image(&m)?;
-        let ro = mount_ro_image(img.clone(), 220)?;
+        let ro = mount_ro_image(img.clone(), 253)?;
         for &ino in &made {
             kassert_eq!(raw_crtime(&img, ino), now);
             kassert_eq!(crtime(&ro, ino)?, Some(now));

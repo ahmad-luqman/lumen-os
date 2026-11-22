@@ -5184,6 +5184,10 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   reclaiming victim inode B in strict global order `Lock 4(B) → Lock 5(B) →
   Lock 6 → 7 → 8`, and retrying—never inside `frame::alloc`, which holds an
   IRQ-off `SpinLock`, and never holding another inode's Lock 4 or Lock 5).
+  Its candidates are every live inode of each mounted `ext4` filesystem
+  (`Ext4FileSystem::snapshot_live`, copied under that filesystem's Lock 6,
+  released before any inode is reclaimed), whether or not the VFS's inode
+  cache holds them.
   `tmpfs` pages and `detached_unlinked` pages are never evicted until truncated
   or dropped on last close.
   Because `ext4` blocks are allocated only at writeback, M7 also keeps a hard

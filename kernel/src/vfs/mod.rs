@@ -132,6 +132,8 @@ impl KernelVfsTables {
         self.mounts.lock().snapshot_filesystems()
     }
 
+    /// Every inode in `InodeCache` (procfs's and global reclaim's ktests).
+    #[cfg(feature = "ktest")]
     pub fn snapshot_inodes(&self) -> Vec<Arc<dyn VfsInode>> {
         self.inodes.lock().snapshot_all()
     }
@@ -415,30 +417,17 @@ pub fn resolve_path_from_root(path: &str) -> Result<Arc<dyn VfsInode>, VfsError>
     Ok(resolved.inode)
 }
 
+#[cfg(feature = "ktest")]
 pub(crate) fn snapshot_cached_inodes() -> Vec<Arc<dyn VfsInode>> {
     TABLES.snapshot_inodes()
 }
 
-fn find_ext4_inode(inode: &Arc<dyn VfsInode>) -> Option<Arc<ext4::Ext4Inode>> {
-    let dev = inode.dev_id();
-    let lock_id = inode.lock_id();
-    let fs = {
-        let guard = EXT4_FILESYSTEMS.lock();
-        guard.iter().find(|f| f.dev_id() == dev).cloned()
-    }?;
-    fs.lookup_live_by_lock_id(lock_id)
-}
-
-pub(crate) fn reclaim_ext4_inode_clean(inode: &Arc<dyn VfsInode>, max_evict: usize) {
-    if let Some(ext4_inode) = find_ext4_inode(inode) {
-        let _ = ext4_inode.reclaim_clean_pages(max_evict);
-    }
-}
-
-pub(crate) fn reclaim_ext4_inode_dirty(inode: &Arc<dyn VfsInode>, max_evict: usize) {
-    if let Some(ext4_inode) = find_ext4_inode(inode) {
-        let _ = ext4_inode.reclaim_dirty_pages(max_evict);
-    }
+/// Every live inode of every mounted `ext4` filesystem, for reclaim: the
+/// filesystems' list is copied first, then each one's live inodes under its
+/// own Lock 6, held only while copying (`Ext4FileSystem::snapshot_live`).
+pub(crate) fn snapshot_live_ext4_inodes() -> Vec<Arc<ext4::Ext4Inode>> {
+    let filesystems = EXT4_FILESYSTEMS.lock().clone();
+    filesystems.iter().flat_map(|fs| fs.snapshot_live()).collect()
 }
 
 /// Flush all dirty `PageCache` pages, metadata, mounted filesystems, and

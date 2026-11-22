@@ -331,10 +331,10 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use lumen_bcache::BlockCache;
 
-        // The ext4 page count is global: pages other ktests left cached, in
-        // caches that `snapshot_cached_inodes` doesn't see, count too, so
-        // every check is against the count before this test's mount. It
-        // assumes `base` holds only such pages, out of reclaim's reach (the
+        // The ext4 page count is global: pages other ktests left cached, on
+        // filesystems reclaim doesn't see (not in `EXT4_FILESYSTEMS`), count
+        // too, so every check is against the count before this test's mount.
+        // It assumes `base` holds only such pages, out of reclaim's reach (the
         // ktest kernel's root is tmpfs): otherwise reclaim could evict them in
         // place of this test's pages.
         let base = page_cache::ext4_cached_pages();
@@ -420,6 +420,35 @@ crate::ktest!(
             crate::ktest::diag(format_args!("cleanup after the failure failed too: {e}"));
         }
         result.and(cleanup)
+    }
+);
+
+crate::ktest!(
+    fn page_cache_global_reclaim_reaches_inodes_the_vfs_caches_never_held() {
+        // Reclaim walks each registered ext4 filesystem's live inodes, not
+        // the VFS's inode cache: a file made and written through the
+        // filesystem alone, never looked up by path, gives its pages back
+        // too, written back first. `base` as in the test above.
+        use crate::{kassert, kassert_eq};
+        let base = page_cache::ext4_cached_pages();
+        let m = ext4::ktest_util::mount(build_minimal_ext4_image_blocks(256), 98)?;
+        EXT4_FILESYSTEMS.lock().push(Arc::clone(&m.fs));
+        let result = (|| -> Result<(), &'static str> {
+            let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
+            let data = ext4::ktest_util::pattern(4 * page_cache::PAGE_SIZE, 7);
+            kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
+            kassert!(page_cache::ext4_cached_pages() >= base + 4);
+            kassert!(snapshot_cached_inodes().iter().all(|i| i.lock_id() != f.lock_id()));
+            page_cache::reclaim_ext4_to_target(base);
+            kassert!(page_cache::ext4_cached_pages() <= base);
+            let ro = ext4::ktest_util::remount_ro(&m, 97)?;
+            let on_disk = ro.root_inode().lookup(b"f").map_err(|_| "ro lookup")?;
+            kassert_eq!(ext4::ktest_util::read_all(&on_disk)?, data);
+            kassert_eq!(read_all_inode(&f).map_err(|_| "read back")?, data);
+            Ok(())
+        })();
+        EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != m.fs.dev_id());
+        result
     }
 );
 
