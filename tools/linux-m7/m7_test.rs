@@ -26,7 +26,8 @@
 //!   between `m7_test: maps begin` and `m7_test: maps end`.
 //!
 //! A mode's success ends in `m7_test: <mode> ok` and exit 0; a failed check
-//! prints `m7_test: FAIL <check> errno=<n>` and exits with a code naming it.
+//! prints `m7_test: FAIL <check>` (with `errno=<n>` after a call) and exits
+//! with a code naming it.
 
 #![no_std]
 #![no_main]
@@ -138,8 +139,17 @@ fn write_hex(fd: c_int, n: usize) {
     write_all(fd, &buf[i..]);
 }
 
-/// Print `m7_test: FAIL <what> errno=<errno>` and give back `code`.
+/// Print `m7_test: FAIL <what>` and give back `code`: a check on the data.
 fn fail(code: c_int, what: &[u8]) -> c_int {
+    write_all(2, b"m7_test: FAIL ");
+    write_all(2, what);
+    write_all(2, b"\n");
+    code
+}
+
+/// Print `m7_test: FAIL <what> errno=<errno>` and give back `code`: a call
+/// that failed, or didn't fail as it should.
+fn fail_os(code: c_int, what: &[u8]) -> c_int {
     let e = errno();
     write_all(2, b"m7_test: FAIL ");
     write_all(2, what);
@@ -268,15 +278,15 @@ const SHARED_PWRITE: &[u8] = b"m7 pwrite into mapped page\n";
 fn mode_shared(path: &CPath) -> c_int {
     let fd = open_path(path, O_RDWR);
     if fd < 0 {
-        return fail(10, b"shared: open");
+        return fail_os(10, b"shared: open");
     }
     let p = map(2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd);
     if p.cast() == MAP_FAILED {
-        return fail(11, b"shared: mmap");
+        return fail_os(11, b"shared: mmap");
     }
     let mut buf = [0u8; 2 * PAGE];
     if !pread_exact(fd, &mut buf, 0) {
-        return fail(12, b"shared: pread");
+        return fail_os(12, b"shared: pread");
     }
     if !mapping_is(p, 0, &buf) {
         return fail(13, b"shared: mapping differs from read");
@@ -298,21 +308,21 @@ fn mode_shared(path: &CPath) -> c_int {
     }
     // write(2), then the mapping sees it.
     if !pwrite_exact(fd, SHARED_PWRITE, 512) {
-        return fail(16, b"shared: pwrite");
+        return fail_os(16, b"shared: pwrite");
     }
     if !mapping_is(p, 512, SHARED_PWRITE) {
         return fail(17, b"shared: mapping misses a pwrite");
     }
     // SAFETY: `p` is this mode's live mapping of two pages.
     if unsafe { msync(p.cast(), 2 * PAGE, MS_SYNC) } != 0 {
-        return fail(18, b"shared: msync(MS_SYNC)");
+        return fail_os(18, b"shared: msync(MS_SYNC)");
     }
     // SAFETY: as above; an address off a page boundary is refused.
     if unsafe { msync(p.add(1).cast(), PAGE, MS_SYNC) } == 0 || errno() != EINVAL {
-        return fail(19, b"shared: msync of an unaligned address not EINVAL");
+        return fail_os(19, b"shared: msync of an unaligned address not EINVAL");
     }
     if !unmap(p, 2 * PAGE) {
-        return fail(20, b"shared: munmap");
+        return fail_os(20, b"shared: munmap");
     }
     // SAFETY: `fd` is open and closed once.
     unsafe { close(fd) };
@@ -322,19 +332,19 @@ fn mode_shared(path: &CPath) -> c_int {
 fn mode_private(path: &CPath) -> c_int {
     let fd = open_path(path, O_RDWR);
     if fd < 0 {
-        return fail(30, b"private: open");
+        return fail_os(30, b"private: open");
     }
     let mut orig = [0u8; 2 * PAGE];
     if !pread_exact(fd, &mut orig, 0) {
-        return fail(31, b"private: pread");
+        return fail_os(31, b"private: pread");
     }
     let p = map(2 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd);
     if p.cast() == MAP_FAILED {
-        return fail(32, b"private: mmap");
+        return fail_os(32, b"private: mmap");
     }
     let s = map(2 * PAGE, PROT_READ, MAP_SHARED, fd);
     if s.cast() == MAP_FAILED {
-        return fail(33, b"private: shared mmap");
+        return fail_os(33, b"private: shared mmap");
     }
     if !mapping_is(p, 0, &orig) {
         return fail(34, b"private: mapping differs from read");
@@ -355,7 +365,7 @@ fn mode_private(path: &CPath) -> c_int {
     // The file written after the copy: the copied page keeps its own bytes.
     let other = [!orig[200]];
     if !pwrite_exact(fd, &other, 200) {
-        return fail(38, b"private: pwrite");
+        return fail_os(38, b"private: pwrite");
     }
     if peek(p, 200) != orig[200] || peek(p, 100) != stored {
         return fail(39, b"private: the copied page changed with the file");
@@ -365,10 +375,10 @@ fn mode_private(path: &CPath) -> c_int {
     }
     // Put the file back as it was.
     if !pwrite_exact(fd, &orig[200..201], 200) {
-        return fail(41, b"private: pwrite back");
+        return fail_os(41, b"private: pwrite back");
     }
     if !unmap(p, 2 * PAGE) || !unmap(s, 2 * PAGE) {
-        return fail(42, b"private: munmap");
+        return fail_os(42, b"private: munmap");
     }
     // SAFETY: `fd` is open and closed once.
     unsafe { close(fd) };
@@ -378,36 +388,36 @@ fn mode_private(path: &CPath) -> c_int {
 fn mode_mprotect(path: &CPath) -> c_int {
     let fd = open_path(path, O_RDONLY);
     if fd < 0 {
-        return fail(50, b"mprotect: open");
+        return fail_os(50, b"mprotect: open");
     }
     let s = map(PAGE, PROT_READ, MAP_SHARED, fd);
     if s.cast() == MAP_FAILED {
-        return fail(51, b"mprotect: shared read-only mmap");
+        return fail_os(51, b"mprotect: shared read-only mmap");
     }
     // SAFETY: `s` is this mode's live mapping of one page.
     if unsafe { mprotect(s.cast(), PAGE, PROT_READ | PROT_WRITE) } == 0 || errno() != EACCES {
-        return fail(52, b"mprotect: PROT_WRITE on an O_RDONLY MAP_SHARED mapping not EACCES");
+        return fail_os(52, b"mprotect: PROT_WRITE on an O_RDONLY MAP_SHARED mapping not EACCES");
     }
     let first = peek(s, 0);
     let w = map(PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd);
     if w.cast() != MAP_FAILED || errno() != EACCES {
-        return fail(53, b"mprotect: writable MAP_SHARED mmap of O_RDONLY not EACCES");
+        return fail_os(53, b"mprotect: writable MAP_SHARED mmap of O_RDONLY not EACCES");
     }
     // A private mapping of the same descriptor may become writable.
     let p = map(PAGE, PROT_READ, MAP_PRIVATE, fd);
     if p.cast() == MAP_FAILED {
-        return fail(54, b"mprotect: private mmap");
+        return fail_os(54, b"mprotect: private mmap");
     }
     // SAFETY: `p` is this mode's live mapping of one page.
     if unsafe { mprotect(p.cast(), PAGE, PROT_READ | PROT_WRITE) } != 0 {
-        return fail(55, b"mprotect: PROT_WRITE on a MAP_PRIVATE mapping");
+        return fail_os(55, b"mprotect: PROT_WRITE on a MAP_PRIVATE mapping");
     }
     poke(p, 0, !first);
     if peek(p, 0) != !first || peek(s, 0) != first {
         return fail(56, b"mprotect: private store not private");
     }
     if !unmap(p, PAGE) || !unmap(s, PAGE) {
-        return fail(57, b"mprotect: munmap");
+        return fail_os(57, b"mprotect: munmap");
     }
     // SAFETY: `fd` is open and closed once.
     unsafe { close(fd) };
@@ -417,18 +427,18 @@ fn mode_mprotect(path: &CPath) -> c_int {
 fn mode_truncate(path: &CPath) -> c_int {
     let fd = open_path(path, O_RDWR);
     if fd < 0 {
-        return fail(60, b"truncate: open");
+        return fail_os(60, b"truncate: open");
     }
     let mut orig = [0u8; 2 * PAGE];
     if !pread_exact(fd, &mut orig, 0) {
-        return fail(61, b"truncate: pread");
+        return fail_os(61, b"truncate: pread");
     }
     if orig[PAGE..].iter().all(|&b| b == 0) {
         return fail(62, b"truncate: page 1 is all zeroes before the test");
     }
     let p = map(2 * PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, fd);
     if p.cast() == MAP_FAILED {
-        return fail(63, b"truncate: mmap");
+        return fail_os(63, b"truncate: mmap");
     }
     // Both pages mapped (their PTEs present) before the shrink.
     if !mapping_is(p, 0, &orig) {
@@ -436,14 +446,14 @@ fn mode_truncate(path: &CPath) -> c_int {
     }
     // SAFETY: `fd` is an open writable descriptor.
     if unsafe { ftruncate(fd, PAGE as i64) } != 0 {
-        return fail(65, b"truncate: ftruncate shrink");
+        return fail_os(65, b"truncate: ftruncate shrink");
     }
     if !mapping_is(p, 0, &orig[..PAGE]) {
         return fail(66, b"truncate: page 0 changed by the shrink");
     }
     // SAFETY: as above.
     if unsafe { ftruncate(fd, 2 * PAGE as i64) } != 0 {
-        return fail(67, b"truncate: ftruncate regrow");
+        return fail_os(67, b"truncate: ftruncate regrow");
     }
     // The old page 1 went with the shrink: regrown, the file reads zeroes
     // there, through the mapping too (a stale PTE would show the old bytes).
@@ -451,13 +461,13 @@ fn mode_truncate(path: &CPath) -> c_int {
         return fail(68, b"truncate: mapping shows page 1's old bytes after shrink and regrow");
     }
     if !pwrite_exact(fd, &orig[PAGE..], PAGE as i64) {
-        return fail(69, b"truncate: pwrite back");
+        return fail_os(69, b"truncate: pwrite back");
     }
     if !mapping_is(p, PAGE, &orig[PAGE..]) {
         return fail(70, b"truncate: mapping misses the pwrite back");
     }
     if !unmap(p, 2 * PAGE) {
-        return fail(71, b"truncate: munmap");
+        return fail_os(71, b"truncate: munmap");
     }
     // SAFETY: `fd` is open and closed once.
     unsafe { close(fd) };
@@ -467,11 +477,11 @@ fn mode_truncate(path: &CPath) -> c_int {
 fn mode_sigbus(path: &CPath) -> c_int {
     let fd = open_path(path, O_RDWR);
     if fd < 0 {
-        return fail(80, b"sigbus: open");
+        return fail_os(80, b"sigbus: open");
     }
     let p = map(2 * PAGE, PROT_READ, MAP_SHARED, fd);
     if p.cast() == MAP_FAILED {
-        return fail(81, b"sigbus: mmap");
+        return fail_os(81, b"sigbus: mmap");
     }
     let mut first = [0u8; 1];
     if !pread_exact(fd, &mut first, PAGE as i64) || peek(p, PAGE) != first[0] {
@@ -479,7 +489,7 @@ fn mode_sigbus(path: &CPath) -> c_int {
     }
     // SAFETY: `fd` is an open writable descriptor.
     if unsafe { ftruncate(fd, PAGE as i64) } != 0 {
-        return fail(83, b"sigbus: ftruncate");
+        return fail_os(83, b"sigbus: ftruncate");
     }
     write_all(1, b"m7_test: sigbus: touching ");
     write_hex(1, p as usize + PAGE);
@@ -493,7 +503,7 @@ fn mode_maps() -> c_int {
     // SAFETY: a static NUL-terminated path.
     let fd = unsafe { open(c"/proc/self/maps".as_ptr(), O_RDONLY) };
     if fd < 0 {
-        return fail(90, b"maps: open");
+        return fail_os(90, b"maps: open");
     }
     let mut buf = [0u8; 16384];
     let mut len = 0;
@@ -501,7 +511,7 @@ fn mode_maps() -> c_int {
         // SAFETY: `buf[len..]` is valid for its length of writes.
         let n = unsafe { read(fd, buf.as_mut_ptr().add(len), buf.len() - len) };
         if n < 0 {
-            return fail(91, b"maps: read");
+            return fail_os(91, b"maps: read");
         }
         if n == 0 {
             break;

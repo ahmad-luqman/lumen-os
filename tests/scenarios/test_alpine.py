@@ -9,35 +9,25 @@ import re
 from lumen_harness import BUILD_DIR
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.klog import unexpected_warnings
+from lumen_harness.leaks import Leaks
 from lumen_harness.qemu import Devices
 from lumen_harness.rootfs import copy_rootfs, e2fsck_check
 from lumen_harness.shell import PROMPT, run
 
 BOOT_TIMEOUT = 60
 MINIROOTFS = BUILD_DIR / "deps" / "alpine-minirootfs"
-EXIT_LINE = re.compile(r"linux: /bin/busybox exit=(\d+) leaked_frames=(-?\d+)")
+EXIT_LINE = re.compile(r"linux: /bin/busybox exit=(\d+) leaked_frames=-?\d+")
 ASH_PROMPT = r"[~/][^\n]* # "
-# Each process's kernel stack takes fresh addresses (`mm::stack` never
-# reuses them), so about every 30th maps a new page table in the stack
-# window, which outlives it and its run counts as leaked.
-STACK_TABLE_EVERY = 30
 
 
 class Busybox:
-    """Runs `/bin/busybox` applets, checking each one's leaked frames: the
-    page-cache pages of the files it creates (or frees), and perhaps one
-    page table for the kernel stack window, those counted in `extra`."""
+    """Runs `/bin/busybox` applets, checking each one's leaked frames
+    (`lumen_harness.leaks`): the page-cache pages of the files it creates
+    (or frees)."""
 
     def __init__(self, m):
         self.m = m
-        self.runs = 0
-        self.extra = 0
-
-    def leaked(self, line, expected):
-        got = int(line) - expected
-        assert got in (0, 1), f"leaked {line} frames, expected {expected}"
-        self.runs += 1
-        self.extra += got
+        self.leaks = Leaks()
 
     def __call__(self, args, *, status=0, leaked=0):
         """`/bin/busybox <args>`'s output, less the `linux:` line, which must
@@ -47,13 +37,8 @@ class Busybox:
         assert lines, out
         done = EXIT_LINE.fullmatch(lines[-1])
         assert done and int(done.group(1)) == status, out
-        self.leaked(done.group(2), leaked)
+        self.leaks.check(lines[-1], leaked)
         return "".join(line + "\n" for line in lines[:-1])
-
-    def check_extra(self):
-        """At most one stack-window page table per `STACK_TABLE_EVERY` runs
-        (one more for where the first window starts)."""
-        assert self.extra <= self.runs // STACK_TABLE_EVERY + 1, (self.extra, self.runs)
 
 
 def test_alpine_minirootfs_coreutils(boot, tmp_path):
@@ -75,8 +60,9 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
       serial (arithmetic, `cd` and `$PWD`, `for`, `[`, `case`, `read`), and
       its `exit 3` is the process's exit code.
 
-    Each run leaks no frames but the pages of the files it makes (and a
-    page table for the kernel stack window now and then). Then `sync`, and
+    Each run leaks no frames but the pages of the files it makes (and,
+    now and then, a page table for the kernel stack window:
+    `lumen_harness.leaks`). Then `sync`, and
     the image passes the host's `e2fsck -fn`."""
     passwd = (MINIROOTFS / "etc" / "passwd").read_text()
     group = (MINIROOTFS / "etc" / "group").read_text()
@@ -174,11 +160,10 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
     m.expect(re.compile(r"^read=lumen-input$", re.MULTILINE), 20)
     m.expect(ASH_PROMPT, 20)
     m.send_line("exit 3")
-    busybox.leaked(m.expect(r"linux: /bin/busybox exit=3 leaked_frames=(-?\d+)\n", 30).group(1), 0)
+    busybox.leaks.check(m.expect(r"linux: /bin/busybox exit=3 leaked_frames=-?\d+", 30).group(0), 0)
     m.expect(PROMPT, 10)
     assert CRASH_BEGIN not in m.output
     assert unexpected_warnings(m.output[ash_from:]) == []
-    busybox.check_extra()
 
     assert run(m, "sync", 60) == "sync: ok\n"
     m.close()

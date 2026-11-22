@@ -8,6 +8,7 @@ and a dynamic musl program's dlopen and file mmap from ring 3 (#255)."""
 import re
 
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
+from lumen_harness.leaks import Leaks
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
 from lumen_harness.rootfs import copy_rootfs, e2fsck_check
 from lumen_harness.shell import run
@@ -423,14 +424,15 @@ MAPS_LINE = re.compile(
 )
 
 
-def m7_run(m, args):
+def m7_run(m, leaks, args):
     """`linux /usr/local/bin/m7_test <args>`: its output between its first
     line and the closing `linux:` line, which must say it exited 0 with no
-    frames leaked."""
+    frames leaked (`leaks`: a `lumen_harness.leaks.Leaks`)."""
     out = run(m, f"linux {M7_TEST} {args}".rstrip(), 60).replace("\r\n", "\n")
     lines = out.splitlines()
     assert lines and lines[0] == "m7_test: dynamic musl start", out
-    assert lines[-1] == f"linux: {M7_TEST} exit=0 leaked_frames=0", out
+    assert re.fullmatch(rf"linux: {M7_TEST} exit=0 leaked_frames=-?\d+", lines[-1]), out
+    leaks.check(lines[-1], 0)
     return lines[1:-1]
 
 
@@ -466,10 +468,12 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
       next boot reads them back.
 
     Every run leaks zero frames, but the bus error's -1: the page the
-    truncation freed. The data files (and `libm7.so`'s one page) are in the
+    truncation freed (a page table for the kernel stack window aside:
+    `lumen_harness.leaks`). The data files (and `libm7.so`'s one page) are in the
     page cache before the first run, so no run counts a cached page."""
     disk = copy_rootfs(tmp_path)
     m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+    leaks = Leaks()
 
     assert run(m, "vfstest write-pattern /m7-shared 8192") == "wrote 8192\n"
     assert run(m, "vfstest write-pattern /m7-data 8192") == "wrote 8192\n"
@@ -478,10 +482,10 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
     # The files' blocks on the disk before the stores, for the reboot.
     assert run(m, "sync", 30) == "sync: ok\n"
 
-    assert m7_run(m, "") == ["m7_test: dlopen/dlsym ok"]
-    assert m7_run(m, "private /m7-data") == ["m7_test: private ok"]
-    assert m7_run(m, "mprotect /m7-data") == ["m7_test: mprotect ok"]
-    assert m7_run(m, "truncate /m7-data") == ["m7_test: truncate ok"]
+    assert m7_run(m, leaks, "") == ["m7_test: dlopen/dlsym ok"]
+    assert m7_run(m, leaks, "private /m7-data") == ["m7_test: private ok"]
+    assert m7_run(m, leaks, "mprotect /m7-data") == ["m7_test: mprotect ok"]
+    assert m7_run(m, leaks, "truncate /m7-data") == ["m7_test: truncate ok"]
 
     # A bus error: the WARN it logs is the point here.
     out = run(
@@ -492,15 +496,17 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
     ).replace("\r\n", "\n")
     touched = re.search(r"^m7_test: sigbus: touching (0x[0-9a-f]+) past EOF$", out, re.MULTILINE)
     assert touched, out
-    assert re.search(
+    bus = re.search(
         rf"^linux: {M7_TEST} exit=135 \(bus error\) rip=0x[0-9a-f]+ "
-        rf"cr2={touched.group(1)} leaked_frames=-1$",
+        rf"cr2={touched.group(1)} leaked_frames=-?\d+$",
         out,
         re.MULTILINE,
-    ), out
+    )
+    assert bus, out
+    leaks.check(bus.group(0), -1)
     assert vfs_stat(m, "/tmp/m7-bus")["size"] == "4096"
 
-    lines = m7_run(m, "maps")
+    lines = m7_run(m, leaks, "maps")
     assert lines[0] == "m7_test: maps begin" and lines[-2:] == [
         "m7_test: maps end",
         "m7_test: maps ok",
@@ -525,7 +531,7 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
         assert any(row.group(3) == "r-xp" for row in rows), f"{path}: no code line"
     assert "[stack]" in by_name, "\n".join(maps)
 
-    assert m7_run(m, "shared /m7-shared") == ["m7_test: shared ok"]
+    assert m7_run(m, leaks, "shared /m7-shared") == ["m7_test: shared ok"]
     assert CRASH_BEGIN not in m.output
     # No `sync`: only msync(MS_SYNC) wrote the stores.
     m.close()
@@ -540,6 +546,8 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
         "m7 pwrite into mapped page",
         "m7 shared page one",
     ], out
-    assert out.endswith("linux: /bin/busybox exit=0 leaked_frames=0\n"), out
+    done = out.splitlines()[-1]
+    assert re.fullmatch(r"linux: /bin/busybox exit=0 leaked_frames=-?\d+", done), out
+    Leaks().check(done, 0)
     m2.send_line("exit")
     assert m2.wait_exit(10) == EXIT_SUCCESS
