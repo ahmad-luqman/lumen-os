@@ -150,14 +150,22 @@ pub(super) fn sys_read(fd: Fd, buf: UserPtr, count: u64) -> u64 {
     finish(read(fd, buf, count))
 }
 
+/// A terminal's read: M6's console read (blocking for the first byte, then
+/// what is queued), except that with `O_NONBLOCK` (`FIONBIO`) and no input
+/// waiting it is `-EAGAIN` instead of a wait.
+fn read_tty(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
+    let io = current_io();
+    if count != 0 && file.status_flags() & OpenFlags::O_NONBLOCK != 0 && !process::stdin_ready(io) {
+        return Err(errno::EAGAIN);
+    }
+    read_into_user(io, user_buf, count).map(|n| n as u64)
+}
+
 fn read(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     let file = file(fd)?;
     file.require_readable().map_err(vfs)?;
     if file.inode.is_tty() {
-        return read_into_user(current_io(), buf.addr(), count).map(|n| n as u64);
-    }
-    if count == 0 {
-        return Ok(0);
+        return read_tty(&file, buf.addr(), count);
     }
     read_file(&file, buf.addr(), count)
 }
@@ -387,12 +395,11 @@ fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     file.require_readable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
     if file.inode.is_tty() {
-        let io = current_io();
         // Standard tty short-read semantics: return as soon as the first
         // non-empty span receives data (or EOF/error) so musl
         // `__stdio_read` never hangs trying to fill trailing iovecs.
         return match iovs.iter().find(|span| span.len != 0) {
-            Some(span) => read_into_user(io, span.base, span.len).map(|n| n as u64),
+            Some(span) => read_tty(&file, span.base, span.len),
             None => Ok(0),
         };
     }
@@ -468,12 +475,12 @@ pub(super) fn sys_openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mo
 
 fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u64, u32> {
     let path = UserPath::copy_in(path, false)?;
-    let start = at::start_dir(dirfd, &path, false)?;
-    // Linux takes the slot first: a full table refuses before anything is
-    // opened or created.
+    // Linux takes the slot right after copying the path in: a full table
+    // refuses before the dirfd is looked at or anything is opened or created.
     if !process::current_has_free_fd() {
         return Err(errno::EMFILE);
     }
+    let start = at::start_dir(dirfd, &path, false)?;
     let umask = process::current_umask();
     let opened = open_inode_guarded(crate::vfs::tables(), start.dir(), path.as_bytes(), flags, mode.perm(), umask)
         .map_err(vfs)?;
@@ -584,6 +591,9 @@ crate::ktest!(
             let creat = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT);
             kassert_eq!(sys_open(new, creat, at::reg(0o644)), neg_errno(errno::EMFILE));
             kassert!(matches!(crate::vfs::resolve_path_from_root("/tmp/fd-ktest-emfile"), Err(VfsError::NoEnt)));
+            // ... before the dirfd is looked at (a bad one is `-EMFILE` too).
+            let rel = ktest_user_path(2, b"null")?;
+            kassert_eq!(sys_openat(Dirfd::Fd(at::reg(999)), rel, rd, mode), neg_errno(errno::EMFILE));
             // A slot closed in the middle is the next one taken.
             kassert_eq!(sys_close(at::reg(700)), 0);
             kassert_eq!(sys_open(null, rd, mode), 700);
@@ -622,6 +632,19 @@ crate::ktest!(
             kassert_eq!(sys_ioctl(a, ioctl::FIONBIO, int_at), 0);
             kassert_eq!(nonblock(a), Some(false));
             kassert_eq!(sys_ioctl(a, ioctl::FIONBIO, 0), neg_errno(errno::EFAULT));
+            // On the console (serial here, with no input waiting), a read
+            // with `O_NONBLOCK` is `-EAGAIN`, not a wait.
+            let io = with_current(|p| p.io);
+            with_current_mut(|p| p.io = ConsoleIo::Serial);
+            copy_to_user(int_at, &1i32.to_le_bytes()).map_err(|_| "copy the int")?;
+            let set = sys_ioctl(at::reg(0), ioctl::FIONBIO, int_at);
+            let pending = process::stdin_ready(ConsoleIo::Serial);
+            let read = sys_read(at::reg(0), at::reg(process::KTEST_USER_VA + 2048), 4);
+            with_current_mut(|p| p.io = io);
+            kassert_eq!(set, 0);
+            if !pending {
+                kassert_eq!(read, neg_errno(errno::EAGAIN));
+            }
             // Not open, or `O_PATH`: `-EBADF`.
             kassert_eq!(sys_ioctl(at::reg(77), ioctl::FIOCLEX, 0), neg_errno(errno::EBADF));
             let tmp = ktest_user_path(1, b"/tmp")?;
@@ -719,6 +742,7 @@ crate::ktest!(
             let dir = ktest_user_path(1, b"/tmp")?;
             let dir_fd = ktest_fd(sys_open(dir, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
             kassert_eq!(sys_read(dir_fd, at::reg(out), 1), neg_errno(errno::EISDIR));
+            kassert_eq!(sys_read(dir_fd, at::reg(out), 0), neg_errno(errno::EISDIR));
             // A console fd's `fstat`: the console's character device.
             kassert_eq!(sys_fstat(at::reg(1), at::reg(out)), 0);
             copy_from_user(&mut st, out).map_err(|_| "copy stat")?;

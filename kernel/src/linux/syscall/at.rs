@@ -244,7 +244,10 @@ impl Start {
 
     /// `path` (as given, relative) joined to the path the start was opened
     /// by, for `/proc/<pid>/fd`; `None` for an absolute or empty one, which
-    /// stands as it is. Lexical: a `..` or a symlink in it stays.
+    /// stands as it is. Lexical: a `..` or a symlink in it stays, and the
+    /// base is the path as it was when the cwd was set or the dirfd opened,
+    /// so a rename since then isn't followed (Linux's `d_path` would be;
+    /// `getcwd` is, computing the cwd's path from its inode).
     pub(super) fn display_path(&self, path: &str) -> Option<Arc<str>> {
         let base = self.base.as_deref()?;
         if path.is_empty() || path.starts_with('/') {
