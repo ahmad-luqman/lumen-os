@@ -466,7 +466,10 @@ mod tests {
                 kassert_eq!(sys_fchown(opath, 0, 0), neg_errno(errno::EBADF));
                 kassert_eq!(sys_fchown(at::reg(900), 0, 0), neg_errno(errno::EBADF));
                 // Unknown flags `-EINVAL`; missing `-ENOENT`; read-only `-EROFS`.
-                kassert_eq!(sys_fchownat(Dirfd::Cwd, path, 0, 0, flags(AtFlags::AT_REMOVEDIR)), neg_errno(errno::EINVAL));
+                kassert_eq!(
+                    sys_fchownat(Dirfd::Cwd, path, 0, 0, flags(AtFlags::AT_REMOVEDIR)),
+                    neg_errno(errno::EINVAL)
+                );
                 kassert_eq!(owner("/tmp/meta-ktest-chown")?, (13, 12));
                 let missing = ktest_user_path(5, b"/tmp/meta-ktest-no-such")?;
                 kassert_eq!(sys_chown(missing, 0, 0), neg_errno(errno::ENOENT));

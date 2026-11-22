@@ -75,3 +75,17 @@ tests = [
     "scenario:test_linux_user::test_static_busybox_ash",
     "scenario:test_linux_user::test_syscall_bad_pointers_return_efault",
 ]
+
+[[feature]]
+name = "chmod/fchmod/fchmodat/fchmodat2 (07777 only, -EOPNOTSUPP on a symlink with AT_SYMLINK_NOFOLLOW), chown/fchown/lchown/fchownat (-1 unchanged), umask (& 0o777, applied by openat O_CREAT), utimensat (NULL times, UTIME_NOW/UTIME_OMIT, NULL path as futimens, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, -EINVAL nsec) and truncate/ftruncate (tail zeroed, mtime/ctime, the caller's mapped pages past the new end unmapped; -EINVAL, -EISDIR, -EBADF, -EFBIG, -EROFS) (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chmod_family_sets_the_permission_and_special_bits",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chown_family_sets_owner_and_group_with_minus_one_unchanged",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_umask_returns_the_old_mask_and_applies_to_openat_o_creat",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_utimensat_sets_omits_and_nows_by_path_fd_and_link",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_resizes_zeroing_the_tail_and_updates_mtime_and_ctime",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_errnos",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_shrink_unmaps_mapped_pages_past_the_new_end",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_handlers_take_their_registers_in_order",
+]

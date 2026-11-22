@@ -860,9 +860,10 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       persist to `ext4` without requiring reverse-PTE walks in M7.
     - **Truncate shrink invalidation (`ftruncate`, `truncate`, `openat(O_TRUNC)`):**
       `AddressSpace::invalidate_file_from(file_id, new_size)` (built in
-      #255; the shrinks call it from wave 3);
-      shrinking a file to `new_size` acquires `AddressSpace::inner` (Lock 1)
-      **before** `VfsInode` (Lock 4) and unmaps all file-VMA PTEs covering
+      #255; `truncate` and `ftruncate` call it, `syscall/meta.rs`, #254;
+      `openat(O_TRUNC)` doesn't yet);
+      once the inode's truncate has returned (Lock 4 released; Lock 1 and
+      Lock 4 are never nested), the syscall unmaps all file-VMA PTEs covering
       `file_off >= align_up_page(new_size)` (in the unmap order above:
       per leaf, propagating `PTE_DIRTY`, issuing `invlpg` and freeing a
       private CoW frame; once the walk is done, dropping the range's
@@ -5063,10 +5064,12 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   `e2fsck` reclaims it.
 - **Truncate & extend interaction:**
   - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`):
-    acquires `AddressSpace::inner` (Lock 1) before `VfsInode` (Lock 4), unmaps
+    the inode's `truncate` (Lock 4) and, after it returns, the caller's
+    `AddressSpace::invalidate_file_from` (Lock 1; never nested with Lock 4,
+    the caller's space only until M8, and not yet on `O_TRUNC`) unmap
     all file-VMA PTEs covering `file_off >= align_up_page(new_size)` (section
-    5), zeroes `[new_size % 4096 .. 4096)` of `page_index = new_size / 4096`
-    and marks it dirty **only when `new_size % 4096 != 0`**, and drops all
+    5), zero `[new_size % 4096 .. 4096)` of `page_index = new_size / 4096`
+    and mark it dirty **only when `new_size % 4096 != 0`**, and drop all
     cached pages with `page_index >= new_size.div_ceil(4096)`.
   - Extending a file (`ftruncate` grow or `write`/`pwrite64` past `old_size`):
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
