@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use crate::cache::DentryTarget;
 use crate::error::VfsError;
-use crate::fs::VfsInode;
+use crate::fs::{OpenGuard, Refused, VfsInode};
 use crate::mount::VfsCacheOps;
 use crate::resolve::{
     MAX_INODE_RACE_RETRIES, ResolveFlags, cross_mounts_down, resolve_and_unify_magic_target, resolve_parent,
@@ -17,8 +17,11 @@ use crate::resolve::{
 use crate::types::{DevId, Ino, InodeType, OpenFlags, RenameFlags};
 use crate::{MAX_SYMLINK_DEPTH, PATH_MAX};
 
-/// Upper bound on non-exclusive `O_CREAT` lookup-vs-create race retries.
-const MAX_CREAT_RACE_RETRIES: usize = 64;
+/// Upper bound on each of non-exclusive `O_CREAT`'s two race retries: a
+/// create that keeps finding the name taken, and a found file that keeps
+/// being freed before the open's reference goes up. Running out of either
+/// fails the open with `EEXIST` (the name kept coming back).
+pub(crate) const MAX_CREAT_RACE_RETRIES: usize = 64;
 
 struct InodeRemovalGuard<'a> {
     env: &'a dyn VfsCacheOps,
@@ -203,10 +206,53 @@ fn lookup_and_unify_inode(
     Ok(first_inode.expect("loop ran at least once"))
 }
 
+/// What [`open_inode_guarded`] opened: the open reference it took, the path
+/// and the flags the open checked, for
+/// [`OpenFile::from_opened`](crate::fd::OpenFile::from_opened). The flags
+/// can't be changed between the two, so a descriptor's access mode is always
+/// the one the open checked (`EROFS`, `EISDIR`, `O_PATH`).
+#[must_use = "dropping an Opened gives its open reference back"]
+pub struct Opened {
+    guard: OpenGuard,
+    path: Arc<str>,
+    flags: OpenFlags,
+}
+
+impl Opened {
+    /// The opened inode.
+    pub fn inode(&self) -> &Arc<dyn VfsInode> {
+        self.guard.inode()
+    }
+
+    /// The path as given (lossy: empty if not UTF-8).
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The flags the open checked.
+    pub fn flags(&self) -> OpenFlags {
+        self.flags
+    }
+
+    pub(crate) fn into_parts(self) -> (OpenGuard, Arc<str>, OpenFlags) {
+        (self.guard, self.path, self.flags)
+    }
+}
+
 /// Open or create a file/directory/device inode according to POSIX/`openat(2)`
-/// semantics.
+/// semantics, returning `(inode, normalized_path_string)` with no open
+/// reference held: [`open_inode_guarded`] with its reference given back.
 ///
-/// Returns `(inode, normalized_path_string)` ready for constructing an [`OpenFile`](crate::fd::OpenFile).
+/// The inode was live when the open checked it, but an `unlink` can free it
+/// once this returns. An open file description built from it with
+/// [`OpenFile::new_unchecked_flags`](crate::fd::OpenFile::new_unchecked_flags)
+/// then fails with `ENOENT` (that call checks again); an
+/// [`OpenGuard::new_unchecked`] on it can hold a freed inode. File
+/// descriptors use [`open_inode_guarded`] and
+/// [`OpenFile::from_opened`](crate::fd::OpenFile::from_opened). The brief
+/// reference it holds while opening can make a racing last-link unlink
+/// detach the file instead of freeing it, which on ext4 copies it into
+/// detached memory and can fail that unlink with `ENOSPC` over the quota.
 pub fn open_inode(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
@@ -215,12 +261,58 @@ pub fn open_inode(
     mode: u16,
     umask: u16,
 ) -> Result<(Arc<dyn VfsInode>, String), VfsError> {
+    let (guard, path_str, _) = open_inode_guarded(env, start_dir, path, flags, mode, umask)?.into_parts();
+    Ok((Arc::clone(guard.inode()), String::from(&*path_str)))
+}
+
+/// [`open_inode`] returning the open reference it took, as an [`Opened`] for
+/// [`OpenFile::from_opened`](crate::fd::OpenFile::from_opened).
+///
+/// The reference is taken ([`OpenGuard::try_new`]) before the last check
+/// that the inode is live and before `O_TRUNC`'s truncate, so an `unlink`
+/// racing the open either detaches the inode (Gate 6 sees the reference;
+/// the data stays readable) or freed it first (`ENOENT`, as if the lookup
+/// had lost the race). Under `O_CREAT` a lost race opens again instead
+/// (POSIX: the old file or a new one, never `ENOENT`); after
+/// `MAX_CREAT_RACE_RETRIES` more lost races it fails with `EEXIST`, as the
+/// create loop does when the name keeps being taken. Only a freed inode is
+/// retried: a `stat()` error passes through unchanged. A file this open
+/// creates takes an unchecked reference ([`OpenGuard::new_unchecked`]) under
+/// its filesystem's Lock 3, by design: on a filesystem with a rename lock
+/// (ext4, tmpfs) no unlink can come between, and the open must succeed even
+/// if one follows at once. Every error gives the reference back.
+pub fn open_inode_guarded(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    flags: OpenFlags,
+    mode: u16,
+    umask: u16,
+) -> Result<Opened, VfsError> {
+    for _ in 0..=MAX_CREAT_RACE_RETRIES {
+        if let Some((guard, path)) = open_once(env, start_dir, path, flags, mode, umask)? {
+            return Ok(Opened { guard, path, flags });
+        }
+    }
+    Err(VfsError::Exist)
+}
+
+/// One attempt of [`open_inode_guarded`]: `Ok(None)` when an `O_CREAT` open
+/// found a file that an unlink freed before the reference went up.
+fn open_once(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    flags: OpenFlags,
+    mode: u16,
+    umask: u16,
+) -> Result<Option<(OpenGuard, Arc<str>)>, VfsError> {
     if flags.has_tmpfile() {
         return Err(VfsError::OpNotSupp);
     }
     let _ = flags.access_mode()?;
 
-    let path_str = core::str::from_utf8(path).map(String::from).unwrap_or_default();
+    let path_str: Arc<str> = Arc::from(core::str::from_utf8(path).unwrap_or_default());
 
     if flags.is_path() {
         let resolved = resolve_path(
@@ -229,7 +321,7 @@ pub fn open_inode(
             path,
             ResolveFlags { follow_final: !flags.has_nofollow(), empty_path: false, require_dir: flags.has_directory() },
         )?;
-        return Ok((resolved.inode, path_str));
+        return Ok(Some((OpenGuard::try_new(resolved.inode)?, path_str)));
     }
 
     let inode = if flags.has_creat() {
@@ -266,7 +358,13 @@ pub fn open_inode(
             enum CreatStep {
                 Done(Arc<dyn VfsInode>),
                 FollowSymlink(Arc<dyn VfsInode>),
-                Created(Arc<dyn VfsInode>),
+                // The open reference, taken right after the create inside
+                // `with_rename_lock`. On a filesystem with a rename lock
+                // (ext4, tmpfs; the trait's default takes none) no unlink,
+                // which takes it too, can come between, so the file this
+                // open made is never freed under it, and the open succeeds
+                // even if an unlink follows at once (POSIX).
+                Created(OpenGuard),
             }
 
             let mut step: Option<CreatStep> = None;
@@ -349,11 +447,12 @@ pub fn open_inode(
                                         dentry_gen,
                                         inode_gen,
                                     );
-                                    step = Some(CreatStep::Created(created));
+                                    step = Some(CreatStep::Created(OpenGuard::new_unchecked(created)));
                                     return Ok(());
                                 }
                                 Err(VfsError::Exist) if !flags.has_excl() => {
                                     if creat_retries >= MAX_CREAT_RACE_RETRIES {
+                                        // See `MAX_CREAT_RACE_RETRIES`.
                                         return Err(VfsError::Exist);
                                     }
                                     creat_retries += 1;
@@ -371,7 +470,7 @@ pub fn open_inode(
                 None => run_creat()?,
             }
             match step.expect("run_creat returns Ok only after setting step") {
-                CreatStep::Created(created) => return Ok((created, path_str)),
+                CreatStep::Created(guard) => return Ok(Some((guard, path_str))),
                 CreatStep::Done(existing) => {
                     // Follow stacked mountpoints if `existing` is a mountpoint directory.
                     let existing = cross_mounts_down(env, existing);
@@ -437,11 +536,22 @@ pub fn open_inode(
     if !inode.exempt_from_rofs() && env.fs_read_only(inode.dev_id()) && (flags.is_writable() || flags.has_trunc()) {
         return Err(VfsError::RoFs);
     }
-    if flags.has_trunc() && inode.inode_type() == InodeType::File {
-        inode.truncate(0)?;
+    // The open reference, then the last liveness check (inside `try_new`),
+    // then the truncate: never a truncate of, or a guard on, a freed inode.
+    let guard = match OpenGuard::try_new_or_refused(inode) {
+        Ok(guard) => guard,
+        // An `O_CREAT` open found a file (an existing name, or a followed
+        // symlink's target; a directory failed with `EISDIR` above) that an
+        // unlink freed once Lock 3 was released. POSIX gives `O_CREAT` the
+        // old file or a new one, never `ENOENT`: open again.
+        Err(Refused::Freed) if flags.has_creat() => return Ok(None),
+        Err(r) => return Err(r.into()),
+    };
+    if flags.has_trunc() && guard.inode().inode_type() == InodeType::File {
+        guard.inode().truncate(0)?;
     }
 
-    Ok((inode, path_str))
+    Ok(Some((guard, path_str)))
 }
 
 /// `mkdirat(2)`: create a directory with `(mode & 0o7777) & !umask`.

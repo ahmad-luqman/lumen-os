@@ -36,9 +36,9 @@ use log::{debug, error, info, warn};
 use lumen_bcache::BlockDevice;
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_vfs::{
-    DentryCache, DentryTarget, DevId, FileSystem, Ino, InodeCache, InodeType, MountInfo, MountTable, OpenFlags,
-    OpenGuard, RenameFlags, ResolveFlags, VfsCacheOps, VfsError, VfsInode, VfsLock, mkdir_at, open_inode, readlink_at,
-    rename_at2, resolve_path, symlink_at, unlink_at,
+    DentryCache, DentryTarget, DevId, FileSystem, Ino, InodeCache, InodeType, MountInfo, MountTable, OpenFile,
+    OpenFlags, RenameFlags, ResolveFlags, VfsCacheOps, VfsError, VfsInode, VfsLock, mkdir_at, open_inode,
+    open_inode_guarded, readlink_at, rename_at2, resolve_path, symlink_at, unlink_at,
 };
 
 use crate::shell::{Ctx, sysinfo, write_in_chunks};
@@ -751,27 +751,29 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     if tmp_mode & 0o7777 != 0o1777 {
         return Err(format!("/tmp mode {tmp_mode:o}, expected 1777"));
     }
-    let (tmp_f, _) = open_inode(
-        &TABLES,
-        None,
-        b"/tmp/hello_tmp.txt",
-        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-        0o644,
-        0o022,
+    let tmp_of = OpenFile::<KernelVfsLock<u64>>::from_opened(
+        open_inode_guarded(
+            &TABLES,
+            None,
+            b"/tmp/hello_tmp.txt",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0o022,
+        )
+        .map_err(|e| format!("open /tmp/hello_tmp.txt: {e:?}"))?,
     )
-    .map_err(|e| format!("open /tmp/hello_tmp.txt: {e:?}"))?;
-    let _guard_tmp = OpenGuard::new(Arc::clone(&tmp_f));
+    .map_err(|e| format!("open file /tmp/hello_tmp.txt: {e:?}"))?;
+    let tmp_f = &tmp_of.inode;
     tmp_f.write_at(0, b"tmpfs-payload").map_err(|e| format!("write /tmp: {e:?}"))?;
     unlink_at(&TABLES, None, b"/tmp/hello_tmp.txt", false).map_err(|e| format!("unlink /tmp: {e:?}"))?;
     if !tmp_f.is_detached() || tmp_f.stat().map_err(|e| format!("stat detached: {e:?}"))?.nlink != 0 {
         return Err(String::from("/tmp open-unlinked did not detach"));
     }
-    let got_tmp = read_all_inode(&tmp_f).map_err(|e| format!("read detached /tmp: {e:?}"))?;
+    let got_tmp = read_all_inode(tmp_f).map_err(|e| format!("read detached /tmp: {e:?}"))?;
     if got_tmp != b"tmpfs-payload" {
         return Err(String::from("/tmp open-unlinked payload mismatch"));
     }
-    drop(_guard_tmp);
-    drop(tmp_f);
+    drop(tmp_of);
 
     // Test 32 MiB /tmp quota enforcement (-ENOSPC) and release on unlink.
     {
@@ -924,16 +926,19 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         .map_err(|e| format!("mmap_anon: {e}"))?;
     let space_for_thread = Arc::clone(&space);
 
-    let (fd_file, _) = open_inode(
-        &TABLES,
-        None,
-        b"/tmp/proc_fd_test.txt",
-        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-        0o644,
-        0,
+    let fd_of = OpenFile::<KernelVfsLock<u64>>::from_opened(
+        open_inode_guarded(
+            &TABLES,
+            None,
+            b"/tmp/proc_fd_test.txt",
+            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+            0o644,
+            0,
+        )
+        .map_err(|e| format!("open /tmp/proc_fd_test.txt: {e:?}"))?,
     )
-    .map_err(|e| format!("open /tmp/proc_fd_test.txt: {e:?}"))?;
-    let fd_guard = OpenGuard::new(Arc::clone(&fd_file));
+    .map_err(|e| format!("open file /tmp/proc_fd_test.txt: {e:?}"))?;
+    let fd_file = Arc::clone(&fd_of.inode);
     fd_file.write_at(0, b"magic-fd-bytes").map_err(|e| format!("write fd_file: {e:?}"))?;
 
     let result: Arc<SleepMutex<Option<Result<String, String>>>> = Arc::new(SleepMutex::new(None));
@@ -1070,7 +1075,7 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     .map_err(|e| format!("spawn_user_on: {e:?}"))?;
 
     handle.join();
-    drop(fd_guard);
+    drop(fd_of);
     drop(space);
     let inner_res = result.lock().take().ok_or_else(|| String::from("missing thread result"))??;
     Ok(inner_res)

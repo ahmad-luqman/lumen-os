@@ -44,6 +44,15 @@ tests = [
 ]
 
 [[feature]]
+name = "open_inode_guarded + OpenFile::from_opened against an unlink placed at each step of the reference check (host model) and after the open (ext4, tmpfs): the data stays readable, the open fails with ENOENT, or O_CREAT opens a new file; never a descriptor on a freed inode (#262)"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::vfs::ext4::ext4_open_racing_unlink_keeps_the_data_or_fails_cleanly",
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_open_racing_unlink_keeps_the_data_or_fails_cleanly",
+]
+
+[[feature]]
 name = "Pseudo-filesystems (/tmp tmpfs, /dev devfs, /proc procfs), boot mount with a tmpfs fallback (quiet for a disk without ext4, a warning for an ext4 disk that won't mount), and mount/sync shell commands"
 milestone = "M7"
 tests = [

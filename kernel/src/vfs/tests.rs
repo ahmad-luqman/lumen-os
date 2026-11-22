@@ -8,6 +8,7 @@
 //! `vfs/page_cache.rs` ktests use it too.
 
 use super::*;
+use lumen_vfs::OpenGuard;
 
 crate::ktest!(
     fn ext4_crate_smoke() {
@@ -45,12 +46,12 @@ crate::ktest!(
             0,
         )
         .map_err(|_| "create tail.bin")?;
-        let of = OpenFile::<KernelVfsLock<u64>>::new(
+        let of = OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(
             Arc::clone(&f),
             Arc::from(path_str.as_str()),
             OpenFlags::from_bits_truncate(OpenFlags::O_RDWR),
         )
-        .map_err(|_| "OpenFile::new")?;
+        .map_err(|_| "OpenFile::new_unchecked_flags")?;
         *of.offset.lock() = 123;
         kassert_eq!(*of.offset.lock(), 123);
         drop(of);
@@ -91,7 +92,7 @@ crate::ktest!(
         kassert!(matches!(readlink_at(&tables, None, b"/sym_hl_2"), Err(VfsError::NoEnt)));
 
         // 3. Gate 6 open-unlinked contract on ext4 file & directory.
-        let g = OpenGuard::new(Arc::clone(&f));
+        let g = OpenGuard::new_unchecked(Arc::clone(&f));
         let orig_ino = f.ino();
         unlink_at(&tables, None, b"/tail.bin", false).map_err(|_| "open unlink tail.bin")?;
         kassert!(f.is_detached());
@@ -384,7 +385,7 @@ crate::ktest!(
             page_cache::reclaim_ext4_to_target(base);
             kassert!(page_cache::ext4_cached_pages() <= base);
 
-            let guard = OpenGuard::new(Arc::clone(&victim));
+            let guard = OpenGuard::new_unchecked(Arc::clone(&victim));
             unlink_at(&TABLES, None, b"/tmp/reclaim_mnt/victim.bin", false).map_err(|_| "unlink victim")?;
             kassert!(victim.is_detached());
             let got_victim = read_all_inode(&victim).map_err(|_| "read detached victim")?;
@@ -717,7 +718,7 @@ crate::ktest!(
         kassert_eq!(u_ext4.reclaim_clean_pages(16), 2);
         kassert_eq!(uf.write_at(8192, b"EXTRA").map_err(|_| "write extra tail")?, 5);
 
-        let ug = OpenGuard::new(Arc::clone(&uf));
+        let ug = OpenGuard::new_unchecked(Arc::clone(&uf));
         let orig_ino = uf.ino();
         let quota_before = page_cache::DETACHED_QUOTA.used_pages();
         let detached_before = page_cache::detached_cached_pages();
@@ -759,7 +760,7 @@ crate::ktest!(
 
         // 3. rmdir and rename overwrite on open targets under fail_writes preserve live state.
         let dir_ino = mkdir_at(&tables, None, b"/open_rmdir", 0o755, 0).map_err(|_| "mkdir open_rmdir")?;
-        let dg = OpenGuard::new(Arc::clone(&dir_ino));
+        let dg = OpenGuard::new_unchecked(Arc::clone(&dir_ino));
         fault_cache.fail_writes.store(true, Ordering::Release);
         kassert!(matches!(unlink_at(&tables, None, b"/open_rmdir", true), Err(VfsError::Io)));
         kassert!(!dir_ino.is_detached());
@@ -793,7 +794,7 @@ crate::ktest!(
         )
         .map_err(|_| "create ren_dst")?;
         kassert_eq!(rdst.write_at(0, b"OLD").map_err(|_| "write ren_dst")?, 3);
-        let rg = OpenGuard::new(Arc::clone(&rdst));
+        let rg = OpenGuard::new_unchecked(Arc::clone(&rdst));
         fault_cache.fail_writes.store(true, Ordering::Release);
         kassert!(matches!(
             rename_at2(&tables, None, b"/ren_src.bin", None, b"/ren_dst.bin", RenameFlags::default()),
@@ -881,7 +882,7 @@ fn sweep_rmdir_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &
             let m = mount_test_ext4(snap.clone(), 21)?;
             let d = resolve_path(&m.tables, None, b"/victim_dir", rf).map_err(|_| "resolve victim_dir")?.inode;
             let orig_ino = d.ino();
-            let guard = if open { Some(OpenGuard::new(Arc::clone(&d))) } else { None };
+            let guard = if open { Some(OpenGuard::new_unchecked(Arc::clone(&d))) } else { None };
             m.fault_cache.arm_write_fail_on(fail_at);
             let res = unlink_at(&m.tables, None, b"/victim_dir", true);
             m.fault_cache.arm_write_fail_on(0);
@@ -970,7 +971,7 @@ fn sweep_rename_dir_overwrite_io_recovery(base_img: &[u8], quota_before: usize) 
         let dst = resolve_path(&m.tables, None, b"/dst_d", rf).map_err(|_| "resolve dst_d")?.inode;
         let dst_orig_ino = dst.ino();
         let src_ino = resolve_path(&m.tables, None, b"/src_d", rf).map_err(|_| "resolve src_d")?.inode.ino();
-        let guard = OpenGuard::new(Arc::clone(&dst));
+        let guard = OpenGuard::new_unchecked(Arc::clone(&dst));
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/src_d", None, b"/dst_d", RenameFlags::default());
         m.fault_cache.arm_write_fail_on(0);
@@ -1047,7 +1048,7 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
         for fail_at in 1..=sym_unlink_writes {
             let m = mount_test_ext4(snap_sym.clone(), 25)?;
             let sym = resolve_path(&m.tables, None, b"/sym_i", rf).map_err(|_| "resolve sym_i")?.inode;
-            let guard = if open { Some(OpenGuard::new(Arc::clone(&sym))) } else { None };
+            let guard = if open { Some(OpenGuard::new_unchecked(Arc::clone(&sym))) } else { None };
             m.fault_cache.arm_write_fail_on(fail_at);
             let res = unlink_at(&m.tables, None, b"/sym_i", false);
             m.fault_cache.arm_write_fail_on(0);
@@ -1108,7 +1109,7 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
         let sym = resolve_path(&m.tables, None, b"/sym_i", rf).map_err(|_| "resolve sym_i ren")?.inode;
         let sym_orig_ino = sym.ino();
         let src_ino = resolve_path(&m.tables, None, b"/sym_s", rf).map_err(|_| "resolve sym_s ren")?.inode.ino();
-        let guard = OpenGuard::new(Arc::clone(&sym));
+        let guard = OpenGuard::new_unchecked(Arc::clone(&sym));
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/sym_s", None, b"/sym_i", RenameFlags::default());
         m.fault_cache.arm_write_fail_on(0);
@@ -1173,7 +1174,7 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
     for fail_at in 1..=reg_writes {
         let m = mount_test_ext4(snap_reg.clone(), 29)?;
         let uf = resolve_path(&m.tables, None, b"/reg.bin", rf).map_err(|_| "resolve reg.bin")?.inode;
-        let guard = OpenGuard::new(Arc::clone(&uf));
+        let guard = OpenGuard::new_unchecked(Arc::clone(&uf));
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = unlink_at(&m.tables, None, b"/reg.bin", false);
         m.fault_cache.arm_write_fail_on(0);
@@ -1244,7 +1245,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
         let m = mount_test_ext4(snap_f.clone(), 31)?;
         let f = resolve_path(&m.tables, None, b"/sd/f", rf).map_err(|_| "resolve /sd/f")?.inode;
         let orig_ino = f.ino();
-        let guard = OpenGuard::new(Arc::clone(&f));
+        let guard = OpenGuard::new_unchecked(Arc::clone(&f));
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default());
         m.fault_cache.arm_write_fail_on(0);
@@ -1379,8 +1380,8 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
         let dd = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "resolve dd ex")?.inode;
         let da = resolve_path(&m.tables, None, b"/sd/dir_a", rf).map_err(|_| "resolve dir_a")?.inode;
         let sb = resolve_path(&m.tables, None, b"/dd/sym_b", rf).map_err(|_| "resolve sym_b")?.inode;
-        let ga = OpenGuard::new(Arc::clone(&da));
-        let gb = OpenGuard::new(Arc::clone(&sb));
+        let ga = OpenGuard::new_unchecked(Arc::clone(&da));
+        let gb = OpenGuard::new_unchecked(Arc::clone(&sb));
 
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/dir_a", None, b"/dd/sym_b", RenameFlags(RenameFlags::EXCHANGE));
@@ -1596,7 +1597,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         let m = mount_test_ext4(snap_hl.clone(), 45)?;
         let hl = resolve_path(&m.tables, None, b"/hl1", rf).map_err(|_| "resolve /hl1")?.inode;
         let orig_ino = hl.ino();
-        let guard = OpenGuard::new(Arc::clone(&hl));
+        let guard = OpenGuard::new_unchecked(Arc::clone(&hl));
 
         m.fault_cache.arm_write_fail_from(from_k);
         let res = unlink_at(&m.tables, None, b"/hl1", false);
@@ -1651,7 +1652,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
 
     let check_file_step2_post_fault =
         |m: TestExt4Mount, f: Arc<dyn VfsInode>, orig_ino: u64| -> Result<(), &'static str> {
-            let guard = OpenGuard::new(Arc::clone(&f));
+            let guard = OpenGuard::new_unchecked(Arc::clone(&f));
             let old_res = resolve_path(&m.tables, None, b"/sd/f", rf);
             let new_res = resolve_path(&m.tables, None, b"/dd/f", rf);
             match (old_res, new_res) {
@@ -1831,8 +1832,8 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         let m = mount_test_ext4(snap_ex_f.clone(), 53)?;
         let fa = resolve_path(&m.tables, None, b"/sd/fa", rf).map_err(|_| "resolve fa single")?.inode;
         let fb = resolve_path(&m.tables, None, b"/dd/fb", rf).map_err(|_| "resolve fb single")?.inode;
-        let ga = OpenGuard::new(Arc::clone(&fa));
-        let gb = OpenGuard::new(Arc::clone(&fb));
+        let ga = OpenGuard::new_unchecked(Arc::clone(&fa));
+        let gb = OpenGuard::new_unchecked(Arc::clone(&fb));
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/fa", None, b"/dd/fb", RenameFlags(RenameFlags::EXCHANGE));
         m.fault_cache.arm_write_fail_on(0);
@@ -1871,8 +1872,8 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
                     let fb = resolve_path(&m.tables, None, b"/dd/fb", rf).map_err(|_| "resolve fb pair")?.inode;
                     let a_ino = fa.ino();
                     let b_ino = fb.ino();
-                    let ga = OpenGuard::new(Arc::clone(&fa));
-                    let gb = OpenGuard::new(Arc::clone(&fb));
+                    let ga = OpenGuard::new_unchecked(Arc::clone(&fa));
+                    let gb = OpenGuard::new_unchecked(Arc::clone(&fb));
                     (a_ino, b_ino, Some((fa, fb, ga, gb)))
                 } else {
                     let ro_fs = mount_ro_snapshot(&m, 54)?;
@@ -1904,8 +1905,8 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
                 kassert_eq!(read_all_inode(&cur_fa).map_err(|_| "read fa pair")?, b"FA_DATA");
                 kassert_eq!(read_all_inode(&cur_fb).map_err(|_| "read fb pair")?, b"FB_DATA");
 
-                let g_cur_a = OpenGuard::new(Arc::clone(&cur_fa));
-                let g_cur_b = OpenGuard::new(Arc::clone(&cur_fb));
+                let g_cur_a = OpenGuard::new_unchecked(Arc::clone(&cur_fa));
+                let g_cur_b = OpenGuard::new_unchecked(Arc::clone(&cur_fb));
                 unlink_at(&m.tables, None, b"/sd/fa", false).map_err(|_| "unlink post /sd/fa")?;
                 unlink_at(&m.tables, None, b"/dd/fb", false).map_err(|_| "unlink post /dd/fb")?;
                 kassert!(cur_fa.is_detached());
@@ -1968,8 +1969,8 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
 
         let orig_da_ino = da.ino();
         let orig_db_ino = db.ino();
-        let ga = OpenGuard::new(Arc::clone(&da));
-        let gb = OpenGuard::new(Arc::clone(&db));
+        let ga = OpenGuard::new_unchecked(Arc::clone(&da));
+        let gb = OpenGuard::new_unchecked(Arc::clone(&db));
 
         m.fault_cache.arm_write_fail_on(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/da", None, b"/dd/db", RenameFlags(RenameFlags::EXCHANGE));
@@ -2371,7 +2372,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                     } else {
                         None
                     };
-                    let pinned_guard = pinned_inode.as_ref().map(|n| OpenGuard::new(Arc::clone(n)));
+                    let pinned_guard = pinned_inode.as_ref().map(|n| OpenGuard::new_unchecked(Arc::clone(n)));
 
                     if c2 == 0 {
                         m.fault_cache.arm_write_fail_from(c1);
@@ -2386,7 +2387,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                     let dst_ok = resolve_path(&m.tables, None, dst_path, rf).ok().map(|r| r.inode);
                     let target = src_ok.as_ref().or(dst_ok.as_ref()).ok_or("missing item A")?;
                     kassert_eq!(target.ino(), orig_ino);
-                    let g = OpenGuard::new(Arc::clone(target));
+                    let g = OpenGuard::new_unchecked(Arc::clone(target));
                     let is_dir = matches!(kind, EntryKind::Dir);
                     if src_ok.is_some() && dst_ok.is_some() {
                         unlink_at(&m.tables, None, src_path, is_dir).map_err(|_| "unlink src dual A")?;
@@ -2490,8 +2491,8 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                 let pin_pair = if pinned {
                     let na = resolve_path(&m.tables, None, path_a, rf).map_err(|_| "pin ea")?.inode;
                     let nb = resolve_path(&m.tables, None, path_b, rf).map_err(|_| "pin eb")?.inode;
-                    let ga = OpenGuard::new(Arc::clone(&na));
-                    let gb = OpenGuard::new(Arc::clone(&nb));
+                    let ga = OpenGuard::new_unchecked(Arc::clone(&na));
+                    let gb = OpenGuard::new_unchecked(Arc::clone(&nb));
                     Some((na, nb, ga, gb))
                 } else {
                     None
@@ -2508,8 +2509,8 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
 
                 let cur_a = resolve_path(&m.tables, None, path_a, rf).map_err(|_| "resolve post ea")?.inode;
                 let cur_b = resolve_path(&m.tables, None, path_b, rf).map_err(|_| "resolve post eb")?.inode;
-                let ga = OpenGuard::new(Arc::clone(&cur_a));
-                let gb = OpenGuard::new(Arc::clone(&cur_b));
+                let ga = OpenGuard::new_unchecked(Arc::clone(&cur_a));
+                let gb = OpenGuard::new_unchecked(Arc::clone(&cur_b));
                 let cur_a_is_dir = cur_a.inode_type() == InodeType::Dir;
                 let cur_b_is_dir = cur_b.inode_type() == InodeType::Dir;
                 unlink_at(&m.tables, None, path_a, cur_a_is_dir).map_err(|_| "unlink post ea")?;
@@ -2581,7 +2582,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
         kassert_eq!(floor_d.stat().map_err(|_| "stat floor_d")?.nlink, 3);
         unlink_at(&m.tables, None, b"/floor_d/mv_sub", true).map_err(|_| "rmdir mv_sub")?;
         kassert_eq!(floor_d.stat().map_err(|_| "stat floor_d empty")?.nlink, 2);
-        let g = OpenGuard::new(Arc::clone(&floor_d));
+        let g = OpenGuard::new_unchecked(Arc::clone(&floor_d));
         unlink_at(&m.tables, None, b"/floor_d", true).map_err(|_| "rmdir floor_d")?;
         kassert!(floor_d.is_detached());
         kassert_eq!(floor_d.stat().map_err(|_| "stat floor_d det")?.nlink, 0);
@@ -2622,7 +2623,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
         let floor_d = resolve_path(&m.tables, None, b"/floor_d", rf).map_err(|_| "resolve floor_d ex")?.inode;
         kassert_eq!(floor_d.stat().map_err(|_| "stat floor_d ex")?.nlink, 3);
         unlink_at(&m.tables, None, b"/floor_d/f2", true).map_err(|_| "rmdir floor_d/f2")?;
-        let g = OpenGuard::new(Arc::clone(&floor_d));
+        let g = OpenGuard::new_unchecked(Arc::clone(&floor_d));
         unlink_at(&m.tables, None, b"/floor_d", true).map_err(|_| "rmdir floor_d ex")?;
         kassert!(floor_d.is_detached());
         drop((g, floor_d));
@@ -2700,7 +2701,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                 unlink_at(&m.tables, None, b"/ceil_p/sub1", true).map_err(|_| "rmdir moved sub2_mv")?;
                 unlink_at(&m.tables, None, b"/ceil_p/sub2_mv", false).map_err(|_| "unlink swapped f")?;
                 kassert_eq!(ceil_p.stat().map_err(|_| "stat ceil_p empty")?.nlink, 2);
-                let g = OpenGuard::new(Arc::clone(&ceil_p));
+                let g = OpenGuard::new_unchecked(Arc::clone(&ceil_p));
                 unlink_at(&m.tables, None, b"/ceil_p", true).map_err(|_| "rmdir ceil_p")?;
                 kassert!(ceil_p.is_detached());
                 drop((g, ceil_p));
@@ -2810,8 +2811,8 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
                     let pin_pair = if pinned {
                         let na = resolve_path(&m.tables, None, path_a, rf).map_err(|_| "pin ea r9")?.inode;
                         let nb = resolve_path(&m.tables, None, path_b, rf).map_err(|_| "pin eb r9")?.inode;
-                        let ga = OpenGuard::new(Arc::clone(&na));
-                        let gb = OpenGuard::new(Arc::clone(&nb));
+                        let ga = OpenGuard::new_unchecked(Arc::clone(&na));
+                        let gb = OpenGuard::new_unchecked(Arc::clone(&nb));
                         Some((na, nb, ga, gb))
                     } else {
                         None
@@ -2831,8 +2832,8 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
                     let cur_b = resolve_path(&m.tables, None, path_b, rf).map_err(|_| "resolve post eb r9")?.inode;
                     kassert!(!cur_a.is_detached());
                     kassert!(!cur_b.is_detached());
-                    let ga = OpenGuard::new(Arc::clone(&cur_a));
-                    let gb = OpenGuard::new(Arc::clone(&cur_b));
+                    let ga = OpenGuard::new_unchecked(Arc::clone(&cur_a));
+                    let gb = OpenGuard::new_unchecked(Arc::clone(&cur_b));
                     let cur_a_is_dir = cur_a.inode_type() == InodeType::Dir;
                     let cur_b_is_dir = cur_b.inode_type() == InodeType::Dir;
                     kassert!(cur_a.stat().map_err(|_| "stat ea r9")?.nlink >= if cur_a_is_dir { 2 } else { 1 });
@@ -2896,7 +2897,7 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
             let m = mount_test_ext4(snap_rmdir.clone(), 91)?;
             let pinned = if pinned_dd {
                 let d = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "pin dd r9")?.inode;
-                let g = OpenGuard::new(Arc::clone(&d));
+                let g = OpenGuard::new_unchecked(Arc::clone(&d));
                 Some((d, g))
             } else {
                 None
@@ -2912,7 +2913,7 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
                 saw_notfound_post_err = true;
             }
             let dd = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "resolve dd r9")?.inode;
-            let g_dd = OpenGuard::new(Arc::clone(&dd));
+            let g_dd = OpenGuard::new_unchecked(Arc::clone(&dd));
             kassert_eq!(dd.stat().map_err(|_| "stat dd before rmdir")?.nlink, 2);
             unlink_at(&m.tables, None, b"/dd", true).map_err(|_| "rmdir dd r9")?;
             kassert!(dd.is_detached());
@@ -2949,7 +2950,7 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
             let m = mount_test_ext4(snap_ov.clone(), 93)?;
             let pinned = if pinned_dd {
                 let d = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "pin dd ov r9")?.inode;
-                let g = OpenGuard::new(Arc::clone(&d));
+                let g = OpenGuard::new_unchecked(Arc::clone(&d));
                 Some((d, g))
             } else {
                 None
@@ -2971,7 +2972,7 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
                 unlink_at(&m.tables, None, b"/sd/src", true).map_err(|_| "cleanup sd/src r9")?;
             }
             let dd = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "resolve dd ov r9")?.inode;
-            let g_dd = OpenGuard::new(Arc::clone(&dd));
+            let g_dd = OpenGuard::new_unchecked(Arc::clone(&dd));
             kassert_eq!(dd.stat().map_err(|_| "stat dd ov before rmdir")?.nlink, 2);
             unlink_at(&m.tables, None, b"/dd", true).map_err(|_| "rmdir dd ov r9")?;
             kassert!(dd.is_detached());
@@ -3017,7 +3018,7 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
         }
 
         let sym = resolve_path(&m.tables, None, b"/sym_z", rf).map_err(|_| "resolve sym_z")?.inode;
-        let g = OpenGuard::new(Arc::clone(&sym));
+        let g = OpenGuard::new_unchecked(Arc::clone(&sym));
         unlink_at(&m.tables, None, b"/sym_z", false).map_err(|_| "retry unlink sym_z")?;
         kassert!(sym.is_detached());
         kassert_eq!(sym.stat().map_err(|_| "stat sym_z det")?.nlink, 0);

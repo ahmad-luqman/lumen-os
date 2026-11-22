@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::error::VfsError;
 use crate::fs::{OpenGuard, VfsInode};
+use crate::ops::Opened;
 use crate::types::{AccessMode, OpenFlags};
 use crate::{MAX_FDS, next_open_file_id};
 
@@ -59,8 +60,8 @@ pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
     pub id: OpenFileId,
     pub inode: Arc<dyn VfsInode>,
     pub path: Arc<str>,
-    pub access_mode: AccessMode,
-    pub is_path: bool,
+    access_mode: AccessMode,
+    is_path: bool,
     status_flags: AtomicU32,
     fd_refs: AtomicU32,
     pub offset: L,
@@ -69,15 +70,44 @@ pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
 }
 
 impl<L: VfsLock<u64>> OpenFile<L> {
-    /// Construct a new open file description with `fd_refs = 1` and an active [`OpenGuard`].
-    pub fn new(inode: Arc<dyn VfsInode>, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
+    /// Construct a new open file description with `fd_refs = 1` on an inode
+    /// and flags no open checked, taking a checked open reference
+    /// ([`OpenGuard::try_new`]).
+    ///
+    /// **Not for `openat`:** `flags` get none of the open's checks (`EROFS`,
+    /// `EISDIR`, `O_PATH`'s rules), so nothing stops a caller from building
+    /// an `O_RDWR` descriptor on an inode looked up read-only. File
+    /// descriptors use [`open_inode_guarded`](crate::ops::open_inode_guarded)
+    /// and [`OpenFile::from_opened`], which also can't lose the race below.
+    ///
+    /// `ENOENT` if `inode` was freed by an unlink since it was looked up
+    /// (between [`open_inode`](crate::ops::open_inode) returning and this
+    /// call, say): only an inode that reports `nlink >= 1`, or is detached,
+    /// can be opened. May sleep, as `try_new` does (the inode's Lock 4 and,
+    /// on ext4 and tmpfs, Lock 5 through `stat()`): never call it holding
+    /// this inode's Lock 4 (or another inode's Lock 4 out of `lock_id`
+    /// order), any of Locks 5 to 9, or a spinlock.
+    pub fn new_unchecked_flags(inode: Arc<dyn VfsInode>, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
+        flags.access_mode()?;
+        Self::build(OpenGuard::try_new(inode)?, path, flags)
+    }
+
+    /// Construct a new open file description with `fd_refs = 1` from what
+    /// [`open_inode_guarded`](crate::ops::open_inode_guarded) opened: it
+    /// takes that open's reference over (no second count) and its checked
+    /// flags. Never sleeps.
+    pub fn from_opened(opened: Opened) -> Result<Self, VfsError> {
+        let (guard, path, flags) = opened.into_parts();
+        Self::build(guard, path, flags)
+    }
+
+    fn build(guard: OpenGuard, path: Arc<str>, flags: OpenFlags) -> Result<Self, VfsError> {
         let access_mode = flags.access_mode()?;
         let is_path = flags.is_path();
         let status_bits = if is_path { 0 } else { flags.status_bits() };
-        let open_guard = OpenGuard::new(Arc::clone(&inode));
         Ok(Self {
             id: next_open_file_id(),
-            inode,
+            inode: Arc::clone(guard.inode()),
             path,
             access_mode,
             is_path,
@@ -85,8 +115,18 @@ impl<L: VfsLock<u64>> OpenFile<L> {
             fd_refs: AtomicU32::new(1),
             offset: L::new(0),
             dir_cursor: L::new(0),
-            _open_guard: open_guard,
+            _open_guard: guard,
         })
+    }
+
+    /// The access mode the open checked (meaningless for `O_PATH`).
+    pub fn access_mode(&self) -> AccessMode {
+        self.access_mode
+    }
+
+    /// True if opened with `O_PATH`.
+    pub fn is_path(&self) -> bool {
+        self.is_path
     }
 
     /// Current mutable status flags (`O_APPEND | O_NONBLOCK`).

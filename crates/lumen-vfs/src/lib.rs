@@ -36,7 +36,9 @@ pub use fd::{FdEntry, FdTable, LocalLock, OpenFile, OpenFileId, VfsLock};
 pub use fs::{FileSystem, OpenGuard, VfsInode};
 pub use locks::{AdvisoryLocks, FlockKind, FlockOp, FlockSpec, LockContext, LockOutcome, PosixLockType};
 pub use mount::{MountInfo, MountTable, SimpleVfsTables, VfsCacheOps};
-pub use ops::{link_at, mkdir_at, open_inode, readlink_at, rename_at2, symlink_at, unlink_at};
+pub use ops::{
+    Opened, link_at, mkdir_at, open_inode, open_inode_guarded, readlink_at, rename_at2, symlink_at, unlink_at,
+};
 pub use resolve::{
     ParentTarget, ResolveFlags, ResolvedPath, check_access, compute_cwd_path, resolve_parent, resolve_path,
 };

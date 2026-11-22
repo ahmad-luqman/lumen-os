@@ -1184,7 +1184,7 @@ fn open_unlinked_file_dir_and_compute_cwd_after_rename() {
     let orig_lock_id = file_inode.lock_id();
     file_inode.write_at(0, b"payload").unwrap();
 
-    let open_guard = OpenGuard::new(Arc::clone(&file_inode));
+    let open_guard = OpenGuard::new_unchecked(Arc::clone(&file_inode));
     assert_eq!(file_inode.open_count(), 1);
 
     // 20. Unlink while open: dentry & InodeCache removed, synthetic ino, lock_id immutable, I/O continues
@@ -1206,7 +1206,7 @@ fn open_unlinked_file_dir_and_compute_cwd_after_rename() {
     // 21. compute_cwd_path updates after ancestor rename and returns ENOENT when cwd is rmdir'd
     mkdir_at(&env, None, b"/parent_old", 0o755, 0).unwrap();
     let cwd = mkdir_at(&env, None, b"/parent_old/work", 0o755, 0).unwrap();
-    let cwd_guard = OpenGuard::new(Arc::clone(&cwd));
+    let cwd_guard = OpenGuard::new_unchecked(Arc::clone(&cwd));
     assert_eq!(compute_cwd_path(&env, &cwd).unwrap(), "/parent_old/work");
 
     rename_at2(&env, None, b"/parent_old", None, b"/parent_new", RenameFlags(0)).unwrap();
@@ -1230,14 +1230,14 @@ fn fd_table_capacity_dup_and_opath_matrix() {
 
     // 23. O_PATH checks
     let of_path = Arc::new(
-        OpenFile::<StdLock<u64>>::new(
+        OpenFile::<StdLock<u64>>::new_unchecked_flags(
             opath,
             Arc::from("/fdtest"),
             OpenFlags(OpenFlags::O_PATH | OpenFlags::O_WRONLY | OpenFlags::O_APPEND),
         )
         .unwrap(),
     );
-    assert!(of_path.is_path);
+    assert!(of_path.is_path());
     assert_eq!(of_path.require_non_path(), Err(VfsError::BadF));
     assert_eq!(of_path.require_readable(), Err(VfsError::BadF));
     assert_eq!(of_path.require_writable(), Err(VfsError::BadF));
@@ -1247,8 +1247,12 @@ fn fd_table_capacity_dup_and_opath_matrix() {
 
     // Normal OpenFile
     let of_rw = Arc::new(
-        OpenFile::<StdLock<u64>>::new(file, Arc::from("/fdtest"), OpenFlags(OpenFlags::O_RDWR | OpenFlags::O_APPEND))
-            .unwrap(),
+        OpenFile::<StdLock<u64>>::new_unchecked_flags(
+            file,
+            Arc::from("/fdtest"),
+            OpenFlags(OpenFlags::O_RDWR | OpenFlags::O_APPEND),
+        )
+        .unwrap(),
     );
     assert_eq!(of_rw.require_non_path(), Ok(()));
     assert_eq!(of_rw.require_readable(), Ok(()));
@@ -2042,7 +2046,7 @@ fn dotdot_unifies_through_inode_cache_and_crosses_stacked_mounts() {
     let via_dotdot = resolve_path(&env, None, b"/dir/sub/..", ResolveFlags::default()).unwrap().inode;
     assert!(Arc::ptr_eq(&via_dotdot, &dir));
 
-    let guard = OpenGuard::new(via_dotdot);
+    let guard = OpenGuard::new_unchecked(via_dotdot);
     assert_eq!(dir.open_count(), 1);
     drop(guard);
     assert_eq!(dir.open_count(), 0);
@@ -2521,8 +2525,24 @@ fn post_mutation_dentry_invalidation_and_fd_ref_sync() {
     rename_at2(&spy, None, b"/d1", None, b"/d2", RenameFlags(0)).unwrap();
     assert_eq!(spy.take_counts(), (4, 2));
 
+    // `/f1` was unlinked with no open reference: an open file description
+    // for it is refused (#262), and gives its reference back.
+    assert_eq!(
+        OpenFile::<StdLock<u64>>::new_unchecked_flags(
+            Arc::clone(&file),
+            Arc::from("/f1"),
+            OpenFlags(OpenFlags::O_RDWR)
+        )
+        .unwrap_err(),
+        VfsError::NoEnt
+    );
+    assert_eq!(file.open_count(), 0);
+
     // `OpenFile::dec_fd_ref` AcqRel reference counting transitions cleanly to 0.
-    let of = OpenFile::<StdLock<u64>>::new(file, Arc::from("/f1"), OpenFlags(OpenFlags::O_RDWR)).unwrap();
+    let (live, _) =
+        open_inode(&spy, None, b"/f2", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let of =
+        OpenFile::<StdLock<u64>>::new_unchecked_flags(live, Arc::from("/f2"), OpenFlags(OpenFlags::O_RDWR)).unwrap();
     of.inc_fd_ref();
     of.inc_fd_ref();
     assert_eq!(of.fd_ref_count(), 3);
@@ -2547,7 +2567,7 @@ fn unchallenged_edges_tmpfile_link_empty_path_and_access() {
     // 2. link_at with `empty_path: true` on live vs unlinked FDs.
     let (live_file, _) =
         open_inode(&env, None, b"/dir/live", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
-    let guard = OpenGuard::new(Arc::clone(&live_file));
+    let guard = OpenGuard::new_unchecked(Arc::clone(&live_file));
     link_at(&env, Some(&live_file), b"", None, b"/dir/hardlink", false, true).unwrap();
     assert_eq!(live_file.stat().unwrap().nlink, 2);
 
@@ -4598,7 +4618,7 @@ fn inode_cache_removal_ring_bounded_and_overflow_safe() {
     let mem = MemFs::new(DevId::makedev(0, 55), "mem", false);
     let mf = mem.root_inode().create("mf", 0o644).unwrap();
     let mf_ino = mf.ino();
-    let mf_guard = OpenGuard::new(Arc::clone(&mf));
+    let mf_guard = OpenGuard::new_unchecked(Arc::clone(&mf));
     let g_before_mf = cache.removal_gen();
     assert!(cache.get_or_insert_if_fresh(Arc::clone(&mf), g_before_mf).is_ok());
     mem.root_inode().unlink("mf").unwrap();
@@ -4612,7 +4632,7 @@ fn inode_cache_removal_ring_bounded_and_overflow_safe() {
     // Simulate a cached entry that becomes detached while still in `inodes` (e.g. direct backend detach).
     let mf2 = mem.root_inode().create("mf2", 0o644).unwrap();
     let mf2_ino = mf2.ino();
-    let mf2_guard = OpenGuard::new(Arc::clone(&mf2));
+    let mf2_guard = OpenGuard::new_unchecked(Arc::clone(&mf2));
     let g_mf2 = cache.removal_gen();
     assert!(cache.get_or_insert_if_fresh(Arc::clone(&mf2), g_mf2).is_ok());
     mem.root_inode().unlink("mf2").unwrap();
@@ -4623,7 +4643,7 @@ fn inode_cache_removal_ring_bounded_and_overflow_safe() {
     // Now `get_or_insert` on a fresh non-detached inode when a detached one was cached evicts the stale one.
     let mf3 = mem.root_inode().create("mf3", 0o644).unwrap();
     let mf3_ino = mf3.ino();
-    let mf3_guard = OpenGuard::new(Arc::clone(&mf3));
+    let mf3_guard = OpenGuard::new_unchecked(Arc::clone(&mf3));
     cache.get_or_insert(Arc::clone(&mf3));
     mem.root_inode().unlink("mf3").unwrap();
     // `mf3` is detached in `cache`; `get_or_insert_if_fresh` on a non-detached `f10`-style entry or checking `remove_if_fresh`:
@@ -5029,7 +5049,7 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
                 let orig_ino = orig.ino();
                 orig.write_at(0, b"stale_hl").unwrap();
                 link_at(env.as_ref(), None, b"/hl/a", None, b"/hl/b", false, false).unwrap();
-                let open_guard = if hold_open { Some(OpenGuard::new(Arc::clone(&orig))) } else { None };
+                let open_guard = if hold_open { Some(OpenGuard::new_unchecked(Arc::clone(&orig))) } else { None };
                 drop(orig);
 
                 let barrier = Barrier::new(2);
@@ -5275,7 +5295,7 @@ fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usiz
                             if let Ok((inode, _)) = open_inode(env_t.as_ref(), None, p, OpenFlags(raw_flags), 0o644, 0)
                             {
                                 if (step % 7 == 0) && held_guards.len() < 4 {
-                                    held_guards.push(OpenGuard::new(inode));
+                                    held_guards.push(OpenGuard::new_unchecked(inode));
                                 } else {
                                     let _ = inode.write_at(0, b"data");
                                 }
@@ -6559,7 +6579,7 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
     let (det_mt, _) =
         open_inode(env.as_ref(), None, b"/det_mt", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap();
-    let det_guard = OpenGuard::new(Arc::clone(&det_mt));
+    let det_guard = OpenGuard::new_unchecked(Arc::clone(&det_mt));
     unlink_at(env.as_ref(), None, b"/det_mt", false).unwrap();
     assert!(det_mt.is_detached());
     let det_calls = Arc::new(core::sync::atomic::AtomicUsize::new(0));
@@ -6624,7 +6644,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
                 open_inode(env.as_ref(), None, b"/src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
                     .unwrap();
             let src_ino = src.ino();
-            let _guard = if hold_open { Some(OpenGuard::new(src)) } else { None };
+            let _guard = if hold_open { Some(OpenGuard::new_unchecked(src)) } else { None };
 
             let sig = Arc::new((Mutex::new(false), Condvar::new()));
             let sig_hook = Arc::clone(&sig);
@@ -6740,7 +6760,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
                         OpKind::Symlink => symlink_at(env.as_ref(), b"/t", None, b"/dst").unwrap(),
                     };
                     let created_ino = created.ino();
-                    let _guard = if hold_open { Some(OpenGuard::new(created)) } else { None };
+                    let _guard = if hold_open { Some(OpenGuard::new_unchecked(created)) } else { None };
                     let ren_res = t_b.join().unwrap();
 
                     if rflags.has_noreplace() {
@@ -7183,7 +7203,7 @@ fn compute_cwd_path_retries_on_concurrent_rename_and_rejects_unlinked_cwd() {
     mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
     let cwd = mkdir_at(env.as_ref(), None, b"/p1/leaf", 0o755, 0).unwrap();
-    let guard = OpenGuard::new(Arc::clone(&cwd));
+    let guard = OpenGuard::new_unchecked(Arc::clone(&cwd));
 
     let env_h = Arc::clone(&env);
     fs.inner.hooks.lock().unwrap().post_lookup.insert(
@@ -7201,7 +7221,7 @@ fn compute_cwd_path_retries_on_concurrent_rename_and_rejects_unlinked_cwd() {
     mkdir_at(env.as_ref(), None, b"/a2", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/a1/sub", 0o755, 0).unwrap();
     let deep = mkdir_at(env.as_ref(), None, b"/a1/sub/deep", 0o755, 0).unwrap();
-    let deep_guard = OpenGuard::new(Arc::clone(&deep));
+    let deep_guard = OpenGuard::new_unchecked(Arc::clone(&deep));
 
     let fs_h2 = Arc::clone(&fs);
     let env_h2 = Arc::clone(&env);
@@ -7258,7 +7278,7 @@ fn concurrent_compute_cwd_path_vs_rename_at2_stress() {
     mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
     let cwd = mkdir_at(env.as_ref(), None, b"/p1/leaf", 0o755, 0).unwrap();
-    let _guard = OpenGuard::new(Arc::clone(&cwd));
+    let _guard = OpenGuard::new_unchecked(Arc::clone(&cwd));
 
     const MIN_TOGGLES: usize = 1000;
     const READER_ITERS: usize = 1000;
@@ -7753,4 +7773,562 @@ fn a_cacheable_child_of_a_non_cacheable_directory_is_refused() {
     let (env, dynfs, _proc_root) = setup_dynfs();
     dynfs.shared.live.lock().unwrap().insert(9);
     let _ = resolve_path(&env, None, b"/proc/9/cached", ResolveFlags::default());
+}
+
+// #262: open racing unlink. `GateFs` frees an unlinked inode's data the way
+// ext4 does (Gate 6: the last unlink reads `open_count()` under the inode's
+// lock, the one `stat` takes, and frees it if 0, detaches it otherwise), so an
+// open file description on a freed inode shows up as `ENOENT` on read. Hooks
+// put the unlink at each point of the open. Its rename lock is a real one, so
+// a hook can show it runs outside Lock 3.
+
+type GateHook = alloc::boxed::Box<dyn FnOnce() + Send>;
+
+struct GateState {
+    nlink: u32,
+    /// `None` once freed by an unlink that saw no open reference.
+    data: Option<Vec<u8>>,
+    children: BTreeMap<String, Arc<GateInode>>,
+}
+
+#[derive(Default)]
+struct GateHooks {
+    /// Runs once, right after the next `inc_open_count` raised the count.
+    after_inc: Option<GateHook>,
+    /// Runs once, at the start of the next `stat` (before its lock).
+    before_stat: Option<GateHook>,
+    /// Runs once, right after the next `stat` (its lock released).
+    after_stat: Option<GateHook>,
+    /// Runs once, right after the next lookup of this name (its lock released).
+    after_lookup: Option<(String, GateHook)>,
+    /// Runs once, at the next `exempt_from_rofs`: in `open_inode_guarded`,
+    /// after the lookup and after Lock 3, before the count goes up.
+    at_rofs_check: Option<GateHook>,
+    /// The next `stat` fails with this.
+    stat_error: Option<VfsError>,
+    /// Every `truncate` fails with this.
+    truncate_error: Option<VfsError>,
+}
+
+struct GateInode {
+    lock_id: u64,
+    ino: Ino,
+    inode_type: InodeType,
+    next_ino: Arc<AtomicU64>,
+    open_count: AtomicU32,
+    detached: AtomicBool,
+    state: Mutex<GateState>,
+    hooks: Mutex<GateHooks>,
+    locks: Mutex<AdvisoryLocks>,
+}
+
+impl GateInode {
+    fn new(next_ino: &Arc<AtomicU64>, inode_type: InodeType, nlink: u32, data: Option<Vec<u8>>) -> Arc<Self> {
+        Arc::new(Self {
+            lock_id: next_lock_id(),
+            ino: next_ino.fetch_add(1, Ordering::Relaxed),
+            inode_type,
+            next_ino: Arc::clone(next_ino),
+            open_count: AtomicU32::new(0),
+            detached: AtomicBool::new(false),
+            state: Mutex::new(GateState { nlink, data, children: BTreeMap::new() }),
+            hooks: Mutex::new(GateHooks::default()),
+            locks: Mutex::new(AdvisoryLocks::new()),
+        })
+    }
+
+    fn arm(&self, f: impl FnOnce(&mut GateHooks)) {
+        f(&mut self.hooks.lock().unwrap());
+    }
+
+    fn run(&self, take: impl FnOnce(&mut GateHooks) -> Option<GateHook>) {
+        let hook = take(&mut self.hooks.lock().unwrap());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn all_hooks_ran(&self) -> bool {
+        let h = self.hooks.lock().unwrap();
+        h.after_inc.is_none()
+            && h.before_stat.is_none()
+            && h.after_stat.is_none()
+            && h.after_lookup.is_none()
+            && h.at_rofs_check.is_none()
+    }
+
+    fn child(&self, name: &str) -> Option<Arc<GateInode>> {
+        self.state.lock().unwrap().children.get(name).cloned()
+    }
+}
+
+impl VfsInode for GateInode {
+    fn lock_id(&self) -> u64 {
+        self.lock_id
+    }
+    fn dev_id(&self) -> DevId {
+        DevId::ROOT
+    }
+    fn ino(&self) -> Ino {
+        self.ino
+    }
+    fn inode_type(&self) -> InodeType {
+        self.inode_type
+    }
+    fn open_count(&self) -> u32 {
+        self.open_count.load(Ordering::Acquire)
+    }
+    fn inc_open_count(&self) {
+        self.open_count.fetch_add(1, Ordering::AcqRel);
+        self.run(|h| h.after_inc.take());
+    }
+    fn dec_open_count(&self) -> u32 {
+        self.open_count.fetch_sub(1, Ordering::AcqRel) - 1
+    }
+    fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
+    }
+    fn exempt_from_rofs(&self) -> bool {
+        self.run(|h| h.at_rofs_check.take());
+        false
+    }
+    fn stat(&self) -> Result<Metadata, VfsError> {
+        self.run(|h| h.before_stat.take());
+        if let Some(e) = self.hooks.lock().unwrap().stat_error.take() {
+            return Err(e);
+        }
+        let meta = {
+            let g = self.state.lock().unwrap();
+            Metadata {
+                dev: DevId::ROOT,
+                ino: self.ino,
+                inode_type: self.inode_type,
+                mode: 0o644,
+                nlink: g.nlink,
+                uid: 0,
+                gid: 0,
+                rdev: DevId(0),
+                size: g.data.as_ref().map_or(0, |d| d.len() as u64),
+                blksize: 4096,
+                blocks: 0,
+                atime: Timespec::default(),
+                mtime: Timespec::default(),
+                ctime: Timespec::default(),
+            }
+        };
+        self.run(|h| h.after_stat.take());
+        Ok(meta)
+    }
+    fn lookup(&self, name: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+        let found = self.child(name);
+        self.run(|h| h.after_lookup.take_if(|(n, _)| n == name).map(|(_, hook)| hook));
+        found.map(|c| c as Arc<dyn VfsInode>).ok_or(VfsError::NoEnt)
+    }
+    fn create(&self, name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+        let mut g = self.state.lock().unwrap();
+        if g.children.contains_key(name) {
+            return Err(VfsError::Exist);
+        }
+        let f = GateInode::new(&self.next_ino, InodeType::File, 1, Some(Vec::new()));
+        g.children.insert(String::from(name), Arc::clone(&f));
+        Ok(f)
+    }
+    fn mkdir(&self, _name: &str, _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn unlink(&self, name: &str) -> Result<(), VfsError> {
+        let child = self.state.lock().unwrap().children.remove(name).ok_or(VfsError::NoEnt)?;
+        // Gate 6: the count read and the free or detach in one hold of the
+        // child's lock.
+        let mut cg = child.state.lock().unwrap();
+        if cg.nlink > 1 {
+            cg.nlink -= 1;
+            return Ok(());
+        }
+        cg.nlink = 0;
+        if child.open_count() > 0 {
+            child.detached.store(true, Ordering::Release);
+        } else {
+            cg.data = None;
+        }
+        Ok(())
+    }
+    fn rmdir(&self, _name: &str) -> Result<(), VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn link(&self, _name: &str, _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn readlink(&self) -> Result<Vec<u8>, VfsError> {
+        Err(VfsError::Inval)
+    }
+    fn rename(&self, _old: &str, _new_dir: &Arc<dyn VfsInode>, _new: &str, _f: RenameFlags) -> Result<(), VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn readdir(&self, _cursor: u64, _out: &mut Vec<DirEntry>, _max: usize) -> Result<(), VfsError> {
+        Ok(())
+    }
+    fn truncate(&self, size: u64) -> Result<(), VfsError> {
+        if let Some(e) = self.hooks.lock().unwrap().truncate_error {
+            return Err(e);
+        }
+        let mut g = self.state.lock().unwrap();
+        g.data.as_mut().ok_or(VfsError::NoEnt)?.resize(size as usize, 0);
+        Ok(())
+    }
+    fn set_mode(&self, _mode: u16) -> Result<(), VfsError> {
+        Ok(())
+    }
+    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), VfsError> {
+        Ok(())
+    }
+    fn set_times(&self, _atime: SetTime, _mtime: SetTime) -> Result<(), VfsError> {
+        Ok(())
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+        let g = self.state.lock().unwrap();
+        let data = g.data.as_ref().ok_or(VfsError::NoEnt)?;
+        let off = (offset as usize).min(data.len());
+        let n = buf.len().min(data.len() - off);
+        buf[..n].copy_from_slice(&data[off..off + n]);
+        Ok(n)
+    }
+    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize, VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn read_page(&self, _page_index: u64, _buf: &mut [u8; 4096]) -> Result<usize, VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn write_page(&self, _page_index: u64, _buf: &[u8]) -> Result<(), VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn sync(&self, _data_only: bool) -> Result<(), VfsError> {
+        Ok(())
+    }
+    fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError> {
+        f(&mut self.locks.lock().unwrap());
+        Ok(())
+    }
+}
+
+struct GateFs {
+    root: Arc<GateInode>,
+    rename_lock: Arc<Mutex<()>>,
+}
+
+impl FileSystem for GateFs {
+    fn dev_id(&self) -> DevId {
+        DevId::ROOT
+    }
+    fn name(&self) -> &'static str {
+        "gatefs"
+    }
+    fn root_inode(&self) -> Arc<dyn VfsInode> {
+        self.root.clone()
+    }
+    fn sync(&self) -> Result<(), VfsError> {
+        Ok(())
+    }
+    fn read_only(&self) -> bool {
+        false
+    }
+    fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
+        let _held = self.rename_lock.lock().unwrap();
+        f()
+    }
+}
+
+const GATE_DATA: &[u8] = b"still here";
+
+struct Gate {
+    env: SimpleVfsTables,
+    root: Arc<GateInode>,
+    files: Vec<Arc<GateInode>>,
+    rename_lock: Arc<Mutex<()>>,
+}
+
+impl Gate {
+    /// A hook unlinking `name` from the root, the way `unlink_at` reaches
+    /// the filesystem: under Lock 3 (so it must run outside it).
+    fn unlink_hook(&self, name: &'static str) -> GateHook {
+        let root = Arc::clone(&self.root);
+        let lock = Arc::clone(&self.rename_lock);
+        alloc::boxed::Box::new(move || {
+            let _held = lock.try_lock().expect("the hook runs outside Lock 3");
+            root.unlink(name).unwrap();
+        })
+    }
+}
+
+/// Tables over a `GateFs` whose root holds the files `names`, each with
+/// `GATE_DATA` and one link.
+fn gate_vfs(names: &[&str]) -> Gate {
+    let next_ino = Arc::new(AtomicU64::new(1));
+    let root = GateInode::new(&next_ino, InodeType::Dir, 2, None);
+    let files: Vec<Arc<GateInode>> = names
+        .iter()
+        .map(|name| {
+            let f = GateInode::new(&next_ino, InodeType::File, 1, Some(GATE_DATA.to_vec()));
+            root.state.lock().unwrap().children.insert(String::from(*name), Arc::clone(&f));
+            f
+        })
+        .collect();
+    let rename_lock = Arc::new(Mutex::new(()));
+    let env = SimpleVfsTables::new();
+    env.mount_root(Arc::new(GateFs { root: Arc::clone(&root), rename_lock: Arc::clone(&rename_lock) })).unwrap();
+    Gate { env, root, files, rename_lock }
+}
+
+fn read_gate(of: &OpenFile<StdLock<u64>>) -> Result<Vec<u8>, VfsError> {
+    let mut buf = [0u8; 32];
+    let n = of.inode.read_at(0, &mut buf)?;
+    Ok(buf[..n].to_vec())
+}
+
+fn gate_file(opened: Opened) -> OpenFile<StdLock<u64>> {
+    OpenFile::<StdLock<u64>>::from_opened(opened).unwrap()
+}
+
+const RDONLY: OpenFlags = OpenFlags(OpenFlags::O_RDONLY);
+const OPATH: OpenFlags = OpenFlags(OpenFlags::O_PATH);
+
+#[test]
+fn open_file_new_refuses_an_inode_freed_since_open_inode() {
+    // The window of #262: `open_inode` returned, the unlink frees the file
+    // (no open reference yet), then the open file description is built.
+    let g = gate_vfs(&["a"]);
+    let (inode, path) = open_inode(&g.env, None, b"/a", RDONLY, 0, 0).unwrap();
+    assert_eq!(g.files[0].open_count(), 0, "open_inode returns holding no reference");
+    unlink_at(&g.env, None, b"/a", false).unwrap();
+    match OpenFile::<StdLock<u64>>::new_unchecked_flags(inode, Arc::from(path.as_str()), RDONLY) {
+        Ok(of) => panic!("an open file description on a freed inode, reading {:?}", read_gate(&of)),
+        Err(e) => assert_eq!(e, VfsError::NoEnt),
+    }
+    assert_eq!(g.files[0].open_count(), 0, "the refused open gave its reference back");
+}
+
+#[test]
+fn guarded_open_keeps_the_data_through_a_racing_unlink() {
+    let g = gate_vfs(&["after", "between", "checked", "before"]);
+    let f = &g.files;
+
+    // 1. The unlink lands after the guarded open returned, before the open
+    //    file description is built: the reference the open took carries over.
+    let opened = open_inode_guarded(&g.env, None, b"/after", RDONLY, 0, 0).unwrap();
+    assert_eq!(f[0].open_count(), 1);
+    assert_eq!(opened.flags(), RDONLY);
+    unlink_at(&g.env, None, b"/after", false).unwrap();
+    let of = gate_file(opened);
+    assert_eq!(f[0].open_count(), 1, "from_opened takes the reference over, no second count");
+    assert!(f[0].is_detached());
+    assert_eq!(read_gate(&of).unwrap(), GATE_DATA);
+    drop(of);
+    assert_eq!(f[0].open_count(), 0);
+
+    // 2. The unlink lands right after the open raised the count, before its
+    //    liveness check: Gate 6 sees the reference and detaches.
+    let hook = g.unlink_hook("between");
+    f[1].arm(|h| h.after_inc = Some(hook));
+    let of = gate_file(open_inode_guarded(&g.env, None, b"/between", RDONLY, 0, 0).unwrap());
+    assert!(f[1].all_hooks_ran());
+    assert!(f[1].is_detached());
+    assert_eq!(f[1].open_count(), 1);
+    assert_eq!(read_gate(&of).unwrap(), GATE_DATA);
+    drop(of);
+    assert_eq!(f[1].open_count(), 0);
+
+    // 3. The unlink lands right after the liveness check read the link
+    //    count: the count was already up, so it still detaches.
+    let hook = g.unlink_hook("checked");
+    f[2].arm(|h| h.after_stat = Some(hook));
+    let of = gate_file(open_inode_guarded(&g.env, None, b"/checked", RDONLY, 0, 0).unwrap());
+    assert!(f[2].all_hooks_ran());
+    assert!(f[2].is_detached());
+    assert_eq!(read_gate(&of).unwrap(), GATE_DATA);
+    drop(of);
+    assert_eq!(f[2].open_count(), 0);
+
+    // 4. The unlink lands after the lookup, before the count went up: the
+    //    file is freed and the open fails cleanly, its reference given back.
+    let hook = g.unlink_hook("before");
+    g.root.arm(|h| h.after_lookup = Some((String::from("before"), hook)));
+    assert_eq!(open_inode_guarded(&g.env, None, b"/before", RDONLY, 0, 0).err(), Some(VfsError::NoEnt));
+    assert!(g.root.all_hooks_ran());
+    assert!(!f[3].is_detached());
+    assert_eq!(f[3].open_count(), 0);
+    let mut buf = [0u8; 4];
+    assert_eq!(f[3].read_at(0, &mut buf), Err(VfsError::NoEnt), "the model freed it");
+}
+
+#[test]
+fn try_new_reads_the_link_count_before_the_detached_flag() {
+    // The unlink lands inside the liveness check, after the count went up and
+    // before `stat` reads: it detaches, and the check must see that. Reading
+    // `is_detached` before `stat` would see "not detached" and then
+    // `nlink == 0`, refusing a live file.
+    let g = gate_vfs(&["mid"]);
+    let hook = g.unlink_hook("mid");
+    g.files[0].arm(|h| h.before_stat = Some(hook));
+    let of = gate_file(open_inode_guarded(&g.env, None, b"/mid", RDONLY, 0, 0).unwrap());
+    assert!(g.files[0].all_hooks_ran());
+    assert!(g.files[0].is_detached());
+    assert_eq!(read_gate(&of).unwrap(), GATE_DATA);
+    drop(of);
+    assert_eq!(g.files[0].open_count(), 0);
+}
+
+#[test]
+fn o_path_open_racing_unlink_detaches_or_fails_cleanly() {
+    let g = gate_vfs(&["between", "before", "plain"]);
+    let f = &g.files;
+
+    // After the count went up: detached, the descriptor holds it.
+    let hook = g.unlink_hook("between");
+    f[0].arm(|h| h.after_inc = Some(hook));
+    let of = gate_file(open_inode_guarded(&g.env, None, b"/between", OPATH, 0, 0).unwrap());
+    assert!(f[0].all_hooks_ran());
+    assert!(of.is_path());
+    assert!(f[0].is_detached());
+    assert_eq!(f[0].open_count(), 1);
+    drop(of);
+    assert_eq!(f[0].open_count(), 0);
+
+    // Before it went up: freed, the open fails, nothing counted.
+    let hook = g.unlink_hook("before");
+    g.root.arm(|h| h.after_lookup = Some((String::from("before"), hook)));
+    assert_eq!(open_inode_guarded(&g.env, None, b"/before", OPATH, 0, 0).err(), Some(VfsError::NoEnt));
+    assert!(g.root.all_hooks_ran());
+    assert_eq!(f[1].open_count(), 0);
+
+    // `open_inode` with `O_PATH` gives its reference back.
+    let (inode, _) = open_inode(&g.env, None, b"/plain", OPATH, 0, 0).unwrap();
+    assert!(Arc::ptr_eq(&(Arc::clone(&f[2]) as Arc<dyn VfsInode>), &inode));
+    assert_eq!(f[2].open_count(), 0);
+}
+
+#[test]
+fn o_creat_open_of_a_file_unlinked_after_lock_3_opens_a_new_one() {
+    // `O_CREAT` (no `O_EXCL`) finds `/c` under Lock 3; the unlink lands
+    // once Lock 3 is released, before the count goes up, and frees it.
+    // POSIX: the old file or a new one, never `ENOENT`. The open goes
+    // round again and creates a new `/c`.
+    let g = gate_vfs(&["c"]);
+    let old = Arc::clone(&g.files[0]);
+    let hook = g.unlink_hook("c");
+    old.arm(|h| h.at_rofs_check = Some(hook));
+    let flags = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR);
+    let of = gate_file(open_inode_guarded(&g.env, None, b"/c", flags, 0o644, 0).unwrap());
+    assert!(old.all_hooks_ran());
+    assert_eq!(old.open_count(), 0);
+    assert!(!old.is_detached());
+    let new = g.root.child("c").expect("a new /c");
+    assert!(!Arc::ptr_eq(&new, &old));
+    assert_eq!(of.inode.lock_id(), new.lock_id());
+    assert_eq!(new.open_count(), 1);
+    assert_eq!(read_gate(&of).unwrap(), b"");
+    drop(of);
+    assert_eq!(new.open_count(), 0);
+
+    // Without `O_CREAT` the same race is a clean `ENOENT`.
+    let g = gate_vfs(&["c"]);
+    let hook = g.unlink_hook("c");
+    g.files[0].arm(|h| h.at_rofs_check = Some(hook));
+    assert_eq!(open_inode_guarded(&g.env, None, b"/c", RDONLY, 0, 0).err(), Some(VfsError::NoEnt));
+    assert_eq!(g.files[0].open_count(), 0);
+}
+
+#[test]
+fn failed_opens_give_their_reference_back() {
+    let g = gate_vfs(&["stat", "stat_new", "trunc"]);
+    let f = &g.files;
+
+    // `stat` fails inside `try_new`: its error, unchanged, and no count.
+    f[0].arm(|h| h.stat_error = Some(VfsError::Io));
+    assert_eq!(open_inode_guarded(&g.env, None, b"/stat", RDONLY, 0, 0).err(), Some(VfsError::Io));
+    assert_eq!(f[0].open_count(), 0);
+    f[1].arm(|h| h.stat_error = Some(VfsError::Io));
+    let res = OpenFile::<StdLock<u64>>::new_unchecked_flags(
+        Arc::clone(&f[1]) as Arc<dyn VfsInode>,
+        Arc::from("/stat_new"),
+        RDONLY,
+    );
+    assert_eq!(res.err(), Some(VfsError::Io));
+    assert_eq!(f[1].open_count(), 0);
+
+    // `O_TRUNC`'s truncate fails after the count went up.
+    f[2].arm(|h| h.truncate_error = Some(VfsError::Io));
+    let trunc = OpenFlags(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC);
+    assert_eq!(open_inode_guarded(&g.env, None, b"/trunc", trunc, 0, 0).err(), Some(VfsError::Io));
+    assert_eq!(f[2].open_count(), 0);
+}
+
+#[test]
+fn o_creat_retries_only_a_freed_file_and_stops_with_eexist() {
+    // `stat()` failing with `ENOENT` (a vanished procfs entry, say) is not a
+    // lost race: passed through at once, not retried (a retry would find
+    // `stat` working again and succeed).
+    let g = gate_vfs(&["s"]);
+    g.files[0].arm(|h| h.stat_error = Some(VfsError::NoEnt));
+    let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR);
+    assert_eq!(open_inode_guarded(&g.env, None, b"/s", creat, 0o644, 0).err(), Some(VfsError::NoEnt));
+    assert_eq!(g.files[0].open_count(), 0);
+
+    // Churn: every round finds a `/churn` that is unlinked (and replaced)
+    // before the reference goes up. After `MAX_CREAT_RACE_RETRIES` more
+    // rounds than the first the open gives up with `EEXIST`, the same error
+    // as the create loop's own limit; no reference left anywhere.
+    fn arm_churn(root: &Arc<GateInode>, lock: &Arc<Mutex<()>>, seen: &Arc<Mutex<Vec<Arc<GateInode>>>>) {
+        let f = GateInode::new(&root.next_ino, InodeType::File, 1, Some(GATE_DATA.to_vec()));
+        let (r, l, n) = (Arc::clone(root), Arc::clone(lock), Arc::clone(seen));
+        f.arm(|h| {
+            h.at_rofs_check = Some(alloc::boxed::Box::new(move || {
+                {
+                    let _held = l.try_lock().expect("the hook runs outside Lock 3");
+                    r.unlink("churn").unwrap();
+                }
+                arm_churn(&r, &l, &n);
+            }))
+        });
+        seen.lock().unwrap().push(Arc::clone(&f));
+        root.state.lock().unwrap().children.insert(String::from("churn"), f);
+    }
+    let g = gate_vfs(&[]);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    arm_churn(&g.root, &g.rename_lock, &seen);
+    assert_eq!(open_inode_guarded(&g.env, None, b"/churn", creat, 0o644, 0).err(), Some(VfsError::Exist));
+    let seen = seen.lock().unwrap();
+    // Each round's file, plus the one armed for a round that never came.
+    assert_eq!(seen.len(), crate::ops::MAX_CREAT_RACE_RETRIES + 2);
+    assert!(seen.iter().all(|f| f.open_count() == 0));
+    assert!(seen[..seen.len() - 1].iter().all(|f| f.all_hooks_ran() && f.state.lock().unwrap().data.is_none()));
+}
+
+#[test]
+fn o_trunc_truncates_only_after_the_reference_is_checked() {
+    // The file `O_CREAT | O_TRUNC` finds is freed before the reference goes
+    // up: the open makes a new `/c` instead of failing on the freed one.
+    let g = gate_vfs(&["c"]);
+    let old = Arc::clone(&g.files[0]);
+    let hook = g.unlink_hook("c");
+    old.arm(|h| h.at_rofs_check = Some(hook));
+    let flags = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_TRUNC | OpenFlags::O_RDWR);
+    let of = gate_file(open_inode_guarded(&g.env, None, b"/c", flags, 0o644, 0).unwrap());
+    assert!(old.all_hooks_ran());
+    let new = g.root.child("c").expect("a new /c");
+    assert_eq!(of.inode.lock_id(), new.lock_id());
+    assert_eq!(old.open_count(), 0);
+    drop(of);
+
+    // The check fails (`stat` errors): nothing is truncated.
+    let g = gate_vfs(&["t"]);
+    g.files[0].arm(|h| h.stat_error = Some(VfsError::Io));
+    let trunc = OpenFlags(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC);
+    assert_eq!(open_inode_guarded(&g.env, None, b"/t", trunc, 0, 0).err(), Some(VfsError::Io));
+    assert_eq!(g.files[0].open_count(), 0);
+    let mut buf = [0u8; 32];
+    let n = g.files[0].read_at(0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], GATE_DATA, "the data is intact");
 }
