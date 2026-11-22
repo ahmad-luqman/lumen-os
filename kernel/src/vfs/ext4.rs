@@ -27,6 +27,7 @@ use ext4plus::inode::{Inode, InodeFlags, InodeMode};
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
 use lumen_vfs::ext4::rdev_from_i_block;
+use lumen_vfs::nlink::NlinkBounds;
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
     VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
@@ -595,7 +596,7 @@ const DETACHED_SCAN_LIMIT_PAGES: usize = 4 * page_cache::DETACHED_QUOTA_PAGES;
 
 /// One mounted filesystem's state behind Lock 6.
 ///
-/// `nlink_floors` and `nlink_ceilings` are in-memory corrections to on-disk
+/// `nlink` ([`NlinkBounds`]) holds in-memory corrections to on-disk
 /// `links_count`s. A namespace operation that fails part-way (a write error
 /// after `ext4plus` already changed one count) rolls the counts back, and if
 /// a rollback write fails too, the disk keeps a count that disagrees with the
@@ -619,26 +620,20 @@ struct Ext4FsInner {
     bcache: SharedBlockCache,
     layout: Ext4DiskLayout,
     live_inodes: BTreeMap<u32, Weak<Ext4Inode>>,
-    nlink_floors: BTreeMap<u32, u32>,
-    nlink_ceilings: BTreeMap<u32, u32>,
+    nlink: NlinkBounds,
 }
 
 impl Ext4FsInner {
     fn nlink_floor(&self, disk_ino: u32) -> u32 {
-        self.nlink_floors.get(&disk_ino).copied().unwrap_or(0)
+        self.nlink.floor(disk_ino)
     }
 
     fn nlink_ceiling(&self, disk_ino: u32) -> Option<u32> {
-        self.nlink_ceilings.get(&disk_ino).copied()
+        self.nlink.ceiling(disk_ino)
     }
 
     fn apply_nlink_bounds(&self, disk_ino: u32, raw_nlink: u32) -> u32 {
-        let floor = self.nlink_floor(disk_ino);
-        let with_floor = raw_nlink.max(floor);
-        match self.nlink_ceiling(disk_ino) {
-            Some(ceil) => with_floor.min(ceil.max(floor)),
-            None => with_floor,
-        }
+        self.nlink.apply(disk_ino, raw_nlink)
     }
 
     /// The on-disk `links_count` of `disk_ino`, if it can be read.
@@ -665,35 +660,9 @@ impl Ext4FsInner {
             return;
         }
         let disk = self.disk_links_count(disk_ino);
-        if disk.is_some_and(|n| n >= min_nlink) {
-            return;
-        }
-        let old_floor = self.nlink_floor(disk_ino);
-        let new_floor =
-            *self.nlink_floors.entry(disk_ino).and_modify(|cur| *cur = (*cur).max(min_nlink)).or_insert(min_nlink);
-        if self.nlink_ceilings.get(&disk_ino).is_some_and(|&c| c < new_floor) {
-            self.nlink_ceilings.remove(&disk_ino);
-        }
-        if new_floor != old_floor {
-            self.log_kept_bound(disk_ino, disk, &alloc::format!("at least {new_floor}"));
-        }
-    }
-
-    fn set_nlink_floor(&mut self, disk_ino: u32, floor: u32) {
-        if floor == 0 {
-            self.nlink_floors.remove(&disk_ino);
-        } else {
-            self.nlink_floors.insert(disk_ino, floor);
-            if self.nlink_ceilings.get(&disk_ino).is_some_and(|&c| c < floor) {
-                self.nlink_ceilings.remove(&disk_ino);
-            }
-        }
-    }
-
-    fn set_nlink_ceiling(&mut self, disk_ino: u32, ceiling: u32) {
-        self.nlink_ceilings.insert(disk_ino, ceiling);
-        if self.nlink_floors.get(&disk_ino).is_some_and(|&f| f > ceiling) {
-            self.nlink_floors.remove(&disk_ino);
+        if self.nlink.raise_floor(disk_ino, disk, min_nlink) {
+            let floor = self.nlink.floor(disk_ino);
+            self.log_kept_bound(disk_ino, disk, &alloc::format!("at least {floor}"));
         }
     }
 
@@ -702,27 +671,22 @@ impl Ext4FsInner {
     /// already holds `exact`.
     fn set_nlink_exact(&mut self, disk_ino: u32, exact: u32) {
         let disk = self.disk_links_count(disk_ino);
-        if disk == Some(exact) {
-            self.clear_nlink_bounds(disk_ino);
-            return;
-        }
-        let unchanged = self.nlink_floor(disk_ino) == exact && self.nlink_ceiling(disk_ino) == Some(exact);
-        self.set_nlink_floor(disk_ino, exact);
-        self.set_nlink_ceiling(disk_ino, exact);
-        if !unchanged {
+        if self.nlink.reconcile(disk_ino, disk, exact) {
             self.log_kept_bound(disk_ino, disk, &alloc::format!("{exact}"));
         }
     }
 
     fn clear_nlink_floor(&mut self, disk_ino: u32) {
-        self.nlink_floors.remove(&disk_ino);
+        self.nlink.clear_floor(disk_ino);
     }
 
     fn clear_nlink_bounds(&mut self, disk_ino: u32) {
-        self.nlink_floors.remove(&disk_ino);
-        self.nlink_ceilings.remove(&disk_ino);
+        self.nlink.clear(disk_ino);
     }
 
+    /// `disk_ino`'s count on disk was just read as `disk_nlink` and should be
+    /// `expected`: nothing is kept when they agree, else the count is pinned
+    /// ([`Self::set_nlink_exact`], which reads the disk again).
     fn reconcile_disk_nlink(&mut self, disk_ino: u32, disk_nlink: u32, expected: u32) {
         if disk_nlink == expected {
             self.clear_nlink_bounds(disk_ino);
@@ -886,8 +850,7 @@ impl Ext4FileSystem {
                 bcache,
                 layout,
                 live_inodes: BTreeMap::new(),
-                nlink_floors: BTreeMap::new(),
-                nlink_ceilings: BTreeMap::new(),
+                nlink: NlinkBounds::new(),
             }),
             #[cfg(feature = "ktest")]
             clock: SleepMutex::new(None),
