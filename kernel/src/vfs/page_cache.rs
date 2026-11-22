@@ -471,11 +471,16 @@ impl MappedPage {
     /// The file's size when the page was looked up (under the inode's Lock
     /// 4). The page starts below it; the page's bytes past it are zero
     /// unless a mapping stored there. A snapshot: a truncate may change the
-    /// size once Lock 4 is released. A shrink takes `AddressSpace::inner`
-    /// (Lock 1) before Lock 4 to invalidate mappings (ARCHITECTURE section
-    /// 5), so a fault holding Lock 1 across the call and the mapping can
-    /// rely on it; one that doesn't must look again. (The fault path needs
-    /// only [`valid_len`](Self::valid_len), through `copy_to_frame`.)
+    /// size once Lock 4 is released, even while the fault holds
+    /// `AddressSpace::inner` (Lock 1), since the truncate takes Lock 4 alone.
+    /// A page mapped from a stale snapshot is unmapped all the same: the
+    /// shrinking syscall's `invalidate_file_from` takes Lock 1 after the
+    /// truncate, and so runs once that fault's mapping is in place
+    /// (ARCHITECTURE section 5's rules: the caller's own space only until
+    /// M8, not after `O_TRUNC`). A private copy-on-write copy of the end
+    /// page made from a stale snapshot can keep bytes past the new end
+    /// (bytes a shared mapping stored past it). (The fault path needs only
+    /// [`valid_len`](Self::valid_len), through `copy_to_frame`.)
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests' check of the snapshot
     pub(crate) fn file_size(&self) -> u64 {
         self.file_size
@@ -541,9 +546,11 @@ impl Drop for WritableMap {
 ///   unless a mapping stored there.
 /// - **Truncate:** a shrink's `remove_from` drops the cache's reference to
 ///   the pages past the new size and stops counting them, even one a
-///   mapping still holds. That is sound only because ARCHITECTURE section
-///   5's truncate invalidation (Lock 1 before Lock 4) unmaps those pages in
-///   the same shrink, so no mapping keeps a page the cache has let go.
+///   mapping still holds. The page stays alive, pinned by that mapping,
+///   until ARCHITECTURE section 5's truncate invalidation, which the
+///   shrinking syscall runs once the truncate has returned, unmaps it (with
+///   section 5's limits: the caller's own space only until M8, not yet
+///   after `O_TRUNC`).
 /// - **Other inodes:** `NoDev` for anything but a regular file of `ext4`
 ///   or `tmpfs` (directories, symlinks, `devfs`, `procfs`). `NoEnt` for an
 ///   `ext4` inode unlinked and not open, as `read_at` says.
@@ -621,80 +628,86 @@ pub(super) mod ktest_hooks {
 }
 
 /// Scratch files on fresh `tmpfs` and `ext4` volumes for the file-backed VM's
-/// ktests (`mm::user_vm`), which can't reach `vfs`'s in-memory block device
-/// themselves. Nothing here is mounted in the global tables.
+/// ktests (`mm::user_vm`) and the positional I/O and `fsync` ktests
+/// (`linux::syscall::io`), which can't reach `vfs`'s in-memory block device
+/// themselves. Nothing here mounts itself in the global tables (a ktest
+/// that wants one there mounts `Ext4Volume::fs` itself, and unmounts it).
 #[cfg(feature = "ktest")]
 pub(crate) mod ktest_files {
     use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::Ordering;
 
-    use lumen_bcache::{BlockCache, BlockError};
     use lumen_vfs::{DevId, FileSystem, VfsInode};
 
+    use super::super::build_minimal_ext4_image_blocks;
+    use super::super::ext4::ktest_util::{self, Mnt};
     use super::super::ext4::{BlockCacheBackend, Ext4FileSystem, Ext4Inode};
-    use super::super::{MemBlkDev, build_minimal_ext4_image_blocks};
-    use crate::sync::SleepMutex;
 
-    /// A block cache over an in-memory disk whose reads fail on request.
-    struct FlakyCache {
-        inner: SleepMutex<BlockCache<MemBlkDev>>,
-        fail_reads: AtomicBool,
-    }
-
-    impl BlockCacheBackend for FlakyCache {
-        fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError> {
-            if self.fail_reads.load(Ordering::Acquire) {
-                return Err(BlockError::Io);
-            }
-            self.inner.lock().read_at(byte_off, dst)
-        }
-
-        fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError> {
-            self.inner.lock().write_at(byte_off, src)
-        }
-
-        fn sync(&self) -> Result<(), BlockError> {
-            self.inner.lock().sync()
-        }
-    }
-
-    /// A fresh writable `ext4` volume (1 MiB) on an in-memory disk.
+    /// A fresh writable `ext4` volume (1 MiB) on an in-memory disk, behind
+    /// `ext4::ktest_util`'s fault-injecting block cache.
     pub(crate) struct Ext4Volume {
-        cache: Arc<FlakyCache>,
-        fs: Arc<Ext4FileSystem>,
+        mnt: Mnt,
         pub(crate) root: Arc<dyn VfsInode>,
     }
 
     impl Ext4Volume {
         pub(crate) fn new(minor: u32) -> Result<Self, &'static str> {
-            let dev = MemBlkDev::new(build_minimal_ext4_image_blocks(256), false);
-            let cache = Arc::new(FlakyCache {
-                inner: SleepMutex::new(BlockCache::new(dev, 64).map_err(|_| "block cache")?),
-                fail_reads: AtomicBool::new(false),
-            });
-            let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&cache) as Arc<dyn BlockCacheBackend>;
-            let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "ext4 mount")?;
-            Ok(Self { cache, root: fs.root_inode(), fs })
+            let mnt = ktest_util::mount(build_minimal_ext4_image_blocks(256), minor)?;
+            Ok(Self { root: Arc::clone(&mnt.root), mnt })
+        }
+
+        /// The mounted filesystem (to mount it in the global tables).
+        pub(crate) fn fs(&self) -> Arc<dyn FileSystem> {
+            Arc::clone(&self.mnt.fs) as Arc<dyn FileSystem>
         }
 
         /// The root of a read-only mount of the same disk (through the same
         /// block cache): what it reads is on the disk, not in the first
-        /// mount's page cache.
+        /// mount's page cache. (`ext4::ktest_util::remount_ro`, by contrast,
+        /// syncs the block cache and mounts a copy of the device; see also
+        /// [`Self::mount_device_copy_ro`], which mounts a copy without
+        /// syncing.)
         pub(crate) fn remount_ro(&self, minor: u32) -> Result<Arc<dyn VfsInode>, &'static str> {
-            let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&self.cache) as Arc<dyn BlockCacheBackend>;
+            let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&self.mnt.cache) as Arc<dyn BlockCacheBackend>;
             let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
             Ok(fs.root_inode())
         }
 
         /// The volume's free inodes, as its superblock counts them.
         pub(crate) fn free_inodes(&self) -> u32 {
-            super::super::ext4::ktest_util::free_inodes(&self.fs)
+            ktest_util::free_inodes(&self.mnt.fs)
         }
 
         /// Make every disk read fail (`true`) or work again.
         pub(crate) fn fail_reads(&self, fail: bool) {
-            self.cache.fail_reads.store(fail, Ordering::Release);
+            self.mnt.cache.fail_reads.store(fail, Ordering::Release);
         }
+
+        /// Make every write into the block cache, and its syncs, fail
+        /// (`true`) or work again (`fsync`'s `-EIO`, #254).
+        pub(crate) fn fail_writes(&self, fail: bool) {
+            self.mnt.cache.fail_writes.store(fail, Ordering::Release);
+        }
+
+        /// Make the block cache's syncs alone fail (`true`) or work again:
+        /// writes still land in the cache, which keeps them dirty.
+        pub(crate) fn fail_syncs(&self, fail: bool) {
+            self.mnt.cache.fail_syncs.store(fail, Ordering::Release);
+        }
+
+        /// The root of a read-only mount of a copy of the disk's bytes as
+        /// they are now, not through the block cache: what it reads reached
+        /// the device.
+        pub(crate) fn mount_device_copy_ro(&self, minor: u32) -> Result<Arc<dyn VfsInode>, &'static str> {
+            Ok(ktest_util::mount_ro_image(self.mnt.dev_bytes(), minor)?.root_inode())
+        }
+    }
+
+    /// A fresh writable `ext4` volume (1 MiB) over `ext4::ktest_util`'s
+    /// `FaultCache`, which counts the filesystem's writes and fails a chosen
+    /// one (`arm_write`) or all (`fail_writes`).
+    pub(crate) fn fault_ext4(minor: u32) -> Result<Mnt, &'static str> {
+        ktest_util::mount(build_minimal_ext4_image_blocks(256), minor)
     }
 
     /// A fresh `tmpfs` holding `quota_bytes`.

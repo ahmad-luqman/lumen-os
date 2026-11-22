@@ -77,6 +77,67 @@ tests = [
 ]
 
 [[feature]]
+name = "fcntl (F_DUPFD/F_DUPFD_CLOEXEC lowest free at or above the minimum, F_GETFD/F_SETFD, F_GETFL/F_SETFL changing only O_APPEND and O_NONBLOCK, F_GETLK/F_SETLK/F_SETLKW POSIX record locks: conflicts with the owner's pid, -EAGAIN, range splitting, SEEK_CUR/SEEK_END and negative lengths, -EINVAL and -EOVERFLOW before the access-mode -EBADF, a blocked F_SETLKW woken by unlock, by a downgrade, by the holder closing any fd of the file, or by its exit, a release between its try and its wait not lost; -EDEADLK for a cycle of waiters and never from a view older than the last release) and flock (per open file description, shared by dups, LOCK_NB -EWOULDBLOCK, the operation checked before the fd and LOCK_MAND ignored, a blocked LOCK_EX woken by LOCK_UN, the last close, or exit, a blocked LOCK_SH by a downgrade; a blocking upgrade giving up its shared lock first), O_PATH refused (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_dupfd_fd_flags_and_status_flags",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_record_locks_check_modes_and_arguments",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_belongs_to_the_open_file_description",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_blocks_until_unlock_close_or_exit",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_blocks_until_unlock_last_close_or_exit",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_getlk_sees_split_ranges_and_offsets_from_seek_cur_and_end",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_refuses_a_deadlock",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_blocking_upgrade_gives_up_the_shared_lock_first",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_reader_woken_by_a_downgrade",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_shared_waiter_woken_by_a_downgrade",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_sees_a_release_between_its_try_and_its_wait",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_retries_on_a_stale_view",
+    "ktest:lumen_kernel::linux::process::process_close_releases_flock_on_last_slot_and_posix_locks_on_any",
+    "cargo:lumen-vfs",
+]
+
+[[feature]]
+name = "pread64/pwrite64 at a given offset without moving the fd's (across a page and over 4 KiB, a hole past EOF reading as zeros, O_APPEND appending whatever the offset, also across chunks, a fault mid-transfer returning what moved, a disk read error as -EIO, a full tmpfs as a short write then -ENOSPC; in Linux's errno order: -EINVAL negative offsets, -EBADF, -ESPIPE on terminals, -EBADF directions, -EFAULT outside user space, -EINVAL past i64::MAX, -EISDIR), fsync/fdatasync writing an ext4 file through the block cache to the device (-EIO when writes or the cache's sync fail, the data written by the next sync; 0 on an open unlinked file; -EINVAL on terminals, devices and procfs; -EBADF on O_PATH), sync flushing every mounted filesystem and returning 0 though one fails, a filesystem over-reporting a chunk taken as -EIO, and their dispatch registers (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::io::io_pread_pwrite_at_offsets_leave_the_offset_alone",
+    "ktest:lumen_kernel::linux::syscall::io::io_pwrite_appends_on_o_append_and_positional_errnos",
+    "ktest:lumen_kernel::linux::syscall::io::io_pread_pwrite_report_filesystem_errors",
+    "ktest:lumen_kernel::linux::syscall::io::io_fsync_writes_an_ext4_file_back_and_reports_eio",
+    "ktest:lumen_kernel::linux::syscall::io::io_fsync_refuses_terminals_devices_and_procfs",
+    "ktest:lumen_kernel::linux::syscall::io::io_sync_flushes_every_mounted_filesystem",
+    "ktest:lumen_kernel::linux::syscall::io::io_a_filesystem_reporting_more_than_its_chunk_is_eio",
+]
+
+[[feature]]
+name = "stat/lstat/newfstatat/statx and access/faccessat/faccessat2 through one dirfd resolution (AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH naming the dirfd's file and a NULL path with it read as an empty one by newfstatat and statx, AT_NO_AUTOMOUNT and the statx sync bits ignored, statx's basic fields in stx_mask whatever was asked (-EINVAL for STATX__RESERVED or both sync bits), root's access rules with -EROFS for W_OK on a read-only mount, -EINVAL for bad flags or modes before the path, -ENOENT/-ENOTDIR/-ELOOP/-EFAULT/-EBADF/-ENAMETOOLONG) (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::stat::tests::stat_lstat_and_newfstatat_on_a_file_a_directory_and_a_symlink",
+    "ktest:lumen_kernel::linux::syscall::stat::tests::stat_statx_mask_and_fields_agree_with_stat",
+    "ktest:lumen_kernel::linux::syscall::stat::tests::stat_access_modes_follow_the_root_rules",
+    "ktest:lumen_kernel::linux::syscall::stat::tests::stat_family_errnos",
+    "ktest:lumen_kernel::linux::syscall::stat::tests::stat_handlers_take_their_registers_in_order",
+    "scenario:test_linux_user::test_busybox_file_syscalls",
+]
+
+[[feature]]
+name = "chmod/fchmod/fchmodat/fchmodat2 (07777 only, -EOPNOTSUPP on a symlink with AT_SYMLINK_NOFOLLOW), chown/fchown/lchown/fchownat (-1 unchanged, setuid and group-exec setgid dropped on non-directories in the same set_owner write, a failed chown changing nothing), umask (& 0o777, applied by openat O_CREAT), utimensat (NULL times, UTIME_NOW/UTIME_OMIT, NULL path as futimens, AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH, -EINVAL nsec) and truncate/ftruncate (tail zeroed, mtime/ctime, the caller's mapped pages past the new end unmapped; -EINVAL, -EISDIR, -EBADF, -EFBIG, -EROFS) (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chmod_family_sets_the_permission_and_special_bits",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chown_family_sets_owner_and_group_with_minus_one_unchanged",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_umask_returns_the_old_mask_and_applies_to_openat_o_creat",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_utimensat_sets_omits_and_nows_by_path_fd_and_link",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_resizes_zeroing_the_tail_and_updates_mtime_and_ctime",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_errnos",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_shrink_unmaps_mapped_pages_past_the_new_end",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chown_on_ext4_drops_set_id_bits_in_its_one_write_and_a_failed_one_changes_nothing",
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_handlers_take_their_registers_in_order",
+]
+
+[[feature]]
 name = "getdents64, chdir and fchdir (#254): linux_dirent64 records (8-byte aligned, d_type for every inode type, . and ..) resuming at the open file's dir_cursor, the filesystem's readdir cursor, stable as entries come and go (a model of busybox rm -r's loop empties a directory on tmpfs and ext4; every survivor listed once; procfs keyed by pid and fd; tmpfs names keep their place through a rename over them or an exchange), d_off for seekdir, lseek rewinding, a partial fill stopping before the entry that doesn't fit, -EINVAL for a buffer too small for one, -EFAULT keeping the position, -EBADF/-ENOTDIR, a removed directory listing as empty, the cursor contract checked; on tmpfs, ext4 (across a gap), /proc and /dev; chdir and fchdir (O_PATH, O_DIRECTORY, through a symlink, an ended /proc/<pid>) moving relative paths and getcwd, the kept cwd path computed from the inode"
 milestone = "M7"
 tests = [

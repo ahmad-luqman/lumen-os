@@ -462,21 +462,11 @@ fn ktest_unique(recs: &[KtestDirent]) -> bool {
     names.len() == recs.len()
 }
 
-/// A handler's return value as the fd it opened.
-#[cfg(feature = "ktest")]
-fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
-    if (ret as i64) < 0 {
-        crate::ktest::diag(format_args!("open returned {}", ret as i64));
-        return Err("open failed");
-    }
-    Ok(super::at::reg(ret))
-}
-
 /// `open(path, flags)` through the handler, `path` in slot `slot`.
 #[cfg(feature = "ktest")]
 fn ktest_open(slot: u64, path: &[u8], flags: u32) -> Result<Fd, &'static str> {
     let path = super::fd::ktest_user_path(slot, path)?;
-    ktest_fd(super::fd::sys_open(path, super::at::reg(u64::from(flags)), super::at::reg(0)))
+    super::fd::ktest_fd(super::fd::sys_open(path, super::fd::ktest_flags(flags), super::at::reg(0)))
 }
 
 /// `chdir(path)` through the handler, `path` in slot 3.

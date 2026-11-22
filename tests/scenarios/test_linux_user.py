@@ -280,6 +280,10 @@ def test_busybox_file_syscalls(boot):
     then `lseek` back), `tail -c` (`lseek` to `SEEK_END` and back), `od`
     (`readv` on a file), `uuencode` (`fstat`'s mode), `tee` (`open` with
     `O_TRUNC` of an existing file, a `write` to it) and `cat` of a missing file (ENOENT);
+    `stat` (musl's `lstat`, and `stat` with `-L`: `SYS_lstat` and
+    `SYS_stat`, both shims over `newfstatat`) of a
+    file and of a symlink to it, and `which` of a path (`access` with
+    `X_OK`, then `stat`) on a file with and without an execute bit;
     console stdio unchanged throughout."""
     m = boot_shell(boot, devices=Devices(rng=True))
 
@@ -312,6 +316,32 @@ def test_busybox_file_syscalls(boot):
         re.compile(r"^0000000 +0 +1 +2 +3 +4 +5 +6 +7 +8 +9 +a +b +c +d +e +f\r?\n", re.MULTILINE),
     )
     run("linux busybox uuencode /tmp/w w", re.compile(r"^begin 640 w\r?\n", re.MULTILINE))
+
+    # `stat` (#254 cluster B): busybox's applet `lstat`s unless `-L`.
+    m.send_line("vfstest symlink /tmp/wl w")
+    m.expect(r"symlink: ok\n", 10)
+    m.expect(r"lumen> ", 10)
+    run(
+        "linux busybox stat -c '%s %a %F' /tmp/w",
+        re.compile(r"^16 640 regular file\r?\n", re.MULTILINE),
+    )
+    run("linux busybox stat -c '%s %F' /tmp/wl", re.compile(r"^1 symbolic link\r?\n", re.MULTILINE))
+    run(
+        "linux busybox stat -L -c '%s %a %F' /tmp/wl",
+        re.compile(r"^16 640 regular file\r?\n", re.MULTILINE),
+    )
+    # `which` of a path: `access(X_OK)`, then `stat`. Root passes `X_OK`
+    # only with an execute bit set.
+    m.send_line("vfstest write /tmp/x exec")
+    m.expect(r"wrote 4\n", 10)
+    m.expect(r"lumen> ", 10)
+    m.send_line("vfstest chmod /tmp/x 744")
+    m.expect(r"chmod: ok\n", 10)
+    m.expect(r"lumen> ", 10)
+    run("linux busybox which /tmp/x", re.compile(r"^/tmp/x\r?\n", re.MULTILINE))
+    m.send_line("linux busybox which /tmp/w")
+    m.expect(r"linux: busybox exit=1 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
 
     # `tee` copies its input (a line, then Ctrl-D) to stdout and to the
     # file, which it opens `O_TRUNC`: the longer text there before goes, and
