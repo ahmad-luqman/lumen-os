@@ -17,7 +17,8 @@ use lumen_elf::loader::{ElfLoadError, LoadedElf, MappedRange, PageAction, Perm};
 use lumen_elf::stack::{AuxvInfo, InitialStack, StackBuildError, build_initial_stack};
 use lumen_mm::paging::{Attrs, MapError, WalkEnd};
 use lumen_mm::{FRAME_SIZE, PhysFrame, VirtAddr};
-use lumen_vfs::{DevId, Ino, OpenGuard, VfsError, VfsInode};
+use lumen_vfs::{DevId, Ino, OpenFile, OpenGuard, VfsError, VfsInode, VfsLock};
+use lumen_vm::maps::ImageRange;
 use lumen_vm::{
     Backing, Brk, FileMapping, MMAP_TOP, MapPlace, PAGE_SIZE, Prot, USER_MAX, USER_MIN, USER_STACK_TOP, VmError, Vma,
     VmaMap,
@@ -52,12 +53,14 @@ pub struct LoadedProgram {
     pub initial_brk: u64,
 }
 
-/// One ELF image to map: its validated plan and the file bytes its segments
-/// copy from.
+/// One ELF image to map: its validated plan, the file bytes its segments
+/// copy from, and the file they were read from (none for a boot module),
+/// which names the image's `/proc/<pid>/maps` lines.
 #[derive(Clone, Copy)]
 pub struct ElfImage<'a> {
     pub plan: &'a LoadedElf,
     pub bytes: &'a [u8],
+    pub file: Option<&'a ImageFile>,
 }
 
 /// Which parts of a program's layout collide ([`UserVmError::Layout`]).
@@ -208,10 +211,11 @@ struct AddressSpaceInner {
     /// removed are dropped only after `inner` is released.
     mapped_files: BTreeMap<u64, MappedFile>,
     /// The ELF images' file-backed parts, loaded by copying into anonymous
-    /// VMAs, as `/proc/<pid>/maps` names them ([`Self::name_image`]):
-    /// trimmed wherever their VMAs are unmapped or replaced, so a later
-    /// mapping in their place isn't named after them.
-    images: Vec<ImageRange>,
+    /// VMAs, as `/proc/<pid>/maps` names them (recorded by
+    /// `commit_loaded_elf` with the pages they name): trimmed wherever their
+    /// VMAs are unmapped or replaced, so a later mapping in their place
+    /// isn't named after them.
+    images: Vec<ImageRange<Arc<ImageFile>>>,
     /// The cache page under every `PTE_SHARED` leaf (present or
     /// `PTE_PROTNONE`), keyed by its page-aligned user address: the pin that
     /// keeps the page cached, and its frame allocated, while the PTE maps
@@ -242,8 +246,8 @@ pub enum Sharing {
 
 /// The `FileMapping::file_id` of a file mapped from `inode`: its `lock_id`,
 /// unique among all inodes of every filesystem and fixed for its lifetime
-/// (unlike `ino`, which a detached unlink changes). Wave 3's `ftruncate`
-/// names the file to [`AddressSpace::invalidate_file_from`] by it.
+/// (unlike `ino`, which a detached unlink changes). `openat(O_TRUNC)` and the truncates
+/// name the file to [`AddressSpace::invalidate_file_from`] by it.
 pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
     inode.lock_id()
 }
@@ -257,17 +261,39 @@ pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
 /// rename isn't seen; an unlink is, as ` (deleted)`), and the first
 /// mapping's for every later mapping of the same file while any maps it
 /// (`mapped_files` keeps one per file).
-#[derive(Clone)]
 pub struct MappedFile {
-    pub guard: OpenGuard,
-    pub path: Arc<str>,
+    guard: OpenGuard,
+    path: Arc<str>,
+}
+
+impl MappedFile {
+    /// The file open description `file` has open, by its path: a clone of
+    /// the description's own open reference, so never refused and never on
+    /// a freed inode.
+    pub fn of<L: VfsLock<u64>>(file: &OpenFile<L>) -> Self {
+        Self { guard: file.open_guard().clone(), path: Arc::clone(&file.path) }
+    }
+
+    /// The file `guard` holds open, by `path` (the ktests, standing in for
+    /// a descriptor).
+    #[cfg(feature = "ktest")]
+    pub(crate) fn new(guard: OpenGuard, path: &str) -> Self {
+        Self { guard, path: Arc::from(path) }
+    }
+
+    /// The mapped file's inode.
+    pub fn inode(&self) -> &Arc<dyn VfsInode> {
+        self.guard.inode()
+    }
 }
 
 /// A file as `/proc/<pid>/maps` names an ELF image's lines: its device,
 /// inode number and path when it was loaded. A snapshot, holding no
 /// reference: unlike a file mapping's, an image's lines don't show
 /// ` (deleted)` once the file is unlinked, and keep the inode number it
-/// had (Linux maps the segments from the file, so it shows both).
+/// had (Linux maps the segments from the file, so it shows both); and the
+/// path is the one the binary was run by (`linux /path`, or `PT_INTERP`'s),
+/// a symlink in it not resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageFile {
     pub dev: DevId,
@@ -280,35 +306,6 @@ impl ImageFile {
     pub fn of(inode: &dyn VfsInode, path: &str) -> Self {
         Self { dev: inode.dev_id(), ino: inode.ino(), path: Arc::from(path) }
     }
-}
-
-/// Part of an ELF image's file copied into anonymous VMAs: `[start, end)`
-/// holds the file's bytes from `offset`.
-#[derive(Clone, Debug)]
-struct ImageRange {
-    start: u64,
-    end: u64,
-    offset: u64,
-    file: Arc<ImageFile>,
-}
-
-/// `ranges` less `[start, end)`: a range overlapping it is cut back, or
-/// split in two around it, its offset following its start.
-fn trim_images(ranges: &mut Vec<ImageRange>, start: u64, end: u64) {
-    let mut kept = Vec::with_capacity(ranges.len() + 1);
-    for r in ranges.drain(..) {
-        if r.end <= start || r.start >= end {
-            kept.push(r);
-            continue;
-        }
-        if r.start < start {
-            kept.push(ImageRange { end: start, ..r.clone() });
-        }
-        if r.end > end {
-            kept.push(ImageRange { start: end, offset: r.offset + (end - r.start), ..r });
-        }
-    }
-    *ranges = kept;
 }
 
 /// Where `mmap(2)`'s `flags` and `hint` place a new mapping:
@@ -335,6 +332,31 @@ pub struct MsyncFiles {
     /// Whether part of the range is mapped by no VMA (`ENOMEM`, after the
     /// mapped parts are written back, as Linux).
     pub hole: bool,
+}
+
+/// A VMA's file missing from `mapped_files` was logged by `format_maps`.
+static MAPS_MISS_WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Record the pages of each `PT_LOAD` segment of `plan` that hold its file
+/// bytes as `file`'s, for `/proc/<pid>/maps` (Linux maps the segments from
+/// the file, so its lines show the file; Lumen copies them into anonymous
+/// memory, so names them by range: [`ImageRange::from_segment`]). A
+/// segment whose file offset and address lie at different offsets in their
+/// pages (which Linux couldn't map) is left unnamed, logged at `debug`.
+fn name_image_locked(images: &mut Vec<ImageRange<Arc<ImageFile>>>, plan: &LoadedElf, file: &ImageFile) {
+    let file = Arc::new(file.clone());
+    for seg in plan.segments() {
+        let (vaddr, filesz, offset) = (seg.vaddr, seg.filesz as u64, seg.file_offset as u64);
+        match ImageRange::from_segment(vaddr, filesz, offset, Arc::clone(&file)) {
+            Some(range) => images.push(range),
+            None if filesz > 0 => log::debug!(
+                target: "mm",
+                "maps: {}'s segment at {vaddr:#x} (file offset {offset:#x}, {filesz:#x} bytes) left unnamed",
+                file.path
+            ),
+            None => {}
+        }
+    }
 }
 
 /// Remove every entry of `map` keyed in `[start, end)` (dropping it), with
@@ -388,7 +410,7 @@ impl AddressSpace {
         random: [u8; 16],
     ) -> Result<(Self, LoadedProgram), UserVmError> {
         let plan = LoadedElf::parse(image).map_err(UserVmError::Elf)?;
-        Self::from_images(ElfImage { plan: &plan, bytes: image }, None, argv, envp, execfn, random)
+        Self::from_images(ElfImage { plan: &plan, bytes: image, file: None }, None, argv, envp, execfn, random)
     }
 
     /// Load a main image and, when it names one, its interpreter into a
@@ -439,7 +461,7 @@ impl AddressSpace {
         random: [u8; 16],
     ) -> Result<LoadedProgram, UserVmError> {
         let plan = LoadedElf::parse(image).map_err(UserVmError::Elf)?;
-        let main = ElfImage { plan: &plan, bytes: image };
+        let main = ElfImage { plan: &plan, bytes: image, file: None };
         let stack = StackPages::build(main, None, argv, envp, execfn, random)?;
         self.commit_loaded_elf(main, None, &stack)
     }
@@ -527,6 +549,11 @@ impl AddressSpace {
 
         inner.vmas = new_vmas;
         inner.brk = new_brk;
+        for image in core::iter::once(main).chain(interp) {
+            if let Some(file) = image.file {
+                name_image_locked(&mut inner.images, image.plan, file);
+            }
+        }
         let entry = interp.map_or(main.plan.entry, |i| i.plan.entry);
         Ok(LoadedProgram { entry, rsp: stack.initial.rsp, initial_brk })
     }
@@ -621,7 +648,7 @@ impl AddressSpace {
     ///
     /// Supports `MAP_PRIVATE` or `MAP_SHARED`, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`,
     /// and `PROT_NONE`. For `MAP_FIXED`, unmaps and frees any replaced PTEs and
-    /// flushes the local TLB.
+    /// flushes the local TLB. The flags checked, [`Self::map_anon_at`] maps.
     pub fn mmap_anon(&self, hint: u64, len: u64, prot: Prot, flags: u64) -> Result<u64, UserVmError> {
         let anon = u64::from(general::MAP_ANONYMOUS);
         let priv_flag = u64::from(general::MAP_PRIVATE);
@@ -633,8 +660,13 @@ impl AddressSpace {
         if share_bits != priv_flag && share_bits != shared_flag {
             return Err(UserVmError::InvalidArg);
         }
-        let place = map_place(hint, flags);
+        self.map_anon_at(map_place(hint, flags), len, prot)
+    }
 
+    /// Register a lazy anonymous VMA of `len` bytes with `prot` where
+    /// `place` says (private and shared anonymous memory map alike until
+    /// M8's `fork`): `mmap_anon`, and `mmap` of `/dev/zero`.
+    pub fn map_anon_at(&self, place: MapPlace, len: u64, prot: Prot) -> Result<u64, UserVmError> {
         // Declared before `inner`, so dropped after it is released.
         let mut gone_files = Vec::new();
         let mut inner = self.inner.lock();
@@ -658,15 +690,18 @@ impl AddressSpace {
     /// that before calling this.
     ///
     /// Nothing is mapped until a fault ([`Self::handle_page_fault`]). The
-    /// address space keeps its own open reference (a clone of `file`) while
-    /// any VMA maps the file, so closing the descriptor keeps the mapping
-    /// valid. `MAP_FIXED` releases what it replaces as `munmap` does.
+    /// address space keeps `file`'s open reference while any VMA maps the
+    /// file, so closing the descriptor keeps the mapping valid; when the
+    /// file is mapped already, the first mapping's `MappedFile` (and so its
+    /// path, for `/proc/<pid>/maps`) is the one kept, and `file` is dropped
+    /// once `inner` is released. `MAP_FIXED` releases what it replaces as
+    /// `munmap` does.
     pub fn mmap_file(
         &self,
         place: MapPlace,
         len: u64,
         prot: Prot,
-        file: &MappedFile,
+        file: MappedFile,
         offset: u64,
         sharing: Sharing,
     ) -> Result<u64, UserVmError> {
@@ -680,9 +715,8 @@ impl AddressSpace {
         }
         let file_id = file_id_of(&**inode);
         let mapping = FileMapping { file_id, offset, shared, may_write };
-        // Declared before `inner`, so dropped after it is released. Cloned
-        // from the caller's reference, so never on a freed inode.
-        let mut spare = Some(file.clone());
+        // Declared before `inner`, so dropped after it is released.
+        let mut spare = Some(file);
         let mut gone_files = Vec::new();
         let mut inner = self.inner.lock();
         if inner.torn_down {
@@ -715,9 +749,10 @@ impl AddressSpace {
     /// `align_up_page(new_size)`, in every VMA mapping it: the cache's pages
     /// released and private copies freed, in the unmap order. The VMAs stay,
     /// so a later access past the new end faults into
-    /// [`FaultResult::BusError`]. Wave 3's truncate-shrink calls it, holding
-    /// no VFS lock (Lock 1 before Lock 4), before dropping the cache's pages
-    /// past the new size. Returns how many leaves (present or `PROT_NONE`)
+    /// [`FaultResult::BusError`]. A shrinking syscall calls it once the
+    /// inode's truncate has returned, holding no VFS lock (`openat(O_TRUNC)`;
+    /// the truncates, #254): until then a page the cache dropped stays
+    /// alive, pinned by the mapping. Returns how many leaves (present or `PROT_NONE`)
     /// were unmapped; pages never faulted in count for nothing.
     ///
     /// **The current process's address space only, until M8's shootdowns:**
@@ -728,7 +763,6 @@ impl AddressSpace {
     /// wave 3's design for other processes' spaces (shootdowns, or holding
     /// their pins until their CPUs flush) must replace this assertion, not
     /// extend it.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: ftruncate (#255, wave 3)
     pub fn invalidate_file_from(&self, file_id: u64, new_size: u64) -> usize {
         debug_assert_eq!(
             arch::paging::active_root(),
@@ -1104,10 +1138,10 @@ impl AddressSpace {
     /// are `lumen_vm::maps::write_maps`'s; the files they name are resolved
     /// here: a file mapping's from `mapped_files` (its inode's device and
     /// number now, which read no lock, deleted once detached by an unlink,
-    /// and the path it was opened by), an ELF image's from
-    /// [`Self::name_image`]'s ranges.
+    /// and the path it was opened by), an ELF image's from the ranges
+    /// `commit_loaded_elf` recorded.
     pub fn format_maps(&self) -> String {
-        use lumen_vm::maps::{FileInfo, ImageRange as MapsImage, MapsLayout};
+        use lumen_vm::maps::{FileInfo, MapsLayout};
         let mut out = String::new();
         let inner = self.inner.lock();
         if inner.torn_down {
@@ -1119,65 +1153,32 @@ impl AddressSpace {
             stack_bottom: USER_STACK_BOTTOM,
             stack_top: USER_STACK_TOP,
         };
-        let images: Vec<MapsImage<'_>> = inner
-            .images
-            .iter()
-            .map(|r| MapsImage {
-                start: r.start,
-                end: r.end,
-                offset: r.offset,
-                file: FileInfo {
-                    major: r.file.dev.major(),
-                    minor: r.file.dev.minor(),
-                    ino: r.file.ino,
-                    path: &r.file.path,
-                    deleted: false,
-                },
-            })
-            .collect();
+        fn image_file(f: &Arc<ImageFile>) -> FileInfo<'_> {
+            FileInfo { major: f.dev.major(), minor: f.dev.minor(), ino: f.ino, path: &f.path, deleted: false }
+        }
         let files = |id: u64| {
-            inner.mapped_files.get(&id).map(|m| {
-                let inode = m.guard.inode();
-                let dev = inode.dev_id();
-                FileInfo {
-                    major: dev.major(),
-                    minor: dev.minor(),
-                    ino: inode.ino(),
-                    path: &m.path,
-                    deleted: inode.is_detached(),
+            let Some(m) = inner.mapped_files.get(&id) else {
+                // Every VMA's file is in `mapped_files` (`file_page` relies
+                // on it too): a miss is a bug, shown as `00:00 0`.
+                debug_assert!(false, "a mapped file missing from mapped_files: {id}");
+                if !MAPS_MISS_WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                    log::error!(target: "mm", "maps: file {id} of a VMA isn't in mapped_files (a bug)");
                 }
+                return None;
+            };
+            let inode = m.inode();
+            let dev = inode.dev_id();
+            Some(FileInfo {
+                major: dev.major(),
+                minor: dev.minor(),
+                ino: inode.ino(),
+                path: &m.path,
+                deleted: inode.is_detached(),
             })
         };
         // Writing to a `String` cannot fail.
-        let _ = lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout, &images, files);
+        let _ = lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout, &inner.images, image_file, files);
         out
-    }
-
-    /// Name the file-backed part of each `PT_LOAD` segment of `plan`, an
-    /// image [`Self::from_images`] loaded into this space, as `file`'s in
-    /// `/proc/<pid>/maps` (Linux maps segments from the file, so its lines
-    /// show the file; Lumen copies them into anonymous memory, so names
-    /// them by range): from the segment's first page to the end of the page
-    /// holding its last file byte, at the segment's file offset less its
-    /// start's offset in that page. Its `.bss` pages past that are
-    /// anonymous, as on Linux. The names go where the VMAs go: an unmap or
-    /// `MAP_FIXED` over them takes them away.
-    pub fn name_image(&self, plan: &LoadedElf, file: ImageFile) {
-        let file = Arc::new(file);
-        let mut inner = self.inner.lock();
-        if inner.torn_down {
-            return;
-        }
-        for seg in plan.segments() {
-            let start = lumen_vm::align_down_page(seg.vaddr);
-            let file_end = seg.vaddr.checked_add(seg.filesz as u64).and_then(lumen_vm::align_up_page);
-            let offset = (seg.file_offset as u64).checked_sub(seg.vaddr - start);
-            if let (Some(end), Some(offset)) = (file_end, offset)
-                && seg.filesz > 0
-            {
-                inner.images.push(ImageRange { start, end, offset, file: Arc::clone(&file) });
-            }
-        }
     }
 
     /// What `msync(2)` over page-aligned `[start, end)` (`start < end`)
@@ -1211,8 +1212,12 @@ impl AddressSpace {
             if let Backing::File(fm) = vma.backing
                 && fm.shared
                 && !seen.contains(&fm.file_id)
-                && let Some(mapped) = inner.mapped_files.get(&fm.file_id)
             {
+                // As `file_page`'s: every VMA's file is in `mapped_files`.
+                let mapped = inner
+                    .mapped_files
+                    .get(&fm.file_id)
+                    .expect("a mapped file stays in mapped_files while a VMA maps it");
                 seen.push(fm.file_id);
                 found.shared.push(mapped.guard.clone());
             }
@@ -1249,9 +1254,7 @@ impl AddressSpace {
     fn unmap_vmas_locked(&self, inner: &mut AddressSpaceInner, removed: &[Vma], gone: &mut Vec<MappedFile>) {
         for vma in removed {
             self.unmap_range_locked(inner, vma.start, vma.end);
-            if !inner.images.is_empty() {
-                trim_images(&mut inner.images, vma.start, vma.end);
-            }
+            ImageRange::trim(&mut inner.images, vma.start, vma.end);
         }
         release_unmapped_files(inner, gone);
     }
@@ -1353,7 +1356,7 @@ fn file_page(
     let file = inner.mapped_files.get(&fm.file_id).expect("a mapped file stays in mapped_files while a VMA maps it");
     let offset = fm.offset + (page_va.as_u64() - vma.start); // `VmaMap` checked it can't overflow
     let index = offset / PAGE_SIZE;
-    let result = mmap_page(file.guard.inode(), index);
+    let result = mmap_page(file.inode(), index);
     let err = match result {
         Err(e) if !matches!(e, VfsError::NoMem | VfsError::Range | VfsError::Io) => e,
         other => {
@@ -1365,7 +1368,7 @@ fn file_page(
             });
         }
     };
-    let inode = file.guard.inode();
+    let inode = file.inode();
     let (dev, ino) = (inode.dev_id(), inode.ino());
     let warn = from_user && inner.fault_warned != Some((fm.file_id, err));
     if warn {
@@ -1854,7 +1857,7 @@ fn file_vm_logged(text: &str) -> usize {
 /// An open reference on `f`, standing in for a descriptor's.
 #[cfg(feature = "ktest")]
 fn file_vm_open(f: &Arc<dyn VfsInode>) -> MappedFile {
-    MappedFile { guard: OpenGuard::new_unchecked(Arc::clone(f)), path: Arc::from("/ktest/file") }
+    MappedFile::new(OpenGuard::new_unchecked(Arc::clone(f)), "/ktest/file")
 }
 
 #[cfg(feature = "ktest")]
@@ -1880,7 +1883,7 @@ crate::ktest!(
             let opens = f.open_count();
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let base = space
-                .mmap_file(MapPlace::Hint(None), 3 * P, RW, &file_vm_open(&f), 0, SHARED_RW)
+                .mmap_file(MapPlace::Hint(None), 3 * P, RW, file_vm_open(&f), 0, SHARED_RW)
                 .map_err(|_| "mmap_file")?;
             kassert_eq!(space.file_page_counts(), (0, 0)); // lazy
             kassert_eq!(space.mapped_file_count(), 1);
@@ -1955,10 +1958,10 @@ crate::ktest!(
             let cache0 = mmap_page(&f, 0).map_err(|_| "mmap_page 0")?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let a = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Private)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, Sharing::Private)
                 .map_err(|_| "map a")?;
             let b = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Private)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, Sharing::Private)
                 .map_err(|_| "map b")?;
             let (copy_a, copy_b);
             {
@@ -2026,21 +2029,21 @@ crate::ktest!(
             let f = file_vm_file(dir, "ro.bin", &file_vm_pattern(P as usize, 7))?;
             let opens = f.open_count();
             let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
-            let refused = space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, SHARED_RO);
+            let refused = space.mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f), 0, SHARED_RO);
             kassert_eq!(refused, Err(UserVmError::Vm(VmError::Access)));
             kassert_eq!(refused.map_err(UserVmError::to_errno), Err(errno::EACCES));
             kassert_eq!((space.mapped_file_count(), f.open_count()), (0, opens));
             let ro = space
-                .mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(&f), 0, SHARED_RO)
+                .mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(&f), 0, SHARED_RO)
                 .map_err(|_| "ro")?;
             kassert_eq!(space.mprotect(ro, P, RW), Err(UserVmError::Vm(VmError::Access)));
             kassert_eq!(space.handle_page_fault(ro, 1 << 1), FaultResult::Invalid); // a store
             kassert_eq!(space.handle_page_fault(ro, 0), FaultResult::Resolved); // a read
             kassert_eq!(space.file_page_counts(), (1, 0));
-            let not_file = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(dir), 0, SHARED_RO);
+            let not_file = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(dir), 0, SHARED_RO);
             kassert_eq!(not_file.map_err(UserVmError::to_errno), Err(errno::ENODEV));
             let misaligned =
-                space.mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(&f), 100, Sharing::Private);
+                space.mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(&f), 100, Sharing::Private);
             kassert_eq!(misaligned, Err(UserVmError::Vm(VmError::Misaligned)));
             kassert_eq!(space.mapped_file_count(), 1);
             drop(space);
@@ -2062,10 +2065,10 @@ crate::ktest!(
             let f = file_vm_file(dir, "short.bin", &file_vm_pattern(100, 9))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let s = space
-                .mmap_file(MapPlace::Hint(None), 3 * P, RW, &file_vm_open(&f), 0, SHARED_RW)
+                .mmap_file(MapPlace::Hint(None), 3 * P, RW, file_vm_open(&f), 0, SHARED_RW)
                 .map_err(|_| "shared")?;
             let p = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Private)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, Sharing::Private)
                 .map_err(|_| "private")?;
             kassert_eq!(space.handle_page_fault(s + P, 0), FaultResult::BusError);
             kassert_eq!(space.handle_page_fault(s + 2 * P + 8, 1 << 1), FaultResult::BusError);
@@ -2100,7 +2103,7 @@ crate::ktest!(
         kassert_eq!(reclaim_ext4(&f)?, 0); // nothing cached: a fault reads the disk
         let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
         let base = space
-            .mmap_file(MapPlace::Hint(None), 3 * P, Prot::READ, &file_vm_open(&f), 0, SHARED_RW)
+            .mmap_file(MapPlace::Hint(None), 3 * P, Prot::READ, file_vm_open(&f), 0, SHARED_RW)
             .map_err(|_| "map")?;
         vol.fail_reads(true);
         let failed = space.handle_page_fault(base + 2 * P, 0);
@@ -2130,7 +2133,7 @@ crate::ktest!(
         f.sync(false).map_err(|_| "sync")?;
         let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
         let base =
-            space.mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
+            space.mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
         {
             let _active = crate::sched::UserSpaceGuard::enter(space.clone());
             kassert_eq!(copy_to_user(base + 10, b"first-store"), Ok(()));
@@ -2164,13 +2167,13 @@ crate::ktest!(
             let g = file_vm_file(dir, "other.bin", &file_vm_pattern(P as usize, 17))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let a = space
-                .mmap_file(MapPlace::Hint(None), 4 * P, RW, &file_vm_open(&f), 0, SHARED_RW)
+                .mmap_file(MapPlace::Hint(None), 4 * P, RW, file_vm_open(&f), 0, SHARED_RW)
                 .map_err(|_| "map a")?;
             let b = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), P, Sharing::Private)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), P, Sharing::Private)
                 .map_err(|_| "map b")?;
             let c =
-                space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&g), 0, SHARED_RW).map_err(|_| "map c")?;
+                space.mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&g), 0, SHARED_RW).map_err(|_| "map c")?;
             let pages: Vec<MappedPage> = (0..4).filter_map(|i| mmap_page(&f, i).ok()).collect();
             kassert_eq!(pages.len(), 4);
             let copy;
@@ -2237,7 +2240,7 @@ crate::ktest!(
             let counts = || (p0.page().writable_maps(), p1.page().writable_maps());
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let base =
-                space.mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
+                space.mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
             {
                 let _active = crate::sched::UserSpaceGuard::enter(space.clone());
                 kassert_eq!(copy_to_user(base, b"0"), Ok(()));
@@ -2273,7 +2276,7 @@ crate::ktest!(
             // `MAP_FIXED` over a mapping: released as by `munmap`.
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let base =
-                space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map 2")?;
+                space.mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map 2")?;
             kassert_eq!(space.handle_page_fault(base, 1 << 1), FaultResult::Resolved);
             kassert_eq!(counts(), (1, 0));
             let fixed = u64::from(general::MAP_PRIVATE | general::MAP_ANONYMOUS | general::MAP_FIXED);
@@ -2281,11 +2284,11 @@ crate::ktest!(
             kassert_eq!(counts(), (0, 0));
             kassert_eq!((space.mapped_file_count(), f.open_count()), (0, opens));
             // A file mapped over itself keeps its reference.
-            space.mmap_file(MapPlace::Fixed(base), P, RW, &file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map 3")?;
+            space.mmap_file(MapPlace::Fixed(base), P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map 3")?;
             // ... and a file page faulted in there is released by the next.
             kassert_eq!(space.handle_page_fault(base, 1 << 1), FaultResult::Resolved);
             kassert_eq!((counts(), space.file_page_counts()), ((1, 0), (1, 1)));
-            space.mmap_file(MapPlace::Fixed(base), P, RW, &file_vm_open(&f), P, SHARED_RW).map_err(|_| "map 4")?;
+            space.mmap_file(MapPlace::Fixed(base), P, RW, file_vm_open(&f), P, SHARED_RW).map_err(|_| "map 4")?;
             kassert_eq!((counts(), space.file_page_counts()), ((0, 0), (0, 0)));
             kassert_eq!((space.mapped_file_count(), f.open_count()), (1, opens + 1));
             {
@@ -2299,7 +2302,7 @@ crate::ktest!(
             let heap = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
             let b0 = heap.brk(0);
             kassert_eq!(heap.brk(b0 + 2 * P), b0 + 2 * P);
-            heap.mmap_file(MapPlace::Fixed(b0 + P), P, RW, &file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map 5")?;
+            heap.mmap_file(MapPlace::Fixed(b0 + P), P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map 5")?;
             kassert_eq!(heap.handle_page_fault(b0 + P, 1 << 1), FaultResult::Resolved);
             kassert_eq!(counts(), (1, 0));
             kassert_eq!(heap.brk(b0), b0);
@@ -2313,7 +2316,7 @@ crate::ktest!(
             kassert_eq!(counts(), (0, 1));
             kassert!(Arc::strong_count(p1.page()) > 2); // the pin and the guard too
             let private = space
-                .mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, Sharing::Private)
+                .mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f), 0, Sharing::Private)
                 .map_err(|_| "map 6")?;
             kassert_eq!(space.handle_page_fault(private, 1 << 1), FaultResult::Resolved);
             let copy = file_vm_leaf(&space, private).ok_or("private copy not mapped")?.phys;
@@ -2360,7 +2363,7 @@ crate::ktest!(
             let (space, prog) =
                 AddressSpace::from_elf(&elf, &[b"/sigbus"], &[], b"/sigbus", [0; 16]).map_err(|_| "from_elf")?;
             space
-                .mmap_file(MapPlace::FixedNoReplace(MAP), 2 * P, Prot::READ, &file_vm_open(&f), 0, SHARED_RO)
+                .mmap_file(MapPlace::FixedNoReplace(MAP), 2 * P, Prot::READ, file_vm_open(&f), 0, SHARED_RO)
                 .map_err(|_| "mmap_file")?;
             run_elf_process("ktest-sigbus", Arc::new(space), prog.entry, prog.rsp, ConsoleIo::Capture, None)
         };
@@ -2387,7 +2390,7 @@ crate::ktest!(
         let f = file_vm_file(&vol.root, "synced.bin", &expected)?;
         f.sync(false).map_err(|_| "sync")?;
         let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
-        let base = space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
+        let base = space.mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
         let _active = crate::sched::UserSpaceGuard::enter(space.clone());
         kassert_eq!(copy_to_user(base + 10, b"first"), Ok(()));
         f.sync(false).map_err(|_| "first sync")?;
@@ -2419,7 +2422,7 @@ crate::ktest!(
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             // The descriptor's reference goes at the end of this statement.
             let base =
-                space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
+                space.mmap_file(MapPlace::Hint(None), P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
             kassert_eq!(f.open_count(), 1); // the mapping's
             dir.unlink("gone.bin").map_err(|_| "unlink")?;
             kassert!(dir.lookup("gone.bin").is_err());
@@ -2462,7 +2465,7 @@ crate::ktest!(
             let f = file_vm_file(dir, "tail.bin", &data)?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let map = |sharing| {
-                space.mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, sharing).map_err(|_| "map")
+                space.mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, sharing).map_err(|_| "map")
             };
             let (s, now, later) = (map(SHARED_RW)?, map(Sharing::Private)?, map(Sharing::Private)?);
             let _active = crate::sched::UserSpaceGuard::enter(space.clone());
@@ -2502,7 +2505,7 @@ crate::ktest!(
             let f = file_vm_file(dir, "regrown.bin", &file_vm_pattern(2 * P as usize, 29))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let map = |sharing| {
-                space.mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, sharing).map_err(|_| "map")
+                space.mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, sharing).map_err(|_| "map")
             };
             let (s, q) = (map(SHARED_RW)?, map(Sharing::Private)?);
             let _active = crate::sched::UserSpaceGuard::enter(space.clone());
@@ -2570,7 +2573,7 @@ crate::ktest!(
         let (f0, f1) = (p0.page().phys_frame().as_u64(), p1.page().phys_frame().as_u64());
         let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
         let base =
-            space.mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
+            space.mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f), 0, SHARED_RW).map_err(|_| "map")?;
         let _active = crate::sched::UserSpaceGuard::enter(space.clone());
         kassert_eq!(copy_to_user(base, b"0"), Ok(()));
         kassert_eq!(copy_to_user(base + P, b"1"), Ok(()));
@@ -2595,7 +2598,7 @@ crate::ktest!(
         kassert_eq!((p0.page().writable_maps(), p1.page().writable_maps()), (0, 0));
 
         // A read-only page is cleared and flushed, with nothing to release.
-        let ro = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(&f), 0, SHARED_RW);
+        let ro = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(&f), 0, SHARED_RW);
         let ro = ro.map_err(|_| "map ro")?;
         kassert_eq!(space.handle_page_fault(ro, 0), FaultResult::Resolved);
         release_order::start();
@@ -2627,7 +2630,7 @@ crate::ktest!(
         let count = || file_vm_logged(&warning);
         let before = count();
         let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
-        let base = space.mmap_file(MapPlace::Hint(None), 4 * P, RW, &file_vm_open(&f), 0, SHARED_RW);
+        let base = space.mmap_file(MapPlace::Hint(None), 4 * P, RW, file_vm_open(&f), 0, SHARED_RW);
         let base = base.map_err(|_| "map")?;
         kassert_eq!(space.handle_page_fault(base, USER_STORE), FaultResult::Resolved);
         kassert_eq!(space.handle_page_fault(base + P, USER_STORE), FaultResult::Resolved);
@@ -2639,7 +2642,7 @@ crate::ktest!(
         kassert_eq!(count(), before + 1); // one streak, one warning
         kassert!(file_vm_leaf(&space, base + 2 * P).is_none());
         // A second mapping of page 0 faults in fine: the streak is over.
-        let again = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(&f), 0, SHARED_RW);
+        let again = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(&f), 0, SHARED_RW);
         let again = again.map_err(|_| "map again")?;
         kassert_eq!(space.handle_page_fault(again, USER_LOAD), FaultResult::Resolved);
         kassert_eq!(space.handle_page_fault(base + 3 * P, USER_STORE), FaultResult::BusError);

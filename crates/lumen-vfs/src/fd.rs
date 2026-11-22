@@ -66,7 +66,7 @@ pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
     fd_refs: AtomicU32,
     pub offset: L,
     pub dir_cursor: L,
-    _open_guard: OpenGuard,
+    open_guard: OpenGuard,
 }
 
 impl<L: VfsLock<u64>> OpenFile<L> {
@@ -115,8 +115,16 @@ impl<L: VfsLock<u64>> OpenFile<L> {
             fd_refs: AtomicU32::new(1),
             offset: L::new(0),
             dir_cursor: L::new(0),
-            _open_guard: guard,
+            open_guard: guard,
         })
+    }
+
+    /// The open reference this description holds on its inode: clone it
+    /// for another holder (a file mapping, `AddressSpace::mmap_file`) that
+    /// must keep the inode open as long as the description does, with no
+    /// fresh [`OpenGuard::try_new`] that could be refused.
+    pub fn open_guard(&self) -> &OpenGuard {
+        &self.open_guard
     }
 
     /// The access mode the open checked (meaningless for `O_PATH`).

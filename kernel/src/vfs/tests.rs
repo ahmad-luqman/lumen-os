@@ -444,7 +444,7 @@ crate::ktest!(
         kassert_eq!(space.brk(0x40_5000), 0x40_5000);
         let maps = space.format_maps();
         kassert!(maps.contains("00402000-00404000 rw-p 00000000 00:00 0\n"));
-        // `[heap]` at column 73, where Linux pads a name to.
+        // `[heap]` after 73 characters, where Linux pads a name to.
         let heap = alloc::format!("{:<72} [heap]\n", "00404000-00405000 rw-p 00000000 00:00 0 ");
         kassert!(maps.contains(&heap));
         // Every line has the strict Linux shape, the text segment is r-xp,

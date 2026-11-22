@@ -1,5 +1,5 @@
 //! Positional I/O and syncing (M7): `pread64`, `pwrite64`, `fsync`,
-//! `fdatasync`, `sync` (#254), and `msync` (#255, with file-backed `mmap`).
+//! `fdatasync`, `sync` (#254). (`msync` is `mem`'s, with file-backed `mmap`.)
 
 use super::at::{Fd, UserPtr};
 use super::not_implemented;

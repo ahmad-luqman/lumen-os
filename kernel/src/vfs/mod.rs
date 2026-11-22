@@ -706,9 +706,9 @@ static FAIL_PROC_CHECKS: core::sync::atomic::AtomicBool = core::sync::atomic::At
 
 /// Whether `line` has the shape of a `/proc/<pid>/maps` line:
 /// `start-end perms offset major:minor inode`, then nothing or a name
-/// (`[heap]`, `[stack]` or an absolute path) at column 73, where Linux pads
+/// (`[heap]`, `[stack]` or an absolute path) after 73 characters, where Linux pads
 /// it (two spaces after the inode when the fields are wider). Addresses are
-/// 8 to 16 lowercase hex digits, the offset exactly 8, the device numbers
+/// 8 to 16 lowercase hex digits, as is the offset; the device numbers
 /// at least 2 each.
 fn is_maps_line(line: &str) -> bool {
     fn hex(s: &str, min: usize, max: usize) -> bool {
@@ -737,7 +737,7 @@ fn is_maps_line(line: &str) -> bool {
         && matches!(p[3], b'p' | b's');
     let dev_ok = devno.split_once(':').is_some_and(|(a, b)| hex(a, 2, 8) && hex(b, 2, 8));
     let ino_ok = !ino.is_empty() && ino.bytes().all(|b| b.is_ascii_digit());
-    range_ok && perms_ok && hex(offset, 8, 8) && dev_ok && ino_ok
+    range_ok && perms_ok && hex(offset, 8, 16) && dev_ok && ino_ok
 }
 
 /// Check that `dir`'s listing agrees with lookup: each entry named in `names`

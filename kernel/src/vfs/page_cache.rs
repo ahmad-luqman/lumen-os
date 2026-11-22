@@ -501,7 +501,8 @@ pub(crate) struct WritableMap {
 impl WritableMap {
     /// The PTE's hardware `DIRTY` bit was found set: mark the page dirty.
     /// (The guard marks it when made and when dropped as well, so this only
-    /// says it sooner, for a sweep that keeps the mapping, like `msync`'s.)
+    /// says it sooner, for a walk that downgrades or clears the PTE, like
+    /// `mprotect`'s.)
     pub(crate) fn note_pte_dirty(&self) {
         self.page.set_dirty();
     }
@@ -716,6 +717,36 @@ pub(crate) mod ktest_files {
         let ext4 = file.as_any().and_then(|a| a.downcast_ref::<Ext4Inode>()).ok_or("not an ext4 inode")?;
         ext4.reclaim_dirty_pages(usize::MAX);
         Ok(ext4.page_cache_lock().lock().len())
+    }
+
+    /// A fresh writable `ext4` volume (1 MiB) whose disk writes fail on
+    /// request, over `ext4::ktest_util`'s `FaultCache`, and whose disk's
+    /// bytes can be mounted apart from its block cache.
+    pub(crate) struct FaultVolume {
+        mnt: super::super::ext4::ktest_util::Mnt,
+        pub(crate) root: Arc<dyn VfsInode>,
+    }
+
+    impl FaultVolume {
+        /// A fresh volume, as device `0:minor`.
+        pub(crate) fn new(minor: u32) -> Result<Self, &'static str> {
+            let mnt = super::super::ext4::ktest_util::mount(build_minimal_ext4_image_blocks(256), minor)?;
+            Ok(Self { root: Arc::clone(&mnt.root), mnt })
+        }
+
+        /// Make every write to the disk (and its flush) fail (`true`), or
+        /// work again.
+        pub(crate) fn fail_writes(&self, fail: bool) {
+            self.mnt.cache.fail_writes.store(fail, Ordering::Release);
+        }
+
+        /// The root of a read-only mount (device `0:minor`) of what the
+        /// disk holds now, its block cache not written back first: what has
+        /// reached the disk itself.
+        pub(crate) fn on_device(&self, minor: u32) -> Result<Arc<dyn VfsInode>, &'static str> {
+            let bytes = self.mnt.cache.dev.0.data.lock().clone();
+            Ok(super::super::ext4::ktest_util::mount_ro_image(bytes, minor)?.root_inode())
+        }
     }
 }
 

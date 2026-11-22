@@ -9,31 +9,37 @@
 //! and `p` when private; an anonymous one is always `p`, even
 //! `MAP_SHARED | MAP_ANONYMOUS` (Linux prints `s`).
 //!
-//! **The name:** a file's path, or a label (`[heap]` or `[stack]`), starts
-//! at column 73 as Linux's `seq_pad` puts it: the fields and a space are
-//! padded with spaces to 72 characters ([`NAME_PAD`]), then one more space
-//! (more fields than fit push the name right, still two spaces after the
-//! inode). A path holding a newline shows it as `\012`, and an unlinked
-//! file's path ends ` (deleted)`, as Linux's `seq_path` and `d_path` print
-//! them. A line without a name ends at its inode (Linux leaves the padding
-//! space there: a deliberate difference, which no reader of the fields sees).
+//! **The name:** a file's path, or a label (`[heap]` or `[stack]`), comes
+//! after 73 characters, where Linux's `seq_pad` puts it: the fields and a
+//! space are padded with spaces to 72 characters ([`NAME_PAD`]), then one
+//! more space (more fields than fit push the name right, still two spaces
+//! after the inode). A path holding a newline shows it as `\012`, and an
+//! unlinked file's path ends ` (deleted)`, as Linux's `seq_path` and
+//! `d_path` print them. A line without a name ends at its inode (Linux
+//! leaves the padding space there: a deliberate difference, which no reader
+//! of the fields sees).
 //!
 //! **Which file:** a file-backed VMA names the file its
 //! [`FileMapping::file_id`](crate::FileMapping) resolves to (device, inode
 //! and path; `00:00 0` and no name if it resolves to nothing). An ELF image
 //! loaded by copying its bytes into anonymous VMAs names its file over the
-//! [`ImageRange`]s the kernel recorded for it, as Linux's file-backed
-//! segments do: an anonymous VMA is split at each range's edges, and the
-//! part inside a range shows the file and the offset in it.
+//! [`ImageRange`]s the kernel recorded for it ([`ImageRange::from_segment`],
+//! cut back by [`ImageRange::trim`] where its memory is unmapped), as
+//! Linux's file-backed segments do: an anonymous VMA is split at each
+//! range's edges, and the part inside a range shows the file and the offset
+//! in it.
 //!
 //! An anonymous VMA overlapping the heap (`[brk initial, brk mapped end)`) is
 //! printed split at the heap's edges, so a `.bss` coalesced with the first
 //! `brk` pages still shows `[heap]` from the initial break. An anonymous VMA
-//! inside the stack range is `[stack]`, and never split.
+//! inside the stack range is `[stack]`, and never split. Where names
+//! overlap, `[stack]` wins, then `[heap]`, then an image range (the first
+//! of overlapping ones).
 
+use alloc::vec::Vec;
 use core::fmt::{self, Write as _};
 
-use crate::{Backing, Prot, Vma};
+use crate::{Backing, PAGE_SIZE, Prot, Vma, align_down_page, align_up_page};
 
 /// What a maps listing needs besides the VMAs: the heap and the stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,15 +70,63 @@ pub struct FileInfo<'a> {
 }
 
 /// Part of an ELF image copied into anonymous memory at load, named as
-/// the file it came from: `[start, end)` (page-aligned) holds the file's
-/// bytes from `offset` on.
+/// the file `file` (whatever the kernel keeps for it) it came from:
+/// `[start, end)` (page-aligned) holds the file's bytes from `offset` on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageRange<'a> {
+pub struct ImageRange<F> {
     pub start: u64,
     pub end: u64,
     /// The file offset of `start`.
     pub offset: u64,
-    pub file: FileInfo<'a>,
+    pub file: F,
+}
+
+impl<F> ImageRange<F> {
+    /// The range naming a `PT_LOAD` segment's file bytes: `filesz` bytes
+    /// from `file_offset` loaded at `vaddr` (load bias added). From the
+    /// segment's first page to the end of the page holding its last file
+    /// byte, at the file offset of that first page (`file_offset` less
+    /// `vaddr`'s offset in its page); its `.bss` past that is anonymous, as
+    /// on Linux. `None` for a segment with no file bytes, one whose
+    /// `file_offset` and `vaddr` lie at different offsets in their pages
+    /// (Linux couldn't map it; a loader refusing it never asks), or one
+    /// whose end overflows.
+    pub fn from_segment(vaddr: u64, filesz: u64, file_offset: u64, file: F) -> Option<Self> {
+        if filesz == 0 || file_offset % PAGE_SIZE != vaddr % PAGE_SIZE {
+            return None;
+        }
+        let start = align_down_page(vaddr);
+        let end = align_up_page(vaddr.checked_add(filesz)?)?;
+        let offset = align_down_page(file_offset);
+        file_offset.checked_add(filesz)?;
+        Some(Self { start, end, offset, file })
+    }
+}
+
+impl<F: Clone> ImageRange<F> {
+    /// `ranges` less `[start, end)`, the memory an unmap or `MAP_FIXED`
+    /// took: a range overlapping it is cut back (its head or its tail), or
+    /// split in two around it, the tail's offset following its new start;
+    /// one inside it goes. In place, the split tails appended.
+    pub fn trim(ranges: &mut Vec<Self>, start: u64, end: u64) {
+        let mut tails = Vec::new();
+        ranges.retain_mut(|r| {
+            if r.end <= start || r.start >= end {
+                return true;
+            }
+            if r.end > end {
+                let offset = r.offset + (end - r.start);
+                tails.push(Self { start: end, end: r.end, offset, file: r.file.clone() });
+            }
+            if r.start < start {
+                r.end = start;
+                true
+            } else {
+                false
+            }
+        });
+        ranges.extend(tails);
+    }
 }
 
 const HEAP: &str = "[heap]";
@@ -80,7 +134,7 @@ const STACK: &str = "[stack]";
 
 /// The width Linux pads a line's fields (and the space after them) to
 /// before the name: `seq_setwidth(m, 25 + sizeof(void *) * 6 - 1)` on a
-/// 64-bit kernel. The name follows one more space, at column 73.
+/// 64-bit kernel. The name follows one more space, after 73 characters.
 pub const NAME_PAD: usize = 25 + 8 * 6 - 1;
 
 /// What follows a line's fields.
@@ -164,16 +218,19 @@ fn pad<W: fmt::Write>(out: &mut Counted<'_, W>) -> fmt::Result {
 
 /// Write the maps lines of `vmas` (in address order) to `out`: a
 /// file-backed VMA named by `files` (its `file_id` to the file, or `None`),
-/// an anonymous one by `layout` (`[heap]`, `[stack]`) or `images`.
-pub fn write_maps<'a, 'n, W, R>(
+/// an anonymous one by `layout` (`[heap]`, `[stack]`) or `images` (each
+/// range's file as `image_file` shows it).
+pub fn write_maps<'a, 'n, W, F, I, R>(
     out: &mut W,
     vmas: impl IntoIterator<Item = &'a Vma>,
     layout: &MapsLayout,
-    images: &[ImageRange<'n>],
+    images: &'n [ImageRange<F>],
+    image_file: I,
     files: R,
 ) -> fmt::Result
 where
     W: fmt::Write,
+    I: Fn(&'n F) -> FileInfo<'n>,
     R: Fn(u64) -> Option<FileInfo<'n>>,
 {
     debug_assert!(layout.stack_bottom <= layout.stack_top, "stack range {layout:x?}");
@@ -198,7 +255,7 @@ where
             let (name, offset) = if heap.is_some_and(|(a, b)| at >= a && next <= b) {
                 (Name::Label(HEAP), 0)
             } else if let Some(r) = images.iter().find(|r| at >= r.start && next <= r.end) {
-                (Name::File(r.file), r.offset + (at - r.start))
+                (Name::File(image_file(&r.file)), r.offset + (at - r.start))
             } else {
                 (Name::None, 0)
             };
@@ -233,6 +290,9 @@ mod tests {
     const DISK_FILE: FileInfo<'static> =
         FileInfo { major: 0xfd, minor: 0x101, ino: 1_572_898, path: "/usr/lib/libc.so", deleted: false };
 
+    /// No image ranges.
+    const NO_IMAGES: &[ImageRange<FileInfo<'static>>] = &[];
+
     const fn layout(brk_initial: u64, brk_mapped_end: u64) -> MapsLayout {
         MapsLayout { brk_initial, brk_mapped_end, stack_bottom: USER_STACK_BOTTOM, stack_top: USER_STACK_TOP }
     }
@@ -266,10 +326,10 @@ mod tests {
     fn with_images<'a>(
         vmas: impl IntoIterator<Item = &'a Vma>,
         layout: &MapsLayout,
-        images: &[ImageRange<'static>],
+        images: &[ImageRange<FileInfo<'static>>],
     ) -> String {
         let mut out = String::new();
-        write_maps(&mut out, vmas, layout, images, resolve).unwrap();
+        write_maps(&mut out, vmas, layout, images, |f| *f, |id| resolve(id)).unwrap();
         out
     }
 
@@ -277,6 +337,57 @@ mod tests {
     /// lines other than the ones pinned literally).
     fn named(fields: &str, name: &str) -> String {
         format!("{:<72} {name}\n", format!("{fields} "))
+    }
+
+    fn range(start: u64, end: u64, offset: u64) -> ImageRange<u32> {
+        ImageRange { start, end, offset, file: 7 }
+    }
+
+    #[test]
+    fn a_segment_names_its_file_bytes_pages_at_its_first_pages_offset() {
+        // Page-aligned: its pages, its offset.
+        assert_eq!(ImageRange::from_segment(0x40_1000, 0x20, 0x1000, 7), Some(range(0x40_1000, 0x40_2000, 0x1000)));
+        // Starting mid-page (0x100 in), its last byte on the next page:
+        // two pages from the offset of its first page.
+        assert_eq!(ImageRange::from_segment(0x40_3100, 0x1000, 0x2100, 7), Some(range(0x40_3000, 0x40_5000, 0x2000)));
+        // Ending exactly at a page's end: no page past it.
+        assert_eq!(ImageRange::from_segment(0x40_3800, 0x800, 0x800, 7), Some(range(0x40_3000, 0x40_4000, 0)));
+        // No file bytes (all .bss), offsets at different places in their
+        // pages, an end past 2^64: no range.
+        assert_eq!(ImageRange::from_segment(0x40_3000, 0, 0x3000, 7), None);
+        assert_eq!(ImageRange::from_segment(0x40_3100, 0x10, 0x2200, 7), None);
+        assert_eq!(ImageRange::from_segment(u64::MAX - 0xfff, 0x2000, 0, 7), None);
+        assert_eq!(ImageRange::from_segment(0x40_3000, 0x2000, u64::MAX - 0xfff, 7), None);
+    }
+
+    #[test]
+    fn trim_cuts_a_ranges_head_or_tail_splits_its_middle_and_spares_the_rest() {
+        let whole = || vec![range(0x10_0000, 0x10_4000, 0x5000)];
+        // Its head unmapped: the tail stays, its offset following.
+        let mut r = whole();
+        ImageRange::trim(&mut r, 0xf_f000, 0x10_1000);
+        assert_eq!(r, vec![range(0x10_1000, 0x10_4000, 0x6000)]);
+        // Its tail: the head stays, offset unchanged.
+        let mut r = whole();
+        ImageRange::trim(&mut r, 0x10_3000, 0x10_5000);
+        assert_eq!(r, vec![range(0x10_0000, 0x10_3000, 0x5000)]);
+        // Its middle: both remainders, the tail's offset past the hole.
+        let mut r = whole();
+        ImageRange::trim(&mut r, 0x10_1000, 0x10_2000);
+        assert_eq!(r, vec![range(0x10_0000, 0x10_1000, 0x5000), range(0x10_2000, 0x10_4000, 0x7000)]);
+        // All of it, or more: gone.
+        let mut r = whole();
+        ImageRange::trim(&mut r, 0x10_0000, 0x10_4000);
+        assert_eq!(r, vec![]);
+        // Beside it, either side: untouched.
+        let mut r = whole();
+        ImageRange::trim(&mut r, 0xf_0000, 0x10_0000);
+        ImageRange::trim(&mut r, 0x10_4000, 0x10_8000);
+        assert_eq!(r, whole());
+        // Two ranges, one cut back, one untouched, one dropped.
+        let mut r = vec![range(0x1000, 0x3000, 0), range(0x3000, 0x4000, 0x9000), range(0x8000, 0x9000, 0)];
+        ImageRange::trim(&mut r, 0x2000, 0x4000);
+        assert_eq!(r, vec![range(0x1000, 0x2000, 0), range(0x8000, 0x9000, 0)]);
     }
 
     #[test]
@@ -295,7 +406,7 @@ mod tests {
         let vma = file_id(1, 0x55d0_c5a3_b000, 0x55d0_c5a3_d000, Prot::READ, 0, false);
         let mut out = String::new();
         let cat = FileInfo { major: 8, minor: 2, ino: 1_572_898, path: "/usr/bin/cat", deleted: false };
-        write_maps(&mut out, &[vma], &LAYOUT, &[], |_| Some(cat)).unwrap();
+        write_maps(&mut out, &[vma], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(cat)).unwrap();
         assert_eq!(out, "55d0c5a3b000-55d0c5a3d000 r--p 00000000 08:02 1572898                    /usr/bin/cat\n");
         assert_eq!(out.find('/'), Some(73));
         // The rule restated agrees.
@@ -307,7 +418,7 @@ mod tests {
         let wide = FileInfo { major: 0xfff, minor: 0xf_ffff, ino: u64::MAX, ..TMP_FILE };
         let vma = file(0x7fff_ffff_e000, 0x7fff_ffff_f000, RW, 0xffff_ffff_ffff_f000, true);
         let mut out = String::new();
-        write_maps(&mut out, &[vma], &LAYOUT, &[], |_| Some(wide)).unwrap();
+        write_maps(&mut out, &[vma], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(wide)).unwrap();
         assert_eq!(
             out,
             "7fffffffe000-7ffffffff000 rw-s fffffffffffff000 fff:fffff 18446744073709551615  /tmp/data.bin\n"
@@ -454,7 +565,15 @@ mod tests {
     fn an_unlinked_file_is_deleted_and_a_newline_in_its_path_escaped() {
         let gone = FileInfo { path: "/tmp/a\nb", deleted: true, ..TMP_FILE };
         let mut out = String::new();
-        write_maps(&mut out, &[file(0x1000_0000, 0x1000_1000, RW, 0, true)], &LAYOUT, &[], |_| Some(gone)).unwrap();
+        write_maps(
+            &mut out,
+            &[file(0x1000_0000, 0x1000_1000, RW, 0, true)],
+            &LAYOUT,
+            NO_IMAGES,
+            |f| *f,
+            |_| Some(gone),
+        )
+        .unwrap();
         assert_eq!(out, named("10000000-10001000 rw-s 00000000 00:02 12", "/tmp/a\\012b (deleted)"));
     }
 
