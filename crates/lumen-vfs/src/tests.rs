@@ -8362,3 +8362,17 @@ fn append_writes_at_the_end_and_the_default_refuses_a_regular_file() {
     let dir = MemInode::new_dir(DevId::ROOT, 3, 0o755, None, registry, next_ino);
     assert_eq!(crate::fs::append_without_end(&*dir, b"zz"), dir.write_at(0, b"zz").map(|n| (0, n)));
 }
+
+#[test]
+fn mode_after_chown_drops_setuid_and_group_exec_setgid_off_directories() {
+    use crate::types::mode_after_chown;
+    for t in [InodeType::File, InodeType::Symlink, InodeType::CharDevice] {
+        assert_eq!(mode_after_chown(t, 0o6755), 0o0755);
+        assert_eq!(mode_after_chown(t, 0o6745), 0o2745); // no group-execute: setgid stays
+        assert_eq!(mode_after_chown(t, 0o2711), 0o0711);
+        assert_eq!(mode_after_chown(t, 0o4700), 0o0700);
+        assert_eq!(mode_after_chown(t, 0o1644), 0o1644); // sticky stays
+        assert_eq!(mode_after_chown(t, 0o0777), 0o0777);
+    }
+    assert_eq!(mode_after_chown(InodeType::Dir, 0o6775), 0o6775);
+}

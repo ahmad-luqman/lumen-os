@@ -177,6 +177,26 @@ impl Metadata {
     }
 }
 
+/// The mode a change of owner leaves on an inode of type `inode_type`
+/// ([`VfsInode::set_owner`](crate::VfsInode::set_owner)'s rule, from
+/// Linux's `chown_common` for a caller with `CAP_FSETID`): on anything but
+/// a directory, setuid goes, and setgid too when group-execute is set (a
+/// setgid file without it marks mandatory locking and keeps the bit). A
+/// directory keeps both. Whatever the caller, and for a `-1, -1` chown too.
+pub const fn mode_after_chown(inode_type: InodeType, mode: u16) -> u16 {
+    const S_ISUID: u16 = 0o4000;
+    const S_ISGID: u16 = 0o2000;
+    const S_IXGRP: u16 = 0o010;
+    if matches!(inode_type, InodeType::Dir) {
+        return mode;
+    }
+    let mut kept = mode & !S_ISUID;
+    if mode & (S_ISGID | S_IXGRP) == S_ISGID | S_IXGRP {
+        kept &= !S_ISGID;
+    }
+    kept
+}
+
 /// Directory entry yielded by `VfsInode::readdir()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {

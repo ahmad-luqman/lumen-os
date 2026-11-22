@@ -7,7 +7,11 @@
 //! truncate, `mtime`) under the inode's lock. A path is resolved through
 //! `at::start_dir`'s `Start`; a descriptor must be open, and not `O_PATH`
 //! (`-EBADF`). A change on a read-only mount is `-EROFS`, checked here
-//! against the mount table before the inode is asked.
+//! against the mount table before the setter is asked.
+//!
+//! `devfs`'s setters refuse every change (`-EROFS`, its mount being
+//! read-only), where Linux's devtmpfs takes `chmod`, `chown` and
+//! `utimensat` on its nodes.
 //!
 //! A truncate then unmaps the current process's mapped pages of the file
 //! past its new end (`AddressSpace::invalidate_file_from`), so a later
@@ -35,10 +39,12 @@ fn vfs(e: VfsError) -> u32 {
 /// The flags `fchmodat2`, `fchownat` and `utimensat` (with a path) take.
 const PATH_FLAGS: u32 = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
 
-/// The inode `path` names from `dirfd`: its last symlink followed unless
-/// `AT_SYMLINK_NOFOLLOW`, an empty path naming `dirfd`'s file (or the cwd)
-/// only with `AT_EMPTY_PATH`. The caller has validated `flags`.
+/// The inode `path` names from `dirfd`: `flags` checked first (anything
+/// but `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` is `-EINVAL`), its last
+/// symlink followed unless `AT_SYMLINK_NOFOLLOW`, an empty path naming
+/// `dirfd`'s file (or the cwd) only with `AT_EMPTY_PATH`.
 fn lookup(dirfd: Dirfd, path: UserPtr, flags: AtFlags) -> Result<Arc<dyn VfsInode>, u32> {
+    let flags = flags.validate(PATH_FLAGS).map_err(vfs)?;
     let empty = flags.has_empty_path();
     let path = UserPath::copy_in(path, empty)?;
     let start = start_dir(dirfd, &path)?;
@@ -55,8 +61,10 @@ fn open_file(fd: Fd) -> Result<FileRef, u32> {
     Ok(file)
 }
 
-/// `-EROFS` if `inode` is on a read-only mount (Linux's `mnt_want_write`,
-/// before any other check of the change).
+/// `-EROFS` if `inode` is on a read-only mount (Linux's `mnt_want_write`),
+/// checked before the setter. An inode whose device isn't in the mount
+/// table (a ktest's scratch volume) counts as writable: its filesystem's
+/// own setters still refuse on a read-only volume.
 fn writable_mount(inode: &dyn VfsInode) -> Result<(), u32> {
     if tables().fs_read_only(inode.dev_id()) { Err(errno::EROFS) } else { Ok(()) }
 }
@@ -73,7 +81,6 @@ fn chmod(inode: &dyn VfsInode, mode: Mode) -> Result<u64, u32> {
 }
 
 fn fchmodat(dirfd: Dirfd, path: UserPtr, mode: Mode, flags: AtFlags) -> Result<u64, u32> {
-    let flags = flags.validate(PATH_FLAGS).map_err(vfs)?;
     chmod(&*lookup(dirfd, path, flags)?, mode)
 }
 
@@ -106,36 +113,16 @@ fn id(raw: u32) -> Option<u32> {
 }
 
 /// Set `inode`'s owner and group. The process is root, so any id goes.
-/// On anything but a directory, setuid goes too, and setgid when
-/// group-execute is set (Linux's `chown_common` asks `notify_change` for
-/// `ATTR_KILL_SUID | ATTR_KILL_SGID`, whoever calls, `-1` ids too).
+/// `VfsInode::set_owner` also drops the set-id bits a chown drops
+/// (`lumen_vfs::mode_after_chown`), in the same hold of the inode's lock
+/// and the same disk write: a failed chown changes nothing.
 fn chown(inode: &dyn VfsInode, uid: u32, gid: u32) -> Result<u64, u32> {
     writable_mount(inode)?;
     inode.set_owner(id(uid), id(gid)).map_err(vfs)?;
-    if inode.inode_type() != InodeType::Dir {
-        let mode = inode.stat().map_err(vfs)?.mode;
-        let kept = kill_suid_sgid(mode);
-        if kept != mode {
-            inode.set_mode(kept).map_err(vfs)?;
-        }
-    }
     Ok(0)
 }
 
-/// `mode` less setuid, and less setgid if group-execute is set.
-fn kill_suid_sgid(mode: u16) -> u16 {
-    const S_ISUID: u16 = 0o4000;
-    const S_ISGID: u16 = 0o2000;
-    const S_IXGRP: u16 = 0o010;
-    let mut kept = mode & !S_ISUID;
-    if mode & (S_ISGID | S_IXGRP) == S_ISGID | S_IXGRP {
-        kept &= !S_ISGID;
-    }
-    kept
-}
-
 fn fchownat(dirfd: Dirfd, path: UserPtr, uid: u32, gid: u32, flags: AtFlags) -> Result<u64, u32> {
-    let flags = flags.validate(PATH_FLAGS).map_err(vfs)?;
     chown(&*lookup(dirfd, path, flags)?, uid, gid)
 }
 
@@ -199,10 +186,7 @@ fn utimensat(dirfd: Dirfd, path: UserPtr, times: UserPtr, flags: AtFlags) -> Res
             let file = open_file(fd)?;
             (Arc::clone(&file.inode), Some(file))
         }
-        _ => {
-            let flags = flags.validate(PATH_FLAGS).map_err(vfs)?;
-            (lookup(dirfd, path, flags)?, None)
-        }
+        _ => (lookup(dirfd, path, flags)?, None),
     };
     let (atime, mtime) = match raw {
         None => (SetTime::Now, SetTime::Now),
@@ -227,35 +211,33 @@ fn length(raw: u64) -> Result<u64, u32> {
     if (raw as i64) < 0 { Err(errno::EINVAL) } else { Ok(raw) }
 }
 
-/// Resize `inode` (a regular file) to `len`, then unmap the current
-/// process's pages of it past the new end, holding no VFS lock (the
-/// truncate has released Lock 4 before Lock 1 is taken), so a later access
-/// there faults into a bus error. A grow unmaps nothing: no page wholly
-/// past the old end could have been mapped.
+/// Resize `inode` (a regular file) on a writable mount (`-EROFS`) to `len`,
+/// then unmap the current process's pages of it past the new end. The
+/// truncate has released Lock 4 before `invalidate_file_from` takes
+/// Lock 1: this syscall never holds both. A later access past the end
+/// faults into a bus error. On a grow there is nothing to unmap in the
+/// caller's space: a fault refuses a page wholly past the old end.
 ///
 /// Only the current process's address space, loaded on this CPU
 /// (`invalidate_file_from`'s debug assertion): another process mapping the
 /// file keeps its pages, holding them alive, until M8 finds the mappers and
 /// shoots their TLB entries down (#255).
 fn resize(inode: &dyn VfsInode, len: u64) -> Result<u64, u32> {
+    writable_mount(inode)?;
     inode.truncate(len).map_err(vfs)?;
-    if let Some(space) = sched::current_address_space() {
-        space.invalidate_file_from(file_id_of(inode), len);
-    }
+    let space = sched::current_address_space().expect("a truncate syscall runs on a thread with an address space");
+    space.invalidate_file_from(file_id_of(inode), len);
     Ok(0)
 }
 
 fn truncate(path: UserPtr, len: u64) -> Result<u64, u32> {
     let len = length(len)?;
-    let path = UserPath::copy_in(path, false)?;
-    let start = start_dir(Dirfd::Cwd, &path)?;
-    let inode = start.resolve(&path, ResolveFlags { follow_final: true, empty_path: false, require_dir: false })?.inode;
+    let inode = lookup(Dirfd::Cwd, path, AtFlags(0))?;
     match inode.inode_type() {
         InodeType::File => {}
         InodeType::Dir => return Err(errno::EISDIR),
         _ => return Err(errno::EINVAL),
     }
-    writable_mount(&*inode)?;
     resize(&*inode, len)
 }
 
@@ -267,7 +249,6 @@ fn ftruncate(fd: Fd, len: u64) -> Result<u64, u32> {
     if !file.is_writable() || file.inode.inode_type() != InodeType::File {
         return Err(errno::EINVAL);
     }
-    writable_mount(&*file.inode)?;
     resize(&*file.inode, len)
 }
 
@@ -281,8 +262,8 @@ pub(super) fn sys_truncate(path: UserPtr, length: u64) -> u64 {
 
 /// `ftruncate(fd, length)` (77): `-EBADF` if `fd` isn't open (or is
 /// `O_PATH`), `-EINVAL` for a negative length, a descriptor not open for
-/// writing or anything but a regular file, `-EFBIG` past the filesystem's
-/// largest file.
+/// writing or anything but a regular file, `-EROFS` on a read-only mount,
+/// `-EFBIG` past the filesystem's largest file.
 pub(super) fn sys_ftruncate(fd: Fd, length: u64) -> u64 {
     finish(ftruncate(fd, length))
 }
@@ -443,6 +424,11 @@ mod tests {
                 let ro = ktest_user_path(6, b"/proc/version")?;
                 kassert_eq!(sys_chmod(ro, at::reg(0o600)), neg_errno(errno::EROFS));
                 kassert_eq!(sys_fchmodat(Dirfd::Cwd, ro, at::reg(0o600)), neg_errno(errno::EROFS));
+                // The mount table's check comes first: procfs's `self` is a
+                // symlink, so without it this would be `-EOPNOTSUPP`.
+                let proc_self = ktest_user_path(7, b"/proc/self")?;
+                let nofollow = flags(AtFlags::AT_SYMLINK_NOFOLLOW);
+                kassert_eq!(sys_fchmodat2(Dirfd::Cwd, proc_self, at::reg(0o600), nofollow), neg_errno(errno::EROFS));
                 remove(&[b"/tmp/meta-ktest-chmod", b"/tmp/meta-ktest-chmod-link"]);
                 Ok(())
             })?
@@ -646,6 +632,9 @@ mod tests {
                 // A read-only mount: `-EROFS`.
                 let ro = ktest_user_path(4, b"/proc/version")?;
                 kassert_eq!(sys_utimensat(Dirfd::Cwd, ro, at::reg(0), flags(0)), neg_errno(errno::EROFS));
+                // ... after an invalid `tv_nsec` (`-EINVAL` first, as Linux).
+                let t = put_times(times_at, [(1, -5), (2, 0)])?;
+                kassert_eq!(sys_utimensat(Dirfd::Cwd, ro, t, flags(0)), neg_errno(errno::EINVAL));
                 remove(&[b"/tmp/meta-ktest-utime", b"/tmp/meta-ktest-utime-link"]);
                 Ok(())
             })?
@@ -766,12 +755,51 @@ mod tests {
         }
     );
 
+    crate::ktest!(
+        fn meta_chown_on_ext4_drops_set_id_bits_in_its_one_write_and_a_failed_one_changes_nothing() {
+            // ext4's `set_owner` drops setuid (and group-exec setgid) in the
+            // same disk write as the owner: a read-only remount of the disk
+            // sees both. A chown whose disk read fails changes neither,
+            // in memory or on disk.
+            use crate::vfs::page_cache::ktest_files::Ext4Volume;
+            process::in_test_process(|_| {
+                let vol = Ext4Volume::new(203)?;
+                let f = vol.root.create("suid", 0o644).map_err(|_| "create on ext4")?;
+                f.set_mode(0o6755).map_err(|_| "set_mode")?;
+                let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
+                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from("/suid"), rw)
+                    .map_err(|_| "open on ext4")?;
+                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                kassert_eq!(sys_fchown(fd, 5, u32::MAX), 0);
+                let m = f.stat().map_err(|_| "stat")?;
+                kassert_eq!((m.uid, m.gid, m.mode), (5, 0, 0o0755));
+                let on_disk = vol.remount_ro(204)?.lookup("suid").map_err(|_| "lookup on the remount")?;
+                let d = on_disk.stat().map_err(|_| "stat on the remount")?;
+                kassert_eq!((d.uid, d.gid, d.mode), (5, 0, 0o0755));
+                // A failing disk: `-EIO`, and nothing changed.
+                f.set_mode(0o4755).map_err(|_| "set_mode")?;
+                let before = f.stat().map_err(|_| "stat")?;
+                vol.fail_reads(true);
+                let failed = sys_fchown(fd, 7, 8);
+                vol.fail_reads(false);
+                kassert_eq!(failed, neg_errno(errno::EIO));
+                let after = f.stat().map_err(|_| "stat")?;
+                kassert_eq!((after.uid, after.gid, after.mode), (5, 0, 0o4755));
+                kassert_eq!(after.ctime, before.ctime);
+                let d = vol.remount_ro(205)?.lookup("suid").and_then(|i| i.stat()).map_err(|_| "remount")?;
+                kassert_eq!((d.uid, d.gid, d.mode), (5, 0, 0o4755));
+                kassert_eq!(sys_close(fd), 0);
+                Ok(())
+            })?
+        }
+    );
+
     /// Map `f` (3 pages) shared and writable in the current process, fault
     /// every page in, then run `shrink` (to `P + 10`) and check that the
     /// pages wholly past the new end are gone from the page tables (a copy
     /// there `-EFAULT`s, a fault is a bus error) while the page holding the
-    /// end stays, its tail zero through the mapping; a later grow maps a
-    /// fresh zero page.
+    /// end reads back, its tail zero through the mapping; a later grow maps
+    /// a fresh zero page.
     fn shrink_unmaps(f: &Arc<dyn VfsInode>, shrink: impl FnOnce() -> u64) -> Result<(), &'static str> {
         use crate::user::copy_from_user;
         let space = sched::current_address_space().ok_or("no address space")?;

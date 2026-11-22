@@ -144,6 +144,12 @@ pub trait VfsInode: Send + Sync {
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError>;
     fn truncate(&self, size: u64) -> Result<(), VfsError>;
     fn set_mode(&self, mode: u16) -> Result<(), VfsError>;
+    /// Set the owner and group (`None` leaves either as it is), update
+    /// `ctime`, and leave the mode [`mode_after_chown`](crate::mode_after_chown)
+    /// gives (setuid dropped on anything but a directory, setgid too with
+    /// group-execute), all in one hold of the inode's metadata lock and, on
+    /// disk, one inode write: a failure changes nothing, and no `set_mode`
+    /// can land between the owner change and the mode's.
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError>;
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError>;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError>;

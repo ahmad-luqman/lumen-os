@@ -44,7 +44,7 @@ pub use resolve::{
 };
 pub use types::{
     AccessMask, AccessMode, AtFlags, DevId, DirEntry, Ino, InodeType, Metadata, OpenFlags, RenameFlags, SeekFrom,
-    SetTime, Timespec,
+    SetTime, Timespec, mode_after_chown,
 };
 
 /// Maximum POSIX path length including NUL (`PATH_MAX`).

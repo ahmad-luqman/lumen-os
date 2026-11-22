@@ -27,7 +27,7 @@ use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFe
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, next_detached_ino, next_lock_id,
+    VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
 use log::{error, warn};
@@ -3865,16 +3865,24 @@ impl VfsInode for Ext4Inode {
         let now_ts = duration_to_timespec(now_dur);
         let new_uid = uid.unwrap_or(meta.uid);
         let new_gid = gid.unwrap_or(meta.gid);
+        // The set-id bits a chown drops, in the same hold and disk write as
+        // the owner (`VfsInode::set_owner`'s contract).
+        let new_mode = mode_after_chown(self.inode_type, meta.mode);
         if !self.is_detached() {
             let inner = self.shared.state.lock();
             let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
             disk.set_uid(new_uid);
             disk.set_gid(new_gid);
+            if new_mode != meta.mode {
+                let full_mode = (self.inode_type.to_mode_bits() as u16) | new_mode;
+                disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
+            }
             disk.set_ctime(now_dur);
             disk.write(&inner.ext4).map_err(map_ext4_err)?;
         }
         meta.uid = new_uid;
         meta.gid = new_gid;
+        meta.mode = new_mode;
         meta.ctime = now_ts;
         Ok(())
     }
