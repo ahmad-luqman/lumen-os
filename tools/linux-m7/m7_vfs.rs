@@ -1383,7 +1383,8 @@ fn locks(d: &[u8]) -> c_int {
 /// short and a long symlink, two files' new mode, owner and times (`f`'s
 /// set while it has unwritten changes, written by a `sync`; `t2`'s set
 /// after that `sync`, on a clean inode), a file and a directory exchanged,
-/// and a directory moved to another parent. Each check reads back what it
+/// a directory moved to another parent, and a file and a symlink whose names
+/// (and the link's target) aren't UTF-8. Each check reads back what it
 /// made, as `keep-check` does on a later boot, from the disk.
 fn keep(d: &[u8]) -> c_int {
     let checks: [(&str, &dyn Fn() -> R); 6] = [

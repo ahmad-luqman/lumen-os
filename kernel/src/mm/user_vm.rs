@@ -1886,8 +1886,15 @@ fn file_vm_open_ro(f: &Arc<dyn VfsInode>) -> Result<MappedFile, &'static str> {
 
 #[cfg(feature = "ktest")]
 fn file_vm_open_as(f: &Arc<dyn VfsInode>, flags: u32) -> Result<MappedFile, &'static str> {
+    file_vm_open_path(f, b"/ktest/file", flags)
+}
+
+/// `f` opened with `flags` by `path` (its bytes, as `/proc/<pid>/maps`
+/// shows them), as a mapping keeps it.
+#[cfg(feature = "ktest")]
+fn file_vm_open_path(f: &Arc<dyn VfsInode>, path: &[u8], flags: u32) -> Result<MappedFile, &'static str> {
     let flags = lumen_vfs::OpenFlags::from_bits(flags);
-    let file = crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from(*b"/ktest/file"), flags)
+    let file = crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from(path), flags)
         .map_err(|_| "open the file")?;
     Ok(MappedFile::of(&file))
 }
@@ -1901,23 +1908,22 @@ crate::ktest!(
         // isn't UTF-8 and holds two newlines is named in `format_maps` by
         // the path's bytes, each newline as `\012`: the listing stays one
         // line, which a name can't split.
-        use crate::kassert;
         use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        use crate::{kassert, kassert_eq};
         let vol = TmpfsVolume::new(272, 16 * PAGE_SIZE as usize);
         let f = ktest_files::file(&vol.root, "maps.bin", &ktest_files::pattern(PAGE_SIZE as usize, 1))?;
-        let flags = lumen_vfs::OpenFlags::from_bits(lumen_vfs::OpenFlags::O_RDONLY);
-        let file =
-            crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(*b"/k/\xff\nf\n"), flags)
-                .map_err(|_| "open the file")?;
+        let file = file_vm_open_path(&f, b"/k/\xff\nf\n", lumen_vfs::OpenFlags::O_RDONLY)?;
         let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
-        let mapped =
-            space.mmap_file(MapPlace::Hint(None), PAGE_SIZE, Prot::READ, MappedFile::of(&file), 0, Sharing::Private);
-        drop(file);
+        let mapped = space.mmap_file(MapPlace::Hint(None), PAGE_SIZE, Prot::READ, file, 0, Sharing::Private);
         let maps = space.format_maps();
         space.teardown();
         mapped.map_err(|_| "mmap_file")?;
-        kassert!(maps.ends_with(b" /k/\xff\\012f\\012\n"));
-        kassert!(maps.iter().filter(|&&b| b == b'\n').count() == 1);
+        let named = maps.ends_with(b" /k/\xff\\012f\\012\n");
+        if !named {
+            crate::ktest::diag(format_args!("maps: {:?}", lumen_vfs::Escaped(&maps)));
+        }
+        kassert!(named);
+        kassert_eq!(maps.iter().filter(|&&b| b == b'\n').count(), 1);
         Ok(())
     }
 );

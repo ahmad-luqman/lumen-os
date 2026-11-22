@@ -1133,9 +1133,10 @@ fn non_utf8_names_are_bytes_through_every_operation() {
     // lossy name would make them one).
     let (other, _) = open_inode(&env, None, b"/d\xff/\xfe\xfcfile", creat, 0o644, 0).unwrap();
     assert_ne!(other.ino(), file.ino());
-    // Each resolves to its own inode with the other's dentry cached: the
-    // first name, looked up after the second is cached, tells a lossy key
-    // apart (it would hand back the second's inode).
+    // Each resolves to its own inode with the other's dentry cached:
+    // `\xfe\xfdfile`, looked up while `\xfe\xfcfile`'s dentry (made by its
+    // create) is cached, tells a lossy key apart (both would be
+    // `\u{fffd}\u{fffd}file`, and it would hand back `\xfe\xfcfile`'s inode).
     for (name, want) in [(&b"/d\xff/\xfe\xfcfile"[..], &other), (b"/d\xff/\xfe\xfdfile", &file)] {
         let got = resolve_path(&env, None, name, ResolveFlags::default()).unwrap().inode;
         assert!(Arc::ptr_eq(&got, want), "{:?} resolves to its own inode", Escaped(name));
@@ -1180,6 +1181,10 @@ fn escaped_shows_every_name_apart() {
     // would drive a terminal or reorder the line: escaped too.
     assert_eq!(format!("{}", Escaped("csi\u{9b}2J rlo\u{202e}".as_bytes())), "csi\\u{9b}2J rlo\\u{202e}");
     assert_eq!(format!("{}", Escaped(b"it's")), "it's");
+    // A nonspacing mark (`Grapheme_Extend`) is escaped, so `e` + U+0301
+    // shows apart from U+00E9; a spacing mark and decomposed Hangul pass.
+    assert_eq!(format!("{}", Escaped("e\u{301} \u{e9}".as_bytes())), "e\\u{301} \u{e9}");
+    assert_eq!(format!("{}", Escaped("\u{915}\u{903} \u{1100}\u{1161}".as_bytes())), "\u{915}\u{903} \u{1100}\u{1161}");
     // Under `{}` a `"` is itself (only `{:?}` quotes and escapes it).
     assert_eq!(format!("{}", Escaped(b"a\"b")), "a\"b");
     // The escape itself can't pass for a byte that needs one.

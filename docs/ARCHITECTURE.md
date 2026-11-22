@@ -5569,8 +5569,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
   - **Names that aren't UTF-8** are listed, looked up, unlinked and
     renamed as any other (#268: VFS names are bytes, "Core abstractions"
     below), except on a volume with unsigned directory hashes, where a
-    hashed directory's lookups miss any name with a byte of 0x80 or more
-    (#308, the caveat below).
+    hashed directory's lookups can miss a name with a byte of 0x80 or
+    more, and such a name Lumen adds there is filed where Linux won't find
+    it (#308, the caveat below).
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
@@ -5638,8 +5639,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     UTF-8 as it is, except an ASCII control character and a byte that
     isn't UTF-8 as `\xNN`, `\` as `\\`, and any other character
     `char::escape_debug` escapes as `\u{..}` (C1 controls, bidi overrides,
-    and also combining marks, U+00A0 and U+00AD, so an NFC and an NFD name
-    never show the same). Its users: log lines, `vfstest ls` and
+    and also nonspacing and enclosing marks, the `Grapheme_Extend` set,
+    U+00A0 and U+00AD, so a decomposed accent shows apart from its
+    precomposed letter; a spacing mark or decomposed Hangul passes as it
+    is, still in bytes of its own). Its users: log lines, `vfstest ls` and
     `vfstest readlink` output, and an exec error's `PT_INTERP` path.
     `/proc/<pid>/maps` prints the raw bytes, a newline as `\012` (Linux's
     `seq_path`). Two exceptions stay text: mount paths
@@ -5654,8 +5657,12 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     and an htree lookup has no linear fallback. On a volume made where
     `char` is unsigned (`mke2fs` on aarch64 Linux), a name with a byte of
     0x80 or more (UTF-8 or not) in such a directory is listed by `readdir`
-    but not found by `lookup`, `unlink`, `rmdir` or `rename`. Lumen's
-    images are made where `char` is signed, so no test meets it.
+    but can be missed by `lookup`, `unlink`, `rmdir` or `rename` (when its
+    signed hash picks another leaf than its real one); and an entry Lumen
+    creates or renames to there is filed under the signed hash, where Linux
+    won't find it (Lumen's own `readdir` still lists it) until `e2fsck -fD`
+    reindexes the directory. Lumen's images are made where `char` is
+    signed, so no test meets it.
   - **Read-only mounts and special files (#291):** `open_inode` (a write
     open: `O_WRONLY`, `O_RDWR`, `O_TRUNC`) and `check_access` (`W_OK`)
     skip their `-EROFS` for a special file, by its type alone

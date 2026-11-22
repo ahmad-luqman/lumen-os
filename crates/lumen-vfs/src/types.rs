@@ -229,11 +229,13 @@ pub struct DirEntry {
 
 impl fmt::Debug for DirEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Destructured, so a new field can't be left out of the output.
+        let Self { ino, inode_type, name, next_cursor } = self;
         f.debug_struct("DirEntry")
-            .field("ino", &self.ino)
-            .field("inode_type", &self.inode_type)
-            .field("name", &Escaped(&self.name))
-            .field("next_cursor", &self.next_cursor)
+            .field("ino", ino)
+            .field("inode_type", inode_type)
+            .field("name", &Escaped(name))
+            .field("next_cursor", next_cursor)
             .finish()
     }
 }
@@ -509,9 +511,10 @@ impl AccessMask {
 /// A name's or a path's bytes shown as text, never lossily (#268): UTF-8
 /// as it is, except `\` as `\\`, an ASCII control character as `\xNN`, any
 /// other character `char::escape_debug` escapes (a C1 control, a bidi
-/// override, and also every combining mark, U+00A0 and U+00AD, so an NFC
-/// and an NFD name never show the same) as `\u{..}`, and each byte that
-/// isn't UTF-8 as `\xNN`.
+/// override, and also a nonspacing or enclosing mark, the `Grapheme_Extend`
+/// set, U+00A0 and U+00AD, so a decomposed accent shows apart from its
+/// precomposed letter; a spacing mark or decomposed Hangul passes as it is)
+/// as `\u{..}`, and each byte that isn't UTF-8 as `\xNN`.
 /// So two names never show the same, and a name can't drive a terminal or
 /// reorder a log line. `{:?}` puts it in quotes, a `"` in it as `\"`.
 #[derive(Clone, Copy, PartialEq, Eq)]

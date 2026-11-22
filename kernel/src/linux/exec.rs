@@ -18,8 +18,8 @@ use crate::vfs;
 
 /// Why a binary could not be loaded. The read and interpreter errors name
 /// the file they are about; `Load` is about the binary, which the caller
-/// names.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// names. Its `Debug` shows a path that isn't UTF-8 `Escaped`.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ExecError {
     /// The binary could not be read (`ENOENT`, `EACCES` when it is not a
     /// regular file with an execute bit, `ENOMEM`, ...).
@@ -47,6 +47,24 @@ impl ExecError {
             ExecError::InterpPathNotUtf8 { .. } => errno::ENOENT,
             ExecError::InterpBad { .. } => errno::ELIBBAD,
             ExecError::Load(e) => e.to_errno(),
+        }
+    }
+}
+
+impl fmt::Debug for ExecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExecError::Read { path, err } => f.debug_struct("Read").field("path", path).field("err", err).finish(),
+            ExecError::InterpRead { path, err } => {
+                f.debug_struct("InterpRead").field("path", path).field("err", err).finish()
+            }
+            ExecError::InterpPathNotUtf8 { path } => {
+                f.debug_struct("InterpPathNotUtf8").field("path", &lumen_vfs::Escaped(path)).finish()
+            }
+            ExecError::InterpBad { path, err } => {
+                f.debug_struct("InterpBad").field("path", path).field("err", err).finish()
+            }
+            ExecError::Load(e) => f.debug_tuple("Load").field(e).finish(),
         }
     }
 }
@@ -484,6 +502,8 @@ crate::ktest!(
         let odd = test_exec(test_dynamic_main(ET_DYN, 0, b"/lib/\xffld.so"), Ok(Vec::new())).map(|_| ());
         kassert_eq!(odd, Err(ExecError::InterpPathNotUtf8 { path: b"/lib/\xffld.so".to_vec() }));
         kassert_eq!(odd.as_ref().map_err(ExecError::to_errno), Err(errno::ENOENT));
+        let debug = odd.as_ref().map_err(|e| alloc::format!("{e:?}"));
+        kassert_eq!(debug, Err(String::from("InterpPathNotUtf8 { path: \"/lib/\\xffld.so\" }")));
         kassert_eq!(
             odd.map_err(|e| alloc::format!("{e}")),
             Err(String::from("cannot read its interpreter '/lib/\\xffld.so' (not UTF-8): ENOENT (2)"))
