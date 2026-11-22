@@ -120,13 +120,35 @@ pub struct LockContext {
     pub writable: bool,
 }
 
-/// Result of a non-failing lock attempt.
+/// Result of a `flock(2)` attempt that didn't fail.
+///
+/// `released` says whether the attempt gave up (or weakened) a lock another
+/// waiter may be blocked on, so the caller knows to wake its waiters: an
+/// unlock that removed a lock, an `LOCK_EX` → `LOCK_SH` downgrade, or a
+/// blocking request dropping the lock its description held before it waits.
+/// Taking a new lock, an upgrade, re-taking the same kind, or unlocking
+/// nothing releases nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockOutcome {
-    /// Lock acquired or unlocked immediately.
-    Granted,
-    /// Blocking lock requested (`!LOCK_NB` or `F_SETLKW`) but conflicted.
-    WouldBlock,
+    /// Lock acquired, converted or unlocked immediately.
+    Granted { released: bool },
+    /// Blocking request (no `LOCK_NB`) that conflicts: wait and retry. As
+    /// Linux's `flock_lock_inode`, the lock this description held (if any)
+    /// was dropped first (`released`), so two holders of `LOCK_SH` both
+    /// asking for `LOCK_EX` can't wait for each other for good.
+    WouldBlock { released: bool },
+}
+
+/// Result of an `F_SETLK`/`F_SETLKW` attempt that didn't fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordLockOutcome {
+    /// Lock taken, changed or given up. `released`: the request gave up or
+    /// weakened a range this pid held (an `F_UNLCK` over a held range, an
+    /// `F_RDLCK` over a held write lock), so waiters may now get theirs.
+    Granted { released: bool },
+    /// `F_SETLKW` conflicts: wait and retry. `holder` is the pid owning the
+    /// first conflicting lock (the one `F_GETLK` would report).
+    WouldBlock { holder: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,11 +203,11 @@ impl AdvisoryLocks {
     /// Callers must reject `O_PATH` descriptors with `-EBADF` beforehand.
     /// When `op.nonblock` is true and another `OpenFileId` conflicts, returns
     /// `Err(VfsError::Again)` while leaving any existing lock held by
-    /// `file_id` intact.
+    /// `file_id` intact (a deviation: Linux drops it first, as it does for a
+    /// blocking request, which this does too: see [`LockOutcome::WouldBlock`]).
     pub fn flock(&mut self, file_id: OpenFileId, op: FlockOp) -> Result<LockOutcome, VfsError> {
         let Some(req_kind) = op.kind else {
-            self.release_flock(file_id);
-            return Ok(LockOutcome::Granted);
+            return Ok(LockOutcome::Granted { released: self.release_flock(file_id) });
         };
 
         let conflict = self.flocks.iter().any(|&(other_id, other_kind)| match (req_kind, other_kind) {
@@ -198,15 +220,18 @@ impl AdvisoryLocks {
             if op.nonblock {
                 return Err(VfsError::Again);
             }
-            return Ok(LockOutcome::WouldBlock);
+            return Ok(LockOutcome::WouldBlock { released: self.release_flock(file_id) });
         }
 
-        if let Some((_, kind)) = self.flocks.iter_mut().find(|(id, _)| *id == file_id) {
+        let released = if let Some((_, kind)) = self.flocks.iter_mut().find(|(id, _)| *id == file_id) {
+            let downgrade = *kind == FlockKind::Exclusive && req_kind == FlockKind::Shared;
             *kind = req_kind;
+            downgrade
         } else {
             self.flocks.push((file_id, req_kind));
-        }
-        Ok(LockOutcome::Granted)
+            false
+        };
+        Ok(LockOutcome::Granted { released })
     }
 
     /// Release any `flock(2)` held by `file_id` (e.g. on last FD close).
@@ -230,28 +255,34 @@ impl AdvisoryLocks {
         };
         let (start, end) = normalize_range(spec, cur_offset, file_size)?;
 
-        for (&other_pid, locks) in &self.posix {
-            if other_pid == pid {
-                continue;
+        match self.first_conflict(pid, start, end, req_kind) {
+            Some((other_pid, lock)) => {
+                spec.l_type = lock.kind.to_raw();
+                spec.l_whence = fcntl_const::SEEK_SET;
+                spec.l_start = lock.start;
+                spec.l_len = if lock.end == i64::MAX { 0 } else { lock.end - lock.start + 1 };
+                spec.l_pid = other_pid as i32;
             }
-            for &lock in locks {
-                if lock.overlaps(start, end) && req_kind.conflicts_with(lock.kind) {
-                    spec.l_type = lock.kind.to_raw();
-                    spec.l_whence = fcntl_const::SEEK_SET;
-                    spec.l_start = lock.start;
-                    spec.l_len = if lock.end == i64::MAX { 0 } else { lock.end - lock.start + 1 };
-                    spec.l_pid = other_pid as i32;
-                    return Ok(());
-                }
-            }
+            None => spec.l_type = fcntl_const::F_UNLCK,
         }
-
-        spec.l_type = fcntl_const::F_UNLCK;
         Ok(())
+    }
+
+    /// The first lock (in pid order, then by start) another pid than `pid`
+    /// holds over `[start, end]` that conflicts with `kind`, with its owner.
+    fn first_conflict(&self, pid: u32, start: i64, end: i64, kind: RangeLockKind) -> Option<(u32, PosixRangeLock)> {
+        self.posix.iter().filter(|&(&other_pid, _)| other_pid != pid).find_map(|(&other_pid, locks)| {
+            locks
+                .iter()
+                .find(|lock| lock.overlaps(start, end) && kind.conflicts_with(lock.kind))
+                .map(|&l| (other_pid, l))
+        })
     }
 
     /// Apply `F_SETLK` (`blocking = false`) or `F_SETLKW` (`blocking = true`).
     ///
+    /// Checked in Linux's order: the lock type and the range (`Inval`,
+    /// `Overflow`) before the access mode (`BadF`; `F_UNLCK` needs none).
     /// Callers must reject `O_PATH` descriptors with `-EBADF` beforehand.
     pub fn setlk(
         &mut self,
@@ -259,15 +290,27 @@ impl AdvisoryLocks {
         spec: FlockSpec,
         ctx: LockContext,
         blocking: bool,
-    ) -> Result<LockOutcome, VfsError> {
+    ) -> Result<RecordLockOutcome, VfsError> {
         let lock_type = PosixLockType::from_raw(spec.l_type)?;
+        let (start, end) = normalize_range(&spec, ctx.cur_offset, ctx.file_size)?;
         match lock_type {
             PosixLockType::Read if !ctx.readable => return Err(VfsError::BadF),
             PosixLockType::Write if !ctx.writable => return Err(VfsError::BadF),
             _ => {}
         }
 
-        let (start, end) = normalize_range(&spec, ctx.cur_offset, ctx.file_size)?;
+        // Whether the request weakens what `pid` holds over the range: an
+        // unlock of a held range, a read lock over a held write lock.
+        let released = self.posix.get(&pid).is_some_and(|locks| {
+            locks.iter().any(|lock| {
+                lock.overlaps(start, end)
+                    && match lock_type {
+                        PosixLockType::Unlock => true,
+                        PosixLockType::Read => lock.kind == RangeLockKind::Write,
+                        PosixLockType::Write => false,
+                    }
+            })
+        });
 
         let req_kind = match lock_type {
             PosixLockType::Unlock => {
@@ -277,21 +320,17 @@ impl AdvisoryLocks {
                         self.posix.remove(&pid);
                     }
                 }
-                return Ok(LockOutcome::Granted);
+                return Ok(RecordLockOutcome::Granted { released });
             }
             PosixLockType::Read => RangeLockKind::Read,
             PosixLockType::Write => RangeLockKind::Write,
         };
 
-        let conflict = self.posix.iter().any(|(&other_pid, locks)| {
-            other_pid != pid && locks.iter().any(|lock| lock.overlaps(start, end) && req_kind.conflicts_with(lock.kind))
-        });
-
-        if conflict {
+        if let Some((holder, _)) = self.first_conflict(pid, start, end, req_kind) {
             if !blocking {
                 return Err(VfsError::Again);
             }
-            return Ok(LockOutcome::WouldBlock);
+            return Ok(RecordLockOutcome::WouldBlock { holder });
         }
 
         let locks = self.posix.entry(pid).or_default();
@@ -299,7 +338,7 @@ impl AdvisoryLocks {
         locks.push(PosixRangeLock { start, end, kind: req_kind });
         sort_and_coalesce(locks);
 
-        Ok(LockOutcome::Granted)
+        Ok(RecordLockOutcome::Granted { released })
     }
 
     /// Release **all** POSIX record locks held by `pid` on this inode
@@ -320,34 +359,117 @@ impl AdvisoryLocks {
     }
 }
 
+/// `spec`'s range as inclusive `[start, end]` offsets, as Linux's
+/// `flock_to_posix_lock` computes it: a bad `l_whence` or a range starting
+/// before offset 0 is `Inval`; one reaching past the largest offset
+/// (`i64::MAX`) is `Overflow` (`EOVERFLOW`, as Linux and POSIX).
 fn normalize_range(spec: &FlockSpec, cur_offset: u64, file_size: u64) -> Result<(i64, i64), VfsError> {
     let base = match spec.l_whence {
         fcntl_const::SEEK_SET => 0i64,
-        fcntl_const::SEEK_CUR => i64::try_from(cur_offset).map_err(|_| VfsError::Inval)?,
-        fcntl_const::SEEK_END => i64::try_from(file_size).map_err(|_| VfsError::Inval)?,
+        fcntl_const::SEEK_CUR => i64::try_from(cur_offset).map_err(|_| VfsError::Overflow)?,
+        fcntl_const::SEEK_END => i64::try_from(file_size).map_err(|_| VfsError::Overflow)?,
         _ => return Err(VfsError::Inval),
     };
 
-    let anchor = base.checked_add(spec.l_start).ok_or(VfsError::Inval)?;
+    // `base >= 0`, so only a positive `l_start` can overflow.
+    let anchor = base.checked_add(spec.l_start).ok_or(VfsError::Overflow)?;
+    if anchor < 0 {
+        return Err(VfsError::Inval);
+    }
 
     if spec.l_len == 0 {
-        if anchor < 0 {
-            return Err(VfsError::Inval);
-        }
         Ok((anchor, i64::MAX))
     } else if spec.l_len > 0 {
-        if anchor < 0 {
-            return Err(VfsError::Inval);
-        }
-        let end = anchor.checked_add(spec.l_len - 1).ok_or(VfsError::Inval)?;
+        let end = anchor.checked_add(spec.l_len - 1).ok_or(VfsError::Overflow)?;
         Ok((anchor, end))
     } else {
-        let start = anchor.checked_add(spec.l_len).ok_or(VfsError::Inval)?;
+        // `anchor >= 0` and `l_len < 0`: no overflow, maybe below 0.
+        let start = anchor + spec.l_len;
         if start < 0 {
             return Err(VfsError::Inval);
         }
-        let end = anchor - 1;
-        Ok((start, end))
+        Ok((start, anchor - 1))
+    }
+}
+
+/// How many other processes' waits [`PosixWaitGraph::wait_for`] follows
+/// looking for a cycle back to the caller (Linux's `MAX_DEADLK_ITERATIONS`
+/// is 10 too): a cycle through more processes isn't found.
+pub const MAX_DEADLOCK_CHAIN: usize = 10;
+
+/// `F_SETLKW` would wait in a cycle: `EDEADLK`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadlock;
+
+/// A process blocked in `F_SETLKW`: who it waits for, and the release count
+/// its wait ends past.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WaitRecord {
+    holder: u32,
+    seen: u64,
+}
+
+/// Who waits for whom among the processes blocked in `F_SETLKW`, for
+/// `EDEADLK`: each waiter's pid and the one holder it waits for (the owner
+/// of the first conflicting lock, [`RecordLockOutcome::WouldBlock`]'s
+/// `holder`). Like Linux's `posix_locks_deadlock`, which follows each
+/// waiter's single `fl_blocker`, a cycle through a second holder of the
+/// same range isn't seen.
+///
+/// The kernel keeps one behind a spinlock, with a count of lock releases:
+/// a waiter reads the count (`seen`) before its try, and its wait ends once
+/// the count moves past it. Records carry that `seen` and are stamped
+/// against the count now (`now`), passed in by the caller, so a record made
+/// before the last release (its waiter woken since, maybe about to get its
+/// lock) is never followed.
+#[derive(Debug, Default)]
+pub struct PosixWaitGraph {
+    waits: BTreeMap<u32, WaitRecord>,
+}
+
+impl PosixWaitGraph {
+    pub const fn new() -> Self {
+        Self { waits: BTreeMap::new() }
+    }
+
+    /// `pid` is about to wait for `holder` (its try having failed with the
+    /// release count at `seen`, which is `now` at this call): record it,
+    /// unless following `holder`'s current wait, its holder's, and so on
+    /// through at most [`MAX_DEADLOCK_CHAIN`] records leads back to `pid`
+    /// (`Err(Deadlock)`, nothing recorded).
+    ///
+    /// A caller whose own view is stale (`seen != now`: a release came
+    /// after its try) is neither checked nor recorded: its wait ends at once
+    /// and it retries with a fresh view. Checking it could follow a record
+    /// made after that release (by the very holder it saw, now waiting on
+    /// it in turn) and report a cycle that its fresh try wouldn't be in.
+    pub fn wait_for(&mut self, pid: u32, holder: u32, seen: u64, now: u64) -> Result<(), Deadlock> {
+        if seen != now {
+            self.waits.remove(&pid);
+            return Ok(());
+        }
+        let mut next = holder;
+        for _ in 0..=MAX_DEADLOCK_CHAIN {
+            if next == pid {
+                return Err(Deadlock);
+            }
+            match self.waits.get(&next) {
+                Some(w) if w.seen == now => next = w.holder,
+                _ => break,
+            }
+        }
+        self.waits.insert(pid, WaitRecord { holder, seen });
+        Ok(())
+    }
+
+    /// `pid` no longer waits (its lock call returned).
+    pub fn done(&mut self, pid: u32) {
+        self.waits.remove(&pid);
+    }
+
+    /// Whether `pid` has a record (diagnostic / test helper).
+    pub fn is_recorded(&self, pid: u32) -> bool {
+        self.waits.contains_key(&pid)
     }
 }
 

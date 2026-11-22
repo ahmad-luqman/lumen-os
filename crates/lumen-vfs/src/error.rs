@@ -61,6 +61,9 @@ pub enum VfsError {
     NotEmpty,
     /// Too many levels of symbolic links (`ELOOP` = 40).
     Loop,
+    /// Value too large for defined data type (`EOVERFLOW` = 75): a lock
+    /// range past the largest offset.
+    Overflow,
     /// Operation not supported (`EOPNOTSUPP` = 95).
     OpNotSupp,
 }
@@ -97,6 +100,7 @@ impl VfsError {
             Self::NoSys => 38,
             Self::NotEmpty => 39,
             Self::Loop => 40,
+            Self::Overflow => 75,
             Self::OpNotSupp => 95,
         }
     }
@@ -133,6 +137,7 @@ impl fmt::Display for VfsError {
             Self::NoSys => "ENOSYS",
             Self::NotEmpty => "ENOTEMPTY",
             Self::Loop => "ELOOP",
+            Self::Overflow => "EOVERFLOW",
             Self::OpNotSupp => "EOPNOTSUPP",
         };
         write!(f, "{name} ({})", self.to_errno())

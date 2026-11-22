@@ -316,10 +316,12 @@ pub fn take_current() -> ProcessState {
     proc
 }
 
-/// Give back one descriptor's slot on `file`: `pid`'s POSIX record locks on
-/// its inode go on any close (as Linux), and its `flock` locks with the last
-/// slot of the open file description. Takes the inode's Lock 4: never call
-/// it holding `ACTIVE_PROCS` (or any spinlock).
+/// Give back one descriptor's slot on `file` (`close`, exit, `dup2`
+/// displacing it): `pid`'s POSIX record locks on its inode go on any close
+/// (as Linux), and its `flock` locks with the last slot of the open file
+/// description; if any went, the blocked lockers are woken to retry
+/// ([`locks_released`]). Takes the inode's Lock 4: never call it holding
+/// `ACTIVE_PROCS` (or any spinlock).
 fn release_fd(pid: u32, file: FileRef) {
     let last = file.dec_fd_ref() == 0;
     let id = file.id;
@@ -364,7 +366,8 @@ pub fn lock_releases() -> u64 {
 /// Say that an advisory lock (`flock` or a POSIX record lock) may have been
 /// given up or weakened, waking every blocked locker to retry. Call it
 /// after the inode's lock state is released, never under it, under
-/// `ACTIVE_PROCS` or under another spinlock.
+/// `ACTIVE_PROCS` or under another spinlock: `wake_all` takes the wait
+/// queue's lock and each woken thread's run-queue lock.
 pub fn locks_released() {
     LOCK_RELEASES.fetch_add(1, Ordering::SeqCst);
     LOCK_WAITERS.wake_all();

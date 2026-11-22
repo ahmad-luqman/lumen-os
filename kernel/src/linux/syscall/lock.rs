@@ -6,36 +6,37 @@
 //! keyed by the process's pid. A blocking request (`F_SETLKW`, `flock`
 //! without `LOCK_NB`) that conflicts waits in
 //! `process::wait_for_lock_release` and retries after any release: one
-//! kernel-wide wait queue, woken by every call here that gave a lock up and
-//! by `close` and exit giving locks up (`process::release_fd`). `F_SETLKW`
-//! refuses a wait that would close a cycle of waiting processes
-//! (`EDEADLK`, from `POSIX_WAITERS`, this module's record of who waits for
-//! whom: lumen-vfs keeps none); a blocking `flock` gives up the lock its
-//! description holds before it waits, as Linux. No signal ends a wait (M7
-//! delivers none, so no `EINTR`).
+//! kernel-wide wait queue, woken by every call here that gave a lock up
+//! (lumen-vfs says which: `released`) and by `close`, exit and `dup2`
+//! displacement giving locks up (`process::release_fd`). `F_SETLKW` refuses
+//! a wait that would close a cycle of waiting processes (`EDEADLK`, from
+//! lumen-vfs's `PosixWaitGraph` in `POSIX_WAITERS`); a blocking `flock`
+//! gives up the lock its description holds before it waits, as Linux. No
+//! signal ends a wait (M7 delivers none, so no `EINTR`).
 
-use alloc::collections::BTreeMap;
-use core::cell::Cell;
+use core::mem::size_of;
 
-use super::at::{Fd, UserPtr};
+use super::at::{self, Fd, UserPtr};
 use super::finish;
 use crate::linux::process::{self, FileRef, with_current};
 use crate::linux::{errno, general};
 use crate::sync::SpinLock;
 use crate::user::{copy_from_user, copy_to_user};
 use lumen_vfs::locks::fcntl_const;
-use lumen_vfs::{FlockOp, FlockSpec, LockContext, LockOutcome, VfsError, VfsLock};
+use lumen_vfs::{
+    AdvisoryLocks, FlockOp, FlockSpec, LockContext, LockOutcome, PosixWaitGraph, RecordLockOutcome, VfsError, VfsLock,
+};
 
 /// A VFS error as the positive errno a handler returns.
 fn vfs(e: VfsError) -> u32 {
     e.to_errno()
 }
 
-/// The size of Linux x86-64's `struct flock` (pinned with its offsets by
+/// The size of Linux x86-64's `struct flock` (its offsets pinned by
 /// `m7_abi_constants_match_spec`): `l_type` (`i16`) at 0, `l_whence`
 /// (`i16`) at 2, `l_start` (`i64`) at 8, `l_len` (`i64`) at 16, `l_pid`
 /// (`i32`) at 24, and padding at 4 and 28.
-const FLOCK_SIZE: usize = 32;
+const FLOCK_SIZE: usize = size_of::<general::flock>();
 
 /// A `struct flock` copied in: its bytes as they came (padding included,
 /// so a copy back changes only the fields `F_GETLK` writes) and its fields.
@@ -82,107 +83,86 @@ fn lock_context(file: &FileRef, spec: &FlockSpec) -> Result<LockContext, u32> {
 }
 
 /// Run `f` on `file`'s inode's lock table (its Lock 4): what `f` returned,
-/// or the filesystem's refusal.
-fn with_locks<T>(
-    file: &FileRef,
-    mut f: impl FnMut(&mut lumen_vfs::AdvisoryLocks) -> Result<T, VfsError>,
-) -> Result<T, u32> {
-    let mut out = Err(VfsError::Io);
-    file.inode.with_locks_mut(&mut |locks| out = f(locks)).map_err(vfs)?;
+/// or the filesystem's refusal. A filesystem that says yes without running
+/// `f` is a bug in it: logged, and `EIO`.
+fn with_locks<T>(file: &FileRef, mut f: impl FnMut(&mut AdvisoryLocks) -> Result<T, VfsError>) -> Result<T, u32> {
+    let mut out = None;
+    file.inode.with_locks_mut(&mut |locks| out = Some(f(locks))).map_err(vfs)?;
+    let Some(out) = out else {
+        log::error!(target: "linux", "{}: with_locks_mut returned without running its closure", file.path);
+        return Err(errno::EIO);
+    };
     out.map_err(vfs)
 }
 
-/// One try at a lock, under the inode's lock: lumen-vfs's answer, and
-/// whether the try may have given a lock up (an unlock, a write lock made a
-/// read lock, a range shrunk, a `flock` dropped to wait): then the waiters
-/// must retry.
-struct Try {
-    outcome: LockOutcome,
-    gave_up: bool,
+/// One try at a lock, under the inode's lock.
+enum Step<H> {
+    /// Taken, changed or given up; `released`: the try gave up or weakened
+    /// a lock (lumen-vfs's `released`), so the waiters must retry.
+    Done { released: bool },
+    /// Must wait, for `holder` (`F_SETLKW`'s pid; `()` for `flock`);
+    /// `released` as for `Done` (a blocking `flock` drops its lock first).
+    Wait { released: bool, holder: H },
 }
 
-/// Take a lock with `attempt`, waiting for a release and trying again
-/// while it says `WouldBlock`; `before_wait` runs (outside the inode's
-/// lock) before each wait and may refuse it (`EDEADLK`), `after_wait`
-/// after it. The release count is read before each try, so a release
-/// between a try and the wait ends the wait at once. A try that gave
-/// something up wakes the waiters, which retry (and wait again if they
-/// still conflict).
-fn lock_or_wait(
+/// Take a lock with `attempt`, waiting for a release and trying again while
+/// it says `Wait`. `before_wait(holder, seen, first)` runs outside the
+/// inode's lock before each wait (`first`: the call's first) and may refuse
+/// it (`EDEADLK`). The release count (`seen`) is read before each try, so a
+/// release between a try and the wait ends the wait at once. A try that
+/// released something wakes the waiters, which retry (and wait again if
+/// they still conflict).
+fn lock_or_wait<H: Copy>(
     file: &FileRef,
-    mut attempt: impl FnMut(&mut lumen_vfs::AdvisoryLocks) -> Result<Try, VfsError>,
-    mut before_wait: impl FnMut(u64) -> Result<(), u32>,
-    mut after_wait: impl FnMut(),
-) -> Result<u64, u32> {
+    mut attempt: impl FnMut(&mut AdvisoryLocks) -> Result<Step<H>, VfsError>,
+    mut before_wait: impl FnMut(H, u64, bool) -> Result<(), u32>,
+) -> Result<(), u32> {
+    let mut first = true;
     loop {
         let seen = process::lock_releases();
-        let Try { outcome, gave_up } = with_locks(file, &mut attempt)?;
-        if gave_up {
-            process::locks_released();
+        let step = with_locks(file, &mut attempt)?;
+        #[cfg(feature = "ktest")]
+        if matches!(step, Step::Wait { .. }) {
+            ktest_window::hold();
         }
-        match outcome {
-            LockOutcome::Granted => return Ok(0),
-            LockOutcome::WouldBlock => {
-                before_wait(seen)?;
+        match step {
+            Step::Done { released } => {
+                if released {
+                    process::locks_released();
+                }
+                return Ok(());
+            }
+            Step::Wait { released, holder } => {
+                if released {
+                    process::locks_released();
+                }
+                before_wait(holder, seen, first)?;
+                first = false;
                 process::wait_for_lock_release(seen);
-                after_wait();
             }
         }
     }
 }
 
-/// How far [`would_deadlock`] follows a chain of waiting processes, as
-/// Linux's `MAX_DEADLK_ITERATIONS`: a longer cycle isn't found.
-const MAX_DEADLOCK_CHAIN: usize = 10;
+/// Who waits for whom among the processes blocked in `F_SETLKW` (keyed by
+/// pid: from M8, two threads of one process would overwrite each other's
+/// record). Not a leaf lock: a record's insert and removal allocate and
+/// free, so the heap's locks nest inside it (ARCHITECTURE section 9, level
+/// 10). Never taken under an inode's lock or another spinlock.
+static POSIX_WAITERS: SpinLock<PosixWaitGraph> = SpinLock::new(PosixWaitGraph::new());
 
-/// A process blocked in `F_SETLKW`: the pid of the process holding the
-/// lock it conflicts with (the first `F_GETLK` would report), and the
-/// release count its wait ends past (`process::lock_releases`).
-#[derive(Clone, Copy)]
-struct Waiting {
-    holder: u32,
-    seen: u64,
-}
-
-/// The processes blocked in `F_SETLKW`, by pid. A leaf lock: taken only
-/// outside the inode's lock.
-static POSIX_WAITERS: SpinLock<BTreeMap<u32, Waiting>> = SpinLock::new(BTreeMap::new());
-
-/// Record that `pid` is about to wait for `holder`'s POSIX lock (its wait
-/// ending once the release count is past `seen`), unless that closes a
-/// cycle (`holder` waiting, through at most `MAX_DEADLOCK_CHAIN`
-/// processes, for `pid`): `EDEADLK` then, as Linux.
-///
-/// Only entries stamped with the current release count are followed: any
-/// release since an entry was made has woken its waiter (whose wait ends
-/// when the count moves), which may now get its lock rather than wait, so
-/// the entry no longer says who it waits for. A waiter that still
-/// conflicts records itself again, with the new count, before it waits.
-/// So a real cycle is found by whichever of its processes records last,
-/// and a holder that has just let go of the lock its waiter wanted isn't
-/// refused for waiting on that waiter in turn. The check and the record
-/// are one hold of `POSIX_WAITERS`, so of two processes about to wait for
-/// each other the second is refused.
-fn would_deadlock(pid: u32, holder: u32, seen: u64) -> Result<(), u32> {
-    let mut waiters = POSIX_WAITERS.lock();
+/// Record that `pid` is about to wait for `holder`'s POSIX lock, its try
+/// having failed with the release count at `seen`, unless that closes a
+/// cycle of waiting processes: `EDEADLK`, as Linux. lumen-vfs's
+/// `PosixWaitGraph::wait_for` has the rules (one holder per waiter, as
+/// Linux's single `fl_blocker`; records older than the last release, and a
+/// caller whose own `seen` is, never followed). The count is read under
+/// `POSIX_WAITERS`, so of two processes about to wait for each other with a
+/// current view, the second is refused.
+fn record_wait_unless_deadlock(pid: u32, holder: u32, seen: u64) -> Result<(), u32> {
+    let mut graph = POSIX_WAITERS.lock();
     let now = process::lock_releases();
-    let mut next = holder;
-    for _ in 0..MAX_DEADLOCK_CHAIN {
-        if next == pid {
-            return Err(errno::EDEADLK);
-        }
-        match waiters.get(&next) {
-            Some(w) if w.seen == now => next = w.holder,
-            _ => break,
-        }
-    }
-    waiters.insert(pid, Waiting { holder, seen });
-    Ok(())
-}
-
-/// The current process's pid: the owner of its POSIX record locks.
-fn current_pid() -> u32 {
-    with_current(|p| p.pid)
+    graph.wait_for(pid, holder, seen, now).map_err(|_| errno::EDEADLK)
 }
 
 /// `fcntl(fd, cmd, arg)` (72).
@@ -193,9 +173,9 @@ pub(super) fn sys_fcntl(fd: Fd, cmd: u32, arg: u64) -> u64 {
 fn fcntl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     // An `int` argument (`F_DUPFD`'s minimum, the flags): the low 32 bits.
-    let argi = arg as u32 as i32;
-    // On an `O_PATH` descriptor only these work; the rest (an unknown
-    // command too) are `-EBADF`, as on Linux.
+    let argi: i32 = at::reg(arg);
+    // On an `O_PATH` descriptor only these work; every other command, an
+    // unknown one too, is `-EBADF`, as on Linux.
     let path_ok = matches!(
         cmd,
         general::F_DUPFD | general::F_DUPFD_CLOEXEC | general::F_GETFD | general::F_SETFD | general::F_GETFL
@@ -218,11 +198,13 @@ fn fcntl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
         }
         general::F_GETFL => Ok(u64::from(file.get_fl())),
         // Only `O_APPEND` and `O_NONBLOCK` change; the access mode and the
-        // creation flags are ignored, as on Linux.
+        // creation flags are ignored, as on Linux, and so are `O_ASYNC`,
+        // `O_DIRECT` and `O_NOATIME`, which Linux would change and Lumen
+        // doesn't track.
         general::F_SETFL => file.set_status_flags(argi as u32).map(|()| 0).map_err(vfs),
-        general::F_GETLK => getlk(&file, super::at::reg(arg)),
-        general::F_SETLK => setlk(&file, super::at::reg(arg), false),
-        general::F_SETLKW => setlk(&file, super::at::reg(arg), true),
+        general::F_GETLK => getlk(&file, at::reg(arg)),
+        general::F_SETLK => setlk(&file, at::reg(arg), false),
+        general::F_SETLKW => setlk(&file, at::reg(arg), true),
         _ => Err(errno::EINVAL),
     }
 }
@@ -231,11 +213,12 @@ fn fcntl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
 /// one described, written back over it (`l_whence` `SEEK_SET`, `l_len` 0
 /// for a lock to the end, the owner's pid), or `l_type` set to `F_UNLCK`
 /// and the rest left as given. The access mode isn't checked (Linux
-/// doesn't); an `F_UNLCK` request is `-EINVAL`.
+/// doesn't); an `F_UNLCK` request is `-EINVAL`, a range past the largest
+/// offset `-EOVERFLOW`.
 fn getlk(file: &FileRef, at: UserPtr) -> Result<u64, u32> {
     let mut flock = UserFlock::copy_in(at)?;
     let ctx = lock_context(file, &flock.spec)?;
-    let pid = current_pid();
+    let pid = with_current(|p| p.pid);
     let mut spec = flock.spec;
     with_locks(file, |locks| locks.getlk(pid, &mut spec, ctx.cur_offset, ctx.file_size))?;
     flock.spec = spec;
@@ -246,69 +229,125 @@ fn getlk(file: &FileRef, at: UserPtr) -> Result<u64, u32> {
 /// `F_SETLK` (`-EAGAIN` on a conflict) and `F_SETLKW` (waits for it to
 /// go; `-EDEADLK` if the holder is waiting, directly or through other
 /// waiters, for this process): take, change or give up (`F_UNLCK`) the
-/// current process's lock on the range. `F_RDLCK` needs a readable
-/// descriptor and `F_WRLCK` a writable one (`-EBADF`).
+/// current process's lock on the range. A bad type or range is `-EINVAL`
+/// (`-EOVERFLOW` past the largest offset), checked before the access mode:
+/// `F_RDLCK` needs a readable descriptor and `F_WRLCK` a writable one
+/// (`-EBADF`).
 fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
     let spec = UserFlock::copy_in(at)?.spec;
     let ctx = lock_context(file, &spec)?;
-    let pid = current_pid();
-    // Who holds the lock this one waits for (set by each try that must).
-    let holder = Cell::new(None);
-    lock_or_wait(
+    let pid = with_current(|p| p.pid);
+    let result = lock_or_wait(
         file,
         |locks| {
-            // A process holding nothing here gives nothing up.
-            let held = locks.posix_lock_count(pid) > 0;
-            let outcome = locks.setlk(pid, spec, ctx, blocking)?;
-            if outcome == LockOutcome::WouldBlock {
-                let mut conflict = spec;
-                locks.getlk(pid, &mut conflict, ctx.cur_offset, ctx.file_size)?;
-                holder.set((conflict.l_type != fcntl_const::F_UNLCK).then_some(conflict.l_pid as u32));
+            Ok(match locks.setlk(pid, spec, ctx, blocking)? {
+                RecordLockOutcome::Granted { released } => Step::Done { released },
+                RecordLockOutcome::WouldBlock { holder } => Step::Wait { released: false, holder },
+            })
+        },
+        |holder, seen, first| {
+            if first {
+                log::debug!(target: "linux", "pid {pid}: F_SETLKW on {} waits for pid {holder}", file.path);
             }
-            Ok(Try { outcome, gave_up: held && outcome == LockOutcome::Granted })
+            record_wait_unless_deadlock(pid, holder, seen)
         },
-        |seen| holder.get().map_or(Ok(()), |h| would_deadlock(pid, h, seen)),
-        || {
-            POSIX_WAITERS.lock().remove(&pid);
-        },
-    )
+    );
+    if blocking {
+        // Its record, if any, goes once the call returns (a record left
+        // between waits is stale after the release that woke it anyway).
+        POSIX_WAITERS.lock().done(pid);
+    }
+    result.map(|()| 0)
 }
 
 /// `flock(fd, operation)` (73): `LOCK_SH`, `LOCK_EX` or `LOCK_UN`, maybe
-/// with `LOCK_NB` (a conflict then `-EWOULDBLOCK`, the lock held kept, as
-/// lumen-vfs does), on the descriptor's open file description; a held lock
-/// is converted in place when nothing conflicts. A blocking request that
-/// conflicts first gives up the lock this description holds, as Linux
-/// does, so two holders of `LOCK_SH` both asking for `LOCK_EX` don't wait
-/// for each other for good: one gets it. Any other operation is `-EINVAL`;
-/// an `O_PATH` descriptor `-EBADF`. No deadlock is detected (Linux finds
-/// none for `flock` either).
+/// with `LOCK_NB`, on the descriptor's open file description; a held lock
+/// is converted in place when nothing conflicts. A conflict with `LOCK_NB`
+/// is `-EWOULDBLOCK`, the held lock kept (a deviation: Linux drops it). A
+/// blocking request that conflicts first gives up the lock this
+/// description holds, as Linux does, so two holders of `LOCK_SH` both
+/// asking for `LOCK_EX` don't wait for each other for good: one gets it.
+///
+/// As Linux (since 5.17): `LOCK_MAND` is ignored (0, whatever the fd), and
+/// the operation is checked (`-EINVAL`) before the descriptor (`-EBADF`;
+/// `O_PATH` too). No deadlock is detected (Linux finds none for `flock`
+/// either).
 pub(super) fn sys_flock(fd: Fd, operation: u32) -> u64 {
     finish(flock(fd, operation))
 }
 
 fn flock(fd: Fd, operation: u32) -> Result<u64, u32> {
-    let file = fd.file()?;
-    // Linux's descriptor lookup for `flock` doesn't see `O_PATH` files:
-    // `-EBADF` before the operation is looked at.
-    file.require_non_path().map_err(vfs)?;
+    if operation & general::LOCK_MAND != 0 {
+        return Ok(0);
+    }
     let op = FlockOp::from_raw(operation as i32).map_err(vfs)?;
+    let file = fd.file()?;
+    file.require_non_path().map_err(vfs)?;
     let id = file.id;
     lock_or_wait(
         &file,
         |locks| {
-            let before = locks.flock_count();
-            let outcome = locks.flock(id, op)?;
-            let gave_up = match outcome {
-                // An unlock or a conversion (no new holder) may free others.
-                LockOutcome::Granted => locks.flock_count() <= before,
-                LockOutcome::WouldBlock => locks.release_flock(id),
-            };
-            Ok(Try { outcome, gave_up })
+            Ok(match locks.flock(id, op)? {
+                LockOutcome::Granted { released } => Step::Done { released },
+                LockOutcome::WouldBlock { released } => Step::Wait { released, holder: () },
+            })
         },
-        |_| Ok(()),
-        || {},
+        |(), _, first| {
+            if first {
+                let pid = with_current(|p| p.pid);
+                log::debug!(target: "linux", "pid {pid}: flock on {} waits", file.path);
+            }
+            Ok(())
+        },
     )
+    .map(|()| 0)
+}
+
+/// A ktest seam in `lock_or_wait`: an armed window holds the next try that
+/// must wait right after it (before anything reads the release count
+/// again), until the test lets it go or a thread is blocked in a lock wait.
+/// The lost-wakeup and stale-view ktests release a lock inside it.
+#[cfg(feature = "ktest")]
+mod ktest_window {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static HELD: AtomicBool = AtomicBool::new(false);
+    static GO: AtomicBool = AtomicBool::new(false);
+
+    /// Hold the next try that must wait.
+    pub(super) fn arm() {
+        GO.store(false, Ordering::SeqCst);
+        ARMED.store(true, Ordering::SeqCst);
+    }
+
+    /// Hold nothing more (after the armed call, whatever it did).
+    pub(super) fn disarm() {
+        ARMED.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether a try is held in the window now.
+    pub(super) fn held() -> bool {
+        HELD.load(Ordering::SeqCst)
+    }
+
+    /// Let the held try go on.
+    pub(super) fn go() {
+        GO.store(true, Ordering::SeqCst);
+    }
+
+    /// `lock_or_wait`'s side: if armed, wait (sleeping a millisecond at a
+    /// time) for `go` or for a thread blocked in a lock wait.
+    pub(super) fn hold() {
+        if !ARMED.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        HELD.store(true, Ordering::SeqCst);
+        while !GO.load(Ordering::SeqCst) && crate::linux::process::lock_waiters() == 0 {
+            crate::time::sleep(1_000_000);
+        }
+        HELD.store(false, Ordering::SeqCst);
+    }
 }
 
 // ---------------------------------------------------------------- ktests
@@ -495,12 +534,15 @@ crate::ktest!(
             kassert_eq!(sys_fcntl(fd, general::F_DUPFD_CLOEXEC + 50, 0), neg_errno(errno::EINVAL));
 
             // O_PATH: the descriptor commands and F_GETFL work; F_SETFL,
-            // the locks, an unknown command and flock are `-EBADF`.
+            // the locks, an unknown command and flock are `-EBADF` (flock
+            // only once its operation is valid).
             let path_fd = ktest_open(1, b"/tmp", OpenFlags::O_PATH)?;
             kassert_eq!(sys_fcntl(path_fd, general::F_GETFL, 0), u64::from(OpenFlags::O_PATH));
             kassert_eq!(sys_fcntl(path_fd, general::F_SETFD, u64::from(general::FD_CLOEXEC)), 0);
             kassert_eq!(sys_fcntl(path_fd, general::F_GETFD, 0), u64::from(general::FD_CLOEXEC));
             kassert_eq!(sys_fcntl(path_fd, general::F_DUPFD, 30), 30);
+            kassert_eq!(sys_fcntl(path_fd, general::F_DUPFD_CLOEXEC, 30), 31);
+            kassert_eq!(process::current_cloexec(31), Ok(true));
             kassert_eq!(sys_fcntl(path_fd, general::F_SETFL, 0), neg_errno(errno::EBADF));
             kassert_eq!(sys_fcntl(path_fd, 99, 0), neg_errno(errno::EBADF));
             kassert_eq!(
@@ -512,7 +554,7 @@ crate::ktest!(
                 neg_errno(errno::EBADF)
             );
             kassert_eq!(sys_flock(path_fd, general::LOCK_SH), neg_errno(errno::EBADF));
-            kassert_eq!(sys_flock(path_fd, 0), neg_errno(errno::EBADF));
+            kassert_eq!(sys_flock(path_fd, 0), neg_errno(errno::EINVAL));
             kassert!(sys_close(path_fd) == 0);
             Ok(())
         });
@@ -532,9 +574,14 @@ crate::ktest!(
             let rdwr = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             let rdonly = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
             let wronly = ktest_open(0, PATH, OpenFlags::O_WRONLY)?;
-            // The lock type must match the access mode.
+            // The lock type must match the access mode ...
             kassert_eq!(ktest_lk(rdonly, set, wr, seek_set, 0, 10)?, neg_errno(errno::EBADF));
             kassert_eq!(ktest_lk(wronly, set, rd, seek_set, 0, 10)?, neg_errno(errno::EBADF));
+            // ... checked after the type and the range, as on Linux.
+            kassert_eq!(ktest_lk(rdonly, set, wr, 3, 0, 10)?, neg_errno(errno::EINVAL));
+            kassert_eq!(ktest_lk(rdonly, set, wr, seek_set, -1, 10)?, neg_errno(errno::EINVAL));
+            kassert_eq!(ktest_lk(rdonly, set, wr, seek_set, i64::MAX, 2)?, neg_errno(errno::EOVERFLOW));
+            kassert_eq!(ktest_lk(wronly, set, 3, seek_set, 0, 10)?, neg_errno(errno::EINVAL));
             kassert_eq!(ktest_lk(rdonly, set, rd, seek_set, 0, 10)?, 0);
             kassert_eq!(ktest_lk(wronly, general::F_SETLKW, wr, seek_set, 5, 10)?, 0);
             // A process's own locks never conflict with each other, nor
@@ -544,12 +591,15 @@ crate::ktest!(
             // Unlocking what isn't locked succeeds.
             kassert_eq!(ktest_lk(rdwr, set, un, seek_set, 0, 0)?, 0);
             kassert_eq!(ktest_lk(rdwr, set, un, seek_set, 100, 5)?, 0);
-            // Bad arguments: `-EINVAL`.
+            // Bad arguments: `-EINVAL`; a range past the largest offset:
+            // `-EOVERFLOW`.
             kassert_eq!(ktest_lk(rdwr, set, 3, seek_set, 0, 1)?, neg_errno(errno::EINVAL));
             kassert_eq!(ktest_lk(rdwr, set, wr, 3, 0, 1)?, neg_errno(errno::EINVAL));
             kassert_eq!(ktest_lk(rdwr, set, wr, seek_set, -1, 1)?, neg_errno(errno::EINVAL));
             kassert_eq!(ktest_lk(rdwr, set, wr, seek_set, 10, -20)?, neg_errno(errno::EINVAL));
-            kassert_eq!(ktest_lk(rdwr, set, wr, seek_set, i64::MAX, 2)?, neg_errno(errno::EINVAL));
+            kassert_eq!(ktest_lk(rdwr, set, wr, seek_set, i64::MAX, 2)?, neg_errno(errno::EOVERFLOW));
+            kassert_eq!(ktest_lk(rdwr, set, wr, seek_set, i64::MAX, 1)?, 0);
+            kassert_eq!(ktest_lk(rdwr, get, rd, seek_set, i64::MAX - 1, 3)?, neg_errno(errno::EOVERFLOW));
             kassert_eq!(ktest_lk(rdwr, get, un, seek_set, 0, 1)?, neg_errno(errno::EINVAL));
             kassert_eq!(ktest_lk(rdwr, get, 3, seek_set, 0, 1)?, neg_errno(errno::EINVAL));
             // A bad pointer: `-EFAULT`; a bad descriptor: `-EBADF`.
@@ -596,14 +646,24 @@ crate::ktest!(
             kassert_eq!(sys_close(a2), 0);
             kassert_eq!(sys_flock(b, ex | nb), 0);
             // POSIX record locks are another namespace: b's flock doesn't
-            // stop this process's (or anyone's) record lock.
+            // stop this process's record lock.
             kassert_eq!(ktest_lk(b, general::F_SETLK, general::F_RDLCK, general::SEEK_SET, 0, 0)?, 0);
-            // Bad operations: `-EINVAL`; LOCK_UN may carry LOCK_NB.
-            for op in [0, sh | ex, nb, 16, sh | 16, un | ex] {
+            // Bad operations: `-EINVAL`, checked before the descriptor (a
+            // bad one too); LOCK_UN may carry LOCK_NB.
+            for op in [0, sh | ex, nb, 16, sh | 16, un | ex, 1 << 31] {
                 kassert_eq!(sys_flock(b, op), neg_errno(errno::EINVAL));
+                kassert_eq!(sys_flock(ktest_fd(77), op), neg_errno(errno::EINVAL));
             }
             kassert_eq!(sys_flock(b, un | nb), 0);
             kassert_eq!(sys_flock(ktest_fd(77), sh), neg_errno(errno::EBADF));
+            // LOCK_MAND is ignored, whatever else is set and whatever the
+            // descriptor: 0, and nothing locked.
+            let mand = general::LOCK_MAND;
+            for (fd, op) in [(b, mand), (b, mand | ex), (ktest_fd(77), mand | sh), (b, mand | 16)] {
+                kassert_eq!(sys_flock(fd, op), 0);
+            }
+            let c = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
+            kassert_eq!(sys_flock(c, ex | nb), 0);
             Ok(())
         });
         ktest_unlink(PATH);
@@ -670,14 +730,15 @@ impl Baton {
 }
 
 /// Run `a` and `b` as two test processes at once (each `in_test_process`
-/// on its own kernel thread, both on this CPU), handed their pids and a
-/// shared [`Baton`]: both results, A's first. Either side ending marks it
+/// on its own kernel thread, both on this CPU), handed a shared [`Baton`]
+/// (A's pid in it): A's failure if it failed (B's then given as a `diag`
+/// line, if it failed too), else B's result. Either side ending marks it
 /// in the baton, so the other's waits stop; A ending releases its locks
 /// (exit closes its descriptors), so B can't be left blocked by a failed A.
 #[cfg(feature = "ktest")]
 fn two_processes(
-    a: impl FnOnce(u32, &Baton) -> TestResult + Send + 'static,
-    b: impl FnOnce(u32, &Baton) -> TestResult + Send + 'static,
+    a: impl FnOnce(&Baton) -> TestResult + Send + 'static,
+    b: impl FnOnce(&Baton) -> TestResult + Send + 'static,
 ) -> TestResult {
     let baton = Arc::new(Baton::default());
     let mut a_result: TestResult = Err("process A didn't run");
@@ -687,8 +748,8 @@ fn two_processes(
     sched::scope(|s| {
         let spawned = s.spawn_on(cpu, "lock-ktest-b", move || {
             let for_b = Arc::clone(&b_baton);
-            *b_slot = process::in_test_process(move |pid| {
-                let r = b(pid, &for_b);
+            *b_slot = process::in_test_process(move |_| {
+                let r = b(&for_b);
                 for_b.b_ended.store(true, Ordering::SeqCst);
                 r
             })
@@ -703,7 +764,7 @@ fn two_processes(
         let for_a = Arc::clone(&baton);
         *a_slot = process::in_test_process(move |pid| {
             for_a.a_pid.store(pid, Ordering::SeqCst);
-            let r = a(pid, &for_a);
+            let r = a(&for_a);
             for_a.a_ended.store(true, Ordering::SeqCst);
             r
         })
@@ -711,6 +772,9 @@ fn two_processes(
         baton.a_ended.store(true, Ordering::SeqCst);
     })
     .map_err(|_| "start the two test processes")?;
+    if let (Err(_), Err(b)) = (a_result, b_result) {
+        crate::ktest::diag(format_args!("process B failed too: {b}"));
+    }
     a_result?;
     b_result
 }
@@ -737,7 +801,7 @@ fn ktest_setlkw_waits_for(release: Release) -> TestResult {
     let (set, wr, rd, un) = (general::F_SETLK, general::F_WRLCK, general::F_RDLCK, general::F_UNLCK);
     let seek_set = general::SEEK_SET;
     let ret = two_processes(
-        move |_, baton| {
+        move |baton| {
             let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             let other = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
             crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 100)?, 0);
@@ -753,7 +817,7 @@ fn ktest_setlkw_waits_for(release: Release) -> TestResult {
             }
             Ok(())
         },
-        move |_, baton| {
+        move |baton| {
             baton.wait_for(1, &baton.a_ended)?;
             let a_pid = baton.a_pid.load(Ordering::SeqCst) as i32;
             let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
@@ -795,7 +859,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
     const PATH: &[u8] = b"/tmp/lock-ktest-flock-wait";
     let (sh, ex, nb, un) = (general::LOCK_SH, general::LOCK_EX, general::LOCK_NB, general::LOCK_UN);
     let ret = two_processes(
-        move |_, baton| {
+        move |baton| {
             let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             crate::kassert_eq!(sys_flock(fd, ex), 0);
             let dup = ktest_fd(sys_fcntl(fd, general::F_DUPFD, 10));
@@ -815,7 +879,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
             }
             Ok(())
         },
-        move |_, baton| {
+        move |baton| {
             baton.wait_for(1, &baton.a_ended)?;
             let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
             crate::kassert_eq!(sys_flock(fd, ex | nb), neg_errno(errno::EWOULDBLOCK));
@@ -852,7 +916,7 @@ crate::ktest!(
         const PATH: &[u8] = b"/tmp/lock-ktest-flock-upgrade";
         let (sh, ex, un) = (general::LOCK_SH, general::LOCK_EX, general::LOCK_UN);
         let ret = two_processes(
-            move |_, baton| {
+            move |baton| {
                 let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
                 crate::kassert_eq!(sys_flock(fd, sh), 0);
                 baton.go(1);
@@ -865,7 +929,7 @@ crate::ktest!(
                 crate::kassert_eq!(sys_flock(fd, un), 0);
                 Ok(())
             },
-            move |_, baton| {
+            move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
                 let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
                 crate::kassert_eq!(sys_flock(fd, sh), 0);
@@ -886,12 +950,13 @@ crate::ktest!(
         // A holds [0, 10) and B [10, 20); B waits for A's range; A asking
         // to wait for B's would close the cycle: `-EDEADLK` (F_SETLK still
         // `-EAGAIN`), and B gets A's range once A lets go; A then waiting
-        // for B's range (B's stale record notwithstanding) is no deadlock.
+        // for B's range (B's record from before the unlock notwithstanding)
+        // is no deadlock.
         const PATH: &[u8] = b"/tmp/lock-ktest-deadlock";
         let (set, setw, wr, un) = (general::F_SETLK, general::F_SETLKW, general::F_WRLCK, general::F_UNLCK);
         let seek_set = general::SEEK_SET;
         let ret = two_processes(
-            move |_, baton| {
+            move |baton| {
                 let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 10)?, 0);
                 baton.go(1);
@@ -900,19 +965,24 @@ crate::ktest!(
                 crate::kassert_eq!(ktest_lk(fd, setw, wr, seek_set, 10, 10)?, neg_errno(errno::EDEADLK));
                 crate::kassert_eq!(ktest_lk(fd, setw, wr, seek_set, 15, 1)?, neg_errno(errno::EDEADLK));
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 10, 10)?, neg_errno(errno::EAGAIN));
-                // A range B doesn't hold is no cycle.
+                // A range nobody else holds is granted at once (no wait, so
+                // no cycle check).
                 crate::kassert_eq!(ktest_lk(fd, setw, wr, seek_set, 20, 10)?, 0);
                 baton.b_stays_blocked()?;
                 baton.releasing.store(true, Ordering::SeqCst);
                 crate::kassert_eq!(ktest_lk(fd, set, un, seek_set, 0, 10)?, 0);
                 // B, just woken, is about to take [0, 10), not waiting for
                 // A any more: waiting for B's range now is no deadlock (it
-                // waits until B's exit lets go of it).
+                // waits until B's exit lets go of it). B has usually not run
+                // yet, so its record is still there, older than the unlock:
+                // it must not be followed. (Whether B ran first depends on
+                // the scheduler; `lock_fcntl_setlkw_retries_on_a_stale_view`
+                // pins the other order in a window.)
                 crate::kassert_eq!(ktest_lk(fd, setw, wr, seek_set, 10, 10)?, 0);
                 crate::kassert!(baton.b_done.load(Ordering::SeqCst));
                 Ok(())
             },
-            move |_, baton| {
+            move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
                 let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 10, 10)?, 0);
@@ -934,7 +1004,7 @@ crate::ktest!(
         let (set, wr, rd, un) = (general::F_SETLK, general::F_WRLCK, general::F_RDLCK, general::F_UNLCK);
         let (seek_set, seek_cur, seek_end) = (general::SEEK_SET, general::SEEK_CUR, general::SEEK_END);
         let ret = two_processes(
-            move |_, baton| {
+            move |baton| {
                 let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC)?;
                 crate::kassert_eq!(ktest_write(fd, b"12345678")?, 8);
                 // [0, 100) written, then its middle [40, 60) unlocked: two
@@ -951,7 +1021,7 @@ crate::ktest!(
                 baton.go(1);
                 baton.wait_for(2, &baton.b_ended)
             },
-            move |_, baton| {
+            move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
                 let a = baton.a_pid.load(Ordering::SeqCst) as i32;
                 let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
@@ -981,6 +1051,182 @@ crate::ktest!(
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 40, 20)?, 0);
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 60, 1)?, neg_errno(errno::EAGAIN));
                 baton.go(2);
+                Ok(())
+            },
+        );
+        ktest_unlink(PATH);
+        ret
+    }
+);
+
+/// A's wait (no ceiling) for B's blocking call to come back while A still
+/// holds its (weakened) lock: B's having returned, or B's failure.
+#[cfg(feature = "ktest")]
+fn ktest_b_done_while_a_holds(baton: &Baton) -> TestResult {
+    while !baton.b_done.load(Ordering::SeqCst) && !baton.b_ended.load(Ordering::SeqCst) {
+        crate::time::sleep(1_000_000);
+    }
+    crate::kassert!(baton.b_done.load(Ordering::SeqCst));
+    Ok(())
+}
+
+crate::ktest!(
+    fn lock_fcntl_setlkw_reader_woken_by_a_downgrade() {
+        // A's write lock made a read lock (A keeps holding it) lets B's
+        // blocked F_SETLKW for a read lock through.
+        const PATH: &[u8] = b"/tmp/lock-ktest-downgrade";
+        let (set, wr, rd) = (general::F_SETLK, general::F_WRLCK, general::F_RDLCK);
+        let seek_set = general::SEEK_SET;
+        let ret = two_processes(
+            move |baton| {
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+                crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 100)?, 0);
+                baton.go(1);
+                baton.wait_for(2, &baton.b_ended)?;
+                baton.wait_for_b_blocked();
+                baton.b_stays_blocked()?;
+                baton.releasing.store(true, Ordering::SeqCst);
+                crate::kassert_eq!(ktest_lk(fd, set, rd, seek_set, 0, 100)?, 0);
+                ktest_b_done_while_a_holds(baton)
+            },
+            move |baton| {
+                baton.wait_for(1, &baton.a_ended)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
+                baton.go(2);
+                crate::kassert_eq!(ktest_lk(fd, general::F_SETLKW, rd, seek_set, 10, 10)?, 0);
+                baton.b_done.store(true, Ordering::SeqCst);
+                crate::kassert!(baton.releasing.load(Ordering::SeqCst));
+                crate::kassert!(!baton.a_ended.load(Ordering::SeqCst));
+                Ok(())
+            },
+        );
+        ktest_unlink(PATH);
+        ret
+    }
+);
+
+crate::ktest!(
+    fn lock_flock_shared_waiter_woken_by_a_downgrade() {
+        // A's LOCK_EX made LOCK_SH (A keeps holding it) lets B's blocked
+        // LOCK_SH through.
+        const PATH: &[u8] = b"/tmp/lock-ktest-flock-downgrade";
+        let (sh, ex) = (general::LOCK_SH, general::LOCK_EX);
+        let ret = two_processes(
+            move |baton| {
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+                crate::kassert_eq!(sys_flock(fd, ex), 0);
+                baton.go(1);
+                baton.wait_for(2, &baton.b_ended)?;
+                baton.wait_for_b_blocked();
+                baton.b_stays_blocked()?;
+                baton.releasing.store(true, Ordering::SeqCst);
+                crate::kassert_eq!(sys_flock(fd, sh), 0);
+                ktest_b_done_while_a_holds(baton)
+            },
+            move |baton| {
+                baton.wait_for(1, &baton.a_ended)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
+                baton.go(2);
+                crate::kassert_eq!(sys_flock(fd, sh), 0);
+                baton.b_done.store(true, Ordering::SeqCst);
+                crate::kassert!(baton.releasing.load(Ordering::SeqCst));
+                crate::kassert!(!baton.a_ended.load(Ordering::SeqCst));
+                Ok(())
+            },
+        );
+        ktest_unlink(PATH);
+        ret
+    }
+);
+
+/// A's wait for B's try to be held in `ktest_window` (or for B to fail).
+#[cfg(feature = "ktest")]
+fn ktest_wait_for_b_held(baton: &Baton) -> TestResult {
+    while !ktest_window::held() && !baton.b_ended.load(Ordering::SeqCst) {
+        crate::time::sleep(1_000_000);
+    }
+    crate::kassert!(ktest_window::held());
+    Ok(())
+}
+
+crate::ktest!(
+    fn lock_fcntl_setlkw_sees_a_release_between_its_try_and_its_wait() {
+        // B's try fails (A holds the range) and is held right after it, in
+        // `ktest_window`; A unlocks there, waking no one (B isn't waiting
+        // yet), and lets B go on. B's wait must still end: the release
+        // count it read before its try has moved.
+        const PATH: &[u8] = b"/tmp/lock-ktest-lost-wakeup";
+        let (set, wr, un) = (general::F_SETLK, general::F_WRLCK, general::F_UNLCK);
+        let seek_set = general::SEEK_SET;
+        let ret = two_processes(
+            move |baton| {
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+                crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 10)?, 0);
+                baton.go(1);
+                baton.wait_for(2, &baton.b_ended)?;
+                ktest_wait_for_b_held(baton)?;
+                baton.releasing.store(true, Ordering::SeqCst);
+                crate::kassert_eq!(ktest_lk(fd, set, un, seek_set, 0, 10)?, 0);
+                crate::kassert_eq!(process::lock_waiters(), 0);
+                ktest_window::go();
+                Ok(())
+            },
+            move |baton| {
+                baton.wait_for(1, &baton.a_ended)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
+                ktest_window::arm();
+                baton.go(2);
+                let got = ktest_lk(fd, general::F_SETLKW, wr, seek_set, 0, 10);
+                ktest_window::disarm();
+                crate::kassert_eq!(got?, 0);
+                baton.b_done.store(true, Ordering::SeqCst);
+                crate::kassert!(baton.releasing.load(Ordering::SeqCst));
+                Ok(())
+            },
+        );
+        ktest_unlink(PATH);
+        ret
+    }
+);
+
+crate::ktest!(
+    fn lock_fcntl_setlkw_retries_on_a_stale_view() {
+        // Review round 1's sequence, pinned with `ktest_window`: A holds
+        // [0, 10) and B [10, 20). B's F_SETLKW on A's range fails its try
+        // and is held before its deadlock check. A unlocks [0, 10) and then
+        // waits for B's range (recorded: A waits for B, at the new count).
+        // B's view (A holds what it wants) is older than that unlock: it
+        // must retry and get the range, not follow A's record back to
+        // itself and report EDEADLK. A gets B's range once B exits.
+        const PATH: &[u8] = b"/tmp/lock-ktest-stale-view";
+        let (set, setw, wr, un) = (general::F_SETLK, general::F_SETLKW, general::F_WRLCK, general::F_UNLCK);
+        let seek_set = general::SEEK_SET;
+        let ret = two_processes(
+            move |baton| {
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+                crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 10)?, 0);
+                baton.go(1);
+                baton.wait_for(2, &baton.b_ended)?;
+                ktest_wait_for_b_held(baton)?;
+                baton.releasing.store(true, Ordering::SeqCst);
+                crate::kassert_eq!(ktest_lk(fd, set, un, seek_set, 0, 10)?, 0);
+                // Blocking here lets B's held try go on (`ktest_window`
+                // ends once a thread is in a lock wait).
+                crate::kassert_eq!(ktest_lk(fd, setw, wr, seek_set, 10, 10)?, 0);
+                crate::kassert!(baton.b_done.load(Ordering::SeqCst));
+                Ok(())
+            },
+            move |baton| {
+                baton.wait_for(1, &baton.a_ended)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
+                crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 10, 10)?, 0);
+                ktest_window::arm();
+                baton.go(2);
+                let got = ktest_lk(fd, setw, wr, seek_set, 0, 10);
+                ktest_window::disarm();
+                crate::kassert_eq!(got?, 0);
+                baton.b_done.store(true, Ordering::SeqCst);
+                crate::kassert!(baton.releasing.load(Ordering::SeqCst));
                 Ok(())
             },
         );
