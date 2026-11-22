@@ -369,7 +369,12 @@ one is its own PR that updates that doc first.
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, the
-  link counts kept in memory when an undo fails); `vfs/tmpfs.rs`,
+  link counts kept in memory when an undo fails; a device's number read
+  raw from `i_block`, `read_rdev`, #292; the times through `times`'
+  `InodeTimes`, clamped on load and by every setter and stored by `store`/
+  `store_ctime`, and `new_inode`, the one way to make an inode, #294;
+  `ktest_util::set_clock`, the ktests' clock, `Ext4Shared::now`);
+  `vfs/tmpfs.rs`,
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
