@@ -298,6 +298,29 @@ fn realtime_duration() -> Duration {
     Duration::new(sec, (nsec as u32).min(999_999_999))
 }
 
+/// The position and inode number of each live record (inode not 0) in a
+/// directory's raw data, in order: the records chained by `rec_len` from
+/// the start, as `ext4plus`'s `ReadDir` walks them (a block's records end at
+/// its end; an htree's index nodes and the checksum tail are records with
+/// inode 0). `EIO` for a record that is too short or runs past the data.
+fn live_dirent_positions(raw: &[u8]) -> Result<Vec<(u64, u32)>, VfsError> {
+    let mut live = Vec::new();
+    let mut off = 0usize;
+    while off < raw.len() {
+        let header = raw.get(off..off + 8).ok_or(VfsError::Io)?;
+        let ino = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let rec_len = usize::from(u16::from_le_bytes([header[4], header[5]]));
+        if rec_len < 8 || off + rec_len > raw.len() {
+            return Err(VfsError::Io);
+        }
+        if ino != 0 {
+            live.push((off as u64, ino));
+        }
+        off += rec_len;
+    }
+    Ok(live)
+}
+
 fn map_file_type(ft: FileType) -> InodeType {
     match ft {
         FileType::Regular => InodeType::File,
@@ -3674,6 +3697,14 @@ impl VfsInode for Ext4Inode {
         step2.res
     }
 
+    /// The cursor is the byte position of an entry in the directory's data
+    /// (the next cursor its position plus one), as Linux's for a linear
+    /// directory: `ext4plus` removes an entry in place (its record merged
+    /// into the one before, or its inode zeroed) and adds one in free space
+    /// after the entries already there, so the entries that stay keep their
+    /// positions and a listing across removals lists each exactly once.
+    /// Only an insert into a hashed (htree) directory that splits a leaf
+    /// block moves entries: a listing across one may repeat or miss them.
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
@@ -3690,12 +3721,23 @@ impl VfsInode for Ext4Inode {
         }
         let inner = self.shared.state.lock();
         let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+        // `ReadDir` checks each block's checksum but doesn't say where an
+        // entry sits: the raw data's live records give their positions, in
+        // the same order.
+        let raw = inner.ext4.read_inode_file(&disk).map_err(map_ext4_err)?;
+        let live = live_dirent_positions(&raw)?;
+        drop(raw);
         let dir = Dir::open_inode(&inner.ext4, disk).map_err(map_ext4_err)?;
         let rd = dir.read_dir().map_err(map_ext4_err)?;
         for (idx, item) in rd.enumerate() {
             let entry = item.map_err(map_ext4_err)?;
-            let cur_idx = idx as u64;
-            if cur_idx < cursor {
+            let Some(&(pos, ino)) = live.get(idx) else {
+                return Err(VfsError::Io);
+            };
+            if ino != entry.inode.get() {
+                return Err(VfsError::Io);
+            }
+            if pos < cursor {
                 continue;
             }
             // VFS names are UTF-8 (#268): a name that isn't is skipped, and
@@ -3721,7 +3763,7 @@ impl VfsInode for Ext4Inode {
                 Ok(ft) => map_file_type(ft),
                 Err(_) => InodeType::File,
             };
-            out.push(DirEntry { ino: u64::from(entry.inode.get()), inode_type, name, next_cursor: cur_idx + 1 });
+            out.push(DirEntry { ino: u64::from(entry.inode.get()), inode_type, name, next_cursor: pos + 1 });
             if out.len() >= max_entries {
                 break;
             }

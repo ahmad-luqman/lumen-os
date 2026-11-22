@@ -141,6 +141,25 @@ pub trait VfsInode: Send + Sync {
         new_name: &str,
         flags: RenameFlags,
     ) -> Result<(), VfsError>;
+    /// Push up to `max_entries` of this directory's entries onto `out`,
+    /// starting with the first at or after `cursor` (`0`: the start; `.`
+    /// and `..` are listed as entries). Nothing pushed means the end.
+    ///
+    /// **The cursor** is the filesystem's own, opaque to callers: `0`, or a
+    /// [`DirEntry::next_cursor`] this directory returned. Each entry's
+    /// `next_cursor` is greater than `cursor` and than the one before it,
+    /// and resumes with the entry after it. It must stay **stable as other
+    /// entries come and go**: a listing resumed after entries were removed
+    /// or added lists every entry that stayed in the directory throughout
+    /// exactly once (POSIX leaves open only the ones removed or added
+    /// meanwhile). `getdents64` keeps it in `OpenFile::dir_cursor` between
+    /// calls, and `lseek` and `d_off` hand it to user space. An index into
+    /// the current listing is not enough: a removal before it would shift
+    /// the rest and skip an entry (busybox `rm -r` would leave one behind).
+    ///
+    /// On an `Err`, the entries already pushed are valid: a caller may hand
+    /// them on and report the error on its next call. A directory removed
+    /// while open lists as empty.
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError>;
     fn truncate(&self, size: u64) -> Result<(), VfsError>;
     fn set_mode(&self, mode: u16) -> Result<(), VfsError>;
@@ -293,7 +312,8 @@ impl OpenGuard {
         Ok(guard)
     }
 
-    /// Borrow the guarded inode.
+    /// Borrow the guarded inode. A clone of the guard (`Clone`) is another
+    /// open reference on it, never refused: the inode is already open.
     pub fn inode(&self) -> &Arc<dyn VfsInode> {
         &self.inode
     }

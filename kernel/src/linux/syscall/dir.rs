@@ -4,6 +4,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::offset_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use lumen_vfs::{DirEntry, InodeType, OpenGuard, ResolveFlags, VfsError, VfsInode, VfsLock};
 
@@ -39,8 +40,8 @@ fn getcwd(buf: UserPtr, size: u64) -> Result<u64, u32> {
 const DIRENT_HEADER: usize = offset_of!(general::linux_dirent64, d_name);
 
 /// The smallest record: the header, a one-byte name and its NUL, rounded up
-/// to 8 bytes.
-const MIN_RECLEN: usize = 24;
+/// to 8 bytes (24).
+const MIN_RECLEN: usize = dirent_reclen(1);
 
 /// The most bytes one `getdents64` call fills (and so allocates in the
 /// kernel), whatever `count` says: room for over a hundred records of the
@@ -51,7 +52,7 @@ const GETDENTS_MAX: usize = 32 * 1024;
 
 /// A record's length for a name of `name_len` bytes: header, name and NUL,
 /// rounded up to 8 bytes (Linux's `ALIGN(.., sizeof(u64))`).
-fn dirent_reclen(name_len: usize) -> usize {
+const fn dirent_reclen(name_len: usize) -> usize {
     (DIRENT_HEADER + name_len + 1).next_multiple_of(8)
 }
 
@@ -73,16 +74,21 @@ fn d_type(t: InodeType) -> u8 {
 /// whether it did. The padding after the name's NUL is zeroed, so no kernel
 /// bytes reach user space.
 fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
+    debug_assert!(limit <= GETDENTS_MAX, "a getdents64 fill of {limit} bytes, past GETDENTS_MAX");
     let reclen = dirent_reclen(entry.name.len());
     if buf.len() + reclen > limit {
         return false;
     }
     let start = buf.len();
     buf.extend_from_slice(&entry.ino.to_le_bytes());
+    // Every filesystem's cursors are far below `i64::MAX` (an index, a
+    // sequence number, a byte position); one past it would read as
+    // negative to `seekdir`.
+    debug_assert!(i64::try_from(entry.next_cursor).is_ok(), "a readdir cursor past i64::MAX");
     let d_off = i64::try_from(entry.next_cursor).unwrap_or(i64::MAX);
     buf.extend_from_slice(&d_off.to_le_bytes());
     // At most 19 + 255 + 1 rounded up for a VFS name, and never past
-    // `GETDENTS_MAX` (checked above), so it fits a `u16`.
+    // `limit`, at most `GETDENTS_MAX` (checked above), so it fits a `u16`.
     buf.extend_from_slice(&(reclen as u16).to_le_bytes());
     buf.push(d_type(entry.inode_type));
     buf.extend_from_slice(entry.name.as_bytes());
@@ -97,23 +103,29 @@ fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
 ///
 /// - **Position:** the open file's `dir_cursor` (Lock 2), which `lseek`
 ///   moves too (`SEEK_SET` 0 rewinds; `rewinddir`, `seekdir`). It is the
-///   filesystem's `readdir` cursor: the index of the next entry in the
-///   directory's listing order. Each record's `d_off` is the cursor just
-///   past it, so `lseek(fd, d_off, SEEK_SET)` (`seekdir(telldir())`)
-///   resumes with the entry after it. The cursor moves past the last whole
-///   record filled: an entry that didn't fit comes back on the next call.
+///   filesystem's own `readdir` cursor, opaque here: a sequence number on
+///   tmpfs, a byte position in the directory on ext4, an index on procfs
+///   and devfs. Each record's `d_off` is the cursor just past it, so
+///   `lseek(fd, d_off, SEEK_SET)` (`seekdir(telldir())`) resumes with the
+///   entry after it. The cursor moves past the last whole record filled: an
+///   entry that didn't fit comes back on the next call.
 /// - **Errors:** `-EBADF` for a descriptor not open or opened `O_PATH`,
 ///   `-ENOTDIR` for one that isn't a directory, `-EINVAL` if `count` can't
-///   hold the next entry, `-EFAULT` if the records can't be copied out (the
-///   cursor then stays where it was), and the filesystem's error from
-///   `readdir` (`-ENOENT` for a removed ext4 directory or `/proc/<pid>`).
-/// - **The directory changing between calls:** the cursor is an index, so
-///   an entry added or removed before it shifts those after it by one: the
-///   next call may repeat one entry or skip one (a loop unlinking what it
-///   lists, like `rm -r`, may need a second pass, or a rewind). It never
-///   loops: each call moves the cursor forward or reaches the end. An entry
-///   added or removed meanwhile may or may not be listed (POSIX leaves that
-///   open).
+///   hold the next entry, `-EFAULT` (what the copy says) if the records
+///   can't be copied out (the cursor then goes back to where it was, unless
+///   something moved it meanwhile), `-EIO` if the filesystem broke its
+///   cursor contract, and the filesystem's error from `readdir` (`-ENOENT`
+///   for a `/proc/<pid>` whose process has ended). An error after some
+///   entries were listed hands those on and comes back on the next call. A
+///   directory removed while open lists as empty (`0`).
+/// - **The directory changing between calls:** the filesystems' cursors are
+///   stable as entries come and go (`VfsInode::readdir`'s contract), so a
+///   listing lists every entry that stayed in the directory exactly once,
+///   however many others were removed or added between calls: busybox's
+///   `rm -r` (read, unlink, read on, no rewind) empties a directory. An
+///   entry added or removed meanwhile may or may not be listed (POSIX
+///   leaves that open). The one exception is an insert into a hashed
+///   (htree) ext4 directory that splits a block (see ext4's `readdir`).
 ///
 /// The cursor's lock is held while the entries are listed and packed in a
 /// kernel buffer, and the cursor moved past them; not across the copy out,
@@ -125,6 +137,8 @@ pub(super) fn sys_getdents64(fd: Fd, dirp: UserPtr, count: u32) -> u64 {
 fn getdents64(fd: Fd, dirp: UserPtr, count: u32) -> Result<u64, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(VfsError::to_errno)?;
+    // Here, not left to `readdir`: the trait has no default, so this is the
+    // one place the rule holds for every filesystem.
     if file.inode.inode_type() != InodeType::Dir {
         return Err(errno::ENOTDIR);
     }
@@ -141,28 +155,66 @@ fn getdents64(fd: Fd, dirp: UserPtr, count: u32) -> Result<u64, u32> {
     };
     // Not across the copy out: a refused one gives the position back, if
     // nothing moved it meanwhile.
-    if !buf.is_empty() && copy_to_user(dirp.addr(), &buf).is_err() {
+    if !buf.is_empty()
+        && let Err(e) = copy_to_user(dirp.addr(), &buf)
+    {
         let mut cursor = file.dir_cursor.lock();
         if *cursor == next {
             *cursor = pos;
         }
-        return Err(errno::EFAULT);
+        return Err(e.to_errno());
     }
     Ok(buf.len() as u64)
 }
 
 /// `dir`'s entries from cursor `pos`, as records within `limit` bytes: the
 /// cursor past the last whole one, and the records (none at the end).
-/// `EINVAL` if the first entry doesn't fit.
 fn pack_entries(dir: &dyn VfsInode, pos: u64, limit: usize) -> Result<(u64, Vec<u8>), u32> {
     // Never more entries than could fit; at least one, so a buffer too
     // small for the next entry is told apart from the end.
     let max_entries = (limit / MIN_RECLEN).max(1);
     let mut entries = Vec::new();
-    dir.readdir(pos, &mut entries, max_entries).map_err(VfsError::to_errno)?;
+    let listed = dir.readdir(pos, &mut entries, max_entries);
+    pack_listed(listed, &entries, pos, limit)
+}
+
+/// What `readdir` from cursor `pos` gave (`listed`, and the `entries` it
+/// pushed), as records within `limit` bytes: the cursor past the last whole
+/// one, and the records.
+///
+/// - The entries pushed before an error are valid (`VfsInode::readdir`'s
+///   contract): they are handed on, and the error, which the next call
+///   meets again, comes back only when there are none.
+/// - `EINVAL` if the first entry doesn't fit.
+/// - The cursor contract is checked, not trusted: an entry whose
+///   `next_cursor` isn't past the one before (or `pos`) would make
+///   `readdir(3)` list forever. The records stop before it, or, if it is
+///   the first, `EIO`.
+fn pack_listed(
+    listed: Result<(), VfsError>,
+    entries: &[DirEntry],
+    pos: u64,
+    limit: usize,
+) -> Result<(u64, Vec<u8>), u32> {
+    if let Err(e) = listed
+        && entries.is_empty()
+    {
+        return Err(e.to_errno());
+    }
     let mut buf = Vec::new();
     let mut next = pos;
-    for entry in &entries {
+    for entry in entries {
+        if entry.next_cursor <= next {
+            log::warn!(
+                target: "linux",
+                "getdents64: readdir gave cursor {} after {next}, not past it: stopping there",
+                entry.next_cursor
+            );
+            if buf.is_empty() {
+                return Err(errno::EIO);
+            }
+            break;
+        }
         if !push_dirent(&mut buf, entry, limit) {
             break;
         }
@@ -174,22 +226,45 @@ fn pack_entries(dir: &dyn VfsInode, pos: u64, limit: usize) -> Result<(u64, Vec<
     Ok((next, buf))
 }
 
+/// The path [`set_cwd`] keeps: what `compute_cwd_path` gave, else
+/// `fallback`'s; and the error, if it is one worth a warning (anything but
+/// `ENOENT`, a directory removed by now).
+fn kept_cwd_path(
+    computed: Result<alloc::string::String, VfsError>,
+    fallback: impl FnOnce() -> Arc<str>,
+) -> (Arc<str>, Option<VfsError>) {
+    match computed {
+        Ok(path) => (Arc::from(path.as_str()), None),
+        Err(VfsError::NoEnt) => (fallback(), None),
+        Err(e) => (fallback(), Some(e)),
+    }
+}
+
+/// Whether [`set_cwd`] has warned of a cwd path it couldn't compute.
+static CWD_PATH_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// Make `guard`'s directory the working directory: `ENOTDIR` if it isn't a
-/// directory. The old one drops outside `ACTIVE_PROCS`.
+/// directory (`Cwd::new`, checked before the path is computed). The old one
+/// drops outside `ACTIVE_PROCS`.
 ///
 /// The path kept with it (what a relative open's `/proc/<pid>/fd` path is
 /// joined to) is computed from the inode, as `getcwd`'s is, so it stays
 /// canonical however many relative `chdir`s led there (`chdir("..")`,
-/// `chdir("sub")`, ... never make it grow). `fallback` is used only if that
-/// fails: a directory removed by now.
+/// `chdir("sub")`, ... never make it grow). If that fails, `fallback` is
+/// kept instead: quietly for a directory removed by now (`ENOENT`, also
+/// what a rename storm outlasting `compute_cwd_path`'s retries says), with
+/// a warning (once a boot) for anything else (`EIO`, `ENAMETOOLONG`).
 fn set_cwd(guard: OpenGuard, fallback: impl FnOnce() -> Arc<str>) -> Result<u64, u32> {
     if guard.inode().inode_type() != InodeType::Dir {
         return Err(errno::ENOTDIR);
     }
-    let path: Arc<str> = match lumen_vfs::compute_cwd_path(crate::vfs::tables(), guard.inode()) {
-        Ok(path) => Arc::from(path.as_str()),
-        Err(_) => fallback(),
-    };
+    let computed = lumen_vfs::compute_cwd_path(crate::vfs::tables(), guard.inode());
+    let (path, unexpected) = kept_cwd_path(computed, fallback);
+    if let Some(e) = unexpected
+        && !CWD_PATH_WARNED.swap(true, Ordering::Relaxed)
+    {
+        log::warn!(target: "linux", "chdir: the new cwd's path can't be computed ({e:?}): keeping {path:?}");
+    }
     let cwd = process::Cwd::new(guard, &path).map_err(VfsError::to_errno)?;
     process::set_current_cwd(cwd);
     Ok(0)
@@ -216,27 +291,26 @@ fn chdir(path: UserPtr) -> Result<u64, u32> {
     // Found by a path lookup: `try_new` refuses an inode an `rmdir` freed
     // since (`ENOENT`).
     let guard = OpenGuard::try_new(resolved.inode).map_err(VfsError::to_errno)?;
-    // Removed since it was found: the path as given, joined to the old
+    // If its path can't be computed: the path as given, joined to the old
     // cwd's if relative.
-    let text = core::str::from_utf8(path.as_bytes()).unwrap_or("/");
+    let text = path.as_str()?;
     set_cwd(guard, || start.display_path(text).unwrap_or_else(|| Arc::from(text)))
 }
 
-/// `fchdir(fd)` (81): the directory open on `fd` becomes the working
-/// directory, an `O_PATH` or `O_DIRECTORY` descriptor as well as a plain
-/// one. `-EBADF` if `fd` isn't
-/// open, `-ENOTDIR` if it isn't a directory. A directory removed while open
-/// is accepted (as on Linux): `getcwd` then says `-ENOENT`.
+/// `fchdir(fd)` (81): the directory open on `fd` (plain, `O_DIRECTORY` or
+/// `O_PATH`) becomes the working directory. `-EBADF` if `fd` isn't open,
+/// `-ENOTDIR` if it isn't a directory. A directory removed while open, or a
+/// `/proc/<pid>` whose process has ended, is accepted (as on Linux), and
+/// `getcwd` then says `-ENOENT`.
 pub(super) fn sys_fchdir(fd: Fd) -> u64 {
     finish(fchdir(fd))
 }
 
 fn fchdir(fd: Fd) -> Result<u64, u32> {
     let file = fd.file()?;
-    let inode: Arc<dyn VfsInode> = Arc::clone(&file.inode);
-    // The open file holds the inode open for as long as this guard is
-    // made, so nothing can free it first (`new_unchecked`'s condition).
-    let guard = OpenGuard::new_unchecked(inode);
+    // Another reference on the open file's own: never refused, where a
+    // fresh `try_new` would be on an ended process's `/proc/<pid>`.
+    let guard = file.open_guard().clone();
     set_cwd(guard, || Arc::clone(&file.path))
 }
 
@@ -509,7 +583,7 @@ crate::ktest!(
             kassert_eq!(ktest_type_of(&devs, "zero"), Some(general::DT_CHR));
 
             // ext4: a fresh volume (not mounted), its root opened directly.
-            let efs = crate::vfs::ktest_ext4(240)?;
+            let efs = crate::vfs::ktest_ext4(252)?;
             let root = efs.root_inode();
             root.create("file", 0o644).map_err(|_| "ext4 create")?;
             root.mkdir("sub", 0o755).map_err(|_| "ext4 mkdir")?;
@@ -564,11 +638,15 @@ crate::ktest!(
                 Ok(ktest_records(n)?.into_iter().map(|r| r.name).collect())
             };
 
-            // Not open, `O_PATH`, not a directory.
+            // Not open, `O_PATH` (a directory, or a file: `-EBADF` before
+            // `-ENOTDIR`, as on Linux), not a directory.
             kassert_eq!(ktest_getdents(super::at::reg(99), 4096), neg(errno::EBADF));
             kassert_eq!(ktest_getdents(super::at::reg(u64::from(u32::MAX)), 4096), neg(errno::EBADF));
             let opath = ktest_open(0, DIR.as_bytes(), OpenFlags::O_PATH)?;
             kassert_eq!(ktest_getdents(opath, 4096), neg(errno::EBADF));
+            let opath_file = ktest_open(2, format!("{DIR}/plain-file").as_bytes(), OpenFlags::O_PATH)?;
+            kassert_eq!(ktest_getdents(opath_file, 4096), neg(errno::EBADF));
+            kassert_eq!(super::fd::sys_close(opath_file), 0);
             kassert_eq!(ktest_getdents(super::at::reg(0), 4096), neg(errno::ENOTDIR));
             let file = ktest_open(1, format!("{DIR}/plain-file").as_bytes(), OpenFlags::O_RDONLY)?;
             kassert_eq!(ktest_getdents(file, 4096), neg(errno::ENOTDIR));
@@ -577,16 +655,16 @@ crate::ktest!(
             // Too small for even "." (24 bytes).
             kassert_eq!(ktest_getdents(fd, 0), neg(errno::EINVAL));
             kassert_eq!(ktest_getdents(fd, 23), neg(errno::EINVAL));
-            // A bad buffer, or one running off the mapped memory: `-EFAULT`,
-            // and the position stays.
-            kassert_eq!(sys_getdents64(fd, super::at::reg(0), 4096), neg(errno::EFAULT));
-            let edge = process::KTEST_USER_VA + process::KTEST_USER_LEN - 8;
-            kassert_eq!(sys_getdents64(fd, super::at::reg(edge), 4096), neg(errno::EFAULT));
             // Room for one record exactly: ".", then "..".
             kassert_eq!(ktest_getdents(fd, 24), 24);
             kassert_eq!(names(24)?, ["."]);
             kassert_eq!(ktest_getdents(fd, 24), 24);
             kassert_eq!(names(24)?, [".."]);
+            // A bad buffer, or one running off the mapped memory: `-EFAULT`,
+            // and the position stays (here past the start).
+            kassert_eq!(sys_getdents64(fd, super::at::reg(0), 4096), neg(errno::EFAULT));
+            let edge = process::KTEST_USER_VA + process::KTEST_USER_LEN - 8;
+            kassert_eq!(sys_getdents64(fd, super::at::reg(edge), 4096), neg(errno::EFAULT));
             // The next needs 40: `-EINVAL` in 39, and it comes back next.
             kassert_eq!(ktest_getdents(fd, 39), neg(errno::EINVAL));
             kassert_eq!(ktest_getdents(fd, 40), 40);
@@ -760,8 +838,8 @@ crate::ktest!(
             kassert_eq!(ktest_cwd()?.as_str(), "/tmp/dir-ktest-fcd");
             let g = ktest_open(1, b"sub/g", OpenFlags::O_RDONLY)?;
             kassert_eq!(super::fd::sys_close(g), 0);
-            // `O_PATH`: the same, its open path kept for the next relative
-            // open's.
+            // `O_PATH`: the same; the next relative open's path is the
+            // directory's own joined to it.
             let pfd = ktest_open(0, b"/tmp/dir-ktest-fcd/sub", OpenFlags::O_PATH)?;
             kassert_eq!(sys_fchdir(pfd), 0);
             kassert_eq!(ktest_cwd()?.as_str(), "/tmp/dir-ktest-fcd/sub");
@@ -835,6 +913,335 @@ crate::ktest!(
             kassert_eq!(super::fd::sys_close(root), 0);
             ktest_remove("/tmp/dir-ktest-regs", true)
         })?
+    }
+);
+
+/// Open `dir` (on a volume of its own, not mounted) as a directory
+/// descriptor of the current process, its path shown as `path`.
+#[cfg(feature = "ktest")]
+fn ktest_open_inode(dir: &Arc<dyn VfsInode>, path: &str) -> Result<Fd, &'static str> {
+    use lumen_vfs::OpenFlags;
+    let flags = OpenFlags::from_bits(OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY);
+    let file = lumen_vfs::OpenFile::new_unchecked_flags(Arc::clone(dir), Arc::from(path), flags)
+        .map_err(|_| "open a test volume's directory")?;
+    let fd = process::install_current_fd(file, false).map_err(|_| "install a test volume's directory")?;
+    Ok(super::at::reg(fd as u64))
+}
+
+/// How many entries the `rm -r` and survivor models start with: more than
+/// a 2048-byte fill (musl's `readdir` buffer) holds, several times over.
+#[cfg(feature = "ktest")]
+const KTEST_CHURN_ENTRIES: usize = 300;
+
+/// A test directory and the one file its names link to.
+#[cfg(feature = "ktest")]
+type KtestDirAndFile = (Arc<dyn VfsInode>, Arc<dyn VfsInode>);
+
+/// Make directory `name` in `parent` holding [`KTEST_CHURN_ENTRIES`] names
+/// (`entry-000`, ...; hard links to one file, so a small volume's few
+/// inodes do): the directory and the file.
+#[cfg(feature = "ktest")]
+fn ktest_churn_dir(
+    parent: &Arc<dyn VfsInode>,
+    name: &str,
+) -> Result<KtestDirAndFile, &'static str> {
+    use alloc::format;
+    let dir = parent.mkdir(name, 0o755).map_err(|_| "mkdir")?;
+    let file = dir.create("entry-000", 0o644).map_err(|_| "create")?;
+    for i in 1..KTEST_CHURN_ENTRIES {
+        dir.link(&format!("entry-{i:03}"), &file).map_err(|_| "link")?;
+    }
+    Ok((dir, file))
+}
+
+/// Busybox `rm -r` over a fresh directory `name` in `parent`
+/// (`libbb/remove_file.c`): `getdents64` 2048 bytes at a time, each entry
+/// unlinked as soon as it is read, never a rewind; then `rmdir`, which
+/// fails if an entry was skipped.
+#[cfg(feature = "ktest")]
+fn ktest_rm_r_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &'static str> {
+    let (dir, _file) = ktest_churn_dir(parent, name)?;
+    let fd = ktest_open_inode(&dir, "/rm-r")?;
+    let mut removed = 0;
+    for _ in 0..100 {
+        let ret = ktest_getdents(fd, 2048);
+        if (ret as i64) < 0 {
+            return Err("getdents64 failed");
+        }
+        if ret == 0 {
+            break;
+        }
+        for r in ktest_records(ret)? {
+            if r.name != "." && r.name != ".." {
+                dir.unlink(&r.name).map_err(|_| "unlink a listed entry")?;
+                removed += 1;
+            }
+        }
+    }
+    if super::fd::sys_close(fd) != 0 {
+        return Err("close");
+    }
+    if removed != KTEST_CHURN_ENTRIES {
+        crate::ktest::diag(format_args!("rm -r removed {removed} of {KTEST_CHURN_ENTRIES}"));
+        return Err("rm -r skipped entries that stayed in the directory");
+    }
+    parent.rmdir(name).map_err(|_| "rmdir after rm -r's loop")
+}
+
+/// A listing of a fresh directory `name` in `parent`, 2048 bytes at a
+/// time, with entries removed and added between calls (after each, the two
+/// lowest-numbered not listed yet and the last one listed removed, a new
+/// one added): every entry that stayed throughout is listed exactly once,
+/// and nothing is listed twice.
+#[cfg(feature = "ktest")]
+fn ktest_survivors_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &'static str> {
+    use alloc::collections::BTreeSet;
+    use alloc::format;
+    use alloc::string::String;
+    let (dir, file) = ktest_churn_dir(parent, name)?;
+    let fd = ktest_open_inode(&dir, "/survivors")?;
+    let mut seen: Vec<String> = Vec::new();
+    let mut gone: BTreeSet<String> = BTreeSet::new();
+    let mut added = 0;
+    let mut ended = false;
+    for _ in 0..100 {
+        let ret = ktest_getdents(fd, 2048);
+        if (ret as i64) < 0 {
+            return Err("getdents64 failed");
+        }
+        if ret == 0 {
+            ended = true;
+            break;
+        }
+        seen.extend(ktest_records(ret)?.into_iter().map(|r| r.name).filter(|n| n != "." && n != ".."));
+        let listed: BTreeSet<&str> = seen.iter().map(String::as_str).collect();
+        let ahead: Vec<String> = (0..KTEST_CHURN_ENTRIES)
+            .map(|i| format!("entry-{i:03}"))
+            .filter(|n| !listed.contains(n.as_str()) && !gone.contains(n))
+            .take(2)
+            .collect();
+        let behind = seen.iter().rev().find(|n| n.starts_with("entry-") && !gone.contains(*n)).cloned();
+        for victim in ahead.into_iter().chain(behind) {
+            dir.unlink(&victim).map_err(|_| "unlink between calls")?;
+            gone.insert(victim);
+        }
+        if added < 20 {
+            dir.link(&format!("new-{added:02}"), &file).map_err(|_| "link between calls")?;
+            added += 1;
+        }
+    }
+    if super::fd::sys_close(fd) != 0 || !ended {
+        return Err("the listing never ended");
+    }
+    let unique: BTreeSet<&str> = seen.iter().map(String::as_str).collect();
+    if unique.len() != seen.len() {
+        return Err("an entry was listed twice");
+    }
+    for i in 0..KTEST_CHURN_ENTRIES {
+        let n = format!("entry-{i:03}");
+        if !gone.contains(&n) && !unique.contains(n.as_str()) {
+            crate::ktest::diag(format_args!("{n} stayed in the directory but wasn't listed"));
+            return Err("a survivor was skipped");
+        }
+    }
+    if !seen.iter().all(|n| n.starts_with("entry-") || n.starts_with("new-")) {
+        return Err("a name that never existed");
+    }
+    // Empty it and remove it.
+    let mut rest = Vec::new();
+    dir.readdir(0, &mut rest, 10_000).map_err(|_| "readdir")?;
+    for e in rest.iter().filter(|e| e.name != "." && e.name != "..") {
+        dir.unlink(&e.name).map_err(|_| "unlink the rest")?;
+    }
+    parent.rmdir(name).map_err(|_| "rmdir")
+}
+
+crate::ktest!(
+    fn dir_getdents64_busybox_rm_r_empties_a_directory_on_tmpfs_and_ext4() {
+        use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        use lumen_vfs::FileSystem;
+        process::in_test_process(|_| {
+            let tmpfs = TmpfsVolume::new(258, 64 * 4096);
+            ktest_rm_r_model(&tmpfs.root, "victim").inspect_err(|_| crate::ktest::diag(format_args!("on tmpfs")))?;
+            let efs = crate::vfs::ktest_ext4(256)?;
+            ktest_rm_r_model(&efs.root_inode(), "victim").inspect_err(|_| crate::ktest::diag(format_args!("on ext4")))
+        })?
+    }
+);
+
+crate::ktest!(
+    fn dir_getdents64_lists_each_survivor_once_while_others_come_and_go() {
+        use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        use lumen_vfs::FileSystem;
+        process::in_test_process(|_| {
+            let tmpfs = TmpfsVolume::new(259, 64 * 4096);
+            ktest_survivors_model(&tmpfs.root, "churn")
+                .inspect_err(|_| crate::ktest::diag(format_args!("on tmpfs")))?;
+            let efs = crate::vfs::ktest_ext4(257)?;
+            ktest_survivors_model(&efs.root_inode(), "churn")
+                .inspect_err(|_| crate::ktest::diag(format_args!("on ext4")))
+        })?
+    }
+);
+
+crate::ktest!(
+    fn dir_getdents64_lists_across_a_gap_in_ext4_cursors() {
+        // A name that isn't UTF-8 is skipped: the cursors after it have a
+        // gap, which a cursor counted as `pos + 1` per entry would miss.
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::FileSystem;
+        process::in_test_process(|_| {
+            let ro = crate::vfs::ktest_ext4_non_utf8(253)?;
+            let root = ro.root_inode();
+            let mut truth = Vec::new();
+            root.readdir(0, &mut truth, 10_000).map_err(|_| "readdir")?;
+            kassert!(truth.iter().map(|e| e.name.as_str()).eq([".", "..", "a0", "a1", "a2", "a4", "a5"]));
+            let fd = ktest_open_inode(&root, "/ktest-gap")?;
+            // One record a call.
+            let got = ktest_list(fd, 24)?;
+            kassert!(ktest_unique(&got));
+            kassert!(got.iter().map(|r| r.name.as_str()).eq(truth.iter().map(|e| e.name.as_str())));
+            kassert!(got.iter().map(|r| r.off as u64).eq(truth.iter().map(|e| e.next_cursor)));
+            kassert_eq!(super::fd::sys_close(fd), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn dir_getdents64_on_a_removed_directory_lists_nothing() {
+        // Removed while open: an empty listing on tmpfs and ext4
+        // (ARCHITECTURE section 9); `/proc/<pid>` of an ended process:
+        // `-ENOENT`.
+        use crate::kassert_eq;
+        use alloc::format;
+        use lumen_vfs::{FileSystem, OpenFlags};
+
+        process::in_test_process(|_| {
+            ktest_mkdir("/tmp/dir-ktest-gone")?;
+            let fd = ktest_open(0, b"/tmp/dir-ktest-gone", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+            ktest_remove("/tmp/dir-ktest-gone", true)?;
+            kassert_eq!(ktest_getdents(fd, 4096), 0);
+            kassert_eq!(super::fd::sys_close(fd), 0);
+
+            let efs = crate::vfs::ktest_ext4(255)?;
+            let root = efs.root_inode();
+            let gone = root.mkdir("gone", 0o755).map_err(|_| "ext4 mkdir")?;
+            let fd = ktest_open_inode(&gone, "/gone")?;
+            root.rmdir("gone").map_err(|_| "ext4 rmdir")?;
+            kassert_eq!(ktest_getdents(fd, 4096), 0);
+            kassert_eq!(super::fd::sys_close(fd), 0);
+            Ok::<(), &'static str>(())
+        })??;
+
+        // `/proc/<pid>` opened by its own process, listed after it ended.
+        let opened = process::in_test_process(|pid| {
+            let path = format!("/proc/{pid}");
+            process::open_kernel_file(path.as_bytes(), OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)
+                .map_err(|_| "open /proc/<pid>")
+        })??;
+        process::in_test_process(move |_| {
+            let fd = process::install_current_fd(opened, false).map_err(|_| "install")?;
+            let fd: Fd = super::at::reg(fd as u64);
+            kassert_eq!(ktest_getdents(fd, 4096), super::neg_errno(errno::ENOENT));
+            // `fchdir` takes it (the open file's own reference, which a
+            // fresh one would be refused), and `getcwd` says it is gone.
+            kassert_eq!(sys_fchdir(fd), 0);
+            kassert_eq!(sys_getcwd(super::at::reg(KTEST_CWD), 256), super::neg_errno(errno::ENOENT));
+            kassert_eq!(super::fd::sys_close(fd), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn dir_fchdir_through_a_symlink_keeps_the_directory_s_own_path() {
+        use crate::kassert_eq;
+        use lumen_vfs::OpenFlags;
+        process::in_test_process(|_| {
+            ktest_mkdir("/tmp/dir-ktest-fln")?;
+            ktest_mkdir("/tmp/dir-ktest-fln/sub")?;
+            ktest_file("/tmp/dir-ktest-fln/sub/g", b"")?;
+            let tables = crate::vfs::tables();
+            lumen_vfs::symlink_at(tables, b"sub", None, b"/tmp/dir-ktest-fln/ln").map_err(|_| "symlink")?;
+            // Opened through the link: the open file's path names the link,
+            // the cwd's is the directory's own.
+            let lfd = ktest_open(0, b"/tmp/dir-ktest-fln/ln", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+            kassert_eq!(sys_fchdir(lfd), 0);
+            kassert_eq!(&*process::current_cwd().1, "/tmp/dir-ktest-fln/sub");
+            let g = ktest_open(1, b"g", OpenFlags::O_RDONLY)?;
+            let shown = process::current_file(g.raw()).map(|f| Arc::clone(&f.path));
+            kassert_eq!(shown.as_deref(), Some("/tmp/dir-ktest-fln/sub/g"));
+            kassert_eq!(ktest_chdir(b"/")?, 0);
+            for f in [lfd, g] {
+                kassert_eq!(super::fd::sys_close(f), 0);
+            }
+            ktest_remove("/tmp/dir-ktest-fln/sub/g", false)?;
+            ktest_remove("/tmp/dir-ktest-fln/ln", false)?;
+            ktest_remove("/tmp/dir-ktest-fln/sub", true)?;
+            ktest_remove("/tmp/dir-ktest-fln", true)
+        })?
+    }
+);
+
+crate::ktest!(
+    fn dir_pack_listed_checks_the_cursor_contract_and_hands_on_entries_before_an_error() {
+        use crate::kassert_eq;
+        let e = |name: &str, next: u64| DirEntry {
+            ino: 7,
+            inode_type: InodeType::File,
+            name: name.into(),
+            next_cursor: next,
+        };
+        let packed = |listed, entries: &[DirEntry]| pack_listed(listed, entries, 3, 4096).map(|(n, b)| (n, b.len()));
+        // A cursor that doesn't move past the one before: the records stop
+        // before it; as the first, `EIO` (or `readdir(3)` would loop).
+        kassert_eq!(packed(Ok(()), &[e("a", 5), e("b", 5), e("c", 9)]), Ok((5, 24)));
+        kassert_eq!(packed(Ok(()), &[e("a", 6), e("b", 4)]), Ok((6, 24)));
+        kassert_eq!(packed(Ok(()), &[e("a", 3)]), Err(errno::EIO));
+        kassert_eq!(packed(Ok(()), &[e("a", 2)]), Err(errno::EIO));
+        kassert_eq!(packed(Ok(()), &[e("a", 4), e("b", 6)]), Ok((6, 48)));
+        // What `readdir` pushed before an error is handed on; the error
+        // comes back alone.
+        kassert_eq!(packed(Err(VfsError::Io), &[e("a", 4), e("b", 6)]), Ok((6, 48)));
+        kassert_eq!(packed(Err(VfsError::Io), &[]), Err(errno::EIO));
+        kassert_eq!(packed(Err(VfsError::NoEnt), &[]), Err(errno::ENOENT));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn dir_kept_cwd_path_falls_back_quietly_only_for_a_removed_directory() {
+        use crate::kassert_eq;
+        let fallback = || Arc::<str>::from("/as/given");
+        let kept = |computed| {
+            let (path, warn) = kept_cwd_path(computed, fallback);
+            (alloc::string::String::from(&*path), warn)
+        };
+        kassert_eq!(kept(Ok("/real".into())), ("/real".into(), None));
+        kassert_eq!(kept(Err(VfsError::NoEnt)), ("/as/given".into(), None));
+        kassert_eq!(kept(Err(VfsError::Io)), ("/as/given".into(), Some(VfsError::Io)));
+        kassert_eq!(kept(Err(VfsError::NameTooLong)), ("/as/given".into(), Some(VfsError::NameTooLong)));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn dir_d_type_maps_every_inode_type() {
+        use crate::kassert_eq;
+        let table = [
+            (InodeType::File, general::DT_REG),
+            (InodeType::Dir, general::DT_DIR),
+            (InodeType::Symlink, general::DT_LNK),
+            (InodeType::CharDevice, general::DT_CHR),
+            (InodeType::BlockDevice, general::DT_BLK),
+            (InodeType::Fifo, general::DT_FIFO),
+            (InodeType::Socket, general::DT_SOCK),
+        ];
+        for (t, dt) in table {
+            kassert_eq!(u32::from(d_type(t)), dt);
+        }
+        Ok(())
     }
 );
 
