@@ -1045,4 +1045,43 @@ mod tests {
             })?
         }
     );
+
+    crate::ktest!(
+        fn meta_a_special_file_on_another_read_only_mount_stays_erofs() {
+            // Only devfs's own nodes skip the mount check (Linux's devtmpfs
+            // being a writable mount): a second devfs on another device is
+            // a read-only mount whose char nodes' setters would take the
+            // change, so only `writable_mount` refuses it here.
+            use lumen_vfs::FileSystem;
+            const MNT: &str = "/tmp/meta-ktest-ro-dev";
+            let fs = crate::vfs::devfs::Devfs::new(DevId::makedev(0, 133));
+            let mp = lumen_vfs::mkdir_at(tables(), None, MNT.as_bytes(), 0o755, 0).map_err(|_| "mkdir")?;
+            let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
+            if tables().mount(mp, MNT, fs as Arc<dyn FileSystem>).is_err() {
+                remove(&[MNT.as_bytes()]);
+                return Err("mount");
+            }
+            let ran = process::in_test_process(|_| {
+                let null = ktest_user_path(0, b"/tmp/meta-ktest-ro-dev/null")?;
+                let before = meta_of("/tmp/meta-ktest-ro-dev/null")?;
+                kassert_eq!(before.inode_type, InodeType::CharDevice);
+                kassert!(tables().fs_read_only(before.dev));
+                kassert_eq!(sys_chmod(null, at::reg(0o600)), neg_errno(errno::EROFS));
+                kassert_eq!(sys_chown(null, 1000, 1000), neg_errno(errno::EROFS));
+                kassert_eq!(sys_utimensat(Dirfd::Cwd, null, at::reg(0), flags(0)), neg_errno(errno::EROFS));
+                // A write open is still fine: a special file (#291).
+                let fd = open(null, OpenFlags::O_WRONLY)?;
+                kassert_eq!(sys_fchmod(fd, at::reg(0o600)), neg_errno(errno::EROFS));
+                kassert_eq!(sys_close(fd), 0);
+                let after = meta_of("/tmp/meta-ktest-ro-dev/null")?;
+                kassert_eq!((after.mode, after.uid, after.gid), (before.mode, before.uid, before.gid));
+                kassert_eq!((ts(after.atime), ts(after.mtime)), (ts(before.atime), ts(before.mtime)));
+                Ok(())
+            });
+            let umounted = tables().umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
+            remove(&[MNT.as_bytes()]);
+            ran??;
+            umounted
+        }
+    );
 }

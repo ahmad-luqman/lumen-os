@@ -101,10 +101,11 @@ milestone = "M7"
 tests = ["cargo:lumen-vfs"]
 
 [[feature]]
-name = "chmod, chown and utimensat on devfs nodes (/dev/null) kept in memory and shown by stat, as Linux's devtmpfs, by path and by descriptor; /dev itself stays -EROFS (#293)"
+name = "chmod, chown and utimensat on devfs nodes (/dev/null) kept in memory and shown by stat, as Linux's devtmpfs, by path and by descriptor; /dev itself, and a special file on any other read-only mount, stay -EROFS (#293)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chmod_on_dev_null_is_kept_as_devtmpfs_does",
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chown_on_dev_null_is_kept_as_devtmpfs_does",
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_utimensat_on_dev_null_is_kept_as_devtmpfs_does",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_a_special_file_on_another_read_only_mount_stays_erofs",
 ]
