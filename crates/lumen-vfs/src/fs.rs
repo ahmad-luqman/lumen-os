@@ -85,9 +85,20 @@ pub trait VfsInode: Send + Sync {
         false
     }
 
-    /// True for `devfs` `S_ISCHR` nodes exempt from `-EROFS` for `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK`.
+    /// True if a read-only mount doesn't refuse this inode with `-EROFS`:
+    /// a write open (`O_WRONLY`, `O_RDWR`, `O_TRUNC`, in `open_inode`),
+    /// `access(W_OK)` (`check_access`) and, in the kernel's syscall layer,
+    /// a `chmod`, `chown` or `utimensat` (its filesystem's setter then
+    /// decides: devfs keeps the change in memory, as Linux's devtmpfs; a
+    /// read-only ext4 still refuses).
+    ///
+    /// Keyed on the file type: the special files (`InodeType::is_special`:
+    /// character and block devices, FIFOs, sockets), as Linux's
+    /// `special_file()` in `do_faccessat` and `may_open`. A filesystem
+    /// keeps the default; the host tests override it only to run a hook
+    /// at the point `open_inode` asks.
     fn exempt_from_rofs(&self) -> bool {
-        false
+        self.inode_type().is_special()
     }
 
     /// True for a terminal (`devfs`'s `tty` and `console`): a descriptor on

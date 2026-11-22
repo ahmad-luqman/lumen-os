@@ -533,6 +533,8 @@ fn open_once(
     if inode.inode_type() == InodeType::Dir && (flags.is_writable() || flags.has_trunc() || flags.has_creat()) {
         return Err(VfsError::IsDir);
     }
+    // A special file is written through, not on, its filesystem: no `-EROFS`
+    // (`VfsInode::exempt_from_rofs`), as `check_access` agrees.
     if !inode.exempt_from_rofs() && env.fs_read_only(inode.dev_id()) && (flags.is_writable() || flags.has_trunc()) {
         return Err(VfsError::RoFs);
     }

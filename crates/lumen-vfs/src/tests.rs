@@ -60,7 +60,6 @@ struct MemInode {
     inode_type: InodeType,
     open_count: AtomicU32,
     detached: AtomicBool,
-    exempt_rofs: bool,
     self_weak: Weak<MemInode>,
     registry: InodeRegistry,
     next_ino: Arc<AtomicU64>,
@@ -89,7 +88,6 @@ impl MemInode {
             inode_type: InodeType::Dir,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
-            exempt_rofs: false,
             self_weak: weak.clone(),
             registry,
             next_ino,
@@ -122,7 +120,6 @@ impl MemInode {
             inode_type: InodeType::File,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
-            exempt_rofs: false,
             self_weak: weak.clone(),
             registry,
             next_ino,
@@ -147,23 +144,25 @@ impl MemInode {
         arc
     }
 
-    fn new_char_dev(
+    /// A special file (`inode_type`: a character or block device, a FIFO
+    /// or a socket) with no data.
+    fn new_special(
         dev: DevId,
         ino: Ino,
+        inode_type: InodeType,
         mode: u16,
         rdev: DevId,
-        exempt_rofs: bool,
         registry: InodeRegistry,
         next_ino: Arc<AtomicU64>,
     ) -> Arc<Self> {
+        assert!(inode_type.is_special());
         let arc = Arc::new_cyclic(|weak| Self {
             lock_id: next_lock_id(),
             dev,
             ino: AtomicU64::new(ino),
-            inode_type: InodeType::CharDevice,
+            inode_type,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
-            exempt_rofs,
             self_weak: weak.clone(),
             registry,
             next_ino,
@@ -196,7 +195,6 @@ impl MemInode {
             inode_type: InodeType::Symlink,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
-            exempt_rofs: false,
             self_weak: weak.clone(),
             registry,
             next_ino,
@@ -254,21 +252,25 @@ impl MemFs {
         Arc::new(Self { dev, name, read_only, next_ino, registry, root, rename_lock: Mutex::new(()) })
     }
 
-    fn add_char_device(
+    fn add_char_device(&self, parent: &Arc<MemInode>, name: &str, mode: u16, rdev: DevId) -> Arc<MemInode> {
+        self.add_special(parent, name, InodeType::CharDevice, mode, rdev)
+    }
+
+    fn add_special(
         &self,
         parent: &Arc<MemInode>,
         name: &str,
+        inode_type: InodeType,
         mode: u16,
         rdev: DevId,
-        exempt_rofs: bool,
     ) -> Arc<MemInode> {
         let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-        let node = MemInode::new_char_dev(
+        let node = MemInode::new_special(
             self.dev,
             ino,
+            inode_type,
             mode,
             rdev,
-            exempt_rofs,
             Arc::clone(&self.registry),
             Arc::clone(&self.next_ino),
         );
@@ -350,10 +352,6 @@ impl VfsInode for MemInode {
 
     fn is_detached(&self) -> bool {
         self.detached.load(Ordering::Acquire)
-    }
-
-    fn exempt_from_rofs(&self) -> bool {
-        self.exempt_rofs
     }
 
     fn resolve_magic_link(&self) -> Option<Arc<dyn VfsInode>> {
@@ -1009,7 +1007,7 @@ fn magic_symlinks_and_rofs_exempt_chardev() {
     let proc_mp = mkdir_at(&env, None, b"/proc", 0o755, 0).unwrap();
 
     let devfs = MemFs::new(DevId::DEVFS, "devfs", true);
-    let _null_dev = devfs.add_char_device(&devfs.root, "null", 0o666, DevId::makedev(1, 3), true);
+    let _null_dev = devfs.add_char_device(&devfs.root, "null", 0o666, DevId::makedev(1, 3));
     let procfs = MemFs::new(DevId::PROCFS, "procfs", true);
 
     env.mount(dev_mp, "/dev", devfs).unwrap();
@@ -2951,25 +2949,76 @@ fn unchallenged_edges_tmpfile_link_empty_path_and_access() {
     assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::R_OK | AccessMask::W_OK), 0, 0), Ok(()));
     assert_eq!(check_access(&env, &acc_file, AccessMask(AccessMask::X_OK), 0, 0), Err(VfsError::Acces));
     assert_eq!(check_access(&env, &dir, AccessMask(AccessMask::X_OK), 0, 0), Ok(()));
-    // ROFS blocks W_OK even for uid == 0 unless exempt.
+    // ROFS blocks W_OK even for uid == 0 unless exempt (a special file).
     let ro_mp = mkdir_at(&env, None, b"/ro_acc", 0o755, 0).unwrap();
     let ro_fs = MemFs::new(DevId::DEVFS, "devfs", true);
-    let ro_reg = MemInode::new_char_dev(
-        DevId::DEVFS,
-        99,
-        0o666,
-        DevId::makedev(1, 3),
-        false,
-        Arc::clone(&ro_fs.registry),
-        Arc::clone(&ro_fs.next_ino),
-    );
+    let ro_reg = MemInode::new_file(DevId::DEVFS, 99, 0o666, Arc::clone(&ro_fs.registry), Arc::clone(&ro_fs.next_ino));
     ro_fs.root.inner.lock().unwrap().children.insert(String::from("non_exempt"), ro_reg);
-    let ro_exempt: Arc<dyn VfsInode> = ro_fs.add_char_device(&ro_fs.root, "exempt", 0o666, DevId::makedev(1, 3), true);
+    let ro_exempt: Arc<dyn VfsInode> = ro_fs.add_char_device(&ro_fs.root, "exempt", 0o666, DevId::makedev(1, 3));
     env.mount(ro_mp, "/ro_acc", ro_fs).unwrap();
     let non_exempt = resolve_path(&env, None, b"/ro_acc/non_exempt", ResolveFlags::default()).unwrap().inode;
     assert_eq!(check_access(&env, &non_exempt, AccessMask(AccessMask::F_OK), 0, 0), Ok(()));
     assert_eq!(check_access(&env, &non_exempt, AccessMask(AccessMask::W_OK), 0, 0), Err(VfsError::RoFs));
     assert_eq!(check_access(&env, &ro_exempt, AccessMask(AccessMask::W_OK), 0, 0), Ok(()));
+}
+
+/// #291: on a read-only mount, `access(W_OK)` and a write open agree. The
+/// special files (character and block devices, FIFOs, sockets) pass, as
+/// Linux's `special_file()`; a regular file, a directory and a symlink get
+/// `EROFS` from `check_access`. A write open of a regular file is `EROFS`;
+/// a directory's is `EISDIR` and a symlink's (`O_NOFOLLOW`) `ELOOP`, both
+/// checked first, as Linux's `do_open` and `may_open` order them.
+#[test]
+fn rofs_exempts_every_special_file_in_access_and_open() {
+    let (env, _) = setup_vfs();
+    let mp = mkdir_at(&env, None, b"/ro", 0o755, 0).unwrap();
+    let ro = MemFs::new(DevId::makedev(0, 71), "ext4", true);
+    let (dev, reg, nxt) = (ro.dev, &ro.registry, &ro.next_ino);
+    let file = MemInode::new_file(dev, 90, 0o666, Arc::clone(reg), Arc::clone(nxt));
+    let dir = MemInode::new_dir(dev, 91, 0o777, Some(Arc::downgrade(&ro.root)), Arc::clone(reg), Arc::clone(nxt));
+    let link = MemInode::new_symlink(dev, 92, "file", Arc::clone(reg), Arc::clone(nxt));
+    {
+        let mut root = ro.root.inner.lock().unwrap();
+        root.children.insert(String::from("file"), file);
+        root.children.insert(String::from("dir"), dir);
+        root.children.insert(String::from("link"), link);
+    }
+    let special = [
+        ("chr", InodeType::CharDevice),
+        ("blk", InodeType::BlockDevice),
+        ("fifo", InodeType::Fifo),
+        ("sock", InodeType::Socket),
+    ];
+    for (name, ty) in special {
+        ro.add_special(&ro.root, name, ty, 0o666, DevId::makedev(8, 1));
+    }
+    env.mount(mp, "/ro", ro).unwrap();
+
+    let nofollow = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
+    let inode = |name: &str| resolve_path(&env, None, format!("/ro/{name}").as_bytes(), nofollow).unwrap().inode;
+    let w_ok = AccessMask(AccessMask::W_OK);
+    let open = |name: &str, bits: u32| {
+        open_inode(&env, None, format!("/ro/{name}").as_bytes(), OpenFlags(bits), 0, 0).map(|(i, _)| i.inode_type())
+    };
+    let writes = [OpenFlags::O_WRONLY, OpenFlags::O_RDWR, OpenFlags::O_RDONLY | OpenFlags::O_TRUNC];
+
+    for (name, ty) in special {
+        assert_eq!(inode(name).inode_type(), ty);
+        assert_eq!(check_access(&env, &inode(name), w_ok, 0, 0), Ok(()), "{name}: access(W_OK)");
+        for bits in writes {
+            assert_eq!(open(name, bits), Ok(ty), "{name}: open({bits:#o})");
+        }
+    }
+    for name in ["file", "dir", "link"] {
+        assert_eq!(check_access(&env, &inode(name), w_ok, 0, 0), Err(VfsError::RoFs), "{name}: access(W_OK)");
+        assert_eq!(check_access(&env, &inode(name), AccessMask(AccessMask::R_OK), 0, 0), Ok(()), "{name}: R_OK");
+    }
+    for bits in writes {
+        assert_eq!(open("file", bits), Err(VfsError::RoFs), "file: open({bits:#o})");
+        assert_eq!(open("dir", bits | OpenFlags::O_DIRECTORY), Err(VfsError::IsDir), "dir: open({bits:#o})");
+        assert_eq!(open("link", bits | OpenFlags::O_NOFOLLOW), Err(VfsError::Loop), "link: open({bits:#o})");
+    }
+    assert_eq!(open("file", OpenFlags::O_RDONLY), Ok(InodeType::File));
 }
 
 #[test]
@@ -8234,7 +8283,7 @@ impl VfsInode for GateInode {
     }
     fn exempt_from_rofs(&self) -> bool {
         self.run(|h| h.at_rofs_check.take());
-        false
+        self.inode_type.is_special()
     }
     fn stat(&self) -> Result<Metadata, VfsError> {
         self.run(|h| h.before_stat.take());

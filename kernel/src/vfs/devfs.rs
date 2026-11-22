@@ -1,9 +1,11 @@
 //! Read-only `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes.
 //!
-//! Namespace changes (create, unlink, mkdir, rename, chmod) return `-EROFS`.
-//! The character nodes report `exempt_from_rofs()`, and `lumen-vfs`'s open
-//! and access checks use that to let `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK`
-//! through on a read-only mount; this file only answers the question.
+//! Namespace changes (create, unlink, mkdir, rename) return `-EROFS`, and
+//! so does a metadata change on `/dev` itself. The character nodes are
+//! special files, so `VfsInode::exempt_from_rofs`'s default lets
+//! `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK` and `chmod`/`chown`/`utimensat`
+//! through the read-only mount; their setters then keep the new mode,
+//! owner and times in memory until reboot, as Linux's devtmpfs does.
 //! `random` and `urandom` read from `crate::rng` and return `-EAGAIN` while
 //! its pool has never been seeded (no RDRAND and no virtio-rng answer).
 
@@ -14,13 +16,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, next_lock_id,
+    VfsInode, mode_after_chown, next_lock_id,
 };
 
 use crate::klog;
 use crate::linux::process;
 use crate::rng;
-use crate::sync::SleepMutex;
+use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +73,7 @@ impl Devfs {
                 dev,
                 ino,
                 kind,
-                ctime: now,
+                meta: SleepMutex::new(DevfsMeta::new(kind, now)),
                 self_weak: Weak::clone(w),
                 open_count: AtomicU32::new(0),
                 nodes: Vec::new(),
@@ -91,7 +93,7 @@ impl Devfs {
             dev,
             ino: 1,
             kind: DevKind::Root,
-            ctime: now,
+            meta: SleepMutex::new(DevfsMeta::new(DevKind::Root, now)),
             self_weak: Weak::clone(w),
             open_count: AtomicU32::new(0),
             nodes: entries,
@@ -123,16 +125,47 @@ impl FileSystem for Devfs {
     }
 }
 
+/// A node's mode, owner and times: fixed at boot, changed only by a
+/// character node's setters (Lock 4, the inode's metadata lock, as
+/// tmpfs's), kept in memory only.
+struct DevfsMeta {
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    atime: Timespec,
+    mtime: Timespec,
+    ctime: Timespec,
+}
+
+impl DevfsMeta {
+    const fn new(kind: DevKind, now: Timespec) -> Self {
+        Self { mode: kind.mode(), uid: 0, gid: 0, atime: now, mtime: now, ctime: now }
+    }
+}
+
 pub struct DevfsInode {
     lock_id: u64,
     dev: DevId,
     ino: Ino,
     kind: DevKind,
-    ctime: Timespec,
+    meta: SleepMutex<DevfsMeta>,
     self_weak: Weak<DevfsInode>,
     open_count: AtomicU32,
     nodes: Vec<(&'static str, Arc<DevfsInode>)>,
     locks: SleepMutex<AdvisoryLocks>,
+}
+
+impl DevfsInode {
+    /// The metadata, held for a change: a character node's, as Linux's
+    /// devtmpfs takes `chmod`, `chown` and `utimensat` on its nodes. `/dev`
+    /// itself is `-EROFS`, as the syscall layer's mount check already says
+    /// for it (a directory isn't exempt).
+    fn changeable_meta(&self) -> Result<SleepMutexGuard<'_, DevfsMeta>, VfsError> {
+        if self.kind == DevKind::Root {
+            return Err(VfsError::RoFs);
+        }
+        Ok(self.meta.lock())
+    }
 }
 
 impl VfsInode for DevfsInode {
@@ -167,30 +200,27 @@ impl VfsInode for DevfsInode {
         self.open_count.fetch_sub(1, Ordering::AcqRel) - 1
     }
 
-    fn exempt_from_rofs(&self) -> bool {
-        self.kind != DevKind::Root
-    }
-
     fn is_tty(&self) -> bool {
         matches!(self.kind, DevKind::Tty | DevKind::Console)
     }
 
     fn stat(&self) -> Result<Metadata, VfsError> {
+        let meta = self.meta.lock();
         Ok(Metadata {
             dev: self.dev,
             ino: self.ino,
             inode_type: self.inode_type(),
-            mode: self.kind.mode(),
+            mode: meta.mode,
             nlink: if self.kind == DevKind::Root { 2 } else { 1 },
-            uid: 0,
-            gid: 0,
+            uid: meta.uid,
+            gid: meta.gid,
             rdev: self.kind.rdev(),
             size: 0,
             blksize: 4096,
             blocks: 0,
-            atime: self.ctime,
-            mtime: self.ctime,
-            ctime: self.ctime,
+            atime: meta.atime,
+            mtime: meta.mtime,
+            ctime: meta.ctime,
         })
     }
 
@@ -273,16 +303,42 @@ impl VfsInode for DevfsInode {
         if self.kind == DevKind::Root { Err(VfsError::IsDir) } else { Err(VfsError::Inval) }
     }
 
-    fn set_mode(&self, _mode: u16) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
+    fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
+        let mut meta = self.changeable_meta()?;
+        meta.mode = mode & 0o7777;
+        meta.ctime = time::realtime_timespec();
+        Ok(())
     }
 
-    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError> {
+        let mut meta = self.changeable_meta()?;
+        if let Some(u) = uid {
+            meta.uid = u;
+        }
+        if let Some(g) = gid {
+            meta.gid = g;
+        }
+        // In the same hold (`VfsInode::set_owner`'s contract).
+        meta.mode = mode_after_chown(self.inode_type(), meta.mode);
+        meta.ctime = time::realtime_timespec();
+        Ok(())
     }
 
-    fn set_times(&self, _atime: SetTime, _mtime: SetTime) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
+    fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
+        let mut meta = self.changeable_meta()?;
+        let now = time::realtime_timespec();
+        match atime {
+            SetTime::Omit => {}
+            SetTime::Now => meta.atime = now,
+            SetTime::Set(ts) => meta.atime = ts,
+        }
+        match mtime {
+            SetTime::Omit => {}
+            SetTime::Now => meta.mtime = now,
+            SetTime::Set(ts) => meta.mtime = ts,
+        }
+        meta.ctime = now;
+        Ok(())
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
