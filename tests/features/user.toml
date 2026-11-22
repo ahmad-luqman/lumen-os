@@ -138,6 +138,18 @@ tests = [
 ]
 
 [[feature]]
+name = "mkdir(at)/rmdir/unlink(at)/link(at)/symlink(at)/readlink(at)/rename/renameat/renameat2 on tmpfs and ext4 through dirfds and the cwd: the umask and dir_perm on mkdir, AT_REMOVEDIR, AT_SYMLINK_FOLLOW and AT_EMPTY_PATH on linkat, readlink cut to bufsiz with no NUL (/proc/self/exe, /proc/<pid>/fd/N, an O_PATH symlink fd), rename over an open file, RENAME_NOREPLACE/RENAME_EXCHANGE, flags checked before paths, and EEXIST/ENOENT/ENOTDIR/EISDIR/ENOTEMPTY/EXDEV/EINVAL/EBUSY/EPERM/EFAULT/EBADF/ELOOP (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::ns::ns_mkdir_rmdir_with_the_umask_dirfds_and_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_unlink_unlinkat_and_their_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_link_linkat_follow_empty_path_and_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_symlink_readlink_truncation_proc_links_and_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_rename_renameat2_over_open_files_exchange_and_errnos",
+    "ktest:lumen_kernel::linux::syscall::ns::ns_handlers_take_their_registers_in_order",
+]
+
+[[feature]]
 name = "getdents64, chdir and fchdir (#254): linux_dirent64 records (8-byte aligned, d_type for every inode type, . and ..) resuming at the open file's dir_cursor, the filesystem's readdir cursor, stable as entries come and go (a model of busybox rm -r's loop empties a directory on tmpfs and ext4; every survivor listed once; procfs keyed by pid and fd; tmpfs names keep their place through a rename over them or an exchange), d_off for seekdir, lseek rewinding, a partial fill stopping before the entry that doesn't fit, -EINVAL for a buffer too small for one, -EFAULT keeping the position, -EBADF/-ENOTDIR, a removed directory listing as empty, the cursor contract checked; on tmpfs, ext4 (across a gap), /proc and /dev; chdir and fchdir (O_PATH, O_DIRECTORY, through a symlink, an ended /proc/<pid>) moving relative paths and getcwd, the kept cwd path computed from the inode"
 milestone = "M7"
 tests = [
