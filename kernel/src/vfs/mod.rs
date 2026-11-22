@@ -48,7 +48,6 @@ use crate::shell::{Ctx, sysinfo, write_in_chunks};
 use crate::sync::{SleepMutex, SleepMutexGuard};
 
 /// Kernel `VfsLock` backed by [`SleepMutex`] (Lock 2).
-#[allow(dead_code)] // public OpenFile lock adapter for M7 syscalls (#254)
 pub struct KernelVfsLock<T>(SleepMutex<T>);
 
 impl<T> VfsLock<T> for KernelVfsLock<T> {
@@ -396,7 +395,6 @@ static TABLES: KernelVfsTables = KernelVfsTables::new();
 static EXT4_FILESYSTEMS: SleepMutex<Vec<Arc<ext4::Ext4FileSystem>>> = SleepMutex::new(Vec::new());
 
 /// Global kernel VFS tables (`VfsCacheOps`).
-#[allow(dead_code)] // public kernel VFS table surface for M7 syscalls (#254)
 pub fn tables() -> &'static KernelVfsTables {
     &TABLES
 }
@@ -951,26 +949,20 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         .map_err(|e| format!("mmap_anon: {e}"))?;
     let space_for_thread = Arc::clone(&space);
 
-    let fd_of = OpenFile::<KernelVfsLock<u64>>::from_opened(
-        open_inode_guarded(
-            &TABLES,
-            None,
-            b"/tmp/proc_fd_test.txt",
-            OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-            0o644,
-            0,
-        )
-        .map_err(|e| format!("open /tmp/proc_fd_test.txt: {e:?}"))?,
+    let fd_file = process::open_kernel_file(
+        b"/tmp/proc_fd_test.txt",
+        OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC,
+        0o644,
     )
-    .map_err(|e| format!("open file /tmp/proc_fd_test.txt: {e:?}"))?;
-    let fd_file = Arc::clone(&fd_of.inode);
-    fd_file.write_at(0, b"magic-fd-bytes").map_err(|e| format!("write fd_file: {e:?}"))?;
+    .map_err(|e| format!("open /tmp/proc_fd_test.txt: {e:?}"))?;
+    fd_file.inode.write_at(0, b"magic-fd-bytes").map_err(|e| format!("write fd_file: {e:?}"))?;
+    let stdio = process::Stdio::open().map_err(|e| format!("open the process's stdio: {e:?}"))?;
 
     let result: Arc<SleepMutex<Option<Result<String, String>>>> = Arc::new(SleepMutex::new(None));
     let res_clone = Arc::clone(&result);
 
     let handle = sched::spawn_user_on(0, "vfstest-proc", space_for_thread, move || {
-        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None);
+        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None, stdio);
         // `/proc/<pid>` and `/proc/<pid>/fd/3` as resolved while they exist,
         // for checking what they say once the process and fd are gone.
         let mut proc_nodes: Option<(Arc<dyn VfsInode>, Arc<dyn VfsInode>)> = None;
@@ -991,13 +983,14 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
                 return Err(String::from("/proc/self/mounts empty"));
             }
             process::set_current_exe_path("/tmp");
-            process::register_current_vfs_fd(3, Arc::clone(&fd_file), String::from("/tmp/proc_fd_test.txt"))
-                .map_err(|e| format!("register fd 3: {e:?}"))?;
+            process::insert_current_fd(3, fd_file).map_err(|e| format!("install fd 3: {e:?}"))?;
             // procfs builds an fd's inode number from it: out-of-range fds
             // are refused.
             for bad in [-1, lumen_vfs::MAX_FDS as i32] {
-                if process::register_current_vfs_fd(bad, Arc::clone(&fd_file), String::from("/bad")).is_ok() {
-                    return Err(format!("fd {bad} was registered"));
+                let null = process::open_kernel_file(b"/dev/null", OpenFlags::O_RDONLY, 0)
+                    .map_err(|e| format!("open /dev/null: {e:?}"))?;
+                if process::insert_current_fd(bad, null).is_ok() {
+                    return Err(format!("fd {bad} was installed"));
                 }
             }
 
@@ -1067,7 +1060,8 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         })();
         // Always unregister, a failed check included: a `ProcessState` left in
         // `ACTIVE_PROCS` would stay in `/proc` for good and pin its address space.
-        process::unregister_current_vfs_fd(3);
+        // Not open if a check failed before fd 3 was: nothing to close then.
+        let _ = process::close_current_fd(3);
         let fd_link_after_close = proc_nodes.as_ref().map(|(_, fd)| fd.stat().err());
         let proc_state = process::take_current();
         // These nodes were resolved while the process lived and are still
@@ -1100,7 +1094,6 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     .map_err(|e| format!("spawn_user_on: {e:?}"))?;
 
     handle.join();
-    drop(fd_of);
     drop(space);
     let inner_res = result.lock().take().ok_or_else(|| String::from("missing thread result"))??;
     Ok(inner_res)
@@ -1685,6 +1678,16 @@ pub fn log_ext4_crate_summary() {
             log::debug!(target: "vfs", "ext4plus =0.1.0-rc.2: smoke failed: {err}");
         }
     }
+}
+
+/// A fresh, writable in-memory ext4 filesystem (a 256-block image) for
+/// ktests outside `vfs` (the FD layer's), on device `0:dev_minor`.
+#[cfg(feature = "ktest")]
+pub(crate) fn ktest_ext4(dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
+    let mem_dev = MemBlkDev::new(build_minimal_ext4_image_blocks(256), false);
+    let bcache: Arc<dyn ext4::BlockCacheBackend> =
+        Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(mem_dev, 64).map_err(|_| "bcache init")?));
+    ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, dev_minor), false).map_err(|_| "ext4 mount")
 }
 
 /// An in-memory block device for ktests. It stays here, not in

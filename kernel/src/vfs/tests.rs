@@ -3052,3 +3052,64 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn vfs_append_writes_at_the_end_in_one_inode_lock_hold() {
+        // `VfsInode::append` (#254, `O_APPEND`): where it wrote and how much,
+        // at the end each time, on tmpfs and ext4; then appenders on every
+        // CPU at once into one tmpfs file, every record whole and none lost.
+        use crate::{kassert, kassert_eq};
+        const RECORD: usize = 8;
+        const PER_THREAD: usize = 256;
+
+        let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 123), 64 * page_cache::PAGE_SIZE);
+        let t = tfs.root_inode().create("a", 0o644).map_err(|_| "tmpfs create")?;
+        kassert_eq!(t.write_at(0, b"xyz"), Ok(3));
+        kassert_eq!(t.append(b"12"), Ok((3, 2)));
+        kassert_eq!(t.append(b""), Ok((5, 0)));
+        kassert_eq!(read_all_inode(&t).map_err(|_| "read tmpfs")?, b"xyz12");
+
+        let m = mount_test_ext4(build_minimal_ext4_image_blocks(256), 141)?;
+        let e = m.fs.root_inode().create("ap", 0o644).map_err(|_| "ext4 create")?;
+        kassert_eq!(e.write_at(0, b"abc"), Ok(3));
+        kassert_eq!(e.append(b"de"), Ok((3, 2)));
+        kassert_eq!(e.append(b""), Ok((5, 0)));
+        kassert_eq!(read_all_inode(&e).map_err(|_| "read ext4")?, b"abcde");
+        drop(e);
+        drop(m);
+
+        let shared = tfs.root_inode().create("shared", 0o644).map_err(|_| "tmpfs create shared")?;
+        let cpus: Vec<usize> =
+            (0..crate::arch::MAX_CPUS).filter(|&c| crate::smp::online_lapic_id(c).is_some()).collect();
+        let refused = core::sync::atomic::AtomicU32::new(0);
+        let (shared_ref, refused_ref) = (&shared, &refused);
+        let spawned = crate::sched::scope(|scope| {
+            for (n, &cpu) in cpus.iter().enumerate() {
+                scope.spawn_on(cpu, "append-ktest", move || {
+                    for i in 0..PER_THREAD {
+                        let rec = alloc::format!("{n:02}:{i:04}\n");
+                        if shared_ref.append(rec.as_bytes()).map(|(_, n)| n) != Ok(RECORD) {
+                            refused_ref.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })?;
+            }
+            Ok::<(), crate::sched::SpawnError>(())
+        });
+        spawned.map_err(|_| "spawn")?.map_err(|_| "spawn an appender")?;
+        kassert_eq!(refused.load(core::sync::atomic::Ordering::Relaxed), 0);
+        let all = read_all_inode(&shared).map_err(|_| "read shared")?;
+        kassert_eq!(all.len(), cpus.len() * PER_THREAD * RECORD);
+        let mut seen = alloc::vec![0u32; cpus.len() * PER_THREAD];
+        for rec in all.chunks(RECORD) {
+            let text = core::str::from_utf8(rec).map_err(|_| "a torn record")?;
+            let (n, i) = text.trim_end().split_once(':').ok_or("a torn record")?;
+            let n: usize = n.parse().map_err(|_| "a torn record")?;
+            let i: usize = i.parse().map_err(|_| "a torn record")?;
+            kassert!(n < cpus.len() && i < PER_THREAD && rec[RECORD - 1] == b'\n');
+            seen[n * PER_THREAD + i] += 1;
+        }
+        kassert!(seen.iter().all(|&c| c == 1));
+        Ok(())
+    }
+);

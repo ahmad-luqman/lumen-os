@@ -227,8 +227,14 @@ def test_static_musl_hello(boot):
 def test_static_busybox_ash(boot):
     """Unmodified Alpine static musl `busybox ash -s` executes shell built-ins
     (echo, pwd, export, arithmetic, for loop, exit 0) interactively over serial
-    and returns cleanly to the Lumen shell with zero leaked frames."""
+    and returns cleanly to the Lumen shell with zero leaked frames. On exit it
+    appends its history to `$HOME/.ash_history` through `open`/`write` (#254),
+    created here first so the page it keeps isn't counted as leaked."""
     m = boot_shell(boot, devices=Devices(rng=True))
+
+    m.send_line("vfstest write /.ash_history x")
+    m.expect(r"wrote 1\n", 10)
+    m.expect(r"lumen> ", 10)
 
     m.send_line("linux busybox ash -s")
     m.expect(r"~ # ", 20)
@@ -255,6 +261,76 @@ def test_static_busybox_ash(boot):
 
     m.send_line("exit 0")
     m.expect(r"linux: busybox exit=0 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
+
+    # Appended after the "x" (no newline there): the first line runs on.
+    m.send_line("vfstest cat /.ash_history")
+    m.expect(re.compile(r"^xecho hello-from-ash\npwd\n", re.MULTILINE), 10)
+    m.expect(r"lumen> ", 10)
+
+    assert CRASH_BEGIN not in m.output
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_busybox_file_syscalls(boot):
+    """Static musl busybox applets reach files through the VFS-backed FD
+    table (#254): `pwd` (`getcwd`), `cat` of a relative path (`open` from
+    the cwd, `read`, `close`) and of `/proc/version`, `head -c` (`read`,
+    then `lseek` back), `tail -c` (`lseek` to `SEEK_END` and back), `od`
+    (`readv` on a file), `uuencode` (`fstat`'s mode), `tee` (`open` with
+    `O_TRUNC` of an existing file, a `write` to it) and `cat` of a missing file (ENOENT);
+    console stdio unchanged throughout."""
+    m = boot_shell(boot, devices=Devices(rng=True))
+
+    def run(cmd, *patterns, leaked=r"0"):
+        m.send_line(cmd)
+        for pattern in patterns:
+            m.expect(pattern, 20)
+        m.expect(rf"linux: busybox exit=0 leaked_frames={leaked}\n", 20)
+        m.expect(r"lumen> ", 10)
+
+    m.send_line("vfstest write /tmp/w 0123456789abcdef")
+    m.expect(r"wrote 16\n", 10)
+    m.expect(r"lumen> ", 10)
+    m.send_line("vfstest chmod /tmp/w 640")
+    m.expect(r"chmod: ok\n", 10)
+    m.expect(r"lumen> ", 10)
+
+    run("linux busybox pwd", re.compile(r"^/\r?\n", re.MULTILINE))
+    run("linux busybox cat tmp/w", re.compile(r"\n0123456789abcdef(?=linux: )"))
+    run(
+        "linux busybox cat /proc/version",
+        re.compile(r"^Linux version 6\.6\.0-lumen ", re.MULTILINE),
+    )
+    # No newline at the end of the file (nor of these): the next line
+    # follows on.
+    run("linux busybox head -c 4 /tmp/w", re.compile(r"\n0123(?=linux: )"))
+    run("linux busybox tail -c 5 /tmp/w", re.compile(r"\nbcdef(?=linux: )"))
+    run(
+        "linux busybox od -c /tmp/w",
+        re.compile(r"^0000000 +0 +1 +2 +3 +4 +5 +6 +7 +8 +9 +a +b +c +d +e +f\r?\n", re.MULTILINE),
+    )
+    run("linux busybox uuencode /tmp/w w", re.compile(r"^begin 640 w\r?\n", re.MULTILINE))
+
+    # `tee` copies its input (a line, then Ctrl-D) to stdout and to the
+    # file, which it opens `O_TRUNC`: the longer text there before goes, and
+    # the page the file already held is all it keeps.
+    m.send_line("vfstest write /tmp/t this-text-is-longer-than-the-line-tee-writes")
+    m.expect(r"wrote 44\n", 10)
+    m.expect(r"lumen> ", 10)
+    m.send_line("linux busybox tee /tmp/t")
+    m.send_line("tee-line-one")
+    m.expect(re.compile(r"^tee-line-one\r?\n", re.MULTILINE), 20)
+    m.send("\x04")
+    m.expect(r"linux: busybox exit=0 leaked_frames=0\n", 20)
+    m.expect(r"lumen> ", 10)
+    m.send_line("vfstest cat /tmp/t")
+    m.expect(re.compile(r"cat /tmp/t\r?\ntee-line-one\r?\nlumen> "), 10)
+
+    m.send_line("linux busybox cat /no-such-file")
+    m.expect(r"cat: can't open '/no-such-file': No such file or directory", 20)
+    m.expect(r"linux: busybox exit=1 leaked_frames=0\n", 20)
     m.expect(r"lumen> ", 10)
 
     assert CRASH_BEGIN not in m.output

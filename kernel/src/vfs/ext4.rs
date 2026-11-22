@@ -694,6 +694,128 @@ pub struct Ext4Inode {
 }
 
 impl Ext4Inode {
+    /// `write_at` at `offset`, or at the end (`append`, `None`): the size is
+    /// read under the same hold of `meta` (Lock 4) the write is made in.
+    /// Returns where the write began and how much was written.
+    fn write_locked(&self, offset: Option<u64>, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+        if self.inode_type == InodeType::Dir {
+            return Err(VfsError::IsDir);
+        }
+        if self.inode_type != InodeType::File {
+            return Err(VfsError::Inval);
+        }
+        if self.shared.read_only && !self.is_detached() {
+            return Err(VfsError::RoFs);
+        }
+        if let Some(at) = offset
+            && buf.is_empty()
+        {
+            return Ok((at, 0));
+        }
+        if !self.is_detached() {
+            page_cache::maybe_reclaim_ext4_pages();
+        }
+
+        let mut meta = self.meta.lock();
+        let detached = self.is_detached();
+        if !detached && meta.nlink == 0 {
+            return Err(VfsError::NoEnt);
+        }
+        let offset = offset.unwrap_or(meta.size);
+        if buf.is_empty() {
+            return Ok((offset, 0));
+        }
+        let mut pages = self.pages.lock();
+        let old_size = meta.size;
+
+        // Past the largest file the filesystem can map, write what fits (a
+        // short write) and `EFBIG` once nothing does, as POSIX asks.
+        let max = self.shared.max_file_size;
+        if offset >= max {
+            return Err(VfsError::FBig);
+        }
+        let buf = &buf[..buf.len().min(usize::try_from(max - offset).unwrap_or(usize::MAX))];
+        if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
+            let tail_page = old_size / PAGE_SIZE as u64;
+            let tail_off = (old_size % PAGE_SIZE as u64) as usize;
+            if let Some(page) = pages.get(tail_page) {
+                page.zero_range(tail_off, PAGE_SIZE);
+                if !detached {
+                    page.set_dirty();
+                }
+            }
+        }
+
+        let mut done = 0usize;
+        while done < buf.len() {
+            let cur_off = offset + done as u64;
+            let page_idx = cur_off / PAGE_SIZE as u64;
+            let in_page = (cur_off % PAGE_SIZE as u64) as usize;
+            let chunk = (PAGE_SIZE - in_page).min(buf.len() - done);
+
+            if let Some(page) = pages.get(page_idx) {
+                page.write_bytes(in_page, &buf[done..done + chunk]);
+                if !detached {
+                    page.set_dirty();
+                }
+            } else {
+                // Past the hard limit no more pages are added: reclaim, run
+                // once before taking the locks, couldn't get below it (the
+                // dirty data can't be written back), or this one write added
+                // more pages than the gap.
+                if !detached && page_cache::ext4_at_hard_limit() {
+                    page_cache::note_hard_limit_refusal();
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(VfsError::NoSpc);
+                }
+                let Some(raw) = CachePage::new_zeroed() else {
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(VfsError::NoMem);
+                };
+                let cp = Arc::new(raw);
+                let page_base = page_idx * PAGE_SIZE as u64;
+                if !detached && chunk < PAGE_SIZE && page_base < old_size {
+                    match self.read_disk_page(page_idx, old_size) {
+                        Ok(tmp) => cp.write_bytes(0, &tmp),
+                        Err(err) => {
+                            if done > 0 {
+                                break;
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                cp.write_bytes(in_page, &buf[done..done + chunk]);
+                if !detached {
+                    cp.set_dirty();
+                }
+                if let Err(err) = pages.insert_new(page_idx, cp) {
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(err);
+                }
+            }
+            done += chunk;
+        }
+
+        let written_end = offset + done as u64;
+        let now_ts = duration_to_timespec(realtime_duration());
+        if written_end > meta.size {
+            meta.size = written_end;
+        }
+        meta.mtime = now_ts;
+        meta.ctime = now_ts;
+        if !detached {
+            meta.meta_dirty = true;
+        }
+        Ok((offset, done))
+    }
+
     fn from_disk_inode(shared: Arc<Ext4Shared>, disk: &Inode, blksize: u32, effective_nlink: u32) -> Arc<Self> {
         let disk_ino = disk.index.get();
         let meta = Ext4InodeMeta {
@@ -3837,116 +3959,11 @@ impl VfsInode for Ext4Inode {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
-        if self.inode_type == InodeType::Dir {
-            return Err(VfsError::IsDir);
-        }
-        if self.inode_type != InodeType::File {
-            return Err(VfsError::Inval);
-        }
-        if self.shared.read_only && !self.is_detached() {
-            return Err(VfsError::RoFs);
-        }
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if !self.is_detached() {
-            page_cache::maybe_reclaim_ext4_pages();
-        }
+        self.write_locked(Some(offset), buf).map(|(_, n)| n)
+    }
 
-        let mut meta = self.meta.lock();
-        let detached = self.is_detached();
-        if !detached && meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let mut pages = self.pages.lock();
-        let old_size = meta.size;
-
-        // Past the largest file the filesystem can map, write what fits (a
-        // short write) and `EFBIG` once nothing does, as POSIX asks.
-        let max = self.shared.max_file_size;
-        if offset >= max {
-            return Err(VfsError::FBig);
-        }
-        let buf = &buf[..buf.len().min(usize::try_from(max - offset).unwrap_or(usize::MAX))];
-        if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
-            let tail_page = old_size / PAGE_SIZE as u64;
-            let tail_off = (old_size % PAGE_SIZE as u64) as usize;
-            if let Some(page) = pages.get(tail_page) {
-                page.zero_range(tail_off, PAGE_SIZE);
-                if !detached {
-                    page.set_dirty();
-                }
-            }
-        }
-
-        let mut done = 0usize;
-        while done < buf.len() {
-            let cur_off = offset + done as u64;
-            let page_idx = cur_off / PAGE_SIZE as u64;
-            let in_page = (cur_off % PAGE_SIZE as u64) as usize;
-            let chunk = (PAGE_SIZE - in_page).min(buf.len() - done);
-
-            if let Some(page) = pages.get(page_idx) {
-                page.write_bytes(in_page, &buf[done..done + chunk]);
-                if !detached {
-                    page.set_dirty();
-                }
-            } else {
-                // Past the hard limit no more pages are added: reclaim, run
-                // once before taking the locks, couldn't get below it (the
-                // dirty data can't be written back), or this one write added
-                // more pages than the gap.
-                if !detached && page_cache::ext4_at_hard_limit() {
-                    page_cache::note_hard_limit_refusal();
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(VfsError::NoSpc);
-                }
-                let Some(raw) = CachePage::new_zeroed() else {
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(VfsError::NoMem);
-                };
-                let cp = Arc::new(raw);
-                let page_base = page_idx * PAGE_SIZE as u64;
-                if !detached && chunk < PAGE_SIZE && page_base < old_size {
-                    match self.read_disk_page(page_idx, old_size) {
-                        Ok(tmp) => cp.write_bytes(0, &tmp),
-                        Err(err) => {
-                            if done > 0 {
-                                break;
-                            }
-                            return Err(err);
-                        }
-                    }
-                }
-                cp.write_bytes(in_page, &buf[done..done + chunk]);
-                if !detached {
-                    cp.set_dirty();
-                }
-                if let Err(err) = pages.insert_new(page_idx, cp) {
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(err);
-                }
-            }
-            done += chunk;
-        }
-
-        let written_end = offset + done as u64;
-        let now_ts = duration_to_timespec(realtime_duration());
-        if written_end > meta.size {
-            meta.size = written_end;
-        }
-        meta.mtime = now_ts;
-        meta.ctime = now_ts;
-        if !detached {
-            meta.meta_dirty = true;
-        }
-        Ok(done)
+    fn append(&self, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+        self.write_locked(None, buf)
     }
 
     fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError> {

@@ -130,6 +130,58 @@ pub struct TmpfsInode {
 }
 
 impl TmpfsInode {
+    /// `write_at` at `offset`, or at the end (`append`, `None`): the size is
+    /// read under the same hold of `meta` (Lock 4) the write is made in.
+    /// Returns where the write began and how much was written.
+    fn write_locked(&self, offset: Option<u64>, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+        if self.inode_type == InodeType::Dir {
+            return Err(VfsError::IsDir);
+        }
+        if self.inode_type != InodeType::File {
+            return Err(VfsError::Inval);
+        }
+        let mut meta = self.meta.lock();
+        let offset = offset.unwrap_or(meta.size);
+        if buf.is_empty() {
+            return Ok((offset, 0));
+        }
+        let mut pages = self.pages.lock();
+        let old_size = meta.size;
+        let _ = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
+        if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
+            let tail_page = old_size / PAGE_SIZE as u64;
+            let tail_off = (old_size % PAGE_SIZE as u64) as usize;
+            if let Some(page) = pages.get(tail_page) {
+                page.zero_range(tail_off, PAGE_SIZE);
+            }
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let cur_off = offset + done as u64;
+            let page_idx = cur_off / PAGE_SIZE as u64;
+            let in_page = (cur_off % PAGE_SIZE as u64) as usize;
+            let chunk = (PAGE_SIZE - in_page).min(buf.len() - done);
+            match page_or_new(&mut pages, page_idx) {
+                Ok(page) => page.write_bytes(in_page, &buf[done..done + chunk]),
+                Err(err) => {
+                    if done > 0 {
+                        break;
+                    }
+                    return Err(err);
+                }
+            }
+            done += chunk;
+        }
+        let written_end = offset + done as u64;
+        let now = time::realtime_timespec();
+        if written_end > meta.size {
+            meta.size = written_end;
+        }
+        meta.mtime = now;
+        meta.ctime = now;
+        Ok((offset, done))
+    }
+
     fn new_child(
         shared: &Arc<TmpfsShared>,
         inode_type: InodeType,
@@ -862,51 +914,11 @@ impl VfsInode for TmpfsInode {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
-        if self.inode_type == InodeType::Dir {
-            return Err(VfsError::IsDir);
-        }
-        if self.inode_type != InodeType::File {
-            return Err(VfsError::Inval);
-        }
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let mut meta = self.meta.lock();
-        let mut pages = self.pages.lock();
-        let old_size = meta.size;
-        let _ = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
-        if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
-            let tail_page = old_size / PAGE_SIZE as u64;
-            let tail_off = (old_size % PAGE_SIZE as u64) as usize;
-            if let Some(page) = pages.get(tail_page) {
-                page.zero_range(tail_off, PAGE_SIZE);
-            }
-        }
-        let mut done = 0usize;
-        while done < buf.len() {
-            let cur_off = offset + done as u64;
-            let page_idx = cur_off / PAGE_SIZE as u64;
-            let in_page = (cur_off % PAGE_SIZE as u64) as usize;
-            let chunk = (PAGE_SIZE - in_page).min(buf.len() - done);
-            match page_or_new(&mut pages, page_idx) {
-                Ok(page) => page.write_bytes(in_page, &buf[done..done + chunk]),
-                Err(err) => {
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(err);
-                }
-            }
-            done += chunk;
-        }
-        let written_end = offset + done as u64;
-        let now = time::realtime_timespec();
-        if written_end > meta.size {
-            meta.size = written_end;
-        }
-        meta.mtime = now;
-        meta.ctime = now;
-        Ok(done)
+        self.write_locked(Some(offset), buf).map(|(_, n)| n)
+    }
+
+    fn append(&self, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+        self.write_locked(None, buf)
     }
 
     fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError> {

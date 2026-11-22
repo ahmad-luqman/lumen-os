@@ -760,6 +760,16 @@ impl VfsInode for MemInode {
         Ok(buf.len())
     }
 
+    fn append(&self, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+        if self.inode_type != InodeType::File {
+            return Err(VfsError::IsDir);
+        }
+        let mut g = self.inner.lock().unwrap();
+        let pos = g.data.len() as u64;
+        g.data.extend_from_slice(buf);
+        Ok((pos, buf.len()))
+    }
+
     fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError> {
         buf.fill(0);
         self.read_at(page_index * 4096, buf)
@@ -8331,4 +8341,24 @@ fn o_trunc_truncates_only_after_the_reference_is_checked() {
     let mut buf = [0u8; 32];
     let n = g.files[0].read_at(0, &mut buf).unwrap();
     assert_eq!(&buf[..n], GATE_DATA, "the data is intact");
+}
+
+#[test]
+fn append_writes_at_the_end_and_the_default_refuses_a_regular_file() {
+    let registry: InodeRegistry = Default::default();
+    let next_ino = Arc::new(AtomicU64::new(10));
+    let file = MemInode::new_file(DevId::ROOT, 2, 0o644, Arc::clone(&registry), Arc::clone(&next_ino));
+    assert_eq!(file.write_at(0, b"ab"), Ok(2));
+    assert_eq!(file.append(b"cd"), Ok((2, 2)));
+    assert_eq!(file.append(b"e"), Ok((4, 1)));
+    let mut buf = [0u8; 8];
+    assert_eq!(file.read_at(0, &mut buf), Ok(5));
+    assert_eq!(&buf[..5], b"abcde");
+    // The default: never a write at 0 over a regular file's first bytes.
+    assert_eq!(crate::fs::append_without_end(&*file, b"zz"), Err(VfsError::Inval));
+    assert_eq!(file.read_at(0, &mut buf), Ok(5));
+    assert_eq!(&buf[..5], b"abcde");
+    // Anything else: `write_at(0, ..)` (here a directory's refusal), at 0.
+    let dir = MemInode::new_dir(DevId::ROOT, 3, 0o755, None, registry, next_ino);
+    assert_eq!(crate::fs::append_without_end(&*dir, b"zz"), dir.write_at(0, b"zz").map(|n| (0, n)));
 }

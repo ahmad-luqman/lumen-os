@@ -84,6 +84,15 @@ pub trait VfsInode: Send + Sync {
         false
     }
 
+    /// True for a terminal (`devfs`'s `tty` and `console`): a descriptor on
+    /// one reads and writes the calling process's console, takes the tty
+    /// `ioctl`s (`-ENOTTY` on anything else), polls on the console's
+    /// readiness and can't seek (`-ESPIPE`). Answers from fixed state,
+    /// without locking.
+    fn is_tty(&self) -> bool {
+        false
+    }
+
     /// False for an inode whose existence the VFS can't hold on to, so it
     /// must never enter `DentryCache` or `InodeCache` (e.g. `procfs`'s
     /// `/proc/<pid>` and everything under it, which go when the process or
@@ -139,6 +148,21 @@ pub trait VfsInode: Send + Sync {
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError>;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError>;
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError>;
+
+    /// Write `buf` at the end of the file (`O_APPEND`): the end read and the
+    /// write made in one hold of the inode's lock (Lock 4), so two appenders
+    /// on separate open file descriptions can't both write at the same old
+    /// end. Returns where the write began and how much was written (a short
+    /// write as `write_at`'s).
+    ///
+    /// Every filesystem with regular files must override it (ext4 and tmpfs
+    /// do). The default is [`append_without_end`]: `EINVAL` for a regular
+    /// file (never a write at 0 over its first bytes), and for an inode
+    /// without an end (a device, which ignores the offset) `write_at(0,
+    /// buf)` at position 0, so the caller's offset becomes `n`.
+    fn append(&self, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+        append_without_end(self, buf)
+    }
     fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError>;
     fn write_page(&self, page_index: u64, buf: &[u8]) -> Result<(), VfsError>;
     fn sync(&self, data_only: bool) -> Result<(), VfsError>;
@@ -176,6 +200,16 @@ impl fmt::Debug for dyn VfsInode {
             .field("type", &self.inode_type())
             .finish()
     }
+}
+
+/// [`VfsInode::append`]'s default: `EINVAL` for a regular file, whose
+/// filesystem must override `append`; for anything else (a device: no end,
+/// the offset ignored) `write_at(0, buf)`, reported at position 0.
+pub fn append_without_end<I: VfsInode + ?Sized>(inode: &I, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+    if inode.inode_type() == InodeType::File {
+        return Err(VfsError::Inval);
+    }
+    inode.write_at(0, buf).map(|n| (0, n))
 }
 
 /// RAII open-reference guard held by `OpenFile`, `cwd`, and `mapped_files`.

@@ -171,6 +171,10 @@ impl VfsInode for DevfsInode {
         self.kind != DevKind::Root
     }
 
+    fn is_tty(&self) -> bool {
+        matches!(self.kind, DevKind::Tty | DevKind::Console)
+    }
+
     fn stat(&self) -> Result<Metadata, VfsError> {
         Ok(Metadata {
             dev: self.dev,
