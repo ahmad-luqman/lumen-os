@@ -1,9 +1,15 @@
 //! Read-only `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes.
 //!
-//! Namespace changes (create, unlink, mkdir, rename, chmod) return `-EROFS`.
-//! The character nodes report `exempt_from_rofs()`, and `lumen-vfs`'s open
-//! and access checks use that to let `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK`
-//! through on a read-only mount; this file only answers the question.
+//! Namespace changes (create, unlink, mkdir, rename) return `-EROFS`, and
+//! so does a metadata change on `/dev` itself (a divergence: devtmpfs
+//! takes those on `/dev` too). The character nodes are special files, so
+//! `lumen-vfs`'s open and access checks let `O_WRONLY`/`O_RDWR`/`O_TRUNC`/
+//! `W_OK` through the read-only mount (`InodeType::is_special`). The
+//! syscall layer's `writable_mount` lets `chmod`/`chown`/`utimensat`
+//! through for this mount's (`DevId::DEVFS`) nodes, and their setters keep
+//! the new mode, owner and times in memory until reboot, as Linux's
+//! devtmpfs does. The setters take a change on any instance's node: only
+//! the mount check tells `/dev`'s instance from another.
 //! `random` and `urandom` read from `crate::rng` and return `-EAGAIN` while
 //! its pool has never been seeded (no RDRAND and no virtio-rng answer).
 
@@ -14,13 +20,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, next_lock_id,
+    VfsInode, mode_after_chown, next_lock_id,
 };
 
 use crate::klog;
 use crate::linux::process;
 use crate::rng;
-use crate::sync::SleepMutex;
+use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,7 +77,7 @@ impl Devfs {
                 dev,
                 ino,
                 kind,
-                ctime: now,
+                meta: SleepMutex::new(DevfsMeta::new(kind, now)),
                 self_weak: Weak::clone(w),
                 open_count: AtomicU32::new(0),
                 nodes: Vec::new(),
@@ -91,7 +97,7 @@ impl Devfs {
             dev,
             ino: 1,
             kind: DevKind::Root,
-            ctime: now,
+            meta: SleepMutex::new(DevfsMeta::new(DevKind::Root, now)),
             self_weak: Weak::clone(w),
             open_count: AtomicU32::new(0),
             nodes: entries,
@@ -123,16 +129,49 @@ impl FileSystem for Devfs {
     }
 }
 
+/// A node's mode, owner and times: fixed at boot, changed only by a
+/// character node's setters (Lock 4, the inode's metadata lock, as
+/// tmpfs's), kept in memory only.
+struct DevfsMeta {
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    atime: Timespec,
+    mtime: Timespec,
+    ctime: Timespec,
+}
+
+impl DevfsMeta {
+    const fn new(kind: DevKind, now: Timespec) -> Self {
+        Self { mode: kind.mode(), uid: 0, gid: 0, atime: now, mtime: now, ctime: now }
+    }
+}
+
 pub struct DevfsInode {
     lock_id: u64,
     dev: DevId,
     ino: Ino,
     kind: DevKind,
-    ctime: Timespec,
+    meta: SleepMutex<DevfsMeta>,
     self_weak: Weak<DevfsInode>,
     open_count: AtomicU32,
     nodes: Vec<(&'static str, Arc<DevfsInode>)>,
     locks: SleepMutex<AdvisoryLocks>,
+}
+
+impl DevfsInode {
+    /// The metadata, held for a change: a character node's, as Linux's
+    /// devtmpfs takes `chmod`, `chown` and `utimensat` on its nodes. `/dev`
+    /// itself is `-EROFS` (a divergence: devtmpfs takes these on `/dev`
+    /// too), and this is the only refusal: the syscall layer's
+    /// `writable_mount` lets every `DevId::DEVFS` inode through, and
+    /// `vfstest chmod` calls the setters directly.
+    fn changeable_meta(&self) -> Result<SleepMutexGuard<'_, DevfsMeta>, VfsError> {
+        if self.kind == DevKind::Root {
+            return Err(VfsError::RoFs);
+        }
+        Ok(self.meta.lock())
+    }
 }
 
 impl VfsInode for DevfsInode {
@@ -167,30 +206,27 @@ impl VfsInode for DevfsInode {
         self.open_count.fetch_sub(1, Ordering::AcqRel) - 1
     }
 
-    fn exempt_from_rofs(&self) -> bool {
-        self.kind != DevKind::Root
-    }
-
     fn is_tty(&self) -> bool {
         matches!(self.kind, DevKind::Tty | DevKind::Console)
     }
 
     fn stat(&self) -> Result<Metadata, VfsError> {
+        let meta = self.meta.lock();
         Ok(Metadata {
             dev: self.dev,
             ino: self.ino,
             inode_type: self.inode_type(),
-            mode: self.kind.mode(),
+            mode: meta.mode,
             nlink: if self.kind == DevKind::Root { 2 } else { 1 },
-            uid: 0,
-            gid: 0,
+            uid: meta.uid,
+            gid: meta.gid,
             rdev: self.kind.rdev(),
             size: 0,
             blksize: 4096,
             blocks: 0,
-            atime: self.ctime,
-            mtime: self.ctime,
-            ctime: self.ctime,
+            atime: meta.atime,
+            mtime: meta.mtime,
+            ctime: meta.ctime,
         })
     }
 
@@ -273,16 +309,42 @@ impl VfsInode for DevfsInode {
         if self.kind == DevKind::Root { Err(VfsError::IsDir) } else { Err(VfsError::Inval) }
     }
 
-    fn set_mode(&self, _mode: u16) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
+    fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
+        let mut meta = self.changeable_meta()?;
+        meta.mode = mode & 0o7777;
+        meta.ctime = time::realtime_timespec();
+        Ok(())
     }
 
-    fn set_owner(&self, _uid: Option<u32>, _gid: Option<u32>) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
+    fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError> {
+        let mut meta = self.changeable_meta()?;
+        if let Some(u) = uid {
+            meta.uid = u;
+        }
+        if let Some(g) = gid {
+            meta.gid = g;
+        }
+        // In the same hold (`VfsInode::set_owner`'s contract).
+        meta.mode = mode_after_chown(self.inode_type(), meta.mode);
+        meta.ctime = time::realtime_timespec();
+        Ok(())
     }
 
-    fn set_times(&self, _atime: SetTime, _mtime: SetTime) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
+    fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
+        let mut meta = self.changeable_meta()?;
+        let now = time::realtime_timespec();
+        match atime {
+            SetTime::Omit => {}
+            SetTime::Now => meta.atime = now,
+            SetTime::Set(ts) => meta.atime = ts,
+        }
+        match mtime {
+            SetTime::Omit => {}
+            SetTime::Now => meta.mtime = now,
+            SetTime::Set(ts) => meta.mtime = ts,
+        }
+        meta.ctime = now;
+        Ok(())
     }
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
@@ -357,3 +419,37 @@ impl VfsInode for DevfsInode {
         Ok(())
     }
 }
+
+crate::ktest!(
+    fn devfs_nodes_start_with_their_boot_metadata() {
+        // A fresh instance (not `/dev`'s, whose nodes a `chmod` may have
+        // changed): each node's Linux mode, number and type, owned by root.
+        use crate::kassert_eq;
+        let fs = Devfs::new(DevId::makedev(0, 134));
+        let root = fs.root_inode();
+        let st = root.stat().map_err(|_| "stat /")?;
+        kassert_eq!((st.inode_type, st.mode, st.uid, st.gid), (InodeType::Dir, 0o755, 0, 0));
+        for (name, maj, min, mode) in [
+            ("null", 1, 3, 0o666),
+            ("zero", 1, 5, 0o666),
+            ("random", 1, 8, 0o666),
+            ("urandom", 1, 9, 0o666),
+            ("tty", 5, 0, 0o666),
+            ("console", 5, 1, 0o620),
+        ] {
+            let node = root.lookup(name).map_err(|_| "lookup")?.stat().map_err(|_| "stat")?;
+            kassert_eq!(node.inode_type, InodeType::CharDevice);
+            kassert_eq!((node.rdev, node.mode, node.uid, node.gid), (DevId::makedev(maj, min), mode, 0, 0));
+        }
+        // The root refuses a metadata change itself, whatever the caller
+        // (`vfstest chmod` calls the setter without the syscalls' mount
+        // check), and keeps its metadata.
+        kassert_eq!(root.set_mode(0o700), Err(VfsError::RoFs));
+        kassert_eq!(root.set_owner(Some(1), Some(1)), Err(VfsError::RoFs));
+        kassert_eq!(root.set_times(SetTime::Now, SetTime::Now), Err(VfsError::RoFs));
+        let after = root.stat().map_err(|_| "stat / after")?;
+        kassert_eq!((after.mode, after.uid, after.gid), (0o755, 0, 0));
+        kassert_eq!((after.mtime, after.ctime), (st.mtime, st.ctime));
+        Ok(())
+    }
+);

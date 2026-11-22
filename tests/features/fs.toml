@@ -94,3 +94,20 @@ tests = [
     "ktest:lumen_kernel::vfs::page_cache::mmap_page_refuses_inodes_of_other_filesystems",
     "ktest:lumen_kernel::vfs::page_cache::mapped_page_copies_to_a_frame_under_the_cache_lock",
 ]
+
+[[feature]]
+name = "Read-only mounts exempt every special file (character and block devices, FIFOs, sockets) from -EROFS, as Linux's special_file(): access(W_OK) and a write open (O_WRONLY, O_RDWR, O_TRUNC) agree, while a regular file, directory or symlink gets EROFS from access (#291)"
+milestone = "M7"
+tests = ["cargo:lumen-vfs"]
+
+[[feature]]
+name = "chmod, chown and utimensat on devfs nodes (/dev/null) kept in memory and shown by stat, as Linux's devtmpfs, by path and by descriptor; set-id and sticky bits kept; /dev itself (its setters refusing, whoever calls them), and a special file on any other read-only mount, stay -EROFS; the nodes start at their Linux boot modes, and vfstest dev-tmp-proc passes after a chmod (#293)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chmod_on_dev_null_is_kept_as_devtmpfs_does",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chown_on_dev_null_is_kept_as_devtmpfs_does",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_utimensat_on_dev_null_is_kept_as_devtmpfs_does",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_a_special_file_on_another_read_only_mount_stays_erofs",
+    "ktest:lumen_kernel::vfs::devfs::devfs_nodes_start_with_their_boot_metadata",
+    "ktest:lumen_kernel::vfs::tests::vfs_dev_checks_pass_after_a_chmod_of_a_dev_node",
+]
