@@ -5710,6 +5710,24 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `statx.stx_dev_{major,minor}`, and `/proc/self/maps` (`0:1` for root `ext4`
     or fallback `tmpfs`, `0:2` for `/tmp`, `0:3` for `/dev`, `0:4` for `/proc`),
     so `st_dev` is unique and cross-mount `rename`/`link` returns `-EXDEV`.
+  - **`VfsTables<F: LockFamily>` (#264):** the three tables above, each
+    behind its own lock (Lock 9, sub-order `MountTable -> DentryCache ->
+    InodeCache`), and the one implementation of `VfsCacheOps` (the short
+    probes `resolve` and `ops` make, each releasing its locks before it
+    returns; the `cacheable()` checks above), with `mount_root`, `mount`,
+    `umount` (the evicted inodes dropped after the locks are released) and
+    the snapshots `sync` takes. It lives in lumen-vfs, generic over a lock
+    family (`trait LockFamily { type Lock<T>: VfsLock<T>; }`), so the
+    kernel and the host tests run the same code: the kernel's
+    `KernelVfsTables` is `VfsTables<KernelLocks>` (`KernelVfsLock`, a
+    `SleepMutex`), and the host tests' is a `std` mutex whose guards count
+    the Lock-9 depth that test filesystems assert is zero in their calls,
+    and which panics when its holder takes it again. `VfsLock::new` isn't
+    `const` (a trait method, on stable Rust), so the kernel's `static
+    TABLES` is built by the `const fn VfsTables::from_locks(mounts,
+    dentries, inodes)` from locks made by `SleepMutex::new`, a `const fn`;
+    `VfsTables::new` and `with_capacities` build the locks at run time.
+    Test-only `VfsCacheOps` wrappers (a spy, a hook) delegate to one.
 - **Path & symlink resolution (`resolve_path`, host-tested):**
   - Handles absolute paths, `dirfd`/`AT_FDCWD` relative paths, physical
     component-by-component `.` and `..` traversal (never lexical `..` collapse
