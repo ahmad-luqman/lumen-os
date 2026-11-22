@@ -164,7 +164,7 @@ one is its own PR that updates that doc first.
   `cmdline.rs`: kernel command line (flags and `key=value`, e.g.
   `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held; a wait recorded as an X-ray `lock` event).
   `smp.rs`: starting the other CPUs, `run_on`. `sched.rs`: kernel threads
-  (per-CPU run queues, preemption on the timer, `sleep`, `WaitQueue`
+  (each named by a `lumen_trace::ThreadName`, 16 bytes inline, #276; per-CPU run queues, preemption on the timer, `sleep`, `WaitQueue`
   with or without a deadline, `spawn`/`join`, `scope`: threads borrowing from the caller, joined before it returns;
   each run-queue change an X-ray `runq` event, `run_queue`: a queue's length both ways); `arch/x86_64/context.rs` switches threads.
   `arch/x86_64/`: GDT/TSS (per CPU), IDT, entry
@@ -379,7 +379,7 @@ one is its own PR that updates that doc first.
   `syscall_name`; pinned by the `abi_constants_match_spec` and
   `m7_abi_constants_match_spec` ktests, the latter with M7's flags and
   struct layouts), `uname`'s payload and the `linux` command (`linux /path`
-  from the VFS, `run_exec`: load, run, count frames, the path as `exe`);
+  from the VFS, `run_exec`: load, run, count frames, the path as `exe`, the thread named after the path's last component, #276);
   `linux/exec.rs` `Exec` (#255: a binary and its `PT_INTERP` interpreter
   read and parsed once, each read from a file with its `ImageFile` (none
   for a boot module), naming its maps lines and giving its path, `load` through `AddressSpace::from_images`;
@@ -536,7 +536,10 @@ one is its own PR that updates that doc first.
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
   `stream_of`: which ring each goes to, and typed layouts: `Switch`/`ThreadState`,
-  `RunQueue`, `Irq`, `LockWait`), and `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free).
+  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free),
+  and `ThreadName` (#276: a thread's name, 16 bytes inline like Linux's `comm`: at most 15 bytes cut
+  at a character boundary, control characters as `?`; `from_path`, a path's last component, the
+  name a binary run by `linux /path` gets).
 - `crates/lumen-time`: timekeeping arithmetic: calibration (windows'
   steadiness, the ones with the smallest bounds filling in, how far off a
   median can be for either rate, `tsc_error_ppm`, a window slow to read

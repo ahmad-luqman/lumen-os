@@ -118,3 +118,11 @@ tests = [
     "ktest:lumen_kernel::sched::a_lost_wake_is_ended_by_the_timer_and_counted",
     "scenario:test_ktest::test_in_kernel_tests_pass",
 ]
+
+[[feature]]
+name = "Per-thread names (#276): a thread's name is a `ThreadName`, 16 bytes inline like Linux's `comm` (no heap; at most 15 bytes, cut at a character boundary, ASCII control characters as `?`, padded like a `&str`); a binary run by path (`linux /path`) runs on a thread named after the path's last component (cut to 15 bytes), as `sched::threads()` lists it for `threads`, not `linux`"
+milestone = "M7"
+tests = [
+    "cargo:lumen-trace",
+    "ktest:lumen_kernel::linux::linux_path_route_records_exe_path",
+]

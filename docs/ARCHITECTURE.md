@@ -3830,8 +3830,9 @@ guest SDK is `apps/lumen-app` (#206). Every number named in capitals below is in
   memory, table or global) is refused at load, naming the import (its
   name sanitised as log text is).
 - **One kernel thread per app**, named `app:<name>` (`kernel/build.rs`
-  generates each name as a `&'static str`, since `sched::spawn` takes
-  one), so `threads`, `top` and `perf top --threads` (#205) show it by
+  generates each name as a `&'static str`; `sched::spawn` takes any
+  `Into<ThreadName>`, 16 bytes inline, so a thread's name keeps 15 bytes:
+  `app:` and the first 11 of the app's name, #276), so `threads`, `top` and `perf top --threads` (#205) show it by
   name. `run` places apps round robin over the started CPUs in app-id
   order (`sched::spawn_on`), on an ordinary guarded kernel stack.
   `portable-dispatch` (#197) keeps the native stack's depth constant

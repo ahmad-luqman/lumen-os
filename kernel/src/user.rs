@@ -16,6 +16,7 @@ use lumen_elf::loader::{
     EM_X86_64, ET_EXEC, EV_CURRENT, ElfLoadError, PF_R, PF_W, PF_X, PHDR_MIN_SIZE, PT_INTERP, PT_LOAD,
 };
 use lumen_mm::FRAME_SIZE;
+use lumen_trace::ThreadName;
 use lumen_vm::{Prot, USER_STACK_BOTTOM};
 
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
@@ -548,7 +549,7 @@ type ResultSlot = Arc<SpinLock<Option<RunResult>>>;
 #[allow(clippy::too_many_arguments)]
 fn spawn_ring3_on(
     cpu: usize,
-    name: &'static str,
+    name: impl Into<ThreadName>,
     space: Arc<AddressSpace>,
     entry: u64,
     rsp: u64,
@@ -603,7 +604,7 @@ fn spawn_ring3_on(
 /// `exe_path` is recorded for `/proc/<pid>/exe` (a binary loaded by path).
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 pub fn run_elf_process(
-    name: &'static str,
+    name: impl Into<ThreadName>,
     space: Arc<AddressSpace>,
     entry: u64,
     rsp: u64,

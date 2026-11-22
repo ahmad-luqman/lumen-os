@@ -59,7 +59,11 @@
 //!
 //! Every switch records a `switch` trace event (previous thread's id, next
 //! thread's id, the previous thread's state), and the crash report names the
-//! thread that was running (`thread: <name> (id N)`, read lock-free). Every
+//! thread that was running (`thread: <name> (id N)`, read lock-free: a
+//! thread's name is a `ThreadName`, 16 bytes inline like Linux's `comm`,
+//! set when it is made and never changed, so reading it takes no lock and
+//! allocates nothing; the spawn functions take anything `Into<ThreadName>`,
+//! a `&str` cut to 15 bytes). Every
 //! change to a run queue records a `runq` event in that CPU's X-ray ring
 //! (`trace::record_run_queue`), under the queue's lock ([`run_queue`]
 //! reads the queue's length and the ring's newest such event under it).
@@ -83,6 +87,7 @@ use crate::mm::user_vm::AddressSpace;
 use crate::sync::SpinLock;
 use crate::trace;
 use crate::{smp, time};
+use lumen_trace::ThreadName;
 use lumen_trace::kind::{RunQueue, RunQueueOp, Switch, ThreadState};
 
 /// Timer ticks (1 ms each) a thread runs before the next ready thread on its
@@ -271,7 +276,8 @@ impl UserSlot {
 /// all have to be revisited.
 pub struct Thread {
     id: u64,
-    name: &'static str,
+    /// Set once, when it is made (the crash report reads it lock-free).
+    name: ThreadName,
     /// Its home CPU, the only one it runs on.
     cpu: usize,
     state: AtomicU8,
@@ -300,7 +306,7 @@ impl Thread {
     /// A ready thread on CPU `cpu` with a fresh stack of `stack_size` bytes,
     /// that starts by running `entry`.
     fn spawned(
-        name: &'static str,
+        name: ThreadName,
         cpu: usize,
         stack_size: u64,
         entry: Entry,
@@ -317,11 +323,12 @@ impl Thread {
     /// A thread for the code running now on this CPU, on a stack it doesn't
     /// own.
     fn adopted(name: &'static str) -> Arc<Thread> {
+        let name = ThreadName::new(name);
         register(Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None, None)))
     }
 
     fn new(
-        name: &'static str,
+        name: ThreadName,
         cpu: usize,
         state: State,
         rsp: u64,
@@ -352,7 +359,7 @@ impl Thread {
     }
 
     /// The name it was spawned with.
-    pub fn name(&self) -> &'static str {
+    pub fn name(&self) -> ThreadName {
         self.name
     }
 
@@ -673,7 +680,7 @@ fn register(t: Arc<Thread>) -> Arc<Thread> {
 #[derive(Clone, Copy, Debug)]
 pub struct ThreadInfo {
     pub id: u64,
-    pub name: &'static str,
+    pub name: ThreadName,
     pub cpu: usize,
     pub state: State,
     /// Timer ticks (1 ms each) that found it running.
@@ -801,7 +808,7 @@ pub fn current() -> Option<Arc<Thread>> {
 /// the CPU that crashed (whose current thread can't change any more). Set
 /// from when this CPU's threads are set up (`sched::init` on the boot CPU,
 /// coming online on an AP).
-pub fn running_here() -> Option<(u64, &'static str)> {
+pub fn running_here() -> Option<(u64, ThreadName)> {
     let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
     // SAFETY: a non-null `CURRENT` points into an `Arc<Thread>` that stays
     // alive while it is stored there (see `CURRENT`).
@@ -1037,7 +1044,7 @@ impl JoinHandle {
 }
 
 /// Start a thread running `f` on this CPU.
-pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle, SpawnError> {
+pub fn spawn(name: impl Into<ThreadName>, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle, SpawnError> {
     spawn_on(arch::cpu_index(), name, f)
 }
 
@@ -1047,7 +1054,11 @@ pub fn spawn(name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<Jo
 /// script interpreter). As it is joined before this returns, `f` may borrow
 /// from the caller. If no thread can be made, or the calling thread can't
 /// block (see [`JoinHandle::join`]), `f` is dropped unrun.
-pub fn run_sized<'a>(name: &'static str, stack_size: u64, f: impl FnOnce() + Send + 'a) -> Result<(), SpawnError> {
+pub fn run_sized<'a>(
+    name: impl Into<ThreadName>,
+    stack_size: u64,
+    f: impl FnOnce() + Send + 'a,
+) -> Result<(), SpawnError> {
     // The SAFETY argument below needs a panic to end the kernel, not unwind
     // past the join.
     #[cfg(not(panic = "abort"))]
@@ -1064,7 +1075,7 @@ pub fn run_sized<'a>(name: &'static str, stack_size: u64, f: impl FnOnce() + Sen
     // so nothing unwinds past the join. If spawning fails, `spawn_with`
     // drops `f` before returning.
     let f: Entry = unsafe { core::mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Entry>(f) };
-    spawn_with(cpu, name, stack_size, f)?.join();
+    spawn_with(cpu, name.into(), stack_size, f)?.join();
     Ok(())
 }
 
@@ -1111,7 +1122,12 @@ impl<'env> Scope<'env> {
     /// Start a thread running `f` on CPU `cpu` (see [`spawn_on`]), joined
     /// when the scope ends. If it can't be started, `f` is dropped unrun
     /// and the threads already started still run (and are joined).
-    pub fn spawn_on(&self, cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'env) -> Result<(), SpawnError> {
+    pub fn spawn_on(
+        &self,
+        cpu: usize,
+        name: impl Into<ThreadName>,
+        f: impl FnOnce() + Send + 'env,
+    ) -> Result<(), SpawnError> {
         let f: Box<dyn FnOnce() + Send + 'env> = Box::new(f);
         // SAFETY: only the closure's lifetime bound changes (same layout).
         // `scope` joins every thread pushed below before it returns (a join
@@ -1124,7 +1140,7 @@ impl<'env> Scope<'env> {
         // nothing unwinds past the joins. If spawning fails, `spawn_with`
         // drops `f` before returning.
         let f: Entry = unsafe { core::mem::transmute::<Box<dyn FnOnce() + Send + 'env>, Entry>(f) };
-        let thread = spawn_with(cpu, name, STACK_SIZE, f)?;
+        let thread = spawn_with(cpu, name.into(), STACK_SIZE, f)?;
         self.threads.borrow_mut().push(thread);
         Ok(())
     }
@@ -1132,8 +1148,12 @@ impl<'env> Scope<'env> {
 
 /// Start a thread running `f` on CPU `cpu`, where it will always run. It is
 /// queued behind the threads already ready there.
-pub fn spawn_on(cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'static) -> Result<JoinHandle, SpawnError> {
-    spawn_with(cpu, name, STACK_SIZE, Box::new(f))
+pub fn spawn_on(
+    cpu: usize,
+    name: impl Into<ThreadName>,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle, SpawnError> {
+    spawn_with(cpu, name.into(), STACK_SIZE, Box::new(f))
 }
 
 /// Start a pinned user thread on CPU `cpu` with its own [`AddressSpace`],
@@ -1145,20 +1165,20 @@ pub fn spawn_on(cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'stati
 /// this thread holds the last reference.
 pub fn spawn_user_on(
     cpu: usize,
-    name: &'static str,
+    name: impl Into<ThreadName>,
     address_space: Arc<AddressSpace>,
     f: impl FnOnce() + Send + 'static,
 ) -> Result<JoinHandle, SpawnError> {
-    spawn_with_user(cpu, name, STACK_SIZE, Box::new(f), Some(UserThreadState::new(address_space)))
+    spawn_with_user(cpu, name.into(), STACK_SIZE, Box::new(f), Some(UserThreadState::new(address_space)))
 }
 
-fn spawn_with(cpu: usize, name: &'static str, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
+fn spawn_with(cpu: usize, name: ThreadName, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
     spawn_with_user(cpu, name, stack_size, f, None)
 }
 
 fn spawn_with_user(
     cpu: usize,
-    name: &'static str,
+    name: ThreadName,
     stack_size: u64,
     f: Entry,
     user: Option<UserThreadState>,
@@ -1724,8 +1744,9 @@ pub fn init() {
     assert_eq!(arch::cpu_index(), 0, "sched::init is for the boot CPU");
     assert!(time::timer_published(), "sched::init before time::init");
     assert!(arch::irq::enabled(), "sched::init with interrupts off: no tick could start a scheduler");
-    let idle = Thread::spawned("idle", 0, STACK_SIZE, Box::new(|| idle_loop(0, || false, || {})), None)
-        .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
+    let idle =
+        Thread::spawned(ThreadName::new("idle"), 0, STACK_SIZE, Box::new(|| idle_loop(0, || false, || {})), None)
+            .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
     install(0, Thread::adopted("main"), idle);
     CPUS[0].lock().home(); // `main`: it can sleep and block too
     // The boot CPU's timer already runs (`time::init`).

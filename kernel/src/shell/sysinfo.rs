@@ -725,7 +725,7 @@ fn thread_table() -> pipe::Table {
     ];
     let mut t = pipe::Table::new(&COLUMNS);
     for th in sched::threads() {
-        t.push(vec![text(th.name), int(th.id), int(th.cpu), text(th.state.name()), int(th.ticks)]);
+        t.push(vec![text(th.name.as_str()), int(th.id), int(th.cpu), text(th.state.name()), int(th.ticks)]);
     }
     t
 }
