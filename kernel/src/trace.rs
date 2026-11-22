@@ -624,7 +624,8 @@ crate::ktest!(
 crate::ktest!(
     fn boot_phases_recorded_in_order() {
         // Boot events are the oldest; this relies on the ring not having
-        // wrapped since boot (true while ktests log little). Every phase,
+        // wrapped since boot (`ktest::FIRST` runs this before any other
+        // ktest). Every phase,
         // once, in order, with non-decreasing timestamps from the boot's
         // origin.
         use crate::{kassert, kassert_eq};
