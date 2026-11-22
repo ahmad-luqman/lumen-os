@@ -5500,8 +5500,22 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     within the same `pid`, returns `-EAGAIN` on conflict for `F_SETLK`, and
     releases **all** POSIX record locks held by `pid` on that inode when `pid`
     closes **any** FD referencing that inode (POSIX requirement relied on by
-    SQLite, Cargo, and Git). (In M8 multi-process execution, `F_SETLKW` and
-    blocking `flock` sleep on a per-inode `WaitQueue`.)
+    SQLite, Cargo, and Git).
+  - **Blocking (`F_SETLKW`, `flock` without `LOCK_NB`):** lumen-vfs answers
+    a conflict with `LockOutcome::WouldBlock`; the kernel's
+    `syscall/lock.rs` then waits on one kernel-wide `WaitQueue`
+    (`process::wait_for_lock_release`, not one per inode, so `VfsInode`
+    needs none) and retries. A release count read before each attempt makes
+    a release between the attempt and the wait end the wait at once. Every
+    lock call that may have given a lock up (an unlock, a downgrade, a
+    shrunk range, a blocking `flock` dropping its description's lock before
+    it waits, as Linux) and every `close`/exit that gave a lock up
+    (`process::release_fd`) bumps it and wakes every waiter
+    (`process::locks_released`), after Lock 4 is released. `F_SETLKW`
+    records who it waits for (the holder `F_GETLK` would report) and is
+    `-EDEADLK` where that closes a cycle of waiters (followed through at
+    most 10, as Linux); `flock` detects no deadlock (nor does Linux). No
+    signal ends a wait (no `EINTR` until signals are delivered).
 
 ### Pseudo-filesystems (`/tmp`, `/dev`, `/proc`)
 

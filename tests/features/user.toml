@@ -75,3 +75,19 @@ tests = [
     "scenario:test_linux_user::test_static_busybox_ash",
     "scenario:test_linux_user::test_syscall_bad_pointers_return_efault",
 ]
+
+[[feature]]
+name = "fcntl (F_DUPFD/F_DUPFD_CLOEXEC lowest free at or above the minimum, F_GETFD/F_SETFD, F_GETFL/F_SETFL changing only O_APPEND and O_NONBLOCK, F_GETLK/F_SETLK/F_SETLKW POSIX record locks: conflicts with the owner's pid, -EAGAIN, range splitting, SEEK_CUR/SEEK_END and negative lengths, access-mode checks, a blocked F_SETLKW woken by unlock, by the holder closing any fd of the file, or by its exit; -EDEADLK for a cycle of waiters) and flock (per open file description, shared by dups, LOCK_NB -EWOULDBLOCK, a blocked LOCK_EX woken by LOCK_UN, the last close, or exit; a blocking upgrade giving up its shared lock first), O_PATH refused (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_dupfd_fd_flags_and_status_flags",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_record_locks_check_modes_and_arguments",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_belongs_to_the_open_file_description",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_blocks_until_unlock_close_or_exit",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_blocks_until_unlock_last_close_or_exit",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_getlk_sees_split_ranges_and_offsets_from_seek_cur_and_end",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_refuses_a_deadlock",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_blocking_upgrade_gives_up_the_shared_lock_first",
+    "ktest:lumen_kernel::linux::process::process_close_releases_flock_on_last_slot_and_posix_locks_on_any",
+    "cargo:lumen-vfs",
+]
