@@ -3756,9 +3756,16 @@ their sum is at most `APP_OVERHEAD`, which `APP_WORST` charges.
 
 `lumen_app_api::limits::APP_WORST` is their sum, and a `const`
 assertion checks `MAX_APPS × APP_WORST <= APP_BUDGET`, so there is no
-runtime counter: holding a slot is holding its worst case. `APP_BUDGET`
-is well below the guests' RAM (`qemu.py` and `make run` give 256 MiB,
-which leave the frame allocator about 167 MiB). The runtime computes,
+runtime counter: holding a slot is holding its worst case.
+`KERNEL_RESERVE` plus four worst cases is right at what the frame
+allocator owns on the guests, though:
+`qemu.py`'s default and `make run` give 256 MiB, which left the frame
+allocator 39,393 to 39,444 frames in #278 (the kernel's ELF, debug info
+and embedded apps included, is reserved), right at the 39,440 (154.06
+MiB) four slots need, so such a guest gets 3 or 4 as the kernel's image
+moves. `test_run_refuses_past_max_apps` boots with 384 MiB
+(`boot(memory=...)`, 72,210 frames) and checks the slot count `mem`'s
+frames give before it fills them. The runtime computes,
 once (at the first `run`), `slots = min(MAX_APPS, (usable RAM −
 KERNEL_RESERVE) / APP_WORST)` (`lumen_app_api::limits::slots`), usable RAM
 being what the frame allocator owns, and `run` refuses past `slots` with

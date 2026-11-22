@@ -14,6 +14,7 @@ import pytest
 from lumen_harness import REPO_ROOT, qemu
 from lumen_harness.__main__ import debug_options, find_gdb, gdb_binary, gdb_command, run_options
 from lumen_harness.qemu import (
+    DEFAULT_MEMORY,
     Devices,
     ExpectTimeout,
     Machine,
@@ -160,6 +161,32 @@ def test_machine_appends_extra_args_last(tmp_path):
     assert args[args.index("-qmp") + 1] == f"unix:{m.qmp_path},server=on,wait=off"
     plain = qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
     assert "-smp" not in plain
+
+
+def dash_m(args: list[str]) -> list[str]:
+    """Every `-m` value in a command line."""
+    return [args[i + 1] for i, a in enumerate(args) if a == "-m"]
+
+
+def test_machine_memory_is_its_one_dash_m(tmp_path):
+    # (#278) A scenario sets the guest's RAM through `memory`: QEMU's one
+    # `-m`, never a second one appended; every other machine keeps the default.
+    m = Machine(Path("x.iso"), tmp_path, memory="384M")
+    assert dash_m(qemu_args(m.options(Path("v.fd")))) == ["384M"]
+    plain = qemu_args(Machine(Path("x.iso"), tmp_path).options(Path("v.fd")))
+    assert dash_m(plain) == [DEFAULT_MEMORY] == ["256M"]
+    # A `-m` in the extra args, in any spelling QEMU takes, is refused where
+    # the command line is built (`extra_args` is a public list).
+    for spelling in (["-m", "512M"], ["--m", "512M"], ["-m=512M"], ["--m=512M"]):
+        with pytest.raises(ValueError, match="not `-m` in extra args"):
+            qemu_args(opts(extra=spelling))
+        late = Machine(Path("x.iso"), tmp_path)
+        late.extra_args += spelling
+        with pytest.raises(ValueError, match="not `-m` in extra args"):
+            qemu_args(late.options(Path("v.fd")))
+    # Options that only start with an m are not it, nor `-M` (`-machine`).
+    others = ["-machine", "q35,hpet=off", "-mem-prealloc", "-M", "q35"]
+    assert dash_m(qemu_args(opts(extra=others))) == [DEFAULT_MEMORY]
 
 
 def test_trace_events_go_to_the_log_file(tmp_path):

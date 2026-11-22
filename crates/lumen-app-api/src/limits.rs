@@ -16,10 +16,14 @@ const MIB: u64 = 1024 * KIB;
 pub const APP_BUDGET: u64 = 128 * MIB;
 /// Apps running or loading at once.
 pub const MAX_APPS: usize = 4;
-/// Memory left to the kernel when a smaller machine gets fewer slots. The
-/// guests' 256 MiB leave the frame allocator about 167 MiB (the kernel's
-/// ELF, the boot structures and the firmware's reservations aside), which
-/// holds the kernel's few MiB and four worst cases with this to spare.
+/// Memory left to the kernel when a smaller machine gets fewer slots.
+/// [`MAX_APPS`] slots need the frame allocator to own this plus four worst
+/// cases (154.06 MiB, 39,440 frames). The guests' default 256 MiB leave it
+/// right at that line (39,393 to 39,444 frames measured in #278; aside: the
+/// kernel's ELF file (debug info and embedded apps with it), the boot
+/// structures and the firmware's reservations), 3 slots or 4 as the
+/// kernel's image moves, so the max-apps scenario boots with 384 MiB
+/// (72,210 frames owned, 282.07 MiB).
 pub const KERNEL_RESERVE: u64 = 32 * MIB;
 /// The largest module `run` takes.
 pub const MODULE_BYTES: usize = MIB as usize;
@@ -157,9 +161,17 @@ mod tests {
         // 16 MiB of memory, 1 of value stack, 8 of code, 2 of overhead and
         // three 640 × 480 surfaces: about 30.5 MiB.
         assert_eq!(APP_WORST, 27 * MIB + 3 * 640 * 480 * 4);
-        // Beside the kernel's reserve on what the guests' 256 MiB leave
-        // the frame allocator (166.7 MiB measured).
-        assert_eq!(slots(166 * MIB), MAX_APPS);
+        // All the slots from exactly the kernel's reserve and four worst
+        // cases (154.06 MiB), one fewer a byte short of it.
+        let all = KERNEL_RESERVE + MAX_APPS as u64 * APP_WORST;
+        assert_eq!(slots(all), MAX_APPS);
+        assert_eq!(slots(all - 1), MAX_APPS - 1);
+        // What the frame allocator owned in #278 (measured, in frames): on
+        // the guests' default 256 MiB, 39,393 (3 slots) and, a merge later,
+        // 39,444 (4); on the max-apps scenario's 384 MiB, 72,210 (all).
+        assert_eq!(slots(39_393 * 4 * KIB), 3);
+        assert_eq!(slots(39_444 * 4 * KIB), MAX_APPS);
+        assert_eq!(slots(72_210 * 4 * KIB), MAX_APPS);
     }
 
     #[test]

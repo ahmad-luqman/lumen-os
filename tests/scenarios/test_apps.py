@@ -21,9 +21,11 @@ import re
 import time
 
 from lumen_harness import REPO_ROOT, gui, klog
+from lumen_harness.app_limits import MAX_APPS, MIB, SLOTS_NEED, slots
 from lumen_harness.gui import parse_records, poll
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.klog import STAMP
+from lumen_harness.qemu import DEFAULT_MEMORY, DEFAULT_MEMORY_MIB
 from lumen_harness.screen import PROMPT
 from lumen_harness.shell import heap_line, run, wait_for_output
 
@@ -31,8 +33,8 @@ BOOT_TIMEOUT = 60
 STARTED = re.compile(r"^run: started (\S+) as app (\d+)$")
 
 
-def boot_shell(boot, extra=None):
-    m = boot("qemutest", extra=extra or [])
+def boot_shell(boot, extra=None, memory=DEFAULT_MEMORY):
+    m = boot("qemutest", extra=extra or [], memory=memory)
     m.expect(PROMPT, BOOT_TIMEOUT)
     return m
 
@@ -146,17 +148,47 @@ def test_busy_app_is_preempted(boot):
     wait_gone(m, busy, later["thread"])
 
 
+# The RAM the max-apps scenario boots with (#278): the default 256M leaves
+# the frame allocator right at `SLOTS_NEED`, 384M about four more worst
+# cases past it (KERNEL_RESERVE's comment in limits.rs has the figures).
+MAX_APPS_MEMORY = "384M"
+
+
+def frames_owned(m) -> int:
+    """What the frame allocator owns, in bytes, as `mem` prints it: what
+    `run` works its slots out from (`lumen_app_api::limits::slots`)."""
+    out = run(m, "mem | where area = frames | select size")
+    rows = parse_records(out, "size")
+    assert len(rows) == 1, out
+    return int(rows[0]["size"])
+
+
 def test_run_refuses_past_max_apps(boot):
-    m = boot_shell(boot)
-    ids = [start(m, "busy")[0] for _ in range(4)]
-    assert ids == [1, 2, 3, 4]
-    assert run(m, "run hello").strip() == "run: hello: 4 apps running already"
+    m = boot_shell(boot, memory=MAX_APPS_MEMORY)
+    # From what `mem` prints: more than a default guest could own (so
+    # `MAX_APPS_MEMORY` reached QEMU), and every slot; or a failure saying
+    # how short it is.
+    owned = frames_owned(m)
+    count = slots(owned)
+    assert owned > DEFAULT_MEMORY_MIB * MIB and count == MAX_APPS, (
+        f"the frame allocator owns {owned / MIB:.2f} MiB: {count} slots of {MAX_APPS} "
+        f"(they need {SLOTS_NEED / MIB:.2f} MiB), and {MAX_APPS_MEMORY} should give "
+        f"more than {DEFAULT_MEMORY_MIB} MiB"
+    )
+    ids = []
+    for _ in range(MAX_APPS):
+        out = run(m, "run busy").strip()
+        found = STARTED.match(out)
+        assert found, f"{out} (with {owned / MIB:.2f} MiB owned, {MAX_APPS} slots expected)"
+        ids.append(int(found[2]))
+    assert ids == list(range(1, MAX_APPS + 1))
+    assert run(m, "run hello").strip() == f"run: hello: {MAX_APPS} apps running already"
     record = app(m, ids[0])
     kill(m, ids[0], "busy")
     wait_gone(m, ids[0], record["thread"])
     # A slot again, and a new id (never a used one).
     again, mark = start(m, "hello")
-    assert again == 5
+    assert again == MAX_APPS + 1
     end_line(m, mark, "hello", again, "exited with 0")
     for app_id in ids[1:]:
         kill(m, app_id, "busy")

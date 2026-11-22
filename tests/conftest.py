@@ -22,6 +22,7 @@ import pytest
 from lumen_harness import BUILD_DIR, REPO_ROOT, artifact_dir, artifacts_root
 from lumen_harness.crash import BEGIN, END, PROTECTION_BROKEN
 from lumen_harness.qemu import (
+    DEFAULT_MEMORY,
     EXIT_CRASH,
     NO_DEVICES,
     Devices,
@@ -82,7 +83,8 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
     lets a reset boot the machine again (no `-no-reboot`). `devices` attaches
     virtio devices (`Devices(rng=True)`, `Devices.every()`), `cpu` sets the
     CPU model (`cpu="max"`), `com1_irq` puts COM1 on another ISA IRQ
-    (`com1_irq=3`)."""
+    (`com1_irq=3`), `memory` sets the guest's RAM (default `DEFAULT_MEMORY`,
+    e.g. `memory="384M"`)."""
     machines: list[Machine] = []
 
     def _boot(
@@ -96,6 +98,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
         cpu: str | None = None,
         com1_irq: int | None = None,
         trace_events: Sequence[str] = (),
+        memory: str = DEFAULT_MEMORY,
     ) -> Machine:
         iso = ISOS[variant]
         if not iso.exists():
@@ -118,6 +121,7 @@ def boot(artifacts: Path) -> Iterator[Callable[..., Machine]]:
             cpu=cpu,
             com1_irq=com1_irq,
             trace_events=trace_events,
+            memory=memory,
         ).start()
         machines.append(m)
         return m

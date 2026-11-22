@@ -164,13 +164,25 @@ def timeout_scale() -> float:
     return scale
 
 
+# The guest's RAM (`-m`) unless set otherwise (`Machine`'s `memory`, the
+# `boot` fixture's).
+DEFAULT_MEMORY_MIB = 256
+DEFAULT_MEMORY = f"{DEFAULT_MEMORY_MIB}M"
+
+
+def sets_memory(arg: str) -> bool:
+    """Is `arg` QEMU's `-m` option, in any of the spellings QEMU takes
+    (`-m`, `--m`, fused with `=`)?"""
+    return arg in ("-m", "--m") or arg.startswith(("-m=", "--m="))
+
+
 @dataclass
 class QemuOptions:
     iso: Path
     vars_file: Path
     headless: bool = True
     accel: str = field(default_factory=default_accel)
-    memory: str = "256M"
+    memory: str = DEFAULT_MEMORY
     serial: str = "stdio"
     # COM1 on this ISA IRQ instead of its own 4 (QEMU's `isa-serial` with
     # `irq=`; with `serial="stdio"` only): the interrupt never reaches the
@@ -470,6 +482,10 @@ def _serial_args(o: QemuOptions) -> list[str]:
 
 
 def qemu_args(o: QemuOptions) -> list[str]:
+    # The guest's RAM is `o.memory`, QEMU's one `-m`: a second one in
+    # `extra` would win silently.
+    if any(sets_memory(a) for a in o.extra):
+        raise ValueError("the guest's RAM goes in `memory`, not `-m` in extra args")
     args = [
         qemu_binary(),
         "-machine", "q35",
@@ -554,6 +570,7 @@ class Machine:
         cpu: str | None = None,
         com1_irq: int | None = None,
         trace_events: Sequence[str] = (),
+        memory: str = DEFAULT_MEMORY,
     ):
         # Read once, before anything starts: a value timeout_scale() rejects fails
         # here, not in the first expect() or wait_exit(). (One so large that it
@@ -564,6 +581,9 @@ class Machine:
         self.trace_interrupts = trace_interrupts
         # Appended to the command line, e.g. ["-smp", "2"].
         self.extra_args = list(extra_args)
+        # The guest's RAM, QEMU's `-m` (e.g. "384M"; default `DEFAULT_MEMORY`):
+        # set here, never with a `-m` in `extra_args` (`qemu_args` refuses one).
+        self.memory = memory
         # False: no serial port at all (`-serial none`: q35 then has no COM1),
         # so nothing from the guest arrives for expect() (QEMU's own messages
         # still do); drive it with the keyboard and read the screen through
@@ -750,6 +770,7 @@ class Machine:
         return QemuOptions(
             iso=self.iso,
             vars_file=vars_file,
+            memory=self.memory,
             qmp_socket=self.qmp_path,
             log_file=self.artifacts / "qemu.log",
             trace=trace,
