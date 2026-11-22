@@ -15,22 +15,20 @@
 //! signal ends a wait (M7 delivers none, so no `EINTR`).
 
 use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::at::{self, Fd, UserPtr};
+use super::fd::vfs;
 use super::finish;
 use crate::linux::process::{self, FileRef, with_current};
 use crate::linux::{errno, general};
 use crate::sync::SpinLock;
 use crate::user::{copy_from_user, copy_to_user};
-use lumen_vfs::locks::fcntl_const;
+use lumen_vfs::locks::{MAX_DEADLOCK_CHAIN, fcntl_const};
 use lumen_vfs::{
-    AdvisoryLocks, FlockOp, FlockSpec, LockContext, LockOutcome, PosixWaitGraph, RecordLockOutcome, VfsError, VfsLock,
+    AdvisoryLocks, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixWaitGraph, RecordLockOutcome, VfsError, VfsLock,
+    WaitSearch,
 };
-
-/// A VFS error as the positive errno a handler returns.
-fn vfs(e: VfsError) -> u32 {
-    e.to_errno()
-}
 
 /// The size of Linux x86-64's `struct flock` (its offsets pinned by
 /// `m7_abi_constants_match_spec`): `l_type` (`i16`) at 0, `l_whence`
@@ -83,16 +81,26 @@ fn lock_context(file: &FileRef, spec: &FlockSpec) -> Result<LockContext, u32> {
 }
 
 /// Run `f` on `file`'s inode's lock table (its Lock 4): what `f` returned,
-/// or the filesystem's refusal. A filesystem that says yes without running
-/// `f` is a bug in it: logged, and `EIO`.
+/// or the filesystem's refusal. `VfsInode::with_locks_mut` is `Err` only
+/// if `f` didn't run; if `f` ran, its result is used whatever the call
+/// said (a release it made must still wake the waiters), and a filesystem
+/// breaking that contract is logged. One that says yes without running `f`
+/// is a bug in it too: logged, and `EIO`.
 fn with_locks<T>(file: &FileRef, mut f: impl FnMut(&mut AdvisoryLocks) -> Result<T, VfsError>) -> Result<T, u32> {
     let mut out = None;
-    file.inode.with_locks_mut(&mut |locks| out = Some(f(locks))).map_err(vfs)?;
-    let Some(out) = out else {
-        log::error!(target: "linux", "{}: with_locks_mut returned without running its closure", file.path);
-        return Err(errno::EIO);
-    };
-    out.map_err(vfs)
+    let called = file.inode.with_locks_mut(&mut |locks| out = Some(f(locks)));
+    match (out, called) {
+        (Some(out), Ok(())) => out.map_err(vfs),
+        (Some(out), Err(e)) => {
+            log::error!(target: "linux", "{}: with_locks_mut ran its closure but returned {e:?}", file.path);
+            out.map_err(vfs)
+        }
+        (None, Err(e)) => Err(vfs(e)),
+        (None, Ok(())) => {
+            log::error!(target: "linux", "{}: with_locks_mut returned without running its closure", file.path);
+            Err(errno::EIO)
+        }
+    }
 }
 
 /// One try at a lock, under the inode's lock.
@@ -106,18 +114,16 @@ enum Step<H> {
 }
 
 /// Take a lock with `attempt`, waiting for a release and trying again while
-/// it says `Wait`. `before_wait(holder, seen, first)` runs outside the
-/// inode's lock before each wait (`first`: the call's first) and may refuse
-/// it (`EDEADLK`). The release count (`seen`) is read before each try, so a
-/// release between a try and the wait ends the wait at once. A try that
-/// released something wakes the waiters, which retry (and wait again if
-/// they still conflict).
+/// it says `Wait`. `before_wait(holder, seen)` runs outside the inode's lock
+/// before each wait and may refuse it (`EDEADLK`). The release count
+/// (`seen`) is read before each try, so a release between a try and the
+/// wait ends the wait at once. A try that released something wakes the
+/// waiters, which retry (and wait again if they still conflict).
 fn lock_or_wait<H: Copy>(
     file: &FileRef,
     mut attempt: impl FnMut(&mut AdvisoryLocks) -> Result<Step<H>, VfsError>,
-    mut before_wait: impl FnMut(H, u64, bool) -> Result<(), u32>,
+    mut before_wait: impl FnMut(H, u64) -> Result<(), u32>,
 ) -> Result<(), u32> {
-    let mut first = true;
     loop {
         let seen = process::lock_releases();
         let step = with_locks(file, &mut attempt)?;
@@ -125,19 +131,14 @@ fn lock_or_wait<H: Copy>(
         if matches!(step, Step::Wait { .. }) {
             ktest_window::hold();
         }
+        let (Step::Done { released } | Step::Wait { released, .. }) = step;
+        if released {
+            process::locks_released();
+        }
         match step {
-            Step::Done { released } => {
-                if released {
-                    process::locks_released();
-                }
-                return Ok(());
-            }
-            Step::Wait { released, holder } => {
-                if released {
-                    process::locks_released();
-                }
-                before_wait(holder, seen, first)?;
-                first = false;
+            Step::Done { .. } => return Ok(()),
+            Step::Wait { holder, .. } => {
+                before_wait(holder, seen)?;
                 process::wait_for_lock_release(seen);
             }
         }
@@ -154,15 +155,55 @@ static POSIX_WAITERS: SpinLock<PosixWaitGraph> = SpinLock::new(PosixWaitGraph::n
 /// Record that `pid` is about to wait for `holder`'s POSIX lock, its try
 /// having failed with the release count at `seen`, unless that closes a
 /// cycle of waiting processes: `EDEADLK`, as Linux. lumen-vfs's
-/// `PosixWaitGraph::wait_for` has the rules (one holder per waiter, as
-/// Linux's single `fl_blocker`; records older than the last release, and a
-/// caller whose own `seen` is, never followed). The count is read under
-/// `POSIX_WAITERS`, so of two processes about to wait for each other with a
-/// current view, the second is refused.
-fn record_wait_unless_deadlock(pid: u32, holder: u32, seen: u64) -> Result<(), u32> {
+/// `PosixWaitGraph::wait_for` has the rules: one holder per waiter, as
+/// Linux's single `fl_blocker`; a record older than the last release is
+/// never followed; a caller whose own `seen` is stale is neither checked
+/// nor recorded (`WaitSearch::StaleCaller`: its wait ends at once and it
+/// retries). The count is read under `POSIX_WAITERS`, so of two processes
+/// about to wait for each other with a current view, the second is refused.
+fn record_wait_unless_deadlock(pid: u32, holder: u32, seen: u64) -> Result<WaitSearch, u32> {
     let mut graph = POSIX_WAITERS.lock();
     let now = process::lock_releases();
     graph.wait_for(pid, holder, seen, now).map_err(|_| errno::EDEADLK)
+}
+
+/// Whether a deadlock search has been cut off at `MAX_DEADLOCK_CHAIN`
+/// (warned about once a boot).
+static WARNED_TRUNCATED: AtomicBool = AtomicBool::new(false);
+
+/// What `F_SETLKW`'s wait decision says in the log: a debug line once the
+/// wait is decided (not before: an `EDEADLK` isn't a wait), the first time
+/// and whenever the holder changes; `EDEADLK` at debug too; and a warning,
+/// once a boot, when the cycle search was cut off (a longer cycle would
+/// hang every process in it, with no signal to end it).
+fn log_wait_decision(
+    pid: u32,
+    file: &FileRef,
+    holder: u32,
+    decided: Result<WaitSearch, u32>,
+    logged: &mut Option<u32>,
+) -> Result<(), u32> {
+    match decided {
+        Ok(WaitSearch::StaleCaller) => Ok(()),
+        Ok(search) => {
+            if search == WaitSearch::Truncated && !WARNED_TRUNCATED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    target: "linux",
+                    "pid {pid}: F_SETLKW's deadlock search stopped after {MAX_DEADLOCK_CHAIN} waiting processes; \
+                     a longer cycle would never be broken"
+                );
+            }
+            if *logged != Some(holder) {
+                log::debug!(target: "linux", "pid {pid}: F_SETLKW on {} waits for pid {holder}", file.path);
+                *logged = Some(holder);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            log::debug!(target: "linux", "pid {pid}: F_SETLKW on {}: EDEADLK (pid {holder} waits for it)", file.path);
+            Err(e)
+        }
+    }
 }
 
 /// `fcntl(fd, cmd, arg)` (72).
@@ -213,8 +254,8 @@ fn fcntl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
 /// one described, written back over it (`l_whence` `SEEK_SET`, `l_len` 0
 /// for a lock to the end, the owner's pid), or `l_type` set to `F_UNLCK`
 /// and the rest left as given. The access mode isn't checked (Linux
-/// doesn't); an `F_UNLCK` request is `-EINVAL`, a range past the largest
-/// offset `-EOVERFLOW`.
+/// doesn't); an `F_UNLCK` request is `-EINVAL` (checked first, as Linux),
+/// a range past the largest offset `-EOVERFLOW`.
 fn getlk(file: &FileRef, at: UserPtr) -> Result<u64, u32> {
     let mut flock = UserFlock::copy_in(at)?;
     let ctx = lock_context(file, &flock.spec)?;
@@ -229,14 +270,15 @@ fn getlk(file: &FileRef, at: UserPtr) -> Result<u64, u32> {
 /// `F_SETLK` (`-EAGAIN` on a conflict) and `F_SETLKW` (waits for it to
 /// go; `-EDEADLK` if the holder is waiting, directly or through other
 /// waiters, for this process): take, change or give up (`F_UNLCK`) the
-/// current process's lock on the range. A bad type or range is `-EINVAL`
-/// (`-EOVERFLOW` past the largest offset), checked before the access mode:
-/// `F_RDLCK` needs a readable descriptor and `F_WRLCK` a writable one
-/// (`-EBADF`).
+/// current process's lock on the range. Checked in Linux's order: the range
+/// (`-EINVAL`, `-EOVERFLOW` past the largest offset), then the type
+/// (`-EINVAL`), then the access mode: `F_RDLCK` needs a readable descriptor
+/// and `F_WRLCK` a writable one (`-EBADF`).
 fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
     let spec = UserFlock::copy_in(at)?.spec;
     let ctx = lock_context(file, &spec)?;
     let pid = with_current(|p| p.pid);
+    let mut logged = None;
     let result = lock_or_wait(
         file,
         |locks| {
@@ -245,11 +287,9 @@ fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
                 RecordLockOutcome::WouldBlock { holder } => Step::Wait { released: false, holder },
             })
         },
-        |holder, seen, first| {
-            if first {
-                log::debug!(target: "linux", "pid {pid}: F_SETLKW on {} waits for pid {holder}", file.path);
-            }
-            record_wait_unless_deadlock(pid, holder, seen)
+        |holder, seen| {
+            let decided = record_wait_unless_deadlock(pid, holder, seen);
+            log_wait_decision(pid, file, holder, decided, &mut logged)
         },
     );
     if blocking {
@@ -260,6 +300,9 @@ fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
     result.map(|()| 0)
 }
 
+/// Whether `flock(LOCK_MAND)` has been seen (reported once a boot).
+static SEEN_LOCK_MAND: AtomicBool = AtomicBool::new(false);
+
 /// `flock(fd, operation)` (73): `LOCK_SH`, `LOCK_EX` or `LOCK_UN`, maybe
 /// with `LOCK_NB`, on the descriptor's open file description; a held lock
 /// is converted in place when nothing conflicts. A conflict with `LOCK_NB`
@@ -268,34 +311,41 @@ fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
 /// description holds, as Linux does, so two holders of `LOCK_SH` both
 /// asking for `LOCK_EX` don't wait for each other for good: one gets it.
 ///
-/// As Linux (since 5.17): `LOCK_MAND` is ignored (0, whatever the fd), and
-/// the operation is checked (`-EINVAL`) before the descriptor (`-EBADF`;
-/// `O_PATH` too). No deadlock is detected (Linux finds none for `flock`
-/// either).
+/// As Linux (since 6.0): `LOCK_MAND` is ignored (0, whatever the fd;
+/// reported once a boot, as Linux's `pr_warn_once`, but at info: the
+/// ktests use it on purpose), and the operation is checked (`-EINVAL`)
+/// before the descriptor (`-EBADF`; `O_PATH` too). No deadlock is detected
+/// (Linux finds none for `flock` either).
 pub(super) fn sys_flock(fd: Fd, operation: u32) -> u64 {
     finish(flock(fd, operation))
 }
 
 fn flock(fd: Fd, operation: u32) -> Result<u64, u32> {
     if operation & general::LOCK_MAND != 0 {
+        if !SEEN_LOCK_MAND.swap(true, Ordering::Relaxed) {
+            let pid = with_current(|p| p.pid);
+            log::info!(target: "linux", "pid {pid}: flock with LOCK_MAND is ignored (no mandatory locks)");
+        }
         return Ok(0);
     }
     let op = FlockOp::from_raw(operation as i32).map_err(vfs)?;
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
     let id = file.id;
+    let mut logged = false;
     lock_or_wait(
         &file,
         |locks| {
             Ok(match locks.flock(id, op)? {
-                LockOutcome::Granted { released } => Step::Done { released },
-                LockOutcome::WouldBlock { released } => Step::Wait { released, holder: () },
+                FlockOutcome::Granted { released } => Step::Done { released },
+                FlockOutcome::WouldBlock { released } => Step::Wait { released, holder: () },
             })
         },
-        |(), _, first| {
-            if first {
+        |(), _| {
+            if !logged {
                 let pid = with_current(|p| p.pid);
                 log::debug!(target: "linux", "pid {pid}: flock on {} waits", file.path);
+                logged = true;
             }
             Ok(())
         },
@@ -354,12 +404,12 @@ mod ktest_window {
 
 #[cfg(feature = "ktest")]
 use {
-    super::fd::{ktest_user_path, sys_close, sys_lseek, sys_open, sys_write},
+    super::fd::{ktest_fd, ktest_flags, ktest_user_path, sys_close, sys_lseek, sys_open, sys_write},
     super::neg_errno,
     crate::ktest::TestResult,
     crate::sched,
     alloc::sync::Arc,
-    core::sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    core::sync::atomic::AtomicU32,
     lumen_vfs::OpenFlags,
 };
 
@@ -387,13 +437,7 @@ const KTEST_FLOOR_NS: u64 = 20_000_000;
 /// descriptor.
 #[cfg(feature = "ktest")]
 fn ktest_open(slot: u64, path: &[u8], flags: u32) -> Result<Fd, &'static str> {
-    let ret = sys_open(ktest_user_path(slot, path)?, OpenFlags::from_bits(flags), super::at::reg(0o644));
-    if ret < lumen_vfs::MAX_FDS as u64 { Ok(super::at::reg(ret)) } else { Err("the open failed") }
-}
-
-#[cfg(feature = "ktest")]
-fn ktest_fd(fd: u64) -> Fd {
-    super::at::reg(fd)
+    ktest_fd(sys_open(ktest_user_path(slot, path)?, ktest_flags(flags), at::reg(0o644)))
 }
 
 /// Write `bytes` at `fd`'s offset (through user memory): `write`'s result.
@@ -471,7 +515,7 @@ crate::ktest!(
             kassert_eq!(fd.raw(), 3);
             // F_DUPFD: the lowest free slot at or above the minimum.
             kassert_eq!(sys_fcntl(fd, general::F_DUPFD, 0), 4);
-            kassert_eq!(sys_close(ktest_fd(1)), 0);
+            kassert_eq!(sys_close(at::reg::<Fd>(1)), 0);
             kassert_eq!(sys_fcntl(fd, general::F_DUPFD, 0), 1);
             kassert_eq!(sys_fcntl(fd, general::F_DUPFD, 10), 10);
             kassert_eq!(sys_fcntl(fd, general::F_DUPFD, 10), 11);
@@ -491,15 +535,15 @@ crate::ktest!(
             // Close-on-exec: F_DUPFD_CLOEXEC sets it, F_DUPFD doesn't;
             // F_SETFD takes only the FD_CLOEXEC bit, per descriptor.
             kassert_eq!(sys_fcntl(fd, general::F_DUPFD_CLOEXEC, 5), 5);
-            kassert_eq!(sys_fcntl(ktest_fd(5), general::F_GETFD, 0), u64::from(general::FD_CLOEXEC));
-            kassert_eq!(sys_fcntl(ktest_fd(10), general::F_GETFD, 0), 0);
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(5), general::F_GETFD, 0), u64::from(general::FD_CLOEXEC));
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(10), general::F_GETFD, 0), 0);
             kassert_eq!(sys_fcntl(fd, general::F_GETFD, 0), 0);
-            kassert_eq!(sys_fcntl(ktest_fd(10), general::F_SETFD, u64::from(general::FD_CLOEXEC)), 0);
-            kassert_eq!(sys_fcntl(ktest_fd(10), general::F_GETFD, 0), u64::from(general::FD_CLOEXEC));
-            kassert_eq!(sys_fcntl(ktest_fd(11), general::F_GETFD, 0), 0);
-            kassert_eq!(sys_fcntl(ktest_fd(10), general::F_SETFD, 0xfe), 0);
-            kassert_eq!(sys_fcntl(ktest_fd(10), general::F_GETFD, 0), 0);
-            kassert_eq!(sys_fcntl(ktest_fd(5), general::F_SETFD, 0), 0);
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(10), general::F_SETFD, u64::from(general::FD_CLOEXEC)), 0);
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(10), general::F_GETFD, 0), u64::from(general::FD_CLOEXEC));
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(11), general::F_GETFD, 0), 0);
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(10), general::F_SETFD, 0xfe), 0);
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(10), general::F_GETFD, 0), 0);
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(5), general::F_SETFD, 0), 0);
             kassert_eq!(process::current_cloexec(5), Ok(false));
 
             // F_GETFL/F_SETFL: the access mode and O_APPEND, shared by the
@@ -510,7 +554,7 @@ crate::ktest!(
             kassert_eq!(sys_fcntl(fd, general::F_SETFL, u64::from(OpenFlags::O_APPEND)), 0);
             let append = u64::from(OpenFlags::O_RDWR | OpenFlags::O_APPEND);
             kassert_eq!(sys_fcntl(fd, general::F_GETFL, 0), append);
-            kassert_eq!(sys_fcntl(ktest_fd(4), general::F_GETFL, 0), append);
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(4), general::F_GETFL, 0), append);
             // With O_APPEND the write lands at the end, not at offset 0.
             kassert_eq!(ktest_write(fd, b"Z")?, 1);
             kassert_eq!(ktest_contents(fd)?, b"abcZ");
@@ -519,7 +563,7 @@ crate::ktest!(
             // truncation, still read-write); O_APPEND clears, O_NONBLOCK
             // sets.
             let ignored = OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC | OpenFlags::O_NONBLOCK;
-            kassert_eq!(sys_fcntl(ktest_fd(4), general::F_SETFL, u64::from(ignored)), 0);
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(4), general::F_SETFL, u64::from(ignored)), 0);
             kassert_eq!(sys_fcntl(fd, general::F_GETFL, 0), u64::from(OpenFlags::O_RDWR | OpenFlags::O_NONBLOCK));
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_SET), 0);
             kassert_eq!(ktest_write(fd, b"Y")?, 1);
@@ -527,9 +571,9 @@ crate::ktest!(
 
             // A bad descriptor: `-EBADF`; an unknown command: `-EINVAL`.
             for cmd in [general::F_DUPFD, general::F_GETFD, general::F_SETFD, general::F_GETFL, general::F_SETFL] {
-                kassert_eq!(sys_fcntl(ktest_fd(77), cmd, 0), neg_errno(errno::EBADF));
+                kassert_eq!(sys_fcntl(at::reg::<Fd>(77), cmd, 0), neg_errno(errno::EBADF));
             }
-            kassert_eq!(sys_fcntl(ktest_fd(77), 99, 0), neg_errno(errno::EBADF));
+            kassert_eq!(sys_fcntl(at::reg::<Fd>(77), 99, 0), neg_errno(errno::EBADF));
             kassert_eq!(sys_fcntl(fd, 99, 0), neg_errno(errno::EINVAL));
             kassert_eq!(sys_fcntl(fd, general::F_DUPFD_CLOEXEC + 50, 0), neg_errno(errno::EINVAL));
 
@@ -582,6 +626,9 @@ crate::ktest!(
             kassert_eq!(ktest_lk(rdonly, set, wr, seek_set, -1, 10)?, neg_errno(errno::EINVAL));
             kassert_eq!(ktest_lk(rdonly, set, wr, seek_set, i64::MAX, 2)?, neg_errno(errno::EOVERFLOW));
             kassert_eq!(ktest_lk(wronly, set, 3, seek_set, 0, 10)?, neg_errno(errno::EINVAL));
+            // The range comes before the type, as Linux (`assign_type` last).
+            kassert_eq!(ktest_lk(wronly, set, 3, seek_set, i64::MAX, 2)?, neg_errno(errno::EOVERFLOW));
+            kassert_eq!(ktest_lk(wronly, set, 3, 7, 0, 10)?, neg_errno(errno::EINVAL));
             kassert_eq!(ktest_lk(rdonly, set, rd, seek_set, 0, 10)?, 0);
             kassert_eq!(ktest_lk(wronly, general::F_SETLKW, wr, seek_set, 5, 10)?, 0);
             // A process's own locks never conflict with each other, nor
@@ -605,7 +652,7 @@ crate::ktest!(
             // A bad pointer: `-EFAULT`; a bad descriptor: `-EBADF`.
             for cmd in [get, set, general::F_SETLKW] {
                 kassert_eq!(sys_fcntl(rdwr, cmd, 0), neg_errno(errno::EFAULT));
-                kassert_eq!(sys_fcntl(ktest_fd(77), cmd, KTEST_FLOCK_AT), neg_errno(errno::EBADF));
+                kassert_eq!(sys_fcntl(at::reg::<Fd>(77), cmd, KTEST_FLOCK_AT), neg_errno(errno::EBADF));
             }
             Ok(())
         });
@@ -625,7 +672,7 @@ crate::ktest!(
             // Another open of the same file, read-only (flock doesn't
             // care), and a dup of the first.
             let b = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
-            let a2 = ktest_fd(sys_fcntl(a, general::F_DUPFD, 10));
+            let a2 = ktest_fd(sys_fcntl(a, general::F_DUPFD, 10))?;
             kassert_eq!(a2.raw(), 10);
             kassert_eq!(sys_flock(a, ex), 0);
             // Another open file description conflicts, even in the same
@@ -652,18 +699,27 @@ crate::ktest!(
             // bad one too); LOCK_UN may carry LOCK_NB.
             for op in [0, sh | ex, nb, 16, sh | 16, un | ex, 1 << 31] {
                 kassert_eq!(sys_flock(b, op), neg_errno(errno::EINVAL));
-                kassert_eq!(sys_flock(ktest_fd(77), op), neg_errno(errno::EINVAL));
+                kassert_eq!(sys_flock(at::reg::<Fd>(77), op), neg_errno(errno::EINVAL));
             }
             kassert_eq!(sys_flock(b, un | nb), 0);
-            kassert_eq!(sys_flock(ktest_fd(77), sh), neg_errno(errno::EBADF));
+            kassert_eq!(sys_flock(at::reg::<Fd>(77), sh), neg_errno(errno::EBADF));
             // LOCK_MAND is ignored, whatever else is set and whatever the
             // descriptor: 0, and nothing locked.
             let mand = general::LOCK_MAND;
-            for (fd, op) in [(b, mand), (b, mand | ex), (ktest_fd(77), mand | sh), (b, mand | 16)] {
+            for (fd, op) in [(b, mand), (b, mand | ex), (at::reg::<Fd>(77), mand | sh), (b, mand | 16)] {
                 kassert_eq!(sys_flock(fd, op), 0);
             }
             let c = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_flock(c, ex | nb), 0);
+            // Reported once a boot (Linux's `pr_warn_once`), however often
+            // it comes: one log line for the four calls above (no other
+            // ktest uses LOCK_MAND).
+            let mut log = alloc::vec![0u8; crate::klog::RING_BYTES];
+            let (n, _) = crate::klog::copy_recent(&mut log);
+            let said = log[..n].split(|&b| b == b'\n').filter(|line| {
+                line.windows(b"flock with LOCK_MAND is ignored".len()).any(|w| w == b"flock with LOCK_MAND is ignored")
+            });
+            kassert_eq!(said.count(), 1);
             Ok(())
         });
         ktest_unlink(PATH);
@@ -862,7 +918,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
         move |baton| {
             let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             crate::kassert_eq!(sys_flock(fd, ex), 0);
-            let dup = ktest_fd(sys_fcntl(fd, general::F_DUPFD, 10));
+            let dup = ktest_fd(sys_fcntl(fd, general::F_DUPFD, 10))?;
             crate::kassert_eq!(dup.raw(), 10);
             baton.go(1);
             baton.wait_for(2, &baton.b_ended)?;
@@ -976,8 +1032,9 @@ crate::ktest!(
                 // waits until B's exit lets go of it). B has usually not run
                 // yet, so its record is still there, older than the unlock:
                 // it must not be followed. (Whether B ran first depends on
-                // the scheduler; `lock_fcntl_setlkw_retries_on_a_stale_view`
-                // pins the other order in a window.)
+                // the scheduler; the host test
+                // `posix_wait_graph_never_follows_a_record_older_than_the_last_release`
+                // pins the rule itself.)
                 crate::kassert_eq!(ktest_lk(fd, setw, wr, seek_set, 10, 10)?, 0);
                 crate::kassert!(baton.b_done.load(Ordering::SeqCst));
                 Ok(())
@@ -1191,7 +1248,7 @@ crate::ktest!(
 
 crate::ktest!(
     fn lock_fcntl_setlkw_retries_on_a_stale_view() {
-        // Review round 1's sequence, pinned with `ktest_window`: A holds
+        // A stale view pinned with `ktest_window`: A holds
         // [0, 10) and B [10, 20). B's F_SETLKW on A's range fails its try
         // and is held before its deadlock check. A unlocks [0, 10) and then
         // waits for B's range (recorded: A waits for B, at the new count).

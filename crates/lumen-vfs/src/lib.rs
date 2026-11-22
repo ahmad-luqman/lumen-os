@@ -35,8 +35,8 @@ pub use error::VfsError;
 pub use fd::{FdEntry, FdTable, LocalLock, OpenFile, OpenFileId, VfsLock};
 pub use fs::{FileSystem, OpenGuard, VfsInode};
 pub use locks::{
-    AdvisoryLocks, Deadlock, FlockKind, FlockOp, FlockSpec, LockContext, LockOutcome, MAX_DEADLOCK_CHAIN,
-    PosixLockType, PosixWaitGraph, RecordLockOutcome,
+    AdvisoryLocks, Deadlock, FlockKind, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixLockType, PosixWaitGraph,
+    RecordLockOutcome, WaitSearch,
 };
 pub use mount::{MountInfo, MountTable, SimpleVfsTables, VfsCacheOps};
 pub use ops::{

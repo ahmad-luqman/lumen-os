@@ -1,6 +1,8 @@
 //! Independent `flock(2)` and `fcntl(2)` POSIX byte-range advisory locks.
 //!
-//! Embedded per-inode inside Lock 4 (`VfsInode` mutex) in the kernel.
+//! [`AdvisoryLocks`] is embedded per inode inside Lock 4 (`VfsInode` mutex)
+//! in the kernel. [`PosixWaitGraph`] is kernel-wide (one for every inode,
+//! behind its own spinlock, never under Lock 4).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -129,7 +131,8 @@ pub struct LockContext {
 /// Taking a new lock, an upgrade, re-taking the same kind, or unlocking
 /// nothing releases nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LockOutcome {
+#[must_use = "a release must be followed by waking the blocked lockers"]
+pub enum FlockOutcome {
     /// Lock acquired, converted or unlocked immediately.
     Granted { released: bool },
     /// Blocking request (no `LOCK_NB`) that conflicts: wait and retry. As
@@ -141,6 +144,7 @@ pub enum LockOutcome {
 
 /// Result of an `F_SETLK`/`F_SETLKW` attempt that didn't fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a release must be followed by waking the blocked lockers"]
 pub enum RecordLockOutcome {
     /// Lock taken, changed or given up. `released`: the request gave up or
     /// weakened a range this pid held (an `F_UNLCK` over a held range, an
@@ -204,10 +208,10 @@ impl AdvisoryLocks {
     /// When `op.nonblock` is true and another `OpenFileId` conflicts, returns
     /// `Err(VfsError::Again)` while leaving any existing lock held by
     /// `file_id` intact (a deviation: Linux drops it first, as it does for a
-    /// blocking request, which this does too: see [`LockOutcome::WouldBlock`]).
-    pub fn flock(&mut self, file_id: OpenFileId, op: FlockOp) -> Result<LockOutcome, VfsError> {
+    /// blocking request, which this does too: see [`FlockOutcome::WouldBlock`]).
+    pub fn flock(&mut self, file_id: OpenFileId, op: FlockOp) -> Result<FlockOutcome, VfsError> {
         let Some(req_kind) = op.kind else {
-            return Ok(LockOutcome::Granted { released: self.release_flock(file_id) });
+            return Ok(FlockOutcome::Granted { released: self.release_flock(file_id) });
         };
 
         let conflict = self.flocks.iter().any(|&(other_id, other_kind)| match (req_kind, other_kind) {
@@ -220,7 +224,7 @@ impl AdvisoryLocks {
             if op.nonblock {
                 return Err(VfsError::Again);
             }
-            return Ok(LockOutcome::WouldBlock { released: self.release_flock(file_id) });
+            return Ok(FlockOutcome::WouldBlock { released: self.release_flock(file_id) });
         }
 
         let released = if let Some((_, kind)) = self.flocks.iter_mut().find(|(id, _)| *id == file_id) {
@@ -231,11 +235,13 @@ impl AdvisoryLocks {
             self.flocks.push((file_id, req_kind));
             false
         };
-        Ok(LockOutcome::Granted { released })
+        Ok(FlockOutcome::Granted { released })
     }
 
     /// Release any `flock(2)` held by `file_id` (e.g. on last FD close).
-    /// Returns `true` if a lock was present and removed.
+    /// Returns `true` if a lock was present and removed: the caller must
+    /// then wake the blocked lockers.
+    #[must_use = "a release must be followed by waking the blocked lockers"]
     pub fn release_flock(&mut self, file_id: OpenFileId) -> bool {
         if let Some(pos) = self.flocks.iter().position(|(id, _)| *id == file_id) {
             self.flocks.swap_remove(pos);
@@ -281,9 +287,12 @@ impl AdvisoryLocks {
 
     /// Apply `F_SETLK` (`blocking = false`) or `F_SETLKW` (`blocking = true`).
     ///
-    /// Checked in Linux's order: the lock type and the range (`Inval`,
-    /// `Overflow`) before the access mode (`BadF`; `F_UNLCK` needs none).
-    /// Callers must reject `O_PATH` descriptors with `-EBADF` beforehand.
+    /// Checked in Linux's order (`flock64_to_posix_lock`, then
+    /// `check_fmode_for_setlk`): the range first (`Inval` for a bad
+    /// `l_whence` or a start before 0, `Overflow` past the largest offset),
+    /// then the lock type (`Inval`), then the access mode (`BadF`;
+    /// `F_UNLCK` needs none). Callers must reject `O_PATH` descriptors with
+    /// `-EBADF` beforehand.
     pub fn setlk(
         &mut self,
         pid: u32,
@@ -291,8 +300,8 @@ impl AdvisoryLocks {
         ctx: LockContext,
         blocking: bool,
     ) -> Result<RecordLockOutcome, VfsError> {
-        let lock_type = PosixLockType::from_raw(spec.l_type)?;
         let (start, end) = normalize_range(&spec, ctx.cur_offset, ctx.file_size)?;
+        let lock_type = PosixLockType::from_raw(spec.l_type)?;
         match lock_type {
             PosixLockType::Read if !ctx.readable => return Err(VfsError::BadF),
             PosixLockType::Write if !ctx.writable => return Err(VfsError::BadF),
@@ -343,7 +352,9 @@ impl AdvisoryLocks {
 
     /// Release **all** POSIX record locks held by `pid` on this inode
     /// (mandated by POSIX when `pid` closes any FD referring to this inode).
-    /// Returns `true` if any locks were removed.
+    /// Returns `true` if any locks were removed: the caller must then wake
+    /// the blocked lockers.
+    #[must_use = "a release must be followed by waking the blocked lockers"]
     pub fn release_posix_for_pid(&mut self, pid: u32) -> bool {
         self.posix.remove(&pid).is_some()
     }
@@ -392,14 +403,34 @@ fn normalize_range(spec: &FlockSpec, cur_offset: u64, file_size: u64) -> Result<
     }
 }
 
-/// How many other processes' waits [`PosixWaitGraph::wait_for`] follows
-/// looking for a cycle back to the caller (Linux's `MAX_DEADLK_ITERATIONS`
-/// is 10 too): a cycle through more processes isn't found.
-pub const MAX_DEADLOCK_CHAIN: usize = 10;
+/// How many other processes' records [`PosixWaitGraph::wait_for`] follows
+/// looking for a cycle back to the caller: a cycle through up to this many
+/// other processes is found, one through more isn't (the search is then
+/// [`WaitSearch::Truncated`]). Linux's `posix_locks_deadlock` checks
+/// `i++ > MAX_DEADLK_ITERATIONS` (10) before each comparison, so it
+/// compares 11 blockers: the same reach.
+pub const MAX_DEADLOCK_CHAIN: usize = 11;
 
 /// `F_SETLKW` would wait in a cycle: `EDEADLK`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlock;
+
+/// What [`PosixWaitGraph::wait_for`] found, short of a cycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a truncated search may hide a deadlock: say so"]
+pub enum WaitSearch {
+    /// The chain ended (no record, or a stale one) without reaching the
+    /// caller: recorded.
+    Clear,
+    /// [`MAX_DEADLOCK_CHAIN`] records were followed and the chain went on:
+    /// recorded, but a cycle through more processes would hang every one of
+    /// them unseen.
+    Truncated,
+    /// The caller's own view is stale (`seen != now`): neither checked nor
+    /// recorded (its old record, if any, removed); its wait ends at once
+    /// and it retries.
+    StaleCaller,
+}
 
 /// A process blocked in `F_SETLKW`: who it waits for, and the release count
 /// its wait ends past.
@@ -416,12 +447,13 @@ struct WaitRecord {
 /// waiter's single `fl_blocker`, a cycle through a second holder of the
 /// same range isn't seen.
 ///
-/// The kernel keeps one behind a spinlock, with a count of lock releases:
-/// a waiter reads the count (`seen`) before its try, and its wait ends once
-/// the count moves past it. Records carry that `seen` and are stamped
-/// against the count now (`now`), passed in by the caller, so a record made
-/// before the last release (its waiter woken since, maybe about to get its
-/// lock) is never followed.
+/// One graph for every inode: the kernel keeps it behind a spinlock (not
+/// under any inode's Lock 4), with a count of lock releases. A waiter reads
+/// the count (`seen`) before its try, and its wait ends once the count
+/// moves past it. Each record is stamped with its waiter's `seen`, and is
+/// followed only while that equals the caller's `now` (the count when it
+/// checks, passed in): a record made before the last release (its waiter
+/// woken since, maybe about to get its lock) is never followed.
 #[derive(Debug, Default)]
 pub struct PosixWaitGraph {
     waits: BTreeMap<u32, WaitRecord>,
@@ -432,34 +464,45 @@ impl PosixWaitGraph {
         Self { waits: BTreeMap::new() }
     }
 
-    /// `pid` is about to wait for `holder` (its try having failed with the
-    /// release count at `seen`, which is `now` at this call): record it,
-    /// unless following `holder`'s current wait, its holder's, and so on
-    /// through at most [`MAX_DEADLOCK_CHAIN`] records leads back to `pid`
-    /// (`Err(Deadlock)`, nothing recorded).
+    /// `pid` is about to wait for `holder`, its try having failed with the
+    /// release count at `seen` (normally `now`, the count at this call):
+    /// record it, unless following `holder`'s record, its holder's, and so
+    /// on through at most [`MAX_DEADLOCK_CHAIN`] records leads back to
+    /// `pid` (`Err(Deadlock)`, nothing recorded). `Ok` says whether the
+    /// search reached the end of the chain ([`WaitSearch::Clear`]) or was
+    /// cut off ([`WaitSearch::Truncated`]).
     ///
     /// A caller whose own view is stale (`seen != now`: a release came
-    /// after its try) is neither checked nor recorded: its wait ends at once
-    /// and it retries with a fresh view. Checking it could follow a record
-    /// made after that release (by the very holder it saw, now waiting on
-    /// it in turn) and report a cycle that its fresh try wouldn't be in.
-    pub fn wait_for(&mut self, pid: u32, holder: u32, seen: u64, now: u64) -> Result<(), Deadlock> {
+    /// after its try) is neither checked nor recorded, and its old record
+    /// goes ([`WaitSearch::StaleCaller`]): its wait ends at once and it
+    /// retries with a fresh view. Checking it could follow a record made
+    /// after that release (by the very holder it saw, now waiting on it in
+    /// turn) and report a cycle that its fresh try wouldn't be in.
+    pub fn wait_for(&mut self, pid: u32, holder: u32, seen: u64, now: u64) -> Result<WaitSearch, Deadlock> {
         if seen != now {
             self.waits.remove(&pid);
-            return Ok(());
+            return Ok(WaitSearch::StaleCaller);
         }
+        let current =
+            |waits: &BTreeMap<u32, WaitRecord>, p: u32| waits.get(&p).filter(|w| w.seen == now).map(|w| w.holder);
+        // Compare `holder`, then each pid reached by following a record.
         let mut next = holder;
-        for _ in 0..=MAX_DEADLOCK_CHAIN {
+        let mut followed = 0;
+        let search = loop {
             if next == pid {
                 return Err(Deadlock);
             }
-            match self.waits.get(&next) {
-                Some(w) if w.seen == now => next = w.holder,
-                _ => break,
+            match current(&self.waits, next) {
+                None => break WaitSearch::Clear,
+                Some(_) if followed == MAX_DEADLOCK_CHAIN => break WaitSearch::Truncated,
+                Some(further) => {
+                    next = further;
+                    followed += 1;
+                }
             }
-        }
+        };
         self.waits.insert(pid, WaitRecord { holder, seen });
-        Ok(())
+        Ok(search)
     }
 
     /// `pid` no longer waits (its lock call returned).
@@ -467,7 +510,8 @@ impl PosixWaitGraph {
         self.waits.remove(&pid);
     }
 
-    /// Whether `pid` has a record (diagnostic / test helper).
+    /// Whether `pid` has a record (host tests).
+    #[cfg(test)]
     pub fn is_recorded(&self, pid: u32) -> bool {
         self.waits.contains_key(&pid)
     }

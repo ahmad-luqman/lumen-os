@@ -1311,11 +1311,11 @@ fn advisory_locks_flock_and_posix_independent_namespaces() {
     // 24. flock(2): shared, conflict on exclusive, atomic upgrade/downgrade
     assert_eq!(
         locks.flock(f1, FlockOp::from_raw(flock_const::LOCK_SH).unwrap()).unwrap(),
-        LockOutcome::Granted { released: false }
+        FlockOutcome::Granted { released: false }
     );
     assert_eq!(
         locks.flock(f2, FlockOp::from_raw(flock_const::LOCK_SH).unwrap()).unwrap(),
-        LockOutcome::Granted { released: false }
+        FlockOutcome::Granted { released: false }
     );
     // Upgrade f1 while f2 holds SH fails with EAGAIN under LOCK_NB AND preserves f1's SH!
     assert_eq!(
@@ -1326,7 +1326,7 @@ fn advisory_locks_flock_and_posix_independent_namespaces() {
     assert!(locks.release_flock(f2));
     assert_eq!(
         locks.flock(f1, FlockOp::from_raw(flock_const::LOCK_EX | flock_const::LOCK_NB).unwrap()).unwrap(),
-        LockOutcome::Granted { released: false }
+        FlockOutcome::Granted { released: false }
     );
     assert_eq!(
         locks.flock(f2, FlockOp::from_raw(flock_const::LOCK_SH | flock_const::LOCK_NB).unwrap()).unwrap_err(),
@@ -1335,11 +1335,11 @@ fn advisory_locks_flock_and_posix_independent_namespaces() {
     // Downgrade EX -> SH allows f2 SH
     assert_eq!(
         locks.flock(f1, FlockOp::from_raw(flock_const::LOCK_SH).unwrap()).unwrap(),
-        LockOutcome::Granted { released: true }
+        FlockOutcome::Granted { released: true }
     );
     assert_eq!(
         locks.flock(f2, FlockOp::from_raw(flock_const::LOCK_SH | flock_const::LOCK_NB).unwrap()).unwrap(),
-        LockOutcome::Granted { released: false }
+        FlockOutcome::Granted { released: false }
     );
 
     // 25. fcntl POSIX locks are independent of flock!
@@ -1417,7 +1417,7 @@ fn advisory_locks_flock_and_posix_independent_namespaces() {
     assert_eq!(probe.l_pid, 10);
 
     // pid 10 splits its own lock [80, 99] by unlocking [85, 89]
-    locks
+    let split = locks
         .setlk(
             10,
             FlockSpec {
@@ -1431,10 +1431,11 @@ fn advisory_locks_flock_and_posix_independent_namespaces() {
             false,
         )
         .unwrap();
+    assert_eq!(split, RecordLockOutcome::Granted { released: true });
     assert_eq!(locks.posix_lock_count(10), 2);
 
     // pid 10 re-locks [85, 89] with F_WRLCK -> coalesces back to 1 segment [80, 99]
-    locks
+    let relock = locks
         .setlk(
             10,
             FlockSpec {
@@ -1448,10 +1449,11 @@ fn advisory_locks_flock_and_posix_independent_namespaces() {
             false,
         )
         .unwrap();
+    assert_eq!(relock, RecordLockOutcome::Granted { released: false });
     assert_eq!(locks.posix_lock_count(10), 1);
 
     // Overwrite middle [85, 89] with F_RDLCK -> splits into 3 segments (WR, RD, WR)
-    locks
+    let downgrade = locks
         .setlk(
             10,
             FlockSpec {
@@ -1465,6 +1467,7 @@ fn advisory_locks_flock_and_posix_independent_namespaces() {
             false,
         )
         .unwrap();
+    assert_eq!(downgrade, RecordLockOutcome::Granted { released: true });
     assert_eq!(locks.posix_lock_count(10), 3);
 
     // Conflict for pid 20 on F_SETLK returns EAGAIN; F_SETLKW returns WouldBlock
@@ -1521,7 +1524,7 @@ fn flock_op(raw: i32) -> FlockOp {
 #[test]
 fn advisory_locks_flock_reports_what_it_released() {
     use flock_const::{LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN};
-    let granted = |released| Ok(LockOutcome::Granted { released });
+    let granted = |released| Ok(FlockOutcome::Granted { released });
     let mut locks = AdvisoryLocks::new();
     let (f1, f2, f3) = (OpenFileId(1), OpenFileId(2), OpenFileId(3));
 
@@ -1541,11 +1544,11 @@ fn advisory_locks_flock_reports_what_it_released() {
     // the exclusive lock.
     assert_eq!(locks.flock(f1, flock_op(LOCK_SH)), granted(false));
     assert_eq!(locks.flock(f2, flock_op(LOCK_SH)), granted(false));
-    assert_eq!(locks.flock(f1, flock_op(LOCK_EX)), Ok(LockOutcome::WouldBlock { released: true }));
+    assert_eq!(locks.flock(f1, flock_op(LOCK_EX)), Ok(FlockOutcome::WouldBlock { released: true }));
     assert_eq!(locks.flock_count(), 1);
     assert_eq!(locks.flock(f2, flock_op(LOCK_EX)), granted(false));
     // Waiting again, holding nothing now: nothing to drop.
-    assert_eq!(locks.flock(f1, flock_op(LOCK_EX)), Ok(LockOutcome::WouldBlock { released: false }));
+    assert_eq!(locks.flock(f1, flock_op(LOCK_EX)), Ok(FlockOutcome::WouldBlock { released: false }));
 
     // LOCK_NB keeps the held lock on a conflict (a deviation from Linux,
     // which drops it as it does for a blocking request).
@@ -1607,6 +1610,9 @@ fn advisory_locks_check_type_and_range_before_the_access_mode() {
 
     // Linux's order: the type and the range first, then the access mode.
     assert_eq!(locks.setlk(1, spec(9, SEEK_SET, 0, 1), ro, false), Err(VfsError::Inval));
+    // The range before the type, as Linux (`assign_type` comes last).
+    assert_eq!(locks.setlk(1, spec(9, SEEK_SET, i64::MAX, 2), ro, false), Err(VfsError::Overflow));
+    assert_eq!(locks.setlk(1, spec(9, SEEK_SET, -1, 1), ro, false), Err(VfsError::Inval));
     assert_eq!(locks.setlk(1, spec(F_WRLCK, 7, 0, 1), ro, false), Err(VfsError::Inval));
     assert_eq!(locks.setlk(1, spec(F_WRLCK, SEEK_SET, -1, 1), ro, false), Err(VfsError::Inval));
     assert_eq!(locks.setlk(1, spec(F_WRLCK, SEEK_SET, i64::MAX, 2), ro, false), Err(VfsError::Overflow));
@@ -1650,65 +1656,79 @@ fn advisory_locks_ranges_past_the_largest_offset_overflow() {
 fn posix_wait_graph_finds_two_and_three_process_cycles() {
     let mut g = PosixWaitGraph::new();
     // 1 waits for 2; 2 asking to wait for 1 closes the cycle.
-    assert_eq!(g.wait_for(1, 2, 7, 7), Ok(()));
+    assert_eq!(g.wait_for(1, 2, 7, 7), Ok(WaitSearch::Clear));
     assert_eq!(g.wait_for(2, 1, 7, 7), Err(Deadlock));
     assert!(!g.is_recorded(2));
     // 2 waits for 3 instead; 3 asking to wait for 1 closes 3 -> 1 -> 2 -> 3.
-    assert_eq!(g.wait_for(2, 3, 7, 7), Ok(()));
+    assert_eq!(g.wait_for(2, 3, 7, 7), Ok(WaitSearch::Clear));
     assert_eq!(g.wait_for(3, 1, 7, 7), Err(Deadlock));
     // Waiting for a process that doesn't wait is no cycle.
-    assert_eq!(g.wait_for(3, 4, 7, 7), Ok(()));
+    assert_eq!(g.wait_for(3, 4, 7, 7), Ok(WaitSearch::Clear));
     // 4 -> 2 -> 3 -> 4 is a cycle; once 1's call returns, 4 waiting for 1
     // isn't.
     assert_eq!(g.wait_for(4, 2, 7, 7), Err(Deadlock));
     g.done(1);
     assert!(!g.is_recorded(1));
-    assert_eq!(g.wait_for(4, 1, 7, 7), Ok(()));
+    assert_eq!(g.wait_for(4, 1, 7, 7), Ok(WaitSearch::Clear));
 }
 
 #[test]
-fn posix_wait_graph_follows_ten_records_and_not_eleven() {
+fn posix_wait_graph_follows_eleven_records_as_linux_and_reports_the_cut_off() {
     // `others` processes after the caller (pid 0), each waiting for the
-    // next and the last for the caller: found while there are at most
-    // MAX_DEADLOCK_CHAIN of them.
-    fn cycle_found(others: u32) -> bool {
+    // next and the last for the caller: what the caller's search answers.
+    // Found while there are at most MAX_DEADLOCK_CHAIN (11, as Linux's loop
+    // reaches) of them; past that the search is cut off, and says so.
+    fn caller_search(others: u32) -> Result<WaitSearch, Deadlock> {
         let mut g = PosixWaitGraph::new();
         for p in 1..others {
-            g.wait_for(p, p + 1, 1, 1).unwrap();
+            assert_eq!(g.wait_for(p, p + 1, 1, 1), Ok(WaitSearch::Clear));
         }
-        g.wait_for(others, 0, 1, 1).unwrap();
-        g.wait_for(0, 1, 1, 1) == Err(Deadlock)
+        assert_eq!(g.wait_for(others, 0, 1, 1), Ok(WaitSearch::Clear));
+        g.wait_for(0, 1, 1, 1)
     }
-    assert_eq!(MAX_DEADLOCK_CHAIN, 10);
-    assert!(cycle_found(1));
-    assert!(cycle_found(9));
-    assert!(cycle_found(10));
-    assert!(!cycle_found(11));
+    assert_eq!(crate::locks::MAX_DEADLOCK_CHAIN, 11);
+    assert_eq!(caller_search(1), Err(Deadlock));
+    assert_eq!(caller_search(10), Err(Deadlock));
+    assert_eq!(caller_search(11), Err(Deadlock));
+    assert_eq!(caller_search(12), Ok(WaitSearch::Truncated));
+    assert_eq!(caller_search(20), Ok(WaitSearch::Truncated));
+
+    // A chain (no cycle) of 11 records ahead ends within reach: clear; one
+    // record longer is cut off.
+    fn chain_search(len: u32) -> Result<WaitSearch, Deadlock> {
+        let mut g = PosixWaitGraph::new();
+        for p in 1..=len {
+            assert_eq!(g.wait_for(p, p + 1, 1, 1), Ok(WaitSearch::Clear));
+        }
+        g.wait_for(0, 1, 1, 1)
+    }
+    assert_eq!(chain_search(11), Ok(WaitSearch::Clear));
+    assert_eq!(chain_search(12), Ok(WaitSearch::Truncated));
 }
 
 #[test]
 fn posix_wait_graph_never_follows_a_record_older_than_the_last_release() {
     let mut g = PosixWaitGraph::new();
     // 1 -> 2 -> 3, recorded at count 4.
-    assert_eq!(g.wait_for(1, 2, 4, 4), Ok(()));
-    assert_eq!(g.wait_for(2, 3, 4, 4), Ok(()));
+    assert_eq!(g.wait_for(1, 2, 4, 4), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(2, 3, 4, 4), Ok(WaitSearch::Clear));
     // A release (count 5) woke 1 and 2. 3 waiting for 1 at count 5: 1's
     // record (made at 4) isn't followed, so no cycle is seen and 3 is
     // recorded.
-    assert_eq!(g.wait_for(3, 1, 5, 5), Ok(()));
+    assert_eq!(g.wait_for(3, 1, 5, 5), Ok(WaitSearch::Clear));
     // 1 and 2, retrying, still conflict and record themselves again at 5:
     // the second to close the cycle is refused.
-    assert_eq!(g.wait_for(1, 2, 5, 5), Ok(()));
+    assert_eq!(g.wait_for(1, 2, 5, 5), Ok(WaitSearch::Clear));
     assert_eq!(g.wait_for(2, 3, 5, 5), Err(Deadlock));
 
     // A stale link in the middle of a chain stops the walk there: 4 -> 1
     // -> 2 (recorded at 7, before the release that made the count 8) is no
     // cycle yet ...
     let mut g = PosixWaitGraph::new();
-    assert_eq!(g.wait_for(2, 3, 7, 7), Ok(()));
-    assert_eq!(g.wait_for(1, 2, 8, 8), Ok(()));
-    assert_eq!(g.wait_for(3, 4, 8, 8), Ok(()));
-    assert_eq!(g.wait_for(4, 1, 8, 8), Ok(()));
+    assert_eq!(g.wait_for(2, 3, 7, 7), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(1, 2, 8, 8), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(3, 4, 8, 8), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(4, 1, 8, 8), Ok(WaitSearch::Clear));
     // ... until 2, woken by that release, records itself again: then it
     // is the one closing 2 -> 3 -> 4 -> 1 -> 2.
     assert_eq!(g.wait_for(2, 3, 8, 8), Err(Deadlock));
@@ -1716,20 +1736,20 @@ fn posix_wait_graph_never_follows_a_record_older_than_the_last_release() {
 
 #[test]
 fn posix_wait_graph_neither_checks_nor_records_a_stale_caller() {
-    // Review round 1's sequence: B tried and saw A holding (count s = 3);
+    // B tried and saw A holding (count s = 3);
     // A unlocked (count 4) and now waits for B, recorded at 4. B, its view
     // stale, would follow A's record back to itself: instead it isn't
     // checked or recorded, and retries.
     let (a, b) = (1, 2);
     let mut g = PosixWaitGraph::new();
-    assert_eq!(g.wait_for(a, b, 4, 4), Ok(()));
-    assert_eq!(g.wait_for(b, a, 3, 4), Ok(()));
+    assert_eq!(g.wait_for(a, b, 4, 4), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(b, a, 3, 4), Ok(WaitSearch::StaleCaller));
     assert!(!g.is_recorded(b));
     // Its fresh try conflicting with A again would be a real cycle.
     assert_eq!(g.wait_for(b, a, 4, 4), Err(Deadlock));
     // A stale caller's own old record goes too.
-    assert_eq!(g.wait_for(3, 9, 4, 4), Ok(()));
-    assert_eq!(g.wait_for(3, 9, 4, 5), Ok(()));
+    assert_eq!(g.wait_for(3, 9, 4, 4), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(3, 9, 4, 5), Ok(WaitSearch::StaleCaller));
     assert!(!g.is_recorded(3));
 }
 

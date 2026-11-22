@@ -61,8 +61,7 @@ pub enum VfsError {
     NotEmpty,
     /// Too many levels of symbolic links (`ELOOP` = 40).
     Loop,
-    /// Value too large for defined data type (`EOVERFLOW` = 75): a lock
-    /// range past the largest offset.
+    /// Value too large for defined data type (`EOVERFLOW` = 75).
     Overflow,
     /// Operation not supported (`EOPNOTSUPP` = 95).
     OpNotSupp,
