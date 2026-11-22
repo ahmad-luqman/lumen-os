@@ -740,9 +740,10 @@ one is its own PR that updates that doc first.
   each tied to the kernel's text, and `unexpected_warnings`, a run's "no
   warning" check without them), `rootfs.py` (matched `e2fsprogs` discovery,
   per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, and
-  `llvm-readobj` dynamic musl ELF checks), `leaks.py` (`Leaks`: a `linux`
-  run's `leaked_frames` against what its files explain, plus a kernel
-  stack-window page table now and then, `STACK_TABLE_EVERY`).
+  `llvm-readobj` dynamic musl ELF checks), `leaks.py` (a `linux` run's
+  `leaked_frames` and the kernel stack window's page tables, one every
+  `STACK_TABLE_EVERY` processes: `start_stack_table`, after which a short
+  test's counts are exact, and `Leaks`, a long one's, allowing that table).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
   assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
   for #255's exit scenarios, and `libm7.so`).

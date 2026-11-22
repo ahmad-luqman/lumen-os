@@ -6,11 +6,15 @@ count one page table that no file explains. Each process's kernel stack is
 `mm::stack::STACK_SIZE` plus a guard page, at addresses never reused, so
 about every `STACK_TABLE_EVERY`th process maps a new L1 table (2 MiB of
 the stack window) that outlives it. Which run that lands on depends on how
-many threads the boot made, so `Leaks` allows the extra frame on any run,
-but only once in `STACK_TABLE_EVERY // 2` runs: a frame leaked by the same
-code path twice in a row still fails."""
+many threads the boot made. A test with fewer runs than that first runs
+`start_stack_table`, after which its counts are exact; one with more uses
+`Leaks`, which allows the extra frame on any run, but only once in
+`STACK_TABLE_EVERY // 2` runs: a frame leaked by the same code path twice in
+a row still fails."""
 
 import re
+
+from lumen_harness.shell import run
 
 # 2 MiB of the stack window per L1 table over a 64 KiB stack and its 4 KiB
 # guard page. Change it with `STACK_SIZE` in kernel/src/mm/stack.rs.
@@ -42,3 +46,18 @@ class Leaks:
             )
             self.last_extra = self.runs
         self.runs += 1
+
+
+def start_stack_table(m) -> int:
+    """Run `linux /bin/busybox true` (a rootfs's) until a run maps a new
+    stack-window page table (`leaked_frames=1`), at most
+    `STACK_TABLE_EVERY + 2` runs: the next `STACK_TABLE_EVERY - 1` processes
+    then map none, and their counts are exact. How many runs it took."""
+    for runs in range(1, STACK_TABLE_EVERY + 3):
+        out = run(m, "linux /bin/busybox true", 60).replace("\r\n", "\n")
+        done = out.splitlines()[-1] if out else ""
+        found = re.fullmatch(r"linux: /bin/busybox exit=0 leaked_frames=(-?\d+)", done)
+        assert found and found.group(1) in ("0", "1"), out
+        if found.group(1) == "1":
+            return runs
+    raise AssertionError(f"no stack-window page table in {STACK_TABLE_EVERY + 2} runs")
