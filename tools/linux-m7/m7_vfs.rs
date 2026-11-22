@@ -989,8 +989,8 @@ fn proc_fd(fd: i64) -> P {
 }
 
 /// Names are bytes (#268): a file, a directory and a symlink target that
-/// aren't UTF-8 are made, listed, looked up, renamed, read back through
-/// getcwd and `/proc/self/fd`, and removed.
+/// aren't UTF-8 are made, listed, looked up, renamed, hard-linked, read
+/// back through getcwd and `/proc/self/fd`, and removed.
 fn non_utf8(d: &[u8]) -> R {
     const FILE: &[u8] = b"\xff\xfe-file";
     const RENAMED: &[u8] = b"\x80-renamed";
@@ -1036,6 +1036,13 @@ fn non_utf8(d: &[u8]) -> R {
     eq("rename to another non-UTF-8 name", s2(nr::RENAME, file.at(), renamed.at()), 0)?;
     eq("the old name gone", st_err(lstat(&file)), -ENOENT)?;
     holds(&renamed, b"x")?;
+    // A hard link at another such name: the same inode, two links.
+    let hard = j(u.bytes(), b"\xe2\x82-link");
+    eq("link at a non-UTF-8 name", s2(nr::LINK, renamed.at(), hard.at()), 0)?;
+    let (a, b) = (st("lstat the file", lstat(&renamed))?, st("lstat its link", lstat(&hard))?);
+    eq("the link's inode", b.ino() as i64, a.ino() as i64)?;
+    eq("two links", a.nlink() as i64, 2)?;
+    eq("unlink the hard link", s1(nr::UNLINK, hard.at()), 0)?;
     eq("unlink it", s1(nr::UNLINK, renamed.at()), 0)?;
     eq("unlink the link", s1(nr::UNLINK, ln.at()), 0)?;
     eq("rmdir the non-UTF-8 directory", s1(nr::RMDIR, j(u.bytes(), DIR).at()), 0)?;

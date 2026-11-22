@@ -5631,7 +5631,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     name for UTF-8, so an ext4 entry whose name isn't is listed, looked up,
     unlinked and renamed like any other, and `getcwd` under it gives its
     bytes. Text shows a name through `lumen_vfs::Escaped` (UTF-8 as it is,
-    any other byte, a control character and `\` as `\xNN`, `\\`): logs,
+    an ASCII control character and a byte that isn't UTF-8 as `\xNN`, any other
+    character `char::escape_debug` escapes as `\u{..}`, `\` as `\\`): logs,
     `vfstest` and `ls` output; never lossily (U+FFFD would name another
     file). `/proc/<pid>/maps` prints the raw bytes, a newline as `\012`
     (Linux's `seq_path`). Two exceptions stay text: mount paths

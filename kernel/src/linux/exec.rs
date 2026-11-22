@@ -26,8 +26,9 @@ pub enum ExecError {
     Read { path: String, err: VfsError },
     /// The interpreter its `PT_INTERP` names could not be read.
     InterpRead { path: String, err: VfsError },
-    /// The interpreter's path is not UTF-8, so it names no file in the VFS
-    /// (`ENOENT`); `path` shows it lossily.
+    /// The interpreter's path is not UTF-8: exec paths stay text (the VFS
+    /// takes any bytes since #268, ARCHITECTURE section 9), so it is refused
+    /// as `ENOENT`; `path` shows it lossily.
     InterpPathNotUtf8 { path: String },
     /// The interpreter is not a loadable `ET_DYN` without its own
     /// `PT_INTERP` (`ELIBBAD`).
@@ -478,7 +479,7 @@ crate::ktest!(
         kassert_eq!(shown, Err(String::from("cannot read its interpreter '/no/such/ld-lumen.so': ENOENT (2)")));
         let dir = Exec::from_image(Cow::Owned(test_dynamic_main(ET_DYN, 0, b"/"))).map(|_| ());
         kassert_eq!(dir, Err(ExecError::InterpRead { path: String::from("/"), err: VfsError::Acces }));
-        // A path that is not UTF-8 names no file in the VFS, and says so.
+        // A path that is not UTF-8 is refused (exec paths stay text), and says so.
         let odd = test_exec(test_dynamic_main(ET_DYN, 0, b"/lib/\xffld.so"), Ok(Vec::new())).map(|_| ());
         kassert_eq!(odd, Err(ExecError::InterpPathNotUtf8 { path: String::from("/lib/\u{fffd}ld.so") }));
         kassert_eq!(odd.as_ref().map_err(ExecError::to_errno), Err(errno::ENOENT));

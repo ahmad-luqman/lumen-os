@@ -327,7 +327,10 @@ def test_posix_vfs_semantics(boot, tmp_path):
     not, O_NOFOLLOW), a trailing slash following a final symlink under
     O_NOFOLLOW, O_PATH descriptors, hard links and linkat's
     AT_SYMLINK_FOLLOW, unlink and rmdir while open, getdents64 (types,
-    d_ino, a small buffer's cursor, a moved directory's ".."),
+    d_ino, a small buffer's cursor, a moved directory's ".."), names that
+    aren't UTF-8 (#268: a file, a directory and a symlink target made,
+    listed, renamed, hard-linked, read back by getcwd and /proc/self/fd, and
+    removed),
     pread64/pwrite64 leaving the offset alone, stat/lstat/newfstatat/statx
     agreeing, chmod/chown/umask/utimensat (UTIME_NOW, UTIME_OMIT, a NULL
     path, a link), chdir/fchdir/getcwd (through a link, a renamed and a
