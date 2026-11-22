@@ -5497,12 +5497,13 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       Applying it per inode and per field, in memory, is Lumen's design,
       since `ext4plus` can't grow `i_extra_isize`. So `stat` before and after
       a flush or a remount agree.
-    - `ext4plus`'s `create_inode` sets a new inode's atime, mtime and ctime
-      before its `i_extra_isize`, so only their low 32 bits land.
+    - `ext4plus`'s `create_inode` sets a new inode's atime, mtime, ctime and
+      crtime before its `i_extra_isize`, so only the low 32 bits of the first
+      three land and nothing of `i_crtime` (0x90, past a 128-byte inode).
       `times::new_inode`, the adapter's one way to make an inode (`create`,
-      `mkdir`, `symlink`), sets them again before the inode is written and
-      linked. `i_crtime` stays 0 (`set_crtime` writes nothing before
-      `i_extra_isize` either); Lumen reports no btime.
+      `mkdir`, `symlink`), sets all four again before the inode is written
+      and linked, `i_crtime_extra` too when the inode reaches it (#303), so
+      Linux's `statx` shows the creation time. Lumen itself reports no btime.
     - A corrupt extra word whose nanoseconds are 1e9 or more is carried into
       the seconds by `ext4plus`, which can decode a different year than
       Linux does (base `0x7fff_ffff`, extra `0xffff_fffc`: 1901 here, 2038

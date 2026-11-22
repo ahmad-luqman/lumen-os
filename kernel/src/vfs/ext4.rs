@@ -342,13 +342,15 @@ mod times {
         }
     }
 
-    /// A new inode from `ext4plus`'s `create_inode`, with atime, mtime and
-    /// ctime `now` as it holds them. `create_inode` sets those times before
-    /// `i_extra_isize`, so it writes only their low 32 bits: no epoch (a time
-    /// past 2038 would read as 1901 to 1970) and no nanoseconds. They are set
-    /// again here; the caller's next write of the inode stores them, before
-    /// the inode is linked. `i_crtime` is left 0 (`ext4plus`'s `set_crtime`
-    /// writes nothing before `i_extra_isize` either); Lumen reports no btime.
+    /// A new inode from `ext4plus`'s `create_inode`, with atime, mtime,
+    /// ctime and crtime `now` as it holds them. `create_inode` sets those
+    /// times before `i_extra_isize`, so it writes only the low 32 bits of the
+    /// first three (no epoch: a time past 2038 would read as 1901 to 1970; no
+    /// nanoseconds) and nothing of crtime (`i_crtime` at 0x90 lies past a
+    /// 128-byte inode, so it stayed 0, read as 1970 by Linux's `statx`;
+    /// #303). They are set again here; the caller's next write of the inode
+    /// stores them, before the inode is linked. Lumen itself reports no
+    /// btime.
     pub(super) fn new_inode(
         ext4: &Ext4,
         file_type: FileType,
@@ -367,6 +369,13 @@ mod times {
         times.set_atime(now);
         times.modified(now);
         times.store(&mut disk);
+        // `set_crtime` writes `i_crtime` only when the inode reaches it, and
+        // `i_crtime_extra` (0x94) only when it reaches that too: ask a copy
+        // which, as `ExtraTimes::of` does for the others.
+        let mut probe = disk.clone();
+        let one = Duration::new(0, 1);
+        probe.set_crtime(one);
+        disk.set_crtime(time_to_disk(now, probe.crtime() == Some(one)));
         Ok(disk)
     }
 
@@ -4487,6 +4496,15 @@ pub(crate) mod ktest_util {
         Ok((u16::from_le_bytes([raw[0], raw[1]]), u16::from_le_bytes([raw[0x1a], raw[0x1b]])))
     }
 
+    /// Inode `ino`'s creation time as `ext4plus` reads it, `None` if the
+    /// inode is too small for `i_crtime`.
+    pub fn crtime(fs: &Ext4FileSystem, ino: u64) -> Result<Option<lumen_vfs::Timespec>, &'static str> {
+        let ino = u32::try_from(ino).ok().and_then(core::num::NonZeroU32::new).ok_or("inode number")?;
+        let inner = fs.shared.state.lock();
+        let disk = super::Inode::read(&inner.ext4, ino).map_err(|_| "inode read")?;
+        Ok(disk.crtime().map(lumen_vfs::ext4::time_from_disk))
+    }
+
     /// The ext4 inode behind `inode`.
     pub fn ext4_inode(inode: &Arc<dyn VfsInode>) -> Result<&super::Ext4Inode, &'static str> {
         inode.as_any().and_then(|a| a.downcast_ref::<super::Ext4Inode>()).ok_or("not an ext4 inode")
@@ -5048,6 +5066,56 @@ crate::ktest!(
         }
         let root = ro.root_inode().stat().map_err(|_| "ro root stat")?;
         kassert_eq!((root.mtime, root.ctime), (now, now));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_new_inodes_get_a_creation_time_that_survives_a_remount() {
+        // `ext4plus`'s `create_inode` sets `i_crtime` before `i_extra_isize`,
+        // so it wrote nothing and every inode Lumen made read as born in 1970
+        // on Linux (#303). `new_inode` sets it, epoch and nanoseconds
+        // included, and later writes of the inode keep it.
+        use self::ktest_util::*;
+        use crate::kassert_eq;
+        use lumen_vfs::ext4::time_from_disk;
+        let now = Timespec { sec: 2_208_988_800, nsec: 987_654_321 }; // 2040-01-01
+        let m = mount(build_1k_blockmap_image(128), 219)?;
+        set_clock(&m.fs, Some(now));
+        let long: alloc::string::String = core::iter::repeat_n('t', 100).collect();
+        let made = [
+            m.root.create(b"f", 0o644).map_err(|_| "create")?.ino(),
+            m.root.mkdir(b"d", 0o755).map_err(|_| "mkdir")?.ino(),
+            m.root.symlink(b"s", b"f").map_err(|_| "symlink")?.ino(),
+            m.root.symlink(b"l", long.as_bytes()).map_err(|_| "long symlink")?.ino(),
+        ];
+        // `i_crtime` and `i_crtime_extra` as stored: the base word signed,
+        // the extra word's epoch bits above it and its nanoseconds.
+        let raw_crtime = |img: &[u8], ino: u64| {
+            let at = |off: usize| u32::from_le_bytes(img[inode_off(ino) + off..][..4].try_into().unwrap());
+            let (base, extra) = (at(0x90), at(0x94));
+            time_from_disk(core::time::Duration::new((u64::from(extra & 3) << 32) | u64::from(base), extra >> 2))
+        };
+        m.fs.sync().map_err(|_| "fs sync")?;
+        let img = image(&m)?;
+        for &ino in &made {
+            kassert_eq!(raw_crtime(&img, ino), now);
+        }
+
+        // A later write and flush of each inode leave it as it was.
+        set_clock(&m.fs, Some(Timespec { sec: now.sec + 100, nsec: 5 }));
+        let f = m.root.lookup(b"f").map_err(|_| "lookup f")?;
+        f.write_at(0, b"data").map_err(|_| "write")?;
+        f.set_mode(0o600).map_err(|_| "chmod")?;
+        m.root.lookup(b"d").and_then(|d| d.create(b"inner", 0o644)).map_err(|_| "create d/inner")?;
+        m.root.link(b"f2", &f).map_err(|_| "link")?;
+        m.fs.sync().map_err(|_| "fs sync again")?;
+        let img = image(&m)?;
+        let ro = mount_ro_image(img.clone(), 220)?;
+        for &ino in &made {
+            kassert_eq!(raw_crtime(&img, ino), now);
+            kassert_eq!(crtime(&ro, ino)?, Some(now));
+        }
         Ok(())
     }
 );
