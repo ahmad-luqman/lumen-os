@@ -3533,8 +3533,12 @@ and, after it, releases the closing pid's POSIX record locks on the inode
 `flock` locks; `take_current` does the same for every descriptor when the
 process ends. `openat` checks for a free slot before it opens (a full
 table is `-EMFILE` before anything is created), and `getcwd` computes the
-path from the cwd's inode (`compute_cwd_path`). `chdir`, `fchdir`, `umask`
-and the other M7 numbers are still stubs (wave 3).
+path from the cwd's inode (`compute_cwd_path`). `chdir` and `fchdir` set
+the cwd (its kept path computed from the inode too, so relative `chdir`s
+never grow it), and `getdents64` lists a directory from its open file's
+`dir_cursor` (`d_off`: the cursor past each entry, an index in the
+filesystem's listing order); the other M7 numbers not yet wired are stubs
+(wave 3).
 
 The design #246 set out for this, and the behaviour of each rerouted call:
 Console FDs 0/1/2 become `OpenFile` entries backed by the process's `ConsoleIo`

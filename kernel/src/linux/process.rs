@@ -456,9 +456,7 @@ pub fn current_cwd() -> (Arc<dyn VfsInode>, Arc<str>) {
 }
 
 /// Make `cwd` the current process's working directory; the old one drops
-/// after `ACTIVE_PROCS` is released. (`chdir` and `fchdir` once they land;
-/// the ktests until then.)
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `chdir`/`fchdir` (#254's wave 3) call it
+/// after `ACTIVE_PROCS` is released (`chdir`, `fchdir`).
 pub fn set_current_cwd(cwd: Cwd) {
     let old = with_current_mut(|p| core::mem::replace(&mut p.cwd, cwd));
     drop(old);

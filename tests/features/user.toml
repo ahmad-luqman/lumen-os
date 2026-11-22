@@ -75,3 +75,16 @@ tests = [
     "scenario:test_linux_user::test_static_busybox_ash",
     "scenario:test_linux_user::test_syscall_bad_pointers_return_efault",
 ]
+
+[[feature]]
+name = "getdents64, chdir and fchdir (#254): linux_dirent64 records (8-byte aligned, d_type from the inode type, . and ..) resuming at the open file's dir_cursor across small buffers with each entry once, d_off for seekdir, lseek rewinding, a partial fill stopping before the entry that doesn't fit, -EINVAL for a buffer too small for one, -EFAULT keeping the position, -EBADF/-ENOTDIR, ending while entries come and go; on tmpfs, ext4, /proc and /dev; chdir and fchdir (O_PATH, O_DIRECTORY) moving relative paths and getcwd"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_lists_a_tmpfs_directory_exactly_once_across_small_buffers",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_types_on_proc_dev_and_ext4",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_refuses_bad_fds_buffers_and_small_counts",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_ends_while_entries_come_and_go",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_chdir_then_a_relative_open_and_getcwd",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_fchdir_takes_plain_o_directory_and_o_path_fds",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_handlers_take_their_registers_in_order",
+]

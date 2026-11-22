@@ -267,7 +267,6 @@ impl Start {
     }
 
     /// `resolve_path` from this start (the `stat` family, `access`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `newfstatat`/`statx`/`faccessat2` call it
     pub(super) fn resolve(&self, path: &UserPath, flags: ResolveFlags) -> Result<ResolvedPath, u32> {
         resolve_path(tables(), self.dir(), path.as_bytes(), flags).map_err(VfsError::to_errno)
     }
