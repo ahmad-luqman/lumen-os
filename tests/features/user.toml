@@ -77,6 +77,26 @@ tests = [
 ]
 
 [[feature]]
+name = "fcntl (F_DUPFD/F_DUPFD_CLOEXEC lowest free at or above the minimum, F_GETFD/F_SETFD, F_GETFL/F_SETFL changing only O_APPEND and O_NONBLOCK, F_GETLK/F_SETLK/F_SETLKW POSIX record locks: conflicts with the owner's pid, -EAGAIN, range splitting, SEEK_CUR/SEEK_END and negative lengths, -EINVAL and -EOVERFLOW before the access-mode -EBADF, a blocked F_SETLKW woken by unlock, by a downgrade, by the holder closing any fd of the file, or by its exit, a release between its try and its wait not lost; -EDEADLK for a cycle of waiters and never from a view older than the last release) and flock (per open file description, shared by dups, LOCK_NB -EWOULDBLOCK, the operation checked before the fd and LOCK_MAND ignored, a blocked LOCK_EX woken by LOCK_UN, the last close, or exit, a blocked LOCK_SH by a downgrade; a blocking upgrade giving up its shared lock first), O_PATH refused (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_dupfd_fd_flags_and_status_flags",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_record_locks_check_modes_and_arguments",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_belongs_to_the_open_file_description",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_blocks_until_unlock_close_or_exit",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_blocks_until_unlock_last_close_or_exit",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_getlk_sees_split_ranges_and_offsets_from_seek_cur_and_end",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_refuses_a_deadlock",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_blocking_upgrade_gives_up_the_shared_lock_first",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_reader_woken_by_a_downgrade",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_flock_shared_waiter_woken_by_a_downgrade",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_sees_a_release_between_its_try_and_its_wait",
+    "ktest:lumen_kernel::linux::syscall::lock::lock_fcntl_setlkw_retries_on_a_stale_view",
+    "ktest:lumen_kernel::linux::process::process_close_releases_flock_on_last_slot_and_posix_locks_on_any",
+    "cargo:lumen-vfs",
+]
+
+[[feature]]
 name = "pread64/pwrite64 at a given offset without moving the fd's (across a page and over 4 KiB, a hole past EOF reading as zeros, O_APPEND appending whatever the offset, also across chunks, a fault mid-transfer returning what moved, a disk read error as -EIO, a full tmpfs as a short write then -ENOSPC; in Linux's errno order: -EINVAL negative offsets, -EBADF, -ESPIPE on terminals, -EBADF directions, -EFAULT outside user space, -EINVAL past i64::MAX, -EISDIR), fsync/fdatasync writing an ext4 file through the block cache to the device (-EIO when writes or the cache's sync fail, the data written by the next sync; 0 on an open unlinked file; -EINVAL on terminals, devices and procfs; -EBADF on O_PATH), sync flushing every mounted filesystem and returning 0 though one fails, a filesystem over-reporting a chunk taken as -EIO, and their dispatch registers (#254)"
 milestone = "M7"
 tests = [
