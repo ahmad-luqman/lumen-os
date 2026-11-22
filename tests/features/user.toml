@@ -77,24 +77,28 @@ tests = [
 ]
 
 [[feature]]
-name = "mmap of a file descriptor and msync (#255): MAP_SHARED stores reaching the file, and the disk through msync(MS_SYNC) (MS_ASYNC accepted, writing nothing; MS_INVALIDATE accepted), on ext4 and tmpfs; MAP_PRIVATE copy-on-write through a read-only descriptor leaving the file alone; a mapping outliving close and unlink; Linux's errnos (EBADF for a bad or O_PATH descriptor; EINVAL for an unaligned offset, no length, MAP_HUGETLB or a bad map type; ENOMEM and EOVERFLOW for lengths past 2^64; EOPNOTSUPP for MAP_SHARED_VALIDATE with unknown flags or MAP_SYNC; EACCES for a descriptor not open for reading and for shared PROT_WRITE, mmap or mprotect, without O_RDWR; ENODEV for a directory, the console and /dev/null; EEXIST for MAP_FIXED_NOREPLACE over a mapping); /dev/zero as anonymous memory; msync's EINVAL and ENOMEM (unmapped parts) and 0 for empty and anonymous ranges; the anonymous path unchanged"
+name = "mmap of a file descriptor and msync (#255): MAP_SHARED stores reaching the file, and the disk's own bytes through msync(MS_SYNC), a hole's page too, and two files in one range (MS_ASYNC and MS_INVALIDATE accepted, writing nothing), on ext4 and tmpfs; a writeback error returned (EIO) before ENOMEM, the stores written once the disk works again; MAP_PRIVATE copy-on-write through a read-only descriptor leaving the file alone; a mapping outliving close and unlink; open(O_TRUNC) unmapping the caller's pages of the file (a touch then EFAULT); mmap and msync dispatched from their registers; Linux's errnos (EBADF for a bad or O_PATH descriptor; EINVAL for an unaligned offset, no length, MAP_HUGETLB, MAP_GROWSDOWN or a bad map type; ENOMEM for a length whose page rounding overflows; EOVERFLOW for an end in a regular file past i64::MAX; EOPNOTSUPP for MAP_SHARED_VALIDATE with unknown flags, MAP_SYNC or MAP_FIXED_NOREPLACE; EACCES for a descriptor not open for reading and for shared PROT_WRITE, mmap or mprotect, without O_RDWR; ENODEV for a directory, the console and /dev/null; EEXIST for MAP_FIXED_NOREPLACE over a mapping); /dev/zero as anonymous memory, placed as asked, at any offset; msync's EINVAL and ENOMEM (overflow, unmapped parts) and 0 for empty, wrapped and anonymous ranges; the anonymous path unchanged"
 milestone = "M7"
 tests = [
-    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_shared_fd_stores_reach_the_file_through_msync",
-    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_private_fd_copies_on_write_and_leaves_the_file_alone",
-    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_fd_outlives_close_and_unlink",
-    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_fd_refuses_with_linuxs_errnos",
-    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_dev_zero_is_anonymous_memory",
-    "ktest:lumen_kernel::linux::syscall::mem::mem_msync_checks_its_arguments_and_the_range",
-    "scenario:test_linux_user::test_static_busybox_ash",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_mmap_shared_fd_stores_reach_the_disk_through_msync",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_msync_returns_a_writeback_error_before_enomem",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_mmap_private_fd_copies_on_write_and_leaves_the_file_alone",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_mmap_fd_outlives_close_and_unlink",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_open_trunc_unmaps_the_callers_pages",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_mmap_fd_refuses_with_linuxs_errnos",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_mmap_dev_zero_is_anonymous_memory",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_msync_checks_its_arguments_and_the_range",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_dispatch_takes_mmap_and_msync_registers_in_order",
+    "scenario:test_linux_user::test_mmap_and_brk",
 ]
 
 [[feature]]
-name = "/proc/<pid>/maps names files (#255): a file mapping's line shows the file's device (major:minor in hex), inode number and path, ' (deleted)' once unlinked, a newline in the path as \\012; an executable loaded from a file names its segments' lines after it at their file offsets, its .bss past the file's bytes anonymous; names ([heap], [stack], paths) at column 73 as Linux pads them"
+name = "/proc/<pid>/maps names files (#255): a file mapping's line shows the file's device (major:minor in hex), inode number and path, ' (deleted)' once unlinked, a newline in the path as \\012; an executable loaded from a file, PIE or not, and its interpreter name their segments' lines after their files at their pages' file offsets (a segment starting mid-page at its first page's), their .bss past the file's bytes anonymous, the names trimmed where memory is unmapped or replaced; names ([heap], [stack], paths) after 73 characters as Linux pads them"
 milestone = "M7"
 tests = [
     "cargo:lumen-vm",
-    "ktest:lumen_kernel::linux::syscall::mem::mem_proc_maps_names_mapped_files_and_the_executable",
-    "ktest:lumen_kernel::linux::syscall::mem::mem_mmap_fd_outlives_close_and_unlink",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_proc_maps_names_mapped_files_and_the_executable",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_mmap_fd_outlives_close_and_unlink",
+    "ktest:lumen_kernel::linux::exec::dynamic_elf_maps_interp_and_sets_auxv",
     "ktest:lumen_kernel::vfs::tests::vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing",
 ]

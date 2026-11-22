@@ -687,14 +687,17 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   - `Backing::File(FileMapping { file_id: u64, offset: u64, shared: bool, may_write: bool })`
     (M7, designed in #246): `file_id` is the inode's `lock_id`
     (`user_vm::file_id_of`: unique across filesystems and fixed for the
-    inode's life, unlike `ino`), keying the open reference (an `OpenGuard`,
-    counted in `open_count`) held in `AddressSpace::mapped_files` (retained until **zero** VMAs reference
+    inode's life, unlike `ino`), keying the open reference (a `MappedFile`:
+    an `OpenGuard`, counted in `open_count`, cloned from the descriptor's
+    open file, and the path it was opened by, which `/proc/<pid>/maps`
+    shows) held in `AddressSpace::mapped_files` (retained until **zero** VMAs reference
     `file_id`, so splitting via `mprotect`/partial `munmap` never drops it early
     and closing the `fd` after `mmap` keeps the mapping valid per POSIX);
     `offset` is the page-aligned file byte offset at `Vma::start`; `shared`
     distinguishes `MAP_SHARED` (`true`) from `MAP_PRIVATE` CoW (`false`);
-    `may_write` (`VM_MAYWRITE`) is `true` for `MAP_PRIVATE` and
-    `open_flags.writable() && !fs.read_only()` for `MAP_SHARED`. In
+    `may_write` (`VM_MAYWRITE`) is `true` for `MAP_PRIVATE` and, for
+    `MAP_SHARED`, whether the descriptor is open `O_RDWR` (a read-only
+    mount can't have opened one: `EROFS`). In
     `VmaMap::protect`, requesting `PROT_WRITE` on a file VMA with
     `!fm.may_write` returns `VmError::Access` (mapped to `-EACCES` in
     `UserVmError::to_mprotect_errno`), preventing `mprotect` from upgrading an
@@ -840,7 +843,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
         `prot_to_attrs(vma.prot)` + `PTE_SHARED = 1` (preserving
         `vma.prot.exec()`), and flush the local TLB (`invlpg`).
     - Any other present fault returns `FaultResult::Invalid`.
-  - **`mprotect`, `munmap`, `ftruncate` invalidation, and `msync` with `PTE_SHARED`:**
+  - **`mprotect`, `munmap` and `ftruncate` invalidation with `PTE_SHARED`:**
     - `protect_user_range` operates **per leaf**: for every leaf with
       `PTE_SHARED = 1`, it **always** writes `WRITABLE = 0` (uniformly for both
       `MAP_PRIVATE` and `MAP_SHARED`, preserving CoW on `MAP_PRIVATE` and
@@ -860,7 +863,8 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       persist to `ext4` without requiring reverse-PTE walks in M7.
     - **Truncate shrink invalidation (`ftruncate`, `truncate`, `openat(O_TRUNC)`):**
       `AddressSpace::invalidate_file_from(file_id, new_size)` (built in
-      #255; the shrinks call it from wave 3);
+      #255; `openat(O_TRUNC)` calls it once the open's truncate has
+      returned, `syscall/fd.rs`; the other shrinks from wave 3);
       shrinking a file to `new_size` acquires `AddressSpace::inner` (Lock 1)
       **before** `VfsInode` (Lock 4) and unmaps all file-VMA PTEs covering
       `file_off >= align_up_page(new_size)` (in the unmap order above:
@@ -876,7 +880,11 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       `Weak<AddressSpace>` holders outside the inode lock and invalidate each in
       Lock 1 → Lock 4 order.)
     - `msync(addr, len, flags)` (syscall 26) returns `0` immediately on
-      `len == 0` (after validating page-aligned `addr` and valid `flags`),
+      `len == 0`, or a `len` within a page of 2^64 (Linux's rounding wraps
+      it to 0), after validating page-aligned `addr` and valid `flags`;
+      `-ENOMEM` when `addr + len` rounded up overflows, and for a range
+      partly unmapped (with `MS_SYNC`, after writing back the mapped
+      parts, a writeback error winning);
       succeeds as a no-op on `MAP_PRIVATE`/anonymous VMAs, and for `MAP_SHARED`
       VMAs with `MS_SYNC` writes back each mapped file's dirty pages
       (`VfsInode::sync(data_only)`: through `ext4` and its block cache's
@@ -3578,11 +3586,11 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 4 | `stat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, 0)` |
 | 6 | `lstat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW)` |
 | 8 | `lseek(fd, off, whence)` | `SEEK_SET` (0), `SEEK_CUR` (1), `SEEK_END` (2) on regular files, `/proc`, and `/dev/{null,zero,random,urandom}` (returning 0); on directories updates `OpenFile::dir_cursor` (`SEEK_SET` for `musl` `rewinddir`/`seekdir`); `-ESPIPE` on console/tty; `-EBADF` on `O_PATH`; rejects resulting negative offset with `-EINVAL` |
-| 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); masks `flags & MAP_TYPE` (`0x0f`) to select `MAP_SHARED` (1), `MAP_PRIVATE` (2), or `MAP_SHARED_VALIDATE` (3, rejecting unknown flags with `-EOPNOTSUPP`; any other `MAP_TYPE` → `-EINVAL`); ignores advisory `MAP_DENYWRITE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_STACK`; validates `off & 0xfff == 0`, `off + aligned_len` no overflow, `fd` open & readable (`-EBADF` if closed or `O_PATH`, `-EACCES` on `O_WRONLY` or `MAP_SHARED \| PROT_WRITE` on `O_RDONLY`/read-only fs), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); records `may_write` on `FileMapping` |
+| 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); masks `flags & MAP_TYPE` (`0x0f`) to select `MAP_SHARED` (1), `MAP_PRIVATE` (2), or `MAP_SHARED_VALIDATE` (3, rejecting unknown flags with `-EOPNOTSUPP`; any other `MAP_TYPE` → `-EINVAL`); `MAP_SYNC` and `MAP_FIXED_NOREPLACE` with `MAP_SHARED_VALIDATE` → `-EOPNOTSUPP`, as Linux's `LEGACY_MAP_MASK`; ignores advisory `MAP_DENYWRITE`/`MAP_EXECUTABLE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_NONBLOCK`/`MAP_STACK`/`MAP_LOCKED`/`MAP_UNINITIALIZED` and `MAP_32BIT`/`MAP_ABOVE4G`; `MAP_HUGETLB` → `-EINVAL`, and `MAP_GROWSDOWN` on a file → `-EINVAL`; validates `off & 0xfff == 0`, `len != 0` (`-EINVAL`), `len`'s page rounding (`-ENOMEM`), `off + aligned_len` at most `i64::MAX` for a regular file, 2^64 for a device (`-EOVERFLOW`), `fd` open & readable (`-EBADF` if closed or `O_PATH`, `-EACCES` on `O_WRONLY` or `MAP_SHARED \| PROT_WRITE` without `O_RDWR`), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); records `may_write` on `FileMapping` |
 | 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `-EINVAL` if `off < 0`, `-ESPIPE` on console/tty, `-EISDIR` on directories, `-EBADF` on `O_PATH` or non-readable fd |
 | 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); `-EINVAL` if `off < 0`, `-ESPIPE` on console/tty, `-EBADF` on `O_PATH` or non-writable fd |
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
-| 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` on any unmapped hole (after writing back the mapped parts); for `MS_SYNC`, writes back each `MAP_SHARED` file's dirty pages (a writable mapping keeps its pages dirty, section 5) through its filesystem and block cache to the device, with the address space's lock released |
+| 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` (or a `len` within a page of 2^64, which Linux's rounding wraps to 0) and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` when `addr + len` rounded up overflows and on any unmapped hole (with `MS_SYNC`, after writing back the mapped parts; a writeback error such as `-EIO` wins); for `MS_SYNC`, writes back each `MAP_SHARED` file's dirty pages (a writable mapping keeps its pages dirty, section 5) through its filesystem and block cache to the device, with the address space's lock released |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0) / `F_DUPFD_CLOEXEC` (1030) (`-EINVAL` if `arg < 0 \|\| arg >= MAX_FDS`, `-EMFILE` if no free slot in `[arg, MAX_FDS)`), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`; `-EBADF` on `O_PATH`), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped, checking open mode `F_WRLCK` → writable / `F_RDLCK` → readable else `-EBADF`, normalizing `l_len < 0`, section 9); unknown `cmd` returns `-EINVAL` |
 | 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; `-EBADF` on `O_PATH`; independent of `fcntl` POSIX locks); atomic upgrade/downgrade on same `OpenFileId`, `-EWOULDBLOCK` on conflict with `LOCK_NB`, released when last FD to the `OpenFile` closes |
 | 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs (and detached unlinked inodes as a no-op), `-EBADF` on `O_PATH`, and `-EINVAL` on non-syncable special devices (console/tty, `/dev/*`) |
@@ -5552,13 +5560,13 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     target.
   - `/proc/<pid>/maps` → strict Linux format
     `{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}` (followed by the name
-    only when named, at column 73 as Linux's `seq_pad` puts it, omitting the
+    only when named, after 73 characters as Linux's `seq_pad` puts it, omitting the
     trailing space on unnamed anonymous VMAs; `p` for private/anonymous, `s`
     for `MAP_SHARED`, `[heap]`, `[stack]`, or a file mapping's path (the one
     it was opened by, ` (deleted)` once unlinked) with the file's
     `dev_major:dev_minor` and `ino` read from its inode as the listing is
     made; the executable's and interpreter's segments, copied into anonymous
-    memory at load, are named by the ranges `AddressSpace::name_image`
+    memory at load, are named by the ranges the loader (`commit_loaded_elf`)
     records (each segment's file bytes, at its file offset; its `.bss`
     past them anonymous), trimmed by any unmap over them; the lines'
     formatting is `lumen_vm::maps`'s, host-tested), enabling `musl`'s `pthread_getattr_np` and runtime stack/mapping

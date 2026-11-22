@@ -236,7 +236,11 @@ one is its own PR that updates that doc first.
   #255), `munmap`/`mprotect`/`brk`, the page-fault paths (zero-fill, the
   page cache's pages, copy-on-write, dirty promotion, `FaultResult::BusError`),
   `invalidate_file_from`, teardown; `pinned_pages`, `writable_maps` and
-  `mapped_files`; `release_order`, the ktests' unmap-order recorder).
+  `mapped_files` (`MappedFile`: a mapping's open reference and path);
+  `map_place` and `map_anon_at`; `msync_files`, what `msync` writes back,
+  found under the lock; the images' maps names, `ImageFile`s recorded by
+  `commit_loaded_elf` and trimmed by unmaps; `format_maps`;
+  `release_order`, the ktests' unmap-order recorder).
   `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`), and X-ray's rings (#198: one per CPU; typed recorders for run-queue
   changes, handled device interrupts and `SpinLock`s that waited; `read`: either ring
@@ -376,7 +380,8 @@ one is its own PR that updates that doc first.
   struct layouts), `uname`'s payload and the `linux` command (`linux /path`
   from the VFS, `run_exec`: load, run, count frames, the path as `exe`);
   `linux/exec.rs` `Exec` (#255: a binary and its `PT_INTERP` interpreter
-  read and parsed once, `load` through `AddressSpace::from_images`;
+  read and parsed once, each with the `ImageFile` naming its maps lines
+  and giving its path, `load` through `AddressSpace::from_images`;
   `ExecError`, each read naming its file);
   `linux/process.rs` `ProcessState` (#254: the private 1024-slot FD table
   of `OpenFile`s, `install_current_fd`/`insert_current_fd`/`dup_current_fd`(`_from`)/
@@ -387,7 +392,9 @@ one is its own PR that updates that doc first.
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern) and the
   shared copy helpers, a module per cluster holding its handlers (`fd`,
-  `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, `proc`; `fd`
+  `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, with #255's
+  `mmap` of a descriptor and `msync` (ktests in `mem/tests.rs`), `proc`;
+  `fd`
   holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
   terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`), an M7
   syscall not yet implemented a stub (`not_implemented`: logged once,
@@ -506,7 +513,9 @@ one is its own PR that updates that doc first.
   by start in a `BTreeMap`: `map` with `MapPlace` hint/fixed/no-replace,
   `unmap`, `protect`, coalescing), the `Brk` cursor, and `maps`
   (`write_maps`: `/proc/<pid>/maps` lines, the heap split at the break's
-  edges, `[heap]`/`[stack]`) (host-tested).
+  edges, `[heap]`/`[stack]`, a file's device, inode and path, names padded
+  as Linux's `seq_pad`; `ImageRange`, an ELF image's named pages:
+  `from_segment`, `trim`) (host-tested).
 - `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
   `FileSystem`/`VfsInode` traits, the path and symlink resolver, the mount
   table and the Lock-9 inode and dentry caches, `OpenFile` and the `FdTable`
