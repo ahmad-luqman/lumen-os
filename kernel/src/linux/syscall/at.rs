@@ -126,7 +126,6 @@ impl Mode {
 
     /// What `mkdir` keeps (`mode & 0o1777`, Linux's `vfs_mkdir`): the
     /// permission bits and sticky, never setuid or setgid.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `mkdirat` (wave 3) calls it; the ktests until then
     pub(super) fn dir_perm(self) -> u16 {
         (self.0 & 0o1777) as u16
     }
@@ -274,7 +273,6 @@ impl Start {
 
     /// `mkdir_at` from this start (`mkdirat`): `mode`'s directory bits, less
     /// the process's umask.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `mkdirat` calls it
     pub(super) fn mkdir(&self, path: &UserPath, mode: Mode) -> Result<Arc<dyn VfsInode>, u32> {
         let umask = process::current_umask();
         mkdir_at(tables(), self.dir(), path.as_bytes(), mode.dir_perm(), umask).map_err(VfsError::to_errno)
@@ -282,27 +280,23 @@ impl Start {
 
     /// `unlink_at` from this start (`unlinkat`; `remove_dir` for
     /// `AT_REMOVEDIR`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `unlinkat` calls it
     pub(super) fn unlink(&self, path: &UserPath, remove_dir: bool) -> Result<(), u32> {
         unlink_at(tables(), self.dir(), path.as_bytes(), remove_dir).map_err(VfsError::to_errno)
     }
 
     /// `readlink_at` from this start (`readlinkat`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `readlinkat` calls it
     pub(super) fn readlink(&self, path: &UserPath) -> Result<Vec<u8>, u32> {
         readlink_at(tables(), self.dir(), path.as_bytes()).map_err(VfsError::to_errno)
     }
 
     /// `symlink_at` at `linkpath` from this start (`symlinkat`): `target` is
     /// stored as given, never resolved, so it takes no start.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `symlinkat` calls it
     pub(super) fn symlink(&self, target: &[u8], linkpath: &UserPath) -> Result<Arc<dyn VfsInode>, u32> {
         symlink_at(tables(), target, self.dir(), linkpath.as_bytes()).map_err(VfsError::to_errno)
     }
 
     /// `link_at` from `old`'s start to `new`'s (`linkat`; `follow` for
     /// `AT_SYMLINK_FOLLOW`, `empty` for `AT_EMPTY_PATH`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `linkat` calls it
     pub(super) fn link(
         old: &Start,
         old_path: &UserPath,
@@ -316,7 +310,6 @@ impl Start {
     }
 
     /// `rename_at2` from `old`'s start to `new`'s (`renameat2`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `renameat2` calls it
     pub(super) fn rename(
         old: &Start,
         old_path: &UserPath,
