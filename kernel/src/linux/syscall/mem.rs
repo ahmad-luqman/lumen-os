@@ -313,32 +313,45 @@ crate::ktest!(
         // `MAP_SHARED` of a descriptor open for reading and writing: stores
         // through the mapping are what the VFS's read path reads, and
         // `msync(MS_SYNC)` writes them to the disk: a fresh read-only mount
-        // of the ext4 volume reads them, where without it nothing wrote them.
+        // of the ext4 volume reads them, where after `MS_ASYNC` it still
+        // read the old bytes. The third page is a hole (no block on the
+        // disk until the writeback allocates one), and the range synced
+        // starts a page below the mapping: `ENOMEM` for that page, after
+        // the mapping is written back.
         use crate::kassert_eq;
         use crate::user::copy_to_user;
         use crate::vfs::page_cache::ktest_files::Ext4Volume;
-        let vol = Ext4Volume::new(180)?;
-        let original = ktest_pattern(3);
+        const P: u64 = PAGE_SIZE;
+        let vol = Arc::new(Ext4Volume::new(180)?);
+        let mut original = ktest_pattern(3);
         let f = ktest_file(&vol.root, "shared.bin", &original)?;
+        f.truncate(3 * P).map_err(|_| "truncate")?;
         f.sync(false).map_err(|_| "sync")?;
-        let disk = Arc::clone(&f);
+        original.resize(3 * P as usize, 0);
+        let mut expected = original.clone();
+        expected[10..24].copy_from_slice(b"through-memory");
+        expected[P as usize + 7..P as usize + 18].copy_from_slice(b"second-page");
+        expected[2 * P as usize + 1..2 * P as usize + 12].copy_from_slice(b"in-the-hole");
+        let (disk, volume) = (Arc::clone(&f), Arc::clone(&vol));
         crate::linux::process::in_test_process(move |_| {
+            let on_disk = |minor: u32| -> Result<alloc::vec::Vec<u8>, &'static str> {
+                let ro = volume.remount_ro(minor)?.lookup("shared.bin").map_err(|_| "ro lookup")?;
+                ktest_read(&ro, 0, 3 * P as usize)
+            };
             let fd = ktest_fd_on(&disk, "/ext4/shared.bin", lumen_vfs::OpenFlags::O_RDWR)?;
-            let va = ktest_map(2 * PAGE_SIZE, RW, SHARED, fd, 0)?;
+            let va = ktest_map(3 * P, RW, SHARED, fd, 0)?;
             copy_to_user(va + 10, b"through-memory").map_err(|_| "store")?;
-            copy_to_user(va + PAGE_SIZE + 7, b"second-page").map_err(|_| "store 2")?;
-            kassert_eq!(ktest_read(&disk, 10, 14)?, b"through-memory");
-            // MS_ASYNC: accepted, writes nothing; MS_SYNC with MS_INVALIDATE writes back.
-            kassert_eq!(sys_msync(va, 2 * PAGE_SIZE, general::MS_ASYNC as i32), 0);
-            kassert_eq!(sys_msync(va, 2 * PAGE_SIZE, (general::MS_SYNC | general::MS_INVALIDATE) as i32), 0);
-            kassert_eq!(sys_munmap(va, 2 * PAGE_SIZE), 0);
+            copy_to_user(va + P + 7, b"second-page").map_err(|_| "store 2")?;
+            copy_to_user(va + 2 * P + 1, b"in-the-hole").map_err(|_| "store 3")?;
+            crate::kassert!(ktest_read(&disk, 0, 3 * P as usize)? == expected);
+            kassert_eq!(sys_msync(va, 3 * P, general::MS_ASYNC as i32), 0);
+            crate::kassert!(on_disk(181)? == original);
+            let both = (general::MS_SYNC | general::MS_INVALIDATE) as i32;
+            kassert_eq!(sys_msync(va - P, 4 * P, both), neg_errno(errno::ENOMEM));
+            crate::kassert!(on_disk(182)? == expected);
+            kassert_eq!(sys_munmap(va, 3 * P), 0);
             Ok::<(), &'static str>(())
         })??;
-        let mut expected = original;
-        expected[10..24].copy_from_slice(b"through-memory");
-        expected[PAGE_SIZE as usize + 7..PAGE_SIZE as usize + 18].copy_from_slice(b"second-page");
-        let ro = vol.remount_ro(181)?.lookup("shared.bin").map_err(|_| "ro lookup")?;
-        crate::kassert!(ktest_read(&ro, 0, expected.len())? == expected);
 
         // On `/tmp` (tmpfs: nothing to write back; `msync` is still 0), from
         // a file offset of one page.
@@ -368,7 +381,7 @@ crate::ktest!(
         use crate::kassert_eq;
         use crate::user::{copy_from_user, copy_to_user};
         use crate::vfs::page_cache::ktest_files::Ext4Volume;
-        let vol = Ext4Volume::new(182)?;
+        let vol = Ext4Volume::new(184)?;
         let original = ktest_pattern(5);
         let f = ktest_file(&vol.root, "private.bin", &original)?;
         let mapped = Arc::clone(&f);
@@ -389,7 +402,7 @@ crate::ktest!(
             Ok::<(), &'static str>(())
         })??;
         f.sync(false).map_err(|_| "sync")?;
-        let ro = vol.remount_ro(183)?.lookup("private.bin").map_err(|_| "ro lookup")?;
+        let ro = vol.remount_ro(185)?.lookup("private.bin").map_err(|_| "ro lookup")?;
         crate::kassert!(ktest_read(&ro, 0, ktest_pattern(5).len())? == ktest_pattern(5));
         Ok(())
     }

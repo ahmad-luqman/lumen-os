@@ -639,7 +639,7 @@ read, then the page and its rights, or the level that is not present. It
 takes no locks; a table outside HHDM-mapped RAM ends the walk instead of
 being read, and if the walk itself faults the report still ends properly.
 
-### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, its core built in #255 (the in-kernel API: `AddressSpace::mmap_file`, the fault paths, `invalidate_file_from`; the `mmap(fd)` syscall, `msync` and `ftruncate`'s call come next), M7; CoW `fork` and shootdowns in M8)
+### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, its core built in #255 (the in-kernel API: `AddressSpace::mmap_file`, the fault paths, `invalidate_file_from`; then the `mmap(fd)` syscall and `msync`; `ftruncate`'s call comes next), M7; CoW `fork` and shootdowns in M8)
 
 Each user process owns an `AddressSpace` protected by a **sleeping,
 interrupt-enabled `SleepMutex`** (not an IRQ-off `SpinLock`—needed both for
@@ -878,9 +878,17 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - `msync(addr, len, flags)` (syscall 26) returns `0` immediately on
       `len == 0` (after validating page-aligned `addr` and valid `flags`),
       succeeds as a no-op on `MAP_PRIVATE`/anonymous VMAs, and for `MAP_SHARED`
-      VMAs sweeps `PTE_DIRTY` into `WritableMap::note_pte_dirty()` and (for `MS_SYNC`)
-      flushes those inodes' dirty pages through `ext4` and
-      `BlockDevice::flush()`.
+      VMAs with `MS_SYNC` writes back each mapped file's dirty pages
+      (`VfsInode::sync(data_only)`: through `ext4` and its block cache's
+      flush to the device). It reads no `PTE_DIRTY` bit: a page mapped
+      writable is dirty through its `writable_maps` count for as long as it
+      is (above), so the writeback writes every store made through the
+      mapping. `AddressSpace::msync_files` clones an open reference on each
+      such file under Lock 1 and the writeback runs after Lock 1 is
+      released (Lock 1 before Lock 4 would be in order, but disk writes
+      under it would stall the process's faults; Linux drops `mmap_lock`
+      around `vfs_fsync_range` likewise). `MS_ASYNC` and `MS_INVALIDATE`
+      write nothing.
 
   `PROT_NONE` VMAs reserve VA space without demand-paging on fault;
   `mprotect(..., PROT_NONE)` on already-populated pages preserves their
@@ -3574,7 +3582,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `-EINVAL` if `off < 0`, `-ESPIPE` on console/tty, `-EISDIR` on directories, `-EBADF` on `O_PATH` or non-readable fd |
 | 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); `-EINVAL` if `off < 0`, `-ESPIPE` on console/tty, `-EBADF` on `O_PATH` or non-writable fd |
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
-| 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` on any unmapped hole; sweeps `MAP_SHARED` PTE dirty bits into `PageCache` and, for `MS_SYNC`, writes back and issues `BlockDevice::flush()` |
+| 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` on any unmapped hole (after writing back the mapped parts); for `MS_SYNC`, writes back each `MAP_SHARED` file's dirty pages (a writable mapping keeps its pages dirty, section 5) through its filesystem and block cache to the device, with the address space's lock released |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0) / `F_DUPFD_CLOEXEC` (1030) (`-EINVAL` if `arg < 0 \|\| arg >= MAX_FDS`, `-EMFILE` if no free slot in `[arg, MAX_FDS)`), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`; `-EBADF` on `O_PATH`), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped, checking open mode `F_WRLCK` → writable / `F_RDLCK` → readable else `-EBADF`, normalizing `l_len < 0`, section 9); unknown `cmd` returns `-EINVAL` |
 | 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; `-EBADF` on `O_PATH`; independent of `fcntl` POSIX locks); atomic upgrade/downgrade on same `OpenFileId`, `-EWOULDBLOCK` on conflict with `LOCK_NB`, released when last FD to the `OpenFile` closes |
 | 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs (and detached unlinked inodes as a no-op), `-EBADF` on `O_PATH`, and `-EINVAL` on non-syncable special devices (console/tty, `/dev/*`) |
@@ -5543,12 +5551,17 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     resolves directly to `OpenFile::inode` rather than re-parsing the text
     target.
   - `/proc/<pid>/maps` → strict Linux format
-    `{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}` (followed by
-    `  {pathname}` only when named, omitting the trailing space on unnamed
-    anonymous VMAs; `p` for private/anonymous, `s` for `MAP_SHARED`, `[heap]`,
-    `[stack]`, or file/executable/interpreter path + `dev_major:dev_minor` +
-    `ino`; until file-backed `mmap` lands in #255, file-backed VMAs print
-    `00:00 0` with no path), enabling `musl`'s `pthread_getattr_np` and runtime stack/mapping
+    `{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}` (followed by the name
+    only when named, at column 73 as Linux's `seq_pad` puts it, omitting the
+    trailing space on unnamed anonymous VMAs; `p` for private/anonymous, `s`
+    for `MAP_SHARED`, `[heap]`, `[stack]`, or a file mapping's path (the one
+    it was opened by, ` (deleted)` once unlinked) with the file's
+    `dev_major:dev_minor` and `ino` read from its inode as the listing is
+    made; the executable's and interpreter's segments, copied into anonymous
+    memory at load, are named by the ranges `AddressSpace::name_image`
+    records (each segment's file bytes, at its file offset; its `.bss`
+    past them anonymous), trimmed by any unmap over them; the lines'
+    formatting is `lumen_vm::maps`'s, host-tested), enabling `musl`'s `pthread_getattr_np` and runtime stack/mapping
     discovery. Generated lock-order-safely by cloning `Arc<AddressSpace>` under
     `ACTIVE_PROCS`, releasing `ACTIVE_PROCS`, locking `AddressSpace::inner`
     (Lock 1) with no `VfsInode` lock held, formatting into a kernel buffer,
