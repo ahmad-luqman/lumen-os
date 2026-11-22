@@ -532,7 +532,9 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     let start = at::start_dir(dirfd, &path)?;
     let opened = start.open(&path, flags, mode)?;
     let mut file = OpenFile::from_opened(opened).map_err(vfs)?;
-    if flags.has_trunc() && file.inode.inode_type() == InodeType::File {
+    // Exactly when `open_inode_guarded` truncated: `O_TRUNC` on a regular
+    // file, not `O_PATH` (which opens without truncating).
+    if flags.has_trunc() && !flags.is_path() && file.inode.inode_type() == InodeType::File {
         // The open truncated the file to 0 (Lock 4, released): unmap the
         // caller's pages of it, as `truncate` does (ARCHITECTURE section 5),
         // so a later access is a bus error, not the old bytes or a store

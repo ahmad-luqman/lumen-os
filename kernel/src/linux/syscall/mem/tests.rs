@@ -293,6 +293,35 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn mem_open_path_with_o_trunc_leaves_the_file_and_its_mappings_alone() {
+        // `open(O_PATH | O_TRUNC)` doesn't truncate (`O_PATH` opens no
+        // file for I/O), so it unmaps nothing: a private copy-on-write page
+        // keeps its bytes, a shared page stays mapped, and the file its size.
+        in_test_process(|_| {
+            let path = b"/tmp/mem-ktest-path-trunc";
+            let fd = open(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+            let inode = inode_of(fd)?;
+            inode.write_at(0, &pattern(9)).map_err(|_| "write")?;
+            let private = map(2 * P, RW, PRIVATE, fd, 0)?;
+            let shared = map(2 * P, READ, SHARED, fd, 0)?;
+            copy_to_user(private + 8, b"private!").map_err(|_| "copy on write")?;
+            let mut seen = [0u8; 8];
+            copy_from_user(&mut seen, shared + P).map_err(|_| "fault in")?;
+            let _path_fd = open(path, OpenFlags::O_PATH | OpenFlags::O_TRUNC)?;
+            kassert_eq!(inode.stat().map(|m| m.size), Ok(2 * P));
+            copy_from_user(&mut seen, private + 8).map_err(|_| "the private page is gone")?;
+            kassert_eq!(&seen, b"private!");
+            copy_from_user(&mut seen, shared + P).map_err(|_| "the shared page is gone")?;
+            kassert_eq!(&seen[..], &pattern(9)[P as usize..P as usize + 8]);
+            kassert_eq!(sys_munmap(private, 2 * P), 0);
+            kassert_eq!(sys_munmap(shared, 2 * P), 0);
+            unlink(path)?;
+            Ok::<(), &'static str>(())
+        })?
+    }
+);
+
+crate::ktest!(
     fn mem_mmap_fd_outlives_close_and_unlink() {
         // The mapping holds the file open: with its descriptor closed and its
         // name unlinked, stores and loads through it still reach the file,
