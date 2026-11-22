@@ -529,8 +529,19 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
         return Err(errno::EMFILE);
     }
     let start = at::start_dir(dirfd, &path)?;
+    // `O_TRUNC` without `O_PATH` truncates a regular file (`O_PATH` opens
+    // without truncating): the space to unmap from is taken first, as
+    // `truncate`'s is.
+    let truncating = (flags.has_trunc() && !flags.is_path()).then(super::shrinking_space);
     let opened = start.open(&path, flags, mode)?;
     let mut file = OpenFile::from_opened(opened).map_err(vfs)?;
+    if let Some(space) = &truncating
+        && file.inode.inode_type() == InodeType::File
+    {
+        // The open truncated it to 0 (exactly when `open_inode_guarded`
+        // does): unmap the caller's pages, as `truncate` does.
+        super::unmap_past(space, &*file.inode, 0);
+    }
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
     }

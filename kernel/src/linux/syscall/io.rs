@@ -1,5 +1,5 @@
 //! Positional I/O and syncing (M7): `pread64`, `pwrite64`, `fsync`,
-//! `fdatasync`, `sync` (#254), and `msync` (#255, with file-backed `mmap`).
+//! `fdatasync`, `sync` (#254). (`msync` is `mem`'s, with file-backed `mmap`.)
 //!
 //! `pread64` and `pwrite64` go to the inode at the position they're given,
 //! a chunk at a time through a bounce buffer on the stack as `fd.rs`'s
@@ -12,9 +12,11 @@
 
 use super::at::{Fd, UserPtr};
 use super::fd::{FILE_CHUNK, checked_len, partial, vfs, write_chunks_from_user};
-use super::{MAX_SINGLE_IO, finish, not_implemented};
+use super::{MAX_SINGLE_IO, finish};
+use crate::linux::errno;
+#[cfg(feature = "ktest")]
+use crate::linux::general;
 use crate::linux::process::FileRef;
-use crate::linux::{errno, general};
 use crate::user::{copy_to_user, user_range_valid};
 use lumen_vfs::{InodeType, OpenFlags, VfsInode};
 
@@ -176,17 +178,6 @@ pub(super) fn sys_sync() -> u64 {
     let _ = crate::vfs::sync_all();
     0
 }
-
-/// `msync(addr, length, flags)` (26): M7 stub (#255).
-pub(super) fn sys_msync(_addr: u64, _length: u64, _flags: i32) -> u64 {
-    not_implemented(general::__NR_msync)
-}
-
-crate::ktest!(
-    fn io_m7_stubs_return_enosys() {
-        super::check_stubs(&[general::__NR_msync])
-    }
-);
 
 #[cfg(feature = "ktest")]
 use super::at::{self, Mode};

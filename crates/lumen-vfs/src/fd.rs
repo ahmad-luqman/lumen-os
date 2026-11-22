@@ -125,9 +125,9 @@ impl<L: VfsLock<u64>> OpenFile<L> {
     }
 
     /// The open reference this description holds on its inode: clone it
-    /// for another holder (`fchdir`'s cwd) that must not be refused the
-    /// way a fresh [`OpenGuard::try_new`] can be: a procfs inode whose
-    /// process has ended (its `stat()` says `ENOENT`).
+    /// for another holder (`fchdir`'s cwd, a file mapping) that must not
+    /// be refused the way a fresh [`OpenGuard::try_new`] can be: a procfs
+    /// inode whose process has ended (its `stat()` says `ENOENT`).
     pub fn open_guard(&self) -> &OpenGuard {
         &self.open_guard
     }

@@ -639,7 +639,7 @@ read, then the page and its rights, or the level that is not present. It
 takes no locks; a table outside HHDM-mapped RAM ends the walk instead of
 being read, and if the walk itself faults the report still ends properly.
 
-### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, its core built in #255 (the in-kernel API: `AddressSpace::mmap_file`, the fault paths, `invalidate_file_from`; `truncate`/`ftruncate` call `invalidate_file_from` since #254's `meta` cluster; the `mmap(fd)` syscall and `msync` come next), M7; CoW `fork` and shootdowns in M8)
+### Per-process address spaces and user VM (M6 built, #233/#237; file-backed `mmap` designed in #246, its core built in #255 (the in-kernel API: `AddressSpace::mmap_file`, the fault paths, `invalidate_file_from`), the `mmap(fd)` and `msync` syscalls built in #255 too; `truncate`/`ftruncate` (#254's `meta` cluster) and `openat(O_TRUNC)` (#255) call `invalidate_file_from`; M7; CoW `fork` and shootdowns in M8)
 
 Each user process owns an `AddressSpace` protected by a **sleeping,
 interrupt-enabled `SleepMutex`** (not an IRQ-off `SpinLock`—needed both for
@@ -687,14 +687,17 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   - `Backing::File(FileMapping { file_id: u64, offset: u64, shared: bool, may_write: bool })`
     (M7, designed in #246): `file_id` is the inode's `lock_id`
     (`user_vm::file_id_of`: unique across filesystems and fixed for the
-    inode's life, unlike `ino`), keying the open reference (an `OpenGuard`,
-    counted in `open_count`) held in `AddressSpace::mapped_files` (retained until **zero** VMAs reference
+    inode's life, unlike `ino`), keying the open reference (a `MappedFile`:
+    an `OpenGuard`, counted in `open_count`, cloned from the descriptor's
+    open file, and the path it was opened by, which `/proc/<pid>/maps`
+    shows) held in `AddressSpace::mapped_files` (retained until **zero** VMAs reference
     `file_id`, so splitting via `mprotect`/partial `munmap` never drops it early
     and closing the `fd` after `mmap` keeps the mapping valid per POSIX);
     `offset` is the page-aligned file byte offset at `Vma::start`; `shared`
     distinguishes `MAP_SHARED` (`true`) from `MAP_PRIVATE` CoW (`false`);
-    `may_write` (`VM_MAYWRITE`) is `true` for `MAP_PRIVATE` and
-    `open_flags.writable() && !fs.read_only()` for `MAP_SHARED`. In
+    `may_write` (`VM_MAYWRITE`) is `true` for `MAP_PRIVATE` and, for
+    `MAP_SHARED`, whether the descriptor is open `O_RDWR` (a read-only
+    mount can't have opened one: `EROFS`). In
     `VmaMap::protect`, requesting `PROT_WRITE` on a file VMA with
     `!fm.may_write` returns `VmError::Access` (mapped to `-EACCES` in
     `UserVmError::to_mprotect_errno`), preventing `mprotect` from upgrading an
@@ -840,7 +843,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
         `prot_to_attrs(vma.prot)` + `PTE_SHARED = 1` (preserving
         `vma.prot.exec()`), and flush the local TLB (`invlpg`).
     - Any other present fault returns `FaultResult::Invalid`.
-  - **`mprotect`, `munmap`, `ftruncate` invalidation, and `msync` with `PTE_SHARED`:**
+  - **`mprotect`, `munmap` and `ftruncate` invalidation with `PTE_SHARED`:**
     - `protect_user_range` operates **per leaf**: for every leaf with
       `PTE_SHARED = 1`, it **always** writes `WRITABLE = 0` (uniformly for both
       `MAP_PRIVATE` and `MAP_SHARED`, preserving CoW on `MAP_PRIVATE` and
@@ -861,7 +864,8 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - **Truncate shrink invalidation (`ftruncate`, `truncate`, `openat(O_TRUNC)`):**
       `AddressSpace::invalidate_file_from(file_id, new_size)` (built in
       #255; `truncate` and `ftruncate` call it, `syscall/meta.rs`, #254;
-      `openat(O_TRUNC)` doesn't yet: #289);
+      `openat(O_TRUNC)` too, `syscall/fd.rs`, once the open's truncate
+      has returned, #255);
       once the inode's truncate has returned, having dropped the `PageCache`
       entries `>= new_size.div_ceil(4096)` under Lock 4, the syscall takes
       Lock 1 and unmaps all file-VMA PTEs covering
@@ -876,16 +880,27 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       local `invlpg`) until M8's shootdowns. Subsequent accesses in the
       caller's space fault into `BusError` / `SIGBUS`, so its later file
       growth can't split-brain against stale mapped frames; another process's
-      mappings, and the caller's after `O_TRUNC` (#289), still can until those
-      land. (In M8, multi-process mappings snapshot active
+      mappings still can until those land. (In M8, multi-process mappings snapshot active
       `Weak<AddressSpace>` holders outside the inode lock and invalidate each
       after the truncate, as the caller's own space is.)
     - `msync(addr, len, flags)` (syscall 26) returns `0` immediately on
-      `len == 0` (after validating page-aligned `addr` and valid `flags`),
+      `len == 0`, or a `len` within a page of 2^64 (Linux's rounding wraps
+      it to 0), after validating page-aligned `addr` and valid `flags`;
+      `-ENOMEM` when `addr + len` rounded up overflows, and for a range
+      partly unmapped (with `MS_SYNC`, after writing back the mapped
+      parts, a writeback error winning);
       succeeds as a no-op on `MAP_PRIVATE`/anonymous VMAs, and for `MAP_SHARED`
-      VMAs sweeps `PTE_DIRTY` into `WritableMap::note_pte_dirty()` and (for `MS_SYNC`)
-      flushes those inodes' dirty pages through `ext4` and
-      `BlockDevice::flush()`.
+      VMAs with `MS_SYNC` writes back each mapped file's dirty pages
+      (`VfsInode::sync(data_only)`: through `ext4` and its block cache's
+      flush to the device). It reads no `PTE_DIRTY` bit: a page mapped
+      writable is dirty through its `writable_maps` count for as long as it
+      is (above), so the writeback writes every store made through the
+      mapping. `AddressSpace::msync_files` clones an open reference on each
+      such file under Lock 1 and the writeback runs after Lock 1 is
+      released (Lock 1 before Lock 4 would be in order, but disk writes
+      under it would stall the process's faults; Linux drops `mmap_lock`
+      around `vfs_fsync_range` likewise). `MS_ASYNC` and `MS_INVALIDATE`
+      write nothing.
 
   `PROT_NONE` VMAs reserve VA space without demand-paging on fault;
   `mprotect(..., PROT_NONE)` on already-populated pages preserves their
@@ -3470,10 +3485,9 @@ Lumen runs two kinds of user code:
   or `NULL` pointer `-EFAULT`, `UserPath::empty()` aside; non-UTF-8
   `-ENOENT` until #268), fills `struct stat` and `struct statx` from VFS
   `Metadata` and writes them to user memory (`write_stat`, `write_statx`:
-  `-EFAULT` for a bad buffer). The per-cluster
-  stub ktests (`check_stubs`) dispatch with every argument zero, so they
-  can't see an arm passing registers out of order: each cluster's own tests
-  must, with distinct values in each argument.
+  `-EFAULT` for a bad buffer). Each cluster's tests check its arms take
+  their registers in order, with distinct values in each argument (the
+  M7 stubs, and their ktests, went with the last of them, `msync`).
 
 #### M6 initial syscall table (30 syscalls: static `musl` & `busybox ash` built-ins)
 
@@ -3600,11 +3614,11 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 4 | `stat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, 0)` |
 | 6 | `lstat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW)` |
 | 8 | `lseek(fd, off, whence)` | `SEEK_SET` (0), `SEEK_CUR` (1), `SEEK_END` (2) on regular files, `/proc`, and `/dev/{null,zero,random,urandom}` (returning 0); on directories updates `OpenFile::dir_cursor` (`SEEK_SET` for `musl` `rewinddir`/`seekdir`); `-ESPIPE` on console/tty; `-EBADF` on `O_PATH`; rejects resulting negative offset with `-EINVAL` |
-| 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); masks `flags & MAP_TYPE` (`0x0f`) to select `MAP_SHARED` (1), `MAP_PRIVATE` (2), or `MAP_SHARED_VALIDATE` (3, rejecting unknown flags with `-EOPNOTSUPP`; any other `MAP_TYPE` → `-EINVAL`); ignores advisory `MAP_DENYWRITE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_STACK`; validates `off & 0xfff == 0`, `off + aligned_len` no overflow, `fd` open & readable (`-EBADF` if closed or `O_PATH`, `-EACCES` on `O_WRONLY` or `MAP_SHARED \| PROT_WRITE` on `O_RDONLY`/read-only fs), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); records `may_write` on `FileMapping` |
+| 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); masks `flags & MAP_TYPE` (`0x0f`) to select `MAP_SHARED` (1), `MAP_PRIVATE` (2), or `MAP_SHARED_VALIDATE` (3, rejecting unknown flags with `-EOPNOTSUPP`; any other `MAP_TYPE` → `-EINVAL`); `MAP_SYNC` and `MAP_FIXED_NOREPLACE` with `MAP_SHARED_VALIDATE` → `-EOPNOTSUPP`, as Linux's `LEGACY_MAP_MASK`; ignores advisory `MAP_DENYWRITE`/`MAP_EXECUTABLE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_NONBLOCK`/`MAP_STACK`/`MAP_LOCKED`/`MAP_UNINITIALIZED` and `MAP_32BIT`/`MAP_ABOVE4G`; `MAP_HUGETLB` → `-EINVAL`, and `MAP_GROWSDOWN` on a file → `-EINVAL`; validates `off & 0xfff == 0`, `len != 0` (`-EINVAL`), `len`'s page rounding (`-ENOMEM`), `off + aligned_len` at most `i64::MAX` for a regular file, below 2^64 otherwise (Linux's `ULONG_MAX` for a character device) (`-EOVERFLOW`), `fd` open & readable (`-EBADF` if closed or `O_PATH`, `-EACCES` on `O_WRONLY` or `MAP_SHARED \| PROT_WRITE` without `O_RDWR`), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); records `may_write` on `FileMapping` |
 | 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `count` capped at 1 MiB (`MAX_SINGLE_IO`), and a fault or filesystem error after the first 4 KiB chunk returns the bytes moved. Errors in this order: `-EINVAL` if `off < 0`; `-EBADF` if not open or `O_PATH`; `-ESPIPE` on console/tty and FIFO/socket nodes; `-EBADF` if not readable; `-EFAULT` if the buffer isn't wholly in user space; `-EINVAL` if `off + count` passes `i64::MAX`; `-EISDIR` on directories (even for 0 bytes) |
 | 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); same cap and the same errors in the same order as `pread64` (`-EBADF` if not writable; no `-EISDIR`, as a directory can't be open for writing) |
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
-| 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` on any unmapped hole; sweeps `MAP_SHARED` PTE dirty bits into `PageCache` and, for `MS_SYNC`, writes back and issues `BlockDevice::flush()` |
+| 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` (or a `len` within a page of 2^64, which Linux's rounding wraps to 0) and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` when `addr + len` rounded up overflows and on any unmapped hole (with `MS_SYNC`, after writing back the mapped parts; a writeback error such as `-EIO` wins); for `MS_SYNC`, writes back each `MAP_SHARED` file's dirty pages (a writable mapping keeps its pages dirty, section 5) through its filesystem and block cache to the device, with the address space's lock released |
 | 72 | `fcntl(fd, cmd, arg)` | `F_DUPFD` (0) / `F_DUPFD_CLOEXEC` (1030) (`-EINVAL` if `arg < 0 \|\| arg >= MAX_FDS`, `-EMFILE` if no free slot in `[arg, MAX_FDS)`), `F_GETFD` (1), `F_SETFD` (2, `FD_CLOEXEC`), `F_GETFL` (3), `F_SETFL` (4, mutating `O_APPEND \| O_NONBLOCK`; the access mode and creation flags ignored, as on Linux, and `O_ASYNC`/`O_DIRECT`/`O_NOATIME` too, which Linux would change and Lumen doesn't track), and POSIX byte-range advisory locks `F_GETLK` (5), `F_SETLK` (6), `F_SETLKW` (7) using `struct flock` (process-scoped; a bad `l_type`/`l_whence` or negative start `-EINVAL`, a range past `OFFSET_MAX` `-EOVERFLOW`, then the open mode `F_WRLCK` → writable / `F_RDLCK` → readable else `-EBADF`; normalizing `l_len < 0`; `F_SETLKW` is `-EDEADLK` where its wait would close a cycle of waiting processes, section 9); on an `O_PATH` fd every `cmd` but `F_DUPFD*`/`F_GETFD`/`F_SETFD`/`F_GETFL` is `-EBADF`, unknown ones included; on any other fd an unknown `cmd` is `-EINVAL` |
 | 73 | `flock(fd, op)` | open-file-description advisory lock (`LOCK_SH`, `LOCK_EX`, `LOCK_UN`, optional `LOCK_NB`; independent of `fcntl` POSIX locks); as Linux 6.0+, `LOCK_MAND` is ignored (returns 0; reported once a boot, at info) and `op` is checked (`-EINVAL`) before `fd` (`-EBADF`, `O_PATH` too); atomic upgrade/downgrade on same `OpenFileId` when nothing conflicts (a blocking request that conflicts gives the held lock up first, as Linux; section 9), `-EWOULDBLOCK` on conflict with `LOCK_NB` (the held lock kept: a deviation, Linux drops it), released when last FD to the `OpenFile` closes |
 | 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs (and detached unlinked inodes as a no-op), `-EBADF` on `O_PATH`, and `-EINVAL` on console/tty, `/dev/*`, character-device, FIFO and socket nodes and anything on procfs, as Linux (no `->fsync`); also on block-device nodes, an M7 deviation (Linux's `blkdev_fsync` syncs the device, which M7 can't open) |
@@ -5103,8 +5117,7 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
        `AddressSpace::invalidate_file_from`, under Lock 1, unmaps all
        file-VMA PTEs covering `file_off >= align_up_page(new_size)` (section
        5). The truncate syscall never holds both locks. This reaches the
-       caller's space only until M8, and doesn't yet run after `O_TRUNC`
-       (#289).
+       caller's space only until M8 (`openat(O_TRUNC)` included).
   - Extending a file (`ftruncate` grow or `write`/`pwrite64` past `old_size`):
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
     `PageCache`, zeroes `[old_size % 4096 .. 4096)` before exposing the new
@@ -5141,7 +5154,7 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     section 5's truncate invalidation, run by the shrinking syscall once
     the truncate has returned, unmaps it (section 5's rules: the syscall
     never holds Lock 1 and Lock 4 together, the caller's space only until
-    M8, not yet after `O_TRUNC`).
+    M8).
   - *Other inodes:* `NoDev` for directories, symlinks, and every inode of
     another filesystem (`devfs`, `procfs`); `NoEnt` for an `ext4` inode
     unlinked and not open.
@@ -5155,8 +5168,7 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     takes Lock 4 alone). A page mapped from a stale snapshot is still
     unmapped: the shrinking syscall's `invalidate_file_from` takes Lock 1
     after the truncate, so it runs after that fault's mapping is in place.
-    This holds for the caller's own space only until M8, and not after
-    `O_TRUNC` (#289). A private copy-on-write copy of the end page made from
+    This holds for the caller's own space only until M8. A private copy-on-write copy of the end page made from
     a stale snapshot can keep bytes past the new end (bytes a shared mapping
     stored past it).
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
@@ -5195,8 +5207,9 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     VM core keeps each guard beside its PTE (`AddressSpace::writable_maps`)
     and drops it only after clearing or downgrading the PTE and flushing
     (section 5's unmap order). `WritableMap::note_pte_dirty` marks the page
-    dirty from a PTE's hardware `DIRTY` bit, for a sweep that keeps the
-    mapping. `set_dirty`, `inc_writable_maps` and `dec_writable_maps` are
+    dirty from a PTE's hardware `DIRTY` bit, for a walk that downgrades or
+    clears the PTE (`mprotect`, `munmap`, truncate invalidation,
+    teardown). `set_dirty`, `inc_writable_maps` and `dec_writable_maps` are
     `pub(super)`: inside `vfs`, only the guard and the ktests count
     mappings. A `fork` copying a writable shared PTE would take a second
     guard of its own.
@@ -5690,12 +5703,17 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     resolves directly to `OpenFile::inode` rather than re-parsing the text
     target.
   - `/proc/<pid>/maps` → strict Linux format
-    `{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}` (followed by
-    `  {pathname}` only when named, omitting the trailing space on unnamed
-    anonymous VMAs; `p` for private/anonymous, `s` for `MAP_SHARED`, `[heap]`,
-    `[stack]`, or file/executable/interpreter path + `dev_major:dev_minor` +
-    `ino`; until file-backed `mmap` lands in #255, file-backed VMAs print
-    `00:00 0` with no path), enabling `musl`'s `pthread_getattr_np` and runtime stack/mapping
+    `{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}` (followed by the name
+    only when named, after 73 characters as Linux's `seq_pad` puts it, omitting the
+    trailing space on unnamed anonymous VMAs; `p` for private/anonymous, `s`
+    for `MAP_SHARED`, `[heap]`, `[stack]`, or a file mapping's path (the one
+    it was opened by, ` (deleted)` once unlinked) with the file's
+    `dev_major:dev_minor` and `ino` read from its inode as the listing is
+    made; the executable's and interpreter's segments, copied into anonymous
+    memory at load, are named by the ranges the loader (`commit_loaded_elf`)
+    records (each segment's file bytes, at its file offset; its `.bss`
+    past them anonymous), trimmed by any unmap over them; the lines'
+    formatting is `lumen_vm::maps`'s, host-tested), enabling `musl`'s `pthread_getattr_np` and runtime stack/mapping
     discovery. Generated lock-order-safely by cloning `Arc<AddressSpace>` under
     `ACTIVE_PROCS`, releasing `ACTIVE_PROCS`, locking `AddressSpace::inner`
     (Lock 1) with no `VfsInode` lock held, formatting into a kernel buffer,
