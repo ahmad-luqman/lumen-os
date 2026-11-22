@@ -3003,15 +3003,17 @@ fn rofs_exempts_every_special_file_in_access_and_open() {
     let writes = [OpenFlags::O_WRONLY, OpenFlags::O_RDWR, OpenFlags::O_RDONLY | OpenFlags::O_TRUNC];
 
     for (name, ty) in special {
-        assert_eq!(inode(name).inode_type(), ty);
-        assert_eq!(check_access(&env, &inode(name), w_ok, 0, 0), Ok(()), "{name}: access(W_OK)");
+        let node = inode(name);
+        assert_eq!(node.inode_type(), ty);
+        assert_eq!(check_access(&env, &node, w_ok, 0, 0), Ok(()), "{name}: access(W_OK)");
         for bits in writes {
             assert_eq!(open(name, bits), Ok(ty), "{name}: open({bits:#o})");
         }
     }
     for name in ["file", "dir", "link"] {
-        assert_eq!(check_access(&env, &inode(name), w_ok, 0, 0), Err(VfsError::RoFs), "{name}: access(W_OK)");
-        assert_eq!(check_access(&env, &inode(name), AccessMask(AccessMask::R_OK), 0, 0), Ok(()), "{name}: R_OK");
+        let node = inode(name);
+        assert_eq!(check_access(&env, &node, w_ok, 0, 0), Err(VfsError::RoFs), "{name}: access(W_OK)");
+        assert_eq!(check_access(&env, &node, AccessMask(AccessMask::R_OK), 0, 0), Ok(()), "{name}: R_OK");
     }
     for bits in writes {
         assert_eq!(open("file", bits), Err(VfsError::RoFs), "file: open({bits:#o})");
@@ -8194,7 +8196,7 @@ struct GateHooks {
     after_stat: Option<GateHook>,
     /// Runs once, right after the next lookup of this name (its lock released).
     after_lookup: Option<(String, GateHook)>,
-    /// Runs once, at the next `exempt_from_rofs`: in `open_inode_guarded`,
+    /// Runs once, at the next `at_rofs_check`: in `open_inode_guarded`,
     /// after the lookup and after Lock 3, before the count goes up.
     at_rofs_check: Option<GateHook>,
     /// The next `stat` fails with this.
@@ -8281,9 +8283,8 @@ impl VfsInode for GateInode {
     fn is_detached(&self) -> bool {
         self.detached.load(Ordering::Acquire)
     }
-    fn exempt_from_rofs(&self) -> bool {
+    fn at_rofs_check(&self) {
         self.run(|h| h.at_rofs_check.take());
-        self.inode_type.is_special()
     }
     fn stat(&self) -> Result<Metadata, VfsError> {
         self.run(|h| h.before_stat.take());

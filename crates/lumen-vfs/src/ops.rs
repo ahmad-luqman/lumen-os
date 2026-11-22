@@ -534,8 +534,14 @@ fn open_once(
         return Err(VfsError::IsDir);
     }
     // A special file is written through, not on, its filesystem: no `-EROFS`
-    // (`VfsInode::exempt_from_rofs`), as `check_access` agrees.
-    if !inode.exempt_from_rofs() && env.fs_read_only(inode.dev_id()) && (flags.is_writable() || flags.has_trunc()) {
+    // (`InodeType::is_special`, as Linux's `do_dentry_open` skips
+    // `mnt_want_write` for one), as `check_access` agrees.
+    #[cfg(test)]
+    inode.at_rofs_check();
+    if !inode.inode_type().is_special()
+        && env.fs_read_only(inode.dev_id())
+        && (flags.is_writable() || flags.has_trunc())
+    {
         return Err(VfsError::RoFs);
     }
     // The open reference, then the last liveness check (inside `try_new`),

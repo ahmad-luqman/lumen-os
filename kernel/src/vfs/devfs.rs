@@ -1,11 +1,15 @@
 //! Read-only `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes.
 //!
 //! Namespace changes (create, unlink, mkdir, rename) return `-EROFS`, and
-//! so does a metadata change on `/dev` itself. The character nodes are
-//! special files, so `VfsInode::exempt_from_rofs`'s default lets
-//! `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK` and `chmod`/`chown`/`utimensat`
-//! through the read-only mount; their setters then keep the new mode,
-//! owner and times in memory until reboot, as Linux's devtmpfs does.
+//! so does a metadata change on `/dev` itself (a divergence: devtmpfs
+//! takes those on `/dev` too). The character nodes are special files, so
+//! `lumen-vfs`'s open and access checks let `O_WRONLY`/`O_RDWR`/`O_TRUNC`/
+//! `W_OK` through the read-only mount (`InodeType::is_special`). The
+//! syscall layer's `writable_mount` lets `chmod`/`chown`/`utimensat`
+//! through for this mount's (`DevId::DEVFS`) nodes, and their setters keep
+//! the new mode, owner and times in memory until reboot, as Linux's
+//! devtmpfs does. The setters take a change on any instance's node: only
+//! the mount check tells `/dev`'s instance from another.
 //! `random` and `urandom` read from `crate::rng` and return `-EAGAIN` while
 //! its pool has never been seeded (no RDRAND and no virtio-rng answer).
 
@@ -413,3 +417,37 @@ impl VfsInode for DevfsInode {
         Ok(())
     }
 }
+
+crate::ktest!(
+    fn devfs_nodes_start_with_their_boot_metadata() {
+        // A fresh instance (not `/dev`'s, whose nodes a `chmod` may have
+        // changed): each node's Linux mode, number and type, owned by root.
+        use crate::{kassert, kassert_eq};
+        let fs = Devfs::new(DevId::makedev(0, 134));
+        let root = fs.root_inode();
+        let st = root.stat().map_err(|_| "stat /")?;
+        kassert_eq!((st.inode_type, st.mode, st.uid, st.gid), (InodeType::Dir, 0o755, 0, 0));
+        for (name, maj, min, mode) in [
+            ("null", 1, 3, 0o666),
+            ("zero", 1, 5, 0o666),
+            ("random", 1, 8, 0o666),
+            ("urandom", 1, 9, 0o666),
+            ("tty", 5, 0, 0o666),
+            ("console", 5, 1, 0o620),
+        ] {
+            let node = root.lookup(name).map_err(|_| "lookup")?.stat().map_err(|_| "stat")?;
+            kassert_eq!(node.inode_type, InodeType::CharDevice);
+            kassert_eq!((node.rdev, node.mode, node.uid, node.gid), (DevId::makedev(maj, min), mode, 0, 0));
+        }
+        // The root refuses a metadata change itself, whatever the caller
+        // (`vfstest chmod` calls the setter without the syscalls' mount
+        // check), and keeps its metadata.
+        kassert_eq!(root.set_mode(0o700), Err(VfsError::RoFs));
+        kassert_eq!(root.set_owner(Some(1), Some(1)), Err(VfsError::RoFs));
+        kassert_eq!(root.set_times(SetTime::Now, SetTime::Now), Err(VfsError::RoFs));
+        let after = root.stat().map_err(|_| "stat / after")?;
+        kassert_eq!((after.mode, after.uid, after.gid), (0o755, 0, 0));
+        kassert!(after.mtime == st.mtime && after.ctime == st.ctime);
+        Ok(())
+    }
+);

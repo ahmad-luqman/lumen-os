@@ -877,7 +877,9 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         return Err(String::from("/dev create did not return -EROFS"));
     }
     let dev_null = resolve_path_from_root("/dev/null").map_err(|e| format!("/dev/null: {e:?}"))?;
-    if !dev_null.exempt_from_rofs() || dev_null.stat().map_err(|e| format!("{e:?}"))?.rdev != DevId::makedev(1, 3) {
+    if dev_null.inode_type() != InodeType::CharDevice
+        || dev_null.stat().map_err(|e| format!("{e:?}"))?.rdev != DevId::makedev(1, 3)
+    {
         return Err(String::from("/dev/null metadata mismatch"));
     }
     if dev_null.write_at(0, b"discard").map_err(|e| format!("{e:?}"))? != 7 {
@@ -897,15 +899,15 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         return Err(String::from("/dev/zero read mismatch"));
     }
 
-    for (path, maj, min, mode) in [
-        ("/dev/random", 1u32, 8u32, 0o666u16),
-        ("/dev/urandom", 1, 9, 0o666),
-        ("/dev/tty", 5, 0, 0o666),
-        ("/dev/console", 5, 1, 0o620),
-    ] {
+    // The type and number only: a node's mode, owner and times are boot
+    // values a `chmod`, `chown` or `utimensat` may have changed since (#293;
+    // devfs's `devfs_nodes_start_with_their_boot_metadata` checks those).
+    for (path, maj, min) in
+        [("/dev/random", 1u32, 8u32), ("/dev/urandom", 1, 9), ("/dev/tty", 5, 0), ("/dev/console", 5, 1)]
+    {
         let n = resolve_path_from_root(path).map_err(|e| format!("{path}: {e:?}"))?;
         let st = n.stat().map_err(|e| format!("{path} stat: {e:?}"))?;
-        if st.rdev != DevId::makedev(maj, min) || st.mode != mode || !n.exempt_from_rofs() {
+        if st.rdev != DevId::makedev(maj, min) || st.inode_type != InodeType::CharDevice {
             return Err(format!("{path} metadata mismatch: {st:?}"));
         }
     }

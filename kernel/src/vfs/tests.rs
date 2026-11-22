@@ -231,6 +231,25 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn vfs_dev_checks_pass_after_a_chmod_of_a_dev_node() {
+        // devfs keeps a `chmod` (#293), so the checks look at a node's type
+        // and number, not its boot mode: `/dev/console` at 0o600 passes.
+        use crate::kassert_eq;
+        let console = resolve_path_from_root("/dev/console").map_err(|_| "resolve /dev/console")?;
+        let mode = console.stat().map_err(|_| "stat")?.mode;
+        console.set_mode(0o600).map_err(|_| "set_mode")?;
+        let res = run_dev_tmp_proc_checks();
+        let restored = console.set_mode(mode);
+        if let Err(err) = &res {
+            log::error!(target: "vfs", "dev_tmp_proc_checks: {err}");
+        }
+        kassert_eq!(res.is_ok(), true);
+        kassert_eq!(restored, Ok(()));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn tmpfs_truncate_returns_quota() {
         use crate::{kassert, kassert_eq};
         let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 121), page_cache::PAGE_SIZE);

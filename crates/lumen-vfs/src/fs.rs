@@ -85,20 +85,11 @@ pub trait VfsInode: Send + Sync {
         false
     }
 
-    /// True if a read-only mount doesn't refuse this inode with `-EROFS`
-    /// for a write open (`O_WRONLY`, `O_RDWR`, `O_TRUNC`, in `open_inode`)
-    /// or `access(W_OK)` (`check_access`). The kernel's syscall layer also
-    /// lets a devfs node's `chmod`, `chown` and `utimensat` through on it
-    /// (Linux's devtmpfs being a writable mount), and no other's.
-    ///
-    /// Keyed on the file type: the special files (`InodeType::is_special`:
-    /// character and block devices, FIFOs, sockets), as Linux's
-    /// `special_file()` in `do_faccessat` and `may_open`. A filesystem
-    /// keeps the default; the host tests override it only to run a hook
-    /// at the point `open_inode` asks.
-    fn exempt_from_rofs(&self) -> bool {
-        self.inode_type().is_special()
-    }
+    /// Host tests only: runs where `open_inode` decides the read-only
+    /// mount's `-EROFS` (after the lookup and Lock 3, before the open
+    /// reference), for the Gate tests' hooks.
+    #[cfg(test)]
+    fn at_rofs_check(&self) {}
 
     /// True for a terminal (`devfs`'s `tty` and `console`): a descriptor on
     /// one reads and writes the calling process's console, takes the tty
