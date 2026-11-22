@@ -40,3 +40,30 @@ tests = [
     "scenario:test_linux_user::test_static_busybox_ash",
     "audit:flags",
 ]
+
+[[feature]]
+name = "VFS-backed 1024-slot per-process FD table (console fds 0/1/2 on /dev/console, lowest free slot, -EMFILE, FD_CLOEXEC from O_CLOEXEC and FIOCLEX/FIONCLEX, FIONBIO), close releasing flock on the last slot and POSIX locks on any, open/openat with one dirfd resolution (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::process::process_starts_with_console_fds_and_root_cwd",
+    "ktest:lumen_kernel::linux::process::process_close_releases_flock_on_last_slot_and_posix_locks_on_any",
+    "ktest:lumen_kernel::linux::syscall::fd::fd_openat_takes_the_lowest_free_slot_and_refuses_past_1024",
+    "ktest:lumen_kernel::linux::syscall::fd::fd_cloexec_follows_o_cloexec_and_fioclex",
+    "ktest:lumen_kernel::linux::syscall::fd::fd_handlers_take_their_registers_in_order",
+    "ktest:lumen_kernel::linux::syscall::at::at_start_dir_resolves_dirfd_with_its_traps",
+    "ktest:lumen_kernel::vfs::procfs::procfs_fd_listing_and_targets_follow_the_fd_table",
+    "scenario:test_linux_user::test_busybox_file_syscalls",
+]
+
+[[feature]]
+name = "read/write/readv/writev/fstat/poll/ioctl/lseek on VFS files through the FD table (offsets, O_APPEND, EOF, -EISDIR, -EBADF directions, -ENOTTY off terminals, -ESPIPE on them) and getcwd from the cwd inode (-ENOENT once unlinked), with M6 console stdio unchanged (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::fd::fd_read_write_readv_writev_and_fstat_on_a_file",
+    "ktest:lumen_kernel::linux::syscall::fd::fd_poll_reports_files_ready_terminals_by_direction_and_the_rest_invalid",
+    "ktest:lumen_kernel::linux::syscall::fd::fd_lseek_edges",
+    "ktest:lumen_kernel::linux::syscall::dir::dir_getcwd_follows_the_cwd_inode_and_fails_once_unlinked",
+    "scenario:test_linux_user::test_busybox_file_syscalls",
+    "scenario:test_linux_user::test_static_busybox_ash",
+    "scenario:test_linux_user::test_syscall_bad_pointers_return_efault",
+]

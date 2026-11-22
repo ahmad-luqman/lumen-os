@@ -1,10 +1,13 @@
-//! Per-process Linux x86-64 state, console I/O bridge, and exit tracking (M6).
+//! Per-process Linux x86-64 state, console I/O bridge, and exit tracking (M6),
+//! with the VFS-backed FD table, working directory and umask (M7, #254).
 //!
 //! Each ring-3 run registers a [`ProcessState`] keyed by its kernel scheduler
 //! thread id in [`ACTIVE_PROCS`] and removes it cleanly when the thread exits
 //! or faults. Lock discipline: `ACTIVE_PROCS` is an IRQ-off [`SpinLock`] and
 //! must NEVER be held across `copy_from_user`, `copy_to_user`, blocking waits,
-//! or `AddressSpace` operations.
+//! or `AddressSpace` operations; nor across anything that takes a VFS lock
+//! (an open, `stat`, an inode's lock state): an open file or cwd leaves the
+//! table under it as a clone or an extracted entry, used and dropped after.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;

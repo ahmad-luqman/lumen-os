@@ -655,8 +655,8 @@ fn current_file(fd: Fd) -> Option<FileRef> {
 
 crate::ktest!(
     fn fd_read_write_readv_writev_and_fstat_on_a_file() {
-        use crate::{kassert, kassert_eq};
         use crate::user::copy_from_user;
+        use crate::{kassert, kassert_eq};
         process::in_test_process(|_| {
             let base = process::KTEST_USER_VA;
             let data = base + 1024;
@@ -727,6 +727,52 @@ crate::ktest!(
             kassert_eq!(st_mode, general::S_IFCHR | 0o620);
             kassert_eq!(st_rdev, (5 << 8) | 1);
             kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/fd-ktest-rw", false).is_ok());
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn fd_poll_reports_files_ready_terminals_by_direction_and_the_rest_invalid() {
+        use crate::kassert_eq;
+        use crate::user::copy_from_user;
+        process::in_test_process(|_| {
+            let mode: Mode = at::reg(0);
+            let null = ktest_user_path(0, b"/dev/null")?;
+            let null_fd = ktest_fd(sys_open(null, ktest_flags(OpenFlags::O_RDONLY), mode))?;
+            let tmp = ktest_user_path(1, b"/tmp")?;
+            let dir_fd = ktest_fd(sys_open(tmp, ktest_flags(OpenFlags::O_RDONLY), mode))?;
+            let path_fd = ktest_fd(sys_open(tmp, ktest_flags(OpenFlags::O_PATH), mode))?;
+            let both = (general::POLLIN | general::POLLOUT) as i16;
+            // (fd, events) -> the revents wanted: a file and a directory
+            // ready both ways (only what was asked); the console's fd 0
+            // readable (capture input never blocks) but not writable, fd 1
+            // writable but not readable; closed and `O_PATH` fds invalid; a
+            // negative fd ignored.
+            let cases: [(i32, i16, i16); 8] = [
+                (null_fd.raw(), both, both),
+                (dir_fd.raw(), general::POLLIN as i16, general::POLLIN as i16),
+                (0, both, general::POLLIN as i16),
+                (1, both, general::POLLOUT as i16),
+                (path_fd.raw(), both, general::POLLNVAL as i16),
+                (99, both, general::POLLNVAL as i16),
+                (lumen_vfs::MAX_FDS as i32, both, general::POLLNVAL as i16),
+                (-1, both, 0),
+            ];
+            let fds = process::KTEST_USER_VA + 1024;
+            let mut raw = Vec::new();
+            for (fd, events, _) in cases {
+                raw.extend_from_slice(&fd.to_le_bytes());
+                raw.extend_from_slice(&events.to_le_bytes());
+                raw.extend_from_slice(&0x5a5ai16.to_le_bytes());
+            }
+            copy_to_user(fds, &raw).map_err(|_| "copy the pollfds")?;
+            kassert_eq!(sys_poll(fds, cases.len() as u64, 0), 7);
+            copy_from_user(&mut raw, fds).map_err(|_| "copy the pollfds back")?;
+            for (i, (_, _, want)) in cases.iter().enumerate() {
+                let got = i16::from_le_bytes(raw[8 * i + 6..8 * i + 8].try_into().expect("2 bytes"));
+                kassert_eq!((i, got), (i, *want));
+            }
             Ok(())
         })?
     }

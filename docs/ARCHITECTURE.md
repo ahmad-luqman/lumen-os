@@ -3387,11 +3387,21 @@ Lumen runs two kinds of user code:
      `RenameFlags`/`AccessMask`, `u32`, `i32`); a size, offset or pointer
      is a whole `u64` or `UserPtr`. A handler never compares a raw register.
   2. **One dirfd resolution.** Turning a `Dirfd` into the directory a path
-     starts from lives in `at.rs`, added by the FD-table PR (#254b). Its
-     traps: lumen-vfs's `start_dir: None` means the global root, so
-     `Dirfd::Cwd` resolves to the cwd's inode; an absolute path ignores the
-     dirfd, even a bad one; `AT_EMPTY_PATH` with `Dirfd::Fd` accepts a
-     descriptor that isn't a directory.
+     starts from is `at::start_dir(dirfd, &UserPath, allow_empty) ->
+     Result<Start, u32>` (built in #254b); every `*at` handler (and each
+     legacy shim, as `Dirfd::Cwd`) calls it once, after `UserPath::copy_in`,
+     and hands `Start::dir()` to lumen-vfs as its `start_dir`. Its contract,
+     the traps included: an absolute path is `Start::dir() == None` (the
+     global root) and the dirfd is never looked at, so a closed, negative or
+     non-directory one is no error; for a relative path, `Dirfd::Cwd` is the
+     cwd's inode, a concrete `Arc` (lumen-vfs's `start_dir: None` means the
+     global root, never the cwd; `-ENOENT` if the process has no cwd), and
+     `Dirfd::Fd` the descriptor's inode (`-EBADF` if it isn't open,
+     `-ENOTDIR` if it isn't a directory; an `O_PATH` directory is fine); an
+     empty path is `-ENOENT` unless `allow_empty` (`AT_EMPTY_PATH`), then
+     the descriptor's file itself, a directory or not (or the cwd).
+     `Start::display_path` joins a relative path to the start's own (the
+     cwd's, or the dirfd's open file's) for `/proc/<pid>/fd`.
   3. **Positive errnos inside, negated once.** Helpers return
      `Result<_, u32>` holding a positive errno (`errno::ENOENT`, as
      `VfsError::to_errno` gives); the handler applies `neg_errno` once, on
@@ -3450,6 +3460,27 @@ arrives in M8.
 
 In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (matching
 `RLIMIT_NOFILE`), storing `Option<FdEntry { file: Arc<OpenFile>, cloexec: bool }>`.
+
+**Built in #254b** (`kernel/src/linux/process.rs`, `syscall/fd.rs`,
+`syscall/dir.rs`): `ProcessState` holds `fds: FdTable<Arc<OpenFile<KernelVfsLock<u64>>>>`,
+`cwd: Option<Cwd>` (an `OpenGuard` on the directory and the path it was
+set by) and `umask` (`0o022`). A process starts with fd 0 on
+`/dev/console` `O_RDONLY` and fds 1 and 2 `O_WRONLY` (each opened through
+`open_inode_guarded`, so M6's `-EBADF` for `read(1)` and `write(0)` stays)
+and `/` as its cwd, all opened before `ACTIVE_PROCS` is taken. A descriptor
+on a terminal (`VfsInode::is_tty`: devfs's `tty` and `console`) reads and
+writes the process's `ConsoleIo` exactly as M6 did; any other reads and
+writes its inode at `OpenFile::offset` through a 4 KiB bounce buffer on the
+stack, the offset's lock (Lock 2) held across each chunk's `read_at`/
+`write_at` but never across the copy (a chunk the copy out refuses is
+given back to the offset). `close` takes the entry out under `ACTIVE_PROCS`
+and, after it, releases the closing pid's POSIX record locks on the inode
+(any close) and, on the open file description's last `dec_fd_ref`, its
+`flock` locks; `take_current` does the same for every descriptor when the
+process ends. `openat` checks for a free slot before it opens (a full
+table is `-EMFILE` before anything is created), and `getcwd` computes the
+path from the cwd's inode (`compute_cwd_path`). `chdir`, `fchdir`, `umask`
+and the other M7 numbers are still stubs (wave 3).
 Console FDs 0/1/2 become `OpenFile` entries backed by the process's `ConsoleIo`
 device node (preserving all M6 serial, framebuffer VT, and `usertest` capture
 semantics), and M6's `read` (0), `write` (1), `close` (3), `fstat` (5), `poll`
@@ -5285,7 +5316,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `unlink(name)`, `rmdir(name)`, `link(name, target)`, `symlink(name,
     target)`, `readlink()`, `rename(...)`, `readdir(cursor)`, `truncate(size)`,
     `set_mode/owner/times(...)`, plus `read_page`/`write_page` feeding
-    `PageCache` and `sync()`. `VfsInode::drop` must never acquire a sleeping
+    `PageCache` and `sync()`, and `is_tty()` (default `false`; `true` for
+    devfs's `tty` and `console`, answered from fixed state without
+    locking): the FD layer routes a terminal's descriptor to the process's
+    console (reads, writes, the tty `ioctl`s, readiness `poll`, `-ESPIPE`
+    on `lseek`) and gives every other `-ENOTTY` for the tty `ioctl`s (#254b). `VfsInode::drop` must never acquire a sleeping
     lock.
   - `InodeCache`: the `(DevId, Ino)` → `Arc<VfsInode>` map above. It evicts
     an entry only on `unlink`/`rmdir`/`rename`, a detach or `umount`, or
@@ -5350,7 +5385,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     path, and the flags it checked) and `OpenFile::from_opened` takes that
     reference over (one count, never two) with those flags, which can't be
     changed in between. `openat` must use `OpenFile::from_opened(open_inode_guarded(..)?)`
-    when #254 wires it. `OpenFile`'s access mode and `O_PATH` flag are
+    (`openat` does, since #254b). `OpenFile`'s access mode and `O_PATH` flag are
     private (getters only). `open_inode` (its signature unchanged) returns
     the inode with that reference given back: an
     `OpenFile::new_unchecked_flags` built from it (not for `openat`: its
