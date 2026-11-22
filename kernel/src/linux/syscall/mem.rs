@@ -15,7 +15,8 @@
 //!   `MAP_FIXED_NOREPLACE` with them (Linux's `LEGACY_MAP_MASK` holds
 //!   neither; no file here is on DAX). Either way `PROT_WRITE` needs the
 //!   descriptor open for writing (`EACCES`), which is also what lets a
-//!   later `mprotect` add it (`may_write`, `VM_MAYWRITE`);
+//!   later `mprotect` add it (`VM_MAYWRITE`: `O_RDWR`, recorded from the
+//!   description itself by `user_vm::MappedFile::of`);
 //! - `MAP_PRIVATE`: copy-on-write, writable whatever the descriptor's mode;
 //! - anything else: `EINVAL`.
 //!
@@ -140,7 +141,7 @@ fn mmap_fd(addr: u64, len: u64, prot: lumen_vm::Prot, flags: u64, fd: Fd, off: u
             if prot.write() && mode == AccessMode::ReadOnly {
                 return Err(errno::EACCES);
             }
-            Sharing::Shared { may_write: mode == AccessMode::ReadWrite }
+            Sharing::Shared // `MappedFile::of` records `O_RDWR` or not
         }
         general::MAP_PRIVATE => Sharing::Private,
         _ => return Err(errno::EINVAL),

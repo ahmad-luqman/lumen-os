@@ -689,15 +689,20 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     (`user_vm::file_id_of`: unique across filesystems and fixed for the
     inode's life, unlike `ino`), keying the open reference (a `MappedFile`:
     an `OpenGuard`, counted in `open_count`, cloned from the descriptor's
-    open file, and the path it was opened by, which `/proc/<pid>/maps`
-    shows) held in `AddressSpace::mapped_files` (retained until **zero** VMAs reference
+    open file, the path it was opened by, which `/proc/<pid>/maps`
+    shows, and the description's shared-write right, `O_RDWR` or not,
+    recorded by `MappedFile::of`, its only constructor) held in `AddressSpace::mapped_files` (retained until **zero** VMAs reference
     `file_id`, so splitting via `mprotect`/partial `munmap` never drops it early
     and closing the `fd` after `mmap` keeps the mapping valid per POSIX);
     `offset` is the page-aligned file byte offset at `Vma::start`; `shared`
     distinguishes `MAP_SHARED` (`true`) from `MAP_PRIVATE` CoW (`false`);
     `may_write` (`VM_MAYWRITE`) is `true` for `MAP_PRIVATE` and, for
     `MAP_SHARED`, whether the descriptor is open `O_RDWR` (a read-only
-    mount can't have opened one: `EROFS`). In
+    mount can't have opened one: `EROFS`). `AddressSpace::mmap_file` takes
+    it from the `MappedFile` it is handed (`Sharing` is `Private` or
+    `Shared`, carrying no right of its own), so it can't come from anywhere
+    but the description mapped; never from the `mapped_files` entry, which
+    is the first mapping's. In
     `VmaMap::protect`, requesting `PROT_WRITE` on a file VMA with
     `!fm.may_write` returns `VmError::Access` (mapped to `-EACCES` in
     `UserVmError::to_mprotect_errno`), preventing `mprotect` from upgrading an

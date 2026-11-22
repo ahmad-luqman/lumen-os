@@ -263,7 +263,7 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use lumen_vfs::{Metadata, OpenFlags, OpenGuard, ResolveFlags, Timespec, VfsInode};
+    use lumen_vfs::{Metadata, OpenFlags, ResolveFlags, Timespec, VfsInode};
     use lumen_vm::{MapPlace, Prot};
 
     use super::super::at::{self, Dirfd, Fd, UserPtr};
@@ -801,12 +801,12 @@ mod tests {
     fn shrink_unmaps(f: &Arc<dyn VfsInode>, shrink: impl FnOnce() -> u64) -> Result<(), &'static str> {
         use crate::user::copy_from_user;
         let space = crate::sched::current_address_space().ok_or("no address space")?;
-        let guard = OpenGuard::try_new(Arc::clone(f)).map_err(|_| "guard")?;
-        let file = crate::mm::user_vm::MappedFile::new(guard, "/ktest/shrunk");
+        let flags = OpenFlags::from_bits(OpenFlags::O_RDWR);
+        let file = KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from("/ktest/shrunk"), flags)
+            .map_err(|_| "open the file")?;
+        let file = crate::mm::user_vm::MappedFile::of(&file);
         let rw = Prot::READ | Prot::WRITE;
-        let va = space
-            .mmap_file(MapPlace::Hint(None), 3 * P, rw, file, 0, Sharing::Shared { may_write: true })
-            .map_err(|_| "mmap_file")?;
+        let va = space.mmap_file(MapPlace::Hint(None), 3 * P, rw, file, 0, Sharing::Shared).map_err(|_| "mmap_file")?;
         let mut byte = [0u8; 1];
         for i in 0..3 {
             kassert_eq!(copy_from_user(&mut byte, va + i * P + 200), Ok(()));
