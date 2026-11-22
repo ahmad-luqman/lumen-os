@@ -4,7 +4,8 @@ Used by:
 - `tools/mkrootfs.sh` / `Makefile` build-time ELF checks on `build/linux/*`
 - `tests/scenarios/test_fs.py`, `test_linux_user.py`, `test_alpine.py` (M7-M8):
   matched `(mke2fs, e2fsck)` discovery, per-test copy isolation of
-  `build/alpine-rootfs.ext4`, and post-QEMU `e2fsck -fn` integrity checks
+  `build/alpine-rootfs.ext4`, post-QEMU `e2fsck -fn` integrity checks, and
+  `debugfs` reads of what a guest left on the disk
 - `tests/harness/test_rootfs.py`
 """
 
@@ -32,6 +33,7 @@ DEFAULT_E2FSPROGS_DIRS = (
 )
 
 _INTERP_RE = re.compile(r"^\s*\[Requesting program interpreter:\s*(.+?)\]\s*$")
+_DEBUGFS_BANNER = re.compile(r"debugfs \S+ \(.*\)$")
 _NEEDED_RE = re.compile(r"\(NEEDED\)\s+Shared library:\s+\[([^\]]+)\]")
 
 
@@ -116,6 +118,33 @@ def e2fsck_check(image: Path, *, e2fsck: Path | None = None) -> None:
             f"e2fsck -fn failed on {image} (exit {proc.returncode})"
             + (f":\n{detail}" if detail else "")
         )
+
+
+def debugfs(image: Path, request: str, *, tool: Path | None = None) -> str:
+    """What `debugfs -R <request>` prints for `image`, opened read-only.
+    `debugfs` exits 0 even when it can't open the image or the request
+    fails, so any stderr line but its version banner is an error."""
+    if tool is None:
+        _, e2fsck = find_e2fsprogs()
+        tool = e2fsck.parent / "debugfs"
+    proc = subprocess.run(
+        [str(tool), "-R", request, str(image)], capture_output=True, text=True, check=False
+    )
+    errors = [line for line in proc.stderr.splitlines() if line and not _DEBUGFS_BANNER.match(line)]
+    if proc.returncode != 0 or errors:
+        raise RuntimeError(
+            f"debugfs -R {request!r} on {image} (exit {proc.returncode}): {proc.stderr}"
+        )
+    return proc.stdout
+
+
+def debugfs_names(image: Path, directory: str, *, tool: Path | None = None) -> set[str]:
+    """The names in `directory` on `image` (`debugfs`'s `ls -p`:
+    `/inode/mode/uid/gid/name/size/` lines), without `.` and `..`."""
+    rows = [
+        line.split("/") for line in debugfs(image, f"ls -p {directory}", tool=tool).splitlines()
+    ]
+    return {row[5] for row in rows if len(row) > 6} - {".", ".."}
 
 
 def parse_gnu_readobj(text: str) -> tuple[str | None, tuple[str, ...]]:
