@@ -747,10 +747,12 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
                 // Step 3: resolve demand paging in the current thread's
                 // `AddressSpace`. Drop `Arc<AddressSpace>` before step 4 so a
                 // fatal unwind never leaks a reference.
-                let resolved = in_user_range
-                    && crate::sched::current_address_space().is_some_and(|space| {
-                        space.handle_page_fault(cr2, frame.error_code) == crate::mm::user_vm::FaultResult::Resolved
-                    });
+                let fault = if in_user_range {
+                    crate::sched::current_address_space().map(|space| space.handle_page_fault(cr2, frame.error_code))
+                } else {
+                    None
+                };
+                let resolved = fault == Some(crate::mm::user_vm::FaultResult::Resolved);
 
                 // Step 4: disable interrupts (IF = 0, depth == 0) BEFORE
                 // returning to `lumen_isr_common` (keeping `swapgs; iretq`
@@ -760,10 +762,30 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
                 if resolved {
                     return;
                 }
+                // A kernel user copy fails with `-EFAULT` whatever the
+                // reason, a bus error included.
                 if let Some(target) = fixup_rip {
+                    if fault == Some(crate::mm::user_vm::FaultResult::OutOfMemory) {
+                        // The caller only sees `-EFAULT`: say why.
+                        log::warn!(
+                            target: "mm",
+                            "out of memory resolving a kernel user copy's fault at cr2 {cr2:#x}; returning EFAULT"
+                        );
+                    }
                     frame.rip = target;
                     frame.rflags &= !(1 << 18); // clear RFLAGS.AC
                     return;
+                }
+                if fault == Some(crate::mm::user_vm::FaultResult::BusError) {
+                    crate::user::handle_user_bus_error(frame, cr2);
+                }
+                if fault == Some(crate::mm::user_vm::FaultResult::OutOfMemory) {
+                    // Otherwise indistinguishable from a segfault below.
+                    log::warn!(
+                        target: "mm",
+                        "out of memory resolving a user page fault at cr2 {cr2:#x} (rip {:#x}); ending the process",
+                        frame.rip
+                    );
                 }
                 crate::user::handle_user_exception(frame, cr2);
             }

@@ -230,7 +230,14 @@ one is its own PR that updates that doc first.
   holds their registry (backtraces, overflow reports).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
   MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
-  PAT. `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
+  PAT.
+  `mm/user_vm.rs`: per-process address spaces (`AddressSpace`: VMAs,
+  ELF loading, anonymous and file-backed `mmap` (`mmap_file`, `Sharing`,
+  #255), `munmap`/`mprotect`/`brk`, the page-fault paths (zero-fill, the
+  page cache's pages, copy-on-write, dirty promotion, `FaultResult::BusError`),
+  `invalidate_file_from`, teardown; `pinned_pages`, `writable_maps` and
+  `mapped_files`; `release_order`, the ktests' unmap-order recorder).
+  `trace.rs`: trace rings (one per CPU), event kinds, `ktrace!`, the boot timeline
   (`Timeline`), and X-ray's rings (#198: one per CPU; typed recorders for run-queue
   changes, handled device interrupts and `SpinLock`s that waited; `read`: either ring
   of an online CPU, events since a sequence number with the gap counted; `cpus`). `acpi.rs`: ACPI
@@ -349,8 +356,10 @@ one is its own PR that updates that doc first.
   64 MiB hard cap, `QuotaCounter`, the detached-inode quota; `mmap_page`,
   re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
   for a mapping, through `VfsInode::as_any`, and `MappedPage::copy_to_frame` (under the cache lock)
-  for copy-on-write, #255; the last writable unmap leaving a page dirty,
-  #266); `vfs/ext4.rs`
+  for copy-on-write, #255; `WritableMap`, the guard counting a writable
+  shared PTE, made by `MappedPage::map_writable`; the last writable unmap
+  leaving a page dirty, #266; `ktest_files`, scratch tmpfs and ext4 volumes
+  for `mm::user_vm`'s file-backed ktests); `vfs/ext4.rs`
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, the
