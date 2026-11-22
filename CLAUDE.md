@@ -344,6 +344,12 @@ one is its own PR that updates that doc first.
   `vfs/tests.rs` the ktests of `mod.rs`'s code (`lumen_kernel::vfs::tests::`;
   `vfs/ext4.rs` and `vfs/page_cache.rs` keep their own; `MemBlkDev`, the
   in-memory block device those files' ktests use too, stays in `mod.rs`);
+  `mm/user_vm.rs`: per-process address spaces (`AddressSpace`: VMAs,
+  ELF loading, anonymous and file-backed `mmap` (`mmap_file`, `Sharing`,
+  #255), `munmap`/`mprotect`/`brk`, the page-fault paths (zero-fill, the
+  page cache's pages, copy-on-write, dirty promotion, `FaultResult::BusError`),
+  `invalidate_file_from`, teardown; `pinned_pages`, `writable_maps` and
+  `mapped_files`; `release_order`, the ktests' unmap-order recorder);
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
   64 MiB hard cap, `QuotaCounter`, the detached-inode quota; `mmap_page`,

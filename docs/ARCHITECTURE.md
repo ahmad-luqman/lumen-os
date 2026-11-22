@@ -745,10 +745,13 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     `clear_user_lower_half`, and `destroy_user_root` (`free_user_subtree`)
     **never** call `frame::free` on a `PTE_SHARED` leaf; instead the VM core
     removes `va` from `pinned_pages` (releasing the `Arc<CachePage>` pin)
-    once the walk has flushed the TLB. Every PTE removal in `user_vm` goes
-    through one helper (`unmap_range_locked`: `munmap`, `MAP_FIXED`, `brk`
-    shrink, the ELF loader's rollback, `invalidate_file_from`, a stale or
-    copy-on-write leaf).
+    once the walk has flushed the TLB. Every PTE removal from a live
+    address space goes through one helper (`unmap_range_locked`: `munmap`,
+    `MAP_FIXED`, `brk` shrink, the ELF loader's rollback,
+    `invalidate_file_from`, a stale or copy-on-write leaf); `teardown` and
+    `Drop` sweep the whole lower half themselves, after the switch away
+    from its `CR3`. A ktest-only recorder (`user_vm::release_order`) checks
+    each page's clear, flush and release happen in that order.
 
   **File-backed `#PF` and coherence protocol (M7, designed in #246):**
   - **EOF and `SIGBUS`:** for a `Backing::File(fm)` VMA, let
@@ -763,7 +766,11 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     for a page `mmap_page` can't hand out: a failed disk read (`Io`, which
     `ext4` logs naming the device, inode and page), a quota or the `ext4`
     hard limit refusing a new page or an unlinked inode (`NoSpc`, `NoEnt`:
-    one `WARN` from `mm`); only `NoMem` is `OutOfMemory` instead. For a partial
+    a `WARN` from `mm` for a ring-3 fault, once per streak of the same file
+    and error, and only a `debug` line for a kernel user copy); only `NoMem`
+    is `OutOfMemory` instead, which for a ring-3 fault logs one `WARN` from
+    `mm` (out of memory resolving a user page fault) before the process
+    ends as for any fatal fault. For a partial
     final page (`file_off < file_size < file_off + 4096`), bytes past
     `file_size` are zero-filled; writes past `file_size` never extend the file
     (writeback clamps to `min(4096, file_size - page_off)`, and subsequent file
@@ -840,7 +847,8 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       write-fault dirty tracking on `MAP_SHARED` without ever wiping hardware
       `PTE_DIRTY` silently), and whenever the prior leaf was
       `(PRESENT && WRITABLE)` follows the unmap order above (propagate
-      `PTE_DIRTY`, flush the TLB, then `dec_writable_maps()`).
+      `PTE_DIRTY` and flush the TLB per leaf; once the walk is done, drop
+      the range's `WritableMap`s, each calling `dec_writable_maps()`).
       When `prot` is non-`PROT_NONE` (including write-only `PROT_WRITE`),
       clearing `WRITABLE = 0` keeps `PRESENT = 1` (never turning a writable
       mapping into `PTE_PROTNONE`). Already CoW-split `PTE_SHARED = 0` leaves
@@ -856,10 +864,13 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       shrinking a file to `new_size` acquires `AddressSpace::inner` (Lock 1)
       **before** `VfsInode` (Lock 4) and unmaps all file-VMA PTEs covering
       `file_off >= align_up_page(new_size)` (in the unmap order above:
-      propagating `PTE_DIRTY`, issuing `invlpg`, then `dec_writable_maps()`;
-      then removing `pinned_pages` entries and freeing private CoW frames)
+      per leaf, propagating `PTE_DIRTY`, issuing `invlpg` and freeing a
+      private CoW frame; once the walk is done, dropping the range's
+      `WritableMap`s and `pinned_pages` entries)
       alongside dropping `PageCache` entries
-      `>= new_size.div_ceil(4096)`. Subsequent accesses fault into `BusError` /
+      `>= new_size.div_ceil(4096)`. `invalidate_file_from` works only on
+      the address space loaded on the calling CPU (asserted: the flush is a
+      local `invlpg`) until M8's shootdowns. Subsequent accesses fault into `BusError` /
       `SIGBUS`, and later file growth can never split-brain against stale
       mapped frames. (In M8, multi-process mappings snapshot active
       `Weak<AddressSpace>` holders outside the inode lock and invalidate each in
@@ -867,7 +878,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     - `msync(addr, len, flags)` (syscall 26) returns `0` immediately on
       `len == 0` (after validating page-aligned `addr` and valid `flags`),
       succeeds as a no-op on `MAP_PRIVATE`/anonymous VMAs, and for `MAP_SHARED`
-      VMAs sweeps `PTE_DIRTY` into `CachePage::set_dirty()` and (for `MS_SYNC`)
+      VMAs sweeps `PTE_DIRTY` into `WritableMap::note_pte_dirty()` and (for `MS_SYNC`)
       flushes those inodes' dirty pages through `ext4` and
       `BlockDevice::flush()`.
 
@@ -891,8 +902,8 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   process's entries), and user page-table mappings (walking L4
   entries 0–255, freeing **only** non-`PTE_SHARED` leaf frames—decrementing
   refcounts from M8 onward—and user L1/L2/L3 tables). Removed `mapped_files`
-  `OpenGuard` entries (from `teardown()`, `munmap()`, or `MAP_FIXED`
-  replacement) are extracted and dropped **after** releasing
+  `OpenGuard` entries (from `teardown()`, `munmap()`, `MAP_FIXED`
+  replacement or a `brk` shrink) are extracted and dropped **after** releasing
   `AddressSpace::inner` (decrementing `inode.open_count` atomically via an RAII
   guard) so any deferred reclamation when the last open/mapped reference
   disappears never holds `AddressSpace::inner`. `AddressSpace::drop` (which may
@@ -5014,7 +5025,7 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError>`.
   `MappedPage` has private fields (the page, its `index`, the file's size
   and the owning inode), `copy_to_frame` and `map_writable` (below), and
-  getters: `page()`, the inode's
+  getters: `valid_len()` (the page's bytes below the file's size), `page()`, the inode's
   own cached `Arc<CachePage>` at `index` (offset `index * 4096`), the same
   `Arc` `read_at`/`write_at` use (another call returns it again while it
   stays cached), and `file_size()`, read under the same Lock 4 hold.

@@ -332,9 +332,11 @@ pub enum UserExit {
     /// Kernel refused to execute `sysretq`/`iretq` to a non-canonical or
     /// kernel-half return `rip`.
     NonCanonicalRip(u64),
-    /// A ring-3 access to a file-backed page that can't be had: wholly past
-    /// the file's end, or unreadable (`FaultResult::BusError`). Linux sends
-    /// `SIGBUS`; Lumen ends the process (signals arrive in M8).
+    /// A ring-3 access to a file-backed page that can't be had
+    /// (`FaultResult::BusError`): wholly past the file's end, unreadable, or
+    /// refused by the page cache (a quota, the `ext4` hard limit, an
+    /// unlinked inode). Linux sends `SIGBUS`; Lumen ends the process
+    /// (signals arrive in M8).
     BusError { rip: u64, cr2: u64 },
 }
 
