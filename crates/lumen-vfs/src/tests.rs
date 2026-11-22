@@ -1077,11 +1077,19 @@ fn mount_table_dotdot_crossing_stacked_mounts_and_exdev() {
     assert_eq!(rename_at2(&env, None, b"/", None, b"/mnt/dst", RenameFlags(0)).unwrap_err(), VfsError::XDev);
     assert_eq!(rename_at2(&env, None, b"/src", None, b"/mnt/.", RenameFlags(0)).unwrap_err(), VfsError::XDev);
     assert_eq!(link_at(&env, None, b"/", None, b"/mnt/hl", true, false).unwrap_err(), VfsError::XDev);
+    // link's EEXIST and ENOENT for the new name come before EXDEV.
+    open_inode(&env, None, b"/mnt/dst", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    assert_eq!(link_at(&env, None, b"/src", None, b"/mnt/dst", true, false).unwrap_err(), VfsError::Exist);
+    assert_eq!(link_at(&env, None, b"/src", None, b"/mnt/free/", true, false).unwrap_err(), VfsError::NoEnt);
 
     // Busy mountpoint cannot be rmdir'd or overwritten by rename
     assert_eq!(unlink_at(&env, None, b"/mnt", true).unwrap_err(), VfsError::Busy);
     mkdir_at(&env, None, b"/other", 0o755, 0).unwrap();
     assert_eq!(rename_at2(&env, None, b"/other", None, b"/mnt", RenameFlags(0)).unwrap_err(), VfsError::Busy);
+    // The types come before a mountpoint's EBUSY (`may_delete`, then
+    // `is_local_mountpoint`).
+    assert_eq!(rename_at2(&env, None, b"/mnt", None, b"/src", RenameFlags(0)).unwrap_err(), VfsError::NotDir);
+    assert_eq!(rename_at2(&env, None, b"/src", None, b"/mnt", RenameFlags(0)).unwrap_err(), VfsError::IsDir);
 }
 
 #[test]
@@ -1147,6 +1155,8 @@ fn unlink_rmdir_and_renameat2_error_matrix() {
     // A last name that isn't UTF-8 names nothing: ENOENT (until #268).
     assert_eq!(unlink_at(&env, None, b"/\xff", false).unwrap_err(), VfsError::NoEnt);
     assert_eq!(mkdir_at(&env, None, b"/d/\xff", 0o755, 0).unwrap_err(), VfsError::NoEnt);
+    let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR);
+    assert_eq!(open_inode(&env, None, b"/d/\xff", creat, 0o644, 0).unwrap_err(), VfsError::NoEnt);
 
     // 18. rmdir error matrix
     assert_eq!(unlink_at(&env, None, b"/f", true).unwrap_err(), VfsError::NotDir);
@@ -1192,6 +1202,30 @@ fn unlink_rmdir_and_renameat2_error_matrix() {
     assert_eq!(rename_at2(&env, None, b"/f", None, b"/d", RenameFlags(0)).unwrap_err(), VfsError::IsDir);
     assert_eq!(rename_at2(&env, None, b"/f", None, b"/d/", RenameFlags(0)).unwrap_err(), VfsError::NotDir);
     assert_eq!(rename_at2(&env, None, b"/f", None, b"/none/", RenameFlags(0)).unwrap_err(), VfsError::NotDir);
+    // ... but a directory may be renamed to a slashed new name.
+    mkdir_at(&env, None, b"/d2src", 0o755, 0).unwrap();
+    rename_at2(&env, None, b"/d2src", None, b"/d2/", RenameFlags(0)).unwrap();
+    assert_eq!(resolve_path(&env, None, b"/d2", ResolveFlags::default()).unwrap().inode.inode_type(), InodeType::Dir);
+    unlink_at(&env, None, b"/d2", true).unwrap();
+    // RENAME_NOREPLACE's EEXIST comes before the trailing slashes' ENOTDIR,
+    // the same inode both sides included.
+    let noreplace = RenameFlags(RenameFlags::NOREPLACE);
+    assert_eq!(rename_at2(&env, None, b"/f", None, b"/f/", noreplace).unwrap_err(), VfsError::Exist);
+    assert_eq!(rename_at2(&env, None, b"/f/", None, b"/g", noreplace).unwrap_err(), VfsError::Exist);
+    // The ancestry traps come before the types: the source an ancestor of the
+    // new name's directory is EINVAL (not ENOTDIR onto a file), the new name
+    // an ancestor of the source's directory ENOTEMPTY (not EISDIR), EINVAL
+    // when exchanging.
+    mkdir_at(&env, None, b"/dx", 0o755, 0).unwrap();
+    mkdir_at(&env, None, b"/dx/sub", 0o755, 0).unwrap();
+    open_inode(&env, None, b"/dx/sub/f", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    assert_eq!(rename_at2(&env, None, b"/dx", None, b"/dx/sub/f", RenameFlags(0)).unwrap_err(), VfsError::Inval);
+    assert_eq!(rename_at2(&env, None, b"/dx/sub/f", None, b"/dx", RenameFlags(0)).unwrap_err(), VfsError::NotEmpty);
+    let exchange = RenameFlags(RenameFlags::EXCHANGE);
+    assert_eq!(rename_at2(&env, None, b"/dx/sub/f", None, b"/dx", exchange).unwrap_err(), VfsError::Inval);
+    unlink_at(&env, None, b"/dx/sub/f", false).unwrap();
+    unlink_at(&env, None, b"/dx/sub", true).unwrap();
+    unlink_at(&env, None, b"/dx", true).unwrap();
     // Not a name: EBUSY on the old side; on the new side EBUSY, or EEXIST
     // with NOREPLACE.
     for not_a_name in [&b"/"[..], b"/d/.", b"/d/.."] {

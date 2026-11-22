@@ -232,9 +232,11 @@ impl UserPath {
         self.0.is_empty()
     }
 
-    /// The path as text, for the calls that take a `&str`. The one place the
-    /// rule lives: a path that isn't UTF-8 names nothing the VFS can hold
-    /// yet, so `-ENOENT` (#268 makes VFS names byte strings).
+    /// The path as text, for the calls that take a `&str`. A path that isn't
+    /// UTF-8 names nothing the VFS can hold yet, so `-ENOENT` (#268 makes VFS
+    /// names byte strings). The same rule lives in lumen-vfs's resolver, for
+    /// a middle component (`resolve_path`) and a final name
+    /// (`resolve_parent`): #268 changes all three.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // for wave 3's `&str` VFS calls; the ktests until then
     pub(super) fn as_str(&self) -> Result<&str, u32> {
         core::str::from_utf8(&self.0).map_err(|_| errno::ENOENT)

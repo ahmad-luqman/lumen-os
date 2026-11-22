@@ -391,6 +391,9 @@ pub(crate) fn resolve_path_with_depth(
 
 /// Resolve the parent directory and final component name for namespace-mutating
 /// operations (`open(O_CREAT)`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`, `rename`).
+///
+/// A final name that isn't UTF-8 is `NoEnt`, as `resolve_path` says for any
+/// other component: VFS names are `&str` until #268.
 pub fn resolve_parent(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,

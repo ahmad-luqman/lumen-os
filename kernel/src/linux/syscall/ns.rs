@@ -3,11 +3,19 @@
 //! `readlinkat`, `rename`, `renameat`, `renameat2`.
 //!
 //! Each legacy call is its `*at` form from `Dirfd::Cwd`, and each `*at` form
-//! reaches lumen-vfs only through `at::start_dir`'s `Start`. As Linux does,
-//! a flags argument (and `readlinkat`'s `bufsiz`) is checked before any path
-//! is copied in, so a bad flag is `-EINVAL` even with a bad pointer.
+//! reaches lumen-vfs only through `at::start_dir`'s `Start`. A flags
+//! argument (and `readlinkat`'s `bufsiz`) is checked before any path is
+//! copied in, so a bad flag is `-EINVAL` even with a bad pointer, as on
+//! Linux (whose wrappers copy the paths first, but check the flags before
+//! they look at them).
 //!
 //! Where Lumen differs from Linux:
+//! - A call taking two paths copies both in before resolving either dirfd,
+//!   so a bad second pointer is `-EFAULT` ahead of a bad first dirfd's
+//!   `-EBADF`; Linux resolves each path as it copies it.
+//! - `mkdir` and `symlink` onto a name in use on a read-only filesystem are
+//!   `-EROFS`; Linux says `-EEXIST` (lumen-vfs checks the filesystem before
+//!   looking the name up; `link` looks first).
 //! - `RENAME_WHITEOUT` is `-EINVAL` (Linux allows it for root on tmpfs and
 //!   ext4; there are no whiteouts here).
 //! - A name that isn't UTF-8 is `-ENOENT`, as a path component anywhere
@@ -19,8 +27,12 @@
 //! - A last component that isn't a name (`/`, `.`, `..`): `unlink` says
 //!   `-EISDIR` for all three, `rmdir` `-EBUSY`, `-EINVAL` and `-ENOTEMPTY`,
 //!   `rename` `-EBUSY` (`-EEXIST` on the new side with
-//!   `RENAME_NOREPLACE`), after `-EXDEV`; `mkdir` and `link` onto one say
-//!   `-EEXIST`.
+//!   `RENAME_NOREPLACE`), though `-EXDEV` comes ahead of it; `mkdir` and
+//!   `link` onto one say `-EEXIST`.
+//! - `rename` checks in `do_renameat2`'s order (lumen-vfs's `rename_at2`):
+//!   `RENAME_NOREPLACE`'s `-EEXIST` before a trailing slash's `-ENOTDIR`,
+//!   the ancestry traps (`-EINVAL`, `-ENOTEMPTY`) before the types, the
+//!   types before a mountpoint's `-EBUSY`.
 //! - `linkat`'s `AT_EMPTY_PATH` links the descriptor's own file, as Linux
 //!   does for a caller with `CAP_DAC_READ_SEARCH` (every process here runs
 //!   as root); a file with no links left is `-ENOENT`.
@@ -352,9 +364,11 @@ mod kt {
     pub(super) fn on_tmpfs_and_ext4(name: &str, minor: u32, body: fn(&str) -> R) -> R {
         let tmp = format!("/tmp/ns-ktest-{name}");
         mkdir(&tmp)?;
-        run_on("tmpfs", &tmp, body)?;
-        lumen_vfs::unlink_at(tables(), None, tmp.as_bytes(), true)
-            .map_err(|e| failed("the tmpfs run left files behind", e))?;
+        let ran = run_on("tmpfs", &tmp, body);
+        let removed = lumen_vfs::unlink_at(tables(), None, tmp.as_bytes(), true)
+            .map_err(|e| failed("the tmpfs run left files behind", e));
+        ran?;
+        removed?;
 
         let fs = crate::vfs::ktest_ext4(minor)?;
         let mnt = format!("/tmp/ns-ktest-ext4-{name}");
@@ -485,6 +499,11 @@ fn ktest_unlink(base: &str) -> kt::R {
     let dfd = open(2, &p("d"), O::O_RDONLY | O::O_DIRECTORY)?;
     kassert_eq!(sys_unlinkat(Dirfd::Fd(dfd), up(3, "g")?, AtFlags(0)), 0);
     kassert_eq!(lstat(&p("d/g")).map(drop), Err(VfsError::NoEnt));
+    // Relative to the cwd.
+    kt::file(&p("d/h"), b"h")?;
+    let rel = up(3, "h")?;
+    kassert_eq!(kt::in_cwd(&p("d"), || sys_unlink(rel))?, 0);
+    kassert!(kt::gone(&p("d/h")));
     // A symlink goes, not what it names.
     kt::file(&p("t"), b"t")?;
     kt::symlink("t", &p("s"))?;
@@ -850,13 +869,18 @@ fn ktest_rename(base: &str) -> kt::R {
     kt::mkdir(&p("empty"))?;
     kassert_eq!(sys_rename(up(1, &p("p"))?, up(2, &p("empty"))?), 0);
     kassert!(gone("p") && lstat(&p("empty/q")).is_ok());
-    // EISDIR: a file onto a directory, but ENOTDIR with a trailing slash
-    // (checked first); ENOTDIR: a directory onto a file.
+    // EISDIR: a file onto a directory; when the source isn't a directory, a
+    // trailing slash on the new name is ENOTDIR, ahead of the types.
     kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, &p("empty"))?), e(errno::EISDIR));
     kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, &p("empty/"))?), e(errno::ENOTDIR));
+    // A directory may take a trailing slash on its new name.
+    kassert_eq!(sys_rename(up(1, &p("empty"))?, up(2, &p("empty2/"))?), 0);
+    kassert!(gone("empty") && lstat(&p("empty2/q")).is_ok());
+    kassert_eq!(sys_rename(up(1, &p("empty2"))?, up(2, &p("empty"))?), 0);
+    // ENOTDIR: a directory onto a file.
     kassert_eq!(sys_rename(up(1, &p("empty"))?, up(2, &p("c2"))?), e(errno::ENOTDIR));
-    // EXDEV: onto the root filesystem (which gets nothing), and before
-    // anything else, `/` on either side included.
+    // EXDEV: onto the root filesystem (which gets nothing), ahead of the
+    // EBUSY `/` would give on either side.
     kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, "/ns-ktest-xdev")?), e(errno::EXDEV));
     kassert!(kt::gone("/ns-ktest-xdev"));
     kassert_eq!(sys_rename(up(1, "/")?, up(2, &p("x"))?), e(errno::EXDEV));
@@ -866,8 +890,8 @@ fn ktest_rename(base: &str) -> kt::R {
     for not_a_name in [p("."), p("..")] {
         kassert_eq!(sys_rename(up(1, &not_a_name)?, up(2, &p("x"))?), e(errno::EBUSY));
         kassert_eq!(sys_rename(up(1, &p("c2"))?, up(2, &not_a_name)?), e(errno::EBUSY));
-        let not_a_name = up(2, &not_a_name)?;
-        kassert_eq!(sys_renameat2(cwd, up(1, &p("c2"))?, cwd, not_a_name, noreplace), e(errno::EEXIST));
+        let new = up(2, &not_a_name)?;
+        kassert_eq!(sys_renameat2(cwd, up(1, &p("c2"))?, cwd, new, noreplace), e(errno::EEXIST));
     }
     // ENOENT, ENOTDIR, EFAULT (either pointer), EBADF (either dirfd), ELOOP.
     kassert_eq!(sys_rename(up(1, &p("none"))?, up(2, &p("x"))?), e(errno::ENOENT));
