@@ -1000,7 +1000,8 @@ fn non_utf8(d: &[u8]) -> R {
     eq("mkdir u", s2(nr::MKDIR, u.at(), 0o755), 0)?;
     let file = j(u.bytes(), FILE);
     put(&file, b"x")?;
-    eq("mkdir a non-UTF-8 directory", s2(nr::MKDIR, j(u.bytes(), DIR).at(), 0o755), 0)?;
+    let dir = j(u.bytes(), DIR);
+    eq("mkdir a non-UTF-8 directory", s2(nr::MKDIR, dir.at(), 0o755), 0)?;
     let ln = j(u.bytes(), b"ln");
     eq("symlink to a non-UTF-8 target", s2(nr::SYMLINK, P::new(&[TARGET]).at(), ln.at()), 0)?;
     link_is("readlink gives the target's bytes", &ln, TARGET)?;
@@ -1027,8 +1028,8 @@ fn non_utf8(d: &[u8]) -> R {
     r?;
     // getcwd inside the directory gives its name's bytes.
     let r = (|| {
-        eq("chdir into it", s1(nr::CHDIR, j(u.bytes(), DIR).at()), 0)?;
-        cwd_is("getcwd in a non-UTF-8 directory", j(u.bytes(), DIR).bytes())
+        eq("chdir into it", s1(nr::CHDIR, dir.at()), 0)?;
+        cwd_is("getcwd in a non-UTF-8 directory", dir.bytes())
     })();
     s1(nr::CHDIR, ptr(&b"/\0"[..]));
     r?;
@@ -1045,7 +1046,7 @@ fn non_utf8(d: &[u8]) -> R {
     eq("unlink the hard link", s1(nr::UNLINK, hard.at()), 0)?;
     eq("unlink it", s1(nr::UNLINK, renamed.at()), 0)?;
     eq("unlink the link", s1(nr::UNLINK, ln.at()), 0)?;
-    eq("rmdir the non-UTF-8 directory", s1(nr::RMDIR, j(u.bytes(), DIR).at()), 0)?;
+    eq("rmdir the non-UTF-8 directory", s1(nr::RMDIR, dir.at()), 0)?;
     eq("rmdir u once empty", s1(nr::RMDIR, u.at()), 0)
 }
 
@@ -1385,23 +1386,25 @@ fn locks(d: &[u8]) -> c_int {
 /// and a directory moved to another parent. Each check reads back what it
 /// made, as `keep-check` does on a later boot, from the disk.
 fn keep(d: &[u8]) -> c_int {
-    let checks: [(&str, &dyn Fn() -> R); 5] = [
+    let checks: [(&str, &dyn Fn() -> R); 6] = [
         ("setup", &|| eq("mkdir the directory", s2(nr::MKDIR, P::new(&[d]).at(), 0o755), 0)),
         ("hard-link-and-symlinks", &|| keep_links(d).and_then(|()| kept_links(d))),
         ("metadata", &|| keep_metadata(d).and_then(|()| kept_metadata(d))),
         ("exchanged-file-and-directory", &|| keep_exchange(d).and_then(|()| kept_exchange(d))),
         ("moved-directory", &|| keep_moved(d).and_then(|()| kept_moved(d))),
+        ("non-utf8-names", &|| keep_odd(d).and_then(|()| kept_odd(d))),
     ];
     run_checks(&checks)
 }
 
 /// `keep-check <dir>`: what `keep` left in `<dir>`, read on a later boot.
 fn keep_check(d: &[u8]) -> c_int {
-    let checks: [(&str, &dyn Fn() -> R); 4] = [
+    let checks: [(&str, &dyn Fn() -> R); 5] = [
         ("hard-link-and-symlinks", &|| kept_links(d)),
         ("metadata", &|| kept_metadata(d)),
         ("exchanged-file-and-directory", &|| kept_exchange(d)),
         ("moved-directory", &|| kept_moved(d)),
+        ("non-utf8-names", &|| kept_odd(d)),
     ];
     run_checks(&checks)
 }
@@ -1486,6 +1489,33 @@ fn kept_moved(d: &[u8]) -> R {
     let in_p2 = st("stat p2", stat(&p2))?;
     eq("p2's links", in_p2.nlink() as i64, 3)?;
     eq("m's ..", st("stat p2/m/..", stat(&P::new(&[p2.bytes(), b"/m/.."])))?.ino() as i64, in_p2.ino() as i64)
+}
+
+/// A file and a symlink whose names (and the link's target) aren't UTF-8
+/// (#268), left on the disk for e2fsck and a cold read on the next boot.
+const ODD_FILE: &[u8] = b"\xff\xfe-kept";
+const ODD_LINK: &[u8] = b"\xc3(-sl";
+const ODD_TARGET: &[u8] = b"\xe2\x28\xa1-target";
+
+fn keep_odd(d: &[u8]) -> R {
+    put(&j(d, ODD_FILE), b"odd")?;
+    eq("symlink at a non-UTF-8 name", s2(nr::SYMLINK, P::new(&[ODD_TARGET]).at(), j(d, ODD_LINK).at()), 0)
+}
+
+fn kept_odd(d: &[u8]) -> R {
+    holds(&j(d, ODD_FILE), b"odd")?;
+    link_is("the non-UTF-8 link's target", &j(d, ODD_LINK), ODD_TARGET)?;
+    // Listed by getdents64 under its own bytes.
+    let fd = ok("open the directory", open(&P::new(&[d]), O_RDONLY | O_DIRECTORY, 0))?;
+    let mut got = no_entries::<32>();
+    let n = list(fd, 1024, &mut got);
+    close(fd);
+    let n = n?;
+    for name in [ODD_FILE, ODD_LINK] {
+        let times = got[..n].iter().filter(|e| &e.name[..e.len] == name).count();
+        eq("a kept non-UTF-8 name listed once", times as i64, 1)?;
+    }
+    Ok(())
 }
 
 fn flk(fd: i64, op: u64) -> i64 {

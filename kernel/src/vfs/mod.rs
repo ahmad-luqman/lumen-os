@@ -1714,7 +1714,7 @@ pub(crate) fn ktest_ext4(dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'
 /// writable mount it is made on and `0:minor+1`) whose root holds, after
 /// `.` and `..`, the names `a0` to `a5` (hard links to one file) with `a3`
 /// renamed on disk to the bytes `ff fe`, not UTF-8, which `readdir` lists
-/// as any other name (#268), for the FD layer's ktests.
+/// as any other name (#268), for the ktests (ext4's and the FD layer's).
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_ext4_non_utf8(minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
     use ext4::ktest_util::{ROOT_DIR_BLOCK_4K, image, mount, mount_ro_image};

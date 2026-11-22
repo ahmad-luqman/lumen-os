@@ -158,7 +158,8 @@ struct Line<'a> {
 }
 
 /// A line's bytes appended to the listing, counted for the padding: text
-/// through `fmt::Write`, a path's raw bytes through [`Counted::bytes`].
+/// through [`Counted::text`] (or `fmt::Write`, for the fields), a path's raw
+/// bytes through [`Counted::bytes`]. Appending to a `Vec` can't fail.
 struct Counted<'w> {
     out: &'w mut Vec<u8>,
     written: usize,
@@ -168,6 +169,10 @@ impl Counted<'_> {
     fn bytes(&mut self, b: &[u8]) {
         self.written += b.len();
         self.out.extend_from_slice(b);
+    }
+
+    fn text(&mut self, s: &str) {
+        self.bytes(s.as_bytes());
     }
 }
 
@@ -180,7 +185,7 @@ impl fmt::Write for Counted<'_> {
 
 impl Line<'_> {
     /// Write the line (with its `\n`).
-    fn write(&self, out: &mut Vec<u8>) -> fmt::Result {
+    fn write(&self, out: &mut Vec<u8>) {
         let (start, end, offset) = (self.start, self.end, self.offset);
         let r = if self.prot.read() { 'r' } else { '-' };
         let w = if self.prot.write() { 'w' } else { '-' };
@@ -191,48 +196,48 @@ impl Line<'_> {
             Name::None | Name::Label(_) => (0, 0, 0),
         };
         let mut out = Counted { out, written: 0 };
-        write!(out, "{start:08x}-{end:08x} {r}{w}{x}{sp} {offset:08x} {major:02x}:{minor:02x} {ino}")?;
+        // `Counted`'s `write_str` is always `Ok`.
+        let _ = write!(out, "{start:08x}-{end:08x} {r}{w}{x}{sp} {offset:08x} {major:02x}:{minor:02x} {ino}");
         match self.name {
             Name::None => {}
             Name::Label(label) => {
-                pad(&mut out)?;
-                out.write_str(label)?;
+                pad(&mut out);
+                out.text(label);
             }
             Name::File(f) => {
-                pad(&mut out)?;
+                pad(&mut out);
                 // `seq_path(.., "\n")`: the path's bytes as they are,
                 // UTF-8 or not (#268), but a newline as `\012`.
                 for (i, part) in f.path.split(|&b| b == b'\n').enumerate() {
                     if i > 0 {
-                        out.write_str("\\012")?;
+                        out.text("\\012");
                     }
                     out.bytes(part);
                 }
                 if f.deleted {
-                    out.write_str(" (deleted)")?;
+                    out.text(" (deleted)");
                 }
             }
         }
-        out.write_char('\n')
+        out.text("\n");
     }
 }
 
 /// The space after the inode, padding to [`NAME_PAD`], and the space
 /// before the name.
-fn pad(out: &mut Counted<'_>) -> fmt::Result {
-    out.write_char(' ')?;
+fn pad(out: &mut Counted<'_>) {
+    out.text(" ");
     while out.written < NAME_PAD {
-        out.write_char(' ')?;
+        out.text(" ");
     }
-    out.write_char(' ')
+    out.text(" ");
 }
 
 /// Write the maps lines of `vmas` (in address order) to `out`: a
 /// file-backed VMA named by `files` (its `file_id` to the file, or `None`),
 /// an anonymous one by `layout` (`[heap]`, `[stack]`) or `images` (each
 /// range's file as `image_file` shows it). Bytes, not text: a path is
-/// written as its bytes, UTF-8 or not. Appending to `out` can't fail: the
-/// result is `Ok`.
+/// written as its bytes, UTF-8 or not.
 pub fn write_maps<'a, 'n, F, I, R>(
     out: &mut Vec<u8>,
     vmas: impl IntoIterator<Item = &'a Vma>,
@@ -240,8 +245,7 @@ pub fn write_maps<'a, 'n, F, I, R>(
     images: &'n [ImageRange<F>],
     image_file: I,
     files: R,
-) -> fmt::Result
-where
+) where
     I: Fn(&'n F) -> FileInfo<'n>,
     R: Fn(u64) -> Option<FileInfo<'n>>,
 {
@@ -251,11 +255,11 @@ where
         let (start, end, prot) = (vma.start, vma.end, vma.prot);
         if let Backing::File(fm) = vma.backing {
             let name = files(fm.file_id).map_or(Name::None, Name::File);
-            Line { start, end, prot, shared: fm.shared, offset: fm.offset, name }.write(out)?;
+            Line { start, end, prot, shared: fm.shared, offset: fm.offset, name }.write(out);
             continue;
         }
         if vma.start >= layout.stack_bottom && vma.end <= layout.stack_top {
-            Line { start, end, prot, shared: false, offset: 0, name: Name::Label(STACK) }.write(out)?;
+            Line { start, end, prot, shared: false, offset: 0, name: Name::Label(STACK) }.write(out);
             continue;
         }
         // Split at the heap's edges and the images' ranges' edges: no edge
@@ -271,11 +275,10 @@ where
             } else {
                 (Name::None, 0)
             };
-            Line { start: at, end: next, prot, shared: false, offset, name }.write(out)?;
+            Line { start: at, end: next, prot, shared: false, offset, name }.write(out);
             at = next;
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -342,7 +345,7 @@ mod tests {
         images: &[ImageRange<FileInfo<'static>>],
     ) -> String {
         let mut out = Vec::new();
-        write_maps(&mut out, vmas, layout, images, |f| *f, resolve).unwrap();
+        write_maps(&mut out, vmas, layout, images, |f| *f, resolve);
         String::from_utf8(out).unwrap()
     }
 
@@ -419,7 +422,7 @@ mod tests {
         let vma = file_id(1, 0x55d0_c5a3_b000, 0x55d0_c5a3_d000, Prot::READ, 0, false);
         let mut out = Vec::new();
         let cat = FileInfo { major: 8, minor: 2, ino: 1_572_898, path: b"/usr/bin/cat", deleted: false };
-        write_maps(&mut out, &[vma], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(cat)).unwrap();
+        write_maps(&mut out, &[vma], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(cat));
         let out = String::from_utf8(out).unwrap();
         assert_eq!(out, "55d0c5a3b000-55d0c5a3d000 r--p 00000000 08:02 1572898                    /usr/bin/cat\n");
         assert_eq!(out.find('/'), Some(73));
@@ -432,7 +435,7 @@ mod tests {
         let wide = FileInfo { major: 0xfff, minor: 0xf_ffff, ino: u64::MAX, ..TMP_FILE };
         let vma = file(0x7fff_ffff_e000, 0x7fff_ffff_f000, RW, 0xffff_ffff_ffff_f000, true);
         let mut out = Vec::new();
-        write_maps(&mut out, &[vma], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(wide)).unwrap();
+        write_maps(&mut out, &[vma], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(wide));
         let out = String::from_utf8(out).unwrap();
         assert_eq!(
             out,
@@ -587,8 +590,7 @@ mod tests {
             NO_IMAGES,
             |f| *f,
             |_| Some(gone),
-        )
-        .unwrap();
+        );
         assert_eq!(out, named("10000000-10001000 rw-s 00000000 00:02 12", "/tmp/a\\012b (deleted)").as_bytes());
     }
 
@@ -596,13 +598,13 @@ mod tests {
     fn a_path_that_is_not_utf8_is_written_as_its_bytes() {
         // #268: the path's bytes as they are (Linux's `seq_path` escapes
         // only the newline), never a lossy U+FFFD.
-        let odd = FileInfo { path: b"/tmp/\xff\xfe\nx", ..TMP_FILE };
+        // Two newlines: each is escaped, so a name can't forge a line.
+        let odd = FileInfo { path: b"/tmp/\xff\n\xfe\nx", ..TMP_FILE };
         let mut out = Vec::new();
-        write_maps(&mut out, &[file(0x1000_0000, 0x1000_1000, RW, 0, true)], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(odd))
-            .unwrap();
+        write_maps(&mut out, &[file(0x1000_0000, 0x1000_1000, RW, 0, true)], &LAYOUT, NO_IMAGES, |f| *f, |_| Some(odd));
         let mut want = named("10000000-10001000 rw-s 00000000 00:02 12", "").into_bytes();
         want.pop(); // the newline after the name
-        want.extend_from_slice(b"/tmp/\xff\xfe\\012x\n");
+        want.extend_from_slice(b"/tmp/\xff\\012\xfe\\012x\n");
         assert_eq!(out, want);
     }
 

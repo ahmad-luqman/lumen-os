@@ -1133,6 +1133,13 @@ fn non_utf8_names_are_bytes_through_every_operation() {
     // lossy name would make them one).
     let (other, _) = open_inode(&env, None, b"/d\xff/\xfe\xfcfile", creat, 0o644, 0).unwrap();
     assert_ne!(other.ino(), file.ino());
+    // Each resolves to its own inode with the other's dentry cached: the
+    // first name, looked up after the second is cached, tells a lossy key
+    // apart (it would hand back the second's inode).
+    for (name, want) in [(&b"/d\xff/\xfe\xfcfile"[..], &other), (b"/d\xff/\xfe\xfdfile", &file)] {
+        let got = resolve_path(&env, None, name, ResolveFlags::default()).unwrap().inode;
+        assert!(Arc::ptr_eq(&got, want), "{:?} resolves to its own inode", Escaped(name));
+    }
     let mut names = listed_names(&dir);
     names.sort();
     assert_eq!(names, [b"\xfe\xfcfile".to_vec(), b"\xfe\xfdfile".to_vec()]);
@@ -1173,6 +1180,8 @@ fn escaped_shows_every_name_apart() {
     // would drive a terminal or reorder the line: escaped too.
     assert_eq!(format!("{}", Escaped("csi\u{9b}2J rlo\u{202e}".as_bytes())), "csi\\u{9b}2J rlo\\u{202e}");
     assert_eq!(format!("{}", Escaped(b"it's")), "it's");
+    // Under `{}` a `"` is itself (only `{:?}` quotes and escapes it).
+    assert_eq!(format!("{}", Escaped(b"a\"b")), "a\"b");
     // The escape itself can't pass for a byte that needs one.
     assert_ne!(format!("{}", Escaped(b"\\xff")), format!("{}", Escaped(b"\xff")));
     assert_eq!(format!("{:?}", Escaped(b"say \"hi\"\xff")), "\"say \\\"hi\\\"\\xff\"");

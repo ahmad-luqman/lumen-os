@@ -210,7 +210,7 @@ fn ktest_pattern(len: usize, seed: u8) -> alloc::vec::Vec<u8> {
 fn ktest_install(inode: &alloc::sync::Arc<dyn VfsInode>, flags: u32) -> Result<Fd, &'static str> {
     let file = process::KernelFile::new_unchecked_flags(
         alloc::sync::Arc::clone(inode),
-        alloc::sync::Arc::from(&b"/io-ktest-volume/file"[..]),
+        alloc::sync::Arc::from(*b"/io-ktest-volume/file"),
         ktest_flags(flags),
     )
     .map_err(|_| "open the volume's file")?;

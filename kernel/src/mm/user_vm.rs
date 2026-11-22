@@ -1207,8 +1207,7 @@ impl AddressSpace {
                 deleted: inode.is_detached(),
             })
         };
-        // Appending to a `Vec` cannot fail.
-        let _ = lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout, &inner.images, image_file, files);
+        lumen_vm::maps::write_maps(&mut out, inner.vmas.iter(), &layout, &inner.images, image_file, files);
         out
     }
 
@@ -1888,14 +1887,40 @@ fn file_vm_open_ro(f: &Arc<dyn VfsInode>) -> Result<MappedFile, &'static str> {
 #[cfg(feature = "ktest")]
 fn file_vm_open_as(f: &Arc<dyn VfsInode>, flags: u32) -> Result<MappedFile, &'static str> {
     let flags = lumen_vfs::OpenFlags::from_bits(flags);
-    let file =
-        crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from(&b"/ktest/file"[..]), flags)
-            .map_err(|_| "open the file")?;
+    let file = crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from(*b"/ktest/file"), flags)
+        .map_err(|_| "open the file")?;
     Ok(MappedFile::of(&file))
 }
 
 #[cfg(feature = "ktest")]
 const RW: Prot = Prot::READ.union(Prot::WRITE);
+
+crate::ktest!(
+    fn file_vm_maps_names_a_mapped_file_by_its_path_bytes() {
+        // #268: a file mapped through a descriptor opened by a path that
+        // isn't UTF-8 and holds two newlines is named in `format_maps` by
+        // the path's bytes, each newline as `\012`: the listing stays one
+        // line, which a name can't split.
+        use crate::kassert;
+        use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        let vol = TmpfsVolume::new(272, 16 * PAGE_SIZE as usize);
+        let f = ktest_files::file(&vol.root, "maps.bin", &ktest_files::pattern(PAGE_SIZE as usize, 1))?;
+        let flags = lumen_vfs::OpenFlags::from_bits(lumen_vfs::OpenFlags::O_RDONLY);
+        let file =
+            crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(*b"/k/\xff\nf\n"), flags)
+                .map_err(|_| "open the file")?;
+        let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
+        let mapped =
+            space.mmap_file(MapPlace::Hint(None), PAGE_SIZE, Prot::READ, MappedFile::of(&file), 0, Sharing::Private);
+        drop(file);
+        let maps = space.format_maps();
+        space.teardown();
+        mapped.map_err(|_| "mmap_file")?;
+        kassert!(maps.ends_with(b" /k/\xff\\012f\\012\n"));
+        kassert!(maps.iter().filter(|&&b| b == b'\n').count() == 1);
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn file_vm_shared_mapping_is_coherent_both_ways() {

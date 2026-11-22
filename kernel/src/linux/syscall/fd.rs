@@ -894,9 +894,8 @@ fn ktest_append_from_every_cpu(inode: &alloc::sync::Arc<dyn VfsInode>) -> crate:
     const PER_CPU: usize = 256;
 
     let flags = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_APPEND);
-    let open = || {
-        KernelFile::new_unchecked_flags(alloc::sync::Arc::clone(inode), alloc::sync::Arc::from(&b"/append"[..]), flags)
-    };
+    let open =
+        || KernelFile::new_unchecked_flags(alloc::sync::Arc::clone(inode), alloc::sync::Arc::from(*b"/append"), flags);
     let files = [open().map_err(|_| "open A")?, open().map_err(|_| "open B")?];
     let cpus: Vec<usize> = (0..crate::arch::MAX_CPUS).filter(|&c| crate::smp::online_lapic_id(c).is_some()).collect();
     let refused = AtomicU32::new(0);

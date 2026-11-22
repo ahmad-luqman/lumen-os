@@ -7,8 +7,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use lumen_vfs::{
-    AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
+    AdvisoryLocks, DevId, DirEntry, Escaped, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec,
+    VfsError, VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
 use crate::sync::{SleepMutex, SleepMutexGuard};
@@ -142,7 +142,7 @@ impl Children {
         debug_assert!(
             entry.is_some_and(|(n, _)| n == name),
             "tmpfs: {:?}'s number {seq} lists another entry",
-            lumen_vfs::Escaped(name)
+            Escaped(name)
         );
         entry.map(|(_, child)| child)
     }
@@ -168,7 +168,7 @@ impl Children {
                 slot.1 = child;
                 return;
             }
-            debug_assert!(false, "tmpfs: {:?}'s number {seq} has no entry", lumen_vfs::Escaped(&name[..]));
+            debug_assert!(false, "tmpfs: {:?}'s number {seq} has no entry", Escaped(&name));
         }
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -179,7 +179,7 @@ impl Children {
     fn remove(&mut self, name: &[u8]) -> Option<Arc<TmpfsInode>> {
         let seq = self.by_name.remove(name)?;
         let entry = self.by_seq.remove(&seq);
-        debug_assert!(entry.is_some(), "tmpfs: {:?}'s number {seq} had no entry", lumen_vfs::Escaped(name));
+        debug_assert!(entry.is_some(), "tmpfs: {:?}'s number {seq} had no entry", Escaped(name));
         entry.map(|(_, child)| child)
     }
 

@@ -722,8 +722,7 @@ mod tests {
                 let vol = Ext4Volume::new(200)?;
                 let big = vol.root.create(b"big", 0o644).map_err(|_| "create on ext4")?;
                 let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file =
-                    KernelFile::new_unchecked_flags(big, Arc::from(&b"/big"[..]), rw).map_err(|_| "open on ext4")?;
+                let file = KernelFile::new_unchecked_flags(big, Arc::from(*b"/big"), rw).map_err(|_| "open on ext4")?;
                 let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
                 kassert_eq!(sys_ftruncate(fd, i64::MAX as u64), neg_errno(errno::EFBIG));
                 kassert_eq!(sys_ftruncate(fd, 5000), 0);
@@ -731,8 +730,7 @@ mod tests {
                 kassert_eq!(sys_close(fd), 0);
                 let ro_root = vol.remount_ro(201)?;
                 let ro_big = ro_root.lookup(b"big").map_err(|_| "lookup on the ro mount")?;
-                let file =
-                    KernelFile::new_unchecked_flags(ro_big, Arc::from(&b"/big"[..]), rw).map_err(|_| "open ro")?;
+                let file = KernelFile::new_unchecked_flags(ro_big, Arc::from(*b"/big"), rw).map_err(|_| "open ro")?;
                 let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
                 kassert_eq!(sys_ftruncate(fd, 0), neg_errno(errno::EROFS));
                 kassert_eq!(sys_close(fd), 0);
@@ -760,7 +758,7 @@ mod tests {
                 let f = m.root.create(b"suid", 0o644).map_err(|_| "create on ext4")?;
                 f.set_mode(0o4755).map_err(|_| "set_mode")?;
                 let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(&b"/suid"[..]), rw)
+                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(*b"/suid"), rw)
                     .map_err(|_| "open on ext4")?;
                 let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
                 let disk = |minor| {
@@ -845,7 +843,7 @@ mod tests {
                 let f = vol.root.create(b"map", 0o644).map_err(|_| "create on ext4")?;
                 kassert_eq!(f.write_at(0, &data), Ok(data.len()));
                 let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(&b"/map"[..]), rw)
+                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(*b"/map"), rw)
                     .map_err(|_| "open on ext4")?;
                 let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
                 shrink_unmaps(&f, || sys_ftruncate(fd, P + 10))

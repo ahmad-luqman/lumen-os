@@ -28,8 +28,8 @@ pub enum ExecError {
     InterpRead { path: String, err: VfsError },
     /// The interpreter's path is not UTF-8: exec paths stay text (the VFS
     /// takes any bytes since #268, ARCHITECTURE section 9), so it is refused
-    /// as `ENOENT`; `path` shows it lossily.
-    InterpPathNotUtf8 { path: String },
+    /// as `ENOENT`; `path` is its bytes, shown `Escaped`.
+    InterpPathNotUtf8 { path: Vec<u8> },
     /// The interpreter is not a loadable `ET_DYN` without its own
     /// `PT_INTERP` (`ELIBBAD`).
     InterpBad { path: String, err: ElfLoadError },
@@ -57,7 +57,7 @@ impl fmt::Display for ExecError {
             ExecError::Read { path, err } => write!(f, "cannot read '{path}': {err}"),
             ExecError::InterpRead { path, err } => write!(f, "cannot read its interpreter '{path}': {err}"),
             ExecError::InterpPathNotUtf8 { path } => {
-                write!(f, "cannot read its interpreter '{path}' (not UTF-8): {}", VfsError::NoEnt)
+                write!(f, "cannot read its interpreter '{}' (not UTF-8): {}", lumen_vfs::Escaped(path), VfsError::NoEnt)
             }
             ExecError::InterpBad { path, err } => {
                 write!(f, "bad interpreter '{path}': {err}: ELIBBAD ({})", errno::ELIBBAD)
@@ -98,7 +98,7 @@ impl Image {
     /// and planned at `INTERP_BASE`.
     fn read_interp(raw: &[u8], read: impl FnOnce(&str) -> Result<ExecFile, VfsError>) -> Result<Self, ExecError> {
         let Ok(path) = core::str::from_utf8(raw) else {
-            return Err(ExecError::InterpPathNotUtf8 { path: String::from_utf8_lossy(raw).into_owned() });
+            return Err(ExecError::InterpPathNotUtf8 { path: raw.to_vec() });
         };
         let (bytes, file) = match read(path) {
             Ok(read) => read,
@@ -479,13 +479,14 @@ crate::ktest!(
         kassert_eq!(shown, Err(String::from("cannot read its interpreter '/no/such/ld-lumen.so': ENOENT (2)")));
         let dir = Exec::from_image(Cow::Owned(test_dynamic_main(ET_DYN, 0, b"/"))).map(|_| ());
         kassert_eq!(dir, Err(ExecError::InterpRead { path: String::from("/"), err: VfsError::Acces }));
-        // A path that is not UTF-8 is refused (exec paths stay text), and says so.
+        // A path that is not UTF-8 is refused (exec paths stay text), and says
+        // so with its bytes escaped: two such paths never show the same.
         let odd = test_exec(test_dynamic_main(ET_DYN, 0, b"/lib/\xffld.so"), Ok(Vec::new())).map(|_| ());
-        kassert_eq!(odd, Err(ExecError::InterpPathNotUtf8 { path: String::from("/lib/\u{fffd}ld.so") }));
+        kassert_eq!(odd, Err(ExecError::InterpPathNotUtf8 { path: b"/lib/\xffld.so".to_vec() }));
         kassert_eq!(odd.as_ref().map_err(ExecError::to_errno), Err(errno::ENOENT));
         kassert_eq!(
             odd.map_err(|e| alloc::format!("{e}")),
-            Err(String::from("cannot read its interpreter '/lib/\u{fffd}ld.so' (not UTF-8): ENOENT (2)"))
+            Err(String::from("cannot read its interpreter '/lib/\\xffld.so' (not UTF-8): ENOENT (2)"))
         );
         // The binary itself missing, by path.
         let gone = Exec::from_path("/no/such/binary").map(|_| ());

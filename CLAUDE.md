@@ -537,11 +537,12 @@ one is its own PR that updates that doc first.
   by start in a `BTreeMap`: `map` with `MapPlace` hint/fixed/no-replace,
   `unmap`, `protect`, coalescing), the `Brk` cursor, and `maps`
   (`write_maps`: `/proc/<pid>/maps` lines, the heap split at the break's
-  edges, `[heap]`/`[stack]`, a file's device, inode and path, names padded
-  as Linux's `seq_pad`; `ImageRange`, an ELF image's named pages:
+  edges, `[heap]`/`[stack]`, a file's device, inode and path (its bytes,
+  each newline as `\012`, #268), names padded as Linux's `seq_pad`; `ImageRange`, an ELF image's named pages:
   `from_segment`, `trim`) (host-tested).
 - `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
-  `FileSystem`/`VfsInode` traits, the path and symlink resolver, the mount
+  `FileSystem`/`VfsInode` traits (names as bytes, #268; `Escaped`, a name's
+  bytes as text, never lossily), the path and symlink resolver, the mount
   table and the Lock-9 inode and dentry caches, `OpenFile` and the `FdTable`
   (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each

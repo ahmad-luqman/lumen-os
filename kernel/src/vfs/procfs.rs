@@ -447,8 +447,7 @@ impl VfsInode for ProcfsInode {
             // the same answer `resolve_magic_link` gives.
             ProcKind::PidExe(pid) => process::process_exe_path(pid).map(String::into_bytes).ok_or(VfsError::NoEnt),
             ProcKind::PidFdLink(pid, fd) => {
-                let (_, path) = process::process_fd_target(pid, fd.get()).ok_or(VfsError::NoEnt)?;
-                Ok(path)
+                process::process_fd_target(pid, fd.get()).map(|(_, path)| path).ok_or(VfsError::NoEnt)
             }
             _ => Err(VfsError::Inval),
         }

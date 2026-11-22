@@ -591,9 +591,8 @@ pub fn process_open_fds(pid: u32) -> Vec<i32> {
 /// it shows, its bytes.
 pub type FdTarget = (Option<Arc<dyn VfsInode>>, Vec<u8>);
 
-/// Snapshot `(Option<Arc<dyn VfsInode>>, display_path)` for `/proc/<pid>/fd/<fd>`:
-/// the open file's inode and the path it was opened by, ` (deleted)` added
-/// once unlinked.
+/// Snapshot `/proc/<pid>/fd/<fd>`'s [`FdTarget`], ` (deleted)` added to the
+/// path once unlinked.
 ///
 /// Releases `ACTIVE_PROCS` before inspecting `VfsInode::stat()` or dropping
 /// the file it cloned.

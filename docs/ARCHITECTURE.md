@@ -5568,7 +5568,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     target then keeps its inode and data without an entry (logged).
   - **Names that aren't UTF-8** are listed, looked up, unlinked and
     renamed as any other (#268: VFS names are bytes, "Core abstractions"
-    below).
+    below), except on a volume with unsigned directory hashes, where a
+    hashed directory's lookups miss any name with a byte of 0x80 or more
+    (#308, the caveat below).
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
@@ -5623,24 +5625,37 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - **Names are byte strings (#268):** a name is any bytes but `/` and
     NUL, as on Linux, and goes through the VFS as `&[u8]` (owned:
     `Box<[u8]>` or `Vec<u8>`): `VfsInode`'s `lookup`, `create`, `mkdir`,
-    `unlink`, `rmdir`, `link`, `symlink` (its target too), `rename`,
-    `DirEntry::name`, the `DentryCache`'s key, `ParentTarget::name`,
-    `compute_cwd_path`'s result, `OpenFile::path` (`Arc<[u8]>`: the path
-    `/proc/<pid>/fd` and `exe` read back, the base of a relative open's,
-    and the cwd's), the paths `/proc/<pid>/maps` names. No layer checks a
-    name for UTF-8, so an ext4 entry whose name isn't is listed, looked up,
-    unlinked and renamed like any other, and `getcwd` under it gives its
-    bytes. Text shows a name through `lumen_vfs::Escaped` (UTF-8 as it is,
-    an ASCII control character and a byte that isn't UTF-8 as `\xNN`, any other
-    character `char::escape_debug` escapes as `\u{..}`, `\` as `\\`): logs,
-    `vfstest` and `ls` output; never lossily (U+FFFD would name another
-    file). `/proc/<pid>/maps` prints the raw bytes, a newline as `\012`
-    (Linux's `seq_path`). Two exceptions stay text: mount paths
+    `unlink`, `rmdir`, `link`, `symlink`, `rename` (a symlink's target is
+    any bytes but NUL, `/` included), `DirEntry::name`, the `DentryCache`'s
+    key, `ParentTarget::name`, `compute_cwd_path`'s result, `OpenFile::path`
+    (`Arc<[u8]>`: the path `/proc/<pid>/fd` reads back, the base of a
+    relative open's, and the cwd's fallback), and the paths
+    `/proc/<pid>/maps` names for file mappings. No layer checks a name for
+    UTF-8, so an ext4 entry whose name isn't is listed, looked up,
+    unlinked and renamed like any other (but see #308 below), and `getcwd`
+    under it gives its bytes. Text shows a name or path through
+    `lumen_vfs::Escaped`, never lossily (U+FFFD would name another file):
+    UTF-8 as it is, except an ASCII control character and a byte that
+    isn't UTF-8 as `\xNN`, `\` as `\\`, and any other character
+    `char::escape_debug` escapes as `\u{..}` (C1 controls, bidi overrides,
+    and also combining marks, U+00A0 and U+00AD, so an NFC and an NFD name
+    never show the same). Its users: log lines, `vfstest ls` and
+    `vfstest readlink` output, and an exec error's `PT_INTERP` path.
+    `/proc/<pid>/maps` prints the raw bytes, a newline as `\012` (Linux's
+    `seq_path`). Two exceptions stay text: mount paths
     (`MountTable::mount`, `/proc/mounts`; only the kernel mounts, at `/`,
     `/tmp`, `/dev` and `/proc`), and the paths a binary is loaded by
-    (`Exec::from_path`, `ImageFile::path`, `/proc/<pid>/exe`): `linux /path`
-    takes the shell's argument, and a `PT_INTERP` path that isn't UTF-8 is
-    refused (`ExecError::InterpPathNotUtf8`); there is no `execve` yet.
+    (`Exec::from_path`, `ImageFile::path`, so an ELF image's maps lines,
+    and `/proc/<pid>/exe`, read from `exe_path`): `linux /path` takes the
+    shell's argument, and a `PT_INTERP` path that isn't UTF-8 is refused
+    (`ExecError::InterpPathNotUtf8`); there is no `execve` yet.
+    **Caveat (#308):** `ext4plus` hashes a hashed (htree) directory's names
+    with signed bytes and never reads the superblock's unsigned-hash flag,
+    and an htree lookup has no linear fallback. On a volume made where
+    `char` is unsigned (`mke2fs` on aarch64 Linux), a name with a byte of
+    0x80 or more (UTF-8 or not) in such a directory is listed by `readdir`
+    but not found by `lookup`, `unlink`, `rmdir` or `rename`. Lumen's
+    images are made where `char` is signed, so no test meets it.
   - **Read-only mounts and special files (#291):** `open_inode` (a write
     open: `O_WRONLY`, `O_RDWR`, `O_TRUNC`) and `check_access` (`W_OK`)
     skip their `-EROFS` for a special file, by its type alone

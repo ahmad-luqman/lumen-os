@@ -211,8 +211,9 @@ pub const fn mode_after_chown(inode_type: InodeType, mode: u16) -> u16 {
     kept
 }
 
-/// Directory entry yielded by `VfsInode::readdir()`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Directory entry yielded by `VfsInode::readdir()`. Its `Debug` shows the
+/// name [`Escaped`].
+#[derive(Clone, PartialEq, Eq)]
 pub struct DirEntry {
     pub ino: Ino,
     pub inode_type: InodeType,
@@ -224,6 +225,17 @@ pub struct DirEntry {
     /// [`VfsInode::readdir`](crate::VfsInode::readdir)). `getdents64` hands
     /// it to user space as `d_off`.
     pub next_cursor: u64,
+}
+
+impl fmt::Debug for DirEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirEntry")
+            .field("ino", &self.ino)
+            .field("inode_type", &self.inode_type)
+            .field("name", &Escaped(&self.name))
+            .field("next_cursor", &self.next_cursor)
+            .finish()
+    }
 }
 
 /// File access mode (`O_RDONLY`, `O_WRONLY`, `O_RDWR`).
@@ -497,7 +509,9 @@ impl AccessMask {
 /// A name's or a path's bytes shown as text, never lossily (#268): UTF-8
 /// as it is, except `\` as `\\`, an ASCII control character as `\xNN`, any
 /// other character `char::escape_debug` escapes (a C1 control, a bidi
-/// override, ...) as `\u{..}`, and each byte that isn't UTF-8 as `\xNN`.
+/// override, and also every combining mark, U+00A0 and U+00AD, so an NFC
+/// and an NFD name never show the same) as `\u{..}`, and each byte that
+/// isn't UTF-8 as `\xNN`.
 /// So two names never show the same, and a name can't drive a terminal or
 /// reorder a log line. `{:?}` puts it in quotes, a `"` in it as `\"`.
 #[derive(Clone, Copy, PartialEq, Eq)]

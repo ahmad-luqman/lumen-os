@@ -2059,7 +2059,7 @@ impl Ext4Inode {
                 let base = Inode::read(&inner.ext4, new_dir_ino).map(|d| d.links_count()).map_err(map_ext4_err);
                 let temp = base.and_then(|base| Ok((base, unused_temp_name(&inner.ext4, new_dir_ino, ino)?)));
                 let res = temp.and_then(|(base, temp)| {
-                    let name = DirEntryName::try_from(temp.as_slice()).map_err(|_| VfsError::Inval)?;
+                    let name = DirEntryName::try_from(temp.as_str()).map_err(|_| VfsError::Inval)?;
                     let first = try_discard_orphan(&mut inner, new_dir_ino, name, ino, Some(base));
                     // While the temporary entry is still there the inode is
                     // still allocated and linked (the free comes after the
@@ -2315,13 +2315,12 @@ const TEMP_NAME_TRIES: u32 = 64;
 /// already points at `ino` (left by an earlier free of it that crashed).
 /// Users can create these names too (or a rename can land on one), so a
 /// taken one is skipped rather than assumed free.
-fn unused_temp_name(ext4: &Ext4, dir_ino: NonZeroU32, ino: NonZeroU32) -> Result<Vec<u8>, VfsError> {
+fn unused_temp_name(ext4: &Ext4, dir_ino: NonZeroU32, ino: NonZeroU32) -> Result<alloc::string::String, VfsError> {
     let dir = Dir::open_inode(ext4, Inode::read(ext4, dir_ino).map_err(map_ext4_err)?).map_err(map_ext4_err)?;
     for n in 0..TEMP_NAME_TRIES {
         let name =
-            if n == 0 { alloc::format!(".lumen-rename-{ino}") } else { alloc::format!(".lumen-rename-{ino}-{n}") }
-                .into_bytes();
-        let dname = DirEntryName::try_from(name.as_slice()).map_err(|_| VfsError::Inval)?;
+            if n == 0 { alloc::format!(".lumen-rename-{ino}") } else { alloc::format!(".lumen-rename-{ino}-{n}") };
+        let dname = DirEntryName::try_from(name.as_str()).map_err(|_| VfsError::Inval)?;
         match dir.get_entry(dname) {
             Err(Ext4Error::NotFound) => return Ok(name),
             Ok(entry) if entry.index == ino => return Ok(name),

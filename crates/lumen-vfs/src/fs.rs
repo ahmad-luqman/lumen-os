@@ -127,15 +127,16 @@ pub trait VfsInode: Send + Sync {
 
     /// Magic symlink target override (e.g. `/proc/<pid>/fd/*` and `/proc/<pid>/exe`).
     /// When `Some`, path traversal jumps directly to the returned inode while
-    /// `readlink()` continues to return the textual symlink path.
+    /// `readlink()` continues to return the link's path bytes.
     fn resolve_magic_link(&self) -> Option<Arc<dyn VfsInode>> {
         None
     }
 
     fn stat(&self) -> Result<Metadata, VfsError>;
-    /// Names, here and in `create` to `rename` (and `symlink`'s target),
-    /// are bytes (#268): any but `/` and NUL, UTF-8 or not. A filesystem
-    /// stores and compares them as given, never through a lossy conversion.
+    /// Names, here and in `create` to `rename`, are bytes (#268): any but
+    /// `/` and NUL, UTF-8 or not; `symlink`'s target is any bytes but NUL.
+    /// A filesystem stores and compares them as given, never through a
+    /// lossy conversion.
     fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError>;

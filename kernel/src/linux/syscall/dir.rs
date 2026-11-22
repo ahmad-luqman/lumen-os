@@ -25,15 +25,14 @@ pub(super) fn sys_getcwd(buf: UserPtr, size: u64) -> u64 {
 
 fn getcwd(buf: UserPtr, size: u64) -> Result<u64, u32> {
     let (cwd, _) = process::current_cwd();
-    let path = lumen_vfs::compute_cwd_path(crate::vfs::tables(), &cwd).map_err(lumen_vfs::VfsError::to_errno)?;
+    let mut path = lumen_vfs::compute_cwd_path(crate::vfs::tables(), &cwd).map_err(lumen_vfs::VfsError::to_errno)?;
     drop(cwd);
-    let mut bytes: Vec<u8> = path;
-    bytes.push(0);
-    if (bytes.len() as u64) > size {
+    path.push(0);
+    if (path.len() as u64) > size {
         return Err(errno::ERANGE);
     }
-    copy_to_user(buf.addr(), &bytes).map_err(CopyError::to_errno)?;
-    Ok(bytes.len() as u64)
+    copy_to_user(buf.addr(), &path).map_err(CopyError::to_errno)?;
+    Ok(path.len() as u64)
 }
 
 /// `struct linux_dirent64`'s fixed part: `d_ino` (8 bytes), `d_off` (8),
@@ -512,6 +511,13 @@ fn ktest_remove(path: &str, dir: bool) -> Result<(), &'static str> {
     lumen_vfs::unlink_at(crate::vfs::tables(), None, path.as_bytes(), dir).map_err(|_| "remove a test entry")
 }
 
+/// Remove the file `name` (its bytes, as listed) from the directory `dir`.
+#[cfg(feature = "ktest")]
+fn ktest_remove_in(dir: &str, name: &[u8]) -> Result<(), &'static str> {
+    let path = [dir.as_bytes(), b"/", name].concat();
+    lumen_vfs::unlink_at(crate::vfs::tables(), None, &path, false).map_err(|_| "remove a listed entry")
+}
+
 /// Make the directory `path` (from `/`).
 #[cfg(feature = "ktest")]
 fn ktest_mkdir(path: &str) -> Result<(), &'static str> {
@@ -629,7 +635,7 @@ crate::ktest!(
             kassert!(truth.len() >= 17);
             let file = lumen_vfs::OpenFile::new_unchecked_flags(
                 alloc::sync::Arc::clone(&root),
-                alloc::sync::Arc::from(&b"/ktest-ext4"[..]),
+                alloc::sync::Arc::from(*b"/ktest-ext4"),
                 OpenFlags::from_bits(dir),
             )
             .map_err(|_| "open the ext4 root")?;
@@ -754,7 +760,7 @@ crate::ktest!(
                     kassert!(r.name == "." || r.name == ".." || r.name.starts_with('c') || r.name.starts_with('n'));
                 }
                 if let Some(r) = recs.iter().find(|r| u32::from(r.ty) == general::DT_REG) {
-                    ktest_remove(&format!("{DIR}/{}", r.name), false)?;
+                    ktest_remove_in(DIR, &r.raw)?;
                 }
                 if added < 40 {
                     ktest_file(&format!("{DIR}/n{added:02}"), b"")?;
@@ -769,14 +775,14 @@ crate::ktest!(
                 kassert!(passes < 20);
                 kassert_eq!(super::fd::sys_lseek(fd, 0, general::SEEK_SET), 0);
                 let recs = ktest_list(fd, 64)?;
-                let files: Vec<&str> =
-                    recs.iter().filter(|r| r.name != "." && r.name != "..").map(|r| r.name.as_str()).collect();
+                let files: Vec<&[u8]> =
+                    recs.iter().filter(|r| r.raw != b"." && r.raw != b"..").map(|r| r.raw.as_slice()).collect();
                 if files.is_empty() {
                     kassert_eq!(recs.len(), 2);
                     break;
                 }
                 for name in files {
-                    ktest_remove(&format!("{DIR}/{name}"), false)?;
+                    ktest_remove_in(DIR, name)?;
                 }
             }
             kassert_eq!(super::fd::sys_close(fd), 0);

@@ -377,7 +377,8 @@ mod tests {
         ] {
             assert_eq!(parse_canonical_u32(name.as_bytes()), None, "{name:?}");
         }
-        // Names are bytes (#268): neither UTF-8 nor another script's digits pass.
+        // Names are bytes (#268): bytes that aren't UTF-8 don't pass, nor does
+        // a non-ASCII character.
         for name in [b"1\xff" as &[u8], b"\xff", b"\xc3\xa1"] {
             assert_eq!(parse_canonical_u32(name), None, "{name:?}");
         }
