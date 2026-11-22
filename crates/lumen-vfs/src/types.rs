@@ -90,6 +90,17 @@ impl InodeType {
         }
     }
 
+    /// A special file (character or block device, FIFO, socket), as
+    /// Linux's `special_file()`: its data isn't stored on its filesystem,
+    /// so a read-only mount doesn't refuse writing to it: `open_inode` and
+    /// `check_access` skip their `-EROFS` for one, as Linux's
+    /// `do_dentry_open` and `do_faccessat` do (and `may_open`'s
+    /// `sb_permission` refuses only regular files, directories and
+    /// symlinks).
+    pub const fn is_special(self) -> bool {
+        matches!(self, Self::CharDevice | Self::BlockDevice | Self::Fifo | Self::Socket)
+    }
+
     /// `d_type` byte for `linux_dirent64`.
     pub const fn to_dt_type(self) -> u8 {
         match self {

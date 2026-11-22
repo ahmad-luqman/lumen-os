@@ -85,10 +85,11 @@ pub trait VfsInode: Send + Sync {
         false
     }
 
-    /// True for `devfs` `S_ISCHR` nodes exempt from `-EROFS` for `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK`.
-    fn exempt_from_rofs(&self) -> bool {
-        false
-    }
+    /// Host tests only: runs where `open_inode` decides the read-only
+    /// mount's `-EROFS` (after the lookup and Lock 3, before the open
+    /// reference), for the Gate tests' hooks.
+    #[cfg(test)]
+    fn at_rofs_check(&self) {}
 
     /// True for a terminal (`devfs`'s `tty` and `console`): a descriptor on
     /// one reads and writes the calling process's console, takes the tty
