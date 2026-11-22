@@ -471,11 +471,16 @@ impl MappedPage {
     /// The file's size when the page was looked up (under the inode's Lock
     /// 4). The page starts below it; the page's bytes past it are zero
     /// unless a mapping stored there. A snapshot: a truncate may change the
-    /// size once Lock 4 is released. A shrink takes `AddressSpace::inner`
-    /// (Lock 1) before Lock 4 to invalidate mappings (ARCHITECTURE section
-    /// 5), so a fault holding Lock 1 across the call and the mapping can
-    /// rely on it; one that doesn't must look again. (The fault path needs
-    /// only [`valid_len`](Self::valid_len), through `copy_to_frame`.)
+    /// size once Lock 4 is released, even while the fault holds
+    /// `AddressSpace::inner` (Lock 1), since the truncate takes Lock 4 alone.
+    /// A page mapped from a stale snapshot is unmapped all the same: the
+    /// shrinking syscall's `invalidate_file_from` takes Lock 1 after the
+    /// truncate, and so runs once that fault's mapping is in place
+    /// (ARCHITECTURE section 5's rules: the caller's own space only until
+    /// M8, not after `O_TRUNC`). A private copy-on-write copy of the end
+    /// page made from a stale snapshot can keep bytes past the new end
+    /// (bytes a shared mapping stored past it). (The fault path needs only
+    /// [`valid_len`](Self::valid_len), through `copy_to_frame`.)
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests' check of the snapshot
     pub(crate) fn file_size(&self) -> u64 {
         self.file_size
@@ -541,9 +546,11 @@ impl Drop for WritableMap {
 ///   unless a mapping stored there.
 /// - **Truncate:** a shrink's `remove_from` drops the cache's reference to
 ///   the pages past the new size and stops counting them, even one a
-///   mapping still holds. That is sound only because ARCHITECTURE section
-///   5's truncate invalidation (Lock 1 before Lock 4) unmaps those pages in
-///   the same shrink, so no mapping keeps a page the cache has let go.
+///   mapping still holds. The page stays alive, pinned by that mapping,
+///   until ARCHITECTURE section 5's truncate invalidation, which the
+///   shrinking syscall runs once the truncate has returned, unmaps it (with
+///   section 5's limits: the caller's own space only until M8, not yet
+///   after `O_TRUNC`).
 /// - **Other inodes:** `NoDev` for anything but a regular file of `ext4`
 ///   or `tmpfs` (directories, symlinks, `devfs`, `procfs`). `NoEnt` for an
 ///   `ext4` inode unlinked and not open, as `read_at` says.
@@ -694,6 +701,13 @@ pub(crate) mod ktest_files {
         pub(crate) fn mount_device_copy_ro(&self, minor: u32) -> Result<Arc<dyn VfsInode>, &'static str> {
             Ok(ktest_util::mount_ro_image(self.mnt.dev_bytes(), minor)?.root_inode())
         }
+    }
+
+    /// A fresh writable `ext4` volume (1 MiB) over `ext4::ktest_util`'s
+    /// `FaultCache`, which counts the filesystem's writes and fails a chosen
+    /// one (`arm_write`) or all (`fail_writes`).
+    pub(crate) fn fault_ext4(minor: u32) -> Result<Mnt, &'static str> {
+        ktest_util::mount(build_minimal_ext4_image_blocks(256), minor)
     }
 
     /// A fresh `tmpfs` holding `quota_bytes`.

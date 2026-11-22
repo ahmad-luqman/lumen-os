@@ -134,7 +134,6 @@ impl Mode {
     }
 
     /// The low 32 bits as given (`umask` keeps `& 0o777` of them).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `umask` (wave 3) calls it; the ktests until then
     pub(super) fn bits(self) -> u32 {
         self.0
     }
