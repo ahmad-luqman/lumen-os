@@ -3429,6 +3429,15 @@ Lumen runs two kinds of user code:
      (`open` and `mkdir`, which take `Mode` and apply the process's umask
      themselves, `resolve`, `unlink`, `readlink`, `symlink`, and the
      associated `Start::link` and `Start::rename` across two starts).
+     A handler that only needs the inode a path names calls
+     `at::lookup(dirfd, &UserPath, AtFlags)`: `start_dir`, then `resolve`,
+     with `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` read from its flags
+     (not for `linkat`, whose `AT_SYMLINK_FOLLOW` runs the other way).
+     A `NULL` path is `-EFAULT` (`copy_in`) for every handler but two:
+     `newfstatat` and `statx` with `AT_EMPTY_PATH` read it as `""`
+     (`UserPath::empty()`), whatever the dirfd and their other flags
+     (Linux 6.11 does so only for an fd dirfd with exactly that flag, 6.13
+     generally); `faccessat2` and the rest keep `-EFAULT`.
      `Start`'s directory is private, so no handler can hand lumen-vfs a raw
      `start_dir` (where `None` means the global root, never the cwd). Its
      contract, the traps included: an absolute path starts at the global
@@ -3450,8 +3459,10 @@ Lumen runs two kinds of user code:
 
   `at.rs` also copies a path argument in (`UserPath`: `PATH_MAX` with its
   NUL, else `-ENAMETOOLONG`; empty `-ENOENT` unless `AT_EMPTY_PATH`; a bad
-  or `NULL` pointer `-EFAULT`; non-UTF-8 `-ENOENT` until #268) and fills
-  `struct stat` and `struct statx` from VFS `Metadata`. The per-cluster
+  or `NULL` pointer `-EFAULT`, `UserPath::empty()` aside; non-UTF-8
+  `-ENOENT` until #268), fills `struct stat` and `struct statx` from VFS
+  `Metadata` and writes them to user memory (`write_stat`, `write_statx`:
+  `-EFAULT` for a bad buffer). The per-cluster
   stub ktests (`check_stubs`) dispatch with every argument zero, so they
   can't see an arm passing registers out of order: each cluster's own tests
   must, with distinct values in each argument.
@@ -3602,7 +3613,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 257 | `openat(dirfd, path, flags, mode)` | resolves path relative to `dirfd`/`AT_FDCWD`, honouring `O_RDONLY`/`O_WRONLY`/`O_RDWR`, `O_CREAT` (`mode & !umask`; `-EISDIR` on trailing `/`; `-EEXIST` with `O_EXCL` even on dangling symlink), `O_TRUNC` (ignored on char devices—including on read-only `devfs`—`-EISDIR` on dirs, `-EROFS` on regular files on rofs, runs `ftruncate(0)` path on regular files), `O_APPEND`, `O_DIRECTORY` (`-ENOTDIR`), `O_NOFOLLOW` (`-ELOOP` on final symlink without trailing `/` unless `O_PATH` is also set; trailing `/` forces directory traversal even with `O_NOFOLLOW`, matching Linux), `O_PATH`, `O_CLOEXEC`, `O_NONBLOCK`; returns `-EOPNOTSUPP` on `O_TMPFILE`; allocates lowest free FD `< MAX_FDS` (`-EMFILE` if full) |
 | 258 | `mkdirat(dirfd, path, mode)` | creates directory with `(mode & 0o7777) & !umask`, stripping trailing slashes; `-EEXIST` if present, `-ENOENT`/`-ENOTDIR` for missing/non-dir parent |
 | 260 | `fchownat(dirfd, path, uid, gid, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; rejects unknown flags (`-EINVAL`) |
-| 262 | `newfstatat(dirfd, path, buf, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH`; writes 144-byte Linux x86-64 `struct stat` with unique `(st_dev, st_ino)` per filesystem/inode |
+| 262 | `newfstatat(dirfd, path, buf, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (a `NULL` path with it is `""`, whatever the dirfd and other flags: Linux 6.11 for an fd dirfd with exactly that flag, 6.13 generally), and accepts and ignores `AT_NO_AUTOMOUNT` and the `AT_STATX_SYNC_TYPE` bits (as Linux's `vfs_statx`); writes 144-byte Linux x86-64 `struct stat` with unique `(st_dev, st_ino)` per filesystem/inode |
 | 263 | `unlinkat(dirfd, path, flags)` | `flags == 0`: unlinks non-directory (`-EISDIR` on dir, `-ENOTDIR` on trailing `/`), handling open-unlinked inodes cleanly (section 9); `flags == AT_REMOVEDIR`: removes empty directory (`-ENOTEMPTY`, `-EINVAL` for `.`, `-EBUSY` for mount point); unknown flags `-EINVAL` |
 | 264 | `renameat(olddirfd, old, newdirfd, new)` | shim to `renameat2(olddirfd, old, newdirfd, new, 0)` |
 | 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | creates hard link (`AT_SYMLINK_FOLLOW` / `AT_EMPTY_PATH`); rejects directories (`-EPERM`), cross-mount (`-EXDEV`), existing target (`-EEXIST`), incrementing `st_nlink` |
@@ -3612,8 +3623,8 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 269 | `faccessat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`); shim to `faccessat2(dirfd, path, mode, 0)` |
 | 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`), `AT_SYMLINK_NOFOLLOW`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`), rejecting invalid `tv_nsec >= 1_000_000_000` with `-EINVAL` |
 | 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); same-inode `rename(a, a)` is a no-op (`0`, or `-EEXIST` with `RENAME_NOREPLACE`); handles open-unlinked file and empty-dir target overwrite via the same detach/orphan path as `unlink`/`rmdir` (section 9); rejects unknown flags or both together (`-EINVAL`), cross-mount (`-EXDEV`), mountpoint overwrite (`-EBUSY`), dir-over-non-dir or trailing `/` on non-dir (`-ENOTDIR`), non-dir-over-dir (`-EISDIR`), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
-| 332 | `statx(dirfd, path, flags, mask, buf)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `AT_NO_AUTOMOUNT`, and `AT_STATX_SYNC_TYPE` (`AS_STAT`/`FORCE_SYNC`/`DONT_SYNC`); fills `struct statx` (`stx_mask`, `stx_blksize`, `stx_nlink`, `stx_uid`, `stx_gid`, `stx_mode`, `stx_ino`, `stx_size`, `stx_blocks`, timestamps, `stx_rdev_*`, `stx_dev_*`) |
-| 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW` and `AT_EACCESS`; checks existence and permission bits (`F_OK \| R_OK \| W_OK \| X_OK`; root `uid == 0` satisfies `R_OK`/`W_OK` on writable fs and on `S_ISCHR` device nodes on `devfs`, and `X_OK` if any execute bit is set on regular files or always on dirs) |
+| 332 | `statx(dirfd, path, flags, mask, buf)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH` (a `NULL` path with it is `""`, as for `newfstatat`), `AT_NO_AUTOMOUNT`, and `AT_STATX_SYNC_TYPE` (`AS_STAT`/`FORCE_SYNC`/`DONT_SYNC`, ignored); `-EINVAL` for both sync bits together or for `STATX__RESERVED` in `mask`; fills `struct statx` (`stx_blksize`, `stx_nlink`, `stx_uid`, `stx_gid`, `stx_mode`, `stx_ino`, `stx_size`, `stx_blocks`, `stx_atime`/`stx_mtime`/`stx_ctime`, `stx_rdev_*`, `stx_dev_*`; no `stx_btime`), `stx_mask` always `STATX_BASIC_STATS` whatever `mask` asks |
+| 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EACCESS` and `AT_EMPTY_PATH` (the three flags it has taken since Linux 5.8 added it; a `NULL` path is `-EFAULT`, even with `AT_EMPTY_PATH`); checks existence (`F_OK`) and permission bits as root (`uid == 0`): `R_OK` always; `W_OK` too, except `-EROFS` on a read-only mount (devfs `S_ISCHR` nodes exempt); `X_OK` if any execute bit is set, or always on a directory; an invalid mode or flag is `-EINVAL` before the path is looked at |
 | 452 | `fchmodat2(dirfd, path, mode, flags)` | 4-argument Linux 6.6+ variant accepting `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (unknown flags → `-EINVAL`); returns `-EOPNOTSUPP` **only when the resolved target is a symlink**, otherwise updates mode bits and `ctime` normally (`-EROFS` on read-only fs) |
 
 - **M8 (Processes, threads, signals, `futex`, PTYs):** `fork`/`vfork`/`clone`/

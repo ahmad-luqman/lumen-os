@@ -243,10 +243,9 @@ pub(super) fn sys_fstat(fd: Fd, statbuf: UserPtr) -> u64 {
 
 fn fstat(fd: Fd, statbuf: UserPtr) -> Result<u64, u32> {
     let file = fd.file()?;
-    let st = at::stat_from_metadata(&file.inode.stat().map_err(vfs)?);
+    let m = file.inode.stat().map_err(vfs)?;
     drop(file);
-    // SAFETY: `general::stat` is 144 bytes with explicit `__pad0` and zero implicit padding.
-    unsafe { copy_pod_to_user(statbuf.addr(), &st) }.map_err(CopyError::to_errno)?;
+    at::write_stat(statbuf, &m)?;
     Ok(0)
 }
 
@@ -780,6 +779,10 @@ crate::ktest!(
             let (st_mode, _, st_size) = ktest_stat(out)?;
             kassert_eq!(st_mode, general::S_IFREG | 0o644);
             kassert_eq!(st_size, 16);
+            // A bad buffer, or one running off the end of user memory: `-EFAULT`.
+            kassert_eq!(sys_fstat(fd, at::reg(0)), neg_errno(errno::EFAULT));
+            let edge = process::KTEST_USER_VA + process::KTEST_USER_LEN - 8;
+            kassert_eq!(sys_fstat(fd, at::reg(edge)), neg_errno(errno::EFAULT));
             // `O_APPEND` writes at the end on every write, wherever the
             // offset was put: twice, an `lseek` to 0 between.
             let app = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_APPEND), at::reg(0)))?;
