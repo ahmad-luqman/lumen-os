@@ -114,27 +114,34 @@ struct TmpfsMeta {
     locks: AdvisoryLocks,
 }
 
-/// A directory's entries by name, each with the sequence number it was
-/// added under: `readdir`'s cursor. An entry keeps its number until it is
-/// removed (replacing what a name points to, a `rename` over it or a
+/// `readdir`'s cursor for the first entry after `.` (0) and `..` (1).
+const FIRST_CHILD_CURSOR: u64 = 2;
+
+/// A directory's entries, each under the sequence number it was added
+/// with: `readdir`'s cursor. An entry keeps its number until it is removed
+/// (replacing what a name points to, a `rename` over it or a
 /// `RENAME_EXCHANGE`, keeps the name's number), and a new name takes the
 /// next number, never one used before; so a cursor between two calls still
 /// starts where it did, whatever was added or removed meanwhile.
 struct Children {
-    by_name: BTreeMap<String, (u64, Arc<TmpfsInode>)>,
-    by_seq: BTreeMap<u64, String>,
-    /// The next name's number. `readdir` lists `.` at cursor 0 and `..` at
-    /// 1, so the entries' numbers start at 2.
+    /// The entries by number: what `readdir` walks.
+    by_seq: BTreeMap<u64, (String, Arc<TmpfsInode>)>,
+    /// Each name's number, for lookups; always the same names as `by_seq`.
+    by_name: BTreeMap<String, u64>,
+    /// The next name's number, from [`FIRST_CHILD_CURSOR`].
     next_seq: u64,
 }
 
 impl Children {
     fn new() -> Self {
-        Self { by_name: BTreeMap::new(), by_seq: BTreeMap::new(), next_seq: FIRST_CHILD_CURSOR }
+        Self { by_seq: BTreeMap::new(), by_name: BTreeMap::new(), next_seq: FIRST_CHILD_CURSOR }
     }
 
     fn get(&self, name: &str) -> Option<&Arc<TmpfsInode>> {
-        self.by_name.get(name).map(|(_, child)| child)
+        let seq = self.by_name.get(name)?;
+        let entry = self.by_seq.get(seq);
+        debug_assert!(entry.is_some_and(|(n, _)| n == name), "tmpfs: {name:?}'s number {seq} lists another entry");
+        entry.map(|(_, child)| child)
     }
 
     fn contains_key(&self, name: &str) -> bool {
@@ -142,44 +149,43 @@ impl Children {
     }
 
     fn is_empty(&self) -> bool {
-        self.by_name.is_empty()
+        debug_assert_eq!(self.by_seq.len(), self.by_name.len());
+        self.by_seq.is_empty()
     }
 
     fn values(&self) -> impl Iterator<Item = &Arc<TmpfsInode>> {
-        self.by_name.values().map(|(_, child)| child)
+        self.by_seq.values().map(|(_, child)| child)
     }
 
     /// Point `name` at `child`: an existing name keeps its number, a new one
     /// takes the next.
     fn insert(&mut self, name: String, child: Arc<TmpfsInode>) {
-        if let Some(slot) = self.by_name.get_mut(&name) {
-            slot.1 = child;
-            return;
+        if let Some(&seq) = self.by_name.get(&name) {
+            if let Some(slot) = self.by_seq.get_mut(&seq) {
+                slot.1 = child;
+                return;
+            }
+            debug_assert!(false, "tmpfs: {name:?}'s number {seq} has no entry");
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.by_seq.insert(seq, name.clone());
-        self.by_name.insert(name, (seq, child));
+        self.by_name.insert(name.clone(), seq);
+        self.by_seq.insert(seq, (name, child));
     }
 
     fn remove(&mut self, name: &str) -> Option<Arc<TmpfsInode>> {
-        let (seq, child) = self.by_name.remove(name)?;
-        self.by_seq.remove(&seq);
-        Some(child)
+        let seq = self.by_name.remove(name)?;
+        let entry = self.by_seq.remove(&seq);
+        debug_assert!(entry.is_some(), "tmpfs: {name:?}'s number {seq} had no entry");
+        entry.map(|(_, child)| child)
     }
 
     /// The entries numbered `from` or more, in number order (the order they
     /// were added in): `(number, name, inode)`.
     fn listed_from(&self, from: u64) -> impl Iterator<Item = (u64, &str, &Arc<TmpfsInode>)> {
-        self.by_seq.range(from..).filter_map(|(&seq, name)| {
-            let (_, child) = self.by_name.get(name)?;
-            Some((seq, name.as_str(), child))
-        })
+        self.by_seq.range(from..).map(|(&seq, (name, child))| (seq, name.as_str(), child))
     }
 }
-
-/// `readdir`'s cursor for the first entry after `.` (0) and `..` (1).
-const FIRST_CHILD_CURSOR: u64 = 2;
 
 /// Inode belonging to a [`Tmpfs`] mount.
 ///
@@ -866,13 +872,12 @@ impl VfsInode for TmpfsInode {
             return Ok(());
         }
         let parent_ino = meta.parent.as_ref().and_then(Weak::upgrade).map_or(self.ino(), |p| p.ino());
-        let dots = [(0, self.ino(), "."), (1, parent_ino, "..")];
-        let dots = dots.into_iter().map(|(seq, ino, name)| (seq, ino, InodeType::Dir, name));
+        let dots = [(0, self.ino(), InodeType::Dir, "."), (1, parent_ino, InodeType::Dir, "..")];
         let children = meta
             .children
             .listed_from(cursor.max(FIRST_CHILD_CURSOR))
             .map(|(seq, name, child)| (seq, child.ino(), child.inode_type, name));
-        for (seq, ino, inode_type, name) in dots.filter(|&(seq, ..)| seq >= cursor).chain(children) {
+        for (seq, ino, inode_type, name) in dots.into_iter().filter(|&(seq, ..)| seq >= cursor).chain(children) {
             if out.len() >= max_entries {
                 break;
             }

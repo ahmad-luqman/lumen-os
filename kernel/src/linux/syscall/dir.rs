@@ -4,7 +4,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lumen_vfs::{DirEntry, InodeType, OpenGuard, ResolveFlags, VfsError, VfsInode, VfsLock};
 
@@ -12,6 +12,7 @@ use super::at::{Dirfd, Fd, UserPath, UserPtr, start_dir};
 use super::finish;
 use crate::linux::process;
 use crate::linux::{errno, general};
+use crate::sync::SpinLock;
 use crate::user::{CopyError, copy_to_user};
 
 /// `getcwd(buf, size)` (79): the working directory's path, computed from
@@ -50,6 +51,9 @@ const MIN_RECLEN: usize = dirent_reclen(1);
 /// call.
 const GETDENTS_MAX: usize = 32 * 1024;
 
+/// Whether [`push_dirent`] has warned of a cursor past `i64::MAX`.
+static D_OFF_CLAMP_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// A record's length for a name of `name_len` bytes: header, name and NUL,
 /// rounded up to 8 bytes (Linux's `ALIGN(.., sizeof(u64))`).
 const fn dirent_reclen(name_len: usize) -> usize {
@@ -85,7 +89,12 @@ fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
     // sequence number, a byte position); one past it would read as
     // negative to `seekdir`.
     debug_assert!(i64::try_from(entry.next_cursor).is_ok(), "a readdir cursor past i64::MAX");
-    let d_off = i64::try_from(entry.next_cursor).unwrap_or(i64::MAX);
+    let d_off = i64::try_from(entry.next_cursor).unwrap_or_else(|_| {
+        if !D_OFF_CLAMP_WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(target: "linux", "getdents64: readdir cursor {} past i64::MAX: d_off clamped", entry.next_cursor);
+        }
+        i64::MAX
+    });
     buf.extend_from_slice(&d_off.to_le_bytes());
     // At most 19 + 255 + 1 rounded up for a VFS name, and never past
     // `limit`, at most `GETDENTS_MAX` (checked above), so it fits a `u16`.
@@ -104,8 +113,9 @@ fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
 /// - **Position:** the open file's `dir_cursor` (Lock 2), which `lseek`
 ///   moves too (`SEEK_SET` 0 rewinds; `rewinddir`, `seekdir`). It is the
 ///   filesystem's own `readdir` cursor, opaque here: a sequence number on
-///   tmpfs, a byte position in the directory on ext4, an index on procfs
-///   and devfs. Each record's `d_off` is the cursor just past it, so
+///   tmpfs, a byte position in the directory on ext4, a pid or fd key on
+///   procfs, an index on devfs (whose entries never change). Each record's
+///   `d_off` is the cursor just past it, so
 ///   `lseek(fd, d_off, SEEK_SET)` (`seekdir(telldir())`) resumes with the
 ///   entry after it. The cursor moves past the last whole record filled: an
 ///   entry that didn't fit comes back on the next call.
@@ -117,15 +127,17 @@ fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
 ///   cursor contract, and the filesystem's error from `readdir` (`-ENOENT`
 ///   for a `/proc/<pid>` whose process has ended). An error after some
 ///   entries were listed hands those on and comes back on the next call. A
-///   directory removed while open lists as empty (`0`).
+///   directory removed while open lists as empty (`0`; Linux says `-ENOENT`
+///   there, `IS_DEADDIR`: ARCHITECTURE section 9's deliberate difference).
 /// - **The directory changing between calls:** the filesystems' cursors are
 ///   stable as entries come and go (`VfsInode::readdir`'s contract), so a
 ///   listing lists every entry that stayed in the directory exactly once,
-///   however many others were removed or added between calls: busybox's
-///   `rm -r` (read, unlink, read on, no rewind) empties a directory. An
-///   entry added or removed meanwhile may or may not be listed (POSIX
-///   leaves that open). The one exception is an insert into a hashed
-///   (htree) ext4 directory that splits a block (see ext4's `readdir`).
+///   however many others were removed or added between calls: a model of
+///   busybox `rm -r`'s loop (read, unlink, read on, no rewind) empties a
+///   directory. An entry added or removed meanwhile may or may not be
+///   listed (POSIX leaves that open). ext4 has two exceptions, a rename
+///   over a name and an htree directory (ARCHITECTURE section 9, ext4's
+///   `readdir`).
 ///
 /// The cursor's lock is held while the entries are listed and packed in a
 /// kernel buffer, and the cursor moved past them; not across the copy out,
@@ -175,7 +187,33 @@ fn pack_entries(dir: &dyn VfsInode, pos: u64, limit: usize) -> Result<(u64, Vec<
     let max_entries = (limit / MIN_RECLEN).max(1);
     let mut entries = Vec::new();
     let listed = dir.readdir(pos, &mut entries, max_entries);
-    pack_listed(listed, &entries, pos, limit)
+    pack_listed(listed, &entries, pos, limit, |prev, got| {
+        if first_broken_cursor(dir.dev_id().raw(), dir.ino()) {
+            log::warn!(
+                target: "linux",
+                "getdents64: {:?} directory {}: readdir gave cursor {got} after {prev}, not past it: stopping there",
+                dir.dev_id(),
+                dir.ino()
+            );
+        }
+    })
+}
+
+/// The directories [`pack_entries`] has warned about, the last 8 (a fixed
+/// table: nothing is allocated under the spinlock).
+static BROKEN_CURSOR_WARNED: SpinLock<([(u64, u64); 8], usize)> = SpinLock::new(([(u64::MAX, u64::MAX); 8], 0));
+
+/// Whether directory `(dev, ino)` broke the cursor contract for the first
+/// time (among the last 8 warned about): its warning is due.
+fn first_broken_cursor(dev: u64, ino: u64) -> bool {
+    let mut warned = BROKEN_CURSOR_WARNED.lock();
+    if warned.0.contains(&(dev, ino)) {
+        return false;
+    }
+    let next = warned.1;
+    warned.0[next] = (dev, ino);
+    warned.1 = (next + 1) % warned.0.len();
+    true
 }
 
 /// What `readdir` from cursor `pos` gave (`listed`, and the `entries` it
@@ -189,12 +227,13 @@ fn pack_entries(dir: &dyn VfsInode, pos: u64, limit: usize) -> Result<(u64, Vec<
 /// - The cursor contract is checked, not trusted: an entry whose
 ///   `next_cursor` isn't past the one before (or `pos`) would make
 ///   `readdir(3)` list forever. The records stop before it, or, if it is
-///   the first, `EIO`.
+///   the first, `EIO`; `broken` is told the cursors (to warn).
 fn pack_listed(
     listed: Result<(), VfsError>,
     entries: &[DirEntry],
     pos: u64,
     limit: usize,
+    broken: impl FnOnce(u64, u64),
 ) -> Result<(u64, Vec<u8>), u32> {
     if let Err(e) = listed
         && entries.is_empty()
@@ -205,11 +244,7 @@ fn pack_listed(
     let mut next = pos;
     for entry in entries {
         if entry.next_cursor <= next {
-            log::warn!(
-                target: "linux",
-                "getdents64: readdir gave cursor {} after {next}, not past it: stopping there",
-                entry.next_cursor
-            );
+            broken(next, entry.next_cursor);
             if buf.is_empty() {
                 return Err(errno::EIO);
             }
@@ -227,33 +262,37 @@ fn pack_listed(
 }
 
 /// The path [`set_cwd`] keeps: what `compute_cwd_path` gave, else
-/// `fallback`'s; and the error, if it is one worth a warning (anything but
-/// `ENOENT`, a directory removed by now).
+/// `fallback`'s; and the error, if it is one worth a warning: anything but
+/// `ENOENT` (a directory removed by now, or a rename storm outlasting the
+/// retries) and `ENAMETOOLONG` (a tree deeper than `PATH_MAX`, which user
+/// space builds without help).
 fn kept_cwd_path(
     computed: Result<alloc::string::String, VfsError>,
     fallback: impl FnOnce() -> Arc<str>,
 ) -> (Arc<str>, Option<VfsError>) {
     match computed {
         Ok(path) => (Arc::from(path.as_str()), None),
-        Err(VfsError::NoEnt) => (fallback(), None),
+        Err(VfsError::NoEnt | VfsError::NameTooLong) => (fallback(), None),
         Err(e) => (fallback(), Some(e)),
     }
 }
 
-/// Whether [`set_cwd`] has warned of a cwd path it couldn't compute.
-static CWD_PATH_WARNED: AtomicBool = AtomicBool::new(false);
+/// The errors [`set_cwd`] has warned of a cwd path it couldn't compute
+/// for, a bit per errno (below 64; any higher shares bit 63).
+static CWD_PATH_WARNED: AtomicU64 = AtomicU64::new(0);
 
 /// Make `guard`'s directory the working directory: `ENOTDIR` if it isn't a
-/// directory (`Cwd::new`, checked before the path is computed). The old one
-/// drops outside `ACTIVE_PROCS`.
+/// directory (checked here first, so a file isn't warned about as a path
+/// that couldn't be computed; `Cwd::new` checks again). The old one drops
+/// outside `ACTIVE_PROCS`.
 ///
 /// The path kept with it (what a relative open's `/proc/<pid>/fd` path is
 /// joined to) is computed from the inode, as `getcwd`'s is, so it stays
 /// canonical however many relative `chdir`s led there (`chdir("..")`,
 /// `chdir("sub")`, ... never make it grow). If that fails, `fallback` is
-/// kept instead: quietly for a directory removed by now (`ENOENT`, also
-/// what a rename storm outlasting `compute_cwd_path`'s retries says), with
-/// a warning (once a boot) for anything else (`EIO`, `ENAMETOOLONG`).
+/// kept instead ([`kept_cwd_path`]): quietly for a directory removed by now
+/// or a path too long, with a warning (once a boot per errno) for anything
+/// else (`EIO`).
 fn set_cwd(guard: OpenGuard, fallback: impl FnOnce() -> Arc<str>) -> Result<u64, u32> {
     if guard.inode().inode_type() != InodeType::Dir {
         return Err(errno::ENOTDIR);
@@ -261,7 +300,7 @@ fn set_cwd(guard: OpenGuard, fallback: impl FnOnce() -> Arc<str>) -> Result<u64,
     let computed = lumen_vfs::compute_cwd_path(crate::vfs::tables(), guard.inode());
     let (path, unexpected) = kept_cwd_path(computed, fallback);
     if let Some(e) = unexpected
-        && !CWD_PATH_WARNED.swap(true, Ordering::Relaxed)
+        && CWD_PATH_WARNED.fetch_or(1 << e.to_errno().min(63), Ordering::Relaxed) & (1 << e.to_errno().min(63)) == 0
     {
         log::warn!(target: "linux", "chdir: the new cwd's path can't be computed ({e:?}): keeping {path:?}");
     }
@@ -559,11 +598,9 @@ crate::ktest!(
         process::in_test_process(|pid| {
             let dir = OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY;
             // `/proc`: its files, the `self` link and this process's
-            // directory (not the exact set: other pids come and go, and
-            // between calls one going would shift the cursor's index, so
-            // in one call).
+            // directory (not the exact set: other pids come and go).
             let proc_fd = ktest_open(0, b"/proc", dir)?;
-            let procs = ktest_list(proc_fd, 4096)?;
+            let procs = ktest_list(proc_fd, 128)?;
             kassert!(ktest_unique(&procs));
             kassert_eq!(ktest_type_of(&procs, "."), Some(general::DT_DIR));
             kassert_eq!(ktest_type_of(&procs, ".."), Some(general::DT_DIR));
@@ -690,10 +727,9 @@ crate::ktest!(
 
 crate::ktest!(
     fn dir_getdents64_ends_while_entries_come_and_go() {
-        // Entries removed and added between calls may shift the cursor's
-        // index (a repeat or a skip), but a listing still ends, and lists
-        // only names that existed; `rm -r`'s loop (list, remove, rewind)
-        // empties the directory.
+        // Entries removed and added between small reads: the listing ends
+        // and lists only names that existed; then a loop that lists it
+        // all, removes what was listed and rewinds empties the directory.
         use crate::{kassert, kassert_eq};
         use alloc::format;
         use lumen_vfs::OpenFlags;
@@ -729,8 +765,8 @@ crate::ktest!(
                     added += 1;
                 }
             }
-            // `rm -r`: list it all, remove what was listed, rewind; until
-            // only "." and ".." are left.
+            // List it all, remove what was listed, rewind; until only "."
+            // and ".." are left.
             let mut passes = 0;
             loop {
                 passes += 1;
@@ -987,9 +1023,10 @@ fn ktest_rm_r_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &'stat
 
 /// A listing of a fresh directory `name` in `parent`, 2048 bytes at a
 /// time, with entries removed and added between calls (after each, the two
-/// lowest-numbered not listed yet and the last one listed removed, a new
-/// one added): every entry that stayed throughout is listed exactly once,
-/// and nothing is listed twice.
+/// lowest-numbered not listed yet and the last two listed removed; after
+/// every other, a new one added, so more go than come and ext4's first-fit
+/// can't refill each gap behind the cursor): every entry that stayed
+/// throughout is listed exactly once, and nothing is listed twice.
 #[cfg(feature = "ktest")]
 fn ktest_survivors_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &'static str> {
     use alloc::collections::BTreeSet;
@@ -1001,7 +1038,7 @@ fn ktest_survivors_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &
     let mut gone: BTreeSet<String> = BTreeSet::new();
     let mut added = 0;
     let mut ended = false;
-    for _ in 0..100 {
+    for round in 0..100 {
         let ret = ktest_getdents(fd, 2048);
         if (ret as i64) < 0 {
             return Err("getdents64 failed");
@@ -1017,18 +1054,22 @@ fn ktest_survivors_model(parent: &Arc<dyn VfsInode>, name: &str) -> Result<(), &
             .filter(|n| !listed.contains(n.as_str()) && !gone.contains(n))
             .take(2)
             .collect();
-        let behind = seen.iter().rev().find(|n| n.starts_with("entry-") && !gone.contains(*n)).cloned();
+        let behind: Vec<String> =
+            seen.iter().rev().filter(|n| n.starts_with("entry-") && !gone.contains(*n)).take(2).cloned().collect();
         for victim in ahead.into_iter().chain(behind) {
             dir.unlink(&victim).map_err(|_| "unlink between calls")?;
             gone.insert(victim);
         }
-        if added < 20 {
+        if round % 2 == 1 && added < 20 {
             dir.link(&format!("new-{added:02}"), &file).map_err(|_| "link between calls")?;
             added += 1;
         }
     }
-    if super::fd::sys_close(fd) != 0 || !ended {
+    if !ended {
         return Err("the listing never ended");
+    }
+    if super::fd::sys_close(fd) != 0 {
+        return Err("close");
     }
     let unique: BTreeSet<&str> = seen.iter().map(String::as_str).collect();
     if unique.len() != seen.len() {
@@ -1099,6 +1140,10 @@ crate::ktest!(
             kassert!(ktest_unique(&got));
             kassert!(got.iter().map(|r| r.name.as_str()).eq(truth.iter().map(|e| e.name.as_str())));
             kassert!(got.iter().map(|r| r.off as u64).eq(truth.iter().map(|e| e.next_cursor)));
+            // Byte positions: after `..`, each step at least ext4's smallest
+            // record (12 bytes), and the skipped name's record a step of 24.
+            kassert!(got[2..].windows(2).all(|w| w[1].off - w[0].off >= 12));
+            kassert!(got[2..].windows(2).any(|w| w[1].off - w[0].off >= 24));
             kassert_eq!(super::fd::sys_close(fd), 0);
             Ok(())
         })?
@@ -1190,14 +1235,20 @@ crate::ktest!(
             name: name.into(),
             next_cursor: next,
         };
-        let packed = |listed, entries: &[DirEntry]| pack_listed(listed, entries, 3, 4096).map(|(n, b)| (n, b.len()));
+        let told = core::cell::Cell::new(None);
+        let packed = |listed, entries: &[DirEntry]| {
+            told.set(None);
+            pack_listed(listed, entries, 3, 4096, |prev, got| told.set(Some((prev, got)))).map(|(n, b)| (n, b.len()))
+        };
         // A cursor that doesn't move past the one before: the records stop
         // before it; as the first, `EIO` (or `readdir(3)` would loop).
         kassert_eq!(packed(Ok(()), &[e("a", 5), e("b", 5), e("c", 9)]), Ok((5, 24)));
+        kassert_eq!(told.get(), Some((5, 5)));
         kassert_eq!(packed(Ok(()), &[e("a", 6), e("b", 4)]), Ok((6, 24)));
         kassert_eq!(packed(Ok(()), &[e("a", 3)]), Err(errno::EIO));
         kassert_eq!(packed(Ok(()), &[e("a", 2)]), Err(errno::EIO));
         kassert_eq!(packed(Ok(()), &[e("a", 4), e("b", 6)]), Ok((6, 48)));
+        kassert_eq!(told.get(), None);
         // What `readdir` pushed before an error is handed on; the error
         // comes back alone.
         kassert_eq!(packed(Err(VfsError::Io), &[e("a", 4), e("b", 6)]), Ok((6, 48)));
@@ -1208,7 +1259,7 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn dir_kept_cwd_path_falls_back_quietly_only_for_a_removed_directory() {
+    fn dir_kept_cwd_path_falls_back_quietly_for_a_removed_directory_or_a_long_path() {
         use crate::kassert_eq;
         let fallback = || Arc::<str>::from("/as/given");
         let kept = |computed| {
@@ -1218,7 +1269,8 @@ crate::ktest!(
         kassert_eq!(kept(Ok("/real".into())), ("/real".into(), None));
         kassert_eq!(kept(Err(VfsError::NoEnt)), ("/as/given".into(), None));
         kassert_eq!(kept(Err(VfsError::Io)), ("/as/given".into(), Some(VfsError::Io)));
-        kassert_eq!(kept(Err(VfsError::NameTooLong)), ("/as/given".into(), Some(VfsError::NameTooLong)));
+        kassert_eq!(kept(Err(VfsError::NameTooLong)), ("/as/given".into(), None));
+        kassert_eq!(kept(Err(VfsError::Acces)), ("/as/given".into(), Some(VfsError::Acces)));
         Ok(())
     }
 );
@@ -1239,6 +1291,108 @@ crate::ktest!(
             kassert_eq!(u32::from(d_type(t)), dt);
         }
         Ok(())
+    }
+);
+
+crate::ktest!(
+    fn dir_getdents64_lists_each_open_fd_once_while_listed_ones_close() {
+        // `/proc/<pid>/fd`'s cursor is the fd, not its index: fds closed
+        // behind the cursor don't shift the rest.
+        use crate::{kassert, kassert_eq};
+        use alloc::collections::BTreeSet;
+        use alloc::format;
+        use lumen_vfs::OpenFlags;
+        process::in_test_process(|pid| {
+            let mut extra = Vec::new();
+            for _ in 0..12 {
+                extra.push(ktest_open(0, b"/dev/null", OpenFlags::O_RDONLY)?.raw());
+            }
+            let dir =
+                ktest_open(1, format!("/proc/{pid}/fd").as_bytes(), OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+            let mut seen = Vec::new();
+            for _ in 0..100 {
+                // One record a call; each extra fd closed once it is listed.
+                let ret = ktest_getdents(dir, 24);
+                kassert!((ret as i64) >= 0);
+                if ret == 0 {
+                    break;
+                }
+                for r in ktest_records(ret)? {
+                    if let Ok(fd) = r.name.parse::<i32>() {
+                        seen.push(fd);
+                        if extra.contains(&fd) {
+                            kassert_eq!(super::fd::sys_close(super::at::reg(fd as u64)), 0);
+                        }
+                    }
+                }
+            }
+            // Every fd open when the listing began is listed, once.
+            let unique: BTreeSet<i32> = seen.iter().copied().collect();
+            kassert_eq!(unique.len(), seen.len());
+            for fd in [0, 1, 2, dir.raw()].into_iter().chain(extra.iter().copied()) {
+                kassert!(unique.contains(&fd));
+            }
+            kassert_eq!(super::fd::sys_close(dir), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn dir_tmpfs_lists_a_name_made_again_once() {
+        // A name removed and made again is one entry (the old number gone
+        // with it).
+        use crate::kassert_eq;
+        use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        process::in_test_process(|_| {
+            let tmpfs = TmpfsVolume::new(260, 64 * 4096);
+            let root = &tmpfs.root;
+            root.create("x", 0o644).map_err(|_| "create")?;
+            root.unlink("x").map_err(|_| "unlink")?;
+            root.create("x", 0o644).map_err(|_| "create again")?;
+            let fd = ktest_open_inode(root, "/again")?;
+            let got = ktest_list(fd, 4096)?;
+            kassert_eq!(got.iter().filter(|r| r.name == "x").count(), 1);
+            kassert_eq!(got.len(), 3);
+            kassert_eq!(super::fd::sys_close(fd), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn dir_tmpfs_rename_over_and_exchange_keep_the_names_place() {
+        // A name that stays in the directory through a rename over it or a
+        // `RENAME_EXCHANGE` keeps its place: listed already, it isn't
+        // listed again; not yet, it is listed once.
+        use crate::kassert_eq;
+        use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        use lumen_vfs::RenameFlags;
+        process::in_test_process(|_| {
+            for (exchange, minor) in [(false, 261), (true, 262)] {
+                let tmpfs = TmpfsVolume::new(minor, 64 * 4096);
+                let root = &tmpfs.root;
+                for name in ["a", "b", "c", "d", "e"] {
+                    root.create(name, 0o644).map_err(|_| "create")?;
+                }
+                let fd = ktest_open_inode(root, "/renames")?;
+                // ".", "..", "a", "b": past "b".
+                let first = ktest_records(ktest_getdents(fd, 96))?;
+                kassert_eq!(first.last().map(|r| r.name.as_str()), Some("b"));
+                // "d" (not listed yet) over "b" (listed), or the two swapped.
+                let flags = RenameFlags(if exchange { RenameFlags::EXCHANGE } else { 0 });
+                root.rename("d", root, "b", flags).map_err(|_| "rename")?;
+                let rest = ktest_list(fd, 4096)?;
+                let names: Vec<&str> = rest.iter().map(|r| r.name.as_str()).collect();
+                if exchange {
+                    kassert_eq!(names, ["c", "d", "e"]);
+                } else {
+                    kassert_eq!(names, ["c", "e"]);
+                }
+                kassert_eq!(super::fd::sys_close(fd), 0);
+            }
+            Ok(())
+        })?
     }
 );
 

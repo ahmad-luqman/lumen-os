@@ -298,27 +298,109 @@ fn realtime_duration() -> Duration {
     Duration::new(sec, (nsec as u32).min(999_999_999))
 }
 
-/// The position and inode number of each live record (inode not 0) in a
-/// directory's raw data, in order: the records chained by `rec_len` from
-/// the start, as `ext4plus`'s `ReadDir` walks them (a block's records end at
-/// its end; an htree's index nodes and the checksum tail are records with
-/// inode 0). `EIO` for a record that is too short or runs past the data.
-fn live_dirent_positions(raw: &[u8]) -> Result<Vec<(u64, u32)>, VfsError> {
-    let mut live = Vec::new();
-    let mut off = 0usize;
-    while off < raw.len() {
-        let header = raw.get(off..off + 8).ok_or(VfsError::Io)?;
-        let ino = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-        let rec_len = usize::from(u16::from_le_bytes([header[4], header[5]]));
-        if rec_len < 8 || off + rec_len > raw.len() {
-            return Err(VfsError::Io);
-        }
-        if ino != 0 {
-            live.push((off as u64, ino));
-        }
-        off += rec_len;
+/// A live directory record's inode number and name bytes.
+type LiveRecord<'a> = (u32, &'a [u8]);
+
+/// What is wrong with a directory record, for the warning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BadRecord {
+    /// Fewer than 8 bytes left in the block for its header.
+    ShortHeader,
+    /// `rec_len` below 8, which would never move on.
+    RecLenTooSmall,
+    /// `rec_len` running past the end of its block.
+    PastBlock,
+    /// `name_len` running past `rec_len`.
+    NamePastRecord,
+}
+
+/// The directory record at `off` in `block`: its `rec_len`, and, if it is
+/// live (inode not 0), its inode number and name bytes. A block's records
+/// chain by `rec_len` to its end, as `ext4plus`'s `ReadDir` walks them;
+/// records with inode 0 are free space, the checksum tail, or an htree's
+/// index nodes (the root's index sits inside `..`'s `rec_len`, so it is
+/// never read as records).
+fn dir_record(block: &[u8], off: usize) -> Result<(usize, Option<LiveRecord<'_>>), BadRecord> {
+    let header = block.get(off..off + 8).ok_or(BadRecord::ShortHeader)?;
+    let ino = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let rec_len = usize::from(u16::from_le_bytes([header[4], header[5]]));
+    if rec_len < 8 {
+        return Err(BadRecord::RecLenTooSmall);
     }
-    Ok(live)
+    if off + rec_len > block.len() {
+        return Err(BadRecord::PastBlock);
+    }
+    if ino == 0 {
+        return Ok((rec_len, None));
+    }
+    let name_len = usize::from(header[6]);
+    if 8 + name_len > rec_len {
+        return Err(BadRecord::NamePastRecord);
+    }
+    Ok((rec_len, Some((ino, &block[off + 8..off + 8 + name_len]))))
+}
+
+/// A live directory record found by [`LiveDirents`].
+struct LiveDirent {
+    /// Its byte position in the directory's data: the `readdir` cursor.
+    pos: u64,
+    ino: u32,
+    name: Vec<u8>,
+}
+
+/// Why [`LiveDirents`] stopped.
+enum WalkError {
+    /// A block couldn't be read: the read's own error.
+    Read(VfsError),
+    /// A malformed record at this position.
+    Record(u64, BadRecord),
+}
+
+/// A directory's live records in order, with their byte positions, read a
+/// block at a time (one block-sized buffer, the blocks read only as far as
+/// the walk goes), beside `ReadDir`, which checks each block's checksum but
+/// doesn't say where an entry sits.
+struct LiveDirents<'a> {
+    ext4: &'a Ext4,
+    inode: Inode,
+    size: u64,
+    block: Vec<u8>,
+    /// The loaded block's position, `None` before the first.
+    block_at: Option<u64>,
+    /// The next record's offset in the loaded block.
+    off: usize,
+}
+
+impl<'a> LiveDirents<'a> {
+    fn new(ext4: &'a Ext4, inode: Inode, block_size: usize) -> Self {
+        let size = inode.size_in_bytes();
+        Self { ext4, inode, size, block: alloc::vec![0; block_size], block_at: None, off: block_size }
+    }
+
+    /// The next live record, `None` at the end of the directory's data.
+    fn next(&mut self) -> Result<Option<LiveDirent>, WalkError> {
+        let bs = self.block.len();
+        loop {
+            if self.off >= bs {
+                let at = self.block_at.map_or(0, |b| b + bs as u64);
+                if at >= self.size {
+                    return Ok(None);
+                }
+                self.block.fill(0);
+                ext4_read_at(self.ext4, &self.inode, &mut self.block, at)
+                    .map_err(|e| WalkError::Read(map_ext4_err(e)))?;
+                self.block_at = Some(at);
+                self.off = 0;
+            }
+            let block_at = self.block_at.unwrap_or(0);
+            let pos = block_at + self.off as u64;
+            let (rec_len, live) = dir_record(&self.block, self.off).map_err(|why| WalkError::Record(pos, why))?;
+            self.off += rec_len;
+            if let Some((ino, name)) = live {
+                return Ok(Some(LiveDirent { pos, ino, name: name.to_vec() }));
+            }
+        }
+    }
 }
 
 fn map_file_type(ft: FileType) -> InodeType {
@@ -712,6 +794,9 @@ pub struct Ext4Inode {
     read_errno: AtomicU32,
     /// A directory listing skipped a name that isn't UTF-8 and said so.
     warned_non_utf8: AtomicBool,
+    /// A listing found the directory's records and `ReadDir` disagreeing,
+    /// or a malformed record, and said so (once).
+    warned_bad_listing: AtomicBool,
     meta: SleepMutex<Ext4InodeMeta>,
     pages: SleepMutex<PageCache>,
 }
@@ -867,9 +952,29 @@ impl Ext4Inode {
             writeback_errno: AtomicU32::new(0),
             read_errno: AtomicU32::new(0),
             warned_non_utf8: AtomicBool::new(false),
+            warned_bad_listing: AtomicBool::new(false),
             meta: SleepMutex::new(meta),
             pages: SleepMutex::new(PageCache::new_ext4()),
         })
+    }
+
+    /// `EIO` for a listing of this directory that can't be trusted, said
+    /// once per directory: its records and `ReadDir` disagree, or one is
+    /// malformed.
+    fn bad_listing(&self, what: core::fmt::Arguments<'_>) -> VfsError {
+        if !self.warned_bad_listing.swap(true, Ordering::AcqRel) {
+            warn!(target: "vfs", "ext4 {:?} directory {}: can't list it: {what}", self.shared.dev, self.disk_ino);
+        }
+        VfsError::Io
+    }
+
+    /// [`LiveDirents`]'s error as `readdir`'s: a failed read as it is, a
+    /// malformed record a [`bad_listing`](Self::bad_listing).
+    fn walk_failed(&self, e: WalkError) -> VfsError {
+        match e {
+            WalkError::Read(e) => e,
+            WalkError::Record(pos, why) => self.bad_listing(format_args!("a malformed record at {pos}: {why:?}")),
+        }
     }
 
     fn disk_inode_index(&self) -> NonZeroU32 {
@@ -3697,14 +3802,28 @@ impl VfsInode for Ext4Inode {
         step2.res
     }
 
-    /// The cursor is the byte position of an entry in the directory's data
-    /// (the next cursor its position plus one), as Linux's for a linear
-    /// directory: `ext4plus` removes an entry in place (its record merged
-    /// into the one before, or its inode zeroed) and adds one in free space
-    /// after the entries already there, so the entries that stay keep their
-    /// positions and a listing across removals lists each exactly once.
-    /// Only an insert into a hashed (htree) directory that splits a leaf
-    /// block moves entries: a listing across one may repeat or miss them.
+    /// The cursor is an entry's byte position in the directory's data, as
+    /// Linux uses for a linear directory; the next cursor is the position
+    /// plus 1. In a linear directory `ext4plus` never moves a record:
+    /// removing one merges it into the record before (or zeroes its inode),
+    /// and adding one takes the slack of the first record with room (which
+    /// keeps its own position) or a new block at the end. So a listing
+    /// resumed after removals or additions lists every entry that stayed
+    /// exactly once. Two exceptions (ARCHITECTURE section 9):
+    /// - a rename over an existing name, or `RENAME_EXCHANGE`, is an unlink
+    ///   and a link: the name that stayed (the target) gets a new record,
+    ///   which first-fit may place behind the cursor (skipped) or ahead of
+    ///   it (listed again);
+    /// - a hashed (htree) directory: an insert repacks a leaf block, split
+    ///   or not, moving its records. `ext4plus` never makes one, so only
+    ///   directories made outside Lumen (`mke2fs -d`, the Alpine image)
+    ///   can be.
+    ///
+    /// Each call walks the directory from its start (`ReadDir` has no
+    /// seek), reading the raw records a block at a time beside it for their
+    /// positions and checking that both agree (inode number and name) and
+    /// end together: a disagreement or a malformed record is `EIO`, logged
+    /// once per directory.
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
@@ -3721,22 +3840,24 @@ impl VfsInode for Ext4Inode {
         }
         let inner = self.shared.state.lock();
         let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-        // `ReadDir` checks each block's checksum but doesn't say where an
-        // entry sits: the raw data's live records give their positions, in
-        // the same order.
-        let raw = inner.ext4.read_inode_file(&disk).map_err(map_ext4_err)?;
-        let live = live_dirent_positions(&raw)?;
-        drop(raw);
+        let mut raw = LiveDirents::new(&inner.ext4, disk.clone(), inner.layout.block_size as usize);
         let dir = Dir::open_inode(&inner.ext4, disk).map_err(map_ext4_err)?;
         let rd = dir.read_dir().map_err(map_ext4_err)?;
+        let mut finished = true;
         for (idx, item) in rd.enumerate() {
             let entry = item.map_err(map_ext4_err)?;
-            let Some(&(pos, ino)) = live.get(idx) else {
-                return Err(VfsError::Io);
+            let live = match raw.next() {
+                Ok(Some(live)) => live,
+                Ok(None) => return Err(self.bad_listing(format_args!("entry {idx}: the raw records ran out first"))),
+                Err(e) => return Err(self.walk_failed(e)),
             };
-            if ino != entry.inode.get() {
-                return Err(VfsError::Io);
+            if live.ino != entry.inode.get() || live.name.as_slice() != entry.file_name().as_ref() {
+                return Err(self.bad_listing(format_args!(
+                    "entry {idx} at {}: the raw record (inode {}) isn't ReadDir's (inode {})",
+                    live.pos, live.ino, entry.inode
+                )));
             }
+            let pos = live.pos;
             if pos < cursor {
                 continue;
             }
@@ -3765,7 +3886,21 @@ impl VfsInode for Ext4Inode {
             };
             out.push(DirEntry { ino: u64::from(entry.inode.get()), inode_type, name, next_cursor: pos + 1 });
             if out.len() >= max_entries {
+                finished = false;
                 break;
+            }
+        }
+        // `ReadDir` is done: so must the raw records be.
+        if finished {
+            match raw.next() {
+                Ok(None) => {}
+                Ok(Some(live)) => {
+                    return Err(self.bad_listing(format_args!(
+                        "a raw record at {} (inode {}) past ReadDir's last entry",
+                        live.pos, live.ino
+                    )));
+                }
+                Err(e) => return Err(self.walk_failed(e)),
             }
         }
         Ok(())
@@ -4781,6 +4916,43 @@ crate::ktest!(
         kassert!(!g.is_detached());
         kassert!(m.root.lookup("far").is_ok());
         g.dec_open_count();
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_dir_record_reads_each_kind_of_record_and_refuses_malformed_ones() {
+        // Over hand-made bytes: a live record, free space (inode 0), the
+        // checksum tail, and each malformed record.
+        use crate::kassert_eq;
+        let rec = |ino: u32, rec_len: u16, name: &[u8]| {
+            let mut r = alloc::vec![0u8; usize::from(rec_len).max(8)];
+            r[..4].copy_from_slice(&ino.to_le_bytes());
+            r[4..6].copy_from_slice(&rec_len.to_le_bytes());
+            r[6] = name.len() as u8;
+            r[7] = 1;
+            let end = (8 + name.len()).min(r.len());
+            r[8..end].copy_from_slice(&name[..end - 8]);
+            r
+        };
+        // A block: "ab" (inode 12, 12 bytes), free space (16), then the
+        // checksum tail (inode 0, 12 bytes, file type 0xde).
+        let mut block = rec(12, 12, b"ab");
+        block.extend(rec(0, 16, b""));
+        let mut tail = rec(0, 12, b"");
+        tail[7] = 0xde;
+        block.extend(tail);
+        kassert_eq!(dir_record(&block, 0), Ok((12, Some((12, &b"ab"[..])))));
+        kassert_eq!(dir_record(&block, 12), Ok((16, None)));
+        kassert_eq!(dir_record(&block, 28), Ok((12, None)));
+        // Malformed: too short a header, rec_len < 8, past the block, a name
+        // past its record.
+        kassert_eq!(dir_record(&block, 36), Err(BadRecord::ShortHeader));
+        kassert_eq!(dir_record(&block[..4], 0), Err(BadRecord::ShortHeader));
+        kassert_eq!(dir_record(&rec(12, 4, b""), 0), Err(BadRecord::RecLenTooSmall));
+        kassert_eq!(dir_record(&rec(12, 0, b""), 0), Err(BadRecord::RecLenTooSmall));
+        kassert_eq!(dir_record(&rec(12, 16, b"ab")[..12], 0), Err(BadRecord::PastBlock));
+        kassert_eq!(dir_record(&rec(12, 12, b"abcdef"), 0), Err(BadRecord::NamePastRecord));
         Ok(())
     }
 );
