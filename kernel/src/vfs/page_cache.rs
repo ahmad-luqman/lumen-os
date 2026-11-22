@@ -635,10 +635,12 @@ pub(crate) mod ktest_files {
     use super::super::{MemBlkDev, build_minimal_ext4_image_blocks};
     use crate::sync::SleepMutex;
 
-    /// A block cache over an in-memory disk whose reads fail on request.
+    /// A block cache over an in-memory disk whose reads, or writes and
+    /// syncs, fail on request.
     struct FlakyCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         fail_reads: AtomicBool,
+        fail_writes: AtomicBool,
     }
 
     impl BlockCacheBackend for FlakyCache {
@@ -650,10 +652,16 @@ pub(crate) mod ktest_files {
         }
 
         fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError> {
+            if self.fail_writes.load(Ordering::Acquire) {
+                return Err(BlockError::Io);
+            }
             self.inner.lock().write_at(byte_off, src)
         }
 
         fn sync(&self) -> Result<(), BlockError> {
+            if self.fail_writes.load(Ordering::Acquire) {
+                return Err(BlockError::Io);
+            }
             self.inner.lock().sync()
         }
     }
@@ -671,6 +679,7 @@ pub(crate) mod ktest_files {
             let cache = Arc::new(FlakyCache {
                 inner: SleepMutex::new(BlockCache::new(dev, 64).map_err(|_| "block cache")?),
                 fail_reads: AtomicBool::new(false),
+                fail_writes: AtomicBool::new(false),
             });
             let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&cache) as Arc<dyn BlockCacheBackend>;
             let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "ext4 mount")?;
@@ -694,6 +703,12 @@ pub(crate) mod ktest_files {
         /// Make every disk read fail (`true`) or work again.
         pub(crate) fn fail_reads(&self, fail: bool) {
             self.cache.fail_reads.store(fail, Ordering::Release);
+        }
+
+        /// Make every disk write and block-cache sync fail (`true`) or work
+        /// again (`fsync`'s `-EIO`, #254).
+        pub(crate) fn fail_writes(&self, fail: bool) {
+            self.cache.fail_writes.store(fail, Ordering::Release);
         }
     }
 

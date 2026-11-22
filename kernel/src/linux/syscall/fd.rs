@@ -27,7 +27,7 @@ use lumen_vfs::{DevId, InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsIn
 
 /// Bytes moved per step between a file and user memory: the bounce buffer,
 /// on the stack (no heap, so a run's frame count is unchanged).
-const FILE_CHUNK: usize = 4096;
+pub(super) const FILE_CHUNK: usize = 4096;
 
 /// Raw Linux x86-64 `struct pollfd` layout (8 bytes, zero padding).
 #[repr(C)]
@@ -39,7 +39,7 @@ pub(super) struct RawPollFd {
 }
 
 /// A VFS error as the positive errno a handler returns.
-fn vfs(e: VfsError) -> u32 {
+pub(super) fn vfs(e: VfsError) -> u32 {
     e.to_errno()
 }
 
@@ -48,7 +48,7 @@ fn current_io() -> ConsoleIo {
 }
 
 /// `n` bytes moved before an error: the count if any, else the error.
-fn partial(done: usize, err: u32) -> Result<u64, u32> {
+pub(super) fn partial(done: usize, err: u32) -> Result<u64, u32> {
     if done > 0 { Ok(done as u64) } else { Err(err) }
 }
 
@@ -571,13 +571,13 @@ pub(super) fn ktest_user_path(slot: u64, path: &[u8]) -> Result<UserPtr, &'stati
 }
 
 #[cfg(feature = "ktest")]
-fn ktest_flags(bits: u32) -> OpenFlags {
+pub(super) fn ktest_flags(bits: u32) -> OpenFlags {
     OpenFlags::from_bits(bits)
 }
 
 /// A handler's return value as the fd it opened.
 #[cfg(feature = "ktest")]
-fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
+pub(super) fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
     if ret < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(ret)) } else { Err("the open failed") }
 }
 
