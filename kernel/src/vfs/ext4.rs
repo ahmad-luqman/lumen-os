@@ -5272,8 +5272,9 @@ crate::ktest!(
         kassert!(got.iter().all(|&b| b == 0));
         drop(hole);
         e.pages.lock().remove_from(1); // the holes uncached again
-        // Open, then unlink: detached, page 0 kept in memory.
-        let open = lumen_vfs::OpenGuard::new(Arc::clone(&f));
+        // Open (the checked open reference an open file holds), then unlink:
+        // detached, page 0 kept in memory.
+        let open = lumen_vfs::OpenGuard::try_new(Arc::clone(&f)).map_err(|_| "open")?;
         m.root.unlink("sparse.bin").map_err(|_| "unlink")?;
         kassert!(f.is_detached());
         kassert_eq!(e.pages.lock().len(), 1);
