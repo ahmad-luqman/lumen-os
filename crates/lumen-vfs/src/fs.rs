@@ -85,12 +85,11 @@ pub trait VfsInode: Send + Sync {
         false
     }
 
-    /// True if a read-only mount doesn't refuse this inode with `-EROFS`:
-    /// a write open (`O_WRONLY`, `O_RDWR`, `O_TRUNC`, in `open_inode`),
-    /// `access(W_OK)` (`check_access`) and, in the kernel's syscall layer,
-    /// a `chmod`, `chown` or `utimensat` (its filesystem's setter then
-    /// decides: devfs keeps the change in memory, as Linux's devtmpfs; a
-    /// read-only ext4 still refuses).
+    /// True if a read-only mount doesn't refuse this inode with `-EROFS`
+    /// for a write open (`O_WRONLY`, `O_RDWR`, `O_TRUNC`, in `open_inode`)
+    /// or `access(W_OK)` (`check_access`). The kernel's syscall layer also
+    /// lets a devfs node's `chmod`, `chown` and `utimensat` through on it
+    /// (Linux's devtmpfs being a writable mount), and no other's.
     ///
     /// Keyed on the file type: the special files (`InodeType::is_special`:
     /// character and block devices, FIFOs, sockets), as Linux's

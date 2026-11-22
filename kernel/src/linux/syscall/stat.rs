@@ -13,9 +13,9 @@
 //! Every Lumen process runs as uid and gid 0, so `access` follows Linux's
 //! rules for root (`lumen_vfs::check_access`): `R_OK` passes; `W_OK` too,
 //! but on a read-only mount it is `-EROFS`; `X_OK` needs an execute bit or a
-//! directory; `F_OK` is existence alone. Linux exempts every device node,
-//! FIFO and socket from that `-EROFS`; Lumen, for now, only devfs's device
-//! nodes (not `/dev` itself).
+//! directory; `F_OK` is existence alone. A special file (device node, FIFO
+//! or socket: `VfsInode::exempt_from_rofs`) is exempt from that `-EROFS`,
+//! as on Linux and as `open` agrees (#291); `/dev` itself is not.
 //! With the real and effective ids the same, `AT_EACCESS` changes nothing.
 
 use super::at::{Dirfd, UserPath, UserPtr, lookup, write_stat, write_statx};

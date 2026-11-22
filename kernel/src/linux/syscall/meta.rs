@@ -7,10 +7,10 @@
 //! truncate, `mtime`) under the inode's lock. A path is resolved through
 //! `at::lookup`; a descriptor must be open, and not `O_PATH`
 //! (`-EBADF`). A change on a read-only mount is `-EROFS`, checked here
-//! against the mount table before the setter is asked, except on a special
-//! file (`VfsInode::exempt_from_rofs`, as `open` and `access` agree): its
-//! filesystem's setter decides. `devfs`'s keep a node's new mode, owner and
-//! times in memory, as Linux's devtmpfs; a read-only ext4's refuse.
+//! against the mount table before the setter is asked, except on a devfs
+//! node: Linux's devtmpfs is a writable mount, so `chmod`, `chown` and
+//! `utimensat` there reach devfs's setters, which keep the new mode, owner
+//! and times in memory (#293).
 //!
 //! A truncate then unmaps the current process's mapped pages of the file
 //! past its new end (`AddressSpace::invalidate_file_from`), so a later
@@ -19,7 +19,7 @@
 
 use alloc::sync::Arc;
 
-use lumen_vfs::{AtFlags, InodeType, SetTime, VfsCacheOps, VfsInode};
+use lumen_vfs::{AtFlags, DevId, InodeType, SetTime, VfsCacheOps, VfsInode};
 
 use super::at::{self, Dirfd, Fd, Mode, UserPath, UserPtr};
 use super::fd::vfs;
@@ -51,15 +51,17 @@ fn open_file(fd: Fd) -> Result<FileRef, u32> {
 }
 
 /// `-EROFS` if `inode` is on a read-only mount (Linux's `mnt_want_write`),
-/// checked before the setter, unless it is exempt (`exempt_from_rofs`: a
-/// special file, such as devfs's nodes, whose setters take the change as
-/// Linux's devtmpfs, a writable mount, does; ext4's setters refuse it on
-/// a read-only volume, as Linux's mount check would). An inode whose
+/// checked before the setter. A devfs node (exempt: `exempt_from_rofs`) is
+/// let through: devfs reports read-only for its fixed namespace, where
+/// Linux's devtmpfs is a writable mount that takes these changes. Only
+/// devfs's: on any other read-only mount a special file is `-EROFS` here,
+/// as on Linux, whatever its filesystem's setter would do. An inode whose
 /// device isn't in the mount table (a ktest's scratch volume) counts as
 /// writable: its filesystem's own setters still refuse on a read-only
 /// volume.
 fn writable_mount(inode: &dyn VfsInode) -> Result<(), u32> {
-    if !inode.exempt_from_rofs() && tables().fs_read_only(inode.dev_id()) { Err(errno::EROFS) } else { Ok(()) }
+    let devfs_node = inode.dev_id() == DevId::DEVFS && inode.exempt_from_rofs();
+    if !devfs_node && tables().fs_read_only(inode.dev_id()) { Err(errno::EROFS) } else { Ok(()) }
 }
 
 /// Set `inode`'s permission and special bits (`mode & 0o7777`): a symlink's
