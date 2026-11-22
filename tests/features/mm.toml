@@ -129,3 +129,19 @@ tests = [
     "scenario:test_linux_user::test_mmap_and_brk",
     "audit:flags",
 ]
+
+[[feature]]
+name = "File-backed VM core, in-kernel API (#255): AddressSpace::mmap_file (lazy, PROT_WRITE without may_write EACCES, non-mappable files ENODEV), MAP_SHARED faults mapping the page cache's own frame (coherent both ways with read_at/write_at, read-only until a store, then counted by a WritableMap guard), MAP_PRIVATE copy-on-write isolated from the file and other mappings, a bus error past EOF or on a failed disk read (UserExit::BusError for ring 3, -EFAULT for a kernel user copy), shared stores reaching the disk after unmap and reclaim, invalidate_file_from unmapping exactly the pages past a new end, and munmap, mprotect, MAP_FIXED, teardown and Drop freeing copies (never cache frames), balancing writable_maps, and dropping pins and mapped files' references, on tmpfs and ext4"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::mm::user_vm::file_vm_shared_mapping_is_coherent_both_ways",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_private_mapping_copies_on_write",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_refuses_writes_without_may_write_and_unmappable_files",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_fault_past_eof_is_a_bus_error",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_disk_read_error_is_a_bus_error",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_shared_stores_persist_through_unmap_reclaim_and_remount",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_invalidate_file_from_unmaps_exactly_the_pages_past_the_new_end",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_writable_maps_balance_through_mprotect_unmap_and_teardown",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_ring3_bus_error_ends_the_process",
+    "ktest:lumen_kernel::vfs::page_cache::mapped_page_copies_to_a_frame_under_the_cache_lock",
+]

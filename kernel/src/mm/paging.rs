@@ -494,7 +494,10 @@ pub fn new_user_root() -> Option<PhysFrame> {
 /// `root` must be an L4 root allocated by [`new_user_root`] (never
 /// [`kernel_root`]), the caller must have exclusive write access to its lower
 /// half, and `phys` must be an allocated physical frame whose ownership is
-/// transferred to `root` (freed on [`destroy_user_root`] or unmap).
+/// transferred to `root` (freed on [`destroy_user_root`] or unmap), or, with
+/// `attrs.shared()` (`PTE_SHARED`), a page-cache frame the caller keeps
+/// allocated (pinned) for as long as the leaf maps it: no unmap or teardown
+/// path frees a `PTE_SHARED` leaf's frame.
 pub unsafe fn map_user_page(root: PhysFrame, virt: VirtAddr, phys: PhysFrame, attrs: Attrs) -> Result<(), MapError> {
     assert_ne!(root, kernel_root(), "map_user_page must never mutate kernel_root()");
     assert!(attrs.user(), "map_user_page requires user-mode attributes");

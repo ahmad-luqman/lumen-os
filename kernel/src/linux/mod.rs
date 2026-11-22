@@ -313,6 +313,13 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         UserExit::NonCanonicalRip(rip) => {
             let _ = writeln!(ctx.out, "linux: {name} non-canonical rip={rip:#x} leaked_frames={leaked_frames}");
         }
+        UserExit::BusError { rip, cr2 } => {
+            let _ = writeln!(
+                ctx.out,
+                "linux: {name} exit={} (bus error) rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}",
+                UserExit::BUS_ERROR_STATUS
+            );
+        }
     }
 }
 
