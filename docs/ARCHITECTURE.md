@@ -687,7 +687,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   - `Backing::File(FileMapping { file_id: u64, offset: u64, shared: bool, may_write: bool })`
     (M7, designed in #246): `file_id` is the inode's `lock_id`
     (`user_vm::file_id_of`: unique across filesystems and fixed for the
-    inode's life, unlike `ino`), keying the open reference (a `MappedFile`:
+    inode's life, unlike `ino`), keying the open reference (a `KeptFile`:
     an `OpenGuard`, counted in `open_count`, cloned from the descriptor's
     open file, and the path it was opened by, which `/proc/<pid>/maps`
     shows) held in `AddressSpace::mapped_files` (retained until **zero** VMAs reference
@@ -697,7 +697,11 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     distinguishes `MAP_SHARED` (`true`) from `MAP_PRIVATE` CoW (`false`);
     `may_write` (`VM_MAYWRITE`) is `true` for `MAP_PRIVATE` and, for
     `MAP_SHARED`, whether the descriptor is open `O_RDWR` (a read-only
-    mount can't have opened one: `EROFS`). In
+    mount can't have opened one: `EROFS`). `MappedFile::of`, the one way
+    to make what `AddressSpace::mmap_file` maps, records it from the
+    description (`Sharing` is `Private` or `Shared`, carrying no right of
+    its own), and `mmap_file` keeps it only in the new VMA: the
+    `mapped_files` entry, the first mapping's, holds no right. In
     `VmaMap::protect`, requesting `PROT_WRITE` on a file VMA with
     `!fm.may_write` returns `VmError::Access` (mapped to `-EACCES` in
     `UserVmError::to_mprotect_errno`), preventing `mprotect` from upgrading an
