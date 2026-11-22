@@ -3,7 +3,8 @@
 //! x86-64 executable built as `m7_test` is.
 //!
 //! musl starts it (`Scrt1.o`, `__libc_start_main`) and ends it (`exit`
-//! once `main` returns; a panic prints `PANIC <where>` and `_exit`s 127);
+//! once `main` returns; a panic prints `PANIC panicked at <file:line:col>:`
+//! and its message, then `_exit`s 127);
 //! every check calls the kernel itself (`syscall`, by number), so each
 //! claim is about the syscall it names (`stat` 4, `newfstatat` 262, `statx`
 //! 332, ...) and its raw `-errno`, not a libc wrapper's choice.
@@ -11,6 +12,7 @@
 //!   m7_vfs posix <dir> <other dir>
 //!   m7_vfs locks <dir>
 //!   m7_vfs keep <dir>
+//!   m7_vfs keep-check <dir>
 //!   m7_vfs lock-hold <file>
 //!   m7_vfs lock-probe <file> <holder pid> <probe>...
 //!
@@ -20,16 +22,16 @@
 //! passed, remove everything they made and exit 0; the first failed check
 //! prints `FAIL <check>: <what> (got <value>)` and exits with the check's
 //! number (from 1). `keep` makes a small tree in `<dir>` and leaves it
-//! there, for the disk's fsck (the same output).
+//! there, for the disk's fsck; `keep-check`, on a later boot, reads it back
+//! from the disk (the same output).
 //!
 //! `lock-hold` takes POSIX record locks on `<file>`, one step per read of
 //! its stdin (on a virtual terminal, one key), printing `hold: <step>`
 //! after each, and exits still holding one; `lock-probe`, a second process
 //! meanwhile, checks what `F_GETLK` reports of them and that `F_SETLK`
-//! conflicts. A
-//! probe is `<t><start>+<len>=<expect>`: a request of type `<t>` (`r` or
-//! `w`) for that range, expecting `unlck` or the holder's lock
-//! `<t><start>+<len>` (its pid the given one), with `F_SETLK` refused
+//! conflicts. A probe is `<t><start>+<len>=<expect>`: a request of type
+//! `<t>` (`r` or `w`) for that range, expecting `unlck` or the holder's
+//! lock `<t><start>+<len>` (its pid the given one), with `F_SETLK` refused
 //! `EAGAIN` (or taken and given back for `unlck`).
 
 #![no_std]
@@ -70,6 +72,7 @@ mod nr {
     pub const GETCWD: u64 = 79;
     pub const CHDIR: u64 = 80;
     pub const FCHDIR: u64 = 81;
+    pub const SYNC: u64 = 162;
     pub const RENAME: u64 = 82;
     pub const MKDIR: u64 = 83;
     pub const RMDIR: u64 = 84;
@@ -161,6 +164,10 @@ const DT_REG: u8 = 8;
 const DT_LNK: u8 = 10;
 
 const STATX_BASIC_STATS: u64 = 0x7ff;
+
+/// `utimensat`'s times for an atime and mtime long past (1970), so a later
+/// change to now (after 2020: `> 1_600_000_000`) shows.
+const OLD_TIMES: [i64; 4] = [1_000_000, 0, 1_000_000, 0];
 
 /// A raw `syscall` with up to six arguments: the kernel's return value
 /// (`-errno` on failure).
@@ -288,9 +295,9 @@ impl P {
     fn new(parts: &[&[u8]]) -> Self {
         let mut p = Self { buf: [0; 256], len: 0 };
         for part in parts {
-            let n = part.len().min(255 - p.len);
-            p.buf[p.len..p.len + n].copy_from_slice(&part[..n]);
-            p.len += n;
+            assert!(p.len + part.len() <= 255, "P::new: a path longer than its buffer");
+            p.buf[p.len..p.len + part.len()].copy_from_slice(part);
+            p.len += part.len();
         }
         p
     }
@@ -399,8 +406,10 @@ struct Stat {
 impl Stat {
     fn new() -> Self {
         // Not zeros: a field the kernel left unwritten never reads as the 0
-        // a check expects.
-        Self { raw: [0xa5; 144] }
+        // a check expects. Not `Statx`'s 0xa5 either, so a field neither
+        // call wrote never agrees between them, and bit 63 of `st_ino`
+        // stays clear (`detached_ino`).
+        Self { raw: [0x5a; 144] }
     }
     fn u64_at(&self, o: usize) -> u64 {
         u64::from_le_bytes(self.raw[o..o + 8].try_into().unwrap())
@@ -514,15 +523,44 @@ struct Entry {
 /// The entries `getdents64` lists on `fd`, `chunk` bytes a call, into
 /// `out`: how many (or a [`Fail`]).
 fn list(fd: i64, chunk: usize, out: &mut [Entry]) -> Result<usize, Fail> {
+    list_calls(fd, chunk, out, &mut Calls::new())
+}
+
+/// What each `getdents64` call of a listing returned: its bytes and its
+/// first record's length.
+struct Calls {
+    each: [(usize, usize); 32],
+    len: usize,
+}
+
+impl Calls {
+    fn new() -> Self {
+        Self { each: [(0, 0); 32], len: 0 }
+    }
+
+    /// Whether some call came back short of `chunk` and the record the next
+    /// call began with wouldn't have fitted in the rest: an entry held back
+    /// for the next call, not lost.
+    fn held_back(&self, chunk: usize) -> bool {
+        self.each[..self.len].windows(2).any(|w| w[0].0 < chunk && w[0].0 + w[1].1 > chunk)
+    }
+}
+
+/// [`list`], each call's bytes and first record's length into `calls`.
+fn list_calls(fd: i64, chunk: usize, out: &mut [Entry], calls: &mut Calls) -> Result<usize, Fail> {
     let mut buf = [0u8; 1024];
+    assert!(chunk <= buf.len(), "list: a chunk larger than its buffer");
     let mut count = 0;
     loop {
-        let chunk = chunk.min(buf.len());
         let n = ok("getdents64", s3(nr::GETDENTS64, fd as u64, mptr(&mut buf[..]), chunk as u64))?;
         if n == 0 {
             return Ok(count);
         }
         ensure("getdents64 within its count", n as usize <= chunk, n)?;
+        ensure("a whole first dirent header", n >= 19, n)?;
+        assert!(calls.len < calls.each.len(), "list: more calls than recorded");
+        calls.each[calls.len] = (n as usize, u16::from_le_bytes([buf[16], buf[17]]) as usize);
+        calls.len += 1;
         let mut off = 0usize;
         while off < n as usize {
             ensure("a whole dirent header", off + 19 <= n as usize, off as i64)?;
@@ -534,9 +572,9 @@ fn list(fd: i64, chunk: usize, out: &mut [Entry]) -> Result<usize, Fail> {
             let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
             ensure("room for every entry", count < out.len(), count as i64)?;
             let e = &mut out[count];
-            let keep = len.min(64);
-            e.name[..keep].copy_from_slice(&name[..keep]);
-            e.len = keep;
+            assert!(len <= e.name.len(), "list: a name longer than an Entry holds");
+            e.name[..len].copy_from_slice(&name[..len]);
+            e.len = len;
             e.kind = kind;
             e.ino = ino;
             count += 1;
@@ -783,7 +821,7 @@ fn unlink_open(d: &[u8]) -> R {
         preads(fd, 0, b"data")?;
         let s = st("fstat after unlink", fstat(fd))?;
         eq("no links", s.nlink() as i64, 0)?;
-        ensure("st_ino: the same, or a detached one", detached_ino(s.ino(), ino), s.ino() as i64)?;
+        ensure("st_ino: a detached one", detached_ino(s.ino(), ino), s.ino() as i64)?;
         eq("its size", s.size(), 4)?;
         eq("pwrite64 to the unlinked file", s4(nr::PWRITE64, fd as u64, ptr(&b"more"[..]), 4, 4), 4)?;
         preads(fd, 0, b"datamore")?;
@@ -797,12 +835,12 @@ fn unlink_open(d: &[u8]) -> R {
     eq("unlink the new one", s1(nr::UNLINK, p.at()), 0)
 }
 
-/// What `st_ino` may read once a file open here has lost its last name:
-/// Linux keeps the number; Lumen's ext4 and tmpfs give it a synthetic one
-/// with bit 63 set, so a reused number never names it (ARCHITECTURE section
-/// 9, Gate 6).
+/// What `st_ino` reads once a file open here has lost its last name:
+/// Lumen's ext4 and tmpfs give it a synthetic number with bit 63 set, so a
+/// reused number never names it (ARCHITECTURE section 9, Gate 6; Linux
+/// keeps the number, which this program, run only on Lumen, refuses).
 fn detached_ino(now: u64, before: u64) -> bool {
-    now == before || now & (1 << 63) != 0
+    now != before && now & (1 << 63) != 0
 }
 
 fn rmdir_open(d: &[u8]) -> R {
@@ -839,8 +877,7 @@ fn getdents(d: &[u8]) -> R {
     let g = j(d, b"g");
     eq("mkdir g", s2(nr::MKDIR, g.at(), 0o755), 0)?;
     // Making a name in a directory updates its mtime.
-    let old_times: [i64; 4] = [1_000_000, 0, 1_000_000, 0];
-    eq("utimensat g", s4(nr::UTIMENSAT, AT_FDCWD as u64, g.at(), ptr(&old_times), 0), 0)?;
+    eq("utimensat g", s4(nr::UTIMENSAT, AT_FDCWD as u64, g.at(), ptr(&OLD_TIMES), 0), 0)?;
     // `longer`'s record is 32 bytes, the others' 24 (19 bytes of header,
     // the name and its NUL, 8-byte aligned); made first, it follows `.` and
     // `..`.
@@ -873,8 +910,12 @@ fn getdents(d: &[u8]) -> R {
         for chunk in [1024usize, 40, 48] {
             eq("rewind", s3(nr::LSEEK, fd as u64, 0, SEEK_SET), 0)?;
             let mut got = no_entries::<16>();
-            let n = list(fd, chunk, &mut got)?;
+            let mut calls = Calls::new();
+            let n = list_calls(fd, chunk, &mut got, &mut calls)?;
             eq("how many entries", n as i64, want.len() as i64)?;
+            if chunk == 48 {
+                ensure("a 48-byte call held an entry back", calls.held_back(chunk), calls.len as i64)?;
+            }
             for (name, kind) in want {
                 let Some(found) = got[..n].iter().find(|e| &e.name[..e.len] == name) else {
                     return Err(Fail { what: "a name listed", got: name.len() as i64 });
@@ -928,8 +969,7 @@ fn positional(d: &[u8]) -> R {
     let p = j(d, b"pp");
     let fd = ok("open pp", open(&p, O_CREAT | O_RDWR | O_TRUNC, 0o644))?;
     let r = (|| {
-        let old_times: [i64; 4] = [1_000_000, 0, 1_000_000, 0];
-        eq("utimensat pp", s4(nr::UTIMENSAT, fd as u64, 0, ptr(&old_times), 0), 0)?;
+        eq("utimensat pp", s4(nr::UTIMENSAT, fd as u64, 0, ptr(&OLD_TIMES), 0), 0)?;
         eq("pwrite64 past the end", s4(nr::PWRITE64, fd as u64, ptr(&b"XYZ"[..]), 3, 5000), 3)?;
         let mtime = st("fstat", fstat(fd))?.mtime().0;
         ensure("pwrite64 updates the mtime", mtime > 1_600_000_000, mtime)?;
@@ -992,6 +1032,9 @@ impl Statx {
     fn size(&self) -> u64 {
         self.u64_at(40)
     }
+    fn dev(&self) -> (u32, u32) {
+        (self.u32_at(136), self.u32_at(140))
+    }
     fn mtime_sec(&self) -> i64 {
         self.u64_at(112) as i64
     }
@@ -1004,11 +1047,11 @@ fn statx(dirfd: i64, path: u64, flags: u64) -> Result<Statx, Fail> {
     Ok(sx)
 }
 
-fn stat_family(ext: &[u8], tmp: &[u8]) -> R {
-    let p = j(ext, b"sf");
+fn stat_family(dir: &[u8], other: &[u8]) -> R {
+    let p = j(dir, b"sf");
     put(&p, b"0123456789")?;
     eq("chown sf 1234:5678", s3(nr::CHOWN, p.at(), 1234, 5678), 0)?;
-    eq("symlink to sf", s2(nr::SYMLINK, P::new(&[b"sf"]).at(), j(ext, b"sl").at()), 0)?;
+    eq("symlink to sf", s2(nr::SYMLINK, P::new(&[b"sf"]).at(), j(dir, b"sl").at()), 0)?;
     let s = st("stat", stat(&p))?;
     eq("stat: a file", s.kind() as i64, S_IFREG as i64)?;
     eq("stat: its size", s.size(), 10)?;
@@ -1037,6 +1080,10 @@ fn stat_family(ext: &[u8], tmp: &[u8]) -> R {
         ensure("statx agrees with stat", sx.ino() == s.ino() && sx.size() == s.size() as u64, sx.ino() as i64)?;
         ensure("statx's mode and links", sx.mode() == s.mode() && sx.nlink() as u64 == s.nlink(), sx.mode() as i64)?;
         ensure("statx's owner", sx.uid() == s.uid() && sx.gid() == s.gid(), sx.gid() as i64)?;
+        // glibc's makedev encoding of st_dev, split.
+        let d = s.dev();
+        let (major, minor) = (((d >> 8) & 0xfff) | ((d >> 32) & !0xfff), (d & 0xff) | ((d >> 12) & !0xff));
+        ensure("statx's device", sx.dev() == (major as u32, minor as u32), sx.dev().1 as i64)?;
         ensure("statx's mtime", sx.mtime_sec() == s.mtime().0, sx.mtime_sec())?;
         let sx = statx(fd, ptr(&b"\0"[..]), AT_EMPTY_PATH)?;
         eq("statx AT_EMPTY_PATH", sx.ino() as i64, s.ino() as i64)
@@ -1044,35 +1091,35 @@ fn stat_family(ext: &[u8], tmp: &[u8]) -> R {
     close(fd);
     r?;
     // The symlink: lstat and AT_SYMLINK_NOFOLLOW see it, stat follows it.
-    let l = st("lstat", lstat(&j(ext, b"sl")))?;
+    let l = st("lstat", lstat(&j(dir, b"sl")))?;
     eq("lstat: a link", l.kind() as i64, S_IFLNK as i64)?;
     eq("lstat: its size is its target's length", l.size(), 2)?;
     ensure("lstat: its own inode", l.ino() != s.ino(), l.ino() as i64)?;
-    eq("stat follows it", st("stat sl", stat(&j(ext, b"sl")))?.ino() as i64, s.ino() as i64)?;
-    let n = st("newfstatat NOFOLLOW", fstatat(AT_FDCWD, j(ext, b"sl").at(), AT_SYMLINK_NOFOLLOW))?;
+    eq("stat follows it", st("stat sl", stat(&j(dir, b"sl")))?.ino() as i64, s.ino() as i64)?;
+    let n = st("newfstatat NOFOLLOW", fstatat(AT_FDCWD, j(dir, b"sl").at(), AT_SYMLINK_NOFOLLOW))?;
     eq("newfstatat AT_SYMLINK_NOFOLLOW", n.ino() as i64, l.ino() as i64)?;
     eq(
         "newfstatat follows by default",
-        st("newfstatat sl", fstatat(AT_FDCWD, j(ext, b"sl").at(), 0))?.ino() as i64,
+        st("newfstatat sl", fstatat(AT_FDCWD, j(dir, b"sl").at(), 0))?.ino() as i64,
         s.ino() as i64,
     )?;
-    let sx = statx(AT_FDCWD, j(ext, b"sl").at(), AT_SYMLINK_NOFOLLOW)?;
+    let sx = statx(AT_FDCWD, j(dir, b"sl").at(), AT_SYMLINK_NOFOLLOW)?;
     eq("statx AT_SYMLINK_NOFOLLOW: a link", (sx.mode() & S_IFMT) as i64, S_IFLNK as i64)?;
     // Relative to a directory fd.
-    let dfd = ok("open the directory", open(&P::new(&[ext]), O_RDONLY | O_DIRECTORY, 0))?;
+    let dfd = ok("open the directory", open(&P::new(&[dir]), O_RDONLY | O_DIRECTORY, 0))?;
     let rel = fstatat(dfd, ptr(&b"sf\0"[..]), 0);
     let relx = statx(dfd, ptr(&b"sf\0"[..]), 0);
     close(dfd);
     eq("newfstatat relative to a dirfd", st("newfstatat dirfd", rel)?.ino() as i64, s.ino() as i64)?;
     eq("statx relative to a dirfd", relx?.ino() as i64, s.ino() as i64)?;
     // Directories, on two filesystems.
-    let de = st("stat the ext4 directory", stat(&P::new(&[ext])))?;
-    let dt = st("stat the tmpfs directory", stat(&P::new(&[tmp])))?;
+    let de = st("stat the directory", stat(&P::new(&[dir])))?;
+    let dt = st("stat the other directory", stat(&P::new(&[other])))?;
     eq("a directory", de.kind() as i64, S_IFDIR as i64)?;
     ensure("two devices", de.dev() != dt.dev(), de.dev() as i64)?;
     eq("stat \"\"", st_err(stat(&P::new(&[b""]))), -ENOENT)?;
-    eq("stat a missing name", st_err(stat(&j(ext, b"missing"))), -ENOENT)?;
-    eq("stat through a file", st_err(stat(&P::new(&[ext, b"/sf/x"]))), -ENOTDIR)
+    eq("stat a missing name", st_err(stat(&j(dir, b"missing"))), -ENOENT)?;
+    eq("stat through a file", st_err(stat(&P::new(&[dir, b"/sf/x"]))), -ENOTDIR)
 }
 
 fn metadata(d: &[u8]) -> R {
@@ -1139,8 +1186,7 @@ fn metadata(d: &[u8]) -> R {
         eq("utimensat NOFOLLOW", s4(nr::UTIMENSAT, at, j(d, b"ml").at(), ptr(&times), AT_SYMLINK_NOFOLLOW), 0)?;
         eq("the link's mtime", st("lstat ml", lstat(&j(d, b"ml")))?.mtime().0, 5_000_000)?;
         eq("the file's mtime unchanged", st("stat m", stat(&m))?.mtime().0, 3_000_000)?;
-        let times: [i64; 4] = [1_000_000, 0, 1_000_000, 0];
-        eq("utimensat set both old", s4(nr::UTIMENSAT, at, m.at(), ptr(&times), 0), 0)?;
+        eq("utimensat set both old", s4(nr::UTIMENSAT, at, m.at(), ptr(&OLD_TIMES), 0), 0)?;
         eq("utimensat times NULL", s4(nr::UTIMENSAT, at, m.at(), 0, 0), 0)?;
         let s = st("stat m", stat(&m))?;
         ensure("both now", s.atime().0 > 1_600_000_000 && s.mtime().0 > 1_600_000_000, s.mtime().0)?;
@@ -1152,37 +1198,41 @@ fn metadata(d: &[u8]) -> R {
     r
 }
 
-fn cwd(ext: &[u8], tmp: &[u8]) -> R {
+fn cwd(dir: &[u8], other: &[u8]) -> R {
     let r = (|| {
         cwd_is("getcwd at start", b"/")?;
-        eq("chdir to the ext4 directory", s1(nr::CHDIR, P::new(&[ext]).at()), 0)?;
-        cwd_is("getcwd after chdir", ext)?;
+        eq("chdir to the directory", s1(nr::CHDIR, P::new(&[dir]).at()), 0)?;
+        cwd_is("getcwd after chdir", dir)?;
         // `sf` is from the stat check: relative paths start at the cwd.
         holds(&P::new(&[b"sf"]), b"0123456789")?;
         eq("mkdir relative", s2(nr::MKDIR, P::new(&[b"cd"]).at(), 0o755), 0)?;
         eq("symlink to it", s2(nr::SYMLINK, P::new(&[b"cd"]).at(), P::new(&[b"lcd"]).at()), 0)?;
         // Through a symlink: getcwd names the directory, not the link.
         eq("chdir through a symlink", s1(nr::CHDIR, P::new(&[b"lcd"]).at()), 0)?;
-        cwd_is("getcwd through the link", j(ext, b"cd").bytes())?;
+        cwd_is("getcwd through the link", j(dir, b"cd").bytes())?;
         // Renaming the cwd's directory: getcwd follows it.
-        eq("rename the cwd", s2(nr::RENAME, j(ext, b"cd").at(), j(ext, b"cd2").at()), 0)?;
-        cwd_is("getcwd after renaming it", j(ext, b"cd2").bytes())?;
+        eq("rename the cwd", s2(nr::RENAME, j(dir, b"cd").at(), j(dir, b"cd2").at()), 0)?;
+        cwd_is("getcwd after renaming it", j(dir, b"cd2").bytes())?;
         eq("rmdir .", s1(nr::RMDIR, P::new(&[b"."]).at()), -EINVAL)?;
         eq("chdir ..", s1(nr::CHDIR, P::new(&[b".."]).at()), 0)?;
-        cwd_is("getcwd after ..", ext)?;
-        // fchdir to another filesystem, by a plain and an O_PATH fd.
-        let tfd = ok("open the tmpfs directory", open(&P::new(&[tmp]), O_RDONLY | O_DIRECTORY, 0))?;
+        cwd_is("getcwd after ..", dir)?;
+        // fchdir to the other filesystem, and back by an O_PATH fd.
+        let tfd = ok("open the other directory", open(&P::new(&[other]), O_RDONLY | O_DIRECTORY, 0))?;
         let r = s1(nr::FCHDIR, tfd as u64);
         close(tfd);
         eq("fchdir", r, 0)?;
-        cwd_is("getcwd after fchdir", tmp)?;
+        cwd_is("getcwd after fchdir", other)?;
         let here = st("stat .", stat(&P::new(&[b"."])))?;
-        eq("\".\" is the tmpfs directory", here.ino() as i64, st("stat tmp", stat(&P::new(&[tmp])))?.ino() as i64)?;
-        let pfd = ok("O_PATH on the ext4 directory", open(&P::new(&[ext]), O_PATH | O_DIRECTORY, 0))?;
+        eq(
+            "\".\" is the other directory",
+            here.ino() as i64,
+            st("stat the other directory", stat(&P::new(&[other])))?.ino() as i64,
+        )?;
+        let pfd = ok("O_PATH on the directory", open(&P::new(&[dir]), O_PATH | O_DIRECTORY, 0))?;
         let r = s1(nr::FCHDIR, pfd as u64);
         close(pfd);
         eq("fchdir by an O_PATH fd", r, 0)?;
-        cwd_is("getcwd after it", ext)?;
+        cwd_is("getcwd after it", dir)?;
         let ffd = ok("open a file", open(&P::new(&[b"sf"]), O_RDONLY, 0))?;
         let r = s1(nr::FCHDIR, ffd as u64);
         close(ffd);
@@ -1191,37 +1241,37 @@ fn cwd(ext: &[u8], tmp: &[u8]) -> R {
         eq("chdir to a missing name", s1(nr::CHDIR, P::new(&[b"missing"]).at()), -ENOENT)?;
         let mut small = [0u8; 2];
         eq("getcwd into 2 bytes", s2(nr::GETCWD, mptr(&mut small[..]), 2), -ERANGE)?;
-        cwd_is("the cwd kept after the failures", ext)
+        cwd_is("the cwd kept after the failures", dir)
     })();
     s1(nr::CHDIR, ptr(&b"/\0"[..]));
     r?;
     cwd_is("back at /", b"/")
 }
 
-fn exdev_enotty(ext: &[u8], tmp: &[u8]) -> R {
-    put(&j(tmp, b"x"), b"x")?;
-    put(&j(ext, b"y"), b"y")?;
-    eq("rename tmpfs -> ext4", s2(nr::RENAME, j(tmp, b"x").at(), j(ext, b"x").at()), -EXDEV)?;
-    eq("link tmpfs -> ext4", s2(nr::LINK, j(tmp, b"x").at(), j(ext, b"x").at()), -EXDEV)?;
+fn exdev_enotty(dir: &[u8], other: &[u8]) -> R {
+    put(&j(other, b"x"), b"x")?;
+    put(&j(dir, b"y"), b"y")?;
+    eq("rename from the other filesystem", s2(nr::RENAME, j(other, b"x").at(), j(dir, b"x").at()), -EXDEV)?;
+    eq("link from the other filesystem", s2(nr::LINK, j(other, b"x").at(), j(dir, b"x").at()), -EXDEV)?;
     let at = AT_FDCWD as u64;
     eq(
         "renameat2 RENAME_EXCHANGE across",
-        s5(nr::RENAMEAT2, at, j(ext, b"y").at(), at, j(tmp, b"x").at(), RENAME_EXCHANGE),
+        s5(nr::RENAMEAT2, at, j(dir, b"y").at(), at, j(other, b"x").at(), RENAME_EXCHANGE),
         -EXDEV,
     )?;
-    holds(&j(tmp, b"x"), b"x")?;
-    holds(&j(ext, b"y"), b"y")?;
-    eq("nothing made on ext4", st_err(lstat(&j(ext, b"x"))), -ENOENT)?;
-    eq("rename within tmpfs", s2(nr::RENAME, j(tmp, b"x").at(), j(tmp, b"x2").at()), 0)?;
+    holds(&j(other, b"x"), b"x")?;
+    holds(&j(dir, b"y"), b"y")?;
+    eq("nothing made in the directory", st_err(lstat(&j(dir, b"x"))), -ENOENT)?;
+    eq("rename within the other directory", s2(nr::RENAME, j(other, b"x").at(), j(other, b"x2").at()), 0)?;
     // ENOTTY: a tty ioctl on a regular file; the console answers it.
-    let fd = ok("open a file", open(&j(ext, b"y"), O_RDONLY, 0))?;
+    let fd = ok("open a file", open(&j(dir, b"y"), O_RDONLY, 0))?;
     let mut buf = [0u8; 64];
     let tcgets = s3(nr::IOCTL, fd as u64, TCGETS, mptr(&mut buf[..]));
     let winsz = s3(nr::IOCTL, fd as u64, TIOCGWINSZ, mptr(&mut buf[..]));
     close(fd);
     eq("TCGETS on a file", tcgets, -ENOTTY)?;
     eq("TIOCGWINSZ on a file", winsz, -ENOTTY)?;
-    let dfd = ok("open a directory", open(&P::new(&[ext]), O_RDONLY | O_DIRECTORY, 0))?;
+    let dfd = ok("open a directory", open(&P::new(&[dir]), O_RDONLY | O_DIRECTORY, 0))?;
     let r = s3(nr::IOCTL, dfd as u64, TCGETS, mptr(&mut buf[..]));
     close(dfd);
     eq("TCGETS on a directory", r, -ENOTTY)?;
@@ -1245,42 +1295,81 @@ fn locks(d: &[u8]) -> c_int {
 // -- mode keep -----------------------------------------------------------------------------
 
 /// `keep <dir>`: a small tree left on the disk for its fsck: a hard link, a
-/// short and a long symlink, a file's new mode, owner and times, a file and
-/// a directory exchanged, and a directory moved to another parent.
+/// short and a long symlink, two files' new mode, owner and times (`f`'s
+/// set while it has unwritten changes, written by a `sync`; `t2`'s set
+/// after that `sync`, on a clean inode), a file and a directory exchanged,
+/// and a directory moved to another parent. Each check reads back what it
+/// made, as `keep-check` does on a later boot, from the disk.
 fn keep(d: &[u8]) -> c_int {
     let checks: [(&str, &dyn Fn() -> R); 5] = [
         ("setup", &|| eq("mkdir the directory", s2(nr::MKDIR, P::new(&[d]).at(), 0o755), 0)),
-        ("hard-link-and-symlinks", &|| keep_links(d)),
-        ("metadata", &|| keep_metadata(d)),
-        ("exchanged-file-and-directory", &|| keep_exchange(d)),
-        ("moved-directory", &|| keep_moved(d)),
+        ("hard-link-and-symlinks", &|| keep_links(d).and_then(|()| kept_links(d))),
+        ("metadata", &|| keep_metadata(d).and_then(|()| kept_metadata(d))),
+        ("exchanged-file-and-directory", &|| keep_exchange(d).and_then(|()| kept_exchange(d))),
+        ("moved-directory", &|| keep_moved(d).and_then(|()| kept_moved(d))),
     ];
     run_checks(&checks)
 }
 
+/// `keep-check <dir>`: what `keep` left in `<dir>`, read on a later boot.
+fn keep_check(d: &[u8]) -> c_int {
+    let checks: [(&str, &dyn Fn() -> R); 4] = [
+        ("hard-link-and-symlinks", &|| kept_links(d)),
+        ("metadata", &|| kept_metadata(d)),
+        ("exchanged-file-and-directory", &|| kept_exchange(d)),
+        ("moved-directory", &|| kept_moved(d)),
+    ];
+    run_checks(&checks)
+}
+
+/// `long`'s target: too long to keep in the inode, a block of its own.
+fn long_target(d: &[u8]) -> P {
+    P::new(&[d, b"/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/f"])
+}
+
 fn keep_links(d: &[u8]) -> R {
     put(&j(d, b"f"), b"kept")?;
+    put(&j(d, b"t2"), b"t2")?;
     eq("link f hl", s2(nr::LINK, j(d, b"f").at(), j(d, b"hl").at()), 0)?;
-    eq("two links", st("stat hl", stat(&j(d, b"hl")))?.nlink() as i64, 2)?;
     eq("symlink sl", s2(nr::SYMLINK, P::new(&[b"f"]).at(), j(d, b"sl").at()), 0)?;
-    // A target too long to keep in the inode: a block of its own.
-    let long = P::new(&[d, b"/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/f"]);
-    eq("symlink a long target", s2(nr::SYMLINK, long.at(), j(d, b"long").at()), 0)?;
+    eq("symlink a long target", s2(nr::SYMLINK, long_target(d).at(), j(d, b"long").at()), 0)
+}
+
+fn kept_links(d: &[u8]) -> R {
+    let f = st("stat f", stat(&j(d, b"f")))?;
+    eq("f's links", f.nlink() as i64, 2)?;
+    eq("hl is f", st("stat hl", stat(&j(d, b"hl")))?.ino() as i64, f.ino() as i64)?;
+    holds(&j(d, b"hl"), b"kept")?;
     let mut buf = [0u8; 128];
+    let n = s3(nr::READLINK, j(d, b"sl").at(), mptr(&mut buf[..]), 128);
+    ensure("readlink sl", n == 1 && buf[0] == b'f', n)?;
+    let long = long_target(d);
     let n = s3(nr::READLINK, j(d, b"long").at(), mptr(&mut buf[..]), 128);
     eq("readlink the long target", n, long.bytes().len() as i64)?;
     ensure("its target", &buf[..n as usize] == long.bytes(), n)
 }
 
 fn keep_metadata(d: &[u8]) -> R {
-    let f = j(d, b"f");
-    eq("chmod 0640", s2(nr::CHMOD, f.at(), 0o640), 0)?;
-    eq("chown 1000:1001", s3(nr::CHOWN, f.at(), 1000, 1001), 0)?;
+    let (f, t2) = (j(d, b"f"), j(d, b"t2"));
+    eq("chmod f 0640", s2(nr::CHMOD, f.at(), 0o640), 0)?;
+    eq("chown f 1000:1001", s3(nr::CHOWN, f.at(), 1000, 1001), 0)?;
     let times: [i64; 4] = [1_000_000, 0, 2_000_000, 0];
-    eq("utimensat", s4(nr::UTIMENSAT, AT_FDCWD as u64, f.at(), ptr(&times), 0), 0)?;
-    let s = st("stat f", stat(&f))?;
-    ensure("its mode and owner", (s.perm(), s.uid(), s.gid()) == (0o640, 1000, 1001), s.perm() as i64)?;
-    eq("its mtime", s.mtime().0, 2_000_000)
+    eq("utimensat f", s4(nr::UTIMENSAT, AT_FDCWD as u64, f.at(), ptr(&times), 0), 0)?;
+    eq("sync", s0(nr::SYNC), 0)?;
+    let times: [i64; 4] = [3_000_000, 0, 4_000_000, 0];
+    eq("utimensat t2", s4(nr::UTIMENSAT, AT_FDCWD as u64, t2.at(), ptr(&times), 0), 0)?;
+    eq("chown t2 2000:2001", s3(nr::CHOWN, t2.at(), 2000, 2001), 0)
+}
+
+fn kept_metadata(d: &[u8]) -> R {
+    let f = st("stat f", stat(&j(d, b"f")))?;
+    ensure("f's mode and owner", (f.perm(), f.uid(), f.gid()) == (0o640, 1000, 1001), f.perm() as i64)?;
+    ensure("f's atime", f.atime() == (1_000_000, 0), f.atime().0)?;
+    ensure("f's mtime", f.mtime() == (2_000_000, 0), f.mtime().0)?;
+    let t2 = st("stat t2", stat(&j(d, b"t2")))?;
+    ensure("t2's owner", (t2.uid(), t2.gid()) == (2000, 2001), t2.uid() as i64)?;
+    ensure("t2's atime", t2.atime() == (3_000_000, 0), t2.atime().0)?;
+    ensure("t2's mtime", t2.mtime() == (4_000_000, 0), t2.mtime().0)
 }
 
 fn keep_exchange(d: &[u8]) -> R {
@@ -1288,9 +1377,14 @@ fn keep_exchange(d: &[u8]) -> R {
     put(&xf, b"file")?;
     eq("mkdir xd", s2(nr::MKDIR, xd.at(), 0o755), 0)?;
     put(&j(xd.bytes(), b"inner"), b"inner")?;
-    eq("RENAME_EXCHANGE", rename2(&xf, &xd, RENAME_EXCHANGE), 0)?;
+    eq("RENAME_EXCHANGE", rename2(&xf, &xd, RENAME_EXCHANGE), 0)
+}
+
+fn kept_exchange(d: &[u8]) -> R {
+    let (xf, xd) = (j(d, b"xf"), j(d, b"xd"));
     eq("xf is the directory", st("stat xf", stat(&xf))?.kind() as i64, S_IFDIR as i64)?;
     holds(&j(xf.bytes(), b"inner"), b"inner")?;
+    eq("xd is the file", st("stat xd", stat(&xd))?.kind() as i64, S_IFREG as i64)?;
     holds(&xd, b"file")
 }
 
@@ -1299,7 +1393,11 @@ fn keep_moved(d: &[u8]) -> R {
     eq("mkdir p1", s2(nr::MKDIR, p1.at(), 0o755), 0)?;
     eq("mkdir p2", s2(nr::MKDIR, p2.at(), 0o755), 0)?;
     eq("mkdir p1/m", s2(nr::MKDIR, j(p1.bytes(), b"m").at(), 0o755), 0)?;
-    eq("move p1/m to p2/m", s2(nr::RENAME, j(p1.bytes(), b"m").at(), j(p2.bytes(), b"m").at()), 0)?;
+    eq("move p1/m to p2/m", s2(nr::RENAME, j(p1.bytes(), b"m").at(), j(p2.bytes(), b"m").at()), 0)
+}
+
+fn kept_moved(d: &[u8]) -> R {
+    let (p1, p2) = (j(d, b"p1"), j(d, b"p2"));
     eq("p1's links", st("stat p1", stat(&p1))?.nlink() as i64, 2)?;
     let in_p2 = st("stat p2", stat(&p2))?;
     eq("p2's links", in_p2.nlink() as i64, 3)?;
@@ -1420,7 +1518,7 @@ fn overwrite_open(d: &[u8]) -> R {
         let s = st("fstat after", fstat(fd))?;
         eq("the old file has no links", s.nlink() as i64, 0)?;
         eq("and its size", s.size(), 12)?;
-        ensure("st_ino: the same, or a detached one", detached_ino(s.ino(), ino), s.ino() as i64)?;
+        ensure("st_ino: a detached one", detached_ino(s.ino(), ino), s.ino() as i64)?;
         ensure("the name's another inode", st("stat old", stat(&old))?.ino() != ino, ino as i64)
     })();
     close(fd);
@@ -1464,7 +1562,8 @@ fn fcntl_lock(fd: i64, cmd: u64, fl: &mut Flock) -> i64 {
     s3(nr::FCNTL, fd as u64, cmd, mptr(fl))
 }
 
-/// Wait for a byte on stdin (a key on the terminal): false at the end of
+/// Wait for one read of stdin to return something (on a virtual terminal,
+/// one key's bytes): false at the end of
 /// input or an error.
 fn wait_step() -> bool {
     let mut b = [0u8; 4];
@@ -1631,7 +1730,7 @@ unsafe fn arg(p: *const u8) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(p, n) }
 }
 
-const USAGE: &str = "usage: m7_vfs posix <dir> <other dir> | locks <dir> | keep <dir> | lock-hold <file> | lock-probe <file> <pid> <probe>...";
+const USAGE: &str = "usage: m7_vfs posix <dir> <other dir> | locks <dir> | keep <dir> | keep-check <dir> | lock-hold <file> | lock-probe <file> <pid> <probe>...";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
@@ -1647,6 +1746,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
         [_, b"posix", dir, other] => posix(dir, other),
         [_, b"locks", dir] => locks(dir),
         [_, b"keep", dir] => keep(dir),
+        [_, b"keep-check", dir] => keep_check(dir),
         [_, b"lock-hold", file] => lock_hold(file),
         [_, b"lock-probe", file, pid, probes @ ..] if !probes.is_empty() => lock_probe(file, pid, probes),
         _ => {

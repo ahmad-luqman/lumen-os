@@ -319,22 +319,24 @@ KEEP_CHECKS = [
 def test_posix_vfs_semantics(boot, tmp_path):
     """#254's POSIX file syscalls from ring 3, by a dynamic musl program on
     the Alpine rootfs (`m7_vfs posix`, each check's details in
-    tools/linux-m7/m7_vfs.rs), run twice: on ext4 (`/m7v`, with `/tmp/m7v`
-    as the other filesystem) and on tmpfs (`/tmp/m7s`, with `/m7s`), so
-    each filesystem gets every check: symlinks and ELOOP (a loop, 40 links followed and 41 not, O_NOFOLLOW),
-    a trailing slash following a final symlink under O_NOFOLLOW, O_PATH
-    descriptors, hard links and linkat's AT_SYMLINK_FOLLOW, unlink and
-    rmdir while open, getdents64 (types, d_ino, a small buffer's cursor, a
-    moved directory's ".."), pread64/pwrite64 leaving the offset alone,
-    stat/lstat/newfstatat/statx agreeing, chmod/chown/umask/utimensat
-    (UTIME_NOW, UTIME_OMIT, a NULL path, a link), chdir/fchdir/getcwd
-    (through a link, a renamed and a removed cwd), EXDEV between the two
-    filesystems and ENOTTY from a tty ioctl on a file. It removes what it
-    made (a second run leaks no frame). Then `m7_vfs keep` leaves a small
-    tree on ext4 (a hard link, a short and a long symlink, a file's mode,
-    owner and times, an exchanged file and directory, a directory moved to
-    another parent), which the kernel's own view agrees with after `sync`,
-    and the disk passes e2fsck with it there."""
+    tools/linux-m7/m7_vfs.rs), run each way round, twice each (the second
+    run leaking no frame): in ext4's `/m7v` (with `/tmp/m7v` as the other
+    filesystem) and in tmpfs's `/tmp/m7s` (with `/m7s`), so each filesystem
+    gets every check: symlinks and ELOOP (a loop, 40 links followed and 41
+    not, O_NOFOLLOW), a trailing slash following a final symlink under
+    O_NOFOLLOW, O_PATH descriptors, hard links and linkat's
+    AT_SYMLINK_FOLLOW, unlink and rmdir while open, getdents64 (types,
+    d_ino, a small buffer's cursor, a moved directory's ".."),
+    pread64/pwrite64 leaving the offset alone, stat/lstat/newfstatat/statx
+    agreeing, chmod/chown/umask/utimensat (UTIME_NOW, UTIME_OMIT, a NULL
+    path, a link), chdir/fchdir/getcwd (through a link, a renamed and a
+    removed cwd), EXDEV between the two filesystems and ENOTTY from a tty
+    ioctl on a file. It removes what it made. Then `m7_vfs keep` leaves a
+    small tree on ext4 (a hard link, a short and a long symlink, two files'
+    mode, owner and times, one set before an in-program `sync` and one
+    after it, an exchanged file and directory, a directory moved to another
+    parent): the disk passes e2fsck with it there, and a second boot on the
+    disk reads it all back (`m7_vfs keep-check`)."""
     disk = copy_rootfs(tmp_path)
     m = shell(boot, devices=Devices(blk_image=disk, rng=True))
     m7_vfs(m, "posix /m7v /tmp/m7v", POSIX_CHECKS)
@@ -356,6 +358,14 @@ def test_posix_vfs_semantics(boot, tmp_path):
     assert m.wait_exit(10) == EXIT_SUCCESS
     m.close()
     e2fsck_check(disk)
+
+    # A second boot reads the tree from the disk, not the first one's cache.
+    m2 = shell(boot, devices=Devices(blk_image=disk, rng=True))
+    run_m7_vfs(m2, "keep-check /m7k", KEEP_CHECKS[1:])
+    assert stat_fields(m2, "/m7k/f")["mtime"] == "2000000.000000000"
+    m2.send_line("exit")
+    assert m2.wait_exit(10) == EXIT_SUCCESS
+    m2.close()
 
 
 LOCKS_CHECKS = [
