@@ -5366,6 +5366,19 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     The same applies to character and block device nodes (which Linux and
     `mke2fs -d` create): they keep `rdev` in `i_block` with no blocks
     allocated, so the adapter zeroes it the same way before freeing them.
+  - **Device numbers and timestamps decoded by the adapter (#292, #294):**
+    `ext4plus` exposes neither a device node's `i_block` nor signed times
+    (it reads a time's low 32 bits as unsigned, so 1969 reads as 2106). The
+    adapter reads a character or block device's `i_block[0..2]` raw when the
+    inode is first loaded and decodes it as `ext4_iget` does
+    (`lumen_vfs::ext4::rdev_from_i_block`: old encoding in `i_block[0]` when
+    non-zero, else new in `i_block[1]`), keeping it for the inode's life. Times
+    go through `lumen_vfs::ext4::time_to_disk`/`time_from_disk`: Linux's signed
+    second plus two epoch bits (1901 to 2446), clamped outside that range
+    (`timestamp_truncate`), and whole 32-bit seconds for an inode whose
+    `i_extra_isize` leaves out `i_crtime` (taken to have no extra time
+    fields). After every write of an inode's times, memory takes back what the
+    disk holds, so `stat` before and after a remount agree.
   - **Truncate partial-block tail zeroing:** `ext4plus::file::truncate` does
     not zero `[new_size % 4096 .. 4096)` in the partial final block on shrink;
     #253's `PageCache` / truncate path MUST enforce the tail-zeroing rule above.

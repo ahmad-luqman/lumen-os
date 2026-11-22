@@ -94,3 +94,13 @@ tests = [
     "ktest:lumen_kernel::vfs::page_cache::mmap_page_refuses_inodes_of_other_filesystems",
     "ktest:lumen_kernel::vfs::page_cache::mapped_page_copies_to_a_frame_under_the_cache_lock",
 ]
+
+[[feature]]
+name = "ext4 device nodes report their st_rdev, decoded from i_block in Linux's old and new encodings and kept while an unlinked node is held (#292); ext4 times from 1901 to 2446 stored as Linux does (a signed 32-bit second, two epoch bits, nanoseconds), clamped outside that range, whole 32-bit seconds in an inode without the extra time fields, and stat agreeing with the disk across a remount after utimensat (set_times) and after a write's metadata flush (#294)"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::vfs::ext4::ext4_device_nodes_report_their_device_numbers",
+    "ktest:lumen_kernel::vfs::ext4::ext4_times_before_1970_and_past_2038_survive_a_remount",
+    "ktest:lumen_kernel::vfs::ext4::ext4_an_inode_without_extra_time_fields_keeps_whole_seconds",
+]

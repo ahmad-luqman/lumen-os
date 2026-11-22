@@ -528,10 +528,12 @@ one is its own PR that updates that doc first.
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
   call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,
   whose `WouldBlock` alone names the holder; `PosixWaitGraph`, who waits
-  for whom, for `EDEADLK`, its search's `WaitSearch`), and
+  for whom, for `EDEADLK`, its search's `WaitSearch`),
   `procfs` (`/proc`'s `ProcKind`s, their inode numbers and types, `ProcFd`:
   an fd in `0..MAX_FDS`, `ProcFd::parse`, and `parse_canonical_u32`: one
-  name per number) (host-tested).
+  name per number), and `ext4` (#292, #294: what the ext4 adapter decodes
+  itself, a device node's `i_block` as `st_rdev` and Linux's signed times
+  with their epoch bits, clamped as `timestamp_truncate` does) (host-tested).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
