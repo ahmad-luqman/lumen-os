@@ -941,10 +941,7 @@ type KtestDirAndFile = (Arc<dyn VfsInode>, Arc<dyn VfsInode>);
 /// (`entry-000`, ...; hard links to one file, so a small volume's few
 /// inodes do): the directory and the file.
 #[cfg(feature = "ktest")]
-fn ktest_churn_dir(
-    parent: &Arc<dyn VfsInode>,
-    name: &str,
-) -> Result<KtestDirAndFile, &'static str> {
+fn ktest_churn_dir(parent: &Arc<dyn VfsInode>, name: &str) -> Result<KtestDirAndFile, &'static str> {
     use alloc::format;
     let dir = parent.mkdir(name, 0o755).map_err(|_| "mkdir")?;
     let file = dir.create("entry-000", 0o644).map_err(|_| "create")?;
