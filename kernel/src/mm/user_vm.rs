@@ -90,10 +90,13 @@ pub enum FaultResult {
     Invalid,
     /// Valid demand-paging fault, but physical memory is exhausted.
     OutOfMemory,
-    /// A file-backed page that can't be had: wholly past the file's end, or
-    /// its disk read failed (`ext4` logs that, naming the device, inode and
-    /// page). A ring-3 fault ends the process with `UserExit::BusError`
-    /// (`SIGBUS` from M8); a kernel user copy fails with `-EFAULT`.
+    /// A file-backed page that can't be had: wholly past the file's end, its
+    /// disk read failed (`ext4` logs that, naming the device, inode and
+    /// page), or the page cache refused it for any other reason than a
+    /// missing frame (a quota or the `ext4` hard limit, `NoSpc`; an unlinked
+    /// inode, `NoEnt`; logged once per streak by `file_page`). A ring-3
+    /// fault ends the process with `UserExit::BusError` (`SIGBUS` from M8);
+    /// a kernel user copy fails with `-EFAULT`.
     BusError,
 }
 
@@ -214,6 +217,21 @@ struct AddressSpaceInner {
     /// or made read-only and the TLB flushed (ARCHITECTURE section 5's
     /// unmap order).
     writable_maps: BTreeMap<u64, WritableMap>,
+    /// The file and error of the last file-fault failure warned about, so a
+    /// streak of the same failure warns once (`file_page`).
+    fault_warned: Option<(u64, VfsError)>,
+}
+
+/// How a file mapping shares its pages (`mmap(2)`'s `MAP_SHARED` or
+/// `MAP_PRIVATE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: mmap(fd) (#255, wave 3)
+pub enum Sharing {
+    /// `MAP_PRIVATE`: copy-on-write; may always be made writable.
+    Private,
+    /// `MAP_SHARED`: stores reach the file. `writable` is `VM_MAYWRITE`:
+    /// the descriptor is open for writing on a writable mount.
+    Shared { writable: bool },
 }
 
 /// The `FileMapping::file_id` of a file mapped from `inode`: its `lock_id`,
@@ -258,6 +276,7 @@ impl AddressSpace {
                 mapped_files: BTreeMap::new(),
                 pinned_pages: BTreeMap::new(),
                 writable_maps: BTreeMap::new(),
+                fault_warned: None,
             }),
         })
     }
@@ -534,28 +553,26 @@ impl AddressSpace {
             return Err(UserVmError::OutOfMemory);
         }
         let mapped = inner.vmas.map_anon(place, len, prot)?;
-        for removed in mapped.unmapped {
-            self.unmap_range_locked(&mut inner, removed.start, removed.end);
-        }
-        release_unmapped_files(&mut inner, &mut gone_files);
+        self.unmap_vmas_locked(&mut inner, &mapped.unmapped, &mut gone_files);
         Ok(mapped.start)
     }
 
     /// Register a lazy file-backed VMA over `[offset, offset + len)` of the
     /// file `file` holds open (`mmap(2)` of a file descriptor, whose open
-    /// reference it is; wave 3's syscall calls it):
-    /// `shared` for `MAP_SHARED`, else `MAP_PRIVATE` copy-on-write;
-    /// `may_write` is `VM_MAYWRITE` (`true` for `MAP_PRIVATE`; for
-    /// `MAP_SHARED`, whether the descriptor is writable on a writable
-    /// mount). `PROT_WRITE` without `may_write` is refused (`Access`), and a
-    /// file with no pages to map (anything but a regular `ext4` or `tmpfs`
-    /// file) with `NoDev`. `offset` must be page-aligned (`Misaligned`).
+    /// reference it is; wave 3's syscall calls it), shared or private as
+    /// `sharing` says. `PROT_WRITE` on a `Shared { writable: false }`
+    /// mapping is refused (`Access`), and a file with no pages to map
+    /// (anything but a regular `ext4` or `tmpfs` file) with `NoDev`.
+    /// `offset` must be page-aligned (`Misaligned`).
+    ///
+    /// It doesn't check that the descriptor is open for reading: Linux
+    /// refuses `mmap` of one that isn't (`EACCES`), and wave 3's syscall
+    /// must check that before calling this.
     ///
     /// Nothing is mapped until a fault ([`Self::handle_page_fault`]). The
     /// address space keeps its own open reference (a clone of `file`) while
     /// any VMA maps the file, so closing the descriptor keeps the mapping
     /// valid. `MAP_FIXED` releases what it replaces as `munmap` does.
-    #[allow(clippy::too_many_arguments)] // mmap(2)'s own arguments
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: mmap(fd) (#255, wave 3)
     pub fn mmap_file(
         &self,
@@ -564,9 +581,12 @@ impl AddressSpace {
         prot: Prot,
         file: &OpenGuard,
         offset: u64,
-        shared: bool,
-        may_write: bool,
+        sharing: Sharing,
     ) -> Result<u64, UserVmError> {
+        let (shared, may_write) = match sharing {
+            Sharing::Private => (false, true),
+            Sharing::Shared { writable } => (true, writable),
+        };
         let inode = file.inode();
         if !page_cache::mappable(&**inode) {
             return Err(UserVmError::NoDev);
@@ -582,13 +602,10 @@ impl AddressSpace {
             return Err(UserVmError::OutOfMemory);
         }
         let mapped = inner.vmas.map_file(place, len, prot, mapping)?;
-        for removed in mapped.unmapped {
-            self.unmap_range_locked(&mut inner, removed.start, removed.end);
-        }
         if let alloc::collections::btree_map::Entry::Vacant(slot) = inner.mapped_files.entry(file_id) {
             slot.insert(spare.take().expect("taken once"));
         }
-        release_unmapped_files(&mut inner, &mut gone_files);
+        self.unmap_vmas_locked(&mut inner, &mapped.unmapped, &mut gone_files);
         Ok(mapped.start)
     }
 
@@ -603,10 +620,7 @@ impl AddressSpace {
             return Ok(());
         }
         let removed = inner.vmas.unmap(addr, len)?;
-        for vma in removed {
-            self.unmap_range_locked(&mut inner, vma.start, vma.end);
-        }
-        release_unmapped_files(&mut inner, &mut gone_files);
+        self.unmap_vmas_locked(&mut inner, &removed, &mut gone_files);
         Ok(())
     }
 
@@ -616,9 +630,21 @@ impl AddressSpace {
     /// so a later access past the new end faults into
     /// [`FaultResult::BusError`]. Wave 3's truncate-shrink calls it, holding
     /// no VFS lock (Lock 1 before Lock 4), before dropping the cache's pages
-    /// past the new size. Returns how many pages were unmapped.
+    /// past the new size. Returns how many leaves (present or `PROT_NONE`)
+    /// were unmapped; pages never faulted in count for nothing.
+    ///
+    /// **The current process's address space only, until M8's shootdowns:**
+    /// the flush is a local `invlpg`, which reaches only a space loaded on
+    /// this CPU. Another process's space, running elsewhere, could keep a
+    /// stale writable entry to a cache frame that the truncate then frees
+    /// (hard rule 2). Asserted.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first caller: ftruncate (#255, wave 3)
     pub fn invalidate_file_from(&self, file_id: u64, new_size: u64) -> usize {
+        debug_assert_eq!(
+            arch::paging::active_root(),
+            self.root,
+            "invalidate_file_from on an address space not loaded on this CPU (needs M8 shootdowns)"
+        );
         let Some(cut) = lumen_vm::align_up_page(new_size) else {
             return 0; // no page starts past such a size
         };
@@ -668,8 +694,10 @@ impl AddressSpace {
         unsafe {
             paging::protect_user_range(self.root, addr, end, attrs, |leaf| {
                 // (1) downgraded (done), (2) flushed:
+                release_order::step(&leaf, release_order::Step::Cleared);
                 if active {
                     arch::paging::invalidate(leaf.va);
+                    release_order::step(&leaf, release_order::Step::Flushed);
                 }
                 note_shared_leaf(writable, &leaf);
             });
@@ -693,10 +721,7 @@ impl AddressSpace {
         }
         let AddressSpaceInner { vmas, brk, .. } = &mut *inner;
         let change = brk.set(vmas, addr);
-        for vma in change.unmapped {
-            self.unmap_range_locked(&mut inner, vma.start, vma.end);
-        }
-        release_unmapped_files(&mut inner, &mut gone_files);
+        self.unmap_vmas_locked(&mut inner, &change.unmapped, &mut gone_files);
         change.current
     }
 
@@ -714,8 +739,9 @@ impl AddressSpace {
     ///   cache's own frame (`PTE_SHARED`), writable only for a write fault
     ///   (counted by a [`WritableMap`]); `MAP_PRIVATE` maps it read-only for
     ///   a read or exec fault, and copies it into a private writable frame
-    ///   for a write fault. A page wholly past the file's end, or one whose
-    ///   disk read failed, is a [`FaultResult::BusError`].
+    ///   for a write fault. A page the cache can't hand out (wholly past the
+    ///   file's end, unreadable, or refused: see [`FaultResult::BusError`])
+    ///   is a bus error; a missing frame is `OutOfMemory`.
     /// - **Present and allowing the access:** a stale TLB entry, flushed.
     /// - **A store to a read-only `PTE_SHARED` leaf:** copy-on-write for
     ///   `MAP_PRIVATE` (a private copy replaces it), dirty promotion for
@@ -741,6 +767,7 @@ impl AddressSpace {
             return FaultResult::Invalid;
         }
         let is_write = (error_code & (1 << 1)) != 0;
+        let from_user = (error_code & (1 << 2)) != 0;
         let is_exec = (error_code & (1 << 4)) != 0;
 
         let mut inner = self.inner.lock();
@@ -772,7 +799,7 @@ impl AddressSpace {
                 }
                 return match vma.backing {
                     Backing::File(fm) if is_write && m.shared => {
-                        self.store_to_shared_leaf(&mut inner, &vma, fm, page_va)
+                        self.store_to_shared_leaf(&mut inner, &vma, fm, page_va, from_user)
                     }
                     _ => FaultResult::Invalid,
                 };
@@ -785,7 +812,7 @@ impl AddressSpace {
         }
 
         if let Backing::File(fm) = vma.backing {
-            return match file_page(&inner, &vma, fm, page_va) {
+            return match file_page(&mut inner, &vma, fm, page_va, from_user) {
                 Ok(mapped) => self.map_file_page(&mut inner, &vma, fm, page_va, is_write, &mapped),
                 Err(fail) => fail,
             };
@@ -830,6 +857,7 @@ impl AddressSpace {
         }
         let guard = writable.then(|| mapped.map_writable());
         let page = mapped.page();
+        debug_assert!(!writable || page.writable_maps() > 0, "a shared PTE made writable uncounted");
         // SAFETY: `self.root` is owned by `self`, `inner` lock is held, and
         // `page_va` is in `USER_MIN..USER_MAX` and not present. The frame
         // stays the page cache's: `PTE_SHARED` keeps every unmap and
@@ -840,9 +868,11 @@ impl AddressSpace {
             drop(guard); // the PTE never became writable
             return map_error_fault(err);
         }
-        inner.pinned_pages.insert(page_va.as_u64(), Arc::clone(page));
+        let pinned_before = inner.pinned_pages.insert(page_va.as_u64(), Arc::clone(page));
+        debug_assert!(pinned_before.is_none(), "pinned_pages out of step at {page_va}");
         if let Some(guard) = guard {
-            inner.writable_maps.insert(page_va.as_u64(), guard);
+            let counted_before = inner.writable_maps.insert(page_va.as_u64(), guard);
+            debug_assert!(counted_before.is_none(), "writable_maps out of step at {page_va}");
         }
         FaultResult::Resolved
     }
@@ -854,6 +884,11 @@ impl AddressSpace {
             return FaultResult::OutOfMemory;
         };
         mapped.copy_to_frame(&mut copy);
+        self.map_copy(page_va, copy, attrs)
+    }
+
+    /// Map the private frame `copy` at the not-present `page_va`.
+    fn map_copy(&self, page_va: VirtAddr, copy: frame::OwnedFrame, attrs: Attrs) -> FaultResult {
         // SAFETY: `self.root` is owned by `self`, the caller holds `inner`,
         // `page_va` is in `USER_MIN..USER_MAX` and not present, and `copy`
         // is a frame this call owns, handed to the page table below only if
@@ -880,14 +915,15 @@ impl AddressSpace {
         vma: &Vma,
         fm: FileMapping,
         page_va: VirtAddr,
+        from_user: bool,
     ) -> FaultResult {
         let va = page_va.as_u64();
-        let mapped = match file_page(inner, vma, fm, page_va) {
+        let mapped = match file_page(inner, vma, fm, page_va, from_user) {
             Ok(mapped) => mapped,
             Err(FaultResult::BusError) => {
                 // Past the new end, or unreadable: don't keep mapping a page
                 // the file may no longer have.
-                self.unmap_range_locked(inner, va, va + PAGE_SIZE);
+                self.unmap_page_locked(inner, page_va);
                 return FaultResult::BusError;
             }
             Err(fail) => return fail, // out of memory: the leaf stays as it was
@@ -897,41 +933,43 @@ impl AddressSpace {
             // Copy-on-write: the copy is taken first (the bytes below the
             // file's size now), then the shared leaf is cleared, flushed and
             // its pin dropped, and the copy mapped private and writable.
+            // The copy's source is the file's current page, which is not the
+            // one the leaf maps when the cache has let that go (`!current`:
+            // a truncate that didn't invalidate mappings), so the copy holds
+            // what the file holds now, as a fresh fault would.
             let Some(mut copy) = frame::alloc_owned() else {
                 return FaultResult::OutOfMemory;
             };
             mapped.copy_to_frame(&mut copy);
-            self.unmap_range_locked(inner, va, va + PAGE_SIZE);
-            // SAFETY: as in `map_private_copy`: `page_va` was just unmapped,
-            // and `copy` goes to the page table only if the mapping succeeds.
-            return match unsafe { paging::map_user_page(self.root, page_va, copy.frame(), prot_to_attrs(vma.prot)) } {
-                Ok(()) => {
-                    let _ = copy.into_raw(); // owned by the page table now
-                    FaultResult::Resolved
-                }
-                Err(err) => map_error_fault(err), // `copy` freed on the way out
-            };
+            self.unmap_page_locked(inner, page_va);
+            return self.map_copy(page_va, copy, prot_to_attrs(vma.prot));
         }
         if !current {
             // A page the cache has let go: map the one the file has now.
-            self.unmap_range_locked(inner, va, va + PAGE_SIZE);
+            self.unmap_page_locked(inner, page_va);
             return self.map_file_page(inner, vma, fm, page_va, true, &mapped);
         }
         // Dirty promotion: counted before the PTE becomes writable.
         if !fm.may_write {
-            return FaultResult::Invalid; // `VmaMap` refuses `PROT_WRITE` here
+            log::error!(target: "mm", "a store promoted a shared page at {page_va} of a mapping without VM_MAYWRITE");
+            debug_assert!(fm.may_write, "VmaMap refuses PROT_WRITE without may_write");
+            return FaultResult::Invalid;
         }
         let guard = mapped.map_writable();
+        debug_assert!(mapped.page().writable_maps() > 0, "a shared PTE made writable uncounted");
         let attrs = prot_to_attrs(vma.prot).with_shared(true);
         // SAFETY: `self.root` is owned by `self`, `inner` lock is held, and
         // the leaf at `page_va` maps the page pinned in `pinned_pages`.
-        if unsafe { paging::protect_user_page(self.root, page_va, attrs) }.is_err() {
+        if let Err(err) = unsafe { paging::protect_user_page(self.root, page_va, attrs) } {
+            log::error!(target: "mm", "promoting the shared page at {page_va}: {err}");
+            debug_assert!(false, "the walk just found the leaf at {page_va}");
             return FaultResult::Invalid; // `guard` dropped: never writable
         }
         if arch::paging::active_root() == self.root {
             arch::paging::invalidate(page_va);
         }
-        inner.writable_maps.insert(va, guard);
+        let counted_before = inner.writable_maps.insert(va, guard);
+        debug_assert!(counted_before.is_none(), "writable_maps out of step at {page_va}");
         FaultResult::Resolved
     }
 
@@ -1011,12 +1049,28 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Unmap the PTEs of `removed` (VMAs `VmaMap` just took out) and move
+    /// the open references of files no VMA maps any more into `gone`.
+    fn unmap_vmas_locked(&self, inner: &mut AddressSpaceInner, removed: &[Vma], gone: &mut Vec<OpenGuard>) {
+        for vma in removed {
+            self.unmap_range_locked(inner, vma.start, vma.end);
+        }
+        release_unmapped_files(inner, gone);
+    }
+
+    /// [`Self::unmap_range_locked`] for the one page at `page_va`.
+    fn unmap_page_locked(&self, inner: &mut AddressSpaceInner, page_va: VirtAddr) {
+        self.unmap_range_locked(inner, page_va.as_u64(), page_va.as_u64() + PAGE_SIZE);
+    }
+
     /// Unmap every populated leaf in page-aligned `[start, end)` in the
     /// unmap order: (1) clear the leaf, (2) flush its TLB entry, then free
     /// a private frame; (3) once the walk is done, drop the range's
     /// [`WritableMap`]s and cache-page pins (a `PTE_SHARED` frame is the
-    /// cache's, never freed here). Every PTE removal goes through here.
-    /// Returns how many leaves were unmapped.
+    /// cache's, never freed here). Every PTE removal from a live address
+    /// space goes through here; `teardown` and `Drop` sweep the whole lower
+    /// half themselves, after the switch away from its `CR3`. Returns how
+    /// many leaves were unmapped.
     fn unmap_range_locked(&self, inner: &mut AddressSpaceInner, start: u64, end: u64) -> usize {
         let active = arch::paging::active_root() == self.root;
         let writable = &inner.writable_maps;
@@ -1026,8 +1080,10 @@ impl AddressSpace {
         unsafe {
             paging::unmap_user_range(self.root, start, end, |leaf| {
                 leaves += 1;
+                release_order::step(&leaf, release_order::Step::Cleared);
                 if active {
                     arch::paging::invalidate(leaf.va);
+                    release_order::step(&leaf, release_order::Step::Flushed);
                 }
                 note_shared_leaf(writable, &leaf);
                 if !leaf.was_shared {
@@ -1078,31 +1134,122 @@ fn note_shared_leaf(writable: &BTreeMap<u64, WritableMap>, leaf: &paging::UserLe
 /// The page of file VMA `vma` (mapping `fm`) at `page_va`, from the page
 /// cache, or the fault's outcome when there is none: `BusError` for a page
 /// wholly past the file's end, a failed disk read (`ext4` logged it), or a
-/// page the file's quota or the cache's hard limit refuses (logged here);
-/// `OutOfMemory` when no frame is free.
+/// page the file's quota or the cache's hard limit refuses, or an unlinked
+/// inode; `OutOfMemory` when no frame is free.
+///
+/// The last kind is logged here: a `WARN` for a ring-3 fault (`from_user`),
+/// once per streak of the same file and error, and only a `debug` line for
+/// a kernel user copy, which hands its caller `-EFAULT` (a loop of `read`s
+/// into a mapped hole on a full `tmpfs` would flood the log otherwise).
+///
+/// The `expect` relies on `mapped_files` holding every file a VMA maps
+/// (`mmap_file` adds it; `release_unmapped_files` removes it only once no
+/// VMA maps it).
 fn file_page(
-    inner: &AddressSpaceInner,
+    inner: &mut AddressSpaceInner,
     vma: &Vma,
     fm: FileMapping,
     page_va: VirtAddr,
+    from_user: bool,
 ) -> Result<MappedPage, FaultResult> {
     let file = inner.mapped_files.get(&fm.file_id).expect("a mapped file stays in mapped_files while a VMA maps it");
     let offset = fm.offset + (page_va.as_u64() - vma.start); // `VmaMap` checked it can't overflow
     let index = offset / PAGE_SIZE;
-    match mmap_page(file.inode(), index) {
-        Ok(mapped) => Ok(mapped),
-        Err(VfsError::NoMem) => Err(FaultResult::OutOfMemory),
-        Err(VfsError::Range | VfsError::Io) => Err(FaultResult::BusError),
-        Err(e) => {
-            let inode = file.inode();
-            log::warn!(
-                target: "mm",
-                "file page {index} of inode {:?}:{} can't be mapped ({e:?}): bus error",
-                inode.dev_id(),
-                inode.ino()
-            );
-            Err(FaultResult::BusError)
+    let err = match mmap_page(file.inode(), index) {
+        Ok(mapped) => {
+            if inner.fault_warned.is_some_and(|(id, _)| id == fm.file_id) {
+                inner.fault_warned = None; // the streak is over
+            }
+            return Ok(mapped);
         }
+        Err(VfsError::NoMem) => return Err(FaultResult::OutOfMemory),
+        Err(VfsError::Range | VfsError::Io) => return Err(FaultResult::BusError),
+        Err(e) => e,
+    };
+    let inode = file.inode();
+    let (dev, ino) = (inode.dev_id(), inode.ino());
+    if from_user && inner.fault_warned != Some((fm.file_id, err)) {
+        inner.fault_warned = Some((fm.file_id, err));
+        log::warn!(target: "mm", "file page {index} of inode {dev:?}:{ino} can't be mapped ({err:?}): bus error");
+    } else {
+        log::debug!(target: "mm", "file page {index} of inode {dev:?}:{ino} can't be mapped ({err:?}): bus error");
+    }
+    Err(FaultResult::BusError)
+}
+
+/// A ktest-only record of the steps of an unmap or downgrade, per page (by
+/// its frame): its leaf cleared or made read-only, its TLB entry flushed,
+/// and its [`WritableMap`] released, so a ktest can check they happen in
+/// that order (ARCHITECTURE section 5's unmap order). Without the ktests
+/// these are no-ops.
+pub(crate) mod release_order {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Step {
+        Cleared,
+        Flushed,
+        Released,
+    }
+
+    #[cfg(feature = "ktest")]
+    mod log {
+        use super::Step;
+        use crate::sync::SpinLock;
+
+        const CAP: usize = 64;
+
+        /// The steps so far (a fixed array: recording never allocates),
+        /// how many, and whether recording is on.
+        pub(super) struct Log {
+            pub(super) steps: [(u64, Step); CAP],
+            pub(super) len: usize,
+            pub(super) on: bool,
+        }
+
+        pub(super) static LOG: SpinLock<Log> =
+            SpinLock::new(Log { steps: [(0, Step::Cleared); CAP], len: 0, on: false });
+    }
+
+    /// Record `step` of the `PTE_SHARED` page under `leaf` (others aren't
+    /// counted).
+    #[inline]
+    pub(crate) fn step(leaf: &super::paging::UserLeaf, step: Step) {
+        if leaf.was_shared {
+            record(leaf.phys.as_u64(), step);
+        }
+    }
+
+    /// Record `step` of the page in frame `frame`.
+    #[inline]
+    pub(crate) fn record(frame: u64, step: Step) {
+        #[cfg(feature = "ktest")]
+        {
+            let mut log = log::LOG.lock();
+            if log.on && log.len < log.steps.len() {
+                let at = log.len;
+                log.steps[at] = (frame, step);
+                log.len += 1;
+            }
+        }
+        #[cfg(not(feature = "ktest"))]
+        let _ = (frame, step);
+    }
+
+    /// Start recording, from nothing.
+    #[cfg(feature = "ktest")]
+    pub(crate) fn start() {
+        let mut log = log::LOG.lock();
+        log.len = 0;
+        log.on = true;
+    }
+
+    /// Stop recording and return the steps.
+    #[cfg(feature = "ktest")]
+    pub(crate) fn stop() -> alloc::vec::Vec<(u64, Step)> {
+        let mut log = log::LOG.lock();
+        log.on = false;
+        let (steps, len) = (log.steps, log.len);
+        drop(log); // copied out: no allocation with the lock held
+        steps[..len].to_vec()
     }
 }
 
@@ -1484,7 +1631,7 @@ crate::ktest!(
         // is what `read_at` reads, and `write_at` shows through the mapping.
         // A read maps it read-only and uncounted; a store (to a mapped or a
         // not-yet-mapped page) makes it writable and counts it.
-        use crate::user::{copy_from_user, copy_to_user};
+        use crate::user::{CopyError, copy_from_user, copy_to_user};
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(150, |dir| {
@@ -1493,7 +1640,7 @@ crate::ktest!(
             let opens = f.open_count();
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let base = space
-                .mmap_file(MapPlace::Hint(None), 3 * P, RW, &file_vm_open(&f), 0, true, true)
+                .mmap_file(MapPlace::Hint(None), 3 * P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
                 .map_err(|_| "mmap_file")?;
             kassert_eq!(space.file_page_counts(), (0, 0)); // lazy
             kassert_eq!(space.mapped_file_count(), 1);
@@ -1538,7 +1685,10 @@ crate::ktest!(
                 kassert_eq!(copy_from_user(&mut buf, base + 2 * P + 200), Ok(()));
                 kassert_eq!(buf, [0u8; 16]);
                 space.munmap(base, 3 * P).map_err(|_| "munmap")?;
+                // A stale TLB entry would still let this read through.
+                kassert_eq!(copy_from_user(&mut buf, base), Err(CopyError::Fault));
             }
+            kassert!(frame::is_allocated(p0.page().phys_frame())); // the cache's, never freed
             kassert_eq!(space.file_page_counts(), (0, 0));
             kassert_eq!((p0.page().writable_maps(), p2.page().writable_maps()), (0, 0));
             kassert_eq!(space.mapped_file_count(), 0);
@@ -1565,10 +1715,10 @@ crate::ktest!(
             let cache0 = mmap_page(&f, 0).map_err(|_| "mmap_page 0")?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let a = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, false, true)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Private)
                 .map_err(|_| "map a")?;
             let b = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, false, true)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Private)
                 .map_err(|_| "map b")?;
             let (copy_a, copy_b);
             {
@@ -1636,20 +1786,36 @@ crate::ktest!(
             let f = file_vm_file(dir, "ro.bin", &file_vm_pattern(P as usize, 7))?;
             let opens = f.open_count();
             let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
-            let refused = space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, true, false);
+            let refused =
+                space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: false });
             kassert_eq!(refused, Err(UserVmError::Vm(VmError::Access)));
             kassert_eq!(refused.map_err(UserVmError::to_errno), Err(errno::EACCES));
             kassert_eq!((space.mapped_file_count(), f.open_count()), (0, opens));
             let ro = space
-                .mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(&f), 0, true, false)
+                .mmap_file(
+                    MapPlace::Hint(None),
+                    P,
+                    Prot::READ,
+                    &file_vm_open(&f),
+                    0,
+                    Sharing::Shared { writable: false },
+                )
                 .map_err(|_| "ro")?;
             kassert_eq!(space.mprotect(ro, P, RW), Err(UserVmError::Vm(VmError::Access)));
             kassert_eq!(space.handle_page_fault(ro, 1 << 1), FaultResult::Invalid); // a store
             kassert_eq!(space.handle_page_fault(ro, 0), FaultResult::Resolved); // a read
             kassert_eq!(space.file_page_counts(), (1, 0));
-            let not_file = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(dir), 0, true, false);
+            let not_file = space.mmap_file(
+                MapPlace::Hint(None),
+                P,
+                Prot::READ,
+                &file_vm_open(dir),
+                0,
+                Sharing::Shared { writable: false },
+            );
             kassert_eq!(not_file.map_err(UserVmError::to_errno), Err(errno::ENODEV));
-            let misaligned = space.mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(&f), 100, false, true);
+            let misaligned =
+                space.mmap_file(MapPlace::Hint(None), P, Prot::READ, &file_vm_open(&f), 100, Sharing::Private);
             kassert_eq!(misaligned, Err(UserVmError::Vm(VmError::Misaligned)));
             kassert_eq!(space.mapped_file_count(), 1);
             drop(space);
@@ -1671,10 +1837,10 @@ crate::ktest!(
             let f = file_vm_file(dir, "short.bin", &file_vm_pattern(100, 9))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let s = space
-                .mmap_file(MapPlace::Hint(None), 3 * P, RW, &file_vm_open(&f), 0, true, true)
+                .mmap_file(MapPlace::Hint(None), 3 * P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
                 .map_err(|_| "shared")?;
             let p = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, false, true)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Private)
                 .map_err(|_| "private")?;
             kassert_eq!(space.handle_page_fault(s + P, 0), FaultResult::BusError);
             kassert_eq!(space.handle_page_fault(s + 2 * P + 8, 1 << 1), FaultResult::BusError);
@@ -1709,7 +1875,14 @@ crate::ktest!(
         kassert_eq!(reclaim_ext4(&f)?, 0); // nothing cached: a fault reads the disk
         let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
         let base = space
-            .mmap_file(MapPlace::Hint(None), 3 * P, Prot::READ, &file_vm_open(&f), 0, true, true)
+            .mmap_file(
+                MapPlace::Hint(None),
+                3 * P,
+                Prot::READ,
+                &file_vm_open(&f),
+                0,
+                Sharing::Shared { writable: true },
+            )
             .map_err(|_| "map")?;
         vol.fail_reads(true);
         let failed = space.handle_page_fault(base + 2 * P, 0);
@@ -1738,8 +1911,9 @@ crate::ktest!(
         let f = file_vm_file(&vol.root, "persist.bin", &expected)?;
         f.sync(false).map_err(|_| "sync")?;
         let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
-        let base =
-            space.mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, true, true).map_err(|_| "map")?;
+        let base = space
+            .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
+            .map_err(|_| "map")?;
         {
             let _active = crate::sched::UserSpaceGuard::enter(space.clone());
             kassert_eq!(copy_to_user(base + 10, b"first-store"), Ok(()));
@@ -1773,17 +1947,19 @@ crate::ktest!(
             let g = file_vm_file(dir, "other.bin", &file_vm_pattern(P as usize, 17))?;
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let a = space
-                .mmap_file(MapPlace::Hint(None), 4 * P, RW, &file_vm_open(&f), 0, true, true)
+                .mmap_file(MapPlace::Hint(None), 4 * P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
                 .map_err(|_| "map a")?;
             let b = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), P, false, true)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), P, Sharing::Private)
                 .map_err(|_| "map b")?;
-            let c =
-                space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&g), 0, true, true).map_err(|_| "map c")?;
+            let c = space
+                .mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&g), 0, Sharing::Shared { writable: true })
+                .map_err(|_| "map c")?;
             let pages: Vec<MappedPage> = (0..4).filter_map(|i| mmap_page(&f, i).ok()).collect();
             kassert_eq!(pages.len(), 4);
             let copy;
             {
+                // `invalidate_file_from` runs on the space loaded here.
                 let _active = crate::sched::UserSpaceGuard::enter(space.clone());
                 for i in 0..4 {
                     kassert_eq!(copy_to_user(a + i * P, b"x"), Ok(()));
@@ -1793,26 +1969,26 @@ crate::ktest!(
                 kassert_eq!(copy_to_user(b + P, b"y"), Ok(())); // file page 2, a private copy
                 copy = file_vm_leaf(&space, b + P).ok_or("b page 1 not mapped")?.phys;
                 kassert_eq!(copy_to_user(c, b"z"), Ok(()));
+                kassert_eq!(space.file_page_counts(), (6, 5));
+                let id = file_id_of(&*f);
+                kassert_eq!(space.invalidate_file_from(id, P + 1), 3); // cut at 2P: file pages 2 and 3
+                for (va, mapped) in [(a, true), (a + P, true), (a + 2 * P, false), (a + 3 * P, false)] {
+                    kassert_eq!(file_vm_leaf(&space, va).is_some(), mapped);
+                }
+                kassert!(file_vm_leaf(&space, b).is_some()); // file page 1
+                kassert!(file_vm_leaf(&space, b + P).is_none()); // file page 2
+                kassert!(!frame::is_allocated(copy));
+                kassert!(file_vm_leaf(&space, c).is_some_and(|m| m.writable)); // the other file
+                kassert_eq!(space.file_page_counts(), (4, 3));
+                let counts: Vec<u32> = pages.iter().map(|p| p.page().writable_maps()).collect();
+                kassert_eq!(counts, [1, 1, 0, 0]);
+                kassert_eq!(space.invalidate_file_from(id, 4 * P), 0); // nothing past the end
+                kassert_eq!(space.invalidate_file_from(id, u64::MAX), 0);
+                kassert_eq!(space.invalidate_file_from(id, 0), 3); // a's pages 0 and 1, b's page 0
+                kassert_eq!(space.file_page_counts(), (1, 1));
+                // The VMAs stay: with the file unchanged, a fault maps again.
+                kassert_eq!(space.handle_page_fault(a + 3 * P, 0), FaultResult::Resolved);
             }
-            kassert_eq!(space.file_page_counts(), (6, 5));
-            let id = file_id_of(&*f);
-            kassert_eq!(space.invalidate_file_from(id, P + 1), 3); // cut at 2P: file pages 2 and 3
-            for (va, mapped) in [(a, true), (a + P, true), (a + 2 * P, false), (a + 3 * P, false)] {
-                kassert_eq!(file_vm_leaf(&space, va).is_some(), mapped);
-            }
-            kassert!(file_vm_leaf(&space, b).is_some()); // file page 1
-            kassert!(file_vm_leaf(&space, b + P).is_none()); // file page 2
-            kassert!(!frame::is_allocated(copy));
-            kassert!(file_vm_leaf(&space, c).is_some_and(|m| m.writable)); // the other file
-            kassert_eq!(space.file_page_counts(), (4, 3));
-            let counts: Vec<u32> = pages.iter().map(|p| p.page().writable_maps()).collect();
-            kassert_eq!(counts, [1, 1, 0, 0]);
-            kassert_eq!(space.invalidate_file_from(id, 4 * P), 0); // nothing past the end
-            kassert_eq!(space.invalidate_file_from(id, u64::MAX), 0);
-            kassert_eq!(space.invalidate_file_from(id, 0), 3); // a's pages 0 and 1, b's page 0
-            kassert_eq!(space.file_page_counts(), (1, 1));
-            // The VMAs stay: with the file unchanged, a fault maps again.
-            kassert_eq!(space.handle_page_fault(a + 3 * P, 0), FaultResult::Resolved);
             Ok(())
         })
     }
@@ -1826,7 +2002,7 @@ crate::ktest!(
         // counting again, a partial `munmap`, `MAP_FIXED` replacing it,
         // `teardown`, and `Drop` without a teardown. `mapped_files` keeps
         // the file open until its last VMA goes.
-        use crate::user::{CopyError, copy_to_user};
+        use crate::user::{CopyError, copy_from_user, copy_to_user};
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
         file_vm_on_both(164, |dir| {
@@ -1838,7 +2014,7 @@ crate::ktest!(
             let counts = || (p0.page().writable_maps(), p1.page().writable_maps());
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
             let base = space
-                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, true, true)
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
                 .map_err(|_| "map")?;
             {
                 let _active = crate::sched::UserSpaceGuard::enter(space.clone());
@@ -1874,8 +2050,9 @@ crate::ktest!(
 
             // `MAP_FIXED` over a mapping: released as by `munmap`.
             let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
-            let base =
-                space.mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, true, true).map_err(|_| "map 2")?;
+            let base = space
+                .mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
+                .map_err(|_| "map 2")?;
             kassert_eq!(space.handle_page_fault(base, 1 << 1), FaultResult::Resolved);
             kassert_eq!(counts(), (1, 0));
             let fixed = u64::from(general::MAP_PRIVATE | general::MAP_ANONYMOUS | general::MAP_FIXED);
@@ -1883,27 +2060,53 @@ crate::ktest!(
             kassert_eq!(counts(), (0, 0));
             kassert_eq!((space.mapped_file_count(), f.open_count()), (0, opens));
             // A file mapped over itself keeps its reference.
-            space.mmap_file(MapPlace::Fixed(base), P, RW, &file_vm_open(&f), 0, true, true).map_err(|_| "map 3")?;
-            space.mmap_file(MapPlace::Fixed(base), P, RW, &file_vm_open(&f), P, true, true).map_err(|_| "map 4")?;
+            space
+                .mmap_file(MapPlace::Fixed(base), P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
+                .map_err(|_| "map 3")?;
+            // ... and a file page faulted in there is released by the next.
+            kassert_eq!(space.handle_page_fault(base, 1 << 1), FaultResult::Resolved);
+            kassert_eq!((counts(), space.file_page_counts()), ((1, 0), (1, 1)));
+            space
+                .mmap_file(MapPlace::Fixed(base), P, RW, &file_vm_open(&f), P, Sharing::Shared { writable: true })
+                .map_err(|_| "map 4")?;
+            kassert_eq!((counts(), space.file_page_counts()), ((0, 0), (0, 0)));
             kassert_eq!((space.mapped_file_count(), f.open_count()), (1, opens + 1));
+            {
+                let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+                let mut head = [0u8; 8];
+                kassert_eq!(copy_from_user(&mut head, base), Ok(()));
+                kassert!(head[..] == file_vm_read(&f, P, 8)?[..]); // file page 1 now
+            }
 
             // A `brk` shrink over a file mapped inside the heap: released.
             let heap = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
             let b0 = heap.brk(0);
             kassert_eq!(heap.brk(b0 + 2 * P), b0 + 2 * P);
-            heap.mmap_file(MapPlace::Fixed(b0 + P), P, RW, &file_vm_open(&f), 0, true, true).map_err(|_| "map 5")?;
+            heap.mmap_file(MapPlace::Fixed(b0 + P), P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
+                .map_err(|_| "map 5")?;
             kassert_eq!(heap.handle_page_fault(b0 + P, 1 << 1), FaultResult::Resolved);
             kassert_eq!(counts(), (1, 0));
             kassert_eq!(heap.brk(b0), b0);
-            kassert_eq!(counts(), (0, 0));
+            kassert_eq!((counts(), heap.file_page_counts()), ((0, 0), (0, 0)));
             kassert_eq!((heap.mapped_file_count(), f.open_count()), (0, opens + 1)); // `space` still maps it
             drop(heap);
 
-            // `Drop` without a teardown (an error path) releases too.
+            // `Drop` without a teardown (an error path) releases too: the
+            // count, the pin, a private copy (freed), and the reference.
             kassert_eq!(space.handle_page_fault(base, 1 << 1), FaultResult::Resolved);
             kassert_eq!(counts(), (0, 1));
+            kassert!(Arc::strong_count(p1.page()) > 2); // the pin and the guard too
+            let private = space
+                .mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, Sharing::Private)
+                .map_err(|_| "map 6")?;
+            kassert_eq!(space.handle_page_fault(private, 1 << 1), FaultResult::Resolved);
+            let copy = file_vm_leaf(&space, private).ok_or("private copy not mapped")?.phys;
+            kassert!(frame::is_allocated(copy));
             drop(space);
             kassert_eq!(counts(), (0, 0));
+            kassert_eq!(Arc::strong_count(p1.page()), 2); // the cache's and `p1`'s
+            kassert!(!frame::is_allocated(copy));
+            kassert!(frame::is_allocated(p1.page().phys_frame()));
             kassert_eq!(f.open_count(), opens);
             Ok(())
         })
@@ -1941,13 +2144,227 @@ crate::ktest!(
             let (space, prog) =
                 AddressSpace::from_elf(&elf, &[b"/sigbus"], &[], b"/sigbus", [0; 16]).map_err(|_| "from_elf")?;
             space
-                .mmap_file(MapPlace::FixedNoReplace(MAP), 2 * P, Prot::READ, &file_vm_open(&f), 0, true, false)
+                .mmap_file(
+                    MapPlace::FixedNoReplace(MAP),
+                    2 * P,
+                    Prot::READ,
+                    &file_vm_open(&f),
+                    0,
+                    Sharing::Shared { writable: false },
+                )
                 .map_err(|_| "mmap_file")?;
             run_elf_process("ktest-sigbus", Arc::new(space), prog.entry, prog.rsp, ConsoleIo::Capture, None)
         };
         kassert_eq!(run(MAP + 8)?, UserExit::Exited(0));
         kassert_eq!(run(MAP + P + 8)?, UserExit::BusError { rip: 0x40_100a, cr2: MAP + P + 8 });
         kassert_eq!(f.open_count(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn file_vm_shared_stores_reach_the_disk_through_syncs_while_mapped() {
+        // The writable-mapping count alone keeps a mapped page dirty: a
+        // store, a sync (which clears `dirty`), a second store through the
+        // still-writable PTE (no fault, nothing set in the page), a second
+        // sync. That sync must write the second store, so a fresh read-only
+        // mount reads both while the mapping still stands.
+        use crate::user::copy_to_user;
+        use crate::vfs::page_cache::ktest_files::Ext4Volume;
+        use crate::{kassert, kassert_eq};
+        const P: u64 = PAGE_SIZE;
+        let vol = Ext4Volume::new(168)?;
+        let mut expected = file_vm_pattern(P as usize, 23);
+        let f = file_vm_file(&vol.root, "synced.bin", &expected)?;
+        f.sync(false).map_err(|_| "sync")?;
+        let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
+        let base = space
+            .mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
+            .map_err(|_| "map")?;
+        let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+        kassert_eq!(copy_to_user(base + 10, b"first"), Ok(()));
+        f.sync(false).map_err(|_| "first sync")?;
+        kassert_eq!(copy_to_user(base + 100, b"second"), Ok(()));
+        f.sync(false).map_err(|_| "second sync")?;
+        expected[10..15].copy_from_slice(b"first");
+        expected[100..106].copy_from_slice(b"second");
+        let ro = vol.remount_ro(169)?.lookup("synced.bin").map_err(|_| "ro lookup")?;
+        kassert!(file_vm_read(&ro, 0, expected.len())? == expected);
+        space.munmap(base, P).map_err(|_| "munmap")?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn file_vm_mapping_outlives_close_and_unlink() {
+        // The mapping's own open reference: with the descriptor closed and
+        // the name unlinked, stores and reads through the mapping still
+        // reach the file (an inode detached rather than freed), and
+        // `munmap` gives the last reference back.
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        const P: u64 = PAGE_SIZE;
+        file_vm_on_both(170, |dir| {
+            let f = file_vm_file(dir, "gone.bin", &file_vm_pattern(P as usize, 25))?;
+            let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
+            // The descriptor's reference goes at the end of this statement.
+            let base = space
+                .mmap_file(MapPlace::Hint(None), P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
+                .map_err(|_| "map")?;
+            kassert_eq!(f.open_count(), 1); // the mapping's
+            dir.unlink("gone.bin").map_err(|_| "unlink")?;
+            kassert!(dir.lookup("gone.bin").is_err());
+            kassert_eq!(f.stat().map_err(|_| "stat")?.nlink, 0);
+            kassert!(f.is_detached()); // kept by the mapping's reference, not freed
+            {
+                let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+                kassert_eq!(copy_to_user(base + 5, b"after-unlink"), Ok(()));
+                let mut buf = [0u8; 12];
+                kassert_eq!(copy_from_user(&mut buf, base + 5), Ok(()));
+                kassert_eq!(&buf, b"after-unlink");
+                kassert!(file_vm_read(&f, 5, 12)? == b"after-unlink");
+                space.munmap(base, P).map_err(|_| "munmap")?;
+            }
+            kassert_eq!((space.mapped_file_count(), f.open_count()), (0, 0));
+            Ok(())
+        })
+    }
+);
+
+crate::ktest!(
+    fn file_vm_private_copy_of_the_last_page_stops_at_eof() {
+        // A private copy of the page holding the file's end has zeros past
+        // it, even where a shared mapping stored past EOF in that page:
+        // copied at once (a store to an unmapped page) or on write (a store
+        // after a read).
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        const P: u64 = PAGE_SIZE;
+        file_vm_on_both(172, |dir| {
+            let data = file_vm_pattern(P as usize + 100, 27);
+            let f = file_vm_file(dir, "tail.bin", &data)?;
+            let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
+            let map = |sharing| {
+                space.mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, sharing).map_err(|_| "map")
+            };
+            let (s, now, later) =
+                (map(Sharing::Shared { writable: true })?, map(Sharing::Private)?, map(Sharing::Private)?);
+            let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+            kassert_eq!(copy_to_user(s + P + 200, b"past-eof"), Ok(()));
+            let mut head = [0u8; 1];
+            kassert_eq!(copy_from_user(&mut head, later + P), Ok(())); // read-only first
+            for va in [now, later] {
+                kassert_eq!(copy_to_user(va + P + 10, b"mine"), Ok(()));
+                let m = file_vm_leaf(&space, va + P).ok_or("copy not mapped")?;
+                kassert!(!m.shared && m.writable);
+                let mut page = vec![0u8; P as usize];
+                kassert_eq!(copy_from_user(&mut page, va + P), Ok(()));
+                kassert!(page[..10] == data[P as usize..P as usize + 10]);
+                kassert_eq!(&page[10..14], b"mine");
+                kassert!(page[14..100] == data[P as usize + 14..]);
+                kassert!(page[100..].iter().all(|&b| b == 0));
+            }
+            let mut stored = [0u8; 8];
+            kassert_eq!(copy_from_user(&mut stored, s + P + 200), Ok(()));
+            kassert_eq!(&stored, b"past-eof"); // the shared mapping keeps it
+            Ok(())
+        })
+    }
+);
+
+crate::ktest!(
+    fn file_vm_store_after_a_truncate_maps_the_files_current_page() {
+        // A truncate that doesn't invalidate mappings (`VfsInode::truncate`
+        // until wave 3) lets the cache drop a page a read-only leaf still
+        // maps. After it regrows, a store maps the file's current page
+        // (`MAP_SHARED`) or copies it (`MAP_PRIVATE`), not the dropped one.
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        const P: u64 = PAGE_SIZE;
+        file_vm_on_both(174, |dir| {
+            let f = file_vm_file(dir, "regrown.bin", &file_vm_pattern(2 * P as usize, 29))?;
+            let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
+            let map = |sharing| {
+                space.mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, sharing).map_err(|_| "map")
+            };
+            let (s, q) = (map(Sharing::Shared { writable: true })?, map(Sharing::Private)?);
+            let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+            let mut byte = [0u8; 1];
+            kassert_eq!(copy_from_user(&mut byte, s + P), Ok(()));
+            kassert_eq!(copy_from_user(&mut byte, q + P), Ok(()));
+            let old = file_vm_leaf(&space, s + P).ok_or("s page 1 not mapped")?.phys;
+            kassert_eq!(file_vm_leaf(&space, q + P).map(|m| m.phys), Some(old));
+            f.truncate(P).map_err(|_| "shrink")?;
+            f.truncate(2 * P).map_err(|_| "regrow")?;
+
+            kassert_eq!(copy_to_user(s + P + 8, b"fresh"), Ok(()));
+            let current = mmap_page(&f, 1).map_err(|_| "mmap_page 1")?;
+            let m = file_vm_leaf(&space, s + P).ok_or("s page 1 gone")?;
+            kassert!(m.shared && m.writable);
+            kassert_eq!(m.phys, current.page().phys_frame());
+            kassert!(m.phys != old);
+            kassert!(file_vm_read(&f, P + 8, 5)? == b"fresh");
+
+            kassert_eq!(copy_to_user(q + P + 16, b"copy"), Ok(()));
+            let mut head = [0u8; 32];
+            kassert_eq!(copy_from_user(&mut head, q + P), Ok(()));
+            let mut want = [0u8; 32]; // the regrown page: zeros and the shared store
+            want[8..13].copy_from_slice(b"fresh");
+            want[16..20].copy_from_slice(b"copy");
+            kassert_eq!(head, want);
+            kassert_eq!(space.file_page_counts(), (1, 1));
+            Ok(())
+        })
+    }
+);
+
+crate::ktest!(
+    fn file_vm_unmap_releases_after_clearing_and_flushing() {
+        // ARCHITECTURE section 5's unmap order, recorded per page: the leaf
+        // cleared (or made read-only), its TLB entry flushed, and only then
+        // its `WritableMap` released, every release after the whole walk;
+        // for `mprotect` and for `munmap`. A read-only page has no release.
+        use crate::mm::user_vm::release_order::{self, Step};
+        use crate::user::copy_to_user;
+        use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        use crate::{kassert, kassert_eq};
+        const P: u64 = PAGE_SIZE;
+        fn at(steps: &[(u64, Step)], frame: u64, step: Step) -> Option<usize> {
+            steps.iter().position(|&s| s == (frame, step))
+        }
+        let vol = TmpfsVolume::new(176, 8 * P as usize);
+        let f = file_vm_file(&vol.root, "order.bin", &file_vm_pattern(2 * P as usize, 31))?;
+        let (Ok(p0), Ok(p1)) = (mmap_page(&f, 0), mmap_page(&f, 1)) else {
+            return Err("mmap_page");
+        };
+        let (f0, f1) = (p0.page().phys_frame().as_u64(), p1.page().phys_frame().as_u64());
+        let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
+        let base = space
+            .mmap_file(MapPlace::Hint(None), 2 * P, RW, &file_vm_open(&f), 0, Sharing::Shared { writable: true })
+            .map_err(|_| "map")?;
+        let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+        kassert_eq!(copy_to_user(base, b"0"), Ok(()));
+        kassert_eq!(copy_to_user(base + P, b"1"), Ok(()));
+
+        release_order::start();
+        let downgraded = space.mprotect(base, P, Prot::READ);
+        let steps = release_order::stop();
+        kassert!(downgraded.is_ok());
+        let (c, fl, r) = (at(&steps, f0, Step::Cleared), at(&steps, f0, Step::Flushed), at(&steps, f0, Step::Released));
+        kassert!(c.is_some() && c < fl && fl < r);
+        kassert_eq!(steps.len(), 3);
+
+        release_order::start();
+        let unmapped = space.munmap(base, 2 * P);
+        let steps = release_order::stop();
+        kassert!(unmapped.is_ok());
+        let (c, fl, r) = (at(&steps, f1, Step::Cleared), at(&steps, f1, Step::Flushed), at(&steps, f1, Step::Released));
+        kassert!(c.is_some() && c < fl && fl < r);
+        kassert!(at(&steps, f0, Step::Flushed).is_some() && at(&steps, f0, Step::Released).is_none());
+        let last_flush = steps.iter().rposition(|&(_, s)| s == Step::Flushed);
+        let first_release = steps.iter().position(|&(_, s)| s == Step::Released);
+        kassert!(last_flush < first_release); // released once the walk is done
+        kassert_eq!((p0.page().writable_maps(), p1.page().writable_maps()), (0, 0));
         Ok(())
     }
 );

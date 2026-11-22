@@ -331,7 +331,6 @@ impl CachePage {
     }
 
     /// How many `PRESENT | WRITABLE | PTE_SHARED` mappings the page has.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     #[inline]
     pub fn writable_maps(&self) -> u32 {
         self.writable_maps.load(Ordering::Acquire)
@@ -510,6 +509,10 @@ impl WritableMap {
 impl Drop for WritableMap {
     fn drop(&mut self) {
         self.page.dec_writable_maps();
+        crate::mm::user_vm::release_order::record(
+            self.page.phys_frame().as_u64(),
+            crate::mm::user_vm::release_order::Step::Released,
+        );
     }
 }
 

@@ -772,6 +772,14 @@ extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
                 if fault == Some(crate::mm::user_vm::FaultResult::BusError) {
                     crate::user::handle_user_bus_error(frame, cr2);
                 }
+                if fault == Some(crate::mm::user_vm::FaultResult::OutOfMemory) {
+                    // Otherwise indistinguishable from a segfault below.
+                    log::warn!(
+                        target: "mm",
+                        "out of memory resolving a user page fault at cr2 {cr2:#x} (rip {:#x}); ending the process",
+                        frame.rip
+                    );
+                }
                 crate::user::handle_user_exception(frame, cr2);
             }
 
