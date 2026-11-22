@@ -17,11 +17,16 @@ fn main() {
 /// Embed the WASM apps `make apps` built (the layout: ARCHITECTURE section
 /// 8, "Building and bundling") as `app::BUNDLED` and `app::TEST_APPS`, each
 /// sorted by name, each an `App { name, thread, module }` (`thread` the
-/// `app:<name>` string its thread is named with, made once here; a
-/// thread's name keeps 15 bytes, `lumen_trace::ThreadName`). A name
-/// outside `[a-z0-9_-]`, or one in both sets, fails the build; no
+/// `app:<name>` string its thread is named with, made once here). A name
+/// outside `[a-z0-9_-]`, longer than [`MAX_APP_NAME`] bytes, or in both
+/// sets, fails the build; no
 /// build/apps at all (`make lint` runs before `make build` in CI) gives
 /// empty lists, said in a warning, as does a directory that can't be read.
+/// The longest app name: `app:<name>` fits in a thread's name
+/// (`lumen_trace::ThreadName::MAX_LEN`, 15 bytes; `kernel/src/app.rs`
+/// checks the two agree at compile time, `tools/new-app.sh` refuses longer).
+const MAX_APP_NAME: usize = 11;
+
 fn embed_apps(apps: &Path) {
     println!("cargo:rerun-if-changed={}", apps.display());
     println!("cargo:rerun-if-changed={}", apps.join("tests").display());
@@ -34,6 +39,7 @@ fn embed_apps(apps: &Path) {
         assert!(!tests.iter().any(|(t, _)| t == name), "app {name} is both a bundled app and a test app");
     }
     let mut out = String::new();
+    writeln!(out, "pub const MAX_APP_NAME: usize = {MAX_APP_NAME};").unwrap();
     for (list, set) in [("BUNDLED", &bundled), ("TEST_APPS", &tests)] {
         writeln!(out, "pub static {list}: &[App] = &[").unwrap();
         for (name, path) in set {
@@ -75,6 +81,12 @@ fn modules(dir: &Path) -> Vec<(String, std::path::PathBuf)> {
                 !name.is_empty()
                     && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'),
                 "app name {name:?} ({}) isn't [a-z0-9_-]",
+                p.display()
+            );
+            assert!(
+                name.len() <= MAX_APP_NAME,
+                "app name {name:?} ({}) is over {MAX_APP_NAME} bytes: its thread, app:<name>, wouldn't fit in a \
+                 thread's name (15 bytes)",
                 p.display()
             );
             let path = p.canonicalize().expect("an app's path");

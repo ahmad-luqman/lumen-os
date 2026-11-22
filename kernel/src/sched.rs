@@ -322,8 +322,7 @@ impl Thread {
 
     /// A thread for the code running now on this CPU, on a stack it doesn't
     /// own.
-    fn adopted(name: &'static str) -> Arc<Thread> {
-        let name = ThreadName::new(name);
+    fn adopted(name: ThreadName) -> Arc<Thread> {
         register(Arc::new(Thread::new(name, arch::cpu_index(), State::Running, 0, None, None, None)))
     }
 
@@ -358,7 +357,8 @@ impl Thread {
         self.id
     }
 
-    /// The name it was spawned with.
+    /// Its name, as made from what it was spawned (or adopted) with (see
+    /// `ThreadName::new`).
     pub fn name(&self) -> ThreadName {
         self.name
     }
@@ -1744,10 +1744,9 @@ pub fn init() {
     assert_eq!(arch::cpu_index(), 0, "sched::init is for the boot CPU");
     assert!(time::timer_published(), "sched::init before time::init");
     assert!(arch::irq::enabled(), "sched::init with interrupts off: no tick could start a scheduler");
-    let idle =
-        Thread::spawned(ThreadName::new("idle"), 0, STACK_SIZE, Box::new(|| idle_loop(0, || false, || {})), None)
-            .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
-    install(0, Thread::adopted("main"), idle);
+    let idle = Thread::spawned("idle".into(), 0, STACK_SIZE, Box::new(|| idle_loop(0, || false, || {})), None)
+        .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
+    install(0, Thread::adopted("main".into()), idle);
     CPUS[0].lock().home(); // `main`: it can sleep and block too
     // The boot CPU's timer already runs (`time::init`).
     ARMED[0].store(true, Ordering::Release);
@@ -1780,7 +1779,7 @@ pub fn init() {
 /// `ap_main`).
 pub fn run_ap_idle(has_job: impl Fn() -> bool, run_job: impl Fn()) -> ! {
     let cpu = arch::cpu_index();
-    let me = Thread::adopted("idle");
+    let me = Thread::adopted("idle".into());
     install(cpu, me.clone(), me);
     idle_loop(cpu, has_job, run_job);
     unreachable!("an idle loop returned")

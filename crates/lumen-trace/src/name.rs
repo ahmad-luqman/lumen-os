@@ -1,6 +1,7 @@
 //! A kernel thread's name: [`ThreadName`], 16 bytes inline like Linux's
 //! `comm` (`TASK_COMM_LEN`), so it is `Copy`, never allocates, and a reader
-//! with no lock (the crash reporter, the profiler) can always read it.
+//! with no lock (the crash reporter, through `sched::running_here`) can
+//! always read it.
 
 use core::fmt;
 
@@ -11,9 +12,16 @@ use core::fmt;
 /// Made from any `&str` by the same rule ([`ThreadName::new`]): a longer
 /// name is cut to its longest prefix of at most 15 bytes that ends on a
 /// character boundary (Linux cuts at byte 15 whatever it splits; cutting
-/// whole characters keeps [`ThreadName::as_str`] valid UTF-8), and each
-/// ASCII control character (a newline, an escape) becomes `?`, so a name
-/// printed on a line (`thread: <name> (id N)`) stays on that line.
+/// whole characters keeps [`ThreadName::as_str`] valid UTF-8), then each
+/// control character (C0 with NUL, DEL, and C1 with NEL) and each Unicode
+/// line or paragraph separator (U+2028, U+2029) becomes one `?`, as
+/// `lumen_app_api::text` treats log text, so a name printed on a line
+/// (`thread: <name> (id N)`) stays on that line.
+///
+/// The cut is for names from outside the kernel's source (a path given to
+/// `linux /path`): every name written in the source fits, which
+/// `tests/harness/test_thread_names.py` checks, and an app's name is at
+/// most 11 bytes (`app:<name>`; `kernel/build.rs`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ThreadName([u8; 16]);
 
@@ -24,18 +32,32 @@ impl ThreadName {
     /// `name` by the rule above.
     pub const fn new(name: &str) -> Self {
         let bytes = name.as_bytes();
-        let mut len = if bytes.len() > Self::MAX_LEN { Self::MAX_LEN } else { bytes.len() };
-        // Back up to a character boundary: a UTF-8 continuation byte is
-        // 0b10xx_xxxx (`is_char_boundary` isn't `const` on the pinned Rust).
-        while len < bytes.len() && bytes[len] & 0xc0 == 0x80 {
-            len -= 1;
-        }
+        let len = name.floor_char_boundary(Self::MAX_LEN);
         let mut out = [0u8; 16];
-        let mut i = 0;
+        let (mut i, mut o) = (0, 0);
         while i < len {
             let b = bytes[i];
-            out[i] = if b < 0x20 || b == 0x7f { b'?' } else { b };
-            i += 1;
+            // The UTF-8 length of a control character or a separator
+            // starting at `i` (0: neither). Each is whole inside `len`: it
+            // ends on a character boundary.
+            let unsafe_len = if b < 0x20 || b == 0x7f {
+                1
+            } else if b == 0xc2 && i + 1 < len && bytes[i + 1] >= 0x80 && bytes[i + 1] <= 0x9f {
+                2 // C1: U+0080..=U+009F, NEL among them
+            } else if b == 0xe2 && i + 2 < len && bytes[i + 1] == 0x80 && (bytes[i + 2] == 0xa8 || bytes[i + 2] == 0xa9)
+            {
+                3 // U+2028, U+2029
+            } else {
+                0
+            };
+            if unsafe_len == 0 {
+                out[o] = b;
+                i += 1;
+            } else {
+                out[o] = b'?';
+                i += unsafe_len;
+            }
+            o += 1;
         }
         ThreadName(out)
     }
@@ -47,23 +69,19 @@ impl ThreadName {
     /// (`/`, empty) gives the whole path.
     pub fn from_path(path: &str) -> Self {
         let trimmed = path.trim_end_matches('/');
-        let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+        let base = trimmed.rsplit_once('/').map_or(trimmed, |(_, base)| base);
         Self::new(if base.is_empty() { path } else { base })
     }
 
     /// The name's text.
     pub fn as_str(&self) -> &str {
         let len = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
-        let bytes = &self.0[..len];
         // `new` copies a prefix of a `&str` that ends on a character
-        // boundary, replacing only ASCII bytes with ASCII, so this is
+        // boundary, replacing whole characters with ASCII, so this is
         // always UTF-8. Never a panic, though: the crash reporter prints
         // the name of the thread that crashed, whose memory a wild write
         // may have hit (then the valid prefix).
-        match core::str::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(e) => core::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
-        }
+        self.0[..len].utf8_chunks().next().map_or("", |chunk| chunk.valid())
     }
 }
 
@@ -73,17 +91,12 @@ impl From<&str> for ThreadName {
     }
 }
 
-/// Compared as a name made from `other` (cut by the same rule): a thread
-/// spawned as `"sleep-mutex-waiter"` is found by that literal.
-impl PartialEq<str> for ThreadName {
-    fn eq(&self, other: &str) -> bool {
-        *self == Self::new(other)
-    }
-}
-
+/// Equal when the name reads as `other` exactly ([`ThreadName::as_str`]):
+/// a literal that wouldn't fit, or that holds a character `new` replaces,
+/// matches no thread (none is spawned with one: see the type's doc).
 impl PartialEq<&str> for ThreadName {
     fn eq(&self, other: &&str) -> bool {
-        *self == Self::new(other)
+        self.as_str() == *other
     }
 }
 
@@ -146,6 +159,29 @@ mod tests {
     fn control_characters_become_question_marks() {
         assert_eq!(ThreadName::new("a\nb\x1b[2Jc\x7f").as_str(), "a?b?[2Jc?");
         assert_eq!(ThreadName::new("tab\there").as_str(), "tab?here");
+        // The C0 range's edges: NUL and 0x1f go, a space (0x20) stays.
+        assert_eq!(ThreadName::new("a\0b").as_str(), "a?b");
+        assert_eq!(ThreadName::new("a\x1fb").as_str(), "a?b");
+        assert_eq!(ThreadName::new("my prog").as_str(), "my prog");
+        assert_eq!(ThreadName::new("~\x7e").as_str(), "~~");
+    }
+
+    #[test]
+    fn c1_controls_and_line_separators_become_one_question_mark_each() {
+        // NEL, an 8-bit CSI, the C1 range's ends, U+2028 and U+2029.
+        assert_eq!(ThreadName::new("a\u{85}b\u{9b}2J").as_str(), "a?b?2J");
+        assert_eq!(ThreadName::new("\u{80}\u{9f}").as_str(), "??");
+        assert_eq!(ThreadName::new("a\u{2028}b\u{2029}c").as_str(), "a?b?c");
+        // Their neighbours stay: U+00A0 (after C1), U+00E9, U+2027 and
+        // U+202A (around the separators), U+20AC (E2 82 AC).
+        for kept in ["\u{a0}", "\u{e9}", "\u{2027}", "\u{202a}", "\u{20ac}"] {
+            assert_eq!(ThreadName::new(kept).as_str(), kept, "{kept:?}");
+        }
+        // Cut first (at byte 15, on a character), then replaced: the name
+        // keeps what fitted.
+        assert_eq!(ThreadName::new("abcdefghijkl\u{2028}xyz").as_str(), "abcdefghijkl?");
+        assert_eq!(ThreadName::new("abcdefghijklm\u{2028}").as_str(), "abcdefghijklm");
+        assert_eq!(ThreadName::new("abcdefghijklm\u{85}z").as_str(), "abcdefghijklm?");
     }
 
     #[test]
@@ -178,10 +214,12 @@ mod tests {
         assert!(ThreadName::new("idle") == "idle");
         assert!(ThreadName::new("idle") != "idl");
         assert!(ThreadName::new("idl") != "idle");
-        // A literal is cut as the name was.
-        assert!(ThreadName::new("sleep-mutex-waiter") == "sleep-mutex-waiter");
+        // A literal is compared as it is: one that wouldn't fit, or holds
+        // a character `new` replaces, matches no name.
+        assert!(ThreadName::new("sleep-mutex-waiter") != "sleep-mutex-waiter");
         assert!(ThreadName::new("sleep-mutex-waiter") == "sleep-mutex-wai");
-        assert!(ThreadName::new("sleep-mutex-wai") != "sleep-mutex-wa");
+        assert!(ThreadName::new("a\nb") != "a\nb");
+        assert!(ThreadName::new("a\nb") == "a?b");
     }
 
     #[test]

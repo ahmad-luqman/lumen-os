@@ -817,7 +817,7 @@ crate::ktest!(
         let _bound = MadeUp::bind(None)?;
         // Released only once `hold` has asked: a release before the ask
         // does nothing.
-        let got = hold_with("hold-ktest-release", release)?;
+        let got = hold_with("hold-ktest-rel", release)?;
         kassert_eq!(got, Err(HoldError::Released));
         kassert_eq!(reads(), Reads::Running);
         Ok(())
@@ -877,7 +877,7 @@ crate::ktest!(
         STOP.store(false, Ordering::SeqCst);
         READ.store(0, Ordering::SeqCst);
         let _bound = MadeUp::bind(None)?;
-        let reader = crate::sched::spawn("hold-ktest-reader", || {
+        let reader = crate::sched::spawn("hold-ktest-rdr", || {
             loop {
                 let seen = BELL.rings();
                 if park_if_asked() {
