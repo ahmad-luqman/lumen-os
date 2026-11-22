@@ -148,6 +148,19 @@ pub trait VfsInode: Send + Sync {
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError>;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError>;
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError>;
+
+    /// Write `buf` at the end of the file (`O_APPEND`): the end read and the
+    /// write made in one hold of the inode's lock (Lock 4), so two appenders
+    /// on separate open file descriptions can't both write at the same old
+    /// end. Returns where the write began and how much was written (a short
+    /// write as `write_at`'s).
+    ///
+    /// Every filesystem with regular files must override it (ext4 and tmpfs
+    /// do). The default is for inodes without an end (devices, which ignore
+    /// the offset): `write_at(0, buf)`, at position 0.
+    fn append(&self, buf: &[u8]) -> Result<(u64, usize), VfsError> {
+        self.write_at(0, buf).map(|n| (0, n))
+    }
     fn read_page(&self, page_index: u64, buf: &mut [u8; 4096]) -> Result<usize, VfsError>;
     fn write_page(&self, page_index: u64, buf: &[u8]) -> Result<(), VfsError>;
     fn sync(&self, data_only: bool) -> Result<(), VfsError>;
