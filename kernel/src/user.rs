@@ -20,7 +20,7 @@ use lumen_vm::{Prot, USER_STACK_BOTTOM};
 
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::arch::{self, TrapFrame};
-use crate::linux::process::{ConsoleIo, record_exit, register_current, take_current};
+use crate::linux::process::{ConsoleIo, Stdio, record_exit, register_current, take_current};
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, errno, general, ioctl, syscall as linux_syscall};
 #[cfg(feature = "ktest")]
 use crate::mm::paging;
@@ -527,10 +527,12 @@ fn spawn_ring3_on(
     stdin: Vec<u8>,
     exe_path: Option<String>,
 ) -> Result<(sched::JoinHandle, ResultSlot), &'static str> {
+    // Stdio first: a process never starts without fds 0, 1 and 2 (logged).
+    let stdio = Stdio::open().map_err(|_| "cannot open the process's stdio")?;
     let result_slot: ResultSlot = Arc::new(SpinLock::new(None));
     let out = result_slot.clone();
     let handle = sched::spawn_user_on(cpu, name, space, move || {
-        let _pid = register_current(io, allow_test_syscalls, stdin, exe_path);
+        let _pid = register_current(io, allow_test_syscalls, stdin, exe_path, stdio);
 
         let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
         let stub_before = arch::idt::DEFERRED_STUB_DB.load(Ordering::Relaxed);

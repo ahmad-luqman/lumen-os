@@ -18,7 +18,7 @@ pub(super) fn sys_getcwd(buf: UserPtr, size: u64) -> u64 {
 }
 
 fn getcwd(buf: UserPtr, size: u64) -> Result<u64, u32> {
-    let (cwd, _) = process::current_cwd().ok_or(errno::ENOENT)?;
+    let (cwd, _) = process::current_cwd();
     let path = lumen_vfs::compute_cwd_path(crate::vfs::tables(), &cwd).map_err(lumen_vfs::VfsError::to_errno)?;
     drop(cwd);
     let mut bytes: Vec<u8> = path.into_bytes();
@@ -74,7 +74,7 @@ crate::ktest!(
             // with the NUL.
             let dir = mkdir_at(tables, None, b"/tmp/dir-ktest-cwd", 0o755, 0).map_err(|_| "mkdir")?;
             let guard = OpenGuard::try_new(dir).map_err(|_| "guard")?;
-            process::set_current_cwd(process::Cwd::new(guard, alloc::string::String::from("/tmp/dir-ktest-cwd")));
+            process::set_current_cwd(process::Cwd::new(guard, "/tmp/dir-ktest-cwd").map_err(|_| "cwd")?);
             kassert_eq!(getcwd(64), 19);
             kassert_eq!(read_back(19)?, b"/tmp/dir-ktest-cwd\0");
             kassert_eq!(getcwd(18), super::neg_errno(errno::ERANGE));

@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use lumen_vfs::{FdTable, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded};
+use lumen_vfs::{FdTable, InodeType, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded};
 
 use crate::keyboard::{Key as KbdKey, KeyCode};
 use crate::klog;
@@ -43,26 +43,71 @@ pub const DEFAULT_UMASK: u16 = 0o022;
 /// Maximum captured stdout bytes for `usertest` runs.
 const CAPTURE_STDOUT_LIMIT: usize = 4096;
 
-/// A process's working directory: an open reference on its inode (so an
-/// `rmdir` detaches it rather than freeing it) and the path it was set by.
-/// `getcwd` computes the path afresh from the inode (`compute_cwd_path`);
+/// A process's working directory: an open reference on a directory inode
+/// (so an `rmdir` detaches it rather than freeing it) and the path it was set
+/// by. `getcwd` computes the path afresh from the inode (`compute_cwd_path`);
 /// the stored one names it for a relative open's `/proc/<pid>/fd` path.
 pub struct Cwd {
     guard: OpenGuard,
-    path: String,
+    path: Arc<str>,
 }
 
 impl Cwd {
-    pub fn new(guard: OpenGuard, path: String) -> Self {
-        Self { guard, path }
+    /// The working directory `guard` holds open, set by `path`: `ENOTDIR`
+    /// unless it is a directory.
+    pub fn new(guard: OpenGuard, path: &str) -> Result<Self, VfsError> {
+        if guard.inode().inode_type() != InodeType::Dir {
+            return Err(VfsError::NotDir);
+        }
+        Ok(Self { guard, path: Arc::from(path) })
     }
 
     pub fn inode(&self) -> &Arc<dyn VfsInode> {
         self.guard.inode()
     }
 
-    pub fn path(&self) -> &str {
+    pub fn path(&self) -> &Arc<str> {
         &self.path
+    }
+}
+
+/// Open `path` (from `/`) into a fresh open file description with `flags`
+/// and, if it creates the file, `mode`: the guarded open `openat` makes,
+/// for kernel callers (a process's stdio, `vfstest`, the ktests). May sleep.
+pub fn open_kernel_file(path: &[u8], flags: u32, mode: u16) -> Result<KernelFile, VfsError> {
+    let opened = open_inode_guarded(crate::vfs::tables(), None, path, OpenFlags::from_bits(flags), mode, 0)?;
+    OpenFile::from_opened(opened)
+}
+
+/// What a process starts with, opened before it is registered: fd 0 on
+/// `/dev/console` read-only, fds 1 and 2 write-only (so `read(1)` and
+/// `write(0)` are `-EBADF`, as in M6), and `/` as its working directory.
+/// A process never starts without all four: an empty stdio slot would be
+/// the first `open`'s, and output meant for the console would go to a file.
+pub struct Stdio {
+    fds: FdTable<FileRef>,
+    cwd: Cwd,
+}
+
+impl Stdio {
+    /// Open the console three times and `/`: the first error, logged (the
+    /// VFS mounts `/dev` at boot, so only a broken boot sees one). Opens
+    /// files, so may sleep: never call it holding a spinlock.
+    pub fn open() -> Result<Self, VfsError> {
+        let opened = (|| {
+            let mut fds = FdTable::new();
+            for (fd, flags) in [(0, OpenFlags::O_RDONLY), (1, OpenFlags::O_WRONLY), (2, OpenFlags::O_WRONLY)] {
+                let file = Arc::new(open_kernel_file(b"/dev/console", flags, 0)?);
+                // A fresh table: nothing is displaced.
+                drop(fds.insert_at(fd, file, false)?);
+            }
+            let root = crate::vfs::resolve_path_from_root("/")?;
+            Ok(Self { fds, cwd: Cwd::new(OpenGuard::try_new(root)?, "/")? })
+        })();
+        if let Err(e) = &opened {
+            log::error!(target: "linux", "cannot open a process's stdio (/dev/console) and working directory (/): {e:?}");
+        }
+        opened
     }
 }
 
@@ -128,10 +173,12 @@ pub struct ProcessState {
     pub ppid: u32,
     pub tid: u32,
     /// Open descriptors (`lumen_vfs::MAX_FDS` slots): 0, 1 and 2 on
-    /// `/dev/console` at the start.
-    pub fds: FdTable<FileRef>,
-    /// The working directory (`None` only if `/` couldn't be opened).
-    pub cwd: Option<Cwd>,
+    /// `/dev/console` at the start. Private: a slot leaves it only through
+    /// `close_current_fd`, `insert_current_fd`'s displacement or
+    /// `take_current`, which release its locks outside `ACTIVE_PROCS`.
+    fds: FdTable<FileRef>,
+    /// The working directory (`set_current_cwd` swaps it).
+    cwd: Cwd,
     /// The file mode creation mask (`0o777` bits).
     pub umask: u16,
     pub sigactions: [KernelSigaction; 64],
@@ -160,7 +207,6 @@ pub struct ProcessState {
 }
 
 impl ProcessState {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         pid: u32,
         io: ConsoleIo,
@@ -168,15 +214,14 @@ impl ProcessState {
         stdin: Vec<u8>,
         address_space: Option<Arc<AddressSpace>>,
         exe_path: Option<String>,
-        fds: FdTable<FileRef>,
-        cwd: Option<Cwd>,
+        stdio: Stdio,
     ) -> Self {
         Self {
             pid,
             ppid: 0,
             tid: pid,
-            fds,
-            cwd,
+            fds: stdio.fds,
+            cwd: stdio.cwd,
             umask: DEFAULT_UMASK,
             sigactions: [KernelSigaction::default(); 64],
             sigmask: 0,
@@ -235,46 +280,21 @@ fn current_kernel_tid() -> u64 {
     sched::running_here().expect("ring-3 syscall/exception requires a running thread").0
 }
 
-/// Open `/dev/console` for a new process's console descriptor, with `flags`
-/// (the access mode). The guarded open, as `openat`'s.
-fn open_console(flags: u32) -> Result<FileRef, VfsError> {
-    let opened = open_inode_guarded(crate::vfs::tables(), None, b"/dev/console", OpenFlags::from_bits(flags), 0, 0)?;
-    Ok(Arc::new(OpenFile::from_opened(opened)?))
-}
-
-/// What a new process starts with: fd 0 on `/dev/console` read-only, fds 1
-/// and 2 write-only (so `read(1)` and `write(0)` are `-EBADF`, as in M6),
-/// and `/` as its working directory. Opens files, so may sleep: never call
-/// it holding `ACTIVE_PROCS`. A failure is logged and leaves that slot
-/// closed (the VFS mounts `/dev` at boot, before anything runs).
-fn initial_files() -> (FdTable<FileRef>, Option<Cwd>) {
-    let mut fds = FdTable::new();
-    for (fd, flags) in [(0, OpenFlags::O_RDONLY), (1, OpenFlags::O_WRONLY), (2, OpenFlags::O_WRONLY)] {
-        match open_console(flags) {
-            // A fresh table: nothing is displaced.
-            Ok(file) => drop(fds.insert_at(fd, file, false)),
-            Err(e) => log::warn!(target: "linux", "fd {fd}: cannot open /dev/console: {e:?}"),
-        }
-    }
-    let cwd = match crate::vfs::resolve_path_from_root("/").and_then(OpenGuard::try_new) {
-        Ok(guard) => Some(Cwd::new(guard, String::from("/"))),
-        Err(e) => {
-            log::warn!(target: "linux", "cannot open / as the working directory: {e:?}");
-            None
-        }
-    };
-    (fds, cwd)
-}
-
-/// Register a fresh [`ProcessState`] for the current user thread, with the
-/// executable's path for `/proc/<pid>/exe` if it was loaded by path, and
-/// return its PID.
-pub fn register_current(io: ConsoleIo, allow_test_syscalls: bool, stdin: Vec<u8>, exe_path: Option<String>) -> u32 {
+/// Register a fresh [`ProcessState`] for the current user thread, starting
+/// with `stdio` (opened by the caller first, so a failure stops the run
+/// before it starts), with the executable's path for `/proc/<pid>/exe` if it
+/// was loaded by path, and return its PID.
+pub fn register_current(
+    io: ConsoleIo,
+    allow_test_syscalls: bool,
+    stdin: Vec<u8>,
+    exe_path: Option<String>,
+    stdio: Stdio,
+) -> u32 {
     let ktid = current_kernel_tid();
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let address_space = sched::current_address_space();
-    let (fds, cwd) = initial_files();
-    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin, address_space, exe_path, fds, cwd);
+    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin, address_space, exe_path, stdio);
     let prev = ACTIVE_PROCS.lock().insert(ktid, state);
     debug_assert!(prev.is_none(), "ring-3 process registered twice on thread {ktid}");
     pid
@@ -299,13 +319,17 @@ pub fn take_current() -> ProcessState {
 fn release_fd(pid: u32, file: FileRef) {
     let last = file.dec_fd_ref() == 0;
     let id = file.id;
-    // An inode without lock state has nothing to release.
-    let _ = file.inode.with_locks_mut(&mut |locks| {
+    let released = file.inode.with_locks_mut(&mut |locks| {
         locks.release_posix_for_pid(pid);
         if last {
             locks.release_flock(id);
         }
     });
+    // Every filesystem keeps lock state today; one that refused would keep
+    // this process's locks held.
+    if let Err(e) = released {
+        log::warn!(target: "linux", "pid {pid}: closing {}: its locks weren't released: {e:?}", file.path);
+    }
 }
 
 /// The current process's open file on `fd` (a clone, taken and released
@@ -314,27 +338,63 @@ pub fn current_file(fd: i32) -> Option<FileRef> {
     with_current(|p| p.fds.get(fd).map(|e| Arc::clone(&e.file)))
 }
 
-/// Whether the current process has a free descriptor slot (`openat` checks
-/// before it opens, as Linux reserves the slot first: a full table is
-/// `-EMFILE` before any file is created).
+/// The current process's open files on each of `fds` (clones, all taken in
+/// one hold of `ACTIVE_PROCS`; `None` where one isn't open), for `poll`.
+pub fn current_files(fds: &[i32]) -> Vec<Option<FileRef>> {
+    with_current(|p| fds.iter().map(|&fd| p.fds.get(fd).map(|e| Arc::clone(&e.file))).collect())
+}
+
+/// Whether the current process has a free descriptor slot. `openat` checks
+/// before it opens, so a full table is `-EMFILE` before any file is created
+/// (Linux reserves the slot; this only checks: from M8, another thread could
+/// fill the table between this check and the install, after an `O_CREAT`).
 pub fn current_has_free_fd() -> bool {
     with_current(|p| p.fds.open_count() < lumen_vfs::MAX_FDS)
 }
 
-/// Put `file` (a fresh open file description, its `fd_refs` 1) in the
-/// current process's lowest free slot: the descriptor, or `EMFILE`.
-pub fn install_current_fd(file: FileRef, cloexec: bool) -> Result<i32, VfsError> {
+/// Put `file`, a fresh open file description (its `fd_refs` 1, for this
+/// slot), in the current process's lowest free slot: the descriptor, or
+/// `EMFILE`.
+pub fn install_current_fd(file: KernelFile, cloexec: bool) -> Result<i32, VfsError> {
+    let file = Arc::new(file);
     // A clone goes in, so a refused one drops under `ACTIVE_PROCS` without
     // being the last reference; `file` drops after the lock is released.
     with_current_mut(|p| p.fds.alloc(Arc::clone(&file), cloexec))
 }
 
-/// Put `file` on descriptor `fd` of the current process, closing what was
-/// there (its locks released outside `ACTIVE_PROCS`). `file`'s `fd_refs` must
-/// already count this slot (a fresh open file's 1 does). `EBADF` for an fd
-/// outside `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s
-/// inode number from it and relies on that range.
-pub fn insert_current_fd(fd: i32, file: FileRef) -> Result<(), VfsError> {
+/// Put `file`, a fresh open file description, on descriptor `fd` of the
+/// current process, closing what was there (its locks released outside
+/// `ACTIVE_PROCS`). `EBADF` for an fd outside `0..lumen_vfs::MAX_FDS`:
+/// procfs builds `/proc/<pid>/fd/<fd>`'s inode number from it and relies on
+/// that range.
+pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
+    place_current_fd(fd, Arc::new(file))
+}
+
+/// Make descriptor `new` share `old`'s open file description (`dup2`'s
+/// slot work, M8's `dup`/`dup2`/`dup3`): its `fd_refs` counts the new slot,
+/// and what `new` held is closed. `EBADF` if `old` isn't open or `new` is
+/// out of range; `old == new` changes nothing.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // M8's `dup2` calls it; the ktests until then
+pub fn dup_current_fd(old: i32, new: i32) -> Result<i32, VfsError> {
+    let file = current_file(old).ok_or(VfsError::BadF)?;
+    if old == new {
+        return Ok(new);
+    }
+    file.inc_fd_ref();
+    match place_current_fd(new, Arc::clone(&file)) {
+        Ok(()) => Ok(new),
+        Err(e) => {
+            // The slot was never filled: give its count back.
+            file.dec_fd_ref();
+            Err(e)
+        }
+    }
+}
+
+/// Put `file` (its `fd_refs` already counting this slot) on `fd`, releasing
+/// what it displaces outside `ACTIVE_PROCS`.
+fn place_current_fd(fd: i32, file: FileRef) -> Result<(), VfsError> {
     let (pid, displaced) = with_current_mut(|p| (p.pid, p.fds.insert_at(fd, Arc::clone(&file), false)));
     if let Some(old) = displaced? {
         release_fd(pid, old.file);
@@ -350,10 +410,23 @@ pub fn close_current_fd(fd: i32) -> Result<(), VfsError> {
     Ok(())
 }
 
+/// Whether descriptor `fd` of the current process is close-on-exec, or
+/// `EBADF`.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `fcntl(F_GETFD)` (wave 3) calls it; the ktests until then
+pub fn current_cloexec(fd: i32) -> Result<bool, VfsError> {
+    with_current(|p| p.fds.get_cloexec(fd))
+}
+
+/// Set or clear descriptor `fd`'s close-on-exec flag (`FIOCLEX`,
+/// `FIONCLEX`), or `EBADF`.
+pub fn set_current_cloexec(fd: i32, cloexec: bool) -> Result<(), VfsError> {
+    with_current_mut(|p| p.fds.set_cloexec(fd, cloexec))
+}
+
 /// The current process's working directory: its inode and the path it was
-/// set by (clones), or `None` if it has none.
-pub fn current_cwd() -> Option<(Arc<dyn VfsInode>, String)> {
-    with_current(|p| p.cwd.as_ref().map(|c| (Arc::clone(c.inode()), String::from(c.path()))))
+/// set by (clones).
+pub fn current_cwd() -> (Arc<dyn VfsInode>, Arc<str>) {
+    with_current(|p| (Arc::clone(p.cwd.inode()), Arc::clone(p.cwd.path())))
 }
 
 /// Make `cwd` the current process's working directory; the old one drops
@@ -361,7 +434,7 @@ pub fn current_cwd() -> Option<(Arc<dyn VfsInode>, String)> {
 /// the ktests until then.)
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `chdir`/`fchdir` (#254's wave 3) call it
 pub fn set_current_cwd(cwd: Cwd) {
-    let old = with_current_mut(|p| p.cwd.replace(cwd));
+    let old = with_current_mut(|p| core::mem::replace(&mut p.cwd, cwd));
     drop(old);
 }
 
@@ -756,10 +829,14 @@ pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send
         space.teardown();
         return Err("map the test process's user memory");
     }
+    let Ok(stdio) = Stdio::open() else {
+        space.teardown();
+        return Err("open the test process's stdio");
+    };
     let slot: Arc<SpinLock<Option<R>>> = Arc::new(SpinLock::new(None));
     let out = Arc::clone(&slot);
     let spawned = sched::spawn_user_on(crate::arch::cpu_index(), "ktest-process", Arc::clone(&space), move || {
-        let pid = register_current(ConsoleIo::Capture, false, Vec::new(), None);
+        let pid = register_current(ConsoleIo::Capture, false, Vec::new(), None, stdio);
         let result = f(pid);
         drop(take_current());
         drop(sched::detach_user_space());
@@ -789,14 +866,18 @@ crate::ktest!(
                 kassert!(file.inode.is_tty());
                 kassert_eq!(&*file.path, "/dev/console");
                 kassert_eq!((file.is_readable(), file.is_writable()), (readable, writable));
-                kassert_eq!(with_current(|p| p.fds.get_cloexec(fd)), Ok(false));
+                kassert_eq!(current_cloexec(fd), Ok(false));
             }
             // `/` is the working directory, with the default umask.
-            let (cwd, path) = current_cwd().ok_or("no working directory")?;
+            let (cwd, path) = current_cwd();
             let root = crate::vfs::resolve_path_from_root("/").map_err(|_| "resolve /")?;
             kassert!(Arc::ptr_eq(&cwd, &root));
-            kassert_eq!(path.as_str(), "/");
+            kassert_eq!(&*path, "/");
             kassert_eq!(current_umask(), 0o022);
+            // A working directory must be a directory.
+            let console = crate::vfs::resolve_path_from_root("/dev/console").map_err(|_| "resolve the console")?;
+            let guard = OpenGuard::try_new(console).map_err(|_| "guard")?;
+            kassert!(matches!(Cwd::new(guard, "/dev/console"), Err(VfsError::NotDir)));
             Ok(())
         })?
     }
@@ -809,10 +890,8 @@ crate::ktest!(
 
         const PATH: &[u8] = b"/tmp/process-ktest-locks";
         const OTHER: &[u8] = b"/tmp/process-ktest-locks-other";
-        fn open(path: &[u8]) -> Result<FileRef, VfsError> {
-            let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_CREAT);
-            let opened = open_inode_guarded(crate::vfs::tables(), None, path, flags, 0o644, 0)?;
-            Ok(Arc::new(OpenFile::from_opened(opened)?))
+        fn open(path: &[u8]) -> Result<KernelFile, &'static str> {
+            open_kernel_file(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644).map_err(|_| "open")
         }
         // The `flock` and `pid`'s POSIX record-lock counts on `file`'s inode.
         fn counts(file: &FileRef, pid: u32) -> (usize, usize) {
@@ -837,16 +916,21 @@ crate::ktest!(
         let (pid, held) = in_test_process(|pid| -> Result<(u32, FileRef), &'static str> {
             // A holds an exclusive `flock` and sits on fds 3 and 4 (a `dup`:
             // one open file description, two slots).
-            let a = open(PATH).map_err(|_| "open A")?;
+            insert_current_fd(3, open(PATH)?).map_err(|_| "install fd 3")?;
+            let a = current_file(3).ok_or("fd 3")?;
             flock_ex(&a).map_err(|_| "flock A")?;
-            insert_current_fd(3, Arc::clone(&a)).map_err(|_| "install fd 3")?;
-            a.inc_fd_ref();
-            insert_current_fd(4, Arc::clone(&a)).map_err(|_| "install fd 4")?;
+            kassert_eq!(dup_current_fd(3, 4), Ok(4));
+            kassert_eq!(a.fd_ref_count(), 2);
+            // `dup` onto itself or from a closed fd changes nothing.
+            kassert_eq!(dup_current_fd(4, 4), Ok(4));
+            kassert_eq!(dup_current_fd(77, 8), Err(VfsError::BadF));
+            kassert_eq!(dup_current_fd(3, lumen_vfs::MAX_FDS as i32), Err(VfsError::BadF));
+            kassert_eq!(a.fd_ref_count(), 2);
             // B, another open of the same file, on fd 5 holds a POSIX lock;
             // a file on another inode on fd 6.
-            let b = open(PATH).map_err(|_| "open B")?;
-            kassert_eq!(install_current_fd(Arc::clone(&b), false), Ok(5));
-            kassert_eq!(install_current_fd(open(OTHER).map_err(|_| "open other")?, false), Ok(6));
+            kassert_eq!(install_current_fd(open(PATH)?, false), Ok(5));
+            let b = current_file(5).ok_or("fd 5")?;
+            kassert_eq!(install_current_fd(open(OTHER)?, false), Ok(6));
             posix_lock(&b, pid).map_err(|_| "take the POSIX lock")?;
             kassert_eq!(counts(&a, pid), (1, 1));
 

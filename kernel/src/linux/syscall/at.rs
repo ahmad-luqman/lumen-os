@@ -10,7 +10,10 @@
 //! offset argument stays a whole `u64`.
 //!
 //! **Turning a [`Dirfd`] into the directory a path starts from** is
-//! [`start_dir`], the one place it happens. Its traps:
+//! [`start_dir`], the one place it happens, and its [`Start`] is the only
+//! way a handler reaches lumen-vfs's path operations (`Start::open`,
+//! `Start::resolve`; wave 3 adds the rest here): a handler never hands
+//! lumen-vfs a raw `start_dir`. Its traps:
 //! - lumen-vfs's `resolve_path(start_dir: None, ..)` starts at the global
 //!   root, not the working directory: `Dirfd::Cwd` resolves to the
 //!   process's cwd inode, a concrete `Arc`, never `None`;
@@ -20,16 +23,15 @@
 //! - with `AT_EMPTY_PATH`, `Dirfd::Fd` names the file itself, which need
 //!   not be a directory (`-ENOTDIR` only for a relative path through it).
 
-// Wave 3's handlers are the callers; until then only the ktests use these.
-#![cfg_attr(not(feature = "ktest"), allow(dead_code))]
-
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use lumen_vfs::{AccessMask, AtFlags, InodeType, Metadata, OpenFlags, RenameFlags, Timespec, VfsInode};
+use lumen_vfs::{
+    AccessMask, AtFlags, InodeType, Metadata, OpenFlags, Opened, RenameFlags, ResolveFlags, ResolvedPath, Timespec,
+    VfsError, VfsInode, open_inode_guarded, resolve_path,
+};
 
-use crate::linux::process;
+use crate::linux::process::{self, FileRef};
 use crate::linux::{errno, general};
 use crate::user::{CopyError, copy_cstr_from_user};
 
@@ -77,6 +79,12 @@ impl Fd {
     pub(super) fn raw(self) -> i32 {
         self.0
     }
+
+    /// The current process's open file on this descriptor (a clone), or
+    /// `EBADF`: every handler's descriptor lookup.
+    pub(super) fn file(self) -> Result<FileRef, u32> {
+        process::current_file(self.0).ok_or(errno::EBADF)
+    }
 }
 
 impl FromReg for Fd {
@@ -114,11 +122,13 @@ impl Mode {
 
     /// What `mkdir` keeps (`mode & 0o1777`, Linux's `vfs_mkdir`): the
     /// permission bits and sticky, never setuid or setgid.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `mkdirat` (wave 3) calls it; the ktests until then
     pub(super) fn dir_perm(self) -> u16 {
         (self.0 & 0o1777) as u16
     }
 
     /// The low 32 bits as given (`umask` keeps `& 0o777` of them).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `umask` (wave 3) calls it; the ktests until then
     pub(super) fn bits(self) -> u32 {
         self.0
     }
@@ -165,6 +175,7 @@ impl FromReg for AccessMask {
 pub(super) struct UserPtr(u64);
 
 impl UserPtr {
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `utimensat` (wave 3) calls it; the ktests until then
     pub(super) fn is_null(self) -> bool {
         self.0 == 0
     }
@@ -220,6 +231,7 @@ impl UserPath {
     /// The path as text, for the calls that take a `&str`. The one place the
     /// rule lives: a path that isn't UTF-8 names nothing the VFS can hold
     /// yet, so `-ENOENT` (#268 makes VFS names byte strings).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the `&str` VFS calls (wave 3) calls it; the ktests until then
     pub(super) fn as_str(&self) -> Result<&str, u32> {
         core::str::from_utf8(&self.0).map_err(|_| errno::ENOENT)
     }
@@ -233,13 +245,26 @@ pub(super) struct Start {
     dir: Option<Arc<dyn VfsInode>>,
     /// The path `dir` was opened or set by (the cwd's, or the dirfd's open
     /// file's), for the path a relative open shows in `/proc/<pid>/fd`.
-    base: Option<String>,
+    base: Option<Arc<str>>,
 }
 
 impl Start {
-    /// The `start_dir` argument for lumen-vfs's resolution and operations.
-    pub(super) fn dir(&self) -> Option<&Arc<dyn VfsInode>> {
+    /// lumen-vfs's `start_dir` for this start: private, so it reaches
+    /// lumen-vfs only through the operations below.
+    fn dir(&self) -> Option<&Arc<dyn VfsInode>> {
         self.dir.as_ref()
+    }
+
+    /// `open_inode_guarded` from this start (`openat`).
+    pub(super) fn open(&self, path: &UserPath, flags: OpenFlags, mode: u16, umask: u16) -> Result<Opened, u32> {
+        open_inode_guarded(crate::vfs::tables(), self.dir(), path.as_bytes(), flags, mode, umask)
+            .map_err(VfsError::to_errno)
+    }
+
+    /// `resolve_path` from this start (the `stat` family, wave 3).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // wave 3's `newfstatat`/`statx` call it
+    pub(super) fn resolve(&self, path: &UserPath, flags: ResolveFlags) -> Result<ResolvedPath, u32> {
+        resolve_path(crate::vfs::tables(), self.dir(), path.as_bytes(), flags).map_err(VfsError::to_errno)
     }
 
     /// `path` (as given, relative) joined to the path the start was opened
@@ -249,7 +274,7 @@ impl Start {
     /// so a rename since then isn't followed (Linux's `d_path` would be;
     /// `getcwd` is, computing the cwd's path from its inode).
     pub(super) fn display_path(&self, path: &str) -> Option<Arc<str>> {
-        let base = self.base.as_deref()?;
+        let base: &str = self.base.as_deref()?;
         if path.is_empty() || path.starts_with('/') {
             return None;
         }
@@ -263,25 +288,23 @@ impl Start {
 ///
 /// - An absolute path starts at the root whatever `dirfd` is: the dirfd is
 ///   never looked at (a bad one is no error).
-/// - An empty path is `-ENOENT` unless `allow_empty` (`AT_EMPTY_PATH`); then
-///   it names the dirfd's file itself, a directory or not, or the cwd.
-/// - A relative path starts at the cwd's inode for `Dirfd::Cwd` (`-ENOENT`
-///   if the process has none), or at the dirfd's file: `-EBADF` if it isn't
-///   open, `-ENOTDIR` if it isn't a directory (an `O_PATH` one is fine).
+/// - An empty path (`UserPath::copy_in` let one through only with
+///   `AT_EMPTY_PATH`) names the dirfd's file itself, a directory or not, or
+///   the cwd.
+/// - A relative path starts at the cwd's inode for `Dirfd::Cwd`, or at the
+///   dirfd's file: `-EBADF` if it isn't open, `-ENOTDIR` if it isn't a
+///   directory (an `O_PATH` one is fine).
 ///
 /// Takes `ACTIVE_PROCS` briefly; the clones it takes drop after it.
-pub(super) fn start_dir(dirfd: Dirfd, path: &UserPath, allow_empty: bool) -> Result<Start, u32> {
+pub(super) fn start_dir(dirfd: Dirfd, path: &UserPath) -> Result<Start, u32> {
     if path.as_bytes().starts_with(b"/") {
         return Ok(Start { dir: None, base: None });
     }
-    if path.is_empty() && !allow_empty {
-        return Err(errno::ENOENT);
-    }
     let (inode, base) = match dirfd {
-        Dirfd::Cwd => process::current_cwd().ok_or(errno::ENOENT)?,
+        Dirfd::Cwd => process::current_cwd(),
         Dirfd::Fd(fd) => {
-            let file = process::current_file(fd.raw()).ok_or(errno::EBADF)?;
-            (Arc::clone(&file.inode), String::from(&*file.path))
+            let file = fd.file()?;
+            (Arc::clone(&file.inode), Arc::clone(&file.path))
         }
     };
     if !path.is_empty() && inode.inode_type() != InodeType::Dir {
@@ -330,6 +353,7 @@ pub(super) fn stat_from_metadata(m: &Metadata) -> general::stat {
     }
 }
 
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `statx` (wave 3) calls it; the ktests until then
 fn statx_time(t: Timespec) -> general::statx_timestamp {
     general::statx_timestamp { tv_sec: t.sec, tv_nsec: nsec(t), __reserved: 0 }
 }
@@ -337,6 +361,7 @@ fn statx_time(t: Timespec) -> general::statx_timestamp {
 /// The Linux `struct statx` for `m` (`statx`): the basic fields
 /// (`STATX_BASIC_STATS` in `stx_mask`, whatever was asked, as Linux may),
 /// no birth time, no mount id, no attributes.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `statx` (wave 3) calls it; the ktests until then
 pub(super) fn statx_from_metadata(m: &Metadata) -> general::statx {
     let zero_time = general::statx_timestamp { tv_sec: 0, tv_nsec: 0, __reserved: 0 };
     general::statx {
@@ -666,28 +691,24 @@ crate::ktest!(
 crate::ktest!(
     fn at_start_dir_resolves_dirfd_with_its_traps() {
         use crate::{kassert, kassert_eq};
-        use lumen_vfs::{OpenFile, OpenFlags, OpenGuard, ResolveFlags, mkdir_at, open_inode_guarded, resolve_path};
+        use lumen_vfs::{OpenGuard, mkdir_at};
 
         const DIR: &[u8] = b"/tmp/at-ktest";
         const FILE: &[u8] = b"/tmp/at-ktest/f";
         let tables = crate::vfs::tables();
         process::in_test_process(move |_| {
             let dir = mkdir_at(tables, None, DIR, 0o755, 0).map_err(|_| "mkdir")?;
-            let open = |path: &[u8], bits: u32| {
-                open_inode_guarded(tables, None, path, OpenFlags::from_bits(bits), 0o644, 0)
-                    .and_then(OpenFile::from_opened)
-                    .map(Arc::new)
-                    .map_err(|_| "open")
-            };
+            let open = |path: &[u8], bits: u32| process::open_kernel_file(path, bits, 0o644).map_err(|_| "open");
             let file = open(FILE, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             let file_inode = Arc::clone(&file.inode);
             let dir_fd = process::install_current_fd(open(DIR, OpenFlags::O_RDONLY)?, false).map_err(|_| "fd")?;
             let path_fd = process::install_current_fd(open(DIR, OpenFlags::O_PATH)?, false).map_err(|_| "fd")?;
             let file_fd = process::install_current_fd(file, false).map_err(|_| "fd")?;
             let fd = |n: i32| Dirfd::Fd(Fd(n));
-            let start = |d: Dirfd, p: &[u8], allow_empty: bool| {
-                start_dir(d, &UserPath::from_bytes(p.to_vec(), true)?, allow_empty)
-            };
+            // As a handler calls it: the path copied in (an empty one only
+            // with `AT_EMPTY_PATH`), then resolved.
+            let start =
+                |d: Dirfd, p: &[u8], allow_empty: bool| start_dir(d, &UserPath::from_bytes(p.to_vec(), allow_empty)?);
             let must = |r: Result<Start, u32>| r.map_err(|_| "start_dir refused");
             let is = |s: &Start, inode: &Arc<dyn VfsInode>| s.dir().is_some_and(|d| Arc::ptr_eq(d, inode));
 
@@ -697,17 +718,17 @@ crate::ktest!(
             let root = crate::vfs::resolve_path_from_root("/").map_err(|_| "resolve /")?;
             let s = must(start(Dirfd::Cwd, b"f", false))?;
             kassert!(is(&s, &root));
-            process::set_current_cwd(process::Cwd::new(
-                OpenGuard::try_new(Arc::clone(&dir)).map_err(|_| "guard")?,
-                String::from("/tmp/at-ktest"),
-            ));
+            let guard = OpenGuard::try_new(Arc::clone(&dir)).map_err(|_| "guard")?;
+            process::set_current_cwd(process::Cwd::new(guard, "/tmp/at-ktest").map_err(|_| "cwd")?);
             let s = must(start(Dirfd::Cwd, b"f", false))?;
             kassert!(is(&s, &dir));
             let follow = ResolveFlags { follow_final: true, empty_path: false, require_dir: false };
-            let found = resolve_path(tables, s.dir(), b"f", follow).map_err(|_| "resolve f from the cwd")?;
+            let f = UserPath::from_bytes(b"f".to_vec(), false).map_err(|_| "path")?;
+            let found = s.resolve(&f, follow).map_err(|_| "resolve f from the cwd")?;
             kassert!(Arc::ptr_eq(&found.inode, &file_inode));
             kassert_eq!(s.display_path("f").as_deref(), Some("/tmp/at-ktest/f"));
-            kassert_eq!(resolve_path(tables, None, b"f", follow).err(), Some(lumen_vfs::VfsError::NoEnt));
+            let from_root = resolve_path(tables, None, b"f", follow).err();
+            kassert_eq!(from_root, Some(lumen_vfs::VfsError::NoEnt));
             // An empty path with `AT_EMPTY_PATH`: the cwd.
             kassert!(is(&must(start(Dirfd::Cwd, b"", true))?, &dir));
 
@@ -733,7 +754,7 @@ crate::ktest!(
             // `AT_EMPTY_PATH` and an empty path, the file itself.
             kassert_eq!(start(fd(file_fd), b"x", false).err(), Some(errno::ENOTDIR));
             kassert!(is(&must(start(fd(file_fd), b"", true))?, &file_inode));
-            // An empty path without `AT_EMPTY_PATH`: `-ENOENT`.
+            // An empty path without `AT_EMPTY_PATH`: `-ENOENT` (copying it in).
             kassert_eq!(start(fd(dir_fd), b"", false).err(), Some(errno::ENOENT));
             kassert_eq!(start(Dirfd::Cwd, b"", false).err(), Some(errno::ENOENT));
             // A closed fd: `-EBADF` again.

@@ -10,7 +10,6 @@
 //! file's offset, through a bounce buffer on the stack. No VFS lock, nor
 //! the offset's (Lock 2), is held across a copy to or from user memory.
 
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -24,7 +23,7 @@ use crate::linux::process::{self, ConsoleIo, FileRef, KernelFile, with_current, 
 use crate::linux::{errno, general, ioctl};
 use crate::sched;
 use crate::user::{CopyError, copy_from_user, copy_to_user};
-use lumen_vfs::{InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsLock, open_inode_guarded};
+use lumen_vfs::{DevId, InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsInode, VfsLock};
 
 /// Bytes moved per step between a file and user memory: the bounce buffer,
 /// on the stack (no heap, so a run's frame count is unchanged).
@@ -44,11 +43,6 @@ fn vfs(e: VfsError) -> u32 {
     e.to_errno()
 }
 
-/// The open file on `fd`, or `EBADF`.
-fn file(fd: Fd) -> Result<FileRef, u32> {
-    process::current_file(fd.raw()).ok_or(errno::EBADF)
-}
-
 fn current_io() -> ConsoleIo {
     with_current(|p| p.io)
 }
@@ -58,11 +52,38 @@ fn partial(done: usize, err: u32) -> Result<u64, u32> {
     if done > 0 { Ok(done as u64) } else { Err(err) }
 }
 
+/// Whether a read of `inode` may hold its file's offset lock (Lock 2)
+/// across `read_at`. Not on procfs: `/proc/<pid>/maps` takes the address
+/// space's Lock 1 in `read_at`, and Lock 1 comes before Lock 2.
+fn offset_lock_across_read(inode: &dyn VfsInode) -> bool {
+    inode.dev_id() != DevId::PROCFS
+}
+
+/// Read one chunk into `kbuf` at `file`'s offset and move the offset past
+/// it: `(where it began, where it ended)`. Under the offset's lock across
+/// the `read_at` where [`offset_lock_across_read`] allows; else from a
+/// snapshot of the offset, moved after only if nothing moved it meanwhile.
+fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError> {
+    if offset_lock_across_read(&*file.inode) {
+        let mut off = file.offset.lock();
+        let pos = *off;
+        let end = pos.saturating_add(file.inode.read_at(pos, kbuf)? as u64);
+        *off = end;
+        return Ok((pos, end));
+    }
+    let pos = *file.offset.lock();
+    let end = pos.saturating_add(file.inode.read_at(pos, kbuf)? as u64);
+    let mut off = file.offset.lock();
+    if *off == pos {
+        *off = end;
+    }
+    Ok((pos, end))
+}
+
 /// Read up to `count` bytes (at most `MAX_SINGLE_IO`) from `file` at its
 /// offset into user memory at `user_buf`, a chunk at a time until EOF or a
-/// short read. The offset's lock is held across each chunk's `read_at` and
-/// released before its copy out; a chunk the copy refuses is given back
-/// (the offset moves only by what reached the caller).
+/// short read. No lock is held across a chunk's copy out; a chunk the copy
+/// refuses is given back (the offset moves only by what reached the caller).
 pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     if file.inode.inode_type() == InodeType::Dir {
         return Err(errno::EISDIR);
@@ -75,16 +96,9 @@ pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<
         let Some(addr) = user_buf.checked_add(done as u64) else {
             return partial(done, errno::EFAULT);
         };
-        let (pos, end) = {
-            let mut off = file.offset.lock();
-            let pos = *off;
-            let n = match file.inode.read_at(pos, &mut kbuf[..want]) {
-                Ok(n) => n,
-                Err(e) => return partial(done, vfs(e)),
-            };
-            let end = pos.saturating_add(n as u64);
-            *off = end;
-            (pos, end)
+        let (pos, end) = match read_chunk(file, &mut kbuf[..want]) {
+            Ok(range) => range,
+            Err(e) => return partial(done, vfs(e)),
         };
         let n = (end - pos) as usize;
         if n == 0 {
@@ -106,8 +120,12 @@ pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<
 }
 
 /// Write up to `count` bytes (at most `MAX_SINGLE_IO`) from user memory at
-/// `user_buf` to `file` at its offset (at its end with `O_APPEND`), a chunk
-/// at a time: each copied in first, then written under the offset's lock.
+/// `user_buf` to `file` at its offset, a chunk at a time: each copied in
+/// first, then written under the offset's lock. With `O_APPEND` each chunk
+/// goes through `VfsInode::append`, which finds the end and writes there in
+/// one hold of the inode's lock, so appenders on other open files can't
+/// write over it; a write longer than one chunk (4 KiB) can have another
+/// appender's data land between its chunks.
 pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     let limit = count.min(MAX_SINGLE_IO as u64) as usize;
     let append = file.status_flags() & OpenFlags::O_APPEND != 0;
@@ -123,16 +141,13 @@ pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result
         }
         let n = {
             let mut off = file.offset.lock();
-            let pos = if append {
-                match file.inode.stat() {
-                    Ok(m) => m.size,
-                    Err(e) => return partial(done, vfs(e)),
-                }
+            let wrote = if append {
+                file.inode.append(&kbuf[..want])
             } else {
-                *off
+                file.inode.write_at(*off, &kbuf[..want]).map(|n| (*off, n))
             };
-            let n = match file.inode.write_at(pos, &kbuf[..want]) {
-                Ok(n) => n,
+            let (pos, n) = match wrote {
+                Ok(at) => at,
                 Err(e) => return partial(done, vfs(e)),
             };
             *off = pos.saturating_add(n as u64);
@@ -162,7 +177,7 @@ fn read_tty(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
 }
 
 fn read(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
-    let file = file(fd)?;
+    let file = fd.file()?;
     file.require_readable().map_err(vfs)?;
     if file.inode.is_tty() {
         return read_tty(&file, buf.addr(), count);
@@ -175,7 +190,7 @@ pub(super) fn sys_write(fd: Fd, buf: UserPtr, count: u64) -> u64 {
 }
 
 fn write(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
-    let file = file(fd)?;
+    let file = fd.file()?;
     file.require_writable().map_err(vfs)?;
     if file.inode.is_tty() {
         return write_from_user(current_io(), buf.addr(), count).map(|n| n as u64);
@@ -192,7 +207,7 @@ pub(super) fn sys_fstat(fd: Fd, statbuf: UserPtr) -> u64 {
 }
 
 fn fstat(fd: Fd, statbuf: UserPtr) -> Result<u64, u32> {
-    let file = file(fd)?;
+    let file = fd.file()?;
     let st = at::stat_from_metadata(&file.inode.stat().map_err(vfs)?);
     drop(file);
     // SAFETY: `general::stat` is 144 bytes with explicit `__pad0` and zero implicit padding.
@@ -248,10 +263,9 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
 
     // The polled files, cloned out in one hold of `ACTIVE_PROCS` and
     // classified (and dropped) after it.
-    let (io, files): (ConsoleIo, Vec<Option<FileRef>>) = with_current(|p| {
-        let files = raw.as_chunks::<8>().0.iter().map(|c| p.fds.get(fd_at(c)).map(|e| Arc::clone(&e.file))).collect();
-        (p.io, files)
-    });
+    let io = current_io();
+    let polled: Vec<i32> = raw.as_chunks::<8>().0.iter().map(fd_at).collect();
+    let files = process::current_files(&polled);
     let classes: Vec<PollClass> = files.iter().map(|f| poll_class(f.as_ref())).collect();
     drop(files);
 
@@ -334,12 +348,12 @@ pub(super) fn sys_ioctl(fd: Fd, req: u32, arg: u64) -> u64 {
 }
 
 fn ioctl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
-    let file = file(fd)?;
+    let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
     match cmd {
         ioctl::FIOCLEX | ioctl::FIONCLEX => {
             let cloexec = cmd == ioctl::FIOCLEX;
-            with_current_mut(|p| p.fds.set_cloexec(fd.raw(), cloexec)).map_err(vfs)?;
+            process::set_current_cloexec(fd.raw(), cloexec).map_err(vfs)?;
             Ok(0)
         }
         ioctl::FIONBIO => {
@@ -391,7 +405,7 @@ pub(super) fn sys_readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> u64 {
 }
 
 fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
-    let file = file(fd)?;
+    let file = fd.file()?;
     file.require_readable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
     if file.inode.is_tty() {
@@ -432,7 +446,7 @@ pub(super) fn sys_writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> u64 {
 }
 
 fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
-    let file = file(fd)?;
+    let file = fd.file()?;
     file.require_writable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
     let tty = file.inode.is_tty().then(current_io);
@@ -480,15 +494,13 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     if !process::current_has_free_fd() {
         return Err(errno::EMFILE);
     }
-    let start = at::start_dir(dirfd, &path, false)?;
-    let umask = process::current_umask();
-    let opened = open_inode_guarded(crate::vfs::tables(), start.dir(), path.as_bytes(), flags, mode.perm(), umask)
-        .map_err(vfs)?;
+    let start = at::start_dir(dirfd, &path)?;
+    let opened = start.open(&path, flags, mode.perm(), process::current_umask())?;
     let mut file = OpenFile::from_opened(opened).map_err(vfs)?;
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
     }
-    let fd = process::install_current_fd(Arc::new(file), flags.has_cloexec()).map_err(vfs)?;
+    let fd = process::install_current_fd(file, flags.has_cloexec()).map_err(vfs)?;
     Ok(fd as u64)
 }
 
@@ -515,7 +527,7 @@ pub(super) fn sys_lseek(fd: Fd, offset: u64, whence: u32) -> u64 {
 }
 
 fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
-    let file = file(fd)?;
+    let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
     if file.inode.is_tty() {
         return Err(errno::ESPIPE);
@@ -613,7 +625,7 @@ crate::ktest!(
         process::in_test_process(|_| {
             let null = ktest_user_path(0, b"/dev/null")?;
             let mode: Mode = at::reg(0);
-            let cloexec = |fd: Fd| with_current(|p| p.fds.get_cloexec(fd.raw()));
+            let cloexec = |fd: Fd| process::current_cloexec(fd.raw());
             let a = ktest_fd(sys_open(null, ktest_flags(OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC), mode))?;
             let b = ktest_fd(sys_open(null, ktest_flags(OpenFlags::O_RDONLY), mode))?;
             kassert_eq!(cloexec(a), Ok(true));
@@ -668,12 +680,33 @@ crate::ktest!(
 /// The status flags of the current process's file on `fd` (ktests).
 #[cfg(feature = "ktest")]
 fn current_file_flags(fd: Fd) -> Option<u32> {
-    process::current_file(fd.raw()).map(|f| f.status_flags())
+    fd.file().ok().map(|f| f.status_flags())
 }
 
 #[cfg(feature = "ktest")]
 fn current_file(fd: Fd) -> Option<FileRef> {
-    process::current_file(fd.raw())
+    fd.file().ok()
+}
+
+/// Write `spans` as a `struct iovec` array at `at` in user memory (ktests).
+#[cfg(feature = "ktest")]
+fn ktest_iovs(at: u64, spans: &[(u64, u64)]) -> Result<UserPtr, &'static str> {
+    let mut raw = Vec::new();
+    for (base, len) in spans {
+        raw.extend_from_slice(&base.to_le_bytes());
+        raw.extend_from_slice(&len.to_le_bytes());
+    }
+    copy_to_user(at, &raw).map_err(|_| "copy the iovecs")?;
+    Ok(at::reg(at))
+}
+
+/// The `struct stat` at `at` in user memory: `(st_mode, st_rdev, st_size)`.
+#[cfg(feature = "ktest")]
+fn ktest_stat(at: u64) -> Result<(u32, u64, u64), &'static str> {
+    let mut st = [0u8; 144];
+    crate::user::copy_from_user(&mut st, at).map_err(|_| "copy the stat")?;
+    let u64_at = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().expect("8 bytes"));
+    Ok((u32::from_le_bytes(st[24..28].try_into().expect("4 bytes")), u64_at(40), u64_at(48)))
 }
 
 crate::ktest!(
@@ -700,57 +733,137 @@ crate::ktest!(
             kassert_eq!(sys_read(fd, at::reg(0xffff_8000_0000_0000), 3), neg_errno(errno::EFAULT));
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 5);
             // `readv` fills each span in turn, stopping at EOF.
-            let spans: [(u64, u64); 2] = [(out, 2), (out + 2, 100)];
-            for (i, (b, l)) in spans.iter().enumerate() {
-                let at = iov + 16 * i as u64;
-                copy_to_user(at, &b.to_le_bytes()).map_err(|_| "iov")?;
-                copy_to_user(at + 8, &l.to_le_bytes()).map_err(|_| "iov")?;
-            }
-            kassert_eq!(sys_readv(fd, at::reg(iov), 2), 6);
+            kassert_eq!(sys_readv(fd, ktest_iovs(iov, &[(out, 2), (out + 2, 100)])?, 2), 6);
             copy_from_user(&mut got[..6], out).map_err(|_| "copy out")?;
             kassert_eq!(&got[..6], b" world");
             kassert_eq!(sys_read(fd, at::reg(out), 5), 0);
             // `writev` writes every span: "hello world" then "AB" + "CDE".
             copy_to_user(data, b"ABCDE").map_err(|_| "copy data")?;
-            let spans: [(u64, u64); 2] = [(data, 2), (data + 2, 3)];
-            for (i, (b, l)) in spans.iter().enumerate() {
-                let at = iov + 16 * i as u64;
-                copy_to_user(at, &b.to_le_bytes()).map_err(|_| "iov")?;
-                copy_to_user(at + 8, &l.to_le_bytes()).map_err(|_| "iov")?;
-            }
-            kassert_eq!(sys_writev(fd, at::reg(iov), 2), 5);
+            kassert_eq!(sys_writev(fd, ktest_iovs(iov, &[(data, 2), (data + 2, 3)])?, 2), 5);
             // `fstat`: a regular file of 16 bytes, its mode less the umask.
             kassert_eq!(sys_fstat(fd, at::reg(out)), 0);
-            let mut st = [0u8; 144];
-            copy_from_user(&mut st, out).map_err(|_| "copy stat")?;
-            let st_mode = u32::from_le_bytes(st[24..28].try_into().expect("4 bytes"));
-            let st_size = u64::from_le_bytes(st[48..56].try_into().expect("8 bytes"));
+            let (st_mode, _, st_size) = ktest_stat(out)?;
             kassert_eq!(st_mode, general::S_IFREG | 0o644);
             kassert_eq!(st_size, 16);
-            // `O_APPEND` writes at the end wherever the offset is.
+            // `O_APPEND` writes at the end on every write, wherever the
+            // offset was put: twice, an `lseek` to 0 between.
             let app = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_APPEND), at::reg(0)))?;
             kassert_eq!(sys_write(app, at::reg(data), 1), 1);
             kassert_eq!(sys_lseek(app, 0, general::SEEK_CUR), 17);
+            kassert_eq!(sys_lseek(app, 0, general::SEEK_SET), 0);
+            kassert_eq!(sys_write(app, at::reg(data + 1), 1), 1);
+            kassert_eq!(sys_lseek(app, 0, general::SEEK_CUR), 18);
             // Wrong direction: `-EBADF`; a directory: `-EISDIR`.
             let rd = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
             kassert_eq!(sys_write(rd, at::reg(data), 1), neg_errno(errno::EBADF));
             kassert_eq!(sys_read(app, at::reg(out), 1), neg_errno(errno::EBADF));
-            kassert_eq!(sys_read(rd, at::reg(out), 32), 17);
-            let mut all = [0u8; 17];
+            kassert_eq!(sys_read(rd, at::reg(out), 32), 18);
+            let mut all = [0u8; 18];
             copy_from_user(&mut all, out).map_err(|_| "copy out")?;
-            kassert_eq!(&all, b"hello worldABCDEA");
+            kassert_eq!(&all, b"hello worldABCDEAB");
+            // A later span that faults: the spans before it count, and the
+            // offset moved by them alone.
+            let bad = 0xffff_8000_0000_0000u64;
+            kassert_eq!(sys_lseek(rd, 0, general::SEEK_SET), 0);
+            kassert_eq!(sys_readv(rd, ktest_iovs(iov, &[(out, 3), (bad, 4)])?, 2), 3);
+            kassert_eq!(sys_lseek(rd, 0, general::SEEK_CUR), 3);
+            kassert_eq!(sys_lseek(fd, 0, general::SEEK_SET), 0);
+            kassert_eq!(sys_writev(fd, ktest_iovs(iov, &[(data, 2), (bad, 4)])?, 2), 2);
+            kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 2);
+            // A faulting first span: `-EFAULT`.
+            kassert_eq!(sys_readv(rd, ktest_iovs(iov, &[(bad, 4), (out, 3)])?, 2), neg_errno(errno::EFAULT));
+            kassert_eq!(sys_writev(fd, ktest_iovs(iov, &[(bad, 4), (data, 2)])?, 2), neg_errno(errno::EFAULT));
             let dir = ktest_user_path(1, b"/tmp")?;
             let dir_fd = ktest_fd(sys_open(dir, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
             kassert_eq!(sys_read(dir_fd, at::reg(out), 1), neg_errno(errno::EISDIR));
             kassert_eq!(sys_read(dir_fd, at::reg(out), 0), neg_errno(errno::EISDIR));
             // A console fd's `fstat`: the console's character device.
             kassert_eq!(sys_fstat(at::reg(1), at::reg(out)), 0);
-            copy_from_user(&mut st, out).map_err(|_| "copy stat")?;
-            let st_mode = u32::from_le_bytes(st[24..28].try_into().expect("4 bytes"));
-            let st_rdev = u64::from_le_bytes(st[40..48].try_into().expect("8 bytes"));
+            let (st_mode, st_rdev, _) = ktest_stat(out)?;
             kassert_eq!(st_mode, general::S_IFCHR | 0o620);
             kassert_eq!(st_rdev, (5 << 8) | 1);
+            // `/proc/self/maps` reads through `read` (its `read_at` takes the
+            // address space's lock, so not under the offset's).
+            let maps = ktest_user_path(2, b"/proc/self/maps")?;
+            let maps_fd = ktest_fd(sys_open(maps, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
+            let n = sys_read(maps_fd, at::reg(out), 1000);
+            kassert!(n > 0 && n <= 1000);
+            kassert_eq!(sys_lseek(maps_fd, 0, general::SEEK_CUR), n);
             kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/fd-ktest-rw", false).is_ok());
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn fd_transfers_span_chunks_and_stop_at_a_fault() {
+        // More than one bounce-buffer chunk (4 KiB) each way: 10 KiB of
+        // patterned bytes written and read back whole, then a transfer whose
+        // second chunk faults returning the first chunk's 4096.
+        use crate::kassert_eq;
+        use crate::user::copy_from_user;
+        const LEN: usize = 10 * 1024;
+        process::in_test_process(|_| {
+            let buf = process::KTEST_USER_VA;
+            let last_page = buf + process::KTEST_USER_LEN - 4096;
+            let pattern: Vec<u8> = (0..LEN).map(|i| (i * 7 % 251) as u8).collect();
+            let path = ktest_user_path(3, b"/tmp/fd-ktest-big")?;
+            let flags = ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
+            let fd = ktest_fd(sys_open(path, flags, at::reg(0o644)))?;
+            copy_to_user(buf, &pattern).map_err(|_| "copy the pattern")?;
+            kassert_eq!(sys_write(fd, at::reg(buf), LEN as u64), LEN as u64);
+            copy_to_user(buf, &[0u8; LEN]).map_err(|_| "zero the buffer")?;
+            kassert_eq!(sys_lseek(fd, 0, general::SEEK_SET), 0);
+            kassert_eq!(sys_read(fd, at::reg(buf), LEN as u64), LEN as u64);
+            let mut back = alloc::vec![0u8; LEN];
+            copy_from_user(&mut back, buf).map_err(|_| "copy back")?;
+            kassert_eq!(back == pattern, true);
+            // The last mapped page, then nothing: the first chunk reaches it,
+            // the second faults.
+            kassert_eq!(sys_lseek(fd, 0, general::SEEK_SET), 0);
+            kassert_eq!(sys_read(fd, at::reg(last_page), 8192), 4096);
+            kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 4096);
+            let mut page = alloc::vec![0u8; 4096];
+            copy_from_user(&mut page, last_page).map_err(|_| "copy the page")?;
+            kassert_eq!(page[..] == pattern[..4096], true);
+            kassert_eq!(sys_write(fd, at::reg(last_page), 8192), 4096);
+            kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 8192);
+            crate::kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/fd-ktest-big", false).is_ok());
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn fd_open_relative_to_a_cwd_other_than_root() {
+        // `open` of a relative path with the cwd moved off `/`: found from
+        // the cwd (where from `/` it names nothing), created there by
+        // `O_CREAT`, and shown in `/proc/<pid>/fd` by its full path.
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::{OpenGuard, mkdir_at, unlink_at};
+        let tables = crate::vfs::tables();
+        process::in_test_process(move |pid| {
+            let dir = mkdir_at(tables, None, b"/tmp/fd-ktest-cwd", 0o755, 0).map_err(|_| "mkdir")?;
+            let guard = OpenGuard::try_new(dir).map_err(|_| "guard")?;
+            process::set_current_cwd(process::Cwd::new(guard, "/tmp/fd-ktest-cwd").map_err(|_| "cwd")?);
+            let rel = ktest_user_path(0, b"made-here")?;
+            let creat = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT);
+            let fd = ktest_fd(sys_open(rel, creat, at::reg(0o600)))?;
+            kassert!(crate::vfs::resolve_path_from_root("/tmp/fd-ktest-cwd/made-here").is_ok());
+            kassert!(crate::vfs::resolve_path_from_root("/made-here").is_err());
+            let link = lumen_vfs::readlink_at(tables, None, alloc::format!("/proc/{pid}/fd/{}", fd.raw()).as_bytes());
+            kassert_eq!(link, Ok(b"/tmp/fd-ktest-cwd/made-here".to_vec()));
+            // Again without `O_CREAT`: the same file, through `openat` too.
+            let rd = ktest_flags(OpenFlags::O_RDONLY);
+            let again = ktest_fd(sys_openat(Dirfd::Cwd, rel, rd, at::reg(0)))?;
+            let same = current_file(again)
+                .zip(current_file(fd))
+                .is_some_and(|(a, b)| alloc::sync::Arc::ptr_eq(&a.inode, &b.inode));
+            kassert!(same);
+            kassert_eq!(sys_close(fd), 0);
+            kassert_eq!(sys_close(again), 0);
+            kassert!(unlink_at(tables, None, b"/tmp/fd-ktest-cwd/made-here", false).is_ok());
+            kassert!(unlink_at(tables, None, b"/tmp/fd-ktest-cwd", true).is_ok());
             Ok(())
         })?
     }

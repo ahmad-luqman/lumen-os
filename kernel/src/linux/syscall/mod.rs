@@ -3,7 +3,9 @@
 //! `dispatch` maps each syscall number to its handler, each number in one
 //! `match` arm (its constant as the pattern, so the compiler refuses one
 //! routed twice), passing the registers of the syscall's Linux signature
-//! (an M7 handler's decoded by `at::reg` into its parameter types).
+//! (an M7 handler's, and since #254 the M6 descriptor handlers' and
+//! `getcwd`'s, decoded by `at::reg` into its parameter types; `poll` and
+//! the rest of M6 still take raw registers).
 //! The handlers live in one module per cluster, so the PRs that implement
 //! M7 (#254, #255) each change only their own module, not `dispatch`:
 //!

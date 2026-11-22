@@ -949,28 +949,20 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         .map_err(|e| format!("mmap_anon: {e}"))?;
     let space_for_thread = Arc::clone(&space);
 
-    let fd_of = Arc::new(
-        OpenFile::<KernelVfsLock<u64>>::from_opened(
-            open_inode_guarded(
-                &TABLES,
-                None,
-                b"/tmp/proc_fd_test.txt",
-                OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-                0o644,
-                0,
-            )
-            .map_err(|e| format!("open /tmp/proc_fd_test.txt: {e:?}"))?,
-        )
-        .map_err(|e| format!("open file /tmp/proc_fd_test.txt: {e:?}"))?,
-    );
-    fd_of.inode.write_at(0, b"magic-fd-bytes").map_err(|e| format!("write fd_file: {e:?}"))?;
-    let fd_file = Arc::clone(&fd_of);
+    let fd_file = process::open_kernel_file(
+        b"/tmp/proc_fd_test.txt",
+        OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC,
+        0o644,
+    )
+    .map_err(|e| format!("open /tmp/proc_fd_test.txt: {e:?}"))?;
+    fd_file.inode.write_at(0, b"magic-fd-bytes").map_err(|e| format!("write fd_file: {e:?}"))?;
+    let stdio = process::Stdio::open().map_err(|e| format!("open the process's stdio: {e:?}"))?;
 
     let result: Arc<SleepMutex<Option<Result<String, String>>>> = Arc::new(SleepMutex::new(None));
     let res_clone = Arc::clone(&result);
 
     let handle = sched::spawn_user_on(0, "vfstest-proc", space_for_thread, move || {
-        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None);
+        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None, stdio);
         // `/proc/<pid>` and `/proc/<pid>/fd/3` as resolved while they exist,
         // for checking what they say once the process and fd are gone.
         let mut proc_nodes: Option<(Arc<dyn VfsInode>, Arc<dyn VfsInode>)> = None;
@@ -991,11 +983,13 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
                 return Err(String::from("/proc/self/mounts empty"));
             }
             process::set_current_exe_path("/tmp");
-            process::insert_current_fd(3, Arc::clone(&fd_file)).map_err(|e| format!("install fd 3: {e:?}"))?;
+            process::insert_current_fd(3, fd_file).map_err(|e| format!("install fd 3: {e:?}"))?;
             // procfs builds an fd's inode number from it: out-of-range fds
             // are refused.
             for bad in [-1, lumen_vfs::MAX_FDS as i32] {
-                if process::insert_current_fd(bad, Arc::clone(&fd_file)).is_ok() {
+                let null = process::open_kernel_file(b"/dev/null", OpenFlags::O_RDONLY, 0)
+                    .map_err(|e| format!("open /dev/null: {e:?}"))?;
+                if process::insert_current_fd(bad, null).is_ok() {
                     return Err(format!("fd {bad} was installed"));
                 }
             }
@@ -1068,7 +1062,6 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         // `ACTIVE_PROCS` would stay in `/proc` for good and pin its address space.
         // Not open if a check failed before fd 3 was: nothing to close then.
         let _ = process::close_current_fd(3);
-        drop(fd_file);
         let fd_link_after_close = proc_nodes.as_ref().map(|(_, fd)| fd.stat().err());
         let proc_state = process::take_current();
         // These nodes were resolved while the process lived and are still
@@ -1101,7 +1094,6 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     .map_err(|e| format!("spawn_user_on: {e:?}"))?;
 
     handle.join();
-    drop(fd_of);
     drop(space);
     let inner_res = result.lock().take().ok_or_else(|| String::from("missing thread result"))??;
     Ok(inner_res)
