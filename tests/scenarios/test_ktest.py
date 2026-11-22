@@ -208,9 +208,9 @@ VFS_EXACT_LINES = {
     # ext4_truncate_and_open_unlink_preserve_state_on_io_error
     rf"ERROR vfs: ext4 {_DEV} inode \d+: truncate failed and its tail bytes couldn't be restored on disk": 1,
     # The writeback-error ktests (reclaim, sync, full disk, failing device,
-    # a failing page among good ones).
+    # a failing page among good ones; msync's writeback error, one Io).
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 4,
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 2,
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 3,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
     # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
     # fills, a good one, a third failed fill), one warning each.
