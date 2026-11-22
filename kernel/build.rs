@@ -17,11 +17,11 @@ fn main() {
 /// Embed the WASM apps `make apps` built (the layout: ARCHITECTURE section
 /// 8, "Building and bundling") as `app::BUNDLED` and `app::TEST_APPS`, each
 /// sorted by name, each an `App { name, thread, module }` (`thread` the
-/// `app:<name>` string its thread is named with, since `sched::spawn` takes
-/// a `&'static str`). A name outside `[a-z0-9_-]`, or one in both sets,
-/// fails the build; no build/apps at all (`make lint` runs before `make
-/// build` in CI) gives empty lists, said in a warning, as does a directory
-/// that can't be read.
+/// `app:<name>` string its thread is named with, made once here; a
+/// thread's name keeps 15 bytes, `lumen_trace::ThreadName`). A name
+/// outside `[a-z0-9_-]`, or one in both sets, fails the build; no
+/// build/apps at all (`make lint` runs before `make build` in CI) gives
+/// empty lists, said in a warning, as does a directory that can't be read.
 fn embed_apps(apps: &Path) {
     println!("cargo:rerun-if-changed={}", apps.display());
     println!("cargo:rerun-if-changed={}", apps.join("tests").display());

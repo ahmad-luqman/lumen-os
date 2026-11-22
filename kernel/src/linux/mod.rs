@@ -697,11 +697,12 @@ crate::ktest!(
                 crate::sched::yield_now();
             }
         }
-        // The process's thread as the scheduler lists it, while it spins.
-        let thread = seen
-            .as_ref()
-            .and_then(|&(pid, _, _)| process_thread_id(pid))
-            .and_then(|ktid| crate::sched::threads().into_iter().find(|t| t.id == ktid));
+        // The process's thread's row in `threads`' table (thread, id, ...),
+        // while it spins.
+        let row = seen.as_ref().and_then(|&(pid, _, _)| process_thread_id(pid)).and_then(|ktid| {
+            let id = crate::shell::sysinfo::int(ktid);
+            crate::shell::sysinfo::thread_table().rows().iter().find(|r| r.get(1) == Some(&id)).cloned()
+        });
         // Let it exit whatever was seen, so the threads always end.
         let released = match seen.as_ref().and_then(|(_, _, space)| space.clone()) {
             Some(space) => {
@@ -715,8 +716,8 @@ crate::ktest!(
         let (pid, path, _) = seen.ok_or("the process never registered")?;
         kassert!(released);
         kassert_eq!(path.as_deref(), Some(PATH));
-        let thread = thread.ok_or("the process's thread isn't listed")?;
-        kassert_eq!(thread.name.as_str(), "lumen-ktest-spi");
+        let row = row.ok_or("the process's thread isn't in `threads`")?;
+        kassert_eq!(row.first(), Some(&crate::shell::sysinfo::text("lumen-ktest-spi")));
         kassert!(matches!(ran, Some(Ok((UserExit::Exited(0), _)))));
         kassert_eq!(process_exe_path(pid), None);
         Ok(())

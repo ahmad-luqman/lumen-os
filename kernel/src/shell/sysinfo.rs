@@ -715,7 +715,8 @@ pub fn threads(ctx: &mut Ctx<'_>, args: &[String]) {
     emit(ctx, &t);
 }
 
-fn thread_table() -> pipe::Table {
+/// `threads`' table (the linux path ktest reads a binary's thread's row).
+pub(crate) fn thread_table() -> pipe::Table {
     const COLUMNS: [Column; 5] = [
         Column::new("thread", Kind::Text, Align::Left, 16),
         Column::new("id", Kind::Int, Align::Right, 2),

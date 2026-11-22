@@ -54,9 +54,16 @@ impl ThreadName {
     /// The name's text.
     pub fn as_str(&self) -> &str {
         let len = self.0.iter().position(|&b| b == 0).unwrap_or(self.0.len());
+        let bytes = &self.0[..len];
         // `new` copies a prefix of a `&str` that ends on a character
-        // boundary, replacing only ASCII bytes with ASCII.
-        core::str::from_utf8(&self.0[..len]).expect("a ThreadName holds UTF-8")
+        // boundary, replacing only ASCII bytes with ASCII, so this is
+        // always UTF-8. Never a panic, though: the crash reporter prints
+        // the name of the thread that crashed, whose memory a wild write
+        // may have hit (then the valid prefix).
+        match core::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => core::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or_default(),
+        }
     }
 }
 
@@ -66,15 +73,17 @@ impl From<&str> for ThreadName {
     }
 }
 
+/// Compared as a name made from `other` (cut by the same rule): a thread
+/// spawned as `"sleep-mutex-waiter"` is found by that literal.
 impl PartialEq<str> for ThreadName {
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        *self == Self::new(other)
     }
 }
 
 impl PartialEq<&str> for ThreadName {
     fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
+        *self == Self::new(other)
     }
 }
 
@@ -121,8 +130,12 @@ mod tests {
         let name = "abcdefghijklmné";
         assert_eq!(name.len(), 16);
         assert_eq!(ThreadName::new(name).as_str(), "abcdefghijklmn");
+        // None of its bytes are kept (not a stray lead byte `as_str` would
+        // skip): the name is the same one.
+        assert_eq!(ThreadName::new(name), ThreadName::new("abcdefghijklmn"));
         // A 4-byte character straddling byte 15 (bytes 12..16) goes too.
         assert_eq!(ThreadName::new("abcdefghijkl🦀x").as_str(), "abcdefghijkl");
+        assert_eq!(ThreadName::new("abcdefghijkl🦀x"), ThreadName::new("abcdefghijkl"));
         // One ending exactly at byte 15 stays.
         assert_eq!(ThreadName::new("abcdefghijk🦀xyz").as_str(), "abcdefghijk🦀");
         // Under 15 bytes, multibyte names are kept whole.
@@ -164,5 +177,20 @@ mod tests {
         assert_ne!(ThreadName::new("idle"), ThreadName::new("idl"));
         assert!(ThreadName::new("idle") == "idle");
         assert!(ThreadName::new("idle") != "idl");
+        assert!(ThreadName::new("idl") != "idle");
+        // A literal is cut as the name was.
+        assert!(ThreadName::new("sleep-mutex-waiter") == "sleep-mutex-waiter");
+        assert!(ThreadName::new("sleep-mutex-waiter") == "sleep-mutex-wai");
+        assert!(ThreadName::new("sleep-mutex-wai") != "sleep-mutex-wa");
+    }
+
+    #[test]
+    fn a_corrupted_name_reads_as_its_valid_prefix() {
+        // Only a wild write makes one (`new` never does): read, not a panic.
+        let mut n = ThreadName::new("abcdef");
+        n.0[3] = 0xff;
+        assert_eq!(n.as_str(), "abc");
+        n.0[0] = 0x80;
+        assert_eq!(n.as_str(), "");
     }
 }

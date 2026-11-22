@@ -120,7 +120,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Per-thread names (#276): a thread's name is a `ThreadName`, 16 bytes inline like Linux's `comm` (no heap; at most 15 bytes, cut at a character boundary, ASCII control characters as `?`, padded like a `&str`); a binary run by path (`linux /path`) runs on a thread named after the path's last component (cut to 15 bytes), as `sched::threads()` lists it for `threads`, not `linux`"
+name = "Per-thread names (#276): a thread's name is a `ThreadName`, 16 bytes inline like Linux's `comm` (no heap; at most 15 bytes, cut at a character boundary, ASCII control characters as `?`, padded like a `&str`); a binary run by path (`linux /path`) runs on a thread named after the path's last component (cut to 15 bytes), as the shell's `threads` table lists it, not `linux`"
 milestone = "M7"
 tests = [
     "cargo:lumen-trace",
