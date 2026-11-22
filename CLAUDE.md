@@ -742,7 +742,10 @@ one is its own PR that updates that doc first.
   per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, and
   `llvm-readobj` dynamic musl ELF checks).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
-  assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, `libm7.so`).
+  assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, `libm7.so`;
+  `m7_vfs`, #254's exit scenarios' program: `posix`, `locks`, and
+  `lock-hold`/`lock-probe`, two processes at once, every check a raw syscall
+  by number).
 - `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests
   (incl. `test_rootfs.py`),
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs

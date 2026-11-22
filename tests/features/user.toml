@@ -202,3 +202,24 @@ tests = [
     "ktest:lumen_kernel::linux::exec::dynamic_elf_maps_interp_and_sets_auxv",
     "ktest:lumen_kernel::vfs::tests::vfs_tmpfs_quota_rmdir_maps_heap_and_procfs_parsing",
 ]
+
+[[feature]]
+name = "M7's 49 POSIX VFS syscall numbers and its ABI's flags and struct layouts (statx, flock, linux_dirent64) pinned against linux-raw-sys (#254)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::m7_abi_constants_match_spec",
+]
+
+[[feature]]
+name = "POSIX file semantics from ring 3 (#254): a dynamic musl program on the Alpine rootfs (m7_vfs posix) on ext4 and tmpfs: symlinks and ELOOP (a loop, 40 links followed and 41 not, O_NOFOLLOW), a trailing slash following a final symlink under O_NOFOLLOW, O_PATH descriptors (-EBADF for I/O, fstat, a dirfd, readlinkat of a link), hard links and linkat AT_SYMLINK_FOLLOW, unlink and rmdir while open, getdents64 (d_type, d_ino as lstat's, a small buffer's cursor, a moved directory's ..), pread64/pwrite64 leaving the offset alone, stat/lstat/newfstatat/statx agreeing, chmod/chown/umask/utimensat (UTIME_NOW, UTIME_OMIT, a NULL path, a link), chdir/fchdir/getcwd (through a link, a renamed and a removed cwd), -EXDEV between tmpfs and ext4, -ENOTTY from a tty ioctl on a file; no frame leaked"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_posix_vfs_semantics",
+]
+
+[[feature]]
+name = "Advisory locks and atomic renames from ring 3 (#254): flock between two open file descriptions in one process (-EWOULDBLOCK, a dup sharing its lock, released by LOCK_UN and the description's last close, not a dup's), renameat2 RENAME_NOREPLACE (-EEXIST) and RENAME_EXCHANGE, rename over an open file (the descriptor reading the old data) on ext4 and tmpfs; fcntl record locks seen by a second process running meanwhile (F_GETLK's type, range and the holder's pid, F_SETLK -EAGAIN): a range split by an unlock, coalesced by a relock, and released by closing any descriptor of the file"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_flock_and_atomic_rename",
+]

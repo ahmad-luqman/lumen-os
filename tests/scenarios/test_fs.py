@@ -3,8 +3,10 @@
 import re
 
 from lumen_harness.calibration import assert_quiet_boot
+from lumen_harness.gui import confirmed_keys, type_confirmed
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
 from lumen_harness.rootfs import copy_rootfs, e2fsck_check
+from lumen_harness.screen import expect_screen
 from lumen_harness.shell import PROMPT, run
 
 SHELLS = r"INFO  shell: shells? on serial.*; type 'help'\n"
@@ -256,3 +258,150 @@ def test_unmountable_ext4_disk_warns_and_falls_back(boot, tmp_path):
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
     m.close()
+
+
+# tools/linux-m7/m7_vfs.rs (built into build/linux/, so tools/mkrootfs.sh
+# puts it in the rootfs's /usr/local/bin): it prints `ok <check>` for each
+# check passed, and `FAIL <check>: ...` for the first that isn't.
+M7_VFS = "/usr/local/bin/m7_vfs"
+EXIT_LINE = rf"linux: {M7_VFS} exit=(\d+) leaked_frames=(-?\d+)"
+
+
+def run_m7_vfs(m, args, oks, timeout=60):
+    """Run `m7_vfs <args>` from the serial shell: it prints exactly `oks`
+    (each line `ok <oks[i]>`), in order, and exits 0; its leaked_frames."""
+    out = run(m, f"linux {M7_VFS} {args}", timeout)
+    lines = out.splitlines()
+    ended = re.fullmatch(EXIT_LINE, lines[-1]) if lines else None
+    assert ended, out
+    assert lines[:-1] == [f"ok {c}" for c in oks], out
+    assert ended[1] == "0", out
+    return int(ended[2])
+
+
+def m7_vfs(m, args, checks):
+    """`run_m7_vfs` twice: the second run leaks no frame. Every file it
+    writes it removes, so the page cache keeps none of their pages; the
+    first run may grow caches the kernel keeps (the block cache's slots,
+    the heap), so its count isn't checked."""
+    run_m7_vfs(m, args, checks)
+    assert run_m7_vfs(m, args, checks) == 0
+
+
+POSIX_CHECKS = [
+    "setup",
+    "symlinks-and-eloop",
+    "trailing-slash-nofollow",
+    "o-path",
+    "hard-links",
+    "unlink-while-open-ext4",
+    "unlink-while-open-tmpfs",
+    "rmdir-while-open",
+    "getdents64",
+    "pread64-pwrite64",
+    "stat-lstat-newfstatat-statx",
+    "chmod-chown-umask-utimensat",
+    "chdir-fchdir-getcwd",
+    "exdev-and-enotty",
+    "cleanup",
+]
+
+
+def test_posix_vfs_semantics(boot, tmp_path):
+    """#254's POSIX file syscalls from ring 3, by a dynamic musl program on
+    the Alpine rootfs (`m7_vfs posix`, each check's details in
+    tools/linux-m7/m7_vfs.rs), on ext4 (`/m7v`) and tmpfs (`/tmp/m7v`):
+    symlinks and ELOOP (a loop, 40 links followed and 41 not, O_NOFOLLOW),
+    a trailing slash following a final symlink under O_NOFOLLOW, O_PATH
+    descriptors, hard links and linkat's AT_SYMLINK_FOLLOW, unlink and
+    rmdir while open, getdents64 (types, d_ino, a small buffer's cursor, a
+    moved directory's ".."), pread64/pwrite64 leaving the offset alone,
+    stat/lstat/newfstatat/statx agreeing, chmod/chown/umask/utimensat
+    (UTIME_NOW, UTIME_OMIT, a NULL path, a link), chdir/fchdir/getcwd
+    (through a link, a renamed and a removed cwd), EXDEV between the two
+    filesystems and ENOTTY from a tty ioctl on a file. It removes what it
+    made (a second run leaks no frame); the disk then passes e2fsck."""
+    disk = copy_rootfs(tmp_path)
+    m = shell(boot, devices=Devices(blk_image=disk, rng=True))
+    m7_vfs(m, "posix /m7v /tmp/m7v", POSIX_CHECKS)
+    assert run(m, "vfstest stat /m7v") == "stat: NoEnt\n"
+    assert run(m, "sync") == "sync: ok\n"
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    m.close()
+    e2fsck_check(disk)
+
+
+LOCKS_CHECKS = [
+    "setup",
+    "flock-open-file-descriptions",
+    "renameat2-noreplace",
+    "renameat2-exchange",
+    "rename-over-an-open-file",
+    "cleanup",
+]
+
+
+def test_flock_and_atomic_rename(boot, tmp_path):
+    """#254's advisory locks and renames from ring 3. `m7_vfs locks`, on
+    ext4 and on tmpfs: flock between two open file descriptions of one
+    file in one process (EWOULDBLOCK, a dup sharing its description's lock,
+    released by LOCK_UN and by the description's last close, not a dup's),
+    renameat2's RENAME_NOREPLACE (EEXIST) and RENAME_EXCHANGE, and rename
+    over an open file (the descriptor keeps reading the old data, the name
+    the new). Then fcntl record locks between two processes:
+    `m7_vfs lock-hold`, typed on virtual terminal 2, takes a step per key
+    (a write lock on [0,100) and a read lock on [200,210), unlocking
+    [40,60), locking it again, closing another descriptor of the file it
+    opened, locking [0,100) again, exiting), and after each
+    `m7_vfs lock-probe`, run from serial, checks F_GETLK's answer (type,
+    range, the holder's pid) and that F_SETLK conflicts (EAGAIN): the split
+    into two ranges, their coalescing into one, the release by closing any
+    descriptor, and by the exit. (Two processes at once: their
+    `leaked_frames` count each other's frames, so only the single-process
+    runs' are checked.)"""
+    disk = copy_rootfs(tmp_path)
+    m = shell(boot, devices=Devices(blk_image=disk, rng=True))
+    for d in ("/m7lk", "/tmp/m7lk"):
+        m7_vfs(m, f"locks {d}", LOCKS_CHECKS)
+
+    confirmed_keys(m, ["alt", "f2"])
+    expect_screen(m, r"\Alumen>\s*\Z")
+    type_confirmed(m, f"linux {M7_VFS} lock-hold /m7.lock\n")
+    pid = int(expect_screen(m, r"^hold: pid=(\d+) ready$", 30)[1])
+
+    def step(name, *probes):
+        # A key (confirmed reaching the keyboard's queue), then the holder's
+        # line for the step it took, then the probes.
+        confirmed_keys(m, "n")
+        expect_screen(m, rf"^hold: {name}$", 20)
+        # Two processes at once: their frame counts overlap.
+        run_m7_vfs(
+            m, f"lock-probe /m7.lock {pid} {' '.join(probes)}", [f"probe {p}" for p in probes]
+        )
+
+    # `<t><start>+<len>=<expect>`: F_GETLK for a `<t>` (r/w) lock on that
+    # range (`+0`: to the end) sees `unlck` or the holder's lock.
+    step(
+        "locked",
+        "w0+0=w0+100",
+        "r50+1=w0+100",
+        "w100+100=unlck",
+        "r200+10=unlck",
+        "w150+100=r200+10",
+    )
+    step("split", "w0+0=w0+40", "w40+20=unlck", "r50+100=w60+40", "w45+10=unlck")
+    step("coalesced", "w0+0=w0+100", "w45+10=w0+100", "w99+1=w0+100")
+    step("released", "w0+0=unlck", "w0+300=unlck")
+    step("relocked", "w0+0=w0+100")
+    # It exits holding [0,100), which its exit gives up.
+    confirmed_keys(m, "n")
+    expect_screen(m, rf"^hold: done\nlinux: {M7_VFS} exit=0 leaked_frames=-?\d+$", 20)
+    run_m7_vfs(m, f"lock-probe /m7.lock {pid} w0+0=unlck", ["probe w0+0=unlck"])
+    assert run(m, "vfstest unlink /m7.lock") == "unlink: ok\n"
+
+    assert run(m, "sync") == "sync: ok\n"
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    m.close()
+    e2fsck_check(disk)

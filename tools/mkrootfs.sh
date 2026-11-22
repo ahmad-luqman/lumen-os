@@ -96,10 +96,12 @@ if [[ -f "$STAGE/usr/local/lib/libm7.so" ]]; then
     PYTHONPATH="$ROOT/tools/harness" uv run --frozen --project "$ROOT" \
         python -m lumen_harness.rootfs "$STAGE/usr/local/lib/libm7.so" --rootfs-dir "$STAGE" --no-interp
 fi
-if [[ -f "$STAGE/usr/local/bin/m7_test" ]]; then
-    PYTHONPATH="$ROOT/tools/harness" uv run --frozen --project "$ROOT" \
-        python -m lumen_harness.rootfs "$STAGE/usr/local/bin/m7_test" --rootfs-dir "$STAGE"
-fi
+for bin in m7_test m7_vfs; do
+    if [[ -f "$STAGE/usr/local/bin/$bin" ]]; then
+        PYTHONPATH="$ROOT/tools/harness" uv run --frozen --project "$ROOT" \
+            python -m lumen_harness.rootfs "$STAGE/usr/local/bin/$bin" --rootfs-dir "$STAGE"
+    fi
+done
 
 # Normalize staged entry mtimes bottom-up (E2FSPROGS_FAKE_TIME does not rewrite `-d` mtimes).
 find "$STAGE" -depth -print0 | xargs -0 env TZ=UTC0 touch -h -t "$FIXED_TOUCH_TS"

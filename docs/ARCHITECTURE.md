@@ -7408,7 +7408,14 @@ test server:
   entry resolves inside the staged rootfs (no stray `libgcc_s.so.1` or
   `libc.so.6`). The M7 sources in `tools/linux-m7/` are formatted and checked
   by `Makefile`'s `fmt` and `fmt-check` targets alongside
-  `tools/linux-hello/hello.rs`.
+  `tools/linux-hello/hello.rs`. `m7_vfs` (#254) is the POSIX VFS exit
+  scenarios' program (`tests/scenarios/test_fs.py`): it calls the kernel by
+  syscall number (inline `syscall`, raw `-errno`), so each check is about the
+  syscall it names, not a libc wrapper's choice; musl only starts and ends
+  it. Its modes: `posix` and `locks` (one `ok <check>` line per check, the
+  first failure named, exiting with its number), and `lock-hold` (record
+  locks taken a step per byte read from its terminal) with `lock-probe`
+  (`F_GETLK`/`F_SETLK` from a second process meanwhile).
 - **Rootless deterministic `ext4` assembly (`tools/mkrootfs.sh`, `make rootfs`):**
   assembles `build/deps/alpine-minirootfs/` + `build/linux/*` into
   **`build/alpine-rootfs.ext4`** (kept outside `build/deps/` so `actions/cache`

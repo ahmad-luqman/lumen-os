@@ -94,3 +94,11 @@ tests = [
     "ktest:lumen_kernel::vfs::page_cache::mmap_page_refuses_inodes_of_other_filesystems",
     "ktest:lumen_kernel::vfs::page_cache::mapped_page_copies_to_a_frame_under_the_cache_lock",
 ]
+
+[[feature]]
+name = "ext4 rootfs fsck-clean after Linux programs' file syscalls (#254): symlinks, hard links, unlink and rmdir while open, renames over open files, RENAME_EXCHANGE of a file and a directory, metadata changes and record locks from ring 3, then sync"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_posix_vfs_semantics",
+    "scenario:test_fs::test_flock_and_atomic_rename",
+]
