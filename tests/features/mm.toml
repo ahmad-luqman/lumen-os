@@ -151,3 +151,10 @@ tests = [
     "ktest:lumen_kernel::mm::user_vm::file_vm_refused_page_is_a_bus_error_warned_once_per_streak",
     "ktest:lumen_kernel::vfs::page_cache::mapped_page_copies_to_a_frame_under_the_cache_lock",
 ]
+
+[[feature]]
+name = "File-backed mmap from ring 3 (#255): a dynamic musl program's MAP_SHARED mapping agrees with pread and pwrite both ways; MAP_PRIVATE stores stay the mapping's (the file and a shared mapping unchanged, a later pwrite not reaching the copied page); an O_RDONLY descriptor's MAP_SHARED mapping refused PROT_WRITE (mmap and mprotect EACCES) where a private one may become writable; ftruncate shrinking a mapped file unmaps the page past the new end (regrown, it reads zeroes through the mapping), and touching a mapped page truncated away is a bus error (exit 135, cr2 that page, its frame freed); every other run leaks zero frames"
+milestone = "M7"
+tests = [
+    "scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen",
+]

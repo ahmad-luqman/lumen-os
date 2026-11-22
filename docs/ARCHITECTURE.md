@@ -3709,7 +3709,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
   `pwd`, `export`, arithmetic, loops, and `exit` over serial without job
   control). Interactive `lineedit`, pipes, and external subprocesses require
   `fork`/`pipe`/`dup2`/`wait4`/PTYs and arrive in M8.
-- **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`; the loader built in #255, designed in #246; file-backed mappings and `dlopen` still designed, M7):**
+- **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`; designed in #246, built in #255 with file-backed mappings; `dlopen` of `libm7.so` checked by `test_linux_user::test_dynamic_musl_binary_and_dlopen`, M7):**
   - **`crates/lumen-elf` parser extension:** `LoadedElf::parse_with_pie_base(image, pie_base)`
     accepts an optional `PT_INTERP` header (at most one; rejects duplicate
     `PT_INTERP`, `p_filesz <= 1` (empty or NUL-only), `p_filesz > PATH_MAX`,
@@ -3763,8 +3763,11 @@ corresponding `*at(AT_FDCWD, ...)` handler):
   - **M7 scope for Alpine minirootfs:** M7 executes unmodified dynamic Alpine
     `/bin/busybox` directly (`ls`, `cp`, `mv`, `grep`, `sed`, `awk`,
     uncompressed `tar -cf/-xf`, and built-ins-only `ash -s`) plus dynamic
-    `dlopen`/`dlsym` test binaries via `linux /path/to/bin [args...]`. Multi-command
-    `ash` scripts, shell redirections (`dup`/`dup2`), and pipelines arrive in M8.
+    `dlopen`/`dlsym` test binaries via `linux /path/to/bin [args...]`, one
+    applet per `linux` line (`test_alpine::test_alpine_minirootfs_coreutils`;
+    `tools/linux-m7/m7_test.rs` with `libm7.so` for `dlopen` and file `mmap`
+    from ring 3). Multi-command `ash` scripts, shell redirections
+    (`dup`/`dup2`), and pipelines arrive in M8.
 
 ### Capabilities and sandboxing (WASM M5; Linux namespaces M11)
 
@@ -7438,8 +7441,9 @@ test server:
   and never writes journal transactions; note `-E root_owner=0:0` owns `/` as
   `0:0` while `-d` staged files inherit host UID/GID, so tests should not assert
   `st_uid == 0` on pre-populated staging files unless explicitly normalized). `e2fsck -fn` validates every freshly
-  built image and every guest-mutated disk image in `test_fs.py` after QEMU
-  exits.
+  built image and every guest-mutated disk image in `test_fs.py`,
+  `test_linux_user.py::test_dynamic_musl_binary_and_dlopen` and
+  `test_alpine.py` after QEMU exits.
 - **Parallel scenario isolation:** `test_blk.py` uses per-test blank scratch
   disks via `Devices(blk_mib=...)` (with `VIRTIO_BLK_F_RO` host-tested in
   `cargo:lumen-bcache` and optionally scenario-tested via a `Devices.blk_readonly`
