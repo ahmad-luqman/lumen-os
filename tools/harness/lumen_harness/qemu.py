@@ -166,7 +166,8 @@ def timeout_scale() -> float:
 
 # The guest's RAM (`-m`) unless set otherwise (`Machine`'s `memory`, the
 # `boot` fixture's).
-DEFAULT_MEMORY = "256M"
+DEFAULT_MEMORY_MIB = 256
+DEFAULT_MEMORY = f"{DEFAULT_MEMORY_MIB}M"
 
 
 def sets_memory(arg: str) -> bool:

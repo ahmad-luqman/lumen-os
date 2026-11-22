@@ -686,6 +686,10 @@ one is its own PR that updates that doc first.
   passed on a re-run, and the tests that failed them, from the failed jobs'
   logs through `gh`; `make census`, and weekly in the `flake-census`
   workflow's summary),
+  `app_limits.py` (#278: `lumen_app_api::limits`' `MAX_APPS`,
+  `KERNEL_RESERVE` and `APP_WORST` copied, checked against limits.rs by
+  `test_app_limits`, and `slots`, the count `run` works out from the frames
+  `mem` says the allocator owns),
   `screenshot.py` (`screenshot`'s frame read back and checked;
   `Machine.screenshot_via_serial`),
   `shell.py` (`run`: a serial command's output, the log's lines taken out

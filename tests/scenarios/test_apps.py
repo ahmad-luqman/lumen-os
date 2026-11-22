@@ -21,10 +21,11 @@ import re
 import time
 
 from lumen_harness import REPO_ROOT, gui, klog
+from lumen_harness.app_limits import MAX_APPS, MIB, SLOTS_NEED, slots
 from lumen_harness.gui import parse_records, poll
 from lumen_harness.image import assert_matches_golden
 from lumen_harness.klog import STAMP
-from lumen_harness.qemu import DEFAULT_MEMORY
+from lumen_harness.qemu import DEFAULT_MEMORY, DEFAULT_MEMORY_MIB
 from lumen_harness.screen import PROMPT
 from lumen_harness.shell import heap_line, run, wait_for_output
 
@@ -147,14 +148,6 @@ def test_busy_app_is_preempted(boot):
     wait_gone(m, busy, later["thread"])
 
 
-MIB = 1024 * 1024
-# lumen_app_api::limits's MAX_APPS, KERNEL_RESERVE and APP_WORST (a harness
-# test, test_app_limits, checks these copies against limits.rs).
-MAX_APPS = 4
-KERNEL_RESERVE = 32 * MIB
-APP_WORST = 27 * MIB + 3 * 640 * 480 * 4
-# What `MAX_APPS` slots need the frame allocator to own (`limits::slots`).
-SLOTS_NEED = KERNEL_RESERVE + MAX_APPS * APP_WORST
 # The RAM the max-apps scenario boots with (#278): the default 256M leaves
 # the frame allocator right at `SLOTS_NEED`, 384M about four more worst
 # cases past it (KERNEL_RESERVE's comment in limits.rs has the figures).
@@ -172,15 +165,15 @@ def frames_owned(m) -> int:
 
 def test_run_refuses_past_max_apps(boot):
     m = boot_shell(boot, memory=MAX_APPS_MEMORY)
-    # From what `mem` prints: more than a 256M guest could own (so
+    # From what `mem` prints: more than a default guest could own (so
     # `MAX_APPS_MEMORY` reached QEMU), and every slot; or a failure saying
     # how short it is.
     owned = frames_owned(m)
-    slots = min(max(owned - KERNEL_RESERVE, 0) // APP_WORST, MAX_APPS)
-    assert owned > 256 * MIB and slots == MAX_APPS, (
-        f"the frame allocator owns {owned / MIB:.2f} MiB: {slots} slots of {MAX_APPS} "
+    count = slots(owned)
+    assert owned > DEFAULT_MEMORY_MIB * MIB and count == MAX_APPS, (
+        f"the frame allocator owns {owned / MIB:.2f} MiB: {count} slots of {MAX_APPS} "
         f"(they need {SLOTS_NEED / MIB:.2f} MiB), and {MAX_APPS_MEMORY} should give "
-        "more than 256 MiB"
+        f"more than {DEFAULT_MEMORY_MIB} MiB"
     )
     ids = []
     for _ in range(MAX_APPS):
