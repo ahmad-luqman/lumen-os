@@ -18,10 +18,6 @@
 //!   looking the name up; `link` looks first).
 //! - `RENAME_WHITEOUT` is `-EINVAL` (Linux allows it for root on tmpfs and
 //!   ext4; there are no whiteouts here).
-//! - A name that isn't UTF-8 is `-ENOENT`, as a path component anywhere
-//!   (#268 makes names byte strings), and a symlink target that isn't
-//!   UTF-8 is `-EINVAL`: a target is stored, not looked up, and lumen-vfs
-//!   stores text.
 //!
 //! Matching Linux, and worth knowing:
 //! - A last component that isn't a name (`/`, `.`, `..`): `unlink` says
@@ -441,8 +437,10 @@ fn ktest_mkdir_and_rmdir(base: &str) -> kt::R {
     // ELOOP: through a symlink to itself.
     kt::symlink("loop", &p("loop"))?;
     kassert_eq!(sys_mkdir(up(0, &p("loop/x"))?, mode(0o755)), e(errno::ELOOP));
-    // A name that isn't UTF-8: ENOENT (until #268), nothing made.
-    kassert_eq!(sys_mkdir(kt::up_bytes(0, &[base.as_bytes(), b"/\xff"].concat())?, mode(0o755)), e(errno::ENOENT));
+    // A name that isn't UTF-8 is a name (#268): made, and removed.
+    let bad_name = [base.as_bytes(), b"/\xff"].concat();
+    kassert_eq!(sys_mkdir(kt::up_bytes(0, &bad_name)?, mode(0o755)), 0);
+    kassert_eq!(sys_rmdir(kt::up_bytes(0, &bad_name)?), 0);
 
     // `rmdir`: ENOTEMPTY (and for `..`), ENOTDIR on a file, EINVAL for `.`,
     // EBUSY for `/`, ENOENT, EFAULT, ELOOP.
@@ -523,7 +521,7 @@ fn ktest_unlink(base: &str) -> kt::R {
     kassert_eq!(sys_unlink(up(1, &p("to-d/"))?), e(errno::ENOTDIR));
     kassert!(lstat(&p("to-d")).is_ok() && lstat(&p("d")).is_ok());
     kassert_eq!(sys_unlink(up(1, &p("to-d"))?), 0);
-    // A name that isn't UTF-8 names nothing: ENOENT (until #268).
+    // A missing name that isn't UTF-8: ENOENT, as any missing name.
     kassert_eq!(sys_unlink(kt::up_bytes(1, &[base.as_bytes(), b"/\xff"].concat())?), e(errno::ENOENT));
     // EINVAL: any flag but AT_REMOVEDIR, before the path is read.
     for bad in [AtFlags::AT_SYMLINK_NOFOLLOW, AtFlags::AT_EMPTY_PATH, AtFlags::AT_REMOVEDIR | 1, 0x8000_0000] {
@@ -744,12 +742,18 @@ fn ktest_symlink_and_readlink(base: &str) -> kt::R {
     kassert_eq!(sys_symlink(ptr(BAD), up(1, &p("x"))?), e(errno::EFAULT));
     kassert_eq!(sys_symlink(up(0, "t")?, ptr(BAD)), e(errno::EFAULT));
     kassert_eq!(sys_symlinkat(up(0, "t")?, Dirfd::Fd(reg(99)), up(1, "x")?), e(errno::EBADF));
-    // Not UTF-8: a name names nothing (ENOENT, until #268); a target can't
-    // be stored (EINVAL).
+    // Bytes, UTF-8 or not (#268): a missing name is ENOENT as any other;
+    // a link at a name that isn't UTF-8 is made, and a target that isn't
+    // is stored as given.
     let bad_name = [base.as_bytes(), b"/\xff"].concat();
     kassert_eq!(sys_readlink(kt::up_bytes(0, &bad_name)?, ptr(BUF), 64), e(errno::ENOENT));
-    kassert_eq!(sys_symlink(up(0, "t")?, kt::up_bytes(1, &bad_name)?), e(errno::ENOENT));
-    kassert_eq!(sys_symlink(kt::up_bytes(0, b"t\xff")?, up(1, &p("x"))?), e(errno::EINVAL));
+    kassert_eq!(sys_symlink(up(0, "t")?, kt::up_bytes(1, &bad_name)?), 0);
+    kassert_eq!(sys_readlink(kt::up_bytes(0, &bad_name)?, ptr(BUF), 64), 1);
+    kassert_eq!(sys_unlink(kt::up_bytes(1, &bad_name)?), 0);
+    kassert_eq!(sys_symlink(kt::up_bytes(0, b"t\xff")?, up(1, &p("x"))?), 0);
+    kassert_eq!(sys_readlink(up(0, &p("x"))?, ptr(BUF), 64), 2);
+    kassert_eq!(kt::user(BUF, 2)?, b"t\xff".to_vec());
+    kassert_eq!(sys_unlink(up(1, &p("x"))?), 0);
     // ELOOP: a looping symlink reads as itself, but nothing resolves through it.
     kt::symlink("loop", &p("loop"))?;
     kassert_eq!(sys_readlink(up(0, &p("loop"))?, ptr(BUF), 64), 4);

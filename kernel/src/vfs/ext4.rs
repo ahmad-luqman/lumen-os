@@ -5477,8 +5477,10 @@ crate::ktest!(
         // A writable volume whose `d/zqxj` is renamed on disk to `ff fe x j`.
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 244)?;
         let d = m.root.mkdir(b"d", 0o755).map_err(|_| "mkdir d")?;
-        d.create(b"zqxj", 0o644).map_err(|_| "create")?.write_at(0, b"odd").map_err(|_| "write")?;
-        drop(d);
+        let f = d.create(b"zqxj", 0o644).map_err(|_| "create")?;
+        f.write_at(0, b"odd").map_err(|_| "write")?;
+        f.sync(false).map_err(|_| "sync")?;
+        drop((f, d));
         let mut img = image(&m)?;
         drop(m);
         let at = img.windows(4).position(|w| w == b"zqxj").ok_or("the entry on disk")?;
