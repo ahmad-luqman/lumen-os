@@ -16,6 +16,7 @@ extern crate alloc;
 
 pub mod cache;
 pub mod error;
+pub mod ext4;
 pub mod fd;
 pub mod fs;
 pub mod locks;
