@@ -5,7 +5,7 @@
 //! Each change goes through the inode's own setter (`VfsInode::set_mode`,
 //! `set_owner`, `set_times`, `truncate`), which updates `ctime` (and, for a
 //! truncate, `mtime`) under the inode's lock. A path is resolved through
-//! `at::start_dir`'s `Start`; a descriptor must be open, and not `O_PATH`
+//! `at::lookup`; a descriptor must be open, and not `O_PATH`
 //! (`-EBADF`). A change on a read-only mount is `-EROFS`, checked here
 //! against the mount table before the setter is asked.
 //!
@@ -20,9 +20,10 @@
 
 use alloc::sync::Arc;
 
-use lumen_vfs::{AtFlags, InodeType, ResolveFlags, SetTime, VfsCacheOps, VfsError, VfsInode};
+use lumen_vfs::{AtFlags, InodeType, SetTime, VfsCacheOps, VfsInode};
 
-use super::at::{Dirfd, Fd, Mode, UserPath, UserPtr, start_dir};
+use super::at::{self, Dirfd, Fd, Mode, UserPath, UserPtr};
+use super::fd::vfs;
 use super::finish;
 use crate::linux::errno;
 use crate::linux::process::{FileRef, with_current_mut};
@@ -31,25 +32,16 @@ use crate::sched;
 use crate::user::{CopyError, copy_from_user};
 use crate::vfs::tables;
 
-/// A VFS error as the positive errno a handler returns.
-fn vfs(e: VfsError) -> u32 {
-    e.to_errno()
-}
-
 /// The flags `fchmodat2`, `fchownat` and `utimensat` (with a path) take.
 const PATH_FLAGS: u32 = AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
 
 /// The inode `path` names from `dirfd`: `flags` checked first (anything
-/// but `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` is `-EINVAL`), its last
-/// symlink followed unless `AT_SYMLINK_NOFOLLOW`, an empty path naming
-/// `dirfd`'s file (or the cwd) only with `AT_EMPTY_PATH`.
+/// but `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` is `-EINVAL`), then the
+/// path copied in (empty only with `AT_EMPTY_PATH`) and resolved by
+/// `at::lookup`.
 fn lookup(dirfd: Dirfd, path: UserPtr, flags: AtFlags) -> Result<Arc<dyn VfsInode>, u32> {
     let flags = flags.validate(PATH_FLAGS).map_err(vfs)?;
-    let empty = flags.has_empty_path();
-    let path = UserPath::copy_in(path, empty)?;
-    let start = start_dir(dirfd, &path)?;
-    let resolve = ResolveFlags { follow_final: !flags.has_symlink_nofollow(), empty_path: empty, require_dir: false };
-    Ok(start.resolve(&path, resolve)?.inode)
+    at::lookup(dirfd, &UserPath::copy_in(path, flags.has_empty_path())?, flags)
 }
 
 /// The open file on `fd` for a change through it: `-EBADF` if it isn't
@@ -277,11 +269,11 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
 
-    use lumen_vfs::{Metadata, OpenFlags, OpenGuard, Timespec, VfsInode};
+    use lumen_vfs::{Metadata, OpenFlags, OpenGuard, ResolveFlags, Timespec, VfsInode};
     use lumen_vm::{MapPlace, Prot};
 
     use super::super::at::{self, Dirfd, Fd, UserPtr};
-    use super::super::fd::{ktest_user_path, sys_close, sys_open, sys_openat};
+    use super::super::fd::{ktest_fd, ktest_user_path, sys_close, sys_open, sys_openat};
     use super::super::neg_errno;
     use super::*;
     use crate::linux::general;
@@ -325,22 +317,18 @@ mod tests {
     fn make_file(slot: u64, path: &[u8], data: &[u8]) -> Result<UserPtr, &'static str> {
         let p = ktest_user_path(slot, path)?;
         let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-        let fd = sys_open(p, flags, at::reg(0o644));
-        if fd >= lumen_vfs::MAX_FDS as u64 {
-            return Err("create the file");
-        }
+        let fd = ktest_fd(sys_open(p, flags, at::reg(0o644)))?;
         let path = core::str::from_utf8(path).map_err(|_| "utf-8")?;
         if inode_of(path)?.write_at(0, data).map_err(|_| "write_at")? != data.len() {
             return Err("short write");
         }
-        kassert_eq!(sys_close(at::reg(fd)), 0);
+        kassert_eq!(sys_close(fd), 0);
         Ok(p)
     }
 
     /// Open `path` (already in user memory) with `flags`: the descriptor.
     fn open(path: UserPtr, flags: u32) -> Result<Fd, &'static str> {
-        let fd = sys_open(path, OpenFlags::from_bits(flags), at::reg(0));
-        if fd < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(fd)) } else { Err("open") }
+        ktest_fd(sys_open(path, OpenFlags::from_bits(flags), at::reg(0)))
     }
 
     fn symlink(target: &[u8], at: &[u8]) -> Result<(), &'static str> {
