@@ -77,7 +77,7 @@ tests = [
 ]
 
 [[feature]]
-name = "stat/lstat/newfstatat/statx and access/faccessat/faccessat2 through one dirfd resolution (AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH naming the dirfd's file, AT_NO_AUTOMOUNT and the statx sync bits ignored, statx's basic fields in stx_mask whatever was asked, root's access rules with -EROFS for W_OK on a read-only mount, -EINVAL for bad flags or modes before the path, -ENOENT/-ENOTDIR/-ELOOP/-EFAULT/-EBADF/-ENAMETOOLONG) (#254)"
+name = "stat/lstat/newfstatat/statx and access/faccessat/faccessat2 through one dirfd resolution (AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH naming the dirfd's file and a NULL path with it read as "" by newfstatat and statx, AT_NO_AUTOMOUNT and the statx sync bits ignored, statx's basic fields in stx_mask whatever was asked, root's access rules with -EROFS for W_OK on a read-only mount, -EINVAL for bad flags or modes before the path, -ENOENT/-ENOTDIR/-ELOOP/-EFAULT/-EBADF/-ENAMETOOLONG) (#254)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::syscall::stat::tests::stat_lstat_and_newfstatat_on_a_file_a_directory_and_a_symlink",
@@ -85,4 +85,5 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::stat::tests::stat_access_modes_follow_the_root_rules",
     "ktest:lumen_kernel::linux::syscall::stat::tests::stat_family_errnos",
     "ktest:lumen_kernel::linux::syscall::stat::tests::stat_handlers_take_their_registers_in_order",
+    "scenario:test_linux_user::test_busybox_file_syscalls",
 ]
