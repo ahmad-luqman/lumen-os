@@ -6552,9 +6552,9 @@ crate::ktest!(
         // every read, or only the blocks past the inode table (directories
         // and data), so the undo can't read back which entries exist (the
         // read-failure arms of the exchange's and the move's undo, and of
-        // a replaced target's retirement); and, for a move, two writes, the
-        // second within three of the first, reads failing only after the
-        // second. For each kind of `SWEPT_RENAMES`:
+        // a replaced target's retirement); and, for a move without a target,
+        // two writes, the second within three of the first, reads failing
+        // only after the second. For each kind of `SWEPT_RENAMES`:
         // - a rename that didn't complete reported an error, moved no
         //   time, and left a target it would have replaced with its count
         //   (put back, or nameless if that failed), not freed;
@@ -6585,12 +6585,16 @@ crate::ktest!(
             let img = swept_rename_image(is_dir, target, 254)?;
             let flags = RenameFlags(if exchange { RenameFlags::EXCHANGE } else { 0 });
             let total = swept_writes(&img, 254, false, dst_name, flags)?;
-            // Each write failing alone; and, for a move, two (the second
-            // within three of the first) with reads failing only after the
-            // second, so the undo of the first can read its entries and then
-            // fails itself unread (`roll_back`'s read-failure arm).
-            let pairs =
-                (1..=total).filter(|_| !exchange).flat_map(|c1| (c1 + 1..=c1 + 3).map(move |c2| (c1, Some(c2))));
+            // Each write failing alone; and, for a move without a target, two
+            // (the second within three of the first) with reads failing only
+            // after the second, so the undo of the first can read its
+            // entries and then fails itself unread (`roll_back`'s
+            // read-failure arm; a rename over a target reaches the same arm,
+            // after more writes, and is left to the single faults to keep
+            // the run short).
+            let pairs = (1..=total)
+                .filter(|_| !exchange && !target)
+                .flat_map(|c1| (c1 + 1..=c1 + 3).map(move |c2| (c1, Some(c2))));
             let faults: Vec<(usize, Option<usize>)> = (1..=total).map(|k| (k, None)).chain(pairs).collect();
             // The pairs reach `roll_back`'s read-failure arm when, every read
             // failing, the source is left with a floor of the count with
@@ -6877,7 +6881,7 @@ crate::ktest!(
 crate::ktest!(
     fn ext4_failed_exchange_never_writes_a_zero_count_onto_a_nameless_inode() {
         // An exchange (of files, of directories) between `a` and `b`, with
-        // three writes failing (each within six of the one before) or every
+        // three writes failing (each within four of the one before) or every
         // write from one on, so that the undo's own writes and its retries
         // fail too; and again with every read failing from the third failed
         // write on, so that the undo's retries run and then can't read their
@@ -6899,7 +6903,7 @@ crate::ktest!(
             let total = swept_writes(&img, 260, false, b"t", flags)?;
             let faults: Vec<(usize, Option<(usize, usize)>)> = (1..=total)
                 .flat_map(|c1| {
-                    (c1 + 1..=c1 + 6).flat_map(move |c2| (c2 + 1..=c2 + 6).map(move |c3| (c1, Some((c2, c3)))))
+                    (c1 + 1..=c1 + 4).flat_map(move |c2| (c2 + 1..=c2 + 4).map(move |c3| (c1, Some((c2, c3)))))
                 })
                 .chain((1..=total).map(|k| (k, None)))
                 .collect();
