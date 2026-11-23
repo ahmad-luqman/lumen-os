@@ -102,7 +102,11 @@ impl NlinkBounds {
         self.bounds.insert(ino, pin) != Some(pin)
     }
 
-    /// Drop `ino`'s floor, keeping a ceiling.
+    /// Drop `ino`'s floor, keeping a ceiling: even one below the floor
+    /// that just landed on disk, which [`Self::apply`] then still caps to
+    /// (unlike [`Self::raise_floor`], which drops such a ceiling). As the
+    /// two maps this replaced did. The kernel's floors come from counts
+    /// with the bounds applied, so none is known to land above a ceiling.
     pub fn clear_floor(&mut self, ino: u32) {
         if let Some(bound) = self.bounds.get_mut(&ino) {
             bound.floor = 0;

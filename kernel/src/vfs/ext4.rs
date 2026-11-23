@@ -680,6 +680,69 @@ impl Ext4FsInner {
         self.nlink.clear(disk_ino);
     }
 
+    /// `disk`'s count with its bounds applied, as ext4 stores it
+    /// ([`links_u16`]).
+    fn bounded_links(&self, disk: &Inode) -> u16 {
+        links_u16(self.apply_nlink_bounds(disk.index.get(), u32::from(disk.links_count())))
+    }
+
+    /// Put `links`, `disk`'s count with its bounds applied, on disk before
+    /// an operation changes it, if the disk holds another; its bounds are
+    /// cleared once that lands.
+    fn store_bounded_links(&mut self, disk: &mut Inode, links: u16) -> Result<(), VfsError> {
+        if disk.links_count() != links {
+            disk.set_links_count(links);
+            disk.write(&self.ext4).map_err(map_ext4_err)?;
+            self.clear_nlink_bounds(disk.index.get());
+        }
+        Ok(())
+    }
+
+    /// A `Dir::link` of `dname` into `dir` failed, after raising `ino`'s
+    /// count from `before` maybe: if the entry isn't there, that count goes
+    /// back ([`Self::write_links_or_pin`]); if it is, the link landed and the
+    /// count stands; if the directory can't be read back, at least `before`
+    /// is kept ([`Self::record_nlink_floor`]).
+    fn undo_failed_link(&mut self, dir: NonZeroU32, dname: DirEntryName<'_>, ino: NonZeroU32, before: u32) {
+        match dir_entry_absent(&self.ext4, dir, dname) {
+            Ok(true) => {
+                let _ = self.write_links_or_pin(ino, links_u16(before));
+            }
+            Ok(false) => {}
+            Err(_) => self.record_nlink_floor(ino.get(), before),
+        }
+    }
+
+    /// Take the `..` link of a directory that left `parent_ino` (removed,
+    /// replaced by a rename, or moved to another parent) off its count on
+    /// disk (its bounds applied first): cleared once written, pinned in
+    /// memory when the write fails. When the parent can't be read,
+    /// `if_unread` (a count from memory) is pinned instead, if given.
+    /// Returns the count for memory and the error.
+    fn remove_dotdot_link(
+        &mut self,
+        parent_ino: NonZeroU32,
+        if_unread: Option<u32>,
+    ) -> (Option<u32>, Option<VfsError>) {
+        let mut parent = match Inode::read(&self.ext4, parent_ino) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(p) = if_unread {
+                    self.set_nlink_exact(parent_ino.get(), p);
+                }
+                return (if_unread, Some(map_ext4_err(e)));
+            }
+        };
+        let p_new = self.apply_nlink_bounds(parent_ino.get(), u32::from(parent.links_count())).saturating_sub(1);
+        parent.set_links_count(links_u16(p_new));
+        if let Err(e) = parent.write(&self.ext4) {
+            self.set_nlink_exact(parent_ino.get(), p_new);
+            return (Some(p_new), Some(map_ext4_err(e)));
+        }
+        self.clear_nlink_bounds(parent_ino.get());
+        (Some(p_new), None)
+    }
+
     /// `disk_ino`'s inode was freed on disk: forget it and its bounds.
     fn forget_freed(&mut self, disk_ino: u32) {
         self.live_inodes.remove(&disk_ino);
@@ -965,9 +1028,7 @@ impl FileSystem for Ext4FileSystem {
         let live = self.snapshot_live();
         let mut first_err: Option<VfsError> = None;
         for inode in live {
-            if inode.is_detached() {
-                continue;
-            }
+            // A detached inode returns before it locks or reads anything.
             if let Err(e) = inode.flush_to_ext4(false) {
                 warn!(target: "vfs", "sync: ext4 {:?} inode {}: {e:?}", self.shared.dev, inode.disk_ino);
                 first_err.get_or_insert(e);
@@ -1719,12 +1780,8 @@ impl Ext4Inode {
         let mut child_disk = Inode::read(&inner.ext4, child_arc.disk_inode_index()).map_err(map_ext4_err)?;
         let effective_nlink =
             inner.apply_nlink_bounds(child_arc.disk_ino, u32::from(child_disk.links_count()).max(child_nlink));
-        let effective_u16 = u16::try_from(effective_nlink).unwrap_or(u16::MAX);
-        if child_disk.links_count() != effective_u16 {
-            child_disk.set_links_count(effective_u16);
-            child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-            inner.clear_nlink_bounds(child_arc.disk_ino);
-        }
+        let effective_u16 = links_u16(effective_nlink);
+        inner.store_bounded_links(&mut child_disk, effective_u16)?;
         let (child_disk, saved_inline) =
             Self::zero_inline_symlink_before_unlink(inner, child_arc.disk_ino, child_disk, effective_nlink)?;
         match parent_dir.unlink(dname, child_disk) {
@@ -1734,10 +1791,7 @@ impl Ext4Inode {
             }
             Err(e) => {
                 let err = map_ext4_err(e);
-                let probe = Inode::read(&inner.ext4, parent_ino)
-                    .and_then(|p| Dir::open_inode(&inner.ext4, p))
-                    .and_then(|d| d.get_entry(dname));
-                match probe {
+                match entry_at(&inner.ext4, parent_ino, dname) {
                     Ok(entry) if entry.index.get() == child_arc.disk_ino => {
                         if let Some(saved) = saved_inline {
                             saved.restore(inner, child_arc.disk_ino);
@@ -1751,14 +1805,8 @@ impl Ext4Inode {
                         // `free_inode` failed, so the inode may already be
                         // freed: don't restore `saved_inline` or write
                         // `effective_nlink` onto it unless a link survives.
-                        let remaining = if effective_nlink > 1 {
-                            match Inode::read(&inner.ext4, child_arc.disk_inode_index()) {
-                                Ok(cur) if cur.links_count() > 0 => Some(cur),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        };
+                        let remaining =
+                            surviving_inode(&inner.ext4, child_arc.disk_inode_index(), false, effective_nlink);
                         let remaining_nlink =
                             inner.after_entry_gone(child_arc.disk_ino, effective_nlink, remaining.as_ref());
                         Ok(UnlinkDiskOutcome::Completed { remaining_nlink, post_err: Some(err) })
@@ -1817,42 +1865,6 @@ impl Ext4Inode {
         }
     }
 
-    /// Take a removed directory's `..` link off `parent_ino`'s count on disk
-    /// (its bounds applied first): cleared once written, pinned in memory
-    /// when the write fails. When the parent can't be read, `if_unread` (a
-    /// count from memory) is pinned instead, if given. Returns the count
-    /// for memory and the error.
-    fn decrement_parent_nlink_after_rmdir(
-        inner: &mut Ext4FsInner,
-        parent_ino: NonZeroU32,
-        if_unread: Option<u32>,
-    ) -> (Option<u32>, Option<VfsError>) {
-        let mut parent_nlink: Option<u32> = None;
-        let post_res = (|| -> Result<(), VfsError> {
-            let mut parent_after = match Inode::read(&inner.ext4, parent_ino) {
-                Ok(p) => p,
-                Err(e) => {
-                    if let Some(p) = if_unread {
-                        inner.set_nlink_exact(parent_ino.get(), p);
-                        parent_nlink = Some(p);
-                    }
-                    return Err(map_ext4_err(e));
-                }
-            };
-            let p_cur = inner.apply_nlink_bounds(parent_ino.get(), u32::from(parent_after.links_count()));
-            let p_new = p_cur.saturating_sub(1);
-            parent_nlink = Some(p_new);
-            parent_after.set_links_count(u16::try_from(p_new).unwrap_or(u16::MAX));
-            if let Err(e) = parent_after.write(&inner.ext4) {
-                inner.set_nlink_exact(parent_ino.get(), p_new);
-                return Err(map_ext4_err(e));
-            }
-            inner.clear_nlink_bounds(parent_ino.get());
-            Ok(())
-        })();
-        (parent_nlink, post_res.err())
-    }
-
     fn unlink_dir_with_recovery(
         inner: &mut Ext4FsInner,
         parent_ino: NonZeroU32,
@@ -1863,12 +1875,13 @@ impl Ext4Inode {
         let mut child_disk = Inode::read(&inner.ext4, child_arc.disk_inode_index()).map_err(map_ext4_err)?;
         let effective_links =
             inner.apply_nlink_bounds(child_arc.disk_ino, u32::from(child_disk.links_count()).max(child_nlink));
-        let effective_links_u16 = u16::try_from(effective_links).unwrap_or(u16::MAX);
-        let pre_unlink_links = if effective_links > 2 { effective_links_u16 } else { 1 };
+        let effective_links_u16 = links_u16(effective_links);
+        let keeps_a_link = !is_last_link(true, effective_links);
+        let pre_unlink_links = if keeps_a_link { effective_links_u16 } else { 1 };
         if child_disk.links_count() != pre_unlink_links {
             child_disk.set_links_count(pre_unlink_links);
             child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-            if effective_links > 2 {
+            if keeps_a_link {
                 inner.clear_nlink_bounds(child_arc.disk_ino);
             }
         }
@@ -1883,10 +1896,7 @@ impl Ext4Inode {
 
         if let Err(e) = unlink_res {
             let err = map_ext4_err(e);
-            let probe = Inode::read(&inner.ext4, parent_ino)
-                .and_then(|p| Dir::open_inode(&inner.ext4, p))
-                .and_then(|d| d.get_entry(dname));
-            return match probe {
+            return match entry_at(&inner.ext4, parent_ino, dname) {
                 Ok(entry) if entry.index.get() == child_arc.disk_ino => {
                     let _ = inner.write_links_or_pin(child_arc.disk_inode_index(), effective_links_u16);
                     Ok(RmdirDiskOutcome::StillPresent { err, actual_nlink: effective_links })
@@ -1896,17 +1906,10 @@ impl Ext4Inode {
                     // `free_inode` failed, so the inode may already be freed:
                     // don't write `effective_links` onto it unless a link
                     // survives.
-                    let remaining = if effective_links > 2 {
-                        match Inode::read(&inner.ext4, child_arc.disk_inode_index()) {
-                            Ok(cur) if cur.links_count() > 0 => Some(cur),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                    let remaining = surviving_inode(&inner.ext4, child_arc.disk_inode_index(), true, effective_links);
                     let remaining_nlink =
                         inner.after_entry_gone(child_arc.disk_ino, effective_links, remaining.as_ref());
-                    let (parent_nlink, _) = Self::decrement_parent_nlink_after_rmdir(inner, parent_ino, None);
+                    let (parent_nlink, _) = inner.remove_dotdot_link(parent_ino, None);
                     Ok(RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err: Some(err) })
                 }
                 Ok(_) | Err(_) => {
@@ -1917,7 +1920,7 @@ impl Ext4Inode {
         }
 
         let remaining_nlink = inner.after_entry_gone(child_arc.disk_ino, effective_links, remaining.as_ref());
-        let (parent_nlink, post_err) = Self::decrement_parent_nlink_after_rmdir(inner, parent_ino, None);
+        let (parent_nlink, post_err) = inner.remove_dotdot_link(parent_ino, None);
         Ok(RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err })
     }
 
@@ -1941,11 +1944,7 @@ impl Ext4Inode {
         // link limit, `VfsError` has no EMLINK).
         let pinned = u16::try_from(effective).ok().and_then(|n| n.checked_add(1)).ok_or(VfsError::NoSpc)?;
         let effective_u16 = pinned - 1;
-        if disk.links_count() != effective_u16 {
-            disk.set_links_count(effective_u16);
-            disk.write(&inner.ext4).map_err(map_ext4_err)?;
-            inner.clear_nlink_bounds(target.disk_ino);
-        }
+        inner.store_bounded_links(&mut disk, effective_u16)?;
         disk.set_links_count(pinned);
         let res = Inode::read(&inner.ext4, parent_ino)
             .and_then(|p| Dir::open_inode(&inner.ext4, p))
@@ -2122,19 +2121,14 @@ impl Ext4Inode {
                 Some(u32::from(rem))
             };
             let parent_nlink = if target.is_dir {
-                Self::decrement_parent_nlink_after_rmdir(
-                    &mut inner,
-                    new_dir_ino,
-                    Some(new_dir_mem_nlink.saturating_sub(1)),
-                )
-                .0
+                inner.remove_dotdot_link(new_dir_ino, Some(new_dir_mem_nlink.saturating_sub(1))).0
             } else {
                 None
             };
             (remaining, parent_nlink)
         };
         let meta = find_guard_mut(guards, target.arc);
-        Self::settle_child(target.arc, meta, target.prepared, ChildFate::gone(remaining, now, true));
+        Self::settle_child(target.arc, meta, target.prepared, ChildFate::gone(remaining, now, Some(now)));
         if let Some(p) = parent_nlink {
             find_guard_mut(guards, new_dir).nlink = p;
         }
@@ -2308,28 +2302,16 @@ impl<'n> Exchange<'n> {
         let mut old_p_init = Inode::read(&inner.ext4, old_dir_ino).map_err(map_ext4_err)?;
         let mut new_p_init = Inode::read(&inner.ext4, new_dir_ino).map_err(map_ext4_err)?;
 
-        let old_orig_links =
-            u16::try_from(inner.apply_nlink_bounds(old_child_ino.get(), u32::from(old_disk.links_count())))
-                .unwrap_or(u16::MAX);
-        let new_orig_links =
-            u16::try_from(inner.apply_nlink_bounds(new_child_ino.get(), u32::from(new_disk.links_count())))
-                .unwrap_or(u16::MAX);
-        let old_p_orig_links =
-            u16::try_from(inner.apply_nlink_bounds(old_dir_ino.get(), u32::from(old_p_init.links_count())))
-                .unwrap_or(u16::MAX);
-        let new_p_orig_links =
-            u16::try_from(inner.apply_nlink_bounds(new_dir_ino.get(), u32::from(new_p_init.links_count())))
-                .unwrap_or(u16::MAX);
+        let old_orig_links = inner.bounded_links(&old_disk);
+        let new_orig_links = inner.bounded_links(&new_disk);
+        let old_p_orig_links = inner.bounded_links(&old_p_init);
+        let new_p_orig_links = inner.bounded_links(&new_p_init);
 
-        if (old_is_dir || new_is_dir) && old_p_init.links_count() != old_p_orig_links {
-            old_p_init.set_links_count(old_p_orig_links);
-            old_p_init.write(&inner.ext4).map_err(map_ext4_err)?;
-            inner.clear_nlink_bounds(old_dir_ino.get());
-        }
-        if !same_parent && (old_is_dir || new_is_dir) && new_p_init.links_count() != new_p_orig_links {
-            new_p_init.set_links_count(new_p_orig_links);
-            new_p_init.write(&inner.ext4).map_err(map_ext4_err)?;
-            inner.clear_nlink_bounds(new_dir_ino.get());
+        if old_is_dir || new_is_dir {
+            inner.store_bounded_links(&mut old_p_init, old_p_orig_links)?;
+            if !same_parent {
+                inner.store_bounded_links(&mut new_p_init, new_p_orig_links)?;
+            }
         }
 
         let x = Exchange {
@@ -2427,10 +2409,17 @@ impl<'n> Exchange<'n> {
             rollback_restore_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino);
         }
 
-        let mut old_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino.get());
-        let mut old_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get());
-        let mut new_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get());
-        let mut new_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, new_child_ino.get());
+        // Which of the four entries exist: each child at its own name and at
+        // the other's.
+        let probe = |ext4: &Ext4| {
+            (
+                dir_has_entry(ext4, old_dir_ino, old_dname, old_child_ino.get()),
+                dir_has_entry(ext4, new_dir_ino, new_dname, old_child_ino.get()),
+                dir_has_entry(ext4, new_dir_ino, new_dname, new_child_ino.get()),
+                dir_has_entry(ext4, old_dir_ino, old_dname, new_child_ino.get()),
+            )
+        };
+        let (mut old_in_old_res, mut old_in_new_res, mut new_in_new_res, mut new_in_old_res) = probe(&inner.ext4);
 
         // If a rollback write above itself failed, an entry may have
         // vanished or both names may point at one inode. Once writes
@@ -2465,10 +2454,7 @@ impl<'n> Exchange<'n> {
                 rollback_restore_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino);
             }
 
-            old_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, old_child_ino.get());
-            old_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino.get());
-            new_in_new_res = dir_has_entry(&inner.ext4, new_dir_ino, new_dname, new_child_ino.get());
-            new_in_old_res = dir_has_entry(&inner.ext4, old_dir_ino, old_dname, new_child_ino.get());
+            (old_in_old_res, old_in_new_res, new_in_new_res, new_in_old_res) = probe(&inner.ext4);
         }
         if !matches!(
             (&old_in_old_res, &old_in_new_res, &new_in_new_res, &new_in_old_res),
@@ -2596,27 +2582,17 @@ impl<'n> Exchange<'n> {
         // 5. Adjust parent link counts and `..` when moving directories:
         // each parent loses the `..` of a directory that left it and gains
         // that of one that came in (one parent: no change).
-        let expected_old_dir_nlink = if same_parent {
-            old_p_orig_links
-        } else if old_is_dir {
-            old_p_orig_links.saturating_sub(1).saturating_add(u16::from(new_is_dir))
-        } else if new_is_dir {
-            old_p_orig_links.saturating_add(1)
+        let (expected_old_dir_nlink, expected_new_dir_nlink) = if same_parent {
+            (old_p_orig_links, old_p_orig_links)
         } else {
-            old_p_orig_links
-        };
-        let expected_new_dir_nlink = if same_parent {
-            old_p_orig_links
-        } else if new_is_dir {
-            new_p_orig_links.saturating_sub(1).saturating_add(u16::from(old_is_dir))
-        } else if old_is_dir {
-            new_p_orig_links.saturating_add(1)
-        } else {
-            new_p_orig_links
+            (
+                old_p_orig_links.saturating_sub(u16::from(old_is_dir)).saturating_add(u16::from(new_is_dir)),
+                new_p_orig_links.saturating_sub(u16::from(new_is_dir)).saturating_add(u16::from(old_is_dir)),
+            )
         };
         if same_parent {
             if old_is_dir || new_is_dir {
-                record_err(inner.write_links_or_pin(old_dir_ino, old_p_orig_links));
+                record_err(inner.write_links_or_pin(old_dir_ino, expected_old_dir_nlink));
             }
         } else {
             if old_is_dir {
@@ -2632,19 +2608,18 @@ impl<'n> Exchange<'n> {
             Some(e) => Err(e),
             None => Ok(()),
         };
+        // Each count for memory: the disk's with its bounds applied, or,
+        // unread, the one just meant to be written.
+        let in_memory = |ino: NonZeroU32, written: u16| {
+            read_disk_nlink(&inner.ext4, ino)
+                .map(|d| inner.apply_nlink_bounds(ino.get(), d))
+                .or(Some(u32::from(written)))
+        };
         ExchangeSync {
-            old_child_nlink: read_disk_nlink(&inner.ext4, old_child_ino)
-                .map(|d| inner.apply_nlink_bounds(old_child_ino.get(), d))
-                .or(Some(u32::from(old_orig_links))),
-            new_child_nlink: read_disk_nlink(&inner.ext4, new_child_ino)
-                .map(|d| inner.apply_nlink_bounds(new_child_ino.get(), d))
-                .or(Some(u32::from(new_orig_links))),
-            old_dir_nlink: read_disk_nlink(&inner.ext4, old_dir_ino)
-                .map(|d| inner.apply_nlink_bounds(old_dir_ino.get(), d))
-                .or(Some(u32::from(expected_old_dir_nlink))),
-            new_dir_nlink: read_disk_nlink(&inner.ext4, new_dir_ino)
-                .map(|d| inner.apply_nlink_bounds(new_dir_ino.get(), d))
-                .or(Some(u32::from(expected_new_dir_nlink))),
+            old_child_nlink: in_memory(old_child_ino, old_orig_links),
+            new_child_nlink: in_memory(new_child_ino, new_orig_links),
+            old_dir_nlink: in_memory(old_dir_ino, expected_old_dir_nlink),
+            new_dir_nlink: in_memory(new_dir_ino, expected_new_dir_nlink),
             swap: Landed::Yes(post_res),
         }
     }
@@ -2720,23 +2695,13 @@ impl<'n> MoveEntry<'n> {
         let old_dir_ino = old_dir_arc.disk_inode_index();
 
         let mut old_disk = Inode::read(&inner.ext4, old_child_ino).map_err(map_ext4_err)?;
-        let orig_old_links =
-            u16::try_from(inner.apply_nlink_bounds(old_child_ino.get(), u32::from(old_disk.links_count())))
-                .unwrap_or(u16::MAX);
-        if old_disk.links_count() != orig_old_links {
-            old_disk.set_links_count(orig_old_links);
-            old_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-            inner.clear_nlink_bounds(old_child_ino.get());
-        }
+        let orig_old_links = inner.bounded_links(&old_disk);
+        inner.store_bounded_links(&mut old_disk, orig_old_links)?;
         let mut np_disk = Inode::read(&inner.ext4, new_dir_ino).map_err(map_ext4_err)?;
         let np_had_floor = inner.nlink.floor(new_dir_ino.get()) > 0;
-        let orig_np_links =
-            u16::try_from(inner.apply_nlink_bounds(new_dir_ino.get(), u32::from(np_disk.links_count())))
-                .unwrap_or(u16::MAX);
-        if old_is_dir && np_disk.links_count() != orig_np_links {
-            np_disk.set_links_count(orig_np_links);
-            np_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-            inner.clear_nlink_bounds(new_dir_ino.get());
+        let orig_np_links = inner.bounded_links(&np_disk);
+        if old_is_dir {
+            inner.store_bounded_links(&mut np_disk, orig_np_links)?;
         }
         let mv = MoveEntry {
             old_dir_ino,
@@ -2767,10 +2732,7 @@ impl<'n> MoveEntry<'n> {
             return self.finish(inner);
         };
         let err = map_ext4_err(e);
-        let old_probe = Inode::read(&inner.ext4, old_dir_ino)
-            .and_then(|op| Dir::open_inode(&inner.ext4, op))
-            .and_then(|d| d.get_entry(old_dname));
-        match old_probe {
+        match entry_at(&inner.ext4, old_dir_ino, old_dname) {
             Ok(entry) if entry.index.get() == old_child_ino.get() => self.roll_back(inner, err),
             Err(Ext4Error::NotFound) => {
                 // `old_dname` is already gone on disk: the move committed.
@@ -2827,11 +2789,8 @@ impl<'n> MoveEntry<'n> {
             (op_expected, op_expected, res)
         } else {
             inner.clear_nlink_bounds(new_dir_ino.get());
-            let (op_nlink, op_err) = Ext4Inode::decrement_parent_nlink_after_rmdir(
-                inner,
-                old_dir_ino,
-                Some(old_dir_nlink_before.saturating_sub(1)),
-            );
+            let (op_nlink, op_err) =
+                inner.remove_dotdot_link(old_dir_ino, Some(old_dir_nlink_before.saturating_sub(1)));
             let dotdot = update_dir_dotdot(&inner.ext4, old_child_ino.get(), new_dir_ino.get());
             let res = match op_err {
                 Some(e) => Err(e),
@@ -3012,12 +2971,37 @@ enum ChildFate {
     /// operation failed before taking it out, or put it back (a failed
     /// put-back is logged where it happens).
     Kept(u32),
-    /// Its entry is gone and it keeps `links` links.
+    /// Its entry is gone and it keeps `links` links. `links` can be 0 when
+    /// the disk, read back, still counts a link the entries don't call for
+    /// (0 is then pinned in memory): the inode isn't freed (an orphan for
+    /// `e2fsck`), and its prepared detach is dropped, not committed.
     Remaining { links: u32, now: Timespec },
     /// That entry was its last link: its inode is freed on disk, or left
     /// for `e2fsck` when the free failed (logged where it happens). `ctime`
     /// is the change time to stamp on it (`rmdir` stamps none).
     Freed { ctime: Option<Timespec> },
+}
+
+/// The inode `dname` names in `parent_ino`, read through the parent's inode
+/// and its directory blocks.
+fn entry_at(ext4: &Ext4, parent_ino: NonZeroU32, dname: DirEntryName<'_>) -> Result<Inode, Ext4Error> {
+    Dir::open_inode(ext4, Inode::read(ext4, parent_ino)?)?.get_entry(dname)
+}
+
+/// A link count for ext4's 16-bit `links_count`: one past it (beyond
+/// ext4's link limit, which `Dir::link` refuses to pass) is capped.
+fn links_u16(n: u32) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// `ino` read back after an entry of its, with `effective` links before,
+/// went: `None` if that was its last link or the inode has none left on
+/// disk (so it may be freed).
+fn surviving_inode(ext4: &Ext4, ino: NonZeroU32, is_dir: bool, effective: u32) -> Option<Inode> {
+    if is_last_link(is_dir, effective) {
+        return None;
+    }
+    Inode::read(ext4, ino).ok().filter(|cur| cur.links_count() > 0)
 }
 
 /// Whether an entry is its inode's last link, given its count (a
@@ -3033,12 +3017,12 @@ fn two_name_links(is_dir: bool) -> u16 {
 }
 
 impl ChildFate {
-    /// The entry is gone, leaving `remaining` links (`None`: it was the
-    /// last).
-    fn gone(remaining: Option<u32>, now: Timespec, ctime_if_freed: bool) -> Self {
+    /// The entry went at `now`, leaving `remaining` links (`None`: it was
+    /// the last, and the inode gets `freed_ctime`).
+    fn gone(remaining: Option<u32>, now: Timespec, freed_ctime: Option<Timespec>) -> Self {
         match remaining {
             Some(links) => Self::Remaining { links, now },
-            None => Self::Freed { ctime: ctime_if_freed.then_some(now) },
+            None => Self::Freed { ctime: freed_ctime },
         }
     }
 }
@@ -3142,9 +3126,7 @@ fn dir_has_entry(
     dname: DirEntryName<'_>,
     expected_ino: u32,
 ) -> Result<bool, Ext4Error> {
-    let parent = Inode::read(ext4, parent_ino)?;
-    let dir = Dir::open_inode(ext4, parent)?;
-    match dir.get_entry(dname) {
+    match entry_at(ext4, parent_ino, dname) {
         Ok(entry) => Ok(entry.index.get() == expected_ino),
         Err(Ext4Error::NotFound) => Ok(false),
         Err(e) => Err(e),
@@ -3154,8 +3136,7 @@ fn dir_has_entry(
 /// Whether `parent_ino` has no entry `dname`; a read error is reported, not
 /// taken as either answer.
 fn dir_entry_absent(ext4: &Ext4, parent_ino: NonZeroU32, dname: DirEntryName<'_>) -> Result<bool, Ext4Error> {
-    let dir = Dir::open_inode(ext4, Inode::read(ext4, parent_ino)?)?;
-    match dir.get_entry(dname) {
+    match entry_at(ext4, parent_ino, dname) {
         Ok(_) => Ok(false),
         Err(Ext4Error::NotFound) => Ok(true),
         Err(e) => Err(e),
@@ -3472,12 +3453,7 @@ impl VfsInode for Ext4Inode {
         let mut inner = self.shared.state.lock();
         let mut parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
         let parent_eff = inner.apply_nlink_bounds(self.disk_ino, u32::from(parent_disk.links_count()));
-        let parent_eff_u16 = u16::try_from(parent_eff).unwrap_or(u16::MAX);
-        if parent_disk.links_count() != parent_eff_u16 {
-            parent_disk.set_links_count(parent_eff_u16);
-            parent_disk.write(&inner.ext4).map_err(map_ext4_err)?;
-            inner.clear_nlink_bounds(self.disk_ino);
-        }
+        inner.store_bounded_links(&mut parent_disk, links_u16(parent_eff))?;
         let parent_check = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
         ensure_absent(&parent_check, dname)?;
         drop(parent_check);
@@ -3504,15 +3480,7 @@ impl VfsInode for Ext4Inode {
         let sub_inode = match linked {
             Ok(sub_inode) => sub_inode,
             Err(e) => {
-                match dir_entry_absent(&inner.ext4, self.disk_inode_index(), dname) {
-                    Ok(true) => {
-                        let _ = inner.write_links_or_pin(self.disk_inode_index(), parent_eff_u16);
-                    }
-                    Ok(false) => {}
-                    // Unknown whether the link landed: the parent's count
-                    // can't be judged; keep at least the count before mkdir.
-                    Err(_) => inner.record_nlink_floor(self.disk_ino, parent_eff),
-                }
+                inner.undo_failed_link(self.disk_inode_index(), dname, self.disk_inode_index(), parent_eff);
                 discard_orphan(&mut inner, self.disk_inode_index(), dname, sub_ino, "after a failed create");
                 return Err(map_ext4_err(e));
             }
@@ -3586,7 +3554,7 @@ impl VfsInode for Ext4Inode {
             }
             UnlinkDiskOutcome::Completed { remaining_nlink, post_err } => {
                 let child_meta = find_guard_mut(&mut guards, &child_arc);
-                let fate = ChildFate::gone(remaining_nlink, now_ts, true);
+                let fate = ChildFate::gone(remaining_nlink, now_ts, Some(now_ts));
                 Self::settle_child(&child_arc, child_meta, prepared_detach, fate);
                 let self_meta = find_guard_mut(&mut guards, &self_arc);
                 self_meta.times.modified(now_ts);
@@ -3676,7 +3644,8 @@ impl VfsInode for Ext4Inode {
                 // The child was checked live under its guard, which every
                 // detach holds, so a freed one is never detached already.
                 let child_meta = find_guard_mut(&mut guards, &child_arc);
-                let fate = ChildFate::gone(remaining_nlink, now_ts, false);
+                // A removed directory gets no change time (as before).
+                let fate = ChildFate::gone(remaining_nlink, now_ts, None);
                 Self::settle_child(&child_arc, child_meta, prepared_detach, fate);
                 if let Some(p_nlink) = parent_nlink {
                     let self_meta = find_guard_mut(&mut guards, &self_arc);
@@ -3746,20 +3715,12 @@ impl VfsInode for Ext4Inode {
             ensure_absent(&parent_dir, dname)?;
             let mut target_disk = Inode::read(&inner.ext4, target_arc.disk_inode_index()).map_err(map_ext4_err)?;
             let target_eff = inner.apply_nlink_bounds(target_arc.disk_ino, u32::from(target_disk.links_count()));
-            let target_eff_u16 = u16::try_from(target_eff).unwrap_or(u16::MAX);
+            let target_eff_u16 = links_u16(target_eff);
             if target_disk.links_count() != target_eff_u16 {
                 target_disk.set_links_count(target_eff_u16);
             }
             if let Err(e) = parent_dir.link(dname, &mut target_disk) {
-                match dir_entry_absent(&inner.ext4, self.disk_inode_index(), dname) {
-                    Ok(true) => {
-                        let _ = inner.write_links_or_pin(target_arc.disk_inode_index(), target_eff_u16);
-                    }
-                    Ok(false) => {}
-                    // Unknown whether the link landed: keep at least the
-                    // target's count from before.
-                    Err(_) => inner.record_nlink_floor(target_arc.disk_ino, target_eff),
-                }
+                inner.undo_failed_link(self.disk_inode_index(), dname, target_arc.disk_inode_index(), target_eff);
                 return Err(map_ext4_err(e));
             }
             inner.clear_nlink_bounds(target_arc.disk_ino);
