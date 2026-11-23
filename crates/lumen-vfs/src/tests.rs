@@ -5124,22 +5124,26 @@ fn list_mounts_asks_the_filesystems_after_releasing_lock9() {
 }
 
 #[test]
-fn snapshot_mounts_pairs_each_mounted_filesystem_with_its_path() {
-    // The filesystems themselves, `/` first, each with its path, from one
-    // snapshot; `MountInfo::of` on a pair, after the lock is released
-    // (`MemFs` asserts it), gives `list_mounts`' row.
+fn mounts_with_fs_pairs_each_row_with_its_mounted_filesystem() {
+    // `list_mounts`' rows, `/` first, each with the filesystem mounted
+    // there itself; the filesystems asked after the lock is released
+    // (`MemFs::name` and `read_only` assert it).
     let (env, root_fs) = setup_vfs();
     let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
     let tmp_fs = MemFs::new(DevId::TMPFS, "tmpfs", true);
     env.mount(mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
-    let mounts = env.snapshot_mounts();
-    let paths: Vec<&str> = mounts.iter().map(|(_, path)| path.as_str()).collect();
-    assert_eq!(paths, ["/", "/mnt"]);
+    let mounts = env.mounts_with_fs();
+    let info = |dev_id, fs_name, mount_path: &str, read_only| MountInfo {
+        dev_id,
+        fs_name,
+        mount_path: String::from(mount_path),
+        read_only,
+    };
+    let rows: Vec<MountInfo> = mounts.iter().map(|(row, _)| row.clone()).collect();
+    assert_eq!(rows, vec![info(DevId::ROOT, "ext4", "/", false), info(DevId::TMPFS, "tmpfs", "/mnt", true)]);
     let addr = |fs: &Arc<dyn FileSystem>| Arc::as_ptr(fs).cast::<()>();
-    assert_eq!(addr(&mounts[0].0), Arc::as_ptr(&root_fs).cast::<()>());
-    assert_eq!(addr(&mounts[1].0), Arc::as_ptr(&tmp_fs).cast::<()>());
-    let rows: Vec<MountInfo> = mounts.into_iter().map(|(fs, path)| MountInfo::of(fs.as_ref(), path)).collect();
-    assert_eq!(rows, env.list_mounts());
+    assert_eq!(addr(&mounts[0].1), Arc::as_ptr(&root_fs).cast::<()>());
+    assert_eq!(addr(&mounts[1].1), Arc::as_ptr(&tmp_fs).cast::<()>());
 }
 
 #[test]

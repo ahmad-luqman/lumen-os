@@ -23,9 +23,8 @@ pub struct MountInfo {
 
 impl MountInfo {
     /// `fs` mounted at `mount_path`, asking `fs` for its device, name and
-    /// read-only flag: call it only with Lock 9 released (on a pair from
-    /// [`VfsTables::snapshot_mounts`], say).
-    pub fn of(fs: &dyn FileSystem, mount_path: String) -> Self {
+    /// read-only flag: call it only with Lock 9 released.
+    pub(crate) fn of(fs: &dyn FileSystem, mount_path: String) -> Self {
         Self { dev_id: fs.dev_id(), fs_name: fs.name(), mount_path, read_only: fs.read_only() }
     }
 }
@@ -481,16 +480,17 @@ impl<F: LockFamily> VfsTables<F> {
     /// Every active mount, `/` first; the filesystems are asked for their
     /// device, name and read-only flag after the lock is released.
     pub fn list_mounts(&self) -> Vec<MountInfo> {
-        let mounts = self.snapshot_mounts();
-        mounts.into_iter().map(|(fs, path)| MountInfo::of(fs.as_ref(), path)).collect()
+        self.mounts_with_fs().into_iter().map(|(info, _)| info).collect()
     }
 
-    /// Every active mount's filesystem and path, `/` first, the lock
-    /// released before the caller uses them: for a caller that asks a
-    /// mount's filesystem for more than [`MountInfo`] holds (the kernel's
-    /// `mount`, a tmpfs mount's quota) from the same snapshot.
-    pub fn snapshot_mounts(&self) -> Vec<(Arc<dyn FileSystem>, String)> {
-        self.mounts.lock().snapshot_mounts()
+    /// [`list_mounts`](Self::list_mounts)' rows, each with its mount's
+    /// filesystem, from one snapshot: for a caller that asks a filesystem
+    /// for more than [`MountInfo`] holds (the kernel's `mount`, a tmpfs
+    /// mount's quota). The lock is released before the filesystems are
+    /// asked, and before the caller uses them.
+    pub fn mounts_with_fs(&self) -> Vec<(MountInfo, Arc<dyn FileSystem>)> {
+        let mounts = self.mounts.lock().snapshot_mounts();
+        mounts.into_iter().map(|(fs, path)| (MountInfo::of(fs.as_ref(), path), fs)).collect()
     }
 
     /// Every cached name.

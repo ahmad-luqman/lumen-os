@@ -225,13 +225,15 @@ pub trait VfsInode: Send + Sync {
     /// never loses a release `f` made (and must wake waiters for).
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError>;
 
-    /// The concrete inode, for the kernel's `vfs::mmap_page`: it downcasts
-    /// to the `ext4` and `tmpfs` inodes to hand out their cached pages,
-    /// which this crate's types can't name (and `tmpfs::quota_use` to a
-    /// `tmpfs` root, for its mount's quota). `None` (the default) for
-    /// every other filesystem. A new filesystem with a page cache that
-    /// overrides this also needs its own branch in `mmap_page`, or its
-    /// inodes are still refused with `NoDev`.
+    /// The concrete inode, which this crate's types can't name: the
+    /// kernel's `vfs::mmap_page` and `page_cache_lock` downcast to the
+    /// `ext4` and `tmpfs` inodes for their cached pages, and
+    /// `tmpfs::quota_use` to a `tmpfs` root for its mount's quota. `None`
+    /// (the default) for every other filesystem.
+    ///
+    /// A new filesystem with a page cache that overrides this also needs
+    /// its own branch in `mmap_page` and `page_cache_lock`, or its inodes
+    /// are still refused with `NoDev`.
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         None
     }

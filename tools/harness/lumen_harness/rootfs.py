@@ -20,6 +20,7 @@ import sys
 from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
+from typing import NamedTuple
 
 from . import BUILD_DIR
 from .audit import llvm_tool
@@ -92,17 +93,39 @@ def find_e2fsprogs(env: Mapping[str, str] | None = None) -> tuple[Path, Path]:
 BUSYBOX_EXIT = re.compile(r"linux: /bin/busybox exit=(\d+) leaked_frames=(-?\d+)")
 
 
+class BusyboxRun(NamedTuple):
+    """One `linux /bin/busybox <args>` run: what it printed before the
+    `linux:` line, and that line's exit code and leaked frames; `raw`, the
+    whole output, for failure messages."""
+
+    output: str
+    status: int
+    leaked: int
+    raw: str
+
+
+def run_busybox(m, args: str, timeout: float = 60) -> BusyboxRun:
+    """Run `/bin/busybox <args>` on machine `m` (booted with a rootfs) from
+    the serial shell. Raises AssertionError, with the output, unless its
+    last line is the `linux:` line giving the exit code and leaked frames
+    (`BUSYBOX_EXIT`)."""
+    from . import shell
+
+    raw = shell.run(m, f"linux /bin/busybox {args}", timeout)
+    lines = raw.splitlines()
+    done = BUSYBOX_EXIT.fullmatch(lines[-1]) if lines else None
+    assert done, f"no `linux: /bin/busybox exit=...` line last:\n{raw}"
+    output = "".join(line + "\n" for line in lines[:-1])
+    return BusyboxRun(output, int(done.group(1)), int(done.group(2)), raw)
+
+
 def warm_up(m) -> None:
     """On machine `m` (booted with a rootfs), one `linux /bin/busybox true`, leaking 0 frames or 1: the first
     process's kernel stack may find no freed slot to reuse and take fresh
     addresses, whose 68 KiB can cross into one new 2 MiB page table; every
     later one reuses the last one's slot (#300), so its count is exact."""
-    from .shell import run
-
-    out = run(m, "linux /bin/busybox true", 60)
-    lines = out.splitlines()
-    done = BUSYBOX_EXIT.fullmatch(lines[-1]) if lines else None
-    assert done and done.group(1) == "0" and done.group(2) in ("0", "1"), out
+    done = run_busybox(m, "true")
+    assert done.status == 0 and done.leaked in (0, 1), done.raw
 
 
 def copy_rootfs(

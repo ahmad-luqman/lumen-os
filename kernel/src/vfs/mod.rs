@@ -276,8 +276,8 @@ pub fn init() {
 
 /// Build `mount`'s records table for shell rendering and pipelines: each
 /// mount's target, filesystem, device and mode, and a tmpfs mount's quota
-/// (`used` and `limit`, in bytes; `-` for any other filesystem), so an
-/// `ENOSPC` on `/tmp` can be told apart from a leaked charge (#324).
+/// (`used` and `limit`, in bytes; `-` for any other filesystem): with them
+/// an `ENOSPC` on `/tmp` can be checked against what its files take (#324).
 pub fn mount_table() -> pipe::Table {
     const COLUMNS: [Column; 6] = [
         Column::new("target", Kind::Text, Align::Left, 6),
@@ -290,8 +290,7 @@ pub fn mount_table() -> pipe::Table {
     let mut t = pipe::Table::new(&COLUMNS);
     // One snapshot, taken under Lock 9; each filesystem is asked after it
     // is released.
-    for (fs, path) in TABLES.snapshot_mounts() {
-        let m = MountInfo::of(fs.as_ref(), path);
+    for (m, fs) in TABLES.mounts_with_fs() {
         let quota = tmpfs::quota_use(fs.as_ref());
         t.push(vec![
             Value::Text(m.mount_path),

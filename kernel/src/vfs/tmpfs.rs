@@ -1824,9 +1824,9 @@ crate::ktest!(
 crate::ktest!(
     fn tmpfs_quota_use_reads_the_mount_s_count_and_limit() {
         // #324: `quota_use`, what the shell's `mount` shows, reached from a
-        // `dyn FileSystem`: a tmpfs mount's bytes in use and its limit,
-        // following the count as a file comes and goes; `None` for a mount
-        // of another kind.
+        // `dyn FileSystem` (neither filesystem here is mounted): a tmpfs's
+        // bytes in use and its limit, following the count as a file comes
+        // and goes; `None` for a filesystem of another kind.
         use crate::kassert_eq;
         const LIMIT: usize = 8 * PAGE_SIZE;
         let fs = Tmpfs::new(DevId::makedev(0, 146), LIMIT);

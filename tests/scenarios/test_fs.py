@@ -6,7 +6,7 @@ from lumen_harness.calibration import assert_quiet_boot
 from lumen_harness.gui import confirmed_keys, type_confirmed
 from lumen_harness.klog import unexpected_warnings
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import BUSYBOX_EXIT, copy_rootfs, e2fsck_check, warm_up
+from lumen_harness.rootfs import copy_rootfs, e2fsck_check, run_busybox, warm_up
 from lumen_harness.screen import expect_screen
 from lumen_harness.shell import PROMPT, run
 
@@ -20,14 +20,19 @@ def shell(boot, **kwargs):
     return m
 
 
-def mount_table(m):
-    """`mount`'s table as {target: (fs, dev, mode, used, limit)}, as text."""
+def parse_mount(out):
+    """`mount`'s output as {target: (fs, dev, mode, used, limit)}, as text."""
     rows = {}
-    for line in run(m, "mount").splitlines():
+    for line in out.splitlines():
         cells = line.split()
         if len(cells) == 6 and cells[0].startswith("/"):
             rows[cells[0]] = tuple(cells[1:])
     return rows
+
+
+def mount_table(m):
+    """`mount`'s table, run once: `parse_mount`'s."""
+    return parse_mount(run(m, "mount"))
 
 
 def mount_rows(m):
@@ -35,16 +40,22 @@ def mount_rows(m):
     return {target: row[:3] for target, row in mount_table(m).items()}
 
 
-# A tmpfs mount's quota: page_cache::TMPFS_DEFAULT_QUOTA_PAGES pages.
+# A tmpfs mount's quota limit in bytes: page_cache::TMPFS_DEFAULT_QUOTA_PAGES
+# pages of 4 KiB.
 TMPFS_LIMIT = 32 << 20
 
 
-def tmpfs_quota(m, target):
-    """The tmpfs mounted at `target`'s quota as `mount` shows it: (used,
-    limit) in bytes."""
-    fs, _dev, _mode, used, limit = mount_table(m)[target]
+def quota_in(table, target):
+    """The tmpfs mounted at `target`'s quota in `mount_table`'s `table`:
+    (used, limit) in bytes."""
+    fs, _dev, _mode, used, limit = table[target]
     assert fs == "tmpfs", (target, fs)
     return int(used), int(limit)
+
+
+def tmpfs_quota(m, target):
+    """The tmpfs mounted at `target`'s quota as `mount` shows it now."""
+    return quota_in(mount_table(m), target)
 
 
 def stat_fields(m, path):
@@ -171,7 +182,10 @@ def test_dev_tmp_proc_filesystems(boot):
     m = shell(boot, devices=Devices(rng=True))
     assert_quiet_boot(m.output)
 
-    assert mount_rows(m) == {
+    out = run(m, "mount")
+    assert out.startswith("mount: 4 mounts\n"), out  # the header counts the table's rows
+    table = parse_mount(out)
+    assert {target: row[:3] for target, row in table.items()} == {
         "/": ("tmpfs", "0:1", "rw"),
         "/tmp": ("tmpfs", "0:2", "rw"),
         "/dev": ("devfs", "0:3", "rw"),
@@ -181,12 +195,9 @@ def test_dev_tmp_proc_filesystems(boot):
     assert "INFO  vfs: mounted / (tmpfs, rw) + /tmp /dev /proc\n" in m.output
     # Both tmpfs mounts show their quota (#324), the others none.
     for target in ("/", "/tmp"):
-        used, limit = tmpfs_quota(m, target)
+        used, limit = quota_in(table, target)
         assert limit == TMPFS_LIMIT and 0 <= used <= limit, (target, used, limit)
-    assert {t: row[3:] for t, row in mount_table(m).items() if t in ("/dev", "/proc")} == {
-        "/dev": ("-", "-"),
-        "/proc": ("-", "-"),
-    }
+    assert (table["/dev"][3:], table["/proc"][3:]) == (("-", "-"), ("-", "-"))
     assert run(m, "mount | where limit > 0 | count") == "2\n"
 
     dev_ls = set(run(m, "vfstest ls /dev").splitlines())
@@ -220,19 +231,20 @@ def test_dev_tmp_proc_filesystems(boot):
 def test_tmpfs_quota_returns_after_ring3_files(boot, tmp_path):
     """#324: `/tmp`'s quota as `mount` shows it follows what ring 3 makes
     there. Alpine's busybox makes a directory with a copy of itself, a
-    hard link to it, a symlink, an empty file and a subdirectory holding
-    one, which raise the count by at least the copy's pages; `rm -r` of it all
-    brings the count back to exactly where it was."""
+    hard link to it, a symlink, an empty file, and a subdirectory holding
+    another empty file, which raise the count by at least the copy's pages;
+    `rm -r` of it all brings the count, and `/tmp`'s listing, back to
+    exactly where they were."""
     disk = copy_rootfs(tmp_path)
     m = shell(boot, devices=Devices(blk_image=disk, rng=True))
     warm_up(m)
 
     def busybox(args):
-        out = run(m, f"linux /bin/busybox {args}", 60)
-        lines = out.splitlines()
-        done = BUSYBOX_EXIT.fullmatch(lines[-1]) if lines else None
-        assert done and done.group(1) == "0", out
+        done = run_busybox(m, args)
+        assert done.status == 0, done.raw
 
+    listed_before = run(m, "vfstest ls /tmp")
+    assert "." in listed_before.splitlines(), listed_before  # a listing, not an error
     used_before, limit = tmpfs_quota(m, "/tmp")
     assert limit == TMPFS_LIMIT
     busybox("mkdir /tmp/q324")
@@ -248,7 +260,7 @@ def test_tmpfs_quota_returns_after_ring3_files(boot, tmp_path):
     used_with_files, _ = tmpfs_quota(m, "/tmp")
     assert used_with_files >= used_before + pages * 4096, (used_before, used_with_files, size)
     busybox("rm -r /tmp/q324")
-    assert "q324" not in run(m, "vfstest ls /tmp").splitlines()
+    assert run(m, "vfstest ls /tmp") == listed_before
     assert tmpfs_quota(m, "/tmp") == (used_before, TMPFS_LIMIT)
 
     m.send_line("exit")
