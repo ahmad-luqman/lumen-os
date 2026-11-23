@@ -9,6 +9,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lumen_vfs::{DirEntry, Escaped, InodeType, OpenGuard, ResolveFlags, VfsError, VfsInode, VfsLock};
 
 use super::at::{Dirfd, Fd, UserPath, UserPtr, start_dir};
+#[cfg(feature = "ktest")]
+use super::fd::{ktest_install, ktest_install_file, ktest_open};
 use super::finish;
 use crate::linux::process;
 use crate::linux::{errno, general};
@@ -364,9 +366,6 @@ struct KtestDirent {
     raw: Vec<u8>,
 }
 
-#[cfg(feature = "ktest")]
-use super::fd::{ktest_install, ktest_open};
-
 /// Where the ktests' `getdents64` records go in the test process's user
 /// memory (up to 8 KiB): past the path slots `ktest_user_path` fills.
 #[cfg(feature = "ktest")]
@@ -375,6 +374,10 @@ const KTEST_DIRENTS: u64 = process::KTEST_USER_VA + 4096;
 /// Where the ktests' `getcwd` writes, in the last page.
 #[cfg(feature = "ktest")]
 const KTEST_CWD: u64 = process::KTEST_USER_VA + 3 * 4096;
+
+/// How the ktests open a directory: for reading, `O_DIRECTORY`.
+#[cfg(feature = "ktest")]
+const KTEST_DIR_FLAGS: u32 = lumen_vfs::OpenFlags::O_RDONLY | lumen_vfs::OpenFlags::O_DIRECTORY;
 
 /// The records in the `n` bytes `getdents64` filled at [`KTEST_DIRENTS`],
 /// each checked: `d_reclen` a multiple of 8 within the fill and no longer
@@ -511,7 +514,7 @@ fn ktest_remove(path: &str, dir: bool) -> Result<(), &'static str> {
 #[cfg(feature = "ktest")]
 fn ktest_remove_in(dir: &str, name: &[u8]) -> Result<(), &'static str> {
     let path = [dir.as_bytes(), b"/", name].concat();
-    lumen_vfs::unlink_at(crate::vfs::tables(), None, &path, false).map_err(|_| "remove a listed entry")
+    super::fd::ktest_unlink(&path).map_err(|_| "remove a listed entry")
 }
 
 /// Make the directory `path` (from `/`).
@@ -525,7 +528,6 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use alloc::format;
         use alloc::string::String;
-        use lumen_vfs::OpenFlags;
 
         process::in_test_process(|_| {
             const DIR: &str = "/tmp/dir-ktest-many";
@@ -549,7 +551,7 @@ crate::ktest!(
             let tmp_ino = crate::vfs::resolve_path_from_root("/tmp").map_err(|_| "resolve /tmp")?.ino();
 
             // 64 bytes a call: one or two records each, every record whole.
-            let fd = ktest_open(0, DIR.as_bytes(), OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let fd = ktest_open(0, DIR.as_bytes(), KTEST_DIR_FLAGS)?;
             let got = ktest_list(fd, 64)?;
             kassert!(ktest_unique(&got));
             let mut seen: Vec<(String, u32)> = got.iter().map(|r| (r.name.clone(), u32::from(r.ty))).collect();
@@ -589,13 +591,12 @@ crate::ktest!(
     fn dir_getdents64_types_on_proc_dev_and_ext4() {
         use crate::{kassert, kassert_eq};
         use alloc::format;
-        use lumen_vfs::{FileSystem, OpenFlags};
+        use lumen_vfs::FileSystem;
 
         process::in_test_process(|pid| {
-            let dir = OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY;
             // `/proc`: its files, the `self` link and this process's
             // directory (not the exact set: other pids come and go).
-            let proc_fd = ktest_open(0, b"/proc", dir, 0)?;
+            let proc_fd = ktest_open(0, b"/proc", KTEST_DIR_FLAGS)?;
             let procs = ktest_list(proc_fd, 128)?;
             kassert!(ktest_unique(&procs));
             kassert_eq!(ktest_type_of(&procs, "."), Some(general::DT_DIR));
@@ -604,12 +605,12 @@ crate::ktest!(
             kassert_eq!(ktest_type_of(&procs, "self"), Some(general::DT_LNK));
             kassert_eq!(ktest_type_of(&procs, &format!("{pid}")), Some(general::DT_DIR));
             // `/proc/<pid>/fd`: this process's descriptors, as links.
-            let fds_fd = ktest_open(1, format!("/proc/{pid}/fd").as_bytes(), dir, 0)?;
+            let fds_fd = ktest_open(1, format!("/proc/{pid}/fd").as_bytes(), KTEST_DIR_FLAGS)?;
             let fds = ktest_list(fds_fd, 64)?;
             kassert_eq!(ktest_type_of(&fds, "0"), Some(general::DT_LNK));
             kassert_eq!(ktest_type_of(&fds, &format!("{}", fds_fd.raw())), Some(general::DT_LNK));
             // `/dev`: character devices.
-            let dev_fd = ktest_open(2, b"/dev", dir, 0)?;
+            let dev_fd = ktest_open(2, b"/dev", KTEST_DIR_FLAGS)?;
             let devs = ktest_list(dev_fd, 64)?;
             kassert!(ktest_unique(&devs));
             kassert_eq!(ktest_type_of(&devs, "null"), Some(general::DT_CHR));
@@ -629,7 +630,7 @@ crate::ktest!(
             let mut truth = Vec::new();
             root.readdir(0, &mut truth, 10_000).map_err(|_| "ext4 readdir")?;
             kassert!(truth.len() >= 17);
-            let fd = ktest_install(&root, b"/ktest-ext4", dir)?;
+            let fd = ktest_install(&root, b"/ktest-ext4", KTEST_DIR_FLAGS)?;
             // 80 bytes a call: the listing whole, once, in the volume's order.
             let got = ktest_list(fd, 80)?;
             kassert!(ktest_unique(&got));
@@ -670,16 +671,16 @@ crate::ktest!(
             // `-ENOTDIR`, as on Linux), not a directory.
             kassert_eq!(ktest_getdents(super::at::reg(99), 4096), neg(errno::EBADF));
             kassert_eq!(ktest_getdents(super::at::reg(u64::from(u32::MAX)), 4096), neg(errno::EBADF));
-            let opath = ktest_open(0, DIR.as_bytes(), OpenFlags::O_PATH, 0)?;
+            let opath = ktest_open(0, DIR.as_bytes(), OpenFlags::O_PATH)?;
             kassert_eq!(ktest_getdents(opath, 4096), neg(errno::EBADF));
-            let opath_file = ktest_open(2, format!("{DIR}/plain-file").as_bytes(), OpenFlags::O_PATH, 0)?;
+            let opath_file = ktest_open(2, format!("{DIR}/plain-file").as_bytes(), OpenFlags::O_PATH)?;
             kassert_eq!(ktest_getdents(opath_file, 4096), neg(errno::EBADF));
             kassert_eq!(super::fd::sys_close(opath_file), 0);
             kassert_eq!(ktest_getdents(super::at::reg(0), 4096), neg(errno::ENOTDIR));
-            let file = ktest_open(1, format!("{DIR}/plain-file").as_bytes(), OpenFlags::O_RDONLY, 0)?;
+            let file = ktest_open(1, format!("{DIR}/plain-file").as_bytes(), OpenFlags::O_RDONLY)?;
             kassert_eq!(ktest_getdents(file, 4096), neg(errno::ENOTDIR));
 
-            let fd = ktest_open(0, DIR.as_bytes(), OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let fd = ktest_open(0, DIR.as_bytes(), KTEST_DIR_FLAGS)?;
             // Too small for even "." (24 bytes).
             kassert_eq!(ktest_getdents(fd, 0), neg(errno::EINVAL));
             kassert_eq!(ktest_getdents(fd, 23), neg(errno::EINVAL));
@@ -723,7 +724,6 @@ crate::ktest!(
         // all, removes what was listed and rewinds empties the directory.
         use crate::{kassert, kassert_eq};
         use alloc::format;
-        use lumen_vfs::OpenFlags;
 
         process::in_test_process(|_| {
             const DIR: &str = "/tmp/dir-ktest-churn";
@@ -731,7 +731,7 @@ crate::ktest!(
             for i in 0..30 {
                 ktest_file(&format!("{DIR}/c{i:02}"), b"")?;
             }
-            let fd = ktest_open(0, DIR.as_bytes(), OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let fd = ktest_open(0, DIR.as_bytes(), KTEST_DIR_FLAGS)?;
             // After each small read: the first file it listed removed, and
             // a new one added (40 at most).
             let mut added = 0;
@@ -800,7 +800,7 @@ crate::ktest!(
             kassert_eq!(ktest_cwd()?.as_str(), "/tmp/dir-ktest-cd/sub");
             // A relative open starts there too, and its `/proc` path is the
             // cwd's joined to it.
-            let fd = ktest_open(0, b"f", OpenFlags::O_RDONLY, 0)?;
+            let fd = ktest_open(0, b"f", OpenFlags::O_RDONLY)?;
             kassert_eq!(super::fd::sys_read(fd, super::at::reg(KTEST_DIRENTS), 16), 5);
             let mut got = [0u8; 5];
             crate::user::copy_from_user(&mut got, KTEST_DIRENTS).map_err(|_| "copy out")?;
@@ -822,7 +822,7 @@ crate::ktest!(
                 kassert_eq!(ktest_chdir(b"./sub")?, 0);
             }
             kassert_eq!(&*kept(), b"/tmp/dir-ktest-cd/sub");
-            let fd = ktest_open(0, b"f", OpenFlags::O_RDONLY, 0)?;
+            let fd = ktest_open(0, b"f", OpenFlags::O_RDONLY)?;
             let shown = process::current_file(fd.raw()).map(|f| alloc::sync::Arc::clone(&f.path));
             kassert_eq!(shown.as_deref(), Some(&b"/tmp/dir-ktest-cd/sub/f"[..]));
             kassert_eq!(super::fd::sys_close(fd), 0);
@@ -860,21 +860,21 @@ crate::ktest!(
             ktest_file("/tmp/dir-ktest-fcd/sub/g", b"")?;
 
             // `O_DIRECTORY`: the cwd, and relative opens start there.
-            let dfd = ktest_open(0, b"/tmp/dir-ktest-fcd", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let dfd = ktest_open(0, b"/tmp/dir-ktest-fcd", KTEST_DIR_FLAGS)?;
             kassert_eq!(sys_fchdir(dfd), 0);
             kassert_eq!(ktest_cwd()?.as_str(), "/tmp/dir-ktest-fcd");
-            let g = ktest_open(1, b"sub/g", OpenFlags::O_RDONLY, 0)?;
+            let g = ktest_open(1, b"sub/g", OpenFlags::O_RDONLY)?;
             kassert_eq!(super::fd::sys_close(g), 0);
             // `O_PATH`: the same; the next relative open's path is the
             // directory's own joined to it.
-            let pfd = ktest_open(0, b"/tmp/dir-ktest-fcd/sub", OpenFlags::O_PATH, 0)?;
+            let pfd = ktest_open(0, b"/tmp/dir-ktest-fcd/sub", OpenFlags::O_PATH)?;
             kassert_eq!(sys_fchdir(pfd), 0);
             kassert_eq!(ktest_cwd()?.as_str(), "/tmp/dir-ktest-fcd/sub");
-            let g = ktest_open(1, b"g", OpenFlags::O_RDONLY, 0)?;
+            let g = ktest_open(1, b"g", OpenFlags::O_RDONLY)?;
             let shown = process::current_file(g.raw()).map(|f| alloc::sync::Arc::clone(&f.path));
             kassert_eq!(shown.as_deref(), Some(&b"/tmp/dir-ktest-fcd/sub/g"[..]));
             // A plain `O_RDONLY` directory.
-            let rfd = ktest_open(2, b"/", OpenFlags::O_RDONLY, 0)?;
+            let rfd = ktest_open(2, b"/", OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_fchdir(rfd), 0);
             kassert_eq!(ktest_cwd()?.as_str(), "/");
 
@@ -883,7 +883,7 @@ crate::ktest!(
             kassert_eq!(sys_fchdir(super::at::reg(99)), neg(errno::EBADF));
             kassert_eq!(sys_fchdir(super::at::reg(u64::from(u32::MAX))), neg(errno::EBADF));
             kassert_eq!(sys_fchdir(g), neg(errno::ENOTDIR));
-            let gpath = ktest_open(0, b"/tmp/dir-ktest-fcd/sub/g", OpenFlags::O_PATH, 0)?;
+            let gpath = ktest_open(0, b"/tmp/dir-ktest-fcd/sub/g", OpenFlags::O_PATH)?;
             kassert_eq!(sys_fchdir(gpath), neg(errno::ENOTDIR));
             kassert_eq!(sys_fchdir(super::at::reg(0)), neg(errno::ENOTDIR));
             kassert_eq!(ktest_cwd()?.as_str(), "/");
@@ -891,7 +891,7 @@ crate::ktest!(
             // A directory removed while open: accepted, and `getcwd` then
             // says it is gone.
             ktest_mkdir("/tmp/dir-ktest-fcd/gone")?;
-            let gone = ktest_open(1, b"/tmp/dir-ktest-fcd/gone", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let gone = ktest_open(1, b"/tmp/dir-ktest-fcd/gone", KTEST_DIR_FLAGS)?;
             ktest_remove("/tmp/dir-ktest-fcd/gone", true)?;
             kassert_eq!(sys_fchdir(gone), 0);
             kassert_eq!(sys_getcwd(super::at::reg(KTEST_CWD), 256), neg(errno::ENOENT));
@@ -914,7 +914,6 @@ crate::ktest!(
         // passing them out of order can't pass.
         use crate::arch::syscall::SyscallFrame;
         use crate::kassert_eq;
-        use lumen_vfs::OpenFlags;
 
         process::in_test_process(|_| {
             let call = |nr: u32, rdi: u64, rsi: u64, rdx: u64| {
@@ -929,7 +928,7 @@ crate::ktest!(
             kassert_eq!(call(general::__NR_chdir, path.addr(), high | 7, high | 9), 0);
             kassert_eq!(ktest_cwd()?.as_str(), "/tmp/dir-ktest-regs");
             // fchdir(fd), with garbage above the fd's 32 bits.
-            let root = ktest_open(1, b"/", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let root = ktest_open(1, b"/", KTEST_DIR_FLAGS)?;
             let root_raw = root.raw() as u64;
             kassert_eq!(call(general::__NR_fchdir, high | root_raw, high | 5, 0), 0);
             kassert_eq!(ktest_cwd()?.as_str(), "/");
@@ -942,11 +941,6 @@ crate::ktest!(
         })?
     }
 );
-
-/// How the ktests open a directory on a volume of its own (not mounted)
-/// with [`ktest_install`].
-#[cfg(feature = "ktest")]
-const KTEST_DIR_FLAGS: u32 = lumen_vfs::OpenFlags::O_RDONLY | lumen_vfs::OpenFlags::O_DIRECTORY;
 
 /// How many entries the `rm -r` and survivor models start with: more than
 /// a 2048-byte fill (musl's `readdir` buffer) holds, several times over.
@@ -1178,11 +1172,11 @@ crate::ktest!(
         // `-ENOENT`.
         use crate::kassert_eq;
         use alloc::format;
-        use lumen_vfs::{FileSystem, OpenFlags};
+        use lumen_vfs::FileSystem;
 
         process::in_test_process(|_| {
             ktest_mkdir("/tmp/dir-ktest-gone")?;
-            let fd = ktest_open(0, b"/tmp/dir-ktest-gone", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let fd = ktest_open(0, b"/tmp/dir-ktest-gone", KTEST_DIR_FLAGS)?;
             ktest_remove("/tmp/dir-ktest-gone", true)?;
             kassert_eq!(ktest_getdents(fd, 4096), 0);
             kassert_eq!(super::fd::sys_close(fd), 0);
@@ -1200,12 +1194,10 @@ crate::ktest!(
         // `/proc/<pid>` opened by its own process, listed after it ended.
         let opened = process::in_test_process(|pid| {
             let path = format!("/proc/{pid}");
-            process::open_kernel_file(path.as_bytes(), OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)
-                .map_err(|_| "open /proc/<pid>")
+            process::open_kernel_file(path.as_bytes(), KTEST_DIR_FLAGS, 0).map_err(|_| "open /proc/<pid>")
         })??;
         process::in_test_process(move |_| {
-            let fd = process::install_current_fd(opened, false).map_err(|_| "install")?;
-            let fd: Fd = super::at::reg(fd as u64);
+            let fd = ktest_install_file(opened)?;
             kassert_eq!(ktest_getdents(fd, 4096), super::neg_errno(errno::ENOENT));
             // `fchdir` takes it (the open file's own reference, which a
             // fresh one would be refused), and `getcwd` says it is gone.
@@ -1229,10 +1221,10 @@ crate::ktest!(
             lumen_vfs::symlink_at(tables, b"sub", None, b"/tmp/dir-ktest-fln/ln").map_err(|_| "symlink")?;
             // Opened through the link: the open file's path names the link,
             // the cwd's is the directory's own.
-            let lfd = ktest_open(0, b"/tmp/dir-ktest-fln/ln", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let lfd = ktest_open(0, b"/tmp/dir-ktest-fln/ln", KTEST_DIR_FLAGS)?;
             kassert_eq!(sys_fchdir(lfd), 0);
             kassert_eq!(&*process::current_cwd().1, b"/tmp/dir-ktest-fln/sub");
-            let g = ktest_open(1, b"g", OpenFlags::O_RDONLY, 0)?;
+            let g = ktest_open(1, b"g", OpenFlags::O_RDONLY)?;
             let shown = process::current_file(g.raw()).map(|f| Arc::clone(&f.path));
             kassert_eq!(shown.as_deref(), Some(&b"/tmp/dir-ktest-fln/sub/g"[..]));
             kassert_eq!(ktest_chdir(b"/")?, 0);
@@ -1326,10 +1318,9 @@ crate::ktest!(
         process::in_test_process(|pid| {
             let mut extra = Vec::new();
             for _ in 0..12 {
-                extra.push(ktest_open(0, b"/dev/null", OpenFlags::O_RDONLY, 0)?.raw());
+                extra.push(ktest_open(0, b"/dev/null", OpenFlags::O_RDONLY)?.raw());
             }
-            let dir =
-                ktest_open(1, format!("/proc/{pid}/fd").as_bytes(), OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY, 0)?;
+            let dir = ktest_open(1, format!("/proc/{pid}/fd").as_bytes(), KTEST_DIR_FLAGS)?;
             let mut seen = Vec::new();
             for _ in 0..100 {
                 // One record a call; each extra fd closed once it is listed.

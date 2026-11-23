@@ -180,11 +180,9 @@ pub(super) fn sys_sync() -> u64 {
 }
 
 #[cfg(feature = "ktest")]
-use super::at::{self, Mode};
+use super::at;
 #[cfg(feature = "ktest")]
-use super::fd::{
-    ktest_fd, ktest_flags, ktest_install, ktest_open, ktest_user_path, sys_close, sys_lseek, sys_open, sys_write,
-};
+use super::fd::{ktest_install, ktest_open, ktest_unlink, sys_close, sys_lseek, sys_write};
 #[cfg(feature = "ktest")]
 use super::neg_errno;
 #[cfg(feature = "ktest")]
@@ -206,8 +204,8 @@ fn ktest_pattern(len: usize, seed: u8) -> alloc::vec::Vec<u8> {
     (0..len).map(|i| ((i * 7 + usize::from(seed)) % 251) as u8 | 1).collect()
 }
 
-/// The path a ktest's descriptor on a volume no path reaches shows
-/// ([`ktest_install`]).
+/// The path that the io ktests' descriptors on volumes no mount holds
+/// ([`ktest_install`]) show in `/proc/<pid>/fd`.
 #[cfg(feature = "ktest")]
 const KTEST_VOLUME_FILE: &[u8] = b"/io-ktest-volume/file";
 
@@ -269,9 +267,7 @@ crate::ktest!(
             let base = process::KTEST_USER_VA;
             let back = base + 8192;
             let last_page = base + process::KTEST_USER_LEN - 4096;
-            let path = ktest_user_path(0, b"/tmp/io-ktest-rw")?;
-            let flags = ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-            let fd = ktest_fd(sys_open(path, flags, at::reg(0o644)))?;
+            let fd = ktest_open(0, b"/tmp/io-ktest-rw", OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC)?;
             copy_to_user(base, b"0123456789").map_err(|_| "copy data")?;
             kassert_eq!(sys_write(fd, at::reg(base), 10), 10);
             // 6000 bytes at 4000: past EOF (10), across the page at 4096
@@ -345,7 +341,7 @@ crate::ktest!(
             kassert_eq!(size(), Ok(34_096));
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 13);
             kassert_eq!(sys_close(fd), 0);
-            kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/io-ktest-rw", false).is_ok());
+            kassert!(ktest_unlink(b"/tmp/io-ktest-rw").is_ok());
             Ok(())
         })?
     }
@@ -361,13 +357,11 @@ crate::ktest!(
             let out = process::KTEST_USER_VA + 8192;
             let kernel_half = 0xffff_8000_0000_0000u64;
             let max = i64::MAX as u64;
-            let mode: Mode = at::reg(0o644);
-            let path = ktest_user_path(0, b"/tmp/io-ktest-append")?;
-            let creat = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-            let w = ktest_fd(sys_open(path, creat, mode))?;
+            const PATH: &[u8] = b"/tmp/io-ktest-append";
+            let w = ktest_open(0, PATH, OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC)?;
             copy_to_user(base, b"hello").map_err(|_| "copy data")?;
             kassert_eq!(sys_write(w, at::reg(base), 5), 5);
-            let app = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_APPEND), mode))?;
+            let app = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_APPEND)?;
             copy_to_user(base, b"AB").map_err(|_| "copy data")?;
             kassert_eq!(sys_pwrite64(app, at::reg(base), 2, 0), 2);
             kassert_eq!(sys_lseek(app, 0, general::SEEK_CUR), 0);
@@ -381,13 +375,12 @@ crate::ktest!(
                 kassert_eq!(sys_pread64(at::reg(fd), at::reg(out), 1, 0), neg_errno(errno::ESPIPE));
                 kassert_eq!(sys_pwrite64(at::reg(fd), at::reg(base), 1, 0), neg_errno(errno::ESPIPE));
             }
-            let tty = ktest_user_path(1, b"/dev/tty")?;
-            let tty_fd = ktest_fd(sys_open(tty, ktest_flags(OpenFlags::O_RDWR), at::reg(0)))?;
+            let tty_fd = ktest_open(1, b"/dev/tty", OpenFlags::O_RDWR)?;
             kassert_eq!(sys_pread64(tty_fd, at::reg(out), 1, 0), neg_errno(errno::ESPIPE));
             kassert_eq!(sys_pwrite64(tty_fd, at::reg(base), 1, 0), neg_errno(errno::ESPIPE));
             // The wrong direction, `O_PATH`, or not open: `EBADF`.
-            let rd = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
-            let opath = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_PATH), at::reg(0)))?;
+            let rd = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
+            let opath = ktest_open(0, PATH, OpenFlags::O_PATH)?;
             kassert_eq!(sys_pwrite64(rd, at::reg(base), 1, 0), neg_errno(errno::EBADF));
             kassert_eq!(sys_pread64(w, at::reg(out), 1, 0), neg_errno(errno::EBADF));
             kassert_eq!(sys_pread64(opath, at::reg(out), 1, 0), neg_errno(errno::EBADF));
@@ -401,8 +394,7 @@ crate::ktest!(
             kassert_eq!(ktest_user_bytes(out, 3)?, b"ABB");
             // A directory: `EISDIR`, even for 0 bytes, but after the
             // buffer's range (`EFAULT`) and the end (`EINVAL`).
-            let tmp = ktest_user_path(2, b"/tmp")?;
-            let dir = ktest_fd(sys_open(tmp, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
+            let dir = ktest_open(2, b"/tmp", OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_pread64(dir, at::reg(out), 1, 0), neg_errno(errno::EISDIR));
             kassert_eq!(sys_pread64(dir, at::reg(out), 0, 0), neg_errno(errno::EISDIR));
             kassert_eq!(sys_pread64(dir, at::reg(kernel_half), 1, 0), neg_errno(errno::EFAULT));
@@ -447,7 +439,7 @@ crate::ktest!(
             kassert!(ktest_user_bytes(out, 6000)? == big);
             kassert_eq!(sys_pread64(rd, at::reg(out), 9, 0), 9);
             kassert_eq!(ktest_user_bytes(out, 9)?, b"helloABQC");
-            kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/io-ktest-append", false).is_ok());
+            kassert!(ktest_unlink(PATH).is_ok());
             Ok(())
         })?
     }
@@ -566,20 +558,15 @@ crate::ktest!(
         // `EINVAL`; `O_PATH` and a closed fd `EBADF`.
         use crate::kassert_eq;
         process::in_test_process(|_| {
-            let rd = ktest_flags(OpenFlags::O_RDONLY);
-            let path = ktest_user_path(0, b"/tmp/io-ktest-fsync")?;
-            let creat = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-            let w = ktest_fd(sys_open(path, creat, at::reg(0o644)))?;
-            let r = ktest_fd(sys_open(path, rd, at::reg(0)))?;
-            let opath = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_PATH), at::reg(0)))?;
-            let tmp = ktest_user_path(1, b"/tmp")?;
-            let dir = ktest_fd(sys_open(tmp, rd, at::reg(0)))?;
-            let null = ktest_user_path(2, b"/dev/null")?;
-            let null_fd = ktest_fd(sys_open(null, ktest_flags(OpenFlags::O_RDWR), at::reg(0)))?;
-            let version = ktest_user_path(3, b"/proc/version")?;
-            let proc_fd = ktest_fd(sys_open(version, rd, at::reg(0)))?;
-            let proc_dir = ktest_user_path(4, b"/proc")?;
-            let proc_dir_fd = ktest_fd(sys_open(proc_dir, rd, at::reg(0)))?;
+            const PATH: &[u8] = b"/tmp/io-ktest-fsync";
+            let rd = OpenFlags::O_RDONLY;
+            let w = ktest_open(0, PATH, OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC)?;
+            let r = ktest_open(0, PATH, rd)?;
+            let opath = ktest_open(0, PATH, OpenFlags::O_PATH)?;
+            let dir = ktest_open(1, b"/tmp", rd)?;
+            let null_fd = ktest_open(2, b"/dev/null", OpenFlags::O_RDWR)?;
+            let proc_fd = ktest_open(3, b"/proc/version", rd)?;
+            let proc_dir_fd = ktest_open(4, b"/proc", rd)?;
             for fd in [w, r, dir] {
                 kassert_eq!(sys_fsync(fd), 0);
                 kassert_eq!(sys_fdatasync(fd), 0);
@@ -592,7 +579,7 @@ crate::ktest!(
                 kassert_eq!(sys_fsync(fd), neg_errno(errno::EBADF));
                 kassert_eq!(sys_fdatasync(fd), neg_errno(errno::EBADF));
             }
-            crate::kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/io-ktest-fsync", false).is_ok());
+            crate::kassert!(ktest_unlink(PATH).is_ok());
             Ok(())
         })?
     }
@@ -620,7 +607,7 @@ crate::ktest!(
                     copy_to_user(base, &pattern).map_err(|_| "copy the pattern")?;
                     let mut fds = alloc::vec::Vec::new();
                     for path in [&b"/tmp/io-sync-bad/f"[..], b"/tmp/io-sync-good/f"] {
-                        let fd = ktest_open(0, path, creat, 0o644)?;
+                        let fd = ktest_open(0, path, creat)?;
                         kassert_eq!(sys_pwrite64(fd, at::reg(base), 5000, 0), 5000);
                         fds.push(fd);
                     }

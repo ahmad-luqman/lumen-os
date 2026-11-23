@@ -433,6 +433,15 @@ const KTEST_PID_SENTINEL: i32 = -7;
 #[cfg(feature = "ktest")]
 const KTEST_FLOOR_NS: u64 = 20_000_000;
 
+/// `ret`, after removing `path`: every lock ktest's body makes its file
+/// and leaves it there, so after a pass a removal that fails fails the
+/// test; a failing test keeps its own error.
+#[cfg(feature = "ktest")]
+fn ktest_unlink_after(path: &[u8], ret: TestResult) -> TestResult {
+    let removed = ktest_unlink(path);
+    ret.and(removed)
+}
+
 /// Write `bytes` at `fd`'s offset (through user memory): `write`'s result.
 #[cfg(feature = "ktest")]
 fn ktest_write(fd: Fd, bytes: &[u8]) -> Result<u64, &'static str> {
@@ -499,7 +508,7 @@ crate::ktest!(
         const PATH: &[u8] = b"/tmp/lock-ktest-fcntl";
         let ret = process::in_test_process(|_| -> TestResult {
             let rdwr = OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC;
-            let fd = ktest_open(0, PATH, rdwr, 0o644)?;
+            let fd = ktest_open(0, PATH, rdwr)?;
             kassert_eq!(fd.raw(), 3);
             // F_DUPFD: the lowest free slot at or above the minimum.
             kassert_eq!(sys_fcntl(fd, general::F_DUPFD, 0), 4);
@@ -568,7 +577,7 @@ crate::ktest!(
             // O_PATH: the descriptor commands and F_GETFL work; F_SETFL,
             // the locks, an unknown command and flock are `-EBADF` (flock
             // only once its operation is valid).
-            let path_fd = ktest_open(1, b"/tmp", OpenFlags::O_PATH, 0o644)?;
+            let path_fd = ktest_open(1, b"/tmp", OpenFlags::O_PATH)?;
             kassert_eq!(sys_fcntl(path_fd, general::F_GETFL, 0), u64::from(OpenFlags::O_PATH));
             kassert_eq!(sys_fcntl(path_fd, general::F_SETFD, u64::from(general::FD_CLOEXEC)), 0);
             kassert_eq!(sys_fcntl(path_fd, general::F_GETFD, 0), u64::from(general::FD_CLOEXEC));
@@ -590,8 +599,7 @@ crate::ktest!(
             kassert!(sys_close(path_fd) == 0);
             Ok(())
         });
-        let _ = ktest_unlink(PATH);
-        ret?
+        ktest_unlink_after(PATH, ret.and_then(|r| r))
     }
 );
 
@@ -603,9 +611,9 @@ crate::ktest!(
             let (set, get) = (general::F_SETLK, general::F_GETLK);
             let (rd, wr, un) = (general::F_RDLCK, general::F_WRLCK, general::F_UNLCK);
             let seek_set = general::SEEK_SET;
-            let rdwr = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
-            let rdonly = ktest_open(0, PATH, OpenFlags::O_RDONLY, 0o644)?;
-            let wronly = ktest_open(0, PATH, OpenFlags::O_WRONLY, 0o644)?;
+            let rdwr = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+            let rdonly = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
+            let wronly = ktest_open(0, PATH, OpenFlags::O_WRONLY)?;
             // The lock type must match the access mode ...
             kassert_eq!(ktest_lk(rdonly, set, wr, seek_set, 0, 10)?, neg_errno(errno::EBADF));
             kassert_eq!(ktest_lk(wronly, set, rd, seek_set, 0, 10)?, neg_errno(errno::EBADF));
@@ -644,8 +652,7 @@ crate::ktest!(
             }
             Ok(())
         });
-        let _ = ktest_unlink(PATH);
-        ret?
+        ktest_unlink_after(PATH, ret.and_then(|r| r))
     }
 );
 
@@ -656,10 +663,10 @@ crate::ktest!(
         let ret = process::in_test_process(|_| -> TestResult {
             let (sh, ex, nb, un) = (general::LOCK_SH, general::LOCK_EX, general::LOCK_NB, general::LOCK_UN);
             let busy = neg_errno(errno::EWOULDBLOCK);
-            let a = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+            let a = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             // Another open of the same file, read-only (flock doesn't
             // care), and a dup of the first.
-            let b = ktest_open(0, PATH, OpenFlags::O_RDONLY, 0o644)?;
+            let b = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
             let a2 = ktest_fd(sys_fcntl(a, general::F_DUPFD, 10))?;
             kassert_eq!(a2.raw(), 10);
             kassert_eq!(sys_flock(a, ex), 0);
@@ -697,7 +704,7 @@ crate::ktest!(
             for (fd, op) in [(b, mand), (b, mand | ex), (at::reg::<Fd>(77), mand | sh), (b, mand | 16)] {
                 kassert_eq!(sys_flock(fd, op), 0);
             }
-            let c = ktest_open(0, PATH, OpenFlags::O_RDONLY, 0o644)?;
+            let c = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_flock(c, ex | nb), 0);
             // Reported once a boot (Linux's `pr_warn_once`), however often
             // it comes: one log line for the four calls above (no other
@@ -710,8 +717,7 @@ crate::ktest!(
             kassert_eq!(said.count(), 1);
             Ok(())
         });
-        let _ = ktest_unlink(PATH);
-        ret?
+        ktest_unlink_after(PATH, ret.and_then(|r| r))
     }
 );
 
@@ -846,8 +852,8 @@ fn ktest_setlkw_waits_for(release: Release) -> TestResult {
     let seek_set = general::SEEK_SET;
     let ret = two_processes(
         move |baton| {
-            let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
-            let other = ktest_open(0, PATH, OpenFlags::O_RDONLY, 0o644)?;
+            let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+            let other = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
             crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 100)?, 0);
             baton.go(1);
             baton.wait_for(2, &baton.b_ended)?;
@@ -864,7 +870,7 @@ fn ktest_setlkw_waits_for(release: Release) -> TestResult {
         move |baton| {
             baton.wait_for(1, &baton.a_ended)?;
             let a_pid = baton.a_pid.load(Ordering::SeqCst) as i32;
-            let fd = ktest_open(0, PATH, OpenFlags::O_RDWR, 0o644)?;
+            let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
             crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 50, 10)?, neg_errno(errno::EAGAIN));
             crate::kassert_eq!(ktest_lk(fd, set, rd, seek_set, 99, 1)?, neg_errno(errno::EAGAIN));
             // Past A's range: no conflict.
@@ -878,7 +884,7 @@ fn ktest_setlkw_waits_for(release: Release) -> TestResult {
             Ok(())
         },
     );
-    let _ = ktest_unlink(PATH);
+    let ret = ktest_unlink_after(PATH, ret);
     if ret.is_err() {
         crate::ktest::diag(format_args!("releasing by {release:?}"));
     }
@@ -904,7 +910,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
     let (sh, ex, nb, un) = (general::LOCK_SH, general::LOCK_EX, general::LOCK_NB, general::LOCK_UN);
     let ret = two_processes(
         move |baton| {
-            let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+            let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             crate::kassert_eq!(sys_flock(fd, ex), 0);
             let dup = ktest_fd(sys_fcntl(fd, general::F_DUPFD, 10))?;
             crate::kassert_eq!(dup.raw(), 10);
@@ -925,7 +931,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
         },
         move |baton| {
             baton.wait_for(1, &baton.a_ended)?;
-            let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY, 0o644)?;
+            let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
             crate::kassert_eq!(sys_flock(fd, ex | nb), neg_errno(errno::EWOULDBLOCK));
             crate::kassert_eq!(sys_flock(fd, sh | nb), neg_errno(errno::EWOULDBLOCK));
             baton.go(2);
@@ -935,7 +941,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
             Ok(())
         },
     );
-    let _ = ktest_unlink(PATH);
+    let ret = ktest_unlink_after(PATH, ret);
     if ret.is_err() {
         crate::ktest::diag(format_args!("releasing by {release:?}"));
     }
@@ -961,7 +967,7 @@ crate::ktest!(
         let (sh, ex, un) = (general::LOCK_SH, general::LOCK_EX, general::LOCK_UN);
         let ret = two_processes(
             move |baton| {
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
                 crate::kassert_eq!(sys_flock(fd, sh), 0);
                 baton.go(1);
                 baton.wait_for(2, &baton.b_ended)?;
@@ -975,7 +981,7 @@ crate::ktest!(
             },
             move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
                 crate::kassert_eq!(sys_flock(fd, sh), 0);
                 baton.go(2);
                 crate::kassert_eq!(sys_flock(fd, ex), 0);
@@ -984,8 +990,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        let _ = ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1001,7 +1006,7 @@ crate::ktest!(
         let seek_set = general::SEEK_SET;
         let ret = two_processes(
             move |baton| {
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 10)?, 0);
                 baton.go(1);
                 baton.wait_for(2, &baton.b_ended)?;
@@ -1029,7 +1034,7 @@ crate::ktest!(
             },
             move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 10, 10)?, 0);
                 baton.go(2);
                 crate::kassert_eq!(ktest_lk(fd, setw, wr, seek_set, 0, 10)?, 0);
@@ -1038,8 +1043,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        let _ = ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1050,7 +1054,7 @@ crate::ktest!(
         let (seek_set, seek_cur, seek_end) = (general::SEEK_SET, general::SEEK_CUR, general::SEEK_END);
         let ret = two_processes(
             move |baton| {
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC)?;
                 crate::kassert_eq!(ktest_write(fd, b"12345678")?, 8);
                 // [0, 100) written, then its middle [40, 60) unlocked: two
                 // pieces left.
@@ -1069,7 +1073,7 @@ crate::ktest!(
             move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
                 let a = baton.a_pid.load(Ordering::SeqCst) as i32;
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
                 let free = |start, len| (un, seek_set, start, len, KTEST_PID_SENTINEL);
                 // The first conflict over the whole file is the first piece.
                 crate::kassert_eq!(ktest_getlk(fd, wr, seek_set, 0, 0)?, (wr, seek_set, 0, 40, a));
@@ -1099,8 +1103,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        let _ = ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1124,7 +1127,7 @@ crate::ktest!(
         let seek_set = general::SEEK_SET;
         let ret = two_processes(
             move |baton| {
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 100)?, 0);
                 baton.go(1);
                 baton.wait_for(2, &baton.b_ended)?;
@@ -1136,7 +1139,7 @@ crate::ktest!(
             },
             move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
                 baton.go(2);
                 crate::kassert_eq!(ktest_lk(fd, general::F_SETLKW, rd, seek_set, 10, 10)?, 0);
                 baton.b_done.store(true, Ordering::SeqCst);
@@ -1145,8 +1148,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        let _ = ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1158,7 +1160,7 @@ crate::ktest!(
         let (sh, ex) = (general::LOCK_SH, general::LOCK_EX);
         let ret = two_processes(
             move |baton| {
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
                 crate::kassert_eq!(sys_flock(fd, ex), 0);
                 baton.go(1);
                 baton.wait_for(2, &baton.b_ended)?;
@@ -1170,7 +1172,7 @@ crate::ktest!(
             },
             move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
                 baton.go(2);
                 crate::kassert_eq!(sys_flock(fd, sh), 0);
                 baton.b_done.store(true, Ordering::SeqCst);
@@ -1179,8 +1181,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        let _ = ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1205,7 +1206,7 @@ crate::ktest!(
         let seek_set = general::SEEK_SET;
         let ret = two_processes(
             move |baton| {
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 10)?, 0);
                 baton.go(1);
                 baton.wait_for(2, &baton.b_ended)?;
@@ -1218,7 +1219,7 @@ crate::ktest!(
             },
             move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
                 ktest_window::arm();
                 baton.go(2);
                 let got = ktest_lk(fd, general::F_SETLKW, wr, seek_set, 0, 10);
@@ -1229,8 +1230,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        let _ = ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1248,7 +1248,7 @@ crate::ktest!(
         let seek_set = general::SEEK_SET;
         let ret = two_processes(
             move |baton| {
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 10)?, 0);
                 baton.go(1);
                 baton.wait_for(2, &baton.b_ended)?;
@@ -1263,7 +1263,7 @@ crate::ktest!(
             },
             move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
-                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR, 0o644)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
                 crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 10, 10)?, 0);
                 ktest_window::arm();
                 baton.go(2);
@@ -1275,7 +1275,6 @@ crate::ktest!(
                 Ok(())
             },
         );
-        let _ = ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );

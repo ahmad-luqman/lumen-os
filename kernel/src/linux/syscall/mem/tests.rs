@@ -258,12 +258,12 @@ crate::ktest!(
             let mut seen = [0u8; 4];
             copy_from_user(&mut seen, shared + P).map_err(|_| "fault in")?;
             copy_to_user(private + 8, b"copy").map_err(|_| "copy on write")?;
-            let _reopened = ktest_open(3, path, OpenFlags::O_RDWR, 0o644)?;
+            let _reopened = ktest_open(3, path, OpenFlags::O_RDWR)?;
             copy_from_user(&mut seen, private + 8).map_err(|_| "the private page is gone")?;
             kassert_eq!(&seen, b"copy");
             copy_from_user(&mut seen, shared + P).map_err(|_| "the shared page is gone")?;
             kassert_eq!(&seen[..], &pattern(8)[P as usize..P as usize + 4]);
-            let again = ktest_open(3, path, OpenFlags::O_RDWR | OpenFlags::O_TRUNC, 0o644)?;
+            let again = ktest_open(3, path, OpenFlags::O_RDWR | OpenFlags::O_TRUNC)?;
             kassert!(copy_from_user(&mut seen, shared + P).is_err());
             kassert!(copy_to_user(shared, b"lost").is_err());
             kassert!(copy_from_user(&mut seen, private + 8).is_err());
@@ -288,7 +288,7 @@ crate::ktest!(
             copy_to_user(private + 8, b"private!").map_err(|_| "copy on write")?;
             let mut seen = [0u8; 8];
             copy_from_user(&mut seen, shared + P).map_err(|_| "fault in")?;
-            let _path_fd = ktest_open(3, path, OpenFlags::O_PATH | OpenFlags::O_TRUNC, 0o644)?;
+            let _path_fd = ktest_open(3, path, OpenFlags::O_PATH | OpenFlags::O_TRUNC)?;
             kassert_eq!(inode.stat().map(|m| m.size), Ok(2 * P));
             copy_from_user(&mut seen, private + 8).map_err(|_| "the private page is gone")?;
             kassert_eq!(&seen, b"private!");
@@ -335,11 +335,11 @@ crate::ktest!(
         in_test_process(|_| {
             let tmp = KtestTmpFile::new(b"/tmp/mem-ktest-errnos", &pattern(1))?;
             let (path, rw) = (tmp.path, tmp.fd);
-            let ro = ktest_open(3, path, OpenFlags::O_RDONLY, 0o644)?;
-            let wo = ktest_open(3, path, OpenFlags::O_WRONLY, 0o644)?;
+            let ro = ktest_open(3, path, OpenFlags::O_RDONLY)?;
+            let wo = ktest_open(3, path, OpenFlags::O_WRONLY)?;
             // EBADF: not open, or O_PATH.
             kassert_eq!(sys_mmap(0, P, READ, PRIVATE, 99, 0), e(errno::EBADF));
-            let opath = ktest_open(3, path, OpenFlags::O_PATH, 0o644)?;
+            let opath = ktest_open(3, path, OpenFlags::O_PATH)?;
             kassert_eq!(sys_mmap(0, P, READ, PRIVATE, raw(opath), 0), e(errno::EBADF));
             // EINVAL: an offset not page-aligned (before the descriptor is
             // looked at), no length, MAP_HUGETLB, a map type other than
@@ -384,12 +384,12 @@ crate::ktest!(
             let private = map(P, RW, PRIVATE, ro, 0)?;
             kassert_eq!(sys_munmap(private, P), 0);
             // ENODEV: a directory, the console (fd 0), /dev/null.
-            let dir = ktest_open(3, b"/tmp", OpenFlags::O_RDONLY, 0o644)?;
+            let dir = ktest_open(3, b"/tmp", OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_mmap(0, P, READ, PRIVATE, raw(dir), 0), e(errno::ENODEV));
             // ... after the access checks, as Linux's order has them.
             kassert_eq!(sys_mmap(0, P, RW, SHARED, raw(dir), 0), e(errno::EACCES));
             kassert_eq!(sys_mmap(0, P, READ, PRIVATE, 0, 0), e(errno::ENODEV));
-            let null = ktest_open(3, b"/dev/null", OpenFlags::O_RDWR, 0o644)?;
+            let null = ktest_open(3, b"/dev/null", OpenFlags::O_RDWR)?;
             kassert_eq!(sys_mmap(0, P, READ, SHARED, raw(null), 0), e(errno::ENODEV));
             // MAP_GROWSDOWN on a file: EINVAL (Linux's `vma_flags_can_grow`).
             kassert_eq!(sys_mmap(0, P, READ, PRIVATE | general::MAP_GROWSDOWN as u64, raw(ro), 0), e(errno::EINVAL));
@@ -417,7 +417,7 @@ crate::ktest!(
         // asked, at an offset past i64::MAX (below 2^64, as a device's may
         // be); its maps line names no file.
         in_test_process(|_| {
-            let zero = ktest_open(3, b"/dev/zero", OpenFlags::O_RDONLY, 0o644)?;
+            let zero = ktest_open(3, b"/dev/zero", OpenFlags::O_RDONLY)?;
             let va = map(2 * P, RW, PRIVATE, zero, 0)?;
             let mut seen = [0xffu8; 16];
             copy_from_user(&mut seen, va + P).map_err(|_| "load")?;
@@ -437,7 +437,7 @@ crate::ktest!(
             kassert_eq!(sys_munmap(high, P), 0);
             // Shared and writable needs the descriptor open for writing.
             kassert_eq!(sys_mmap(0, P, RW, SHARED, raw(zero), 0), e(errno::EACCES));
-            let zero_rw = ktest_open(3, b"/dev/zero", OpenFlags::O_RDWR, 0o644)?;
+            let zero_rw = ktest_open(3, b"/dev/zero", OpenFlags::O_RDWR)?;
             let shared = map(P, RW, SHARED, zero_rw, 0)?;
             copy_to_user(shared, b"shared-zero").map_err(|_| "store shared")?;
             kassert_eq!(sys_munmap(shared, P), 0);

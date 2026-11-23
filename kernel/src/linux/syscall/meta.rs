@@ -267,7 +267,7 @@ mod tests {
     use lumen_vm::{MapPlace, Prot};
 
     use super::super::at::{self, Dirfd, Fd, UserPtr};
-    use super::super::fd::{ktest_fd, ktest_install, ktest_user_path, sys_close, sys_open, sys_openat};
+    use super::super::fd::{ktest_fd, ktest_install, ktest_unlink, ktest_user_path, sys_close, sys_open, sys_openat};
     use super::super::neg_errno;
     use super::*;
     use crate::linux::general;
@@ -331,7 +331,7 @@ mod tests {
 
     fn remove(paths: &[&[u8]]) {
         for p in paths {
-            let _ = lumen_vfs::unlink_at(crate::vfs::tables(), None, p, false);
+            let _ = ktest_unlink(p);
         }
     }
 
@@ -720,17 +720,23 @@ mod tests {
                 // descriptor installed on a scratch volume's file; on its
                 // read-only mount, `-EROFS`.
                 let vol = Ext4Volume::new(200)?;
-                let big = vol.root.create(b"big", 0o644).map_err(|_| "create on ext4")?;
-                let fd = ktest_install(&big, b"/big", OpenFlags::O_RDWR)?;
-                drop(big);
+                // Each inode a temporary, dropped at the end of its install's
+                // statement: the open file's reference is the test's only one.
+                let fd = ktest_install(
+                    &vol.root.create(b"big", 0o644).map_err(|_| "create on ext4")?,
+                    b"/big-rw",
+                    OpenFlags::O_RDWR,
+                )?;
                 kassert_eq!(sys_ftruncate(fd, i64::MAX as u64), neg_errno(errno::EFBIG));
                 kassert_eq!(sys_ftruncate(fd, 5000), 0);
                 kassert_eq!(fd.file().map(|f| f.inode.stat().map(|m| m.size)), Ok(Ok(5000)));
                 kassert_eq!(sys_close(fd), 0);
                 let ro_root = vol.remount_ro(201)?;
-                let ro_big = ro_root.lookup(b"big").map_err(|_| "lookup on the ro mount")?;
-                let fd = ktest_install(&ro_big, b"/big", OpenFlags::O_RDWR)?;
-                drop(ro_big);
+                let fd = ktest_install(
+                    &ro_root.lookup(b"big").map_err(|_| "lookup on the ro mount")?,
+                    b"/big-ro",
+                    OpenFlags::O_RDWR,
+                )?;
                 kassert_eq!(sys_ftruncate(fd, 0), neg_errno(errno::EROFS));
                 kassert_eq!(sys_close(fd), 0);
                 remove(&[b"/tmp/meta-ktest-terr"]);

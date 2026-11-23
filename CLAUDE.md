@@ -415,7 +415,10 @@ one is its own PR that updates that doc first.
   `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, with #255's
   `mmap` of a descriptor and `msync` (ktests in `mem/tests.rs`), `proc`;
   `fd` holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
-  terminals by `VfsInode::is_tty` to the console, `dir` `getcwd`,
+  terminals by `VfsInode::is_tty` to the console, and the syscall ktests'
+  shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_open`,
+  `ktest_install`: a descriptor on a volume no mount holds, `KtestTmpFile`,
+  `ktest_unlink`), `dir` `getcwd`,
   `getdents64` (the filesystem's `readdir` cursor in `dir_cursor`), `chdir`
   and `fchdir`; every M7 syscall implemented, the stubs gone with #255's
   `msync`; `lock` holds `fcntl` and `flock`: `lock_or_wait`, the retry loop
