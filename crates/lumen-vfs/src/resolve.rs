@@ -67,14 +67,11 @@ pub struct ParentTarget<'a> {
 /// (`mkdirat`'s `-EEXIST`; `rmdir`'s `-EBUSY`, `-EINVAL` and `-ENOTEMPTY`;
 /// ...). A name's bytes come only out of a pattern on it, so the other
 /// three always get some answer. `ops.rs` reads it only by a `match` on
-/// `final_component()`, which doesn't compile if it leaves a case out;
-/// clippy refuses a `_` or catch-all arm there
-/// (`clippy::wildcard_enum_match_arm`, denied in that file), and a host
-/// test, `ops_reads_final_only_through_a_direct_match`, refuses any other
-/// way of reading one there (`let ... else`, `if let`, `matches!`, a
-/// tuple, a method path). Neither sees a helper whose own `match` answers
-/// the three alike for several operations; review does, and code outside
-/// `ops.rs` is held to all of it by convention only.
+/// `final_component()`, which doesn't compile if it leaves a case out; the
+/// comment at the top of `ops.rs` says what keeps it to that form (clippy
+/// lints forbidden there and the host test
+/// `ops_reads_final_only_through_a_direct_match`) and what they miss. Code
+/// outside `ops.rs` is held to it by convention only.
 ///
 /// Stable rustdoc doesn't check a `compile_fail` example's error code, so
 /// each one is followed by a twin that is the same but for the part meant

@@ -5745,13 +5745,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     filesystem's own `..`, where Linux says `-EISDIR`, #318), ahead of
     `-EROFS`. In `ops.rs` each reads it with a `match` on
     `final_component()`, so one that leaves a case out doesn't compile;
-    `clippy::wildcard_enum_match_arm`, denied in that file, refuses a `_` or
-    catch-all arm, and the host test
-    `ops_reads_final_only_through_a_direct_match` any other way of reading
-    it there (`let ... else`, `if let`, `matches!`, a tuple, a method path).
-    Neither sees a shared helper whose own `match` answers the three alike;
-    review keeps each operation's match in the operation, and outside
-    `ops.rs` all of it is a convention.
+    clippy lints forbidden in that file and the host test
+    `ops_reads_final_only_through_a_direct_match` keep it to that form. The
+    comment at the top of `ops.rs` is the one statement of what they refuse
+    and what they miss (a shared helper answering the three alike, for
+    one); outside `ops.rs` all of it is a convention.
   - **Namespace operations check in Linux's order** (`unlink_at`,
     `rename_at2`, `link_at` as v6.12's `fs/namei.c`; `readlink_at` as
     `fs/stat.c`; #254):

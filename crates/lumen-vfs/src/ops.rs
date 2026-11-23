@@ -3,16 +3,30 @@
 //! Lock-9 cache invalidation, Lock-3 `rename_lock`, and Gate 6 detach rules.
 
 // A last component (`resolve::Final`) is read here only as the scrutinee of
-// a `match` on `final_component()` whose arms are `Final::` patterns (no
-// `let ... else`, `if let`, `matches!`, tuple, method path, or `Final` held
-// in a variable: the host test `ops_reads_final_only_through_a_direct_match`
-// refuses those), so an operation that leaves a case out doesn't compile,
-// and `make lint` refuses a `_` or catch-all arm answering them all alike
-// (#309). Keep each operation's match in the operation: a shared helper
-// answering the three alike would pass both checks. The deny covers every
-// enum matched in this file, not only `Final`: name the cases of the others
-// too, or allow it on one match with the reason.
-#![deny(clippy::wildcard_enum_match_arm)]
+// a `match` on `final_component()` whose arms are `Final::` patterns, so an
+// operation that leaves a case out doesn't compile (#309). This is the one
+// statement of what holds that (`Final`'s rustdoc and ARCHITECTURE section 9
+// point here):
+// - The host test `ops_reads_final_only_through_a_direct_match` refuses any
+//   other way of reading one here: `let ... else`, `if let`, `matches!`, a
+//   tuple scrutinee, a method path, a `Final` held in a variable, a second
+//   `final_component()` in the scrutinee. On the safe side it also refuses
+//   some direct matches it doesn't parse (`return match`, a typed or `mut`
+//   binding, a comment after the `{`): write those as it reads them.
+// - The lints forbidden below refuse a `_` or catch-all arm on that match,
+//   whichever fires: covering several cases (`wildcard_enum_match_arm`), one
+//   (`match_wildcard_for_single_variants`), or in an or-pattern
+//   (`wildcard_in_or_patterns`). Forbidden, not denied, so no `allow` or
+//   `expect` (of a lint or of its group) can switch them off for one match.
+//   They cover every enum matched in this file, not only `Final`: name the
+//   cases of the others too.
+// - Rustc doesn't count a guarded arm toward covering every case, so a case
+//   added to `Final` needs adding by hand to a guard naming the others
+//   (`open_once`'s `O_EXCL` arm).
+// None of them sees a shared helper whose own `match` answers the three
+// alike, or a `Final` rebuilt under another name (`use ... as`) and read
+// that way: keep each operation's match in the operation.
+#![forbid(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants, clippy::wildcard_in_or_patterns)]
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -357,6 +371,8 @@ fn open_once(
                 )?
                 .inode)
             };
+            // Rustc doesn't count this guarded arm toward covering every
+            // case: a case added to `Final` needs adding to it by hand.
             let name = match target.final_component() {
                 Final::Root | Final::Dot | Final::DotDot if flags.has_excl() => return Err(VfsError::Exist),
                 Final::Root => break 'follow cross_mounts_down(env, Arc::clone(&target.parent)),
