@@ -403,17 +403,6 @@ impl<F: LockFamily> VfsTables<F> {
         )
     }
 
-    /// Empty tables holding at most `dentry_capacity` names and remembering
-    /// `removal_history` inode removals.
-    #[cfg(test)]
-    pub(crate) fn with_capacities(dentry_capacity: usize, removal_history: usize) -> Self {
-        Self::from_locks(
-            F::Lock::new(MountTable::new()),
-            F::Lock::new(DentryCache::new(dentry_capacity)),
-            F::Lock::new(InodeCache::with_removal_history(removal_history)),
-        )
-    }
-
     /// Mount `fs` at `/` and seed its root inode into `InodeCache`.
     pub fn mount_root(&self, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
         let root = fs.root_inode();

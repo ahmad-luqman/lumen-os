@@ -75,7 +75,7 @@ impl<T> KernelVfsLock<T> {
     /// [`VfsLock::new`] as a `const fn`, for [`TABLES`] only (a trait
     /// method can't be `const` on stable); everything else uses
     /// `VfsLock::new`.
-    pub const fn new_const(val: T) -> Self {
+    const fn new_const(val: T) -> Self {
         Self(SleepMutex::new(val))
     }
 }

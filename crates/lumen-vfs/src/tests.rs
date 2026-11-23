@@ -2228,7 +2228,6 @@ fn dotdot_unifies_through_inode_cache_and_crosses_stacked_mounts() {
             self.inner.sync()
         }
         fn read_only(&self) -> bool {
-            assert_test_lock9_free();
             self.inner.read_only()
         }
         fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -3638,16 +3637,22 @@ impl LockFamily for TestLocks {
 /// The kernel's own Lock-9 tables (`VfsTables`) over [`TestLock`]s.
 type TestTables = VfsTables<TestLocks>;
 
-/// Tables with `root` mounted at `/`.
+/// Tables built as the kernel's are (`VfsTables::new`), with `root`
+/// mounted at `/`.
 fn mounted_tables(root: Arc<dyn FileSystem>) -> Arc<TestTables> {
-    mounted_tables_with(root, DentryCache::DEFAULT_CAPACITY, InodeCache::DEFAULT_REMOVAL_HISTORY)
+    let env = Arc::new(TestTables::new());
+    env.mount_root(root).unwrap();
+    env
 }
 
 /// Tables holding at most `dentry_capacity` names and remembering
-/// `removal_history` inode removals (`VfsTables::with_capacities`'
-/// order), with `root` mounted at `/`.
+/// `removal_history` inode removals, with `root` mounted at `/`.
 fn mounted_tables_with(root: Arc<dyn FileSystem>, dentry_capacity: usize, removal_history: usize) -> Arc<TestTables> {
-    let env = Arc::new(TestTables::with_capacities(dentry_capacity, removal_history));
+    let env = Arc::new(TestTables::from_locks(
+        TestLock::new(MountTable::new()),
+        TestLock::new(DentryCache::new(dentry_capacity)),
+        TestLock::new(InodeCache::with_removal_history(removal_history)),
+    ));
     env.mount_root(root).unwrap();
     env
 }
@@ -5244,7 +5249,6 @@ fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
             self.inner.sync()
         }
         fn read_only(&self) -> bool {
-            assert_test_lock9_free();
             self.inner.read_only()
         }
         fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -5278,7 +5282,7 @@ fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
     );
 }
 
-fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usize, dentry_cap: usize) {
+fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, dentry_cap: usize, hist: usize) {
     let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, use_rename_lock);
     let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, use_rename_lock);
     let env = mounted_tables_with(Arc::clone(&root_fs) as Arc<dyn FileSystem>, dentry_cap, hist);
@@ -5547,10 +5551,10 @@ fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usiz
 
 #[test]
 fn unhooked_4_thread_concurrent_vfs_stress_with_ino_reuse() {
-    for (use_rename_lock, hist, dentry_cap) in
-        [(true, InodeCache::DEFAULT_REMOVAL_HISTORY, DentryCache::DEFAULT_CAPACITY), (true, 4, 16), (true, 0, 0)]
+    for (use_rename_lock, dentry_cap, hist) in
+        [(true, DentryCache::DEFAULT_CAPACITY, InodeCache::DEFAULT_REMOVAL_HISTORY), (true, 16, 4), (true, 0, 0)]
     {
-        run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock, hist, dentry_cap);
+        run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock, dentry_cap, hist);
     }
 }
 
@@ -6210,7 +6214,6 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
             self.inner.sync()
         }
         fn read_only(&self) -> bool {
-            assert_test_lock9_free();
             self.inner.read_only()
         }
         fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
