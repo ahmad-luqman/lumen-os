@@ -270,7 +270,7 @@ VFS_EXACT_LINES = {
     # page_cache_write_from_refuses_at_the_hard_limit_before_filling,
     # page_cache_write_from_refuses_a_page_the_cache_filled_up_for,
     # page_cache_map_page_asks_the_hard_cap_before_and_after_make and
-    # page_cache_ext4_fsync_after_a_refused_write_past_the_end_succeeds (#321,
+    # page_cache_ext4_fdatasync_after_a_refused_write_past_the_end_succeeds (#321,
     # a write refused past the end): one each
     # (one crossing each, however many refusals: page_cache's
     # hard_limit_crossing).

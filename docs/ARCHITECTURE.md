@@ -3679,8 +3679,9 @@ route through the VFS and real process working directory:
   `musl` stdio buffering and `busybox`); `FIOCLEX`/`FIONCLEX`/`FIONBIO`
   update per-FD `FD_CLOEXEC` / `O_NONBLOCK` on any open non-`O_PATH` FD.
 - **`readv` (19):** loops across all non-empty `iov` spans for regular files
-  (stopping early only on EOF or error), while keeping single-read early return
-  on console/tty FDs.
+  (stopping early only on EOF, an error, or a short span: the page cache's
+  short count for an error past a span's first page, #321), while keeping
+  single-read early return on console/tty FDs.
 - **`poll` (7):** regular files, directories, `/proc/*`, and always-ready
   character devices (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`)
   report `POLLIN | POLLOUT` immediately (matching Linux), while console FDs

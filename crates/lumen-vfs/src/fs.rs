@@ -193,9 +193,9 @@ pub trait VfsInode: Send + Sync {
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError>;
     /// Read up to `buf.len()` bytes at `offset`, as `pread(2)`: how many
     /// were read, 0 at or past the end. A count short of what lies before
-    /// the end is not EOF alone: a filesystem error past the first page
-    /// read returns the bytes before it, and the next read, starting there,
-    /// returns the error (the kernel's page cache, as Linux's
+    /// the end is not EOF alone: an error past the first page read returns
+    /// the bytes before it, and the next read, starting there, returns the
+    /// error if it happens again (the kernel's page cache, as Linux's
     /// `filemap_read`).
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError>;
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError>;

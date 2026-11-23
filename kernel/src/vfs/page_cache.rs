@@ -959,12 +959,9 @@ impl PageCache {
     /// A page not cached is asked of `miss`, by index: `Some(page)`, a new
     /// page holding the file's bytes there, is read and then inserted (its
     /// insert's error returned); `None` reads as zeros without a page (a
-    /// hole). An error from `miss` (or the insert) is returned only when no
-    /// page before the failing one was copied; else the bytes of the pages
-    /// before it are returned, a short count ([`page::short_count`], as
-    /// Linux's `filemap_read` and [`Self::write_from`] answer, #321), and
-    /// the caller's next read, starting at the failing page, returns the
-    /// error. (The pages loaded before the error stay cached.) The caller
+    /// hole). An error from `miss` (or the insert) is returned only when it
+    /// is the first page's, else a short count ([`page::short_count`],
+    /// #321). (The pages loaded before the error stay cached.) The caller
     /// holds the inode's Lock 4, under which it read `file_size`, and this
     /// lock (Lock 5).
     pub fn read_into(
@@ -1009,11 +1006,11 @@ impl PageCache {
     /// past `old_size`, as a growth to `offset` would ([`Self::resize`]),
     /// and they stay zeroed even if the write then fails (they lie past the
     /// end, so the file reads the same). That page is marked dirty, if
-    /// written back, only once the write has written something, so that its
-    /// zeros lie below the new size; a write refused outright (an `Err`)
-    /// leaves the size as it was and a clean tail page clean, so that no
-    /// writeback of it can fail, and turn up as a later `fsync`'s `EIO`, for
-    /// a write the caller saw fail (#321). A linked `ext4` file's pages
+    /// written back, only once the write has written something (only then
+    /// do its zeros lie below the new size); a write refused outright (an
+    /// `Err`) leaves the size as it was and a clean tail page clean, so that
+    /// no writeback of it can fail, and turn up as a later `fsync`'s `EIO`,
+    /// for a write the caller saw fail (#321). A linked `ext4` file's pages
     /// ([`Self::writes_back`]) are marked dirty, and a new one is refused
     /// at the hard limit ([`Self::admit_unreclaimable`]) before `fill`
     /// runs. That is an early answer: `fill` may sleep (a disk read) or be
@@ -1021,10 +1018,10 @@ impl PageCache {
     /// asks again and refuses the page `fill` made. Returns how many bytes
     /// were written: an error (the admission's, `fill`'s or the insert's,
     /// either check's refusal alike) only when it is the first page's, else
-    /// a short count ([`page::short_count`]). `FBig` when the range ends past `u64::MAX`, before
-    /// anything changes. The caller holds the inode's Lock 4 (`old_size` is
-    /// the size it read under it) and this lock (Lock 5), and sets the size
-    /// and times.
+    /// a short count ([`page::short_count`]). `FBig` when the range ends
+    /// past `u64::MAX`, before anything changes. The caller holds the
+    /// inode's Lock 4 (`old_size` is the size it read under it) and this
+    /// lock (Lock 5), and sets the size and times.
     pub fn write_from(
         &mut self,
         offset: u64,
@@ -1039,9 +1036,8 @@ impl PageCache {
         let done = page::short_count(spans, |span| self.write_span(span, &buf[span.buf()], &mut fill))?;
         if let Some(tail) = tail
             && done > 0
-            && self.writes_back()
         {
-            tail.set_dirty();
+            self.mark_dirty(&tail);
         }
         Ok(done)
     }
@@ -1055,18 +1051,22 @@ impl PageCache {
     ) -> Result<(), VfsError> {
         if let Some(cached) = self.pages.get(&span.index()) {
             cached.write_bytes(span.in_page(), src);
-            if self.writes_back() {
-                cached.set_dirty();
-            }
+            self.mark_dirty(cached);
             return Ok(());
         }
         self.admit_unreclaimable()?;
         let fresh = fill(span)?;
         fresh.write_bytes(span.in_page(), src);
-        if self.writes_back() {
-            fresh.set_dirty();
-        }
+        self.mark_dirty(&fresh);
         self.insert_new(span.index(), Arc::new(fresh))
+    }
+
+    /// Mark `page` dirty if this cache's pages are written back
+    /// ([`Self::writes_back`]): a write's or a truncate's change to it.
+    fn mark_dirty(&self, page: &CachePage) {
+        if self.writes_back() {
+            page.set_dirty();
+        }
     }
 
     /// The cache's side of a change of the file's size from `old_size` to
@@ -1084,10 +1084,8 @@ impl PageCache {
         if new_size < old_size {
             self.drop_from(page::pages_in(new_size));
         }
-        if let Some(cached) = self.zero_tail(old_size, new_size)
-            && self.writes_back()
-        {
-            cached.set_dirty();
+        if let Some(cached) = self.zero_tail(old_size, new_size) {
+            self.mark_dirty(&cached);
         }
     }
 
@@ -1097,6 +1095,7 @@ impl PageCache {
     /// mark it dirty if it is written back: [`Self::resize`] at once, a
     /// write past the end ([`Self::write_from`]) once it has written
     /// something.
+    #[must_use = "a grown tail page's zeros reach the disk only once it is marked dirty"]
     fn zero_tail(&self, old_size: u64, new_size: u64) -> Option<Arc<CachePage>> {
         let tail = page::resize_tail(old_size, new_size)?;
         let cached = self.pages.get(&tail.index())?;
@@ -1504,9 +1503,10 @@ crate::ktest!(
         // A write past the end zeroes the old last page's bytes past the end
         // first, and marks that page dirty only once it has written
         // something (its zeros then lie below the new size): a write refused
-        // outright leaves a clean tail page clean, so no writeback a failing
-        // disk fails again, and no `fsync` EIO, comes of a write the caller
-        // saw fail (#321). A short write and a whole one mark it dirty.
+        // outright leaves a clean tail page clean, so a failing disk can't
+        // fail its writeback, and a later `fsync` can't return EIO for it,
+        // after a write the caller saw fail (#321). A short write and a
+        // whole one mark it dirty.
         use crate::{kassert, kassert_eq};
         let p = PAGE_SIZE as u64;
         let size = 100; // page 0 is the tail
@@ -1531,7 +1531,7 @@ crate::ktest!(
         kassert!(whole.get(0).ok_or("page 0")?.is_dirty());
         // A tmpfs file's pages are never written back: its tail page isn't
         // marked dirty either.
-        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new("ktest", 4)));
+        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new_pages("ktest", 4)));
         tmp.insert_new(0, Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?)).map_err(|_| "insert")?;
         kassert_eq!(tmp.write_from(2 * p, b"ab", size, |_| CachePage::new_zeroed()), Ok(2));
         kassert!(!tmp.get(0).ok_or("tmpfs page 0")?.is_dirty());
@@ -1540,7 +1540,7 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn page_cache_ext4_fsync_after_a_refused_write_past_the_end_succeeds() {
+    fn page_cache_ext4_fdatasync_after_a_refused_write_past_the_end_succeeds() {
         // End to end (#321): an ext4 file whose last page is cached and
         // clean; a write past the end refused at the hard limit (one
         // hard-limit warning, pinned by test_ktest.py); then every block
