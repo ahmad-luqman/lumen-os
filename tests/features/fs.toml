@@ -162,7 +162,7 @@ tests = [
 ]
 
 [[feature]]
-name = "tmpfs quota charges inodes, directory entries and symlink targets as well as pages (#267): past it create, mkdir, symlink, link and a rename to a longer new name fail with ENOSPC and leave nothing behind (an existing name still EEXIST); a rename to a name no longer than the old one fits on a full mount; unlink gives a name's room back, the last reference an inode's, and dropping a mount every byte"
+name = "tmpfs quota charges inodes, directory entries and symlink targets as well as pages (#267): past it create, mkdir, symlink, link and a rename to a new name costing more than the old fail with ENOSPC and leave nothing behind (an existing name still EEXIST); a rename to a name no longer than the old one fits on a full mount; unlink gives a name's room back, the last reference an inode's, and dropping a mount every byte"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_charges_inodes_names_and_symlink_targets",

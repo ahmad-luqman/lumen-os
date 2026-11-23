@@ -215,7 +215,7 @@ VFS_SWEEP_LINES = (
 )
 VFS_EXACT_LINES = {
     # page_quota_release_saturates_and_detached_quota_reports_nospc
-    r"ERROR vfs: page quota ktest \(4 pages\): released 5 pages with only 2 reserved": 1,
+    r"ERROR vfs: quota ktest \(16384 bytes\): released 5 pages with only 8192 bytes reserved": 1,
     # ext4_unlink_restores_an_inline_symlink_when_the_directory_cant_be_read_back
     r"ERROR vfs: ext4 inode \d+: restoring the inline symlink target failed; run e2fsck": 1,
     # ext4_truncate_and_open_unlink_preserve_state_on_io_error

@@ -5862,9 +5862,14 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   bounded by a configurable memory quota (default 32 MiB in M7, returning
   `-ENOSPC` instead of exhausting kernel frames or heap). The quota, counted
   in bytes (`QuotaCounter`), pays for the data pages and, since #267, for
-  each inode but the root (`tmpfs::INODE_COST`: the inode as allocated),
-  each directory entry (`tmpfs::entry_cost`: the name, kept twice, and its
-  map slots) and each symlink's target bytes. A name is charged while it
+  each inode but the root (`tmpfs::INODE_COST`: the inode as allocated;
+  a directory's two maps' root nodes, `tmpfs::DIR_COST`), each directory
+  entry (`tmpfs::entry_cost`: the name's heap block, kept twice, and its
+  share of the maps' other nodes, each holding at least five entries) and
+  each symlink's target's heap block: an estimate from above of what each
+  takes from the kernel heap, from std's `BTreeMap` layout (B = 6) and
+  `lumen_heap`'s 16-byte granule (a file's page map and advisory locks are
+  not charged). A name is charged while it
   exists, an inode until its last reference goes (an unlinked file still
   open keeps its charge, as its pages), and a rename to a new name is
   charged net of the old name it frees, so on a full mount a rename to a

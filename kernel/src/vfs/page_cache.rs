@@ -176,10 +176,9 @@ impl QuotaCounter {
         if let Some(had) = self.release_counted(pages.saturating_mul(PAGE_SIZE)) {
             log::error!(
                 target: "vfs",
-                "page quota {} ({} pages): released {pages} pages with only {} reserved",
+                "quota {} ({} bytes): released {pages} pages with only {had} bytes reserved",
                 self.name,
-                self.limit_bytes / PAGE_SIZE,
-                had.div_ceil(PAGE_SIZE)
+                self.limit_bytes
             );
         }
     }
