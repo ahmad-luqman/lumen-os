@@ -426,9 +426,10 @@ mod charge {
             let EntryCharge { mut reserved, name } = charge;
             debug_assert!(!self.by_name.contains_key(&name), "tmpfs: {:?} added twice", Escaped(&name));
             debug_assert!(
-                Arc::ptr_eq(&reserved.quota, &self.quota),
-                "tmpfs: {:?} charged to another quota",
-                Escaped(&name)
+                Arc::ptr_eq(&reserved.quota, &self.quota) && reserved.bytes == entry_cost(name.len()),
+                "tmpfs: {:?} charged {} bytes, or to another quota",
+                Escaped(&name),
+                reserved.bytes
             );
             // From here this directory gives it back (`take`, its drop).
             reserved.bytes = 0;
@@ -452,10 +453,11 @@ mod charge {
         /// to the new name, and which is given back if dropped).
         pub(super) fn take(&mut self, name: &[u8]) -> Option<(Arc<TmpfsInode>, EntryCharge)> {
             let seq = self.by_name.remove(name)?;
+            // The name's charge comes out with it, whatever `by_seq` holds.
+            let reserved = Reserved { quota: Arc::clone(&self.quota), bytes: entry_cost(name.len()) };
             let entry = self.by_seq.remove(&seq);
             debug_assert!(entry.is_some(), "tmpfs: {:?}'s number {seq} had no entry", Escaped(name));
             let (name, child) = entry?;
-            let reserved = Reserved { quota: Arc::clone(&self.quota), bytes: entry_cost(name.len()) };
             Some((child, EntryCharge { reserved, name }))
         }
 
@@ -1681,8 +1683,10 @@ crate::ktest!(
     fn tmpfs_quota_charges_cover_what_the_heap_gives() {
         // #267's bound: what a mount charges for inodes, entries and targets
         // is at least what they take from the kernel heap
-        // (`heap::stats().used`, which nothing else moves meanwhile: names,
-        // targets and the holder are made first). Three shapes: one
+        // (`heap::stats().used`, which nothing else moves meanwhile: the
+        // other CPUs idle through the ktests, as `app::tests`' exact heap
+        // checks also rely on, and names, targets and the holder are made
+        // first). Three shapes: one
         // directory with hundreds of long names, so both maps grow nodes
         // past their roots (an entry's share); the same after removing every
         // other name (nodes at their emptiest); many directories of one
