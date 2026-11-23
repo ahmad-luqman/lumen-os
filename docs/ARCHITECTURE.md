@@ -6091,7 +6091,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   (one per mount), a file's page map, advisory locks, and the VFS caches'
   entries. A name is charged while it exists, an inode until its last
   reference goes (an unlinked file still open keeps its charge, as its
-  pages). A rename to a new name moves the old name's charge to it,
+  pages; so does a removed directory's parent that the inode cache's
+  record for `..` holds (#318), until that record is pruned once nothing
+  else holds the removed directory: at the next directory removal on the
+  mount, or the next `..` taken from a removed directory). A rename to a new name moves the old name's charge to it,
   reserving only what the new one costs more before anything changes: on
   a full mount a name no costlier than the old one still fits, and the
   count never passes the limit.

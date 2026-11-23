@@ -1456,7 +1456,7 @@ crate::ktest!(
         kassert_eq!(entry_cost(255) - entry_cost(0), 2 * 256); // two 16-byte-granule blocks
         const N: usize = 6;
         let file_cost = INODE_COST + entry_cost(8);
-        let fs = Tmpfs::new(DevId::makedev(0, 135), N * file_cost);
+        let fs = Tmpfs::new(DevId::makedev(0, 144), N * file_cost);
         let root = fs.root_inode();
         let name = |i: usize| format!("f{i:07}").into_bytes();
         let mut held = Vec::new();
@@ -1782,7 +1782,7 @@ crate::ktest!(
         use lumen_vfs::{OpenFlags, open_inode, unlink_at};
         const FILES: usize = 5;
         let file_cost = INODE_COST + entry_cost(8);
-        let fs = Tmpfs::new(DevId::makedev(0, 142), FILES * file_cost);
+        let fs = Tmpfs::new(DevId::makedev(0, 145), FILES * file_cost);
         let tables = KernelVfsTables::new();
         tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
         let create = OpenFlags::from_bits_truncate(OpenFlags::O_CREAT | OpenFlags::O_WRONLY);
