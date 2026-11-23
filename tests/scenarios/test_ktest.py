@@ -190,7 +190,8 @@ def test_in_kernel_tests_pass(boot):
 # sweeps' families (link counts kept in memory after a failed undo, rename
 # undos left inconsistent, unlinks whose outcome can't be read back, renames'
 # replaced targets whose free failed, rename targets that couldn't be taken
-# out or put back) depend on how many writes `ext4plus`
+# out or put back, moved directories whose parents' fix-ups failed) depend on
+# how many writes `ext4plus`
 # makes, so they're counted as present; every
 # other line is counted exactly, and a line matching none of these fails.
 _DEV = r"DevId\(\d+\)"
@@ -218,6 +219,14 @@ VFS_SWEEP_LINES = (
     (
         rf"ERROR vfs: ext4 {_DEV} directory \d+: taking rename target inode \d+ out failed and the directory "
         r"doesn't read back; assuming its entry is still there; run e2fsck"
+    ),
+    # A directory move whose unlink failed after taking the old entry out
+    # (so it moved), its parents' fix-ups failing too
+    # (ext4_directory_move_that_commits_before_failing_fixes_its_parents's
+    # pairs of landed failed writes, #323).
+    (
+        rf"ERROR vfs: ext4 {_DEV}: directory inode \d+ moved from directory \d+ to \d+ despite an unlink error, "
+        r"but fixing its parents failed: \w+; run e2fsck"
     ),
     # A rename's target put back after a failed move, the put-back failing
     # too (ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated).

@@ -105,18 +105,15 @@ impl NlinkBounds {
     /// A raise of `ino`'s count on disk to at least `min` (entries that may
     /// exist call for it, so a count below it frees an inode still named):
     /// `landed`, or failed with the disk then reading `disk`. Either way a
-    /// ceiling below `min` goes, since [`Self::apply`] would cap the count
-    /// under it; then a landed raise drops the floor ([`Self::clear_floor`])
-    /// and a failed one keeps at least `min` ([`Self::raise_floor`], nothing
-    /// when the disk holds it). Whether the floor kept changed.
+    /// bound whose ceiling is below `min` goes, floor and all (the floor is
+    /// at most that ceiling, so below `min` too), since [`Self::apply`] would
+    /// cap the count under it; then a landed raise drops the floor
+    /// ([`Self::clear_floor`]) and a failed one keeps at least `min`
+    /// ([`Self::raise_floor`], nothing when the disk holds it). Whether the
+    /// floor kept changed.
     pub fn raised_to(&mut self, ino: u32, min: u32, landed: bool, disk: Option<u32>) -> bool {
-        if let Some(bound) = self.bounds.get_mut(&ino)
-            && bound.ceiling.is_some_and(|c| c < min)
-        {
-            bound.ceiling = None;
-            if bound.is_trivial() {
-                self.bounds.remove(&ino);
-            }
+        if self.ceiling(ino).is_some_and(|c| c < min) {
+            self.bounds.remove(&ino);
         }
         if landed {
             self.clear_floor(ino);
@@ -232,6 +229,9 @@ mod tests {
         assert!(b.reconcile(1, None, 2));
         assert!(!b.raised_to(1, 3, false, Some(3)));
         assert_eq!((b.apply(1, 3), b.ceiling(1)), (3, None));
+        // The pin's floor goes with it: a lower count later is not raised.
+        assert_eq!((b.floor(1), b.apply(1, 1)), (0, 1));
+        assert!(b.bounds.is_empty());
         // Failed, the disk unreadable or low: a floor of 3, no ceiling.
         assert!(b.reconcile(1, None, 2));
         assert!(b.raised_to(1, 3, false, None));

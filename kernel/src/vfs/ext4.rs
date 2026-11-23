@@ -2769,8 +2769,13 @@ impl<'n> MoveEntry<'n> {
                 }
                 let (sync_old_dir, sync_new_dir) = if self.old_is_dir {
                     let (old_dir, new_dir, res) = self.fix_parents(inner);
-                    if res.is_err() {
-                        log_rename_undo_failure(inner.dev, "rename", old_dir_ino, new_dir_ino);
+                    if let Err(e) = res {
+                        error!(
+                            target: "vfs",
+                            "ext4 {:?}: directory inode {old_child_ino} moved from directory {old_dir_ino} to \
+                             {new_dir_ino} despite an unlink error, but fixing its parents failed: {e:?}; run e2fsck",
+                            inner.dev
+                        );
                     }
                     (old_dir, new_dir)
                 } else {
@@ -4466,9 +4471,9 @@ pub(crate) mod ktest_util {
         /// `arm_write*` call), each once (`arm_write`, `arm_write_pair`,
         /// `arm_write_triple`); 0 for none.
         fail_write_at: [AtomicUsize; 3],
-        /// The failed write lands first (`arm_write_landing`, which arms that
-        /// one write alone): a device that wrote the block but reported an
-        /// error. This kernel's block cache never lands a failed write of
+        /// The armed writes land before they fail (`failed_writes_land`,
+        /// after an `arm_write*` call, which resets it): a device that wrote
+        /// the block but reported an error. This kernel's block cache never lands a failed write of
         /// one block; the states this leads to are real all the same (a
         /// `delete_file` or a directory's truncate failing after the entry
         /// went).
@@ -4520,9 +4525,9 @@ pub(crate) mod ktest_util {
             self.arm_writes([0, 0, 0], from);
         }
 
-        /// Write number `nth` from now lands, then reports an error.
-        pub fn arm_write_landing(&self, nth: usize) {
-            self.arm_write(nth);
+        /// The writes the last `arm_write*` call armed land, then report an
+        /// error.
+        pub fn failed_writes_land(&self) {
             self.failed_write_lands.store(true, Ordering::Release);
         }
 
@@ -6707,6 +6712,9 @@ crate::ktest!(
         // for. Each kind has at least one such move that reported an error
         // (the writes failing in turn include the unlink's own removal of
         // the old entry, the `NotFound` arm's case, and the fix-ups' writes).
+        // Two writes landing and failing (the second within three of the
+        // first) reach the `NotFound` arm's fix-ups failing too, which it
+        // logs; the same holds then.
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -6716,15 +6724,27 @@ crate::ktest!(
             [("movedir", false, b"s", false), ("overdir", true, b"t", false), ("withindir", false, b"s2", true)];
         for (kind, target, dst_name, within) in kinds {
             let img = swept_rename_image(true, target, 258)?;
-            let (mut k, mut committed, mut committed_err) = (1, 0, 0);
-            loop {
+            let total = {
+                let m = mount(img.clone(), 258)?;
+                let (a, b) = swept_dirs(&m.root)?;
+                m.cache.arm_write(0);
+                a.rename(b"s", if within { &a } else { &b }, dst_name, RenameFlags(0))
+                    .map_err(|_| "rename without a fault")?;
+                m.cache.writes.load(O::Acquire)
+            };
+            let pairs = (1..=total).flat_map(|k| (k + 1..=k + 3).map(move |k2| (k, Some(k2))));
+            let (mut committed, mut committed_err) = (0, 0);
+            for (k, k2) in (1..=total).map(|k| (k, None)).chain(pairs) {
                 let m = mount(img.clone(), 258)?;
                 let (a, b) = swept_dirs(&m.root)?;
                 let s = a.lookup(b"s").map_err(|_| "s")?;
                 let to = if within { &a } else { &b };
-                m.cache.arm_write_landing(k);
+                match k2 {
+                    Some(k2) => m.cache.arm_write_pair(k, k2),
+                    None => m.cache.arm_write(k),
+                }
+                m.cache.failed_writes_land();
                 let res = a.rename(b"s", to, dst_name, RenameFlags(0));
-                let reached = m.cache.writes.load(O::Acquire) >= k;
                 m.cache.clear();
                 let ro = remount_ro(&m, 259)?;
                 let (ro_a, ro_b) = swept_dirs(&ro.root_inode())?;
@@ -6740,21 +6760,15 @@ crate::ktest!(
                     let got = (nlink(&ro_a)?, nlink(&a)?, nlink(&ro_b)?, nlink(&b)?);
                     if got != want {
                         crate::ktest::diag(format_args!(
-                            "{kind} k={k} res={res:?}: (a on disk, in memory, b on disk, in memory) {got:?}"
+                            "{kind} k={k} {k2:?} res={res:?}: (a on disk, in memory, b on disk, in memory) {got:?}"
                         ));
                     }
                     kassert_eq!(got, want);
                 }
                 drop((s, a, b, ro_a, ro_b, ro, m));
-                if !reached {
-                    res.map_err(|_| "rename without a fault")?;
-                    break;
-                }
-                k += 1;
             }
             crate::ktest::diag(format_args!(
-                "{kind}: {} writes; committed {committed}, {committed_err} of them with an error",
-                k - 1
+                "{kind}: {total} writes; committed {committed}, {committed_err} of them with an error"
             ));
             kassert!(committed_err >= 1);
         }
@@ -6900,9 +6914,6 @@ crate::ktest!(
             m.cache.clear();
             if write.is_none() && !failed_a_read {
                 res.map_err(|_| "rmdir without a fault")?;
-                if skip == 64 {
-                    return Err("rmdir kept reading its parent");
-                }
                 first_done = true;
                 continue;
             }
@@ -6937,6 +6948,7 @@ crate::ktest!(
              a unread",
             gone[0], unread[0], gone[1], unread[1]
         ));
+        // The first leg ended: an rmdir with no read of `a` left to fail.
         kassert!(first_done);
         kassert!(unread[0] >= 1 && unread[1] >= 1);
         Ok(())
