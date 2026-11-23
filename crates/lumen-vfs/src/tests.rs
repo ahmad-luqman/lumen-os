@@ -3833,9 +3833,9 @@ struct ReusingHandle {
 
 impl Drop for ReusingHandle {
     fn drop(&mut self) {
-        // Counted, not asserted: `InodeCache::get_or_insert` drops a losing
-        // `Arc` under Lock 9 by design; a test checks the count where it
-        // matters.
+        // Counted, not asserted: `InodeCache::get_or_insert` still drops a
+        // losing `Arc` under Lock 9 (#320); a test checks the count where
+        // it matters.
         if TEST_LOCK9_HELD.try_with(core::cell::Cell::get).unwrap_or(0) != 0 {
             self.inner.handle_drops_under_lock9.fetch_add(1, Ordering::Relaxed);
         }
