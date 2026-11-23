@@ -5617,7 +5617,11 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     (`raise_links_or_floor`), and by link's and mkdir's undo of a failed
     `Dir::link` (`undo_failed_link`) without; `unlink` and `rmdir`, unable to read
     their directory back (or finding the name on another inode), pin the
-    count they assume. A move that can't read back whether its old entry
+    count they assume, unless the child reads back zeroed (`delete_file`
+    zeroes an inode only after its entry went): its entry is then gone and
+    it may be free, so it is forgotten, never kept live where a new inode
+    could alias it, and for `rmdir` the parent is handled as for a removed
+    entry. A move that can't read back whether its old entry
     (after the unlink failed) or its new one (after undoing the link
     failed) is still there keeps the counts with the source at both names:
     the source's count from before plus one (at least 3 for a directory)
@@ -5629,7 +5633,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     it didn't: its count is one high, its old parent keeps the `..` link it
     lost, and its `..` still names that parent. Such a raise drops a
     ceiling below it, whether it lands or not (`NlinkBounds::raised_to`).
-    An exchange's undo writes the count a child's names call for, except
+    An exchange's undo that can't read its entries back likewise raises
+    each child to its count at both names (its retries can leave one at
+    both). One that can writes the count a child's names call for, except
     where that would be 0 (a child at neither name with no other link): it
     then keeps the child's count from before rather than writing 0 onto its
     allocated inode, which `e2fsck` would clear instead of reattaching in
@@ -5645,7 +5651,11 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     state, not per attempt), a move that can't tell whether its old entry
     went among them. A directory move whose fix-ups fail after its unlink
     failed past the entry (it moved; no undo runs) logs that, naming the
-    directory, both parents and the error. `create`, `mkdir` and `symlink`
+    directory, both parents and the error; a moved directory whose `..`
+    rewrite fails (a move's or an exchange's) logs it too, since its `..`
+    may still name the old parent and nothing in memory says so; and an
+    `unlink` or `rmdir` that took a last entry out and then failed freeing
+    the inode logs that it may be left half-freed. `create`, `mkdir` and `symlink`
     release the inode they allocated when linking it fails (e.g. `ENOSPC`
     growing the directory).
   - **Rename over an existing target:** the target is held, not removed,
