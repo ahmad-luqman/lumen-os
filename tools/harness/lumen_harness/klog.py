@@ -41,6 +41,14 @@ LOUD = ("ERROR", "WARN")
 LOG_LINE = re.compile(rf"{STAMP} {LEVEL} [^ \n]+: [^\n]*\n")
 
 
+# The ktest kernel's summary of the lines `klog::hold_repeats` held back
+# from serial at one call site (#347): how many (`n`), after the first, and
+# that first line from its level on (`first`, as printed before; cut ones end
+# `...`). Matched from its stamp, so the first line inside it never reads as
+# a log line of its own.
+HELD_BACK = re.compile(rf"{STAMP} INFO  klog: (?P<n>\d+) more held back like: (?P<first>[^\n]*)\n")
+
+
 def is_log_line(text: str) -> bool:
     """Whether `text` is one whole log line (its newline optional)."""
     return LOG_LINE.fullmatch(text if text.endswith("\n") else text + "\n") is not None

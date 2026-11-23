@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from lumen_harness.klog import (
+    HELD_BACK,
     HOST_TIMED,
     UNDERRUNS,
     is_host_timed,
@@ -97,3 +98,23 @@ def test_the_underrun_count_is_read_from_the_warning():
         "[    9.330000] WARN  sound: a sound found the queue empty 3 times (underruns)\n"
     )
     assert m and m["n"] == "3"
+
+
+def test_a_held_back_summary_is_read_and_its_first_line_is_no_log_line():
+    # kernel/src/klog.rs's summary of a call site's held lines (#347).
+    assert (ROOT / "kernel/src/klog.rs").read_text().count(
+        '"{count} more held back like: {first}"'
+    ) == 1
+    line = (
+        "[   11.241244] INFO  klog: 1294 more held back like: ERROR vfs: ext4 DevId(7) inode 13: "
+        "links_count on disk is 2, keeping 1 in memory until a write lands\n"
+    )
+    m = HELD_BACK.fullmatch(line)
+    assert m and m["n"] == "1294"
+    assert m["first"].startswith("ERROR vfs: ext4 DevId(7) inode 13: ")
+    # The copy of the first line inside it isn't a warning of its own.
+    assert unexpected_warnings(line) == []
+    # Found wherever its stamped line starts, as other log lines are.
+    assert HELD_BACK.search(
+        "ok 9 - x\nlumen> [    1.000000] INFO  klog: 2 more held back like: WARN  a: b\n"
+    )

@@ -1,6 +1,7 @@
 //! Lock-free trace ring buffer for the Lumen kernel (and, in [`text`], a
 //! plain byte ring for log lines, which isn't lock-free; in [`name`], the
-//! inline [`ThreadName`] the traced threads carry).
+//! inline [`ThreadName`] the traced threads carry; in [`repeats`], the table
+//! counting the log lines a ktest holds back from serial).
 //!
 //! The kernel records fixed-size binary [`Event`]s (timestamp, CPU, kind,
 //! pid, four arguments) into a [`TraceRing`] that always overwrites the
@@ -55,6 +56,7 @@ use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 pub mod kind;
 pub mod name;
+pub mod repeats;
 pub mod text;
 pub use kind::Stream;
 pub use name::ThreadName;

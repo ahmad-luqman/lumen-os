@@ -3,7 +3,7 @@
 import re
 
 import pytest
-from lumen_harness import save_ktest_tap, tap
+from lumen_harness import klog, save_ktest_tap, tap
 from lumen_harness.clock_diags import check_clock_diags
 from lumen_harness.qemu import EXIT_CRASH, EXIT_FAILURE, EXIT_SUCCESS, Devices
 
@@ -175,6 +175,7 @@ def test_in_kernel_tests_pass(boot):
     # Every transport dropped in the ktests reset its device.
     assert "after a reset" not in out
     check_vfs_log_lines(out)
+    check_held_back_lines(out)
     # Issue #3: the trace cost per event is printed as a TAP diagnostic.
     assert re.search(r"^# trace: \d+ TSC ticks per event", out, re.MULTILINE), (
         "no trace cost diagnostic"
@@ -321,20 +322,66 @@ VFS_EXACT_LINES = {
 }
 
 
+# The ktests that hold their repeated vfs lines back from serial
+# (`klog::hold_repeats`, #347): the fault sweeps, which logged about 3,600 of
+# the run's 3,700 WARN and ERROR lines, each about 30 ms on the UART under
+# KVM, and took the run past `finished`'s bound.
+VFS_HELD_KTESTS = 8
+# At most this many sweep lines on serial: each guarded ktest prints one per
+# call site it reaches (the summaries carry the rest), so a sweep logging
+# without a guard (thousands) fails here, not at the time bound.
+VFS_SWEEP_PRINTED_MAX = VFS_HELD_KTESTS * len(VFS_SWEEP_LINES)
+
+
 def check_vfs_log_lines(out):
-    """Pin the vfs ktests' WARN and ERROR lines (see VFS_EXACT_LINES)."""
-    lines = re.findall(r"((?:WARN |ERROR) vfs: .*)\n", out)
-    counts = {
-        want: sum(1 for line in lines if re.fullmatch(want, line)) for want in VFS_EXACT_LINES
-    }
+    """Pin the vfs ktests' WARN and ERROR lines (see VFS_EXACT_LINES): those
+    printed, plus those `klog::hold_repeats` held back, counted from their
+    summaries (`klog.HELD_BACK`: each a call site's lines after its first,
+    which is printed, and a copy of that first line)."""
+    # From the stamp, so a summary's copy of a first line isn't counted.
+    printed = re.findall(rf"{klog.STAMP} ((?:WARN |ERROR) vfs: .*)\n", out)
+    held = [
+        (int(m["n"]), m["first"])
+        for m in klog.HELD_BACK.finditer(out)
+        if re.match(r"(?:WARN |ERROR) vfs: ", m["first"])
+    ]
+    assert held, "no vfs lines held back from serial: the sweeps' guards are gone"
+
+    def count(want):
+        return sum(1 for line in printed if re.fullmatch(want, line)) + sum(
+            n for n, first in held if re.fullmatch(want, first)
+        )
+
+    counts = {want: count(want) for want in VFS_EXACT_LINES}
     assert counts == VFS_EXACT_LINES, counts
-    sweeps = {
-        want: sum(1 for line in lines if re.fullmatch(want, line)) for want in VFS_SWEEP_LINES
-    }
+    sweeps = {want: count(want) for want in VFS_SWEEP_LINES}
     assert all(sweeps.values()), sweeps
     known = (*VFS_EXACT_LINES, *VFS_SWEEP_LINES)
-    unknown = [line for line in lines if not any(re.fullmatch(want, line) for want in known)]
+    unknown = [
+        line
+        for line in (*printed, *(first for _, first in held))
+        if not any(re.fullmatch(want, line) for want in known)
+    ]
     assert not unknown, unknown
+    on_serial = sum(1 for line in printed if any(re.fullmatch(w, line) for w in VFS_SWEEP_LINES))
+    assert on_serial <= VFS_SWEEP_PRINTED_MAX, (on_serial, sweeps)
+
+
+def check_held_back_lines(out):
+    """`klog::repeats_held_back_from_serial_are_summarized_when_the_guard_drops`
+    on serial: the first warning of its call site, the error and both info
+    lines printed, the two repeats held back and summarized at the guard's
+    drop, and the warning after it printed."""
+    lines = [klog.without_stamp(line) for line in klog.LOG_LINE.findall(out)]
+    mine = [line for line in lines if " klogheld: " in line or "like: WARN  klogheld:" in line]
+    assert mine == [
+        "WARN  klogheld: repeated 0\n",
+        "ERROR klogheld: once\n",
+        "INFO  klogheld: info 0, never held\n",
+        "INFO  klogheld: info 1, never held\n",
+        "INFO  klog: 2 more held back like: WARN  klogheld: repeated 0\n",
+        "WARN  klogheld: after the guard\n",
+    ], mine
 
 
 # The modules holding the ktests whose claims are tight to the boot's
