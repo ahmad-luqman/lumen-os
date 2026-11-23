@@ -609,12 +609,18 @@ crate::ktest!(
             let fds = ktest_list(fds_fd, 64)?;
             kassert_eq!(ktest_type_of(&fds, "0"), Some(general::DT_LNK));
             kassert_eq!(ktest_type_of(&fds, &format!("{}", fds_fd.raw())), Some(general::DT_LNK));
-            // `/dev`: character devices.
+            // `/dev`: its six character devices, each listed once over
+            // several 64-byte calls.
             let dev_fd = ktest_open(2, b"/dev", KTEST_DIR_FLAGS)?;
             let devs = ktest_list(dev_fd, 64)?;
-            kassert!(ktest_unique(&devs));
-            kassert_eq!(ktest_type_of(&devs, "null"), Some(general::DT_CHR));
-            kassert_eq!(ktest_type_of(&devs, "zero"), Some(general::DT_CHR));
+            let mut dev_names: Vec<&str> = devs.iter().map(|r| r.name.as_str()).collect();
+            dev_names.sort_unstable();
+            kassert_eq!(dev_names, [".", "..", "console", "null", "random", "tty", "urandom", "zero"]);
+            kassert_eq!(ktest_type_of(&devs, "."), Some(general::DT_DIR));
+            kassert_eq!(ktest_type_of(&devs, ".."), Some(general::DT_DIR));
+            for node in ["console", "null", "random", "tty", "urandom", "zero"] {
+                kassert_eq!(ktest_type_of(&devs, node), Some(general::DT_CHR));
+            }
 
             // ext4: a fresh volume (not mounted), its root opened directly.
             let efs = crate::vfs::ktest_ext4(252)?;

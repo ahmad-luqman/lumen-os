@@ -189,7 +189,8 @@ def test_in_kernel_tests_pass(boot):
 # quota over-release, a read-only feature bit). The fault
 # sweeps' families (link counts kept in memory after a failed undo, rename
 # undos left inconsistent, unlinks whose outcome can't be read back, renames'
-# replaced targets whose free failed) depend on how many writes `ext4plus`
+# replaced targets whose free failed, rename targets that couldn't be taken
+# out or put back) depend on how many writes `ext4plus`
 # makes, so they're counted as present; every
 # other line is counted exactly, and a line matching none of these fails.
 _DEV = r"DevId\(\d+\)"
@@ -211,6 +212,18 @@ VFS_SWEEP_LINES = (
     (
         rf"ERROR vfs: ext4 {_DEV} directory \d+: freeing inode \d+, replaced by a rename, failed: \w+; "
         r"run e2fsck"
+    ),
+    # A rename's target that couldn't be taken out, its directory unreadable
+    # (ext4_failed_rename_that_cant_read_back_keeps_every_entry).
+    (
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: taking rename target inode \d+ out failed and the directory "
+        r"doesn't read back; assuming its entry is still there; run e2fsck"
+    ),
+    # A rename's target put back after a failed move, the put-back failing
+    # too (ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated).
+    (
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: putting rename target inode \d+ back after a failed move "
+        r"failed: \w+; its data is intact; run e2fsck"
     ),
 )
 VFS_EXACT_LINES = {
@@ -242,11 +255,17 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: fsync: ext4 {_DEV} inode \d+: block cache: block device I/O error": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 1,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
-    # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page.
+    # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page;
+    # page_cache_insert_refuses_a_dirty_ext4_page_at_the_hard_limit,
+    # page_cache_write_from_refuses_at_the_hard_limit_before_filling,
+    # page_cache_write_from_refuses_a_page_the_cache_filled_up_for and
+    # page_cache_map_page_asks_the_hard_cap_before_and_after_make: one each
+    # (one crossing each, however many refusals: page_cache's
+    # hard_limit_crossing).
     (
         r"WARN  vfs: ext4 page cache at its hard limit \(\d+ pages\): refusing new pages \(ENOSPC\) until "
         r"writeback or unmapping frees some"
-    ): 3,
+    ): 7,
     # ext4_unwritable_ro_compat_features_force_read_only
     (
         rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: ro_compat feature not supported for writing "

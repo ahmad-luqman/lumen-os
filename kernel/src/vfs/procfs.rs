@@ -12,9 +12,10 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use lumen_vfs::pseudo::fill_readdir;
 use lumen_vfs::{
-    AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, next_lock_id,
+    AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, SetTime, Timespec, VfsError, VfsInode,
+    next_lock_id,
 };
 
 use crate::arch;
@@ -415,29 +416,7 @@ impl VfsInode for ProcfsInode {
         }
     }
 
-    fn create(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn mkdir(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn unlink(&self, _name: &[u8]) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn rmdir(&self, _name: &[u8]) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn link(&self, _name: &[u8], _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn symlink(&self, _name: &[u8], _target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-        Err(VfsError::RoFs)
-    }
+    lumen_vfs::fixed_namespace_ops!();
 
     fn readlink(&self) -> Result<Vec<u8>, VfsError> {
         match self.kind {
@@ -451,16 +430,6 @@ impl VfsInode for ProcfsInode {
             }
             _ => Err(VfsError::Inval),
         }
-    }
-
-    fn rename(
-        &self,
-        _old_name: &[u8],
-        _new_dir: &Arc<dyn VfsInode>,
-        _new_name: &[u8],
-        _flags: RenameFlags,
-    ) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
     }
 
     /// Each entry's cursor is a key, not its index in today's listing, so
@@ -533,14 +502,7 @@ impl VfsInode for ProcfsInode {
             }
             _ => return Err(VfsError::NotDir),
         }
-        debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "procfs readdir keys not ascending");
-
-        for (key, (ino, itype, name)) in entries.into_iter().filter(|&(key, _)| key >= cursor) {
-            if out.len() >= max_entries {
-                break;
-            }
-            out.push(DirEntry { ino, inode_type: itype, name, next_cursor: key + 1 });
-        }
+        fill_readdir(out, cursor, max_entries, entries);
         Ok(())
     }
 
