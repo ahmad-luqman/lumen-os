@@ -191,7 +191,9 @@ def test_in_kernel_tests_pass(boot):
 # inconsistent, unlinks whose outcome can't be read back, renames' replaced
 # targets whose free failed, rename targets that couldn't be taken out or put
 # back, moved directories whose parents' fix-ups or `..` rewrite failed,
-# unlinks and rmdirs whose free failed after the entry went) depend on how
+# unlinks and rmdirs whose free failed after the entry went, children
+# forgotten after their blocks were being freed and children kept live with
+# that untold, #330) depend on how
 # many writes `ext4plus` makes, so they're counted as present; every other
 # line is counted exactly, and a line matching none of these fails.
 _DEV = r"DevId\(\d+\)"
@@ -241,11 +243,19 @@ VFS_SWEEP_LINES = (
         r"run e2fsck"
     ),
     # An unlink or rmdir whose directory couldn't be read back after
-    # `delete_file` freed the inode's blocks, not yet zeroing it: forgotten,
-    # not kept live (#330; the unlink and rmdir fault sweeps).
+    # `delete_file` had begun freeing the inode's blocks, not yet zeroing it:
+    # forgotten, not kept live (#330; the unlink and rmdir fault sweeps).
     (
-        rf"ERROR vfs: ext4 {_DEV} directory \d+: inode \d+ lost its entry and its blocks were freed \(block \d+ "
-        r"is free\) before the unlink failed, the directory unreadable; forgetting it; run e2fsck"
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: inode \d+ lost its entry and its blocks were being freed "
+        r"\(block \d+ is free\) when the unlink failed, the directory unreadable; forgetting it; run e2fsck"
+    ),
+    # One whose directory couldn't be read back and whose blocks' state
+    # couldn't be told either: kept live, saying so (the unlink sweep's leg
+    # with the block bitmap unreadable).
+    (
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: unlink of inode \d+ failed, the directory unreadable, and "
+        r"whether its blocks were freed can't be told \(.+\); keeping it live, so writes through it may reach "
+        r"another file if they were; run e2fsck"
     ),
     # A rename's target put back after a failed move, the put-back failing
     # too (ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated).

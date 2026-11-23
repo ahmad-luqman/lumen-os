@@ -5623,20 +5623,26 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     `Dir::link` (`undo_failed_link`) without; `unlink` and `rmdir`, unable to read
     their directory back (or finding the name on another inode), pin the
     count they assume, unless the child reads back zeroed or with its
-    blocks freed (`delete_file` frees an inode's blocks, then zeroes it,
-    only after its entry went): its entry is then gone and the inode or
+    blocks being freed (`delete_file` frees an inode's blocks, then zeroes
+    it, only after its entry went): its entry is then gone and the inode or
     its blocks may be handed out again, so it is forgotten rather than kept
     live where a new inode could alias it or a create in it, or a write
     through an open descriptor (it is detached, its pages never written
     back), could reach a new file given its blocks (#330), and for `rmdir`
-    the parent is handled as for a removed entry. Freed blocks are told by
-    the first block `delete_file` frees (it frees data blocks in file order
-    before map blocks): that block's bit clear in the block bitmap, read
-    through the block cache as the allocator reads it
-    (`lumen_vfs::ext4::first_block_freed` and `block_bitmap_bit`,
-    host-tested), and forgetting one for that is logged. A child whose
-    inode, map or bitmap byte can't be read is still kept live, as when it
-    reads back allocated. A move that can't read back whether its old entry
+    the parent is handled as for a removed entry. Blocks being freed are
+    told by the first block `delete_file` frees: that block's bit clear in
+    the block bitmap, read through the block cache as the allocator reads
+    it, the block found by parsing `i_block` (`lumen_vfs::ext4`'s
+    `first_block_freed`, and `Geometry` for the bit, host-tested). That it
+    is the first rests on `ext4plus` 0.1.0-rc.2 freeing data blocks in file
+    order before map blocks, read from its source and exercised by the
+    ktests (one extent, a depth-1 tree, a block map); a bump of `ext4plus`
+    must check it again. Forgetting one for that is logged; the rest of its
+    blocks, and its inode, may stay allocated, for `e2fsck`. A child whose
+    inode, map or bitmap byte can't be read, whose map doesn't parse or
+    takes more than 16 reads, or whose first block is outside the volume is
+    still kept live, as when it reads back allocated, though its blocks may
+    then be free: that is logged, saying so. A move that can't read back whether its old entry
     (after the unlink failed) or its new one (after undoing the link
     failed) is still there keeps the counts with the source at both names:
     the source's count from before plus one (at least 3 for a directory)

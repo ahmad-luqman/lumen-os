@@ -11,7 +11,6 @@
 //! (`fs/ext4/ext4_extents.h`, `fs/ext4/indirect.c`).
 
 use alloc::vec;
-use alloc::vec::Vec;
 use core::time::Duration;
 
 use crate::types::{DevId, Timespec};
@@ -82,13 +81,16 @@ pub fn time_from_disk(d: Duration) -> Timespec {
     Timespec { sec: low + (epoch << 32), nsec: i64::from(d.subsec_nanos()) }
 }
 
-/// Why [`first_block_freed`] couldn't name a block: a read failed, or the
-/// map doesn't parse (a bad extent header, an index block of the wrong
-/// depth, or more blocks to read than [`MAP_READS_MAX`]).
+/// Why [`first_block_freed`] couldn't name a block: a read failed, the map
+/// doesn't parse (a bad extent header, an index block of the wrong depth),
+/// or finding its first block takes more reads than [`MAP_READS_MAX`] (a
+/// map with many empty blocks first, as a block map truncated by
+/// `ext4plus`, which keeps its emptied indirect blocks, can be).
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlockMapError<E> {
     Read(E),
     Corrupt,
+    TooManyReads,
 }
 
 /// The most map blocks [`first_block_freed`] reads: an extent tree's
@@ -99,8 +101,6 @@ pub const MAP_READS_MAX: usize = 16;
 const EXTENT_MAGIC: u16 = 0xf30a;
 /// An extent tree's depth limit (Linux's `EXT4_MAX_EXTENT_DEPTH`).
 const EXTENT_DEPTH_MAX: u16 = 5;
-/// `ee_len` past this marks an unwritten extent of `ee_len - 32768` blocks.
-const EXTENT_INIT_MAX_LEN: u16 = 32768;
 
 fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
@@ -119,10 +119,12 @@ fn le32(b: &[u8], at: usize) -> u32 {
 /// extent tree's extents depth first, leftmost first, each extent's blocks
 /// from its start; a block map's direct blocks, then those under its
 /// single, double and triple indirect blocks), its map blocks after them,
-/// and zeroes the inode last. So once any of an inode's blocks is free,
-/// this one is (`ExtentTree::collect_extents`' and
-/// `BlockMap::collect_data_and_metadata_blocks`' orders, in `ext4plus`
-/// 0.1.0-rc.2). With no data block, it is the first map block freed: an
+/// and only then writes, zeroes and frees the inode. So once any of an
+/// inode's blocks is free, this one is. The order is `ext4plus`
+/// 0.1.0-rc.2's, read from its source (`ExtentTree::collect_extents`,
+/// `BlockMap::collect_data_and_metadata_blocks`, `free_freed_ranges`): no
+/// test runs `ext4plus` against it beyond the kernel's ktests, so a bump
+/// of `ext4plus` must check it again. With no data block, it is the first map block freed: an
 /// extent tree's first index block under its root, a block map's first
 /// indirect block. An extent with no start or no length is skipped, as
 /// `free_freed_ranges` skips it.
@@ -139,7 +141,7 @@ pub fn first_block_freed<E>(
     let mut read_block = |block: u64, buf: &mut [u8]| {
         reads += 1;
         if reads > MAP_READS_MAX {
-            return Err(BlockMapError::Corrupt);
+            return Err(BlockMapError::TooManyReads);
         }
         read(block, buf).map_err(BlockMapError::Read)
     };
@@ -199,8 +201,9 @@ fn first_extent_start<E>(
     if depth == 0 {
         return Ok((0..entries).find_map(|i| {
             let at = 12 + i * 12;
-            let raw_len = le16(node, at + 4);
-            let len = if raw_len > EXTENT_INIT_MAX_LEN { raw_len - EXTENT_INIT_MAX_LEN } else { raw_len };
+            // `ee_len`: an unwritten extent's (past 32768, its length plus
+            // 32768) is never 0 either.
+            let len = le16(node, at + 4);
             let start = (u64::from(le16(node, at + 6)) << 32) | u64::from(le32(node, at + 8));
             (start != 0 && len != 0).then_some(start)
         }));
@@ -226,12 +229,11 @@ fn first_mapped<E>(
 ) -> Result<Option<u64>, BlockMapError<E>> {
     let mut buf = vec![0u8; block_size];
     read(block, &mut buf)?;
-    let mut mapped = buf.as_chunks::<4>().0.iter().map(|w| u64::from(u32::from_le_bytes(*w))).filter(|&b| b != 0);
-    if level == 1 {
-        return Ok(mapped.next());
-    }
-    let next: Vec<u64> = mapped.collect();
-    for below in next {
+    let mapped = buf.as_chunks::<4>().0.iter().map(|w| u64::from(u32::from_le_bytes(*w))).filter(|&b| b != 0);
+    for below in mapped {
+        if level == 1 {
+            return Ok(Some(below));
+        }
         if let Some(found) = first_mapped(below, level - 1, block_size, read)? {
             return Ok(Some(found));
         }
@@ -239,27 +241,88 @@ fn first_mapped<E>(
     Ok(None)
 }
 
-/// Where block `block`'s bit is in its group's block bitmap, on a volume of
-/// `blocks_count` blocks whose groups of `blocks_per_group` start at
-/// `first_data_block`: (the group, the byte in its bitmap, the bit's mask in
-/// that byte). `None` for a block outside the groups.
-pub fn block_bitmap_bit(
-    block: u64,
+/// A volume's block geometry, read from its superblock by
+/// [`Geometry::from_superblock`], which refuses one whose groups don't fit
+/// their bitmaps: every `Geometry` places each of its blocks' bits inside
+/// its group's bitmap block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Geometry {
+    block_size: u64,
     first_data_block: u32,
     blocks_per_group: u32,
     blocks_count: u64,
-) -> Option<(u32, u32, u8)> {
-    let rel = block.checked_sub(u64::from(first_data_block))?;
-    if block >= blocks_count || blocks_per_group == 0 {
-        return None;
+}
+
+/// Where a block's bit is: its group, the byte in that group's block bitmap
+/// (below the block size), and the bit's mask in that byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitmapBit {
+    pub group: u32,
+    pub byte: u32,
+    pub mask: u8,
+}
+
+/// The superblock's `INCOMPAT_64BIT` feature: `s_blocks_count_hi` counts.
+const INCOMPAT_64BIT: u32 = 0x80;
+
+impl Geometry {
+    /// The geometry in the superblock's 1024 bytes: `s_blocks_count_lo`
+    /// (0x04, with `s_blocks_count_hi` at 0x150 on a 64-bit volume),
+    /// `s_first_data_block` (0x14), `s_log_block_size` (0x18) and
+    /// `s_blocks_per_group` (0x20). `None` unless the block size is 1 to
+    /// 64 KiB, a group has 1 to 8 × block-size blocks (one bitmap block's
+    /// bits, as ext4 allows) and the first data block is on the volume.
+    pub fn from_superblock(sb: &[u8; 1024]) -> Option<Self> {
+        let log = le32(sb, 0x18);
+        if log > 6 {
+            return None;
+        }
+        let block_size = 1024u64 << log;
+        let first_data_block = le32(sb, 0x14);
+        let blocks_per_group = le32(sb, 0x20);
+        let hi = if le32(sb, 0x60) & INCOMPAT_64BIT != 0 { le32(sb, 0x150) } else { 0 };
+        let blocks_count = (u64::from(hi) << 32) | u64::from(le32(sb, 0x04));
+        let fits = blocks_per_group != 0 && u64::from(blocks_per_group) <= 8 * block_size;
+        (fits && u64::from(first_data_block) < blocks_count).then_some(Self {
+            block_size,
+            first_data_block,
+            blocks_per_group,
+            blocks_count,
+        })
     }
-    let group = u32::try_from(rel / u64::from(blocks_per_group)).ok()?;
-    let bit = (rel % u64::from(blocks_per_group)) as u32;
-    Some((group, bit / 8, 1 << (bit % 8)))
+
+    pub fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
+    /// Block `block`'s first byte on the device; `None` for block 0 (the
+    /// superblock's, never a map's or bitmap's) or past the volume, which
+    /// `ext4plus`'s block reads refuse too.
+    pub fn block_byte(&self, block: u64) -> Option<u64> {
+        if block == 0 || block >= self.blocks_count {
+            return None;
+        }
+        block.checked_mul(self.block_size)
+    }
+
+    /// Where block `block`'s bit is in its group's block bitmap, as
+    /// `ext4plus`'s `block_block_group_location` and `BitmapHandle` place it;
+    /// `None` for a block outside the groups.
+    pub fn bitmap_bit(&self, block: u64) -> Option<BitmapBit> {
+        let rel = block.checked_sub(u64::from(self.first_data_block))?;
+        if block >= self.blocks_count {
+            return None;
+        }
+        let group = u32::try_from(rel / u64::from(self.blocks_per_group)).ok()?;
+        let bit = (rel % u64::from(self.blocks_per_group)) as u32;
+        Some(BitmapBit { group, byte: bit / 8, mask: 1 << (bit % 8) })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::*;
 
     /// What `ext4plus`'s setters write for a `Duration` (its
@@ -461,8 +524,13 @@ mod tests {
         // A start past 32 bits (ee_start_hi).
         let high = (7u64 << 32) | 0x8000_0001;
         assert_eq!(first_with(&root(0, &[extent(0, 1, high)]), true, &[]).0, Ok(Some(high)));
-        // Nothing mapped.
+        // A full root (4 entries of 4: `ext4plus` builds one for 4 extents).
+        let full = root(0, &[extent(0, 1, 40), extent(2, 1, 41), extent(4, 1, 42), extent(6, 1, 43)]);
+        assert_eq!(first_with(&full, true, &[]).0, Ok(Some(40)));
+        // Nothing mapped, or only extents that free nothing: none (not a
+        // leaf entry read as an index).
         assert_eq!(first_with(&root(0, &[]), true, &[]), (Ok(None), vec![]));
+        assert_eq!(first_with(&root(0, &[extent(0, 0, 50), extent(1, 3, 0)]), true, &[]).0, Ok(None));
     }
 
     #[test]
@@ -485,6 +553,26 @@ mod tests {
         // map blocks.
         let empty = [(500, leaf(&[])), (501, leaf(&[]))];
         assert_eq!(first_with(&root(1, &[index(0, 500), index(9, 501)]), true, &empty).0, Ok(Some(500)));
+        // A root with no index entries: none (not block 0).
+        assert_eq!(first_with(&root(1, &[]), true, &[]), (Ok(None), vec![]));
+        // A full leaf (84 entries of 84 in a 1 KiB block).
+        let many: Vec<[u8; 12]> = (0..84).map(|i| extent(i * 2, 1, 7000 + u64::from(i))).collect();
+        let full = [(500, leaf(&many))];
+        assert_eq!(first_with(&root(1, &[index(0, 500)]), true, &full).0, Ok(Some(7000)));
+        // Five levels below the root, the deepest allowed.
+        let chain: Vec<(u64, Vec<u8>)> = (0..5u16)
+            .map(|d| {
+                let depth = 4 - d;
+                let node = if depth == 0 {
+                    leaf(&[extent(0, 1, 9999)])
+                } else {
+                    extent_node(BS, 84, depth, &[index(0, 801 + u64::from(d))])
+                };
+                (800 + u64::from(d), node)
+            })
+            .collect();
+        let deep = first_with(&root(5, &[index(0, 800)]), true, &chain);
+        assert_eq!(deep, (Ok(Some(9999)), vec![800, 801, 802, 803, 804]));
     }
 
     #[test]
@@ -506,22 +594,23 @@ mod tests {
         assert_eq!(first_with(&root(1, &[index(0, 500)]), true, &[]).0, Err(BlockMapError::Read(500)));
     }
 
-    /// A block map's `i_block`: 12 direct blocks, then the single, double and
-    /// triple indirect ones.
-    fn block_map(words: [u32; 15]) -> [u8; 60] {
-        let mut out = [0u8; 60];
+    /// `words` little-endian, padded with zeros to `len` bytes.
+    fn words_le(words: &[u32], len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
         for (i, w) in words.iter().enumerate() {
             out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
         out
     }
 
+    /// A block map's `i_block`: 12 direct blocks, then the single, double and
+    /// triple indirect ones.
+    fn block_map(words: [u32; 15]) -> [u8; 60] {
+        words_le(&words, 60).try_into().unwrap()
+    }
+
     fn indirect(entries: &[u32]) -> Vec<u8> {
-        let mut out = vec![0u8; BS];
-        for (i, e) in entries.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&e.to_le_bytes());
-        }
-        out
+        words_le(entries, BS)
     }
 
     #[test]
@@ -531,12 +620,22 @@ mod tests {
         words[5] = 33;
         words[12] = 400;
         assert_eq!(first_with(&block_map(words), false, &[]), (Ok(Some(77)), vec![]));
-        // No direct block: the single indirect's first, then the double's.
+        let mut last_direct = [0u32; 15];
+        last_direct[11] = 78;
+        assert_eq!(first_with(&block_map(last_direct), false, &[]).0, Ok(Some(78)));
+        // No direct block: the single indirect's first, then the double's,
+        // each in file order (an indirect block's first data entry, a
+        // double's first child that leads to data).
         let mut sparse = [0u32; 15];
         sparse[12] = 400;
         sparse[13] = 401;
-        let blocks =
-            [(400, indirect(&[0, 0])), (401, indirect(&[0, 402])), (402, indirect(&[0, 0, 55])), (403, indirect(&[]))];
+        let blocks = [
+            (400, indirect(&[0, 0])),
+            (401, indirect(&[0, 402, 404])),
+            (402, indirect(&[0, 0, 55, 66])),
+            (403, indirect(&[])),
+            (404, indirect(&[77])),
+        ];
         assert_eq!(first_with(&block_map(sparse), false, &blocks), (Ok(Some(55)), vec![400, 401, 402]));
         let mut single = [0u32; 15];
         single[12] = 402;
@@ -546,10 +645,13 @@ mod tests {
         triple[14] = 405;
         let deep = [(405, indirect(&[406])), (406, indirect(&[0, 402])), (402, indirect(&[0, 0, 55]))];
         assert_eq!(first_with(&block_map(triple), false, &deep).0, Ok(Some(55)));
-        // No data block: the first indirect block; nothing at all: none.
+        // No data block: the first indirect block (single before double);
+        // nothing at all: none.
         let mut bare = [0u32; 15];
         bare[13] = 403;
         assert_eq!(first_with(&block_map(bare), false, &blocks).0, Ok(Some(403)));
+        bare[12] = 400;
+        assert_eq!(first_with(&block_map(bare), false, &blocks).0, Ok(Some(400)));
         assert_eq!(first_with(&block_map([0; 15]), false, &[]), (Ok(None), vec![]));
     }
 
@@ -563,7 +665,7 @@ mod tests {
         let mut blocks = vec![(900, indirect(&children))];
         blocks.extend(children.iter().map(|&c| (u64::from(c), indirect(&[]))));
         let (res, read) = first_with(&block_map(words), false, &blocks);
-        assert_eq!(res, Err(BlockMapError::Corrupt));
+        assert_eq!(res, Err(BlockMapError::TooManyReads));
         assert_eq!(read.len(), MAP_READS_MAX);
         // One fewer empty child fits, and the next has data.
         let fits: Vec<u32> = (901..900 + MAP_READS_MAX as u32).collect();
@@ -573,18 +675,67 @@ mod tests {
         assert_eq!(first_with(&block_map(words), false, &blocks).0, Ok(Some(4242)));
     }
 
+    /// A superblock's bytes with the geometry fields set: `log` block size,
+    /// `count` blocks (its high half only on a 64-bit volume), groups of
+    /// `per_group` from `first`. Clusters per group (0x24) is set to
+    /// something else, so a parse reading it shows.
+    fn superblock(log: u32, count: u64, first: u32, per_group: u32, is_64bit: bool) -> [u8; 1024] {
+        let mut sb = [0u8; 1024];
+        let mut put = |at: usize, v: u32| sb[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(0x04, count as u32);
+        put(0x14, first);
+        put(0x18, log);
+        put(0x20, per_group);
+        put(0x24, per_group / 2 + 1);
+        put(0x60, if is_64bit { INCOMPAT_64BIT } else { 0 });
+        put(0x150, (count >> 32) as u32);
+        sb
+    }
+
+    fn bit(group: u32, byte: u32, mask: u8) -> Option<BitmapBit> {
+        Some(BitmapBit { group, byte, mask })
+    }
+
     #[test]
     fn a_blocks_bitmap_bit_is_its_place_in_its_group() {
         // 1 KiB blocks: the groups start at block 1, 8192 to a group.
-        assert_eq!(block_bitmap_bit(1, 1, 8192, 65536), Some((0, 0, 1)));
-        assert_eq!(block_bitmap_bit(10, 1, 8192, 65536), Some((0, 1, 2)));
-        assert_eq!(block_bitmap_bit(8192, 1, 8192, 65536), Some((0, 1023, 0x80)));
-        assert_eq!(block_bitmap_bit(8193, 1, 8192, 65536), Some((1, 0, 1)));
-        assert_eq!(block_bitmap_bit(0, 1, 8192, 65536), None);
+        let g = Geometry::from_superblock(&superblock(0, 65536, 1, 8192, false)).unwrap();
+        assert_eq!(g.block_size(), 1024);
+        assert_eq!(g.bitmap_bit(1), bit(0, 0, 1));
+        assert_eq!(g.bitmap_bit(10), bit(0, 1, 2));
+        assert_eq!(g.bitmap_bit(8192), bit(0, 1023, 0x80));
+        assert_eq!(g.bitmap_bit(8193), bit(1, 0, 1));
+        assert_eq!(g.bitmap_bit(0), None);
         // 4 KiB blocks: from block 0, 32768 to a group; past the volume.
-        assert_eq!(block_bitmap_bit(32768 + 17, 0, 32768, 65536), Some((1, 2, 2)));
-        assert_eq!(block_bitmap_bit(65535, 0, 32768, 65536), Some((1, 4095, 0x80)));
-        assert_eq!(block_bitmap_bit(65536, 0, 32768, 65536), None);
-        assert_eq!(block_bitmap_bit(5, 0, 0, 65536), None);
+        let g = Geometry::from_superblock(&superblock(2, 65536, 0, 32768, false)).unwrap();
+        assert_eq!(g.bitmap_bit(32768 + 17), bit(1, 2, 2));
+        assert_eq!(g.bitmap_bit(65535), bit(1, 4095, 0x80));
+        assert_eq!(g.bitmap_bit(65536), None);
+        // Smaller groups than a bitmap holds.
+        let g = Geometry::from_superblock(&superblock(0, 4096, 1, 1000, false)).unwrap();
+        assert_eq!(g.bitmap_bit(1001), bit(1, 0, 1));
+        assert_eq!(g.bitmap_bit(1000), bit(0, 124, 0x80));
+    }
+
+    #[test]
+    fn a_superblocks_geometry_is_read_and_checked() {
+        // The high half of the count only on a 64-bit volume.
+        let wide = (1u64 << 32) + 100;
+        let g = Geometry::from_superblock(&superblock(2, wide, 0, 32768, true)).unwrap();
+        assert_eq!(g.block_byte(wide - 1), Some((wide - 1) * 4096));
+        assert_eq!(g.block_byte(wide), None);
+        let narrow = Geometry::from_superblock(&superblock(2, wide, 0, 32768, false)).unwrap();
+        assert_eq!(narrow.block_byte(100), None);
+        assert_eq!(narrow.block_byte(99), Some(99 * 4096));
+        // Block 0 is never a map's or a bitmap's.
+        assert_eq!(narrow.block_byte(0), None);
+        // A group with more blocks than its bitmap block has bits, or none.
+        assert_eq!(Geometry::from_superblock(&superblock(0, 65536, 1, 8193, false)), None);
+        assert!(Geometry::from_superblock(&superblock(0, 65536, 1, 8192, false)).is_some());
+        assert_eq!(Geometry::from_superblock(&superblock(0, 65536, 1, 0, false)), None);
+        // The first data block on the volume; a block size up to 64 KiB.
+        assert_eq!(Geometry::from_superblock(&superblock(0, 1, 1, 8192, false)), None);
+        assert!(Geometry::from_superblock(&superblock(6, 16, 0, 8192, false)).is_some());
+        assert_eq!(Geometry::from_superblock(&superblock(7, 16, 0, 8192, false)), None);
     }
 }
