@@ -1033,9 +1033,10 @@ impl PageCache {
         self.release_accounting(removed.len());
     }
 
-    /// Uncache every page from `start_page` on without a size change, as
-    /// reclaim would (ktests only: a truncate goes through
-    /// [`Self::resize`]).
+    /// Drop every page from `start_page` on without a size change, dirty or
+    /// mapped ones too (unlike reclaim, which writes dirty pages back and
+    /// skips mapped ones): a dirty page's data is lost. Ktests only: a
+    /// truncate goes through [`Self::resize`].
     #[cfg(feature = "ktest")]
     pub(super) fn remove_from(&mut self, start_page: u64) {
         self.drop_from(start_page);
@@ -1256,13 +1257,15 @@ crate::ktest!(
 /// The ktests' crossing of the `ext4` hard limit: `f` runs with the
 /// hard-limit warning re-armed, so the crossing logs it once however many
 /// refusals `f` sees (tests/scenarios/test_ktest.py counts one per
-/// crossing), and the real limits are restored after it, also when `f` (or
-/// a fill it hands on) put the cache at the limit ([`reach_hard_limit`]).
+/// crossing). The real limits and the warning's state from before are
+/// restored after it, also when `f` (or a fill it hands on) put the cache
+/// at the limit ([`reach_hard_limit`]).
 #[cfg(feature = "ktest")]
 fn hard_limit_crossing<T>(f: impl FnOnce() -> T) -> T {
-    HARD_LIMIT_WARNED.store(false, Ordering::Release);
+    let warned = HARD_LIMIT_WARNED.swap(false, Ordering::AcqRel);
     let out = f();
     set_ext4_limits_for_test(None);
+    HARD_LIMIT_WARNED.store(warned, Ordering::Release);
     out
 }
 
@@ -1481,9 +1484,9 @@ crate::ktest!(
     }
 );
 
-/// Shrink `f` (at least three pages long, its page 0 cached) to 100 bytes,
-/// its pages 1 and 2 held mapped across the truncate so reclaim can't drop
-/// them first, then grow it again by a write at three pages: the shrink
+/// Shrink `f` (at least three pages long) to 100 bytes, its pages 0 to 2
+/// held mapped across the truncate so reclaim can't drop them first, then
+/// grow it again by a write at three pages: the shrink
 /// drops the pages past the new end, and the cut bytes read back as zeros
 /// ([`PageCache::resize`]; with its sizes swapped, a shrink would keep the
 /// pages and leave them to the next truncate, and a write would read the
@@ -1493,7 +1496,8 @@ fn check_shrink_then_write_past(f: &Arc<dyn VfsInode>) -> Result<(), &'static st
     use crate::{kassert, kassert_eq};
     let p = PAGE_SIZE as u64;
     let cached = || page_cache_lock(&**f).map(|l| l.lock().len()).ok_or("no page cache");
-    let held = (mmap_page(f, 1).map_err(|_| "map page 1")?, mmap_page(f, 2).map_err(|_| "map page 2")?);
+    let held = [0, 1, 2].map(|i| mmap_page(f, i));
+    let held: Vec<MappedPage> = held.into_iter().collect::<Result<_, _>>().map_err(|_| "map pages 0 to 2")?;
     f.truncate(100).map_err(|_| "shrink")?;
     kassert_eq!(cached()?, 1); // page 0 alone
     drop(held);
