@@ -3524,7 +3524,11 @@ std::thread_local! {
 /// panicked, the run hangs until CI's job timeout and the message is lost.
 fn lock9_violation(msg: core::fmt::Arguments<'_>) -> ! {
     use std::io::Write as _;
-    let _ = writeln!(std::io::stderr(), "{msg}");
+    // libtest names each test's thread after the test; one write, so
+    // threads aborting at once don't interleave their lines.
+    let thread = std::thread::current();
+    let line = format!("{msg} [thread {}]\n", thread.name().unwrap_or("unnamed, spawned by a test"));
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
     std::process::abort()
 }
 
@@ -5038,6 +5042,20 @@ fn umount_drops_the_evicted_inodes_after_releasing_lock9() {
         drops_under_lock9,
         "an evicted inode was dropped under Lock 9"
     );
+}
+
+#[test]
+fn mount_root_and_mount_seed_their_roots_into_inode_cache() {
+    // Checked before any lookup could cache them another way.
+    let (env, root_fs) = setup_vfs();
+    let root = root_fs.root_inode();
+    assert!(Arc::ptr_eq(&env.inode_get(root.dev_id(), root.ino()).expect("mount_root seeds /"), &root));
+
+    let mp = root.mkdir(b"mnt", 0o755).unwrap();
+    let tmp_fs = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    env.mount(mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
+    let tmp_root = tmp_fs.root_inode();
+    assert!(Arc::ptr_eq(&env.inode_get(DevId::TMPFS, tmp_root.ino()).expect("mount seeds its root"), &tmp_root));
 }
 
 #[test]
