@@ -1,11 +1,12 @@
 //! Pure `no_std + alloc` POSIX VFS core for the Lumen kernel.
 //!
-//! Provides filesystem/inode traits, Lock-9 inode/dentry/mount tables with a
-//! short-probe `VfsCacheOps` boundary (never held across Locks 4–8), physical
-//! path & symlink resolution, `OpenFile` / 1024-FD `FdTable`, high-level
-//! namespace operations (`open`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`,
-//! `readlink`, `renameat2`), and independent `flock(2)` + `fcntl` POSIX record
-//! advisory locks.
+//! Provides filesystem/inode traits, Lock-9 inode/dentry/mount tables
+//! (`VfsTables`, the kernel's and the host tests', generic over a
+//! `LockFamily`) with a short-probe `VfsCacheOps` boundary (never held
+//! across Locks 4–8), physical path & symlink resolution, `OpenFile` /
+//! 1024-FD `FdTable`, high-level namespace operations (`open`, `mkdir`,
+//! `unlink`, `rmdir`, `link`, `symlink`, `readlink`, `renameat2`), and
+//! independent `flock(2)` + `fcntl` POSIX record advisory locks.
 //!
 //! Clean-room MIT implementation conceptually adapted from Starry / `axfs_vfs`.
 
@@ -34,13 +35,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub use cache::{DentryCache, DentryTarget, InodeCache};
 pub use error::VfsError;
-pub use fd::{FdEntry, FdTable, LocalLock, OpenFile, OpenFileId, VfsLock};
+pub use fd::{FdEntry, FdTable, LocalLock, LockFamily, OpenFile, OpenFileId, VfsLock};
 pub use fs::{FileSystem, OpenGuard, VfsInode};
 pub use locks::{
     AdvisoryLocks, Deadlock, FlockKind, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixLockType, PosixWaitGraph,
     RecordLockOutcome, WaitSearch,
 };
-pub use mount::{MountInfo, MountTable, SimpleVfsTables, VfsCacheOps};
+pub use mount::{MountInfo, MountTable, VfsCacheOps, VfsTables};
 pub use ops::{
     Opened, link_at, mkdir_at, open_inode, open_inode_guarded, readlink_at, rename_at2, symlink_at, unlink_at,
 };

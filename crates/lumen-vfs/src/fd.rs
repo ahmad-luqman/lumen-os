@@ -13,7 +13,8 @@ use crate::ops::Opened;
 use crate::types::{AccessMode, OpenFlags};
 use crate::{MAX_FDS, next_open_file_id};
 
-/// Synchronization abstraction for `OpenFile::offset` and `dir_cursor` (Lock 2).
+/// Synchronization abstraction for `OpenFile::offset` and `dir_cursor` (Lock 2)
+/// and, through a [`LockFamily`], the `VfsTables` (Lock 9).
 ///
 /// The kernel implements this over `SleepMutex<T>`; single-threaded host tests
 /// can use [`LocalLock<T>`] with zero `unsafe`.
@@ -26,6 +27,15 @@ pub trait VfsLock<T> {
     fn new(val: T) -> Self;
     fn lock(&self) -> Self::Guard<'_>;
     fn get_mut(&mut self) -> &mut T;
+}
+
+/// A family of [`VfsLock`]s, one lock type for any `T`: what
+/// [`VfsTables`](crate::VfsTables) is generic over (#264). The kernel's is
+/// `vfs::KernelLocks` (`SleepMutex`); the host tests' is `TestLocks`, a
+/// `std` mutex recording which Lock-9 tables a thread holds and aborting
+/// the test binary on an out-of-order or repeated take.
+pub trait LockFamily {
+    type Lock<T>: VfsLock<T>;
 }
 
 /// Zero-`unsafe` single-threaded `VfsLock` backed by `core::cell::RefCell`.

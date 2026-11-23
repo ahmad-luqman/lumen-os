@@ -1,13 +1,14 @@
-//! Mount table, short-held Lock 9 cache probe trait, and host-test tables.
+//! Mount table, short-held Lock 9 cache probe trait, and the Lock-9 tables
+//! (`VfsTables`) behind it.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 use crate::cache::{DentryCache, DentryTarget, InodeCache};
 use crate::error::VfsError;
+use crate::fd::{LockFamily, VfsLock};
 use crate::fs::{FileSystem, VfsInode};
 use crate::types::{DevId, Ino, InodeType};
 
@@ -18,6 +19,14 @@ pub struct MountInfo {
     pub fs_name: &'static str,
     pub mount_path: String,
     pub read_only: bool,
+}
+
+impl MountInfo {
+    /// `fs` mounted at `mount_path`, asking `fs` for its device, name and
+    /// read-only flag: call it only with Lock 9 released.
+    pub(crate) fn of(fs: &dyn FileSystem, mount_path: String) -> Self {
+        Self { dev_id: fs.dev_id(), fs_name: fs.name(), mount_path, read_only: fs.read_only() }
+    }
 }
 
 struct MountRecord {
@@ -217,24 +226,15 @@ impl MountTable {
         out
     }
 
-    /// Snapshot mount metadata for `/proc/mounts` and `mount` output.
-    pub fn list_mounts(&self) -> Vec<MountInfo> {
+    /// Every mount's filesystem and path, `/` first, for `/proc/mounts` and
+    /// `mount`: the caller asks the filesystems for the rest after releasing
+    /// Lock 9. As with [`snapshot_filesystems`](Self::snapshot_filesystems),
+    /// if `umount` runs meanwhile, the caller may drop a filesystem's last
+    /// reference.
+    pub fn snapshot_mounts(&self) -> Vec<(Arc<dyn FileSystem>, String)> {
         let mut out = Vec::with_capacity(self.mounts.len() + usize::from(self.root.is_some()));
-        if let Some(root) = &self.root {
-            out.push(MountInfo {
-                dev_id: root.fs.dev_id(),
-                fs_name: root.fs.name(),
-                mount_path: root.mount_path.clone(),
-                read_only: root.fs.read_only(),
-            });
-        }
-        for rec in self.mounts.values() {
-            out.push(MountInfo {
-                dev_id: rec.fs.dev_id(),
-                fs_name: rec.fs.name(),
-                mount_path: rec.mount_path.clone(),
-                read_only: rec.fs.read_only(),
-            });
+        for rec in self.root.iter().chain(self.mounts.values()) {
+            out.push((Arc::clone(&rec.fs), rec.mount_path.clone()));
         }
         out
     }
@@ -350,26 +350,65 @@ pub trait VfsCacheOps {
     fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>>;
 }
 
-/// Single-threaded `RefCell`-backed VFS lookup tables for host unit tests.
-#[derive(Default)]
-pub struct SimpleVfsTables {
-    pub mounts: RefCell<MountTable>,
-    pub dentries: RefCell<DentryCache>,
-    pub inodes: RefCell<InodeCache>,
+/// The Lock-9 VFS lookup tables (#264): the kernel's (`vfs::KernelVfsTables`,
+/// over `SleepMutex`) and the host tests' alike, generic over the
+/// [`LockFamily`] that guards each table.
+///
+/// Strict sub-order `MountTable -> DentryCache -> InodeCache`. Never holds
+/// any of the three across `FileSystem::root_inode()`, `read_only()` and
+/// `name()` (`fs_read_only`, `list_mounts`), Locks 1–8, or the drops of the
+/// inodes `umount` evicts. Some calls into the filesystems still run under
+/// them: `VfsInode::dev_id`, `ino` and `cacheable` and `FileSystem::dev_id`
+/// (fixed state, by design), `VfsInode::is_detached` (an atomic load in
+/// ext4 and tmpfs, but not fixed state: a detach sets it), and #320's
+/// pre-existing cases
+/// (`MountTable::mount_with_ino`'s `inode_type()` and its error paths'
+/// `Arc` drops, the unmounted mountpoint's `Arc` dropped inside
+/// `MountTable::umount`, the `Arc` each of `InodeCache`'s `get_or_insert*`
+/// is handed and drops when it finds a live entry, and the stale (detached
+/// or `ino`-mismatched) entries `InodeCache` drops in `get_if_fresh`, every
+/// `get_or_insert*`, `end_removal`, `evict_detached` and
+/// `record_removal_if_absent`).
+pub struct VfsTables<F: LockFamily> {
+    mounts: F::Lock<MountTable>,
+    dentries: F::Lock<DentryCache>,
+    inodes: F::Lock<InodeCache>,
 }
 
-impl SimpleVfsTables {
-    /// Create empty VFS tables with default dentry cache capacity.
+impl<F: LockFamily> VfsTables<F> {
+    /// Tables over the given locks, which must hold empty tables (seeded
+    /// ones would bypass the invariants `mount_root`, `mount` and `umount`
+    /// keep across the three, such as the root inode being cached): the way
+    /// to a `static`, since [`VfsLock::new`] isn't `const` (the kernel
+    /// passes locks built by `SleepMutex::new`, a `const fn`, around
+    /// [`MountTable::new`], [`DentryCache::with_default_capacity`] and
+    /// [`InodeCache::new`], the constructors [`new`](Self::new) uses).
+    pub const fn from_locks(
+        mounts: F::Lock<MountTable>,
+        dentries: F::Lock<DentryCache>,
+        inodes: F::Lock<InodeCache>,
+    ) -> Self {
+        Self { mounts, dentries, inodes }
+    }
+
+    /// Empty tables: [`DentryCache::DEFAULT_CAPACITY`] names and
+    /// [`InodeCache::DEFAULT_REMOVAL_HISTORY`] removals remembered, from the
+    /// same argument-free constructors the kernel's `static` hands
+    /// [`from_locks`](Self::from_locks), so neither names a capacity.
     pub fn new() -> Self {
-        Self::default()
+        Self::from_locks(
+            F::Lock::new(MountTable::new()),
+            F::Lock::new(DentryCache::with_default_capacity()),
+            F::Lock::new(InodeCache::new()),
+        )
     }
 
     /// Mount `fs` at `/` and seed its root inode into `InodeCache`.
     pub fn mount_root(&self, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
         let root = fs.root_inode();
         let root_ino = root.ino();
-        self.mounts.borrow_mut().mount_root_with_ino(fs, root_ino)?;
-        let _ = self.inodes.borrow_mut().get_or_insert(root);
+        self.mounts.lock().mount_root_with_ino(fs, root_ino)?;
+        let _ = self.inodes.lock().get_or_insert(root);
         Ok(())
     }
 
@@ -379,71 +418,121 @@ impl SimpleVfsTables {
         let mp_ino = mountpoint.ino();
         let root = fs.root_inode();
         let root_ino = root.ino();
-        let mut mounts = self.mounts.borrow_mut();
-        let mut dentries = self.dentries.borrow_mut();
-        let mut inodes = self.inodes.borrow_mut();
+        let mut mounts = self.mounts.lock();
+        let mut dentries = self.dentries.lock();
+        let mut inodes = self.inodes.lock();
         mounts.mount_with_ino(mountpoint, path, fs, root_ino)?;
         dentries.invalidate_dir(mp_dev, mp_ino);
         let _ = inodes.get_or_insert(root);
         Ok(())
     }
 
-    /// Unmount the filesystem mounted on `(mountpoint_dev, mountpoint_ino)` and
-    /// purge its entries from `DentryCache` and `InodeCache`.
+    /// Unmount the filesystem mounted on `(mountpoint_dev, mountpoint_ino)`
+    /// and purge its entries from `DentryCache` and `InodeCache`, dropping
+    /// the evicted inodes after the locks are released.
     pub fn umount(&self, mountpoint_dev: DevId, mountpoint_ino: Ino) -> Result<Arc<dyn FileSystem>, VfsError> {
-        let mut mounts = self.mounts.borrow_mut();
-        let mut dentries = self.dentries.borrow_mut();
-        let mut inodes = self.inodes.borrow_mut();
-        let fs = mounts.umount(mountpoint_dev, mountpoint_ino)?;
-        let dev = fs.dev_id();
-        dentries.invalidate_fs(dev);
-        dentries.invalidate_dir(mountpoint_dev, mountpoint_ino);
-        let _ = inodes.evict_fs(dev);
+        let (fs, evicted) = {
+            let mut mounts = self.mounts.lock();
+            let mut dentries = self.dentries.lock();
+            let mut inodes = self.inodes.lock();
+            let fs = mounts.umount(mountpoint_dev, mountpoint_ino)?;
+            let dev = fs.dev_id();
+            dentries.invalidate_fs(dev);
+            dentries.invalidate_dir(mountpoint_dev, mountpoint_ino);
+            let evicted = inodes.evict_fs(dev);
+            (fs, evicted)
+        };
+        drop(evicted);
         Ok(fs)
+    }
+
+    /// Every mounted filesystem, the lock released before the caller uses them.
+    pub fn snapshot_filesystems(&self) -> Vec<Arc<dyn FileSystem>> {
+        self.mounts.lock().snapshot_filesystems()
+    }
+
+    /// Every cached inode, the lock released before the caller uses them.
+    pub fn snapshot_inodes(&self) -> Vec<Arc<dyn VfsInode>> {
+        self.inodes.lock().snapshot_all()
+    }
+
+    /// How many names `DentryCache` holds.
+    pub fn dentry_count(&self) -> usize {
+        self.dentries.lock().len()
+    }
+
+    /// Every active mount, `/` first; the filesystems are asked for their
+    /// device, name and read-only flag after the lock is released.
+    pub fn list_mounts(&self) -> Vec<MountInfo> {
+        let mounts = self.mounts.lock().snapshot_mounts();
+        mounts.into_iter().map(|(fs, path)| MountInfo::of(fs.as_ref(), path)).collect()
+    }
+
+    /// Every cached name.
+    #[cfg(test)]
+    pub(crate) fn snapshot_dentries(&self) -> Vec<(DevId, Ino, Vec<u8>, DentryTarget)> {
+        self.dentries.lock().snapshot_all()
+    }
+
+    /// Whether a filesystem with `dev` is mounted.
+    #[cfg(test)]
+    pub(crate) fn is_dev_mounted(&self, dev: DevId) -> bool {
+        self.mounts.lock().is_dev_mounted(dev)
     }
 }
 
-impl VfsCacheOps for SimpleVfsTables {
+impl<F: LockFamily> Default for VfsTables<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
-        let root_fs = self.mounts.borrow().root_fs().ok_or(VfsError::NoEnt)?;
+        let root_fs = self.mounts.lock().root_fs().ok_or(VfsError::NoEnt)?;
         Ok(root_fs.root_inode())
     }
 
     fn is_global_root(&self, dev: DevId, ino: Ino) -> bool {
-        self.mounts.borrow().is_global_root(dev, ino)
+        self.mounts.lock().is_global_root(dev, ino)
     }
 
     fn mount_at(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn FileSystem>> {
-        self.mounts.borrow().mount_at(dev, ino)
+        self.mounts.lock().mount_at(dev, ino)
     }
 
     fn mount_at_with_id(&self, dev: DevId, ino: Ino) -> Option<(Arc<dyn FileSystem>, u64)> {
-        self.mounts.borrow().mount_at_with_id(dev, ino)
+        self.mounts.lock().mount_at_with_id(dev, ino)
     }
 
     fn parent_mount(&self, mounted_dev: DevId) -> Option<Arc<dyn VfsInode>> {
-        self.mounts.borrow().parent_mount(mounted_dev)
+        self.mounts.lock().parent_mount(mounted_dev)
     }
 
     fn parent_mount_if_root(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        self.mounts.borrow().parent_mount_if_root(dev, ino)
+        self.mounts.lock().parent_mount_if_root(dev, ino)
     }
 
     fn is_mountpoint(&self, dev: DevId, ino: Ino) -> bool {
-        self.mounts.borrow().is_mountpoint(dev, ino)
+        self.mounts.lock().is_mountpoint(dev, ino)
     }
 
     fn fs_read_only(&self, dev: DevId) -> bool {
-        self.mounts.borrow().fs_by_dev(dev).is_some_and(|fs| fs.read_only())
+        // The guard is released before `read_only` runs, as `root_inode`
+        // does before `root_inode()` (`fs_by_dev` still asks the root
+        // filesystem's `dev_id()` under it; the struct doc lists what runs
+        // under the guards).
+        let fs = self.mounts.lock().fs_by_dev(dev);
+        fs.is_some_and(|fs| fs.read_only())
     }
 
     fn fs_by_dev(&self, dev: DevId) -> Option<Arc<dyn FileSystem>> {
-        self.mounts.borrow().fs_by_dev(dev)
+        self.mounts.lock().fs_by_dev(dev)
     }
 
     fn cache_gens(&self) -> (u64, u64) {
-        let dentries = self.dentries.borrow();
-        let inodes = self.inodes.borrow();
+        let dentries = self.dentries.lock();
+        let inodes = self.inodes.lock();
         (dentries.invalidation_gen(), inodes.removal_gen())
     }
 
@@ -453,8 +542,8 @@ impl VfsCacheOps for SimpleVfsTables {
         parent_ino: Ino,
         name: &[u8],
     ) -> (Option<Arc<dyn VfsInode>>, u64, u64) {
-        let dentries = self.dentries.borrow();
-        let inodes = self.inodes.borrow();
+        let dentries = self.dentries.lock();
+        let inodes = self.inodes.lock();
         let (target_opt, dentry_gen) = dentries.get_with_gen(parent_dev, parent_ino, name);
         let inode_gen = inodes.removal_gen();
         let inode = target_opt.and_then(|t| inodes.get(t.dev, t.ino));
@@ -470,9 +559,9 @@ impl VfsCacheOps for SimpleVfsTables {
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let mounts = self.mounts.borrow();
-        let mut dentries = self.dentries.borrow_mut();
-        let mut inodes = self.inodes.borrow_mut();
+        let mounts = self.mounts.lock();
+        let mut dentries = self.dentries.lock();
+        let mut inodes = self.inodes.lock();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
         }
@@ -501,9 +590,9 @@ impl VfsCacheOps for SimpleVfsTables {
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let mounts = self.mounts.borrow();
-        let mut dentries = self.dentries.borrow_mut();
-        let mut inodes = self.inodes.borrow_mut();
+        let mounts = self.mounts.lock();
+        let mut dentries = self.dentries.lock();
+        let mut inodes = self.inodes.lock();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
         }
@@ -525,19 +614,19 @@ impl VfsCacheOps for SimpleVfsTables {
     }
 
     fn dentry_gen(&self) -> u64 {
-        self.dentries.borrow().invalidation_gen()
+        self.dentries.lock().invalidation_gen()
     }
 
     fn dentry_get(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> Option<DentryTarget> {
-        self.dentries.borrow().get(parent_dev, parent_ino, name)
+        self.dentries.lock().get(parent_dev, parent_ino, name)
     }
 
     fn dentry_get_with_gen(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64) {
-        self.dentries.borrow().get_with_gen(parent_dev, parent_ino, name)
+        self.dentries.lock().get_with_gen(parent_dev, parent_ino, name)
     }
 
     fn dentry_insert(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8], target: DentryTarget) {
-        self.dentries.borrow_mut().insert(parent_dev, parent_ino, name, target);
+        self.dentries.lock().insert(parent_dev, parent_ino, name, target);
     }
 
     fn dentry_insert_if_gen(
@@ -548,8 +637,8 @@ impl VfsCacheOps for SimpleVfsTables {
         target: DentryTarget,
         expected_gen: u64,
     ) -> bool {
-        let mounts = self.mounts.borrow();
-        let mut dentries = self.dentries.borrow_mut();
+        let mounts = self.mounts.lock();
+        let mut dentries = self.dentries.lock();
         if mounts.is_mountpoint(parent_dev, parent_ino) {
             return false;
         }
@@ -557,26 +646,26 @@ impl VfsCacheOps for SimpleVfsTables {
     }
 
     fn dentry_invalidate(&self, parent_dev: DevId, parent_ino: Ino, name: &[u8]) {
-        self.dentries.borrow_mut().invalidate(parent_dev, parent_ino, name);
+        self.dentries.lock().invalidate(parent_dev, parent_ino, name);
     }
 
     fn dentry_invalidate_dir(&self, parent_dev: DevId, parent_ino: Ino) {
-        self.dentries.borrow_mut().invalidate_dir(parent_dev, parent_ino);
+        self.dentries.lock().invalidate_dir(parent_dev, parent_ino);
     }
 
     fn inode_get(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.borrow().get(dev, ino)
+        self.inodes.lock().get(dev, ino)
     }
 
     fn inode_get_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.borrow_mut().get_if_fresh(dev, ino, since_gen)
+        self.inodes.lock().get_if_fresh(dev, ino, since_gen)
     }
 
     fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
         if !inode.cacheable() {
             return inode;
         }
-        self.inodes.borrow_mut().get_or_insert(inode)
+        self.inodes.lock().get_or_insert(inode)
     }
 
     fn inode_get_or_insert_if_mounted(
@@ -586,8 +675,8 @@ impl VfsCacheOps for SimpleVfsTables {
         mount_id: u64,
         inode: Arc<dyn VfsInode>,
     ) -> Option<Arc<dyn VfsInode>> {
-        let mounts = self.mounts.borrow();
-        let mut inodes = self.inodes.borrow_mut();
+        let mounts = self.mounts.lock();
+        let mut inodes = self.inodes.lock();
         if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
             return None;
         }
@@ -602,8 +691,8 @@ impl VfsCacheOps for SimpleVfsTables {
         inode: Arc<dyn VfsInode>,
         since_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let mounts = self.mounts.borrow();
-        let mut inodes = self.inodes.borrow_mut();
+        let mounts = self.mounts.lock();
+        let mut inodes = self.inodes.lock();
         if !mounts.is_dev_mounted(inode.dev_id()) {
             return Err(inode);
         }
@@ -614,34 +703,34 @@ impl VfsCacheOps for SimpleVfsTables {
     }
 
     fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.borrow_mut().remove(dev, ino)
+        self.inodes.lock().remove(dev, ino)
     }
 
     fn inode_remove_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-        self.inodes.borrow_mut().remove_if_fresh(dev, ino, since_gen)
+        self.inodes.lock().remove_if_fresh(dev, ino, since_gen)
     }
 
     fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
-        self.inodes.borrow_mut().begin_removal_if_fresh(dev, ino, since_gen)
+        self.inodes.lock().begin_removal_if_fresh(dev, ino, since_gen)
     }
 
     fn inode_end_removal(&self, dev: DevId, ino: Ino) -> u64 {
-        self.inodes.borrow_mut().end_removal(dev, ino)
+        self.inodes.lock().end_removal(dev, ino)
     }
 
     fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool {
-        self.inodes.borrow_mut().evict_detached(dev, ino)
+        self.inodes.lock().evict_detached(dev, ino)
     }
 
     fn inode_remove_if_same(&self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.borrow_mut().remove_if_same(dev, ino, expected)
+        self.inodes.lock().remove_if_same(dev, ino, expected)
     }
 
     fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
-        self.inodes.borrow_mut().record_removal(dev, ino)
+        self.inodes.lock().record_removal(dev, ino)
     }
 
     fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
-        self.inodes.borrow_mut().record_removal_if_absent(dev, ino)
+        self.inodes.lock().record_removal_if_absent(dev, ino)
     }
 }
