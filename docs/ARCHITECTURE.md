@@ -5656,7 +5656,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `Box<[u8]>` or `Vec<u8>`): `VfsInode`'s `lookup`, `create`, `mkdir`,
     `unlink`, `rmdir`, `link`, `symlink`, `rename` (a symlink's target is
     any bytes but NUL, `/` included), `DirEntry::name`, the `DentryCache`'s
-    key, `ParentTarget::name`, `compute_cwd_path`'s result, `OpenFile::path`
+    key, `resolve_parent`'s `Final::Name`, `compute_cwd_path`'s result, `OpenFile::path`
     (`Arc<[u8]>`: the path `/proc/<pid>/fd` reads back, the base of a
     relative open's, and the cwd's fallback), and the paths
     `/proc/<pid>/maps` names for file mappings. No layer checks a name for
@@ -5759,6 +5759,25 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `open("symlink", O_NOFOLLOW)` returns `-ELOOP`, **except**
     `open("symlink", O_PATH | O_NOFOLLOW)` which opens an `O_PATH` descriptor
     to the symlink itself.
+  - **The last component (#309):** `resolve_parent` gives a `ParentTarget`
+    (the parent directory, the trailing `/`) whose last component,
+    `final_component()`, is a `Final`: `Root` (a path of only slashes),
+    `Dot`, `DotDot` or `Name(&[u8])` (borrowed from the path; never empty,
+    `.` or `..`). A name's bytes come only out of a pattern on it, so each
+    namespace operation (`open` with `O_CREAT`, `mkdir`, `unlink`/`rmdir`,
+    `link`, `symlink`, `rename`) states its own errno for the other three
+    (below; `-EEXIST` for `mkdir`, `link` and `symlink`, and for `O_CREAT |
+    O_EXCL`; `O_CREAT` without `O_EXCL` resolves the directory `/`, `.` or
+    `..` names, which then gives `-EISDIR` as any directory opened with
+    `O_CREAT`; but `..` from a removed directory is `-ENOENT`, as it is the
+    filesystem's own `..`, where Linux says `-EISDIR`, #318), ahead of
+    `-EROFS`. In `ops.rs` each reads it with a `match` on
+    `final_component()`, so one that leaves a case out doesn't compile;
+    clippy lints forbidden in that file and the host test
+    `ops_reads_final_only_through_a_direct_match` keep it to that form. The
+    comment at the top of `ops.rs` is the one statement of what they refuse
+    and what they miss (a shared helper answering the three alike, for
+    one); outside `ops.rs` all of it is a convention.
   - **Namespace operations check in Linux's order** (`unlink_at`,
     `rename_at2`, `link_at` as v6.12's `fs/namei.c`; `readlink_at` as
     `fs/stat.c`; #254):
