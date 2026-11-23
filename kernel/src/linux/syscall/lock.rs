@@ -404,7 +404,7 @@ mod ktest_window {
 
 #[cfg(feature = "ktest")]
 use {
-    super::fd::{ktest_fd, ktest_open, ktest_unlink, sys_close, sys_lseek, sys_write},
+    super::fd::{ktest_failed_at, ktest_fd, ktest_open, sys_close, sys_lseek, sys_write},
     super::neg_errno,
     crate::ktest::TestResult,
     crate::sched,
@@ -435,10 +435,12 @@ const KTEST_FLOOR_NS: u64 = 20_000_000;
 
 /// `ret`, after removing `path`: every lock ktest's body makes its file
 /// and leaves it there, so after a pass a removal that fails fails the
-/// test; a failing test keeps its own error.
+/// test (a `ktest::diag` line naming the path and the error); a failing
+/// test keeps its own error.
 #[cfg(feature = "ktest")]
 fn ktest_unlink_after(path: &[u8], ret: TestResult) -> TestResult {
-    let removed = ktest_unlink(path);
+    let removed = lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false)
+        .map_err(|e| ktest_failed_at("remove the test's file", path, e));
     ret.and(removed)
 }
 

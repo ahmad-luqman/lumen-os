@@ -600,7 +600,8 @@ fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
 }
 
 /// Copy `path` and a NUL into the test process's user memory, in slot
-/// `slot` (256 bytes each), for a handler's path argument.
+/// `slot` (256 bytes each, slot `n` at `KTEST_USER_VA + n * 256`, so a
+/// test's own bytes there are overwritten), for a handler's path argument.
 #[cfg(feature = "ktest")]
 pub(super) fn ktest_user_path(slot: u64, path: &[u8]) -> Result<UserPtr, &'static str> {
     let addr = process::KTEST_USER_VA + slot * 256;
@@ -628,7 +629,9 @@ pub(super) fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
 /// open's `ktest::diag` line names the path and what the handler returned.
 #[cfg(feature = "ktest")]
 pub(super) fn ktest_open(slot: u64, path: &[u8], flags: u32) -> Result<Fd, &'static str> {
-    let ret = sys_open(ktest_user_path(slot, path)?, ktest_flags(flags), at::reg(0o644));
+    let user = ktest_user_path(slot, path)
+        .inspect_err(|why| crate::ktest::diag(format_args!("{why}: {}", lumen_vfs::Escaped(path))))?;
+    let ret = sys_open(user, ktest_flags(flags), at::reg(0o644));
     ktest_fd(ret).inspect_err(|why| {
         crate::ktest::diag(format_args!("{why}: {} gave {}", lumen_vfs::Escaped(path), ret as i64));
     })
@@ -663,9 +666,9 @@ pub(super) fn ktest_install_file(file: KernelFile) -> Result<Fd, &'static str> {
 }
 
 /// `why`, after a `ktest::diag` line naming `path` and the error: which of
-/// a ktest's opens failed, and how.
+/// a ktest's opens (or removals) failed, and how.
 #[cfg(feature = "ktest")]
-fn ktest_failed_at(why: &'static str, path: &[u8], e: VfsError) -> &'static str {
+pub(super) fn ktest_failed_at(why: &'static str, path: &[u8], e: VfsError) -> &'static str {
     crate::ktest::diag(format_args!("{why} at {}: {e:?}", lumen_vfs::Escaped(path)));
     why
 }
@@ -694,7 +697,10 @@ impl KtestTmpFile {
             return Err("a KtestTmpFile's path starts with /tmp/");
         }
         let _ = ktest_unlink(path); // an earlier run's, if it crashed
-        let fd = ktest_open(3, path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+        // An open can fail after its create (a full fd table, say).
+        let fd = ktest_open(3, path, OpenFlags::O_RDWR | OpenFlags::O_CREAT).inspect_err(|_| {
+            let _ = ktest_unlink(path);
+        })?;
         let Ok(inode) = fd.file().map(|f| alloc::sync::Arc::clone(&f.inode)) else {
             let _ = ktest_unlink(path);
             return Err("look up the new fd");
