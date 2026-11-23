@@ -349,7 +349,11 @@ mod charge {
         pub(super) fn renamed(self, growth: Growth) -> Self {
             let Self { mut reserved, name: old_name } = self;
             let Growth { reserved: mut more, old_len, name } = growth;
-            debug_assert_eq!(old_name.len(), old_len, "tmpfs: a rename's growth was reserved for another name");
+            debug_assert_eq!(
+                old_name.len(),
+                old_len,
+                "tmpfs: a rename's growth was reserved for another name's length"
+            );
             debug_assert!(Arc::ptr_eq(&reserved.quota, &more.quota), "tmpfs: a rename across quotas");
             reserved.bytes += core::mem::take(&mut more.bytes);
             let cost = entry_cost(name.len());
@@ -479,17 +483,19 @@ mod charge {
         /// Take `name`'s entry out, with its charge (which a rename moves
         /// to the new name, and which is given back if dropped).
         pub(super) fn take(&mut self, name: &[u8]) -> Option<(Arc<TmpfsInode>, EntryCharge)> {
-            let (name, seq) = self.by_name.remove_entry(name)?;
+            let seq = *self.by_name.get(name)?;
+            // Maps out of step (a bug) take nothing out: the name keeps its
+            // entry and its charge.
+            let listed = self.by_seq.get(&seq).is_some_and(|(n, _)| n == name);
+            debug_assert!(listed, "tmpfs: {:?}'s number {seq} lists another entry, or none", Escaped(name));
+            if !listed {
+                return None;
+            }
+            let (name, _) = self.by_name.remove_entry(name)?;
+            let (_, child) = self.by_seq.remove(&seq)?;
             // The name's charge comes out with it, sized and named from the
-            // one key, whatever `by_seq` holds.
+            // one key.
             let reserved = Reserved { quota: Arc::clone(&self.quota), bytes: entry_cost(name.len()) };
-            let entry = self.by_seq.remove(&seq);
-            debug_assert!(
-                entry.as_ref().is_some_and(|(n, _)| *n == name),
-                "tmpfs: {:?}'s number {seq} lists another entry, or none",
-                Escaped(&name)
-            );
-            let (_, child) = entry?;
             Some((child, EntryCharge { reserved, name }))
         }
 
