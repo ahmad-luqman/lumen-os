@@ -5622,14 +5622,34 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     (`raise_links_or_floor`), and by link's and mkdir's undo of a failed
     `Dir::link` (`undo_failed_link`) without; `unlink` and `rmdir`, unable to read
     their directory back (or finding the name on another inode), pin the
-    count they assume, unless the child reads back zeroed (`delete_file`
-    zeroes an inode only after its entry went): its entry is then gone and
-    it may be free, so it is forgotten rather than kept live where a new
-    inode could alias it, and for `rmdir` the parent is handled as for a
-    removed entry. That catches only a zeroed child: one whose entry went
-    and whose blocks `delete_file` already freed, before it zeroed the
-    inode, is still kept live with those blocks, which a later file can be
-    given (#330, open). A move that can't read back whether its old entry
+    count they assume, unless the child reads back zeroed or with its
+    blocks being freed (`delete_file` frees an inode's blocks, then zeroes
+    it, only after its entry went): its entry is then gone and the inode or
+    its blocks may be handed out again, so it is forgotten rather than kept
+    live where a new inode could alias it or a create in it, or a write
+    through an open descriptor (it is detached, its pages never written
+    back), could reach a new file given its blocks (#330), and for `rmdir`
+    the parent is handled as for a removed entry. Blocks being freed are
+    told by the first block `delete_file` frees: that block's bit clear in
+    the block bitmap, read through the block cache as the allocator reads
+    it, the block found by parsing `i_block` (`lumen_vfs::ext4`'s
+    `first_block_freed`, and `Geometry` for the bit, host-tested). That it
+    is the first rests on `ext4plus` 0.1.0-rc.2 freeing data blocks in file
+    order before map blocks, read from its source and exercised by the
+    ktests (one extent, a depth-1 tree, a block map); a bump of `ext4plus`
+    must check it again. Forgetting one for that is logged; the rest of its
+    blocks, and its inode, may stay allocated, for `e2fsck`. A child whose
+    inode, map or bitmap byte can't be read, whose map doesn't parse or
+    takes more than 16 reads, or whose first block is outside the volume,
+    and one that isn't the last link and reads back corrupt (`delete_file`
+    runs only for a last link), is still kept live, as when it reads back
+    allocated, though its blocks may then be free: one line says so, with
+    the cause. The geometry this reads by (`Geometry`) is checked at mount:
+    a superblock whose groups have more blocks than a bitmap block has
+    bits, none, a first data block off the volume or a block over 64 KiB
+    refuses the mount, naming the field and its value; on a bigalloc
+    volume the bound is on its clusters per group, and no block's bit is
+    placed (it mounts read-only, so no unlink reaches this). A move that can't read back whether its old entry
     (after the unlink failed) or its new one (after undoing the link
     failed) is still there keeps the counts with the source at both names:
     the source's count from before plus one (at least 3 for a directory)

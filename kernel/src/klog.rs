@@ -288,9 +288,10 @@ mod held {
     /// all are taken, every line of a site not among them is printed as if
     /// nothing were held.
     const SITES: usize = 32;
-    /// A held line's text kept, from its level on (the vfs sweeps' are
-    /// under 200 bytes); a longer one is shown cut, ending `...`.
-    const TEXT: usize = 320;
+    /// A held line's text kept, from its level on (the vfs sweeps' longest,
+    /// a corrupt inode's undecided unlink, is about 350 bytes); a longer one
+    /// is shown cut, ending `...`, which test_ktest fails.
+    const TEXT: usize = 512;
 
     /// A call site, at its level: source file, line, level.
     type Site = (&'static str, u32, Level);
