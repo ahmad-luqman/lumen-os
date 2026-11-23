@@ -404,7 +404,7 @@ mod ktest_window {
 
 #[cfg(feature = "ktest")]
 use {
-    super::fd::{ktest_fd, ktest_flags, ktest_user_path, sys_close, sys_lseek, sys_open, sys_write},
+    super::fd::{ktest_failed_at, ktest_fd_of, ktest_open, ktest_unlink, sys_close, sys_lseek, sys_write},
     super::neg_errno,
     crate::ktest::TestResult,
     crate::sched,
@@ -433,11 +433,15 @@ const KTEST_PID_SENTINEL: i32 = -7;
 #[cfg(feature = "ktest")]
 const KTEST_FLOOR_NS: u64 = 20_000_000;
 
-/// Open `path` (in path slot `slot`) with `flags` in the test process: the
-/// descriptor.
+/// `ret`, after removing `path`: every lock ktest's body makes its file
+/// and leaves it there, so after a pass a removal that fails fails the
+/// test (a `ktest::diag` line naming the path and the error). A failing
+/// test, which may have failed before making its file, keeps its own
+/// error and gets no line about the removal.
 #[cfg(feature = "ktest")]
-fn ktest_open(slot: u64, path: &[u8], flags: u32) -> Result<Fd, &'static str> {
-    ktest_fd(sys_open(ktest_user_path(slot, path)?, ktest_flags(flags), at::reg(0o644)))
+fn ktest_unlink_after(path: &[u8], ret: TestResult) -> TestResult {
+    let removed = ktest_unlink(path);
+    ret.and_then(|()| removed.map_err(|e| ktest_failed_at("remove the test's file", path, e)))
 }
 
 /// Write `bytes` at `fd`'s offset (through user memory): `write`'s result.
@@ -498,11 +502,6 @@ fn ktest_contents(fd: Fd) -> Result<alloc::vec::Vec<u8>, &'static str> {
     let n = file.inode.read_at(0, &mut buf).map_err(|_| "read the file")?;
     buf.truncate(n);
     Ok(buf)
-}
-
-#[cfg(feature = "ktest")]
-fn ktest_unlink(path: &[u8]) {
-    let _ = lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false);
 }
 
 crate::ktest!(
@@ -602,8 +601,7 @@ crate::ktest!(
             kassert!(sys_close(path_fd) == 0);
             Ok(())
         });
-        ktest_unlink(PATH);
-        ret?
+        ktest_unlink_after(PATH, ret.and_then(|r| r))
     }
 );
 
@@ -656,8 +654,7 @@ crate::ktest!(
             }
             Ok(())
         });
-        ktest_unlink(PATH);
-        ret?
+        ktest_unlink_after(PATH, ret.and_then(|r| r))
     }
 );
 
@@ -672,7 +669,7 @@ crate::ktest!(
             // Another open of the same file, read-only (flock doesn't
             // care), and a dup of the first.
             let b = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
-            let a2 = ktest_fd(sys_fcntl(a, general::F_DUPFD, 10))?;
+            let a2 = ktest_fd_of(sys_fcntl(a, general::F_DUPFD, 10), "fcntl(F_DUPFD)", PATH)?;
             kassert_eq!(a2.raw(), 10);
             kassert_eq!(sys_flock(a, ex), 0);
             // Another open file description conflicts, even in the same
@@ -722,8 +719,7 @@ crate::ktest!(
             kassert_eq!(said.count(), 1);
             Ok(())
         });
-        ktest_unlink(PATH);
-        ret?
+        ktest_unlink_after(PATH, ret.and_then(|r| r))
     }
 );
 
@@ -890,7 +886,7 @@ fn ktest_setlkw_waits_for(release: Release) -> TestResult {
             Ok(())
         },
     );
-    ktest_unlink(PATH);
+    let ret = ktest_unlink_after(PATH, ret);
     if ret.is_err() {
         crate::ktest::diag(format_args!("releasing by {release:?}"));
     }
@@ -918,7 +914,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
         move |baton| {
             let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             crate::kassert_eq!(sys_flock(fd, ex), 0);
-            let dup = ktest_fd(sys_fcntl(fd, general::F_DUPFD, 10))?;
+            let dup = ktest_fd_of(sys_fcntl(fd, general::F_DUPFD, 10), "fcntl(F_DUPFD)", PATH)?;
             crate::kassert_eq!(dup.raw(), 10);
             baton.go(1);
             baton.wait_for(2, &baton.b_ended)?;
@@ -947,7 +943,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
             Ok(())
         },
     );
-    ktest_unlink(PATH);
+    let ret = ktest_unlink_after(PATH, ret);
     if ret.is_err() {
         crate::ktest::diag(format_args!("releasing by {release:?}"));
     }
@@ -996,8 +992,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1050,8 +1045,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1111,8 +1105,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1157,8 +1150,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1191,8 +1183,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1241,8 +1232,7 @@ crate::ktest!(
                 Ok(())
             },
         );
-        ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
 
@@ -1287,7 +1277,6 @@ crate::ktest!(
                 Ok(())
             },
         );
-        ktest_unlink(PATH);
-        ret
+        ktest_unlink_after(PATH, ret)
     }
 );
