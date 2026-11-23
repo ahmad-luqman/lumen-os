@@ -268,7 +268,8 @@ mod tests {
 
     use super::super::at::{self, Dirfd, Fd, UserPtr};
     use super::super::fd::{
-        ktest_fd_of, ktest_install, ktest_open, ktest_unlink, ktest_user_path, sys_close, sys_open, sys_openat,
+        ktest_failed_at, ktest_fd_of, ktest_install, ktest_open, ktest_unlink, ktest_user_path, sys_close, sys_open,
+        sys_openat,
     };
     use super::super::neg_errno;
     use super::*;
@@ -339,14 +340,18 @@ mod tests {
         lumen_vfs::symlink_at(crate::vfs::tables(), target, None, at).map(|_| ()).map_err(|_| "symlink")
     }
 
-    /// Remove each of `paths`, any failure ignored: the tests call it
-    /// before making their files (an earlier run's, if it crashed) and
-    /// after, with names a test may not have made (its `-link`s), so
-    /// `NoEnt` is expected, and a tmpfs file's unlink has no other way to
-    /// fail.
+    /// Remove each of `paths`. The tests call it before making their
+    /// files (an earlier run's, if it crashed) and after, with names a test
+    /// may not have made (its `-link`s), so `NoEnt` is expected; any other
+    /// failure (a directory left at the name, say) gets a `ktest::diag`
+    /// line naming the path, without failing the test.
     fn remove(paths: &[&[u8]]) {
         for p in paths {
-            let _ = ktest_unlink(p);
+            if let Err(e) = ktest_unlink(p)
+                && e != lumen_vfs::VfsError::NoEnt
+            {
+                ktest_failed_at("remove a test's file", p, e);
+            }
         }
     }
 

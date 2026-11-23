@@ -603,9 +603,10 @@ fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
 /// `slot`, for a handler's path argument: 16 slots of 256 bytes, slot `n`
 /// at `KTEST_USER_VA + n * 256`, filling the first page (so a test's own
 /// bytes there are overwritten). A path that wouldn't fit its slot with
-/// its NUL, or a slot past 15, is refused. Some tests keep raw buffers at
-/// `KTEST_USER_VA + 1024` and `+ 2048`, inside slots 4 and 8: such a test
-/// keeps its paths below them.
+/// its NUL, or a slot past 15, is refused. A raw buffer a test keeps in
+/// the first page shares it with the slots (`+ 1024`, `+ 2048` and
+/// `+ 3072` are slots 4, 8 and 12): such a test keeps its paths clear of
+/// its buffers.
 #[cfg(feature = "ktest")]
 pub(super) fn ktest_user_path(slot: u64, path: &[u8]) -> Result<UserPtr, &'static str> {
     if slot >= KTEST_PATH_SLOTS {
