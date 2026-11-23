@@ -181,8 +181,9 @@ pub struct ProcessState {
     pub tid: u32,
     /// Open descriptors (`lumen_vfs::MAX_FDS` slots): 0, 1 and 2 on
     /// `/dev/console` at the start. Private: a slot leaves it only through
-    /// `close_current_fd`, `insert_current_fd`'s displacement or
-    /// `take_current`, which release its locks outside `ACTIVE_PROCS`.
+    /// `close_current_fd`, `insert_current_fd`'s displacement or `take_of`
+    /// (`take_current`, `RegisteredProcess`), which release its locks
+    /// outside `ACTIVE_PROCS`.
     fds: FdTable<FileRef>,
     /// The working directory (`set_current_cwd` swaps it).
     cwd: Cwd,
@@ -315,7 +316,8 @@ pub fn take_current() -> ProcessState {
 }
 
 /// Remove thread `ktid`'s [`ProcessState`], if it has one, and close its
-/// descriptors outside `ACTIVE_PROCS` ([`take_current`]).
+/// descriptors outside `ACTIVE_PROCS`: the one way a process is taken down
+/// ([`take_current`] and [`RegisteredProcess`] both come here).
 fn take_of(ktid: u64) -> Option<ProcessState> {
     let mut proc = ACTIVE_PROCS.lock().remove(&ktid)?;
     for entry in proc.fds.drain_all() {
@@ -325,18 +327,22 @@ fn take_of(ktid: u64) -> Option<ProcessState> {
 }
 
 /// A process the kernel's own checks register on the current user thread,
-/// taken down (its descriptors closed, as [`take_current`] does) when this
-/// drops, so an early return can't leave it in `ACTIVE_PROCS`, where it
-/// would stay in `/proc` for good. It starts with `ConsoleIo::Capture`, no
-/// test syscalls, no stdin and no executable path. Real runs (`user.rs`)
-/// register and take their process themselves.
+/// taken down (its descriptors closed, by [`take_of`]) when this drops, so
+/// an early return can't leave it in `ACTIVE_PROCS`, where it would stay in
+/// `/proc` for good. It starts with `ConsoleIo::Capture`, no test syscalls,
+/// no stdin and no executable path. Real runs (`user.rs`) register and take
+/// their process themselves.
 ///
-/// - Drop it, or [`end`](Self::end) it for its [`ProcessState`], before
-///   `sched::detach_user_space`: the state holds the thread's address
-///   space, so a process still registered then keeps the space from being
-///   torn down (its frames leak).
+/// - Drop it, or [`end`](Self::end) it and drop the [`ProcessState`] that
+///   returns, before `sched::detach_user_space`: the state holds the
+///   thread's address space, so with it still alive then the detached
+///   space isn't the last reference, its teardown there is skipped, and
+///   the space is only freed when its last `Arc` drops.
 /// - Never call [`take_current`] while it lives: its own takedown would
 ///   find no process, a panic.
+/// - Bind it to a named variable: `#[must_use]` catches a bare call, not
+///   `let _ = RegisteredProcess::register(..)`, which drops it (and takes
+///   the process down) at once.
 /// - Not `Send`: taking it down finds the process by the running thread.
 #[must_use = "dropping it takes its process down again at once"]
 pub(crate) struct RegisteredProcess {
@@ -357,8 +363,8 @@ impl RegisteredProcess {
         self.pid
     }
 
-    /// Take the process down now ([`take_current`]) and return its state
-    /// (what its console captured, say).
+    /// Take the process down now ([`take_of`]) and return its state (what
+    /// its console captured, say).
     pub(crate) fn end(self) -> ProcessState {
         let proc = self.take();
         // Taken, so `Drop` must not take it again; nothing else in `self`
@@ -373,7 +379,7 @@ impl RegisteredProcess {
         let proc = take_of(ktid).unwrap_or_else(|| {
             panic!("pid {}: thread {ktid} has no process left to take down", self.pid);
         });
-        debug_assert_eq!(proc.pid, self.pid, "thread {ktid}'s process isn't the one it registered");
+        debug_assert_eq!(proc.pid, self.pid, "thread {ktid}'s process (left) isn't this RegisteredProcess's (right)");
         proc
     }
 }
