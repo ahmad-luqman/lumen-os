@@ -6099,10 +6099,12 @@ crate::ktest!(
         //   too low frees an inode still named);
         // - every name then comes off, and while another name still has
         //   an inode, a new file never gets its number.
-        // Known exception (#322): a move whose unlink failed with its old
-        // directory unreadable keeps the source at both names with too low
-        // a count; there, the source's and its new parent's counts and the
-        // source's removal aren't checked.
+        // Known exception (#322): a move that leaves its source at both
+        // names can keep too low a count, whichever undo left it there (the
+        // unlink failing with its old directory unreadable, or the undo of
+        // the link not knowing whether the new entry went, `roll_back`'s
+        // `Err` arm); in that state, whatever the fault, the source's and
+        // its new parent's counts and the source's removal aren't checked.
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
