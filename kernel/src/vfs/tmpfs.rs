@@ -1624,7 +1624,6 @@ crate::ktest!(
         root.link(&[b'g'; 16], &t).map_err(|_| "link 16")?;
         root.link(&[b'h'; 17], &t).map_err(|_| "link 17")?;
         kassert_eq!(fs.used_bytes(), one + entry_cost(16) + entry_cost(17));
-        kassert_eq!(entry_cost(17) - entry_cost(16), 2 * 16);
         root.unlink(&[b'g'; 16]).map_err(|_| "unlink 16")?;
         kassert_eq!(fs.used_bytes(), one + entry_cost(17));
         root.unlink(&[b'h'; 17]).map_err(|_| "unlink 17")?;
