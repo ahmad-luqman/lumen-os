@@ -25,6 +25,9 @@ pub struct BlockCacheStats {
     pub evictions: u64,
     /// Number of dirty block writebacks issued to the underlying device.
     pub writebacks: u64,
+    /// Number of block writebacks the device failed, an eviction's or a
+    /// sync's ([`BlockCache::writeback_failures`]).
+    pub writeback_failures: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +70,7 @@ struct CacheInner {
     misses: u64,
     evictions: u64,
     writebacks: u64,
+    writeback_failures: u64,
 }
 
 impl CacheInner {
@@ -84,6 +88,7 @@ impl CacheInner {
             misses: 0,
             evictions: 0,
             writebacks: 0,
+            writeback_failures: 0,
         }
     }
 
@@ -232,6 +237,16 @@ impl<B: BlockDevice> BlockCache<B> {
         self.inner.borrow_mut().frozen = false;
     }
 
+    /// How many block writebacks the device has failed: an eviction's (which
+    /// fails the `read_at`, `write_at` or pin whose miss needed the slot, a
+    /// read included) or a sync's (which stops at its first failed block). A
+    /// failed device flush isn't counted: no block's write failed. The one
+    /// signal that a device write failed, since a call's error alone can't
+    /// say (a pre-read, a full cache): a caller compares it before and after.
+    pub fn writeback_failures(&self) -> u64 {
+        self.inner.borrow().writeback_failures
+    }
+
     /// Whether [`Self::freeze`] stopped the cache's writes.
     pub fn is_frozen(&self) -> bool {
         self.inner.borrow().frozen
@@ -265,6 +280,7 @@ impl<B: BlockDevice> BlockCache<B> {
             misses: inner.misses,
             evictions: inner.evictions,
             writebacks: inner.writebacks,
+            writeback_failures: inner.writeback_failures,
         }
     }
 
@@ -340,7 +356,10 @@ impl<B: BlockDevice> BlockCache<B> {
                         inner.needs_device_flush = true;
                         // Continue loop: re-check victim cleanly and evict it (or hit if somehow present).
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        inner.writeback_failures += 1;
+                        return Err(e);
+                    }
                 }
             } else {
                 inner.unlink(victim_idx);
@@ -563,6 +582,9 @@ impl<B: BlockDevice> BlockCache<B> {
 
             let mut inner = self.inner.borrow_mut();
             inner.slots[slot_idx].pin_count -= 1;
+            if write_res.is_err() {
+                inner.writeback_failures += 1;
+            }
             write_res?;
             inner.slots[slot_idx].state = SlotState::Occupied { block_id, dirty: false };
             inner.writebacks += 1;

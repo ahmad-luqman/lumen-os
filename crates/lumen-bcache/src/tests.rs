@@ -429,6 +429,9 @@ fn every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty() {
     assert_eq!(cache.sync(), Err(BlockError::Io));
     let stats = cache.stats();
     assert_eq!((stats.cached, stats.dirty, stats.writebacks), (1, 1, 0));
+    // Each failed writeback counted, the eviction's (a read's too) and the
+    // syncs': how a caller tells a read's error from another block's (#349).
+    assert_eq!((cache.writeback_failures(), stats.writeback_failures), (4, 4));
     assert_eq!(cache.device().flush_calls(), 0);
     assert_eq!(cache.device().volatile_snapshot()[..16], [0; 16]);
     assert_eq!(cache.device().volatile_snapshot()[BLOCK_SIZE..BLOCK_SIZE + 16], [0; 16]);
@@ -451,6 +454,17 @@ fn every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty() {
         assert_eq!(cache.read_at(block * BLOCK_SIZE as u64, &mut buf), Err(BlockError::Io));
     }
     assert_eq!(cache.stats().cached, 2);
+    assert_eq!(cache.writeback_failures(), 2);
+    // Frozen (a filesystem's errors=remount-ro, #349), it skips the dirty
+    // block and evicts the clean one: the misses are served.
+    cache.device().clear_logs();
+    cache.freeze();
+    cache.device().inject_write_error(BlockError::Io);
+    for block in [2u64, 3] {
+        cache.read_at(block * BLOCK_SIZE as u64, &mut buf).unwrap();
+    }
+    assert_eq!(cache.writeback_failures(), 2);
+    assert!(cache.device().write_log().is_empty());
 }
 
 #[test]
