@@ -1572,6 +1572,14 @@ struct MemBlkDevInner {
     /// device error under a real `BlockCache`, where it surfaces only when
     /// the cache writes a block back (#331).
     fail_device_writes: core::sync::atomic::AtomicBool,
+    /// The device writes that landed.
+    writes: core::sync::atomic::AtomicUsize,
+    /// Fail the device write attempt by this number, counting from
+    /// `fail_nth_device_write` (0: none), and keep the device's write count
+    /// and bytes as they were then (`at_failure`).
+    fail_nth: core::sync::atomic::AtomicUsize,
+    attempts: core::sync::atomic::AtomicUsize,
+    at_failure: SleepMutex<Option<(usize, Vec<u8>)>>,
 }
 
 #[cfg(feature = "ktest")]
@@ -1582,6 +1590,10 @@ impl MemBlkDev {
             read_only,
             flushed: core::sync::atomic::AtomicBool::new(false),
             fail_device_writes: core::sync::atomic::AtomicBool::new(false),
+            writes: core::sync::atomic::AtomicUsize::new(0),
+            fail_nth: core::sync::atomic::AtomicUsize::new(0),
+            attempts: core::sync::atomic::AtomicUsize::new(0),
+            at_failure: SleepMutex::new(None),
         }))
     }
 
@@ -1595,6 +1607,23 @@ impl MemBlkDev {
     /// The device's bytes as they are.
     fn bytes(&self) -> Vec<u8> {
         self.0.data.lock().clone()
+    }
+
+    /// Fail only the `nth` device write attempt from now (#349), keeping the
+    /// write count and bytes of that moment for `at_failure`.
+    fn fail_nth_device_write(&self, nth: usize) {
+        self.0.attempts.store(0, core::sync::atomic::Ordering::Release);
+        self.0.fail_nth.store(nth, core::sync::atomic::Ordering::Release);
+    }
+
+    /// The device writes that landed so far.
+    fn writes(&self) -> usize {
+        self.0.writes.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The write count and bytes when `fail_nth_device_write`'s write failed.
+    fn at_failure(&self) -> Option<(usize, Vec<u8>)> {
+        self.0.at_failure.lock().clone()
     }
 }
 
@@ -1625,10 +1654,17 @@ impl lumen_bcache::BlockDevice for MemBlkDev {
         if self.0.fail_device_writes.load(core::sync::atomic::Ordering::Acquire) {
             return Err(lumen_bcache::BlockError::Io);
         }
+        let attempt = self.0.attempts.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
+        if attempt == self.0.fail_nth.load(core::sync::atomic::Ordering::Acquire) {
+            let bytes = self.0.data.lock().clone();
+            *self.0.at_failure.lock() = Some((self.writes(), bytes));
+            return Err(lumen_bcache::BlockError::Io);
+        }
         let off = (lba * 512) as usize;
         let mut guard = self.0.data.lock();
         let slice = guard.get_mut(off..off + src.len()).ok_or(lumen_bcache::BlockError::OutOfRange)?;
         slice.copy_from_slice(src);
+        self.0.writes.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 

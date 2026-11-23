@@ -294,9 +294,9 @@ VFS_HOLDABLE_LINES = (*VFS_SWEEP_LINES, *VFS_ERRORED_LINES)
 # The ktests erroring one volume outside a guard, one line each: the
 # writeback ktests (sync past a failing inode, a failing page, reclaim's
 # write error), vfs::tests' sync past a failing inode and flush/reclaim
-# write error, io's sync of every filesystem, mem's msync and meta's
-# failed chown.
-VFS_ERRORED_UNGUARDED = 8
+# write error, io's sync of every filesystem, mem's msync, meta's failed
+# chown, and the device write failing part-way through a sync (#349).
+VFS_ERRORED_UNGUARDED = 9
 VFS_EXACT_LINES = {
     # page_quota_release_saturates_and_detached_quota_reports_nospc
     r"ERROR vfs: quota ktest \(16384 bytes\): released 20480 bytes with only 8192 reserved": 1,
@@ -312,9 +312,10 @@ VFS_EXACT_LINES = {
     # a failing page among good ones; linux::syscall::io's
     # io_fsync_writes_an_ext4_file_back_and_reports_eio: one failed page;
     # linux::syscall::mem::tests' mem_msync_returns_a_writeback_error_before_enomem:
-    # one failed page).
+    # one failed page; ext4_nothing_reaches_the_device_after_the_first_failed_write
+    # (#349): its three files' writebacks, refused once writeback stopped).
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 4,
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 4,
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 7,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
     # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
     # fills, a good one, a third failed fill), one warning each;
@@ -329,7 +330,9 @@ VFS_EXACT_LINES = {
     # mm::user_vm::file_vm_disk_read_error_is_a_bus_error: a fault's fill.
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 2 \(offset 8192\) failed: Io": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
-    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 1,
+    # (and ext4_nothing_reaches_the_device_after_the_first_failed_write's
+    # sync: one per file)
+    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 4,
     # linux::syscall::io: io_fsync_writes_an_ext4_file_back_and_reports_eio's
     # `fsync` with the block cache's sync failing, and
     # io_sync_flushes_every_mounted_filesystem's `sync` with one volume's;
