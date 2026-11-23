@@ -996,9 +996,6 @@ pub fn reclaim_ext4_to_target(target_pages: usize) {
         if cur <= target_pages {
             return;
         }
-        if inode.is_detached() {
-            continue;
-        }
         let excess = cur - target_pages;
         inode.reclaim_clean_pages(excess);
     }
@@ -1008,9 +1005,6 @@ pub fn reclaim_ext4_to_target(target_pages: usize) {
         let cur = EXT4_CACHED_PAGES.load(Ordering::Relaxed);
         if cur <= target_pages {
             return;
-        }
-        if inode.is_detached() {
-            continue;
         }
         let excess = cur - target_pages;
         inode.reclaim_dirty_pages(excess);
