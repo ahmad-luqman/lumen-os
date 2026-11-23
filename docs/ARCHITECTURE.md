@@ -493,9 +493,41 @@ test the fallbacks (q35 always takes 0xCF9's reset); an unknown value starts
 at 0xCF9 with a warning (tested). The reboot scenarios run QEMU without
 `-no-reboot` (the banner appears twice, the log shows which method did it,
 and under TCG `qemu.log` shows a triple fault only for that method); the
-power-off one accepts QEMU's exit status 0 only with a QMP `SHUTDOWN` event
+power-off ones (`test_shell::test_shutdown_powers_off` and
+`test_fs::test_ext4_unsynced_writes_survive_shutdown`) accept QEMU's exit status 0 only with a QMP `SHUTDOWN` event
 whose reason is `guest-shutdown` (a triple fault under `-no-reboot` also
 exits with 0, but as `guest-reset`).
+
+Both commands first flush every filesystem (`vfs::sync_all`, #352), on the
+shell's thread while it can still sleep: `reboot` before `reboot:
+restarting`, `shutdown` before `shutdown: powering off` and only when ACPI
+gave a way to power off (`shell/commands.rs`'s `sync_then_announce`). A
+failed sync is a warning on serial, `WARN  power: <command>: sync failed:
+<error>; <restarting|powering off> anyway` (a terminal window's or virtual
+terminal's output may never show before the machine goes), and a line on
+the console, `<command>: sync failed: <error> (the log says what failed);
+<restarting|powering off> anyway`; then the command goes on. The block
+cache writes its dirty blocks back in block order and stops at the first
+that fails, before the device flush: the blocks ahead of it reached the
+device but were never flushed, and it and the ones after it are lost.
+Staying up would save them only if the failure passes (a failed block stays
+dirty for the next sync, section 9), and whoever suspects that runs the
+shell's `sync` command first, as often as they like; refusing would let a
+disk that keeps failing keep the machine from going down at all. What the
+ext4 rootfs holds unsynced is on the disk after either (tested:
+`test_fs::test_ext4_unsynced_writes_survive_reboot` and
+`test_fs::test_ext4_unsynced_writes_survive_shutdown`, each checking first
+that the image is still untouched; the failure's line and warning by a
+ktest over a failing sync; not tested: a failing disk, and the sync being
+skipped when ACPI gave no way to power off). Nothing stops other threads
+first, so what they write after the sync can still be lost. A device that
+stops answering doesn't hang the command (each virtio-blk request gives up
+after 5 s, and the sync then fails), but a VFS or ext4 lock another thread
+never releases would. `exit` (the
+`lumen.qemu_exit` test hook), the ktest kernel's exit and the crash
+reporter's don't sync: the first two end QEMU as pulling the plug would (a
+scenario that wants its writes kept runs `sync` first), and the crash
+reporter must take no lock it could deadlock on (`crash.rs`).
 
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`

@@ -334,3 +334,13 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried",
     "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc",
 ]
+
+[[feature]]
+name = "`reboot` and `shutdown` sync every filesystem before the machine goes (#352): on the ext4 rootfs, a new directory with a file and a multi-page file in it, and an existing file rewritten, all without `sync` and checked not yet on the disk image, are on it after `reboot` (read back in the same QEMU) and after `shutdown` (read back by a second QEMU), and the image passes e2fsck after each; a failed sync is a `power` warning on serial and one line on the console (`<command>: sync failed: <error> (the log says what failed); <restarting|powering off> anyway`) before the usual announcement, the sync run once (a ktest over a failing sync, not a failing disk)"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_ext4_unsynced_writes_survive_reboot",
+    "scenario:test_fs::test_ext4_unsynced_writes_survive_shutdown",
+    "ktest:lumen_kernel::shell::commands::power_commands_sync_once_then_announce",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+]
