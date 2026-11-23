@@ -5897,13 +5897,22 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `/proc/mounts` (each filesystem asked for its device, name and
     read-only flag after the lock is released), or `mounts_with_fs` (#324)
     for `mount`: the same rows, each with its filesystem, which `mount`
-    asks a `tmpfs` one's quota of, all from one snapshot. Calls into a filesystem it still
-    makes under the locks (`VfsInode::dev_id`, `ino`, `cacheable` and
-    `is_detached`, `FileSystem::dev_id`, `mount`'s `inode_type()`), and
-    `Arc`s it drops there (a failed `mount`'s, the unmounted mountpoint,
-    the ones `InodeCache` drops in `get_or_insert*`, `get_if_fresh`,
-    `end_removal`, `evict_detached` and `record_removal_if_absent`), are
-    listed in `VfsTables`' doc and #320. It lives in lumen-vfs, generic
+    asks a `tmpfs` one's quota of, all from one snapshot. No inode or
+    filesystem `Arc` it lets go of drops under the locks (#320): `umount`
+    hands back the mountpoint with the filesystem, a refused `mount` or
+    `mount_root` takes its `Arc`s by reference and clones them only into
+    the mount, and every `InodeCache` method that evicts a stale entry or
+    unifies a handed inode with a cached one puts what it let go of in a
+    `Released` the caller declares before its guards, so it drops after
+    them. `mount` asks its mountpoint's `inode_type()` before taking the
+    locks. The calls into a filesystem it still makes under them,
+    `VfsInode::dev_id`, `ino`, `cacheable` and `is_detached` and
+    `FileSystem::dev_id` (probing a cached entry or a mount needs them),
+    must by their docs answer without locking or blocking (each an atomic
+    or a fixed field in ext4, tmpfs, devfs and procfs). The host tests
+    count, on a filesystem handing out a fresh `Arc` per lookup, each drop
+    of its inodes and of the filesystem made while a table is held
+    (`*_after_releasing_lock9`). It lives in lumen-vfs, generic
     over a lock family (`trait LockFamily { type Lock<T>: VfsLock<T>; }`),
     so the kernel and the host tests run
     the same code: the kernel's `KernelVfsTables` is

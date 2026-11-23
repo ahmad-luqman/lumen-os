@@ -11,6 +11,9 @@ use crate::types::{DevId, DirEntry, Ino, InodeType, Metadata, RenameFlags, SetTi
 /// Mounted filesystem interface (`ext4`, `tmpfs`, `devfs`, `procfs`).
 pub trait FileSystem: Send + Sync {
     /// Canonical `DevId` (`makedev(major, minor)`) matching `stat.st_dev`.
+    ///
+    /// Called under Lock 9 (the mount table's checks, #320): must not lock
+    /// or block, and answers from fixed state.
     fn dev_id(&self) -> DevId;
 
     /// Human-readable filesystem type name (e.g. `"ext4"`, `"tmpfs"`, `"devfs"`, `"procfs"`).
@@ -54,9 +57,16 @@ pub trait VfsInode: Send + Sync {
     fn lock_id(&self) -> u64;
 
     /// Filesystem device ID (`stat.st_dev`).
+    ///
+    /// Called under Lock 9 (`InodeCache`'s keys, #320): must not lock or
+    /// block, and answers from fixed state.
     fn dev_id(&self) -> DevId;
 
     /// Current `st_ino` (may transition to `(1 << 63) | seq` on detached unlinks).
+    ///
+    /// Called under Lock 9 (`InodeCache` checks a cached entry's number,
+    /// #320): must not lock or block (an atomic load, as the detach that
+    /// changes it stores it).
     fn ino(&self) -> Ino;
 
     /// File type (`File`, `Dir`, `Symlink`, `CharDevice`, ...).
@@ -81,6 +91,10 @@ pub trait VfsInode: Send + Sync {
     fn dec_open_count(&self) -> u32;
 
     /// True if this inode has been detached-unlinked (`st_nlink == 0` while open).
+    ///
+    /// Called under Lock 9 (`InodeCache` checks whether a cached entry is
+    /// stale, #320): must not lock or block (an atomic load, as the detach
+    /// stores it).
     fn is_detached(&self) -> bool {
         false
     }

@@ -35,7 +35,7 @@ mod tests;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use cache::{DentryCache, DentryTarget, InodeCache};
+pub use cache::{DentryCache, DentryTarget, InodeCache, Released};
 pub use error::VfsError;
 pub use fd::{FdEntry, FdTable, LocalLock, LockFamily, OpenFile, OpenFileId, VfsLock};
 pub use fs::{FileSystem, OpenGuard, VfsInode};
