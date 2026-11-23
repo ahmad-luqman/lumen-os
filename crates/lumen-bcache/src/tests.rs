@@ -636,3 +636,56 @@ fn a_frozen_cache_writes_nothing_and_keeps_its_dirty_blocks() {
     cache.sync().unwrap();
     assert_eq!(cache.device().durable_snapshot()[..4], [0xaa; 4]);
 }
+
+#[test]
+fn the_first_device_failure_stops_writeback_when_asked() {
+    // A failed eviction (on a read's miss), with stop_writeback_on_failure:
+    // counted, and from then on nothing reaches the device, though writes
+    // into the cache are still taken and misses served from clean slots.
+    let mut buf = [0u8; 16];
+    let cache = BlockCache::new(MemBlockDevice::new(512, 64), 3).unwrap();
+    cache.stop_writeback_on_failure();
+    cache.write_at(0, &[0x11; 16]).unwrap(); // dirty, least recently used
+    cache.write_at(BLOCK_SIZE as u64, &[0x22; 16]).unwrap(); // dirty
+    cache.read_at(2 * BLOCK_SIZE as u64, &mut buf).unwrap(); // clean
+    cache.device().inject_write_error(BlockError::Io);
+    assert_eq!(cache.read_at(3 * BLOCK_SIZE as u64, &mut buf), Err(BlockError::Io));
+    assert!(cache.writeback_stopped() && !cache.is_frozen());
+    assert_eq!(cache.writeback_failures(), 1);
+    cache.device().clear_logs();
+    let before = cache.device().volatile_snapshot();
+    // Block 0 would have been the victim again: now only the clean block 2 goes.
+    cache.read_at(3 * BLOCK_SIZE as u64, &mut buf).unwrap();
+    cache.write_at(2 + BLOCK_SIZE as u64, &[0x33; 4]).unwrap(); // still taken
+    assert_eq!(cache.sync(), Err(BlockError::ReadOnly));
+    assert_eq!(cache.flush_blocks(&[0, 1]), Err(BlockError::ReadOnly));
+    // Block 3 dirtied too: every slot is dirty, so a miss can't be served.
+    cache.write_at(3 * BLOCK_SIZE as u64, &[0x44; 4]).unwrap();
+    assert_eq!(cache.read_at(5 * BLOCK_SIZE as u64, &mut buf), Err(BlockError::CacheFull));
+    assert!(cache.device().write_log().is_empty());
+    assert_eq!(cache.device().flush_calls(), 0);
+    assert_eq!(cache.device().volatile_snapshot(), before);
+    cache.read_at(BLOCK_SIZE as u64, &mut buf).unwrap();
+    assert_eq!(buf[..4], [0x22, 0x22, 0x33, 0x33]);
+
+    // A failed flush is counted, and stops writeback too.
+    let cache = BlockCache::new(MemBlockDevice::new(512, 64), 3).unwrap();
+    cache.stop_writeback_on_failure();
+    cache.write_at(0, &[0x55; 16]).unwrap();
+    cache.device().inject_flush_error(BlockError::Io);
+    assert_eq!(cache.sync(), Err(BlockError::Io));
+    assert_eq!(cache.writeback_failures(), 1);
+    assert!(cache.writeback_stopped());
+    cache.write_at(0, &[0x66; 16]).unwrap();
+    assert_eq!(cache.sync(), Err(BlockError::ReadOnly));
+
+    // Without asking, a failed flush is counted and the next sync retries.
+    let cache = BlockCache::new(MemBlockDevice::new(512, 64), 3).unwrap();
+    cache.write_at(0, &[0x77; 16]).unwrap();
+    cache.device().inject_flush_error(BlockError::Io);
+    assert_eq!(cache.sync(), Err(BlockError::Io));
+    assert_eq!(cache.writeback_failures(), 1);
+    assert!(!cache.writeback_stopped());
+    cache.sync().unwrap();
+    assert_eq!(cache.device().durable_snapshot()[..16], [0x77; 16]);
+}
