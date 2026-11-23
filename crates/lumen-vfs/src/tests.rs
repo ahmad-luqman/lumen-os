@@ -5126,13 +5126,13 @@ fn probes_refuse_inodes_of_unmounted_filesystems() {
     let (dentry_gen, inode_gen) = env.cache_gens();
     // The same calls with the mounted root filesystem's inodes are taken.
     let a = root.create(b"a", 0o644).unwrap();
-    assert!(env.publish_lookup_inode(rdev, rino, b"a", Arc::clone(&a), dentry_gen, inode_gen).is_ok());
+    assert!(env.publish_lookup_inode(rdev, rino, b"a", Arc::clone(&a), dentry_gen, inode_gen).is_ok(), "lookup");
     assert!(env.inode_get(rdev, a.ino()).is_some(), "publish_lookup_inode");
     let b = root.create(b"b", 0o644).unwrap();
-    assert!(env.publish_created_inode(rdev, rino, b"b", Arc::clone(&b), dentry_gen, inode_gen).is_ok());
+    assert!(env.publish_created_inode(rdev, rino, b"b", Arc::clone(&b), dentry_gen, inode_gen).is_ok(), "created");
     assert!(env.inode_get(rdev, b.ino()).is_some(), "publish_created_inode");
     let c = root.create(b"c", 0o644).unwrap();
-    assert!(env.inode_get_or_insert_if_fresh(Arc::clone(&c), inode_gen).is_ok());
+    assert!(env.inode_get_or_insert_if_fresh(Arc::clone(&c), inode_gen).is_ok(), "inode_get_or_insert_if_fresh");
     assert!(env.inode_get(rdev, c.ino()).is_some(), "inode_get_or_insert_if_fresh");
 }
 
@@ -5147,7 +5147,7 @@ fn umount_forgets_the_unmounted_filesystems_names() {
     let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
     let first = MemFs::new(DevId::TMPFS, "tmpfs", false);
     env.mount(Arc::clone(&mp), "/mnt", first as Arc<dyn FileSystem>).unwrap();
-    drop(mkdir_at(&env, None, b"/mnt/d", 0o755, 0).unwrap());
+    let d_ino = mkdir_at(&env, None, b"/mnt/d", 0o755, 0).unwrap().ino();
     assert!(env.snapshot_dentries().iter().any(|(pd, _, _, _)| *pd == DevId::TMPFS));
     drop(env.umount(mp.dev_id(), mp.ino()).unwrap());
     assert!(
@@ -5157,14 +5157,16 @@ fn umount_forgets_the_unmounted_filesystems_names() {
 
     let second = MemFs::new(DevId::TMPFS, "tmpfs", false);
     env.mount(Arc::clone(&mp), "/mnt", second as Arc<dyn FileSystem>).unwrap();
-    // The same inode number `d` had on the first one.
-    drop(mkdir_at(&env, None, b"/mnt/other", 0o755, 0).unwrap());
+    // The same inode number `d` had on the first one, or the check below
+    // would pass with the name left behind.
+    assert_eq!(mkdir_at(&env, None, b"/mnt/other", 0o755, 0).unwrap().ino(), d_ino);
     assert_eq!(resolve_path(&env, None, b"/mnt/d", nofollow).err(), Some(VfsError::NoEnt));
 }
 
 /// The table probes' generation and identity rules, each call alone: a
 /// stale generation refuses, a cached inode isn't published again, an
-/// identity check compares the `Arc`, not the number.
+/// identity check compares the `Arc`, not the number (a filesystem that
+/// hands out a fresh `Arc` per lookup, `FreshArcReusingFs`).
 #[test]
 fn table_probes_keep_their_generation_and_identity_rules() {
     let (env, root_fs) = setup_vfs();
@@ -5199,16 +5201,23 @@ fn table_probes_keep_their_generation_and_identity_rules() {
     assert!(env.inode_get(rdev, d.ino()).is_some(), "inode_begin_removal");
     let _ = env.inode_end_removal(rdev, d.ino());
 
-    let e = env.inode_get_or_insert(root.create(b"e", 0o644).unwrap());
-    assert!(env.inode_remove_if_same(rdev, e.ino(), &a).is_none());
-    assert!(env.inode_get(rdev, e.ino()).is_some(), "inode_remove_if_same");
-
     let f = env.inode_get_or_insert(root.create(b"f", 0o644).unwrap());
     let f_ino = f.ino();
     f.inc_open_count();
     root.unlink(b"f").unwrap();
     assert!(!env.inode_evict_detached(rdev, a.ino()));
     assert!(env.inode_evict_detached(rdev, f_ino), "inode_evict_detached");
+    f.dec_open_count();
+
+    let fresh = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fresh) as Arc<dyn FileSystem>);
+    let root = fresh.root_inode();
+    let e = env.inode_get_or_insert(root.create(b"e", 0o644).unwrap());
+    let twin = root.lookup(b"e").unwrap();
+    assert!(twin.ino() == e.ino() && !Arc::ptr_eq(&twin, &e));
+    assert!(env.inode_remove_if_same(rdev, e.ino(), &twin).is_none());
+    assert!(env.inode_get(rdev, e.ino()).is_some(), "inode_remove_if_same");
+    assert!(env.inode_remove_if_same(rdev, e.ino(), &e).is_some());
 }
 
 #[test]

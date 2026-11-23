@@ -519,7 +519,7 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
 
     fn fs_read_only(&self, dev: DevId) -> bool {
         // The guard is released before `read_only` runs, as `root_inode`
-        // does before `root_inode()` (`fs_by_dev` still asks each mounted
+        // does before `root_inode()` (`fs_by_dev` still asks the root
         // filesystem's `dev_id()` under it; the struct doc lists what runs
         // under the guards).
         let fs = self.mounts.lock().fs_by_dev(dev);
