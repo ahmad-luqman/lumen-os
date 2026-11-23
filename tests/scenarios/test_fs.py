@@ -75,6 +75,12 @@ def stat_fields(m, path):
     return fields
 
 
+def blk_dirty(m):
+    """How many blocks the block cache holds dirty (`blk`'s dirty column,
+    the last row's)."""
+    return int(run(m, "blk | select dirty").strip().splitlines()[-1])
+
+
 def test_ext4_read_write_persists_across_reboot(boot, tmp_path):
     disk = copy_rootfs(tmp_path)
 
@@ -115,7 +121,7 @@ def test_ext4_read_write_persists_across_reboot(boot, tmp_path):
     assert run(m1, f"vfstest symlink /long_sym {long_target}") == "symlink: ok\n"
 
     assert run(m1, "sync") == "sync: ok\n"
-    assert run(m1, "blk | select dirty").strip().splitlines()[-1].strip() == "0"
+    assert blk_dirty(m1) == 0
     mtime_before = stat_fields(m1, "/persist_dir/hello.txt")["mtime"]
 
     # Abrupt power loss after sync (no graceful shell exit).
@@ -171,23 +177,27 @@ BOOTING = r"INFO  boot: Lumen \d+\.\d+\.\d+ \(x86_64\) booting"
 MOTD = "/etc/motd"
 
 
-def write_unsynced(m, tag):
-    """Write on the ext4 root without `sync` (#352): a new directory with a
-    file and a multi-page file in it, and `/etc/motd`, which the image
-    ships, rewritten. Returns the precondition: what the block cache still
-    holds dirty (the files' data is in the page cache, not even there)."""
+def write_unsynced(m, tag, disk, pristine):
+    """Write on the ext4 root without `sync` (#352): a new directory, a file
+    and a multi-page file in it, and `/etc/motd`, which the image ships,
+    rewritten. Then the precondition that makes a later read-back mean
+    something: the block cache still holds dirty blocks, and the disk image
+    `disk` still has its `pristine` bytes (nothing written reached it)."""
+    assert stat_fields(m, MOTD)["type"] == "file", "the image has no /etc/motd to rewrite"
     assert run(m, f"vfstest mkdir /unsynced_{tag} 0755") == "mkdir: ok\n"
     text = f"unsynced-{tag}"
     assert run(m, f"vfstest write /unsynced_{tag}/new.txt {text}") == f"wrote {len(text)}\n"
     assert run(m, f"vfstest write-pattern /unsynced_{tag}/big.bin 9001") == "wrote 9001\n"
     motd = f"motd-{tag}"
     assert run(m, f"vfstest write {MOTD} {motd}") == f"wrote {len(motd)}\n"
-    return int(run(m, "blk | select dirty").strip().splitlines()[-1])
+    assert blk_dirty(m) > 0, "nothing left to sync: the test would prove nothing"
+    assert disk.read_bytes() == pristine, "the writes reached the disk before the power command"
 
 
 def check_unsynced(m, tag):
-    """What `write_unsynced(m, tag)` wrote reads back after a reboot (all
-    three read before comparing, so a failure shows each)."""
+    """What `write_unsynced(m, tag, ...)` wrote reads back, on the next boot
+    (after `reboot` in the same machine, or after `shutdown` in a new one;
+    all three read before comparing, so a failure shows each)."""
     got = (
         run(m, f"vfstest cat /unsynced_{tag}/new.txt"),
         run(m, f"vfstest verify-pattern /unsynced_{tag}/big.bin 9001"),
@@ -199,12 +209,12 @@ def check_unsynced(m, tag):
 def test_ext4_unsynced_writes_survive_reboot(boot, tmp_path):
     # `reboot` syncs every filesystem before it resets the machine (#352):
     # what was written without `sync` is on the disk when it boots again, in
-    # the same QEMU on the same image.
+    # the same QEMU on the same image, which passes e2fsck.
     disk = copy_rootfs(tmp_path)
+    pristine = disk.read_bytes()
     m = shell(boot, reboot=True, devices=Devices(blk_image=disk, rng=True))
     assert_quiet_boot(m.output)
-    assert stat_fields(m, MOTD)["type"] == "file", "the image has no /etc/motd to rewrite"
-    assert write_unsynced(m, "reboot") > 0, "nothing left to sync: the test would prove nothing"
+    write_unsynced(m, "reboot", disk, pristine)
     m.qmp()  # connected before the reset, so it gets the RESET event
     start = len(m.output)
     m.send_line("reboot")
@@ -227,9 +237,10 @@ def test_ext4_unsynced_writes_survive_shutdown(boot, tmp_path):
     # written without `sync` is on the disk, which passes e2fsck, and a
     # second machine booted on it reads it back.
     disk = copy_rootfs(tmp_path)
+    pristine = disk.read_bytes()
     m1 = shell(boot, devices=Devices(blk_image=disk, rng=True))
     assert_quiet_boot(m1.output)
-    assert write_unsynced(m1, "shutdown") > 0, "nothing left to sync: the test would prove nothing"
+    write_unsynced(m1, "shutdown", disk, pristine)
     m1.qmp()  # connected before the power-off, so it gets the SHUTDOWN event
     start = len(m1.output)
     m1.send_line("shutdown")
@@ -529,7 +540,7 @@ def test_posix_vfs_semantics(boot, tmp_path):
     # What it keeps stays in the page cache: its frame count isn't checked.
     run_m7_vfs(m, "keep /m7k", KEEP_CHECKS)
     assert run(m, "sync") == "sync: ok\n"
-    assert run(m, "blk | select dirty").strip().splitlines()[-1].strip() == "0"
+    assert blk_dirty(m) == 0
     f, hl = stat_fields(m, "/m7k/f"), stat_fields(m, "/m7k/hl")
     assert (f["ino"], f["nlink"], f["mode"]) == (hl["ino"], "2", "0640"), (f, hl)
     assert stat_fields(m, "/m7k/xf")["type"] == "dir"

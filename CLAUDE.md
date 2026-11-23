@@ -271,7 +271,7 @@ one is its own PR that updates that doc first.
   `sources`, `stats` (the shell's `random`, rhai's `random()`), RDRAND and
   the virtio-rng driver (its own queue, one deadline per request, dropped
   on a failed request) feeding a ChaCha20 pool. `power.rs`: `reboot` and `shutdown` (ACPI S5;
-  the shell's commands sync the filesystems first, `sync_before`, #352);
+  the shell's commands sync the filesystems first, `shell/commands.rs`'s `sync_then_announce`, #352);
   `arch/x86_64/reset.rs` their registers.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).

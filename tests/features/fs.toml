@@ -318,7 +318,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`reboot` and `shutdown` sync every filesystem before the machine goes (#352): files created, a multi-page file and an existing file rewritten on the ext4 rootfs without `sync` are on the disk when it boots again (after `reboot` in the same QEMU, after `shutdown` in a second one on the image, which passes e2fsck); a failed sync is one line (`<command>: sync failed: <error> ...; <restarting|powering off> anyway`; its text checked by a ktest, not with a failing disk)"
+name = "`reboot` and `shutdown` sync every filesystem before the machine goes (#352): on the ext4 rootfs, a new directory with a file and a multi-page file in it, and an existing file rewritten, all without `sync` and checked not yet on the disk image, are on it after `reboot` (read back in the same QEMU) and after `shutdown` (read back by a second QEMU), and the image passes e2fsck after each; a failed sync is a `power` warning on serial and one line on the console (`<command>: sync failed: <error> (the log says what failed); <restarting|powering off> anyway`) before the usual announcement, the sync run once (a ktest over a failing sync, not a failing disk)"
 milestone = "M7"
 tests = [
     "scenario:test_fs::test_ext4_unsynced_writes_survive_reboot",

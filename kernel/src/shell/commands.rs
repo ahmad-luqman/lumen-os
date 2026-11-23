@@ -873,31 +873,58 @@ fn refuse_in_pipeline(ctx: &mut Ctx<'_>, name: &str) -> bool {
     ctx.piped()
 }
 
-/// Before `name` (`reboot` or `shutdown`) takes the machine down: every
-/// filesystem flushed (`vfs::sync_all`, #352), while this thread can still
-/// sleep (`power::reboot` turns interrupts off for good). A failure is one
-/// line, and `name` goes on (`going`: what it does then): the filesystems
-/// wrote all they could past it, and a reboot or power-off that refused
-/// would leave the machine up with no way to fix the disk.
-fn sync_before(ctx: &mut Ctx<'_>, name: &str, going: &str) {
-    report_sync(ctx, name, going, crate::vfs::sync_all());
+/// How `reboot` or `shutdown` takes the machine down: its command name and
+/// what it says it is doing (`reboot: restarting`, `shutdown: powering
+/// off`), kept together so the two can't be paired wrongly.
+#[derive(Clone, Copy)]
+enum Going {
+    Restart,
+    PowerOff,
 }
 
-/// `sync_before`'s line for `synced`: none for `Ok`.
-fn report_sync(ctx: &mut Ctx<'_>, name: &str, going: &str, synced: Result<(), lumen_vfs::VfsError>) {
-    if let Err(e) = synced {
-        ctx.fail(format_args!(
-            "{name}: sync failed: {e:?} (each failing inode or filesystem is in the log); {going} anyway"
-        ));
+impl Going {
+    fn command(self) -> &'static str {
+        match self {
+            Going::Restart => "reboot",
+            Going::PowerOff => "shutdown",
+        }
     }
+
+    fn doing(self) -> &'static str {
+        match self {
+            Going::Restart => "restarting",
+            Going::PowerOff => "powering off",
+        }
+    }
+}
+
+/// Before `going` takes the machine down: every filesystem flushed by
+/// `sync` (`vfs::sync_all`, #352), while this thread can still sleep
+/// (`power::reboot` turns interrupts off for good), then the announcement.
+///
+/// A failed sync is a warning on serial (whichever console ran the command:
+/// a window's or a virtual terminal's output may never show before the
+/// machine goes) and a line on the console, and the command goes on anyway.
+/// What was written before the failure is on the disk; what wasn't (the
+/// block cache's write-back stops at its first failed block) stays lost
+/// either way, since nothing in the kernel can repair the disk, and
+/// refusing would only keep the machine up with it in memory. Whoever
+/// wants to know first runs `sync`, which says the same failure without
+/// going anywhere.
+fn sync_then_announce(ctx: &mut Ctx<'_>, going: Going, sync: impl FnOnce() -> Result<(), lumen_vfs::VfsError>) {
+    let (command, doing) = (going.command(), going.doing());
+    if let Err(e) = sync() {
+        log::warn!(target: "power", "{command}: sync failed: {e:?}; {doing} anyway");
+        ctx.fail(format_args!("{command}: sync failed: {e:?} (the log says what failed); {doing} anyway"));
+    }
+    let _ = writeln!(ctx.out, "{command}: {doing}");
 }
 
 fn reboot(ctx: &mut Ctx<'_>, _: &[String]) {
     if refuse_in_pipeline(ctx, "reboot") {
         return;
     }
-    sync_before(ctx, "reboot", "restarting");
-    let _ = writeln!(ctx.out, "reboot: restarting");
+    sync_then_announce(ctx, Going::Restart, crate::vfs::sync_all);
     crate::power::reboot()
 }
 
@@ -910,8 +937,7 @@ fn shutdown(ctx: &mut Ctx<'_>, _: &[String]) {
     }
     let why = match crate::power::power_off_plan() {
         Ok(plan) => {
-            sync_before(ctx, "shutdown", "powering off");
-            let _ = writeln!(ctx.out, "shutdown: powering off");
+            sync_then_announce(ctx, Going::PowerOff, crate::vfs::sync_all);
             crate::power::power_off(plan)
         }
         Err(why) => why,
@@ -928,23 +954,36 @@ fn exit(ctx: &mut Ctx<'_>, _: &[String]) {
 
 crate::ktest!(
     fn power_sync_failure_is_one_line() {
-        // `reboot` and `shutdown` say a failed sync in one line and go on
-        // (#352); a sync that worked adds nothing to what they print.
+        // `reboot` and `shutdown` sync once, then announce themselves; a
+        // failed sync adds one line before the announcement (and a warning
+        // on serial, which test_ktest counts) and they go on (#352).
         use crate::kassert_eq;
         let history = lumen_shell::History::new(0);
-        let mut console = super::Captured::default();
-        report_sync(&mut Ctx::new(&mut console, false, &history), "reboot", "restarting", Ok(()));
-        kassert_eq!(console.text.as_str(), "");
-        report_sync(
-            &mut Ctx::new(&mut console, false, &history),
-            "shutdown",
-            "powering off",
-            Err(lumen_vfs::VfsError::Io),
-        );
-        kassert_eq!(
-            console.text.as_str(),
-            "shutdown: sync failed: Io (each failing inode or filesystem is in the log); powering off anyway\n"
-        );
+        let expected = [
+            (Going::Restart, false, "reboot: restarting\n"),
+            (Going::PowerOff, false, "shutdown: powering off\n"),
+            (
+                Going::Restart,
+                true,
+                "reboot: sync failed: Io (the log says what failed); restarting anyway\nreboot: restarting\n",
+            ),
+            (
+                Going::PowerOff,
+                true,
+                "shutdown: sync failed: Io (the log says what failed); powering off anyway\nshutdown: powering off\n",
+            ),
+        ];
+        for (going, fails, text) in expected {
+            let mut console = super::Captured::default();
+            let mut syncs = 0;
+            let sync = || {
+                syncs += 1;
+                if fails { Err(lumen_vfs::VfsError::Io) } else { Ok(()) }
+            };
+            sync_then_announce(&mut Ctx::new(&mut console, false, &history), going, sync);
+            kassert_eq!(syncs, 1);
+            kassert_eq!(console.text.as_str(), text);
+        }
         Ok(())
     }
 );
