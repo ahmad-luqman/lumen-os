@@ -76,7 +76,7 @@ impl UserFlock {
 /// per call: a `F_SETLKW` keeps the range it was given while it waits.
 fn lock_context(file: &FileRef, spec: &FlockSpec) -> Result<LockContext, u32> {
     let cur_offset = *file.offset.lock();
-    let file_size = if spec.l_whence == fcntl_const::SEEK_END { file.inode.stat().map_err(vfs)?.size } else { 0 };
+    let file_size = if spec.l_whence == fcntl_const::SEEK_END { file.inode().stat().map_err(vfs)?.size } else { 0 };
     Ok(LockContext { cur_offset, file_size, readable: file.is_readable(), writable: file.is_writable() })
 }
 
@@ -88,7 +88,7 @@ fn lock_context(file: &FileRef, spec: &FlockSpec) -> Result<LockContext, u32> {
 /// is a bug in it too: logged, and `EIO`.
 fn with_locks<T>(file: &FileRef, mut f: impl FnMut(&mut AdvisoryLocks) -> Result<T, VfsError>) -> Result<T, u32> {
     let mut out = None;
-    let called = file.inode.with_locks_mut(&mut |locks| out = Some(f(locks)));
+    let called = file.inode().with_locks_mut(&mut |locks| out = Some(f(locks)));
     match (out, called) {
         (Some(out), Ok(())) => out.map_err(vfs),
         (Some(out), Err(e)) => {
@@ -499,7 +499,7 @@ fn ktest_getlk(
 fn ktest_contents(fd: Fd) -> Result<alloc::vec::Vec<u8>, &'static str> {
     let file = fd.file().map_err(|_| "the fd isn't open")?;
     let mut buf = alloc::vec![0u8; 64];
-    let n = file.inode.read_at(0, &mut buf).map_err(|_| "read the file")?;
+    let n = file.inode().read_at(0, &mut buf).map_err(|_| "read the file")?;
     buf.truncate(n);
     Ok(buf)
 }

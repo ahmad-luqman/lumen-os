@@ -242,7 +242,7 @@ mod tests {
                 create(FILE, 0o640)?;
                 {
                     let file = process::open_kernel_file(FILE, OpenFlags::O_WRONLY, 0).map_err(|_| "open")?;
-                    file.inode.write_at(0, b"twelve bytes").map_err(|_| "write")?;
+                    file.inode().write_at(0, b"twelve bytes").map_err(|_| "write")?;
                 }
                 symlink_at(tables, b"f", None, LINK).map_err(|_| "symlink")?;
                 symlink_at(tables, DIR, None, DIR_LINK).map_err(|_| "symlink")?;
@@ -370,7 +370,7 @@ mod tests {
                 create(FILE, 0o604)?;
                 {
                     let file = process::open_kernel_file(FILE, OpenFlags::O_WRONLY, 0).map_err(|_| "open")?;
-                    file.inode.write_at(0, &[7u8; 5000]).map_err(|_| "write")?;
+                    file.inode().write_at(0, &[7u8; 5000]).map_err(|_| "write")?;
                 }
                 symlink_at(tables, b"f", None, LINK).map_err(|_| "symlink")?;
                 let file = ktest_user_path(0, FILE)?;
