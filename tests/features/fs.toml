@@ -316,3 +316,10 @@ milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
 ]
+
+[[feature]]
+name = "ext4plus 0.1.0-rc.2's range-free retry pinned (#331): a write failing inside freeing a file's block range is retried block by block, so the unlink returns Ok though the failed write was reported, the file gone and its blocks free in the bitmap, and a failed descriptor or superblock write leaves that free count raised twice; an ext4plus bump that changes it fails the pin"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried",
+]

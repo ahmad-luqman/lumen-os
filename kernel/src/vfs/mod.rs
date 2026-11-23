@@ -1556,6 +1556,10 @@ struct MemBlkDevInner {
     data: SleepMutex<Vec<u8>>,
     read_only: bool,
     flushed: core::sync::atomic::AtomicBool,
+    /// Fail every `write_sectors` (`Io`, nothing written) while set: a
+    /// device error under a real `BlockCache`, where it surfaces only when
+    /// the cache writes a block back (#331).
+    fail_writes: core::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "ktest")]
@@ -1565,7 +1569,18 @@ impl MemBlkDev {
             data: SleepMutex::new(data),
             read_only,
             flushed: core::sync::atomic::AtomicBool::new(false),
+            fail_writes: core::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// Fail every write from now until `fail_writes(false)`.
+    fn fail_writes(&self, on: bool) {
+        self.0.fail_writes.store(on, core::sync::atomic::Ordering::Release);
+    }
+
+    /// The device's bytes as they are.
+    fn bytes(&self) -> Vec<u8> {
+        self.0.data.lock().clone()
     }
 }
 
@@ -1592,6 +1607,9 @@ impl lumen_bcache::BlockDevice for MemBlkDev {
     fn write_sectors(&self, lba: u64, src: &[u8]) -> Result<(), lumen_bcache::BlockError> {
         if self.0.read_only {
             return Err(lumen_bcache::BlockError::ReadOnly);
+        }
+        if self.0.fail_writes.load(core::sync::atomic::Ordering::Acquire) {
+            return Err(lumen_bcache::BlockError::Io);
         }
         let off = (lba * 512) as usize;
         let mut guard = self.0.data.lock();

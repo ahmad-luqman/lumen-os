@@ -4774,6 +4774,24 @@ pub(crate) mod ktest_util {
     /// set it, which disarms the others; any of them may land on the device
     /// and still fail, `failed_writes_land`), every read or write, syncs, or
     /// reads of a range (after some of them passed).
+    ///
+    /// A failed write fails `ext4plus`'s own `write` call at once, before the
+    /// block cache, and it is always reported (`Err(Io)`), never retried
+    /// here (#331). Two things make it unlike a real device's error:
+    /// - Under the real [`BlockCache`] a `write_at` only dirties a cached
+    ///   block; the device's error comes later, from `sync` or from the
+    ///   eviction that writes the block back (to whichever `read_at` or
+    ///   `write_at` missed and needed its slot). A `write_at` fails at once
+    ///   only on a miss: a failed eviction of another block, a failed
+    ///   pre-read, or every slot pinned. Here any write fails by its number,
+    ///   a cache hit as well, so the faults reach steps the real path can
+    ///   fail only under cache pressure.
+    /// - What the operation reports is `ext4plus`'s doing: it frees a file's
+    ///   block range again block by block when the range free fails
+    ///   (`file_blocks/utils.rs`, `free_freed_ranges`), so a failed write
+    ///   inside that range free leaves the unlink `Ok`, and its counts,
+    ///   raised in memory before each write, then count those blocks twice
+    ///   (`ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`).
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         pub(in crate::vfs) dev: MemBlkDev,
@@ -5046,7 +5064,7 @@ pub(crate) mod ktest_util {
     impl FaultCache {
         /// The device's bytes as they are, under the block cache.
         pub fn dev_bytes(&self) -> Vec<u8> {
-            self.dev.0.data.lock().clone()
+            self.dev.bytes()
         }
     }
 
@@ -6124,6 +6142,127 @@ crate::ktest!(
         kassert_eq!(a4.reclaim_clean_pages(16), 0); // still dirty
         kassert_eq!(b4.reclaim_clean_pages(16), 1); // written anyway
         kassert!(m.cache.dev.0.flushed.load(O::Acquire)); // and the device flushed
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next() {
+        // The real write path, no `FaultCache` (#331): a `BlockCache` over a
+        // device whose writes fail. The block cache writes back, so an
+        // `unlink`'s writes land in it and the unlink returns `Ok`; the
+        // device's error comes back from the next file `fsync` and the
+        // filesystem's `sync`, nothing reaches the device, the blocks stay
+        // dirty, and once the device works a sync writes them all: a fresh
+        // mount of the device sees the unlink and the fsynced file's data.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let dev = crate::vfs::MemBlkDev::new(crate::vfs::build_minimal_ext4_image_blocks(256), false);
+        let bcache = Arc::new(SleepMutex::new(BlockCache::new(dev.clone(), 64).map_err(|_| "bcache")?));
+        let backend: SharedBlockCache = Arc::clone(&bcache) as SharedBlockCache;
+        let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, 272), false).map_err(|_| "mount")?;
+        let root = fs.root_inode();
+        let f = root.create(b"f", 0o644).map_err(|_| "create f")?;
+        kassert_eq!(f.write_at(0, &pattern(2 * PAGE_SIZE, 3)).map_err(|_| "write f")?, 2 * PAGE_SIZE);
+        let g = root.create(b"g", 0o644).map_err(|_| "create g")?;
+        kassert_eq!(g.write_at(0, &pattern(PAGE_SIZE, 4)).map_err(|_| "write g")?, PAGE_SIZE);
+        fs.sync().map_err(|_| "first sync")?;
+        drop(f);
+        let on_disk = dev.bytes();
+
+        dev.fail_writes(true);
+        root.unlink(b"f").map_err(|_| "unlink f")?; // in the block cache only
+        let data = pattern(PAGE_SIZE, 5);
+        kassert_eq!(g.write_at(0, &data).map_err(|_| "rewrite g")?, PAGE_SIZE);
+        kassert_eq!(g.sync(false), Err(VfsError::Io));
+        kassert_eq!(fs.sync(), Err(VfsError::Io));
+        kassert!(bcache.lock().stats().dirty > 0);
+        kassert!(dev.bytes() == on_disk);
+
+        dev.fail_writes(false);
+        fs.sync().map_err(|_| "sync once the device works")?;
+        kassert_eq!(bcache.lock().stats().dirty, 0);
+        let ro = mount_ro_image(dev.bytes(), 273)?;
+        kassert!(matches!(ro.root_inode().lookup(b"f"), Err(VfsError::NoEnt)));
+        kassert_eq!(read_all(&ro.root_inode().lookup(b"g").map_err(|_| "ro lookup g")?)?, data);
+        kassert_eq!(free_blocks(&ro), free_blocks(&fs));
+        kassert_eq!(free_inodes(&ro), free_inodes(&fs));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried() {
+        // #331: `ext4plus` 0.1.0-rc.2 frees a file's extent with `free_blocks`
+        // and, if that fails, frees the same blocks again one at a time
+        // (`file_blocks/utils.rs`, `free_freed_ranges`), so a failed write
+        // inside the range free is absorbed: the unlink returns `Ok`. The
+        // counts are raised in memory before they are written and never put
+        // back, so a retry after a failed descriptor or superblock write
+        // counts the blocks twice: on disk the group's (or the superblock's)
+        // free count rises by 4 for `f`'s 2 blocks. The `FaultCache` reports
+        // each failed write, so it is `ext4plus` absorbing it, and an
+        // operation's result can't tell a write error happened (#349 must
+        // watch the block cache instead). `f` is 2 blocks of one extent
+        // (4 KiB blocks, one group); each write of the unlink fails in turn.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let setup = {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 274)?;
+            let f = m.root.create(b"f", 0o644).map_err(|_| "create f")?;
+            kassert_eq!(f.write_at(0, &pattern(2 * PAGE_SIZE, 6)).map_err(|_| "write f")?, 2 * PAGE_SIZE);
+            m.fs.sync().map_err(|_| "sync")?;
+            drop(f);
+            image(&m)?
+        };
+        /// The block bitmap's set bits, the superblock's free-block count
+        /// and group 0's, as stored (4 KiB blocks: the superblock at 1024,
+        /// the 64-byte descriptors in block 1).
+        fn counts(img: &[u8], bitmap: u64) -> (u32, u64, u64) {
+            let le = |at: usize, n: usize| img[at..at + n].iter().rev().fold(0u64, |v, &b| (v << 8) | u64::from(b));
+            let bitmap = usize::try_from(bitmap).unwrap_or(usize::MAX);
+            let bits = img.get(bitmap..bitmap + PAGE_SIZE).map_or(0, |b| b.iter().map(|b| b.count_ones()).sum());
+            let sb = le(1024 + 0x0c, 4) | (le(1024 + 0x158, 4) << 32);
+            let bg = le(PAGE_SIZE + 0x0c, 2) | (le(PAGE_SIZE + 0x2c, 2) << 16);
+            (bits, sb, bg)
+        }
+        let (total, bitmap) = {
+            let m = mount(setup.clone(), 274)?;
+            m.cache.arm_write(0);
+            m.root.unlink(b"f").map_err(|_| "unlink without a fault")?;
+            (m.cache.writes.load(O::Acquire), block_bitmap_offset(&m.fs)?)
+        };
+        let (bits0, sb0, bg0) = counts(&setup, bitmap);
+        let (mut absorbed, mut sb_twice, mut bg_twice) = (0usize, 0usize, 0usize);
+        for k in 1..=total {
+            let m = mount(setup.clone(), 274)?;
+            m.cache.arm_write(k);
+            let res = m.root.unlink(b"f");
+            let failed = m.cache.writes.load(O::Acquire) >= k;
+            m.cache.clear();
+            if res.is_err() || !failed {
+                continue;
+            }
+            // Write k failed and the unlink still returned Ok: `f` is gone,
+            // its 2 blocks free in the bitmap, and neither count is below
+            // what was freed.
+            absorbed += 1;
+            let img = image(&m)?;
+            let (bits, sb, bg) = counts(&img, bitmap);
+            kassert_eq!(bits0 - bits, 2);
+            kassert!(sb >= sb0 + 2 && bg >= bg0 + 2);
+            sb_twice += usize::from(sb == sb0 + 4);
+            bg_twice += usize::from(bg == bg0 + 4);
+            let ro = mount_ro_image(img, 275)?;
+            kassert!(matches!(ro.root_inode().lookup(b"f"), Err(VfsError::NoEnt)));
+        }
+        crate::ktest::diag(format_args!(
+            "{total} writes: {absorbed} failed writes absorbed, the superblock's count raised twice in {sb_twice}, \
+             the group's in {bg_twice}"
+        ));
+        kassert!(absorbed >= 1);
+        kassert!(sb_twice >= 1 && bg_twice >= 1);
         Ok(())
     }
 );

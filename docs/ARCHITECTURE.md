@@ -5142,6 +5142,17 @@ blocks, extent trees, and file data writeback):
   dirty (e.g., after prior LRU dirty evictions or a retried failed flush). On
   any write or flush error, `needs_device_flush` stays `true` and the error
   propagates.
+- **Where a device write error surfaces (#331):** `write_at` only copies
+  into a cached block and marks it dirty, so its `Ok` means "cached", not
+  "on the device". The device's error comes back later, from whichever call
+  writes the block back: `sync` or `flush_blocks`, or the `read_at`,
+  `write_at` or pin whose miss needed the block's slot (a read can thus fail
+  with another block's write error). A `write_at` fails at once only on a
+  miss (that eviction failing, a failed pre-read of a partial block, or
+  every slot pinned), its bytes then cached nowhere. No failed device write
+  is ever reported as success or dropped: the block stays dirty and cached
+  and the next writeback tries it again
+  (`every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty`).
 - **Host tests (`cargo:lumen-bcache`):** verified against an in-memory
   `MemBlockDevice` with LRU eviction order, dirty writeback, RAII pin refusal
   (`CacheFull`), read-only rejection, partial tail block clamps, crash-before-
@@ -5686,6 +5697,45 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     the inode logs that it may be left half-freed. `create`, `mkdir` and `symlink`
     release the inode they allocated when linking it fails (e.g. `ENOSPC`
     growing the directory).
+  - **Write errors an operation doesn't see (#331):** an operation's result
+    doesn't say whether every write it made reached the device:
+    - Every write goes into the block cache, which writes back (above): an
+      operation whose blocks are only cached returns `Ok`, and the device's
+      error comes from the next `FileSystem::sync` or a file's
+      `fsync`/`fdatasync`/`msync` (`EIO`, the blocks kept dirty for the next
+      sync; `ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next`),
+      or from the eviction that writes a block back, to whichever read or
+      write missed then (a lookup or a page read can get another block's
+      write error).
+    - `sync(2)` returns 0 whatever `vfs::sync_all` returns (Linux's
+      behaviour), and global reclaim's page writeback has no caller: each
+      failure is logged, its page kept dirty.
+    - `ext4plus` 0.1.0-rc.2 frees a file's block range again block by block
+      when the range free fails (`file_blocks/utils.rs`,
+      `free_freed_ranges`), so a write that fails inside it can leave the
+      unlink, rmdir or truncate `Ok`. `free_blocks` and `free_block`
+      (`lib.rs`) raise the group's and the superblock's free counts in
+      memory before writing them and never put them back, so after a failed
+      descriptor or superblock write the retry counts the blocks twice and
+      writes the too-high count (`e2fsck` fixes it). Under the real block
+      cache that write can fail only on a miss, so only under cache
+      pressure; the `FaultCache` fails it by number
+      (`ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`).
+      Its allocators (`alloc_block`, `alloc_contiguous_blocks`, `alloc_inode`)
+      loop forever on a group whose count promises more than its bitmap has,
+      so such a count must never be allocated from.
+    - After a first error, the adapter's undo writes (above) report nothing
+      further: a failed one is pinned in memory or logged, and the operation
+      returns the first error.
+    - A rename over an existing target, once the move landed, returns `Ok`
+      whatever retiring the target does: its lowered `links_count` (pinned in
+      memory if the write fails), freeing it when that was its last link
+      (logged), and a directory target's parent's count (pinned).
+
+    So a write error can't be told from operations' results; it can be from
+    the block cache's calls (`BcacheIo::write`, the adapter's raw
+    `write_at`s, `sync`), except an eviction's, which reaches a read as an
+    ordinary `Io`.
   - **Rename over an existing target:** the target is held, not removed,
     until the source has landed at its name. Its entry is taken out with
     its `links_count` unchanged (`Dir::unlink` is handed one more than the
