@@ -357,7 +357,7 @@ one is its own PR that updates that doc first.
   playing `lumen-synth` sources paced by the device), `beep`, `play`,
   `volume` and `sound`.
   `vfs/` (M7, #253; ARCHITECTURE section 9): `vfs/mod.rs` the kernel's VFS
-  tables (`KernelVfsTables`: mounts, dentries, inodes, lock 9), `init` (the
+  tables (`KernelVfsTables`: lumen-vfs's `VfsTables` on `SleepMutex`), `init` (the
   first ext4 virtio-blk volume at `/`, else a tmpfs root; `/tmp`, `/dev`,
   `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
   and the `mount`, `sync` and `vfstest` commands (`vfstest`: file
@@ -549,7 +549,8 @@ one is its own PR that updates that doc first.
 - `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
   `FileSystem`/`VfsInode` traits (names as bytes, #268; `Escaped`, a name's
   bytes as text, never lossily), the path and symlink resolver, the mount
-  table and the Lock-9 inode and dentry caches, `OpenFile` and the `FdTable`
+  table and the Lock-9 inode and dentry caches (`VfsTables`, generic over a
+  `LockFamily`: the kernel's and the host tests'), `OpenFile` and the `FdTable`
   (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
   call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,
