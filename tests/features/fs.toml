@@ -32,6 +32,15 @@ tests = [
 ]
 
 [[feature]]
+name = "Page-cache I/O errors past the first page (#321): a read whose second page's disk read fails returns the first page's bytes (a short count, as Linux's filemap_read) and the next read at the failing page returns EIO; a write whose partial-page fill read fails past its first page returns short and logs the failed read (the inode's read-error streak set); a write past the end refused outright leaves a clean tail page clean (its past-the-end bytes still zeroed), while a short or whole write marks it dirty"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::page_cache::page_cache_a_read_failing_past_its_first_page_returns_the_bytes_before_it",
+    "ktest:lumen_kernel::vfs::ext4::ext4_a_write_whose_fill_fails_past_its_first_page_logs_the_read",
+    "ktest:lumen_kernel::vfs::page_cache::page_cache_a_refused_write_past_the_end_leaves_its_tail_page_clean",
+]
+
+[[feature]]
 name = "Writable ext4 rootfs VFS adapter over BlockCache with Gate 6 open-unlinked detach, symlinks, rmdir/rename, write-error undo, and reboot persistence"
 milestone = "M7"
 tests = [

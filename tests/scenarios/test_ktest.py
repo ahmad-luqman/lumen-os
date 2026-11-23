@@ -242,9 +242,14 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 4,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
     # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
-    # fills, a good one, a third failed fill), one warning each; and
-    # linux::syscall::io's io_pread_pwrite_report_filesystem_errors: one.
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 3,
+    # fills, a good one, a third failed fill), one warning each;
+    # linux::syscall::io's io_pread_pwrite_report_filesystem_errors: one;
+    # and #321's two: page_cache's
+    # page_cache_a_read_failing_past_its_first_page_returns_the_bytes_before_it
+    # (a short read, then the failing page's EIO: one streak) and
+    # ext4_a_write_whose_fill_fails_past_its_first_page_logs_the_read (a
+    # write's partial-page fill, now logged as a read's is).
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 5,
     # mm::user_vm::file_vm_disk_read_error_is_a_bus_error: a fault's fill.
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 2 \(offset 8192\) failed: Io": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,

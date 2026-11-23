@@ -5217,8 +5217,9 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   through the same four `PageCache` methods, under the inode's Lock 4 and
   Lock 5: `read_into(offset, buf, file_size, miss)` (a page not cached is
   `miss`'s: a page read from disk, inserted after the copy, or `None`, a
-  hole read as zeros without a frame; an error after some bytes were copied
-  is returned, not a short count, as before), `write_from(offset, buf,
+  hole read as zeros without a frame; an error past the first page is a
+  short count, the bytes before it, as Linux's `filemap_read` gives, #321),
+  `write_from(offset, buf,
   old_size, fill)` (a page not cached is `fill`'s, a zero page or one
   holding the disk's bytes a partial write keeps; a write starting past
   `old_size` first zeroes the old tail, the rule below; an error past the
@@ -5254,7 +5255,12 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
     `PageCache`, zeroes `[old_size % 4096 .. 4096)` (marking it dirty as
     above) before exposing the new size so stale past-EOF `MAP_SHARED`
-    stores never leak into extended regions. Writeback writes a page's
+    stores never leak into extended regions. A write marks that page dirty
+    only once it has written something: one refused outright leaves the
+    size as it was and a clean tail page clean (its zeros stay, past the
+    end), so a
+    failing disk's writeback never fails for it and `fsync` reports no
+    `EIO` for a write the caller saw fail (#321). Writeback writes a page's
     bytes below the size alone (`valid_len`), so such a store never
     reaches the disk either.
 - **Pages for `mmap` (built in #255's first part):** the file-backed VM
@@ -5269,9 +5275,10 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   Holding the `Arc` pins the page (reclaim evicts only `strong_count == 1`).
   - *Filling:* both filesystems go through `PageCache::map_page`, which
     asks the fill for a missing page. A missing `ext4` page is read from
-    disk by the same private fill as `read_at` (`Ext4Inode::load_page`,
-    which logs a failed read naming the device, inode and page, once per
-    streak of the same error).
+    disk by the same private fill as `read_at` and a write's partial
+    pages (`Ext4Inode::load_page`, which logs a failed read naming the
+    device, inode and page, once per streak of the same error: past a read's
+    or write's first page the error becomes a short count, #321).
     A hole in a `tmpfs` file (or a detached `ext4` one) gets a zero page
     (`CachePage::new_zeroed`, as `write_at`'s new pages).
     Unlike `read_at`, which reads a hole as zeros without a frame, a mapped

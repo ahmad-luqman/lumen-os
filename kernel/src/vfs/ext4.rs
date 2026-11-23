@@ -1140,13 +1140,15 @@ impl Ext4Inode {
         // A new page a write covers only part of starts as the disk's bytes
         // (below the old size) of a linked file, else as zeros. (A write
         // never dirties a detached file's page, and nothing writes one
-        // back: `PageCache::writes_back`.)
+        // back: `PageCache::writes_back`.) A failed disk read is logged by
+        // `load_page`: past the first page the write returns short, and the
+        // error goes nowhere else (#321).
         let done = pages.write_from(offset, buf, old_size, |span| {
-            let cp = CachePage::new_zeroed()?;
             if !detached && !span.whole_page() && span.page_start() < old_size {
-                cp.write_bytes(0, &self.read_disk_page(span.index(), old_size)?);
+                self.load_page(span.index(), old_size)
+            } else {
+                CachePage::new_zeroed()
             }
-            Ok(cp)
         })?;
 
         let written_end = offset + done as u64;
@@ -1249,13 +1251,12 @@ impl Ext4Inode {
     }
 
     /// A new page, not yet in the cache, holding page `page_idx` as on disk
-    /// and zero past `file_size`: the fill of a missing page for `read_at`
-    /// and `mmap_page`. (`write_at`'s partial-page fill calls
-    /// [`Self::read_disk_page`] itself and hands a failure to the writer,
-    /// unlogged.) Same locks as `read_disk_page`. A failed read is logged
-    /// naming the device, inode and page ([`Self::note_read_error`]): a
-    /// mapping's fault turns it into `SIGBUS`, which says nothing of the
-    /// disk.
+    /// and zero past `file_size`: the fill of a missing page for `read_at`,
+    /// `mmap_page` and `write_at`'s partial pages. Same locks as
+    /// `read_disk_page`. A failed read is logged naming the device, inode
+    /// and page ([`Self::note_read_error`]): a mapping's fault turns it into
+    /// `SIGBUS`, and a read or write past its first page into a short count,
+    /// neither of which says anything of the disk (#321).
     fn load_page(&self, page_idx: u64, file_size: u64) -> Result<CachePage, VfsError> {
         let tmp = match self.read_disk_page(page_idx, file_size) {
             Ok(tmp) => {
@@ -6470,6 +6471,38 @@ crate::ktest!(
         let third = mmap_page(&f, 1).err(); // a new streak: warns again
         m.cache.clear();
         kassert_eq!(third, Some(VfsError::Io));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_write_whose_fill_fails_past_its_first_page_logs_the_read() {
+        // A write over part of a page below the old size fills that page
+        // from the disk first. When that read fails on a page after the
+        // first, the write returns short (the pages before it) and the error
+        // reaches no caller, so the failed read is logged as a read's is
+        // (`note_read_error`: the streak's errno set, one warning naming
+        // page 1, pinned by test_ktest.py), and nothing is cached for it
+        // (#321).
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 199)?;
+        let data = pattern(2 * PAGE_SIZE, 17);
+        let f = m.root.create(b"fill.bin", 0o644).map_err(|_| "create")?;
+        kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
+        f.sync(false).map_err(|_| "sync")?;
+        let e = ext4_inode(&f)?;
+        e.pages.lock().remove_from(0); // filled from the disk next
+        kassert_eq!(e.read_errno.load(O::Acquire), 0);
+        m.cache.fail_reads.store(true, O::Release);
+        // Page 0 whole (no fill), then page 1's first 10 bytes (a fill).
+        let wrote = f.write_at(0, &pattern(PAGE_SIZE + 10, 3));
+        m.cache.clear();
+        kassert_eq!(wrote, Ok(PAGE_SIZE));
+        kassert_eq!(e.read_errno.load(O::Acquire), VfsError::Io.to_errno());
+        kassert!(e.pages.lock().get(1).is_none());
+        kassert_eq!(f.stat().map_err(|_| "stat")?.size, data.len() as u64);
         Ok(())
     }
 );

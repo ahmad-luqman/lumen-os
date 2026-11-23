@@ -893,12 +893,13 @@ impl PageCache {
     /// A page not cached is asked of `miss`, by index: `Some(page)`, a new
     /// page holding the file's bytes there, is read and then inserted (its
     /// insert's error returned); `None` reads as zeros without a page (a
-    /// hole). An error from `miss` (or the insert) is returned even after
-    /// some bytes were copied, and those bytes are lost to the caller: where
-    /// Linux returns a short count, as [`Self::write_from`] does. (The
-    /// pages loaded before the error stay cached.) The caller holds the
-    /// inode's Lock 4, under which it read `file_size`, and this lock
-    /// (Lock 5).
+    /// hole). An error from `miss` (or the insert) is returned only when it
+    /// is the first page's; after one, the bytes copied before it are
+    /// returned, a short count, as Linux's `filemap_read` does and as
+    /// [`Self::write_from`] does (#321): the caller's next read starts at
+    /// the failing page and gets its error. (The pages loaded before the
+    /// error stay cached.) The caller holds the inode's Lock 4, under which
+    /// it read `file_size`, and this lock (Lock 5).
     pub fn read_into(
         &mut self,
         offset: u64,
@@ -912,18 +913,35 @@ impl PageCache {
         let to_read = buf.len().min(usize::try_from(file_size - offset).unwrap_or(usize::MAX));
         // Never `None`: the range ends at or below `file_size`.
         let spans = page::spans(offset, to_read).ok_or(VfsError::Inval)?;
+        let mut done = 0usize;
         for span in spans {
-            let dst = &mut buf[span.buf()];
-            if let Some(cached) = self.pages.get(&span.index()) {
-                cached.read_bytes(span.in_page(), dst);
-            } else if let Some(loaded) = miss(span.index())? {
-                loaded.read_bytes(span.in_page(), dst);
-                self.insert_new(span.index(), Arc::new(loaded))?;
-            } else {
-                dst.fill(0);
+            if let Err(err) = self.read_span(&span, &mut buf[span.buf()], &mut miss) {
+                if done > 0 {
+                    break;
+                }
+                return Err(err);
             }
+            done = span.buf().end;
         }
-        Ok(to_read)
+        Ok(done)
+    }
+
+    /// One page's part of [`Self::read_into`].
+    fn read_span(
+        &mut self,
+        span: &PageSpan,
+        dst: &mut [u8],
+        miss: &mut impl FnMut(u64) -> Result<Option<CachePage>, VfsError>,
+    ) -> Result<(), VfsError> {
+        if let Some(cached) = self.pages.get(&span.index()) {
+            cached.read_bytes(span.in_page(), dst);
+        } else if let Some(loaded) = miss(span.index())? {
+            loaded.read_bytes(span.in_page(), dst);
+            self.insert_new(span.index(), Arc::new(loaded))?;
+        } else {
+            dst.fill(0);
+        }
+        Ok(())
     }
 
     /// Write `buf` at file offset `offset` of a file of `old_size` bytes,
@@ -932,11 +950,14 @@ impl PageCache {
     /// partial write keeps), which is then inserted ([`Self::insert_new`]).
     /// A write starting past the end first zeroes the old last page's bytes
     /// past `old_size`, as a growth to `offset` would ([`Self::resize`]),
-    /// and they stay zeroed, that page dirty if written back, even if the
-    /// write then fails. The bytes lie past the end, so the file reads the
-    /// same; but while writeback is failing, that page stays dirty, and a
-    /// later `fsync` reports `EIO` for a write the caller saw fail (#321).
-    /// A linked `ext4` file's pages ([`Self::writes_back`]) are marked
+    /// and they stay zeroed even if the write then fails (they lie past the
+    /// end, so the file reads the same). That page is marked dirty, if
+    /// written back, only once the write has written something, so its
+    /// zeros lie below the new size: a write refused outright (an `Err`)
+    /// leaves a clean tail page clean, so a later `fsync` never reports a
+    /// writeback error for it, a write the caller saw fail (#321). (Its
+    /// first page is then another, uncached one: a write's first span on
+    /// the cached tail page can't fail.) A linked `ext4` file's pages ([`Self::writes_back`]) are marked
     /// dirty, and a new one is refused at the hard limit
     /// ([`Self::admit_unreclaimable`]) before `fill` runs. That is an early
     /// answer: `fill` may sleep (a disk read) or be preempted, and another
@@ -957,7 +978,7 @@ impl PageCache {
         let spans = page::spans(offset, buf.len()).ok_or(VfsError::FBig)?;
         // At or before the end (`offset <= old_size`) nothing is zeroed: the
         // write overwrites the bytes it extends the file over.
-        self.zero_tail(old_size, offset.max(old_size));
+        let tail = self.zero_tail_clean(old_size, offset.max(old_size));
         let mut done = 0usize;
         for span in spans {
             if let Err(err) = self.write_span(&span, &buf[span.buf()], &mut fill) {
@@ -967,6 +988,12 @@ impl PageCache {
                 return Err(err);
             }
             done = span.buf().end;
+        }
+        if let Some(tail) = tail
+            && done > 0
+            && self.writes_back()
+        {
+            tail.set_dirty();
         }
         Ok(done)
     }
@@ -1012,17 +1039,26 @@ impl PageCache {
         self.zero_tail(old_size, new_size);
     }
 
-    /// [`Self::resize`]'s zeroing, which a write past the end shares
-    /// ([`Self::write_from`]).
+    /// [`Self::resize`]'s zeroing: [`Self::zero_tail_clean`], then that
+    /// page marked dirty if written back.
     fn zero_tail(&self, old_size: u64, new_size: u64) {
-        if let Some(tail) = page::resize_tail(old_size, new_size)
-            && let Some(cached) = self.pages.get(&tail.index())
+        if let Some(cached) = self.zero_tail_clean(old_size, new_size)
+            && self.writes_back()
         {
-            cached.zero_range(tail.from(), PAGE_SIZE);
-            if self.writes_back() {
-                cached.set_dirty();
-            }
+            cached.set_dirty();
         }
+    }
+
+    /// Zero, in the cached page holding it, what [`page::resize_tail`] says
+    /// a change of the size from `old_size` to `new_size` zeroes, leaving
+    /// the page's dirty bit as it is; the page zeroed, if any. A write past
+    /// the end ([`Self::write_from`]) marks it dirty itself once it has
+    /// written something.
+    fn zero_tail_clean(&self, old_size: u64, new_size: u64) -> Option<Arc<CachePage>> {
+        let tail = page::resize_tail(old_size, new_size)?;
+        let cached = self.pages.get(&tail.index())?;
+        cached.zero_range(tail.from(), PAGE_SIZE);
+        Some(Arc::clone(cached))
     }
 
     /// Drop all cached pages with `page_index >= start_page`, updating
@@ -1416,6 +1452,67 @@ crate::ktest!(
         let page = pc.map_page(1, size, CachePage::new_zeroed).map_err(|_| "map below the limit")?;
         kassert!(Arc::ptr_eq(&page, pc.get(1).ok_or("page 1")?));
         kassert_eq!(pc.map_page(3, size, CachePage::new_zeroed).err(), Some(VfsError::Range));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_a_refused_write_past_the_end_leaves_its_tail_page_clean() {
+        // A write past the end zeroes the old last page's bytes past the end
+        // first, and marks that page dirty only once it has written
+        // something (its zeros then lie below the new size): a write refused
+        // outright leaves a clean tail page clean, so no writeback a failing
+        // disk fails again, and no `fsync` EIO, comes of a write the caller
+        // saw fail (#321). A short write and a whole one mark it dirty.
+        use crate::{kassert, kassert_eq};
+        let p = PAGE_SIZE as u64;
+        let size = 100; // page 0 is the tail
+        let mut pc = ext4_cache_with_page0()?;
+        let tail = Arc::clone(pc.get(0).ok_or("page 0")?);
+        tail.write_bytes(200, b"junk"); // past the end, as a mapping stores
+        let refused = pc.write_from(2 * p, b"ab", size, |_| Err(VfsError::Io));
+        kassert_eq!(refused, Err(VfsError::Io));
+        kassert!(!tail.is_dirty());
+        let mut stale = [1u8; 4];
+        tail.read_bytes(200, &mut stale);
+        kassert_eq!(stale, [0; 4]); // zeroed all the same
+        kassert_eq!(pc.len(), 1);
+        // Page 1's byte written, page 2's fill failing: a short count.
+        let short = pc.write_from(2 * p - 1, b"ab", size, |span| {
+            if span.index() == 1 { CachePage::new_zeroed() } else { Err(VfsError::Io) }
+        });
+        kassert_eq!(short, Ok(1));
+        kassert!(tail.is_dirty());
+        let mut whole = ext4_cache_with_page0()?;
+        kassert_eq!(whole.write_from(2 * p, b"ab", size, |_| CachePage::new_zeroed()), Ok(2));
+        kassert!(whole.get(0).ok_or("page 0")?.is_dirty());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_a_read_failing_past_its_first_page_returns_the_bytes_before_it() {
+        // A read whose second page's disk read fails returns the first
+        // page's bytes, a short count as Linux's `filemap_read` gives, not
+        // the error; the next read, at the failing page, gets it (#321).
+        // One warning in all (both failures in one streak), pinned by
+        // test_ktest.py.
+        use crate::{kassert, kassert_eq};
+        use ktest_files::{file, pattern, read, reclaim_ext4};
+        let vol = ktest_files::Ext4Volume::new(198)?;
+        let data = pattern(2 * PAGE_SIZE, 13);
+        let f = file(&vol.root, "short.bin", &data)?;
+        kassert_eq!(reclaim_ext4(&f)?, 0); // on disk alone
+        kassert!(read(&f, 0, PAGE_SIZE)? == data[..PAGE_SIZE]); // page 0 cached, page 1 not
+        let mut whole = alloc::vec![0u8; 2 * PAGE_SIZE];
+        let mut second = alloc::vec![0u8; PAGE_SIZE];
+        vol.fail_reads(true);
+        let (got_whole, got_second) = (f.read_at(0, &mut whole), f.read_at(PAGE_SIZE as u64, &mut second));
+        vol.fail_reads(false);
+        kassert_eq!(got_whole, Ok(PAGE_SIZE));
+        kassert!(whole[..PAGE_SIZE] == data[..PAGE_SIZE]);
+        kassert_eq!(got_second, Err(VfsError::Io));
+        kassert!(read(&f, 0, 2 * PAGE_SIZE)? == data); // the disk reads again
         Ok(())
     }
 );
