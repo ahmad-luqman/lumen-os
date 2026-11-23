@@ -422,7 +422,8 @@ one is its own PR that updates that doc first.
   `wait_for_lock_release`: `F_SETLKW` and blocking `flock`, #254);
   `Stdio`: fds 0/1/2 on `/dev/console` and `/` as
   cwd, opened before a run or it is refused; `Cwd`, `umask`;
-  `open_kernel_file`; the console bridge; `in_test_process` for ktests);
+  `open_kernel_file`; the console bridge; `in_test_process` for ktests;
+  `RegisteredProcess`: the test seams' process, taken down when it drops, #264);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern) and the
   shared copy helpers, a module per cluster holding its handlers (`fd`,
@@ -562,7 +563,8 @@ one is its own PR that updates that doc first.
   `FileSystem`/`VfsInode` traits (names as bytes, #268; `Escaped`, a name's
   bytes as text, never lossily), the path and symlink resolver, the mount
   table and the Lock-9 inode and dentry caches (`VfsTables`, generic over a
-  `LockFamily`: the kernel's and the host tests'), `OpenFile` and the `FdTable`
+  `LockFamily`: the kernel's and the host tests'), `OpenFile` (its inode,
+  `inode()`, read from its `OpenGuard`, #264) and the `FdTable`
   (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
   call saying what it `released`: `FlockOutcome`, `RecordLockOutcome`,

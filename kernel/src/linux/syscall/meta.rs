@@ -82,7 +82,7 @@ pub(super) fn sys_chmod(path: UserPtr, mode: Mode) -> u64 {
 
 /// `fchmod(fd, mode)` (91).
 pub(super) fn sys_fchmod(fd: Fd, mode: Mode) -> u64 {
-    finish(open_file(fd).and_then(|file| chmod(&*file.inode, mode)))
+    finish(open_file(fd).and_then(|file| chmod(&**file.inode(), mode)))
 }
 
 /// `fchmodat(dirfd, path, mode)` (268): following symlinks. Three arguments
@@ -124,7 +124,7 @@ pub(super) fn sys_chown(path: UserPtr, uid: u32, gid: u32) -> u64 {
 
 /// `fchown(fd, uid, gid)` (93).
 pub(super) fn sys_fchown(fd: Fd, uid: u32, gid: u32) -> u64 {
-    finish(open_file(fd).and_then(|file| chown(&*file.inode, uid, gid)))
+    finish(open_file(fd).and_then(|file| chown(&**file.inode(), uid, gid)))
 }
 
 /// `lchown(path, uid, gid)` (94): the symlink itself.
@@ -175,7 +175,7 @@ fn utimensat(dirfd: Dirfd, path: UserPtr, times: UserPtr, flags: AtFlags) -> Res
                 return Err(errno::EINVAL);
             }
             let file = open_file(fd)?;
-            (Arc::clone(&file.inode), Some(file))
+            (Arc::clone(file.inode()), Some(file))
         }
         _ => (lookup(dirfd, path, flags)?, None),
     };
@@ -232,10 +232,10 @@ fn ftruncate(fd: Fd, len: u64) -> Result<u64, u32> {
     let file = open_file(fd)?;
     // Not open for writing, or not a regular file (a directory too):
     // `-EINVAL`, as Linux's `do_sys_ftruncate`.
-    if !file.is_writable() || file.inode.inode_type() != InodeType::File {
+    if !file.is_writable() || file.inode().inode_type() != InodeType::File {
         return Err(errno::EINVAL);
     }
-    resize(&*file.inode, len)
+    resize(&**file.inode(), len)
 }
 
 /// `truncate(path, length)` (76): following symlinks. `-EINVAL` for a
@@ -746,7 +746,7 @@ mod tests {
                 )?;
                 kassert_eq!(sys_ftruncate(fd, i64::MAX as u64), neg_errno(errno::EFBIG));
                 kassert_eq!(sys_ftruncate(fd, 5000), 0);
-                kassert_eq!(fd.file().map(|f| f.inode.stat().map(|m| m.size)), Ok(Ok(5000)));
+                kassert_eq!(fd.file().map(|f| f.inode().stat().map(|m| m.size)), Ok(Ok(5000)));
                 kassert_eq!(sys_close(fd), 0);
                 let ro_root = vol.remount_ro(201)?;
                 let fd = ktest_install(

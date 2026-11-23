@@ -3624,8 +3624,8 @@ In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (matching
 **Built in #254b** (`kernel/src/linux/process.rs`, `syscall/fd.rs`,
 `syscall/dir.rs`): `ProcessState` holds `fds: FdTable<Arc<OpenFile<KernelVfsLock<u64>>>>`
 (private: a slot leaves it only through `close_current_fd`, a displacing
-`insert_current_fd`/`dup_current_fd` or `take_current`, which release its
-locks; `install_current_fd` and `insert_current_fd` take a fresh
+`insert_current_fd`/`dup_current_fd` or `take_of` (behind `take_current`
+and the test seams' `RegisteredProcess`), which release its locks; `install_current_fd` and `insert_current_fd` take a fresh
 `OpenFile` by value, and `dup_current_fd` (`dup2`/`dup3`) and
 `dup_current_fd_from` (`F_DUPFD*`), each with a close-on-exec flag, count
 the slot they share),
@@ -6029,7 +6029,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 - **Open file descriptions vs FD table:**
   - `FdEntry { file: Arc<OpenFile>, cloexec: bool }` in per-process `FdTable`
     (capacity `MAX_FDS = 1024`).
-  - `OpenFile { id: OpenFileId, inode: Arc<VfsInode>, path: Arc<[u8]>, flags: OpenFlags, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64> }`.
+  - `OpenFile { id: OpenFileId, path: Arc<[u8]>, access_mode: AccessMode, is_path: bool, status_flags: AtomicU32, fd_refs: AtomicU32, offset: L, dir_cursor: L, open_guard: OpenGuard }`,
+    `L` a `VfsLock<u64>` (the kernel's `KernelVfsLock<u64>`, a `SleepMutex`).
+    Its inode is `OpenFile::inode()`, read from its `OpenGuard` (#264): no
+    field of its own that could be pointed at an inode it doesn't keep open.
   - **Opening (#262):** `open_inode_guarded` returns an `Opened` (the
     `OpenGuard` it took before its last liveness check, Gate 6 above, the
     path, and the flags it checked) and `OpenFile::from_opened` takes that
@@ -6195,7 +6198,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `/proc/<pid>/fd` → directory of **magic symlinks** `0`, `1`, `2`, ...:
     `readlink` returns each open FD's path (appending ` (deleted)` if
     unlinked), while traversing `/proc/<pid>/fd/<n>` (e.g. `open`/`stat`)
-    resolves directly to `OpenFile::inode` rather than re-parsing the text
+    resolves directly to `OpenFile::inode()` rather than re-parsing the text
     target.
   - `/proc/<pid>/maps` → strict Linux format
     `{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}` (followed by the name

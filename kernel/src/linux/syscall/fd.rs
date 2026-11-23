@@ -78,15 +78,15 @@ pub(super) fn checked_len(n: usize, want: usize) -> Result<usize, VfsError> {
 /// the `read_at` where [`offset_lock_across_read`] allows; else from a
 /// snapshot of the offset, moved after only if nothing moved it meanwhile.
 fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError> {
-    if offset_lock_across_read(&*file.inode) {
+    if offset_lock_across_read(&**file.inode()) {
         let mut off = file.offset.lock();
         let pos = *off;
-        let end = pos.saturating_add(checked_len(file.inode.read_at(pos, kbuf)?, kbuf.len())? as u64);
+        let end = pos.saturating_add(checked_len(file.inode().read_at(pos, kbuf)?, kbuf.len())? as u64);
         *off = end;
         return Ok((pos, end));
     }
     let pos = *file.offset.lock();
-    let end = pos.saturating_add(checked_len(file.inode.read_at(pos, kbuf)?, kbuf.len())? as u64);
+    let end = pos.saturating_add(checked_len(file.inode().read_at(pos, kbuf)?, kbuf.len())? as u64);
     let mut off = file.offset.lock();
     if *off == pos {
         *off = end;
@@ -99,7 +99,7 @@ fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError
 /// short read. No lock is held across a chunk's copy out; a chunk the copy
 /// refuses is given back (the offset moves only by what reached the caller).
 pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
-    if file.inode.inode_type() == InodeType::Dir {
+    if file.inode().inode_type() == InodeType::Dir {
         return Err(errno::EISDIR);
     }
     let limit = count.min(MAX_SINGLE_IO as u64) as usize;
@@ -141,9 +141,9 @@ pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<
 fn write_chunk(file: &KernelFile, chunk: &[u8]) -> Result<(u64, usize), VfsError> {
     let mut off = file.offset.lock();
     let (pos, n) = if file.status_flags() & OpenFlags::O_APPEND != 0 {
-        file.inode.append(chunk)?
+        file.inode().append(chunk)?
     } else {
-        (*off, file.inode.write_at(*off, chunk)?)
+        (*off, file.inode().write_at(*off, chunk)?)
     };
     let n = checked_len(n, chunk.len())?;
     *off = pos.saturating_add(n as u64);
@@ -214,7 +214,7 @@ fn read_tty(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
 fn read(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     file.require_readable().map_err(vfs)?;
-    if file.inode.is_tty() {
+    if file.inode().is_tty() {
         return read_tty(&file, buf.addr(), count);
     }
     read_file(&file, buf.addr(), count)
@@ -227,7 +227,7 @@ pub(super) fn sys_write(fd: Fd, buf: UserPtr, count: u64) -> u64 {
 fn write(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     file.require_writable().map_err(vfs)?;
-    if file.inode.is_tty() {
+    if file.inode().is_tty() {
         return write_from_user(current_io(), buf.addr(), count).map(|n| n as u64);
     }
     write_file(&file, buf.addr(), count)
@@ -243,7 +243,7 @@ pub(super) fn sys_fstat(fd: Fd, statbuf: UserPtr) -> u64 {
 
 fn fstat(fd: Fd, statbuf: UserPtr) -> Result<u64, u32> {
     let file = fd.file()?;
-    let m = file.inode.stat().map_err(vfs)?;
+    let m = file.inode().stat().map_err(vfs)?;
     drop(file);
     at::write_stat(statbuf, &m)?;
     Ok(0)
@@ -266,7 +266,7 @@ fn poll_class(file: Option<&FileRef>) -> PollClass {
     match file {
         None => PollClass::Invalid,
         Some(f) if f.is_path() => PollClass::Invalid,
-        Some(f) if f.inode.is_tty() => PollClass::Tty { readable: f.is_readable(), writable: f.is_writable() },
+        Some(f) if f.inode().is_tty() => PollClass::Tty { readable: f.is_readable(), writable: f.is_writable() },
         Some(_) => PollClass::Ready,
     }
 }
@@ -396,7 +396,7 @@ fn ioctl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
             file.set_nonblock(on != 0).map_err(vfs)?;
             Ok(0)
         }
-        _ if file.inode.is_tty() => tty_ioctl(cmd, arg),
+        _ if file.inode().is_tty() => tty_ioctl(cmd, arg),
         _ => Err(errno::ENOTTY),
     }
 }
@@ -442,7 +442,7 @@ fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     file.require_readable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
-    if file.inode.is_tty() {
+    if file.inode().is_tty() {
         // Standard tty short-read semantics: return as soon as the first
         // non-empty span receives data (or EOF/error) so musl
         // `__stdio_read` never hangs trying to fill trailing iovecs.
@@ -485,7 +485,7 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     file.require_writable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
-    let tty = file.inode.is_tty().then(current_io);
+    let tty = file.inode().is_tty().then(current_io);
     let mut total = 0usize;
     for span in iovs {
         if span.len == 0 {
@@ -538,11 +538,11 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     let opened = start.open(&path, flags, mode)?;
     let mut file = OpenFile::from_opened(opened).map_err(vfs)?;
     if let Some(space) = &truncating
-        && file.inode.inode_type() == InodeType::File
+        && file.inode().inode_type() == InodeType::File
     {
         // The open truncated it to 0 (exactly when `open_inode_guarded`
         // does): unmap the caller's pages, as `truncate` does.
-        super::unmap_past(space, &*file.inode, 0);
+        super::unmap_past(space, &**file.inode(), 0);
     }
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
@@ -576,10 +576,10 @@ pub(super) fn sys_lseek(fd: Fd, offset: u64, whence: u32) -> u64 {
 fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
-    if file.inode.is_tty() {
+    if file.inode().is_tty() {
         return Err(errno::ESPIPE);
     }
-    match file.inode.inode_type() {
+    match file.inode().inode_type() {
         // A directory's position is its cursor (`rewinddir`, `seekdir`);
         // its end means nothing.
         InodeType::Dir => {
@@ -594,7 +594,7 @@ fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
         InodeType::CharDevice => Ok(0),
         _ => {
             let mut off = file.offset.lock();
-            let new = seek_target(whence, delta, *off, || file.inode.stat().map(|m| m.size).map_err(vfs))?;
+            let new = seek_target(whence, delta, *off, || file.inode().stat().map(|m| m.size).map_err(vfs))?;
             *off = new;
             Ok(new)
         }
@@ -734,7 +734,7 @@ impl KtestTmpFile {
                     crate::ktest::diag(format_args!("look up the fd of {}: {e}", lumen_vfs::Escaped(path)));
                     "look up the new fd"
                 })?;
-                Ok((fd, alloc::sync::Arc::clone(&file.inode)))
+                Ok((fd, alloc::sync::Arc::clone(file.inode())))
             })
             .inspect_err(|_| {
                 let _ = ktest_unlink(path);
@@ -878,7 +878,7 @@ crate::ktest!(
             kassert_eq!(sys_ioctl(at::reg(0), ioctl::TCGETS, out), 0);
             let tty_fd = ktest_open(2, b"/dev/tty", OpenFlags::O_RDWR)?;
             kassert_eq!(sys_ioctl(tty_fd, ioctl::TIOCGWINSZ, out), 0);
-            kassert!(current_file(tty_fd).is_some_and(|f| f.inode.is_tty()));
+            kassert!(current_file(tty_fd).is_some_and(|f| f.inode().is_tty()));
             Ok(())
         })?
     }
@@ -1150,7 +1150,7 @@ crate::ktest!(
             let again = ktest_fd_of(sys_openat(Dirfd::Cwd, rel, rd, at::reg(0)), "openat", b"made-here")?;
             let same = current_file(again)
                 .zip(current_file(fd))
-                .is_some_and(|(a, b)| alloc::sync::Arc::ptr_eq(&a.inode, &b.inode));
+                .is_some_and(|(a, b)| alloc::sync::Arc::ptr_eq(a.inode(), b.inode()));
             kassert!(same);
             kassert_eq!(sys_close(fd), 0);
             kassert_eq!(sys_close(again), 0);

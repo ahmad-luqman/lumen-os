@@ -68,7 +68,6 @@ pub struct OpenFileId(pub u64);
 /// Open file description shared across `dup` / `F_DUPFD*` / `fork` descriptors.
 pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
     pub id: OpenFileId,
-    pub inode: Arc<dyn VfsInode>,
     /// The path it was opened by, its bytes (#268): what `/proc/<pid>/fd`
     /// reads back, never a lossy copy (that would name another file).
     pub path: Arc<[u8]>,
@@ -124,7 +123,6 @@ impl<L: VfsLock<u64>> OpenFile<L> {
         let status_bits = if is_path { 0 } else { flags.status_bits() };
         Ok(Self {
             id: next_open_file_id(),
-            inode: Arc::clone(guard.inode()),
             path,
             access_mode,
             is_path,
@@ -134,6 +132,13 @@ impl<L: VfsLock<u64>> OpenFile<L> {
             dir_cursor: L::new(0),
             open_guard: guard,
         })
+    }
+
+    /// The inode this description is open on: always the one its open
+    /// reference ([`OpenFile::open_guard`]) holds, so a description can
+    /// never point at an inode it doesn't keep open (#264).
+    pub fn inode(&self) -> &Arc<dyn VfsInode> {
+        self.open_guard.inode()
     }
 
     /// The open reference this description holds on its inode: clone it
@@ -235,8 +240,8 @@ impl<L: VfsLock<u64>> fmt::Debug for OpenFile<L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenFile")
             .field("id", &self.id)
-            .field("dev", &self.inode.dev_id())
-            .field("ino", &self.inode.ino())
+            .field("dev", &self.inode().dev_id())
+            .field("ino", &self.inode().ino())
             .field("path", &crate::Escaped(&self.path))
             .field("access_mode", &self.access_mode)
             .field("is_path", &self.is_path)

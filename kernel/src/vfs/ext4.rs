@@ -7547,10 +7547,10 @@ crate::ktest!(
         let opened = open_inode_guarded(tables, None, b"/kept", rd, 0, 0).map_err(why("open kept"))?;
         unlink_at(tables, None, b"/kept", false).map_err(why("unlink kept"))?;
         let of = OpenFile::<KernelVfsLock<u64>>::from_opened(opened).map_err(why("OpenFile::from_opened"))?;
-        kassert!(of.inode.is_detached());
-        kassert_eq!(of.inode.open_count(), 1);
-        kassert_eq!(read_all(&of.inode)?, data);
-        let kept = Arc::clone(&of.inode);
+        kassert!(of.inode().is_detached());
+        kassert_eq!(of.inode().open_count(), 1);
+        kassert_eq!(read_all(of.inode())?, data);
+        let kept = Arc::clone(of.inode());
         drop(of);
         kassert_eq!(kept.open_count(), 0);
 
