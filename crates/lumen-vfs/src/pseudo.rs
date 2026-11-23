@@ -19,11 +19,16 @@ pub fn fill_readdir<N: Into<Vec<u8>>>(
     max_entries: usize,
     entries: impl IntoIterator<Item = (u64, Ino, InodeType, N)>,
 ) {
+    // Every key is checked, past a full page too, so an order bug shows on
+    // any listing (debug builds); a release build stops at a full page.
     let mut last = None;
     for (key, ino, inode_type, name) in entries {
         debug_assert!(last.is_none_or(|l| l < key), "readdir keys not ascending");
         last = Some(key);
         if out.len() >= max_entries {
+            if cfg!(debug_assertions) {
+                continue;
+            }
             break;
         }
         if key >= cursor {
@@ -157,11 +162,22 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "readdir keys not ascending")]
+    fn keys_out_of_order_past_a_full_page_still_panic() {
+        let unordered =
+            [(0u64, 10, InodeType::Dir, b"a"), (5, 11, InodeType::File, b"b"), (3, 12, InodeType::File, b"c")];
+        let mut out = Vec::new();
+        fill_readdir(&mut out, 0, 1, unordered.map(|(k, ino, t, n)| (k, ino, t, n.to_vec())));
+    }
+
+    #[test]
     fn listing_in_pages_resumed_at_each_cursor_lists_each_entry_once() {
         for page in 1..=6 {
             let mut all = Vec::new();
             let mut cursor = 0;
-            loop {
+            for call in 0.. {
+                // Bounded: a cursor that never moves on fails, never hangs.
+                assert!(call <= 5, "page {page}: no end after {call} calls");
                 let mut out = Vec::new();
                 fill_readdir(&mut out, cursor, page, entries());
                 let Some(last) = out.last() else { break };

@@ -15,7 +15,8 @@
 //! but on a read-only mount it is `-EROFS`; `X_OK` needs an execute bit or a
 //! directory; `F_OK` is existence alone. A special file (device node, FIFO
 //! or socket: `InodeType::is_special`) is exempt from that `-EROFS`,
-//! as on Linux and as `open` agrees (#291); `/dev` itself is not.
+//! as on Linux and as `open` agrees (#291). devfs is a writable mount
+//! (#301), so `/dev` itself passes `W_OK` too, as on Linux.
 //! With the real and effective ids the same, `AT_EACCESS` changes nothing.
 
 use super::at::{Dirfd, UserPath, UserPtr, lookup, write_stat, write_statx};
