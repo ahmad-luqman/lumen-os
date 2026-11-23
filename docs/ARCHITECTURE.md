@@ -5219,9 +5219,10 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   `miss`'s: a page read from disk, inserted after the copy, or `None`, a
   hole read as zeros without a frame; an error past the first page is a
   short count, the bytes before it, as Linux's `filemap_read` gives, #321),
-  `write_from(offset, buf,
-  old_size, fill)` (a page not cached is `fill`'s, a zero page or one
-  holding the disk's bytes a partial write keeps; a write starting past
+  `write_from(offset, buf, old_size, fill)` (a page not cached is
+  `fill`'s, a zero page or one holding the disk's bytes a partial write
+  keeps, through the same `Ext4Inode::load_page` as a read, which logs a
+  failed disk read, first page or not; a write starting past
   `old_size` first zeroes the old tail, the rule below; an error past the
   first page is a short count), `resize(old_size, new_size)` (a
   truncate's: a shrink's pages dropped, then the tail zeroed, the rule

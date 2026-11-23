@@ -1141,8 +1141,9 @@ impl Ext4Inode {
         // (below the old size) of a linked file, else as zeros. (A write
         // never dirties a detached file's page, and nothing writes one
         // back: `PageCache::writes_back`.) A failed disk read is logged by
-        // `load_page`: past the first page the write returns short, and the
-        // error goes nowhere else (#321).
+        // `load_page`, on the first page (whose error is also returned) as
+        // on a later one, where the write returns short and the error goes
+        // nowhere else (#321).
         let done = pages.write_from(offset, buf, old_size, |span| {
             if !detached && !span.whole_page() && span.page_start() < old_size {
                 self.load_page(span.index(), old_size)

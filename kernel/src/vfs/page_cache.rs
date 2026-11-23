@@ -720,8 +720,9 @@ pub(crate) mod ktest_files {
         (0..len).map(|i| ((i % 251) as u8).wrapping_add(seed) | 1).collect()
     }
 
-    /// `len` bytes of `f` at `off` (short at EOF), through the VFS's read
-    /// path.
+    /// `len` bytes of `f` at `off` (short at EOF, or where a page past the
+    /// first failed to read: `PageCache::read_into`), through the VFS's
+    /// read path.
     pub(crate) fn read(f: &Arc<dyn VfsInode>, off: u64, len: usize) -> Result<alloc::vec::Vec<u8>, &'static str> {
         let mut buf = alloc::vec![0u8; len];
         let n = f.read_at(off, &mut buf).map_err(|_| "read_at")?;
@@ -957,17 +958,18 @@ impl PageCache {
     /// leaves a clean tail page clean, so a later `fsync` never reports a
     /// writeback error for it, a write the caller saw fail (#321). (Its
     /// first page is then another, uncached one: a write's first span on
-    /// the cached tail page can't fail.) A linked `ext4` file's pages ([`Self::writes_back`]) are marked
-    /// dirty, and a new one is refused at the hard limit
-    /// ([`Self::admit_unreclaimable`]) before `fill` runs. That is an early
-    /// answer: `fill` may sleep (a disk read) or be preempted, and another
-    /// thread may add pages meanwhile, so the insert asks again and refuses
-    /// the page `fill` made. Returns how many bytes were written: an error
-    /// (the admission's, `fill`'s or the insert's, either check's refusal
-    /// alike) only when it is the first page's, else a short count. `FBig`
-    /// when the range ends past `u64::MAX`, before anything changes. The
-    /// caller holds the inode's Lock 4 (`old_size` is the size it read
-    /// under it) and this lock (Lock 5), and sets the size and times.
+    /// the cached tail page can't fail.) A linked `ext4` file's pages
+    /// ([`Self::writes_back`]) are marked dirty, and a new one is refused
+    /// at the hard limit ([`Self::admit_unreclaimable`]) before `fill`
+    /// runs. That is an early answer: `fill` may sleep (a disk read) or be
+    /// preempted, and another thread may add pages meanwhile, so the insert
+    /// asks again and refuses the page `fill` made. Returns how many bytes
+    /// were written: an error (the admission's, `fill`'s or the insert's,
+    /// either check's refusal alike) only when it is the first page's, else
+    /// a short count. `FBig` when the range ends past `u64::MAX`, before
+    /// anything changes. The caller holds the inode's Lock 4 (`old_size` is
+    /// the size it read under it) and this lock (Lock 5), and sets the size
+    /// and times.
     pub fn write_from(
         &mut self,
         offset: u64,
