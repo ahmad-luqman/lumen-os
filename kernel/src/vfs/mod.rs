@@ -274,21 +274,31 @@ pub fn init() {
     info!(target: "vfs", "mounted / ({}, {}){others}", root_fs.name(), if root_ro { "ro" } else { "rw" });
 }
 
-/// Build `mount`'s records table for shell rendering and pipelines.
+/// Build `mount`'s records table for shell rendering and pipelines: each
+/// mount's target, filesystem, device and mode, and a tmpfs mount's quota
+/// (`used` and `limit`, in bytes; `-` for any other filesystem): with them
+/// an `ENOSPC` on `/tmp` can be checked against what its files take (#324).
 pub fn mount_table() -> pipe::Table {
-    const COLUMNS: [Column; 4] = [
+    const COLUMNS: [Column; 6] = [
         Column::new("target", Kind::Text, Align::Left, 6),
         Column::new("fs", Kind::Text, Align::Left, 6),
         Column::new("dev", Kind::Text, Align::Left, 5),
         Column::new("mode", Kind::Text, Align::Left, 4),
+        Column::new("used", Kind::Int, Align::Right, 4),
+        Column::new("limit", Kind::Int, Align::Right, 5),
     ];
     let mut t = pipe::Table::new(&COLUMNS);
-    for m in list_mounts() {
+    // One snapshot, taken under Lock 9; each filesystem is asked after it
+    // is released.
+    for (m, fs) in TABLES.mounts_with_fs() {
+        let quota = tmpfs::quota_use(fs.as_ref());
         t.push(vec![
             Value::Text(m.mount_path),
             sysinfo::text(m.fs_name),
             Value::Text(format!("{}", m.dev_id)),
             sysinfo::text(if m.read_only { "ro" } else { "rw" }),
+            quota.map_or(sysinfo::DASH, |q| sysinfo::int(q.used_bytes)),
+            quota.map_or(sysinfo::DASH, |q| sysinfo::int(q.limit_bytes)),
         ]);
     }
     t
@@ -306,10 +316,10 @@ pub fn mount_command(ctx: &mut Ctx<'_>, args: &[String]) {
         return ctx.fail("usage: mount");
     }
     let t = mount_table();
-    let mounts = list_mounts();
     let mut out = String::new();
-    let s = if mounts.len() == 1 { "" } else { "s" };
-    let _ = writeln!(out, "mount: {} mount{s}", mounts.len());
+    let mounts = t.rows().len(); // the table's own, so the two agree
+    let s = if mounts == 1 { "" } else { "s" };
+    let _ = writeln!(out, "mount: {mounts} mount{s}");
     t.render(&mut out);
     let _ = ctx.out.write_str(&out);
 }
