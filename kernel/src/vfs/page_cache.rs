@@ -1327,10 +1327,13 @@ fn check_writes_over_cached_pages(root: &Arc<dyn VfsInode>, ext4: bool) -> Resul
         kassert!(read(&f, 0, want.len())? == want);
         kassert_eq!(cached(&f)?, 3);
     }
-    kassert_eq!(cached(&f)?, 3); // page 0 among them: the overwrite's
+    kassert_eq!(cached(&f)?, 3);
+    // Page 0, the overwrite's, held mapped so reclaim can't drop it first.
+    let page0 = mmap_page(&f, 0).map_err(|_| "map page 0")?;
     kassert_eq!(f.write_at(100, b"xy").map_err(|_| "overwrite")?, 2);
     want[100..102].copy_from_slice(b"xy");
     kassert!(read(&f, 0, want.len())? == want);
+    drop(page0);
 
     // A file of a page and 100 bytes; a store through a mapping at 200 of
     // its page 1 (past the end); then a write at a page and 1000.
