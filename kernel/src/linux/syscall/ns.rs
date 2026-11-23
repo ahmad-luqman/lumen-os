@@ -26,8 +26,8 @@
 //! - A last component that isn't a name (`/`, `.`, `..`): `unlink` says
 //!   `-EISDIR` for all three, `rmdir` `-EBUSY`, `-EINVAL` and `-ENOTEMPTY`,
 //!   `rename` `-EBUSY` (`-EEXIST` on the new side with
-//!   `RENAME_NOREPLACE`), though `-EXDEV` comes ahead of it; `mkdir` and
-//!   `link` onto one say `-EEXIST`.
+//!   `RENAME_NOREPLACE`), though `-EXDEV` comes ahead of it; `mkdir`,
+//!   `link` and `symlink` onto one say `-EEXIST`.
 //! - `rename` checks in `do_renameat2`'s order (lumen-vfs's `rename_at2`):
 //!   `RENAME_NOREPLACE`'s `-EEXIST` before a trailing slash's `-ENOTDIR`,
 //!   the ancestry traps (`-EINVAL`, `-ENOTEMPTY`) before the types, the
