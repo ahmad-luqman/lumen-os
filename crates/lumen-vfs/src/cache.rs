@@ -49,6 +49,32 @@ impl RemovedDir {
     }
 }
 
+/// The `Arc` an [`InodeCache`] call lets go of (#320), at most one: a stale
+/// (detached or `ino`-mismatched) entry it evicts, or the inode a
+/// `get_or_insert*` was handed and unified with the one already cached.
+/// Its caller declares it before taking Lock 9's guards, so it drops after
+/// them on every path out, an early return included: never under Lock 9,
+/// where an inode's last reference must not drop (ARCHITECTURE section 9).
+/// Crate-private, with the methods taking it, so the only callers outside
+/// the tests are
+/// `VfsTables`' (`mount.rs`), each tested for it.
+pub(crate) struct Released(Option<Arc<dyn VfsInode>>);
+
+impl Released {
+    /// Nothing let go of yet.
+    pub(crate) const fn new() -> Self {
+        Self(None)
+    }
+
+    /// Keep `inode` for the caller to drop. One `Arc` per `Released` (use
+    /// one per `InodeCache` call): a second is a bug, and panics here before
+    /// the first could drop under Lock 9.
+    fn hold(&mut self, inode: Arc<dyn VfsInode>) {
+        assert!(self.0.is_none(), "one Arc per Released (#320)");
+        self.0 = Some(inode);
+    }
+}
+
 /// Active inode cache keyed by `(DevId, Ino)`.
 ///
 /// Ensures hard links and multiple open descriptors share the same
@@ -62,6 +88,10 @@ impl RemovedDir {
 /// causing `InodeCache` skips or zombie leaks.
 ///
 /// Also keeps each removed directory's parent for `..` (#318, [`RemovedDir`]).
+///
+/// Never drops an inode itself while its caller holds the lock: every
+/// method that lets one go hands it back, in its return value or in the
+/// [`Released`] it is passed (#320).
 pub struct InodeCache {
     inodes: BTreeMap<(DevId, Ino), CachedInode>,
     removal_gen: u64,
@@ -106,6 +136,13 @@ impl InodeCache {
     #[inline]
     fn gen_gt(a: u64, b: u64) -> bool {
         a != b && a.wrapping_sub(b) < (1u64 << 63)
+    }
+
+    /// Remove `key`'s entry into `released`.
+    fn evict_into(&mut self, key: (DevId, Ino), released: &mut Released) {
+        if let Some(c) = self.inodes.remove(&key) {
+            released.hold(c.inode);
+        }
     }
 
     /// Monotonic removal generation incremented on every removal or FS eviction.
@@ -157,14 +194,20 @@ impl InodeCache {
     /// If `(dev, ino)` is absent from the cache (or detached / `ino`-mismatched,
     /// in which case it is evicted first), atomically record a removal generation
     /// and return `Ok(gen_id)`. Otherwise return `Err(Arc::clone(&existing))` so
-    /// the caller can check `is_inode_dead` outside Lock 9.
-    pub fn record_removal_if_absent(&mut self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
+    /// the caller can check `is_inode_dead` outside Lock 9. An evicted entry
+    /// goes into `released`.
+    pub(crate) fn record_removal_if_absent(
+        &mut self,
+        dev: DevId,
+        ino: Ino,
+        released: &mut Released,
+    ) -> Result<u64, Arc<dyn VfsInode>> {
         let key = (dev, ino);
         if let Some(existing) = self.inodes.get(&key) {
             if !existing.inode.is_detached() && existing.inode.ino() == ino {
                 return Err(Arc::clone(&existing.inode));
             }
-            let _ = self.inodes.remove(&key);
+            self.evict_into(key, released);
         }
         Ok(self.record_removal(dev, ino))
     }
@@ -192,11 +235,17 @@ impl InodeCache {
 
     /// Look up a cached inode only if `(dev, ino)` has no in-flight removal and
     /// has not been removed or its filesystem evicted since `since_gen`. Eagerly
-    /// evicts any detached or `ino`-mismatched cached entry.
-    pub fn get_if_fresh(&mut self, dev: DevId, ino: Ino, since_gen: u64) -> Option<Arc<dyn VfsInode>> {
+    /// evicts any detached or `ino`-mismatched cached entry, into `released`.
+    pub(crate) fn get_if_fresh(
+        &mut self,
+        dev: DevId,
+        ino: Ino,
+        since_gen: u64,
+        released: &mut Released,
+    ) -> Option<Arc<dyn VfsInode>> {
         let key = (dev, ino);
         if self.inodes.get(&key).is_some_and(|c| c.inode.is_detached() || c.inode.ino() != ino) {
-            let _ = self.inodes.remove(&key);
+            self.evict_into(key, released);
             let _ = self.record_removal(dev, ino);
             return None;
         }
@@ -208,17 +257,19 @@ impl InodeCache {
 
     /// Return an existing live cached inode for `(inode.dev_id(), inode.ino())`,
     /// or insert and return `inode` (skipping detached inodes and eagerly
-    /// evicting any stale detached/`ino`-mismatched entry).
-    pub fn get_or_insert(&mut self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
+    /// evicting any stale detached/`ino`-mismatched entry). The stale entry,
+    /// or `inode` when it loses to a live cached one, goes into `released`.
+    pub(crate) fn get_or_insert(&mut self, inode: Arc<dyn VfsInode>, released: &mut Released) -> Arc<dyn VfsInode> {
         if inode.is_detached() {
             return inode;
         }
         let key = (inode.dev_id(), inode.ino());
         if let Some(existing) = self.inodes.get(&key) {
             if !existing.inode.is_detached() && existing.inode.ino() == key.1 {
+                released.hold(inode);
                 return Arc::clone(&existing.inode);
             }
-            let _ = self.inodes.remove(&key);
+            self.evict_into(key, released);
             let _ = self.record_removal(key.0, key.1);
         }
         self.inodes.insert(key, CachedInode { inode: Arc::clone(&inode), inserted_at_gen: self.removal_gen });
@@ -229,11 +280,13 @@ impl InodeCache {
     /// has no in-flight removal and was not removed/evicted since `since_gen`,
     /// and any existing entry is live and `ino`-matching. Returns `Err(inode)`
     /// on race/staleness so the caller can retry or return `inode` uncached
-    /// without aliasing.
-    pub fn get_or_insert_if_fresh(
+    /// without aliasing. A stale entry evicted, or `inode` when it loses to
+    /// a live cached one, goes into `released`.
+    pub(crate) fn get_or_insert_if_fresh(
         &mut self,
         inode: Arc<dyn VfsInode>,
         since_gen: u64,
+        released: &mut Released,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
         if inode.is_detached() {
             return Err(inode);
@@ -244,9 +297,10 @@ impl InodeCache {
         }
         if let Some(existing) = self.inodes.get(&key) {
             if !existing.inode.is_detached() && existing.inode.ino() == key.1 {
+                released.hold(inode);
                 return Ok(Arc::clone(&existing.inode));
             }
-            let _ = self.inodes.remove(&key);
+            self.evict_into(key, released);
             let _ = self.record_removal(key.0, key.1);
             return Err(inode);
         }
@@ -258,11 +312,13 @@ impl InodeCache {
     /// been removed/evicted since `since_gen`. Unlike
     /// [`Self::get_or_insert_if_fresh`], allows unification when `since_gen`
     /// already reflects an in-flight `begin_removal` whose freed `ino` was
-    /// reallocated to this creator.
-    pub fn get_or_insert_created_if_fresh(
+    /// reallocated to this creator. A stale entry evicted, or `inode` when it
+    /// loses to a live cached one, goes into `released`.
+    pub(crate) fn get_or_insert_created_if_fresh(
         &mut self,
         inode: Arc<dyn VfsInode>,
         since_gen: u64,
+        released: &mut Released,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
         if inode.is_detached() {
             return Err(inode);
@@ -273,9 +329,10 @@ impl InodeCache {
         }
         if let Some(existing) = self.inodes.get(&key) {
             if !existing.inode.is_detached() && existing.inode.ino() == key.1 {
+                released.hold(inode);
                 return Ok(Arc::clone(&existing.inode));
             }
-            let _ = self.inodes.remove(&key);
+            self.evict_into(key, released);
             let _ = self.record_removal(key.0, key.1);
             return Err(inode);
         }
@@ -288,6 +345,7 @@ impl InodeCache {
     /// `since_gen` (or `dev` overflowed and the cached entry was inserted after
     /// `since_gen`), and record a pre-mutation removal generation. Must be
     /// paired with [`Self::end_removal`] after the filesystem mutation finishes.
+    #[must_use = "the evicted inode goes after Lock 9 is released (#320)"]
     pub fn begin_removal_if_fresh(&mut self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
         let key = (dev, ino);
         *self.pending_removals.entry(key).or_insert(0) += 1;
@@ -326,8 +384,9 @@ impl InodeCache {
     /// Complete an in-flight removal for `(dev, ino)` started by
     /// [`Self::begin_removal_if_fresh`], evicting any detached entry and
     /// recording a post-mutation removal generation without evicting a live
-    /// newly created inode reusing `(dev, ino)`.
-    pub fn end_removal(&mut self, dev: DevId, ino: Ino) -> u64 {
+    /// newly created inode reusing `(dev, ino)`. An evicted entry goes into
+    /// `released`.
+    pub(crate) fn end_removal(&mut self, dev: DevId, ino: Ino, released: &mut Released) -> u64 {
         let key = (dev, ino);
         if let Some(cnt) = self.pending_removals.get_mut(&key) {
             if *cnt <= 1 {
@@ -337,16 +396,17 @@ impl InodeCache {
             }
         }
         if self.inodes.get(&key).is_some_and(|c| c.inode.is_detached() || c.inode.ino() != ino) {
-            let _ = self.inodes.remove(&key);
+            self.evict_into(key, released);
         }
         self.record_removal(dev, ino)
     }
 
-    /// Evict `(dev, ino)` if its cached entry is detached or `ino`-mismatched.
-    pub fn evict_detached(&mut self, dev: DevId, ino: Ino) -> bool {
+    /// Evict `(dev, ino)` into `released` if its cached entry is detached or
+    /// `ino`-mismatched.
+    pub(crate) fn evict_detached(&mut self, dev: DevId, ino: Ino, released: &mut Released) -> bool {
         let key = (dev, ino);
         if self.inodes.get(&key).is_some_and(|c| c.inode.is_detached() || c.inode.ino() != ino) {
-            let _ = self.inodes.remove(&key);
+            self.evict_into(key, released);
             let _ = self.record_removal(dev, ino);
             return true;
         }
@@ -355,6 +415,7 @@ impl InodeCache {
 
     /// Evict `(dev, ino)` only if the currently cached entry is the exact same
     /// `Arc` instance as `expected`.
+    #[must_use = "the removed inode goes after Lock 9 is released (#320)"]
     pub fn remove_if_same(&mut self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
         let key = (dev, ino);
         if self.inodes.get(&key).is_some_and(|c| Arc::ptr_eq(&c.inode, expected)) {
@@ -367,55 +428,16 @@ impl InodeCache {
 
     /// Unconditionally record a removal for `(dev, ino)` and remove any
     /// cached inode for `(dev, ino)`.
+    #[must_use = "the removed inode goes after Lock 9 is released (#320)"]
     pub fn remove(&mut self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
         let _ = self.record_removal(dev, ino);
         self.inodes.remove(&(dev, ino)).map(|c| c.inode)
     }
 
-    /// Record a removal and evict `(dev, ino)` unless `(dev, ino)` itself was
-    /// already removed or evicted since `since_gen` (or `dev` overflowed and
-    /// the cached entry was inserted after `since_gen`).
-    pub fn remove_if_fresh(
-        &mut self,
-        dev: DevId,
-        ino: Ino,
-        since_gen: u64,
-    ) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-        let key = (dev, ino);
-        let known_key_removed = self.fs_evict_gen.get(&dev).is_some_and(|&g| Self::gen_gt(g, since_gen))
-            || self.recent_removals.get(&key).is_some_and(|&g| Self::gen_gt(g, since_gen));
-        let dev_overflowed = self.dev_overflow_gen.get(&dev).is_some_and(|&g| Self::gen_gt(g, since_gen));
-
-        let should_evict_existing = match self.inodes.get(&key) {
-            None => false,
-            Some(existing) => {
-                if existing.inode.is_detached() || existing.inode.ino() != ino {
-                    true
-                } else if known_key_removed {
-                    false
-                } else if !dev_overflowed {
-                    true
-                } else {
-                    !Self::gen_gt(existing.inserted_at_gen, since_gen)
-                }
-            }
-        };
-
-        if should_evict_existing {
-            let removed = self.inodes.remove(&key).map(|c| c.inode);
-            let gen_id = self.record_removal(dev, ino);
-            return Some((removed, gen_id));
-        }
-        if !self.inodes.contains_key(&key) && !known_key_removed && !dev_overflowed {
-            let gen_id = self.record_removal(dev, ino);
-            return Some((None, gen_id));
-        }
-        None
-    }
-
     /// Evict all cached inodes belonging to filesystem `dev` and bump
     /// `fs_evict_gen`, and drop its removed directories' records (#318),
     /// their parents returned with the evicted inodes.
+    #[must_use = "the evicted inodes go after Lock 9 is released (#320)"]
     pub fn evict_fs(&mut self, dev: DevId) -> Vec<Arc<dyn VfsInode>> {
         self.removal_gen = self.removal_gen.wrapping_add(1);
         self.fs_evict_gen.insert(dev, self.removal_gen);

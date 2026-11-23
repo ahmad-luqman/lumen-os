@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::cache::{DentryCache, DentryTarget, InodeCache};
+use crate::cache::{DentryCache, DentryTarget, InodeCache, Released};
 use crate::error::VfsError;
 use crate::fd::{LockFamily, VfsLock};
 use crate::fs::{FileSystem, VfsInode};
@@ -68,7 +68,9 @@ impl MountTable {
 
     /// Mount the global root filesystem `/` using a pre-fetched `fs_root_ino`
     /// so callers holding Lock 9 never invoke `FileSystem::root_inode()`.
-    pub fn mount_root_with_ino(&mut self, fs: Arc<dyn FileSystem>, fs_root_ino: Ino) -> Result<(), VfsError> {
+    /// Takes `fs` by reference, cloned only into the mount, so a refused
+    /// one's last reference is never dropped here, under Lock 9 (#320).
+    fn mount_root_with_ino(&mut self, fs: &Arc<dyn FileSystem>, fs_root_ino: Ino) -> Result<(), VfsError> {
         if self.root.is_some() {
             return Err(VfsError::Busy);
         }
@@ -77,30 +79,33 @@ impl MountTable {
             return Err(VfsError::Busy);
         }
         let mount_id = self.alloc_mount_id();
-        self.root =
-            Some(MountRecord { mount_id, fs, fs_root_ino, parent_mountpoint: None, mount_path: String::from("/") });
+        self.root = Some(MountRecord {
+            mount_id,
+            fs: Arc::clone(fs),
+            fs_root_ino,
+            parent_mountpoint: None,
+            mount_path: String::from("/"),
+        });
         Ok(())
     }
 
-    /// Mount the global root filesystem `/`.
-    pub fn mount_root(&mut self, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
-        let fs_root_ino = fs.root_inode().ino();
-        self.mount_root_with_ino(fs, fs_root_ino)
-    }
-
     /// Mount `fs` on directory `mountpoint` at `path` using a pre-fetched
-    /// `fs_root_ino` so callers holding Lock 9 never invoke `FileSystem::root_inode()`.
-    pub fn mount_with_ino(
+    /// `fs_root_ino` and `mountpoint_type` (the mountpoint's `inode_type()`)
+    /// so callers holding Lock 9 never call into either (#320). Takes the
+    /// `Arc`s by reference, cloned only into the mount, so a refused one's
+    /// last references are never dropped here, under Lock 9 (#320).
+    fn mount_with_ino(
         &mut self,
-        mountpoint: Arc<dyn VfsInode>,
+        mountpoint: &Arc<dyn VfsInode>,
+        mountpoint_type: InodeType,
         path: &str,
-        fs: Arc<dyn FileSystem>,
+        fs: &Arc<dyn FileSystem>,
         fs_root_ino: Ino,
     ) -> Result<(), VfsError> {
         if self.root.is_none() {
             return Err(VfsError::NoEnt);
         }
-        if mountpoint.inode_type() != InodeType::Dir {
+        if mountpoint_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
         let fs_dev = fs.dev_id();
@@ -117,29 +122,21 @@ impl MountTable {
             mp_key,
             MountRecord {
                 mount_id,
-                fs,
+                fs: Arc::clone(fs),
                 fs_root_ino,
-                parent_mountpoint: Some(mountpoint),
+                parent_mountpoint: Some(Arc::clone(mountpoint)),
                 mount_path: String::from(path),
             },
         );
         Ok(())
     }
 
-    /// Mount `fs` on directory `mountpoint` at `path`.
-    pub fn mount(
-        &mut self,
-        mountpoint: Arc<dyn VfsInode>,
-        path: &str,
-        fs: Arc<dyn FileSystem>,
-    ) -> Result<(), VfsError> {
-        let fs_root_ino = fs.root_inode().ino();
-        self.mount_with_ino(mountpoint, path, fs, fs_root_ino)
-    }
-
-    /// Unmount the filesystem mounted on `(mountpoint_dev, mountpoint_ino)`.
-    /// Returns `Err(Busy)` if any child filesystem is mounted beneath it.
-    pub fn umount(&mut self, mountpoint_dev: DevId, mountpoint_ino: Ino) -> Result<Arc<dyn FileSystem>, VfsError> {
+    /// Unmount the filesystem mounted on `(mountpoint_dev, mountpoint_ino)`,
+    /// returning its record for the caller to drop after releasing Lock 9
+    /// (#320: the mount's may be the last reference to its mountpoint).
+    /// Returns `Err(Inval)` if nothing is mounted there, and `Err(Busy)` if
+    /// any child filesystem is mounted beneath it.
+    fn umount(&mut self, mountpoint_dev: DevId, mountpoint_ino: Ino) -> Result<MountRecord, VfsError> {
         let mp_key = (mountpoint_dev, mountpoint_ino);
         let Some(rec) = self.mounts.get(&mp_key) else {
             return Err(VfsError::Inval);
@@ -151,7 +148,7 @@ impl MountTable {
         }
         let rec = self.mounts.remove(&mp_key).ok_or(VfsError::Inval)?;
         self.dev_to_mp.remove(&mounted_dev);
-        Ok(rec.fs)
+        Ok(rec)
     }
 
     /// Return the global root filesystem, if mounted.
@@ -341,7 +338,6 @@ pub trait VfsCacheOps {
         since_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>>;
     fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>>;
-    fn inode_remove_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<(Option<Arc<dyn VfsInode>>, u64)>;
     fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64);
     fn inode_end_removal(&self, dev: DevId, ino: Ino) -> u64;
     fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool;
@@ -372,19 +368,21 @@ pub trait VfsCacheOps {
 ///
 /// Strict sub-order `MountTable -> DentryCache -> InodeCache`. Never holds
 /// any of the three across `FileSystem::root_inode()`, `read_only()` and
-/// `name()` (`fs_read_only`, `list_mounts`, `mounts_with_fs`), Locks 1–8, or the drops of the
-/// inodes `umount` evicts. Some calls into the filesystems still run under
-/// them: `VfsInode::dev_id`, `ino` and `cacheable` and `FileSystem::dev_id`
-/// (fixed state, by design), `VfsInode::is_detached` (an atomic load in
-/// ext4 and tmpfs, but not fixed state: a detach sets it), and #320's
-/// pre-existing cases
-/// (`MountTable::mount_with_ino`'s `inode_type()` and its error paths'
-/// `Arc` drops, the unmounted mountpoint's `Arc` dropped inside
-/// `MountTable::umount`, the `Arc` each of `InodeCache`'s `get_or_insert*`
-/// is handed and drops when it finds a live entry, and the stale (detached
-/// or `ino`-mismatched) entries `InodeCache` drops in `get_if_fresh`, every
-/// `get_or_insert*`, `end_removal`, `evict_detached` and
-/// `record_removal_if_absent`).
+/// `name()` (`fs_read_only`, `list_mounts`, `mounts_with_fs`),
+/// `VfsInode::inode_type()` (`mount` asks its mountpoint's first), Locks
+/// 1–8, or the drop of an inode or filesystem `Arc` it lets go of (#320):
+/// the inodes `umount` evicts and the mountpoint it unmounts, a refused
+/// `mount`'s mountpoint, filesystem and filesystem root (`mount_root`'s
+/// filesystem and root), and what `InodeCache` lets go of (a stale entry it
+/// evicts, an inode a `get_or_insert*` unifies with the cached one), which
+/// it hands back in its return value or in a
+/// [`Released`](crate::cache::Released) declared before the guards (see
+/// [`with_inodes`](Self::with_inodes)), so it drops after them. The calls
+/// into the filesystems still made under them are `VfsInode::dev_id`,
+/// `ino`, `cacheable` and `is_detached`, and `FileSystem::dev_id`: probing
+/// a cached entry or a mount takes them under the lock, so their docs
+/// require each to answer without locking or blocking (from an atomic or
+/// fixed state in every kernel filesystem).
 pub struct VfsTables<F: LockFamily> {
     mounts: F::Lock<MountTable>,
     dentries: F::Lock<DentryCache>,
@@ -419,46 +417,59 @@ impl<F: LockFamily> VfsTables<F> {
         )
     }
 
-    /// Mount `fs` at `/` and seed its root inode into `InodeCache`.
+    /// Mount `fs` at `/` and seed its root inode into `InodeCache`. A
+    /// refused `fs`, like every `Arc` here, drops after the locks are
+    /// released (#320).
     pub fn mount_root(&self, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
         let root = fs.root_inode();
         let root_ino = root.ino();
-        self.mounts.lock().mount_root_with_ino(fs, root_ino)?;
-        let _ = self.inodes.lock().get_or_insert(root);
+        self.mounts.lock().mount_root_with_ino(&fs, root_ino)?;
+        let _seeded = self.with_inodes(|inodes, released| inodes.get_or_insert(root, released));
         Ok(())
     }
 
-    /// Mount `fs` at `mountpoint` (`path`), invalidating stale dentries at `mountpoint`.
+    /// Mount `fs` at `mountpoint` (`path`), invalidating stale dentries at
+    /// `mountpoint`. Asks `mountpoint` its type before taking the locks, and
+    /// a refused mount's `Arc`s, like every one here, drop after they are
+    /// released (#320).
     pub fn mount(&self, mountpoint: Arc<dyn VfsInode>, path: &str, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
         let mp_dev = mountpoint.dev_id();
         let mp_ino = mountpoint.ino();
+        let mp_type = mountpoint.inode_type();
         let root = fs.root_inode();
         let root_ino = root.ino();
-        let mut mounts = self.mounts.lock();
-        let mut dentries = self.dentries.lock();
-        let mut inodes = self.inodes.lock();
-        mounts.mount_with_ino(mountpoint, path, fs, root_ino)?;
-        dentries.invalidate_dir(mp_dev, mp_ino);
-        let _ = inodes.get_or_insert(root);
+        let mut released = Released::new();
+        let _seeded = {
+            let mut mounts = self.mounts.lock();
+            let mut dentries = self.dentries.lock();
+            let mut inodes = self.inodes.lock();
+            mounts.mount_with_ino(&mountpoint, mp_type, path, &fs, root_ino)?;
+            dentries.invalidate_dir(mp_dev, mp_ino);
+            inodes.get_or_insert(root, &mut released)
+        };
         Ok(())
     }
 
     /// Unmount the filesystem mounted on `(mountpoint_dev, mountpoint_ino)`
     /// and purge its entries from `DentryCache` and `InodeCache`, dropping
-    /// the evicted inodes after the locks are released.
+    /// the evicted inodes and the rest of the mount (its mountpoint and
+    /// path) after the locks are released (#320: the mount's reference to
+    /// its mountpoint may be the last).
     pub fn umount(&self, mountpoint_dev: DevId, mountpoint_ino: Ino) -> Result<Arc<dyn FileSystem>, VfsError> {
-        let (fs, evicted) = {
+        let (record, evicted) = {
             let mut mounts = self.mounts.lock();
             let mut dentries = self.dentries.lock();
             let mut inodes = self.inodes.lock();
-            let fs = mounts.umount(mountpoint_dev, mountpoint_ino)?;
-            let dev = fs.dev_id();
+            let record = mounts.umount(mountpoint_dev, mountpoint_ino)?;
+            let dev = record.fs.dev_id();
             dentries.invalidate_fs(dev);
             dentries.invalidate_dir(mountpoint_dev, mountpoint_ino);
             let evicted = inodes.evict_fs(dev);
-            (fs, evicted)
+            (record, evicted)
         };
         drop(evicted);
+        let MountRecord { fs, parent_mountpoint, mount_path, .. } = record;
+        drop((parent_mountpoint, mount_path));
         Ok(fs)
     }
 
@@ -499,6 +510,19 @@ impl<F: LockFamily> VfsTables<F> {
         self.dentries.lock().snapshot_all()
     }
 
+    /// Run `f` on `InodeCache` under its lock, handing it the [`Released`]
+    /// for what it lets go of: declared before the guard, so it drops after
+    /// it (#320). The single-lock methods go through this; the multi-lock
+    /// ones declare their own `Released` before their guards, for the same
+    /// reason (locals drop in reverse order, on every path out). Only what
+    /// `f` hands the cache is covered: an `Arc` `f` captures and drops
+    /// itself drops under the guard.
+    fn with_inodes<R>(&self, f: impl FnOnce(&mut InodeCache, &mut Released) -> R) -> R {
+        let mut released = Released::new();
+        let mut inodes = self.inodes.lock();
+        f(&mut inodes, &mut released)
+    }
+
     /// Drop the parents of removed directories' records `InodeCache` let go
     /// (#318), with Lock 9 released: a parent dropping can leave its own
     /// record dead, so prune again until nothing is dropped.
@@ -528,6 +552,7 @@ impl<F: LockFamily> Default for VfsTables<F> {
     }
 }
 
+/// The `Released` rule (#320): [`VfsTables::with_inodes`].
 impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
         let root_fs = self.mounts.lock().root_fs().ok_or(VfsError::NoEnt)?;
@@ -600,6 +625,7 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
+        let mut released = Released::new();
         let mounts = self.mounts.lock();
         let mut dentries = self.dentries.lock();
         let mut inodes = self.inodes.lock();
@@ -609,7 +635,7 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
         if !inode.cacheable() {
             return Ok(inode);
         }
-        let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
+        let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen, &mut released)?;
         if !mounts.is_mountpoint(parent_dev, parent_ino) {
             let _ = dentries.insert_if_gen(
                 parent_dev,
@@ -631,6 +657,7 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
         expected_dentry_gen: u64,
         expected_inode_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
+        let mut released = Released::new();
         let mounts = self.mounts.lock();
         let mut dentries = self.dentries.lock();
         let mut inodes = self.inodes.lock();
@@ -640,8 +667,9 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
         if !inode.cacheable() {
             return Ok(inode);
         }
+        // A live entry's clone, never the last reference.
         let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
-        let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
+        let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen, &mut released)?;
         if !was_cached && !mounts.is_mountpoint(parent_dev, parent_ino) {
             let _ = dentries.insert_if_gen(
                 parent_dev,
@@ -699,14 +727,14 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     }
 
     fn inode_get_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<Arc<dyn VfsInode>> {
-        self.inodes.lock().get_if_fresh(dev, ino, since_gen)
+        self.with_inodes(|inodes, released| inodes.get_if_fresh(dev, ino, since_gen, released))
     }
 
     fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
         if !inode.cacheable() {
             return inode;
         }
-        self.inodes.lock().get_or_insert(inode)
+        self.with_inodes(|inodes, released| inodes.get_or_insert(inode, released))
     }
 
     fn inode_get_or_insert_if_mounted(
@@ -716,15 +744,17 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
         mount_id: u64,
         inode: Arc<dyn VfsInode>,
     ) -> Option<Arc<dyn VfsInode>> {
+        let mut released = Released::new();
         let mounts = self.mounts.lock();
         let mut inodes = self.inodes.lock();
         if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
+            // `inode` drops after the guards, a parameter.
             return None;
         }
         if !inode.cacheable() {
             return Some(inode);
         }
-        Some(inodes.get_or_insert(inode))
+        Some(inodes.get_or_insert(inode, &mut released))
     }
 
     fn inode_get_or_insert_if_fresh(
@@ -732,6 +762,7 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
         inode: Arc<dyn VfsInode>,
         since_gen: u64,
     ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
+        let mut released = Released::new();
         let mounts = self.mounts.lock();
         let mut inodes = self.inodes.lock();
         if !mounts.is_dev_mounted(inode.dev_id()) {
@@ -740,15 +771,11 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
         if !inode.cacheable() {
             return Ok(inode);
         }
-        inodes.get_or_insert_if_fresh(inode, since_gen)
+        inodes.get_or_insert_if_fresh(inode, since_gen, &mut released)
     }
 
     fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
         self.inodes.lock().remove(dev, ino)
-    }
-
-    fn inode_remove_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-        self.inodes.lock().remove_if_fresh(dev, ino, since_gen)
     }
 
     fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
@@ -756,11 +783,11 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     }
 
     fn inode_end_removal(&self, dev: DevId, ino: Ino) -> u64 {
-        self.inodes.lock().end_removal(dev, ino)
+        self.with_inodes(|inodes, released| inodes.end_removal(dev, ino, released))
     }
 
     fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool {
-        self.inodes.lock().evict_detached(dev, ino)
+        self.with_inodes(|inodes, released| inodes.evict_detached(dev, ino, released))
     }
 
     fn inode_remove_if_same(&self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
@@ -772,7 +799,7 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     }
 
     fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
-        self.inodes.lock().record_removal_if_absent(dev, ino)
+        self.with_inodes(|inodes, released| inodes.record_removal_if_absent(dev, ino, released))
     }
 
     fn inode_record_removed_dir(&self, dir: &Arc<dyn VfsInode>, parent: &Arc<dyn VfsInode>) {

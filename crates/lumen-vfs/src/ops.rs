@@ -644,7 +644,8 @@ pub fn mkdir_at(
 ///
 /// Serializes under Lock 3 (`FileSystem::with_rename_lock`), invalidates
 /// `DentryCache` immediately, removes the target from `InodeCache` safely via
-/// `inode_remove_if_fresh`, and performs post-mutation `nlink == 0`/`is_detached`
+/// `inode_begin_removal`/`inode_end_removal` around the filesystem's
+/// removal, and performs post-mutation `nlink == 0`/`is_detached`
 /// cleanup so open-unlinked inodes never alias reused inode numbers.
 pub fn unlink_at(
     env: &dyn VfsCacheOps,
