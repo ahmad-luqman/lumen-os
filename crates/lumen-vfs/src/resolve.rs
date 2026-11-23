@@ -247,6 +247,12 @@ pub(crate) fn resolve_and_unify_magic_target(
 
 /// Look up `".."` on `cur` and unify it in `InodeCache` when fresh, with
 /// bounded retries so concurrent unlinks/`ino` reuse never alias a wrong inode.
+///
+/// A removed directory, which its filesystem no longer gives a `..`
+/// (`ENOENT`), has the parent it was removed from, as Linux's `d_parent` of
+/// a deleted dentry (#318): the one `rmdir` or a `rename` over it recorded
+/// (`VfsCacheOps::inode_record_removed_dir`), handed back as it is, the
+/// parent possibly removed in turn.
 fn lookup_dotdot(env: &dyn VfsCacheOps, cur: &Arc<dyn VfsInode>) -> Result<Arc<dyn VfsInode>, VfsError> {
     let mut first_parent: Option<Arc<dyn VfsInode>> = None;
     for attempt in 0..=MAX_INODE_RACE_RETRIES {
@@ -256,6 +262,7 @@ fn lookup_dotdot(env: &dyn VfsCacheOps, cur: &Arc<dyn VfsInode>) -> Result<Arc<d
             Err(VfsError::NoEnt) if attempt > 0 => {
                 return Ok(first_parent.expect("first_parent set before retry"));
             }
+            Err(VfsError::NoEnt) => return env.inode_removed_dir_parent(cur).ok_or(VfsError::NoEnt),
             Err(e) => return Err(e),
         };
         match env.inode_get_or_insert_if_fresh(parent, since_gen) {

@@ -348,6 +348,15 @@ pub trait VfsCacheOps {
     fn inode_remove_if_same(&self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>>;
     fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64;
     fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>>;
+    /// Remember `parent` as the directory `dir` is removed from, for `..`
+    /// from `dir` once its filesystem no longer has its `..` (#318,
+    /// `InodeCache::record_removed_dir`). `rmdir` and a `rename` over a
+    /// directory call it before the filesystem removes `dir`, under its
+    /// rename lock, and [`Self::inode_forget_removed_dir`] if that fails.
+    fn inode_record_removed_dir(&self, dir: &Arc<dyn VfsInode>, parent: &Arc<dyn VfsInode>);
+    fn inode_forget_removed_dir(&self, dir: &Arc<dyn VfsInode>);
+    /// The directory `dir` (this very `Arc`) was removed from, if recorded.
+    fn inode_removed_dir_parent(&self, dir: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>>;
 }
 
 /// The Lock-9 VFS lookup tables (#264): the kernel's (`vfs::KernelVfsTables`,
@@ -472,6 +481,22 @@ impl<F: LockFamily> VfsTables<F> {
     #[cfg(test)]
     pub(crate) fn snapshot_dentries(&self) -> Vec<(DevId, Ino, Vec<u8>, DentryTarget)> {
         self.dentries.lock().snapshot_all()
+    }
+
+    /// Drop the parents of removed directories' records `InodeCache` let go
+    /// (#318), with Lock 9 released: a parent dropping can leave its own
+    /// record dead, so prune again until nothing is dropped.
+    fn drop_pruned(&self, mut dropped: Vec<Arc<dyn VfsInode>>) {
+        while !dropped.is_empty() {
+            drop(dropped);
+            dropped = self.inodes.lock().prune_removed_dirs();
+        }
+    }
+
+    /// How many removed directories' parents `InodeCache` keeps (#318).
+    #[cfg(test)]
+    pub(crate) fn removed_dirs_len(&self) -> usize {
+        self.inodes.lock().removed_dirs_len()
     }
 
     /// Whether a filesystem with `dev` is mounted.
@@ -732,5 +757,29 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
 
     fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
         self.inodes.lock().record_removal_if_absent(dev, ino)
+    }
+
+    fn inode_record_removed_dir(&self, dir: &Arc<dyn VfsInode>, parent: &Arc<dyn VfsInode>) {
+        let dropped = self.inodes.lock().record_removed_dir(dir, Arc::clone(parent));
+        self.drop_pruned(dropped);
+    }
+
+    fn inode_forget_removed_dir(&self, dir: &Arc<dyn VfsInode>) {
+        let dropped = {
+            let mut inodes = self.inodes.lock();
+            let mut dropped = inodes.prune_removed_dirs();
+            dropped.extend(inodes.forget_removed_dir(dir));
+            dropped
+        };
+        self.drop_pruned(dropped);
+    }
+
+    fn inode_removed_dir_parent(&self, dir: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
+        let (parent, dropped) = {
+            let mut inodes = self.inodes.lock();
+            (inodes.removed_dir_parent(dir), inodes.prune_removed_dirs())
+        };
+        self.drop_pruned(dropped);
+        parent
     }
 }

@@ -171,3 +171,11 @@ tests = [
     "ktest:lumen_kernel::linux::exec::missing_interpreter_is_enoent",
     "scenario:test_fs::test_posix_vfs_semantics",
 ]
+
+[[feature]]
+name = "`..` from a removed directory is the directory it was removed from (#318), as Linux's d_parent of a deleted dentry: from a removed cwd, chdir(\"..\") succeeds and getcwd then names the parent, open(\"..\", O_DIRECTORY) opens the parent and open(\"..\", O_CREAT) is -EISDIR, on ext4 and on tmpfs; in lumen-vfs's host tests also from a removed directory held open (detached) or freed, in a mounted filesystem's root (../.. crossing up to /), from a directory a rename replaced, through a parent removed in turn, with a failed rmdir or rename keeping no record (one that removed the directory all the same keeping it) and dead records pruned"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+    "scenario:test_fs::test_posix_vfs_semantics",
+]

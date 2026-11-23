@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::fs::VfsInode;
@@ -18,6 +18,30 @@ pub struct DentryTarget {
 struct CachedInode {
     inode: Arc<dyn VfsInode>,
     inserted_at_gen: u64,
+}
+
+/// A removed directory's parent, as Linux keeps a deleted dentry's
+/// `d_parent` (#318): `..` from a directory no longer in its filesystem
+/// (which has dropped its own `..` with it) still finds the directory it
+/// was removed from.
+///
+/// Keyed by the `Arc` itself, never `(dev, ino)`: a directory removed while
+/// open is detached under a synthetic number and a freed one's number is
+/// reused. The `Weak` keeps the allocation, so its address is never another
+/// inode's while the record lasts; a record whose directory has no strong
+/// reference left is dead and pruned by the next
+/// [`InodeCache::record_removed_dir`] (or [`InodeCache::evict_fs`]).
+struct RemovedDir {
+    dir: Weak<dyn VfsInode>,
+    /// Held strongly, as `d_parent` holds its dentry: the parent stays
+    /// reachable through `..` even if it is removed in turn.
+    parent: Arc<dyn VfsInode>,
+}
+
+impl RemovedDir {
+    fn is(&self, dir: &Arc<dyn VfsInode>) -> bool {
+        core::ptr::addr_eq(self.dir.as_ptr(), Arc::as_ptr(dir))
+    }
 }
 
 /// Active inode cache keyed by `(DevId, Ino)`.
@@ -41,6 +65,7 @@ pub struct InodeCache {
     dev_overflow_gen: BTreeMap<DevId, u64>,
     fs_evict_gen: BTreeMap<DevId, u64>,
     pending_removals: BTreeMap<(DevId, Ino), usize>,
+    removed_dirs: Vec<RemovedDir>,
 }
 
 impl InodeCache {
@@ -67,6 +92,7 @@ impl InodeCache {
             dev_overflow_gen: BTreeMap::new(),
             fs_evict_gen: BTreeMap::new(),
             pending_removals: BTreeMap::new(),
+            removed_dirs: Vec::new(),
         }
     }
 
@@ -391,7 +417,67 @@ impl InodeCache {
                 evicted.push(c.inode);
             }
         }
+        // A removed directory and its parent are on one filesystem (`rmdir`
+        // and `rename` never cross one), so the parent's device is both's.
+        self.removed_dirs.retain(|r| {
+            if r.parent.dev_id() == dev {
+                evicted.push(Arc::clone(&r.parent));
+                false
+            } else {
+                true
+            }
+        });
         evicted
+    }
+
+    /// Remember `parent` as `dir`'s for `..` once `dir` is removed (#318;
+    /// [`RemovedDir`]), replacing any record of `dir` already there, and
+    /// prune the dead records ([`Self::prune_removed_dirs`]). Called before
+    /// the filesystem removes `dir`, under its rename lock (so `dir` can't
+    /// move meanwhile), and undone by [`Self::forget_removed_dir`] if the
+    /// removal fails. Returns the parents of the records it dropped, for the
+    /// caller to drop after releasing Lock 9.
+    pub fn record_removed_dir(&mut self, dir: &Arc<dyn VfsInode>, parent: Arc<dyn VfsInode>) -> Vec<Arc<dyn VfsInode>> {
+        let mut dropped = self.prune_removed_dirs();
+        dropped.extend(self.forget_removed_dir(dir));
+        self.removed_dirs.push(RemovedDir { dir: Arc::downgrade(dir), parent });
+        dropped
+    }
+
+    /// Drop the records whose directory has no strong reference left,
+    /// returning their parents for the caller to drop after releasing Lock
+    /// 9. A parent that was itself a removed directory kept alive only by
+    /// such a record dies with that drop, so its own record is dead only
+    /// afterwards: the caller prunes again until nothing is dropped.
+    pub fn prune_removed_dirs(&mut self) -> Vec<Arc<dyn VfsInode>> {
+        let mut dropped = Vec::new();
+        self.removed_dirs.retain(|r| {
+            if r.dir.strong_count() == 0 {
+                dropped.push(Arc::clone(&r.parent));
+                false
+            } else {
+                true
+            }
+        });
+        dropped
+    }
+
+    /// Drop the record [`Self::record_removed_dir`] made of `dir`, returning
+    /// its parent for the caller to drop after releasing Lock 9.
+    pub fn forget_removed_dir(&mut self, dir: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
+        let at = self.removed_dirs.iter().position(|r| r.is(dir))?;
+        Some(self.removed_dirs.swap_remove(at).parent)
+    }
+
+    /// The directory `dir` was removed from, if a record of it is kept.
+    pub fn removed_dir_parent(&self, dir: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
+        self.removed_dirs.iter().find(|r| r.is(dir)).map(|r| Arc::clone(&r.parent))
+    }
+
+    /// How many removed directories' records are kept, dead ones included.
+    #[cfg(test)]
+    pub(crate) fn removed_dirs_len(&self) -> usize {
+        self.removed_dirs.len()
     }
 
     /// Snapshot all currently cached inodes so `sync()` can release Lock 9

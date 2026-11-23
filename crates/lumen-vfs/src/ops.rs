@@ -726,8 +726,17 @@ pub fn unlink_at(
             env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), name);
             env.dentry_invalidate_dir(old_dev, old_ino);
             let (guard, removed_arc_opt) = InodeRemovalGuard::begin(env, old_dev, old_ino, since_gen);
+            // Its `..` once removed (#318): recorded first, under the rename
+            // lock, so no `..` from it ever finds neither.
+            env.inode_record_removed_dir(&child, &target.parent);
 
             if let Err(err) = target.parent.rmdir(name) {
+                // Kept if the directory is gone all the same (ext4 failing
+                // to undo its disk changes after a write error, or another
+                // `rmdir` winning on a filesystem without a rename lock).
+                if !is_inode_dead(&child) {
+                    env.inode_forget_removed_dir(&child);
+                }
                 let end_gen = guard.finish();
                 if let Some(removed_arc) = removed_arc_opt
                     && !removed_arc.is_detached()
@@ -1062,11 +1071,16 @@ pub fn rename_at2(
         env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), old_name);
         env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), new_name);
 
+        // A directory the rename removes: its `..` once removed (#318), as
+        // `unlink_at`'s `rmdir` records it.
+        let mut overwritten_dir: Option<&Arc<dyn VfsInode>> = None;
         if let Some((ref new_inode, orig_ino, last_link)) = last_link_info {
             if new_inode.inode_type() == InodeType::Dir {
                 let dir_key = (new_inode.dev_id(), orig_ino);
                 env.dentry_invalidate_dir(dir_key.0, dir_key.1);
                 overwritten_dir_key = Some(dir_key);
+                env.inode_record_removed_dir(new_inode, &new_target.parent);
+                overwritten_dir = Some(new_inode);
             }
             if last_link {
                 let (guard, removed_arc) = InodeRemovalGuard::begin(env, new_inode.dev_id(), orig_ino, new_since_gen);
@@ -1075,6 +1089,11 @@ pub fn rename_at2(
         }
 
         if let Err(err) = old_target.parent.rename(old_name, &new_target.parent, new_name, flags) {
+            if let Some(dir) = overwritten_dir
+                && !is_inode_dead(dir)
+            {
+                env.inode_forget_removed_dir(dir);
+            }
             if let Some(pending) = removal_guard {
                 let end_gen = pending.guard.finish();
                 if let Some(removed_arc) = pending.removed_arc

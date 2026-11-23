@@ -2712,6 +2712,15 @@ fn post_mutation_dentry_invalidation_and_fd_ref_sync() {
         fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
             self.inner.inode_record_removal_if_absent(dev, ino)
         }
+        fn inode_record_removed_dir(&self, dir: &Arc<dyn VfsInode>, parent: &Arc<dyn VfsInode>) {
+            self.inner.inode_record_removed_dir(dir, parent)
+        }
+        fn inode_forget_removed_dir(&self, dir: &Arc<dyn VfsInode>) {
+            self.inner.inode_forget_removed_dir(dir)
+        }
+        fn inode_removed_dir_parent(&self, dir: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
+            self.inner.inode_removed_dir_parent(dir)
+        }
     }
 
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
@@ -7056,6 +7065,15 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
             }
             res
         }
+        fn inode_record_removed_dir(&self, dir: &Arc<dyn VfsInode>, parent: &Arc<dyn VfsInode>) {
+            self.inner.inode_record_removed_dir(dir, parent)
+        }
+        fn inode_forget_removed_dir(&self, dir: &Arc<dyn VfsInode>) {
+            self.inner.inode_forget_removed_dir(dir)
+        }
+        fn inode_removed_dir_parent(&self, dir: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
+            self.inner.inode_removed_dir_parent(dir)
+        }
     }
 
     // 1. `reviewer_11` Finding 2 (`ops.rs:118-135`): `O_CREAT | O_EXCL` preempted right before
@@ -8499,10 +8517,170 @@ fn not_a_name_answered_without_the_filesystem() {
         assert_eq!(link_at(env, None, b"/f", Some(&gone), p, false, false).unwrap_err(), VfsError::Exist, "link {at}");
         assert_eq!(open_inode(env, Some(&gone), p, excl, 0o644, 0).unwrap_err(), VfsError::Exist, "O_EXCL {at}");
     }
-    // `.` is the directory itself, found without a lookup. `..` here is the
-    // filesystem's own `..`, which it no longer has: `ENOENT`, where Linux
-    // says `EISDIR` (#318), so left out; the next test tells `.` from `..`.
+    // `.` is the directory itself, found without a lookup; `..` the parent
+    // it was removed from, which the filesystem no longer gives (#318).
     assert_eq!(open_inode(env, Some(&gone), b".", creat, 0o644, 0).unwrap_err(), VfsError::IsDir);
+    assert_eq!(open_inode(env, Some(&gone), b"..", creat, 0o644, 0).unwrap_err(), VfsError::IsDir);
+}
+
+/// Whether `a` and `b` are the same inode.
+fn same_inode(a: &Arc<dyn VfsInode>, b: &Arc<dyn VfsInode>) -> bool {
+    (a.dev_id(), a.ino()) == (b.dev_id(), b.ino())
+}
+
+/// #318: `..` from a removed directory is the directory it was removed
+/// from, as Linux's `d_parent` of a deleted dentry, though its filesystem
+/// no longer has its `..`: `open("..", O_CREAT)` is `EISDIR`,
+/// `open("..", O_DIRECTORY)` opens the parent, `chdir("..")` (a lookup and
+/// an open reference) succeeds, and `../..` and `../<name>` go on from
+/// there. For a directory freed by its removal and one held open (detached
+/// under another number), in a directory and in a mounted filesystem's
+/// root (`../..` crossing up to `/`).
+#[test]
+fn dotdot_from_a_removed_directory_is_its_parent() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = env.as_ref();
+    let root = resolve_path(env, None, b"/", ResolveFlags::default()).unwrap().inode;
+    let p = mkdir_at(env, None, b"/p", 0o755, 0).unwrap();
+    open_inode(env, None, b"/p/s", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let mp = mkdir_at(env, None, b"/m", 0o755, 0).unwrap();
+    let mounted = FreshArcReusingFs::new(DevId::makedev(0, 74), "fresh-tmpfs", false, true);
+    env.mount(mp, "/m", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
+    let m = resolve_path(env, None, b"/m", ResolveFlags::default()).unwrap().inode;
+    open_inode(env, None, b"/m/s", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+
+    let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY);
+    let dir_flags = OpenFlags(OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY);
+    let chdir = ResolveFlags { follow_final: true, empty_path: false, require_dir: true };
+    // (the directory to remove, its parent, held open while removed)
+    let rows: [(&[u8], &Arc<dyn VfsInode>, bool); 4] =
+        [(b"/p/gone", &p, false), (b"/p/gone", &p, true), (b"/m/gone", &m, false), (b"/m/gone", &m, true)];
+    for (path, parent, held) in rows {
+        let at = format!("{} held {held}", Escaped(path));
+        let gone = mkdir_at(env, None, path, 0o755, 0).unwrap();
+        let guard = held.then(|| OpenGuard::try_new(Arc::clone(&gone)).unwrap());
+        let ino = gone.ino();
+        unlink_at(env, None, path, true).unwrap();
+        assert_eq!(gone.is_detached(), held, "{at}");
+        assert_eq!(gone.ino() != ino, held, "{at}: a detached directory's new number");
+        assert_eq!(gone.lookup(b"..").unwrap_err(), VfsError::NoEnt, "{at}: the filesystem's own `..`");
+
+        assert_eq!(open_inode(env, Some(&gone), b"..", creat, 0o644, 0).unwrap_err(), VfsError::IsDir, "{at}");
+        let (opened, _) = open_inode(env, Some(&gone), b"..", dir_flags, 0, 0).unwrap();
+        assert!(same_inode(&opened, parent), "{at}: O_DIRECTORY opened another directory");
+        let cwd = resolve_path(env, Some(&gone), b"..", chdir).unwrap().inode;
+        assert!(Arc::ptr_eq(&cwd, parent), "{at}: chdir found another directory");
+        drop(OpenGuard::try_new(cwd).unwrap());
+        let up = resolve_path(env, Some(&gone), b"../..", chdir).unwrap().inode;
+        assert!(same_inode(&up, &root), "{at}: `../..` isn't /");
+        let s = resolve_path(env, Some(&gone), b"../s", ResolveFlags::default()).unwrap().inode;
+        assert_eq!(s.inode_type(), InodeType::File, "{at}");
+        drop(guard);
+    }
+}
+
+/// #318: a directory a `rename` replaces is removed as by `rmdir`: `..`
+/// from it is the directory it was replaced in. A rename that fails (onto a
+/// directory not empty) and a failed `rmdir` keep no record of a parent,
+/// and the directory's own `..` is the filesystem's again.
+#[test]
+fn dotdot_from_a_directory_a_rename_replaced() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = env.as_ref();
+    let a = mkdir_at(env, None, b"/a", 0o755, 0).unwrap();
+    mkdir_at(env, None, b"/b", 0o755, 0).unwrap();
+    mkdir_at(env, None, b"/b/src", 0o755, 0).unwrap();
+    let victim = mkdir_at(env, None, b"/a/victim", 0o755, 0).unwrap();
+    let full = mkdir_at(env, None, b"/a/full", 0o755, 0).unwrap();
+    mkdir_at(env, None, b"/a/full/x", 0o755, 0).unwrap();
+
+    assert_eq!(rename_at2(env, None, b"/b/src", None, b"/a/full", RenameFlags(0)).unwrap_err(), VfsError::NotEmpty);
+    assert!(env.inode_removed_dir_parent(&full).is_none(), "a failed rename kept a record");
+    fs.inner.hooks.lock().unwrap().rmdir_override_err.insert(b"victim".to_vec(), VfsError::Busy);
+    assert_eq!(unlink_at(env, None, b"/a/victim", true).unwrap_err(), VfsError::Busy);
+    assert!(env.inode_removed_dir_parent(&victim).is_none(), "a failed rmdir kept a record");
+
+    rename_at2(env, None, b"/b/src", None, b"/a/victim", RenameFlags(0)).unwrap();
+    assert_eq!(victim.lookup(b"..").unwrap_err(), VfsError::NoEnt);
+    let up = resolve_path(env, Some(&victim), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up, &a), "`..` from the replaced directory isn't /a");
+}
+
+/// #318: an `rmdir` that fails though the directory is gone (as ext4's when
+/// undoing its disk changes fails after a write error) keeps the record:
+/// `..` from the directory is still its parent.
+#[test]
+fn dotdot_from_a_directory_a_failed_rmdir_removed() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = env.as_ref();
+    let p = mkdir_at(env, None, b"/p", 0o755, 0).unwrap();
+    let gone = mkdir_at(env, None, b"/p/gone", 0o755, 0).unwrap();
+    // Inside the filesystem's `rmdir`: the directory removed, then the call
+    // made to fail.
+    let (dir, fs2) = (Arc::clone(&p), Arc::clone(&fs));
+    let hook = alloc::boxed::Box::new(move || {
+        dir.rmdir(b"gone").unwrap();
+        fs2.inner.hooks.lock().unwrap().rmdir_override_err.insert(b"gone".to_vec(), VfsError::Io);
+    });
+    fs.inner.hooks.lock().unwrap().pre_rmdir.insert(b"gone".to_vec(), hook);
+    assert_eq!(unlink_at(env, None, b"/p/gone", true).unwrap_err(), VfsError::Io);
+    assert_eq!(gone.lookup(b"..").unwrap_err(), VfsError::NoEnt);
+    let up = resolve_path(env, Some(&gone), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up, &p), "`..` from a directory a failed rmdir removed isn't its parent");
+}
+
+/// #318: `..` from a removed directory whose parent was removed after it
+/// is that parent (held as `d_parent` holds its dentry), and `../..` the
+/// parent's own parent; a record whose directory is gone is pruned by the
+/// next removal, with those its parents' drops leave dead, and unmounting
+/// drops the filesystem's records.
+#[test]
+fn removed_directories_parents_kept_while_needed() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let x = mkdir_at(env.as_ref(), None, b"/x", 0o755, 0).unwrap();
+    let y = mkdir_at(env.as_ref(), None, b"/x/y", 0o755, 0).unwrap();
+    let w = mkdir_at(env.as_ref(), None, b"/x/y/w", 0o755, 0).unwrap();
+    for path in [&b"/x/y/w"[..], b"/x/y", b"/x"] {
+        unlink_at(env.as_ref(), None, path, true).unwrap();
+    }
+    let up = resolve_path(env.as_ref(), Some(&w), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up, &y), "`..` isn't the removed parent");
+    let up2 = resolve_path(env.as_ref(), Some(&w), b"../..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up2, &x), "`../..` isn't the removed grandparent");
+    let root = resolve_path(env.as_ref(), Some(&w), b"../../..", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(root.ino(), fs.root_inode().ino());
+    let records = |env: &TestTables| env.removed_dirs_len();
+    assert_eq!(records(&env), 3);
+
+    // `w` gone: `y`, kept by `w`'s record alone, goes with it, and then
+    // `x`; the next removal prunes all three records.
+    drop((up, up2, w, y, x));
+    mkdir_at(env.as_ref(), None, b"/z", 0o755, 0).unwrap();
+    unlink_at(env.as_ref(), None, b"/z", true).unwrap();
+    assert_eq!(records(&env), 1, "dead records outlived a removal");
+
+    let mp = mkdir_at(env.as_ref(), None, b"/m", 0o755, 0).unwrap();
+    let mounted = FreshArcReusingFs::new(DevId::makedev(0, 75), "fresh-tmpfs", false, true);
+    env.mount(Arc::clone(&mp), "/m", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
+    let held = mkdir_at(env.as_ref(), None, b"/m/d", 0o755, 0).unwrap();
+    unlink_at(env.as_ref(), None, b"/m/d", true).unwrap();
+    assert_eq!(records(&env), 1, "the `/z` record pruned, `/m/d`'s kept");
+    // A `..` that takes a record prunes the dead ones too.
+    let q = mkdir_at(env.as_ref(), None, b"/q", 0o755, 0).unwrap();
+    unlink_at(env.as_ref(), None, b"/q", true).unwrap();
+    drop(q);
+    assert_eq!(records(&env), 2);
+    let m = resolve_path(env.as_ref(), Some(&held), b"..", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(m.ino(), mounted.root_inode().ino());
+    assert_eq!(records(&env), 1, "a `..` from a removed directory kept a dead record");
+    drop(m);
+    env.umount(mp.dev_id(), mp.ino()).unwrap();
+    assert_eq!(records(&env), 0, "unmounting kept the filesystem's records");
+    assert_eq!(resolve_path(env.as_ref(), Some(&held), b"..", ResolveFlags::default()).unwrap_err(), VfsError::NoEnt);
 }
 
 /// #309: `open(O_CREAT)` on `.` or `..` opens the directory that one names
