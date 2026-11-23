@@ -1277,6 +1277,88 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn page_cache_write_from_refuses_a_page_the_cache_filled_up_for() {
+        // `fill` may sleep (a disk read) or be preempted while another
+        // thread adds pages, so the insert asks the hard cap again: a page
+        // made while the cache reached it is refused all the same (it is
+        // dirty when inserted), `NoSpc` on the first page and a short count
+        // after a cached one. Here `fill` lowers the limit itself.
+        use crate::{kassert, kassert_eq};
+        let mut pc = PageCache::new_ext4();
+        pc.insert_new(0, CachePage::new_shared().map_err(|_| "frame")?).map_err(|_| "insert")?;
+        let mut fills = 0usize;
+        let mut fill = |_: &PageSpan| {
+            fills += 1;
+            set_ext4_limits_for_test(Some((usize::MAX, 0))); // the cache filled meanwhile
+            CachePage::new_shared()
+        };
+        let data = [0x5a; 16];
+        let size = 3 * PAGE_SIZE as u64;
+        HARD_LIMIT_WARNED.store(false, Ordering::Release); // one warning, as for the tests above
+        let first = pc.write_from(PAGE_SIZE as u64, &data[..10], size, &mut fill);
+        set_ext4_limits_for_test(None);
+        let spanning = pc.write_from(PAGE_SIZE as u64 - 6, &data, size, &mut fill);
+        set_ext4_limits_for_test(None);
+        kassert_eq!(first, Err(VfsError::NoSpc));
+        kassert_eq!(spanning, Ok(6)); // the cached page's part
+        kassert_eq!(fills, 2); // past the early check both times
+        kassert!(pc.get(1).is_none());
+        kassert_eq!(pc.len(), 1);
+        Ok(())
+    }
+);
+
+/// `write_at` over a file's cached pages on `root`'s filesystem (through
+/// [`PageCache::write_from`]): an overwrite inside the file, at an offset
+/// inside a page, keeps the rest of that page (it is no shrink, and zeroes
+/// no tail); and a write starting past the end zeroes the old last page's
+/// bytes past the end, where a mapping stored, so the gap it opens reads
+/// as zeros. With `ext4`, the first file's pages are written back, dropped
+/// and read in again first: the pages a read loads stay cached.
+#[cfg(feature = "ktest")]
+fn check_writes_over_cached_pages(root: &Arc<dyn VfsInode>, ext4: bool) -> Result<(), &'static str> {
+    use crate::{kassert, kassert_eq};
+    use ktest_files::{file, pattern, read, reclaim_ext4};
+    let cached = |f: &Arc<dyn VfsInode>| page_cache_lock(&**f).map(|l| l.lock().len()).ok_or("no page cache");
+    let mut want = pattern(10_000, 3);
+    let f = file(root, "over.bin", &want)?;
+    if ext4 {
+        kassert_eq!(reclaim_ext4(&f)?, 0);
+        kassert!(read(&f, 0, want.len())? == want);
+        kassert_eq!(cached(&f)?, 3);
+    }
+    kassert_eq!(cached(&f)?, 3); // page 0 among them: the overwrite's
+    kassert_eq!(f.write_at(100, b"xy").map_err(|_| "overwrite")?, 2);
+    want[100..102].copy_from_slice(b"xy");
+    kassert!(read(&f, 0, want.len())? == want);
+
+    // A file of a page and 100 bytes; a store through a mapping at 200 of
+    // its page 1 (past the end); then a write at a page and 1000.
+    let p = PAGE_SIZE as u64;
+    let g = file(root, "tail.bin", &pattern(PAGE_SIZE + 100, 5))?;
+    mmap_page(&g, 1).map_err(|_| "map")?.page().write_bytes(200, b"junk");
+    kassert_eq!(g.write_at(p + 1000, b"z").map_err(|_| "write past the end")?, 1);
+    let back = read(&g, p + 100, 901)?;
+    kassert!(back[..900].iter().all(|&b| b == 0));
+    kassert_eq!(back[900], b'z');
+    Ok(())
+}
+
+crate::ktest!(
+    fn page_cache_tmpfs_writes_keep_their_page_and_zero_a_stale_tail() {
+        let vol = ktest_files::TmpfsVolume::new(184, 16 * PAGE_SIZE);
+        check_writes_over_cached_pages(&vol.root, false)
+    }
+);
+
+crate::ktest!(
+    fn page_cache_ext4_writes_keep_their_page_and_zero_a_stale_tail() {
+        let vol = ktest_files::Ext4Volume::new(185)?;
+        check_writes_over_cached_pages(&vol.root, true)
+    }
+);
+
+crate::ktest!(
     fn mmap_page_refuses_inodes_of_other_filesystems() {
         // Only ext4's and tmpfs's regular files have pages to map: a devfs
         // device and a procfs file (a regular file, but not cached) don't.
