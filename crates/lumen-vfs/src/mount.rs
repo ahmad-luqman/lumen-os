@@ -350,7 +350,8 @@ pub trait VfsCacheOps {
     fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>>;
     /// Remember `parent` as the directory `dir` is removed from, for `..`
     /// from `dir` once its filesystem no longer has its `..` (#318,
-    /// `InodeCache::record_removed_dir`), and prune the dead records.
+    /// `InodeCache::record_removed_dir`), and prune `dir`'s filesystem's
+    /// dead records.
     /// `rmdir` and a `rename` over a directory call it before the
     /// filesystem removes `dir`, under its rename lock (ext4's and
     /// tmpfs's), and [`Self::inode_forget_removed_dir`] if that fails with
@@ -492,10 +493,10 @@ impl<F: LockFamily> VfsTables<F> {
     /// Drop the parents of removed directories' records `InodeCache` let go
     /// (#318), with Lock 9 released: a parent dropping can leave its own
     /// record dead, so prune again until nothing is dropped.
-    fn drop_pruned(&self, mut dropped: Vec<Arc<dyn VfsInode>>) {
+    fn drop_pruned(&self, mut dropped: Vec<Arc<dyn VfsInode>>, only: Option<DevId>) {
         while !dropped.is_empty() {
             drop(dropped);
-            dropped = self.inodes.lock().prune_removed_dirs();
+            dropped = self.inodes.lock().prune_removed_dirs(only);
         }
     }
 
@@ -767,7 +768,7 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
 
     fn inode_record_removed_dir(&self, dir: &Arc<dyn VfsInode>, parent: &Arc<dyn VfsInode>) {
         let dropped = self.inodes.lock().record_removed_dir(dir, Arc::clone(parent));
-        self.drop_pruned(dropped);
+        self.drop_pruned(dropped, Some(dir.dev_id()));
     }
 
     fn inode_forget_removed_dir(&self, dir: &Arc<dyn VfsInode>) {
@@ -779,9 +780,9 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     fn inode_removed_dir_parent(&self, dir: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
         let (parent, dropped) = {
             let mut inodes = self.inodes.lock();
-            (inodes.removed_dir_parent(dir), inodes.prune_removed_dirs())
+            (inodes.removed_dir_parent(dir), inodes.prune_removed_dirs(None))
         };
-        self.drop_pruned(dropped);
+        self.drop_pruned(dropped, None);
         parent
     }
 }

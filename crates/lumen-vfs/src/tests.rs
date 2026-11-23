@@ -8718,12 +8718,13 @@ fn removed_directories_parents_kept_while_needed() {
     env.mount(Arc::clone(&mp), "/m", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
     let held = mkdir_at(env, None, b"/m/d", 0o755, 0).unwrap();
     unlink_at(env, None, b"/m/d", true).unwrap();
-    assert_eq!(tables.removed_dirs_len(), 1, "the `/z` record pruned, `/m/d`'s kept");
-    // A `..` its filesystem answers `ENOENT` prunes the dead ones too.
+    assert_eq!(tables.removed_dirs_len(), 2, "a removal on /m pruned the root filesystem's `/z` record");
+    // A `..` its filesystem answers `ENOENT` prunes the dead ones too, on
+    // every filesystem.
     let q = mkdir_at(env, None, b"/q", 0o755, 0).unwrap();
     unlink_at(env, None, b"/q", true).unwrap();
     drop(q);
-    assert_eq!(tables.removed_dirs_len(), 2);
+    assert_eq!(tables.removed_dirs_len(), 2, "`/z`'s record not pruned by `/q`'s removal");
     let m = dotdot(env, &held).unwrap();
     assert_eq!(m.ino(), mounted.root_inode().ino());
     assert_eq!(tables.removed_dirs_len(), 1, "a `..` from a removed directory kept a dead record");
@@ -8915,7 +8916,16 @@ fn removed_directories_pruned_parents_dropped_outside_lock9() {
     env.mount(mp, "/m", Arc::clone(&mfs) as Arc<dyn FileSystem>).unwrap();
     let under = || mfs.inner.handle_drops_under_lock9.load(Ordering::Relaxed);
     let drops = || mfs.inner.handle_drops.load(Ordering::Relaxed);
-    // Pruned by a record on the root fs: /m/x and /m/x/y kept only by the records below them.
+    // What an `rmdir` on /m drops under Lock 9 by itself, with nothing to
+    // prune (the cases #320 lists): the same again below, with records to
+    // prune.
+    mkdir_at(env, None, b"/m/c", 0o755, 0).unwrap();
+    let u = under();
+    unlink_at(env, None, b"/m/c", true).unwrap();
+    let rmdir_alone = under() - u;
+    // Pruned by a record on the same filesystem, never on another (whose
+    // rename lock it holds): /m/x and /m/x/y kept only by the records below
+    // them.
     let x = mkdir_at(env, None, b"/m/x", 0o755, 0).unwrap();
     let y = mkdir_at(env, None, b"/m/x/y", 0o755, 0).unwrap();
     let w = mkdir_at(env, None, b"/m/x/y/w", 0o755, 0).unwrap();
@@ -8924,10 +8934,14 @@ fn removed_directories_pruned_parents_dropped_outside_lock9() {
     }
     drop((w, y, x));
     mkdir_at(env, None, b"/z", 0o755, 0).unwrap();
+    mkdir_at(env, None, b"/m/z", 0o755, 0).unwrap();
     let (u0, d0) = (under(), drops());
     unlink_at(env, None, b"/z", true).unwrap();
-    assert!(drops() > d0, "nothing dropped");
-    assert_eq!(under(), u0, "a pruned parent dropped under Lock 9 (record)");
+    assert_eq!(drops(), d0, "a removal on the root filesystem dropped the mounted one's inodes");
+    let records = tables.removed_dirs_len();
+    unlink_at(env, None, b"/m/z", true).unwrap();
+    assert_eq!(tables.removed_dirs_len(), records - 3 + 1, "the chain's records not pruned");
+    assert_eq!(under() - u0, rmdir_alone, "a pruned parent dropped under Lock 9 (record)");
     // Pruned by a `..` on the root fs: /m/r kept only by q's dead record.
     let held = mkdir_at(env, None, b"/h", 0o755, 0).unwrap();
     unlink_at(env, None, b"/h", true).unwrap();

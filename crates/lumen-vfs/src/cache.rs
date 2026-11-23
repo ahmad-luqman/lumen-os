@@ -30,8 +30,9 @@ struct CachedInode {
 /// reused. The `Weak` keeps the allocation, so its address is never another
 /// inode's while the record lasts. A record whose directory has no strong
 /// reference left is dead, and dropped by [`InodeCache::prune_removed_dirs`]
-/// (which `VfsTables` runs on each new record and each `..` that falls back
-/// to the records); [`InodeCache::evict_fs`] drops a filesystem's records,
+/// (which `VfsTables` runs on each new record, for that filesystem's
+/// records, and on each `..` that falls back to the records, for all);
+/// [`InodeCache::evict_fs`] drops a filesystem's records,
 /// live or dead.
 struct RemovedDir {
     dir: Weak<dyn VfsInode>,
@@ -440,7 +441,9 @@ impl InodeCache {
 
     /// Remember `parent` as `dir`'s for `..` once `dir` is removed (#318;
     /// [`RemovedDir`]), replacing any record of `dir` already there, and
-    /// prune the dead records ([`Self::prune_removed_dirs`]). Called before
+    /// prune `dir`'s filesystem's dead records ([`Self::prune_removed_dirs`];
+    /// only its own, as the caller holds its rename lock: another
+    /// filesystem's inodes never drop under it). Called before
     /// the filesystem removes `dir`, under its rename lock (ext4's and
     /// tmpfs's; so `dir` can't move meanwhile), and undone by
     /// [`Self::forget_removed_dir`] if the removal fails with `dir` still
@@ -448,7 +451,7 @@ impl InodeCache {
     /// caller to drop after releasing Lock 9.
     #[must_use = "the dropped records' parents go after Lock 9 is released"]
     pub fn record_removed_dir(&mut self, dir: &Arc<dyn VfsInode>, parent: Arc<dyn VfsInode>) -> Vec<Arc<dyn VfsInode>> {
-        let mut dropped = self.prune_removed_dirs();
+        let mut dropped = self.prune_removed_dirs(Some(dir.dev_id()));
         dropped.extend(self.forget_removed_dir(dir));
         self.removed_dirs.push(RemovedDir { dir: Arc::downgrade(dir), parent });
         dropped
@@ -458,12 +461,14 @@ impl InodeCache {
     /// returning their parents for the caller to drop after releasing Lock
     /// 9. A parent that was itself a removed directory kept alive only by
     /// such a record dies with that drop, so its own record is dead only
-    /// afterwards: the caller prunes again until nothing is dropped.
+    /// afterwards: the caller prunes again until nothing is dropped. With
+    /// `only`, only that filesystem's records (a removed directory and its
+    /// parent are on one, so a chain never leaves it).
     #[must_use = "the dropped records' parents go after Lock 9 is released"]
-    pub fn prune_removed_dirs(&mut self) -> Vec<Arc<dyn VfsInode>> {
+    pub fn prune_removed_dirs(&mut self, only: Option<DevId>) -> Vec<Arc<dyn VfsInode>> {
         let mut dropped = Vec::new();
         self.removed_dirs.retain(|r| {
-            if r.dir.strong_count() == 0 {
+            if r.dir.strong_count() == 0 && only.is_none_or(|dev| r.parent.dev_id() == dev) {
                 dropped.push(Arc::clone(&r.parent));
                 false
             } else {

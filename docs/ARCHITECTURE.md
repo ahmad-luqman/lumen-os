@@ -5728,11 +5728,14 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
       filesystem has for it (ext4 and tmpfs keep one per live inode;
       `umount` drops the records with the cache).
     - A record whose directory has no strong reference left is dead: each
-      new record and each `..` that falls back to the records prune the
-      dead ones (again after their parents drop, outside the lock, since a
-      parent kept only by such a record leaves its own record dead), so a
-      dead record keeps its parent until the next of those. `umount` drops
-      the filesystem's records with its inodes.
+      new record prunes its filesystem's dead ones (only its own: the
+      caller holds that filesystem's rename lock, and another
+      filesystem's inodes never drop under it) and each `..` that falls
+      back to the records prunes every filesystem's (again after their
+      parents drop, outside the lock, since a parent kept only by such a
+      record leaves its own record dead), so a dead record keeps its
+      parent until the next of those. `umount` drops the filesystem's
+      records with its inodes.
     - `getcwd` (`compute_cwd_path`) checks each directory it names (the
       cwd, then each ancestor) is still linked once named: one removed
       during the walk (the cwd, or an ancestor the cwd moved out of first)
