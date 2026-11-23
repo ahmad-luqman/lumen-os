@@ -141,6 +141,7 @@ mod tests {
         assert!(!b.raise_floor(1, Some(4), 3));
         assert!(!b.raise_floor(1, None, 0));
         assert_eq!((b.floor(1), b.ceiling(1)), (0, None));
+        assert!(b.bounds.is_empty()); // not even a trivial bound for an unreadable disk
         assert!(b.raise_floor(1, None, 3));
         assert_eq!(b.floor(1), 3);
         assert!(!b.raise_floor(1, None, 2)); // lower: unchanged
@@ -196,6 +197,14 @@ mod tests {
         assert_eq!(b.assumed(1), Some(3));
         b.reconcile(1, None, 4);
         assert_eq!(b.assumed(1), Some(4));
+        // A floor below a ceiling: the floor, which `apply` still raises to
+        // and the ceiling still caps.
+        b.reconcile(2, None, 5);
+        b.clear_floor(2);
+        b.raise_floor(2, Some(1), 3);
+        assert_eq!((b.floor(2), b.ceiling(2)), (3, Some(5)));
+        assert_eq!(b.assumed(2), Some(3));
+        assert_eq!((b.apply(2, 1), b.apply(2, 9)), (3, 5));
     }
 
     /// The kernel's two maps before `NlinkBounds` (`Ext4FsInner`'s

@@ -1,11 +1,11 @@
-//! The vfs ktests: the `ext4plus` smoke check, the ext4 adapter over the
 //! The ktests of `vfs/mod.rs`'s code (`vfs/ext4.rs` and `vfs/page_cache.rs`
 //! keep their own): the `ext4plus` smoke check, the ext4 adapter over the
 //! page cache, `/tmp`, `/dev` and `/proc`, tmpfs's quota, `sync`, global
 //! reclaim and recovery from injected I/O errors.
 //!
 //! `MemBlkDev` stays in `vfs/mod.rs`: the `vfs/ext4.rs` and
-//! `vfs/page_cache.rs` ktests use it too.
+//! `vfs/page_cache.rs` ktests use it too. The ext4 mounts come from
+//! `ext4::ktest_util` (`Mnt`, `mount`, `remount_ro`).
 
 use super::*;
 use ext4::ktest_util::{Mnt, mount, mount_ro_image, remount_ro};
@@ -28,7 +28,6 @@ crate::ktest!(
         use lumen_vfs::OpenFile;
 
         let Mnt { cache, tables, .. } = mount(build_minimal_ext4_image_blocks(256), 10)?;
-        let mem_dev = &cache.dev;
 
         // 1. Write-back PageCache + OpenFile<KernelVfsLock<u64>> + truncate shrink tail zeroing + sync.
         let (f, path_str) = open_inode(
@@ -54,7 +53,7 @@ crate::ktest!(
         payload[..10].copy_from_slice(b"0123456789");
         f.write_at(0, &payload).map_err(|_| "write tail.bin")?;
         f.sync(false).map_err(|_| "sync tail.bin")?;
-        kassert!(mem_dev.0.flushed.load(core::sync::atomic::Ordering::Acquire));
+        kassert!(cache.dev.0.flushed.load(core::sync::atomic::Ordering::Acquire));
 
         // Shrink to 100 (partial page 0) -> tail [100..4096) zeroed on disk too.
         f.truncate(100).map_err(|_| "truncate shrink")?;
@@ -156,7 +155,7 @@ crate::ktest!(
         kassert_eq!(moved_back.inode.inode_type(), InodeType::File);
 
         // Read-only mount check.
-        let ro_fs = mount_ro_image(mem_dev.0.data.lock().clone(), 11)?;
+        let ro_fs = mount_ro_image(cache.dev_bytes(), 11)?;
         kassert!(ro_fs.read_only());
 
         // Stale unlinked inode with open_count == 0 returns NoEnt (not freed disk reuse).
@@ -413,26 +412,39 @@ crate::ktest!(
         // Reclaim walks each registered ext4 filesystem's live inodes, not
         // the VFS's inode cache: a file made and written through the
         // filesystem alone, never looked up by path, gives its pages back
-        // too, written back first. `base` as in the test above.
+        // too, written back first. Two volumes, so that reclaiming down to
+        // `base` (as in the test above) needs every registered filesystem,
+        // not just one.
         use crate::{kassert, kassert_eq};
+        use ext4::ktest_util::read_all;
         let base = page_cache::ext4_cached_pages();
-        let m = mount(build_minimal_ext4_image_blocks(256), 98)?;
-        EXT4_FILESYSTEMS.lock().push(Arc::clone(&m.fs));
+        let vols = [mount(build_minimal_ext4_image_blocks(256), 98)?, mount(build_minimal_ext4_image_blocks(256), 96)?];
+        for m in &vols {
+            EXT4_FILESYSTEMS.lock().push(Arc::clone(&m.fs));
+        }
         let result = (|| -> Result<(), &'static str> {
-            let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
-            let data = ext4::ktest_util::pattern(4 * page_cache::PAGE_SIZE, 7);
-            kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
-            kassert!(page_cache::ext4_cached_pages() >= base + 4);
-            kassert!(snapshot_cached_inodes().iter().all(|i| i.lock_id() != f.lock_id()));
+            let mut files = Vec::new();
+            for (seed, m) in (7..).zip(&vols) {
+                let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
+                let data = ext4::ktest_util::pattern(4 * page_cache::PAGE_SIZE, seed);
+                kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
+                kassert!(snapshot_cached_inodes().iter().all(|i| i.lock_id() != f.lock_id()));
+                files.push((f, data));
+            }
+            kassert!(page_cache::ext4_cached_pages() >= base + 8);
             page_cache::reclaim_ext4_to_target(base);
             kassert!(page_cache::ext4_cached_pages() <= base);
-            let ro = remount_ro(&m, 97)?;
-            let on_disk = ro.root_inode().lookup(b"f").map_err(|_| "ro lookup")?;
-            kassert_eq!(ext4::ktest_util::read_all(&on_disk)?, data);
-            kassert_eq!(read_all_inode(&f).map_err(|_| "read back")?, data);
+            for ((m, ro_minor), (f, data)) in vols.iter().zip([97, 88]).zip(&files) {
+                let ro = remount_ro(m, ro_minor)?;
+                let on_disk = ro.root_inode().lookup(b"f").map_err(|_| "ro lookup")?;
+                kassert_eq!(&read_all(&on_disk)?, data);
+                kassert_eq!(&read_all(f)?, data);
+            }
             Ok(())
         })();
-        EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != m.fs.dev_id());
+        for m in &vols {
+            EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != m.fs.dev_id());
+        }
         result
     }
 );
@@ -506,7 +518,6 @@ crate::ktest!(
         use core::sync::atomic::Ordering;
 
         let Mnt { cache: fault_cache, fs, tables, .. } = mount(build_minimal_ext4_image_blocks(256), 13)?;
-        let mem_dev = &fault_cache.dev;
 
         // 1. Create a file and write 2 dirty pages in PageCache without syncing yet.
         let (f, _) = open_inode(
@@ -570,7 +581,7 @@ crate::ktest!(
         drop(w_f);
 
         // 5. Verify persisted bytes on a fresh read-only mount of the backing image.
-        let ro_fs = mount_ro_image(mem_dev.0.data.lock().clone(), 14)?;
+        let ro_fs = mount_ro_image(fault_cache.dev_bytes(), 14)?;
         let ro_root = ro_fs.root_inode();
         let ro_dirty = ro_root.lookup(b"dirty_err.bin").map_err(|_| "ro lookup dirty_err")?;
         kassert_eq!(read_all_inode(&ro_dirty).map_err(|_| "ro read dirty_err")?, payload);
@@ -587,7 +598,6 @@ crate::ktest!(
         use core::sync::atomic::Ordering;
 
         let Mnt { cache: fault_cache, fs, tables, .. } = mount(build_minimal_ext4_image_blocks(256), 15)?;
-        let mem_dev = &fault_cache.dev;
 
         // 1. truncate shrink under fail_reads and fail_writes preserves meta.size and dirty PageCache bytes.
         let (tf, _) = open_inode(
@@ -754,7 +764,7 @@ crate::ktest!(
 
         // 4. Verify persisted truncated prefix and renamed file on fresh RO mount.
         fs.sync().map_err(|_| "final fs.sync")?;
-        let ro_fs = mount_ro_image(mem_dev.0.data.lock().clone(), 16)?;
+        let ro_fs = mount_ro_image(fault_cache.dev_bytes(), 16)?;
         let ro_root = ro_fs.root_inode();
         let ro_trunc = ro_root.lookup(b"trunc_err.bin").map_err(|_| "ro lookup trunc_err")?;
         kassert_eq!(read_all_inode(&ro_trunc).map_err(|_| "ro read trunc_err")?, payload_2[..100]);
