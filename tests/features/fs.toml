@@ -305,3 +305,10 @@ tests = [
     "cargo:lumen-vfs",
     "scenario:test_fs::test_posix_vfs_semantics",
 ]
+
+[[feature]]
+name = "The VFS's Lock-9 tables never drop an inode or filesystem Arc they let go of while holding a table (#320): umount drops the mountpoint it unmounts after releasing them, a refused mount (no root mounted, a mountpoint that isn't a directory, a filesystem or a mountpoint already mounted) or mount_root drops the Arcs it was handed after them, mount asks its mountpoint's type before taking them, and an inode a get_or_insert path unifies with the cached one (mount's and mount_root's seeded root too), an inode inode_get_or_insert_if_mounted refuses, or a stale (detached) entry a probe evicts, drops after them, through every VfsCacheOps method that can; a second Arc for one Released panics rather than drop the first (lumen-vfs's host tests, on a filesystem handing out a fresh Arc per lookup)"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+]
