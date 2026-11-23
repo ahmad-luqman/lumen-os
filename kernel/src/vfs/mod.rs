@@ -279,6 +279,11 @@ pub fn init() {
 /// (`used` and `limit`, in bytes; `-` for any other filesystem): with them
 /// an `ENOSPC` on `/tmp` can be checked against what its files take (#324).
 pub fn mount_table() -> pipe::Table {
+    mount_table_of(&TABLES)
+}
+
+/// [`mount_table`] over `tables` (the ktests' own tables too).
+pub(crate) fn mount_table_of(tables: &KernelVfsTables) -> pipe::Table {
     const COLUMNS: [Column; 6] = [
         Column::new("target", Kind::Text, Align::Left, 6),
         Column::new("fs", Kind::Text, Align::Left, 6),
@@ -290,13 +295,20 @@ pub fn mount_table() -> pipe::Table {
     let mut t = pipe::Table::new(&COLUMNS);
     // One snapshot, taken under Lock 9; each filesystem is asked after it
     // is released.
-    for (m, fs) in TABLES.mounts_with_fs() {
+    for (m, fs) in tables.mounts_with_fs() {
         let quota = tmpfs::quota_use(fs.as_ref());
         t.push(vec![
             Value::Text(m.mount_path),
             sysinfo::text(m.fs_name),
             Value::Text(format!("{}", m.dev_id)),
-            sysinfo::text(if m.read_only { "ro" } else { "rw" }),
+            // An ext4 volume errored read-only says so (#349).
+            sysinfo::text(if m.errored {
+                "ro,errors"
+            } else if m.read_only {
+                "ro"
+            } else {
+                "rw"
+            }),
             quota.map_or(sysinfo::DASH, |q| sysinfo::int(q.used_bytes)),
             quota.map_or(sysinfo::DASH, |q| sysinfo::int(q.limit_bytes)),
         ]);

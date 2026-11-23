@@ -154,14 +154,14 @@ crate::ktest!(
 crate::ktest!(
     fn mem_msync_returns_a_writeback_error_before_enomem() {
         // With the disk's writes failing, `msync(MS_SYNC)` over a mapping
-        // and a hole below it returns the writeback's `EIO`, not `ENOMEM`;
-        // with them working again, it writes the stores (still dirty: the
-        // page is mapped writable) and the disk holds them.
+        // and a hole below it returns the writeback's `EIO`, not `ENOMEM`.
+        // The failed write made the volume read-only (`errors=remount-ro`,
+        // #349): with the disk's writes working again, `msync` still writes
+        // nothing (`EIO`) and the disk keeps its old bytes.
         let vol = Arc::new(Ext4Volume::new(236)?);
         let f = file(&vol.root, "failing.bin", &pattern(6)[..P as usize])?;
         f.sync(false).map_err(|_| "sync")?;
-        let mut expected = pattern(6)[..P as usize].to_vec();
-        expected[20..28].copy_from_slice(b"retried!");
+        let expected = pattern(6)[..P as usize].to_vec();
         let (vol2, f2) = (Arc::clone(&vol), Arc::clone(&f));
         let (failed, retried) = in_test_process(move |_| {
             let fd = ktest_install(&f2, b"/ext4/failing.bin", OpenFlags::O_RDWR)?;
@@ -175,7 +175,7 @@ crate::ktest!(
             Ok::<_, &'static str>((failed, retried))
         })??;
         kassert_eq!(failed, e(errno::EIO));
-        kassert_eq!(retried, 0);
+        kassert_eq!(retried, e(errno::EIO));
         kassert!(on_disk(&vol, 237, "failing.bin", P as usize)? == expected);
         Ok(())
     }

@@ -277,6 +277,19 @@ VFS_SWEEP_LINES = (
         r"failed: \w+; its data is intact; run e2fsck"
     ),
 )
+# The volume's `errors=remount-ro` line (#349): once per ext4 volume a
+# failed write makes read-only, so once per leg of every write-fault sweep
+# (held back, inside their guards) and once in each other ktest that fails
+# a write (printed, outside any guard): counted as present, inside a guard
+# or not. One call site, so a guard prints it at most once.
+VFS_ERRORED_LINES = (
+    (
+        rf"ERROR vfs: ext4 {_DEV}: (unlink|rmdir|rename|link|create|mkdir|symlink|truncate|chmod|chown|"
+        r"utimensat|writeback|fsync|sync) failed writing to the device \([^()]+\); the volume is read-only "
+        r"until reboot \(errors=remount-ro\); run e2fsck -f"
+    ),
+)
+VFS_HOLDABLE_LINES = (*VFS_SWEEP_LINES, *VFS_ERRORED_LINES)
 VFS_EXACT_LINES = {
     # page_quota_release_saturates_and_detached_quota_reports_nospc
     r"ERROR vfs: quota ktest \(16384 bytes\): released 20480 bytes with only 8192 reserved": 1,
@@ -377,7 +390,7 @@ VFS_HELD_KTESTS = sum(
 def vfs_family(line):
     """The one family of VFS_EXACT_LINES or VFS_SWEEP_LINES that vfs line
     `line` (from its level on) fits, or None; a line fitting two fails."""
-    fits = [want for want in (*VFS_EXACT_LINES, *VFS_SWEEP_LINES) if re.fullmatch(want, line)]
+    fits = [want for want in (*VFS_EXACT_LINES, *VFS_HOLDABLE_LINES) if re.fullmatch(want, line)]
     assert len(fits) <= 1, (line, fits)
     return fits[0] if fits else None
 
@@ -396,7 +409,7 @@ def check_vfs_log_lines(out):
     Every printed sweep line and every vfs summary falls inside a vfs guard,
     and the guards on serial are the kernel source's: a sweep without a guard
     fails here, not at the time bound."""
-    tally = dict.fromkeys((*VFS_EXACT_LINES, *VFS_SWEEP_LINES), 0)
+    tally = dict.fromkeys((*VFS_EXACT_LINES, *VFS_HOLDABLE_LINES), 0)
     problems = []
     guards = 0
     held_any = False
@@ -429,13 +442,15 @@ def check_vfs_log_lines(out):
             problems.append(("a vfs line fitting no family", line))
             continue
         tally[family] += weight
-        if not summary and family not in VFS_SWEEP_LINES:
+        if not summary and family not in VFS_HOLDABLE_LINES:
             continue
+        if not summary and family in VFS_ERRORED_LINES and guard is None:
+            continue  # a single fault's volume, outside any sweep
         if guard is None:
             problems.append(("a sweep line or summary outside a vfs guard", line))
         elif not summary:
             guard["printed"][family] += 1
-        elif family not in VFS_SWEEP_LINES:
+        elif family not in VFS_HOLDABLE_LINES:
             problems.append(("an exact family held back", line))
         elif family not in guard["printed"]:
             problems.append(("a summary of a family its guard didn't print", line))
@@ -446,7 +461,7 @@ def check_vfs_log_lines(out):
     assert not problems, problems
     counts = {want: tally[want] for want in VFS_EXACT_LINES}
     assert counts == VFS_EXACT_LINES, counts
-    sweeps = {want: tally[want] for want in VFS_SWEEP_LINES}
+    sweeps = {want: tally[want] for want in VFS_HOLDABLE_LINES}
     assert all(sweeps.values()), sweeps
     assert guards == VFS_HELD_KTESTS, (guards, VFS_HELD_KTESTS)
     assert held_any, "no vfs lines held back: the guards hold nothing"

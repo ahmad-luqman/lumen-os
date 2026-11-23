@@ -642,6 +642,18 @@ pub(crate) fn mappable(inode: &dyn VfsInode) -> bool {
     inode.inode_type() == lumen_vfs::InodeType::File && page_cache_lock(inode).is_some()
 }
 
+/// Whether `inode`'s volume refuses a new shared writable mapping
+/// (`EROFS`): an `ext4` one read-only, mounted so or errored since its
+/// descriptor was opened `O_RDWR` (`errors=remount-ro`, #349). Asked of the
+/// inode's own filesystem, so a volume outside the mount table (a ktest's)
+/// answers too; `tmpfs` never refuses.
+pub(crate) fn mapped_read_only(inode: &dyn VfsInode) -> bool {
+    inode
+        .as_any()
+        .and_then(|any| any.downcast_ref::<super::ext4::Ext4Inode>())
+        .is_some_and(super::ext4::Ext4Inode::volume_read_only)
+}
+
 /// The `PageCache` lock (Lock 5) of an `ext4` or `tmpfs` inode.
 fn page_cache_lock(inode: &dyn VfsInode) -> Option<&SleepMutex<PageCache>> {
     let any = inode.as_any()?;

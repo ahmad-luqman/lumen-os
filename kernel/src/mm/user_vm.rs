@@ -261,24 +261,27 @@ pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
 /// keeps nowhere else.
 pub struct MappedFile {
     kept: KeptFile,
-    /// The description is open `O_RDWR`: a `MAP_SHARED` mapping of it may
-    /// be made writable, and its stores reach the file. (`openat` refuses
-    /// `O_RDWR` on a read-only mount with `EROFS`, so a descriptor's also
-    /// says the mount is writable; `OpenFile::new_unchecked_flags`, which
-    /// skips that check, is the ktests' alone.)
+    /// The description is open `O_RDWR` and its mount was writable when
+    /// mapped: a `MAP_SHARED` mapping of it may be made writable, and its
+    /// stores reach the file. (`openat` refuses `O_RDWR` on a read-only
+    /// mount with `EROFS`, but an `ext4` volume can go read-only after the
+    /// open, `errors=remount-ro`, #349, so the caller says;
+    /// `OpenFile::new_unchecked_flags`, which skips the open's check, is
+    /// the ktests' alone.)
     may_write: bool,
 }
 
 impl MappedFile {
     /// The file open description `file` has open, by its path: a clone of
     /// the description's own open reference, so never refused and never on
-    /// a freed inode. Its shared-write right is the description's: `O_RDWR`
-    /// or not. Never an `O_PATH` description: `mmap` refuses one (`EBADF`)
-    /// before getting here.
-    pub fn of<L: VfsLock<u64>>(file: &OpenFile<L>) -> Self {
+    /// a freed inode. Its shared-write right is the description's, `O_RDWR`
+    /// or not, while `mount_writable` (the file's volume isn't read-only
+    /// now: `page_cache::mapped_read_only`). Never an `O_PATH` description:
+    /// `mmap` refuses one (`EBADF`) before getting here.
+    pub fn of<L: VfsLock<u64>>(file: &OpenFile<L>, mount_writable: bool) -> Self {
         debug_assert!(!file.is_path(), "a mapping of an O_PATH description");
         let kept = KeptFile { guard: file.open_guard().clone(), path: Arc::clone(&file.path) };
-        Self { kept, may_write: file.access_mode() == AccessMode::ReadWrite }
+        Self { kept, may_write: mount_writable && file.access_mode() == AccessMode::ReadWrite }
     }
 }
 
@@ -1896,7 +1899,7 @@ fn file_vm_open_path(f: &Arc<dyn VfsInode>, path: &[u8], flags: u32) -> Result<M
     let flags = lumen_vfs::OpenFlags::from_bits(flags);
     let file = crate::linux::process::KernelFile::new_unchecked_flags(Arc::clone(f), Arc::from(path), flags)
         .map_err(|_| "open the file")?;
-    Ok(MappedFile::of(&file))
+    Ok(MappedFile::of(&file, true))
 }
 
 #[cfg(feature = "ktest")]

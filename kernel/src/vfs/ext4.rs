@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use core::error::Error;
 use core::fmt;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use ext4plus::dir::Dir;
 use ext4plus::error::Ext4Error;
@@ -47,6 +47,9 @@ pub trait BlockCacheBackend: Send + Sync {
     fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError>;
     fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError>;
     fn sync(&self) -> Result<(), BlockError>;
+    /// Write nothing more to the device ([`BlockCache::freeze`]): an `ext4`
+    /// volume errored by `errors=remount-ro` (#349).
+    fn freeze(&self);
 }
 
 impl<B: BlockDevice + Send + Sync + 'static> BlockCacheBackend for SleepMutex<BlockCache<B>> {
@@ -61,9 +64,110 @@ impl<B: BlockDevice + Send + Sync + 'static> BlockCacheBackend for SleepMutex<Bl
     fn sync(&self) -> Result<(), BlockError> {
         self.lock().sync()
     }
+
+    fn freeze(&self) {
+        self.lock().freeze();
+    }
 }
 
 type SharedBlockCache = Arc<dyn BlockCacheBackend>;
+
+/// The volume's state under `errors=remount-ro` (#349, ARCHITECTURE §9):
+/// writable.
+const HEALTHY: u8 = 0;
+/// A write failed; the operation that hit it hasn't ended (its undo still
+/// writes, to the block cache).
+const TRIPPED: u8 = 1;
+/// Reported and frozen: nothing more is written to the device.
+const ERRORED: u8 = 2;
+
+/// Every [`BlockError`], numbered from 1 by place, for [`LatchedCache`]'s
+/// latched cause (0: none).
+const BLOCK_ERRORS: [BlockError; 7] = [
+    BlockError::OutOfRange,
+    BlockError::Unaligned,
+    BlockError::ReadOnly,
+    BlockError::CacheFull,
+    BlockError::Io,
+    BlockError::Timeout,
+    BlockError::DeviceFailed,
+];
+
+/// The block cache a mounted volume reaches its own through: the one seam
+/// every write of the volume goes through (`ext4plus`'s, the adapter's raw
+/// ones, the syncs), where `errors=remount-ro` (#349) latches the first that
+/// fails ([`TRIPPED`]) and, once the operation that hit it has ended
+/// ([`Ext4Shared::settle`]), refuses every write ([`ERRORED`]: `ReadOnly`,
+/// so `EROFS`) with the cache below frozen. Reads pass through.
+struct LatchedCache {
+    inner: SharedBlockCache,
+    state: AtomicU8,
+    /// The first failed write's error, by its place in [`BLOCK_ERRORS`]
+    /// plus one; 0 before any.
+    cause: AtomicU8,
+}
+
+impl LatchedCache {
+    fn new(inner: SharedBlockCache) -> Self {
+        Self { inner, state: AtomicU8::new(HEALTHY), cause: AtomicU8::new(0) }
+    }
+
+    fn healthy(&self) -> bool {
+        self.state.load(Ordering::Acquire) == HEALTHY
+    }
+
+    /// Settled: nothing is written any more.
+    fn frozen(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ERRORED
+    }
+
+    /// A write failed with `err`: latch it (the first error is kept).
+    fn trip(&self, err: BlockError) {
+        let code = BLOCK_ERRORS.iter().position(|&e| e == err).map_or(0, |i| i as u8 + 1);
+        let _ = self.cause.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self.state.compare_exchange(HEALTHY, TRIPPED, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The end of an operation: if a write failed (and nobody settled it
+    /// yet), refuse every write from now on, freeze the cache below and
+    /// return the latched error, for the one log line.
+    fn settle(&self) -> Option<BlockError> {
+        self.state.compare_exchange(TRIPPED, ERRORED, Ordering::AcqRel, Ordering::Acquire).ok()?;
+        self.inner.freeze();
+        let code = self.cause.load(Ordering::Acquire);
+        Some(BLOCK_ERRORS.get(usize::from(code).wrapping_sub(1)).copied().unwrap_or(BlockError::Io))
+    }
+
+    /// `ReadOnly` once settled; else `res`, latching its error.
+    fn written(&self, res: impl FnOnce() -> Result<(), BlockError>) -> Result<(), BlockError> {
+        if self.frozen() {
+            return Err(BlockError::ReadOnly);
+        }
+        let res = res();
+        if let Err(e) = res {
+            self.trip(e);
+        }
+        res
+    }
+}
+
+impl BlockCacheBackend for LatchedCache {
+    fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        self.inner.read_at(byte_off, dst)
+    }
+
+    fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError> {
+        self.written(|| self.inner.write_at(byte_off, src))
+    }
+
+    fn sync(&self) -> Result<(), BlockError> {
+        self.written(|| self.inner.sync())
+    }
+
+    fn freeze(&self) {
+        self.inner.freeze();
+    }
+}
 
 /// `ro_compat` bits the adapter recognises (up to `ORPHAN_PRESENT`, 0x10000).
 /// Any other bit forces a read-only mount, and so do the recognised ones in
@@ -1101,7 +1205,11 @@ impl Ext4FsInner {
 
 struct Ext4Shared {
     dev: DevId,
-    read_only: bool,
+    /// Mounted read-only (the device, or a feature the adapter can't write).
+    mounted_ro: bool,
+    /// The seam every write goes through, and its `errors=remount-ro`
+    /// state (#349).
+    cache: Arc<LatchedCache>,
     /// The volume may hash names unsigned (its [`DirHash`] isn't `Signed`;
     /// the mount is then read-only): a non-ASCII lookup missing in an htree
     /// directory walks it (#308, until #313).
@@ -1118,7 +1226,61 @@ struct Ext4Shared {
     clock: SleepMutex<Option<Timespec>>,
 }
 
+/// A write-type operation on the volume, from its start to its end (the
+/// guard's drop, after every lock the operation took): if a write failed
+/// during it, the volume errors there ([`Ext4Shared::settle`]).
+struct WriteOp<'a> {
+    shared: &'a Ext4Shared,
+    op: &'static str,
+}
+
+impl Drop for WriteOp<'_> {
+    fn drop(&mut self) {
+        self.shared.settle(self.op);
+    }
+}
+
 impl Ext4Shared {
+    /// Read-only: mounted so, or errored since (`errors=remount-ro`, #349,
+    /// from the failed write on, before the operation that hit it ends).
+    fn read_only(&self) -> bool {
+        self.mounted_ro || !self.cache.healthy()
+    }
+
+    /// Gone read-only after a failed write (`errors=remount-ro`, #349).
+    fn errored(&self) -> bool {
+        !self.cache.healthy()
+    }
+
+    /// Operation `op` begins, on a volume that must be writable (else
+    /// `EROFS`).
+    fn writable_op(&self, op: &'static str) -> Result<WriteOp<'_>, VfsError> {
+        if self.read_only() {
+            return Err(VfsError::RoFs);
+        }
+        Ok(self.op(op))
+    }
+
+    /// Operation `op` begins, its writability checked by the caller (a
+    /// detached inode's work is in memory).
+    fn op(&self, op: &'static str) -> WriteOp<'_> {
+        WriteOp { shared: self, op }
+    }
+
+    /// The end of operation `op`: if a write failed during it, the volume
+    /// is errored from now on (no write reaches the device again) and that
+    /// is logged, once.
+    fn settle(&self, op: &str) {
+        if let Some(cause) = self.cache.settle() {
+            error!(
+                target: "vfs",
+                "ext4 {:?}: {op} failed writing to the device ({cause}); the volume is read-only until reboot \
+                 (errors=remount-ro); run e2fsck -f",
+                self.dev
+            );
+        }
+    }
+
     /// The wall clock, for times this filesystem sets.
     fn now(&self) -> Timespec {
         #[cfg(feature = "ktest")]
@@ -1163,6 +1325,9 @@ impl Ext4FileSystem {
         let hash = DirHash::from_superblock(s_flags, compat);
         let may_hash_unsigned = hash != DirHash::Signed;
 
+        // Every write from here on goes through the latch (#349).
+        let cache = Arc::new(LatchedCache::new(bcache));
+        let bcache: SharedBlockCache = Arc::clone(&cache) as SharedBlockCache;
         let io = BcacheIo(Arc::clone(&bcache));
         // Probe read-only first to inspect superblock feature flags safely.
         let probe_fs = Ext4::load_with_writer(Box::new(io.clone()), None).map_err(map_ext4_err)?;
@@ -1204,7 +1369,8 @@ impl Ext4FileSystem {
         let extents = ext4.superblock().features().incompatible().contains(IncompatibleFeatures::EXTENTS);
         let shared = Arc::new(Ext4Shared {
             dev,
-            read_only,
+            mounted_ro: read_only,
+            cache,
             may_hash_unsigned,
             max_file_size: max_file_size(layout.block_size(), extents),
             bcache_sync_errno: AtomicU32::new(0),
@@ -1261,9 +1427,15 @@ impl FileSystem for Ext4FileSystem {
     /// metadata in the block cache) off the disk. Each failure is logged;
     /// the first is returned.
     fn sync(&self) -> Result<(), VfsError> {
-        if self.shared.read_only {
+        if self.shared.mounted_ro {
             return Ok(());
         }
+        // Errored (#349): nothing will be written again, and the volume's
+        // one line already said so.
+        if self.shared.errored() {
+            return Err(VfsError::Io);
+        }
+        let _op = self.shared.op("sync");
         let live = self.snapshot_live();
         let mut first_err: Option<VfsError> = None;
         for inode in live {
@@ -1281,7 +1453,11 @@ impl FileSystem for Ext4FileSystem {
     }
 
     fn read_only(&self) -> bool {
-        self.shared.read_only
+        self.shared.read_only()
+    }
+
+    fn errored(&self) -> bool {
+        self.shared.errored()
     }
 
     fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -1344,7 +1520,7 @@ impl Ext4Inode {
         if self.inode_type != InodeType::File {
             return Err(VfsError::Inval);
         }
-        if self.shared.read_only && !self.is_detached() {
+        if self.shared.read_only() && !self.is_detached() {
             return Err(VfsError::RoFs);
         }
         if let Some(at) = offset
@@ -1514,6 +1690,12 @@ impl Ext4Inode {
         Ok(cp)
     }
 
+    /// The volume is read-only: mounted so, or errored since
+    /// (`errors=remount-ro`, #349), for `page_cache::mapped_read_only`.
+    pub(super) fn volume_read_only(&self) -> bool {
+        self.shared.read_only()
+    }
+
     /// This file's page-cache lock (Lock 5), for
     /// `page_cache::MappedPage::copy_to_frame`.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
@@ -1619,9 +1801,15 @@ impl Ext4Inode {
     /// whose write fails stays dirty (and is never evicted); the others are
     /// still written. The number of pages evicted.
     pub fn reclaim_dirty_pages(&self, max_evict: usize) -> usize {
-        if self.is_detached() || self.inode_type != InodeType::File || self.shared.read_only {
+        if self.is_detached() || self.inode_type != InodeType::File || self.shared.mounted_ro {
             return 0;
         }
+        if self.shared.errored() {
+            // Nothing is written back (#349): only clean pages go.
+            let _meta = self.meta.lock();
+            return self.pages.lock().evict_clean_oldest(max_evict);
+        }
+        let _op = self.shared.op("writeback");
         let mut meta = self.meta.lock();
         if self.is_detached() || meta.nlink == 0 {
             return 0;
@@ -1657,8 +1845,14 @@ impl Ext4Inode {
     /// write fails, so a later sync retries both; every other page is still
     /// written, and the first error is returned.
     fn flush_to_ext4(&self, data_only: bool) -> Result<(), VfsError> {
-        if self.is_detached() || self.shared.read_only {
+        if self.is_detached() || self.shared.mounted_ro {
             return Ok(());
+        }
+        // Errored and settled (#349): what it would write will never land.
+        // (A `sync` whose earlier inode tripped the latch still writes the
+        // rest: the operation that hit it hasn't ended.)
+        if self.shared.cache.frozen() {
+            return Err(VfsError::Io);
         }
         let mut meta = self.meta.lock();
         if self.is_detached() || meta.nlink == 0 {
@@ -3832,9 +4026,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        if self.shared.read_only {
-            return Err(VfsError::RoFs);
-        }
+        let _op = self.shared.writable_op("create")?;
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -3868,9 +4060,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        if self.shared.read_only {
-            return Err(VfsError::RoFs);
-        }
+        let _op = self.shared.writable_op("mkdir")?;
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -3930,9 +4120,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
-        if self.shared.read_only {
-            return Err(VfsError::RoFs);
-        }
+        let _op = self.shared.writable_op("unlink")?;
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -4002,9 +4190,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn rmdir(&self, name: &[u8]) -> Result<(), VfsError> {
-        if self.shared.read_only {
-            return Err(VfsError::RoFs);
-        }
+        let _op = self.shared.writable_op("rmdir")?;
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -4104,9 +4290,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn link(&self, name: &[u8], target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
-        if self.shared.read_only {
-            return Err(VfsError::RoFs);
-        }
+        let _op = self.shared.writable_op("link")?;
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -4178,9 +4362,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn symlink(&self, name: &[u8], target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-        if self.shared.read_only {
-            return Err(VfsError::RoFs);
-        }
+        let _op = self.shared.writable_op("symlink")?;
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -4263,9 +4445,7 @@ impl VfsInode for Ext4Inode {
         flags: RenameFlags,
     ) -> Result<(), VfsError> {
         let flags = flags.validate()?;
-        if self.shared.read_only {
-            return Err(VfsError::RoFs);
-        }
+        let _op = self.shared.writable_op("rename")?;
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -4530,9 +4710,10 @@ impl VfsInode for Ext4Inode {
         if new_size > self.shared.max_file_size {
             return Err(VfsError::FBig);
         }
-        if self.shared.read_only && !self.is_detached() {
+        if self.shared.read_only() && !self.is_detached() {
             return Err(VfsError::RoFs);
         }
+        let _op = self.shared.op("truncate");
         let mut meta = self.meta.lock();
         let detached = self.is_detached();
         if !detached && meta.nlink == 0 {
@@ -4601,9 +4782,10 @@ impl VfsInode for Ext4Inode {
     }
 
     fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
-        if self.shared.read_only && !self.is_detached() {
+        if self.shared.read_only() && !self.is_detached() {
             return Err(VfsError::RoFs);
         }
+        let _op = self.shared.op("chmod");
         let mut meta = self.meta.lock();
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
@@ -4625,9 +4807,10 @@ impl VfsInode for Ext4Inode {
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError> {
-        if self.shared.read_only && !self.is_detached() {
+        if self.shared.read_only() && !self.is_detached() {
             return Err(VfsError::RoFs);
         }
+        let _op = self.shared.op("chown");
         let mut meta = self.meta.lock();
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
@@ -4659,9 +4842,10 @@ impl VfsInode for Ext4Inode {
     }
 
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
-        if self.shared.read_only && !self.is_detached() {
+        if self.shared.read_only() && !self.is_detached() {
             return Err(VfsError::RoFs);
         }
+        let _op = self.shared.op("utimensat");
         let mut meta = self.meta.lock();
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
@@ -4732,9 +4916,10 @@ impl VfsInode for Ext4Inode {
     }
 
     fn sync(&self, data_only: bool) -> Result<(), VfsError> {
-        if self.is_detached() || self.shared.read_only {
+        if self.is_detached() || self.shared.mounted_ro {
             return Ok(());
         }
+        let _op = self.shared.op("fsync");
         self.flush_to_ext4(data_only)?;
         // A global sync goes through the filesystem's own `sync` (which logs
         // a block-cache failure once, not once per inode), never through
@@ -4793,6 +4978,8 @@ pub(crate) mod ktest_util {
         pub(in crate::vfs) dev: MemBlkDev,
         pub reads: AtomicUsize,
         pub writes: AtomicUsize,
+        /// `sync` calls, failed ones included.
+        pub syncs: AtomicUsize,
         /// Up to three writes to fail by their numbers (counting from the
         /// `arm_write*` call), each once (`arm_write`, `arm_write_pair`,
         /// `arm_write_triple`); 0 for none.
@@ -5002,10 +5189,15 @@ pub(crate) mod ktest_util {
         }
 
         fn sync(&self) -> Result<(), BlockError> {
+            self.syncs.fetch_add(1, Ordering::AcqRel);
             if self.fail_writes.load(Ordering::Acquire) || self.fail_syncs.load(Ordering::Acquire) {
                 return Err(BlockError::Io);
             }
             self.inner.lock().sync()
+        }
+
+        fn freeze(&self) {
+            self.inner.lock().freeze();
         }
     }
 
@@ -5025,6 +5217,7 @@ pub(crate) mod ktest_util {
             dev,
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
+            syncs: AtomicUsize::new(0),
             fail_write_at: [const { AtomicUsize::new(0) }; 3],
             failed_write_lands: AtomicBool::new(false),
             fail_write_from: AtomicUsize::new(0),
@@ -5051,10 +5244,38 @@ pub(crate) mod ktest_util {
         Ok(Mnt { cache, fs, root, tables })
     }
 
-    /// The device's bytes after writing the block cache back.
+    /// The device's bytes after writing the block cache back; for a cache
+    /// frozen by `errors=remount-ro` (#349), what it holds (thawed for the
+    /// write-back, then frozen again): what the volume reads.
     pub fn image(m: &Mnt) -> Result<Vec<u8>, &'static str> {
-        m.cache.sync().map_err(|_| "cache sync")?;
+        let frozen = m.cache.inner.lock().is_frozen();
+        if frozen {
+            let inner = m.cache.inner.lock();
+            inner.thaw();
+            let synced = inner.sync();
+            inner.freeze();
+            synced.map_err(|_| "frozen cache sync")?;
+        } else {
+            m.cache.sync().map_err(|_| "cache sync")?;
+        }
         Ok(m.dev_bytes())
+    }
+
+    impl FaultCache {
+        /// Whether the volume froze the cache (`errors=remount-ro`, #349).
+        pub fn frozen(&self) -> bool {
+            self.inner.lock().is_frozen()
+        }
+    }
+
+    /// After a write fault, the volume went read-only (`errors=remount-ro`,
+    /// #349): errored, its cache frozen, a create refused (`EROFS`). What
+    /// the fault sweeps check in place of writing on after the failure.
+    pub fn went_read_only(m: &Mnt) -> bool {
+        m.fs.errored()
+            && m.fs.read_only()
+            && m.cache.frozen()
+            && m.root.create(b"after-the-fault", 0o644).err() == Some(lumen_vfs::VfsError::RoFs)
     }
 
     impl FaultCache {
@@ -6138,6 +6359,10 @@ crate::ktest!(
         kassert_eq!(a4.reclaim_clean_pages(16), 0); // still dirty
         kassert_eq!(b4.reclaim_clean_pages(16), 1); // written anyway
         kassert!(m.cache.dev.0.flushed.load(O::Acquire)); // and the device flushed
+        // Then the volume went read-only (#349): `a`'s page is never written.
+        kassert!(went_read_only(&m));
+        kassert_eq!(m.fs.sync().err(), Some(VfsError::Io));
+        kassert_eq!(a4.reclaim_clean_pages(16), 0);
         Ok(())
     }
 );
@@ -6469,9 +6694,11 @@ crate::ktest!(
         let on_disk = read_all(&ro.root_inode().lookup(b"pages").map_err(|_| "ro lookup")?)?;
         kassert_eq!(on_disk.len(), data.len());
         kassert_eq!(&on_disk[PAGE_SIZE..], &data[PAGE_SIZE..]); // pages 1 and 2 reached the disk
-        f.sync(false).map_err(|_| "retry sync")?; // the failed page stayed dirty
-        let ro = remount_ro(&m, 241)?;
-        kassert_eq!(read_all(&ro.root_inode().lookup(b"pages").map_err(|_| "ro lookup 2")?)?, data);
+        // Then the volume went read-only (#349): no retry writes the failed
+        // page, which stays in memory.
+        crate::kassert!(went_read_only(&m));
+        kassert_eq!(f.sync(false).err(), Some(VfsError::Io));
+        kassert_eq!(read_all(&f)?, data);
         Ok(())
     }
 );
@@ -6501,9 +6728,12 @@ crate::ktest!(
         kassert_eq!(f4.reclaim_dirty_pages(16), 0);
         kassert_eq!(f4.reclaim_clean_pages(16), 0); // nothing was dropped as clean
         m.cache.clear();
-        f.sync(false).map_err(|_| "sync")?;
-        let ro = remount_ro(&m, 223)?;
-        kassert_eq!(read_all(&ro.root_inode().lookup(b"r").map_err(|_| "ro lookup")?)?, data);
+        // Then the volume went read-only (#349): the pages stay dirty, in
+        // memory, never written or dropped.
+        crate::kassert!(went_read_only(&m));
+        kassert_eq!(f.sync(false).err(), Some(VfsError::Io));
+        kassert_eq!(f4.reclaim_dirty_pages(16), 0);
+        kassert_eq!(read_all(&f)?, data);
         Ok(())
     }
 );
@@ -6858,8 +7088,7 @@ crate::ktest!(
         // - each count in memory is at least the entries on disk (a count
         //   too low frees an inode still named), and once the rename
         //   completed, each parent's is exactly what its entries call for;
-        // - every name then comes off, and while another name still has
-        //   an inode, a new file never gets its number;
+        // - the volume went read-only (#349), so nothing more is written;
         // - for each kind and mode, at least one fault left the undo
         //   unable to read back (a nameless inode, or a move's source left
         //   at both names), so reads really failed; and for a move without
@@ -6987,27 +7216,11 @@ crate::ktest!(
                     }
                     drop((ro_a, ro_b, at_src, at_dst, ro));
 
-                    // Every name comes off; while another still names an
-                    // inode, a new file doesn't get its number.
-                    for inode in core::iter::once(&s).chain(t.as_ref()) {
-                        let names: Vec<(&Arc<dyn VfsInode>, &[u8])> = [(&a, &b"s"[..]), (&b, dst_name)]
-                            .into_iter()
-                            .filter(|(dir, name)| dir.lookup(name).is_ok_and(|i| i.ino() == inode.ino()))
-                            .collect();
-                        for (i, (dir, name)) in names.iter().enumerate() {
-                            if is_dir {
-                                let _ = dir.lookup(name).map_err(|_| "lookup")?.unlink(b"inner");
-                                dir.rmdir(name).map_err(|_| "rmdir a name")?;
-                            } else {
-                                dir.unlink(name).map_err(|_| "unlink a name")?;
-                            }
-                            if i + 1 < names.len() {
-                                let canary = m.root.create(b"canary", 0o644).map_err(|_| "canary")?;
-                                kassert!(canary.ino() != inode.ino());
-                                m.root.unlink(b"canary").map_err(|_| "unlink canary")?;
-                            }
-                        }
-                    }
+                    // The volume went read-only (#349): no name comes off
+                    // and nothing new can take a number.
+                    kassert!(went_read_only(&m));
+                    let removed = if is_dir { b.rmdir(dst_name) } else { a.unlink(b"s") };
+                    kassert!(removed.is_err());
                     drop((s, t, a, b, m));
                     kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
                 }
@@ -7186,8 +7399,9 @@ crate::ktest!(
         // write on, so that the undo's retries run and then can't read their
         // entries back. Each name left holds its inode's data, each count in
         // memory is at least the names on disk (a file left at both names
-        // keeps its inode when one comes off: a new file never gets its
-        // number, #322's class), and an inode the undo leaves with no name
+        // keeps it, on disk with its bounds too: #322's class; the volume
+        // then goes read-only, #349, so no name comes off), and an inode the
+        // undo leaves with no name
         // keeps a count above 0, on disk (allocated, for e2fsck's
         // lost+found, which a count of 0 would clear instead: #323) and in
         // memory. At least one fault leaves a file nameless, and with reads
@@ -7263,13 +7477,6 @@ crate::ktest!(
                                 ));
                             }
                             kassert!(bounded >= names_n + u32::from(is_dir));
-                            if !is_dir {
-                                // One name comes off; the other still names the
-                                // inode, so a new file doesn't get its number.
-                                a.unlink(b"s").map_err(|_| "unlink a/s")?;
-                                let canary = m.root.create(b"canary", 0o644).map_err(|_| "canary")?;
-                                kassert!(canary.ino() != inode.ino());
-                            }
                         }
                         if names.is_empty() {
                             nameless += 1;
@@ -7286,6 +7493,9 @@ crate::ktest!(
                             kassert!(links >= 1);
                         }
                     }
+                    // The volume went read-only (#349): no name comes off.
+                    kassert!(went_read_only(&m));
+                    kassert!(a.unlink(b"s").is_err());
                     drop((s, t, a, b, at, ro_a, ro_b, ro, m));
                     crate::kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
                 }
@@ -7320,12 +7530,11 @@ crate::ktest!(
         // for (2), kept as a pin while the disk says otherwise (#325,
         // logged), and its times moved; where `sub` stayed, the rmdir failed
         // and `a` is as it was. A `sub` zeroed on disk is dead in memory (a
-        // count of 0) and a new file never comes back as it. With no read of
-        // `a` passing (skip 0, a write failing) and `sub`'s entry gone, a
-        // directory made afterwards (`x`, with a file in it) is never
-        // changed by a create in `sub`: a `sub` whose blocks `delete_file`
-        // had begun freeing, not yet zeroed, is forgotten like a zeroed one
-        // (#330). Each leg has at least one rmdir that took the entry out
+        // count of 0). With no read of `a` passing (skip 0, a write failing)
+        // and `sub`'s entry gone, a `sub` whose blocks `delete_file` had
+        // begun freeing, not yet zeroed, is forgotten like a zeroed one
+        // (#330); a write fault makes the volume read-only (#349), so
+        // nothing made afterwards can get its blocks. Each leg has at least one rmdir that took the entry out
         // and then couldn't read `a` back, and the second at least one that
         // took rmdir's zeroed-child arm and one that forgot `sub` for its
         // freed blocks.
@@ -7400,19 +7609,21 @@ crate::ktest!(
             // `Dir::unlink`'s first write, the entry maybe still there.)
             let sub_freed = raw_mode_and_links(&ro, u32::try_from(sub.ino()).map_err(|_| "ino")?)?.0 == 0;
             if sub_freed {
-                // Never kept live: dead in memory, and a new inode that
-                // takes its number is a new file.
+                // Never kept live: dead in memory.
                 let sub_nlink = sub.stat().map_err(|_| "stat sub")?.nlink;
-                let canary = m.root.create(b"canary", 0o644).map_err(|_| "canary")?;
-                if sub_nlink != 0 || canary.inode_type() != InodeType::File {
+                if sub_nlink != 0 {
                     crate::ktest::diag(format_args!(
-                        "skip={skip} write={write:?} res={res:?}: sub freed on disk, {sub_nlink} links in memory; \
-                         a new file is a {:?}",
-                        canary.inode_type()
+                        "skip={skip} write={write:?} res={res:?}: sub freed on disk, {sub_nlink} links in memory"
                     ));
                 }
                 kassert_eq!(sub_nlink, 0);
-                kassert_eq!(canary.inode_type(), InodeType::File);
+            }
+            // A write fault made the volume read-only (#349); a read fault
+            // alone doesn't.
+            if write.is_some() {
+                kassert!(went_read_only(&m));
+            } else {
+                kassert!(!m.fs.errored());
             }
             let sub_gone = ro_a.lookup(b"sub").is_err();
             let sub_kept = sub.stat().map_err(|_| "stat sub")?.nlink != 0;
@@ -7451,31 +7662,13 @@ crate::ktest!(
                 kassert_eq!(times, times_before);
             }
             if sub_gone && skip == 0 && write.is_some() {
-                // A directory made now may get blocks `sub` had: a create in
-                // `sub` (refused if forgotten) must not reach it (#330).
+                // A directory made now could get blocks `sub` had (#330),
+                // but nothing is made now: the volume is read-only (#349),
+                // and so is a create in `sub`.
                 aliasing_checked += 1;
                 blocks_freed += usize::from(forgot_for_blocks);
-                let x = m.root.mkdir(b"x", 0o755).map_err(|_| "mkdir x")?;
-                x.create(b"inx", 0o644).map_err(|_| "create x/inx")?;
-                let evil = sub.create(b"evil", 0o644);
-                let live = x.lookup(b"evil").is_ok();
-                let ro_x = remount_ro(&m, 264)?.root_inode().lookup(b"x").map_err(|_| "ro x")?;
-                let mut listed = Vec::new();
-                ro_x.readdir(0, &mut listed, 16).map_err(|_| "readdir ro x")?;
-                let mut names: Vec<&[u8]> = listed.iter().map(|e| &e.name[..]).collect();
-                names.sort_unstable();
-                let intact = names == [&b"."[..], b"..", b"inx"];
-                if live || !intact {
-                    crate::ktest::diag(format_args!(
-                        "skip={skip} write={write:?} res={res:?}: sub gone (zeroed {sub_freed}, kept {sub_kept}), \
-                         free blocks {free_before} -> {free_after}; sub.create(evil)={:?}, x.lookup(evil) {live}, \
-                         x on disk lists {:?}",
-                        evil.map(|e| e.ino()),
-                        names.iter().map(|n| core::str::from_utf8(n).unwrap_or("?")).collect::<Vec<_>>()
-                    ));
-                }
-                kassert!(!live);
-                kassert!(intact);
+                kassert_eq!(m.root.mkdir(b"x", 0o755).err(), Some(VfsError::RoFs));
+                kassert!(sub.create(b"evil", 0o644).is_err());
             }
             drop((a, sub, ro_a, ro, m));
         }
@@ -7557,14 +7750,14 @@ crate::ktest!(
         //   block;
         // - the first leg's `f`, the block bitmap unreadable after the fault
         //   too (reads from it through `a`'s inode failing).
-        // In the first three, wherever `f`'s entry went, a file made
-        // afterwards (`g`, 8 KiB) never gets bytes written through the
-        // still-open `f`: an `f` whose blocks `delete_file` had begun
-        // freeing, not yet zeroed, is forgotten and detached (its pages
-        // never written back, but its writes read back through it, #330),
-        // and one kept live still owns its blocks (and the free count on
-        // disk didn't rise: a weaker check, since a pair can clear a block's
-        // bit and fail the counts' writes). Each forgets `f` for its freed
+        // In the first three, wherever `f`'s entry went, an `f` whose blocks
+        // `delete_file` had begun freeing, not yet zeroed, is forgotten and
+        // detached (its writes, in memory, read back through it, #330), and
+        // one kept live still owns its blocks (the free count on disk didn't
+        // rise: a weaker check, since a pair can clear a block's bit and
+        // fail the counts' writes). Every fault makes the volume read-only
+        // (#349): no file made afterwards can get `f`'s blocks, and a kept
+        // `f`'s writes are refused. Each forgets `f` for its freed
         // blocks at least once, and the first keeps it live at least once.
         // In the fourth, an `f` whose entry went is never forgotten for its
         // freed blocks, and is kept live only when whether they were freed
@@ -7647,7 +7840,6 @@ crate::ktest!(
                 a.unlink(b"f").map_err(|_| "unlink without a fault")?;
                 m.cache.writes.load(O::Acquire)
             };
-            let g_data = pattern(2 * PAGE_SIZE, 5);
             let quota_before = page_cache::DETACHED_QUOTA.used_pages();
             let mut seen = Seen::default();
             let runs = (1..=total).flat_map(|k| [(k, false), (k, true)]);
@@ -7702,38 +7894,37 @@ crate::ktest!(
                     kassert!(!undecided || f_kept);
                 } else if gone {
                     let free_after = free_blocks(&ro);
-                    // A file made now may get blocks `f` had: bytes written
-                    // through the open `f` afterwards must not reach it.
-                    let g = m.root.create(b"g", 0o644).map_err(|_| "create g")?;
-                    kassert_eq!(g.write_at(0, &g_data).map_err(|_| "write g")?, g_data.len());
-                    m.fs.sync().map_err(|_| "sync g")?;
+                    if f_kept && free_after > free_before {
+                        crate::ktest::diag(format_args!(
+                            "{} write={k} (and the next {pair}) res={res:?}: f gone, kept live, free blocks \
+                             {free_before} -> {free_after}",
+                            leg.name
+                        ));
+                    }
+                    // Kept live only while nothing was freed.
+                    kassert!(!f_kept || free_after <= free_before);
+                    // A file made now could get blocks `f` had (#330), but
+                    // nothing is made now: the volume is read-only (#349).
+                    kassert_eq!(m.root.create(b"g", 0o644).err(), Some(VfsError::RoFs));
                     let mut wrote = true;
                     for &(off, len) in leg.pieces {
                         wrote &= f.write_at(off, &pattern(len, 99)) == Ok(len);
                     }
-                    m.fs.sync().map_err(|_| "sync f")?;
-                    let g_on_disk = read_all(&remount_ro(&m, 266)?.root_inode().lookup(b"g").map_err(|_| "ro g")?)?;
-                    let intact = g_on_disk == g_data;
-                    if !intact || (f_kept && free_after > free_before) {
-                        crate::ktest::diag(format_args!(
-                            "{} write={k} (and the next {pair}) res={res:?}: f gone, kept {f_kept}, free blocks \
-                             {free_before} -> {free_after}; writes through f {wrote}, g intact on disk {intact}",
-                            leg.name
-                        ));
-                    }
-                    kassert!(intact);
-                    // Kept live only while nothing was freed.
-                    kassert!(!f_kept || free_after <= free_before);
                     if forgot_for_blocks {
-                        // A detached file's writes read back through it.
+                        // A detached file's writes, in memory, read back
+                        // through it.
                         kassert!(wrote);
                         for &(off, len) in leg.pieces {
                             let mut back = vec![0u8; len];
                             kassert_eq!(f.read_at(off, &mut back).map_err(|_| "read f")?, len);
                             kassert!(back == pattern(len, 99));
                         }
+                    } else if f_kept {
+                        // A linked one's are refused.
+                        kassert!(!wrote);
                     }
                 }
+                kassert!(went_read_only(&m));
                 f.dec_open_count();
                 drop((f, a, ro, m));
                 kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
@@ -8277,6 +8468,168 @@ crate::ktest!(
             OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(Arc::clone(&inode), Arc::from(path.as_slice()), rd);
         kassert_eq!(res.err(), Some(VfsError::NoEnt));
         kassert_eq!(inode.open_count(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_write_error_makes_the_volume_read_only() {
+        // #349, `errors=remount-ro`: a write fault in an unlink, a rename
+        // and an rmdir, each on a volume of its own. The operation returns
+        // `EIO` and leaves its name; from its end on, every write-type
+        // operation is `EROFS` (through the VFS, on the adapter's own
+        // checks, and through an inode open before); reads keep working;
+        // nothing more reaches the device: its bytes, the writes and syncs
+        // at the seam stay as they were through the refused writes, `fsync`,
+        // `sync`, reclaim and reads cycling every slot of the block cache,
+        // which holds dirty blocks (a create's, after the last sync) the
+        // device never gets; one line says so; `mount` and `/proc/mounts`
+        // show the volume `ro` with the errors noted.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use lumen_shell::pipe::Value;
+        use lumen_vfs::{
+            OpenFlags, ResolveFlags, link_at, mkdir_at, open_inode, rename_at2, resolve_path, symlink_at, unlink_at,
+        };
+        fn why(what: &'static str) -> impl FnOnce(VfsError) -> &'static str {
+            move |e| {
+                crate::ktest::diag(format_args!("{what}: {e:?}"));
+                what
+            }
+        }
+        fn ext4(inode: &Arc<dyn VfsInode>) -> Result<&Ext4Inode, &'static str> {
+            inode.as_any().and_then(|a| a.downcast_ref::<Ext4Inode>()).ok_or("not an ext4 inode")
+        }
+        // How many lines in the kernel log's ring hold `text`.
+        fn logged(text: &str) -> usize {
+            let mut buf = vec![0u8; 64 * 1024];
+            let (n, _) = crate::klog::copy_recent(&mut buf);
+            core::str::from_utf8(&buf[..n]).map_or(0, |s| s.lines().filter(|l| l.contains(text)).count())
+        }
+        fn mode_cell(m: &Mnt) -> Value {
+            crate::vfs::mount_table_of(&m.tables).rows()[0][3].clone()
+        }
+        let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
+        let flags = OpenFlags::from_bits_truncate;
+        // More pages than the block cache's 64 slots.
+        let big = pattern(80 * PAGE_SIZE, 3);
+        for (op, minor) in [("unlink", 349u32), ("rename", 350), ("rmdir", 351)] {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), minor)?;
+            let t = &m.tables;
+            let victim = m.root.create(b"victim", 0o644).map_err(why("create victim"))?;
+            let keep = m.root.create(b"keep", 0o644).map_err(why("create keep"))?;
+            kassert_eq!(keep.write_at(0, b"kept").map_err(why("write keep"))?, 4);
+            let b = m.root.create(b"big", 0o644).map_err(why("create big"))?;
+            kassert_eq!(b.write_at(0, &big).map_err(why("write big"))?, big.len());
+            let other = m.root.mkdir(b"other", 0o755).map_err(why("mkdir other"))?;
+            drop(m.root.mkdir(b"empty", 0o755).map_err(why("mkdir empty"))?);
+            drop(m.root.mkdir(b"dir", 0o755).map_err(why("mkdir dir"))?);
+            m.fs.sync().map_err(why("sync"))?;
+            // Dirty state the device hasn't got: a page and the times of
+            // `keep`, and a create's blocks (its directory block, bitmap,
+            // descriptor and superblock: blocks reading `big` doesn't
+            // touch, so they go cold in the cache).
+            kassert_eq!(keep.write_at(0, b"KEPT").map_err(why("rewrite keep"))?, 4);
+            drop(other.create(b"x", 0o644).map_err(why("create other/x"))?);
+            kassert_eq!(ext4(&b)?.reclaim_clean_pages(usize::MAX), 80);
+            kassert!(!m.fs.read_only() && !m.fs.errored());
+            kassert_eq!(mode_cell(&m), Value::Text(String::from("rw")));
+
+            m.cache.arm_write(1);
+            let res = match op {
+                "unlink" => unlink_at(t, None, b"/victim", false),
+                "rename" => rename_at2(t, None, b"/victim", None, b"/moved", RenameFlags::default()),
+                _ => unlink_at(t, None, b"/dir", true),
+            };
+            m.cache.arm_write(0);
+            kassert_eq!(res, Err(VfsError::Io));
+            let dev = m.dev_bytes();
+            let writes = m.cache.writes.load(Ordering::Acquire);
+            let syncs = m.cache.syncs.load(Ordering::Acquire);
+            kassert!(m.fs.read_only() && m.fs.errored() && m.cache.frozen());
+            let line = alloc::format!(
+                "ERROR vfs: ext4 {:?}: {op} failed writing to the device (block device I/O error); the volume is \
+                 read-only until reboot (errors=remount-ro); run e2fsck -f",
+                DevId::makedev(0, minor)
+            );
+            kassert_eq!(logged(&line), 1);
+
+            // Every write-type operation through the VFS.
+            let creat = flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT);
+            let trunc = flags(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC);
+            let refused: [(&str, Result<(), VfsError>); 10] = [
+                ("create", open_inode(t, None, b"/new", creat, 0o644, 0).map(drop)),
+                ("open O_RDWR", open_inode(t, None, b"/keep", flags(OpenFlags::O_RDWR), 0, 0).map(drop)),
+                ("open O_TRUNC", open_inode(t, None, b"/keep", trunc, 0, 0).map(drop)),
+                ("mkdir", mkdir_at(t, None, b"/d2", 0o755, 0).map(drop)),
+                ("symlink", symlink_at(t, b"/keep", None, b"/sym").map(drop)),
+                ("link", link_at(t, None, b"/keep", None, b"/hard", false, false)),
+                ("unlink", unlink_at(t, None, b"/keep", false)),
+                ("rmdir", unlink_at(t, None, b"/empty", true)),
+                ("rename", rename_at2(t, None, b"/keep", None, b"/k2", RenameFlags::default())),
+                ("rename dir", rename_at2(t, None, b"/empty", None, b"/e2", RenameFlags::default())),
+            ];
+            for (what, res) in refused {
+                if res != Err(VfsError::RoFs) {
+                    crate::ktest::diag(format_args!("after the {op} fault, {what}: {res:?}"));
+                    return Err("a write-type operation through the VFS wasn't EROFS");
+                }
+            }
+            // The adapter's own checks, and an inode open before.
+            let r = &m.root;
+            let refused: [(&str, Result<(), VfsError>); 13] = [
+                ("create", r.create(b"n", 0o644).map(drop)),
+                ("mkdir", r.mkdir(b"n", 0o755).map(drop)),
+                ("symlink", r.symlink(b"n", b"/keep").map(drop)),
+                ("link", r.link(b"n", &keep)),
+                ("unlink", r.unlink(b"keep")),
+                ("rmdir", r.rmdir(b"empty")),
+                ("rename", r.rename(b"keep", r, b"n", RenameFlags::default())),
+                ("write", keep.write_at(0, b"x").map(drop)),
+                ("append", keep.append(b"x").map(drop)),
+                ("truncate", keep.truncate(0)),
+                ("chmod", keep.set_mode(0o600)),
+                ("chown", keep.set_owner(Some(1), None)),
+                ("utimensat", keep.set_times(SetTime::Now, SetTime::Now)),
+            ];
+            for (what, res) in refused {
+                if res != Err(VfsError::RoFs) {
+                    crate::ktest::diag(format_args!("after the {op} fault, the inode's {what}: {res:?}"));
+                    return Err("a write-type operation on an inode wasn't EROFS");
+                }
+            }
+            kassert!(crate::vfs::page_cache::mapped_read_only(&*keep));
+            // What would be written never lands: `fsync` and `sync` say so.
+            kassert_eq!(keep.sync(false).err(), Some(VfsError::Io));
+            kassert_eq!(keep.sync(true).err(), Some(VfsError::Io));
+            kassert_eq!(m.fs.sync().err(), Some(VfsError::Io));
+            // Reclaim writes nothing back: the dirty page stays.
+            ext4(&keep)?.reclaim_dirty_pages(usize::MAX);
+
+            // Reads: the failed operation left its name; `keep` reads its
+            // unwritten page; `big`, read from the disk, cycles the cache.
+            let left: &[u8] = if op == "rmdir" { b"/dir" } else { b"/victim" };
+            kassert!(resolve_path(t, None, left, rf).is_ok());
+            kassert_eq!(victim.stat().map_err(why("stat victim"))?.nlink, 1);
+            kassert_eq!(read_all(&keep)?, b"KEPT");
+            kassert!(read_all(&b)? == big);
+            kassert!(other.lookup(b"x").is_ok());
+            let mut listed = Vec::new();
+            m.root.readdir(0, &mut listed, 64).map_err(why("readdir"))?;
+            kassert!(listed.iter().any(|e| e.name == b"big"));
+
+            // Nothing more reached the device.
+            kassert_eq!(m.cache.writes.load(Ordering::Acquire), writes);
+            kassert_eq!(m.cache.syncs.load(Ordering::Acquire), syncs);
+            kassert!(m.dev_bytes() == dev);
+            kassert_eq!(logged(&line), 1);
+
+            // `mount` and `/proc/mounts`.
+            let rows = m.tables.list_mounts();
+            kassert!(rows.len() == 1 && rows[0].read_only && rows[0].errored);
+            kassert_eq!(mode_cell(&m), Value::Text(String::from("ro,errors")));
+            kassert_eq!(crate::vfs::procfs::format_mounts_of(rows), "/dev/vda / ext4 ro,errors=remount-ro 0 0\n");
+        }
         Ok(())
     }
 );

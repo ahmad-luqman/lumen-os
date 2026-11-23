@@ -496,9 +496,11 @@ crate::ktest!(
         // On a fresh ext4 volume: what a write left in the page cache is not
         // on the device until `fsync`, and is after it (read back through a
         // read-only mount of a copy of the device's bytes, under the block
-        // cache). Writes into the block cache failing, or its sync alone:
-        // `EIO`, the device unchanged, and the next sync writes it all. An
-        // open file unlinked since: `fsync` is 0 (nothing to write).
+        // cache). An open file unlinked since: `fsync` is 0 (nothing to
+        // write). Writes into the block cache failing, or (on a second
+        // volume) its sync alone: `EIO`, the device unchanged, and the volume
+        // read-only from then on (`errors=remount-ro`, #349): the next sync
+        // writes nothing (`EIO`) and a write is `EROFS`.
         use crate::vfs::page_cache::ktest_files::Ext4Volume;
         use crate::{kassert, kassert_eq};
         const LEN: usize = 6000;
@@ -514,8 +516,18 @@ crate::ktest!(
             kassert!(on_device(187)?.is_none_or(|d| d.is_empty()));
             kassert_eq!(sys_fsync(fd), 0);
             kassert_eq!(on_device(188)?, Some(pattern.clone()));
+            // Open, written, then unlinked: detached, so `fsync` has nothing
+            // to write and is 0 (ARCHITECTURE section 8, `fsync`).
+            let gone = vol.root.create(b"g", 0o644).map_err(|_| "ext4 create g")?;
+            let gone_fd = ktest_install(&gone, KTEST_VOLUME_FILE, OpenFlags::O_RDWR)?;
+            kassert_eq!(sys_pwrite64(gone_fd, at::reg(base), 100, 0), 100);
+            vol.root.unlink(b"g").map_err(|_| "unlink g")?;
+            kassert_eq!(sys_fsync(gone_fd), 0);
+            kassert_eq!(sys_fdatasync(gone_fd), 0);
+            kassert_eq!(sys_close(gone_fd), 0);
             // Overwrite the start with writes failing: `EIO` from both, the
-            // device unchanged; once they work, `fdatasync` writes it.
+            // device unchanged; once they work, the volume is read-only, so
+            // `fdatasync` still writes nothing and a write is `EROFS`.
             copy_to_user(base, b"ZZZZ").map_err(|_| "copy data")?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 4, 0), 4);
             vol.fail_writes(true);
@@ -523,12 +535,20 @@ crate::ktest!(
             vol.fail_writes(false);
             kassert_eq!(failed, (neg_errno(errno::EIO), neg_errno(errno::EIO)));
             kassert_eq!(on_device(189)?, Some(pattern.clone()));
-            kassert_eq!(sys_fdatasync(fd), 0);
-            let mut want = pattern.clone();
-            want[..4].copy_from_slice(b"ZZZZ");
-            kassert_eq!(on_device(190)?, Some(want.clone()));
-            // Again with only the block cache's sync failing: the page goes
-            // into the cache, which keeps it; the next `fsync` flushes it.
+            kassert_eq!(sys_fdatasync(fd), neg_errno(errno::EIO));
+            kassert_eq!(sys_pwrite64(fd, at::reg(base), 4, 0), neg_errno(errno::EROFS));
+            kassert_eq!(on_device(190)?, Some(pattern.clone()));
+            kassert_eq!(sys_close(fd), 0);
+            // Again, on a second volume, with only the block cache's sync
+            // failing: the page goes into the cache, which keeps it; the
+            // volume is read-only after it all the same.
+            let vol = Ext4Volume::new(352)?;
+            let on_device = |minor: u32| ktest_on_device(&vol, minor, "f");
+            let inode = vol.root.create(b"f", 0o644).map_err(|_| "ext4 create")?;
+            let fd = ktest_install(&inode, KTEST_VOLUME_FILE, OpenFlags::O_RDWR)?;
+            copy_to_user(base, &pattern).map_err(|_| "copy the pattern")?;
+            kassert_eq!(sys_pwrite64(fd, at::reg(base), LEN as u64, 0), LEN as u64);
+            kassert_eq!(sys_fsync(fd), 0);
             copy_to_user(base, b"YY").map_err(|_| "copy data")?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 2, 4096), 2);
             // Twice: one warning for the streak (test_ktest pins the count).
@@ -536,19 +556,9 @@ crate::ktest!(
             let failed = (sys_fsync(fd), sys_fdatasync(fd));
             vol.fail_syncs(false);
             kassert_eq!(failed, (neg_errno(errno::EIO), neg_errno(errno::EIO)));
-            kassert_eq!(on_device(191)?, Some(want.clone()));
-            kassert_eq!(sys_fsync(fd), 0);
-            want[4096..4098].copy_from_slice(b"YY");
-            kassert_eq!(on_device(192)?, Some(want));
-            kassert_eq!(sys_close(fd), 0);
-            // Open, written, then unlinked: detached, so `fsync` has nothing
-            // to write and is 0 (ARCHITECTURE section 8, `fsync`).
-            let gone = vol.root.create(b"g", 0o644).map_err(|_| "ext4 create g")?;
-            let fd = ktest_install(&gone, KTEST_VOLUME_FILE, OpenFlags::O_RDWR)?;
-            kassert_eq!(sys_pwrite64(fd, at::reg(base), 100, 0), 100);
-            vol.root.unlink(b"g").map_err(|_| "unlink g")?;
-            kassert_eq!(sys_fsync(fd), 0);
-            kassert_eq!(sys_fdatasync(fd), 0);
+            kassert_eq!(on_device(353)?, Some(pattern.clone()));
+            kassert_eq!(sys_fsync(fd), neg_errno(errno::EIO));
+            kassert_eq!(on_device(354)?, Some(pattern.clone()));
             kassert_eq!(sys_close(fd), 0);
             Ok(())
         })?
