@@ -1696,8 +1696,10 @@ crate::ktest!(
 crate::ktest!(
     fn page_cache_soft_limit_triggers_reclaim() {
         // Past the soft limit, the next ext4 read or write reclaims (writing
-        // dirty pages back) before it runs, through the global tables. The
-        // limits in force outside this test: 32 MiB soft, twice that hard.
+        // dirty pages back) before it runs. Reclaim reaches the file through
+        // its filesystem in `EXT4_FILESYSTEMS` (each one's live inodes); the
+        // mount in `TABLES` is only for opening it by path. The limits in
+        // force outside this test: 32 MiB soft, twice that hard.
         crate::kassert_eq!(EXT4_SOFT_LIMIT_PAGES * PAGE_SIZE, 32 << 20);
         crate::kassert_eq!(EXT4_HARD_LIMIT_PAGES, 2 * EXT4_SOFT_LIMIT_PAGES);
         use crate::vfs::{EXT4_FILESYSTEMS, TABLES, ext4};
