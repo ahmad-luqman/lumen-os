@@ -445,6 +445,11 @@ impl DentryCache {
         Self { max_entries, next_gen: 0, invalidation_gen: 0, entries: BTreeMap::new(), order: VecDeque::new() }
     }
 
+    /// Create a dentry cache bounded to [`Self::DEFAULT_CAPACITY`].
+    pub const fn with_default_capacity() -> Self {
+        Self::new(Self::DEFAULT_CAPACITY)
+    }
+
     fn compact_order(&mut self) {
         let entries = &self.entries;
         self.order.retain(|(k, g)| entries.get(k).is_some_and(|&(_, cur_g)| cur_g == *g));
@@ -579,6 +584,6 @@ impl DentryCache {
 
 impl Default for DentryCache {
     fn default() -> Self {
-        Self::new(Self::DEFAULT_CAPACITY)
+        Self::with_default_capacity()
     }
 }

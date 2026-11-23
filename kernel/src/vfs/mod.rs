@@ -3,8 +3,9 @@
 //! Provides unified [`page_cache::PageCache`], writable [`ext4::Ext4FileSystem`]
 //! over [`lumen_bcache::BlockCache`], [`tmpfs::Tmpfs`], [`devfs::Devfs`],
 //! [`procfs::Procfs`], Lock-9 [`KernelVfsTables`] (lumen-vfs's `VfsTables`
-//! over `SleepMutex`: `MountTable -> DentryCache -> InodeCache`), boot-time [`init()`] mounting, shell commands (`mount`, `sync`,
-//! `vfstest`), and the `#248` `ext4plus` smoke check (`exercise_ext4_smoke`;
+//! over `SleepMutex`: `MountTable -> DentryCache -> InodeCache`), boot-time
+//! [`init()`] mounting, shell commands (`mount`, `sync`, `vfstest`), and the
+//! `#248` `ext4plus` smoke check (`exercise_ext4_smoke`;
 //! its ktest, `ext4_crate_smoke`, is in `vfs/tests.rs` with the others of
 //! this file's code).
 
@@ -71,7 +72,9 @@ impl<T> VfsLock<T> for KernelVfsLock<T> {
 }
 
 impl<T> KernelVfsLock<T> {
-    /// [`VfsLock::new`] as a `const fn`, for [`TABLES`].
+    /// [`VfsLock::new`] as a `const fn`, for [`TABLES`] only (a trait
+    /// method can't be `const` on stable); everything else uses
+    /// `VfsLock::new`.
     pub const fn new_const(val: T) -> Self {
         Self(SleepMutex::new(val))
     }
@@ -90,8 +93,8 @@ pub type KernelVfsTables = VfsTables<KernelLocks>;
 
 static TABLES: KernelVfsTables = KernelVfsTables::from_locks(
     KernelVfsLock::new_const(MountTable::new()),
-    KernelVfsLock::new_const(DentryCache::new(DentryCache::DEFAULT_CAPACITY)),
-    KernelVfsLock::new_const(InodeCache::with_removal_history(InodeCache::DEFAULT_REMOVAL_HISTORY)),
+    KernelVfsLock::new_const(DentryCache::with_default_capacity()),
+    KernelVfsLock::new_const(InodeCache::new()),
 );
 static EXT4_FILESYSTEMS: SleepMutex<Vec<Arc<ext4::Ext4FileSystem>>> = SleepMutex::new(Vec::new());
 

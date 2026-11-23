@@ -356,8 +356,14 @@ pub trait VfsCacheOps {
 /// [`LockFamily`] that guards each table.
 ///
 /// Strict sub-order `MountTable -> DentryCache -> InodeCache`. Never holds
-/// any of the three across `FileSystem::root_inode()`, Locks 1–8, or the
-/// `Arc` drops after `umount`.
+/// any of the three across `FileSystem::root_inode()`, `FileSystem::read_only()`
+/// (`fs_read_only`), Locks 1–8, or the drops of the inodes `umount` evicts.
+/// Some calls into the filesystems still run under them: `VfsInode::dev_id`,
+/// `ino` and `cacheable` (fixed state, by design), and #320's pre-existing
+/// cases (`MountTable::mount_with_ino`'s `inode_type()` and its error
+/// paths' `Arc` drops, the unmounted mountpoint's `Arc` dropped inside
+/// `MountTable::umount`, `list_mounts`' `read_only()`/`name()`, the `Arc`s
+/// `InodeCache::get_or_insert` drops).
 pub struct VfsTables<F: LockFamily> {
     mounts: F::Lock<MountTable>,
     dentries: F::Lock<DentryCache>,
@@ -365,9 +371,13 @@ pub struct VfsTables<F: LockFamily> {
 }
 
 impl<F: LockFamily> VfsTables<F> {
-    /// Tables over the given (empty or seeded) locks: the way to a `static`,
-    /// since [`VfsLock::new`] isn't `const` (the kernel passes locks built
-    /// by `SleepMutex::new`, a `const fn`).
+    /// Tables over the given locks, which must hold empty tables (seeded
+    /// ones would bypass the invariants `mount_root`, `mount` and `umount`
+    /// keep across the three, such as the root inode being cached): the way
+    /// to a `static`, since [`VfsLock::new`] isn't `const` (the kernel
+    /// passes locks built by `SleepMutex::new`, a `const fn`, around
+    /// [`MountTable::new`], [`DentryCache::with_default_capacity`] and
+    /// [`InodeCache::new`], the constructors [`new`](Self::new) uses).
     pub const fn from_locks(
         mounts: F::Lock<MountTable>,
         dentries: F::Lock<DentryCache>,
@@ -377,15 +387,21 @@ impl<F: LockFamily> VfsTables<F> {
     }
 
     /// Empty tables: [`DentryCache::DEFAULT_CAPACITY`] names and
-    /// [`InodeCache::DEFAULT_REMOVAL_HISTORY`] removals remembered, the same
-    /// named defaults the kernel's `static` hands [`from_locks`](Self::from_locks).
+    /// [`InodeCache::DEFAULT_REMOVAL_HISTORY`] removals remembered, from the
+    /// same argument-free constructors the kernel's `static` hands
+    /// [`from_locks`](Self::from_locks), so neither names a capacity.
     pub fn new() -> Self {
-        Self::with_capacities(DentryCache::DEFAULT_CAPACITY, InodeCache::DEFAULT_REMOVAL_HISTORY)
+        Self::from_locks(
+            F::Lock::new(MountTable::new()),
+            F::Lock::new(DentryCache::with_default_capacity()),
+            F::Lock::new(InodeCache::new()),
+        )
     }
 
     /// Empty tables holding at most `dentry_capacity` names and remembering
     /// `removal_history` inode removals.
-    pub fn with_capacities(dentry_capacity: usize, removal_history: usize) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_capacities(dentry_capacity: usize, removal_history: usize) -> Self {
         Self::from_locks(
             F::Lock::new(MountTable::new()),
             F::Lock::new(DentryCache::new(dentry_capacity)),
@@ -506,7 +522,8 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     }
 
     fn fs_read_only(&self, dev: DevId) -> bool {
-        // The guard is released before `read_only` runs, as in every probe.
+        // The guard is released before `read_only` runs, as every other
+        // probe does before calling into the filesystem.
         let fs = self.mounts.lock().fs_by_dev(dev);
         fs.is_some_and(|fs| fs.read_only())
     }

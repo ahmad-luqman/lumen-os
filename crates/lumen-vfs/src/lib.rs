@@ -3,11 +3,10 @@
 //! Provides filesystem/inode traits, Lock-9 inode/dentry/mount tables
 //! (`VfsTables`, the kernel's and the host tests', generic over a
 //! `LockFamily`) with a short-probe `VfsCacheOps` boundary (never held
-//! across Locks 4–8), physical
-//! path & symlink resolution, `OpenFile` / 1024-FD `FdTable`, high-level
-//! namespace operations (`open`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`,
-//! `readlink`, `renameat2`), and independent `flock(2)` + `fcntl` POSIX record
-//! advisory locks.
+//! across Locks 4–8), physical path & symlink resolution, `OpenFile` /
+//! 1024-FD `FdTable`, high-level namespace operations (`open`, `mkdir`,
+//! `unlink`, `rmdir`, `link`, `symlink`, `readlink`, `renameat2`), and
+//! independent `flock(2)` + `fcntl` POSIX record advisory locks.
 //!
 //! Clean-room MIT implementation conceptually adapted from Starry / `axfs_vfs`.
 
