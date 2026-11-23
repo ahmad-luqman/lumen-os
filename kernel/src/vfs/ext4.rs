@@ -27,6 +27,7 @@ use ext4plus::inode::{Inode, InodeFlags, InodeMode};
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
 use lumen_vfs::ext4::rdev_from_i_block;
+use lumen_vfs::page;
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
     VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
@@ -1044,73 +1045,21 @@ impl Ext4Inode {
             return Err(VfsError::FBig);
         }
         let buf = &buf[..buf.len().min(usize::try_from(max - offset).unwrap_or(usize::MAX))];
-        if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
-            let tail_page = old_size / PAGE_SIZE as u64;
-            let tail_off = (old_size % PAGE_SIZE as u64) as usize;
-            if let Some(page) = pages.get(tail_page) {
-                page.zero_range(tail_off, PAGE_SIZE);
-                if !detached {
-                    page.set_dirty();
-                }
+        // A detached file's pages are its only copy (never written back), so
+        // they aren't marked dirty; they count against the detached quota,
+        // not the hard limit (`PageCache::write_from`'s admission).
+        let dirty = !detached;
+        // A write starting past the end grows the file to `offset` first.
+        pages.zero_tail(old_size, offset.max(old_size), dirty);
+        // A new page a write covers only part of starts as the disk's bytes
+        // (below the old size) of a linked file, else as zeros.
+        let done = pages.write_from(offset, buf, dirty, |span| {
+            let cp = CachePage::new_shared()?;
+            if !detached && !span.whole_page() && span.page_start() < old_size {
+                cp.write_bytes(0, &self.read_disk_page(span.index, old_size)?);
             }
-        }
-
-        let mut done = 0usize;
-        while done < buf.len() {
-            let cur_off = offset + done as u64;
-            let page_idx = cur_off / PAGE_SIZE as u64;
-            let in_page = (cur_off % PAGE_SIZE as u64) as usize;
-            let chunk = (PAGE_SIZE - in_page).min(buf.len() - done);
-
-            if let Some(page) = pages.get(page_idx) {
-                page.write_bytes(in_page, &buf[done..done + chunk]);
-                if !detached {
-                    page.set_dirty();
-                }
-            } else {
-                // Past the hard limit no more pages are added: reclaim, run
-                // once before taking the locks, couldn't get below it (the
-                // dirty data can't be written back), or this one write added
-                // more pages than the gap.
-                if !detached && page_cache::ext4_at_hard_limit() {
-                    page_cache::note_hard_limit_refusal();
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(VfsError::NoSpc);
-                }
-                let Some(raw) = CachePage::new_zeroed() else {
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(VfsError::NoMem);
-                };
-                let cp = Arc::new(raw);
-                let page_base = page_idx * PAGE_SIZE as u64;
-                if !detached && chunk < PAGE_SIZE && page_base < old_size {
-                    match self.read_disk_page(page_idx, old_size) {
-                        Ok(tmp) => cp.write_bytes(0, &tmp),
-                        Err(err) => {
-                            if done > 0 {
-                                break;
-                            }
-                            return Err(err);
-                        }
-                    }
-                }
-                cp.write_bytes(in_page, &buf[done..done + chunk]);
-                if !detached {
-                    cp.set_dirty();
-                }
-                if let Err(err) = pages.insert_new(page_idx, cp) {
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(err);
-                }
-            }
-            done += chunk;
-        }
+            Ok(cp)
+        })?;
 
         let written_end = offset + done as u64;
         let now_ts = self.shared.now();
@@ -1231,7 +1180,7 @@ impl Ext4Inode {
                 return Err(e);
             }
         };
-        let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
+        let cp = CachePage::new_shared()?;
         cp.write_bytes(0, &tmp);
         Ok(cp)
     }
@@ -1272,7 +1221,7 @@ impl Ext4Inode {
             Some(page) => Arc::clone(page),
             None => {
                 let page = if detached {
-                    Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?)
+                    CachePage::new_shared()?
                 } else if page_cache::ext4_at_hard_limit() {
                     page_cache::note_hard_limit_refusal();
                     return Err(VfsError::NoSpc);
@@ -4119,34 +4068,15 @@ impl VfsInode for Ext4Inode {
                 }
                 meta.blocks_512 = disk.blocks();
             }
-            pages.remove_from(new_size.div_ceil(PAGE_SIZE as u64));
-            if tail_rem != 0 {
-                let tail_page = new_size / PAGE_SIZE as u64;
-                if let Some(page) = pages.get(tail_page) {
-                    page.zero_range(tail_rem, PAGE_SIZE);
-                    if !detached {
-                        page.set_dirty();
-                    }
-                }
-            }
-        } else if new_size > old_size {
-            let tail_rem = (old_size % PAGE_SIZE as u64) as usize;
-            if !detached {
-                let inner = self.shared.state.lock();
-                let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
-                meta.blocks_512 = disk.blocks();
-            }
-            if tail_rem != 0 {
-                let tail_page = old_size / PAGE_SIZE as u64;
-                if let Some(page) = pages.get(tail_page) {
-                    page.zero_range(tail_rem, PAGE_SIZE);
-                    if !detached {
-                        page.set_dirty();
-                    }
-                }
-            }
+            pages.remove_from(page::pages_in(new_size));
+        } else if new_size > old_size && !detached {
+            let inner = self.shared.state.lock();
+            let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+            ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
+            meta.blocks_512 = disk.blocks();
         }
+        // The cached tail, once the disk holds the new size.
+        pages.zero_tail(old_size, new_size, !detached);
 
         let now_ts = self.shared.now();
         meta.size = new_size;
@@ -4225,17 +4155,11 @@ impl VfsInode for Ext4Inode {
         }
         let now_ts = self.shared.now();
         // Set in memory only once the disk holds them.
+        // (An omitted stamp is set to itself: unchanged, as the inode
+        // already holds it truncated.)
         let mut times = meta.times;
-        match atime {
-            SetTime::Omit => {}
-            SetTime::Now => times.set_atime(now_ts),
-            SetTime::Set(ts) => times.set_atime(ts),
-        }
-        match mtime {
-            SetTime::Omit => {}
-            SetTime::Now => times.set_mtime(now_ts),
-            SetTime::Set(ts) => times.set_mtime(ts),
-        }
+        times.set_atime(atime.resolve(times.atime(), now_ts));
+        times.set_mtime(mtime.resolve(times.mtime(), now_ts));
         times.set_ctime(now_ts);
         if !self.is_detached() {
             let inner = self.shared.state.lock();
@@ -4266,31 +4190,13 @@ impl VfsInode for Ext4Inode {
         if !detached && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if offset >= meta.size {
-            return Ok(0);
-        }
-        let to_read = buf.len().min((meta.size - offset) as usize);
-        let mut pages = self.pages.lock();
-
-        let mut done = 0usize;
-        while done < to_read {
-            let cur_off = offset + done as u64;
-            let page_idx = cur_off / PAGE_SIZE as u64;
-            let in_page = (cur_off % PAGE_SIZE as u64) as usize;
-            let chunk = (PAGE_SIZE - in_page).min(to_read - done);
-
-            if let Some(page) = pages.get(page_idx) {
-                page.read_bytes(in_page, &mut buf[done..done + chunk]);
-            } else if detached {
-                buf[done..done + chunk].fill(0);
-            } else {
-                let cp = self.load_page(page_idx, meta.size)?;
-                cp.read_bytes(in_page, &mut buf[done..done + chunk]);
-                pages.insert_new(page_idx, cp)?;
-            }
-            done += chunk;
-        }
-        Ok(to_read)
+        // A missing page of a linked file is read from disk; a detached
+        // file's pages were all read in when it was detached, so a missing
+        // one is a hole.
+        let file_size = meta.size;
+        self.pages.lock().read_into(offset, buf, file_size, |index| {
+            if detached { Ok(None) } else { self.load_page(index, file_size).map(Some) }
+        })
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {

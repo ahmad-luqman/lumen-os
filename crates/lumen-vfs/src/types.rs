@@ -158,6 +158,17 @@ impl SetTime {
             Err(VfsError::Inval)
         }
     }
+
+    /// The timestamp after this change, of a stamp that was `current`:
+    /// `current` for `Omit`, `now` for `Now`, `ts` for `Set(ts)`. Each
+    /// filesystem's `set_times` sets each stamp to this.
+    pub const fn resolve(self, current: Timespec, now: Timespec) -> Timespec {
+        match self {
+            Self::Omit => current,
+            Self::Now => now,
+            Self::Set(ts) => ts,
+        }
+    }
 }
 
 /// Inode metadata returned by `VfsInode::stat()`.
@@ -552,5 +563,23 @@ impl fmt::Debug for Escaped<'_> {
         f.write_str("\"")?;
         self.write(f, true)?;
         f.write_str("\"")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_time_resolves_each_variant() {
+        let current = Timespec { sec: 10, nsec: 1 };
+        let now = Timespec { sec: 20, nsec: 2 };
+        let ts = Timespec { sec: 30, nsec: 3 };
+        assert_eq!(SetTime::Omit.resolve(current, now), current);
+        assert_eq!(SetTime::Now.resolve(current, now), now);
+        assert_eq!(SetTime::Set(ts).resolve(current, now), ts);
+        // `Set` wins even when it names `current` or `now` exactly.
+        assert_eq!(SetTime::Set(current).resolve(ts, now), current);
+        assert_eq!(SetTime::Set(now).resolve(current, ts), now);
     }
 }

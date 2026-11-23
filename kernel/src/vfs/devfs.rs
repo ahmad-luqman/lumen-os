@@ -332,16 +332,8 @@ impl VfsInode for DevfsInode {
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
         let mut meta = self.changeable_meta()?;
         let now = time::realtime_timespec();
-        match atime {
-            SetTime::Omit => {}
-            SetTime::Now => meta.atime = now,
-            SetTime::Set(ts) => meta.atime = ts,
-        }
-        match mtime {
-            SetTime::Omit => {}
-            SetTime::Now => meta.mtime = now,
-            SetTime::Set(ts) => meta.mtime = ts,
-        }
+        meta.atime = atime.resolve(meta.atime, now);
+        meta.mtime = mtime.resolve(meta.mtime, now);
         meta.ctime = now;
         Ok(())
     }

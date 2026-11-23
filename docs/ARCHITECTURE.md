@@ -5191,7 +5191,10 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   at the cap (reclaim, run once before the write takes its locks, couldn't get
   below it, or this one write added more pages than the gap) returns a short
   count or `-ENOSPC` instead of growing the cache until the kernel runs out of
-  frames, logged once per crossing; and a write or truncate past the
+  frames, logged once per crossing. The cap is `PageCache::insert_new`'s: it
+  refuses a dirty page of a linked `ext4` file at the cap whichever path
+  made it (`write_from` asks first, before making the page), and lets a
+  clean one (a read's, which reclaim can drop) in; a write or truncate past the
   volume's largest file size returns `-EFBIG`. `create`/`mkdir`/`symlink`
   return `-ENOSPC` while fewer than 8 blocks are free, so a new entry can
   always be linked (or its inode released) without the directory growing
@@ -5200,6 +5203,18 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   `EMLINK`). A write failing inside `ext4plus` between allocating a block and
   recording it in the inode leaks that block (its free is crate-private):
   `e2fsck` reclaims it.
+- **Shared page I/O (#264, #265):** `tmpfs` and `ext4` move a file's bytes
+  through the same three `PageCache` methods, under the inode's Lock 4 and
+  Lock 5: `read_into(offset, buf, file_size, miss)` (a page not cached is
+  `miss`'s: a page read from disk, inserted after the copy, or `None`, a
+  hole read as zeros without a frame), `write_from(offset, buf, dirty,
+  fill)` (a page not cached is `fill`'s, a zero page or one holding the
+  disk's bytes a partial write keeps; an error past the first page is a
+  short count) and `zero_tail(old_size, new_size, dirty)` (the rule
+  below). Their page arithmetic is `lumen_vfs::page`'s, host-tested:
+  `spans` (each page a byte range touches, its offset there and its part
+  of the buffer), `pages_in` (the pages below a size) and `resize_tail`
+  (which bytes past the end a size change zeroes).
 - **Truncate & extend interaction:**
   - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`),
     in this order:
@@ -5230,7 +5245,8 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     fill as `read_at` (`Ext4Inode::load_page`, which logs a failed read
     naming the device, inode and page, once per streak of the same error).
     A hole in a `tmpfs` file (or a detached `ext4` one) gets a zero page
-    through the same get-or-insert as `write_at` (`tmpfs::page_or_new`).
+    (`CachePage::new_shared`, as `write_at`'s new pages; `tmpfs::page_or_new`
+    for `tmpfs`).
     Unlike `read_at`, which reads a hole as zeros without a frame, a mapped
     hole costs a frame: the `tmpfs` or detached quota can refuse it
     (`NoSpc`). A missing page of a linked `ext4` file is refused (`NoSpc`,
@@ -5610,7 +5626,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `set_mode/owner/times(...)` (`set_owner` also leaves the mode
     `lumen_vfs::mode_after_chown` gives: setuid dropped on a non-directory,
     setgid too with group-execute, in the same metadata-lock hold and
-    inode write, #254), plus `read_page`/`write_page` feeding
+    inode write, #254; `set_times` sets each stamp to
+    `SetTime::resolve(current, now)`: kept for `Omit`, `now` for `Now`,
+    the given time for `Set`, #302), plus `read_page`/`write_page` feeding
     `PageCache` and `sync()`, `append(buf) -> (pos, n)` (#254b: `O_APPEND`'s
     write, the end read and the write made in one hold of the inode's
     Lock 4, so appenders through separate open file descriptions never
