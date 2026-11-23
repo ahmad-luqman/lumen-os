@@ -279,17 +279,24 @@ VFS_SWEEP_LINES = (
 )
 # The volume's `errors=remount-ro` line (#349): once per ext4 volume a
 # failed write makes read-only, so once per leg of every write-fault sweep
-# (held back, inside their guards) and once in each other ktest that fails
-# a write (printed, outside any guard): counted as present, inside a guard
-# or not. One call site, so a guard prints it at most once.
+# (held back, inside their guards; so is any ktest erroring more than one
+# volume) and once in each other ktest that fails a write, printed outside
+# any guard: counted as present, those outside guards exactly
+# (`VFS_ERRORED_UNGUARDED`). One call site, so a guard prints it at most once.
 VFS_ERRORED_LINES = (
     (
         rf"ERROR vfs: ext4 {_DEV}: (unlink|rmdir|rename|link|create|mkdir|symlink|truncate|chmod|chown|"
-        r"utimensat|writeback|fsync|sync) failed writing to the device \([^()]+\); the volume is read-only "
+        r"utimensat|writeback|fsync|sync|a read's eviction) failed writing to the device \([^()]+\); the volume is read-only "
         r"until reboot \(errors=remount-ro\); run e2fsck -f"
     ),
 )
 VFS_HOLDABLE_LINES = (*VFS_SWEEP_LINES, *VFS_ERRORED_LINES)
+# The ktests erroring one volume outside a guard, one line each: the
+# writeback ktests (sync past a failing inode, a failing page, reclaim's
+# write error), vfs::tests' sync past a failing inode and flush/reclaim
+# write error, io's sync of every filesystem, mem's msync and meta's
+# failed chown.
+VFS_ERRORED_UNGUARDED = 8
 VFS_EXACT_LINES = {
     # page_quota_release_saturates_and_detached_quota_reports_nospc
     r"ERROR vfs: quota ktest \(16384 bytes\): released 20480 bytes with only 8192 reserved": 1,
@@ -326,10 +333,12 @@ VFS_EXACT_LINES = {
     # linux::syscall::io: io_fsync_writes_an_ext4_file_back_and_reports_eio's
     # `fsync` with the block cache's sync failing, and
     # io_sync_flushes_every_mounted_filesystem's `sync` with one volume's;
-    # and ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next
-    # (#331): one of each, the device's writes failing under the block cache.
+    # and ext4_a_failed_device_write_makes_the_volume_read_only (#331, #349):
+    # its fsync's, the device's writes failing under the block cache (the
+    # volume read-only after it, its own sync then writes nothing and warns
+    # nothing).
     rf"WARN  vfs: fsync: ext4 {_DEV} inode \d+: block cache: block device I/O error": 2,
-    rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 2,
+    rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 1,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
     # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page;
     # page_cache_insert_refuses_a_dirty_ext4_page_at_the_hard_limit,
@@ -412,6 +421,7 @@ def check_vfs_log_lines(out):
     and the guards on serial are the kernel source's: a sweep without a guard
     fails here, not at the time bound."""
     tally = dict.fromkeys((*VFS_EXACT_LINES, *VFS_HOLDABLE_LINES), 0)
+    unguarded = 0
     problems = []
     guards = 0
     held_any = False
@@ -447,7 +457,8 @@ def check_vfs_log_lines(out):
         if not summary and family not in VFS_HOLDABLE_LINES:
             continue
         if not summary and family in VFS_ERRORED_LINES and guard is None:
-            continue  # a single fault's volume, outside any sweep
+            unguarded += 1  # a single fault's volume, outside any sweep
+            continue
         if guard is None:
             problems.append(("a sweep line or summary outside a vfs guard", line))
         elif not summary:
@@ -466,6 +477,7 @@ def check_vfs_log_lines(out):
     sweeps = {want: tally[want] for want in VFS_HOLDABLE_LINES}
     assert all(sweeps.values()), sweeps
     assert guards == VFS_HELD_KTESTS, (guards, VFS_HELD_KTESTS)
+    assert unguarded == VFS_ERRORED_UNGUARDED, (unguarded, VFS_ERRORED_UNGUARDED)
     assert held_any, "no vfs lines held back: the guards hold nothing"
 
 

@@ -613,6 +613,8 @@ crate::ktest!(
 
 crate::ktest!(
     fn ext4_truncate_and_open_unlink_preserve_state_on_io_error() {
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering;
 
@@ -850,13 +852,7 @@ fn sweep_rmdir_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &
                         kassert!(!d.is_detached());
                         kassert_eq!(d.stat().map_err(|_| "stat still live")?.nlink, 2);
                         kassert!(m.fs.lookup_live_by_lock_id(d.lock_id()).is_some());
-                        if !read_only_after(&m)? {
-                            unlink_at(&m.tables, None, b"/victim_dir", true).map_err(|_| "retry rmdir")?;
-                            if open {
-                                kassert!(d.is_detached());
-                            }
-                            kassert_eq!(d.stat().map_err(|_| "stat retried")?.nlink, 0);
-                        }
+                        kassert!(read_only_after(&m)?);
                     } else {
                         if open {
                             kassert!(d.is_detached());
@@ -919,11 +915,7 @@ fn sweep_rename_dir_overwrite_io_recovery(base_img: &[u8], quota_before: usize) 
                     kassert!(!dst.is_detached());
                     kassert_eq!(dst.stat().map_err(|_| "stat dst live")?.nlink, 2);
                     kassert!(m.fs.lookup_live_by_lock_id(dst.lock_id()).is_some());
-                    if !read_only_after(&m)? {
-                        rename_at2(&m.tables, None, b"/src_d", None, b"/dst_d", RenameFlags::default())
-                            .map_err(|_| "retry ren dir")?;
-                        kassert!(dst.is_detached());
-                    }
+                    kassert!(read_only_after(&m)?);
                 } else {
                     // The error came after the source landed: `/dst_d` is
                     // the source now, never missing.
@@ -994,13 +986,7 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
                             readlink_at(&m.tables, None, b"/sym_i").map_err(|_| "path readlink")?,
                             b"/real/target"
                         );
-                        if !read_only_after(&m)? {
-                            unlink_at(&m.tables, None, b"/sym_i", false).map_err(|_| "retry sym unlink")?;
-                            if open {
-                                kassert!(sym.is_detached());
-                                kassert_eq!(sym.readlink().map_err(|_| "sym readlink detached")?, b"/real/target");
-                            }
-                        }
+                        kassert!(read_only_after(&m)?);
                     } else {
                         if open {
                             kassert!(sym.is_detached());
@@ -1050,11 +1036,7 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
                 if matches!(cur, Ok(ref r) if r.inode.ino() == sym_orig_ino) {
                     kassert!(!sym.is_detached());
                     kassert_eq!(sym.readlink().map_err(|_| "sym ren live readlink")?, b"/real/target");
-                    if !read_only_after(&m)? {
-                        rename_at2(&m.tables, None, b"/sym_s", None, b"/sym_i", RenameFlags::default())
-                            .map_err(|_| "retry sym rename")?;
-                        kassert!(sym.is_detached());
-                    }
+                    kassert!(read_only_after(&m)?);
                 } else {
                     // The error came after the source landed.
                     let moved = resolve_path(&m.tables, None, b"/sym_i", rf).map_err(|_| "sym_i lost")?.inode;
@@ -1115,10 +1097,7 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
                     kassert!(!uf.is_detached());
                     kassert_eq!(uf.stat().map_err(|_| "stat reg live")?.nlink, 1);
                     kassert!(m.fs.lookup_live_by_lock_id(uf.lock_id()).is_some());
-                    if !read_only_after(&m)? {
-                        unlink_at(&m.tables, None, b"/reg.bin", false).map_err(|_| "retry reg unlink")?;
-                        kassert!(uf.is_detached());
-                    }
+                    kassert!(read_only_after(&m)?);
                 } else {
                     kassert!(uf.is_detached());
                     kassert_eq!(uf.stat().map_err(|_| "stat reg detached")?.nlink, 0);
@@ -1186,10 +1165,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
                 kassert!(!f.is_detached());
                 kassert_eq!(f.stat().map_err(|_| "stat rolled back f")?.nlink, 1);
                 kassert!(m.fs.lookup_live_by_lock_id(f.lock_id()).is_some());
-                if !read_only_after(&m)? {
-                    unlink_at(&m.tables, None, b"/sd/f", false).map_err(|_| "unlink rolled back f")?;
-                    kassert!(f.is_detached());
-                }
+                kassert!(read_only_after(&m)?);
             }
             (Err(VfsError::NoEnt), Ok(n)) => {
                 kassert!(!f.is_detached());
@@ -1807,15 +1783,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
                 kassert_eq!(fb_nlink, 1);
             } else {
                 kassert!(fa_nlink == 1 || fb_nlink == 1);
-                if !read_only_after(&m)? {
-                    if fb_nlink == 1 {
-                        unlink_at(&m.tables, None, b"/sd/fa", false).map_err(|_| "unlink swapped fb")?;
-                        kassert!(fb.is_detached());
-                    } else {
-                        unlink_at(&m.tables, None, b"/dd/fb", false).map_err(|_| "unlink swapped fa")?;
-                        kassert!(fa.is_detached());
-                    }
-                }
+                kassert!(read_only_after(&m)?);
             }
         }
         drop((ga, gb, fa, fb, m));

@@ -501,6 +501,8 @@ crate::ktest!(
         // volume) its sync alone: `EIO`, the device unchanged, and the volume
         // read-only from then on (`errors=remount-ro`, #349): the next sync
         // writes nothing (`EIO`) and a write is `EROFS`.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use crate::vfs::page_cache::ktest_files::Ext4Volume;
         use crate::{kassert, kassert_eq};
         const LEN: usize = 6000;

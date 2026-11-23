@@ -382,9 +382,10 @@ one is its own PR that updates that doc first.
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, then
-  `errors=remount-ro`: the first failed write, latched at `LatchedCache`,
-  the one write seam, makes the volume read-only and freezes its block
-  cache when the operation (`WriteOp`) ends, #349; the
+  `errors=remount-ro`: the first failed device write, told by the block
+  cache's `writeback_failures` and latched at `LatchedCache`, the one seam,
+  makes the volume read-only and freezes its block cache when the
+  operation (`WriteOp`) ends, or at once for a read's eviction, #349; the
   link counts kept in memory when an undo fails (`NlinkBounds` through
   `write_links_or_pin`/`raise_links_or_floor`); `rename` split into
   `Exchange` (`RENAME_EXCHANGE`: `run`, `roll_back`, `finish`), `MoveEntry`

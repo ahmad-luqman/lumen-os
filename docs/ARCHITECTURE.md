@@ -5167,8 +5167,11 @@ blocks, extent trees, and file data writeback):
   clean unpinned slots, so a dirty block stays cached, still served to
   reads, until reboot (a miss while every unpinned slot is dirty returns
   `CacheFull`). `thaw` undoes it, for the ktests that read back what a
-  frozen cache holds; the kernel never thaws. `ext4`'s `errors=remount-ro`
-  (below) freezes its volume's cache through `BlockCacheBackend::freeze`.
+  frozen cache holds; the kernel never thaws. `writeback_failures` counts
+  the device's failed block writebacks (an eviction's or a sync's), so a
+  caller can tell a read failing for another block's writeback from a read
+  error. `ext4`'s `errors=remount-ro` (below) freezes its volume's cache
+  through `BlockCacheBackend::freeze`, and watches `writeback_failures`.
 - **Host tests (`cargo:lumen-bcache`):** verified against an in-memory
   `MemBlockDevice` with LRU eviction order, dirty writeback, RAII pin refusal
   (`CacheFull`), read-only rejection, partial tail block clamps, crash-before-
@@ -5721,11 +5724,15 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     - Every write goes into the block cache, which writes back (above): an
       operation whose blocks are only cached returns `Ok`, and the device's
       error comes from the next `FileSystem::sync` or a file's
-      `fsync`/`fdatasync`/`msync` (`EIO`, the blocks kept dirty for the next
-      sync; `ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next`),
-      or from the eviction that writes a block back, to whichever read or
-      write missed then (a lookup or a page read can get another block's
-      write error).
+      `fsync`/`fdatasync`/`msync` (`EIO`, the blocks kept dirty; since #349
+      that error makes the volume read-only, below:
+      `ext4_a_failed_device_write_makes_the_volume_read_only`), or from the
+      eviction that writes a block back, to whichever read or write missed
+      then (a lookup or a page read can get another block's write error).
+    - `ext4plus` retries a failed block allocation (`Extent::allocate`) one
+      block shorter and then reports `NoSpace`, so a write failing while a
+      writeback fills a hole can reach the caller as `ENOSPC`
+      (`ext4_writeback_continues_past_a_failing_page`), or even `Ok`.
     - `sync(2)` returns 0 whatever `vfs::sync_all` returns (Linux's
       behaviour), and global reclaim's page writeback has no caller: each
       failure is logged, its page kept dirty.
@@ -5754,33 +5761,43 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
 
     So a write error can't be told from operations' results; it can be from
     the block cache's calls (`BcacheIo::write`, the adapter's raw
-    `write_at`s, `sync`), except an eviction's, which reaches a read as an
-    ordinary `Io`.
+    `write_at`s, `sync`), and an eviction's, which reaches a read as an
+    ordinary `Io`, from the block cache's count of failed writebacks
+    (`BlockCache::writeback_failures`): where #349 watches.
   - **`errors=remount-ro` (#349):** Lumen's one policy for a write error,
     as Linux's for a root mounted `errors=remount-ro` (whose journal also
     aborts on a write error). `ext4plus` has no journal and writes each
     step of an operation as it goes, so a failure can leave any of a
     dozen partial states; rather than write on from one of them, the
     volume stops writing.
-    - *Trigger:* the first write of the volume's that fails, at one seam,
-      `LatchedCache` (the `BlockCacheBackend` the mount wraps the volume's
-      in, which every write goes through): a block-cache `write_at` from
-      `ext4plus` (directory blocks, inodes, bitmaps, group descriptors, the
-      superblock, a file's data and map at writeback) or from the adapter's
-      own raw writes (`..`, inline-symlink bytes), or a block-cache `sync`
-      (`fsync`, `sync`). It latches the first failure and its `BlockError`.
-      A data block's failed write counts too: the seam can't tell data from
+    - *Trigger:* the first device write of the volume's that fails, told by
+      one signal, the block cache's count of failed writebacks
+      (`writeback_failures`, above), which `LatchedCache` (the
+      `BlockCacheBackend` the mount wraps the volume's in, which every call
+      goes through) reads around each call: a block written back by a
+      `sync` (`fsync`, `sync`) or by the eviction of whichever `write_at`
+      (`ext4plus`'s, for directory blocks, inodes, bitmaps, group
+      descriptors, the superblock, a file's data and map at writeback; the
+      adapter's raw ones, `..` and inline-symlink bytes) or `read_at` missed.
+      A call's result alone decides nothing: a `write_at` can fail on a
+      pre-read or a full cache with no write failing, and the operation can
+      return `ENOSPC` (`ext4plus`'s allocation retry) or `Ok` (its
+      range-free retry, above) after one did. It latches the first failure
+      and its `BlockError` (`Io` when the call itself succeeded). A data
+      block's failed write counts too: the count can't tell data from
       metadata, and a file's writeback allocates blocks and writes its map
-      in the same call. Read errors, `NoSpc`, `NoMem`, and refusals made
-      before anything is written (`EFBIG`, the page cache's hard cap) never
-      reach a write and don't trigger it. Nor does a device write failing
-      inside a read's eviction, which surfaces as a read error (#331): the
-      block stays dirty, and the next sync writing it trips the policy.
+      in the same call. Read errors, a failed device flush (nothing it
+      wrote failed), `NoSpc` and `NoMem` that no failed write caused, and
+      refusals made before anything is written (`EFBIG`, the page cache's
+      hard cap), don't trigger it. In the ktests the `FaultCache` counts
+      each write or sync it fails as the device's.
     - *The operation that hit it* finishes as before: its undo (above)
-      still runs, writing to the block cache, and it returns its error
-      (`EIO`).
-    - *From its end on, the volume is errored* until reboot (nothing clears
-      it). `FileSystem::read_only()` and `errored()` say so, so the VFS
+      still runs, writing to the block cache, and it returns its error.
+    - *Read-only from the failed write on* until reboot (nothing clears
+      it): `FileSystem::read_only()` and `errored()` say so at once, so an
+      operation starting meanwhile is refused, while the one that hit it
+      writes on to its end (each write-type operation holds a `WriteOp`,
+      whose drop freezes the cache, below). The VFS
       refuses every write-type path with `EROFS` (create, `mkdir`,
       `symlink`, `link`, `unlink`, `rmdir`, `rename`, an open for writing
       or truncating, `chmod`/`chown`/`utimensat`), and the adapter's own
@@ -5791,17 +5808,21 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       error stays so, its stores reaching the page cache, never the disk.
       Reads, `stat`, `readdir` and `readlink` keep working, from the block
       and page caches (which hold the failed operation's in-memory undo).
-    - *Nothing more is written:* the operation's end freezes the block
-      cache (`BlockCache::freeze`, above), and the seam refuses every
-      write past it (`ReadOnly`, so `EROFS`). Dirty pages and metadata are
+    - *Nothing more is written:* the end of the operation that hit it
+      freezes the block cache (`BlockCache::freeze`, above), and the seam
+      refuses every write past it (`ReadOnly`, so `EROFS`). A read's
+      eviction tripping it with no write-type operation running freezes it
+      at once and reads again: the frozen cache evicts only clean blocks,
+      so the read is served (a failing dirty block would otherwise fail
+      every miss, #331). Dirty pages and metadata are
       never written back: reclaim evicts clean pages only, and `fsync`,
       `fdatasync`, `msync` and `sync` write nothing and return `EIO` (what
       they would write will never land), without a warning per inode.
-    - *One line,* when the operation that hit it ends:
+    - *One line,* when the freeze comes:
       `ERROR vfs: ext4 <dev>: <op> failed writing to the device (<cause>);
       the volume is read-only until reboot (errors=remount-ro); run e2fsck
       -f`, `<op>` the operation (`unlink`, `rename`, `writeback`, `fsync`,
-      ...) and `<cause>` the latched `BlockError`. `mount` shows its mode as
+      ..., or `a read's eviction`) and `<cause>` the latched `BlockError`. `mount` shows its mode as
       `ro,errors`, `/proc/mounts` as `ro,errors=remount-ro`.
     - *Not marked on disk:* the superblock's `s_state` error bit and
       `s_error_count` aren't set. `ext4plus` 0.1.0-rc.2 neither reads nor
@@ -5814,9 +5835,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     - Tested by `ktest:lumen_kernel::vfs::ext4::ext4_a_write_error_makes_the_volume_read_only`
       (a fault in `unlink`, `rename` and `rmdir`, then every write-type
       operation `EROFS`, reads working, the device's bytes unchanged
-      through writes, syncs and evicting reads, the line, `ro,errors`) and
-      the fault sweeps, which check the failed operation's own outcome and
-      then that the volume went read-only.
+      through writes, syncs and evicting reads, the line, `ro,errors`),
+      `ext4_a_failed_device_write_makes_the_volume_read_only` (the real block
+      cache over a failing device: an `fsync`'s sync, and a read's
+      eviction, which is then served) and the fault sweeps, which check the
+      failed operation's own outcome and then that the volume went
+      read-only.
   - **Rename over an existing target:** the target is held, not removed,
     until the source has landed at its name. Its entry is taken out with
     its `links_count` unchanged (`Dir::unlink` is handed one more than the

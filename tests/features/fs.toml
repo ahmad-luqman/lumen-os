@@ -318,10 +318,12 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4's errors=remount-ro (#349): the first failed write of a volume (ext4plus's or the adapter's, a writeback or a block-cache sync) makes it read-only once the operation that hit it ends: that operation returns its error with its undo run, every later write-type operation is EROFS (create, mkdir, symlink, link, unlink, rmdir, rename, opens for writing or truncating, write, truncate, chmod, chown, utimensat, a new shared writable mmap), fsync, fdatasync, msync and sync write nothing and return EIO, reclaim drops only clean pages, reads keep working, and nothing more reaches the device (the block cache frozen: no write, sync or eviction writeback); one ERROR line names the device, the operation and the error; mount shows ro,errors and /proc/mounts ro,errors=remount-ro; a read error leaves the volume writable; the fault sweeps check each failed operation's own outcome and then that the volume went read-only"
+name = "ext4's errors=remount-ro (#349): the first failed device write of a volume (counted by the block cache, wherever it is written back: an ext4plus or adapter write's eviction, a writeback, a sync, a read's eviction; whatever errno the operation returns, ENOSPC or Ok included) makes it read-only at once and freezes its block cache when the operation that hit it ends (a read's at once, the read then served): that operation returns its error with its undo run, every later write-type operation is EROFS (create, mkdir, symlink, link, unlink, rmdir, rename, opens for writing or truncating, write, truncate, chmod, chown, utimensat, a new shared writable mmap), fsync, fdatasync, msync and sync write nothing and return EIO, reclaim drops only clean pages, reads keep working, and nothing more reaches the device (the block cache frozen: no write, sync or eviction writeback); one ERROR line names the device, the operation and the error; NoSpc with no failed write leaves the volume writable; mount shows ro,errors and /proc/mounts ro,errors=remount-ro; a read error leaves the volume writable; the fault sweeps check each failed operation's own outcome and then that the volume went read-only"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_a_write_error_makes_the_volume_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_device_write_makes_the_volume_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried",
     "ktest:lumen_kernel::vfs::ext4::ext4_writeback_continues_past_a_failing_page",
     "ktest:lumen_kernel::vfs::ext4::ext4_sync_flushes_the_rest_past_a_failing_inode",
     "ktest:lumen_kernel::vfs::tests::ext4_partial_phase2_io_error_recovery",

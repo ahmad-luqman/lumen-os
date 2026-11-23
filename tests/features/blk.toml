@@ -21,9 +21,9 @@ tests = [
 ]
 
 [[feature]]
-name = "A failed device write is never reported as success or dropped (#331): `write_at` only caches, so a device error comes back from the call that writes the block back (the `write_at` or `read_at` whose miss evicts it, `flush_blocks`, `sync`), the block stays dirty and cached, the caller's own write lands nowhere, and the next writeback writes it; through ext4 over the real block cache, an unlink returns Ok (cached), the next fsync and filesystem sync return EIO with nothing reaching the device, and the sync after the device recovers writes it all (a fresh mount sees the unlink and the fsynced data)"
+name = "A failed device write is never reported as success or dropped (#331): `write_at` only caches, so a device error comes back from the call that writes the block back (the `write_at` or `read_at` whose miss evicts it, `flush_blocks`, `sync`), the block stays dirty and cached, the caller's own write lands nowhere, and the next writeback writes it; each failed block writeback is counted (writeback_failures), an eviction's too; and frozen, the cache writes nothing and serves misses from clean slots (#349); through ext4 over the real block cache, an unlink returns Ok (cached) and the next fsync returns EIO with nothing reaching the device (ext4 then goes read-only: errors=remount-ro, fs.toml)"
 milestone = "M7"
 tests = [
     "cargo:lumen-bcache",
-    "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next",
+    "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_device_write_makes_the_volume_read_only",
 ]
