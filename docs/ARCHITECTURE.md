@@ -3679,8 +3679,9 @@ route through the VFS and real process working directory:
   `musl` stdio buffering and `busybox`); `FIOCLEX`/`FIONCLEX`/`FIONBIO`
   update per-FD `FD_CLOEXEC` / `O_NONBLOCK` on any open non-`O_PATH` FD.
 - **`readv` (19):** loops across all non-empty `iov` spans for regular files
-  (stopping early only on EOF or error), while keeping single-read early return
-  on console/tty FDs.
+  (stopping early only on EOF, an error, or a short span: the page cache's
+  short count for an error past a span's first page, #321), while keeping
+  single-read early return on console/tty FDs.
 - **`poll` (7):** regular files, directories, `/proc/*`, and always-ready
   character devices (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`)
   report `POLLIN | POLLOUT` immediately (matching Linux), while console FDs
@@ -3702,7 +3703,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 6 | `lstat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW)` |
 | 8 | `lseek(fd, off, whence)` | `SEEK_SET` (0), `SEEK_CUR` (1), `SEEK_END` (2) on regular files, `/proc`, and `/dev/{null,zero,random,urandom}` (returning 0); on directories updates `OpenFile::dir_cursor` (`SEEK_SET` for `musl` `rewinddir`/`seekdir`); `-ESPIPE` on console/tty; `-EBADF` on `O_PATH`; rejects resulting negative offset with `-EINVAL` |
 | 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); masks `flags & MAP_TYPE` (`0x0f`) to select `MAP_SHARED` (1), `MAP_PRIVATE` (2), or `MAP_SHARED_VALIDATE` (3, rejecting unknown flags with `-EOPNOTSUPP`; any other `MAP_TYPE` → `-EINVAL`); `MAP_SYNC` and `MAP_FIXED_NOREPLACE` with `MAP_SHARED_VALIDATE` → `-EOPNOTSUPP`, as Linux's `LEGACY_MAP_MASK`; ignores advisory `MAP_DENYWRITE`/`MAP_EXECUTABLE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_NONBLOCK`/`MAP_STACK`/`MAP_LOCKED`/`MAP_UNINITIALIZED` and `MAP_32BIT`/`MAP_ABOVE4G`; `MAP_HUGETLB` → `-EINVAL`, and `MAP_GROWSDOWN` on a file → `-EINVAL`; validates `off & 0xfff == 0`, `len != 0` (`-EINVAL`), `len`'s page rounding (`-ENOMEM`), `off + aligned_len` at most `i64::MAX` for a regular file, below 2^64 otherwise (Linux's `ULONG_MAX` for a character device) (`-EOVERFLOW`), `fd` open & readable (`-EBADF` if closed or `O_PATH`, `-EACCES` on `O_WRONLY` or `MAP_SHARED \| PROT_WRITE` without `O_RDWR`), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); records `may_write` on `FileMapping` |
-| 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `count` capped at 1 MiB (`MAX_SINGLE_IO`), and a fault or filesystem error after the first 4 KiB chunk returns the bytes moved. Errors in this order: `-EINVAL` if `off < 0`; `-EBADF` if not open or `O_PATH`; `-ESPIPE` on console/tty and FIFO/socket nodes; `-EBADF` if not readable; `-EFAULT` if the buffer isn't wholly in user space; `-EINVAL` if `off + count` passes `i64::MAX`; `-EISDIR` on directories (even for 0 bytes) |
+| 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `count` capped at 1 MiB (`MAX_SINGLE_IO`), and a fault or filesystem error after the first 4 KiB chunk returns the bytes moved (as does a filesystem error past the first page inside that chunk: the page cache's short count, #321). Errors in this order: `-EINVAL` if `off < 0`; `-EBADF` if not open or `O_PATH`; `-ESPIPE` on console/tty and FIFO/socket nodes; `-EBADF` if not readable; `-EFAULT` if the buffer isn't wholly in user space; `-EINVAL` if `off + count` passes `i64::MAX`; `-EISDIR` on directories (even for 0 bytes) |
 | 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); same cap and the same errors in the same order as `pread64` (`-EBADF` if not writable; no `-EISDIR`, as a directory can't be open for writing) |
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
 | 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` (or a `len` within a page of 2^64, which Linux's rounding wraps to 0) and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` when `addr + len` rounded up overflows and on any unmapped hole (with `MS_SYNC`, after writing back the mapped parts; a writeback error such as `-EIO` wins); for `MS_SYNC`, writes back each `MAP_SHARED` file's dirty pages (a writable mapping keeps its pages dirty, section 5) through its filesystem and block cache to the device, with the address space's lock released |
@@ -5217,10 +5218,12 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   through the same four `PageCache` methods, under the inode's Lock 4 and
   Lock 5: `read_into(offset, buf, file_size, miss)` (a page not cached is
   `miss`'s: a page read from disk, inserted after the copy, or `None`, a
-  hole read as zeros without a frame; an error after some bytes were copied
-  is returned, not a short count, as before), `write_from(offset, buf,
-  old_size, fill)` (a page not cached is `fill`'s, a zero page or one
-  holding the disk's bytes a partial write keeps; a write starting past
+  hole read as zeros without a frame; an error past the first page is a
+  short count, the bytes before it, as Linux's `filemap_read` gives, #321),
+  `write_from(offset, buf, old_size, fill)` (a page not cached is
+  `fill`'s, a zero page or one holding the disk's bytes a partial write
+  keeps, through the same `Ext4Inode::load_page` as a read, which logs a
+  failed disk read, first page or not; a write starting past
   `old_size` first zeroes the old tail, the rule below; an error past the
   first page is a short count), `resize(old_size, new_size)` (a
   truncate's: a shrink's pages dropped, then the tail zeroed, the rule
@@ -5252,11 +5255,15 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
        caller's space only until M8 (`openat(O_TRUNC)` included).
   - Extending a file (`ftruncate` grow or `write`/`pwrite64` past `old_size`):
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
-    `PageCache`, zeroes `[old_size % 4096 .. 4096)` (marking it dirty as
-    above) before exposing the new size so stale past-EOF `MAP_SHARED`
-    stores never leak into extended regions. Writeback writes a page's
-    bytes below the size alone (`valid_len`), so such a store never
-    reaches the disk either.
+    `PageCache`, zeroes `[old_size % 4096 .. 4096)` before exposing the
+    new size so stale past-EOF `MAP_SHARED` stores never leak into extended
+    regions, and marks that page dirty for a linked `ext4` file: a truncate
+    at once, a write once it has written something (#321). A write refused
+    outright leaves the size as it was and a clean tail page clean, its
+    zeros past the end, so no writeback of the page can fail, and turn up
+    as a later `fsync`'s `EIO`, for a write the caller saw fail. Writeback
+    writes a page's bytes below the size alone (`valid_len`), so such a
+    store never reaches the disk either.
 - **Pages for `mmap` (built in #255's first part):** the file-backed VM
   takes a file's pages through one helper, `crate::vfs::mmap_page(inode:
   &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError>`.
@@ -5269,9 +5276,12 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   Holding the `Arc` pins the page (reclaim evicts only `strong_count == 1`).
   - *Filling:* both filesystems go through `PageCache::map_page`, which
     asks the fill for a missing page. A missing `ext4` page is read from
-    disk by the same private fill as `read_at` (`Ext4Inode::load_page`,
-    which logs a failed read naming the device, inode and page, once per
-    streak of the same error).
+    disk by the same private fill as `read_at` and a write's partial
+    pages (`Ext4Inode::load_page`, which logs a failed read naming the
+    device, inode and page, once per streak of the same error: a mapping's
+    fault turns the error into `SIGBUS`, and a read or write past its first
+    page into a short count, neither of which says anything of the disk,
+    #321).
     A hole in a `tmpfs` file (or a detached `ext4` one) gets a zero page
     (`CachePage::new_zeroed`, as `write_at`'s new pages).
     Unlike `read_at`, which reads a hole as zeros without a frame, a mapped
@@ -6102,7 +6112,26 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   work identically to `ext4`, directories, symlinks, hard links, native
   unlink-while-open via `Arc`, `renameat2`, `chmod`/`chown`/`utimensat`),
   bounded by a configurable memory quota (default 32 MiB in M7, returning
-  `-ENOSPC` instead of exhausting kernel frames).
+  `-ENOSPC` instead of exhausting kernel frames or heap). The quota, counted
+  in bytes (`QuotaCounter`), pays for the data pages and, since #267, for
+  each inode but the root (`tmpfs::charge::INODE_COST`: the inode as
+  allocated; a directory's two maps' root nodes, `charge::DIR_COST`), each
+  directory entry (`charge::entry_cost`: the name's heap block, kept twice,
+  and its share of the maps' other nodes, each holding at least five
+  entries) and each symlink's target's heap block: an estimate from above
+  of what each takes from the kernel heap, from std's `BTreeMap` layout
+  (B = 6) and `lumen_heap`'s 16-byte granule, which a ktest measures
+  against the heap. Not charged: the root inode and its maps' root nodes
+  (one per mount), a file's page map, advisory locks, and the VFS caches'
+  entries. A name is charged while it exists, an inode until its last
+  reference goes (an unlinked file still open keeps its charge, as its
+  pages; so does a removed directory's parent that the inode cache's
+  record for `..` holds (#318), until that record is pruned once nothing
+  else holds the removed directory: at the next directory removal on the
+  mount, or the next `..` taken from a removed directory). A rename to a new name moves the old name's charge to it,
+  reserving only what the new one costs more before anything changes: on
+  a full mount a name no costlier than the old one still fits, and the
+  count never passes the limit.
 - **`/dev` (`devfs`, `dev = 0:3`):** a writable mount (`rw` in `mount`
   and `/proc/mounts`), as Linux's devtmpfs (#301), whose names never
   change. lumen-vfs's own checks answer first, as on any writable mount

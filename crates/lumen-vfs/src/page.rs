@@ -3,7 +3,8 @@
 //! file, and which bytes past a file's end must be zero when its size
 //! changes. The kernel's `PageCache` (shared by `tmpfs` and `ext4`) walks
 //! its reads and writes with [`spans`], zeroes with [`resize_tail`] and, on
-//! a shrink, drops the pages from [`pages_in`] on; a page's [`valid_len`]
+//! a shrink, drops the pages from [`pages_in`] on, and answers a read or
+//! write that fails part-way with [`short_count`]; a page's [`valid_len`]
 //! bytes are what `ext4` reads in and writes back, and what a private
 //! mapping's copy of a page keeps (`MappedPage`, either filesystem's).
 
@@ -86,6 +87,26 @@ impl Iterator for PageSpans {
         self.done += chunk;
         Some(span)
     }
+}
+
+/// `step` run on each of `spans` in order, until one fails: how many of
+/// the buffer's bytes the spans before it cover, or that first span's error
+/// when nothing came before it. (The count is the failing span's start in
+/// the buffer, right because [`PageSpans`] come in order, without gaps,
+/// from 0.) The page cache's reads and writes answer this way (a short
+/// count, never an error, once some bytes moved, as Linux's `filemap_read`
+/// and `generic_perform_write` do); the caller's next call starts at the
+/// failing page and gets its error if it happens again. No span runs after
+/// a failure.
+pub fn short_count<E>(spans: PageSpans, mut step: impl FnMut(&PageSpan) -> Result<(), E>) -> Result<usize, E> {
+    let mut done = 0usize;
+    for span in spans {
+        if let Err(err) = step(&span) {
+            return if done > 0 { Ok(done) } else { Err(err) };
+        }
+        done = span.buf().end;
+    }
+    Ok(done)
 }
 
 /// How many pages a file of `size` bytes has: its pages are `0..pages_in(size)`,
@@ -312,5 +333,32 @@ mod tests {
         assert_eq!(resize_tail(5000, PAGE), None); // the new end on one
         assert_eq!(resize_tail(PAGE + 7, 0), None);
         assert_eq!(resize_tail(3 * PAGE + 1, PAGE + 9), Some(Tail { index: 1, from: 9 }));
+    }
+
+    #[test]
+    fn short_count_is_the_bytes_before_the_first_failure() {
+        // Each edge-case range, and each page in it failing: the bytes of
+        // the spans before the failing one, the error when it is the first,
+        // the whole range when none fails; and no span runs after a failure
+        // (a failing middle page never lets a later one count).
+        for offset in offsets().into_iter().filter(|&o| o < u64::MAX - 4 * PAGE) {
+            for len in lens() {
+                let range = spans(offset, len).unwrap();
+                let all: Vec<PageSpan> = range.clone().collect();
+                assert_eq!(short_count(range.clone(), |_| Ok::<(), ()>(())), Ok(len), "{offset}+{len}");
+                for bad in 0..all.len() {
+                    let mut ran = Vec::new();
+                    let got = short_count(range.clone(), |s| {
+                        ran.push(s.index());
+                        let i = s.index() - all[0].index();
+                        if i as usize == bad { Err(i) } else { Ok(()) }
+                    });
+                    let want = if bad == 0 { Err(0) } else { Ok(all[bad].buf().start) };
+                    assert_eq!(got, want, "{offset}+{len}, page {bad} failing");
+                    let indices: Vec<u64> = all[..=bad].iter().map(|s| s.index()).collect();
+                    assert_eq!(ran, indices, "{offset}+{len}, page {bad} failing");
+                }
+            }
+        }
     }
 }

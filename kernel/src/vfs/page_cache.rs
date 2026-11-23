@@ -17,11 +17,12 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use lumen_mm::PhysFrame;
 use lumen_vfs::page::{self, PageSpan};
-use lumen_vfs::{VfsError, VfsInode};
+use lumen_vfs::{DevId, VfsError, VfsInode};
 
 use crate::arch;
 use crate::mm;
@@ -38,7 +39,8 @@ pub const EXT4_SOFT_LIMIT_PAGES: usize = 8192;
 /// failing (a full or failing disk) or pages are pinned, so this bounds the
 /// memory a writer can fill with pages that never reach the disk.
 pub const EXT4_HARD_LIMIT_PAGES: usize = 2 * EXT4_SOFT_LIMIT_PAGES;
-/// Default `tmpfs` memory quota (32 MiB = 8192 pages).
+/// Default `tmpfs` memory quota (32 MiB = 8192 pages' worth), which its
+/// pages share with, since #267, its inodes, names and symlink targets.
 pub const TMPFS_DEFAULT_QUOTA_PAGES: usize = 8192;
 /// Non-evictable quota for open-unlinked detached `ext4` inodes (32 MiB = 8192 pages).
 pub const DETACHED_QUOTA_PAGES: usize = 8192;
@@ -109,79 +111,126 @@ pub fn detached_cached_pages() -> usize {
     DETACHED_CACHED_PAGES.load(Ordering::Relaxed)
 }
 
-/// Lock-free atomic page-frame quota counter (used by `tmpfs` and Gate 6 detach).
+/// Lock-free atomic memory quota, counted in bytes: `tmpfs`'s (its pages,
+/// and since #267 its inodes, directory entries and symlink targets) and
+/// Gate 6 detach's (pages only). The `_pages` methods count whole pages.
+/// The count never passes the limit. A quota dropped with bytes still
+/// reserved logs an error: its owner leaked them.
 #[derive(Debug)]
 pub struct QuotaCounter {
     /// What the quota is for, named in its log lines.
     name: &'static str,
-    limit_pages: usize,
-    used_pages: AtomicUsize,
+    /// The mount it bounds (a `tmpfs`'s), also named in its log lines.
+    dev: Option<DevId>,
+    limit_bytes: usize,
+    used_bytes: AtomicUsize,
 }
 
 impl QuotaCounter {
-    pub const fn new(name: &'static str, limit_pages: usize) -> Self {
-        Self { name, limit_pages, used_pages: AtomicUsize::new(0) }
+    /// A quota of `limit_pages` pages.
+    pub const fn new_pages(name: &'static str, limit_pages: usize) -> Self {
+        Self { name, dev: None, limit_bytes: limit_pages.saturating_mul(PAGE_SIZE), used_bytes: AtomicUsize::new(0) }
     }
 
-    /// Reserve `pages`, or `false` if that would pass the limit. A `true`
-    /// must be released later, or the pages leak from the quota.
+    /// The quota of `limit_bytes` bytes bounding the mount `dev`.
+    pub const fn for_mount(name: &'static str, dev: DevId, limit_bytes: usize) -> Self {
+        Self { name, dev: Some(dev), limit_bytes, used_bytes: AtomicUsize::new(0) }
+    }
+
+    /// Reserve `pages` pages, or `false` if that would pass the limit. A
+    /// `true` must be released later, or the pages leak from the quota.
     #[must_use]
-    pub fn try_reserve(&self, pages: usize) -> bool {
-        if pages == 0 {
+    pub fn try_reserve_pages(&self, pages: usize) -> bool {
+        pages.checked_mul(PAGE_SIZE).is_some_and(|bytes| self.try_reserve_bytes(bytes))
+    }
+
+    /// Reserve `bytes`, or `false` if that would pass the limit. A `true`
+    /// must be released later, or the bytes leak from the quota.
+    #[must_use]
+    pub fn try_reserve_bytes(&self, bytes: usize) -> bool {
+        if bytes == 0 {
             return true;
         }
-        let mut cur = self.used_pages.load(Ordering::Acquire);
+        let mut cur = self.used_bytes.load(Ordering::Acquire);
         loop {
-            let Some(next) = cur.checked_add(pages) else {
+            let Some(next) = cur.checked_add(bytes) else {
                 return false;
             };
-            if next > self.limit_pages {
+            if next > self.limit_bytes {
                 return false;
             }
-            match self.used_pages.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            match self.used_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return true,
                 Err(actual) => cur = actual,
             }
         }
     }
 
-    /// Return `pages` to the quota. Releasing more than is reserved is a
+    /// Return `pages` pages to the quota, as [`Self::release_bytes`].
+    pub fn release_pages(&self, pages: usize) {
+        self.release_bytes(pages.saturating_mul(PAGE_SIZE));
+    }
+
+    /// Return `bytes` to the quota. Releasing more than is reserved is a
     /// bug elsewhere: the count saturates at zero (logged) rather than
     /// wrapping, which would make every later reservation fail.
-    pub fn release(&self, pages: usize) {
-        if pages == 0 {
+    pub fn release_bytes(&self, bytes: usize) {
+        if bytes == 0 {
             return;
         }
-        let mut cur = self.used_pages.load(Ordering::Acquire);
+        let mut cur = self.used_bytes.load(Ordering::Acquire);
         loop {
-            let next = cur.saturating_sub(pages);
-            match self.used_pages.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            let next = cur.saturating_sub(bytes);
+            match self.used_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }
         }
-        if pages > cur {
-            log::error!(
-                target: "vfs",
-                "page quota {} ({} pages): released {pages} pages with only {cur} reserved",
-                self.name,
-                self.limit_pages
-            );
+        if bytes > cur {
+            log::error!(target: "vfs", "quota {self}: released {bytes} bytes with only {cur} reserved");
         }
     }
 
+    /// The whole pages' worth reserved: exact for a quota only ever
+    /// reserved in pages (the detached one).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
     pub fn used_pages(&self) -> usize {
-        self.used_pages.load(Ordering::Acquire)
+        self.used_bytes() / PAGE_SIZE
     }
 
-    #[allow(dead_code)]
-    pub const fn limit_pages(&self) -> usize {
-        self.limit_pages
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+}
+
+/// `name`, the mount if one, and the limit: `tmpfs 0:2 (33554432 bytes)`.
+impl fmt::Display for QuotaCounter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name)?;
+        if let Some(dev) = self.dev {
+            write!(f, " {dev}")?;
+        }
+        write!(f, " ({} bytes)", self.limit_bytes)
+    }
+}
+
+impl Drop for QuotaCounter {
+    /// A quota goes when the last of its owners (a `tmpfs` mount, its
+    /// inodes and directories, their pages and charges) has gone, each
+    /// having given back what it held: bytes still reserved were leaked by
+    /// an owner that dropped without giving them back. An owner leaked
+    /// itself keeps the quota alive, so that logs nothing. Takes no
+    /// sleeping lock (the leak's `error!` takes the log's leaf lock).
+    fn drop(&mut self) {
+        let left = *self.used_bytes.get_mut();
+        if left != 0 {
+            log::error!(target: "vfs", "quota {self}: dropped with {left} bytes still reserved");
+        }
     }
 }
 
 /// Global Gate 6 quota for open-unlinked detached `ext4` inodes.
-pub static DETACHED_QUOTA: QuotaCounter = QuotaCounter::new("detached", DETACHED_QUOTA_PAGES);
+pub static DETACHED_QUOTA: QuotaCounter = QuotaCounter::new_pages("detached", DETACHED_QUOTA_PAGES);
 
 /// Ownership class controlling accounting and reclaim eligibility.
 #[derive(Clone, Debug)]
@@ -693,6 +742,18 @@ pub(crate) mod ktest_files {
             self.mnt.cache.fail_writes.store(fail, Ordering::Release);
         }
 
+        /// Fail every write into the block cache from the `from`th on,
+        /// counting from now, its syncs still working, until
+        /// [`Self::clear_faults`].
+        pub(crate) fn arm_write_from(&self, from: usize) {
+            self.mnt.cache.arm_write_from(from);
+        }
+
+        /// Make every injected fault stop.
+        pub(crate) fn clear_faults(&self) {
+            self.mnt.cache.clear();
+        }
+
         /// Make the block cache's syncs alone fail (`true`) or work again:
         /// writes still land in the cache, which keeps them dirty.
         pub(crate) fn fail_syncs(&self, fail: bool) {
@@ -720,8 +781,9 @@ pub(crate) mod ktest_files {
         (0..len).map(|i| ((i % 251) as u8).wrapping_add(seed) | 1).collect()
     }
 
-    /// `len` bytes of `f` at `off` (short at EOF), through the VFS's read
-    /// path.
+    /// `len` bytes of `f` at `off` (short at EOF, or where a page past the
+    /// first failed to read: `PageCache::read_into`), through the VFS's
+    /// read path.
     pub(crate) fn read(f: &Arc<dyn VfsInode>, off: u64, len: usize) -> Result<alloc::vec::Vec<u8>, &'static str> {
         let mut buf = alloc::vec![0u8; len];
         let n = f.read_at(off, &mut buf).map_err(|_| "read_at")?;
@@ -738,7 +800,8 @@ pub(crate) mod ktest_files {
         Ok(f)
     }
 
-    /// A fresh `tmpfs` holding `quota_bytes`.
+    /// A fresh `tmpfs` holding `quota_bytes` of data, and its few files'
+    /// inodes and names (`tmpfs::KTEST_METADATA_ROOM`).
     pub(crate) struct TmpfsVolume {
         _fs: Arc<super::super::tmpfs::Tmpfs>,
         pub(crate) root: Arc<dyn VfsInode>,
@@ -746,7 +809,10 @@ pub(crate) mod ktest_files {
 
     impl TmpfsVolume {
         pub(crate) fn new(minor: u32, quota_bytes: usize) -> Self {
-            let fs = super::super::tmpfs::Tmpfs::new(DevId::makedev(0, minor), quota_bytes);
+            let fs = super::super::tmpfs::Tmpfs::new(
+                DevId::makedev(0, minor),
+                quota_bytes + super::super::tmpfs::KTEST_METADATA_ROOM,
+            );
             Self { root: fs.root_inode(), _fs: fs }
         }
     }
@@ -807,13 +873,13 @@ impl PageCache {
                 TOTAL_CACHED_PAGES.fetch_add(1, Ordering::Relaxed);
             }
             CacheOwner::Tmpfs(quota) => {
-                if !quota.try_reserve(1) {
+                if !quota.try_reserve_pages(1) {
                     return Err(VfsError::NoSpc);
                 }
                 TOTAL_CACHED_PAGES.fetch_add(1, Ordering::Relaxed);
             }
             CacheOwner::Detached => {
-                if !DETACHED_QUOTA.try_reserve(1) {
+                if !DETACHED_QUOTA.try_reserve_pages(1) {
                     return Err(VfsError::NoSpc);
                 }
                 DETACHED_CACHED_PAGES.fetch_add(1, Ordering::Relaxed);
@@ -893,12 +959,11 @@ impl PageCache {
     /// A page not cached is asked of `miss`, by index: `Some(page)`, a new
     /// page holding the file's bytes there, is read and then inserted (its
     /// insert's error returned); `None` reads as zeros without a page (a
-    /// hole). An error from `miss` (or the insert) is returned even after
-    /// some bytes were copied, and those bytes are lost to the caller: where
-    /// Linux returns a short count, as [`Self::write_from`] does. (The
-    /// pages loaded before the error stay cached.) The caller holds the
-    /// inode's Lock 4, under which it read `file_size`, and this lock
-    /// (Lock 5).
+    /// hole). An error from `miss` (or the insert) is returned only when it
+    /// is the first page's, else a short count ([`page::short_count`],
+    /// #321). (The pages loaded before the error stay cached.) The caller
+    /// holds the inode's Lock 4, under which it read `file_size`, and this
+    /// lock (Lock 5).
     pub fn read_into(
         &mut self,
         offset: u64,
@@ -912,18 +977,25 @@ impl PageCache {
         let to_read = buf.len().min(usize::try_from(file_size - offset).unwrap_or(usize::MAX));
         // Never `None`: the range ends at or below `file_size`.
         let spans = page::spans(offset, to_read).ok_or(VfsError::Inval)?;
-        for span in spans {
-            let dst = &mut buf[span.buf()];
-            if let Some(cached) = self.pages.get(&span.index()) {
-                cached.read_bytes(span.in_page(), dst);
-            } else if let Some(loaded) = miss(span.index())? {
-                loaded.read_bytes(span.in_page(), dst);
-                self.insert_new(span.index(), Arc::new(loaded))?;
-            } else {
-                dst.fill(0);
-            }
+        page::short_count(spans, |span| self.read_span(span, &mut buf[span.buf()], &mut miss))
+    }
+
+    /// One page's part of [`Self::read_into`].
+    fn read_span(
+        &mut self,
+        span: &PageSpan,
+        dst: &mut [u8],
+        miss: &mut impl FnMut(u64) -> Result<Option<CachePage>, VfsError>,
+    ) -> Result<(), VfsError> {
+        if let Some(cached) = self.pages.get(&span.index()) {
+            cached.read_bytes(span.in_page(), dst);
+        } else if let Some(loaded) = miss(span.index())? {
+            loaded.read_bytes(span.in_page(), dst);
+            self.insert_new(span.index(), Arc::new(loaded))?;
+        } else {
+            dst.fill(0);
         }
-        Ok(to_read)
+        Ok(())
     }
 
     /// Write `buf` at file offset `offset` of a file of `old_size` bytes,
@@ -932,21 +1004,24 @@ impl PageCache {
     /// partial write keeps), which is then inserted ([`Self::insert_new`]).
     /// A write starting past the end first zeroes the old last page's bytes
     /// past `old_size`, as a growth to `offset` would ([`Self::resize`]),
-    /// and they stay zeroed, that page dirty if written back, even if the
-    /// write then fails. The bytes lie past the end, so the file reads the
-    /// same; but while writeback is failing, that page stays dirty, and a
-    /// later `fsync` reports `EIO` for a write the caller saw fail (#321).
-    /// A linked `ext4` file's pages ([`Self::writes_back`]) are marked
-    /// dirty, and a new one is refused at the hard limit
-    /// ([`Self::admit_unreclaimable`]) before `fill` runs. That is an early
-    /// answer: `fill` may sleep (a disk read) or be preempted, and another
-    /// thread may add pages meanwhile, so the insert asks again and refuses
-    /// the page `fill` made. Returns how many bytes were written: an error
-    /// (the admission's, `fill`'s or the insert's, either check's refusal
-    /// alike) only when it is the first page's, else a short count. `FBig`
-    /// when the range ends past `u64::MAX`, before anything changes. The
-    /// caller holds the inode's Lock 4 (`old_size` is the size it read
-    /// under it) and this lock (Lock 5), and sets the size and times.
+    /// and they stay zeroed even if the write then fails (they lie past the
+    /// end, so the file reads the same). That page is marked dirty, if
+    /// written back, only once the write has written something (only then
+    /// do its zeros lie below the new size); a write refused outright (an
+    /// `Err`) leaves the size as it was and a clean tail page clean, so that
+    /// no writeback of it can fail, and turn up as a later `fsync`'s `EIO`,
+    /// for a write the caller saw fail (#321). A linked `ext4` file's pages
+    /// ([`Self::writes_back`]) are marked dirty, and a new one is refused
+    /// at the hard limit ([`Self::admit_unreclaimable`]) before `fill`
+    /// runs. That is an early answer: `fill` may sleep (a disk read) or be
+    /// preempted, and another thread may add pages meanwhile, so the insert
+    /// asks again and refuses the page `fill` made. Returns how many bytes
+    /// were written: an error (the admission's, `fill`'s or the insert's,
+    /// either check's refusal alike) only when it is the first page's, else
+    /// a short count ([`page::short_count`]). `FBig` when the range ends
+    /// past `u64::MAX`, before anything changes. The caller holds the
+    /// inode's Lock 4 (`old_size` is the size it read under it) and this
+    /// lock (Lock 5), and sets the size and times.
     pub fn write_from(
         &mut self,
         offset: u64,
@@ -957,16 +1032,12 @@ impl PageCache {
         let spans = page::spans(offset, buf.len()).ok_or(VfsError::FBig)?;
         // At or before the end (`offset <= old_size`) nothing is zeroed: the
         // write overwrites the bytes it extends the file over.
-        self.zero_tail(old_size, offset.max(old_size));
-        let mut done = 0usize;
-        for span in spans {
-            if let Err(err) = self.write_span(&span, &buf[span.buf()], &mut fill) {
-                if done > 0 {
-                    break;
-                }
-                return Err(err);
-            }
-            done = span.buf().end;
+        let tail = self.zero_tail(old_size, offset.max(old_size));
+        let done = page::short_count(spans, |span| self.write_span(span, &buf[span.buf()], &mut fill))?;
+        if let Some(tail) = tail
+            && done > 0
+        {
+            self.mark_dirty(&tail);
         }
         Ok(done)
     }
@@ -980,18 +1051,22 @@ impl PageCache {
     ) -> Result<(), VfsError> {
         if let Some(cached) = self.pages.get(&span.index()) {
             cached.write_bytes(span.in_page(), src);
-            if self.writes_back() {
-                cached.set_dirty();
-            }
+            self.mark_dirty(cached);
             return Ok(());
         }
         self.admit_unreclaimable()?;
         let fresh = fill(span)?;
         fresh.write_bytes(span.in_page(), src);
-        if self.writes_back() {
-            fresh.set_dirty();
-        }
+        self.mark_dirty(&fresh);
         self.insert_new(span.index(), Arc::new(fresh))
+    }
+
+    /// Mark `page` dirty if this cache's pages are written back
+    /// ([`Self::writes_back`]): a write's or a truncate's change to it.
+    fn mark_dirty(&self, page: &CachePage) {
+        if self.writes_back() {
+            page.set_dirty();
+        }
     }
 
     /// The cache's side of a change of the file's size from `old_size` to
@@ -1009,20 +1084,23 @@ impl PageCache {
         if new_size < old_size {
             self.drop_from(page::pages_in(new_size));
         }
-        self.zero_tail(old_size, new_size);
+        if let Some(cached) = self.zero_tail(old_size, new_size) {
+            self.mark_dirty(&cached);
+        }
     }
 
-    /// [`Self::resize`]'s zeroing, which a write past the end shares
-    /// ([`Self::write_from`]).
-    fn zero_tail(&self, old_size: u64, new_size: u64) {
-        if let Some(tail) = page::resize_tail(old_size, new_size)
-            && let Some(cached) = self.pages.get(&tail.index())
-        {
-            cached.zero_range(tail.from(), PAGE_SIZE);
-            if self.writes_back() {
-                cached.set_dirty();
-            }
-        }
+    /// Zero, in the cached page holding it, what [`page::resize_tail`] says
+    /// a change of the size from `old_size` to `new_size` zeroes, leaving
+    /// the page's dirty bit as it is; the page zeroed, if any. Its callers
+    /// mark it dirty if it is written back: [`Self::resize`] at once, a
+    /// write past the end ([`Self::write_from`]) once it has written
+    /// something.
+    #[must_use = "a grown tail page's zeros reach the disk only once it is marked dirty"]
+    fn zero_tail(&self, old_size: u64, new_size: u64) -> Option<Arc<CachePage>> {
+        let tail = page::resize_tail(old_size, new_size)?;
+        let cached = self.pages.get(&tail.index())?;
+        cached.zero_range(tail.from(), PAGE_SIZE);
+        Some(Arc::clone(cached))
     }
 
     /// Drop all cached pages with `page_index >= start_page`, updating
@@ -1127,11 +1205,11 @@ impl PageCache {
                 EXT4_CACHED_PAGES.fetch_sub(count, Ordering::Relaxed);
             }
             CacheOwner::Tmpfs(quota) => {
-                quota.release(count);
+                quota.release_pages(count);
             }
             CacheOwner::Detached => {
                 DETACHED_CACHED_PAGES.fetch_sub(count, Ordering::Relaxed);
-                DETACHED_QUOTA.release(count);
+                DETACHED_QUOTA.release_pages(count);
             }
         }
     }
@@ -1160,7 +1238,7 @@ impl DetachedQuotaGuard {
     /// Reserve `pages` more; `NoSpc` (as [`PageCache::insert_new`] reports
     /// the same quota) when it is used up.
     pub fn try_reserve(&mut self, pages: usize) -> Result<(), VfsError> {
-        if DETACHED_QUOTA.try_reserve(pages) {
+        if DETACHED_QUOTA.try_reserve_pages(pages) {
             self.reserved += pages;
             Ok(())
         } else {
@@ -1176,7 +1254,7 @@ impl DetachedQuotaGuard {
 impl Drop for DetachedQuotaGuard {
     fn drop(&mut self) {
         if self.reserved > 0 {
-            DETACHED_QUOTA.release(self.reserved);
+            DETACHED_QUOTA.release_pages(self.reserved);
             self.reserved = 0;
         }
     }
@@ -1286,7 +1364,7 @@ crate::ktest!(
         // and a tmpfs page (its own quota) are let in at the limit.
         use crate::{kassert, kassert_eq};
         let mut pc = PageCache::new_ext4();
-        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new("ktest", 4)));
+        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new_pages("ktest", 4)));
         let dirty = Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?);
         dirty.set_dirty();
         let (clean, tmp_dirty) = (
@@ -1388,7 +1466,7 @@ crate::ktest!(
         // file's new page isn't held to it (its own quota).
         use crate::{kassert, kassert_eq};
         let mut pc = ext4_cache_with_page0()?;
-        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new("ktest", 4)));
+        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new_pages("ktest", 4)));
         let size = 3 * PAGE_SIZE as u64;
         let mut makes = 0usize;
         let (before, cached, in_tmpfs, after) = hard_limit_crossing(|| {
@@ -1416,6 +1494,136 @@ crate::ktest!(
         let page = pc.map_page(1, size, CachePage::new_zeroed).map_err(|_| "map below the limit")?;
         kassert!(Arc::ptr_eq(&page, pc.get(1).ok_or("page 1")?));
         kassert_eq!(pc.map_page(3, size, CachePage::new_zeroed).err(), Some(VfsError::Range));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_a_refused_write_past_the_end_leaves_its_tail_page_clean() {
+        // A write past the end zeroes the old last page's bytes past the end
+        // first, and marks that page dirty only once it has written
+        // something (its zeros then lie below the new size): a write refused
+        // outright leaves a clean tail page clean, so a failing disk can't
+        // fail its writeback, and a later `fsync` can't return EIO for it,
+        // after a write the caller saw fail (#321). A short write and a
+        // whole one mark it dirty.
+        use crate::{kassert, kassert_eq};
+        let p = PAGE_SIZE as u64;
+        let size = 100; // page 0 is the tail
+        let mut pc = ext4_cache_with_page0()?;
+        let tail = Arc::clone(pc.get(0).ok_or("page 0")?);
+        tail.write_bytes(200, b"junk"); // past the end, as a mapping stores
+        let refused = pc.write_from(2 * p, b"ab", size, |_| Err(VfsError::Io));
+        kassert_eq!(refused, Err(VfsError::Io));
+        kassert!(!tail.is_dirty());
+        let mut stale = [1u8; 4];
+        tail.read_bytes(200, &mut stale);
+        kassert_eq!(stale, [0; 4]); // zeroed all the same
+        kassert_eq!(pc.len(), 1);
+        // Page 1's byte written, page 2's fill failing: a short count.
+        let short = pc.write_from(2 * p - 1, b"ab", size, |span| {
+            if span.index() == 1 { CachePage::new_zeroed() } else { Err(VfsError::Io) }
+        });
+        kassert_eq!(short, Ok(1));
+        kassert!(tail.is_dirty());
+        let mut whole = ext4_cache_with_page0()?;
+        kassert_eq!(whole.write_from(2 * p, b"ab", size, |_| CachePage::new_zeroed()), Ok(2));
+        kassert!(whole.get(0).ok_or("page 0")?.is_dirty());
+        // A tmpfs file's pages are never written back: its tail page isn't
+        // marked dirty either.
+        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new_pages("ktest", 4)));
+        tmp.insert_new(0, Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?)).map_err(|_| "insert")?;
+        kassert_eq!(tmp.write_from(2 * p, b"ab", size, |_| CachePage::new_zeroed()), Ok(2));
+        kassert!(!tmp.get(0).ok_or("tmpfs page 0")?.is_dirty());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_ext4_fdatasync_after_a_refused_write_past_the_end_succeeds() {
+        // End to end (#321): an ext4 file whose last page is cached and
+        // clean; a write past the end refused at the hard limit (one
+        // hard-limit warning, pinned by test_ktest.py); then every block
+        // write failing, the block cache's own sync still working. The
+        // refused write left the tail page clean (and still cached), so
+        // `fdatasync` has nothing to write back and succeeds.
+        use crate::{kassert, kassert_eq};
+        use ktest_files::{file, pattern, read};
+        let vol = ktest_files::Ext4Volume::new(179)?;
+        let data = pattern(100, 21);
+        let f = file(&vol.root, "tail.bin", &data)?;
+        f.sync(false).map_err(|_| "sync")?;
+        let cache = page_cache_lock(&*f).ok_or("no page cache")?;
+        let cached = cache.lock().len();
+        kassert_eq!(cached, 1); // the tail page
+        let refused = hard_limit_crossing(|| {
+            reach_hard_limit();
+            f.write_at(2 * PAGE_SIZE as u64, b"ab")
+        });
+        kassert_eq!(refused, Err(VfsError::NoSpc));
+        let still_cached = cache.lock().get(0).is_some();
+        kassert!(still_cached); // the page the refused write zeroed past the end
+        let dirty = cache.lock().dirty_count();
+        vol.arm_write_from(1);
+        let synced = f.sync(true);
+        vol.clear_faults();
+        kassert_eq!(synced, Ok(()));
+        kassert_eq!(dirty, 0);
+        kassert!(read(&f, 0, 200)? == data);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_a_read_stops_at_its_first_failing_page() {
+        // A read over three pages whose middle one fails to load returns the
+        // first page's bytes alone: never the third page's (cached, so it
+        // would read) past the gap, and `miss` is asked of the middle one
+        // alone (`page::short_count`, #321).
+        use crate::{kassert, kassert_eq};
+        let mut pc = PageCache::new_ext4();
+        for (index, byte) in [(0u64, 0xa0u8), (2, 0xa2)] {
+            let page = CachePage::new_zeroed().map_err(|_| "frame")?;
+            page.write_bytes(0, &alloc::vec![byte; PAGE_SIZE]);
+            pc.insert_new(index, Arc::new(page)).map_err(|_| "insert")?;
+        }
+        let mut asked = Vec::new();
+        let mut buf = alloc::vec![0u8; 3 * PAGE_SIZE];
+        let got = pc.read_into(0, &mut buf, 3 * PAGE_SIZE as u64, |index| {
+            asked.push(index);
+            Err(VfsError::Io)
+        });
+        kassert_eq!(got, Ok(PAGE_SIZE));
+        kassert_eq!(asked, [1]);
+        kassert!(buf[..PAGE_SIZE].iter().all(|&b| b == 0xa0));
+        kassert!(buf[PAGE_SIZE..].iter().all(|&b| b == 0)); // nothing copied past the gap
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_a_read_failing_past_its_first_page_returns_the_bytes_before_it() {
+        // A read whose second page's disk read fails returns the first
+        // page's bytes, a short count as Linux's `filemap_read` gives, not
+        // the error; the next read, at the failing page, gets it (#321).
+        // One warning in all (both failures in one streak), pinned by
+        // test_ktest.py.
+        use crate::{kassert, kassert_eq};
+        use ktest_files::{file, pattern, read, reclaim_ext4};
+        let vol = ktest_files::Ext4Volume::new(198)?;
+        let data = pattern(2 * PAGE_SIZE, 13);
+        let f = file(&vol.root, "short.bin", &data)?;
+        kassert_eq!(reclaim_ext4(&f)?, 0); // on disk alone
+        kassert!(read(&f, 0, PAGE_SIZE)? == data[..PAGE_SIZE]); // page 0 cached, page 1 not
+        let mut whole = alloc::vec![0u8; 2 * PAGE_SIZE];
+        let mut second = alloc::vec![0u8; PAGE_SIZE];
+        vol.fail_reads(true);
+        let (got_whole, got_second) = (f.read_at(0, &mut whole), f.read_at(PAGE_SIZE as u64, &mut second));
+        vol.fail_reads(false);
+        kassert_eq!(got_whole, Ok(PAGE_SIZE));
+        kassert!(whole[..PAGE_SIZE] == data[..PAGE_SIZE]);
+        kassert_eq!(got_second, Err(VfsError::Io));
+        kassert!(read(&f, 0, 2 * PAGE_SIZE)? == data); // the disk reads again
         Ok(())
     }
 );
@@ -1681,12 +1889,20 @@ crate::ktest!(
 
 crate::ktest!(
     fn page_quota_release_saturates_and_detached_quota_reports_nospc() {
+        // Releasing more than is reserved (a bug elsewhere) saturates at
+        // zero, logged, rather than wrapping to "full"; a quota dropped with
+        // bytes still reserved logs that leak. Both lines are pinned in
+        // test_ktest.py's `VFS_EXACT_LINES`.
         use crate::kassert_eq;
-        let q = QuotaCounter::new("ktest", 4);
-        kassert_eq!(q.try_reserve(2), true);
-        q.release(5); // a bug elsewhere: more than reserved
-        kassert_eq!(q.used_pages(), 0);
-        kassert_eq!(q.try_reserve(4), true); // not wrapped to "full"
+        let q = QuotaCounter::new_pages("ktest", 4);
+        kassert_eq!(q.try_reserve_pages(2), true);
+        q.release_pages(5);
+        kassert_eq!(q.used_bytes(), 0);
+        kassert_eq!(q.try_reserve_pages(4), true); // not wrapped to "full"
+        kassert_eq!(q.try_reserve_bytes(1), false); // full to the byte
+        q.release_bytes(PAGE_SIZE - 1);
+        kassert_eq!(q.used_bytes(), 3 * PAGE_SIZE + 1);
+        drop(q); // with those still reserved: the leak's line
         let mut g = DetachedQuotaGuard::new();
         kassert_eq!(g.try_reserve(DETACHED_QUOTA_PAGES + 1).err(), Some(VfsError::NoSpc));
         Ok(())

@@ -237,7 +237,11 @@ VFS_SWEEP_LINES = (
 )
 VFS_EXACT_LINES = {
     # page_quota_release_saturates_and_detached_quota_reports_nospc
-    r"ERROR vfs: page quota ktest \(4 pages\): released 5 pages with only 2 reserved": 1,
+    r"ERROR vfs: quota ktest \(16384 bytes\): released 20480 bytes with only 8192 reserved": 1,
+    r"ERROR vfs: quota ktest \(16384 bytes\): dropped with 12289 bytes still reserved": 1,
+    # tmpfs_quota_dropped_with_bytes_reserved_logs_the_leak: a mount's own
+    # quota, named by its device
+    r"ERROR vfs: quota tmpfs 0:143 \(4096 bytes\): dropped with 16 bytes still reserved": 1,
     # ext4_unlink_restores_an_inline_symlink_when_the_directory_cant_be_read_back
     r"ERROR vfs: ext4 inode \d+: restoring the inline symlink target failed; run e2fsck": 1,
     # ext4_truncate_and_open_unlink_preserve_state_on_io_error
@@ -251,9 +255,15 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 4,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
     # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
-    # fills, a good one, a third failed fill), one warning each; and
-    # linux::syscall::io's io_pread_pwrite_report_filesystem_errors: one.
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 3,
+    # fills, a good one, a third failed fill), one warning each;
+    # linux::syscall::io's io_pread_pwrite_report_filesystem_errors: one;
+    # and #321's three: page_cache's
+    # page_cache_a_read_failing_past_its_first_page_returns_the_bytes_before_it
+    # (a short read, then the failing page's EIO: one streak) and
+    # ext4_a_write_whose_fill_read_fails_logs_it_as_a_read_does (a write's
+    # partial-page fill, logged as a read's is: two streaks, a failure past
+    # the write's first page and one on it, a fill that reads between).
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 1 \(offset 4096\) failed: Io": 6,
     # mm::user_vm::file_vm_disk_read_error_is_a_bus_error: a fault's fill.
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 2 \(offset 8192\) failed: Io": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
@@ -267,14 +277,16 @@ VFS_EXACT_LINES = {
     # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page;
     # page_cache_insert_refuses_a_dirty_ext4_page_at_the_hard_limit,
     # page_cache_write_from_refuses_at_the_hard_limit_before_filling,
-    # page_cache_write_from_refuses_a_page_the_cache_filled_up_for and
-    # page_cache_map_page_asks_the_hard_cap_before_and_after_make: one each
+    # page_cache_write_from_refuses_a_page_the_cache_filled_up_for,
+    # page_cache_map_page_asks_the_hard_cap_before_and_after_make and
+    # page_cache_ext4_fdatasync_after_a_refused_write_past_the_end_succeeds (#321,
+    # a write refused past the end): one each
     # (one crossing each, however many refusals: page_cache's
     # hard_limit_crossing).
     (
         r"WARN  vfs: ext4 page cache at its hard limit \(\d+ pages\): refusing new pages \(ENOSPC\) until "
         r"writeback or unmapping frees some"
-    ): 7,
+    ): 8,
     # ext4_unwritable_ro_compat_features_force_read_only
     (
         rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: ro_compat feature not supported for writing "
