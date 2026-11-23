@@ -2820,17 +2820,11 @@ impl<'n> MoveEntry<'n> {
         let (sync_old_dir, sync_new_dir, res) = if !old_is_dir {
             (None, None, Ok(()))
         } else if same_parent {
-            let op_expected = u32::from(orig_np_links);
-            let op_res = (|| -> Result<(), VfsError> {
-                let mut op_after = Inode::read(&inner.ext4, old_dir_ino).map_err(map_ext4_err)?;
-                op_after.set_links_count(orig_np_links);
-                op_after.write(&inner.ext4).map_err(map_ext4_err)
-            })();
-            match op_res {
-                Ok(()) => inner.clear_nlink_bounds(old_dir_ino.get()),
-                Err(_) => inner.set_nlink_exact(old_dir_ino.get(), op_expected),
-            }
-            (Some(op_expected), Some(op_expected), op_res)
+            // `Dir::link` wrote the parent's count plus one and the unlink
+            // left it, so this write always happens.
+            let res = inner.write_links_or_pin(old_dir_ino, orig_np_links);
+            let op_expected = Some(u32::from(orig_np_links));
+            (op_expected, op_expected, res)
         } else {
             inner.clear_nlink_bounds(new_dir_ino.get());
             let (op_nlink, op_err) = Ext4Inode::decrement_parent_nlink_after_rmdir(
@@ -5184,10 +5178,13 @@ crate::ktest!(
 crate::ktest!(
     fn ext4_namespace_operations_set_their_childrens_ctime() {
         // The test above checks the parents; this one the children: a moved
-        // or renamed file or directory, both sides of an exchange, an inode
+        // or renamed file or directory (renamed in its parent, or moved to
+        // another), both sides of an exchange between parents, an inode
         // that keeps a link after an unlink, and a rename's target that keeps
         // one. Each operation runs at its own clock reading, and each child
         // holds that reading as its ctime, in memory and after a remount.
+        // The parents' counts on disk then match memory (the directory
+        // renamed in its parent puts the parent's count back).
         use self::ktest_util::*;
         use crate::kassert_eq;
         let at = |k: i64| Timespec { sec: 1_800_000_000 + 10 * k, nsec: 0 };
@@ -5199,6 +5196,7 @@ crate::ktest!(
         let mv = m.root.create(b"mv", 0o644).map_err(|_| "create mv")?;
         let rn = m.root.create(b"rn", 0o644).map_err(|_| "create rn")?;
         let md = m.root.mkdir(b"md", 0o755).map_err(|_| "mkdir md")?;
+        let rd = m.root.mkdir(b"rd", 0o755).map_err(|_| "mkdir rd")?;
         let x = m.root.create(b"x", 0o644).map_err(|_| "create x")?;
         let y = d.mkdir(b"y", 0o755).map_err(|_| "mkdir d/y")?;
         let t = m.root.create(b"t", 0o644).map_err(|_| "create t")?;
@@ -5208,11 +5206,12 @@ crate::ktest!(
         // Each step, and the children it stamps with the paths they end at.
         type Step<'a> = &'a dyn Fn() -> Result<(), VfsError>;
         type Children<'a> = &'a [(&'a Arc<dyn VfsInode>, &'a [&'a [u8]])];
-        let steps: [(&str, Step<'_>, Children<'_>); 6] = [
+        let steps: [(&str, Step<'_>, Children<'_>); 7] = [
             ("unlink", &|| m.root.unlink(b"u2"), &[(&u, &[b"u"])]),
             ("move", &|| m.root.rename(b"mv", &d, b"mv", RenameFlags(0)), &[(&mv, &[b"d", b"mv"])]),
             ("rename", &|| m.root.rename(b"rn", &m.root, b"rn2", RenameFlags(0)), &[(&rn, &[b"rn2"])]),
             ("dir move", &|| m.root.rename(b"md", &d, b"md", RenameFlags(0)), &[(&md, &[b"d", b"md"])]),
+            ("dir rename", &|| m.root.rename(b"rd", &m.root, b"rd2", RenameFlags(0)), &[(&rd, &[b"rd2"])]),
             (
                 "exchange",
                 &|| m.root.rename(b"x", &d, b"y", RenameFlags(RenameFlags::EXCHANGE)),
@@ -5249,6 +5248,13 @@ crate::ktest!(
             }
         }
         kassert_eq!(lost, Vec::<&str>::new());
+        for (dir, path) in [(&m.root, &[][..]), (&d, &[&b"d"[..]][..])] {
+            let mut node = ro.root_inode();
+            for part in path.iter() {
+                node = node.lookup(part).map_err(|_| "ro lookup")?;
+            }
+            kassert_eq!(node.stat().map_err(|_| "ro stat")?.nlink, dir.stat().map_err(|_| "stat")?.nlink);
+        }
         Ok(())
     }
 );
