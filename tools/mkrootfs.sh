@@ -5,7 +5,8 @@
 #
 # Stages build/deps/alpine-minirootfs/ plus build/linux/* (/usr/local/bin and
 # /usr/local/lib), normalizes timestamps, builds the ext4 filesystem with the
-# exact #248-pinned mke2fs -O mask, and verifies it with e2fsck -fn.
+# exact #248-pinned mke2fs -O mask, makes it say its directories hash signed
+# (tools/ext4-signed-hash.sh, #308), and verifies it with e2fsck -fn.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -113,6 +114,14 @@ COPYFILE_DISABLE=1 E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$MKE2FS" -q -F \
     -E "hash_seed=${FIXED_UUID},root_owner=0:0,lazy_itable_init=0,no_copy_xattrs" \
     -d "$STAGE" "$TMP_IMG" "$ROOTFS_SIZE"
 
+# mke2fs sets s_flags' EXT2_FLAGS_UNSIGNED_HASH where `char` is unsigned (e.g.
+# Linux on aarch64), and Lumen mounts such a volume read-only (#308: ext4plus
+# hashes directory names signed). Set s_flags to signed on every host: only the
+# flag changes, which is all it takes since `mke2fs -d` indexes no directory,
+# and an image already signed (x86-64, macOS) is untouched. It checks the flag
+# from the image's bytes either way.
+E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$ROOT/tools/ext4-signed-hash.sh" "$DEBUGFS" "$TMP_IMG"
+
 # Normalize uid/gid (0:0), i_ctime/ctime_extra, and i_atime/atime_extra on every
 # allocated inode: `mke2fs -d` copies host st_uid/st_gid and wall-clock st_ctime
 # (updated by touch), and strictatime hosts can advance atime on read; `-E
@@ -164,5 +173,8 @@ if grep -qvE '^(debugfs [0-9]|$)' "$DBG_DIR/sif.err"; then
     exit 1
 fi
 
-"$E2FSCK" -fn "$TMP_IMG" >/dev/null
+if ! "$E2FSCK" -fn "$TMP_IMG" >/dev/null; then
+    echo "mkrootfs: e2fsck -fn failed on the image (one cause: an indexed directory, left in unsigned-hash order by ext4-signed-hash.sh's switch, holding a name with a byte of 0x80 or above: #308)" >&2
+    exit 1
+fi
 mv -f "$TMP_IMG" "$OUT"

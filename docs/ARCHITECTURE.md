@@ -5578,8 +5578,14 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     the adapter's raw `BlockCache` writes (`..` updates, inline-symlink
     zeroing, writing and restoring an inline target) never recompute
     checksums, `READONLY` because the volume says so, `ORPHAN_PRESENT`
-    because `ext4plus` never processes the orphan file's entries. A forced
-    read-only mount is logged with its reason.
+    because `ext4plus` never processes the orphan file's entries. So does
+    a volume whose directories may hash names unsigned (#308, the caveat
+    below): the superblock's `s_flags` (offset 0x160 in the superblock)
+    having `EXT2_FLAGS_UNSIGNED_HASH` (0x2), or neither that nor
+    `EXT2_FLAGS_SIGNED_HASH` (0x1) on a volume with `dir_index`. A forced
+    read-only mount is logged with its reason and its `ro_compat` (and its
+    `s_flags` when the hash is the reason; a journal needing recovery,
+    checked first, wins over it), unless the device itself is read-only.
   - **Write errors part-way through a namespace operation:** when a later
     `ext4` write fails, `unlink`, `rmdir`, `link` and `rename` (all three
     flavours) undo the disk changes they already made (re-linking entries,
@@ -5629,10 +5635,8 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     target then keeps its inode and data without an entry (logged).
   - **Names that aren't UTF-8** are listed, looked up, unlinked and
     renamed as any other (#268: VFS names are bytes, "Core abstractions"
-    below), except on a volume with unsigned directory hashes, where a
-    hashed directory's lookups can miss a name with a byte of 0x80 or
-    more, and such a name Lumen adds there is filed where Linux won't find
-    it (#308, the caveat below).
+    below), except on a volume whose directory hashes are or may be
+    unsigned, which mounts read-only (#308, the caveat below).
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
@@ -5698,7 +5702,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     relative open's, and the cwd's fallback), and the paths
     `/proc/<pid>/maps` names for file mappings. No layer checks a name for
     UTF-8, so an ext4 entry whose name isn't is listed, looked up,
-    unlinked and renamed like any other (but see #308 below), and `getcwd`
+    unlinked and renamed like any other (but see #308 below: on a volume
+    whose directory hashes are or may be unsigned, only listed and looked
+    up), and `getcwd`
     under it gives its bytes. Text shows a name or path through
     `lumen_vfs::Escaped`, never lossily (U+FFFD would name another file):
     UTF-8 as it is, except an ASCII control character and a byte that
@@ -5718,16 +5724,53 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     shell's argument, and a `PT_INTERP` path that isn't UTF-8 is refused
     (`ExecError::InterpPathNotUtf8`); there is no `execve` yet.
     **Caveat (#308):** `ext4plus` hashes a hashed (htree) directory's names
-    with signed bytes and never reads the superblock's unsigned-hash flag,
-    and an htree lookup has no linear fallback. On a volume made where
-    `char` is unsigned (`mke2fs` on aarch64 Linux), a name with a byte of
-    0x80 or more (UTF-8 or not) in such a directory is listed by `readdir`
-    but can be missed by `lookup`, `unlink`, `rmdir` or `rename` (when its
-    signed hash picks another leaf than its real one); and an entry Lumen
-    creates or renames to there is filed under the signed hash, where Linux
-    won't find it (Lumen's own `readdir` still lists it) until `e2fsck -fD`
-    reindexes the directory. Lumen's images are made where `char` is
-    signed, so no test meets it.
+    with signed bytes and never reads the superblock's hash flags, and an
+    htree lookup has no linear fallback. A volume says how its directories
+    hash in `s_flags`: `EXT2_FLAGS_UNSIGNED_HASH` (which `mke2fs` sets
+    where `char` is unsigned, e.g. aarch64 Linux) or
+    `EXT2_FLAGS_SIGNED_HASH`. With neither flag on a volume with
+    `dir_index`, Lumen can't tell: Linux since 6.2 builds with
+    `-funsigned-char` on every architecture, so its `ext4_hash_info_init`
+    hashes such a volume unsigned, and it writes the flag only from
+    `__ext4_fill_super` on a mount writable from the start, never on a
+    read-only mount later remounted read-write (`__ext4_remount`), so it
+    may have indexed directories unsigned and left no flag; `e2fsck`
+    stamps the flag its own host's `char` picks
+    (`e2fsck_fix_dirhash_hint`). So on a volume hashing unsigned, or maybe
+    so, a name with a byte of 0x80 or more (UTF-8 or not) in an htree
+    directory could be missed by a lookup (when its signed hash picks
+    another leaf than its real one), and an entry `ext4plus` adds there
+    would be filed under the signed hash, where Linux won't find it. Until
+    `ext4plus` takes the signedness from `s_flags` (#313), the adapter
+    guards: it mounts such a volume read-only (with the forced-read-only
+    warning naming the flag, or its absence beside `dir_index`), and its
+    `lookup`, on a miss in an htree directory of such a volume for a name
+    with a byte of 0x80 or above (the only bytes the two hashes read
+    differently), walks the directory's entries (`scan_dir_for`) before
+    saying `ENOENT`. On a sound directory, `lookup` (and so `stat` and
+    `open`) and `readdir` then agree (a read error during the walk, or in
+    the hash lookup before it, is that error, never `ENOENT`); `unlink`,
+    `rmdir`, `rename` and every other change are `EROFS`. Only such a miss
+    pays for the walk: an ASCII name's miss and a miss in a linear
+    directory stay one lookup (counted in blocks read by
+    `ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name`,
+    over `kernel/src/vfs/testdata/unsigned-hash.ext4`, made by
+    `tools/ext4-unsigned-hash-image.py`), and so does every miss on a
+    signed volume, which gets no walk (the same image with its flag set to
+    signed: the three names are `ENOENT`). Lumen's own images say they
+    hash signed, so they mount writable: the ktests' images built in code
+    set `EXT2_FLAGS_SIGNED_HASH` (or lack `dir_index`), and
+    `tools/mkrootfs.sh` sets `s_flags` to signed on an image `mke2fs` made
+    with unsigned hashes (on a host where `char` is unsigned), or with
+    neither flag, through
+    `tools/ext4-signed-hash.sh`, which changes only the flag, in the
+    primary superblock, and checks the image's bytes after
+    (`harness:test_rootfs::test_signed_hash_*`,
+    `harness:test_rootfs::test_mkrootfs_*`). `mke2fs -d` indexes no
+    directory; if one ever were indexed, mkrootfs.sh's final `e2fsck -fn`
+    fails the build once it holds a name with a byte of 0x80 or above in
+    a leaf its signed hash doesn't lead to (an ASCII name hashes alike
+    either way).
   - **Read-only mounts and special files (#291):** `open_inode` (a write
     open: `O_WRONLY`, `O_RDWR`, `O_TRUNC`) and `check_access` (`W_OK`)
     skip their `-EROFS` for a special file, by its type alone
@@ -7928,7 +7971,7 @@ crates/            no_std, host-testable libraries (lumen-acpi, lumen-app-api, l
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template
-tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), linux-hello/ (M6), linux-m7/ (M7), wallpaper.py (makes the wallpaper), harness/ (Python package)
+tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), linux-hello/ (M6), linux-m7/ (M7), ext4-signed-hash.sh (mkrootfs.sh's #308 switch), ext4-unsigned-hash-image.py (makes kernel/src/vfs/testdata/unsigned-hash.ext4, #308), wallpaper.py (makes the wallpaper), harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
 apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs for wasm32-unknown-unknown, built by `make build` into build/apps/<name>.wasm (the runtime's test apps, test-<name>, into build/apps/tests/<name>.wasm; testkit, the library they share)
