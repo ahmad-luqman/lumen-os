@@ -163,9 +163,13 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4 volumes with unsigned directory hashes (#308, s_flags EXT2_FLAGS_UNSIGNED_HASH, which ext4plus ignores) mount read-only with one warning naming the flag; every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (a hash miss walks the directory), a missing name is ENOENT, and unlink and rmdir are EROFS; the same volume hashing signed mounts writable"
+name = "ext4 volumes with unsigned directory hashes (#308, s_flags EXT2_FLAGS_UNSIGNED_HASH, which ext4plus ignores) mount read-only with one warning naming the flag; every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (only a non-ASCII hash miss in an htree directory walks it, a read error in the walk is EIO), a missing name is ENOENT, and unlink, rmdir and create are EROFS; the same volume with its flag set to signed mounts writable and gets no walk; mkrootfs.sh sets an unsigned image's flag to signed (tools/ext4-signed-hash.sh), failing if the flag stays unsigned"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name",
+    "ktest:lumen_kernel::vfs::ext4::ext4_unwritable_ro_compat_features_force_read_only",
     "scenario:test_ktest::test_in_kernel_tests_pass",
+    "harness:test_rootfs::test_signed_hash_switches_only_the_flag",
+    "harness:test_rootfs::test_signed_hash_on_an_image_mke2fs_made_passes_e2fsck",
+    "harness:test_rootfs::test_signed_hash_fails_when_the_flag_stays_unsigned",
 ]

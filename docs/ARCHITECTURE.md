@@ -5528,10 +5528,11 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     zeroing, writing and restoring an inline target) never recompute
     checksums, `READONLY` because the volume says so, `ORPHAN_PRESENT`
     because `ext4plus` never processes the orphan file's entries. So does
-    the superblock's `s_flags` (offset 0x160) having
+    the superblock's `s_flags` (offset 0x160 in the superblock) having
     `EXT2_FLAGS_UNSIGNED_HASH` (0x2; #308, the caveat below). A forced
-    read-only mount is logged with its reason, its `ro_compat` and its
-    `s_flags`, unless the device itself is read-only.
+    read-only mount is logged with its reason and its `ro_compat` (and its
+    `s_flags` when that has the flag), unless the device itself is
+    read-only.
   - **Write errors part-way through a namespace operation:** when a later
     `ext4` write fails, `unlink`, `rmdir`, `link` and `rename` (all three
     flavours) undo the disk changes they already made (re-linking entries,
@@ -5668,16 +5669,21 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     miss in an htree directory of such a volume for a name with a byte of
     0x80 or above (the only bytes the two hashes read differently), walks
     the directory's entries (`scan_dir_for`) before saying `ENOENT`.
-    `lookup` (and so `stat` and `open`) and `readdir` then agree;
-    `unlink`, `rmdir`, `rename` and every other change are `EROFS`. Only
-    such a miss pays for the walk: an ASCII name's, or any miss on a signed
-    volume, stays a hash lookup
+    On a sound directory, `lookup` (and so `stat` and `open`) and
+    `readdir` then agree (a read error during the walk is that error,
+    never `ENOENT`); `unlink`, `rmdir`, `rename` and every other change are
+    `EROFS`. Only such a miss pays for the walk: an ASCII name's, a miss in
+    a linear directory, or any miss on a signed volume stays one lookup
     (`ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name`,
-    over `kernel/src/vfs/testdata/unsigned-hash.ext4`, made by
+    which counts the blocks each miss reads, over
+    `kernel/src/vfs/testdata/unsigned-hash.ext4`, made by
     `tools/ext4-unsigned-hash-image.py`). Lumen's own images hash signed,
-    so they mount writable: `tools/mkrootfs.sh` switches an image `mke2fs`
-    made with unsigned hashes (on a host where `char` is unsigned) to
-    signed and re-indexes it with `e2fsck -fyD`.
+    so they mount writable: `tools/mkrootfs.sh` sets `s_flags` to signed
+    on an image `mke2fs` made with unsigned hashes (on a host where `char`
+    is unsigned) through `tools/ext4-signed-hash.sh`, which changes only
+    the flag (`mke2fs -d` indexes no directory, and the script's final
+    `e2fsck -fn` would fail on one) and checks the image's bytes after
+    (`harness:test_rootfs::test_signed_hash_*`).
   - **Read-only mounts and special files (#291):** `open_inode` (a write
     open: `O_WRONLY`, `O_RDWR`, `O_TRUNC`) and `check_access` (`W_OK`)
     skip their `-EROFS` for a special file, by its type alone
@@ -7758,7 +7764,7 @@ crates/            no_std, host-testable libraries (lumen-acpi, lumen-app-api, l
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template
-tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), linux-hello/ (M6), linux-m7/ (M7), wallpaper.py (makes the wallpaper), harness/ (Python package)
+tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), linux-hello/ (M6), linux-m7/ (M7), ext4-signed-hash.sh (mkrootfs.sh's #308 switch), ext4-unsigned-hash-image.py (makes kernel/src/vfs/testdata/unsigned-hash.ext4, #308), wallpaper.py (makes the wallpaper), harness/ (Python package)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
 apps/              the WASM apps (M5): their own cargo workspace, no_std cdylibs for wasm32-unknown-unknown, built by `make build` into build/apps/<name>.wasm (the runtime's test apps, test-<name>, into build/apps/tests/<name>.wasm; testkit, the library they share)

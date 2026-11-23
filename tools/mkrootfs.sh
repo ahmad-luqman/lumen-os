@@ -5,7 +5,8 @@
 #
 # Stages build/deps/alpine-minirootfs/ plus build/linux/* (/usr/local/bin and
 # /usr/local/lib), normalizes timestamps, builds the ext4 filesystem with the
-# exact #248-pinned mke2fs -O mask, and verifies it with e2fsck -fn.
+# exact #248-pinned mke2fs -O mask, makes it say its directories hash signed
+# (tools/ext4-signed-hash.sh, #308), and verifies it with e2fsck -fn.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -115,19 +116,11 @@ COPYFILE_DISABLE=1 E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$MKE2FS" -q -F \
 
 # mke2fs sets s_flags' EXT2_FLAGS_UNSIGNED_HASH where `char` is unsigned (e.g.
 # Linux on aarch64), and Lumen mounts such a volume read-only (#308: ext4plus
-# hashes directory names signed). Make the image hash signed on every host:
-# flip the flag and re-index any hashed directory (a no-op where the flag is
-# already signed, so x86-64 and macOS images are unchanged).
-if LC_ALL=C "$DEBUGFS" -R "stats" "$TMP_IMG" 2>/dev/null | grep -q '^Filesystem flags:.*unsigned_directory_hash'; then
-    LC_ALL=C E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$DEBUGFS" -w -R "ssv flags 1" "$TMP_IMG" >/dev/null 2>&1
-    rc=0
-    E2FSCK_TIME="$FIXED_EPOCH" E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$E2FSCK" -fyD "$TMP_IMG" >/dev/null || rc=$?
-    if (( rc > 1 )); then
-        echo "mkrootfs: e2fsck -fyD failed ($rc) re-indexing with signed directory hashes" >&2
-        exit 1
-    fi
-    echo "mkrootfs: mke2fs made unsigned directory hashes on this host; switched the image to signed (#308)" >&2
-fi
+# hashes directory names signed). Set s_flags to signed on every host: only the
+# flag changes, since `mke2fs -d` indexes no directory (the final `e2fsck -fn`
+# would fail on one), and an image already signed (x86-64, macOS) is untouched.
+# It checks the flag from the image's bytes either way.
+E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$ROOT/tools/ext4-signed-hash.sh" "$DEBUGFS" "$TMP_IMG"
 
 # Normalize uid/gid (0:0), i_ctime/ctime_extra, and i_atime/atime_extra on every
 # allocated inode: `mke2fs -d` copies host st_uid/st_gid and wall-clock st_ctime

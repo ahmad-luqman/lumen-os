@@ -1,8 +1,8 @@
 """Make the ktests' ext4 image with unsigned directory hashes (#308), written to
 kernel/src/vfs/testdata/unsigned-hash.ext4:
 
-a 160 KiB ext4 volume (1 KiB blocks, Lumen's writable feature mask, no
-journal) whose superblock sets `EXT2_FLAGS_UNSIGNED_HASH` (`s_flags` 0x2, as
+a 160 KiB ext4 volume (1 KiB blocks; mkrootfs.sh's #248 feature mask, so no
+journal, minus `resize_inode` to keep it small) whose superblock sets `EXT2_FLAGS_UNSIGNED_HASH` (`s_flags` 0x2, as
 mke2fs does where `char` is unsigned, e.g. Linux on aarch64), holding one
 indexed (htree, half_md4) directory `/d` built by `e2fsck -fyD` with the
 unsigned hash: 80 ASCII names `entry-number-NN` (each file holding `NN`) and
@@ -21,9 +21,12 @@ The names go in through `mke2fs -d` as ASCII stand-ins of the same length
 (macOS refuses names that aren't UTF-8), patched to their bytes in the image
 before `e2fsck -fyD` indexes the directory.
 
-Deterministic: the same e2fsprogs give the same file (fixed UUID, hash seed
-and times). It is committed, so the build never runs this; run it again only
-to change it:
+Deterministic for a given e2fsprogs and mke2fs.conf (fixed UUID, hash seed
+and times): the committed file was made with e2fsprogs 1.47.4 and its stock
+mke2fs.conf (Homebrew's; `-t ext4` takes its feature defaults and the
+half_md4 hash from there), found as `lumen_harness.rootfs.find_e2fsprogs`
+finds them (`LUMEN_E2FSPROGS_SBIN` first). It is committed, so the build
+never runs this; run it again only to change it:
 
     uv run python tools/ext4-unsigned-hash-image.py
 """
@@ -45,11 +48,15 @@ from lumen_harness.rootfs import find_e2fsprogs
 OUT = ROOT / "kernel" / "src" / "vfs" / "testdata" / "unsigned-hash.ext4"
 SIZE = "160K"
 EPOCH = "1700000000"
-TOUCH_TS = "202311142213.20"
-# The seed decides the leaves' hash ranges; this one sends all three signed
-# hashes to another leaf than their entry's (checked below).
+# The hash seed decides each name's hash, and so the leaf it lands in. This
+# one sends all three names' signed hashes to another leaf than their entry's
+# (checked below); if a change breaks that, `main` tries the other seeds and
+# names one that works.
 UUID = "4c756d65-6e2d-4d37-8000-00000000030c"
-SEEDS = [UUID, *(f"4c756d65-6e2d-4d37-8000-{n:012x}" for n in range(0x309, 0x400))]
+SEEDS = [
+    UUID,
+    *(s for n in range(0x309, 0x400) if (s := f"4c756d65-6e2d-4d37-8000-{n:012x}") != UUID),
+]
 # (stand-in, name, contents): each stand-in as long as its name.
 ODD = (
     (b"QQ-utf8", "é-utf8".encode(), b"x"),
@@ -79,6 +86,23 @@ def run(*args: object, env_extra: dict[str, str] | None = None, ok=(0,)) -> byte
     if proc.returncode not in ok:
         sys.stderr.buffer.write(proc.stdout + proc.stderr)
         raise SystemExit(f"{args[0]} exited {proc.returncode}")
+    return proc.stdout
+
+
+DEBUGFS_BANNER = re.compile(rb"debugfs \S+ \(.*\)$")
+
+
+def run_debugfs(debugfs: Path, *args: object) -> bytes:
+    """`run` for debugfs, which exits 0 when a request fails: any stderr line
+    but its version banner fails it too."""
+    env = {**os.environ, "LC_ALL": "C", "E2FSPROGS_FAKE_TIME": EPOCH}
+    proc = subprocess.run(
+        [str(debugfs), *map(str, args)], capture_output=True, env=env, check=False
+    )
+    errors = [line for line in proc.stderr.splitlines() if line and not DEBUGFS_BANNER.match(line)]
+    if proc.returncode != 0 or errors:
+        sys.stderr.buffer.write(proc.stdout + proc.stderr)
+        raise SystemExit(f"debugfs {args} exited {proc.returncode}")
     return proc.stdout
 
 
@@ -118,7 +142,7 @@ def build(seed: str, mke2fs: Path, e2fsck: Path, debugfs: Path, work: Path) -> P
     for stand_in, _name, data in ODD:
         (stage / "d" / stand_in.decode()).write_bytes(data)
     for p in sorted(stage.rglob("*"), reverse=True) + [stage]:
-        run("touch", "-h", "-t", TOUCH_TS, p, env_extra={"TZ": "UTC0"})
+        os.utime(p, (int(EPOCH), int(EPOCH)), follow_symlinks=False)
     image = work / "unsigned.ext4"
     run(
         mke2fs, "-q", "-F", "-t", "ext4", "-b", "1024", "-I", "256", "-N", "128",
@@ -144,8 +168,8 @@ def build(seed: str, mke2fs: Path, e2fsck: Path, debugfs: Path, work: Path) -> P
     (work / "sif.cmd").write_bytes(
         b"".join(b"".join(b"sif %s %s\n" % (p, f) for f in FIELDS) for p in paths)
     )
-    run(debugfs, "-w", "-f", work / "sif.cmd", image)
-    run(debugfs, "-w", "-R", "ssv flags 2", image)
+    run_debugfs(debugfs, "-w", "-f", work / "sif.cmd", image)
+    run_debugfs(debugfs, "-w", "-R", "ssv flags 2", image)
     run(e2fsck, "-fyD", image, ok=(0, 1))
     run(e2fsck, "-fn", image)
     return image
@@ -154,6 +178,8 @@ def build(seed: str, mke2fs: Path, e2fsck: Path, debugfs: Path, work: Path) -> P
 def main() -> int:
     mke2fs, e2fsck = find_e2fsprogs()
     debugfs = mke2fs.parent / "debugfs"
+    version = subprocess.run([str(mke2fs), "-V"], capture_output=True, text=True, check=False)
+    print(f"with {(version.stderr or version.stdout).splitlines()[0]}")
     for seed in SEEDS:
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
@@ -162,7 +188,7 @@ def main() -> int:
             # The same tree with the signed flag, re-indexed: each name's signed hash.
             signed = work / "signed.ext4"
             signed.write_bytes(image.read_bytes())
-            run(debugfs, "-w", "-R", "ssv flags 1", signed)
+            run_debugfs(debugfs, "-w", "-R", "ssv flags 1", signed)
             run(e2fsck, "-fyD", signed, ok=(0, 1))
             _, signed_names = htree(debugfs, signed)
             missed = [

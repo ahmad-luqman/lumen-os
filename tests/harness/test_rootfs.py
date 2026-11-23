@@ -436,3 +436,125 @@ def test_rootfs_cli_main_exit_codes(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "rootfs check-elf:" in err
     assert "expected PT_INTERP" in err
+
+
+SIGNED_HASH = REPO_ROOT / "tools" / "ext4-signed-hash.sh"
+UNSIGNED_IMAGE = REPO_ROOT / "kernel" / "src" / "vfs" / "testdata" / "unsigned-hash.ext4"
+S_FLAGS_AT = 1024 + 0x160
+
+
+def _e2fsprogs() -> tuple[Path, Path, Path]:
+    """The real (mke2fs, e2fsck, debugfs): skipped locally without them,
+    failed in CI (which installs them)."""
+    try:
+        mke2fs, e2fsck = rootfs.find_e2fsprogs()
+    except FileNotFoundError:
+        if os.environ.get("CI"):
+            raise
+        pytest.skip("e2fsprogs not installed")
+    return mke2fs, e2fsck, e2fsck.parent / "debugfs"
+
+
+def _sign(debugfs: Path, image: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(SIGNED_HASH), str(debugfs), str(image)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "E2FSPROGS_FAKE_TIME": "1700000000"},
+    )
+
+
+def _s_flags(image: Path) -> int:
+    return int.from_bytes(image.read_bytes()[S_FLAGS_AT : S_FLAGS_AT + 4], "little")
+
+
+def test_signed_hash_switches_only_the_flag(tmp_path):
+    """#308: mkrootfs.sh's switch on an image with unsigned directory hashes
+    sets s_flags to signed and changes nothing else; an image already
+    signed is left as it is, without running debugfs."""
+    _, e2fsck, debugfs = _e2fsprogs()
+    image = tmp_path / "unsigned.ext4"
+    image.write_bytes(UNSIGNED_IMAGE.read_bytes())
+    assert _s_flags(image) == 0x2
+
+    proc = _sign(debugfs, image)
+    assert proc.returncode == 0, proc.stderr
+    assert "had unsigned directory hashes (s_flags 2); set s_flags to 1" in proc.stderr
+    assert _s_flags(image) == 0x1
+    before, after = UNSIGNED_IMAGE.read_bytes(), image.read_bytes()
+    assert [i for i in range(len(before)) if before[i] != after[i]] == [S_FLAGS_AT]
+    assert "signed_directory_hash" in rootfs.debugfs(image, "stats", tool=debugfs)
+    assert "unsigned_directory_hash" not in rootfs.debugfs(image, "stats", tool=debugfs)
+    # Only the flag: this image's htree `/d` is still ordered by the unsigned
+    # hash, which mkrootfs.sh's final `e2fsck -fn` would fail on.
+    with pytest.raises(RuntimeError, match="exit 4"):
+        rootfs.e2fsck_check(image, e2fsck=e2fsck)
+
+    signed = image.read_bytes()
+    no_debugfs = _make_exec(tmp_path / "debugfs_never", "#!/bin/sh\nexit 1\n")
+    proc = _sign(no_debugfs, image)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    assert image.read_bytes() == signed
+
+
+def test_signed_hash_on_an_image_mke2fs_made_passes_e2fsck(tmp_path):
+    """An image `mke2fs -d` made (as mkrootfs.sh does), with a directory
+    spanning several blocks, indexes none of them: switched from unsigned, it
+    passes `e2fsck -fn`."""
+    mke2fs, e2fsck, debugfs = _e2fsprogs()
+    stage = tmp_path / "stage"
+    (stage / "big").mkdir(parents=True)
+    for n in range(200):
+        (stage / "big" / f"a-long-file-name-number-{n:03}").write_bytes(b"x")
+    image = tmp_path / "made.ext4"
+    env = {**os.environ, "COPYFILE_DISABLE": "1", "LC_ALL": "C"}
+    subprocess.run(
+        [str(mke2fs), "-q", "-F", "-t", "ext4", "-b", "1024", "-O", "^has_journal",
+         "-d", str(stage), str(image), "2M"],
+        check=True, env=env,
+    )  # fmt: skip
+    htree = subprocess.run(
+        [str(debugfs), "-R", "htree big", str(image)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=True,
+        env=env,
+    )
+    assert "Not a hash-indexed directory" in htree.stdout
+    assert int(rootfs.debugfs(image, "stat big", tool=debugfs).split("Size: ")[1].split()[0]) > 1024
+    subprocess.run([str(debugfs), "-w", "-R", "ssv flags 2", str(image)], check=True, env=env)
+    assert _s_flags(image) == 0x2
+
+    proc = _sign(debugfs, image)
+    assert proc.returncode == 0, proc.stderr
+    assert _s_flags(image) == 0x1
+    rootfs.e2fsck_check(image, e2fsck=e2fsck)
+
+
+def test_signed_hash_fails_when_the_flag_stays_unsigned(tmp_path):
+    """debugfs exits 0 when `ssv` fails: an error line on its stderr fails
+    the switch, and so does an image still unsigned afterwards."""
+    _, _, debugfs = _e2fsprogs()
+    image = tmp_path / "unsigned.ext4"
+    banner = "debugfs 1.47.4 (6-Mar-2025)"
+    # Writes the flag but says it failed: only the stderr check catches it.
+    noisy = _make_exec(
+        tmp_path / "debugfs_noisy",
+        f'#!/bin/sh\n"{debugfs}" "$@" 2>/dev/null\necho "{banner}" >&2\n'
+        'echo "ssv: Filesystem not open" >&2\nexit 0\n',
+    )
+    # Says nothing and writes nothing: only the read-back catches it.
+    silent = _make_exec(tmp_path / "debugfs_silent", f'#!/bin/sh\necho "{banner}" >&2\nexit 0\n')
+    failing = _make_exec(tmp_path / "debugfs_exit", "#!/bin/sh\nexit 1\n")
+    for tool, why in (
+        (noisy, "ssv: Filesystem not open"),
+        (silent, "still has unsigned directory hashes (s_flags 2)"),
+        (failing, "failed (exit 1)"),
+    ):
+        image.write_bytes(UNSIGNED_IMAGE.read_bytes())
+        proc = _sign(tool, image)
+        assert proc.returncode != 0, tool
+        assert why in proc.stderr, proc.stderr

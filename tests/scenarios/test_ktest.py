@@ -250,7 +250,7 @@ VFS_EXACT_LINES = {
     # ext4_unwritable_ro_compat_features_force_read_only
     (
         rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: ro_compat feature not supported for writing "
-        r"\(metadata_csum, quota, bigalloc, orphan_present, \.\.\.\) \(ro_compat 0x[0-9a-f]+, s_flags 0x[0-9a-f]+\)"
+        r"\(metadata_csum, quota, bigalloc, orphan_present, \.\.\.\) \(ro_compat 0x[0-9a-f]+\)"
     ): 1,
     # ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name
     # (#308): the unsigned volume's mount only, not the signed one's.
