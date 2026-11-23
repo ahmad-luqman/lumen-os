@@ -705,16 +705,25 @@ fn check_dev_namespace() -> Result<(), String> {
     );
     check("forbidden after the refusals", &|| resolve_path_from_root("/dev/forbidden").map(drop), noent);
     if skipped > 0 {
-        mismatches.push(format!("/dev: a change went through, so the {skipped} checks after it didn't run"));
+        let s = if skipped == 1 { "" } else { "s" };
+        mismatches.push(format!("/dev: a change went through, so the {skipped} check{s} after it didn't run"));
     }
     // A `/dev/forbidden` that a change left (reported above) is removed, or
     // the next run's `create` would open it and stop there, blaming the
-    // wrong check: a removal that fails is reported too.
-    if resolve_path_from_root("/dev/forbidden").is_ok()
-        && let Err(e) = unlink_at(&TABLES, None, b"/dev/forbidden", false)
-            .or_else(|_| unlink_at(&TABLES, None, b"/dev/forbidden", true))
-    {
-        mismatches.push(format!("couldn't remove the /dev/forbidden left behind: {e:?}"));
+    // wrong check: a removal that fails is reported too. A device there is
+    // a boot node a rename moved: it is left, not unlinked for good.
+    match resolve_path_from_root("/dev/forbidden").and_then(|n| n.stat()) {
+        Ok(st) if st.inode_type == InodeType::CharDevice => {
+            mismatches.push(format!("/dev/forbidden is a moved boot node (rdev {}), left there", st.rdev));
+        }
+        Ok(_) => {
+            if let Err(e) = unlink_at(&TABLES, None, b"/dev/forbidden", false)
+                .or_else(|_| unlink_at(&TABLES, None, b"/dev/forbidden", true))
+            {
+                mismatches.push(format!("couldn't remove the /dev/forbidden left behind: {e:?}"));
+            }
+        }
+        Err(_) => {}
     }
     if let Err(e) = unlink_at(&TABLES, None, b"/tmp/dev_link_src.txt", false) {
         mismatches.push(format!("unlink /tmp/dev_link_src.txt: {e:?}"));

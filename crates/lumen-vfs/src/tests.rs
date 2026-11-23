@@ -7646,8 +7646,8 @@ fn setup_dynfs() -> (TestTables, Arc<uncached::DynFs>, Arc<dyn VfsInode>) {
 /// `fixed_namespace_ops!`, which the fake procfs's inodes expand as the
 /// kernel's devfs and procfs do, refuses each of its seven operations with
 /// `-EROFS`, asked directly (the read-only mount refuses first by path);
-/// `mkdir` and `symlink` onto a name in use too, without looking it up
-/// (ARCHITECTURE section 9: `-EROFS` where Linux says `-EEXIST`).
+/// `mkdir` and `symlink` onto a name in use too (ARCHITECTURE section 9:
+/// `-EROFS` where Linux says `-EEXIST`).
 #[test]
 fn fixed_namespace_ops_refuse_each_change_with_erofs() {
     let (_env, _dynfs, proc_root) = setup_dynfs();
