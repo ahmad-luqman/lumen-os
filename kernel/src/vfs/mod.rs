@@ -936,8 +936,9 @@ fn check_dev() -> Result<(), String> {
 /// in use under `RENAME_NOREPLACE`, a link from another mount; a rename onto
 /// itself does nothing), and a change that reaches devfs is `-EROFS` (a
 /// divergence: devtmpfs takes these from root), `mkdir` and `symlink` onto a
-/// name in use too (Linux: `-EEXIST`). Every check runs, and every mismatch
-/// is reported.
+/// name in use too (Linux: `-EEXIST`). Every check runs and every mismatch
+/// is reported, until a change goes through (`Ok` where a refusal was
+/// expected): the checks stop there.
 fn check_dev_namespace() -> Result<(), String> {
     let creat = OpenFlags::from_bits_truncate(OpenFlags::O_CREAT | OpenFlags::O_WRONLY);
     let none = RenameFlags::default();
