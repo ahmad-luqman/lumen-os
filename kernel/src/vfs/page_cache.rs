@@ -792,7 +792,8 @@ impl PageCache {
     /// [`Self::admit_unreclaimable`]), whichever path made it; a clean one
     /// is not, since reclaim can drop it once nothing else holds it. (A
     /// page a mapping will pin is clean here: `ext4`'s `mmap_page` asks
-    /// [`Self::admit_unreclaimable`] itself, before reading it in.)
+    /// [`Self::admit_unreclaimable`] itself, before reading it in and
+    /// again after.)
     pub fn insert_new(&mut self, page_index: u64, page: Arc<CachePage>) -> Result<(), VfsError> {
         if self.pages.contains_key(&page_index) {
             return Err(VfsError::Exist);
@@ -1334,10 +1335,15 @@ fn check_writes_over_cached_pages(root: &Arc<dyn VfsInode>, ext4: bool) -> Resul
     // A file of a page and 100 bytes; a store through a mapping at 200 of
     // its page 1 (past the end); then a write at a page and 1000.
     let p = PAGE_SIZE as u64;
+    // The mapping is held throughout, so reclaim can't drop the page (and
+    // the store with it) before the write: the write found it cached.
     let g = file(root, "tail.bin", &pattern(PAGE_SIZE + 100, 5))?;
-    mmap_page(&g, 1).map_err(|_| "map")?.page().write_bytes(200, b"junk");
+    let mapped = mmap_page(&g, 1).map_err(|_| "map")?;
+    mapped.page().write_bytes(200, b"junk");
     kassert_eq!(g.write_at(p + 1000, b"z").map_err(|_| "write past the end")?, 1);
     let back = read(&g, p + 100, 901)?;
+    let still = page_cache_lock(&*g).ok_or("no page cache")?.lock().get(1).map(|c| Arc::ptr_eq(c, mapped.page()));
+    kassert_eq!(still, Some(true));
     kassert!(back[..900].iter().all(|&b| b == 0));
     kassert_eq!(back[900], b'z');
     Ok(())

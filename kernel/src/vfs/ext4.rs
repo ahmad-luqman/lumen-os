@@ -1216,10 +1216,13 @@ impl Ext4Inode {
             Some(page) => Arc::clone(page),
             None => {
                 // The mapping pins the page, so reclaim can't drop it: held
-                // to the hard cap as a dirty page is, before the disk read.
+                // to the hard cap as a dirty page is, before the disk read
+                // and again after it (the read may sleep while other files'
+                // pages fill the cache), as `PageCache::write_from` asks.
                 pages.admit_unreclaimable()?;
                 let page =
                     Arc::new(if detached { CachePage::new_zeroed()? } else { self.load_page(index, file_size)? });
+                pages.admit_unreclaimable()?;
                 pages.insert_new(index, Arc::clone(&page))?;
                 page
             }
@@ -4809,7 +4812,7 @@ crate::ktest!(
         use crate::kassert_eq;
         let ts = |sec: i64, nsec: i64| Timespec { sec, nsec };
         let times = |i: &Arc<dyn VfsInode>| i.stat().map(|st| (st.atime, st.mtime)).map_err(|_| "stat");
-        let m = mount(build_1k_blockmap_image(128), 186)?;
+        let m = mount(build_1k_blockmap_image(128), 182)?;
         let f = m.root.create(b"t", 0o644).map_err(|_| "create")?;
         let (atime, mtime) = (ts(-946_771_200, 123_456_789), ts(0x2_0000_0005, 42));
         f.set_times(SetTime::Set(atime), SetTime::Set(mtime)).map_err(|_| "set")?;
@@ -4823,7 +4826,7 @@ crate::ktest!(
         kassert_eq!((omit_now, now_omit), (Ok(()), Ok(())));
         kassert_eq!(after_first?, (atime, now1));
         kassert_eq!(times(&f)?, (now2, now1));
-        let ro = remount_ro(&m, 187)?;
+        let ro = remount_ro(&m, 183)?;
         let back = ro.root_inode().lookup(b"t").map_err(|_| "ro lookup")?;
         kassert_eq!(times(&back)?, (now2, now1));
         Ok(())

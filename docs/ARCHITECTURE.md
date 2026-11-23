@@ -5196,8 +5196,8 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   that reclaim can't drop: `insert_new` asks it for a page that is dirty when
   inserted, whichever path made it (`write_from` also asks before making the
   page, and the insert asks again in case the cache filled meanwhile), and
-  `mmap_page` asks it before reading in a page a mapping will pin (clean, so
-  the insert lets it in); a clean page (a read's, which reclaim can drop) is
+  `mmap_page` asks it before reading in a page a mapping will pin and again
+  after the read (the page is clean, so the insert lets it in); a clean page (a read's, which reclaim can drop) is
   let in at the cap. A write or truncate past the
   volume's largest file size returns `-EFBIG`. `create`/`mkdir`/`symlink`
   return `-ENOSPC` while fewer than 8 blocks are free, so a new entry can
@@ -5261,7 +5261,7 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     (`NoSpc`). A missing page of a linked `ext4` file is refused (`NoSpc`,
     the hard-limit warning) while the `ext4` cache is at its hard limit, by
     the same check as a write's new page (`admit_unreclaimable`, before
-    the disk read): mapped pages are pinned, so reclaim can't keep them
+    the disk read and after it): mapped pages are pinned, so reclaim can't keep them
     under it. A detached `ext4` file's pages count against the
     detached quota instead of the hard limit. Also `NoMem` and `Io`.
   - *EOF:* `Range` when `index * 4096 >= file_size` (or the product
