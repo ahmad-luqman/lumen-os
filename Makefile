@@ -145,7 +145,7 @@ $(BUILD)/lumen-ktest.iso: $(BUILD)/lumen-kernel-ktest $(ISO_DEPS)
 
 iso: $(BUILD)/lumen.iso $(BUILD)/lumen-qemutest.iso $(BUILD)/lumen-ktest.iso ## Build all bootable ISOs
 
-$(BUILD)/alpine-rootfs.ext4: tools/mkrootfs.sh $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so
+$(BUILD)/alpine-rootfs.ext4: tools/mkrootfs.sh tools/ext4-signed-hash.sh $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so
 	tools/mkrootfs.sh $@
 
 rootfs: $(BUILD)/alpine-rootfs.ext4 ## Build deterministic Alpine minirootfs ext4 image
