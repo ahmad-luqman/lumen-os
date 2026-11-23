@@ -6791,6 +6791,8 @@ crate::ktest!(
         kassert_eq!(f.write_at(PAGE_SIZE as u64 - 1, b"xy"), Ok(2));
         kassert_eq!(e.read_errno.load(O::Acquire), 0);
         // Its first page's fill failing: the error returned, and logged.
+        // (Page 1 written back first, then dropped: filled from the disk.)
+        f.sync(false).map_err(|_| "sync page 1")?;
         e.pages.lock().remove_from(1);
         m.cache.fail_reads.store(true, O::Release);
         let first = f.write_at(PAGE_SIZE as u64 + 2, b"y");

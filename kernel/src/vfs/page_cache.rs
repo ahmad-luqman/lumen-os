@@ -1492,9 +1492,8 @@ crate::ktest!(
         // clean; a write past the end refused at the hard limit (one
         // hard-limit warning, pinned by test_ktest.py); then every block
         // write failing, the block cache's own sync still working. The
-        // refused write left the tail page clean, so `fdatasync` has nothing
-        // to write back and succeeds. (Were the block cache's sync failing
-        // too, it would be `EIO` whatever the tail page's state.)
+        // refused write left the tail page clean (and still cached), so
+        // `fdatasync` has nothing to write back and succeeds.
         use crate::{kassert, kassert_eq};
         use ktest_files::{file, pattern, read};
         let vol = ktest_files::Ext4Volume::new(179)?;
@@ -1509,6 +1508,8 @@ crate::ktest!(
             f.write_at(2 * PAGE_SIZE as u64, b"ab")
         });
         kassert_eq!(refused, Err(VfsError::NoSpc));
+        let still_cached = cache.lock().get(0).is_some();
+        kassert!(still_cached); // the page the refused write zeroed past the end
         let dirty = cache.lock().dirty_count();
         vol.arm_write_from(1);
         let synced = f.sync(true);
@@ -1542,6 +1543,7 @@ crate::ktest!(
         kassert_eq!(got, Ok(PAGE_SIZE));
         kassert_eq!(asked, [1]);
         kassert!(buf[..PAGE_SIZE].iter().all(|&b| b == 0xa0));
+        kassert!(buf[PAGE_SIZE..].iter().all(|&b| b == 0)); // nothing copied past the gap
         Ok(())
     }
 );
