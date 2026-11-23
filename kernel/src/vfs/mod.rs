@@ -287,13 +287,12 @@ pub fn mount_table() -> pipe::Table {
         Column::new("used", Kind::Int, Align::Right, 4),
         Column::new("limit", Kind::Int, Align::Right, 5),
     ];
-    // The mounts' filesystems, matched to `list_mounts`' rows by device
-    // (each mount's is its own); both are snapshots, taken under Lock 9
-    // and used after it is released.
-    let filesystems = TABLES.snapshot_filesystems();
     let mut t = pipe::Table::new(&COLUMNS);
-    for m in list_mounts() {
-        let quota = filesystems.iter().find(|fs| fs.dev_id() == m.dev_id).and_then(|fs| tmpfs::quota_use(fs.as_ref()));
+    // One snapshot, taken under Lock 9; each filesystem is asked after it
+    // is released.
+    for (fs, path) in TABLES.snapshot_mounts() {
+        let m = MountInfo::of(fs.as_ref(), path);
+        let quota = tmpfs::quota_use(fs.as_ref());
         t.push(vec![
             Value::Text(m.mount_path),
             sysinfo::text(m.fs_name),
@@ -318,10 +317,10 @@ pub fn mount_command(ctx: &mut Ctx<'_>, args: &[String]) {
         return ctx.fail("usage: mount");
     }
     let t = mount_table();
-    let mounts = list_mounts();
     let mut out = String::new();
-    let s = if mounts.len() == 1 { "" } else { "s" };
-    let _ = writeln!(out, "mount: {} mount{s}", mounts.len());
+    let mounts = t.rows().len(); // the table's own, so the two agree
+    let s = if mounts == 1 { "" } else { "s" };
+    let _ = writeln!(out, "mount: {mounts} mount{s}");
     t.render(&mut out);
     let _ = ctx.out.write_str(&out);
 }

@@ -5880,9 +5880,12 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     returns; the `cacheable()` checks above), with `mount_root`, `mount`,
     `umount` (the evicted inodes dropped after the locks are released) and
     the snapshots: of the filesystems for `sync`, of the inodes for the
-    ktests' cache checks (and the host tests'), and `list_mounts` for `/proc/mounts`
-    and `mount` (each filesystem asked for its device, name and read-only
-    flag after the lock is released). Calls into a filesystem it still
+    ktests' cache checks (and the host tests'), `list_mounts` for `/proc/mounts`
+    (each filesystem asked for its device, name and read-only
+    flag after the lock is released: `MountInfo::of`), and of the mounts'
+    filesystems with their paths (`snapshot_mounts`, #324) for `mount`,
+    which asks each pair for `MountInfo::of` and a `tmpfs` one for its
+    quota from the one snapshot. Calls into a filesystem it still
     makes under the locks (`VfsInode::dev_id`, `ino`, `cacheable` and
     `is_detached`, `FileSystem::dev_id`, `mount`'s `inode_type()`), and
     `Arc`s it drops there (a failed `mount`'s, the unmounted mountpoint,
@@ -6186,8 +6189,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     and `used` and `limit`: a `tmpfs` mount's quota in bytes, `-` for any
     other filesystem; #324), so an `ENOSPC` on `/tmp` can be told apart
     from a leaked charge. `tmpfs::quota_use` reads them from a `dyn
-    FileSystem` through its root inode's `VfsInode::as_any`, matched to
-    `list_mounts`' rows by device; `/proc/mounts` keeps Linux's columns.
+    FileSystem` through its root inode's `VfsInode::as_any`, for each
+    mount of one `VfsTables::snapshot_mounts`; `/proc/mounts` keeps
+    Linux's columns.
   - `sync`: flushes every mounted filesystem (each flushing its own live
     inodes, then its block cache), continuing past a failing inode or
     filesystem and reporting the first error (each failure logged once at
