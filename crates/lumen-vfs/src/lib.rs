@@ -44,7 +44,7 @@ pub use ops::{
     Opened, link_at, mkdir_at, open_inode, open_inode_guarded, readlink_at, rename_at2, symlink_at, unlink_at,
 };
 pub use resolve::{
-    ParentTarget, ResolveFlags, ResolvedPath, check_access, compute_cwd_path, resolve_parent, resolve_path,
+    Final, ParentTarget, ResolveFlags, ResolvedPath, check_access, compute_cwd_path, resolve_parent, resolve_path,
 };
 pub use types::{
     AccessMask, AccessMode, AtFlags, DevId, DirEntry, Escaped, Ino, InodeType, Metadata, OpenFlags, RenameFlags,
