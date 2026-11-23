@@ -5152,6 +5152,78 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn ext4_namespace_operations_set_their_childrens_ctime() {
+        // The test above checks the parents; this one the children: a moved
+        // or renamed file or directory, both sides of an exchange, an inode
+        // that keeps a link after an unlink, and a rename's target that keeps
+        // one. Each operation runs at its own clock reading, and each child
+        // holds that reading as its ctime, in memory and after a remount.
+        use self::ktest_util::*;
+        use crate::kassert_eq;
+        let at = |k: i64| Timespec { sec: 1_800_000_000 + 10 * k, nsec: 0 };
+        let m = mount(build_1k_blockmap_image(128), 280)?;
+        set_clock(&m.fs, Some(at(0)));
+        let d = m.root.mkdir(b"d", 0o755).map_err(|_| "mkdir d")?;
+        let u = m.root.create(b"u", 0o644).map_err(|_| "create u")?;
+        m.root.link(b"u2", &u).map_err(|_| "link u2")?;
+        let mv = m.root.create(b"mv", 0o644).map_err(|_| "create mv")?;
+        let rn = m.root.create(b"rn", 0o644).map_err(|_| "create rn")?;
+        let md = m.root.mkdir(b"md", 0o755).map_err(|_| "mkdir md")?;
+        let x = m.root.create(b"x", 0o644).map_err(|_| "create x")?;
+        let y = d.mkdir(b"y", 0o755).map_err(|_| "mkdir d/y")?;
+        let t = m.root.create(b"t", 0o644).map_err(|_| "create t")?;
+        m.root.link(b"t2", &t).map_err(|_| "link t2")?;
+        let o = m.root.create(b"o", 0o644).map_err(|_| "create o")?;
+
+        // Each step, and the children it stamps with the paths they end at.
+        type Step<'a> = &'a dyn Fn() -> Result<(), VfsError>;
+        type Children<'a> = &'a [(&'a Arc<dyn VfsInode>, &'a [&'a [u8]])];
+        let steps: [(&str, Step<'_>, Children<'_>); 6] = [
+            ("unlink", &|| m.root.unlink(b"u2"), &[(&u, &[b"u"])]),
+            ("move", &|| m.root.rename(b"mv", &d, b"mv", RenameFlags(0)), &[(&mv, &[b"d", b"mv"])]),
+            ("rename", &|| m.root.rename(b"rn", &m.root, b"rn2", RenameFlags(0)), &[(&rn, &[b"rn2"])]),
+            ("dir move", &|| m.root.rename(b"md", &d, b"md", RenameFlags(0)), &[(&md, &[b"d", b"md"])]),
+            (
+                "exchange",
+                &|| m.root.rename(b"x", &d, b"y", RenameFlags(RenameFlags::EXCHANGE)),
+                &[(&x, &[b"d", b"y"]), (&y, &[b"x"])],
+            ),
+            ("over", &|| m.root.rename(b"o", &m.root, b"t", RenameFlags(0)), &[(&o, &[b"t"]), (&t, &[b"t2"])]),
+        ];
+        let mut wrong: Vec<&str> = Vec::new();
+        for (k, (name, step, children)) in steps.iter().enumerate() {
+            let now = at(k as i64 + 1);
+            set_clock(&m.fs, Some(now));
+            step().map_err(|_| "step")?;
+            for (child, _) in children.iter() {
+                if child.stat().map_err(|_| "stat")?.ctime != now {
+                    wrong.push(name);
+                }
+            }
+        }
+        kassert_eq!(wrong, Vec::<&str>::new());
+
+        m.fs.sync().map_err(|_| "fs sync")?;
+        let ro = remount_ro(&m, 281)?;
+        let mut lost: Vec<&str> = Vec::new();
+        for (k, (name, _, children)) in steps.iter().enumerate() {
+            for (child, path) in children.iter() {
+                let mut node = ro.root_inode();
+                for part in path.iter() {
+                    node = node.lookup(part).map_err(|_| "ro lookup")?;
+                }
+                kassert_eq!(node.ino(), child.ino());
+                if node.stat().map_err(|_| "ro stat")?.ctime != at(k as i64 + 1) {
+                    lost.push(name);
+                }
+            }
+        }
+        kassert_eq!(lost, Vec::<&str>::new());
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn ext4_files_made_past_2038_keep_their_times() {
         // `ext4plus`'s `create_inode` sets a new inode's atime, mtime and
         // ctime before its `i_extra_isize`, so only their low 32 bits land: a
