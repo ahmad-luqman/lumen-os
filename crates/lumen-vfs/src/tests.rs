@@ -318,6 +318,7 @@ impl FileSystem for MemFs {
     }
 
     fn read_only(&self) -> bool {
+        assert_test_lock9_free();
         self.read_only
     }
 
@@ -2075,7 +2076,7 @@ fn lock9_is_never_held_during_inode_calls() {
     }
 
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
-    let probe = sync_tables(root_fs.clone());
+    let probe = mounted_tables(root_fs.clone());
     let checking_root: Arc<dyn VfsInode> = Arc::new(CheckingInode { inner: root_fs.root_inode() });
 
     mkdir_at(probe.as_ref(), Some(&checking_root), b"a", 0o755, 0).unwrap();
@@ -2226,6 +2227,7 @@ fn dotdot_unifies_through_inode_cache_and_crosses_stacked_mounts() {
             self.inner.sync()
         }
         fn read_only(&self) -> bool {
+            assert_test_lock9_free();
             self.inner.read_only()
         }
         fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -3139,7 +3141,7 @@ fn lookup_component_does_not_resurrect_dentry_across_concurrent_rename_unlink_or
     }
 
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
-    let env = sync_tables(root_fs);
+    let env = mounted_tables(root_fs);
 
     // Subcase 1: Concurrent `rename_at2` immediately before `lookup_component` cache publication.
     let ren_dir = mkdir_at(env.as_ref(), None, b"/ren_dir", 0o755, 0).unwrap();
@@ -3510,19 +3512,33 @@ fn open_creat_retries_on_concurrent_exist_race_across_winner_types() {
 // ============================================================================
 
 std::thread_local! {
-    static TEST_LOCK9_DEPTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     /// The Lock-9 tables this thread holds, one bit per [`lock9_level`],
-    /// across every `TestTables` (no test holds two tables' locks at once).
+    /// across every `TestTables` instance (no test holds the locks of two
+    /// `TestTables` at once).
     static TEST_LOCK9_HELD: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
 }
 
+/// A broken Lock-9 rule, printed to stderr (which libtest doesn't capture)
+/// before the test binary aborts. A panic would only end its own thread:
+/// in a test whose other threads wait on a `Barrier` for the one that
+/// panicked, the run hangs until CI's job timeout and the message is lost.
+fn lock9_violation(msg: core::fmt::Arguments<'_>) -> ! {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{msg}");
+    std::process::abort()
+}
+
 fn assert_test_lock9_free() {
-    let depth = TEST_LOCK9_DEPTH.with(|d| d.get());
-    assert_eq!(depth, 0, "Lock 9 held across VfsInode/FileSystem call (depth={depth})");
+    let held = TEST_LOCK9_HELD.with(core::cell::Cell::get);
+    if held != 0 {
+        lock9_violation(format_args!("Lock 9 held across a VfsInode/FileSystem call (holding {held:#05b})"));
+    }
 }
 
 /// A table's place in Lock 9's sub-order `MountTable -> DentryCache ->
-/// InodeCache`.
+/// InodeCache`. By type name: `LockFamily::Lock<T>` is a lock for every
+/// `T`, so `TestLock<T>` can't bound `T` by a trait naming its level, nor
+/// by `'static` for a `TypeId`.
 fn lock9_level<T>() -> u8 {
     let name = core::any::type_name::<T>();
     if name.ends_with("::MountTable") {
@@ -3536,10 +3552,11 @@ fn lock9_level<T>() -> u8 {
     }
 }
 
-/// Lock 9 in the host tests (#264): a `std` mutex whose guards count
-/// towards `TEST_LOCK9_DEPTH` (what `assert_test_lock9_free` checks), and
-/// which panics when its thread takes it out of Lock 9's sub-order or
-/// takes a table it already holds (where a bare mutex could hang).
+/// Lock 9 in the host tests (#264): a `std` mutex whose guards record the
+/// tables their thread holds in `TEST_LOCK9_HELD` (what
+/// `assert_test_lock9_free` checks), and which aborts the test binary
+/// ([`lock9_violation`]) when its thread takes it out of Lock 9's sub-order
+/// or takes a table it already holds (where a bare mutex could hang).
 struct TestLock<T> {
     level: u8,
     inner: Mutex<T>,
@@ -3566,7 +3583,6 @@ impl<T> core::ops::DerefMut for TestLockGuard<'_, T> {
 impl<T> Drop for TestLockGuard<'_, T> {
     fn drop(&mut self) {
         TEST_LOCK9_HELD.with(|h| h.set(h.get() & !(1 << self.level)));
-        TEST_LOCK9_DEPTH.with(|d| d.set(d.get() - 1));
     }
 }
 
@@ -3581,17 +3597,16 @@ impl<T> VfsLock<T> for TestLock<T> {
     }
 
     fn lock(&self) -> Self::Guard<'_> {
-        let held = TEST_LOCK9_HELD.with(|h| h.get());
-        assert_eq!(
-            held >> self.level,
-            0,
-            "Lock 9 taken out of order (MountTable -> DentryCache -> InodeCache) or twice: \
-             level {} while holding {held:#05b}",
-            self.level
-        );
+        let held = TEST_LOCK9_HELD.with(core::cell::Cell::get);
+        if held >> self.level != 0 {
+            lock9_violation(format_args!(
+                "Lock 9 taken out of order (MountTable -> DentryCache -> InodeCache) or twice: \
+                 level {} while holding {held:#05b}",
+                self.level
+            ));
+        }
         let inner = self.inner.lock().unwrap();
         TEST_LOCK9_HELD.with(|h| h.set(held | (1 << self.level)));
-        TEST_LOCK9_DEPTH.with(|d| d.set(d.get() + 1));
         TestLockGuard { level: self.level, inner }
     }
 
@@ -3610,14 +3625,15 @@ impl LockFamily for TestLocks {
 type TestTables = VfsTables<TestLocks>;
 
 /// Tables with `root` mounted at `/`.
-fn sync_tables(root: Arc<dyn FileSystem>) -> Arc<TestTables> {
-    sync_tables_with(root, InodeCache::DEFAULT_REMOVAL_HISTORY, DentryCache::DEFAULT_CAPACITY)
+fn mounted_tables(root: Arc<dyn FileSystem>) -> Arc<TestTables> {
+    mounted_tables_with(root, DentryCache::DEFAULT_CAPACITY, InodeCache::DEFAULT_REMOVAL_HISTORY)
 }
 
-/// Tables remembering `max_history` inode removals and holding at most
-/// `dentry_cap` names, with `root` mounted at `/`.
-fn sync_tables_with(root: Arc<dyn FileSystem>, max_history: usize, dentry_cap: usize) -> Arc<TestTables> {
-    let env = Arc::new(TestTables::with_capacities(dentry_cap, max_history));
+/// Tables holding at most `dentry_capacity` names and remembering
+/// `removal_history` inode removals (`VfsTables::with_capacities`'
+/// order), with `root` mounted at `/`.
+fn mounted_tables_with(root: Arc<dyn FileSystem>, dentry_capacity: usize, removal_history: usize) -> Arc<TestTables> {
+    let env = Arc::new(TestTables::with_capacities(dentry_capacity, removal_history));
     env.mount_root(root).unwrap();
     env
 }
@@ -3678,6 +3694,10 @@ struct ReusingFsInner {
     rename_lock: Mutex<()>,
     state: Mutex<ReusingFsState>,
     hooks: Mutex<ReusingHooks>,
+    /// `ReusingHandle`s dropped, and how many of those drops ran while
+    /// their thread held a Lock-9 table.
+    handle_drops: AtomicU32,
+    handle_drops_under_lock9: AtomicU32,
 }
 
 /// Backend constructing a fresh `Arc<dyn VfsInode>` per `lookup`/`create`/
@@ -3726,6 +3746,8 @@ impl FreshArcReusingFs {
                     orphans: BTreeMap::new(),
                 }),
                 hooks: Mutex::new(ReusingHooks::default()),
+                handle_drops: AtomicU32::new(0),
+                handle_drops_under_lock9: AtomicU32::new(0),
             }),
         })
     }
@@ -3785,6 +3807,7 @@ impl FileSystem for FreshArcReusingFs {
         Ok(())
     }
     fn read_only(&self) -> bool {
+        assert_test_lock9_free();
         self.inner.read_only
     }
     fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -3802,6 +3825,18 @@ struct ReusingHandle {
     lock_id: u64,
     inner: Arc<ReusingFsInner>,
     meta: Arc<ReusingSharedMeta>,
+}
+
+impl Drop for ReusingHandle {
+    fn drop(&mut self) {
+        // Counted, not asserted: `InodeCache::get_or_insert` drops a losing
+        // `Arc` under Lock 9 by design; a test checks the count where it
+        // matters.
+        if TEST_LOCK9_HELD.try_with(core::cell::Cell::get).unwrap_or(0) != 0 {
+            self.inner.handle_drops_under_lock9.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.handle_drops.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl ReusingHandle {
@@ -4482,7 +4517,7 @@ fn inode_cache_survives_unrelated_dentry_invalidations_on_fresh_arc_backend() {
     // Parts 1–3 invoke `unlink_at` re-entrantly inside `post_create`/`post_mkdir`/`post_symlink` hooks
     // on the same `fs`, so they run with `use_rename_lock = false` to avoid self-deadlocking Lock 3.
     let fs_nolock = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env_nolock = sync_tables(Arc::clone(&fs_nolock) as Arc<dyn FileSystem>);
+    let env_nolock = mounted_tables(Arc::clone(&fs_nolock) as Arc<dyn FileSystem>);
 
     for i in 1..=3 {
         let p = format!("/unrel_{i}");
@@ -4543,7 +4578,7 @@ fn inode_cache_survives_unrelated_dentry_invalidations_on_fresh_arc_backend() {
 
     // Parts 4–5 run `resolve_path` `post_lookup` hooks (not holding Lock 3) with `use_rename_lock = true`.
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     let (created_l, _) =
         open_inode(env.as_ref(), None, b"/f_create", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap();
@@ -4598,7 +4633,7 @@ fn inode_cache_survives_unrelated_dentry_invalidations_on_fresh_arc_backend() {
 #[test]
 fn ino_reuse_during_lookup_create_mkdir_symlink_never_aliases_wrong_file() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     mkdir_at(env.as_ref(), None, b"/a", 0o755, 0).unwrap();
 
     // Part A1: `lookup_component` interrupted by `unlink_at` + `create` reusing exact freed `ino`.
@@ -4638,7 +4673,7 @@ fn ino_reuse_during_lookup_create_mkdir_symlink_never_aliases_wrong_file() {
     // Parts A2–A5 & Part B (`new_f`/`new_d`/`new_s`) invoke `unlink_at`/`open_inode(O_CREAT)` re-entrantly
     // inside hooks under Lock 3, so they run on `use_rename_lock = false`.
     let fs_nolock = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env_nolock = sync_tables(Arc::clone(&fs_nolock) as Arc<dyn FileSystem>);
+    let env_nolock = mounted_tables(Arc::clone(&fs_nolock) as Arc<dyn FileSystem>);
     mkdir_at(env_nolock.as_ref(), None, b"/a", 0o755, 0).unwrap();
 
     // Part A2: `open_inode(O_CREAT)` `lookup` arm interrupted by `unlink_at` + `create` reusing `ino`.
@@ -4845,7 +4880,7 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
     for use_rename_lock in [true, false] {
         for hold_open in [false, true] {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, use_rename_lock);
-            let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
             mkdir_at(env.as_ref(), None, b"/hl", 0o755, 0).unwrap();
 
             for iter in 0..16 {
@@ -4909,7 +4944,7 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
     // 2. Concurrent `unlink_at("/hl2/a")` vs overwriting `rename_at2("/src", "/hl2/b")`.
     for use_rename_lock in [true, false] {
         let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, use_rename_lock);
-        let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+        let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
         mkdir_at(env.as_ref(), None, b"/hl2", 0o755, 0).unwrap();
 
         for iter in 0..16 {
@@ -4945,7 +4980,7 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
     // 3. `rmdir` `NotEmpty` rollback after concurrent `ino` reuse must not evict new file or restore dead `child`.
     // `pre_rmdir` invokes `open_inode(O_CREAT)` on the same `fs`, so it runs with `use_rename_lock = false`.
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     let victim = mkdir_at(env.as_ref(), None, b"/victim", 0o755, 0).unwrap();
     let victim_ino = victim.ino();
     let env_r = Arc::clone(&env);
@@ -4982,6 +5017,71 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
 }
 
 #[test]
+fn umount_drops_the_evicted_inodes_after_releasing_lock9() {
+    let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
+    // A fresh `Arc` per call: once the caller's are gone, `InodeCache` holds
+    // the last reference to each of this filesystem's cached inodes.
+    let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
+    env.mount(Arc::clone(&mp), "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
+    drop(mkdir_at(env.as_ref(), None, b"/mnt/d", 0o755, 0).unwrap());
+    let cached = env.snapshot_inodes().iter().filter(|i| i.dev_id() == DevId::TMPFS).count();
+    assert_eq!(cached, 2, "the mounted root and /mnt/d");
+
+    let drops = tmp_fs.inner.handle_drops.load(Ordering::Relaxed);
+    let drops_under_lock9 = tmp_fs.inner.handle_drops_under_lock9.load(Ordering::Relaxed);
+    drop(env.umount(mp.dev_id(), mp.ino()).unwrap());
+    assert_eq!(tmp_fs.inner.handle_drops.load(Ordering::Relaxed) - drops, 2, "umount dropped the evicted inodes");
+    assert_eq!(
+        tmp_fs.inner.handle_drops_under_lock9.load(Ordering::Relaxed),
+        drops_under_lock9,
+        "an evicted inode was dropped under Lock 9"
+    );
+}
+
+#[test]
+fn probes_refuse_inodes_of_unmounted_filesystems() {
+    let (env, root_fs) = setup_vfs();
+    let root = root_fs.root_inode();
+    let (rdev, rino) = (root.dev_id(), root.ino());
+    let (dentry_gen, inode_gen) = env.cache_gens();
+
+    // A filesystem that was never mounted (or was unmounted meanwhile).
+    let stray = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    assert!(env.publish_lookup_inode(rdev, rino, b"a", stray.root_inode(), dentry_gen, inode_gen).is_err());
+    assert!(env.publish_created_inode(rdev, rino, b"b", stray.root_inode(), dentry_gen, inode_gen).is_err());
+    assert!(env.inode_get_or_insert_if_fresh(stray.root_inode(), inode_gen).is_err());
+    assert!(env.inode_get(DevId::TMPFS, stray.root_inode().ino()).is_none());
+    assert!(env.dentry_get(rdev, rino, b"a").is_none());
+    assert!(env.dentry_get(rdev, rino, b"b").is_none());
+
+    // The same calls with the mounted root filesystem's inodes are taken.
+    for (name, call) in [(&b"a"[..], 0), (b"b", 1), (b"c", 2)] {
+        let inode = root.create(name, 0o644).unwrap();
+        let ino = inode.ino();
+        let taken = match call {
+            0 => env.publish_lookup_inode(rdev, rino, name, inode, dentry_gen, inode_gen),
+            1 => env.publish_created_inode(rdev, rino, name, inode, dentry_gen, inode_gen),
+            _ => env.inode_get_or_insert_if_fresh(inode, inode_gen),
+        };
+        assert!(taken.is_ok(), "{}", Escaped(name));
+        assert!(env.inode_get(rdev, ino).is_some(), "{}", Escaped(name));
+    }
+}
+
+#[test]
+fn cache_gens_is_the_dentry_then_the_inode_generation() {
+    let (env, _root_fs) = setup_vfs();
+    env.dentry_invalidate_dir(DevId::ROOT, 1);
+    env.dentry_invalidate_dir(DevId::ROOT, 1);
+    let inode_gen = env.inode_record_removal(DevId::ROOT, 99);
+    let dentry_gen = env.dentry_gen();
+    assert_ne!(dentry_gen, inode_gen);
+    assert_eq!(env.cache_gens(), (dentry_gen, inode_gen));
+}
+
+#[test]
 fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
     struct HookMountFs {
         inner: Arc<MemFs>,
@@ -5008,6 +5108,7 @@ fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
             self.inner.sync()
         }
         fn read_only(&self) -> bool {
+            assert_test_lock9_free();
             self.inner.read_only()
         }
         fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -5017,7 +5118,7 @@ fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
     }
 
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
-    let env = sync_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
     let mp = mkdir_at(env.as_ref(), None, b"/mp", 0o755, 0).unwrap();
     let mp_dev = mp.dev_id();
     let mp_ino = mp.ino();
@@ -5044,7 +5145,7 @@ fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
 fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usize, dentry_cap: usize) {
     let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, use_rename_lock);
     let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, use_rename_lock);
-    let env = sync_tables_with(Arc::clone(&root_fs) as Arc<dyn FileSystem>, hist, dentry_cap);
+    let env = mounted_tables_with(Arc::clone(&root_fs) as Arc<dyn FileSystem>, dentry_cap, hist);
 
     for d in [b"/d0" as &[u8], b"/d1", b"/d0/sub", b"/mnt"] {
         mkdir_at(env.as_ref(), None, d, 0o755, 0).unwrap();
@@ -5318,7 +5419,15 @@ fn unhooked_4_thread_concurrent_vfs_stress_with_ino_reuse() {
 }
 
 fn assert_no_zombies_in_cache(env: &TestTables) {
-    for cached in env.snapshot_inodes() {
+    let snapshot = env.snapshot_inodes();
+    // The root is cached from `mount_root` on, so an empty snapshot can't
+    // pass the checks below unnoticed.
+    let root = env.root_inode().unwrap();
+    assert!(
+        snapshot.iter().any(|i| (i.dev_id(), i.ino()) == (root.dev_id(), root.ino())),
+        "the root inode is missing from InodeCache's snapshot"
+    );
+    for cached in snapshot {
         assert!(!cached.is_detached(), "detached inode in InodeCache: {cached:?}");
         assert_eq!(cached.ino() & DETACHED_INO_BIT, 0, "DETACHED_INO_BIT in InodeCache: {cached:?}");
         let meta = cached.stat().expect("cached inode must stat cleanly");
@@ -5331,7 +5440,7 @@ fn cross_fs_and_single_fs_overflow_never_skips_removal_or_leaves_zombie() {
     // Part 1: Cross-FS overflow (`PROBE 3I`, `3I-rmdir`, `3I-rename`) at `DEFAULT_REMOVAL_HISTORY = 4096`.
     let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
     let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
-    let env = sync_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
 
     let mnt_mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
     env.mount(mnt_mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
@@ -5438,7 +5547,7 @@ fn cross_fs_and_single_fs_overflow_never_skips_removal_or_leaves_zombie() {
 
     // Part 2a: Single-FS overflow on `DevId::ROOT` (`with_removal_history(4)`), pre-cached victim.
     let fs2 = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env2 = sync_tables_with(Arc::clone(&fs2) as Arc<dyn FileSystem>, 4, 64);
+    let env2 = mounted_tables_with(Arc::clone(&fs2) as Arc<dyn FileSystem>, 64, 4);
     let (s_pre, _) =
         open_inode(env2.as_ref(), None, b"/s_pre", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap();
@@ -5470,7 +5579,7 @@ fn cross_fs_and_single_fs_overflow_never_skips_removal_or_leaves_zombie() {
 
     // Part 2b: Single-FS overflow (`hist = 0`) with concurrent post-`since_gen` insertion before `begin_removal`.
     let fs3 = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env3 = sync_tables_with(Arc::clone(&fs3) as Arc<dyn FileSystem>, 0, 0);
+    let env3 = mounted_tables_with(Arc::clone(&fs3) as Arc<dyn FileSystem>, 0, 0);
     let (s_post, _) =
         open_inode(env3.as_ref(), None, b"/s_post", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap();
@@ -5510,7 +5619,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
         // 1a. `open_inode(O_CREAT)` vs `unlink_at`
         {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-            let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
             let b_created = Arc::new(Barrier::new(2));
             let b_in_guard = Arc::new(Barrier::new(2));
             let b_in_lookup = Arc::new(Barrier::new(2));
@@ -5603,7 +5712,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
         // 1b. `mkdir_at` vs `unlink_at(..., true)` (`pre_rmdir`)
         {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-            let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
             let b_created = Arc::new(Barrier::new(2));
             let b_in_guard = Arc::new(Barrier::new(2));
             let b_in_lookup = Arc::new(Barrier::new(2));
@@ -5685,7 +5794,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
         // 1c. `symlink_at` vs `unlink_at(..., false)`
         {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-            let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
             let b_created = Arc::new(Barrier::new(2));
             let b_in_guard = Arc::new(Barrier::new(2));
             let b_in_lookup = Arc::new(Barrier::new(2));
@@ -5768,7 +5877,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
     // 2. `PROBE 3F` & Codex P1: `O_CREAT | O_EXCL` post-create unlink + recreate same name reusing `ino`.
     //    `post_create` calls `unlink_at` + `open_inode` on the same `fs`, so `use_rename_lock = false`.
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     mkdir_at(env.as_ref(), None, b"/a", 0o755, 0).unwrap();
 
     let env_h = Arc::clone(&env);
@@ -5816,7 +5925,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
 fn noop_rename_lock_hardlink_unlink_and_rename_races_evict_zombies() {
     // Part 1: `PROBE 1D-1` (`use_rename_lock = false`, `open_count == 0`, `/hl/a` & `/hl/b` cached).
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     mkdir_at(env.as_ref(), None, b"/hl", 0o755, 0).unwrap();
 
     let (orig, _) =
@@ -5965,6 +6074,7 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
             self.inner.sync()
         }
         fn read_only(&self) -> bool {
+            assert_test_lock9_free();
             self.inner.read_only()
         }
         fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -5974,7 +6084,7 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
 
     let raw_root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
     let hook_root_fs = Arc::new(HookRootFs { inner: Arc::clone(&raw_root_fs), on_root: Mutex::new(None) });
-    let env = sync_tables_with(Arc::clone(&hook_root_fs) as Arc<dyn FileSystem>, 2, 64);
+    let env = mounted_tables_with(Arc::clone(&hook_root_fs) as Arc<dyn FileSystem>, 64, 2);
     for i in 0..3usize {
         let p = format!("/r_unrel_{i}");
         open_inode(env.as_ref(), None, p.as_bytes(), OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
@@ -6272,6 +6382,7 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
             Ok(())
         }
         fn read_only(&self) -> bool {
+            assert_test_lock9_free();
             true
         }
     }
@@ -6446,7 +6557,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
     for hold_open in [false, true] {
         for kind in [OpKind::OpenCreat, OpKind::Mkdir, OpKind::Symlink] {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-            let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
 
             let (src, _) =
                 open_inode(env.as_ref(), None, b"/src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
@@ -6508,7 +6619,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
         for rflags in [RenameFlags(0), RenameFlags(RenameFlags::NOREPLACE)] {
             for kind in [OpKind::OpenCreat, OpKind::Mkdir, OpKind::Symlink] {
                 let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-                let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+                let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
 
                 let (src, _) = open_inode(
                     env.as_ref(),
@@ -6593,7 +6704,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
     // 3. Cross-FS symlink hop in `open_inode(O_CREAT)` drops `ROOT`'s Lock 3 before crossing to `TMPFS`.
     let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
     let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
-    let env = sync_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
     let mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
     env.mount(mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
     symlink_at(env.as_ref(), b"/mnt/file", None, b"/link_to_tmp").unwrap();
@@ -6800,7 +6911,7 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
     //    retry-loop `env.cache_gens()` must NOT adopt replacement `other`.
     {
         let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-        let inner = sync_tables_with(Arc::clone(&fs) as Arc<dyn FileSystem>, 0, 64);
+        let inner = mounted_tables_with(Arc::clone(&fs) as Arc<dyn FileSystem>, 64, 0);
         let env = HookCacheEnv::new(Arc::clone(&inner));
         mkdir_at(inner.as_ref(), None, b"/a", 0o755, 0).unwrap();
         open_inode(inner.as_ref(), None, b"/a/unrel", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
@@ -6858,7 +6969,7 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
     // 2. `PROBE 1D-4` (`evict_zombie_inode` vs `lookup_component` atomicity, `use_rename_lock = false`).
     for publish_before_record in [true, false] {
         let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-        let inner = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+        let inner = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
         let env = HookCacheEnv::new(Arc::clone(&inner));
         let hl_dir = mkdir_at(inner.as_ref(), None, b"/hl", 0o755, 0).unwrap();
 
@@ -6954,38 +7065,32 @@ fn shadowed_mountpoint_never_pollutes_dentry_cache() {
     // when `parent` is an active mountpoint, while still unifying via `InodeCache`.
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
     let tmp_fs = MemFs::new(DevId::TMPFS, "tmpfs", false);
-    let sync_env = sync_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
-    let mnt_mp = mkdir_at(sync_env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
-    sync_env.mount(Arc::clone(&mnt_mp), "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let mnt_mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
+    env.mount(Arc::clone(&mnt_mp), "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
 
-    let (under_c, _) = open_inode(
-        sync_env.as_ref(),
-        Some(&mnt_mp),
-        b"under",
-        OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
-        0o644,
-        0,
-    )
-    .unwrap();
-    let under_r = resolve_path(sync_env.as_ref(), Some(&mnt_mp), b"under", ResolveFlags::default()).unwrap().inode;
+    let (under_c, _) =
+        open_inode(env.as_ref(), Some(&mnt_mp), b"under", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let under_r = resolve_path(env.as_ref(), Some(&mnt_mp), b"under", ResolveFlags::default()).unwrap().inode;
     assert!(Arc::ptr_eq(&under_c, &under_r));
-    assert!(Arc::ptr_eq(&sync_env.inode_get(under_c.dev_id(), under_c.ino()).unwrap(), &under_c));
-    assert!(sync_env.dentry_get(mnt_mp.dev_id(), mnt_mp.ino(), b"under").is_none());
-    assert!(!sync_env.dentry_insert_if_gen(
+    assert!(Arc::ptr_eq(&env.inode_get(under_c.dev_id(), under_c.ino()).unwrap(), &under_c));
+    assert!(env.dentry_get(mnt_mp.dev_id(), mnt_mp.ino(), b"under").is_none());
+    assert!(!env.dentry_insert_if_gen(
         mnt_mp.dev_id(),
         mnt_mp.ino(),
         b"under",
         DentryTarget { dev: under_c.dev_id(), ino: under_c.ino() },
-        sync_env.dentry_gen(),
+        env.dentry_gen(),
     ));
-    assert!(sync_env.dentry_get(mnt_mp.dev_id(), mnt_mp.ino(), b"under").is_none());
+    assert!(env.dentry_get(mnt_mp.dev_id(), mnt_mp.ino(), b"under").is_none());
 }
 
 #[test]
 fn compute_cwd_path_retries_on_concurrent_rename_and_rejects_unlinked_cwd() {
     // 1. Direct `cwd` rename between `lookup_dotdot` and `find_child_name_in_dir` (`readdir`).
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
 
     mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
@@ -7060,7 +7165,7 @@ fn concurrent_compute_cwd_path_vs_rename_at2_stress() {
     use std::sync::Barrier;
 
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = sync_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
 
     mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
@@ -7199,6 +7304,7 @@ mod uncached {
             Ok(())
         }
         fn read_only(&self) -> bool {
+            assert_test_lock9_free();
             true
         }
     }
@@ -7505,6 +7611,8 @@ fn non_cacheable_lookups_leave_the_caches_flat() {
     resolve_path(&env, None, b"/proc/version", nofollow).unwrap();
     let inodes_before = env.snapshot_inodes().len();
     let dentries_before = env.dentry_count();
+    // `/`, `/proc` and `/proc/version` are cached, so "flat" can't be 0 == 0.
+    assert!(inodes_before > 0 && dentries_before > 0, "{inodes_before} inodes, {dentries_before} names");
 
     for pid in 1..=2000u32 {
         dynfs.shared.live.lock().unwrap().insert(pid);
@@ -7819,6 +7927,7 @@ impl FileSystem for GateFs {
         Ok(())
     }
     fn read_only(&self) -> bool {
+        assert_test_lock9_free();
         false
     }
     fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
