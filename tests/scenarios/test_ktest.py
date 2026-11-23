@@ -189,7 +189,8 @@ def test_in_kernel_tests_pass(boot):
 # quota over-release, a read-only feature bit). The fault
 # sweeps' families (link counts kept in memory after a failed undo, rename
 # undos left inconsistent, unlinks whose outcome can't be read back, renames'
-# replaced targets whose free failed) depend on how many writes `ext4plus`
+# replaced targets whose free failed, rename targets that couldn't be taken
+# out or put back) depend on how many writes `ext4plus`
 # makes, so they're counted as present; every
 # other line is counted exactly, and a line matching none of these fails.
 _DEV = r"DevId\(\d+\)"

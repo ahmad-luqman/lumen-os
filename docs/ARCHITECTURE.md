@@ -5556,9 +5556,13 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     filesystem, a floor and maybe a ceiling per inode, the floor never above
     the ceiling, and `reconcile` pins a count unless the disk already holds
     it. An undo that knows which entries exist writes their count through
-    `write_links_or_pin`, pinning it when the write fails; where the entries
-    can't be read back only a floor is kept (in the exchange's and the
-    move's undo after trying the write, `raise_links_or_floor`). Each kept bound is logged at
+    `write_links_or_pin`, pinning it when the write fails. Where the entries
+    can't be read back, only a floor is kept: by the exchange's and the
+    move's undo after trying to raise the count on disk
+    (`raise_links_or_floor`), and by link's and mkdir's undo of a failed
+    `Dir::link` (`undo_failed_link`) without; `unlink` and `rmdir`, unable to read
+    their directory back (or finding the name on another inode), pin the
+    count they assume. Each kept bound is logged at
     `error` (once per change, naming the inode and its disk count), and so
     is a rename undo that leaves its entries inconsistent or unreadable
     (judged once, from the entries' end state, not per attempt). `create`,
@@ -5737,7 +5741,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     returns; the `cacheable()` checks above), with `mount_root`, `mount`,
     `umount` (the evicted inodes dropped after the locks are released) and
     the snapshots: of the filesystems for `sync`, of the inodes for the
-    page-cache reclaim and procfs, and `list_mounts` for `/proc/mounts`
+    ktests' cache checks (and the host tests'), and `list_mounts` for `/proc/mounts`
     and `mount` (each filesystem asked for its device, name and read-only
     flag after the lock is released). Calls into a filesystem it still
     makes under the locks (`VfsInode::dev_id`, `ino`, `cacheable` and

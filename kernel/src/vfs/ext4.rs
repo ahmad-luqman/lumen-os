@@ -5569,8 +5569,8 @@ crate::ktest!(
         use crate::kassert_eq;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 218)?;
         let f = m.root.create(b"capped", 0o644).map_err(|_| "create")?;
-        // This mount isn't in the global tables, so reclaim can't free its
-        // pages: three more pages reach the limit.
+        // This filesystem isn't in `EXT4_FILESYSTEMS`, so reclaim can't
+        // free its pages: three more pages reach the limit.
         let cur = page_cache::ext4_cached_pages();
         page_cache::set_ext4_limits_for_test(Some((usize::MAX, cur + 3)));
         let res = f.write_at(0, &pattern(5 * PAGE_SIZE, 4));
