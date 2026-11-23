@@ -451,7 +451,9 @@ fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
             None => Ok(0),
         };
     }
-    // Any other file: every span in turn, stopping at EOF (a short span).
+    // Any other file: every span in turn, stopping at a short span: EOF,
+    // or an error past a page boundary, which the next call returns if it
+    // happens again (the page cache's short count, #321).
     let mut total = 0usize;
     for span in iovs {
         if span.len == 0 {
