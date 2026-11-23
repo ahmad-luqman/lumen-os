@@ -42,7 +42,7 @@ fn nonnegative(offset: u64) -> Result<u64, u32> {
 fn positional_file(fd: Fd) -> Result<FileRef, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
-    if file.inode.is_tty() || matches!(file.inode.inode_type(), InodeType::Fifo | InodeType::Socket) {
+    if file.inode().is_tty() || matches!(file.inode().inode_type(), InodeType::Fifo | InodeType::Socket) {
         return Err(errno::ESPIPE);
     }
     Ok(file)
@@ -76,10 +76,10 @@ fn pread64(fd: Fd, buf: UserPtr, count: u64, offset: u64) -> Result<u64, u32> {
     let file = positional_file(fd)?;
     file.require_readable().map_err(vfs)?;
     let limit = transfer_len(buf, pos, count)?;
-    if file.inode.inode_type() == InodeType::Dir {
+    if file.inode().inode_type() == InodeType::Dir {
         return Err(errno::EISDIR);
     }
-    read_at_into_user(&*file.inode, pos, buf.addr(), limit)
+    read_at_into_user(&**file.inode(), pos, buf.addr(), limit)
 }
 
 /// The read side's chunk loop: up to `limit` bytes of `inode` from `pos`
@@ -128,7 +128,11 @@ fn pwrite64(fd: Fd, buf: UserPtr, count: u64, offset: u64) -> Result<u64, u32> {
     let limit = transfer_len(buf, pos, count)?;
     let append = file.status_flags() & OpenFlags::O_APPEND != 0;
     write_chunks_from_user(buf.addr(), limit, |done, chunk| {
-        if append { file.inode.append(chunk).map(|(_, n)| n) } else { file.inode.write_at(pos + done as u64, chunk) }
+        if append {
+            file.inode().append(chunk).map(|(_, n)| n)
+        } else {
+            file.inode().write_at(pos + done as u64, chunk)
+        }
     })
 }
 
@@ -154,10 +158,10 @@ fn syncable(inode: &dyn VfsInode) -> bool {
 fn fsync(fd: Fd, data_only: bool) -> Result<u64, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
-    if !syncable(&*file.inode) {
+    if !syncable(&**file.inode()) {
         return Err(errno::EINVAL);
     }
-    file.inode.sync(data_only).map_err(vfs)?;
+    file.inode().sync(data_only).map_err(vfs)?;
     Ok(0)
 }
 

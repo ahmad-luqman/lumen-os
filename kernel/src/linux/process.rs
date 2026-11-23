@@ -13,6 +13,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -180,8 +181,9 @@ pub struct ProcessState {
     pub tid: u32,
     /// Open descriptors (`lumen_vfs::MAX_FDS` slots): 0, 1 and 2 on
     /// `/dev/console` at the start. Private: a slot leaves it only through
-    /// `close_current_fd`, `insert_current_fd`'s displacement or
-    /// `take_current`, which release its locks outside `ACTIVE_PROCS`.
+    /// `close_current_fd`, `insert_current_fd`'s displacement or `take_of`
+    /// (`take_current`, `RegisteredProcess`), which release its locks
+    /// outside `ACTIVE_PROCS`.
     fds: FdTable<FileRef>,
     /// The working directory (`set_current_cwd` swaps it).
     cwd: Cwd,
@@ -310,12 +312,82 @@ pub fn register_current(
 /// exits, its descriptors closed (each lock released as `close` does, outside
 /// `ACTIVE_PROCS`); its working directory goes when it drops.
 pub fn take_current() -> ProcessState {
-    let ktid = current_kernel_tid();
-    let mut proc = ACTIVE_PROCS.lock().remove(&ktid).expect("active process state missing after ring-3 exit");
+    take_of(current_kernel_tid()).expect("active process state missing after ring-3 exit")
+}
+
+/// Remove thread `ktid`'s [`ProcessState`], if it has one, and close its
+/// descriptors outside `ACTIVE_PROCS`: the one way a process is taken down
+/// ([`take_current`] and [`RegisteredProcess`] both come here).
+fn take_of(ktid: u64) -> Option<ProcessState> {
+    let mut proc = ACTIVE_PROCS.lock().remove(&ktid)?;
     for entry in proc.fds.drain_all() {
         release_fd(proc.pid, entry.file);
     }
-    proc
+    Some(proc)
+}
+
+/// A process the kernel's own checks register on the current user thread,
+/// taken down (its descriptors closed, by [`take_of`]) when this drops, so
+/// an early return can't leave it in `ACTIVE_PROCS`, where it would stay in
+/// `/proc` for good. It starts with `ConsoleIo::Capture`, no test syscalls,
+/// no stdin and no executable path. Real runs (`user.rs`) register and take
+/// their process themselves.
+///
+/// - Drop it, or [`end`](Self::end) it and drop the [`ProcessState`] that
+///   returns, before `sched::detach_user_space`: the state holds the
+///   thread's address space, so with it still alive then the detached
+///   space isn't the last reference, its teardown there is skipped, and
+///   the space is only freed when its last `Arc` drops.
+/// - Never call [`take_current`] while it lives: its own takedown would
+///   find no process, a panic.
+/// - Bind it to a named variable: `#[must_use]` catches a bare call, not
+///   `let _ = RegisteredProcess::register(..)`, which drops it (and takes
+///   the process down) at once.
+/// - Not `Send`: taking it down finds the process by the running thread.
+#[must_use = "dropping it takes its process down again at once"]
+pub(crate) struct RegisteredProcess {
+    pid: u32,
+    _on_this_thread: PhantomData<*const ()>,
+}
+
+impl RegisteredProcess {
+    /// Register a process on the current user thread with `stdio`
+    /// ([`register_current`]).
+    pub(crate) fn register(stdio: Stdio) -> Self {
+        let pid = register_current(ConsoleIo::Capture, false, Vec::new(), None, stdio);
+        Self { pid, _on_this_thread: PhantomData }
+    }
+
+    /// Its pid.
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Take the process down now ([`take_of`]) and return its state (what
+    /// its console captured, say).
+    pub(crate) fn end(self) -> ProcessState {
+        let proc = self.take();
+        // Taken, so `Drop` must not take it again; nothing else in `self`
+        // needs dropping.
+        core::mem::forget(self);
+        proc
+    }
+
+    /// Take the current thread's process down: this one's, or a panic.
+    fn take(&self) -> ProcessState {
+        let ktid = current_kernel_tid();
+        let proc = take_of(ktid).unwrap_or_else(|| {
+            panic!("pid {}: thread {ktid} has no process left to take down", self.pid);
+        });
+        debug_assert_eq!(proc.pid, self.pid, "thread {ktid}'s process (left) isn't this RegisteredProcess's (right)");
+        proc
+    }
+}
+
+impl Drop for RegisteredProcess {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
 }
 
 /// Give back one descriptor's slot on `file` (`close`, exit, `dup2`
@@ -328,7 +400,7 @@ fn release_fd(pid: u32, file: FileRef) {
     let last = file.dec_fd_ref() == 0;
     let id = file.id;
     let mut freed = false;
-    let released = file.inode.with_locks_mut(&mut |locks| {
+    let released = file.inode().with_locks_mut(&mut |locks| {
         freed = locks.release_posix_for_pid(pid);
         if last {
             freed |= locks.release_flock(id);
@@ -602,7 +674,7 @@ pub fn process_fd_target(pid: u32, fd: i32) -> Option<FdTarget> {
         let proc = guard.values().find(|p| p.pid == pid)?;
         Arc::clone(&proc.fds.get(fd)?.file)
     };
-    let inode = Arc::clone(&file.inode);
+    let inode = Arc::clone(file.inode());
     let mut path = file.path.to_vec();
     drop(file);
     let unlinked = inode.is_detached() || inode.stat().ok().is_some_and(|m| m.nlink == 0);
@@ -906,10 +978,9 @@ pub(crate) const KTEST_USER_LEN: u64 = 4 * 4096;
 
 /// Run `f` as a Linux process for a ktest: on a user thread with its own
 /// address space ([`KTEST_USER_LEN`] bytes mapped at [`KTEST_USER_VA`], so
-/// handlers can copy to and from user memory) and a registered
-/// [`ProcessState`] (`ConsoleIo::Capture`), handed its pid. The process is
-/// taken down (`take_current`, closing its descriptors) when `f` returns,
-/// whatever it returned, and `f`'s result comes back.
+/// handlers can copy to and from user memory) and a [`RegisteredProcess`],
+/// handed its pid. `f`'s result comes back once the process is taken down,
+/// whatever `f` returned.
 #[cfg(feature = "ktest")]
 pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send + 'static) -> Result<R, &'static str> {
     use lumen_vm::Prot;
@@ -926,9 +997,9 @@ pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send
     let slot: Arc<SpinLock<Option<R>>> = Arc::new(SpinLock::new(None));
     let out = Arc::clone(&slot);
     let spawned = sched::spawn_user_on(crate::arch::cpu_index(), "ktest-process", Arc::clone(&space), move || {
-        let pid = register_current(ConsoleIo::Capture, false, Vec::new(), None, stdio);
-        let result = f(pid);
-        drop(take_current());
+        let registered = RegisteredProcess::register(stdio);
+        let result = f(registered.pid());
+        drop(registered);
         drop(sched::detach_user_space());
         *out.lock() = Some(result);
     });
@@ -944,6 +1015,16 @@ pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send
 }
 
 crate::ktest!(
+    fn in_test_process_takes_its_process_down() {
+        use crate::kassert;
+        let (pid, listed) = in_test_process(|pid| (pid, active_pids().contains(&pid)))?;
+        kassert!(listed);
+        kassert!(!active_pids().contains(&pid));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn process_starts_with_console_fds_and_root_cwd() {
         use crate::{kassert, kassert_eq};
         in_test_process(|pid| {
@@ -953,7 +1034,7 @@ crate::ktest!(
             kassert_eq!(process_open_fds(pid), [0, 1, 2]);
             for (fd, readable, writable) in [(0, true, false), (1, false, true), (2, false, true)] {
                 let file = current_file(fd).ok_or("a console fd isn't open")?;
-                kassert!(file.inode.is_tty());
+                kassert!(file.inode().is_tty());
                 kassert_eq!(&*file.path, b"/dev/console");
                 kassert_eq!((file.is_readable(), file.is_writable()), (readable, writable));
                 kassert_eq!(current_cloexec(fd), Ok(false));
@@ -988,20 +1069,20 @@ crate::ktest!(
         // The `flock` and `pid`'s POSIX record-lock counts on `file`'s inode.
         fn counts(file: &FileRef, pid: u32) -> (usize, usize) {
             let mut got = (usize::MAX, usize::MAX);
-            let _ = file.inode.with_locks_mut(&mut |l| got = (l.flock_count(), l.posix_lock_count(pid)));
+            let _ = file.inode().with_locks_mut(&mut |l| got = (l.flock_count(), l.posix_lock_count(pid)));
             got
         }
         fn posix_lock(file: &FileRef, pid: u32) -> Result<(), VfsError> {
             let spec = FlockSpec { l_type: general::F_WRLCK as i16, l_whence: 0, l_start: 0, l_len: 10, l_pid: 0 };
             let ctx = LockContext { cur_offset: 0, file_size: 0, readable: true, writable: true };
             let mut res = Err(VfsError::Io);
-            file.inode.with_locks_mut(&mut |l| res = l.setlk(pid, spec, ctx, false).map(drop))?;
+            file.inode().with_locks_mut(&mut |l| res = l.setlk(pid, spec, ctx, false).map(drop))?;
             res
         }
         fn flock_ex(file: &FileRef) -> Result<(), VfsError> {
             let ex = FlockOp { kind: Some(FlockKind::Exclusive), nonblock: true };
             let mut res = Err(VfsError::Io);
-            file.inode.with_locks_mut(&mut |l| res = l.flock(file.id, ex).map(drop))?;
+            file.inode().with_locks_mut(&mut |l| res = l.flock(file.id, ex).map(drop))?;
             res
         }
 
