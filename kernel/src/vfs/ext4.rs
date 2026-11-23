@@ -1889,7 +1889,7 @@ impl Ext4Inode {
             return match probe {
                 Ok(entry) if entry.index.get() == child_arc.disk_ino => {
                     let _ = inner.write_links_or_pin(child_arc.disk_inode_index(), effective_links_u16);
-                    Ok(RmdirDiskOutcome::StillPresent { err, actual_nlink: u32::from(effective_links_u16) })
+                    Ok(RmdirDiskOutcome::StillPresent { err, actual_nlink: effective_links })
                 }
                 Err(Ext4Error::NotFound) => {
                     // The entry was removed on disk before `delete_file` /
