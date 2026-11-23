@@ -17,10 +17,11 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use lumen_mm::PhysFrame;
-use lumen_vfs::{VfsError, VfsInode};
+use lumen_vfs::{DevId, VfsError, VfsInode};
 
 use crate::arch;
 use crate::mm;
@@ -109,30 +110,34 @@ pub fn detached_cached_pages() -> usize {
 
 /// Lock-free atomic memory quota, counted in bytes: `tmpfs`'s (its pages,
 /// and since #267 its inodes, directory entries and symlink targets) and
-/// Gate 6 detach's (pages only). The page methods count whole pages.
+/// Gate 6 detach's (pages only). The `_pages` methods count whole pages.
+/// The count never passes the limit. A quota dropped with bytes still
+/// reserved logs an error: its owner leaked them.
 #[derive(Debug)]
 pub struct QuotaCounter {
     /// What the quota is for, named in its log lines.
     name: &'static str,
+    /// The mount it bounds (a `tmpfs`'s), also named in its log lines.
+    dev: Option<DevId>,
     limit_bytes: usize,
     used_bytes: AtomicUsize,
 }
 
 impl QuotaCounter {
     /// A quota of `limit_pages` pages.
-    pub const fn new(name: &'static str, limit_pages: usize) -> Self {
-        Self::with_bytes(name, limit_pages.saturating_mul(PAGE_SIZE))
+    pub const fn new_pages(name: &'static str, limit_pages: usize) -> Self {
+        Self { name, dev: None, limit_bytes: limit_pages.saturating_mul(PAGE_SIZE), used_bytes: AtomicUsize::new(0) }
     }
 
-    /// A quota of `limit_bytes` bytes.
-    pub const fn with_bytes(name: &'static str, limit_bytes: usize) -> Self {
-        Self { name, limit_bytes, used_bytes: AtomicUsize::new(0) }
+    /// The quota of `limit_bytes` bytes bounding the mount `dev`.
+    pub const fn for_mount(name: &'static str, dev: DevId, limit_bytes: usize) -> Self {
+        Self { name, dev: Some(dev), limit_bytes, used_bytes: AtomicUsize::new(0) }
     }
 
     /// Reserve `pages` pages, or `false` if that would pass the limit. A
     /// `true` must be released later, or the pages leak from the quota.
     #[must_use]
-    pub fn try_reserve(&self, pages: usize) -> bool {
+    pub fn try_reserve_pages(&self, pages: usize) -> bool {
         pages.checked_mul(PAGE_SIZE).is_some_and(|bytes| self.try_reserve_bytes(bytes))
     }
 
@@ -140,26 +145,15 @@ impl QuotaCounter {
     /// must be released later, or the bytes leak from the quota.
     #[must_use]
     pub fn try_reserve_bytes(&self, bytes: usize) -> bool {
-        self.try_reserve_bytes_freeing(bytes, 0)
-    }
-
-    /// Reserve `bytes` for a change that releases `freeing` bytes right
-    /// after (a rename: the new name reserved, then the old one released):
-    /// `false` only if the change as a whole would pass the limit. Until
-    /// that release the count may stand above the limit by up to `freeing`,
-    /// which only makes other reservations meanwhile fail.
-    #[must_use]
-    pub fn try_reserve_bytes_freeing(&self, bytes: usize, freeing: usize) -> bool {
         if bytes == 0 {
             return true;
         }
-        let ceiling = self.limit_bytes.saturating_add(freeing);
         let mut cur = self.used_bytes.load(Ordering::Acquire);
         loop {
             let Some(next) = cur.checked_add(bytes) else {
                 return false;
             };
-            if next > ceiling {
+            if next > self.limit_bytes {
                 return false;
             }
             match self.used_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
@@ -169,37 +163,17 @@ impl QuotaCounter {
         }
     }
 
-    /// Return `pages` pages to the quota. Releasing more than is reserved
-    /// is a bug elsewhere: the count saturates at zero (logged) rather than
+    /// Return `pages` pages to the quota, as [`Self::release_bytes`].
+    pub fn release_pages(&self, pages: usize) {
+        self.release_bytes(pages.saturating_mul(PAGE_SIZE));
+    }
+
+    /// Return `bytes` to the quota. Releasing more than is reserved is a
+    /// bug elsewhere: the count saturates at zero (logged) rather than
     /// wrapping, which would make every later reservation fail.
-    pub fn release(&self, pages: usize) {
-        if let Some(had) = self.release_counted(pages.saturating_mul(PAGE_SIZE)) {
-            log::error!(
-                target: "vfs",
-                "quota {} ({} bytes): released {pages} pages with only {had} bytes reserved",
-                self.name,
-                self.limit_bytes
-            );
-        }
-    }
-
-    /// Return `bytes` to the quota; as [`Self::release`], saturating.
     pub fn release_bytes(&self, bytes: usize) {
-        if let Some(had) = self.release_counted(bytes) {
-            log::error!(
-                target: "vfs",
-                "quota {} ({} bytes): released {bytes} bytes with only {had} reserved",
-                self.name,
-                self.limit_bytes
-            );
-        }
-    }
-
-    /// Take `bytes` off the count, saturating at zero: what was reserved
-    /// before if that was less than `bytes` (an over-release), else `None`.
-    fn release_counted(&self, bytes: usize) -> Option<usize> {
         if bytes == 0 {
-            return None;
+            return;
         }
         let mut cur = self.used_bytes.load(Ordering::Acquire);
         loop {
@@ -209,7 +183,9 @@ impl QuotaCounter {
                 Err(actual) => cur = actual,
             }
         }
-        (bytes > cur).then_some(cur)
+        if bytes > cur {
+            log::error!(target: "vfs", "quota {self}: released {bytes} bytes with only {cur} reserved");
+        }
     }
 
     /// The whole pages' worth reserved: exact for a quota only ever
@@ -224,8 +200,32 @@ impl QuotaCounter {
     }
 }
 
+/// `name`, the mount if one, and the limit: `tmpfs 0:2 (33554432 bytes)`.
+impl fmt::Display for QuotaCounter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name)?;
+        if let Some(dev) = self.dev {
+            write!(f, " {dev}")?;
+        }
+        write!(f, " ({} bytes)", self.limit_bytes)
+    }
+}
+
+impl Drop for QuotaCounter {
+    /// A quota goes when the last of its owners (a `tmpfs` mount and its
+    /// inodes, entries and pages) has gone, each having given back what it
+    /// held: bytes still reserved were leaked. Takes no sleeping lock (the
+    /// leak's `error!` takes the log's leaf lock).
+    fn drop(&mut self) {
+        let left = *self.used_bytes.get_mut();
+        if left != 0 {
+            log::error!(target: "vfs", "quota {self}: dropped with {left} bytes still reserved");
+        }
+    }
+}
+
 /// Global Gate 6 quota for open-unlinked detached `ext4` inodes.
-pub static DETACHED_QUOTA: QuotaCounter = QuotaCounter::new("detached", DETACHED_QUOTA_PAGES);
+pub static DETACHED_QUOTA: QuotaCounter = QuotaCounter::new_pages("detached", DETACHED_QUOTA_PAGES);
 
 /// Ownership class controlling accounting and reclaim eligibility.
 #[derive(Clone, Debug)]
@@ -846,13 +846,13 @@ impl PageCache {
                 TOTAL_CACHED_PAGES.fetch_add(1, Ordering::Relaxed);
             }
             CacheOwner::Tmpfs(quota) => {
-                if !quota.try_reserve(1) {
+                if !quota.try_reserve_pages(1) {
                     return Err(VfsError::NoSpc);
                 }
                 TOTAL_CACHED_PAGES.fetch_add(1, Ordering::Relaxed);
             }
             CacheOwner::Detached => {
-                if !DETACHED_QUOTA.try_reserve(1) {
+                if !DETACHED_QUOTA.try_reserve_pages(1) {
                     return Err(VfsError::NoSpc);
                 }
                 DETACHED_CACHED_PAGES.fetch_add(1, Ordering::Relaxed);
@@ -958,11 +958,11 @@ impl PageCache {
                 EXT4_CACHED_PAGES.fetch_sub(count, Ordering::Relaxed);
             }
             CacheOwner::Tmpfs(quota) => {
-                quota.release(count);
+                quota.release_pages(count);
             }
             CacheOwner::Detached => {
                 DETACHED_CACHED_PAGES.fetch_sub(count, Ordering::Relaxed);
-                DETACHED_QUOTA.release(count);
+                DETACHED_QUOTA.release_pages(count);
             }
         }
     }
@@ -991,7 +991,7 @@ impl DetachedQuotaGuard {
     /// Reserve `pages` more; `NoSpc` (as [`PageCache::insert_new`] reports
     /// the same quota) when it is used up.
     pub fn try_reserve(&mut self, pages: usize) -> Result<(), VfsError> {
-        if DETACHED_QUOTA.try_reserve(pages) {
+        if DETACHED_QUOTA.try_reserve_pages(pages) {
             self.reserved += pages;
             Ok(())
         } else {
@@ -1007,7 +1007,7 @@ impl DetachedQuotaGuard {
 impl Drop for DetachedQuotaGuard {
     fn drop(&mut self) {
         if self.reserved > 0 {
-            DETACHED_QUOTA.release(self.reserved);
+            DETACHED_QUOTA.release_pages(self.reserved);
             self.reserved = 0;
         }
     }
@@ -1192,12 +1192,20 @@ crate::ktest!(
 
 crate::ktest!(
     fn page_quota_release_saturates_and_detached_quota_reports_nospc() {
+        // Releasing more than is reserved (a bug elsewhere) saturates at
+        // zero, logged, rather than wrapping to "full"; a quota dropped with
+        // bytes still reserved logs that leak. Both lines are pinned in
+        // test_ktest.py's `VFS_EXACT_LINES`.
         use crate::kassert_eq;
-        let q = QuotaCounter::new("ktest", 4);
-        kassert_eq!(q.try_reserve(2), true);
-        q.release(5); // a bug elsewhere: more than reserved
-        kassert_eq!(q.used_pages(), 0);
-        kassert_eq!(q.try_reserve(4), true); // not wrapped to "full"
+        let q = QuotaCounter::new_pages("ktest", 4);
+        kassert_eq!(q.try_reserve_pages(2), true);
+        q.release_pages(5);
+        kassert_eq!(q.used_bytes(), 0);
+        kassert_eq!(q.try_reserve_pages(4), true); // not wrapped to "full"
+        kassert_eq!(q.try_reserve_bytes(1), false); // full to the byte
+        q.release_bytes(PAGE_SIZE - 1);
+        kassert_eq!(q.used_bytes(), 3 * PAGE_SIZE + 1);
+        drop(q); // with those still reserved: the leak's line
         let mut g = DetachedQuotaGuard::new();
         kassert_eq!(g.try_reserve(DETACHED_QUOTA_PAGES + 1).err(), Some(VfsError::NoSpc));
         Ok(())

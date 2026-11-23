@@ -1,13 +1,15 @@
 //! In-memory POSIX filesystem (`tmpfs`) backed by unified `PageCache` frames
 //! and bounded by an atomic per-mount memory quota (default 32 MiB). The
 //! quota pays for the data pages, and also (#267) for each inode
-//! ([`INODE_COST`], and a directory's maps, [`DIR_COST`]), each directory
-//! entry ([`entry_cost`]: its name and its share of the maps) and each
-//! symlink's target, so neither files nor names can grow the kernel heap
-//! past it. The root inode, one per mount, is free.
+//! ([`charge::INODE_COST`], and a directory's maps, [`charge::DIR_COST`]),
+//! each directory entry ([`charge::entry_cost`]: its name and its share of
+//! the maps) and each symlink's target, so files and names can't grow the
+//! kernel heap without bound. Those costs are estimates from above, and
+//! some of what a mount takes from the heap isn't charged: the root inode
+//! and its maps' root nodes (one per mount), a file's page map, advisory
+//! locks, and the VFS caches' entries (ARCHITECTURE section 9).
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -21,6 +23,9 @@ use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
 use super::page_cache::{self, CachePage, PAGE_SIZE, PageCache, QuotaCounter};
+use charge::{Children, EntryCharge, FIRST_CHILD_CURSOR, Growth, InodeCharge};
+#[cfg(feature = "ktest")]
+use charge::{DIR_COST, INODE_COST, entry_cost};
 
 struct TmpfsShared {
     dev: DevId,
@@ -41,7 +46,7 @@ impl Tmpfs {
     pub fn new(dev: DevId, quota_bytes: usize) -> Arc<Self> {
         let shared = Arc::new(TmpfsShared {
             dev,
-            quota: Arc::new(QuotaCounter::with_bytes("tmpfs", quota_bytes)),
+            quota: Arc::new(QuotaCounter::for_mount("tmpfs", dev, quota_bytes)),
             next_ino: AtomicU64::new(2),
         });
         let now = time::realtime_timespec();
@@ -51,7 +56,7 @@ impl Tmpfs {
             self_weak: Weak::clone(weak_self),
             ino: AtomicU64::new(1),
             inode_type: InodeType::Dir,
-            charged: 0,
+            _charged: InodeCharge::root(&shared.quota),
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
             meta: SleepMutex::new(TmpfsMeta {
@@ -81,85 +86,15 @@ impl Tmpfs {
     }
 }
 
-/// What each inode but the root costs its mount's quota, besides its
-/// pages and a symlink's target: the inode as allocated (the struct and an
-/// `Arc`'s two counts), rounded up to 64 bytes.
-pub(crate) const INODE_COST: usize = (size_of::<TmpfsInode>() + 2 * size_of::<usize>()).next_multiple_of(64);
-
-/// The heap block holding `bytes`: `lumen_heap` rounds every block up to
-/// its granule and keeps no header.
-const fn heap_block(bytes: usize) -> usize {
-    bytes.next_multiple_of(lumen_heap::GRANULE)
-}
-
-/// A bound on one node of a `BTreeMap<K, V>` with keys of `key` bytes and
-/// values of `val`, as std lays them out (B = 6): up to 11 keys and 11
-/// values, a parent pointer, two `u16`s and padding, and in an internal
-/// node, the larger, 12 edges.
-const fn btree_node(key: usize, val: usize) -> usize {
-    heap_block(size_of::<usize>() + 2 * size_of::<u16>() + 11 * (key + val) + 7 + 12 * size_of::<usize>())
-}
-
-/// Every `BTreeMap` node but the root holds at least this many entries.
-const BTREE_MIN_LEN: usize = 5;
-
-/// The nodes of a directory's two maps (see [`Children`]): what one node of
-/// each costs.
-const DIR_NODES: usize = btree_node(size_of::<u64>(), size_of::<(Vec<u8>, Arc<TmpfsInode>)>())
-    + btree_node(size_of::<Vec<u8>>(), size_of::<u64>());
-
-/// What a directory costs its mount's quota besides [`INODE_COST`]: the
-/// root node of each of its maps, which may hold a single entry.
-pub(crate) const DIR_COST: usize = DIR_NODES;
-
-/// What a directory entry named with `name_len` bytes costs its mount's
-/// quota: the name's heap block, which [`Children`] keeps twice, and its
-/// share of the maps' other nodes, each holding at least
-/// [`BTREE_MIN_LEN`] entries (the roots are [`DIR_COST`]).
-pub(crate) const fn entry_cost(name_len: usize) -> usize {
-    2 * heap_block(name_len) + DIR_NODES.div_ceil(BTREE_MIN_LEN)
-}
-
 /// Room for a ktest's few small files' inodes and names on top of a whole
 /// number of pages of data: under a page, so such a mount still runs out
-/// of data pages exactly where a quota of only those pages would.
+/// of data pages exactly where a quota of only those pages would, as long
+/// as the files' charges ([`INODE_COST`] and [`entry_cost`] each, a
+/// directory's [`DIR_COST`] too) fit in it: six files named with up to 16
+/// bytes at most (656 bytes each as of #267), or one directory and three
+/// such files. Past that, creating one more fails with `NoSpc`.
 #[cfg(feature = "ktest")]
 pub(crate) const KTEST_METADATA_ROOM: usize = PAGE_SIZE - 1;
-
-/// Bytes reserved from a mount's quota: released when dropped, unless
-/// [`Charge::keep`] hands them on to what they pay for (an inode's
-/// `charged`, a [`Children`] entry).
-#[must_use]
-struct Charge<'q> {
-    quota: &'q QuotaCounter,
-    bytes: usize,
-}
-
-impl<'q> Charge<'q> {
-    /// Reserve `bytes`, or `NoSpc` past the quota.
-    fn reserve(quota: &'q QuotaCounter, bytes: usize) -> Result<Self, VfsError> {
-        Self::reserve_freeing(quota, bytes, 0)
-    }
-
-    /// Reserve `bytes` for a change that then releases `freeing` (see
-    /// [`QuotaCounter::try_reserve_bytes_freeing`]), or `NoSpc`.
-    fn reserve_freeing(quota: &'q QuotaCounter, bytes: usize, freeing: usize) -> Result<Self, VfsError> {
-        if quota.try_reserve_bytes_freeing(bytes, freeing) { Ok(Self { quota, bytes }) } else { Err(VfsError::NoSpc) }
-    }
-
-    /// The bytes, now owned by whoever releases them.
-    fn keep(self) -> usize {
-        let bytes = self.bytes;
-        core::mem::forget(self);
-        bytes
-    }
-}
-
-impl Drop for Charge<'_> {
-    fn drop(&mut self) {
-        self.quota.release_bytes(self.bytes);
-    }
-}
 
 impl FileSystem for Tmpfs {
     fn dev_id(&self) -> DevId {
@@ -217,6 +152,13 @@ impl TmpfsMeta {
         }
     }
 
+    /// A directory's own part, for an inode already known to be one (by its
+    /// `inode_type`, fixed with its `node`): where a change has been made,
+    /// so that failing would leave it half done.
+    fn known_dir_mut(&mut self) -> &mut Dir {
+        self.dir_mut().expect("tmpfs: a directory's node is a Dir")
+    }
+
     /// A directory's parent (the root's is itself), if it is still there.
     fn parent(&self) -> Option<Arc<TmpfsInode>> {
         self.dir().ok().and_then(|dir| dir.parent.upgrade())
@@ -249,107 +191,295 @@ struct Dir {
     parent: Weak<TmpfsInode>,
 }
 
-/// `readdir`'s cursor for the first entry after `.` (0) and `..` (1).
-const FIRST_CHILD_CURSOR: u64 = 2;
+/// What a mount's inodes, names and symlink targets cost its quota (#267),
+/// and the charges that carry those costs: only this module reserves or
+/// gives back a charge, so every byte reserved has one owner and one
+/// release. The costs are estimates from above of what each takes from the
+/// kernel heap (`tmpfs_quota_charges_cover_what_the_heap_gives` measures
+/// them), from std's `BTreeMap` layout and `lumen_heap`'s blocks.
+mod charge {
+    use alloc::collections::BTreeMap;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
 
-/// A directory's entries, each under the sequence number it was added
-/// with: `readdir`'s cursor. An entry keeps its number until it is removed
-/// (replacing what a name points to, a `rename` over it or a
-/// `RENAME_EXCHANGE`, keeps the name's number), and a new name takes the
-/// next number, never one used before; so a cursor between two calls still
-/// starts where it did, whatever was added or removed meanwhile.
-///
-/// Each entry is charged to the mount's quota ([`entry_cost`]) from
-/// [`Children::add`] until it is removed, or the directory dropped.
-struct Children {
-    quota: Arc<QuotaCounter>,
-    /// The entries by number: what `readdir` walks.
-    by_seq: BTreeMap<u64, (Vec<u8>, Arc<TmpfsInode>)>,
-    /// Each name's number, for lookups; always the same names as `by_seq`.
-    by_name: BTreeMap<Vec<u8>, u64>,
-    /// The next name's number, from [`FIRST_CHILD_CURSOR`].
-    next_seq: u64,
-}
+    use lumen_vfs::{Escaped, VfsError};
 
-impl Children {
-    fn new(quota: Arc<QuotaCounter>) -> Self {
-        Self { quota, by_seq: BTreeMap::new(), by_name: BTreeMap::new(), next_seq: FIRST_CHILD_CURSOR }
+    use super::{Node, QuotaCounter, TmpfsInode};
+
+    /// What each inode but the root costs, besides its pages and what
+    /// [`inode_cost`] adds for its kind: the inode as allocated, the struct
+    /// and an `Arc`'s two counts in one heap block.
+    pub(super) const INODE_COST: usize = heap_block(size_of::<TmpfsInode>() + 2 * size_of::<usize>());
+
+    /// What a directory costs besides [`INODE_COST`]: the root node of each
+    /// of its maps, which may hold a single entry.
+    pub(super) const DIR_COST: usize = <BySeq as MapNode>::NODE + <ByName as MapNode>::NODE;
+
+    /// What a directory entry named with `name_len` bytes costs: the name's
+    /// heap block, which [`Children`] keeps twice, and its share of the
+    /// maps' nodes past their roots (which are [`DIR_COST`]), each of which
+    /// holds at least [`BTREE_MIN_LEN`] entries.
+    pub(super) const fn entry_cost(name_len: usize) -> usize {
+        2 * heap_block(name_len) + DIR_COST.div_ceil(BTREE_MIN_LEN)
     }
 
-    fn get(&self, name: &[u8]) -> Option<&Arc<TmpfsInode>> {
-        let seq = self.by_name.get(name)?;
-        let entry = self.by_seq.get(seq);
-        debug_assert!(
-            entry.is_some_and(|(n, _)| n == name),
-            "tmpfs: {:?}'s number {seq} lists another entry",
-            Escaped(name)
-        );
-        entry.map(|(_, child)| child)
+    /// What an inode of `node`'s kind costs: [`INODE_COST`], and a
+    /// directory's [`DIR_COST`] or a symlink's target's heap block.
+    fn inode_cost(node: &Node) -> usize {
+        INODE_COST
+            + match node {
+                Node::File => 0,
+                Node::Dir(_) => DIR_COST,
+                Node::Symlink(target) => heap_block(target.len()),
+            }
     }
 
-    fn contains_key(&self, name: &[u8]) -> bool {
-        self.by_name.contains_key(name)
+    /// The heap block holding `bytes`: `lumen_heap` rounds every block up
+    /// to its granule and keeps no header.
+    const fn heap_block(bytes: usize) -> usize {
+        bytes.next_multiple_of(lumen_heap::GRANULE)
     }
 
-    fn is_empty(&self) -> bool {
-        debug_assert_eq!(self.by_seq.len(), self.by_name.len());
-        self.by_seq.is_empty()
+    /// std's `BTreeMap` branching factor: a node holds at most `2 * B - 1`
+    /// entries, an internal one `2 * B` edges too, and every node but the
+    /// root at least `B - 1` entries.
+    const BTREE_B: usize = 6;
+    const BTREE_MIN_LEN: usize = BTREE_B - 1;
+
+    /// A bound on one node of a map, from its key and value types.
+    trait MapNode {
+        const NODE: usize;
     }
 
-    fn values(&self) -> impl Iterator<Item = &Arc<TmpfsInode>> {
-        self.by_seq.values().map(|(_, child)| child)
+    impl<K, V> MapNode for BTreeMap<K, V> {
+        /// The larger, internal kind of node as std lays it out: a parent
+        /// pointer, its index there and the length (two `u16`s), the keys
+        /// and values, padding to a pointer's alignment, and the edges. The
+        /// padding is at most that alignment less one only while keys and
+        /// values are whole words (no padding between the arrays), which
+        /// this checks at compile time.
+        const NODE: usize = {
+            let word = align_of::<usize>();
+            assert!(size_of::<K>().is_multiple_of(word) && align_of::<K>() <= word);
+            assert!(size_of::<V>().is_multiple_of(word) && align_of::<V>() <= word);
+            heap_block(
+                size_of::<usize>()
+                    + 2 * size_of::<u16>()
+                    + (2 * BTREE_B - 1) * (size_of::<K>() + size_of::<V>())
+                    + (word - 1)
+                    + 2 * BTREE_B * size_of::<usize>(),
+            )
+        };
     }
 
-    /// Add a new name for `child`, under the next number, paid for by
-    /// `charge` (its [`entry_cost`], reserved from this mount's quota).
-    fn add(&mut self, name: &[u8], child: Arc<TmpfsInode>, charge: Charge<'_>) {
-        debug_assert!(!self.by_name.contains_key(name), "tmpfs: {:?} added twice", Escaped(name));
-        debug_assert!(
-            core::ptr::eq(charge.quota, &*self.quota) && charge.bytes == entry_cost(name.len()),
-            "tmpfs: {:?} charged {} bytes, or to another quota",
-            Escaped(name),
-            charge.bytes
-        );
-        charge.keep();
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        self.by_name.insert(name.to_vec(), seq);
-        self.by_seq.insert(seq, (name.to_vec(), child));
+    /// Bytes reserved from a mount's quota, given back when dropped.
+    struct Reserved {
+        quota: Arc<QuotaCounter>,
+        bytes: usize,
     }
 
-    /// Point the existing `name` at `child`, keeping its number (and its
-    /// charge).
-    fn replace(&mut self, name: &[u8], child: Arc<TmpfsInode>) {
-        let slot = self.by_name.get(name).and_then(|seq| self.by_seq.get_mut(seq));
-        debug_assert!(slot.is_some(), "tmpfs: replacing {:?}, which has no entry", Escaped(name));
-        if let Some(slot) = slot {
-            slot.1 = child;
+    impl Reserved {
+        /// Reserve `bytes`, or `NoSpc` past the quota.
+        fn new(quota: &Arc<QuotaCounter>, bytes: usize) -> Result<Self, VfsError> {
+            if quota.try_reserve_bytes(bytes) {
+                Ok(Self { quota: Arc::clone(quota), bytes })
+            } else {
+                Err(VfsError::NoSpc)
+            }
         }
     }
 
-    /// Remove `name`, giving its charge back to the quota.
-    fn remove(&mut self, name: &[u8]) -> Option<Arc<TmpfsInode>> {
-        let seq = self.by_name.remove(name)?;
-        self.quota.release_bytes(entry_cost(name.len()));
-        let entry = self.by_seq.remove(&seq);
-        debug_assert!(entry.is_some(), "tmpfs: {:?}'s number {seq} had no entry", Escaped(name));
-        entry.map(|(_, child)| child)
+    impl Drop for Reserved {
+        /// Takes no sleeping lock (an over-release's `error!` takes the
+        /// log's leaf lock).
+        fn drop(&mut self) {
+            self.quota.release_bytes(self.bytes);
+        }
     }
 
-    /// The entries numbered `from` or more, in number order (the order they
-    /// were added in): `(number, name, inode)`.
-    fn listed_from(&self, from: u64) -> impl Iterator<Item = (u64, &[u8], &Arc<TmpfsInode>)> {
-        self.by_seq.range(from..).map(|(&seq, (name, child))| (seq, name.as_slice(), child))
+    /// An inode's charge ([`inode_cost`]), held by the inode and given back
+    /// when it is dropped: an unlinked inode keeps it until its last
+    /// reference goes (an open file, a mapping).
+    pub(super) struct InodeCharge {
+        _reserved: Reserved,
     }
-}
 
-impl Drop for Children {
-    /// A directory dropped with entries (only ever with its whole mount:
-    /// `rmdir` and a rename over a directory take only empty ones) gives
-    /// their charges back. Takes no lock.
-    fn drop(&mut self) {
-        let bytes = self.by_name.keys().map(|name| entry_cost(name.len())).sum();
-        self.quota.release_bytes(bytes);
+    impl InodeCharge {
+        /// Reserve what an inode of `node`'s kind costs, or `NoSpc`.
+        pub(super) fn reserve(quota: &Arc<QuotaCounter>, node: &Node) -> Result<Self, VfsError> {
+            Reserved::new(quota, inode_cost(node)).map(|reserved| Self { _reserved: reserved })
+        }
+
+        /// The root's: nothing, one per mount.
+        pub(super) fn root(quota: &Arc<QuotaCounter>) -> Self {
+            Self { _reserved: Reserved { quota: Arc::clone(quota), bytes: 0 } }
+        }
+    }
+
+    /// A directory entry's charge ([`entry_cost`]) and the name it pays
+    /// for: reserved for a new name ([`EntryCharge::for_name`]) or taken
+    /// out of a directory with its entry ([`Children::take`]), spent by
+    /// [`Children::add`], which files the name under it, and given back if
+    /// dropped instead.
+    pub(super) struct EntryCharge {
+        reserved: Reserved,
+        name: Vec<u8>,
+    }
+
+    impl EntryCharge {
+        /// Reserve `name`'s charge, or `NoSpc`.
+        pub(super) fn for_name(quota: &Arc<QuotaCounter>, name: &[u8]) -> Result<Self, VfsError> {
+            let reserved = Reserved::new(quota, entry_cost(name.len()))?;
+            Ok(Self { reserved, name: name.to_vec() })
+        }
+
+        /// This charge, with `growth`, now paying for `new_name` instead: a
+        /// rename's. What the old name's charge holds past the new name's
+        /// cost is given back.
+        pub(super) fn renamed(self, growth: Growth, new_name: &[u8]) -> Self {
+            let Self { mut reserved, .. } = self;
+            let mut growth = growth.0;
+            debug_assert!(Arc::ptr_eq(&reserved.quota, &growth.quota), "tmpfs: a rename across quotas");
+            reserved.bytes += core::mem::take(&mut growth.bytes);
+            let cost = entry_cost(new_name.len());
+            debug_assert!(reserved.bytes >= cost, "tmpfs: renaming to {:?} reserved too little", Escaped(new_name));
+            reserved.quota.release_bytes(reserved.bytes.saturating_sub(cost));
+            reserved.bytes = cost;
+            Self { reserved, name: new_name.to_vec() }
+        }
+    }
+
+    /// What a rename to a new name costs on top of the old name's charge,
+    /// which moves to it: reserved before anything changes, so the count
+    /// never passes the limit and a name no costlier than the old one
+    /// needs nothing.
+    pub(super) struct Growth(Reserved);
+
+    impl Growth {
+        /// Reserve what `new_name` costs more than `old_name`, or `NoSpc`.
+        pub(super) fn reserve(quota: &Arc<QuotaCounter>, old_name: &[u8], new_name: &[u8]) -> Result<Self, VfsError> {
+            let more = entry_cost(new_name.len()).saturating_sub(entry_cost(old_name.len()));
+            Reserved::new(quota, more).map(Self)
+        }
+    }
+
+    type BySeq = BTreeMap<u64, (Vec<u8>, Arc<TmpfsInode>)>;
+    type ByName = BTreeMap<Vec<u8>, u64>;
+
+    /// `readdir`'s cursor for the first entry after `.` (0) and `..` (1).
+    pub(super) const FIRST_CHILD_CURSOR: u64 = 2;
+
+    /// A directory's entries, each under the sequence number it was added
+    /// with: `readdir`'s cursor. An entry keeps its number until it is
+    /// removed (replacing what a name points to, a `rename` over it or a
+    /// `RENAME_EXCHANGE`, keeps the name's number), and a new name takes
+    /// the next number, never one used before; so a cursor between two
+    /// calls still starts where it did, whatever was added or removed
+    /// meanwhile.
+    ///
+    /// Each entry holds its [`EntryCharge`] from [`Children::add`] until it
+    /// is removed, taken out, or the directory dropped.
+    pub(super) struct Children {
+        /// The mount's quota, which the entries' charges are given back to.
+        quota: Arc<QuotaCounter>,
+        /// The entries by number: what `readdir` walks.
+        by_seq: BySeq,
+        /// Each name's number, for lookups; always the same names as
+        /// `by_seq`.
+        by_name: ByName,
+        /// The next name's number, from [`FIRST_CHILD_CURSOR`].
+        next_seq: u64,
+    }
+
+    impl Children {
+        pub(super) fn new(quota: Arc<QuotaCounter>) -> Self {
+            Self { quota, by_seq: BTreeMap::new(), by_name: BTreeMap::new(), next_seq: FIRST_CHILD_CURSOR }
+        }
+
+        pub(super) fn get(&self, name: &[u8]) -> Option<&Arc<TmpfsInode>> {
+            let seq = self.by_name.get(name)?;
+            let entry = self.by_seq.get(seq);
+            debug_assert!(
+                entry.is_some_and(|(n, _)| n == name),
+                "tmpfs: {:?}'s number {seq} lists another entry",
+                Escaped(name)
+            );
+            entry.map(|(_, child)| child)
+        }
+
+        pub(super) fn contains_key(&self, name: &[u8]) -> bool {
+            self.by_name.contains_key(name)
+        }
+
+        pub(super) fn is_empty(&self) -> bool {
+            debug_assert_eq!(self.by_seq.len(), self.by_name.len());
+            self.by_seq.is_empty()
+        }
+
+        pub(super) fn values(&self) -> impl Iterator<Item = &Arc<TmpfsInode>> {
+            self.by_seq.values().map(|(_, child)| child)
+        }
+
+        /// Add `charge`'s name for `child`, under the next number: the
+        /// entry now holds the charge.
+        pub(super) fn add(&mut self, child: Arc<TmpfsInode>, charge: EntryCharge) {
+            let EntryCharge { mut reserved, name } = charge;
+            debug_assert!(!self.by_name.contains_key(&name), "tmpfs: {:?} added twice", Escaped(&name));
+            debug_assert!(
+                Arc::ptr_eq(&reserved.quota, &self.quota),
+                "tmpfs: {:?} charged to another quota",
+                Escaped(&name)
+            );
+            // From here this directory gives it back (`take`, its drop).
+            reserved.bytes = 0;
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            self.by_name.insert(name.clone(), seq);
+            self.by_seq.insert(seq, (name, child));
+        }
+
+        /// Point the existing `name` at `child`, keeping its number (and
+        /// its charge).
+        pub(super) fn replace(&mut self, name: &[u8], child: Arc<TmpfsInode>) {
+            let slot = self.by_name.get(name).and_then(|seq| self.by_seq.get_mut(seq));
+            debug_assert!(slot.is_some(), "tmpfs: replacing {:?}, which has no entry", Escaped(name));
+            if let Some(slot) = slot {
+                slot.1 = child;
+            }
+        }
+
+        /// Take `name`'s entry out, with its charge (which a rename moves
+        /// to the new name, and which is given back if dropped).
+        pub(super) fn take(&mut self, name: &[u8]) -> Option<(Arc<TmpfsInode>, EntryCharge)> {
+            let seq = self.by_name.remove(name)?;
+            let entry = self.by_seq.remove(&seq);
+            debug_assert!(entry.is_some(), "tmpfs: {:?}'s number {seq} had no entry", Escaped(name));
+            let (name, child) = entry?;
+            let reserved = Reserved { quota: Arc::clone(&self.quota), bytes: entry_cost(name.len()) };
+            Some((child, EntryCharge { reserved, name }))
+        }
+
+        /// Remove `name`, giving its charge back.
+        pub(super) fn remove(&mut self, name: &[u8]) -> Option<Arc<TmpfsInode>> {
+            self.take(name).map(|(child, _charge)| child)
+        }
+
+        /// The entries numbered `from` or more, in number order (the order
+        /// they were added in): `(number, name, inode)`.
+        pub(super) fn listed_from(&self, from: u64) -> impl Iterator<Item = (u64, &[u8], &Arc<TmpfsInode>)> {
+            self.by_seq.range(from..).map(|(&seq, (name, child))| (seq, name.as_slice(), child))
+        }
+    }
+
+    impl Drop for Children {
+        /// A directory dropped with entries (only ever with its whole
+        /// mount: `rmdir` and a rename over a directory take only empty
+        /// ones) gives their charges back. Takes no sleeping lock (an
+        /// over-release's `error!` takes the log's leaf lock).
+        fn drop(&mut self) {
+            let bytes = self.by_name.keys().map(|name| entry_cost(name.len())).sum();
+            self.quota.release_bytes(bytes);
+        }
     }
 }
 
@@ -364,11 +494,8 @@ pub struct TmpfsInode {
     /// The kind of [`TmpfsMeta::node`], readable without its lock.
     inode_type: InodeType,
     /// What this inode holds of the quota besides its pages and its
-    /// names: [`INODE_COST`], and a directory's [`DIR_COST`] or a symlink's
-    /// target's heap block (0 for the root).
-    /// Released when the inode is dropped, so an unlinked inode still
-    /// open keeps it until its last close.
-    charged: usize,
+    /// names (nothing for the root), given back when it is dropped.
+    _charged: InodeCharge,
     open_count: AtomicU32,
     detached: AtomicBool,
     meta: SleepMutex<TmpfsMeta>,
@@ -428,16 +555,14 @@ impl TmpfsInode {
         Ok((offset, done))
     }
 
-    /// A new inode of `node`'s kind, its [`INODE_COST`] and a directory's
-    /// [`DIR_COST`] or a symlink's target charged to the quota (`NoSpc`
-    /// past it) until it is dropped.
+    /// A new inode of `node`'s kind, charged to the quota ([`InodeCharge`],
+    /// `NoSpc` past it) until it is dropped.
     fn new_child(shared: &Arc<TmpfsShared>, node: Node, mode: u16, nlink: u32) -> Result<Arc<Self>, VfsError> {
-        let (size, extra) = match &node {
-            Node::Symlink(target) => (target.len(), heap_block(target.len())),
-            Node::Dir(_) => (0, DIR_COST),
-            Node::File => (0, 0),
+        let charged = InodeCharge::reserve(&shared.quota, &node)?;
+        let size = match &node {
+            Node::Symlink(target) => target.len(),
+            Node::File | Node::Dir(_) => 0,
         };
-        let charged = Charge::reserve(&shared.quota, INODE_COST + extra)?.keep();
         let now = time::realtime_timespec();
         let ino = shared.next_ino.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new_cyclic(|weak_self| Self {
@@ -446,7 +571,7 @@ impl TmpfsInode {
             self_weak: Weak::clone(weak_self),
             ino: AtomicU64::new(ino),
             inode_type: node.inode_type(),
-            charged,
+            _charged: charged,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
             meta: SleepMutex::new(TmpfsMeta {
@@ -510,14 +635,6 @@ impl TmpfsInode {
         let page = page_or_new(&mut pages, index)?;
         page.touch();
         Ok((page, file_size))
-    }
-}
-
-impl Drop for TmpfsInode {
-    /// Gives `charged` back (its pages go with `pages`, its directory's
-    /// entries with its `Children`). Takes no lock.
-    fn drop(&mut self) {
-        self.shared.quota.release_bytes(self.charged);
     }
 }
 
@@ -681,12 +798,13 @@ impl VfsInode for TmpfsInode {
         if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if meta.dir()?.children.contains_key(name) {
+        let children = &mut meta.dir_mut()?.children;
+        if children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let entry = Charge::reserve(&self.shared.quota, entry_cost(name.len()))?;
+        let entry = EntryCharge::for_name(&self.shared.quota, name)?;
         let child = Self::new_child(&self.shared, Node::File, mode, 1)?;
-        meta.dir_mut()?.children.add(name, Arc::clone(&child), entry);
+        children.add(Arc::clone(&child), entry);
         let now = time::realtime_timespec();
         meta.mtime = now;
         meta.ctime = now;
@@ -706,13 +824,14 @@ impl VfsInode for TmpfsInode {
         if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if meta.dir()?.children.contains_key(name) {
+        let children = &mut meta.dir_mut()?.children;
+        if children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let entry = Charge::reserve(&self.shared.quota, entry_cost(name.len()))?;
+        let entry = EntryCharge::for_name(&self.shared.quota, name)?;
         let dir = Dir { children: Children::new(Arc::clone(&self.shared.quota)), parent: Arc::downgrade(&self_arc) };
         let child = Self::new_child(&self.shared, Node::Dir(dir), mode, 2)?;
-        meta.dir_mut()?.children.add(name, Arc::clone(&child), entry);
+        children.add(Arc::clone(&child), entry);
         meta.nlink = meta.nlink.saturating_add(1);
         let now = time::realtime_timespec();
         meta.mtime = now;
@@ -745,7 +864,10 @@ impl VfsInode for TmpfsInode {
         let now = time::realtime_timespec();
         {
             let p_meta = tmpfs_guard_mut(&mut guards, &self_arc);
-            if self_arc.is_detached() || p_meta.nlink == 0 || p_meta.dir_mut()?.children.remove(name).is_none() {
+            if self_arc.is_detached() || p_meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            if p_meta.dir_mut()?.children.remove(name).is_none() {
                 return Err(VfsError::NoEnt);
             }
             p_meta.mtime = now;
@@ -793,7 +915,10 @@ impl VfsInode for TmpfsInode {
         let now = time::realtime_timespec();
         {
             let p_meta = tmpfs_guard_mut(&mut guards, &self_arc);
-            if self_arc.is_detached() || p_meta.nlink == 0 || p_meta.dir_mut()?.children.remove(name).is_none() {
+            if self_arc.is_detached() || p_meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            if p_meta.dir_mut()?.children.remove(name).is_none() {
                 return Err(VfsError::NoEnt);
             }
             p_meta.nlink = p_meta.nlink.saturating_sub(1);
@@ -841,8 +966,8 @@ impl VfsInode for TmpfsInode {
             if children.contains_key(name) {
                 return Err(VfsError::Exist);
             }
-            let entry = Charge::reserve(&self.shared.quota, entry_cost(name.len()))?;
-            children.add(name, Arc::clone(&target_arc), entry);
+            let entry = EntryCharge::for_name(&self.shared.quota, name)?;
+            children.add(Arc::clone(&target_arc), entry);
             p_meta.mtime = now;
             p_meta.ctime = now;
         }
@@ -870,12 +995,13 @@ impl VfsInode for TmpfsInode {
         if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if meta.dir()?.children.contains_key(name) {
+        let children = &mut meta.dir_mut()?.children;
+        if children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let entry = Charge::reserve(&self.shared.quota, entry_cost(name.len()))?;
+        let entry = EntryCharge::for_name(&self.shared.quota, name)?;
         let child = Self::new_child(&self.shared, Node::Symlink(Box::from(target)), 0o777, 1)?;
-        meta.dir_mut()?.children.add(name, Arc::clone(&child), entry);
+        children.add(Arc::clone(&child), entry);
         let now = time::realtime_timespec();
         meta.mtime = now;
         meta.ctime = now;
@@ -967,26 +1093,26 @@ impl VfsInode for TmpfsInode {
             // Both names stay, each keeping its charge.
             {
                 let old_p = tmpfs_guard_mut(&mut guards, &old_dir_arc);
-                old_p.dir_mut()?.children.replace(old_name, Arc::clone(new_child_arc));
+                old_p.known_dir_mut().children.replace(old_name, Arc::clone(new_child_arc));
                 old_p.mtime = now;
                 old_p.ctime = now;
             }
             {
                 let new_p = tmpfs_guard_mut(&mut guards, &new_dir_arc);
-                new_p.dir_mut()?.children.replace(new_name, Arc::clone(&old_child_arc));
+                new_p.known_dir_mut().children.replace(new_name, Arc::clone(&old_child_arc));
                 new_p.mtime = now;
                 new_p.ctime = now;
             }
             if !same_parent {
                 if old_is_dir {
-                    tmpfs_guard_mut(&mut guards, &old_child_arc).dir_mut()?.parent = Arc::downgrade(&new_dir_arc);
+                    tmpfs_guard_mut(&mut guards, &old_child_arc).known_dir_mut().parent = Arc::downgrade(&new_dir_arc);
                     tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink =
                         tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_sub(1);
                     tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink =
                         tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_add(1);
                 }
                 if new_is_dir {
-                    tmpfs_guard_mut(&mut guards, new_child_arc).dir_mut()?.parent = Arc::downgrade(&old_dir_arc);
+                    tmpfs_guard_mut(&mut guards, new_child_arc).known_dir_mut().parent = Arc::downgrade(&old_dir_arc);
                     tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink =
                         tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_sub(1);
                     tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink =
@@ -998,15 +1124,17 @@ impl VfsInode for TmpfsInode {
             return Ok(());
         }
 
-        // Replacing a name charges nothing; a new name is reserved before
-        // anything changes, against the old name's charge, which goes with
-        // it: on a full mount a name no longer than the old one still fits.
-        let new_entry = match &new_child_opt {
+        // Every check comes before the first change. A new name takes the
+        // old name's charge, and only what it costs more is reserved, here:
+        // on a full mount a name no costlier than the old one still fits.
+        // A name replaced keeps its charge, and the old name's is given back.
+        let new_is_dir = new_child_opt.as_ref().is_some_and(|nc| nc.inode_type == InodeType::Dir);
+        let growth = match &new_child_opt {
+            None => Some(Growth::reserve(&self.shared.quota, old_name, new_name)?),
             Some(nc) => {
                 if nc.lock_id == old_child_arc.lock_id {
                     return Ok(());
                 }
-                let new_is_dir = nc.inode_type == InodeType::Dir;
                 if old_is_dir && !new_is_dir {
                     return Err(VfsError::NotDir);
                 }
@@ -1018,14 +1146,16 @@ impl VfsInode for TmpfsInode {
                 }
                 None
             }
-            None => Some(Charge::reserve_freeing(
-                &self.shared.quota,
-                entry_cost(new_name.len()),
-                entry_cost(old_name.len()),
-            )?),
         };
+        // The first change: the old name out, with its charge (there under
+        // the rename lock; were it gone, nothing has changed yet).
+        let (moved, entry) = tmpfs_guard_mut(&mut guards, &old_dir_arc)
+            .known_dir_mut()
+            .children
+            .take(old_name)
+            .ok_or(VfsError::NoEnt)?;
+        debug_assert!(Arc::ptr_eq(&moved, &old_child_arc), "tmpfs: {:?} changed during a rename", Escaped(old_name));
         if let Some(ref nc) = new_child_opt {
-            let new_is_dir = nc.inode_type == InodeType::Dir;
             let nc_meta = tmpfs_guard_mut(&mut guards, nc);
             if new_is_dir || nc_meta.nlink <= 1 {
                 Self::detach_if_open(nc, nc_meta);
@@ -1038,16 +1168,17 @@ impl VfsInode for TmpfsInode {
                 np.nlink = np.nlink.saturating_sub(1);
             }
         }
-
-        tmpfs_guard_mut(&mut guards, &old_dir_arc).dir_mut()?.children.remove(old_name);
-        let new_children = &mut tmpfs_guard_mut(&mut guards, &new_dir_arc).dir_mut()?.children;
-        match new_entry {
-            Some(entry) => new_children.add(new_name, Arc::clone(&old_child_arc), entry),
-            None => new_children.replace(new_name, Arc::clone(&old_child_arc)),
+        let new_children = &mut tmpfs_guard_mut(&mut guards, &new_dir_arc).known_dir_mut().children;
+        match growth {
+            Some(growth) => new_children.add(moved, entry.renamed(growth, new_name)),
+            None => {
+                drop(entry);
+                new_children.replace(new_name, moved);
+            }
         }
 
         if old_is_dir && !same_parent {
-            tmpfs_guard_mut(&mut guards, &old_child_arc).dir_mut()?.parent = Arc::downgrade(&new_dir_arc);
+            tmpfs_guard_mut(&mut guards, &old_child_arc).known_dir_mut().parent = Arc::downgrade(&new_dir_arc);
             tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink =
                 tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_sub(1);
             tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink =
