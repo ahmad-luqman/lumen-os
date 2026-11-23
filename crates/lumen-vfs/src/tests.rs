@@ -8924,8 +8924,9 @@ fn not_a_name_errno_per_operation_ahead_of_erofs() {
 }
 
 /// #309: `.` and `..` in a removed directory, which the filesystem no longer
-/// finds either of: `link` and `open(O_CREAT)` answer from the path, never
-/// handing either to the filesystem as a name.
+/// finds either of: `link` and `open(O_CREAT|O_EXCL)` on either, and
+/// `open(O_CREAT)` on `.`, answer from the path, never handing it to the
+/// filesystem as a name.
 #[test]
 fn not_a_name_answered_without_the_filesystem() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
@@ -8951,9 +8952,9 @@ fn not_a_name_answered_without_the_filesystem() {
 
 /// #309: `open(O_CREAT)` on `.` or `..` opens the directory that one names
 /// (either then gives `EISDIR`, so which was resolved shows only in the
-/// lookups): `.` asks no filesystem; `..` asks the parent's filesystem for
-/// its `..`, at a mount root after crossing up to the mount point, never
-/// the mounted filesystem.
+/// lookups): `.` asks no filesystem for `.` or `..`; `..` asks the parent's
+/// filesystem for its `..`, at a mount root after crossing up to the mount
+/// point, never the mounted filesystem, and no filesystem for `.`.
 #[test]
 fn open_creat_resolves_the_dots_it_was_given() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
@@ -8963,11 +8964,13 @@ fn open_creat_resolves_the_dots_it_was_given() {
     let mounted = FreshArcReusingFs::new(DevId::makedev(0, 73), "fresh-tmpfs", false, true);
     env.mount(mp, "/m", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
     let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY);
-    let asks = |fs: &FreshArcReusingFs| {
+    // Set when `fs` is asked to look `name` up. A hook fires once and is
+    // gone; the next row's replaces one that didn't.
+    let asks = |fs: &FreshArcReusingFs, name: &[u8]| {
         let asked = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&asked);
         let hook = alloc::boxed::Box::new(move || flag.store(true, Ordering::Release));
-        fs.inner.hooks.lock().unwrap().pre_lookup.insert(b"..".to_vec(), hook);
+        fs.inner.hooks.lock().unwrap().pre_lookup.insert(name.to_vec(), hook);
         asked
     };
     // (path, from `d`, the root filesystem asked for `..`)
@@ -8981,27 +8984,32 @@ fn open_creat_resolves_the_dots_it_was_given() {
     ];
     for (path, from_d, root_asked) in rows {
         let at = Escaped(path);
-        let (root, other) = (asks(&fs), asks(&mounted));
+        let (root, other) = (asks(&fs, b".."), asks(&mounted, b".."));
+        let (root_dot, other_dot) = (asks(&fs, b"."), asks(&mounted, b"."));
         let start = from_d.then_some(&d);
         assert_eq!(open_inode(env.as_ref(), start, path, creat, 0o644, 0).unwrap_err(), VfsError::IsDir, "{at}");
         assert_eq!(root.load(Ordering::Acquire), root_asked, "root filesystem asked for `..` by {at}");
         assert!(!other.load(Ordering::Acquire), "mounted filesystem asked for `..` by {at}");
-        fs.inner.hooks.lock().unwrap().pre_lookup.clear();
-        mounted.inner.hooks.lock().unwrap().pre_lookup.clear();
+        assert!(!root_dot.load(Ordering::Acquire), "root filesystem asked for `.` by {at}");
+        assert!(!other_dot.load(Ordering::Acquire), "mounted filesystem asked for `.` by {at}");
     }
 }
 
 /// The lines of `src` (Rust source) that get a `Final` other than as a
-/// `match`'s scrutinee, or use a `Final::` pattern other than as a match
-/// arm, `//` comment lines skipped. Rustc's exhaustiveness check and
-/// `clippy::wildcard_enum_match_arm` see only a `match` on a bare `Final`;
-/// this keeps `ops.rs` to that form (no `let ... else`, `if let`,
-/// `matches!`, tuple scrutinee, method path or `Final` held in a
-/// variable; #309). A helper whose own direct `match` answers the three
-/// alike passes it.
+/// `match`'s scrutinee, all on one line as `match target.final_component() {`
+/// (a `let <ident> = ` before it or a field path such as `self.target` as
+/// the receiver allowed), or use a `Final::` pattern other than at the
+/// start of a match arm's line, `//` comment lines skipped (#309). Rustc's
+/// exhaustiveness check and clippy's wildcard lints see every case only of
+/// a `match` on a bare `Final`; the comment at the top of `ops.rs` says what
+/// this refuses there and what it misses.
 fn final_outside_a_direct_match(src: &str) -> Vec<(usize, &str)> {
     fn is_ident(s: &str) -> bool {
         !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+    // `target` or `self.target`: no call, so no second `Final` read in it.
+    fn is_path(s: &str) -> bool {
+        s.split('.').all(is_ident)
     }
     fn direct_match(line: &str) -> bool {
         let line = match line.strip_prefix("let ") {
@@ -9011,7 +9019,7 @@ fn final_outside_a_direct_match(src: &str) -> Vec<(usize, &str)> {
             },
             None => line,
         };
-        line.strip_prefix("match ").and_then(|rest| rest.strip_suffix(".final_component() {")).is_some_and(is_ident)
+        line.strip_prefix("match ").and_then(|rest| rest.strip_suffix(".final_component() {")).is_some_and(is_path)
     }
     src.lines()
         .enumerate()
@@ -9035,7 +9043,8 @@ fn ops_reads_final_only_through_a_direct_match() {
 
     let good = "let name = match target.final_component() {\n    Final::Root | Final::Dot | Final::DotDot => \
                 return Err(VfsError::Exist),\n    | Final::Name(name) => name,\n};\n\
-                match new_target.final_component() {\n// if let Final::Name(n) = x {\n";
+                match new_target.final_component() {\nmatch self.target.final_component() {\n\
+                // if let Final::Name(n) = x {\n";
     assert_eq!(final_outside_a_direct_match(good), []);
     for bad in [
         "let Final::Name(name) = target.final_component() else {",
@@ -9045,7 +9054,7 @@ fn ops_reads_final_only_through_a_direct_match() {
         "if matches!(target.final_component(), Final::Name(_)) {",
         "let last = target.final_component();",
         "if let Final::Name(name) = last {",
-        "let mut name = match target.final_component() {",
+        "match pick(target.final_component(), other).final_component() {",
         "let name = match target.final_component() { Final::Name(n) => n, _ => return Err(e) };",
         "let last = Some(&target).map(ParentTarget::final_component);",
     ] {
