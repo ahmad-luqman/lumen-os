@@ -368,7 +368,7 @@ one is its own PR that updates that doc first.
   in-memory block device those files' ktests use too, stays in `mod.rs`);
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
-  64 MiB hard cap, `QuotaCounter`, the detached-inode quota; `mmap_page`,
+  64 MiB hard cap, `QuotaCounter` (bytes; a leak logged when dropped), the detached-inode quota; `mmap_page`,
   re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
   for a mapping, through `VfsInode::as_any`, and `MappedPage::copy_to_frame` (under the cache lock)
   for copy-on-write, #255; `WritableMap`, the guard counting a writable
@@ -384,7 +384,9 @@ one is its own PR that updates that doc first.
   `InodeTimes`, clamped on load and by every setter and stored by `store`/
   `store_ctime`, and `new_inode`, the one way to make an inode, #294;
   `ktest_util::set_clock`, the ktests' clock, `Ext4Shared::now`);
-  `vfs/tmpfs.rs`,
+  `vfs/tmpfs.rs` (its quota charging inodes, directory entries and symlink
+  targets besides pages, #267: `charge`, the cost model, `InodeCharge`,
+  `EntryCharge` and `Children`, the only code reserving or giving one back),
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
