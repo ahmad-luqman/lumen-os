@@ -600,18 +600,36 @@ fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
 }
 
 /// Copy `path` and a NUL into the test process's user memory, in slot
-/// `slot` (256 bytes each), for a handler's path argument.
+/// `slot`, for a handler's path argument: 16 slots of 256 bytes, slot `n`
+/// at `KTEST_USER_VA + n * 256`, filling the first page (so a test's own
+/// bytes there are overwritten). A path that wouldn't fit its slot with
+/// its NUL, or a slot past 15, is refused. A raw buffer a test keeps in
+/// the first page shares it with the slots (`+ 1024`, `+ 2048` and
+/// `+ 3072` are slots 4, 8 and 12): such a test keeps its paths clear of
+/// its buffers.
 #[cfg(feature = "ktest")]
 pub(super) fn ktest_user_path(slot: u64, path: &[u8]) -> Result<UserPtr, &'static str> {
-    let addr = process::KTEST_USER_VA + slot * 256;
+    if slot >= KTEST_PATH_SLOTS {
+        return Err("a ktest path slot past the first page");
+    }
+    if path.len() >= KTEST_PATH_SLOT_LEN as usize {
+        return Err("a ktest path longer than its slot");
+    }
+    let addr = process::KTEST_USER_VA + slot * KTEST_PATH_SLOT_LEN;
     let mut bytes = path.to_vec();
     bytes.push(0);
     copy_to_user(addr, &bytes).map_err(|_| "copy a path into user memory")?;
     Ok(at::reg(addr))
 }
 
+/// [`ktest_user_path`]'s slots: how many, and the bytes in each.
 #[cfg(feature = "ktest")]
-pub(super) fn ktest_flags(bits: u32) -> OpenFlags {
+const KTEST_PATH_SLOTS: u64 = 16;
+#[cfg(feature = "ktest")]
+const KTEST_PATH_SLOT_LEN: u64 = 256;
+
+#[cfg(feature = "ktest")]
+fn ktest_flags(bits: u32) -> OpenFlags {
     OpenFlags::from_bits(bits)
 }
 
@@ -619,6 +637,152 @@ pub(super) fn ktest_flags(bits: u32) -> OpenFlags {
 #[cfg(feature = "ktest")]
 pub(super) fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
     if ret < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(ret)) } else { Err("the open failed") }
+}
+
+/// [`ktest_fd`] for `call` on `path` (`open`, say, or `fcntl(F_DUPFD)`):
+/// when `ret` isn't a descriptor, a `ktest::diag` line names the call, the
+/// path and what the handler returned.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_fd_of(ret: u64, call: &str, path: &[u8]) -> Result<Fd, &'static str> {
+    ktest_fd(ret).inspect_err(|why| {
+        crate::ktest::diag(format_args!("{why}: {call} {} gave {}", lumen_vfs::Escaped(path), ret as i64));
+    })
+}
+
+/// `open(path, flags, 0o644)` through the handler, `path` copied into path
+/// slot `slot` of the test process's user memory: the descriptor. A file
+/// `O_CREAT` makes is `0o644` less the umask (the mode means nothing
+/// without it); a test of another mode calls `sys_open` itself. A failed
+/// open's `ktest::diag` line names the path and what the handler returned
+/// ([`ktest_fd_of`]).
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_open(slot: u64, path: &[u8], flags: u32) -> Result<Fd, &'static str> {
+    let user = ktest_user_path(slot, path)
+        .inspect_err(|why| crate::ktest::diag(format_args!("{why}: {}", lumen_vfs::Escaped(path))))?;
+    ktest_fd_of(sys_open(user, ktest_flags(flags), at::reg(0o644)), "open", path)
+}
+
+/// A new descriptor of the current process on `inode` with `flags`, with
+/// no lookup (`OpenFile::new_unchecked_flags`): how ktests reach a volume
+/// no mount holds. `path` is the open file's path, as `/proc/<pid>/maps`
+/// and `/proc/<pid>/fd` show it, and a failure's `ktest::diag` line.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_install(
+    inode: &alloc::sync::Arc<dyn VfsInode>,
+    path: &[u8],
+    flags: u32,
+) -> Result<Fd, &'static str> {
+    let file = KernelFile::new_unchecked_flags(
+        alloc::sync::Arc::clone(inode),
+        alloc::sync::Arc::from(path),
+        ktest_flags(flags),
+    )
+    .map_err(|e| ktest_failed_at("open the inode", path, e))?;
+    ktest_install_file(file)
+}
+
+/// `file` (opened however a ktest likes, in any process) as a new
+/// descriptor of the current process, without close-on-exec.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_install_file(file: KernelFile) -> Result<Fd, &'static str> {
+    let path = alloc::sync::Arc::clone(&file.path);
+    let raw = process::install_current_fd(file, false).map_err(|e| ktest_failed_at("install the fd", &path, e))?;
+    Ok(at::reg(u64::from(raw as u32)))
+}
+
+/// `why`, after a `ktest::diag` line naming `path` and the error: which of
+/// a ktest's opens (or removals) failed, and how.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_failed_at(why: &'static str, path: &[u8], e: VfsError) -> &'static str {
+    crate::ktest::diag(format_args!("{why} at {}: {e:?}", lumen_vfs::Escaped(path)));
+    why
+}
+
+/// A file at `path` (in `/tmp`) holding `data`, open `O_RDWR` as `fd`
+/// (through [`ktest_open`] in path slot 3, overwriting what a caller kept
+/// there): its name removed again when dropped, so a failing check, which
+/// returns early, leaves no file behind for the next run, nor does a
+/// failing `new`. Dropping it doesn't close `fd`, which stays open until
+/// the test process ends; it can't leave that process (it isn't `Send`,
+/// so `in_test_process` can't return it). Its fields are private, so the
+/// path `Drop` removes is the one `new` checked.
+#[cfg(feature = "ktest")]
+pub(super) struct KtestTmpFile {
+    path: &'static [u8],
+    fd: Fd,
+    inode: alloc::sync::Arc<dyn VfsInode>,
+    _in_its_process: core::marker::PhantomData<*const ()>,
+}
+
+#[cfg(feature = "ktest")]
+impl KtestTmpFile {
+    pub(super) fn new(path: &'static [u8], data: &[u8]) -> Result<Self, &'static str> {
+        // Absolute, so that `Drop` (which unlinks from `/`) removes the
+        // file `open` (which starts at the cwd) made.
+        if !path.starts_with(b"/tmp/") {
+            return Err("a KtestTmpFile's path starts with /tmp/");
+        }
+        let _ = ktest_unlink(path); // an earlier run's, if it crashed
+        // A step of the open after its create (making the open file, or
+        // installing it) can fail, and so can the lookup: either way, no
+        // file is left behind.
+        let (fd, inode) = ktest_open(3, path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)
+            .and_then(|fd| {
+                let file = fd.file().map_err(|e| {
+                    crate::ktest::diag(format_args!("look up the fd of {}: {e}", lumen_vfs::Escaped(path)));
+                    "look up the new fd"
+                })?;
+                Ok((fd, alloc::sync::Arc::clone(&file.inode)))
+            })
+            .inspect_err(|_| {
+                let _ = ktest_unlink(path);
+            })?;
+        // From here on an early return drops `tmp`, which unlinks it.
+        let tmp = Self { path, fd, inode, _in_its_process: core::marker::PhantomData };
+        let wrote = tmp.inode.write_at(0, data);
+        if wrote != Ok(data.len()) {
+            crate::ktest::diag(format_args!("write {} bytes at {}: {wrote:?}", data.len(), lumen_vfs::Escaped(path)));
+            return Err("write");
+        }
+        Ok(tmp)
+    }
+
+    /// The file's path, under `/tmp/`.
+    pub(super) fn path(&self) -> &'static [u8] {
+        self.path
+    }
+
+    /// The descriptor `new` opened, `O_RDWR`.
+    pub(super) fn fd(&self) -> Fd {
+        self.fd
+    }
+
+    /// The file's inode.
+    pub(super) fn inode(&self) -> &alloc::sync::Arc<dyn VfsInode> {
+        &self.inode
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for KtestTmpFile {
+    fn drop(&mut self) {
+        // Gone already where a test unlinks it; any other failure (which
+        // a drop can't fail the test with) gets a `ktest::diag` line.
+        if let Err(e) = ktest_unlink(self.path)
+            && e != VfsError::NoEnt
+        {
+            ktest_failed_at("remove the KtestTmpFile", self.path, e);
+        }
+    }
+}
+
+/// Remove the file `path` (from `/`), handing back the error: a caller
+/// that wants a test error maps it through [`ktest_failed_at`], which
+/// names the path; a cleanup that may find it gone already looks for
+/// `NoEnt`.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_unlink(path: &[u8]) -> Result<(), VfsError> {
+    lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false)
 }
 
 crate::ktest!(
@@ -668,11 +832,9 @@ crate::ktest!(
     fn fd_cloexec_follows_o_cloexec_and_fioclex() {
         use crate::{kassert, kassert_eq};
         process::in_test_process(|_| {
-            let null = ktest_user_path(0, b"/dev/null")?;
-            let mode: Mode = at::reg(0);
             let cloexec = |fd: Fd| process::current_cloexec(fd.raw());
-            let a = ktest_fd(sys_open(null, ktest_flags(OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC), mode))?;
-            let b = ktest_fd(sys_open(null, ktest_flags(OpenFlags::O_RDONLY), mode))?;
+            let a = ktest_open(0, b"/dev/null", OpenFlags::O_RDONLY | OpenFlags::O_CLOEXEC)?;
+            let b = ktest_open(0, b"/dev/null", OpenFlags::O_RDONLY)?;
             kassert_eq!(cloexec(a), Ok(true));
             kassert_eq!(cloexec(b), Ok(false));
             kassert_eq!(sys_ioctl(b, ioctl::FIOCLEX, 0), 0);
@@ -704,8 +866,7 @@ crate::ktest!(
             }
             // Not open, or `O_PATH`: `-EBADF`.
             kassert_eq!(sys_ioctl(at::reg(77), ioctl::FIOCLEX, 0), neg_errno(errno::EBADF));
-            let tmp = ktest_user_path(1, b"/tmp")?;
-            let path_fd = ktest_fd(sys_open(tmp, ktest_flags(OpenFlags::O_PATH), mode))?;
+            let path_fd = ktest_open(1, b"/tmp", OpenFlags::O_PATH)?;
             kassert_eq!(sys_ioctl(path_fd, ioctl::FIOCLEX, 0), neg_errno(errno::EBADF));
             kassert_eq!(cloexec(path_fd), Ok(false));
             // The tty requests: only on a terminal (fd 0, `/dev/tty`).
@@ -713,8 +874,7 @@ crate::ktest!(
             kassert_eq!(sys_ioctl(a, ioctl::TCGETS, out), neg_errno(errno::ENOTTY));
             kassert_eq!(sys_ioctl(a, ioctl::TIOCGWINSZ, out), neg_errno(errno::ENOTTY));
             kassert_eq!(sys_ioctl(at::reg(0), ioctl::TCGETS, out), 0);
-            let tty = ktest_user_path(2, b"/dev/tty")?;
-            let tty_fd = ktest_fd(sys_open(tty, ktest_flags(OpenFlags::O_RDWR), mode))?;
+            let tty_fd = ktest_open(2, b"/dev/tty", OpenFlags::O_RDWR)?;
             kassert_eq!(sys_ioctl(tty_fd, ioctl::TIOCGWINSZ, out), 0);
             kassert!(current_file(tty_fd).is_some_and(|f| f.inode.is_tty()));
             Ok(())
@@ -763,9 +923,12 @@ crate::ktest!(
             let data = base + 1024;
             let iov = base + 2048;
             let out = base + 3072;
+            // Raw, created `0o666`: the fstat below checks that the umask
+            // takes `0o022` off (through `ktest_open`, `0o644`, it would
+            // pass with no umask at all).
             let path = ktest_user_path(0, b"/tmp/fd-ktest-rw")?;
             let rdwr = ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-            let fd = ktest_fd(sys_open(path, rdwr, at::reg(0o666)))?;
+            let fd = ktest_fd_of(sys_open(path, rdwr, at::reg(0o666)), "open", b"/tmp/fd-ktest-rw")?;
             copy_to_user(data, b"hello world").map_err(|_| "copy data")?;
             kassert_eq!(sys_write(fd, at::reg(data), 11), 11);
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_SET), 0);
@@ -796,14 +959,14 @@ crate::ktest!(
             kassert_eq!(sys_fstat(fd, at::reg(edge)), neg_errno(errno::EFAULT));
             // `O_APPEND` writes at the end on every write, wherever the
             // offset was put: twice, an `lseek` to 0 between.
-            let app = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_APPEND), at::reg(0)))?;
+            let app = ktest_open(0, b"/tmp/fd-ktest-rw", OpenFlags::O_WRONLY | OpenFlags::O_APPEND)?;
             kassert_eq!(sys_write(app, at::reg(data), 1), 1);
             kassert_eq!(sys_lseek(app, 0, general::SEEK_CUR), 17);
             kassert_eq!(sys_lseek(app, 0, general::SEEK_SET), 0);
             kassert_eq!(sys_write(app, at::reg(data + 1), 1), 1);
             kassert_eq!(sys_lseek(app, 0, general::SEEK_CUR), 18);
             // Wrong direction: `-EBADF`; a directory: `-EISDIR`.
-            let rd = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
+            let rd = ktest_open(0, b"/tmp/fd-ktest-rw", OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_write(rd, at::reg(data), 1), neg_errno(errno::EBADF));
             kassert_eq!(sys_read(app, at::reg(out), 1), neg_errno(errno::EBADF));
             kassert_eq!(sys_read(rd, at::reg(out), 32), 18);
@@ -822,8 +985,7 @@ crate::ktest!(
             // A faulting first span: `-EFAULT`.
             kassert_eq!(sys_readv(rd, ktest_iovs(iov, &[(bad, 4), (out, 3)])?, 2), neg_errno(errno::EFAULT));
             kassert_eq!(sys_writev(fd, ktest_iovs(iov, &[(bad, 4), (data, 2)])?, 2), neg_errno(errno::EFAULT));
-            let dir = ktest_user_path(1, b"/tmp")?;
-            let dir_fd = ktest_fd(sys_open(dir, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
+            let dir_fd = ktest_open(1, b"/tmp", OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_read(dir_fd, at::reg(out), 1), neg_errno(errno::EISDIR));
             kassert_eq!(sys_read(dir_fd, at::reg(out), 0), neg_errno(errno::EISDIR));
             // A console fd's `fstat`: the console's character device.
@@ -833,12 +995,11 @@ crate::ktest!(
             kassert_eq!(st_rdev, (5 << 8) | 1);
             // `/proc/self/maps` reads through `read` (its `read_at` takes the
             // address space's lock, so not under the offset's).
-            let maps = ktest_user_path(2, b"/proc/self/maps")?;
-            let maps_fd = ktest_fd(sys_open(maps, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
+            let maps_fd = ktest_open(2, b"/proc/self/maps", OpenFlags::O_RDONLY)?;
             let n = sys_read(maps_fd, at::reg(out), 1000);
             kassert!(n > 0 && n <= 1000);
             kassert_eq!(sys_lseek(maps_fd, 0, general::SEEK_CUR), n);
-            kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/fd-ktest-rw", false).is_ok());
+            kassert!(ktest_unlink(b"/tmp/fd-ktest-rw").is_ok());
             Ok(())
         })?
     }
@@ -856,9 +1017,7 @@ crate::ktest!(
             let buf = process::KTEST_USER_VA;
             let last_page = buf + process::KTEST_USER_LEN - 4096;
             let pattern: Vec<u8> = (0..LEN).map(|i| (i * 7 % 251) as u8).collect();
-            let path = ktest_user_path(3, b"/tmp/fd-ktest-big")?;
-            let flags = ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-            let fd = ktest_fd(sys_open(path, flags, at::reg(0o644)))?;
+            let fd = ktest_open(3, b"/tmp/fd-ktest-big", OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC)?;
             copy_to_user(buf, &pattern).map_err(|_| "copy the pattern")?;
             kassert_eq!(sys_write(fd, at::reg(buf), LEN as u64), LEN as u64);
             copy_to_user(buf, &[0u8; LEN]).map_err(|_| "zero the buffer")?;
@@ -877,7 +1036,7 @@ crate::ktest!(
             crate::kassert!(page[..] == pattern[..4096]);
             kassert_eq!(sys_write(fd, at::reg(last_page), 8192), 4096);
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_CUR), 8192);
-            crate::kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/fd-ktest-big", false).is_ok());
+            crate::kassert!(ktest_unlink(b"/tmp/fd-ktest-big").is_ok());
             Ok(())
         })?
     }
@@ -979,21 +1138,21 @@ crate::ktest!(
             process::set_current_cwd(process::Cwd::new(guard, b"/tmp/fd-ktest-cwd").map_err(|_| "cwd")?);
             let rel = ktest_user_path(0, b"made-here")?;
             let creat = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT);
-            let fd = ktest_fd(sys_open(rel, creat, at::reg(0o600)))?;
+            let fd = ktest_fd_of(sys_open(rel, creat, at::reg(0o600)), "open", b"made-here")?;
             kassert!(crate::vfs::resolve_path_from_root("/tmp/fd-ktest-cwd/made-here").is_ok());
             kassert!(crate::vfs::resolve_path_from_root("/made-here").is_err());
             let link = lumen_vfs::readlink_at(tables, None, alloc::format!("/proc/{pid}/fd/{}", fd.raw()).as_bytes());
             kassert_eq!(link, Ok(b"/tmp/fd-ktest-cwd/made-here".to_vec()));
             // Again without `O_CREAT`: the same file, through `openat` too.
             let rd = ktest_flags(OpenFlags::O_RDONLY);
-            let again = ktest_fd(sys_openat(Dirfd::Cwd, rel, rd, at::reg(0)))?;
+            let again = ktest_fd_of(sys_openat(Dirfd::Cwd, rel, rd, at::reg(0)), "openat", b"made-here")?;
             let same = current_file(again)
                 .zip(current_file(fd))
                 .is_some_and(|(a, b)| alloc::sync::Arc::ptr_eq(&a.inode, &b.inode));
             kassert!(same);
             kassert_eq!(sys_close(fd), 0);
             kassert_eq!(sys_close(again), 0);
-            kassert!(unlink_at(tables, None, b"/tmp/fd-ktest-cwd/made-here", false).is_ok());
+            kassert!(ktest_unlink(b"/tmp/fd-ktest-cwd/made-here").is_ok());
             kassert!(unlink_at(tables, None, b"/tmp/fd-ktest-cwd", true).is_ok());
             Ok(())
         })?
@@ -1005,12 +1164,9 @@ crate::ktest!(
         use crate::kassert_eq;
         use crate::user::copy_from_user;
         process::in_test_process(|_| {
-            let mode: Mode = at::reg(0);
-            let null = ktest_user_path(0, b"/dev/null")?;
-            let null_fd = ktest_fd(sys_open(null, ktest_flags(OpenFlags::O_RDONLY), mode))?;
-            let tmp = ktest_user_path(1, b"/tmp")?;
-            let dir_fd = ktest_fd(sys_open(tmp, ktest_flags(OpenFlags::O_RDONLY), mode))?;
-            let path_fd = ktest_fd(sys_open(tmp, ktest_flags(OpenFlags::O_PATH), mode))?;
+            let null_fd = ktest_open(0, b"/dev/null", OpenFlags::O_RDONLY)?;
+            let dir_fd = ktest_open(1, b"/tmp", OpenFlags::O_RDONLY)?;
+            let path_fd = ktest_open(1, b"/tmp", OpenFlags::O_PATH)?;
             let both = (general::POLLIN | general::POLLOUT) as i16;
             // (fd, events) -> the revents wanted: a file and a directory
             // ready both ways (only what was asked); the console's fd 0
@@ -1074,9 +1230,8 @@ crate::ktest!(
         // Through `lseek`, on each kind of descriptor.
         process::in_test_process(|_| {
             let data = process::KTEST_USER_VA + 1024;
-            let path = ktest_user_path(0, b"/tmp/fd-ktest-lseek")?;
-            let flags = ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-            let fd = ktest_fd(sys_open(path, flags, at::reg(0o644)))?;
+            const PATH: &[u8] = b"/tmp/fd-ktest-lseek";
+            let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC)?;
             copy_to_user(data, b"0123456789").map_err(|_| "copy data")?;
             kassert_eq!(sys_write(fd, at::reg(data), 10), 10);
             kassert_eq!(sys_lseek(fd, 3, general::SEEK_SET), 3);
@@ -1100,22 +1255,20 @@ crate::ktest!(
             kassert_eq!(sys_lseek(at::reg(0), 0, general::SEEK_SET), neg_errno(errno::ESPIPE));
             kassert_eq!(sys_lseek(at::reg(1), 0, general::SEEK_CUR), neg_errno(errno::ESPIPE));
             kassert_eq!(sys_lseek(at::reg(99), 0, general::SEEK_SET), neg_errno(errno::EBADF));
-            let opath = ktest_fd(sys_open(path, ktest_flags(OpenFlags::O_PATH), at::reg(0)))?;
+            let opath = ktest_open(0, PATH, OpenFlags::O_PATH)?;
             kassert_eq!(sys_lseek(opath, 0, general::SEEK_SET), neg_errno(errno::EBADF));
             // `/dev/null` is always at 0.
-            let null = ktest_user_path(1, b"/dev/null")?;
-            let null_fd = ktest_fd(sys_open(null, ktest_flags(OpenFlags::O_RDWR), at::reg(0)))?;
+            let null_fd = ktest_open(1, b"/dev/null", OpenFlags::O_RDWR)?;
             kassert_eq!(sys_lseek(null_fd, 100, general::SEEK_SET), 0);
             kassert_eq!(sys_lseek(null_fd, 5, general::SEEK_END), 0);
             // A directory seeks its cursor; it has no end.
-            let tmp = ktest_user_path(2, b"/tmp")?;
-            let dir_fd = ktest_fd(sys_open(tmp, ktest_flags(OpenFlags::O_RDONLY), at::reg(0)))?;
+            let dir_fd = ktest_open(2, b"/tmp", OpenFlags::O_RDONLY)?;
             kassert_eq!(sys_lseek(dir_fd, 2, general::SEEK_SET), 2);
             kassert_eq!(sys_lseek(dir_fd, 1, general::SEEK_CUR), 3);
             kassert_eq!(current_file(dir_fd).map(|f| *f.dir_cursor.lock()), Some(3));
             kassert_eq!(sys_lseek(dir_fd, 0, general::SEEK_END), neg_errno(errno::EINVAL));
             kassert_eq!(sys_lseek(dir_fd, 0, general::SEEK_SET), 0);
-            crate::kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/fd-ktest-lseek", false).is_ok());
+            crate::kassert!(ktest_unlink(PATH).is_ok());
             Ok(())
         })?
     }
@@ -1138,7 +1291,7 @@ crate::ktest!(
             let tmp = ktest_user_path(0, b"/tmp")?;
             let dirfd = call(general::__NR_open, tmp.addr(), high | u64::from(OpenFlags::O_DIRECTORY), 0, 0);
             kassert_eq!(dirfd, 3);
-            // openat(dirfd, "fd-ktest-reg", O_RDWR | O_CREAT, 0o640): relative
+            // openat(dirfd, "fd-ktest-reg", O_RDWR | O_CREAT, 0o666): relative
             // to fd 3, the mode less the umask (0o022).
             let rel = ktest_user_path(1, b"fd-ktest-reg")?;
             let flags = u64::from(OpenFlags::O_RDWR | OpenFlags::O_CREAT);
@@ -1157,7 +1310,7 @@ crate::ktest!(
             kassert_eq!(call(general::__NR_open, abs.addr(), high, high | 0o777, 0), 5);
             kassert_eq!(call(general::__NR_close, high | 5, 0, 0, 0), 0);
             kassert_eq!(call(general::__NR_close, 5, 0, 0, 0), neg_errno(errno::EBADF));
-            kassert!(lumen_vfs::unlink_at(crate::vfs::tables(), None, b"/tmp/fd-ktest-reg", false).is_ok());
+            kassert!(ktest_unlink(b"/tmp/fd-ktest-reg").is_ok());
             Ok(())
         })?
     }
