@@ -147,16 +147,25 @@ tests = [
 ]
 
 [[feature]]
-name = "Byte-string names through the VFS (#268): a name that is not UTF-8 (on ext4 and tmpfs) is created, listed by readdir and getdents64, looked up (the dentry cache telling names apart by their bytes), renamed, hard-linked, unlinked and its directory removed once empty, kept on an ext4 disk through e2fsck and read back cold on the next boot; getcwd under it and /proc/<pid>/fd give its bytes; a symlink target that is not UTF-8 is stored as given; /proc/<pid>/maps names a mapped file by its path's bytes (each newline as \\012); vfstest ls and an exec error's interpreter path show such a name escaped, never lossily (lumen_vfs::Escaped). Not on an ext4 volume with unsigned directory hashes (#308)."
+name = "Byte-string names through the VFS (#268): a name that is not UTF-8 (on ext4 and tmpfs) is created, listed by readdir and getdents64, looked up (the dentry cache telling names apart by their bytes), renamed, hard-linked, unlinked and its directory removed once empty, kept on an ext4 disk through e2fsck and read back cold on the next boot; getcwd under it and /proc/<pid>/fd give its bytes; a symlink target that is not UTF-8 is stored as given; /proc/<pid>/maps names a mapped file by its path's bytes (each newline as \\012); vfstest ls and an exec error's interpreter path show such a name escaped, never lossily (lumen_vfs::Escaped). On an ext4 volume with unsigned directory hashes, only listed and looked up (#308)."
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
     "cargo:lumen-vm",
     "ktest:lumen_kernel::vfs::ext4::ext4_names_that_are_not_utf8_are_listed_looked_up_renamed_and_removed",
+    "ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name",
     "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_lists_names_that_are_not_utf8",
     "ktest:lumen_kernel::linux::syscall::at::at_start_operations_take_names_that_are_not_utf8",
     "ktest:lumen_kernel::linux::syscall::at::at_user_path_rules",
     "ktest:lumen_kernel::mm::user_vm::file_vm_maps_names_a_mapped_file_by_its_path_bytes",
     "ktest:lumen_kernel::linux::exec::missing_interpreter_is_enoent",
     "scenario:test_fs::test_posix_vfs_semantics",
+]
+
+[[feature]]
+name = "ext4 volumes with unsigned directory hashes (#308, s_flags EXT2_FLAGS_UNSIGNED_HASH, which ext4plus ignores) mount read-only with one warning naming the flag; every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (a hash miss walks the directory), a missing name is ENOENT, and unlink and rmdir are EROFS; the same volume hashing signed mounts writable"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
 ]

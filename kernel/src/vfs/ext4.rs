@@ -80,10 +80,22 @@ const DISALLOWED_RW_RO_COMPAT_BITS: u32 = 0x0004 | 0x0010 | 0x0100 | 0x0200 | 0x
 // A disallowed bit dropped from the known set would be reported as unknown.
 const _: () = assert!(DISALLOWED_RW_RO_COMPAT_BITS & !KNOWN_RO_COMPAT_BITS == 0);
 
+/// Where the superblock's `s_flags` is, within it.
+const S_FLAGS_OFFSET: usize = 0x160;
+/// `s_flags`' `EXT2_FLAGS_UNSIGNED_HASH`: the volume's htree directories hash
+/// their names' bytes as unsigned (mke2fs sets it where `char` is unsigned,
+/// e.g. Linux on aarch64). `ext4plus` 0.1.0-rc.2 always hashes them signed
+/// (#308), so such a volume mounts read-only, and a lookup of a name with a
+/// byte of 0x80 or above that misses in one of its htree directories scans
+/// the directory's entries.
+const EXT2_FLAGS_UNSIGNED_HASH: u32 = 0x2;
+
 /// Why a filesystem's superblock forces a read-only mount, if it does.
-fn forced_read_only_reason(needs_recovery: bool, ro_compat_bits: u32) -> Option<&'static str> {
+fn forced_read_only_reason(needs_recovery: bool, ro_compat_bits: u32, s_flags: u32) -> Option<&'static str> {
     if needs_recovery {
         Some("the journal needs recovery")
+    } else if s_flags & EXT2_FLAGS_UNSIGNED_HASH != 0 {
+        Some("its directories hash names unsigned (s_flags EXT2_FLAGS_UNSIGNED_HASH), which ext4plus can't write")
     } else if ro_compat_bits & !KNOWN_RO_COMPAT_BITS != 0 {
         Some("unknown ro_compat feature")
     } else if ro_compat_bits & DISALLOWED_RW_RO_COMPAT_BITS != 0 {
@@ -799,6 +811,9 @@ impl Ext4FsInner {
 struct Ext4Shared {
     dev: DevId,
     read_only: bool,
+    /// `s_flags` has [`EXT2_FLAGS_UNSIGNED_HASH`] (the mount is then
+    /// read-only): a non-ASCII lookup missing in an htree directory scans it.
+    unsigned_hash: bool,
     /// The largest file size the filesystem can map ([`max_file_size`]).
     max_file_size: u64,
     /// The errno of the last per-inode sync's (`fsync`/`fdatasync`) failed
@@ -851,18 +866,25 @@ impl Ext4FileSystem {
             return Err(VfsError::Inval);
         }
         let layout = Ext4DiskLayout::from_superblock_bytes(&raw_sb)?;
+        let s_flags = u32::from_le_bytes(raw_sb[S_FLAGS_OFFSET..S_FLAGS_OFFSET + 4].try_into().unwrap());
 
         let io = BcacheIo(Arc::clone(&bcache));
         // Probe read-only first to inspect superblock feature flags safely.
         let probe_fs = Ext4::load_with_writer(Box::new(io.clone()), None).map_err(map_ext4_err)?;
         let feats = probe_fs.superblock().features();
         let ro_compat_bits = feats.read_only_compatible().bits();
-        let forced =
-            forced_read_only_reason(feats.incompatible().contains(IncompatibleFeatures::RECOVERY), ro_compat_bits);
+        let forced = forced_read_only_reason(
+            feats.incompatible().contains(IncompatibleFeatures::RECOVERY),
+            ro_compat_bits,
+            s_flags,
+        );
         if let Some(why) = forced
             && !hw_read_only
         {
-            warn!(target: "vfs", "ext4 on {dev:?}: mounting read-only: {why} (ro_compat {ro_compat_bits:#x})");
+            warn!(
+                target: "vfs",
+                "ext4 on {dev:?}: mounting read-only: {why} (ro_compat {ro_compat_bits:#x}, s_flags {s_flags:#x})"
+            );
         }
         let read_only = hw_read_only || forced.is_some();
 
@@ -878,6 +900,7 @@ impl Ext4FileSystem {
         let shared = Arc::new(Ext4Shared {
             dev,
             read_only,
+            unsigned_hash: s_flags & EXT2_FLAGS_UNSIGNED_HASH != 0,
             max_file_size: max_file_size(layout.block_size, extents),
             bcache_sync_errno: AtomicU32::new(0),
             state: SleepMutex::new(Ext4FsInner {
@@ -2237,6 +2260,18 @@ fn is_ext4_dir_empty(ext4: &Ext4, dir_inode: &Inode) -> Result<bool, VfsError> {
     Ok(true)
 }
 
+/// The inode of `dir`'s entry `name`, found by walking every entry (not by
+/// its hash): `ENOENT` if none has that name.
+fn scan_dir_for(ext4: &Ext4, dir: &Dir, name: &[u8]) -> Result<Inode, VfsError> {
+    for item in dir.read_dir().map_err(map_ext4_err)? {
+        let entry = item.map_err(map_ext4_err)?;
+        if entry.file_name().as_ref() == name {
+            return Inode::read(ext4, entry.inode).map_err(map_ext4_err);
+        }
+    }
+    Err(VfsError::NoEnt)
+}
+
 fn update_dir_dotdot(ext4: &Ext4, dir_ino: u32, new_parent_ino: u32) -> Result<(), VfsError> {
     let mut dir_inode = Inode::read(ext4, NonZeroU32::new(dir_ino).ok_or(VfsError::Inval)?).map_err(map_ext4_err)?;
     let mut hdr = [0u8; 24];
@@ -2529,8 +2564,18 @@ impl VfsInode for Ext4Inode {
         let dname = entry_name(name)?;
         let mut inner = self.shared.state.lock();
         let dir_inode = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+        let indexed = dir_inode.flags().contains(InodeFlags::DIRECTORY_HTREE);
         let dir = Dir::open_inode(&inner.ext4, dir_inode).map_err(map_ext4_err)?;
-        let child_disk = dir.get_entry(dname).map_err(map_ext4_err)?;
+        let child_disk = match dir.get_entry(dname) {
+            // `ext4plus` hashed the name signed: on a volume hashing unsigned
+            // (#308), an entry whose name has a byte of 0x80 or above (the
+            // only bytes the two hashes read differently) may sit in another
+            // leaf.
+            Err(Ext4Error::NotFound) if indexed && self.shared.unsigned_hash && !name.is_ascii() => {
+                scan_dir_for(&inner.ext4, &dir, name)?
+            }
+            found => found.map_err(map_ext4_err)?,
+        };
         let child = inner.get_or_create_inode(child_disk, &self.shared)?;
         Ok(child as Arc<dyn VfsInode>)
     }
@@ -4557,6 +4602,17 @@ pub(crate) mod ktest_util {
         *fs.shared.clock.lock() = now;
     }
 
+    /// An `e2fsck`-clean 160 KiB ext4 image (made by
+    /// `tools/ext4-unsigned-hash-image.py`, which says what it holds) whose
+    /// superblock has [`super::EXT2_FLAGS_UNSIGNED_HASH`] and whose htree
+    /// directory `/d` files three names with bytes of 0x80 or above in leaves
+    /// their signed hashes don't lead to (#308).
+    pub static UNSIGNED_HASH_IMAGE: &[u8] = include_bytes!("testdata/unsigned-hash.ext4");
+    /// [`UNSIGNED_HASH_IMAGE`]'s names with bytes of 0x80 or above, each with
+    /// its file's contents.
+    pub const UNSIGNED_HASH_NAMES: [(&[u8], &[u8]); 3] =
+        [("é-utf8".as_bytes(), b"x"), (b"\xff\xfe-odd", b"y"), (b"\x80\x81\x82\x83\x84", b"z")];
+
     /// An `e2fsck`-clean ext4 image with 1 KiB blocks and no `extents`
     /// feature, so files are block-mapped and `ext4plus` writes at most one
     /// 1 KiB block per `write_at` call. 32 inodes; the root directory in
@@ -5094,13 +5150,13 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         // `metadata_csum`: the adapter's raw inode and `..` writes don't
         // update checksums. `readonly`: the volume asks not to be written.
-        kassert!(forced_read_only_reason(false, 0x0400).is_some());
-        kassert!(forced_read_only_reason(false, 0x1000).is_some());
+        kassert!(forced_read_only_reason(false, 0x0400, 0).is_some());
+        kassert!(forced_read_only_reason(false, 0x1000, 0).is_some());
         // `orphan_present`: the orphan file has entries ext4plus won't process.
-        kassert!(forced_read_only_reason(false, 0x1_0000).is_some());
+        kassert!(forced_read_only_reason(false, 0x1_0000, 0).is_some());
         // The writable profile's bits (sparse_super, large_file, huge_file,
         // dir_nlink, extra_isize) don't.
-        kassert!(forced_read_only_reason(false, 0x6b).is_none());
+        kassert!(forced_read_only_reason(false, 0x6b, 0).is_none());
         let mut img = crate::vfs::build_minimal_ext4_image_blocks(64);
         let ro_compat = u32::from_le_bytes(img[1024 + 0x64..1024 + 0x68].try_into().unwrap());
         img[1024 + 0x64..1024 + 0x68].copy_from_slice(&(ro_compat | 0x1000).to_le_bytes());
@@ -5503,6 +5559,58 @@ crate::ktest!(
         drop(d);
         m.root.rmdir(b"d").map_err(|_| "rmdir once empty")?;
         kassert_eq!(m.root.lookup(b"d").err(), Some(VfsError::NoEnt));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name() {
+        // #308: `ext4plus` hashes names signed. On a volume whose superblock
+        // says its htree directories hash unsigned, asked for a writable
+        // mount (one warning names the flag), the mount is read-only; every
+        // name `/d` lists, the three with bytes of 0x80 or above too (filed
+        // in leaves their signed hashes don't lead to), is looked up to the
+        // inode listed, with its contents; a name that isn't there is still
+        // ENOENT; unlink and rmdir are EROFS.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(UNSIGNED_HASH_IMAGE.to_vec(), 308)?;
+        kassert!(m.fs.read_only());
+        let d = m.root.lookup(b"d").map_err(|_| "lookup d")?;
+        {
+            let inner = m.fs.shared.state.lock();
+            let disk = Inode::read(&inner.ext4, ext4_inode(&d)?.disk_inode_index()).map_err(|_| "read d")?;
+            kassert!(disk.flags().contains(InodeFlags::DIRECTORY_HTREE));
+        }
+        let mut out = Vec::new();
+        d.readdir(0, &mut out, 256).map_err(|_| "readdir d")?;
+        // `.`, `..`, 80 `entry-number-NN` and the three.
+        kassert_eq!(out.len(), 85);
+        for entry in out.iter().filter(|e| e.name != b"." && e.name != b"..") {
+            let found = d.lookup(&entry.name).map_err(|_| "a listed name isn't found")?;
+            kassert_eq!(found.ino(), entry.ino);
+        }
+        for (name, contents) in UNSIGNED_HASH_NAMES {
+            kassert!(out.iter().any(|e| e.name == name));
+            kassert_eq!(read_all(&d.lookup(name).map_err(|_| "lookup a name with high bytes")?)?, contents.to_vec());
+            kassert_eq!(d.unlink(name).err(), Some(VfsError::RoFs));
+        }
+        kassert_eq!(read_all(&d.lookup(b"entry-number-42").map_err(|_| "lookup entry-number-42")?)?, b"42".to_vec());
+        kassert_eq!(d.lookup(b"\xff\xfe-od").err(), Some(VfsError::NoEnt));
+        kassert_eq!(d.lookup(b"entry-number-80").err(), Some(VfsError::NoEnt));
+        kassert_eq!(m.root.rmdir(b"d").err(), Some(VfsError::RoFs));
+        kassert_eq!(d.create(b"new", 0o644).err(), Some(VfsError::RoFs));
+        drop(d);
+
+        // The same volume saying it hashes signed mounts writable, warning
+        // nothing.
+        let mut img = UNSIGNED_HASH_IMAGE.to_vec();
+        let s_flags = 1024 + S_FLAGS_OFFSET;
+        kassert_eq!(img[s_flags], 0x2);
+        img[s_flags] = 0x1;
+        let m = mount(img, 309)?;
+        kassert!(!m.fs.read_only());
+        m.root.create(b"new", 0o644).map_err(|_| "create on the signed volume")?;
         Ok(())
     }
 );

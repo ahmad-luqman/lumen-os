@@ -113,6 +113,22 @@ COPYFILE_DISABLE=1 E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$MKE2FS" -q -F \
     -E "hash_seed=${FIXED_UUID},root_owner=0:0,lazy_itable_init=0,no_copy_xattrs" \
     -d "$STAGE" "$TMP_IMG" "$ROOTFS_SIZE"
 
+# mke2fs sets s_flags' EXT2_FLAGS_UNSIGNED_HASH where `char` is unsigned (e.g.
+# Linux on aarch64), and Lumen mounts such a volume read-only (#308: ext4plus
+# hashes directory names signed). Make the image hash signed on every host:
+# flip the flag and re-index any hashed directory (a no-op where the flag is
+# already signed, so x86-64 and macOS images are unchanged).
+if LC_ALL=C "$DEBUGFS" -R "stats" "$TMP_IMG" 2>/dev/null | grep -q '^Filesystem flags:.*unsigned_directory_hash'; then
+    LC_ALL=C E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$DEBUGFS" -w -R "ssv flags 1" "$TMP_IMG" >/dev/null 2>&1
+    rc=0
+    E2FSCK_TIME="$FIXED_EPOCH" E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$E2FSCK" -fyD "$TMP_IMG" >/dev/null || rc=$?
+    if (( rc > 1 )); then
+        echo "mkrootfs: e2fsck -fyD failed ($rc) re-indexing with signed directory hashes" >&2
+        exit 1
+    fi
+    echo "mkrootfs: mke2fs made unsigned directory hashes on this host; switched the image to signed (#308)" >&2
+fi
+
 # Normalize uid/gid (0:0), i_ctime/ctime_extra, and i_atime/atime_extra on every
 # allocated inode: `mke2fs -d` copies host st_uid/st_gid and wall-clock st_ctime
 # (updated by touch), and strictatime hosts can advance atime on read; `-E
