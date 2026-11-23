@@ -1191,13 +1191,14 @@ impl Ext4Inode {
 
     /// This file's cached page `index`, filled when missing, and its size
     /// read with it: `ext4`'s side of [`page_cache::mmap_page`] (its
-    /// contract). A hole in a detached file
-    /// (whose pages were all read in when it was detached) gets a zero page,
-    /// counted against the detached quota (not the hard limit). For a linked
-    /// file at the cache's hard limit a missing page is refused (`NoSpc`,
-    /// logged once per crossing), as
-    /// `write_at` refuses one: a mapping pins its pages, so reclaim can't
-    /// keep the cache under the limit as it does for `read_at`'s pages.
+    /// contract). A hole in a detached file (every page holding data was
+    /// read in when it was detached) gets a zero page, counted against the
+    /// detached quota (not the hard limit). For a linked file at the
+    /// cache's hard limit a missing page is refused (`NoSpc`, logged once
+    /// per crossing) by the same check as a write's new page
+    /// (`PageCache::admit_unreclaimable`): a mapping pins its pages, so
+    /// reclaim can't keep the cache under the limit as it does for
+    /// `read_at`'s pages.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     pub(super) fn mmap_page(&self, index: u64) -> Result<(Arc<CachePage>, u64), VfsError> {
         if self.inode_type != InodeType::File {
@@ -1217,14 +1218,10 @@ impl Ext4Inode {
         let page = match pages.get(index) {
             Some(page) => Arc::clone(page),
             None => {
-                let page = if detached {
-                    CachePage::new_shared()?
-                } else if page_cache::ext4_at_hard_limit() {
-                    page_cache::note_hard_limit_refusal();
-                    return Err(VfsError::NoSpc);
-                } else {
-                    self.load_page(index, file_size)?
-                };
+                // The mapping pins the page, so reclaim can't drop it: held
+                // to the hard cap as a dirty page is, before the disk read.
+                pages.admit_unreclaimable()?;
+                let page = if detached { CachePage::new_shared()? } else { self.load_page(index, file_size)? };
                 pages.insert_new(index, Arc::clone(&page))?;
                 page
             }
@@ -4187,9 +4184,9 @@ impl VfsInode for Ext4Inode {
         if !detached && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        // A missing page of a linked file is read from disk; a detached
-        // file's pages were all read in when it was detached, so a missing
-        // one is a hole.
+        // A missing page of a linked file is read from disk; every page of
+        // a detached file holding data was read in when it was detached, so
+        // a missing one is a hole.
         let file_size = meta.size;
         self.pages.lock().read_into(offset, buf, file_size, |index| {
             if detached { Ok(None) } else { self.load_page(index, file_size).map(Some) }

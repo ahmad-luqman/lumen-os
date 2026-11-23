@@ -58,8 +58,9 @@ pub fn ext4_soft_limit() -> usize {
 }
 
 /// Whether the live `ext4` pages have reached the hard limit
-/// ([`EXT4_HARD_LIMIT_PAGES`]), so no new page may be added.
-pub fn ext4_at_hard_limit() -> bool {
+/// ([`EXT4_HARD_LIMIT_PAGES`]), so no new page reclaim can't drop (a dirty
+/// one, or a mapping's) may be added: [`PageCache::admit_unreclaimable`].
+fn ext4_at_hard_limit() -> bool {
     EXT4_CACHED_PAGES.load(Ordering::Relaxed) >= EXT4_HARD_LIMIT.load(Ordering::Relaxed)
 }
 
@@ -68,14 +69,13 @@ pub fn ext4_at_hard_limit() -> bool {
 static HARD_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Log (once per crossing of the hard limit) that an `ext4` page was
-/// refused, to a write ([`PageCache::insert_new`]'s admission of a dirty
-/// page) or a mapping (`mmap_page`). The cache
-/// is full of pages reclaim can't drop: dirty pages whose writeback keeps
-/// failing (its own warning names the inode), or pages pinned by mappings,
-/// which only unmapping frees. Writes and new mapped pages of any linked
-/// file (detached files use their own quota) now
-/// fail with `ENOSPC`.
-pub fn note_hard_limit_refusal() {
+/// refused, to a write or a mapping ([`PageCache::admit_unreclaimable`]).
+/// The cache is full of pages reclaim can't drop: dirty pages whose
+/// writeback keeps failing (its own warning names the inode), or pages
+/// pinned by mappings, which only unmapping frees. Writes and new mapped
+/// pages of any linked file (detached files use their own quota) now fail
+/// with `ENOSPC`.
+fn note_hard_limit_refusal() {
     if !HARD_LIMIT_WARNED.swap(true, Ordering::AcqRel) {
         log::warn!(
             target: "vfs",
@@ -545,8 +545,8 @@ impl Drop for WritableMap {
 ///   with `NoSpc`. `NoMem` when no frame is free, `Io` when the disk read
 ///   fails (logged, naming the page), and `NoSpc` for a missing page of a
 ///   linked `ext4` file while the `ext4` cache is at its hard limit (a
-///   mapping pins its pages, so reclaim can't make room), as `write_at`
-///   refuses one. A detached `ext4` file's pages count against the
+///   mapping pins its pages, so reclaim can't make room), by the same check
+///   as a write's new page ([`PageCache::admit_unreclaimable`]). A detached `ext4` file's pages count against the
 ///   detached quota instead of the hard limit.
 /// - **EOF:** `Range` when the page starts at or past the file's size
 ///   (`index * 4096 >= file_size`, or the product overflows): there is no
@@ -793,14 +793,19 @@ impl PageCache {
     /// Insert a newly allocated page at `page_index`, reserving `tmpfs`/
     /// `detached` quota if applicable. A page already cached at that index is
     /// left as it is (it may hold dirty data) and `Exist` returned, before
-    /// any quota or count changes. A dirty page of a linked `ext4` file is
-    /// refused at the hard limit (`NoSpc`, [`Self::admit`]), whichever path
-    /// made it; a clean one (a read's) is not, since reclaim can drop it.
+    /// any quota or count changes. A page of a linked `ext4` file that is
+    /// dirty when inserted is refused at the hard limit (`NoSpc`,
+    /// [`Self::admit_unreclaimable`]), whichever path made it; a clean one
+    /// is not, since reclaim can drop it once nothing else holds it. (A
+    /// page a mapping will pin is clean here: `ext4`'s `mmap_page` asks
+    /// [`Self::admit_unreclaimable`] itself, before reading it in.)
     pub fn insert_new(&mut self, page_index: u64, page: Arc<CachePage>) -> Result<(), VfsError> {
         if self.pages.contains_key(&page_index) {
             return Err(VfsError::Exist);
         }
-        self.admit(page.is_dirty())?;
+        if page.is_dirty() {
+            self.admit_unreclaimable()?;
+        }
         match &self.owner {
             CacheOwner::Ext4 => {
                 EXT4_CACHED_PAGES.fetch_add(1, Ordering::Relaxed);
@@ -834,15 +839,17 @@ impl PageCache {
         matches!(self.owner, CacheOwner::Ext4)
     }
 
-    /// Whether a new page, dirty or not, may join this cache: `NoSpc` (the
-    /// hard-limit warning, once per crossing) for a dirty page of a linked
-    /// `ext4` file while the `ext4` cache is at its hard limit. Reclaim, run
-    /// before the caller took its locks, couldn't get below it (the dirty
-    /// data can't be written back, or mappings pin the pages), or the
-    /// caller's own write added more pages than the gap. Quotas (`tmpfs`,
-    /// detached) are reserved by `insert_new` itself.
-    fn admit(&self, dirty: bool) -> Result<(), VfsError> {
-        if dirty && self.writes_back() && ext4_at_hard_limit() {
+    /// Whether a new page reclaim can't drop (a dirty one, or one a mapping
+    /// pins) may join this cache: the one check of the `ext4` hard cap.
+    /// `NoSpc` (the hard-limit warning, once per crossing) for a linked
+    /// `ext4` file's cache ([`Self::writes_back`]) while the `ext4` cache is
+    /// at its hard limit. Reclaim, run before the caller took its locks,
+    /// couldn't get below it (the dirty data can't be written back, or
+    /// mappings pin the pages), or the caller's own write added more pages
+    /// than the gap. Quotas (`tmpfs`, detached) are reserved by
+    /// `insert_new` itself. The caller holds this lock (Lock 5).
+    pub(super) fn admit_unreclaimable(&self) -> Result<(), VfsError> {
+        if self.writes_back() && ext4_at_hard_limit() {
             note_hard_limit_refusal();
             return Err(VfsError::NoSpc);
         }
@@ -889,7 +896,7 @@ impl PageCache {
     /// or one holding the file's bytes a partial write keeps), which is then
     /// inserted ([`Self::insert_new`]). A linked `ext4` file's pages
     /// ([`Self::writes_back`]) are marked dirty, and a new one is refused at
-    /// the hard limit ([`Self::admit`]) before `fill` runs. That is an early
+    /// the hard limit ([`Self::admit_unreclaimable`]) before `fill` runs. That is an early
     /// answer: `fill` may sleep (a disk read) or be preempted, and another
     /// thread may add pages meanwhile, so the insert asks again and refuses
     /// the page `fill` made. Returns how many bytes were written: an error
@@ -933,7 +940,7 @@ impl PageCache {
             }
             return Ok(());
         }
-        self.admit(dirty)?;
+        self.admit_unreclaimable()?;
         let fresh = fill(span)?;
         fresh.write_bytes(span.in_page, src);
         if dirty {
