@@ -5860,7 +5860,15 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   work identically to `ext4`, directories, symlinks, hard links, native
   unlink-while-open via `Arc`, `renameat2`, `chmod`/`chown`/`utimensat`),
   bounded by a configurable memory quota (default 32 MiB in M7, returning
-  `-ENOSPC` instead of exhausting kernel frames).
+  `-ENOSPC` instead of exhausting kernel frames or heap). The quota, counted
+  in bytes (`QuotaCounter`), pays for the data pages and, since #267, for
+  each inode but the root (`tmpfs::INODE_COST`: the inode as allocated),
+  each directory entry (`tmpfs::entry_cost`: the name, kept twice, and its
+  map slots) and each symlink's target bytes. A name is charged while it
+  exists, an inode until its last reference goes (an unlinked file still
+  open keeps its charge, as its pages), and a rename to a new name is
+  charged net of the old name it frees, so on a full mount a rename to a
+  name no longer than the old one still succeeds.
 - **`/dev` (`devfs`, `dev = 0:3`):** read-only directory (namespace mutations
   such as `create`/`unlink`/`mkdir`/`rename`, and a `chmod`/`chown`/`utimensat`
   of `/dev` itself, return `-EROFS`, while the device nodes, special files, are

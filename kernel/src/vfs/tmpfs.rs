@@ -1,6 +1,11 @@
 //! In-memory POSIX filesystem (`tmpfs`) backed by unified `PageCache` frames
-//! and bounded by an atomic per-mount memory quota (default 32 MiB).
+//! and bounded by an atomic per-mount memory quota (default 32 MiB). The
+//! quota pays for the data pages, and also (#267) for each inode
+//! ([`INODE_COST`]), each directory entry ([`entry_cost`]: its name and
+//! slots) and each symlink's target bytes, so neither files nor names can
+//! grow the kernel heap past it. The root inode, one per mount, is free.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -30,11 +35,12 @@ pub struct Tmpfs {
 }
 
 impl Tmpfs {
+    /// A mount whose pages, inodes, names and symlink targets share
+    /// `quota_bytes`.
     pub fn new(dev: DevId, quota_bytes: usize) -> Arc<Self> {
-        let quota_pages = quota_bytes / PAGE_SIZE;
         let shared = Arc::new(TmpfsShared {
             dev,
-            quota: Arc::new(QuotaCounter::new("tmpfs", quota_pages)),
+            quota: Arc::new(QuotaCounter::with_bytes("tmpfs", quota_bytes)),
             next_ino: AtomicU64::new(2),
         });
         let now = time::realtime_timespec();
@@ -44,6 +50,7 @@ impl Tmpfs {
             self_weak: Weak::clone(weak_self),
             ino: AtomicU64::new(1),
             inode_type: InodeType::Dir,
+            charged: 0,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
             meta: SleepMutex::new(TmpfsMeta {
@@ -55,9 +62,10 @@ impl Tmpfs {
                 atime: now,
                 mtime: now,
                 ctime: now,
-                symlink_target: Vec::new(),
-                children: Children::new(),
-                parent: Some(Weak::clone(weak_self)),
+                node: Node::Dir(Dir {
+                    children: Children::new(Arc::clone(&shared.quota)),
+                    parent: Weak::clone(weak_self),
+                }),
                 locks: AdvisoryLocks::new(),
             }),
             pages: SleepMutex::new(PageCache::new_tmpfs(Arc::clone(&shared.quota))),
@@ -65,9 +73,63 @@ impl Tmpfs {
         Arc::new(Self { shared, rename_lock: SleepMutex::new(()), root })
     }
 
-    #[allow(dead_code)]
-    pub fn used_pages(&self) -> usize {
-        self.shared.quota.used_pages()
+    /// The bytes of the quota in use: pages, inodes, names and targets.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+    pub fn used_bytes(&self) -> usize {
+        self.shared.quota.used_bytes()
+    }
+}
+
+/// What each inode but the root costs its mount's quota, besides its
+/// pages and a symlink's target: the inode as allocated (the struct and an
+/// `Arc`'s two counts), rounded up to 64 bytes.
+pub(crate) const INODE_COST: usize = (size_of::<TmpfsInode>() + 2 * size_of::<usize>()).next_multiple_of(64);
+
+/// What a directory entry named with `name_len` bytes costs its mount's
+/// quota: the name, which [`Children`] keeps twice, and a slot in each of
+/// its two maps.
+pub(crate) const fn entry_cost(name_len: usize) -> usize {
+    2 * name_len + size_of::<(u64, (Vec<u8>, Arc<TmpfsInode>))>() + size_of::<(Vec<u8>, u64)>()
+}
+
+/// Room for a ktest's few small files' inodes and names on top of a whole
+/// number of pages of data: under a page, so such a mount still runs out
+/// of data pages exactly where a quota of only those pages would.
+#[cfg(feature = "ktest")]
+pub(crate) const KTEST_METADATA_ROOM: usize = PAGE_SIZE - 1;
+
+/// Bytes reserved from a mount's quota: released when dropped, unless
+/// [`Charge::keep`] hands them on to what they pay for (an inode's
+/// `charged`, a [`Children`] entry).
+#[must_use]
+struct Charge<'q> {
+    quota: &'q QuotaCounter,
+    bytes: usize,
+}
+
+impl<'q> Charge<'q> {
+    /// Reserve `bytes`, or `NoSpc` past the quota.
+    fn reserve(quota: &'q QuotaCounter, bytes: usize) -> Result<Self, VfsError> {
+        Self::reserve_freeing(quota, bytes, 0)
+    }
+
+    /// Reserve `bytes` for a change that then releases `freeing` (see
+    /// [`QuotaCounter::try_reserve_bytes_freeing`]), or `NoSpc`.
+    fn reserve_freeing(quota: &'q QuotaCounter, bytes: usize, freeing: usize) -> Result<Self, VfsError> {
+        if quota.try_reserve_bytes_freeing(bytes, freeing) { Ok(Self { quota, bytes }) } else { Err(VfsError::NoSpc) }
+    }
+
+    /// The bytes, now owned by whoever releases them.
+    fn keep(self) -> usize {
+        let bytes = self.bytes;
+        core::mem::forget(self);
+        bytes
+    }
+}
+
+impl Drop for Charge<'_> {
+    fn drop(&mut self) {
+        self.quota.release_bytes(self.bytes);
     }
 }
 
@@ -107,10 +169,56 @@ struct TmpfsMeta {
     atime: Timespec,
     mtime: Timespec,
     ctime: Timespec,
-    symlink_target: Vec<u8>,
-    children: Children,
-    parent: Option<Weak<TmpfsInode>>,
+    node: Node,
     locks: AdvisoryLocks,
+}
+
+impl TmpfsMeta {
+    /// A directory's own part, or `NotDir`.
+    fn dir(&self) -> Result<&Dir, VfsError> {
+        match &self.node {
+            Node::Dir(dir) => Ok(dir),
+            _ => Err(VfsError::NotDir),
+        }
+    }
+
+    fn dir_mut(&mut self) -> Result<&mut Dir, VfsError> {
+        match &mut self.node {
+            Node::Dir(dir) => Ok(dir),
+            _ => Err(VfsError::NotDir),
+        }
+    }
+
+    /// A directory's parent (the root's is itself), if it is still there.
+    fn parent(&self) -> Option<Arc<TmpfsInode>> {
+        self.dir().ok().and_then(|dir| dir.parent.upgrade())
+    }
+}
+
+/// What only one kind of inode has. An inode's kind is fixed when it is
+/// made, its `inode_type` taken from it ([`Node::inode_type`]).
+enum Node {
+    /// Its data is in the inode's `pages`.
+    File,
+    Dir(Dir),
+    /// The target, as given (charged to the quota with the inode).
+    Symlink(Box<[u8]>),
+}
+
+impl Node {
+    fn inode_type(&self) -> InodeType {
+        match self {
+            Node::File => InodeType::File,
+            Node::Dir(_) => InodeType::Dir,
+            Node::Symlink(_) => InodeType::Symlink,
+        }
+    }
+}
+
+struct Dir {
+    children: Children,
+    /// The directory holding this one; the root's own.
+    parent: Weak<TmpfsInode>,
 }
 
 /// `readdir`'s cursor for the first entry after `.` (0) and `..` (1).
@@ -122,7 +230,11 @@ const FIRST_CHILD_CURSOR: u64 = 2;
 /// `RENAME_EXCHANGE`, keeps the name's number), and a new name takes the
 /// next number, never one used before; so a cursor between two calls still
 /// starts where it did, whatever was added or removed meanwhile.
+///
+/// Each entry is charged to the mount's quota ([`entry_cost`]) from
+/// [`Children::add`] until it is removed, or the directory dropped.
 struct Children {
+    quota: Arc<QuotaCounter>,
     /// The entries by number: what `readdir` walks.
     by_seq: BTreeMap<u64, (Vec<u8>, Arc<TmpfsInode>)>,
     /// Each name's number, for lookups; always the same names as `by_seq`.
@@ -132,8 +244,8 @@ struct Children {
 }
 
 impl Children {
-    fn new() -> Self {
-        Self { by_seq: BTreeMap::new(), by_name: BTreeMap::new(), next_seq: FIRST_CHILD_CURSOR }
+    fn new(quota: Arc<QuotaCounter>) -> Self {
+        Self { quota, by_seq: BTreeMap::new(), by_name: BTreeMap::new(), next_seq: FIRST_CHILD_CURSOR }
     }
 
     fn get(&self, name: &[u8]) -> Option<&Arc<TmpfsInode>> {
@@ -160,24 +272,37 @@ impl Children {
         self.by_seq.values().map(|(_, child)| child)
     }
 
-    /// Point `name` at `child`: an existing name keeps its number, a new one
-    /// takes the next.
-    fn insert(&mut self, name: Vec<u8>, child: Arc<TmpfsInode>) {
-        if let Some(&seq) = self.by_name.get(&name) {
-            if let Some(slot) = self.by_seq.get_mut(&seq) {
-                slot.1 = child;
-                return;
-            }
-            debug_assert!(false, "tmpfs: {:?}'s number {seq} has no entry", Escaped(&name));
-        }
+    /// Add a new name for `child`, under the next number, paid for by
+    /// `charge` (its [`entry_cost`], reserved from this mount's quota).
+    fn add(&mut self, name: &[u8], child: Arc<TmpfsInode>, charge: Charge<'_>) {
+        debug_assert!(!self.by_name.contains_key(name), "tmpfs: {:?} added twice", Escaped(name));
+        debug_assert!(
+            core::ptr::eq(charge.quota, &*self.quota) && charge.bytes == entry_cost(name.len()),
+            "tmpfs: {:?} charged {} bytes, or to another quota",
+            Escaped(name),
+            charge.bytes
+        );
+        charge.keep();
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.by_name.insert(name.clone(), seq);
-        self.by_seq.insert(seq, (name, child));
+        self.by_name.insert(name.to_vec(), seq);
+        self.by_seq.insert(seq, (name.to_vec(), child));
     }
 
+    /// Point the existing `name` at `child`, keeping its number (and its
+    /// charge).
+    fn replace(&mut self, name: &[u8], child: Arc<TmpfsInode>) {
+        let slot = self.by_name.get(name).and_then(|seq| self.by_seq.get_mut(seq));
+        debug_assert!(slot.is_some(), "tmpfs: replacing {:?}, which has no entry", Escaped(name));
+        if let Some(slot) = slot {
+            slot.1 = child;
+        }
+    }
+
+    /// Remove `name`, giving its charge back to the quota.
     fn remove(&mut self, name: &[u8]) -> Option<Arc<TmpfsInode>> {
         let seq = self.by_name.remove(name)?;
+        self.quota.release_bytes(entry_cost(name.len()));
         let entry = self.by_seq.remove(&seq);
         debug_assert!(entry.is_some(), "tmpfs: {:?}'s number {seq} had no entry", Escaped(name));
         entry.map(|(_, child)| child)
@@ -190,6 +315,16 @@ impl Children {
     }
 }
 
+impl Drop for Children {
+    /// A directory dropped with entries (only ever with its whole mount:
+    /// `rmdir` and a rename over a directory take only empty ones) gives
+    /// their charges back. Takes no lock.
+    fn drop(&mut self) {
+        let bytes = self.by_name.keys().map(|name| entry_cost(name.len())).sum();
+        self.quota.release_bytes(bytes);
+    }
+}
+
 /// Inode belonging to a [`Tmpfs`] mount.
 ///
 /// `Drop` never acquires any sleeping lock.
@@ -198,7 +333,13 @@ pub struct TmpfsInode {
     shared: Arc<TmpfsShared>,
     self_weak: Weak<TmpfsInode>,
     ino: AtomicU64,
+    /// The kind of [`TmpfsMeta::node`], readable without its lock.
     inode_type: InodeType,
+    /// What this inode holds of the quota besides its pages and its
+    /// names: [`INODE_COST`] and a symlink's target (0 for the root).
+    /// Released when the inode is dropped, so an unlinked inode still
+    /// open keeps it until its last close.
+    charged: usize,
     open_count: AtomicU32,
     detached: AtomicBool,
     meta: SleepMutex<TmpfsMeta>,
@@ -258,22 +399,23 @@ impl TmpfsInode {
         Ok((offset, done))
     }
 
-    fn new_child(
-        shared: &Arc<TmpfsShared>,
-        inode_type: InodeType,
-        mode: u16,
-        nlink: u32,
-        symlink_target: Vec<u8>,
-        parent: Option<Weak<TmpfsInode>>,
-    ) -> Arc<Self> {
+    /// A new inode of `node`'s kind, its [`INODE_COST`] and a symlink's
+    /// target charged to the quota (`NoSpc` past it) until it is dropped.
+    fn new_child(shared: &Arc<TmpfsShared>, node: Node, mode: u16, nlink: u32) -> Result<Arc<Self>, VfsError> {
+        let size = match &node {
+            Node::Symlink(target) => target.len(),
+            Node::File | Node::Dir(_) => 0,
+        };
+        let charged = Charge::reserve(&shared.quota, INODE_COST + size)?.keep();
         let now = time::realtime_timespec();
         let ino = shared.next_ino.fetch_add(1, Ordering::Relaxed);
-        Arc::new_cyclic(|weak_self| Self {
+        Ok(Arc::new_cyclic(|weak_self| Self {
             lock_id: next_lock_id(),
             shared: Arc::clone(shared),
             self_weak: Weak::clone(weak_self),
             ino: AtomicU64::new(ino),
-            inode_type,
+            inode_type: node.inode_type(),
+            charged,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
             meta: SleepMutex::new(TmpfsMeta {
@@ -281,17 +423,15 @@ impl TmpfsInode {
                 nlink,
                 uid: 0,
                 gid: 0,
-                size: symlink_target.len() as u64,
+                size: size as u64,
                 atime: now,
                 mtime: now,
                 ctime: now,
-                symlink_target,
-                children: Children::new(),
-                parent,
+                node,
                 locks: AdvisoryLocks::new(),
             }),
             pages: SleepMutex::new(PageCache::new_tmpfs(Arc::clone(&shared.quota))),
-        })
+        }))
     }
 
     fn detach_if_open(target: &Arc<TmpfsInode>, meta: &mut TmpfsMeta) {
@@ -342,6 +482,14 @@ impl TmpfsInode {
     }
 }
 
+impl Drop for TmpfsInode {
+    /// Gives `charged` back (its pages go with `pages`, its directory's
+    /// entries with its `Children`). Takes no lock.
+    fn drop(&mut self) {
+        self.shared.quota.release_bytes(self.charged);
+    }
+}
+
 /// The cached page `index`, or a new zero page inserted there (`NoMem`, or
 /// `NoSpc` past the quota): the one way `write_at` and `mmap_page` get a
 /// page. (`read_at` reads a hole as zeros without one.) The caller holds
@@ -386,10 +534,7 @@ fn find_tmpfs_dir_arc(known_dir: &TmpfsInode, target_lock_id: u64, target_ino: I
         if cur.lock_id == target_lock_id {
             return Some(cur);
         }
-        let next = {
-            let m = cur.meta.lock();
-            m.parent.as_ref().and_then(Weak::upgrade)
-        };
+        let next = cur.meta.lock().parent();
         match next {
             Some(p) if p.lock_id != cur.lock_id => cur = p,
             _ => break,
@@ -402,7 +547,8 @@ fn find_tmpfs_dir_arc(known_dir: &TmpfsInode, target_lock_id: u64, target_ino: I
             return Some(node);
         }
         let m = node.meta.lock();
-        for child in m.children.values() {
+        let Ok(dir) = m.dir() else { continue };
+        for child in dir.children.values() {
             if child.inode_type == InodeType::Dir {
                 if child.lock_id == target_lock_id || child.ino() == target_ino {
                     return Some(Arc::clone(child));
@@ -486,10 +632,10 @@ impl VfsInode for TmpfsInode {
             return self.self_arc().map(|a| a as Arc<dyn VfsInode>).ok_or(VfsError::NoEnt);
         }
         if name == b".." {
-            let p = meta.parent.as_ref().and_then(Weak::upgrade).ok_or(VfsError::NoEnt)?;
+            let p = meta.parent().ok_or(VfsError::NoEnt)?;
             return Ok(p as Arc<dyn VfsInode>);
         }
-        meta.children.get(name).map(|c| Arc::clone(c) as Arc<dyn VfsInode>).ok_or(VfsError::NoEnt)
+        meta.dir()?.children.get(name).map(|c| Arc::clone(c) as Arc<dyn VfsInode>).ok_or(VfsError::NoEnt)
     }
 
     fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
@@ -504,11 +650,12 @@ impl VfsInode for TmpfsInode {
         if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if meta.children.contains_key(name) {
+        if meta.dir()?.children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let child = Self::new_child(&self.shared, InodeType::File, mode, 1, Vec::new(), None);
-        meta.children.insert(name.to_vec(), Arc::clone(&child));
+        let entry = Charge::reserve(&self.shared.quota, entry_cost(name.len()))?;
+        let child = Self::new_child(&self.shared, Node::File, mode, 1)?;
+        meta.dir_mut()?.children.add(name, Arc::clone(&child), entry);
         let now = time::realtime_timespec();
         meta.mtime = now;
         meta.ctime = now;
@@ -528,11 +675,13 @@ impl VfsInode for TmpfsInode {
         if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if meta.children.contains_key(name) {
+        if meta.dir()?.children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let child = Self::new_child(&self.shared, InodeType::Dir, mode, 2, Vec::new(), Some(Arc::downgrade(&self_arc)));
-        meta.children.insert(name.to_vec(), Arc::clone(&child));
+        let entry = Charge::reserve(&self.shared.quota, entry_cost(name.len()))?;
+        let dir = Dir { children: Children::new(Arc::clone(&self.shared.quota)), parent: Arc::downgrade(&self_arc) };
+        let child = Self::new_child(&self.shared, Node::Dir(dir), mode, 2)?;
+        meta.dir_mut()?.children.add(name, Arc::clone(&child), entry);
         meta.nlink = meta.nlink.saturating_add(1);
         let now = time::realtime_timespec();
         meta.mtime = now;
@@ -554,7 +703,7 @@ impl VfsInode for TmpfsInode {
             if self_arc.is_detached() || meta.nlink == 0 {
                 return Err(VfsError::NoEnt);
             }
-            let c = meta.children.get(name).ok_or(VfsError::NoEnt)?;
+            let c = meta.dir()?.children.get(name).ok_or(VfsError::NoEnt)?;
             if c.inode_type == InodeType::Dir {
                 return Err(VfsError::IsDir);
             }
@@ -565,10 +714,9 @@ impl VfsInode for TmpfsInode {
         let now = time::realtime_timespec();
         {
             let p_meta = tmpfs_guard_mut(&mut guards, &self_arc);
-            if self_arc.is_detached() || p_meta.nlink == 0 || !p_meta.children.contains_key(name) {
+            if self_arc.is_detached() || p_meta.nlink == 0 || p_meta.dir_mut()?.children.remove(name).is_none() {
                 return Err(VfsError::NoEnt);
             }
-            p_meta.children.remove(name);
             p_meta.mtime = now;
             p_meta.ctime = now;
         }
@@ -600,7 +748,7 @@ impl VfsInode for TmpfsInode {
             if self_arc.is_detached() || meta.nlink == 0 {
                 return Err(VfsError::NoEnt);
             }
-            let c = meta.children.get(name).ok_or(VfsError::NoEnt)?;
+            let c = meta.dir()?.children.get(name).ok_or(VfsError::NoEnt)?;
             if c.inode_type != InodeType::Dir {
                 return Err(VfsError::NotDir);
             }
@@ -608,16 +756,15 @@ impl VfsInode for TmpfsInode {
         };
 
         let mut guards = lock_tmpfs_ordered(&[&self_arc, &child_arc]);
-        if !tmpfs_guard_mut(&mut guards, &child_arc).children.is_empty() {
+        if !tmpfs_guard_mut(&mut guards, &child_arc).dir()?.children.is_empty() {
             return Err(VfsError::NotEmpty);
         }
         let now = time::realtime_timespec();
         {
             let p_meta = tmpfs_guard_mut(&mut guards, &self_arc);
-            if self_arc.is_detached() || p_meta.nlink == 0 || !p_meta.children.contains_key(name) {
+            if self_arc.is_detached() || p_meta.nlink == 0 || p_meta.dir_mut()?.children.remove(name).is_none() {
                 return Err(VfsError::NoEnt);
             }
-            p_meta.children.remove(name);
             p_meta.nlink = p_meta.nlink.saturating_sub(1);
             p_meta.mtime = now;
             p_meta.ctime = now;
@@ -659,10 +806,12 @@ impl VfsInode for TmpfsInode {
         let now = time::realtime_timespec();
         {
             let p_meta = tmpfs_guard_mut(&mut guards, &self_arc);
-            if p_meta.children.contains_key(name) {
+            let children = &mut p_meta.dir_mut()?.children;
+            if children.contains_key(name) {
                 return Err(VfsError::Exist);
             }
-            p_meta.children.insert(name.to_vec(), Arc::clone(&target_arc));
+            let entry = Charge::reserve(&self.shared.quota, entry_cost(name.len()))?;
+            children.add(name, Arc::clone(&target_arc), entry);
             p_meta.mtime = now;
             p_meta.ctime = now;
         }
@@ -690,11 +839,12 @@ impl VfsInode for TmpfsInode {
         if self.is_detached() || meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
-        if meta.children.contains_key(name) {
+        if meta.dir()?.children.contains_key(name) {
             return Err(VfsError::Exist);
         }
-        let child = Self::new_child(&self.shared, InodeType::Symlink, 0o777, 1, target.to_vec(), None);
-        meta.children.insert(name.to_vec(), Arc::clone(&child));
+        let entry = Charge::reserve(&self.shared.quota, entry_cost(name.len()))?;
+        let child = Self::new_child(&self.shared, Node::Symlink(Box::from(target)), 0o777, 1)?;
+        meta.dir_mut()?.children.add(name, Arc::clone(&child), entry);
         let now = time::realtime_timespec();
         meta.mtime = now;
         meta.ctime = now;
@@ -702,11 +852,10 @@ impl VfsInode for TmpfsInode {
     }
 
     fn readlink(&self) -> Result<Vec<u8>, VfsError> {
-        if self.inode_type != InodeType::Symlink {
-            return Err(VfsError::Inval);
+        match &self.meta.lock().node {
+            Node::Symlink(target) => Ok(target.to_vec()),
+            Node::File | Node::Dir(_) => Err(VfsError::Inval),
         }
-        let meta = self.meta.lock();
-        Ok(meta.symlink_target.clone())
     }
 
     fn rename(
@@ -745,11 +894,12 @@ impl VfsInode for TmpfsInode {
                 return Err(VfsError::NoEnt);
             }
             let old_c = tmpfs_guard_mut(&mut dir_guards, &old_dir_arc)
+                .dir()?
                 .children
                 .get(old_name)
                 .cloned()
                 .ok_or(VfsError::NoEnt)?;
-            let new_c = tmpfs_guard_mut(&mut dir_guards, &new_dir_arc).children.get(new_name).cloned();
+            let new_c = tmpfs_guard_mut(&mut dir_guards, &new_dir_arc).dir()?.children.get(new_name).cloned();
             (old_c, new_c)
         };
 
@@ -783,28 +933,29 @@ impl VfsInode for TmpfsInode {
         if flags.has_exchange() {
             let new_child_arc = new_child_opt.as_ref().expect("checked Some for EXCHANGE");
             let new_is_dir = new_child_arc.inode_type == InodeType::Dir;
+            // Both names stay, each keeping its charge.
             {
                 let old_p = tmpfs_guard_mut(&mut guards, &old_dir_arc);
-                old_p.children.insert(old_name.to_vec(), Arc::clone(new_child_arc));
+                old_p.dir_mut()?.children.replace(old_name, Arc::clone(new_child_arc));
                 old_p.mtime = now;
                 old_p.ctime = now;
             }
             {
                 let new_p = tmpfs_guard_mut(&mut guards, &new_dir_arc);
-                new_p.children.insert(new_name.to_vec(), Arc::clone(&old_child_arc));
+                new_p.dir_mut()?.children.replace(new_name, Arc::clone(&old_child_arc));
                 new_p.mtime = now;
                 new_p.ctime = now;
             }
             if !same_parent {
                 if old_is_dir {
-                    tmpfs_guard_mut(&mut guards, &old_child_arc).parent = Some(Arc::downgrade(&new_dir_arc));
+                    tmpfs_guard_mut(&mut guards, &old_child_arc).dir_mut()?.parent = Arc::downgrade(&new_dir_arc);
                     tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink =
                         tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_sub(1);
                     tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink =
                         tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_add(1);
                 }
                 if new_is_dir {
-                    tmpfs_guard_mut(&mut guards, new_child_arc).parent = Some(Arc::downgrade(&old_dir_arc));
+                    tmpfs_guard_mut(&mut guards, new_child_arc).dir_mut()?.parent = Arc::downgrade(&old_dir_arc);
                     tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink =
                         tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink.saturating_sub(1);
                     tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink =
@@ -816,20 +967,34 @@ impl VfsInode for TmpfsInode {
             return Ok(());
         }
 
+        // Replacing a name charges nothing; a new name is reserved before
+        // anything changes, against the old name's charge, which goes with
+        // it: on a full mount a name no longer than the old one still fits.
+        let new_entry = match &new_child_opt {
+            Some(nc) => {
+                if nc.lock_id == old_child_arc.lock_id {
+                    return Ok(());
+                }
+                let new_is_dir = nc.inode_type == InodeType::Dir;
+                if old_is_dir && !new_is_dir {
+                    return Err(VfsError::NotDir);
+                }
+                if !old_is_dir && new_is_dir {
+                    return Err(VfsError::IsDir);
+                }
+                if new_is_dir && !tmpfs_guard_mut(&mut guards, nc).dir()?.children.is_empty() {
+                    return Err(VfsError::NotEmpty);
+                }
+                None
+            }
+            None => Some(Charge::reserve_freeing(
+                &self.shared.quota,
+                entry_cost(new_name.len()),
+                entry_cost(old_name.len()),
+            )?),
+        };
         if let Some(ref nc) = new_child_opt {
-            if nc.lock_id == old_child_arc.lock_id {
-                return Ok(());
-            }
             let new_is_dir = nc.inode_type == InodeType::Dir;
-            if old_is_dir && !new_is_dir {
-                return Err(VfsError::NotDir);
-            }
-            if !old_is_dir && new_is_dir {
-                return Err(VfsError::IsDir);
-            }
-            if new_is_dir && !tmpfs_guard_mut(&mut guards, nc).children.is_empty() {
-                return Err(VfsError::NotEmpty);
-            }
             let nc_meta = tmpfs_guard_mut(&mut guards, nc);
             if new_is_dir || nc_meta.nlink <= 1 {
                 Self::detach_if_open(nc, nc_meta);
@@ -843,11 +1008,15 @@ impl VfsInode for TmpfsInode {
             }
         }
 
-        tmpfs_guard_mut(&mut guards, &old_dir_arc).children.remove(old_name);
-        tmpfs_guard_mut(&mut guards, &new_dir_arc).children.insert(new_name.to_vec(), Arc::clone(&old_child_arc));
+        tmpfs_guard_mut(&mut guards, &old_dir_arc).dir_mut()?.children.remove(old_name);
+        let new_children = &mut tmpfs_guard_mut(&mut guards, &new_dir_arc).dir_mut()?.children;
+        match new_entry {
+            Some(entry) => new_children.add(new_name, Arc::clone(&old_child_arc), entry),
+            None => new_children.replace(new_name, Arc::clone(&old_child_arc)),
+        }
 
         if old_is_dir && !same_parent {
-            tmpfs_guard_mut(&mut guards, &old_child_arc).parent = Some(Arc::downgrade(&new_dir_arc));
+            tmpfs_guard_mut(&mut guards, &old_child_arc).dir_mut()?.parent = Arc::downgrade(&new_dir_arc);
             tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink =
                 tmpfs_guard_mut(&mut guards, &old_dir_arc).nlink.saturating_sub(1);
             tmpfs_guard_mut(&mut guards, &new_dir_arc).nlink =
@@ -873,9 +1042,10 @@ impl VfsInode for TmpfsInode {
         if self.is_detached() || meta.nlink == 0 || max_entries == 0 {
             return Ok(());
         }
-        let parent_ino = meta.parent.as_ref().and_then(Weak::upgrade).map_or(self.ino(), |p| p.ino());
+        let parent_ino = meta.parent().map_or(self.ino(), |p| p.ino());
         let dots = [(0, self.ino(), InodeType::Dir, &b"."[..]), (1, parent_ino, InodeType::Dir, &b".."[..])];
         let children = meta
+            .dir()?
             .children
             .listed_from(cursor.max(FIRST_CHILD_CURSOR))
             .map(|(seq, name, child)| (seq, child.ino(), child.inode_type, name));
@@ -1030,10 +1200,7 @@ impl VfsInode for TmpfsInode {
 fn find_tmpfs_non_dir(known_dir: &Arc<TmpfsInode>, target_lock_id: u64) -> Option<Arc<TmpfsInode>> {
     let mut cur = Arc::clone(known_dir);
     loop {
-        let next = {
-            let m = cur.meta.lock();
-            m.parent.as_ref().and_then(Weak::upgrade)
-        };
+        let next = cur.meta.lock().parent();
         match next {
             Some(p) if p.lock_id != cur.lock_id => cur = p,
             _ => break,
@@ -1042,7 +1209,8 @@ fn find_tmpfs_non_dir(known_dir: &Arc<TmpfsInode>, target_lock_id: u64) -> Optio
     let mut stack = alloc::vec![cur];
     while let Some(node) = stack.pop() {
         let m = node.meta.lock();
-        for child in m.children.values() {
+        let Ok(dir) = m.dir() else { continue };
+        for child in dir.children.values() {
             if child.lock_id == target_lock_id {
                 return Some(Arc::clone(child));
             }
@@ -1064,12 +1232,13 @@ crate::ktest!(
         // mapping would: nothing else uses this mount.)
         use crate::vfs::mmap_page;
         use crate::{kassert, kassert_eq};
-        let fs = Tmpfs::new(DevId::makedev(0, 125), 4 * PAGE_SIZE);
+        let fs = Tmpfs::new(DevId::makedev(0, 125), 4 * PAGE_SIZE + KTEST_METADATA_ROOM);
         let root = fs.root_inode();
         let f = root.create(b"map.bin", 0o644).map_err(|_| "create")?;
+        let data_pages = || (fs.used_bytes() - INODE_COST - entry_cost(7)) / PAGE_SIZE;
         let data: Vec<u8> = (0..PAGE_SIZE + 100).map(|i| (i % 251) as u8 | 1).collect();
         kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
-        kassert_eq!(fs.used_pages(), 2);
+        kassert_eq!(data_pages(), 2);
         let first = mmap_page(&f, 0).map_err(|_| "map page 0")?;
         kassert_eq!(first.file_size(), data.len() as u64);
         let mut got = [0u8; PAGE_SIZE];
@@ -1081,7 +1250,7 @@ crate::ktest!(
         kassert!(got[100..].iter().all(|&b| b == 0)); // past EOF: zero
         let again = mmap_page(&f, 0).map_err(|_| "map page 0 again")?;
         kassert!(Arc::ptr_eq(again.page(), first.page()));
-        kassert_eq!(fs.used_pages(), 2); // no page added for either
+        kassert_eq!(data_pages(), 2); // no page added for either
         // Coherent both ways: a write shows in the page, a store in the
         // page shows in a read.
         kassert_eq!(f.write_at(5, b"written").map_err(|_| "write_at")?, 7);
@@ -1095,14 +1264,14 @@ crate::ktest!(
         // the quota (4 pages) refuses.
         f.truncate(5 * PAGE_SIZE as u64).map_err(|_| "truncate")?;
         kassert_eq!(f.read_at(2 * PAGE_SIZE as u64, &mut back).map_err(|_| "read hole")?, 6);
-        kassert_eq!(fs.used_pages(), 2);
+        kassert_eq!(data_pages(), 2);
         let hole = mmap_page(&f, 3).map_err(|_| "map hole")?;
-        kassert_eq!(fs.used_pages(), 3);
+        kassert_eq!(data_pages(), 3);
         hole.page().read_bytes(0, &mut got);
         kassert!(got.iter().all(|&b| b == 0));
         kassert!(Arc::ptr_eq(mmap_page(&f, 3).map_err(|_| "map hole again")?.page(), hole.page()));
         mmap_page(&f, 2).map_err(|_| "map last page of the quota")?;
-        kassert_eq!(fs.used_pages(), 4);
+        kassert_eq!(data_pages(), 4);
         kassert_eq!(mmap_page(&f, 4).err(), Some(VfsError::NoSpc));
         // Past EOF there is no page: `1 << 52` pages is 2^64 bytes, which a
         // plain multiplication wraps to offset 0. Nor in a directory or a
@@ -1164,6 +1333,123 @@ crate::ktest!(
             OpenFile::<KernelVfsLock<u64>>::new_unchecked_flags(Arc::clone(&inode), Arc::from(path.as_slice()), rd);
         kassert_eq!(res.err(), Some(VfsError::NoEnt));
         kassert_eq!(inode.open_count(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tmpfs_quota_charges_inodes_names_and_symlink_targets() {
+        // #267: a tmpfs mount's quota pays for each inode, each directory
+        // entry (its name) and each symlink's target, not only for pages:
+        // past it creating, linking or renaming fails with `NoSpc` and
+        // leaves nothing behind, and freeing gives the room back exactly.
+        use crate::{kassert, kassert_eq};
+        use alloc::format;
+        let flags = RenameFlags(0);
+        kassert!(INODE_COST >= size_of::<TmpfsInode>());
+        kassert_eq!(entry_cost(255) - entry_cost(0), 2 * 255);
+
+        // Inodes: room for exactly `N` files named with 8 bytes.
+        const N: usize = 6;
+        let file_cost = INODE_COST + entry_cost(8);
+        let fs = Tmpfs::new(DevId::makedev(0, 135), N * file_cost);
+        let root = fs.root_inode();
+        let name = |i: usize| format!("f{i:07}").into_bytes();
+        let mut held = Vec::new();
+        for i in 0..N {
+            held.push(root.create(&name(i), 0o644).map_err(|_| "create within the quota")?);
+        }
+        kassert_eq!(fs.used_bytes(), N * file_cost);
+        kassert_eq!(root.create(b"one_more", 0o644).err(), Some(VfsError::NoSpc));
+        kassert_eq!(root.mkdir(b"one_more", 0o755).err(), Some(VfsError::NoSpc));
+        kassert_eq!(root.symlink(b"one_more", b"t").err(), Some(VfsError::NoSpc));
+        kassert_eq!(root.link(b"one_more", &held[1]).err(), Some(VfsError::NoSpc));
+        kassert_eq!(root.lookup(b"one_more").err(), Some(VfsError::NoEnt));
+        kassert_eq!(fs.used_bytes(), N * file_cost);
+        // An existing name is `Exist`, full or not.
+        kassert_eq!(root.create(&name(1), 0o644).err(), Some(VfsError::Exist));
+        // Unlinking gives the name's room back; the inode's comes back when
+        // its last reference goes (an open file unlinked keeps it).
+        root.unlink(&name(0)).map_err(|_| "unlink")?;
+        kassert_eq!(fs.used_bytes(), N * file_cost - entry_cost(8));
+        drop(held.remove(0));
+        kassert_eq!(fs.used_bytes(), (N - 1) * file_cost);
+        // A directory costs what a file does, and gives it back the same way.
+        let d = root.mkdir(b"d0000000", 0o755).map_err(|_| "mkdir in the room freed")?;
+        kassert_eq!(fs.used_bytes(), N * file_cost);
+        kassert_eq!(d.create(b"x", 0o644).err(), Some(VfsError::NoSpc));
+        root.rmdir(b"d0000000").map_err(|_| "rmdir")?;
+        drop(d);
+        kassert_eq!(fs.used_bytes(), (N - 1) * file_cost);
+        // A rename over a file frees the old name and the replaced inode.
+        held.clear();
+        root.rename(&name(1), &root, &name(2), flags).map_err(|_| "rename over")?;
+        kassert_eq!(fs.used_bytes(), (N - 2) * file_cost);
+
+        // Names: a file named "t", then room for exactly `K` more entries
+        // with 255-byte names.
+        const K: usize = 4;
+        let long = |c: u8| [c; 255];
+        let fs = Tmpfs::new(DevId::makedev(0, 136), INODE_COST + entry_cost(1) + K * entry_cost(255));
+        let root = fs.root_inode();
+        let t = root.create(b"t", 0o644).map_err(|_| "create t")?;
+        for c in 0..K as u8 {
+            root.link(&long(b'a' + c), &t).map_err(|_| "link within the quota")?;
+        }
+        let full = fs.used_bytes();
+        kassert_eq!(full, INODE_COST + entry_cost(1) + K * entry_cost(255));
+        kassert_eq!(root.link(&long(b'z'), &t).err(), Some(VfsError::NoSpc));
+        kassert_eq!(root.link(b"z", &t).err(), Some(VfsError::NoSpc));
+        kassert_eq!(root.lookup(&long(b'z')).err(), Some(VfsError::NoEnt));
+        kassert_eq!(t.stat().map_err(|_| "stat t")?.nlink, 1 + K as u32);
+        // Renaming on a full mount: to a name no longer than the old one
+        // fits (the old name's room pays for it); to a longer one is
+        // `NoSpc`, nothing changed.
+        root.rename(&long(b'a'), &root, &long(b'y'), flags).map_err(|_| "rename, same length")?;
+        kassert_eq!(fs.used_bytes(), full);
+        kassert_eq!(root.rename(b"t", &root, b"tt", flags).err(), Some(VfsError::NoSpc));
+        kassert!(root.lookup(b"t").is_ok());
+        kassert_eq!(root.lookup(b"tt").err(), Some(VfsError::NoEnt));
+        kassert_eq!(fs.used_bytes(), full);
+        root.rename(&long(b'y'), &root, b"y", flags).map_err(|_| "rename shorter")?;
+        kassert_eq!(fs.used_bytes(), full - entry_cost(255) + entry_cost(1));
+        root.unlink(b"y").map_err(|_| "unlink y")?;
+        root.link(&long(b'z'), &t).map_err(|_| "link in the room freed")?;
+        kassert_eq!(fs.used_bytes(), full);
+        for c in (1..K as u8).map(|c| b'a' + c).chain(*b"z") {
+            root.unlink(&long(c)).map_err(|_| "unlink a link")?;
+        }
+        kassert_eq!(fs.used_bytes(), INODE_COST + entry_cost(1));
+
+        // Symlink targets: room for one symlink "s" to a 4000-byte target.
+        const T: usize = 4000;
+        let fs = Tmpfs::new(DevId::makedev(0, 137), INODE_COST + entry_cost(1) + T);
+        let root = fs.root_inode();
+        let target = [b'p'; T];
+        let s = root.symlink(b"s", &target).map_err(|_| "symlink within the quota")?;
+        kassert_eq!(fs.used_bytes(), INODE_COST + entry_cost(1) + T);
+        kassert!(s.readlink().map_err(|_| "readlink")? == target);
+        kassert_eq!(root.symlink(b"r", b"x").err(), Some(VfsError::NoSpc));
+        root.unlink(b"s").map_err(|_| "unlink s")?;
+        drop(s);
+        kassert_eq!(fs.used_bytes(), 0);
+        kassert_eq!(root.symlink(b"s", &[b'p'; T + 1]).err(), Some(VfsError::NoSpc));
+        kassert_eq!(root.lookup(b"s").err(), Some(VfsError::NoEnt));
+        kassert_eq!(fs.used_bytes(), 0);
+        root.symlink(b"s", &target).map_err(|_| "symlink again")?;
+
+        // Dropping a mount with everything in it gives every byte back:
+        // pages, inodes, the entries of a directory inside, a target.
+        let fs = Tmpfs::new(DevId::makedev(0, 138), 64 * PAGE_SIZE);
+        let quota = Arc::clone(&fs.shared.quota);
+        let sub = fs.root_inode().mkdir(b"sub", 0o755).map_err(|_| "mkdir sub")?;
+        let f = sub.create(b"file", 0o644).map_err(|_| "create sub/file")?;
+        kassert_eq!(f.write_at(0, &[1u8; 100]).map_err(|_| "write")?, 100);
+        sub.symlink(b"link", b"file").map_err(|_| "symlink sub/link")?;
+        let inodes = 3 * INODE_COST + b"file".len();
+        kassert_eq!(quota.used_bytes(), inodes + entry_cost(3) + 2 * entry_cost(4) + PAGE_SIZE);
+        drop((f, sub, fs));
+        kassert_eq!(quota.used_bytes(), 0);
         Ok(())
     }
 );

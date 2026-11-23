@@ -107,74 +107,121 @@ pub fn detached_cached_pages() -> usize {
     DETACHED_CACHED_PAGES.load(Ordering::Relaxed)
 }
 
-/// Lock-free atomic page-frame quota counter (used by `tmpfs` and Gate 6 detach).
+/// Lock-free atomic memory quota, counted in bytes: `tmpfs`'s (its pages,
+/// and since #267 its inodes, directory entries and symlink targets) and
+/// Gate 6 detach's (pages only). The page methods count whole pages.
 #[derive(Debug)]
 pub struct QuotaCounter {
     /// What the quota is for, named in its log lines.
     name: &'static str,
-    limit_pages: usize,
-    used_pages: AtomicUsize,
+    limit_bytes: usize,
+    used_bytes: AtomicUsize,
 }
 
 impl QuotaCounter {
+    /// A quota of `limit_pages` pages.
     pub const fn new(name: &'static str, limit_pages: usize) -> Self {
-        Self { name, limit_pages, used_pages: AtomicUsize::new(0) }
+        Self::with_bytes(name, limit_pages.saturating_mul(PAGE_SIZE))
     }
 
-    /// Reserve `pages`, or `false` if that would pass the limit. A `true`
-    /// must be released later, or the pages leak from the quota.
+    /// A quota of `limit_bytes` bytes.
+    pub const fn with_bytes(name: &'static str, limit_bytes: usize) -> Self {
+        Self { name, limit_bytes, used_bytes: AtomicUsize::new(0) }
+    }
+
+    /// Reserve `pages` pages, or `false` if that would pass the limit. A
+    /// `true` must be released later, or the pages leak from the quota.
     #[must_use]
     pub fn try_reserve(&self, pages: usize) -> bool {
-        if pages == 0 {
+        pages.checked_mul(PAGE_SIZE).is_some_and(|bytes| self.try_reserve_bytes(bytes))
+    }
+
+    /// Reserve `bytes`, or `false` if that would pass the limit. A `true`
+    /// must be released later, or the bytes leak from the quota.
+    #[must_use]
+    pub fn try_reserve_bytes(&self, bytes: usize) -> bool {
+        self.try_reserve_bytes_freeing(bytes, 0)
+    }
+
+    /// Reserve `bytes` for a change that releases `freeing` bytes right
+    /// after (a rename: the new name reserved, then the old one released):
+    /// `false` only if the change as a whole would pass the limit. Until
+    /// that release the count may stand above the limit by up to `freeing`,
+    /// which only makes other reservations meanwhile fail.
+    #[must_use]
+    pub fn try_reserve_bytes_freeing(&self, bytes: usize, freeing: usize) -> bool {
+        if bytes == 0 {
             return true;
         }
-        let mut cur = self.used_pages.load(Ordering::Acquire);
+        let ceiling = self.limit_bytes.saturating_add(freeing);
+        let mut cur = self.used_bytes.load(Ordering::Acquire);
         loop {
-            let Some(next) = cur.checked_add(pages) else {
+            let Some(next) = cur.checked_add(bytes) else {
                 return false;
             };
-            if next > self.limit_pages {
+            if next > ceiling {
                 return false;
             }
-            match self.used_pages.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            match self.used_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => return true,
                 Err(actual) => cur = actual,
             }
         }
     }
 
-    /// Return `pages` to the quota. Releasing more than is reserved is a
-    /// bug elsewhere: the count saturates at zero (logged) rather than
+    /// Return `pages` pages to the quota. Releasing more than is reserved
+    /// is a bug elsewhere: the count saturates at zero (logged) rather than
     /// wrapping, which would make every later reservation fail.
     pub fn release(&self, pages: usize) {
-        if pages == 0 {
-            return;
-        }
-        let mut cur = self.used_pages.load(Ordering::Acquire);
-        loop {
-            let next = cur.saturating_sub(pages);
-            match self.used_pages.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
-        }
-        if pages > cur {
+        if let Some(had) = self.release_counted(pages.saturating_mul(PAGE_SIZE)) {
             log::error!(
                 target: "vfs",
-                "page quota {} ({} pages): released {pages} pages with only {cur} reserved",
+                "page quota {} ({} pages): released {pages} pages with only {} reserved",
                 self.name,
-                self.limit_pages
+                self.limit_bytes / PAGE_SIZE,
+                had.div_ceil(PAGE_SIZE)
             );
         }
     }
 
-    pub fn used_pages(&self) -> usize {
-        self.used_pages.load(Ordering::Acquire)
+    /// Return `bytes` to the quota; as [`Self::release`], saturating.
+    pub fn release_bytes(&self, bytes: usize) {
+        if let Some(had) = self.release_counted(bytes) {
+            log::error!(
+                target: "vfs",
+                "quota {} ({} bytes): released {bytes} bytes with only {had} reserved",
+                self.name,
+                self.limit_bytes
+            );
+        }
     }
 
-    #[allow(dead_code)]
-    pub const fn limit_pages(&self) -> usize {
-        self.limit_pages
+    /// Take `bytes` off the count, saturating at zero: what was reserved
+    /// before if that was less than `bytes` (an over-release), else `None`.
+    fn release_counted(&self, bytes: usize) -> Option<usize> {
+        if bytes == 0 {
+            return None;
+        }
+        let mut cur = self.used_bytes.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(bytes);
+            match self.used_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        (bytes > cur).then_some(cur)
+    }
+
+    /// The whole pages' worth reserved: exact for a quota only ever
+    /// reserved in pages (the detached one).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+    pub fn used_pages(&self) -> usize {
+        self.used_bytes() / PAGE_SIZE
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes.load(Ordering::Acquire)
     }
 }
 
@@ -735,7 +782,8 @@ pub(crate) mod ktest_files {
         Ok(f)
     }
 
-    /// A fresh `tmpfs` holding `quota_bytes`.
+    /// A fresh `tmpfs` holding `quota_bytes` of data, and its few files'
+    /// inodes and names (`tmpfs::KTEST_METADATA_ROOM`).
     pub(crate) struct TmpfsVolume {
         _fs: Arc<super::super::tmpfs::Tmpfs>,
         pub(crate) root: Arc<dyn VfsInode>,
@@ -743,7 +791,10 @@ pub(crate) mod ktest_files {
 
     impl TmpfsVolume {
         pub(crate) fn new(minor: u32, quota_bytes: usize) -> Self {
-            let fs = super::super::tmpfs::Tmpfs::new(DevId::makedev(0, minor), quota_bytes);
+            let fs = super::super::tmpfs::Tmpfs::new(
+                DevId::makedev(0, minor),
+                quota_bytes + super::super::tmpfs::KTEST_METADATA_ROOM,
+            );
             Self { root: fs.root_inode(), _fs: fs }
         }
     }

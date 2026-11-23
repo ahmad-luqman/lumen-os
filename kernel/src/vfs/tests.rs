@@ -249,7 +249,7 @@ crate::ktest!(
 crate::ktest!(
     fn tmpfs_truncate_returns_quota() {
         use crate::{kassert, kassert_eq};
-        let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 121), page_cache::PAGE_SIZE);
+        let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 121), page_cache::PAGE_SIZE + tmpfs::KTEST_METADATA_ROOM);
         let f = tfs.root_inode().create(b"q.bin", 0o644).map_err(|_| "tmpfs create q.bin")?;
         let page = vec![0x5Au8; page_cache::PAGE_SIZE];
         kassert_eq!(f.write_at(0, &page).map_err(|_| "write page 0")?, page.len());
@@ -428,7 +428,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
 
         // 1. tmpfs multi-page -ENOSPC short-write + truncate extend does not leak unwritten data.
-        let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 120), page_cache::PAGE_SIZE);
+        let tfs = tmpfs::Tmpfs::new(DevId::makedev(0, 120), page_cache::PAGE_SIZE + tmpfs::KTEST_METADATA_ROOM);
         let root = tfs.root_inode();
         let f = root.create(b"short.bin", 0o644).map_err(|_| "tmpfs create short.bin")?;
         let two_pages = vec![0xA5u8; 2 * page_cache::PAGE_SIZE];
