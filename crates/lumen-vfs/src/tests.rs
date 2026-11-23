@@ -8943,8 +8943,9 @@ fn not_a_name_answered_without_the_filesystem() {
         assert_eq!(link_at(env, None, b"/f", Some(&gone), p, false, false).unwrap_err(), VfsError::Exist, "link {at}");
         assert_eq!(open_inode(env, Some(&gone), p, excl, 0o644, 0).unwrap_err(), VfsError::Exist, "O_EXCL {at}");
     }
-    // `.` is the directory itself, found without a lookup. (`..` here is the
-    // filesystem's own `..`, which it no longer has: see the next test.)
+    // `.` is the directory itself, found without a lookup. `..` here is the
+    // filesystem's own `..`, which it no longer has: `ENOENT`, where Linux
+    // says `EISDIR` (#318), so left out; the next test tells `.` from `..`.
     assert_eq!(open_inode(env, Some(&gone), b".", creat, 0o644, 0).unwrap_err(), VfsError::IsDir);
 }
 
@@ -8995,7 +8996,9 @@ fn open_creat_resolves_the_dots_it_was_given() {
 /// arm, `//` comment lines skipped. Rustc's exhaustiveness check and
 /// `clippy::wildcard_enum_match_arm` see only a `match` on a bare `Final`;
 /// this keeps `ops.rs` to that form (no `let ... else`, `if let`,
-/// `matches!`, tuple scrutinee or `Final` held in a variable; #309).
+/// `matches!`, tuple scrutinee, method path or `Final` held in a
+/// variable; #309). A helper whose own direct `match` answers the three
+/// alike passes it.
 fn final_outside_a_direct_match(src: &str) -> Vec<(usize, &str)> {
     fn is_ident(s: &str) -> bool {
         !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -9015,7 +9018,7 @@ fn final_outside_a_direct_match(src: &str) -> Vec<(usize, &str)> {
         .map(|(i, line)| (i + 1, line.trim()))
         .filter(|(_, line)| !line.starts_with("//"))
         .filter(|(_, line)| {
-            (line.contains("final_component(") && !direct_match(line))
+            (line.contains("final_component") && !direct_match(line))
                 || (line.contains("Final::") && !(line.starts_with("Final::") || line.starts_with("| Final::")))
         })
         .collect()
@@ -9026,7 +9029,8 @@ fn final_outside_a_direct_match(src: &str) -> Vec<(usize, &str)> {
 #[test]
 fn ops_reads_final_only_through_a_direct_match() {
     let ops = include_str!("ops.rs");
-    assert!(ops.matches("final_component()").count() >= 6, "the operations' matches went missing");
+    let reads = ops.lines().filter(|l| !l.trim().starts_with("//") && l.contains("final_component()")).count();
+    assert!(reads >= 7, "the operations' matches went missing: {reads}");
     assert_eq!(final_outside_a_direct_match(ops), [], "a `Final` read in ops.rs other than by a `match`");
 
     let good = "let name = match target.final_component() {\n    Final::Root | Final::Dot | Final::DotDot => \
@@ -9043,6 +9047,7 @@ fn ops_reads_final_only_through_a_direct_match() {
         "if let Final::Name(name) = last {",
         "let mut name = match target.final_component() {",
         "let name = match target.final_component() { Final::Name(n) => n, _ => return Err(e) };",
+        "let last = Some(&target).map(ParentTarget::final_component);",
     ] {
         assert_eq!(final_outside_a_direct_match(bad), [(1, bad)], "{bad}");
     }

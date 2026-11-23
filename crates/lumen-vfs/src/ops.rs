@@ -4,13 +4,14 @@
 
 // A last component (`resolve::Final`) is read here only as the scrutinee of
 // a `match` on `final_component()` whose arms are `Final::` patterns (no
-// `let ... else`, `if let`, `matches!`, tuple, or `Final` held in a
-// variable: the host test `ops_reads_final_only_through_a_direct_match`
+// `let ... else`, `if let`, `matches!`, tuple, method path, or `Final` held
+// in a variable: the host test `ops_reads_final_only_through_a_direct_match`
 // refuses those), so an operation that leaves a case out doesn't compile,
 // and `make lint` refuses a `_` or catch-all arm answering them all alike
-// (#309). The deny covers every enum matched in this file, not only
-// `Final`: name the cases of the others too, or allow it on one match with
-// the reason.
+// (#309). Keep each operation's match in the operation: a shared helper
+// answering the three alike would pass both checks. The deny covers every
+// enum matched in this file, not only `Final`: name the cases of the others
+// too, or allow it on one match with the reason.
 #![deny(clippy::wildcard_enum_match_arm)]
 
 use alloc::sync::Arc;

@@ -5741,13 +5741,17 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     (below; `-EEXIST` for `mkdir`, `link` and `symlink`, and for `O_CREAT |
     O_EXCL`; `O_CREAT` without `O_EXCL` resolves the directory `/`, `.` or
     `..` names, which then gives `-EISDIR` as any directory opened with
-    `O_CREAT`), ahead of `-EROFS`. In `ops.rs` each reads it with a `match`
-    on `final_component()`, so one that leaves a case out doesn't compile;
+    `O_CREAT`; but `..` from a removed directory is `-ENOENT`, as it is the
+    filesystem's own `..`, where Linux says `-EISDIR`, #318), ahead of
+    `-EROFS`. In `ops.rs` each reads it with a `match` on
+    `final_component()`, so one that leaves a case out doesn't compile;
     `clippy::wildcard_enum_match_arm`, denied in that file, refuses a `_` or
     catch-all arm, and the host test
     `ops_reads_final_only_through_a_direct_match` any other way of reading
-    it there (`let ... else`, `if let`, `matches!`, a tuple). Outside
-    `ops.rs` that is a convention.
+    it there (`let ... else`, `if let`, `matches!`, a tuple, a method path).
+    Neither sees a shared helper whose own `match` answers the three alike;
+    review keeps each operation's match in the operation, and outside
+    `ops.rs` all of it is a convention.
   - **Namespace operations check in Linux's order** (`unlink_at`,
     `rename_at2`, `link_at` as v6.12's `fs/namei.c`; `readlink_at` as
     `fs/stat.c`; #254):

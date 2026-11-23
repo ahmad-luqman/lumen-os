@@ -72,11 +72,13 @@ pub struct ParentTarget<'a> {
 /// (`clippy::wildcard_enum_match_arm`, denied in that file), and a host
 /// test, `ops_reads_final_only_through_a_direct_match`, refuses any other
 /// way of reading one there (`let ... else`, `if let`, `matches!`, a
-/// tuple). Code elsewhere is held to that by convention only.
+/// tuple, a method path). Neither sees a helper whose own `match` answers
+/// the three alike for several operations; review does, and code outside
+/// `ops.rs` is held to all of it by convention only.
 ///
 /// Stable rustdoc doesn't check a `compile_fail` example's error code, so
-/// each one is followed by a twin that differs only where it should fail
-/// and compiles: it fails for that reason, not another.
+/// each one is followed by a twin that is the same but for the part meant
+/// to fail, and compiles: it fails for that reason, not another.
 ///
 /// ```compile_fail
 /// use lumen_vfs::resolve::{Final, ParentTarget};
@@ -100,8 +102,27 @@ pub struct ParentTarget<'a> {
 /// }
 /// ```
 ///
-/// Nor is there a field to take the bytes from instead (this would
-/// compile were the name a public `Vec<u8>` or `&[u8]`):
+/// Nor is there a field to take it from instead: the component's own is
+/// private (this would compile were it `pub`)...
+///
+/// ```compile_fail
+/// use lumen_vfs::resolve::{Final, ParentTarget};
+///
+/// fn last<'a>(target: &ParentTarget<'a>) -> Final<'a> {
+///     target.last
+/// }
+/// ```
+///
+/// ```
+/// use lumen_vfs::resolve::{Final, ParentTarget};
+///
+/// fn last<'a>(target: &ParentTarget<'a>) -> Final<'a> {
+///     target.final_component()
+/// }
+/// ```
+///
+/// ...and the name's bytes have none (this would compile were they a
+/// public `name: Vec<u8>` or `&[u8]` again):
 ///
 /// ```compile_fail
 /// fn is_empty(target: &lumen_vfs::resolve::ParentTarget<'_>) -> bool {
@@ -110,8 +131,8 @@ pub struct ParentTarget<'a> {
 /// ```
 ///
 /// ```
-/// fn trailing_slash(target: &lumen_vfs::resolve::ParentTarget<'_>) -> bool {
-///     target.has_trailing_slash
+/// fn is_empty(target: &lumen_vfs::resolve::ParentTarget<'_>) -> bool {
+///     !target.has_trailing_slash
 /// }
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
