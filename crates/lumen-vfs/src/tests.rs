@@ -8029,24 +8029,7 @@ mod uncached {
                 _ => Err(VfsError::NotDir),
             }
         }
-        fn create(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn mkdir(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn unlink(&self, _name: &[u8]) -> Result<(), VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn rmdir(&self, _name: &[u8]) -> Result<(), VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn link(&self, _name: &[u8], _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn symlink(&self, _name: &[u8], _target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-            Err(VfsError::RoFs)
-        }
+        crate::fixed_namespace_ops!();
         fn readlink(&self) -> Result<Vec<u8>, VfsError> {
             match self.node {
                 Node::FdLink(_) if self.is_live() => Ok(b"../info".to_vec()),
@@ -8054,15 +8037,6 @@ mod uncached {
                 Node::FdLink(_) | Node::VerLink(_) => Err(VfsError::NoEnt),
                 _ => Err(VfsError::Inval),
             }
-        }
-        fn rename(
-            &self,
-            _old_name: &[u8],
-            _new_dir: &Arc<dyn VfsInode>,
-            _new_name: &[u8],
-            _flags: RenameFlags,
-        ) -> Result<(), VfsError> {
-            Err(VfsError::RoFs)
         }
         fn readdir(&self, _cursor: u64, _out: &mut Vec<DirEntry>, _max_entries: usize) -> Result<(), VfsError> {
             if self.inode_type() == InodeType::Dir { Ok(()) } else { Err(VfsError::NotDir) }
@@ -8112,6 +8086,24 @@ fn setup_dynfs() -> (SimpleVfsTables, Arc<uncached::DynFs>, Arc<dyn VfsInode>) {
     let proc_root = resolve_path(&env, None, b"/proc", ResolveFlags::default()).unwrap().inode;
     assert_eq!(proc_root.dev_id(), DYNFS_DEV);
     (env, dynfs, proc_root)
+}
+
+/// `fixed_namespace_ops!`, which the fake procfs's inodes expand as the
+/// kernel's devfs and procfs do, refuses each of its seven operations with
+/// `-EROFS`, asked directly (the read-only mount refuses first by path).
+#[test]
+fn fixed_namespace_ops_refuse_each_change_with_erofs() {
+    let (_env, _dynfs, proc_root) = setup_dynfs();
+    let other: Arc<dyn VfsInode> = proc_root.clone();
+    let rofs = Err(VfsError::RoFs);
+    assert_eq!(proc_root.create(b"n", 0o644).map(|_| ()), rofs);
+    assert_eq!(proc_root.mkdir(b"n", 0o755).map(|_| ()), rofs);
+    assert_eq!(proc_root.unlink(b"version"), rofs);
+    assert_eq!(proc_root.rmdir(b"version"), rofs);
+    assert_eq!(proc_root.link(b"n", &other), rofs);
+    assert_eq!(proc_root.symlink(b"n", b"version").map(|_| ()), rofs);
+    assert_eq!(proc_root.rename(b"version", &other, b"n", RenameFlags(0)), rofs);
+    assert_eq!(proc_root.rename(b"version", &other, b"n", RenameFlags(RenameFlags::EXCHANGE)), rofs);
 }
 
 /// How many per-pid entries `InodeCache` and `DentryCache` hold.

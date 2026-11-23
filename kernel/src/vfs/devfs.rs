@@ -1,10 +1,13 @@
 //! The `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes.
 //!
 //! A writable mount, as Linux's devtmpfs (`FileSystem::read_only` is
-//! false, #301), whose names never change: its namespace operations
-//! (create, unlink, mkdir, rename, ...) return `-EROFS` themselves
-//! (`lumen_vfs::fixed_namespace_ops!`), and so does a metadata change on
-//! `/dev` itself (a divergence: devtmpfs takes those on `/dev` too). A
+//! false, #301), whose names never change: lumen-vfs's own checks answer
+//! first, as on any writable mount, and a namespace operation that reaches
+//! devfs (create, unlink, mkdir, rename, ...) returns `-EROFS`
+//! (`lumen_vfs::fixed_namespace_ops!`; a divergence: devtmpfs takes these
+//! from root, and Linux never answers `-EROFS` on an `rw` mount), and so
+//! does a metadata change on `/dev` itself (a divergence too: devtmpfs
+//! takes those on `/dev`). A
 //! character node's setters take `chmod`, `chown` and `utimensat` and keep
 //! the new mode, owner and times in memory until reboot, as devtmpfs does,
 //! on any instance's node (#293).
@@ -254,14 +257,11 @@ impl VfsInode for DevfsInode {
         if self.kind != DevKind::Root {
             return Err(VfsError::NotDir);
         }
-        if max_entries == 0 {
-            return Ok(());
-        }
         // Each entry's key is its index: the names never change.
         let entries = [(1, InodeType::Dir, "."), (1, InodeType::Dir, "..")]
             .into_iter()
             .chain(self.nodes.iter().map(|&(name, ref node)| (node.ino, InodeType::CharDevice, name)));
-        fill_readdir(out, cursor, max_entries, (0u64..).zip(entries).map(|(key, (ino, t, name))| (key, ino, t, name)));
+        fill_readdir(out, cursor, max_entries, (0u64..).zip(entries));
         Ok(())
     }
 

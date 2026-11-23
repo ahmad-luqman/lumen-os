@@ -1070,9 +1070,11 @@ mod tests {
         }
     );
 
-    /// `inner` mounted read-only: a read-only filesystem holding special
-    /// files (none of Lumen's own is one since devfs's mounts are writable,
-    /// #301), with `inner`'s inodes and device number.
+    /// The wrapped filesystem mounted read-only, with its inodes and device
+    /// number: a read-only filesystem holding special files (none of
+    /// Lumen's boot mounts is one since devfs's mounts are writable, #301).
+    /// It forwards only `FileSystem`'s required methods: `with_rename_lock`
+    /// keeps the default, so wrap only a filesystem that keeps it too.
     struct ReadOnlyMount(Arc<dyn lumen_vfs::FileSystem>);
 
     impl lumen_vfs::FileSystem for ReadOnlyMount {
@@ -1115,6 +1117,15 @@ mod tests {
         let ran = process::in_test_process(|_| f());
         let umounted = tables().umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
         let removed = rmdir();
+        // A failed run's error is the one returned: a cleanup failure
+        // after it is logged, not lost (the mount may stay at `mnt`).
+        if !matches!(ran, Ok(Ok(()))) {
+            for (step, r) in [("umount", umounted), ("rmdir", removed.map(drop))] {
+                if let Err(e) = r {
+                    log::warn!(target: "ktest", "{mnt}: {step} after a failed run: {e}");
+                }
+            }
+        }
         ran??;
         umounted?;
         removed.map(drop)
@@ -1151,13 +1162,15 @@ mod tests {
         fn meta_a_second_devfs_mount_takes_chmod_chown_and_utimensat() {
             // Every devfs mount is writable, as every devtmpfs mount on
             // Linux (#301), not only `/dev`'s: a second instance's nodes
-            // take the changes, by path and by descriptor.
+            // take the changes, by path (and `fchmod` by descriptor), and
+            // `/dev`'s own nodes keep theirs.
             const MNT: &str = "/tmp/meta-ktest-dev2";
             const NULL: &str = "/tmp/meta-ktest-dev2/null";
             let devfs = crate::vfs::devfs::Devfs::new(lumen_vfs::DevId::makedev(0, 135));
             in_a_mount(MNT, devfs, || {
                 let null = ktest_user_path(0, NULL.as_bytes())?;
                 let before = meta_of(NULL)?;
+                let dev_null = meta_of("/dev/null")?;
                 kassert!(!tables().fs_read_only(before.dev));
                 kassert!(crate::vfs::list_mounts().iter().any(|m| m.mount_path == MNT && !m.read_only));
                 kassert_eq!(sys_chmod(null, at::reg(0o600)), 0);
@@ -1171,6 +1184,11 @@ mod tests {
                 let after = meta_of(NULL)?;
                 kassert_eq!((after.mode, after.uid, after.gid), (0o640, 1000, 2000));
                 kassert_eq!((ts(after.atime), ts(after.mtime)), ((1000, 5), (2000, 7)));
+                let boot_null = meta_of("/dev/null")?;
+                kassert_eq!(
+                    (boot_null.mode, boot_null.uid, boot_null.gid),
+                    (dev_null.mode, dev_null.uid, dev_null.gid)
+                );
                 // Its root refuses, as `/dev`'s does.
                 let root = ktest_user_path(1, MNT.as_bytes())?;
                 kassert_eq!(sys_chmod(root, at::reg(0o700)), neg_errno(errno::EROFS));

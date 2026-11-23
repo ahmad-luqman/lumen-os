@@ -5593,8 +5593,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     exactly once. tmpfs numbers entries as they are added (a name keeps
     its number through a rename over it or an exchange); procfs keys them
     as Linux does (`/proc`'s pids past its fixed entries, `/proc/<pid>/fd`
-    by fd); devfs, whose entries never change, uses an index (both list
-    through `lumen_vfs::pseudo::fill_readdir`, host-tested); ext4 uses an
+    by fd); devfs, whose entries never change, uses an index (procfs and
+    devfs both list through `lumen_vfs::pseudo::fill_readdir`,
+    host-tested); ext4 uses an
     entry's byte position, as Linux does for a linear directory, which
     holds because `ext4plus` never moves a record there (a removal merges
     or zeroes it, an insert takes the first slack with room or a new
@@ -5864,11 +5865,18 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   `-ENOSPC` instead of exhausting kernel frames).
 - **`/dev` (`devfs`, `dev = 0:3`):** a writable mount (`rw` in `mount`
   and `/proc/mounts`), as Linux's devtmpfs (#301), whose names never
-  change: its namespace operations (`create`, `mkdir`, `unlink`, `rmdir`,
-  `link`, `symlink`, `rename`: `lumen_vfs::fixed_namespace_ops!`) refuse a
-  change themselves with `-EROFS` (a missing name is `-ENOENT` first, a
-  link from another mount `-EXDEV`), as does a `chmod`/`chown`/`utimensat`
-  of `/dev` itself (a divergence: devtmpfs takes those). Its character
+  change. lumen-vfs's own checks answer first, as on any writable mount
+  (a missing name to unlink or rename `-ENOENT`, a node that is no
+  directory `-ENOTDIR`, a name in use under `RENAME_NOREPLACE` `-EEXIST`,
+  a link from another mount `-EXDEV`; a rename onto itself does nothing
+  and returns 0), and devfs
+  refuses only what reaches it: its namespace operations (`create`,
+  `mkdir`, `unlink`, `rmdir`, `link`, `symlink`, `rename`:
+  `lumen_vfs::fixed_namespace_ops!`) return `-EROFS`, `mkdir` and
+  `symlink` onto a name in use too (a divergence: devtmpfs takes these
+  from root, Linux says `-EEXIST` for a name in use, and it never answers
+  `-EROFS` on an `rw` mount), as does a `chmod`/`chown`/`utimensat` of
+  `/dev` itself (a divergence too: devtmpfs takes those). Its character
   devices (`S_IFCHR`) open for writing and pass `W_OK`. A node's
   `chmod`/`chown`/`utimensat` is taken, as devtmpfs takes it: devfs keeps
   the new mode, owner and times in memory until reboot (#293). The nodes,

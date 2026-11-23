@@ -216,6 +216,19 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn vfs_dev_answers_namespace_changes_after_lumen_vfs_checks() {
+        // `check_dev_namespace` on its own, every check run (#301): with
+        // devfs's mount writable, lumen-vfs's errnos come before devfs's
+        // `-EROFS`, which a read-only devfs would answer for all of them.
+        if let Err(err) = check_dev_namespace() {
+            log::error!(target: "vfs", "check_dev_namespace: {err}");
+            return Err("check_dev_namespace failed (its mismatches are logged above)");
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn vfs_proc_checks_unregister_their_process_on_failure() {
         use crate::linux::process;
         use crate::{kassert, kassert_eq};

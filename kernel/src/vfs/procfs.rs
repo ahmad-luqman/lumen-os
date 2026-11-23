@@ -502,7 +502,7 @@ impl VfsInode for ProcfsInode {
             }
             _ => return Err(VfsError::NotDir),
         }
-        fill_readdir(out, cursor, max_entries, entries.into_iter().map(|(key, (ino, t, name))| (key, ino, t, name)));
+        fill_readdir(out, cursor, max_entries, entries);
         Ok(())
     }
 

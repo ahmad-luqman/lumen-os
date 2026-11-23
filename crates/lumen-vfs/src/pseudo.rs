@@ -1,46 +1,47 @@
-//! What the kernel's pseudo-filesystems whose names never change (devfs,
-//! procfs) share: [`fill_readdir`], their listing, and
-//! [`fixed_namespace_ops!`](crate::fixed_namespace_ops), their namespace
-//! operations, each `-EROFS`.
+//! What the kernel's pseudo-filesystems whose names no caller can change
+//! (devfs's fixed nodes, procfs's generated ones) share: [`fill_readdir`],
+//! their listing, and [`fixed_namespace_ops!`](crate::fixed_namespace_ops),
+//! their namespace operations, each `-EROFS`.
 
 use alloc::vec::Vec;
 
 use crate::types::{DirEntry, Ino, InodeType};
 
-/// `VfsInode::readdir` over generated entries: each `(key, ino, type,
-/// name)`, keys strictly ascending. An entry is listed when its key is at
-/// least `cursor`, with `next_cursor` its key plus 1 (so a cursor names an
-/// entry, not a position, and a listing resumed after entries came and went
-/// lists each one that stayed exactly once), until `out` holds
-/// `max_entries` entries, counting those it held before.
+/// The `Arc` [`fixed_namespace_ops!`](crate::fixed_namespace_ops) names, so
+/// its caller needs no `extern crate alloc`.
+#[doc(hidden)]
+pub use alloc::sync::Arc as __Arc;
+
+/// `VfsInode::readdir` over generated entries: each `(key, (ino, type,
+/// name))`, keys strictly ascending and each below `u64::MAX`, and each key
+/// fixed for its entry (the caller's promise: an index into a list that
+/// changes is not one). An entry is listed when its key is at least
+/// `cursor`, with `next_cursor` its key plus 1 (so a cursor names an entry,
+/// not a position, and a listing resumed after entries came and went lists
+/// each one that stayed exactly once), until `out` holds `max_entries`
+/// entries, counting those it held before.
 pub fn fill_readdir<N: Into<Vec<u8>>>(
     out: &mut Vec<DirEntry>,
     cursor: u64,
     max_entries: usize,
-    entries: impl IntoIterator<Item = (u64, Ino, InodeType, N)>,
+    entries: impl IntoIterator<Item = (u64, (Ino, InodeType, N))>,
 ) {
-    // Every key is checked, past a full page too, so an order bug shows on
-    // any listing (debug builds); a release build stops at a full page.
+    // Every key's order is checked, before the cursor and past a full page
+    // too, so an order bug shows on any listing (Lumen's builds all keep
+    // debug assertions, its release kernel too).
     let mut last = None;
-    for (key, ino, inode_type, name) in entries {
+    for (key, (ino, inode_type, name)) in entries {
         debug_assert!(last.is_none_or(|l| l < key), "readdir keys not ascending");
         last = Some(key);
-        if out.len() >= max_entries {
-            if cfg!(debug_assertions) {
-                continue;
-            }
-            break;
-        }
-        if key >= cursor {
+        if key >= cursor && out.len() < max_entries {
             out.push(DirEntry { ino, inode_type, name: name.into(), next_cursor: key + 1 });
         }
     }
 }
 
-/// The seven namespace operations of a filesystem whose names never change
-/// (`create`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`, `rename`),
-/// each `-EROFS`, inside its `impl VfsInode`. The caller's crate has
-/// `extern crate alloc`.
+/// The seven namespace operations of a filesystem whose names no caller can
+/// change (`create`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`,
+/// `rename`), each `-EROFS`, inside its `impl VfsInode`.
 #[macro_export]
 macro_rules! fixed_namespace_ops {
     () => {
@@ -48,7 +49,7 @@ macro_rules! fixed_namespace_ops {
             &self,
             _name: &[u8],
             _mode: u16,
-        ) -> Result<::alloc::sync::Arc<dyn $crate::VfsInode>, $crate::VfsError> {
+        ) -> Result<$crate::pseudo::__Arc<dyn $crate::VfsInode>, $crate::VfsError> {
             Err($crate::VfsError::RoFs)
         }
 
@@ -56,7 +57,7 @@ macro_rules! fixed_namespace_ops {
             &self,
             _name: &[u8],
             _mode: u16,
-        ) -> Result<::alloc::sync::Arc<dyn $crate::VfsInode>, $crate::VfsError> {
+        ) -> Result<$crate::pseudo::__Arc<dyn $crate::VfsInode>, $crate::VfsError> {
             Err($crate::VfsError::RoFs)
         }
 
@@ -71,7 +72,7 @@ macro_rules! fixed_namespace_ops {
         fn link(
             &self,
             _name: &[u8],
-            _target: &::alloc::sync::Arc<dyn $crate::VfsInode>,
+            _target: &$crate::pseudo::__Arc<dyn $crate::VfsInode>,
         ) -> Result<(), $crate::VfsError> {
             Err($crate::VfsError::RoFs)
         }
@@ -80,14 +81,14 @@ macro_rules! fixed_namespace_ops {
             &self,
             _name: &[u8],
             _target: &[u8],
-        ) -> Result<::alloc::sync::Arc<dyn $crate::VfsInode>, $crate::VfsError> {
+        ) -> Result<$crate::pseudo::__Arc<dyn $crate::VfsInode>, $crate::VfsError> {
             Err($crate::VfsError::RoFs)
         }
 
         fn rename(
             &self,
             _old_name: &[u8],
-            _new_dir: &::alloc::sync::Arc<dyn $crate::VfsInode>,
+            _new_dir: &$crate::pseudo::__Arc<dyn $crate::VfsInode>,
             _new_name: &[u8],
             _flags: $crate::RenameFlags,
         ) -> Result<(), $crate::VfsError> {
@@ -103,15 +104,23 @@ mod tests {
 
     use super::*;
 
+    /// What `fill_readdir` takes, as a list.
+    type Entries = Vec<(u64, (Ino, InodeType, Vec<u8>))>;
+
     /// devfs-like keys (0, 1, 2) and procfs-like ones with a gap (0x103,
     /// 0x107), each named after its key.
-    fn entries() -> Vec<(u64, Ino, InodeType, Vec<u8>)> {
+    fn entries() -> Entries {
         [0u64, 1, 2, 0x103, 0x107]
             .into_iter()
             .map(|k| {
-                (k, k + 10, if k < 2 { InodeType::Dir } else { InodeType::File }, std::format!("{k}").into_bytes())
+                (k, (k + 10, if k < 2 { InodeType::Dir } else { InodeType::File }, std::format!("{k}").into_bytes()))
             })
             .collect()
+    }
+
+    /// `keys`, each a file named after itself.
+    fn keyed(keys: &[u64]) -> Entries {
+        keys.iter().map(|&k| (k, (k + 10, InodeType::File, std::format!("{k}").into_bytes()))).collect()
     }
 
     fn listed(cursor: u64, max: usize) -> Vec<(u64, Vec<u8>)> {
@@ -164,10 +173,20 @@ mod tests {
     #[test]
     #[should_panic(expected = "readdir keys not ascending")]
     fn keys_out_of_order_past_a_full_page_still_panic() {
-        let unordered =
-            [(0u64, 10, InodeType::Dir, b"a"), (5, 11, InodeType::File, b"b"), (3, 12, InodeType::File, b"c")];
-        let mut out = Vec::new();
-        fill_readdir(&mut out, 0, 1, unordered.map(|(k, ino, t, n)| (k, ino, t, n.to_vec())));
+        fill_readdir(&mut Vec::new(), 0, 1, keyed(&[0, 5, 3]));
+    }
+
+    #[test]
+    #[should_panic(expected = "readdir keys not ascending")]
+    fn keys_out_of_order_before_the_cursor_still_panic() {
+        fill_readdir(&mut Vec::new(), 6, 64, keyed(&[5, 3, 7]));
+    }
+
+    #[test]
+    #[should_panic(expected = "readdir keys not ascending")]
+    fn a_key_twice_panics() {
+        // A resumed listing would skip the second: its cursor is past both.
+        fill_readdir(&mut Vec::new(), 0, 64, keyed(&[2, 2]));
     }
 
     #[test]
