@@ -5562,7 +5562,23 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     (`raise_links_or_floor`), and by link's and mkdir's undo of a failed
     `Dir::link` (`undo_failed_link`) without; `unlink` and `rmdir`, unable to read
     their directory back (or finding the name on another inode), pin the
-    count they assume. Each kept bound is logged at
+    count they assume. A move that can't read back whether its old entry
+    (after the unlink failed) or its new one (after undoing the link
+    failed) is still there keeps the counts with the source at both names:
+    the source's count from before plus one (at least 3 for a directory)
+    and, for a directory, the new parent's plus one. An entry that did go
+    then leaves a count one high, for `e2fsck`; never one low, which frees
+    an inode that the other name still points at (#322). An exchange's undo
+    that finds a child at neither name keeps the child's count from before
+    rather than writing 0 onto its allocated inode (which `e2fsck` would
+    clear instead of reattaching in `lost+found`); with fewer names it
+    writes the count its names call for (#323). A directory move whose
+    unlink fails after taking the old entry out has moved: it still fixes
+    the old parent's count and, between parents, the child's `..`, and
+    returns the unlink's error (#323). An `rmdir` whose parent can't be read
+    back once the entry is gone pins the parent's count one below its count
+    in memory, and the parent's times move whenever the entry went, whatever
+    failed after (#325). Each kept bound is logged at
     `error` (once per change, naming the inode and its disk count), and so
     is a rename undo that leaves its entries inconsistent or unreadable
     (judged once, from the entries' end state, not per attempt). `create`,

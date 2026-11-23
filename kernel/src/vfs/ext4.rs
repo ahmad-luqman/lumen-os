@@ -1871,7 +1871,11 @@ impl Ext4Inode {
         dname: DirEntryName<'_>,
         child_arc: &Arc<Ext4Inode>,
         child_nlink: u32,
+        parent_nlink: u32,
     ) -> Result<RmdirDiskOutcome, VfsError> {
+        // The parent's count to pin once the entry is gone, if the parent
+        // can't be read back to lower it (#325).
+        let parent_if_unread = Some(parent_nlink.saturating_sub(1));
         let mut child_disk = Inode::read(&inner.ext4, child_arc.disk_inode_index()).map_err(map_ext4_err)?;
         let effective_links =
             inner.apply_nlink_bounds(child_arc.disk_ino, u32::from(child_disk.links_count()).max(child_nlink));
@@ -1909,7 +1913,7 @@ impl Ext4Inode {
                     let remaining = surviving_inode(&inner.ext4, child_arc.disk_inode_index(), true, effective_links);
                     let remaining_nlink =
                         inner.after_entry_gone(child_arc.disk_ino, effective_links, remaining.as_ref());
-                    let (parent_nlink, _) = inner.remove_dotdot_link(parent_ino, None);
+                    let (parent_nlink, _) = inner.remove_dotdot_link(parent_ino, parent_if_unread);
                     Ok(RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err: Some(err) })
                 }
                 Ok(_) | Err(_) => {
@@ -1920,7 +1924,7 @@ impl Ext4Inode {
         }
 
         let remaining_nlink = inner.after_entry_gone(child_arc.disk_ino, effective_links, remaining.as_ref());
-        let (parent_nlink, post_err) = inner.remove_dotdot_link(parent_ino, None);
+        let (parent_nlink, post_err) = inner.remove_dotdot_link(parent_ino, parent_if_unread);
         Ok(RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err })
     }
 
@@ -2248,10 +2252,12 @@ impl Landed {
 /// One child's count after an exchange's undo: with its entries read back
 /// (`here`: at its own name, `there`: at the other's), the count they call
 /// for (its count from before, `orig`, less the entry it lost, plus each
-/// found; at least `two_names`, the count with both, when both are there)
-/// is written ([`Ext4FsInner::write_links_or_pin_retrying`]); unread, it
-/// is raised to `orig` ([`Ext4FsInner::raise_links_or_floor`]). Returns the
-/// least count to keep in memory (`None`: what the disk says).
+/// found; at least `two_names`, the count with both, when both are there;
+/// `orig` when that would be 0, so an allocated inode no entry names never
+/// gets `links_count` 0 and e2fsck reattaches it rather than clearing it,
+/// #323) is written ([`Ext4FsInner::write_links_or_pin_retrying`]); unread,
+/// it is raised to `orig` ([`Ext4FsInner::raise_links_or_floor`]). Returns
+/// the least count to keep in memory (`None`: what the disk says).
 fn child_count_after_undo(
     inner: &mut Ext4FsInner,
     ino: NonZeroU32,
@@ -2266,7 +2272,11 @@ fn child_count_after_undo(
     };
     let slots = u16::from(*here) + u16::from(*there);
     let target = orig.saturating_sub(1).saturating_add(slots);
-    let resolved = if slots >= 2 { target.max(two_names) } else { target };
+    let resolved = match target {
+        _ if slots >= 2 => target.max(two_names),
+        0 => orig,
+        _ => target,
+    };
     let _ = inner.write_links_or_pin_retrying(ino, resolved);
     (resolved > 0 || slots >= 2).then_some(u32::from(resolved))
 }
@@ -2652,8 +2662,6 @@ struct MoveEntry<'n> {
     old_dir_nlink_before: u32,
     orig_old_links: u16,
     orig_np_links: u16,
-    /// Whether the new parent's count had a floor kept in memory.
-    np_had_floor: bool,
 }
 
 /// `disk`, a count read from disk, with `ino`'s bounds applied; with none
@@ -2675,8 +2683,9 @@ impl<'n> MoveEntry<'n> {
     /// `old_dname` from `old_dir`, then, for a directory, fix the old
     /// parent's count (and between parents the child's `..`). A failure with
     /// the old entry still there is undone ([`Self::roll_back`]); one after
-    /// the unlink landed is reported, the move kept; if the old entry can't
-    /// be judged, nothing is undone and only a floor is kept. `Err`: the move
+    /// the unlink landed is reported, the move kept (and a directory's
+    /// parents fixed); if the old entry can't be judged, nothing is undone
+    /// and the counts with the source at both names are kept. `Err`: the move
     /// never started (a write putting the child's or the new parent's
     /// bounded count on disk may have landed first).
     fn run(
@@ -2698,7 +2707,6 @@ impl<'n> MoveEntry<'n> {
         let orig_old_links = inner.bounded_links(&old_disk);
         inner.store_bounded_links(&mut old_disk, orig_old_links)?;
         let mut np_disk = Inode::read(&inner.ext4, new_dir_ino).map_err(map_ext4_err)?;
-        let np_had_floor = inner.nlink.floor(new_dir_ino.get()) > 0;
         let orig_np_links = inner.bounded_links(&np_disk);
         if old_is_dir {
             inner.store_bounded_links(&mut np_disk, orig_np_links)?;
@@ -2714,7 +2722,6 @@ impl<'n> MoveEntry<'n> {
             old_dir_nlink_before,
             orig_old_links,
             orig_np_links,
-            np_had_floor,
         };
         Ok(mv.link_then_unlink(inner, old_disk, np_disk))
     }
@@ -2742,15 +2749,42 @@ impl<'n> MoveEntry<'n> {
                     Some(n) => inner.reconcile_disk_nlink(old_child_ino.get(), n, u32::from(orig_old_links)),
                     None => inner.record_nlink_floor(old_child_ino.get(), u32::from(orig_old_links)),
                 }
+                // A directory still needs the parents' fix-ups the move's
+                // end makes (#323); the unlink's error stays the result.
+                let (sync_old_dir, sync_new_dir) = if self.old_is_dir {
+                    let (old_dir, new_dir, _) = self.fix_parents(inner);
+                    (old_dir, new_dir)
+                } else {
+                    (read_bounded(inner, old_dir_ino), read_bounded(inner, new_dir_ino))
+                };
                 MoveOutcome {
                     moved: Landed::Yes(Err(err)),
                     sync_old_child: clamp_to_bounds(inner, old_child_ino, child_disk_n),
+                    sync_old_dir,
+                    sync_new_dir,
+                }
+            }
+            Ok(_) => {
+                // The name is on another inode: the old entry went.
+                inner.record_nlink_floor(old_child_ino.get(), u32::from(orig_old_links));
+                MoveOutcome {
+                    moved: Landed::No(err),
+                    sync_old_child: read_bounded(inner, old_child_ino),
                     sync_old_dir: read_bounded(inner, old_dir_ino),
                     sync_new_dir: read_bounded(inner, new_dir_ino),
                 }
             }
-            Ok(_) | Err(_) => {
-                inner.record_nlink_floor(old_child_ino.get(), u32::from(orig_old_links));
+            Err(_) => {
+                // The new entry landed and the old one may still be there
+                // (`Dir::unlink` writes the lowered count before it takes the
+                // entry out): keep the counts with the source at both names,
+                // so unlinking either name never frees the inode the other
+                // still names (#322). An old entry that did go leaves them
+                // one high, for e2fsck.
+                inner.raise_links_or_floor(old_child_ino, self.source_at_both_names());
+                if self.old_is_dir {
+                    inner.raise_links_or_floor(new_dir_ino, self.new_parent_at_both_names());
+                }
                 MoveOutcome {
                     moved: Landed::No(err),
                     sync_old_child: read_bounded(inner, old_child_ino),
@@ -2761,12 +2795,37 @@ impl<'n> MoveEntry<'n> {
         }
     }
 
+    /// The source's count with an entry at both names.
+    fn source_at_both_names(&self) -> u16 {
+        self.orig_old_links.saturating_add(1).max(two_name_links(self.old_is_dir))
+    }
+
+    /// The new parent's count with a directory source at both names (its
+    /// `..` counted).
+    fn new_parent_at_both_names(&self) -> u16 {
+        self.orig_np_links.saturating_add(1)
+    }
+
     /// The unlink landed, so the move is done on disk; for a directory, fix
-    /// the old parent's count (between parents one less, as after an
-    /// `rmdir`; within one, the count from before, which the link raised)
-    /// and, between parents, the child's `..`. A failure there is
-    /// reported, the move kept.
+    /// the parents ([`Self::fix_parents`]). A failure there is reported, the
+    /// move kept.
     fn finish(&self, inner: &mut Ext4FsInner) -> MoveOutcome {
+        inner.clear_nlink_bounds(self.old_child_ino.get());
+        let (sync_old_dir, sync_new_dir, res) = self.fix_parents(inner);
+        MoveOutcome {
+            moved: Landed::Yes(res),
+            sync_old_child: Some(u32::from(self.orig_old_links)),
+            sync_old_dir,
+            sync_new_dir,
+        }
+    }
+
+    /// Once the old entry is gone, a directory source's fix-ups: the old
+    /// parent's count (between parents one less, as after an `rmdir`;
+    /// within one, the count from before, which the link raised) and,
+    /// between parents, the child's `..`. Returns the parents' counts for
+    /// memory (`None`: unchanged, as for a file) and the first error.
+    fn fix_parents(&self, inner: &mut Ext4FsInner) -> (Option<u32>, Option<u32>, Result<(), VfsError>) {
         let MoveEntry {
             old_dir_ino,
             new_dir_ino,
@@ -2774,12 +2833,10 @@ impl<'n> MoveEntry<'n> {
             same_parent,
             old_is_dir,
             old_dir_nlink_before,
-            orig_old_links,
             orig_np_links,
             ..
         } = *self;
-        inner.clear_nlink_bounds(old_child_ino.get());
-        let (sync_old_dir, sync_new_dir, res) = if !old_is_dir {
+        if !old_is_dir {
             (None, None, Ok(()))
         } else if same_parent {
             // `Dir::link` wrote the parent's count plus one and the unlink
@@ -2797,20 +2854,14 @@ impl<'n> MoveEntry<'n> {
                 None => dotdot,
             };
             (op_nlink, Some(u32::from(orig_np_links).saturating_add(1)), res)
-        };
-        MoveOutcome {
-            moved: Landed::Yes(res),
-            sync_old_child: Some(u32::from(orig_old_links)),
-            sync_old_dir,
-            sync_new_dir,
         }
     }
 
     /// Undo the link at `new_dname` and put the counts back: as they were if
     /// the new entry is gone, one up for the source (and the new parent, for
-    /// a directory) if it stayed, a floor for the source if it can't be read
-    /// (and for a directory's new parent, only if it had one); the counts
-    /// for memory come back with `err`, the move undone.
+    /// a directory) if it stayed or can't be read (raised on disk, or a
+    /// floor kept, #322); the counts for memory come back with `err`, the
+    /// move undone.
     fn roll_back(&self, inner: &mut Ext4FsInner, err: VfsError) -> MoveOutcome {
         let MoveEntry {
             old_dir_ino,
@@ -2821,7 +2872,6 @@ impl<'n> MoveEntry<'n> {
             old_is_dir,
             orig_old_links,
             orig_np_links,
-            np_had_floor,
             ..
         } = *self;
         rollback_link_entry(&inner.ext4, new_dir_ino, new_dname, old_child_ino, orig_old_links.saturating_add(1));
@@ -2829,9 +2879,8 @@ impl<'n> MoveEntry<'n> {
         if !matches!(new_still_has, Ok(false)) {
             log_rename_undo_failure(inner.dev, "rename", old_dir_ino, new_dir_ino);
         }
-        // The counts with the source at both names.
-        let src_both = orig_old_links.saturating_add(1).max(two_name_links(old_is_dir));
-        let np_both = orig_np_links.saturating_add(1);
+        let src_both = self.source_at_both_names();
+        let np_both = self.new_parent_at_both_names();
         match new_still_has {
             Ok(true) => {
                 let _ = inner.write_links_or_pin(old_child_ino, src_both);
@@ -2846,9 +2895,12 @@ impl<'n> MoveEntry<'n> {
                 }
             }
             Err(_) => {
-                inner.raise_links_or_floor(old_child_ino, orig_old_links);
-                if old_is_dir && np_had_floor {
-                    inner.raise_links_or_floor(new_dir_ino, orig_np_links);
+                // The new entry may still be there, beside the old one: the
+                // counts with both, so unlinking either name never frees the
+                // inode the other still names (#322).
+                inner.raise_links_or_floor(old_child_ino, src_both);
+                if old_is_dir {
+                    inner.raise_links_or_floor(new_dir_ino, np_both);
                 }
             }
         }
@@ -3627,9 +3679,17 @@ impl VfsInode for Ext4Inode {
             None
         };
 
+        let parent_nlink = find_guard_mut(&mut guards, &self_arc).nlink;
         let outcome = {
             let mut inner = self.shared.state.lock();
-            Self::unlink_dir_with_recovery(&mut inner, self.disk_inode_index(), dname, &child_arc, child_nlink)?
+            Self::unlink_dir_with_recovery(
+                &mut inner,
+                self.disk_inode_index(),
+                dname,
+                &child_arc,
+                child_nlink,
+                parent_nlink,
+            )?
         };
 
         let now_ts = self.shared.now();
@@ -3646,14 +3706,14 @@ impl VfsInode for Ext4Inode {
                 // A removed directory gets no change time (as before).
                 let fate = ChildFate::gone(remaining_nlink, now_ts, None);
                 Self::settle_child(&child_arc, child_meta, prepared_detach, fate);
+                // The entry is gone, so the parent was modified whatever
+                // failed after (#325).
+                let self_meta = find_guard_mut(&mut guards, &self_arc);
                 if let Some(p_nlink) = parent_nlink {
-                    let self_meta = find_guard_mut(&mut guards, &self_arc);
                     self_meta.nlink = p_nlink;
-                    if post_err.is_none() {
-                        self_meta.times.modified(now_ts);
-                        self_meta.meta_dirty = true;
-                    }
                 }
+                self_meta.times.modified(now_ts);
+                self_meta.meta_dirty = true;
                 match post_err {
                     Some(e) => Err(e),
                     None => Ok(()),
@@ -4385,10 +4445,11 @@ pub(crate) mod ktest_util {
     use crate::vfs::{KernelVfsTables, MemBlkDev};
 
     /// A block cache over an in-memory device that counts reads and writes
-    /// and fails them on request: one write by its number, two, or every
-    /// write from one on (each counted from the `arm_write*` call that set
-    /// it, which disarms the others), every read or write, syncs, or reads
-    /// of a range.
+    /// and fails them on request: one write by its number (or one that lands
+    /// and still fails), two, three, or every write from one on (each
+    /// counted from the `arm_write*` call that set it, which disarms the
+    /// others), every read or write, syncs, or reads of a range (after some
+    /// of them passed).
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         pub(in crate::vfs) dev: MemBlkDev,
@@ -4399,11 +4460,19 @@ pub(crate) mod ktest_util {
         fail_write_at: AtomicUsize,
         /// A second write to fail, once (`arm_write_pair`); 0 for none.
         fail_write_at2: AtomicUsize,
+        /// A third write to fail, once (`arm_write_triple`); 0 for none.
+        fail_write_at3: AtomicUsize,
+        /// A failed write lands first (`arm_write_landing`): a device that
+        /// wrote the block but reported an error.
+        failed_write_lands: AtomicBool,
         /// Fail every write from this number on (`arm_write_from`); 0 for
         /// none.
         fail_write_from: AtomicUsize,
         /// After that write fails, fail every read until cleared.
         pub reads_fail_after_write_fault: AtomicBool,
+        /// How many failed writes leave reads alone before the two flags
+        /// above take effect (`reads_fail_from_fault`); 0 by default.
+        quiet_faults: AtomicUsize,
         /// After that write fails, fail every read of the range set by
         /// `fail_reads_in` until cleared.
         pub range_reads_fail_after_write_fault: AtomicBool,
@@ -4411,44 +4480,80 @@ pub(crate) mod ktest_util {
         pub fail_writes: AtomicBool,
         /// Fail only `sync` (written blocks stay in the cache, dirty).
         pub fail_syncs: AtomicBool,
-        /// Fail the next `fail_range_reads` reads overlapping `[lo, hi)`.
+        /// Fail the next `fail_range_reads` reads overlapping `[lo, hi)`,
+        /// once `range_skip` more of them have passed.
         range_lo: AtomicU64,
         range_hi: AtomicU64,
         fail_range_reads: AtomicUsize,
+        range_skip: AtomicUsize,
     }
 
     impl FaultCache {
         /// Fail write number `nth` from now (0: none).
         pub fn arm_write(&self, nth: usize) {
-            self.arm_writes(nth, 0, 0);
+            self.arm_writes([nth, 0, 0], 0);
         }
 
         /// Fail writes number `first` and `second` from now.
         pub fn arm_write_pair(&self, first: usize, second: usize) {
-            self.arm_writes(first, second, 0);
+            self.arm_writes([first, second, 0], 0);
+        }
+
+        /// Fail writes number `first`, `second` and `third` from now.
+        pub fn arm_write_triple(&self, first: usize, second: usize, third: usize) {
+            self.arm_writes([first, second, third], 0);
         }
 
         /// Fail every write from number `from` on, counting from now.
         pub fn arm_write_from(&self, from: usize) {
-            self.arm_writes(0, 0, from);
+            self.arm_writes([0, 0, 0], from);
         }
 
-        fn arm_writes(&self, at: usize, at2: usize, from: usize) {
+        /// Write number `nth` from now lands, then reports an error.
+        pub fn arm_write_landing(&self, nth: usize) {
+            self.arm_write(nth);
+            self.failed_write_lands.store(true, Ordering::Release);
+        }
+
+        fn arm_writes(&self, at: [usize; 3], from: usize) {
             self.writes.store(0, Ordering::Release);
-            self.fail_write_at.store(at, Ordering::Release);
-            self.fail_write_at2.store(at2, Ordering::Release);
+            self.failed_write_lands.store(false, Ordering::Release);
+            self.fail_write_at.store(at[0], Ordering::Release);
+            self.fail_write_at2.store(at[1], Ordering::Release);
+            self.fail_write_at3.store(at[2], Ordering::Release);
             self.fail_write_from.store(from, Ordering::Release);
         }
 
         pub fn fail_reads_in(&self, lo: u64, hi: u64, count: usize) {
+            self.fail_reads_in_after(lo, hi, 0, count);
+        }
+
+        /// Start the reads failing after a write fault (the flags) only at
+        /// the `nth` failed write, not the first.
+        pub fn reads_fail_from_fault(&self, nth: usize) {
+            self.quiet_faults.store(nth.saturating_sub(1), Ordering::Release);
+        }
+
+        /// How many of the range's reads are still to fail.
+        pub fn range_reads_left(&self) -> usize {
+            self.fail_range_reads.load(Ordering::Acquire)
+        }
+
+        /// [`Self::fail_reads_in`] once `skip` reads of the range passed.
+        pub fn fail_reads_in_after(&self, lo: u64, hi: u64, skip: usize, count: usize) {
             self.range_lo.store(lo, Ordering::Release);
             self.range_hi.store(hi, Ordering::Release);
+            self.range_skip.store(skip, Ordering::Release);
             self.fail_range_reads.store(count, Ordering::Release);
         }
 
         pub fn clear(&self) {
             self.fail_write_at.store(0, Ordering::Release);
             self.fail_write_at2.store(0, Ordering::Release);
+            self.fail_write_at3.store(0, Ordering::Release);
+            self.failed_write_lands.store(false, Ordering::Release);
+            self.range_skip.store(0, Ordering::Release);
+            self.quiet_faults.store(0, Ordering::Release);
             self.fail_write_from.store(0, Ordering::Release);
             self.reads_fail_after_write_fault.store(false, Ordering::Release);
             self.range_reads_fail_after_write_fault.store(false, Ordering::Release);
@@ -4466,11 +4571,18 @@ pub(crate) mod ktest_util {
                 return Err(BlockError::Io);
             }
             let end = byte_off + dst.len() as u64;
-            if byte_off < self.range_hi.load(Ordering::Acquire)
-                && end > self.range_lo.load(Ordering::Acquire)
-                && self.fail_range_reads.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok()
-            {
-                return Err(BlockError::Io);
+            if byte_off < self.range_hi.load(Ordering::Acquire) && end > self.range_lo.load(Ordering::Acquire) {
+                let armed = self.fail_range_reads.load(Ordering::Acquire) > 0;
+                let skipped = armed
+                    && self.range_skip.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).is_ok();
+                if !skipped
+                    && self
+                        .fail_range_reads
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok()
+                {
+                    return Err(BlockError::Io);
+                }
             }
             self.inner.lock().read_at(byte_off, dst)
         }
@@ -4483,12 +4595,19 @@ pub(crate) mod ktest_util {
             let from = self.fail_write_from.load(Ordering::Acquire);
             if self.fail_write_at.load(Ordering::Acquire) == n
                 || self.fail_write_at2.load(Ordering::Acquire) == n
+                || self.fail_write_at3.load(Ordering::Acquire) == n
                 || (from != 0 && n >= from)
             {
-                if self.reads_fail_after_write_fault.load(Ordering::Acquire) {
+                if self.failed_write_lands.load(Ordering::Acquire) {
+                    // The write is on the device; only its report fails.
+                    let _ = self.inner.lock().write_at(byte_off, src);
+                }
+                let quiet =
+                    self.quiet_faults.try_update(Ordering::AcqRel, Ordering::Acquire, |q| q.checked_sub(1)).is_ok();
+                if !quiet && self.reads_fail_after_write_fault.load(Ordering::Acquire) {
                     self.fail_reads.store(true, Ordering::Release);
                 }
-                if self.range_reads_fail_after_write_fault.load(Ordering::Acquire) {
+                if !quiet && self.range_reads_fail_after_write_fault.load(Ordering::Acquire) {
                     self.fail_range_reads.store(usize::MAX, Ordering::Release);
                 }
                 return Err(BlockError::Io);
@@ -4522,8 +4641,11 @@ pub(crate) mod ktest_util {
             writes: AtomicUsize::new(0),
             fail_write_at: AtomicUsize::new(0),
             fail_write_at2: AtomicUsize::new(0),
+            fail_write_at3: AtomicUsize::new(0),
+            failed_write_lands: AtomicBool::new(false),
             fail_write_from: AtomicUsize::new(0),
             reads_fail_after_write_fault: AtomicBool::new(false),
+            quiet_faults: AtomicUsize::new(0),
             range_reads_fail_after_write_fault: AtomicBool::new(false),
             fail_reads: AtomicBool::new(false),
             fail_writes: AtomicBool::new(false),
@@ -4531,6 +4653,7 @@ pub(crate) mod ktest_util {
             range_lo: AtomicU64::new(0),
             range_hi: AtomicU64::new(0),
             fail_range_reads: AtomicUsize::new(0),
+            range_skip: AtomicUsize::new(0),
         });
         let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&cache) as Arc<dyn BlockCacheBackend>;
         let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "ext4 mount")?;
@@ -6108,8 +6231,9 @@ crate::ktest!(
         // every read, or only the blocks past the inode table (directories
         // and data), so the undo can't read back which entries exist (the
         // read-failure arms of the exchange's and the move's undo, and of
-        // a replaced target's retirement). For each kind of
-        // `SWEPT_RENAMES`:
+        // a replaced target's retirement); and, for a move, two writes, the
+        // second within three of the first, reads failing only after the
+        // second. For each kind of `SWEPT_RENAMES`:
         // - a rename that didn't complete reported an error, moved no
         //   time, and left a target it would have replaced with its count
         //   (put back, or nameless if that failed), not freed;
@@ -6123,14 +6247,11 @@ crate::ktest!(
         // - every name then comes off, and while another name still has
         //   an inode, a new file never gets its number;
         // - for each kind and mode, at least one fault left the undo
-        //   unable to read back (a nameless inode, or #322's state), so
-        //   reads really failed.
-        // Known exception (#322): a move that leaves its source at both
-        // names can keep too low a count, whichever undo left it there (the
-        // unlink failing with its old directory unreadable, or the undo of
-        // the link not knowing whether the new entry went, `roll_back`'s
-        // `Err` arm); in that state, whatever the fault, the source's and
-        // its new parent's counts and the source's removal aren't checked.
+        //   unable to read back (a nameless inode, or a move's source left
+        //   at both names), so reads really failed.
+        // A move's source left at both names is checked as any other state
+        // (#322: its count, and its new parent's for a directory, are those
+        // with both names, whichever undo left it there).
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -6140,9 +6261,23 @@ crate::ktest!(
             let target = dst_name == b"t";
             let img = swept_rename_image(is_dir, target, 254)?;
             let flags = RenameFlags(if exchange { RenameFlags::EXCHANGE } else { 0 });
+            let total = {
+                let m = mount(img.clone(), 254)?;
+                let (a, b) = swept_dirs(&m.root)?;
+                m.cache.arm_write(0);
+                a.rename(b"s", &b, dst_name, flags).map_err(|_| "rename without a fault")?;
+                m.cache.writes.load(O::Acquire)
+            };
+            // Each write failing alone; and, for a move, two (the second
+            // within three of the first) with reads failing only after the
+            // second, so the undo of the first can read its entries and then
+            // fails itself unread (`roll_back`'s read-failure arm).
+            let pairs =
+                (1..=total).filter(|_| !exchange).flat_map(|c1| (c1 + 1..=c1 + 3).map(move |c2| (c1, Some(c2))));
+            let faults: Vec<(usize, Option<usize>)> = (1..=total).map(|k| (k, None)).chain(pairs).collect();
             for all_reads in [true, false] {
-                let (mut k, mut errs, mut nameless, mut known) = (1, 0, 0, 0);
-                loop {
+                let (mut errs, mut nameless, mut doubled) = (0, 0, 0);
+                for &(c1, c2) in &faults {
                     let m = mount(img.clone(), 254)?;
                     let (a, b) = swept_dirs(&m.root)?;
                     let s = a.lookup(b"s").map_err(|_| "s")?;
@@ -6154,7 +6289,13 @@ crate::ktest!(
                     let stamped: Vec<&Arc<dyn VfsInode>> = [&s, &a, &b].into_iter().chain(t.as_ref()).collect();
                     let times_before = change_times(&stamped)?;
                     set_clock(&m.fs, Some(Timespec { sec: 1_900_000_000, nsec: 0 }));
-                    m.cache.arm_write(k);
+                    match c2 {
+                        Some(c2) => {
+                            m.cache.arm_write_pair(c1, c2);
+                            m.cache.reads_fail_from_fault(2);
+                        }
+                        None => m.cache.arm_write(c1),
+                    }
                     if all_reads {
                         m.cache.reads_fail_after_write_fault.store(true, O::Release);
                     } else {
@@ -6162,12 +6303,7 @@ crate::ktest!(
                         m.cache.range_reads_fail_after_write_fault.store(true, O::Release);
                     }
                     let res = a.rename(b"s", &b, dst_name, flags);
-                    let reached = m.cache.writes.load(O::Acquire) >= k;
                     m.cache.clear();
-                    if !reached {
-                        res.map_err(|_| "rename without a fault")?;
-                        break;
-                    }
                     errs += usize::from(res.is_err());
 
                     // Which names hold which inode, on disk.
@@ -6192,8 +6328,7 @@ crate::ktest!(
                         }
                     }
                     drop(stamped);
-                    let both = !exchange && s_names == 2; // #322
-                    known += usize::from(both);
+                    doubled += usize::from(!exchange && s_names == 2);
                     for (inode, source) in core::iter::once((&s, true)).chain(t.as_ref().map(|t| (t, false))) {
                         for at in [&at_src, &at_dst].into_iter().flatten().filter(|i| i.ino() == inode.ino()) {
                             kassert!(swept_holds(at, source)?);
@@ -6208,10 +6343,8 @@ crate::ktest!(
                     let subdirs = |at: &Option<Arc<dyn VfsInode>>| {
                         u32::from(at.as_ref().is_some_and(|i| i.inode_type() == InodeType::Dir))
                     };
-                    if !both {
-                        kassert!(s.stat().map_err(|_| "stat s")?.nlink >= s_names + dir_extra);
-                        kassert!(b.stat().map_err(|_| "stat b")?.nlink >= 2 + subdirs(&at_dst));
-                    }
+                    kassert!(s.stat().map_err(|_| "stat s")?.nlink >= s_names + dir_extra);
+                    kassert!(b.stat().map_err(|_| "stat b")?.nlink >= 2 + subdirs(&at_dst));
                     if let Some(t) = &t {
                         let t_names = names_of(t.ino());
                         if t_names > 0 {
@@ -6227,8 +6360,7 @@ crate::ktest!(
 
                     // Every name comes off; while another still names an
                     // inode, a new file doesn't get its number.
-                    let cleared = if both { t.as_ref() } else { Some(&s) };
-                    for inode in cleared.into_iter().chain(t.as_ref().filter(|_| !both)) {
+                    for inode in core::iter::once(&s).chain(t.as_ref()) {
                         let names: Vec<(&Arc<dyn VfsInode>, &[u8])> = [(&a, &b"s"[..]), (&b, dst_name)]
                             .into_iter()
                             .filter(|(dir, name)| dir.lookup(name).is_ok_and(|i| i.ino() == inode.ino()))
@@ -6249,15 +6381,15 @@ crate::ktest!(
                     }
                     drop((s, t, a, b, m));
                     kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
-                    k += 1;
                 }
                 crate::ktest::diag(format_args!(
-                    "{kind}, {}: {} writes, {errs} failed, {nameless} inodes left nameless, {known} #322",
+                    "{kind}, {}: {total} writes, {} faults, {errs} failed, {nameless} inodes left nameless, \
+                     {doubled} sources left at both names",
                     if all_reads { "every read failing" } else { "reads past the inode table failing" },
-                    k - 1
+                    faults.len()
                 ));
                 kassert!(errs >= 1);
-                kassert!(nameless + known >= 1);
+                kassert!(nameless + doubled >= 1);
             }
         }
         Ok(())
@@ -6344,6 +6476,222 @@ crate::ktest!(
             ));
             kassert!(orphaned >= 1 && kept >= 1 && landed >= 1);
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_directory_move_that_commits_before_failing_fixes_its_parents() {
+        // A directory move from `a` to `b` (to a free name, and over an
+        // empty directory) and within `a`, with each write in turn landing
+        // on the disk but reporting an error, as a device can. Wherever the
+        // move committed (the source at its new name, the old name gone),
+        // error or not, its parents are fixed as after a move that
+        // succeeded (#323): the source's `..` names its new parent, and each
+        // parent's count, on disk and in memory, is what its entries call
+        // for. Each kind has at least one such move that reported an error:
+        // the unlink of the old name failing after it took the entry out.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let nlink = |i: &Arc<dyn VfsInode>| i.stat().map(|st| st.nlink).map_err(|_| "stat");
+        // (kind, a target in `b`, the new name, within `a`)
+        let kinds: [(&str, bool, &[u8], bool); 3] =
+            [("movedir", false, b"s", false), ("overdir", true, b"t", false), ("withindir", false, b"s2", true)];
+        for (kind, target, dst_name, within) in kinds {
+            let img = swept_rename_image(true, target, 258)?;
+            let (mut k, mut committed, mut committed_err) = (1, 0, 0);
+            loop {
+                let m = mount(img.clone(), 258)?;
+                let (a, b) = swept_dirs(&m.root)?;
+                let s = a.lookup(b"s").map_err(|_| "s")?;
+                let to = if within { &a } else { &b };
+                m.cache.arm_write_landing(k);
+                let res = a.rename(b"s", to, dst_name, RenameFlags(0));
+                let reached = m.cache.writes.load(O::Acquire) >= k;
+                m.cache.clear();
+                let ro = remount_ro(&m, 259)?;
+                let (ro_a, ro_b) = swept_dirs(&ro.root_inode())?;
+                let ro_to = if within { &ro_a } else { &ro_b };
+                let moved = ro_to.lookup(dst_name).ok().filter(|i| i.ino() == s.ino());
+                if let Some(moved) = moved.filter(|_| ro_a.lookup(b"s").is_err()) {
+                    committed += 1;
+                    committed_err += usize::from(res.is_err());
+                    kassert_eq!(moved.lookup(b"..").map_err(|_| "ro ..")?.ino(), ro_to.ino());
+                    // Within `a`, `a` keeps its subdirectory; between them,
+                    // `b` gains it (in place of the target it replaced).
+                    let (a_links, b_links) = if within { (3, 2) } else { (2, 3) };
+                    if (nlink(&ro_a)?, nlink(&ro_b)?, nlink(&a)?, nlink(&b)?) != (a_links, b_links, a_links, b_links) {
+                        crate::ktest::diag(format_args!(
+                            "{kind} k={k} res={res:?}: a {} on disk, {} in memory; b {} on disk, {} in memory",
+                            nlink(&ro_a)?,
+                            nlink(&a)?,
+                            nlink(&ro_b)?,
+                            nlink(&b)?
+                        ));
+                    }
+                    kassert_eq!((nlink(&ro_a)?, nlink(&a)?), (a_links, a_links));
+                    kassert_eq!((nlink(&ro_b)?, nlink(&b)?), (b_links, b_links));
+                }
+                drop((s, a, b, ro_a, ro_b, ro, m));
+                if !reached {
+                    res.map_err(|_| "rename without a fault")?;
+                    break;
+                }
+                k += 1;
+            }
+            crate::ktest::diag(format_args!(
+                "{kind}: {} writes; committed {committed}, {committed_err} of them with an error",
+                k - 1
+            ));
+            kassert!(committed_err >= 1);
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_failed_exchange_never_writes_a_zero_count_onto_a_nameless_inode() {
+        // An exchange (of files, of directories) between `a` and `b`, with
+        // three writes failing (each within six of the one before) or every
+        // write from one on, so that the undo's own writes and its retries
+        // fail too: each name left holds its inode's data, and an inode the
+        // undo leaves with no name keeps a count above 0, on disk (allocated,
+        // for e2fsck's lost+found, which a count of 0 would clear instead:
+        // #323) and in memory. At least one fault leaves a file nameless.
+        use self::ktest_util::*;
+        use crate::kassert;
+        use core::sync::atomic::Ordering as O;
+        let quota_before = page_cache::DETACHED_QUOTA.used_pages();
+        let flags = RenameFlags(RenameFlags::EXCHANGE);
+        for (kind, is_dir) in [("exchange", false), ("exchangedir", true)] {
+            let img = swept_rename_image(is_dir, true, 260)?;
+            let total = {
+                let m = mount(img.clone(), 260)?;
+                let (a, b) = swept_dirs(&m.root)?;
+                m.cache.arm_write(0);
+                a.rename(b"s", &b, b"t", flags).map_err(|_| "measure")?;
+                m.cache.writes.load(O::Acquire)
+            };
+            let faults = (1..=total)
+                .flat_map(|c1| {
+                    (c1 + 1..=c1 + 6).flat_map(move |c2| (c2 + 1..=c2 + 6).map(move |c3| (c1, Some((c2, c3)))))
+                })
+                .chain((1..=total).map(|k| (k, None)));
+            let (mut runs, mut nameless) = (0, 0);
+            for (c1, rest) in faults {
+                let m = mount(img.clone(), 260)?;
+                let (a, b) = swept_dirs(&m.root)?;
+                let s = a.lookup(b"s").map_err(|_| "s")?;
+                let t = b.lookup(b"t").map_err(|_| "t")?;
+                match rest {
+                    Some((c2, c3)) => m.cache.arm_write_triple(c1, c2, c3),
+                    None => m.cache.arm_write_from(c1),
+                }
+                let res = a.rename(b"s", &b, b"t", flags);
+                m.cache.clear();
+                runs += 1;
+                let ro = remount_ro(&m, 261)?;
+                let (ro_a, ro_b) = swept_dirs(&ro.root_inode())?;
+                let at = [ro_a.lookup(b"s").ok(), ro_b.lookup(b"t").ok()];
+                for (inode, source) in [(&s, true), (&t, false)] {
+                    let names: Vec<&Arc<dyn VfsInode>> =
+                        at.iter().flatten().filter(|i| i.ino() == inode.ino()).collect();
+                    for name in &names {
+                        kassert!(swept_holds(name, source)?);
+                    }
+                    if names.is_empty() {
+                        nameless += 1;
+                        let links = inode.stat().map_err(|_| "stat")?.nlink;
+                        if !still_allocated(&ro, inode)? || links == 0 {
+                            crate::ktest::diag(format_args!(
+                                "{kind} faults {c1} {rest:?} res={res:?}: inode {} has no name, links {:?} on disk, \
+                                 {links} in memory",
+                                inode.ino(),
+                                raw_mode_and_links(&ro, u32::try_from(inode.ino()).map_err(|_| "ino")?)?
+                            ));
+                        }
+                        kassert!(still_allocated(&ro, inode)?);
+                        kassert!(links >= 1);
+                    }
+                }
+                drop((s, t, a, b, at, ro_a, ro_b, ro, m));
+                crate::kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+            }
+            crate::ktest::diag(format_args!("{kind}: {total} writes, {runs} runs; {nameless} inodes left nameless"));
+            if !is_dir {
+                kassert!(nameless >= 1);
+            }
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_rmdir_whose_parent_cant_be_read_back_still_lowers_its_count_and_stamps_it() {
+        // `rmdir a/sub` with one read of `a`'s inode failing, each in turn
+        // (the ones before it passing). Where `sub` went, `a`'s count in
+        // memory is what its entries call for and its times moved, even when
+        // the failed read was the one before lowering its count on disk
+        // (#325: the count is then kept in memory, logged); where `sub`
+        // stayed, the rmdir failed and `a` is as it was. At least one rmdir
+        // took the entry out and then couldn't read `a` back.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let img = {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 262)?;
+            let a = m.root.mkdir(b"a", 0o755).map_err(|_| "mkdir a")?;
+            a.mkdir(b"sub", 0o755).map_err(|_| "mkdir sub")?;
+            m.fs.sync().map_err(|_| "sync")?;
+            drop(a);
+            image(&m)?
+        };
+        let now = Timespec { sec: 1_900_000_000, nsec: 0 };
+        let (mut skip, mut gone, mut unread) = (0, 0, 0);
+        loop {
+            if skip > 64 {
+                return Err("rmdir kept reading its parent");
+            }
+            let m = mount(img.clone(), 262)?;
+            let a = m.root.lookup(b"a").map_err(|_| "a")?;
+            let off = {
+                let inner = m.fs.shared.state.lock();
+                let ino = u32::try_from(a.ino()).map_err(|_| "ino")?;
+                inner.layout.inode_disk_offset(&inner.bcache, ino).map_err(|_| "inode offset")?
+            };
+            let times_before = change_times(&[&a])?;
+            set_clock(&m.fs, Some(now));
+            m.cache.fail_reads_in_after(off, off + 1, skip, 1);
+            let res = a.rmdir(b"sub");
+            let failed_a_read = m.cache.range_reads_left() == 0;
+            m.cache.clear();
+            if !failed_a_read {
+                res.map_err(|_| "rmdir without a fault")?;
+                break;
+            }
+            let ro = remount_ro(&m, 263)?;
+            let ro_a = ro.root_inode().lookup(b"a").map_err(|_| "ro a")?;
+            let nlink = a.stat().map_err(|_| "stat a")?.nlink;
+            if ro_a.lookup(b"sub").is_err() {
+                gone += 1;
+                unread += usize::from(res.is_err());
+                if nlink != 2 || change_times(&[&a])? != [(now, now)] {
+                    crate::ktest::diag(format_args!(
+                        "skip={skip} res={res:?}: sub gone, a has {nlink} links in memory"
+                    ));
+                }
+                kassert_eq!(nlink, 2);
+                kassert_eq!(change_times(&[&a])?, [(now, now)]);
+            } else {
+                kassert!(res.is_err());
+                kassert_eq!(nlink, 3);
+                kassert_eq!(change_times(&[&a])?, times_before);
+            }
+            drop((a, ro_a, ro, m));
+            skip += 1;
+        }
+        crate::ktest::diag(format_args!("{skip} reads of a's inode; sub removed {gone}, {unread} with an error"));
+        kassert!(unread >= 1);
         Ok(())
     }
 );
