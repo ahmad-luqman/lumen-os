@@ -5991,7 +5991,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 - **Open file descriptions vs FD table:**
   - `FdEntry { file: Arc<OpenFile>, cloexec: bool }` in per-process `FdTable`
     (capacity `MAX_FDS = 1024`).
-  - `OpenFile { id: OpenFileId, inode: Arc<VfsInode>, path: Arc<[u8]>, flags: OpenFlags, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64> }`.
+  - `OpenFile { id: OpenFileId, path: Arc<[u8]>, flags: OpenFlags, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64>, open_guard: OpenGuard }`.
+    Its inode is `OpenFile::inode()`, read from its `OpenGuard` (#264): no
+    field of its own that could be pointed at an inode it doesn't keep open.
   - **Opening (#262):** `open_inode_guarded` returns an `Opened` (the
     `OpenGuard` it took before its last liveness check, Gate 6 above, the
     path, and the flags it checked) and `OpenFile::from_opened` takes that
@@ -6157,7 +6159,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `/proc/<pid>/fd` → directory of **magic symlinks** `0`, `1`, `2`, ...:
     `readlink` returns each open FD's path (appending ` (deleted)` if
     unlinked), while traversing `/proc/<pid>/fd/<n>` (e.g. `open`/`stat`)
-    resolves directly to `OpenFile::inode` rather than re-parsing the text
+    resolves directly to `OpenFile::inode()` rather than re-parsing the text
     target.
   - `/proc/<pid>/maps` → strict Linux format
     `{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {}` (followed by the name

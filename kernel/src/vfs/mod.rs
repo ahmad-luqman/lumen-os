@@ -514,7 +514,7 @@ fn check_tmp() -> Result<(), String> {
         .map_err(|e| format!("open /tmp/hello_tmp.txt: {e:?}"))?,
     )
     .map_err(|e| format!("open file /tmp/hello_tmp.txt: {e:?}"))?;
-    let tmp_f = &tmp_of.inode;
+    let tmp_f = tmp_of.inode();
     tmp_f.write_at(0, b"tmpfs-payload").map_err(|e| format!("write /tmp: {e:?}"))?;
     unlink_at(&TABLES, None, b"/tmp/hello_tmp.txt", false).map_err(|e| format!("unlink /tmp: {e:?}"))?;
     if !tmp_f.is_detached() || tmp_f.stat().map_err(|e| format!("stat detached: {e:?}"))?.nlink != 0 {
@@ -764,7 +764,7 @@ fn check_proc_static() -> Result<(), String> {
 /// real `AddressSpace` and `ProcessState`: the run's summary
 /// (`pid=<pid> maps_ok tty_ok`).
 fn check_proc_of_a_process() -> Result<String, String> {
-    use crate::linux::process::{self, ConsoleIo};
+    use crate::linux::process;
     use crate::mm::user_vm::AddressSpace;
     use crate::sched;
     use lumen_vm::Prot;
@@ -786,14 +786,15 @@ fn check_proc_of_a_process() -> Result<String, String> {
         0o644,
     )
     .map_err(|e| format!("open /tmp/proc_fd_test.txt: {e:?}"))?;
-    fd_file.inode.write_at(0, b"magic-fd-bytes").map_err(|e| format!("write fd_file: {e:?}"))?;
+    fd_file.inode().write_at(0, b"magic-fd-bytes").map_err(|e| format!("write fd_file: {e:?}"))?;
     let stdio = process::Stdio::open().map_err(|e| format!("open the process's stdio: {e:?}"))?;
 
     let result: Arc<SleepMutex<Option<Result<String, String>>>> = Arc::new(SleepMutex::new(None));
     let res_clone = Arc::clone(&result);
 
     let handle = sched::spawn_user_on(0, "vfstest-proc", space_for_thread, move || {
-        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None, stdio);
+        let registered = process::RegisteredProcess::register(stdio);
+        let pid = registered.pid();
         // `/proc/<pid>` and `/proc/<pid>/fd/3` as resolved while they exist,
         // for checking what they say once the process and fd are gone.
         let mut proc_nodes: Option<(Arc<dyn VfsInode>, Arc<dyn VfsInode>)> = None;
@@ -890,12 +891,12 @@ fn check_proc_of_a_process() -> Result<String, String> {
 
             Ok(format!("pid={pid} maps_ok tty_ok"))
         })();
-        // Always unregister, a failed check included: a `ProcessState` left in
-        // `ACTIVE_PROCS` would stay in `/proc` for good and pin its address space.
-        // Not open if a check failed before fd 3 was: nothing to close then.
+        // Ended here, a failed check included, for what its console
+        // captured. Fd 3 isn't open if a check failed before it was: nothing
+        // to close then.
         let _ = process::close_current_fd(3);
         let fd_link_after_close = proc_nodes.as_ref().map(|(_, fd)| fd.stat().err());
-        let proc_state = process::take_current();
+        let proc_state = registered.end();
         // These nodes were resolved while the process lived and are still
         // held (the VFS no longer caches them, #263), so procfs's `stat` must
         // say they are gone.

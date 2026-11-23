@@ -63,7 +63,7 @@ fn map(len: u64, prot: u64, flags: u64, fd: Fd, off: u64) -> Result<u64, &'stati
 
 /// The inode descriptor `fd` has open.
 fn inode_of(fd: Fd) -> Result<Inode, &'static str> {
-    Ok(Arc::clone(&fd.file().map_err(|_| "fd")?.inode))
+    Ok(Arc::clone(fd.file().map_err(|_| "fd")?.inode()))
 }
 
 /// Two pages of `ktest_files::pattern` (no zero byte).

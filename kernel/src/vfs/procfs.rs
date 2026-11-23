@@ -609,7 +609,7 @@ fn cached_procfs_inodes() -> (usize, usize) {
 fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
     use lumen_vfs::{ResolveFlags, VfsCacheOps, resolve_path};
 
-    use crate::linux::process::{self, ConsoleIo};
+    use crate::linux::process;
     use crate::mm::user_vm::AddressSpace;
     use crate::sched;
 
@@ -619,7 +619,8 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
     let res_clone = Arc::clone(&result);
 
     let handle = sched::spawn_user_on(0, "procfs-uncached", Arc::clone(&space), move || {
-        let pid = process::register_current(ConsoleIo::Capture, false, Vec::new(), None, stdio);
+        let registered = process::RegisteredProcess::register(stdio);
+        let pid = registered.pid();
         let checks = (|| -> Result<(), String> {
             let tables = super::tables();
             let name = format!("{pid}");
@@ -710,9 +711,9 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
             }
             Ok(())
         })();
-        // Always end the process, a failed check included: one left in
-        // `ACTIVE_PROCS` stays in `/proc` for good.
-        drop(process::take_current());
+        // Ended before the address space is detached, a failed check
+        // included.
+        drop(registered);
         if let Some(detached) = sched::detach_user_space()
             && Arc::strong_count(&detached) == 1
         {
@@ -858,7 +859,7 @@ crate::ktest!(
 
             let file = process::open_kernel_file(PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)
                 .map_err(|_| "open the file")?;
-            let inode = Arc::clone(&file.inode);
+            let inode = Arc::clone(file.inode());
             kassert_eq!(process::install_current_fd(file, false), Ok(3));
             process::close_current_fd(1).map_err(|_| "close fd 1")?;
             kassert_eq!(listed()?, ["0", "2", "3"]);

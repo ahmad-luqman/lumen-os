@@ -360,7 +360,7 @@ pub(super) fn start_dir(dirfd: Dirfd, path: &UserPath) -> Result<Start, u32> {
         Dirfd::Cwd => process::current_cwd(),
         Dirfd::Fd(fd) => {
             let file = fd.file()?;
-            (Arc::clone(&file.inode), Arc::clone(&file.path))
+            (Arc::clone(file.inode()), Arc::clone(&file.path))
         }
     };
     if !path.is_empty() && inode.inode_type() != InodeType::Dir {
@@ -787,7 +787,7 @@ crate::ktest!(
             let dir = mkdir_at(tables, None, DIR, 0o755, 0).map_err(|_| "mkdir")?;
             let open = |path: &[u8], bits: u32| process::open_kernel_file(path, bits, 0o644).map_err(|_| "open");
             let file = open(FILE, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
-            let file_inode = Arc::clone(&file.inode);
+            let file_inode = Arc::clone(file.inode());
             let dir_fd = process::install_current_fd(open(DIR, OpenFlags::O_RDONLY)?, false).map_err(|_| "fd")?;
             let path_fd = process::install_current_fd(open(DIR, OpenFlags::O_PATH)?, false).map_err(|_| "fd")?;
             let file_fd = process::install_current_fd(file, false).map_err(|_| "fd")?;

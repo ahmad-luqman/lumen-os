@@ -152,7 +152,7 @@ fn getdents64(fd: Fd, dirp: UserPtr, count: u32) -> Result<u64, u32> {
     file.require_non_path().map_err(VfsError::to_errno)?;
     // Here, not left to `readdir`: the trait has no default, so this is the
     // one place the rule holds for every filesystem.
-    if file.inode.inode_type() != InodeType::Dir {
+    if file.inode().inode_type() != InodeType::Dir {
         return Err(errno::ENOTDIR);
     }
     let limit = (count as usize).min(GETDENTS_MAX);
@@ -162,7 +162,7 @@ fn getdents64(fd: Fd, dirp: UserPtr, count: u32) -> Result<u64, u32> {
     let (pos, next, buf) = {
         let mut cursor = file.dir_cursor.lock();
         let pos = *cursor;
-        let (next, buf) = pack_entries(&*file.inode, pos, limit)?;
+        let (next, buf) = pack_entries(&**file.inode(), pos, limit)?;
         *cursor = next;
         (pos, next, buf)
     };
@@ -498,7 +498,7 @@ fn ktest_file(path: &str, data: &[u8]) -> Result<(), &'static str> {
     use lumen_vfs::OpenFlags;
     let file = process::open_kernel_file(path.as_bytes(), OpenFlags::O_WRONLY | OpenFlags::O_CREAT, 0o644)
         .map_err(|_| "create a file")?;
-    if !data.is_empty() && file.inode.write_at(0, data) != Ok(data.len()) {
+    if !data.is_empty() && file.inode().write_at(0, data) != Ok(data.len()) {
         return Err("write a file");
     }
     Ok(())

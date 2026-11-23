@@ -126,7 +126,7 @@ fn mmap_fd(addr: u64, len: u64, prot: lumen_vm::Prot, flags: u64, fd: Fd, off: u
         return Err(errno::EINVAL);
     }
     let aligned_len = lumen_vm::align_up_page(len).ok_or(errno::ENOMEM)?;
-    let inode = &file.inode;
+    let inode = file.inode();
     let max_end = if inode.inode_type() == InodeType::File { i64::MAX as u64 } else { u64::MAX };
     if off.checked_add(aligned_len).is_none_or(|end| end > max_end) {
         return Err(errno::EOVERFLOW);

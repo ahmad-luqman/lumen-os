@@ -8172,7 +8172,7 @@ fn gate_vfs(names: &[&str]) -> Gate {
 
 fn read_gate(of: &OpenFile<StdLock<u64>>) -> Result<Vec<u8>, VfsError> {
     let mut buf = [0u8; 32];
-    let n = of.inode.read_at(0, &mut buf)?;
+    let n = of.inode().read_at(0, &mut buf)?;
     Ok(buf[..n].to_vec())
 }
 
@@ -8314,7 +8314,7 @@ fn o_creat_open_of_a_file_unlinked_after_lock_3_opens_a_new_one() {
     assert!(!old.is_detached());
     let new = g.root.child(b"c").expect("a new /c");
     assert!(!Arc::ptr_eq(&new, &old));
-    assert_eq!(of.inode.lock_id(), new.lock_id());
+    assert_eq!(of.inode().lock_id(), new.lock_id());
     assert_eq!(new.open_count(), 1);
     assert_eq!(read_gate(&of).unwrap(), b"");
     drop(of);
@@ -8406,7 +8406,7 @@ fn o_trunc_truncates_only_after_the_reference_is_checked() {
     let of = gate_file(open_inode_guarded(&g.env, None, b"/c", flags, 0o644, 0).unwrap());
     assert!(old.all_hooks_ran());
     let new = g.root.child(b"c").expect("a new /c");
-    assert_eq!(of.inode.lock_id(), new.lock_id());
+    assert_eq!(of.inode().lock_id(), new.lock_id());
     assert_eq!(old.open_count(), 0);
     drop(of);
 
