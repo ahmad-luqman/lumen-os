@@ -439,6 +439,18 @@ fn every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty() {
     assert_eq!(cache.device().durable_snapshot()[..16], [0x12; 16]);
     cache.read_at(0, &mut buf).unwrap();
     assert_eq!(buf, [0x12; 16]);
+
+    // The victim is always the least recently used unpinned block: while
+    // its writeback fails, every miss fails, even with a clean block that
+    // could make room.
+    let cache = BlockCache::new(MemBlockDevice::new(512, 32), 2).unwrap();
+    cache.write_at(0, &[0x56; 16]).unwrap(); // dirty, least recently used
+    cache.read_at(BLOCK_SIZE as u64, &mut buf).unwrap(); // clean
+    for block in [2u64, 3] {
+        cache.device().inject_write_error(BlockError::Io);
+        assert_eq!(cache.read_at(block * BLOCK_SIZE as u64, &mut buf), Err(BlockError::Io));
+    }
+    assert_eq!(cache.stats().cached, 2);
 }
 
 #[test]

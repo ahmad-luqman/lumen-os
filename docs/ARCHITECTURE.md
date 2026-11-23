@@ -5153,6 +5153,9 @@ blocks, extent trees, and file data writeback):
   is ever reported as success or dropped: the block stays dirty and cached
   and the next writeback tries it again
   (`every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty`).
+  The victim is always the least recently used unpinned block, so while its
+  writeback keeps failing every miss fails, reads included, even with a
+  clean block that could make room.
 - **Host tests (`cargo:lumen-bcache`):** verified against an in-memory
   `MemBlockDevice` with LRU eviction order, dirty writeback, RAII pin refusal
   (`CacheFull`), read-only rejection, partial tail block clamps, crash-before-
@@ -5722,8 +5725,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       pressure; the `FaultCache` fails it by number
       (`ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`).
       Its allocators (`alloc_block`, `alloc_contiguous_blocks`, `alloc_inode`)
-      loop forever on a group whose count promises more than its bitmap has,
-      so such a count must never be allocated from.
+      loop forever on a group whose count promises more than its bitmap has
+      (read from the source, and seen hanging a file's writeback on an image
+      made so, #350), so such a count must never be allocated from.
     - After a first error, the adapter's undo writes (above) report nothing
       further: a failed one is pinned in memory or logged, and the operation
       returns the first error.
