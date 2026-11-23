@@ -891,10 +891,13 @@ impl PageCache {
         Ok(to_read)
     }
 
-    /// Write `buf` at file offset `offset`, page by page: into the cached
-    /// page, or else into a new page `fill` makes for the span (a zero page,
-    /// or one holding the file's bytes a partial write keeps), which is then
-    /// inserted ([`Self::insert_new`]). A linked `ext4` file's pages
+    /// Write `buf` at file offset `offset` of a file of `old_size` bytes,
+    /// page by page: into the cached page, or else into a new page `fill`
+    /// makes for the span (a zero page, or one holding the file's bytes a
+    /// partial write keeps), which is then inserted ([`Self::insert_new`]).
+    /// A write starting past the end first zeroes the old last page's bytes
+    /// past `old_size`, as a growth to `offset` would ([`Self::resize`]),
+    /// and they stay zeroed even if the write then fails. A linked `ext4` file's pages
     /// ([`Self::writes_back`]) are marked dirty, and a new one is refused at
     /// the hard limit ([`Self::admit_unreclaimable`]) before `fill` runs. That is an early
     /// answer: `fill` may sleep (a disk read) or be preempted, and another
@@ -902,15 +905,20 @@ impl PageCache {
     /// the page `fill` made. Returns how many bytes were written: an error
     /// (the admission's, `fill`'s or the insert's, either check's refusal
     /// alike) only when it is the first page's, else a short count. `FBig`
-    /// when the range ends past `u64::MAX`. The caller holds the inode's
-    /// Lock 4 and this lock (Lock 5), and sets the size and times.
+    /// when the range ends past `u64::MAX`, before anything changes. The
+    /// caller holds the inode's Lock 4 (`old_size` is the size it read
+    /// under it) and this lock (Lock 5), and sets the size and times.
     pub fn write_from(
         &mut self,
         offset: u64,
         buf: &[u8],
+        old_size: u64,
         mut fill: impl FnMut(&PageSpan) -> Result<Arc<CachePage>, VfsError>,
     ) -> Result<usize, VfsError> {
         let spans = page::spans(offset, buf.len()).ok_or(VfsError::FBig)?;
+        // At or before the end (`offset <= old_size`) nothing is zeroed: the
+        // write overwrites the bytes it extends the file over.
+        self.zero_tail(old_size, offset.max(old_size));
         let dirty = self.writes_back();
         let mut done = 0usize;
         for span in spans {
@@ -949,16 +957,27 @@ impl PageCache {
         self.insert_new(span.index, fresh)
     }
 
-    /// Zero, in the cached page holding it, what a change of the file's size
-    /// from `old_size` to `new_size` must ([`page::resize_tail`]: on a
-    /// shrink, the cut bytes of the new last page; on a growth, or a write
-    /// starting past the end, the old last page's bytes past the old end,
-    /// where a `MAP_SHARED` mapping may have stored), marking that page dirty
-    /// if it is written back ([`Self::writes_back`]). A page not cached is
-    /// left to the filesystem (`ext4` zeroes its disk tail itself). The
-    /// caller holds the inode's Lock 4 and this lock (Lock 5), before it
-    /// sets the new size.
-    pub fn zero_tail(&self, old_size: u64, new_size: u64) {
+    /// The cache's side of a change of the file's size from `old_size` to
+    /// `new_size` (a truncate): on a shrink, drop every page from
+    /// [`page::pages_in`]`(new_size)` on; then zero, in the cached page
+    /// holding it, what [`page::resize_tail`] says (on a shrink, the cut
+    /// bytes of the new last page; on a growth, the old last page's bytes
+    /// past the old end, where a `MAP_SHARED` mapping may have stored),
+    /// marking that page dirty if it is written back
+    /// ([`Self::writes_back`]). A page not cached is left to the filesystem
+    /// (`ext4` zeroes its disk tail itself). The caller holds the inode's
+    /// Lock 4 and this lock (Lock 5), once the filesystem holds the new
+    /// size and before it sets it in memory.
+    pub fn resize(&mut self, old_size: u64, new_size: u64) {
+        if new_size < old_size {
+            self.remove_from(page::pages_in(new_size));
+        }
+        self.zero_tail(old_size, new_size);
+    }
+
+    /// [`Self::resize`]'s zeroing, which a write past the end shares
+    /// ([`Self::write_from`]).
+    fn zero_tail(&self, old_size: u64, new_size: u64) {
         if let Some(tail) = page::resize_tail(old_size, new_size)
             && let Some(cached) = self.pages.get(&tail.index)
         {
@@ -1238,9 +1257,10 @@ crate::ktest!(
         let data = [0x5a; 2 * PAGE_SIZE];
         HARD_LIMIT_WARNED.store(false, Ordering::Release); // one warning, as for the test above
         set_ext4_limits_for_test(Some((usize::MAX, 0)));
-        let new_page = pc.write_from(PAGE_SIZE as u64, &data[..10], &mut fill);
-        let spanning = pc.write_from(PAGE_SIZE as u64 - 6, &data[..16], &mut fill);
-        let in_detached = detached.write_from(2 * PAGE_SIZE as u64, &data[..10], &mut fill);
+        let size = 3 * PAGE_SIZE as u64;
+        let new_page = pc.write_from(PAGE_SIZE as u64, &data[..10], size, &mut fill);
+        let spanning = pc.write_from(PAGE_SIZE as u64 - 6, &data[..16], size, &mut fill);
+        let in_detached = detached.write_from(2 * PAGE_SIZE as u64, &data[..10], size, &mut fill);
         set_ext4_limits_for_test(None);
         kassert_eq!(new_page, Err(VfsError::NoSpc));
         kassert_eq!(spanning, Ok(6)); // the cached page's part

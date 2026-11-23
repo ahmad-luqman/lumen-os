@@ -27,7 +27,6 @@ use ext4plus::inode::{Inode, InodeFlags, InodeMode};
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
 use lumen_vfs::ext4::rdev_from_i_block;
-use lumen_vfs::page;
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
     VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
@@ -1045,12 +1044,10 @@ impl Ext4Inode {
             return Err(VfsError::FBig);
         }
         let buf = &buf[..buf.len().min(usize::try_from(max - offset).unwrap_or(usize::MAX))];
-        // A write starting past the end grows the file to `offset` first.
-        pages.zero_tail(old_size, offset.max(old_size));
         // A new page a write covers only part of starts as the disk's bytes
         // (below the old size) of a linked file, else as zeros. (A detached
         // file's pages are never dirty: `PageCache::writes_back`.)
-        let done = pages.write_from(offset, buf, |span| {
+        let done = pages.write_from(offset, buf, old_size, |span| {
             let cp = CachePage::new_shared()?;
             if !detached && !span.whole_page() && span.page_start() < old_size {
                 cp.write_bytes(0, &self.read_disk_page(span.index, old_size)?);
@@ -4062,15 +4059,14 @@ impl VfsInode for Ext4Inode {
                 }
                 meta.blocks_512 = disk.blocks();
             }
-            pages.remove_from(page::pages_in(new_size));
         } else if new_size > old_size && !detached {
             let inner = self.shared.state.lock();
             let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
             ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
             meta.blocks_512 = disk.blocks();
         }
-        // The cached tail, once the disk holds the new size.
-        pages.zero_tail(old_size, new_size);
+        // The cached pages, once the disk holds the new size.
+        pages.resize(old_size, new_size);
 
         let now_ts = self.shared.now();
         meta.size = new_size;

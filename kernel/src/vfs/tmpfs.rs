@@ -6,7 +6,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use lumen_vfs::page;
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, Escaped, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec,
     VfsError, VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
@@ -222,12 +221,7 @@ impl TmpfsInode {
         if buf.is_empty() {
             return Ok((offset, 0));
         }
-        let mut pages = self.pages.lock();
-        let old_size = meta.size;
-        let _ = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
-        // A write starting past the end grows the file to `offset` first.
-        pages.zero_tail(old_size, offset.max(old_size));
-        let done = pages.write_from(offset, buf, |_| CachePage::new_shared())?;
+        let done = self.pages.lock().write_from(offset, buf, meta.size, |_| CachePage::new_shared())?;
         let written_end = offset + done as u64;
         let now = time::realtime_timespec();
         if written_end > meta.size {
@@ -877,12 +871,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::Inval);
         }
         let mut meta = self.meta.lock();
-        let mut pages = self.pages.lock();
-        let old_size = meta.size;
-        if new_size < old_size {
-            pages.remove_from(page::pages_in(new_size));
-        }
-        pages.zero_tail(old_size, new_size);
+        self.pages.lock().resize(meta.size, new_size);
         let now = time::realtime_timespec();
         meta.size = new_size;
         meta.mtime = now;
