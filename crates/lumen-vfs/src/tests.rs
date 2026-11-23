@@ -3520,15 +3520,24 @@ std::thread_local! {
 }
 
 /// A broken Lock-9 rule, printed to stderr (which libtest doesn't capture)
-/// before the test binary aborts. A panic would only end its own thread:
-/// in a test whose other threads wait on a `Barrier` for the one that
-/// panicked, the run hangs until CI's job timeout and the message is lost.
+/// with a backtrace before the test binary aborts. A panic would only end
+/// its own thread: in a test whose other threads wait on a `Barrier` for
+/// the one that panicked, the run hangs until CI's job timeout and the
+/// message is lost. The abort's cost: the rest of the binary's run goes
+/// unreported (no other test's failure message, no summary), so this line
+/// is the one to fix first.
 fn lock9_violation(msg: core::fmt::Arguments<'_>) -> ! {
     use std::io::Write as _;
-    // libtest names each test's thread after the test; one write, so
+    // libtest names each test's thread after the test, but a thread a test
+    // spawns has no name: the backtrace names the test (a closure in it)
+    // and the `VfsCacheOps` method that broke the rule. One write, so
     // threads aborting at once don't interleave their lines.
     let thread = std::thread::current();
-    let line = format!("{msg} [thread {}]\n", thread.name().unwrap_or("unnamed, spawned by a test"));
+    let line = format!(
+        "{msg} [thread {}]; aborting lumen-vfs's tests, the rest of the run unreported: fix this first\n{}\n",
+        thread.name().unwrap_or("unnamed, spawned by a test"),
+        std::backtrace::Backtrace::force_capture()
+    );
     let _ = std::io::stderr().lock().write_all(line.as_bytes());
     std::process::abort()
 }

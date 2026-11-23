@@ -5728,9 +5728,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     host tests' is `VfsTables<TestLocks>`: `TestLock`, a `std` mutex whose
     guards record which tables their thread holds, which test filesystems
     assert is none in their calls (`assert_test_lock9_free`), and which
-    aborts the test binary, its message on stderr, when a thread takes the
-    tables out of their sub-order or takes one it already holds (a panic
-    would leave a test whose other threads wait on a `Barrier` hanging).
+    aborts the test binary, its message and a backtrace (the method and
+    the test) on stderr, when a thread takes the tables out of their
+    sub-order or takes one it already holds (a panic would leave a test
+    whose other threads wait on a `Barrier` hanging; the abort loses the
+    rest of that run's results).
     `VfsLock::new` isn't `const` (a trait method, on stable Rust), so the
     kernel's `static TABLES` is built by the `const fn
     VfsTables::from_locks(mounts, dentries, inodes)` from locks made by
