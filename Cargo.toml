@@ -5,7 +5,10 @@ members = ["kernel", "crates/*"]
 # The kernel is built for x86_64-unknown-none via `make build`.
 default-members = ["crates/*"]
 # The WASM apps are their own workspace (apps/Cargo.toml), built by `make build`.
-exclude = ["apps"]
+# `vendor/` holds patched copies of crates.io dependencies (`[patch.crates-io]`
+# below), built as dependencies, never as members: Lumen's commands don't
+# lint, format or test them.
+exclude = ["apps", "vendor"]
 
 [workspace.package]
 version = "0.0.1"
@@ -114,6 +117,13 @@ linux-raw-sys = { version = "=0.12.1", default-features = false, features = ["no
 # select synchronous `Send + Sync` `Ext4Read`/`Ext4Write` traits backed by `Arc`
 # and `spin`, matching Lumen's SMP SleepMutex + BlockCache adapter.
 ext4plus = { version = "=0.1.0-rc.2", default-features = false, features = ["sync", "multi-threaded"] }
+
+# `vendor/ext4plus` is ext4plus 0.1.0-rc.2's crate file unpacked (sha256
+# 6c83a722…, the checksum Cargo.lock had for it), with Lumen's fixes on top,
+# each marked `Lumen (#n)` in its source (#313: the htree hash's signedness
+# taken from the superblock).
+[patch.crates-io]
+ext4plus = { path = "vendor/ext4plus" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
