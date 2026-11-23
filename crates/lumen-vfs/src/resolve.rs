@@ -53,8 +53,9 @@ impl fmt::Debug for ResolvedPath {
 #[derive(Clone)]
 pub struct ParentTarget<'a> {
     pub parent: Arc<dyn VfsInode>,
-    /// Private, so that the only way to a name's bytes is a match on
-    /// [`Final`], and only [`resolve_parent`] makes one.
+    /// Private, so a `ParentTarget` comes only from [`resolve_parent`],
+    /// which classifies the component, and a name's bytes come only out of
+    /// a pattern on [`ParentTarget::final_component`]'s [`Final`].
     last: Final<'a>,
     pub has_trailing_slash: bool,
 }
@@ -64,11 +65,18 @@ pub struct ParentTarget<'a> {
 /// Only [`Final::Name`] is an entry a filesystem can create, remove or
 /// rename; for the other three each namespace operation has its own errno
 /// (`mkdirat`'s `-EEXIST`; `rmdir`'s `-EBUSY`, `-EINVAL` and `-ENOTEMPTY`;
-/// ...). A name's bytes come only out of a match, so an operation that
-/// leaves a case out doesn't compile, unless it answers them with a `_`
-/// arm, which `ops.rs` refuses (`clippy::wildcard_enum_match_arm`, denied
-/// there). Stable rustdoc doesn't check a `compile_fail` example's error
-/// code, so each passing twin below, a line apart, keeps the rest honest:
+/// ...). A name's bytes come only out of a pattern on it, so the other
+/// three always get some answer. `ops.rs` reads it only by a `match` on
+/// `final_component()`, which doesn't compile if it leaves a case out;
+/// clippy refuses a `_` or catch-all arm there
+/// (`clippy::wildcard_enum_match_arm`, denied in that file), and a host
+/// test, `ops_reads_final_only_through_a_direct_match`, refuses any other
+/// way of reading one there (`let ... else`, `if let`, `matches!`, a
+/// tuple). Code elsewhere is held to that by convention only.
+///
+/// Stable rustdoc doesn't check a `compile_fail` example's error code, so
+/// each one is followed by a twin that differs only where it should fail
+/// and compiles: it fails for that reason, not another.
 ///
 /// ```compile_fail
 /// use lumen_vfs::resolve::{Final, ParentTarget};
@@ -114,8 +122,10 @@ pub enum Final<'a> {
     Dot,
     /// `..`
     DotDot,
-    /// A name in the parent: never empty, `.` or `..`, and holding neither
-    /// `/` nor NUL; any other bytes, UTF-8 or not (#268).
+    /// A name in the parent. As [`resolve_parent`] makes it (the variant
+    /// itself checks nothing): never empty, `.` or `..`, at most
+    /// `NAME_MAX` bytes, and holding neither `/` nor NUL; any other bytes,
+    /// UTF-8 or not (#268).
     Name(&'a [u8]),
 }
 
@@ -476,8 +486,8 @@ pub(crate) fn resolve_path_with_depth(
 
 /// Resolve the parent directory and final component for namespace-mutating
 /// operations (`open(O_CREAT)`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`, `rename`).
-/// The component is borrowed from `path`: a [`Final::Name`] is its bytes,
-/// UTF-8 or not (#268); a path of only slashes is [`Final::Root`].
+/// A [`Final::Name`] borrows its bytes from `path`, UTF-8 or not (#268); a
+/// path of only slashes is [`Final::Root`], with `has_trailing_slash` set.
 pub fn resolve_parent<'a>(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,

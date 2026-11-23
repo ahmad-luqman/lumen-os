@@ -8922,3 +8922,61 @@ fn not_a_name_errno_per_operation_ahead_of_erofs() {
         assert_eq!(rename(sibling, path, noreplace), VfsError::Exist, "rename NOREPLACE onto {at}");
     }
 }
+
+/// The lines of `src` (Rust source) that get a `Final` other than as a
+/// `match`'s scrutinee, or use a `Final::` pattern other than as a match
+/// arm, `//` comment lines skipped. Rustc's exhaustiveness check and
+/// `clippy::wildcard_enum_match_arm` see only a `match` on a bare `Final`;
+/// this keeps `ops.rs` to that form (no `let ... else`, `if let`,
+/// `matches!`, tuple scrutinee or `Final` held in a variable; #309).
+fn final_outside_a_direct_match(src: &str) -> Vec<(usize, &str)> {
+    fn is_ident(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+    fn direct_match(line: &str) -> bool {
+        let line = match line.strip_prefix("let ") {
+            Some(rest) => match rest.split_once(" = ") {
+                Some((binding, rhs)) if is_ident(binding) => rhs,
+                _ => return false,
+            },
+            None => line,
+        };
+        line.strip_prefix("match ").and_then(|rest| rest.strip_suffix(".final_component() {")).is_some_and(is_ident)
+    }
+    src.lines()
+        .enumerate()
+        .map(|(i, line)| (i + 1, line.trim()))
+        .filter(|(_, line)| !line.starts_with("//"))
+        .filter(|(_, line)| {
+            (line.contains("final_component(") && !direct_match(line))
+                || (line.contains("Final::") && !(line.starts_with("Final::") || line.starts_with("| Final::")))
+        })
+        .collect()
+}
+
+/// #309: `ops.rs` reads a last component only through a `match` on
+/// `final_component()`, so the compiler and clippy see every one.
+#[test]
+fn ops_reads_final_only_through_a_direct_match() {
+    let ops = include_str!("ops.rs");
+    assert!(ops.matches("final_component()").count() >= 6, "the operations' matches went missing");
+    assert_eq!(final_outside_a_direct_match(ops), [], "a `Final` read in ops.rs other than by a `match`");
+
+    let good = "let name = match target.final_component() {\n    Final::Root | Final::Dot | Final::DotDot => \
+                return Err(VfsError::Exist),\n    | Final::Name(name) => name,\n};\n\
+                match new_target.final_component() {\n// if let Final::Name(n) = x {\n";
+    assert_eq!(final_outside_a_direct_match(good), []);
+    for bad in [
+        "let Final::Name(name) = target.final_component() else {",
+        "let name = if let Final::Name(name) = target.final_component() {",
+        "let name = match (target.final_component(), remove_dir) {",
+        "(Final::Name(name), _) => name,",
+        "if matches!(target.final_component(), Final::Name(_)) {",
+        "let last = target.final_component();",
+        "if let Final::Name(name) = last {",
+        "let mut name = match target.final_component() {",
+        "let name = match target.final_component() { Final::Name(n) => n, _ => return Err(e) };",
+    ] {
+        assert_eq!(final_outside_a_direct_match(bad), [(1, bad)], "{bad}");
+    }
+}

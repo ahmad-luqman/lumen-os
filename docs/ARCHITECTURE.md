@@ -5731,17 +5731,23 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `open("symlink", O_NOFOLLOW)` returns `-ELOOP`, **except**
     `open("symlink", O_PATH | O_NOFOLLOW)` which opens an `O_PATH` descriptor
     to the symlink itself.
-  - **The last component (#309):** `resolve_parent` gives a
-    `ParentTarget` (the parent directory, the trailing `/`) whose last
-    component, `final_component()`, is a `Final`: `Root` (a path of only
-    slashes), `Dot`, `DotDot` or `Name(&[u8])` (borrowed from the path;
-    never empty, `.` or `..`). A name's bytes come only out of a match on
-    it, with no wildcard arm (`ops.rs` denies
-    `clippy::wildcard_enum_match_arm`), so each namespace operation (`open` with
-    `O_CREAT`, `mkdir`, `unlink`/`rmdir`, `link`, `symlink`, `rename`)
-    states its own errno for the other three (below; `-EEXIST` for
-    `mkdir`, `link` and `symlink`, and for `O_CREAT | O_EXCL`), ahead of
-    `-EROFS`, and one that leaves a case out doesn't compile.
+  - **The last component (#309):** `resolve_parent` gives a `ParentTarget`
+    (the parent directory, the trailing `/`) whose last component,
+    `final_component()`, is a `Final`: `Root` (a path of only slashes),
+    `Dot`, `DotDot` or `Name(&[u8])` (borrowed from the path; never empty,
+    `.` or `..`). A name's bytes come only out of a pattern on it, so each
+    namespace operation (`open` with `O_CREAT`, `mkdir`, `unlink`/`rmdir`,
+    `link`, `symlink`, `rename`) states its own errno for the other three
+    (below; `-EEXIST` for `mkdir`, `link` and `symlink`, and for `O_CREAT |
+    O_EXCL`; `O_CREAT` without `O_EXCL` resolves the directory `/`, `.` or
+    `..` names, which then gives `-EISDIR` as any directory opened with
+    `O_CREAT`), ahead of `-EROFS`. In `ops.rs` each reads it with a `match`
+    on `final_component()`, so one that leaves a case out doesn't compile;
+    `clippy::wildcard_enum_match_arm`, denied in that file, refuses a `_` or
+    catch-all arm, and the host test
+    `ops_reads_final_only_through_a_direct_match` any other way of reading
+    it there (`let ... else`, `if let`, `matches!`, a tuple). Outside
+    `ops.rs` that is a convention.
   - **Namespace operations check in Linux's order** (`unlink_at`,
     `rename_at2`, `link_at` as v6.12's `fs/namei.c`; `readlink_at` as
     `fs/stat.c`; #254):

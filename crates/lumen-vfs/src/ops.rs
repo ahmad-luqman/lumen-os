@@ -2,9 +2,15 @@
 //! `link`, `symlink`, `readlink`, `renameat2`) coordinating `resolve_path`,
 //! Lock-9 cache invalidation, Lock-3 `rename_lock`, and Gate 6 detach rules.
 
-// Every match on a `resolve::Final` here names each case, so an operation
-// that leaves one out doesn't compile, and `make lint` refuses a `_` arm
-// that would answer them all alike (#309).
+// A last component (`resolve::Final`) is read here only as the scrutinee of
+// a `match` on `final_component()` whose arms are `Final::` patterns (no
+// `let ... else`, `if let`, `matches!`, tuple, or `Final` held in a
+// variable: the host test `ops_reads_final_only_through_a_direct_match`
+// refuses those), so an operation that leaves a case out doesn't compile,
+// and `make lint` refuses a `_` or catch-all arm answering them all alike
+// (#309). The deny covers every enum matched in this file, not only
+// `Final`: name the cases of the others too, or allow it on one match with
+// the reason.
 #![deny(clippy::wildcard_enum_match_arm)]
 
 use alloc::sync::Arc;
@@ -339,11 +345,8 @@ fn open_once(
 
         'follow: loop {
             let target = resolve_parent_with_depth(env, cur_start_dir.as_ref(), &cur_path, &mut symlink_depth)?;
-            // `.` or `..`: the directory it names, or `EEXIST` with `O_EXCL`.
+            // `.` or `..` (without `O_EXCL`): the directory it names.
             let mut dots_dir = |dots: &[u8]| -> Result<Arc<dyn VfsInode>, VfsError> {
-                if flags.has_excl() {
-                    return Err(VfsError::Exist);
-                }
                 Ok(resolve_path_with_depth(
                     env,
                     Some(&target.parent),
@@ -354,12 +357,8 @@ fn open_once(
                 .inode)
             };
             let name = match target.final_component() {
-                Final::Root => {
-                    if flags.has_excl() {
-                        return Err(VfsError::Exist);
-                    }
-                    break 'follow cross_mounts_down(env, Arc::clone(&target.parent));
-                }
+                Final::Root | Final::Dot | Final::DotDot if flags.has_excl() => return Err(VfsError::Exist),
+                Final::Root => break 'follow cross_mounts_down(env, Arc::clone(&target.parent)),
                 Final::Dot => break 'follow dots_dir(b".")?,
                 Final::DotDot => break 'follow dots_dir(b"..")?,
                 Final::Name(name) => name,
@@ -622,12 +621,11 @@ pub fn unlink_at(
     let target = resolve_parent(env, start_dir, path)?;
     // A last component that isn't a name: Linux's `do_unlinkat` says
     // `-EISDIR` for all three; `do_rmdir` tells them apart.
-    let name = match (target.final_component(), remove_dir) {
-        (Final::Root | Final::Dot | Final::DotDot, false) => return Err(VfsError::IsDir),
-        (Final::Root, true) => return Err(VfsError::Busy),
-        (Final::Dot, true) => return Err(VfsError::Inval),
-        (Final::DotDot, true) => return Err(VfsError::NotEmpty),
-        (Final::Name(name), _) => name,
+    let name = match target.final_component() {
+        Final::Root => return Err(if remove_dir { VfsError::Busy } else { VfsError::IsDir }),
+        Final::Dot => return Err(if remove_dir { VfsError::Inval } else { VfsError::IsDir }),
+        Final::DotDot => return Err(if remove_dir { VfsError::NotEmpty } else { VfsError::IsDir }),
+        Final::Name(name) => name,
     };
     if env.fs_read_only(target.parent.dev_id()) {
         return Err(VfsError::RoFs);
