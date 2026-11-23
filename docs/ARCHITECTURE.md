@@ -5642,11 +5642,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     (#325). Each kept bound is logged at `error` (once per change, naming
     the inode and its disk count), and so is a rename undo that leaves its
     entries inconsistent or unreadable (judged once, from the entries' end
-    state, not per attempt): a move that can't tell whether its old entry
-    went, and a directory move whose fix-ups fail after its unlink failed
-    past the entry, log it too. `create`,
-    `mkdir` and `symlink` release the inode they allocated when linking it
-    fails (e.g. `ENOSPC` growing the directory).
+    state, not per attempt), a move that can't tell whether its old entry
+    went among them. A directory move whose fix-ups fail after its unlink
+    failed past the entry (it moved; no undo runs) logs that, naming the
+    directory, both parents and the error. `create`, `mkdir` and `symlink`
+    release the inode they allocated when linking it fails (e.g. `ENOSPC`
+    growing the directory).
   - **Rename over an existing target:** the target is held, not removed,
     until the source has landed at its name. Its entry is taken out with
     its `links_count` unchanged (`Dir::unlink` is handed one more than the

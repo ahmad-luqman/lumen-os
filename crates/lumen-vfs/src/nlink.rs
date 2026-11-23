@@ -107,16 +107,20 @@ impl NlinkBounds {
     /// `landed`, or failed with the disk then reading `disk`. Either way a
     /// bound whose ceiling is below `min` goes, floor and all (the floor is
     /// at most that ceiling, so below `min` too), since [`Self::apply`] would
-    /// cap the count under it; then a landed raise drops the floor
-    /// ([`Self::clear_floor`]) and a failed one keeps at least `min`
-    /// ([`Self::raise_floor`], nothing when the disk holds it). Whether the
-    /// floor kept changed.
+    /// cap the count under it; then a landed raise drops a floor it covers
+    /// (one at most `min`: [`Self::clear_floor`]; a higher floor stays, the
+    /// disk holding only `min`) and a failed one keeps at least `min`
+    /// ([`Self::raise_floor`], nothing when the disk holds it). Returns
+    /// whether a floor was newly kept or raised (what the caller logs; a
+    /// bound dropped is not reported).
     pub fn raised_to(&mut self, ino: u32, min: u32, landed: bool, disk: Option<u32>) -> bool {
         if self.ceiling(ino).is_some_and(|c| c < min) {
             self.bounds.remove(&ino);
         }
         if landed {
-            self.clear_floor(ino);
+            if self.floor(ino) <= min {
+                self.clear_floor(ino);
+            }
             false
         } else {
             self.raise_floor(ino, disk, min)
@@ -239,10 +243,15 @@ mod tests {
         // A ceiling at or above the raise stays.
         assert!(b.reconcile(2, None, 3));
         assert!(!b.raised_to(2, 2, true, None));
-        assert_eq!((b.floor(2), b.ceiling(2)), (0, Some(3)));
+        assert_eq!((b.floor(2), b.ceiling(2)), (3, Some(3))); // the floor above the raise stays too
         assert!(b.reconcile(3, None, 3));
         assert!(!b.raised_to(3, 3, false, None)); // the floor was 3 already
         assert_eq!((b.floor(3), b.ceiling(3)), (3, Some(3)));
+        // A landed raise below a floor leaves the floor: the disk holds
+        // only the raise.
+        assert!(b.raise_floor(4, None, 4));
+        assert!(!b.raised_to(4, 2, true, None));
+        assert_eq!((b.floor(4), b.apply(4, 2)), (4, 4));
     }
 
     #[test]

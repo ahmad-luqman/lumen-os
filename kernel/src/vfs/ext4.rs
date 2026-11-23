@@ -4461,11 +4461,11 @@ pub(crate) mod ktest_util {
     use crate::vfs::{KernelVfsTables, MemBlkDev};
 
     /// A block cache over an in-memory device that counts reads and writes
-    /// and fails them on request: one write by its number (or one that lands
-    /// and still fails), two, three, or every write from one on (each
-    /// counted from the `arm_write*` call that set it, which disarms the
-    /// others), every read or write, syncs, or reads of a range (after some
-    /// of them passed).
+    /// and fails them on request: one write by its number, two, three, or
+    /// every write from one on (each counted from the `arm_write*` call that
+    /// set it, which disarms the others; any of them may land on the device
+    /// and still fail, `failed_writes_land`), every read or write, syncs, or
+    /// reads of a range (after some of them passed).
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         pub(in crate::vfs) dev: MemBlkDev,
@@ -4475,10 +4475,12 @@ pub(crate) mod ktest_util {
         /// `arm_write*` call), each once (`arm_write`, `arm_write_pair`,
         /// `arm_write_triple`); 0 for none.
         fail_write_at: [AtomicUsize; 3],
-        /// The armed writes land before they fail (`failed_writes_land`,
-        /// after an `arm_write*` call, which resets it): a device that wrote
-        /// the block but reported an error. This kernel's block cache never lands a failed write of
-        /// one block; the states this leads to are real all the same (a
+        /// Every write the armed faults fail (by number, or from one on)
+        /// lands before it fails (`failed_writes_land`, after an
+        /// `arm_write*` call, which resets it): a device that wrote the
+        /// block but reported an error. This kernel's block cache never
+        /// lands a failed write of one block; the states this leads to are
+        /// real all the same (a
         /// `delete_file` or a directory's truncate failing after the entry
         /// went).
         failed_write_lands: AtomicBool,
@@ -6953,6 +6955,9 @@ crate::ktest!(
             gone[0], unread[0], gone[1], unread[1]
         ));
         // The first leg ended: an rmdir with no read of `a` left to fail.
+        if !first_done {
+            crate::ktest::diag(format_args!("rmdir read a's inode more than 64 times: the first leg never ended"));
+        }
         kassert!(first_done);
         kassert!(unread[0] >= 1 && unread[1] >= 1);
         Ok(())
