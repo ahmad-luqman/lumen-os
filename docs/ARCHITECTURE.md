@@ -5147,18 +5147,20 @@ blocks, extent trees, and file data writeback):
   "on the device". The device's error comes back later, from whichever call
   writes the block back: `sync` or `flush_blocks`, or the `read_at`,
   `write_at` or pin whose miss needed the block's slot (a read can thus fail
-  with another block's write error). A `write_at` fails at once only on a
-  miss (that eviction failing, a failed pre-read of a partial block, or
-  every slot pinned) or on a block pinned at that moment; the bytes for
+  with another block's write error). Besides its `ReadOnly` and
+  `OutOfRange` refusals, a `write_at` fails at once only on a miss (that
+  eviction failing, a failed pre-read of a partial block, or every slot
+  pinned) or on a block pinned at that moment; the bytes for
   that block and any after it are then cached nowhere, while a write
   spanning blocks keeps its earlier blocks' bytes, dirty (no kernel caller
   spans blocks). No failed device write is ever reported as success or
   dropped: the block stays dirty and cached and the next writeback tries it
   again (`every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty`).
-  Two consequences of the order:
-  - `sync` and `flush_blocks` stop at the first block that fails, so the
-    dirty blocks after it stay unwritten and the device unflushed, and a
-    block that keeps failing keeps every higher one off the device. A file's
+  Two consequences of how blocks are picked for writeback:
+  - `sync` and `flush_blocks` go in ascending order and stop at the first
+    block that fails, so the dirty blocks after it stay unwritten and the
+    device unflushed, and a block that keeps failing keeps every higher one
+    from being synced (an eviction may still write one back). A file's
     `fsync` is a whole-cache sync, so it can report another block's error.
   - The eviction victim is always the least recently used unpinned block,
     so while its writeback keeps failing, every miss that needs an eviction
@@ -5715,52 +5717,85 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       error comes from the next `FileSystem::sync` or a file's `fsync`,
       `fdatasync` or `msync(MS_SYNC)` (`EIO`, the blocks kept dirty for the
       next sync; `ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next`
-      checks `fsync`, `fdatasync` and `sync`), or from the eviction that
-      writes a block back, to whichever read or write missed then (a lookup
-      or a page read can get another block's write error). A sync stops at
-      the first block that fails (above), so an `fsync` can report another
-      file's block and leave its own unwritten.
+      checks `fsync`, `fdatasync` and `FileSystem::sync`), or from the
+      eviction that writes a block back, to whichever read or write missed
+      then (a lookup or a page read can get another block's write error,
+      unless `ext4plus` drops it, below). A sync stops at the first block
+      that fails (above), so an `fsync` can report another file's block and
+      leave its own unwritten.
     - `sync(2)` returns 0 whatever `vfs::sync_all` returns (Linux's
       behaviour), and global reclaim's page writeback has no caller: a
-      failing streak is logged once per inode, its pages kept dirty.
-    - `ext4plus` 0.1.0-rc.2 frees a file's block range again block by block
-      when the range free fails (`file_blocks/utils.rs`,
+      failing streak is logged once per inode, its pages kept dirty. Once
+      dirty pages can't be written back, the `ext4` page cache reaches its
+      hard limit and other files' writes get `ENOSPC` (the page cache,
+      above).
+    - `ext4plus` 0.1.0-rc.2 frees an extent-mapped file's block range again
+      block by block when the range free fails (`file_blocks/utils.rs`,
       `free_freed_ranges`), so a write that fails inside it leaves the
-      unlink `Ok` (probed: unlink and rmdir; truncate and a rename's
-      replaced target reach the same code, read from the source).
-      `free_blocks` and `free_block` (`lib.rs`) raise the group's and the
-      superblock's free counts in memory before writing them and never put
-      them back, so when the failed write is the descriptor write carrying
-      the raised group count, or the superblock write, the retry counts the
-      blocks twice and writes that too-high count (`e2fsck` fixes it); a
-      failed bitmap byte or bitmap-checksum write doubles nothing
+      operation `Ok` (unlink and rmdir probed in the kernel, truncate on the
+      host in #351's review; a rename's replaced target reaches the same
+      code, read from the source). A block-mapped file's free
+      (`block_map.rs`) has no retry and returns the error. `free_blocks` and
+      `free_block` (`lib.rs`) raise each count in memory just before writing
+      it and never put it back, so a failure at or after the descriptor
+      write carrying the raised group count doubles the group's count, and
+      a failed superblock write doubles the superblock's as well; a failed
+      bitmap byte or bitmap-checksum write doubles nothing
       (`ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`,
-      by the `FaultCache`). Under the real block cache only a miss can fail,
-      and the bitmap bytes and the count's descriptor write are hits (the
-      block was just read or written), so it takes cache pressure and a
-      transient device error (a persistent one fails the retry's own miss
-      too), and only the superblock write can double a count.
+      by the `FaultCache`). `e2fsck` recomputes the counts (read, not
+      tested).
     - `ext4plus`'s `Extent::allocate` (`extent.rs`) retries any failed
       `alloc_contiguous_blocks(n)` with one block fewer and gives `NoSpace`
       at 0. It runs for every new block a write needs: page writeback
       (`fsync`, `fdatasync`, `msync`, `sync`, reclaim), long symlink
       targets, truncate's tail zeroing. `alloc_contiguous_blocks` writes the
-      bitmap bytes, the descriptor (checksum, then count) and the superblock,
-      lowering the counts in memory first, and puts nothing back. On 4 KiB
-      blocks a page needs 1 block, so a failed allocation write comes back
-      as `NoSpc`, not `Io`, and leaves the bit it set owned by no extent;
-      until the count's write lands the group's count is above its bitmap
+      bitmap bits, then the descriptor's checksum, then lowers the group's
+      count in memory and writes it, then the superblock's, and puts nothing
+      back. On 4 KiB blocks a page needs 1 block, so nothing is retried: a
+      failed allocation write comes back as `NoSpc`, not `Io`, and once the
+      bit has landed it leaks (owned by no extent). If the checksum write
+      failed, neither count was lowered, so both stay one above the bitmap
+      for good, every later write storing them so; if the count's write
+      failed, the superblock's stays one above for good (the group's is put
+      right by its next write); a failed superblock write is put right by
+      the next one
       (`ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc`). On
-      a 1 or 2 KiB-block extent volume, where a page needs several blocks, a
-      host probe (#351's review, not a test) saw the shorter retry succeed: the write returns `Ok`,
-      with blocks leaked and counts lowered twice. Under the real cache the
-      same conditions apply as for the free.
+      a 1 KiB-block extent volume, where a page needs 4 blocks, a host probe
+      in #351's review (not a test; 2 KiB reaches the same code, not probed)
+      saw the shorter retry succeed: the write returns `Ok`, with up to 4
+      bits leaked (a failed bitmap write after the first leaves the earlier
+      bits and both counts above the bitmap for good), and a count lowered
+      twice when its own write failed.
+    - Under the real block cache only a miss can fail. The bitmap is read
+      just before its bits are written, and the count's descriptor write
+      follows the checksum's, so those are hits; the writes that can fail
+      are the descriptor's first write in the operation (the checksum's)
+      and the superblock's, under cache pressure. The free's retry needs
+      the error to be transient (a persistent one fails the retry's own miss
+      too), and then only the superblock write can double a count (both
+      counts, then). The 4 KiB allocation has no retry, so a persistent
+      error is enough, and its checksum write failing leaves the permanent
+      over-count. The likeliest route, though, is the bitmap's own read
+      missing and its eviction of another dirty block failing: the free's
+      retry turns that into `Ok`, the allocation's into `NoSpc` (nothing
+      doubled or leaked; the victim stays dirty).
     - `ext4plus`'s allocators (`alloc_block`, `alloc_contiguous_blocks`,
       `alloc_inode`) loop forever on a group whose count promises more than
       its bitmap has, or, for `alloc_contiguous_blocks(n)`, on one with no
       run of `n` free bits: the next allocation from such a group hangs
       (read from the source, and seen hanging a file's writeback on an
-      image made so; #350). The two retries above can leave such a count.
+      image made so; #350). Any allocation whose checksum write fails after
+      its bit landed leaves such a count, retry or not, whether it reports
+      `Io` (`alloc_block` for a directory's or an index block,
+      `alloc_inode` for create, mkdir, symlink) or `NoSpc` (through
+      `Extent::allocate`); so does the free's double count.
+    - Two narrow paths drop an error before any of these (read from the
+      source, not probed): `ext4plus`'s duplicate-name check in
+      `add_dir_entry` (`dir.rs`) takes a failed lookup (an eviction's write
+      error) as "absent", so `Dir::link` can return `Ok`; and a rename's
+      `take_out_target_entry`, when the target's `Dir::unlink` fails after
+      its entry went, carries on as if it had worked, unlogged, and the
+      rename can return `Ok`.
     - After a first error, the adapter's undo writes (above) report nothing
       further: a failed one is pinned in memory or logged, and the operation
       returns the first error. Among them: `undo_failed_link`,
