@@ -14,7 +14,7 @@ use lumen_vfs::{
 use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
-use super::page_cache::{self, CachePage, PAGE_SIZE, PageCache, QuotaCounter};
+use super::page_cache::{CachePage, PAGE_SIZE, PageCache, QuotaCounter};
 
 struct TmpfsShared {
     dev: DevId,
@@ -298,9 +298,10 @@ impl TmpfsInode {
     }
 
     /// This file's page `index`, a zero page allocated for a hole, and its
-    /// size read with it: `tmpfs`'s side of [`page_cache::mmap_page`] (its
-    /// contract). The hole's page
-    /// counts against the mount's quota, as a write's would.
+    /// size read with it: `tmpfs`'s side of
+    /// [`super::page_cache::mmap_page`] (its contract), through
+    /// `PageCache::map_page`. The hole's page counts against the mount's
+    /// quota, as a write's would.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     pub(super) fn mmap_page(&self, index: u64) -> Result<(Arc<CachePage>, u64), VfsError> {
         if self.inode_type != InodeType::File {
@@ -308,17 +309,7 @@ impl TmpfsInode {
         }
         let meta = self.meta.lock();
         let file_size = meta.size;
-        page_cache::mmap_page_in_file(index, file_size)?;
-        let mut pages = self.pages.lock();
-        let page = match pages.get(index) {
-            Some(page) => Arc::clone(page),
-            None => {
-                let page = Arc::new(CachePage::new_zeroed()?);
-                pages.insert_new(index, Arc::clone(&page))?;
-                page
-            }
-        };
-        page.touch();
+        let page = self.pages.lock().map_page(index, file_size, CachePage::new_zeroed)?;
         Ok((page, file_size))
     }
 }

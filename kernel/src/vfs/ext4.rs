@@ -1046,8 +1046,9 @@ impl Ext4Inode {
         }
         let buf = &buf[..buf.len().min(usize::try_from(max - offset).unwrap_or(usize::MAX))];
         // A new page a write covers only part of starts as the disk's bytes
-        // (below the old size) of a linked file, else as zeros. (A detached
-        // file's pages are never dirty: `PageCache::writes_back`.)
+        // (below the old size) of a linked file, else as zeros. (A write
+        // never dirties a detached file's page, and nothing writes one
+        // back: `PageCache::writes_back`.)
         let done = pages.write_from(offset, buf, old_size, |span| {
             let cp = CachePage::new_zeroed()?;
             if !detached && !span.whole_page() && span.page_start() < old_size {
@@ -1188,14 +1189,11 @@ impl Ext4Inode {
 
     /// This file's cached page `index`, filled when missing, and its size
     /// read with it: `ext4`'s side of [`page_cache::mmap_page`] (its
-    /// contract). A hole in a detached file (every page holding data was
-    /// read in when it was detached) gets a zero page, counted against the
-    /// detached quota (not the hard limit). For a linked file at the
-    /// cache's hard limit a missing page is refused (`NoSpc`, logged once
-    /// per crossing) by the same check as a write's new page
-    /// (`PageCache::admit_unreclaimable`): a mapping pins its pages, so
-    /// reclaim can't keep the cache under the limit as it does for
-    /// `read_at`'s pages.
+    /// contract), through `PageCache::map_page`. A missing page of a linked
+    /// file is read from disk, once the hard cap lets it in; a hole in a
+    /// detached file (every page holding data was read in when it was
+    /// detached) gets a zero page, counted against the detached quota (not
+    /// the hard limit).
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     pub(super) fn mmap_page(&self, index: u64) -> Result<(Arc<CachePage>, u64), VfsError> {
         if self.inode_type != InodeType::File {
@@ -1210,24 +1208,9 @@ impl Ext4Inode {
             return Err(VfsError::NoEnt);
         }
         let file_size = meta.size;
-        page_cache::mmap_page_in_file(index, file_size)?;
-        let mut pages = self.pages.lock();
-        let page = match pages.get(index) {
-            Some(page) => Arc::clone(page),
-            None => {
-                // The mapping pins the page, so reclaim can't drop it: held
-                // to the hard cap as a dirty page is, before the disk read
-                // and again after it (the read may sleep while other files'
-                // pages fill the cache), as `PageCache::write_from` asks.
-                pages.admit_unreclaimable()?;
-                let page =
-                    Arc::new(if detached { CachePage::new_zeroed()? } else { self.load_page(index, file_size)? });
-                pages.admit_unreclaimable()?;
-                pages.insert_new(index, Arc::clone(&page))?;
-                page
-            }
-        };
-        page.touch();
+        let page = self.pages.lock().map_page(index, file_size, || {
+            if detached { CachePage::new_zeroed() } else { self.load_page(index, file_size) }
+        })?;
         Ok((page, file_size))
     }
 
@@ -1272,11 +1255,11 @@ impl Ext4Inode {
     /// page's bytes are read under Lock 5). `Ok(None)` for a page wholly past
     /// `file_size` (nothing to write), else the new `i_blocks`.
     fn write_back_page(&self, page_idx: u64, page: &CachePage, file_size: u64) -> Result<Option<u64>, VfsError> {
-        let page_off = page_idx * PAGE_SIZE as u64;
-        if page_off >= file_size {
+        let valid = page::valid_len(page_idx, file_size);
+        if valid == 0 {
             return Ok(None);
         }
-        let valid = page::valid_len(page_idx, file_size);
+        let page_off = page_idx * PAGE_SIZE as u64;
         page.swap_dirty(false);
         let mut bounce = [0u8; PAGE_SIZE];
         page.read_bytes(0, &mut bounce[..valid]);

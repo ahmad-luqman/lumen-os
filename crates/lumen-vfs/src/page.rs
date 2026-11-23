@@ -3,8 +3,9 @@
 //! file, and which bytes past a file's end must be zero when its size
 //! changes. The kernel's `PageCache` (shared by `tmpfs` and `ext4`) walks
 //! its reads and writes with [`spans`], zeroes with [`resize_tail`] and, on
-//! a shrink, drops the pages from [`pages_in`] on; `ext4` reads and writes
-//! back a page's [`valid_len`] bytes.
+//! a shrink, drops the pages from [`pages_in`] on; a page's [`valid_len`]
+//! bytes are what `ext4` reads in and writes back, and what a private
+//! mapping's copy of a page keeps (`MappedPage`, either filesystem's).
 
 use core::ops::Range;
 
@@ -101,8 +102,9 @@ pub const fn valid_len(index: u64, file_size: u64) -> usize {
     if len < PAGE { len as usize } else { PAGE_SIZE }
 }
 
-/// A page's bytes from [`from`](Self::from) to its end, which lie past a
-/// file's end: `0 < from < 4096`. Only [`resize_tail`] makes one.
+/// A page's bytes from [`from`](Self::from) to its end, which lie past the
+/// smaller of a file's old and new ends: `0 < from < 4096`. Only
+/// [`resize_tail`] makes one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tail {
     index: u64,
