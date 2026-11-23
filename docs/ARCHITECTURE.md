@@ -5696,7 +5696,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     hash signed, so they mount writable: the ktests' images built in code
     set `EXT2_FLAGS_SIGNED_HASH` (or lack `dir_index`), and
     `tools/mkrootfs.sh` sets `s_flags` to signed on an image `mke2fs` made
-    with unsigned hashes (on a host where `char` is unsigned) through
+    with unsigned hashes (on a host where `char` is unsigned), or with
+    neither flag, through
     `tools/ext4-signed-hash.sh`, which changes only the flag, in the
     primary superblock, and checks the image's bytes after
     (`harness:test_rootfs::test_signed_hash_*`,

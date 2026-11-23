@@ -106,8 +106,8 @@ const UNKNOWN_HASH_REASON: &str =
 /// takes the signedness from `s_flags` (#313).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DirHash {
-    /// `EXT2_FLAGS_SIGNED_HASH` alone, or neither flag without `dir_index`
-    /// (no directory has been indexed).
+    /// `EXT2_FLAGS_SIGNED_HASH` without `EXT2_FLAGS_UNSIGNED_HASH`, or
+    /// neither flag without `dir_index` (no directory has been indexed).
     Signed,
     /// `EXT2_FLAGS_UNSIGNED_HASH` (which Linux's `ext4_hash_info_init` checks
     /// first): `mke2fs` sets it where `char` is unsigned, e.g. Linux on

@@ -5,11 +5,13 @@
 #
 # mke2fs sets s_flags' EXT2_FLAGS_UNSIGNED_HASH (0x2) where `char` is unsigned
 # (e.g. Linux on aarch64), and Lumen mounts such a volume read-only, because
-# ext4plus hashes directory names signed (#308, until #313). If IMAGE has that
-# bit, this clears it and sets EXT2_FLAGS_SIGNED_HASH (0x1), keeping s_flags'
-# other bits, with DEBUGFS's `ssv flags` (E2FSPROGS_FAKE_TIME, if set, passes
-# through to it); an image without it is left as it is. Either way it then
-# reads s_flags back from the image's bytes and fails unless the bit is clear.
+# ext4plus hashes directory names signed (#308, until #313); so does a volume
+# with neither that nor EXT2_FLAGS_SIGNED_HASH (0x1) when it has dir_index. If
+# IMAGE has the unsigned bit, or neither, this clears the one and sets the
+# signed one, keeping s_flags' other bits, with DEBUGFS's `ssv flags`
+# (E2FSPROGS_FAKE_TIME, if set, passes through to it); an image already
+# signed is left as it is. Either way it then reads s_flags back from the
+# image's bytes and fails unless it says signed and not unsigned.
 #
 # Only the flag changes, and only in the primary superblock: backups keep the
 # old flag (mkrootfs.sh's default 64M image with 4 KiB blocks has one block
@@ -47,13 +49,27 @@ read_s_flags() {
     S_FLAGS=$(( b0 | b1 << 8 | b2 << 16 | b3 << 24 ))
 }
 
+if [[ ! -f "$IMAGE" || ! -r "$IMAGE" ]]; then
+    echo "ext4-signed-hash: can't read $IMAGE" >&2
+    exit 1
+fi
 magic=$(od -An -tu1 -j "$MAGIC_AT" -N2 "$IMAGE")
 if [[ "$(echo $magic)" != "83 239" ]]; then
     echo "ext4-signed-hash: $IMAGE has no ext4 superblock (no magic 0xEF53)" >&2
     exit 1
 fi
+# Whether S_FLAGS fails to say signed (unsigned, or neither).
+not_signed() {
+    (( (S_FLAGS & UNSIGNED) || !(S_FLAGS & SIGNED) ))
+}
+
 read_s_flags
-if (( S_FLAGS & UNSIGNED )); then
+if not_signed; then
+    if (( S_FLAGS & UNSIGNED )); then
+        had="unsigned directory hashes"
+    else
+        had="no directory hash flag"
+    fi
     new=$(( (S_FLAGS & ~UNSIGNED) | SIGNED ))
     # debugfs exits 0 when a request fails: any stderr line but its version
     # banner is an error.
@@ -64,11 +80,11 @@ if (( S_FLAGS & UNSIGNED )); then
         echo "ext4-signed-hash: debugfs ssv flags $new failed (exit $rc) on $IMAGE" >&2
         exit 1
     fi
-    echo "ext4-signed-hash: $IMAGE had unsigned directory hashes (s_flags $S_FLAGS); set s_flags to $new (#308)" >&2
+    echo "ext4-signed-hash: $IMAGE had $had (s_flags $S_FLAGS); set s_flags to $new (#308)" >&2
 fi
 
 read_s_flags
-if (( S_FLAGS & UNSIGNED )); then
-    echo "ext4-signed-hash: $IMAGE still has unsigned directory hashes (s_flags $S_FLAGS)" >&2
+if not_signed; then
+    echo "ext4-signed-hash: $IMAGE still doesn't say its directories hash signed (s_flags $S_FLAGS)" >&2
     exit 1
 fi
