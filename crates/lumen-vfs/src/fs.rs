@@ -65,8 +65,8 @@ pub trait VfsInode: Send + Sync {
     /// Current `st_ino` (may transition to `(1 << 63) | seq` on detached unlinks).
     ///
     /// Called under Lock 9 (`InodeCache` checks a cached entry's number,
-    /// #320): must not lock or block (an atomic load, as the detach that
-    /// changes it stores it).
+    /// #320): must not lock or block (an atomic load where a detach changes
+    /// it, a fixed field otherwise).
     fn ino(&self) -> Ino;
 
     /// File type (`File`, `Dir`, `Symlink`, `CharDevice`, ...).
@@ -93,8 +93,8 @@ pub trait VfsInode: Send + Sync {
     /// True if this inode has been detached-unlinked (`st_nlink == 0` while open).
     ///
     /// Called under Lock 9 (`InodeCache` checks whether a cached entry is
-    /// stale, #320): must not lock or block (an atomic load, as the detach
-    /// stores it).
+    /// stale, #320): must not lock or block (an atomic load where a detach
+    /// sets it, a constant otherwise).
     fn is_detached(&self) -> bool {
         false
     }

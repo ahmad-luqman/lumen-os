@@ -5770,7 +5770,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `vfstest readlink` output, and an exec error's `PT_INTERP` path.
     `/proc/<pid>/maps` prints the raw bytes, a newline as `\012` (Linux's
     `seq_path`). Two exceptions stay text: mount paths
-    (`MountTable::mount`, `/proc/mounts`; only the kernel mounts, at `/`,
+    (`VfsTables::mount`, `/proc/mounts`; only the kernel mounts, at `/`,
     `/tmp`, `/dev` and `/proc`), and the paths a binary is loaded by
     (`Exec::from_path`, `ImageFile::path`, so an ELF image's maps lines,
     and `/proc/<pid>/exe`, read from `exe_path`): `linux /path` takes the
@@ -5936,12 +5936,15 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     read-only flag after the lock is released), or `mounts_with_fs` (#324)
     for `mount`: the same rows, each with its filesystem, which `mount`
     asks a `tmpfs` one's quota of, all from one snapshot. No inode or
-    filesystem `Arc` it lets go of drops under the locks (#320): `umount`
-    hands back the mountpoint with the filesystem, a refused `mount` or
-    `mount_root` takes its `Arc`s by reference and clones them only into
-    the mount, and every `InodeCache` method that evicts a stale entry or
-    unifies a handed inode with a cached one puts what it let go of in a
-    `Released` the caller declares before its guards, so it drops after
+    filesystem `Arc` it lets go of drops under the locks (#320):
+    `MountTable::umount` hands back the mountpoint with the filesystem,
+    which `umount` drops after the guards; `MountTable::mount_with_ino` and
+    `mount_root_with_ino` take the `Arc`s by reference and clone them only
+    into the mount, so a refused `mount`'s or `mount_root`'s drop with
+    their caller, after the guards; and every `InodeCache` method that
+    evicts a stale entry or unifies a handed inode with a cached one hands
+    what it let go of back, in its return value or in a `Released` (a
+    crate-private holder) declared before the guards, so it drops after
     them. `mount` asks its mountpoint's `inode_type()` before taking the
     locks. The calls into a filesystem it still makes under them,
     `VfsInode::dev_id`, `ino`, `cacheable` and `is_detached` and

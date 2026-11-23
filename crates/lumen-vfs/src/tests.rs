@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
+use crate::cache::Released;
 use crate::locks::{fcntl_const, flock_const};
 use crate::*;
 
@@ -2674,14 +2675,6 @@ fn post_mutation_dentry_invalidation_and_fd_ref_sync() {
         fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
             self.inner.inode_remove(dev, ino)
         }
-        fn inode_remove_if_fresh(
-            &self,
-            dev: DevId,
-            ino: Ino,
-            since_gen: u64,
-        ) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-            self.inner.inode_remove_if_fresh(dev, ino, since_gen)
-        }
         fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
             self.inner.inode_begin_removal(dev, ino, since_gen)
         }
@@ -3727,13 +3720,10 @@ struct ReusingFsInner {
     rename_lock: Mutex<()>,
     state: Mutex<ReusingFsState>,
     hooks: Mutex<ReusingHooks>,
-    /// `ReusingHandle`s dropped, and how many of those drops ran while
-    /// their thread held a Lock-9 table.
-    handle_drops: AtomicU32,
-    handle_drops_under_lock9: AtomicU32,
+    /// `ReusingHandle`s dropped.
+    handle_drops: DropCount,
     /// The same for the `FreshArcReusingFs` over this state (one at most).
-    fs_drops: AtomicU32,
-    fs_drops_under_lock9: AtomicU32,
+    fs_drops: DropCount,
     /// `ReusingHandle::inode_type` calls made while a Lock-9 table was held
     /// (#320: `mount` asks its mountpoint's before taking them).
     type_asks_under_lock9: AtomicU32,
@@ -3743,6 +3733,28 @@ struct ReusingFsInner {
 /// are being torn down).
 fn test_lock9_held() -> bool {
     TEST_LOCK9_HELD.try_with(core::cell::Cell::get).unwrap_or(0) != 0
+}
+
+/// Drops counted, and how many of those ran while their thread held a
+/// Lock-9 table.
+#[derive(Default)]
+struct DropCount {
+    all: AtomicU32,
+    under_lock9: AtomicU32,
+}
+
+impl DropCount {
+    fn note(&self) {
+        if test_lock9_held() {
+            self.under_lock9.fetch_add(1, Ordering::Relaxed);
+        }
+        self.all.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// (all, under Lock 9).
+    fn get(&self) -> (u32, u32) {
+        (self.all.load(Ordering::Relaxed), self.under_lock9.load(Ordering::Relaxed))
+    }
 }
 
 /// Backend constructing a fresh `Arc<dyn VfsInode>` per `lookup`/`create`/
@@ -3791,10 +3803,8 @@ impl FreshArcReusingFs {
                     orphans: BTreeMap::new(),
                 }),
                 hooks: Mutex::new(ReusingHooks::default()),
-                handle_drops: AtomicU32::new(0),
-                handle_drops_under_lock9: AtomicU32::new(0),
-                fs_drops: AtomicU32::new(0),
-                fs_drops_under_lock9: AtomicU32::new(0),
+                handle_drops: DropCount::default(),
+                fs_drops: DropCount::default(),
                 type_asks_under_lock9: AtomicU32::new(0),
             }),
         })
@@ -3877,10 +3887,7 @@ struct ReusingHandle {
 
 impl Drop for FreshArcReusingFs {
     fn drop(&mut self) {
-        if test_lock9_held() {
-            self.inner.fs_drops_under_lock9.fetch_add(1, Ordering::Relaxed);
-        }
-        self.inner.fs_drops.fetch_add(1, Ordering::Relaxed);
+        self.inner.fs_drops.note();
     }
 }
 
@@ -3889,10 +3896,7 @@ impl Drop for ReusingHandle {
         // Counted, not asserted (an abort would end the whole run, hiding
         // every other test's result): the tests of #320's drops check the
         // count, each on a path that leaves `VfsTables` the last reference.
-        if test_lock9_held() {
-            self.inner.handle_drops_under_lock9.fetch_add(1, Ordering::Relaxed);
-        }
-        self.inner.handle_drops.fetch_add(1, Ordering::Relaxed);
+        self.inner.handle_drops.note();
     }
 }
 
@@ -4571,7 +4575,7 @@ fn inode_cache_removal_ring_bounded_and_overflow_safe() {
     let mf3_guard = OpenGuard::new_unchecked(Arc::clone(&mf3));
     cache.get_or_insert(Arc::clone(&mf3), &mut Released::new());
     mem.root_inode().unlink(b"mf3").unwrap();
-    // `mf3` is detached in `cache`; `get_or_insert_if_fresh` on a non-detached `f10`-style entry or checking `remove_if_fresh`:
+    // `mf3` is detached in `cache`:
     assert!(cache.get(mem.dev_id(), mf3_ino).is_none());
     drop(mf_guard);
     drop(mf2_guard);
@@ -5107,25 +5111,10 @@ fn umount_drops_the_evicted_inodes_after_releasing_lock9() {
     let cached = env.snapshot_inodes().iter().filter(|i| i.dev_id() == DevId::TMPFS).count();
     assert_eq!(cached, 2, "the mounted root and /mnt/d");
 
-    let drops = tmp_fs.inner.handle_drops.load(Ordering::Relaxed);
-    let drops_under_lock9 = tmp_fs.inner.handle_drops_under_lock9.load(Ordering::Relaxed);
+    let (drops, drops_under_lock9) = tmp_fs.inner.handle_drops.get();
     drop(env.umount(mp.dev_id(), mp.ino()).unwrap());
-    assert_eq!(tmp_fs.inner.handle_drops.load(Ordering::Relaxed) - drops, 2, "umount dropped the evicted inodes");
-    assert_eq!(
-        tmp_fs.inner.handle_drops_under_lock9.load(Ordering::Relaxed),
-        drops_under_lock9,
-        "an evicted inode was dropped under Lock 9"
-    );
-}
-
-/// `inner`'s `ReusingHandle` drops: (all, under Lock 9).
-fn handle_drop_counts(inner: &ReusingFsInner) -> (u32, u32) {
-    (inner.handle_drops.load(Ordering::Relaxed), inner.handle_drops_under_lock9.load(Ordering::Relaxed))
-}
-
-/// `inner`'s `FreshArcReusingFs` drops: (all, under Lock 9).
-fn fs_drop_counts(inner: &ReusingFsInner) -> (u32, u32) {
-    (inner.fs_drops.load(Ordering::Relaxed), inner.fs_drops_under_lock9.load(Ordering::Relaxed))
+    assert_eq!(tmp_fs.inner.handle_drops.get().0 - drops, 2, "umount dropped the evicted inodes");
+    assert_eq!(tmp_fs.inner.handle_drops.get().1, drops_under_lock9, "an evicted inode was dropped under Lock 9");
 }
 
 /// #320: `umount` drops the mountpoint it lets go of after releasing Lock
@@ -5139,9 +5128,9 @@ fn umount_drops_the_unmounted_mountpoint_after_releasing_lock9() {
     let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
     let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
     env.mount(mp, "/mnt", MemFs::new(DevId::TMPFS, "tmpfs", false) as Arc<dyn FileSystem>).unwrap();
-    let (drops, under) = handle_drop_counts(&root_fs.inner);
+    let (drops, under) = root_fs.inner.handle_drops.get();
     drop(env.umount(mp_dev, mp_ino).unwrap());
-    let (drops_after, under_after) = handle_drop_counts(&root_fs.inner);
+    let (drops_after, under_after) = root_fs.inner.handle_drops.get();
     assert_eq!(drops_after - drops, 1, "umount didn't drop the mountpoint");
     assert_eq!(under_after, under, "umount dropped the mountpoint under Lock 9");
 }
@@ -5159,13 +5148,13 @@ fn refused_mounts_drop_their_arcs_after_releasing_lock9() {
     let refused = |what: &str, env: &TestTables, mp: Arc<dyn VfsInode>, fs_dev: DevId, expected: VfsError| {
         let fs = FreshArcReusingFs::new(fs_dev, "fresh-tmpfs", false, true);
         let fs_inner = Arc::clone(&fs.inner);
-        let (mp_drops, mp_under) = handle_drop_counts(&root_fs.inner);
+        let (mp_drops, mp_under) = root_fs.inner.handle_drops.get();
         assert_eq!(env.mount(mp, "/d", fs).unwrap_err(), expected, "{what}");
-        let (mp_drops_after, mp_under_after) = handle_drop_counts(&root_fs.inner);
+        let (mp_drops_after, mp_under_after) = root_fs.inner.handle_drops.get();
         assert_eq!(mp_drops_after - mp_drops, 1, "{what}: the mountpoint wasn't dropped");
         assert_eq!(mp_under_after, mp_under, "{what}: the mountpoint was dropped under Lock 9");
-        assert_eq!(fs_drop_counts(&fs_inner), (1, 0), "{what}: the filesystem not dropped, or dropped under Lock 9");
-        assert_eq!(handle_drop_counts(&fs_inner).1, 0, "{what}: the filesystem's root dropped under Lock 9");
+        assert_eq!(fs_inner.fs_drops.get(), (1, 0), "{what}: the filesystem not dropped, or dropped under Lock 9");
+        assert_eq!(fs_inner.handle_drops.get().1, 0, "{what}: the filesystem's root dropped under Lock 9");
     };
     let fresh = |name: &[u8]| root.lookup(name).unwrap();
 
@@ -5179,7 +5168,8 @@ fn refused_mounts_drop_their_arcs_after_releasing_lock9() {
     let fs = FreshArcReusingFs::new(DevId::makedev(0, 80), "fresh-tmpfs", false, true);
     let fs_inner = Arc::clone(&fs.inner);
     assert_eq!(env.mount_root(fs).unwrap_err(), VfsError::Busy);
-    assert_eq!(fs_drop_counts(&fs_inner), (1, 0), "mount_root: the filesystem not dropped, or dropped under Lock 9");
+    assert_eq!(fs_inner.fs_drops.get(), (1, 0), "mount_root: the filesystem not dropped, or dropped under Lock 9");
+    assert_eq!(fs_inner.handle_drops.get().1, 0, "mount_root: the filesystem's root dropped under Lock 9");
 }
 
 /// #320: `mount` asks its mountpoint's type before taking Lock 9.
@@ -5192,6 +5182,79 @@ fn mount_asks_the_mountpoints_type_before_taking_lock9() {
     env.mount(mp, "/mnt", MemFs::new(DevId::TMPFS, "tmpfs", false) as Arc<dyn FileSystem>).unwrap();
     assert!(env.mount_at(DevId::ROOT, mp_ino).is_some(), "not mounted");
     assert_eq!(root_fs.inner.type_asks_under_lock9.load(Ordering::Relaxed), 0, "inode_type() asked under Lock 9");
+}
+
+/// #320: `mount` and `mount_root` seed the mounted root into `InodeCache`.
+/// When that root is cached already (an inode of a filesystem cached before
+/// it was mounted: `inode_get_or_insert` doesn't ask), the cached one wins,
+/// and the root `mount` got from `root_inode()` (a fresh handle, its only
+/// reference) drops after the locks are released.
+#[test]
+fn mount_seeds_losing_to_a_cached_root_drop_after_releasing_lock9() {
+    let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
+    let fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
+    let inner = Arc::clone(&fs.inner);
+    let seeded = env.inode_get_or_insert(fs.root_inode());
+    let (drops, under) = inner.handle_drops.get();
+    env.mount(mp, "/mnt", fs as Arc<dyn FileSystem>).unwrap();
+    let (drops_after, under_after) = inner.handle_drops.get();
+    assert_eq!(drops_after - drops, 1, "mount: its root didn't lose to the cached one");
+    assert_eq!(under_after, under, "mount: its losing root dropped under Lock 9");
+    assert!(Arc::ptr_eq(&env.inode_get(DevId::TMPFS, seeded.ino()).unwrap(), &seeded), "mount: the cached root lost");
+
+    let env = TestTables::new();
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let inner = Arc::clone(&fs.inner);
+    let seeded = env.inode_get_or_insert(fs.root_inode());
+    let (drops, under) = inner.handle_drops.get();
+    env.mount_root(fs as Arc<dyn FileSystem>).unwrap();
+    let (drops_after, under_after) = inner.handle_drops.get();
+    assert_eq!(drops_after - drops, 1, "mount_root: its root didn't lose to the cached one");
+    assert_eq!(under_after, under, "mount_root: its losing root dropped under Lock 9");
+    assert!(
+        Arc::ptr_eq(&env.inode_get(DevId::ROOT, seeded.ino()).unwrap(), &seeded),
+        "mount_root: the cached root lost"
+    );
+}
+
+/// #320: `inode_get_or_insert_if_mounted` refused (the mount it names gone:
+/// the resolver racing `umount`) drops the inode it was handed after the
+/// locks are released: a fresh root handle, its only reference.
+#[test]
+fn refused_get_or_insert_if_mounted_drops_the_inode_after_releasing_lock9() {
+    let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
+    let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
+    env.mount(mp, "/mnt", MemFs::new(DevId::TMPFS, "tmpfs", false) as Arc<dyn FileSystem>).unwrap();
+    let (_, mount_id) = env.mount_at_with_id(mp_dev, mp_ino).unwrap();
+    let fresh = root_fs.root_inode();
+    let (drops, under) = root_fs.inner.handle_drops.get();
+    assert!(env.inode_get_or_insert_if_mounted(mp_dev, mp_ino, mount_id + 1, fresh).is_none());
+    let (drops_after, under_after) = root_fs.inner.handle_drops.get();
+    assert_eq!(drops_after - drops, 1, "the refused inode wasn't dropped");
+    assert_eq!(under_after, under, "the refused inode was dropped under Lock 9");
+}
+
+/// #320: a `Released` holds one `Arc`; an `InodeCache` call handed one
+/// already holding one panics rather than drop the first under Lock 9.
+#[test]
+#[should_panic(expected = "one InodeCache call per Released")]
+fn a_released_reused_for_a_second_arc_panics() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let root = fs.root_inode();
+    let f = root.create(b"f", 0o644).unwrap();
+    let mut cache = InodeCache::new();
+    let mut released = Released::new();
+    drop(cache.get_or_insert(Arc::clone(&f), &mut released));
+    let drops = fs.inner.handle_drops.get().0;
+    // A loser, held.
+    drop(cache.get_or_insert(root.lookup(b"f").unwrap(), &mut released));
+    assert_eq!(fs.inner.handle_drops.get().0, drops, "the loser wasn't held");
+    // A second loser: the panic.
+    drop(cache.get_or_insert(root.lookup(b"f").unwrap(), &mut released));
 }
 
 /// #320: an inode handed to a `get_or_insert*` path that finds the same
@@ -5213,11 +5276,11 @@ fn get_or_insert_losers_dropped_after_releasing_lock9() {
 
     let check = |what: &str, probe: &dyn Fn(Arc<dyn VfsInode>) -> Arc<dyn VfsInode>| {
         let loser = root.lookup(b"f").unwrap();
-        let (drops, under) = handle_drop_counts(&root_fs.inner);
+        let (drops, under) = root_fs.inner.handle_drops.get();
         let got = probe(loser);
         assert!(Arc::ptr_eq(&got, &cached), "{what}: not unified with the cached inode");
         drop(got);
-        let (drops_after, under_after) = handle_drop_counts(&root_fs.inner);
+        let (drops_after, under_after) = root_fs.inner.handle_drops.get();
         assert_eq!(drops_after - drops, 1, "{what}: the loser wasn't dropped");
         assert_eq!(under_after, under, "{what}: the loser was dropped under Lock 9");
     };
@@ -5279,9 +5342,9 @@ fn stale_cache_entries_dropped_after_releasing_lock9() {
     type Kept = Option<Arc<dyn VfsInode>>;
     let check = |what: &str, reuse: bool, probe: &dyn Fn(Ino, Kept) -> Kept| {
         let (ino, reuser) = stale(reuse);
-        let (drops, under) = handle_drop_counts(&root_fs.inner);
+        let (drops, under) = root_fs.inner.handle_drops.get();
         let kept = probe(ino, reuser);
-        let (drops_after, under_after) = handle_drop_counts(&root_fs.inner);
+        let (drops_after, under_after) = root_fs.inner.handle_drops.get();
         assert_eq!(drops_after - drops, 1, "{what}: the stale entry wasn't evicted");
         assert_eq!(under_after, under, "{what}: the stale entry was dropped under Lock 9");
         assert_eq!(kept.is_some(), reuse, "{what}: the handed inode not given back");
@@ -7280,14 +7343,6 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
         fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
             self.inner.inode_remove(dev, ino)
         }
-        fn inode_remove_if_fresh(
-            &self,
-            dev: DevId,
-            ino: Ino,
-            since_gen: u64,
-        ) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-            self.inner.inode_remove_if_fresh(dev, ino, since_gen)
-        }
         fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
             self.inner.inode_begin_removal(dev, ino, since_gen)
         }
@@ -9150,8 +9205,8 @@ fn removed_directories_pruned_parents_dropped_outside_lock9() {
     let mp = mkdir_at(env, None, b"/m", 0o755, 0).unwrap();
     let mfs = FreshArcReusingFs::new(DevId::makedev(0, 78), "fresh-tmpfs", false, true);
     env.mount(mp, "/m", Arc::clone(&mfs) as Arc<dyn FileSystem>).unwrap();
-    let under = || mfs.inner.handle_drops_under_lock9.load(Ordering::Relaxed);
-    let drops = || mfs.inner.handle_drops.load(Ordering::Relaxed);
+    let under = || mfs.inner.handle_drops.get().1;
+    let drops = || mfs.inner.handle_drops.get().0;
     // An `rmdir` on /m drops nothing under Lock 9 by itself, with nothing
     // to prune (#320): nor below, with records to prune.
     mkdir_at(env, None, b"/m/c", 0o755, 0).unwrap();

@@ -35,7 +35,7 @@ mod tests;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use cache::{DentryCache, DentryTarget, InodeCache, Released};
+pub use cache::{DentryCache, DentryTarget, InodeCache};
 pub use error::VfsError;
 pub use fd::{FdEntry, FdTable, LocalLock, LockFamily, OpenFile, OpenFileId, VfsLock};
 pub use fs::{FileSystem, OpenGuard, VfsInode};
@@ -43,7 +43,7 @@ pub use locks::{
     AdvisoryLocks, Deadlock, FlockKind, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixLockType, PosixWaitGraph,
     RecordLockOutcome, WaitSearch,
 };
-pub use mount::{MountInfo, MountTable, Unmounted, VfsCacheOps, VfsTables};
+pub use mount::{MountInfo, MountTable, VfsCacheOps, VfsTables};
 pub use ops::{
     Opened, link_at, mkdir_at, open_inode, open_inode_guarded, readlink_at, rename_at2, symlink_at, unlink_at,
 };
