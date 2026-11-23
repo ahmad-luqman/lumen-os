@@ -5322,8 +5322,9 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
     Option<&dyn Any>`, a default trait method returning `None`, overridden
     by `Ext4Inode` and `TmpfsInode` to return themselves. Its users are
-    `mmap_page` and `page_cache_lock` (behind `mappable`), which downcast
-    to either inode for its page cache, and, since #324,
+    `mmap_page` and `page_cache_lock` (behind `mappable` and
+    `MappedPage::copy_to_frame`), which downcast to either inode for its
+    page cache, and, since #324,
     `tmpfs::quota_use`, which downcasts a mount's root inode to
     `TmpfsInode` alone for the shell's `mount`. Another cached filesystem
     that overrides it also needs its own branch in `mmap_page` and
@@ -6202,7 +6203,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     checked against what its files take, a charge far past that pointing
     to a leak. `tmpfs::quota_use` reads them from a `dyn
     FileSystem` through its root inode's `VfsInode::as_any`, for each
-    mount of one `VfsTables::mounts_with_fs`; `/proc/mounts` keeps
+    mount that one `VfsTables::mounts_with_fs` snapshot lists;
+    `/proc/mounts` keeps
     Linux's columns.
   - `sync`: flushes every mounted filesystem (each flushing its own live
     inodes, then its block cache), continuing past a failing inode or

@@ -5106,41 +5106,25 @@ fn mount_root_and_mount_seed_their_roots_into_inode_cache() {
 }
 
 #[test]
-fn list_mounts_asks_the_filesystems_after_releasing_lock9() {
-    // `MemFs::name` and `read_only` assert Lock 9 is free.
-    let (env, root_fs) = setup_vfs();
-    let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
-    env.mount(mp, "/mnt", MemFs::new(DevId::TMPFS, "tmpfs", true) as Arc<dyn FileSystem>).unwrap();
-    let info = |dev_id, fs_name, mount_path: &str, read_only| MountInfo {
-        dev_id,
-        fs_name,
-        mount_path: String::from(mount_path),
-        read_only,
-    };
-    assert_eq!(
-        env.list_mounts(),
-        vec![info(DevId::ROOT, "ext4", "/", false), info(DevId::TMPFS, "tmpfs", "/mnt", true)]
-    );
-}
-
-#[test]
-fn mounts_with_fs_pairs_each_row_with_its_mounted_filesystem() {
-    // `list_mounts`' rows, `/` first, each with the filesystem mounted
-    // there itself; the filesystems asked after the lock is released
-    // (`MemFs::name` and `read_only` assert it).
+fn list_mounts_and_mounts_with_fs_ask_the_filesystems_after_releasing_lock9() {
+    // The rows, `/` first, from either (`MemFs::name` and `read_only`
+    // assert Lock 9 is free); `mounts_with_fs` pairs each with the
+    // filesystem mounted there itself.
     let (env, root_fs) = setup_vfs();
     let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
     let tmp_fs = MemFs::new(DevId::TMPFS, "tmpfs", true);
     env.mount(mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
-    let mounts = env.mounts_with_fs();
     let info = |dev_id, fs_name, mount_path: &str, read_only| MountInfo {
         dev_id,
         fs_name,
         mount_path: String::from(mount_path),
         read_only,
     };
+    let expected = vec![info(DevId::ROOT, "ext4", "/", false), info(DevId::TMPFS, "tmpfs", "/mnt", true)];
+    assert_eq!(env.list_mounts(), expected);
+    let mounts = env.mounts_with_fs();
     let rows: Vec<MountInfo> = mounts.iter().map(|(row, _)| row.clone()).collect();
-    assert_eq!(rows, vec![info(DevId::ROOT, "ext4", "/", false), info(DevId::TMPFS, "tmpfs", "/mnt", true)]);
+    assert_eq!(rows, expected);
     let addr = |fs: &Arc<dyn FileSystem>| Arc::as_ptr(fs).cast::<()>();
     assert_eq!(addr(&mounts[0].1), Arc::as_ptr(&root_fs).cast::<()>());
     assert_eq!(addr(&mounts[1].1), Arc::as_ptr(&tmp_fs).cast::<()>());

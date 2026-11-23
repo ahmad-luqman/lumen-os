@@ -1316,7 +1316,8 @@ impl VfsInode for TmpfsInode {
         Ok(())
     }
 
-    /// For `vfs::mmap_page`, and the root's for [`quota_use`].
+    /// For `vfs::mmap_page` and `page_cache_lock`, and the root's for
+    /// [`quota_use`].
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }

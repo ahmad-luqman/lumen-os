@@ -372,7 +372,7 @@ pub trait VfsCacheOps {
 ///
 /// Strict sub-order `MountTable -> DentryCache -> InodeCache`. Never holds
 /// any of the three across `FileSystem::root_inode()`, `read_only()` and
-/// `name()` (`fs_read_only`, `list_mounts`), Locks 1–8, or the drops of the
+/// `name()` (`fs_read_only`, `list_mounts`, `mounts_with_fs`), Locks 1–8, or the drops of the
 /// inodes `umount` evicts. Some calls into the filesystems still run under
 /// them: `VfsInode::dev_id`, `ino` and `cacheable` and `FileSystem::dev_id`
 /// (fixed state, by design), `VfsInode::is_detached` (an atomic load in
@@ -485,9 +485,9 @@ impl<F: LockFamily> VfsTables<F> {
 
     /// [`list_mounts`](Self::list_mounts)' rows, each with its mount's
     /// filesystem, from one snapshot: for a caller that asks a filesystem
-    /// for more than [`MountInfo`] holds (the kernel's `mount`, a tmpfs
-    /// mount's quota). The lock is released before the filesystems are
-    /// asked, and before the caller uses them.
+    /// for more than [`MountInfo`] holds (the kernel's `mount`, which asks
+    /// a tmpfs mount for its quota). The lock is released before the
+    /// filesystems are asked, and before the caller uses them.
     pub fn mounts_with_fs(&self) -> Vec<(MountInfo, Arc<dyn FileSystem>)> {
         let mounts = self.mounts.lock().snapshot_mounts();
         mounts.into_iter().map(|(fs, path)| (MountInfo::of(fs.as_ref(), path), fs)).collect()

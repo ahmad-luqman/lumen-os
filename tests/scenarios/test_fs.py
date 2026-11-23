@@ -21,11 +21,15 @@ def shell(boot, **kwargs):
 
 
 def parse_mount(out):
-    """`mount`'s output as {target: (fs, dev, mode, used, limit)}, as text."""
+    """`mount`'s output as {target: (fs, dev, mode, used, limit)}, as text:
+    every row (a line starting with `/`) has those six cells and a target of
+    its own."""
     rows = {}
     for line in out.splitlines():
         cells = line.split()
-        if len(cells) == 6 and cells[0].startswith("/"):
+        if cells and cells[0].startswith("/"):
+            assert len(cells) == 6, f"a mount row without 6 cells: {line!r} in\n{out}"
+            assert cells[0] not in rows, f"{cells[0]} listed twice in\n{out}"
             rows[cells[0]] = tuple(cells[1:])
     return rows
 
@@ -35,9 +39,14 @@ def mount_table(m):
     return parse_mount(run(m, "mount"))
 
 
+def without_quota(table):
+    """A `mount_table` as {target: (fs, dev, mode)}."""
+    return {target: row[:3] for target, row in table.items()}
+
+
 def mount_rows(m):
     """`mount`'s table as {target: (fs, dev, mode)}."""
-    return {target: row[:3] for target, row in mount_table(m).items()}
+    return without_quota(mount_table(m))
 
 
 # A tmpfs mount's quota limit in bytes: page_cache::TMPFS_DEFAULT_QUOTA_PAGES
@@ -74,14 +83,15 @@ def test_ext4_read_write_persists_across_reboot(boot, tmp_path):
     m1 = shell(boot, devices=Devices(blk_image=disk, rng=True))
     assert_quiet_boot(m1.output)
 
-    assert mount_rows(m1) == {
+    table = mount_table(m1)
+    assert without_quota(table) == {
         "/": ("ext4", "0:1", "rw"),
         "/tmp": ("tmpfs", "0:2", "rw"),
         "/dev": ("devfs", "0:3", "rw"),
         "/proc": ("procfs", "0:4", "ro"),
     }
+    assert table["/"][3:] == ("-", "-")  # ext4 has no quota to show
     assert run(m1, "mount | count") == "4\n"
-    assert mount_table(m1)["/"][3:] == ("-", "-")  # ext4 has no quota to show
 
     assert run(m1, "vfstest cat /etc/alpine-release").strip() == "3.21.10"
     assert run(m1, "vfstest readlink /bin/sh").strip() == "/bin/busybox"
@@ -185,7 +195,7 @@ def test_dev_tmp_proc_filesystems(boot):
     out = run(m, "mount")
     assert out.startswith("mount: 4 mounts\n"), out  # the header counts the table's rows
     table = parse_mount(out)
-    assert {target: row[:3] for target, row in table.items()} == {
+    assert without_quota(table) == {
         "/": ("tmpfs", "0:1", "rw"),
         "/tmp": ("tmpfs", "0:2", "rw"),
         "/dev": ("devfs", "0:3", "rw"),
@@ -240,6 +250,8 @@ def test_tmpfs_quota_returns_after_ring3_files(boot, tmp_path):
     warm_up(m)
 
     def busybox(args):
+        # Leaked frames aren't checked: what a run makes on /tmp (`cp`'s
+        # pages, say) stays there, counted by the quota checked below.
         done = run_busybox(m, args)
         assert done.status == 0, done.raw
 

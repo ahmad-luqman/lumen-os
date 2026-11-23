@@ -104,14 +104,15 @@ class BusyboxRun(NamedTuple):
     raw: str
 
 
-def run_busybox(m, args: str, timeout: float = 60) -> BusyboxRun:
+def run_busybox(m, args: str) -> BusyboxRun:
     """Run `/bin/busybox <args>` on machine `m` (booted with a rootfs) from
-    the serial shell. Raises AssertionError, with the output, unless its
+    the serial shell, waiting up to 60 seconds for the prompt after it.
+    Raises AssertionError, with the output, unless its
     last line is the `linux:` line giving the exit code and leaked frames
     (`BUSYBOX_EXIT`)."""
     from . import shell
 
-    raw = shell.run(m, f"linux /bin/busybox {args}", timeout)
+    raw = shell.run(m, f"linux /bin/busybox {args}", 60)
     lines = raw.splitlines()
     done = BUSYBOX_EXIT.fullmatch(lines[-1]) if lines else None
     assert done, f"no `linux: /bin/busybox exit=...` line last:\n{raw}"
