@@ -6205,6 +6205,8 @@ crate::ktest!(
         // operation's result can't tell a write error happened (#349 must
         // watch the block cache instead). `f` is 2 blocks of one extent
         // (4 KiB blocks, one group); each write of the unlink fails in turn.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
