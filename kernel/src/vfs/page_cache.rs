@@ -41,6 +41,8 @@ pub const EXT4_SOFT_LIMIT_PAGES: usize = 8192;
 pub const EXT4_HARD_LIMIT_PAGES: usize = 2 * EXT4_SOFT_LIMIT_PAGES;
 /// Default `tmpfs` memory quota (32 MiB = 8192 pages' worth), which its
 /// pages share with, since #267, its inodes, names and symlink targets.
+/// `vfs::init` gives it to `/tmp` and to a diskless `/`; `mount` shows it,
+/// in bytes, as their `limit`, which `test_fs.py`'s `TMPFS_LIMIT` copies.
 pub const TMPFS_DEFAULT_QUOTA_PAGES: usize = 8192;
 /// Non-evictable quota for open-unlinked detached `ext4` inodes (32 MiB = 8192 pages).
 pub const DETACHED_QUOTA_PAGES: usize = 8192;
@@ -200,6 +202,11 @@ impl QuotaCounter {
 
     pub fn used_bytes(&self) -> usize {
         self.used_bytes.load(Ordering::Acquire)
+    }
+
+    /// The most that may be reserved at once.
+    pub const fn limit_bytes(&self) -> usize {
+        self.limit_bytes
     }
 }
 

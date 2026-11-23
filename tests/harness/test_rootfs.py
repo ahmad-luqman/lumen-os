@@ -686,3 +686,34 @@ def test_mkrootfs_fails_on_a_directory_indexed_by_the_unsigned_hash(tmp_path):
     assert "mkrootfs: e2fsck -fn failed on the image" in proc.stderr
     assert "#308" in proc.stderr
     assert not out.exists()
+
+
+def test_run_busybox_splits_the_linux_line_and_refuses_output_without_it(monkeypatch):
+    # `run_busybox`: the applet's output, then the `linux:` line's exit code
+    # and leaked frames; no such line last is an AssertionError naming it.
+    # `fake_run` stands in for `shell.run`, handing back the machine it is
+    # given as the command's output: each call below passes the output as `m`.
+    sent = []
+
+    def fake_run(m, line, timeout=10):
+        sent.append((line, timeout))
+        return m
+
+    monkeypatch.setattr("lumen_harness.shell.run", fake_run)
+    out = "a\nb\nlinux: /bin/busybox exit=2 leaked_frames=-1\n"
+    assert rootfs.run_busybox(out, "ls /x") == rootfs.BusyboxRun(
+        output="a\nb\n", status=2, leaked=-1, raw=out
+    )
+    assert sent == [("linux /bin/busybox ls /x", 60)]
+    out = "linux: /bin/busybox exit=0 leaked_frames=3\n"
+    assert rootfs.run_busybox(out, "true") == rootfs.BusyboxRun(
+        output="", status=0, leaked=3, raw=out
+    )
+    for bad in (
+        "",
+        "a\n",
+        "linux: /bin/busybox exit=0 leaked_frames=0\nafter\n",
+        "linux: /bin/busybox exit=0 leaked_frames=0 x\n",
+    ):
+        with pytest.raises(AssertionError, match="no `linux: /bin/busybox exit=...` line last"):
+            rootfs.run_busybox(bad, "true")

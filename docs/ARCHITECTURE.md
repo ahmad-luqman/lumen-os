@@ -5321,12 +5321,17 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     stored past it).
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
     Option<&dyn Any>`, a default trait method returning `None`, overridden
-    by `Ext4Inode` and `TmpfsInode` to return themselves; `mmap_page`
-    downcasts. It exists for `mmap_page` alone, so another cached
-    filesystem that overrides it also needs its own branch there. A
-    kernel-side registry was the alternative, but `tmpfs` has none, an
-    unlinked (detached) file isn't reachable by walking a tree, and the
-    `ext4` one costs a scan per fault.
+    by `Ext4Inode` and `TmpfsInode` to return themselves. Its users are
+    `mmap_page` and `page_cache_lock` (behind `mappable` and
+    `MappedPage::copy_to_frame`), which downcast to either inode for its
+    page cache, and, since #324,
+    `tmpfs::quota_use`, which downcasts a mount's root inode to
+    `TmpfsInode` alone for the shell's `mount`. Another cached filesystem
+    that overrides it also needs its own branch in `mmap_page` and
+    `page_cache_lock`. For the page cache, a kernel-side registry was the
+    alternative, but `tmpfs` has none, an unlinked (detached) file isn't
+    reachable by walking a tree, and the `ext4` one costs a scan per
+    fault.
   - *Bytes and state:* `CachePage::read_bytes`, `write_bytes`,
     `zero_range`, `copy_to_frame`, `swap_dirty`, `touch`, `last_access` and
     `new_zeroed` are `pub(super)` (inside `vfs` only); the byte accessors
@@ -5888,9 +5893,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     returns; the `cacheable()` checks above), with `mount_root`, `mount`,
     `umount` (the evicted inodes dropped after the locks are released) and
     the snapshots: of the filesystems for `sync`, of the inodes for the
-    ktests' cache checks (and the host tests'), and `list_mounts` for `/proc/mounts`
-    and `mount` (each filesystem asked for its device, name and read-only
-    flag after the lock is released). Calls into a filesystem it still
+    ktests' cache checks (and the host tests'), and `list_mounts` for
+    `/proc/mounts` (each filesystem asked for its device, name and
+    read-only flag after the lock is released), or `mounts_with_fs` (#324)
+    for `mount`: the same rows, each with its filesystem, which `mount`
+    asks a `tmpfs` one's quota of, all from one snapshot. Calls into a filesystem it still
     makes under the locks (`VfsInode::dev_id`, `ino`, `cacheable` and
     `is_detached`, `FileSystem::dev_id`, `mount`'s `inode_type()`), and
     `Arc`s it drops there (a failed `mount`'s, the unmounted mountpoint,
@@ -6190,7 +6197,15 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 - **Shell commands:**
   - `blk`: lists bound block devices (PCI addr, capacity, read-only, flush
     support, `BlockCache` hit/miss/dirty stats).
-  - `mount`: lists active mounts as records (target, fs, dev, mode `ro`/`rw`).
+  - `mount`: lists active mounts as records (target, fs, dev, mode `ro`/`rw`,
+    and `used` and `limit`: a `tmpfs` mount's quota in bytes, `-` for any
+    other filesystem; #324): with them an `ENOSPC` on `/tmp` can be
+    checked against what its files take, a charge far past that pointing
+    to a leak. `tmpfs::quota_use` reads them from a `dyn
+    FileSystem` through its root inode's `VfsInode::as_any`, for each
+    mount that one `VfsTables::mounts_with_fs` snapshot lists;
+    `/proc/mounts` keeps
+    Linux's columns.
   - `sync`: flushes every mounted filesystem (each flushing its own live
     inodes, then its block cache), continuing past a failing inode or
     filesystem and reporting the first error (each failure logged once at

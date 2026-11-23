@@ -263,6 +263,16 @@ tests = [
 ]
 
 [[feature]]
+name = "The shell's mount shows each tmpfs mount's quota, its bytes in use and its limit (- for ext4, devfs and procfs; /proc/mounts keeping Linux's six fields), and the count follows a file's charges as it comes and goes; a directory with a copy of busybox, a hard link to it, a symlink, an empty file and a subdirectory made on /tmp by ring-3 busybox raise /tmp's count by at least the file's pages, and rm -r brings it back to exactly where it was (#324)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_use_reads_the_mount_s_count_and_limit",
+    "scenario:test_fs::test_tmpfs_quota_returns_after_ring3_files",
+    "scenario:test_fs::test_dev_tmp_proc_filesystems",
+    "scenario:test_fs::test_ext4_read_write_persists_across_reboot",
+]
+
+[[feature]]
 name = "ext4 volumes whose directory hashes are or may be unsigned (#308: s_flags EXT2_FLAGS_UNSIGNED_HASH, or neither hash flag with dir_index; ext4plus hashes signed) mount read-only with one warning naming the flag or its absence (and a journal needing recovery outranks it, its warning showing no s_flags); every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (only a non-ASCII hash miss in an htree directory walks it; a read error in the walk or in the hash lookup is EIO), a missing name is ENOENT, and unlink, rmdir and create are EROFS; the same volume with its flag set to signed, or with neither flag and no dir_index, mounts writable (the signed one gets no walk); tools/ext4-signed-hash.sh sets an ext4 image's s_flags to signed (from unsigned, or neither flag), changing nothing else (keeping s_flags' other bits), refuses a missing file or one without ext4's magic, and fails unless the image then says signed; tools/mkrootfs.sh runs it, so an image its mke2fs made unsigned comes out signed (mke2fs -d indexing no directory), passing an ASCII-only directory indexed by the unsigned hash and failing on one holding names with bytes of 0x80 or above"
 milestone = "M7"
 tests = [

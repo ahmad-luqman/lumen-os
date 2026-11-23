@@ -86,6 +86,25 @@ impl Tmpfs {
     }
 }
 
+/// `fs`'s quota use if it is a tmpfs, `None` for any other filesystem: for
+/// the shell's `mount`. `FileSystem` has no way to the concrete type, so
+/// this goes through the root inode, which `VfsInode::as_any` hands over as
+/// a [`TmpfsInode`] sharing the mount's quota.
+pub fn quota_use(fs: &dyn FileSystem) -> Option<QuotaUse> {
+    let root = fs.root_inode();
+    let quota = &root.as_any()?.downcast_ref::<TmpfsInode>()?.shared.quota;
+    Some(QuotaUse { used_bytes: quota.used_bytes(), limit_bytes: quota.limit_bytes() })
+}
+
+/// A tmpfs mount's quota as the shell's `mount` shows it: the bytes in use
+/// (pages, inodes, directory entries and symlink targets) and the limit,
+/// past which a write or a new name is `NoSpc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuotaUse {
+    pub used_bytes: usize,
+    pub limit_bytes: usize,
+}
+
 /// Room for a ktest's few small files' inodes and names on top of a whole
 /// number of pages of data: under a page, so such a mount still runs out
 /// of data pages exactly where a quota of only those pages would, as long
@@ -1297,7 +1316,8 @@ impl VfsInode for TmpfsInode {
         Ok(())
     }
 
-    /// For `vfs::mmap_page`.
+    /// For `vfs::mmap_page` and `page_cache_lock`, and the root's for
+    /// [`quota_use`].
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
@@ -1798,6 +1818,33 @@ crate::ktest!(
             }
             kassert_eq!(fs.used_bytes(), 0);
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tmpfs_quota_use_reads_the_mount_s_count_and_limit() {
+        // #324: `quota_use`, what the shell's `mount` shows, reached from a
+        // `dyn FileSystem` (neither filesystem here is mounted): a tmpfs's
+        // bytes in use and its limit, following the count as a file comes
+        // and goes; `None` for a filesystem of another kind.
+        use crate::kassert_eq;
+        const LIMIT: usize = 8 * PAGE_SIZE;
+        let fs = Tmpfs::new(DevId::makedev(0, 146), LIMIT);
+        let dyn_fs = Arc::clone(&fs) as Arc<dyn FileSystem>;
+        let at = |used_bytes| Some(QuotaUse { used_bytes, limit_bytes: LIMIT });
+        kassert_eq!(quota_use(&*dyn_fs), at(0));
+        let root = fs.root_inode();
+        let f = root.create(b"q.bin", 0o644).map_err(|_| "create")?;
+        let file = INODE_COST + entry_cost(5);
+        kassert_eq!(quota_use(&*dyn_fs), at(file));
+        kassert_eq!(f.write_at(0, &[7u8; PAGE_SIZE + 1]).map_err(|_| "write")?, PAGE_SIZE + 1);
+        kassert_eq!(quota_use(&*dyn_fs), at(file + 2 * PAGE_SIZE));
+        root.unlink(b"q.bin").map_err(|_| "unlink")?;
+        drop(f);
+        kassert_eq!(quota_use(&*dyn_fs), at(0));
+        let devfs = super::devfs::Devfs::new(DevId::makedev(0, 147));
+        kassert_eq!(quota_use(&*devfs), None);
         Ok(())
     }
 );

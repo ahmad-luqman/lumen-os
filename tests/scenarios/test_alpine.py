@@ -12,11 +12,11 @@ from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.klog import unexpected_warnings
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
 from lumen_harness.rootfs import (
-    BUSYBOX_EXIT,
     copy_rootfs,
     debugfs,
     debugfs_names,
     e2fsck_check,
+    run_busybox,
     warm_up,
 )
 from lumen_harness.shell import PROMPT, run
@@ -37,13 +37,10 @@ class Busybox:
     def __call__(self, args, *, status=0, leaked=0):
         """`/bin/busybox <args>`'s output, less the `linux:` line, which must
         give `status` as its exit code and `leaked` frames."""
-        out = run(self.m, f"linux /bin/busybox {args}", 60)
-        lines = out.splitlines()
-        assert lines, out
-        done = BUSYBOX_EXIT.fullmatch(lines[-1])
-        assert done and int(done.group(1)) == status, out
-        assert int(done.group(2)) == leaked, f"expected leaked_frames={leaked}:\n{out}"
-        return "".join(line + "\n" for line in lines[:-1])
+        done = run_busybox(self.m, args)
+        assert done.status == status, done.raw
+        assert done.leaked == leaked, f"expected leaked_frames={leaked}:\n{done.raw}"
+        return done.output
 
     def assert_gone(self, path):
         """`ls <path>` fails: no such file or directory."""
