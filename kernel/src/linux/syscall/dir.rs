@@ -613,7 +613,6 @@ crate::ktest!(
             // several 64-byte calls.
             let dev_fd = ktest_open(2, b"/dev", KTEST_DIR_FLAGS)?;
             let devs = ktest_list(dev_fd, 64)?;
-            kassert!(ktest_unique(&devs));
             let mut dev_names: Vec<&str> = devs.iter().map(|r| r.name.as_str()).collect();
             dev_names.sort_unstable();
             kassert_eq!(dev_names, [".", "..", "console", "null", "random", "tty", "urandom", "zero"]);

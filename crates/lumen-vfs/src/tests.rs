@@ -7645,7 +7645,9 @@ fn setup_dynfs() -> (TestTables, Arc<uncached::DynFs>, Arc<dyn VfsInode>) {
 
 /// `fixed_namespace_ops!`, which the fake procfs's inodes expand as the
 /// kernel's devfs and procfs do, refuses each of its seven operations with
-/// `-EROFS`, asked directly (the read-only mount refuses first by path).
+/// `-EROFS`, asked directly (the read-only mount refuses first by path);
+/// `mkdir` and `symlink` onto a name in use too, without looking it up
+/// (ARCHITECTURE section 9: `-EROFS` where Linux says `-EEXIST`).
 #[test]
 fn fixed_namespace_ops_refuse_each_change_with_erofs() {
     let (_env, _dynfs, proc_root) = setup_dynfs();
@@ -7653,10 +7655,13 @@ fn fixed_namespace_ops_refuse_each_change_with_erofs() {
     let rofs = Err(VfsError::RoFs);
     assert_eq!(proc_root.create(b"n", 0o644).map(|_| ()), rofs);
     assert_eq!(proc_root.mkdir(b"n", 0o755).map(|_| ()), rofs);
+    assert!(proc_root.lookup(b"version").is_ok());
+    assert_eq!(proc_root.mkdir(b"version", 0o755).map(|_| ()), rofs);
     assert_eq!(proc_root.unlink(b"version"), rofs);
     assert_eq!(proc_root.rmdir(b"version"), rofs);
     assert_eq!(proc_root.link(b"n", &other), rofs);
     assert_eq!(proc_root.symlink(b"n", b"version").map(|_| ()), rofs);
+    assert_eq!(proc_root.symlink(b"version", b"n").map(|_| ()), rofs);
     assert_eq!(proc_root.rename(b"version", &other, b"n", RenameFlags(0)), rofs);
     assert_eq!(proc_root.rename(b"version", &other, b"n", RenameFlags(RenameFlags::EXCHANGE)), rofs);
 }

@@ -217,8 +217,9 @@ crate::ktest!(
 
 crate::ktest!(
     fn vfs_dev_answers_namespace_changes_after_lumen_vfs_checks() {
-        // `check_dev_namespace` on its own, reporting every mismatch
-        // (#301): with devfs's mount writable, lumen-vfs's errnos come
+        // `check_dev_namespace` on its own, reporting every mismatch up to
+        // a change that goes through (see its doc; #301): with devfs's
+        // mount writable, lumen-vfs's errnos come
         // before devfs's `-EROFS`, which a read-only devfs would answer for
         // all of them.
         if let Err(err) = check_dev_namespace() {

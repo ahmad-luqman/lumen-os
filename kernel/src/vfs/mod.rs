@@ -340,7 +340,6 @@ pub fn sync_command(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))]
 fn parse_octal(s: &str) -> Option<u16> {
     u16::from_str_radix(s, 8).ok()
 }
@@ -349,7 +348,6 @@ fn parse_octal(s: &str) -> Option<u16> {
 /// the heap first, and a length from the shell must not panic the kernel.
 const WRITE_PATTERN_MAX: usize = 16 << 20;
 
-#[cfg_attr(feature = "ktest", allow(dead_code))]
 fn vfs_pattern_byte(idx: usize) -> u8 {
     ((idx.wrapping_mul(131)) ^ (idx >> 8).wrapping_mul(17) ^ 0x5a) as u8
 }
@@ -603,22 +601,22 @@ fn check_dev() -> Result<(), String> {
         }
     }
     let dev_null = resolve_path_from_root("/dev/null").map_err(|e| format!("/dev/null: {e:?}"))?;
-    if dev_null.write_at(0, b"discard").map_err(|e| format!("{e:?}"))? != 7 {
+    if dev_null.write_at(0, b"discard").map_err(|e| format!("/dev/null write: {e:?}"))? != 7 {
         return Err(String::from("/dev/null write failed"));
     }
     let mut nb = [0xAAu8; 8];
-    if dev_null.read_at(0, &mut nb).map_err(|e| format!("{e:?}"))? != 0 {
+    if dev_null.read_at(0, &mut nb).map_err(|e| format!("/dev/null read: {e:?}"))? != 0 {
         return Err(String::from("/dev/null read non-empty"));
     }
 
     let dev_zero = resolve_path_from_root("/dev/zero").map_err(|e| format!("/dev/zero: {e:?}"))?;
     let mut zb = [0xFFu8; 16];
-    if dev_zero.read_at(0, &mut zb).map_err(|e| format!("{e:?}"))? != 16 || zb != [0u8; 16] {
+    if dev_zero.read_at(0, &mut zb).map_err(|e| format!("/dev/zero read: {e:?}"))? != 16 || zb != [0u8; 16] {
         return Err(String::from("/dev/zero read mismatch"));
     }
 
-    let dev_rand = resolve_path_from_root("/dev/random").map_err(|e| format!("{e:?}"))?;
-    let dev_urand = resolve_path_from_root("/dev/urandom").map_err(|e| format!("{e:?}"))?;
+    let dev_rand = resolve_path_from_root("/dev/random").map_err(|e| format!("/dev/random: {e:?}"))?;
+    let dev_urand = resolve_path_from_root("/dev/urandom").map_err(|e| format!("/dev/urandom: {e:?}"))?;
     let mut rbuf = [0u8; 32];
     let mut ubuf1 = [0u8; 32];
     let mut ubuf2 = [0u8; 32];
@@ -651,23 +649,16 @@ fn check_dev_namespace() -> Result<(), String> {
     let rofs = Err(VfsError::RoFs);
     let noent = Err(VfsError::NoEnt);
     let dev = resolve_path_from_root("/dev").map_err(|e| format!("/dev: {e:?}"))?;
-    let (src, _) = open_inode(
-        &TABLES,
-        None,
-        b"/tmp/dev_link_src.txt",
-        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-        0o644,
-        0,
-    )
-    .map_err(|e| format!("open /tmp/dev_link_src.txt: {e:?}"))?;
-    drop(src);
+    create_truncated("/tmp/dev_link_src.txt").map_err(|e| format!("open /tmp/dev_link_src.txt: {e:?}"))?;
     let mut mismatches = Vec::new();
     // A change that went through (`Ok` where a refusal was expected) stops
     // the checks: the ones after it would run on a changed `/dev` and bury
     // it under their own mismatches.
     let mut changed = false;
+    let mut skipped = 0usize;
     let mut check = |what: &str, op: &dyn Fn() -> Result<(), VfsError>, want: Result<(), VfsError>| {
         if changed {
+            skipped += 1;
             return;
         }
         let got = op();
@@ -713,14 +704,17 @@ fn check_dev_namespace() -> Result<(), String> {
         Err(VfsError::XDev),
     );
     check("forbidden after the refusals", &|| resolve_path_from_root("/dev/forbidden").map(drop), noent);
-    if changed {
-        mismatches.push(String::from("/dev: a change went through, so the checks after it didn't run"));
+    if skipped > 0 {
+        mismatches.push(format!("/dev: a change went through, so the {skipped} checks after it didn't run"));
     }
-    // Best effort, its failure already reported above: a `/dev/forbidden`
-    // left behind would fail the next run's checks for another reason.
-    if resolve_path_from_root("/dev/forbidden").is_ok() {
-        let _ = unlink_at(&TABLES, None, b"/dev/forbidden", false)
-            .or_else(|_| unlink_at(&TABLES, None, b"/dev/forbidden", true));
+    // A `/dev/forbidden` that a change left (reported above) is removed, or
+    // the next run's `create` would open it and stop there, blaming the
+    // wrong check: a removal that fails is reported too.
+    if resolve_path_from_root("/dev/forbidden").is_ok()
+        && let Err(e) = unlink_at(&TABLES, None, b"/dev/forbidden", false)
+            .or_else(|_| unlink_at(&TABLES, None, b"/dev/forbidden", true))
+    {
+        mismatches.push(format!("couldn't remove the /dev/forbidden left behind: {e:?}"));
     }
     if let Err(e) = unlink_at(&TABLES, None, b"/tmp/dev_link_src.txt", false) {
         mismatches.push(format!("unlink /tmp/dev_link_src.txt: {e:?}"));
@@ -1016,9 +1010,10 @@ fn vfstest_read(ctx: &mut Ctx<'_>, path: &str, len: &str) {
     }
 }
 
-/// `path` opened for writing as `vfstest write` and `write-pattern` do:
-/// created (0o644 under umask 0o022) or truncated.
-fn vfstest_create(path: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+/// `path` opened for writing, as `vfstest write` and `write-pattern` and
+/// `check_dev_namespace`'s link source want it: created (0o644 under umask
+/// 0o022) or truncated.
+fn create_truncated(path: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
     let flags = OpenFlags::from_bits_truncate(OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
     open_inode(&TABLES, None, path.as_bytes(), flags, 0o644, 0o022).map(|(inode, _)| inode)
 }
@@ -1033,16 +1028,21 @@ fn vfstest_ok<T>(ctx: &mut Ctx<'_>, name: &str, r: Result<T, VfsError>) {
     }
 }
 
+/// `wrote <n>`, or `r`'s error as the command's failure.
+fn vfstest_wrote(ctx: &mut Ctx<'_>, name: &str, r: Result<usize, VfsError>) {
+    match r {
+        Ok(n) => {
+            let _ = writeln!(ctx.out, "wrote {n}");
+        }
+        Err(e) => ctx.fail(format_args!("{name}: {e:?}")),
+    }
+}
+
 /// `vfstest write <path> <text>...`: the words joined by spaces, from
 /// offset 0 of the file created or truncated.
 fn vfstest_write(ctx: &mut Ctx<'_>, path: &str, text: &[String]) {
     let payload = text.join(" ");
-    match vfstest_create(path).and_then(|inode| inode.write_at(0, payload.as_bytes())) {
-        Ok(n) => {
-            let _ = writeln!(ctx.out, "wrote {n}");
-        }
-        Err(e) => ctx.fail(format_args!("write: {e:?}")),
-    }
+    vfstest_wrote(ctx, "write", create_truncated(path).and_then(|inode| inode.write_at(0, payload.as_bytes())));
 }
 
 /// `vfstest write-pattern <path> <bytes>`: [`vfs_pattern_byte`]'s bytes,
@@ -1054,16 +1054,11 @@ fn vfstest_write_pattern(ctx: &mut Ctx<'_>, path: &str, len: &str) {
     if len > WRITE_PATTERN_MAX {
         return ctx.fail("write-pattern: length exceeds 16 MiB");
     }
-    let wrote = vfstest_create(path).and_then(|inode| {
+    let wrote = create_truncated(path).and_then(|inode| {
         let buf: Vec<u8> = (0..len).map(vfs_pattern_byte).collect();
         inode.write_at(0, &buf)
     });
-    match wrote {
-        Ok(n) => {
-            let _ = writeln!(ctx.out, "wrote {n}");
-        }
-        Err(e) => ctx.fail(format_args!("write-pattern: {e:?}")),
-    }
+    vfstest_wrote(ctx, "write-pattern", wrote);
 }
 
 /// `vfstest verify-pattern <path> <bytes>`: the file is `write-pattern`'s

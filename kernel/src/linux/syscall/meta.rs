@@ -1126,26 +1126,30 @@ mod tests {
         fs: Arc<dyn lumen_vfs::FileSystem>,
         f: impl FnOnce() -> Result<(), &'static str> + Send + 'static,
     ) -> Result<(), &'static str> {
-        let rmdir = || lumen_vfs::unlink_at(tables(), None, mnt.as_bytes(), true).map_err(|_| "rmdir");
+        let rmdir = || lumen_vfs::unlink_at(tables(), None, mnt.as_bytes(), true);
         let mp = lumen_vfs::mkdir_at(tables(), None, mnt.as_bytes(), 0o755, 0).map_err(|_| "mkdir")?;
         let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
-        if tables().mount(mp, mnt, fs).is_err() {
-            let _ = rmdir();
+        if let Err(e) = tables().mount(mp, mnt, fs) {
+            log::warn!(target: "ktest", "{mnt}: mount failed: {e:?}");
+            if let Err(e) = rmdir() {
+                log::warn!(target: "ktest", "{mnt}: rmdir failed: {e:?}");
+            }
             return Err("mount");
         }
         let ran = process::in_test_process(|_| f());
-        let umounted = tables().umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
+        let umounted = tables().umount(mp_dev, mp_ino).map(drop);
         let removed = rmdir();
         // Only the first failure is returned: every cleanup failure is
-        // logged, so none is lost (the mount may stay at `mnt`).
-        for (step, r) in [("umount", umounted), ("rmdir", removed.map(drop))] {
+        // logged with its errno, so none is lost (the mount may stay at
+        // `mnt`).
+        for (step, r) in [("umount", umounted), ("rmdir", removed)] {
             if let Err(e) = r {
-                log::warn!(target: "ktest", "{mnt}: {step} failed: {e}");
+                log::warn!(target: "ktest", "{mnt}: {step} failed: {e:?}");
             }
         }
         ran??;
-        umounted?;
-        removed.map(drop)
+        umounted.map_err(|_| "umount")?;
+        removed.map_err(|_| "rmdir")
     }
 
     crate::ktest!(

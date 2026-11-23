@@ -18,7 +18,8 @@
 //!   looking the name up; `link` looks first). So are they in `/dev`, a
 //!   writable mount (#301) whose names never change: devfs's own `mkdir`
 //!   and `symlink` refuse without looking (`lumen_vfs::fixed_namespace_ops!`;
-//!   `check_dev_namespace`'s "over a node" lines).
+//!   `check_dev_namespace`'s "mkdir over a node" and "symlink over a node"
+//!   lines).
 //! - `RENAME_WHITEOUT` is `-EINVAL` (Linux allows it for root on tmpfs and
 //!   ext4; there are no whiteouts here).
 //!
