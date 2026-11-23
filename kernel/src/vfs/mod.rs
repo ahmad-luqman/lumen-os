@@ -132,7 +132,7 @@ impl KernelVfsTables {
         self.mounts.lock().snapshot_filesystems()
     }
 
-    /// Every inode in `InodeCache` (procfs's and global reclaim's ktests).
+    /// Every inode in `InodeCache` (for the ktests).
     #[cfg(feature = "ktest")]
     pub fn snapshot_inodes(&self) -> Vec<Arc<dyn VfsInode>> {
         self.inodes.lock().snapshot_all()

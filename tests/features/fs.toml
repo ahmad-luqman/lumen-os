@@ -109,7 +109,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Files, directories and symlinks (inline and in a block) made on ext4 get i_crtime and i_crtime_extra set to their creation time, epoch and nanoseconds included, kept by later writes, flushes and a remount (#303)"
+name = "Files, directories and symlinks (inline and in a block) made on ext4 get i_crtime and i_crtime_extra set to their creation time, epoch and nanoseconds included, kept by later writes (of a file and a directory), flushes and a remount (#303)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_new_inodes_get_a_creation_time_that_survives_a_remount",
