@@ -21,6 +21,14 @@ pub struct MountInfo {
     pub read_only: bool,
 }
 
+impl MountInfo {
+    /// `fs` mounted at `mount_path`, asking `fs` for its device, name and
+    /// read-only flag (so never under Lock 9).
+    pub fn of(fs: &dyn FileSystem, mount_path: String) -> Self {
+        Self { dev_id: fs.dev_id(), fs_name: fs.name(), mount_path, read_only: fs.read_only() }
+    }
+}
+
 struct MountRecord {
     mount_id: u64,
     fs: Arc<dyn FileSystem>,
@@ -218,24 +226,13 @@ impl MountTable {
         out
     }
 
-    /// Snapshot mount metadata for `/proc/mounts` and `mount` output.
-    pub fn list_mounts(&self) -> Vec<MountInfo> {
+    /// Every mount's filesystem and path, `/` first, for `/proc/mounts` and
+    /// `mount`: the caller asks the filesystems for the rest
+    /// ([`MountInfo::of`]) after releasing Lock 9.
+    pub fn snapshot_mounts(&self) -> Vec<(Arc<dyn FileSystem>, String)> {
         let mut out = Vec::with_capacity(self.mounts.len() + usize::from(self.root.is_some()));
-        if let Some(root) = &self.root {
-            out.push(MountInfo {
-                dev_id: root.fs.dev_id(),
-                fs_name: root.fs.name(),
-                mount_path: root.mount_path.clone(),
-                read_only: root.fs.read_only(),
-            });
-        }
-        for rec in self.mounts.values() {
-            out.push(MountInfo {
-                dev_id: rec.fs.dev_id(),
-                fs_name: rec.fs.name(),
-                mount_path: rec.mount_path.clone(),
-                read_only: rec.fs.read_only(),
-            });
+        for rec in self.root.iter().chain(self.mounts.values()) {
+            out.push((Arc::clone(&rec.fs), rec.mount_path.clone()));
         }
         out
     }
@@ -356,14 +353,14 @@ pub trait VfsCacheOps {
 /// [`LockFamily`] that guards each table.
 ///
 /// Strict sub-order `MountTable -> DentryCache -> InodeCache`. Never holds
-/// any of the three across `FileSystem::root_inode()`, `FileSystem::read_only()`
-/// (`fs_read_only`), Locks 1–8, or the drops of the inodes `umount` evicts.
-/// Some calls into the filesystems still run under them: `VfsInode::dev_id`,
-/// `ino` and `cacheable` (fixed state, by design), and #320's pre-existing
-/// cases (`MountTable::mount_with_ino`'s `inode_type()` and its error
-/// paths' `Arc` drops, the unmounted mountpoint's `Arc` dropped inside
-/// `MountTable::umount`, `list_mounts`' `read_only()`/`name()`, the `Arc`s
-/// `InodeCache::get_or_insert` drops).
+/// any of the three across `FileSystem::root_inode()`, `read_only()` and
+/// `name()` (`fs_read_only`, `list_mounts`), Locks 1–8, or the drops of the
+/// inodes `umount` evicts. Some calls into the filesystems still run under
+/// them: `VfsInode::dev_id`, `ino` and `cacheable` and `FileSystem::dev_id`
+/// (fixed state, by design), and #320's pre-existing cases
+/// (`MountTable::mount_with_ino`'s `inode_type()` and its error paths'
+/// `Arc` drops, the unmounted mountpoint's `Arc` dropped inside
+/// `MountTable::umount`, the `Arc`s `InodeCache::get_or_insert` drops).
 pub struct VfsTables<F: LockFamily> {
     mounts: F::Lock<MountTable>,
     dentries: F::Lock<DentryCache>,
@@ -467,9 +464,11 @@ impl<F: LockFamily> VfsTables<F> {
         self.dentries.lock().len()
     }
 
-    /// Every active mount (`MountTable::list_mounts`).
+    /// Every active mount, `/` first; the filesystems are asked for their
+    /// name and read-only flag after the lock is released.
     pub fn list_mounts(&self) -> Vec<MountInfo> {
-        self.mounts.lock().list_mounts()
+        let mounts = self.mounts.lock().snapshot_mounts();
+        mounts.into_iter().map(|(fs, path)| MountInfo::of(fs.as_ref(), path)).collect()
     }
 
     /// Every cached name.

@@ -103,7 +103,7 @@ pub fn tables() -> &'static KernelVfsTables {
     &TABLES
 }
 
-/// Snapshot all active mounts (`MountTable::list_mounts`).
+/// Snapshot all active mounts (`VfsTables::list_mounts`).
 pub fn list_mounts() -> Vec<MountInfo> {
     TABLES.list_mounts()
 }

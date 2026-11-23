@@ -5059,21 +5059,56 @@ fn mount_root_and_mount_seed_their_roots_into_inode_cache() {
 }
 
 #[test]
+fn list_mounts_asks_the_filesystems_after_releasing_lock9() {
+    // `MemFs::read_only` asserts Lock 9 is free.
+    let (env, root_fs) = setup_vfs();
+    let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
+    env.mount(mp, "/mnt", MemFs::new(DevId::TMPFS, "tmpfs", true) as Arc<dyn FileSystem>).unwrap();
+    let info = |dev_id, fs_name, mount_path: &str, read_only| MountInfo {
+        dev_id,
+        fs_name,
+        mount_path: String::from(mount_path),
+        read_only,
+    };
+    assert_eq!(
+        env.list_mounts(),
+        vec![info(DevId::ROOT, "ext4", "/", false), info(DevId::TMPFS, "tmpfs", "/mnt", true)]
+    );
+}
+
+#[test]
 fn probes_refuse_inodes_of_unmounted_filesystems() {
     let (env, root_fs) = setup_vfs();
     let root = root_fs.root_inode();
     let (rdev, rino) = (root.dev_id(), root.ino());
+    let refused = |fs: &Arc<MemFs>, what: &str| {
+        // Current generations: only the mount check stands in the way.
+        let (dentry_gen, inode_gen) = env.cache_gens();
+        let child = fs.root.mkdir(b"child", 0o755).unwrap();
+        let ino = child.ino();
+        assert!(
+            env.publish_lookup_inode(rdev, rino, b"x", Arc::clone(&child), dentry_gen, inode_gen).is_err(),
+            "{what}"
+        );
+        assert!(
+            env.publish_created_inode(rdev, rino, b"y", Arc::clone(&child), dentry_gen, inode_gen).is_err(),
+            "{what}"
+        );
+        assert!(env.inode_get_or_insert_if_fresh(child, inode_gen).is_err(), "{what}");
+        assert!(env.inode_get(fs.dev, ino).is_none(), "{what}");
+        assert!(env.dentry_get(rdev, rino, b"x").is_none(), "{what}");
+        assert!(env.dentry_get(rdev, rino, b"y").is_none(), "{what}");
+    };
+
+    refused(&MemFs::new(DevId::TMPFS, "tmpfs", false), "a filesystem never mounted");
+    // One unmounted since: a lookup that raced `umount`.
+    let gone = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    let mp = root.mkdir(b"mnt", 0o755).unwrap();
+    env.mount(Arc::clone(&mp), "/mnt", Arc::clone(&gone) as Arc<dyn FileSystem>).unwrap();
+    drop(env.umount(mp.dev_id(), mp.ino()).unwrap());
+    refused(&gone, "a filesystem unmounted");
+
     let (dentry_gen, inode_gen) = env.cache_gens();
-
-    // A filesystem that was never mounted (or was unmounted meanwhile).
-    let stray = MemFs::new(DevId::TMPFS, "tmpfs", false);
-    assert!(env.publish_lookup_inode(rdev, rino, b"a", stray.root_inode(), dentry_gen, inode_gen).is_err());
-    assert!(env.publish_created_inode(rdev, rino, b"b", stray.root_inode(), dentry_gen, inode_gen).is_err());
-    assert!(env.inode_get_or_insert_if_fresh(stray.root_inode(), inode_gen).is_err());
-    assert!(env.inode_get(DevId::TMPFS, stray.root_inode().ino()).is_none());
-    assert!(env.dentry_get(rdev, rino, b"a").is_none());
-    assert!(env.dentry_get(rdev, rino, b"b").is_none());
-
     // The same calls with the mounted root filesystem's inodes are taken.
     for (name, call) in [(&b"a"[..], 0), (b"b", 1), (b"c", 2)] {
         let inode = root.create(name, 0o644).unwrap();
