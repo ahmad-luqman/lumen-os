@@ -6066,9 +6066,13 @@ const SWEPT_SRC: &[u8] = b"SOURCE";
 #[cfg(feature = "ktest")]
 const SWEPT_DST: &[u8] = b"TARGET-DATA";
 
+/// Two directories' inodes.
+#[cfg(feature = "ktest")]
+type DirPair = (Arc<dyn VfsInode>, Arc<dyn VfsInode>);
+
 /// The swept renames' directories `a` and `b` under `root`.
 #[cfg(feature = "ktest")]
-fn swept_dirs(root: &Arc<dyn VfsInode>) -> Result<(Arc<dyn VfsInode>, Arc<dyn VfsInode>), &'static str> {
+fn swept_dirs(root: &Arc<dyn VfsInode>) -> Result<DirPair, &'static str> {
     Ok((root.lookup(b"a").map_err(|_| "a")?, root.lookup(b"b").map_err(|_| "b")?))
 }
 
