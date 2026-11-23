@@ -162,8 +162,22 @@ tests = [
 ]
 
 [[feature]]
-name = "tmpfs quota charges inodes, directory entries and symlink targets as well as pages (#267): past it create, mkdir, symlink, link and a rename to a new name costing more than the old fail with ENOSPC and leave nothing behind (an existing name still EEXIST); a rename to a name no longer than the old one fits on a full mount; unlink gives a name's room back, the last reference an inode's, and dropping a mount every byte"
+name = "tmpfs quota charges inodes, directory entries and symlink targets as well as pages (#267): past it create, mkdir, symlink, link and a rename to a new name costing more than the old fail with ENOSPC and leave nothing behind (an existing name is still EEXIST for each of the four); a rename to a name no longer than the old one fits on a full mount, as does an exchange; a rename across directories moves the name's charge; unlink gives a name's room back (names at the heap granule's edge too), the last reference an inode's, and dropping a mount every byte"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_charges_inodes_names_and_symlink_targets",
+]
+
+[[feature]]
+name = "tmpfs's quota charges for inodes, directory entries and symlink targets are at least what they take from the kernel heap (#267), measured: one directory of hundreds of long names, the same after removing every other one, and many directories of one entry each"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_charges_cover_what_the_heap_gives",
+]
+
+[[feature]]
+name = "tmpfs files created through the kernel's VFS tables until ENOSPC and unlinked by unlink_at give all their quota back, so as many can be created again (#267)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_unlinking_through_the_vfs_gives_the_room_back",
 ]

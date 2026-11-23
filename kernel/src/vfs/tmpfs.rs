@@ -25,7 +25,7 @@ use crate::time;
 use super::page_cache::{self, CachePage, PAGE_SIZE, PageCache, QuotaCounter};
 use charge::{Children, EntryCharge, FIRST_CHILD_CURSOR, Growth, InodeCharge};
 #[cfg(feature = "ktest")]
-use charge::{DIR_COST, INODE_COST, entry_cost};
+use charge::{DIR_COST, INODE_COST, entry_cost, heap_block};
 
 struct TmpfsShared {
     dev: DevId,
@@ -236,7 +236,7 @@ mod charge {
 
     /// The heap block holding `bytes`: `lumen_heap` rounds every block up
     /// to its granule and keeps no header.
-    const fn heap_block(bytes: usize) -> usize {
+    pub(super) const fn heap_block(bytes: usize) -> usize {
         bytes.next_multiple_of(lumen_heap::GRANULE)
     }
 
@@ -1509,7 +1509,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use alloc::format;
         let flags = RenameFlags(0);
-        kassert!(INODE_COST >= size_of::<TmpfsInode>());
+        let exchange = RenameFlags(RenameFlags::EXCHANGE);
+        kassert!(INODE_COST >= size_of::<TmpfsInode>() + 2 * size_of::<usize>()); // an `Arc`'s block
         kassert_eq!(entry_cost(255) - entry_cost(0), 2 * 256); // two 16-byte-granule blocks
 
         // Inodes: room for exactly `N` files named with 8 bytes.
@@ -1523,14 +1524,22 @@ crate::ktest!(
             held.push(root.create(&name(i), 0o644).map_err(|_| "create within the quota")?);
         }
         kassert_eq!(fs.used_bytes(), N * file_cost);
+        let root_nlink = root.stat().map_err(|_| "stat root")?.nlink;
         kassert_eq!(root.create(b"one_more", 0o644).err(), Some(VfsError::NoSpc));
         kassert_eq!(root.mkdir(b"one_more", 0o755).err(), Some(VfsError::NoSpc));
         kassert_eq!(root.symlink(b"one_more", b"t").err(), Some(VfsError::NoSpc));
         kassert_eq!(root.link(b"one_more", &held[1]).err(), Some(VfsError::NoSpc));
         kassert_eq!(root.lookup(b"one_more").err(), Some(VfsError::NoEnt));
         kassert_eq!(fs.used_bytes(), N * file_cost);
+        kassert_eq!(held[1].stat().map_err(|_| "stat")?.nlink, 1);
         // An existing name is `Exist`, full or not.
         kassert_eq!(root.create(&name(1), 0o644).err(), Some(VfsError::Exist));
+        kassert_eq!(root.mkdir(&name(1), 0o755).err(), Some(VfsError::Exist));
+        kassert_eq!(root.symlink(&name(1), b"t").err(), Some(VfsError::Exist));
+        kassert_eq!(root.link(&name(1), &held[2]).err(), Some(VfsError::Exist));
+        // Exchanging two names keeps both, and their charges.
+        root.rename(&name(2), &root, &name(3), exchange).map_err(|_| "exchange on a full mount")?;
+        kassert_eq!(fs.used_bytes(), N * file_cost);
         // Unlinking gives the name's room back; the inode's comes back when
         // its last reference goes (an open file unlinked keeps it).
         root.unlink(&name(0)).map_err(|_| "unlink")?;
@@ -1541,6 +1550,7 @@ crate::ktest!(
         kassert_eq!(root.mkdir(b"d0000000", 0o755).err(), Some(VfsError::NoSpc));
         kassert_eq!(root.lookup(b"d0000000").err(), Some(VfsError::NoEnt));
         kassert_eq!(fs.used_bytes(), (N - 1) * file_cost);
+        kassert_eq!(root.stat().map_err(|_| "stat root")?.nlink, root_nlink); // no `..` counted
         held.insert(0, root.create(&name(0), 0o644).map_err(|_| "create in the room freed")?);
         kassert_eq!(fs.used_bytes(), N * file_cost);
         // A rename over a file frees the old name and the replaced inode.
@@ -1605,7 +1615,18 @@ crate::ktest!(
         for c in (1..K as u8).map(|c| b'a' + c).chain(*b"z") {
             root.unlink(&long(c)).map_err(|_| "unlink a link")?;
         }
-        kassert_eq!(fs.used_bytes(), INODE_COST + entry_cost(1));
+        let one = INODE_COST + entry_cost(1);
+        kassert_eq!(fs.used_bytes(), one);
+        // Names at the heap granule's edge, 16 bytes and 17, each give back
+        // exactly what it took.
+        root.link(&[b'g'; 16], &t).map_err(|_| "link 16")?;
+        root.link(&[b'h'; 17], &t).map_err(|_| "link 17")?;
+        kassert_eq!(fs.used_bytes(), one + entry_cost(16) + entry_cost(17));
+        kassert_eq!(entry_cost(17) - entry_cost(16), 2 * 16);
+        root.unlink(&[b'g'; 16]).map_err(|_| "unlink 16")?;
+        kassert_eq!(fs.used_bytes(), one + entry_cost(17));
+        root.unlink(&[b'h'; 17]).map_err(|_| "unlink 17")?;
+        kassert_eq!(fs.used_bytes(), one);
 
         // Symlink targets: room for one symlink "s" to a 4000-byte target.
         const T: usize = 4000;
@@ -1624,18 +1645,135 @@ crate::ktest!(
         kassert_eq!(fs.used_bytes(), 0);
         root.symlink(b"s", &target).map_err(|_| "symlink again")?;
 
-        // Dropping a mount with everything in it gives every byte back:
-        // pages, inodes, the entries of a directory inside, a target.
+        // Across directories: a rename moves the name's charge, net of the
+        // new name's cost, and an exchange moves nothing. Then dropping the
+        // mount with everything in it gives every byte back but what an
+        // inode still held keeps: pages, inodes, a directory's entries
+        // inside (16 and 17 bytes among them), a target.
         let fs = Tmpfs::new(DevId::makedev(0, 138), 64 * PAGE_SIZE);
         let quota = Arc::clone(&fs.shared.quota);
-        let sub = fs.root_inode().mkdir(b"sub", 0o755).map_err(|_| "mkdir sub")?;
+        let root = fs.root_inode();
+        let sub = root.mkdir(b"sub", 0o755).map_err(|_| "mkdir sub")?;
         let f = sub.create(b"file", 0o644).map_err(|_| "create sub/file")?;
         kassert_eq!(f.write_at(0, &[1u8; 100]).map_err(|_| "write")?, 100);
         sub.symlink(b"link", b"file").map_err(|_| "symlink sub/link")?;
-        let inodes = 3 * INODE_COST + DIR_COST + 16; // "file", a 16-byte block
-        kassert_eq!(quota.used_bytes(), inodes + entry_cost(3) + 2 * entry_cost(4) + PAGE_SIZE);
-        drop((f, sub, fs));
+        let inodes = 3 * INODE_COST + DIR_COST;
+        let target_block = heap_block(b"file".len());
+        let at_first = inodes + target_block + entry_cost(3) + 2 * entry_cost(4) + PAGE_SIZE;
+        kassert_eq!(quota.used_bytes(), at_first);
+        sub.rename(b"file", &root, &[b'm'; 17], flags).map_err(|_| "rename across")?;
+        kassert_eq!(quota.used_bytes(), at_first - entry_cost(4) + entry_cost(17));
+        root.rename(&[b'm'; 17], &sub, b"link", exchange).map_err(|_| "exchange across")?;
+        kassert_eq!(quota.used_bytes(), at_first - entry_cost(4) + entry_cost(17));
+        sub.rename(b"link", &sub, &[b'g'; 16], flags).map_err(|_| "rename in sub")?;
+        root.rename(&[b'm'; 17], &sub, &[b'h'; 17], flags).map_err(|_| "rename back across")?;
+        let sub_names = entry_cost(16) + entry_cost(17);
+        kassert_eq!(quota.used_bytes(), at_first - 2 * entry_cost(4) + sub_names);
+        drop((sub, root, fs));
+        kassert_eq!(quota.used_bytes(), INODE_COST + PAGE_SIZE); // `f` and its page
+        drop(f);
         kassert_eq!(quota.used_bytes(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tmpfs_quota_charges_cover_what_the_heap_gives() {
+        // #267's bound: what a mount charges for inodes, entries and targets
+        // is at least what they take from the kernel heap
+        // (`heap::stats().used`, which nothing else moves meanwhile: names,
+        // targets and the holder are made first). Three shapes: one
+        // directory with hundreds of long names, so both maps grow nodes
+        // past their roots (an entry's share); the same after removing every
+        // other name (nodes at their emptiest); many directories of one
+        // entry each (a directory's map roots, `DIR_COST`). The root's own
+        // maps are free by design, so each baseline is taken with the root
+        // already holding an entry.
+        use crate::kassert;
+        use crate::mm::heap;
+        use alloc::format;
+        fn covered(what: &'static str, heap0: usize, quota0: usize, fs: &Tmpfs) -> Result<(), &'static str> {
+            let took = heap::stats().used as isize - heap0 as isize;
+            let charged = fs.used_bytes() as isize - quota0 as isize;
+            crate::ktest::diag(format_args!("{what}: the heap gave {took} bytes, the quota charged {charged}"));
+            kassert!(took <= charged);
+            Ok(())
+        }
+        const FILES: usize = 240;
+        const LINKS: usize = 120;
+        const DIRS: usize = 48;
+        let fs = Tmpfs::new(DevId::makedev(0, 141), 1024 * PAGE_SIZE);
+        let root = fs.root_inode();
+        root.create(b"a", 0o644).map_err(|_| "create a")?;
+        let long = |i: usize| {
+            let mut name = format!("{i:05}").into_bytes();
+            name.resize(255, b'n');
+            name
+        };
+        let names: Vec<Vec<u8>> = (0..FILES + LINKS).map(long).collect();
+        let dir_names: Vec<Vec<u8>> = (0..DIRS).map(|i| format!("d{i:04}").into_bytes()).collect();
+        crate::ktest::diag(format_args!(
+            "INODE_COST {INODE_COST}, DIR_COST {DIR_COST}, entry_cost(8) {}, entry_cost(255) {}",
+            entry_cost(8),
+            entry_cost(255)
+        ));
+        let target = [b'p'; 4001]; // not a whole number of heap granules
+        let mut files = Vec::with_capacity(FILES);
+        let mut dirs = Vec::with_capacity(DIRS);
+
+        let (heap0, quota0) = (heap::stats().used, fs.used_bytes());
+        let big = root.mkdir(b"big", 0o755).map_err(|_| "mkdir big")?;
+        for name in &names[..FILES] {
+            files.push(big.create(name, 0o644).map_err(|_| "create")?);
+        }
+        for (i, name) in names[FILES..].iter().enumerate() {
+            big.link(name, &files[i]).map_err(|_| "link")?;
+        }
+        big.symlink(b"s", &target).map_err(|_| "symlink")?;
+        covered("one directory", heap0, quota0, &fs)?;
+        for name in names.iter().step_by(2) {
+            big.unlink(name).map_err(|_| "unlink")?;
+        }
+        covered("every other name removed", heap0, quota0, &fs)?;
+
+        let (heap0, quota0) = (heap::stats().used, fs.used_bytes());
+        for name in &dir_names {
+            let d = root.mkdir(name, 0o755).map_err(|_| "mkdir")?;
+            d.create(b"f", 0o644).map_err(|_| "create f")?;
+            dirs.push(d);
+        }
+        covered("one entry per directory", heap0, quota0, &fs)?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tmpfs_unlinking_through_the_vfs_gives_the_room_back() {
+        // The charges come back through the kernel's VFS tables too, whose
+        // caches let an unlinked inode go: files made by `open_inode` until
+        // `NoSpc`, all unlinked by `unlink_at`, then as many made again.
+        use crate::kassert_eq;
+        use crate::vfs::KernelVfsTables;
+        use alloc::format;
+        use lumen_vfs::{OpenFlags, open_inode, unlink_at};
+        const FILES: usize = 5;
+        let file_cost = INODE_COST + entry_cost(8);
+        let fs = Tmpfs::new(DevId::makedev(0, 142), FILES * file_cost);
+        let tables = KernelVfsTables::new();
+        tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+        let create = OpenFlags::from_bits_truncate(OpenFlags::O_CREAT | OpenFlags::O_WRONLY);
+        let path = |i: usize| format!("/f{i:07}").into_bytes();
+        for _ in 0..2 {
+            for i in 0..FILES {
+                open_inode(&tables, None, &path(i), create, 0o644, 0).map_err(|_| "create within the quota")?;
+            }
+            kassert_eq!(open_inode(&tables, None, b"/one_more", create, 0o644, 0).err(), Some(VfsError::NoSpc));
+            kassert_eq!(fs.used_bytes(), FILES * file_cost);
+            for i in 0..FILES {
+                unlink_at(&tables, None, &path(i), false).map_err(|_| "unlink")?;
+            }
+            kassert_eq!(fs.used_bytes(), 0);
+        }
         Ok(())
     }
 );
