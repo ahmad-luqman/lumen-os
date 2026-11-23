@@ -226,8 +226,8 @@ impl TmpfsInode {
         let old_size = meta.size;
         let _ = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
         // A write starting past the end grows the file to `offset` first.
-        pages.zero_tail(old_size, offset.max(old_size), false);
-        let done = pages.write_from(offset, buf, false, |_| CachePage::new_shared())?;
+        pages.zero_tail(old_size, offset.max(old_size));
+        let done = pages.write_from(offset, buf, |_| CachePage::new_shared())?;
         let written_end = offset + done as u64;
         let now = time::realtime_timespec();
         if written_end > meta.size {
@@ -882,7 +882,7 @@ impl VfsInode for TmpfsInode {
         if new_size < old_size {
             pages.remove_from(page::pages_in(new_size));
         }
-        pages.zero_tail(old_size, new_size, false);
+        pages.zero_tail(old_size, new_size);
         let now = time::realtime_timespec();
         meta.size = new_size;
         meta.mtime = now;
