@@ -22,9 +22,11 @@ pub mod fd;
 pub mod fs;
 pub mod locks;
 pub mod mount;
+pub mod nlink;
 pub mod ops;
 pub mod page;
 pub mod procfs;
+pub mod pseudo;
 pub mod resolve;
 pub mod types;
 

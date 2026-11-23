@@ -3723,11 +3723,11 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 88 | `symlink(target, linkpath)` | shim to `symlinkat(target, AT_FDCWD, linkpath)` |
 | 89 | `readlink(path, buf, bufsiz)` | shim to `readlinkat(AT_FDCWD, path, buf, bufsiz)` |
 | 90 | `chmod(path, mode)` | shim to `fchmodat(AT_FDCWD, path, mode)` |
-| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on a read-only mount, devfs's nodes excepted: see below) |
+| 91 | `fchmod(fd, mode)` | updates `mode & 0o7777` and `ctime` on open `fd`'s inode (`-EBADF` on `O_PATH`, `-EROFS` on a read-only mount; devfs: see below) |
 | 92 | `chown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, 0)` |
-| 93 | `fchown(fd, uid, gid)` | updates `uid`/`gid` (`u32::MAX` = leave unchanged) and `ctime` on open `fd`'s inode, dropping setuid (and setgid with group-execute) on a non-directory in the same `set_owner` (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs, devfs's nodes excepted: see below) |
+| 93 | `fchown(fd, uid, gid)` | updates `uid`/`gid` (`u32::MAX` = leave unchanged) and `ctime` on open `fd`'s inode, dropping setuid (and setgid with group-execute) on a non-directory in the same `set_owner` (`-EBADF` on `O_PATH`, `-EROFS` on read-only fs; devfs: see below) |
 | 94 | `lchown(path, uid, gid)` | shim to `fchownat(AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW)` |
-| — | *`chmod`, `chown` and `utimensat` families on `devfs`* | devfs's mount (`DevId::DEVFS`) skips the read-only-mount `-EROFS` (#293): Linux's devtmpfs is a writable mount. Its nodes' setters keep the new mode, owner and times in memory until reboot, and `stat` shows them. `/dev` itself stays `-EROFS`, its setters refusing (a divergence: Lumen's `/dev` namespace is read-only, and Linux's devtmpfs takes these on `/dev` too). A special file on any other read-only mount is `-EROFS`, as Linux's `mnt_want_write` |
+| — | *`chmod`, `chown` and `utimensat` families on `devfs`* | devfs's mounts are writable, as every Linux devtmpfs mount (#301), so these reach its setters (#293). Its nodes' setters keep the new mode, owner and times in memory until reboot, and `stat` shows them, on any devfs instance. `/dev` itself stays `-EROFS`, its setters refusing (a divergence: Linux's devtmpfs takes these on `/dev` too), while `access("/dev", W_OK)` passes for root, as on Linux. A special file on a read-only mount is `-EROFS`, as Linux's `mnt_want_write` |
 | 95 | `umask(mask)` | atomically sets per-process `umask = mask & 0o777` (default `0o022`) and returns previous mask |
 | 162 | `sync()` | snapshots mounted filesystems and cached inodes (never holding `MountTable`/`InodeCache` across I/O), flushes every dirty `PageCache` page and `BlockCache` block followed by `BlockDevice::flush()`; always returns `0` |
 | 217 | `getdents64(fd, dirp, count)` | validates open directory (`-ENOTDIR`, `-EBADF` on `O_PATH`), emits 8-byte-aligned `struct linux_dirent64` records (`d_ino`, `d_off`, `d_reclen`, `d_type`, NUL-terminated `d_name`) advancing `OpenFile::dir_cursor` (the filesystem's `readdir` cursor, stable as entries come and go, with ext4's exceptions in section 9; `d_off` the cursor past each record); returns bytes written (`0` at EOF, `-EINVAL` if `count` cannot fit the next entry) |
@@ -3740,13 +3740,13 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 265 | `linkat(olddirfd, old, newdirfd, new, flags)` | creates hard link (`AT_SYMLINK_FOLLOW` / `AT_EMPTY_PATH`); rejects existing target (`-EEXIST`, a trailing `/` too; `-ENOENT` for a trailing `/` on a free name), then a read-only filesystem (`-EROFS`), then cross-mount (`-EXDEV`), then directories (`-EPERM`), Linux's order, incrementing `st_nlink` |
 | 266 | `symlinkat(target, newdirfd, linkpath)` | creates symlink with verbatim non-empty `target` (`-ENOENT` if `target` is empty, `-EEXIST` if `linkpath` exists, `-ENOENT`/`-EEXIST` on trailing `/`; the target's bytes stored as given, UTF-8 or not, #268) |
 | 267 | `readlinkat(dirfd, path, buf, bufsiz)` | does not follow final symlink (`-EINVAL` if target is not a symlink or `bufsiz <= 0`); accepts empty `path == ""` on an `O_PATH` symlink `dirfd` (`-ENOENT` if that file is not a symlink, as Linux); copies `min(target.len(), bufsiz)` bytes **without** trailing NUL and returns bytes copied |
-| 268 | `fchmodat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`, which `musl` leaves uninitialized); follows symlinks and updates mode bits and `ctime` (`-EROFS` on read-only fs, devfs's nodes excepted) |
+| 268 | `fchmodat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`, which `musl` leaves uninitialized); follows symlinks and updates mode bits and `ctime` (`-EROFS` on read-only fs) |
 | 269 | `faccessat(dirfd, path, mode)` | **3-argument Linux x86-64 syscall** (never reads `r10`); shim to `faccessat2(dirfd, path, mode, 0)` |
-| 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`: any flag `-EINVAL`, an `O_PATH` or closed fd `-EBADF`; with `AT_FDCWD`, `-EFAULT`), `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`; both omitted returns `0` before the path or fd is looked at); an invalid `tv_nsec` (negative, or `>= 1_000_000_000`, and not a sentinel) is `-EINVAL`, checked after the lookup and before `-EROFS` (devfs's nodes excepted) |
+| 280 | `utimensat(dirfd, path, times, flags)` | supports `path == NULL` (operates on `dirfd` for `musl` `futimens`: any flag `-EINVAL`, an `O_PATH` or closed fd `-EBADF`; with `AT_FDCWD`, `-EFAULT`), `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH`, `times == NULL` (both set to current realtime), `UTIME_NOW` (`0x3fff_ffff`), `UTIME_OMIT` (`0x3fff_fffe`; both omitted returns `0` before the path or fd is looked at); an invalid `tv_nsec` (negative, or `>= 1_000_000_000`, and not a sentinel) is `-EINVAL`, checked after the lookup and before `-EROFS` |
 | 316 | `renameat2(olddirfd, old, newdirfd, new, flags)` | atomic rename supporting `0`, `RENAME_NOREPLACE` (1 → `-EEXIST`), and `RENAME_EXCHANGE` (2 → atomic swap, `-ENOENT` if either missing); same-inode `rename(a, a)` is a no-op (`0`, or `-EEXIST` with `RENAME_NOREPLACE`); handles open-unlinked file and empty-dir target overwrite via the same detach/orphan path as `unlink`/`rmdir` (section 9); rejects unknown flags, `RENAME_WHITEOUT` or both together (`-EINVAL`, before the paths), cross-mount (`-EXDEV`, ahead of the `-EBUSY` below), `/`, `.` or `..` as either name (`-EBUSY`; `-EEXIST` on the new side with `RENAME_NOREPLACE`), mountpoint overwrite (`-EBUSY`), dir-over-non-dir, or a trailing `/` on either name when the source isn't a directory (`-ENOTDIR`, the slash checked before the types), non-dir-over-dir (`-EISDIR`), a new name that is an ancestor of the source's directory (`-ENOTEMPTY`); the checks in `do_renameat2`'s order (section 9), non-empty target dir (`-ENOTEMPTY`), and ancestor-into-descendant (`-EINVAL`) |
 | 332 | `statx(dirfd, path, flags, mask, buf)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EMPTY_PATH` (a `NULL` path with it is `""`, as for `newfstatat`), `AT_NO_AUTOMOUNT`, and `AT_STATX_SYNC_TYPE` (`AS_STAT`/`FORCE_SYNC`/`DONT_SYNC`, ignored); `-EINVAL` for both sync bits together or for `STATX__RESERVED` in `mask`; fills `struct statx` (`stx_blksize`, `stx_nlink`, `stx_uid`, `stx_gid`, `stx_mode`, `stx_ino`, `stx_size`, `stx_blocks`, `stx_atime`/`stx_mtime`/`stx_ctime`, `stx_rdev_*`, `stx_dev_*`; no `stx_btime`), `stx_mask` always `STATX_BASIC_STATS` whatever `mask` asks |
 | 439 | `faccessat2(dirfd, path, mode, flags)` | supports `AT_SYMLINK_NOFOLLOW`, `AT_EACCESS` and `AT_EMPTY_PATH` (the three flags it has taken since Linux 5.8 added it; a `NULL` path is `-EFAULT`, even with `AT_EMPTY_PATH`); checks existence (`F_OK`) and permission bits as root (`uid == 0`): `R_OK` always; `W_OK` too, except `-EROFS` on a read-only mount (special files exempt: `InodeType::is_special`, as `openat` agrees; #291); `X_OK` if any execute bit is set, or always on a directory; an invalid mode or flag is `-EINVAL` before the path is looked at |
-| 452 | `fchmodat2(dirfd, path, mode, flags)` | 4-argument Linux 6.6+ variant accepting `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (unknown flags → `-EINVAL`); returns `-EOPNOTSUPP` **only when the resolved target is a symlink**, otherwise updates mode bits and `ctime` normally (`-EROFS` on read-only fs, devfs's nodes excepted) |
+| 452 | `fchmodat2(dirfd, path, mode, flags)` | 4-argument Linux 6.6+ variant accepting `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (unknown flags → `-EINVAL`); returns `-EOPNOTSUPP` **only when the resolved target is a symlink**, otherwise updates mode bits and `ctime` normally (`-EROFS` on read-only fs) |
 
 - **M8 (Processes, threads, signals, `futex`, PTYs):** `fork`/`vfork`/`clone`/
   `execve`/`wait4`, `futex`, real signals (`rt_sigreturn`, `sigaltstack`,
@@ -5184,6 +5184,11 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   reclaiming victim inode B in strict global order `Lock 4(B) → Lock 5(B) →
   Lock 6 → 7 → 8`, and retrying—never inside `frame::alloc`, which holds an
   IRQ-off `SpinLock`, and never holding another inode's Lock 4 or Lock 5).
+  Its candidates are every live inode of each `ext4` filesystem in
+  `EXT4_FILESYSTEMS` (the root volume, which `vfs::init` registers, and the
+  ktests' volumes), whether or not the VFS's inode cache holds it, copied by
+  `Ext4FileSystem::snapshot_live` under that filesystem's Lock 6, which is
+  released before any inode is reclaimed.
   `tmpfs` pages and `detached_unlinked` pages are never evicted until truncated
   or dropped on last close.
   Because `ext4` blocks are allocated only at writeback, M7 also keeps a hard
@@ -5536,12 +5541,19 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       Applying it per inode and per field, in memory, is Lumen's design,
       since `ext4plus` can't grow `i_extra_isize`. So `stat` before and after
       a flush or a remount agree.
-    - `ext4plus`'s `create_inode` sets a new inode's atime, mtime and ctime
-      before its `i_extra_isize`, so only their low 32 bits land.
+    - `ext4plus`'s `create_inode` sets a new inode's atime, mtime, ctime and
+      crtime before its `i_extra_isize`, so only the low 32 bits of the first
+      three land and nothing of `i_crtime` (0x90: `ext4plus` places the
+      fields by `128 + i_extra_isize`, which is still 0 then).
       `times::new_inode`, the adapter's one way to make an inode (`create`,
-      `mkdir`, `symlink`), sets them again before the inode is written and
-      linked. `i_crtime` stays 0 (`set_crtime` writes nothing before
-      `i_extra_isize` either); Lumen reports no btime.
+      `mkdir`, `symlink`), sets all four again before the inode is written
+      and linked, `i_crtime_extra` too when the inode reaches it (#303), so
+      the inode stores its creation time where Linux's `statx` reads it (a
+      ktest checks the bytes; nothing reads them with Linux's tools). With
+      `i_crtime` but no `i_crtime_extra`, the time is clamped to 32 bits as
+      for the others (untested: the ktests' images give new inodes an
+      `i_extra_isize` of 32, past both fields; the branch needs 20 to 23).
+      Lumen itself reports no btime.
     - A corrupt extra word whose nanoseconds are 1e9 or more is carried into
       the seconds by `ext4plus`, which can decode a different year than
       Linux does (base `0x7fff_ffff`, extra `0xffff_fffc`: 1901 here, 2038
@@ -5575,11 +5587,21 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     error; once the entry change itself has landed (the name is gone on
     disk), they finish the operation instead and return the later error.
     When an undo write of a `links_count` fails, the adapter keeps in-memory
-    bounds (`nlink_floors` / `nlink_ceilings`) so `stat` and later
-    operations see the true link count, and the next namespace operation on
-    that inode writes the corrected count (writeback never writes
-    `links_count`); the bounds are not persisted, so an undo that never lands
-    leaves work for `e2fsck` after a reboot. Each kept bound is logged at
+    bounds so `stat` and later operations see the true link count, and the
+    next namespace operation on that inode writes the corrected count
+    (writeback never writes `links_count`); the bounds are not persisted, so
+    an undo that never lands leaves work for `e2fsck` after a reboot. The
+    bounds are `lumen_vfs::nlink::NlinkBounds` (host-tested): one map per
+    filesystem, a floor and maybe a ceiling per inode, the floor never above
+    the ceiling, and `reconcile` pins a count unless the disk already holds
+    it. An undo that knows which entries exist writes their count through
+    `write_links_or_pin`, pinning it when the write fails. Where the entries
+    can't be read back, only a floor is kept: by the exchange's and the
+    move's undo after trying to raise the count on disk
+    (`raise_links_or_floor`), and by link's and mkdir's undo of a failed
+    `Dir::link` (`undo_failed_link`) without; `unlink` and `rmdir`, unable to read
+    their directory back (or finding the name on another inode), pin the
+    count they assume. Each kept bound is logged at
     `error` (once per change, naming the inode and its disk count), and so
     is a rename undo that leaves its entries inconsistent or unreadable
     (judged once, from the entries' end state, not per attempt). `create`,
@@ -5632,7 +5654,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     exactly once. tmpfs numbers entries as they are added (a name keeps
     its number through a rename over it or an exchange); procfs keys them
     as Linux does (`/proc`'s pids past its fixed entries, `/proc/<pid>/fd`
-    by fd); devfs, whose entries never change, uses an index; ext4 uses an
+    by fd); devfs, whose entries never change, uses an index (procfs and
+    devfs both list through `lumen_vfs::pseudo::fill_readdir`,
+    host-tested); ext4 uses an
     entry's byte position, as Linux does for a linear directory, which
     holds because `ext4plus` never moves a record there (a removal merges
     or zeroes it, an insert takes the first slack with room or a new
@@ -5712,8 +5736,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `do_faccessat` (and `may_open`'s `sb_permission`, which refuses only
     regular files, directories and symlinks); no filesystem can answer
     otherwise. `chmod`/`chown`/`utimensat` keep the mount check whatever
-    the type, as Linux's `mnt_want_write`, except on devfs (section 8,
-    #293). A deviation until pipes and device routing by `rdev` exist: a
+    the type, as Linux's `mnt_want_write` (devfs's mounts are writable,
+    section 8, #301). A deviation until pipes and device routing by `rdev` exist: a
     special file stored on ext4 (none in M7's image) opens for writing on
     a read-only mount, as on a writable one, and its reads and writes are
     `-EINVAL` (Linux: a FIFO waits for its peer, a socket node is
@@ -5758,7 +5782,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     returns; the `cacheable()` checks above), with `mount_root`, `mount`,
     `umount` (the evicted inodes dropped after the locks are released) and
     the snapshots: of the filesystems for `sync`, of the inodes for the
-    page-cache reclaim and procfs, and `list_mounts` for `/proc/mounts`
+    ktests' cache checks (and the host tests'), and `list_mounts` for `/proc/mounts`
     and `mount` (each filesystem asked for its device, name and read-only
     flag after the lock is released). Calls into a filesystem it still
     makes under the locks (`VfsInode::dev_id`, `ino`, `cacheable` and
@@ -5958,11 +5982,21 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   unlink-while-open via `Arc`, `renameat2`, `chmod`/`chown`/`utimensat`),
   bounded by a configurable memory quota (default 32 MiB in M7, returning
   `-ENOSPC` instead of exhausting kernel frames).
-- **`/dev` (`devfs`, `dev = 0:3`):** read-only directory (namespace mutations
-  such as `create`/`unlink`/`mkdir`/`rename`, and a `chmod`/`chown`/`utimensat`
-  of `/dev` itself, return `-EROFS`, while the device nodes, special files, are
-  exempt from `-EROFS` for `O_WRONLY`/`O_RDWR`/`O_TRUNC`/`W_OK`, matching Linux
-  `may_open` and `do_faccessat`) of character devices (`S_IFCHR`). A node's
+- **`/dev` (`devfs`, `dev = 0:3`):** a writable mount (`rw` in `mount`
+  and `/proc/mounts`), as Linux's devtmpfs (#301), whose names never
+  change. lumen-vfs's own checks answer first, as on any writable mount
+  (a missing name to unlink or rename `-ENOENT`, a node that is no
+  directory `-ENOTDIR`, a name in use under `RENAME_NOREPLACE` `-EEXIST`,
+  a link from another mount `-EXDEV`; a rename onto itself does nothing
+  and returns 0), and devfs
+  refuses only what reaches it: its namespace operations (`create`,
+  `mkdir`, `unlink`, `rmdir`, `link`, `symlink`, `rename`:
+  `lumen_vfs::fixed_namespace_ops!`) return `-EROFS`, `mkdir` and
+  `symlink` onto a name in use too (a divergence: devtmpfs takes these
+  from root, Linux says `-EEXIST` for a name in use, and it never answers
+  `-EROFS` on an `rw` mount), as does a `chmod`/`chown`/`utimensat` of
+  `/dev` itself (a divergence too: devtmpfs takes those). Its character
+  devices (`S_IFCHR`) open for writing and pass `W_OK`. A node's
   `chmod`/`chown`/`utimensat` is taken, as devtmpfs takes it: devfs keeps
   the new mode, owner and times in memory until reboot (#293). The nodes,
   with standard Linux `major:minor` `st_rdev` and these permissions at boot:
