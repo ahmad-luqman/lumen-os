@@ -7,11 +7,10 @@
 //! truncate, `mtime`) under the inode's lock. A path is resolved through
 //! `at::lookup`; a descriptor must be open, and not `O_PATH`
 //! (`-EBADF`). A change on a read-only mount is `-EROFS`, checked here
-//! against the mount table before the setter is asked, except on devfs
-//! (`DevId::DEVFS`): Linux's devtmpfs is a writable mount, so `chmod`,
-//! `chown` and `utimensat` there reach devfs's setters, which keep a
-//! node's new mode, owner and times in memory and refuse `/dev` itself
-//! (#293).
+//! against the mount table before the setter is asked. devfs is a writable
+//! mount, as Linux's devtmpfs (#301), so `chmod`, `chown` and `utimensat`
+//! there reach devfs's setters, which keep a node's new mode, owner and
+//! times in memory and refuse `/dev` itself (#293).
 //!
 //! A truncate then unmaps the current process's mapped pages of the file
 //! past its new end (`AddressSpace::invalidate_file_from`), so a later
@@ -20,7 +19,7 @@
 
 use alloc::sync::Arc;
 
-use lumen_vfs::{AtFlags, DevId, InodeType, SetTime, VfsCacheOps, VfsInode};
+use lumen_vfs::{AtFlags, InodeType, SetTime, VfsCacheOps, VfsInode};
 
 use super::at::{self, Dirfd, Fd, Mode, UserPath, UserPtr};
 use super::fd::vfs;
@@ -52,15 +51,13 @@ fn open_file(fd: Fd) -> Result<FileRef, u32> {
 }
 
 /// `-EROFS` if `inode` is on a read-only mount (Linux's `mnt_want_write`),
-/// checked before the setter; devfs's mount excepted (module doc), its
-/// setters deciding. A special file on any other read-only mount is
-/// `-EROFS` here, as on Linux. A device not in the mount table (a ktest's
-/// scratch volume) counts as writable: ext4's setters still refuse on a
-/// read-only volume, while devfs's character nodes take the change on any
-/// instance (its root refuses).
+/// checked before the setter, whatever the inode's type: a special file on
+/// a read-only mount is `-EROFS` here, as on Linux. devfs's mounts are
+/// writable (#301), its setters deciding. A device not in the mount table
+/// (a ktest's scratch volume) counts as writable: ext4's setters still
+/// refuse on a read-only volume.
 fn writable_mount(inode: &dyn VfsInode) -> Result<(), u32> {
-    let dev = inode.dev_id();
-    if dev != DevId::DEVFS && tables().fs_read_only(dev) { Err(errno::EROFS) } else { Ok(()) }
+    if tables().fs_read_only(inode.dev_id()) { Err(errno::EROFS) } else { Ok(()) }
 }
 
 /// Set `inode`'s permission and special bits (`mode & 0o7777`): a symlink's
@@ -965,8 +962,7 @@ mod tests {
             process::in_test_process(|_| {
                 let mut restore = DevNullRestore::take()?;
                 let null = ktest_user_path(0, b"/dev/null")?;
-                // devfs is a read-only mount, but its mount (`DevId::DEVFS`)
-                // skips `writable_mount`'s check: the new mode is kept,
+                // devfs is a writable mount (#301): the new mode is kept,
                 // set-id and sticky bits too, `stat` shows it, ctime moves.
                 let before = meta_of("/dev/null")?;
                 kassert_eq!(before.mode, 0o666);
@@ -1074,25 +1070,63 @@ mod tests {
         }
     );
 
+    /// `inner` mounted read-only: a read-only filesystem holding special
+    /// files (none of Lumen's own is one since devfs's mounts are writable,
+    /// #301), with `inner`'s inodes and device number.
+    struct ReadOnlyMount(Arc<dyn lumen_vfs::FileSystem>);
+
+    impl lumen_vfs::FileSystem for ReadOnlyMount {
+        fn dev_id(&self) -> lumen_vfs::DevId {
+            self.0.dev_id()
+        }
+
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+
+        fn root_inode(&self) -> Arc<dyn VfsInode> {
+            self.0.root_inode()
+        }
+
+        fn sync(&self) -> Result<(), lumen_vfs::VfsError> {
+            self.0.sync()
+        }
+
+        fn read_only(&self) -> bool {
+            true
+        }
+    }
+
+    /// Mount `fs` on `mnt`, a new directory (under `/tmp`), run `f` in a
+    /// test process, then unmount `fs` and remove `mnt`, whatever `f`
+    /// returned.
+    fn in_a_mount(
+        mnt: &str,
+        fs: Arc<dyn lumen_vfs::FileSystem>,
+        f: impl FnOnce() -> Result<(), &'static str> + Send + 'static,
+    ) -> Result<(), &'static str> {
+        let rmdir = || lumen_vfs::unlink_at(tables(), None, mnt.as_bytes(), true).map_err(|_| "rmdir");
+        let mp = lumen_vfs::mkdir_at(tables(), None, mnt.as_bytes(), 0o755, 0).map_err(|_| "mkdir")?;
+        let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
+        if tables().mount(mp, mnt, fs).is_err() {
+            let _ = rmdir();
+            return Err("mount");
+        }
+        let ran = process::in_test_process(|_| f());
+        let umounted = tables().umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
+        let removed = rmdir();
+        ran??;
+        umounted?;
+        removed.map(drop)
+    }
+
     crate::ktest!(
         fn meta_a_special_file_on_another_read_only_mount_stays_erofs() {
-            // Only devfs's mount (`DevId::DEVFS`) skips the mount check
-            // (Linux's devtmpfs being a writable mount): a second devfs on
-            // another device is a read-only mount whose char nodes' setters
-            // take a change (checked first), so only `writable_mount`
-            // refuses it here.
-            use lumen_vfs::FileSystem;
-            const MNT: &str = "/tmp/meta-ktest-ro-dev";
+            // A read-only mount whose char nodes' setters take a change
+            // (checked first): only `writable_mount` refuses it here.
             const NULL: &str = "/tmp/meta-ktest-ro-dev/null";
-            let rmdir = || lumen_vfs::unlink_at(tables(), None, MNT.as_bytes(), true).map_err(|_| "rmdir");
-            let fs = crate::vfs::devfs::Devfs::new(DevId::makedev(0, 133));
-            let mp = lumen_vfs::mkdir_at(tables(), None, MNT.as_bytes(), 0o755, 0).map_err(|_| "mkdir")?;
-            let (mp_dev, mp_ino) = (mp.dev_id(), mp.ino());
-            if tables().mount(mp, MNT, fs as Arc<dyn FileSystem>).is_err() {
-                let _ = rmdir();
-                return Err("mount");
-            }
-            let ran = process::in_test_process(|_| {
+            let devfs = crate::vfs::devfs::Devfs::new(lumen_vfs::DevId::makedev(0, 133));
+            in_a_mount("/tmp/meta-ktest-ro-dev", Arc::new(ReadOnlyMount(devfs)), || {
                 let null = ktest_user_path(0, NULL.as_bytes())?;
                 let before = meta_of(NULL)?;
                 kassert_eq!(inode_of(NULL)?.set_mode(before.mode), Ok(()));
@@ -1109,12 +1143,39 @@ mod tests {
                 kassert_eq!((after.mode, after.uid, after.gid), (before.mode, before.uid, before.gid));
                 kassert_eq!((ts(after.atime), ts(after.mtime)), (ts(before.atime), ts(before.mtime)));
                 Ok(())
-            });
-            let umounted = tables().umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
-            let removed = rmdir();
-            ran??;
-            umounted?;
-            removed.map(drop)
+            })
+        }
+    );
+
+    crate::ktest!(
+        fn meta_a_second_devfs_mount_takes_chmod_chown_and_utimensat() {
+            // Every devfs mount is writable, as every devtmpfs mount on
+            // Linux (#301), not only `/dev`'s: a second instance's nodes
+            // take the changes, by path and by descriptor.
+            const MNT: &str = "/tmp/meta-ktest-dev2";
+            const NULL: &str = "/tmp/meta-ktest-dev2/null";
+            let devfs = crate::vfs::devfs::Devfs::new(lumen_vfs::DevId::makedev(0, 135));
+            in_a_mount(MNT, devfs, || {
+                let null = ktest_user_path(0, NULL.as_bytes())?;
+                let before = meta_of(NULL)?;
+                kassert!(!tables().fs_read_only(before.dev));
+                kassert!(crate::vfs::list_mounts().iter().any(|m| m.mount_path == MNT && !m.read_only));
+                kassert_eq!(sys_chmod(null, at::reg(0o600)), 0);
+                kassert_eq!(meta_of(NULL)?.mode, 0o600);
+                kassert_eq!(sys_chown(null, 1000, 2000), 0);
+                let t = put_times(process::KTEST_USER_VA + 2048, [(1000, 5), (2000, 7)])?;
+                kassert_eq!(sys_utimensat(Dirfd::Cwd, null, t, flags(0)), 0);
+                let fd = open(null, OpenFlags::O_WRONLY)?;
+                kassert_eq!(sys_fchmod(fd, at::reg(0o640)), 0);
+                kassert_eq!(sys_close(fd), 0);
+                let after = meta_of(NULL)?;
+                kassert_eq!((after.mode, after.uid, after.gid), (0o640, 1000, 2000));
+                kassert_eq!((ts(after.atime), ts(after.mtime)), ((1000, 5), (2000, 7)));
+                // Its root refuses, as `/dev`'s does.
+                let root = ktest_user_path(1, MNT.as_bytes())?;
+                kassert_eq!(sys_chmod(root, at::reg(0o700)), neg_errno(errno::EROFS));
+                Ok(())
+            })
         }
     );
 }

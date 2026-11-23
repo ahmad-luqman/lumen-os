@@ -508,14 +508,15 @@ mod tests {
                 }
 
                 // A read-only mount: `W_OK` is `-EROFS` (the check comes
-                // before root's pass), `R_OK` passes; a devfs device node is
-                // exempt.
+                // before root's pass), `R_OK` passes. devfs is a writable
+                // mount, as Linux's devtmpfs (#301): `/dev` itself passes
+                // `W_OK` for root, as its device nodes do.
                 let erofs = neg_errno(errno::EROFS);
                 kassert_eq!(check(0, b"/proc/version", r)?, 0);
                 kassert_eq!(check(0, b"/proc/version", w)?, erofs);
                 kassert_eq!(check(0, b"/proc/version", r | w)?, erofs);
                 kassert_eq!(check(0, b"/proc", w)?, erofs);
-                kassert_eq!(check(0, b"/dev", w)?, erofs);
+                kassert_eq!(check(0, b"/dev", w)?, 0);
                 kassert_eq!(check(0, b"/dev", x)?, 0);
                 kassert_eq!(check(0, b"/dev/null", w)?, 0);
                 kassert_eq!(check(0, b"/dev/null", r | w)?, 0);

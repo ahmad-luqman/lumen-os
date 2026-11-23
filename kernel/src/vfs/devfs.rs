@@ -1,15 +1,13 @@
-//! Read-only `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes.
+//! The `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes.
 //!
-//! Namespace changes (create, unlink, mkdir, rename) return `-EROFS`, and
-//! so does a metadata change on `/dev` itself (a divergence: devtmpfs
-//! takes those on `/dev` too). The character nodes are special files, so
-//! `lumen-vfs`'s open and access checks let `O_WRONLY`/`O_RDWR`/`O_TRUNC`/
-//! `W_OK` through the read-only mount (`InodeType::is_special`). The
-//! syscall layer's `writable_mount` lets `chmod`/`chown`/`utimensat`
-//! through for this mount's (`DevId::DEVFS`) nodes, and their setters keep
-//! the new mode, owner and times in memory until reboot, as Linux's
-//! devtmpfs does. The setters take a change on any instance's node: only
-//! the mount check tells `/dev`'s instance from another.
+//! A writable mount, as Linux's devtmpfs (`FileSystem::read_only` is
+//! false, #301), whose names never change: its namespace operations
+//! (create, unlink, mkdir, rename, ...) return `-EROFS` themselves
+//! (`lumen_vfs::fixed_namespace_ops!`), and so does a metadata change on
+//! `/dev` itself (a divergence: devtmpfs takes those on `/dev` too). A
+//! character node's setters take `chmod`, `chown` and `utimensat` and keep
+//! the new mode, owner and times in memory until reboot, as devtmpfs does,
+//! on any instance's node (#293).
 //! `random` and `urandom` read from `crate::rng` and return `-EAGAIN` while
 //! its pool has never been seeded (no RDRAND and no virtio-rng answer).
 
@@ -17,9 +15,10 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use lumen_vfs::pseudo::fill_readdir;
 use lumen_vfs::{
-    AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
-    VfsInode, mode_after_chown, next_lock_id,
+    AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, SetTime, Timespec, VfsError, VfsInode,
+    mode_after_chown, next_lock_id,
 };
 
 use crate::klog;
@@ -123,8 +122,10 @@ impl FileSystem for Devfs {
         Ok(())
     }
 
+    /// A writable mount, as every devtmpfs mount on Linux (#301): its nodes'
+    /// setters decide what changes, and its names never do.
     fn read_only(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -162,9 +163,9 @@ impl DevfsInode {
     /// The metadata, held for a change: a character node's, as Linux's
     /// devtmpfs takes `chmod`, `chown` and `utimensat` on its nodes. `/dev`
     /// itself is `-EROFS` (a divergence: devtmpfs takes these on `/dev`
-    /// too), and this is the only refusal: the syscall layer's
-    /// `writable_mount` lets every `DevId::DEVFS` inode through, and
-    /// `vfstest chmod` calls the setters directly.
+    /// too), and this is the only refusal: the mount is writable (#301), so
+    /// the syscall layer's `writable_mount` lets every devfs inode through,
+    /// and `vfstest chmod` calls the setters directly.
     fn changeable_meta(&self) -> Result<SleepMutexGuard<'_, DevfsMeta>, VfsError> {
         if self.kind == DevKind::Root {
             return Err(VfsError::RoFs);
@@ -243,42 +244,10 @@ impl VfsInode for DevfsInode {
             .ok_or(VfsError::NoEnt)
     }
 
-    fn create(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn mkdir(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn unlink(&self, _name: &[u8]) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn rmdir(&self, _name: &[u8]) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn link(&self, _name: &[u8], _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
-    }
-
-    fn symlink(&self, _name: &[u8], _target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-        Err(VfsError::RoFs)
-    }
+    lumen_vfs::fixed_namespace_ops!();
 
     fn readlink(&self) -> Result<Vec<u8>, VfsError> {
         Err(VfsError::Inval)
-    }
-
-    fn rename(
-        &self,
-        _old_name: &[u8],
-        _new_dir: &Arc<dyn VfsInode>,
-        _new_name: &[u8],
-        _flags: RenameFlags,
-    ) -> Result<(), VfsError> {
-        Err(VfsError::RoFs)
     }
 
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
@@ -288,19 +257,11 @@ impl VfsInode for DevfsInode {
         if max_entries == 0 {
             return Ok(());
         }
-        for (idx, (ino, itype, name)) in [(1, InodeType::Dir, "."), (1, InodeType::Dir, "..")]
+        // Each entry's key is its index: the names never change.
+        let entries = [(1, InodeType::Dir, "."), (1, InodeType::Dir, "..")]
             .into_iter()
-            .chain(self.nodes.iter().map(|&(name, ref node)| (node.ino, InodeType::CharDevice, name)))
-            .enumerate()
-        {
-            if out.len() >= max_entries {
-                break;
-            }
-            let cur_idx = idx as u64;
-            if cur_idx >= cursor {
-                out.push(DirEntry { ino, inode_type: itype, name: name.as_bytes().to_vec(), next_cursor: cur_idx + 1 });
-            }
-        }
+            .chain(self.nodes.iter().map(|&(name, ref node)| (node.ino, InodeType::CharDevice, name)));
+        fill_readdir(out, cursor, max_entries, (0u64..).zip(entries).map(|(key, (ino, t, name))| (key, ino, t, name)));
         Ok(())
     }
 

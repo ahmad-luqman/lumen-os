@@ -199,7 +199,7 @@ crate::ktest!(
         let mounts = list_mounts();
         kassert!(mounts.iter().any(|m| m.mount_path == "/"));
         kassert!(mounts.iter().any(|m| m.mount_path == "/tmp" && m.dev_id == DevId::TMPFS && !m.read_only));
-        kassert!(mounts.iter().any(|m| m.mount_path == "/dev" && m.dev_id == DevId::DEVFS && m.read_only));
+        kassert!(mounts.iter().any(|m| m.mount_path == "/dev" && m.dev_id == DevId::DEVFS && !m.read_only));
         kassert!(mounts.iter().any(|m| m.mount_path == "/proc" && m.dev_id == DevId::PROCFS && m.read_only));
 
         let summary = match run_dev_tmp_proc_checks() {

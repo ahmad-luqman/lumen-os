@@ -139,6 +139,16 @@ tests = [
 ]
 
 [[feature]]
+name = "devfs is a writable mount, as Linux's devtmpfs (#301): /dev shows rw in mount and /proc/mounts, a second devfs instance's nodes take chmod, chown and utimensat through the syscalls, access(\"/dev\", W_OK) passes for root, and its namespace operations still refuse a change with -EROFS (a missing name -ENOENT, a link from another mount -EXDEV)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_a_second_devfs_mount_takes_chmod_chown_and_utimensat",
+    "ktest:lumen_kernel::linux::syscall::stat::tests::stat_access_modes_follow_the_root_rules",
+    "ktest:lumen_kernel::vfs::tests::vfs_boot_mounts_tmp_dev_proc_work",
+    "scenario:test_fs::test_dev_tmp_proc_filesystems",
+]
+
+[[feature]]
 name = "ext4 rootfs fsck-clean after Linux programs' file syscalls (#254): with nothing left once the programs remove what they made (unlink and rmdir while open, renames over open files, record locks), and with a tree they leave (a hard link, a short and a long symlink, two files' mode, owner and times, one written by a sync and one set on a clean inode after it, a file and a directory exchanged, a directory moved to another parent with its ..), all of it read back from the disk on a second boot"
 milestone = "M7"
 tests = [
