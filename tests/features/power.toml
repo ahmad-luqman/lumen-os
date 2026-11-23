@@ -9,7 +9,7 @@ tests = [
 ]
 
 [[feature]]
-name = "`reboot` resets the machine through port 0xCF9 and it boots again; its fallbacks (the 8042's reset pulse, then a triple fault, each started with `lumen.reboot=`, an unknown value warned about) do too; `shutdown` enters ACPI S5 (SLP_TYP 0 on QEMU) and QEMU exits because the guest powered off (a power-off exit is a pass only for that scenario, with a guest-shutdown SHUTDOWN event)"
+name = "`reboot` resets the machine through port 0xCF9 and it boots again; its fallbacks (the 8042's reset pulse, then a triple fault, each started with `lumen.reboot=`, an unknown value warned about) do too; `shutdown` enters ACPI S5 (SLP_TYP 0 on QEMU) and QEMU exits because the guest powered off (a power-off exit is a pass only for the power-off scenarios, with a guest-shutdown SHUTDOWN event)"
 milestone = "M2"
 tests = [
     "scenario:test_shell::test_reboot_boots_again",

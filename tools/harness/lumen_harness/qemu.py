@@ -50,7 +50,7 @@ from .qmp import QmpClient, QmpError, button_args, pointer_move_args, qcodes_for
 
 # isa-debug-exit: QEMU exits with (code << 1) | 1. Must match kernel qemu.rs.
 # Any other status fails a test; the only exception is 0 in the power-off
-# scenario, together with a SHUTDOWN event whose reason is guest-shutdown
+# scenarios, together with a SHUTDOWN event whose reason is guest-shutdown
 # (`Machine.wait_event`).
 EXIT_SUCCESS = (0x10 << 1) | 1  # 33
 EXIT_FAILURE = (0x11 << 1) | 1  # 35
@@ -198,7 +198,7 @@ class QemuOptions:
     trace_events: tuple[str, ...] = ()
     gdb: bool = False
     # False: `-no-reboot`, so a reset (a triple fault among them) ends QEMU
-    # with status 0, which fails a test; the power-off scenario passes on a
+    # with status 0, which fails a test; the power-off scenarios pass on a
     # 0 that comes with a guest-shutdown event (see EXIT_SUCCESS). True: a
     # reset boots the machine again (the reboot scenarios).
     reboot: bool = False
