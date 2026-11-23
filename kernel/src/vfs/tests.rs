@@ -2964,6 +2964,8 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
 
 crate::ktest!(
     fn ext4_partial_phase2_io_error_recovery() {
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         let base_img = build_minimal_ext4_image_blocks(256);
         let quota_before = page_cache::DETACHED_QUOTA.used_pages();
 

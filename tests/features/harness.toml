@@ -13,6 +13,16 @@ tests = [
 ]
 
 [[feature]]
+name = "A ktest's repeated warnings and errors held back from serial while it runs (`klog::hold_repeats`, #347; the ext4 fault sweeps): a line when it starts and when it ends, each call site's first line printed, the rest kept in the `dmesg` ring and summarized at the guard's drop as a count and a copy of the newest, other tags and `info` lines printed as always, a full table printing every line; test_ktest counts every vfs family from the printed lines and the summaries, each line fitting one family, and fails on a sweep line or summary outside a guard, a guard count other than the kernel source's, more than one printed line per sweep family in a guard, a summary of a family its guard didn't print (or of an exact family, or not a vfs line), or a guard's total other than its summaries' sum"
+milestone = "M7"
+tests = [
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+    "ktest:lumen_kernel::klog::repeats_held_back_from_serial_are_summarized_when_the_guard_drops",
+    "harness:test_klog::test_held_back_lines_are_read_and_a_summarys_copy_is_no_log_line",
+    "cargo:lumen-trace",
+]
+
+[[feature]]
 name = "A re-run with LUMEN_ARTIFACTS_DIR (CI's TCG re-run) keeps its artifacts and ktest.tap apart from the first run's (never in build/test-results or build/test-artifacts; status says why ktest results are missing)"
 milestone = "M1"
 tests = [

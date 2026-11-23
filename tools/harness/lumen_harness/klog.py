@@ -41,6 +41,25 @@ LOUD = ("ERROR", "WARN")
 LOG_LINE = re.compile(rf"{STAMP} {LEVEL} [^ \n]+: [^\n]*\n")
 
 
+# The ktest kernel's `klog::hold_repeats` (#347), as serial shows it: a
+# guard's first line (`HOLDING`, its tag `tag`), a summary per call site of
+# the lines it held back (`HELD_BACK`: how many, `n`, after the site's
+# printed first, and the newest of them from its level on, `last`; a cut one
+# ends `...`), and the guard's last line (`HELD_ALL`: its tag and the total).
+# A summary's copied line is no log line of its own to a reader matching
+# lines from their stamps (`LOG_LINE`, `unexpected_warnings`): no stamp
+# precedes it.
+HOLDING = re.compile(
+    rf"{STAMP} INFO  klog: holding (?P<tag>\S+)'s repeated warnings and errors back from serial\n"
+)
+HELD_BACK = re.compile(
+    rf"{STAMP} INFO  klog: (?P<n>\d+) more held back, the last: (?P<last>[^\n]*)\n"
+)
+HELD_ALL = re.compile(
+    rf"{STAMP} INFO  klog: no longer holding (?P<tag>\S+)'s repeats: (?P<n>\d+) held back\n"
+)
+
+
 def is_log_line(text: str) -> bool:
     """Whether `text` is one whole log line (its newline optional)."""
     return LOG_LINE.fullmatch(text if text.endswith("\n") else text + "\n") is not None

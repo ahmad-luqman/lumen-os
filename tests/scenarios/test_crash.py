@@ -291,7 +291,7 @@ def test_relock_of_the_log_lock_is_reported(crash_report):
     # never waits for that lock.
     report = crash_report("relocklog")
     assert re.search(
-        r"^panic: SpinLock<\(\)> at 0x[0-9a-f]+ re-locked on cpu 0, which already holds it$",
+        r"^panic: SpinLock<lumen_kernel::klog::Lines> at 0x[0-9a-f]+ re-locked on cpu 0, which already holds it$",
         report,
         re.MULTILINE,
     ), report
