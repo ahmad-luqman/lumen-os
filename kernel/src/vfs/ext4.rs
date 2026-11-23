@@ -116,7 +116,8 @@ enum DirHash {
     /// Neither flag, with `dir_index`: Linux since 6.2 builds with
     /// `-funsigned-char` on every architecture, so it indexes such a volume
     /// unsigned, and stamps the flag only on a mount writable from the start,
-    /// not on a read-only one later remounted read-write; it may have.
+    /// not on a read-only one later remounted read-write: such a volume's
+    /// directories may have been indexed unsigned without a flag saying so.
     Unknown,
 }
 
