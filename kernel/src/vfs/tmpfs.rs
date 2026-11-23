@@ -14,7 +14,7 @@ use lumen_vfs::{
 use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
-use super::page_cache::{self, CachePage, PAGE_SIZE, PageCache, QuotaCounter};
+use super::page_cache::{CachePage, PAGE_SIZE, PageCache, QuotaCounter};
 
 struct TmpfsShared {
     dev: DevId,
@@ -221,33 +221,7 @@ impl TmpfsInode {
         if buf.is_empty() {
             return Ok((offset, 0));
         }
-        let mut pages = self.pages.lock();
-        let old_size = meta.size;
-        let _ = offset.checked_add(buf.len() as u64).ok_or(VfsError::FBig)?;
-        if offset > old_size && !old_size.is_multiple_of(PAGE_SIZE as u64) {
-            let tail_page = old_size / PAGE_SIZE as u64;
-            let tail_off = (old_size % PAGE_SIZE as u64) as usize;
-            if let Some(page) = pages.get(tail_page) {
-                page.zero_range(tail_off, PAGE_SIZE);
-            }
-        }
-        let mut done = 0usize;
-        while done < buf.len() {
-            let cur_off = offset + done as u64;
-            let page_idx = cur_off / PAGE_SIZE as u64;
-            let in_page = (cur_off % PAGE_SIZE as u64) as usize;
-            let chunk = (PAGE_SIZE - in_page).min(buf.len() - done);
-            match page_or_new(&mut pages, page_idx) {
-                Ok(page) => page.write_bytes(in_page, &buf[done..done + chunk]),
-                Err(err) => {
-                    if done > 0 {
-                        break;
-                    }
-                    return Err(err);
-                }
-            }
-            done += chunk;
-        }
+        let done = self.pages.lock().write_from(offset, buf, meta.size, |_| CachePage::new_zeroed())?;
         let written_end = offset + done as u64;
         let now = time::realtime_timespec();
         if written_end > meta.size {
@@ -324,9 +298,10 @@ impl TmpfsInode {
     }
 
     /// This file's page `index`, a zero page allocated for a hole, and its
-    /// size read with it: `tmpfs`'s side of [`page_cache::mmap_page`] (its
-    /// contract). The hole's page
-    /// counts against the mount's quota, as a write's would.
+    /// size read with it: `tmpfs`'s side of
+    /// [`super::page_cache::mmap_page`] (its contract), through
+    /// `PageCache::map_page`. The hole's page counts against the mount's
+    /// quota, as a write's would.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed mmap (#255)
     pub(super) fn mmap_page(&self, index: u64) -> Result<(Arc<CachePage>, u64), VfsError> {
         if self.inode_type != InodeType::File {
@@ -334,25 +309,9 @@ impl TmpfsInode {
         }
         let meta = self.meta.lock();
         let file_size = meta.size;
-        page_cache::mmap_page_in_file(index, file_size)?;
-        let mut pages = self.pages.lock();
-        let page = page_or_new(&mut pages, index)?;
-        page.touch();
+        let page = self.pages.lock().map_page(index, file_size, CachePage::new_zeroed)?;
         Ok((page, file_size))
     }
-}
-
-/// The cached page `index`, or a new zero page inserted there (`NoMem`, or
-/// `NoSpc` past the quota): the one way `write_at` and `mmap_page` get a
-/// page. (`read_at` reads a hole as zeros without one.) The caller holds
-/// the inode's Lock 4 and the `pages` lock (Lock 5).
-fn page_or_new(pages: &mut PageCache, index: u64) -> Result<Arc<CachePage>, VfsError> {
-    if let Some(page) = pages.get(index) {
-        return Ok(Arc::clone(page));
-    }
-    let page = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
-    pages.insert_new(index, Arc::clone(&page))?;
-    Ok(page)
 }
 
 struct LockedTmpfs<'a> {
@@ -896,24 +855,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::Inval);
         }
         let mut meta = self.meta.lock();
-        let mut pages = self.pages.lock();
-        let old_size = meta.size;
-        if new_size < old_size {
-            pages.remove_from(new_size.div_ceil(PAGE_SIZE as u64));
-            let tail_rem = (new_size % PAGE_SIZE as u64) as usize;
-            if tail_rem != 0
-                && let Some(page) = pages.get(new_size / PAGE_SIZE as u64)
-            {
-                page.zero_range(tail_rem, PAGE_SIZE);
-            }
-        } else if new_size > old_size {
-            let tail_rem = (old_size % PAGE_SIZE as u64) as usize;
-            if tail_rem != 0
-                && let Some(page) = pages.get(old_size / PAGE_SIZE as u64)
-            {
-                page.zero_range(tail_rem, PAGE_SIZE);
-            }
-        }
+        self.pages.lock().resize(meta.size, new_size);
         let now = time::realtime_timespec();
         meta.size = new_size;
         meta.mtime = now;
@@ -945,16 +887,8 @@ impl VfsInode for TmpfsInode {
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
         let mut meta = self.meta.lock();
         let now = time::realtime_timespec();
-        match atime {
-            SetTime::Omit => {}
-            SetTime::Now => meta.atime = now,
-            SetTime::Set(ts) => meta.atime = ts,
-        }
-        match mtime {
-            SetTime::Omit => {}
-            SetTime::Now => meta.mtime = now,
-            SetTime::Set(ts) => meta.mtime = ts,
-        }
+        meta.atime = atime.resolve(meta.atime, now);
+        meta.mtime = mtime.resolve(meta.mtime, now);
         meta.ctime = now;
         Ok(())
     }
@@ -970,26 +904,8 @@ impl VfsInode for TmpfsInode {
             return Ok(0);
         }
         let meta = self.meta.lock();
-        if offset >= meta.size {
-            return Ok(0);
-        }
-        let to_read = buf.len().min((meta.size - offset) as usize);
-        let pages = self.pages.lock();
-        let mut done = 0usize;
-        while done < to_read {
-            let cur_off = offset + done as u64;
-            let page_idx = cur_off / PAGE_SIZE as u64;
-            let in_page = (cur_off % PAGE_SIZE as u64) as usize;
-            let chunk = (PAGE_SIZE - in_page).min(to_read - done);
-            if let Some(page) = pages.get(page_idx) {
-                page.read_bytes(in_page, &mut buf[done..done + chunk]);
-            } else {
-                // Sparse miss: zero without allocating a frame.
-                buf[done..done + chunk].fill(0);
-            }
-            done += chunk;
-        }
-        Ok(to_read)
+        // A hole reads as zeros without a frame.
+        self.pages.lock().read_into(offset, buf, meta.size, |_| Ok(None))
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
