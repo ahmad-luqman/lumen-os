@@ -19,13 +19,15 @@ pub struct MountInfo {
     pub fs_name: &'static str,
     pub mount_path: String,
     pub read_only: bool,
+    /// Read-only because of an error ([`FileSystem::errored`]).
+    pub errored: bool,
 }
 
 impl MountInfo {
-    /// `fs` mounted at `mount_path`, asking `fs` for its device, name and
-    /// read-only flag: call it only with Lock 9 released.
+    /// `fs` mounted at `mount_path`, asking `fs` for its device, name,
+    /// read-only flag and error state: call it only with Lock 9 released.
     pub(crate) fn of(fs: &dyn FileSystem, mount_path: String) -> Self {
-        Self { dev_id: fs.dev_id(), fs_name: fs.name(), mount_path, read_only: fs.read_only() }
+        Self { dev_id: fs.dev_id(), fs_name: fs.name(), mount_path, read_only: fs.read_only(), errored: fs.errored() }
     }
 }
 
