@@ -3714,6 +3714,8 @@ struct ReusingHooks {
     post_unlink: BTreeMap<Vec<u8>, FsOpHook>,
     pre_rmdir: BTreeMap<Vec<u8>, FsOpHook>,
     post_rename: BTreeMap<Vec<u8>, FsOpHook>,
+    /// Runs once, at the start of the next `readdir` from cursor 0.
+    pre_readdir: Option<FsOpHook>,
     /// `rmdir(name)` fails with this instead of removing anything.
     rmdir_override_err: BTreeMap<Vec<u8>, VfsError>,
     /// `rmdir(name)` removes the directory, then fails with this.
@@ -4378,6 +4380,12 @@ impl VfsInode for ReusingHandle {
         assert_test_lock9_free();
         if self.meta.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
+        }
+        if cursor == 0 {
+            let hook = self.inner.hooks.lock().unwrap().pre_readdir.take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         let state = self.inner.state.lock().unwrap();
         let Some(dir_body) = state.inodes.get(&self.meta.orig_ino).filter(|b| b.meta.body_id == self.meta.body_id)
@@ -8953,6 +8961,9 @@ fn removed_directories_pruned_parents_dropped_outside_lock9() {
     let (u1, d1) = (under(), drops());
     dotdot(env, &held).unwrap();
     assert!(drops() > d1, "nothing dropped by `..`");
+    // Only `/h`'s record is left: q's pruned, then r's, dead once q's
+    // went, by the re-prune, on `/m` though the `..` was on `/`.
+    assert_eq!(tables.removed_dirs_len(), 1, "`..` left another filesystem's chained dead record");
     assert_eq!(under(), u1, "a pruned parent dropped under Lock 9 (`..`)");
 }
 
@@ -9133,4 +9144,51 @@ fn getcwd_of_a_freed_cwd_removed_during_the_walk_is_enoent() {
         assert_eq!(compute_cwd_path(env, &c).unwrap_err(), VfsError::NoEnt, "removed after `..`: {after_dotdot}");
         assert!(!c.is_detached());
     }
+}
+
+/// #318 review round 3: a directory removed after its `..` was looked up
+/// and checked, during the `readdir` of its parent that names it, its
+/// number taken by a new entry there: `getcwd` is `ENOENT` for a removed
+/// cwd and walks again for a live cwd whose old ancestor it was, never
+/// naming the new entry (the check comes after the name, not before).
+#[test]
+fn getcwd_rechecks_a_directory_removed_while_its_parent_is_read() {
+    // The cwd, freed while `/p` is read to name it.
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let tables = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = tables.as_ref();
+    mkdir_at(env, None, b"/p", 0o755, 0).unwrap();
+    let c = mkdir_at(env, None, b"/p/c", 0o755, 0).unwrap();
+    let ino = c.ino();
+    let tables2 = Arc::clone(&tables);
+    fs.inner.hooks.lock().unwrap().pre_readdir = Some(alloc::boxed::Box::new(move || {
+        unlink_at(tables2.as_ref(), None, b"/p/c", true).unwrap();
+        let z = mkdir_at(tables2.as_ref(), None, b"/p/z", 0o755, 0).unwrap();
+        assert_eq!(z.ino(), ino, "the removed cwd's number not reused");
+    }));
+    assert_eq!(compute_cwd_path(env, &c).unwrap_err(), VfsError::NoEnt);
+
+    // An old ancestor of a live cwd, freed while `/a` is read to name it
+    // (the second `readdir`; the first names the cwd in `/a/b`).
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let tables = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = tables.as_ref();
+    mkdir_at(env, None, b"/a", 0o755, 0).unwrap();
+    mkdir_at(env, None, b"/x", 0o755, 0).unwrap();
+    let b_ino = mkdir_at(env, None, b"/a/b", 0o755, 0).unwrap().ino();
+    let c = mkdir_at(env, None, b"/a/b/c", 0o755, 0).unwrap();
+    let guard = OpenGuard::try_new(Arc::clone(&c)).unwrap();
+    let (tables2, fs2) = (Arc::clone(&tables), Arc::clone(&fs));
+    fs.inner.hooks.lock().unwrap().pre_readdir = Some(alloc::boxed::Box::new(move || {
+        let tables3 = Arc::clone(&tables2);
+        fs2.inner.hooks.lock().unwrap().pre_readdir = Some(alloc::boxed::Box::new(move || {
+            let env = tables3.as_ref();
+            rename_at2(env, None, b"/a/b/c", None, b"/x/c", RenameFlags(0)).unwrap();
+            unlink_at(env, None, b"/a/b", true).unwrap();
+            let q = mkdir_at(env, None, b"/a/q", 0o755, 0).unwrap();
+            assert_eq!(q.ino(), b_ino, "b's number not reused");
+        }));
+    }));
+    assert_eq!(compute_cwd_path(env, &c).unwrap(), b"/x/c");
+    drop(guard);
 }
