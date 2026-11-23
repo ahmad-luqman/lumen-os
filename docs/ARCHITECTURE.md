@@ -3702,7 +3702,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 6 | `lstat(path, buf)` | shim to `newfstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW)` |
 | 8 | `lseek(fd, off, whence)` | `SEEK_SET` (0), `SEEK_CUR` (1), `SEEK_END` (2) on regular files, `/proc`, and `/dev/{null,zero,random,urandom}` (returning 0); on directories updates `OpenFile::dir_cursor` (`SEEK_SET` for `musl` `rewinddir`/`seekdir`); `-ESPIPE` on console/tty; `-EBADF` on `O_PATH`; rejects resulting negative offset with `-EINVAL` |
 | 9 | `mmap(addr, len, prot, flags, fd, off)` | extends M6 anonymous `mmap` with file-backed `MAP_PRIVATE` (CoW) and `MAP_SHARED` (zero-copy unified `PageCache`, section 5); masks `flags & MAP_TYPE` (`0x0f`) to select `MAP_SHARED` (1), `MAP_PRIVATE` (2), or `MAP_SHARED_VALIDATE` (3, rejecting unknown flags with `-EOPNOTSUPP`; any other `MAP_TYPE` → `-EINVAL`); `MAP_SYNC` and `MAP_FIXED_NOREPLACE` with `MAP_SHARED_VALIDATE` → `-EOPNOTSUPP`, as Linux's `LEGACY_MAP_MASK`; ignores advisory `MAP_DENYWRITE`/`MAP_EXECUTABLE`/`MAP_POPULATE`/`MAP_NORESERVE`/`MAP_NONBLOCK`/`MAP_STACK`/`MAP_LOCKED`/`MAP_UNINITIALIZED` and `MAP_32BIT`/`MAP_ABOVE4G`; `MAP_HUGETLB` → `-EINVAL`, and `MAP_GROWSDOWN` on a file → `-EINVAL`; validates `off & 0xfff == 0`, `len != 0` (`-EINVAL`), `len`'s page rounding (`-ENOMEM`), `off + aligned_len` at most `i64::MAX` for a regular file, below 2^64 otherwise (Linux's `ULONG_MAX` for a character device) (`-EOVERFLOW`), `fd` open & readable (`-EBADF` if closed or `O_PATH`, `-EACCES` on `O_WRONLY` or `MAP_SHARED \| PROT_WRITE` without `O_RDWR`), `-ENODEV` for non-mappable nodes (except `/dev/zero`, mapped as anonymous zero pages); records `may_write` on `FileMapping` |
-| 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `count` capped at 1 MiB (`MAX_SINGLE_IO`), and a fault or filesystem error after the first 4 KiB chunk returns the bytes moved. Errors in this order: `-EINVAL` if `off < 0`; `-EBADF` if not open or `O_PATH`; `-ESPIPE` on console/tty and FIFO/socket nodes; `-EBADF` if not readable; `-EFAULT` if the buffer isn't wholly in user space; `-EINVAL` if `off + count` passes `i64::MAX`; `-EISDIR` on directories (even for 0 bytes) |
+| 17 | `pread64(fd, buf, count, off)` | positional read at `off >= 0` without reading/modifying `OpenFile::offset`; `count` capped at 1 MiB (`MAX_SINGLE_IO`), and a fault or filesystem error after the first 4 KiB chunk returns the bytes moved (as does a filesystem error past the first page inside that chunk: the page cache's short count, #321). Errors in this order: `-EINVAL` if `off < 0`; `-EBADF` if not open or `O_PATH`; `-ESPIPE` on console/tty and FIFO/socket nodes; `-EBADF` if not readable; `-EFAULT` if the buffer isn't wholly in user space; `-EINVAL` if `off + count` passes `i64::MAX`; `-EISDIR` on directories (even for 0 bytes) |
 | 18 | `pwrite64(fd, buf, count, off)` | positional write at `off >= 0` without reading/modifying `OpenFile::offset` (when `O_APPEND` is set, appends to EOF per Linux `pwrite(2)` semantics); same cap and the same errors in the same order as `pread64` (`-EBADF` if not writable; no `-EISDIR`, as a directory can't be open for writing) |
 | 21 | `access(path, mode)` | shim to `faccessat2(AT_FDCWD, path, mode, 0)` |
 | 26 | `msync(addr, len, flags)` | validates page-aligned `addr`, `flags` subset of `MS_ASYNC \| MS_SYNC \| MS_INVALIDATE` (`MS_ASYNC \| MS_SYNC` rejected with `-EINVAL`), returns `0` immediately on `len == 0` (or a `len` within a page of 2^64, which Linux's rounding wraps to 0) and succeeds as a no-op over `MAP_PRIVATE`/anonymous VMAs, `-ENOMEM` when `addr + len` rounded up overflows and on any unmapped hole (with `MS_SYNC`, after writing back the mapped parts; a writeback error such as `-EIO` wins); for `MS_SYNC`, writes back each `MAP_SHARED` file's dirty pages (a writable mapping keeps its pages dirty, section 5) through its filesystem and block cache to the device, with the address space's lock released |
@@ -5254,16 +5254,15 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
        caller's space only until M8 (`openat(O_TRUNC)` included).
   - Extending a file (`ftruncate` grow or `write`/`pwrite64` past `old_size`):
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
-    `PageCache`, zeroes `[old_size % 4096 .. 4096)` (marking it dirty as
-    above) before exposing the new size so stale past-EOF `MAP_SHARED`
-    stores never leak into extended regions. A write marks that page dirty
-    only once it has written something: one refused outright leaves the
-    size as it was and a clean tail page clean (its zeros stay, past the
-    end), so a
-    failing disk's writeback never fails for it and `fsync` reports no
-    `EIO` for a write the caller saw fail (#321). Writeback writes a page's
-    bytes below the size alone (`valid_len`), so such a store never
-    reaches the disk either.
+    `PageCache`, zeroes `[old_size % 4096 .. 4096)` before exposing the
+    new size so stale past-EOF `MAP_SHARED` stores never leak into extended
+    regions, and marks that page dirty for a linked `ext4` file: a truncate
+    at once, a write once it has written something (#321). A write refused
+    outright leaves the size as it was and a clean tail page clean, its
+    zeros past the end, so no writeback of the page can fail, and turn up
+    as a later `fsync`'s `EIO`, for a write the caller saw fail. Writeback
+    writes a page's bytes below the size alone (`valid_len`), so such a
+    store never reaches the disk either.
 - **Pages for `mmap` (built in #255's first part):** the file-backed VM
   takes a file's pages through one helper, `crate::vfs::mmap_page(inode:
   &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError>`.
@@ -5278,8 +5277,10 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     asks the fill for a missing page. A missing `ext4` page is read from
     disk by the same private fill as `read_at` and a write's partial
     pages (`Ext4Inode::load_page`, which logs a failed read naming the
-    device, inode and page, once per streak of the same error: past a read's
-    or write's first page the error becomes a short count, #321).
+    device, inode and page, once per streak of the same error: a mapping's
+    fault turns the error into `SIGBUS`, and a read or write past its first
+    page into a short count, neither of which says anything of the disk,
+    #321).
     A hole in a `tmpfs` file (or a detached `ext4` one) gets a zero page
     (`CachePage::new_zeroed`, as `write_at`'s new pages).
     Unlike `read_at`, which reads a hole as zeros without a frame, a mapped

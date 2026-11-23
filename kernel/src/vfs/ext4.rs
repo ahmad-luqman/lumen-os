@@ -1330,7 +1330,9 @@ impl Ext4Inode {
     /// The file's bytes of page `page_idx` below `file_size`, read from disk
     /// (Locks 6–8): at most a page, fewer for the file's last page.
     /// The caller holds Lock 4 (`file_size` is its `meta.size`) and Lock 5,
-    /// and the page starts below `file_size`.
+    /// and the page starts below `file_size`. Reached only through
+    /// [`Self::load_page`], which logs a failure: a page fill calls that, so
+    /// that no failed read goes unlogged (#321).
     fn read_disk_page(&self, page_idx: u64, file_size: u64) -> Result<Vec<u8>, VfsError> {
         let page_base = page_idx * PAGE_SIZE as u64;
         let mut tmp = vec![0u8; page::valid_len(page_idx, file_size)];
@@ -6756,33 +6758,45 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ext4_a_write_whose_fill_fails_past_its_first_page_logs_the_read() {
+    fn ext4_a_write_whose_fill_read_fails_logs_it_as_a_read_does() {
         // A write over part of a page below the old size fills that page
-        // from the disk first. When that read fails on a page after the
-        // first, the write returns short (the pages before it) and the error
-        // reaches no caller, so the failed read is logged as a read's is
-        // (`note_read_error`: the streak's errno set, one warning naming
-        // page 1, pinned by test_ktest.py), and nothing is cached for it
-        // (#321).
+        // from the disk first, through the read path's fill (`load_page`),
+        // and so is logged as a read's is (#321): `note_read_error` sets the
+        // streak's errno and warns once per streak, and a fill that reads
+        // ends the streak. On a page after the write's first, the write
+        // returns short (the pages before it), the error reaching no caller;
+        // on its first page, the error is returned and logged too. Two
+        // warnings naming page 1 (two streaks), pinned by test_ktest.py.
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 199)?;
-        let data = pattern(2 * PAGE_SIZE, 17);
+        let data = pattern(PAGE_SIZE + 5, 17);
         let f = m.root.create(b"fill.bin", 0o644).map_err(|_| "create")?;
         kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
         f.sync(false).map_err(|_| "sync")?;
         let e = ext4_inode(&f)?;
-        e.pages.lock().remove_from(0); // filled from the disk next
+        let eio = VfsError::Io.to_errno();
+        e.pages.lock().remove_from(0); // none cached: page 1 is filled from the disk next
         kassert_eq!(e.read_errno.load(O::Acquire), 0);
         m.cache.fail_reads.store(true, O::Release);
         // Page 0 whole (no fill), then page 1's first 10 bytes (a fill).
         let wrote = f.write_at(0, &pattern(PAGE_SIZE + 10, 3));
         m.cache.clear();
         kassert_eq!(wrote, Ok(PAGE_SIZE));
-        kassert_eq!(e.read_errno.load(O::Acquire), VfsError::Io.to_errno());
+        kassert_eq!(e.read_errno.load(O::Acquire), eio);
         kassert!(e.pages.lock().get(1).is_none());
-        kassert_eq!(f.stat().map_err(|_| "stat")?.size, data.len() as u64);
+        kassert_eq!(f.stat().map_err(|_| "stat")?.size, data.len() as u64); // not grown
+        // A fill that reads ends the streak (page 0 cached, page 1 filled).
+        kassert_eq!(f.write_at(PAGE_SIZE as u64 - 1, b"xy"), Ok(2));
+        kassert_eq!(e.read_errno.load(O::Acquire), 0);
+        // Its first page's fill failing: the error returned, and logged.
+        e.pages.lock().remove_from(1);
+        m.cache.fail_reads.store(true, O::Release);
+        let first = f.write_at(PAGE_SIZE as u64 + 2, b"y");
+        m.cache.clear();
+        kassert_eq!(first, Err(VfsError::Io));
+        kassert_eq!(e.read_errno.load(O::Acquire), eio);
         Ok(())
     }
 );

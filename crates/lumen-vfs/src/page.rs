@@ -88,6 +88,27 @@ impl Iterator for PageSpans {
     }
 }
 
+/// `step` run on each of `spans` in order, until one fails: how many of
+/// the buffer's bytes the spans before it cover, or that first span's error
+/// when nothing came before it. The page cache's reads and writes answer
+/// this way (a short count, never an error, once some bytes moved, as
+/// Linux's `filemap_read` and `generic_perform_write` do); the caller's next
+/// call starts at the failing page and gets its error then. No span runs
+/// after a failure.
+pub fn short_count<E>(
+    spans: impl IntoIterator<Item = PageSpan>,
+    mut step: impl FnMut(&PageSpan) -> Result<(), E>,
+) -> Result<usize, E> {
+    let mut done = 0usize;
+    for span in spans {
+        if let Err(err) = step(&span) {
+            return if done > 0 { Ok(done) } else { Err(err) };
+        }
+        done = span.buf().end;
+    }
+    Ok(done)
+}
+
 /// How many pages a file of `size` bytes has: its pages are `0..pages_in(size)`,
 /// and a shrink to `size` drops every cached page from `pages_in(size)` on.
 pub const fn pages_in(size: u64) -> u64 {
@@ -312,5 +333,33 @@ mod tests {
         assert_eq!(resize_tail(5000, PAGE), None); // the new end on one
         assert_eq!(resize_tail(PAGE + 7, 0), None);
         assert_eq!(resize_tail(3 * PAGE + 1, PAGE + 9), Some(Tail { index: 1, from: 9 }));
+    }
+
+    #[test]
+    fn short_count_is_the_bytes_before_the_first_failure() {
+        // Every range and every page in it failing, alone or with all after
+        // it: the bytes of the spans before the failing one, the error when
+        // it is the first, the whole range when none fails; and no span runs
+        // after a failure (a failing middle page never lets a later one count).
+        for offset in offsets().into_iter().filter(|&o| o < u64::MAX - 4 * PAGE) {
+            for len in lens() {
+                let all: Vec<PageSpan> = spans(offset, len).unwrap().collect();
+                assert_eq!(short_count(all.clone(), |_| Ok::<(), ()>(())), Ok(len), "{offset}+{len}");
+                for bad in 0..all.len() {
+                    for later_fail in [false, true] {
+                        let mut ran = Vec::new();
+                        let got = short_count(all.clone(), |s| {
+                            ran.push(s.index());
+                            let i = s.index() - all[0].index();
+                            if i as usize == bad || (later_fail && i as usize > bad) { Err(i) } else { Ok(()) }
+                        });
+                        let want = if bad == 0 { Err(0) } else { Ok(all[bad].buf().start) };
+                        assert_eq!(got, want, "{offset}+{len}, page {bad} failing");
+                        let indices: Vec<u64> = all[..=bad].iter().map(|s| s.index()).collect();
+                        assert_eq!(ran, indices, "{offset}+{len}, page {bad} failing");
+                    }
+                }
+            }
+        }
     }
 }
