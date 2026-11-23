@@ -213,10 +213,12 @@ impl fmt::Display for QuotaCounter {
 }
 
 impl Drop for QuotaCounter {
-    /// A quota goes when the last of its owners (a `tmpfs` mount and its
-    /// inodes, entries and pages) has gone, each having given back what it
-    /// held: bytes still reserved were leaked. Takes no sleeping lock (the
-    /// leak's `error!` takes the log's leaf lock).
+    /// A quota goes when the last of its owners (a `tmpfs` mount, its
+    /// inodes and directories, their pages and charges) has gone, each
+    /// having given back what it held: bytes still reserved were leaked by
+    /// an owner that dropped without giving them back. An owner leaked
+    /// itself keeps the quota alive, so that logs nothing. Takes no
+    /// sleeping lock (the leak's `error!` takes the log's leaf lock).
     fn drop(&mut self) {
         let left = *self.used_bytes.get_mut();
         if left != 0 {

@@ -23,7 +23,7 @@ use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
 use super::page_cache::{self, CachePage, PAGE_SIZE, PageCache, QuotaCounter};
-use charge::{Children, EntryCharge, FIRST_CHILD_CURSOR, Growth, InodeCharge};
+use charge::{Children, FIRST_CHILD_CURSOR, Growth, InodeCharge};
 #[cfg(feature = "ktest")]
 use charge::{DIR_COST, INODE_COST, entry_cost, heap_block};
 
@@ -56,7 +56,7 @@ impl Tmpfs {
             self_weak: Weak::clone(weak_self),
             ino: AtomicU64::new(1),
             inode_type: InodeType::Dir,
-            _charged: InodeCharge::root(&shared.quota),
+            _charged: InodeCharge::uncharged_root(&shared.quota),
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
             meta: SleepMutex::new(TmpfsMeta {
@@ -92,9 +92,18 @@ impl Tmpfs {
 /// as the files' charges ([`INODE_COST`] and [`entry_cost`] each, a
 /// directory's [`DIR_COST`] too) fit in it: six files named with up to 16
 /// bytes at most (656 bytes each as of #267), or one directory and three
-/// such files. Past that, creating one more fails with `NoSpc`.
+/// such files (both checked below at compile time). Past that the files'
+/// charges take the data's room: creating them still works, but the mount
+/// runs out of data pages early.
 #[cfg(feature = "ktest")]
 pub(crate) const KTEST_METADATA_ROOM: usize = PAGE_SIZE - 1;
+
+#[cfg(feature = "ktest")]
+const _: () = {
+    let file = INODE_COST + entry_cost(16);
+    assert!(6 * file <= KTEST_METADATA_ROOM);
+    assert!(INODE_COST + DIR_COST + entry_cost(16) + 3 * file <= KTEST_METADATA_ROOM);
+};
 
 impl FileSystem for Tmpfs {
     fn dev_id(&self) -> DevId {
@@ -310,14 +319,15 @@ mod charge {
             Reserved::new(quota, inode_cost(node)).map(|reserved| Self { _reserved: reserved })
         }
 
-        /// The root's: nothing, one per mount.
-        pub(super) fn root(quota: &Arc<QuotaCounter>) -> Self {
+        /// The root's, which is free (one per mount): only [`super::Tmpfs::new`]
+        /// may make one, as it pays for nothing.
+        pub(super) fn uncharged_root(quota: &Arc<QuotaCounter>) -> Self {
             Self { _reserved: Reserved { quota: Arc::clone(quota), bytes: 0 } }
         }
     }
 
     /// A directory entry's charge ([`entry_cost`]) and the name it pays
-    /// for: reserved for a new name ([`EntryCharge::for_name`]) or taken
+    /// for: reserved for a new name ([`Children::reserve_new`]) or taken
     /// out of a directory with its entry ([`Children::take`]), spent by
     /// [`Children::add`], which files the name under it, and given back if
     /// dropped instead.
@@ -328,38 +338,46 @@ mod charge {
 
     impl EntryCharge {
         /// Reserve `name`'s charge, or `NoSpc`.
-        pub(super) fn for_name(quota: &Arc<QuotaCounter>, name: &[u8]) -> Result<Self, VfsError> {
+        fn for_name(quota: &Arc<QuotaCounter>, name: &[u8]) -> Result<Self, VfsError> {
             let reserved = Reserved::new(quota, entry_cost(name.len()))?;
             Ok(Self { reserved, name: name.to_vec() })
         }
 
-        /// This charge, with `growth`, now paying for `new_name` instead: a
-        /// rename's. What the old name's charge holds past the new name's
-        /// cost is given back.
-        pub(super) fn renamed(self, growth: Growth, new_name: &[u8]) -> Self {
-            let Self { mut reserved, .. } = self;
-            let mut growth = growth.0;
-            debug_assert!(Arc::ptr_eq(&reserved.quota, &growth.quota), "tmpfs: a rename across quotas");
-            reserved.bytes += core::mem::take(&mut growth.bytes);
-            let cost = entry_cost(new_name.len());
-            debug_assert!(reserved.bytes >= cost, "tmpfs: renaming to {:?} reserved too little", Escaped(new_name));
+        /// This charge, with `growth`, now paying for the name `growth` was
+        /// reserved for instead: a rename's. What the old name's charge
+        /// holds past the new name's cost is given back.
+        pub(super) fn renamed(self, growth: Growth) -> Self {
+            let Self { mut reserved, name: old_name } = self;
+            let Growth { reserved: mut more, old_len, name } = growth;
+            debug_assert_eq!(old_name.len(), old_len, "tmpfs: a rename's growth was reserved for another name");
+            debug_assert!(Arc::ptr_eq(&reserved.quota, &more.quota), "tmpfs: a rename across quotas");
+            reserved.bytes += core::mem::take(&mut more.bytes);
+            let cost = entry_cost(name.len());
+            debug_assert!(reserved.bytes >= cost, "tmpfs: renaming to {:?} reserved too little", Escaped(&name));
             reserved.quota.release_bytes(reserved.bytes.saturating_sub(cost));
             reserved.bytes = cost;
-            Self { reserved, name: new_name.to_vec() }
+            Self { reserved, name }
         }
     }
 
     /// What a rename to a new name costs on top of the old name's charge,
-    /// which moves to it: reserved before anything changes, so the count
-    /// never passes the limit and a name no costlier than the old one
-    /// needs nothing.
-    pub(super) struct Growth(Reserved);
+    /// which moves to it, and that new name: reserved before anything
+    /// changes, so the count never passes the limit and a name no costlier
+    /// than the old one needs nothing.
+    pub(super) struct Growth {
+        reserved: Reserved,
+        /// The length of the old name it was sized against.
+        old_len: usize,
+        /// The new name.
+        name: Vec<u8>,
+    }
 
     impl Growth {
         /// Reserve what `new_name` costs more than `old_name`, or `NoSpc`.
         pub(super) fn reserve(quota: &Arc<QuotaCounter>, old_name: &[u8], new_name: &[u8]) -> Result<Self, VfsError> {
             let more = entry_cost(new_name.len()).saturating_sub(entry_cost(old_name.len()));
-            Reserved::new(quota, more).map(Self)
+            let reserved = Reserved::new(quota, more)?;
+            Ok(Self { reserved, old_len: old_name.len(), name: new_name.to_vec() })
         }
     }
 
@@ -377,8 +395,11 @@ mod charge {
     /// calls still starts where it did, whatever was added or removed
     /// meanwhile.
     ///
-    /// Each entry holds its [`EntryCharge`] from [`Children::add`] until it
-    /// is removed, taken out, or the directory dropped.
+    /// An entry's charge, `entry_cost(name.len())`, is held implicitly
+    /// from [`Children::add`] until it is removed, taken out, or the
+    /// directory dropped: `add` empties the [`EntryCharge`], and `take` and
+    /// the directory's drop work the charge out again from the name. So an
+    /// entry's cost must depend on its name's length alone.
     pub(super) struct Children {
         /// The mount's quota, which the entries' charges are given back to.
         quota: Arc<QuotaCounter>,
@@ -407,8 +428,14 @@ mod charge {
             entry.map(|(_, child)| child)
         }
 
-        pub(super) fn contains_key(&self, name: &[u8]) -> bool {
-            self.by_name.contains_key(name)
+        /// Reserve the charge for a new entry `name`: `Exist` if the name is
+        /// taken (whether or not there is room), else `NoSpc` past the
+        /// quota.
+        pub(super) fn reserve_new(&self, name: &[u8]) -> Result<EntryCharge, VfsError> {
+            if self.by_name.contains_key(name) {
+                return Err(VfsError::Exist);
+            }
+            EntryCharge::for_name(&self.quota, name)
         }
 
         pub(super) fn is_empty(&self) -> bool {
@@ -421,7 +448,7 @@ mod charge {
         }
 
         /// Add `charge`'s name for `child`, under the next number: the
-        /// entry now holds the charge.
+        /// directory now holds the charge.
         pub(super) fn add(&mut self, child: Arc<TmpfsInode>, charge: EntryCharge) {
             let EntryCharge { mut reserved, name } = charge;
             debug_assert!(!self.by_name.contains_key(&name), "tmpfs: {:?} added twice", Escaped(&name));
@@ -452,12 +479,17 @@ mod charge {
         /// Take `name`'s entry out, with its charge (which a rename moves
         /// to the new name, and which is given back if dropped).
         pub(super) fn take(&mut self, name: &[u8]) -> Option<(Arc<TmpfsInode>, EntryCharge)> {
-            let seq = self.by_name.remove(name)?;
-            // The name's charge comes out with it, whatever `by_seq` holds.
+            let (name, seq) = self.by_name.remove_entry(name)?;
+            // The name's charge comes out with it, sized and named from the
+            // one key, whatever `by_seq` holds.
             let reserved = Reserved { quota: Arc::clone(&self.quota), bytes: entry_cost(name.len()) };
             let entry = self.by_seq.remove(&seq);
-            debug_assert!(entry.is_some(), "tmpfs: {:?}'s number {seq} had no entry", Escaped(name));
-            let (name, child) = entry?;
+            debug_assert!(
+                entry.as_ref().is_some_and(|(n, _)| *n == name),
+                "tmpfs: {:?}'s number {seq} lists another entry, or none",
+                Escaped(&name)
+            );
+            let (_, child) = entry?;
             Some((child, EntryCharge { reserved, name }))
         }
 
@@ -801,10 +833,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::NoEnt);
         }
         let children = &mut meta.dir_mut()?.children;
-        if children.contains_key(name) {
-            return Err(VfsError::Exist);
-        }
-        let entry = EntryCharge::for_name(&self.shared.quota, name)?;
+        let entry = children.reserve_new(name)?;
         let child = Self::new_child(&self.shared, Node::File, mode, 1)?;
         children.add(Arc::clone(&child), entry);
         let now = time::realtime_timespec();
@@ -827,10 +856,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::NoEnt);
         }
         let children = &mut meta.dir_mut()?.children;
-        if children.contains_key(name) {
-            return Err(VfsError::Exist);
-        }
-        let entry = EntryCharge::for_name(&self.shared.quota, name)?;
+        let entry = children.reserve_new(name)?;
         let dir = Dir { children: Children::new(Arc::clone(&self.shared.quota)), parent: Arc::downgrade(&self_arc) };
         let child = Self::new_child(&self.shared, Node::Dir(dir), mode, 2)?;
         children.add(Arc::clone(&child), entry);
@@ -965,10 +991,7 @@ impl VfsInode for TmpfsInode {
         {
             let p_meta = tmpfs_guard_mut(&mut guards, &self_arc);
             let children = &mut p_meta.dir_mut()?.children;
-            if children.contains_key(name) {
-                return Err(VfsError::Exist);
-            }
-            let entry = EntryCharge::for_name(&self.shared.quota, name)?;
+            let entry = children.reserve_new(name)?;
             children.add(Arc::clone(&target_arc), entry);
             p_meta.mtime = now;
             p_meta.ctime = now;
@@ -998,10 +1021,7 @@ impl VfsInode for TmpfsInode {
             return Err(VfsError::NoEnt);
         }
         let children = &mut meta.dir_mut()?.children;
-        if children.contains_key(name) {
-            return Err(VfsError::Exist);
-        }
-        let entry = EntryCharge::for_name(&self.shared.quota, name)?;
+        let entry = children.reserve_new(name)?;
         let child = Self::new_child(&self.shared, Node::Symlink(Box::from(target)), 0o777, 1)?;
         children.add(Arc::clone(&child), entry);
         let now = time::realtime_timespec();
@@ -1172,7 +1192,7 @@ impl VfsInode for TmpfsInode {
         }
         let new_children = &mut tmpfs_guard_mut(&mut guards, &new_dir_arc).known_dir_mut().children;
         match growth {
-            Some(growth) => new_children.add(moved, entry.renamed(growth, new_name)),
+            Some(growth) => new_children.add(moved, entry.renamed(growth)),
             None => {
                 drop(entry);
                 new_children.replace(new_name, moved);
@@ -1502,20 +1522,16 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn tmpfs_quota_charges_inodes_names_and_symlink_targets() {
-        // #267: a tmpfs mount's quota pays for each inode (a directory's
-        // maps too), each directory entry (its name) and each symlink's
-        // target, not only for pages:
-        // past it creating, linking or renaming fails with `NoSpc` and
-        // leaves nothing behind, and freeing gives the room back exactly.
+    fn tmpfs_quota_charges_each_inode_and_refuses_past_it() {
+        // #267: a tmpfs mount's quota pays for each inode and each directory
+        // entry, not only for pages: past it creating or linking fails with
+        // `NoSpc` and leaves nothing behind, an existing name is still
+        // `Exist`, and freeing gives the room back exactly. Room for exactly
+        // `N` files named with 8 bytes.
         use crate::{kassert, kassert_eq};
         use alloc::format;
-        let flags = RenameFlags(0);
-        let exchange = RenameFlags(RenameFlags::EXCHANGE);
         kassert!(INODE_COST >= size_of::<TmpfsInode>() + 2 * size_of::<usize>()); // an `Arc`'s block
         kassert_eq!(entry_cost(255) - entry_cost(0), 2 * 256); // two 16-byte-granule blocks
-
-        // Inodes: room for exactly `N` files named with 8 bytes.
         const N: usize = 6;
         let file_cost = INODE_COST + entry_cost(8);
         let fs = Tmpfs::new(DevId::makedev(0, 135), N * file_cost);
@@ -1540,6 +1556,7 @@ crate::ktest!(
         kassert_eq!(root.symlink(&name(1), b"t").err(), Some(VfsError::Exist));
         kassert_eq!(root.link(&name(1), &held[2]).err(), Some(VfsError::Exist));
         // Exchanging two names keeps both, and their charges.
+        let exchange = RenameFlags(RenameFlags::EXCHANGE);
         root.rename(&name(2), &root, &name(3), exchange).map_err(|_| "exchange on a full mount")?;
         kassert_eq!(fs.used_bytes(), N * file_cost);
         // Unlinking gives the name's room back; the inode's comes back when
@@ -1557,11 +1574,19 @@ crate::ktest!(
         kassert_eq!(fs.used_bytes(), N * file_cost);
         // A rename over a file frees the old name and the replaced inode.
         held.clear();
-        root.rename(&name(1), &root, &name(2), flags).map_err(|_| "rename over")?;
+        root.rename(&name(1), &root, &name(2), RenameFlags(0)).map_err(|_| "rename over")?;
         kassert_eq!(fs.used_bytes(), (N - 1) * file_cost);
+        Ok(())
+    }
+);
 
-        // Directories: room for exactly one, `d`, with nothing in it; and
-        // a byte less, none.
+crate::ktest!(
+    fn tmpfs_quota_charges_a_directory_its_maps() {
+        // #267: a directory costs an inode, its maps' root nodes
+        // (`DIR_COST`) and its name. Room for exactly one, `d`, with nothing
+        // in it; and a byte less, none. Removing it gives its name back, and
+        // its last reference the rest.
+        use crate::kassert_eq;
         let dir_cost = INODE_COST + DIR_COST + entry_cost(1);
         {
             let fs = Tmpfs::new(DevId::makedev(0, 139), dir_cost - 1);
@@ -1578,9 +1603,17 @@ crate::ktest!(
         kassert_eq!(fs.used_bytes(), INODE_COST + DIR_COST); // `d` itself, still held
         drop(d);
         kassert_eq!(fs.used_bytes(), 0);
+        Ok(())
+    }
+);
 
-        // Names: a file named "t", then room for exactly `K` more entries
-        // with 255-byte names.
+crate::ktest!(
+    fn tmpfs_quota_charges_names_by_length_and_renames_net() {
+        // #267: a name costs by its length, and a rename to a new name
+        // reserves only what it costs more. A file named "t", then room for
+        // exactly `K` more entries with 255-byte names.
+        use crate::{kassert, kassert_eq};
+        let flags = RenameFlags(0);
         const K: usize = 4;
         let long = |c: u8| [c; 255];
         let fs = Tmpfs::new(DevId::makedev(0, 136), INODE_COST + entry_cost(1) + K * entry_cost(255));
@@ -1628,8 +1661,15 @@ crate::ktest!(
         kassert_eq!(fs.used_bytes(), one + entry_cost(17));
         root.unlink(&[b'h'; 17]).map_err(|_| "unlink 17")?;
         kassert_eq!(fs.used_bytes(), one);
+        Ok(())
+    }
+);
 
-        // Symlink targets: room for one symlink "s" to a 4000-byte target.
+crate::ktest!(
+    fn tmpfs_quota_charges_symlink_targets() {
+        // #267: a symlink's target is charged with its inode. Room for one
+        // symlink "s" to a 4000-byte target.
+        use crate::{kassert, kassert_eq};
         const T: usize = 4000;
         let fs = Tmpfs::new(DevId::makedev(0, 137), INODE_COST + entry_cost(1) + T);
         let root = fs.root_inode();
@@ -1645,12 +1685,21 @@ crate::ktest!(
         kassert_eq!(root.lookup(b"s").err(), Some(VfsError::NoEnt));
         kassert_eq!(fs.used_bytes(), 0);
         root.symlink(b"s", &target).map_err(|_| "symlink again")?;
+        Ok(())
+    }
+);
 
-        // Across directories: a rename moves the name's charge, net of the
-        // new name's cost, and an exchange moves nothing. Then dropping the
-        // mount with everything in it gives every byte back but what an
+crate::ktest!(
+    fn tmpfs_quota_moves_charges_across_directories_and_drops_them_with_the_mount() {
+        // #267: a rename across directories moves the name's charge, net of
+        // the new name's cost, and an exchange moves nothing. Then dropping
+        // the mount with everything in it gives every byte back but what an
         // inode still held keeps: pages, inodes, a directory's entries
-        // inside (16 and 17 bytes among them), a target.
+        // inside (16 and 17 bytes among them), a target; and then the test's
+        // own reference is the quota's last.
+        use crate::kassert_eq;
+        let flags = RenameFlags(0);
+        let exchange = RenameFlags(RenameFlags::EXCHANGE);
         let fs = Tmpfs::new(DevId::makedev(0, 138), 64 * PAGE_SIZE);
         let quota = Arc::clone(&fs.shared.quota);
         let root = fs.root_inode();
@@ -1674,6 +1723,24 @@ crate::ktest!(
         kassert_eq!(quota.used_bytes(), INODE_COST + PAGE_SIZE); // `f` and its page
         drop(f);
         kassert_eq!(quota.used_bytes(), 0);
+        kassert_eq!(Arc::strong_count(&quota), 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn tmpfs_quota_dropped_with_bytes_reserved_logs_the_leak() {
+        // A mount's quota dropped with bytes still reserved (an owner that
+        // dropped without giving them back) logs the leak, naming the
+        // mount: the line is pinned in test_ktest.py's `VFS_EXACT_LINES`,
+        // so any tmpfs ktest mount that leaks fails there. The quota goes
+        // with the mount's last owner.
+        use crate::kassert;
+        let fs = Tmpfs::new(DevId::makedev(0, 143), PAGE_SIZE);
+        let quota = Arc::downgrade(&fs.shared.quota);
+        kassert!(fs.shared.quota.try_reserve_bytes(16));
+        drop(fs);
+        kassert!(quota.upgrade().is_none());
         Ok(())
     }
 );
@@ -1685,15 +1752,19 @@ crate::ktest!(
         // (`heap::stats().used`, which nothing else moves meanwhile: the
         // other CPUs idle through the ktests, as `app::tests`' exact heap
         // checks also rely on, and names, targets and the holder are made
-        // first). Three shapes: one
-        // directory with hundreds of long names, so both maps grow nodes
-        // past their roots (an entry's share); the same after removing every
-        // other name (nodes at their emptiest); many directories of one
-        // entry each (a directory's map roots, `DIR_COST`). The root's own
-        // maps are free by design, so each baseline is taken with the root
-        // already holding an entry.
-        use crate::kassert;
+        // first). Four shapes:
+        // - one directory with hundreds of long names, so both maps grow
+        //   nodes past their roots (an entry's share);
+        // - the same after removing every other name (std merges and
+        //   refills the nodes that underflow, so this isn't their emptiest);
+        // - many directories of one entry each (a directory's map roots,
+        //   `DIR_COST`);
+        // - one directory's leaves at std's minimum fill, `B - 1` entries
+        //   each, where an entry's share of the nodes is the largest.
+        // The root's own maps are free by design, so each baseline is taken
+        // with the root already holding an entry.
         use crate::mm::heap;
+        use crate::{kassert, kassert_eq};
         use alloc::format;
         fn covered(what: &'static str, heap0: usize, quota0: usize, fs: &Tmpfs) -> Result<(), &'static str> {
             let took = heap::stats().used as isize - heap0 as isize;
@@ -1705,16 +1776,20 @@ crate::ktest!(
         const FILES: usize = 240;
         const LINKS: usize = 120;
         const DIRS: usize = 48;
+        const MIN_FILL: usize = 700;
         let fs = Tmpfs::new(DevId::makedev(0, 141), 1024 * PAGE_SIZE);
         let root = fs.root_inode();
         root.create(b"a", 0o644).map_err(|_| "create a")?;
-        let long = |i: usize| {
+        // Zero-padded numbers, so a directory's names sort in the order
+        // they are added: both maps then have the same shape.
+        let numbered = |i: usize, len: usize| {
             let mut name = format!("{i:05}").into_bytes();
-            name.resize(255, b'n');
+            name.resize(len, b'n');
             name
         };
-        let names: Vec<Vec<u8>> = (0..FILES + LINKS).map(long).collect();
+        let names: Vec<Vec<u8>> = (0..FILES + LINKS).map(|i| numbered(i, 255)).collect();
         let dir_names: Vec<Vec<u8>> = (0..DIRS).map(|i| format!("d{i:04}").into_bytes()).collect();
+        let min_names: Vec<Vec<u8>> = (0..MIN_FILL).map(|i| numbered(i, 16)).collect();
         crate::ktest::diag(format_args!(
             "INODE_COST {INODE_COST}, DIR_COST {DIR_COST}, entry_cost(8) {}, entry_cost(255) {}",
             entry_cost(8),
@@ -1746,6 +1821,30 @@ crate::ktest!(
             dirs.push(d);
         }
         covered("one entry per directory", heap0, quota0, &fs)?;
+
+        // Names added in order fill each leaf to `2 * B - 1` and split it
+        // keeping `B` on the left, one going up, the rest on the right; so
+        // every leaf but the last holds `B` names and they start `B + 1`
+        // names apart (std's `B` is 6). Unlinking the first name of each leaf after the
+        // first leaves each at `B - 1`, std's minimum, with no merge: the
+        // heap falls by exactly those names' blocks, no node freed (were
+        // std's split to change, that fails first).
+        let (heap0, quota0) = (heap::stats().used, fs.used_bytes());
+        let min = root.mkdir(b"min", 0o755).map_err(|_| "mkdir min")?;
+        let held = min.create(&min_names[0], 0o644).map_err(|_| "create in min")?;
+        for name in &min_names[1..] {
+            min.link(name, &held).map_err(|_| "link in min")?;
+        }
+        let filled = heap::stats().used;
+        let mut removed = 0;
+        for name in min_names.iter().skip(7).step_by(7) {
+            min.unlink(name).map_err(|_| "unlink in min")?;
+            removed += 1;
+        }
+        kassert_eq!(removed, MIN_FILL / 7 - 1);
+        let fell = filled as isize - heap::stats().used as isize;
+        kassert_eq!(fell, (removed * 2 * heap_block(16)) as isize);
+        covered("leaves at minimum fill", heap0, quota0, &fs)?;
         Ok(())
     }
 );
