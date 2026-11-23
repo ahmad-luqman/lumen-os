@@ -47,20 +47,130 @@ impl fmt::Debug for ResolvedPath {
     }
 }
 
-/// Output of [`resolve_parent`].
+/// Output of [`resolve_parent`]: the directory a namespace operation works
+/// in and the path's last component, borrowed from the path and handed out
+/// as a [`Final`] by [`ParentTarget::final_component`] (#309).
 #[derive(Clone)]
-pub struct ParentTarget {
+pub struct ParentTarget<'a> {
     pub parent: Arc<dyn VfsInode>,
-    pub name: Vec<u8>,
+    /// Private, so a `ParentTarget` comes only from [`resolve_parent`],
+    /// which classifies the component, and a name's bytes come only out of
+    /// a pattern on [`ParentTarget::final_component`]'s [`Final`].
+    last: Final<'a>,
     pub has_trailing_slash: bool,
 }
 
-impl fmt::Debug for ParentTarget {
+/// A path's last component, as [`ParentTarget::final_component`] gives it.
+///
+/// Only [`Final::Name`] is an entry a filesystem can create, remove or
+/// rename; for the other three each namespace operation has its own errno
+/// (`mkdirat`'s `-EEXIST`; `rmdir`'s `-EBUSY`, `-EINVAL` and `-ENOTEMPTY`;
+/// ...). A name's bytes come only out of a pattern on it, so the other
+/// three always get some answer. `ops.rs` reads it only by a `match` on
+/// `final_component()`, which doesn't compile if it leaves a case out; the
+/// comment at the top of `ops.rs` says what keeps it to that form (clippy
+/// lints forbidden there and the host test
+/// `ops_reads_final_only_through_a_direct_match`) and what they miss. Code
+/// outside `ops.rs` is held to it by convention only.
+///
+/// Stable rustdoc doesn't check a `compile_fail` example's error code, so
+/// each one is followed by a twin that is the same but for the part meant
+/// to fail, and compiles: it fails for that reason, not another.
+///
+/// ```compile_fail
+/// use lumen_vfs::resolve::{Final, ParentTarget};
+///
+/// fn name<'a>(target: &ParentTarget<'a>) -> Option<&'a [u8]> {
+///     match target.final_component() {
+///         Final::Root | Final::Dot => None,
+///         Final::Name(name) => Some(name),
+///     }
+/// }
+/// ```
+///
+/// ```
+/// use lumen_vfs::resolve::{Final, ParentTarget};
+///
+/// fn name<'a>(target: &ParentTarget<'a>) -> Option<&'a [u8]> {
+///     match target.final_component() {
+///         Final::Root | Final::Dot | Final::DotDot => None,
+///         Final::Name(name) => Some(name),
+///     }
+/// }
+/// ```
+///
+/// Nor is there a field to take it from instead: the component's own is
+/// private (this would compile were it `pub`)...
+///
+/// ```compile_fail
+/// use lumen_vfs::resolve::{Final, ParentTarget};
+///
+/// fn last<'a>(target: &ParentTarget<'a>) -> Final<'a> {
+///     target.last
+/// }
+/// ```
+///
+/// ```
+/// use lumen_vfs::resolve::{Final, ParentTarget};
+///
+/// fn last<'a>(target: &ParentTarget<'a>) -> Final<'a> {
+///     target.final_component()
+/// }
+/// ```
+///
+/// ...and the name's bytes have none (this would compile were they a
+/// public `name: Vec<u8>` or `&[u8]` again):
+///
+/// ```compile_fail
+/// fn is_empty(target: &lumen_vfs::resolve::ParentTarget<'_>) -> bool {
+///     target.name.is_empty()
+/// }
+/// ```
+///
+/// ```
+/// fn is_empty(target: &lumen_vfs::resolve::ParentTarget<'_>) -> bool {
+///     !target.has_trailing_slash
+/// }
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Final<'a> {
+    /// The path was only slashes (`/`, `//`): the parent is the global root.
+    Root,
+    /// `.`
+    Dot,
+    /// `..`
+    DotDot,
+    /// A name in the parent. As [`resolve_parent`] makes it (the variant
+    /// itself checks nothing): never empty, `.` or `..`, at most
+    /// `NAME_MAX` bytes, and holding neither `/` nor NUL; any other bytes,
+    /// UTF-8 or not (#268).
+    Name(&'a [u8]),
+}
+
+impl fmt::Debug for Final<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Final::Root => f.write_str("Root"),
+            Final::Dot => f.write_str("Dot"),
+            Final::DotDot => f.write_str("DotDot"),
+            Final::Name(name) => f.debug_tuple("Name").field(&Escaped(name)).finish(),
+        }
+    }
+}
+
+impl<'a> ParentTarget<'a> {
+    /// The path's last component.
+    pub fn final_component(&self) -> Final<'a> {
+        self.last
+    }
+}
+
+impl fmt::Debug for ParentTarget<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ParentTarget")
             .field("parent_dev", &self.parent.dev_id())
             .field("parent_ino", &self.parent.ino())
-            .field("name", &Escaped(&self.name))
+            .field("final", &self.last)
             .field("has_trailing_slash", &self.has_trailing_slash)
             .finish()
     }
@@ -392,24 +502,25 @@ pub(crate) fn resolve_path_with_depth(
     Ok(ResolvedPath { inode: cur, has_trailing_slash })
 }
 
-/// Resolve the parent directory and final component name for namespace-mutating
+/// Resolve the parent directory and final component for namespace-mutating
 /// operations (`open(O_CREAT)`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`, `rename`).
-/// The name is the final component's bytes, UTF-8 or not (#268).
-pub fn resolve_parent(
+/// A [`Final::Name`] borrows its bytes from `path`, UTF-8 or not (#268); a
+/// path of only slashes is [`Final::Root`], with `has_trailing_slash` set.
+pub fn resolve_parent<'a>(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
-    path: &[u8],
-) -> Result<ParentTarget, VfsError> {
+    path: &'a [u8],
+) -> Result<ParentTarget<'a>, VfsError> {
     let mut symlink_depth = 0usize;
     resolve_parent_with_depth(env, start_dir, path, &mut symlink_depth)
 }
 
-pub(crate) fn resolve_parent_with_depth(
+pub(crate) fn resolve_parent_with_depth<'a>(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
-    path: &[u8],
+    path: &'a [u8],
     symlink_depth: &mut usize,
-) -> Result<ParentTarget, VfsError> {
+) -> Result<ParentTarget<'a>, VfsError> {
     if path.len() >= PATH_MAX {
         return Err(VfsError::NameTooLong);
     }
@@ -427,7 +538,7 @@ pub(crate) fn resolve_parent_with_depth(
     }
     if trimmed_end == 0 {
         let root = resolve_global_root(env)?;
-        return Ok(ParentTarget { parent: root, name: b"/".to_vec(), has_trailing_slash: true });
+        return Ok(ParentTarget { parent: root, last: Final::Root, has_trailing_slash: true });
     }
 
     let trimmed = &path[..trimmed_end];
@@ -458,7 +569,12 @@ pub(crate) fn resolve_parent_with_depth(
     if name_bytes.len() > NAME_MAX {
         return Err(VfsError::NameTooLong);
     }
-    Ok(ParentTarget { parent, name: name_bytes.to_vec(), has_trailing_slash })
+    let last = match name_bytes {
+        b"." => Final::Dot,
+        b".." => Final::DotDot,
+        name => Final::Name(name),
+    };
+    Ok(ParentTarget { parent, last, has_trailing_slash })
 }
 
 /// Reconstruct the canonical path of `cwd` by walking `".."` and crossing
