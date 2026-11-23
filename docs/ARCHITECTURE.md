@@ -5716,19 +5716,28 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     probes `resolve` and `ops` make, each releasing its locks before it
     returns; the `cacheable()` checks above), with `mount_root`, `mount`,
     `umount` (the evicted inodes dropped after the locks are released) and
-    the snapshots `sync` takes. It lives in lumen-vfs, generic over a lock
-    family (`trait LockFamily { type Lock<T>: VfsLock<T>; }`), so the
-    kernel and the host tests run the same code: the kernel's
-    `KernelVfsTables` is `VfsTables<KernelLocks>` (`KernelVfsLock`, a
-    `SleepMutex`), and the host tests' is a `std` mutex whose guards count
-    the Lock-9 depth that test filesystems assert is zero in their calls,
-    and which panics when a thread takes the tables out of their sub-order
-    or takes one it already holds. `VfsLock::new` isn't
-    `const` (a trait method, on stable Rust), so the kernel's `static
-    TABLES` is built by the `const fn VfsTables::from_locks(mounts,
-    dentries, inodes)` from locks made by `SleepMutex::new`, a `const fn`;
-    `VfsTables::new` and `with_capacities` build the locks at run time.
-    Test-only `VfsCacheOps` wrappers (a spy, a hook) delegate to one.
+    the snapshots: of the filesystems for `sync`, of the inodes for the
+    page-cache reclaim and procfs. Calls into a filesystem it still makes
+    under the locks, and `Arc`s it drops there, are listed in #320. It
+    lives in lumen-vfs, generic over a lock family (`trait LockFamily {
+    type Lock<T>: VfsLock<T>; }`), so the kernel and the host tests run
+    the same code: the kernel's `KernelVfsTables` is
+    `VfsTables<KernelLocks>` (`KernelVfsLock`, a `SleepMutex`), and the
+    host tests' is `VfsTables<TestLocks>`: `TestLock`, a `std` mutex whose
+    guards record which tables their thread holds, which test filesystems
+    assert is none in their calls (`assert_test_lock9_free`), and which
+    aborts the test binary, its message on stderr, when a thread takes the
+    tables out of their sub-order or takes one it already holds (a panic
+    would leave a test whose other threads wait on a `Barrier` hanging).
+    `VfsLock::new` isn't `const` (a trait method, on stable Rust), so the
+    kernel's `static TABLES` is built by the `const fn
+    VfsTables::from_locks(mounts, dentries, inodes)` from locks made by
+    `KernelVfsLock::new_const` (`SleepMutex::new`, a `const fn`; for
+    `TABLES` only) around empty tables. It and `VfsTables::new`, which
+    builds the locks at run time, take the same argument-free constructors
+    (`MountTable::new`, `DentryCache::with_default_capacity`,
+    `InodeCache::new`), so neither names a capacity. Test-only
+    `VfsCacheOps` wrappers (a spy, a hook) delegate to one.
 - **Path & symlink resolution (`resolve_path`, host-tested):**
   - Handles absolute paths, `dirfd`/`AT_FDCWD` relative paths, physical
     component-by-component `.` and `..` traversal (never lexical `..` collapse
