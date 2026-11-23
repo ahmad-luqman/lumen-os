@@ -86,6 +86,16 @@ pub(crate) fn is_inode_dead(inode: &Arc<dyn VfsInode>) -> bool {
     inode.is_detached() || matches!(inode.stat(), Ok(m) if m.nlink == 0) || matches!(inode.stat(), Err(VfsError::NoEnt))
 }
 
+/// After a failed `rmdir` or `rename` over a directory, forget the parent
+/// recorded for `dir` (#318), unless `dir` is gone all the same (ext4 failing
+/// to undo its disk changes after a write error): then `..` from it still
+/// needs the record.
+fn forget_removed_dir_unless_gone(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>) {
+    if !is_inode_dead(dir) {
+        env.inode_forget_removed_dir(dir);
+    }
+}
+
 /// Evict any cached dead inode for `(dev, ino)` without recording a redundant
 /// removal if none is cached (used right after `InodeRemovalGuard::finish`).
 fn evict_if_cached_zombie(env: &dyn VfsCacheOps, dev: DevId, ino: Ino) {
@@ -727,16 +737,13 @@ pub fn unlink_at(
             env.dentry_invalidate_dir(old_dev, old_ino);
             let (guard, removed_arc_opt) = InodeRemovalGuard::begin(env, old_dev, old_ino, since_gen);
             // Its `..` once removed (#318): recorded first, under the rename
-            // lock, so no `..` from it ever finds neither.
+            // lock (ext4's and tmpfs's), so a `..` from it always has an
+            // answer: the filesystem's `..` until the removal, the record
+            // after.
             env.inode_record_removed_dir(&child, &target.parent);
 
             if let Err(err) = target.parent.rmdir(name) {
-                // Kept if the directory is gone all the same (ext4 failing
-                // to undo its disk changes after a write error, or another
-                // `rmdir` winning on a filesystem without a rename lock).
-                if !is_inode_dead(&child) {
-                    env.inode_forget_removed_dir(&child);
-                }
+                forget_removed_dir_unless_gone(env, &child);
                 let end_gen = guard.finish();
                 if let Some(removed_arc) = removed_arc_opt
                     && !removed_arc.is_detached()
@@ -1079,6 +1086,7 @@ pub fn rename_at2(
                 let dir_key = (new_inode.dev_id(), orig_ino);
                 env.dentry_invalidate_dir(dir_key.0, dir_key.1);
                 overwritten_dir_key = Some(dir_key);
+                // Recorded before the rename, as `unlink_at`'s `rmdir`.
                 env.inode_record_removed_dir(new_inode, &new_target.parent);
                 overwritten_dir = Some(new_inode);
             }
@@ -1089,10 +1097,8 @@ pub fn rename_at2(
         }
 
         if let Err(err) = old_target.parent.rename(old_name, &new_target.parent, new_name, flags) {
-            if let Some(dir) = overwritten_dir
-                && !is_inode_dead(dir)
-            {
-                env.inode_forget_removed_dir(dir);
+            if let Some(dir) = overwritten_dir {
+                forget_removed_dir_unless_gone(env, dir);
             }
             if let Some(pending) = removal_guard {
                 let end_gen = pending.guard.finish();

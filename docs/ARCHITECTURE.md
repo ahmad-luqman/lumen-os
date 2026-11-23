@@ -5697,44 +5697,53 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     with their process or fd, and pids only grow. Each lookup of one builds
     a fresh inode, so two opens of the same `/proc/<pid>` file don't share
     advisory locks or an open count.
-    **A removed directory's parent (#318):** it also keeps, for each
-    directory an `rmdir` or a `rename` over it removed, the directory it
-    was removed from, as Linux keeps a deleted dentry's `d_parent`: `..`
-    from it asks the filesystem first, as from any directory, and on
-    `-ENOENT` (ext4 and tmpfs give a removed directory no `..`) takes the
+    **A removed directory's parent (#318):** `InodeCache` also keeps,
+    for each directory an `rmdir` or a `rename` over it removed, the
+    directory it was removed from, as Linux keeps a deleted dentry's
+    `d_parent`: `..` from it asks the filesystem first, as from any
+    directory, and only on `-ENOENT` (ext4 and tmpfs give a removed
+    directory no `..`; any other error is reported as it is) takes the
     recorded parent (`VfsCacheOps::inode_removed_dir_parent`), so
     `chdir("..")`, `open("..", O_DIRECTORY)` and `open("..", O_CREAT)`
     (`-EISDIR`) from a removed cwd or start directory act as on Linux, and
-    `../..` and `../name` go on from there. `ops` records it
-    (`inode_record_removed_dir`) before the filesystem's `rmdir` or
-    `rename`, under its rename lock (so the directory can't move
-    meanwhile and no `..` from it finds neither answer), and forgets it
-    (`inode_forget_removed_dir`) if that fails with the directory still
-    linked (one gone all the same, as after ext4 fails to undo its disk
-    changes, keeps it; tested for `rmdir`, the `rename` side untested). A
-    record is keyed by the
-    directory's `Arc` (a `Weak` to it, which keeps the address from being
-    reused), never `(dev, ino)`: a directory removed while open is
-    detached under another number, a freed one's is reused. It holds the
-    parent's `Arc` strongly, as `d_parent` does, so the parent stays
-    reachable if it is removed in turn while held open (detached, under a
-    number of its own). One freed by its removal, nothing holding it open,
-    is `-ENOENT` from `..` (Linux still finds it): its number may be
-    another inode's by now, which the dentry cache and the mount table,
-    both keyed by numbers, would take it for (`stat` read before
-    `is_detached`, as `OpenGuard::try_new` does). The `Arc` a removal sees is the cached
-    one, the same a cwd or a descriptor holds (and ext4 and tmpfs keep one
-    `Arc` per live inode, so even an uncached lookup's is that one); a
-    different `Arc` of the same directory (only from a filesystem making a
-    fresh one per lookup, uncached) finds no record. A record whose
-    directory has no strong reference left is dead: each new record, each
-    forgotten one and each `..` that takes one prune the dead ones (again
-    after their parents drop, outside the lock, since a parent kept only by
-    such a record leaves its own record dead), so a dead record keeps its
-    parent until the next of those; `umount` drops the filesystem's records
-    with its inodes (`..` from a removed directory on it is then
-    `-ENOENT`: `umount` doesn't refuse a filesystem in use, where Linux
-    says `-EBUSY`).
+    `../..` and `../name` go on from there.
+    - `ops` records it (`inode_record_removed_dir`) before the
+      filesystem's `rmdir` or `rename`, under its rename lock (ext4's and
+      tmpfs's: the directory can't move meanwhile, and a `..` from it
+      always has an answer, the filesystem's until the removal and the
+      record after), and forgets it (`inode_forget_removed_dir`) if that
+      fails with the directory still linked; one gone all the same (as
+      after ext4 fails to undo its disk changes) keeps it.
+    - A record is keyed by the directory's `Arc` (a `Weak` to it, which
+      keeps the address from being reused), never `(dev, ino)`: a
+      directory removed while open is detached under another number, a
+      freed one's is reused. The `Arc` a removal sees is the cached one,
+      the same a cwd or a descriptor holds (and ext4 and tmpfs keep one
+      `Arc` per live inode, so even an uncached lookup's is that one).
+    - It holds the parent's `Arc` strongly, as `d_parent` does, so the
+      parent stays reachable if it is removed in turn while held open
+      (detached, under a number of its own). The parent is handed back
+      without unifying it in `InodeCache`: while live it is the cached
+      `Arc` (`InodeCache` never evicts a live entry but at `umount`, which
+      drops the records too).
+    - A record whose directory has no strong reference left is dead: each
+      new record and each `..` the filesystem answers `-ENOENT` prune the
+      dead ones (again after their parents drop, outside the lock, since a
+      parent kept only by such a record leaves its own record dead), so a
+      dead record keeps its parent until the next of those. `umount` drops
+      the filesystem's records with its inodes.
+    - `getcwd` (`compute_cwd_path`) checks the cwd is still linked after
+      naming it: one removed during the walk can have had its number taken
+      by a new entry in its parent, which the walk would have named.
+    - Differences from Linux: a parent freed by its own removal, nothing
+      holding it open, is `-ENOENT` from `..` (Linux still finds it): its
+      number may be another inode's by now, which the dentry cache and the
+      mount table, both keyed by numbers, would take it for (`stat` read
+      before `is_detached`, the order as in `OpenGuard::try_new`). After
+      `umount`, `..` from a removed directory on it is `-ENOENT`: `umount`
+      doesn't refuse a filesystem in use, where Linux says `-EBUSY`. A
+      different `Arc` of the same directory (only from a filesystem making
+      a fresh one per lookup, uncached) finds no record.
   - `DentryCache`: keyed by `(parent_dev, parent_ino, name)` (the name a `Box<[u8]>`), storing
     child `(DevId, Ino)` with immediate invalidation on `unlink`, `rmdir`,
     `rename`, and `mount`/`umount`, and bounded at 4096 entries (oldest

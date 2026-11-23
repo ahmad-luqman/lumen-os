@@ -252,7 +252,14 @@ pub(crate) fn resolve_and_unify_magic_target(
 /// by its removal is `ENOENT`: its number may be another inode's by now,
 /// which the dentry cache and the mount table, both keyed by numbers, would
 /// take it for (Linux, whose dentries aren't, still finds it). `stat` is
-/// read before `is_detached`, as `OpenGuard::try_new` does.
+/// read before `is_detached` (the order, and why, as in
+/// `OpenGuard::try_new`).
+///
+/// Handed back without unifying it in `InodeCache`, as the filesystem's
+/// answer is: while live it is the cached `Arc` (`ops` records the resolved
+/// parent, and `InodeCache` never evicts a live entry but at `umount`, which
+/// drops the records too), detached it has a number of its own, and freed it
+/// is refused.
 fn removed_dir_parent(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>) -> Result<Arc<dyn VfsInode>, VfsError> {
     let parent = env.inode_removed_dir_parent(dir).ok_or(VfsError::NoEnt)?;
     if parent.stat()?.nlink == 0 && !parent.is_detached() {
@@ -617,7 +624,17 @@ pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Resul
     let mut components: Vec<Vec<u8>> = Vec::new();
     for attempt in 0..=MAX_CWD_RENAME_RETRIES {
         match compute_cwd_path_once(env, cwd, &mut components) {
-            Ok(path) => return Ok(path),
+            // Still linked once named: a `cwd` removed during the walk can
+            // have had its number taken by a new entry in its parent, which
+            // `find_child_name_in_dir` would have named (`stat` before
+            // `is_detached`, as `OpenGuard::try_new`). A removed ancestor
+            // means `cwd` was removed first: only an empty directory can be.
+            Ok(path) => {
+                if cwd.stat()?.nlink == 0 || cwd.is_detached() {
+                    return Err(VfsError::NoEnt);
+                }
+                return Ok(path);
+            }
             Err(VfsError::NoEnt) => {
                 if cwd.is_detached() || cwd.stat()?.nlink == 0 {
                     return Err(VfsError::NoEnt);

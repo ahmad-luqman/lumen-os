@@ -3715,6 +3715,8 @@ struct ReusingHooks {
     pre_rmdir: BTreeMap<Vec<u8>, FsOpHook>,
     post_rename: BTreeMap<Vec<u8>, FsOpHook>,
     rmdir_override_err: BTreeMap<Vec<u8>, VfsError>,
+    rename_override_err: BTreeMap<Vec<u8>, VfsError>,
+    lookup_override_err: BTreeMap<Vec<u8>, VfsError>,
 }
 
 struct ReusingFsInner {
@@ -3956,6 +3958,9 @@ impl VfsInode for ReusingHandle {
         let hook = self.inner.hooks.lock().unwrap().pre_lookup.remove(name);
         if let Some(hook) = hook {
             hook();
+        }
+        if let Some(err) = self.inner.hooks.lock().unwrap().lookup_override_err.remove(name) {
+            return Err(err);
         }
         let res = {
             let state = self.inner.state.lock().unwrap();
@@ -4352,6 +4357,11 @@ impl VfsInode for ReusingHandle {
         let hook = self.inner.hooks.lock().unwrap().post_rename.remove(new_name);
         if let Some(hook) = hook {
             hook();
+        }
+        if res.is_ok()
+            && let Some(err) = self.inner.hooks.lock().unwrap().rename_override_err.remove(new_name)
+        {
+            return Err(err);
         }
         res
     }
@@ -8499,7 +8509,8 @@ fn not_a_name_errno_per_operation_ahead_of_erofs() {
 /// #309: `.` and `..` in a removed directory, which the filesystem no longer
 /// finds either of: `link` and `open(O_CREAT|O_EXCL)` on either, and
 /// `open(O_CREAT)` on `.`, answer from the path, never handing it to the
-/// filesystem as a name.
+/// filesystem as a name; `open(O_CREAT)` on `..` is `EISDIR` too, from the
+/// parent it was removed from once the filesystem has no `..` (#318).
 #[test]
 fn not_a_name_answered_without_the_filesystem() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
@@ -8539,14 +8550,14 @@ fn same_inode(a: &Arc<dyn VfsInode>, b: &Arc<dyn VfsInode>) -> bool {
 #[test]
 fn dotdot_from_a_removed_directory_is_its_parent() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(fs as Arc<dyn FileSystem>);
     let env = env.as_ref();
     let root = resolve_path(env, None, b"/", ResolveFlags::default()).unwrap().inode;
     let p = mkdir_at(env, None, b"/p", 0o755, 0).unwrap();
     open_inode(env, None, b"/p/s", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
     let mp = mkdir_at(env, None, b"/m", 0o755, 0).unwrap();
     let mounted = FreshArcReusingFs::new(DevId::makedev(0, 74), "fresh-tmpfs", false, true);
-    env.mount(mp, "/m", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
+    env.mount(mp, "/m", mounted as Arc<dyn FileSystem>).unwrap();
     let m = resolve_path(env, None, b"/m", ResolveFlags::default()).unwrap().inode;
     open_inode(env, None, b"/m/s", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
 
@@ -8582,8 +8593,8 @@ fn dotdot_from_a_removed_directory_is_its_parent() {
 
 /// #318: a directory a `rename` replaces is removed as by `rmdir`: `..`
 /// from it is the directory it was replaced in. A rename that fails (onto a
-/// directory not empty) and a failed `rmdir` keep no record of a parent,
-/// and the directory's own `..` is the filesystem's again.
+/// directory not empty) and a failed `rmdir` keep no record of a parent:
+/// the directory's `..` is still the filesystem's.
 #[test]
 fn dotdot_from_a_directory_a_rename_replaced() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
@@ -8598,6 +8609,8 @@ fn dotdot_from_a_directory_a_rename_replaced() {
 
     assert_eq!(rename_at2(env, None, b"/b/src", None, b"/a/full", RenameFlags(0)).unwrap_err(), VfsError::NotEmpty);
     assert!(env.inode_removed_dir_parent(&full).is_none(), "a failed rename kept a record");
+    let up = resolve_path(env, Some(&full), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up, &a));
     fs.inner.hooks.lock().unwrap().rmdir_override_err.insert(b"victim".to_vec(), VfsError::Busy);
     assert_eq!(unlink_at(env, None, b"/a/victim", true).unwrap_err(), VfsError::Busy);
     assert!(env.inode_removed_dir_parent(&victim).is_none(), "a failed rmdir kept a record");
@@ -8639,7 +8652,7 @@ fn dotdot_from_a_directory_a_failed_rmdir_removed() {
 #[test]
 fn dotdot_to_a_freed_parent_is_enoent() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(fs as Arc<dyn FileSystem>);
     let env = env.as_ref();
     let x = mkdir_at(env, None, b"/x", 0o755, 0).unwrap();
     let y = mkdir_at(env, None, b"/x/y", 0o755, 0).unwrap();
@@ -8656,61 +8669,63 @@ fn dotdot_to_a_freed_parent_is_enoent() {
     assert_eq!(from_y(b"..").unwrap_err(), VfsError::NoEnt);
     assert_eq!(from_y(b"../f").unwrap_err(), VfsError::NoEnt, "`../f` found /n/f");
     let mounted = FreshArcReusingFs::new(DevId::makedev(0, 76), "fresh-tmpfs", false, true);
-    env.mount(n, "/n", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
+    env.mount(n, "/n", mounted as Arc<dyn FileSystem>).unwrap();
     assert_eq!(from_y(b"..").unwrap_err(), VfsError::NoEnt, "`..` crossed into what is mounted on /n");
     drop(guard);
 }
 
 /// #318: `..` from a removed directory whose parent was removed after it,
 /// held open (detached), is that parent (held as `d_parent` holds its
-/// dentry), and `../..` the parent's own parent; a record whose directory
-/// is gone is pruned by the next removal, with those its parents' drops
-/// leave dead, and unmounting drops the filesystem's records.
+/// dentry), and `../..` the parent's own parent. A record whose directory
+/// is gone is pruned by the next removal, and so, in turn, are the records
+/// its parent's drop leaves dead; a `..` its filesystem answers `ENOENT`
+/// prunes too; unmounting drops the filesystem's records.
 #[test]
 fn removed_directories_parents_kept_while_needed() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
-    let x = mkdir_at(env.as_ref(), None, b"/x", 0o755, 0).unwrap();
-    let y = mkdir_at(env.as_ref(), None, b"/x/y", 0o755, 0).unwrap();
-    let w = mkdir_at(env.as_ref(), None, b"/x/y/w", 0o755, 0).unwrap();
+    let tables = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = tables.as_ref();
+    let x = mkdir_at(env, None, b"/x", 0o755, 0).unwrap();
+    let y = mkdir_at(env, None, b"/x/y", 0o755, 0).unwrap();
+    let w = mkdir_at(env, None, b"/x/y/w", 0o755, 0).unwrap();
     let guards = [&x, &y].map(|d| OpenGuard::try_new(Arc::clone(d)).unwrap());
     for path in [&b"/x/y/w"[..], b"/x/y", b"/x"] {
-        unlink_at(env.as_ref(), None, path, true).unwrap();
+        unlink_at(env, None, path, true).unwrap();
     }
-    let up = resolve_path(env.as_ref(), Some(&w), b"..", ResolveFlags::default()).unwrap().inode;
+    let up = resolve_path(env, Some(&w), b"..", ResolveFlags::default()).unwrap().inode;
     assert!(Arc::ptr_eq(&up, &y), "`..` isn't the removed parent");
-    let up2 = resolve_path(env.as_ref(), Some(&w), b"../..", ResolveFlags::default()).unwrap().inode;
+    let up2 = resolve_path(env, Some(&w), b"../..", ResolveFlags::default()).unwrap().inode;
     assert!(Arc::ptr_eq(&up2, &x), "`../..` isn't the removed grandparent");
-    let root = resolve_path(env.as_ref(), Some(&w), b"../../..", ResolveFlags::default()).unwrap().inode;
+    let root = resolve_path(env, Some(&w), b"../../..", ResolveFlags::default()).unwrap().inode;
     assert_eq!(root.ino(), fs.root_inode().ino());
-    let records = |env: &TestTables| env.removed_dirs_len();
-    assert_eq!(records(&env), 3);
+    assert_eq!(tables.removed_dirs_len(), 3);
 
     // `w` gone: `y`, kept by `w`'s record alone, goes with it, and then
-    // `x`; the next removal prunes all three records.
+    // `x`; the next removal prunes all three records (leaving `/z`'s own,
+    // dead once its last `Arc` drops).
     drop((up, up2, w, y, x, guards));
-    mkdir_at(env.as_ref(), None, b"/z", 0o755, 0).unwrap();
-    unlink_at(env.as_ref(), None, b"/z", true).unwrap();
-    assert_eq!(records(&env), 1, "dead records outlived a removal");
+    mkdir_at(env, None, b"/z", 0o755, 0).unwrap();
+    unlink_at(env, None, b"/z", true).unwrap();
+    assert_eq!(tables.removed_dirs_len(), 1, "dead records outlived a removal");
 
-    let mp = mkdir_at(env.as_ref(), None, b"/m", 0o755, 0).unwrap();
+    let mp = mkdir_at(env, None, b"/m", 0o755, 0).unwrap();
     let mounted = FreshArcReusingFs::new(DevId::makedev(0, 75), "fresh-tmpfs", false, true);
     env.mount(Arc::clone(&mp), "/m", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
-    let held = mkdir_at(env.as_ref(), None, b"/m/d", 0o755, 0).unwrap();
-    unlink_at(env.as_ref(), None, b"/m/d", true).unwrap();
-    assert_eq!(records(&env), 1, "the `/z` record pruned, `/m/d`'s kept");
-    // A `..` that takes a record prunes the dead ones too.
-    let q = mkdir_at(env.as_ref(), None, b"/q", 0o755, 0).unwrap();
-    unlink_at(env.as_ref(), None, b"/q", true).unwrap();
+    let held = mkdir_at(env, None, b"/m/d", 0o755, 0).unwrap();
+    unlink_at(env, None, b"/m/d", true).unwrap();
+    assert_eq!(tables.removed_dirs_len(), 1, "the `/z` record pruned, `/m/d`'s kept");
+    // A `..` its filesystem answers `ENOENT` prunes the dead ones too.
+    let q = mkdir_at(env, None, b"/q", 0o755, 0).unwrap();
+    unlink_at(env, None, b"/q", true).unwrap();
     drop(q);
-    assert_eq!(records(&env), 2);
-    let m = resolve_path(env.as_ref(), Some(&held), b"..", ResolveFlags::default()).unwrap().inode;
+    assert_eq!(tables.removed_dirs_len(), 2);
+    let m = resolve_path(env, Some(&held), b"..", ResolveFlags::default()).unwrap().inode;
     assert_eq!(m.ino(), mounted.root_inode().ino());
-    assert_eq!(records(&env), 1, "a `..` from a removed directory kept a dead record");
+    assert_eq!(tables.removed_dirs_len(), 1, "a `..` from a removed directory kept a dead record");
     drop(m);
     env.umount(mp.dev_id(), mp.ino()).unwrap();
-    assert_eq!(records(&env), 0, "unmounting kept the filesystem's records");
-    assert_eq!(resolve_path(env.as_ref(), Some(&held), b"..", ResolveFlags::default()).unwrap_err(), VfsError::NoEnt);
+    assert_eq!(tables.removed_dirs_len(), 0, "unmounting kept the filesystem's records");
+    assert_eq!(resolve_path(env, Some(&held), b"..", ResolveFlags::default()).unwrap_err(), VfsError::NoEnt);
 }
 
 /// #309: `open(O_CREAT)` on `.` or `..` opens the directory that one names
@@ -8828,5 +8843,152 @@ fn ops_reads_final_only_through_a_direct_match() {
         "Final::Root => shared(Final::Root)?,",
     ] {
         assert_eq!(final_outside_a_direct_match(bad), [(1, bad)], "{bad}");
+    }
+}
+
+/// #318: a `rename` over a directory that fails though the directory is
+/// gone keeps the record, as `dotdot_from_a_directory_a_failed_rmdir_removed`'s
+/// `rmdir`: `..` from it is still the directory it was replaced in.
+#[test]
+fn dotdot_from_a_directory_a_failed_rename_removed() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = env.as_ref();
+    let a = mkdir_at(env, None, b"/a", 0o755, 0).unwrap();
+    mkdir_at(env, None, b"/src", 0o755, 0).unwrap();
+    let victim = mkdir_at(env, None, b"/a/victim", 0o755, 0).unwrap();
+    fs.inner.hooks.lock().unwrap().rename_override_err.insert(b"victim".to_vec(), VfsError::Io);
+    assert_eq!(rename_at2(env, None, b"/src", None, b"/a/victim", RenameFlags(0)).unwrap_err(), VfsError::Io);
+    assert_eq!(victim.lookup(b"..").unwrap_err(), VfsError::NoEnt);
+    let up = resolve_path(env, Some(&victim), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up, &a));
+}
+
+/// #318: a record is the removed directory's `Arc`'s, not its number's: a
+/// directory that took a freed one's number, removed in turn, doesn't
+/// answer `..` for it.
+#[test]
+fn removed_directory_record_keyed_by_its_arc() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = env.as_ref();
+    let p = mkdir_at(env, None, b"/p", 0o755, 0).unwrap();
+    mkdir_at(env, None, b"/q", 0o755, 0).unwrap();
+    let gone = mkdir_at(env, None, b"/p/gone", 0o755, 0).unwrap();
+    unlink_at(env, None, b"/p/gone", true).unwrap();
+    let n = mkdir_at(env, None, b"/q/n", 0o755, 0).unwrap();
+    assert_eq!(n.ino(), gone.ino(), "number not reused");
+    unlink_at(env, None, b"/q/n", true).unwrap();
+    let up = resolve_path(env, Some(&gone), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up, &p), "`..` from gone found the record of the directory that took its number");
+}
+
+/// #318: `umount` drops only the unmounted filesystem's records.
+#[test]
+fn umount_keeps_other_filesystems_removed_directories() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let p = mkdir_at(env.as_ref(), None, b"/p", 0o755, 0).unwrap();
+    let gone = mkdir_at(env.as_ref(), None, b"/p/gone", 0o755, 0).unwrap();
+    unlink_at(env.as_ref(), None, b"/p/gone", true).unwrap();
+    let mp = mkdir_at(env.as_ref(), None, b"/m", 0o755, 0).unwrap();
+    let mounted = FreshArcReusingFs::new(DevId::makedev(0, 77), "fresh-tmpfs", false, true);
+    env.mount(Arc::clone(&mp), "/m", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
+    env.umount(mp.dev_id(), mp.ino()).unwrap();
+    let up = resolve_path(env.as_ref(), Some(&gone), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up, &p), "umount of another filesystem dropped the root filesystem's record");
+}
+
+/// #318: the parents of pruned records (on a mounted filesystem, which
+/// counts drops under Lock 9) are dropped after Lock 9 is released, when a
+/// new record prunes and when a `..` the filesystem answers `ENOENT` does.
+#[test]
+fn removed_directories_pruned_parents_dropped_outside_lock9() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = env.as_ref();
+    let mp = mkdir_at(env, None, b"/m", 0o755, 0).unwrap();
+    let mfs = FreshArcReusingFs::new(DevId::makedev(0, 78), "fresh-tmpfs", false, true);
+    env.mount(mp, "/m", Arc::clone(&mfs) as Arc<dyn FileSystem>).unwrap();
+    let under = || mfs.inner.handle_drops_under_lock9.load(Ordering::Relaxed);
+    let drops = || mfs.inner.handle_drops.load(Ordering::Relaxed);
+    // Pruned by a record on the root fs: /m/x, /m/x/y kept only by w's record.
+    let x = mkdir_at(env, None, b"/m/x", 0o755, 0).unwrap();
+    let y = mkdir_at(env, None, b"/m/x/y", 0o755, 0).unwrap();
+    let w = mkdir_at(env, None, b"/m/x/y/w", 0o755, 0).unwrap();
+    for path in [&b"/m/x/y/w"[..], b"/m/x/y", b"/m/x"] {
+        unlink_at(env, None, path, true).unwrap();
+    }
+    drop((w, y, x));
+    mkdir_at(env, None, b"/z", 0o755, 0).unwrap();
+    let (u0, d0) = (under(), drops());
+    unlink_at(env, None, b"/z", true).unwrap();
+    assert!(drops() > d0, "nothing dropped");
+    assert_eq!(under(), u0, "a pruned parent dropped under Lock 9 (record)");
+    // Pruned by a `..` on the root fs: /m/r kept only by q's dead record.
+    let held = mkdir_at(env, None, b"/h", 0o755, 0).unwrap();
+    unlink_at(env, None, b"/h", true).unwrap();
+    let r = mkdir_at(env, None, b"/m/r", 0o755, 0).unwrap();
+    let q = mkdir_at(env, None, b"/m/r/q", 0o755, 0).unwrap();
+    unlink_at(env, None, b"/m/r/q", true).unwrap();
+    unlink_at(env, None, b"/m/r", true).unwrap();
+    drop((r, q));
+    let (u1, d1) = (under(), drops());
+    resolve_path(env, Some(&held), b"..", ResolveFlags::default()).unwrap();
+    assert!(drops() > d1, "nothing dropped by `..`");
+    assert_eq!(under(), u1, "a pruned parent dropped under Lock 9 (`..`)");
+}
+
+/// #318: only `ENOENT` from the filesystem's `..` turns to the record: any
+/// other error is reported as it is, from a live directory (and by
+/// `getcwd`) and from a removed one with a record.
+#[test]
+fn dotdot_lookup_error_is_reported() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let tables = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = tables.as_ref();
+    let a = mkdir_at(env, None, b"/a", 0o755, 0).unwrap();
+    let gone = mkdir_at(env, None, b"/a/gone", 0o755, 0).unwrap();
+    unlink_at(env, None, b"/a/gone", true).unwrap();
+    let fail_next_dotdot = || fs.inner.hooks.lock().unwrap().lookup_override_err.insert(b"..".to_vec(), VfsError::Io);
+    fail_next_dotdot();
+    assert_eq!(resolve_path(env, Some(&a), b"..", ResolveFlags::default()).unwrap_err(), VfsError::Io);
+    fail_next_dotdot();
+    assert_eq!(compute_cwd_path(env, &a).unwrap_err(), VfsError::Io);
+    fail_next_dotdot();
+    assert_eq!(resolve_path(env, Some(&gone), b"..", ResolveFlags::default()).unwrap_err(), VfsError::Io);
+    let up = resolve_path(env, Some(&gone), b"..", ResolveFlags::default()).unwrap().inode;
+    assert!(Arc::ptr_eq(&up, &a));
+}
+
+/// #318 review: a cwd removed while `compute_cwd_path` walks, its number
+/// taken at once by a new directory in the same parent (as ext4 frees an
+/// open directory's disk number at `rmdir`), is `ENOENT`, never the new
+/// directory's path: removed before its `..` is looked up (the record then
+/// answering `..`) or after (its parent listed under the stale number).
+#[test]
+fn getcwd_of_a_cwd_removed_during_the_walk_is_enoent() {
+    for after_dotdot in [false, true] {
+        let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+        let tables = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+        let env = tables.as_ref();
+        mkdir_at(env, None, b"/p", 0o755, 0).unwrap();
+        let c = mkdir_at(env, None, b"/p/c", 0o755, 0).unwrap();
+        let guard = OpenGuard::try_new(Arc::clone(&c)).unwrap();
+        let ino = c.ino();
+        let (tables2, fs2) = (Arc::clone(&tables), Arc::clone(&fs));
+        let hook = alloc::boxed::Box::new(move || {
+            unlink_at(tables2.as_ref(), None, b"/p/c", true).unwrap();
+            fs2.inner.state.lock().unwrap().free_inos.push(ino);
+            let z = mkdir_at(tables2.as_ref(), None, b"/p/z", 0o755, 0).unwrap();
+            assert_eq!(z.ino(), ino, "the removed cwd's number not reused");
+        });
+        let mut hooks = fs.inner.hooks.lock().unwrap();
+        let at = if after_dotdot { &mut hooks.post_lookup } else { &mut hooks.pre_lookup };
+        at.insert(b"..".to_vec(), hook);
+        drop(hooks);
+        assert_eq!(compute_cwd_path(env, &c).unwrap_err(), VfsError::NoEnt, "removed after `..`: {after_dotdot}");
+        assert!(c.is_detached());
+        drop(guard);
     }
 }
