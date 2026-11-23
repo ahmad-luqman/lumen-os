@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use lumen_mm::PhysFrame;
+use lumen_vfs::page::{self, PageSpan};
 use lumen_vfs::{VfsError, VfsInode};
 
 use crate::arch;
@@ -27,7 +28,7 @@ use crate::mm;
 use crate::mm::frame::{self, OwnedFrame};
 use crate::sync::SleepMutex;
 
-pub const PAGE_SIZE: usize = 4096;
+pub use lumen_vfs::page::PAGE_SIZE;
 
 /// Soft global reclaim target for live `ext4` page-cache frames (32 MiB = 8192 pages).
 pub const EXT4_SOFT_LIMIT_PAGES: usize = 8192;
@@ -57,8 +58,9 @@ pub fn ext4_soft_limit() -> usize {
 }
 
 /// Whether the live `ext4` pages have reached the hard limit
-/// ([`EXT4_HARD_LIMIT_PAGES`]), so no new page may be added.
-pub fn ext4_at_hard_limit() -> bool {
+/// ([`EXT4_HARD_LIMIT_PAGES`]), so no new page reclaim can't drop (a dirty
+/// one, or a mapping's) may be added: [`PageCache::admit_unreclaimable`].
+fn ext4_at_hard_limit() -> bool {
     EXT4_CACHED_PAGES.load(Ordering::Relaxed) >= EXT4_HARD_LIMIT.load(Ordering::Relaxed)
 }
 
@@ -67,13 +69,13 @@ pub fn ext4_at_hard_limit() -> bool {
 static HARD_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Log (once per crossing of the hard limit) that an `ext4` page was
-/// refused, to a write (`write_at`) or a mapping (`mmap_page`). The cache
-/// is full of pages reclaim can't drop: dirty pages whose writeback keeps
-/// failing (its own warning names the inode), or pages pinned by mappings,
-/// which only unmapping frees. Writes and new mapped pages of any linked
-/// file (detached files use their own quota) now
-/// fail with `ENOSPC`.
-pub fn note_hard_limit_refusal() {
+/// refused, to a write or a mapping ([`PageCache::admit_unreclaimable`]).
+/// The cache is full of pages reclaim can't drop: dirty pages whose
+/// writeback keeps failing (its own warning names the inode), or pages
+/// pinned by mappings, which only unmapping frees. Writes and new mapped
+/// pages of any linked file (detached files use their own quota) now fail
+/// with `ENOSPC`.
+fn note_hard_limit_refusal() {
     if !HARD_LIMIT_WARNED.swap(true, Ordering::AcqRel) {
         log::warn!(
             target: "vfs",
@@ -200,14 +202,15 @@ pub struct CachePage {
 }
 
 impl CachePage {
-    /// Allocate and zero a fresh 4 KiB [`CachePage`].
-    pub(super) fn new_zeroed() -> Option<Self> {
-        let frame = frame::alloc_owned()?;
+    /// A fresh 4 KiB [`CachePage`], zeroed and in no cache yet: `NoMem`
+    /// when no frame is free.
+    pub(super) fn new_zeroed() -> Result<Self, VfsError> {
+        let frame = frame::alloc_owned().ok_or(VfsError::NoMem)?;
         let ptr = mm::phys_to_virt(frame.frame().start()).as_mut_ptr::<u8>();
         // SAFETY: `frame` is a freshly allocated, uniquely owned 4 KiB RAM frame
         // mapped RW through the HHDM.
         unsafe { core::ptr::write_bytes(ptr, 0, PAGE_SIZE) };
-        Some(Self {
+        Ok(Self {
             frame,
             dirty: AtomicBool::new(false),
             writable_maps: AtomicU32::new(0),
@@ -282,7 +285,7 @@ impl CachePage {
 
     /// Zero `[start .. end)` inside the 4 KiB frame. Lock 5 held by the
     /// caller, as for [`read_bytes`](Self::read_bytes).
-    pub(super) fn zero_range(&self, start: usize, end: usize) {
+    fn zero_range(&self, start: usize, end: usize) {
         assert!(start <= end && end <= PAGE_SIZE);
         if start == end {
             return;
@@ -420,8 +423,7 @@ impl MappedPage {
     /// holding its end ([`mmap_page`] hands out no page starting at or past
     /// it).
     pub(crate) fn valid_len(&self) -> usize {
-        let start = self.index.saturating_mul(PAGE_SIZE as u64);
-        self.file_size.saturating_sub(start).min(PAGE_SIZE as u64) as usize
+        page::valid_len(self.index, self.file_size)
     }
 
     /// Copy the page's bytes below the file's size ([`valid_len`]) into
@@ -537,17 +539,18 @@ impl Drop for WritableMap {
 ///   with `NoSpc`. `NoMem` when no frame is free, `Io` when the disk read
 ///   fails (logged, naming the page), and `NoSpc` for a missing page of a
 ///   linked `ext4` file while the `ext4` cache is at its hard limit (a
-///   mapping pins its pages, so reclaim can't make room), as `write_at`
-///   refuses one. A detached `ext4` file's pages count against the
-///   detached quota instead of the hard limit.
+///   mapping pins its pages, so reclaim can't make room), asked before the
+///   fill and again after it, by the same check as a write's new page
+///   ([`PageCache::map_page`]). A detached `ext4` file's pages count
+///   against the detached quota instead of the hard limit.
 /// - **EOF:** `Range` when the page starts at or past the file's size
 ///   (`index * 4096 >= file_size`, or the product overflows): there is no
 ///   page to map, and the fault path raises `SIGBUS`. The page holding the
 ///   end of the file is returned; its bytes past `file_size` are zero
 ///   unless a mapping stored there.
-/// - **Truncate:** a shrink's `remove_from` drops the cache's reference to
-///   the pages past the new size and stops counting them, even one a
-///   mapping still holds. The page stays alive, pinned by that mapping,
+/// - **Truncate:** a shrink's [`PageCache::resize`] drops the cache's
+///   reference to the pages past the new size and stops counting them, even
+///   one a mapping still holds. The page stays alive, pinned by that mapping,
 ///   until ARCHITECTURE section 5's truncate invalidation, which the
 ///   shrinking syscall (`truncate`, `ftruncate`, `openat(O_TRUNC)`) runs
 ///   once the truncate has returned, unmaps it (with section 5's limit: the
@@ -593,9 +596,9 @@ fn page_cache_lock(inode: &dyn VfsInode) -> Option<&SleepMutex<PageCache>> {
 }
 
 /// `Range` unless page `index` starts below `file_size` (an overflowing
-/// offset is past any file): [`mmap_page`]'s EOF rule, for each
-/// filesystem's side of it.
-pub(super) fn mmap_page_in_file(index: u64, file_size: u64) -> Result<(), VfsError> {
+/// offset is past any file): [`mmap_page`]'s EOF rule, for
+/// [`PageCache::map_page`].
+fn mmap_page_in_file(index: u64, file_size: u64) -> Result<(), VfsError> {
     match index.checked_mul(PAGE_SIZE as u64) {
         Some(off) if off < file_size => Ok(()),
         _ => Err(VfsError::Range),
@@ -785,10 +788,18 @@ impl PageCache {
     /// Insert a newly allocated page at `page_index`, reserving `tmpfs`/
     /// `detached` quota if applicable. A page already cached at that index is
     /// left as it is (it may hold dirty data) and `Exist` returned, before
-    /// any quota or count changes.
-    pub fn insert_new(&mut self, page_index: u64, page: Arc<CachePage>) -> Result<(), VfsError> {
+    /// any quota or count changes. A page of a linked `ext4` file that is
+    /// dirty when inserted is refused at the hard limit (`NoSpc`,
+    /// [`Self::admit_unreclaimable`]), whichever path made it; a clean one
+    /// is not, since reclaim can drop it once nothing else holds it. (A
+    /// page a mapping will pin is clean here: [`Self::map_page`] asks
+    /// [`Self::admit_unreclaimable`] itself.)
+    fn insert_new(&mut self, page_index: u64, page: Arc<CachePage>) -> Result<(), VfsError> {
         if self.pages.contains_key(&page_index) {
             return Err(VfsError::Exist);
+        }
+        if page.is_dirty() {
+            self.admit_unreclaimable()?;
         }
         match &self.owner {
             CacheOwner::Ext4 => {
@@ -813,14 +824,222 @@ impl PageCache {
         Ok(())
     }
 
-    /// Drop all cached pages with `page_index >= start_page`, updating accounting.
-    pub fn remove_from(&mut self, start_page: u64) -> usize {
-        let removed = self.pages.split_off(&start_page);
-        let count = removed.len();
-        if count > 0 {
-            self.release_accounting(count);
+    /// Whether this cache's pages are written back: a linked `ext4` file's
+    /// (`CacheOwner::Ext4`). A write (or a truncate's zeroing) marks its
+    /// pages dirty only then: a `tmpfs` file's pages and a detached file's
+    /// are the file's only copy, never written back, and count against
+    /// their quotas instead of the hard limit. (A writable shared mapping
+    /// still marks any owner's page dirty, and `commit_detached` keeps a
+    /// page's dirty bit; nothing writes those back.) The owner turns
+    /// `Detached` under Locks 4 and 5, which every writer holds.
+    fn writes_back(&self) -> bool {
+        matches!(self.owner, CacheOwner::Ext4)
+    }
+
+    /// Whether a new page reclaim can't drop (a dirty one, or one a mapping
+    /// pins) may join this cache: the one check of the `ext4` hard cap.
+    /// `NoSpc` (the hard-limit warning, once per crossing) for a linked
+    /// `ext4` file's cache ([`Self::writes_back`]) while the `ext4` cache is
+    /// at its hard limit. Reclaim, run before the caller took its locks,
+    /// couldn't get below it (the dirty data can't be written back, or
+    /// mappings pin the pages), the caller's own write added more pages
+    /// than the gap, or other threads added pages while a fill slept (a
+    /// disk read), which is why [`Self::write_from`] and [`Self::map_page`]
+    /// ask again after their fill. Quotas (`tmpfs`, detached) are reserved
+    /// by `insert_new` itself. The caller holds this lock (Lock 5).
+    fn admit_unreclaimable(&self) -> Result<(), VfsError> {
+        if self.writes_back() && ext4_at_hard_limit() {
+            note_hard_limit_refusal();
+            return Err(VfsError::NoSpc);
         }
-        count
+        Ok(())
+    }
+
+    /// Page `index` of a file of `file_size` bytes for a mapping: each
+    /// filesystem's side of [`mmap_page`], under that contract. `Range` when
+    /// the page starts at or past `file_size`. The cached page, or else a
+    /// new page `make` makes (a zero page for a hole, or the file's bytes
+    /// read from disk), inserted ([`Self::insert_new`]: the `tmpfs` or
+    /// detached quota's `NoSpc`). A mapping pins its page, so reclaim can't
+    /// drop it: a linked `ext4` file's new page is held to the hard cap as
+    /// a write's new page is ([`Self::admit_unreclaimable`]), before `make`
+    /// runs (no frame, no disk read) and again after it, since `make` may
+    /// sleep (a disk read) while other threads add pages. Either way the
+    /// page is touched (reclaim's age). The caller holds the inode's Lock 4,
+    /// under which it read `file_size`, and this lock (Lock 5).
+    pub(super) fn map_page(
+        &mut self,
+        index: u64,
+        file_size: u64,
+        make: impl FnOnce() -> Result<CachePage, VfsError>,
+    ) -> Result<Arc<CachePage>, VfsError> {
+        mmap_page_in_file(index, file_size)?;
+        let page = match self.pages.get(&index) {
+            Some(page) => Arc::clone(page),
+            None => {
+                self.admit_unreclaimable()?;
+                let page = Arc::new(make()?);
+                self.admit_unreclaimable()?;
+                self.insert_new(index, Arc::clone(&page))?;
+                page
+            }
+        };
+        page.touch();
+        Ok(page)
+    }
+
+    /// Copy the file's bytes at `offset` into `buf`, as far as `file_size`,
+    /// page by page; returns how many were copied (0 at or past the end).
+    /// A page not cached is asked of `miss`, by index: `Some(page)`, a new
+    /// page holding the file's bytes there, is read and then inserted (its
+    /// insert's error returned); `None` reads as zeros without a page (a
+    /// hole). An error from `miss` (or the insert) is returned even after
+    /// some bytes were copied, and those bytes are lost to the caller: where
+    /// Linux returns a short count, as [`Self::write_from`] does. (The
+    /// pages loaded before the error stay cached.) The caller holds the
+    /// inode's Lock 4, under which it read `file_size`, and this lock
+    /// (Lock 5).
+    pub fn read_into(
+        &mut self,
+        offset: u64,
+        buf: &mut [u8],
+        file_size: u64,
+        mut miss: impl FnMut(u64) -> Result<Option<CachePage>, VfsError>,
+    ) -> Result<usize, VfsError> {
+        if offset >= file_size {
+            return Ok(0);
+        }
+        let to_read = buf.len().min(usize::try_from(file_size - offset).unwrap_or(usize::MAX));
+        // Never `None`: the range ends at or below `file_size`.
+        let spans = page::spans(offset, to_read).ok_or(VfsError::Inval)?;
+        for span in spans {
+            let dst = &mut buf[span.buf()];
+            if let Some(cached) = self.pages.get(&span.index()) {
+                cached.read_bytes(span.in_page(), dst);
+            } else if let Some(loaded) = miss(span.index())? {
+                loaded.read_bytes(span.in_page(), dst);
+                self.insert_new(span.index(), Arc::new(loaded))?;
+            } else {
+                dst.fill(0);
+            }
+        }
+        Ok(to_read)
+    }
+
+    /// Write `buf` at file offset `offset` of a file of `old_size` bytes,
+    /// page by page: into the cached page, or else into a new page `fill`
+    /// makes for the span (a zero page, or one holding the file's bytes a
+    /// partial write keeps), which is then inserted ([`Self::insert_new`]).
+    /// A write starting past the end first zeroes the old last page's bytes
+    /// past `old_size`, as a growth to `offset` would ([`Self::resize`]),
+    /// and they stay zeroed, that page dirty if written back, even if the
+    /// write then fails. The bytes lie past the end, so the file reads the
+    /// same; but while writeback is failing, that page stays dirty, and a
+    /// later `fsync` reports `EIO` for a write the caller saw fail (#321).
+    /// A linked `ext4` file's pages ([`Self::writes_back`]) are marked
+    /// dirty, and a new one is refused at the hard limit
+    /// ([`Self::admit_unreclaimable`]) before `fill` runs. That is an early
+    /// answer: `fill` may sleep (a disk read) or be preempted, and another
+    /// thread may add pages meanwhile, so the insert asks again and refuses
+    /// the page `fill` made. Returns how many bytes were written: an error
+    /// (the admission's, `fill`'s or the insert's, either check's refusal
+    /// alike) only when it is the first page's, else a short count. `FBig`
+    /// when the range ends past `u64::MAX`, before anything changes. The
+    /// caller holds the inode's Lock 4 (`old_size` is the size it read
+    /// under it) and this lock (Lock 5), and sets the size and times.
+    pub fn write_from(
+        &mut self,
+        offset: u64,
+        buf: &[u8],
+        old_size: u64,
+        mut fill: impl FnMut(&PageSpan) -> Result<CachePage, VfsError>,
+    ) -> Result<usize, VfsError> {
+        let spans = page::spans(offset, buf.len()).ok_or(VfsError::FBig)?;
+        // At or before the end (`offset <= old_size`) nothing is zeroed: the
+        // write overwrites the bytes it extends the file over.
+        self.zero_tail(old_size, offset.max(old_size));
+        let mut done = 0usize;
+        for span in spans {
+            if let Err(err) = self.write_span(&span, &buf[span.buf()], &mut fill) {
+                if done > 0 {
+                    break;
+                }
+                return Err(err);
+            }
+            done = span.buf().end;
+        }
+        Ok(done)
+    }
+
+    /// One page's part of [`Self::write_from`].
+    fn write_span(
+        &mut self,
+        span: &PageSpan,
+        src: &[u8],
+        fill: &mut impl FnMut(&PageSpan) -> Result<CachePage, VfsError>,
+    ) -> Result<(), VfsError> {
+        if let Some(cached) = self.pages.get(&span.index()) {
+            cached.write_bytes(span.in_page(), src);
+            if self.writes_back() {
+                cached.set_dirty();
+            }
+            return Ok(());
+        }
+        self.admit_unreclaimable()?;
+        let fresh = fill(span)?;
+        fresh.write_bytes(span.in_page(), src);
+        if self.writes_back() {
+            fresh.set_dirty();
+        }
+        self.insert_new(span.index(), Arc::new(fresh))
+    }
+
+    /// The cache's side of a change of the file's size from `old_size` to
+    /// `new_size` (a truncate): on a shrink, drop every page from
+    /// [`page::pages_in`]`(new_size)` on; then zero, in the cached page
+    /// holding it, what [`page::resize_tail`] says (on a shrink, the cut
+    /// bytes of the new last page; on a growth, the old last page's bytes
+    /// past the old end, where a `MAP_SHARED` mapping may have stored),
+    /// marking that page dirty if it is written back
+    /// ([`Self::writes_back`]). A page not cached is left to the filesystem
+    /// (`ext4` zeroes its disk tail itself). The caller holds the inode's
+    /// Lock 4 and this lock (Lock 5), once the filesystem holds the new
+    /// size and before it sets it in memory.
+    pub fn resize(&mut self, old_size: u64, new_size: u64) {
+        if new_size < old_size {
+            self.drop_from(page::pages_in(new_size));
+        }
+        self.zero_tail(old_size, new_size);
+    }
+
+    /// [`Self::resize`]'s zeroing, which a write past the end shares
+    /// ([`Self::write_from`]).
+    fn zero_tail(&self, old_size: u64, new_size: u64) {
+        if let Some(tail) = page::resize_tail(old_size, new_size)
+            && let Some(cached) = self.pages.get(&tail.index())
+        {
+            cached.zero_range(tail.from(), PAGE_SIZE);
+            if self.writes_back() {
+                cached.set_dirty();
+            }
+        }
+    }
+
+    /// Drop all cached pages with `page_index >= start_page`, updating
+    /// accounting: [`Self::resize`]'s shrink, which also zeroes the new
+    /// last page's tail.
+    fn drop_from(&mut self, start_page: u64) {
+        let removed = self.pages.split_off(&start_page);
+        self.release_accounting(removed.len());
+    }
+
+    /// Drop every page from `start_page` on without a size change, dirty or
+    /// mapped ones too (unlike reclaim, which writes dirty pages back and
+    /// skips mapped ones): a dirty page's data is lost. Ktests only: a
+    /// truncate goes through [`Self::resize`].
+    #[cfg(feature = "ktest")]
+    pub(super) fn remove_from(&mut self, start_page: u64) {
+        self.drop_from(start_page);
     }
 
     /// How many cached pages are dirty (written, or mapped writable, and not
@@ -1016,16 +1235,341 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let mut pc = PageCache::new_ext4();
         let before = ext4_cached_pages();
-        let first = Arc::new(CachePage::new_zeroed().ok_or("frame")?);
+        let first = Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?);
         first.write_bytes(0, b"dirty");
         first.set_dirty();
         pc.insert_new(7, Arc::clone(&first)).map_err(|_| "insert")?;
-        let second = Arc::new(CachePage::new_zeroed().ok_or("frame")?);
+        let second = Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?);
         kassert_eq!(pc.insert_new(7, second).err(), Some(VfsError::Exist));
         kassert_eq!(ext4_cached_pages(), before + 1); // counted once
         kassert!(Arc::ptr_eq(pc.get(7).ok_or("page")?, &first)); // the dirty page kept
         drop(pc);
         kassert_eq!(ext4_cached_pages(), before);
+        Ok(())
+    }
+);
+
+/// The ktests' crossing of the `ext4` hard limit: `f` runs with the
+/// hard-limit warning re-armed, so the crossing logs it once however many
+/// refusals `f` sees (tests/scenarios/test_ktest.py counts one per
+/// crossing). The real limits and the warning's state from before are
+/// restored after it, also when `f` (or a fill it hands on) put the cache
+/// at the limit ([`reach_hard_limit`]).
+#[cfg(feature = "ktest")]
+fn hard_limit_crossing<T>(f: impl FnOnce() -> T) -> T {
+    let warned = HARD_LIMIT_WARNED.swap(false, Ordering::AcqRel);
+    let out = f();
+    set_ext4_limits_for_test(None);
+    HARD_LIMIT_WARNED.store(warned, Ordering::Release);
+    out
+}
+
+/// Put the `ext4` cache at its hard limit, whatever it holds.
+#[cfg(feature = "ktest")]
+fn reach_hard_limit() {
+    set_ext4_limits_for_test(Some((usize::MAX, 0)));
+}
+
+/// A linked `ext4` file's cache holding a clean page 0.
+#[cfg(feature = "ktest")]
+fn ext4_cache_with_page0() -> Result<PageCache, &'static str> {
+    let mut pc = PageCache::new_ext4();
+    pc.insert_new(0, Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?)).map_err(|_| "insert")?;
+    Ok(pc)
+}
+
+crate::ktest!(
+    fn page_cache_insert_refuses_a_dirty_ext4_page_at_the_hard_limit() {
+        // The hard limit is `insert_new`'s, so no path adding a dirty page
+        // of a linked ext4 file can pass it: refused (`NoSpc`) at the limit,
+        // let in below it. A clean page (a read's, which reclaim can drop)
+        // and a tmpfs page (its own quota) are let in at the limit.
+        use crate::{kassert, kassert_eq};
+        let mut pc = PageCache::new_ext4();
+        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new("ktest", 4)));
+        let dirty = Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?);
+        dirty.set_dirty();
+        let (clean, tmp_dirty) = (
+            Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?),
+            Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?),
+        );
+        tmp_dirty.set_dirty();
+        let at_limit = hard_limit_crossing(|| {
+            reach_hard_limit();
+            (pc.insert_new(1, Arc::clone(&dirty)), pc.insert_new(2, clean), tmp.insert_new(1, tmp_dirty))
+        });
+        kassert_eq!(at_limit, (Err(VfsError::NoSpc), Ok(()), Ok(())));
+        kassert!(pc.get(1).is_none());
+        kassert_eq!(pc.len(), 1);
+        kassert_eq!(pc.insert_new(1, dirty), Ok(())); // below the limit
+        kassert_eq!(pc.len(), 2);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_write_from_refuses_at_the_hard_limit_before_filling() {
+        // A write into a linked ext4 file's cache at the hard limit: a new
+        // page is refused before `fill` runs (no frame, no disk read), and a
+        // write that has already written a cached page returns short
+        // instead. A detached file's cache (a write dirties none of its
+        // pages; its own quota) isn't held to it.
+        use crate::{kassert, kassert_eq};
+        let mut pc = ext4_cache_with_page0()?;
+        let mut detached = PageCache::new_ext4();
+        detached.commit_detached(Vec::new()); // no pages yet: nothing to reserve
+        let mut fills = 0usize;
+        let mut fill = |_: &PageSpan| {
+            fills += 1;
+            CachePage::new_zeroed()
+        };
+        let data = [0x5a; 16];
+        let size = 3 * PAGE_SIZE as u64;
+        let (new_page, spanning, in_detached) = hard_limit_crossing(|| {
+            reach_hard_limit();
+            (
+                pc.write_from(PAGE_SIZE as u64, &data[..10], size, &mut fill),
+                pc.write_from(PAGE_SIZE as u64 - 6, &data, size, &mut fill),
+                detached.write_from(2 * PAGE_SIZE as u64, &data[..10], size, &mut fill),
+            )
+        });
+        kassert_eq!(new_page, Err(VfsError::NoSpc));
+        kassert_eq!(spanning, Ok(6)); // the cached page's part
+        kassert_eq!(in_detached, Ok(10));
+        kassert_eq!(fills, 1); // the detached file's page alone
+        kassert!(pc.get(0).ok_or("page 0")?.is_dirty());
+        kassert!(pc.get(1).is_none());
+        kassert!(!detached.get(2).ok_or("detached page")?.is_dirty());
+        let mut back = [0u8; 8];
+        kassert_eq!(pc.read_into(PAGE_SIZE as u64 - 8, &mut back, size, |_| Ok(None)), Ok(8));
+        kassert_eq!(back, [0, 0, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a]);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_write_from_refuses_a_page_the_cache_filled_up_for() {
+        // `fill` may sleep (a disk read) or be preempted while another
+        // thread adds pages, so the insert asks the hard cap again: a page
+        // made while the cache reached it is refused all the same (it is
+        // dirty when inserted), `NoSpc` on the first page and a short count
+        // after a cached one. Here `fill` lowers the limit itself.
+        use crate::{kassert, kassert_eq};
+        let mut pc = ext4_cache_with_page0()?;
+        let mut fills = 0usize;
+        let mut fill = |_: &PageSpan| {
+            fills += 1;
+            reach_hard_limit(); // the cache filled meanwhile
+            CachePage::new_zeroed()
+        };
+        let data = [0x5a; 16];
+        let size = 3 * PAGE_SIZE as u64;
+        let (first, spanning) = hard_limit_crossing(|| {
+            let first = pc.write_from(PAGE_SIZE as u64, &data[..10], size, &mut fill);
+            set_ext4_limits_for_test(None);
+            (first, pc.write_from(PAGE_SIZE as u64 - 6, &data, size, &mut fill))
+        });
+        kassert_eq!(first, Err(VfsError::NoSpc));
+        kassert_eq!(spanning, Ok(6)); // the cached page's part
+        kassert_eq!(fills, 2); // past the early check both times
+        kassert!(pc.get(1).is_none());
+        kassert_eq!(pc.len(), 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn page_cache_map_page_asks_the_hard_cap_before_and_after_make() {
+        // A mapping pins its page, so a linked ext4 file's new mapped page
+        // is held to the hard cap: at the limit `make` never runs (no frame,
+        // no disk read), and a page `make` returns once the cache filled up
+        // meanwhile (here `make` lowers the limit itself) is refused, not
+        // inserted. A cached page is handed out at the limit, and a tmpfs
+        // file's new page isn't held to it (its own quota).
+        use crate::{kassert, kassert_eq};
+        let mut pc = ext4_cache_with_page0()?;
+        let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new("ktest", 4)));
+        let size = 3 * PAGE_SIZE as u64;
+        let mut makes = 0usize;
+        let (before, cached, in_tmpfs, after) = hard_limit_crossing(|| {
+            reach_hard_limit();
+            let before = pc.map_page(1, size, || {
+                makes += 1;
+                CachePage::new_zeroed()
+            });
+            let cached = pc.map_page(0, size, || Err(VfsError::Io)).is_ok();
+            let in_tmpfs = tmp.map_page(1, size, CachePage::new_zeroed).is_ok();
+            set_ext4_limits_for_test(None);
+            let after = pc.map_page(1, size, || {
+                makes += 1;
+                reach_hard_limit(); // the cache filled meanwhile
+                CachePage::new_zeroed()
+            });
+            (before.err(), cached, in_tmpfs, after.err())
+        });
+        kassert_eq!((before, after), (Some(VfsError::NoSpc), Some(VfsError::NoSpc)));
+        kassert_eq!(makes, 1); // the second call's alone
+        kassert!(cached && in_tmpfs);
+        kassert!(pc.get(1).is_none());
+        kassert_eq!(pc.len(), 1);
+        // Below the limit: made and inserted, then handed out again.
+        let page = pc.map_page(1, size, CachePage::new_zeroed).map_err(|_| "map below the limit")?;
+        kassert!(Arc::ptr_eq(&page, pc.get(1).ok_or("page 1")?));
+        kassert_eq!(pc.map_page(3, size, CachePage::new_zeroed).err(), Some(VfsError::Range));
+        Ok(())
+    }
+);
+
+/// `write_at` over a file's cached pages on `root`'s filesystem (through
+/// [`PageCache::write_from`]): an overwrite inside the file, at an offset
+/// inside a page, keeps the rest of that page (it is no shrink, and zeroes
+/// no tail); and a write starting past the end zeroes the old last page's
+/// bytes past the end, where a mapping stored, so the gap it opens reads
+/// as zeros. With `ext4`, the first file's pages are written back, dropped
+/// and read in again first: the pages a read loads stay cached.
+#[cfg(feature = "ktest")]
+fn check_writes_over_cached_pages(root: &Arc<dyn VfsInode>, ext4: bool) -> Result<(), &'static str> {
+    use crate::{kassert, kassert_eq};
+    use ktest_files::{file, pattern, read, reclaim_ext4};
+    fn cache(f: &Arc<dyn VfsInode>) -> Result<&SleepMutex<PageCache>, &'static str> {
+        page_cache_lock(&**f).ok_or("no page cache")
+    }
+    let mut want = pattern(10_000, 3);
+    let f = file(root, "over.bin", &want)?;
+    if ext4 {
+        kassert_eq!(reclaim_ext4(&f)?, 0);
+        kassert!(read(&f, 0, want.len())? == want);
+    }
+    kassert_eq!(cache(&f)?.lock().len(), 3);
+    // Page 0, the overwrite's, held mapped so reclaim can't drop it first.
+    let page0 = mmap_page(&f, 0).map_err(|_| "map page 0")?;
+    kassert_eq!(f.write_at(100, b"xy").map_err(|_| "overwrite")?, 2);
+    want[100..102].copy_from_slice(b"xy");
+    kassert!(read(&f, 0, want.len())? == want);
+    drop(page0);
+
+    // A file of a page and 100 bytes; a store through a mapping at 200 of
+    // its page 1 (past the end); then a write at a page and 1000.
+    let p = PAGE_SIZE as u64;
+    let g = file(root, "tail.bin", &pattern(PAGE_SIZE + 100, 5))?;
+    // The mapping is held throughout, so reclaim can't drop the page (and
+    // the store with it) before the write: the write found it cached.
+    let mapped = mmap_page(&g, 1).map_err(|_| "map")?;
+    mapped.page().write_bytes(200, b"junk");
+    kassert_eq!(g.write_at(p + 1000, b"z").map_err(|_| "write past the end")?, 1);
+    let back = read(&g, p + 100, 901)?;
+    let still = cache(&g)?.lock().get(1).map(|c| Arc::ptr_eq(c, mapped.page()));
+    kassert_eq!(still, Some(true));
+    kassert!(back[..900].iter().all(|&b| b == 0));
+    kassert_eq!(back[900], b'z');
+    Ok(())
+}
+
+crate::ktest!(
+    fn page_cache_tmpfs_writes_keep_their_page_and_zero_a_stale_tail() {
+        let vol = ktest_files::TmpfsVolume::new(184, 16 * PAGE_SIZE);
+        check_writes_over_cached_pages(&vol.root, false)
+    }
+);
+
+crate::ktest!(
+    fn page_cache_ext4_writes_keep_their_page_and_zero_a_stale_tail() {
+        let vol = ktest_files::Ext4Volume::new(185)?;
+        check_writes_over_cached_pages(&vol.root, true)
+    }
+);
+
+/// Shrink `f` (at least three pages long) to 100 bytes, its pages 0 to 2
+/// held mapped across the truncate so reclaim can't drop them first, then
+/// grow it again by a write at three pages: the shrink
+/// drops the pages past the new end, and the cut bytes read back as zeros
+/// ([`PageCache::resize`]; with its sizes swapped, a shrink would keep the
+/// pages and leave them to the next truncate, and a write would read the
+/// cut bytes back).
+#[cfg(feature = "ktest")]
+fn check_shrink_then_write_past(f: &Arc<dyn VfsInode>) -> Result<(), &'static str> {
+    use crate::{kassert, kassert_eq};
+    let p = PAGE_SIZE as u64;
+    let cached = || page_cache_lock(&**f).map(|l| l.lock().len()).ok_or("no page cache");
+    let held = [0, 1, 2].map(|i| mmap_page(f, i));
+    let held: Vec<MappedPage> = held.into_iter().collect::<Result<_, _>>().map_err(|_| "map pages 0 to 2")?;
+    f.truncate(100).map_err(|_| "shrink")?;
+    kassert_eq!(cached()?, 1); // page 0 alone
+    drop(held);
+    kassert_eq!(f.write_at(3 * p, b"z").map_err(|_| "write past the end")?, 1);
+    let back = ktest_files::read(f, 100, 3 * PAGE_SIZE - 99)?;
+    kassert_eq!(back.len(), 3 * PAGE_SIZE - 99);
+    kassert!(back[..back.len() - 1].iter().all(|&b| b == 0));
+    kassert_eq!(back.last(), Some(&b'z'));
+    Ok(())
+}
+
+crate::ktest!(
+    fn page_cache_tmpfs_shrink_then_write_past_reads_zeros() {
+        let vol = ktest_files::TmpfsVolume::new(187, 16 * PAGE_SIZE);
+        let f = ktest_files::file(&vol.root, "shrink.bin", &ktest_files::pattern(3 * PAGE_SIZE, 7))?;
+        check_shrink_then_write_past(&f)
+    }
+);
+
+crate::ktest!(
+    fn page_cache_ext4_shrink_then_write_past_reads_zeros() {
+        let vol = ktest_files::Ext4Volume::new(188)?;
+        let f = ktest_files::file(&vol.root, "shrink.bin", &ktest_files::pattern(3 * PAGE_SIZE, 7))?;
+        check_shrink_then_write_past(&f)
+    }
+);
+
+crate::ktest!(
+    fn page_cache_detached_ext4_file_never_reads_the_disk() {
+        // An open-unlinked ext4 file holds its data in its pages (read in
+        // when it was detached; its blocks are freed): with every disk read
+        // failing from then on, a hole reads as zeros, a write into a hole
+        // starts from a zero page, and a shrink then a growth by a write
+        // reads zeros where the cut bytes were.
+        use crate::{kassert, kassert_eq};
+        use ktest_files::{file, pattern, read, reclaim_ext4};
+        let p = PAGE_SIZE as u64;
+        let vol = ktest_files::Ext4Volume::new(189)?;
+        let f = file(&vol.root, "detached.bin", &pattern(PAGE_SIZE, 9))?;
+        kassert_eq!(f.write_at(3 * p, &pattern(PAGE_SIZE, 11)).map_err(|_| "write page 3")?, PAGE_SIZE);
+        kassert_eq!(reclaim_ext4(&f)?, 0); // on disk alone: the detach reads pages 0 and 3 in
+        let open = lumen_vfs::OpenGuard::try_new(Arc::clone(&f)).map_err(|_| "open")?;
+        vol.root.unlink(b"detached.bin").map_err(|_| "unlink")?;
+        kassert!(f.is_detached());
+        vol.fail_reads(true);
+        let checks = (|| -> Result<(), &'static str> {
+            kassert!(read(&f, p, PAGE_SIZE)?.iter().all(|&b| b == 0)); // page 1, a hole
+            kassert_eq!(f.write_at(2 * p + 10, b"hi").map_err(|_| "write into a hole")?, 2);
+            let page2 = read(&f, 2 * p, PAGE_SIZE)?;
+            kassert_eq!(&page2[10..12], b"hi");
+            kassert!(page2[..10].iter().chain(&page2[12..]).all(|&b| b == 0));
+            check_shrink_then_write_past(&f)
+        })();
+        vol.fail_reads(false);
+        drop(open);
+        checks
+    }
+);
+
+crate::ktest!(
+    fn page_cache_ext4_writes_back_only_the_bytes_below_eof() {
+        // A store through a shared mapping past the end of a file's last
+        // page stays out of the file: writeback writes the page's bytes
+        // below the size alone (`page::valid_len`), so once the page is
+        // dropped, a growth reads zeros there from the disk, not the store.
+        use crate::{kassert, kassert_eq};
+        use ktest_files::{file, pattern, read, reclaim_ext4};
+        let p = PAGE_SIZE as u64;
+        let vol = ktest_files::Ext4Volume::new(190)?;
+        let g = file(&vol.root, "eof.bin", &pattern(PAGE_SIZE + 100, 5))?;
+        let mapped = mmap_page(&g, 1).map_err(|_| "map")?;
+        mapped.page().write_bytes(200, b"junk"); // past the end
+        drop(mapped);
+        kassert_eq!(g.write_at(p + 50, b"q").map_err(|_| "dirty the page")?, 1);
+        kassert_eq!(reclaim_ext4(&g)?, 0); // written back and dropped
+        g.truncate(2 * p).map_err(|_| "grow")?;
+        kassert!(read(&g, p + 100, PAGE_SIZE - 100)?.iter().all(|&b| b == 0));
         Ok(())
     }
 );
@@ -1055,7 +1599,7 @@ crate::ktest!(
         // `dirty`: whichever way the unmap falls, the page must read dirty,
         // or reclaim evicts its mapped stores unwritten.
         use crate::{kassert, kassert_eq};
-        let page = CachePage::new_zeroed().ok_or("frame")?;
+        let page = CachePage::new_zeroed().map_err(|_| "frame")?;
         page.set_dirty();
         page.inc_writable_maps();
         kassert!(page.swap_dirty(false)); // a writeback while mapped
@@ -1152,8 +1696,10 @@ crate::ktest!(
 crate::ktest!(
     fn page_cache_soft_limit_triggers_reclaim() {
         // Past the soft limit, the next ext4 read or write reclaims (writing
-        // dirty pages back) before it runs, through the global tables. The
-        // limits in force outside this test: 32 MiB soft, twice that hard.
+        // dirty pages back) before it runs. Reclaim reaches the file through
+        // its filesystem in `EXT4_FILESYSTEMS` (each one's live inodes); the
+        // mount in `TABLES` is only for opening it by path. The limits in
+        // force outside this test: 32 MiB soft, twice that hard.
         crate::kassert_eq!(EXT4_SOFT_LIMIT_PAGES * PAGE_SIZE, 32 << 20);
         crate::kassert_eq!(EXT4_HARD_LIMIT_PAGES, 2 * EXT4_SOFT_LIMIT_PAGES);
         use crate::vfs::{EXT4_FILESYSTEMS, TABLES, ext4};

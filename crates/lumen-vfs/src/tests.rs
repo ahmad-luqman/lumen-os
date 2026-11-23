@@ -730,16 +730,9 @@ impl VfsInode for MemInode {
 
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
         let mut g = self.inner.lock().unwrap();
-        match atime {
-            SetTime::Omit => {}
-            SetTime::Now => g.atime = Timespec { sec: 100, nsec: 0 },
-            SetTime::Set(ts) => g.atime = ts,
-        }
-        match mtime {
-            SetTime::Omit => {}
-            SetTime::Now => g.mtime = Timespec { sec: 100, nsec: 0 },
-            SetTime::Set(ts) => g.mtime = ts,
-        }
+        let now = Timespec { sec: 100, nsec: 0 };
+        g.atime = atime.resolve(g.atime, now);
+        g.mtime = mtime.resolve(g.mtime, now);
         Ok(())
     }
 

@@ -368,7 +368,9 @@ one is its own PR that updates that doc first.
   in-memory block device those files' ktests use too, stays in `mod.rs`);
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
-  64 MiB hard cap, `QuotaCounter`, the detached-inode quota; `mmap_page`,
+  64 MiB hard cap, one check, `admit_unreclaimable`, for a dirty or mapped
+  page, `QuotaCounter`, the detached-inode quota; `read_into`/`write_from`/
+  `resize`/`map_page`, the page I/O ext4 and tmpfs share, #264; `mmap_page`,
   re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
   for a mapping, through `VfsInode::as_any`, and `MappedPage::copy_to_frame` (under the cache lock)
   for copy-on-write, #255; `WritableMap`, the guard counting a writable
@@ -567,12 +569,14 @@ one is its own PR that updates that doc first.
   an fd in `0..MAX_FDS`, `ProcFd::parse`, and `parse_canonical_u32`: one
   name per number), `pseudo` (what devfs and procfs share: `fill_readdir`,
   a listing keyed by entry, and `fixed_namespace_ops!`, the seven namespace
-  operations each `-EROFS`), and `ext4` (#292, #294: what the ext4 adapter encodes and
+  operations each `-EROFS`), `ext4` (#292, #294: what the ext4 adapter encodes and
   decodes itself, a device node's `i_block` as `st_rdev` and Linux's signed times
-  with their epoch bits, clamped as `timestamp_truncate` does), and `nlink`
+  with their epoch bits, clamped as `timestamp_truncate` does), `nlink`
   (#265: `NlinkBounds`, ext4's in-memory link-count corrections: a floor
   and maybe a ceiling per inode, never trivial, the floor never above the
-  ceiling) (host-tested).
+  ceiling), and `page` (#265: the page cache's arithmetic, `spans`,
+  `pages_in`, `valid_len`, `resize_tail`); `SetTime::resolve` (#302) in
+  `types` (host-tested).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
