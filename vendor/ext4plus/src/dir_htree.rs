@@ -445,7 +445,12 @@ pub(crate) async fn find_leaf_lookup(
     block: &mut [u8],
 ) -> Result<HtreeLeafLookup, Ext4Error> {
     let hash_alg = HashAlg::from_u8(block[0x1c])?;
-    let hash = hash_alg.hash(name, &fs.0.superblock.htree_hash_seed());
+    // Lumen (#313): signed or unsigned as the superblock's `s_flags` says.
+    let hash = hash_alg.hash(
+        name,
+        &fs.0.superblock.htree_hash_seed(),
+        fs.0.superblock.htree_hash_unsigned(),
+    );
 
     // Read the htree depth from the root block. The depth is the
     // number of internal levels between the root and the leaves.

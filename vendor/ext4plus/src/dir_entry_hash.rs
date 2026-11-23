@@ -67,10 +67,20 @@ impl HashAlg {
     /// The `seed` value comes from the `s_hash_seed` field of the
     /// superblock. If the `seed` is all zeroes, it's replaced with a
     /// standard default seed.
+    ///
+    /// Lumen (#313): `unsigned` says how the name's bytes are widened
+    /// (Linux's `str2hashbuf_unsigned` rather than `str2hashbuf_signed`),
+    /// from the superblock's `s_flags`
+    /// ([`Superblock::htree_hash_unsigned`]). Release 0.1.0-rc.2 always
+    /// hashed signed, so on an unsigned-hash volume a name with a byte of
+    /// 0x80 or above was looked up, and filed, under the wrong hash.
+    ///
+    /// [`Superblock::htree_hash_unsigned`]: crate::superblock::Superblock::htree_hash_unsigned
     pub(crate) fn hash(
         &self,
         name: DirEntryName<'_>,
         mut seed: &[u32; 4],
+        unsigned: bool,
     ) -> u32 {
         // Replace all-zero seed with a standard default seed.
         if seed == &[0; 4] {
@@ -90,7 +100,7 @@ impl HashAlg {
                 for chunk in
                     name.as_ref().chunks(mem::size_of::<HashBlock<8>>())
                 {
-                    let inp = create_hash_block(chunk);
+                    let inp = create_hash_block(chunk, unsigned);
                     md4_half(&mut state, &inp);
                 }
 
@@ -101,7 +111,7 @@ impl HashAlg {
                 for chunk in
                     name.as_ref().chunks(mem::size_of::<HashBlock<4>>())
                 {
-                    let inp = create_hash_block(chunk);
+                    let inp = create_hash_block(chunk, unsigned);
                     tea(&mut state, &inp);
                 }
 
@@ -112,6 +122,25 @@ impl HashAlg {
         // Finalize the hash.
         hash & !1
     }
+}
+
+/// Lumen (#313): the hash of `name` in an htree directory whose root
+/// block gives hash version `alg` (1: half-MD4, 2: TEA; `None` for any
+/// other, which [`HashAlg::from_u8`] refuses, or a name that isn't a
+/// valid entry name), with hash seed `seed`, its bytes widened unsigned
+/// or signed. Not ext4plus's API: public only so that Lumen's host tests
+/// can pin it against Linux's values.
+#[doc(hidden)]
+#[must_use]
+pub fn htree_hash(
+    alg: u8,
+    name: &[u8],
+    seed: [u32; 4],
+    unsigned: bool,
+) -> Option<u32> {
+    let alg = HashAlg::from_u8(alg).ok()?;
+    let name = DirEntryName::try_from(name).ok()?;
+    Some(alg.hash(name, &seed, unsigned))
 }
 
 type Wu32 = Wrapping<u32>;
@@ -214,7 +243,15 @@ fn sign_extend_byte_to_u32(byte: u8) -> u32 {
 }
 
 /// Create the 32-byte block of data that will be hashed.
-fn create_hash_block<const N: usize>(mut src: &[u8]) -> HashBlock<N> {
+///
+/// Lumen (#313): each byte is sign-extended, or with `unsigned`
+/// zero-extended, as Linux's `str2hashbuf_signed` and
+/// `str2hashbuf_unsigned` do. The two differ only for bytes of 0x80 or
+/// above; the padding is the same either way.
+fn create_hash_block<const N: usize>(
+    mut src: &[u8],
+    unsigned: bool,
+) -> HashBlock<N> {
     let mut dst = [Wu32::default(); N];
 
     // Get padding value. If `src` is smaller than the block size (4 * N
@@ -228,8 +265,13 @@ fn create_hash_block<const N: usize>(mut src: &[u8]) -> HashBlock<N> {
         // Process up to four bytes of `src`.
         for _ in 0..4 {
             if let Some(src_byte) = src.first() {
-                // Sign extend the byte into a `u32`.
-                let src_u32 = sign_extend_byte_to_u32(*src_byte);
+                // Sign extend the byte into a `u32` (Lumen, #313: or
+                // zero extend it on an unsigned-hash volume).
+                let src_u32 = if unsigned {
+                    u32::from(*src_byte)
+                } else {
+                    sign_extend_byte_to_u32(*src_byte)
+                };
                 elem = src_u32.wrapping_add(elem << 8);
 
                 src = &src[1..];
@@ -265,7 +307,7 @@ mod tests {
     #[track_caller]
     fn check_hash_block(src: &[u8], expected: [u32; 8]) {
         assert_eq!(
-            create_hash_block::<8>(src)
+            create_hash_block::<8>(src, false)
                 // Convert from `Wu32` to `u32`.
                 .iter()
                 .map(|n| n.0)
@@ -356,22 +398,22 @@ mod tests {
         // Test a short name.
         let name = DirEntryName::try_from(b"abc").unwrap();
         assert_eq!(
-            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED1)),
+            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED1), false),
             0x25783134
         );
         assert_eq!(
-            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED2)),
+            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED2), false),
             0x4599f742
         );
         assert_eq!(
-            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED0)),
+            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED0), false),
             0xd196a868
         );
 
         // Test a name with non-ASCII characters.
         let name = DirEntryName::try_from(NON_ASCII_NAME).unwrap();
         assert_eq!(
-            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED1)),
+            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED1), false),
             0xb40a2038
         );
 
@@ -379,7 +421,7 @@ mod tests {
         assert_eq!(MAX_LEN_NAME.len(), 255);
         let name = DirEntryName::try_from(MAX_LEN_NAME).unwrap();
         assert_eq!(
-            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED1)),
+            HashAlg::HalfMd4.hash(name, &seed_from_uuid(SEED1), false),
             0xe40e82e0
         );
     }
@@ -395,18 +437,33 @@ mod tests {
 
         // Test a short name.
         let name = DirEntryName::try_from(b"abc").unwrap();
-        assert_eq!(HashAlg::Tea.hash(name, &seed_from_uuid(SEED1)), 0x8abf7e2e);
-        assert_eq!(HashAlg::Tea.hash(name, &seed_from_uuid(SEED2)), 0xa19eddb4);
-        assert_eq!(HashAlg::Tea.hash(name, &seed_from_uuid(SEED0)), 0xb1435ec4);
+        assert_eq!(
+            HashAlg::Tea.hash(name, &seed_from_uuid(SEED1), false),
+            0x8abf7e2e
+        );
+        assert_eq!(
+            HashAlg::Tea.hash(name, &seed_from_uuid(SEED2), false),
+            0xa19eddb4
+        );
+        assert_eq!(
+            HashAlg::Tea.hash(name, &seed_from_uuid(SEED0), false),
+            0xb1435ec4
+        );
 
         // Test a name with non-ASCII characters.
         let name = DirEntryName::try_from(NON_ASCII_NAME).unwrap();
-        assert_eq!(HashAlg::Tea.hash(name, &seed_from_uuid(SEED1)), 0x23d61dc4);
+        assert_eq!(
+            HashAlg::Tea.hash(name, &seed_from_uuid(SEED1), false),
+            0x23d61dc4
+        );
 
         // Test a max-length name.
         assert_eq!(MAX_LEN_NAME.len(), 255);
         let name = DirEntryName::try_from(MAX_LEN_NAME).unwrap();
-        assert_eq!(HashAlg::Tea.hash(name, &seed_from_uuid(SEED1)), 0xfd79bbac);
+        assert_eq!(
+            HashAlg::Tea.hash(name, &seed_from_uuid(SEED1), false),
+            0xfd79bbac
+        );
     }
 
     /// Generate random names and compare the hash generated by this
@@ -523,6 +580,7 @@ mod tests {
             let actual_hash = hash_alg.hash(
                 DirEntryName::try_from(to_hash.as_slice()).unwrap(),
                 &seed_from_uuid(&seed),
+                false,
             );
 
             if actual_hash != expected_hash {

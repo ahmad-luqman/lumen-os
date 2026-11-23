@@ -782,6 +782,9 @@ fn read_htree_leaf_entries(
     let mut off = 0usize;
     let path = PtrPrimitive::new(PathBuf::empty());
     let seed = fs.0.superblock.htree_hash_seed();
+    // Lumen (#313): the leaf's entries rehashed for a split as the
+    // volume says, as the lookup that placed them did.
+    let unsigned = fs.0.superblock.htree_hash_unsigned();
 
     while off < block.len() {
         let (entry, entry_size) = DirEntry::from_bytes(
@@ -798,7 +801,7 @@ fn read_htree_leaf_entries(
 
         let name = entry.file_name();
         entries.push(HtreeLeafEntryData {
-            hash: hash_alg.hash(name, &seed),
+            hash: hash_alg.hash(name, &seed, unsigned),
             inode: entry.inode,
             name: name.as_ref().to_vec(),
             file_type: entry.file_type()?,

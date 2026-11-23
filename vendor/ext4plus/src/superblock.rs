@@ -369,6 +369,19 @@ impl Superblock {
         self.htree_hash_seed
     }
 
+    /// Lumen (#313): whether htree directories hash their names' bytes
+    /// unsigned: `s_flags` (offset 0x160) has `EXT2_FLAGS_UNSIGNED_HASH`
+    /// (0x2), which Linux's `ext4_hash_info_init` checks first. With
+    /// `EXT2_FLAGS_SIGNED_HASH` (0x1), or neither flag, they hash signed,
+    /// as release 0.1.0-rc.2 always did. (Linux built with unsigned
+    /// `char`, as every build is since 6.2, hashes a volume with neither
+    /// flag unsigned; such a volume is ambiguous, and a caller must decide
+    /// for itself whether to trust it.)
+    #[must_use]
+    pub fn htree_hash_unsigned(&self) -> bool {
+        read_u32le(&self.data, 0x160) & 0x2 != 0
+    }
+
     pub(crate) fn journal_inode(&self) -> Option<InodeIndex> {
         self.journal_inode
     }

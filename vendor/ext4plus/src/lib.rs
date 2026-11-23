@@ -177,6 +177,9 @@ use sync::PtrPrimitive;
 use util::{u64_from_usize, usize_from_u32};
 
 pub use dir_entry::{DirEntry, DirEntryName, DirEntryNameError};
+// Lumen (#313): for Lumen's host tests only.
+#[doc(hidden)]
+pub use dir_entry_hash::htree_hash;
 pub use features::IncompatibleFeatures;
 pub use file_type::FileType;
 pub use format::BytesDisplay;
