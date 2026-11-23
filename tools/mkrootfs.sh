@@ -173,5 +173,8 @@ if grep -qvE '^(debugfs [0-9]|$)' "$DBG_DIR/sif.err"; then
     exit 1
 fi
 
-"$E2FSCK" -fn "$TMP_IMG" >/dev/null
+if ! "$E2FSCK" -fn "$TMP_IMG" >/dev/null; then
+    echo "mkrootfs: e2fsck -fn failed on the image (an indexed directory, which ext4-signed-hash.sh's switch would leave in unsigned-hash order, is one cause: #308)" >&2
+    exit 1
+fi
 mv -f "$TMP_IMG" "$OUT"

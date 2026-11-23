@@ -163,7 +163,7 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4 volumes with unsigned directory hashes (#308, s_flags EXT2_FLAGS_UNSIGNED_HASH, which ext4plus ignores) mount read-only with one warning naming the flag; every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (only a non-ASCII hash miss in an htree directory walks it, a read error in the walk is EIO), a missing name is ENOENT, and unlink, rmdir and create are EROFS; the same volume with its flag set to signed mounts writable and gets no walk; mkrootfs.sh sets an unsigned image's flag to signed (tools/ext4-signed-hash.sh), failing if the flag stays unsigned"
+name = "ext4 volumes with unsigned directory hashes (#308, s_flags EXT2_FLAGS_UNSIGNED_HASH, which ext4plus ignores) mount read-only with one warning naming the flag; every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (only a non-ASCII hash miss in an htree directory walks it, a read error in the walk is EIO), a missing name is ENOENT, and unlink, rmdir and create are EROFS; the same volume with its flag set to signed mounts writable and gets no walk; tools/ext4-signed-hash.sh (mkrootfs.sh's switch) sets an unsigned image's flag to signed, changing nothing else, and fails if the flag stays unsigned"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name",

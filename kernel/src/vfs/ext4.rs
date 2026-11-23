@@ -889,7 +889,8 @@ impl Ext4FileSystem {
         if let Some(why) = forced
             && !hw_read_only
         {
-            if unsigned_hash {
+            // `s_flags` only beside its own reason.
+            if why == UNSIGNED_HASH_REASON {
                 warn!(
                     target: "vfs",
                     "ext4 on {dev:?}: mounting read-only: {why} (ro_compat {ro_compat_bits:#x}, s_flags {s_flags:#x})"

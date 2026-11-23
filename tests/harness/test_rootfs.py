@@ -452,7 +452,12 @@ def _e2fsprogs() -> tuple[Path, Path, Path]:
         if os.environ.get("CI"):
             raise
         pytest.skip("e2fsprogs not installed")
-    return mke2fs, e2fsck, e2fsck.parent / "debugfs"
+    debugfs = e2fsck.parent / "debugfs"
+    if not os.access(debugfs, os.X_OK):
+        if os.environ.get("CI"):
+            raise FileNotFoundError(f"no debugfs beside {e2fsck}")
+        pytest.skip(f"no debugfs beside {e2fsck}")
+    return mke2fs, e2fsck, debugfs
 
 
 def _sign(debugfs: Path, image: Path) -> subprocess.CompletedProcess[str]:

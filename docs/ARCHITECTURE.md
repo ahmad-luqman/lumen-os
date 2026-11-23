@@ -5658,8 +5658,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     **Caveat (#308):** `ext4plus` hashes a hashed (htree) directory's names
     with signed bytes and never reads the superblock's unsigned-hash flag
     (`s_flags & EXT2_FLAGS_UNSIGNED_HASH`, which `mke2fs` sets where `char`
-    is unsigned, e.g. aarch64 Linux), and an htree lookup has no linear
-    fallback. So a name with a byte of 0x80 or more (UTF-8 or not) in such
+    is unsigned, e.g. aarch64 Linux; a volume with neither that nor
+    `EXT2_FLAGS_SIGNED_HASH` is read as signed, as Linux on x86 does, and
+    Linux where `char` is unsigned sets the unsigned flag on such a
+    volume's first writable mount, before it can index a directory), and an
+    htree lookup has no linear fallback. So a name with a byte of 0x80 or more (UTF-8 or not) in such
     a directory, on such a volume, could be missed by a lookup (when its
     signed hash picks another leaf than its real one), and an entry
     `ext4plus` adds there would be filed under the signed hash, where Linux
@@ -5681,7 +5684,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     so they mount writable: `tools/mkrootfs.sh` sets `s_flags` to signed
     on an image `mke2fs` made with unsigned hashes (on a host where `char`
     is unsigned) through `tools/ext4-signed-hash.sh`, which changes only
-    the flag (`mke2fs -d` indexes no directory, and the script's final
+    the flag (`mke2fs -d` indexes no directory, and mkrootfs.sh's final
     `e2fsck -fn` would fail on one) and checks the image's bytes after
     (`harness:test_rootfs::test_signed_hash_*`).
   - **Read-only mounts and special files (#291):** `open_inode` (a write
