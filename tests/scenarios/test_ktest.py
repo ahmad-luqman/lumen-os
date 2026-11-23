@@ -305,9 +305,11 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 1,
     # linux::syscall::io: io_fsync_writes_an_ext4_file_back_and_reports_eio's
     # `fsync` with the block cache's sync failing, and
-    # io_sync_flushes_every_mounted_filesystem's `sync` with one volume's.
-    rf"WARN  vfs: fsync: ext4 {_DEV} inode \d+: block cache: block device I/O error": 1,
-    rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 1,
+    # io_sync_flushes_every_mounted_filesystem's `sync` with one volume's;
+    # and ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next
+    # (#331): one of each, the device's writes failing under the block cache.
+    rf"WARN  vfs: fsync: ext4 {_DEV} inode \d+: block cache: block device I/O error": 2,
+    rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 2,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
     # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page;
     # page_cache_insert_refuses_a_dirty_ext4_page_at_the_hard_limit,
