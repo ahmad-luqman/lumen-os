@@ -1014,19 +1014,21 @@ fn magic_symlinks_and_rofs_exempt_chardev() {
     let dev_mp = mkdir_at(&env, None, b"/dev", 0o755, 0).unwrap();
     let proc_mp = mkdir_at(&env, None, b"/proc", 0o755, 0).unwrap();
 
-    let devfs = MemFs::new(DevId::DEVFS, "devfs", true);
+    // A read-only mount at `/dev` holding a char device (the kernel's devfs
+    // is writable since #301; this is any read-only mount).
+    let devfs = MemFs::new(DevId::makedev(0, 33), "rodev", true);
     let _null_dev = devfs.add_char_device(&devfs.root, b"null", 0o666, DevId::makedev(1, 3));
     let procfs = MemFs::new(DevId::PROCFS, "procfs", true);
 
     env.mount(dev_mp, "/dev", devfs).unwrap();
     env.mount(proc_mp, "/proc", procfs.clone()).unwrap();
 
-    // `O_WRONLY | O_TRUNC` succeeds on devfs char device even though devfs is read-only.
+    // `O_WRONLY | O_TRUNC` succeeds on the char device though its mount is read-only.
     let (null_inode, _) =
         open_inode(&env, None, b"/dev/null", OpenFlags(OpenFlags::O_WRONLY | OpenFlags::O_TRUNC), 0, 0).unwrap();
     assert_eq!(null_inode.inode_type(), InodeType::CharDevice);
     assert_eq!(check_access(&env, &null_inode, AccessMask(AccessMask::W_OK), 0, 0), Ok(()));
-    // Namespace mutation on rofs devfs returns EROFS.
+    // A namespace change on the read-only mount returns EROFS.
     assert_eq!(
         open_inode(&env, None, b"/dev/newfile", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap_err(),
@@ -2819,8 +2821,9 @@ fn unchallenged_edges_tmpfile_link_empty_path_and_access() {
     assert_eq!(check_access(&env, &dir, AccessMask(AccessMask::X_OK), 0, 0), Ok(()));
     // ROFS blocks W_OK even for uid == 0 unless exempt (a special file).
     let ro_mp = mkdir_at(&env, None, b"/ro_acc", 0o755, 0).unwrap();
-    let ro_fs = MemFs::new(DevId::DEVFS, "devfs", true);
-    let ro_reg = MemInode::new_file(DevId::DEVFS, 99, 0o666, Arc::clone(&ro_fs.registry), Arc::clone(&ro_fs.next_ino));
+    let ro_fs = MemFs::new(DevId::makedev(0, 34), "rofs", true);
+    let ro_reg =
+        MemInode::new_file(DevId::makedev(0, 34), 99, 0o666, Arc::clone(&ro_fs.registry), Arc::clone(&ro_fs.next_ino));
     ro_fs.root.inner.lock().unwrap().children.insert(b"non_exempt".to_vec(), ro_reg);
     let ro_exempt: Arc<dyn VfsInode> = ro_fs.add_char_device(&ro_fs.root, b"exempt", 0o666, DevId::makedev(1, 3));
     env.mount(ro_mp, "/ro_acc", ro_fs).unwrap();
@@ -7581,24 +7584,7 @@ mod uncached {
                 _ => Err(VfsError::NotDir),
             }
         }
-        fn create(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn mkdir(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn unlink(&self, _name: &[u8]) -> Result<(), VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn rmdir(&self, _name: &[u8]) -> Result<(), VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn link(&self, _name: &[u8], _target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
-            Err(VfsError::RoFs)
-        }
-        fn symlink(&self, _name: &[u8], _target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-            Err(VfsError::RoFs)
-        }
+        crate::fixed_namespace_ops!();
         fn readlink(&self) -> Result<Vec<u8>, VfsError> {
             match self.node {
                 Node::FdLink(_) if self.is_live() => Ok(b"../info".to_vec()),
@@ -7606,15 +7592,6 @@ mod uncached {
                 Node::FdLink(_) | Node::VerLink(_) => Err(VfsError::NoEnt),
                 _ => Err(VfsError::Inval),
             }
-        }
-        fn rename(
-            &self,
-            _old_name: &[u8],
-            _new_dir: &Arc<dyn VfsInode>,
-            _new_name: &[u8],
-            _flags: RenameFlags,
-        ) -> Result<(), VfsError> {
-            Err(VfsError::RoFs)
         }
         fn readdir(&self, _cursor: u64, _out: &mut Vec<DirEntry>, _max_entries: usize) -> Result<(), VfsError> {
             if self.inode_type() == InodeType::Dir { Ok(()) } else { Err(VfsError::NotDir) }
@@ -7664,6 +7641,29 @@ fn setup_dynfs() -> (TestTables, Arc<uncached::DynFs>, Arc<dyn VfsInode>) {
     let proc_root = resolve_path(&env, None, b"/proc", ResolveFlags::default()).unwrap().inode;
     assert_eq!(proc_root.dev_id(), DYNFS_DEV);
     (env, dynfs, proc_root)
+}
+
+/// `fixed_namespace_ops!`, which the fake procfs's inodes expand as the
+/// kernel's devfs and procfs do, refuses each of its seven operations with
+/// `-EROFS`, asked directly (the read-only mount refuses first by path);
+/// `mkdir` and `symlink` onto a name in use too (ARCHITECTURE section 9:
+/// `-EROFS` where Linux says `-EEXIST`).
+#[test]
+fn fixed_namespace_ops_refuse_each_change_with_erofs() {
+    let (_env, _dynfs, proc_root) = setup_dynfs();
+    let other: Arc<dyn VfsInode> = proc_root.clone();
+    let rofs = Err(VfsError::RoFs);
+    assert_eq!(proc_root.create(b"n", 0o644).map(|_| ()), rofs);
+    assert_eq!(proc_root.mkdir(b"n", 0o755).map(|_| ()), rofs);
+    assert!(proc_root.lookup(b"version").is_ok());
+    assert_eq!(proc_root.mkdir(b"version", 0o755).map(|_| ()), rofs);
+    assert_eq!(proc_root.unlink(b"version"), rofs);
+    assert_eq!(proc_root.rmdir(b"version"), rofs);
+    assert_eq!(proc_root.link(b"n", &other), rofs);
+    assert_eq!(proc_root.symlink(b"n", b"version").map(|_| ()), rofs);
+    assert_eq!(proc_root.symlink(b"version", b"n").map(|_| ()), rofs);
+    assert_eq!(proc_root.rename(b"version", &other, b"n", RenameFlags(0)), rofs);
+    assert_eq!(proc_root.rename(b"version", &other, b"n", RenameFlags(RenameFlags::EXCHANGE)), rofs);
 }
 
 /// How many per-pid entries `InodeCache` and `DentryCache` hold.

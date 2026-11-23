@@ -25,6 +25,7 @@ pub mod mount;
 pub mod nlink;
 pub mod ops;
 pub mod procfs;
+pub mod pseudo;
 pub mod resolve;
 pub mod types;
 

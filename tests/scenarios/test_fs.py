@@ -49,7 +49,7 @@ def test_ext4_read_write_persists_across_reboot(boot, tmp_path):
     assert mount_rows(m1) == {
         "/": ("ext4", "0:1", "rw"),
         "/tmp": ("tmpfs", "0:2", "rw"),
-        "/dev": ("devfs", "0:3", "ro"),
+        "/dev": ("devfs", "0:3", "rw"),
         "/proc": ("procfs", "0:4", "ro"),
     }
     assert run(m1, "mount | count") == "4\n"
@@ -156,7 +156,7 @@ def test_dev_tmp_proc_filesystems(boot):
     assert mount_rows(m) == {
         "/": ("tmpfs", "0:1", "rw"),
         "/tmp": ("tmpfs", "0:2", "rw"),
-        "/dev": ("devfs", "0:3", "ro"),
+        "/dev": ("devfs", "0:3", "rw"),
         "/proc": ("procfs", "0:4", "ro"),
     }
     assert run(m, "mount | count") == "4\n"
@@ -170,7 +170,7 @@ def test_dev_tmp_proc_filesystems(boot):
         assert "dev=0:4" in st and "size=0" in st, st
     assert "MemTotal:" in run(m, "vfstest cat /proc/meminfo")
     assert "processor" in run(m, "vfstest cat /proc/cpuinfo")
-    assert "devfs /dev devfs ro 0 0" in run(m, "vfstest cat /proc/mounts")
+    assert "devfs /dev devfs rw 0 0" in run(m, "vfstest cat /proc/mounts")
     assert "Linux version" in run(m, "vfstest cat /proc/version")
 
     out = run(m, "vfstest dev-tmp-proc")
