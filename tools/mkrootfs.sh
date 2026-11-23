@@ -115,8 +115,9 @@ COPYFILE_DISABLE=1 E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$MKE2FS" -q -F \
     -d "$STAGE" "$TMP_IMG" "$ROOTFS_SIZE"
 
 # mke2fs sets s_flags' EXT2_FLAGS_UNSIGNED_HASH where `char` is unsigned (e.g.
-# Linux on aarch64), and Lumen mounts such a volume read-only (#308: ext4plus
-# hashes directory names signed). Set s_flags to signed on every host: only the
+# Linux on aarch64). Lumen mounted such a volume read-only until #313 (#308),
+# and still does one with neither hash flag; and the image should come out the
+# same on every host. Set s_flags to signed on every host: only the
 # flag changes, which is all it takes since `mke2fs -d` indexes no directory,
 # and an image already signed (x86-64, macOS) is untouched. It checks the flag
 # from the image's bytes either way.

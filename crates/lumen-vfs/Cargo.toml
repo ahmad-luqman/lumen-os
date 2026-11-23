@@ -7,3 +7,9 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+# #313: the vendored ext4plus's htree hash pinned against e2fsprogs' values
+# (tests/ext4plus_htree_hash.rs). A host test only: the kernel uses it, not
+# this crate.
+[dev-dependencies]
+ext4plus.workspace = true

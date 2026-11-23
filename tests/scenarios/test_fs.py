@@ -1,12 +1,23 @@
 """POSIX VFS, PageCache, writable ext4 rootfs, tmpfs, devfs, and procfs scenarios."""
 
 import re
+import shutil
+import subprocess
+from pathlib import Path
 
+import pytest
 from lumen_harness.calibration import assert_quiet_boot
 from lumen_harness.gui import confirmed_keys, type_confirmed
 from lumen_harness.klog import unexpected_warnings
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import copy_rootfs, e2fsck_check, run_busybox, warm_up
+from lumen_harness.rootfs import (
+    copy_rootfs,
+    debugfs,
+    e2fsck_check,
+    find_e2fsprogs,
+    run_busybox,
+    warm_up,
+)
 from lumen_harness.screen import expect_screen
 from lumen_harness.shell import PROMPT, run
 
@@ -332,6 +343,123 @@ def test_ext4_deletions_and_renames_fsck_clean(boot, tmp_path):
     assert run(m2, "vfstest cat /f2") == "one\n"
     for gone in ("/f1", "/gone.txt", "/gonedir", "/pa/sub", "/pa/x"):
         assert run(m2, f"vfstest stat {gone}") == "stat: NoEnt\n", gone
+    m2.send_line("exit")
+    assert m2.wait_exit(10) == EXIT_SUCCESS
+    m2.close()
+
+
+# kernel/src/vfs/testdata/unsigned-hash.ext4 (tools/ext4-unsigned-hash-image.py):
+# an htree directory `/d` of 80 ASCII names and three with bytes of 0x80 or
+# above, `é-utf8` among them, indexed by the unsigned half-MD4 hash.
+UNSIGNED_HASH_IMAGE = (
+    Path(__file__).resolve().parents[2]
+    / "kernel"
+    / "src"
+    / "vfs"
+    / "testdata"
+    / "unsigned-hash.ext4"
+)
+# Where the superblock's `s_flags` is in the image.
+S_FLAGS_AT = 1024 + 0x160
+
+
+def htree_volume(dest: Path, alg: str, s_flags: int) -> Path:
+    """A copy of UNSIGNED_HASH_IMAGE with `s_flags` and its default hash set,
+    `/d` re-indexed by `e2fsck -fyD` with the hash they say (Linux's own,
+    e2fsprogs' `ext2fs_dirhash`), checked clean, and both read back from the
+    image: `s_flags` and `/d`'s root block's hash version."""
+    image = dest / f"{alg}-{s_flags}.ext4"
+    shutil.copyfile(UNSIGNED_HASH_IMAGE, image)
+    _, e2fsck = find_e2fsprogs()
+    tool = e2fsck.parent / "debugfs"
+    for request in (f"ssv flags {s_flags}", f"ssv def_hash_version {alg}"):
+        proc = subprocess.run(
+            [str(tool), "-w", "-R", request, str(image)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        errors = [line for line in proc.stderr.splitlines()[1:] if line]  # past the banner
+        assert proc.returncode == 0 and not errors, (request, proc.stderr)
+    proc = subprocess.run([str(e2fsck), "-fyD", str(image)], capture_output=True, check=False)
+    assert proc.returncode in (0, 1), proc
+    e2fsck_check(image)
+    data = image.read_bytes()
+    assert data[S_FLAGS_AT] == s_flags
+    first = int(debugfs(image, "blocks d").split()[0])
+    assert data[first * 1024 + 0x1C] == {"half_md4": 1, "tea": 2}[alg]
+    return image
+
+
+def dir_size(image: Path, path: str) -> int:
+    """`path`'s size on `image`, as `debugfs stat` reads it."""
+    found = re.search(r"\bSize: (\d+)", debugfs(image, f"stat {path}"))
+    assert found, path
+    return int(found.group(1))
+
+
+@pytest.mark.parametrize(
+    ("alg", "s_flags"),
+    [("half_md4", 2), ("tea", 2), ("half_md4", 1), ("tea", 1)],
+    ids=["half_md4-unsigned", "tea-unsigned", "half_md4-signed", "tea-signed"],
+)
+def test_ext4_htree_names_with_high_bytes_fsck_clean(boot, tmp_path, alg, s_flags):
+    """#313: on an ext4 root whose htree directory `/d` is indexed by either
+    hash (half-MD4, TEA), signed or unsigned as `s_flags` says (an unsigned
+    one mounting writable, no longer read-only as #308's guard had it), a
+    name with bytes of 0x80 or above is looked up, created, renamed into the
+    directory (enough of them to split a leaf), made a directory, unlinked
+    and removed, and the volume then passes `e2fsck -fn`, which checks each
+    entry's hash against the leaf it sits in, as Linux computes it."""
+    disk = htree_volume(tmp_path, alg, s_flags)
+    size = dir_size(disk, "d")
+    m = shell(boot, devices=Devices(blk_image=disk, rng=True))
+    assert_quiet_boot(m.output)
+    assert mount_rows(m)["/"] == ("ext4", "0:1", "rw")
+    assert run(m, "vfstest cat /d/é-utf8") == "x\n"
+    assert stat_fields(m, "/d/é-utf8")["type"] == "file"
+
+    # 63 characters, 183 bytes each: eight of them overflow every leaf's
+    # free space put together.
+    def long(n):
+        return "€" * 60 + f"-{n:02}"
+
+    for n in range(8):
+        assert run(m, f"vfstest rename /d/entry-number-{n:02} /d/{long(n)}") == "rename: ok\n"
+    assert run(m, f"vfstest write /d/{long(8)} eight") == "wrote 5\n"
+    assert run(m, "vfstest mkdir /d/é-dir") == "mkdir: ok\n"
+    assert run(m, "vfstest write /d/é-dir/ü inner") == "wrote 5\n"
+    for n in range(8):
+        assert run(m, f"vfstest cat /d/{long(n)}") == f"{n:02}\n", n
+        assert run(m, f"vfstest stat /d/entry-number-{n:02}") == "stat: NoEnt\n", n
+    assert run(m, f"vfstest cat /d/{long(8)}") == "eight\n"
+    assert run(m, "vfstest cat /d/é-utf8") == "x\n"
+    assert run(m, "vfstest cat /d/é-dir/ü") == "inner\n"
+    assert run(m, "vfstest unlink /d/é-utf8") == "unlink: ok\n"
+    assert run(m, "vfstest stat /d/é-utf8") == "stat: NoEnt\n"
+    assert run(m, f"vfstest unlink /d/{long(3)}") == "unlink: ok\n"
+    assert run(m, "vfstest mkdir /d/ö-gone") == "mkdir: ok\n"
+    assert run(m, "vfstest rmdir /d/ö-gone") == "rmdir: ok\n"
+    assert run(m, "sync") == "sync: ok\n"
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    m.close()
+
+    e2fsck_check(disk)
+    # The directory grew a leaf (read from the disk: the adapter doesn't
+    # refresh a directory's cached size as ext4plus grows it).
+    grew = dir_size(disk, "d")
+    assert grew > size, f"/d didn't split a leaf: {size} -> {grew} bytes"
+
+    # A second boot finds them from the disk, by their hashes.
+    m2 = shell(boot, devices=Devices(blk_image=disk, rng=True))
+    assert_quiet_boot(m2.output)
+    for n in (0, 1, 2, 4, 5, 6, 7):
+        assert run(m2, f"vfstest cat /d/{long(n)}") == f"{n:02}\n", n
+    assert run(m2, f"vfstest cat /d/{long(8)}") == "eight\n"
+    assert run(m2, "vfstest cat /d/é-dir/ü") == "inner\n"
+    for gone in ("é-utf8", long(3), "ö-gone"):
+        assert run(m2, f"vfstest stat /d/{gone}") == "stat: NoEnt\n", gone
     m2.send_line("exit")
     assert m2.wait_exit(10) == EXIT_SUCCESS
     m2.close()
