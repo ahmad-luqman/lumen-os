@@ -8923,6 +8923,73 @@ fn not_a_name_errno_per_operation_ahead_of_erofs() {
     }
 }
 
+/// #309: `.` and `..` in a removed directory, which the filesystem no longer
+/// finds either of: `link` and `open(O_CREAT)` answer from the path, never
+/// handing either to the filesystem as a name.
+#[test]
+fn not_a_name_answered_without_the_filesystem() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = env.as_ref();
+    open_inode(env, None, b"/f", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    let gone = mkdir_at(env, None, b"/gone", 0o755, 0).unwrap();
+    unlink_at(env, None, b"/gone", true).unwrap();
+    assert_eq!(gone.lookup(b".").unwrap_err(), VfsError::NoEnt);
+    assert_eq!(gone.lookup(b"..").unwrap_err(), VfsError::NoEnt);
+    let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY);
+    let excl = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDONLY);
+    for p in [&b"."[..], b".."] {
+        let at = Escaped(p);
+        assert_eq!(link_at(env, None, b"/f", Some(&gone), p, false, false).unwrap_err(), VfsError::Exist, "link {at}");
+        assert_eq!(open_inode(env, Some(&gone), p, excl, 0o644, 0).unwrap_err(), VfsError::Exist, "O_EXCL {at}");
+    }
+    // `.` is the directory itself, found without a lookup. (`..` here is the
+    // filesystem's own `..`, which it no longer has: see the next test.)
+    assert_eq!(open_inode(env, Some(&gone), b".", creat, 0o644, 0).unwrap_err(), VfsError::IsDir);
+}
+
+/// #309: `open(O_CREAT)` on `.` or `..` opens the directory that one names
+/// (either then gives `EISDIR`, so which was resolved shows only in the
+/// lookups): `.` asks no filesystem; `..` asks the parent's filesystem for
+/// its `..`, at a mount root after crossing up to the mount point, never
+/// the mounted filesystem.
+#[test]
+fn open_creat_resolves_the_dots_it_was_given() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let d = mkdir_at(env.as_ref(), None, b"/d", 0o755, 0).unwrap();
+    let mp = mkdir_at(env.as_ref(), None, b"/m", 0o755, 0).unwrap();
+    let mounted = FreshArcReusingFs::new(DevId::makedev(0, 73), "fresh-tmpfs", false, true);
+    env.mount(mp, "/m", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
+    let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY);
+    let asks = |fs: &FreshArcReusingFs| {
+        let asked = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&asked);
+        let hook = alloc::boxed::Box::new(move || flag.store(true, Ordering::Release));
+        fs.inner.hooks.lock().unwrap().pre_lookup.insert(b"..".to_vec(), hook);
+        asked
+    };
+    // (path, from `d`, the root filesystem asked for `..`)
+    let rows: [(&[u8], bool, bool); 6] = [
+        (b".", true, false),
+        (b"..", true, true),
+        (b"/d/.", false, false),
+        (b"/d/..", false, true),
+        (b"/m/.", false, false),
+        (b"/m/..", false, true),
+    ];
+    for (path, from_d, root_asked) in rows {
+        let at = Escaped(path);
+        let (root, other) = (asks(&fs), asks(&mounted));
+        let start = from_d.then_some(&d);
+        assert_eq!(open_inode(env.as_ref(), start, path, creat, 0o644, 0).unwrap_err(), VfsError::IsDir, "{at}");
+        assert_eq!(root.load(Ordering::Acquire), root_asked, "root filesystem asked for `..` by {at}");
+        assert!(!other.load(Ordering::Acquire), "mounted filesystem asked for `..` by {at}");
+        fs.inner.hooks.lock().unwrap().pre_lookup.clear();
+        mounted.inner.hooks.lock().unwrap().pre_lookup.clear();
+    }
+}
+
 /// The lines of `src` (Rust source) that get a `Final` other than as a
 /// `match`'s scrutinee, or use a `Final::` pattern other than as a match
 /// arm, `//` comment lines skipped. Rustc's exhaustiveness check and
