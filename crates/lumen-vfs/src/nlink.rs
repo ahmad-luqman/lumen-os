@@ -102,11 +102,36 @@ impl NlinkBounds {
         self.bounds.insert(ino, pin) != Some(pin)
     }
 
+    /// A raise of `ino`'s count on disk to at least `min` (entries that may
+    /// exist call for it, so a count below it frees an inode still named):
+    /// `landed`, or failed with the disk then reading `disk`. Either way a
+    /// ceiling below `min` goes, since [`Self::apply`] would cap the count
+    /// under it; then a landed raise drops the floor ([`Self::clear_floor`])
+    /// and a failed one keeps at least `min` ([`Self::raise_floor`], nothing
+    /// when the disk holds it). Whether the floor kept changed.
+    pub fn raised_to(&mut self, ino: u32, min: u32, landed: bool, disk: Option<u32>) -> bool {
+        if let Some(bound) = self.bounds.get_mut(&ino)
+            && bound.ceiling.is_some_and(|c| c < min)
+        {
+            bound.ceiling = None;
+            if bound.is_trivial() {
+                self.bounds.remove(&ino);
+            }
+        }
+        if landed {
+            self.clear_floor(ino);
+            false
+        } else {
+            self.raise_floor(ino, disk, min)
+        }
+    }
+
     /// Drop `ino`'s floor, keeping a ceiling: even one below the floor
     /// that just landed on disk, which [`Self::apply`] then still caps to
     /// (unlike [`Self::raise_floor`], which drops such a ceiling). As the
-    /// two maps this replaced did. The kernel's floors come from counts
-    /// with the bounds applied, so none is known to land above a ceiling.
+    /// two maps this replaced did. A floor that may land above a ceiling
+    /// (a raise for entries that may exist, one past the count with the
+    /// bounds applied) goes through [`Self::raised_to`] instead.
     pub fn clear_floor(&mut self, ino: u32) {
         if let Some(bound) = self.bounds.get_mut(&ino) {
             bound.floor = 0;
@@ -191,6 +216,33 @@ mod tests {
         assert!(b.raise_floor(1, None, 4));
         b.clear_floor(1);
         assert!(b.bounds.is_empty()); // nothing trivial is kept
+    }
+
+    #[test]
+    fn a_raise_drops_a_ceiling_below_it_whether_it_landed_or_not() {
+        // A stale pin at 2 under a raise to 3 (#322: a source that may be at
+        // both names): landed, nothing is kept and the disk's 3 stands.
+        let mut b = NlinkBounds::new();
+        assert!(b.reconcile(1, None, 2));
+        assert!(!b.raised_to(1, 3, true, None));
+        assert_eq!((b.apply(1, 3), b.floor(1), b.ceiling(1)), (3, 0, None));
+        assert!(b.bounds.is_empty());
+        // Failed, with the disk reading 3 anyway (`raise_floor` keeps no
+        // floor then): the pin still goes, so the count isn't capped at 2.
+        assert!(b.reconcile(1, None, 2));
+        assert!(!b.raised_to(1, 3, false, Some(3)));
+        assert_eq!((b.apply(1, 3), b.ceiling(1)), (3, None));
+        // Failed, the disk unreadable or low: a floor of 3, no ceiling.
+        assert!(b.reconcile(1, None, 2));
+        assert!(b.raised_to(1, 3, false, None));
+        assert_eq!((b.floor(1), b.ceiling(1), b.apply(1, 1)), (3, None, 3));
+        // A ceiling at or above the raise stays.
+        assert!(b.reconcile(2, None, 3));
+        assert!(!b.raised_to(2, 2, true, None));
+        assert_eq!((b.floor(2), b.ceiling(2)), (0, Some(3)));
+        assert!(b.reconcile(3, None, 3));
+        assert!(!b.raised_to(3, 3, false, None)); // the floor was 3 already
+        assert_eq!((b.floor(3), b.ceiling(3)), (3, Some(3)));
     }
 
     #[test]
