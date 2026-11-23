@@ -906,11 +906,12 @@ impl Going {
 /// a window's or a virtual terminal's output may never show before the
 /// machine goes) and a line on the console, and the command goes on anyway.
 /// What was written before the failure is on the disk; what wasn't (the
-/// block cache's write-back stops at its first failed block) stays lost
-/// either way, since nothing in the kernel can repair the disk, and
-/// refusing would only keep the machine up with it in memory. Whoever
-/// wants to know first runs `sync`, which says the same failure without
-/// going anywhere.
+/// block cache's write-back stops at its first failed block) is lost.
+/// Staying up would save it only if the failure passes (a failed block
+/// stays dirty for the next sync, #331), and whoever suspects that runs
+/// `sync` first, as often as they like, which says the same failure
+/// without going anywhere; refusing would make a disk that keeps failing
+/// keep the machine from going down at all.
 fn sync_then_announce(ctx: &mut Ctx<'_>, going: Going, sync: impl FnOnce() -> Result<(), lumen_vfs::VfsError>) {
     let (command, doing) = (going.command(), going.doing());
     if let Err(e) = sync() {

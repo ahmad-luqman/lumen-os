@@ -4774,6 +4774,28 @@ pub(crate) mod ktest_util {
     /// set it, which disarms the others; any of them may land on the device
     /// and still fail, `failed_writes_land`), every read or write, syncs, or
     /// reads of a range (after some of them passed).
+    ///
+    /// A failed write, `ext4plus`'s through `BcacheIo::write` or one of the
+    /// adapter's raw `write_at`s, fails at once with `Err(Io)` (before the
+    /// block cache, unless `failed_writes_land`), and is never retried here
+    /// (#331). Two things make it unlike a real device's error:
+    /// - Under the real [`BlockCache`] a `write_at` only dirties a cached
+    ///   block; the device's error comes later, from `sync` or from the
+    ///   eviction that writes the block back (to whichever `read_at` or
+    ///   `write_at` missed and needed its slot). Besides its `ReadOnly` and
+    ///   `OutOfRange` refusals, a `write_at` fails at once only on a miss
+    ///   (a failed eviction of another block, a failed
+    ///   pre-read, every slot pinned) or on a block pinned at that moment.
+    ///   Here any write fails by its number, a cache hit as well, so the
+    ///   faults reach steps the real path can fail only under cache
+    ///   pressure.
+    /// - What the operation then reports is partly `ext4plus`'s doing: it
+    ///   retries a failed range free block by block and a failed allocation
+    ///   one block shorter, so a failed write can come back as `Ok` or as
+    ///   `NoSpc`, with counts or bits left wrong (ARCHITECTURE section 9,
+    ///   "Write errors an operation doesn't see";
+    ///   `ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`,
+    ///   `ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc`).
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         pub(in crate::vfs) dev: MemBlkDev,
@@ -4910,6 +4932,7 @@ pub(crate) mod ktest_util {
             self.fail_reads.store(false, Ordering::Release);
             self.fail_writes.store(false, Ordering::Release);
             self.fail_syncs.store(false, Ordering::Release);
+            self.dev.fail_device_writes(false);
             self.fail_range_reads.store(0, Ordering::Release);
             self.zero_after_write_fault.store(false, Ordering::Release);
             self.zeroing.store(false, Ordering::Release);
@@ -5046,7 +5069,7 @@ pub(crate) mod ktest_util {
     impl FaultCache {
         /// The device's bytes as they are, under the block cache.
         pub fn dev_bytes(&self) -> Vec<u8> {
-            self.dev.0.data.lock().clone()
+            self.dev.bytes()
         }
     }
 
@@ -5089,6 +5112,30 @@ pub(crate) mod ktest_util {
         let inner = fs.shared.state.lock();
         let block = inner.layout.group_block(&inner.bcache, 0, super::BG_BLOCK_BITMAP).map_err(|_| "descriptor")?;
         inner.layout.block_byte(block).map_err(|_| "bitmap block")
+    }
+
+    /// [`counts_4k`]: an image's block accounting, as stored.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Counts {
+        /// The bits set in the block bitmap.
+        pub bits: u32,
+        /// The superblock's free-block count.
+        pub sb: u64,
+        /// Group 0's free-block count.
+        pub bg: u64,
+    }
+
+    /// On an image of `build_minimal_ext4_image_blocks` (4 KiB blocks, one
+    /// group, the superblock at 1024, 64-byte descriptors in block 1), with
+    /// its block bitmap at byte `bitmap`: its [`Counts`].
+    pub fn counts_4k(img: &[u8], bitmap: u64) -> Counts {
+        let u16_at = |at: usize| u64::from(u16::from_le_bytes([img[at], img[at + 1]]));
+        let u32_at = |at: usize| u64::from(u32::from_le_bytes([img[at], img[at + 1], img[at + 2], img[at + 3]]));
+        let bitmap = bitmap as usize; // a block of a 1 MiB image
+        let bits = img[bitmap..bitmap + 4096].iter().map(|b| b.count_ones()).sum();
+        let sb = u32_at(1024 + 0x0c) | (u32_at(1024 + 0x158) << 32);
+        let bg = u16_at(4096 + 0x0c) | (u16_at(4096 + 0x2c) << 16);
+        Counts { bits, sb, bg }
     }
 
     /// Inode `ino`'s `(i_mode, i_links_count)` as stored, read raw (a zeroed
@@ -6124,6 +6171,229 @@ crate::ktest!(
         kassert_eq!(a4.reclaim_clean_pages(16), 0); // still dirty
         kassert_eq!(b4.reclaim_clean_pages(16), 1); // written anyway
         kassert!(m.cache.dev.0.flushed.load(O::Acquire)); // and the device flushed
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next() {
+        // The real write path, no `FaultCache` (#331): a `BlockCache` over a
+        // device whose writes fail. The block cache writes back, so an
+        // `unlink`'s writes land in it and the unlink returns `Ok`; the
+        // device's error comes back from the next file `fsync` and
+        // `fdatasync` and the filesystem's `sync`, nothing reaches the
+        // device, the blocks stay dirty, and once the device works a sync
+        // writes them all: a fresh mount of the device sees the unlink and
+        // the rewritten file's data.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let dev = crate::vfs::MemBlkDev::new(crate::vfs::build_minimal_ext4_image_blocks(256), false);
+        let bcache = Arc::new(SleepMutex::new(BlockCache::new(dev.clone(), 64).map_err(|_| "bcache")?));
+        let backend: SharedBlockCache = bcache.clone();
+        let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, 272), false).map_err(|_| "mount")?;
+        let root = fs.root_inode();
+        let f = root.create(b"f", 0o644).map_err(|_| "create f")?;
+        kassert_eq!(f.write_at(0, &pattern(2 * PAGE_SIZE, 3)).map_err(|_| "write f")?, 2 * PAGE_SIZE);
+        let g = root.create(b"g", 0o644).map_err(|_| "create g")?;
+        kassert_eq!(g.write_at(0, &pattern(PAGE_SIZE, 4)).map_err(|_| "write g")?, PAGE_SIZE);
+        fs.sync().map_err(|_| "first sync")?;
+        drop(f);
+        let on_disk = dev.bytes();
+
+        dev.fail_device_writes(true);
+        root.unlink(b"f").map_err(|_| "unlink f")?; // in the block cache only
+        let data = pattern(PAGE_SIZE, 5);
+        kassert_eq!(g.write_at(0, &data).map_err(|_| "rewrite g")?, PAGE_SIZE);
+        kassert_eq!(g.sync(false), Err(VfsError::Io));
+        kassert_eq!(g.sync(true), Err(VfsError::Io)); // the same streak: no second warning
+        kassert_eq!(fs.sync(), Err(VfsError::Io));
+        kassert!(bcache.lock().stats().dirty > 0);
+        kassert!(dev.bytes() == on_disk);
+
+        dev.fail_device_writes(false);
+        fs.sync().map_err(|_| "sync once the device works")?;
+        kassert_eq!(bcache.lock().stats().dirty, 0);
+        let ro = mount_ro_image(dev.bytes(), 273)?;
+        kassert!(matches!(ro.root_inode().lookup(b"f"), Err(VfsError::NoEnt)));
+        kassert_eq!(read_all(&ro.root_inode().lookup(b"g").map_err(|_| "ro lookup g")?)?, data);
+        kassert_eq!(free_blocks(&ro), free_blocks(&fs));
+        kassert_eq!(free_inodes(&ro), free_inodes(&fs));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried() {
+        // #331: `ext4plus` 0.1.0-rc.2 frees a file's extent with `free_blocks`
+        // and, if that fails, frees the same blocks again one at a time
+        // (`file_blocks/utils.rs`, `free_freed_ranges`), so a failed write
+        // inside the range free is absorbed: the unlink returns `Ok`. Each
+        // count is raised in memory just before it is written and never put
+        // back, so a failure at or after the descriptor write carrying the
+        // raised group count doubles the group's count, and a failed
+        // superblock write doubles the superblock's as well: that count rises
+        // by 4 on disk for `f`'s 2 blocks.
+        // `f` is 2 blocks of one extent (4 KiB blocks, one group); each write
+        // of the unlink fails in turn. Pinned exactly, so that neither an
+        // `ext4plus` bump nor a Lumen change absorbing a write elsewhere goes
+        // unseen: the range free's 5 writes (2 bitmap bytes, the descriptor
+        // twice, the superblock) are absorbed, one contiguous run, and every
+        // other failed write returns `Io`; the group's count doubles at the
+        // last 2 of them, the superblock's at the last. #349 turns these into
+        // errors (no write lands after the first failure) and changes this.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let setup = {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 274)?;
+            let f = m.root.create(b"f", 0o644).map_err(|_| "create f")?;
+            kassert_eq!(f.write_at(0, &pattern(2 * PAGE_SIZE, 6)).map_err(|_| "write f")?, 2 * PAGE_SIZE);
+            m.fs.sync().map_err(|_| "sync")?;
+            drop(f);
+            image(&m)?
+        };
+        let (total, bitmap) = {
+            let m = mount(setup.clone(), 274)?;
+            m.cache.arm_write(0);
+            m.root.unlink(b"f").map_err(|_| "unlink without a fault")?;
+            (m.cache.writes.load(O::Acquire), block_bitmap_offset(&m.fs)?)
+        };
+        let Counts { bits: bits0, sb: sb0, bg: bg0 } = counts_4k(&setup, bitmap);
+        let (mut absorbed, mut sb_twice, mut bg_twice) = (Vec::new(), Vec::new(), Vec::new());
+        for k in 1..=total {
+            let m = mount(setup.clone(), 274)?;
+            m.cache.arm_write(k);
+            let res = m.root.unlink(b"f");
+            kassert!(m.cache.writes.load(O::Acquire) >= k); // write k was made, and failed
+            m.cache.clear();
+            if res.is_err() {
+                kassert_eq!(res, Err(VfsError::Io));
+                continue;
+            }
+            // The unlink returned Ok: `f` is gone, its 2 blocks free in the
+            // bitmap, and neither count is below what was freed.
+            absorbed.push(k);
+            let img = image(&m)?;
+            let Counts { bits, sb, bg } = counts_4k(&img, bitmap);
+            kassert_eq!(bits + 2, bits0);
+            kassert!(sb >= sb0 + 2 && bg >= bg0 + 2);
+            if sb == sb0 + 4 {
+                sb_twice.push(k);
+            }
+            if bg == bg0 + 4 {
+                bg_twice.push(k);
+            }
+            let ro = mount_ro_image(img, 275)?;
+            kassert!(matches!(ro.root_inode().lookup(b"f"), Err(VfsError::NoEnt)));
+        }
+        crate::ktest::diag(format_args!(
+            "{total} writes: absorbed {absorbed:?}, the superblock's count raised twice at {sb_twice:?}, the group's \
+             at {bg_twice:?}"
+        ));
+        kassert_eq!(absorbed.len(), 5);
+        let (first, last) = (absorbed[0], absorbed[4]);
+        kassert!(first > 1 && last < total);
+        kassert_eq!(absorbed, (first..=last).collect::<Vec<_>>());
+        kassert_eq!(bg_twice, alloc::vec![last - 1, last]);
+        kassert_eq!(sb_twice, alloc::vec![last]);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc() {
+        // #331 review: `ext4plus` 0.1.0-rc.2's `Extent::allocate`
+        // (`extent.rs`) retries any failed `alloc_contiguous_blocks(n)` with
+        // one block fewer and gives `NoSpace` at 0. On 4 KiB blocks a page's
+        // writeback asks for 1 block, so nothing is retried and a failed
+        // write among the allocation's comes back as `NoSpc`, not `Io`. The
+        // allocation writes the bitmap byte, the descriptor's checksum, then
+        // lowers the group's count in memory and writes it, then the
+        // superblock's; nothing is put back. So once the bit has landed it
+        // leaks (no extent owns it), and:
+        // - the checksum write failing (k=2) never lowers either count: both
+        //   stay one above the bitmap for good (until e2fsck), every later
+        //   descriptor and superblock write storing them so: #350's hang,
+        //   once the group fills;
+        // - the count's write failing (k=3) lowers the group's count in
+        //   memory (the next descriptor write stores it), not the
+        //   superblock's, which stays one above for good;
+        // - the superblock write failing (k=4) is put right by the next one.
+        // Each write of one page's write into a hole of `f` fails in turn;
+        // a failure after the allocation is `Io`. Then the page's next
+        // writeback, on a new block, stores every count from memory, and
+        // what is on disk is pinned per k. `write_page` repeats what
+        // `write_back_page` does (`ext4_write_all`, `map_ext4_err`) rather
+        // than calling it, to leave out its warning; it pins `ext4plus`, not
+        // Lumen's writeback. #349 (no write after the first failure) will
+        // change this.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let setup = {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 276)?;
+            m.root.create(b"f", 0o644).map_err(|_| "create f")?;
+            m.fs.sync().map_err(|_| "sync")?;
+            image(&m)?
+        };
+        let page = pattern(PAGE_SIZE, 8);
+        /// One page written at 0 into `f`'s hole, as writeback does it.
+        fn write_page(m: &Mnt, page: &[u8]) -> Result<(), VfsError> {
+            let f = m.root.lookup(b"f")?;
+            let ino = NonZeroU32::new(u32::try_from(f.ino()).map_err(|_| VfsError::Inval)?).ok_or(VfsError::Inval)?;
+            let inner = m.fs.shared.state.lock();
+            let mut disk = Inode::read(&inner.ext4, ino).map_err(map_ext4_err)?;
+            ext4_write_all(&inner.ext4, &mut disk, page, 0).map_err(map_ext4_err)
+        }
+        let (total, bitmap) = {
+            let m = mount(setup.clone(), 276)?;
+            m.cache.arm_write(0);
+            write_page(&m, &page).map_err(|_| "write without a fault")?;
+            (m.cache.writes.load(O::Acquire), block_bitmap_offset(&m.fs)?)
+        };
+        let c0 = counts_4k(&setup, bitmap);
+        let (mut nospc, mut leaked, mut above, mut after) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for k in 1..=total {
+            let m = mount(setup.clone(), 276)?;
+            m.cache.arm_write(k);
+            let res = write_page(&m, &page);
+            kassert!(m.cache.writes.load(O::Acquire) >= k); // write k was made, and failed
+            m.cache.clear();
+            match res {
+                Err(VfsError::NoSpc) => nospc.push(k),
+                other => {
+                    kassert_eq!(other, Err(VfsError::Io));
+                    continue;
+                }
+            }
+            let c = counts_4k(&image(&m)?, bitmap);
+            kassert!(c.sb <= c0.sb && c.bg <= c0.bg && c.bits <= c0.bits + 1);
+            let leaked_now = c.bits == c0.bits + 1;
+            if leaked_now {
+                leaked.push(k);
+                if c.bg == c0.bg {
+                    above.push(k); // the bit taken, the group's count on disk not lowered
+                }
+            }
+            // The page's next writeback works, on a new block, and stores
+            // every count from memory: bits taken, and each count lowered.
+            write_page(&m, &page).map_err(|_| "write again")?;
+            let c = counts_4k(&image(&m)?, bitmap);
+            kassert_eq!(c.bits, c0.bits + if leaked_now { 2 } else { 1 });
+            after.push((k, c.bits - c0.bits, c0.bg - c.bg, c0.sb - c.sb));
+        }
+        crate::ktest::diag(format_args!(
+            "{total} writes: NoSpc at {nospc:?}, a bit leaked at {leaked:?}, the group's count above its bitmap at \
+             {above:?}; after the next writeback (k, bits taken, group and superblock counts lowered): {after:?}"
+        ));
+        kassert_eq!(nospc, alloc::vec![1, 2, 3, 4]);
+        kassert_eq!(leaked, alloc::vec![2, 3, 4]);
+        kassert_eq!(above, alloc::vec![2, 3]);
+        // k=1 clean; k=2 both counts one above for good; k=3 the
+        // superblock's one above for good; k=4 put right.
+        kassert_eq!(after, alloc::vec![(1, 1, 1, 1), (2, 2, 1, 1), (3, 2, 2, 1), (4, 2, 2, 2)]);
         Ok(())
     }
 );

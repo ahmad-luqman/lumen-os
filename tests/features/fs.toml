@@ -318,6 +318,14 @@ tests = [
 ]
 
 [[feature]]
+name = "ext4plus 0.1.0-rc.2's write-error retries pinned (#331), every run of each sweep checked: a write failing inside freeing a file's block range is retried block by block, so the unlink returns Ok after exactly the range free's 5 failed writes (every other failed write giving EIO), the file gone and its blocks free in the bitmap, the group's free count raised twice by a failure at or after the descriptor write carrying it and the superblock's too by a failed superblock write; and a write failing in a page's block allocation on 4 KiB blocks comes back as ENOSPC, not EIO, leaving the bit it set owned by no extent, both counts one above the bitmap for good when the descriptor's checksum write failed, the superblock's when the count's write failed, and nothing wrong when the superblock write failed (each checked after the next writeback). An ext4plus bump that changes either fails the pin; #349 (no write after the first failure) will change both"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried",
+    "ktest:lumen_kernel::vfs::ext4::ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc",
+]
+
+[[feature]]
 name = "`reboot` and `shutdown` sync every filesystem before the machine goes (#352): on the ext4 rootfs, a new directory with a file and a multi-page file in it, and an existing file rewritten, all without `sync` and checked not yet on the disk image, are on it after `reboot` (read back in the same QEMU) and after `shutdown` (read back by a second QEMU), and the image passes e2fsck after each; a failed sync is a `power` warning on serial and one line on the console (`<command>: sync failed: <error> (the log says what failed); <restarting|powering off> anyway`) before the usual announcement, the sync run once (a ktest over a failing sync, not a failing disk)"
 milestone = "M7"
 tests = [
