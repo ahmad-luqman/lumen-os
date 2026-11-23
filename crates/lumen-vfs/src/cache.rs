@@ -70,11 +70,6 @@ impl Released {
         debug_assert!(self.0.is_none(), "one InodeCache call per Released");
         self.0 = Some(inode);
     }
-
-    /// Whether a call let go of an `Arc`.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_none()
-    }
 }
 
 /// Active inode cache keyed by `(DevId, Ino)`.

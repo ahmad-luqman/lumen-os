@@ -5273,38 +5273,49 @@ fn stale_cache_entries_dropped_after_releasing_lock9() {
         assert!(reuser.as_ref().is_none_or(|r| r.ino() == ino), "number not reused");
         (ino, reuser)
     };
-    let check = |what: &str, reuse: bool, probe: &dyn Fn(Ino, Option<Arc<dyn VfsInode>>)| {
+    // Each probe gives back the inode it was handed (inserted, or refused
+    // as `Err`), kept until after the count: the one drop counted is the
+    // stale entry's.
+    type Kept = Option<Arc<dyn VfsInode>>;
+    let check = |what: &str, reuse: bool, probe: &dyn Fn(Ino, Kept) -> Kept| {
         let (ino, reuser) = stale(reuse);
         let (drops, under) = handle_drop_counts(&root_fs.inner);
-        probe(ino, reuser);
+        let kept = probe(ino, reuser);
         let (drops_after, under_after) = handle_drop_counts(&root_fs.inner);
-        assert!(drops_after > drops, "{what}: the stale entry wasn't evicted");
+        assert_eq!(drops_after - drops, 1, "{what}: the stale entry wasn't evicted");
         assert_eq!(under_after, under, "{what}: the stale entry was dropped under Lock 9");
+        assert_eq!(kept.is_some(), reuse, "{what}: the handed inode not given back");
     };
     check("inode_get_if_fresh", false, &|ino, _| {
         assert!(env.inode_get_if_fresh(rdev, ino, env.cache_gens().1).is_none());
+        None
     });
     check("inode_end_removal", false, &|ino, _| {
         env.inode_end_removal(rdev, ino);
+        None
     });
-    check("inode_evict_detached", false, &|ino, _| assert!(env.inode_evict_detached(rdev, ino)));
+    check("inode_evict_detached", false, &|ino, _| {
+        assert!(env.inode_evict_detached(rdev, ino));
+        None
+    });
     check("inode_record_removal_if_absent", false, &|ino, _| {
         assert!(env.inode_record_removal_if_absent(rdev, ino).is_ok());
+        None
     });
-    check("inode_get_or_insert", true, &|_, r| drop(env.inode_get_or_insert(r.unwrap())));
+    check("inode_get_or_insert", true, &|_, r| Some(env.inode_get_or_insert(r.unwrap())));
     check("inode_get_or_insert_if_mounted", true, &|_, r| {
-        assert!(env.inode_get_or_insert_if_mounted(mp_dev, mp_ino, mount_id, r.unwrap()).is_some());
+        env.inode_get_or_insert_if_mounted(mp_dev, mp_ino, mount_id, r.unwrap())
     });
     check("inode_get_or_insert_if_fresh", true, &|_, r| {
-        assert!(env.inode_get_or_insert_if_fresh(r.unwrap(), env.cache_gens().1).is_err());
+        env.inode_get_or_insert_if_fresh(r.unwrap(), env.cache_gens().1).err()
     });
     check("publish_lookup_inode", true, &|_, r| {
         let (dentry_gen, inode_gen) = env.cache_gens();
-        assert!(env.publish_lookup_inode(rdev, rino, b"x", r.unwrap(), dentry_gen, inode_gen).is_err());
+        env.publish_lookup_inode(rdev, rino, b"x", r.unwrap(), dentry_gen, inode_gen).err()
     });
     check("publish_created_inode", true, &|_, r| {
         let (dentry_gen, inode_gen) = env.cache_gens();
-        assert!(env.publish_created_inode(rdev, rino, b"x", r.unwrap(), dentry_gen, inode_gen).is_err());
+        env.publish_created_inode(rdev, rino, b"x", r.unwrap(), dentry_gen, inode_gen).err()
     });
 }
 

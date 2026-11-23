@@ -37,6 +37,8 @@ pub struct Unmounted {
     pub fs: Arc<dyn FileSystem>,
     /// The directory it was mounted on.
     pub mountpoint: Option<Arc<dyn VfsInode>>,
+    /// The path it was mounted at.
+    pub path: String,
 }
 
 struct MountRecord {
@@ -158,7 +160,7 @@ impl MountTable {
         }
         let rec = self.mounts.remove(&mp_key).ok_or(VfsError::Inval)?;
         self.dev_to_mp.remove(&mounted_dev);
-        Ok(Unmounted { fs: rec.fs, mountpoint: rec.parent_mountpoint })
+        Ok(Unmounted { fs: rec.fs, mountpoint: rec.parent_mountpoint, path: rec.mount_path })
     }
 
     /// Return the global root filesystem, if mounted.
@@ -464,22 +466,24 @@ impl<F: LockFamily> VfsTables<F> {
 
     /// Unmount the filesystem mounted on `(mountpoint_dev, mountpoint_ino)`
     /// and purge its entries from `DentryCache` and `InodeCache`, dropping
-    /// the evicted inodes and the mountpoint after the locks are released
-    /// (#320: the mount's reference to its mountpoint may be the last).
+    /// the evicted inodes and the rest of the mount (its mountpoint and path)
+    /// after the locks are released (#320: the mount's reference to its
+    /// mountpoint may be the last).
     pub fn umount(&self, mountpoint_dev: DevId, mountpoint_ino: Ino) -> Result<Arc<dyn FileSystem>, VfsError> {
-        let (fs, mountpoint, evicted) = {
+        let (unmounted, evicted) = {
             let mut mounts = self.mounts.lock();
             let mut dentries = self.dentries.lock();
             let mut inodes = self.inodes.lock();
-            let Unmounted { fs, mountpoint } = mounts.umount(mountpoint_dev, mountpoint_ino)?;
-            let dev = fs.dev_id();
+            let unmounted = mounts.umount(mountpoint_dev, mountpoint_ino)?;
+            let dev = unmounted.fs.dev_id();
             dentries.invalidate_fs(dev);
             dentries.invalidate_dir(mountpoint_dev, mountpoint_ino);
             let evicted = inodes.evict_fs(dev);
-            (fs, mountpoint, evicted)
+            (unmounted, evicted)
         };
         drop(evicted);
-        drop(mountpoint);
+        let Unmounted { fs, mountpoint, path } = unmounted;
+        drop((mountpoint, path));
         Ok(fs)
     }
 
