@@ -327,7 +327,9 @@ def test_posix_vfs_semantics(boot, tmp_path):
     gets every check: symlinks and ELOOP (a loop, 40 links followed and 41
     not, O_NOFOLLOW), a trailing slash following a final symlink under
     O_NOFOLLOW, O_PATH descriptors, hard links and linkat's
-    AT_SYMLINK_FOLLOW, unlink and rmdir while open, getdents64 (types,
+    AT_SYMLINK_FOLLOW, unlink and rmdir while open (#318: `..` from the
+    removed directory as cwd is its parent: chdir, getcwd after it, open
+    O_DIRECTORY, and O_CREAT's EISDIR), getdents64 (types,
     d_ino, a small buffer's cursor, a moved directory's ".."), names that
     aren't UTF-8 (#268: a file, a directory and a symlink target made,
     listed, renamed, hard-linked, read back by getcwd and /proc/self/fd, and
