@@ -240,21 +240,28 @@ VFS_SWEEP_LINES = (
     ),
     # An unlink or rmdir whose directory couldn't be read back after
     # `delete_file` had begun freeing the inode's blocks, not yet zeroing it:
-    # forgotten, not kept live (#330; the unlink and rmdir fault sweeps).
-    (
-        rf"ERROR vfs: ext4 {_DEV} directory \d+: inode \d+ lost its entry and its blocks were being freed "
-        r"\(block \d+ is free\) when the (unlink|rmdir) failed, the directory unreadable; forgetting it; run e2fsck"
+    # forgotten, not kept live (#330; the unlink and rmdir fault sweeps), one
+    # family per op, so each must name its own.
+    *(
+        (
+            rf"ERROR vfs: ext4 {_DEV} directory \d+: inode \d+ lost its entry and its blocks were being freed "
+            rf"\(block \d+ is free\) when the {op} failed, the directory unreadable; forgetting it; run e2fsck"
+        )
+        for op in ("unlink", "rmdir")
     ),
     # One whose directory couldn't be read back and whose entry's and
     # blocks' state couldn't be told from its inode either (the inode, its
     # map or its bitmap byte unreadable, or a linked one reading corrupt):
     # kept live, saying so and why (the unlink and rmdir sweeps' legs with
     # the block bitmap unreadable, the corrupt-inode ktest, and the unlinks
-    # with every read failing).
-    (
-        rf"ERROR vfs: ext4 {_DEV} directory \d+: (unlink|rmdir) of inode \d+ failed, the directory unreadable, "
-        r"and whether its entry went and its blocks were freed can't be told \(.+\); keeping it live, so writes "
-        r"through it may reach another file if they were; run e2fsck"
+    # with every read failing), one family per op.
+    *(
+        (
+            rf"ERROR vfs: ext4 {_DEV} directory \d+: {op} of inode \d+ failed, the directory unreadable, "
+            r"and whether its entry went and its blocks were freed can't be told \(.+\); keeping it live, so "
+            r"writes through it may reach another file if they were; run e2fsck"
+        )
+        for op in ("unlink", "rmdir")
     ),
     # A rename's target put back after a failed move, the put-back failing
     # too (ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated).

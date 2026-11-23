@@ -368,14 +368,13 @@ impl Ext4DiskLayout {
 
     /// Whether `bit` is clear in its group's block bitmap (its block free),
     /// as `ext4plus`'s allocator would read it (through the block cache).
-    /// `Inval` for a bitmap block outside the volume.
-    fn bit_is_clear(&self, bcache: &SharedBlockCache, bit: BitmapBit) -> Result<bool, VfsError> {
-        let bitmap = self.group_block(bcache, bit.group, BG_BLOCK_BITMAP)?;
+    fn bit_is_clear(&self, bcache: &SharedBlockCache, bit: BitmapBit) -> Result<bool, BitmapFault> {
+        let bitmap = self.group_block(bcache, bit.group, BG_BLOCK_BITMAP).map_err(BitmapFault::Read)?;
         // `bit.byte` is below the block size: `Geometry`'s groups fit their
         // bitmaps.
-        let off = self.block_byte(bitmap)? + u64::from(bit.byte);
+        let off = self.block_byte(bitmap).map_err(|_| BitmapFault::Outside(bitmap))? + u64::from(bit.byte);
         let mut bits = [0u8; 1];
-        bcache.read_at(off, &mut bits).map_err(|e| map_block_error(&e))?;
+        bcache.read_at(off, &mut bits).map_err(|e| BitmapFault::Read(map_block_error(&e)))?;
         Ok(bits[0] & bit.mask == 0)
     }
 
@@ -3312,12 +3311,22 @@ enum Undecided {
     NoBit(u64),
     /// Its first block's group descriptor or bitmap byte doesn't read back,
     /// or the descriptor names a bitmap block outside the volume.
-    Bitmap { block: u64, err: VfsError },
+    Bitmap { block: u64, fault: BitmapFault },
+}
+
+/// Why [`Ext4DiskLayout::bit_is_clear`] couldn't read a bit: the group
+/// descriptor names a bitmap block outside the volume (it is corrupt), or a
+/// read failed.
+#[derive(Debug)]
+enum BitmapFault {
+    Outside(u64),
+    Read(VfsError),
 }
 
 impl core::fmt::Display for Undecided {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Inode(Ext4Error::Corrupt(c)) => write!(f, "the inode reads back corrupt: {c:?}"),
             Self::Inode(e) => write!(f, "the inode doesn't read back: {e:?}"),
             Self::IBlock(e) => write!(f, "its i_block doesn't read back: {e:?}"),
             Self::Map(BlockMapError::Read(MapBlock::Outside(b))) => {
@@ -3331,7 +3340,12 @@ impl core::fmt::Display for Undecided {
                 write!(f, "its map has more than {} blocks before its first data block", lumen_vfs::ext4::MAP_READS_MAX)
             }
             Self::NoBit(b) => write!(f, "its first block {b} is outside the volume's groups"),
-            Self::Bitmap { block, err } => write!(f, "block {block}'s bitmap bit can't be read: {err:?}"),
+            Self::Bitmap { block, fault: BitmapFault::Outside(b) } => {
+                write!(f, "block {block}'s group descriptor names bitmap block {b}, outside the volume")
+            }
+            Self::Bitmap { block, fault: BitmapFault::Read(e) } => {
+                write!(f, "block {block}'s bitmap bit doesn't read back: {e:?}")
+            }
         }
     }
 }
@@ -3392,7 +3406,7 @@ fn child_after_failed_unlink(inner: &Ext4FsInner, ino: NonZeroU32, last_link: bo
     match inner.layout.bit_is_clear(&inner.bcache, bit) {
         Ok(true) => ChildReadBack::BlocksFreed(block),
         Ok(false) => ChildReadBack::Allocated,
-        Err(err) => ChildReadBack::Unreadable(Undecided::Bitmap { block, err }),
+        Err(fault) => ChildReadBack::Unreadable(Undecided::Bitmap { block, fault }),
     }
 }
 

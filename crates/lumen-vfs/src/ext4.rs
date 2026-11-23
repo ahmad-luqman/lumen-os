@@ -744,7 +744,9 @@ mod tests {
         put(0x18, log);
         put(0x20, per_group);
         put(0x24, per_group / 2 + 1);
-        put(0x60, if is_64bit { 0x80 } else { 0 });
+        // Incompat flex_bg (0x200, mke2fs's default; bigalloc's value in
+        // ro_compat), so a parse reading bigalloc from incompat shows.
+        put(0x60, 0x200 | if is_64bit { 0x80 } else { 0 });
         put(0x150, (count >> 32) as u32);
         sb
     }
@@ -831,6 +833,9 @@ mod tests {
             Geometry::from_superblock(&bigalloc(2, 1 << 20, 0, 32768)),
             Err(BlocksPerGroup { value: 0, .. })
         ));
+        // The first data block on the volume there too.
+        let first = Geometry::from_superblock(&bigalloc(2, 0, 524_288, 32768));
+        assert_eq!(first, Err(FirstDataBlock { first: 0, count: 0 }));
         // Each refusal names its field and value.
         let says = |e: GeometryError| alloc::format!("{e}");
         assert_eq!(says(BlocksPerGroup { value: 8193, max: 8192 }), "s_blocks_per_group 8193 not in 1..=8192");
