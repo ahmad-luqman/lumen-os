@@ -369,8 +369,9 @@ one is its own PR that updates that doc first.
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
   64 MiB hard cap, one check, `admit_unreclaimable`, for a dirty or mapped
-  page, `QuotaCounter`, the detached-inode quota; `read_into`/`write_from`/
-  `resize`/`map_page`, the page I/O ext4 and tmpfs share, #264; `mmap_page`,
+  page, `QuotaCounter` (bytes; a leak logged when dropped), the detached-inode
+  quota; `read_into`/`write_from`/`resize`/`map_page`, the page I/O ext4 and
+  tmpfs share, #264; `mmap_page`,
   re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
   for a mapping, through `VfsInode::as_any`, and `MappedPage::copy_to_frame` (under the cache lock)
   for copy-on-write, #255; `WritableMap`, the guard counting a writable
@@ -395,7 +396,9 @@ one is its own PR that updates that doc first.
   share: `FaultCache` (writes failed by number, pair or from one on,
   reads by range or after a write fault), `Mnt`, `mount`, `remount_ro`,
   `set_clock`, the ktests' clock, `Ext4Shared::now`);
-  `vfs/tmpfs.rs`,
+  `vfs/tmpfs.rs` (its quota charging inodes, directory entries and symlink
+  targets besides pages, #267: `charge`, the cost model, `InodeCharge`,
+  `EntryCharge` and `Children`, the only code reserving or giving one back),
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
   `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from

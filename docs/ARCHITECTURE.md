@@ -6087,7 +6087,26 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   work identically to `ext4`, directories, symlinks, hard links, native
   unlink-while-open via `Arc`, `renameat2`, `chmod`/`chown`/`utimensat`),
   bounded by a configurable memory quota (default 32 MiB in M7, returning
-  `-ENOSPC` instead of exhausting kernel frames).
+  `-ENOSPC` instead of exhausting kernel frames or heap). The quota, counted
+  in bytes (`QuotaCounter`), pays for the data pages and, since #267, for
+  each inode but the root (`tmpfs::charge::INODE_COST`: the inode as
+  allocated; a directory's two maps' root nodes, `charge::DIR_COST`), each
+  directory entry (`charge::entry_cost`: the name's heap block, kept twice,
+  and its share of the maps' other nodes, each holding at least five
+  entries) and each symlink's target's heap block: an estimate from above
+  of what each takes from the kernel heap, from std's `BTreeMap` layout
+  (B = 6) and `lumen_heap`'s 16-byte granule, which a ktest measures
+  against the heap. Not charged: the root inode and its maps' root nodes
+  (one per mount), a file's page map, advisory locks, and the VFS caches'
+  entries. A name is charged while it exists, an inode until its last
+  reference goes (an unlinked file still open keeps its charge, as its
+  pages; so does a removed directory's parent that the inode cache's
+  record for `..` holds (#318), until that record is pruned once nothing
+  else holds the removed directory: at the next directory removal on the
+  mount, or the next `..` taken from a removed directory). A rename to a new name moves the old name's charge to it,
+  reserving only what the new one costs more before anything changes: on
+  a full mount a name no costlier than the old one still fits, and the
+  count never passes the limit.
 - **`/dev` (`devfs`, `dev = 0:3`):** a writable mount (`rw` in `mount`
   and `/proc/mounts`), as Linux's devtmpfs (#301), whose names never
   change. lumen-vfs's own checks answer first, as on any writable mount
