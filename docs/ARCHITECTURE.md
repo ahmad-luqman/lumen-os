@@ -5640,9 +5640,16 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     must check it again. Forgetting one for that is logged; the rest of its
     blocks, and its inode, may stay allocated, for `e2fsck`. A child whose
     inode, map or bitmap byte can't be read, whose map doesn't parse or
-    takes more than 16 reads, or whose first block is outside the volume is
-    still kept live, as when it reads back allocated, though its blocks may
-    then be free: that is logged, saying so. A move that can't read back whether its old entry
+    takes more than 16 reads, or whose first block is outside the volume,
+    and one that isn't the last link and reads back corrupt (`delete_file`
+    runs only for a last link), is still kept live, as when it reads back
+    allocated, though its blocks may then be free: one line says so, with
+    the cause. The geometry this reads by (`Geometry`) is checked at mount:
+    a superblock whose groups have more blocks than a bitmap block has
+    bits, none, a first data block off the volume or a block over 64 KiB
+    refuses the mount, naming the field and its value; on a bigalloc
+    volume the bound is on its clusters per group, and no block's bit is
+    placed (it mounts read-only, so no unlink reaches this). A move that can't read back whether its old entry
     (after the unlink failed) or its new one (after undoing the link
     failed) is still there keeps the counts with the source at both names:
     the source's count from before plus one (at least 3 for a directory)

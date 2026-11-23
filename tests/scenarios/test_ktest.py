@@ -206,10 +206,6 @@ VFS_SWEEP_LINES = (
         rf"ERROR vfs: ext4 {_DEV}: undoing a failed (rename|exchange) between directories \d+ and \d+ left its "
         r"entries inconsistent or unreadable; run e2fsck"
     ),
-    (
-        rf"ERROR vfs: ext4 {_DEV} inode \d+: unlink failed and neither its directory nor the inode reads back; "
-        r"assuming the entry survived; run e2fsck"
-    ),
     # A rename's replaced target whose free failed inside `ext4plus` (left
     # for e2fsck; the rename itself went through).
     (
@@ -247,15 +243,18 @@ VFS_SWEEP_LINES = (
     # forgotten, not kept live (#330; the unlink and rmdir fault sweeps).
     (
         rf"ERROR vfs: ext4 {_DEV} directory \d+: inode \d+ lost its entry and its blocks were being freed "
-        r"\(block \d+ is free\) when the unlink failed, the directory unreadable; forgetting it; run e2fsck"
+        r"\(block \d+ is free\) when the (unlink|rmdir) failed, the directory unreadable; forgetting it; run e2fsck"
     ),
-    # One whose directory couldn't be read back and whose blocks' state
-    # couldn't be told either: kept live, saying so (the unlink sweep's leg
-    # with the block bitmap unreadable).
+    # One whose directory couldn't be read back and whose entry's and
+    # blocks' state couldn't be told from its inode either (the inode, its
+    # map or its bitmap byte unreadable, or a linked one reading corrupt):
+    # kept live, saying so and why (the unlink and rmdir sweeps' legs with
+    # the block bitmap unreadable, the corrupt-inode ktest, and the unlinks
+    # with every read failing).
     (
-        rf"ERROR vfs: ext4 {_DEV} directory \d+: unlink of inode \d+ failed, the directory unreadable, and "
-        r"whether its blocks were freed can't be told \(.+\); keeping it live, so writes through it may reach "
-        r"another file if they were; run e2fsck"
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: (unlink|rmdir) of inode \d+ failed, the directory unreadable, "
+        r"and whether its entry went and its blocks were freed can't be told \(.+\); keeping it live, so writes "
+        r"through it may reach another file if they were; run e2fsck"
     ),
     # A rename's target put back after a failed move, the put-back failing
     # too (ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated).
@@ -316,11 +315,18 @@ VFS_EXACT_LINES = {
         r"WARN  vfs: ext4 page cache at its hard limit \(\d+ pages\): refusing new pages \(ENOSPC\) until "
         r"writeback or unmapping frees some"
     ): 8,
-    # ext4_unwritable_ro_compat_features_force_read_only
+    # ext4_a_bad_group_geometry_refuses_the_mount_and_bigalloc_still_mounts_read_only:
+    # the refused superblock.
+    rf"WARN  vfs: ext4 on {_DEV}: refusing to mount: s_blocks_per_group 32769 not in 1\.\.=32768": 1,
+    # vfs::tests' ext4_adapter_pagecache_quirks_and_open_unlinked: a 64-bit
+    # superblock with a 32-byte descriptor size.
+    rf"WARN  vfs: ext4 on {_DEV}: refusing to mount: s_desc_size 32 on a 64-bit volume, not 64": 1,
+    # ext4_unwritable_ro_compat_features_force_read_only, and the bigalloc
+    # volume of ext4_a_bad_group_geometry_refuses_the_mount_and_bigalloc_still_mounts_read_only
     (
         rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: ro_compat feature not supported for writing "
         r"\(metadata_csum, quota, bigalloc, orphan_present, \.\.\.\) \(ro_compat 0x[0-9a-f]+\)"
-    ): 1,
+    ): 2,
     # ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name
     # (#308): the unsigned volume's mount, not the signed one's; the volume
     # with neither hash flag (and dir_index); and the one with a journal

@@ -244,13 +244,17 @@ fn first_mapped<E>(
 /// A volume's block geometry, read from its superblock by
 /// [`Geometry::from_superblock`], which refuses one whose groups don't fit
 /// their bitmaps: every `Geometry` places each of its blocks' bits inside
-/// its group's bitmap block.
+/// its group's bitmap block, or (bigalloc) places none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Geometry {
     block_size: u64,
     first_data_block: u32,
     blocks_per_group: u32,
     blocks_count: u64,
+    is_64bit: bool,
+    /// `RO_COMPAT_BIGALLOC`: the bitmaps count clusters, not blocks
+    /// ([`Geometry::bitmap_bit`] places no block's bit).
+    bigalloc: bool,
 }
 
 /// Where a block's bit is: its group, the byte in that group's block bitmap
@@ -262,42 +266,90 @@ pub struct BitmapBit {
     pub mask: u8,
 }
 
+/// Why [`Geometry::from_superblock`] refused a superblock: the field, its
+/// value and its limit (its `Display` says all three).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeometryError {
+    /// `s_log_block_size` past 6 (a block over 64 KiB).
+    BlockSize { log: u32 },
+    /// `s_blocks_per_group` 0, or more than one bitmap block's bits (`max`).
+    BlocksPerGroup { value: u32, max: u64 },
+    /// On a bigalloc volume, `s_clusters_per_group` 0 or more than `max`.
+    ClustersPerGroup { value: u32, max: u64 },
+    /// `s_first_data_block` not below `s_blocks_count`.
+    FirstDataBlock { first: u32, count: u64 },
+}
+
+impl core::fmt::Display for GeometryError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::BlockSize { log } => write!(f, "s_log_block_size {log} > 6"),
+            Self::BlocksPerGroup { value, max } => write!(f, "s_blocks_per_group {value} not in 1..={max}"),
+            Self::ClustersPerGroup { value, max } => write!(f, "s_clusters_per_group {value} not in 1..={max}"),
+            Self::FirstDataBlock { first, count } => {
+                write!(f, "s_first_data_block {first} not below s_blocks_count {count}")
+            }
+        }
+    }
+}
+
 /// The superblock's `INCOMPAT_64BIT` feature: `s_blocks_count_hi` counts.
 const INCOMPAT_64BIT: u32 = 0x80;
+/// The superblock's `RO_COMPAT_BIGALLOC` feature: a bitmap bit per cluster.
+const RO_COMPAT_BIGALLOC: u32 = 0x200;
 
 impl Geometry {
     /// The geometry in the superblock's 1024 bytes: `s_blocks_count_lo`
-    /// (0x04, with `s_blocks_count_hi` at 0x150 on a 64-bit volume),
-    /// `s_first_data_block` (0x14), `s_log_block_size` (0x18) and
-    /// `s_blocks_per_group` (0x20). `None` unless the block size is 1 to
-    /// 64 KiB, a group has 1 to 8 × block-size blocks (one bitmap block's
-    /// bits, as ext4 allows) and the first data block is on the volume.
-    pub fn from_superblock(sb: &[u8; 1024]) -> Option<Self> {
+    /// (0x04, with `s_blocks_count_hi` at 0x150 when `s_feature_incompat`,
+    /// 0x60, has 64-bit), `s_first_data_block` (0x14), `s_log_block_size`
+    /// (0x18), `s_blocks_per_group` (0x20) and, when `s_feature_ro_compat`
+    /// (0x64) has bigalloc, `s_clusters_per_group` (0x24). Refused unless
+    /// the block size is 1 to 64 KiB, a group has 1 to 8 × block-size bits
+    /// in its bitmap (blocks, or on a bigalloc volume clusters, as Linux's
+    /// `ext4_fill_super` checks) and the first data block is on the volume.
+    pub fn from_superblock(sb: &[u8; 1024]) -> Result<Self, GeometryError> {
         let log = le32(sb, 0x18);
         if log > 6 {
-            return None;
+            return Err(GeometryError::BlockSize { log });
         }
         let block_size = 1024u64 << log;
+        let max = 8 * block_size;
         let first_data_block = le32(sb, 0x14);
         let blocks_per_group = le32(sb, 0x20);
-        let hi = if le32(sb, 0x60) & INCOMPAT_64BIT != 0 { le32(sb, 0x150) } else { 0 };
+        let is_64bit = le32(sb, 0x60) & INCOMPAT_64BIT != 0;
+        let bigalloc = le32(sb, 0x64) & RO_COMPAT_BIGALLOC != 0;
+        let hi = if is_64bit { le32(sb, 0x150) } else { 0 };
         let blocks_count = (u64::from(hi) << 32) | u64::from(le32(sb, 0x04));
-        let fits = blocks_per_group != 0 && u64::from(blocks_per_group) <= 8 * block_size;
-        (fits && u64::from(first_data_block) < blocks_count).then_some(Self {
-            block_size,
-            first_data_block,
-            blocks_per_group,
-            blocks_count,
-        })
+        let in_bitmap = |value: u32| value != 0 && u64::from(value) <= max;
+        if bigalloc {
+            let value = le32(sb, 0x24);
+            if !in_bitmap(value) {
+                return Err(GeometryError::ClustersPerGroup { value, max });
+            }
+            if blocks_per_group == 0 {
+                return Err(GeometryError::BlocksPerGroup { value: 0, max: u64::from(u32::MAX) });
+            }
+        } else if !in_bitmap(blocks_per_group) {
+            return Err(GeometryError::BlocksPerGroup { value: blocks_per_group, max });
+        }
+        if u64::from(first_data_block) >= blocks_count {
+            return Err(GeometryError::FirstDataBlock { first: first_data_block, count: blocks_count });
+        }
+        Ok(Self { block_size, first_data_block, blocks_per_group, blocks_count, is_64bit, bigalloc })
     }
 
     pub fn block_size(&self) -> u64 {
         self.block_size
     }
 
-    /// Block `block`'s first byte on the device; `None` for block 0 (the
-    /// superblock's, never a map's or bitmap's) or past the volume, which
-    /// `ext4plus`'s block reads refuse too.
+    /// Whether `s_blocks_count_hi` and the descriptors' high halves count.
+    pub fn is_64bit(&self) -> bool {
+        self.is_64bit
+    }
+
+    /// Block `block`'s first byte on the device; `None` for block 0 (its
+    /// first 1024 bytes reserved, never a map's or a bitmap's) or past the
+    /// volume, which `ext4plus`'s block reads refuse too.
     pub fn block_byte(&self, block: u64) -> Option<u64> {
         if block == 0 || block >= self.blocks_count {
             return None;
@@ -307,8 +359,12 @@ impl Geometry {
 
     /// Where block `block`'s bit is in its group's block bitmap, as
     /// `ext4plus`'s `block_block_group_location` and `BitmapHandle` place it;
-    /// `None` for a block outside the groups.
+    /// `None` for a block outside the groups, and on a bigalloc volume
+    /// (whose bits are clusters'; such a volume mounts read-only).
     pub fn bitmap_bit(&self, block: u64) -> Option<BitmapBit> {
+        if self.bigalloc {
+            return None;
+        }
         let rel = block.checked_sub(u64::from(self.first_data_block))?;
         if block >= self.blocks_count {
             return None;
@@ -678,7 +734,8 @@ mod tests {
     /// A superblock's bytes with the geometry fields set: `log` block size,
     /// `count` blocks (its high half only on a 64-bit volume), groups of
     /// `per_group` from `first`. Clusters per group (0x24) is set to
-    /// something else, so a parse reading it shows.
+    /// something else, so a parse reading it shows. (The feature bits are
+    /// written as numbers, not the code's constants.)
     fn superblock(log: u32, count: u64, first: u32, per_group: u32, is_64bit: bool) -> [u8; 1024] {
         let mut sb = [0u8; 1024];
         let mut put = |at: usize, v: u32| sb[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -687,8 +744,17 @@ mod tests {
         put(0x18, log);
         put(0x20, per_group);
         put(0x24, per_group / 2 + 1);
-        put(0x60, if is_64bit { INCOMPAT_64BIT } else { 0 });
+        put(0x60, if is_64bit { 0x80 } else { 0 });
         put(0x150, (count >> 32) as u32);
+        sb
+    }
+
+    /// [`superblock`] of a bigalloc volume: `per_group` blocks, `clusters`
+    /// clusters to a group.
+    fn bigalloc(log: u32, count: u64, per_group: u32, clusters: u32) -> [u8; 1024] {
+        let mut sb = superblock(log, count, 0, per_group, false);
+        sb[0x24..0x28].copy_from_slice(&clusters.to_le_bytes());
+        sb[0x64..0x68].copy_from_slice(&0x200u32.to_le_bytes());
         sb
     }
 
@@ -701,6 +767,7 @@ mod tests {
         // 1 KiB blocks: the groups start at block 1, 8192 to a group.
         let g = Geometry::from_superblock(&superblock(0, 65536, 1, 8192, false)).unwrap();
         assert_eq!(g.block_size(), 1024);
+        assert!(!g.is_64bit());
         assert_eq!(g.bitmap_bit(1), bit(0, 0, 1));
         assert_eq!(g.bitmap_bit(10), bit(0, 1, 2));
         assert_eq!(g.bitmap_bit(8192), bit(0, 1023, 0x80));
@@ -719,9 +786,11 @@ mod tests {
 
     #[test]
     fn a_superblocks_geometry_is_read_and_checked() {
+        use GeometryError::*;
         // The high half of the count only on a 64-bit volume.
         let wide = (1u64 << 32) + 100;
         let g = Geometry::from_superblock(&superblock(2, wide, 0, 32768, true)).unwrap();
+        assert!(g.is_64bit());
         assert_eq!(g.block_byte(wide - 1), Some((wide - 1) * 4096));
         assert_eq!(g.block_byte(wide), None);
         let narrow = Geometry::from_superblock(&superblock(2, wide, 0, 32768, false)).unwrap();
@@ -730,12 +799,43 @@ mod tests {
         // Block 0 is never a map's or a bitmap's.
         assert_eq!(narrow.block_byte(0), None);
         // A group with more blocks than its bitmap block has bits, or none.
-        assert_eq!(Geometry::from_superblock(&superblock(0, 65536, 1, 8193, false)), None);
-        assert!(Geometry::from_superblock(&superblock(0, 65536, 1, 8192, false)).is_some());
-        assert_eq!(Geometry::from_superblock(&superblock(0, 65536, 1, 0, false)), None);
+        let over = Geometry::from_superblock(&superblock(0, 65536, 1, 8193, false));
+        assert_eq!(over, Err(BlocksPerGroup { value: 8193, max: 8192 }));
+        assert!(Geometry::from_superblock(&superblock(0, 65536, 1, 8192, false)).is_ok());
+        let none = Geometry::from_superblock(&superblock(0, 65536, 1, 0, false));
+        assert_eq!(none, Err(BlocksPerGroup { value: 0, max: 8192 }));
         // The first data block on the volume; a block size up to 64 KiB.
-        assert_eq!(Geometry::from_superblock(&superblock(0, 1, 1, 8192, false)), None);
-        assert!(Geometry::from_superblock(&superblock(6, 16, 0, 8192, false)).is_some());
-        assert_eq!(Geometry::from_superblock(&superblock(7, 16, 0, 8192, false)), None);
+        let first = Geometry::from_superblock(&superblock(0, 1, 1, 8192, false));
+        assert_eq!(first, Err(FirstDataBlock { first: 1, count: 1 }));
+        assert!(Geometry::from_superblock(&superblock(6, 16, 0, 8192, false)).is_ok());
+        assert_eq!(Geometry::from_superblock(&superblock(7, 16, 0, 8192, false)), Err(BlockSize { log: 7 }));
+    }
+
+    #[test]
+    fn a_bigalloc_volume_bounds_its_clusters_and_places_no_block_bit() {
+        use GeometryError::*;
+        // `mke2fs -O bigalloc -b 4096 -C 65536`: 524288 blocks, 32768
+        // clusters to a group. Its bitmaps count clusters, so no block's
+        // bit is placed.
+        let g = Geometry::from_superblock(&bigalloc(2, 1 << 20, 524_288, 32768)).unwrap();
+        assert_eq!(g.bitmap_bit(5), None);
+        assert_eq!(g.block_byte(5), Some(5 * 4096));
+        // Clusters bounded by the bitmap block instead; blocks still not 0.
+        let over = Geometry::from_superblock(&bigalloc(2, 1 << 20, 524_288, 32769));
+        assert_eq!(over, Err(ClustersPerGroup { value: 32769, max: 32768 }));
+        assert_eq!(
+            Geometry::from_superblock(&bigalloc(2, 1 << 20, 524_288, 0)),
+            Err(ClustersPerGroup { value: 0, max: 32768 })
+        );
+        assert!(matches!(
+            Geometry::from_superblock(&bigalloc(2, 1 << 20, 0, 32768)),
+            Err(BlocksPerGroup { value: 0, .. })
+        ));
+        // Each refusal names its field and value.
+        let says = |e: GeometryError| alloc::format!("{e}");
+        assert_eq!(says(BlocksPerGroup { value: 8193, max: 8192 }), "s_blocks_per_group 8193 not in 1..=8192");
+        assert_eq!(says(ClustersPerGroup { value: 0, max: 32768 }), "s_clusters_per_group 0 not in 1..=32768");
+        assert_eq!(says(FirstDataBlock { first: 1, count: 1 }), "s_first_data_block 1 not below s_blocks_count 1");
+        assert_eq!(says(BlockSize { log: 7 }), "s_log_block_size 7 > 6");
     }
 }
