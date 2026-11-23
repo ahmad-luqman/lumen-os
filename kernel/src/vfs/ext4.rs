@@ -5172,13 +5172,14 @@ crate::ktest!(
             ("move", &|| m.root.rename(b"mv", &d, b"mv", RenameFlags(0)), &[(&mv, &[b"d", b"mv"])]),
             ("rename", &|| m.root.rename(b"rn", &m.root, b"rn2", RenameFlags(0)), &[(&rn, &[b"rn2"])]),
             ("dir move", &|| m.root.rename(b"md", &d, b"md", RenameFlags(0)), &[(&md, &[b"d", b"md"])]),
-            ("dir rename", &|| m.root.rename(b"rd", &m.root, b"rd2", RenameFlags(0)), &[(&rd, &[b"rd2"])]),
             (
                 "exchange",
                 &|| m.root.rename(b"x", &d, b"y", RenameFlags(RenameFlags::EXCHANGE)),
                 &[(&x, &[b"d", b"y"]), (&y, &[b"x"])],
             ),
             ("over", &|| m.root.rename(b"o", &m.root, b"t", RenameFlags(0)), &[(&o, &[b"t"]), (&t, &[b"t2"])]),
+            // Last: no later step resyncs the root's count from the disk.
+            ("dir rename", &|| m.root.rename(b"rd", &m.root, b"rd2", RenameFlags(0)), &[(&rd, &[b"rd2"])]),
         ];
         let mut wrong: Vec<&str> = Vec::new();
         for (k, (name, step, children)) in steps.iter().enumerate() {
