@@ -5046,8 +5046,9 @@ pub(crate) mod ktest_util {
     /// - Under the real [`BlockCache`] a `write_at` only dirties a cached
     ///   block; the device's error comes later, from `sync` or from the
     ///   eviction that writes the block back (to whichever `read_at` or
-    ///   `write_at` missed and needed its slot). A `write_at` fails at once
-    ///   only on a miss (a failed eviction of another block, a failed
+    ///   `write_at` missed and needed its slot). Besides its `ReadOnly` and
+    ///   `OutOfRange` refusals, a `write_at` fails at once only on a miss
+    ///   (a failed eviction of another block, a failed
     ///   pre-read, every slot pinned) or on a block pinned at that moment.
     ///   Here any write fails by its number, a cache hit as well, so the
     ///   faults reach steps the real path can fail only under cache
@@ -5452,18 +5453,28 @@ pub(crate) mod ktest_util {
         inner.layout.block_byte(block).map_err(|_| "bitmap block")
     }
 
+    /// [`counts_4k`]: an image's block accounting, as stored.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Counts {
+        /// The bits set in the block bitmap.
+        pub bits: u32,
+        /// The superblock's free-block count.
+        pub sb: u64,
+        /// Group 0's free-block count.
+        pub bg: u64,
+    }
+
     /// On an image of `build_minimal_ext4_image_blocks` (4 KiB blocks, one
-    /// group, the superblock at 1024, 64-byte descriptors in block 1): the
-    /// bits set in the block bitmap at `bitmap`, the superblock's free-block
-    /// count and group 0's, as stored.
-    pub fn counts_4k(img: &[u8], bitmap: u64) -> (u32, u64, u64) {
+    /// group, the superblock at 1024, 64-byte descriptors in block 1), with
+    /// its block bitmap at byte `bitmap`: its [`Counts`].
+    pub fn counts_4k(img: &[u8], bitmap: u64) -> Counts {
         let u16_at = |at: usize| u64::from(u16::from_le_bytes([img[at], img[at + 1]]));
         let u32_at = |at: usize| u64::from(u32::from_le_bytes([img[at], img[at + 1], img[at + 2], img[at + 3]]));
-        let bitmap = usize::try_from(bitmap).unwrap_or(usize::MAX);
-        let bits = img.get(bitmap..bitmap + 4096).map_or(0, |b| b.iter().map(|b| b.count_ones()).sum());
+        let bitmap = bitmap as usize; // a block of a 1 MiB image
+        let bits = img[bitmap..bitmap + 4096].iter().map(|b| b.count_ones()).sum();
         let sb = u32_at(1024 + 0x0c) | (u32_at(1024 + 0x158) << 32);
         let bg = u16_at(4096 + 0x0c) | (u16_at(4096 + 0x2c) << 16);
-        (bits, sb, bg)
+        Counts { bits, sb, bg }
     }
 
     /// Inode `ino`'s `(i_mode, i_links_count)` as stored, read raw (a zeroed
@@ -6659,11 +6670,12 @@ crate::ktest!(
         // #331: `ext4plus` 0.1.0-rc.2 frees a file's extent with `free_blocks`
         // and, if that fails, frees the same blocks again one at a time
         // (`file_blocks/utils.rs`, `free_freed_ranges`), so a failed write
-        // inside the range free is absorbed: the unlink returns `Ok`. The
-        // counts are raised in memory before they are written and never put
-        // back, so when the failed write is the descriptor write carrying the
-        // raised group count, or the superblock write, the retry counts the
-        // blocks twice: that count rises by 4 on disk for `f`'s 2 blocks.
+        // inside the range free is absorbed: the unlink returns `Ok`. Each
+        // count is raised in memory just before it is written and never put
+        // back, so a failure at or after the descriptor write carrying the
+        // raised group count doubles the group's count, and a failed
+        // superblock write doubles the superblock's as well: that count rises
+        // by 4 on disk for `f`'s 2 blocks.
         // `f` is 2 blocks of one extent (4 KiB blocks, one group); each write
         // of the unlink fails in turn. Pinned exactly, so that neither an
         // `ext4plus` bump nor a Lumen change absorbing a write elsewhere goes
@@ -6692,7 +6704,7 @@ crate::ktest!(
             m.root.unlink(b"f").map_err(|_| "unlink without a fault")?;
             (m.cache.writes.load(O::Acquire), block_bitmap_offset(&m.fs)?)
         };
-        let (bits0, sb0, bg0) = counts_4k(&setup, bitmap);
+        let Counts { bits: bits0, sb: sb0, bg: bg0 } = counts_4k(&setup, bitmap);
         let (mut absorbed, mut sb_twice, mut bg_twice) = (Vec::new(), Vec::new(), Vec::new());
         for k in 1..=total {
             let m = mount(setup.clone(), 274)?;
@@ -6710,7 +6722,7 @@ crate::ktest!(
             // bitmap, and neither count is below what was freed.
             absorbed.push(k);
             let img = image(&m)?;
-            let (bits, sb, bg) = counts_4k(&img, bitmap);
+            let Counts { bits, sb, bg } = counts_4k(&img, bitmap);
             kassert_eq!(bits + 2, bits0);
             kassert!(sb >= sb0 + 2 && bg >= bg0 + 2);
             if sb == sb0 + 4 {
@@ -6726,10 +6738,10 @@ crate::ktest!(
             "{total} writes: absorbed {absorbed:?}, the superblock's count raised twice at {sb_twice:?}, the group's \
              at {bg_twice:?}"
         ));
-        let (first, last) = (*absorbed.first().ok_or("none absorbed")?, *absorbed.last().ok_or("none absorbed")?);
+        kassert_eq!(absorbed.len(), 5);
+        let (first, last) = (absorbed[0], absorbed[4]);
         kassert!(first > 1 && last < total);
         kassert_eq!(absorbed, (first..=last).collect::<Vec<_>>());
-        kassert_eq!(absorbed.len(), 5);
         kassert_eq!(bg_twice, alloc::vec![last - 1, last]);
         kassert_eq!(sb_twice, alloc::vec![last]);
         Ok(())
@@ -6741,17 +6753,29 @@ crate::ktest!(
         // #331 review: `ext4plus` 0.1.0-rc.2's `Extent::allocate`
         // (`extent.rs`) retries any failed `alloc_contiguous_blocks(n)` with
         // one block fewer and gives `NoSpace` at 0. On 4 KiB blocks a page's
-        // writeback asks for 1 block, so a failed write among the
-        // allocation's (the bitmap byte, the descriptor twice, the
-        // superblock) comes back as `NoSpc`, not `Io`, and leaves the bit it
-        // set: no extent owns it, and until the count's write lands the
-        // group's count is above its bitmap (#350's hang). Each write of one
-        // page's write into a hole of `f` fails in turn, through
-        // `ext4_write_all` as `write_back_page` calls it (without its
-        // logging); a failure after the allocation is `Io`. The runs giving
-        // `NoSpc` are the allocation's 4 writes, one contiguous run from
-        // the first; once the bitmap byte has landed the bit leaks, so the
-        // retry that works leaves 2 bits set for the 1 block `f` owns.
+        // writeback asks for 1 block, so nothing is retried and a failed
+        // write among the allocation's comes back as `NoSpc`, not `Io`. The
+        // allocation writes the bitmap byte, the descriptor's checksum, then
+        // lowers the group's count in memory and writes it, then the
+        // superblock's; nothing is put back. So once the bit has landed it
+        // leaks (no extent owns it), and:
+        // - the checksum write failing (k=2) never lowers either count: both
+        //   stay one above the bitmap for good (until e2fsck), every later
+        //   descriptor and superblock write storing them so: #350's hang,
+        //   once the group fills;
+        // - the count's write failing (k=3) lowers the group's count in
+        //   memory (the next descriptor write stores it), not the
+        //   superblock's, which stays one above for good;
+        // - the superblock write failing (k=4) is put right by the next one.
+        // Each write of one page's write into a hole of `f` fails in turn;
+        // a failure after the allocation is `Io`. Then the page's next
+        // writeback, on a new block, stores every count from memory, and
+        // what is on disk is pinned per k. `write_page` repeats what
+        // `write_back_page` does (`ext4_write_all`, `map_ext4_err`) rather
+        // than calling it, to leave out its warning; it pins `ext4plus`, not
+        // Lumen's writeback. Under #349 each failed write errors the volume
+        // (asserted) and stops the block cache's writeback, so the next
+        // writeback's counts land in the cache only (read back by `image`).
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -6776,8 +6800,8 @@ crate::ktest!(
             write_page(&m, &page).map_err(|_| "write without a fault")?;
             (m.cache.writes.load(O::Acquire), block_bitmap_offset(&m.fs)?)
         };
-        let (bits0, sb0, bg0) = counts_4k(&setup, bitmap);
-        let (mut nospc, mut leaked, mut above) = (Vec::new(), Vec::new(), Vec::new());
+        let c0 = counts_4k(&setup, bitmap);
+        let (mut nospc, mut leaked, mut above, mut after) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for k in 1..=total {
             let m = mount(setup.clone(), 276)?;
             m.cache.arm_write(k);
@@ -6793,26 +6817,32 @@ crate::ktest!(
                     continue;
                 }
             }
-            let (bits, sb, bg) = counts_4k(&image(&m)?, bitmap);
-            kassert!(sb <= sb0 && bg <= bg0 && bits <= bits0 + 1);
-            if bits == bits0 + 1 {
+            let c = counts_4k(&image(&m)?, bitmap);
+            kassert!(c.sb <= c0.sb && c.bg <= c0.bg && c.bits <= c0.bits + 1);
+            let leaked_now = c.bits == c0.bits + 1;
+            if leaked_now {
                 leaked.push(k);
-                if bg == bg0 {
-                    above.push(k); // the bit taken, the group's count not lowered
+                if c.bg == c0.bg {
+                    above.push(k); // the bit taken, the group's count on disk not lowered
                 }
             }
-            // The page's next writeback works, on a new block.
+            // The page's next writeback works, on a new block, and stores
+            // every count from memory: bits taken, and each count lowered.
             write_page(&m, &page).map_err(|_| "write again")?;
-            let (bits, ..) = counts_4k(&image(&m)?, bitmap);
-            kassert_eq!(bits, bits0 + 1 + u32::from(leaked.last() == Some(&k)));
+            let c = counts_4k(&image(&m)?, bitmap);
+            kassert_eq!(c.bits, c0.bits + if leaked_now { 2 } else { 1 });
+            after.push((k, c.bits - c0.bits, c0.bg - c.bg, c0.sb - c.sb));
         }
         crate::ktest::diag(format_args!(
             "{total} writes: NoSpc at {nospc:?}, a bit leaked at {leaked:?}, the group's count above its bitmap at \
-             {above:?}"
+             {above:?}; after the next writeback (k, bits taken, group and superblock counts lowered): {after:?}"
         ));
         kassert_eq!(nospc, alloc::vec![1, 2, 3, 4]);
         kassert_eq!(leaked, alloc::vec![2, 3, 4]);
-        kassert!(!above.is_empty());
+        kassert_eq!(above, alloc::vec![2, 3]);
+        // k=1 clean; k=2 both counts one above for good; k=3 the
+        // superblock's one above for good; k=4 put right.
+        kassert_eq!(after, alloc::vec![(1, 1, 1, 1), (2, 2, 1, 1), (3, 2, 2, 1), (4, 2, 2, 2)]);
         Ok(())
     }
 );
