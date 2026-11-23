@@ -97,13 +97,14 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4 device nodes report their st_rdev, decoded from i_block in Linux's old and new encodings and kept while an unlinked node is held, and other inodes report 0:0 (#292); ext4 times from 1901 to 2446 stored as Linux encodes them (a signed 32-bit second, two epoch bits, nanoseconds), clamped outside that range, whole 32-bit seconds for a time whose extra field the inode's i_extra_isize leaves out (tested at 0, 8, 12 and 16; 0 read as ext4plus does, as no extra fields), files, directories and symlinks made past 2038 keeping their atime, mtime and ctime, and stat agreeing with the disk across a remount after utimensat, chmod and chown (written at once) and after truncate, link, a write and create/rename/unlink/mkdir/rmdir/symlink in a directory (through the metadata flush), each at its own time (#294)"
+name = "ext4 device nodes report their st_rdev, decoded from i_block in Linux's old and new encodings and kept while an unlinked node is held, and other inodes report 0:0 (#292); ext4 times from 1901 to 2446 stored as Linux encodes them (a signed 32-bit second, two epoch bits, nanoseconds), clamped outside that range, whole 32-bit seconds for a time whose extra field the inode's i_extra_isize leaves out (tested at 0, 8, 12 and 16; 0 read as ext4plus does, as no extra fields), files, directories and symlinks made past 2038 keeping their atime, mtime and ctime, and stat agreeing with the disk across a remount after utimensat, chmod and chown (written at once) and after truncate, link, a write and create/rename/unlink/mkdir/rmdir/symlink in a directory (through the metadata flush), each at its own time (#294); utimensat's UTIME_OMIT keeping and UTIME_NOW stamping each ext4 stamp alone, in memory and on disk (#302)"
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
     "ktest:lumen_kernel::vfs::ext4::ext4_device_nodes_report_their_device_numbers",
     "ktest:lumen_kernel::vfs::ext4::ext4_times_before_1970_and_past_2038_survive_a_remount",
     "ktest:lumen_kernel::vfs::ext4::ext4_times_follow_the_extra_fields_an_inode_has",
+    "ktest:lumen_kernel::vfs::ext4::ext4_set_times_omits_and_nows_each_stamp_alone",
     "ktest:lumen_kernel::vfs::ext4::ext4_each_operation_that_sets_a_time_puts_it_on_disk",
     "ktest:lumen_kernel::vfs::ext4::ext4_files_made_past_2038_keep_their_times",
 ]

@@ -4798,6 +4798,37 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn ext4_set_times_omits_and_nows_each_stamp_alone() {
+        // `utimensat`'s `UTIME_OMIT` keeps its stamp and `UTIME_NOW` takes
+        // the filesystem's clock, each for its own stamp (#302's
+        // `SetTime::resolve`), in memory and on disk: the two stamps apart,
+        // and each clock reading apart from both.
+        use self::ktest_util::*;
+        use crate::kassert_eq;
+        let ts = |sec: i64, nsec: i64| Timespec { sec, nsec };
+        let times = |i: &Arc<dyn VfsInode>| i.stat().map(|st| (st.atime, st.mtime)).map_err(|_| "stat");
+        let m = mount(build_1k_blockmap_image(128), 186)?;
+        let f = m.root.create(b"t", 0o644).map_err(|_| "create")?;
+        let (atime, mtime) = (ts(-946_771_200, 123_456_789), ts(0x2_0000_0005, 42));
+        f.set_times(SetTime::Set(atime), SetTime::Set(mtime)).map_err(|_| "set")?;
+        let (now1, now2) = (ts(1_700_000_000, 111), ts(1_800_000_000, 222));
+        set_clock(&m.fs, Some(now1));
+        let omit_now = f.set_times(SetTime::Omit, SetTime::Now);
+        let after_first = times(&f);
+        set_clock(&m.fs, Some(now2));
+        let now_omit = f.set_times(SetTime::Now, SetTime::Omit);
+        set_clock(&m.fs, None);
+        kassert_eq!((omit_now, now_omit), (Ok(()), Ok(())));
+        kassert_eq!(after_first?, (atime, now1));
+        kassert_eq!(times(&f)?, (now2, now1));
+        let ro = remount_ro(&m, 187)?;
+        let back = ro.root_inode().lookup(b"t").map_err(|_| "ro lookup")?;
+        kassert_eq!(times(&back)?, (now2, now1));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn ext4_times_follow_the_extra_fields_an_inode_has() {
         // `i_extra_isize` decides which times have their extra field, as
         // `ext4plus` reads them (`i_ctime_extra` from 8, `i_mtime_extra` from
