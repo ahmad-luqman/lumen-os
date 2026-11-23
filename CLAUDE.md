@@ -133,7 +133,7 @@ one is its own PR that updates that doc first.
   calibrated): match the rest of the line, not its start.
 - **QEMU exit codes:** 33 pass, 35 test failure, 37 crash report; anything else
   (including 0 from a triple fault with `-no-reboot`) is a failure. The one
-  exception: 0 in the power-off scenario, with a QMP `SHUTDOWN` event whose
+  exception: 0 in the power-off scenarios, with a QMP `SHUTDOWN` event whose
   reason is `guest-shutdown` (a triple fault's is `guest-reset`).
 - **Tests on a busy host.** A guest's clocks run on while the host stalls
   its vCPU, so a loaded laptop or CI runner adds time to anything timed

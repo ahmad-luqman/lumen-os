@@ -493,7 +493,8 @@ test the fallbacks (q35 always takes 0xCF9's reset); an unknown value starts
 at 0xCF9 with a warning (tested). The reboot scenarios run QEMU without
 `-no-reboot` (the banner appears twice, the log shows which method did it,
 and under TCG `qemu.log` shows a triple fault only for that method); the
-power-off one accepts QEMU's exit status 0 only with a QMP `SHUTDOWN` event
+power-off ones (`test_shutdown_powers_off`, and `test_fs`'s after
+`shutdown`) accept QEMU's exit status 0 only with a QMP `SHUTDOWN` event
 whose reason is `guest-shutdown` (a triple fault under `-no-reboot` also
 exits with 0, but as `guest-reset`).
 
@@ -507,13 +508,14 @@ written all it could past the failure, and refusing would leave the machine
 up with nothing to fix the disk with. What the ext4 rootfs holds unsynced
 is on the disk after either (tested: `test_fs`'s
 `test_ext4_unsynced_writes_survive_reboot` and `_shutdown`; the failure
-line by a ktest over its text, not by a failing disk). Nothing stops other
+line's text by a ktest; not tested: a failing disk, and the command going
+on after a failed sync). Nothing stops other
 threads first, so what they write after the sync can still be lost, and a
 device that hangs rather than fails hangs the command. `exit` (the
 `lumen.qemu_exit` test hook), the ktest kernel's exit and the crash
 reporter's don't sync: the first two end QEMU as pulling the plug would (a
 scenario that wants its writes kept runs `sync` first), and the crash
-reporter takes no locks.
+reporter must take no lock it could deadlock on (`crash.rs`).
 
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`
