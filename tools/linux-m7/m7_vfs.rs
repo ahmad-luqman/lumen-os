@@ -863,12 +863,24 @@ fn rmdir_open(d: &[u8]) -> R {
         let mut buf = [0u8; 256];
         eq("getdents64 on it", s3(nr::GETDENTS64, fd as u64, mptr(&mut buf[..]), 256), 0)?;
         eq("openat O_CREAT in it", s4(nr::OPENAT, fd as u64, ptr(&b"y\0"[..]), O_CREAT | O_WRONLY, 0o644), -ENOENT)?;
-        // Its cwd: getcwd says ENOENT, as Linux.
+        // Its cwd: getcwd says ENOENT, as Linux; `..` from it is still the
+        // directory it was removed from (#318, Linux's `d_parent`).
         eq("fchdir into it", s1(nr::FCHDIR, fd as u64), 0)?;
-        let mut buf = [0u8; 256];
-        let cwd = getcwd(&mut buf).err().unwrap_or(0);
+        let in_removed = (|| {
+            let mut buf = [0u8; 256];
+            eq("getcwd in a removed directory", getcwd(&mut buf).err().unwrap_or(0), -ENOENT)?;
+            let dotdot = P::new(&[b".."]);
+            eq("open .. O_CREAT from a removed cwd", open(&dotdot, O_CREAT | O_RDONLY, 0o644), -EISDIR)?;
+            let up = ok("open .. O_DIRECTORY from a removed cwd", open(&dotdot, O_RDONLY | O_DIRECTORY, 0))?;
+            let (got, want) = (fstat(up), stat(&P::new(&[d])));
+            close(up);
+            let (got, want) = (st("fstat ..", got)?, st("stat the test directory", want)?);
+            ensure("open .. is the parent", (got.dev(), got.ino()) == (want.dev(), want.ino()), got.ino() as i64)?;
+            eq("chdir .. from a removed cwd", s1(nr::CHDIR, dotdot.at()), 0)?;
+            cwd_is("getcwd after chdir .. from a removed cwd", d)
+        })();
         eq("back to /", s1(nr::CHDIR, ptr(&b"/\0"[..])), 0)?;
-        eq("getcwd in a removed directory", cwd, -ENOENT)
+        in_removed
     })();
     close(fd);
     r

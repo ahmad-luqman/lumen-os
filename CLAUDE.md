@@ -368,7 +368,10 @@ one is its own PR that updates that doc first.
   in-memory block device those files' ktests use too, stays in `mod.rs`);
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
-  64 MiB hard cap, `QuotaCounter` (bytes; a leak logged when dropped), the detached-inode quota; `mmap_page`,
+  64 MiB hard cap, one check, `admit_unreclaimable`, for a dirty or mapped
+  page, `QuotaCounter` (bytes; a leak logged when dropped), the detached-inode
+  quota; `read_into`/`write_from`/`resize`/`map_page`, the page I/O ext4 and
+  tmpfs share, #264; `mmap_page`,
   re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
   for a mapping, through `VfsInode::as_any`, and `MappedPage::copy_to_frame` (under the cache lock)
   for copy-on-write, #255; `WritableMap`, the guard counting a writable
@@ -379,11 +382,20 @@ one is its own PR that updates that doc first.
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, the
-  link counts kept in memory when an undo fails; a device's number read
+  link counts kept in memory when an undo fails (`NlinkBounds` through
+  `write_links_or_pin`/`raise_links_or_floor`); `rename` split into
+  `Exchange` (`RENAME_EXCHANGE`: `run`, `roll_back`, `finish`), `MoveEntry`
+  (link, unlink, `roll_back`, `finish`) and a held target (`hold_target`,
+  then `put_back_target` or `retire_target`); a removed child's end
+  through `ChildFate`/`settle_child`; `snapshot_live`, reclaim's and
+  `sync`'s inodes; a device's number read
   raw from `i_block`, `read_rdev`, #292; the times through `times`'
   `InodeTimes`, clamped on load and by every setter and stored by `store`/
   `store_ctime`, and `new_inode`, the one way to make an inode, #294;
-  `ktest_util::set_clock`, the ktests' clock, `Ext4Shared::now`);
+  `ktest_util`, the ext4 ktest helpers `vfs/tests.rs` and `page_cache.rs`
+  share: `FaultCache` (writes failed by number, pair or from one on,
+  reads by range or after a write fault), `Mnt`, `mount`, `remount_ro`,
+  `set_clock`, the ktests' clock, `Ext4Shared::now`);
   `vfs/tmpfs.rs` (its quota charging inodes, directory entries and symlink
   targets besides pages, #267: `charge`, the cost model, `InodeCharge`,
   `EntryCharge` and `Children`, the only code reserving or giving one back),
@@ -558,9 +570,16 @@ one is its own PR that updates that doc first.
   for whom, for `EDEADLK`, its search's `WaitSearch`),
   `procfs` (`/proc`'s `ProcKind`s, their inode numbers and types, `ProcFd`:
   an fd in `0..MAX_FDS`, `ProcFd::parse`, and `parse_canonical_u32`: one
-  name per number), and `ext4` (#292, #294: what the ext4 adapter encodes and
+  name per number), `pseudo` (what devfs and procfs share: `fill_readdir`,
+  a listing keyed by entry, and `fixed_namespace_ops!`, the seven namespace
+  operations each `-EROFS`), `ext4` (#292, #294: what the ext4 adapter encodes and
   decodes itself, a device node's `i_block` as `st_rdev` and Linux's signed times
-  with their epoch bits, clamped as `timestamp_truncate` does) (host-tested).
+  with their epoch bits, clamped as `timestamp_truncate` does), `nlink`
+  (#265: `NlinkBounds`, ext4's in-memory link-count corrections: a floor
+  and maybe a ceiling per inode, never trivial, the floor never above the
+  ceiling), and `page` (#265: the page cache's arithmetic, `spans`,
+  `pages_in`, `valid_len`, `resize_tail`); `SetTime::resolve` (#302) in
+  `types` (host-tested).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and

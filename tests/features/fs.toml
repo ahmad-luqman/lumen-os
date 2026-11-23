@@ -16,11 +16,13 @@ tests = [
 ]
 
 [[feature]]
-name = "Unified 4 KiB frame-backed PageCache with write-back, soft 32 MiB reclaim and a 64 MiB hard cap for ext4, quota accounting, and truncate tail zeroing"
+name = "Unified 4 KiB frame-backed PageCache with write-back, soft 32 MiB reclaim and a 64 MiB hard cap for ext4 (one check for a page reclaim can't drop: PageCache::insert_new refusing a page dirty when inserted at the cap and letting a clean or tmpfs page in; write_from and map_page (a mapped page) asking before they make a page and again after, an error after a write's first page returning a short count), quota accounting, truncate tail zeroing, and writeback of a page's bytes below the size alone; tmpfs and ext4 share its page I/O (read_into, write_from, resize, map_page): an overwrite inside a page keeping the rest of it, a write past the end zeroing what a mapping stored past the old end, a shrink dropping the pages past the new end so a later write reads zeros there, a page a read loads staying cached, and a detached ext4 file's holes, writes and truncates never reading the disk; its page spans, a page's bytes below the size and the tail-zero rule lumen-vfs host-tests against byte-by-byte models (#264, #265)"
 milestone = "M7"
 tests = [
+    "cargo:lumen-vfs",
     "ktest:lumen_kernel::vfs::tests::ext4_adapter_pagecache_quirks_and_open_unlinked",
     "ktest:lumen_kernel::vfs::tests::page_cache_global_reclaim_writes_back_and_evicts",
+    "ktest:lumen_kernel::vfs::tests::page_cache_global_reclaim_reaches_inodes_the_vfs_caches_never_held",
     "ktest:lumen_kernel::vfs::page_cache::*",
     "ktest:lumen_kernel::vfs::tests::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
     "ktest:lumen_kernel::vfs::tests::ext4_truncate_and_open_unlink_preserve_state_on_io_error",
@@ -96,15 +98,32 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4 device nodes report their st_rdev, decoded from i_block in Linux's old and new encodings and kept while an unlinked node is held, and other inodes report 0:0 (#292); ext4 times from 1901 to 2446 stored as Linux encodes them (a signed 32-bit second, two epoch bits, nanoseconds), clamped outside that range, whole 32-bit seconds for a time whose extra field the inode's i_extra_isize leaves out (tested at 0, 8, 12 and 16; 0 read as ext4plus does, as no extra fields), files, directories and symlinks made past 2038 keeping their atime, mtime and ctime, and stat agreeing with the disk across a remount after utimensat, chmod and chown (written at once) and after truncate, link, a write and create/rename/unlink/mkdir/rmdir/symlink in a directory (through the metadata flush), each at its own time (#294)"
+name = "ext4 device nodes report their st_rdev, decoded from i_block in Linux's old and new encodings and kept while an unlinked node is held, and other inodes report 0:0 (#292); ext4 times from 1901 to 2446 stored as Linux encodes them (a signed 32-bit second, two epoch bits, nanoseconds), clamped outside that range, whole 32-bit seconds for a time whose extra field the inode's i_extra_isize leaves out (tested at 0, 8, 12 and 16; 0 read as ext4plus does, as no extra fields), files, directories and symlinks made past 2038 keeping their atime, mtime and ctime, and stat agreeing with the disk across a remount after utimensat, chmod and chown (written at once) and after truncate, link, a write and create/rename/unlink/mkdir/rmdir/symlink in a directory (through the metadata flush), each at its own time (#294), and the operation's time as the ctime of a file or directory moved to another parent or renamed in its own, of both sides of an exchange of a file and a directory between parents, and of an inode an unlink or a rename over it leaves with a link, in memory and across a remount, the parents' link counts then what their directories call for, on disk and in memory; utimensat's UTIME_OMIT keeping and UTIME_NOW stamping each ext4 stamp alone, in memory and on disk (#302)"
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
     "ktest:lumen_kernel::vfs::ext4::ext4_device_nodes_report_their_device_numbers",
     "ktest:lumen_kernel::vfs::ext4::ext4_times_before_1970_and_past_2038_survive_a_remount",
     "ktest:lumen_kernel::vfs::ext4::ext4_times_follow_the_extra_fields_an_inode_has",
+    "ktest:lumen_kernel::vfs::ext4::ext4_set_times_omits_and_nows_each_stamp_alone",
     "ktest:lumen_kernel::vfs::ext4::ext4_each_operation_that_sets_a_time_puts_it_on_disk",
+    "ktest:lumen_kernel::vfs::ext4::ext4_namespace_operations_set_their_childrens_ctime",
     "ktest:lumen_kernel::vfs::ext4::ext4_files_made_past_2038_keep_their_times",
+]
+
+[[feature]]
+name = "Files, directories and symlinks (inline and in a block) made on ext4 get i_crtime and i_crtime_extra set to their creation time, epoch and nanoseconds included, kept by later writes (of a file and a directory), flushes and a remount (#303)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_new_inodes_get_a_creation_time_that_survives_a_remount",
+]
+
+[[feature]]
+name = "A failed ext4 rename whose undo can't read its entries back (every read, or every read past the inode table, failing after each write in turn; a move, an exchange and a rename over a target, of files and of directories) reports an error if it didn't complete, moves no time then and leaves a target it would have replaced with its count, not freed, keeps each name's data, leaves an inode it couldn't put back allocated for e2fsck, keeps no count in memory below the entries on disk and, once the rename completed, each parent's count exactly what its entries call for, except for a move's source left at both names, by whichever undo, whose count, its new parent's and its removal go unchecked (#322); each kind and mode has at least one fault whose undo couldn't read back; a rename over a target whose put-back fails too (two failed writes, the second within six of the first, or every write from one on) leaves the target nameless but allocated with its data and count, frees nothing, and reports an error"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_failed_rename_that_cant_read_back_keeps_every_entry",
+    "ktest:lumen_kernel::vfs::ext4::ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated",
 ]
 
 [[feature]]
@@ -127,7 +146,7 @@ milestone = "M7"
 tests = ["cargo:lumen-vfs"]
 
 [[feature]]
-name = "chmod, chown and utimensat on devfs nodes (/dev/null) kept in memory and shown by stat, as Linux's devtmpfs, by path and by descriptor; set-id and sticky bits kept; /dev itself (its setters refusing, whoever calls them), and a special file on any other read-only mount, stay -EROFS; the nodes start at their Linux boot modes, and vfstest dev-tmp-proc passes after a chmod (#293)"
+name = "chmod, chown and utimensat on devfs nodes (/dev/null) kept in memory and shown by stat, as Linux's devtmpfs, by path and by descriptor; set-id and sticky bits kept; /dev itself (its setters refusing, whoever calls them), and a special file on a read-only mount, stay -EROFS; the nodes start at their Linux boot modes, and vfstest dev-tmp-proc passes after a chmod (#293)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chmod_on_dev_null_is_kept_as_devtmpfs_does",
@@ -139,6 +158,17 @@ tests = [
 ]
 
 [[feature]]
+name = "devfs is a writable mount, as Linux's devtmpfs (#301): /dev shows rw in mount and /proc/mounts, a second devfs instance's nodes take chmod, chown and utimensat through the syscalls, access(\"/dev\", W_OK) passes for root, and lumen-vfs's own namespace checks answer first (unlinking or renaming a missing name -ENOENT, rmdir of a node -ENOTDIR, RENAME_NOREPLACE over a node -EEXIST, a link from another mount -EXDEV, a rename onto itself 0), then devfs refuses every change that reaches it with -EROFS, mkdir and symlink onto a name in use too"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_a_second_devfs_mount_takes_chmod_chown_and_utimensat",
+    "ktest:lumen_kernel::linux::syscall::stat::tests::stat_access_modes_follow_the_root_rules",
+    "ktest:lumen_kernel::vfs::tests::vfs_boot_mounts_tmp_dev_proc_work",
+    "ktest:lumen_kernel::vfs::tests::vfs_dev_answers_namespace_changes_after_lumen_vfs_checks",
+    "scenario:test_fs::test_dev_tmp_proc_filesystems",
+]
+
+[[feature]]
 name = "ext4 rootfs fsck-clean after Linux programs' file syscalls (#254): with nothing left once the programs remove what they made (unlink and rmdir while open, renames over open files, record locks), and with a tree they leave (a hard link, a short and a long symlink, two files' mode, owner and times, one written by a sync and one set on a clean inode after it, a file and a directory exchanged, a directory moved to another parent with its ..), all of it read back from the disk on a second boot"
 milestone = "M7"
 tests = [
@@ -147,12 +177,13 @@ tests = [
 ]
 
 [[feature]]
-name = "Byte-string names through the VFS (#268): a name that is not UTF-8 (on ext4 and tmpfs) is created, listed by readdir and getdents64, looked up (the dentry cache telling names apart by their bytes), renamed, hard-linked, unlinked and its directory removed once empty, kept on an ext4 disk through e2fsck and read back cold on the next boot; getcwd under it and /proc/<pid>/fd give its bytes; a symlink target that is not UTF-8 is stored as given; /proc/<pid>/maps names a mapped file by its path's bytes (each newline as \\012); vfstest ls and an exec error's interpreter path show such a name escaped, never lossily (lumen_vfs::Escaped). Not on an ext4 volume with unsigned directory hashes (#308)."
+name = "Byte-string names through the VFS (#268): a name that is not UTF-8 (on ext4 and tmpfs) is created, listed by readdir and getdents64, looked up (the dentry cache telling names apart by their bytes), renamed, hard-linked, unlinked and its directory removed once empty, kept on an ext4 disk through e2fsck and read back cold on the next boot; getcwd under it and /proc/<pid>/fd give its bytes; a symlink target that is not UTF-8 is stored as given; /proc/<pid>/maps names a mapped file by its path's bytes (each newline as \\012); vfstest ls and an exec error's interpreter path show such a name escaped, never lossily (lumen_vfs::Escaped). On an ext4 volume whose directory hashes are or may be unsigned, only listed and looked up (#308)."
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
     "cargo:lumen-vm",
     "ktest:lumen_kernel::vfs::ext4::ext4_names_that_are_not_utf8_are_listed_looked_up_renamed_and_removed",
+    "ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name",
     "ktest:lumen_kernel::linux::syscall::dir::dir_getdents64_lists_names_that_are_not_utf8",
     "ktest:lumen_kernel::linux::syscall::at::at_start_operations_take_names_that_are_not_utf8",
     "ktest:lumen_kernel::linux::syscall::at::at_user_path_rules",
@@ -216,4 +247,27 @@ name = "tmpfs files created through the kernel's VFS tables until ENOSPC and unl
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::tmpfs::tmpfs_unlinking_through_the_vfs_gives_the_room_back",
+]
+
+[[feature]]
+name = "ext4 volumes whose directory hashes are or may be unsigned (#308: s_flags EXT2_FLAGS_UNSIGNED_HASH, or neither hash flag with dir_index; ext4plus hashes signed) mount read-only with one warning naming the flag or its absence (and a journal needing recovery outranks it, its warning showing no s_flags); every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (only a non-ASCII hash miss in an htree directory walks it; a read error in the walk or in the hash lookup is EIO), a missing name is ENOENT, and unlink, rmdir and create are EROFS; the same volume with its flag set to signed, or with neither flag and no dir_index, mounts writable (the signed one gets no walk); tools/ext4-signed-hash.sh sets an ext4 image's s_flags to signed (from unsigned, or neither flag), changing nothing else (keeping s_flags' other bits), refuses a missing file or one without ext4's magic, and fails unless the image then says signed; tools/mkrootfs.sh runs it, so an image its mke2fs made unsigned comes out signed (mke2fs -d indexing no directory), passing an ASCII-only directory indexed by the unsigned hash and failing on one holding names with bytes of 0x80 or above"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name",
+    "ktest:lumen_kernel::vfs::ext4::ext4_unwritable_ro_compat_features_force_read_only",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+    "harness:test_rootfs::test_signed_hash_switches_only_the_flag",
+    "harness:test_rootfs::test_signed_hash_fails_when_the_flag_stays_unsigned",
+    "harness:test_rootfs::test_signed_hash_refuses_a_file_without_an_ext4_superblock",
+    "harness:test_rootfs::test_mkrootfs_makes_an_unsigned_image_signed",
+    "harness:test_rootfs::test_mkrootfs_passes_an_ascii_directory_indexed_by_the_unsigned_hash",
+    "harness:test_rootfs::test_mkrootfs_fails_on_a_directory_indexed_by_the_unsigned_hash",
+]
+
+[[feature]]
+name = "`..` from a removed directory is the directory it was removed from (#318), as Linux's d_parent of a deleted dentry: from a removed cwd, chdir(\"..\") succeeds and getcwd then names the parent, open(\"..\", O_DIRECTORY) opens the parent and open(\"..\", O_CREAT) is -EISDIR, on ext4 and on tmpfs; in lumen-vfs's host tests also from a removed directory held open (detached) or freed, in a mounted filesystem's root (../.. crossing up to /), from a directory a rename replaced, through a parent removed in turn while held open (one freed by its removal -ENOENT, never the inode reusing its number), with only ENOENT from the filesystem's .. taking the record, a record found by the directory's Arc and not its reused number, a failed rmdir or rename keeping no record (one that removed the directory all the same keeping it), dead records pruned (their parents dropped outside Lock 9) and unmounting dropping only its filesystem's records; getcwd of a cwd removed during its walk, its number taken by a new entry, -ENOENT, and of a live cwd whose old ancestor was removed during the walk (its number taken) where the cwd is now"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+    "scenario:test_fs::test_posix_vfs_semantics",
 ]

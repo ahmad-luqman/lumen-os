@@ -49,7 +49,7 @@ def test_ext4_read_write_persists_across_reboot(boot, tmp_path):
     assert mount_rows(m1) == {
         "/": ("ext4", "0:1", "rw"),
         "/tmp": ("tmpfs", "0:2", "rw"),
-        "/dev": ("devfs", "0:3", "ro"),
+        "/dev": ("devfs", "0:3", "rw"),
         "/proc": ("procfs", "0:4", "ro"),
     }
     assert run(m1, "mount | count") == "4\n"
@@ -156,7 +156,7 @@ def test_dev_tmp_proc_filesystems(boot):
     assert mount_rows(m) == {
         "/": ("tmpfs", "0:1", "rw"),
         "/tmp": ("tmpfs", "0:2", "rw"),
-        "/dev": ("devfs", "0:3", "ro"),
+        "/dev": ("devfs", "0:3", "rw"),
         "/proc": ("procfs", "0:4", "ro"),
     }
     assert run(m, "mount | count") == "4\n"
@@ -170,7 +170,7 @@ def test_dev_tmp_proc_filesystems(boot):
         assert "dev=0:4" in st and "size=0" in st, st
     assert "MemTotal:" in run(m, "vfstest cat /proc/meminfo")
     assert "processor" in run(m, "vfstest cat /proc/cpuinfo")
-    assert "devfs /dev devfs ro 0 0" in run(m, "vfstest cat /proc/mounts")
+    assert "devfs /dev devfs rw 0 0" in run(m, "vfstest cat /proc/mounts")
     assert "Linux version" in run(m, "vfstest cat /proc/version")
 
     out = run(m, "vfstest dev-tmp-proc")
@@ -327,7 +327,9 @@ def test_posix_vfs_semantics(boot, tmp_path):
     gets every check: symlinks and ELOOP (a loop, 40 links followed and 41
     not, O_NOFOLLOW), a trailing slash following a final symlink under
     O_NOFOLLOW, O_PATH descriptors, hard links and linkat's
-    AT_SYMLINK_FOLLOW, unlink and rmdir while open, getdents64 (types,
+    AT_SYMLINK_FOLLOW, unlink and rmdir while open (#318: `..` from the
+    removed directory as cwd is its parent: chdir, getcwd after it, open
+    O_DIRECTORY, and O_CREAT's EISDIR), getdents64 (types,
     d_ino, a small buffer's cursor, a moved directory's ".."), names that
     aren't UTF-8 (#268: a file, a directory and a symlink target made,
     listed, renamed, hard-linked, read back by getcwd and /proc/self/fd, and
