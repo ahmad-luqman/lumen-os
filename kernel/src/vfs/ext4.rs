@@ -4338,17 +4338,26 @@ pub(crate) mod ktest_util {
 
     use super::{BlockCacheBackend, Ext4FileSystem};
     use crate::sync::SleepMutex;
-    use crate::vfs::MemBlkDev;
+    use crate::vfs::{KernelVfsTables, MemBlkDev};
 
     /// A block cache over an in-memory device that counts reads and writes
-    /// and fails them on request.
+    /// and fails them on request: one write by its number, two, or every
+    /// write from one on (each counted from the `arm_write*` call that set
+    /// it, which disarms the others), every read or write, syncs, or reads
+    /// of a range.
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         pub(in crate::vfs) dev: MemBlkDev,
         pub reads: AtomicUsize,
         pub writes: AtomicUsize,
-        /// Fail the write with this number (counting from `arm_write`), once.
+        /// Fail the write with this number (counting from `arm_write`), once;
+        /// 0 for none.
         fail_write_at: AtomicUsize,
+        /// A second write to fail, once (`arm_write_pair`); 0 for none.
+        fail_write_at2: AtomicUsize,
+        /// Fail every write from this number on (`arm_write_from`); 0 for
+        /// none.
+        fail_write_from: AtomicUsize,
         /// After that write fails, fail every read until cleared.
         pub reads_fail_after_write_fault: AtomicBool,
         /// After that write fails, fail every read of the range set by
@@ -4365,9 +4374,26 @@ pub(crate) mod ktest_util {
     }
 
     impl FaultCache {
+        /// Fail write number `nth` from now (0: none).
         pub fn arm_write(&self, nth: usize) {
+            self.arm_writes(nth, 0, 0);
+        }
+
+        /// Fail writes number `first` and `second` from now.
+        pub fn arm_write_pair(&self, first: usize, second: usize) {
+            self.arm_writes(first, second, 0);
+        }
+
+        /// Fail every write from number `from` on, counting from now.
+        pub fn arm_write_from(&self, from: usize) {
+            self.arm_writes(0, 0, from);
+        }
+
+        fn arm_writes(&self, at: usize, at2: usize, from: usize) {
             self.writes.store(0, Ordering::Release);
-            self.fail_write_at.store(nth, Ordering::Release);
+            self.fail_write_at.store(at, Ordering::Release);
+            self.fail_write_at2.store(at2, Ordering::Release);
+            self.fail_write_from.store(from, Ordering::Release);
         }
 
         pub fn fail_reads_in(&self, lo: u64, hi: u64, count: usize) {
@@ -4378,6 +4404,8 @@ pub(crate) mod ktest_util {
 
         pub fn clear(&self) {
             self.fail_write_at.store(0, Ordering::Release);
+            self.fail_write_at2.store(0, Ordering::Release);
+            self.fail_write_from.store(0, Ordering::Release);
             self.reads_fail_after_write_fault.store(false, Ordering::Release);
             self.range_reads_fail_after_write_fault.store(false, Ordering::Release);
             self.fail_reads.store(false, Ordering::Release);
@@ -4408,7 +4436,11 @@ pub(crate) mod ktest_util {
                 return Err(BlockError::Io);
             }
             let n = self.writes.fetch_add(1, Ordering::AcqRel) + 1;
-            if self.fail_write_at.load(Ordering::Acquire) == n {
+            let from = self.fail_write_from.load(Ordering::Acquire);
+            if self.fail_write_at.load(Ordering::Acquire) == n
+                || self.fail_write_at2.load(Ordering::Acquire) == n
+                || (from != 0 && n >= from)
+            {
                 if self.reads_fail_after_write_fault.load(Ordering::Acquire) {
                     self.fail_reads.store(true, Ordering::Release);
                 }
@@ -4428,10 +4460,13 @@ pub(crate) mod ktest_util {
         }
     }
 
+    /// A writable mount of an image over a [`FaultCache`], with VFS tables
+    /// of its own that have it at `/`.
     pub struct Mnt {
         pub cache: Arc<FaultCache>,
         pub fs: Arc<Ext4FileSystem>,
         pub root: Arc<dyn VfsInode>,
+        pub tables: KernelVfsTables,
     }
 
     pub fn mount(img: Vec<u8>, minor: u32) -> Result<Mnt, &'static str> {
@@ -4442,6 +4477,8 @@ pub(crate) mod ktest_util {
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             fail_write_at: AtomicUsize::new(0),
+            fail_write_at2: AtomicUsize::new(0),
+            fail_write_from: AtomicUsize::new(0),
             reads_fail_after_write_fault: AtomicBool::new(false),
             range_reads_fail_after_write_fault: AtomicBool::new(false),
             fail_reads: AtomicBool::new(false),
@@ -4454,7 +4491,9 @@ pub(crate) mod ktest_util {
         let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&cache) as Arc<dyn BlockCacheBackend>;
         let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "ext4 mount")?;
         let root = fs.root_inode();
-        Ok(Mnt { cache, fs, root })
+        let tables = KernelVfsTables::new();
+        tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+        Ok(Mnt { cache, fs, root, tables })
     }
 
     /// The device's bytes after writing the block cache back.
