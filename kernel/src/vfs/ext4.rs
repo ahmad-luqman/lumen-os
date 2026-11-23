@@ -6685,6 +6685,8 @@ crate::ktest!(
         // still there, with its data and link counts, and nothing was
         // allocated or freed (as a read-only remount sees it). If it landed,
         // the source is at the name and its old name is gone.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use self::{SWEPT_DST as DST, SWEPT_SRC as SRC};
         use crate::{kassert, kassert_eq};
@@ -6991,6 +6993,8 @@ crate::ktest!(
         // A move's source left at both names is checked as any other state
         // (#322: its count, and its new parent's for a directory, are those
         // with both names, whichever undo left it there).
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -7159,6 +7163,8 @@ crate::ktest!(
         // freed, the source stays where it was, and the rename reported an
         // error.
         // Otherwise the target is back at its name or the source took it.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         let quota_before = page_cache::DETACHED_QUOTA.used_pages();
@@ -7241,6 +7247,8 @@ crate::ktest!(
         // Two writes landing and failing (the second within three of the
         // first) reach the `NotFound` arm's fix-ups failing too, which it
         // logs; the same holds then.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         let nlink = |i: &Arc<dyn VfsInode>| i.stat().map(|st| st.nlink).map_err(|_| "stat");
@@ -7309,6 +7317,8 @@ crate::ktest!(
         // lost+found, which a count of 0 would clear instead: #323) and in
         // memory. At least one fault leaves a file nameless, and with reads
         // failing at least one leaves a file at both names.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::kassert;
         use core::sync::atomic::Ordering as O;
@@ -7444,6 +7454,8 @@ crate::ktest!(
         // and then couldn't read `a` back, and the second at least one that
         // took rmdir's zeroed-child arm and one that forgot `sub` for its
         // freed blocks.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -7682,6 +7694,8 @@ crate::ktest!(
         // In the fourth, an `f` whose entry went is never forgotten for its
         // freed blocks, and is kept live only when whether they were freed
         // can't be told, logged, at least once.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -7891,6 +7905,8 @@ crate::ktest!(
         // entry: `f` is kept live (its count in memory at least 1, not
         // detached), logged as undecided, at least once, and `f2` still
         // names it with its data.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -7976,6 +7992,8 @@ crate::ktest!(
         // Fail each write of the unlink once, with every read failing after
         // it: wherever the unlink stops, a symlink whose entry survives must
         // still have its target.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::kassert_eq;
         use core::sync::atomic::Ordering as O;
@@ -8014,6 +8032,8 @@ crate::ktest!(
         // reads failing after it, so the adapter decides from the inode
         // itself: an entry that survived keeps its target, and an inode the
         // unlink already zeroed (and maybe freed) gets nothing written back.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;

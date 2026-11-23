@@ -221,7 +221,7 @@ one is its own PR that updates that doc first.
   paused, a failure answered `Then::Failed`), a
   button per window, the `Clock` (the RTC polled without animating, `rtc::now_quiet`, its last reading kept
   on errors; `desktop tick` moves it a minute ahead), its `taskbar` owner thread
-  (`lumen.taskbar_wake_delay_ms=` holds back a poke's handling, for the scenarios). `klog.rs`: logger (and the ring `dmesg` reads). `rtc.rs`: the CMOS RTC (`date`, `now_quiet` for pollers; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
+  (`lumen.taskbar_wake_delay_ms=` holds back a poke's handling, for the scenarios). `klog.rs`: logger (and the ring `dmesg` reads; ktest kernels: `hold_repeats`, a sweep's repeated lines kept off serial, summarized, #347). `rtc.rs`: the CMOS RTC (`date`, `now_quiet` for pollers; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
   `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
@@ -586,7 +586,7 @@ one is its own PR that updates that doc first.
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
   `stream_of`: which ring each goes to, and typed layouts: `Switch`/`ThreadState`,
-  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free),
+  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free), `repeats` (`klog::hold_repeats`' table),
   and `ThreadName` (#276: a thread's name, 16 bytes inline like Linux's `comm`: at most 15 bytes cut
   at a character boundary, control characters (C0, DEL, C1) and U+2028/U+2029 as `?`; `from_path`,
   a path's last component, the name a binary run by `linux /path` gets; `From<&str>`, the kernel's
@@ -793,7 +793,8 @@ one is its own PR that updates that doc first.
   `PROMPT`), `klog.py` (the kernel log line's format, as kernel/src/klog.rs
   prints it; `HOST_TIMED`, the warnings a loaded host can cause on its own,
   each tied to the kernel's text, and `unexpected_warnings`, a run's "no
-  warning" check without them), `rootfs.py` (matched `e2fsprogs` discovery,
+  warning" check without them; `HOLDING`, `HELD_BACK`, `HELD_ALL`: a
+  `klog::hold_repeats` guard's lines), `rootfs.py` (matched `e2fsprogs` discovery,
   per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, `debugfs`
   and `debugfs_names` (reading an image back, any error line failing), and
   `llvm-readobj` dynamic musl ELF checks, and `warm_up`: one uncounted
