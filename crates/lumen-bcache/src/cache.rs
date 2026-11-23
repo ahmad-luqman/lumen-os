@@ -61,6 +61,8 @@ struct CacheInner {
     mru_head: Option<usize>,
     lru_tail: Option<usize>,
     needs_device_flush: bool,
+    /// [`BlockCache::freeze`]: nothing is written to the device.
+    frozen: bool,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -77,6 +79,7 @@ impl CacheInner {
             mru_head: None,
             lru_tail: None,
             needs_device_flush: false,
+            frozen: false,
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -119,10 +122,13 @@ impl CacheInner {
         self.link_mru(idx);
     }
 
+    /// The least recently used unpinned slot; a clean one while the cache
+    /// is frozen (a dirty one would be written back first).
     fn find_lru_unpinned(&self) -> Option<usize> {
         let mut cur = self.lru_tail;
         while let Some(idx) = cur {
-            if self.slots[idx].pin_count == 0 {
+            let evictable = !self.frozen || matches!(self.slots[idx].state, SlotState::Occupied { dirty: false, .. });
+            if self.slots[idx].pin_count == 0 && evictable {
                 return Some(idx);
             }
             cur = self.slots[idx].prev;
@@ -206,6 +212,34 @@ impl<B: BlockDevice> BlockCache<B> {
     /// Whether dirty writes have hit the device since the last successful [`BlockDevice::flush`].
     pub fn needs_device_flush(&self) -> bool {
         self.inner.borrow().needs_device_flush
+    }
+
+    /// Stop writing to the device, for good unless [`Self::thaw`]ed: every
+    /// write ([`Self::write_at`], [`Self::pin_mut`]), [`Self::sync`] and
+    /// [`Self::flush_blocks`] returns [`BlockError::ReadOnly`] without
+    /// writing or flushing anything, and eviction takes only clean slots,
+    /// so dirty blocks stay cached and keep being read (a miss while every
+    /// unpinned slot is dirty returns [`BlockError::CacheFull`]). For a
+    /// filesystem that stops writing after a write error (`ext4`'s
+    /// `errors=remount-ro`).
+    pub fn freeze(&self) {
+        self.inner.borrow_mut().frozen = true;
+    }
+
+    /// Undo [`Self::freeze`]: for tests reading back what a frozen cache
+    /// holds.
+    pub fn thaw(&self) {
+        self.inner.borrow_mut().frozen = false;
+    }
+
+    /// Whether [`Self::freeze`] stopped the cache's writes.
+    pub fn is_frozen(&self) -> bool {
+        self.inner.borrow().frozen
+    }
+
+    /// `ReadOnly` for a write while the device or the cache is read-only.
+    fn check_writable(&self) -> Result<(), BlockError> {
+        if self.info.read_only || self.inner.borrow().frozen { Err(BlockError::ReadOnly) } else { Ok(()) }
     }
 
     /// Current cache statistics snapshot.
@@ -365,9 +399,7 @@ impl<B: BlockDevice> BlockCache<B> {
 
     /// Pin 4 KiB block `block_id` for exclusive mutable access.
     pub fn pin_mut(&self, block_id: u64) -> Result<PinnedBlockMut<'_, B>, BlockError> {
-        if self.info.read_only {
-            return Err(BlockError::ReadOnly);
-        }
+        self.check_writable()?;
         let slot_idx = self.ensure_slot(block_id, false)?;
         let mut inner = self.inner.borrow_mut();
         let data_ptr: *const RefCell<[u8; BLOCK_SIZE]> = &*inner.slots[slot_idx].data;
@@ -414,9 +446,7 @@ impl<B: BlockDevice> BlockCache<B> {
 
     /// Write `src` starting at byte offset `byte_off`.
     pub fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError> {
-        if self.info.read_only {
-            return Err(BlockError::ReadOnly);
-        }
+        self.check_writable()?;
         let end = byte_off.checked_add(src.len() as u64).ok_or(BlockError::OutOfRange)?;
         if end > self.total_bytes {
             return Err(BlockError::OutOfRange);
@@ -496,6 +526,9 @@ impl<B: BlockDevice> BlockCache<B> {
     }
 
     fn writeback_and_flush(&self, dirty_list: &[(u64, usize)]) -> Result<(), BlockError> {
+        if self.inner.borrow().frozen {
+            return Err(BlockError::ReadOnly);
+        }
         {
             let inner = self.inner.borrow();
             for &(block_id, slot_idx) in dirty_list {

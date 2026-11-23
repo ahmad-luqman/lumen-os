@@ -513,3 +513,51 @@ fn unmodified_pin_mut_stays_clean_and_allows_sync() {
         assert_eq!(cache.device().durable_snapshot()[0], 0x66);
     }
 }
+
+#[test]
+fn a_frozen_cache_writes_nothing_and_keeps_its_dirty_blocks() {
+    let dev = MemBlockDevice::new(512, 64); // 8 blocks of 4 KiB
+    for b in 0..8u8 {
+        dev.seed(usize::from(b) * BLOCK_SIZE, &[b + 1; 8]);
+    }
+    let cache = BlockCache::new(dev, 3).unwrap();
+    // Block 0 dirty, blocks 1 and 2 clean (LRU tail: 0, then 1, then 2).
+    cache.write_at(0, &[0xaa; 4]).unwrap();
+    cache.pin(1).unwrap();
+    cache.pin(2).unwrap();
+    // One write before the freeze lands on a sync, as ever.
+    cache.write_at(BLOCK_SIZE as u64, &[0xbb; 4]).unwrap();
+    cache.flush_blocks(&[1]).unwrap();
+    cache.device().clear_logs();
+    let before = cache.device().volatile_snapshot();
+
+    cache.freeze();
+    assert!(cache.is_frozen());
+    assert_eq!(cache.write_at(2 * BLOCK_SIZE as u64, &[0xcc; 4]), Err(BlockError::ReadOnly));
+    assert_eq!(cache.pin_mut(2).err(), Some(BlockError::ReadOnly));
+    assert_eq!(cache.sync(), Err(BlockError::ReadOnly));
+    assert_eq!(cache.flush_blocks(&[0]), Err(BlockError::ReadOnly));
+    // Misses evict the clean blocks, never the dirty one, which still reads
+    // back as written.
+    for id in 3..8u64 {
+        assert_eq!(cache.pin(id).unwrap()[0], id as u8 + 1);
+    }
+    let mut got = [0u8; 4];
+    cache.read_at(0, &mut got).unwrap();
+    assert_eq!(got, [0xaa; 4]);
+    assert_eq!(cache.stats().dirty, 1);
+    // With every unpinned slot dirty a miss can't be served.
+    {
+        let _p6 = cache.pin(6).unwrap();
+        let _p7 = cache.pin(7).unwrap();
+        assert_eq!(cache.pin(5).err(), Some(BlockError::CacheFull));
+    }
+    assert!(cache.device().write_log().is_empty());
+    assert_eq!(cache.device().flush_calls(), 0);
+    assert_eq!(cache.device().volatile_snapshot(), before);
+
+    // Thawed (the tests' way to read back what it held), it writes again.
+    cache.thaw();
+    cache.sync().unwrap();
+    assert_eq!(cache.device().durable_snapshot()[..4], [0xaa; 4]);
+}
