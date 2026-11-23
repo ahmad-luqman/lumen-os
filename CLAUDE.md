@@ -793,7 +793,8 @@ one is its own PR that updates that doc first.
   `PROMPT`), `klog.py` (the kernel log line's format, as kernel/src/klog.rs
   prints it; `HOST_TIMED`, the warnings a loaded host can cause on its own,
   each tied to the kernel's text, and `unexpected_warnings`, a run's "no
-  warning" check without them), `rootfs.py` (matched `e2fsprogs` discovery,
+  warning" check without them; `HOLDING`, `HELD_BACK`, `HELD_ALL`: a
+  `klog::hold_repeats` guard's lines), `rootfs.py` (matched `e2fsprogs` discovery,
   per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, `debugfs`
   and `debugfs_names` (reading an image back, any error line failing), and
   `llvm-readobj` dynamic musl ELF checks, and `warm_up`: one uncounted

@@ -1,6 +1,7 @@
 """Run the in-kernel test suite (`--features ktest`) and check its TAP output."""
 
 import re
+from collections import Counter
 
 import pytest
 from lumen_harness import REPO_ROOT, klog, save_ktest_tap, tap
@@ -195,10 +196,11 @@ def test_in_kernel_tests_pass(boot):
 # unlinks and rmdirs whose free failed after the entry went) depend on how
 # many writes `ext4plus` makes, so they're counted as present; every other
 # line is counted exactly, and a line matching none of these (or two)
-# fails. The sweeps hold their repeats back from serial (`VFS_HELD_KTESTS`):
-# a call site's first line is matched as printed, and its summary's count goes
-# to the family of the newest line it copies (each call site's format fits one
-# family).
+# fails. The sweeps hold their repeats back from serial (`VFS_HELD_KTESTS`,
+# `check_vfs_log_lines`): each sweep family has one call site, whose first
+# line is printed and whose summary's count goes to that family. An exact
+# family's site may make lines of several (writeback's `NoSpc` and `Io`), so
+# none is held.
 _DEV = r"DevId\(\d+\)"
 VFS_SWEEP_LINES = (
     (
@@ -351,65 +353,73 @@ def vfs_family(line):
 
 
 def check_vfs_log_lines(out):
-    """Pin the vfs ktests' WARN and ERROR lines (see VFS_EXACT_LINES): those
-    printed, plus those `klog::hold_repeats` held back, counted from their
-    summaries (`klog.HELD_BACK`: each a call site's lines after its printed
-    first, and a copy of the newest, whose family the count goes to: each
-    call site's format fits one family). Every sweep line printed, and every
-    summary, falls inside a vfs guard, and each guard prints at most one line
-    per sweep family it reaches: a sweep without a guard fails here, not at
-    the time bound."""
+    """Pin the vfs ktests' WARN and ERROR lines (see VFS_EXACT_LINES), in one
+    pass over the log's lines: those printed, plus those `klog::hold_repeats`
+    held back, counted from their summaries (`klog.HELD_BACK`: a call site's
+    lines after its printed first, and a copy of the newest, whose family the
+    count goes to). Each vfs guard (`klog.HOLDING` to `klog.HELD_ALL`):
+    - holds only sweep lines (each sweep family has one call site; an exact
+      family's site can make lines of several, so none is held);
+    - prints at most one line of each sweep family, the first of its site;
+    - has a summary only for a family it printed, and only vfs summaries;
+    - ends with a total that is the sum of its summaries.
+    Every printed sweep line and every vfs summary falls inside a vfs guard,
+    and the guards on serial are the kernel source's: a sweep without a guard
+    fails here, not at the time bound."""
     tally = dict.fromkeys((*VFS_EXACT_LINES, *VFS_SWEEP_LINES), 0)
-    unknown = []
-    guards = []  # each guard's (sweep lines printed, summaries)
-    inside = None
-    outside = []
-    events = sorted(
-        [
-            (m.start(), "line", m)
-            for m in re.finditer(rf"{klog.STAMP} ((?:WARN |ERROR) vfs: .*)\n", out)
-        ]
-        + [(m.start(), "held", m) for m in klog.HELD_BACK.finditer(out)]
-        + [(m.start(), "start", m) for m in klog.HOLDING.finditer(out) if m["tag"] == "vfs"]
-        + [(m.start(), "end", m) for m in klog.HELD_ALL.finditer(out) if m["tag"] == "vfs"],
-        key=lambda e: e[0],
-    )
-    for _, kind, m in events:
-        if kind == "start":
-            assert inside is None, "a vfs guard started inside another"
-            inside = [0, 0]
+    problems = []
+    guards = 0
+    held_any = False
+    guard = None  # inside a vfs guard: its printed families and summaries' total
+    for m in klog.LOG_LINE.finditer(out):
+        if (start := klog.HOLDING.fullmatch(m[0])) and start["tag"] == "vfs":
+            assert guard is None, "a vfs guard started inside another"
+            guard = {"printed": Counter(), "held": 0}
             continue
-        if kind == "end":
-            assert inside is not None, "a vfs guard's last line without its first"
-            guards.append(tuple(inside))
-            inside = None
+        if (end := klog.HELD_ALL.fullmatch(m[0])) and end["tag"] == "vfs":
+            assert guard is not None, "a vfs guard's last line without its first"
+            if int(end["n"]) != guard["held"]:
+                problems.append(("a guard's total isn't its summaries' sum", end[0], guard["held"]))
+            over = [f for f, n in guard["printed"].items() if n > 1]
+            if over:
+                problems.append(("a sweep family printed more than once in a guard", over))
+            guards += 1
+            guard = None
             continue
-        if kind == "held" and not re.match(r"(?:WARN |ERROR) vfs: ", m["last"]):
+        summary = klog.HELD_BACK.fullmatch(m[0])
+        line, weight = (
+            (summary["last"], int(summary["n"])) if summary else (klog.without_stamp(m[0])[:-1], 1)
+        )
+        if not re.fullmatch(r"(?:WARN |ERROR) vfs: .*", line):
+            if summary and guard is not None:
+                problems.append(("a summary inside a vfs guard that isn't a vfs line", line))
             continue
-        line, weight = (m[1], 1) if kind == "line" else (m["last"], int(m["n"]))
         family = vfs_family(line)
         if family is None:
-            unknown.append(line)
+            problems.append(("a vfs line fitting no family", line))
             continue
         tally[family] += weight
-        if kind == "held" or family in VFS_SWEEP_LINES:
-            if inside is None:
-                outside.append(line)
-            elif kind == "held":
-                inside[1] += 1
-            else:
-                inside[0] += 1
-    assert inside is None, "a vfs guard never ended"
-    assert not unknown, unknown
+        if not summary and family not in VFS_SWEEP_LINES:
+            continue
+        if guard is None:
+            problems.append(("a sweep line or summary outside a vfs guard", line))
+        elif not summary:
+            guard["printed"][family] += 1
+        elif family not in VFS_SWEEP_LINES:
+            problems.append(("an exact family held back", line))
+        elif family not in guard["printed"]:
+            problems.append(("a summary of a family its guard didn't print", line))
+        else:
+            guard["held"] += weight
+            held_any = True
+    assert guard is None, "a vfs guard never ended"
+    assert not problems, problems
     counts = {want: tally[want] for want in VFS_EXACT_LINES}
     assert counts == VFS_EXACT_LINES, counts
     sweeps = {want: tally[want] for want in VFS_SWEEP_LINES}
     assert all(sweeps.values()), sweeps
-    assert not outside, ("sweep lines or summaries outside a vfs guard", outside)
-    assert len(guards) == VFS_HELD_KTESTS, (len(guards), VFS_HELD_KTESTS)
-    assert any(held for _, held in guards), "no vfs lines held back: the guards hold nothing"
-    over = [printed for printed, _ in guards if printed > len(VFS_SWEEP_LINES)]
-    assert not over, ("sweep lines printed in a guard, past one per family", over)
+    assert guards == VFS_HELD_KTESTS, (guards, VFS_HELD_KTESTS)
+    assert held_any, "no vfs lines held back: the guards hold nothing"
 
 
 def check_held_back_lines(out):

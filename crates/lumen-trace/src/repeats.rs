@@ -14,6 +14,7 @@ use core::fmt;
 
 /// What [`Repeats::see`] made of a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "a line is printed or held by what was seen"]
 pub enum Seen {
     /// Its first line: print it.
     First,
@@ -195,9 +196,9 @@ mod tests {
         // Only keys with repeats are reported, in the order first seen,
         // each with its newest line's text.
         assert_eq!(summary(&r), [(3, "seven 3".into())]);
-        r.see(9, line("nine 1"));
+        let _ = r.see(9, line("nine 1"));
         assert_eq!(r.see(5, line("five 0")), Seen::First);
-        r.see(5, line("five 1"));
+        let _ = r.see(5, line("five 1"));
         assert_eq!(summary(&r), [(3, "seven 3".into()), (1, "nine 1".into()), (1, "five 1".into())]);
     }
 
@@ -212,8 +213,8 @@ mod tests {
     #[test]
     fn a_new_key_past_the_table_is_never_held() {
         let mut r = Repeats::<u32, 2, 32>::new();
-        r.see(1, line("one"));
-        r.see(2, line("two"));
+        let _ = r.see(1, line("one"));
+        let _ = r.see(2, line("two"));
         // Every line of a third key is printed: none counted or kept.
         for _ in 0..3 {
             let seen = r.see(3, |_| panic!("a full table kept a text"));
@@ -230,42 +231,42 @@ mod tests {
         let mut r = Repeats::<u32, 2, 32>::new();
         assert!(r.is_empty());
         // A key seen once, nothing held: not empty all the same.
-        r.see(1, line("one"));
+        let _ = r.see(1, line("one"));
         assert!(!r.is_empty() && summary(&r).is_empty());
-        r.see(1, line("one again"));
-        r.see(2, line("two"));
+        let _ = r.see(1, line("one again"));
+        let _ = r.see(2, line("two"));
         r.clear();
         assert!(r.is_empty());
         assert_eq!(summary(&r), []);
         // A key seen before is a first again, and the room is back.
         assert_eq!(r.see(2, line("two")), Seen::First);
         assert_eq!(r.see(3, line("three")), Seen::First);
-        r.see(2, line("two again"));
+        let _ = r.see(2, line("two again"));
         assert_eq!(summary(&r), [(1, "two again".into())]);
     }
 
     #[test]
     fn a_long_text_is_cut_at_a_character_and_says_so() {
         let mut r = Repeats::<u32, 2, 8>::new();
-        r.see(1, |_| {});
+        let _ = r.see(1, |_| {});
         // "abcdefg" and then 'é' (2 bytes) would end at byte 9: cut before it.
-        r.see(1, |t| t.write_str("abcdefgé and more").unwrap());
+        let _ = r.see(1, |t| t.write_str("abcdefgé and more").unwrap());
         let (_, text) = r.held().next().unwrap();
         assert_eq!((text.as_str(), text.is_cut()), ("abcdefg", true));
         assert_eq!(text.to_string(), "abcdefg...");
         // Written in pieces, exactly filling it: whole, not cut.
-        r.see(1, |t| ["abcd", "efgh"].iter().for_each(|s| t.write_str(s).unwrap()));
+        let _ = r.see(1, |t| ["abcd", "efgh"].iter().for_each(|s| t.write_str(s).unwrap()));
         let (_, text) = r.held().next().unwrap();
         assert_eq!((text.as_str(), text.is_cut(), text.to_string()), ("abcdefgh", false, "abcdefgh".into()));
         // One byte more, in a later piece: cut.
-        r.see(1, |t| ["abcdefgh", "i"].iter().for_each(|s| t.write_str(s).unwrap()));
+        let _ = r.see(1, |t| ["abcdefgh", "i"].iter().for_each(|s| t.write_str(s).unwrap()));
         assert_eq!(summary(&r), [(3, "abcdefgh...".into())]);
         // Once cut, a later piece that would fit isn't added: the text
         // stays cut, never reading as whole.
-        r.see(1, |t| ["abcdefgé", "x"].iter().for_each(|s| t.write_str(s).unwrap()));
+        let _ = r.see(1, |t| ["abcdefgé", "x"].iter().for_each(|s| t.write_str(s).unwrap()));
         assert_eq!(summary(&r), [(4, "abcdefg...".into())]);
         // A repeat's text replaces the last one's whole, cut or not.
-        r.see(1, line_8("short"));
+        let _ = r.see(1, line_8("short"));
         assert_eq!(summary(&r), [(5, "short".into())]);
     }
 

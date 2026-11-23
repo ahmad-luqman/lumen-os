@@ -25,16 +25,17 @@
 //! with the `lumen_kernel::` prefix removed. The level threshold comes from
 //! `lumen.log=<level>` on the command line (default `info`).
 //!
-//! Every emitted line also records a `Log` event in the trace ring
-//! (`crate::trace`); recording it doesn't change the printed line. The
+//! Every line logged through `log` also records a `Log` event in the trace
+//! ring (`crate::trace`); recording it doesn't change the printed line. The
 //! lines are also kept as serial prints them, the newest [`RING_BYTES`]
 //! bytes of them, for the shell's `dmesg` ([`copy_recent`]).
 //!
 //! In the ktest kernel, [`hold_repeats`] holds a ktest's repeated warnings
 //! and errors back from serial while it runs (#347): the fault sweeps log
-//! thousands, and under KVM each line on the UART took up to 30 ms (#332's
-//! failed run). Those held lines still record their trace event and go to
-//! the ring; only serial and the screen skip them.
+//! thousands, and under KVM each line on the UART took about 30 ms in
+//! #332's failed run (the median). Those held lines still record their trace
+//! event and go to the ring; only serial and the screen skip them. The
+//! guard's own lines (its start, summaries and end) record no trace event.
 
 use crate::arch::serial;
 use crate::sync::{SpinLock, SpinLockGuard};
@@ -213,19 +214,21 @@ fn line_to(mut out: impl Write, stamp: lumen_time::Stamp, level: Level, tag: &st
 ///   printed as always; its later ones only record their trace event and go
 ///   to the ring (`dmesg`), not to serial or the screen.
 /// - When the guard drops, one line per call site that had any held says
-///   how many and repeats the newest (the nearest a failure), e.g. `INFO
-///   klog: 56 more held back, the last: ERROR vfs: ...`, and then `INFO
-///   klog: no longer holding <tag>'s repeats: <n> held back`. test_ktest
-///   counts each family from these. These lines are printed whatever
-///   `lumen.log` says (they stand for warnings and errors).
+///   how many and repeats the newest (the nearest a failure), e.g.
+///   `INFO  klog: 56 more held back, the last: ERROR vfs: ...`, and then
+///   `INFO  klog: no longer holding <tag>'s repeats: <n> held back`.
+///   These lines are printed whatever `lumen.log` says (they stand for
+///   warnings and errors).
 ///
 /// The hold is global: it holds `tag`'s repeats from every CPU and thread,
 /// not just the caller's. Every other line is printed as always: other
 /// tags', and `info` and below. Panics if a guard is alive (ktests run one
 /// at a time).
 ///
-/// For a sweep logging the same failures thousands of times. Don't hold a
-/// tag whose lines a test counts one by one.
+/// For a sweep logging the same failures thousands of times. A test that
+/// counts a held tag's lines must count them from the summaries too, as
+/// test_ktest does for `vfs`; one counting printed lines alone would miss
+/// the held ones.
 #[cfg(feature = "ktest")]
 pub fn hold_repeats(tag: &'static str) -> HeldRepeats {
     debug_assert_eq!(tag_for(tag), tag, "hold_repeats takes a line's tag, not a module path");
@@ -281,8 +284,9 @@ mod held {
     use log::{Level, Record};
     use lumen_trace::repeats::{Repeats, Text};
 
-    /// Call sites one guard can hold (a sweep's have been under ten); one
-    /// past them is printed as if nothing were held.
+    /// Call sites one guard can hold (a sweep's have been under ten); once
+    /// all are taken, every line of a site not among them is printed as if
+    /// nothing were held.
     const SITES: usize = 32;
     /// A held line's text kept, from its level on (the vfs sweeps' are
     /// under 200 bytes); a longer one is shown cut, ending `...`.
@@ -335,12 +339,17 @@ mod held {
             if held != tag || record.level() > Level::Warn {
                 return false;
             }
-            // `log`'s macros always give both.
+            // `log`'s macros always give both (a missing one only merges
+            // sites, in a release build).
+            debug_assert!(record.file_static().is_some() && record.line().is_some());
             let site = (record.file_static().unwrap_or("?"), record.line().unwrap_or(0), record.level());
             let seen = self.repeats.see(site, |text| {
                 use core::fmt::Write;
-                // A cut is shown (`Text`'s `...`); nothing else fails.
-                let _ = write!(text, "{:<5} {tag}: {}", record.level(), record.args());
+                // A cut is shown (`Text`'s `...`); an argument's formatting
+                // failing part way is marked as the printed path marks it.
+                if write!(text, "{:<5} {tag}: {}", record.level(), record.args()).is_err() {
+                    let _ = text.write_str(" <formatting failed>");
+                }
             });
             seen.is_held()
         }
@@ -354,8 +363,10 @@ mod held {
         ///
         /// [`summaries`]: Self::summaries
         pub(super) fn stop(&mut self) {
-            if let State::Holding(tag) = self.state {
-                self.state = State::Draining(tag);
+            match self.state {
+                State::Holding(tag) => self.state = State::Draining(tag),
+                // Only a guard stops, and only once.
+                State::Idle | State::Draining(_) => debug_assert!(false, "klog: stopping holding that isn't"),
             }
         }
 
@@ -363,8 +374,16 @@ mod held {
         /// the tag that was held.
         pub(super) fn forget(&mut self) -> &'static str {
             let tag = match self.state {
-                State::Holding(tag) | State::Draining(tag) => tag,
-                State::Idle => "",
+                State::Draining(tag) => tag,
+                // Only after `stop`.
+                State::Holding(tag) => {
+                    debug_assert!(false, "klog: forgetting {tag}'s repeats while holding them");
+                    tag
+                }
+                State::Idle => {
+                    debug_assert!(false, "klog: forgetting repeats nobody held");
+                    "?"
+                }
             };
             self.repeats.clear();
             self.state = State::Idle;
