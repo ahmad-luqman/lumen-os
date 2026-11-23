@@ -267,11 +267,14 @@ mod tests {
     use lumen_vm::{MapPlace, Prot};
 
     use super::super::at::{self, Dirfd, Fd, UserPtr};
-    use super::super::fd::{ktest_fd, ktest_user_path, sys_close, sys_open, sys_openat};
+    use super::super::fd::{
+        ktest_failed_at, ktest_fd_of, ktest_install, ktest_open, ktest_unlink, ktest_user_path, sys_close, sys_open,
+        sys_openat,
+    };
     use super::super::neg_errno;
     use super::*;
     use crate::linux::general;
-    use crate::linux::process::{self, KernelFile};
+    use crate::linux::process;
     use crate::mm::user_vm::{FaultResult, Sharing};
     use crate::user::copy_to_user;
     use crate::{kassert, kassert_eq};
@@ -311,7 +314,7 @@ mod tests {
     fn make_file(slot: u64, path: &[u8], data: &[u8]) -> Result<UserPtr, &'static str> {
         let p = ktest_user_path(slot, path)?;
         let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-        let fd = ktest_fd(sys_open(p, flags, at::reg(0o644)))?;
+        let fd = ktest_fd_of(sys_open(p, flags, at::reg(0o644)), "open", path)?;
         let path = core::str::from_utf8(path).map_err(|_| "utf-8")?;
         if inode_of(path)?.write_at(0, data).map_err(|_| "write_at")? != data.len() {
             return Err("short write");
@@ -321,17 +324,34 @@ mod tests {
     }
 
     /// Open `path` (already in user memory) with `flags`: the descriptor.
+    /// A failure's `ktest::diag` line names the path, read back from user
+    /// memory, and the flags.
     fn open(path: UserPtr, flags: u32) -> Result<Fd, &'static str> {
-        ktest_fd(sys_open(path, OpenFlags::from_bits(flags), at::reg(0)))
+        let ret = sys_open(path, OpenFlags::from_bits(flags), at::reg(0));
+        if ret < lumen_vfs::MAX_FDS as u64 {
+            return Ok(at::reg(ret));
+        }
+        let name = at::UserPath::copy_in(path, true).map(|p| p.as_bytes().to_vec());
+        let call = alloc::format!("open({flags:#o})");
+        ktest_fd_of(ret, &call, name.as_deref().unwrap_or(b"<unreadable path>"))
     }
 
     fn symlink(target: &[u8], at: &[u8]) -> Result<(), &'static str> {
         lumen_vfs::symlink_at(crate::vfs::tables(), target, None, at).map(|_| ()).map_err(|_| "symlink")
     }
 
+    /// Remove each of `paths`. The tests call it before making their
+    /// files (an earlier run's, if it crashed) and after, with names a test
+    /// may not have made (its `-link`s), so `NoEnt` is expected; any other
+    /// failure (a directory left at the name, say) gets a `ktest::diag`
+    /// line naming the path, without failing the test.
     fn remove(paths: &[&[u8]]) {
         for p in paths {
-            let _ = lumen_vfs::unlink_at(crate::vfs::tables(), None, p, false);
+            if let Err(e) = ktest_unlink(p)
+                && e != lumen_vfs::VfsError::NoEnt
+            {
+                ktest_failed_at("remove a test's file", p, e);
+            }
         }
     }
 
@@ -378,7 +398,7 @@ mod tests {
                 kassert_eq!(sys_fchmod(opath, at::reg(0o600)), neg_errno(errno::EBADF));
                 kassert_eq!(sys_fchmod(at::reg(900), at::reg(0o600)), neg_errno(errno::EBADF));
                 // fchmodat relative to a directory descriptor.
-                let tmp = open(ktest_user_path(2, b"/tmp")?, OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+                let tmp = ktest_open(2, b"/tmp", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
                 let rel = ktest_user_path(3, b"meta-ktest-chmod")?;
                 kassert_eq!(sys_fchmodat(Dirfd::Fd(tmp), rel, at::reg(0o604)), 0);
                 kassert_eq!(meta_of("/tmp/meta-ktest-chmod")?.mode, 0o604);
@@ -467,7 +487,7 @@ mod tests {
                 kassert_eq!(sys_fchownat(Dirfd::Cwd, link, u32::MAX, 8, flags(0)), 0);
                 kassert_eq!(owner("/tmp/meta-ktest-chown")?, (3, 8));
                 // fchownat relative to a dirfd, and AT_EMPTY_PATH on its file.
-                let tmp = open(ktest_user_path(2, b"/tmp")?, OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+                let tmp = ktest_open(2, b"/tmp", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
                 let rel = ktest_user_path(3, b"meta-ktest-chown")?;
                 kassert_eq!(sys_fchownat(Dirfd::Fd(tmp), rel, 9, 10, flags(0)), 0);
                 kassert_eq!(owner("/tmp/meta-ktest-chown")?, (9, 10));
@@ -720,18 +740,23 @@ mod tests {
                 // descriptor installed on a scratch volume's file; on its
                 // read-only mount, `-EROFS`.
                 let vol = Ext4Volume::new(200)?;
-                let big = vol.root.create(b"big", 0o644).map_err(|_| "create on ext4")?;
-                let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file = KernelFile::new_unchecked_flags(big, Arc::from(*b"/big"), rw).map_err(|_| "open on ext4")?;
-                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                // Each inode a temporary, dropped at the end of its install's
+                // statement, so closing `fd` drops the inode's last reference.
+                let fd = ktest_install(
+                    &vol.root.create(b"big", 0o644).map_err(|_| "create on ext4")?,
+                    b"/big-rw",
+                    OpenFlags::O_RDWR,
+                )?;
                 kassert_eq!(sys_ftruncate(fd, i64::MAX as u64), neg_errno(errno::EFBIG));
                 kassert_eq!(sys_ftruncate(fd, 5000), 0);
                 kassert_eq!(fd.file().map(|f| f.inode.stat().map(|m| m.size)), Ok(Ok(5000)));
                 kassert_eq!(sys_close(fd), 0);
                 let ro_root = vol.remount_ro(201)?;
-                let ro_big = ro_root.lookup(b"big").map_err(|_| "lookup on the ro mount")?;
-                let file = KernelFile::new_unchecked_flags(ro_big, Arc::from(*b"/big"), rw).map_err(|_| "open ro")?;
-                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                let fd = ktest_install(
+                    &ro_root.lookup(b"big").map_err(|_| "lookup on the ro mount")?,
+                    b"/big-ro",
+                    OpenFlags::O_RDWR,
+                )?;
                 kassert_eq!(sys_ftruncate(fd, 0), neg_errno(errno::EROFS));
                 kassert_eq!(sys_close(fd), 0);
                 remove(&[b"/tmp/meta-ktest-terr"]);
@@ -757,10 +782,7 @@ mod tests {
                 let m = fault_ext4(203)?;
                 let f = m.root.create(b"suid", 0o644).map_err(|_| "create on ext4")?;
                 f.set_mode(0o4755).map_err(|_| "set_mode")?;
-                let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(*b"/suid"), rw)
-                    .map_err(|_| "open on ext4")?;
-                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                let fd = ktest_install(&f, b"/suid", OpenFlags::O_RDWR)?;
                 let disk = |minor| {
                     remount_ro(&m, minor)?.root_inode().lookup(b"suid").and_then(|i| i.stat()).map_err(|_| "remount")
                 };
@@ -842,10 +864,7 @@ mod tests {
                 let vol = Ext4Volume::new(202)?;
                 let f = vol.root.create(b"map", 0o644).map_err(|_| "create on ext4")?;
                 kassert_eq!(f.write_at(0, &data), Ok(data.len()));
-                let rw = OpenFlags::from_bits(OpenFlags::O_RDWR);
-                let file = KernelFile::new_unchecked_flags(Arc::clone(&f), Arc::from(*b"/map"), rw)
-                    .map_err(|_| "open on ext4")?;
-                let fd: Fd = at::reg(process::install_current_fd(file, false).map_err(|_| "install")? as u64);
+                let fd = ktest_install(&f, b"/map", OpenFlags::O_RDWR)?;
                 shrink_unmaps(&f, || sys_ftruncate(fd, P + 10))
                     .inspect_err(|_| crate::ktest::diag(format_args!("ftruncate on ext4")))?;
                 kassert_eq!(sys_close(fd), 0);
@@ -870,7 +889,7 @@ mod tests {
                 };
                 let high = 0xdead_beef_0000_0000u64;
                 let path = make_file(0, b"/tmp/meta-ktest-regs", b"0123456789")?.addr();
-                let tmp = open(ktest_user_path(1, b"/tmp")?, OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+                let tmp = ktest_open(1, b"/tmp", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
                 let rel = ktest_user_path(2, b"meta-ktest-regs")?.addr();
                 let fd = open(at::reg(path), OpenFlags::O_RDWR)?;
                 let fdr = fd.raw() as u64;
