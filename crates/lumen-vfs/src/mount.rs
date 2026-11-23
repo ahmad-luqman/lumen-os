@@ -359,10 +359,16 @@ pub trait VfsCacheOps {
 /// `name()` (`fs_read_only`, `list_mounts`), Locks 1–8, or the drops of the
 /// inodes `umount` evicts. Some calls into the filesystems still run under
 /// them: `VfsInode::dev_id`, `ino` and `cacheable` and `FileSystem::dev_id`
-/// (fixed state, by design), and #320's pre-existing cases
+/// (fixed state, by design), `VfsInode::is_detached` (an atomic load in
+/// ext4 and tmpfs, but not fixed state: a detach sets it), and #320's
+/// pre-existing cases
 /// (`MountTable::mount_with_ino`'s `inode_type()` and its error paths'
 /// `Arc` drops, the unmounted mountpoint's `Arc` dropped inside
-/// `MountTable::umount`, the `Arc`s `InodeCache::get_or_insert` drops).
+/// `MountTable::umount`, the `Arc` each of `InodeCache`'s `get_or_insert*`
+/// is handed and drops when it finds a live entry, and the stale (detached
+/// or `ino`-mismatched) entries `InodeCache` drops in `get_if_fresh`, every
+/// `get_or_insert*`, `end_removal`, `evict_detached` and
+/// `record_removal_if_absent`).
 pub struct VfsTables<F: LockFamily> {
     mounts: F::Lock<MountTable>,
     dentries: F::Lock<DentryCache>,
@@ -467,7 +473,7 @@ impl<F: LockFamily> VfsTables<F> {
     }
 
     /// Every active mount, `/` first; the filesystems are asked for their
-    /// name and read-only flag after the lock is released.
+    /// device, name and read-only flag after the lock is released.
     pub fn list_mounts(&self) -> Vec<MountInfo> {
         let mounts = self.mounts.lock().snapshot_mounts();
         mounts.into_iter().map(|(fs, path)| MountInfo::of(fs.as_ref(), path)).collect()
@@ -523,8 +529,10 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     }
 
     fn fs_read_only(&self, dev: DevId) -> bool {
-        // The guard is released before `read_only` runs, as every other
-        // probe does before calling into the filesystem.
+        // The guard is released before `read_only` runs, as `root_inode`
+        // does before `root_inode()` (`fs_by_dev` still asks each mounted
+        // filesystem's `dev_id()` under it; the struct doc lists what runs
+        // under the guards).
         let fs = self.mounts.lock().fs_by_dev(dev);
         fs.is_some_and(|fs| fs.read_only())
     }
