@@ -5568,11 +5568,13 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     the source's count from before plus one (at least 3 for a directory)
     and, for a directory, the new parent's plus one. An entry that did go
     then leaves a count one high, for `e2fsck`; never one low, which frees
-    an inode that the other name still points at (#322). An exchange's undo
-    that finds a child at neither name keeps the child's count from before
-    rather than writing 0 onto its allocated inode (which `e2fsck` would
-    clear instead of reattaching in `lost+found`); with fewer names it
-    writes the count its names call for (#323). A directory move whose
+    an inode that the other name still points at (#322). Such a raise that
+    lands also drops a ceiling below it. An exchange's undo writes the
+    count a child's names call for, except where that would be 0 (a child
+    at neither name with no other link): it then keeps the child's count
+    from before rather than writing 0 onto its allocated inode, which
+    `e2fsck` would clear instead of reattaching in `lost+found` (#323). A
+    directory move whose
     unlink fails after taking the old entry out has moved: it still fixes
     the old parent's count and, between parents, the child's `..`, and
     returns the unlink's error (#323). An `rmdir` whose parent can't be read

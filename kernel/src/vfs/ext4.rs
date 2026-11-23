@@ -808,12 +808,19 @@ impl Ext4FsInner {
 
     /// Raise `ino`'s count on disk to at least `min` (when which entries
     /// exist can't be read back, so only a floor is known): once that lands
-    /// its floor is cleared, and if it fails the floor is kept in memory
-    /// ([`Self::record_nlink_floor`]). Returns whether the write landed.
+    /// its floor is cleared (with a ceiling below `min`, which would bring
+    /// the count back under what just landed: #322's raises are one past the
+    /// count with bounds applied), and if it fails the floor is kept in
+    /// memory ([`Self::record_nlink_floor`]). Returns whether the write
+    /// landed.
     fn raise_links_or_floor(&mut self, ino: NonZeroU32, min: u16) -> bool {
         let landed = ensure_min_disk_links_count(&self.ext4, ino, min).is_ok();
         if landed {
-            self.nlink.clear_floor(ino.get());
+            if self.nlink.ceiling(ino.get()).is_some_and(|c| c < u32::from(min)) {
+                self.nlink.clear(ino.get());
+            } else {
+                self.nlink.clear_floor(ino.get());
+            }
         } else {
             self.record_nlink_floor(ino.get(), u32::from(min));
         }
@@ -2765,7 +2772,8 @@ impl<'n> MoveEntry<'n> {
                 }
             }
             Ok(_) => {
-                // The name is on another inode: the old entry went.
+                // The name is on another inode, which the locks rule out
+                // (only a corrupt directory reads so): kept as it was.
                 inner.record_nlink_floor(old_child_ino.get(), u32::from(orig_old_links));
                 MoveOutcome {
                     moved: Landed::No(err),
@@ -2939,9 +2947,8 @@ impl MoveOutcome {
 
     /// Once a held target is settled ([`Ext4Inode::retire_target`] or
     /// [`Ext4Inode::put_back_target`], after [`Self::apply_counts`]): if the
-    /// source moved, its and the parents' timestamps, and (a directory,
-    /// neither parent's count read back, so the old parent's decrement never
-    /// written) one more link on the parent that gained it. The result.
+    /// source moved, its and the parents' timestamps (a directory's parents'
+    /// counts come from [`MoveEntry::fix_parents`]). The result.
     fn stamp(
         self,
         guards: &mut [LockedInode<'_>],
@@ -2951,11 +2958,6 @@ impl MoveOutcome {
         now: Timespec,
     ) -> Result<(), VfsError> {
         if let Landed::Yes(_) = self.moved {
-            if old_child.inode_type == InodeType::Dir && self.sync_old_dir.is_none() && self.sync_new_dir.is_none() {
-                let bumped = if old_dir.disk_ino == new_dir.disk_ino { old_dir } else { new_dir };
-                let g = find_guard_mut(guards, bumped);
-                g.nlink = g.nlink.saturating_add(1);
-            }
             stamp_rename(guards, &[old_dir, new_dir], &[old_child], now);
         }
         self.moved.into_result()
