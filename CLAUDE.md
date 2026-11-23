@@ -133,7 +133,7 @@ one is its own PR that updates that doc first.
   calibrated): match the rest of the line, not its start.
 - **QEMU exit codes:** 33 pass, 35 test failure, 37 crash report; anything else
   (including 0 from a triple fault with `-no-reboot`) is a failure. The one
-  exception: 0 in the power-off scenario, with a QMP `SHUTDOWN` event whose
+  exception: 0 in the power-off scenarios, with a QMP `SHUTDOWN` event whose
   reason is `guest-shutdown` (a triple fault's is `guest-reset`).
 - **Tests on a busy host.** A guest's clocks run on while the host stalls
   its vCPU, so a loaded laptop or CI runner adds time to anything timed
@@ -270,7 +270,8 @@ one is its own PR that updates that doc first.
   rings, or the driver itself to wake its thread: `mouse::hold`). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
   `sources`, `stats` (the shell's `random`, rhai's `random()`), RDRAND and
   the virtio-rng driver (its own queue, one deadline per request, dropped
-  on a failed request) feeding a ChaCha20 pool. `power.rs`: `reboot` and `shutdown` (ACPI S5);
+  on a failed request) feeding a ChaCha20 pool. `power.rs`: `reboot` and `shutdown` (ACPI S5;
+  the shell's commands sync the filesystems first, `shell/commands.rs`'s `sync_then_announce`, #352);
   `arch/x86_64/reset.rs` their registers.
   `interrupts.rs`: 8259s masked, local APIC on, I/O APIC inputs masked,
   `route_isa_irq` (MADT overrides, handler registered before unmasking).

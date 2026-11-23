@@ -12,7 +12,9 @@
 //!   (the FADT's SMI command).
 //!
 //! Both run with interrupts off on the calling CPU; the other CPUs aren't
-//! stopped first (a reset or power-off takes them too).
+//! stopped first (a reset or power-off takes them too). Neither syncs the
+//! filesystems: the shell's `reboot` and `shutdown` do that before calling
+//! them (`vfs::sync_all`, while sleeping still works; #352).
 
 use crate::acpi::{self, PowerOff};
 use crate::arch::{irq, reset};
