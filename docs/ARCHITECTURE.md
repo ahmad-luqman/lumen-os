@@ -5723,23 +5723,26 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     - It holds the parent's `Arc` strongly, as `d_parent` does, so the
       parent stays reachable if it is removed in turn while held open
       (detached, under a number of its own). The parent is handed back
-      without unifying it in `InodeCache`: while live it is the cached
-      `Arc` (`InodeCache` never evicts a live entry but at `umount`, which
-      drops the records too).
+      without unifying it in `InodeCache` (unlike the filesystem's answer,
+      which `lookup_dotdot` unifies): while live it is the one `Arc` its
+      filesystem has for it (ext4 and tmpfs keep one per live inode;
+      `umount` drops the records with the cache).
     - A record whose directory has no strong reference left is dead: each
-      new record and each `..` the filesystem answers `-ENOENT` prune the
+      new record and each `..` that falls back to the records prune the
       dead ones (again after their parents drop, outside the lock, since a
       parent kept only by such a record leaves its own record dead), so a
       dead record keeps its parent until the next of those. `umount` drops
       the filesystem's records with its inodes.
-    - `getcwd` (`compute_cwd_path`) checks the cwd is still linked after
-      naming it: one removed during the walk can have had its number taken
-      by a new entry in its parent, which the walk would have named.
+    - `getcwd` (`compute_cwd_path`) checks each directory it names (the
+      cwd, then each ancestor) is still linked once named: one removed
+      during the walk (the cwd, or an ancestor the cwd moved out of first)
+      can have had its number taken by a new entry in the parent just
+      read, which the walk would have named. It then gives `-ENOENT` if
+      the cwd is gone, or walks again if it lives.
     - Differences from Linux: a parent freed by its own removal, nothing
       holding it open, is `-ENOENT` from `..` (Linux still finds it): its
       number may be another inode's by now, which the dentry cache and the
-      mount table, both keyed by numbers, would take it for (`stat` read
-      before `is_detached`, the order as in `OpenGuard::try_new`). After
+      mount table, both keyed by numbers, would take it for. After
       `umount`, `..` from a removed directory on it is `-ENOENT`: `umount`
       doesn't refuse a filesystem in use, where Linux says `-EBUSY`. A
       different `Arc` of the same directory (only from a filesystem making
@@ -5828,7 +5831,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     O_EXCL`; `O_CREAT` without `O_EXCL` resolves the directory `/`, `.` or
     `..` names, which then gives `-EISDIR` as any directory opened with
     `O_CREAT`, `..` from a removed directory included: its recorded
-    parent, #318, under `InodeCache` above), ahead of
+    parent, #318, under `InodeCache` above; `-ENOENT` if that parent was
+    freed), ahead of
     `-EROFS`. In `ops.rs` each reads it with a `match` on
     `final_component()`, so one that leaves a case out doesn't compile;
     clippy lints forbidden in that file and the host test

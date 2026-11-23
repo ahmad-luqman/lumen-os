@@ -255,11 +255,11 @@ pub(crate) fn resolve_and_unify_magic_target(
 /// read before `is_detached` (the order, and why, as in
 /// `OpenGuard::try_new`).
 ///
-/// Handed back without unifying it in `InodeCache`, as the filesystem's
-/// answer is: while live it is the cached `Arc` (`ops` records the resolved
-/// parent, and `InodeCache` never evicts a live entry but at `umount`, which
-/// drops the records too), detached it has a number of its own, and freed it
-/// is refused.
+/// Handed back without unifying it in `InodeCache` (`lookup_dotdot` unifies
+/// the filesystem's answer, not this one): while live it is the one `Arc`
+/// its filesystem has for it (ext4 and tmpfs keep one per live inode, and
+/// `ops` recorded the resolved parent), detached it has a number of its
+/// own, and freed it is refused.
 fn removed_dir_parent(env: &dyn VfsCacheOps, dir: &Arc<dyn VfsInode>) -> Result<Arc<dyn VfsInode>, VfsError> {
     let parent = env.inode_removed_dir_parent(dir).ok_or(VfsError::NoEnt)?;
     if parent.stat()?.nlink == 0 && !parent.is_detached() {
@@ -609,7 +609,8 @@ pub(crate) fn resolve_parent_with_depth<'a>(
 ///
 /// Retries from `cwd` up to [`MAX_CWD_RENAME_RETRIES`] times if a concurrent
 /// `rename` moves `cwd` or an ancestor between `".."` lookup and parent
-/// `readdir`, provided `cwd` itself remains live (`!is_detached() && nlink > 0`).
+/// `readdir`, or an ancestor is removed during the walk, provided `cwd`
+/// itself remains live (`!is_detached() && nlink > 0`).
 ///
 /// Returns `Err(NoEnt)` if `cwd` was unlinked (`st_nlink == 0` or detached).
 /// The path is bytes, each component the name `readdir` lists (#268).
@@ -617,26 +618,16 @@ pub fn compute_cwd_path(env: &dyn VfsCacheOps, cwd: &Arc<dyn VfsInode>) -> Resul
     if cwd.inode_type() != InodeType::Dir {
         return Err(VfsError::NotDir);
     }
-    if cwd.is_detached() || cwd.stat()?.nlink == 0 {
+    if is_unlinked(cwd)? {
         return Err(VfsError::NoEnt);
     }
 
     let mut components: Vec<Vec<u8>> = Vec::new();
     for attempt in 0..=MAX_CWD_RENAME_RETRIES {
         match compute_cwd_path_once(env, cwd, &mut components) {
-            // Still linked once named: a `cwd` removed during the walk can
-            // have had its number taken by a new entry in its parent, which
-            // `find_child_name_in_dir` would have named (`stat` before
-            // `is_detached`, as `OpenGuard::try_new`). A removed ancestor
-            // means `cwd` was removed first: only an empty directory can be.
-            Ok(path) => {
-                if cwd.stat()?.nlink == 0 || cwd.is_detached() {
-                    return Err(VfsError::NoEnt);
-                }
-                return Ok(path);
-            }
+            Ok(path) => return Ok(path),
             Err(VfsError::NoEnt) => {
-                if cwd.is_detached() || cwd.stat()?.nlink == 0 {
+                if is_unlinked(cwd)? {
                     return Err(VfsError::NoEnt);
                 }
                 if attempt == MAX_CWD_RENAME_RETRIES {
@@ -674,6 +665,14 @@ fn compute_cwd_path_once(
         }
 
         let found_name = find_child_name_in_dir(&parent, cur_ino)?;
+        // Still linked once named (#318): a directory removed during the
+        // walk (the cwd, or an ancestor the cwd moved out of first) can have
+        // had its number taken by a new entry in the parent just read, which
+        // would have been named instead. `ENOENT` makes the caller give up
+        // if the cwd is the one gone, or retry if it lives.
+        if is_unlinked(&cur)? {
+            return Err(VfsError::NoEnt);
+        }
         components.push(found_name);
         cur = parent;
     }
@@ -695,6 +694,11 @@ fn compute_cwd_path_once(
         return Err(VfsError::NameTooLong);
     }
     Ok(out)
+}
+
+/// Whether `dir` is no longer linked: detached, or `nlink == 0`.
+fn is_unlinked(dir: &Arc<dyn VfsInode>) -> Result<bool, VfsError> {
+    Ok(dir.is_detached() || dir.stat()?.nlink == 0)
 }
 
 fn find_child_name_in_dir(parent: &Arc<dyn VfsInode>, target_ino: u64) -> Result<Vec<u8>, VfsError> {

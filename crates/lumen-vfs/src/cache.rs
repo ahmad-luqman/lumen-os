@@ -30,8 +30,8 @@ struct CachedInode {
 /// reused. The `Weak` keeps the allocation, so its address is never another
 /// inode's while the record lasts. A record whose directory has no strong
 /// reference left is dead, and dropped by [`InodeCache::prune_removed_dirs`]
-/// (which `VfsTables` runs on each new record and each `..` its filesystem
-/// answers `ENOENT`); [`InodeCache::evict_fs`] drops a filesystem's records,
+/// (which `VfsTables` runs on each new record and each `..` that falls back
+/// to the records); [`InodeCache::evict_fs`] drops a filesystem's records,
 /// live or dead.
 struct RemovedDir {
     dir: Weak<dyn VfsInode>,
