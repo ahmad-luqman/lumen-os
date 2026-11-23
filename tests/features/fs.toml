@@ -193,6 +193,63 @@ tests = [
 ]
 
 [[feature]]
+name = "tmpfs quota charges inodes and directory entries as well as pages (#267): past it create, mkdir, symlink and link fail with ENOSPC and leave nothing behind (an existing name is still EEXIST for each of the four); an exchange fits on a full mount; unlink gives a name's room back and the last reference an inode's"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_charges_each_inode_and_refuses_past_it",
+]
+
+[[feature]]
+name = "tmpfs quota charges a directory its maps' root nodes on top of an inode (#267): one byte short of its cost mkdir fails with ENOSPC; rmdir and the last reference give it all back"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_charges_a_directory_its_maps",
+]
+
+[[feature]]
+name = "tmpfs quota charges a directory entry by its name's length (#267): a rename to a name no costlier than the old one fits on a full mount, one costing more fails with ENOSPC and changes nothing, and names at the heap granule's edge give back exactly what they took"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_charges_names_by_length_and_renames_net",
+]
+
+[[feature]]
+name = "tmpfs quota charges a symlink's target (#267): a target one byte past the room fails with ENOSPC, leaving no entry"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_charges_symlink_targets",
+]
+
+[[feature]]
+name = "tmpfs quota charges move with a rename across directories, an exchange moves none, and dropping a mount gives back every byte but what a still-held inode keeps (#267)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_moves_charges_across_directories_and_drops_them_with_the_mount",
+]
+
+[[feature]]
+name = "A tmpfs mount's quota dropped with bytes still reserved logs the leak, naming the mount's device, so a tmpfs ktest mount whose owners drop without giving bytes back fails the ktest scenario (#267)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_dropped_with_bytes_reserved_logs_the_leak",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+]
+
+[[feature]]
+name = "tmpfs's quota charges for inodes, directory entries and symlink targets are at least what they take from the kernel heap (#267), measured: one directory of hundreds of long names, the same after removing every other one, many directories of one entry each, and one directory whose leaves sit at the B-tree's minimum fill"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_quota_charges_cover_what_the_heap_gives",
+]
+
+[[feature]]
+name = "tmpfs files created through the kernel's VFS tables until ENOSPC and unlinked by unlink_at give all their quota back, so as many can be created again (#267)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::tmpfs::tmpfs_unlinking_through_the_vfs_gives_the_room_back",
+]
+
+[[feature]]
 name = "ext4 volumes whose directory hashes are or may be unsigned (#308: s_flags EXT2_FLAGS_UNSIGNED_HASH, or neither hash flag with dir_index; ext4plus hashes signed) mount read-only with one warning naming the flag or its absence (and a journal needing recovery outranks it, its warning showing no s_flags); every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (only a non-ASCII hash miss in an htree directory walks it; a read error in the walk or in the hash lookup is EIO), a missing name is ENOENT, and unlink, rmdir and create are EROFS; the same volume with its flag set to signed, or with neither flag and no dir_index, mounts writable (the signed one gets no walk); tools/ext4-signed-hash.sh sets an ext4 image's s_flags to signed (from unsigned, or neither flag), changing nothing else (keeping s_flags' other bits), refuses a missing file or one without ext4's magic, and fails unless the image then says signed; tools/mkrootfs.sh runs it, so an image its mke2fs made unsigned comes out signed (mke2fs -d indexing no directory), passing an ASCII-only directory indexed by the unsigned hash and failing on one holding names with bytes of 0x80 or above"
 milestone = "M7"
 tests = [
