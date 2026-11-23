@@ -5111,17 +5111,90 @@ fn probes_refuse_inodes_of_unmounted_filesystems() {
 
     let (dentry_gen, inode_gen) = env.cache_gens();
     // The same calls with the mounted root filesystem's inodes are taken.
-    for (name, call) in [(&b"a"[..], 0), (b"b", 1), (b"c", 2)] {
-        let inode = root.create(name, 0o644).unwrap();
-        let ino = inode.ino();
-        let taken = match call {
-            0 => env.publish_lookup_inode(rdev, rino, name, inode, dentry_gen, inode_gen),
-            1 => env.publish_created_inode(rdev, rino, name, inode, dentry_gen, inode_gen),
-            _ => env.inode_get_or_insert_if_fresh(inode, inode_gen),
-        };
-        assert!(taken.is_ok(), "{}", Escaped(name));
-        assert!(env.inode_get(rdev, ino).is_some(), "{}", Escaped(name));
-    }
+    let a = root.create(b"a", 0o644).unwrap();
+    assert!(env.publish_lookup_inode(rdev, rino, b"a", Arc::clone(&a), dentry_gen, inode_gen).is_ok());
+    assert!(env.inode_get(rdev, a.ino()).is_some(), "publish_lookup_inode");
+    let b = root.create(b"b", 0o644).unwrap();
+    assert!(env.publish_created_inode(rdev, rino, b"b", Arc::clone(&b), dentry_gen, inode_gen).is_ok());
+    assert!(env.inode_get(rdev, b.ino()).is_some(), "publish_created_inode");
+    let c = root.create(b"c", 0o644).unwrap();
+    assert!(env.inode_get_or_insert_if_fresh(Arc::clone(&c), inode_gen).is_ok());
+    assert!(env.inode_get(rdev, c.ino()).is_some(), "inode_get_or_insert_if_fresh");
+}
+
+/// `umount` forgets the unmounted filesystem's names: the kernel mounts
+/// each filesystem kind at its canonical `DevId` (`/tmp` is `0:2`), so a
+/// remount gets the same one, and a name left behind would resolve to
+/// whichever inode now has its number.
+#[test]
+fn umount_forgets_the_unmounted_filesystems_names() {
+    let (env, root_fs) = setup_vfs();
+    let nofollow = ResolveFlags { follow_final: false, ..ResolveFlags::default() };
+    let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
+    let first = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    env.mount(Arc::clone(&mp), "/mnt", first as Arc<dyn FileSystem>).unwrap();
+    drop(mkdir_at(&env, None, b"/mnt/d", 0o755, 0).unwrap());
+    assert!(env.snapshot_dentries().iter().any(|(pd, _, _, _)| *pd == DevId::TMPFS));
+    drop(env.umount(mp.dev_id(), mp.ino()).unwrap());
+    assert!(
+        env.snapshot_dentries().iter().all(|(pd, _, _, t)| *pd != DevId::TMPFS && t.dev != DevId::TMPFS),
+        "a name of the unmounted filesystem is still cached"
+    );
+
+    let second = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    env.mount(Arc::clone(&mp), "/mnt", second as Arc<dyn FileSystem>).unwrap();
+    // The same inode number `d` had on the first one.
+    drop(mkdir_at(&env, None, b"/mnt/other", 0o755, 0).unwrap());
+    assert_eq!(resolve_path(&env, None, b"/mnt/d", nofollow).err(), Some(VfsError::NoEnt));
+}
+
+/// The table probes' generation and identity rules, each call alone: a
+/// stale generation refuses, a cached inode isn't published again, an
+/// identity check compares the `Arc`, not the number.
+#[test]
+fn table_probes_keep_their_generation_and_identity_rules() {
+    let (env, root_fs) = setup_vfs();
+    let root = root_fs.root_inode();
+    let (rdev, rino) = (root.dev_id(), root.ino());
+
+    let a = env.inode_get_or_insert(root.create(b"a", 0o644).unwrap());
+    env.dentry_insert(rdev, rino, b"a", DentryTarget { dev: a.dev_id(), ino: a.ino() });
+    env.dentry_invalidate_dir(rdev, rino);
+    assert!(env.dentry_get(rdev, rino, b"a").is_none(), "dentry_invalidate_dir");
+
+    // A dentry generation from before an invalidation.
+    let (dentry_gen, inode_gen) = env.cache_gens();
+    env.dentry_invalidate_dir(rdev, rino);
+    let b = root.create(b"b", 0o644).unwrap();
+    assert!(env.publish_created_inode(rdev, rino, b"b", b, dentry_gen, inode_gen).is_ok());
+    assert!(env.dentry_get(rdev, rino, b"b").is_none(), "a stale dentry generation");
+
+    let (dentry_gen, inode_gen) = env.cache_gens();
+    let c = env.inode_get_or_insert(root.create(b"c", 0o644).unwrap());
+    assert!(env.publish_created_inode(rdev, rino, b"c", c, dentry_gen, inode_gen).is_ok());
+    assert!(env.dentry_get(rdev, rino, b"c").is_none(), "an inode cached already");
+
+    // An inode removed since `since`: neither looked up nor removed again.
+    let d = env.inode_get_or_insert(root.create(b"d", 0o644).unwrap());
+    let (_, since) = env.cache_gens();
+    let _ = env.inode_record_removal(rdev, d.ino());
+    assert!(env.inode_get(rdev, d.ino()).is_some());
+    assert!(env.inode_get_if_fresh(rdev, d.ino(), since).is_none(), "inode_get_if_fresh");
+    let (removed, _) = env.inode_begin_removal(rdev, d.ino(), since);
+    assert!(removed.is_none(), "inode_begin_removal");
+    assert!(env.inode_get(rdev, d.ino()).is_some(), "inode_begin_removal");
+    let _ = env.inode_end_removal(rdev, d.ino());
+
+    let e = env.inode_get_or_insert(root.create(b"e", 0o644).unwrap());
+    assert!(env.inode_remove_if_same(rdev, e.ino(), &a).is_none());
+    assert!(env.inode_get(rdev, e.ino()).is_some(), "inode_remove_if_same");
+
+    let f = env.inode_get_or_insert(root.create(b"f", 0o644).unwrap());
+    let f_ino = f.ino();
+    f.inc_open_count();
+    root.unlink(b"f").unwrap();
+    assert!(!env.inode_evict_detached(rdev, a.ino()));
+    assert!(env.inode_evict_detached(rdev, f_ino), "inode_evict_detached");
 }
 
 #[test]
