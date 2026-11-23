@@ -5184,9 +5184,10 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   reclaiming victim inode B in strict global order `Lock 4(B) → Lock 5(B) →
   Lock 6 → 7 → 8`, and retrying—never inside `frame::alloc`, which holds an
   IRQ-off `SpinLock`, and never holding another inode's Lock 4 or Lock 5).
-  Its candidates are every live inode of each mounted `ext4` filesystem
-  (`Ext4FileSystem::snapshot_live`, copied under that filesystem's Lock 6,
-  released before any inode is reclaimed), whether or not the VFS's inode
+  Its candidates are every live inode of each `ext4` filesystem registered
+  in `EXT4_FILESYSTEMS` (the root volume; `vfs::init` registers it), by
+  `Ext4FileSystem::snapshot_live`, copied under that filesystem's Lock 6,
+  released before any inode is reclaimed, whether or not the VFS's inode
   cache holds them.
   `tmpfs` pages and `detached_unlinked` pages are never evicted until truncated
   or dropped on last close.
@@ -5507,7 +5508,11 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       `times::new_inode`, the adapter's one way to make an inode (`create`,
       `mkdir`, `symlink`), sets all four again before the inode is written
       and linked, `i_crtime_extra` too when the inode reaches it (#303), so
-      Linux's `statx` shows the creation time. Lumen itself reports no btime.
+      the inode stores its creation time where Linux's `statx` reads it (a
+      ktest checks the bytes; nothing reads them with Linux's tools). With
+      `i_crtime` but no `i_crtime_extra`, the time is clamped to 32 bits as
+      for the others (untested: the ktests' images have 256-byte inodes).
+      Lumen itself reports no btime.
     - A corrupt extra word whose nanoseconds are 1e9 or more is carried into
       the seconds by `ext4plus`, which can decode a different year than
       Linux does (base `0x7fff_ffff`, extra `0xffff_fffc`: 1901 here, 2038

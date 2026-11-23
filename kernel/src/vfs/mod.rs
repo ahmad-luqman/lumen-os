@@ -422,7 +422,8 @@ pub(crate) fn snapshot_cached_inodes() -> Vec<Arc<dyn VfsInode>> {
     TABLES.snapshot_inodes()
 }
 
-/// Every live inode of every mounted `ext4` filesystem, for reclaim: the
+/// Every live inode of every `ext4` filesystem in `EXT4_FILESYSTEMS` (the
+/// root volume, and the ktests' volumes), for reclaim: the
 /// filesystems' list is copied first, then each one's live inodes under its
 /// own Lock 6, held only while copying (`Ext4FileSystem::snapshot_live`).
 pub(crate) fn snapshot_live_ext4_inodes() -> Vec<Arc<ext4::Ext4Inode>> {

@@ -21,6 +21,7 @@ milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::tests::ext4_adapter_pagecache_quirks_and_open_unlinked",
     "ktest:lumen_kernel::vfs::tests::page_cache_global_reclaim_writes_back_and_evicts",
+    "ktest:lumen_kernel::vfs::tests::page_cache_global_reclaim_reaches_inodes_the_vfs_caches_never_held",
     "ktest:lumen_kernel::vfs::page_cache::*",
     "ktest:lumen_kernel::vfs::tests::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
     "ktest:lumen_kernel::vfs::tests::ext4_truncate_and_open_unlink_preserve_state_on_io_error",
