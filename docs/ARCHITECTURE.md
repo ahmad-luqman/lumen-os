@@ -5710,6 +5710,43 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `statx.stx_dev_{major,minor}`, and `/proc/self/maps` (`0:1` for root `ext4`
     or fallback `tmpfs`, `0:2` for `/tmp`, `0:3` for `/dev`, `0:4` for `/proc`),
     so `st_dev` is unique and cross-mount `rename`/`link` returns `-EXDEV`.
+  - **`VfsTables<F: LockFamily>` (#264):** the three tables above, each
+    behind its own lock (Lock 9, sub-order `MountTable -> DentryCache ->
+    InodeCache`), and the one implementation of `VfsCacheOps` (the short
+    probes `resolve` and `ops` make, each releasing its locks before it
+    returns; the `cacheable()` checks above), with `mount_root`, `mount`,
+    `umount` (the evicted inodes dropped after the locks are released) and
+    the snapshots: of the filesystems for `sync`, of the inodes for the
+    page-cache reclaim and procfs, and `list_mounts` for `/proc/mounts`
+    and `mount` (each filesystem asked for its device, name and read-only
+    flag after the lock is released). Calls into a filesystem it still
+    makes under the locks (`VfsInode::dev_id`, `ino`, `cacheable` and
+    `is_detached`, `FileSystem::dev_id`, `mount`'s `inode_type()`), and
+    `Arc`s it drops there (a failed `mount`'s, the unmounted mountpoint,
+    the ones `InodeCache` drops in `get_or_insert*`, `get_if_fresh`,
+    `end_removal`, `evict_detached` and `record_removal_if_absent`), are
+    listed in `VfsTables`' doc and #320. It lives in lumen-vfs, generic
+    over a lock family (`trait LockFamily { type Lock<T>: VfsLock<T>; }`),
+    so the kernel and the host tests run
+    the same code: the kernel's `KernelVfsTables` is
+    `VfsTables<KernelLocks>` (`KernelVfsLock`, a `SleepMutex`), and the
+    host tests' is `VfsTables<TestLocks>`: `TestLock`, a `std` mutex whose
+    guards record which tables their thread holds, which test filesystems
+    assert is none in their calls (`assert_test_lock9_free`), and which
+    aborts the test binary, its message and a backtrace (the method and
+    the test) on stderr, when a thread takes the tables out of their
+    sub-order or takes one it already holds (a panic would leave a test
+    whose other threads wait on a `Barrier` hanging; the abort loses the
+    rest of that run's results).
+    `VfsLock::new` isn't `const` (a trait method, on stable Rust), so the
+    kernel's `static TABLES` is built by the `const fn
+    VfsTables::from_locks(mounts, dentries, inodes)` from locks made by
+    `KernelVfsLock::new_const` (`SleepMutex::new`, a `const fn`; for
+    `TABLES` only) around empty tables. It and `VfsTables::new`, which
+    builds the locks at run time, take the same argument-free constructors
+    (`MountTable::new`, `DentryCache::with_default_capacity`,
+    `InodeCache::new`), so neither names a capacity. Test-only
+    `VfsCacheOps` wrappers (a spy, a hook) delegate to one.
 - **Path & symlink resolution (`resolve_path`, host-tested):**
   - Handles absolute paths, `dirfd`/`AT_FDCWD` relative paths, physical
     component-by-component `.` and `..` traversal (never lexical `..` collapse
