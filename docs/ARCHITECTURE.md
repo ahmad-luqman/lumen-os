@@ -5196,7 +5196,15 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   at the cap (reclaim, run once before the write takes its locks, couldn't get
   below it, or this one write added more pages than the gap) returns a short
   count or `-ENOSPC` instead of growing the cache until the kernel runs out of
-  frames, logged once per crossing; and a write or truncate past the
+  frames, logged once per crossing. The cap is one check,
+  `PageCache::admit_unreclaimable` (private to `page_cache.rs`), for a new
+  page of a linked `ext4` file that reclaim can't drop: `insert_new` asks
+  it for a page that is dirty when inserted, whichever path made it
+  (`write_from` also asks before making the page, and the insert asks again
+  in case the cache filled meanwhile), and `map_page` asks it before making
+  a page a mapping will pin (a disk read) and again after it (the page is
+  clean, so the insert lets it in); a clean page (a read's, which reclaim
+  can drop) is let in at the cap. A write or truncate past the
   volume's largest file size returns `-EFBIG`. `create`/`mkdir`/`symlink`
   return `-ENOSPC` while fewer than 8 blocks are free, so a new entry can
   always be linked (or its inode released) without the directory growing
@@ -5205,13 +5213,38 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   `EMLINK`). A write failing inside `ext4plus` between allocating a block and
   recording it in the inode leaks that block (its free is crate-private):
   `e2fsck` reclaims it.
+- **Shared page I/O (#264, #265):** `tmpfs` and `ext4` move a file's bytes
+  through the same four `PageCache` methods, under the inode's Lock 4 and
+  Lock 5: `read_into(offset, buf, file_size, miss)` (a page not cached is
+  `miss`'s: a page read from disk, inserted after the copy, or `None`, a
+  hole read as zeros without a frame; an error after some bytes were copied
+  is returned, not a short count, as before), `write_from(offset, buf,
+  old_size, fill)` (a page not cached is `fill`'s, a zero page or one
+  holding the disk's bytes a partial write keeps; a write starting past
+  `old_size` first zeroes the old tail, the rule below; an error past the
+  first page is a short count), `resize(old_size, new_size)` (a
+  truncate's: a shrink's pages dropped, then the tail zeroed, the rule
+  below) and `map_page(index, file_size, make)` (a mapping's page: the
+  cached one, or `make`'s, a zero page or one read from disk, inserted
+  past the hard cap's two checks; below). Pages are marked dirty by the
+  cache's owner, a linked `ext4` file's alone (`writes_back`): a write
+  never dirties a detached file's page (a writable shared mapping still
+  may), and nothing writes one back. Their page arithmetic is
+  `lumen_vfs::page`'s, host-tested: `spans` (each page a byte range
+  touches, its offset there and its part of the buffer), `pages_in` (how
+  many pages a file of that size has; a shrink drops the cached pages from
+  there on), `valid_len` (a page's bytes below the file's size) and
+  `resize_tail` (which bytes past the end a size change zeroes).
 - **Truncate & extend interaction:**
   - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`),
     in this order:
-    1. the inode's `truncate`, under Lock 4: zeroes
-       `[new_size % 4096 .. 4096)` of `page_index = new_size / 4096` and marks
-       it dirty **only when `new_size % 4096 != 0`**, drops all cached pages
-       with `page_index >= new_size.div_ceil(4096)`, and sets the size;
+    1. the inode's `truncate`, under Locks 4 and 5 (`ext4` first cuts the
+       file on disk and zeroes its disk tail): `PageCache::resize` drops
+       all cached pages with `page_index >= new_size.div_ceil(4096)`, then,
+       **only when `new_size % 4096 != 0`**, zeroes
+       `[new_size % 4096 .. 4096)` of `page_index = new_size / 4096` if it
+       is cached, marking it dirty for a linked `ext4` file
+       (`writes_back`); then the size is set;
     2. once it has returned, the caller's
        `AddressSpace::invalidate_file_from`, under Lock 1, unmaps all
        file-VMA PTEs covering `file_off >= align_up_page(new_size)` (section
@@ -5219,8 +5252,11 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
        caller's space only until M8 (`openat(O_TRUNC)` included).
   - Extending a file (`ftruncate` grow or `write`/`pwrite64` past `old_size`):
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
-    `PageCache`, zeroes `[old_size % 4096 .. 4096)` before exposing the new
-    size so stale past-EOF `MAP_SHARED` stores never leak into extended regions.
+    `PageCache`, zeroes `[old_size % 4096 .. 4096)` (marking it dirty as
+    above) before exposing the new size so stale past-EOF `MAP_SHARED`
+    stores never leak into extended regions. Writeback writes a page's
+    bytes below the size alone (`valid_len`), so such a store never
+    reaches the disk either.
 - **Pages for `mmap` (built in #255's first part):** the file-backed VM
   takes a file's pages through one helper, `crate::vfs::mmap_page(inode:
   &Arc<dyn VfsInode>, index: u64) -> Result<MappedPage, VfsError>`.
@@ -5231,23 +5267,26 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   `Arc` `read_at`/`write_at` use (another call returns it again while it
   stays cached), and `file_size()`, read under the same Lock 4 hold.
   Holding the `Arc` pins the page (reclaim evicts only `strong_count == 1`).
-  - *Filling:* a missing `ext4` page is read from disk by the same private
-    fill as `read_at` (`Ext4Inode::load_page`, which logs a failed read
-    naming the device, inode and page, once per streak of the same error).
+  - *Filling:* both filesystems go through `PageCache::map_page`, which
+    asks the fill for a missing page. A missing `ext4` page is read from
+    disk by the same private fill as `read_at` (`Ext4Inode::load_page`,
+    which logs a failed read naming the device, inode and page, once per
+    streak of the same error).
     A hole in a `tmpfs` file (or a detached `ext4` one) gets a zero page
-    through the same get-or-insert as `write_at` (`tmpfs::page_or_new`).
+    (`CachePage::new_zeroed`, as `write_at`'s new pages).
     Unlike `read_at`, which reads a hole as zeros without a frame, a mapped
     hole costs a frame: the `tmpfs` or detached quota can refuse it
     (`NoSpc`). A missing page of a linked `ext4` file is refused (`NoSpc`,
-    the hard-limit warning) while the `ext4` cache is at its hard limit, as
-    `write_at` refuses one: mapped pages are pinned, so reclaim can't keep
-    them under it. A detached `ext4` file's pages count against the
+    the hard-limit warning) while the `ext4` cache is at its hard limit, by
+    the same check as a write's new page (`admit_unreclaimable`, before
+    the disk read and after it): mapped pages are pinned, so reclaim can't
+    keep them under it. A detached `ext4` file's pages count against the
     detached quota instead of the hard limit. Also `NoMem` and `Io`.
   - *EOF:* `Range` when `index * 4096 >= file_size` (or the product
     overflows): no page is mapped there, and the fault path raises
     `SIGBUS` (section 5). The page holding EOF is returned; its bytes past
     `file_size` are zero unless a mapping stored there.
-  - *Truncate:* a shrink's `remove_from` drops the cache's own reference
+  - *Truncate:* a shrink's `resize` drops the cache's own reference
     to pages past the new size and stops counting them, even if a mapping
     still holds one. The page stays alive, pinned by that mapping, until
     section 5's truncate invalidation, run by the shrinking syscall once
@@ -5652,7 +5691,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `set_mode/owner/times(...)` (`set_owner` also leaves the mode
     `lumen_vfs::mode_after_chown` gives: setuid dropped on a non-directory,
     setgid too with group-execute, in the same metadata-lock hold and
-    inode write, #254), plus `read_page`/`write_page` feeding
+    inode write, #254; `set_times` sets each stamp to
+    `SetTime::resolve(current, now)`: kept for `Omit`, `now` for `Now`,
+    the given time for `Set`, #302), plus `read_page`/`write_page` feeding
     `PageCache` and `sync()`, `append(buf) -> (pos, n)` (#254b: `O_APPEND`'s
     write, the end read and the write made in one hold of the inode's
     Lock 4, so appenders through separate open file descriptions never
@@ -5737,6 +5778,59 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     with their process or fd, and pids only grow. Each lookup of one builds
     a fresh inode, so two opens of the same `/proc/<pid>` file don't share
     advisory locks or an open count.
+    **A removed directory's parent (#318):** `InodeCache` also keeps,
+    for each directory an `rmdir` or a `rename` over it removed, the
+    directory it was removed from, as Linux keeps a deleted dentry's
+    `d_parent`: `..` from it asks the filesystem first, as from any
+    directory, and only on `-ENOENT` (ext4 and tmpfs give a removed
+    directory no `..`; any other error is reported as it is) takes the
+    recorded parent (`VfsCacheOps::inode_removed_dir_parent`), so
+    `chdir("..")`, `open("..", O_DIRECTORY)` and `open("..", O_CREAT)`
+    (`-EISDIR`) from a removed cwd or start directory act as on Linux, and
+    `../..` and `../name` go on from there.
+    - `ops` records it (`inode_record_removed_dir`) before the
+      filesystem's `rmdir` or `rename`, under its rename lock (ext4's and
+      tmpfs's: the directory can't move meanwhile, and a `..` from it
+      always has an answer, the filesystem's until the removal and the
+      record after), and forgets it (`inode_forget_removed_dir`) if that
+      fails with the directory still linked; one gone all the same (as
+      after ext4 fails to undo its disk changes) keeps it.
+    - A record is keyed by the directory's `Arc` (a `Weak` to it, which
+      keeps the address from being reused), never `(dev, ino)`: a
+      directory removed while open is detached under another number, a
+      freed one's is reused. The `Arc` a removal sees is the cached one,
+      the same a cwd or a descriptor holds (and ext4 and tmpfs keep one
+      `Arc` per live inode, so even an uncached lookup's is that one).
+    - It holds the parent's `Arc` strongly, as `d_parent` does, so the
+      parent stays reachable if it is removed in turn while held open
+      (detached, under a number of its own). The parent is handed back
+      without unifying it in `InodeCache` (unlike the filesystem's answer,
+      which `lookup_dotdot` unifies): while live it is the one `Arc` its
+      filesystem has for it (ext4 and tmpfs keep one per live inode;
+      `umount` drops the records with the cache).
+    - A record whose directory has no strong reference left is dead: each
+      new record prunes its filesystem's dead ones (only its own: the
+      caller holds that filesystem's rename lock, and another
+      filesystem's inodes never drop under it) and each `..` that falls
+      back to the records prunes every filesystem's (again after their
+      parents drop, outside the lock, since a parent kept only by such a
+      record leaves its own record dead), so a dead record keeps its
+      parent until the next of those. `umount` drops the filesystem's
+      records with its inodes.
+    - `getcwd` (`compute_cwd_path`) checks each directory it names (the
+      cwd, then each ancestor) is still linked once named: one removed
+      during the walk (the cwd, or an ancestor the cwd moved out of first)
+      can have had its number taken by a new entry in the parent just
+      read, which the walk would have named. It then gives `-ENOENT` if
+      the cwd is gone, or walks again if it lives.
+    - Differences from Linux: a parent freed by its own removal, nothing
+      holding it open, is `-ENOENT` from `..` (Linux still finds it): its
+      number may be another inode's by now, which the dentry cache and the
+      mount table, both keyed by numbers, would take it for. After
+      `umount`, `..` from a removed directory on it is `-ENOENT`: `umount`
+      doesn't refuse a filesystem in use, where Linux says `-EBUSY`. A
+      different `Arc` of the same directory (only from a filesystem making
+      a fresh one per lookup, uncached) finds no record.
   - `DentryCache`: keyed by `(parent_dev, parent_ino, name)` (the name a `Box<[u8]>`), storing
     child `(DevId, Ino)` with immediate invalidation on `unlink`, `rmdir`,
     `rename`, and `mount`/`umount`, and bounded at 4096 entries (oldest
@@ -5820,8 +5914,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     (below; `-EEXIST` for `mkdir`, `link` and `symlink`, and for `O_CREAT |
     O_EXCL`; `O_CREAT` without `O_EXCL` resolves the directory `/`, `.` or
     `..` names, which then gives `-EISDIR` as any directory opened with
-    `O_CREAT`; but `..` from a removed directory is `-ENOENT`, as it is the
-    filesystem's own `..`, where Linux says `-EISDIR`, #318), ahead of
+    `O_CREAT`, `..` from a removed directory included: its recorded
+    parent, #318, under `InodeCache` above; `-ENOENT` if that parent was
+    freed), ahead of
     `-EROFS`. In `ops.rs` each reads it with a `match` on
     `final_component()`, so one that leaves a case out doesn't compile;
     clippy lints forbidden in that file and the host test

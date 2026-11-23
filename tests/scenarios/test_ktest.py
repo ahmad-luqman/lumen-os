@@ -255,11 +255,17 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: fsync: ext4 {_DEV} inode \d+: block cache: block device I/O error": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 1,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
-    # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page.
+    # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page;
+    # page_cache_insert_refuses_a_dirty_ext4_page_at_the_hard_limit,
+    # page_cache_write_from_refuses_at_the_hard_limit_before_filling,
+    # page_cache_write_from_refuses_a_page_the_cache_filled_up_for and
+    # page_cache_map_page_asks_the_hard_cap_before_and_after_make: one each
+    # (one crossing each, however many refusals: page_cache's
+    # hard_limit_crossing).
     (
         r"WARN  vfs: ext4 page cache at its hard limit \(\d+ pages\): refusing new pages \(ENOSPC\) until "
         r"writeback or unmapping frees some"
-    ): 3,
+    ): 7,
     # ext4_unwritable_ro_compat_features_force_read_only
     (
         rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: ro_compat feature not supported for writing "
