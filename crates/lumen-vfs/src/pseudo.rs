@@ -32,6 +32,7 @@ pub fn fill_readdir<N: Into<Vec<u8>>>(
     let mut last = None;
     for (key, (ino, inode_type, name)) in entries {
         debug_assert!(last.is_none_or(|l| l < key), "readdir keys not ascending");
+        debug_assert!(key < u64::MAX, "readdir key u64::MAX has no cursor past it");
         last = Some(key);
         if key >= cursor && out.len() < max_entries {
             out.push(DirEntry { ino, inode_type, name: name.into(), next_cursor: key + 1 });
@@ -120,7 +121,7 @@ mod tests {
 
     /// `keys`, each a file named after itself.
     fn keyed(keys: &[u64]) -> Entries {
-        keys.iter().map(|&k| (k, (k + 10, InodeType::File, std::format!("{k}").into_bytes()))).collect()
+        keys.iter().map(|&k| (k, (1, InodeType::File, std::format!("{k}").into_bytes()))).collect()
     }
 
     fn listed(cursor: u64, max: usize) -> Vec<(u64, Vec<u8>)> {
@@ -180,6 +181,12 @@ mod tests {
     #[should_panic(expected = "readdir keys not ascending")]
     fn keys_out_of_order_before_the_cursor_still_panic() {
         fill_readdir(&mut Vec::new(), 6, 64, keyed(&[5, 3, 7]));
+    }
+
+    #[test]
+    #[should_panic(expected = "readdir key u64::MAX has no cursor past it")]
+    fn a_key_of_u64_max_panics_even_unlisted() {
+        fill_readdir(&mut Vec::new(), 0, 0, keyed(&[1, u64::MAX]));
     }
 
     #[test]

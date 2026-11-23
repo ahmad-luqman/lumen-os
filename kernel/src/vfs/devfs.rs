@@ -7,10 +7,9 @@
 //! (`lumen_vfs::fixed_namespace_ops!`; a divergence: devtmpfs takes these
 //! from root, and Linux never answers `-EROFS` on an `rw` mount), and so
 //! does a metadata change on `/dev` itself (a divergence too: devtmpfs
-//! takes those on `/dev`). A
-//! character node's setters take `chmod`, `chown` and `utimensat` and keep
-//! the new mode, owner and times in memory until reboot, as devtmpfs does,
-//! on any instance's node (#293).
+//! takes those on `/dev`). A character node's setters take `chmod`,
+//! `chown` and `utimensat` and keep the new mode, owner and times in
+//! memory until reboot, as devtmpfs does, on any instance's node (#293).
 //! `random` and `urandom` read from `crate::rng` and return `-EAGAIN` while
 //! its pool has never been seeded (no RDRAND and no virtio-rng answer).
 

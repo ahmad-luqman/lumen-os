@@ -956,43 +956,70 @@ fn check_dev_namespace() -> Result<(), String> {
     )
     .map_err(|e| format!("open /tmp/dev_link_src.txt: {e:?}"))?;
     drop(src);
-    let xdev = lumen_vfs::link_at(&TABLES, None, b"/tmp/dev_link_src.txt", None, b"/dev/forbidden", false, false);
-    unlink_at(&TABLES, None, b"/tmp/dev_link_src.txt", false).map_err(|e| format!("unlink dev_link_src: {e:?}"))?;
-    let checks = [
-        // Changes that reach devfs.
-        ("create", open_inode(&TABLES, None, b"/dev/forbidden", creat, 0o644, 0).map(drop), rofs),
-        ("mkdir", mkdir_at(&TABLES, None, b"/dev/forbidden", 0o755, 0).map(drop), rofs),
-        ("mkdir over a node", mkdir_at(&TABLES, None, b"/dev/null", 0o755, 0).map(drop), rofs),
-        ("symlink", symlink_at(&TABLES, b"null", None, b"/dev/forbidden").map(drop), rofs),
-        ("symlink over a node", symlink_at(&TABLES, b"zero", None, b"/dev/null").map(drop), rofs),
-        ("link", lumen_vfs::link_at(&TABLES, None, b"/dev/null", None, b"/dev/forbidden", false, false), rofs),
-        ("unlink", unlink_at(&TABLES, None, b"/dev/null", false), rofs),
-        ("rename", rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/forbidden", none), rofs),
-        ("rename over", rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", none), rofs),
-        ("rename exchange", rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", exchange), rofs),
-        ("rmdir (devfs's own)", dev.rmdir(b"null"), rofs),
-        // lumen-vfs's own answers, before devfs is asked.
-        ("unlink of a missing name", unlink_at(&TABLES, None, b"/dev/missing", false), noent),
-        ("rename of a missing name", rename_at2(&TABLES, None, b"/dev/missing", None, b"/dev/forbidden", none), noent),
-        (
-            "rename exchange with a missing name",
-            rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/missing", exchange),
-            noent,
-        ),
-        ("rmdir of a node", unlink_at(&TABLES, None, b"/dev/null", true), Err(VfsError::NotDir)),
-        (
-            "RENAME_NOREPLACE over a node",
-            rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", noreplace),
-            Err(VfsError::Exist),
-        ),
-        ("rename onto itself", rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/null", none), Ok(())),
-        ("link from /tmp", xdev, Err(VfsError::XDev)),
-        ("forbidden after the refusals", resolve_path_from_root("/dev/forbidden").map(drop), noent),
-    ];
-    let mismatches: Vec<String> = checks
-        .into_iter()
-        .filter_map(|(what, got, want)| expect_eq(&format!("/dev {what}"), got, want).err())
-        .collect();
+    let mut mismatches = Vec::new();
+    // A change that went through (`Ok` where a refusal was expected) stops
+    // the checks: the ones after it would run on a changed `/dev` and bury
+    // it under their own mismatches.
+    let mut changed = false;
+    let mut check = |what: &str, op: &dyn Fn() -> Result<(), VfsError>, want: Result<(), VfsError>| {
+        if changed {
+            return;
+        }
+        let got = op();
+        changed = got.is_ok() && want.is_err();
+        if let Err(mismatch) = expect_eq(&format!("/dev {what}"), got, want) {
+            mismatches.push(mismatch);
+        }
+    };
+    // Changes that reach devfs.
+    check("create", &|| open_inode(&TABLES, None, b"/dev/forbidden", creat, 0o644, 0).map(drop), rofs);
+    check("mkdir", &|| mkdir_at(&TABLES, None, b"/dev/forbidden", 0o755, 0).map(drop), rofs);
+    check("mkdir over a node", &|| mkdir_at(&TABLES, None, b"/dev/null", 0o755, 0).map(drop), rofs);
+    check("symlink", &|| symlink_at(&TABLES, b"null", None, b"/dev/forbidden").map(drop), rofs);
+    check("symlink over a node", &|| symlink_at(&TABLES, b"zero", None, b"/dev/null").map(drop), rofs);
+    check("link", &|| lumen_vfs::link_at(&TABLES, None, b"/dev/null", None, b"/dev/forbidden", false, false), rofs);
+    check("unlink", &|| unlink_at(&TABLES, None, b"/dev/null", false), rofs);
+    check("rename", &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/forbidden", none), rofs);
+    check("rename over", &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", none), rofs);
+    check("rename exchange", &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", exchange), rofs);
+    check("rmdir (devfs's own)", &|| dev.rmdir(b"null"), rofs);
+    // lumen-vfs's own answers, before devfs is asked.
+    check("unlink of a missing name", &|| unlink_at(&TABLES, None, b"/dev/missing", false), noent);
+    check(
+        "rename of a missing name",
+        &|| rename_at2(&TABLES, None, b"/dev/missing", None, b"/dev/forbidden", none),
+        noent,
+    );
+    check(
+        "rename exchange with a missing name",
+        &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/missing", exchange),
+        noent,
+    );
+    check("rmdir of a node", &|| unlink_at(&TABLES, None, b"/dev/null", true), Err(VfsError::NotDir));
+    check(
+        "RENAME_NOREPLACE over a node",
+        &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", noreplace),
+        Err(VfsError::Exist),
+    );
+    check("rename onto itself", &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/null", none), Ok(()));
+    check(
+        "link from /tmp",
+        &|| lumen_vfs::link_at(&TABLES, None, b"/tmp/dev_link_src.txt", None, b"/dev/forbidden", false, false),
+        Err(VfsError::XDev),
+    );
+    check("forbidden after the refusals", &|| resolve_path_from_root("/dev/forbidden").map(drop), noent);
+    if changed {
+        mismatches.push(String::from("/dev: a change went through, so the checks after it didn't run"));
+    }
+    // Best effort, its failure already reported above: a `/dev/forbidden`
+    // left behind would fail the next run's checks for another reason.
+    if resolve_path_from_root("/dev/forbidden").is_ok() {
+        let _ = unlink_at(&TABLES, None, b"/dev/forbidden", false)
+            .or_else(|_| unlink_at(&TABLES, None, b"/dev/forbidden", true));
+    }
+    if let Err(e) = unlink_at(&TABLES, None, b"/tmp/dev_link_src.txt", false) {
+        mismatches.push(format!("unlink /tmp/dev_link_src.txt: {e:?}"));
+    }
     if mismatches.is_empty() { Ok(()) } else { Err(mismatches.join("; ")) }
 }
 

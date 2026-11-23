@@ -1117,13 +1117,11 @@ mod tests {
         let ran = process::in_test_process(|_| f());
         let umounted = tables().umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
         let removed = rmdir();
-        // A failed run's error is the one returned: a cleanup failure
-        // after it is logged, not lost (the mount may stay at `mnt`).
-        if !matches!(ran, Ok(Ok(()))) {
-            for (step, r) in [("umount", umounted), ("rmdir", removed.map(drop))] {
-                if let Err(e) = r {
-                    log::warn!(target: "ktest", "{mnt}: {step} after a failed run: {e}");
-                }
+        // Only the first failure is returned: every cleanup failure is
+        // logged, so none is lost (the mount may stay at `mnt`).
+        for (step, r) in [("umount", umounted), ("rmdir", removed.map(drop))] {
+            if let Err(e) = r {
+                log::warn!(target: "ktest", "{mnt}: {step} failed: {e}");
             }
         }
         ran??;
@@ -1184,9 +1182,9 @@ mod tests {
                 let after = meta_of(NULL)?;
                 kassert_eq!((after.mode, after.uid, after.gid), (0o640, 1000, 2000));
                 kassert_eq!((ts(after.atime), ts(after.mtime)), ((1000, 5), (2000, 7)));
-                let boot_null = meta_of("/dev/null")?;
+                let dev_null_after = meta_of("/dev/null")?;
                 kassert_eq!(
-                    (boot_null.mode, boot_null.uid, boot_null.gid),
+                    (dev_null_after.mode, dev_null_after.uid, dev_null_after.gid),
                     (dev_null.mode, dev_null.uid, dev_null.gid)
                 );
                 // Its root refuses, as `/dev`'s does.
