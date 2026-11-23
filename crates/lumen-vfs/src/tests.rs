@@ -306,6 +306,7 @@ impl FileSystem for MemFs {
     }
 
     fn name(&self) -> &'static str {
+        assert_test_lock9_free();
         self.name
     }
 
@@ -318,6 +319,7 @@ impl FileSystem for MemFs {
     }
 
     fn read_only(&self) -> bool {
+        assert_test_lock9_free();
         self.read_only
     }
 
@@ -799,8 +801,8 @@ impl VfsInode for MemInode {
     }
 }
 
-fn setup_vfs() -> (SimpleVfsTables, Arc<MemFs>) {
-    let tables = SimpleVfsTables::new();
+fn setup_vfs() -> (TestTables, Arc<MemFs>) {
+    let tables = TestTables::new();
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
     tables.mount_root(root_fs.clone()).unwrap();
     (tables, root_fs)
@@ -1968,235 +1970,8 @@ fn hard_links_access_checks_and_symlink_creation_edges() {
 
 #[test]
 fn lock9_is_never_held_during_inode_calls() {
-    struct ProbeGuardEnv {
-        mounts: Mutex<MountTable>,
-        dentries: Mutex<DentryCache>,
-        inodes: Mutex<InodeCache>,
-    }
-
-    impl ProbeGuardEnv {
-        fn new() -> Self {
-            Self {
-                mounts: Mutex::new(MountTable::new()),
-                dentries: Mutex::new(DentryCache::default()),
-                inodes: Mutex::new(InodeCache::new()),
-            }
-        }
-
-        fn assert_lock9_free(&self) {
-            assert!(self.mounts.try_lock().is_ok(), "MountTable Lock 9 held across VfsInode call!");
-            assert!(self.dentries.try_lock().is_ok(), "DentryCache Lock 9 held across VfsInode call!");
-            assert!(self.inodes.try_lock().is_ok(), "InodeCache Lock 9 held across VfsInode call!");
-        }
-    }
-
-    // Leaves out `SimpleVfsTables`'s `VfsInode::cacheable` checks: no
-    // filesystem mounted on these tables has a non-cacheable inode (#264's
-    // generic `KernelVfsTables` could let these share the check).
-    impl VfsCacheOps for ProbeGuardEnv {
-        fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
-            let root_fs = self.mounts.lock().unwrap().root_fs().ok_or(VfsError::NoEnt)?;
-            Ok(root_fs.root_inode())
-        }
-        fn is_global_root(&self, dev: DevId, ino: Ino) -> bool {
-            self.mounts.lock().unwrap().is_global_root(dev, ino)
-        }
-        fn mount_at(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn FileSystem>> {
-            self.mounts.lock().unwrap().mount_at(dev, ino)
-        }
-        fn mount_at_with_id(&self, dev: DevId, ino: Ino) -> Option<(Arc<dyn FileSystem>, u64)> {
-            self.mounts.lock().unwrap().mount_at_with_id(dev, ino)
-        }
-        fn parent_mount(&self, mounted_dev: DevId) -> Option<Arc<dyn VfsInode>> {
-            self.mounts.lock().unwrap().parent_mount(mounted_dev)
-        }
-        fn parent_mount_if_root(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-            self.mounts.lock().unwrap().parent_mount_if_root(dev, ino)
-        }
-        fn is_mountpoint(&self, dev: DevId, ino: Ino) -> bool {
-            self.mounts.lock().unwrap().is_mountpoint(dev, ino)
-        }
-        fn fs_read_only(&self, dev: DevId) -> bool {
-            self.mounts.lock().unwrap().fs_by_dev(dev).is_some_and(|fs| fs.read_only())
-        }
-        fn fs_by_dev(&self, dev: DevId) -> Option<Arc<dyn FileSystem>> {
-            self.mounts.lock().unwrap().fs_by_dev(dev)
-        }
-        fn cache_gens(&self) -> (u64, u64) {
-            let dentries = self.dentries.lock().unwrap();
-            let inodes = self.inodes.lock().unwrap();
-            (dentries.invalidation_gen(), inodes.removal_gen())
-        }
-        fn dentry_lookup_inode(&self, pdev: DevId, pino: Ino, name: &[u8]) -> (Option<Arc<dyn VfsInode>>, u64, u64) {
-            let dentries = self.dentries.lock().unwrap();
-            let inodes = self.inodes.lock().unwrap();
-            let (target_opt, dentry_gen) = dentries.get_with_gen(pdev, pino, name);
-            let inode_gen = inodes.removal_gen();
-            let inode = target_opt.and_then(|t| inodes.get(t.dev, t.ino));
-            (inode, dentry_gen, inode_gen)
-        }
-        fn publish_lookup_inode(
-            &self,
-            pdev: DevId,
-            pino: Ino,
-            name: &[u8],
-            inode: Arc<dyn VfsInode>,
-            expected_dentry_gen: u64,
-            expected_inode_gen: u64,
-        ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-            let mounts = self.mounts.lock().unwrap();
-            let mut dentries = self.dentries.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            if !mounts.is_dev_mounted(inode.dev_id()) {
-                return Err(inode);
-            }
-            let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
-            if !mounts.is_mountpoint(pdev, pino) {
-                let _ = dentries.insert_if_gen(
-                    pdev,
-                    pino,
-                    name,
-                    DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                    expected_dentry_gen,
-                );
-            }
-            Ok(unified)
-        }
-        fn publish_created_inode(
-            &self,
-            pdev: DevId,
-            pino: Ino,
-            name: &[u8],
-            inode: Arc<dyn VfsInode>,
-            expected_dentry_gen: u64,
-            expected_inode_gen: u64,
-        ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-            let mounts = self.mounts.lock().unwrap();
-            let mut dentries = self.dentries.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            if !mounts.is_dev_mounted(inode.dev_id()) {
-                return Err(inode);
-            }
-            let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
-            let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-            if !was_cached && !mounts.is_mountpoint(pdev, pino) {
-                let _ = dentries.insert_if_gen(
-                    pdev,
-                    pino,
-                    name,
-                    DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                    expected_dentry_gen,
-                );
-            }
-            Ok(unified)
-        }
-        fn dentry_gen(&self) -> u64 {
-            self.dentries.lock().unwrap().invalidation_gen()
-        }
-        fn dentry_get(&self, pdev: DevId, pino: Ino, name: &[u8]) -> Option<DentryTarget> {
-            self.dentries.lock().unwrap().get(pdev, pino, name)
-        }
-        fn dentry_get_with_gen(&self, pdev: DevId, pino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64) {
-            self.dentries.lock().unwrap().get_with_gen(pdev, pino, name)
-        }
-        fn dentry_insert(&self, pdev: DevId, pino: Ino, name: &[u8], target: DentryTarget) {
-            self.dentries.lock().unwrap().insert(pdev, pino, name, target);
-        }
-        fn dentry_insert_if_gen(
-            &self,
-            pdev: DevId,
-            pino: Ino,
-            name: &[u8],
-            target: DentryTarget,
-            expected_gen: u64,
-        ) -> bool {
-            let mounts = self.mounts.lock().unwrap();
-            let mut dentries = self.dentries.lock().unwrap();
-            if mounts.is_mountpoint(pdev, pino) {
-                return false;
-            }
-            dentries.insert_if_gen(pdev, pino, name, target, expected_gen)
-        }
-        fn dentry_invalidate(&self, pdev: DevId, pino: Ino, name: &[u8]) {
-            self.dentries.lock().unwrap().invalidate(pdev, pino, name);
-        }
-        fn dentry_invalidate_dir(&self, pdev: DevId, pino: Ino) {
-            self.dentries.lock().unwrap().invalidate_dir(pdev, pino);
-        }
-        fn inode_get(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().get(dev, ino)
-        }
-        fn inode_get_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().get_if_fresh(dev, ino, since_gen)
-        }
-        fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
-            self.inodes.lock().unwrap().get_or_insert(inode)
-        }
-        fn inode_get_or_insert_if_mounted(
-            &self,
-            mp_dev: DevId,
-            mp_ino: Ino,
-            mount_id: u64,
-            inode: Arc<dyn VfsInode>,
-        ) -> Option<Arc<dyn VfsInode>> {
-            let mounts = self.mounts.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
-                return None;
-            }
-            Some(inodes.get_or_insert(inode))
-        }
-        fn inode_get_or_insert_if_fresh(
-            &self,
-            inode: Arc<dyn VfsInode>,
-            since_gen: u64,
-        ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-            let mounts = self.mounts.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            if !mounts.is_dev_mounted(inode.dev_id()) {
-                return Err(inode);
-            }
-            inodes.get_or_insert_if_fresh(inode, since_gen)
-        }
-        fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().remove(dev, ino)
-        }
-        fn inode_remove_if_fresh(
-            &self,
-            dev: DevId,
-            ino: Ino,
-            since_gen: u64,
-        ) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-            self.inodes.lock().unwrap().remove_if_fresh(dev, ino, since_gen)
-        }
-        fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
-            self.inodes.lock().unwrap().begin_removal_if_fresh(dev, ino, since_gen)
-        }
-        fn inode_end_removal(&self, dev: DevId, ino: Ino) -> u64 {
-            self.inodes.lock().unwrap().end_removal(dev, ino)
-        }
-        fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool {
-            self.inodes.lock().unwrap().evict_detached(dev, ino)
-        }
-        fn inode_remove_if_same(
-            &self,
-            dev: DevId,
-            ino: Ino,
-            expected: &Arc<dyn VfsInode>,
-        ) -> Option<Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().remove_if_same(dev, ino, expected)
-        }
-        fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
-            self.inodes.lock().unwrap().record_removal(dev, ino)
-        }
-        fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().record_removal_if_absent(dev, ino)
-        }
-    }
-
     struct CheckingInode {
         inner: Arc<dyn VfsInode>,
-        env: Arc<ProbeGuardEnv>,
     }
 
     impl VfsInode for CheckingInode {
@@ -2222,39 +1997,39 @@ fn lock9_is_never_held_during_inode_calls() {
             self.inner.dec_open_count()
         }
         fn stat(&self) -> Result<Metadata, VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.stat()
         }
         fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.lookup(name)
         }
         fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.create(name, mode)
         }
         fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.mkdir(name, mode)
         }
         fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.unlink(name)
         }
         fn rmdir(&self, name: &[u8]) -> Result<(), VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.rmdir(name)
         }
         fn link(&self, name: &[u8], target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.link(name, target)
         }
         fn symlink(&self, name: &[u8], target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.symlink(name, target)
         }
         fn readlink(&self) -> Result<Vec<u8>, VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.readlink()
         }
         fn rename(
@@ -2264,11 +2039,11 @@ fn lock9_is_never_held_during_inode_calls() {
             new_name: &[u8],
             flags: RenameFlags,
         ) -> Result<(), VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.rename(old_name, new_dir, new_name, flags)
         }
         fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
-            self.env.assert_lock9_free();
+            assert_test_lock9_free();
             self.inner.readdir(cursor, out, max_entries)
         }
         fn truncate(&self, size: u64) -> Result<(), VfsError> {
@@ -2304,10 +2079,8 @@ fn lock9_is_never_held_during_inode_calls() {
     }
 
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
-    let probe = Arc::new(ProbeGuardEnv::new());
-    probe.mounts.lock().unwrap().mount_root(root_fs.clone()).unwrap();
-    let checking_root: Arc<dyn VfsInode> =
-        Arc::new(CheckingInode { inner: root_fs.root_inode(), env: Arc::clone(&probe) });
+    let probe = mounted_tables(root_fs.clone());
+    let checking_root: Arc<dyn VfsInode> = Arc::new(CheckingInode { inner: root_fs.root_inode() });
 
     mkdir_at(probe.as_ref(), Some(&checking_root), b"a", 0o755, 0).unwrap();
     open_inode(
@@ -2464,7 +2237,7 @@ fn dotdot_unifies_through_inode_cache_and_crosses_stacked_mounts() {
         }
     }
 
-    let env = SimpleVfsTables::new();
+    let env = TestTables::new();
     let mem_fs = MemFs::new(DevId::ROOT, "fresh", false);
     let fresh_fs = Arc::new(FreshRootFs { inner: Arc::clone(&mem_fs) });
     env.mount_root(fresh_fs).unwrap();
@@ -2778,14 +2551,14 @@ fn symlink_at_trailing_slash_preserves_intermediate_enotdir() {
 #[test]
 fn post_mutation_dentry_invalidation_and_fd_ref_sync() {
     struct SpyEnv {
-        inner: SimpleVfsTables,
+        inner: TestTables,
         invalidations: AtomicU32,
         dir_invalidations: AtomicU32,
     }
 
     impl SpyEnv {
         fn new(root: Arc<MemFs>) -> Self {
-            let inner = SimpleVfsTables::new();
+            let inner = TestTables::new();
             inner.mount_root(root).unwrap();
             Self { inner, invalidations: AtomicU32::new(0), dir_invalidations: AtomicU32::new(0) }
         }
@@ -3254,245 +3027,6 @@ fn open_creat_chained_trailing_slash_magic_depth_and_sym_dir_edges() {
 fn lookup_component_does_not_resurrect_dentry_across_concurrent_rename_unlink_or_mount() {
     use alloc::boxed::Box;
 
-    struct SyncTestEnv {
-        mounts: Mutex<MountTable>,
-        dentries: Mutex<DentryCache>,
-        inodes: Mutex<InodeCache>,
-    }
-
-    impl SyncTestEnv {
-        fn new(root: Arc<MemFs>) -> Arc<Self> {
-            let env = Arc::new(Self {
-                mounts: Mutex::new(MountTable::new()),
-                dentries: Mutex::new(DentryCache::default()),
-                inodes: Mutex::new(InodeCache::new()),
-            });
-            let root_inode = root.root_inode();
-            let root_ino = root_inode.ino();
-            env.mounts.lock().unwrap().mount_root_with_ino(root, root_ino).unwrap();
-            let _ = env.inodes.lock().unwrap().get_or_insert(root_inode);
-            env
-        }
-
-        fn mount(&self, mountpoint: Arc<dyn VfsInode>, path: &str, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
-            let mp_dev = mountpoint.dev_id();
-            let mp_ino = mountpoint.ino();
-            let root = fs.root_inode();
-            let root_ino = root.ino();
-            let mut mounts = self.mounts.lock().unwrap();
-            let mut dentries = self.dentries.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            mounts.mount_with_ino(mountpoint, path, fs, root_ino)?;
-            dentries.invalidate_dir(mp_dev, mp_ino);
-            let _ = inodes.get_or_insert(root);
-            Ok(())
-        }
-    }
-
-    // Leaves out `SimpleVfsTables`'s `VfsInode::cacheable` checks: no
-    // filesystem mounted on these tables has a non-cacheable inode (#264's
-    // generic `KernelVfsTables` could let these share the check).
-    impl VfsCacheOps for SyncTestEnv {
-        fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
-            let root_fs = self.mounts.lock().unwrap().root_fs().ok_or(VfsError::NoEnt)?;
-            Ok(root_fs.root_inode())
-        }
-        fn is_global_root(&self, dev: DevId, ino: Ino) -> bool {
-            self.mounts.lock().unwrap().is_global_root(dev, ino)
-        }
-        fn mount_at(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn FileSystem>> {
-            self.mounts.lock().unwrap().mount_at(dev, ino)
-        }
-        fn mount_at_with_id(&self, dev: DevId, ino: Ino) -> Option<(Arc<dyn FileSystem>, u64)> {
-            self.mounts.lock().unwrap().mount_at_with_id(dev, ino)
-        }
-        fn parent_mount(&self, mounted_dev: DevId) -> Option<Arc<dyn VfsInode>> {
-            self.mounts.lock().unwrap().parent_mount(mounted_dev)
-        }
-        fn parent_mount_if_root(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-            self.mounts.lock().unwrap().parent_mount_if_root(dev, ino)
-        }
-        fn is_mountpoint(&self, dev: DevId, ino: Ino) -> bool {
-            self.mounts.lock().unwrap().is_mountpoint(dev, ino)
-        }
-        fn fs_read_only(&self, dev: DevId) -> bool {
-            self.mounts.lock().unwrap().fs_by_dev(dev).is_some_and(|fs| fs.read_only())
-        }
-        fn fs_by_dev(&self, dev: DevId) -> Option<Arc<dyn FileSystem>> {
-            self.mounts.lock().unwrap().fs_by_dev(dev)
-        }
-        fn cache_gens(&self) -> (u64, u64) {
-            let dentries = self.dentries.lock().unwrap();
-            let inodes = self.inodes.lock().unwrap();
-            (dentries.invalidation_gen(), inodes.removal_gen())
-        }
-        fn dentry_lookup_inode(&self, pdev: DevId, pino: Ino, name: &[u8]) -> (Option<Arc<dyn VfsInode>>, u64, u64) {
-            let dentries = self.dentries.lock().unwrap();
-            let inodes = self.inodes.lock().unwrap();
-            let (target_opt, dentry_gen) = dentries.get_with_gen(pdev, pino, name);
-            let inode_gen = inodes.removal_gen();
-            let inode = target_opt.and_then(|t| inodes.get(t.dev, t.ino));
-            (inode, dentry_gen, inode_gen)
-        }
-        fn publish_lookup_inode(
-            &self,
-            pdev: DevId,
-            pino: Ino,
-            name: &[u8],
-            inode: Arc<dyn VfsInode>,
-            expected_dentry_gen: u64,
-            expected_inode_gen: u64,
-        ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-            let mounts = self.mounts.lock().unwrap();
-            let mut dentries = self.dentries.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            if !mounts.is_dev_mounted(inode.dev_id()) {
-                return Err(inode);
-            }
-            let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
-            if !mounts.is_mountpoint(pdev, pino) {
-                let _ = dentries.insert_if_gen(
-                    pdev,
-                    pino,
-                    name,
-                    DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                    expected_dentry_gen,
-                );
-            }
-            Ok(unified)
-        }
-        fn publish_created_inode(
-            &self,
-            pdev: DevId,
-            pino: Ino,
-            name: &[u8],
-            inode: Arc<dyn VfsInode>,
-            expected_dentry_gen: u64,
-            expected_inode_gen: u64,
-        ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-            let mounts = self.mounts.lock().unwrap();
-            let mut dentries = self.dentries.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            if !mounts.is_dev_mounted(inode.dev_id()) {
-                return Err(inode);
-            }
-            let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
-            let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-            if !was_cached && !mounts.is_mountpoint(pdev, pino) {
-                let _ = dentries.insert_if_gen(
-                    pdev,
-                    pino,
-                    name,
-                    DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                    expected_dentry_gen,
-                );
-            }
-            Ok(unified)
-        }
-        fn dentry_gen(&self) -> u64 {
-            self.dentries.lock().unwrap().invalidation_gen()
-        }
-        fn dentry_get(&self, pdev: DevId, pino: Ino, name: &[u8]) -> Option<DentryTarget> {
-            self.dentries.lock().unwrap().get(pdev, pino, name)
-        }
-        fn dentry_get_with_gen(&self, pdev: DevId, pino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64) {
-            self.dentries.lock().unwrap().get_with_gen(pdev, pino, name)
-        }
-        fn dentry_insert(&self, pdev: DevId, pino: Ino, name: &[u8], target: DentryTarget) {
-            self.dentries.lock().unwrap().insert(pdev, pino, name, target);
-        }
-        fn dentry_insert_if_gen(
-            &self,
-            pdev: DevId,
-            pino: Ino,
-            name: &[u8],
-            target: DentryTarget,
-            expected_gen: u64,
-        ) -> bool {
-            let mounts = self.mounts.lock().unwrap();
-            let mut dentries = self.dentries.lock().unwrap();
-            if mounts.is_mountpoint(pdev, pino) {
-                return false;
-            }
-            dentries.insert_if_gen(pdev, pino, name, target, expected_gen)
-        }
-        fn dentry_invalidate(&self, pdev: DevId, pino: Ino, name: &[u8]) {
-            self.dentries.lock().unwrap().invalidate(pdev, pino, name);
-        }
-        fn dentry_invalidate_dir(&self, pdev: DevId, pino: Ino) {
-            self.dentries.lock().unwrap().invalidate_dir(pdev, pino);
-        }
-        fn inode_get(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().get(dev, ino)
-        }
-        fn inode_get_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().get_if_fresh(dev, ino, since_gen)
-        }
-        fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
-            self.inodes.lock().unwrap().get_or_insert(inode)
-        }
-        fn inode_get_or_insert_if_mounted(
-            &self,
-            mp_dev: DevId,
-            mp_ino: Ino,
-            mount_id: u64,
-            inode: Arc<dyn VfsInode>,
-        ) -> Option<Arc<dyn VfsInode>> {
-            let mounts = self.mounts.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
-                return None;
-            }
-            Some(inodes.get_or_insert(inode))
-        }
-        fn inode_get_or_insert_if_fresh(
-            &self,
-            inode: Arc<dyn VfsInode>,
-            since_gen: u64,
-        ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-            let mounts = self.mounts.lock().unwrap();
-            let mut inodes = self.inodes.lock().unwrap();
-            if !mounts.is_dev_mounted(inode.dev_id()) {
-                return Err(inode);
-            }
-            inodes.get_or_insert_if_fresh(inode, since_gen)
-        }
-        fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().remove(dev, ino)
-        }
-        fn inode_remove_if_fresh(
-            &self,
-            dev: DevId,
-            ino: Ino,
-            since_gen: u64,
-        ) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-            self.inodes.lock().unwrap().remove_if_fresh(dev, ino, since_gen)
-        }
-        fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
-            self.inodes.lock().unwrap().begin_removal_if_fresh(dev, ino, since_gen)
-        }
-        fn inode_end_removal(&self, dev: DevId, ino: Ino) -> u64 {
-            self.inodes.lock().unwrap().end_removal(dev, ino)
-        }
-        fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool {
-            self.inodes.lock().unwrap().evict_detached(dev, ino)
-        }
-        fn inode_remove_if_same(
-            &self,
-            dev: DevId,
-            ino: Ino,
-            expected: &Arc<dyn VfsInode>,
-        ) -> Option<Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().remove_if_same(dev, ino, expected)
-        }
-        fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
-            self.inodes.lock().unwrap().record_removal(dev, ino)
-        }
-        fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
-            self.inodes.lock().unwrap().record_removal_if_absent(dev, ino)
-        }
-    }
-
     type LookupHook = Box<dyn FnOnce() + Send>;
 
     struct HookDirInode {
@@ -3610,7 +3144,7 @@ fn lookup_component_does_not_resurrect_dentry_across_concurrent_rename_unlink_or
     }
 
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
-    let env = SyncTestEnv::new(root_fs);
+    let env = mounted_tables(root_fs);
 
     // Subcase 1: Concurrent `rename_at2` immediately before `lookup_component` cache publication.
     let ren_dir = mkdir_at(env.as_ref(), None, b"/ren_dir", 0o755, 0).unwrap();
@@ -3981,327 +3515,149 @@ fn open_creat_retries_on_concurrent_exist_race_across_winner_types() {
 // ============================================================================
 
 std::thread_local! {
-    static TEST_LOCK9_DEPTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// The Lock-9 tables this thread holds, one bit per [`lock9_level`],
+    /// across every `TestTables` instance (no test holds the locks of two
+    /// `TestTables` at once).
+    static TEST_LOCK9_HELD: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
 }
 
-struct Lock9DepthGuard;
-
-impl Lock9DepthGuard {
-    fn enter() -> Self {
-        TEST_LOCK9_DEPTH.with(|d| d.set(d.get() + 1));
-        Self
-    }
-}
-
-impl Drop for Lock9DepthGuard {
-    fn drop(&mut self) {
-        TEST_LOCK9_DEPTH.with(|d| d.set(d.get() - 1));
-    }
+/// A broken Lock-9 rule, printed to stderr (which libtest doesn't capture)
+/// with a backtrace before the test binary aborts. A panic would only end
+/// its own thread: in a test whose other threads wait on a `Barrier` for
+/// the one that panicked, the run hangs until CI's job timeout and the
+/// message is lost. The abort's cost: the rest of the binary's run goes
+/// unreported (no other test's failure message, no summary), so this line
+/// is the one to fix first.
+fn lock9_violation(msg: core::fmt::Arguments<'_>) -> ! {
+    use std::io::Write as _;
+    // libtest names each test's thread after the test, but a thread a test
+    // spawns has no name: the backtrace names the test (a closure in it)
+    // and the `VfsCacheOps` method that broke the rule. One write, so
+    // threads aborting at once don't interleave their lines.
+    let thread = std::thread::current();
+    let line = format!(
+        "{msg} [thread {}]; aborting lumen-vfs's tests, the rest of the run unreported: fix this first\n{}\n",
+        thread.name().unwrap_or("unnamed, spawned by a test"),
+        std::backtrace::Backtrace::force_capture()
+    );
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
+    std::process::abort()
 }
 
 fn assert_test_lock9_free() {
-    let depth = TEST_LOCK9_DEPTH.with(|d| d.get());
-    assert_eq!(depth, 0, "Lock 9 held across VfsInode/FileSystem call (depth={depth})");
-}
-
-struct SyncVfsTables {
-    mounts: Mutex<MountTable>,
-    dentries: Mutex<DentryCache>,
-    inodes: Mutex<InodeCache>,
-}
-
-impl SyncVfsTables {
-    fn new(root: Arc<dyn FileSystem>) -> Arc<Self> {
-        Self::with_removal_history(root, InodeCache::DEFAULT_REMOVAL_HISTORY, DentryCache::DEFAULT_CAPACITY)
-    }
-
-    fn with_removal_history(root: Arc<dyn FileSystem>, max_history: usize, dentry_cap: usize) -> Arc<Self> {
-        let env = Arc::new(Self {
-            mounts: Mutex::new(MountTable::new()),
-            dentries: Mutex::new(DentryCache::new(dentry_cap)),
-            inodes: Mutex::new(InodeCache::with_removal_history(max_history)),
-        });
-        let root_inode = root.root_inode();
-        let root_ino = root_inode.ino();
-        {
-            let _g = Lock9DepthGuard::enter();
-            env.mounts.lock().unwrap().mount_root_with_ino(root, root_ino).unwrap();
-            let _ = env.inodes.lock().unwrap().get_or_insert(root_inode);
-        }
-        env
-    }
-
-    fn mount(&self, mountpoint: Arc<dyn VfsInode>, path: &str, fs: Arc<dyn FileSystem>) -> Result<(), VfsError> {
-        let mp_dev = mountpoint.dev_id();
-        let mp_ino = mountpoint.ino();
-        let root = fs.root_inode();
-        let root_ino = root.ino();
-        let _g = Lock9DepthGuard::enter();
-        let mut mounts = self.mounts.lock().unwrap();
-        let mut dentries = self.dentries.lock().unwrap();
-        let mut inodes = self.inodes.lock().unwrap();
-        mounts.mount_with_ino(mountpoint, path, fs, root_ino)?;
-        dentries.invalidate_dir(mp_dev, mp_ino);
-        let _ = inodes.get_or_insert(root);
-        Ok(())
-    }
-
-    fn umount(&self, mountpoint_dev: DevId, mountpoint_ino: Ino) -> Result<Arc<dyn FileSystem>, VfsError> {
-        let _g = Lock9DepthGuard::enter();
-        let mut mounts = self.mounts.lock().unwrap();
-        let mut dentries = self.dentries.lock().unwrap();
-        let mut inodes = self.inodes.lock().unwrap();
-        let fs = mounts.umount(mountpoint_dev, mountpoint_ino)?;
-        let dev = fs.dev_id();
-        dentries.invalidate_fs(dev);
-        dentries.invalidate_dir(mountpoint_dev, mountpoint_ino);
-        let _ = inodes.evict_fs(dev);
-        Ok(fs)
-    }
-
-    fn snapshot_inodes(&self) -> Vec<Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().snapshot_all()
-    }
-
-    fn snapshot_dentries(&self) -> Vec<(DevId, Ino, Vec<u8>, DentryTarget)> {
-        let _g = Lock9DepthGuard::enter();
-        self.dentries.lock().unwrap().snapshot_all()
-    }
-
-    fn is_dev_mounted(&self, dev: DevId) -> bool {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().is_dev_mounted(dev)
+    let held = TEST_LOCK9_HELD.with(core::cell::Cell::get);
+    if held != 0 {
+        lock9_violation(format_args!("Lock 9 held across a VfsInode/FileSystem call (holding {held:#05b})"));
     }
 }
 
-// Leaves out `SimpleVfsTables`'s `VfsInode::cacheable` checks: no
-// filesystem mounted on these tables has a non-cacheable inode (#264's
-// generic `KernelVfsTables` could let these share the check).
-impl VfsCacheOps for SyncVfsTables {
-    fn root_inode(&self) -> Result<Arc<dyn VfsInode>, VfsError> {
-        let root_fs = {
-            let _g = Lock9DepthGuard::enter();
-            self.mounts.lock().unwrap().root_fs().ok_or(VfsError::NoEnt)?
-        };
-        Ok(root_fs.root_inode())
+/// A table's place in Lock 9's sub-order `MountTable -> DentryCache ->
+/// InodeCache`. By type name: `LockFamily::Lock<T>` is a lock for every
+/// `T`, so `TestLock<T>` can't bound `T` by a trait naming its level, nor
+/// by `'static` for a `TypeId`.
+fn lock9_level<T>() -> u8 {
+    let name = core::any::type_name::<T>();
+    if name.ends_with("::MountTable") {
+        0
+    } else if name.ends_with("::DentryCache") {
+        1
+    } else if name.ends_with("::InodeCache") {
+        2
+    } else {
+        panic!("TestLock guards only the Lock-9 tables, not {name}")
     }
-    fn is_global_root(&self, dev: DevId, ino: Ino) -> bool {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().is_global_root(dev, ino)
+}
+
+/// Lock 9 in the host tests (#264): a `std` mutex whose guards record the
+/// tables their thread holds in `TEST_LOCK9_HELD` (what
+/// `assert_test_lock9_free` checks), and which aborts the test binary
+/// ([`lock9_violation`]) when its thread takes it out of Lock 9's sub-order
+/// or takes a table it already holds (where a bare mutex could hang).
+struct TestLock<T> {
+    level: u8,
+    inner: Mutex<T>,
+}
+
+struct TestLockGuard<'a, T> {
+    level: u8,
+    inner: std::sync::MutexGuard<'a, T>,
+}
+
+impl<T> core::ops::Deref for TestLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
     }
-    fn mount_at(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn FileSystem>> {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().mount_at(dev, ino)
+}
+
+impl<T> core::ops::DerefMut for TestLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
     }
-    fn mount_at_with_id(&self, dev: DevId, ino: Ino) -> Option<(Arc<dyn FileSystem>, u64)> {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().mount_at_with_id(dev, ino)
+}
+
+impl<T> Drop for TestLockGuard<'_, T> {
+    fn drop(&mut self) {
+        TEST_LOCK9_HELD.with(|h| h.set(h.get() & !(1 << self.level)));
     }
-    fn parent_mount(&self, mounted_dev: DevId) -> Option<Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().parent_mount(mounted_dev)
+}
+
+impl<T> VfsLock<T> for TestLock<T> {
+    type Guard<'a>
+        = TestLockGuard<'a, T>
+    where
+        T: 'a;
+
+    fn new(val: T) -> Self {
+        Self { level: lock9_level::<T>(), inner: Mutex::new(val) }
     }
-    fn parent_mount_if_root(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().parent_mount_if_root(dev, ino)
-    }
-    fn is_mountpoint(&self, dev: DevId, ino: Ino) -> bool {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().is_mountpoint(dev, ino)
-    }
-    fn fs_read_only(&self, dev: DevId) -> bool {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().fs_by_dev(dev).is_some_and(|fs| fs.read_only())
-    }
-    fn fs_by_dev(&self, dev: DevId) -> Option<Arc<dyn FileSystem>> {
-        let _g = Lock9DepthGuard::enter();
-        self.mounts.lock().unwrap().fs_by_dev(dev)
-    }
-    fn cache_gens(&self) -> (u64, u64) {
-        let _g = Lock9DepthGuard::enter();
-        let dentries = self.dentries.lock().unwrap();
-        let inodes = self.inodes.lock().unwrap();
-        (dentries.invalidation_gen(), inodes.removal_gen())
-    }
-    fn dentry_lookup_inode(&self, pdev: DevId, pino: Ino, name: &[u8]) -> (Option<Arc<dyn VfsInode>>, u64, u64) {
-        let _g = Lock9DepthGuard::enter();
-        let dentries = self.dentries.lock().unwrap();
-        let inodes = self.inodes.lock().unwrap();
-        let (target_opt, dentry_gen) = dentries.get_with_gen(pdev, pino, name);
-        let inode_gen = inodes.removal_gen();
-        let inode = target_opt.and_then(|t| inodes.get(t.dev, t.ino));
-        (inode, dentry_gen, inode_gen)
-    }
-    fn publish_lookup_inode(
-        &self,
-        pdev: DevId,
-        pino: Ino,
-        name: &[u8],
-        inode: Arc<dyn VfsInode>,
-        expected_dentry_gen: u64,
-        expected_inode_gen: u64,
-    ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        let mounts = self.mounts.lock().unwrap();
-        let mut dentries = self.dentries.lock().unwrap();
-        let mut inodes = self.inodes.lock().unwrap();
-        if !mounts.is_dev_mounted(inode.dev_id()) {
-            return Err(inode);
+
+    fn lock(&self) -> Self::Guard<'_> {
+        let held = TEST_LOCK9_HELD.with(core::cell::Cell::get);
+        if held >> self.level != 0 {
+            lock9_violation(format_args!(
+                "Lock 9 taken out of order (MountTable -> DentryCache -> InodeCache) or twice: \
+                 level {} while holding {held:#05b}",
+                self.level
+            ));
         }
-        let unified = inodes.get_or_insert_if_fresh(inode, expected_inode_gen)?;
-        if !mounts.is_mountpoint(pdev, pino) {
-            let _ = dentries.insert_if_gen(
-                pdev,
-                pino,
-                name,
-                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                expected_dentry_gen,
-            );
-        }
-        Ok(unified)
+        let inner = self.inner.lock().unwrap();
+        TEST_LOCK9_HELD.with(|h| h.set(held | (1 << self.level)));
+        TestLockGuard { level: self.level, inner }
     }
-    fn publish_created_inode(
-        &self,
-        pdev: DevId,
-        pino: Ino,
-        name: &[u8],
-        inode: Arc<dyn VfsInode>,
-        expected_dentry_gen: u64,
-        expected_inode_gen: u64,
-    ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        let mounts = self.mounts.lock().unwrap();
-        let mut dentries = self.dentries.lock().unwrap();
-        let mut inodes = self.inodes.lock().unwrap();
-        if !mounts.is_dev_mounted(inode.dev_id()) {
-            return Err(inode);
-        }
-        let was_cached = inodes.get(inode.dev_id(), inode.ino()).is_some();
-        let unified = inodes.get_or_insert_created_if_fresh(inode, expected_inode_gen)?;
-        if !was_cached && !mounts.is_mountpoint(pdev, pino) {
-            let _ = dentries.insert_if_gen(
-                pdev,
-                pino,
-                name,
-                DentryTarget { dev: unified.dev_id(), ino: unified.ino() },
-                expected_dentry_gen,
-            );
-        }
-        Ok(unified)
+
+    fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut().unwrap()
     }
-    fn dentry_gen(&self) -> u64 {
-        let _g = Lock9DepthGuard::enter();
-        self.dentries.lock().unwrap().invalidation_gen()
-    }
-    fn dentry_get(&self, pdev: DevId, pino: Ino, name: &[u8]) -> Option<DentryTarget> {
-        let _g = Lock9DepthGuard::enter();
-        self.dentries.lock().unwrap().get(pdev, pino, name)
-    }
-    fn dentry_get_with_gen(&self, pdev: DevId, pino: Ino, name: &[u8]) -> (Option<DentryTarget>, u64) {
-        let _g = Lock9DepthGuard::enter();
-        self.dentries.lock().unwrap().get_with_gen(pdev, pino, name)
-    }
-    fn dentry_insert(&self, pdev: DevId, pino: Ino, name: &[u8], target: DentryTarget) {
-        let _g = Lock9DepthGuard::enter();
-        self.dentries.lock().unwrap().insert(pdev, pino, name, target);
-    }
-    fn dentry_insert_if_gen(
-        &self,
-        pdev: DevId,
-        pino: Ino,
-        name: &[u8],
-        target: DentryTarget,
-        expected_gen: u64,
-    ) -> bool {
-        let _g = Lock9DepthGuard::enter();
-        let mounts = self.mounts.lock().unwrap();
-        let mut dentries = self.dentries.lock().unwrap();
-        if mounts.is_mountpoint(pdev, pino) {
-            return false;
-        }
-        dentries.insert_if_gen(pdev, pino, name, target, expected_gen)
-    }
-    fn dentry_invalidate(&self, pdev: DevId, pino: Ino, name: &[u8]) {
-        let _g = Lock9DepthGuard::enter();
-        self.dentries.lock().unwrap().invalidate(pdev, pino, name);
-    }
-    fn dentry_invalidate_dir(&self, pdev: DevId, pino: Ino) {
-        let _g = Lock9DepthGuard::enter();
-        self.dentries.lock().unwrap().invalidate_dir(pdev, pino);
-    }
-    fn inode_get(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().get(dev, ino)
-    }
-    fn inode_get_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().get_if_fresh(dev, ino, since_gen)
-    }
-    fn inode_get_or_insert(&self, inode: Arc<dyn VfsInode>) -> Arc<dyn VfsInode> {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().get_or_insert(inode)
-    }
-    fn inode_get_or_insert_if_mounted(
-        &self,
-        mp_dev: DevId,
-        mp_ino: Ino,
-        mount_id: u64,
-        inode: Arc<dyn VfsInode>,
-    ) -> Option<Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        let mounts = self.mounts.lock().unwrap();
-        let mut inodes = self.inodes.lock().unwrap();
-        if !mounts.has_mount_id(mp_dev, mp_ino, mount_id) {
-            return None;
-        }
-        Some(inodes.get_or_insert(inode))
-    }
-    fn inode_get_or_insert_if_fresh(
-        &self,
-        inode: Arc<dyn VfsInode>,
-        since_gen: u64,
-    ) -> Result<Arc<dyn VfsInode>, Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        let mounts = self.mounts.lock().unwrap();
-        let mut inodes = self.inodes.lock().unwrap();
-        if !mounts.is_dev_mounted(inode.dev_id()) {
-            return Err(inode);
-        }
-        inodes.get_or_insert_if_fresh(inode, since_gen)
-    }
-    fn inode_remove(&self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().remove(dev, ino)
-    }
-    fn inode_remove_if_fresh(&self, dev: DevId, ino: Ino, since_gen: u64) -> Option<(Option<Arc<dyn VfsInode>>, u64)> {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().remove_if_fresh(dev, ino, since_gen)
-    }
-    fn inode_begin_removal(&self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().begin_removal_if_fresh(dev, ino, since_gen)
-    }
-    fn inode_end_removal(&self, dev: DevId, ino: Ino) -> u64 {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().end_removal(dev, ino)
-    }
-    fn inode_evict_detached(&self, dev: DevId, ino: Ino) -> bool {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().evict_detached(dev, ino)
-    }
-    fn inode_remove_if_same(&self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().remove_if_same(dev, ino, expected)
-    }
-    fn inode_record_removal(&self, dev: DevId, ino: Ino) -> u64 {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().record_removal(dev, ino)
-    }
-    fn inode_record_removal_if_absent(&self, dev: DevId, ino: Ino) -> Result<u64, Arc<dyn VfsInode>> {
-        let _g = Lock9DepthGuard::enter();
-        self.inodes.lock().unwrap().record_removal_if_absent(dev, ino)
-    }
+}
+
+struct TestLocks;
+
+impl LockFamily for TestLocks {
+    type Lock<T> = TestLock<T>;
+}
+
+/// The kernel's own Lock-9 tables (`VfsTables`) over [`TestLock`]s.
+type TestTables = VfsTables<TestLocks>;
+
+/// Tables built as the kernel's are (`VfsTables::new`), with `root`
+/// mounted at `/`.
+fn mounted_tables(root: Arc<dyn FileSystem>) -> Arc<TestTables> {
+    let env = Arc::new(TestTables::new());
+    env.mount_root(root).unwrap();
+    env
+}
+
+/// Tables holding at most `dentry_capacity` names and remembering
+/// `removal_history` inode removals, with `root` mounted at `/`.
+fn mounted_tables_with(root: Arc<dyn FileSystem>, dentry_capacity: usize, removal_history: usize) -> Arc<TestTables> {
+    let env = Arc::new(TestTables::from_locks(
+        TestLock::new(MountTable::new()),
+        TestLock::new(DentryCache::new(dentry_capacity)),
+        TestLock::new(InodeCache::with_removal_history(removal_history)),
+    ));
+    env.mount_root(root).unwrap();
+    env
 }
 
 struct ReusingSharedMeta {
@@ -4360,6 +3716,10 @@ struct ReusingFsInner {
     rename_lock: Mutex<()>,
     state: Mutex<ReusingFsState>,
     hooks: Mutex<ReusingHooks>,
+    /// `ReusingHandle`s dropped, and how many of those drops ran while
+    /// their thread held a Lock-9 table.
+    handle_drops: AtomicU32,
+    handle_drops_under_lock9: AtomicU32,
 }
 
 /// Backend constructing a fresh `Arc<dyn VfsInode>` per `lookup`/`create`/
@@ -4408,6 +3768,8 @@ impl FreshArcReusingFs {
                     orphans: BTreeMap::new(),
                 }),
                 hooks: Mutex::new(ReusingHooks::default()),
+                handle_drops: AtomicU32::new(0),
+                handle_drops_under_lock9: AtomicU32::new(0),
             }),
         })
     }
@@ -4457,6 +3819,7 @@ impl FileSystem for FreshArcReusingFs {
         self.inner.name
     }
     fn root_inode(&self) -> Arc<dyn VfsInode> {
+        assert_test_lock9_free();
         let state = self.inner.state.lock().unwrap();
         let root_meta = Arc::clone(&state.inodes.get(&1).expect("root inode exists").meta);
         Self::make_handle(&self.inner, root_meta)
@@ -4466,6 +3829,7 @@ impl FileSystem for FreshArcReusingFs {
         Ok(())
     }
     fn read_only(&self) -> bool {
+        assert_test_lock9_free();
         self.inner.read_only
     }
     fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -4483,6 +3847,18 @@ struct ReusingHandle {
     lock_id: u64,
     inner: Arc<ReusingFsInner>,
     meta: Arc<ReusingSharedMeta>,
+}
+
+impl Drop for ReusingHandle {
+    fn drop(&mut self) {
+        // Counted, not asserted: `InodeCache::get_or_insert` still drops a
+        // losing `Arc` under Lock 9 (#320); a test checks the count where
+        // it matters.
+        if TEST_LOCK9_HELD.try_with(core::cell::Cell::get).unwrap_or(0) != 0 {
+            self.inner.handle_drops_under_lock9.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.handle_drops.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl ReusingHandle {
@@ -5163,7 +4539,7 @@ fn inode_cache_survives_unrelated_dentry_invalidations_on_fresh_arc_backend() {
     // Parts 1–3 invoke `unlink_at` re-entrantly inside `post_create`/`post_mkdir`/`post_symlink` hooks
     // on the same `fs`, so they run with `use_rename_lock = false` to avoid self-deadlocking Lock 3.
     let fs_nolock = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env_nolock = SyncVfsTables::new(Arc::clone(&fs_nolock) as Arc<dyn FileSystem>);
+    let env_nolock = mounted_tables(Arc::clone(&fs_nolock) as Arc<dyn FileSystem>);
 
     for i in 1..=3 {
         let p = format!("/unrel_{i}");
@@ -5224,7 +4600,7 @@ fn inode_cache_survives_unrelated_dentry_invalidations_on_fresh_arc_backend() {
 
     // Parts 4–5 run `resolve_path` `post_lookup` hooks (not holding Lock 3) with `use_rename_lock = true`.
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     let (created_l, _) =
         open_inode(env.as_ref(), None, b"/f_create", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap();
@@ -5279,7 +4655,7 @@ fn inode_cache_survives_unrelated_dentry_invalidations_on_fresh_arc_backend() {
 #[test]
 fn ino_reuse_during_lookup_create_mkdir_symlink_never_aliases_wrong_file() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     mkdir_at(env.as_ref(), None, b"/a", 0o755, 0).unwrap();
 
     // Part A1: `lookup_component` interrupted by `unlink_at` + `create` reusing exact freed `ino`.
@@ -5319,7 +4695,7 @@ fn ino_reuse_during_lookup_create_mkdir_symlink_never_aliases_wrong_file() {
     // Parts A2–A5 & Part B (`new_f`/`new_d`/`new_s`) invoke `unlink_at`/`open_inode(O_CREAT)` re-entrantly
     // inside hooks under Lock 3, so they run on `use_rename_lock = false`.
     let fs_nolock = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env_nolock = SyncVfsTables::new(Arc::clone(&fs_nolock) as Arc<dyn FileSystem>);
+    let env_nolock = mounted_tables(Arc::clone(&fs_nolock) as Arc<dyn FileSystem>);
     mkdir_at(env_nolock.as_ref(), None, b"/a", 0o755, 0).unwrap();
 
     // Part A2: `open_inode(O_CREAT)` `lookup` arm interrupted by `unlink_at` + `create` reusing `ino`.
@@ -5526,7 +4902,7 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
     for use_rename_lock in [true, false] {
         for hold_open in [false, true] {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, use_rename_lock);
-            let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
             mkdir_at(env.as_ref(), None, b"/hl", 0o755, 0).unwrap();
 
             for iter in 0..16 {
@@ -5590,7 +4966,7 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
     // 2. Concurrent `unlink_at("/hl2/a")` vs overwriting `rename_at2("/src", "/hl2/b")`.
     for use_rename_lock in [true, false] {
         let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, use_rename_lock);
-        let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+        let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
         mkdir_at(env.as_ref(), None, b"/hl2", 0o755, 0).unwrap();
 
         for iter in 0..16 {
@@ -5626,7 +5002,7 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
     // 3. `rmdir` `NotEmpty` rollback after concurrent `ino` reuse must not evict new file or restore dead `child`.
     // `pre_rmdir` invokes `open_inode(O_CREAT)` on the same `fs`, so it runs with `use_rename_lock = false`.
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     let victim = mkdir_at(env.as_ref(), None, b"/victim", 0o755, 0).unwrap();
     let victim_ino = victim.ino();
     let env_r = Arc::clone(&env);
@@ -5660,6 +5036,202 @@ fn concurrent_hardlink_unlink_and_rename_overwrite_evicts_inode_cache() {
     let cached = env.inode_get(DevId::ROOT, victim_ino).expect("new_reuser must remain in InodeCache");
     assert!(Arc::ptr_eq(&cached, &reuser));
     assert!(!Arc::ptr_eq(&cached, &victim));
+}
+
+#[test]
+fn umount_drops_the_evicted_inodes_after_releasing_lock9() {
+    let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
+    // A fresh `Arc` per call: once the caller's are gone, `InodeCache` holds
+    // the last reference to each of this filesystem's cached inodes.
+    let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
+    env.mount(Arc::clone(&mp), "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
+    drop(mkdir_at(env.as_ref(), None, b"/mnt/d", 0o755, 0).unwrap());
+    let cached = env.snapshot_inodes().iter().filter(|i| i.dev_id() == DevId::TMPFS).count();
+    assert_eq!(cached, 2, "the mounted root and /mnt/d");
+
+    let drops = tmp_fs.inner.handle_drops.load(Ordering::Relaxed);
+    let drops_under_lock9 = tmp_fs.inner.handle_drops_under_lock9.load(Ordering::Relaxed);
+    drop(env.umount(mp.dev_id(), mp.ino()).unwrap());
+    assert_eq!(tmp_fs.inner.handle_drops.load(Ordering::Relaxed) - drops, 2, "umount dropped the evicted inodes");
+    assert_eq!(
+        tmp_fs.inner.handle_drops_under_lock9.load(Ordering::Relaxed),
+        drops_under_lock9,
+        "an evicted inode was dropped under Lock 9"
+    );
+}
+
+#[test]
+fn mount_root_and_mount_seed_their_roots_into_inode_cache() {
+    // Checked before any lookup could cache them another way.
+    let (env, root_fs) = setup_vfs();
+    let root = root_fs.root_inode();
+    assert!(Arc::ptr_eq(&env.inode_get(root.dev_id(), root.ino()).expect("mount_root seeds /"), &root));
+
+    let mp = root.mkdir(b"mnt", 0o755).unwrap();
+    let tmp_fs = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    env.mount(mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
+    let tmp_root = tmp_fs.root_inode();
+    assert!(Arc::ptr_eq(&env.inode_get(DevId::TMPFS, tmp_root.ino()).expect("mount seeds its root"), &tmp_root));
+}
+
+#[test]
+fn list_mounts_asks_the_filesystems_after_releasing_lock9() {
+    // `MemFs::name` and `read_only` assert Lock 9 is free.
+    let (env, root_fs) = setup_vfs();
+    let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
+    env.mount(mp, "/mnt", MemFs::new(DevId::TMPFS, "tmpfs", true) as Arc<dyn FileSystem>).unwrap();
+    let info = |dev_id, fs_name, mount_path: &str, read_only| MountInfo {
+        dev_id,
+        fs_name,
+        mount_path: String::from(mount_path),
+        read_only,
+    };
+    assert_eq!(
+        env.list_mounts(),
+        vec![info(DevId::ROOT, "ext4", "/", false), info(DevId::TMPFS, "tmpfs", "/mnt", true)]
+    );
+}
+
+#[test]
+fn probes_refuse_inodes_of_unmounted_filesystems() {
+    let (env, root_fs) = setup_vfs();
+    let root = root_fs.root_inode();
+    let (rdev, rino) = (root.dev_id(), root.ino());
+    let refused = |fs: &Arc<MemFs>, what: &str| {
+        // Current generations: only the mount check stands in the way.
+        let (dentry_gen, inode_gen) = env.cache_gens();
+        let child = fs.root.mkdir(b"child", 0o755).unwrap();
+        let ino = child.ino();
+        assert!(
+            env.publish_lookup_inode(rdev, rino, b"x", Arc::clone(&child), dentry_gen, inode_gen).is_err(),
+            "{what}"
+        );
+        assert!(
+            env.publish_created_inode(rdev, rino, b"y", Arc::clone(&child), dentry_gen, inode_gen).is_err(),
+            "{what}"
+        );
+        assert!(env.inode_get_or_insert_if_fresh(child, inode_gen).is_err(), "{what}");
+        assert!(env.inode_get(fs.dev, ino).is_none(), "{what}");
+        assert!(env.dentry_get(rdev, rino, b"x").is_none(), "{what}");
+        assert!(env.dentry_get(rdev, rino, b"y").is_none(), "{what}");
+    };
+
+    refused(&MemFs::new(DevId::TMPFS, "tmpfs", false), "a filesystem never mounted");
+    // One unmounted since: a lookup that raced `umount`.
+    let gone = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    let mp = root.mkdir(b"mnt", 0o755).unwrap();
+    env.mount(Arc::clone(&mp), "/mnt", Arc::clone(&gone) as Arc<dyn FileSystem>).unwrap();
+    drop(env.umount(mp.dev_id(), mp.ino()).unwrap());
+    refused(&gone, "a filesystem unmounted");
+
+    let (dentry_gen, inode_gen) = env.cache_gens();
+    // The same calls with the mounted root filesystem's inodes are taken.
+    let a = root.create(b"a", 0o644).unwrap();
+    assert!(env.publish_lookup_inode(rdev, rino, b"a", Arc::clone(&a), dentry_gen, inode_gen).is_ok(), "lookup");
+    assert!(env.inode_get(rdev, a.ino()).is_some(), "publish_lookup_inode");
+    let b = root.create(b"b", 0o644).unwrap();
+    assert!(env.publish_created_inode(rdev, rino, b"b", Arc::clone(&b), dentry_gen, inode_gen).is_ok(), "created");
+    assert!(env.inode_get(rdev, b.ino()).is_some(), "publish_created_inode");
+    let c = root.create(b"c", 0o644).unwrap();
+    assert!(env.inode_get_or_insert_if_fresh(Arc::clone(&c), inode_gen).is_ok(), "inode_get_or_insert_if_fresh");
+    assert!(env.inode_get(rdev, c.ino()).is_some(), "inode_get_or_insert_if_fresh");
+}
+
+/// `umount` forgets the unmounted filesystem's names: the kernel mounts
+/// each filesystem kind at its canonical `DevId` (`/tmp` is `0:2`), so a
+/// remount gets the same one, and a name left behind would resolve to
+/// whichever inode now has its number.
+#[test]
+fn umount_forgets_the_unmounted_filesystems_names() {
+    let (env, root_fs) = setup_vfs();
+    let nofollow = ResolveFlags { follow_final: false, ..ResolveFlags::default() };
+    let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
+    let first = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    env.mount(Arc::clone(&mp), "/mnt", first as Arc<dyn FileSystem>).unwrap();
+    let d_ino = mkdir_at(&env, None, b"/mnt/d", 0o755, 0).unwrap().ino();
+    assert!(env.snapshot_dentries().iter().any(|(pd, _, _, _)| *pd == DevId::TMPFS));
+    drop(env.umount(mp.dev_id(), mp.ino()).unwrap());
+    assert!(
+        env.snapshot_dentries().iter().all(|(pd, _, _, t)| *pd != DevId::TMPFS && t.dev != DevId::TMPFS),
+        "a name of the unmounted filesystem is still cached"
+    );
+
+    let second = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    env.mount(Arc::clone(&mp), "/mnt", second as Arc<dyn FileSystem>).unwrap();
+    // The same inode number `d` had on the first one, or the check below
+    // would pass with the name left behind.
+    assert_eq!(mkdir_at(&env, None, b"/mnt/other", 0o755, 0).unwrap().ino(), d_ino);
+    assert_eq!(resolve_path(&env, None, b"/mnt/d", nofollow).err(), Some(VfsError::NoEnt));
+}
+
+/// The table probes' generation and identity rules, each call alone: a
+/// stale generation refuses, a cached inode isn't published again, an
+/// identity check compares the `Arc`, not the number (a filesystem that
+/// hands out a fresh `Arc` per lookup, `FreshArcReusingFs`).
+#[test]
+fn table_probes_keep_their_generation_and_identity_rules() {
+    let (env, root_fs) = setup_vfs();
+    let root = root_fs.root_inode();
+    let (rdev, rino) = (root.dev_id(), root.ino());
+
+    let a = env.inode_get_or_insert(root.create(b"a", 0o644).unwrap());
+    env.dentry_insert(rdev, rino, b"a", DentryTarget { dev: a.dev_id(), ino: a.ino() });
+    env.dentry_invalidate_dir(rdev, rino);
+    assert!(env.dentry_get(rdev, rino, b"a").is_none(), "dentry_invalidate_dir");
+
+    // A dentry generation from before an invalidation.
+    let (dentry_gen, inode_gen) = env.cache_gens();
+    env.dentry_invalidate_dir(rdev, rino);
+    let b = root.create(b"b", 0o644).unwrap();
+    assert!(env.publish_created_inode(rdev, rino, b"b", b, dentry_gen, inode_gen).is_ok());
+    assert!(env.dentry_get(rdev, rino, b"b").is_none(), "a stale dentry generation");
+
+    let (dentry_gen, inode_gen) = env.cache_gens();
+    let c = env.inode_get_or_insert(root.create(b"c", 0o644).unwrap());
+    assert!(env.publish_created_inode(rdev, rino, b"c", c, dentry_gen, inode_gen).is_ok());
+    assert!(env.dentry_get(rdev, rino, b"c").is_none(), "an inode cached already");
+
+    // An inode removed since `since`: neither looked up nor removed again.
+    let d = env.inode_get_or_insert(root.create(b"d", 0o644).unwrap());
+    let (_, since) = env.cache_gens();
+    let _ = env.inode_record_removal(rdev, d.ino());
+    assert!(env.inode_get(rdev, d.ino()).is_some());
+    assert!(env.inode_get_if_fresh(rdev, d.ino(), since).is_none(), "inode_get_if_fresh");
+    let (removed, _) = env.inode_begin_removal(rdev, d.ino(), since);
+    assert!(removed.is_none(), "inode_begin_removal");
+    assert!(env.inode_get(rdev, d.ino()).is_some(), "inode_begin_removal");
+    let _ = env.inode_end_removal(rdev, d.ino());
+
+    let f = env.inode_get_or_insert(root.create(b"f", 0o644).unwrap());
+    let f_ino = f.ino();
+    f.inc_open_count();
+    root.unlink(b"f").unwrap();
+    assert!(!env.inode_evict_detached(rdev, a.ino()));
+    assert!(env.inode_evict_detached(rdev, f_ino), "inode_evict_detached");
+    f.dec_open_count();
+
+    let fresh = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fresh) as Arc<dyn FileSystem>);
+    let root = fresh.root_inode();
+    let e = env.inode_get_or_insert(root.create(b"e", 0o644).unwrap());
+    let twin = root.lookup(b"e").unwrap();
+    assert!(twin.ino() == e.ino() && !Arc::ptr_eq(&twin, &e));
+    assert!(env.inode_remove_if_same(rdev, e.ino(), &twin).is_none());
+    assert!(env.inode_get(rdev, e.ino()).is_some(), "inode_remove_if_same");
+    assert!(env.inode_remove_if_same(rdev, e.ino(), &e).is_some());
+}
+
+#[test]
+fn cache_gens_is_the_dentry_then_the_inode_generation() {
+    let (env, _root_fs) = setup_vfs();
+    env.dentry_invalidate_dir(DevId::ROOT, 1);
+    env.dentry_invalidate_dir(DevId::ROOT, 1);
+    let inode_gen = env.inode_record_removal(DevId::ROOT, 99);
+    let dentry_gen = env.dentry_gen();
+    assert_ne!(dentry_gen, inode_gen);
+    assert_eq!(env.cache_gens(), (dentry_gen, inode_gen));
 }
 
 #[test]
@@ -5698,7 +5270,7 @@ fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
     }
 
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
-    let env = SyncVfsTables::new(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
     let mp = mkdir_at(env.as_ref(), None, b"/mp", 0o755, 0).unwrap();
     let mp_dev = mp.dev_id();
     let mp_ino = mp.ino();
@@ -5722,10 +5294,10 @@ fn cross_mounts_down_vs_umount_does_not_leak_unmounted_root_inode() {
     );
 }
 
-fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usize, dentry_cap: usize) {
+fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, dentry_cap: usize, hist: usize) {
     let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, use_rename_lock);
     let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, use_rename_lock);
-    let env = SyncVfsTables::with_removal_history(Arc::clone(&root_fs) as Arc<dyn FileSystem>, hist, dentry_cap);
+    let env = mounted_tables_with(Arc::clone(&root_fs) as Arc<dyn FileSystem>, dentry_cap, hist);
 
     for d in [b"/d0" as &[u8], b"/d1", b"/d0/sub", b"/mnt"] {
         mkdir_at(env.as_ref(), None, d, 0o755, 0).unwrap();
@@ -5991,15 +5563,23 @@ fn run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock: bool, hist: usiz
 
 #[test]
 fn unhooked_4_thread_concurrent_vfs_stress_with_ino_reuse() {
-    for (use_rename_lock, hist, dentry_cap) in
-        [(true, InodeCache::DEFAULT_REMOVAL_HISTORY, DentryCache::DEFAULT_CAPACITY), (true, 4, 16), (true, 0, 0)]
+    for (use_rename_lock, dentry_cap, hist) in
+        [(true, DentryCache::DEFAULT_CAPACITY, InodeCache::DEFAULT_REMOVAL_HISTORY), (true, 16, 4), (true, 0, 0)]
     {
-        run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock, hist, dentry_cap);
+        run_unhooked_4_thread_concurrent_vfs_stress(use_rename_lock, dentry_cap, hist);
     }
 }
 
-fn assert_no_zombies_in_cache(env: &SyncVfsTables) {
-    for cached in env.snapshot_inodes() {
+fn assert_no_zombies_in_cache(env: &TestTables) {
+    let snapshot = env.snapshot_inodes();
+    // The root is cached from `mount_root` on, so an empty snapshot can't
+    // pass the checks below unnoticed.
+    let root = env.root_inode().unwrap();
+    assert!(
+        snapshot.iter().any(|i| (i.dev_id(), i.ino()) == (root.dev_id(), root.ino())),
+        "the root inode is missing from InodeCache's snapshot"
+    );
+    for cached in snapshot {
         assert!(!cached.is_detached(), "detached inode in InodeCache: {cached:?}");
         assert_eq!(cached.ino() & DETACHED_INO_BIT, 0, "DETACHED_INO_BIT in InodeCache: {cached:?}");
         let meta = cached.stat().expect("cached inode must stat cleanly");
@@ -6012,7 +5592,7 @@ fn cross_fs_and_single_fs_overflow_never_skips_removal_or_leaves_zombie() {
     // Part 1: Cross-FS overflow (`PROBE 3I`, `3I-rmdir`, `3I-rename`) at `DEFAULT_REMOVAL_HISTORY = 4096`.
     let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
     let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
 
     let mnt_mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
     env.mount(mnt_mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
@@ -6119,7 +5699,7 @@ fn cross_fs_and_single_fs_overflow_never_skips_removal_or_leaves_zombie() {
 
     // Part 2a: Single-FS overflow on `DevId::ROOT` (`with_removal_history(4)`), pre-cached victim.
     let fs2 = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env2 = SyncVfsTables::with_removal_history(Arc::clone(&fs2) as Arc<dyn FileSystem>, 4, 64);
+    let env2 = mounted_tables_with(Arc::clone(&fs2) as Arc<dyn FileSystem>, 64, 4);
     let (s_pre, _) =
         open_inode(env2.as_ref(), None, b"/s_pre", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap();
@@ -6151,7 +5731,7 @@ fn cross_fs_and_single_fs_overflow_never_skips_removal_or_leaves_zombie() {
 
     // Part 2b: Single-FS overflow (`hist = 0`) with concurrent post-`since_gen` insertion before `begin_removal`.
     let fs3 = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env3 = SyncVfsTables::with_removal_history(Arc::clone(&fs3) as Arc<dyn FileSystem>, 0, 0);
+    let env3 = mounted_tables_with(Arc::clone(&fs3) as Arc<dyn FileSystem>, 0, 0);
     let (s_post, _) =
         open_inode(env3.as_ref(), None, b"/s_post", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
             .unwrap();
@@ -6191,7 +5771,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
         // 1a. `open_inode(O_CREAT)` vs `unlink_at`
         {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-            let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
             let b_created = Arc::new(Barrier::new(2));
             let b_in_guard = Arc::new(Barrier::new(2));
             let b_in_lookup = Arc::new(Barrier::new(2));
@@ -6284,7 +5864,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
         // 1b. `mkdir_at` vs `unlink_at(..., true)` (`pre_rmdir`)
         {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-            let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
             let b_created = Arc::new(Barrier::new(2));
             let b_in_guard = Arc::new(Barrier::new(2));
             let b_in_lookup = Arc::new(Barrier::new(2));
@@ -6366,7 +5946,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
         // 1c. `symlink_at` vs `unlink_at(..., false)`
         {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-            let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
             let b_created = Arc::new(Barrier::new(2));
             let b_in_guard = Arc::new(Barrier::new(2));
             let b_in_lookup = Arc::new(Barrier::new(2));
@@ -6449,7 +6029,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
     // 2. `PROBE 3F` & Codex P1: `O_CREAT | O_EXCL` post-create unlink + recreate same name reusing `ino`.
     //    `post_create` calls `unlink_at` + `open_inode` on the same `fs`, so `use_rename_lock = false`.
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     mkdir_at(env.as_ref(), None, b"/a", 0o755, 0).unwrap();
 
     let env_h = Arc::clone(&env);
@@ -6497,7 +6077,7 @@ fn publish_created_inode_retry_respects_pending_removals_and_o_excl_race() {
 fn noop_rename_lock_hardlink_unlink_and_rename_races_evict_zombies() {
     // Part 1: `PROBE 1D-1` (`use_rename_lock = false`, `open_count == 0`, `/hl/a` & `/hl/b` cached).
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     mkdir_at(env.as_ref(), None, b"/hl", 0o755, 0).unwrap();
 
     let (orig, _) =
@@ -6655,7 +6235,7 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
 
     let raw_root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
     let hook_root_fs = Arc::new(HookRootFs { inner: Arc::clone(&raw_root_fs), on_root: Mutex::new(None) });
-    let env = SyncVfsTables::with_removal_history(Arc::clone(&hook_root_fs) as Arc<dyn FileSystem>, 2, 64);
+    let env = mounted_tables_with(Arc::clone(&hook_root_fs) as Arc<dyn FileSystem>, 64, 2);
     for i in 0..3usize {
         let p = format!("/r_unrel_{i}");
         open_inode(env.as_ref(), None, p.as_bytes(), OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
@@ -6953,6 +6533,7 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
             Ok(())
         }
         fn read_only(&self) -> bool {
+            assert_test_lock9_free();
             true
         }
     }
@@ -7127,7 +6708,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
     for hold_open in [false, true] {
         for kind in [OpKind::OpenCreat, OpKind::Mkdir, OpKind::Symlink] {
             let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-            let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+            let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
 
             let (src, _) =
                 open_inode(env.as_ref(), None, b"/src", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
@@ -7189,7 +6770,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
         for rflags in [RenameFlags(0), RenameFlags(RenameFlags::NOREPLACE)] {
             for kind in [OpKind::OpenCreat, OpKind::Mkdir, OpKind::Symlink] {
                 let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-                let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+                let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
 
                 let (src, _) = open_inode(
                     env.as_ref(),
@@ -7274,7 +6855,7 @@ fn rename_at2_vs_creat_mkdir_symlink_serialized_by_rename_lock_zero_zombies() {
     // 3. Cross-FS symlink hop in `open_inode(O_CREAT)` drops `ROOT`'s Lock 3 before crossing to `TMPFS`.
     let root_fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
     let tmp_fs = FreshArcReusingFs::new(DevId::TMPFS, "fresh-tmpfs", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
     let mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
     env.mount(mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
     symlink_at(env.as_ref(), b"/mnt/file", None, b"/link_to_tmp").unwrap();
@@ -7295,7 +6876,7 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
     type CacheHook = alloc::boxed::Box<dyn FnOnce() + Send>;
 
     struct HookCacheEnv {
-        inner: Arc<SyncVfsTables>,
+        inner: Arc<TestTables>,
         on_cache_gens: Mutex<Option<CacheHook>>,
         on_before_record_if_absent: Mutex<Option<CacheHook>>,
         on_after_record_if_absent: Mutex<Option<CacheHook>>,
@@ -7303,7 +6884,7 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
     }
 
     impl HookCacheEnv {
-        fn new(inner: Arc<SyncVfsTables>) -> Arc<Self> {
+        fn new(inner: Arc<TestTables>) -> Arc<Self> {
             Arc::new(Self {
                 inner,
                 on_cache_gens: Mutex::new(None),
@@ -7481,7 +7062,7 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
     //    retry-loop `env.cache_gens()` must NOT adopt replacement `other`.
     {
         let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-        let inner = SyncVfsTables::with_removal_history(Arc::clone(&fs) as Arc<dyn FileSystem>, 0, 64);
+        let inner = mounted_tables_with(Arc::clone(&fs) as Arc<dyn FileSystem>, 64, 0);
         let env = HookCacheEnv::new(Arc::clone(&inner));
         mkdir_at(inner.as_ref(), None, b"/a", 0o755, 0).unwrap();
         open_inode(inner.as_ref(), None, b"/a/unrel", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
@@ -7539,7 +7120,7 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
     // 2. `PROBE 1D-4` (`evict_zombie_inode` vs `lookup_component` atomicity, `use_rename_lock = false`).
     for publish_before_record in [true, false] {
         let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, false);
-        let inner = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+        let inner = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
         let env = HookCacheEnv::new(Arc::clone(&inner));
         let hl_dir = mkdir_at(inner.as_ref(), None, b"/hl", 0o755, 0).unwrap();
 
@@ -7631,63 +7212,36 @@ fn publish_created_inode_retry_cache_gens_window_and_evict_zombie_atomicity() {
 
 #[test]
 fn shadowed_mountpoint_never_pollutes_dentry_cache() {
-    // Verify both `SyncVfsTables` and `SimpleVfsTables` skip `DentryCache` insertion
+    // Verify the tables skip `DentryCache` insertion
     // when `parent` is an active mountpoint, while still unifying via `InodeCache`.
     let root_fs = MemFs::new(DevId::ROOT, "ext4", false);
     let tmp_fs = MemFs::new(DevId::TMPFS, "tmpfs", false);
-    let sync_env = SyncVfsTables::new(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
-    let mnt_mp = mkdir_at(sync_env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
-    sync_env.mount(Arc::clone(&mnt_mp), "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
+    let env = mounted_tables(Arc::clone(&root_fs) as Arc<dyn FileSystem>);
+    let mnt_mp = mkdir_at(env.as_ref(), None, b"/mnt", 0o755, 0).unwrap();
+    env.mount(Arc::clone(&mnt_mp), "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
 
-    let (under_c, _) = open_inode(
-        sync_env.as_ref(),
-        Some(&mnt_mp),
-        b"under",
-        OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
-        0o644,
-        0,
-    )
-    .unwrap();
-    let under_r = resolve_path(sync_env.as_ref(), Some(&mnt_mp), b"under", ResolveFlags::default()).unwrap().inode;
+    let (under_c, _) =
+        open_inode(env.as_ref(), Some(&mnt_mp), b"under", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
+            .unwrap();
+    let under_r = resolve_path(env.as_ref(), Some(&mnt_mp), b"under", ResolveFlags::default()).unwrap().inode;
     assert!(Arc::ptr_eq(&under_c, &under_r));
-    assert!(Arc::ptr_eq(&sync_env.inode_get(under_c.dev_id(), under_c.ino()).unwrap(), &under_c));
-    assert!(sync_env.dentry_get(mnt_mp.dev_id(), mnt_mp.ino(), b"under").is_none());
-    assert!(!sync_env.dentry_insert_if_gen(
+    assert!(Arc::ptr_eq(&env.inode_get(under_c.dev_id(), under_c.ino()).unwrap(), &under_c));
+    assert!(env.dentry_get(mnt_mp.dev_id(), mnt_mp.ino(), b"under").is_none());
+    assert!(!env.dentry_insert_if_gen(
         mnt_mp.dev_id(),
         mnt_mp.ino(),
         b"under",
         DentryTarget { dev: under_c.dev_id(), ino: under_c.ino() },
-        sync_env.dentry_gen(),
+        env.dentry_gen(),
     ));
-    assert!(sync_env.dentry_get(mnt_mp.dev_id(), mnt_mp.ino(), b"under").is_none());
-
-    let simple_env = SimpleVfsTables::new();
-    let root_fs2 = MemFs::new(DevId::ROOT, "ext4", false);
-    let tmp_fs2 = MemFs::new(DevId::TMPFS, "tmpfs", false);
-    simple_env.mount_root(root_fs2).unwrap();
-    let mp2 = mkdir_at(&simple_env, None, b"/mnt", 0o755, 0).unwrap();
-    simple_env.mount(Arc::clone(&mp2), "/mnt", tmp_fs2).unwrap();
-
-    let (u2_c, _) =
-        open_inode(&simple_env, Some(&mp2), b"under", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0)
-            .unwrap();
-    let u2_r = resolve_path(&simple_env, Some(&mp2), b"under", ResolveFlags::default()).unwrap().inode;
-    assert!(Arc::ptr_eq(&u2_c, &u2_r));
-    assert!(simple_env.dentry_get(mp2.dev_id(), mp2.ino(), b"under").is_none());
-    assert!(!simple_env.dentry_insert_if_gen(
-        mp2.dev_id(),
-        mp2.ino(),
-        b"under",
-        DentryTarget { dev: u2_c.dev_id(), ino: u2_c.ino() },
-        simple_env.dentry_gen(),
-    ));
+    assert!(env.dentry_get(mnt_mp.dev_id(), mnt_mp.ino(), b"under").is_none());
 }
 
 #[test]
 fn compute_cwd_path_retries_on_concurrent_rename_and_rejects_unlinked_cwd() {
     // 1. Direct `cwd` rename between `lookup_dotdot` and `find_child_name_in_dir` (`readdir`).
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
 
     mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
@@ -7762,7 +7316,7 @@ fn concurrent_compute_cwd_path_vs_rename_at2_stress() {
     use std::sync::Barrier;
 
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
 
     mkdir_at(env.as_ref(), None, b"/p1", 0o755, 0).unwrap();
     mkdir_at(env.as_ref(), None, b"/p2", 0o755, 0).unwrap();
@@ -7901,6 +7455,7 @@ mod uncached {
             Ok(())
         }
         fn read_only(&self) -> bool {
+            assert_test_lock9_free();
             true
         }
     }
@@ -8078,7 +7633,7 @@ mod uncached {
 const DYNFS_DEV: DevId = DevId::makedev(0, 77);
 
 /// A root `MemFs` with a [`uncached::DynFs`] mounted at `/proc`.
-fn setup_dynfs() -> (SimpleVfsTables, Arc<uncached::DynFs>, Arc<dyn VfsInode>) {
+fn setup_dynfs() -> (TestTables, Arc<uncached::DynFs>, Arc<dyn VfsInode>) {
     let (env, _root_fs) = setup_vfs();
     let mp = mkdir_at(&env, None, b"/proc", 0o555, 0).unwrap();
     let dynfs = uncached::DynFs::new(DYNFS_DEV);
@@ -8107,14 +7662,11 @@ fn fixed_namespace_ops_refuse_each_change_with_erofs() {
 }
 
 /// How many per-pid entries `InodeCache` and `DentryCache` hold.
-fn dynfs_cached_per_pid(env: &SimpleVfsTables) -> (usize, usize) {
+fn dynfs_cached_per_pid(env: &TestTables) -> (usize, usize) {
     let per_pid = |ino: Ino| ino & (1u64 << 48) != 0;
-    let inodes =
-        env.inodes.borrow().snapshot_all().iter().filter(|i| i.dev_id() == DYNFS_DEV && per_pid(i.ino())).count();
+    let inodes = env.snapshot_inodes().iter().filter(|i| i.dev_id() == DYNFS_DEV && per_pid(i.ino())).count();
     let dentries = env
-        .dentries
-        .borrow()
-        .snapshot_all()
+        .snapshot_dentries()
         .iter()
         .filter(|(pdev, pino, _, target)| {
             (*pdev == DYNFS_DEV && per_pid(*pino)) || (target.dev == DYNFS_DEV && per_pid(target.ino))
@@ -8200,8 +7752,10 @@ fn non_cacheable_lookups_leave_the_caches_flat() {
     let nofollow = ResolveFlags { follow_final: false, ..ResolveFlags::default() };
     let follow = ResolveFlags { follow_final: true, ..ResolveFlags::default() };
     resolve_path(&env, None, b"/proc/version", nofollow).unwrap();
-    let inodes_before = env.inodes.borrow().len();
-    let dentries_before = env.dentries.borrow().len();
+    let inodes_before = env.snapshot_inodes().len();
+    let dentries_before = env.dentry_count();
+    // `/`, `/proc` and `/proc/version` are cached, so "flat" can't be 0 == 0.
+    assert!(inodes_before > 0 && dentries_before > 0, "{inodes_before} inodes, {dentries_before} names");
 
     for pid in 1..=2000u32 {
         dynfs.shared.live.lock().unwrap().insert(pid);
@@ -8224,8 +7778,8 @@ fn non_cacheable_lookups_leave_the_caches_flat() {
     }
 
     assert_eq!(dynfs_cached_per_pid(&env), (0, 0));
-    assert_eq!(env.inodes.borrow().len(), inodes_before);
-    assert_eq!(env.dentries.borrow().len(), dentries_before);
+    assert_eq!(env.snapshot_inodes().len(), inodes_before);
+    assert_eq!(env.dentry_count(), dentries_before);
 }
 
 #[test]
@@ -8516,6 +8070,7 @@ impl FileSystem for GateFs {
         Ok(())
     }
     fn read_only(&self) -> bool {
+        assert_test_lock9_free();
         false
     }
     fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -8527,7 +8082,7 @@ impl FileSystem for GateFs {
 const GATE_DATA: &[u8] = b"still here";
 
 struct Gate {
-    env: SimpleVfsTables,
+    env: TestTables,
     root: Arc<GateInode>,
     files: Vec<Arc<GateInode>>,
     rename_lock: Arc<Mutex<()>>,
@@ -8560,7 +8115,7 @@ fn gate_vfs(names: &[&str]) -> Gate {
         })
         .collect();
     let rename_lock = Arc::new(Mutex::new(()));
-    let env = SimpleVfsTables::new();
+    let env = TestTables::new();
     env.mount_root(Arc::new(GateFs { root: Arc::clone(&root), rename_lock: Arc::clone(&rename_lock) })).unwrap();
     Gate { env, root, files, rename_lock }
 }
@@ -8885,14 +8440,14 @@ fn not_a_name_errno_per_operation_ahead_of_erofs() {
     open_inode(&env, None, b"/f", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
     let ro_mp = mkdir_at(&env, None, b"/ro", 0o755, 0).unwrap();
     env.mount(ro_mp, "/ro", MemFs::new(DevId::makedev(0, 72), "rofs", true)).unwrap();
-    let ro_root = SimpleVfsTables::new();
+    let ro_root = TestTables::new();
     ro_root.mount_root(MemFs::new(DevId::ROOT, "ext4", true)).unwrap();
 
     let creat = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDONLY);
     let excl = OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_EXCL | OpenFlags::O_RDONLY);
     let noreplace = RenameFlags(RenameFlags::NOREPLACE);
     // (tables, path, a name in the same directory, rmdir's errno)
-    let rows: [(&SimpleVfsTables, &[u8], &[u8], VfsError); 8] = [
+    let rows: [(&TestTables, &[u8], &[u8], VfsError); 8] = [
         (&env, b"/", b"/f", VfsError::Busy),
         (&env, b".", b"/f", VfsError::Inval),
         (&env, b"/d/.", b"/d/x", VfsError::Inval),
@@ -8925,7 +8480,7 @@ fn not_a_name_errno_per_operation_ahead_of_erofs() {
 #[test]
 fn not_a_name_answered_without_the_filesystem() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     let env = env.as_ref();
     open_inode(env, None, b"/f", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
     let gone = mkdir_at(env, None, b"/gone", 0o755, 0).unwrap();
@@ -8953,7 +8508,7 @@ fn not_a_name_answered_without_the_filesystem() {
 #[test]
 fn open_creat_resolves_the_dots_it_was_given() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
-    let env = SyncVfsTables::new(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
     let d = mkdir_at(env.as_ref(), None, b"/d", 0o755, 0).unwrap();
     let mp = mkdir_at(env.as_ref(), None, b"/m", 0o755, 0).unwrap();
     let mounted = FreshArcReusingFs::new(DevId::makedev(0, 73), "fresh-tmpfs", false, true);
