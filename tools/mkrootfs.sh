@@ -117,9 +117,9 @@ COPYFILE_DISABLE=1 E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$MKE2FS" -q -F \
 # mke2fs sets s_flags' EXT2_FLAGS_UNSIGNED_HASH where `char` is unsigned (e.g.
 # Linux on aarch64), and Lumen mounts such a volume read-only (#308: ext4plus
 # hashes directory names signed). Set s_flags to signed on every host: only the
-# flag changes, since `mke2fs -d` indexes no directory (the final `e2fsck -fn`
-# would fail on one), and an image already signed (x86-64, macOS) is untouched.
-# It checks the flag from the image's bytes either way.
+# flag changes, which is all it takes since `mke2fs -d` indexes no directory,
+# and an image already signed (x86-64, macOS) is untouched. It checks the flag
+# from the image's bytes either way.
 E2FSPROGS_FAKE_TIME="$FIXED_EPOCH" "$ROOT/tools/ext4-signed-hash.sh" "$DEBUGFS" "$TMP_IMG"
 
 # Normalize uid/gid (0:0), i_ctime/ctime_extra, and i_atime/atime_extra on every
@@ -174,7 +174,7 @@ if grep -qvE '^(debugfs [0-9]|$)' "$DBG_DIR/sif.err"; then
 fi
 
 if ! "$E2FSCK" -fn "$TMP_IMG" >/dev/null; then
-    echo "mkrootfs: e2fsck -fn failed on the image (an indexed directory, which ext4-signed-hash.sh's switch would leave in unsigned-hash order, is one cause: #308)" >&2
+    echo "mkrootfs: e2fsck -fn failed on the image (one cause: an indexed directory, left in unsigned-hash order by ext4-signed-hash.sh's switch, holding a name with a byte of 0x80 or above: #308)" >&2
     exit 1
 fi
 mv -f "$TMP_IMG" "$OUT"

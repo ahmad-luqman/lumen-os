@@ -147,7 +147,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Byte-string names through the VFS (#268): a name that is not UTF-8 (on ext4 and tmpfs) is created, listed by readdir and getdents64, looked up (the dentry cache telling names apart by their bytes), renamed, hard-linked, unlinked and its directory removed once empty, kept on an ext4 disk through e2fsck and read back cold on the next boot; getcwd under it and /proc/<pid>/fd give its bytes; a symlink target that is not UTF-8 is stored as given; /proc/<pid>/maps names a mapped file by its path's bytes (each newline as \\012); vfstest ls and an exec error's interpreter path show such a name escaped, never lossily (lumen_vfs::Escaped). On an ext4 volume with unsigned directory hashes, only listed and looked up (#308)."
+name = "Byte-string names through the VFS (#268): a name that is not UTF-8 (on ext4 and tmpfs) is created, listed by readdir and getdents64, looked up (the dentry cache telling names apart by their bytes), renamed, hard-linked, unlinked and its directory removed once empty, kept on an ext4 disk through e2fsck and read back cold on the next boot; getcwd under it and /proc/<pid>/fd give its bytes; a symlink target that is not UTF-8 is stored as given; /proc/<pid>/maps names a mapped file by its path's bytes (each newline as \\012); vfstest ls and an exec error's interpreter path show such a name escaped, never lossily (lumen_vfs::Escaped). On an ext4 volume whose directory hashes are or may be unsigned, only listed and looked up (#308)."
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
@@ -163,13 +163,15 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4 volumes with unsigned directory hashes (#308, s_flags EXT2_FLAGS_UNSIGNED_HASH, which ext4plus ignores) mount read-only with one warning naming the flag; every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (only a non-ASCII hash miss in an htree directory walks it, a read error in the walk is EIO), a missing name is ENOENT, and unlink, rmdir and create are EROFS; the same volume with its flag set to signed mounts writable and gets no walk; tools/ext4-signed-hash.sh (mkrootfs.sh's switch) sets an unsigned image's flag to signed, changing nothing else, and fails if the flag stays unsigned"
+name = "ext4 volumes whose directory hashes are or may be unsigned (#308: s_flags EXT2_FLAGS_UNSIGNED_HASH, or neither hash flag with dir_index; ext4plus hashes signed) mount read-only with one warning naming the flag or its absence (and a journal needing recovery outranks it, its warning showing no s_flags); every name an htree directory lists, those with bytes of 0x80 or above too, is looked up to the inode listed (only a non-ASCII hash miss in an htree directory walks it; a read error in the walk or in the hash lookup is EIO), a missing name is ENOENT, and unlink, rmdir and create are EROFS; the same volume with its flag set to signed, or with neither flag and no dir_index, mounts writable (the signed one gets no walk); tools/ext4-signed-hash.sh sets an ext4 image's unsigned flag to signed, changing nothing else (keeping s_flags' other bits), refuses a file without ext4's magic and fails if the flag stays unsigned; tools/mkrootfs.sh runs it, so an image its mke2fs made unsigned comes out signed, and fails if a directory indexed by the unsigned hash holds names with bytes of 0x80 or above"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name",
     "ktest:lumen_kernel::vfs::ext4::ext4_unwritable_ro_compat_features_force_read_only",
     "scenario:test_ktest::test_in_kernel_tests_pass",
     "harness:test_rootfs::test_signed_hash_switches_only_the_flag",
-    "harness:test_rootfs::test_signed_hash_on_an_image_mke2fs_made_passes_e2fsck",
     "harness:test_rootfs::test_signed_hash_fails_when_the_flag_stays_unsigned",
+    "harness:test_rootfs::test_signed_hash_refuses_a_file_without_an_ext4_superblock",
+    "harness:test_rootfs::test_mkrootfs_makes_an_unsigned_image_signed",
+    "harness:test_rootfs::test_mkrootfs_fails_on_a_directory_indexed_by_the_unsigned_hash",
 ]

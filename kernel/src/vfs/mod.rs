@@ -1456,6 +1456,10 @@ fn build_minimal_ext4_image_blocks(total_blocks: usize) -> Vec<u8> {
     write_u16le(sb, 0xfe, 64);
     write_u16le(sb, 0x15c, 32);
     write_u16le(sb, 0x15e, 32);
+    // s_flags: EXT2_FLAGS_SIGNED_HASH, as mke2fs writes where `char` is
+    // signed. With `dir_index` (compat 0x20) and neither hash flag, the
+    // adapter mounts read-only (#308).
+    write_u32le(sb, 0x160, 0x1);
 
     let bgd = &mut img[BLOCK_SIZE..BLOCK_SIZE + 64];
     write_u32le(bgd, 0x00, 2);

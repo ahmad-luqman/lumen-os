@@ -23,8 +23,8 @@ before `e2fsck -fyD` indexes the directory.
 
 Deterministic for a given e2fsprogs and mke2fs.conf (fixed UUID, hash seed
 and times): the committed file was made with e2fsprogs 1.47.4 and its stock
-mke2fs.conf (Homebrew's; `-t ext4` takes its feature defaults and the
-half_md4 hash from there), found as `lumen_harness.rootfs.find_e2fsprogs`
+mke2fs.conf (Homebrew's; `-t ext4` takes its feature defaults from there,
+and half_md4 is mke2fs's built-in default hash), found as `lumen_harness.rootfs.find_e2fsprogs`
 finds them (`LUMEN_E2FSPROGS_SBIN` first). It is committed, so the build
 never runs this; run it again only to change it:
 
@@ -159,7 +159,8 @@ def build(seed: str, mke2fs: Path, e2fsck: Path, debugfs: Path, work: Path) -> P
         data[at : at + len(name)] = name
     image.write_bytes(data)
     # Owners as root and the change and access times fixed: `mke2fs -d`
-    # copies the host's (`touch` sets only the modification time).
+    # copies the host's owners and times, and `os.utime` above can't set the
+    # change time (nor keep a later read from moving the access time).
     paths = [
         b"d",
         *(b"d/entry-number-%02d" % i for i in range(ENTRIES)),

@@ -11,10 +11,14 @@
 # through to it); an image without it is left as it is. Either way it then
 # reads s_flags back from the image's bytes and fails unless the bit is clear.
 #
-# Only the flag changes. An htree directory already in IMAGE stays ordered by
-# the unsigned hash, which `e2fsck -fn` then reports, so this is for images
-# whose directories aren't indexed: `mke2fs -d` indexes none (mkrootfs.sh's
-# final `e2fsck -fn` fails the build if one ever is).
+# Only the flag changes, and only in the primary superblock: backups keep the
+# old flag (mkrootfs.sh's default 64M image with 4 KiB blocks has one block
+# group, so none), and the kernel and e2fsck read the primary. An htree
+# directory already in IMAGE stays ordered by the unsigned hash, so this is
+# for images whose directories aren't indexed: `mke2fs -d` indexes none. If
+# one ever is, mkrootfs.sh's final `e2fsck -fn` fails the build once such a
+# directory holds a name with a byte of 0x80 or above filed in a leaf its
+# signed hash doesn't lead to (an ASCII name hashes alike either way).
 set -euo pipefail
 
 if (( $# != 2 )); then
@@ -28,11 +32,14 @@ S_FLAGS_AT=$((1024 + 0x160))
 UNSIGNED=0x2
 SIGNED=0x1
 
+# The superblock's magic, 0xEF53, little-endian at 0x38 in it.
+MAGIC_AT=$((1024 + 0x38))
+
 # Sets S_FLAGS from IMAGE's bytes (one at a time: od's words are host-endian).
 read_s_flags() {
     local bytes b0 b1 b2 b3
     bytes=$(od -An -tu1 -j "$S_FLAGS_AT" -N4 "$IMAGE")
-    read -r b0 b1 b2 b3 <<< "$bytes" || true
+    read -r b0 b1 b2 b3 <<< "$bytes"
     if [[ ! "${b3:-}" =~ ^[0-9]+$ ]]; then
         echo "ext4-signed-hash: can't read s_flags from $IMAGE" >&2
         exit 1
@@ -40,6 +47,11 @@ read_s_flags() {
     S_FLAGS=$(( b0 | b1 << 8 | b2 << 16 | b3 << 24 ))
 }
 
+magic=$(od -An -tu1 -j "$MAGIC_AT" -N2 "$IMAGE")
+if [[ "$(echo $magic)" != "83 239" ]]; then
+    echo "ext4-signed-hash: $IMAGE has no ext4 superblock (no magic 0xEF53)" >&2
+    exit 1
+fi
 read_s_flags
 if (( S_FLAGS & UNSIGNED )); then
     new=$(( (S_FLAGS & ~UNSIGNED) | SIGNED ))

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -489,12 +491,26 @@ def test_signed_hash_switches_only_the_flag(tmp_path):
     assert _s_flags(image) == 0x1
     before, after = UNSIGNED_IMAGE.read_bytes(), image.read_bytes()
     assert [i for i in range(len(before)) if before[i] != after[i]] == [S_FLAGS_AT]
-    assert "signed_directory_hash" in rootfs.debugfs(image, "stats", tool=debugfs)
-    assert "unsigned_directory_hash" not in rootfs.debugfs(image, "stats", tool=debugfs)
+    # debugfs reads the same byte as the flag (S_FLAGS_AT is right).
+    stats = rootfs.debugfs(image, "stats", tool=debugfs)
+    assert re.search(r"^Filesystem flags:\s+signed_directory_hash\s*$", stats, re.MULTILINE), stats
     # Only the flag: this image's htree `/d` is still ordered by the unsigned
-    # hash, which mkrootfs.sh's final `e2fsck -fn` would fail on.
+    # hash, and its names with bytes of 0x80 or above now sit in leaves their
+    # signed hashes don't lead to, which `e2fsck -fn` (mkrootfs.sh's last
+    # check) reports.
     with pytest.raises(RuntimeError, match="exit 4"):
         rootfs.e2fsck_check(image, e2fsck=e2fsck)
+
+    # s_flags' other bits are kept: 0x6 (unsigned and test_filesys) -> 0x5.
+    other = bytearray(UNSIGNED_IMAGE.read_bytes())
+    other[S_FLAGS_AT] = 0x6
+    image.write_bytes(other)
+    proc = _sign(debugfs, image)
+    assert proc.returncode == 0, proc.stderr
+    assert "had unsigned directory hashes (s_flags 6); set s_flags to 5" in proc.stderr
+    after = image.read_bytes()
+    assert [i for i in range(len(other)) if other[i] != after[i]] == [S_FLAGS_AT]
+    assert _s_flags(image) == 0x5
 
     signed = image.read_bytes()
     no_debugfs = _make_exec(tmp_path / "debugfs_never", "#!/bin/sh\nexit 1\n")
@@ -502,41 +518,6 @@ def test_signed_hash_switches_only_the_flag(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert proc.stderr == ""
     assert image.read_bytes() == signed
-
-
-def test_signed_hash_on_an_image_mke2fs_made_passes_e2fsck(tmp_path):
-    """An image `mke2fs -d` made (as mkrootfs.sh does), with a directory
-    spanning several blocks, indexes none of them: switched from unsigned, it
-    passes `e2fsck -fn`."""
-    mke2fs, e2fsck, debugfs = _e2fsprogs()
-    stage = tmp_path / "stage"
-    (stage / "big").mkdir(parents=True)
-    for n in range(200):
-        (stage / "big" / f"a-long-file-name-number-{n:03}").write_bytes(b"x")
-    image = tmp_path / "made.ext4"
-    env = {**os.environ, "COPYFILE_DISABLE": "1", "LC_ALL": "C"}
-    subprocess.run(
-        [str(mke2fs), "-q", "-F", "-t", "ext4", "-b", "1024", "-O", "^has_journal",
-         "-d", str(stage), str(image), "2M"],
-        check=True, env=env,
-    )  # fmt: skip
-    htree = subprocess.run(
-        [str(debugfs), "-R", "htree big", str(image)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        check=True,
-        env=env,
-    )
-    assert "Not a hash-indexed directory" in htree.stdout
-    assert int(rootfs.debugfs(image, "stat big", tool=debugfs).split("Size: ")[1].split()[0]) > 1024
-    subprocess.run([str(debugfs), "-w", "-R", "ssv flags 2", str(image)], check=True, env=env)
-    assert _s_flags(image) == 0x2
-
-    proc = _sign(debugfs, image)
-    assert proc.returncode == 0, proc.stderr
-    assert _s_flags(image) == 0x1
-    rootfs.e2fsck_check(image, e2fsck=e2fsck)
 
 
 def test_signed_hash_fails_when_the_flag_stays_unsigned(tmp_path):
@@ -563,3 +544,90 @@ def test_signed_hash_fails_when_the_flag_stays_unsigned(tmp_path):
         proc = _sign(tool, image)
         assert proc.returncode != 0, tool
         assert why in proc.stderr, proc.stderr
+
+
+def test_signed_hash_refuses_a_file_without_an_ext4_superblock(tmp_path):
+    """A file without ext4's magic (0xEF53 at 1024 + 0x38) fails the switch
+    before debugfs runs, even with s_flags' unsigned bit clear."""
+    image = tmp_path / "zeros.img"
+    image.write_bytes(bytes(64 * 1024))
+    never = _make_exec(tmp_path / "debugfs_never", "#!/bin/sh\necho ran >&2\nexit 1\n")
+    proc = _sign(never, image)
+    assert proc.returncode == 1
+    assert "has no ext4 superblock (no magic 0xEF53)" in proc.stderr
+    assert "ran" not in proc.stderr
+
+
+def _mkrootfs_with_unsigned_mke2fs(tmp_path: Path, stage_extra=None, index: bool = False):
+    """tools/mkrootfs.sh run on a stub minirootfs with an `mke2fs` that makes
+    the image unsigned, as it does where `char` is unsigned (aarch64 Linux),
+    and with `index`, then indexes its directories by the unsigned hash
+    (`e2fsck -fyD`). Returns (the process, the output image)."""
+    mke2fs, e2fsck, debugfs = _e2fsprogs()
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    for name in ("mkrootfs.sh", "ext4-signed-hash.sh"):
+        shutil.copy2(REPO_ROOT / "tools" / name, tools / name)
+    mini = tmp_path / "build" / "deps" / "alpine-minirootfs"
+    (mini / "lib").mkdir(parents=True)
+    (mini / ".version").write_text("stub\n")
+    (mini / "lib" / "ld-musl-x86_64.so.1").write_bytes(b"")
+    _make_exec(mini / "bin" / "busybox")
+    if stage_extra:
+        stage_extra(mini)
+    sbin = tmp_path / "sbin"
+    sbin.mkdir()
+    (sbin / "e2fsck").symlink_to(e2fsck)
+    (sbin / "debugfs").symlink_to(debugfs)
+    reindex = f'"{e2fsck}" -fyD "$img" >/dev/null 2>&1; [ $? -le 1 ] || exit 1\n' if index else ""
+    _make_exec(
+        sbin / "mke2fs",
+        f'#!/bin/sh\n"{mke2fs}" "$@" || exit 1\n'
+        # The image is the next-to-last argument (the size is the last).
+        "img=; prev=\nfor arg; do img=$prev; prev=$arg; done\n"
+        f'"{debugfs}" -w -R "ssv flags 2" "$img" 2>/dev/null || exit 1\n' + reindex,
+    )
+    out = tmp_path / "out.ext4"
+    env = {
+        **os.environ,
+        "LUMEN_E2FSPROGS_SBIN": str(sbin),
+        "ROOTFS_SIZE": "4M",
+        "TMPDIR": str(tmp_path),
+    }
+    proc = subprocess.run(
+        ["bash", str(tools / "mkrootfs.sh"), str(out)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    return proc, out
+
+
+def test_mkrootfs_makes_an_unsigned_image_signed(tmp_path):
+    """#308: mkrootfs.sh on a host whose mke2fs makes unsigned images (here a
+    wrapper does) still builds an image saying its directories hash signed,
+    which `e2fsck -fn` passes, so Lumen mounts its rootfs writable."""
+    proc, out = _mkrootfs_with_unsigned_mke2fs(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "had unsigned directory hashes (s_flags 2); set s_flags to 1" in proc.stderr
+    assert _s_flags(out) == 0x1
+
+
+def test_mkrootfs_fails_on_a_directory_indexed_by_the_unsigned_hash(tmp_path):
+    """The switch changes only the flag, so an image with a directory
+    indexed by the unsigned hash holding names with bytes of 0x80 or above
+    fails mkrootfs.sh's final `e2fsck -fn`, naming #308, and leaves no
+    output."""
+
+    def many_utf8_names(mini: Path) -> None:
+        (mini / "big").mkdir()
+        for n in range(300):
+            (mini / "big" / f"é-a-long-file-name-number-{n:03}").write_bytes(b"x")
+
+    proc, out = _mkrootfs_with_unsigned_mke2fs(tmp_path, many_utf8_names, index=True)
+    assert proc.returncode == 1, proc.stderr
+    assert "had unsigned directory hashes (s_flags 2); set s_flags to 1" in proc.stderr
+    assert "mkrootfs: e2fsck -fn failed on the image" in proc.stderr
+    assert "#308" in proc.stderr
+    assert not out.exists()

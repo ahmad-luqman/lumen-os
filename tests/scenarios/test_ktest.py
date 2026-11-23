@@ -253,11 +253,19 @@ VFS_EXACT_LINES = {
         r"\(metadata_csum, quota, bigalloc, orphan_present, \.\.\.\) \(ro_compat 0x[0-9a-f]+\)"
     ): 1,
     # ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name
-    # (#308): the unsigned volume's mount only, not the signed one's.
+    # (#308): the unsigned volume's mount, not the signed one's; the volume
+    # with neither hash flag (and dir_index); and the one with a journal
+    # needing recovery and the unsigned flag, whose line shows no s_flags.
     (
         rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: its directories hash names unsigned "
         r"\(s_flags EXT2_FLAGS_UNSIGNED_HASH\), which ext4plus can't write \(ro_compat 0x[0-9a-f]+, s_flags 0x2\)"
     ): 1,
+    (
+        rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: its directories may hash names unsigned "
+        r"\(dir_index, but neither hash flag in s_flags\), which ext4plus can't write "
+        r"\(ro_compat 0x[0-9a-f]+, s_flags 0x0\)"
+    ): 1,
+    rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: the journal needs recovery \(ro_compat 0x[0-9a-f]+\)": 1,
 }
 
 
