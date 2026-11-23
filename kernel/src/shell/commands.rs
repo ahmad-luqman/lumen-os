@@ -873,21 +873,44 @@ fn refuse_in_pipeline(ctx: &mut Ctx<'_>, name: &str) -> bool {
     ctx.piped()
 }
 
+/// Before `name` (`reboot` or `shutdown`) takes the machine down: every
+/// filesystem flushed (`vfs::sync_all`, #352), while this thread can still
+/// sleep (`power::reboot` turns interrupts off for good). A failure is one
+/// line, and `name` goes on (`going`: what it does then): the filesystems
+/// wrote all they could past it, and a reboot or power-off that refused
+/// would leave the machine up with no way to fix the disk.
+fn sync_before(ctx: &mut Ctx<'_>, name: &str, going: &str) {
+    report_sync(ctx, name, going, crate::vfs::sync_all());
+}
+
+/// `sync_before`'s line for `synced`: none for `Ok`.
+fn report_sync(ctx: &mut Ctx<'_>, name: &str, going: &str, synced: Result<(), lumen_vfs::VfsError>) {
+    if let Err(e) = synced {
+        ctx.fail(format_args!(
+            "{name}: sync failed: {e:?} (each failing inode or filesystem is in the log); {going} anyway"
+        ));
+    }
+}
+
 fn reboot(ctx: &mut Ctx<'_>, _: &[String]) {
     if refuse_in_pipeline(ctx, "reboot") {
         return;
     }
+    sync_before(ctx, "reboot", "restarting");
     let _ = writeln!(ctx.out, "reboot: restarting");
     crate::power::reboot()
 }
 
-/// Power off, or say why it can't be done or didn't happen.
+/// Power off, or say why it can't be done or didn't happen. The
+/// filesystems are synced only when there is a way to power off (a refused
+/// `shutdown` leaves the machine up, as it was).
 fn shutdown(ctx: &mut Ctx<'_>, _: &[String]) {
     if refuse_in_pipeline(ctx, "shutdown") {
         return;
     }
     let why = match crate::power::power_off_plan() {
         Ok(plan) => {
+            sync_before(ctx, "shutdown", "powering off");
             let _ = writeln!(ctx.out, "shutdown: powering off");
             crate::power::power_off(plan)
         }
@@ -902,6 +925,29 @@ fn exit(ctx: &mut Ctx<'_>, _: &[String]) {
     }
     ctx.fail("exit: lumen.qemu_exit not set");
 }
+
+crate::ktest!(
+    fn power_sync_failure_is_one_line() {
+        // `reboot` and `shutdown` say a failed sync in one line and go on
+        // (#352); a sync that worked adds nothing to what they print.
+        use crate::kassert_eq;
+        let history = lumen_shell::History::new(0);
+        let mut console = super::Captured::default();
+        report_sync(&mut Ctx::new(&mut console, false, &history), "reboot", "restarting", Ok(()));
+        kassert_eq!(console.text.as_str(), "");
+        report_sync(
+            &mut Ctx::new(&mut console, false, &history),
+            "shutdown",
+            "powering off",
+            Err(lumen_vfs::VfsError::Io),
+        );
+        kassert_eq!(
+            console.text.as_str(),
+            "shutdown: sync failed: Io (each failing inode or filesystem is in the log); powering off anyway\n"
+        );
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn help_lists_every_command_once() {

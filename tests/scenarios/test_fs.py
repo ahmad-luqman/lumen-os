@@ -167,6 +167,87 @@ def test_ext4_read_write_persists_across_reboot(boot, tmp_path):
     m2.close()
 
 
+BOOTING = r"INFO  boot: Lumen \d+\.\d+\.\d+ \(x86_64\) booting"
+MOTD = "/etc/motd"
+
+
+def write_unsynced(m, tag):
+    """Write on the ext4 root without `sync` (#352): a new directory with a
+    file and a multi-page file in it, and `/etc/motd`, which the image
+    ships, rewritten. Returns the precondition: what the block cache still
+    holds dirty (the files' data is in the page cache, not even there)."""
+    assert run(m, f"vfstest mkdir /unsynced_{tag} 0755") == "mkdir: ok\n"
+    text = f"unsynced-{tag}"
+    assert run(m, f"vfstest write /unsynced_{tag}/new.txt {text}") == f"wrote {len(text)}\n"
+    assert run(m, f"vfstest write-pattern /unsynced_{tag}/big.bin 9001") == "wrote 9001\n"
+    motd = f"motd-{tag}"
+    assert run(m, f"vfstest write {MOTD} {motd}") == f"wrote {len(motd)}\n"
+    return int(run(m, "blk | select dirty").strip().splitlines()[-1])
+
+
+def check_unsynced(m, tag):
+    """What `write_unsynced(m, tag)` wrote reads back after a reboot (all
+    three read before comparing, so a failure shows each)."""
+    got = (
+        run(m, f"vfstest cat /unsynced_{tag}/new.txt"),
+        run(m, f"vfstest verify-pattern /unsynced_{tag}/big.bin 9001"),
+        run(m, f"vfstest cat {MOTD}"),
+    )
+    assert got == (f"unsynced-{tag}\n", "verify-pattern: ok (9001)\n", f"motd-{tag}\n")
+
+
+def test_ext4_unsynced_writes_survive_reboot(boot, tmp_path):
+    # `reboot` syncs every filesystem before it resets the machine (#352):
+    # what was written without `sync` is on the disk when it boots again, in
+    # the same QEMU on the same image.
+    disk = copy_rootfs(tmp_path)
+    m = shell(boot, reboot=True, devices=Devices(blk_image=disk, rng=True))
+    assert_quiet_boot(m.output)
+    assert stat_fields(m, MOTD)["type"] == "file", "the image has no /etc/motd to rewrite"
+    assert write_unsynced(m, "reboot") > 0, "nothing left to sync: the test would prove nothing"
+    m.qmp()  # connected before the reset, so it gets the RESET event
+    start = len(m.output)
+    m.send_line("reboot")
+    m.expect(r"reboot: restarting\n", 60)
+    assert m.wait_event("RESET", 120)["data"]["reason"] == "guest-reset"
+    second = m.expect(BOOTING, 120)
+    m.expect(SHELLS, 60)
+    m.expect(PROMPT, 60)
+    assert "sync failed" not in m.output[start:]
+    assert_quiet_boot(m.output[second.start() :])
+    check_unsynced(m, "reboot")
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    m.close()
+    e2fsck_check(disk)
+
+
+def test_ext4_unsynced_writes_survive_shutdown(boot, tmp_path):
+    # `shutdown` syncs every filesystem before it powers off (#352): what was
+    # written without `sync` is on the disk, which passes e2fsck, and a
+    # second machine booted on it reads it back.
+    disk = copy_rootfs(tmp_path)
+    m1 = shell(boot, devices=Devices(blk_image=disk, rng=True))
+    assert_quiet_boot(m1.output)
+    assert write_unsynced(m1, "shutdown") > 0, "nothing left to sync: the test would prove nothing"
+    m1.qmp()  # connected before the power-off, so it gets the SHUTDOWN event
+    start = len(m1.output)
+    m1.send_line("shutdown")
+    m1.expect(r"shutdown: powering off\n", 60)
+    assert m1.wait_event("SHUTDOWN", 120)["data"] == {"guest": True, "reason": "guest-shutdown"}
+    assert m1.wait_exit(30) == 0
+    assert "sync failed" not in m1.output[start:]
+    m1.close()
+    e2fsck_check(disk)
+
+    m2 = shell(boot, devices=Devices(blk_image=disk, rng=True))
+    assert_quiet_boot(m2.output)
+    check_unsynced(m2, "shutdown")
+    m2.send_line("exit")
+    assert m2.wait_exit(10) == EXIT_SUCCESS
+    m2.close()
+
+
 def test_ext4_readonly_device_mounts_ro(boot, tmp_path):
     disk = copy_rootfs(tmp_path)
     before = disk.read_bytes()

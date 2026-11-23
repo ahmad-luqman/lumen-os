@@ -316,3 +316,12 @@ milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
 ]
+
+[[feature]]
+name = "`reboot` and `shutdown` sync every filesystem before the machine goes (#352): files created, a multi-page file and an existing file rewritten on the ext4 rootfs without `sync` are on the disk when it boots again (after `reboot` in the same QEMU, after `shutdown` in a second one on the image, which passes e2fsck); a failed sync is one line (`<command>: sync failed: <error> ...; <restarting|powering off> anyway`) and the command goes on (the line checked by a ktest over its text, not with a failing disk)"
+milestone = "M7"
+tests = [
+    "scenario:test_fs::test_ext4_unsynced_writes_survive_reboot",
+    "scenario:test_fs::test_ext4_unsynced_writes_survive_shutdown",
+    "ktest:lumen_kernel::shell::commands::power_sync_failure_is_one_line",
+]

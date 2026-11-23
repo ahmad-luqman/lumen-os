@@ -497,6 +497,24 @@ power-off one accepts QEMU's exit status 0 only with a QMP `SHUTDOWN` event
 whose reason is `guest-shutdown` (a triple fault under `-no-reboot` also
 exits with 0, but as `guest-reset`).
 
+Both commands first flush every filesystem (`vfs::sync_all`, #352), on the
+shell's thread while it can still sleep: `reboot` before `reboot:
+restarting`, `shutdown` before `shutdown: powering off` and only when ACPI
+gave a way to power off. A failed sync is one line, `<command>: sync
+failed: <error> (each failing inode or filesystem is in the log);
+<restarting|powering off> anyway`, and the command goes on: `sync_all` has
+written all it could past the failure, and refusing would leave the machine
+up with nothing to fix the disk with. What the ext4 rootfs holds unsynced
+is on the disk after either (tested: `test_fs`'s
+`test_ext4_unsynced_writes_survive_reboot` and `_shutdown`; the failure
+line by a ktest over its text, not by a failing disk). Nothing stops other
+threads first, so what they write after the sync can still be lost, and a
+device that hangs rather than fails hangs the command. `exit` (the
+`lumen.qemu_exit` test hook), the ktest kernel's exit and the crash
+reporter's don't sync: the first two end QEMU as pulling the plug would (a
+scenario that wants its writes kept runs `sync` first), and the crash
+reporter takes no locks.
+
 Kernel command-line flags: `lumen.qemu_exit` (allow ending QEMU through
 `isa-debug-exit`, used by tests), `lumen.log=<error|warn|info|debug|trace>`
 and `lumen.keymap=<us|uk|de|fr|no|se|jp|dvorak|colemak>` (the keyboard's
