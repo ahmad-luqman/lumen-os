@@ -7232,7 +7232,7 @@ crate::ktest!(
             let freed_arm_before = FREED_BLOCKS_ARM.load(O::Relaxed);
             let res = a.rmdir(b"sub");
             let took_zeroed_arm = RMDIR_ZEROED_ARM.load(O::Relaxed) != zeroed_arm_before;
-            blocks_freed += FREED_BLOCKS_ARM.load(O::Relaxed) - freed_arm_before;
+            let forgot_for_blocks = FREED_BLOCKS_ARM.load(O::Relaxed) != freed_arm_before;
             let left = m.cache.range_reads_left();
             // The first leg's one read failed; the second's write failed and
             // then a read of `a` did.
@@ -7303,6 +7303,7 @@ crate::ktest!(
                 // A directory made now may get blocks `sub` had: a create in
                 // `sub` (refused if forgotten) must not reach it (#330).
                 aliasing_checked += 1;
+                blocks_freed += usize::from(forgot_for_blocks);
                 let x = m.root.mkdir(b"x", 0o755).map_err(|_| "mkdir x")?;
                 x.create(b"inx", 0o644).map_err(|_| "create x/inx")?;
                 let evil = sub.create(b"evil", 0o644);
@@ -7413,7 +7414,7 @@ crate::ktest!(
             let free_before = free_blocks(&m.fs);
             let freed_arm_before = FREED_BLOCKS_ARM.load(O::Relaxed);
             let res = a.unlink(b"f");
-            blocks_freed += FREED_BLOCKS_ARM.load(O::Relaxed) - freed_arm_before;
+            let forgot_for_blocks = FREED_BLOCKS_ARM.load(O::Relaxed) != freed_arm_before;
             m.cache.clear();
             let ro = remount_ro(&m, 266)?;
             let ro_a = ro.root_inode().lookup(b"a").map_err(|_| "ro a")?;
@@ -7422,6 +7423,7 @@ crate::ktest!(
                 continue;
             }
             gone += 1;
+            blocks_freed += usize::from(forgot_for_blocks);
             let free_after = free_blocks(&ro);
             let f_kept = f.stat().map_err(|_| "stat f")?.nlink != 0;
             kept += usize::from(f_kept);
