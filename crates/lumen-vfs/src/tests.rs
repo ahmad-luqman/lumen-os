@@ -3511,6 +3511,8 @@ fn open_creat_retries_on_concurrent_exist_race_across_winner_types() {
 
 std::thread_local! {
     static TEST_LOCK9_DEPTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    /// The Lock-9 tables this thread holds, one bit per [`lock9_level`].
+    static TEST_LOCK9_HELD: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
 }
 
 fn assert_test_lock9_free() {
@@ -3518,23 +3520,32 @@ fn assert_test_lock9_free() {
     assert_eq!(depth, 0, "Lock 9 held across VfsInode/FileSystem call (depth={depth})");
 }
 
-/// This thread's token: its `TEST_LOCK9_DEPTH` slot's address, unique among
-/// live threads (never 0).
-fn test_thread_token() -> usize {
-    TEST_LOCK9_DEPTH.with(|d| d as *const core::cell::Cell<usize> as usize)
+/// A table's place in Lock 9's sub-order `MountTable -> DentryCache ->
+/// InodeCache`.
+fn lock9_level<T>() -> u8 {
+    let name = core::any::type_name::<T>();
+    if name.ends_with("::MountTable") {
+        0
+    } else if name.ends_with("::DentryCache") {
+        1
+    } else if name.ends_with("::InodeCache") {
+        2
+    } else {
+        panic!("TestLock guards only the Lock-9 tables, not {name}")
+    }
 }
 
 /// Lock 9 in the host tests (#264): a `std` mutex whose guards count
 /// towards `TEST_LOCK9_DEPTH` (what `assert_test_lock9_free` checks), and
-/// which panics when the thread holding it takes it again (where a bare
-/// mutex would hang).
+/// which panics when its thread takes it out of Lock 9's sub-order or
+/// takes a table it already holds (where a bare mutex could hang).
 struct TestLock<T> {
-    holder: core::sync::atomic::AtomicUsize,
+    level: u8,
     inner: Mutex<T>,
 }
 
 struct TestLockGuard<'a, T> {
-    holder: &'a core::sync::atomic::AtomicUsize,
+    level: u8,
     inner: std::sync::MutexGuard<'a, T>,
 }
 
@@ -3553,8 +3564,7 @@ impl<T> core::ops::DerefMut for TestLockGuard<'_, T> {
 
 impl<T> Drop for TestLockGuard<'_, T> {
     fn drop(&mut self) {
-        // Before `inner` unlocks: the next holder writes its own token.
-        self.holder.store(0, Ordering::Relaxed);
+        TEST_LOCK9_HELD.with(|h| h.set(h.get() & !(1 << self.level)));
         TEST_LOCK9_DEPTH.with(|d| d.set(d.get() - 1));
     }
 }
@@ -3566,16 +3576,22 @@ impl<T> VfsLock<T> for TestLock<T> {
         T: 'a;
 
     fn new(val: T) -> Self {
-        Self { holder: core::sync::atomic::AtomicUsize::new(0), inner: Mutex::new(val) }
+        Self { level: lock9_level::<T>(), inner: Mutex::new(val) }
     }
 
     fn lock(&self) -> Self::Guard<'_> {
-        let me = test_thread_token();
-        assert_ne!(self.holder.load(Ordering::Relaxed), me, "a Lock-9 table locked twice by one thread");
+        let held = TEST_LOCK9_HELD.with(|h| h.get());
+        assert_eq!(
+            held >> self.level,
+            0,
+            "Lock 9 taken out of order (MountTable -> DentryCache -> InodeCache) or twice: \
+             level {} while holding {held:#05b}",
+            self.level
+        );
         let inner = self.inner.lock().unwrap();
-        self.holder.store(me, Ordering::Relaxed);
+        TEST_LOCK9_HELD.with(|h| h.set(held | (1 << self.level)));
         TEST_LOCK9_DEPTH.with(|d| d.set(d.get() + 1));
-        TestLockGuard { holder: &self.holder, inner }
+        TestLockGuard { level: self.level, inner }
     }
 
     fn get_mut(&mut self) -> &mut T {

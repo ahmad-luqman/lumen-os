@@ -47,7 +47,8 @@ use lumen_vfs::{
 use crate::shell::{Ctx, sysinfo, write_in_chunks};
 use crate::sync::{SleepMutex, SleepMutexGuard};
 
-/// Kernel `VfsLock` backed by [`SleepMutex`] (Lock 2).
+/// Kernel `VfsLock` backed by [`SleepMutex`]: Lock 2, and Lock 9 through
+/// [`KernelLocks`].
 pub struct KernelVfsLock<T>(SleepMutex<T>);
 
 impl<T> VfsLock<T> for KernelVfsLock<T> {

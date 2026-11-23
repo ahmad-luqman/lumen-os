@@ -5722,7 +5722,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `KernelVfsTables` is `VfsTables<KernelLocks>` (`KernelVfsLock`, a
     `SleepMutex`), and the host tests' is a `std` mutex whose guards count
     the Lock-9 depth that test filesystems assert is zero in their calls,
-    and which panics when its holder takes it again. `VfsLock::new` isn't
+    and which panics when a thread takes the tables out of their sub-order
+    or takes one it already holds. `VfsLock::new` isn't
     `const` (a trait method, on stable Rust), so the kernel's `static
     TABLES` is built by the `const fn VfsTables::from_locks(mounts,
     dentries, inodes)` from locks made by `SleepMutex::new`, a `const fn`;

@@ -13,7 +13,8 @@ use crate::ops::Opened;
 use crate::types::{AccessMode, OpenFlags};
 use crate::{MAX_FDS, next_open_file_id};
 
-/// Synchronization abstraction for `OpenFile::offset` and `dir_cursor` (Lock 2).
+/// Synchronization abstraction for `OpenFile::offset` and `dir_cursor` (Lock 2)
+/// and, through a [`LockFamily`], the `VfsTables` (Lock 9).
 ///
 /// The kernel implements this over `SleepMutex<T>`; single-threaded host tests
 /// can use [`LocalLock<T>`] with zero `unsafe`.
