@@ -5795,12 +5795,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     `NoSpc` may follow one), nor from the block cache's: a failed `write_at`
     may be a failed pre-read or another block's eviction, a failed `sync` a
     failed flush or a pinned block, and an eviction's write error reaches a
-    read as an ordinary `Io`. What #349 needs is one latched write-back
-    failure signal inside `BlockCache`, set where a device write or flush
+    read as an ordinary `Io`. #349 reads one signal inside `BlockCache`
+    instead, `writeback_failures`, raised where a block's device write
     fails (`ensure_slot`'s dirty victim, `writeback_and_flush`), which
-    every route goes through. #349's is
-    `BlockCache::writeback_failures`, counting each failed block write (a
-    failed flush aside: no block's write failed).
+    every route goes through. A failed device flush doesn't raise it (no
+    block's write failed): its `EIO` reaches the caller, and the volume
+    stays writable.
   - **`errors=remount-ro` (#349):** Lumen's one policy for a write error,
     as Linux's for a root mounted `errors=remount-ro` (whose journal also
     aborts on a write error). `ext4plus` has no journal and writes each
