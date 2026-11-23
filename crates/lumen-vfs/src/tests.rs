@@ -306,6 +306,7 @@ impl FileSystem for MemFs {
     }
 
     fn name(&self) -> &'static str {
+        assert_test_lock9_free();
         self.name
     }
 
@@ -5060,7 +5061,7 @@ fn mount_root_and_mount_seed_their_roots_into_inode_cache() {
 
 #[test]
 fn list_mounts_asks_the_filesystems_after_releasing_lock9() {
-    // `MemFs::read_only` asserts Lock 9 is free.
+    // `MemFs::name` and `read_only` assert Lock 9 is free.
     let (env, root_fs) = setup_vfs();
     let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
     env.mount(mp, "/mnt", MemFs::new(DevId::TMPFS, "tmpfs", true) as Arc<dyn FileSystem>).unwrap();

@@ -23,8 +23,8 @@ pub struct MountInfo {
 
 impl MountInfo {
     /// `fs` mounted at `mount_path`, asking `fs` for its device, name and
-    /// read-only flag (so never under Lock 9).
-    pub fn of(fs: &dyn FileSystem, mount_path: String) -> Self {
+    /// read-only flag: call it only with Lock 9 released.
+    pub(crate) fn of(fs: &dyn FileSystem, mount_path: String) -> Self {
         Self { dev_id: fs.dev_id(), fs_name: fs.name(), mount_path, read_only: fs.read_only() }
     }
 }
@@ -227,8 +227,10 @@ impl MountTable {
     }
 
     /// Every mount's filesystem and path, `/` first, for `/proc/mounts` and
-    /// `mount`: the caller asks the filesystems for the rest
-    /// ([`MountInfo::of`]) after releasing Lock 9.
+    /// `mount`: the caller asks the filesystems for the rest after releasing
+    /// Lock 9. As with [`snapshot_filesystems`](Self::snapshot_filesystems),
+    /// if `umount` runs meanwhile, the caller may drop a filesystem's last
+    /// reference.
     pub fn snapshot_mounts(&self) -> Vec<(Arc<dyn FileSystem>, String)> {
         let mut out = Vec::with_capacity(self.mounts.len() + usize::from(self.root.is_some()));
         for rec in self.root.iter().chain(self.mounts.values()) {
