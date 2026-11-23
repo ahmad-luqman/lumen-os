@@ -5717,7 +5717,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     returns; the `cacheable()` checks above), with `mount_root`, `mount`,
     `umount` (the evicted inodes dropped after the locks are released) and
     the snapshots: of the filesystems for `sync`, of the inodes for the
-    page-cache reclaim and procfs. Calls into a filesystem it still makes
+    page-cache reclaim and procfs, and `list_mounts` for `/proc/mounts`
+    and `mount` (each filesystem asked for its name and read-only flag
+    after the lock is released). Calls into a filesystem it still makes
     under the locks, and `Arc`s it drops there, are listed in #320. It
     lives in lumen-vfs, generic over a lock family (`trait LockFamily {
     type Lock<T>: VfsLock<T>; }`), so the kernel and the host tests run
