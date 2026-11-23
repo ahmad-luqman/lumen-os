@@ -506,13 +506,14 @@ failed sync is a warning on serial, `WARN  power: <command>: sync failed:
 <error>; <restarting|powering off> anyway` (a terminal window's or virtual
 terminal's output may never show before the machine goes), and a line on
 the console, `<command>: sync failed: <error> (the log says what failed);
-<restarting|powering off> anyway`; then the command goes on. What was
-written before the failure is on the disk; what wasn't (the block cache's
-write-back stops at its first failed block) is lost. Staying up would save
-it only if the failure passes (a failed block stays dirty for the next
-sync, section 9), and whoever suspects that runs `sync` first, as often as they
-like; refusing would let a disk that keeps failing keep the machine from
-going down at all. What the
+<restarting|powering off> anyway`; then the command goes on. The block
+cache writes its dirty blocks back in block order and stops at the first
+that fails, before the device flush: the blocks ahead of it reached the
+device but were never flushed, and it and the ones after it are lost.
+Staying up would save them only if the failure passes (a failed block stays
+dirty for the next sync, section 9), and whoever suspects that runs the
+shell's `sync` command first, as often as they like; refusing would let a
+disk that keeps failing keep the machine from going down at all. What the
 ext4 rootfs holds unsynced is on the disk after either (tested:
 `test_fs::test_ext4_unsynced_writes_survive_reboot` and
 `test_fs::test_ext4_unsynced_writes_survive_shutdown`, each checking first

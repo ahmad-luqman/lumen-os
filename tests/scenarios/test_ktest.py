@@ -153,8 +153,9 @@ def test_in_kernel_tests_pass(boot):
         r"INFO  shell: serial prompt released after \d+ ms: every screen shell waits for keys\n",
         out,
     ), "the serial prompt's release"
-    # shell::commands::power_sync_failure_is_one_line: a failed sync before
-    # `reboot` or `shutdown` is a warning on serial too, once each (#352).
+    # shell::commands::power_commands_sync_once_then_announce: a failed sync
+    # before `reboot` or `shutdown` is a warning on serial too, once each
+    # (#352).
     for warning in (
         "reboot: sync failed: Io; restarting anyway",
         "shutdown: sync failed: Io; powering off anyway",
