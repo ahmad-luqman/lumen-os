@@ -377,7 +377,8 @@ impl<F: LockFamily> VfsTables<F> {
     }
 
     /// Empty tables: [`DentryCache::DEFAULT_CAPACITY`] names and
-    /// [`InodeCache::DEFAULT_REMOVAL_HISTORY`] removals remembered.
+    /// [`InodeCache::DEFAULT_REMOVAL_HISTORY`] removals remembered, the same
+    /// named defaults the kernel's `static` hands [`from_locks`](Self::from_locks).
     pub fn new() -> Self {
         Self::with_capacities(DentryCache::DEFAULT_CAPACITY, InodeCache::DEFAULT_REMOVAL_HISTORY)
     }
@@ -505,7 +506,9 @@ impl<F: LockFamily> VfsCacheOps for VfsTables<F> {
     }
 
     fn fs_read_only(&self, dev: DevId) -> bool {
-        self.mounts.lock().fs_by_dev(dev).is_some_and(|fs| fs.read_only())
+        // The guard is released before `read_only` runs, as in every probe.
+        let fs = self.mounts.lock().fs_by_dev(dev);
+        fs.is_some_and(|fs| fs.read_only())
     }
 
     fn fs_by_dev(&self, dev: DevId) -> Option<Arc<dyn FileSystem>> {

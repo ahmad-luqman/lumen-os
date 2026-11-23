@@ -91,7 +91,7 @@ pub type KernelVfsTables = VfsTables<KernelLocks>;
 static TABLES: KernelVfsTables = KernelVfsTables::from_locks(
     KernelVfsLock::new_const(MountTable::new()),
     KernelVfsLock::new_const(DentryCache::new(DentryCache::DEFAULT_CAPACITY)),
-    KernelVfsLock::new_const(InodeCache::new()),
+    KernelVfsLock::new_const(InodeCache::with_removal_history(InodeCache::DEFAULT_REMOVAL_HISTORY)),
 );
 static EXT4_FILESYSTEMS: SleepMutex<Vec<Arc<ext4::Ext4FileSystem>>> = SleepMutex::new(Vec::new());
 

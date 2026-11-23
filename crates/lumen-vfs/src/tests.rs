@@ -3511,7 +3511,8 @@ fn open_creat_retries_on_concurrent_exist_race_across_winner_types() {
 
 std::thread_local! {
     static TEST_LOCK9_DEPTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
-    /// The Lock-9 tables this thread holds, one bit per [`lock9_level`].
+    /// The Lock-9 tables this thread holds, one bit per [`lock9_level`],
+    /// across every `TestTables` (no test holds two tables' locks at once).
     static TEST_LOCK9_HELD: core::cell::Cell<u8> = const { core::cell::Cell::new(0) };
 }
 
