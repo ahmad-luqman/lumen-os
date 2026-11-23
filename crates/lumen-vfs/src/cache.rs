@@ -55,7 +55,8 @@ impl RemovedDir {
 /// Its caller declares it before taking Lock 9's guards, so it drops after
 /// them on every path out, an early return included: never under Lock 9,
 /// where an inode's last reference must not drop (ARCHITECTURE section 9).
-/// Crate-private, with the methods taking it, so the only callers are
+/// Crate-private, with the methods taking it, so the only callers outside
+/// the tests are
 /// `VfsTables`' (`mount.rs`), each tested for it.
 pub(crate) struct Released(Option<Arc<dyn VfsInode>>);
 
@@ -65,11 +66,11 @@ impl Released {
         Self(None)
     }
 
-    /// Keep `inode` for the caller to drop. One `InodeCache` call per
-    /// `Released`: a second is a bug, and panics here before the first
-    /// could drop under Lock 9.
+    /// Keep `inode` for the caller to drop. One `Arc` per `Released` (use
+    /// one per `InodeCache` call): a second is a bug, and panics here before
+    /// the first could drop under Lock 9.
     fn hold(&mut self, inode: Arc<dyn VfsInode>) {
-        assert!(self.0.is_none(), "one InodeCache call per Released (#320)");
+        assert!(self.0.is_none(), "one Arc per Released (#320)");
         self.0 = Some(inode);
     }
 }
@@ -344,6 +345,7 @@ impl InodeCache {
     /// `since_gen` (or `dev` overflowed and the cached entry was inserted after
     /// `since_gen`), and record a pre-mutation removal generation. Must be
     /// paired with [`Self::end_removal`] after the filesystem mutation finishes.
+    #[must_use = "the evicted inode goes after Lock 9 is released (#320)"]
     pub fn begin_removal_if_fresh(&mut self, dev: DevId, ino: Ino, since_gen: u64) -> (Option<Arc<dyn VfsInode>>, u64) {
         let key = (dev, ino);
         *self.pending_removals.entry(key).or_insert(0) += 1;
@@ -413,6 +415,7 @@ impl InodeCache {
 
     /// Evict `(dev, ino)` only if the currently cached entry is the exact same
     /// `Arc` instance as `expected`.
+    #[must_use = "the removed inode goes after Lock 9 is released (#320)"]
     pub fn remove_if_same(&mut self, dev: DevId, ino: Ino, expected: &Arc<dyn VfsInode>) -> Option<Arc<dyn VfsInode>> {
         let key = (dev, ino);
         if self.inodes.get(&key).is_some_and(|c| Arc::ptr_eq(&c.inode, expected)) {
@@ -425,6 +428,7 @@ impl InodeCache {
 
     /// Unconditionally record a removal for `(dev, ino)` and remove any
     /// cached inode for `(dev, ino)`.
+    #[must_use = "the removed inode goes after Lock 9 is released (#320)"]
     pub fn remove(&mut self, dev: DevId, ino: Ino) -> Option<Arc<dyn VfsInode>> {
         let _ = self.record_removal(dev, ino);
         self.inodes.remove(&(dev, ino)).map(|c| c.inode)
@@ -433,6 +437,7 @@ impl InodeCache {
     /// Evict all cached inodes belonging to filesystem `dev` and bump
     /// `fs_evict_gen`, and drop its removed directories' records (#318),
     /// their parents returned with the evicted inodes.
+    #[must_use = "the evicted inodes go after Lock 9 is released (#320)"]
     pub fn evict_fs(&mut self, dev: DevId) -> Vec<Arc<dyn VfsInode>> {
         self.removal_gen = self.removal_gen.wrapping_add(1);
         self.fs_evict_gen.insert(dev, self.removal_gen);

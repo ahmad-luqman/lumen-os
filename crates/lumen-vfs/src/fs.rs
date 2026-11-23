@@ -66,7 +66,7 @@ pub trait VfsInode: Send + Sync {
     ///
     /// Called under Lock 9 (`InodeCache` checks a cached entry's number,
     /// #320): must not lock or block (an atomic load where a detach changes
-    /// it, a fixed field otherwise).
+    /// it, fixed state otherwise).
     fn ino(&self) -> Ino;
 
     /// File type (`File`, `Dir`, `Symlink`, `CharDevice`, ...).

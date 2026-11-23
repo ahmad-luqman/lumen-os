@@ -5937,11 +5937,12 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     for `mount`: the same rows, each with its filesystem, which `mount`
     asks a `tmpfs` one's quota of, all from one snapshot. No inode or
     filesystem `Arc` it lets go of drops under the locks (#320):
-    `MountTable::umount` hands back the mountpoint with the filesystem,
-    which `umount` drops after the guards; `MountTable::mount_with_ino` and
-    `mount_root_with_ino` take the `Arc`s by reference and clone them only
-    into the mount, so a refused `mount`'s or `mount_root`'s drop with
-    their caller, after the guards; and every `InodeCache` method that
+    `MountTable::umount` hands back the removed mount's record;
+    `VfsTables::umount` drops its mountpoint after the guards and returns
+    its filesystem; `MountTable::mount_with_ino` and `mount_root_with_ino`
+    take the `Arc`s by reference and clone them only into the mount, so a
+    refused `mount`'s or `mount_root`'s `Arc`s drop with their caller,
+    after the guards; and every `InodeCache` method that
     evicts a stale entry or unifies a handed inode with a cached one hands
     what it let go of back, in its return value or in a `Released` (a
     crate-private holder) declared before the guards, so it drops after
@@ -5950,7 +5951,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `VfsInode::dev_id`, `ino`, `cacheable` and `is_detached` and
     `FileSystem::dev_id` (probing a cached entry or a mount needs them),
     must by their docs answer without locking or blocking (each an atomic
-    or a fixed field in ext4, tmpfs, devfs and procfs). The host tests
+    or fixed state in ext4, tmpfs, devfs and procfs). The host tests
     count, on a filesystem handing out a fresh `Arc` per lookup, each drop
     of its inodes and of the filesystem made while a table is held
     (`*_after_releasing_lock9`). It lives in lumen-vfs, generic
