@@ -10,13 +10,15 @@
 // - The host test `ops_reads_final_only_through_a_direct_match` refuses any
 //   other way of reading one here: `let ... else`, `if let`, `matches!`, a
 //   tuple scrutinee, a method path, a `Final` held in a variable, a second
-//   `final_component()` in the scrutinee. On the safe side it also refuses
+//   `final_component()` in the scrutinee, `Final::` in an arm's body (a
+//   `Final` built or compared there). On the safe side it also refuses
 //   some direct matches it doesn't parse (`return match`, a typed or `mut`
 //   binding, a comment after the `{`): write those as it reads them.
 // - The lints forbidden below refuse a `_` or catch-all arm on that match,
 //   whichever fires: covering several cases (`wildcard_enum_match_arm`), one
-//   (`match_wildcard_for_single_variants`), or in an or-pattern
-//   (`wildcard_in_or_patterns`). Forbidden, not denied, so no `allow` or
+//   (`match_wildcard_for_single_variants`), in an or-pattern
+//   (`wildcard_in_or_patterns`), or alone, a `Final` handed on whole
+//   (`match_single_binding`). Forbidden, not denied, so no `allow` or
 //   `expect` (of a lint or of its group) can switch them off for one match.
 //   They cover every enum matched in this file, not only `Final`: name the
 //   cases of the others too.
@@ -26,7 +28,12 @@
 // None of them sees a shared helper whose own `match` answers the three
 // alike, or a `Final` rebuilt under another name (`use ... as`) and read
 // that way: keep each operation's match in the operation.
-#![forbid(clippy::wildcard_enum_match_arm, clippy::match_wildcard_for_single_variants, clippy::wildcard_in_or_patterns)]
+#![forbid(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants,
+    clippy::wildcard_in_or_patterns,
+    clippy::match_single_binding
+)]
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

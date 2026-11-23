@@ -8998,8 +8998,8 @@ fn open_creat_resolves_the_dots_it_was_given() {
 /// The lines of `src` (Rust source) that get a `Final` other than as a
 /// `match`'s scrutinee, all on one line as `match target.final_component() {`
 /// (a `let <ident> = ` before it or a field path such as `self.target` as
-/// the receiver allowed), or use a `Final::` pattern other than at the
-/// start of a match arm's line, `//` comment lines skipped (#309). Rustc's
+/// the receiver allowed), or use `Final::` other than in the pattern of a
+/// match arm starting its line, `//` comment lines skipped (#309). Rustc's
 /// exhaustiveness check and clippy's wildcard lints see every case only of
 /// a `match` on a bare `Final`; the comment at the top of `ops.rs` says what
 /// this refuses there and what it misses.
@@ -9010,6 +9010,11 @@ fn final_outside_a_direct_match(src: &str) -> Vec<(usize, &str)> {
     // `target` or `self.target`: no call, so no second `Final` read in it.
     fn is_path(s: &str) -> bool {
         s.split('.').all(is_ident)
+    }
+    // A match arm's pattern: `Final::` only before its `=>`, if any.
+    fn arm(line: &str) -> bool {
+        (line.starts_with("Final::") || line.starts_with("| Final::"))
+            && line.split_once("=>").is_none_or(|(_, body)| !body.contains("Final::"))
     }
     fn direct_match(line: &str) -> bool {
         let line = match line.strip_prefix("let ") {
@@ -9026,8 +9031,7 @@ fn final_outside_a_direct_match(src: &str) -> Vec<(usize, &str)> {
         .map(|(i, line)| (i + 1, line.trim()))
         .filter(|(_, line)| !line.starts_with("//"))
         .filter(|(_, line)| {
-            (line.contains("final_component") && !direct_match(line))
-                || (line.contains("Final::") && !(line.starts_with("Final::") || line.starts_with("| Final::")))
+            (line.contains("final_component") && !direct_match(line)) || (line.contains("Final::") && !arm(line))
         })
         .collect()
 }
@@ -9057,6 +9061,8 @@ fn ops_reads_final_only_through_a_direct_match() {
         "match pick(target.final_component(), other).final_component() {",
         "let name = match target.final_component() { Final::Name(n) => n, _ => return Err(e) };",
         "let last = Some(&target).map(ParentTarget::final_component);",
+        "Final::Name(n) => if last == Final::Dot { return Err(e) } else { n },",
+        "Final::Root => shared(Final::Root)?,",
     ] {
         assert_eq!(final_outside_a_direct_match(bad), [(1, bad)], "{bad}");
     }
