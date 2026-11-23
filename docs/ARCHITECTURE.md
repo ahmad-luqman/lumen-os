@@ -5149,13 +5149,21 @@ blocks, extent trees, and file data writeback):
   `write_at` or pin whose miss needed the block's slot (a read can thus fail
   with another block's write error). A `write_at` fails at once only on a
   miss (that eviction failing, a failed pre-read of a partial block, or
-  every slot pinned), its bytes then cached nowhere. No failed device write
-  is ever reported as success or dropped: the block stays dirty and cached
-  and the next writeback tries it again
-  (`every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty`).
-  The victim is always the least recently used unpinned block, so while its
-  writeback keeps failing every miss fails, reads included, even with a
-  clean block that could make room.
+  every slot pinned) or on a block pinned at that moment; the bytes for
+  that block and any after it are then cached nowhere, while a write
+  spanning blocks keeps its earlier blocks' bytes, dirty (no kernel caller
+  spans blocks). No failed device write is ever reported as success or
+  dropped: the block stays dirty and cached and the next writeback tries it
+  again (`every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty`).
+  Two consequences of the order:
+  - `sync` and `flush_blocks` stop at the first block that fails, so the
+    dirty blocks after it stay unwritten and the device unflushed, and a
+    block that keeps failing keeps every higher one off the device. A file's
+    `fsync` is a whole-cache sync, so it can report another block's error.
+  - The eviction victim is always the least recently used unpinned block,
+    so while its writeback keeps failing, every miss that needs an eviction
+    fails, reads included, even with a clean block that could make room
+    (`a_failing_dirty_lru_victim_fails_every_miss_even_with_a_clean_slot`).
 - **Host tests (`cargo:lumen-bcache`):** verified against an in-memory
   `MemBlockDevice` with LRU eviction order, dirty writeback, RAII pin refusal
   (`CacheFull`), read-only rejection, partial tail block clamps, crash-before-
@@ -5704,42 +5712,74 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     doesn't say whether every write it made reached the device:
     - Every write goes into the block cache, which writes back (above): an
       operation whose blocks are only cached returns `Ok`, and the device's
-      error comes from the next `FileSystem::sync` or a file's
-      `fsync`/`fdatasync`/`msync` (`EIO`, the blocks kept dirty for the next
-      sync; `ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next`),
-      or from the eviction that writes a block back, to whichever read or
-      write missed then (a lookup or a page read can get another block's
-      write error).
+      error comes from the next `FileSystem::sync` or a file's `fsync`,
+      `fdatasync` or `msync(MS_SYNC)` (`EIO`, the blocks kept dirty for the
+      next sync; `ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next`
+      checks `fsync`, `fdatasync` and `sync`), or from the eviction that
+      writes a block back, to whichever read or write missed then (a lookup
+      or a page read can get another block's write error). A sync stops at
+      the first block that fails (above), so an `fsync` can report another
+      file's block and leave its own unwritten.
     - `sync(2)` returns 0 whatever `vfs::sync_all` returns (Linux's
-      behaviour), and global reclaim's page writeback has no caller: each
-      failure is logged, its page kept dirty.
+      behaviour), and global reclaim's page writeback has no caller: a
+      failing streak is logged once per inode, its pages kept dirty.
     - `ext4plus` 0.1.0-rc.2 frees a file's block range again block by block
       when the range free fails (`file_blocks/utils.rs`,
-      `free_freed_ranges`), so a write that fails inside it can leave the
-      unlink, rmdir or truncate `Ok`. `free_blocks` and `free_block`
-      (`lib.rs`) raise the group's and the superblock's free counts in
-      memory before writing them and never put them back, so after a failed
-      descriptor or superblock write the retry counts the blocks twice and
-      writes the too-high count (`e2fsck` fixes it). Under the real block
-      cache that write can fail only on a miss, so only under cache
-      pressure; the `FaultCache` fails it by number
-      (`ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`).
-      Its allocators (`alloc_block`, `alloc_contiguous_blocks`, `alloc_inode`)
-      loop forever on a group whose count promises more than its bitmap has
-      (read from the source, and seen hanging a file's writeback on an image
-      made so, #350), so such a count must never be allocated from.
+      `free_freed_ranges`), so a write that fails inside it leaves the
+      unlink `Ok` (probed: unlink and rmdir; truncate and a rename's
+      replaced target reach the same code, read from the source).
+      `free_blocks` and `free_block` (`lib.rs`) raise the group's and the
+      superblock's free counts in memory before writing them and never put
+      them back, so when the failed write is the descriptor write carrying
+      the raised group count, or the superblock write, the retry counts the
+      blocks twice and writes that too-high count (`e2fsck` fixes it); a
+      failed bitmap byte or bitmap-checksum write doubles nothing
+      (`ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`,
+      by the `FaultCache`). Under the real block cache only a miss can fail,
+      and the bitmap bytes and the count's descriptor write are hits (the
+      block was just read or written), so it takes cache pressure and a
+      transient device error (a persistent one fails the retry's own miss
+      too), and only the superblock write can double a count.
+    - `ext4plus`'s `Extent::allocate` (`extent.rs`) retries any failed
+      `alloc_contiguous_blocks(n)` with one block fewer and gives `NoSpace`
+      at 0. It runs for every new block a write needs: page writeback
+      (`fsync`, `fdatasync`, `msync`, `sync`, reclaim), long symlink
+      targets, truncate's tail zeroing. `alloc_contiguous_blocks` writes the
+      bitmap bytes, the descriptor (checksum, then count) and the superblock,
+      lowering the counts in memory first, and puts nothing back. On 4 KiB
+      blocks a page needs 1 block, so a failed allocation write comes back
+      as `NoSpc`, not `Io`, and leaves the bit it set owned by no extent;
+      until the count's write lands the group's count is above its bitmap
+      (`ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc`). On
+      a 1 or 2 KiB-block extent volume, where a page needs several blocks, a
+      host probe (#351's review, not a test) saw the shorter retry succeed: the write returns `Ok`,
+      with blocks leaked and counts lowered twice. Under the real cache the
+      same conditions apply as for the free.
+    - `ext4plus`'s allocators (`alloc_block`, `alloc_contiguous_blocks`,
+      `alloc_inode`) loop forever on a group whose count promises more than
+      its bitmap has, or, for `alloc_contiguous_blocks(n)`, on one with no
+      run of `n` free bits: the next allocation from such a group hangs
+      (read from the source, and seen hanging a file's writeback on an
+      image made so; #350). The two retries above can leave such a count.
     - After a first error, the adapter's undo writes (above) report nothing
       further: a failed one is pinned in memory or logged, and the operation
-      returns the first error.
+      returns the first error. Among them: `undo_failed_link`,
+      `write_links_or_pin` in the unlink, rmdir, rename and exchange undos,
+      the inline-symlink restore, `discard_orphan`, `put_back_target`,
+      `rollback_link_entry` and truncate's tail restore.
     - A rename over an existing target, once the move landed, returns `Ok`
       whatever retiring the target does: its lowered `links_count` (pinned in
       memory if the write fails), freeing it when that was its last link
       (logged), and a directory target's parent's count (pinned).
 
-    So a write error can't be told from operations' results; it can be from
-    the block cache's calls (`BcacheIo::write`, the adapter's raw
-    `write_at`s, `sync`), except an eviction's, which reaches a read as an
-    ordinary `Io`.
+    So a write error can't be told from operations' results (an `Ok` or a
+    `NoSpc` may follow one), nor from the block cache's: a failed `write_at`
+    may be a failed pre-read or another block's eviction, a failed `sync` a
+    failed flush or a pinned block, and an eviction's write error reaches a
+    read as an ordinary `Io`. What #349 needs is one latched write-back
+    failure signal inside `BlockCache`, set where a device write or flush
+    fails (`ensure_slot`'s dirty victim, `writeback_and_flush`), which
+    every route goes through.
   - **Rename over an existing target:** the target is held, not removed,
     until the source has landed at its name. Its entry is taken out with
     its `links_count` unchanged (`Dir::unlink` is handed one more than the
