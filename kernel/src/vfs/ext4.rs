@@ -41,22 +41,28 @@ use crate::time;
 
 use super::page_cache::{self, CachePage, DetachedQuotaGuard, PAGE_SIZE, PageCache};
 
-/// Abstraction over `SleepMutex<BlockCache<B>>` allowing `Ext4FileSystem` to
-/// mount over both `virtio-blk` devices and in-memory test `BlockDevice`s.
+/// A volume's block cache as the filesystem reads and writes it: over
+/// `virtio-blk` devices and the ktests' in-memory ones.
 pub trait BlockCacheBackend: Send + Sync {
     fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError>;
     fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError>;
     fn sync(&self) -> Result<(), BlockError>;
-    /// Write nothing more to the device ([`BlockCache::freeze`]): an `ext4`
-    /// volume errored by `errors=remount-ro` (#349).
+}
+
+/// A block cache an `ext4` volume mounts over, with the controls its
+/// `errors=remount-ro` (#349) needs, which only the volume's latch
+/// ([`LatchedCache`]) calls. The latch is no `LatchableCache` itself, so
+/// nothing past it can freeze the cache below behind its back.
+pub trait LatchableCache: BlockCacheBackend {
+    /// Writeback stopped and writes into the cache refused
+    /// ([`BlockCache::freeze`]).
     fn freeze(&self);
-    /// How many block writebacks and flushes the device has failed
-    /// ([`BlockCache::writeback_failures`]): the one signal that a device
-    /// write failed (#349).
-    fn writeback_failures(&self) -> u64;
+    /// The first device write or flush that failed
+    /// ([`BlockCache::first_failure`]): the one signal that one did.
+    fn first_failure(&self) -> Option<BlockError>;
     /// From now on the first failed device write or flush stops writeback
     /// ([`BlockCache::stop_writeback_on_failure`]): nothing more reaches
-    /// the device after it (#349).
+    /// the device after it.
     fn stop_writeback_on_failure(&self);
 }
 
@@ -72,13 +78,15 @@ impl<B: BlockDevice + Send + Sync + 'static> BlockCacheBackend for SleepMutex<Bl
     fn sync(&self) -> Result<(), BlockError> {
         self.lock().sync()
     }
+}
 
+impl<B: BlockDevice + Send + Sync + 'static> LatchableCache for SleepMutex<BlockCache<B>> {
     fn freeze(&self) {
         self.lock().freeze();
     }
 
-    fn writeback_failures(&self) -> u64 {
-        self.lock().writeback_failures()
+    fn first_failure(&self) -> Option<BlockError> {
+        self.lock().first_failure()
     }
 
     fn stop_writeback_on_failure(&self) {
@@ -86,87 +94,102 @@ impl<B: BlockDevice + Send + Sync + 'static> BlockCacheBackend for SleepMutex<Bl
     }
 }
 
-type SharedBlockCache = Arc<dyn BlockCacheBackend>;
+/// The volume's handle on its block cache: every call goes through the latch.
+type SharedBlockCache = Arc<LatchedCache>;
 
 /// The volume's state under `errors=remount-ro` (#349, ARCHITECTURE §9):
 /// writable.
 const HEALTHY: u8 = 0;
-/// A write failed; the operation that hit it hasn't ended (its undo still
-/// writes, to the block cache).
+/// A device write failed (writeback stopped there, in the block cache); the
+/// write-type operations running then haven't all ended, and still write
+/// into the cache (the failing one's undo among them).
 const TRIPPED: u8 = 1;
-/// Reported and frozen: nothing more is written to the device.
-const ERRORED: u8 = 2;
+/// Settled and frozen: writes into the cache are refused too.
+const FROZEN: u8 = 2;
 
-/// Every [`BlockError`], numbered from 1 by place, for [`LatchedCache`]'s
-/// latched cause (0: none).
-const BLOCK_ERRORS: [BlockError; 7] = [
-    BlockError::OutOfRange,
-    BlockError::Unaligned,
-    BlockError::ReadOnly,
-    BlockError::CacheFull,
-    BlockError::Io,
-    BlockError::Timeout,
-    BlockError::DeviceFailed,
-];
+/// No thread's id: [`LatchedCache`]'s tripper before a trip.
+const NO_THREAD: u64 = u64::MAX;
+
+/// The running thread's id ([`NO_THREAD`] before the scheduler runs), for
+/// telling which write-type operation met the failure.
+fn thread_id() -> u64 {
+    let _irq = crate::arch::irq::push_off();
+    crate::sched::running_here().map_or(NO_THREAD, |(id, _)| id)
+}
 
 /// The block cache a mounted volume reaches its own through: the one seam
 /// every call of the volume goes through (`ext4plus`'s, the adapter's raw
-/// writes, the syncs), where `errors=remount-ro` (#349) latches the first
-/// device write or flush that fails ([`TRIPPED`]), told by the block
-/// cache's one signal, its count of failed writebacks and flushes, not by a
-/// call's result (the block cache writes back, so a device error turns up
-/// wherever a block is written back, a read's eviction included, #331).
-/// The block cache itself stops writing back at that failure, inside the
-/// call that met it, so nothing more reaches the device; it still takes
-/// writes, for the rest of the operation and its undo, until the freeze. Once the operation that hit it has
-/// ended ([`WriteOp`]'s drop), or at once when none is running (a read's),
-/// it refuses every write ([`ERRORED`]: `ReadOnly`, so `EROFS`), freezes the
-/// cache below and logs the one line ([`Self::settle`]).
+/// writes, the syncs). `errors=remount-ro` (#349) trips it ([`TRIPPED`])
+/// when the cache below has a failed device write or flush
+/// ([`LatchableCache::first_failure`], set wherever a block is written back,
+/// a read's eviction included, #331), not by a call's result; the cache
+/// below stopped writing back inside the call that met it, so nothing more
+/// reaches the device, while it still takes writes. When the last
+/// write-type operation running then ends ([`WriteOp`]'s drop), or at once
+/// when none runs (a read's), it settles ([`Self::settle`]): it refuses
+/// every write ([`FROZEN`]: `ReadOnly`, so `EROFS`), freezes the cache below
+/// and logs the one line, naming the operation that met the failure.
 struct LatchedCache {
-    inner: SharedBlockCache,
+    inner: Arc<dyn LatchableCache>,
     dev: DevId,
     state: AtomicU8,
-    /// The first failed write's error, by its place in [`BLOCK_ERRORS`]
-    /// plus one; 0 before any.
-    cause: AtomicU8,
     /// Write-type operations running ([`WriteOp`]s alive).
     ops: AtomicUsize,
+    /// The thread whose call met the failure ([`NO_THREAD`] before).
+    tripper: AtomicU64,
+    /// The innermost write-type operation of [`Self::tripper`]'s that was
+    /// running then, named when it ends; none for a read outside one.
+    failed_op: crate::sync::SpinLock<Option<&'static str>>,
 }
 
 impl LatchedCache {
     /// Over `inner`, which from now on stops writing back at its first
     /// failed device write or flush.
-    fn new(inner: SharedBlockCache, dev: DevId) -> Self {
+    fn new(inner: Arc<dyn LatchableCache>, dev: DevId) -> Self {
         inner.stop_writeback_on_failure();
-        Self { inner, dev, state: AtomicU8::new(HEALTHY), cause: AtomicU8::new(0), ops: AtomicUsize::new(0) }
+        Self {
+            inner,
+            dev,
+            state: AtomicU8::new(HEALTHY),
+            ops: AtomicUsize::new(0),
+            tripper: AtomicU64::new(NO_THREAD),
+            failed_op: crate::sync::SpinLock::new(None),
+        }
     }
 
     fn healthy(&self) -> bool {
-        self.state.load(Ordering::Acquire) == HEALTHY
+        self.state.load(Ordering::SeqCst) == HEALTHY
     }
 
-    /// Settled: nothing is written any more.
+    /// Settled: writes into the cache are refused too.
     fn frozen(&self) -> bool {
-        self.state.load(Ordering::Acquire) == ERRORED
+        self.state.load(Ordering::SeqCst) == FROZEN
     }
 
-    /// A write failed with `err`: latch it (the first error is kept).
-    fn trip(&self, err: BlockError) {
-        let code = BLOCK_ERRORS.iter().position(|&e| e == err).map_or(0, |i| i as u8 + 1);
-        let _ = self.cause.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
-        let _ = self.state.compare_exchange(HEALTHY, TRIPPED, Ordering::AcqRel, Ordering::Acquire);
+    /// A device write failed below: trip, remembering whose call met it.
+    fn trip(&self) {
+        if self.state.compare_exchange(HEALTHY, TRIPPED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            self.tripper.store(thread_id(), Ordering::SeqCst);
+        }
     }
 
-    /// The end of operation `op`: if a write failed (and nobody settled it
-    /// yet), refuse every write from now on, freeze the cache below and log
-    /// it, once. Whether it settled.
-    fn settle(&self, op: &str) -> bool {
-        if self.state.compare_exchange(TRIPPED, ERRORED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    /// Write-type operation `op` of the tripping thread ends: the first so
+    /// named (the innermost) is the one that met the failure.
+    fn name_failed_op(&self, op: &'static str) {
+        self.failed_op.lock().get_or_insert(op);
+    }
+
+    /// No write-type operation runs any more (or a read met the failure
+    /// outside one): if the latch tripped (and nobody settled it yet),
+    /// refuse every write from now on, freeze the cache below and log it,
+    /// once, naming the operation that met the failure. Whether it settled.
+    fn settle(&self) -> bool {
+        if self.state.compare_exchange(TRIPPED, FROZEN, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return false;
         }
         self.inner.freeze();
-        let code = self.cause.load(Ordering::Acquire);
-        let cause = BLOCK_ERRORS.get(usize::from(code).wrapping_sub(1)).copied().unwrap_or(BlockError::Io);
+        let cause = self.inner.first_failure().unwrap_or(BlockError::Io);
+        let op = self.failed_op.lock().unwrap_or("a read's eviction");
         error!(
             target: "vfs",
             "ext4 {:?}: {op} failed writing to the device ({cause}); the volume is read-only until reboot \
@@ -176,16 +199,14 @@ impl LatchedCache {
         true
     }
 
-    /// `call` on the cache below, latching a device write that failed
-    /// meanwhile (the cache's `writeback_failures` rose: its own block's or
-    /// an eviction's), whatever `call` returns: a failed pre-read or a full
-    /// cache fails a `write_at` with no write failing, and `ext4plus` can
-    /// retry past a failed write to `Ok`.
+    /// `call` on the cache below, tripping if a device write failed
+    /// meanwhile (or before), whatever `call` returns: a failed pre-read or
+    /// a full cache fails a `write_at` with no write failing, and `ext4plus`
+    /// can retry past a failed write to `Ok`.
     fn watched(&self, call: impl FnOnce() -> Result<(), BlockError>) -> Result<(), BlockError> {
-        let failures = self.inner.writeback_failures();
         let res = call();
-        if self.inner.writeback_failures() != failures {
-            self.trip(res.err().unwrap_or(BlockError::Io));
+        if self.healthy() && self.inner.first_failure().is_some() {
+            self.trip();
         }
         res
     }
@@ -201,15 +222,14 @@ impl LatchedCache {
 
 impl BlockCacheBackend for LatchedCache {
     fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError> {
-        let failures = self.inner.writeback_failures();
         let res = self.watched(|| self.inner.read_at(byte_off, dst));
-        if res.is_err() && self.inner.writeback_failures() != failures {
-            // Its eviction failed writing another block back, which stopped
+        if res.is_err() && !self.healthy() {
+            // Its eviction may have met the failure, which stopped
             // writeback: with no write-type operation running, it ends
-            // here. Either way the cache now evicts only clean blocks, so
-            // the read is tried again (`EIO` if every slot is dirty).
-            if self.ops.load(Ordering::Acquire) == 0 {
-                self.settle("a read's eviction");
+            // here. Either way the cache below now evicts only clean blocks
+            // or reads past itself, so the read is tried again.
+            if self.ops.load(Ordering::SeqCst) == 0 {
+                self.settle();
             }
             return self.inner.read_at(byte_off, dst);
         }
@@ -222,18 +242,6 @@ impl BlockCacheBackend for LatchedCache {
 
     fn sync(&self) -> Result<(), BlockError> {
         self.written(|| self.inner.sync())
-    }
-
-    fn freeze(&self) {
-        self.inner.freeze();
-    }
-
-    fn writeback_failures(&self) -> u64 {
-        self.inner.writeback_failures()
-    }
-
-    fn stop_writeback_on_failure(&self) {
-        self.inner.stop_writeback_on_failure();
     }
 }
 
@@ -930,10 +938,16 @@ impl Ext4FsInner {
 
     fn log_kept_bound(&self, disk_ino: u32, disk: Option<u32>, kept: &str) {
         let disk = disk.map_or_else(|| String::from("unreadable"), |n| alloc::format!("{n}"));
+        // On a volume a failed write made read-only (#349) no write lands
+        // again: the bound stays until reboot.
+        let until = if self.bcache.healthy() {
+            "until a write lands; run e2fsck if the volume is unmounted first"
+        } else {
+            "until reboot (the volume is read-only); run e2fsck"
+        };
         error!(
             target: "vfs",
-            "ext4 {:?} inode {disk_ino}: links_count on disk is {disk}, keeping {kept} in memory until a write lands; \
-             run e2fsck if the volume is unmounted first",
+            "ext4 {:?} inode {disk_ino}: links_count on disk is {disk}, keeping {kept} in memory {until}",
             self.dev
         );
     }
@@ -1087,11 +1101,18 @@ impl Ext4FsInner {
     fn log_undecided(&self, op: &str, parent_ino: NonZeroU32, disk_ino: u32, why: &Undecided) {
         #[cfg(feature = "ktest")]
         ktest_util::UNDECIDED_ARM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // On a volume a failed write made read-only (#349) no write through
+        // it, nor any allocation, can happen.
+        let risk = if self.bcache.healthy() {
+            "so writes through it may reach another file if they were"
+        } else {
+            "the volume read-only, so nothing reaches another file"
+        };
         error!(
             target: "vfs",
             "ext4 {:?} directory {parent_ino}: {op} of inode {disk_ino} failed, the directory unreadable, and \
-             whether its entry went and its blocks were freed can't be told ({why}); keeping it live, so writes \
-             through it may reach another file if they were; run e2fsck",
+             whether its entry went and its blocks were freed can't be told ({why}); keeping it live, {risk}; \
+             run e2fsck",
             self.dev
         );
     }
@@ -1295,17 +1316,28 @@ struct Ext4Shared {
 }
 
 /// A write-type operation on the volume, from its start to its end (the
-/// guard's drop, after every lock the operation took): if a write failed
-/// during it, the volume errors there ([`LatchedCache::settle`]).
+/// guard's drop, after every lock the operation took): when the last one
+/// running after a failed device write ends, the volume settles
+/// ([`LatchedCache::settle`]); the one whose thread met the failure is the
+/// one the log line names.
 struct WriteOp<'a> {
     shared: &'a Ext4Shared,
     op: &'static str,
+    /// The thread running it.
+    thread: u64,
+    /// It began before the failure: it may be the one that met it.
+    began_healthy: bool,
 }
 
 impl Drop for WriteOp<'_> {
     fn drop(&mut self) {
-        self.shared.cache.ops.fetch_sub(1, Ordering::AcqRel);
-        self.shared.cache.settle(self.op);
+        let cache = &self.shared.cache;
+        if self.began_healthy && !cache.healthy() && cache.tripper.load(Ordering::SeqCst) == self.thread {
+            cache.name_failed_op(self.op);
+        }
+        if cache.ops.fetch_sub(1, Ordering::SeqCst) == 1 {
+            cache.settle();
+        }
     }
 }
 
@@ -1313,7 +1345,7 @@ impl Ext4Shared {
     /// Read-only: mounted so, or errored since (`errors=remount-ro`, #349,
     /// from the failed write on, before the operation that hit it ends).
     fn read_only(&self) -> bool {
-        self.mounted_ro || !self.cache.healthy()
+        self.mounted_ro || self.errored()
     }
 
     /// Gone read-only after a failed write (`errors=remount-ro`, #349).
@@ -1333,8 +1365,8 @@ impl Ext4Shared {
     /// Operation `op` begins, its writability checked by the caller (a
     /// detached inode's work is in memory).
     fn op(&self, op: &'static str) -> WriteOp<'_> {
-        self.cache.ops.fetch_add(1, Ordering::AcqRel);
-        WriteOp { shared: self, op }
+        self.cache.ops.fetch_add(1, Ordering::SeqCst);
+        WriteOp { shared: self, op, thread: thread_id(), began_healthy: self.cache.healthy() }
     }
 
     /// The wall clock, for times this filesystem sets.
@@ -1368,7 +1400,7 @@ pub struct Ext4FileSystem {
 
 impl Ext4FileSystem {
     /// Probe and mount an `ext4` filesystem on `bcache` as `dev`.
-    pub fn mount(bcache: SharedBlockCache, dev: DevId, hw_read_only: bool) -> Result<Arc<Self>, VfsError> {
+    pub fn mount(bcache: Arc<dyn LatchableCache>, dev: DevId, hw_read_only: bool) -> Result<Arc<Self>, VfsError> {
         let mut raw_sb = [0u8; 1024];
         bcache.read_at(1024, &mut raw_sb).map_err(|e| map_block_error(&e))?;
         let magic = u16::from_le_bytes(raw_sb[0x38..0x3a].try_into().unwrap());
@@ -1383,7 +1415,7 @@ impl Ext4FileSystem {
 
         // Every write from here on goes through the latch (#349).
         let cache = Arc::new(LatchedCache::new(bcache, dev));
-        let bcache: SharedBlockCache = Arc::clone(&cache) as SharedBlockCache;
+        let bcache: SharedBlockCache = Arc::clone(&cache);
         let io = BcacheIo(Arc::clone(&bcache));
         // Probe read-only first to inspect superblock feature flags safely.
         let probe_fs = Ext4::load_with_writer(Box::new(io.clone()), None).map_err(map_ext4_err)?;
@@ -1481,7 +1513,9 @@ impl FileSystem for Ext4FileSystem {
     /// Flush every live inode, then the block cache, even past failures:
     /// one inode that can't be written mustn't keep the others (and the
     /// metadata in the block cache) off the disk. Each failure is logged;
-    /// the first is returned.
+    /// the first is returned. A failed device write stops it there (#349):
+    /// nothing more is written, into the cache either (the cache below can
+    /// evict only clean blocks from then on).
     fn sync(&self) -> Result<(), VfsError> {
         if self.shared.mounted_ro {
             return Ok(());
@@ -1499,6 +1533,9 @@ impl FileSystem for Ext4FileSystem {
             if let Err(e) = inode.flush_to_ext4(false) {
                 warn!(target: "vfs", "sync: ext4 {:?} inode {}: {e:?}", self.shared.dev, inode.disk_ino);
                 first_err.get_or_insert(e);
+            }
+            if self.shared.errored() {
+                break;
             }
         }
         // A failed write during the flushes stopped writeback (#349).
@@ -1597,6 +1634,10 @@ impl Ext4Inode {
         if !detached && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
         }
+        // Again: the reclaim just run may have met a failed write (#349).
+        if !detached && self.shared.read_only() {
+            return Err(VfsError::RoFs);
+        }
         let offset = offset.unwrap_or(meta.size);
         if buf.is_empty() {
             return Ok((offset, 0));
@@ -1625,6 +1666,12 @@ impl Ext4Inode {
                 CachePage::new_zeroed()
             }
         })?;
+        // A partial page's read may have met a failed write (its eviction,
+        // #349): the bytes are in the page cache, never to be written back,
+        // so the write is refused (the size and times left as they were).
+        if !detached && self.shared.read_only() {
+            return Err(VfsError::RoFs);
+        }
 
         let written_end = offset + done as u64;
         let now_ts = self.shared.now();
@@ -1750,6 +1797,12 @@ impl Ext4Inode {
         Ok(cp)
     }
 
+    /// Write-type operation `op` begins on this inode: `EROFS` on a
+    /// read-only volume unless the inode is detached (its work is in memory).
+    fn writable_op(&self, op: &'static str) -> Result<WriteOp<'_>, VfsError> {
+        if self.is_detached() { Ok(self.shared.op(op)) } else { self.shared.writable_op(op) }
+    }
+
     /// The volume is read-only: mounted so, or errored since
     /// (`errors=remount-ro`, #349), for `page_cache::mapped_read_only`.
     pub(super) fn volume_read_only(&self) -> bool {
@@ -1858,8 +1911,11 @@ impl Ext4Inode {
     /// Write back every dirty page (Lock 4 -> Lock 5 -> Lock 6 -> 7 -> 8),
     /// then evict every page it wrote that is still clean and unpinned, then
     /// up to `max_evict` minus those more clean pages, oldest first. A page
-    /// whose write fails stays dirty (and is never evicted); the others are
-    /// still written. The number of pages evicted.
+    /// whose write fails for another reason (`NoSpc`, a read) stays dirty
+    /// (and is never evicted); the others are still written. A failed device
+    /// write stops the writeback there, the rest left dirty, and on a volume
+    /// errored so (#349) nothing is written back at all: only clean pages
+    /// go. The number of pages evicted.
     pub fn reclaim_dirty_pages(&self, max_evict: usize) -> usize {
         if self.is_detached() || self.inode_type != InodeType::File || self.shared.mounted_ro {
             return 0;
@@ -1888,6 +1944,9 @@ impl Ext4Inode {
                 Ok(None) => {}
                 Err(_) => failed = true,
             }
+            if self.shared.errored() {
+                break;
+            }
         }
         if !failed {
             self.writeback_errno.store(0, Ordering::Release);
@@ -1901,17 +1960,18 @@ impl Ext4Inode {
 
     /// Flush all dirty `PageCache` pages and authoritative metadata to `ext4`
     /// under `Lock 4 -> Lock 5 -> Lock 6 -> Lock 7 -> Lock 8`. A page whose
-    /// write fails stays dirty, and `meta_dirty` stays set if the metadata
-    /// write fails, so a later sync retries both; every other page is still
-    /// written, and the first error is returned.
+    /// write fails for another reason (`NoSpc`, a read) stays dirty, and
+    /// `meta_dirty` stays set if the metadata write fails, so a later sync
+    /// retries both; every other page is still written, and the first error
+    /// is returned. A failed device write stops it there (#349): the volume
+    /// is read-only, the rest stays dirty in memory and is never written.
     fn flush_to_ext4(&self, data_only: bool) -> Result<(), VfsError> {
         if self.is_detached() || self.shared.mounted_ro {
             return Ok(());
         }
-        // Errored and settled (#349): what it would write will never land.
-        // (A `sync` whose earlier inode tripped the latch still writes the
-        // rest: the operation that hit it hasn't ended.)
-        if self.shared.cache.frozen() {
+        // Errored (#349): what it would write will never land, and writing
+        // it into the cache would only fill the slots reads need.
+        if self.shared.errored() {
             return Err(VfsError::Io);
         }
         let mut meta = self.meta.lock();
@@ -1930,7 +1990,13 @@ impl Ext4Inode {
                         first_err.get_or_insert(e);
                     }
                 }
+                if self.shared.errored() {
+                    break;
+                }
             }
+        }
+        if self.shared.errored() {
+            return Err(first_err.unwrap_or(VfsError::Io));
         }
 
         if meta.meta_dirty || !data_only {
@@ -4770,10 +4836,7 @@ impl VfsInode for Ext4Inode {
         if new_size > self.shared.max_file_size {
             return Err(VfsError::FBig);
         }
-        if self.shared.read_only() && !self.is_detached() {
-            return Err(VfsError::RoFs);
-        }
-        let _op = self.shared.op("truncate");
+        let _op = self.writable_op("truncate")?;
         let mut meta = self.meta.lock();
         let detached = self.is_detached();
         if !detached && meta.nlink == 0 {
@@ -4842,10 +4905,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
-        if self.shared.read_only() && !self.is_detached() {
-            return Err(VfsError::RoFs);
-        }
-        let _op = self.shared.op("chmod");
+        let _op = self.writable_op("chmod")?;
         let mut meta = self.meta.lock();
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
@@ -4867,10 +4927,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError> {
-        if self.shared.read_only() && !self.is_detached() {
-            return Err(VfsError::RoFs);
-        }
-        let _op = self.shared.op("chown");
+        let _op = self.writable_op("chown")?;
         let mut meta = self.meta.lock();
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
@@ -4902,10 +4959,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
-        if self.shared.read_only() && !self.is_detached() {
-            return Err(VfsError::RoFs);
-        }
-        let _op = self.shared.op("utimensat");
+        let _op = self.writable_op("utimensat")?;
         let mut meta = self.meta.lock();
         if !self.is_detached() && meta.nlink == 0 {
             return Err(VfsError::NoEnt);
@@ -4979,6 +5033,10 @@ impl VfsInode for Ext4Inode {
         if self.is_detached() || self.shared.mounted_ro {
             return Ok(());
         }
+        // Errored (#349): nothing will be written again.
+        if self.shared.errored() {
+            return Err(VfsError::Io);
+        }
         let _op = self.shared.op("fsync");
         self.flush_to_ext4(data_only)?;
         // A failed write during the flush stopped writeback (#349): nothing
@@ -5028,9 +5086,20 @@ pub(crate) mod ktest_util {
     use lumen_bcache::{BlockCache, BlockError};
     use lumen_vfs::{DevId, FileSystem, VfsInode};
 
-    use super::{BlockCacheBackend, Ext4FileSystem};
+    use super::{BlockCacheBackend, Ext4FileSystem, LatchableCache};
     use crate::sync::SleepMutex;
     use crate::vfs::{KernelVfsTables, MemBlkDev};
+
+    /// The `errors=remount-ro` line (#349) for the volume `0:minor` whose
+    /// `op` met a failed device write (`I/O error`, as the ktests' devices
+    /// fail), as the kernel log holds it.
+    pub fn remount_ro_line(op: &str, minor: u32) -> alloc::string::String {
+        alloc::format!(
+            "ERROR vfs: ext4 {:?}: {op} failed writing to the device (block device I/O error); the volume is \
+             read-only until reboot (errors=remount-ro); run e2fsck -f",
+            DevId::makedev(0, minor)
+        )
+    }
 
     /// A block cache over an in-memory device that counts reads and writes
     /// and fails them on request: one write by its number, two, three, or
@@ -5103,6 +5172,10 @@ pub(crate) mod ktest_util {
         pub fail_writes: AtomicBool,
         /// Fail only `sync` (written blocks stay in the cache, dirty).
         pub fail_syncs: AtomicBool,
+        /// Fail every write into the cache with no device write failing (as
+        /// a failed pre-read or a full cache does): not counted as the
+        /// device's, so it leaves the volume writable (#349).
+        pub fail_writes_uncounted: AtomicBool,
         /// Fail the next `fail_range_reads` reads overlapping `[lo, hi)`,
         /// once `range_skip` more of them have passed (counted only while
         /// some range failures are pending: a skip set with none waits for
@@ -5204,6 +5277,7 @@ pub(crate) mod ktest_util {
             self.fail_reads.store(false, Ordering::Release);
             self.fail_writes.store(false, Ordering::Release);
             self.fail_syncs.store(false, Ordering::Release);
+            self.fail_writes_uncounted.store(false, Ordering::Release);
             self.dev.fail_device_writes(false);
             self.fail_range_reads.store(0, Ordering::Release);
             self.zero_after_write_fault.store(false, Ordering::Release);
@@ -5261,6 +5335,11 @@ pub(crate) mod ktest_util {
                 self.inject_failure();
                 return Err(BlockError::Io);
             }
+            if self.fail_writes_uncounted.load(Ordering::Acquire) {
+                // A write into the cache refused with no device write
+                // failing (a pre-read's or a full cache's failure).
+                return Err(BlockError::Io);
+            }
             let n = self.writes.fetch_add(1, Ordering::AcqRel) + 1;
             let from = self.fail_write_from.load(Ordering::Acquire);
             if self.fail_write_at.iter().any(|slot| slot.load(Ordering::Acquire) == n) || (from != 0 && n >= from) {
@@ -5292,13 +5371,18 @@ pub(crate) mod ktest_util {
             }
             self.inner.lock().sync()
         }
+    }
 
+    impl LatchableCache for FaultCache {
         fn freeze(&self) {
             self.inner.lock().freeze();
         }
 
-        fn writeback_failures(&self) -> u64 {
-            self.injected.load(Ordering::Acquire) + self.inner.lock().writeback_failures()
+        fn first_failure(&self) -> Option<BlockError> {
+            if self.injected.load(Ordering::Acquire) > 0 {
+                return Some(BlockError::Io);
+            }
+            self.inner.lock().first_failure()
         }
 
         fn stop_writeback_on_failure(&self) {
@@ -5346,6 +5430,7 @@ pub(crate) mod ktest_util {
             fail_reads: AtomicBool::new(false),
             fail_writes: AtomicBool::new(false),
             fail_syncs: AtomicBool::new(false),
+            fail_writes_uncounted: AtomicBool::new(false),
             range_lo: AtomicU64::new(0),
             range_hi: AtomicU64::new(0),
             fail_range_reads: AtomicUsize::new(0),
@@ -5355,7 +5440,7 @@ pub(crate) mod ktest_util {
             zero_after_write_fault: AtomicBool::new(false),
             zeroing: AtomicBool::new(false),
         });
-        let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&cache) as Arc<dyn BlockCacheBackend>;
+        let backend: Arc<dyn LatchableCache> = Arc::clone(&cache) as Arc<dyn LatchableCache>;
         let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "ext4 mount")?;
         let root = fs.root_inode();
         let tables = KernelVfsTables::new();
@@ -5368,23 +5453,23 @@ pub(crate) mod ktest_util {
     /// (thawed for the write-back, then stopped again): what the volume
     /// reads.
     pub fn image(m: &Mnt) -> Result<Vec<u8>, &'static str> {
-        let (frozen, stopped) = {
+        {
             let inner = m.cache.inner.lock();
-            (inner.is_frozen(), inner.writeback_stopped())
-        };
-        if stopped {
-            let inner = m.cache.inner.lock();
-            inner.thaw();
-            let synced = inner.sync();
-            if frozen {
-                inner.freeze();
-            } else {
-                inner.stop_writeback();
+            let (frozen, stopped) = (inner.is_frozen(), inner.writeback_stopped());
+            if stopped {
+                inner.thaw();
+                let synced = inner.sync();
+                if frozen {
+                    inner.freeze();
+                } else {
+                    inner.stop_writeback();
+                }
+                synced.map_err(|_| "stopped cache sync")?;
+                drop(inner);
+                return Ok(m.dev_bytes());
             }
-            synced.map_err(|_| "stopped cache sync")?;
-        } else {
-            m.cache.sync().map_err(|_| "cache sync")?;
         }
+        m.cache.sync().map_err(|_| "cache sync")?;
         Ok(m.dev_bytes())
     }
 
@@ -5392,6 +5477,12 @@ pub(crate) mod ktest_util {
         /// Whether the volume froze the cache (`errors=remount-ro`, #349).
         pub fn frozen(&self) -> bool {
             self.inner.lock().is_frozen()
+        }
+
+        /// Whether this seam failed a device write (a write or sync it
+        /// failed, counted as the device's).
+        pub fn faulted(&self) -> bool {
+            self.injected.load(Ordering::Acquire) > 0
         }
     }
 
@@ -5422,7 +5513,7 @@ pub(crate) mod ktest_util {
     /// A fresh read-only mount of `img`.
     pub fn mount_ro_image(img: Vec<u8>, minor: u32) -> Result<Arc<Ext4FileSystem>, &'static str> {
         let dev = MemBlkDev::new(img, true);
-        let bcache: Arc<dyn BlockCacheBackend> =
+        let bcache: Arc<dyn LatchableCache> =
             Arc::new(SleepMutex::new(BlockCache::new(dev, 32).map_err(|_| "ro bcache")?));
         Ext4FileSystem::mount(bcache, DevId::makedev(0, minor), true).map_err(|_| "ro mount")
     }
@@ -6494,11 +6585,12 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ext4_sync_flushes_the_rest_past_a_failing_inode() {
-        // A sync whose first inode's write fails still writes the next
-        // inode's page, into the block cache; the failed write stopped
-        // writeback (#349), so none of it reaches the device, which isn't
-        // flushed, and the volume is read-only after it.
+    fn ext4_sync_stops_at_the_first_failed_write() {
+        // A sync whose first inode's write fails stops there (#349): the
+        // next inode's page isn't written, into the block cache either (a
+        // stopped cache can evict only clean blocks, which reads need),
+        // nothing reaches the device, which isn't flushed, and the volume
+        // is read-only after it.
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -6517,13 +6609,16 @@ crate::ktest!(
         let a4 = m.fs.lookup_live_by_lock_id(a.lock_id()).ok_or("live a")?;
         let b4 = m.fs.lookup_live_by_lock_id(b.lock_id()).ok_or("live b")?;
         kassert_eq!(a4.reclaim_clean_pages(16), 0); // still dirty
-        kassert_eq!(b4.reclaim_clean_pages(16), 1); // written anyway, to the block cache
+        kassert_eq!(b4.reclaim_clean_pages(16), 0); // and so is `b`'s: never written
         kassert!(!m.cache.dev.0.flushed.load(O::Acquire)); // the device neither flushed
         kassert!(m.dev_bytes() == on_disk); // nor written
-        // The volume went read-only (#349): `a`'s page is never written.
+        // The volume went read-only (#349): neither page is ever written,
+        // and both read back from memory.
         kassert!(went_read_only(&m));
         kassert_eq!(m.fs.sync().err(), Some(VfsError::Io));
         kassert_eq!(a4.reclaim_clean_pages(16), 0);
+        kassert_eq!(read_all(&a)?, pattern(PAGE_SIZE, 1));
+        kassert_eq!(read_all(&b)?, pattern(PAGE_SIZE, 2));
         Ok(())
     }
 );
@@ -6536,14 +6631,24 @@ crate::ktest!(
         // that moment the device's write count and bytes never change: not
         // in the rest of that sync (the other pages, the metadata, the
         // block-cache sync), nor after it (reads, refused writes, syncs).
-        // The files still read back their data.
+        // The files still read back their data, and so does a file synced
+        // before and cached nowhere since (its directory, inode and data
+        // read cold, though the stopped cache's slots are all dirty: read
+        // past it, from the device).
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         let dev = crate::vfs::MemBlkDev::new(crate::vfs::build_minimal_ext4_image_blocks(256), false);
         let bcache = Arc::new(SleepMutex::new(BlockCache::new(dev.clone(), 16).map_err(|_| "bcache")?));
-        let backend: SharedBlockCache = Arc::clone(&bcache) as SharedBlockCache;
+        let backend: Arc<dyn LatchableCache> = Arc::clone(&bcache) as Arc<dyn LatchableCache>;
         let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, 279), false).map_err(|_| "mount")?;
         let root = fs.root_inode();
+        let cold_data = pattern(4 * PAGE_SIZE, 9);
+        {
+            let sub = root.mkdir(b"sub", 0o755).map_err(|_| "mkdir sub")?;
+            let cold = sub.create(b"cold", 0o644).map_err(|_| "create cold")?;
+            kassert_eq!(cold.write_at(0, &cold_data).map_err(|_| "write cold")?, cold_data.len());
+            fs.sync().map_err(|_| "sync cold")?;
+        }
         let mut files = Vec::new();
         for (i, name) in [&b"f0"[..], b"f1", b"f2"].into_iter().enumerate() {
             let f = root.create(name, 0o644).map_err(|_| "create")?;
@@ -6551,16 +6656,22 @@ crate::ktest!(
             kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
             files.push((f, data));
         }
+        let before = dev.writes();
         dev.fail_nth_device_write(3);
         kassert!(fs.sync().is_err());
         let (writes, bytes) = dev.at_failure().ok_or("no device write failed")?;
-        kassert!(writes >= 2); // the sync had begun writing back
+        kassert_eq!(writes, before + 2); // two landed, the third failed
         kassert!(fs.errored() && bcache.lock().writeback_stopped());
         kassert_eq!(dev.writes(), writes);
         kassert!(dev.bytes() == bytes);
         for (f, data) in &files {
             kassert!(read_all(f)? == *data);
         }
+        // Cold reads: the stopped cache's slots are dirty for good.
+        kassert_eq!(bcache.lock().stats().dirty, 16);
+        let sub = root.lookup(b"sub").map_err(|_| "lookup sub")?;
+        let cold = sub.lookup(b"cold").map_err(|_| "lookup cold")?;
+        kassert!(read_all(&cold)? == cold_data);
         kassert_eq!(fs.sync(), Err(VfsError::Io));
         kassert_eq!(root.create(b"n", 0o644).err(), Some(VfsError::RoFs));
         kassert_eq!(dev.writes(), writes);
@@ -6586,22 +6697,11 @@ crate::ktest!(
         let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
-        fn logged(text: &str) -> usize {
-            let mut buf = vec![0u8; 64 * 1024];
-            let (n, _) = crate::klog::copy_recent(&mut buf);
-            core::str::from_utf8(&buf[..n]).map_or(0, |s| s.lines().filter(|l| l.contains(text)).count())
-        }
-        let line = |op: &str, minor: u32| {
-            alloc::format!(
-                "ERROR vfs: ext4 {:?}: {op} failed writing to the device (block device I/O error); the volume is \
-                 read-only until reboot (errors=remount-ro); run e2fsck -f",
-                DevId::makedev(0, minor)
-            )
-        };
+        let line = remount_ro_line;
         let volume = |slots: usize, minor: u32| -> Result<_, &'static str> {
             let dev = crate::vfs::MemBlkDev::new(crate::vfs::build_minimal_ext4_image_blocks(256), false);
             let bcache = Arc::new(SleepMutex::new(BlockCache::new(dev.clone(), slots).map_err(|_| "bcache")?));
-            let backend: SharedBlockCache = Arc::clone(&bcache) as SharedBlockCache;
+            let backend: Arc<dyn LatchableCache> = Arc::clone(&bcache) as Arc<dyn LatchableCache>;
             let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), false).map_err(|_| "mount")?;
             Ok((dev, bcache, fs))
         };
@@ -6624,7 +6724,7 @@ crate::ktest!(
         kassert_eq!(g.write_at(0, &data).map_err(|_| "rewrite g")?, PAGE_SIZE);
         kassert_eq!(g.sync(false), Err(VfsError::Io));
         kassert!(fs.errored() && fs.read_only() && bcache.lock().is_frozen());
-        kassert_eq!(logged(&line("fsync", 272)), 1);
+        kassert_eq!(crate::desktop::logged(&line("fsync", 272))?, 1);
         kassert_eq!(g.sync(true), Err(VfsError::Io)); // writes nothing, warns nothing more
         kassert_eq!(fs.sync(), Err(VfsError::Io));
         dev.fail_device_writes(false);
@@ -6655,11 +6755,34 @@ crate::ktest!(
         kassert!(read_all(&b)? == big);
         kassert!(bcache.lock().writeback_failures() > failures);
         kassert!(fs.errored() && bcache.lock().is_frozen());
-        kassert_eq!(logged(&line("a read's eviction", 278)), 1);
+        kassert_eq!(crate::desktop::logged(&line("a read's eviction", 278))?, 1);
         dev.fail_device_writes(false);
         kassert_eq!(fs.sync(), Err(VfsError::Io));
         kassert!(d.lookup(b"x").is_ok());
         kassert!(read_all(&b)? == big);
+        kassert!(dev.bytes() == on_disk);
+        drop((b, d, root, fs, bcache, dev));
+
+        // An unlink's own read meets the failed eviction: the volume settles
+        // only when the unlink ends, and the line names it.
+        let (dev, bcache, fs) = volume(16, 277)?;
+        let root = fs.root_inode();
+        drop(root.create(b"v", 0o644).map_err(|_| "create v")?);
+        let b = root.create(b"big", 0o644).map_err(|_| "create big")?;
+        fs.sync().map_err(|_| "sync v")?;
+        // Write `big` back into the cache: its blocks fill every slot,
+        // dirty, and the root's directory block goes.
+        kassert_eq!(b.write_at(0, &big).map_err(|_| "write big")?, big.len());
+        let b4 = b.as_any().and_then(|a| a.downcast_ref::<Ext4Inode>()).ok_or("ext4 inode")?;
+        b4.reclaim_dirty_pages(usize::MAX);
+        kassert!(!fs.errored());
+        let on_disk = dev.bytes();
+        dev.fail_device_writes(true);
+        let _ = root.unlink(b"v");
+        dev.fail_device_writes(false);
+        kassert!(fs.errored() && bcache.lock().is_frozen());
+        kassert_eq!(crate::desktop::logged(&line("unlink", 277))?, 1);
+        kassert_eq!(crate::desktop::logged(&line("a read's eviction", 277))?, 0);
         kassert!(dev.bytes() == on_disk);
         Ok(())
     }
@@ -7158,14 +7281,13 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ext4_writeback_continues_past_a_failing_page() {
-        // The first page's write fails: the other pages are still written
-        // (and the sync reports the error), so one bad block doesn't keep
-        // the rest of the file off the disk. The failed write is in the
-        // page's block allocation, which `ext4plus` (`Extent::allocate`)
-        // retries one block shorter and then calls `NoSpace`: the sync says
-        // `ENOSPC`, yet the write failed, so the volume goes read-only all
-        // the same (#349: the trigger is the write, not the errno).
+    fn ext4_a_failed_page_writeback_errors_the_volume_as_enospc() {
+        // The first page's write fails in its block allocation, which
+        // `ext4plus` (`Extent::allocate`) retries one block shorter and then
+        // calls `NoSpace`: the sync says `ENOSPC`, yet a write failed, so
+        // the volume goes read-only all the same (#349: the trigger is the
+        // write, not the errno) and the writeback stops there: the other
+        // pages stay dirty in memory, never written.
         use self::ktest_util::*;
         use crate::kassert_eq;
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 239)?;
@@ -7176,12 +7298,9 @@ crate::ktest!(
         kassert_eq!(f.sync(false), Err(VfsError::NoSpc));
         crate::kassert!(m.fs.errored());
         m.cache.clear();
-        let ro = remount_ro(&m, 240)?;
-        let on_disk = read_all(&ro.root_inode().lookup(b"pages").map_err(|_| "ro lookup")?)?;
-        kassert_eq!(on_disk.len(), data.len());
-        kassert_eq!(&on_disk[PAGE_SIZE..], &data[PAGE_SIZE..]); // pages 1 and 2 reached the disk
-        // Then the volume went read-only (#349): no retry writes the failed
-        // page, which stays in memory.
+        let f4 = m.fs.lookup_live_by_lock_id(f.lock_id()).ok_or("live")?;
+        kassert_eq!(f4.reclaim_clean_pages(16), 0); // none written
+        // No retry writes them.
         crate::kassert!(went_read_only(&m));
         kassert_eq!(f.sync(false).err(), Some(VfsError::Io));
         kassert_eq!(read_all(&f)?, data);
@@ -8959,6 +9078,116 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn ext4_the_latch_settles_when_the_last_write_type_operation_ends() {
+        // #349: a failed write trips the latch inside one write-type
+        // operation; another that begins and ends meanwhile doesn't settle
+        // it (the first may still be running its undo, into the cache); the
+        // first one's end does, and the line names it, not the other.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 362)?;
+        let off = inode_offset(&m.fs, 2)?;
+        let outer = m.fs.shared.op("rename");
+        m.cache.arm_write(1);
+        let failed = m.fs.shared.state.lock().bcache.write_at(off, &[0u8; 4]);
+        m.cache.clear();
+        kassert!(failed.is_err() && m.fs.errored());
+        drop(m.fs.shared.op("fsync"));
+        kassert!(!m.cache.frozen() && !m.fs.shared.cache.frozen());
+        // The cache still takes the running operation's writes.
+        kassert!(m.fs.shared.state.lock().bcache.write_at(off, &[0u8; 4]).is_ok());
+        drop(outer);
+        kassert!(m.fs.shared.cache.frozen() && m.cache.frozen());
+        kassert_eq!(crate::desktop::logged(&remount_ro_line("rename", 362))?, 1);
+        kassert_eq!(crate::desktop::logged(&remount_ro_line("fsync", 362))?, 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_kept_link_count_is_written_before_the_next_unlink() {
+        // A count kept in memory while the disk holds another (an undo's
+        // write that didn't land, on a volume a read fault left writable)
+        // goes on disk before the next unlink of the inode changes it:
+        // `store_bounded_links`. Here the disk is made to hold 3 for a file
+        // with 2 names, 2 pinned; unlinking one name leaves 1 on disk.
+        // Its kept-count line held back with the sweeps' (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 363)?;
+        let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
+        m.root.link(b"g", &f).map_err(|_| "link")?;
+        let ino = u32::try_from(f.ino()).map_err(|_| "ino")?;
+        let off = inode_offset(&m.fs, ino)?;
+        {
+            let mut inner = m.fs.shared.state.lock();
+            inner.bcache.write_at(off + 0x1a, &3u16.to_le_bytes()).map_err(|_| "raw links_count")?;
+            inner.set_nlink_exact(ino, 2);
+        }
+        kassert_eq!(raw_mode_and_links(&m.fs, ino)?.1, 3);
+        m.root.unlink(b"g").map_err(|_| "unlink g")?;
+        kassert_eq!(raw_mode_and_links(&m.fs, ino)?.1, 1);
+        kassert_eq!(f.stat().map_err(|_| "stat")?.nlink, 1);
+        kassert!(!m.fs.errored());
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_write_refused_by_the_cache_alone_leaves_the_volume_writable() {
+        // #349: a write into the block cache that fails with no device
+        // write failing (a failed pre-read, a full cache) errors the
+        // operation, not the volume.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 360)?;
+        let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
+        m.cache.fail_writes_uncounted.store(true, Ordering::Release);
+        let res = f.set_mode(0o600);
+        m.cache.clear();
+        kassert_eq!(res, Err(VfsError::Io));
+        kassert!(!m.fs.errored() && !m.fs.read_only());
+        f.set_mode(0o600).map_err(|_| "chmod after")?;
+        m.root.create(b"g", 0o644).map_err(|_| "create after")?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_write_whose_reclaim_meets_a_failed_write_is_refused() {
+        // #349: a `write` runs the global reclaim before it writes; when
+        // that reclaim's writeback fails, the volume errors, and the write
+        // itself is refused (`EROFS`), not taken into a cache that will
+        // never be written back.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 361)?;
+        super::EXT4_FILESYSTEMS.lock().push(Arc::clone(&m.fs));
+        let res = (|| -> Result<Result<usize, VfsError>, &'static str> {
+            let a = m.root.create(b"a", 0o644).map_err(|_| "create a")?;
+            kassert_eq!(a.write_at(0, &pattern(4 * PAGE_SIZE, 3)).map_err(|_| "write a")?, 4 * PAGE_SIZE);
+            let b = m.root.create(b"b", 0o644).map_err(|_| "create b")?;
+            // Reclaim to nothing: `a`'s dirty pages are written back first.
+            page_cache::set_ext4_limits_for_test(Some((0, usize::MAX)));
+            m.cache.arm_write(1);
+            let pages = page_cache::ext4_cached_pages();
+            let res = b.write_at(0, b"x");
+            // Refused before it took a page into the cache.
+            let taken = page_cache::ext4_cached_pages() - pages;
+            page_cache::set_ext4_limits_for_test(None);
+            m.cache.clear();
+            kassert_eq!(taken, 0);
+            Ok(res)
+        })();
+        super::EXT4_FILESYSTEMS.lock().retain(|e| !Arc::ptr_eq(e, &m.fs));
+        kassert_eq!(res?, Err(VfsError::RoFs));
+        kassert!(went_read_only(&m));
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn ext4_a_write_error_makes_the_volume_read_only() {
         // #349, `errors=remount-ro`: a write fault in an unlink, a rename
         // and an rmdir, each on a volume of its own. The operation returns
@@ -8987,12 +9216,6 @@ crate::ktest!(
         }
         fn ext4(inode: &Arc<dyn VfsInode>) -> Result<&Ext4Inode, &'static str> {
             inode.as_any().and_then(|a| a.downcast_ref::<Ext4Inode>()).ok_or("not an ext4 inode")
-        }
-        // How many lines in the kernel log's ring hold `text`.
-        fn logged(text: &str) -> usize {
-            let mut buf = vec![0u8; 64 * 1024];
-            let (n, _) = crate::klog::copy_recent(&mut buf);
-            core::str::from_utf8(&buf[..n]).map_or(0, |s| s.lines().filter(|l| l.contains(text)).count())
         }
         fn mode_cell(m: &Mnt) -> Value {
             crate::vfs::mount_table_of(&m.tables).rows()[0][3].clone()
@@ -9035,12 +9258,7 @@ crate::ktest!(
             let writes = m.cache.writes.load(Ordering::Acquire);
             let syncs = m.cache.syncs.load(Ordering::Acquire);
             kassert!(m.fs.read_only() && m.fs.errored() && m.cache.frozen());
-            let line = alloc::format!(
-                "ERROR vfs: ext4 {:?}: {op} failed writing to the device (block device I/O error); the volume is \
-                 read-only until reboot (errors=remount-ro); run e2fsck -f",
-                DevId::makedev(0, minor)
-            );
-            kassert_eq!(logged(&line), 1);
+            kassert_eq!(crate::desktop::logged(&remount_ro_line(op, minor))?, 1);
 
             // Every write-type operation through the VFS.
             let creat = flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT);
@@ -9092,7 +9310,7 @@ crate::ktest!(
             kassert_eq!(keep.sync(true).err(), Some(VfsError::Io));
             kassert_eq!(m.fs.sync().err(), Some(VfsError::Io));
             // Reclaim writes nothing back: the dirty page stays.
-            ext4(&keep)?.reclaim_dirty_pages(usize::MAX);
+            kassert_eq!(ext4(&keep)?.reclaim_dirty_pages(usize::MAX), 0);
 
             // Reads: the failed operation left its name; `keep` reads its
             // unwritten page; `big`, read from the disk, cycles the cache.
@@ -9101,6 +9319,8 @@ crate::ktest!(
             kassert_eq!(victim.stat().map_err(why("stat victim"))?.nlink, 1);
             kassert_eq!(read_all(&keep)?, b"KEPT");
             kassert!(read_all(&b)? == big);
+            // Clean pages still go.
+            kassert_eq!(ext4(&b)?.reclaim_dirty_pages(usize::MAX), 80);
             kassert!(other.lookup(b"x").is_ok());
             let mut listed = Vec::new();
             m.root.readdir(0, &mut listed, 64).map_err(why("readdir"))?;
@@ -9110,7 +9330,7 @@ crate::ktest!(
             kassert_eq!(m.cache.writes.load(Ordering::Acquire), writes);
             kassert_eq!(m.cache.syncs.load(Ordering::Acquire), syncs);
             kassert!(m.dev_bytes() == dev);
-            kassert_eq!(logged(&line), 1);
+            kassert_eq!(crate::desktop::logged(&remount_ro_line(op, minor))?, 1);
 
             // `mount` and `/proc/mounts`.
             let rows = m.tables.list_mounts();

@@ -384,9 +384,13 @@ one is its own PR that updates that doc first.
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, then
   `errors=remount-ro`: the first failed device write, told by the block
-  cache's `writeback_failures` and latched at `LatchedCache`, the one seam,
-  makes the volume read-only and freezes its block cache when the
-  operation (`WriteOp`) ends, or at once for a read's eviction, #349; the
+  cache's `first_failure` (`LatchableCache`, the controls only the caches
+  below the latch have) and latched at `LatchedCache`, the one seam the
+  volume holds, makes the volume read-only (syncs stop there, older shared
+  mappings take no store, a miss with no clean slot read uncached) and
+  freezes its block cache when the last write-type operation (`WriteOp`,
+  naming the one that met it) ends, or at once for a read's eviction with
+  none running, #349; the
   link counts kept in memory when an undo fails (`NlinkBounds` through
   `write_links_or_pin`/`raise_links_or_floor`); `rename` split into
   `Exchange` (`RENAME_EXCHANGE`: `run`, `roll_back`, `finish`), `MoveEntry`

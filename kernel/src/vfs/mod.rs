@@ -200,7 +200,7 @@ pub fn init() {
             continue;
         }
         let hw_ro = entry.dev.info().read_only;
-        let cache: Arc<dyn ext4::BlockCacheBackend> = entry.cache;
+        let cache: Arc<dyn ext4::LatchableCache> = entry.cache;
         match has_ext4_magic(&*cache) {
             Ok(true) => {}
             Ok(false) => {
@@ -1531,7 +1531,7 @@ pub fn log_ext4_crate_summary() {
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_ext4(dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
     let mem_dev = MemBlkDev::new(build_minimal_ext4_image_blocks(256), false);
-    let bcache: Arc<dyn ext4::BlockCacheBackend> =
+    let bcache: Arc<dyn ext4::LatchableCache> =
         Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(mem_dev, 64).map_err(|_| "bcache init")?));
     ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, dev_minor), false).map_err(|_| "ext4 mount")
 }

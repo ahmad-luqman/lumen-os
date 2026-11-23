@@ -170,7 +170,7 @@ crate::ktest!(
         let mut bad_img = build_minimal_ext4_image_blocks(64);
         bad_img[1024 + 0xfe..1024 + 0x100].copy_from_slice(&32u16.to_le_bytes());
         let bad_dev = MemBlkDev::new(bad_img, true);
-        let bad_bcache: Arc<dyn ext4::BlockCacheBackend> =
+        let bad_bcache: Arc<dyn ext4::LatchableCache> =
             Arc::new(SleepMutex::new(BlockCache::new(bad_dev, 16).map_err(|_| "bad bcache")?));
         kassert!(matches!(ext4::Ext4FileSystem::mount(bad_bcache, DevId::makedev(0, 12), true), Err(VfsError::Inval)));
 
@@ -293,7 +293,7 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn vfs_sync_continues_past_a_failing_inode() {
+    fn vfs_sync_stops_at_a_failed_write_and_reports_it() {
         use crate::{kassert, kassert_eq};
         let m = mount(build_minimal_ext4_image_blocks(256), 130)?;
         let files = [("sync_a.bin", 0xA1u8), ("sync_b.bin", 0xB2u8)];
@@ -316,16 +316,16 @@ crate::ktest!(
         kassert!(held.iter().all(|f| cached.iter().any(|c| c.lock_id() == f.lock_id())));
 
         // The sync's first block write fails, once: the sync reports it, and
-        // everything else (the other file, the filesystem) is still flushed.
+        // stops there (#349: the volume is read-only, nothing more written);
+        // a later sync reports it again, and the files read back their data
+        // from memory.
         m.cache.arm_write(1);
         kassert!(matches!(sync_tables(&m.tables), Err(VfsError::Io)));
         m.cache.arm_write(0);
-
-        let ro = remount_ro(&m, 131)?;
-        let root = ro.root_inode();
-        for (name, byte) in files {
-            let f = root.lookup(name.as_bytes()).map_err(|_| "ro lookup sync file")?;
-            kassert_eq!(read_all_inode(&f).map_err(|_| "ro read sync file")?, vec![byte; 4096]);
+        kassert!(went_read_only(&m));
+        kassert!(matches!(sync_tables(&m.tables), Err(VfsError::Io)));
+        for (f, (_, byte)) in held.iter().zip(files) {
+            kassert_eq!(read_all_inode(f).map_err(|_| "read sync file")?, vec![byte; 4096]);
         }
         Ok(())
     }
@@ -792,7 +792,9 @@ crate::ktest!(
 /// the leg goes on as before.
 fn read_only_after(m: &Mnt) -> Result<bool, &'static str> {
     if !m.fs.errored() {
-        return Ok(false);
+        // No device write failed: the fault fell past the operation's
+        // writes (a failed one errors the volume, even under an `Ok`).
+        return if m.cache.faulted() { Err("a write failed, but the volume is writable") } else { Ok(false) };
     }
     if went_read_only(m) { Ok(true) } else { Err("errored after a fault, but not read-only") }
 }
@@ -2014,7 +2016,8 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         kassert_eq!(unlink_at(&m.tables, None, b"/h1", false), Err(VfsError::RoFs));
         let h2 = resolve_path(&m.tables, None, b"/h2", rf).map_err(|_| "resolve cold /h2")?.inode;
         kassert_eq!(h2.ino(), cold_hl_orig_ino);
-        kassert!(h2.stat().map_err(|_| "stat cold /h2")?.nlink >= 1);
+        let names = 1 + u32::from(resolve_path(&m.tables, None, b"/h1", rf).is_ok());
+        kassert!(h2.stat().map_err(|_| "stat cold /h2")?.nlink >= names);
         kassert_eq!(read_all_inode(&h2).map_err(|_| "read cold /h2")?, b"COLD_HL_DATA");
         drop((h2, m));
         kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
@@ -2046,7 +2049,8 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         kassert_eq!(unlink_at(&m.tables, None, b"/sym1", false), Err(VfsError::RoFs));
         let sym2 = resolve_path(&m.tables, None, b"/sym2", rf).map_err(|_| "resolve cold /sym2")?.inode;
         kassert_eq!(sym2.ino(), cold_sym_orig_ino);
-        kassert!(sym2.stat().map_err(|_| "stat cold /sym2")?.nlink >= 1);
+        let names = 1 + u32::from(resolve_path(&m.tables, None, b"/sym1", rf).is_ok());
+        kassert!(sym2.stat().map_err(|_| "stat cold /sym2")?.nlink >= names);
         kassert_eq!(sym2.readlink().map_err(|_| "readlink cold /sym2")?, b"/cold/sym/target");
         kassert_eq!(readlink_at(&m.tables, None, b"/sym2").map_err(|_| "readlink_at cold /sym2")?, b"/cold/sym/target");
         drop((sym2, m));
@@ -2102,7 +2106,9 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         kassert_eq!(rename_at2(&m.tables, None, b"/src", None, b"/h1", RenameFlags::default()), Err(VfsError::RoFs));
         let h2 = resolve_path(&m.tables, None, b"/h2", rf).map_err(|_| "resolve cold ow /h2")?.inode;
         kassert_eq!(h2.ino(), cold_ow_orig_ino);
-        kassert!(h2.stat().map_err(|_| "stat cold ow /h2")?.nlink >= 1);
+        let at_h1 = resolve_path(&m.tables, None, b"/h1", rf).is_ok_and(|r| r.inode.ino() == cold_ow_orig_ino);
+        let names = 1 + u32::from(at_h1);
+        kassert!(h2.stat().map_err(|_| "stat cold ow /h2")?.nlink >= names);
         kassert_eq!(read_all_inode(&h2).map_err(|_| "read cold ow /h2")?, b"OLD_HL_OW");
         let at_src = resolve_path(&m.tables, None, b"/src", rf).map(|r| r.inode.ino());
         let at_h1 = resolve_path(&m.tables, None, b"/h1", rf).map(|r| r.inode.ino());
@@ -2163,7 +2169,10 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         kassert_eq!(unlink_at(&m.tables, None, b"/sd/sub", true), Err(VfsError::RoFs));
         let dd_sub = resolve_path(&m.tables, None, b"/dd/sub", rf).map_err(|_| "resolve cold /dd/sub")?.inode;
         kassert_eq!(dd_sub.ino(), dual_dir_orig_ino);
-        kassert!(dd_sub.stat().map_err(|_| "stat cold /dd/sub")?.nlink >= 2);
+        let names = 1 + u32::from(resolve_path(&m.tables, None, b"/sd/sub", rf).is_ok());
+        // Its names and its own `.`.
+        let links = names + 1;
+        kassert!(dd_sub.stat().map_err(|_| "stat cold /dd/sub")?.nlink >= links);
         drop((dd_sub, m));
         kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
     }
@@ -2288,6 +2297,9 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                     let dst_ok = resolve_path(&m.tables, None, dst_path, rf).ok().map(|r| r.inode);
                     let target = src_ok.as_ref().or(dst_ok.as_ref()).ok_or("missing item A")?;
                     kassert_eq!(target.ino(), orig_ino);
+                    let names = u32::from(src_ok.is_some()) + u32::from(dst_ok.is_some());
+                    let dir = u32::from(matches!(kind, EntryKind::Dir));
+                    kassert!(target.stat().map_err(|_| "stat target A")?.nlink >= names + dir);
                     // Read-only now (#349): no name comes off, nothing new
                     // takes its number.
                     kassert!(read_only_after(&m)?);
@@ -2381,6 +2393,11 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                 // Both names hold one of the two inodes; read-only now (#349).
                 let names = [cur_a.ino(), cur_b.ino()];
                 kassert!(names == [orig_a_ino, orig_b_ino] || names == [orig_b_ino, orig_a_ino]);
+                for cur in [&cur_a, &cur_b] {
+                    let dir = u32::from(cur.inode_type() == InodeType::Dir);
+                    let links = 1 + dir;
+                    kassert!(cur.stat().map_err(|_| "stat exchanged B")?.nlink >= links);
+                }
                 kassert!(read_only_after(&m)?);
                 drop((cur_a, cur_b, pin_pair, m));
                 kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);

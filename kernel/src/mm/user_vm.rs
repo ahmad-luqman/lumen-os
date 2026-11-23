@@ -830,6 +830,22 @@ impl AddressSpace {
         if inner.torn_down {
             return Err(UserVmError::Vm(VmError::NoMem));
         }
+        // A shared mapping of a file whose volume went read-only since it was
+        // made (`errors=remount-ro`, #349) can't be made writable: `EACCES`,
+        // as without `VM_MAYWRITE`.
+        if prot.write() {
+            let end = addr.saturating_add(len);
+            let read_only = inner.vmas.overlapping(addr, end).any(|vma| match vma.backing {
+                Backing::File(fm) if fm.shared && fm.may_write => inner
+                    .mapped_files
+                    .get(&fm.file_id)
+                    .is_some_and(|kept| page_cache::mapped_read_only(&**kept.inode())),
+                _ => false,
+            });
+            if read_only {
+                return Err(UserVmError::Vm(VmError::Access));
+            }
+        }
         inner.vmas.protect(addr, len, prot)?;
         if len == 0 {
             return Ok(());
@@ -1001,6 +1017,11 @@ impl AddressSpace {
             return self.map_private_copy(page_va, mapped, prot_to_attrs(vma.prot));
         }
         let writable = is_write && fm.may_write;
+        if writable && mapped.volume_read_only() {
+            // The volume went read-only after the mapping was made (#349):
+            // a store would never reach the disk.
+            return FaultResult::BusError;
+        }
         let mut attrs = prot_to_attrs(vma.prot).with_shared(true);
         if !writable {
             attrs = attrs.without_writable();
@@ -1104,6 +1125,11 @@ impl AddressSpace {
             log::error!(target: "mm", "a store promoted a shared page at {page_va} of a mapping without VM_MAYWRITE");
             debug_assert!(false, "VmaMap refuses PROT_WRITE without may_write");
             return FaultResult::Invalid;
+        }
+        if mapped.volume_read_only() {
+            // The volume went read-only after the mapping was made (#349):
+            // the leaf stays read-only, the store a bus error.
+            return FaultResult::BusError;
         }
         let guard = mapped.map_writable();
         debug_assert!(mapped.page().writable_maps() > 0, "a shared PTE made writable uncounted");
@@ -2224,6 +2250,43 @@ crate::ktest!(
         kassert!(file_vm_leaf(&space, base + 2 * P).is_none());
         kassert_eq!(space.handle_page_fault(base + 2 * P, 0), FaultResult::Resolved);
         kassert!(file_vm_leaf(&space, base + 2 * P).is_some_and(|m| m.shared));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn file_vm_a_volume_gone_read_only_takes_no_store_through_an_older_mapping() {
+        // #349: a shared writable mapping made while the ext4 volume was
+        // writable, the volume then errored (a failed writeback): a store
+        // fault on a page never touched, and one promoting a page mapped
+        // read-only by a read, are bus errors (the leaf stays as it was),
+        // and `mprotect` can't add write access to the mapping (`EACCES`).
+        // A read still maps the page.
+        use crate::vfs::page_cache::ktest_files::Ext4Volume;
+        use crate::{kassert, kassert_eq};
+        const P: u64 = PAGE_SIZE;
+        let vol = Ext4Volume::new(359)?;
+        let data = ktest_files::pattern(3 * P as usize, 17);
+        let f = ktest_files::file(&vol.root, "older.bin", &data)?;
+        f.sync(false).map_err(|_| "sync")?;
+        let space = AddressSpace::new().map_err(|_| "AddressSpace::new")?;
+        let base = space
+            .mmap_file(MapPlace::Hint(None), 3 * P, RW, file_vm_open(&f)?, 0, Sharing::Shared)
+            .map_err(|_| "map")?;
+        kassert_eq!(space.handle_page_fault(base + P, 0), FaultResult::Resolved); // read-only leaf
+        // The volume errors: a dirty page's writeback fails.
+        kassert_eq!(f.write_at(0, b"dirty").map_err(|_| "write")?, 5);
+        vol.fail_writes(true);
+        kassert!(f.sync(false).is_err());
+        vol.fail_writes(false);
+        kassert!(crate::vfs::page_cache::mapped_read_only(&*f));
+        kassert_eq!(space.handle_page_fault(base + 2 * P, 1 << 1), FaultResult::BusError); // untouched
+        kassert!(file_vm_leaf(&space, base + 2 * P).is_none());
+        kassert_eq!(space.handle_page_fault(base + P, 1 << 1), FaultResult::BusError); // promotion
+        kassert!(file_vm_leaf(&space, base + P).is_some_and(|m| m.shared));
+        kassert!(matches!(space.mprotect(base, 3 * P, RW), Err(UserVmError::Vm(VmError::Access))));
+        kassert!(space.mprotect(base, 3 * P, Prot::READ).is_ok());
+        kassert_eq!(space.handle_page_fault(base + 2 * P, 0), FaultResult::Resolved);
         Ok(())
     }
 );

@@ -553,7 +553,9 @@ crate::ktest!(
             kassert_eq!(sys_fsync(fd), 0);
             copy_to_user(base, b"YY").map_err(|_| "copy data")?;
             kassert_eq!(sys_pwrite64(fd, at::reg(base), 2, 4096), 2);
-            // Twice: one warning for the streak (test_ktest pins the count).
+            // Twice: one warning (test_ktest pins the count), since the
+            // first sync's failure made the volume read-only and the second
+            // writes nothing (#349).
             vol.fail_syncs(true);
             let failed = (sys_fsync(fd), sys_fdatasync(fd));
             vol.fail_syncs(false);

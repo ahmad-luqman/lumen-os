@@ -652,6 +652,8 @@ fn the_first_device_failure_stops_writeback_when_asked() {
     assert_eq!(cache.read_at(3 * BLOCK_SIZE as u64, &mut buf), Err(BlockError::Io));
     assert!(cache.writeback_stopped() && !cache.is_frozen());
     assert_eq!(cache.writeback_failures(), 1);
+    assert_eq!(cache.first_failure(), Some(BlockError::Io));
+    cache.device().seed(5 * BLOCK_SIZE, &[0x55; 4]);
     cache.device().clear_logs();
     let before = cache.device().volatile_snapshot();
     // Block 0 would have been the victim again: now only the clean block 2 goes.
@@ -659,9 +661,17 @@ fn the_first_device_failure_stops_writeback_when_asked() {
     cache.write_at(2 + BLOCK_SIZE as u64, &[0x33; 4]).unwrap(); // still taken
     assert_eq!(cache.sync(), Err(BlockError::ReadOnly));
     assert_eq!(cache.flush_blocks(&[0, 1]), Err(BlockError::ReadOnly));
-    // Block 3 dirtied too: every slot is dirty, so a miss can't be served.
+    // Block 3 dirtied too: every slot is dirty, so a miss is read straight
+    // from the device, uncached (the device holds the block: it isn't
+    // cached), and a cached block still reads from the cache.
     cache.write_at(3 * BLOCK_SIZE as u64, &[0x44; 4]).unwrap();
-    assert_eq!(cache.read_at(5 * BLOCK_SIZE as u64, &mut buf), Err(BlockError::CacheFull));
+    cache.read_at(5 * BLOCK_SIZE as u64, &mut buf).unwrap();
+    assert_eq!(buf[..4], [0x55; 4]);
+    assert_eq!(cache.stats().cached, 3);
+    cache.read_at(3 * BLOCK_SIZE as u64, &mut buf).unwrap();
+    assert_eq!(buf[..4], [0x44; 4]);
+    // A pin can't be served that way: it needs a slot.
+    assert_eq!(cache.pin(6).err(), Some(BlockError::CacheFull));
     assert!(cache.device().write_log().is_empty());
     assert_eq!(cache.device().flush_calls(), 0);
     assert_eq!(cache.device().volatile_snapshot(), before);
@@ -679,13 +689,16 @@ fn the_first_device_failure_stops_writeback_when_asked() {
     cache.write_at(0, &[0x66; 16]).unwrap();
     assert_eq!(cache.sync(), Err(BlockError::ReadOnly));
 
-    // Without asking, a failed flush is counted and the next sync retries.
+    // Without asking, a failed flush is counted and the next sync retries;
+    // the first failure is kept all the same.
     let cache = BlockCache::new(MemBlockDevice::new(512, 64), 3).unwrap();
+    assert_eq!(cache.first_failure(), None);
     cache.write_at(0, &[0x77; 16]).unwrap();
-    cache.device().inject_flush_error(BlockError::Io);
-    assert_eq!(cache.sync(), Err(BlockError::Io));
+    cache.device().inject_flush_error(BlockError::Timeout);
+    assert_eq!(cache.sync(), Err(BlockError::Timeout));
     assert_eq!(cache.writeback_failures(), 1);
     assert!(!cache.writeback_stopped());
     cache.sync().unwrap();
     assert_eq!(cache.device().durable_snapshot()[..16], [0x77; 16]);
+    assert_eq!(cache.first_failure(), Some(BlockError::Timeout));
 }
