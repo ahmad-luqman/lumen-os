@@ -5945,6 +5945,297 @@ crate::ktest!(
     }
 );
 
+/// The renames the read-fault and put-back sweeps fail, each from `a/s`
+/// into `b`: the kind's name, whether the source is a directory, the name
+/// it goes to in `b` (`t`: there is a target there, of the source's type),
+/// and whether it is an exchange.
+#[cfg(feature = "ktest")]
+const SWEPT_RENAMES: [(&str, bool, &[u8], bool); 6] = [
+    ("move", false, b"s", false),
+    ("movedir", true, b"s", false),
+    ("exchange", false, b"t", true),
+    ("exchangedir", true, b"t", true),
+    ("over", false, b"t", false),
+    ("overdir", true, b"t", false),
+];
+
+/// An image with directories `a` and `b`, `a/s` and (when `target`) `b/t`:
+/// files holding `SRC` and `DST`, or directories, `a/s` holding a file
+/// `inner` (a target directory must be empty).
+#[cfg(feature = "ktest")]
+fn swept_rename_image(is_dir: bool, target: bool, minor: u32) -> Result<Vec<u8>, &'static str> {
+    use self::ktest_util::*;
+    let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), minor)?;
+    let a = m.root.mkdir(b"a", 0o755).map_err(|_| "mkdir a")?;
+    let b = m.root.mkdir(b"b", 0o755).map_err(|_| "mkdir b")?;
+    let mut keep = Vec::new();
+    let file = |dir: &Arc<dyn VfsInode>, name: &[u8], data: &[u8]| -> Result<Arc<dyn VfsInode>, &'static str> {
+        let f = dir.create(name, 0o644).map_err(|_| "create")?;
+        crate::kassert_eq!(f.write_at(0, data).map_err(|_| "write")?, data.len());
+        Ok(f)
+    };
+    if is_dir {
+        let s = a.mkdir(b"s", 0o755).map_err(|_| "mkdir s")?;
+        keep.push(file(&s, b"inner", SWEPT_SRC)?);
+        keep.push(s);
+        if target {
+            keep.push(b.mkdir(b"t", 0o755).map_err(|_| "mkdir t")?);
+        }
+    } else {
+        keep.push(file(&a, b"s", SWEPT_SRC)?);
+        if target {
+            keep.push(file(&b, b"t", SWEPT_DST)?);
+        }
+    }
+    m.fs.sync().map_err(|_| "sync")?;
+    drop((keep, a, b));
+    image(&m)
+}
+
+#[cfg(feature = "ktest")]
+const SWEPT_SRC: &[u8] = b"SOURCE";
+#[cfg(feature = "ktest")]
+const SWEPT_DST: &[u8] = b"TARGET-DATA";
+
+/// Whether `inode` is the swept rename's source (`SRC`, or a directory
+/// holding it as `inner`) or target (`DST`, or an empty directory).
+#[cfg(feature = "ktest")]
+fn swept_holds(inode: &Arc<dyn VfsInode>, source: bool) -> Result<bool, &'static str> {
+    use self::ktest_util::read_all;
+    Ok(match (inode.inode_type() == InodeType::Dir, source) {
+        (true, true) => read_all(&inode.lookup(b"inner").map_err(|_| "inner")?)? == SWEPT_SRC,
+        (true, false) => inode.lookup(b"inner").is_err(),
+        (false, true) => read_all(inode)? == SWEPT_SRC,
+        (false, false) => read_all(inode)? == SWEPT_DST,
+    })
+}
+
+crate::ktest!(
+    fn ext4_failed_rename_that_cant_read_back_keeps_every_entry() {
+        // Fail each write of a rename once, with reads failing after it:
+        // every read, or only the blocks past the inode table (directories
+        // and data), so the undo can't read back which entries exist (the
+        // read-failure arms of the exchange's and the move's undo, and of
+        // a replaced target's retirement). For each kind of
+        // `SWEPT_RENAMES`:
+        // - a rename that didn't complete reported an error;
+        // - each name left holds its inode's data, and an inode left with
+        //   no name (an undo that couldn't read its entries back, logged)
+        //   is still allocated, for e2fsck, unless it is a target the
+        //   source replaced;
+        // - each count in memory is at least the entries on disk (a count
+        //   too low frees an inode still named);
+        // - every name then comes off, and while another name still has
+        //   an inode, a new file never gets its number.
+        // Known exception (#322): a move whose unlink failed with its old
+        // directory unreadable keeps the source at both names with too low
+        // a count; there, the source's and its new parent's counts and the
+        // source's removal aren't checked.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let quota_before = page_cache::DETACHED_QUOTA.used_pages();
+        let past_itable = ROOT_DIR_BLOCK_4K * 4096;
+        for (kind, is_dir, dst_name, exchange) in SWEPT_RENAMES {
+            let target = dst_name == b"t";
+            let img = swept_rename_image(is_dir, target, 254)?;
+            let flags = RenameFlags(if exchange { RenameFlags::EXCHANGE } else { 0 });
+            for all_reads in [true, false] {
+                let (mut k, mut errs, mut nameless, mut known) = (1, 0, 0, 0);
+                loop {
+                    let m = mount(img.clone(), 254)?;
+                    let a = m.root.lookup(b"a").map_err(|_| "a")?;
+                    let b = m.root.lookup(b"b").map_err(|_| "b")?;
+                    let s = a.lookup(b"s").map_err(|_| "s")?;
+                    let t = if target { Some(b.lookup(b"t").map_err(|_| "t")?) } else { None };
+                    m.cache.arm_write(k);
+                    if all_reads {
+                        m.cache.reads_fail_after_write_fault.store(true, O::Release);
+                    } else {
+                        m.cache.fail_reads_in(past_itable, u64::MAX, 0);
+                        m.cache.range_reads_fail_after_write_fault.store(true, O::Release);
+                    }
+                    let res = a.rename(b"s", &b, dst_name, flags);
+                    let reached = m.cache.writes.load(O::Acquire) >= k;
+                    m.cache.clear();
+                    if !reached {
+                        res.map_err(|_| "rename without a fault")?;
+                        break;
+                    }
+                    errs += usize::from(res.is_err());
+
+                    // Which names hold which inode, on disk.
+                    let ro = remount_ro(&m, 255)?;
+                    let ro_a = ro.root_inode().lookup(b"a").map_err(|_| "ro a")?;
+                    let ro_b = ro.root_inode().lookup(b"b").map_err(|_| "ro b")?;
+                    let at_src = ro_a.lookup(b"s").ok();
+                    let at_dst = ro_b.lookup(dst_name).ok();
+                    let names_of = |ino: u64| {
+                        u32::from(at_src.as_ref().is_some_and(|i| i.ino() == ino))
+                            + u32::from(at_dst.as_ref().is_some_and(|i| i.ino() == ino))
+                    };
+                    let s_names = names_of(s.ino());
+                    let t_at_src = t.as_ref().is_some_and(|t| at_src.as_ref().is_some_and(|i| i.ino() == t.ino()));
+                    let completed = at_dst.as_ref().is_some_and(|i| i.ino() == s.ino())
+                        && if exchange { t_at_src } else { at_src.is_none() };
+                    if !completed {
+                        kassert!(res.is_err());
+                    }
+                    let both = !exchange && s_names == 2; // #322
+                    known += usize::from(both);
+                    for (inode, source) in core::iter::once((&s, true)).chain(t.as_ref().map(|t| (t, false))) {
+                        for at in [&at_src, &at_dst].into_iter().flatten().filter(|i| i.ino() == inode.ino()) {
+                            kassert!(swept_holds(at, source)?);
+                        }
+                        if names_of(inode.ino()) == 0 && (source || exchange || !completed) {
+                            nameless += 1;
+                            let (mode, links) =
+                                raw_mode_and_links(&ro, u32::try_from(inode.ino()).map_err(|_| "ino")?)?;
+                            kassert!(mode != 0 && links > 0);
+                        }
+                    }
+                    // Counts in memory: never below the entries on disk.
+                    let dir_extra = u32::from(is_dir);
+                    let subdirs = |at: &Option<Arc<dyn VfsInode>>| {
+                        u32::from(at.as_ref().is_some_and(|i| i.inode_type() == InodeType::Dir))
+                    };
+                    if !both {
+                        kassert!(s.stat().map_err(|_| "stat s")?.nlink >= s_names + dir_extra);
+                        kassert!(b.stat().map_err(|_| "stat b")?.nlink >= 2 + subdirs(&at_dst));
+                    }
+                    if let Some(t) = &t {
+                        let t_names = names_of(t.ino());
+                        if t_names > 0 {
+                            kassert!(t.stat().map_err(|_| "stat t")?.nlink >= t_names + dir_extra);
+                        }
+                    }
+                    kassert!(a.stat().map_err(|_| "stat a")?.nlink >= 2 + subdirs(&at_src));
+                    drop((ro_a, ro_b, at_src, at_dst, ro));
+
+                    // Every name comes off; while another still names an
+                    // inode, a new file doesn't get its number.
+                    let cleared = if both { t.as_ref() } else { Some(&s) };
+                    for inode in cleared.into_iter().chain(t.as_ref().filter(|_| !both)) {
+                        let names: Vec<(&Arc<dyn VfsInode>, &[u8])> = [(&a, &b"s"[..]), (&b, dst_name)]
+                            .into_iter()
+                            .filter(|(dir, name)| dir.lookup(name).is_ok_and(|i| i.ino() == inode.ino()))
+                            .collect();
+                        for (i, (dir, name)) in names.iter().enumerate() {
+                            if is_dir {
+                                let _ = dir.lookup(name).map_err(|_| "lookup")?.unlink(b"inner");
+                                dir.rmdir(name).map_err(|_| "rmdir a name")?;
+                            } else {
+                                dir.unlink(name).map_err(|_| "unlink a name")?;
+                            }
+                            if i + 1 < names.len() {
+                                let canary = m.root.create(b"canary", 0o644).map_err(|_| "canary")?;
+                                kassert!(canary.ino() != inode.ino());
+                                m.root.unlink(b"canary").map_err(|_| "unlink canary")?;
+                            }
+                        }
+                    }
+                    drop((s, t, a, b, m));
+                    kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+                    k += 1;
+                }
+                crate::ktest::diag(format_args!(
+                    "{kind}, {}: {} writes, {errs} failed, {nameless} inodes left nameless, {known} #322",
+                    if all_reads { "every read failing" } else { "reads past the inode table failing" },
+                    k - 1
+                ));
+                kassert!(errs >= 1);
+            }
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated() {
+        // A rename over a target (a file, a directory) between directories,
+        // with two writes failing (the second within six of the first) or
+        // every write from one on: when the move fails and so does putting
+        // the target back, the target has no name but keeps its inode, its
+        // data and its count (for e2fsck's lost+found; logged), nothing is
+        // freed, the source stays where it was, and the rename reported an
+        // error.
+        // Otherwise the target is back at its name or the source took it.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let quota_before = page_cache::DETACHED_QUOTA.used_pages();
+        for (kind, is_dir) in [("over", false), ("overdir", true)] {
+            let img = swept_rename_image(is_dir, true, 256)?;
+            let total = {
+                let m = mount(img.clone(), 256)?;
+                let (a, b) = (m.root.lookup(b"a").map_err(|_| "a")?, m.root.lookup(b"b").map_err(|_| "b")?);
+                m.cache.arm_write(0);
+                a.rename(b"s", &b, b"t", RenameFlags(0)).map_err(|_| "measure")?;
+                m.cache.writes.load(O::Acquire)
+            };
+            let faults = (1..=total)
+                .flat_map(|c1| (c1 + 1..=c1 + 6).map(move |c2| (c1, Some(c2))))
+                .chain((1..=total).map(|k| (k, None)));
+            let (mut orphaned, mut kept, mut landed) = (0, 0, 0);
+            for (c1, c2) in faults {
+                let m = mount(img.clone(), 256)?;
+                let (a, b) = (m.root.lookup(b"a").map_err(|_| "a")?, m.root.lookup(b"b").map_err(|_| "b")?);
+                let s = a.lookup(b"s").map_err(|_| "s")?;
+                let t = b.lookup(b"t").map_err(|_| "t")?;
+                let t_links = t.stat().map_err(|_| "stat t")?.nlink;
+                let before = (free_inodes(&m.fs), free_blocks(&m.fs));
+                match c2 {
+                    Some(c2) => m.cache.arm_write_pair(c1, c2),
+                    None => m.cache.arm_write_from(c1),
+                }
+                let res = a.rename(b"s", &b, b"t", RenameFlags(0));
+                m.cache.clear();
+                let ro = remount_ro(&m, 257)?;
+                let ro_a = ro.root_inode().lookup(b"a").map_err(|_| "ro a")?;
+                let ro_b = ro.root_inode().lookup(b"b").map_err(|_| "ro b")?;
+                let src_kept = ro_a.lookup(b"s").is_ok_and(|i| i.ino() == s.ino());
+                match ro_b.lookup(b"t") {
+                    Ok(at) if at.ino() == s.ino() && !src_kept => {
+                        landed += 1;
+                        kassert!(swept_holds(&at, true)?);
+                        kassert!(ro_a.lookup(b"s").is_err());
+                    }
+                    Ok(at) if at.ino() == t.ino() => {
+                        kept += 1;
+                        kassert!(res.is_err());
+                        kassert!(swept_holds(&at, false)?);
+                        kassert_eq!(ro_a.lookup(b"s").map_err(|_| "ro s")?.ino(), s.ino());
+                    }
+                    // The move failed and so did the put-back: the source
+                    // where it was (and at the target's name too when the
+                    // move's undo failed as well).
+                    at => {
+                        orphaned += 1;
+                        kassert!(res.is_err());
+                        kassert!(at.as_ref().map_or(true, |at| at.ino() == s.ino() && src_kept));
+                        let at = ro_a.lookup(b"s").map_err(|_| "ro s")?;
+                        kassert_eq!(at.ino(), s.ino());
+                        kassert!(swept_holds(&at, true)?);
+                        let (mode, links) = raw_mode_and_links(&ro, u32::try_from(t.ino()).map_err(|_| "ino")?)?;
+                        kassert!(mode != 0 && links > 0);
+                        kassert_eq!((free_inodes(&ro), free_blocks(&ro)), before);
+                        kassert!(!t.is_detached());
+                        kassert_eq!(t.stat().map_err(|_| "stat t")?.nlink, t_links);
+                        kassert!(swept_holds(&t, false)?);
+                    }
+                }
+                drop((s, t, a, b, ro_a, ro_b, ro, m));
+                kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+            }
+            crate::ktest::diag(format_args!(
+                "{kind}: {total} writes; target orphaned {orphaned}, kept {kept}, replaced {landed}"
+            ));
+            kassert!(orphaned >= 1 && kept >= 1 && landed >= 1);
+        }
+        Ok(())
+    }
+);
+
 crate::ktest!(
     fn ext4_unlink_restores_an_inline_symlink_when_the_directory_cant_be_read_back() {
         // Fail each write of the unlink once, with every read failing after

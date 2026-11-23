@@ -1165,12 +1165,14 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
         m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default());
         m.cache.arm_write(0);
-        kassert!(res.is_err() || res.is_ok());
 
+        // Rolled back or left at both names: an error. Moved: either (an
+        // error after the move landed is reported).
         let old_res = resolve_path(&m.tables, None, b"/sd/f", rf);
         let new_res = resolve_path(&m.tables, None, b"/dd/f", rf);
         match (old_res, new_res) {
             (Ok(_), Err(VfsError::NoEnt)) => {
+                kassert!(res.is_err());
                 kassert!(!f.is_detached());
                 kassert_eq!(f.stat().map_err(|_| "stat rolled back f")?.nlink, 1);
                 kassert!(m.fs.lookup_live_by_lock_id(f.lock_id()).is_some());
@@ -1186,6 +1188,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
                 kassert!(f.is_detached());
             }
             (Ok(_), Ok(n)) => {
+                kassert!(res.is_err());
                 kassert!(!f.is_detached());
                 kassert_eq!(n.inode.lock_id(), f.lock_id());
                 kassert!(f.stat().map_err(|_| "stat dual f")?.nlink >= 2);
@@ -1246,6 +1249,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
 
         match (resolve_path(&m.tables, None, b"/sd/sub", rf), resolve_path(&m.tables, None, b"/dd/sub", rf)) {
             (Ok(_), Err(VfsError::NoEnt)) => {
+                kassert!(res.is_err());
                 unlink_at(&m.tables, None, b"/sd/sub", true).map_err(|_| "rmdir rolled back sub")?;
             }
             (Err(VfsError::NoEnt), Ok(_)) => {
@@ -1266,6 +1270,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
                 unlink_at(&m.tables, None, b"/dd/sub", true).map_err(|_| "rmdir moved sub")?;
             }
             (Ok(_), Ok(_)) => {
+                kassert!(res.is_err());
                 kassert!(sub.stat().map_err(|_| "stat dual sub")?.nlink >= 3);
             }
             _ => return Err("unexpected dir rename step2 state"),
@@ -2176,6 +2181,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         let ro_fs = mount_ro_image(snap_f.clone(), 67)?;
         ro_fs.root_inode().lookup(b"sd").and_then(|d| d.lookup(b"f")).map_err(|_| "ro /sd/f")?.ino()
     };
+    let mut dual = 0;
     for &use_from in &[false, true] {
         let m = mount(snap_f.clone(), 68)?;
         if use_from {
@@ -2186,6 +2192,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         let _ = rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default());
         m.cache.arm_write(0);
         if resolve_path(&m.tables, None, b"/sd/f", rf).is_ok() && resolve_path(&m.tables, None, b"/dd/f", rf).is_ok() {
+            dual += 1;
             unlink_at(&m.tables, None, b"/sd/f", false).map_err(|_| "cold s2 unlink /sd/f")?;
             let dd_f = resolve_path(&m.tables, None, b"/dd/f", rf).map_err(|_| "cold s2 resolve /dd/f")?.inode;
             kassert_eq!(dd_f.ino(), snap_f_orig_ino);
@@ -2206,6 +2213,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         drop(m);
         kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
     }
+    kassert!(dual >= 1); // the state this part is about was reached
 
     Ok(())
 }

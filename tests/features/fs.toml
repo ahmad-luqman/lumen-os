@@ -116,6 +116,14 @@ tests = [
 ]
 
 [[feature]]
+name = "A failed ext4 rename whose undo can't read its entries back (every read, or every read past the inode table, failing after each write in turn; a move, an exchange and a rename over a target, of files and of directories) reports an error, keeps each name's data, leaves an inode it couldn't put back allocated for e2fsck, and keeps no count in memory below the entries on disk, except for a move's source left at both names (#322); a rename over a target whose put-back fails too (two failed writes, or every write from one on) leaves the target nameless but allocated with its data and count, frees nothing, and reports an error"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_failed_rename_that_cant_read_back_keeps_every_entry",
+    "ktest:lumen_kernel::vfs::ext4::ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated",
+]
+
+[[feature]]
 name = "msync(MS_SYNC) puts a ring-3 MAP_SHARED mapping's stores on the disk (#255): the shell exiting without a sync after it, the ext4 image passes the host's e2fsck -fn and the next boot reads the stores back"
 milestone = "M7"
 tests = [

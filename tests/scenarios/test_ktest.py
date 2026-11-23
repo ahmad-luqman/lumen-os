@@ -212,6 +212,18 @@ VFS_SWEEP_LINES = (
         rf"ERROR vfs: ext4 {_DEV} directory \d+: freeing inode \d+, replaced by a rename, failed: \w+; "
         r"run e2fsck"
     ),
+    # A rename's target that couldn't be taken out, its directory unreadable
+    # (ext4_failed_rename_that_cant_read_back_keeps_every_entry).
+    (
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: taking rename target inode \d+ out failed and the directory "
+        r"doesn't read back; assuming its entry is still there; run e2fsck"
+    ),
+    # A rename's target put back after a failed move, the put-back failing
+    # too (ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated).
+    (
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: putting rename target inode \d+ back after a failed move "
+        r"failed: \w+; its data is intact; run e2fsck"
+    ),
 )
 VFS_EXACT_LINES = {
     # page_quota_release_saturates_and_detached_quota_reports_nospc
