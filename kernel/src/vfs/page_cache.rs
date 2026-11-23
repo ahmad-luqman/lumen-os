@@ -201,6 +201,11 @@ impl QuotaCounter {
     pub fn used_bytes(&self) -> usize {
         self.used_bytes.load(Ordering::Acquire)
     }
+
+    /// The most that may be reserved at once.
+    pub const fn limit_bytes(&self) -> usize {
+        self.limit_bytes
+    }
 }
 
 /// `name`, the mount if one, and the limit: `tmpfs 0:2 (33554432 bytes)`.

@@ -274,21 +274,33 @@ pub fn init() {
     info!(target: "vfs", "mounted / ({}, {}){others}", root_fs.name(), if root_ro { "ro" } else { "rw" });
 }
 
-/// Build `mount`'s records table for shell rendering and pipelines.
+/// Build `mount`'s records table for shell rendering and pipelines: each
+/// mount's target, filesystem, device and mode, and a tmpfs mount's quota
+/// (`used` and `limit`, in bytes; `-` for any other filesystem), so an
+/// `ENOSPC` on `/tmp` can be told apart from a leaked charge (#324).
 pub fn mount_table() -> pipe::Table {
-    const COLUMNS: [Column; 4] = [
+    const COLUMNS: [Column; 6] = [
         Column::new("target", Kind::Text, Align::Left, 6),
         Column::new("fs", Kind::Text, Align::Left, 6),
         Column::new("dev", Kind::Text, Align::Left, 5),
         Column::new("mode", Kind::Text, Align::Left, 4),
+        Column::new("used", Kind::Int, Align::Right, 4),
+        Column::new("limit", Kind::Int, Align::Right, 5),
     ];
+    // The mounts' filesystems, matched to `list_mounts`' rows by device
+    // (each mount's is its own); both are snapshots, taken under Lock 9
+    // and used after it is released.
+    let filesystems = TABLES.snapshot_filesystems();
     let mut t = pipe::Table::new(&COLUMNS);
     for m in list_mounts() {
+        let quota = filesystems.iter().find(|fs| fs.dev_id() == m.dev_id).and_then(|fs| tmpfs::quota_use(fs.as_ref()));
         t.push(vec![
             Value::Text(m.mount_path),
             sysinfo::text(m.fs_name),
             Value::Text(format!("{}", m.dev_id)),
             sysinfo::text(if m.read_only { "ro" } else { "rw" }),
+            quota.map_or(sysinfo::DASH, |q| sysinfo::int(q.used_bytes)),
+            quota.map_or(sysinfo::DASH, |q| sysinfo::int(q.limit_bytes)),
         ]);
     }
     t

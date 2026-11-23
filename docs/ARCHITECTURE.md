@@ -5312,8 +5312,10 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
     Option<&dyn Any>`, a default trait method returning `None`, overridden
     by `Ext4Inode` and `TmpfsInode` to return themselves; `mmap_page`
-    downcasts. It exists for `mmap_page` alone, so another cached
-    filesystem that overrides it also needs its own branch there. A
+    downcasts. It exists for `mmap_page`, so another cached
+    filesystem that overrides it also needs its own branch there (and,
+    since #324, for `tmpfs::quota_use`, which downcasts a mount's root
+    inode to reach its quota for the shell's `mount`). A
     kernel-side registry was the alternative, but `tmpfs` has none, an
     unlinked (detached) file isn't reachable by walking a tree, and the
     `ext4` one costs a scan per fault.
@@ -6180,7 +6182,12 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 - **Shell commands:**
   - `blk`: lists bound block devices (PCI addr, capacity, read-only, flush
     support, `BlockCache` hit/miss/dirty stats).
-  - `mount`: lists active mounts as records (target, fs, dev, mode `ro`/`rw`).
+  - `mount`: lists active mounts as records (target, fs, dev, mode `ro`/`rw`,
+    and `used` and `limit`: a `tmpfs` mount's quota in bytes, `-` for any
+    other filesystem; #324), so an `ENOSPC` on `/tmp` can be told apart
+    from a leaked charge. `tmpfs::quota_use` reads them from a `dyn
+    FileSystem` through its root inode's `VfsInode::as_any`, matched to
+    `list_mounts`' rows by device; `/proc/mounts` keeps Linux's columns.
   - `sync`: flushes every mounted filesystem (each flushing its own live
     inodes, then its block cache), continuing past a failing inode or
     filesystem and reporting the first error (each failure logged once at

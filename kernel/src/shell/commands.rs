@@ -282,7 +282,7 @@ pub static COMMANDS: Table<Run> = Table(&[
         name: "mount",
         args: &[],
         usage: "",
-        about: "active VFS mounts (target, filesystem, dev, mode)",
+        about: "active VFS mounts (target, filesystem, dev, mode; a tmpfs quota's used and limit bytes)",
         run: crate::vfs::mount_command,
     },
     Command {
