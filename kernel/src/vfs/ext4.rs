@@ -2671,16 +2671,11 @@ struct MoveEntry<'n> {
 }
 
 /// `disk`, a count read from disk, with `ino`'s bounds applied; with none
-/// read, what the bounds alone say (`None` without any).
+/// read, what the bounds alone say ([`NlinkBounds::assumed`]).
 fn clamp_to_bounds(inner: &Ext4FsInner, ino: NonZeroU32, disk: Option<u32>) -> Option<u32> {
     match disk {
         Some(d) => Some(inner.apply_nlink_bounds(ino.get(), d)),
-        None => match (inner.nlink_floor(ino.get()), inner.nlink_ceiling(ino.get())) {
-            (0, None) => None,
-            (0, Some(c)) => Some(c),
-            (f, Some(c)) => Some(f.min(c.max(f))),
-            (f, None) => Some(f),
-        },
+        None => inner.nlink.assumed(ino.get()),
     }
 }
 

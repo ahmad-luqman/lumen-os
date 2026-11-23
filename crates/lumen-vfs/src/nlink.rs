@@ -225,7 +225,8 @@ mod tests {
             }
         }
 
-        /// Step 2's `clamp_bounds` without a disk count.
+        /// The kernel's `clamp_to_bounds` (step 2's `clamp_bounds` then) without
+        /// a disk count.
         fn assumed(&self, ino: u32) -> Option<u32> {
             match (self.nlink_floor(ino), self.nlink_ceiling(ino)) {
                 (0, None) => None,
