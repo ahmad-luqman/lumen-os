@@ -11,8 +11,10 @@
 //! hence the numbers; `-h 4` gives `é-utf8` the hash `debugfs htree` shows
 //! for it in `kernel/src/vfs/testdata/unsigned-hash.ext4`, made by `e2fsck
 //! -fyD` on an unsigned-hash volume, with that image's seed (the first one
-//! here). ext4plus has no legacy hash (version 0): it refuses such a
-//! directory, signed or not, before #313 and after.
+//! here). ext4plus has no legacy hash (version 0): its hash refuses that
+//! version, signed or not, before #313 and after (checked here), and a
+//! lookup in such a directory fails, which Lumen answers with an unlogged
+//! `EIO` (not checked in the kernel).
 
 use ext4plus::htree_hash;
 
@@ -111,6 +113,15 @@ fn legacy_and_unknown_hash_versions_are_refused_either_way() {
             assert_eq!(htree_hash(alg, "é-utf8".as_bytes(), seed, unsigned), None, "version {alg}");
         }
     }
+}
+
+#[test]
+fn image_seed_is_the_images() {
+    // `s_hash_seed`: four little-endian words at 0xec in the superblock.
+    let image = include_bytes!("../../../kernel/src/vfs/testdata/unsigned-hash.ext4");
+    let at = 1024 + 0xec;
+    let words: Vec<u32> = image[at..at + 16].chunks(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    assert_eq!(words, seed_from_uuid(IMAGE_SEED));
 }
 
 #[test]

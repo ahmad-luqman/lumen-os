@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from lumen_harness import REPO_ROOT
 from lumen_harness.calibration import assert_quiet_boot
 from lumen_harness.gui import confirmed_keys, type_confirmed
 from lumen_harness.klog import unexpected_warnings
@@ -443,36 +444,21 @@ def test_ext4_deletions_and_renames_fsck_clean(boot, tmp_path):
 # kernel/src/vfs/testdata/unsigned-hash.ext4 (tools/ext4-unsigned-hash-image.py):
 # an htree directory `/d` of 80 ASCII names and three with bytes of 0x80 or
 # above, `é-utf8` among them, indexed by the unsigned half-MD4 hash.
-UNSIGNED_HASH_IMAGE = (
-    Path(__file__).resolve().parents[2]
-    / "kernel"
-    / "src"
-    / "vfs"
-    / "testdata"
-    / "unsigned-hash.ext4"
-)
+UNSIGNED_HASH_IMAGE = REPO_ROOT / "kernel" / "src" / "vfs" / "testdata" / "unsigned-hash.ext4"
 # Where the superblock's `s_flags` is in the image.
 S_FLAGS_AT = 1024 + 0x160
 
 
 def htree_volume(dest: Path, alg: str, s_flags: int) -> Path:
     """A copy of UNSIGNED_HASH_IMAGE with `s_flags` and its default hash set,
-    `/d` re-indexed by `e2fsck -fyD` with the hash they say (Linux's own,
-    e2fsprogs' `ext2fs_dirhash`), checked clean, and both read back from the
-    image: `s_flags` and `/d`'s root block's hash version."""
+    `/d` re-indexed by `e2fsck -fyD` with the hash they say (e2fsprogs'
+    `ext2fs_dirhash`), checked clean, and both read back from the image:
+    `s_flags` and `/d`'s root block's hash version."""
     image = dest / f"{alg}-{s_flags}.ext4"
     shutil.copyfile(UNSIGNED_HASH_IMAGE, image)
     _, e2fsck = find_e2fsprogs()
-    tool = e2fsck.parent / "debugfs"
     for request in (f"ssv flags {s_flags}", f"ssv def_hash_version {alg}"):
-        proc = subprocess.run(
-            [str(tool), "-w", "-R", request, str(image)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        errors = [line for line in proc.stderr.splitlines()[1:] if line]  # past the banner
-        assert proc.returncode == 0 and not errors, (request, proc.stderr)
+        debugfs(image, request, write=True)
     proc = subprocess.run([str(e2fsck), "-fyD", str(image)], capture_output=True, check=False)
     assert proc.returncode in (0, 1), proc
     e2fsck_check(image)
@@ -502,7 +488,8 @@ def test_ext4_htree_names_with_high_bytes_fsck_clean(boot, tmp_path, alg, s_flag
     name with bytes of 0x80 or above is looked up, created, renamed into the
     directory (enough of them to split a leaf), made a directory, unlinked
     and removed, and the volume then passes `e2fsck -fn`, which checks each
-    entry's hash against the leaf it sits in, as Linux computes it."""
+    entry's hash against the leaf it sits in, as e2fsprogs computes it. `stat`
+    gives `/d`'s size as it reaches the disk (#357)."""
     disk = htree_volume(tmp_path, alg, s_flags)
     size = dir_size(disk, "d")
     m = shell(boot, devices=Devices(blk_image=disk, rng=True))
@@ -532,16 +519,17 @@ def test_ext4_htree_names_with_high_bytes_fsck_clean(boot, tmp_path, alg, s_flag
     assert run(m, f"vfstest unlink /d/{long(3)}") == "unlink: ok\n"
     assert run(m, "vfstest mkdir /d/ö-gone") == "mkdir: ok\n"
     assert run(m, "vfstest rmdir /d/ö-gone") == "rmdir: ok\n"
+    live = int(stat_fields(m, "/d")["size"])
     assert run(m, "sync") == "sync: ok\n"
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
     m.close()
 
     e2fsck_check(disk)
-    # The directory grew a leaf (read from the disk: the adapter doesn't
-    # refresh a directory's cached size as ext4plus grows it).
+    # The directory grew a leaf, and `stat` said so (#357).
     grew = dir_size(disk, "d")
     assert grew > size, f"/d didn't split a leaf: {size} -> {grew} bytes"
+    assert live == grew, (live, grew)
 
     # A second boot finds them from the disk, by their hashes.
     m2 = shell(boot, devices=Devices(blk_image=disk, rng=True))

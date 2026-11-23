@@ -728,8 +728,9 @@ one is its own PR that updates that doc first.
   columns (`Column`, `Span`: empty, counted, a backlog's gap, offline;
   `COLUMNS`); `replay`, the fixed trace of the frozen view (host-tested).
 - `vendor/ext4plus`: ext4plus 0.1.0-rc.2's crate file with Lumen's fixes
-  on top, each its own commit marked `Lumen (#n)` (`[patch.crates-io]`,
-  out of the workspace; #313: the htree hash's signedness from `s_flags`).
+  on top, each its own commit, its code marked `Lumen (#n)`
+  (`[patch.crates-io]`, out of the workspace; #313: the htree hash's
+  signedness from `s_flags`).
 - `apps/`: the WASM apps (M5), their own cargo workspace (out of the root
   one; every directory but dot ones a member, named after its crate; output
   in `target-apps/`) for `wasm32-unknown-unknown`, `no_std`

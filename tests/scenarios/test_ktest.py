@@ -346,8 +346,9 @@ VFS_EXACT_LINES = {
     ): 2,
     # ext4_an_unsigned_hash_volume_mounts_writable_and_hashes_names_unsigned
     # (#308, #313): the volume with neither hash flag (and dir_index), not the
-    # unsigned or the signed one's; and the one with a journal needing
-    # recovery and the unsigned flag, whose line shows no s_flags.
+    # unsigned, both-flags or signed one's; and the neither-flag one with a
+    # journal needing recovery, which outranks it: its line names the journal
+    # and shows no s_flags.
     (
         rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: its directories may hash names unsigned "
         r"\(dir_index, but neither hash flag in s_flags\), which ext4plus can't write "

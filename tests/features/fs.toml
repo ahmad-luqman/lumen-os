@@ -288,7 +288,7 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4 htree directories hashed signed or unsigned as s_flags says (#313: the vendored ext4plus, vendor/ext4plus, takes the signedness from EXT2_FLAGS_UNSIGNED_HASH; its half-MD4 and TEA hashes, signed and unsigned, agree with e2fsprogs' ext2fs_dirhash on names with bytes of 0x80 or above, including past the first hash block; legacy and unknown hash versions are refused): an unsigned-hash volume mounts writable, warning nothing; every name its htree directory lists, those with bytes of 0x80 or above too, is looked up by its hash alone (no walk; a read error in the leaf the signed hash would pick doesn't touch it); names with such bytes are created (splitting a leaf, whose entries are rehashed), renamed in, made directories, found again from the disk, unlinked and removed; on an htree directory indexed by e2fsck with half-MD4 or TEA, signed or unsigned, the volume then passes e2fsck -fn, which checks every entry's leaf by its hash"
+name = "ext4 htree directories hashed signed or unsigned as s_flags says (#313: the vendored ext4plus, vendor/ext4plus, takes the signedness from EXT2_FLAGS_UNSIGNED_HASH; its half-MD4 and TEA hashes, signed and unsigned, agree with e2fsprogs' ext2fs_dirhash on names with bytes of 0x80 or above, including past the first hash block; that hash refuses legacy and unknown hash versions): an unsigned-hash volume mounts writable, warning nothing; every name its htree directory lists, those with bytes of 0x80 or above too, is looked up by its hash alone (no walk; a read error in the leaf the signed hash would pick doesn't touch it); names with such bytes are created (splitting a leaf, whose entries are rehashed), renamed in, made directories, found again from the disk, unlinked and removed; on an htree directory indexed by e2fsck with half-MD4 or TEA, signed or unsigned, the volume then passes e2fsck -fn, which checks every entry's leaf by its hash"
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
@@ -343,4 +343,12 @@ tests = [
     "scenario:test_fs::test_ext4_unsynced_writes_survive_shutdown",
     "ktest:lumen_kernel::shell::commands::power_commands_sync_once_then_announce",
     "scenario:test_ktest::test_in_kernel_tests_pass",
+]
+
+[[feature]]
+name = "A directory ext4plus grows (an entry that does not fit a linear directory, an htree leaf split) stats the size and blocks its inode on disk has, as a fresh mount does (#357)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_a_directory_grown_by_ext4plus_stats_its_size_on_disk",
+    "scenario:test_fs::test_ext4_htree_names_with_high_bytes_fsck_clean[*]",
 ]

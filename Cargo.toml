@@ -120,8 +120,8 @@ ext4plus = { version = "=0.1.0-rc.2", default-features = false, features = ["syn
 
 # `vendor/ext4plus` is ext4plus 0.1.0-rc.2's crate file unpacked (sha256
 # 6c83a722…, the checksum Cargo.lock had for it), with Lumen's fixes on top,
-# each marked `Lumen (#n)` in its source (#313: the htree hash's signedness
-# taken from the superblock).
+# their code changes marked `Lumen (#n)` in its source (#313: the htree
+# hash's signedness taken from the superblock).
 [patch.crates-io]
 ext4plus = { path = "vendor/ext4plus" }
 

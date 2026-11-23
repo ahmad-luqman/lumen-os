@@ -161,15 +161,17 @@ def e2fsck_check(image: Path, *, e2fsck: Path | None = None) -> None:
         )
 
 
-def debugfs(image: Path, request: str, *, tool: Path | None = None) -> str:
-    """What `debugfs -R <request>` prints for `image`, opened read-only.
-    `debugfs` exits 0 even when it can't open the image or the request
-    fails, so any stderr line but its version banner is an error."""
+def debugfs(image: Path, request: str, *, tool: Path | None = None, write: bool = False) -> str:
+    """What `debugfs -R <request>` prints for `image`, opened read-only
+    (read-write with `write`). `debugfs` exits 0 even when it can't open
+    the image or the request fails, so any stderr line but its version
+    banner is an error."""
     if tool is None:
         _, e2fsck = find_e2fsprogs()
         tool = e2fsck.parent / "debugfs"
+    mode = ["-w"] if write else []
     proc = subprocess.run(
-        [str(tool), "-R", request, str(image)], capture_output=True, text=True, check=False
+        [str(tool), *mode, "-R", request, str(image)], capture_output=True, text=True, check=False
     )
     errors = [line for line in proc.stderr.splitlines() if line and not _DEBUGFS_BANNER.match(line)]
     if proc.returncode != 0 or errors:
