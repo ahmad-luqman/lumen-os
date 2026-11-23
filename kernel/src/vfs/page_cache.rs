@@ -879,7 +879,9 @@ impl PageCache {
     /// or one holding the file's bytes a partial write keeps), which is then
     /// inserted ([`Self::insert_new`]). With `dirty` every page written is
     /// marked dirty, and a new page is refused at the `ext4` hard limit
-    /// ([`Self::admit`]) before `fill` runs. Returns how many bytes were
+    /// ([`Self::admit`]) before `fill` runs (an early answer: the insert
+    /// asks again, so a cache another CPU filled meanwhile still refuses
+    /// the page `fill` made, as a short count). Returns how many bytes were
     /// written: an error (the admission's, `fill`'s or the insert's) only
     /// when it is the first page's, else a short count. `FBig` when the
     /// range ends past `u64::MAX`. The caller holds the inode's Lock 4 and
@@ -1185,7 +1187,7 @@ crate::ktest!(
             (CachePage::new_shared().map_err(|_| "frame")?, CachePage::new_shared().map_err(|_| "frame")?);
         tmp_dirty.set_dirty();
         HARD_LIMIT_WARNED.store(false, Ordering::Release); // a crossing of its own: one warning
-        set_ext4_limits_for_test(Some((usize::MAX, ext4_cached_pages())));
+        set_ext4_limits_for_test(Some((usize::MAX, 0))); // at the limit whatever else the cache holds
         let at_limit = (pc.insert_new(1, Arc::clone(&dirty)), pc.insert_new(2, clean), tmp.insert_new(1, tmp_dirty));
         set_ext4_limits_for_test(None);
         kassert_eq!(at_limit, (Err(VfsError::NoSpc), Ok(()), Ok(())));
@@ -1213,7 +1215,7 @@ crate::ktest!(
         };
         let data = [0x5a; 2 * PAGE_SIZE];
         HARD_LIMIT_WARNED.store(false, Ordering::Release); // one warning, as for the test above
-        set_ext4_limits_for_test(Some((usize::MAX, ext4_cached_pages())));
+        set_ext4_limits_for_test(Some((usize::MAX, 0)));
         let new_page = pc.write_from(PAGE_SIZE as u64, &data[..10], true, &mut fill);
         let spanning = pc.write_from(PAGE_SIZE as u64 - 6, &data[..16], true, &mut fill);
         let clean = pc.write_from(2 * PAGE_SIZE as u64, &data[..10], false, &mut fill);
