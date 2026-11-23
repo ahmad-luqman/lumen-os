@@ -966,8 +966,9 @@ impl Drop for DetachedQuotaGuard {
 /// Soft global reclaim for `ext4` `PageCache` frames when above the soft
 /// limit ([`EXT4_SOFT_LIMIT_PAGES`]).
 ///
-/// The caller holds no lock at level 3 or above (§9: reclaim takes Lock 9's
-/// snapshot, then 4 -> 5 -> 6 -> 7 -> 8), with interrupts enabled.
+/// The caller holds no lock at level 3 or above (§9: reclaim copies each
+/// `ext4` filesystem's live inodes under its Lock 6, released, then takes
+/// 4 -> 5 -> 6 -> 7 -> 8 per inode), with interrupts enabled.
 pub fn maybe_reclaim_ext4_pages() {
     let soft = ext4_soft_limit();
     if EXT4_CACHED_PAGES.load(Ordering::Relaxed) <= soft {
@@ -988,18 +989,15 @@ pub fn reclaim_ext4_to_target(target_pages: usize) {
         "reclaim_ext4_to_target called with interrupts off"
     );
 
-    let inodes = super::snapshot_cached_inodes();
+    let inodes = super::snapshot_live_ext4_inodes();
     // Pass 1: evict clean unpinned ext4 pages (Lock 4(B) -> Lock 5(B)).
     for inode in &inodes {
         let cur = EXT4_CACHED_PAGES.load(Ordering::Relaxed);
         if cur <= target_pages {
             return;
         }
-        if inode.is_detached() {
-            continue;
-        }
         let excess = cur - target_pages;
-        super::reclaim_ext4_inode_clean(inode, excess);
+        inode.reclaim_clean_pages(excess);
     }
 
     // Pass 2: if still over target, flush dirty ext4 pages and evict if unpinned.
@@ -1008,11 +1006,8 @@ pub fn reclaim_ext4_to_target(target_pages: usize) {
         if cur <= target_pages {
             return;
         }
-        if inode.is_detached() {
-            continue;
-        }
         let excess = cur - target_pages;
-        super::reclaim_ext4_inode_dirty(inode, excess);
+        inode.reclaim_dirty_pages(excess);
     }
 }
 

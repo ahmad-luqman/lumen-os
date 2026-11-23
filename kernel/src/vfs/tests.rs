@@ -1,13 +1,14 @@
-//! The vfs ktests: the `ext4plus` smoke check, the ext4 adapter over the
 //! The ktests of `vfs/mod.rs`'s code (`vfs/ext4.rs` and `vfs/page_cache.rs`
 //! keep their own): the `ext4plus` smoke check, the ext4 adapter over the
 //! page cache, `/tmp`, `/dev` and `/proc`, tmpfs's quota, `sync`, global
 //! reclaim and recovery from injected I/O errors.
 //!
 //! `MemBlkDev` stays in `vfs/mod.rs`: the `vfs/ext4.rs` and
-//! `vfs/page_cache.rs` ktests use it too.
+//! `vfs/page_cache.rs` ktests use it too. The ext4 mounts come from
+//! `ext4::ktest_util` (`Mnt`, `mount`, `remount_ro`).
 
 use super::*;
+use ext4::ktest_util::{Mnt, mount, mount_ro_image, remount_ro};
 use lumen_vfs::OpenGuard;
 
 crate::ktest!(
@@ -26,15 +27,7 @@ crate::ktest!(
         use lumen_bcache::BlockCache;
         use lumen_vfs::OpenFile;
 
-        let img = build_minimal_ext4_image_blocks(256);
-        let mem_dev = MemBlkDev::new(img, false);
-        let bcache: Arc<dyn ext4::BlockCacheBackend> =
-            Arc::new(SleepMutex::new(BlockCache::new(mem_dev.clone(), 64).map_err(|_| "bcache init")?));
-        let fs =
-            ext4::Ext4FileSystem::mount(Arc::clone(&bcache), DevId::makedev(0, 10), false).map_err(|_| "ext4 mount")?;
-
-        let tables = KernelVfsTables::new();
-        tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+        let Mnt { cache, tables, .. } = mount(build_minimal_ext4_image_blocks(256), 10)?;
 
         // 1. Write-back PageCache + OpenFile<KernelVfsLock<u64>> + truncate shrink tail zeroing + sync.
         let (f, path_str) = open_inode(
@@ -60,7 +53,7 @@ crate::ktest!(
         payload[..10].copy_from_slice(b"0123456789");
         f.write_at(0, &payload).map_err(|_| "write tail.bin")?;
         f.sync(false).map_err(|_| "sync tail.bin")?;
-        kassert!(mem_dev.0.flushed.load(core::sync::atomic::Ordering::Acquire));
+        kassert!(cache.dev.0.flushed.load(core::sync::atomic::Ordering::Acquire));
 
         // Shrink to 100 (partial page 0) -> tail [100..4096) zeroed on disk too.
         f.truncate(100).map_err(|_| "truncate shrink")?;
@@ -162,10 +155,7 @@ crate::ktest!(
         kassert_eq!(moved_back.inode.inode_type(), InodeType::File);
 
         // Read-only mount check.
-        let ro_dev = MemBlkDev::new(mem_dev.0.data.lock().clone(), true);
-        let ro_bcache: Arc<dyn ext4::BlockCacheBackend> =
-            Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache")?));
-        let ro_fs = ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 11), true).map_err(|_| "ro mount")?;
+        let ro_fs = mount_ro_image(cache.dev_bytes(), 11)?;
         kassert!(ro_fs.read_only());
 
         // Stale unlinked inode with open_count == 0 returns NoEnt (not freed disk reuse).
@@ -305,7 +295,7 @@ crate::ktest!(
 crate::ktest!(
     fn vfs_sync_continues_past_a_failing_inode() {
         use crate::{kassert, kassert_eq};
-        let m = mount_test_ext4(build_minimal_ext4_image_blocks(256), 130)?;
+        let m = mount(build_minimal_ext4_image_blocks(256), 130)?;
         let files = [("sync_a.bin", 0xA1u8), ("sync_b.bin", 0xB2u8)];
         let mut held = Vec::new();
         for (name, byte) in files {
@@ -327,11 +317,11 @@ crate::ktest!(
 
         // The sync's first block write fails, once: the sync reports it, and
         // everything else (the other file, the filesystem) is still flushed.
-        m.fault_cache.arm_write_fail_on(1);
+        m.cache.arm_write(1);
         kassert!(matches!(sync_tables(&m.tables), Err(VfsError::Io)));
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
-        let ro = mount_ro_snapshot(&m, 131)?;
+        let ro = remount_ro(&m, 131)?;
         let root = ro.root_inode();
         for (name, byte) in files {
             let f = root.lookup(name.as_bytes()).map_err(|_| "ro lookup sync file")?;
@@ -344,21 +334,15 @@ crate::ktest!(
 crate::ktest!(
     fn page_cache_global_reclaim_writes_back_and_evicts() {
         use crate::{kassert, kassert_eq};
-        use lumen_bcache::BlockCache;
 
-        // The ext4 page count is global: pages other ktests left cached, in
-        // caches that `snapshot_cached_inodes` doesn't see, count too, so
-        // every check is against the count before this test's mount. It
-        // assumes `base` holds only such pages, out of reclaim's reach (the
+        // The ext4 page count is global: pages other ktests left cached, on
+        // filesystems reclaim doesn't see (not in `EXT4_FILESYSTEMS`), count
+        // too, so every check is against the count before this test's mount.
+        // It assumes `base` holds only such pages, out of reclaim's reach (the
         // ktest kernel's root is tmpfs): otherwise reclaim could evict them in
         // place of this test's pages.
         let base = page_cache::ext4_cached_pages();
-        let img = build_minimal_ext4_image_blocks(256);
-        let mem_dev = MemBlkDev::new(img, false);
-        let bcache: Arc<dyn ext4::BlockCacheBackend> =
-            Arc::new(SleepMutex::new(BlockCache::new(mem_dev, 64).map_err(|_| "bcache init")?));
-        let dev = DevId::makedev(0, 99);
-        let fs = ext4::Ext4FileSystem::mount(Arc::clone(&bcache), dev, false).map_err(|_| "ext4 mount")?;
+        let fs = mount(build_minimal_ext4_image_blocks(256), 99)?.fs;
 
         let mp = mkdir_at(&TABLES, None, b"/tmp/reclaim_mnt", 0o755, 0).map_err(|_| "mkdir mnt")?;
         let mp_dev = mp.dev_id();
@@ -426,7 +410,7 @@ crate::ktest!(
             Ok(())
         })();
         let umounted = TABLES.umount(mp_dev, mp_ino).map(drop).map_err(|_| "umount");
-        EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != dev);
+        EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != fs.dev_id());
         let unlinked = unlink_at(&TABLES, None, b"/tmp/reclaim_mnt", true).map(drop).map_err(|_| "rmdir mnt");
         let cleanup = umounted.and(unlinked);
         if let (Err(_), Err(e)) = (&result, &cleanup) {
@@ -435,6 +419,48 @@ crate::ktest!(
             crate::ktest::diag(format_args!("cleanup after the failure failed too: {e}"));
         }
         result.and(cleanup)
+    }
+);
+
+crate::ktest!(
+    fn page_cache_global_reclaim_reaches_inodes_the_vfs_caches_never_held() {
+        // Reclaim walks each registered ext4 filesystem's live inodes, not
+        // the VFS's inode cache: a file made and written through the
+        // filesystem alone, never looked up by path, gives its pages back
+        // too, written back first. Two volumes, so that reclaiming down to
+        // `base` (as in the test above) needs every registered filesystem,
+        // not just one.
+        use crate::{kassert, kassert_eq};
+        use ext4::ktest_util::read_all;
+        let base = page_cache::ext4_cached_pages();
+        let vols = [mount(build_minimal_ext4_image_blocks(256), 98)?, mount(build_minimal_ext4_image_blocks(256), 96)?];
+        for m in &vols {
+            EXT4_FILESYSTEMS.lock().push(Arc::clone(&m.fs));
+        }
+        let result = (|| -> Result<(), &'static str> {
+            let mut files = Vec::new();
+            for (seed, m) in (7..).zip(&vols) {
+                let f = m.root.create(b"f", 0o644).map_err(|_| "create")?;
+                let data = ext4::ktest_util::pattern(4 * page_cache::PAGE_SIZE, seed);
+                kassert_eq!(f.write_at(0, &data).map_err(|_| "write")?, data.len());
+                kassert!(snapshot_cached_inodes().iter().all(|i| i.lock_id() != f.lock_id()));
+                files.push((f, data));
+            }
+            kassert!(page_cache::ext4_cached_pages() >= base + 8);
+            page_cache::reclaim_ext4_to_target(base);
+            kassert!(page_cache::ext4_cached_pages() <= base);
+            for ((m, ro_minor), (f, data)) in vols.iter().zip([97, 88]).zip(&files) {
+                let ro = remount_ro(m, ro_minor)?;
+                let on_disk = ro.root_inode().lookup(b"f").map_err(|_| "ro lookup")?;
+                kassert_eq!(&read_all(&on_disk)?, data);
+                kassert_eq!(&read_all(f)?, data);
+            }
+            Ok(())
+        })();
+        for m in &vols {
+            EXT4_FILESYSTEMS.lock().retain(|e| e.dev_id() != m.fs.dev_id());
+        }
+        result
     }
 );
 
@@ -501,99 +527,12 @@ crate::ktest!(
     }
 );
 
-struct FaultInjectBlockCache {
-    inner: SleepMutex<lumen_bcache::BlockCache<MemBlkDev>>,
-    fail_reads: core::sync::atomic::AtomicBool,
-    fail_writes: core::sync::atomic::AtomicBool,
-    fail_write_on_call: core::sync::atomic::AtomicUsize,
-    fail_write_on_call2: core::sync::atomic::AtomicUsize,
-    fail_write_from_call: core::sync::atomic::AtomicUsize,
-    write_calls: core::sync::atomic::AtomicUsize,
-}
-
-impl FaultInjectBlockCache {
-    fn new(inner: lumen_bcache::BlockCache<MemBlkDev>) -> Self {
-        Self {
-            inner: SleepMutex::new(inner),
-            fail_reads: core::sync::atomic::AtomicBool::new(false),
-            fail_writes: core::sync::atomic::AtomicBool::new(false),
-            fail_write_on_call: core::sync::atomic::AtomicUsize::new(0),
-            fail_write_on_call2: core::sync::atomic::AtomicUsize::new(0),
-            fail_write_from_call: core::sync::atomic::AtomicUsize::new(0),
-            write_calls: core::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    fn arm_write_fail_on(&self, call_num: usize) {
-        self.write_calls.store(0, core::sync::atomic::Ordering::Release);
-        self.fail_write_on_call.store(call_num, core::sync::atomic::Ordering::Release);
-        self.fail_write_on_call2.store(0, core::sync::atomic::Ordering::Release);
-        self.fail_write_from_call.store(0, core::sync::atomic::Ordering::Release);
-    }
-
-    fn arm_write_fail_pair(&self, call_1: usize, call_2: usize) {
-        self.write_calls.store(0, core::sync::atomic::Ordering::Release);
-        self.fail_write_on_call.store(call_1, core::sync::atomic::Ordering::Release);
-        self.fail_write_on_call2.store(call_2, core::sync::atomic::Ordering::Release);
-        self.fail_write_from_call.store(0, core::sync::atomic::Ordering::Release);
-    }
-
-    fn arm_write_fail_from(&self, from_call: usize) {
-        self.write_calls.store(0, core::sync::atomic::Ordering::Release);
-        self.fail_write_on_call.store(0, core::sync::atomic::Ordering::Release);
-        self.fail_write_on_call2.store(0, core::sync::atomic::Ordering::Release);
-        self.fail_write_from_call.store(from_call, core::sync::atomic::Ordering::Release);
-    }
-}
-
-impl ext4::BlockCacheBackend for FaultInjectBlockCache {
-    fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), lumen_bcache::BlockError> {
-        if self.fail_reads.load(core::sync::atomic::Ordering::Acquire) {
-            return Err(lumen_bcache::BlockError::Io);
-        }
-        self.inner.lock().read_at(byte_off, dst)
-    }
-
-    fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), lumen_bcache::BlockError> {
-        if self.fail_writes.load(core::sync::atomic::Ordering::Acquire) {
-            return Err(lumen_bcache::BlockError::Io);
-        }
-        let call_idx = self.write_calls.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
-        let target = self.fail_write_on_call.load(core::sync::atomic::Ordering::Acquire);
-        let target2 = self.fail_write_on_call2.load(core::sync::atomic::Ordering::Acquire);
-        let from_call = self.fail_write_from_call.load(core::sync::atomic::Ordering::Acquire);
-        if (target != 0 && call_idx == target)
-            || (target2 != 0 && call_idx == target2)
-            || (from_call != 0 && call_idx >= from_call)
-        {
-            return Err(lumen_bcache::BlockError::Io);
-        }
-        self.inner.lock().write_at(byte_off, src)
-    }
-
-    fn sync(&self) -> Result<(), lumen_bcache::BlockError> {
-        if self.fail_writes.load(core::sync::atomic::Ordering::Acquire) {
-            return Err(lumen_bcache::BlockError::Io);
-        }
-        self.inner.lock().sync()
-    }
-}
-
 crate::ktest!(
     fn ext4_flush_and_reclaim_preserve_dirty_on_io_error() {
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering;
-        use lumen_bcache::BlockCache;
 
-        let img = build_minimal_ext4_image_blocks(256);
-        let mem_dev = MemBlkDev::new(img, false);
-        let bcache_raw = BlockCache::new(mem_dev.clone(), 64).map_err(|_| "bcache init")?;
-        let fault_cache = Arc::new(FaultInjectBlockCache::new(bcache_raw));
-        let bcache: Arc<dyn ext4::BlockCacheBackend> = Arc::clone(&fault_cache) as Arc<dyn ext4::BlockCacheBackend>;
-        let fs = ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, 13), false).map_err(|_| "ext4 mount")?;
-
-        let tables = KernelVfsTables::new();
-        tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+        let Mnt { cache: fault_cache, fs, tables, .. } = mount(build_minimal_ext4_image_blocks(256), 13)?;
 
         // 1. Create a file and write 2 dirty pages in PageCache without syncing yet.
         let (f, _) = open_inode(
@@ -657,10 +596,7 @@ crate::ktest!(
         drop(w_f);
 
         // 5. Verify persisted bytes on a fresh read-only mount of the backing image.
-        let ro_dev = MemBlkDev::new(mem_dev.0.data.lock().clone(), true);
-        let ro_bcache: Arc<dyn ext4::BlockCacheBackend> =
-            Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache")?));
-        let ro_fs = ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 14), true).map_err(|_| "ro mount")?;
+        let ro_fs = mount_ro_image(fault_cache.dev_bytes(), 14)?;
         let ro_root = ro_fs.root_inode();
         let ro_dirty = ro_root.lookup(b"dirty_err.bin").map_err(|_| "ro lookup dirty_err")?;
         kassert_eq!(read_all_inode(&ro_dirty).map_err(|_| "ro read dirty_err")?, payload);
@@ -675,17 +611,8 @@ crate::ktest!(
     fn ext4_truncate_and_open_unlink_preserve_state_on_io_error() {
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering;
-        use lumen_bcache::BlockCache;
 
-        let img = build_minimal_ext4_image_blocks(256);
-        let mem_dev = MemBlkDev::new(img, false);
-        let bcache_raw = BlockCache::new(mem_dev.clone(), 64).map_err(|_| "bcache init")?;
-        let fault_cache = Arc::new(FaultInjectBlockCache::new(bcache_raw));
-        let bcache: Arc<dyn ext4::BlockCacheBackend> = Arc::clone(&fault_cache) as Arc<dyn ext4::BlockCacheBackend>;
-        let fs = ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, 15), false).map_err(|_| "ext4 mount")?;
-
-        let tables = KernelVfsTables::new();
-        tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
+        let Mnt { cache: fault_cache, fs, tables, .. } = mount(build_minimal_ext4_image_blocks(256), 15)?;
 
         // 1. truncate shrink under fail_reads and fail_writes preserves meta.size and dirty PageCache bytes.
         let (tf, _) = open_inode(
@@ -852,10 +779,7 @@ crate::ktest!(
 
         // 4. Verify persisted truncated prefix and renamed file on fresh RO mount.
         fs.sync().map_err(|_| "final fs.sync")?;
-        let ro_dev = MemBlkDev::new(mem_dev.0.data.lock().clone(), true);
-        let ro_bcache: Arc<dyn ext4::BlockCacheBackend> =
-            Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache")?));
-        let ro_fs = ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, 16), true).map_err(|_| "ro mount")?;
+        let ro_fs = mount_ro_image(fault_cache.dev_bytes(), 16)?;
         let ro_root = ro_fs.root_inode();
         let ro_trunc = ro_root.lookup(b"trunc_err.bin").map_err(|_| "ro lookup trunc_err")?;
         kassert_eq!(read_all_inode(&ro_trunc).map_err(|_| "ro read trunc_err")?, payload_2[..100]);
@@ -866,35 +790,6 @@ crate::ktest!(
     }
 );
 
-struct TestExt4Mount {
-    mem_dev: MemBlkDev,
-    fault_cache: Arc<FaultInjectBlockCache>,
-    fs: Arc<ext4::Ext4FileSystem>,
-    tables: KernelVfsTables,
-}
-
-fn mount_test_ext4(img: Vec<u8>, dev_minor: u32) -> Result<TestExt4Mount, &'static str> {
-    use lumen_bcache::BlockCache;
-    let mem_dev = MemBlkDev::new(img, false);
-    let bcache_raw = BlockCache::new(mem_dev.clone(), 32).map_err(|_| "bcache init")?;
-    let fault_cache = Arc::new(FaultInjectBlockCache::new(bcache_raw));
-    let bcache: Arc<dyn ext4::BlockCacheBackend> = Arc::clone(&fault_cache) as Arc<dyn ext4::BlockCacheBackend>;
-    let fs = ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, dev_minor), false).map_err(|_| "ext4 mount")?;
-    let tables = KernelVfsTables::new();
-    tables.mount_root(Arc::clone(&fs) as Arc<dyn FileSystem>).map_err(|_| "mount_root")?;
-    Ok(TestExt4Mount { mem_dev, fault_cache, fs, tables })
-}
-
-fn mount_ro_snapshot(m: &TestExt4Mount, dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
-    use ext4::BlockCacheBackend;
-    use lumen_bcache::BlockCache;
-    m.fault_cache.sync().map_err(|_| "fault_cache sync")?;
-    let ro_dev = MemBlkDev::new(m.mem_dev.0.data.lock().clone(), true);
-    let ro_bcache: Arc<dyn ext4::BlockCacheBackend> =
-        Arc::new(SleepMutex::new(BlockCache::new(ro_dev, 32).map_err(|_| "ro bcache")?));
-    ext4::Ext4FileSystem::mount(ro_bcache, DevId::makedev(0, dev_minor), true).map_err(|_| "ro mount")
-}
-
 #[inline(never)]
 fn sweep_rmdir_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -902,26 +797,26 @@ fn sweep_rmdir_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &
 
     let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
 
-    let m = mount_test_ext4(base_img.to_vec(), 20)?;
+    let m = mount(base_img.to_vec(), 20)?;
     let d = mkdir_at(&m.tables, None, b"/victim_dir", 0o755, 0).map_err(|_| "mkdir victim_dir")?;
     drop(d);
     m.fs.sync().map_err(|_| "sync victim_dir")?;
-    let snap = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap = m.dev_bytes();
+    m.cache.arm_write(0);
     unlink_at(&m.tables, None, b"/victim_dir", true).map_err(|_| "measure rmdir")?;
-    let total_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let total_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(total_writes >= 10);
     drop(m);
 
     for &open in &[true, false] {
         for fail_at in 1..=total_writes {
-            let m = mount_test_ext4(snap.clone(), 21)?;
+            let m = mount(snap.clone(), 21)?;
             let d = resolve_path(&m.tables, None, b"/victim_dir", rf).map_err(|_| "resolve victim_dir")?.inode;
             let orig_ino = d.ino();
             let guard = if open { Some(OpenGuard::new_unchecked(Arc::clone(&d))) } else { None };
-            m.fault_cache.arm_write_fail_on(fail_at);
+            m.cache.arm_write(fail_at);
             let res = unlink_at(&m.tables, None, b"/victim_dir", true);
-            m.fault_cache.arm_write_fail_on(0);
+            m.cache.arm_write(0);
 
             match res {
                 Ok(()) => {
@@ -990,27 +885,27 @@ fn sweep_rename_dir_overwrite_io_recovery(base_img: &[u8], quota_before: usize) 
 
     let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
 
-    let m = mount_test_ext4(base_img.to_vec(), 22)?;
+    let m = mount(base_img.to_vec(), 22)?;
     let s = mkdir_at(&m.tables, None, b"/src_d", 0o755, 0).map_err(|_| "mkdir src_d")?;
     let d = mkdir_at(&m.tables, None, b"/dst_d", 0o755, 0).map_err(|_| "mkdir dst_d")?;
     drop((s, d));
     m.fs.sync().map_err(|_| "sync rename dir")?;
-    let snap = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/src_d", None, b"/dst_d", RenameFlags::default()).map_err(|_| "measure ren dir")?;
-    let total_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let total_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(total_writes >= 12);
     drop(m);
 
     for fail_at in 1..=total_writes {
-        let m = mount_test_ext4(snap.clone(), 23)?;
+        let m = mount(snap.clone(), 23)?;
         let dst = resolve_path(&m.tables, None, b"/dst_d", rf).map_err(|_| "resolve dst_d")?.inode;
         let dst_orig_ino = dst.ino();
         let src_ino = resolve_path(&m.tables, None, b"/src_d", rf).map_err(|_| "resolve src_d")?.inode.ino();
         let guard = OpenGuard::new_unchecked(Arc::clone(&dst));
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/src_d", None, b"/dst_d", RenameFlags::default());
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
         match res {
             Ok(()) => {
@@ -1067,27 +962,27 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
     let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
 
     // (1) Inline symlink unlink (open & closed) + rename overwrite
-    let m = mount_test_ext4(base_img.to_vec(), 24)?;
+    let m = mount(base_img.to_vec(), 24)?;
     let s = symlink_at(&m.tables, b"/real/target", None, b"/sym_i").map_err(|_| "symlink sym_i")?;
     let s_src = symlink_at(&m.tables, b"/other/target", None, b"/sym_s").map_err(|_| "symlink sym_s")?;
     drop((s, s_src));
     m.fs.sync().map_err(|_| "sync syms")?;
-    let snap_sym = m.mem_dev.0.data.lock().clone();
+    let snap_sym = m.dev_bytes();
 
-    m.fault_cache.arm_write_fail_on(0);
+    m.cache.arm_write(0);
     unlink_at(&m.tables, None, b"/sym_i", false).map_err(|_| "measure sym unlink")?;
-    let sym_unlink_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let sym_unlink_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(sym_unlink_writes >= 8);
     drop(m);
 
     for &open in &[true, false] {
         for fail_at in 1..=sym_unlink_writes {
-            let m = mount_test_ext4(snap_sym.clone(), 25)?;
+            let m = mount(snap_sym.clone(), 25)?;
             let sym = resolve_path(&m.tables, None, b"/sym_i", rf).map_err(|_| "resolve sym_i")?.inode;
             let guard = if open { Some(OpenGuard::new_unchecked(Arc::clone(&sym))) } else { None };
-            m.fault_cache.arm_write_fail_on(fail_at);
+            m.cache.arm_write(fail_at);
             let res = unlink_at(&m.tables, None, b"/sym_i", false);
-            m.fault_cache.arm_write_fail_on(0);
+            m.cache.arm_write(0);
 
             match res {
                 Ok(()) => {
@@ -1132,23 +1027,23 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
     }
 
     // Inline symlink rename overwrite
-    let m_ren = mount_test_ext4(snap_sym.clone(), 26)?;
-    m_ren.fault_cache.arm_write_fail_on(0);
+    let m_ren = mount(snap_sym.clone(), 26)?;
+    m_ren.cache.arm_write(0);
     rename_at2(&m_ren.tables, None, b"/sym_s", None, b"/sym_i", RenameFlags::default())
         .map_err(|_| "measure sym rename")?;
-    let sym_ren_writes = m_ren.fault_cache.write_calls.load(Ordering::Acquire);
+    let sym_ren_writes = m_ren.cache.writes.load(Ordering::Acquire);
     kassert!(sym_ren_writes >= sym_unlink_writes);
     drop(m_ren);
 
     for fail_at in 1..=sym_ren_writes {
-        let m = mount_test_ext4(snap_sym.clone(), 27)?;
+        let m = mount(snap_sym.clone(), 27)?;
         let sym = resolve_path(&m.tables, None, b"/sym_i", rf).map_err(|_| "resolve sym_i ren")?.inode;
         let sym_orig_ino = sym.ino();
         let src_ino = resolve_path(&m.tables, None, b"/sym_s", rf).map_err(|_| "resolve sym_s ren")?.inode.ino();
         let guard = OpenGuard::new_unchecked(Arc::clone(&sym));
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/sym_s", None, b"/sym_i", RenameFlags::default());
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
         match res {
             Ok(()) => {
@@ -1185,7 +1080,7 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
     }
 
     // (2) Regular file unlink (open)
-    let m = mount_test_ext4(base_img.to_vec(), 28)?;
+    let m = mount(base_img.to_vec(), 28)?;
     let (uf, _) = open_inode(
         &m.tables,
         None,
@@ -1200,20 +1095,20 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
     uf.sync(false).map_err(|_| "sync reg.bin")?;
     drop(uf);
     m.fs.sync().map_err(|_| "sync reg fs")?;
-    let snap_reg = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_reg = m.dev_bytes();
+    m.cache.arm_write(0);
     unlink_at(&m.tables, None, b"/reg.bin", false).map_err(|_| "measure reg unlink")?;
-    let reg_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let reg_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(reg_writes >= 9);
     drop(m);
 
     for fail_at in 1..=reg_writes {
-        let m = mount_test_ext4(snap_reg.clone(), 29)?;
+        let m = mount(snap_reg.clone(), 29)?;
         let uf = resolve_path(&m.tables, None, b"/reg.bin", rf).map_err(|_| "resolve reg.bin")?.inode;
         let guard = OpenGuard::new_unchecked(Arc::clone(&uf));
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = unlink_at(&m.tables, None, b"/reg.bin", false);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
         match res {
             Ok(()) => {
@@ -1255,7 +1150,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
     let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
 
     // (1) Cross-dir file move step-2 sweep
-    let m = mount_test_ext4(base_img.to_vec(), 30)?;
+    let m = mount(base_img.to_vec(), 30)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd")?;
     let (sf, _) = open_inode(
@@ -1270,27 +1165,29 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
     kassert_eq!(sf.write_at(0, b"FILE_DATA").map_err(|_| "write /sd/f")?, 9);
     drop((sd, dd, sf));
     m.fs.sync().map_err(|_| "sync step2 file")?;
-    let snap_f = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_f = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default()).map_err(|_| "measure ren file")?;
-    let file_ren_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let file_ren_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(file_ren_writes >= 4);
     drop(m);
 
     for fail_at in 1..=file_ren_writes {
-        let m = mount_test_ext4(snap_f.clone(), 31)?;
+        let m = mount(snap_f.clone(), 31)?;
         let f = resolve_path(&m.tables, None, b"/sd/f", rf).map_err(|_| "resolve /sd/f")?.inode;
         let orig_ino = f.ino();
         let guard = OpenGuard::new_unchecked(Arc::clone(&f));
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default());
-        m.fault_cache.arm_write_fail_on(0);
-        kassert!(res.is_err() || res.is_ok());
+        m.cache.arm_write(0);
 
+        // Rolled back or left at both names: an error. Moved: either (an
+        // error after the move landed is reported).
         let old_res = resolve_path(&m.tables, None, b"/sd/f", rf);
         let new_res = resolve_path(&m.tables, None, b"/dd/f", rf);
         match (old_res, new_res) {
             (Ok(_), Err(VfsError::NoEnt)) => {
+                kassert!(res.is_err());
                 kassert!(!f.is_detached());
                 kassert_eq!(f.stat().map_err(|_| "stat rolled back f")?.nlink, 1);
                 kassert!(m.fs.lookup_live_by_lock_id(f.lock_id()).is_some());
@@ -1306,6 +1203,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
                 kassert!(f.is_detached());
             }
             (Ok(_), Ok(n)) => {
+                kassert!(res.is_err());
                 kassert!(!f.is_detached());
                 kassert_eq!(n.inode.lock_id(), f.lock_id());
                 kassert!(f.stat().map_err(|_| "stat dual f")?.nlink >= 2);
@@ -1326,29 +1224,29 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
     }
 
     // (2) Cross-dir directory move step-2 sweep
-    let m = mount_test_ext4(base_img.to_vec(), 32)?;
+    let m = mount(base_img.to_vec(), 32)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd2")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd2")?;
     let sub = mkdir_at(&m.tables, None, b"/sd/sub", 0o755, 0).map_err(|_| "mkdir sub")?;
     drop((sd, dd, sub));
     m.fs.sync().map_err(|_| "sync step2 dir")?;
-    let snap_d = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_d = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/sd/sub", None, b"/dd/sub", RenameFlags::default()).map_err(|_| "measure ren sub")?;
-    let dir_ren_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let dir_ren_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(dir_ren_writes >= 6);
     drop(m);
 
     for fail_at in 1..=dir_ren_writes {
-        let m = mount_test_ext4(snap_d.clone(), 33)?;
+        let m = mount(snap_d.clone(), 33)?;
         let sd = resolve_path(&m.tables, None, b"/sd", rf).map_err(|_| "resolve sd")?.inode;
         let dd = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "resolve dd")?.inode;
         let sub = resolve_path(&m.tables, None, b"/sd/sub", rf).map_err(|_| "resolve sub")?.inode;
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/sub", None, b"/dd/sub", RenameFlags::default());
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
-        let ro_fs = mount_ro_snapshot(&m, 34)?;
+        let ro_fs = remount_ro(&m, 34)?;
         let ro_sd = ro_fs.root_inode().lookup(b"sd").map_err(|_| "ro lookup sd")?;
         let ro_dd = ro_fs.root_inode().lookup(b"dd").map_err(|_| "ro lookup dd")?;
         let sd_nlink = sd.stat().map_err(|_| "stat sd")?.nlink;
@@ -1366,6 +1264,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
 
         match (resolve_path(&m.tables, None, b"/sd/sub", rf), resolve_path(&m.tables, None, b"/dd/sub", rf)) {
             (Ok(_), Err(VfsError::NoEnt)) => {
+                kassert!(res.is_err());
                 unlink_at(&m.tables, None, b"/sd/sub", true).map_err(|_| "rmdir rolled back sub")?;
             }
             (Err(VfsError::NoEnt), Ok(_)) => {
@@ -1386,6 +1285,7 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
                 unlink_at(&m.tables, None, b"/dd/sub", true).map_err(|_| "rmdir moved sub")?;
             }
             (Ok(_), Ok(_)) => {
+                kassert!(res.is_err());
                 kassert!(sub.stat().map_err(|_| "stat dual sub")?.nlink >= 3);
             }
             _ => return Err("unexpected dir rename step2 state"),
@@ -1395,23 +1295,23 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
     }
 
     // (3) RENAME_EXCHANGE cross-dir dir <-> inline symlink sweep
-    let m = mount_test_ext4(base_img.to_vec(), 35)?;
+    let m = mount(base_img.to_vec(), 35)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd3")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd3")?;
     let da = mkdir_at(&m.tables, None, b"/sd/dir_a", 0o755, 0).map_err(|_| "mkdir dir_a")?;
     let sb = symlink_at(&m.tables, b"/exch/target", None, b"/dd/sym_b").map_err(|_| "symlink sym_b")?;
     drop((sd, dd, da, sb));
     m.fs.sync().map_err(|_| "sync exch")?;
-    let snap_ex = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_ex = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/sd/dir_a", None, b"/dd/sym_b", RenameFlags(RenameFlags::EXCHANGE))
         .map_err(|_| "measure exchange")?;
-    let exch_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let exch_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(exch_writes >= 8);
     drop(m);
 
     for fail_at in 1..=exch_writes {
-        let m = mount_test_ext4(snap_ex.clone(), 36)?;
+        let m = mount(snap_ex.clone(), 36)?;
         let sd = resolve_path(&m.tables, None, b"/sd", rf).map_err(|_| "resolve sd ex")?.inode;
         let dd = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "resolve dd ex")?.inode;
         let da = resolve_path(&m.tables, None, b"/sd/dir_a", rf).map_err(|_| "resolve dir_a")?.inode;
@@ -1419,15 +1319,15 @@ fn sweep_rename_step2_and_exchange_io_recovery(base_img: &[u8], quota_before: us
         let ga = OpenGuard::new_unchecked(Arc::clone(&da));
         let gb = OpenGuard::new_unchecked(Arc::clone(&sb));
 
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/dir_a", None, b"/dd/sym_b", RenameFlags(RenameFlags::EXCHANGE));
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
         kassert!(!da.is_detached());
         kassert!(!sb.is_detached());
         kassert_eq!(sb.readlink().map_err(|_| "sym_b readlink ex")?, b"/exch/target");
 
-        let ro_fs = mount_ro_snapshot(&m, 37)?;
+        let ro_fs = remount_ro(&m, 37)?;
         let ro_sd = ro_fs.root_inode().lookup(b"sd").map_err(|_| "ro sd ex")?;
         let ro_dd = ro_fs.root_inode().lookup(b"dd").map_err(|_| "ro dd ex")?;
         let sd_nlink = sd.stat().map_err(|_| "stat sd ex")?.nlink;
@@ -1469,7 +1369,7 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
 
     let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
 
-    let m = mount_test_ext4(base_img.to_vec(), 38)?;
+    let m = mount(base_img.to_vec(), 38)?;
     let (tf, _) = open_inode(
         &m.tables,
         None,
@@ -1498,20 +1398,20 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
     sf.sync(false).map_err(|_| "sync bb_200")?;
     drop(sf);
     m.fs.sync().map_err(|_| "sync trunc setup")?;
-    let snap = m.mem_dev.0.data.lock().clone();
+    let snap = m.dev_bytes();
 
     // Measure clean truncate write counts for 8192 -> 100 and 200 -> 100.
     let tf = resolve_path(&m.tables, None, b"/t8k.bin", rf).map_err(|_| "resolve t8k")?.inode;
-    m.fault_cache.arm_write_fail_on(0);
+    m.cache.arm_write(0);
     tf.truncate(100).map_err(|_| "measure t8k")?;
-    let t8k_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let t8k_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(t8k_writes >= 7);
     drop(tf);
 
     let sf = resolve_path(&m.tables, None, b"/t200.bin", rf).map_err(|_| "resolve t200")?.inode;
-    m.fault_cache.arm_write_fail_on(0);
+    m.cache.arm_write(0);
     sf.truncate(100).map_err(|_| "measure t200")?;
-    let t200_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let t200_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(t200_writes >= 3);
     drop((sf, m));
 
@@ -1519,13 +1419,13 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
     // `ext4plus::file::truncate`'s own writes).
     let mut saw_err_at_last_8k = false;
     for fail_at in 1..=t8k_writes {
-        let m = mount_test_ext4(snap.clone(), 39)?;
+        let m = mount(snap.clone(), 39)?;
         let tf = resolve_path(&m.tables, None, b"/t8k.bin", rf).map_err(|_| "resolve t8k sweep")?.inode;
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = tf.truncate(100);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
-        let ro_fs = mount_ro_snapshot(&m, 40)?;
+        let ro_fs = remount_ro(&m, 40)?;
         let ro_tf = ro_fs.root_inode().lookup(b"t8k.bin").map_err(|_| "ro t8k")?;
         match res {
             Ok(()) => {
@@ -1550,15 +1450,15 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
 
     // Dirty tail in PageCache must also be preserved on ext4_write_at / ext4_truncate EIO.
     for &fail_at in &[1usize, 2usize, t8k_writes] {
-        let m = mount_test_ext4(snap.clone(), 43)?;
+        let m = mount(snap.clone(), 43)?;
         let tf = resolve_path(&m.tables, None, b"/t8k.bin", rf).map_err(|_| "resolve t8k dirty")?.inode;
         let cc = [0xCCu8; 32];
         kassert_eq!(tf.write_at(150, &cc).map_err(|_| "dirty write tail")?, cc.len());
         let mut expected = aa_8k.clone();
         expected[150..182].copy_from_slice(&cc);
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         kassert!(matches!(tf.truncate(100), Err(VfsError::Io)));
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         kassert_eq!(tf.stat().map_err(|_| "stat t8k dirty eio")?.size, 8192);
         kassert_eq!(read_all_inode(&tf).map_err(|_| "read t8k dirty eio")?, expected);
         drop((tf, m));
@@ -1567,13 +1467,13 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
     // Fail each block write of the 200-byte shrink in turn.
     let mut saw_err_at_last_200 = false;
     for fail_at in 1..=t200_writes {
-        let m = mount_test_ext4(snap.clone(), 41)?;
+        let m = mount(snap.clone(), 41)?;
         let sf = resolve_path(&m.tables, None, b"/t200.bin", rf).map_err(|_| "resolve t200 sweep")?.inode;
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = sf.truncate(100);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
-        let ro_fs = mount_ro_snapshot(&m, 42)?;
+        let ro_fs = remount_ro(&m, 42)?;
         let ro_sf = ro_fs.root_inode().lookup(b"t200.bin").map_err(|_| "ro t200")?;
         match res {
             Ok(()) => {
@@ -1607,7 +1507,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
 
     // (1) Hardlinked file unlink write-cutoff (From(1..=hl_writes+1), including From(2))
-    let m = mount_test_ext4(base_img.to_vec(), 44)?;
+    let m = mount(base_img.to_vec(), 44)?;
     let (hl1, _) = open_inode(
         &m.tables,
         None,
@@ -1622,22 +1522,22 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     drop(hl1);
     link_at(&m.tables, None, b"/hl1", None, b"/hl2", false, false).map_err(|_| "link /hl2")?;
     m.fs.sync().map_err(|_| "sync hl")?;
-    let snap_hl = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_hl = m.dev_bytes();
+    m.cache.arm_write(0);
     unlink_at(&m.tables, None, b"/hl1", false).map_err(|_| "measure hl unlink")?;
-    let hl_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let hl_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(hl_writes >= 2);
     drop(m);
 
     for from_k in 1..=(hl_writes + 1) {
-        let m = mount_test_ext4(snap_hl.clone(), 45)?;
+        let m = mount(snap_hl.clone(), 45)?;
         let hl = resolve_path(&m.tables, None, b"/hl1", rf).map_err(|_| "resolve /hl1")?.inode;
         let orig_ino = hl.ino();
         let guard = OpenGuard::new_unchecked(Arc::clone(&hl));
 
-        m.fault_cache.arm_write_fail_from(from_k);
+        m.cache.arm_write_from(from_k);
         let res = unlink_at(&m.tables, None, b"/hl1", false);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         if from_k <= hl_writes {
             kassert!(res.is_err());
         }
@@ -1664,7 +1564,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     }
 
     // (2) Rename step-2 file move: every write failing from k on (From(k)), and every pair of failed writes (Pair(c1, c2)).
-    let m = mount_test_ext4(base_img.to_vec(), 46)?;
+    let m = mount(base_img.to_vec(), 46)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd casc f")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd casc f")?;
     let (sf, _) = open_inode(
@@ -1679,158 +1579,156 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     kassert_eq!(sf.write_at(0, b"FILE_DATA").map_err(|_| "write /sd/f casc")?, 9);
     drop((sd, dd, sf));
     m.fs.sync().map_err(|_| "sync casc f")?;
-    let snap_f = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_f = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default()).map_err(|_| "measure casc f")?;
-    let file_ren_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let file_ren_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(file_ren_writes >= 4);
     drop(m);
 
-    let check_file_step2_post_fault =
-        |m: TestExt4Mount, f: Arc<dyn VfsInode>, orig_ino: u64| -> Result<(), &'static str> {
-            let guard = OpenGuard::new_unchecked(Arc::clone(&f));
-            let old_res = resolve_path(&m.tables, None, b"/sd/f", rf);
-            let new_res = resolve_path(&m.tables, None, b"/dd/f", rf);
-            match (old_res, new_res) {
-                (Ok(_), Err(VfsError::NoEnt)) => {
-                    kassert!(!f.is_detached());
-                    let nlink = f.stat().map_err(|_| "stat f rb")?.nlink;
-                    kassert!(nlink == 1 || nlink == 2);
-                    unlink_at(&m.tables, None, b"/sd/f", false).map_err(|_| "unlink f rb")?;
-                    kassert!(matches!(resolve_path(&m.tables, None, b"/sd/f", rf), Err(VfsError::NoEnt)));
-                    if nlink == 1 {
-                        kassert!(f.is_detached());
-                    }
-                }
-                (Err(VfsError::NoEnt), Ok(n)) => {
-                    kassert!(!f.is_detached());
-                    kassert_eq!(n.inode.ino(), orig_ino);
-                    unlink_at(&m.tables, None, b"/dd/f", false).map_err(|_| "unlink f mv")?;
+    let check_file_step2_post_fault = |m: Mnt, f: Arc<dyn VfsInode>, orig_ino: u64| -> Result<(), &'static str> {
+        let guard = OpenGuard::new_unchecked(Arc::clone(&f));
+        let old_res = resolve_path(&m.tables, None, b"/sd/f", rf);
+        let new_res = resolve_path(&m.tables, None, b"/dd/f", rf);
+        match (old_res, new_res) {
+            (Ok(_), Err(VfsError::NoEnt)) => {
+                kassert!(!f.is_detached());
+                let nlink = f.stat().map_err(|_| "stat f rb")?.nlink;
+                kassert!(nlink == 1 || nlink == 2);
+                unlink_at(&m.tables, None, b"/sd/f", false).map_err(|_| "unlink f rb")?;
+                kassert!(matches!(resolve_path(&m.tables, None, b"/sd/f", rf), Err(VfsError::NoEnt)));
+                if nlink == 1 {
                     kassert!(f.is_detached());
                 }
-                (Ok(_), Ok(n)) => {
-                    kassert!(!f.is_detached());
-                    kassert_eq!(n.inode.lock_id(), f.lock_id());
-                    kassert!(f.stat().map_err(|_| "stat dual f casc")?.nlink >= 2);
-                    unlink_at(&m.tables, None, b"/sd/f", false).map_err(|_| "unlink /sd/f dual casc")?;
-                    kassert!(!f.is_detached());
-                    kassert_eq!(f.stat().map_err(|_| "stat /dd/f surviving")?.nlink, 1);
-                    let dd_f = resolve_path(&m.tables, None, b"/dd/f", rf).map_err(|_| "lookup /dd/f surviving")?.inode;
-                    kassert_eq!(dd_f.ino(), orig_ino);
-                    kassert_eq!(read_all_inode(&dd_f).map_err(|_| "read /dd/f surviving")?, b"FILE_DATA");
-                    let (canary, _) = open_inode(
-                        &m.tables,
-                        None,
-                        b"/canary_f",
-                        OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-                        0o644,
-                        0,
-                    )
-                    .map_err(|_| "create canary_f")?;
-                    kassert_ne_u64(canary.ino(), orig_ino)?;
-                    drop((dd_f, canary));
-                    unlink_at(&m.tables, None, b"/dd/f", false).map_err(|_| "unlink /dd/f final")?;
-                    kassert!(f.is_detached());
-                }
-                _ => return Err("unexpected cascading file rename state"),
             }
-            kassert_eq!(read_all_inode(&f).map_err(|_| "read f final")?, b"FILE_DATA");
-            drop(guard);
-            drop(f);
-            drop(m);
-            kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
-            Ok(())
-        };
+            (Err(VfsError::NoEnt), Ok(n)) => {
+                kassert!(!f.is_detached());
+                kassert_eq!(n.inode.ino(), orig_ino);
+                unlink_at(&m.tables, None, b"/dd/f", false).map_err(|_| "unlink f mv")?;
+                kassert!(f.is_detached());
+            }
+            (Ok(_), Ok(n)) => {
+                kassert!(!f.is_detached());
+                kassert_eq!(n.inode.lock_id(), f.lock_id());
+                kassert!(f.stat().map_err(|_| "stat dual f casc")?.nlink >= 2);
+                unlink_at(&m.tables, None, b"/sd/f", false).map_err(|_| "unlink /sd/f dual casc")?;
+                kassert!(!f.is_detached());
+                kassert_eq!(f.stat().map_err(|_| "stat /dd/f surviving")?.nlink, 1);
+                let dd_f = resolve_path(&m.tables, None, b"/dd/f", rf).map_err(|_| "lookup /dd/f surviving")?.inode;
+                kassert_eq!(dd_f.ino(), orig_ino);
+                kassert_eq!(read_all_inode(&dd_f).map_err(|_| "read /dd/f surviving")?, b"FILE_DATA");
+                let (canary, _) = open_inode(
+                    &m.tables,
+                    None,
+                    b"/canary_f",
+                    OpenFlags::from_bits_truncate(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
+                    0o644,
+                    0,
+                )
+                .map_err(|_| "create canary_f")?;
+                kassert_ne_u64(canary.ino(), orig_ino)?;
+                drop((dd_f, canary));
+                unlink_at(&m.tables, None, b"/dd/f", false).map_err(|_| "unlink /dd/f final")?;
+                kassert!(f.is_detached());
+            }
+            _ => return Err("unexpected cascading file rename state"),
+        }
+        kassert_eq!(read_all_inode(&f).map_err(|_| "read f final")?, b"FILE_DATA");
+        drop(guard);
+        drop(f);
+        drop(m);
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+        Ok(())
+    };
 
     for from_k in 1..=(file_ren_writes + 1) {
-        let m = mount_test_ext4(snap_f.clone(), 47)?;
+        let m = mount(snap_f.clone(), 47)?;
         let f = resolve_path(&m.tables, None, b"/sd/f", rf).map_err(|_| "resolve f from")?.inode;
         let orig_ino = f.ino();
-        m.fault_cache.arm_write_fail_from(from_k);
+        m.cache.arm_write_from(from_k);
         let _ = rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default());
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         check_file_step2_post_fault(m, f, orig_ino)?;
     }
 
     for c1 in 1..=file_ren_writes {
         for c2 in (c1 + 1)..=(c1 + 5) {
-            let m = mount_test_ext4(snap_f.clone(), 48)?;
+            let m = mount(snap_f.clone(), 48)?;
             let f = resolve_path(&m.tables, None, b"/sd/f", rf).map_err(|_| "resolve f pair")?.inode;
             let orig_ino = f.ino();
-            m.fault_cache.arm_write_fail_pair(c1, c2);
+            m.cache.arm_write_pair(c1, c2);
             let _ = rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default());
-            m.fault_cache.arm_write_fail_on(0);
+            m.cache.arm_write(0);
             check_file_step2_post_fault(m, f, orig_ino)?;
         }
     }
 
     // (3) Rename step-2 dir move: every pair of failed writes (Pair(c1, c2)), and every write failing from k on (From(k)).
-    let m = mount_test_ext4(base_img.to_vec(), 49)?;
+    let m = mount(base_img.to_vec(), 49)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd casc d")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd casc d")?;
     let sub = mkdir_at(&m.tables, None, b"/sd/sub", 0o755, 0).map_err(|_| "mkdir sub casc")?;
     drop((sd, dd, sub));
     m.fs.sync().map_err(|_| "sync casc d")?;
-    let snap_d = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_d = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/sd/sub", None, b"/dd/sub", RenameFlags::default()).map_err(|_| "measure casc d")?;
-    let dir_ren_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let dir_ren_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(dir_ren_writes >= 6);
     drop(m);
 
-    let check_dir_step2_post_fault =
-        |m: TestExt4Mount, sub: Arc<dyn VfsInode>, orig_ino: u64| -> Result<(), &'static str> {
-            match (resolve_path(&m.tables, None, b"/sd/sub", rf), resolve_path(&m.tables, None, b"/dd/sub", rf)) {
-                (Ok(_), Err(VfsError::NoEnt)) => {
-                    unlink_at(&m.tables, None, b"/sd/sub", true).map_err(|_| "rmdir sub rb")?;
-                }
-                (Err(VfsError::NoEnt), Ok(_)) => {
-                    unlink_at(&m.tables, None, b"/dd/sub", true).map_err(|_| "rmdir sub mv")?;
-                }
-                (Ok(_), Ok(n)) => {
-                    kassert_eq!(n.inode.lock_id(), sub.lock_id());
-                    kassert!(sub.stat().map_err(|_| "stat dual sub casc")?.nlink >= 3);
-                    unlink_at(&m.tables, None, b"/sd/sub", true).map_err(|_| "rmdir /sd/sub dual")?;
-                    kassert!(!sub.is_detached());
-                    kassert_eq!(sub.stat().map_err(|_| "stat surviving sub")?.nlink, 2);
-                    let dd_sub = resolve_path(&m.tables, None, b"/dd/sub", rf).map_err(|_| "lookup /dd/sub")?.inode;
-                    kassert_eq!(dd_sub.ino(), orig_ino);
-                    let canary_d = mkdir_at(&m.tables, None, b"/canary_d", 0o755, 0).map_err(|_| "mkdir canary_d")?;
-                    kassert_ne_u64(canary_d.ino(), orig_ino)?;
-                    drop((dd_sub, canary_d));
-                    unlink_at(&m.tables, None, b"/dd/sub", true).map_err(|_| "rmdir /dd/sub final")?;
-                }
-                _ => return Err("unexpected cascading dir rename state"),
+    let check_dir_step2_post_fault = |m: Mnt, sub: Arc<dyn VfsInode>, orig_ino: u64| -> Result<(), &'static str> {
+        match (resolve_path(&m.tables, None, b"/sd/sub", rf), resolve_path(&m.tables, None, b"/dd/sub", rf)) {
+            (Ok(_), Err(VfsError::NoEnt)) => {
+                unlink_at(&m.tables, None, b"/sd/sub", true).map_err(|_| "rmdir sub rb")?;
             }
-            drop((sub, m));
-            kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
-            Ok(())
-        };
+            (Err(VfsError::NoEnt), Ok(_)) => {
+                unlink_at(&m.tables, None, b"/dd/sub", true).map_err(|_| "rmdir sub mv")?;
+            }
+            (Ok(_), Ok(n)) => {
+                kassert_eq!(n.inode.lock_id(), sub.lock_id());
+                kassert!(sub.stat().map_err(|_| "stat dual sub casc")?.nlink >= 3);
+                unlink_at(&m.tables, None, b"/sd/sub", true).map_err(|_| "rmdir /sd/sub dual")?;
+                kassert!(!sub.is_detached());
+                kassert_eq!(sub.stat().map_err(|_| "stat surviving sub")?.nlink, 2);
+                let dd_sub = resolve_path(&m.tables, None, b"/dd/sub", rf).map_err(|_| "lookup /dd/sub")?.inode;
+                kassert_eq!(dd_sub.ino(), orig_ino);
+                let canary_d = mkdir_at(&m.tables, None, b"/canary_d", 0o755, 0).map_err(|_| "mkdir canary_d")?;
+                kassert_ne_u64(canary_d.ino(), orig_ino)?;
+                drop((dd_sub, canary_d));
+                unlink_at(&m.tables, None, b"/dd/sub", true).map_err(|_| "rmdir /dd/sub final")?;
+            }
+            _ => return Err("unexpected cascading dir rename state"),
+        }
+        drop((sub, m));
+        kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+        Ok(())
+    };
 
     for from_k in 1..=(dir_ren_writes + 1) {
-        let m = mount_test_ext4(snap_d.clone(), 50)?;
+        let m = mount(snap_d.clone(), 50)?;
         let sub = resolve_path(&m.tables, None, b"/sd/sub", rf).map_err(|_| "resolve sub from")?.inode;
         let orig_ino = sub.ino();
-        m.fault_cache.arm_write_fail_from(from_k);
+        m.cache.arm_write_from(from_k);
         let _ = rename_at2(&m.tables, None, b"/sd/sub", None, b"/dd/sub", RenameFlags::default());
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         check_dir_step2_post_fault(m, sub, orig_ino)?;
     }
 
     for c1 in 1..=dir_ren_writes {
         for c2 in (c1 + 1)..=(c1 + 5) {
-            let m = mount_test_ext4(snap_d.clone(), 51)?;
+            let m = mount(snap_d.clone(), 51)?;
             let sub = resolve_path(&m.tables, None, b"/sd/sub", rf).map_err(|_| "resolve sub pair")?.inode;
             let orig_ino = sub.ino();
-            m.fault_cache.arm_write_fail_pair(c1, c2);
+            m.cache.arm_write_pair(c1, c2);
             let _ = rename_at2(&m.tables, None, b"/sd/sub", None, b"/dd/sub", RenameFlags::default());
-            m.fault_cache.arm_write_fail_on(0);
+            m.cache.arm_write(0);
             check_dir_step2_post_fault(m, sub, orig_ino)?;
         }
     }
 
     // (4) RENAME_EXCHANGE file<->file: each single failed write's post_res checks, then pairs of failed writes.
-    let m = mount_test_ext4(base_img.to_vec(), 52)?;
+    let m = mount(base_img.to_vec(), 52)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd ex f")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd ex f")?;
     let (fa, _) = open_inode(
@@ -1855,24 +1753,24 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     kassert_eq!(fb.write_at(0, b"FB_DATA").map_err(|_| "write /dd/fb")?, 7);
     drop((sd, dd, fa, fb));
     m.fs.sync().map_err(|_| "sync ex f")?;
-    let snap_ex_f = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_ex_f = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/sd/fa", None, b"/dd/fb", RenameFlags(RenameFlags::EXCHANGE))
         .map_err(|_| "measure ex f")?;
-    let exch_file_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let exch_file_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(exch_file_writes >= 10);
     drop(m);
 
     // Single-write post_res verification on file<->file RENAME_EXCHANGE
     for fail_at in 1..=exch_file_writes {
-        let m = mount_test_ext4(snap_ex_f.clone(), 53)?;
+        let m = mount(snap_ex_f.clone(), 53)?;
         let fa = resolve_path(&m.tables, None, b"/sd/fa", rf).map_err(|_| "resolve fa single")?.inode;
         let fb = resolve_path(&m.tables, None, b"/dd/fb", rf).map_err(|_| "resolve fb single")?.inode;
         let ga = OpenGuard::new_unchecked(Arc::clone(&fa));
         let gb = OpenGuard::new_unchecked(Arc::clone(&fb));
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/fa", None, b"/dd/fb", RenameFlags(RenameFlags::EXCHANGE));
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
         let fa_at_dd = resolve_path(&m.tables, None, b"/dd/fb", rf).is_ok_and(|r| r.inode.ino() == fa.ino());
         let fb_at_sd = resolve_path(&m.tables, None, b"/sd/fa", rf).is_ok_and(|r| r.inode.ino() == fb.ino());
@@ -1902,7 +1800,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     for &pinned in &[false, true] {
         for c1 in 1..=exch_file_writes {
             for c2 in (c1 + 1)..=(c1 + 6) {
-                let m = mount_test_ext4(snap_ex_f.clone(), 54)?;
+                let m = mount(snap_ex_f.clone(), 54)?;
                 let (fa_orig_ino, fb_orig_ino, pinned_pair) = if pinned {
                     let fa = resolve_path(&m.tables, None, b"/sd/fa", rf).map_err(|_| "resolve fa pair")?.inode;
                     let fb = resolve_path(&m.tables, None, b"/dd/fb", rf).map_err(|_| "resolve fb pair")?.inode;
@@ -1912,7 +1810,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
                     let gb = OpenGuard::new_unchecked(Arc::clone(&fb));
                     (a_ino, b_ino, Some((fa, fb, ga, gb)))
                 } else {
-                    let ro_fs = mount_ro_snapshot(&m, 54)?;
+                    let ro_fs = remount_ro(&m, 54)?;
                     let a_ino =
                         ro_fs.root_inode().lookup(b"sd").and_then(|d| d.lookup(b"fa")).map_err(|_| "ro fa pair")?.ino();
                     let b_ino =
@@ -1920,9 +1818,9 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
                     (a_ino, b_ino, None)
                 };
 
-                m.fault_cache.arm_write_fail_pair(c1, c2);
+                m.cache.arm_write_pair(c1, c2);
                 let _ = rename_at2(&m.tables, None, b"/sd/fa", None, b"/dd/fb", RenameFlags(RenameFlags::EXCHANGE));
-                m.fault_cache.arm_write_fail_on(0);
+                m.cache.arm_write(0);
 
                 let fa_at_sd = resolve_path(&m.tables, None, b"/sd/fa", rf).is_ok_and(|r| r.inode.ino() == fa_orig_ino);
                 let fa_at_dd = resolve_path(&m.tables, None, b"/dd/fb", rf).is_ok_and(|r| r.inode.ino() == fa_orig_ino);
@@ -1981,23 +1879,23 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     }
 
     // (5) RENAME_EXCHANGE dir<->dir single-write post_res verification across 1..=total_writes
-    let m = mount_test_ext4(base_img.to_vec(), 55)?;
+    let m = mount(base_img.to_vec(), 55)?;
     let sd = mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd ex d")?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd ex d")?;
     let da = mkdir_at(&m.tables, None, b"/sd/da", 0o755, 0).map_err(|_| "mkdir /sd/da")?;
     let db = mkdir_at(&m.tables, None, b"/dd/db", 0o755, 0).map_err(|_| "mkdir /dd/db")?;
     drop((sd, dd, da, db));
     m.fs.sync().map_err(|_| "sync ex d")?;
-    let snap_ex_d = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_ex_d = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/sd/da", None, b"/dd/db", RenameFlags(RenameFlags::EXCHANGE))
         .map_err(|_| "measure ex d")?;
-    let exch_dir_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let exch_dir_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(exch_dir_writes >= 12);
     drop(m);
 
     for fail_at in 1..=exch_dir_writes {
-        let m = mount_test_ext4(snap_ex_d.clone(), 56)?;
+        let m = mount(snap_ex_d.clone(), 56)?;
         let sd = resolve_path(&m.tables, None, b"/sd", rf).map_err(|_| "resolve sd ex d")?.inode;
         let dd = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "resolve dd ex d")?.inode;
         let da = resolve_path(&m.tables, None, b"/sd/da", rf).map_err(|_| "resolve da ex d")?.inode;
@@ -2008,11 +1906,11 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         let ga = OpenGuard::new_unchecked(Arc::clone(&da));
         let gb = OpenGuard::new_unchecked(Arc::clone(&db));
 
-        m.fault_cache.arm_write_fail_on(fail_at);
+        m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/sd/da", None, b"/dd/db", RenameFlags(RenameFlags::EXCHANGE));
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
 
-        let ro_fs = mount_ro_snapshot(&m, 57)?;
+        let ro_fs = remount_ro(&m, 57)?;
         let ro_sd = ro_fs.root_inode().lookup(b"sd").map_err(|_| "ro sd ex d")?;
         let ro_dd = ro_fs.root_inode().lookup(b"dd").map_err(|_| "ro dd ex d")?;
         let sd_nlink = sd.stat().map_err(|_| "stat sd ex d")?.nlink;
@@ -2077,7 +1975,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     //     rename overwrites, dual-linked directories, and uncached step-2 file rename.
 
     // (6a) Cold-cache hardlinked regular file unlink_at("/h1")
-    let m = mount_test_ext4(base_img.to_vec(), 58)?;
+    let m = mount(base_img.to_vec(), 58)?;
     let (h1, _) = open_inode(
         &m.tables,
         None,
@@ -2093,18 +1991,18 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     drop(h1);
     link_at(&m.tables, None, b"/h1", None, b"/h2", false, false).map_err(|_| "link cold /h2")?;
     m.fs.sync().map_err(|_| "sync cold hl")?;
-    let snap_cold_hl = m.mem_dev.0.data.lock().clone();
+    let snap_cold_hl = m.dev_bytes();
     drop(m);
 
     for &use_from in &[false, true] {
-        let m = mount_test_ext4(snap_cold_hl.clone(), 59)?;
+        let m = mount(snap_cold_hl.clone(), 59)?;
         if use_from {
-            m.fault_cache.arm_write_fail_from(2);
+            m.cache.arm_write_from(2);
         } else {
-            m.fault_cache.arm_write_fail_pair(2, 3);
+            m.cache.arm_write_pair(2, 3);
         }
         let res1 = unlink_at(&m.tables, None, b"/h1", false);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         kassert!(matches!(res1, Err(VfsError::Io)));
 
         unlink_at(&m.tables, None, b"/h1", false).map_err(|_| "retry cold /h1 unlink")?;
@@ -2130,24 +2028,24 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     }
 
     // (6b) Cold-cache hardlinked inline symlink unlink_at("/sym1")
-    let m = mount_test_ext4(base_img.to_vec(), 60)?;
+    let m = mount(base_img.to_vec(), 60)?;
     let sym1 = symlink_at(&m.tables, b"/cold/sym/target", None, b"/sym1").map_err(|_| "symlink cold /sym1")?;
     let cold_sym_orig_ino = sym1.ino();
     drop(sym1);
     link_at(&m.tables, None, b"/sym1", None, b"/sym2", false, false).map_err(|_| "link cold /sym2")?;
     m.fs.sync().map_err(|_| "sync cold sym")?;
-    let snap_cold_sym = m.mem_dev.0.data.lock().clone();
+    let snap_cold_sym = m.dev_bytes();
     drop(m);
 
     for &use_from in &[false, true] {
-        let m = mount_test_ext4(snap_cold_sym.clone(), 61)?;
+        let m = mount(snap_cold_sym.clone(), 61)?;
         if use_from {
-            m.fault_cache.arm_write_fail_from(2);
+            m.cache.arm_write_from(2);
         } else {
-            m.fault_cache.arm_write_fail_pair(2, 3);
+            m.cache.arm_write_pair(2, 3);
         }
         let res1 = unlink_at(&m.tables, None, b"/sym1", false);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         kassert!(matches!(res1, Err(VfsError::Io)));
 
         unlink_at(&m.tables, None, b"/sym1", false).map_err(|_| "retry cold /sym1 unlink")?;
@@ -2166,7 +2064,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     }
 
     // (6c) Cold-cache hardlink overwrite rename_at2("/src", "/h1")
-    let m = mount_test_ext4(base_img.to_vec(), 62)?;
+    let m = mount(base_img.to_vec(), 62)?;
     let (ow_h1, _) = open_inode(
         &m.tables,
         None,
@@ -2195,18 +2093,18 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     ow_src.sync(false).map_err(|_| "sync cold ow /src")?;
     drop(ow_src);
     m.fs.sync().map_err(|_| "sync cold ow")?;
-    let snap_cold_ow = m.mem_dev.0.data.lock().clone();
+    let snap_cold_ow = m.dev_bytes();
     drop(m);
 
     for &use_from in &[false, true] {
-        let m = mount_test_ext4(snap_cold_ow.clone(), 63)?;
+        let m = mount(snap_cold_ow.clone(), 63)?;
         if use_from {
-            m.fault_cache.arm_write_fail_from(2);
+            m.cache.arm_write_from(2);
         } else {
-            m.fault_cache.arm_write_fail_pair(2, 3);
+            m.cache.arm_write_pair(2, 3);
         }
         let res1 = rename_at2(&m.tables, None, b"/src", None, b"/h1", RenameFlags::default());
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         kassert!(matches!(res1, Err(VfsError::Io)));
 
         rename_at2(&m.tables, None, b"/src", None, b"/h1", RenameFlags::default())
@@ -2238,17 +2136,17 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     let mut snap_dual_dir_opt: Option<(Vec<u8>, u64)> = None;
     'find_dual: for c1 in 1..=dir_ren_writes {
         for c2 in (c1 + 1)..=(c1 + 5) {
-            let m = mount_test_ext4(snap_d.clone(), 64)?;
-            m.fault_cache.arm_write_fail_pair(c1, c2);
+            let m = mount(snap_d.clone(), 64)?;
+            m.cache.arm_write_pair(c1, c2);
             let _ = rename_at2(&m.tables, None, b"/sd/sub", None, b"/dd/sub", RenameFlags::default());
-            m.fault_cache.arm_write_fail_on(0);
+            m.cache.arm_write(0);
             if let (Ok(sd_r), Ok(dd_r)) =
                 (resolve_path(&m.tables, None, b"/sd/sub", rf), resolve_path(&m.tables, None, b"/dd/sub", rf))
             {
                 let ino = sd_r.inode.ino();
                 if dd_r.inode.ino() == ino {
                     drop((sd_r, dd_r));
-                    let ro_fs = mount_ro_snapshot(&m, 65)?;
+                    let ro_fs = remount_ro(&m, 65)?;
                     let ro_sub = ro_fs
                         .root_inode()
                         .lookup(b"dd")
@@ -2258,7 +2156,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
                         drop(ro_sub);
                         drop(ro_fs);
                         m.fs.sync().map_err(|_| "sync dual dir snap")?;
-                        snap_dual_dir_opt = Some((m.mem_dev.0.data.lock().clone(), ino));
+                        snap_dual_dir_opt = Some((m.dev_bytes(), ino));
                         drop(m);
                         break 'find_dual;
                     }
@@ -2270,14 +2168,14 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
     let (snap_dual_dir, dual_dir_orig_ino) = snap_dual_dir_opt.ok_or("missing dual dir snapshot")?;
 
     for &use_from in &[false, true] {
-        let m = mount_test_ext4(snap_dual_dir.clone(), 66)?;
+        let m = mount(snap_dual_dir.clone(), 66)?;
         if use_from {
-            m.fault_cache.arm_write_fail_from(2);
+            m.cache.arm_write_from(2);
         } else {
-            m.fault_cache.arm_write_fail_pair(2, 3);
+            m.cache.arm_write_pair(2, 3);
         }
         let res1 = unlink_at(&m.tables, None, b"/sd/sub", true);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         kassert!(matches!(res1, Err(VfsError::Io)));
 
         unlink_at(&m.tables, None, b"/sd/sub", true).map_err(|_| "retry cold dual rmdir")?;
@@ -2295,22 +2193,21 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
 
     // (6e) Cold-cache step-2 file rename From(4) / Pair(3, 4) without prior resolve_path
     let snap_f_orig_ino = {
-        let ro_dev = MemBlkDev::new(snap_f.clone(), true);
-        let ro_bc: Arc<dyn ext4::BlockCacheBackend> =
-            Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(ro_dev, 32).map_err(|_| "ro bc snap_f")?));
-        let ro_fs = ext4::Ext4FileSystem::mount(ro_bc, DevId::makedev(0, 67), true).map_err(|_| "ro snap_f")?;
+        let ro_fs = mount_ro_image(snap_f.clone(), 67)?;
         ro_fs.root_inode().lookup(b"sd").and_then(|d| d.lookup(b"f")).map_err(|_| "ro /sd/f")?.ino()
     };
+    let mut dual = 0;
     for &use_from in &[false, true] {
-        let m = mount_test_ext4(snap_f.clone(), 68)?;
+        let m = mount(snap_f.clone(), 68)?;
         if use_from {
-            m.fault_cache.arm_write_fail_from(4);
+            m.cache.arm_write_from(4);
         } else {
-            m.fault_cache.arm_write_fail_pair(3, 4);
+            m.cache.arm_write_pair(3, 4);
         }
         let _ = rename_at2(&m.tables, None, b"/sd/f", None, b"/dd/f", RenameFlags::default());
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         if resolve_path(&m.tables, None, b"/sd/f", rf).is_ok() && resolve_path(&m.tables, None, b"/dd/f", rf).is_ok() {
+            dual += 1;
             unlink_at(&m.tables, None, b"/sd/f", false).map_err(|_| "cold s2 unlink /sd/f")?;
             let dd_f = resolve_path(&m.tables, None, b"/dd/f", rf).map_err(|_| "cold s2 resolve /dd/f")?.inode;
             kassert_eq!(dd_f.ino(), snap_f_orig_ino);
@@ -2331,6 +2228,7 @@ fn sweep_cascading_eio_and_post_res_recovery(base_img: &[u8], quota_before: usiz
         drop(m);
         kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
     }
+    kassert!(dual >= 1); // the state this part is about was reached
 
     Ok(())
 }
@@ -2343,10 +2241,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
     let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
 
     let ro_ino_at = |img: &[u8], dir_name: Option<&str>, name: &str, minor: u32| -> Result<u64, &'static str> {
-        let ro_dev = MemBlkDev::new(img.to_vec(), true);
-        let ro_bc: Arc<dyn ext4::BlockCacheBackend> =
-            Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(ro_dev, 32).map_err(|_| "ro bc")?));
-        let ro_fs = ext4::Ext4FileSystem::mount(ro_bc, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
+        let ro_fs = mount_ro_image(img.to_vec(), minor)?;
         let dir = match dir_name {
             Some(d) => ro_fs.root_inode().lookup(d.as_bytes()).map_err(|_| "ro lookup parent")?,
             None => ro_fs.root_inode(),
@@ -2364,7 +2259,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
     }
     for &kind in &[EntryKind::File, EntryKind::Symlink, EntryKind::Dir] {
         for &same_dir in &[false, true] {
-            let m = mount_test_ext4(base_img.to_vec(), 70)?;
+            let m = mount(base_img.to_vec(), 70)?;
             mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd A")?;
             if !same_dir {
                 mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd A")?;
@@ -2392,7 +2287,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                 }
             }
             m.fs.sync().map_err(|_| "sync A")?;
-            let snap = m.mem_dev.0.data.lock().clone();
+            let snap = m.dev_bytes();
             let orig_ino = ro_ino_at(&snap, Some("sd"), "item", 71)?;
             drop(m);
 
@@ -2402,7 +2297,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
             };
             for &pinned in &[false, true] {
                 for &(c1, c2) in faults {
-                    let m = mount_test_ext4(snap.clone(), 72)?;
+                    let m = mount(snap.clone(), 72)?;
                     let pinned_inode = if pinned {
                         Some(resolve_path(&m.tables, None, src_path, rf).map_err(|_| "pin src A")?.inode)
                     } else {
@@ -2411,12 +2306,12 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                     let pinned_guard = pinned_inode.as_ref().map(|n| OpenGuard::new_unchecked(Arc::clone(n)));
 
                     if c2 == 0 {
-                        m.fault_cache.arm_write_fail_from(c1);
+                        m.cache.arm_write_from(c1);
                     } else {
-                        m.fault_cache.arm_write_fail_pair(c1, c2);
+                        m.cache.arm_write_pair(c1, c2);
                     }
                     let res = rename_at2(&m.tables, None, src_path, None, dst_path, RenameFlags::default());
-                    m.fault_cache.arm_write_fail_on(0);
+                    m.cache.arm_write(0);
                     kassert!(matches!(res, Err(VfsError::Io)));
 
                     let src_ok = resolve_path(&m.tables, None, src_path, rf).ok().map(|r| r.inode);
@@ -2483,7 +2378,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
         ExCase { same_dir: true, a_kind: EntryKind::Dir, b_kind: EntryKind::File },
     ];
     for case in &ex_cases {
-        let m = mount_test_ext4(base_img.to_vec(), 73)?;
+        let m = mount(base_img.to_vec(), 73)?;
         mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd B")?;
         if !case.same_dir {
             mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd B")?;
@@ -2516,14 +2411,14 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
         make_entry(path_a, case.a_kind)?;
         make_entry(path_b, case.b_kind)?;
         m.fs.sync().map_err(|_| "sync B")?;
-        let snap = m.mem_dev.0.data.lock().clone();
+        let snap = m.dev_bytes();
         let orig_a_ino = ro_ino_at(&snap, Some("sd"), "ea", 74)?;
         let orig_b_ino = ro_ino_at(&snap, Some(if case.same_dir { "sd" } else { "dd" }), "eb", 75)?;
         drop(m);
 
         for &pinned in &[false, true] {
             for &use_from in &[false, true] {
-                let m = mount_test_ext4(snap.clone(), 76)?;
+                let m = mount(snap.clone(), 76)?;
                 let pin_pair = if pinned {
                     let na = resolve_path(&m.tables, None, path_a, rf).map_err(|_| "pin ea")?.inode;
                     let nb = resolve_path(&m.tables, None, path_b, rf).map_err(|_| "pin eb")?.inode;
@@ -2535,12 +2430,12 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                 };
 
                 if use_from {
-                    m.fault_cache.arm_write_fail_from(2);
+                    m.cache.arm_write_from(2);
                 } else {
-                    m.fault_cache.arm_write_fail_pair(2, 3);
+                    m.cache.arm_write_pair(2, 3);
                 }
                 let res = rename_at2(&m.tables, None, path_a, None, path_b, RenameFlags(RenameFlags::EXCHANGE));
-                m.fault_cache.arm_write_fail_on(0);
+                m.cache.arm_write(0);
                 kassert!(matches!(res, Err(VfsError::Io)));
 
                 let cur_a = resolve_path(&m.tables, None, path_a, rf).map_err(|_| "resolve post ea")?.inode;
@@ -2589,27 +2484,27 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
     // (C) Cold-cache directories carrying a pre-existing nlink_floor entering rename step-2
     //     (!same_parent & same_parent) and RENAME_EXCHANGE, plus nlink_ceiling same_parent & !same_parent.
     // (C1) !same_parent rename step-2 & RENAME_EXCHANGE with new_dir carrying nlink_floor = 2 (disk = 1)
-    let m = mount_test_ext4(base_img.to_vec(), 77)?;
+    let m = mount(base_img.to_vec(), 77)?;
     let fd = mkdir_at(&m.tables, None, b"/floor_d", 0o755, 0).map_err(|_| "mkdir floor_d")?;
     let fd_orig_ino = fd.ino();
     drop(fd);
     mkdir_at(&m.tables, None, b"/other", 0o755, 0).map_err(|_| "mkdir other")?;
     mkdir_at(&m.tables, None, b"/other/mv_sub", 0o755, 0).map_err(|_| "mkdir mv_sub")?;
     m.fs.sync().map_err(|_| "sync C1")?;
-    let snap_c1 = m.mem_dev.0.data.lock().clone();
+    let snap_c1 = m.dev_bytes();
     drop(m);
 
     // Arm Pair(2, 3) on rmdir("/floor_d") in cold cache -> /floor_d has disk links_count == 1, nlink_floor == 2.
     {
-        let m = mount_test_ext4(snap_c1.clone(), 78)?;
-        m.fault_cache.arm_write_fail_pair(2, 3);
+        let m = mount(snap_c1.clone(), 78)?;
+        m.cache.arm_write_pair(2, 3);
         let res = unlink_at(&m.tables, None, b"/floor_d", true);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         kassert!(matches!(res, Err(VfsError::Io)));
 
         rename_at2(&m.tables, None, b"/other/mv_sub", None, b"/floor_d/mv_sub", RenameFlags::default())
             .map_err(|_| "rename into floor_d")?;
-        let ro_fs = mount_ro_snapshot(&m, 79)?;
+        let ro_fs = remount_ro(&m, 79)?;
         let ro_fd = ro_fs.root_inode().lookup(b"floor_d").map_err(|_| "ro floor_d")?;
         kassert_eq!(ro_fd.stat().map_err(|_| "ro stat floor_d")?.nlink, 3);
         drop(ro_fs);
@@ -2631,10 +2526,10 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
 
     // (C2) same_parent rename step-2 with nlink_floor = 2 (disk = 1) & RENAME_EXCHANGE with new_dir nlink_floor = 2 (disk = 1)
     {
-        let m = mount_test_ext4(snap_c1.clone(), 80)?;
-        m.fault_cache.arm_write_fail_pair(2, 3);
+        let m = mount(snap_c1.clone(), 80)?;
+        m.cache.arm_write_pair(2, 3);
         let res = unlink_at(&m.tables, None, b"/floor_d", true);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         kassert!(matches!(res, Err(VfsError::Io)));
 
         let (f1, _) = open_inode(
@@ -2651,7 +2546,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
             .map_err(|_| "same_parent file rename in floor_d")?;
         rename_at2(&m.tables, None, b"/other/mv_sub", None, b"/floor_d/f2", RenameFlags(RenameFlags::EXCHANGE))
             .map_err(|_| "exchange into floor_d")?;
-        let ro_fs = mount_ro_snapshot(&m, 81)?;
+        let ro_fs = remount_ro(&m, 81)?;
         let ro_fd = ro_fs.root_inode().lookup(b"floor_d").map_err(|_| "ro floor_d ex")?;
         kassert_eq!(ro_fd.stat().map_err(|_| "ro stat floor_d ex")?.nlink, 3);
         drop(ro_fs);
@@ -2671,7 +2566,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
 
     // (C3) Cold-cache directory carrying pre-existing nlink_ceiling (disk = 4, ceiling = 3)
     //      entering same_parent rename step-2 and RENAME_EXCHANGE.
-    let m = mount_test_ext4(base_img.to_vec(), 82)?;
+    let m = mount(base_img.to_vec(), 82)?;
     let cp = mkdir_at(&m.tables, None, b"/ceil_p", 0o755, 0).map_err(|_| "mkdir ceil_p")?;
     let cp_orig_ino = cp.ino();
     drop(cp);
@@ -2689,21 +2584,21 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
     .map_err(|_| "create other/f")?;
     drop(of);
     m.fs.sync().map_err(|_| "sync C3")?;
-    let snap_c3 = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_c3 = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/ceil_p/sub1", None, b"/other/f", RenameFlags(RenameFlags::EXCHANGE))
         .map_err(|_| "measure C3")?;
-    let c3_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let c3_writes = m.cache.writes.load(Ordering::Acquire);
     drop(m);
 
     let mut tested_ceil_same_parent = false;
     for fail_at in 1..=c3_writes {
-        let m = mount_test_ext4(snap_c3.clone(), 83)?;
-        m.fault_cache.arm_write_fail_on(fail_at);
+        let m = mount(snap_c3.clone(), 83)?;
+        m.cache.arm_write(fail_at);
         let res = rename_at2(&m.tables, None, b"/ceil_p/sub1", None, b"/other/f", RenameFlags(RenameFlags::EXCHANGE));
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         if res.is_err() {
-            let ro_fs = mount_ro_snapshot(&m, 84)?;
+            let ro_fs = remount_ro(&m, 84)?;
             let ro_cp = ro_fs.root_inode().lookup(b"ceil_p").map_err(|_| "ro ceil_p")?;
             let ro_nlink = ro_cp.stat().map_err(|_| "ro stat ceil_p")?.nlink;
             let ro_swapped = ro_fs
@@ -2717,7 +2612,7 @@ fn sweep_upward_drift_and_dir_floor_recovery(base_img: &[u8], quota_before: usiz
                 // Cold-cache same_parent dir rename on ceil_p (disk=4, nlink_ceiling=3).
                 rename_at2(&m.tables, None, b"/ceil_p/sub2", None, b"/ceil_p/sub2_mv", RenameFlags::default())
                     .map_err(|_| "same_parent rename on ceil_p")?;
-                let ro_fs2 = mount_ro_snapshot(&m, 85)?;
+                let ro_fs2 = remount_ro(&m, 85)?;
                 let ro_cp2 = ro_fs2.root_inode().lookup(b"ceil_p").map_err(|_| "ro ceil_p 2")?;
                 kassert_eq!(ro_cp2.stat().map_err(|_| "ro stat ceil_p 2")?.nlink, 3);
                 drop(ro_fs2);
@@ -2764,10 +2659,7 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
     let rf = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
 
     let ro_ino_at = |img: &[u8], dir_name: Option<&str>, name: &str, minor: u32| -> Result<u64, &'static str> {
-        let ro_dev = MemBlkDev::new(img.to_vec(), true);
-        let ro_bc: Arc<dyn ext4::BlockCacheBackend> =
-            Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(ro_dev, 32).map_err(|_| "ro bc")?));
-        let ro_fs = ext4::Ext4FileSystem::mount(ro_bc, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
+        let ro_fs = mount_ro_image(img.to_vec(), minor)?;
         let dir = match dir_name {
             Some(d) => ro_fs.root_inode().lookup(d.as_bytes()).map_err(|_| "ro lookup parent")?,
             None => ro_fs.root_inode(),
@@ -2797,7 +2689,7 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
         PairExCase { same_dir: true, a_kind: Kind::Dir, b_kind: Kind::File },
     ];
     for case in &cases {
-        let m = mount_test_ext4(base_img.to_vec(), 86)?;
+        let m = mount(base_img.to_vec(), 86)?;
         mkdir_at(&m.tables, None, b"/sd", 0o755, 0).map_err(|_| "mkdir sd r9")?;
         if !case.same_dir {
             mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd r9")?;
@@ -2830,20 +2722,20 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
         make_entry(path_a, case.a_kind)?;
         make_entry(path_b, case.b_kind)?;
         m.fs.sync().map_err(|_| "sync r9 ex")?;
-        let snap = m.mem_dev.0.data.lock().clone();
+        let snap = m.dev_bytes();
         let orig_a_ino = ro_ino_at(&snap, Some("sd"), "ea", 87)?;
         let orig_b_ino = ro_ino_at(&snap, Some(if case.same_dir { "sd" } else { "dd" }), "eb", 88)?;
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         rename_at2(&m.tables, None, path_a, None, path_b, RenameFlags(RenameFlags::EXCHANGE))
             .map_err(|_| "measure ex r9")?;
-        let total_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+        let total_writes = m.cache.writes.load(Ordering::Acquire);
         kassert!(total_writes >= 12);
         drop(m);
 
         for &pinned in &[false, true] {
             for c1 in 1..=total_writes {
                 for c2 in (c1 + 1)..=(c1 + 6) {
-                    let m = mount_test_ext4(snap.clone(), 89)?;
+                    let m = mount(snap.clone(), 89)?;
                     let pin_pair = if pinned {
                         let na = resolve_path(&m.tables, None, path_a, rf).map_err(|_| "pin ea r9")?.inode;
                         let nb = resolve_path(&m.tables, None, path_b, rf).map_err(|_| "pin eb r9")?.inode;
@@ -2854,9 +2746,9 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
                         None
                     };
 
-                    m.fault_cache.arm_write_fail_pair(c1, c2);
+                    m.cache.arm_write_pair(c1, c2);
                     let _ = rename_at2(&m.tables, None, path_a, None, path_b, RenameFlags(RenameFlags::EXCHANGE));
-                    m.fault_cache.arm_write_fail_on(0);
+                    m.cache.arm_write(0);
 
                     let a_at_a = resolve_path(&m.tables, None, path_a, rf).is_ok_and(|r| r.inode.ino() == orig_a_ino);
                     let a_at_b = resolve_path(&m.tables, None, path_b, rf).is_ok_and(|r| r.inode.ino() == orig_a_ino);
@@ -2914,23 +2806,23 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
 
     // (2) unlink_dir_with_recovery's Err(Ext4Error::NotFound) arm must not leak the parent's nlink:
     //     (2a) rmdir("/dd/sub") with each of its writes failing in turn
-    let m = mount_test_ext4(base_img.to_vec(), 90)?;
+    let m = mount(base_img.to_vec(), 90)?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd r9")?;
     let dd_orig_ino = dd.ino();
     drop(dd);
     mkdir_at(&m.tables, None, b"/dd/sub", 0o755, 0).map_err(|_| "mkdir dd/sub r9")?;
     m.fs.sync().map_err(|_| "sync dd/sub r9")?;
-    let snap_rmdir = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_rmdir = m.dev_bytes();
+    m.cache.arm_write(0);
     unlink_at(&m.tables, None, b"/dd/sub", true).map_err(|_| "measure rmdir dd/sub")?;
-    let rmdir_sub_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let rmdir_sub_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(rmdir_sub_writes >= 10);
     drop(m);
 
     for &pinned_dd in &[false, true] {
         let mut saw_notfound_post_err = false;
         for fail_at in 1..=rmdir_sub_writes {
-            let m = mount_test_ext4(snap_rmdir.clone(), 91)?;
+            let m = mount(snap_rmdir.clone(), 91)?;
             let pinned = if pinned_dd {
                 let d = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "pin dd r9")?.inode;
                 let g = OpenGuard::new_unchecked(Arc::clone(&d));
@@ -2938,9 +2830,9 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
             } else {
                 None
             };
-            m.fault_cache.arm_write_fail_on(fail_at);
+            m.cache.arm_write(fail_at);
             let res = unlink_at(&m.tables, None, b"/dd/sub", true);
-            m.fault_cache.arm_write_fail_on(0);
+            m.cache.arm_write(0);
             kassert!(res.is_ok() || matches!(res, Err(VfsError::Io)));
 
             if resolve_path(&m.tables, None, b"/dd/sub", rf).is_ok() {
@@ -2966,7 +2858,7 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
     }
 
     //     (2b) rename_at2("/sd/src", "/dd/dst") overwriting empty dir /dd/dst across fail_at=1..=total_writes
-    let m = mount_test_ext4(base_img.to_vec(), 92)?;
+    let m = mount(base_img.to_vec(), 92)?;
     let dd = mkdir_at(&m.tables, None, b"/dd", 0o755, 0).map_err(|_| "mkdir dd ov r9")?;
     let dd_ov_orig_ino = dd.ino();
     drop(dd);
@@ -2974,16 +2866,16 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
     mkdir_at(&m.tables, None, b"/sd/src", 0o755, 0).map_err(|_| "mkdir sd/src r9")?;
     mkdir_at(&m.tables, None, b"/dd/dst", 0o755, 0).map_err(|_| "mkdir dd/dst r9")?;
     m.fs.sync().map_err(|_| "sync ov r9")?;
-    let snap_ov = m.mem_dev.0.data.lock().clone();
-    m.fault_cache.arm_write_fail_on(0);
+    let snap_ov = m.dev_bytes();
+    m.cache.arm_write(0);
     rename_at2(&m.tables, None, b"/sd/src", None, b"/dd/dst", RenameFlags::default()).map_err(|_| "measure ov r9")?;
-    let ov_writes = m.fault_cache.write_calls.load(Ordering::Acquire);
+    let ov_writes = m.cache.writes.load(Ordering::Acquire);
     kassert!(ov_writes >= 14);
     drop(m);
 
     for &pinned_dd in &[false, true] {
         for fail_at in 1..=ov_writes {
-            let m = mount_test_ext4(snap_ov.clone(), 93)?;
+            let m = mount(snap_ov.clone(), 93)?;
             let pinned = if pinned_dd {
                 let d = resolve_path(&m.tables, None, b"/dd", rf).map_err(|_| "pin dd ov r9")?.inode;
                 let g = OpenGuard::new_unchecked(Arc::clone(&d));
@@ -2991,9 +2883,9 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
             } else {
                 None
             };
-            m.fault_cache.arm_write_fail_on(fail_at);
+            m.cache.arm_write(fail_at);
             let res = rename_at2(&m.tables, None, b"/sd/src", None, b"/dd/dst", RenameFlags::default());
-            m.fault_cache.arm_write_fail_on(0);
+            m.cache.arm_write(0);
             kassert!(res.is_ok() || matches!(res, Err(VfsError::Io)));
 
             let dst_ok = resolve_path(&m.tables, None, b"/dd/dst", rf).is_ok();
@@ -3026,23 +2918,23 @@ fn sweep_r9_exchange_pair_and_notfound_recovery(base_img: &[u8], quota_before: u
     // (3) zero_inline_symlink_before_unlink under From(1), Pair(2, 3), and From(2):
     //     inline_60 and size_lo are zeroed atomically in one write_at so From(2) can never
     //     leave non-zero size pointing at NUL bytes, and From(1)/Pair(2,3) preserve target intact.
-    let m = mount_test_ext4(base_img.to_vec(), 94)?;
+    let m = mount(base_img.to_vec(), 94)?;
     let sym = symlink_at(&m.tables, b"/sym/target/abc", None, b"/sym_z").map_err(|_| "create sym_z")?;
     let sym_orig_ino = sym.ino();
     drop(sym);
     m.fs.sync().map_err(|_| "sync sym_z")?;
-    let snap_sym_z = m.mem_dev.0.data.lock().clone();
+    let snap_sym_z = m.dev_bytes();
     drop(m);
 
     for &mode in &[0u8, 1, 2] {
-        let m = mount_test_ext4(snap_sym_z.clone(), 95)?;
+        let m = mount(snap_sym_z.clone(), 95)?;
         match mode {
-            0 => m.fault_cache.arm_write_fail_from(1),
-            1 => m.fault_cache.arm_write_fail_pair(2, 3),
-            _ => m.fault_cache.arm_write_fail_from(2),
+            0 => m.cache.arm_write_from(1),
+            1 => m.cache.arm_write_pair(2, 3),
+            _ => m.cache.arm_write_from(2),
         }
         let res = unlink_at(&m.tables, None, b"/sym_z", false);
-        m.fault_cache.arm_write_fail_on(0);
+        m.cache.arm_write(0);
         kassert!(matches!(res, Err(VfsError::Io)));
 
         let target = readlink_at(&m.tables, None, b"/sym_z").map_err(|_| "readlink sym_z")?;
@@ -3105,7 +2997,7 @@ crate::ktest!(
         kassert_eq!(t.append(b""), Ok((5, 0)));
         kassert_eq!(read_all_inode(&t).map_err(|_| "read tmpfs")?, b"xyz12");
 
-        let m = mount_test_ext4(build_minimal_ext4_image_blocks(256), 141)?;
+        let m = mount(build_minimal_ext4_image_blocks(256), 141)?;
         let e = m.fs.root_inode().create(b"ap", 0o644).map_err(|_| "ext4 create")?;
         kassert_eq!(e.write_at(0, b"abc"), Ok(3));
         kassert_eq!(e.append(b"de"), Ok((3, 2)));

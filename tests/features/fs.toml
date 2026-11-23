@@ -21,6 +21,7 @@ milestone = "M7"
 tests = [
     "ktest:lumen_kernel::vfs::tests::ext4_adapter_pagecache_quirks_and_open_unlinked",
     "ktest:lumen_kernel::vfs::tests::page_cache_global_reclaim_writes_back_and_evicts",
+    "ktest:lumen_kernel::vfs::tests::page_cache_global_reclaim_reaches_inodes_the_vfs_caches_never_held",
     "ktest:lumen_kernel::vfs::page_cache::*",
     "ktest:lumen_kernel::vfs::tests::ext4_flush_and_reclaim_preserve_dirty_on_io_error",
     "ktest:lumen_kernel::vfs::tests::ext4_truncate_and_open_unlink_preserve_state_on_io_error",
@@ -96,7 +97,7 @@ tests = [
 ]
 
 [[feature]]
-name = "ext4 device nodes report their st_rdev, decoded from i_block in Linux's old and new encodings and kept while an unlinked node is held, and other inodes report 0:0 (#292); ext4 times from 1901 to 2446 stored as Linux encodes them (a signed 32-bit second, two epoch bits, nanoseconds), clamped outside that range, whole 32-bit seconds for a time whose extra field the inode's i_extra_isize leaves out (tested at 0, 8, 12 and 16; 0 read as ext4plus does, as no extra fields), files, directories and symlinks made past 2038 keeping their atime, mtime and ctime, and stat agreeing with the disk across a remount after utimensat, chmod and chown (written at once) and after truncate, link, a write and create/rename/unlink/mkdir/rmdir/symlink in a directory (through the metadata flush), each at its own time (#294)"
+name = "ext4 device nodes report their st_rdev, decoded from i_block in Linux's old and new encodings and kept while an unlinked node is held, and other inodes report 0:0 (#292); ext4 times from 1901 to 2446 stored as Linux encodes them (a signed 32-bit second, two epoch bits, nanoseconds), clamped outside that range, whole 32-bit seconds for a time whose extra field the inode's i_extra_isize leaves out (tested at 0, 8, 12 and 16; 0 read as ext4plus does, as no extra fields), files, directories and symlinks made past 2038 keeping their atime, mtime and ctime, and stat agreeing with the disk across a remount after utimensat, chmod and chown (written at once) and after truncate, link, a write and create/rename/unlink/mkdir/rmdir/symlink in a directory (through the metadata flush), each at its own time (#294), and the operation's time as the ctime of a file or directory moved to another parent or renamed in its own, of both sides of an exchange of a file and a directory between parents, and of an inode an unlink or a rename over it leaves with a link, in memory and across a remount, the parents' link counts then what their directories call for, on disk and in memory"
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
@@ -104,7 +105,23 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_times_before_1970_and_past_2038_survive_a_remount",
     "ktest:lumen_kernel::vfs::ext4::ext4_times_follow_the_extra_fields_an_inode_has",
     "ktest:lumen_kernel::vfs::ext4::ext4_each_operation_that_sets_a_time_puts_it_on_disk",
+    "ktest:lumen_kernel::vfs::ext4::ext4_namespace_operations_set_their_childrens_ctime",
     "ktest:lumen_kernel::vfs::ext4::ext4_files_made_past_2038_keep_their_times",
+]
+
+[[feature]]
+name = "Files, directories and symlinks (inline and in a block) made on ext4 get i_crtime and i_crtime_extra set to their creation time, epoch and nanoseconds included, kept by later writes (of a file and a directory), flushes and a remount (#303)"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_new_inodes_get_a_creation_time_that_survives_a_remount",
+]
+
+[[feature]]
+name = "A failed ext4 rename whose undo can't read its entries back (every read, or every read past the inode table, failing after each write in turn; a move, an exchange and a rename over a target, of files and of directories) reports an error if it didn't complete, moves no time then and leaves a target it would have replaced with its count, not freed, keeps each name's data, leaves an inode it couldn't put back allocated for e2fsck, keeps no count in memory below the entries on disk and, once the rename completed, each parent's count exactly what its entries call for, except for a move's source left at both names, by whichever undo, whose count, its new parent's and its removal go unchecked (#322); each kind and mode has at least one fault whose undo couldn't read back; a rename over a target whose put-back fails too (two failed writes, the second within six of the first, or every write from one on) leaves the target nameless but allocated with its data and count, frees nothing, and reports an error"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_failed_rename_that_cant_read_back_keeps_every_entry",
+    "ktest:lumen_kernel::vfs::ext4::ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated",
 ]
 
 [[feature]]

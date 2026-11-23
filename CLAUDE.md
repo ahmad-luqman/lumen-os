@@ -379,11 +379,20 @@ one is its own PR that updates that doc first.
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
   undoing a namespace operation's disk changes after a write error, the
-  link counts kept in memory when an undo fails; a device's number read
+  link counts kept in memory when an undo fails (`NlinkBounds` through
+  `write_links_or_pin`/`raise_links_or_floor`); `rename` split into
+  `Exchange` (`RENAME_EXCHANGE`: `run`, `roll_back`, `finish`), `MoveEntry`
+  (link, unlink, `roll_back`, `finish`) and a held target (`hold_target`,
+  then `put_back_target` or `retire_target`); a removed child's end
+  through `ChildFate`/`settle_child`; `snapshot_live`, reclaim's and
+  `sync`'s inodes; a device's number read
   raw from `i_block`, `read_rdev`, #292; the times through `times`'
   `InodeTimes`, clamped on load and by every setter and stored by `store`/
   `store_ctime`, and `new_inode`, the one way to make an inode, #294;
-  `ktest_util::set_clock`, the ktests' clock, `Ext4Shared::now`);
+  `ktest_util`, the ext4 ktest helpers `vfs/tests.rs` and `page_cache.rs`
+  share: `FaultCache` (writes failed by number, pair or from one on,
+  reads by range or after a write fault), `Mnt`, `mount`, `remount_ro`,
+  `set_clock`, the ktests' clock, `Ext4Shared::now`);
   `vfs/tmpfs.rs`,
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
@@ -560,7 +569,10 @@ one is its own PR that updates that doc first.
   a listing keyed by entry, and `fixed_namespace_ops!`, the seven namespace
   operations each `-EROFS`), and `ext4` (#292, #294: what the ext4 adapter encodes and
   decodes itself, a device node's `i_block` as `st_rdev` and Linux's signed times
-  with their epoch bits, clamped as `timestamp_truncate` does) (host-tested).
+  with their epoch bits, clamped as `timestamp_truncate` does), and `nlink`
+  (#265: `NlinkBounds`, ext4's in-memory link-count corrections: a floor
+  and maybe a ceiling per inode, never trivial, the floor never above the
+  ceiling) (host-tested).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and

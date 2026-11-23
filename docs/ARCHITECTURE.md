@@ -5184,6 +5184,11 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   reclaiming victim inode B in strict global order `Lock 4(B) → Lock 5(B) →
   Lock 6 → 7 → 8`, and retrying—never inside `frame::alloc`, which holds an
   IRQ-off `SpinLock`, and never holding another inode's Lock 4 or Lock 5).
+  Its candidates are every live inode of each `ext4` filesystem in
+  `EXT4_FILESYSTEMS` (the root volume, which `vfs::init` registers, and the
+  ktests' volumes), whether or not the VFS's inode cache holds it, copied by
+  `Ext4FileSystem::snapshot_live` under that filesystem's Lock 6, which is
+  released before any inode is reclaimed.
   `tmpfs` pages and `detached_unlinked` pages are never evicted until truncated
   or dropped on last close.
   Because `ext4` blocks are allocated only at writeback, M7 also keeps a hard
@@ -5497,12 +5502,19 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       Applying it per inode and per field, in memory, is Lumen's design,
       since `ext4plus` can't grow `i_extra_isize`. So `stat` before and after
       a flush or a remount agree.
-    - `ext4plus`'s `create_inode` sets a new inode's atime, mtime and ctime
-      before its `i_extra_isize`, so only their low 32 bits land.
+    - `ext4plus`'s `create_inode` sets a new inode's atime, mtime, ctime and
+      crtime before its `i_extra_isize`, so only the low 32 bits of the first
+      three land and nothing of `i_crtime` (0x90: `ext4plus` places the
+      fields by `128 + i_extra_isize`, which is still 0 then).
       `times::new_inode`, the adapter's one way to make an inode (`create`,
-      `mkdir`, `symlink`), sets them again before the inode is written and
-      linked. `i_crtime` stays 0 (`set_crtime` writes nothing before
-      `i_extra_isize` either); Lumen reports no btime.
+      `mkdir`, `symlink`), sets all four again before the inode is written
+      and linked, `i_crtime_extra` too when the inode reaches it (#303), so
+      the inode stores its creation time where Linux's `statx` reads it (a
+      ktest checks the bytes; nothing reads them with Linux's tools). With
+      `i_crtime` but no `i_crtime_extra`, the time is clamped to 32 bits as
+      for the others (untested: the ktests' images give new inodes an
+      `i_extra_isize` of 32, past both fields; the branch needs 20 to 23).
+      Lumen itself reports no btime.
     - A corrupt extra word whose nanoseconds are 1e9 or more is carried into
       the seconds by `ext4plus`, which can decode a different year than
       Linux does (base `0x7fff_ffff`, extra `0xffff_fffc`: 1901 here, 2038
@@ -5536,11 +5548,21 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     error; once the entry change itself has landed (the name is gone on
     disk), they finish the operation instead and return the later error.
     When an undo write of a `links_count` fails, the adapter keeps in-memory
-    bounds (`nlink_floors` / `nlink_ceilings`) so `stat` and later
-    operations see the true link count, and the next namespace operation on
-    that inode writes the corrected count (writeback never writes
-    `links_count`); the bounds are not persisted, so an undo that never lands
-    leaves work for `e2fsck` after a reboot. Each kept bound is logged at
+    bounds so `stat` and later operations see the true link count, and the
+    next namespace operation on that inode writes the corrected count
+    (writeback never writes `links_count`); the bounds are not persisted, so
+    an undo that never lands leaves work for `e2fsck` after a reboot. The
+    bounds are `lumen_vfs::nlink::NlinkBounds` (host-tested): one map per
+    filesystem, a floor and maybe a ceiling per inode, the floor never above
+    the ceiling, and `reconcile` pins a count unless the disk already holds
+    it. An undo that knows which entries exist writes their count through
+    `write_links_or_pin`, pinning it when the write fails. Where the entries
+    can't be read back, only a floor is kept: by the exchange's and the
+    move's undo after trying to raise the count on disk
+    (`raise_links_or_floor`), and by link's and mkdir's undo of a failed
+    `Dir::link` (`undo_failed_link`) without; `unlink` and `rmdir`, unable to read
+    their directory back (or finding the name on another inode), pin the
+    count they assume. Each kept bound is logged at
     `error` (once per change, naming the inode and its disk count), and so
     is a rename undo that leaves its entries inconsistent or unreadable
     (judged once, from the entries' end state, not per attempt). `create`,
@@ -5772,7 +5794,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     returns; the `cacheable()` checks above), with `mount_root`, `mount`,
     `umount` (the evicted inodes dropped after the locks are released) and
     the snapshots: of the filesystems for `sync`, of the inodes for the
-    page-cache reclaim and procfs, and `list_mounts` for `/proc/mounts`
+    ktests' cache checks (and the host tests'), and `list_mounts` for `/proc/mounts`
     and `mount` (each filesystem asked for its device, name and read-only
     flag after the lock is released). Calls into a filesystem it still
     makes under the locks (`VfsInode::dev_id`, `ino`, `cacheable` and
