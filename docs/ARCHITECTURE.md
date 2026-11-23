@@ -5541,7 +5541,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     error; once the entry change itself has landed (the name is gone on
     disk), they finish the operation instead and return the later error.
     When an undo write of a `links_count` fails, the adapter keeps in-memory
-    bounds (`nlink_floors` / `nlink_ceilings`) so `stat` and later
+    bounds (`lumen_vfs::nlink::NlinkBounds`, host-tested: one map per
+    filesystem, a floor and maybe a ceiling per inode, the floor never above
+    the ceiling; `reconcile` pins a count unless the disk already holds it;
+    an undo writes a count through `write_links_or_pin`, pinning it when the
+    write fails, or, when the entries can't be read back, raises it through
+    `raise_links_or_floor`, keeping a floor) so `stat` and later
     operations see the true link count, and the next namespace operation on
     that inode writes the corrected count (writeback never writes
     `links_count`); the bounds are not persisted, so an undo that never lands
