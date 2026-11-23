@@ -102,11 +102,39 @@ impl NlinkBounds {
         self.bounds.insert(ino, pin) != Some(pin)
     }
 
+    /// A raise of `ino`'s count on disk to at least `min` (entries that may
+    /// exist call for it, so a count below it frees an inode still named):
+    /// `Ok` if it landed, `Err(disk)` if it failed with the disk then reading
+    /// `disk`. Either way a bound whose ceiling is below `min` goes, floor
+    /// and all (the floor is at most that ceiling, so below `min` too), since
+    /// [`Self::apply`] would cap the count under it; then a landed raise
+    /// drops a floor it covers (one at most `min`, keeping a ceiling:
+    /// [`Self::clear_floor`]; a higher floor stays, the disk holding only
+    /// `min`) and a failed one keeps at least `min` ([`Self::raise_floor`],
+    /// nothing when the disk holds it). Returns whether a floor was newly
+    /// kept or raised (what the caller logs; a bound dropped is not
+    /// reported).
+    pub fn raised_to(&mut self, ino: u32, min: u32, raise: Result<(), Option<u32>>) -> bool {
+        if self.ceiling(ino).is_some_and(|c| c < min) {
+            self.bounds.remove(&ino);
+        }
+        match raise {
+            Ok(()) => {
+                if self.floor(ino) <= min {
+                    self.clear_floor(ino);
+                }
+                false
+            }
+            Err(disk) => self.raise_floor(ino, disk, min),
+        }
+    }
+
     /// Drop `ino`'s floor, keeping a ceiling: even one below the floor
     /// that just landed on disk, which [`Self::apply`] then still caps to
     /// (unlike [`Self::raise_floor`], which drops such a ceiling). As the
-    /// two maps this replaced did. The kernel's floors come from counts
-    /// with the bounds applied, so none is known to land above a ceiling.
+    /// two maps this replaced did. A floor that may land above a ceiling
+    /// (a raise for entries that may exist, one past the count with the
+    /// bounds applied) goes through [`Self::raised_to`] instead.
     pub fn clear_floor(&mut self, ino: u32) {
         if let Some(bound) = self.bounds.get_mut(&ino) {
             bound.floor = 0;
@@ -191,6 +219,49 @@ mod tests {
         assert!(b.raise_floor(1, None, 4));
         b.clear_floor(1);
         assert!(b.bounds.is_empty()); // nothing trivial is kept
+    }
+
+    #[test]
+    fn a_raise_drops_a_ceiling_below_it_whether_it_landed_or_not() {
+        // A stale pin at 2 under a raise to 3 (#322: a source that may be at
+        // both names): landed, nothing is kept and the disk's 3 stands.
+        let mut b = NlinkBounds::new();
+        assert!(b.reconcile(1, None, 2));
+        assert!(!b.raised_to(1, 3, Ok(())));
+        assert_eq!((b.apply(1, 3), b.floor(1), b.ceiling(1)), (3, 0, None));
+        assert!(b.bounds.is_empty());
+        // Failed, with the disk reading 3 anyway (`raise_floor` keeps no
+        // floor then): the pin still goes, so the count isn't capped at 2.
+        assert!(b.reconcile(1, None, 2));
+        assert!(!b.raised_to(1, 3, Err(Some(3))));
+        assert_eq!((b.apply(1, 3), b.ceiling(1)), (3, None));
+        // The pin's floor goes with it: a lower count later is not raised.
+        assert_eq!((b.floor(1), b.apply(1, 1)), (0, 1));
+        assert!(b.bounds.is_empty());
+        // Failed, the disk unreadable or low: a floor of 3, no ceiling.
+        assert!(b.reconcile(1, None, 2));
+        assert!(b.raised_to(1, 3, Err(None)));
+        assert_eq!((b.floor(1), b.ceiling(1), b.apply(1, 1)), (3, None, 3));
+        // A ceiling at or above the raise stays.
+        assert!(b.reconcile(2, None, 3));
+        assert!(!b.raised_to(2, 2, Ok(())));
+        assert_eq!((b.floor(2), b.ceiling(2)), (3, Some(3))); // the floor above the raise stays too
+        assert!(b.reconcile(3, None, 3));
+        assert!(!b.raised_to(3, 3, Err(None))); // the floor was 3 already
+        assert_eq!((b.floor(3), b.ceiling(3)), (3, Some(3)));
+        // A landed raise below a floor leaves the floor: the disk holds
+        // only the raise.
+        assert!(b.raise_floor(4, None, 4));
+        assert!(!b.raised_to(4, 2, Ok(())));
+        assert_eq!((b.floor(4), b.apply(4, 2)), (4, 4));
+        // A landed raise drops a floor equal to it.
+        assert!(b.raise_floor(5, None, 3));
+        assert!(!b.raised_to(5, 3, Ok(())));
+        assert_eq!(b.floor(5), 0);
+        // A landed raise keeps a ceiling at it, dropping the pin's floor.
+        assert!(b.reconcile(6, None, 3));
+        assert!(!b.raised_to(6, 3, Ok(())));
+        assert_eq!((b.floor(6), b.ceiling(6)), (0, Some(3)));
     }
 
     #[test]
