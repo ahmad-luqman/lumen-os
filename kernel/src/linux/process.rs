@@ -311,23 +311,34 @@ pub fn register_current(
 /// exits, its descriptors closed (each lock released as `close` does, outside
 /// `ACTIVE_PROCS`); its working directory goes when it drops.
 pub fn take_current() -> ProcessState {
-    let ktid = current_kernel_tid();
-    let mut proc = ACTIVE_PROCS.lock().remove(&ktid).expect("active process state missing after ring-3 exit");
+    take_of(current_kernel_tid()).expect("active process state missing after ring-3 exit")
+}
+
+/// Remove thread `ktid`'s [`ProcessState`], if it has one, and close its
+/// descriptors outside `ACTIVE_PROCS` ([`take_current`]).
+fn take_of(ktid: u64) -> Option<ProcessState> {
+    let mut proc = ACTIVE_PROCS.lock().remove(&ktid)?;
     for entry in proc.fds.drain_all() {
         release_fd(proc.pid, entry.file);
     }
-    proc
+    Some(proc)
 }
 
-/// A process the kernel's own checks register on the current user thread
-/// (`vfstest`'s `/proc` check, procfs's ktest, [`in_test_process`]), with
-/// `ConsoleIo::Capture`, no test syscalls, no stdin and no executable path:
-/// taken down ([`take_current`], closing its descriptors) when it drops,
-/// so an early return can't leave it in `ACTIVE_PROCS` (where it would
-/// stay in `/proc` for good and pin its address space), or by
-/// [`RegisteredProcess::end`] for its [`ProcessState`]. Not `Send`: it
-/// names the thread that registered it. Real runs (`user.rs`) register and
-/// take their process themselves.
+/// A process the kernel's own checks register on the current user thread,
+/// taken down (its descriptors closed, as [`take_current`] does) when this
+/// drops, so an early return can't leave it in `ACTIVE_PROCS`, where it
+/// would stay in `/proc` for good. It starts with `ConsoleIo::Capture`, no
+/// test syscalls, no stdin and no executable path. Real runs (`user.rs`)
+/// register and take their process themselves.
+///
+/// - Drop it, or [`end`](Self::end) it for its [`ProcessState`], before
+///   `sched::detach_user_space`: the state holds the thread's address
+///   space, so a process still registered then keeps the space from being
+///   torn down (its frames leak).
+/// - Never call [`take_current`] while it lives: its own takedown would
+///   find no process, a panic.
+/// - Not `Send`: taking it down finds the process by the running thread.
+#[must_use = "dropping it takes its process down again at once"]
 pub(crate) struct RegisteredProcess {
     pid: u32,
     _on_this_thread: PhantomData<*const ()>,
@@ -349,16 +360,27 @@ impl RegisteredProcess {
     /// Take the process down now ([`take_current`]) and return its state
     /// (what its console captured, say).
     pub(crate) fn end(self) -> ProcessState {
-        // Taken here, so `Drop` must not take it again; nothing else in
-        // `self` needs dropping.
+        let proc = self.take();
+        // Taken, so `Drop` must not take it again; nothing else in `self`
+        // needs dropping.
         core::mem::forget(self);
-        take_current()
+        proc
+    }
+
+    /// Take the current thread's process down: this one's, or a panic.
+    fn take(&self) -> ProcessState {
+        let ktid = current_kernel_tid();
+        let proc = take_of(ktid).unwrap_or_else(|| {
+            panic!("pid {}: thread {ktid} has no process left to take down", self.pid);
+        });
+        debug_assert_eq!(proc.pid, self.pid, "thread {ktid}'s process isn't the one it registered");
+        proc
     }
 }
 
 impl Drop for RegisteredProcess {
     fn drop(&mut self) {
-        drop(take_current());
+        drop(self.take());
     }
 }
 
@@ -950,10 +972,9 @@ pub(crate) const KTEST_USER_LEN: u64 = 4 * 4096;
 
 /// Run `f` as a Linux process for a ktest: on a user thread with its own
 /// address space ([`KTEST_USER_LEN`] bytes mapped at [`KTEST_USER_VA`], so
-/// handlers can copy to and from user memory) and a registered
-/// [`ProcessState`] (a [`RegisteredProcess`]), handed its pid. The process
-/// is taken down (`take_current`, closing its descriptors) when `f` returns,
-/// whatever it returned, and `f`'s result comes back.
+/// handlers can copy to and from user memory) and a [`RegisteredProcess`],
+/// handed its pid. `f`'s result comes back once the process is taken down,
+/// whatever `f` returned.
 #[cfg(feature = "ktest")]
 pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send + 'static) -> Result<R, &'static str> {
     use lumen_vm::Prot;
@@ -986,6 +1007,16 @@ pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send
     space.teardown();
     result
 }
+
+crate::ktest!(
+    fn in_test_process_takes_its_process_down() {
+        use crate::kassert;
+        let (pid, listed) = in_test_process(|pid| (pid, active_pids().contains(&pid)))?;
+        kassert!(listed);
+        kassert!(!active_pids().contains(&pid));
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn process_starts_with_console_fds_and_root_cwd() {

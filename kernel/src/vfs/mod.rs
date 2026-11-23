@@ -891,11 +891,11 @@ fn check_proc_of_a_process() -> Result<String, String> {
 
             Ok(format!("pid={pid} maps_ok tty_ok"))
         })();
-        // Ended here, a failed check included, for what its console
-        // captured. Fd 3 isn't open if a check failed before it was: nothing
-        // to close then.
+        // Fd 3 isn't open if a check failed before it was: nothing to close
+        // then.
         let _ = process::close_current_fd(3);
         let fd_link_after_close = proc_nodes.as_ref().map(|(_, fd)| fd.stat().err());
+        // Ended here, a failed check included, for what its console captured.
         let proc_state = registered.end();
         // These nodes were resolved while the process lived and are still
         // held (the VFS no longer caches them, #263), so procfs's `stat` must

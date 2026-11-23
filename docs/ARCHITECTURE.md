@@ -5991,7 +5991,7 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 - **Open file descriptions vs FD table:**
   - `FdEntry { file: Arc<OpenFile>, cloexec: bool }` in per-process `FdTable`
     (capacity `MAX_FDS = 1024`).
-  - `OpenFile { id: OpenFileId, path: Arc<[u8]>, flags: OpenFlags, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64>, open_guard: OpenGuard }`.
+  - `OpenFile { id: OpenFileId, path: Arc<[u8]>, access_mode: AccessMode, is_path: bool, status_flags: AtomicU32, fd_refs: AtomicU32, offset: SleepMutex<u64>, dir_cursor: SleepMutex<u64>, open_guard: OpenGuard }`.
     Its inode is `OpenFile::inode()`, read from its `OpenGuard` (#264): no
     field of its own that could be pointed at an inode it doesn't keep open.
   - **Opening (#262):** `open_inode_guarded` returns an `Opened` (the
