@@ -24,6 +24,7 @@ pub mod locks;
 pub mod mount;
 pub mod ops;
 pub mod procfs;
+pub mod pseudo;
 pub mod resolve;
 pub mod types;
 

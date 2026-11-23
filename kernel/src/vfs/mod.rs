@@ -340,7 +340,6 @@ pub fn sync_command(ctx: &mut Ctx<'_>, args: &[String]) {
     }
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))]
 fn parse_octal(s: &str) -> Option<u16> {
     u16::from_str_radix(s, 8).ok()
 }
@@ -349,7 +348,6 @@ fn parse_octal(s: &str) -> Option<u16> {
 /// the heap first, and a length from the shell must not panic the kernel.
 const WRITE_PATTERN_MAX: usize = 16 << 20;
 
-#[cfg_attr(feature = "ktest", allow(dead_code))]
 fn vfs_pattern_byte(idx: usize) -> u8 {
     ((idx.wrapping_mul(131)) ^ (idx >> 8).wrapping_mul(17) ^ 0x5a) as u8
 }
@@ -486,14 +484,22 @@ fn check_listing_agrees_with_lookup(dir: &Arc<dyn VfsInode>, what: &str, names: 
     Ok(())
 }
 
-#[cfg_attr(feature = "ktest", allow(dead_code))]
-fn run_dev_tmp_proc_checks() -> Result<String, String> {
-    use crate::linux::process::{self, ConsoleIo};
-    use crate::mm::user_vm::AddressSpace;
-    use crate::sched;
-    use lumen_vm::Prot;
+/// `what: got`, unless `got` is `want`.
+fn expect_eq<T: PartialEq + fmt::Debug>(what: &str, got: T, want: T) -> Result<(), String> {
+    if got == want { Ok(()) } else { Err(format!("{what}: {got:?}, expected {want:?}")) }
+}
 
-    // 1. /tmp: mode 1777, write, read, open-unlinked, and 32 MiB quota (-ENOSPC).
+/// `vfstest dev-tmp-proc`'s checks of `/tmp`, `/dev` and `/proc`, a
+/// section at a time, the last from a user process's thread: its summary.
+fn run_dev_tmp_proc_checks() -> Result<String, String> {
+    check_tmp()?;
+    check_dev()?;
+    check_proc_static()?;
+    check_proc_of_a_process().map(|summary| format!("{summary} quota_ok"))
+}
+
+/// `/tmp`: mode 1777, write, read, open-unlinked, and 32 MiB quota (-ENOSPC).
+fn check_tmp() -> Result<(), String> {
     let tmp_mode = resolve_path_from_root("/tmp").and_then(|t| t.stat()).map_err(|e| format!("stat /tmp: {e:?}"))?.mode;
     if tmp_mode & 0o7777 != 0o1777 {
         return Err(format!("/tmp mode {tmp_mode:o}, expected 1777"));
@@ -569,23 +575,15 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         unlink_at(&TABLES, None, b"/tmp/after_quota.bin", false)
             .map_err(|e| format!("unlink after_quota.bin: {e:?}"))?;
     }
+    Ok(())
+}
 
-    // 2. /dev namespace ROFS vs char dev exemptions + 6 nodes.
-    if !matches!(
-        open_inode(
-            &TABLES,
-            None,
-            b"/dev/forbidden",
-            OpenFlags::from_bits_truncate(OpenFlags::O_CREAT | OpenFlags::O_WRONLY),
-            0o644,
-            0
-        ),
-        Err(VfsError::RoFs)
-    ) {
-        return Err(String::from("/dev create did not return -EROFS"));
-    }
-    // The type and number only: a node's mode and owner are boot values a
-    // `chmod` or `chown` may have changed since (#293; devfs's
+/// `/dev`: a writable mount whose names never change, and its 6 nodes.
+fn check_dev() -> Result<(), String> {
+    check_dev_namespace()?;
+    // Each node is still there after the refusals. The type and number
+    // only: a node's mode and owner are boot values a `chmod` or `chown`
+    // may have changed since (#293; devfs's
     // `devfs_nodes_start_with_their_boot_metadata` checks the boot modes
     // and owners).
     for (path, maj, min) in [
@@ -603,22 +601,22 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
         }
     }
     let dev_null = resolve_path_from_root("/dev/null").map_err(|e| format!("/dev/null: {e:?}"))?;
-    if dev_null.write_at(0, b"discard").map_err(|e| format!("{e:?}"))? != 7 {
+    if dev_null.write_at(0, b"discard").map_err(|e| format!("/dev/null write: {e:?}"))? != 7 {
         return Err(String::from("/dev/null write failed"));
     }
     let mut nb = [0xAAu8; 8];
-    if dev_null.read_at(0, &mut nb).map_err(|e| format!("{e:?}"))? != 0 {
+    if dev_null.read_at(0, &mut nb).map_err(|e| format!("/dev/null read: {e:?}"))? != 0 {
         return Err(String::from("/dev/null read non-empty"));
     }
 
     let dev_zero = resolve_path_from_root("/dev/zero").map_err(|e| format!("/dev/zero: {e:?}"))?;
     let mut zb = [0xFFu8; 16];
-    if dev_zero.read_at(0, &mut zb).map_err(|e| format!("{e:?}"))? != 16 || zb != [0u8; 16] {
+    if dev_zero.read_at(0, &mut zb).map_err(|e| format!("/dev/zero read: {e:?}"))? != 16 || zb != [0u8; 16] {
         return Err(String::from("/dev/zero read mismatch"));
     }
 
-    let dev_rand = resolve_path_from_root("/dev/random").map_err(|e| format!("{e:?}"))?;
-    let dev_urand = resolve_path_from_root("/dev/urandom").map_err(|e| format!("{e:?}"))?;
+    let dev_rand = resolve_path_from_root("/dev/random").map_err(|e| format!("/dev/random: {e:?}"))?;
+    let dev_urand = resolve_path_from_root("/dev/urandom").map_err(|e| format!("/dev/urandom: {e:?}"))?;
     let mut rbuf = [0u8; 32];
     let mut ubuf1 = [0u8; 32];
     let mut ubuf2 = [0u8; 32];
@@ -631,13 +629,114 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
     if dev_urand.read_at(0, &mut []).map_err(|e| format!("/dev/urandom empty read: {e:?}"))? != 0 {
         return Err(String::from("/dev/urandom empty read non-zero"));
     }
+    Ok(())
+}
 
-    // 3. /proc static virtual views (st_size == 0). This kernel thread is no
-    // Linux process, so `/proc/self` dangles and no `/proc/<pid>` is invented.
-    match readlink_at(&TABLES, None, b"/proc/self") {
-        Err(VfsError::NoEnt) => {}
-        other => return Err(format!("/proc/self from a kernel thread: {other:?}, expected NoEnt")),
+/// `/dev`'s namespace. devfs's mount is writable, as Linux's devtmpfs
+/// (#301), so lumen-vfs's own checks answer first, as on any writable mount
+/// (a missing name to unlink or rename, a node that is no directory, a name
+/// in use under `RENAME_NOREPLACE`, a link from another mount; a rename onto
+/// itself does nothing), and a change that reaches devfs is `-EROFS` (a
+/// divergence: devtmpfs takes these from root), `mkdir` and `symlink` onto a
+/// name in use too (Linux: `-EEXIST`). Every check runs and every mismatch
+/// is reported, until a change goes through (`Ok` where a refusal was
+/// expected): the checks stop there.
+fn check_dev_namespace() -> Result<(), String> {
+    let creat = OpenFlags::from_bits_truncate(OpenFlags::O_CREAT | OpenFlags::O_WRONLY);
+    let none = RenameFlags::default();
+    let noreplace = RenameFlags(RenameFlags::NOREPLACE);
+    let exchange = RenameFlags(RenameFlags::EXCHANGE);
+    let rofs = Err(VfsError::RoFs);
+    let noent = Err(VfsError::NoEnt);
+    let dev = resolve_path_from_root("/dev").map_err(|e| format!("/dev: {e:?}"))?;
+    create_truncated("/tmp/dev_link_src.txt").map_err(|e| format!("open /tmp/dev_link_src.txt: {e:?}"))?;
+    let mut mismatches = Vec::new();
+    // A change that went through (`Ok` where a refusal was expected) stops
+    // the checks: the ones after it would run on a changed `/dev` and bury
+    // it under their own mismatches.
+    let mut changed = false;
+    let mut skipped = 0usize;
+    let mut check = |what: &str, op: &dyn Fn() -> Result<(), VfsError>, want: Result<(), VfsError>| {
+        if changed {
+            skipped += 1;
+            return;
+        }
+        let got = op();
+        changed = got.is_ok() && want.is_err();
+        if let Err(mismatch) = expect_eq(&format!("/dev {what}"), got, want) {
+            mismatches.push(mismatch);
+        }
+    };
+    // Changes that reach devfs.
+    check("create", &|| open_inode(&TABLES, None, b"/dev/forbidden", creat, 0o644, 0).map(drop), rofs);
+    check("mkdir", &|| mkdir_at(&TABLES, None, b"/dev/forbidden", 0o755, 0).map(drop), rofs);
+    check("mkdir over a node", &|| mkdir_at(&TABLES, None, b"/dev/null", 0o755, 0).map(drop), rofs);
+    check("symlink", &|| symlink_at(&TABLES, b"null", None, b"/dev/forbidden").map(drop), rofs);
+    check("symlink over a node", &|| symlink_at(&TABLES, b"zero", None, b"/dev/null").map(drop), rofs);
+    check("link", &|| lumen_vfs::link_at(&TABLES, None, b"/dev/null", None, b"/dev/forbidden", false, false), rofs);
+    check("unlink", &|| unlink_at(&TABLES, None, b"/dev/null", false), rofs);
+    check("rename", &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/forbidden", none), rofs);
+    check("rename over", &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", none), rofs);
+    check("rename exchange", &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", exchange), rofs);
+    check("rmdir (devfs's own)", &|| dev.rmdir(b"null"), rofs);
+    // lumen-vfs's own answers, before devfs is asked.
+    check("unlink of a missing name", &|| unlink_at(&TABLES, None, b"/dev/missing", false), noent);
+    check(
+        "rename of a missing name",
+        &|| rename_at2(&TABLES, None, b"/dev/missing", None, b"/dev/forbidden", none),
+        noent,
+    );
+    check(
+        "rename exchange with a missing name",
+        &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/missing", exchange),
+        noent,
+    );
+    check("rmdir of a node", &|| unlink_at(&TABLES, None, b"/dev/null", true), Err(VfsError::NotDir));
+    check(
+        "RENAME_NOREPLACE over a node",
+        &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/zero", noreplace),
+        Err(VfsError::Exist),
+    );
+    check("rename onto itself", &|| rename_at2(&TABLES, None, b"/dev/null", None, b"/dev/null", none), Ok(()));
+    check(
+        "link from /tmp",
+        &|| lumen_vfs::link_at(&TABLES, None, b"/tmp/dev_link_src.txt", None, b"/dev/forbidden", false, false),
+        Err(VfsError::XDev),
+    );
+    check("forbidden after the refusals", &|| resolve_path_from_root("/dev/forbidden").map(drop), noent);
+    if skipped > 0 {
+        let s = if skipped == 1 { "" } else { "s" };
+        mismatches.push(format!("/dev: a change went through, so the {skipped} check{s} after it didn't run"));
     }
+    // A `/dev/forbidden` that a change left (reported above) is removed, or
+    // the next run's `create` would open it and stop there, blaming the
+    // wrong check: a removal that fails is reported too. A device there is
+    // a boot node a rename moved: it is left, not unlinked for good.
+    match resolve_path_from_root("/dev/forbidden").and_then(|n| n.stat()) {
+        Ok(st) if st.inode_type == InodeType::CharDevice => {
+            mismatches.push(format!("/dev/forbidden is a moved boot node (rdev {}), left there", st.rdev));
+        }
+        Ok(_) => {
+            if let Err(e) = unlink_at(&TABLES, None, b"/dev/forbidden", false)
+                .or_else(|_| unlink_at(&TABLES, None, b"/dev/forbidden", true))
+            {
+                mismatches.push(format!("couldn't remove the /dev/forbidden left behind: {e:?}"));
+            }
+        }
+        Err(_) => {}
+    }
+    if let Err(e) = unlink_at(&TABLES, None, b"/tmp/dev_link_src.txt", false) {
+        mismatches.push(format!("unlink /tmp/dev_link_src.txt: {e:?}"));
+    }
+    if mismatches.is_empty() { Ok(()) } else { Err(mismatches.join("; ")) }
+}
+
+/// `/proc`'s static virtual views (st_size == 0). This kernel thread is no
+/// Linux process, so `/proc/self` dangles and no `/proc/<pid>` is invented.
+fn check_proc_static() -> Result<(), String> {
+    use crate::linux::process;
+
+    expect_eq("/proc/self from a kernel thread", readlink_at(&TABLES, None, b"/proc/self"), Err(VfsError::NoEnt))?;
     if process::active_pids().is_empty() {
         let mut names = Vec::new();
         resolve_path_from_root("/proc")
@@ -658,10 +757,20 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
             return Err(format!("{path} empty"));
         }
     }
+    Ok(())
+}
 
-    // 4. Spawn a user thread with real AddressSpace + ProcessState to test
-    // /proc/self, /proc/self/exe, /proc/self/fd/* magic symlinks (incl. deleted),
-    // /proc/self/maps format, and /dev/tty + /dev/console ConsoleIo::Capture.
+/// `/proc/self`, `/proc/self/exe`, the `/proc/self/fd/*` magic links (a
+/// deleted file's too), `/proc/self/maps`, and what `/dev/tty` and
+/// `/dev/console` write (`ConsoleIo::Capture`), from a user thread with a
+/// real `AddressSpace` and `ProcessState`: the run's summary
+/// (`pid=<pid> maps_ok tty_ok`).
+fn check_proc_of_a_process() -> Result<String, String> {
+    use crate::linux::process::{self, ConsoleIo};
+    use crate::mm::user_vm::AddressSpace;
+    use crate::sched;
+    use lumen_vm::Prot;
+
     let space = Arc::new(AddressSpace::new().map_err(|e| format!("AddressSpace::new: {e}"))?);
     let _anon = space
         .mmap_anon(
@@ -696,10 +805,11 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
                 return Err(String::from("injected failure"));
             }
             // No executable path recorded yet: `exe` has no target.
-            match readlink_at(&TABLES, None, b"/proc/self/exe") {
-                Err(VfsError::NoEnt) => {}
-                other => return Err(format!("/proc/self/exe without a path: {other:?}, expected NoEnt")),
-            }
+            expect_eq(
+                "/proc/self/exe without a path",
+                readlink_at(&TABLES, None, b"/proc/self/exe"),
+                Err(VfsError::NoEnt),
+            )?;
             if read_all_inode(&resolve_path_from_root("/proc/self/mounts").map_err(|e| format!("self/mounts: {e:?}"))?)
                 .map_err(|e| format!("read /proc/self/mounts: {e:?}"))?
                 .is_empty()
@@ -780,7 +890,7 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
             tty.write_at(0, b"tty-ok ").map_err(|e| format!("tty write: {e:?}"))?;
             con.write_at(0, b"con-ok").map_err(|e| format!("con write: {e:?}"))?;
 
-            Ok(format!("pid={pid} maps_ok tty_ok quota_ok"))
+            Ok(format!("pid={pid} maps_ok tty_ok"))
         })();
         // Always unregister, a failed check included: a `ProcessState` left in
         // `ACTIVE_PROCS` would stay in `/proc` for good and pin its address space.
@@ -824,243 +934,240 @@ fn run_dev_tmp_proc_checks() -> Result<String, String> {
 }
 
 /// `vfstest` shell command handler: exercises real VFS paths, `PageCache`,
-/// `ext4`, `tmpfs`, `devfs`, and `procfs` operations.
+/// `ext4`, `tmpfs`, `devfs`, and `procfs` operations, a function per
+/// subcommand.
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 pub fn vfstest_command(ctx: &mut Ctx<'_>, args: &[String]) {
     match args {
-        [sub, path] if sub == "stat" => match resolve_path(
-            &TABLES,
-            None,
-            path.as_bytes(),
-            ResolveFlags { follow_final: false, empty_path: false, require_dir: false },
-        ) {
-            Ok(res) => match res.inode.stat() {
-                Ok(st) => {
-                    let kind = match st.inode_type {
-                        InodeType::File => "file",
-                        InodeType::Dir => "dir",
-                        InodeType::Symlink => "symlink",
-                        InodeType::CharDevice => "char",
-                        InodeType::BlockDevice => "block",
-                        InodeType::Fifo => "fifo",
-                        InodeType::Socket => "socket",
-                    };
-                    let _ = writeln!(
-                        ctx.out,
-                        "dev={} ino={} type={kind} mode={:04o} nlink={} size={} rdev={} mtime={}.{:09}",
-                        st.dev, st.ino, st.mode, st.nlink, st.size, st.rdev, st.mtime.sec, st.mtime.nsec
-                    );
-                }
-                Err(e) => ctx.fail(format_args!("stat: {e:?}")),
-            },
-            Err(e) => ctx.fail(format_args!("stat: {e:?}")),
-        },
-        [sub, path] if sub == "cat" => match open_inode(
-            &TABLES,
-            None,
-            path.as_bytes(),
-            OpenFlags::from_bits_truncate(OpenFlags::O_RDONLY),
-            0,
-            0,
-        ) {
-            Ok((inode, _)) => match read_all_inode(&inode) {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    write_in_chunks(ctx.out, &text);
-                    if !text.ends_with('\n') {
-                        let _ = ctx.out.write_str("\n");
-                    }
-                }
-                Err(e) => ctx.fail(format_args!("cat: {e:?}")),
-            },
-            Err(e) => ctx.fail(format_args!("cat: {e:?}")),
-        },
-        [sub, path, len_str] if sub == "read" => {
-            let Ok(len) = len_str.parse::<usize>() else {
-                return ctx.fail("usage: vfstest read <path> <bytes>");
-            };
-            if len > 64 * 1024 {
-                return ctx.fail("read: length exceeds 64 KiB");
-            }
-            match open_inode(
-                &TABLES,
-                None,
-                path.as_bytes(),
-                OpenFlags::from_bits_truncate(OpenFlags::O_RDONLY),
-                0,
-                0,
-            ) {
-                Ok((inode, _)) => {
-                    let mut buf = vec![0xA5u8; len];
-                    match inode.read_at(0, &mut buf) {
-                        Ok(n) => {
-                            let _ = writeln!(ctx.out, "read: {n}");
-                        }
-                        Err(e) => ctx.fail(format_args!("read: {e:?}")),
-                    }
-                }
-                Err(e) => ctx.fail(format_args!("read: {e:?}")),
-            }
-        }
-        [sub, path, text @ ..] if sub == "write" && !text.is_empty() => {
-            let payload = text.join(" ");
-            match open_inode(
-                &TABLES,
-                None,
-                path.as_bytes(),
-                OpenFlags::from_bits_truncate(OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-                0o644,
-                0o022,
-            ) {
-                Ok((inode, _)) => match inode.write_at(0, payload.as_bytes()) {
-                    Ok(n) => {
-                        let _ = writeln!(ctx.out, "wrote {n}");
-                    }
-                    Err(e) => ctx.fail(format_args!("write: {e:?}")),
-                },
-                Err(e) => ctx.fail(format_args!("write: {e:?}")),
-            }
-        }
-        [sub, path, len_str] if sub == "write-pattern" => {
-            let Ok(len) = len_str.parse::<usize>() else {
-                return ctx.fail("usage: vfstest write-pattern <path> <bytes>");
-            };
-            if len > WRITE_PATTERN_MAX {
-                return ctx.fail("write-pattern: length exceeds 16 MiB");
-            }
-            match open_inode(
-                &TABLES,
-                None,
-                path.as_bytes(),
-                OpenFlags::from_bits_truncate(OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC),
-                0o644,
-                0o022,
-            ) {
-                Ok((inode, _)) => {
-                    let mut buf = vec![0u8; len];
-                    for (i, b) in buf.iter_mut().enumerate() {
-                        *b = vfs_pattern_byte(i);
-                    }
-                    match inode.write_at(0, &buf) {
-                        Ok(n) => {
-                            let _ = writeln!(ctx.out, "wrote {n}");
-                        }
-                        Err(e) => ctx.fail(format_args!("write-pattern: {e:?}")),
-                    }
-                }
-                Err(e) => ctx.fail(format_args!("write-pattern: {e:?}")),
-            }
-        }
-        [sub, path, len_str] if sub == "verify-pattern" => {
-            let Ok(len) = len_str.parse::<usize>() else {
-                return ctx.fail("usage: vfstest verify-pattern <path> <bytes>");
-            };
-            match resolve_path_from_root(path).and_then(|i| read_all_inode(&i)) {
-                Ok(bytes) => {
-                    if bytes.len() != len {
-                        return ctx.fail(format_args!("verify-pattern: len {} != {len}", bytes.len()));
-                    }
-                    for (i, &b) in bytes.iter().enumerate() {
-                        let exp = vfs_pattern_byte(i);
-                        if b != exp {
-                            return ctx.fail(format_args!("verify-pattern: mismatch at {i}: {b:#x} != {exp:#x}"));
-                        }
-                    }
-                    let _ = writeln!(ctx.out, "verify-pattern: ok ({len})");
-                }
-                Err(e) => ctx.fail(format_args!("verify-pattern: {e:?}")),
-            }
-        }
-        [sub, path, rest @ ..] if sub == "mkdir" && rest.len() <= 1 => {
-            let mode = match rest.first() {
-                Some(m) => match parse_octal(m) {
-                    Some(v) => v,
-                    None => return ctx.fail("usage: vfstest mkdir <path> [octal_mode]"),
-                },
-                None => 0o755,
-            };
-            match mkdir_at(&TABLES, None, path.as_bytes(), mode, 0) {
-                Ok(_) => {
-                    let _ = ctx.out.write_str("mkdir: ok\n");
-                }
-                Err(e) => ctx.fail(format_args!("mkdir: {e:?}")),
-            }
-        }
-        [sub, linkpath, target] if sub == "symlink" => {
-            match symlink_at(&TABLES, target.as_bytes(), None, linkpath.as_bytes()) {
-                Ok(_) => {
-                    let _ = ctx.out.write_str("symlink: ok\n");
-                }
-                Err(e) => ctx.fail(format_args!("symlink: {e:?}")),
-            }
-        }
-        [sub, path] if sub == "readlink" => match readlink_at(&TABLES, None, path.as_bytes()) {
-            Ok(bytes) => {
-                let _ = writeln!(ctx.out, "{}", Escaped(&bytes));
-            }
-            Err(e) => ctx.fail(format_args!("readlink: {e:?}")),
-        },
-        [sub, path, mode_str] if sub == "chmod" => {
-            let Some(mode) = parse_octal(mode_str) else {
-                return ctx.fail("usage: vfstest chmod <path> <octal_mode>");
-            };
-            match resolve_path_from_root(path).and_then(|i| i.set_mode(mode)) {
-                Ok(()) => {
-                    let _ = ctx.out.write_str("chmod: ok\n");
-                }
-                Err(e) => ctx.fail(format_args!("chmod: {e:?}")),
-            }
-        }
-        [sub, path, size_str] if sub == "truncate" => {
-            let Ok(sz) = size_str.parse::<u64>() else {
-                return ctx.fail("usage: vfstest truncate <path> <size>");
-            };
-            match resolve_path_from_root(path).and_then(|i| i.truncate(sz)) {
-                Ok(()) => {
-                    let _ = ctx.out.write_str("truncate: ok\n");
-                }
-                Err(e) => ctx.fail(format_args!("truncate: {e:?}")),
-            }
-        }
-        [sub, path] if sub == "unlink" => match unlink_at(&TABLES, None, path.as_bytes(), false) {
-            Ok(()) => {
-                let _ = ctx.out.write_str("unlink: ok\n");
-            }
-            Err(e) => ctx.fail(format_args!("unlink: {e:?}")),
-        },
-        [sub, path] if sub == "rmdir" => match unlink_at(&TABLES, None, path.as_bytes(), true) {
-            Ok(()) => {
-                let _ = ctx.out.write_str("rmdir: ok\n");
-            }
-            Err(e) => ctx.fail(format_args!("rmdir: {e:?}")),
-        },
-        [sub, old, new] if sub == "rename" => {
-            match rename_at2(&TABLES, None, old.as_bytes(), None, new.as_bytes(), RenameFlags::default()) {
-                Ok(()) => {
-                    let _ = ctx.out.write_str("rename: ok\n");
-                }
-                Err(e) => ctx.fail(format_args!("rename: {e:?}")),
-            }
-        }
-        [sub, path] if sub == "ls" => match resolve_path_from_root(path) {
-            Ok(dir) => {
-                let mut entries = Vec::new();
-                if let Err(e) = dir.readdir(0, &mut entries, 256) {
-                    return ctx.fail(format_args!("ls: {e:?}"));
-                }
-                for e in entries {
-                    let _ = writeln!(ctx.out, "{}", Escaped(&e.name));
-                }
-            }
-            Err(e) => ctx.fail(format_args!("ls: {e:?}")),
-        },
-        [sub] if sub == "dev-tmp-proc" => match run_dev_tmp_proc_checks() {
-            Ok(summary) => {
-                let _ = writeln!(ctx.out, "dev-tmp-proc: ok ({summary})");
-            }
-            Err(err) => ctx.fail(format_args!("dev-tmp-proc: {err}")),
-        },
+        [sub, path] if sub == "stat" => vfstest_stat(ctx, path),
+        [sub, path] if sub == "cat" => vfstest_cat(ctx, path),
+        [sub, path, len] if sub == "read" => vfstest_read(ctx, path, len),
+        [sub, path, text @ ..] if sub == "write" && !text.is_empty() => vfstest_write(ctx, path, text),
+        [sub, path, len] if sub == "write-pattern" => vfstest_write_pattern(ctx, path, len),
+        [sub, path, len] if sub == "verify-pattern" => vfstest_verify_pattern(ctx, path, len),
+        [sub, path, rest @ ..] if sub == "mkdir" && rest.len() <= 1 => vfstest_mkdir(ctx, path, rest.first()),
+        [sub, linkpath, target] if sub == "symlink" => vfstest_symlink(ctx, linkpath, target),
+        [sub, path] if sub == "readlink" => vfstest_readlink(ctx, path),
+        [sub, path, mode] if sub == "chmod" => vfstest_chmod(ctx, path, mode),
+        [sub, path, size] if sub == "truncate" => vfstest_truncate(ctx, path, size),
+        [sub, path] if sub == "unlink" => vfstest_unlink(ctx, path, false),
+        [sub, path] if sub == "rmdir" => vfstest_unlink(ctx, path, true),
+        [sub, old, new] if sub == "rename" => vfstest_rename(ctx, old, new),
+        [sub, path] if sub == "ls" => vfstest_ls(ctx, path),
+        [sub] if sub == "dev-tmp-proc" => vfstest_dev_tmp_proc(ctx),
         _ => ctx.fail("usage: vfstest <stat|cat|read|write|write-pattern|verify-pattern|mkdir|symlink|readlink|chmod|truncate|unlink|rmdir|rename|ls|dev-tmp-proc> ..."),
+    }
+}
+
+/// `vfstest stat <path>`: the final symlink not followed.
+fn vfstest_stat(ctx: &mut Ctx<'_>, path: &str) {
+    let nofollow = ResolveFlags { follow_final: false, empty_path: false, require_dir: false };
+    match resolve_path(&TABLES, None, path.as_bytes(), nofollow).and_then(|res| res.inode.stat()) {
+        Ok(st) => {
+            let kind = match st.inode_type {
+                InodeType::File => "file",
+                InodeType::Dir => "dir",
+                InodeType::Symlink => "symlink",
+                InodeType::CharDevice => "char",
+                InodeType::BlockDevice => "block",
+                InodeType::Fifo => "fifo",
+                InodeType::Socket => "socket",
+            };
+            let _ = writeln!(
+                ctx.out,
+                "dev={} ino={} type={kind} mode={:04o} nlink={} size={} rdev={} mtime={}.{:09}",
+                st.dev, st.ino, st.mode, st.nlink, st.size, st.rdev, st.mtime.sec, st.mtime.nsec
+            );
+        }
+        Err(e) => ctx.fail(format_args!("stat: {e:?}")),
+    }
+}
+
+/// `vfstest cat <path>`: the whole file as text.
+fn vfstest_cat(ctx: &mut Ctx<'_>, path: &str) {
+    let rdonly = OpenFlags::from_bits_truncate(OpenFlags::O_RDONLY);
+    match open_inode(&TABLES, None, path.as_bytes(), rdonly, 0, 0).and_then(|(inode, _)| read_all_inode(&inode)) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            write_in_chunks(ctx.out, &text);
+            if !text.ends_with('\n') {
+                let _ = ctx.out.write_str("\n");
+            }
+        }
+        Err(e) => ctx.fail(format_args!("cat: {e:?}")),
+    }
+}
+
+/// `vfstest read <path> <bytes>`: one read from offset 0, at most 64 KiB.
+fn vfstest_read(ctx: &mut Ctx<'_>, path: &str, len: &str) {
+    let Ok(len) = len.parse::<usize>() else {
+        return ctx.fail("usage: vfstest read <path> <bytes>");
+    };
+    if len > 64 * 1024 {
+        return ctx.fail("read: length exceeds 64 KiB");
+    }
+    let rdonly = OpenFlags::from_bits_truncate(OpenFlags::O_RDONLY);
+    let read = open_inode(&TABLES, None, path.as_bytes(), rdonly, 0, 0).and_then(|(inode, _)| {
+        let mut buf = vec![0xA5u8; len];
+        inode.read_at(0, &mut buf)
+    });
+    match read {
+        Ok(n) => {
+            let _ = writeln!(ctx.out, "read: {n}");
+        }
+        Err(e) => ctx.fail(format_args!("read: {e:?}")),
+    }
+}
+
+/// `path` opened for writing, as `vfstest write` and `write-pattern` and
+/// `check_dev_namespace`'s link source want it: created (0o644 under umask
+/// 0o022) or truncated.
+fn create_truncated(path: &str) -> Result<Arc<dyn VfsInode>, VfsError> {
+    let flags = OpenFlags::from_bits_truncate(OpenFlags::O_WRONLY | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
+    open_inode(&TABLES, None, path.as_bytes(), flags, 0o644, 0o022).map(|(inode, _)| inode)
+}
+
+/// `<name>: ok`, or `r`'s error as the command's failure.
+fn vfstest_ok<T>(ctx: &mut Ctx<'_>, name: &str, r: Result<T, VfsError>) {
+    match r {
+        Ok(_) => {
+            let _ = writeln!(ctx.out, "{name}: ok");
+        }
+        Err(e) => ctx.fail(format_args!("{name}: {e:?}")),
+    }
+}
+
+/// `wrote <n>`, or `r`'s error as the command's failure.
+fn vfstest_wrote(ctx: &mut Ctx<'_>, name: &str, r: Result<usize, VfsError>) {
+    match r {
+        Ok(n) => {
+            let _ = writeln!(ctx.out, "wrote {n}");
+        }
+        Err(e) => ctx.fail(format_args!("{name}: {e:?}")),
+    }
+}
+
+/// `vfstest write <path> <text>...`: the words joined by spaces, from
+/// offset 0 of the file created or truncated.
+fn vfstest_write(ctx: &mut Ctx<'_>, path: &str, text: &[String]) {
+    let payload = text.join(" ");
+    vfstest_wrote(ctx, "write", create_truncated(path).and_then(|inode| inode.write_at(0, payload.as_bytes())));
+}
+
+/// `vfstest write-pattern <path> <bytes>`: [`vfs_pattern_byte`]'s bytes,
+/// at most [`WRITE_PATTERN_MAX`].
+fn vfstest_write_pattern(ctx: &mut Ctx<'_>, path: &str, len: &str) {
+    let Ok(len) = len.parse::<usize>() else {
+        return ctx.fail("usage: vfstest write-pattern <path> <bytes>");
+    };
+    if len > WRITE_PATTERN_MAX {
+        return ctx.fail("write-pattern: length exceeds 16 MiB");
+    }
+    let wrote = create_truncated(path).and_then(|inode| {
+        let buf: Vec<u8> = (0..len).map(vfs_pattern_byte).collect();
+        inode.write_at(0, &buf)
+    });
+    vfstest_wrote(ctx, "write-pattern", wrote);
+}
+
+/// `vfstest verify-pattern <path> <bytes>`: the file is `write-pattern`'s
+/// bytes, exactly that long.
+fn vfstest_verify_pattern(ctx: &mut Ctx<'_>, path: &str, len: &str) {
+    let Ok(len) = len.parse::<usize>() else {
+        return ctx.fail("usage: vfstest verify-pattern <path> <bytes>");
+    };
+    match resolve_path_from_root(path).and_then(|i| read_all_inode(&i)) {
+        Ok(bytes) => {
+            if bytes.len() != len {
+                return ctx.fail(format_args!("verify-pattern: len {} != {len}", bytes.len()));
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                let exp = vfs_pattern_byte(i);
+                if b != exp {
+                    return ctx.fail(format_args!("verify-pattern: mismatch at {i}: {b:#x} != {exp:#x}"));
+                }
+            }
+            let _ = writeln!(ctx.out, "verify-pattern: ok ({len})");
+        }
+        Err(e) => ctx.fail(format_args!("verify-pattern: {e:?}")),
+    }
+}
+
+/// `vfstest mkdir <path> [octal_mode]` (0o755 by default, no umask).
+fn vfstest_mkdir(ctx: &mut Ctx<'_>, path: &str, mode: Option<&String>) {
+    let mode = match mode {
+        Some(m) => match parse_octal(m) {
+            Some(v) => v,
+            None => return ctx.fail("usage: vfstest mkdir <path> [octal_mode]"),
+        },
+        None => 0o755,
+    };
+    vfstest_ok(ctx, "mkdir", mkdir_at(&TABLES, None, path.as_bytes(), mode, 0));
+}
+
+/// `vfstest symlink <linkpath> <target>`.
+fn vfstest_symlink(ctx: &mut Ctx<'_>, linkpath: &str, target: &str) {
+    vfstest_ok(ctx, "symlink", symlink_at(&TABLES, target.as_bytes(), None, linkpath.as_bytes()));
+}
+
+/// `vfstest readlink <path>`: the target, escaped.
+fn vfstest_readlink(ctx: &mut Ctx<'_>, path: &str) {
+    match readlink_at(&TABLES, None, path.as_bytes()) {
+        Ok(bytes) => {
+            let _ = writeln!(ctx.out, "{}", Escaped(&bytes));
+        }
+        Err(e) => ctx.fail(format_args!("readlink: {e:?}")),
+    }
+}
+
+/// `vfstest chmod <path> <octal_mode>`: the inode's setter, called directly
+/// (no mount check).
+fn vfstest_chmod(ctx: &mut Ctx<'_>, path: &str, mode: &str) {
+    let Some(mode) = parse_octal(mode) else {
+        return ctx.fail("usage: vfstest chmod <path> <octal_mode>");
+    };
+    vfstest_ok(ctx, "chmod", resolve_path_from_root(path).and_then(|i| i.set_mode(mode)));
+}
+
+/// `vfstest truncate <path> <size>`: the inode's `truncate`, called directly.
+fn vfstest_truncate(ctx: &mut Ctx<'_>, path: &str, size: &str) {
+    let Ok(sz) = size.parse::<u64>() else {
+        return ctx.fail("usage: vfstest truncate <path> <size>");
+    };
+    vfstest_ok(ctx, "truncate", resolve_path_from_root(path).and_then(|i| i.truncate(sz)));
+}
+
+/// `vfstest unlink <path>`, or `vfstest rmdir <path>` with `remove_dir`.
+fn vfstest_unlink(ctx: &mut Ctx<'_>, path: &str, remove_dir: bool) {
+    let name = if remove_dir { "rmdir" } else { "unlink" };
+    vfstest_ok(ctx, name, unlink_at(&TABLES, None, path.as_bytes(), remove_dir));
+}
+
+/// `vfstest rename <old> <new>`: no flags.
+fn vfstest_rename(ctx: &mut Ctx<'_>, old: &str, new: &str) {
+    vfstest_ok(ctx, "rename", rename_at2(&TABLES, None, old.as_bytes(), None, new.as_bytes(), RenameFlags::default()));
+}
+
+/// `vfstest ls <path>`: the first 256 names, escaped, `.` and `..` too.
+fn vfstest_ls(ctx: &mut Ctx<'_>, path: &str) {
+    let mut entries = Vec::new();
+    match resolve_path_from_root(path).and_then(|dir| dir.readdir(0, &mut entries, 256)) {
+        Ok(()) => {
+            for e in entries {
+                let _ = writeln!(ctx.out, "{}", Escaped(&e.name));
+            }
+        }
+        Err(e) => ctx.fail(format_args!("ls: {e:?}")),
+    }
+}
+
+/// `vfstest dev-tmp-proc`: [`run_dev_tmp_proc_checks`].
+fn vfstest_dev_tmp_proc(ctx: &mut Ctx<'_>) {
+    match run_dev_tmp_proc_checks() {
+        Ok(summary) => {
+            let _ = writeln!(ctx.out, "dev-tmp-proc: ok ({summary})");
+        }
+        Err(err) => ctx.fail(format_args!("dev-tmp-proc: {err}")),
     }
 }
 

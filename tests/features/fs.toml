@@ -127,7 +127,7 @@ milestone = "M7"
 tests = ["cargo:lumen-vfs"]
 
 [[feature]]
-name = "chmod, chown and utimensat on devfs nodes (/dev/null) kept in memory and shown by stat, as Linux's devtmpfs, by path and by descriptor; set-id and sticky bits kept; /dev itself (its setters refusing, whoever calls them), and a special file on any other read-only mount, stay -EROFS; the nodes start at their Linux boot modes, and vfstest dev-tmp-proc passes after a chmod (#293)"
+name = "chmod, chown and utimensat on devfs nodes (/dev/null) kept in memory and shown by stat, as Linux's devtmpfs, by path and by descriptor; set-id and sticky bits kept; /dev itself (its setters refusing, whoever calls them), and a special file on a read-only mount, stay -EROFS; the nodes start at their Linux boot modes, and vfstest dev-tmp-proc passes after a chmod (#293)"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_chmod_on_dev_null_is_kept_as_devtmpfs_does",
@@ -136,6 +136,17 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::meta::tests::meta_a_special_file_on_another_read_only_mount_stays_erofs",
     "ktest:lumen_kernel::vfs::devfs::devfs_nodes_start_with_their_boot_metadata",
     "ktest:lumen_kernel::vfs::tests::vfs_dev_checks_pass_after_a_chmod_of_a_dev_node",
+]
+
+[[feature]]
+name = "devfs is a writable mount, as Linux's devtmpfs (#301): /dev shows rw in mount and /proc/mounts, a second devfs instance's nodes take chmod, chown and utimensat through the syscalls, access(\"/dev\", W_OK) passes for root, and lumen-vfs's own namespace checks answer first (unlinking or renaming a missing name -ENOENT, rmdir of a node -ENOTDIR, RENAME_NOREPLACE over a node -EEXIST, a link from another mount -EXDEV, a rename onto itself 0), then devfs refuses every change that reaches it with -EROFS, mkdir and symlink onto a name in use too"
+milestone = "M7"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_a_second_devfs_mount_takes_chmod_chown_and_utimensat",
+    "ktest:lumen_kernel::linux::syscall::stat::tests::stat_access_modes_follow_the_root_rules",
+    "ktest:lumen_kernel::vfs::tests::vfs_boot_mounts_tmp_dev_proc_work",
+    "ktest:lumen_kernel::vfs::tests::vfs_dev_answers_namespace_changes_after_lumen_vfs_checks",
+    "scenario:test_fs::test_dev_tmp_proc_filesystems",
 ]
 
 [[feature]]
