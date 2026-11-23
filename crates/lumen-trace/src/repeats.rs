@@ -123,6 +123,11 @@ impl<K: PartialEq, const N: usize, const B: usize> Repeats<K, N, B> {
         self.entries[..self.len].iter().flatten().filter(|e| e.held > 0).map(|e| (e.held, &e.first))
     }
 
+    /// Whether no key has been seen since it was made or cleared.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Forget every key (in place: nothing this size is moved).
     pub fn clear(&mut self) {
         for slot in &mut self.entries[..self.len] {
@@ -180,10 +185,14 @@ mod tests {
     #[test]
     fn clearing_forgets_every_key() {
         let mut r = Repeats::<u32, 2, 16>::new();
+        assert!(r.is_empty());
+        // A key seen once, nothing held: not empty all the same.
         r.see(1, |t| t.write_str("one").unwrap());
+        assert!(!r.is_empty() && summary(&r).is_empty());
         r.see(1, |_| {});
         r.see(2, |t| t.write_str("two").unwrap());
         r.clear();
+        assert!(r.is_empty());
         assert_eq!(summary(&r), []);
         // A key seen before is a first again, with its new text, and the
         // room is back.

@@ -194,7 +194,10 @@ def test_in_kernel_tests_pass(boot):
 # back, moved directories whose parents' fix-ups or `..` rewrite failed,
 # unlinks and rmdirs whose free failed after the entry went) depend on how
 # many writes `ext4plus` makes, so they're counted as present; every other
-# line is counted exactly, and a line matching none of these fails.
+# line is counted exactly, and a line matching none of these fails. The
+# sweeps hold their repeats back from serial (`VFS_HELD_KTESTS`): a call
+# site's first line is matched, and its summary's count is added to that
+# first line's family (each call site's format fits one family).
 _DEV = r"DevId\(\d+\)"
 VFS_SWEEP_LINES = (
     (
@@ -371,14 +374,17 @@ def check_held_back_lines(out):
     """`klog::repeats_held_back_from_serial_are_summarized_when_the_guard_drops`
     on serial: the first warning of its call site, the error and both info
     lines printed, the two repeats held back and summarized at the guard's
-    drop, and the warning after it printed."""
+    drop, and the warning after it printed; another target's warnings under
+    the guard printed too."""
     lines = [klog.without_stamp(line) for line in klog.LOG_LINE.findall(out)]
-    mine = [line for line in lines if " klogheld: " in line or "like: WARN  klogheld:" in line]
+    mine = [line for line in lines if re.search(r" (klogheld|klogother): ", line)]
     assert mine == [
         "WARN  klogheld: repeated 0\n",
         "ERROR klogheld: once\n",
         "INFO  klogheld: info 0, never held\n",
         "INFO  klogheld: info 1, never held\n",
+        "WARN  klogother: another target's 0, never held\n",
+        "WARN  klogother: another target's 1, never held\n",
         "INFO  klog: 2 more held back like: WARN  klogheld: repeated 0\n",
         "WARN  klogheld: after the guard\n",
     ], mine

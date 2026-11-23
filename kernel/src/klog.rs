@@ -212,9 +212,9 @@ fn line_to(mut out: impl Write, stamp: lumen_time::Stamp, level: Level, tag: &st
 #[cfg(feature = "ktest")]
 pub fn hold_repeats(target: &'static str) -> HeldRepeats {
     // The line lock let go before a panic (whose report is printed).
-    let already = LINE_LOCK.lock().held.start(target);
-    if let Some(other) = already {
-        panic!("klog: repeats are already held for {other}");
+    let started = LINE_LOCK.lock().held.start(target);
+    if let Err(why) = started {
+        panic!("klog: can't hold {target}'s repeats: {why}");
     }
     HeldRepeats { _on_this_thread: core::marker::PhantomData }
 }
@@ -231,14 +231,17 @@ pub struct HeldRepeats {
 #[cfg(feature = "ktest")]
 impl Drop for HeldRepeats {
     fn drop(&mut self) {
-        // Under the line lock throughout: the table is read in place (not
-        // moved), and no held line can come between the summaries and the
-        // end of holding.
-        let mut lines = LINE_LOCK.lock();
-        for (count, first) in lines.held.summaries() {
+        // Holding stops first: from here on every line is printed, and the
+        // table is left alone (read in place, not moved).
+        LINE_LOCK.lock().held.stop();
+        // A summary per hold of the line lock, as any log line: each takes
+        // milliseconds on the UART under KVM, with interrupts off.
+        for i in 0.. {
+            let lines = LINE_LOCK.lock();
+            let Some((count, first)) = lines.held.summaries().nth(i) else { break };
             write_line(&lines, Level::Info, "klog", &format_args!("{count} more held back like: {first}"));
         }
-        lines.held.end();
+        LINE_LOCK.lock().held.forget();
     }
 }
 
@@ -271,14 +274,17 @@ mod held {
             Held { target: None, repeats: Repeats::new() }
         }
 
-        /// Hold `target`'s repeats, unless another target's already are
-        /// (returned, and nothing changed).
-        pub(super) fn start(&mut self, target: &'static str) -> Option<&'static str> {
+        /// Hold `target`'s repeats, unless a guard is alive or its
+        /// summaries are still being printed (nothing changed then).
+        pub(super) fn start(&mut self, target: &'static str) -> Result<(), &'static str> {
             if self.target.is_some() {
-                return self.target;
+                return Err("another guard is alive");
+            }
+            if !self.repeats.is_empty() {
+                return Err("the last guard's summaries are still being printed");
             }
             self.target = Some(target);
-            None
+            Ok(())
         }
 
         /// Whether `record` (tagged `tag`) is a repeat to hold back: its call
@@ -302,9 +308,15 @@ mod held {
             self.repeats.held()
         }
 
-        /// Hold no more, and forget every call site.
-        pub(super) fn end(&mut self) {
+        /// Hold no more lines (the counts are kept for [`summaries`]).
+        ///
+        /// [`summaries`]: Self::summaries
+        pub(super) fn stop(&mut self) {
             self.target = None;
+        }
+
+        /// Forget every call site, once the summaries are printed.
+        pub(super) fn forget(&mut self) {
             self.repeats.clear();
         }
     }
@@ -371,10 +383,11 @@ crate::ktest!(
 crate::ktest!(
     fn repeats_held_back_from_serial_are_summarized_when_the_guard_drops() {
         // Under a guard for `klogheld`: one call site's warning three times,
-        // another's error once, an info line twice. Serial gets the first
-        // warning, the error, both info lines and, at the drop, one summary
-        // for the two held warnings (test_ktest checks serial); the ring
-        // keeps every line, the held ones too.
+        // another's error once, an info line twice, and another target's
+        // warning twice. Serial gets the first warning, the error, both info
+        // lines, both of the other target's and, at the drop, one summary for
+        // the two held warnings (test_ktest checks serial); the ring keeps
+        // every line, the held ones too.
         use crate::kassert;
         {
             let _held = hold_repeats("klogheld");
@@ -384,6 +397,9 @@ crate::ktest!(
             log::error!(target: "klogheld", "once");
             for i in 0..2 {
                 log::info!(target: "klogheld", "info {i}, never held");
+            }
+            for i in 0..2 {
+                log::warn!(target: "klogother", "another target's {i}, never held");
             }
         }
         // Holding ended with the guard: this one is printed.
@@ -400,6 +416,8 @@ crate::ktest!(
             "] ERROR klogheld: once",
             "] INFO  klogheld: info 0, never held",
             "] INFO  klogheld: info 1, never held",
+            "] WARN  klogother: another target's 0, never held",
+            "] WARN  klogother: another target's 1, never held",
             "] INFO  klog: 2 more held back like: WARN  klogheld: repeated 0",
             "] WARN  klogheld: after the guard",
         ];
