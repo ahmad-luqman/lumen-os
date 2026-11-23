@@ -32,6 +32,19 @@ tests = [
 ]
 
 [[feature]]
+name = "Page-cache I/O errors (#321): a read stops at its first page that fails, returning the bytes of the pages before it (a short count, as Linux's filemap_read; lumen-vfs's page::short_count host-tested for each page of each edge-case range failing) and the next read at the failing page returns EIO, a later cached page never read past the gap; a write's partial-page fill whose disk read fails is logged as a read's is (one warning per streak, its errno set, a fill that reads ending the streak), past the write's first page as a short count, on it as EIO; a write past the end refused outright leaves a clean ext4 tail page clean (its past-the-end bytes still zeroed), a short or whole write marking it dirty and a tmpfs one never, so fdatasync after a write refused at the hard limit succeeds with every block write failing (while the block cache's own sync works)"
+milestone = "M7"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::vfs::page_cache::page_cache_a_read_failing_past_its_first_page_returns_the_bytes_before_it",
+    "ktest:lumen_kernel::vfs::page_cache::page_cache_a_read_stops_at_its_first_failing_page",
+    "ktest:lumen_kernel::vfs::ext4::ext4_a_write_whose_fill_read_fails_logs_it_as_a_read_does",
+    "ktest:lumen_kernel::vfs::page_cache::page_cache_a_refused_write_past_the_end_leaves_its_tail_page_clean",
+    "ktest:lumen_kernel::vfs::page_cache::page_cache_ext4_fdatasync_after_a_refused_write_past_the_end_succeeds",
+    "scenario:test_ktest::test_in_kernel_tests_pass",
+]
+
+[[feature]]
 name = "Writable ext4 rootfs VFS adapter over BlockCache with Gate 6 open-unlinked detach, symlinks, rmdir/rename, write-error undo, and reboot persistence"
 milestone = "M7"
 tests = [
