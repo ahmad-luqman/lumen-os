@@ -13,12 +13,12 @@ tests = [
 ]
 
 [[feature]]
-name = "A ktest's repeated warnings and errors held back from serial while it runs (`klog::hold_repeats`, #347; the ext4 fault sweeps): each call site's first line printed, the rest kept in the `dmesg` ring and summarized at the guard's drop as a count and a copy of the first line, other targets and `info` lines printed as always, a full table never losing a line; test_ktest counts every vfs family from the printed lines and the summaries, and fails if more than a few sweep lines reach serial"
+name = "A ktest's repeated warnings and errors held back from serial while it runs (`klog::hold_repeats`, #347; the ext4 fault sweeps): a line when it starts and when it ends, each call site's first line printed, the rest kept in the `dmesg` ring and summarized at the guard's drop as a count and a copy of the newest, other tags and `info` lines printed as always, a full table printing every line; test_ktest counts every vfs family from the printed lines and the summaries, each line fitting one family, and fails on a sweep line or summary outside a guard, a guard count other than the kernel source's, or more than one printed line per sweep family in a guard"
 milestone = "M7"
 tests = [
     "scenario:test_ktest::test_in_kernel_tests_pass",
     "ktest:lumen_kernel::klog::repeats_held_back_from_serial_are_summarized_when_the_guard_drops",
-    "harness:test_klog::test_a_held_back_summary_is_read_and_its_first_line_is_no_log_line",
+    "harness:test_klog::test_held_back_lines_are_read_and_a_summarys_copy_is_no_log_line",
     "cargo:lumen-trace",
 ]
 

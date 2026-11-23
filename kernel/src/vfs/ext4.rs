@@ -7210,6 +7210,8 @@ crate::ktest!(
         // reads failing after it, so the adapter decides from the inode
         // itself: an entry that survived keeps its target, and an inode the
         // unlink already zeroed (and maybe freed) gets nothing written back.
+        // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;

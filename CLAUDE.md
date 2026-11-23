@@ -586,7 +586,7 @@ one is its own PR that updates that doc first.
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
   `stream_of`: which ring each goes to, and typed layouts: `Switch`/`ThreadState`,
-  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free), `repeats` (`hold_repeats`' table),
+  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free), `repeats` (`klog::hold_repeats`' table),
   and `ThreadName` (#276: a thread's name, 16 bytes inline like Linux's `comm`: at most 15 bytes cut
   at a character boundary, control characters (C0, DEL, C1) and U+2028/U+2029 as `?`; `from_path`,
   a path's last component, the name a binary run by `linux /path` gets; `From<&str>`, the kernel's

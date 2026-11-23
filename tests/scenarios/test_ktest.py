@@ -3,7 +3,7 @@
 import re
 
 import pytest
-from lumen_harness import klog, save_ktest_tap, tap
+from lumen_harness import REPO_ROOT, klog, save_ktest_tap, tap
 from lumen_harness.clock_diags import check_clock_diags
 from lumen_harness.qemu import EXIT_CRASH, EXIT_FAILURE, EXIT_SUCCESS, Devices
 
@@ -194,10 +194,11 @@ def test_in_kernel_tests_pass(boot):
 # back, moved directories whose parents' fix-ups or `..` rewrite failed,
 # unlinks and rmdirs whose free failed after the entry went) depend on how
 # many writes `ext4plus` makes, so they're counted as present; every other
-# line is counted exactly, and a line matching none of these fails. The
-# sweeps hold their repeats back from serial (`VFS_HELD_KTESTS`): a call
-# site's first line is matched, and its summary's count is added to that
-# first line's family (each call site's format fits one family).
+# line is counted exactly, and a line matching none of these (or two)
+# fails. The sweeps hold their repeats back from serial (`VFS_HELD_KTESTS`):
+# a call site's first line is matched as printed, and its summary's count goes
+# to the family of the newest line it copies (each call site's format fits one
+# family).
 _DEV = r"DevId\(\d+\)"
 VFS_SWEEP_LINES = (
     (
@@ -327,66 +328,114 @@ VFS_EXACT_LINES = {
 
 # The ktests that hold their repeated vfs lines back from serial
 # (`klog::hold_repeats`, #347): the fault sweeps, which logged about 3,600 of
-# the run's 3,700 WARN and ERROR lines, each about 30 ms on the UART under
-# KVM, and took the run past `finished`'s bound.
-VFS_HELD_KTESTS = 8
-# At most this many sweep lines on serial: each guarded ktest prints one per
-# call site it reaches (the summaries carry the rest), so a sweep logging
-# without a guard (thousands) fails here, not at the time bound.
-VFS_SWEEP_PRINTED_MAX = VFS_HELD_KTESTS * len(VFS_SWEEP_LINES)
+# the run's 3,700 WARN and ERROR lines. In #332's failed CI run each took
+# about 30 ms on the UART under KVM, taking the run past `finished`'s bound.
+# Each guard is a `hold_repeats("vfs")` call in the kernel's source, and
+# shows on serial between its first and last line (`klog.HOLDING`,
+# `klog.HELD_ALL`).
+_GUARD = 'hold_repeats("vfs")'
+VFS_HELD_KTESTS = sum(
+    1
+    for path in (REPO_ROOT / "kernel/src").rglob("*.rs")
+    for line in path.read_text().splitlines()
+    if _GUARD in line and not line.lstrip().startswith("//")
+)
+
+
+def vfs_family(line):
+    """The one family of VFS_EXACT_LINES or VFS_SWEEP_LINES that vfs line
+    `line` (from its level on) fits, or None; a line fitting two fails."""
+    fits = [want for want in (*VFS_EXACT_LINES, *VFS_SWEEP_LINES) if re.fullmatch(want, line)]
+    assert len(fits) <= 1, (line, fits)
+    return fits[0] if fits else None
 
 
 def check_vfs_log_lines(out):
     """Pin the vfs ktests' WARN and ERROR lines (see VFS_EXACT_LINES): those
     printed, plus those `klog::hold_repeats` held back, counted from their
-    summaries (`klog.HELD_BACK`: each a call site's lines after its first,
-    which is printed, and a copy of that first line)."""
-    # From the stamp, so a summary's copy of a first line isn't counted.
-    printed = re.findall(rf"{klog.STAMP} ((?:WARN |ERROR) vfs: .*)\n", out)
-    held = [
-        (int(m["n"]), m["first"])
-        for m in klog.HELD_BACK.finditer(out)
-        if re.match(r"(?:WARN |ERROR) vfs: ", m["first"])
-    ]
-    assert held, "no vfs lines held back from serial: the sweeps' guards are gone"
-
-    def count(want):
-        return sum(1 for line in printed if re.fullmatch(want, line)) + sum(
-            n for n, first in held if re.fullmatch(want, first)
-        )
-
-    counts = {want: count(want) for want in VFS_EXACT_LINES}
-    assert counts == VFS_EXACT_LINES, counts
-    sweeps = {want: count(want) for want in VFS_SWEEP_LINES}
-    assert all(sweeps.values()), sweeps
-    known = (*VFS_EXACT_LINES, *VFS_SWEEP_LINES)
-    unknown = [
-        line
-        for line in (*printed, *(first for _, first in held))
-        if not any(re.fullmatch(want, line) for want in known)
-    ]
+    summaries (`klog.HELD_BACK`: each a call site's lines after its printed
+    first, and a copy of the newest, whose family the count goes to: each
+    call site's format fits one family). Every sweep line printed, and every
+    summary, falls inside a vfs guard, and each guard prints at most one line
+    per sweep family it reaches: a sweep without a guard fails here, not at
+    the time bound."""
+    tally = dict.fromkeys((*VFS_EXACT_LINES, *VFS_SWEEP_LINES), 0)
+    unknown = []
+    guards = []  # each guard's (sweep lines printed, summaries)
+    inside = None
+    outside = []
+    events = sorted(
+        [
+            (m.start(), "line", m)
+            for m in re.finditer(rf"{klog.STAMP} ((?:WARN |ERROR) vfs: .*)\n", out)
+        ]
+        + [(m.start(), "held", m) for m in klog.HELD_BACK.finditer(out)]
+        + [(m.start(), "start", m) for m in klog.HOLDING.finditer(out) if m["tag"] == "vfs"]
+        + [(m.start(), "end", m) for m in klog.HELD_ALL.finditer(out) if m["tag"] == "vfs"],
+        key=lambda e: e[0],
+    )
+    for _, kind, m in events:
+        if kind == "start":
+            assert inside is None, "a vfs guard started inside another"
+            inside = [0, 0]
+            continue
+        if kind == "end":
+            assert inside is not None, "a vfs guard's last line without its first"
+            guards.append(tuple(inside))
+            inside = None
+            continue
+        if kind == "held" and not re.match(r"(?:WARN |ERROR) vfs: ", m["last"]):
+            continue
+        line, weight = (m[1], 1) if kind == "line" else (m["last"], int(m["n"]))
+        family = vfs_family(line)
+        if family is None:
+            unknown.append(line)
+            continue
+        tally[family] += weight
+        if kind == "held" or family in VFS_SWEEP_LINES:
+            if inside is None:
+                outside.append(line)
+            elif kind == "held":
+                inside[1] += 1
+            else:
+                inside[0] += 1
+    assert inside is None, "a vfs guard never ended"
     assert not unknown, unknown
-    on_serial = sum(1 for line in printed if any(re.fullmatch(w, line) for w in VFS_SWEEP_LINES))
-    assert on_serial <= VFS_SWEEP_PRINTED_MAX, (on_serial, sweeps)
+    counts = {want: tally[want] for want in VFS_EXACT_LINES}
+    assert counts == VFS_EXACT_LINES, counts
+    sweeps = {want: tally[want] for want in VFS_SWEEP_LINES}
+    assert all(sweeps.values()), sweeps
+    assert not outside, ("sweep lines or summaries outside a vfs guard", outside)
+    assert len(guards) == VFS_HELD_KTESTS, (len(guards), VFS_HELD_KTESTS)
+    assert any(held for _, held in guards), "no vfs lines held back: the guards hold nothing"
+    over = [printed for printed, _ in guards if printed > len(VFS_SWEEP_LINES)]
+    assert not over, ("sweep lines printed in a guard, past one per family", over)
 
 
 def check_held_back_lines(out):
     """`klog::repeats_held_back_from_serial_are_summarized_when_the_guard_drops`
-    on serial: the first warning of its call site, the error and both info
-    lines printed, the two repeats held back and summarized at the guard's
-    drop, and the warning after it printed; another target's warnings under
-    the guard printed too."""
+    on serial: the guard's first line, each warning site's first line, the
+    error and both info lines printed, another tag's warnings printed too;
+    at the drop, a summary for each warning site with its newest line, and
+    the guard's last line; then the warning after it, and a second guard
+    holding nothing."""
     lines = [klog.without_stamp(line) for line in klog.LOG_LINE.findall(out)]
-    mine = [line for line in lines if re.search(r" (klogheld|klogother): ", line)]
+    mine = [line for line in lines if re.search(r"klogheld|klogother", line)]
     assert mine == [
+        "INFO  klog: holding klogheld's repeated warnings and errors back from serial\n",
         "WARN  klogheld: repeated 0\n",
+        "WARN  klogheld: another site's 0\n",
         "ERROR klogheld: once\n",
         "INFO  klogheld: info 0, never held\n",
         "INFO  klogheld: info 1, never held\n",
-        "WARN  klogother: another target's 0, never held\n",
-        "WARN  klogother: another target's 1, never held\n",
-        "INFO  klog: 2 more held back like: WARN  klogheld: repeated 0\n",
+        "WARN  klogother: another tag's 0, never held\n",
+        "WARN  klogother: another tag's 1, never held\n",
+        "INFO  klog: 2 more held back, the last: WARN  klogheld: repeated 2\n",
+        "INFO  klog: 1 more held back, the last: WARN  klogheld: another site's 1\n",
+        "INFO  klog: no longer holding klogheld's repeats: 3 held back\n",
         "WARN  klogheld: after the guard\n",
+        "INFO  klog: holding klogheld's repeated warnings and errors back from serial\n",
+        "INFO  klog: no longer holding klogheld's repeats: 0 held back\n",
     ], mine
 
 

@@ -1,8 +1,9 @@
 //! Repeated log lines, counted: the table behind the kernel's held-back
 //! repeats (`klog::hold_repeats`, ktest kernels only, #347). Each key (the
 //! kernel's: a log call site with its level) is seen a first time, its line
-//! then printed and its text kept here, and after that only counted, until
-//! [`Repeats::held`] reports the counts and [`Repeats::clear`] forgets them.
+//! then printed, and after that held back: counted, the newest one's text
+//! kept, until [`Repeats::held`] reports them and [`Repeats::clear`] forgets
+//! them. [`Seen::is_held`] is the decision the logger acts on.
 //!
 //! Fixed-size, no allocation: the logger fills it holding its line lock,
 //! which code holding the frame allocator's lock may log under. A key past
@@ -14,12 +15,19 @@ use core::fmt;
 /// What [`Repeats::see`] made of a key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Seen {
-    /// Its first line: print it (its text is now kept).
+    /// Its first line: print it.
     First,
-    /// A repeat: counted, held back.
+    /// A repeat: counted, its text kept as the newest, held back.
     Repeat,
-    /// A new key with the table full: print it, nothing counted.
+    /// A new key with the table full: print it, nothing counted or kept.
     Full,
+}
+
+impl Seen {
+    /// Whether the line is held back (else it is printed): a repeat only.
+    pub fn is_held(self) -> bool {
+        self == Seen::Repeat
+    }
 }
 
 /// A line's text, the first `B` bytes of it (cut at a character boundary).
@@ -34,10 +42,17 @@ impl<const B: usize> Text<B> {
         Text { buf: [0; B], len: 0, cut: false }
     }
 
+    fn clear(&mut self) {
+        self.len = 0;
+        self.cut = false;
+    }
+
     /// The text kept (all of it unless [`is_cut`](Self::is_cut)).
     pub fn as_str(&self) -> &str {
-        // `write_str` copies whole characters only, so this is UTF-8.
-        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+        let text = core::str::from_utf8(&self.buf[..self.len]);
+        // `write_str` copies whole characters only.
+        debug_assert!(text.is_ok());
+        text.unwrap_or("")
     }
 
     /// Whether the text was longer than `B` bytes and is cut short.
@@ -47,8 +62,10 @@ impl<const B: usize> Text<B> {
 }
 
 impl<const B: usize> fmt::Write for Text<B> {
-    /// Copies what fits, whole characters only; never fails (a failure
-    /// would end the caller's formatting part way, as a cut does anyway).
+    /// Copies what fits, whole characters only, and nothing once cut (a
+    /// later piece that fits would read as if nothing were missing); never
+    /// fails (a failure would end the caller's formatting part way, as a cut
+    /// does anyway).
     fn write_str(&mut self, s: &str) -> fmt::Result {
         if self.cut {
             return Ok(());
@@ -78,14 +95,15 @@ struct Entry<K, const B: usize> {
     key: K,
     /// Lines held back after the first.
     held: u64,
-    first: Text<B>,
+    /// The newest line's text (the first's until one is held).
+    newest: Text<B>,
 }
 
-/// Up to `N` keys, each with its first line's text (up to `B` bytes) and
-/// how many lines after it were held back, in the order first seen.
+/// Up to `N` keys, each with how many lines after its first were held back
+/// and the newest one's text (up to `B` bytes), in the order first seen.
+/// The keys fill the slots from the front: the first empty slot ends them.
 pub struct Repeats<K, const N: usize, const B: usize> {
     entries: [Option<Entry<K, B>>; N],
-    len: usize,
 }
 
 impl<K: PartialEq, const N: usize, const B: usize> Default for Repeats<K, N, B> {
@@ -96,44 +114,56 @@ impl<K: PartialEq, const N: usize, const B: usize> Default for Repeats<K, N, B> 
 
 impl<K: PartialEq, const N: usize, const B: usize> Repeats<K, N, B> {
     pub const fn new() -> Self {
-        Repeats { entries: [const { None }; N], len: 0 }
+        const { assert!(N > 0) };
+        Repeats { entries: [const { None }; N] }
     }
 
-    /// A line with `key`: its first (`write_first` then writes its text
-    /// into the kept one), a repeat (counted), or a new key with the table
-    /// full (not kept: `write_first` isn't called).
-    pub fn see(&mut self, key: K, write_first: impl FnOnce(&mut Text<B>)) -> Seen {
-        let found = self.entries[..self.len].iter_mut().flatten().find(|e| e.key == key);
-        if let Some(entry) = found {
-            entry.held += 1;
-            return Seen::Repeat;
+    /// The keys' entries, in the order first seen.
+    fn used(&self) -> impl Iterator<Item = &Entry<K, B>> {
+        self.entries.iter().map_while(Option::as_ref)
+    }
+
+    /// A line with `key`: its first, a repeat (counted), or a new key with
+    /// the table full. `write` writes the line's text into the kept one,
+    /// for a first and a repeat (the newest kept); not for a full table.
+    pub fn see(&mut self, key: K, write: impl FnOnce(&mut Text<B>)) -> Seen {
+        for slot in &mut self.entries {
+            match slot {
+                Some(entry) if entry.key == key => {
+                    entry.held += 1;
+                    entry.newest.clear();
+                    write(&mut entry.newest);
+                    return Seen::Repeat;
+                }
+                Some(_) => {}
+                None => {
+                    let entry = slot.insert(Entry { key, held: 0, newest: Text::new() });
+                    write(&mut entry.newest);
+                    return Seen::First;
+                }
+            }
         }
-        let Some(slot) = self.entries.get_mut(self.len) else {
-            return Seen::Full;
-        };
-        let entry = slot.insert(Entry { key, held: 0, first: Text::new() });
-        write_first(&mut entry.first);
-        self.len += 1;
-        Seen::First
+        Seen::Full
     }
 
-    /// Each key that had lines held back: how many, and its first line's
+    /// Each key that had lines held back: how many, and the newest one's
     /// text, in the order first seen.
     pub fn held(&self) -> impl Iterator<Item = (u64, &Text<B>)> {
-        self.entries[..self.len].iter().flatten().filter(|e| e.held > 0).map(|e| (e.held, &e.first))
+        self.used().filter(|e| e.held > 0).map(|e| (e.held, &e.newest))
     }
 
     /// Whether no key has been seen since it was made or cleared.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.entries[0].is_none()
     }
 
     /// Forget every key (in place: nothing this size is moved).
     pub fn clear(&mut self) {
-        for slot in &mut self.entries[..self.len] {
-            *slot = None;
+        for slot in &mut self.entries {
+            if slot.take().is_none() {
+                break;
+            }
         }
-        self.len = 0;
     }
 }
 
@@ -150,85 +180,104 @@ mod tests {
         r.held().map(|(n, t)| (n, t.to_string())).collect()
     }
 
+    fn line(text: &str) -> impl FnOnce(&mut Text<32>) + '_ {
+        move |t| t.write_str(text).unwrap()
+    }
+
     #[test]
-    fn the_first_line_of_a_key_is_kept_and_its_repeats_counted() {
+    fn a_keys_first_line_is_printed_and_its_repeats_held_with_the_newest_kept() {
         let mut r = Repeats::<u32, 4, 32>::new();
         assert_eq!(r.see(7, |t| write!(t, "seven {}", 0).unwrap()), Seen::First);
-        assert_eq!(r.see(9, |t| t.write_str("nine").unwrap()), Seen::First);
-        // A repeat doesn't write: its text isn't asked for.
-        for _ in 0..3 {
-            assert_eq!(r.see(7, |_| panic!("a repeat's text written")), Seen::Repeat);
+        assert_eq!(r.see(9, line("nine 0")), Seen::First);
+        for i in 1..4 {
+            assert_eq!(r.see(7, |t| write!(t, "seven {i}").unwrap()), Seen::Repeat);
         }
         // Only keys with repeats are reported, in the order first seen,
-        // each with its first line's text.
-        assert_eq!(summary(&r), [(3, "seven 0".into())]);
-        r.see(9, |_| {});
-        assert_eq!(r.see(5, |t| t.write_str("five").unwrap()), Seen::First);
-        r.see(5, |_| {});
-        assert_eq!(summary(&r), [(3, "seven 0".into()), (1, "nine".into()), (1, "five".into())]);
+        // each with its newest line's text.
+        assert_eq!(summary(&r), [(3, "seven 3".into())]);
+        r.see(9, line("nine 1"));
+        assert_eq!(r.see(5, line("five 0")), Seen::First);
+        r.see(5, line("five 1"));
+        assert_eq!(summary(&r), [(3, "seven 3".into()), (1, "nine 1".into()), (1, "five 1".into())]);
+    }
+
+    #[test]
+    fn only_a_repeat_is_held() {
+        assert!(Seen::Repeat.is_held());
+        // A first line and a full table's line are printed.
+        assert!(!Seen::First.is_held());
+        assert!(!Seen::Full.is_held());
     }
 
     #[test]
     fn a_new_key_past_the_table_is_never_held() {
-        let mut r = Repeats::<u32, 2, 16>::new();
-        r.see(1, |t| t.write_str("one").unwrap());
-        r.see(2, |t| t.write_str("two").unwrap());
+        let mut r = Repeats::<u32, 2, 32>::new();
+        r.see(1, line("one"));
+        r.see(2, line("two"));
         // Every line of a third key is printed: none counted or kept.
         for _ in 0..3 {
-            assert_eq!(r.see(3, |_| panic!("a full table kept a text")), Seen::Full);
+            let seen = r.see(3, |_| panic!("a full table kept a text"));
+            assert_eq!(seen, Seen::Full);
+            assert!(!seen.is_held());
         }
         // The keys it has still count.
-        assert_eq!(r.see(2, |_| {}), Seen::Repeat);
-        assert_eq!(summary(&r), [(1, "two".into())]);
+        assert_eq!(r.see(2, line("two again")), Seen::Repeat);
+        assert_eq!(summary(&r), [(1, "two again".into())]);
     }
 
     #[test]
     fn clearing_forgets_every_key() {
-        let mut r = Repeats::<u32, 2, 16>::new();
+        let mut r = Repeats::<u32, 2, 32>::new();
         assert!(r.is_empty());
         // A key seen once, nothing held: not empty all the same.
-        r.see(1, |t| t.write_str("one").unwrap());
+        r.see(1, line("one"));
         assert!(!r.is_empty() && summary(&r).is_empty());
-        r.see(1, |_| {});
-        r.see(2, |t| t.write_str("two").unwrap());
+        r.see(1, line("one again"));
+        r.see(2, line("two"));
         r.clear();
         assert!(r.is_empty());
         assert_eq!(summary(&r), []);
-        // A key seen before is a first again, with its new text, and the
-        // room is back.
-        assert_eq!(r.see(2, |t| t.write_str("two again").unwrap()), Seen::First);
-        assert_eq!(r.see(3, |t| t.write_str("three").unwrap()), Seen::First);
-        r.see(2, |_| {});
+        // A key seen before is a first again, and the room is back.
+        assert_eq!(r.see(2, line("two")), Seen::First);
+        assert_eq!(r.see(3, line("three")), Seen::First);
+        r.see(2, line("two again"));
         assert_eq!(summary(&r), [(1, "two again".into())]);
     }
 
     #[test]
     fn a_long_text_is_cut_at_a_character_and_says_so() {
         let mut r = Repeats::<u32, 2, 8>::new();
+        r.see(1, |_| {});
         // "abcdefg" and then 'é' (2 bytes) would end at byte 9: cut before it.
         r.see(1, |t| t.write_str("abcdefgé and more").unwrap());
-        r.see(1, |_| {});
         let (_, text) = r.held().next().unwrap();
         assert_eq!((text.as_str(), text.is_cut()), ("abcdefg", true));
         assert_eq!(text.to_string(), "abcdefg...");
         // Written in pieces, exactly filling it: whole, not cut.
-        let mut r = Repeats::<u32, 2, 8>::new();
         r.see(1, |t| ["abcd", "efgh"].iter().for_each(|s| t.write_str(s).unwrap()));
-        r.see(1, |_| {});
         let (_, text) = r.held().next().unwrap();
         assert_eq!((text.as_str(), text.is_cut(), text.to_string()), ("abcdefgh", false, "abcdefgh".into()));
         // One byte more, in a later piece: cut.
-        let mut r = Repeats::<u32, 2, 8>::new();
         r.see(1, |t| ["abcdefgh", "i"].iter().for_each(|s| t.write_str(s).unwrap()));
-        r.see(1, |_| {});
-        assert_eq!(summary(&r), [(1, "abcdefgh...".into())]);
+        assert_eq!(summary(&r), [(3, "abcdefgh...".into())]);
+        // Once cut, a later piece that would fit isn't added: the text
+        // stays cut, never reading as whole.
+        r.see(1, |t| ["abcdefgé", "x"].iter().for_each(|s| t.write_str(s).unwrap()));
+        assert_eq!(summary(&r), [(4, "abcdefg...".into())]);
+        // A repeat's text replaces the last one's whole, cut or not.
+        r.see(1, line_8("short"));
+        assert_eq!(summary(&r), [(5, "short".into())]);
+    }
+
+    fn line_8(text: &str) -> impl FnOnce(&mut Text<8>) + '_ {
+        move |t| t.write_str(text).unwrap()
     }
 
     #[test]
     fn matches_a_model_over_many_lines() {
-        // Against a model keeping every key's lines: the first `N` keys
-        // seen are kept with their first text and counted; later keys are
-        // never held.
+        // Against a model listing the keys in the order first seen, up to
+        // `N`, each with its repeats' count and newest text: a key past
+        // them is never held.
         const N: usize = 5;
         let mut r = Repeats::<u32, N, 24>::new();
         let mut model: Vec<(u32, u64, String)> = Vec::new();
@@ -242,8 +291,9 @@ mod tests {
             let seen = r.see(key, |t| t.write_str(&text).unwrap());
             let kept = model.len();
             let want = match model.iter_mut().find(|(k, ..)| *k == key) {
-                Some((_, held, _)) => {
+                Some((_, held, newest)) => {
                     *held += 1;
+                    *newest = text.clone();
                     Seen::Repeat
                 }
                 None if kept < N => {
