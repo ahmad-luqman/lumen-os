@@ -5658,11 +5658,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     **Caveat (#308):** `ext4plus` hashes a hashed (htree) directory's names
     with signed bytes and never reads the superblock's unsigned-hash flag
     (`s_flags & EXT2_FLAGS_UNSIGNED_HASH`, which `mke2fs` sets where `char`
-    is unsigned, e.g. aarch64 Linux; a volume with neither that nor
-    `EXT2_FLAGS_SIGNED_HASH` is read as signed, as Linux on x86 does, and
-    Linux where `char` is unsigned sets the unsigned flag on such a
-    volume's first writable mount, before it can index a directory), and an
-    htree lookup has no linear fallback. So a name with a byte of 0x80 or more (UTF-8 or not) in such
+    is unsigned, e.g. aarch64 Linux; Lumen reads a volume with neither that
+    nor `EXT2_FLAGS_SIGNED_HASH` as signed, while Linux picks by its own
+    build's `char` and writes that choice to `s_flags` on its first
+    writable mount, before it can index a directory), and an htree lookup
+    has no linear fallback. So a name with a byte of 0x80 or more (UTF-8 or not) in such
     a directory, on such a volume, could be missed by a lookup (when its
     signed hash picks another leaf than its real one), and an entry
     `ext4plus` adds there would be filed under the signed hash, where Linux
