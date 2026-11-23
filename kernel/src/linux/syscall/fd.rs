@@ -600,19 +600,35 @@ fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
 }
 
 /// Copy `path` and a NUL into the test process's user memory, in slot
-/// `slot` (256 bytes each, slot `n` at `KTEST_USER_VA + n * 256`, so a
-/// test's own bytes there are overwritten), for a handler's path argument.
+/// `slot`, for a handler's path argument: 16 slots of 256 bytes, slot `n`
+/// at `KTEST_USER_VA + n * 256`, filling the first page (so a test's own
+/// bytes there are overwritten). A path that wouldn't fit its slot with
+/// its NUL, or a slot past 15, is refused. Some tests keep raw buffers at
+/// `KTEST_USER_VA + 1024` and `+ 2048`, inside slots 4 and 8: such a test
+/// keeps its paths below them.
 #[cfg(feature = "ktest")]
 pub(super) fn ktest_user_path(slot: u64, path: &[u8]) -> Result<UserPtr, &'static str> {
-    let addr = process::KTEST_USER_VA + slot * 256;
+    if slot >= KTEST_PATH_SLOTS {
+        return Err("a ktest path slot past the first page");
+    }
+    if path.len() >= KTEST_PATH_SLOT_LEN as usize {
+        return Err("a ktest path longer than its slot");
+    }
+    let addr = process::KTEST_USER_VA + slot * KTEST_PATH_SLOT_LEN;
     let mut bytes = path.to_vec();
     bytes.push(0);
     copy_to_user(addr, &bytes).map_err(|_| "copy a path into user memory")?;
     Ok(at::reg(addr))
 }
 
+/// [`ktest_user_path`]'s slots: how many, and the bytes in each.
 #[cfg(feature = "ktest")]
-pub(super) fn ktest_flags(bits: u32) -> OpenFlags {
+const KTEST_PATH_SLOTS: u64 = 16;
+#[cfg(feature = "ktest")]
+const KTEST_PATH_SLOT_LEN: u64 = 256;
+
+#[cfg(feature = "ktest")]
+fn ktest_flags(bits: u32) -> OpenFlags {
     OpenFlags::from_bits(bits)
 }
 
@@ -622,19 +638,27 @@ pub(super) fn ktest_fd(ret: u64) -> Result<Fd, &'static str> {
     if ret < lumen_vfs::MAX_FDS as u64 { Ok(at::reg(ret)) } else { Err("the open failed") }
 }
 
+/// [`ktest_fd`] for `call` on `path` (`open`, say, or `fcntl(F_DUPFD)`):
+/// when `ret` isn't a descriptor, a `ktest::diag` line names the call, the
+/// path and what the handler returned.
+#[cfg(feature = "ktest")]
+pub(super) fn ktest_fd_of(ret: u64, call: &str, path: &[u8]) -> Result<Fd, &'static str> {
+    ktest_fd(ret).inspect_err(|why| {
+        crate::ktest::diag(format_args!("{why}: {call} {} gave {}", lumen_vfs::Escaped(path), ret as i64));
+    })
+}
+
 /// `open(path, flags, 0o644)` through the handler, `path` copied into path
 /// slot `slot` of the test process's user memory: the descriptor. A file
 /// `O_CREAT` makes is `0o644` less the umask (the mode means nothing
 /// without it); a test of another mode calls `sys_open` itself. A failed
-/// open's `ktest::diag` line names the path and what the handler returned.
+/// open's `ktest::diag` line names the path and what the handler returned
+/// ([`ktest_fd_of`]).
 #[cfg(feature = "ktest")]
 pub(super) fn ktest_open(slot: u64, path: &[u8], flags: u32) -> Result<Fd, &'static str> {
     let user = ktest_user_path(slot, path)
         .inspect_err(|why| crate::ktest::diag(format_args!("{why}: {}", lumen_vfs::Escaped(path))))?;
-    let ret = sys_open(user, ktest_flags(flags), at::reg(0o644));
-    ktest_fd(ret).inspect_err(|why| {
-        crate::ktest::diag(format_args!("{why}: {} gave {}", lumen_vfs::Escaped(path), ret as i64));
-    })
+    ktest_fd_of(sys_open(user, ktest_flags(flags), at::reg(0o644)), "open", path)
 }
 
 /// A new descriptor of the current process on `inode` with `flags`, with
@@ -679,12 +703,13 @@ pub(super) fn ktest_failed_at(why: &'static str, path: &[u8], e: VfsError) -> &'
 /// returns early, leaves no file behind for the next run, nor does a
 /// failing `new`. Dropping it doesn't close `fd`, which stays open until
 /// the test process ends; it can't leave that process (it isn't `Send`,
-/// so `in_test_process` can't return it).
+/// so `in_test_process` can't return it). Its fields are private, so the
+/// path `Drop` removes is the one `new` checked.
 #[cfg(feature = "ktest")]
 pub(super) struct KtestTmpFile {
-    pub(super) path: &'static [u8],
-    pub(super) fd: Fd,
-    pub(super) inode: alloc::sync::Arc<dyn VfsInode>,
+    path: &'static [u8],
+    fd: Fd,
+    inode: alloc::sync::Arc<dyn VfsInode>,
     _in_its_process: core::marker::PhantomData<*const ()>,
 }
 
@@ -697,14 +722,20 @@ impl KtestTmpFile {
             return Err("a KtestTmpFile's path starts with /tmp/");
         }
         let _ = ktest_unlink(path); // an earlier run's, if it crashed
-        // An open can fail after its create (a full fd table, say).
-        let fd = ktest_open(3, path, OpenFlags::O_RDWR | OpenFlags::O_CREAT).inspect_err(|_| {
-            let _ = ktest_unlink(path);
-        })?;
-        let Ok(inode) = fd.file().map(|f| alloc::sync::Arc::clone(&f.inode)) else {
-            let _ = ktest_unlink(path);
-            return Err("look up the new fd");
-        };
+        // A step of the open after its create (making the open file, or
+        // installing it) can fail, and so can the lookup: either way, no
+        // file is left behind.
+        let (fd, inode) = ktest_open(3, path, OpenFlags::O_RDWR | OpenFlags::O_CREAT)
+            .and_then(|fd| {
+                let file = fd.file().map_err(|e| {
+                    crate::ktest::diag(format_args!("look up the fd of {}: {e}", lumen_vfs::Escaped(path)));
+                    "look up the new fd"
+                })?;
+                Ok((fd, alloc::sync::Arc::clone(&file.inode)))
+            })
+            .inspect_err(|_| {
+                let _ = ktest_unlink(path);
+            })?;
         // From here on an early return drops `tmp`, which unlinks it.
         let tmp = Self { path, fd, inode, _in_its_process: core::marker::PhantomData };
         let wrote = tmp.inode.write_at(0, data);
@@ -714,19 +745,43 @@ impl KtestTmpFile {
         }
         Ok(tmp)
     }
+
+    /// The file's path, under `/tmp/`.
+    pub(super) fn path(&self) -> &'static [u8] {
+        self.path
+    }
+
+    /// The descriptor `new` opened, `O_RDWR`.
+    pub(super) fn fd(&self) -> Fd {
+        self.fd
+    }
+
+    /// The file's inode.
+    pub(super) fn inode(&self) -> &alloc::sync::Arc<dyn VfsInode> {
+        &self.inode
+    }
 }
 
 #[cfg(feature = "ktest")]
 impl Drop for KtestTmpFile {
     fn drop(&mut self) {
-        let _ = ktest_unlink(self.path); // gone already where a test unlinks it
+        // Gone already where a test unlinks it; any other failure (which
+        // a drop can't fail the test with) gets a `ktest::diag` line.
+        if let Err(e) = ktest_unlink(self.path)
+            && e != VfsError::NoEnt
+        {
+            ktest_failed_at("remove the KtestTmpFile", self.path, e);
+        }
     }
 }
 
-/// Remove the file `path` (from `/`).
+/// Remove the file `path` (from `/`), handing back the error: a caller
+/// that wants a test error maps it through [`ktest_failed_at`], which
+/// names the path; a cleanup that may find it gone already looks for
+/// `NoEnt`.
 #[cfg(feature = "ktest")]
-pub(super) fn ktest_unlink(path: &[u8]) -> Result<(), &'static str> {
-    lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false).map_err(|_| "unlink")
+pub(super) fn ktest_unlink(path: &[u8]) -> Result<(), VfsError> {
+    lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false)
 }
 
 crate::ktest!(
@@ -867,9 +922,12 @@ crate::ktest!(
             let data = base + 1024;
             let iov = base + 2048;
             let out = base + 3072;
+            // Raw, created `0o666`: the fstat below checks that the umask
+            // takes `0o022` off (through `ktest_open`, `0o644`, it would
+            // pass with no umask at all).
             let path = ktest_user_path(0, b"/tmp/fd-ktest-rw")?;
             let rdwr = ktest_flags(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-            let fd = ktest_fd(sys_open(path, rdwr, at::reg(0o666)))?;
+            let fd = ktest_fd_of(sys_open(path, rdwr, at::reg(0o666)), "open", b"/tmp/fd-ktest-rw")?;
             copy_to_user(data, b"hello world").map_err(|_| "copy data")?;
             kassert_eq!(sys_write(fd, at::reg(data), 11), 11);
             kassert_eq!(sys_lseek(fd, 0, general::SEEK_SET), 0);
@@ -1079,14 +1137,14 @@ crate::ktest!(
             process::set_current_cwd(process::Cwd::new(guard, b"/tmp/fd-ktest-cwd").map_err(|_| "cwd")?);
             let rel = ktest_user_path(0, b"made-here")?;
             let creat = ktest_flags(OpenFlags::O_WRONLY | OpenFlags::O_CREAT);
-            let fd = ktest_fd(sys_open(rel, creat, at::reg(0o600)))?;
+            let fd = ktest_fd_of(sys_open(rel, creat, at::reg(0o600)), "open", b"made-here")?;
             kassert!(crate::vfs::resolve_path_from_root("/tmp/fd-ktest-cwd/made-here").is_ok());
             kassert!(crate::vfs::resolve_path_from_root("/made-here").is_err());
             let link = lumen_vfs::readlink_at(tables, None, alloc::format!("/proc/{pid}/fd/{}", fd.raw()).as_bytes());
             kassert_eq!(link, Ok(b"/tmp/fd-ktest-cwd/made-here".to_vec()));
             // Again without `O_CREAT`: the same file, through `openat` too.
             let rd = ktest_flags(OpenFlags::O_RDONLY);
-            let again = ktest_fd(sys_openat(Dirfd::Cwd, rel, rd, at::reg(0)))?;
+            let again = ktest_fd_of(sys_openat(Dirfd::Cwd, rel, rd, at::reg(0)), "openat", b"made-here")?;
             let same = current_file(again)
                 .zip(current_file(fd))
                 .is_some_and(|(a, b)| alloc::sync::Arc::ptr_eq(&a.inode, &b.inode));
@@ -1232,7 +1290,7 @@ crate::ktest!(
             let tmp = ktest_user_path(0, b"/tmp")?;
             let dirfd = call(general::__NR_open, tmp.addr(), high | u64::from(OpenFlags::O_DIRECTORY), 0, 0);
             kassert_eq!(dirfd, 3);
-            // openat(dirfd, "fd-ktest-reg", O_RDWR | O_CREAT, 0o640): relative
+            // openat(dirfd, "fd-ktest-reg", O_RDWR | O_CREAT, 0o666): relative
             // to fd 3, the mode less the umask (0o022).
             let rel = ktest_user_path(1, b"fd-ktest-reg")?;
             let flags = u64::from(OpenFlags::O_RDWR | OpenFlags::O_CREAT);

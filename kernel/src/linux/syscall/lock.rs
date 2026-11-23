@@ -404,7 +404,7 @@ mod ktest_window {
 
 #[cfg(feature = "ktest")]
 use {
-    super::fd::{ktest_failed_at, ktest_fd, ktest_open, sys_close, sys_lseek, sys_write},
+    super::fd::{ktest_failed_at, ktest_fd_of, ktest_open, ktest_unlink, sys_close, sys_lseek, sys_write},
     super::neg_errno,
     crate::ktest::TestResult,
     crate::sched,
@@ -435,13 +435,13 @@ const KTEST_FLOOR_NS: u64 = 20_000_000;
 
 /// `ret`, after removing `path`: every lock ktest's body makes its file
 /// and leaves it there, so after a pass a removal that fails fails the
-/// test (a `ktest::diag` line naming the path and the error); a failing
-/// test keeps its own error.
+/// test (a `ktest::diag` line naming the path and the error). A failing
+/// test, which may have failed before making its file, keeps its own
+/// error and gets no line about the removal.
 #[cfg(feature = "ktest")]
 fn ktest_unlink_after(path: &[u8], ret: TestResult) -> TestResult {
-    let removed = lumen_vfs::unlink_at(crate::vfs::tables(), None, path, false)
-        .map_err(|e| ktest_failed_at("remove the test's file", path, e));
-    ret.and(removed)
+    let removed = ktest_unlink(path);
+    ret.and_then(|()| removed.map_err(|e| ktest_failed_at("remove the test's file", path, e)))
 }
 
 /// Write `bytes` at `fd`'s offset (through user memory): `write`'s result.
@@ -669,7 +669,7 @@ crate::ktest!(
             // Another open of the same file, read-only (flock doesn't
             // care), and a dup of the first.
             let b = ktest_open(0, PATH, OpenFlags::O_RDONLY)?;
-            let a2 = ktest_fd(sys_fcntl(a, general::F_DUPFD, 10))?;
+            let a2 = ktest_fd_of(sys_fcntl(a, general::F_DUPFD, 10), "fcntl(F_DUPFD)", PATH)?;
             kassert_eq!(a2.raw(), 10);
             kassert_eq!(sys_flock(a, ex), 0);
             // Another open file description conflicts, even in the same
@@ -914,7 +914,7 @@ fn ktest_flock_waits_for(release: Release) -> TestResult {
         move |baton| {
             let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
             crate::kassert_eq!(sys_flock(fd, ex), 0);
-            let dup = ktest_fd(sys_fcntl(fd, general::F_DUPFD, 10))?;
+            let dup = ktest_fd_of(sys_fcntl(fd, general::F_DUPFD, 10), "fcntl(F_DUPFD)", PATH)?;
             crate::kassert_eq!(dup.raw(), 10);
             baton.go(1);
             baton.wait_for(2, &baton.b_ended)?;

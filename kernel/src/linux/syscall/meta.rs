@@ -267,7 +267,9 @@ mod tests {
     use lumen_vm::{MapPlace, Prot};
 
     use super::super::at::{self, Dirfd, Fd, UserPtr};
-    use super::super::fd::{ktest_fd, ktest_install, ktest_unlink, ktest_user_path, sys_close, sys_open, sys_openat};
+    use super::super::fd::{
+        ktest_fd_of, ktest_install, ktest_open, ktest_unlink, ktest_user_path, sys_close, sys_open, sys_openat,
+    };
     use super::super::neg_errno;
     use super::*;
     use crate::linux::general;
@@ -311,7 +313,7 @@ mod tests {
     fn make_file(slot: u64, path: &[u8], data: &[u8]) -> Result<UserPtr, &'static str> {
         let p = ktest_user_path(slot, path)?;
         let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_CREAT | OpenFlags::O_TRUNC);
-        let fd = ktest_fd(sys_open(p, flags, at::reg(0o644)))?;
+        let fd = ktest_fd_of(sys_open(p, flags, at::reg(0o644)), "open", path)?;
         let path = core::str::from_utf8(path).map_err(|_| "utf-8")?;
         if inode_of(path)?.write_at(0, data).map_err(|_| "write_at")? != data.len() {
             return Err("short write");
@@ -321,14 +323,27 @@ mod tests {
     }
 
     /// Open `path` (already in user memory) with `flags`: the descriptor.
+    /// A failure's `ktest::diag` line names the path, read back from user
+    /// memory, and the flags.
     fn open(path: UserPtr, flags: u32) -> Result<Fd, &'static str> {
-        ktest_fd(sys_open(path, OpenFlags::from_bits(flags), at::reg(0)))
+        let ret = sys_open(path, OpenFlags::from_bits(flags), at::reg(0));
+        if ret < lumen_vfs::MAX_FDS as u64 {
+            return Ok(at::reg(ret));
+        }
+        let name = at::UserPath::copy_in(path, true).map(|p| p.as_bytes().to_vec());
+        let call = alloc::format!("open({flags:#o})");
+        ktest_fd_of(ret, &call, name.as_deref().unwrap_or(b"<unreadable path>"))
     }
 
     fn symlink(target: &[u8], at: &[u8]) -> Result<(), &'static str> {
         lumen_vfs::symlink_at(crate::vfs::tables(), target, None, at).map(|_| ()).map_err(|_| "symlink")
     }
 
+    /// Remove each of `paths`, any failure ignored: the tests call it
+    /// before making their files (an earlier run's, if it crashed) and
+    /// after, with names a test may not have made (its `-link`s), so
+    /// `NoEnt` is expected, and a tmpfs file's unlink has no other way to
+    /// fail.
     fn remove(paths: &[&[u8]]) {
         for p in paths {
             let _ = ktest_unlink(p);
@@ -378,7 +393,7 @@ mod tests {
                 kassert_eq!(sys_fchmod(opath, at::reg(0o600)), neg_errno(errno::EBADF));
                 kassert_eq!(sys_fchmod(at::reg(900), at::reg(0o600)), neg_errno(errno::EBADF));
                 // fchmodat relative to a directory descriptor.
-                let tmp = open(ktest_user_path(2, b"/tmp")?, OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+                let tmp = ktest_open(2, b"/tmp", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
                 let rel = ktest_user_path(3, b"meta-ktest-chmod")?;
                 kassert_eq!(sys_fchmodat(Dirfd::Fd(tmp), rel, at::reg(0o604)), 0);
                 kassert_eq!(meta_of("/tmp/meta-ktest-chmod")?.mode, 0o604);
@@ -467,7 +482,7 @@ mod tests {
                 kassert_eq!(sys_fchownat(Dirfd::Cwd, link, u32::MAX, 8, flags(0)), 0);
                 kassert_eq!(owner("/tmp/meta-ktest-chown")?, (3, 8));
                 // fchownat relative to a dirfd, and AT_EMPTY_PATH on its file.
-                let tmp = open(ktest_user_path(2, b"/tmp")?, OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+                let tmp = ktest_open(2, b"/tmp", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
                 let rel = ktest_user_path(3, b"meta-ktest-chown")?;
                 kassert_eq!(sys_fchownat(Dirfd::Fd(tmp), rel, 9, 10, flags(0)), 0);
                 kassert_eq!(owner("/tmp/meta-ktest-chown")?, (9, 10));
@@ -721,7 +736,7 @@ mod tests {
                 // read-only mount, `-EROFS`.
                 let vol = Ext4Volume::new(200)?;
                 // Each inode a temporary, dropped at the end of its install's
-                // statement: the open file's reference is the test's only one.
+                // statement, so closing `fd` drops the inode's last reference.
                 let fd = ktest_install(
                     &vol.root.create(b"big", 0o644).map_err(|_| "create on ext4")?,
                     b"/big-rw",
@@ -869,7 +884,7 @@ mod tests {
                 };
                 let high = 0xdead_beef_0000_0000u64;
                 let path = make_file(0, b"/tmp/meta-ktest-regs", b"0123456789")?.addr();
-                let tmp = open(ktest_user_path(1, b"/tmp")?, OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
+                let tmp = ktest_open(1, b"/tmp", OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY)?;
                 let rel = ktest_user_path(2, b"meta-ktest-regs")?.addr();
                 let fd = open(at::reg(path), OpenFlags::O_RDWR)?;
                 let fdr = fd.raw() as u64;

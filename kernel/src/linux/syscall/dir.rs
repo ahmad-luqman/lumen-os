@@ -514,7 +514,7 @@ fn ktest_remove(path: &str, dir: bool) -> Result<(), &'static str> {
 #[cfg(feature = "ktest")]
 fn ktest_remove_in(dir: &str, name: &[u8]) -> Result<(), &'static str> {
     let path = [dir.as_bytes(), b"/", name].concat();
-    super::fd::ktest_unlink(&path).map_err(|_| "remove a listed entry")
+    super::fd::ktest_unlink(&path).map_err(|e| super::fd::ktest_failed_at("remove a listed entry", &path, e))
 }
 
 /// Make the directory `path` (from `/`).

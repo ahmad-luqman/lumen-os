@@ -416,9 +416,10 @@ one is its own PR that updates that doc first.
   `mmap` of a descriptor and `msync` (ktests in `mem/tests.rs`), `proc`;
   `fd` holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
   terminals by `VfsInode::is_tty` to the console, and the syscall ktests'
-  shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_open`,
-  `ktest_install`: a descriptor on a volume no mount holds, `KtestTmpFile`,
-  `ktest_unlink`), `dir` `getcwd`,
+  shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_fd_of`: a failure
+  naming the path, `ktest_open`, `ktest_install` and `ktest_install_file`:
+  a descriptor on a volume no mount holds, `ktest_failed_at`,
+  `KtestTmpFile`, `ktest_unlink`), `dir` `getcwd`,
   `getdents64` (the filesystem's `readdir` cursor in `dir_cursor`), `chdir`
   and `fchdir`; every M7 syscall implemented, the stubs gone with #255's
   `msync`; `lock` holds `fcntl` and `flock`: `lock_or_wait`, the retry loop

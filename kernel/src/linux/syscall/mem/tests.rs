@@ -13,7 +13,7 @@ use lumen_vfs::{OpenFlags, VfsInode};
 use lumen_vm::PAGE_SIZE;
 
 use super::super::at::Fd;
-use super::super::fd::{KtestTmpFile, ktest_install, ktest_open, ktest_unlink, sys_close};
+use super::super::fd::{KtestTmpFile, ktest_failed_at, ktest_install, ktest_open, ktest_unlink, sys_close};
 use super::super::neg_errno;
 use super::{sys_mmap, sys_mprotect, sys_msync, sys_munmap};
 use crate::linux::process::{KTEST_USER_LEN, KTEST_USER_VA, in_test_process};
@@ -141,10 +141,10 @@ crate::ktest!(
         // a file offset of one page.
         in_test_process(|_| {
             let tmp = KtestTmpFile::new(b"/tmp/mem-ktest-shared", &pattern(9))?;
-            let va = map(P, RW, SHARED, tmp.fd, P)?;
+            let va = map(P, RW, SHARED, tmp.fd(), P)?;
             copy_to_user(va, b"tmpfs-store").map_err(|_| "store")?;
             kassert_eq!(sys_msync(va, P, MS_SYNC), 0);
-            kassert_eq!(read(&tmp.inode, P, 11)?, b"tmpfs-store");
+            kassert_eq!(read(tmp.inode(), P, 11)?, b"tmpfs-store");
             kassert_eq!(sys_munmap(va, P), 0);
             Ok::<(), &'static str>(())
         })?
@@ -252,7 +252,7 @@ crate::ktest!(
         // its bytes and the shared page still reads the file.
         in_test_process(|_| {
             let tmp = KtestTmpFile::new(b"/tmp/mem-ktest-trunc", &pattern(8))?;
-            let (path, fd) = (tmp.path, tmp.fd);
+            let (path, fd) = (tmp.path(), tmp.fd());
             let shared = map(2 * P, RW, SHARED, fd, 0)?;
             let private = map(2 * P, RW, PRIVATE, fd, 0)?;
             let mut seen = [0u8; 4];
@@ -282,7 +282,7 @@ crate::ktest!(
         // keeps its bytes, a shared page stays mapped, and the file its size.
         in_test_process(|_| {
             let tmp = KtestTmpFile::new(b"/tmp/mem-ktest-path-trunc", &pattern(9))?;
-            let (path, fd, inode) = (tmp.path, tmp.fd, &tmp.inode);
+            let (path, fd, inode) = (tmp.path(), tmp.fd(), tmp.inode());
             let private = map(2 * P, RW, PRIVATE, fd, 0)?;
             let shared = map(2 * P, READ, SHARED, fd, 0)?;
             copy_to_user(private + 8, b"private!").map_err(|_| "copy on write")?;
@@ -309,11 +309,11 @@ crate::ktest!(
         // the last reference back.
         in_test_process(|_| {
             let tmp = KtestTmpFile::new(b"/tmp/mem-ktest-gone", &pattern(7))?;
-            let (path, fd, inode) = (tmp.path, tmp.fd, Arc::clone(&tmp.inode));
+            let (path, fd, inode) = (tmp.path(), tmp.fd(), Arc::clone(tmp.inode()));
             let va = map(P, RW, SHARED, fd, 0)?;
             kassert_eq!(sys_close(fd), 0);
             kassert_eq!(inode.open_count(), 1); // the mapping's
-            ktest_unlink(path)?;
+            ktest_unlink(path).map_err(|e| ktest_failed_at("unlink", path, e))?;
             kassert!(crate::vfs::resolve_path_from_root("/tmp/mem-ktest-gone").is_err());
             copy_to_user(va + 100, b"after-unlink").map_err(|_| "store")?;
             let mut seen = [0u8; 12];
@@ -334,7 +334,7 @@ crate::ktest!(
     fn mem_mmap_fd_refuses_with_linuxs_errnos() {
         in_test_process(|_| {
             let tmp = KtestTmpFile::new(b"/tmp/mem-ktest-errnos", &pattern(1))?;
-            let (path, rw) = (tmp.path, tmp.fd);
+            let (path, rw) = (tmp.path(), tmp.fd());
             let ro = ktest_open(3, path, OpenFlags::O_RDONLY)?;
             let wo = ktest_open(3, path, OpenFlags::O_WRONLY)?;
             // EBADF: not open, or O_PATH.
@@ -493,7 +493,7 @@ crate::ktest!(
             };
             let high = 0xdead_beef_0000_0000u64;
             let tmp = KtestTmpFile::new(b"/tmp/mem-ktest-dispatch", &pattern(2))?;
-            let (fd, inode) = (tmp.fd, &tmp.inode);
+            let (fd, inode) = (tmp.fd(), tmp.inode());
             let at = 0x7000_0000_0000;
             kassert_eq!(call(general::__NR_mmap, [at, P, RW, SHARED | FIXED, high | raw(fd), P]), at);
             let mut seen = [0u8; 8];
@@ -519,8 +519,8 @@ crate::ktest!(
         // offsets, its `.bss` past the file's bytes anonymous.
         in_test_process(|_| {
             let tmp = KtestTmpFile::new(b"/tmp/mem-ktest-maps", &pattern(2))?;
-            let ino = tmp.inode.stat().map_err(|_| "stat")?.ino;
-            let va = map(P, RW, SHARED, tmp.fd, P)?;
+            let ino = tmp.inode().stat().map_err(|_| "stat")?.ino;
+            let va = map(P, RW, SHARED, tmp.fd(), P)?;
             let maps = maps()?;
             let line = line(&maps, va)?;
             let fields = format!("{va:08x}-{:08x} rw-s 00001000 00:02 {ino}", va + P);
