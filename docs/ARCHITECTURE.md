@@ -5191,10 +5191,14 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   at the cap (reclaim, run once before the write takes its locks, couldn't get
   below it, or this one write added more pages than the gap) returns a short
   count or `-ENOSPC` instead of growing the cache until the kernel runs out of
-  frames, logged once per crossing. The cap is `PageCache::insert_new`'s: it
-  refuses a dirty page of a linked `ext4` file at the cap whichever path
-  made it (`write_from` asks first, before making the page), and lets a
-  clean one (a read's, which reclaim can drop) in; a write or truncate past the
+  frames, logged once per crossing. The cap is one check,
+  `PageCache::admit_unreclaimable`, for a new page of a linked `ext4` file
+  that reclaim can't drop: `insert_new` asks it for a page that is dirty when
+  inserted, whichever path made it (`write_from` also asks before making the
+  page, and the insert asks again in case the cache filled meanwhile), and
+  `mmap_page` asks it before reading in a page a mapping will pin (clean, so
+  the insert lets it in); a clean page (a read's, which reclaim can drop) is
+  let in at the cap. A write or truncate past the
   volume's largest file size returns `-EFBIG`. `create`/`mkdir`/`symlink`
   return `-ENOSPC` while fewer than 8 blocks are free, so a new entry can
   always be linked (or its inode released) without the directory growing
@@ -5207,14 +5211,20 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   through the same three `PageCache` methods, under the inode's Lock 4 and
   Lock 5: `read_into(offset, buf, file_size, miss)` (a page not cached is
   `miss`'s: a page read from disk, inserted after the copy, or `None`, a
-  hole read as zeros without a frame), `write_from(offset, buf, dirty,
-  fill)` (a page not cached is `fill`'s, a zero page or one holding the
-  disk's bytes a partial write keeps; an error past the first page is a
-  short count) and `zero_tail(old_size, new_size, dirty)` (the rule
-  below). Their page arithmetic is `lumen_vfs::page`'s, host-tested:
-  `spans` (each page a byte range touches, its offset there and its part
-  of the buffer), `pages_in` (the pages below a size) and `resize_tail`
-  (which bytes past the end a size change zeroes).
+  hole read as zeros without a frame; an error after some bytes were copied
+  is returned, not a short count, as before), `write_from(offset, buf,
+  old_size, fill)` (a page not cached is `fill`'s, a zero page or one
+  holding the disk's bytes a partial write keeps; a write starting past
+  `old_size` first zeroes the old tail, the rule below; an error past the
+  first page is a short count) and `resize(old_size, new_size)` (a
+  truncate's: a shrink's pages dropped, then the tail zeroed, the rule
+  below). Pages are marked dirty by the cache's owner, a linked `ext4`
+  file's alone (`writes_back`). Their page arithmetic is
+  `lumen_vfs::page`'s, host-tested: `spans` (each page a byte range
+  touches, its offset there and its part of the buffer), `pages_in` (how
+  many pages a file of that size has; a shrink drops the cached pages from
+  there on), `valid_len` (a page's bytes below the file's size) and
+  `resize_tail` (which bytes past the end a size change zeroes).
 - **Truncate & extend interaction:**
   - Shrinking a file to `new_size` (`ftruncate`, `truncate`, `openat(O_TRUNC)`),
     in this order:
@@ -5245,14 +5255,14 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     fill as `read_at` (`Ext4Inode::load_page`, which logs a failed read
     naming the device, inode and page, once per streak of the same error).
     A hole in a `tmpfs` file (or a detached `ext4` one) gets a zero page
-    (`CachePage::new_shared`, as `write_at`'s new pages; `tmpfs::page_or_new`
-    for `tmpfs`).
+    (`CachePage::new_zeroed`, as `write_at`'s new pages).
     Unlike `read_at`, which reads a hole as zeros without a frame, a mapped
     hole costs a frame: the `tmpfs` or detached quota can refuse it
     (`NoSpc`). A missing page of a linked `ext4` file is refused (`NoSpc`,
-    the hard-limit warning) while the `ext4` cache is at its hard limit, as
-    `write_at` refuses one: mapped pages are pinned, so reclaim can't keep
-    them under it. A detached `ext4` file's pages count against the
+    the hard-limit warning) while the `ext4` cache is at its hard limit, by
+    the same check as a write's new page (`admit_unreclaimable`, before
+    the disk read): mapped pages are pinned, so reclaim can't keep them
+    under it. A detached `ext4` file's pages count against the
     detached quota instead of the hard limit. Also `NoMem` and `Io`.
   - *EOF:* `Range` when `index * 4096 >= file_size` (or the product
     overflows): no page is mapped there, and the fault path raises

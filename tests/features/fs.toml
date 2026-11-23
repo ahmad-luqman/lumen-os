@@ -16,7 +16,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Unified 4 KiB frame-backed PageCache with write-back, soft 32 MiB reclaim and a 64 MiB hard cap for ext4 (PageCache::insert_new refusing a dirty ext4 page at the cap and letting a clean or tmpfs page in; write_from asking before it makes a page, a write past the first page returning short), quota accounting, and truncate tail zeroing; tmpfs and ext4 share its page I/O (read_into, write_from, zero_tail), whose page spans and tail-zero rule lumen-vfs host-tests against byte-by-byte models (#264, #265)"
+name = "Unified 4 KiB frame-backed PageCache with write-back, soft 32 MiB reclaim and a 64 MiB hard cap for ext4 (one check for a page reclaim can't drop: PageCache::insert_new refusing a page dirty when inserted at the cap and letting a clean or tmpfs page in; write_from asking before it makes a page and the insert asking again, an error after the first page returning a short count), quota accounting, and truncate tail zeroing; tmpfs and ext4 share its page I/O (read_into, write_from, resize): an overwrite inside a page keeping the rest of it, a write past the end zeroing what a mapping stored past the old end, a page a read loads staying cached; its page spans, a page's bytes below the size and the tail-zero rule lumen-vfs host-tests against byte-by-byte models (#264, #265)"
 milestone = "M7"
 tests = [
     "cargo:lumen-vfs",
