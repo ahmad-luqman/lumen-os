@@ -16,8 +16,8 @@ HARNESS     := PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness
 # `.rhai`: the built-in scripts, embedded with `include_str!`.
 # apps/ (its sources, manifests and lock file): the kernels embed the
 # modules `make apps` builds from them (kernel/build.rs), so a change there
-# rebuilds the kernels, `apps` first.
-KERNEL_SRCS := $(shell find kernel crates apps -name '*.rs' -o -name '*.toml' -o -name '*.ld' -o -name '*.rhai') Cargo.toml Cargo.lock apps/Cargo.lock .cargo/config.toml rust-toolchain.toml
+# rebuilds the kernels, `apps` first. vendor/: patched dependencies (#313).
+KERNEL_SRCS := $(shell find kernel crates apps vendor -name '*.rs' -o -name '*.toml' -o -name '*.ld' -o -name '*.rhai') Cargo.toml Cargo.lock apps/Cargo.lock .cargo/config.toml rust-toolchain.toml
 
 # Both kernels are built into the same cargo output path and copied out, so
 # their recipes must never run concurrently (`make -j`).
