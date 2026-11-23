@@ -26,7 +26,7 @@ use ext4plus::file::{read_at as ext4_read_at, truncate as ext4_truncate, write_a
 use ext4plus::inode::{Inode, InodeFlags, InodeMode};
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
-use lumen_vfs::ext4::rdev_from_i_block;
+use lumen_vfs::ext4::{block_bitmap_bit, first_block_freed, rdev_from_i_block};
 use lumen_vfs::nlink::NlinkBounds;
 use lumen_vfs::page;
 use lumen_vfs::{
@@ -301,6 +301,11 @@ struct Ext4DiskLayout {
     inodes_per_group: u32,
     desc_size: u16,
     is_64bit: bool,
+    /// Where the block groups start, how many blocks each has, and the
+    /// volume's blocks: where a block's bitmap bit is (#330).
+    first_data_block: u32,
+    blocks_per_group: u32,
+    blocks_count: u64,
 }
 
 impl Ext4DiskLayout {
@@ -318,14 +323,32 @@ impl Ext4DiskLayout {
         if desc_size < 32 || (is_64bit && desc_size != 64) {
             return Err(VfsError::Inval);
         }
-        Ok(Self { block_size, inode_size, inodes_per_group, desc_size, is_64bit })
+        let first_data_block = u32::from_le_bytes(sb[0x14..0x18].try_into().unwrap());
+        let blocks_per_group = u32::from_le_bytes(sb[0x20..0x24].try_into().unwrap());
+        let blocks_hi = if is_64bit { u32::from_le_bytes(sb[0x150..0x154].try_into().unwrap()) } else { 0 };
+        let blocks_count =
+            (u64::from(blocks_hi) << 32) | u64::from(u32::from_le_bytes(sb[0x04..0x08].try_into().unwrap()));
+        Ok(Self {
+            block_size,
+            inode_size,
+            inodes_per_group,
+            desc_size,
+            is_64bit,
+            first_data_block,
+            blocks_per_group,
+            blocks_count,
+        })
     }
 
-    fn inode_disk_offset(&self, bcache: &SharedBlockCache, ino: u32) -> Result<u64, VfsError> {
-        let ino_m1 = ino.checked_sub(1).ok_or(VfsError::Inval)?;
-        let bg_idx = ino_m1 / self.inodes_per_group;
-        let idx_in_group = ino_m1 % self.inodes_per_group;
-
+    /// Group `bg_idx`'s descriptor field at `lo_off`, with its high half at
+    /// `hi_off` on a 64-bit volume: a block number.
+    fn group_block(
+        &self,
+        bcache: &SharedBlockCache,
+        bg_idx: u32,
+        lo_off: usize,
+        hi_off: usize,
+    ) -> Result<u64, VfsError> {
         let bgd_start_block: u64 = if self.block_size == 1024 { 2 } else { 1 };
         let desc_sz = u64::from(self.desc_size);
         let bgd_per_block = self.block_size / desc_sz;
@@ -337,10 +360,35 @@ impl Ext4DiskLayout {
         let read_len = usize::from(self.desc_size).min(bgd.len());
         bcache.read_at(bgd_byte, &mut bgd[..read_len]).map_err(|e| map_block_error(&e))?;
 
-        let lo = u32::from_le_bytes(bgd[0x8..0xc].try_into().unwrap());
-        let hi =
-            if self.is_64bit && read_len >= 0x2c { u32::from_le_bytes(bgd[0x28..0x2c].try_into().unwrap()) } else { 0 };
-        let inode_table_block = (u64::from(hi) << 32) | u64::from(lo);
+        let lo = u32::from_le_bytes(bgd[lo_off..lo_off + 4].try_into().unwrap());
+        let hi = if self.is_64bit && read_len >= hi_off + 4 {
+            u32::from_le_bytes(bgd[hi_off..hi_off + 4].try_into().unwrap())
+        } else {
+            0
+        };
+        Ok((u64::from(hi) << 32) | u64::from(lo))
+    }
+
+    /// Whether `block` is free in its group's block bitmap, as `ext4plus`'s
+    /// allocator would read it (through the block cache). `Inval` for a
+    /// block outside the volume.
+    fn block_is_free(&self, bcache: &SharedBlockCache, block: u64) -> Result<bool, VfsError> {
+        let (bg_idx, byte, mask) =
+            block_bitmap_bit(block, self.first_data_block, self.blocks_per_group, self.blocks_count)
+                .ok_or(VfsError::Inval)?;
+        let bitmap = self.group_block(bcache, bg_idx, 0x0, 0x20)?;
+        let off =
+            bitmap.checked_mul(self.block_size).and_then(|b| b.checked_add(u64::from(byte))).ok_or(VfsError::Inval)?;
+        let mut bits = [0u8; 1];
+        bcache.read_at(off, &mut bits).map_err(|e| map_block_error(&e))?;
+        Ok(bits[0] & mask == 0)
+    }
+
+    fn inode_disk_offset(&self, bcache: &SharedBlockCache, ino: u32) -> Result<u64, VfsError> {
+        let ino_m1 = ino.checked_sub(1).ok_or(VfsError::Inval)?;
+        let bg_idx = ino_m1 / self.inodes_per_group;
+        let idx_in_group = ino_m1 % self.inodes_per_group;
+        let inode_table_block = self.group_block(bcache, bg_idx, 0x8, 0x28)?;
         let byte_off = inode_table_block
             .checked_mul(self.block_size)
             .and_then(|b| b.checked_add(u64::from(idx_in_group) * u64::from(self.inode_size)))
@@ -838,6 +886,22 @@ impl Ext4FsInner {
             target: "vfs",
             "ext4 {:?} directory {parent_ino}: freeing inode {disk_ino}, whose last entry went, failed: {err:?}; \
              run e2fsck",
+            self.dev
+        );
+    }
+
+    /// An unlink or rmdir failed and `parent_ino` can't be read back, but
+    /// `delete_file` had already freed `disk_ino`'s blocks (`block`, the
+    /// first it frees, is free) without zeroing it: it is forgotten, not
+    /// kept live with blocks a new file may get (#330). Its blocks are
+    /// free, its inode maybe still allocated, for `e2fsck`.
+    fn log_forgot_freed_blocks(&self, parent_ino: NonZeroU32, disk_ino: u32, block: u64) {
+        #[cfg(feature = "ktest")]
+        ktest_util::FREED_BLOCKS_ARM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        error!(
+            target: "vfs",
+            "ext4 {:?} directory {parent_ino}: inode {disk_ino} lost its entry and its blocks were freed (block \
+             {block} is free) before the unlink failed, the directory unreadable; forgetting it; run e2fsck",
             self.dev
         );
     }
@@ -1884,24 +1948,30 @@ impl Ext4Inode {
                     }
                     Err(_) => {
                         // The directory can't be read back, so decide from
-                        // the child inode itself ([`zeroed_by_unlink`]):
+                        // the child inode itself ([`child_after_failed_unlink`]):
                         // restoring onto a zeroed one would revive a number
-                        // another create can reuse.
-                        let zeroed = zeroed_by_unlink(&inner.ext4, child_arc.disk_inode_index());
-                        if zeroed == Some(true) {
+                        // another create can reuse, and keeping one whose
+                        // blocks were freed live would let writes through an
+                        // open descriptor reach a new file given them (#330).
+                        // Forgotten, an open one is detached (`settle_child`):
+                        // its pages are never written back.
+                        let last_link = is_last_link(false, effective_nlink);
+                        let read_back = child_after_failed_unlink(inner, child_arc.disk_inode_index(), last_link);
+                        if read_back.lost() {
+                            if let ChildReadBack::BlocksFreed(block) = read_back {
+                                inner.log_forgot_freed_blocks(parent_ino, child_arc.disk_ino, block);
+                            }
                             inner.forget_freed(child_arc.disk_ino);
                             inner.log_failed_free(parent_ino, child_arc.disk_ino, &err);
                             return Ok(UnlinkDiskOutcome::Completed { remaining_nlink: None, post_err: Some(err) });
                         }
-                        // Otherwise the inode isn't zeroed (its bitmap bit is
-                        // freed only after the zeroing): assume the entry
-                        // survived and put the inline target back, or a
-                        // surviving symlink would read as empty. If the entry
-                        // was in fact removed, the restored inode is an orphan
-                        // `e2fsck` reattaches, with its target intact. Its
-                        // blocks may already be free, though (`delete_file`
-                        // frees them before zeroing it): that is #330, open.
-                        if zeroed.is_none() {
+                        // Otherwise the inode isn't zeroed and its blocks
+                        // aren't freed: assume the entry survived and put the
+                        // inline target back, or a surviving symlink would
+                        // read as empty. If the entry was in fact removed,
+                        // the restored inode is an orphan `e2fsck`
+                        // reattaches, with its target and its blocks intact.
+                        if read_back == ChildReadBack::Unreadable {
                             error!(
                                 target: "vfs",
                                 "ext4 {:?} inode {}: unlink failed and neither its directory nor the inode reads \
@@ -1969,16 +2039,30 @@ impl Ext4Inode {
                         Some(err)
                     }
                     // The directory can't be read back: a child that
-                    // `delete_file` already zeroed has lost its entry, as
-                    // unlink decides ([`zeroed_by_unlink`]); keeping it live
-                    // would let a new inode alias it.
-                    Err(_) if zeroed_by_unlink(&inner.ext4, child_arc.disk_inode_index()) == Some(true) => {
-                        #[cfg(feature = "ktest")]
-                        ktest_util::RMDIR_ZEROED_ARM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    // `delete_file` already zeroed, or whose blocks it
+                    // already freed, has lost its entry, as unlink decides
+                    // ([`child_after_failed_unlink`]); keeping it live would
+                    // let a new inode alias it, or a create in it write into
+                    // blocks a new directory was given (#330).
+                    Err(_) => {
+                        let read_back = child_after_failed_unlink(inner, child_arc.disk_inode_index(), !keeps_a_link);
+                        match read_back {
+                            ChildReadBack::Zeroed => {
+                                #[cfg(feature = "ktest")]
+                                ktest_util::RMDIR_ZEROED_ARM.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            }
+                            ChildReadBack::BlocksFreed(block) => {
+                                inner.log_forgot_freed_blocks(parent_ino, child_arc.disk_ino, block);
+                            }
+                            ChildReadBack::Allocated | ChildReadBack::Unreadable => {
+                                inner.set_nlink_exact(child_arc.disk_ino, effective_links);
+                                return Ok(RmdirDiskOutcome::StillPresent { err, actual_nlink: effective_links });
+                            }
+                        }
                         remaining = None;
                         Some(err)
                     }
-                    Ok(_) | Err(_) => {
+                    Ok(_) => {
                         inner.set_nlink_exact(child_arc.disk_ino, effective_links);
                         return Ok(RmdirDiskOutcome::StillPresent { err, actual_nlink: effective_links });
                     }
@@ -3158,19 +3242,81 @@ fn surviving_inode(ext4: &Ext4, ino: NonZeroU32, is_dir: bool, effective: u32) -
     Inode::read(ext4, ino).ok().filter(|cur| cur.links_count() > 0)
 }
 
-/// After an unlink of `ino`'s last link failed and its directory can't be
-/// read back, whether `delete_file` already zeroed the inode: `Dir::unlink`
-/// writes the child's lowered count, removes the entry, and only then
-/// (`delete_file`) zeroes the inode and frees it in the bitmap, so a zeroed
-/// mode means the entry is gone and the inode may be free. `Some(true)`: a
-/// zeroed mode, or an inode that doesn't parse (a zeroed one may not);
-/// `Some(false)`: still allocated; `None`: it can't be read at all
-/// (unknown, which callers treat as live).
-fn zeroed_by_unlink(ext4: &Ext4, ino: NonZeroU32) -> Option<bool> {
-    match Inode::read(ext4, ino) {
-        Ok(cur) => Some(cur.mode().bits() == 0),
-        Err(Ext4Error::Corrupt(_)) => Some(true),
-        Err(_) => None,
+/// What a child's inode, read back after an unlink of it failed and its
+/// directory couldn't be read back, says about its entry
+/// ([`child_after_failed_unlink`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChildReadBack {
+    /// `delete_file` zeroed it (or it doesn't parse, as a zeroed one may
+    /// not): the entry is gone and the inode may be free.
+    Zeroed,
+    /// Not zeroed, but `delete_file` already freed this block of its, the
+    /// first it frees: the entry is gone and the block may be handed out
+    /// again (#330).
+    BlocksFreed(u64),
+    /// Still allocated with its blocks: the entry may have survived.
+    Allocated,
+    /// The inode, its map or the bitmap can't be read (unknown, which
+    /// callers treat as `Allocated`).
+    Unreadable,
+}
+
+impl ChildReadBack {
+    /// Whether the entry is known to be gone, so the inode must not be kept
+    /// live: a new inode, or a new file's blocks, could alias it.
+    fn lost(self) -> bool {
+        matches!(self, Self::Zeroed | Self::BlocksFreed(_))
+    }
+}
+
+/// After an unlink of `ino` failed and its directory can't be read back,
+/// whether its entry is gone, from the inode itself ([`ChildReadBack`];
+/// `last_link`: the unlink took its last link, so `delete_file` ran).
+/// `Dir::unlink` writes the child's lowered count, removes the entry, and
+/// only then (`delete_file`) frees the inode's blocks, writes it, zeroes it
+/// and frees it in the bitmap. So a zeroed mode means the entry is gone,
+/// and so does the first block `delete_file` frees being free in the block
+/// bitmap ([`first_block_freed`]): then the inode is left with its mode
+/// and with block numbers some new file may be given, and keeping it live
+/// would let writes through it (a create in a directory, a write to an
+/// open file) reach that file. An inode whose `i_block` holds no block
+/// numbers (an inline symlink, a device) frees no blocks.
+///
+/// Its reads: the inode, then (a last link, not zeroed, with blocks) its
+/// `i_block` raw, any map blocks on the way to its first data block, its
+/// group's descriptor and the one bitmap byte.
+fn child_after_failed_unlink(inner: &Ext4FsInner, ino: NonZeroU32, last_link: bool) -> ChildReadBack {
+    let cur = match Inode::read(&inner.ext4, ino) {
+        Ok(cur) => cur,
+        Err(Ext4Error::Corrupt(_)) => return ChildReadBack::Zeroed,
+        Err(_) => return ChildReadBack::Unreadable,
+    };
+    if cur.mode().bits() == 0 {
+        return ChildReadBack::Zeroed;
+    }
+    if !last_link || i_block_holds_no_block_numbers(&cur) {
+        return ChildReadBack::Allocated;
+    }
+    let first = (|| -> Result<Option<u64>, VfsError> {
+        let off = inner.layout.inode_disk_offset(&inner.bcache, ino.get())?;
+        let mut i_block = [0u8; 60];
+        inner.bcache.read_at(off + I_BLOCK_OFFSET, &mut i_block).map_err(|e| map_block_error(&e))?;
+        let block_size = usize::try_from(inner.layout.block_size).map_err(|_| VfsError::Inval)?;
+        let extents = cur.flags().contains(InodeFlags::EXTENTS);
+        first_block_freed(&i_block, extents, block_size, |block, buf| {
+            let at = block.checked_mul(inner.layout.block_size).ok_or(VfsError::Inval)?;
+            inner.bcache.read_at(at, buf).map_err(|e| map_block_error(&e))
+        })
+        .map_err(|_| VfsError::Io)
+    })();
+    match first {
+        Ok(None) => ChildReadBack::Allocated,
+        Ok(Some(block)) => match inner.layout.block_is_free(&inner.bcache, block) {
+            Ok(true) => ChildReadBack::BlocksFreed(block),
+            Ok(false) => ChildReadBack::Allocated,
+            Err(_) => ChildReadBack::Unreadable,
+        },
+        Err(_) => ChildReadBack::Unreadable,
     }
 }
 
@@ -4681,6 +4827,11 @@ pub(crate) mod ktest_util {
     /// unreadable after a failed unlink, the child zeroed by `delete_file`),
     /// for a ktest's reach guard.
     pub static RMDIR_ZEROED_ARM: AtomicUsize = AtomicUsize::new(0);
+
+    /// How many times unlink or rmdir forgot a child whose blocks
+    /// `delete_file` already freed, not yet zeroed (its directory unreadable
+    /// after a failed unlink; #330), for a ktest's reach guard.
+    pub static FREED_BLOCKS_ARM: AtomicUsize = AtomicUsize::new(0);
 
     /// Take one from `counter` if it is above 0; whether it was.
     fn take_one(counter: &AtomicUsize) -> bool {
@@ -7016,15 +7167,18 @@ crate::ktest!(
         // Where `sub` went, `a`'s count in memory is what its entries call
         // for (2), kept as a pin while the disk says otherwise (#325, logged),
         // and its times moved; where `sub` stayed, the rmdir failed and `a`
-        // is as it was. Not checked: with no read of `a` passing and `sub`
-        // not zeroed (its entry gone, `delete_file` stopped before zeroing
-        // it, maybe after freeing its blocks), rmdir keeps `sub` live and
-        // `a` as it was, failing; that state is #330's, not claimed safe
-        // here (only the error is asserted). A `sub` zeroed on disk is
-        // never kept live: its count in memory is 0 and a new file never
-        // comes back as it. Each leg has at least one rmdir that took the
-        // entry out and then couldn't read `a` back, and the second at
-        // least one that took rmdir's zeroed-child arm.
+        // is as it was. A `sub` zeroed on disk is never kept live: its count
+        // in memory is 0 and a new file never comes back as it. With no read
+        // of `a` passing (skip 0, a write failing) and `sub`'s entry gone, a
+        // directory made afterwards (`x`, with a file in it) is never
+        // changed by a create in `sub`: a `sub` whose blocks `delete_file`
+        // already freed, not yet zeroed, is forgotten like a zeroed one
+        // (#330), and one kept live still owns its blocks (and the free
+        // count on disk didn't rise; no single failed write leaves one kept
+        // live, as the unlink ktest's pairs do). Each leg has at least one
+        // rmdir that took the entry out and then couldn't read `a` back, and
+        // the second at least one that took rmdir's zeroed-child arm and one
+        // that forgot `sub` for its freed blocks.
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -7048,6 +7202,7 @@ crate::ktest!(
         let first = (0..=64).map(|skip| (skip, None));
         let second = (1..=total).flat_map(|k| (0..=3).map(move |skip| (skip, Some(k))));
         let (mut gone, mut unread, mut freed_unread) = ([0; 2], [0; 2], 0);
+        let (mut blocks_freed, mut aliasing_checked, mut kept) = (0, 0, 0);
         let mut first_done = false;
         for (skip, write) in first.chain(second) {
             if first_done && write.is_none() {
@@ -7072,9 +7227,12 @@ crate::ktest!(
                     m.cache.arm_write(k);
                 }
             }
+            let free_before = free_blocks(&m.fs);
             let zeroed_arm_before = RMDIR_ZEROED_ARM.load(O::Relaxed);
+            let freed_arm_before = FREED_BLOCKS_ARM.load(O::Relaxed);
             let res = a.rmdir(b"sub");
             let took_zeroed_arm = RMDIR_ZEROED_ARM.load(O::Relaxed) != zeroed_arm_before;
+            blocks_freed += FREED_BLOCKS_ARM.load(O::Relaxed) - freed_arm_before;
             let left = m.cache.range_reads_left();
             // The first leg's one read failed; the second's write failed and
             // then a read of `a` did.
@@ -7107,12 +7265,18 @@ crate::ktest!(
                 kassert_eq!(sub_nlink, 0);
                 kassert_eq!(canary.inode_type(), InodeType::File);
             }
-            if ro_a.lookup(b"sub").is_err() && skip == 0 && write.is_some() && !sub_freed {
-                // `a` unread and `sub` not zeroed: rmdir keeps `sub` live and
-                // `a` as it was (the cautious arm; its blocks may already be
-                // free, #330). Only the error is checked.
+            let sub_gone = ro_a.lookup(b"sub").is_err();
+            let sub_kept = sub.stat().map_err(|_| "stat sub")?.nlink != 0;
+            let free_after = free_blocks(&ro);
+            // `a` unread and `sub` neither zeroed nor with a block freed:
+            // rmdir keeps `sub` live and `a` as it was (the cautious arm),
+            // failing, and nothing was freed (checked below, after a create
+            // in `sub`).
+            let cautious = sub_gone && skip == 0 && write.is_some() && !sub_freed && sub_kept;
+            if cautious {
+                kept += 1;
                 kassert!(res.is_err());
-            } else if ro_a.lookup(b"sub").is_err() {
+            } else if sub_gone {
                 gone[leg] += 1;
                 // A read of `a`'s inode failed after the entry went, the
                 // parent's own write (the last) excepted.
@@ -7135,6 +7299,39 @@ crate::ktest!(
                 kassert_eq!(nlink, 3);
                 kassert_eq!(times, times_before);
             }
+            if sub_gone && skip == 0 && write.is_some() {
+                // A directory made now may get blocks `sub` had: a create in
+                // `sub` (refused if forgotten) must not reach it (#330).
+                aliasing_checked += 1;
+                let x = m.root.mkdir(b"x", 0o755).map_err(|_| "mkdir x")?;
+                x.create(b"inx", 0o644).map_err(|_| "create x/inx")?;
+                let evil = sub.create(b"evil", 0o644);
+                let live = x.lookup(b"evil").is_ok();
+                let ro_x = remount_ro(&m, 264)?.root_inode().lookup(b"x").map_err(|_| "ro x")?;
+                let mut listed = Vec::new();
+                ro_x.readdir(0, &mut listed, 16).map_err(|_| "readdir ro x")?;
+                let mut names: Vec<&[u8]> = listed.iter().map(|e| &e.name[..]).collect();
+                names.sort_unstable();
+                let intact = names == [&b"."[..], b"..", b"inx"];
+                if live || !intact {
+                    crate::ktest::diag(format_args!(
+                        "skip={skip} write={write:?} res={res:?}: sub gone (zeroed {sub_freed}, kept {sub_kept}), \
+                         free blocks {free_before} -> {free_after}; sub.create(evil)={:?}, x.lookup(evil) {live}, \
+                         x on disk lists {:?}",
+                        evil.map(|e| e.ino()),
+                        names.iter().map(|n| core::str::from_utf8(n).unwrap_or("?")).collect::<Vec<_>>()
+                    ));
+                }
+                kassert!(!live);
+                kassert!(intact);
+            }
+            if cautious && free_after > free_before {
+                crate::ktest::diag(format_args!(
+                    "skip={skip} write={write:?} res={res:?}: sub gone and kept live, free blocks {free_before} -> \
+                     {free_after}"
+                ));
+            }
+            kassert!(!cautious || free_after <= free_before);
             drop((a, sub, ro_a, ro, m));
         }
         crate::ktest::diag(format_args!(
@@ -7142,13 +7339,120 @@ crate::ktest!(
              a unread, {freed_unread} through the zeroed-child arm",
             gone[0], unread[0], gone[1], unread[1]
         ));
+        crate::ktest::diag(format_args!(
+            "rmdir, a unread from the fault on: {aliasing_checked} with sub gone, {blocks_freed} forgetting sub for \
+             its freed blocks, {kept} keeping it live"
+        ));
         kassert!(freed_unread >= 1);
+        kassert!(blocks_freed >= 1);
         // The first leg ended: an rmdir with no read of `a` left to fail.
         if !first_done {
             crate::ktest::diag(format_args!("rmdir read a's inode more than 64 times: the first leg never ended"));
         }
         kassert!(first_done);
         kassert!(unread[0] >= 1 && unread[1] >= 1);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_unlink_whose_directory_cant_be_read_back_never_writes_into_freed_blocks() {
+        // `unlink a/f` of an open 8 KiB file, each write failing in turn
+        // (alone, and with the next one: a failed free of a block range is
+        // retried block by block, so it takes two to stop `delete_file`
+        // before it frees anything) and every read of `a`'s inode failing
+        // after it, so an unlink that took the entry out finds `a`
+        // unreadable and decides from `f`'s inode. Wherever `f`'s entry
+        // went, a file made afterwards (`g`, 8 KiB) never gets bytes
+        // written through the still-open `f`: an `f` whose blocks
+        // `delete_file` already freed, not yet zeroed, is forgotten and
+        // detached (its pages never written back, #330), and one kept live
+        // still owns its blocks (and the free count on disk didn't rise:
+        // a weaker check, since a pair can clear a block's bit and fail the
+        // counts' writes). At least one unlink forgot `f` for its freed
+        // blocks, and at least one kept it live.
+        use self::ktest_util::*;
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::Ordering as O;
+        let data = pattern(2 * PAGE_SIZE, 7);
+        let img = {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 265)?;
+            let a = m.root.mkdir(b"a", 0o755).map_err(|_| "mkdir a")?;
+            let f = a.create(b"f", 0o644).map_err(|_| "create f")?;
+            kassert_eq!(f.write_at(0, &data).map_err(|_| "write f")?, data.len());
+            m.fs.sync().map_err(|_| "sync")?;
+            drop((f, a));
+            image(&m)?
+        };
+        let total = {
+            let m = mount(img.clone(), 265)?;
+            let a = m.root.lookup(b"a").map_err(|_| "a")?;
+            m.cache.arm_write(0);
+            a.unlink(b"f").map_err(|_| "unlink without a fault")?;
+            m.cache.writes.load(O::Acquire)
+        };
+        let quota_before = page_cache::DETACHED_QUOTA.used_pages();
+        let (mut gone, mut kept, mut blocks_freed) = (0, 0, 0);
+        for (k, pair) in (1..=total).flat_map(|k| [(k, false), (k, true)]) {
+            let m = mount(img.clone(), 265)?;
+            let a = m.root.lookup(b"a").map_err(|_| "a")?;
+            let f = a.lookup(b"f").map_err(|_| "f")?;
+            f.inc_open_count();
+            let off = {
+                let inner = m.fs.shared.state.lock();
+                let a_ino = u32::try_from(a.ino()).map_err(|_| "ino")?;
+                inner.layout.inode_disk_offset(&inner.bcache, a_ino).map_err(|_| "inode offset")?
+            };
+            m.cache.fail_reads_in_after(off, off + 1, 0, 0);
+            m.cache.range_reads_fail_after_write_fault.store(true, O::Release);
+            if pair {
+                m.cache.arm_write_pair(k, k + 1);
+            } else {
+                m.cache.arm_write(k);
+            }
+            let free_before = free_blocks(&m.fs);
+            let freed_arm_before = FREED_BLOCKS_ARM.load(O::Relaxed);
+            let res = a.unlink(b"f");
+            blocks_freed += FREED_BLOCKS_ARM.load(O::Relaxed) - freed_arm_before;
+            m.cache.clear();
+            let ro = remount_ro(&m, 266)?;
+            let ro_a = ro.root_inode().lookup(b"a").map_err(|_| "ro a")?;
+            if ro_a.lookup(b"f").is_ok() {
+                f.dec_open_count();
+                continue;
+            }
+            gone += 1;
+            let free_after = free_blocks(&ro);
+            let f_kept = f.stat().map_err(|_| "stat f")?.nlink != 0;
+            kept += usize::from(f_kept);
+            // A file made now may get blocks `f` had: bytes written through
+            // the open `f` afterwards must not reach it.
+            let g = m.root.create(b"g", 0o644).map_err(|_| "create g")?;
+            kassert_eq!(g.write_at(0, &data).map_err(|_| "write g")?, data.len());
+            m.fs.sync().map_err(|_| "sync g")?;
+            let evil = f.write_at(0, &pattern(2 * PAGE_SIZE, 99));
+            m.fs.sync().map_err(|_| "sync f")?;
+            let g_on_disk = read_all(&remount_ro(&m, 266)?.root_inode().lookup(b"g").map_err(|_| "ro g")?)?;
+            let intact = g_on_disk == data;
+            if !intact || (f_kept && free_after > free_before) {
+                crate::ktest::diag(format_args!(
+                    "write={k} (and the next {pair}) res={res:?}: f gone, kept {f_kept}, free blocks {free_before} -> {free_after}; write \
+                     through f {:?}, g intact on disk {intact}",
+                    evil
+                ));
+            }
+            kassert!(intact);
+            // Kept live only while nothing was freed.
+            kassert!(!f_kept || free_after <= free_before);
+            f.dec_open_count();
+            drop((g, f, a, ro_a, ro, m));
+            kassert_eq!(page_cache::DETACHED_QUOTA.used_pages(), quota_before);
+        }
+        crate::ktest::diag(format_args!(
+            "unlink, a unread from the fault on: {total} writes, one or two failing: f gone {gone}, kept live {kept}, \
+             forgotten for its freed blocks {blocks_freed}"
+        ));
+        kassert!(blocks_freed >= 1 && kept >= 1);
         Ok(())
     }
 );

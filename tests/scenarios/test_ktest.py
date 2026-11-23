@@ -240,6 +240,13 @@ VFS_SWEEP_LINES = (
         rf"ERROR vfs: ext4 {_DEV} directory \d+: freeing inode \d+, whose last entry went, failed: \w+; "
         r"run e2fsck"
     ),
+    # An unlink or rmdir whose directory couldn't be read back after
+    # `delete_file` freed the inode's blocks, not yet zeroing it: forgotten,
+    # not kept live (#330; the unlink and rmdir fault sweeps).
+    (
+        rf"ERROR vfs: ext4 {_DEV} directory \d+: inode \d+ lost its entry and its blocks were freed \(block \d+ "
+        r"is free\) before the unlink failed, the directory unreadable; forgetting it; run e2fsck"
+    ),
     # A rename's target put back after a failed move, the put-back failing
     # too (ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated).
     (

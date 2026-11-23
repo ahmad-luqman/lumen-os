@@ -1,11 +1,17 @@
 //! ext4's on-disk encodings that the kernel's adapter encodes and decodes
 //! itself, because `ext4plus` doesn't: a device node's number in `i_block`,
-//! and timestamps before 1970 or past 2038 (`ext4plus` reads the low 32 bits
-//! of a time as unsigned).
+//! timestamps before 1970 or past 2038 (`ext4plus` reads the low 32 bits
+//! of a time as unsigned), and the first block `ext4plus`'s `delete_file`
+//! frees of an inode, with where that block's bit is in the block bitmap
+//! (`ext4plus` keeps its block maps and bitmaps to itself; #330).
 //!
-//! Both follow Linux (`fs/ext4/inode.c`'s `ext4_iget`, `fs/ext4/ext4.h`'s
-//! `ext4_encode_extra_time`/`ext4_decode_extra_time`, `include/linux/kdev_t.h`).
+//! The first two follow Linux (`fs/ext4/inode.c`'s `ext4_iget`,
+//! `fs/ext4/ext4.h`'s `ext4_encode_extra_time`/`ext4_decode_extra_time`,
+//! `include/linux/kdev_t.h`); the extent and block-map layouts are ext4's
+//! (`fs/ext4/ext4_extents.h`, `fs/ext4/indirect.c`).
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::time::Duration;
 
 use crate::types::{DevId, Timespec};
@@ -74,6 +80,182 @@ pub fn time_from_disk(d: Duration) -> Timespec {
     let low = i64::from(secs as u32 as i32);
     let epoch = ((secs >> 32) & 3) as i64;
     Timespec { sec: low + (epoch << 32), nsec: i64::from(d.subsec_nanos()) }
+}
+
+/// Why [`first_block_freed`] couldn't name a block: a read failed, or the
+/// map doesn't parse (a bad extent header, an index block of the wrong
+/// depth, or more blocks to read than [`MAP_READS_MAX`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlockMapError<E> {
+    Read(E),
+    Corrupt,
+}
+
+/// The most map blocks [`first_block_freed`] reads: an extent tree's
+/// leftmost path (at most 5 deep) or a block map's three indirect levels,
+/// with room for a few empty nodes on the way.
+pub const MAP_READS_MAX: usize = 16;
+
+const EXTENT_MAGIC: u16 = 0xf30a;
+/// An extent tree's depth limit (Linux's `EXT4_MAX_EXTENT_DEPTH`).
+const EXTENT_DEPTH_MAX: u16 = 5;
+/// `ee_len` past this marks an unwritten extent of `ee_len - 32768` blocks.
+const EXTENT_INIT_MAX_LEN: u16 = 32768;
+
+fn le16(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// The first block `ext4plus`'s `delete_file` frees of an inode whose
+/// `i_block` is `i_block` (`extents`: the inode has the `EXTENTS` flag),
+/// reading the map's other blocks (`block_size` bytes each) through `read`;
+/// `None` if it frees none.
+///
+/// `delete_file` frees an inode's data blocks first, in file order (an
+/// extent tree's extents depth first, leftmost first, each extent's blocks
+/// from its start; a block map's direct blocks, then those under its
+/// single, double and triple indirect blocks), its map blocks after them,
+/// and zeroes the inode last. So once any of an inode's blocks is free,
+/// this one is (`ExtentTree::collect_extents`' and
+/// `BlockMap::collect_data_and_metadata_blocks`' orders, in `ext4plus`
+/// 0.1.0-rc.2). With no data block, it is the first map block freed: an
+/// extent tree's first index block under its root, a block map's first
+/// indirect block. An extent with no start or no length is skipped, as
+/// `free_freed_ranges` skips it.
+///
+/// Not for an inode whose `i_block` holds no block numbers (an inline
+/// symlink's target, a device's number): it would read those as blocks.
+pub fn first_block_freed<E>(
+    i_block: &[u8; 60],
+    extents: bool,
+    block_size: usize,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<(), E>,
+) -> Result<Option<u64>, BlockMapError<E>> {
+    let mut reads = 0;
+    let mut read_block = |block: u64, buf: &mut [u8]| {
+        reads += 1;
+        if reads > MAP_READS_MAX {
+            return Err(BlockMapError::Corrupt);
+        }
+        read(block, buf).map_err(BlockMapError::Read)
+    };
+    if extents {
+        let depth = extent_header(i_block, None)?;
+        if let Some(block) = first_extent_start(i_block, depth, block_size, &mut read_block)? {
+            return Ok(Some(block));
+        }
+        // No data: the first index block under the root, if any.
+        Ok((depth > 0 && le16(i_block, 2) > 0).then(|| extent_index_child(i_block, 0)))
+    } else {
+        let word = |i: usize| u64::from(le32(i_block, i * 4));
+        if let Some(block) = (0..12).map(word).find(|&b| b != 0) {
+            return Ok(Some(block));
+        }
+        for (level, slot) in [(1, 12), (2, 13), (3, 14)] {
+            let top = word(slot);
+            if top != 0
+                && let Some(block) = first_mapped(top, level, block_size, &mut read_block)?
+            {
+                return Ok(Some(block));
+            }
+        }
+        // No data: the first indirect block, if any.
+        Ok((12..15).map(word).find(|&b| b != 0))
+    }
+}
+
+/// An extent node's header checked (its magic, its entries within its room
+/// and its room within the node's bytes, its depth at most 5, and `want`
+/// when given); its depth.
+fn extent_header<E>(node: &[u8], want: Option<u16>) -> Result<u16, BlockMapError<E>> {
+    let (entries, max, depth) = (le16(node, 2), le16(node, 4), le16(node, 6));
+    let fits = 12 + usize::from(max) * 12 <= node.len();
+    let depth_ok = depth <= EXTENT_DEPTH_MAX && want.is_none_or(|w| w == depth);
+    if le16(node, 0) != EXTENT_MAGIC || entries > max || !fits || !depth_ok {
+        return Err(BlockMapError::Corrupt);
+    }
+    Ok(depth)
+}
+
+/// Index entry `i`'s child block (`ei_leaf_lo`, `ei_leaf_hi`).
+fn extent_index_child(node: &[u8], i: usize) -> u64 {
+    let at = 12 + i * 12;
+    u64::from(le32(node, at + 4)) | (u64::from(le16(node, at + 8)) << 32)
+}
+
+/// The first extent's start in `node` (its header checked, at `depth`) and
+/// under it, depth first, leftmost first.
+fn first_extent_start<E>(
+    node: &[u8],
+    depth: u16,
+    block_size: usize,
+    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), BlockMapError<E>>,
+) -> Result<Option<u64>, BlockMapError<E>> {
+    let entries = usize::from(le16(node, 2));
+    if depth == 0 {
+        return Ok((0..entries).find_map(|i| {
+            let at = 12 + i * 12;
+            let raw_len = le16(node, at + 4);
+            let len = if raw_len > EXTENT_INIT_MAX_LEN { raw_len - EXTENT_INIT_MAX_LEN } else { raw_len };
+            let start = (u64::from(le16(node, at + 6)) << 32) | u64::from(le32(node, at + 8));
+            (start != 0 && len != 0).then_some(start)
+        }));
+    }
+    let mut child = vec![0u8; block_size];
+    for i in 0..entries {
+        read(extent_index_child(node, i), &mut child)?;
+        extent_header(&child, Some(depth - 1))?;
+        if let Some(block) = first_extent_start(&child, depth - 1, block_size, read)? {
+            return Ok(Some(block));
+        }
+    }
+    Ok(None)
+}
+
+/// The first non-zero block number `level` indirect blocks under `block`
+/// (1: `block` lists data blocks), depth first.
+fn first_mapped<E>(
+    block: u64,
+    level: u32,
+    block_size: usize,
+    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), BlockMapError<E>>,
+) -> Result<Option<u64>, BlockMapError<E>> {
+    let mut buf = vec![0u8; block_size];
+    read(block, &mut buf)?;
+    let mut mapped = buf.as_chunks::<4>().0.iter().map(|w| u64::from(u32::from_le_bytes(*w))).filter(|&b| b != 0);
+    if level == 1 {
+        return Ok(mapped.next());
+    }
+    let next: Vec<u64> = mapped.collect();
+    for below in next {
+        if let Some(found) = first_mapped(below, level - 1, block_size, read)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// Where block `block`'s bit is in its group's block bitmap, on a volume of
+/// `blocks_count` blocks whose groups of `blocks_per_group` start at
+/// `first_data_block`: (the group, the byte in its bitmap, the bit's mask in
+/// that byte). `None` for a block outside the groups.
+pub fn block_bitmap_bit(
+    block: u64,
+    first_data_block: u32,
+    blocks_per_group: u32,
+    blocks_count: u64,
+) -> Option<(u32, u32, u8)> {
+    let rel = block.checked_sub(u64::from(first_data_block))?;
+    if block >= blocks_count || blocks_per_group == 0 {
+        return None;
+    }
+    let group = u32::try_from(rel / u64::from(blocks_per_group)).ok()?;
+    let bit = (rel % u64::from(blocks_per_group)) as u32;
+    Some((group, bit / 8, 1 << (bit % 8)))
 }
 
 #[cfg(test)]
@@ -207,5 +389,202 @@ mod tests {
             assert!(d.as_secs() <= u64::from(u32::MAX));
             assert_eq!(time_from_disk(Duration::from_secs(d.as_secs())), truncate_time(t, false));
         }
+    }
+
+    const BS: usize = 1024;
+
+    /// An extent node: its header (`max` entries of room) and 12-byte
+    /// entries, padded to `len` bytes.
+    fn extent_node(len: usize, max: u16, depth: u16, entries: &[[u8; 12]]) -> Vec<u8> {
+        let mut node = vec![0u8; len];
+        node[0..2].copy_from_slice(&EXTENT_MAGIC.to_le_bytes());
+        node[2..4].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+        node[4..6].copy_from_slice(&max.to_le_bytes());
+        node[6..8].copy_from_slice(&depth.to_le_bytes());
+        for (i, e) in entries.iter().enumerate() {
+            node[12 + i * 12..24 + i * 12].copy_from_slice(e);
+        }
+        node
+    }
+
+    /// A leaf entry: `len` blocks (`ee_len` as stored) from `start`.
+    fn extent(logical: u32, len: u16, start: u64) -> [u8; 12] {
+        let mut e = [0u8; 12];
+        e[0..4].copy_from_slice(&logical.to_le_bytes());
+        e[4..6].copy_from_slice(&len.to_le_bytes());
+        e[6..8].copy_from_slice(&((start >> 32) as u16).to_le_bytes());
+        e[8..12].copy_from_slice(&(start as u32).to_le_bytes());
+        e
+    }
+
+    /// An index entry pointing at `child`.
+    fn index(logical: u32, child: u64) -> [u8; 12] {
+        let mut e = [0u8; 12];
+        e[0..4].copy_from_slice(&logical.to_le_bytes());
+        e[4..8].copy_from_slice(&(child as u32).to_le_bytes());
+        e[8..10].copy_from_slice(&((child >> 32) as u16).to_le_bytes());
+        e
+    }
+
+    fn root(depth: u16, entries: &[[u8; 12]]) -> [u8; 60] {
+        extent_node(60, 4, depth, entries).try_into().unwrap()
+    }
+
+    /// `first_block_freed` over `blocks` (block number, bytes); the blocks
+    /// it read, in order.
+    fn first_with(
+        i_block: &[u8; 60],
+        extents: bool,
+        blocks: &[(u64, Vec<u8>)],
+    ) -> (Result<Option<u64>, BlockMapError<u64>>, Vec<u64>) {
+        let mut read = Vec::new();
+        let res = first_block_freed(i_block, extents, BS, |b, buf: &mut [u8]| {
+            read.push(b);
+            let (_, bytes) = blocks.iter().find(|(n, _)| *n == b).ok_or(b)?;
+            buf.copy_from_slice(bytes);
+            Ok(())
+        });
+        (res, read)
+    }
+
+    #[test]
+    fn an_extent_roots_first_extent_with_blocks_is_freed_first() {
+        let only = root(0, &[extent(0, 2, 1234), extent(2, 1, 99)]);
+        assert_eq!(first_with(&only, true, &[]), (Ok(Some(1234)), vec![]));
+        // No start or no length: skipped, as `free_freed_ranges` does.
+        let skips = root(0, &[extent(0, 0, 50), extent(1, 3, 0), extent(4, 1, 77)]);
+        assert_eq!(first_with(&skips, true, &[]).0, Ok(Some(77)));
+        // An unwritten extent (ee_len past 32768) holds ee_len - 32768
+        // blocks; 32768 itself is a written one of 32768.
+        assert_eq!(first_with(&root(0, &[extent(0, 32768, 5)]), true, &[]).0, Ok(Some(5)));
+        assert_eq!(first_with(&root(0, &[extent(0, 32769, 6)]), true, &[]).0, Ok(Some(6)));
+        // A start past 32 bits (ee_start_hi).
+        let high = (7u64 << 32) | 0x8000_0001;
+        assert_eq!(first_with(&root(0, &[extent(0, 1, high)]), true, &[]).0, Ok(Some(high)));
+        // Nothing mapped.
+        assert_eq!(first_with(&root(0, &[]), true, &[]), (Ok(None), vec![]));
+    }
+
+    #[test]
+    fn a_deeper_extent_tree_is_walked_leftmost_first_to_its_first_extent() {
+        let leaf = |extents: &[[u8; 12]]| extent_node(BS, 84, 0, extents);
+        let blocks = [
+            (500, leaf(&[])),
+            (501, leaf(&[extent(0, 4, 3000), extent(4, 4, 2000)])),
+            (502, leaf(&[extent(8, 1, 1000)])),
+        ];
+        let tree = root(1, &[index(0, 500), index(0, 501), index(8, 502)]);
+        // The empty leaf passed, the next leaf's first extent: in file
+        // order, not the lowest block number.
+        assert_eq!(first_with(&tree, true, &blocks), (Ok(Some(3000)), vec![500, 501]));
+        // Two levels (ei_leaf_hi used too).
+        let mid = (1u64 << 32) | 600;
+        let two = [(mid, extent_node(BS, 84, 1, &[index(0, 502)])), (502, blocks[2].1.clone())];
+        assert_eq!(first_with(&root(2, &[index(0, mid)]), true, &two), (Ok(Some(1000)), vec![mid, 502]));
+        // No data under the root: its first index block, freed first of the
+        // map blocks.
+        let empty = [(500, leaf(&[])), (501, leaf(&[]))];
+        assert_eq!(first_with(&root(1, &[index(0, 500), index(9, 501)]), true, &empty).0, Ok(Some(500)));
+    }
+
+    #[test]
+    fn a_bad_extent_tree_or_a_failed_read_names_no_block() {
+        let mut bad_magic = root(0, &[extent(0, 1, 9)]);
+        bad_magic[0] = 0;
+        assert_eq!(first_with(&bad_magic, true, &[]).0, Err(BlockMapError::Corrupt));
+        // More entries than room, room past the node, too deep.
+        let mut over = root(0, &[extent(0, 1, 9)]);
+        over[2..4].copy_from_slice(&5u16.to_le_bytes());
+        assert_eq!(first_with(&over, true, &[]).0, Err(BlockMapError::Corrupt));
+        let roomy: [u8; 60] = extent_node(60, 5, 0, &[]).try_into().unwrap();
+        assert_eq!(first_with(&roomy, true, &[]).0, Err(BlockMapError::Corrupt));
+        assert_eq!(first_with(&root(6, &[]), true, &[]).0, Err(BlockMapError::Corrupt));
+        // A child at the wrong depth.
+        let wrong = [(500, extent_node(BS, 84, 1, &[]))];
+        assert_eq!(first_with(&root(1, &[index(0, 500)]), true, &wrong).0, Err(BlockMapError::Corrupt));
+        // A read that fails.
+        assert_eq!(first_with(&root(1, &[index(0, 500)]), true, &[]).0, Err(BlockMapError::Read(500)));
+    }
+
+    /// A block map's `i_block`: 12 direct blocks, then the single, double and
+    /// triple indirect ones.
+    fn block_map(words: [u32; 15]) -> [u8; 60] {
+        let mut out = [0u8; 60];
+        for (i, w) in words.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    fn indirect(entries: &[u32]) -> Vec<u8> {
+        let mut out = vec![0u8; BS];
+        for (i, e) in entries.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&e.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn a_block_maps_first_data_block_is_freed_first() {
+        let mut words = [0u32; 15];
+        words[2] = 77;
+        words[5] = 33;
+        words[12] = 400;
+        assert_eq!(first_with(&block_map(words), false, &[]), (Ok(Some(77)), vec![]));
+        // No direct block: the single indirect's first, then the double's.
+        let mut sparse = [0u32; 15];
+        sparse[12] = 400;
+        sparse[13] = 401;
+        let blocks =
+            [(400, indirect(&[0, 0])), (401, indirect(&[0, 402])), (402, indirect(&[0, 0, 55])), (403, indirect(&[]))];
+        assert_eq!(first_with(&block_map(sparse), false, &blocks), (Ok(Some(55)), vec![400, 401, 402]));
+        let mut single = [0u32; 15];
+        single[12] = 402;
+        assert_eq!(first_with(&block_map(single), false, &blocks).0, Ok(Some(55)));
+        // Triple.
+        let mut triple = [0u32; 15];
+        triple[14] = 405;
+        let deep = [(405, indirect(&[406])), (406, indirect(&[0, 402])), (402, indirect(&[0, 0, 55]))];
+        assert_eq!(first_with(&block_map(triple), false, &deep).0, Ok(Some(55)));
+        // No data block: the first indirect block; nothing at all: none.
+        let mut bare = [0u32; 15];
+        bare[13] = 403;
+        assert_eq!(first_with(&block_map(bare), false, &blocks).0, Ok(Some(403)));
+        assert_eq!(first_with(&block_map([0; 15]), false, &[]), (Ok(None), vec![]));
+    }
+
+    #[test]
+    fn a_map_with_too_many_empty_blocks_to_read_names_no_block() {
+        // A double indirect block listing more empty single ones than the
+        // reads allowed.
+        let mut words = [0u32; 15];
+        words[13] = 900;
+        let children: Vec<u32> = (901..901 + MAP_READS_MAX as u32).collect();
+        let mut blocks = vec![(900, indirect(&children))];
+        blocks.extend(children.iter().map(|&c| (u64::from(c), indirect(&[]))));
+        let (res, read) = first_with(&block_map(words), false, &blocks);
+        assert_eq!(res, Err(BlockMapError::Corrupt));
+        assert_eq!(read.len(), MAP_READS_MAX);
+        // One fewer empty child fits, and the next has data.
+        let fits: Vec<u32> = (901..900 + MAP_READS_MAX as u32).collect();
+        let mut blocks = vec![(900, indirect(&fits))];
+        blocks.extend(fits.iter().map(|&c| (u64::from(c), indirect(&[]))));
+        blocks.last_mut().unwrap().1 = indirect(&[0, 4242]);
+        assert_eq!(first_with(&block_map(words), false, &blocks).0, Ok(Some(4242)));
+    }
+
+    #[test]
+    fn a_blocks_bitmap_bit_is_its_place_in_its_group() {
+        // 1 KiB blocks: the groups start at block 1, 8192 to a group.
+        assert_eq!(block_bitmap_bit(1, 1, 8192, 65536), Some((0, 0, 1)));
+        assert_eq!(block_bitmap_bit(10, 1, 8192, 65536), Some((0, 1, 2)));
+        assert_eq!(block_bitmap_bit(8192, 1, 8192, 65536), Some((0, 1023, 0x80)));
+        assert_eq!(block_bitmap_bit(8193, 1, 8192, 65536), Some((1, 0, 1)));
+        assert_eq!(block_bitmap_bit(0, 1, 8192, 65536), None);
+        // 4 KiB blocks: from block 0, 32768 to a group; past the volume.
+        assert_eq!(block_bitmap_bit(32768 + 17, 0, 32768, 65536), Some((1, 2, 2)));
+        assert_eq!(block_bitmap_bit(65535, 0, 32768, 65536), Some((1, 4095, 0x80)));
+        assert_eq!(block_bitmap_bit(65536, 0, 32768, 65536), None);
+        assert_eq!(block_bitmap_bit(5, 0, 0, 65536), None);
     }
 }
