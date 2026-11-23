@@ -5711,14 +5711,18 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     meanwhile and no `..` from it finds neither answer), and forgets it
     (`inode_forget_removed_dir`) if that fails with the directory still
     linked (one gone all the same, as after ext4 fails to undo its disk
-    changes, keeps it). A record is keyed by the
+    changes, keeps it; tested for `rmdir`, the `rename` side untested). A
+    record is keyed by the
     directory's `Arc` (a `Weak` to it, which keeps the address from being
     reused), never `(dev, ino)`: a directory removed while open is
     detached under another number, a freed one's is reused. It holds the
     parent's `Arc` strongly, as `d_parent` does, so the parent stays
-    reachable even if it is removed in turn (then freed if nothing holds
-    it open: a `chdir("..")` into it is `-ENOENT` from `OpenGuard::try_new`,
-    where Linux succeeds; untested). The `Arc` a removal sees is the cached
+    reachable if it is removed in turn while held open (detached, under a
+    number of its own). One freed by its removal, nothing holding it open,
+    is `-ENOENT` from `..` (Linux still finds it): its number may be
+    another inode's by now, which the dentry cache and the mount table,
+    both keyed by numbers, would take it for (`stat` read before
+    `is_detached`, as `OpenGuard::try_new` does). The `Arc` a removal sees is the cached
     one, the same a cwd or a descriptor holds (and ext4 and tmpfs keep one
     `Arc` per live inode, so even an uncached lookup's is that one); a
     different `Arc` of the same directory (only from a filesystem making a

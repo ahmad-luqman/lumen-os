@@ -8632,11 +8632,40 @@ fn dotdot_from_a_directory_a_failed_rmdir_removed() {
     assert!(Arc::ptr_eq(&up, &p), "`..` from a directory a failed rmdir removed isn't its parent");
 }
 
-/// #318: `..` from a removed directory whose parent was removed after it
-/// is that parent (held as `d_parent` holds its dentry), and `../..` the
-/// parent's own parent; a record whose directory is gone is pruned by the
-/// next removal, with those its parents' drops leave dead, and unmounting
-/// drops the filesystem's records.
+/// #318: `..` from a removed directory whose parent was freed by its own
+/// removal (nothing holding it open) is `ENOENT`, never the inode that took
+/// the parent's number since: not a name in it through the dentry cache,
+/// nor a filesystem mounted on it.
+#[test]
+fn dotdot_to_a_freed_parent_is_enoent() {
+    let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
+    let env = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = env.as_ref();
+    let x = mkdir_at(env, None, b"/x", 0o755, 0).unwrap();
+    let y = mkdir_at(env, None, b"/x/y", 0o755, 0).unwrap();
+    let guard = OpenGuard::try_new(Arc::clone(&y)).unwrap();
+    unlink_at(env, None, b"/x/y", true).unwrap();
+    unlink_at(env, None, b"/x", true).unwrap();
+    assert!(!x.is_detached());
+    let n = mkdir_at(env, None, b"/n", 0o755, 0).unwrap();
+    assert_eq!(n.ino(), x.ino(), "the freed parent's number not reused");
+    open_inode(env, None, b"/n/f", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();
+    assert!(env.inode_removed_dir_parent(&y).is_some_and(|p| Arc::ptr_eq(&p, &x)));
+
+    let from_y = |path: &[u8]| resolve_path(env, Some(&y), path, ResolveFlags::default()).map(|r| r.inode);
+    assert_eq!(from_y(b"..").unwrap_err(), VfsError::NoEnt);
+    assert_eq!(from_y(b"../f").unwrap_err(), VfsError::NoEnt, "`../f` found /n/f");
+    let mounted = FreshArcReusingFs::new(DevId::makedev(0, 76), "fresh-tmpfs", false, true);
+    env.mount(n, "/n", Arc::clone(&mounted) as Arc<dyn FileSystem>).unwrap();
+    assert_eq!(from_y(b"..").unwrap_err(), VfsError::NoEnt, "`..` crossed into what is mounted on /n");
+    drop(guard);
+}
+
+/// #318: `..` from a removed directory whose parent was removed after it,
+/// held open (detached), is that parent (held as `d_parent` holds its
+/// dentry), and `../..` the parent's own parent; a record whose directory
+/// is gone is pruned by the next removal, with those its parents' drops
+/// leave dead, and unmounting drops the filesystem's records.
 #[test]
 fn removed_directories_parents_kept_while_needed() {
     let fs = FreshArcReusingFs::new(DevId::ROOT, "fresh-ext4", false, true);
@@ -8644,6 +8673,7 @@ fn removed_directories_parents_kept_while_needed() {
     let x = mkdir_at(env.as_ref(), None, b"/x", 0o755, 0).unwrap();
     let y = mkdir_at(env.as_ref(), None, b"/x/y", 0o755, 0).unwrap();
     let w = mkdir_at(env.as_ref(), None, b"/x/y/w", 0o755, 0).unwrap();
+    let guards = [&x, &y].map(|d| OpenGuard::try_new(Arc::clone(d)).unwrap());
     for path in [&b"/x/y/w"[..], b"/x/y", b"/x"] {
         unlink_at(env.as_ref(), None, path, true).unwrap();
     }
@@ -8658,7 +8688,7 @@ fn removed_directories_parents_kept_while_needed() {
 
     // `w` gone: `y`, kept by `w`'s record alone, goes with it, and then
     // `x`; the next removal prunes all three records.
-    drop((up, up2, w, y, x));
+    drop((up, up2, w, y, x, guards));
     mkdir_at(env.as_ref(), None, b"/z", 0o755, 0).unwrap();
     unlink_at(env.as_ref(), None, b"/z", true).unwrap();
     assert_eq!(records(&env), 1, "dead records outlived a removal");
