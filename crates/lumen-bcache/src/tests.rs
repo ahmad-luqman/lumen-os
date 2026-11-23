@@ -405,8 +405,11 @@ fn injected_io_errors_preserve_dirty_state_and_recover_cleanly() {
 /// every such failure reaches a caller, never reported as success: the
 /// `write_at` or `read_at` whose miss needed the room (for another block's
 /// failed write), `flush_blocks` and `sync`. The failed block stays dirty and
-/// cached, the caller's own write lands nowhere, and the next writeback
-/// writes the block.
+/// cached, the missed block's bytes are cached nowhere (a write spanning
+/// blocks would keep its earlier blocks' bytes, dirty), and the next
+/// writeback writes the block. (`sync` and `flush_blocks` stop at the first
+/// block that fails, leaving the later ones dirty and the device unflushed:
+/// `injected_io_errors_preserve_dirty_state_and_recover_cleanly`.)
 #[test]
 fn every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty() {
     let dev = MemBlockDevice::new(512, 32); // 4 blocks
@@ -415,7 +418,7 @@ fn every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty() {
     assert!(cache.device().write_log().is_empty()); // written back later
 
     // A write needing block 0's slot: block 0's writeback fails, so this
-    // write fails too, and its bytes land nowhere.
+    // write fails too, and its bytes are cached nowhere.
     cache.device().inject_write_error(BlockError::Io);
     assert_eq!(cache.write_at(BLOCK_SIZE as u64, &[0x34; 16]), Err(BlockError::Io));
     // A read needing the slot gets the failed write's error.
@@ -442,11 +445,17 @@ fn every_failed_device_write_reaches_a_caller_and_keeps_its_block_dirty() {
     assert_eq!(cache.device().durable_snapshot()[..16], [0x12; 16]);
     cache.read_at(0, &mut buf).unwrap();
     assert_eq!(buf, [0x12; 16]);
+}
 
-    // The victim is always the least recently used unpinned block: while
-    // its writeback fails, every miss fails, even with a clean block that
-    // could make room.
+/// The eviction victim is always the least recently used unpinned block:
+/// while its writeback fails, every miss that needs an eviction fails, reads
+/// included, even with a clean block that could make room. Pinned for #349,
+/// whose read-only volume must keep reads working once it stops writing back,
+/// and which is expected to change this.
+#[test]
+fn a_failing_dirty_lru_victim_fails_every_miss_even_with_a_clean_slot() {
     let cache = BlockCache::new(MemBlockDevice::new(512, 32), 2).unwrap();
+    let mut buf = [0u8; 16];
     cache.write_at(0, &[0x56; 16]).unwrap(); // dirty, least recently used
     cache.read_at(BLOCK_SIZE as u64, &mut buf).unwrap(); // clean
     for block in [2u64, 3] {
