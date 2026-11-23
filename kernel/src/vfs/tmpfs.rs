@@ -221,7 +221,7 @@ impl TmpfsInode {
         if buf.is_empty() {
             return Ok((offset, 0));
         }
-        let done = self.pages.lock().write_from(offset, buf, meta.size, |_| CachePage::new_shared())?;
+        let done = self.pages.lock().write_from(offset, buf, meta.size, |_| CachePage::new_zeroed())?;
         let written_end = offset + done as u64;
         let now = time::realtime_timespec();
         if written_end > meta.size {
@@ -310,24 +310,17 @@ impl TmpfsInode {
         let file_size = meta.size;
         page_cache::mmap_page_in_file(index, file_size)?;
         let mut pages = self.pages.lock();
-        let page = page_or_new(&mut pages, index)?;
+        let page = match pages.get(index) {
+            Some(page) => Arc::clone(page),
+            None => {
+                let page = Arc::new(CachePage::new_zeroed()?);
+                pages.insert_new(index, Arc::clone(&page))?;
+                page
+            }
+        };
         page.touch();
         Ok((page, file_size))
     }
-}
-
-/// The cached page `index`, or a new zero page inserted there (`NoMem`, or
-/// `NoSpc` past the quota): `mmap_page`'s page. (`write_at` gets the same
-/// zero page through `PageCache::write_from`; `read_at` reads a hole as
-/// zeros without one.) The caller holds the inode's Lock 4 and the `pages`
-/// lock (Lock 5).
-fn page_or_new(pages: &mut PageCache, index: u64) -> Result<Arc<CachePage>, VfsError> {
-    if let Some(page) = pages.get(index) {
-        return Ok(Arc::clone(page));
-    }
-    let page = CachePage::new_shared()?;
-    pages.insert_new(index, Arc::clone(&page))?;
-    Ok(page)
 }
 
 struct LockedTmpfs<'a> {

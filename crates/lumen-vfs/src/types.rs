@@ -160,8 +160,9 @@ impl SetTime {
     }
 
     /// The timestamp after this change, of a stamp that was `current`:
-    /// `current` for `Omit`, `now` for `Now`, `ts` for `Set(ts)`. Each
-    /// filesystem's `set_times` sets each stamp to this.
+    /// `current` for `Omit`, `now` for `Now`, `ts` for `Set(ts)`. The
+    /// `set_times` of tmpfs, devfs and ext4 set each stamp to this (procfs
+    /// refuses the call).
     pub const fn resolve(self, current: Timespec, now: Timespec) -> Timespec {
         match self {
             Self::Omit => current,

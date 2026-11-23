@@ -28,7 +28,7 @@ use crate::mm;
 use crate::mm::frame::{self, OwnedFrame};
 use crate::sync::SleepMutex;
 
-pub const PAGE_SIZE: usize = page::PAGE_SIZE;
+pub use lumen_vfs::page::PAGE_SIZE;
 
 /// Soft global reclaim target for live `ext4` page-cache frames (32 MiB = 8192 pages).
 pub const EXT4_SOFT_LIMIT_PAGES: usize = 8192;
@@ -202,20 +202,15 @@ pub struct CachePage {
 }
 
 impl CachePage {
-    /// A fresh zero page, shared: `NoMem` when no frame is free. A new
-    /// page for a write into a hole, or a hole a mapping faults on.
-    pub(super) fn new_shared() -> Result<Arc<Self>, VfsError> {
-        Self::new_zeroed().map(Arc::new).ok_or(VfsError::NoMem)
-    }
-
-    /// Allocate and zero a fresh 4 KiB [`CachePage`].
-    pub(super) fn new_zeroed() -> Option<Self> {
-        let frame = frame::alloc_owned()?;
+    /// A fresh 4 KiB [`CachePage`], zeroed and in no cache yet: `NoMem`
+    /// when no frame is free.
+    pub(super) fn new_zeroed() -> Result<Self, VfsError> {
+        let frame = frame::alloc_owned().ok_or(VfsError::NoMem)?;
         let ptr = mm::phys_to_virt(frame.frame().start()).as_mut_ptr::<u8>();
         // SAFETY: `frame` is a freshly allocated, uniquely owned 4 KiB RAM frame
         // mapped RW through the HHDM.
         unsafe { core::ptr::write_bytes(ptr, 0, PAGE_SIZE) };
-        Some(Self {
+        Ok(Self {
             frame,
             dirty: AtomicBool::new(false),
             writable_maps: AtomicU32::new(0),
@@ -428,8 +423,7 @@ impl MappedPage {
     /// holding its end ([`mmap_page`] hands out no page starting at or past
     /// it).
     pub(crate) fn valid_len(&self) -> usize {
-        let start = self.index.saturating_mul(PAGE_SIZE as u64);
-        self.file_size.saturating_sub(start).min(PAGE_SIZE as u64) as usize
+        page::valid_len(self.index, self.file_size)
     }
 
     /// Copy the page's bytes below the file's size ([`valid_len`]) into
@@ -861,15 +855,18 @@ impl PageCache {
     /// A page not cached is asked of `miss`, by index: `Some(page)`, a new
     /// page holding the file's bytes there, is read and then inserted (its
     /// insert's error returned); `None` reads as zeros without a page (a
-    /// hole). An error from `miss` is returned even after some bytes were
-    /// copied. The caller holds the inode's Lock 4, under which it read
-    /// `file_size`, and this lock (Lock 5).
+    /// hole). An error from `miss` (or the insert) is returned even after
+    /// some bytes were copied, and those bytes are lost to the caller: where
+    /// Linux returns a short count, as [`Self::write_from`] does. (The
+    /// pages loaded before the error stay cached.) The caller holds the
+    /// inode's Lock 4, under which it read `file_size`, and this lock
+    /// (Lock 5).
     pub fn read_into(
         &mut self,
         offset: u64,
         buf: &mut [u8],
         file_size: u64,
-        mut miss: impl FnMut(u64) -> Result<Option<Arc<CachePage>>, VfsError>,
+        mut miss: impl FnMut(u64) -> Result<Option<CachePage>, VfsError>,
     ) -> Result<usize, VfsError> {
         if offset >= file_size {
             return Ok(0);
@@ -878,12 +875,12 @@ impl PageCache {
         // Never `None`: the range ends at or below `file_size`.
         let spans = page::spans(offset, to_read).ok_or(VfsError::Inval)?;
         for span in spans {
-            let dst = &mut buf[span.buf.clone()];
-            if let Some(cached) = self.pages.get(&span.index) {
-                cached.read_bytes(span.in_page, dst);
-            } else if let Some(loaded) = miss(span.index)? {
-                loaded.read_bytes(span.in_page, dst);
-                self.insert_new(span.index, loaded)?;
+            let dst = &mut buf[span.buf()];
+            if let Some(cached) = self.pages.get(&span.index()) {
+                cached.read_bytes(span.in_page(), dst);
+            } else if let Some(loaded) = miss(span.index())? {
+                loaded.read_bytes(span.in_page(), dst);
+                self.insert_new(span.index(), Arc::new(loaded))?;
             } else {
                 dst.fill(0);
             }
@@ -913,7 +910,7 @@ impl PageCache {
         offset: u64,
         buf: &[u8],
         old_size: u64,
-        mut fill: impl FnMut(&PageSpan) -> Result<Arc<CachePage>, VfsError>,
+        mut fill: impl FnMut(&PageSpan) -> Result<CachePage, VfsError>,
     ) -> Result<usize, VfsError> {
         let spans = page::spans(offset, buf.len()).ok_or(VfsError::FBig)?;
         // At or before the end (`offset <= old_size`) nothing is zeroed: the
@@ -922,13 +919,13 @@ impl PageCache {
         let dirty = self.writes_back();
         let mut done = 0usize;
         for span in spans {
-            if let Err(err) = self.write_span(&span, &buf[span.buf.clone()], dirty, &mut fill) {
+            if let Err(err) = self.write_span(&span, &buf[span.buf()], dirty, &mut fill) {
                 if done > 0 {
                     break;
                 }
                 return Err(err);
             }
-            done = span.buf.end;
+            done = span.buf().end;
         }
         Ok(done)
     }
@@ -939,10 +936,10 @@ impl PageCache {
         span: &PageSpan,
         src: &[u8],
         dirty: bool,
-        fill: &mut impl FnMut(&PageSpan) -> Result<Arc<CachePage>, VfsError>,
+        fill: &mut impl FnMut(&PageSpan) -> Result<CachePage, VfsError>,
     ) -> Result<(), VfsError> {
-        if let Some(cached) = self.pages.get(&span.index) {
-            cached.write_bytes(span.in_page, src);
+        if let Some(cached) = self.pages.get(&span.index()) {
+            cached.write_bytes(span.in_page(), src);
             if dirty {
                 cached.set_dirty();
             }
@@ -950,11 +947,11 @@ impl PageCache {
         }
         self.admit_unreclaimable()?;
         let fresh = fill(span)?;
-        fresh.write_bytes(span.in_page, src);
+        fresh.write_bytes(span.in_page(), src);
         if dirty {
             fresh.set_dirty();
         }
-        self.insert_new(span.index, fresh)
+        self.insert_new(span.index(), Arc::new(fresh))
     }
 
     /// The cache's side of a change of the file's size from `old_size` to
@@ -979,9 +976,9 @@ impl PageCache {
     /// ([`Self::write_from`]).
     fn zero_tail(&self, old_size: u64, new_size: u64) {
         if let Some(tail) = page::resize_tail(old_size, new_size)
-            && let Some(cached) = self.pages.get(&tail.index)
+            && let Some(cached) = self.pages.get(&tail.index())
         {
-            cached.zero_range(tail.from, PAGE_SIZE);
+            cached.zero_range(tail.from(), PAGE_SIZE);
             if self.writes_back() {
                 cached.set_dirty();
             }
@@ -1196,11 +1193,11 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let mut pc = PageCache::new_ext4();
         let before = ext4_cached_pages();
-        let first = Arc::new(CachePage::new_zeroed().ok_or("frame")?);
+        let first = Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?);
         first.write_bytes(0, b"dirty");
         first.set_dirty();
         pc.insert_new(7, Arc::clone(&first)).map_err(|_| "insert")?;
-        let second = Arc::new(CachePage::new_zeroed().ok_or("frame")?);
+        let second = Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?);
         kassert_eq!(pc.insert_new(7, second).err(), Some(VfsError::Exist));
         kassert_eq!(ext4_cached_pages(), before + 1); // counted once
         kassert!(Arc::ptr_eq(pc.get(7).ok_or("page")?, &first)); // the dirty page kept
@@ -1219,10 +1216,12 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         let mut pc = PageCache::new_ext4();
         let mut tmp = PageCache::new_tmpfs(Arc::new(QuotaCounter::new("ktest", 4)));
-        let dirty = CachePage::new_shared().map_err(|_| "frame")?;
+        let dirty = Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?);
         dirty.set_dirty();
-        let (clean, tmp_dirty) =
-            (CachePage::new_shared().map_err(|_| "frame")?, CachePage::new_shared().map_err(|_| "frame")?);
+        let (clean, tmp_dirty) = (
+            Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?),
+            Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?),
+        );
         tmp_dirty.set_dirty();
         HARD_LIMIT_WARNED.store(false, Ordering::Release); // a crossing of its own: one warning
         set_ext4_limits_for_test(Some((usize::MAX, 0))); // at the limit whatever else the cache holds
@@ -1246,13 +1245,13 @@ crate::ktest!(
         // own quota) isn't held to it.
         use crate::{kassert, kassert_eq};
         let mut pc = PageCache::new_ext4();
-        pc.insert_new(0, CachePage::new_shared().map_err(|_| "frame")?).map_err(|_| "insert")?;
+        pc.insert_new(0, Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?)).map_err(|_| "insert")?;
         let mut detached = PageCache::new_ext4();
         detached.commit_detached(Vec::new()); // no pages yet: nothing to reserve
         let mut fills = 0usize;
         let mut fill = |_: &PageSpan| {
             fills += 1;
-            CachePage::new_shared()
+            CachePage::new_zeroed()
         };
         let data = [0x5a; 2 * PAGE_SIZE];
         HARD_LIMIT_WARNED.store(false, Ordering::Release); // one warning, as for the test above
@@ -1285,12 +1284,12 @@ crate::ktest!(
         // after a cached one. Here `fill` lowers the limit itself.
         use crate::{kassert, kassert_eq};
         let mut pc = PageCache::new_ext4();
-        pc.insert_new(0, CachePage::new_shared().map_err(|_| "frame")?).map_err(|_| "insert")?;
+        pc.insert_new(0, Arc::new(CachePage::new_zeroed().map_err(|_| "frame")?)).map_err(|_| "insert")?;
         let mut fills = 0usize;
         let mut fill = |_: &PageSpan| {
             fills += 1;
             set_ext4_limits_for_test(Some((usize::MAX, 0))); // the cache filled meanwhile
-            CachePage::new_shared()
+            CachePage::new_zeroed()
         };
         let data = [0x5a; 16];
         let size = 3 * PAGE_SIZE as u64;
@@ -1383,7 +1382,7 @@ crate::ktest!(
         // `dirty`: whichever way the unmap falls, the page must read dirty,
         // or reclaim evicts its mapped stores unwritten.
         use crate::{kassert, kassert_eq};
-        let page = CachePage::new_zeroed().ok_or("frame")?;
+        let page = CachePage::new_zeroed().map_err(|_| "frame")?;
         page.set_dirty();
         page.inc_writable_maps();
         kassert!(page.swap_dirty(false)); // a writeback while mapped

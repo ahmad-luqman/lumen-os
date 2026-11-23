@@ -27,6 +27,7 @@ use ext4plus::inode::{Inode, InodeFlags, InodeMode};
 use ext4plus::{DirEntryName, Ext4, Ext4Read, Ext4Write, FileType, IncompatibleFeatures};
 use lumen_bcache::{BlockCache, BlockDevice, BlockError};
 use lumen_vfs::ext4::rdev_from_i_block;
+use lumen_vfs::page;
 use lumen_vfs::{
     AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, RenameFlags, SetTime, Timespec, VfsError,
     VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
@@ -1048,9 +1049,9 @@ impl Ext4Inode {
         // (below the old size) of a linked file, else as zeros. (A detached
         // file's pages are never dirty: `PageCache::writes_back`.)
         let done = pages.write_from(offset, buf, old_size, |span| {
-            let cp = CachePage::new_shared()?;
+            let cp = CachePage::new_zeroed()?;
             if !detached && !span.whole_page() && span.page_start() < old_size {
-                cp.write_bytes(0, &self.read_disk_page(span.index, old_size)?);
+                cp.write_bytes(0, &self.read_disk_page(span.index(), old_size)?);
             }
             Ok(cp)
         })?;
@@ -1147,8 +1148,7 @@ impl Ext4Inode {
     /// and the page starts below `file_size`.
     fn read_disk_page(&self, page_idx: u64, file_size: u64) -> Result<Vec<u8>, VfsError> {
         let page_base = page_idx * PAGE_SIZE as u64;
-        let valid = (file_size - page_base).min(PAGE_SIZE as u64) as usize;
-        let mut tmp = vec![0u8; valid];
+        let mut tmp = vec![0u8; page::valid_len(page_idx, file_size)];
         let inner = self.shared.state.lock();
         let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
         ext4_read_full(&inner.ext4, &disk, &mut tmp, page_base).map_err(map_ext4_err)?;
@@ -1163,7 +1163,7 @@ impl Ext4Inode {
     /// naming the device, inode and page ([`Self::note_read_error`]): a
     /// mapping's fault turns it into `SIGBUS`, which says nothing of the
     /// disk.
-    fn load_page(&self, page_idx: u64, file_size: u64) -> Result<Arc<CachePage>, VfsError> {
+    fn load_page(&self, page_idx: u64, file_size: u64) -> Result<CachePage, VfsError> {
         let tmp = match self.read_disk_page(page_idx, file_size) {
             Ok(tmp) => {
                 self.read_errno.store(0, Ordering::Relaxed);
@@ -1174,7 +1174,7 @@ impl Ext4Inode {
                 return Err(e);
             }
         };
-        let cp = CachePage::new_shared()?;
+        let cp = CachePage::new_zeroed()?;
         cp.write_bytes(0, &tmp);
         Ok(cp)
     }
@@ -1218,7 +1218,8 @@ impl Ext4Inode {
                 // The mapping pins the page, so reclaim can't drop it: held
                 // to the hard cap as a dirty page is, before the disk read.
                 pages.admit_unreclaimable()?;
-                let page = if detached { CachePage::new_shared()? } else { self.load_page(index, file_size)? };
+                let page =
+                    Arc::new(if detached { CachePage::new_zeroed()? } else { self.load_page(index, file_size)? });
                 pages.insert_new(index, Arc::clone(&page))?;
                 page
             }
@@ -1272,7 +1273,7 @@ impl Ext4Inode {
         if page_off >= file_size {
             return Ok(None);
         }
-        let valid = (file_size - page_off).min(PAGE_SIZE as u64) as usize;
+        let valid = page::valid_len(page_idx, file_size);
         page.swap_dirty(false);
         let mut bounce = [0u8; PAGE_SIZE];
         page.read_bytes(0, &mut bounce[..valid]);
@@ -1540,7 +1541,7 @@ impl Ext4Inode {
                                 scanned += 1;
                             }
                             let page_off = p * PAGE_SIZE as u64;
-                            let chunk = (file_size - page_off).min(PAGE_SIZE as u64) as usize;
+                            let chunk = page::valid_len(p, file_size);
                             tmp[..chunk].fill(0);
                             {
                                 let inner = target.shared.state.lock();
@@ -1562,7 +1563,7 @@ impl Ext4Inode {
                             }
                             if any_nonzero && !cached {
                                 quota_guard.try_reserve(1)?;
-                                let cp = Arc::new(CachePage::new_zeroed().ok_or(VfsError::NoMem)?);
+                                let cp = Arc::new(CachePage::new_zeroed()?);
                                 cp.write_bytes(0, &tmp[..chunk]);
                                 faulted.push((p, cp));
                             }
@@ -4020,7 +4021,6 @@ impl VfsInode for Ext4Inode {
         let old_size = meta.size;
 
         if new_size < old_size {
-            let tail_rem = (new_size % PAGE_SIZE as u64) as usize;
             if !detached {
                 let inner = self.shared.state.lock();
                 let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
@@ -4029,8 +4029,10 @@ impl VfsInode for Ext4Inode {
                 // so sub-page files are never temporarily extended to 4096)
                 // before truncating, and restore them if `ext4_truncate` fails.
                 let mut saved_tail: Option<Vec<u8>> = None;
-                if tail_rem != 0 && disk.size_in_bytes() > new_size {
-                    let tail_end = (new_size / PAGE_SIZE as u64 + 1) * PAGE_SIZE as u64;
+                if let Some(tail) = page::resize_tail(old_size, new_size)
+                    && disk.size_in_bytes() > new_size
+                {
+                    let tail_end = (tail.index() + 1) * PAGE_SIZE as u64;
                     let check_len = (disk.size_in_bytes().min(tail_end) - new_size) as usize;
                     if check_len > 0 {
                         let mut probe = vec![0u8; check_len];

@@ -1,8 +1,10 @@
 //! Page-span arithmetic for a file's page cache (4 KiB pages): which pages a
-//! byte range touches and where, and which bytes past a file's end must be
-//! zero when its size changes. The kernel's `PageCache` (shared by `tmpfs`
-//! and `ext4`) walks its reads and writes with [`spans`] and zeroes with
-//! [`resize_tail`] and [`pages_in`].
+//! byte range touches and where, how many bytes of a page lie inside a
+//! file, and which bytes past a file's end must be zero when its size
+//! changes. The kernel's `PageCache` (shared by `tmpfs` and `ext4`) walks
+//! its reads and writes with [`spans`], zeroes with [`resize_tail`] and, on
+//! a shrink, drops the pages from [`pages_in`] on; `ext4` reads and writes
+//! back a page's [`valid_len`] bytes.
 
 use core::ops::Range;
 
@@ -11,30 +13,37 @@ pub const PAGE_SIZE: usize = 4096;
 
 const PAGE: u64 = PAGE_SIZE as u64;
 
-/// One page's part of a byte range: the bytes `buf` of the range (offsets
-/// into the caller's buffer) lie in page `index` (file offset
-/// `index * 4096`) from `in_page` on.
+/// One page's part of a byte range: the bytes [`buf`](Self::buf) of the
+/// range (offsets into the caller's buffer) lie in page
+/// [`index`](Self::index) (file offset `index * 4096`) from
+/// [`in_page`](Self::in_page) on, never past the page's end. Only
+/// [`spans`] makes one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageSpan {
-    pub index: u64,
-    pub in_page: usize,
-    pub buf: Range<usize>,
+    index: u64,
+    in_page: usize,
+    buf: Range<usize>,
 }
 
 impl PageSpan {
-    /// How many bytes of the range lie in this page.
-    pub fn len(&self) -> usize {
-        self.buf.len()
+    /// The page's index in the file.
+    pub fn index(&self) -> u64 {
+        self.index
     }
 
-    /// Whether the span is empty (never, for a span [`spans`] yields).
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
+    /// Where in the page the span starts.
+    pub fn in_page(&self) -> usize {
+        self.in_page
+    }
+
+    /// The span's bytes, as offsets into the caller's buffer (never empty).
+    pub fn buf(&self) -> Range<usize> {
+        self.buf.clone()
     }
 
     /// Whether the span covers its whole page.
     pub fn whole_page(&self) -> bool {
-        self.len() == PAGE_SIZE
+        self.buf.len() == PAGE_SIZE
     }
 
     /// The file offset where the span's page starts.
@@ -84,11 +93,32 @@ pub const fn pages_in(size: u64) -> u64 {
     size.div_ceil(PAGE)
 }
 
-/// A page's bytes from `from` to its end, which lie past a file's end.
+/// How many bytes of page `index` lie below `file_size`: 4096 for a page
+/// wholly inside the file, fewer for the page holding its end, 0 for a
+/// page at or past it (an index whose offset overflows included).
+pub const fn valid_len(index: u64, file_size: u64) -> usize {
+    let len = file_size.saturating_sub(index.saturating_mul(PAGE));
+    if len < PAGE { len as usize } else { PAGE_SIZE }
+}
+
+/// A page's bytes from [`from`](Self::from) to its end, which lie past a
+/// file's end: `0 < from < 4096`. Only [`resize_tail`] makes one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tail {
-    pub index: u64,
-    pub from: usize,
+    index: u64,
+    from: usize,
+}
+
+impl Tail {
+    /// The page's index in the file.
+    pub const fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// Where in the page the bytes to zero start.
+    pub const fn from(&self) -> usize {
+        self.from
+    }
 }
 
 /// The bytes a change of a file's size from `old` to `new` must zero in the
@@ -152,23 +182,27 @@ mod tests {
                     continue;
                 };
                 assert!(off.checked_add(len as u64).is_some(), "{off} {len} accepted");
-                let got: Vec<PageSpan> = it.collect();
+                // Bounded, so spans that stop advancing fail rather than
+                // hang: a range touches at most `len / 4096 + 2` pages.
+                let got: Vec<PageSpan> = it.take(len / PAGE_SIZE + 3).collect();
+                assert!(got.len() <= len / PAGE_SIZE + 2, "{off} {len}: {} spans", got.len());
                 let mut i = 0usize;
                 for (k, s) in got.iter().enumerate() {
-                    assert!(!s.is_empty());
+                    assert!(!s.buf.is_empty());
                     assert_eq!(s.buf.start, i, "{off} {len}: span {k} starts where the last ended");
-                    assert!(s.in_page + s.len() <= PAGE_SIZE);
+                    assert!(s.in_page + s.buf.len() <= PAGE_SIZE);
                     for b in s.buf.clone() {
                         let at = off + b as u64;
                         assert_eq!((s.index, s.in_page + (b - s.buf.start)), (at / PAGE, (at % PAGE) as usize));
                     }
                     if k + 1 < got.len() {
-                        assert_eq!(s.in_page + s.len(), PAGE_SIZE, "{off} {len}: span {k} stops at its page's end");
+                        assert_eq!(s.in_page + s.buf.len(), PAGE_SIZE, "{off} {len}: span {k} stops at its page's end");
                         assert_eq!(got[k + 1].index, s.index + 1);
                         assert_eq!(got[k + 1].in_page, 0);
                     }
+                    assert_eq!((s.index(), s.in_page(), s.buf()), (s.index, s.in_page, s.buf.clone()));
                     assert_eq!(s.page_start(), s.index * PAGE);
-                    assert_eq!(s.whole_page(), s.len() == PAGE_SIZE);
+                    assert_eq!(s.whole_page(), s.buf.len() == PAGE_SIZE);
                     i = s.buf.end;
                 }
                 assert_eq!(i, len, "{off} {len}: the spans cover the range");
@@ -180,14 +214,15 @@ mod tests {
     fn spans_refuse_a_range_past_u64_max() {
         assert!(spans(u64::MAX, 1).is_none());
         assert!(spans(u64::MAX - 1, 2).is_none());
-        let last: Vec<PageSpan> = spans(u64::MAX - 1, 1).expect("ends at u64::MAX").collect();
+        let last: Vec<PageSpan> = spans(u64::MAX - 1, 1).expect("ends at u64::MAX").take(4).collect();
         assert_eq!(last, vec![PageSpan { index: u64::MAX / PAGE, in_page: PAGE_SIZE - 2, buf: 0..1 }]);
         assert_eq!(spans(u64::MAX, 0).expect("empty").count(), 0);
     }
 
     #[test]
     fn spans_of_some_ranges() {
-        let s = |off, len| spans(off, len).expect("in range").collect::<Vec<_>>();
+        // `take`: spans that stop advancing fail here rather than hang.
+        let s = |off, len| spans(off, len).expect("in range").take(8).collect::<Vec<_>>();
         assert_eq!(s(10, 0), vec![]);
         assert_eq!(s(10, 5), vec![PageSpan { index: 0, in_page: 10, buf: 0..5 }]);
         assert_eq!(
@@ -214,6 +249,27 @@ mod tests {
         assert_eq!(pages_in(PAGE), 1);
         assert_eq!(pages_in(PAGE + 1), 2);
         assert_eq!(pages_in(u64::MAX), u64::MAX / PAGE + 1);
+    }
+
+    #[test]
+    fn valid_len_matches_a_byte_by_byte_model() {
+        // The bytes of page `index` below `size`, counted one by one.
+        let model = |index: u64, size: u64| {
+            (0..PAGE)
+                .filter(|&b| index.checked_mul(PAGE).and_then(|s| s.checked_add(b)).is_some_and(|at| at < size))
+                .count()
+        };
+        let sizes: Vec<u64> = offsets();
+        for index in [0u64, 1, 2, 7, 8, u64::MAX / PAGE - 1, u64::MAX / PAGE, u64::MAX / PAGE + 1, u64::MAX] {
+            for &size in &sizes {
+                assert_eq!(valid_len(index, size), model(index, size), "page {index} of {size}");
+            }
+        }
+        assert_eq!(valid_len(0, 0), 0);
+        assert_eq!(valid_len(0, 100), 100);
+        assert_eq!(valid_len(1, 5000), 5000 - PAGE_SIZE);
+        assert_eq!(valid_len(1, 3 * PAGE), PAGE_SIZE);
+        assert_eq!(valid_len(3, 3 * PAGE), 0);
     }
 
     /// The bytes past a file's end that a size change from `old` to `new`
