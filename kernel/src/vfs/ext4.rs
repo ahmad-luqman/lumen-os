@@ -2971,10 +2971,9 @@ enum ChildFate {
     /// operation failed before taking it out, or put it back (a failed
     /// put-back is logged where it happens).
     Kept(u32),
-    /// Its entry is gone and it keeps `links` links. `links` can be 0 when
-    /// the disk, read back, still counts a link the entries don't call for
-    /// (0 is then pinned in memory): the inode isn't freed (an orphan for
-    /// `e2fsck`), and its prepared detach is dropped, not committed.
+    /// Its entry is gone and it keeps `links` links. Every caller passes at
+    /// least 1 (a last link is [`Self::Freed`]); `settle_child`'s
+    /// `links > 0` test is only a guard.
     Remaining { links: u32, now: Timespec },
     /// That entry was its last link: its inode is freed on disk, or left
     /// for `e2fsck` when the free failed (logged where it happens). `ctime`
@@ -5144,8 +5143,9 @@ crate::ktest!(
         // that keeps a link after an unlink, and a rename's target that keeps
         // one. Each operation runs at its own clock reading, and each child
         // holds that reading as its ctime, in memory and after a remount.
-        // The parents' counts on disk then match memory (the directory
-        // renamed in its parent puts the parent's count back).
+        // The parents' counts, on disk and in memory, are then what their
+        // directories call for (the directory renamed in its parent puts the
+        // parent's count back).
         use self::ktest_util::*;
         use crate::kassert_eq;
         let at = |k: i64| Timespec { sec: 1_800_000_000 + 10 * k, nsec: 0 };
@@ -5210,12 +5210,19 @@ crate::ktest!(
             }
         }
         kassert_eq!(lost, Vec::<&str>::new());
-        for (dir, path) in [(&m.root, &[][..]), (&d, &[&b"d"[..]][..])] {
+        // Each parent's count: 2 plus a link per directory in it (of the
+        // names that could be one), on disk and in memory.
+        let root_names: &[&[u8]] = &[b"d", b"x", b"rd2", b"lost+found"];
+        let d_names: &[&[u8]] = &[b"md", b"y", b"mv"];
+        for (dir, path, names) in [(&m.root, &[][..], root_names), (&d, &[&b"d"[..]][..], d_names)] {
             let mut node = ro.root_inode();
             for part in path.iter() {
                 node = node.lookup(part).map_err(|_| "ro lookup")?;
             }
-            kassert_eq!(node.stat().map_err(|_| "ro stat")?.nlink, dir.stat().map_err(|_| "stat")?.nlink);
+            let subdirs = names.iter().filter(|n| node.lookup(n).is_ok_and(|i| i.inode_type() == InodeType::Dir));
+            let expected = 2 + subdirs.count() as u32;
+            kassert_eq!(node.stat().map_err(|_| "ro stat")?.nlink, expected);
+            kassert_eq!(dir.stat().map_err(|_| "stat")?.nlink, expected);
         }
         Ok(())
     }
