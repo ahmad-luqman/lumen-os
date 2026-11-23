@@ -29,6 +29,16 @@ impl MountInfo {
     }
 }
 
+/// What [`MountTable::umount`] removed, for its caller to drop after
+/// releasing Lock 9 (#320: the mount's reference to its mountpoint may be
+/// the last).
+pub struct Unmounted {
+    /// The filesystem that was mounted.
+    pub fs: Arc<dyn FileSystem>,
+    /// The directory it was mounted on.
+    pub mountpoint: Option<Arc<dyn VfsInode>>,
+}
+
 struct MountRecord {
     mount_id: u64,
     fs: Arc<dyn FileSystem>,
@@ -136,11 +146,7 @@ impl MountTable {
     /// drop after releasing Lock 9 (#320: the mount's may be the last
     /// reference to its mountpoint).
     /// Returns `Err(Busy)` if any child filesystem is mounted beneath it.
-    pub fn umount(
-        &mut self,
-        mountpoint_dev: DevId,
-        mountpoint_ino: Ino,
-    ) -> Result<(Arc<dyn FileSystem>, Option<Arc<dyn VfsInode>>), VfsError> {
+    pub fn umount(&mut self, mountpoint_dev: DevId, mountpoint_ino: Ino) -> Result<Unmounted, VfsError> {
         let mp_key = (mountpoint_dev, mountpoint_ino);
         let Some(rec) = self.mounts.get(&mp_key) else {
             return Err(VfsError::Inval);
@@ -152,7 +158,7 @@ impl MountTable {
         }
         let rec = self.mounts.remove(&mp_key).ok_or(VfsError::Inval)?;
         self.dev_to_mp.remove(&mounted_dev);
-        Ok((rec.fs, rec.parent_mountpoint))
+        Ok(Unmounted { fs: rec.fs, mountpoint: rec.parent_mountpoint })
     }
 
     /// Return the global root filesystem, if mounted.
@@ -465,7 +471,7 @@ impl<F: LockFamily> VfsTables<F> {
             let mut mounts = self.mounts.lock();
             let mut dentries = self.dentries.lock();
             let mut inodes = self.inodes.lock();
-            let (fs, mountpoint) = mounts.umount(mountpoint_dev, mountpoint_ino)?;
+            let Unmounted { fs, mountpoint } = mounts.umount(mountpoint_dev, mountpoint_ino)?;
             let dev = fs.dev_id();
             dentries.invalidate_fs(dev);
             dentries.invalidate_dir(mountpoint_dev, mountpoint_ino);

@@ -5222,7 +5222,9 @@ fn get_or_insert_losers_dropped_after_releasing_lock9() {
         assert_eq!(under_after, under, "{what}: the loser was dropped under Lock 9");
     };
     check("inode_get_or_insert", &|l| env.inode_get_or_insert(l));
-    check("inode_get_or_insert_if_mounted", &|l| env.inode_get_or_insert_if_mounted(mp_dev, mp_ino, mount_id, l).unwrap());
+    check("inode_get_or_insert_if_mounted", &|l| {
+        env.inode_get_or_insert_if_mounted(mp_dev, mp_ino, mount_id, l).unwrap()
+    });
     check("inode_get_or_insert_if_fresh", &|l| env.inode_get_or_insert_if_fresh(l, env.cache_gens().1).unwrap());
     check("publish_lookup_inode", &|l| {
         let (dentry_gen, inode_gen) = env.cache_gens();
