@@ -5,6 +5,9 @@ from pathlib import Path
 
 import pytest
 from lumen_harness.klog import (
+    HELD_ALL,
+    HELD_BACK,
+    HOLDING,
     HOST_TIMED,
     UNDERRUNS,
     is_host_timed,
@@ -97,3 +100,40 @@ def test_the_underrun_count_is_read_from_the_warning():
         "[    9.330000] WARN  sound: a sound found the queue empty 3 times (underruns)\n"
     )
     assert m and m["n"] == "3"
+
+
+def test_held_back_lines_are_read_and_a_summarys_copy_is_no_log_line():
+    # kernel/src/klog.rs's lines for `hold_repeats` (#347): each format text
+    # once in the kernel.
+    source = (ROOT / "kernel/src/klog.rs").read_text()
+    for text in (
+        '"holding {tag}\'s repeated warnings and errors back from serial"',
+        '"{count} more held back, the last: {last}"',
+        '"no longer holding {tag}\'s repeats: {total} held back"',
+    ):
+        assert source.count(text) == 1, text
+    start = (
+        "[   11.240000] INFO  klog: holding vfs's repeated warnings and errors back from serial\n"
+    )
+    m = HOLDING.fullmatch(start)
+    assert m and m["tag"] == "vfs"
+    line = (
+        "[   11.241244] INFO  klog: 1294 more held back, the last: ERROR vfs: ext4 DevId(1048580) inode 13: "
+        "links_count on disk is 2, keeping 1 in memory until a write lands; run e2fsck if the volume is "
+        "unmounted first\n"
+    )
+    m = HELD_BACK.fullmatch(line)
+    assert m and m["n"] == "1294"
+    assert m["last"] == (
+        "ERROR vfs: ext4 DevId(1048580) inode 13: links_count on disk is 2, keeping 1 in memory until a "
+        "write lands; run e2fsck if the volume is unmounted first"
+    )
+    end = "[   11.245000] INFO  klog: no longer holding vfs's repeats: 1294 held back\n"
+    m = HELD_ALL.fullmatch(end)
+    assert m and (m["tag"], m["n"]) == ("vfs", "1294")
+    # The copy of the newest line inside a summary isn't a warning of its own.
+    assert unexpected_warnings(start + line + end) == []
+    # Found wherever its stamped line starts, as other log lines are.
+    assert HELD_BACK.search(
+        "ok 9 - x\nlumen> [    1.000000] INFO  klog: 2 more held back, the last: WARN  a: b\n"
+    )
