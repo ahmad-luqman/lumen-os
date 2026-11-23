@@ -5624,9 +5624,12 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     their directory back (or finding the name on another inode), pin the
     count they assume, unless the child reads back zeroed (`delete_file`
     zeroes an inode only after its entry went): its entry is then gone and
-    it may be free, so it is forgotten, never kept live where a new inode
-    could alias it, and for `rmdir` the parent is handled as for a removed
-    entry. A move that can't read back whether its old entry
+    it may be free, so it is forgotten rather than kept live where a new
+    inode could alias it, and for `rmdir` the parent is handled as for a
+    removed entry. That catches only a zeroed child: one whose entry went
+    and whose blocks `delete_file` already freed, before it zeroed the
+    inode, is still kept live with those blocks, which a later file can be
+    given (#330, open). A move that can't read back whether its old entry
     (after the unlink failed) or its new one (after undoing the link
     failed) is still there keeps the counts with the source at both names:
     the source's count from before plus one (at least 3 for a directory)
