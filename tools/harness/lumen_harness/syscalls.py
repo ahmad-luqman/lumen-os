@@ -112,7 +112,7 @@ X86_64: dict[str, int] = {
 # - no field: that argument's value (`futex`'s op);
 # - a field: `field=value` inside that argument (`clone(child_stack=NULL,
 #   flags=17)`'s flags; `rt_sigaction`'s new action's sa_flags, never the old
-#   action's).
+#   action's). An argument of `NULL` has no field and records nothing.
 KEY_ARGS: dict[str, tuple[tuple[str, int, str | None], ...]] = {
     "arch_prctl": (("code", 0, None),),
     "clock_getres": (("clock", 0, None),),
@@ -141,7 +141,7 @@ KEY_ARGS: dict[str, tuple[tuple[str, int, str | None], ...]] = {
     "personality": (("persona", 0, None),),
     "pipe2": (("flags", 1, None),),
     "prctl": (("option", 0, None),),
-    "prlimit64": (("resource", 1, None),),
+    "prlimit64": (("resource", 1, None), ("new_limit", 2, None)),
     "renameat2": (("flags", 4, None),),
     "rt_sigaction": (("signal", 0, None), ("sa_flags", 1, "sa_flags")),
     "rt_sigprocmask": (("how", 0, None),),
@@ -156,8 +156,10 @@ KEY_ARGS: dict[str, tuple[tuple[str, int, str | None], ...]] = {
     "waitid": (("idtype", 0, None), ("options", 3, None)),
 }
 
-# Labels shown in decimal; every other value (flags, ops, requests) in hex.
+# Labels shown in decimal; every other number (flags, ops, requests) in hex.
 DECIMAL_LABELS = frozenset({"signal", "clock", "resource", "domain", "idtype", "whence", "code"})
+# Pointer labels recorded only as `NULL` or `set` (whether `prlimit64` writes).
+PRESENCE_LABELS = frozenset({"new_limit"})
 
 # The milestones that plan each syscall. M8: ROADMAP M8's rows, plus the calls
 # the M8 issues name that those rows don't (waitid in #336; tkill, waitid and
@@ -189,17 +191,18 @@ PLANNED: dict[str, frozenset[str]] = {
 }
 # fmt: on
 
-# Calls Linux answers from the vDSO, so strace never sees them. Lumen maps no
+# Calls Linux normally answers from the vDSO, so strace doesn't see them. Lumen maps no
 # vDSO, so musl falls back to syscalls there: clock_gettime (which its
 # gettimeofday and time call too) and getcpu. The report lists them apart.
 VDSO = ("clock_gettime", "gettimeofday", "time", "getcpu")
 
 
 class CensusError(Exception):
-    """Input this census can't stand behind: a trace line it can't read, a
-    syscall name x86-64 doesn't have (the `syscall_0x...` lines strace prints
-    under Rosetta's translation), missing container facts, or a dispatch table
-    it finds no syscalls in."""
+    """Input this census can't stand behind: no traces, a trace line it can't
+    read or calls out of order on one pid, a recorded argument that is missing
+    or not a number, a syscall name x86-64 doesn't have (the `syscall_0x...`
+    lines strace prints under Rosetta's translation), missing container facts,
+    or a dispatch table it can't read."""
 
 
 @dataclass
@@ -226,7 +229,7 @@ _LINE = re.compile(r"^(\d+)\s+(.*)$")
 _UNFINISHED = re.compile(r"^(\w+)\((.*) <unfinished \.\.\.>$")
 _RESUMED = re.compile(r"^<\.\.\. (\w+) resumed>(.*)$")
 # A resumption cut off by the thread's end: `<... read resumed> <unfinished ...>) = ?`.
-_CUT_OFF = re.compile(r"^\s*<unfinished \.\.\.>\)")
+_CUT_OFF = re.compile(r"^\s*<unfinished \.\.\.>(?=\))")
 # A completed call: its arguments, its return value, then whatever strace adds
 # after it: an errno (`-1 ENOENT (...)`, `? ERESTARTNOHAND (...)`) or a note on
 # a success (`0x8800 (flags O_RDONLY|O_NONBLOCK|O_LARGEFILE)`, `0 (Timeout)`,
@@ -266,9 +269,10 @@ def split_args(text: str) -> list[str]:
     return parts
 
 
-def _partial_args(partial: str) -> list[str]:
-    """The arguments of a call strace printed only in part (`wait4(-1, `)."""
-    return split_args(partial.rstrip().removesuffix(","))
+def _trimmed(partial: str) -> str:
+    """The arguments of a call strace printed only in part (`wait4(-1, `),
+    without the comma it left for the rest."""
+    return partial.rstrip().removesuffix(",")
 
 
 def parse_trace(lines: Iterable[str]) -> list[Call]:
@@ -305,9 +309,8 @@ def parse_trace(lines: Iterable[str]) -> list[Call]:
                 raise CensusError(f"pid {pid}: {r.group(1)} resumed while {name} was pending")
             tail = r.group(2)
             if cut := _CUT_OFF.match(tail):
-                rest = f"{name}({', '.join(_partial_args(partial))}){tail[cut.end() :]}"
-            else:
-                rest = f"{name}({partial}{tail}"
+                partial, tail = _trimmed(partial), tail[cut.end() :]
+            rest = f"{name}({partial}{tail}"
         elif pid in pending:
             raise CensusError(
                 f"pid {pid}: a new call while {pending[pid][0]} was pending: {rest!r}"
@@ -332,37 +335,47 @@ def parse_trace(lines: Iterable[str]) -> list[Call]:
             errno = None
         calls.append(Call(name, split_args(args), ret, errno))
     for name, partial in pending.values():
-        calls.append(Call(name, _partial_args(partial), "?", None))
+        calls.append(Call(name, split_args(_trimmed(partial)), "?", None))
     return calls
 
 
 def render_value(label: str, value: str) -> str:
-    """A recorded argument as the census writes it: numbers in hex, or in
-    decimal for the labels in `DECIMAL_LABELS`; anything else (`NULL`) as is.
-    A `|`-joined value (`clone`'s flags with its exit signal, `0x4100|17`) is
-    one number, its parts OR'd."""
+    """A recorded argument as the census writes it: in hex, or in decimal for
+    the labels in `DECIMAL_LABELS`, or as `NULL` or `set` for those in
+    `PRESENCE_LABELS`. A `|`-joined value (`clone`'s flags with its exit
+    signal, `0x4100|17`) is one number, its parts OR'd. Anything else is a
+    `CensusError`: `-X raw` prints every recorded argument as a number."""
+    if label in PRESENCE_LABELS:
+        return "NULL" if value == "NULL" else "set"
     try:
         n = 0
         for part in value.split("|"):
             n |= int(part, 0)
     except ValueError:
-        return value
+        raise CensusError(f"{label}={value!r}: not a number (a trace without -X raw?)") from None
     if label in DECIMAL_LABELS or n < 0:
         return str(n)
     return hex(n)
 
 
 def key_values(call: Call) -> dict[str, str]:
-    """The recorded arguments of one call (`KEY_ARGS`)."""
+    """The recorded arguments of one call (`KEY_ARGS`). An argument strace
+    didn't print is skipped only in a call that never returned (printed in
+    part), and a field only in a `NULL` argument; anything else missing is a
+    `CensusError`."""
     out: dict[str, str] = {}
     for label, pos, fld in KEY_ARGS.get(call.name, ()):
         if pos >= len(call.args):
-            continue
+            if call.ret == "?":
+                continue
+            raise CensusError(f"{call.name}: no argument {pos} for its {label}")
         value = call.args[pos]
         if fld is not None:
             m = re.search(rf"(?:^|[{{,\s]){fld}=([^,}}\s]+)", value)
             if not m:
-                continue
+                if value == "NULL":
+                    continue
+                raise CensusError(f"{call.name}: no {fld}= in argument {pos}: {value!r}")
             value = m.group(1)
         out[label] = render_value(label, value)
     return out
@@ -382,7 +395,11 @@ def census(traces: dict[str, list[Call]]) -> dict[str, Seen]:
             s = seen.setdefault(call.name, Seen())
             s.calls += 1
             s.workloads.add(workload)
-            for label, value in key_values(call).items():
+            try:
+                values = key_values(call)
+            except CensusError as e:
+                raise CensusError(f"{workload}: {e}") from None
+            for label, value in values.items():
                 s.args[label].add(value)
             if call.errno:
                 s.errors[call.errno] += 1
@@ -414,9 +431,7 @@ def render_toml(meta: dict[str, str | list[str]], seen: dict[str, Seen]) -> str:
         "[meta]",
     ]
     for key, value in meta.items():
-        out.append(
-            f"{key} = {_toml_list(value) if isinstance(value, list) else _toml_str(str(value))}"
-        )
+        out.append(f"{key} = {_toml_list(value) if isinstance(value, list) else _toml_str(value)}")
     for name in sorted(seen, key=X86_64.__getitem__):
         s = seen[name]
         out += [
@@ -474,15 +489,25 @@ def build(traces_dir: Path, meta_dir: Path) -> str:
 
 # --- the report ---
 
-# A dispatch arm: `Ok(general::__NR_exit | general::__NR_exit_group) => {`.
-_ARM = re.compile(r"^\s*Ok\((general::__NR_\w+(?:\s*\|\s*general::__NR_\w+)*)\)\s*=>", re.MULTILINE)
+# A dispatch arm, on one line or as rustfmt wraps it, with or without a guard:
+# `Ok(general::__NR_exit | general::__NR_exit_group) => {`, or
+# `Ok(\n    general::__NR_getuid\n    | general::__NR_getgid,\n) if x =>`.
+_ARM = re.compile(
+    r"\bOk\(\s*(general::__NR_\w+(?:\s*\|\s*general::__NR_\w+)*)\s*,?\s*\)\s*(?:if\b.*?)?=>",
+    re.DOTALL,
+)
 
 
 def dispatched(dispatch_rs: str) -> set[str]:
     """The syscalls `kernel/src/linux/syscall/mod.rs` dispatches: the names in
-    its `Ok(general::__NR_<name>) =>` arms, never a mention elsewhere. Finding
-    none is a `CensusError` (the arms changed shape), not an empty kernel."""
-    names = {n for arm in _ARM.findall(dispatch_rs) for n in re.findall(r"__NR_(\w+)", arm)}
+    its `Ok(general::__NR_<name>) =>` arms; a mention in a comment doesn't
+    count. A `general::__NR_` anywhere else, or no arms at all, is a
+    `CensusError`: the arms changed shape, and the report would quietly call
+    implemented syscalls unplanned."""
+    code = re.sub(r"//[^\n]*", "", dispatch_rs)
+    names = {n for arm in _ARM.findall(code) for n in re.findall(r"__NR_(\w+)", arm)}
+    if stray := sorted(set(re.findall(r"general::__NR_(\w+)", _ARM.sub("", code)))):
+        raise CensusError(f"general::__NR_ outside an arm the report can read: {', '.join(stray)}")
     if not names:
         raise CensusError("no `Ok(general::__NR_<name>) =>` arms in the dispatch table")
     return names
@@ -530,7 +555,7 @@ def report(data: dict, implemented: set[str], verbose: bool = False) -> str:
         "ERESTART* errors: the kernel's restart codes, where a signal interrupted the call;",
         "the program saw EINTR or a restart, by the code, the handler and SA_RESTART.",
         "",
-        "vDSO calls (Linux answers these without a syscall, so the census can't see them):",
+        "vDSO calls (Linux normally answers these without a syscall, so the census can't see them):",
         f"{', '.join(VDSO)}.",
         "Without a vDSO, musl makes clock_gettime (for gettimeofday and time too) and getcpu",
         "syscalls on Lumen.",

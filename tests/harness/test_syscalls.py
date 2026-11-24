@@ -110,6 +110,10 @@ def test_a_resumption_cut_off_by_the_threads_end_is_kept_with_no_return():
             ["7    wait4(-1,  <unfinished ...>", "7    getpid() = 7"],
             "a new call while wait4 was pending",
         ),
+        (
+            ["5    read(3,  <unfinished ...>", "5    <... write resumed>) = 1"],
+            "write resumed while read was pending",
+        ),
     ],
 )
 def test_calls_out_of_order_on_one_pid_are_refused(lines, match):
@@ -117,10 +121,9 @@ def test_calls_out_of_order_on_one_pid_are_refused(lines, match):
         parse_trace(lines)
 
 
-def test_a_resumption_of_another_call_than_the_pending_one_is_refused():
-    lines = ["5    read(3,  <unfinished ...>", "5    <... write resumed>) = 1"]
-    with pytest.raises(CensusError, match="write resumed while read was pending"):
-        parse_trace(lines)
+def test_a_return_value_in_a_string_argument_is_not_the_calls():
+    [call] = parse_trace(['7    open("a) = b", 0) = -1 ENOENT (No such file or directory)'])
+    assert (call.args, call.ret, call.errno) == (['"a) = b"', "0"], "-1", "ENOENT")
 
 
 def test_a_success_strace_annotates_is_kept_and_has_no_errno():
@@ -142,19 +145,10 @@ def test_a_success_strace_annotates_is_kept_and_has_no_errno():
     assert key_values(calls[0]) == {"cmd": "0x3"}
 
 
-def test_an_errno_with_an_underscore_is_read_whole():
-    line = (
-        "9    nanosleep({tv_sec=5, tv_nsec=0}, {tv_sec=3, tv_nsec=999979558}) "
-        "= ? ERESTART_RESTARTBLOCK (Interrupted by signal)"
-    )
-    [call] = parse_trace([line])
-    assert (call.ret, call.errno) == ("?", "ERESTART_RESTARTBLOCK")
-    assert census({"signals": [call]})["nanosleep"].errors == {"ERESTART_RESTARTBLOCK": 1}
-
-
-def test_rt_sigreturn_restoring_an_error_has_no_errno_of_its_own():
-    # The handler's return restores the interrupted nanosleep's -EINTR: that is
-    # nanosleep's result, not an error of rt_sigreturn's.
+def test_an_interrupted_call_keeps_its_restart_code_and_rt_sigreturn_has_no_errno():
+    # The errno with an underscore is read whole. The handler's return restores
+    # the interrupted nanosleep's -EINTR: nanosleep's result, not an error of
+    # rt_sigreturn's.
     lines = [
         (
             "9    nanosleep({tv_sec=5, tv_nsec=0}, {tv_sec=3, tv_nsec=999979558}) "
@@ -167,7 +161,9 @@ def test_rt_sigreturn_restoring_an_error_has_no_errno_of_its_own():
         ("nanosleep", "?", "ERESTART_RESTARTBLOCK"),
         ("rt_sigreturn", "-1", None),
     ]
-    assert census({"signals": calls})["rt_sigreturn"].errors == {}
+    seen = census({"signals": calls})
+    assert seen["nanosleep"].errors == {"ERESTART_RESTARTBLOCK": 1}
+    assert seen["rt_sigreturn"].errors == {}
 
 
 @pytest.mark.parametrize(
@@ -186,39 +182,104 @@ def test_a_line_the_parser_cant_read_is_refused(line, match):
         parse_trace([line])
 
 
-# One real line (from the x86-64 traces) per syscall with recorded arguments.
-@pytest.mark.parametrize(
-    ("line", "expected"),
-    [
-        ("futex(0x7ffda3c64ff4, 0x81, 1)    = 1", {"op": "0x81"}),
+# One line per syscall in KEY_ARGS, in `strace -X raw`'s shapes: from the
+# x86-64 traces for the 18 the census has, the rest written the same way.
+KEY_ARG_LINES = [
+    (
         (
-            "mmap(0x578506282000, 4096, 0, 0x32, -1, 0) = 0x578506282000",
-            {"prot": "0x0", "flags": "0x32"},
+            "clone(child_stack=0x78b82aec5af8, flags=0x7d0f00, parent_tid=[158], "
+            "tls=0x78b82aec5b38, child_tidptr=0x78b82af6af90) = 158"
         ),
-        ('open("ash.sh", 0x88000)           = 3', {"flags": "0x88000"}),
-        ("lseek(3, 376, 0)                  = 376", {"whence": "0"}),
-        ("mprotect(0x7ebf425ae000, 4096, 0x1) = 0", {"prot": "0x1"}),
-        ("rt_sigprocmask(0x1, [33 34], NULL, 8) = 0", {"how": "0x1"}),
+        {"flags": "0x7d0f00"},
+    ),
+    ("ioctl(0, 0x540b, 0)               = 0", {"request": "0x540b"}),
+    (
         (
-            "prlimit64(0, 0x3, NULL, {rlim_cur=8388608, rlim_max=18446744073709551615}) = 0",
-            {"resource": "3"},
+            "rt_sigaction(17, {sa_handler=0x5784e90091f8, sa_mask=~[32 33 34], sa_flags=0x4000000, "
+            "sa_restorer=0x7ebf4256b57e}, NULL, 8) = 0"
         ),
-        ("arch_prctl(0x1002, 0x7ebf425b1b28) = 0", {"code": "4098"}),
-        ("kill(19, 2)                       = 0", {"signal": "2"}),
-        ("tkill(171, 10)                    = 0", {"signal": "10"}),
-        (
-            'faccessat2(-100, "/usr/local/sbin/gcc", 0x1, 0x200) = -1 ENOENT (No such file)',
-            {"flags": "0x200"},
-        ),
-        ("pipe2([...], 0x80000)             = 0", {"flags": "0x80000"}),
-        ("fcntl(3, 0x2, 0x1)                = 0", {"cmd": "0x2"}),
-        ("wait4(-1, 0x7ffe34ace10c, 0x1, NULL) = -1 ECHILD (No child process)", {"options": "0x1"}),
-        ("membarrier(0x10, 0)               = 0", {"cmd": "0x10"}),
-    ],
-)
-def test_key_values_of_real_lines(line, expected):
+        {"signal": "17", "sa_flags": "0x4000000"},
+    ),
+    (
+        "prlimit64(0, 0x3, {rlim_cur=67108864, rlim_max=18446744073709551615}, NULL) = 0",
+        {"resource": "3", "new_limit": "set"},
+    ),
+    ("futex(0x7ffda3c64ff4, 0x81, 1)    = 1", {"op": "0x81"}),
+    (
+        "mmap(0x578506282000, 4096, 0, 0x32, -1, 0) = 0x578506282000",
+        {"prot": "0x0", "flags": "0x32"},
+    ),
+    ('open("ash.sh", 0x88000)           = 3', {"flags": "0x88000"}),
+    ("lseek(3, 376, 0)                  = 376", {"whence": "0"}),
+    ("mprotect(0x7ebf425ae000, 4096, 0x1) = 0", {"prot": "0x1"}),
+    ("rt_sigprocmask(0x1, [33 34], NULL, 8) = 0", {"how": "0x1"}),
+    (
+        "prlimit64(0, 0x3, NULL, {rlim_cur=8388608, rlim_max=18446744073709551615}) = 0",
+        {"resource": "3", "new_limit": "NULL"},
+    ),
+    ("arch_prctl(0x1002, 0x7ebf425b1b28) = 0", {"code": "4098"}),
+    ("kill(19, 2)                       = 0", {"signal": "2"}),
+    ("tkill(171, 10)                    = 0", {"signal": "10"}),
+    (
+        'faccessat2(-100, "/usr/local/sbin/gcc", 0x1, 0x200) = -1 ENOENT (No such file)',
+        {"flags": "0x200"},
+    ),
+    ("pipe2([...], 0x80000)             = 0", {"flags": "0x80000"}),
+    ("fcntl(3, 0x2, 0x1)                = 0", {"cmd": "0x2"}),
+    ("wait4(-1, 0x7ffe34ace10c, 0x1, NULL) = -1 ECHILD (No child process)", {"options": "0x1"}),
+    ("membarrier(0x10, 0)               = 0", {"cmd": "0x10"}),
+    # Written, not traced:
+    (
+        "clone3({flags=0x3d0f00, exit_signal=0, stack=0x7f, stack_size=0x1000}, 88) = 5",
+        {"flags": "0x3d0f00"},
+    ),
+    ("clock_getres(1, 0x7ffe0000)       = 0", {"clock": "1"}),
+    ("clock_gettime(7, 0x7ffe0000)      = 0", {"clock": "7"}),
+    ("clock_nanosleep(1, 0x1, {tv_sec=1, tv_nsec=0}, NULL) = 0", {"clock": "1", "flags": "0x1"}),
+    ("dup3(3, 4, 0x80000)               = 4", {"flags": "0x80000"}),
+    ("flock(3, 0x6)                     = 0", {"operation": "0x6"}),
+    ('getrandom(""..., 16, 0x1)         = 16', {"flags": "0x1"}),
+    ("madvise(0x7f0000, 4096, 0x4)      = 0", {"advice": "0x4"}),
+    ("mremap(0x7f0000, 4096, 8192, 0x1) = 0x7f1000", {"flags": "0x1"}),
+    ("msync(0x7f0000, 4096, 0x4)        = 0", {"flags": "0x4"}),
+    ('newfstatat(-100, "/x", 0x7ffe0000, 0x100) = 0', {"flags": "0x100"}),
+    ('openat(-100, "/x", 0x80000)       = 3', {"flags": "0x80000"}),
+    ("personality(0xffffffff)           = 0", {"persona": "0xffffffff"}),
+    ("prctl(0xf, 0x7ffe0000)            = 0", {"option": "0xf"}),
+    ('renameat2(-100, "/a", -100, "/b", 0x1) = 0', {"flags": "0x1"}),
+    ("rt_sigqueueinfo(5, 10, {si_signo=10, si_code=-1}) = 0", {"signal": "10"}),
+    ("socket(0x1, 0x80001, 0)           = 3", {"domain": "1", "type": "0x80001"}),
+    ('statx(-100, "/x", 0x100, 0xfff, 0x7ffe0000) = 0', {"flags": "0x100"}),
+    ("tgkill(5, 6, 6)                   = 0", {"signal": "6"}),
+    ('unlinkat(-100, "/x", 0x200)       = 0', {"flags": "0x200"}),
+    ('utimensat(-100, "/x", NULL, 0x100) = 0', {"flags": "0x100"}),
+    ("waitid(0x1, 5, {si_signo=17}, 0x4, NULL) = 0", {"idtype": "1", "options": "0x4"}),
+]
+
+
+@pytest.mark.parametrize(("line", "expected"), KEY_ARG_LINES)
+def test_key_values_of_each_syscall_with_recorded_arguments(line, expected):
     [call] = parse_trace([f"7    {line}"])
     assert key_values(call) == expected
+
+
+def test_every_key_args_syscall_has_a_line():
+    assert {line.split("(", 1)[0] for line, _ in KEY_ARG_LINES} == set(syscalls.KEY_ARGS)
+
+
+@pytest.mark.parametrize(
+    ("call", "match"),
+    [
+        (Call("futex", ["0x7f00"], "0", None), "futex: no argument 1 for its op"),
+        (Call("clone", ["child_stack=NULL", "0x11"], "5", None), "clone: no flags= in argument 1"),
+        (Call("ioctl", ["1", "TCGETS", "0x7f00"], "0", None), "request='TCGETS': not a number"),
+    ],
+)
+def test_a_recorded_argument_missing_or_not_a_number_is_refused(call, match):
+    with pytest.raises(CensusError, match=match):
+        key_values(call)
+    with pytest.raises(CensusError, match="make: "):
+        census({"make": [call]})
 
 
 def test_key_args_and_decimal_labels_agree():
@@ -236,7 +297,10 @@ def test_render_value_folds_or_and_picks_the_base_by_label():
     for label in ("signal", "clock", "resource", "domain", "idtype", "whence", "code"):
         assert render_value(label, "0x1") == "1", label
     assert render_value("flags", "-1") == "-1"
-    assert render_value("flags", "NULL") == "NULL"
+    assert render_value("new_limit", "NULL") == "NULL"
+    assert render_value("new_limit", "{rlim_cur=8388608, rlim_max=8388608}") == "set"
+    with pytest.raises(CensusError, match="not a number"):
+        render_value("flags", "NULL")
 
 
 def test_key_values_reads_positions_named_args_and_fields():
@@ -257,8 +321,9 @@ def test_key_values_reads_positions_named_args_and_fields():
     assert key_values(old_only) == {"signal": "2"}
     clone3 = Call("clone3", ["{flags=0x3d0f00, exit_signal=0, stack=0x7f}", "88"], "5", None)
     assert key_values(clone3) == {"flags": "0x3d0f00"}
-    # A position past the arguments strace printed records nothing.
-    assert key_values(Call("futex", ["0x7f00"], "0", None)) == {}
+    # A position past the arguments strace printed records nothing, in a call
+    # that never returned (printed in part).
+    assert key_values(Call("futex", ["0x7f00"], "?", None)) == {}
     assert key_values(Call("getpid", [], "1", None)) == {}
 
 
@@ -277,10 +342,14 @@ def test_the_census_file_sorts_workloads_and_values_numerically():
         Call("ioctl", ["1", "0x10", "0"], "0", None),
         Call("ioctl", ["1", "0x9", "0"], "-1", "ENOTTY"),
     ]
-    seen = census({"make": calls, "ash": calls[:1]})
+    # Five workloads, so a set's order is almost never the sorted one.
+    seen = census(
+        {"vim": calls[:1], "make": calls, "git": calls[:1], "gcc": calls[:1], "ash": calls[:1]}
+    )
     meta = {"alpine": "3.21.10", "image": "img", "kernel": "6.6", "packages": [], "workloads": []}
     entry = tomllib.loads(render_toml(meta, seen))["syscalls"]["ioctl"]
-    assert entry["workloads"] == ["ash", "make"]
+    assert entry["calls"] == 6
+    assert entry["workloads"] == ["ash", "gcc", "git", "make", "vim"]
     assert entry["args"]["request"] == ["0x9", "0x10"]
     assert entry["errors"] == {"ENOTTY": 1}
 
@@ -357,18 +426,31 @@ def test_the_syscall_table_is_linux_x86_64s():
 DISPATCH_RS = """
     match nr {
         Ok(general::__NR_read) => {
-            // A mention outside an arm, such as __NR_clone, is not dispatched.
+            // A mention in a comment, such as general::__NR_clone, is not dispatched.
         }
+        Ok(general::__NR_poll) => {}
         Ok(general::__NR_exit | general::__NR_exit_group) => {}
+        // The shape rustfmt wraps a long arm into, and a guarded arm:
+        Ok(
+            general::__NR_getuid
+            | general::__NR_getgid
+            | general::__NR_geteuid,
+        ) => 1,
+        Ok(general::__NR_wait4) if nr > 0 => {}
         _ => {}
     }
 """
 
 
 def test_dispatched_reads_the_arms_only():
-    assert syscalls.dispatched(DISPATCH_RS) == {"read", "exit", "exit_group"}
+    assert syscalls.dispatched(DISPATCH_RS) == {
+        "read", "poll", "exit", "exit_group", "getuid", "getgid", "geteuid", "wait4"
+    }  # fmt: skip
     with pytest.raises(CensusError, match="no `Ok"):
-        syscalls.dispatched("general::__NR_read => ..")
+        syscalls.dispatched("fn dispatch() {}")
+    stray = DISPATCH_RS.replace("_ => {}", "Some(general::__NR_kill) => {}\n        _ => {}")
+    with pytest.raises(CensusError, match="outside an arm the report can read: kill"):
+        syscalls.dispatched(stray)
 
 
 def test_the_planned_milestones_are_disjoint():
@@ -381,6 +463,8 @@ def test_the_planned_milestones_are_disjoint():
 def test_report_classifies_against_the_dispatch_table():
     implemented = syscalls.dispatched(DISPATCH_RS)
     assert classify("read", implemented) == "implemented"
+    # Implemented wins over planned: poll is in M8's plan and dispatched.
+    assert "poll" in syscalls.PLANNED["M8"] and classify("poll", implemented) == "implemented"
     assert classify("clone", implemented) == "M8"
     assert classify("socket", implemented) == "M9"
     assert classify("mremap", implemented) == "M10"
@@ -390,14 +474,15 @@ def test_report_classifies_against_the_dispatch_table():
         "syscalls": {
             "read": {"nr": 0, "calls": 3, "workloads": ["ash", "make"], "errors": {"EINTR": 2}},
             "clone": {"nr": 56, "calls": 1, "workloads": ["make"]},
+            "fork": {"nr": 57, "calls": 1, "workloads": ["ash"]},
             "socket": {"nr": 41, "calls": 1, "workloads": ["make"]},
             "mremap": {"nr": 25, "calls": 1, "workloads": ["make"]},
             "membarrier": {"nr": 324, "calls": 1, "workloads": ["ash"], "args": {"cmd": ["0x0"]}},
         },
     }
     text = report(data, implemented, verbose=True)
-    assert "Census of ash, make on Alpine 3.21.10 (kernel 6.6): 5 syscalls." in text
-    headers = ["unplanned (1):", "M8 (1):", "M9 (1):", "M10 (1):", "implemented (1):"]
+    assert "Census of ash, make on Alpine 3.21.10 (kernel 6.6): 6 syscalls." in text
+    headers = ["unplanned (1):", "M8 (2):", "M9 (1):", "M10 (1):", "implemented (1):"]
     at = [text.index(h) for h in headers]
     assert at == sorted(at)
     rows = [line for line in text.splitlines() if re.match(r"  +\d+ \w", line)]
@@ -415,7 +500,20 @@ def test_main_reports_the_checked_in_census_by_default(capsys):
     out = capsys.readouterr().out
     count = len(tomllib.loads(CENSUS.read_text())["syscalls"])
     assert f": {count} syscalls." in out
+    assert len([line for line in out.splitlines() if re.match(r"  +\d+ \w", line)]) == count
     assert "implemented (" in out and "        errors: " in out
+
+
+def test_main_reports_the_census_it_is_given(tmp_path, capsys):
+    census_file = tmp_path / "census.toml"
+    census_file.write_text(
+        '[meta]\nalpine = "3.21.10"\nkernel = "6.6"\nworkloads = ["ash"]\n\n'
+        '[syscalls.getpid]\nnr = 39\ncalls = 2\nworkloads = ["ash"]\n'
+    )
+    assert syscalls.main(["report", "--census", str(census_file)]) == 0
+    out = capsys.readouterr().out
+    assert "Census of ash on Alpine 3.21.10 (kernel 6.6): 1 syscalls." in out
+    assert "   39 getpid                     2  ash" in out
 
 
 def test_main_builds_the_census_file(tmp_path):
