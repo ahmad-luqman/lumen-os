@@ -43,11 +43,10 @@ impl<'a> Shebang<'a> {
 
     /// The error from opening this interpreter, if known without filesystem I/O.
     ///
-    /// Caller sequence: [`crate::args::ArgBudget::rewrite`], the kernel's ENOENT
-    /// check for PATH_INACCESSIBLE, this check, then opening the interpreter.
-    /// This defers empty-path EACCES until after E2BIG/ENOMEM. Linux itself
-    /// checks PATH_INACCESSIBLE before copying; exact ENOENT precedence requires
-    /// that kernel precheck before rewrite as well.
+    /// Caller sequence, following `load_script`: the kernel's own ENOENT check
+    /// (`BINPRM_FLAGS_PATH_INACCESSIBLE`), then [`crate::args::ArgBudget::rewrite`]
+    /// (E2BIG, then ENOMEM), then this check (EACCES), then opening the
+    /// interpreter.
     pub const fn open_error(&self) -> Option<ShebangError> {
         if self.interpreter.is_empty() { Some(ShebangError::EmptyInterpreterPath) } else { None }
     }
