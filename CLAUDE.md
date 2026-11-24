@@ -626,7 +626,7 @@ one is its own PR that updates that doc first.
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
   `stream_of`: which ring each goes to, and typed layouts: `Switch`/`ThreadState`,
-  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free), `repeats` (`klog::hold_repeats`' table),
+  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free), `repeats` (`klog::hold_repeats`' table; `Seen::is_held`, the logger's print-or-hold),
   and `ThreadName` (#276: a thread's name, 16 bytes inline like Linux's `comm`: at most 15 bytes cut
   at a character boundary, control characters (C0, DEL, C1) and U+2028/U+2029 as `?`; `from_path`,
   a path's last component, the name a binary run by `linux /path` gets; `From<&str>`, the kernel's
@@ -846,7 +846,8 @@ one is its own PR that updates that doc first.
   `BUSYBOX_EXIT`), #324, and `warm_up`: one uncounted
   `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
-  assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
+  assembly (`s_flags` saying signed directory hashes on every host,
+  `tools/ext4-signed-hash.sh`, #308) and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
   for #255's exit scenarios, and `libm7.so`;
   `m7_vfs`, #254's exit scenarios' program: `posix`, `locks`, `keep` (a
   tree left for fsck), and `lock-hold`/`lock-probe`, two processes at once,
