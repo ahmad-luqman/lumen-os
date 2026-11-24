@@ -346,13 +346,10 @@ def copy_dev_rootfs(
     flag = "-c" if sys.platform == "darwin" else "--reflink=auto"
     try:
         try:
-            cloned = subprocess.run(
+            subprocess.run(
                 ["cp", flag, str(master), str(tmp)], capture_output=True, check=False
-            )
-            ok = cloned.returncode == 0
-        except OSError:
-            ok = False
-        if not ok:
+            ).check_returncode()
+        except (OSError, subprocess.CalledProcessError):
             shutil.copyfile(master, tmp)
         # cp gives the copy the master's mode: writable for QEMU even if
         # the master is read-only.

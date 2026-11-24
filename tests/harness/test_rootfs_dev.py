@@ -12,8 +12,10 @@ until the gate issues build them there.
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import hashlib
+import http.server
 import importlib.util
 import io
 import os
@@ -22,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -80,18 +83,23 @@ def _tar(entries, *, eof: bool) -> bytes:
     return raw if eof else raw[:end]
 
 
-def _apk(data_entries, *, scripts=None, signed=True, data_eof=True) -> bytes:
+def _apk(data_entries, *, scripts=None, signed=True, data_eof=True, datahash=True) -> bytes:
     """An .apk: a signature segment (when `signed`), a control segment
-    (.PKGINFO and `scripts`, name to body) and a data segment, each its own
-    gzip member."""
-    control = [(".PKGINFO", "f", b"pkgname = fixture\n", 0o644)]
+    (.PKGINFO, with the data segment's sha256 as `datahash` unless told
+    otherwise, and `scripts`, name to body) and a data segment, each its
+    own gzip member. `datahash` may be False (none) or a hash to claim."""
+    data = gzip.compress(_tar(data_entries, eof=data_eof), mtime=0)
+    pkginfo = "pkgname = fixture\n"
+    if datahash:
+        claimed = hashlib.sha256(data).hexdigest() if datahash is True else datahash
+        pkginfo += f"datahash = {claimed}\n"
+    control = [(".PKGINFO", "f", pkginfo.encode(), 0o644)]
     control += [(name, "f", body, 0o755) for name, body in (scripts or {}).items()]
     members = []
     if signed:
         members.append(_tar([(".SIGN.RSA.fixture.rsa.pub", "f", b"sig", 0o644)], eof=False))
     members.append(_tar(control, eof=False))
-    members.append(_tar(data_entries, eof=data_eof))
-    return b"".join(gzip.compress(m, mtime=0) for m in members)
+    return b"".join(gzip.compress(m, mtime=0) for m in members) + data
 
 
 HELLO = b"\x7fELF hello"
@@ -120,6 +128,8 @@ DATA = [
         ("1.2-r0", "1.2.1-r0", -1),
         ("1.0_rc1-r0", "1.0-r0", -1),
         ("1.0_alpha-r0", "1.0_beta-r0", -1),
+        ("1.0_beta-r0", "1.0_pre-r0", -1),
+        ("1.0_pre-r0", "1.0_rc-r0", -1),
         ("1.0_p1-r0", "1.0-r0", 1),
         ("1.0a-r0", "1.0-r0", 1),
         ("6.5_p20241006-r3", "6.5-r3", 1),
@@ -234,8 +244,7 @@ def test_resolver_closure_through_deps_provides_so_cmd_install_if_and_a_cycle():
 
 
 def test_resolver_skips_wanted_packages_the_minirootfs_has():
-    assert _resolve(["musl", "extradep"]).packages[0].name == "extradep"
-    assert len(_resolve(["musl", "extradep"]).packages) == 1
+    assert [p.name for p in _resolve(["musl", "extradep"]).packages] == ["extradep"]
 
 
 def test_resolver_picks_providers_by_priority_then_provided_version():
@@ -299,6 +308,42 @@ def test_resolver_reads_a_conflict_in_install_if_as_absent():
     index = "P:a\nV:1-r0\n\nP:c\nV:1-r0\n\nP:e\nV:1-r0\ni:a !c\n"
     assert [p.name for p in _resolve(["a"], index).packages] == ["a", "e"]
     assert [p.name for p in _resolve(["a", "c"], index).packages] == ["a", "c"]
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        # c joins in the same pass as b.
+        "P:a\nV:1-r0\n\nP:b\nV:1-r0\ni:a !c\n\nP:c\nV:1-r0\ni:a\n",
+        # b's own dependency brings c.
+        "P:a\nV:1-r0\n\nP:b\nV:1-r0\ni:a !c\nD:d\n\nP:d\nV:1-r0\nD:c\n\nP:c\nV:1-r0\n",
+    ],
+)
+def test_resolver_refuses_an_install_if_conflict_met_later(index):
+    """apk leaves b out in both; this resolver refuses rather than guess."""
+    with pytest.raises(al.LockError, match=r"b joined by install_if, but !c no longer holds"):
+        _resolve(["a"], index)
+
+
+def test_resolver_refuses_a_conflict_a_minirootfs_package_declares():
+    with pytest.raises(al.LockError, match=r"x conflicts with y \(y\)"):
+        _resolve(["y"], "P:y\nV:1-r0\n", INSTALLED + "\nP:x\nV:1-r0\nD:!y\n")
+
+
+def test_resolver_installed_package_never_joins_by_install_if():
+    assert [
+        p.name for p in _resolve(["a"], "P:a\nV:1-r0\n\nP:musl\nV:1.2.5-r12\ni:a\n").packages
+    ] == ["a"]
+
+
+def test_resolver_minirootfs_package_is_never_upgraded_for_a_provide():
+    index = "P:a\nV:1-r0\nD:so:libc.musl-x86_64.so.1>=2\n\nP:musl\nV:1.2.6-r0\np:so:libc.musl-x86_64.so.1=2\n"
+    with pytest.raises(al.LockError, match="which musl-1.2.6-r0 doesn't meet"):
+        _resolve(["a"], index)
+
+
+def test_resolver_a_package_may_conflict_with_a_name_it_provides():
+    assert [p.name for p in _resolve(["new"], "P:new\nV:1-r0\np:old\nD:!old\n").packages] == ["new"]
 
 
 def test_resolver_names_the_providers_of_a_wanted_name_the_index_lacks():
@@ -369,6 +414,11 @@ def test_lockfile_parses_is_sorted_and_names_each_package_once():
     assert {p.repo for p in lock.packages} <= {"main", "community"}
 
 
+def test_parse_lock_refuses_a_malformed_minirootfs_line():
+    with pytest.raises(al.LockError, match="malformed minirootfs"):
+        al.parse_lock("# minirootfs 3.21.10 extra\na 1-r0 main " + "a" * 64 + "\n")
+
+
 def test_parse_lock_refusals():
     sha = "a" * 64
     head = "# minirootfs 3.21.10\n"
@@ -423,8 +473,10 @@ def test_extract_yields_only_the_data_files(tmp_path):
     segments (with a .post-install) stay out; the data segment's files,
     directories, symlink and hard link come out with their modes, a
     read-only directory still filled."""
-    apk = al.split_apk(_apk(DATA, scripts={".post-install": b"#!/bin/sh\ntouch /ran\n"}))
-    assert apk.scripts == (".post-install",)
+    script = b"#!/bin/sh\ntouch /ran\n"
+    apk = al.split_apk(_apk(DATA, scripts={".post-install": script}))
+    assert apk.scripts == ((".post-install", hashlib.sha256(script).hexdigest()),)
+    assert apk.has_datahash
     out = al.extract_data(apk, tmp_path)
     assert out.replaced == frozenset()
     al.apply_dir_modes(out.dir_modes)
@@ -539,6 +591,23 @@ def test_extract_keeps_setuid_setgid_and_sticky_bits(tmp_path):
     assert (tmp_path / "shared").stat().st_mode & 0o7777 == 0o1777
 
 
+@pytest.mark.parametrize("kind", ["file", "symlink"])
+def test_extract_refuses_a_directory_over_a_file_or_symlink(tmp_path, kind):
+    root = tmp_path / "root"
+    root.mkdir()
+    target = tmp_path / "outside"
+    target.mkdir()
+    target.chmod(0o755)
+    if kind == "file":
+        (root / "d").write_bytes(b"x")
+    else:
+        (root / "d").symlink_to(target)
+    with pytest.raises(al.LockError, match="d: a directory over a file"):
+        out = al.extract_data(al.split_apk(_apk([("d", "d", None, 0o700)])), root)
+        al.apply_dir_modes(out.dir_modes)
+    assert target.stat().st_mode & 0o777 == 0o755
+
+
 def test_extract_refuses_to_write_through_a_symlink(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -566,11 +635,33 @@ def test_split_apk_wants_two_or_three_members_in_their_roles():
         al.split_apk(bad_sig)
 
 
+def _swap_data(apk: bytes, other: bytes) -> bytes:
+    """`apk` with its data segment replaced by `other`'s: the control
+    segment, and so the index's C:, unchanged."""
+    return b"".join(al.gzip_members(apk)[:-1]) + al.gzip_members(other)[-1]
+
+
+def test_split_apk_checks_the_data_segment_against_datahash():
+    """C: covers only the control segment; its .PKGINFO's datahash is what
+    covers the data. A data segment swapped for another of the same size
+    is refused."""
+    real = _apk([("usr/bin/tool", "f", b"A" * 64, 0o755)])
+    swapped = _swap_data(real, _apk([("usr/bin/tool", "f", b"B" * 64, 0o755)]))
+    assert len(swapped) == len(real)
+    assert al.control_checksum(swapped) == al.control_checksum(real)
+    with pytest.raises(al.LockError, match="doesn't match its .PKGINFO datahash"):
+        al.split_apk(swapped)
+    assert not al.split_apk(_apk(DATA, datahash=False)).has_datahash
+
+
 # --- busybox's applet links and staging --------------------------------------------
 
-INSTALLED_DB = """\
+BUSYBOX_C = "Q1p/ydDCbqw8aB8uA/M5rzEgEeRD4="
+BUSYBOX_TRIGGER = f"{BUSYBOX_C} /bin /usr/bin /sbin /usr/sbin /lib/modules/* /usr/lib/modules/*\n"
+INSTALLED_DB = f"""\
 P:busybox
 V:1.37.0-r14
+C:{BUSYBOX_C}
 F:bin
 R:busybox
 
@@ -603,6 +694,7 @@ def _stub_minirootfs(mini: Path, version: str = "3.21.10") -> None:
     (mini / ".version").write_text(version + "\n")
     (mini / "lib/ld-musl-x86_64.so.1").write_bytes(b"\x7fELF ld")
     (mini / "lib/apk/db/installed").write_text(INSTALLED_DB)
+    (mini / "lib/apk/db/triggers").write_text(BUSYBOX_TRIGGER)
     busybox = mini / "bin/busybox"
     busybox.write_bytes(b"#!/bin/sh\nexit 0\n")
     busybox.chmod(0o755)
@@ -667,6 +759,80 @@ def test_stage_fills_a_directory_an_earlier_package_made_read_only(tmp_path):
     (dest / "usr/share/ro").chmod(0o755)
 
 
+def test_stage_refuses_two_packages_disagreeing_on_a_directorys_mode(tmp_path):
+    """Two packages giving one directory different modes is an error, not
+    the later name's win; a minirootfs directory takes the package's mode."""
+    mini, apks, dest = tmp_path / "mini", tmp_path / "apks", tmp_path / "stage"
+    _stub_minirootfs(mini)
+    (mini / "etc").chmod(0o775)  # as tools/fetch-deps.sh leaves it under umask 002
+    shutil.copytree(mini, dest, symlinks=True)
+    agree = {"a-1.0-r0": _apk([("etc", "d", None, 0o755), ("etc/a", "f", b"a", 0o644)])}
+    al.stage(al.parse_lock(_fixture_lock(apks, apks=agree)), apks, mini, dest)
+    assert (dest / "etc").stat().st_mode & 0o7777 == 0o755
+    two = {
+        "a-1.0-r0": _apk([("usr/share/x", "d", None, 0o755)]),
+        "b-1.0-r0": _apk([("usr/share/x", "d", None, 0o700)]),
+    }
+    dest = tmp_path / "stage2"
+    shutil.copytree(mini, dest, symlinks=True)
+    with pytest.raises(al.LockError, match="usr/share/x/: mode 0700, but a package gave it 0755"):
+        al.stage(
+            al.parse_lock(_fixture_lock(tmp_path / "apks2", apks=two)),
+            tmp_path / "apks2",
+            mini,
+            dest,
+        )
+
+
+@pytest.mark.parametrize(
+    ("triggers", "why"),
+    [
+        ("Q1other= /bin\n", "a trigger the image doesn't reproduce (Q1other=: /bin)"),
+        (BUSYBOX_TRIGGER.replace(" /sbin", ""), "a trigger the image doesn't reproduce (busybox:"),
+    ],
+)
+def test_stage_refuses_a_minirootfs_trigger_it_doesnt_know(tmp_path, triggers, why):
+    mini, apks, dest = tmp_path / "mini", tmp_path / "apks", tmp_path / "stage"
+    _stub_minirootfs(mini)
+    (mini / "lib/apk/db/triggers").write_text(triggers)
+    shutil.copytree(mini, dest, symlinks=True)
+    with pytest.raises(al.LockError, match=re.escape(why)):
+        al.stage(al.parse_lock(_fixture_lock(apks)), apks, mini, dest)
+
+
+@pytest.mark.parametrize(
+    ("path", "named"), [("lib/modules/6.6/x.ko", "lib/modules"), ("bin/bbsuid", "bin/bbsuid")]
+)
+def test_stage_refuses_what_busyboxs_trigger_would_act_on(tmp_path, path, named):
+    """busybox's trigger runs depmod on a modules directory and bbsuid's
+    install; mkrootfs-dev.sh reproduces neither, so such a path is refused."""
+    mini, apks, dest = tmp_path / "mini", tmp_path / "apks", tmp_path / "stage"
+    _stub_minirootfs(mini)
+    shutil.copytree(mini, dest, symlinks=True)
+    one = {"k-1.0-r0": _apk([(path, "f", b"x", 0o755)])}
+    with pytest.raises(al.LockError, match=f"{named} is in the image"):
+        al.stage(al.parse_lock(_fixture_lock(apks, apks=one)), apks, mini, dest)
+
+
+def test_stage_refuses_two_packages_replacing_one_link(tmp_path):
+    mini, apks, dest = tmp_path / "mini", tmp_path / "apks", tmp_path / "stage"
+    _stub_minirootfs(mini)
+    shutil.copytree(mini, dest, symlinks=True)
+    two = {**FIXTURE_APKS, "other-1.0-r0": _apk([("usr/bin/strings", "f", b"other", 0o755)])}
+    with pytest.raises(al.LockError, match="usr/bin/strings is already in the image"):
+        al.stage(al.parse_lock(_fixture_lock(apks, apks=two)), apks, mini, dest)
+
+
+@pytest.mark.parametrize("script", [".pre-install", ".trigger", ".post-upgrade"])
+def test_stage_refuses_every_kind_of_install_script(tmp_path, script):
+    mini, apks, dest = tmp_path / "mini", tmp_path / "apks", tmp_path / "stage"
+    _stub_minirootfs(mini)
+    shutil.copytree(mini, dest, symlinks=True)
+    apk = {"s-1.0-r0": _apk([("etc", "d", None, 0o755)], scripts={script: b"#!/bin/sh\n"})}
+    with pytest.raises(al.LockError, match=f"s carries {script}"):
+        al.stage(al.parse_lock(_fixture_lock(apks, apks=apk)), apks, mini, dest)
+
+
 def test_stage_refuses_install_scripts_handled_scripts_doesnt_list(tmp_path, monkeypatch):
     """A package carrying a script fails before anything is extracted,
     naming the script; listed in HANDLED_SCRIPTS, it passes, the script
@@ -679,7 +845,12 @@ def test_stage_refuses_install_scripts_handled_scripts_doesnt_list(tmp_path, mon
     with pytest.raises(al.LockError, match="scripted carries .post-install.*HANDLED_SCRIPTS"):
         al.stage(lock, apks, mini, dest)
     assert not (dest / "usr/bin/hello").exists()
-    monkeypatch.setitem(al.HANDLED_SCRIPTS, ("scripted", ".post-install"), "nothing to do")
+    # Listed for other content (a bump that changed the script): still refused.
+    monkeypatch.setitem(al.HANDLED_SCRIPTS, ("scripted", ".post-install", "0" * 64), "old")
+    with pytest.raises(al.LockError, match="scripted carries .post-install"):
+        al.stage(lock, apks, mini, dest)
+    sha = hashlib.sha256(b"#!/bin/sh\ntouch /etc/post-install-ran\n").hexdigest()
+    monkeypatch.setitem(al.HANDLED_SCRIPTS, ("scripted", ".post-install", sha), "nothing to do")
     dest = tmp_path / "s1"
     shutil.copytree(mini, dest, symlinks=True)
     staged = al.stage(lock, apks, mini, dest)
@@ -695,14 +866,13 @@ def test_the_locked_packages_carry_no_unhandled_install_scripts():
     fetched packages (`make deps-dev`), as CI is until the gate issues."""
     apk_dir = BUILD_DIR / "deps/alpine-packages"
     lock = al.parse_lock(LOCK.read_text())
-    have = [p for p in lock.packages if (apk_dir / p.filename).is_file()]
-    if len(have) != len(lock.packages):
+    if not all((apk_dir / p.filename).is_file() for p in lock.packages):
         pytest.skip(f"{apk_dir} doesn't hold every locked package (`make deps-dev`)")
-    for pkg in have:
+    for pkg in lock.packages:
         data = (apk_dir / pkg.filename).read_bytes()
         assert hashlib.sha256(data).hexdigest() == pkg.sha256, pkg.filename
         for script in al.split_apk(data).scripts:
-            assert (pkg.name, script) in al.HANDLED_SCRIPTS, (pkg.name, script)
+            assert (pkg.name, *script) in al.HANDLED_SCRIPTS, (pkg.name, script)
 
 
 def test_stage_refusals(tmp_path):
@@ -717,6 +887,19 @@ def test_stage_refusals(tmp_path):
     (apks / "hello-1.0-r0.apk").unlink()
     with pytest.raises(al.LockError, match="hello-1.0-r0.apk is missing"):
         al.stage(lock, apks, mini, tmp_path / "s2")
+
+
+def test_image_size_adds_a_quarter_of_the_inodes(tmp_path, monkeypatch):
+    for i in range(20):
+        (tmp_path / f"f{i}").write_bytes(b"")
+    monkeypatch.setattr(al, "INODE_HEADROOM", 1)
+    s = al.image_size(tmp_path)
+    assert s.inodes == 21 + 21 // 4
+
+
+def test_image_size_refuses_a_missing_stage(tmp_path):
+    with pytest.raises(al.LockError, match="no staged tree at"):
+        al.image_size(tmp_path / "missing")
 
 
 def _index_blob(stanzas: str) -> bytes:
@@ -783,6 +966,10 @@ def test_lock_resolves_downloads_checks_and_writes_the_lock(tmp_path):
     ]
     for stem, data in FIXTURE_APKS.items():
         assert (tmp_path / "apks" / f"{stem}.apk").read_bytes() == data
+    dest = tmp_path / "stage"
+    shutil.copytree(tmp_path / "mini", dest, symlinks=True)
+    al.stage(parsed, tmp_path / "apks", tmp_path / "mini", dest)
+    assert (dest / "usr/bin/hello").read_bytes() == HELLO
     # Run again, the downloads kept: the same lock.
     assert al.main(args) == 0
     assert lock.read_text() == text
@@ -807,6 +994,62 @@ def test_lock_refuses_a_file_the_index_doesnt_vouch_for(tmp_path, capsys, overri
     assert al.main(args) == 1
     assert why in capsys.readouterr().err
     assert not lock.exists()
+
+
+def test_lock_refuses_a_data_segment_its_control_segment_doesnt_vouch_for(tmp_path, capsys):
+    """Codex's case on #366: the mirror's hello has the indexed size and
+    C:, but other data. And a package whose .PKGINFO gives no datahash
+    can't be locked."""
+    real = FIXTURE_APKS["hello-1.0-r0"]
+    stanzas = _stanza("binutils-2.43.1-r3", FIXTURE_APKS["binutils-2.43.1-r3"]) + "\n"
+    stanzas += _stanza("hello-1.0-r0", real)
+    args, lock, repo_dir = _lock_tree(tmp_path, stanzas)
+    # Another payload of the same compressed size: one letter changed.
+    for letter in b"abcdefgijklmnopqrstuvwxyz":
+        payload = HELLO.replace(b"h", bytes([letter]))
+        other = _apk([(n, k, payload if p == HELLO else p, m) for n, k, p, m in DATA[:6]])
+        swapped = _swap_data(real, other)
+        if len(swapped) == len(real):
+            break
+    assert len(swapped) == len(real)
+    (repo_dir / "hello-1.0-r0.apk").write_bytes(swapped)
+    assert al.main(args) == 1
+    assert "hello-1.0-r0.apk: the .apk's data segment doesn't match its .PKGINFO datahash" in (
+        capsys.readouterr().err
+    )
+    assert not lock.exists()
+
+    bare = _apk(DATA[:6], datahash=False)
+    stanzas = _stanza("binutils-2.43.1-r3", FIXTURE_APKS["binutils-2.43.1-r3"]) + "\n"
+    stanzas += _stanza("hello-1.0-r0", bare)
+    args, lock, repo_dir = _lock_tree(tmp_path / "bare", stanzas)
+    (repo_dir / "hello-1.0-r0.apk").write_bytes(bare)
+    assert al.main(args) == 1
+    assert "hello-1.0-r0.apk: its .PKGINFO gives no datahash" in capsys.readouterr().err
+
+
+def test_lock_rechecks_a_kept_download(tmp_path, capsys):
+    stanzas = "\n".join(_stanza(stem, data) for stem, data in sorted(FIXTURE_APKS.items()))
+    args, _, _ = _lock_tree(tmp_path, stanzas)
+    assert al.main(args) == 0
+    (tmp_path / "apks/hello-1.0-r0.apk").write_bytes(b"corrupt")
+    assert al.main(args) == 1
+    assert "bytes, the index says" in capsys.readouterr().err
+
+
+def test_lock_lets_main_hide_community_and_names_only_contributing_repos(tmp_path):
+    stanzas = "\n".join(_stanza(stem, data) for stem, data in sorted(FIXTURE_APKS.items()))
+    args, lock, repo_dir = _lock_tree(tmp_path, stanzas)
+    comm = repo_dir.parent.parent / "community/x86_64"
+    comm.mkdir(parents=True)
+    other = _apk([("usr/bin/hello", "f", b"community hello", 0o755)])
+    (comm / "hello-9.0-r0.apk").write_bytes(other)
+    (comm / "APKINDEX.tar.gz").write_bytes(_index_blob(_stanza("hello-9.0-r0", other)))
+    args = [a for a in args if a not in ("--repo", "main")]
+    assert al.main(args) == 0
+    text = lock.read_text()
+    assert "hello 1.0-r0 main" in text
+    assert "community/x86_64/APKINDEX" not in text
 
 
 def test_image_size_counts_the_same_on_every_host(tmp_path):
@@ -863,11 +1106,7 @@ def test_fetch_tries_mirrors_in_order_and_checks_each_sha256(tmp_path):
     # it, binutils from the CDN after the mismatch.
     (flat / "hello-1.0-r0.apk").write_bytes(FIXTURE_APKS["hello-1.0-r0"])
     (flat / "binutils-2.43.1-r3.apk").write_bytes(b"not binutils")
-    shutil.rmtree(tmp_path / "cdn/v3.21/main/x86_64")
-    (tmp_path / "cdn/v3.21/main/x86_64").mkdir()
-    (tmp_path / "cdn/v3.21/main/x86_64/binutils-2.43.1-r3.apk").write_bytes(
-        FIXTURE_APKS["binutils-2.43.1-r3"]
-    )
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
     proc = _run_fetch(script, tmp_path, f"file://{flat}/{{file}}")
     assert proc.returncode == 0, proc.stderr
     assert "binutils-2.43.1-r3.apk: sha256" in proc.stderr
@@ -905,6 +1144,169 @@ def test_fetch_fails_clearly_when_a_pinned_file_is_gone_everywhere(tmp_path):
     assert "couldn't be reached" not in proc.stderr
     assert not (out / "hello-1.0-r0.apk").exists()
     assert not [p for p in out.iterdir() if p.name.startswith(".part")]
+
+
+class _Mirror(http.server.BaseHTTPRequestHandler):
+    """An HTTP mirror for the fetch tests: `status` for every path, with
+    `body` when it is 200."""
+
+    status = 404
+    body = b""
+
+    def do_GET(self):
+        self.send_response(self.status)
+        self.send_header("Content-Length", str(len(self.body) if self.status == 200 else 0))
+        self.end_headers()
+        if self.status == 200:
+            self.wfile.write(self.body)
+
+    def log_message(self, *args):
+        pass
+
+
+@contextlib.contextmanager
+def _http_mirror(status: int, body: bytes = b""):
+    handler = type("Handler", (_Mirror,), {"status": status, "body": body})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "advice", "not_advice"),
+    [
+        (404, b"", "Re-run tools/alpine-lock.py", "couldn't be reached"),
+        (403, b"", "Re-run tools/alpine-lock.py", "couldn't be reached"),
+        (410, b"", "Re-run tools/alpine-lock.py", "couldn't be reached"),
+        (503, b"", "couldn't be reached", "Re-run tools/alpine-lock.py"),
+        (200, b"<html>captive portal</html>", "served other bytes", "Re-run tools/alpine-lock.py"),
+    ],
+)
+def test_fetch_tells_a_dropped_file_from_a_broken_mirror_over_http(
+    tmp_path, status, body, advice, not_advice
+):
+    """Over HTTP, as dl-cdn answers: a 403, 404 or 410 everywhere means the
+    file is gone (re-lock); a 5xx means the mirror is down, and other bytes
+    under the name a proxy or corrupt mirror: neither is a reason to
+    re-lock."""
+    script, out, _ = _fetch_tree(tmp_path)
+    with _http_mirror(status, body) as base:
+        env = {**os.environ, "LUMEN_APK_CDN": base, "LUMEN_PYTHON": sys.executable}
+        env.pop("LUMEN_APK_MIRROR", None)
+        proc = subprocess.run(
+            ["bash", str(script)], capture_output=True, text=True, check=False, env=env, timeout=120
+        )
+    assert proc.returncode == 1
+    assert advice in proc.stderr
+    assert not_advice not in proc.stderr
+    assert not list(out.glob("*.apk"))
+
+
+def _serve_dir(root: Path, redirect: dict[str, str] | None = None):
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=str(root), **k)
+
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if redirect and self.path in redirect:
+                self.send_response(302)
+                self.send_header("Location", redirect[self.path])
+                self.end_headers()
+                return
+            super().do_GET()
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def test_fetch_follows_a_mirrors_redirect(tmp_path):
+    script, out, flat = _fetch_tree(tmp_path)
+    shutil.rmtree(tmp_path / "cdn")
+    for stem, data in FIXTURE_APKS.items():
+        (flat / f"{stem}.apk").write_bytes(data)
+    redirect = {f"/r/{s}.apk": f"/{s}.apk" for s in FIXTURE_APKS}
+    srv = _serve_dir(flat, redirect)
+    try:
+        env = {
+            **os.environ,
+            "LUMEN_APK_CDN": f"file://{tmp_path}/none",
+            "LUMEN_PYTHON": sys.executable,
+            "LUMEN_APK_MIRROR": f"http://127.0.0.1:{srv.server_port}/r/{{file}}",
+        }
+        proc = subprocess.run(
+            ["bash", str(script)], check=False, capture_output=True, text=True, env=env, timeout=120
+        )
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert proc.returncode == 0, proc.stderr
+    for stem, data in FIXTURE_APKS.items():
+        assert (out / f"{stem}.apk").read_bytes() == data
+
+
+def test_fetch_other_bytes_everywhere_fail_without_a_part_file(tmp_path):
+    script, out, _ = _fetch_tree(tmp_path)
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").write_bytes(b"other bytes")
+    env = {
+        **os.environ,
+        "LUMEN_APK_CDN": f"file://{tmp_path}/cdn",
+        "LUMEN_PYTHON": sys.executable,
+        "LUMEN_APK_MIRROR": "",
+    }
+    proc = subprocess.run(
+        ["bash", str(script)], check=False, capture_output=True, text=True, env=env, timeout=120
+    )
+    assert proc.returncode == 1
+    assert "served other bytes" in proc.stderr
+    assert "Re-run tools/alpine-lock.py" not in proc.stderr
+    assert "couldn't be reached" not in proc.stderr
+    assert not [p for p in out.iterdir() if p.name.startswith(".part")]
+
+
+def test_fetch_stops_at_the_first_good_mirror(tmp_path):
+    script, out, flat = _fetch_tree(tmp_path)
+    for stem, data in FIXTURE_APKS.items():
+        (flat / f"{stem}.apk").write_bytes(data)
+    # The CDN, tried second, gives wrong bytes: never consulted.
+    for p in (tmp_path / "cdn/v3.21/main/x86_64").iterdir():
+        p.write_bytes(b"wrong")
+    env = {
+        **os.environ,
+        "LUMEN_APK_CDN": f"file://{tmp_path}/cdn",
+        "LUMEN_PYTHON": sys.executable,
+        "LUMEN_APK_MIRROR": f"file://{flat}/{{file}}",
+    }
+    proc = subprocess.run(
+        ["bash", str(script)], check=False, capture_output=True, text=True, env=env, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "sha256" not in proc.stderr
+    for stem, data in FIXTURE_APKS.items():
+        assert (out / f"{stem}.apk").read_bytes() == data
+
+
+def test_fetch_reads_mirrors_one_per_line(tmp_path):
+    """LUMEN_APK_MIRROR split on newlines too (a YAML block): the second
+    line's mirror is used, not dropped."""
+    script, out, flat = _fetch_tree(tmp_path)
+    shutil.rmtree(tmp_path / "cdn")
+    for stem, data in FIXTURE_APKS.items():
+        (flat / f"{stem}.apk").write_bytes(data)
+    proc = _run_fetch(
+        script, tmp_path, f"file://{tmp_path}/nowhere/{{file}}\nfile://{flat}/{{file}}"
+    )
+    assert proc.returncode == 0, proc.stderr
+    for stem, data in FIXTURE_APKS.items():
+        assert (out / f"{stem}.apk").read_bytes() == data
 
 
 def test_fetch_says_an_unreachable_mirror_is_no_reason_to_relock(tmp_path):
@@ -953,6 +1355,7 @@ def test_fetch_reads_the_lock_through_alpine_lock(tmp_path, edit, why):
     proc = _run_fetch(script, tmp_path)
     assert proc.returncode != 0
     assert why in proc.stderr
+    assert "no mirror gave" not in proc.stderr  # stopped before any download
     assert not out.exists() or not list(out.glob("*.apk"))
 
 
@@ -980,12 +1383,12 @@ def test_fetch_takes_a_community_package_from_its_repository(tmp_path):
     assert (out / "binutils-2.43.1-r3.apk").read_bytes() == FIXTURE_APKS["binutils-2.43.1-r3"]
 
 
-def test_files_prints_the_locks_repo_file_and_sha256(tmp_path, capsys):
+def test_files_prints_the_locks_mirror_path_file_and_sha256(tmp_path, capsys):
     lock = tmp_path / "lock"
     lock.write_text(_fixture_lock(tmp_path / "apks"))
     assert al.main(["files", "--lock", str(lock)]) == 0
     want = [
-        f"main {stem}.apk {hashlib.sha256(data).hexdigest()}"
+        f"v3.21/main/x86_64/{stem}.apk {stem}.apk {hashlib.sha256(data).hexdigest()}"
         for stem, data in sorted(FIXTURE_APKS.items())
     ]
     assert capsys.readouterr().out.splitlines() == want
@@ -1068,6 +1471,14 @@ def test_mkrootfs_dev_builds_the_same_image_twice_from_fixtures(tmp_path):
         "extra_isize",
     ]
     assert re.search(r"^Filesystem flags:\s+signed_directory_hash\s*$", stats, re.MULTILINE)
+    # The label, the fixed UUID ("M8"), no reserved blocks, and /proc's mode,
+    # set after the packages.
+    assert re.search(r"^Filesystem volume name:\s+lumen-dev$", stats, re.MULTILINE)
+    assert re.search(
+        r"^Filesystem UUID:\s+4c756d65-6e2d-4d38-8000-000000000001$", stats, re.MULTILINE
+    )
+    assert re.search(r"^Reserved block count:\s+0$", stats, re.MULTILINE)
+    assert "Mode:  0555" in rootfs.debugfs(first, "stat /proc", tool=debugfs)
     # The size and inode count alpine-lock.py's `size` worked out, given to
     # mke2fs (which rounds inodes up to whole groups).
     m = re.search(r"image (\d+) MiB with (\d+) inodes", proc.stdout)
@@ -1095,12 +1506,26 @@ def test_mkrootfs_dev_builds_the_same_image_twice_from_fixtures(tmp_path):
         if re.search(r"^Links: 0\b", block, re.MULTILINE):
             continue
         allocated += 1
+        assert re.search(r"^User:\s+0\s+Group:\s+0\b", block, re.MULTILINE), block
         times = re.findall(r"^\s*(c|a|m|cr)time: (0x[0-9a-f]+)", block, re.MULTILINE)
         assert {t for _, t in times} == {"0x6553f100"}, block
     # `used` counts the reserved inodes 1-10 too; only the root among them
     # is stat'ed.
     assert allocated == used - 9
-    # No stage or temporary image left behind.
+    # No stage, debugfs directory or temporary image left behind.
+    assert not [p for p in tmp_path.iterdir() if p.name.startswith("lumen-rootfs-dev")]
+    assert not [p for p in tmp_path.iterdir() if ".tmp." in p.name]
+
+
+def test_mkrootfs_dev_cleans_up_a_read_only_stage(tmp_path):
+    _e2fsprogs()
+    repo = _mkrootfs_dev_tree(tmp_path)
+    lock = _fixture_lock(
+        repo / "build/deps/alpine-packages", apks={**FIXTURE_APKS, "ro-1.0-r0": _apk(DATA[6:])}
+    )
+    (repo / "tools/alpine-packages.lock").write_text(lock)
+    proc = _mkrootfs_dev(repo, tmp_path / "o.ext4", tmp_path)
+    assert proc.returncode == 0, proc.stderr
     assert not [p for p in tmp_path.iterdir() if p.name.startswith("lumen-rootfs-dev")]
 
 
@@ -1302,6 +1727,48 @@ def test_make_deps_dev_fetches_even_with_its_stamp_up_to_date(tmp_path):
     )
     assert dry.returncode == 0, dry.stderr
     assert "tools/fetch-alpine-packages.sh" in dry.stdout
+
+
+@pytest.mark.parametrize("newer", ["tools/alpine-packages.lock", "tools/alpine-lock.py"])
+def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer):
+    files = [
+        "deps/alpine-minirootfs/.version",
+        "linux/libm7.so",
+        "linux/hello",
+        "linux/m7_test",
+        "linux/m7_vfs",
+        "deps/alpine-packages/.lock",
+        "alpine-dev.ext4",
+    ]
+    now = (
+        max(
+            (REPO_ROOT / t).stat().st_mtime
+            for t in (
+                "Makefile",
+                "tools/mkrootfs-dev.sh",
+                "tools/alpine-lock.py",
+                "tools/ext4-signed-hash.sh",
+                "tools/alpine-packages.lock",
+                "tools/fetch-alpine-packages.sh",
+            )
+        )
+        + 200
+    )
+    for i, f in enumerate(files):
+        p = tmp_path / f
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"")
+        os.utime(p, (now - 100 + i,) * 2)
+    run = lambda *extra: (
+        subprocess.run(
+            ["make", "-n", "-C", str(REPO_ROOT), *extra, "rootfs-dev", f"BUILD={tmp_path}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
+    assert "mkrootfs-dev.sh" not in run()
+    assert "mkrootfs-dev.sh" in run("-W", newer)
 
 
 # --- The built image (skipped without build/alpine-dev.ext4) ------------------------------------

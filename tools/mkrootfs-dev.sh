@@ -113,12 +113,13 @@ COPYFILE_DISABLE=1 cp -a "$MINIROOTFS/." "$STAGE/"
 rm -f "$STAGE/.version"
 rm -rf "${STAGE:?}/dev" "$STAGE/proc" "$STAGE/tmp"
 mkdir -p "$STAGE/dev" "$STAGE/proc" "$STAGE/tmp"
-chmod 0755 "$STAGE/dev"
-chmod 0555 "$STAGE/proc"
-chmod 1777 "$STAGE/tmp"
 
 alpine_lock stage --lock "$LOCK" --apk-dir "$APK_DIR" --minirootfs "$MINIROOTFS" "$STAGE" \
     | sed 's/^/mkrootfs-dev: /'
+# After the packages, so none can change them.
+chmod 0755 "$STAGE/dev"
+chmod 0555 "$STAGE/proc"
+chmod 1777 "$STAGE/tmp"
 
 if [[ -d "$LINUX_DIR" ]]; then
     mkdir -p "$STAGE/usr/local/bin" "$STAGE/usr/local/lib"

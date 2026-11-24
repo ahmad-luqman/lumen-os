@@ -11,11 +11,14 @@ the image from it.
 name `main` lacks), resolves the closure of `tools/alpine-packages.txt` through
 `D:` dependencies, `p:` provides (`so:` and `cmd:` included) and `i:`
 install-if rules, leaving out the minirootfs' packages (its
-`lib/apk/db/installed`), downloads each `.apk` once to record its sha256 (an
-APKINDEX's `C:` is a SHA-1 of the control segment, not a file hash; it is
-checked against the download, which ties the file to the index), and writes
-`tools/alpine-packages.lock`. It keeps the downloads in `build/deps/alpine-packages/`,
-where `tools/fetch-alpine-packages.sh` would put them.
+`lib/apk/db/installed`), downloads each `.apk` once to record its sha256, and
+writes
+`tools/alpine-packages.lock`. Each download is tied to the index before its
+sha256 is recorded: its length to the index's `S:`, its control segment to
+`C:` (a SHA-1 of that segment, not a file hash), and its data segment to the
+`datahash` the control segment's `.PKGINFO` gives. It keeps the downloads in
+`build/deps/alpine-packages/`, where `tools/fetch-alpine-packages.sh` would
+put them.
 
 `stage` and `size` are `tools/mkrootfs-dev.sh`'s: `stage` checks every locked
 `.apk`'s sha256, then extracts each one's data segment only (never its install
@@ -23,7 +26,8 @@ scripts; a package carrying any is refused unless `HANDLED_SCRIPTS` says how
 the image reproduces them) into a staged root; `size` works out the image's
 size and inode count from the staged content, the same on every host. `files`
 is `tools/fetch-alpine-packages.sh`'s: the lock, parsed and checked here, as
-`repo file sha256` lines, so the lock has one reader.
+`mirror-path file sha256` lines (the path under an Alpine-layout mirror's
+base URL), so the lock has one reader and the URL layout one writer.
 
 Standard library only, so the harness tests import it and `LUMEN_PYTHON` can
 run it without uv (the tests' stub trees).
@@ -44,6 +48,7 @@ import tarfile
 import urllib.request
 import zlib
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -256,14 +261,16 @@ def resolve(
     A dependency is met by an installed or already chosen package with that
     name or provide (its version constraint checked); otherwise by the
     available package of that name, or else by a provider of it: the
-    highest `k:` priority, then the highest version of what it provides
-    (apk's order: isl26's `so:libisl.so.23=23.3.0` over isl25's 23.2.0),
+    highest `k:` priority, then a provide with a version over one without,
+    then the highest version of what it provides (apk's order: isl26's
+    `so:libisl.so.23=23.3.0` over isl25's 23.2.0),
     and a tie an error (name one in alpine-packages.txt to choose). Then,
     as apk does, every package whose `i:` atoms are all met joins, with its
     dependencies, until none does.
-    An `i:` atom `!name` holds while nothing meets `name`. A conflict
-    (`!name`) in `D:` met by the result is an error, and so is an installed
-    package too old or too new for an atom naming it."""
+    An `i:` atom `!name` holds while nothing meets `name`, and must still
+    hold in the result (an error otherwise). A conflict (`!name`) in a
+    chosen or installed package's `D:` met by the result is an error, and
+    so is an installed package too old or too new for an atom naming it."""
     chosen: dict[str, Package] = {}
 
     def met(dep: Dep) -> bool:
@@ -348,8 +355,19 @@ def resolve(
             choose(pkg)
         drain()
 
-    everything = (*installed.values(), *chosen.values())
+    # A `!name` in `i:` was checked when its package joined; something that
+    # joined later (or its dependencies) may meet name since. apk's solver
+    # would leave the package out; this resolver refuses instead of guessing.
     for pkg in chosen.values():
+        for atom in pkg.install_if:
+            if atom.conflict and met(atom):
+                raise LockError(
+                    f"{pkg.name} joined by install_if, but {atom} no longer holds: "
+                    "name the packages to use in tools/alpine-packages.txt"
+                )
+
+    everything = (*installed.values(), *chosen.values())
+    for pkg in everything:
         for dep in pkg.deps:
             if dep.conflict:
                 clash = [p.name for p in everything if p.name != pkg.name and p.satisfies(dep)]
@@ -440,9 +458,6 @@ def format_lock(
         description, sha = indexes[repo]
         lines.append(f"#   {repo}/{ARCH}/APKINDEX.tar.gz {description} sha256 {sha}")
     lines += [f"# minirootfs {minirootfs}", "# name version repo sha256"]
-    missing = [p.name for p in resolution.packages if p.name not in hashes]
-    if missing:
-        raise LockError(f"no sha256 for {', '.join(missing)}")
     lines += [f"{p.name} {p.version} {p.repo} {hashes[p.name]}" for p in resolution.packages]
     return "\n".join(lines) + "\n"
 
@@ -487,29 +502,52 @@ def _member_names(member: bytes) -> list[str]:
         return tar.getnames()
 
 
+def _member_files(member: bytes) -> dict[str, bytes]:
+    """A segment's regular files by name (a control segment's are small)."""
+    files = {}
+    with tarfile.open(fileobj=io.BytesIO(member), mode="r:gz") as tar:
+        for m in tar:
+            f = tar.extractfile(m) if m.isreg() else None
+            if f is not None:
+                files[m.name] = f.read()
+    return files
+
+
 @dataclass(frozen=True)
 class ApkParts:
     """An `.apk` split once: the scripts its control segment carries
     (`.pre-install`, `.post-install`, `.trigger`, ...: what `stage` never
-    runs) and its data segment (a gzipped tar)."""
+    runs), each with its content's sha256, and its data segment (a gzipped
+    tar), already checked against `.PKGINFO`'s `datahash` when that is
+    there (`has_datahash`)."""
 
-    scripts: tuple[str, ...]
+    scripts: tuple[tuple[str, str], ...]
     data: bytes
+    has_datahash: bool
 
 
 def split_apk(data: bytes) -> ApkParts:
     """An `.apk`'s parts: the last gzip member is its data segment, after
     the control segment (`.PKGINFO`, the install scripts) and, when signed,
-    the signature (`.SIGN.*`). Checked by what each holds."""
+    the signature (`.SIGN.*`). Checked by what each holds, and the data
+    segment by `.PKGINFO`'s `datahash` (its sha256: the index's `C:` covers
+    only the control segment, so this is what ties the payload to it)."""
     members = gzip_members(data)
     if len(members) not in (2, 3):
         raise LockError(f"an .apk has 2 or 3 gzip members, this one {len(members)}")
-    control = _member_names(members[-2])
+    control = _member_files(members[-2])
     if ".PKGINFO" not in control:
         raise LockError("the .apk's control segment has no .PKGINFO")
     if len(members) == 3 and not all(n.startswith(".SIGN.") for n in _member_names(members[0])):
         raise LockError("the .apk's first segment isn't a signature")
-    return ApkParts(tuple(sorted(n for n in control if n != ".PKGINFO")), members[-1])
+    pkginfo = control.pop(".PKGINFO").decode("utf-8", "replace")
+    hashes = re.findall(r"^datahash = ([0-9a-f]{64})$", pkginfo, re.MULTILINE)
+    if len(hashes) > 1:
+        raise LockError("the .apk's .PKGINFO gives two datahash lines")
+    if hashes and hashlib.sha256(members[-1]).hexdigest() != hashes[0]:
+        raise LockError("the .apk's data segment doesn't match its .PKGINFO datahash")
+    scripts = tuple(sorted((n, hashlib.sha256(b).hexdigest()) for n, b in control.items()))
+    return ApkParts(scripts, members[-1], bool(hashes))
 
 
 def _safe_parts(name: str) -> list[str]:
@@ -566,16 +604,27 @@ def _extracted_file(dest: Path, parts: list[str]) -> Path | None:
     return None if here.is_symlink() or not here.is_file() else here
 
 
-def extract_data(apk: ApkParts, dest: Path, replaceable: frozenset[str] = frozenset()) -> Extracted:
+def extract_data(
+    apk: ApkParts,
+    dest: Path,
+    replaceable: frozenset[str] = frozenset(),
+    pending_modes: Mapping[Path, int] | None = None,
+) -> Extracted:
     """Extract an `.apk`'s data segment into `dest`. Stricter than apk,
     which overwrites any file no package owns: a path already in `dest` (the
     minirootfs', or another package's) is an error, unless both are
     directories or the path is in `replaceable` (the busybox applet links
     `stage` passes, the only unowned files the minirootfs has in the way).
-    New directories are made at 0755 and their archive modes handed back
-    (`Extracted.dir_modes`), for the caller to apply when every package is
-    in (`apply_dir_modes`), so a read-only one can still be filled; owners
-    and times are left to mkrootfs-dev.sh."""
+    Each directory entry's archive mode is handed back (`Extracted.dir_modes`)
+    for the caller to apply when every package is in (`apply_dir_modes`), so
+    a read-only one can still be filled; one this call creates is made at
+    0755 meanwhile. A directory an earlier package gave a mode
+    (`pending_modes`, not yet applied) and this archive gives another is an
+    error; one the minirootfs made takes the package's mode, as apk sets it
+    (the minirootfs' own modes went through the umask of
+    tools/fetch-deps.sh's extraction). Owners and times are left to
+    mkrootfs-dev.sh."""
+    pending = pending_modes or {}
     written = []
     replaced = set()
     dir_modes: dict[Path, int] = {}
@@ -588,8 +637,12 @@ def extract_data(apk: ApkParts, dest: Path, replaceable: frozenset[str] = frozen
             if m.isdir():
                 if path.is_symlink() or (path.exists() and not path.is_dir()):
                     raise LockError(f"{rel}: a directory over a file")
+                mode = m.mode & 0o7777
+                have = dir_modes.get(path, pending.get(path))
+                if have is not None and have != mode:
+                    raise LockError(f"{rel}/: mode {mode:04o}, but a package gave it {have:04o}")
                 path.mkdir(mode=0o755, exist_ok=True)
-                dir_modes[path] = m.mode & 0o7777
+                dir_modes[path] = mode
                 written.append(rel + "/")
                 continue
             if os.path.lexists(path):
@@ -653,16 +706,49 @@ def busybox_links(root: Path, owned: set[str]) -> set[str]:
     return links
 
 
+# The triggers the minirootfs' packages may hold (`lib/apk/db/triggers`: a
+# package's C: and the paths it watches), and what of busybox's trigger the
+# image doesn't reproduce: `busybox --install -s` makes nothing new (the
+# minirootfs has every link; `busybox_links`), but `depmod` for a modules
+# directory, and bbsuid's and busybox-extras' installs, are left out, so a
+# package bringing any of those paths is refused.
+KNOWN_TRIGGERS = {
+    "busybox": ("/bin", "/usr/bin", "/sbin", "/usr/sbin", "/lib/modules/*", "/usr/lib/modules/*")
+}
+BUSYBOX_UNREPRODUCED = ("lib/modules", "usr/lib/modules", "bin/bbsuid", "bin/busybox-extras")
+
+
+def check_triggers(minirootfs: Path, installed: dict[str, Package]) -> None:
+    """Every trigger the minirootfs holds is one `KNOWN_TRIGGERS` lists:
+    the package its C: names, watching exactly those paths. Another one
+    (a minirootfs bump's) fails, so nothing a trigger does goes missing
+    from the image unnoticed."""
+    path = minirootfs / "lib/apk/db/triggers"
+    text = path.read_text() if path.is_file() else ""
+    by_checksum = {p.checksum: p.name for p in installed.values() if p.checksum}
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        checksum, *paths = line.split()
+        name = by_checksum.get(checksum)
+        if name is None or KNOWN_TRIGGERS.get(name) != tuple(paths):
+            raise LockError(
+                f"{path}:{n}: a trigger the image doesn't reproduce ({name or checksum}: "
+                f"{' '.join(paths)}): work out what it does and add it to KNOWN_TRIGGERS"
+            )
+
+
 def sha256_file(path: Path) -> str:
     with open(path, "rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
-# Install scripts the image reproduces statically: (package, script) to how,
-# printed by `stage`; tools/mkrootfs-dev.sh does the reproducing. Empty: no
-# locked package carries a script (#344). A lock bump that brings one fails
-# `stage` until it is worked out and listed here.
-HANDLED_SCRIPTS: dict[tuple[str, str], str] = {}
+# Install scripts the image reproduces statically: (package, script, the
+# script's sha256) to how, printed by `stage`; tools/mkrootfs-dev.sh does the
+# reproducing. Empty: no locked package carries a script (#344). A lock bump
+# that brings one, or changes a listed one, fails `stage` until it is worked
+# out and listed here.
+HANDLED_SCRIPTS: dict[tuple[str, str, str], str] = {}
 
 
 @dataclass(frozen=True)
@@ -701,24 +787,32 @@ def stage(lock: Lock, apk_dir: Path, minirootfs: Path, dest: Path) -> Staged:
         apks.append((pkg.name, split_apk(data)))
     handled = []
     for name, apk in apks:
-        for script in apk.scripts:
-            how = HANDLED_SCRIPTS.get((name, script))
+        for script, sha in apk.scripts:
+            how = HANDLED_SCRIPTS.get((name, script, sha))
             if how is None:
                 raise LockError(
-                    f"{name} carries {script}, which the image never runs: work out what it "
-                    "does, reproduce it in tools/mkrootfs-dev.sh and list it in "
+                    f"{name} carries {script} (sha256 {sha}), which the image never runs: work "
+                    "out what it does, reproduce it in tools/mkrootfs-dev.sh and list it in "
                     "tools/alpine-lock.py's HANDLED_SCRIPTS"
                 )
             handled.append((name, script, how))
-    owned = owned_paths((minirootfs / "lib/apk/db/installed").read_text())
+    installed_db = (minirootfs / "lib/apk/db/installed").read_text()
+    check_triggers(minirootfs, parse_index(installed_db, "installed"))
+    owned = owned_paths(installed_db)
     links = frozenset(busybox_links(dest, owned))
     replaced: set[str] = set()
     dir_modes: dict[Path, int] = {}
     for _, apk in apks:
-        out = extract_data(apk, dest, links - replaced)
+        out = extract_data(apk, dest, links - replaced, dir_modes)
         replaced |= out.replaced
         dir_modes |= out.dir_modes
     apply_dir_modes(dir_modes)
+    for rel in BUSYBOX_UNREPRODUCED:
+        if os.path.lexists(dest / rel):
+            raise LockError(
+                f"{rel} is in the image: busybox's trigger would act on it, which mkrootfs-dev.sh "
+                "doesn't reproduce"
+            )
     return Staged(tuple(handled), tuple(sorted(replaced)))
 
 
@@ -746,10 +840,16 @@ def image_size(stage_dir: Path) -> ImageSize:
     sit in its inode (60 bytes or more); then 64 MiB of free space and a
     quarter more inodes (at least 4096) for what the gates write, and room
     for the inode tables."""
+    if not stage_dir.is_dir() or stage_dir.is_symlink():
+        raise LockError(f"no staged tree at {stage_dir}")
+
+    def unreadable(exc: OSError) -> None:
+        raise exc
+
     content = 0
     inodes = 1
     seen: set[tuple[int, int]] = set()
-    for dirpath, dirnames, filenames in os.walk(stage_dir):
+    for dirpath, dirnames, filenames in os.walk(stage_dir, onerror=unreadable):
         for name in (*dirnames, *filenames):
             st = os.lstat(os.path.join(dirpath, name))
             if (st.st_dev, st.st_ino) in seen:
@@ -767,6 +867,12 @@ def image_size(stage_dir: Path) -> ImageSize:
 
 
 # --- lock: network and command line --------------------------------------------------
+
+
+def mirror_path(repo: str, filename: str) -> str:
+    """Where a mirror laid out as Alpine's keeps a file, under its base URL:
+    `lock` and tools/fetch-alpine-packages.sh both use it."""
+    return f"{ALPINE_BRANCH}/{repo}/{ARCH}/{filename}"
 
 
 def _fetch(url: str) -> bytes:
@@ -797,7 +903,7 @@ def cmd_lock(a: argparse.Namespace) -> int:
     indexes: dict[str, tuple[str, str]] = {}
     parsed = []
     for repo in a.repo or DEFAULT_REPOS:
-        url = f"{a.mirror}/{ALPINE_BRANCH}/{repo}/{ARCH}/APKINDEX.tar.gz"
+        url = f"{a.mirror}/{mirror_path(repo, 'APKINDEX.tar.gz')}"
         print(f"alpine-lock: reading {url}", file=sys.stderr)
         blob = _fetch(url)
         index, description = _read_index(blob, repo)
@@ -808,14 +914,15 @@ def cmd_lock(a: argparse.Namespace) -> int:
     a.apk_dir.mkdir(parents=True, exist_ok=True)
     hashes = {}
     for pkg in resolution.packages:
-        # The index's size and control checksum are what tie a download to
+        # The index's size and control checksum (and the datahash the
+        # control segment carries, checked by split_apk) are what tie a download to
         # the index: a stanza without them can't be locked.
         if pkg.checksum is None or pkg.size is None:
             raise LockError(f"{pkg.repo}: the index gives {pkg.name} no C: or S:")
         path = a.apk_dir / pkg.filename
         downloaded = not path.is_file()
         if downloaded:
-            url = f"{a.mirror}/{ALPINE_BRANCH}/{pkg.repo}/{ARCH}/{pkg.filename}"
+            url = f"{a.mirror}/{mirror_path(pkg.repo, pkg.filename)}"
             print(f"alpine-lock: downloading {pkg.filename}", file=sys.stderr)
             data = _fetch(url)
         else:
@@ -824,6 +931,12 @@ def cmd_lock(a: argparse.Namespace) -> int:
             raise LockError(f"{pkg.filename}: {len(data)} bytes, the index says {pkg.size}")
         if control_checksum(data) != pkg.checksum:
             raise LockError(f"{pkg.filename}: its control segment doesn't match the index's C:")
+        try:
+            parts = split_apk(data)
+        except LockError as exc:
+            raise LockError(f"{pkg.filename}: {exc}") from None
+        if not parts.has_datahash:
+            raise LockError(f"{pkg.filename}: its .PKGINFO gives no datahash for the data segment")
         if downloaded:
             tmp = path.with_suffix(".apk.part")
             tmp.write_bytes(data)
@@ -854,7 +967,7 @@ def cmd_size(a: argparse.Namespace) -> int:
 
 def cmd_files(a: argparse.Namespace) -> int:
     for pkg in parse_lock(a.lock.read_text()).packages:
-        print(pkg.repo, pkg.filename, pkg.sha256)
+        print(mirror_path(pkg.repo, pkg.filename), pkg.filename, pkg.sha256)
     return 0
 
 
@@ -880,7 +993,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     sz.add_argument("stage", type=Path)
     sz.set_defaults(fn=cmd_size)
-    fl = sub.add_parser("files", help="print the lock's `repo file sha256` lines")
+    fl = sub.add_parser("files", help="print the lock's `mirror-path file sha256` lines")
     fl.add_argument("--lock", type=Path, default=ROOT / "tools/alpine-packages.lock")
     fl.set_defaults(fn=cmd_files)
     a = p.parse_args(argv)
