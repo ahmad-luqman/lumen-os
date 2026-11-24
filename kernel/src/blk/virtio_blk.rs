@@ -7,7 +7,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use log::{info, warn};
-use lumen_bcache::{BLOCK_SIZE, BlockCache, BlockDevice, BlockError, BlockInfo, DEFAULT_CAPACITY, SECTOR_SIZE};
+use lumen_bcache::{
+    BLOCK_SIZE, BlockCache, BlockCacheStats, BlockDevice, BlockError, BlockInfo, DEFAULT_CAPACITY, SECTOR_SIZE,
+};
 use lumen_pci::PciAddr;
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::{DeviceStatus, Transport};
@@ -72,7 +74,23 @@ const IRQ_HANDLERS: [fn(); MAX_BLK_DEVICES] = [on_irq::<0>, on_irq::<1>, on_irq:
 pub struct BlkEntry {
     pub id: usize,
     pub dev: Arc<VirtioBlkDevice>,
-    pub cache: Arc<SleepMutex<BlockCache<Arc<VirtioBlkDevice>>>>,
+    /// Reached only through [`Self::stats`] and [`Self::into_cache`]: a
+    /// volume mounted on it reaches it through its own seam (`ext4`'s
+    /// `LatchedCache`, #349), never through the registry.
+    cache: Arc<SleepMutex<BlockCache<Arc<VirtioBlkDevice>>>>,
+}
+
+impl BlkEntry {
+    /// Its block cache's statistics, for `lsblk`.
+    pub fn stats(&self) -> BlockCacheStats {
+        self.cache.lock().stats()
+    }
+
+    /// Its block cache, for `vfs::init` alone, which mounts it behind the
+    /// volume's seam.
+    pub fn into_cache(self) -> Arc<SleepMutex<BlockCache<Arc<VirtioBlkDevice>>>> {
+        self.cache
+    }
 }
 
 #[derive(Clone)]
@@ -122,16 +140,6 @@ pub fn device(id: usize) -> Option<Arc<VirtioBlkDevice>> {
     let slots = SLOTS.lock();
     match slots.get(id) {
         Some(SlotState::Bound(entry)) => Some(entry.dev.clone()),
-        _ => None,
-    }
-}
-
-/// Look up a bound device's [`BlockCache`] by logical id (`0..MAX_BLK_DEVICES`).
-#[allow(dead_code, reason = "consumed by the VFS ext4 adapter (#253)")]
-pub fn cache(id: usize) -> Option<Arc<SleepMutex<BlockCache<Arc<VirtioBlkDevice>>>>> {
-    let slots = SLOTS.lock();
-    match slots.get(id) {
-        Some(SlotState::Bound(entry)) => Some(entry.cache.clone()),
         _ => None,
     }
 }

@@ -244,6 +244,8 @@ struct MemFs {
     dev: DevId,
     name: &'static str,
     read_only: bool,
+    /// Gone read-only after an error (`FileSystem::errored`), set by a test.
+    errored: AtomicBool,
     next_ino: Arc<AtomicU64>,
     registry: InodeRegistry,
     root: Arc<MemInode>,
@@ -256,7 +258,8 @@ impl MemFs {
         let next_ino = Arc::new(AtomicU64::new(2));
         let root = MemInode::new_dir(dev, 1, 0o755, None, Arc::clone(&registry), Arc::clone(&next_ino));
         root.inner.lock().unwrap().parent = Some(Arc::downgrade(&root));
-        Arc::new(Self { dev, name, read_only, next_ino, registry, root, rename_lock: Mutex::new(()) })
+        let errored = AtomicBool::new(false);
+        Arc::new(Self { dev, name, read_only, errored, next_ino, registry, root, rename_lock: Mutex::new(()) })
     }
 
     fn add_char_device(&self, parent: &Arc<MemInode>, name: &[u8], mode: u16, rdev: DevId) -> Arc<MemInode> {
@@ -321,7 +324,12 @@ impl FileSystem for MemFs {
 
     fn read_only(&self) -> bool {
         assert_test_lock9_free();
-        self.read_only
+        self.read_only || self.errored.load(Ordering::Acquire)
+    }
+
+    fn errored(&self) -> bool {
+        assert_test_lock9_free();
+        self.errored.load(Ordering::Acquire)
     }
 
     fn with_rename_lock(&self, f: &mut dyn FnMut() -> Result<(), VfsError>) -> Result<(), VfsError> {
@@ -5391,13 +5399,14 @@ fn list_mounts_and_mounts_with_fs_ask_the_filesystems_after_releasing_lock9() {
     let mp = root_fs.root_inode().mkdir(b"mnt", 0o755).unwrap();
     let tmp_fs = MemFs::new(DevId::TMPFS, "tmpfs", true);
     env.mount(mp, "/mnt", Arc::clone(&tmp_fs) as Arc<dyn FileSystem>).unwrap();
-    let info = |dev_id, fs_name, mount_path: &str, read_only| MountInfo {
+    let info = |dev_id, fs_name, mount_path: &str, read_only, errored| MountInfo {
         dev_id,
         fs_name,
         mount_path: String::from(mount_path),
         read_only,
+        errored,
     };
-    let expected = vec![info(DevId::ROOT, "ext4", "/", false), info(DevId::TMPFS, "tmpfs", "/mnt", true)];
+    let expected = vec![info(DevId::ROOT, "ext4", "/", false, false), info(DevId::TMPFS, "tmpfs", "/mnt", true, false)];
     assert_eq!(env.list_mounts(), expected);
     let mounts = env.mounts_with_fs();
     let rows: Vec<MountInfo> = mounts.iter().map(|(row, _)| row.clone()).collect();
@@ -5405,6 +5414,13 @@ fn list_mounts_and_mounts_with_fs_ask_the_filesystems_after_releasing_lock9() {
     let addr = |fs: &Arc<dyn FileSystem>| Arc::as_ptr(fs).cast::<()>();
     assert_eq!(addr(&mounts[0].1), Arc::as_ptr(&root_fs).cast::<()>());
     assert_eq!(addr(&mounts[1].1), Arc::as_ptr(&tmp_fs).cast::<()>());
+    // A filesystem gone read-only after an error is asked again each time:
+    // read-only now, and errored.
+    root_fs.errored.store(true, Ordering::Release);
+    let errored = vec![info(DevId::ROOT, "ext4", "/", true, true), info(DevId::TMPFS, "tmpfs", "/mnt", true, false)];
+    assert_eq!(env.list_mounts(), errored);
+    let rows: Vec<MountInfo> = env.mounts_with_fs().into_iter().map(|(row, _)| row).collect();
+    assert_eq!(rows, errored);
 }
 
 #[test]

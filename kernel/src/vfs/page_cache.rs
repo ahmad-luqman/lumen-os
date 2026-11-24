@@ -75,8 +75,10 @@ static HARD_LIMIT_WARNED: AtomicBool = AtomicBool::new(false);
 /// Log (once per crossing of the hard limit) that an `ext4` page was
 /// refused, to a write or a mapping ([`PageCache::admit_unreclaimable`]).
 /// The cache is full of pages reclaim can't drop: dirty pages whose
-/// writeback keeps failing (its own warning names the inode), or pages
-/// pinned by mappings, which only unmapping frees. Writes and new mapped
+/// writeback keeps failing (its own warning names the inode) or that
+/// belong to a volume a failed write made read-only (#349: never written
+/// back, so never freed until reboot; that volume's own ERROR line says
+/// so), or pages pinned by mappings, which only unmapping frees. Writes and new mapped
 /// pages of any linked file (detached files use their own quota) now fail
 /// with `ENOSPC`.
 fn note_hard_limit_refusal() {
@@ -506,6 +508,13 @@ impl MappedPage {
         self.page.copy_to_frame(dst, self.valid_len());
     }
 
+    /// Whether the page's volume has gone read-only since the mapping was
+    /// made (`errors=remount-ro`, #349): a store fault on it is then a bus
+    /// error, as Linux's `page_mkwrite` refuses on a shut-down `ext4`.
+    pub(crate) fn volume_read_only(&self) -> bool {
+        mapped_read_only(&*self.owner)
+    }
+
     /// Count one `PRESENT | WRITABLE | PTE_SHARED` mapping of the page: mark
     /// it dirty and raise its writable-mapping count together, before the
     /// caller makes the PTE writable. The returned [`WritableMap`] lowers
@@ -642,6 +651,21 @@ pub(crate) fn mappable(inode: &dyn VfsInode) -> bool {
     inode.inode_type() == lumen_vfs::InodeType::File && page_cache_lock(inode).is_some()
 }
 
+/// Whether `inode`'s volume refuses writing through a shared mapping: a new
+/// writable one (`EROFS`), a store fault or promotion on an older one (a
+/// bus error) and `mprotect(+W)` (`EACCES`). An `ext4` one read-only,
+/// mounted so or errored since its descriptor was opened `O_RDWR`
+/// (`errors=remount-ro`, #349), unless the file is detached (open but
+/// unlinked: all in memory, as its `write` is). Asked of the inode's own
+/// filesystem, so a volume outside the mount table (a ktest's) answers too;
+/// `tmpfs` never refuses.
+pub(crate) fn mapped_read_only(inode: &dyn VfsInode) -> bool {
+    inode
+        .as_any()
+        .and_then(|any| any.downcast_ref::<super::ext4::Ext4Inode>())
+        .is_some_and(super::ext4::Ext4Inode::volume_read_only)
+}
+
 /// The `PageCache` lock (Lock 5) of an `ext4` or `tmpfs` inode.
 fn page_cache_lock(inode: &dyn VfsInode) -> Option<&SleepMutex<PageCache>> {
     let any = inode.as_any()?;
@@ -701,7 +725,7 @@ pub(crate) mod ktest_files {
 
     use super::super::build_minimal_ext4_image_blocks;
     use super::super::ext4::ktest_util::{self, Mnt};
-    use super::super::ext4::{BlockCacheBackend, Ext4FileSystem, Ext4Inode};
+    use super::super::ext4::{Ext4FileSystem, Ext4Inode, LatchableCache};
 
     /// A fresh writable `ext4` volume (1 MiB) on an in-memory disk, behind
     /// `ext4::ktest_util`'s fault-injecting block cache.
@@ -728,7 +752,7 @@ pub(crate) mod ktest_files {
         /// [`Self::mount_device_copy_ro`], which mounts a copy without
         /// syncing.)
         pub(crate) fn remount_ro(&self, minor: u32) -> Result<Arc<dyn VfsInode>, &'static str> {
-            let backend: Arc<dyn BlockCacheBackend> = Arc::clone(&self.mnt.cache) as Arc<dyn BlockCacheBackend>;
+            let backend: Arc<dyn LatchableCache> = Arc::clone(&self.mnt.cache) as Arc<dyn LatchableCache>;
             let fs = Ext4FileSystem::mount(backend, DevId::makedev(0, minor), true).map_err(|_| "ro mount")?;
             Ok(fs.root_inode())
         }
@@ -1932,7 +1956,7 @@ crate::ktest!(
 
         let img = crate::vfs::build_minimal_ext4_image_blocks(256);
         let dev = crate::vfs::MemBlkDev::new(img, false);
-        let bcache: Arc<dyn ext4::BlockCacheBackend> =
+        let bcache: Arc<dyn ext4::LatchableCache> =
             Arc::new(crate::sync::SleepMutex::new(BlockCache::new(dev, 64).map_err(|_| "bcache")?));
         let devid = lumen_vfs::DevId::makedev(0, 231);
         let fs = ext4::Ext4FileSystem::mount(Arc::clone(&bcache), devid, false).map_err(|_| "mount")?;

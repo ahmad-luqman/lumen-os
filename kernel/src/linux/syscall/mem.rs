@@ -16,7 +16,9 @@
 //!   neither; no file here is on DAX). Either way `PROT_WRITE` needs the
 //!   descriptor open for writing (`EACCES`), which is also what lets a
 //!   later `mprotect` add it (`VM_MAYWRITE`: `O_RDWR`, recorded from the
-//!   description itself by `user_vm::MappedFile::of`);
+//!   description itself by `user_vm::MappedFile::of`), on a volume still
+//!   writable (an `ext4` one errored read-only since the open, #349:
+//!   `EROFS` for `PROT_WRITE`, and no `VM_MAYWRITE`);
 //! - `MAP_PRIVATE`: copy-on-write, writable whatever the descriptor's mode;
 //! - anything else: `EINVAL`.
 //!
@@ -154,6 +156,13 @@ fn mmap_fd(addr: u64, len: u64, prot: lumen_vm::Prot, flags: u64, fd: Fd, off: u
     if !dev_zero && !page_cache::mappable(&**inode) {
         return Err(errno::ENODEV);
     }
+    // An `ext4` volume gone read-only since the descriptor was opened
+    // (`errors=remount-ro`, #349) takes no new shared writable mapping, nor
+    // one `mprotect` could make writable later.
+    let mount_writable = dev_zero || !page_cache::mapped_read_only(&**inode);
+    if sharing == Sharing::Shared && prot.write() && !mount_writable {
+        return Err(errno::EROFS);
+    }
     if flags & u64::from(general::MAP_GROWSDOWN) != 0 {
         return Err(errno::EINVAL); // Linux's `vma_flags_can_grow`
     }
@@ -163,7 +172,7 @@ fn mmap_fd(addr: u64, len: u64, prot: lumen_vm::Prot, flags: u64, fd: Fd, off: u
         // Anonymous memory, placed as asked (shared alike until M8).
         return space.map_anon_at(place, len, prot).map_err(|e| e.to_errno());
     }
-    space.mmap_file(place, len, prot, MappedFile::of(&file), off, sharing).map_err(|e| e.to_errno())
+    space.mmap_file(place, len, prot, MappedFile::of(&file, mount_writable), off, sharing).map_err(|e| e.to_errno())
 }
 
 pub(super) fn sys_mprotect(addr: u64, len: u64, prot_raw: u64) -> u64 {

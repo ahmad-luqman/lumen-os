@@ -25,6 +25,9 @@ pub struct BlockCacheStats {
     pub evictions: u64,
     /// Number of dirty block writebacks issued to the underlying device.
     pub writebacks: u64,
+    /// Number of block writebacks and flushes the device failed
+    /// ([`BlockCache::writeback_failures`]).
+    pub writeback_failures: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +56,18 @@ impl Slot {
     }
 }
 
+/// Whether a cache writes back to its device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Writeback {
+    Running,
+    /// `BlockCache::stop_writeback` (test-util), or a failure under
+    /// [`BlockCache::stop_writeback_on_failure`]: nothing is written to the
+    /// device or flushed; writes into the cache are still taken.
+    Stopped,
+    /// [`BlockCache::freeze`]: stopped, and writes into the cache refused.
+    Frozen,
+}
+
 struct CacheInner {
     capacity: usize,
     slots: Vec<Slot>,
@@ -61,10 +76,17 @@ struct CacheInner {
     mru_head: Option<usize>,
     lru_tail: Option<usize>,
     needs_device_flush: bool,
+    writeback: Writeback,
+    /// [`BlockCache::stop_writeback_on_failure`]: the first failed device
+    /// write or flush stops writeback.
+    stop_on_failure: bool,
+    /// The first device write or flush that failed ([`BlockCache::first_failure`]).
+    first_failure: Option<BlockError>,
     hits: u64,
     misses: u64,
     evictions: u64,
     writebacks: u64,
+    writeback_failures: u64,
 }
 
 impl CacheInner {
@@ -77,10 +99,14 @@ impl CacheInner {
             mru_head: None,
             lru_tail: None,
             needs_device_flush: false,
+            writeback: Writeback::Running,
+            stop_on_failure: false,
+            first_failure: None,
             hits: 0,
             misses: 0,
             evictions: 0,
             writebacks: 0,
+            writeback_failures: 0,
         }
     }
 
@@ -119,10 +145,14 @@ impl CacheInner {
         self.link_mru(idx);
     }
 
+    /// The least recently used unpinned slot; a clean one while writeback
+    /// is stopped (a dirty one would be written back first).
     fn find_lru_unpinned(&self) -> Option<usize> {
         let mut cur = self.lru_tail;
         while let Some(idx) = cur {
-            if self.slots[idx].pin_count == 0 {
+            let evictable = self.writeback == Writeback::Running
+                || matches!(self.slots[idx].state, SlotState::Occupied { dirty: false, .. });
+            if self.slots[idx].pin_count == 0 && evictable {
                 return Some(idx);
             }
             cur = self.slots[idx].prev;
@@ -143,6 +173,10 @@ pub struct BlockCache<B: BlockDevice> {
     total_bytes: u64,
     total_blocks: u64,
     inner: RefCell<CacheInner>,
+    /// One block's room for [`Self::read_uncached`]'s partial blocks:
+    /// allocated with the cache, so nothing is allocated (or put on the
+    /// stack) on that path.
+    scratch: RefCell<Box<[u8]>>,
 }
 
 impl<B: BlockDevice> BlockCache<B> {
@@ -170,6 +204,7 @@ impl<B: BlockDevice> BlockCache<B> {
             total_bytes,
             total_blocks,
             inner: RefCell::new(CacheInner::new(capacity)),
+            scratch: RefCell::new(alloc::vec![0u8; BLOCK_SIZE].into_boxed_slice()),
         })
     }
 
@@ -208,6 +243,99 @@ impl<B: BlockDevice> BlockCache<B> {
         self.inner.borrow().needs_device_flush
     }
 
+    /// Write nothing more to the device or flush it, for good unless
+    /// [`Self::thaw`]ed, while still taking writes into the cache:
+    /// [`Self::sync`] and [`Self::flush_blocks`] return
+    /// [`BlockError::ReadOnly`] without writing or flushing anything, and
+    /// eviction takes only clean slots, so dirty blocks stay cached and keep
+    /// being read (a [`Self::read_at`] miss while every unpinned slot is
+    /// dirty is read from the device, uncached; a write or pin miss returns
+    /// [`BlockError::CacheFull`]). For a filesystem that stops writing after
+    /// a write error (`ext4`'s `errors=remount-ro`).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn stop_writeback(&self) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.writeback == Writeback::Running {
+            inner.writeback = Writeback::Stopped;
+        }
+    }
+
+    /// From now on, the first device write or flush that fails stops
+    /// writeback (`stop_writeback`) before the call that met it
+    /// returns, so nothing else reaches the device after it. Off by
+    /// default: a failed block then stays dirty and the next writeback
+    /// tries it again.
+    pub fn stop_writeback_on_failure(&self) {
+        self.inner.borrow_mut().stop_on_failure = true;
+    }
+
+    /// Whether writeback is stopped (`stop_writeback` (test-util),
+    /// [`Self::freeze`], or a failure under
+    /// [`Self::stop_writeback_on_failure`]).
+    pub fn writeback_stopped(&self) -> bool {
+        self.inner.borrow().writeback != Writeback::Running
+    }
+
+    /// Stop writeback for good and refuse writes into the cache too:
+    /// nothing more is written to the device or flushed ([`Self::sync`]
+    /// and [`Self::flush_blocks`] return [`BlockError::ReadOnly`], eviction
+    /// takes only clean slots, a miss with none is read uncached), and
+    /// [`Self::write_at`] and [`Self::pin_mut`] return
+    /// [`BlockError::ReadOnly`]; reads and read pins still work. Nothing
+    /// outside the tests undoes it (`thaw` is `test-util` only).
+    pub fn freeze(&self) {
+        self.inner.borrow_mut().writeback = Writeback::Frozen;
+    }
+
+    /// Undo [`Self::freeze`] and [`Self::stop_writeback`]: for tests reading
+    /// back what such a cache holds.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn thaw(&self) {
+        self.inner.borrow_mut().writeback = Writeback::Running;
+    }
+
+    /// How many block writebacks and flushes the device has failed: an
+    /// eviction's (which fails the `read_at`, `write_at` or pin whose miss
+    /// needed the slot, a read included), a sync's block (the sync stops
+    /// there) or a sync's flush (what it wrote may not be durable), for
+    /// statistics; [`Self::first_failure`], set at the first of them, is
+    /// what tells a caller that a device write failed (a call's error alone
+    /// can't say: a pre-read, a full cache).
+    pub fn writeback_failures(&self) -> u64 {
+        self.inner.borrow().writeback_failures
+    }
+
+    /// Whether [`Self::freeze`] stopped the cache's writes.
+    pub fn is_frozen(&self) -> bool {
+        self.inner.borrow().writeback == Writeback::Frozen
+    }
+
+    /// The first device write or flush that failed, kept for good (a
+    /// `thaw` (test-util) doesn't clear it): one call after another tells
+    /// whether a device write failed, whatever that call returned.
+    pub fn first_failure(&self) -> Option<BlockError> {
+        self.inner.borrow().first_failure
+    }
+
+    /// `ReadOnly` for a write while the device or the cache is read-only.
+    fn check_writable(&self) -> Result<(), BlockError> {
+        if self.info.read_only || self.inner.borrow().writeback == Writeback::Frozen {
+            Err(BlockError::ReadOnly)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A device write or flush failed: counted, and writeback stopped if
+    /// [`Self::stop_writeback_on_failure`] asked for it.
+    fn note_device_failure(inner: &mut CacheInner, err: BlockError) {
+        inner.writeback_failures += 1;
+        inner.first_failure.get_or_insert(err);
+        if inner.stop_on_failure && inner.writeback == Writeback::Running {
+            inner.writeback = Writeback::Stopped;
+        }
+    }
+
     /// Current cache statistics snapshot.
     pub fn stats(&self) -> BlockCacheStats {
         let inner = self.inner.borrow();
@@ -231,6 +359,7 @@ impl<B: BlockDevice> BlockCache<B> {
             misses: inner.misses,
             evictions: inner.evictions,
             writebacks: inner.writebacks,
+            writeback_failures: inner.writeback_failures,
         }
     }
 
@@ -287,24 +416,36 @@ impl<B: BlockDevice> BlockCache<B> {
                 let data_ptr: *const RefCell<[u8; BLOCK_SIZE]> = &*inner.slots[victim_idx].data;
                 drop(inner);
 
+                // `Ok(Err(_))`: the device's failure; `Err(_)`: the block busy.
                 let write_res = {
                     // SAFETY: `victim_idx` has `pin_count > 0` and its slot `Box` is never moved/dropped
                     // while `BlockCache` is borrowed; `BlockCache` is `!Sync`.
-                    let guard = unsafe { &*data_ptr }.try_borrow().map_err(|_| BlockError::CacheFull);
-                    match guard {
-                        Ok(buf) => self.device.write_sectors(old_lba, &buf[..old_valid_bytes]),
-                        Err(e) => Err(e),
+                    match unsafe { &*data_ptr }.try_borrow() {
+                        Ok(buf) => Ok(self.device.write_sectors(old_lba, &buf[..old_valid_bytes])),
+                        Err(_) => Err(BlockError::CacheFull),
                     }
                 };
 
                 let mut inner = self.inner.borrow_mut();
                 inner.slots[victim_idx].pin_count -= 1;
                 match write_res {
-                    Ok(()) => {
+                    Ok(Ok(())) => {
                         inner.slots[victim_idx].state = SlotState::Occupied { block_id: old_block_id, dirty: false };
                         inner.writebacks += 1;
                         inner.needs_device_flush = true;
                         // Continue loop: re-check victim cleanly and evict it (or hit if somehow present).
+                    }
+                    Ok(Err(e)) => {
+                        Self::note_device_failure(&mut inner, e);
+                        if inner.writeback == Writeback::Running {
+                            return Err(e);
+                        }
+                        // Writeback stopped at this failure
+                        // (`stop_writeback_on_failure`): the victim stays
+                        // dirty for good, and the miss looks again, for a
+                        // clean slot or none (`CacheFull`, which a read
+                        // serves past the cache). The failure is kept in
+                        // `first_failure` for the caller to see.
                     }
                     Err(e) => return Err(e),
                 }
@@ -365,9 +506,7 @@ impl<B: BlockDevice> BlockCache<B> {
 
     /// Pin 4 KiB block `block_id` for exclusive mutable access.
     pub fn pin_mut(&self, block_id: u64) -> Result<PinnedBlockMut<'_, B>, BlockError> {
-        if self.info.read_only {
-            return Err(BlockError::ReadOnly);
-        }
+        self.check_writable()?;
         let slot_idx = self.ensure_slot(block_id, false)?;
         let mut inner = self.inner.borrow_mut();
         let data_ptr: *const RefCell<[u8; BLOCK_SIZE]> = &*inner.slots[slot_idx].data;
@@ -401,7 +540,16 @@ impl<B: BlockDevice> BlockCache<B> {
             let in_block = (cur_off % BLOCK_SIZE as u64) as usize;
             let chunk = (dst.len() - written).min(BLOCK_SIZE - in_block);
 
-            let slot_idx = self.ensure_slot(block_id, false)?;
+            let slot_idx = match self.ensure_slot(block_id, false) {
+                Ok(slot_idx) => slot_idx,
+                Err(BlockError::CacheFull) if self.reads_past_the_cache(block_id) => {
+                    self.read_uncached(block_id, in_block, &mut dst[written..written + chunk])?;
+                    cur_off += chunk as u64;
+                    written += chunk;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let inner = self.inner.borrow();
             let buf = inner.slots[slot_idx].data.try_borrow().map_err(|_| BlockError::CacheFull)?;
             dst[written..written + chunk].copy_from_slice(&buf[in_block..in_block + chunk]);
@@ -412,11 +560,32 @@ impl<B: BlockDevice> BlockCache<B> {
         Ok(())
     }
 
+    /// Whether a miss of `block_id` that found no slot may be read past the
+    /// cache: writeback is stopped (so every unpinned slot may be dirty for
+    /// good) and the block isn't cached, so the device holds its bytes.
+    fn reads_past_the_cache(&self, block_id: u64) -> bool {
+        let inner = self.inner.borrow();
+        inner.writeback != Writeback::Running && !inner.index.contains_key(&block_id)
+    }
+
+    /// `dst.len()` bytes of block `block_id` from `in_block` on, read
+    /// straight from the device, not cached: a stopped cache with no clean
+    /// slot still serves reads.
+    fn read_uncached(&self, block_id: u64, in_block: usize, dst: &mut [u8]) -> Result<(), BlockError> {
+        let (lba, valid_bytes) = self.block_extent(block_id)?;
+        if in_block == 0 && dst.len() == valid_bytes {
+            // The whole block: straight into the caller's buffer.
+            return self.device.read_sectors(lba, dst);
+        }
+        let mut block = self.scratch.try_borrow_mut().map_err(|_| BlockError::CacheFull)?;
+        self.device.read_sectors(lba, &mut block[..valid_bytes])?;
+        dst.copy_from_slice(&block[in_block..in_block + dst.len()]);
+        Ok(())
+    }
+
     /// Write `src` starting at byte offset `byte_off`.
     pub fn write_at(&self, byte_off: u64, src: &[u8]) -> Result<(), BlockError> {
-        if self.info.read_only {
-            return Err(BlockError::ReadOnly);
-        }
+        self.check_writable()?;
         let end = byte_off.checked_add(src.len() as u64).ok_or(BlockError::OutOfRange)?;
         if end > self.total_bytes {
             return Err(BlockError::OutOfRange);
@@ -496,6 +665,9 @@ impl<B: BlockDevice> BlockCache<B> {
     }
 
     fn writeback_and_flush(&self, dirty_list: &[(u64, usize)]) -> Result<(), BlockError> {
+        if self.inner.borrow().writeback != Writeback::Running {
+            return Err(BlockError::ReadOnly);
+        }
         {
             let inner = self.inner.borrow();
             for &(block_id, slot_idx) in dirty_list {
@@ -520,17 +692,21 @@ impl<B: BlockDevice> BlockCache<B> {
                 &*inner.slots[slot_idx].data
             };
 
+            // `Ok(Err(_))`: the device's failure; `Err(_)`: the block busy.
             let write_res = {
                 // SAFETY: `slot_idx` is pinned and `BlockCache` is `!Sync`.
                 match unsafe { &*data_ptr }.try_borrow() {
-                    Ok(buf) => self.device.write_sectors(lba, &buf[..valid_bytes]),
+                    Ok(buf) => Ok(self.device.write_sectors(lba, &buf[..valid_bytes])),
                     Err(_) => Err(BlockError::CacheFull),
                 }
             };
 
             let mut inner = self.inner.borrow_mut();
             inner.slots[slot_idx].pin_count -= 1;
-            write_res?;
+            if let Ok(Err(e)) = write_res {
+                Self::note_device_failure(&mut inner, e);
+            }
+            write_res??;
             inner.slots[slot_idx].state = SlotState::Occupied { block_id, dirty: false };
             inner.writebacks += 1;
             inner.needs_device_flush = true;
@@ -538,7 +714,10 @@ impl<B: BlockDevice> BlockCache<B> {
 
         let need_flush = self.inner.borrow().needs_device_flush;
         if need_flush {
-            self.device.flush()?;
+            if let Err(e) = self.device.flush() {
+                Self::note_device_failure(&mut self.inner.borrow_mut(), e);
+                return Err(e);
+            }
             self.inner.borrow_mut().needs_device_flush = false;
         }
         Ok(())

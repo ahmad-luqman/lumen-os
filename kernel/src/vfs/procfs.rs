@@ -255,14 +255,26 @@ fn format_meminfo() -> String {
 }
 
 fn format_mounts() -> String {
-    let mounts = super::list_mounts();
+    format_mounts_of(super::list_mounts())
+}
+
+/// `/proc/mounts`' text for `mounts` (the ktests' own tables' too).
+pub(crate) fn format_mounts_of(mounts: Vec<lumen_vfs::MountInfo>) -> String {
     let mut out = String::new();
     for m in mounts {
         // Outside the ktests the only ext4 mount is the root, always the first
         // virtio-blk disk `vfs::init` found; `/dev` has no block nodes yet, so
         // the name follows Linux's (a ktest's ext4 mount is labelled the same).
         let source = if m.fs_name == "ext4" { "/dev/vda" } else { m.fs_name };
-        let mode = if m.read_only { "ro" } else { "rw" };
+        // An ext4 volume errored read-only (#349) notes why, as Linux shows the
+        // option that made it so.
+        let mode = if m.errored {
+            "ro,errors=remount-ro"
+        } else if m.read_only {
+            "ro"
+        } else {
+            "rw"
+        };
         let _ = writeln!(out, "{source} {} {} {mode} 0 0", m.mount_path, m.fs_name);
     }
     out

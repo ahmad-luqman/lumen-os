@@ -51,7 +51,8 @@ pub enum BlockError {
     Unaligned,
     /// Attempted write on a read-only device or cache.
     ReadOnly,
-    /// All cache slots are currently pinned (no evictable victim slot).
+    /// No evictable victim slot: every slot pinned, or (writeback stopped)
+    /// every unpinned slot dirty.
     CacheFull,
     /// Device returned an I/O error, unsupported status, or malformed completion.
     Io,
@@ -67,7 +68,7 @@ impl fmt::Display for BlockError {
             BlockError::OutOfRange => f.write_str("block address out of range"),
             BlockError::Unaligned => f.write_str("unaligned or empty block transfer"),
             BlockError::ReadOnly => f.write_str("block device is read-only"),
-            BlockError::CacheFull => f.write_str("block cache full (all slots pinned)"),
+            BlockError::CacheFull => f.write_str("block cache full (no evictable slot)"),
             BlockError::Io => f.write_str("block device I/O error"),
             BlockError::Timeout => f.write_str("block device request timed out"),
             BlockError::DeviceFailed => f.write_str("block device failed and was retired"),

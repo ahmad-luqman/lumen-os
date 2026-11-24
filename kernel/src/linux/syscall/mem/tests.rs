@@ -154,14 +154,15 @@ crate::ktest!(
 crate::ktest!(
     fn mem_msync_returns_a_writeback_error_before_enomem() {
         // With the disk's writes failing, `msync(MS_SYNC)` over a mapping
-        // and a hole below it returns the writeback's `EIO`, not `ENOMEM`;
-        // with them working again, it writes the stores (still dirty: the
-        // page is mapped writable) and the disk holds them.
+        // and a hole below it returns the writeback's `EIO`, not `ENOMEM`.
+        // The failed write made the volume read-only (`errors=remount-ro`,
+        // #349): with the disk's writes working again, `msync` still writes
+        // nothing (`EIO`) and the disk keeps its old bytes, and no new
+        // mapping of the file can write it.
         let vol = Arc::new(Ext4Volume::new(236)?);
         let f = file(&vol.root, "failing.bin", &pattern(6)[..P as usize])?;
         f.sync(false).map_err(|_| "sync")?;
-        let mut expected = pattern(6)[..P as usize].to_vec();
-        expected[20..28].copy_from_slice(b"retried!");
+        let expected = pattern(6)[..P as usize].to_vec();
         let (vol2, f2) = (Arc::clone(&vol), Arc::clone(&f));
         let (failed, retried) = in_test_process(move |_| {
             let fd = ktest_install(&f2, b"/ext4/failing.bin", OpenFlags::O_RDWR)?;
@@ -171,11 +172,27 @@ crate::ktest!(
             let failed = sys_msync(va - P, 2 * P, MS_SYNC);
             vol2.fail_writes(false);
             let retried = sys_msync(va, P, MS_SYNC);
+            // On the read-only volume, through the same `O_RDWR` descriptor:
+            // a new shared writable mapping is `EROFS`; a shared read-only
+            // one maps but `mprotect` can't make it writable (`EACCES`, no
+            // `VM_MAYWRITE`); a private one is writable as ever.
+            kassert_eq!(sys_mmap(0, P, RW, SHARED, raw(fd), 0), e(errno::EROFS));
+            let shared_ro = map(P, READ, SHARED, fd, 0)?;
+            kassert_eq!(sys_mprotect(shared_ro, P, RW), e(errno::EACCES));
+            kassert_eq!(sys_munmap(shared_ro, P), 0);
+            let private = map(P, RW, PRIVATE, fd, 0)?;
+            copy_to_user(private, b"private").map_err(|_| "private store")?;
+            kassert_eq!(sys_munmap(private, P), 0);
+            // Nor does `mprotect` refuse write access to a private one.
+            let private_ro = map(P, READ, PRIVATE, fd, 0)?;
+            kassert_eq!(sys_mprotect(private_ro, P, RW), 0);
+            copy_to_user(private_ro, b"private").map_err(|_| "private store after mprotect")?;
+            kassert_eq!(sys_munmap(private_ro, P), 0);
             kassert_eq!(sys_munmap(va, P), 0);
             Ok::<_, &'static str>((failed, retried))
         })??;
         kassert_eq!(failed, e(errno::EIO));
-        kassert_eq!(retried, 0);
+        kassert_eq!(retried, e(errno::EIO));
         kassert!(on_disk(&vol, 237, "failing.bin", P as usize)? == expected);
         Ok(())
     }

@@ -389,7 +389,16 @@ one is its own PR that updates that doc first.
   positional I/O, `fsync` and `sync` ktests); `vfs/ext4.rs`
   the writable adapter over `ext4plus` and the `BlockCache` (writeback,
   Gate 6 open-unlinked detach, `rmdir`/`rename`/inline-symlink workarounds,
-  undoing a namespace operation's disk changes after a write error, the
+  undoing a namespace operation's disk changes after a write error, then
+  `errors=remount-ro`: the first failed device write, told by the block
+  cache's `first_failure` (`LatchableCache`, the controls only the caches
+  below the latch have) and latched at `LatchedCache`, the one seam the
+  volume holds, makes the volume read-only (syncs stop there, older shared
+  mappings get no new writable PTE, a miss with no clean slot read
+  uncached, an operation running then `EIO`, `WriteOp::end`) and
+  freezes its block cache when the last write-type operation (`WriteOp`,
+  naming the one that met it) ends, or at once for a read's eviction with
+  none running, #349; the
   link counts kept in memory when an undo fails (`NlinkBounds` through
   `write_links_or_pin`/`raise_links_or_floor`); `rename` split into
   `Exchange` (`RENAME_EXCHANGE`: `run`, `roll_back`, `finish`), `MoveEntry`

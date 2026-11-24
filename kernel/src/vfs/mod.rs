@@ -200,26 +200,27 @@ pub fn init() {
             continue;
         }
         let hw_ro = entry.dev.info().read_only;
-        let cache: Arc<dyn ext4::BlockCacheBackend> = entry.cache;
+        let id = entry.id;
+        let cache: Arc<dyn ext4::LatchableCache> = entry.into_cache();
         match has_ext4_magic(&*cache) {
             Ok(true) => {}
             Ok(false) => {
-                debug!(target: "vfs", "blk{}: no ext4 superblock", entry.id);
+                debug!(target: "vfs", "blk{}: no ext4 superblock", id);
                 continue;
             }
             Err(err) => {
-                warn!(target: "vfs", "blk{}: can't read the superblock: {err:?}", entry.id);
+                warn!(target: "vfs", "blk{}: can't read the superblock: {err:?}", id);
                 continue;
             }
         }
         match ext4::Ext4FileSystem::mount(cache, DevId::ROOT, hw_ro) {
             Ok(fs) => {
                 EXT4_FILESYSTEMS.lock().push(Arc::clone(&fs));
-                mounted_ext4 = Some((entry.id, fs));
+                mounted_ext4 = Some((id, fs));
                 break;
             }
             Err(err) => {
-                warn!(target: "vfs", "blk{}: has an ext4 superblock but won't mount: {err:?}", entry.id);
+                warn!(target: "vfs", "blk{}: has an ext4 superblock but won't mount: {err:?}", id);
             }
         }
     }
@@ -279,6 +280,11 @@ pub fn init() {
 /// (`used` and `limit`, in bytes; `-` for any other filesystem): with them
 /// an `ENOSPC` on `/tmp` can be checked against what its files take (#324).
 pub fn mount_table() -> pipe::Table {
+    mount_table_of(&TABLES)
+}
+
+/// [`mount_table`] over `tables` (the ktests' own tables too).
+pub(crate) fn mount_table_of(tables: &KernelVfsTables) -> pipe::Table {
     const COLUMNS: [Column; 6] = [
         Column::new("target", Kind::Text, Align::Left, 6),
         Column::new("fs", Kind::Text, Align::Left, 6),
@@ -290,13 +296,20 @@ pub fn mount_table() -> pipe::Table {
     let mut t = pipe::Table::new(&COLUMNS);
     // One snapshot, taken under Lock 9; each filesystem is asked after it
     // is released.
-    for (m, fs) in TABLES.mounts_with_fs() {
+    for (m, fs) in tables.mounts_with_fs() {
         let quota = tmpfs::quota_use(fs.as_ref());
         t.push(vec![
             Value::Text(m.mount_path),
             sysinfo::text(m.fs_name),
             Value::Text(format!("{}", m.dev_id)),
-            sysinfo::text(if m.read_only { "ro" } else { "rw" }),
+            // An ext4 volume errored read-only says so (#349).
+            sysinfo::text(if m.errored {
+                "ro,errors"
+            } else if m.read_only {
+                "ro"
+            } else {
+                "rw"
+            }),
             quota.map_or(sysinfo::DASH, |q| sysinfo::int(q.used_bytes)),
             quota.map_or(sysinfo::DASH, |q| sysinfo::int(q.limit_bytes)),
         ]);
@@ -1519,7 +1532,7 @@ pub fn log_ext4_crate_summary() {
 #[cfg(feature = "ktest")]
 pub(crate) fn ktest_ext4(dev_minor: u32) -> Result<Arc<ext4::Ext4FileSystem>, &'static str> {
     let mem_dev = MemBlkDev::new(build_minimal_ext4_image_blocks(256), false);
-    let bcache: Arc<dyn ext4::BlockCacheBackend> =
+    let bcache: Arc<dyn ext4::LatchableCache> =
         Arc::new(SleepMutex::new(lumen_bcache::BlockCache::new(mem_dev, 64).map_err(|_| "bcache init")?));
     ext4::Ext4FileSystem::mount(bcache, DevId::makedev(0, dev_minor), false).map_err(|_| "ext4 mount")
 }
@@ -1560,6 +1573,14 @@ struct MemBlkDevInner {
     /// device error under a real `BlockCache`, where it surfaces only when
     /// the cache writes a block back (#331).
     fail_device_writes: core::sync::atomic::AtomicBool,
+    /// The device writes that landed.
+    writes: core::sync::atomic::AtomicUsize,
+    /// Fail the device write attempt by this number, counting from
+    /// `fail_nth_device_write` (0: none), and keep the device's write count
+    /// and bytes as they were then (`at_failure`).
+    fail_nth: core::sync::atomic::AtomicUsize,
+    attempts: core::sync::atomic::AtomicUsize,
+    at_failure: SleepMutex<Option<(usize, Vec<u8>)>>,
 }
 
 #[cfg(feature = "ktest")]
@@ -1570,6 +1591,10 @@ impl MemBlkDev {
             read_only,
             flushed: core::sync::atomic::AtomicBool::new(false),
             fail_device_writes: core::sync::atomic::AtomicBool::new(false),
+            writes: core::sync::atomic::AtomicUsize::new(0),
+            fail_nth: core::sync::atomic::AtomicUsize::new(0),
+            attempts: core::sync::atomic::AtomicUsize::new(0),
+            at_failure: SleepMutex::new(None),
         }))
     }
 
@@ -1583,6 +1608,23 @@ impl MemBlkDev {
     /// The device's bytes as they are.
     fn bytes(&self) -> Vec<u8> {
         self.0.data.lock().clone()
+    }
+
+    /// Fail only the `nth` device write attempt from now (#349), keeping the
+    /// write count and bytes of that moment for `at_failure`.
+    fn fail_nth_device_write(&self, nth: usize) {
+        self.0.attempts.store(0, core::sync::atomic::Ordering::Release);
+        self.0.fail_nth.store(nth, core::sync::atomic::Ordering::Release);
+    }
+
+    /// The device writes that landed so far.
+    fn writes(&self) -> usize {
+        self.0.writes.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The write count and bytes when `fail_nth_device_write`'s write failed.
+    fn at_failure(&self) -> Option<(usize, Vec<u8>)> {
+        self.0.at_failure.lock().clone()
     }
 }
 
@@ -1613,10 +1655,17 @@ impl lumen_bcache::BlockDevice for MemBlkDev {
         if self.0.fail_device_writes.load(core::sync::atomic::Ordering::Acquire) {
             return Err(lumen_bcache::BlockError::Io);
         }
+        let attempt = self.0.attempts.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
+        if attempt == self.0.fail_nth.load(core::sync::atomic::Ordering::Acquire) {
+            let bytes = self.0.data.lock().clone();
+            *self.0.at_failure.lock() = Some((self.writes(), bytes));
+            return Err(lumen_bcache::BlockError::Io);
+        }
         let off = (lba * 512) as usize;
         let mut guard = self.0.data.lock();
         let slice = guard.get_mut(off..off + src.len()).ok_or(lumen_bcache::BlockError::OutOfRange)?;
         slice.copy_from_slice(src);
+        self.0.writes.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         Ok(())
     }
 

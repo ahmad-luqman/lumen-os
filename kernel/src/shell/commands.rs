@@ -909,11 +909,11 @@ impl Going {
 /// The block cache writes its dirty blocks back in block order and stops at
 /// the first that fails, before the device flush: the blocks ahead of it
 /// reached the device but were never flushed, and it and the ones after it
-/// are lost. Staying up would save them only if the failure passes (a
-/// failed block stays dirty for the next sync, #331), and whoever suspects
-/// that runs the shell's `sync` command first, as often as they like, which
-/// says the same failure without going anywhere; refusing would make a disk
-/// that keeps failing keep the machine from going down at all.
+/// are lost. On `ext4` that failure makes the volume read-only
+/// (`errors=remount-ro`, #349): it writes nothing more, so this sync
+/// returns `EIO`, and so does every later one, and staying up saves
+/// nothing; the log's ERROR line says so. Refusing to go down would only make a disk
+/// that failed keep the machine up.
 fn sync_then_announce(ctx: &mut Ctx<'_>, going: Going, sync: impl FnOnce() -> Result<(), lumen_vfs::VfsError>) {
     let (command, doing) = (going.command(), going.doing());
     if let Err(e) = sync() {
