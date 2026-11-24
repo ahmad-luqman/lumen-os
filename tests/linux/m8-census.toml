@@ -162,6 +162,11 @@ nr = 22
 calls = 21
 workloads = ["ash", "git", "make"]
 
+[syscalls.select]
+nr = 23
+calls = 65
+workloads = ["vim-pty"]
+
 [syscalls.dup]
 nr = 32
 calls = 8
@@ -174,8 +179,11 @@ workloads = ["ash", "git", "make", "sqlite"]
 
 [syscalls.nanosleep]
 nr = 35
-calls = 1
-workloads = ["ash"]
+calls = 2
+workloads = ["ash", "signals"]
+
+[syscalls.nanosleep.errors]
+ERESTART_RESTARTBLOCK = 1
 
 [syscalls.setitimer]
 nr = 38
@@ -244,11 +252,11 @@ workloads = ["git", "vim", "vim-pty"]
 
 [syscalls.fcntl]
 nr = 72
-calls = 930
+calls = 933
 workloads = ["ash", "gcc", "git", "gpp", "make", "sqlite", "vim", "vim-pty"]
 
 [syscalls.fcntl.args]
-cmd = ["0x1", "0x2", "0x4", "0x5", "0x6", "0x406"]
+cmd = ["0x1", "0x2", "0x3", "0x4", "0x5", "0x6", "0x406"]
 
 [syscalls.fsync]
 nr = 74
@@ -470,7 +478,7 @@ workloads = ["ash", "gcc", "git", "gpp", "make", "pthread", "signals", "sqlite",
 
 [syscalls.pselect6]
 nr = 270
-calls = 2
+calls = 5
 workloads = ["make"]
 
 [syscalls.pselect6.errors]
