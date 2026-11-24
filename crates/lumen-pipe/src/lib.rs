@@ -183,7 +183,8 @@ pub struct Consumed {
     /// Number of bytes removed from the pipe.
     pub n: usize,
     /// `true` if `n > 0` and the pipe was not [`Pipe::writable`] before the
-    /// read; the kernel must wake a waiting writer (exclusive wake).
+    /// read; the kernel must wake all waiting writers (see the wake rules on
+    /// [`WriteProgress`]: writers wait for different amounts).
     pub wake_writers: bool,
 }
 
@@ -267,7 +268,8 @@ pub enum WriteStep {
         /// Total bytes written.
         total: usize,
         /// `true` if `total > 0` and any buffer space remains free; the kernel
-        /// must wake the next exclusive waiting writer (Linux `wake_next_writer`).
+        /// wakes the waiting writers (Linux's `wake_next_writer`; a safeguard
+        /// with non-exclusive waits, see the wake rules on [`WriteProgress`]).
         wake_next_writer: bool,
     },
     /// Consumed `wrote_now` bytes from `next` (all or a prefix of `next`);
@@ -336,20 +338,27 @@ pub enum FaultedWrite {
 ///
 /// # Wake rules (writer and reader wait queues)
 ///
-/// Writer waits are **exclusive** (matching Linux `wr_wait`), so each wake
-/// unblocks one waiting writer; any waiter whose [`WriteProgress::can_progress`]
-/// turns true is woken by Rule 1:
+/// Writer waits are **not exclusive**: wake **all** waiting writers, and let
+/// each recheck [`WriteProgress::can_progress`] and sleep again if it still
+/// cannot step. Writers wait for different amounts (an atomic write for its
+/// whole length, a larger write for `min(remaining, PIPE_BUF)`), so waking a
+/// single writer could pick one that still cannot progress while another that
+/// can stays asleep: a 4096-byte writer queued before a 300-byte writer, and a
+/// 300-byte read. Linux can wake one writer exclusively (`wr_wait`) only because
+/// every Linux writer waits for the same thing, one free slot.
 ///
 /// - **Writer wake rule 1:** a read (`commit` / `commit_prefix`) that frees
 ///   `>= 1` byte from a pipe that was not [`Pipe::writable`] before the read
-///   returns [`Consumed::wake_writers`] `== true` -> wake one waiting writer
+///   returns [`Consumed::wake_writers`] `== true` -> wake all waiting writers
 ///   (and pollers when `writable()` becomes true).
 /// - **Writer wake rule 2:** a growing [`Pipe::set_capacity`] returns
 ///   [`Resized::wake_writers`] `== true` -> wake waiting writers and pollers.
 /// - **Writer wake rule 3:** a writer that leaves after having slept, by
 ///   **any** exit (`Done`, `Broken`, copy fault, or interrupted), wakes the
-///   next waiting writer if any space is free (`pipe.fionread() < pipe.capacity()`,
+///   waiting writers if any space is free (`pipe.fionread() < pipe.capacity()`,
 ///   provided directly as [`WriteStep::Done::wake_next_writer`] on `Done`).
+///   With non-exclusive waits this is a cheap safeguard rather than a
+///   necessity: a writer only takes space, so it cannot make another eligible.
 /// - **Reader wake rules:** a write that copies `>= 1` byte wakes waiting
 ///   readers; a reader that leaves data queued (`!pipe.is_empty()` after
 ///   `commit` / `commit_prefix`) wakes the next reader (Linux `wake_next_reader`);
@@ -490,7 +499,12 @@ pub enum FaultedWrite {
 ///         (user_len - written).min(avail).min(kbuf.len())
 ///     };
 ///     if copy_from_user(&mut kbuf[..chunk_len], user_ptr + written).is_err() {
-///         return if written > 0 { Ok(written) } else { Err(EFAULT) };
+///         if written > 0 {
+///             drop(pipe);
+///             inode.wake_readers(); // earlier chunks queued data: wake before returning
+///             return Ok(written);
+///         }
+///         return Err(EFAULT);
 ///     }
 ///     match pipe.write(&kbuf[..chunk_len]) {
 ///         WriteOutcome::Wrote(n) => written += n,
