@@ -2,10 +2,11 @@
 //!
 //! Buffers are snapshots, not user pointers. The kernel must copy them safely,
 //! enforce mappings and apply its final return-to-user checks. XSAVE uses the
-//! standard (non-compacted), CPU-sized layout; CPUID component layout and actual
+//! standard (non-compacted) layout; CPUID component layout and actual
 //! FPU instructions remain the kernel's responsibility.
 
 use alloc::vec::Vec;
+use core::fmt;
 use core::mem::offset_of;
 use linux_raw_sys::general;
 
@@ -76,7 +77,12 @@ pub struct Registers {
 #[derive(Clone, Copy, Debug)]
 pub enum FpState<'a> {
     Fxsave(&'a [u8]),
-    Xsave { bytes: &'a [u8], xfeatures: u64 },
+    Xsave {
+        bytes: &'a [u8],
+        xfeatures: u64,
+        /// Standard size configured for this CPU (CPUID.(0Dh,0):EBX).
+        configured_size: usize,
+    },
 }
 
 impl<'a> FpState<'a> {
@@ -92,14 +98,22 @@ pub struct Handler {
     pub address: u64,
     pub flags: u64,
     pub restorer: u64,
+    pub sa_mask: SigSet,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct FrameInput<'a> {
     pub registers: Registers,
+    /// This thread's own plain XSAVE/FXSAVE bytes, or a buffer zeroed before
+    /// saving. The kernel must not expose another thread's stale FP bytes.
     pub fp: FpState<'a>,
+    /// Copied into the frame regardless of SA_SIGINFO.
     pub info: SigInfo,
-    pub mask: Blocked,
+    /// Linux sigmask_to_save(): restore this on sigreturn. During sigsuspend or
+    /// ppoll this is the mask from before the temporary mask was installed.
+    pub saved_mask: Blocked,
+    /// The currently active blocked mask, used while the handler executes.
+    pub blocked: Blocked,
     pub handler: Handler,
     pub alt_stack: AltStack,
     /// Trusted kernel syscall context; None for asynchronous user execution.
@@ -109,24 +123,31 @@ pub struct FrameInput<'a> {
     pub user_ss: u16,
 }
 
-/// A complete delivery image. The kernel must copy bytes to new_rsp first,
-/// and only after a successful copy install alt_stack_during_handler (Linux
-/// signal_delivered). It must also block sa_mask and, unless SA_NODEFER, the
-/// signal; apply SA_RESETHAND; and reset user FP state (fpu__clear_user_states).
+/// A complete delivery image. SA_RESETHAND is applied at dequeue (Linux
+/// get_signal), before build; resets_handler reports that flag, not a later step.
+/// Only after copying bytes to new_rsp succeeds may the kernel install
+/// blocked_during_handler and alt_stack_during_handler and reset FP state
+/// (fpu__clear_user_states). A failed copy forces SIGSEGV and changes neither
+/// the blocked mask nor the alternate-stack configuration.
 ///
 /// The validated delivery image cannot be edited in place:
 /// ```compile_fail
 /// use lumen_signal::frame::FrameImage;
 /// fn corrupt(image: &mut FrameImage) { image.bytes.clear(); }
 /// ```
+/// ```compile_fail
+/// use lumen_signal::frame::FrameImage;
+/// fn corrupt(image: &mut FrameImage) { image.entry.rip = 0; }
+/// ```
 #[must_use]
-#[derive(Debug)]
 pub struct FrameImage {
     bytes: Vec<u8>,
     new_rsp: u64,
     entry: Registers,
     alt_stack_during_handler: AltStack,
     fp_offset: usize,
+    blocked_during_handler: Blocked,
+    resets_handler: bool,
 }
 
 impl FrameImage {
@@ -141,6 +162,13 @@ impl FrameImage {
     }
     pub const fn alt_stack_during_handler(&self) -> AltStack {
         self.alt_stack_during_handler
+    }
+    pub const fn blocked_during_handler(&self) -> Blocked {
+        self.blocked_during_handler
+    }
+    /// The dequeue layer must apply this flag even if build or the copy fails.
+    pub const fn resets_handler(&self) -> bool {
+        self.resets_handler
     }
     pub fn fp_snapshot(&self) -> FpSnapshot<'_> {
         FpSnapshot { address: self.new_rsp + self.fp_offset as u64, bytes: &self.bytes[self.fp_offset..] }
@@ -188,9 +216,8 @@ fn read64(bytes: &[u8], offset: usize) -> Result<u64, FpError> {
 }
 
 macro_rules! register_words {
-    ($mac:ident $(, $args:expr)*) => {
-        $mac!($($args,)* r8, r9, r10, r11, r12, r13, r14, r15,
-            rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, rflags)
+    ($mac:ident) => {
+        $mac!(r8, r9, r10, r11, r12, r13, r14, r15, rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, rflags)
     };
 }
 
@@ -204,8 +231,9 @@ fn encode_registers(bytes: &mut [u8], regs: Registers) {
     write16(bytes, offset_of!(RtSigFrame, uc.mcontext.ss), regs.ss);
 }
 
-fn check_xheader(bytes: &[u8], features: u64) -> Result<(), FpError> {
-    if read64(bytes, XSTATE_BV)? & !features != 0 {
+fn check_xheader(bytes: &[u8], features: u64) -> Result<u64, FpError> {
+    let xstate_bv = read64(bytes, XSTATE_BV)?;
+    if xstate_bv & !features != 0 {
         return Err(FpError::Features);
     }
     let reserved = bytes.get(XCOMP_BV..XHEADER_END).ok_or(FpError::Truncated)?;
@@ -213,55 +241,64 @@ fn check_xheader(bytes: &[u8], features: u64) -> Result<(), FpError> {
     if reserved.iter().any(|&byte| byte != 0) {
         return Err(FpError::Reserved);
     }
-    Ok(())
+    Ok(xstate_bv)
 }
 
-/// Build a frame below the interrupted red zone, or from the alternate stack's
-/// top on first SA_ONSTACK entry. All stack arithmetic is checked, including
-/// nested alternate-stack overflow. The image's FP address is 64-byte aligned
+/// Build below the red zone, or at the alternate stack's top when SA_ONSTACK
+/// is set and rsp - 128 is not on it (including an underflowing original RSP).
+/// Stack placement arithmetic is checked, including nested alternate-stack
+/// overflow. The image's FP address is 64-byte aligned
 /// and the handler RSP satisfies (RSP + 8) % 16 == 0. Handler addresses 0 and 1
 /// are SIG_DFL/SIG_IGN, not callable handlers. Restorer non-null and USER_MAX
 /// address checks are intentionally stricter than Linux. Restart processing is
-/// applied to the saved registers before encoding the frame.
+/// applied to the saved registers before encoding the frame. On any build error
+/// the caller's registers still contain the ERESTART code: delivery of the forced
+/// SIGSEGV must apply it. The input is by value and never mutates caller state.
 pub fn build(input: FrameInput<'_>) -> Result<FrameImage, FrameError> {
-    let FrameInput { mut registers, fp, info, mask, handler, alt_stack, syscall, user_cs, user_ss } = input;
-    restart::decide(syscall, Handling::Handler { sa_restart: handler.flags & general::SA_RESTART as u64 != 0 })
-        .apply(&mut registers)
-        .map_err(|_| FrameError::RestartUnderflow)?;
+    let FrameInput { mut registers, fp, info, saved_mask, blocked, handler, alt_stack, syscall, user_cs, user_ss } =
+        input;
+    restart::decide(
+        syscall,
+        registers.rax,
+        Handling::Handler { sa_restart: handler.flags & general::SA_RESTART as u64 != 0 },
+    )
+    .apply(&mut registers)
+    .map_err(|_| FrameError::RestartUnderflow)?;
     if handler.flags & general::SA_RESTORER as u64 == 0 || handler.restorer == 0 {
         return Err(FrameError::MissingRestorer);
     }
     if handler.address <= 1 || handler.address >= USER_MAX || handler.restorer >= USER_MAX {
         return Err(FrameError::InvalidAddress);
     }
-    let raw = fp.bytes();
-    let extra = match fp {
-        FpState::Fxsave(_) => {
-            if raw.len() != FXSAVE_SIZE {
+    let (raw, xsave) = match fp {
+        FpState::Fxsave(bytes) => {
+            if bytes.len() != FXSAVE_SIZE {
                 return Err(FrameError::BadFpState(FpError::Size));
             }
-            0
+            (bytes, None)
         }
-        FpState::Xsave { xfeatures, .. } => {
-            if raw.len() < FXSAVE_SIZE + XHEADER_SIZE || raw.len() > u32::MAX as usize - 4 {
+        FpState::Xsave { bytes, xfeatures, configured_size } => {
+            if bytes.len() != configured_size || bytes.len() < XHEADER_END || bytes.len() > u32::MAX as usize - 4 {
                 return Err(FrameError::BadFpState(FpError::Size));
             }
-            check_xheader(raw, xfeatures).map_err(FrameError::BadFpState)?;
-            4
+            let bv = check_xheader(bytes, xfeatures).map_err(FrameError::BadFpState)?;
+            (bytes, Some((xfeatures, bv)))
         }
     };
-    let fp_len = raw.len().checked_add(extra).ok_or(FrameError::BadFpState(FpError::Size))?;
-    let sp = registers.rsp.checked_sub(128).ok_or(FrameError::StackOverflow)?;
+    // The size bound above leaves room for magic2 even on a 32-bit host.
+    let fp_len = raw.len() + if xsave.is_some() { 4 } else { 0 };
+    let sp = registers.rsp.checked_sub(128);
     let nested_alt = alt_stack.on_stack(registers.rsp);
-    let entering_alt =
-        handler.flags & general::SA_ONSTACK as u64 != 0 && alt_stack.enabled() && !alt_stack.on_stack(sp);
+    let entering_alt = handler.flags & general::SA_ONSTACK as u64 != 0
+        && alt_stack.enabled()
+        && sp.is_none_or(|sp| !alt_stack.on_stack(sp));
     let top = if entering_alt {
         alt_stack.top()
     } else {
         if registers.rsp > USER_MAX {
             return Err(FrameError::InvalidAddress);
         }
-        sp
+        sp.ok_or(FrameError::StackOverflow)?
     };
     let fp_address = top.checked_sub(fp_len as u64).ok_or(FrameError::StackOverflow)? & !63;
     let new_rsp = (fp_address.checked_sub(FRAME_SIZE as u64).ok_or(FrameError::StackOverflow)? & !15)
@@ -275,48 +312,61 @@ pub fn build(input: FrameInput<'_>) -> Result<FrameImage, FrameError> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).map_err(|_| FrameError::NoMemory)?;
     bytes.resize(len, 0);
-    write64(&mut bytes, 0, handler.restorer);
-    let flags =
-        UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS | if matches!(fp, FpState::Xsave { .. }) { UC_FP_XSTATE } else { 0 };
-    write64(&mut bytes, UCONTEXT, flags);
+    write64(&mut bytes, offset_of!(RtSigFrame, pretcode), handler.restorer);
+    let flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS | if xsave.is_some() { UC_FP_XSTATE } else { 0 };
+    write64(&mut bytes, offset_of!(RtSigFrame, uc.flags), flags);
     write64(&mut bytes, offset_of!(RtSigFrame, uc.stack.sp), alt_stack.sp());
     write32(&mut bytes, offset_of!(RtSigFrame, uc.stack.flags), alt_stack.flags());
     write64(&mut bytes, offset_of!(RtSigFrame, uc.stack.size), alt_stack.size());
     encode_registers(&mut bytes, registers);
-    write64(&mut bytes, offset_of!(RtSigFrame, uc.mcontext.oldmask), mask.set().0);
+    write64(&mut bytes, offset_of!(RtSigFrame, uc.mcontext.oldmask), saved_mask.set().0);
     write64(&mut bytes, offset_of!(RtSigFrame, uc.mcontext.fpstate), fp_address);
-    write64(&mut bytes, SIGMASK, mask.set().0);
-    bytes[SIGINFO..SIGINFO + 128].copy_from_slice(info.bytes());
+    write64(&mut bytes, offset_of!(RtSigFrame, uc.sigmask), saved_mask.set().0);
+    let info_offset = offset_of!(RtSigFrame, info);
+    bytes[info_offset..info_offset + size_of::<SigInfo>()].copy_from_slice(info.bytes());
     let fp_bytes = &mut bytes[fp_offset..];
     fp_bytes[..raw.len()].copy_from_slice(raw);
-    // Software metadata is kernel-owned; never expose stale FXSAVE padding.
+    // Kernel-owned metadata. Unlike Linux, FXSAVE frames have zeroed sw bytes.
     fp_bytes[SW_BYTES..FXSAVE_SIZE].fill(0);
-    if let FpState::Xsave { xfeatures, .. } = fp {
+    if let Some((xfeatures, xstate_bv)) = xsave {
         write32(fp_bytes, SW_MAGIC1, FP_XSTATE_MAGIC1);
         write32(fp_bytes, SW_EXTENDED_SIZE, fp_len as u32);
         write64(fp_bytes, SW_XFEATURES, xfeatures);
         write32(fp_bytes, SW_XSTATE_SIZE, raw.len() as u32);
         write32(fp_bytes, raw.len(), FP_XSTATE_MAGIC2);
         // Linux save_xstate_epilog ensures handler edits to FP/SSE are restored.
-        let xstate_bv = read64(raw, XSTATE_BV).map_err(FrameError::BadFpState)?;
         write64(fp_bytes, XSTATE_BV, xstate_bv | 0b11);
     }
     let mut entry = registers;
     entry.rsp = new_rsp;
     entry.rip = handler.address;
     entry.rdi = info.signal().number() as u64;
-    entry.rsi = new_rsp + SIGINFO as u64;
-    entry.rdx = new_rsp + UCONTEXT as u64;
+    entry.rsi = new_rsp + offset_of!(RtSigFrame, info) as u64;
+    entry.rdx = new_rsp + offset_of!(RtSigFrame, uc) as u64;
     entry.rax = 0;
     // Linux handle_signal clears DF/RF/TF for handler execution.
     entry.rflags &= !(eflags::DF | eflags::RF | eflags::TF);
     entry.cs = user_cs;
     entry.ss = user_ss;
-    Ok(FrameImage { bytes, new_rsp, entry, alt_stack_during_handler: alt_stack.during_handler(), fp_offset })
+    let deferred_signal = if handler.flags & general::SA_NODEFER as u64 == 0 { info.signal().bit() } else { 0 };
+    let blocked_during_handler = Blocked::new(SigSet(blocked.set().0 | handler.sa_mask.0 | deferred_signal));
+    Ok(FrameImage {
+        bytes,
+        new_rsp,
+        entry,
+        alt_stack_during_handler: alt_stack.during_handler(),
+        fp_offset,
+        blocked_during_handler,
+        resets_handler: handler.flags & general::SA_RESETHAND as u64 != 0,
+    })
 }
 
 /// A separate user-copy snapshot permits an edited fpstate pointer to refer
-/// outside the frame. Its address must equal sigcontext.fpstate.
+/// outside the frame. Its address must equal sigcontext.fpstate. Copy in two
+/// phases: first 512 bytes, then xstate_size + 4 when magic1 matches and the size
+/// is in 576..=cpu_size. Keep just the first copy for invalid metadata so restore
+/// can report the FX-only fallback. Bound the size before allocating/copying.
+/// extended_size does not control the copy length; magic2 is at buf + xstate_size.
 #[derive(Clone, Copy, Debug)]
 pub struct FpSnapshot<'a> {
     pub address: u64,
@@ -324,16 +374,44 @@ pub struct FpSnapshot<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct RestoreConfig {
+pub struct RestoreConfig<'a> {
     /// The user's R11 at rt_sigreturn syscall entry, not kernel execution flags.
     pub current_rflags: u64,
     pub user_cs: u16,
     pub user_ss: u16,
+    /// CPU MXCSR_MASK, using 0xFFBF when FXSAVE reports zero.
     pub mxcsr_mask: u32,
+    /// User features enabled by XCR0; never include supervisor-only features.
     pub enabled_xfeatures: u64,
     /// Standard size for the features XCR0 enables (CPUID.(0Dh,0):EBX),
     /// or None for FXSAVE-only CPUs.
     pub xsave_size: Option<usize>,
+    /// Standard-format CPUID.(0Dh, bit) offsets/sizes for enabled features >= 2.
+    pub xfeature_layout: &'a [XFeature],
+}
+
+/// One standard-format extended-state component from CPUID.(0Dh, bit).
+#[derive(Clone, Copy, Debug)]
+pub struct XFeature {
+    pub bit: u8,
+    pub offset: usize,
+    pub size: usize,
+}
+
+fn standard_size(features: u64, layout: &[XFeature], cpu_size: usize) -> Result<usize, FpError> {
+    let mut size = XHEADER_END;
+    for bit in 2..64 {
+        if features & (1 << bit) == 0 {
+            continue;
+        }
+        let component = layout.iter().find(|component| component.bit == bit).ok_or(FpError::Size)?;
+        let end = component.offset.checked_add(component.size).ok_or(FpError::Size)?;
+        if component.offset < XHEADER_END || component.size == 0 || end > cpu_size {
+            return Err(FpError::Size);
+        }
+        size = size.max(end);
+    }
+    Ok(size)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -341,6 +419,8 @@ pub enum RestoreError {
     TruncatedFrame,
     NonCanonicalRip,
     NonUserRip,
+    /// Lumen does not implement compat mode or arbitrary user code selectors.
+    UnsupportedCs,
     BadFpState(FpError),
 }
 
@@ -362,17 +442,22 @@ pub enum FpKind {
 /// ```compile_fail
 /// use lumen_signal::frame::{ValidatedFp, FpKind};
 /// let raw = [0xff; 512];
-/// let forged = ValidatedFp { bytes: &raw, kind: FpKind::Fxsave };
+/// let forged = ValidatedFp { bytes: &raw, kind: FpKind::Fxsave, fallback: None };
 /// ```
 /// Nor can a caller replace an already validated image's bytes:
 /// ```compile_fail
 /// use lumen_signal::frame::ValidatedFp;
 /// fn replace(fp: &mut ValidatedFp<'static>) { fp.bytes = &[0xff; 512]; }
 /// ```
-#[derive(Clone, Copy, Debug)]
+/// ```compile_fail
+/// use lumen_signal::frame::{ValidatedFp, FpKind};
+/// fn corrupt(fp: &mut ValidatedFp<'_>) { fp.kind = FpKind::Xsave { xfeatures: u64::MAX }; }
+/// ```
+#[derive(Clone, Copy)]
 pub struct ValidatedFp<'a> {
     bytes: &'a [u8],
     kind: FpKind,
+    fallback: Option<FpFallback>,
 }
 impl<'a> ValidatedFp<'a> {
     pub const fn bytes(self) -> &'a [u8] {
@@ -381,6 +466,22 @@ impl<'a> ValidatedFp<'a> {
     pub const fn kind(self) -> FpKind {
         self.kind
     }
+    /// Why an XSAVE-capable CPU must use FX-only state, for kernel diagnostics.
+    pub const fn fallback(self) -> Option<FpFallback> {
+        self.fallback
+    }
+    /// Standard size to restore; initialize all enabled state beyond this size.
+    pub const fn size(self) -> usize {
+        self.bytes.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FpFallback {
+    BadMagic1,
+    InvalidSize,
+    InvalidExtendedSize,
+    BadMagic2,
 }
 
 /// An opaque successful sigreturn verdict. Exception metadata is not restored
@@ -398,7 +499,19 @@ impl<'a> ValidatedFp<'a> {
 /// use lumen_signal::frame::Restored;
 /// fn corrupt(state: &mut Restored<'_>) { state.registers.rip = u64::MAX; }
 /// ```
-#[derive(Clone, Copy, Debug)]
+/// ```compile_fail
+/// use lumen_signal::{Blocked, frame::Restored};
+/// fn corrupt(state: &mut Restored<'_>) { state.mask = Blocked::EMPTY; }
+/// ```
+/// ```compile_fail
+/// use lumen_signal::{altstack::AltStack, frame::Restored};
+/// fn corrupt(state: &mut Restored<'_>) { state.alt_stack = AltStack::DISABLED; }
+/// ```
+/// ```compile_fail
+/// use lumen_signal::frame::Restored;
+/// fn corrupt(state: &mut Restored<'_>) { state.fp = None; }
+/// ```
+#[derive(Clone, Copy)]
 pub struct Restored<'a> {
     registers: Registers,
     mask: Blocked,
@@ -423,7 +536,30 @@ impl<'a> Restored<'a> {
     }
 }
 
-fn validate_fp(snapshot: FpSnapshot<'_>, config: RestoreConfig) -> Result<ValidatedFp<'_>, FpError> {
+impl fmt::Debug for FrameImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameImage")
+            .field("bytes", &self.bytes.len())
+            .field("resets_handler", &self.resets_handler)
+            .finish_non_exhaustive()
+    }
+}
+impl fmt::Debug for ValidatedFp<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ValidatedFp")
+            .field("size", &self.bytes.len())
+            .field("kind", &self.kind)
+            .field("fallback", &self.fallback)
+            .finish_non_exhaustive()
+    }
+}
+impl fmt::Debug for Restored<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Restored").field("fp", &self.fp).finish_non_exhaustive()
+    }
+}
+
+fn validate_fp<'a>(snapshot: FpSnapshot<'a>, config: RestoreConfig<'_>) -> Result<ValidatedFp<'a>, FpError> {
     let FpSnapshot { address, bytes } = snapshot;
     if address >= USER_MAX || address.checked_add(bytes.len() as u64).is_none_or(|end| end > USER_MAX) {
         return Err(FpError::Address);
@@ -432,47 +568,60 @@ fn validate_fp(snapshot: FpSnapshot<'_>, config: RestoreConfig) -> Result<Valida
         return Err(FpError::Alignment);
     }
     let legacy = bytes.get(..FXSAVE_SIZE).ok_or(FpError::Truncated)?;
+    // Also checked on a successful XSAVE path. Refusing MXCSR even when SSE
+    // is absent from xfeatures is stricter than Linux and safe for restoration.
     if read32(bytes, MXCSR)? & !config.mxcsr_mask != 0 {
         return Err(FpError::Mxcsr);
     }
-    let fx = ValidatedFp { bytes: legacy, kind: FpKind::Fxsave };
-    // check_xstate_in_sigframe fallback: UC_FP_XSTATE and sw padding are not
-    // validation inputs. FXSAVE-only CPUs ignore all software metadata.
-    let Some(cpu_size) = config.xsave_size else { return Ok(fx) };
+    let fx = |fallback| ValidatedFp { bytes: legacy, kind: FpKind::Fxsave, fallback };
+    let Some(cpu_size) = config.xsave_size else { return Ok(fx(None)) };
     if read32(bytes, SW_MAGIC1)? != FP_XSTATE_MAGIC1 {
-        return Ok(fx);
+        return Ok(fx(Some(FpFallback::BadMagic1)));
     }
-    let extended = read32(bytes, SW_EXTENDED_SIZE)? as usize;
     let size = read32(bytes, SW_XSTATE_SIZE)? as usize;
-    if size < XHEADER_END || size != cpu_size || size.checked_add(4) != Some(extended) {
-        return Ok(fx);
+    if size < XHEADER_END || size > cpu_size {
+        return Ok(fx(Some(FpFallback::InvalidSize)));
+    }
+    let extended = read32(bytes, SW_EXTENDED_SIZE)? as u64;
+    if extended < size as u64 + 4 {
+        return Ok(fx(Some(FpFallback::InvalidExtendedSize)));
     }
     let area = bytes.get(..size).ok_or(FpError::Truncated)?;
-    if read32(bytes, extended - 4)? != FP_XSTATE_MAGIC2 {
-        return Ok(fx);
+    if read32(bytes, size)? != FP_XSTATE_MAGIC2 {
+        return Ok(fx(Some(FpFallback::BadMagic2)));
     }
     if address & 63 != 0 {
         return Err(FpError::Alignment);
     }
     check_xheader(area, config.enabled_xfeatures)?;
-    let features = read64(bytes, SW_XFEATURES)? & config.enabled_xfeatures;
-    Ok(ValidatedFp { bytes: area, kind: FpKind::Xsave { xfeatures: features } })
+    let advertised = read64(bytes, SW_XFEATURES)?;
+    let features = advertised & config.enabled_xfeatures;
+    let required = if size != cpu_size || advertised != config.enabled_xfeatures {
+        standard_size(features, config.xfeature_layout, cpu_size)?
+    } else {
+        cpu_size
+    };
+    if size < required {
+        return Err(FpError::Size);
+    }
+    Ok(ValidatedFp { bytes: &area[..required], kind: FpKind::Xsave { xfeatures: features }, fallback: None })
 }
 
-/// Validate a copied x86-64 frame starting at pretcode (restorer syscall RSP is
-/// normally frame_address + 8). current_stack/current_rsp are the live alternate
-/// stack configuration and user RSP at sigreturn entry, for do_sigaltstack's
-/// -EPERM check. Invalid saved stack changes are ignored, as Linux does; safe
+/// Validate a frame copied from the rt_sigreturn entry RSP minus 8. The kernel
+/// must reset its restart block (Linux do_no_restart_syscall) and pass None as
+/// syscall context after success. current_rsp is the *entry* RSP: current Linux
+/// rt_sigreturn calls restore_altstack before restore_sigcontext. Do not replace
+/// it with the RSP saved inside the frame. Stack configuration errors are ignored;
 /// user-copy faults must already have been handled by the caller.
 ///
-/// Forces selectors, restores Blocked, and merges FIX_EFLAGS with user R11 from
-/// syscall entry. Non-canonical RIP has a distinct verdict; kernel/top-guard
-/// addresses are refused too. The kernel must apply its final address/RFLAGS
-/// checks (which always clear TF/RF) before any return instruction.
+/// SS is forced and CS must select Lumen's 64-bit user code segment after OR 3;
+/// this is stricter than Linux's compat/arbitrary-selector support. The kernel
+/// must still apply its final address/RFLAGS checks (always clearing TF/RF).
+/// FP snapshots follow the two-phase copy documented on FpSnapshot.
 pub fn restore<'a>(
     bytes: &[u8],
     fp: Option<FpSnapshot<'a>>,
-    config: RestoreConfig,
+    config: RestoreConfig<'_>,
     current_stack: AltStack,
     current_rsp: u64,
 ) -> Result<Restored<'a>, RestoreError> {
@@ -487,6 +636,11 @@ pub fn restore<'a>(
         };
     }
     let mut registers = register_words!(decode);
+    let cs_offset = offset_of!(RtSigFrame, uc.mcontext.cs);
+    let saved_cs = u16::from_le_bytes([bytes[cs_offset], bytes[cs_offset + 1]]);
+    if (saved_cs | 3) != config.user_cs {
+        return Err(RestoreError::UnsupportedCs);
+    }
     if ((registers.rip << 16) as i64 >> 16) as u64 != registers.rip {
         return Err(RestoreError::NonCanonicalRip);
     }
@@ -494,7 +648,7 @@ pub fn restore<'a>(
         return Err(RestoreError::NonUserRip);
     }
     registers.rflags = (registers.rflags & FIX_EFLAGS) | (config.current_rflags & !FIX_EFLAGS);
-    let mask = Blocked::new(SigSet(word(SIGMASK)));
+    let mask = Blocked::new(SigSet(word(offset_of!(RtSigFrame, uc.sigmask))));
     let pointer = word(offset_of!(RtSigFrame, uc.mcontext.fpstate));
     let fp = if pointer == 0 {
         None

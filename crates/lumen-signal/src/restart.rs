@@ -25,14 +25,25 @@ impl RestartCode {
     }
 }
 
-/// An interrupted syscall, supplied by the kernel rather than inferred from RAX.
-/// None represents Linux's orig_ax == -1, including every successful sigreturn.
+/// The original syscall number, supplied by the kernel. Restart status is read
+/// from the current saved RAX, never cached here. The kernel must pass None
+/// after rt_sigreturn (Linux clears orig_ax and resets the restart block).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SyscallExit {
-    pub result: i64,
-    pub orig_rax: u64,
+    orig_rax: u64,
 }
 
+impl SyscallExit {
+    /// Refuses Linux's sentinel so None is the only non-syscall encoding.
+    pub const fn new(orig_rax: u64) -> Option<Self> {
+        if orig_rax == u64::MAX { None } else { Some(Self { orig_rax }) }
+    }
+    pub const fn orig_rax(self) -> u64 {
+        self.orig_rax
+    }
+}
+
+/// Whether this return-to-user path delivers a handler, including SA_RESTART.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Handling {
     None,
@@ -50,19 +61,16 @@ pub enum RestartDecision {
 /// internal restart code. RESTARTBLOCK without a handler uses restart_syscall
 /// (219); the kernel must retain its associated restart-block state.
 #[must_use]
-pub const fn decide(syscall: Option<SyscallExit>, handling: Handling) -> RestartDecision {
+pub const fn decide(syscall: Option<SyscallExit>, rax: u64, handling: Handling) -> RestartDecision {
     use RestartCode::*;
     use RestartDecision::*;
     let Some(exit) = syscall else { return Unchanged };
-    if exit.orig_rax == u64::MAX {
-        return Unchanged;
-    }
-    let Some(code) = RestartCode::from_kernel_result(exit.result) else { return Unchanged };
+    let Some(code) = RestartCode::from_kernel_result(rax as i64) else { return Unchanged };
     match (code, handling) {
         (NoIntr, _) | (Sys, Handling::None | Handling::Handler { sa_restart: true }) | (NoHand, Handling::None) => {
             Restart { rax: exit.orig_rax }
         }
-        (RestartBlock, Handling::None) => Restart { rax: 219 },
+        (RestartBlock, Handling::None) => Restart { rax: RESTART_SYSCALL },
         _ => ReturnEintr,
     }
 }
@@ -87,5 +95,7 @@ impl RestartDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartUnderflow;
 
+/// x86-64 __NR_restart_syscall, independent of the host architecture.
+pub const RESTART_SYSCALL: u64 = 219;
 #[cfg(target_arch = "x86_64")]
-const _: () = assert!(linux_raw_sys::general::__NR_restart_syscall == 219);
+const _: () = assert!(linux_raw_sys::general::__NR_restart_syscall as u64 == RESTART_SYSCALL);

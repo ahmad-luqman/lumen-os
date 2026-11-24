@@ -137,6 +137,7 @@ impl SigSet {
         self.0 &= !signal.bit();
     }
 
+    #[must_use]
     pub const fn unblockable_stripped(self) -> Self {
         Self(self.0 & !(Signal::KILL.bit() | Signal::STOP.bit()))
     }
@@ -156,11 +157,16 @@ impl SigSet {
 
 /// A thread's blocked mask. Every constructor and mask operation removes KILL
 /// and STOP. User interest sets (sigwait) and pending sets remain [`SigSet`].
+/// ```compile_fail
+/// use lumen_signal::{Blocked, SigSet};
+/// fn corrupt(mask: &mut Blocked) { mask.0 = SigSet::ALL; }
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Blocked(SigSet);
 
 impl Blocked {
     pub const EMPTY: Self = Self(SigSet::EMPTY);
+    #[must_use]
     pub const fn new(set: SigSet) -> Self {
         Self(set.unblockable_stripped())
     }
@@ -178,4 +184,7 @@ impl Blocked {
     }
 }
 
-pub const STOP_SIGNALS: SigSet = SigSet::of(&[Signal::STOP, Signal::TSTP, Signal::TTIN, Signal::TTOU]);
+/// Linux's stop-signal numbers, for process-wide stop/continue cancellation.
+pub const STOP_LIST: [Signal; 4] = [Signal::STOP, Signal::TSTP, Signal::TTIN, Signal::TTOU];
+/// Set form of STOP_LIST for membership tests.
+pub const STOP_SIGNALS: SigSet = SigSet::of(&STOP_LIST);

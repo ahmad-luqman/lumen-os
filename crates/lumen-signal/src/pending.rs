@@ -1,14 +1,17 @@
 //! Pending queues and a deterministic subset of Linux kernel/signal.c policy.
 
+use alloc::alloc::{Layout, alloc};
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::fmt;
 use linux_raw_sys::{errno, general};
 
-use crate::{Blocked, DefaultAction, STOP_SIGNALS, SigSet, Signal};
+use crate::{Blocked, DefaultAction, STOP_LIST, STOP_SIGNALS, SigSet, Signal};
 
 /// An initialized 128-byte Linux siginfo image with a valid si_signo. Payload
 /// bytes are opaque; callers are responsible for syscall-specific si_code checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SigInfo([u8; 128]);
 
 impl SigInfo {
@@ -19,14 +22,19 @@ impl SigInfo {
         Self(bytes)
     }
 
-    /// Linux __copy_siginfo_from_user: the syscall's signal overrides si_signo.
+    /// Copies Linux's 48-byte kernel_siginfo payload, stamps the syscall's
+    /// signal, and zeroes the expansion bytes as on Linux delivery. Linux's
+    /// -E2BIG check for unknown layouts with nonzero expansion is not done here;
+    /// the syscall layer must perform that layout-dependent check.
     pub fn from_user(signal: Signal, mut bytes: [u8; 128]) -> Self {
         bytes[..4].copy_from_slice(&signal.number().to_le_bytes());
+        bytes[48..].fill(0);
         Self(bytes)
     }
 
     /// Decode an already trusted image; syscall inputs must use from_user.
-    pub fn from_bytes(bytes: [u8; 128]) -> Option<Self> {
+    #[cfg(test)]
+    pub(crate) fn from_bytes(bytes: [u8; 128]) -> Option<Self> {
         Signal::new(u32::from_le_bytes(bytes[..4].try_into().ok()?))?;
         Some(Self(bytes))
     }
@@ -48,6 +56,12 @@ impl SigInfo {
     }
 }
 
+impl fmt::Debug for SigInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigInfo").field("signal", &self.signal()).finish_non_exhaustive()
+    }
+}
+
 const _: () = {
     assert!(size_of::<SigInfo>() == size_of::<general::siginfo_t>());
     assert!(size_of::<SigInfo>() == general::SI_MAX_SIZE as usize);
@@ -63,12 +77,15 @@ const _: () = {
 pub enum Enqueued {
     Queued,
     Coalesced,
-    /// A real-time SI_USER signal survives, but its siginfo could not be queued.
+    /// SI_USER exhaustion sets the pending bit without adding a queued entry.
+    /// An existing entry of this number absorbs the send when it is dequeued.
     InfoLost,
 }
 
 /// The kernel classifies the validated sender; this is not inferred from a
-/// user-controlled si_code. Only SI_USER has Linux's loss-of-info fallback.
+/// user-controlled si_code. SiUser covers kill() and the kernel's special
+/// SEND_SIG_NOINFO/SEND_SIG_PRIV sends (Linux is_si_special). SI_TKILL from
+/// tkill/tgkill and rt_sigqueueinfo are Other, returning -EAGAIN on exhaustion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SenderClass {
     SiUser,
@@ -84,7 +101,8 @@ pub enum PendingError {
 
 impl PendingError {
     /// Negative Linux errno. InvalidThread is a kernel bookkeeping bug and has
-    /// no user errno; both queue exhaustion and allocation failure are -EAGAIN.
+    /// no user errno. For enqueue, exhaustion/allocation failure are -EAGAIN.
+    /// NoMemory from new/add_thread is the caller's to map (e.g. -ENOMEM on clone).
     pub const fn errno(self) -> Option<i32> {
         match self {
             Self::Full | Self::NoMemory => Some(-(errno::EAGAIN as i32)),
@@ -97,20 +115,19 @@ impl PendingError {
 /// performs process-wide stop/continue cancellation. Capacity is per queue,
 /// not Linux's per-user RLIMIT_SIGPENDING accounting.
 #[derive(Debug)]
-pub(crate) struct Pending {
+struct Pending {
     set: SigSet,
     standard: [Option<SigInfo>; 31],
     realtime: VecDeque<SigInfo>,
-    info_less: SigSet,
     cap: usize,
 }
 
 impl Pending {
-    pub(crate) fn new(cap: usize) -> Self {
-        Self { set: SigSet::EMPTY, standard: [None; 31], realtime: VecDeque::new(), info_less: SigSet::EMPTY, cap }
+    fn new(cap: usize) -> Self {
+        Self { set: SigSet::EMPTY, standard: [None; 31], realtime: VecDeque::new(), cap }
     }
 
-    pub(crate) fn enqueue(&mut self, info: SigInfo, sender: SenderClass) -> Result<Enqueued, PendingError> {
+    fn enqueue(&mut self, info: SigInfo, sender: SenderClass) -> Result<Enqueued, PendingError> {
         let signal = info.signal();
         if signal.is_realtime() {
             let capacity = if self.realtime.len() == self.cap {
@@ -122,7 +139,6 @@ impl Pending {
                 if sender != SenderClass::SiUser {
                     return Err(error);
                 }
-                self.info_less.insert(signal);
                 self.set.insert(signal);
                 return Ok(Enqueued::InfoLost);
             }
@@ -138,10 +154,9 @@ impl Pending {
         Ok(Enqueued::Queued)
     }
 
-    pub(crate) fn discard(&mut self, signal: Signal) {
+    fn discard(&mut self, signal: Signal) {
         if signal.is_realtime() {
             self.realtime.retain(|info| info.signal() != signal);
-            self.info_less.remove(signal);
         } else {
             self.standard[signal.index()] = None;
         }
@@ -149,7 +164,7 @@ impl Pending {
     }
 
     #[must_use]
-    pub(crate) fn dequeue_mask(&mut self, mask: SigSet) -> Option<SigInfo> {
+    fn dequeue_mask(&mut self, mask: SigSet) -> Option<SigInfo> {
         // kernel/signal.c SYNCHRONOUS_MASK (ABRT is deliberately absent).
         const SYNCHRONOUS: SigSet =
             SigSet::of(&[Signal::SEGV, Signal::BUS, Signal::ILL, Signal::TRAP, Signal::FPE, Signal::SYS]);
@@ -163,12 +178,11 @@ impl Pending {
         if signal.is_realtime() {
             if let Some(index) = self.realtime.iter().position(|info| info.signal() == signal) {
                 let info = self.realtime.remove(index);
-                if !self.info_less.contains(signal) && !self.realtime.iter().any(|info| info.signal() == signal) {
+                if !self.realtime.iter().any(|info| info.signal() == signal) {
                     self.set.remove(signal);
                 }
                 return info;
             }
-            self.info_less.remove(signal);
             self.set.remove(signal);
             // Linux collect_signal's minimal fallback: zero payload and SI_USER.
             Some(SigInfo::new(signal, general::SI_USER as i32))
@@ -193,52 +207,99 @@ impl Disposition {
     }
 }
 
+/// Process-local identity minted by new/add_thread, not a candidate position.
+/// Slots are never reused. The kernel must keep a slot with its owning process.
+/// ```compile_fail
+/// use lumen_signal::pending::ThreadSlot;
+/// let forged = ThreadSlot(0);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadSlot(usize);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Process,
-    Thread(usize),
+    Thread(ThreadSlot),
 }
 
-/// Shared and private pending state. Thread indices are stable and never reused;
-/// removing a thread leaves a vacant slot. The owner serializes operations and
-/// retains dispositions in its KernelSigaction table, not in this object.
-#[derive(Debug)]
+type SlotStorage = Option<Box<Pending>>;
+
+/// Private queues are boxed; removing one releases its queue and leaves only a
+/// pointer-sized vacancy. The owner serializes operations and retains dispositions
+/// in its KernelSigaction table. Initial slots are returned alongside the state.
 pub struct PendingSignals {
     shared: Pending,
-    threads: Vec<Option<Pending>>,
+    threads: Vec<SlotStorage>,
     cap: usize,
 }
 
+impl fmt::Debug for PendingSignals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingSignals")
+            .field("slots", &self.threads.len())
+            .field("realtime_cap", &self.cap)
+            .finish_non_exhaustive()
+    }
+}
+
+fn boxed_pending(cap: usize) -> Result<Box<Pending>, PendingError> {
+    // SAFETY: Pending is nonzero-sized, and its Layout supplies the size and
+    // alignment required by the global allocator. A null allocation is handled.
+    let pointer = unsafe { alloc(Layout::new::<Pending>()) }.cast::<Pending>();
+    if pointer.is_null() {
+        return Err(PendingError::NoMemory);
+    }
+    // SAFETY: pointer uniquely owns a correctly aligned Pending allocation.
+    // new does not allocate or panic. Initialize before transferring ownership
+    // to Box, which deallocates through the same global allocator and Layout.
+    unsafe {
+        pointer.write(Pending::new(cap));
+        Ok(Box::from_raw(pointer))
+    }
+}
+
 impl PendingSignals {
-    pub fn new(thread_count: usize, realtime_cap: usize) -> Result<Self, PendingError> {
+    pub fn new(thread_count: usize, realtime_cap: usize) -> Result<(Self, Vec<ThreadSlot>), PendingError> {
         let mut threads = Vec::new();
+        let mut slots = Vec::new();
         threads.try_reserve(thread_count).map_err(|_| PendingError::NoMemory)?;
-        for _ in 0..thread_count {
-            threads.push(Some(Pending::new(realtime_cap)));
+        slots.try_reserve(thread_count).map_err(|_| PendingError::NoMemory)?;
+        for index in 0..thread_count {
+            threads.push(Some(boxed_pending(realtime_cap)?));
+            slots.push(ThreadSlot(index));
         }
-        Ok(Self { shared: Pending::new(realtime_cap), threads, cap: realtime_cap })
+        Ok((Self { shared: Pending::new(realtime_cap), threads, cap: realtime_cap }, slots))
     }
 
-    pub fn add_thread(&mut self) -> Result<usize, PendingError> {
+    pub fn add_thread(&mut self) -> Result<ThreadSlot, PendingError> {
         self.threads.try_reserve(1).map_err(|_| PendingError::NoMemory)?;
-        let index = self.threads.len();
-        self.threads.push(Some(Pending::new(self.cap)));
-        Ok(index)
+        let pending = boxed_pending(self.cap)?;
+        let slot = ThreadSlot(self.threads.len());
+        self.threads.push(Some(pending));
+        Ok(slot)
+    }
+
+    fn thread(&self, slot: ThreadSlot) -> Result<&Pending, PendingError> {
+        self.threads.get(slot.0).and_then(Option::as_deref).ok_or(PendingError::InvalidThread)
+    }
+    fn thread_mut(&mut self, slot: ThreadSlot) -> Result<&mut Pending, PendingError> {
+        self.threads.get_mut(slot.0).and_then(Option::as_deref_mut).ok_or(PendingError::InvalidThread)
     }
 
     /// Drops only this thread's private pending state. Shared state survives.
-    pub fn remove_thread(&mut self, thread: usize) -> Result<(), PendingError> {
-        self.threads.get_mut(thread).and_then(Option::take).ok_or(PendingError::InvalidThread)?;
+    pub fn remove_thread(&mut self, slot: ThreadSlot) -> Result<(), PendingError> {
+        self.threads.get_mut(slot.0).and_then(Option::take).ok_or(PendingError::InvalidThread)?;
         Ok(())
     }
 
-    pub fn pending(&self, thread: usize) -> Result<SigSet, PendingError> {
-        let private = self.threads.get(thread).and_then(Option::as_ref).ok_or(PendingError::InvalidThread)?;
-        Ok(SigSet(private.set.0 | self.shared.set.0))
+    /// Private | shared pending signals, including blocked ones, for rt_sigpending.
+    pub fn pending(&self, slot: ThreadSlot) -> Result<SigSet, PendingError> {
+        Ok(SigSet(self.thread(slot)?.set.0 | self.shared.set.0))
     }
 
-    pub fn has_deliverable(&self, thread: usize, blocked: Blocked) -> Result<bool, PendingError> {
-        Ok(self.pending(thread)?.0 & !blocked.set().0 != 0)
+    /// Whether any private or shared signal is outside the blocked mask.
+    pub fn has_deliverable(&self, slot: ThreadSlot, blocked: Blocked) -> Result<bool, PendingError> {
+        Ok(self.pending(slot)?.0 & !blocked.set().0 != 0)
     }
 
     fn discard_all(&mut self, signal: Signal) {
@@ -248,10 +309,10 @@ impl PendingSignals {
         }
     }
 
-    /// Apply a disposition change already validated and stored by the kernel.
-    /// SIG_KERNEL_IGNORE_MASK includes default SIGCONT as well as default-Ign.
+    /// Flush after a disposition change; KILL/STOP cannot change disposition.
+    /// SIG_KERNEL_IGNORE_MASK includes default CONT as well as default-Ign.
     pub fn disposition_changed(&mut self, signal: Signal, new: Disposition) {
-        if new.ignores(signal) {
+        if !signal.is_unblockable() && new.ignores(signal) {
             self.discard_all(signal);
         }
     }
@@ -262,52 +323,45 @@ impl PendingSignals {
         if STOP_SIGNALS.contains(signal) {
             self.discard_all(Signal::CONT);
         } else if signal == Signal::CONT {
-            for number in 1..=64 {
-                let signal = Signal(number);
-                if STOP_SIGNALS.contains(signal) {
-                    self.discard_all(signal);
-                }
+            for stop in STOP_LIST {
+                self.discard_all(stop);
             }
         }
     }
 
-    /// Queues even ignored signals (blocked ignored signals may serve sigwait).
-    /// Linux drops unblocked ignored signals at generation: the kernel must do
-    /// that before calling, after prepare_signal's cancellation when applicable.
-    /// SI_USER queue exhaustion retains a coalescing info-less real-time marker;
-    /// dequeue synthesizes zero payload with si_signo and SI_USER for that marker.
+    /// Queues even ignored signals so blocked signals remain available to sigwait.
+    /// The kernel drops unblocked ignored signals before calling, after applying
+    /// prepare_signal when needed. SI_USER exhaustion sets only the pending bit.
+    /// With no queued entry, dequeue synthesizes minimal SI_USER siginfo. Taking
+    /// the last queued entry clears the bit: an overflow adds no extra delivery.
     pub fn enqueue(&mut self, target: Target, info: SigInfo, sender: SenderClass) -> Result<Enqueued, PendingError> {
-        if let Target::Thread(index) = target {
-            self.pending(index)?;
+        if let Target::Thread(slot) = target {
+            self.thread(slot)?;
         }
         self.prepare_signal(info.signal());
         match target {
             Target::Process => self.shared.enqueue(info, sender),
-            Target::Thread(index) => {
-                self.threads[index].as_mut().ok_or(PendingError::InvalidThread)?.enqueue(info, sender)
-            }
+            Target::Thread(slot) => self.thread_mut(slot)?.enqueue(info, sender),
         }
     }
 
-    /// Delivery dequeue: private pending precedes shared pending. Within each
-    /// queue Linux next_signal prefers SYNCHRONOUS_MASK, then the lowest number,
-    /// with FIFO siginfo for a real-time number. Blocked already excludes KILL
-    /// and STOP; this function does not alter the supplied mask.
+    /// Private precedes shared. Each queue prefers SYNCHRONOUS_MASK, then the
+    /// lowest number, with FIFO real-time siginfo. Blocked already excludes KILL
+    /// and STOP; this function does not alter it.
     #[must_use = "A dequeued signal must be consumed or delivered"]
-    pub fn dequeue(&mut self, thread: usize, blocked: Blocked) -> Result<Option<SigInfo>, PendingError> {
-        self.dequeue_mask(thread, blocked.set())
+    pub fn dequeue(&mut self, slot: ThreadSlot, blocked: Blocked) -> Result<Option<SigInfo>, PendingError> {
+        self.dequeue_mask(slot, blocked.set())
     }
 
-    /// sigwait dequeue: only wanted signals, always excluding KILL and STOP,
-    /// regardless of whether those uncatchable signals were explicitly wanted.
+    /// sigwait takes only wanted signals, always excluding KILL/STOP.
     #[must_use = "A dequeued signal must be consumed or delivered"]
-    pub fn dequeue_wanted(&mut self, thread: usize, wanted: SigSet) -> Result<Option<SigInfo>, PendingError> {
-        self.dequeue_mask(thread, SigSet(!wanted.unblockable_stripped().0))
+    pub fn dequeue_wanted(&mut self, slot: ThreadSlot, wanted: SigSet) -> Result<Option<SigInfo>, PendingError> {
+        self.dequeue_mask(slot, SigSet(!wanted.unblockable_stripped().0))
     }
 
-    fn dequeue_mask(&mut self, thread: usize, mask: SigSet) -> Result<Option<SigInfo>, PendingError> {
-        let private = self.threads.get_mut(thread).and_then(Option::as_mut).ok_or(PendingError::InvalidThread)?;
-        Ok(private.dequeue_mask(mask).or_else(|| self.shared.dequeue_mask(mask)))
+    fn dequeue_mask(&mut self, slot: ThreadSlot, mask: SigSet) -> Result<Option<SigInfo>, PendingError> {
+        let private = self.thread_mut(slot)?.dequeue_mask(mask);
+        Ok(private.or_else(|| self.shared.dequeue_mask(mask)))
     }
 }
 
@@ -315,6 +369,7 @@ impl PendingSignals {
 pub enum ThreadState {
     /// Currently executing on a CPU (Linux task_curr).
     Running,
+    /// Not on a CPU, regardless of the scheduler's precise sleep state.
     Sleeping,
     Stopped,
     Traced,
@@ -323,29 +378,59 @@ pub enum ThreadState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ThreadCandidate {
+    pub slot: ThreadSlot,
     pub mask: Blocked,
     pub state: ThreadState,
+    /// Linux TIF_SIGPENDING notification state.
     pub has_pending: bool,
 }
 
-/// Simplified complete_signal/wants_signal: preferred represents both Linux's
-/// p and curr_target, then a cyclic scan chooses an eligible thread. An invalid
-/// preferred index is refused. Running means task_curr (on a CPU); otherwise a
-/// sleeper accepts only without pending notification. KILL also accepts stopped
-/// or traced threads; exiting threads never accept. The caller retains the
-/// cursor and implements wakeups, SIGCONT resumption, group-exit and job control.
-#[must_use]
-pub fn select_target(signal: Signal, threads: &[ThreadCandidate], preferred: usize) -> Option<usize> {
-    if preferred >= threads.len() {
-        return None;
-    }
-    (preferred..threads.len()).chain(0..preferred).find(|&index| {
+/// A stale or absent preferred slot is a caller error, not "no eligible thread".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BadCursor;
+
+/// Simplified complete_signal/wants_signal. preferred names Linux's p/curr_target,
+/// not an index in the candidate slice. The cyclic scan returns a slot identity.
+/// The caller retains the cursor and implements wakeups, group-exit and job control.
+#[must_use = "Handle a stale cursor separately from having no eligible thread"]
+pub fn select_target(
+    signal: Signal,
+    threads: &[ThreadCandidate],
+    preferred: ThreadSlot,
+) -> Result<Option<ThreadSlot>, BadCursor> {
+    let start = threads.iter().position(|thread| thread.slot == preferred).ok_or(BadCursor)?;
+    Ok((start..threads.len()).chain(0..start).find_map(|index| {
         let thread = threads[index];
         if thread.state == ThreadState::Exiting || thread.mask.contains(signal) {
-            return false;
+            return None;
         }
-        signal == Signal::KILL
+        (signal == Signal::KILL
             || thread.state == ThreadState::Running
-            || (thread.state == ThreadState::Sleeping && !thread.has_pending)
-    })
+            || (thread.state == ThreadState::Sleeping && !thread.has_pending))
+            .then_some(thread.slot)
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vacant_thread_slot_is_one_word() {
+        assert_eq!(size_of::<SlotStorage>(), size_of::<usize>());
+        let (mut pending, slots) = PendingSignals::new(1, 0).unwrap();
+        pending.remove_thread(slots[0]).unwrap();
+        assert!(pending.threads[0].is_none());
+    }
+
+    #[test]
+    fn trusted_siginfo_decoder_validates_signo() {
+        let mut bytes = [0x5a; 128];
+        bytes[..4].copy_from_slice(&64u32.to_le_bytes());
+        assert_eq!(*SigInfo::from_bytes(bytes).unwrap().bytes(), bytes);
+        for number in [0u32, 65, 0x100_0001] {
+            bytes[..4].copy_from_slice(&number.to_le_bytes());
+            assert_eq!(SigInfo::from_bytes(bytes), None);
+        }
+    }
 }
