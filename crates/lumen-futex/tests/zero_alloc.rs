@@ -5,6 +5,7 @@
 //! observes heap traffic.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lumen_futex::{CancelOutcome, FUTEX_BITSET_MATCH_ANY, FutexError, FutexNode, FutexTable};
@@ -32,6 +33,10 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static A: Counting = Counting;
+
+fn nz(v: u32) -> NonZeroU32 {
+    NonZeroU32::new(v).unwrap()
+}
 
 fn assert_zero_heap_traffic<R>(label: &str, f: impl FnOnce() -> R) -> R {
     let allocs_before = ALLOC_COUNT.load(Ordering::SeqCst);
@@ -64,136 +69,118 @@ fn enqueue_wake_requeue_cancel_perform_zero_allocations() {
     drop(probe);
     assert!(DEALLOC_COUNT.load(Ordering::SeqCst) > d0, "counting allocator must observe dealloc");
 
-    // Pre-allocate nodes and a holding Vec outside the lock / measurement window.
+    // Pre-allocate all nodes and per-waiter bucket mirrors outside the measurement window.
+    // Assign bitsets by `(i / 4) % 4` so each of the 4 keys receives a mix of all 4 bits.
     let mut pool: Vec<Box<FutexNode<u64, u32>>> =
-        (0..64u32).map(|i| Box::new(FutexNode::new(i, 1u32 << (i % 4)))).collect();
-    let mut zero_bitset_node = Box::new(FutexNode::new(999, 0));
+        (0..64u32).map(|i| Box::new(FutexNode::new(i, nz(1u32 << ((i / 4) % 4))))).collect();
+    let mut cancel_node = Some(Box::new(FutexNode::new(64, FUTEX_BITSET_MATCH_ANY)));
+    let waiter_bucket: [AtomicUsize; 65] = std::array::from_fn(|_| AtomicUsize::new(0));
     let mut table = FutexTable::<u64, u32>::new();
     let mut other_bucket = FutexTable::<u64, u32>::new();
 
-    // 1. `enqueue` (both normal and refused zero-bitset) allocates and frees nothing.
-    zero_bitset_node = assert_zero_heap_traffic("enqueue(zero bitset)", || {
-        let err = table.enqueue(1, zero_bitset_node).unwrap_err();
-        assert_eq!(err.kind, FutexError::ZeroBitset);
-        err.node
-    });
-
+    // 1. `enqueue` allocates and frees nothing.
     assert_zero_heap_traffic("enqueue(32 nodes across 4 keys)", || {
         for i in 0..32u64 {
             let n = pool.pop().unwrap();
-            table.enqueue(i % 4, n).unwrap();
+            table.enqueue(i % 4, n);
         }
     });
     assert_eq!(table.len(), 32);
 
-    // 2. `wake` (matching subset, nr == 0, negative nr, zero-bitset error) allocates and frees nothing.
-    assert_zero_heap_traffic("wake(zero bitset)", || {
-        assert_eq!(table.wake(0, 1, 0).unwrap_err(), FutexError::ZeroBitset);
-    });
-
+    // 2. `wake` (matching bitset subset, nr == 0, negative nr) allocates and frees nothing.
+    // Key 0 has 8 nodes with bitsets spanning 0b0001..=0b1000 (4 match 0b0011).
     assert_zero_heap_traffic("wake(bitset subset)", || {
-        let mut woken = table.wake(0, 3, 0b0011).unwrap();
-        while let Some(n) = woken.pop() {
-            pool.push(n);
-        }
+        let woken = table.wake(0, 3, nz(0b0011));
+        assert_eq!(woken.len(), 3);
+        pool.extend(woken);
     });
 
     assert_zero_heap_traffic("wake(nr == 0 and nr < 0)", || {
-        let mut w0 = table.wake(1, 0, FUTEX_BITSET_MATCH_ANY).unwrap();
+        let w0 = table.wake(1, 0, FUTEX_BITSET_MATCH_ANY);
         assert_eq!(w0.len(), 1);
-        while let Some(n) = w0.pop() {
-            pool.push(n);
-        }
-        let mut wneg = table.wake(1, -1, FUTEX_BITSET_MATCH_ANY).unwrap();
+        pool.extend(w0);
+
+        let wneg = table.wake(1, -1, FUTEX_BITSET_MATCH_ANY);
         assert_eq!(wneg.len(), 1);
-        while let Some(n) = wneg.pop() {
-            pool.push(n);
-        }
+        pool.extend(wneg);
     });
 
     // 3. `requeue` and `requeue_into` allocate and free nothing.
     assert_zero_heap_traffic("requeue(negative count)", || {
-        assert_eq!(table.requeue(2, 3, -1, 1).unwrap_err(), FutexError::NegativeCount);
+        assert_eq!(table.requeue(2, 3, -1, 1, |_, _| {}).unwrap_err(), FutexError::NegativeCount);
     });
 
     assert_zero_heap_traffic("requeue(same table, from != to)", || {
-        let (mut woken, moved) = table.requeue(2, 3, 2, 4).unwrap();
+        let (woken, moved) = table
+            .requeue(2, 3, 2, 4, |w, _| {
+                waiter_bucket[*w as usize].store(0, Ordering::Release);
+            })
+            .unwrap();
         assert_eq!(woken.len(), 2);
         assert_eq!(moved, 4);
-        while let Some(n) = woken.pop() {
-            pool.push(n);
-        }
+        pool.extend(woken);
     });
 
     assert_zero_heap_traffic("requeue(same table, from == to)", || {
-        let (mut woken, moved) = table.requeue(3, 3, 1, 3).unwrap();
+        let (woken, moved) = table.requeue(3, 3, 1, 3, |_, _| {}).unwrap();
         assert_eq!(woken.len(), 1);
         assert_eq!(moved, 3);
-        while let Some(n) = woken.pop() {
-            pool.push(n);
-        }
+        pool.extend(woken);
     });
 
     assert_zero_heap_traffic("requeue_into(across buckets)", || {
-        let (mut woken, moved) = table.requeue_into(3, &mut other_bucket, 10, 1, 5).unwrap();
+        let (woken, moved) = table
+            .requeue_into(3, &mut other_bucket, 10, 1, 5, |w, _| {
+                waiter_bucket[*w as usize].store(1, Ordering::Release);
+            })
+            .unwrap();
         assert_eq!(woken.len(), 1);
         assert_eq!(moved, 5);
-        while let Some(n) = woken.pop() {
-            pool.push(n);
-        }
+        pool.extend(woken);
     });
 
     // 4. `cancel` (both `Cancelled` and `AlreadyWoken`) allocates and frees nothing.
-    let target_waiter = assert_zero_heap_traffic("cancel(Cancelled and AlreadyWoken)", || {
-        // Enqueue a fresh known waiter on key 10 in `other_bucket`, cancel it,
-        // then cancel again to hit `AlreadyWoken`.
-        let mut n = pool.pop().unwrap();
-        n.reset(777, FUTEX_BITSET_MATCH_ANY);
-        other_bucket.enqueue(10, n).unwrap();
+    assert_zero_heap_traffic("cancel(Cancelled and AlreadyWoken)", || {
+        let n = cancel_node.take().unwrap();
+        other_bucket.enqueue(10, n);
 
-        match other_bucket.cancel(10, &777) {
+        match other_bucket.cancel(|w| *w == 64) {
             CancelOutcome::Cancelled(returned) => {
-                assert_eq!(*returned.waiter(), 777);
-                pool.push(returned);
+                assert_eq!(*returned.waiter(), 64);
+                assert_eq!(returned.key(), Some(10));
+                cancel_node = Some(returned);
             }
             CancelOutcome::AlreadyWoken => panic!("expected Cancelled"),
         }
-        assert!(other_bucket.cancel(10, &777).is_already_woken());
-        777u32
+        assert!(other_bucket.cancel(|w| *w == 64).is_already_woken());
     });
-    assert_eq!(target_waiter, 777);
 
     // 5. Sustained interleaved churn recycling the pre-allocated node pool: 0 allocs, 0 deallocs.
     assert_zero_heap_traffic("interleaved churn (200 rounds)", || {
         for round in 0..200u32 {
             let k1 = (round % 4) as u64;
             let k2 = ((round + 1) % 4) as u64;
-            if let Some(mut n) = pool.pop() {
-                n.reset(round, 1u32 << (round % 4));
-                table.enqueue(k1, n).unwrap();
+            if let Some(n) = pool.pop() {
+                table.enqueue(k1, n);
             }
             if round % 3 == 0 {
-                let (mut woken, _) = table.requeue(k1, k2, 1, 2).unwrap();
-                while let Some(n) = woken.pop() {
-                    pool.push(n);
-                }
+                let (woken, _) = table.requeue(k1, k2, 1, 2, |_, _| {}).unwrap();
+                pool.extend(woken);
             }
             if round % 5 == 0
-                && let CancelOutcome::Cancelled(n) = table.cancel(k2, &round)
+                && let CancelOutcome::Cancelled(n) = table.cancel(|w| *w == round % 64)
             {
                 pool.push(n);
             }
             if round % 2 == 0 {
-                let mut woken = table.wake(k2, 2, FUTEX_BITSET_MATCH_ANY).unwrap();
-                while let Some(n) = woken.pop() {
-                    pool.push(n);
-                }
+                let woken = table.wake(k2, 2, FUTEX_BITSET_MATCH_ANY);
+                pool.extend(woken);
             }
         }
     });
 
     // Drop everything outside the zero-heap measurement window.
-    drop(zero_bitset_node);
+    drop(cancel_node);
     drop(table);
     drop(other_bucket);
     drop(pool);
