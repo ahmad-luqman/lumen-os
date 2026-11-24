@@ -1,8 +1,10 @@
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use super::*;
 
@@ -24,6 +26,41 @@ fn ids<K>(woken: Woken<K, u32>) -> Vec<u32> {
 
 fn drain(table: &mut FutexTable<u64, u32>, key: u64) -> Vec<u32> {
     ids(table.wake(key, i32::MAX, FUTEX_BITSET_MATCH_ANY))
+}
+
+/// Fixed-capacity, non-allocating recorder for `on_requeue` callbacks in tests.
+struct Moves<const N: usize> {
+    buf: [(u32, u64); N],
+    len: usize,
+}
+
+impl<const N: usize> Moves<N> {
+    const fn new() -> Self {
+        Self { buf: [(0, 0); N], len: 0 }
+    }
+
+    fn record(&mut self, waiter: &u32, key: u64) {
+        self.buf[self.len] = (*waiter, key);
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[(u32, u64)] {
+        &self.buf[..self.len]
+    }
+}
+
+#[test]
+fn check_requeue_counts_rejects_negative() {
+    assert_eq!(check_requeue_counts(0, 0), Ok(()));
+    assert_eq!(check_requeue_counts(1, 0), Ok(()));
+    assert_eq!(check_requeue_counts(0, 1), Ok(()));
+    assert_eq!(check_requeue_counts(i32::MAX, i32::MAX), Ok(()));
+
+    assert_eq!(check_requeue_counts(-1, 0), Err(FutexError::NegativeCount));
+    assert_eq!(check_requeue_counts(0, -1), Err(FutexError::NegativeCount));
+    assert_eq!(check_requeue_counts(-1, -1), Err(FutexError::NegativeCount));
+    assert_eq!(check_requeue_counts(i32::MIN, 0), Err(FutexError::NegativeCount));
+    assert_eq!(check_requeue_counts(0, i32::MIN), Err(FutexError::NegativeCount));
 }
 
 #[test]
@@ -72,37 +109,29 @@ fn wake_fifo_order_and_key_isolation() {
 #[test]
 fn woken_len_and_size_hint_track_partial_drain() {
     let mut table = FutexTable::<u64, u32>::new();
-    table.enqueue(1, node_any(10));
-    table.enqueue(1, node_any(20));
-    table.enqueue(1, node_any(30));
+    let expected = [10u32, 20, 30];
+    for id in expected {
+        table.enqueue(1, node_any(id));
+    }
 
     let mut woken = table.wake(1, i32::MAX, FUTEX_BITSET_MATCH_ANY);
-    assert!(!woken.is_empty());
-    assert_eq!(woken.len(), 3);
-    assert_eq!(ExactSizeIterator::len(&woken), 3);
-    assert_eq!(woken.size_hint(), (3, Some(3)));
+    for (idx, &id) in expected.iter().enumerate() {
+        let rem = expected.len() - idx;
+        assert!(!woken.is_empty());
+        assert_eq!(woken.len(), rem);
+        assert_eq!(ExactSizeIterator::len(&woken), rem);
+        assert_eq!(woken.size_hint(), (rem, Some(rem)));
+        assert_eq!(woken.next().unwrap().into_waiter(), id);
+    }
 
-    assert_eq!(woken.next().unwrap().into_waiter(), 10);
-    assert!(!woken.is_empty());
-    assert_eq!(woken.len(), 2);
-    assert_eq!(ExactSizeIterator::len(&woken), 2);
-    assert_eq!(woken.size_hint(), (2, Some(2)));
-
-    assert_eq!(woken.next().unwrap().into_waiter(), 20);
-    assert_eq!(woken.len(), 1);
-    assert_eq!(ExactSizeIterator::len(&woken), 1);
-    assert_eq!(woken.size_hint(), (1, Some(1)));
-
-    assert_eq!(woken.next().unwrap().into_waiter(), 30);
-    assert!(woken.is_empty());
-    assert_eq!(woken.len(), 0);
-    assert_eq!(ExactSizeIterator::len(&woken), 0);
-    assert_eq!(woken.size_hint(), (0, Some(0)));
-
-    // Fused: subsequent `next()` returns `None` and keeps `len == 0`.
-    assert!(woken.next().is_none());
-    assert_eq!(woken.len(), 0);
-    assert_eq!(woken.size_hint(), (0, Some(0)));
+    // Exhausted and fused: subsequent `next()` returns `None` and keeps `len == 0`.
+    for _ in 0..2 {
+        assert!(woken.is_empty());
+        assert_eq!(woken.len(), 0);
+        assert_eq!(ExactSizeIterator::len(&woken), 0);
+        assert_eq!(woken.size_hint(), (0, Some(0)));
+        assert!(woken.next().is_none());
+    }
 }
 
 #[test]
@@ -124,6 +153,7 @@ fn reenqueued_woken_node_is_found_at_new_key() {
     let n = woken2.next().unwrap();
     assert_eq!(n.key(), Some(2));
     assert_eq!(n.into_waiter(), 42);
+    assert!(woken2.next().is_none());
     assert!(table.is_empty());
 }
 
@@ -201,17 +231,10 @@ fn requeue_keeps_order_and_preserves_bitset() {
     table.enqueue(20, node_any(101));
     table.enqueue(10, node_any(4));
 
-    let mut seen_moves = [(0u32, 0u64); 2];
-    let mut seen_len = 0usize;
-    let (woken, moved) = table
-        .requeue(10, 20, 1, 2, |w, new_key| {
-            seen_moves[seen_len] = (*w, new_key);
-            seen_len += 1;
-        })
-        .unwrap();
+    let mut moves = Moves::<2>::new();
+    let (woken, moved) = table.requeue(10, 20, 1, 2, |w, k| moves.record(w, k)).unwrap();
     assert_eq!(moved, 2);
-    assert_eq!(seen_len, 2);
-    assert_eq!(seen_moves, [(2, 20), (3, 20)]);
+    assert_eq!(moves.as_slice(), [(2, 20), (3, 20)]);
 
     let woken_nodes: Vec<_> = woken.collect();
     assert_eq!(woken_nodes.len(), 1);
@@ -282,24 +305,19 @@ fn requeue_nr_edge_cases_match_linux() {
     assert_eq!(table.count_for_key(1), 0);
 
     // `from == to` with a bystander key (99) interleaved: wakes up to `nr_wake`,
-    // keeps remaining FIFO order without rotating or double-counting, and leaves
-    // the bystander untouched and unnotified.
+    // keeps remaining FIFO order without rotating or double-counting, still
+    // counts them in `moved` and invokes `on_requeue`, and leaves the bystander
+    // untouched and unnotified.
     table.enqueue(99, node_any(900));
     table.enqueue(2, node_any(5));
     table.enqueue(99, node_any(901));
     table.enqueue(2, node_any(6));
     // Key 2 now has [1, 2, 5, 6]; key 99 has [900, 901].
-    let mut cb_hits = [(0u32, 0u64); 4];
-    let mut cb_len = 0usize;
-    let (woken, moved) = table
-        .requeue(2, 2, 1, 2, |w, k| {
-            cb_hits[cb_len] = (*w, k);
-            cb_len += 1;
-        })
-        .unwrap();
+    let mut moves = Moves::<4>::new();
+    let (woken, moved) = table.requeue(2, 2, 1, 2, |w, k| moves.record(w, k)).unwrap();
     assert_eq!(ids(woken), [1]);
     assert_eq!(moved, 2);
-    assert_eq!(&cb_hits[..cb_len], [(2, 2), (5, 2)]);
+    assert_eq!(moves.as_slice(), [(2, 2), (5, 2)]);
 
     // Remaining order on key 2 must stay [2, 5, 6]; bystander key 99 stays [900, 901].
     let (woken, moved) = table.requeue(2, 2, 0, 100, |_, _| {}).unwrap();
@@ -326,36 +344,26 @@ fn requeue_into_across_tables() {
     assert_eq!(src.requeue_into(1, &mut dst, 2, 1, -1, |_, _| {}).unwrap_err(), FutexError::NegativeCount);
 
     // `(0, 1)` wakes 0 and moves waiter 10 to `dst`'s tail.
-    let mut notified = [(0u32, 0u64); 4];
-    let mut notified_len = 0usize;
-    let (woken, moved) = src
-        .requeue_into(1, &mut dst, 2, 0, 1, |w, k| {
-            notified[notified_len] = (*w, k);
-            notified_len += 1;
-        })
-        .unwrap();
+    let mut moves = Moves::<4>::new();
+    let (woken, moved) = src.requeue_into(1, &mut dst, 2, 0, 1, |w, k| moves.record(w, k)).unwrap();
     assert!(woken.is_empty());
     assert_eq!(moved, 1);
-    assert_eq!(&notified[..notified_len], [(10, 2)]);
+    assert_eq!(moves.as_slice(), [(10, 2)]);
     assert_eq!(src.len(), 4);
     assert_eq!(dst.len(), 2);
 
     // `(1, 2)` wakes waiter 11 and moves waiters 12, 13 to `dst`'s tail.
-    notified_len = 0;
-    let (woken, moved) = src
-        .requeue_into(1, &mut dst, 2, 1, 2, |w, k| {
-            notified[notified_len] = (*w, k);
-            notified_len += 1;
-        })
-        .unwrap();
+    let mut moves = Moves::<4>::new();
+    let (woken, moved) = src.requeue_into(1, &mut dst, 2, 1, 2, |w, k| moves.record(w, k)).unwrap();
     assert_eq!(ids(woken), [11]);
     assert_eq!(moved, 2);
-    assert_eq!(&notified[..notified_len], [(12, 2), (13, 2)]);
+    assert_eq!(moves.as_slice(), [(12, 2), (13, 2)]);
     assert_eq!(src.len(), 1);
     assert_eq!(dst.len(), 4);
 
-    // Waiter 12 is no longer in `src` (`AlreadyWoken`) and cancels cleanly in `dst`.
-    assert!(src.cancel(|w| *w == 12).is_already_woken());
+    // Waiter 12 is absent from `src` (`AlreadyWoken` here only means not in
+    // `src`, not that waiter 12 was woken) and cancels cleanly in `dst`.
+    assert!(matches!(src.cancel(|w| *w == 12), CancelOutcome::AlreadyWoken));
     let cancelled = dst.cancel(|w| *w == 12).into_node().unwrap();
     assert_eq!(cancelled.key(), Some(2));
     assert_eq!(cancelled.into_waiter(), 12);
@@ -370,7 +378,7 @@ fn requeue_into_across_tables() {
 #[test]
 fn cancel_after_wake_reports_already_woken() {
     let mut table = FutexTable::<u64, u32>::new();
-    assert!(table.cancel(|w| *w == 99).is_already_woken());
+    assert!(matches!(table.cancel(|w| *w == 99), CancelOutcome::AlreadyWoken));
 
     table.enqueue(1, node_any(1));
     table.enqueue(1, node_any(2));
@@ -379,18 +387,19 @@ fn cancel_after_wake_reports_already_woken() {
     // Wake waiter 1.
     assert_eq!(ids(table.wake(1, 1, FUTEX_BITSET_MATCH_ANY)), [1]);
 
-    // Cancelling waiter 1 after wake must report `AlreadyWoken`.
-    assert!(table.cancel(|w| *w == 1).is_already_woken());
+    // Cancelling waiter 1 after wake reports `AlreadyWoken`.
+    assert!(matches!(table.cancel(|w| *w == 1), CancelOutcome::AlreadyWoken));
 
     // Cancelling waiter 2 while still queued returns `Cancelled` and removes it.
-    let cancelled = table.cancel(|w| *w == 2);
-    assert!(cancelled.is_cancelled());
-    let cancelled_node = cancelled.into_node().unwrap();
+    let cancelled_node = match table.cancel(|w| *w == 2) {
+        CancelOutcome::Cancelled(node) => node,
+        CancelOutcome::AlreadyWoken => panic!("expected Cancelled"),
+    };
     assert_eq!(cancelled_node.key(), Some(1));
     assert_eq!(cancelled_node.into_waiter(), 2);
 
     // Cancelling waiter 2 a second time reports `AlreadyWoken`.
-    assert!(table.cancel(|w| *w == 2).is_already_woken());
+    assert!(matches!(table.cancel(|w| *w == 2), CancelOutcome::AlreadyWoken));
 
     // Only waiter 3 remains.
     assert_eq!(drain(&mut table, 1), [3]);
@@ -416,46 +425,199 @@ fn cancel_after_requeue_without_key_and_across_buckets() {
     let cancelled = table.cancel(|w| *w == 1).into_node().unwrap();
     assert_eq!(cancelled.key(), Some(20));
     assert_eq!(cancelled.into_waiter(), 1);
-    assert!(table.cancel(|w| *w == 1).is_already_woken());
+    assert!(matches!(table.cancel(|w| *w == 1), CancelOutcome::AlreadyWoken));
 
     assert_eq!(drain(&mut table, 20), [2]);
     assert_eq!(drain(&mut table, 10), [3]);
     assert!(table.is_empty());
 
-    // 2. Multi-bucket requeue using the atomic bucket-index (`lock_ptr`)
-    //    pattern with zero heap allocation in `on_requeue`.
+    // 2. Single-threaded multi-bucket requeue (no recheck race; the race is
+    //    tested with `std::sync::Mutex` in `bucket_index_cancel_in_retries_across_mutex_move`).
     const BUCKETS: usize = 2;
     let bucket_of = |key: u64| (key as usize) % BUCKETS;
-    let mut buckets: [FutexTable<u64, u32>; BUCKETS] = core::array::from_fn(|_| FutexTable::new());
-    let waiter_bucket: [AtomicUsize; 3] = core::array::from_fn(|_| AtomicUsize::new(usize::MAX));
+    let buckets: [RefCell<FutexTable<u64, u32>>; BUCKETS] = core::array::from_fn(|_| RefCell::new(FutexTable::new()));
+    let waiter_bucket: [BucketIndex; 3] = core::array::from_fn(|_| BucketIndex::new(usize::MAX));
 
     for id in 0..3u32 {
         let key = 10u64; // bucket 0
-        waiter_bucket[id as usize].store(bucket_of(key), Ordering::Release);
-        buckets[bucket_of(key)].enqueue(key, node_any(id));
+        waiter_bucket[id as usize].set(bucket_of(key));
+        buckets[bucket_of(key)].borrow_mut().enqueue(key, node_any(id));
     }
 
     // Requeue waiters 0 and 1 from key 10 (bucket 0) to key 11 (bucket 1).
-    let [b0, b1] = buckets.get_disjoint_mut([0, 1]).unwrap();
-    let (woken, moved) = b0
-        .requeue_into(10, b1, 11, 0, 2, |w, new_key| {
-            waiter_bucket[*w as usize].store(bucket_of(new_key), Ordering::Release);
+    let (woken, moved) = buckets[0]
+        .borrow_mut()
+        .requeue_into(10, &mut buckets[1].borrow_mut(), 11, 0, 2, |w, new_key| {
+            waiter_bucket[*w as usize].set(bucket_of(new_key));
         })
         .unwrap();
     assert!(woken.is_empty());
     assert_eq!(moved, 2);
 
-    // Waiter 0 loads its atomic bucket index -> bucket 1, cancels cleanly.
-    let b = waiter_bucket[0].load(Ordering::Acquire);
-    assert_eq!(b, 1);
-    let cancelled = buckets[b].cancel(|w| *w == 0).into_node().unwrap();
+    // Waiter 0 cancels via `BucketIndex::cancel_in` -> finds bucket 1 and key 11.
+    assert_eq!(waiter_bucket[0].get(), 1);
+    let cancelled = waiter_bucket[0].cancel_in(|b| buckets[b].borrow_mut(), |w| *w == 0).into_node().unwrap();
     assert_eq!(cancelled.key(), Some(11));
     assert_eq!(cancelled.into_waiter(), 0);
 
-    // A waiter absent from a bucket reports `AlreadyWoken`.
-    assert!(buckets[0].cancel(|w| *w == 1).is_already_woken());
-    assert_eq!(drain(&mut buckets[1], 11), [1]);
-    assert_eq!(drain(&mut buckets[0], 10), [2]);
+    // Waiter 1 is absent from `buckets[0]` (`AlreadyWoken` here means only
+    // "not in bucket 0", not that waiter 1 was woken).
+    assert!(matches!(buckets[0].borrow_mut().cancel(|w| *w == 1), CancelOutcome::AlreadyWoken));
+    assert_eq!(drain(&mut buckets[1].borrow_mut(), 11), [1]);
+    assert_eq!(drain(&mut buckets[0].borrow_mut(), 10), [2]);
+}
+
+#[test]
+fn bucket_index_cancel_in_retries_across_mutex_move() {
+    #[derive(Debug)]
+    struct Waiter {
+        id: u32,
+        bucket: BucketIndex,
+    }
+
+    let buckets: [Mutex<FutexTable<u64, Arc<Waiter>>>; 2] = core::array::from_fn(|_| Mutex::new(FutexTable::new()));
+
+    // 1. Deterministic race: move waiter from bucket 0 -> bucket 1 *between*
+    //    `cancel_in`'s pre-lock load of `0` and its lock acquisition of bucket 0.
+    let w0 = Arc::new(Waiter { id: 7, bucket: BucketIndex::new(0) });
+    buckets[0].lock().unwrap().enqueue(10, Box::new(FutexNode::new_match_any(Arc::clone(&w0))));
+
+    let mut lock_calls = Vec::new();
+    let mut moved_once = false;
+    let outcome = w0.bucket.cancel_in(
+        |b| {
+            lock_calls.push(b);
+            if b == 0 && !moved_once {
+                moved_once = true;
+                // Simulate a concurrent `requeue_into` locking buckets 0 and 1
+                // in ascending order before `cancel_in` gets bucket 0's lock.
+                let mut g0 = buckets[0].lock().unwrap();
+                let mut g1 = buckets[1].lock().unwrap();
+                let (woken, moved) = g0.requeue_into(10, &mut g1, 11, 0, 1, |w, _| w.bucket.set(1)).unwrap();
+                assert!(woken.is_empty());
+                assert_eq!(moved, 1);
+            }
+            buckets[b].lock().unwrap()
+        },
+        |w| Arc::ptr_eq(w, &w0),
+    );
+
+    // `cancel_in` must have tried bucket 0, detected the move, retried bucket 1,
+    // cancelled the waiter at key 11, and dropped both mutex guards before returning.
+    assert_eq!(lock_calls, [0, 1]);
+    assert!(buckets[0].try_lock().is_ok());
+    assert!(buckets[1].try_lock().is_ok());
+    let cancelled = outcome.into_node().unwrap();
+    assert_eq!(cancelled.key(), Some(11));
+    assert_eq!(cancelled.waiter().id, 7);
+
+    // 2. Concurrent wake before `cancel_in` -> `AlreadyWoken`, locks released.
+    let w1 = Arc::new(Waiter { id: 8, bucket: BucketIndex::new(1) });
+    buckets[1].lock().unwrap().enqueue(11, Box::new(FutexNode::new_match_any(Arc::clone(&w1))));
+    let woken = {
+        let mut g1 = buckets[1].lock().unwrap();
+        g1.wake(11, 1, FUTEX_BITSET_MATCH_ANY)
+    };
+    assert_eq!(woken.count(), 1);
+    let outcome = w1.bucket.cancel_in(|b| buckets[b].lock().unwrap(), |w| Arc::ptr_eq(w, &w1));
+    assert!(matches!(outcome, CancelOutcome::AlreadyWoken));
+    assert!(buckets[1].try_lock().is_ok());
+
+    // 3. Multi-threaded stress: one thread repeatedly requeues waiters between
+    //    two `Mutex` buckets (and wakes some) while another cancels via `cancel_in`.
+    //    Every waiter must be either woken or cancelled exactly once.
+    const COUNT: usize = 64;
+    let shared_buckets = Arc::new(buckets);
+    let waiters: Vec<Arc<Waiter>> = (0..COUNT as u32)
+        .map(|id| {
+            let b = (id as usize) % 2;
+            let key = if b == 0 { 10 } else { 11 };
+            let w = Arc::new(Waiter { id, bucket: BucketIndex::new(b) });
+            shared_buckets[b].lock().unwrap().enqueue(key, Box::new(FutexNode::new_match_any(Arc::clone(&w))));
+            w
+        })
+        .collect();
+
+    let requeuer = {
+        let buckets = Arc::clone(&shared_buckets);
+        std::thread::spawn(move || {
+            let mut woken_ids = Vec::new();
+            for round in 0..200u32 {
+                let nr_wake = if round % 7 == 0 { 1 } else { 0 };
+                let (from_b, to_b, from_k, to_k) = if round % 2 == 0 { (0, 1, 10, 11) } else { (1, 0, 11, 10) };
+                let woken = {
+                    // Always acquire bucket locks in ascending index order (0 then 1).
+                    let mut g0 = buckets[0].lock().unwrap();
+                    let mut g1 = buckets[1].lock().unwrap();
+                    let (src, dst) = if from_b == 0 { (&mut *g0, &mut *g1) } else { (&mut *g1, &mut *g0) };
+                    let (woken, _) =
+                        src.requeue_into(from_k, dst, to_k, nr_wake, 4, |w, _| w.bucket.set(to_b)).unwrap();
+                    woken
+                };
+                for node in woken {
+                    woken_ids.push(node.waiter().id);
+                }
+            }
+            woken_ids
+        })
+    };
+
+    let mut cancelled_ids = Vec::new();
+    for w in &waiters {
+        if let CancelOutcome::Cancelled(node) =
+            w.bucket.cancel_in(|b| shared_buckets[b].lock().unwrap(), |cand| Arc::ptr_eq(cand, w))
+        {
+            cancelled_ids.push(node.waiter().id);
+        }
+    }
+
+    let mut all_ids = requeuer.join().unwrap();
+    all_ids.extend(cancelled_ids);
+    all_ids.sort_unstable();
+    let expected_ids: Vec<u32> = (0..COUNT as u32).collect();
+    assert_eq!(all_ids, expected_ids);
+    assert!(shared_buckets[0].lock().unwrap().is_empty());
+    assert!(shared_buckets[1].lock().unwrap().is_empty());
+}
+
+#[test]
+fn debug_format_exact_short_and_truncated() {
+    let mut table = FutexTable::<u64, u32>::new();
+    assert_eq!(format!("{table:?}"), "FutexTable { len: 0, keys: [] }");
+
+    let unqueued = FutexNode::<u64, u32>::new(42, nz(3));
+    assert_eq!(format!("{unqueued:?}"), "FutexNode { key: None, bitset: 3, waiter: 42 }");
+
+    table.enqueue(1, node_any(10));
+    table.enqueue(2, node_any(20));
+    assert_eq!(format!("{table:?}"), "FutexTable { len: 2, keys: [1, 2] }");
+
+    for k in 3..=8 {
+        table.enqueue(k, node_any(k as u32 * 10));
+    }
+    assert_eq!(format!("{table:?}"), "FutexTable { len: 8, keys: [1, 2, 3, 4, 5, 6, 7, 8] }");
+
+    table.enqueue(9, node_any(90));
+    assert_eq!(format!("{table:?}"), "FutexTable { len: 9, keys: [1, 2, 3, 4, 5, 6, 7, 8, ..] }");
+
+    // Same exact-string checks on `Woken` for 0, 2, 8, and 9 nodes.
+    let mut w_table = FutexTable::<u64, u32>::new();
+    let w0 = w_table.wake(1, 10, FUTEX_BITSET_MATCH_ANY);
+    assert_eq!(format!("{w0:?}"), "Woken { len: 0, keys: [] }");
+    assert_eq!(w0.count(), 0);
+
+    for (count, expected_fmt) in [
+        (2, "Woken { len: 2, keys: [1, 1] }"),
+        (8, "Woken { len: 8, keys: [1, 1, 1, 1, 1, 1, 1, 1] }"),
+        (9, "Woken { len: 9, keys: [1, 1, 1, 1, 1, 1, 1, 1, ..] }"),
+    ] {
+        for i in 0..count {
+            w_table.enqueue(1, node_any(i));
+        }
+        let woken = w_table.wake(1, i32::MAX, FUTEX_BITSET_MATCH_ANY);
+        assert_eq!(format!("{woken:?}"), expected_fmt);
+        assert_eq!(woken.count(), count as usize);
+    }
 }
 
 /// Deterministic SplitMix64 PRNG for randomized model tests.
@@ -487,7 +649,7 @@ impl VecModel {
     }
 
     fn wake(&mut self, key: u64, nr: i32, bitset: NonZeroU32) -> Vec<u32> {
-        let limit = if nr <= 0 { 1 } else { nr as usize };
+        let limit = nr.max(1) as usize;
         let mask = bitset.get();
         let mut woken = Vec::new();
         let mut kept = Vec::with_capacity(self.entries.len());
@@ -503,9 +665,7 @@ impl VecModel {
     }
 
     fn requeue(&mut self, from: u64, to: u64, nr_wake: i32, nr_requeue: i32) -> Result<(Vec<u32>, usize), FutexError> {
-        if nr_wake < 0 || nr_requeue < 0 {
-            return Err(FutexError::NegativeCount);
-        }
+        check_requeue_counts(nr_wake, nr_requeue)?;
         let wake_limit = nr_wake as usize;
         let requeue_limit = nr_requeue as usize;
 
@@ -571,10 +731,11 @@ fn run_model(seed: u64, num_keys: usize, num_buckets: usize, steps: usize) {
     let bucket_of = |key: u64| (key as usize) % num_buckets;
 
     let mut rng = Rng(seed);
-    let mut buckets: Vec<FutexTable<u64, u32>> = (0..num_buckets).map(|_| FutexTable::new()).collect();
+    let buckets: Vec<RefCell<FutexTable<u64, u32>>> =
+        (0..num_buckets).map(|_| RefCell::new(FutexTable::new())).collect();
     let mut model = VecModel::default();
-    // Pre-allocated atomic bucket mirror per waiter ID (zero allocation in `on_requeue`).
-    let waiter_bucket: Vec<AtomicUsize> = (0..steps).map(|_| AtomicUsize::new(usize::MAX)).collect();
+    // Pre-allocated atomic bucket index per waiter ID (zero allocation in `on_requeue`).
+    let waiter_bucket: Vec<BucketIndex> = (0..steps).map(|_| BucketIndex::new(usize::MAX)).collect();
     let mut next_waiter: u32 = 0;
 
     for step in 0..steps {
@@ -587,8 +748,8 @@ fn run_model(seed: u64, num_keys: usize, num_buckets: usize, steps: usize) {
                 next_waiter += 1;
 
                 let b = bucket_of(key);
-                waiter_bucket[id as usize].store(b, Ordering::Release);
-                buckets[b].enqueue(key, Box::new(FutexNode::new(id, bitset)));
+                waiter_bucket[id as usize].set(b);
+                buckets[b].borrow_mut().enqueue(key, Box::new(FutexNode::new(id, bitset)));
                 model.enqueue(key, id, bitset);
             }
             // Wake (20%)
@@ -597,7 +758,8 @@ fn run_model(seed: u64, num_keys: usize, num_buckets: usize, steps: usize) {
                 let nr = random_nr(&mut rng);
                 let bitset = random_bitset(&mut rng);
 
-                let actual = ids(buckets[bucket_of(key)].wake(key, nr, bitset));
+                let woken = buckets[bucket_of(key)].borrow_mut().wake(key, nr, bitset);
+                let actual = ids(woken);
                 let expected = model.wake(key, nr, bitset);
                 assert_eq!(actual, expected, "seed {seed:#x} buckets {num_buckets} step {step} wake({key}, {nr})");
             }
@@ -613,14 +775,15 @@ fn run_model(seed: u64, num_keys: usize, num_buckets: usize, steps: usize) {
                 let mut cb_count = 0usize;
                 let mut on_requeue = |w: &u32, new_key: u64| {
                     assert_eq!(new_key, to);
-                    waiter_bucket[*w as usize].store(bucket_of(new_key), Ordering::Release);
+                    waiter_bucket[*w as usize].set(bucket_of(new_key));
                     cb_count += 1;
                 };
                 let actual = if b1 == b2 {
-                    buckets[b1].requeue(from, to, nr_wake, nr_requeue, &mut on_requeue)
+                    buckets[b1].borrow_mut().requeue(from, to, nr_wake, nr_requeue, &mut on_requeue)
                 } else {
-                    let [src, dst] = buckets.get_disjoint_mut([b1, b2]).unwrap();
-                    src.requeue_into(from, dst, to, nr_wake, nr_requeue, &mut on_requeue)
+                    let mut src = buckets[b1].borrow_mut();
+                    let mut dst = buckets[b2].borrow_mut();
+                    src.requeue_into(from, &mut dst, to, nr_wake, nr_requeue, &mut on_requeue)
                 }
                 .map(|(w, m)| (ids(w), m));
                 let expected = model.requeue(from, to, nr_wake, nr_requeue);
@@ -638,18 +801,20 @@ fn run_model(seed: u64, num_keys: usize, num_buckets: usize, steps: usize) {
                     continue;
                 }
                 let id = rng.below(next_waiter as usize) as u32;
-                let b = waiter_bucket[id as usize].load(Ordering::Acquire);
-                let actual = buckets[b].cancel(|w| *w == id).into_node().map(|n| (n.key().unwrap(), n.into_waiter()));
+                let actual = waiter_bucket[id as usize]
+                    .cancel_in(|b| buckets[b].borrow_mut(), |w| *w == id)
+                    .into_node()
+                    .map(|n| (n.key().unwrap(), n.into_waiter()));
                 let expected = model.cancel(id);
                 assert_eq!(actual, expected, "seed {seed:#x} buckets {num_buckets} step {step} cancel({id})");
             }
         }
 
-        let total_len: usize = buckets.iter().map(FutexTable::len).sum();
+        let total_len: usize = buckets.iter().map(|b| b.borrow().len()).sum();
         assert_eq!(total_len, model.entries.len(), "seed {seed:#x} buckets {num_buckets} step {step} len");
         for k in 0..num_keys as u64 {
             assert_eq!(
-                buckets[bucket_of(k)].count_for_key(k),
+                buckets[bucket_of(k)].borrow().count_for_key(k),
                 model.count_for_key(k),
                 "seed {seed:#x} buckets {num_buckets} step {step} count_for_key({k})"
             );
@@ -678,8 +843,7 @@ fn drop_and_debug_deep_lists_without_stack_overflow() {
                 table.enqueue(1, node_any(i));
             }
             let table_dbg = format!("{table:?}");
-            assert!(table_dbg.contains("len: 10000"), "{table_dbg}");
-            assert!(table_dbg.contains(".."), "{table_dbg}");
+            assert_eq!(table_dbg, "FutexTable { len: 10000, keys: [1, 1, 1, 1, 1, 1, 1, 1, ..] }");
             drop(table);
 
             let mut table = FutexTable::<u64, u32>::new();
@@ -689,9 +853,8 @@ fn drop_and_debug_deep_lists_without_stack_overflow() {
             let woken = table.wake(1, i32::MAX, FUTEX_BITSET_MATCH_ANY);
             assert_eq!(woken.len(), N as usize);
             let woken_dbg = format!("{woken:?}");
-            assert!(woken_dbg.contains("len: 10000"), "{woken_dbg}");
-            assert!(woken_dbg.contains(".."), "{woken_dbg}");
-            drop(woken);
+            assert_eq!(woken_dbg, "Woken { len: 10000, keys: [1, 1, 1, 1, 1, 1, 1, 1, ..] }");
+            assert_eq!(woken.count(), N as usize);
         })
         .unwrap();
     handle.join().unwrap();
