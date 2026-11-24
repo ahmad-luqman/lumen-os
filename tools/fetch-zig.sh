@@ -67,7 +67,10 @@ STAMP="$ZIG_VERSION $HOST"
 MUSL_VERSION=1.2.5
 MUSL_H="lib/libc/musl/src/internal/version.h"
 
-if [[ -f "$DIR/.version" && "$(cat "$DIR/.version")" == "$STAMP" && -x "$DIR/zig" && -f "$DIR/$MUSL_H" ]]; then
+installed() {
+    [[ -f "$DIR/.version" && "$(cat "$DIR/.version")" == "$STAMP" && -x "$DIR/zig" && -f "$DIR/$MUSL_H" ]]
+}
+if installed; then
     exit 0
 fi
 
@@ -75,11 +78,14 @@ fi
 # replaced only once the new one is checked, so a failed or interrupted run
 # leaves the previous zig (or nothing) and never a stamp over a broken tree,
 # and two runs at once don't share files. A run killed outright (SIGKILL,
-# power loss) leaves its build/deps/zig.tmp.* behind; delete those by hand.
+# power loss) leaves its build/deps/zig.tmp.* (and maybe build/deps/zig.lock)
+# behind; delete those by hand.
 echo "fetch-zig: downloading zig $ZIG_VERSION for $HOST (about 50 MB)"
 mkdir -p "$DEPS"
 WORK=$(mktemp -d "$DEPS/zig.tmp.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT
+LOCK="$DEPS/zig.lock"
+LOCKED=
+trap 'rm -rf "$WORK"; if [[ -n "$LOCKED" ]]; then rmdir "$LOCK"; fi' EXIT
 ARCHIVE="$WORK/zig.tar.xz"
 NEW="$WORK/zig"
 mkdir -p "$NEW"
@@ -108,6 +114,23 @@ if ! grep -qF "\"$MUSL_VERSION\"" "$NEW/$MUSL_H" 2>/dev/null; then
     exit 1
 fi
 echo "$STAMP" > "$NEW/.version"
+
+# Publishing is serialized (mkdir is atomic), and a run that finds a good
+# install published meanwhile keeps it, so two runs at once both succeed.
+for _ in $(seq 600); do
+    if mkdir "$LOCK" 2>/dev/null; then
+        LOCKED=1
+        break
+    fi
+    sleep 0.5
+done
+if [[ -z "$LOCKED" ]]; then
+    echo "fetch-zig: $LOCK has been held for 5 minutes; if no other fetch-zig is running, remove it" >&2
+    exit 1
+fi
+if installed; then
+    exit 0
+fi
 # Rename the old tree aside (the trap deletes it) so the swap is two renames.
 if [[ -e "$DIR" ]]; then
     mv "$DIR" "$WORK/old"
