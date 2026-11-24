@@ -1,8 +1,10 @@
-//! What a `wait4` or `waitid` asks for ([`WaitRequest`]: its [`WaitTarget`]
-//! and [`WaitOptions`], checked in Linux's order) and what it gets
+//! What a `wait4` or `waitid` asks for ([`WaitRequest`]: its target and
+//! [`WaitOptions`], checked in Linux's order) and what it gets
 //! ([`WaitReady`], [`Report`]).
 
-use crate::{Errno, ExitStatus, Signal, WaitStatus};
+use lumen_signal::Signal;
+
+use crate::{Errno, ExitStatus, RusageSlot, SlotRef, WaitStatus};
 
 /// Return at once if no child is ready.
 pub const WNOHANG: u32 = 0x1;
@@ -40,7 +42,7 @@ const WAITID_ALLOWED: u32 = WNOHANG | WNOWAIT | WEXITED | WSTOPPED | WCONTINUED 
 
 /// Which children a wait considers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitTarget {
+pub(crate) enum WaitTarget {
     /// The child with this pid.
     Pid(u32),
     /// Any child in this process group (a `0` in the call already resolved
@@ -155,7 +157,9 @@ impl WaitOptions {
 /// children, with which options. Built once per syscall by
 /// [`crate::ProcTree::wait4_request`] or [`crate::ProcTree::waitid_request`]
 /// and reused across a blocking wait's retries (a `0` meaning the caller's
-/// group is resolved once, at the call, as Linux does).
+/// group is resolved once, at the call, as Linux does). It names processes
+/// and groups by number, not identity: rebuild it when the syscall
+/// restarts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WaitRequest {
     pub(crate) caller: u32,
@@ -165,12 +169,14 @@ pub struct WaitRequest {
 
 impl WaitRequest {
     /// The waiting process.
-    pub const fn caller(&self) -> u32 {
+    #[cfg(test)]
+    pub(crate) const fn caller(&self) -> u32 {
         self.caller
     }
 
     /// Which children it waits for.
-    pub const fn target(&self) -> WaitTarget {
+    #[cfg(test)]
+    pub(crate) const fn target(&self) -> WaitTarget {
         self.target
     }
 
@@ -202,10 +208,9 @@ pub enum Report {
         pid: u32,
         /// How it ended.
         status: ExitStatus,
-        /// The token the kernel gave the child when it was created, handed
-        /// back for the last time: the kernel adds the child's usage to the
-        /// parent's totals and frees it.
-        rusage_slot: u64,
+        /// The child's token, handed back for good: the kernel adds the
+        /// child's usage to the parent's totals and frees it.
+        rusage_slot: RusageSlot,
     },
     /// A zombie child reported under [`WNOWAIT`] and left in place.
     Zombie {
@@ -216,8 +221,8 @@ pub enum Report {
         /// The child's token, only lent: the kernel may read it to report
         /// `rusage`, but must neither free it nor add it to the parent's
         /// totals (Linux's `WNOWAIT` path skips that accumulation); a later
-        /// reap or release hands it back.
-        rusage_slot: u64,
+        /// reap hands it back.
+        lent_slot: SlotRef,
     },
     /// A stopped child not reported before (now reported, unless
     /// [`WNOWAIT`]).

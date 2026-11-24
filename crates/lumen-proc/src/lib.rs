@@ -3,7 +3,9 @@
 //!
 //! [`ProcTree`] holds every process the kernel knows by pid: its parent, its
 //! children in Linux's children-list order, its process group and session,
-//! its wait state ([`ProcState`]) and whether it has exec'd. On it:
+//! its wait state ([`ProcState`]), whether it has exec'd, and the kernel's
+//! token for its resource usage ([`RusageSlot`], owned by the tree until
+//! the process leaves it). On it:
 //!
 //! - **`wait4`/`waitid`**: [`ProcTree::wait4_request`] and
 //!   [`ProcTree::waitid_request`] check a call's arguments in Linux's order
@@ -11,11 +13,14 @@
 //!   reports ([`WaitReady`], [`Report`]), with the status words and
 //!   `siginfo` codes of [`WaitStatus`];
 //! - **exit and reparenting** ([`ProcTree::exit`]): the zombie, its children
-//!   moved to the reaper the kernel names, and what the kernel must then do
-//!   ([`ExitOutcome::actions`]: tell or release the zombies, hang up
-//!   orphaned process groups with a stopped member);
+//!   moved to the reaper the kernel names (or made roots, without one), the
+//!   zombies nobody will wait for removed, and what the kernel must then do
+//!   ([`ExitOutcome`]: notify parents, free tokens, hang up orphaned process
+//!   groups with a stopped member, whose members [`ProcTree::pgrp_members`]
+//!   lists; no further tree change, but the recipients are numbers, resolved
+//!   in the same lock hold);
 //! - **stops and continues** ([`ProcTree::stop`], [`ProcTree::cont`]), each
-//!   naming the parent to tell ([`StateChanged`]);
+//!   saying whom to tell ([`StateChange`]);
 //! - **sessions and groups**: [`ProcTree::setsid`], [`ProcTree::setpgid`],
 //!   [`ProcTree::getpgid`], [`ProcTree::getsid`], [`ProcTree::is_orphaned_pgrp`]
 //!   and the checks of `tcsetpgrp` ([`ProcTree::tcsetpgrp`]);
@@ -25,14 +30,25 @@
 //! Ids are plain `u32`s; arguments a syscall passes signed (`wait4`'s `pid`,
 //! `waitid`'s `idtype` and `id`, `setpgid`'s two, `getpgid`'s, `getsid`'s
 //! and `tcsetpgrp`'s `pgrp`) are taken as `i32` so their negative values get
-//! Linux's errors. Errors are [`Error`]s: an [`Errno`] for the user, or a
-//! [`Bug`], a call the kernel should never make, which maps to no `errno`.
+//! Linux's errors. Signals are `lumen_signal::Signal`s.
+//!
+//! Errors are per call. The calls made on behalf of a user (`fork`,
+//! `wait*`, `setsid`, `setpgid`, `getpgid`, `getsid`, `tcsetpgrp`) return
+//! [`Error`]: an [`Errno`] for the user, or a [`Bug`], a wrong or stale pid
+//! from the kernel, which maps to no `errno`. The others say only what can
+//! happen to them: [`ProcTree::exit`] an [`ExitError`], [`ProcTree::exec`]
+//! a [`Bug`], [`ProcTree::spawn_init`] a [`SpawnInitError`],
+//! [`ProcTree::spawn_root`] [`NoFreePid`], [`ProcTree::stop`] and
+//! [`ProcTree::cont`] `ESRCH`.
 //!
 //! Not modelled: threads (every process is one thread group with one
 //! thread), signal delivery and dispositions (the kernel sends what an
-//! operation returns), `rusage` accounting (each process carries an opaque
-//! `rusage_slot` token instead), controlling-terminal acquisition and
-//! hangup, `CLONE_PARENT`, ptrace and child subreapers.
+//! operation returns, and says through `exit`'s `autoreap` which parents
+//! ignore `SIGCHLD`), `rusage` accounting (the tree only carries each
+//! process's token), controlling-terminal acquisition and hangup,
+//! `CLONE_PARENT`, ptrace, child subreapers, and `PR_SET_PDEATHSIG` (the
+//! kernel reads [`ProcTree::children`] before [`ProcTree::exit`] to signal
+//! them).
 //!
 //! # Allocation
 //!
@@ -41,33 +57,43 @@
 //!
 //! - **Fallible allocation only:** [`ProcTree::exit`] reserves room in the
 //!   reaper's children list and in the exiting process's old children list,
-//!   which its [`ExitOutcome`] keeps for the actions. A failed reservation
-//!   is `ENOMEM` with the tree unchanged.
+//!   which its [`ExitOutcome`] keeps for the actions (room means the list
+//!   holds their words: two for a zombie, four for one released, one for a
+//!   hangup; without a reaper, after the children themselves). A failed reservation
+//!   is [`ExitError::NoMem`] with the tree unchanged. It also frees the
+//!   nodes of the zombies that leave.
 //! - **Infallible allocation (a known gap):** stable `BTreeMap`/`BTreeSet`
-//!   have no fallible insert. The node a new process takes
-//!   ([`ProcTree::spawn_init`], [`ProcTree::spawn_root`], [`ProcTree::fork`])
-//!   and the index entries [`ProcTree::setsid`] and [`ProcTree::setpgid`]
-//!   move can still abort on out-of-memory; the kernel issue must settle it.
-//!   `fork` reserves room in the parent's children list fallibly first
-//!   (`ENOMEM`, the tree unchanged). These calls can also free (an index
-//!   entry moved out of a node).
-//! - **Freeing only:** [`ProcTree::wait`] when it reaps, and
-//!   [`ProcTree::release`], free the zombie's node and index entries.
-//!   Dropping an [`ExitOutcome`] frees its list. That `wait` and `release`
-//!   never allocate rests on liballoc's current `BTreeMap::remove` and
-//!   `Vec::retain`; `tests/alloc.rs` checks it with a counting allocator.
-//! - **Neither:** the lookups, the request builders, [`ProcTree::exec`],
+//!   have no fallible insert. A new process takes three B-tree inserts (its
+//!   node and its two index entries; [`ProcTree::spawn_init`],
+//!   [`ProcTree::spawn_root`], [`ProcTree::fork`]), and
+//!   [`ProcTree::setsid`] and [`ProcTree::setpgid`] move index entries; any
+//!   of them can abort on out-of-memory, and the kernel issue must settle
+//!   it. A review counted up to 8 allocations in a `fork` (node splits), 7
+//!   in a `spawn_root`, 4 in a `setsid` and 2 in a `setpgid`; only `fork`'s
+//!   reservation in the parent's children list is fallible (`ENOMEM`, the
+//!   tree unchanged). These calls can also free.
+//! - **Freeing only:** [`ProcTree::wait`] when it reaps frees the zombie's
+//!   node and index entries. Dropping an [`ExitOutcome`]'s actions frees
+//!   their list. That a reaping `wait` never allocates rests on liballoc's
+//!   current `BTreeMap::remove` and `Vec::retain`; `tests/alloc.rs` checks
+//!   it with a counting allocator.
+//! - **Neither:** the lookups (including [`ProcTree::pgrp_members`]), the
+//!   request builders, a `wait` that doesn't reap, [`ProcTree::exec`],
 //!   [`ProcTree::stop`], [`ProcTree::cont`], [`ProcTree::getpgid`],
-//!   [`ProcTree::getsid`] and [`ProcTree::tcsetpgrp`].
+//!   [`ProcTree::getsid`] and [`ProcTree::tcsetpgrp`]; `tests/alloc.rs`
+//!   checks that they neither allocate nor free.
 
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod errno;
 mod exit;
 mod pid;
 mod session;
+mod slot;
 mod status;
 mod tree;
 mod wait;
@@ -75,15 +101,14 @@ mod wait;
 #[cfg(test)]
 mod tests;
 
-pub use errno::{Bug, Errno, Error};
-pub use exit::{ExitAction, ExitOutcome};
+pub use errno::{Bug, Errno, Error, ExitError, NoFreePid, Role, SpawnInitError};
+pub use exit::{ExitAction, ExitActions, ExitOutcome};
 pub use pid::{FIRST_PID, INIT_PID};
 pub use session::{Controlling, Sigttou, Tcsetpgrp};
-pub use status::{
-    CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ChildInfo, ExitStatus, Signal, WaitStatus,
-};
-pub use tree::{ProcState, ProcTree, StateChanged};
+pub use slot::{RusageSlot, SlotRef};
+pub use status::{CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ChildInfo, ExitStatus, WaitStatus};
+pub use tree::{ProcState, ProcTree, StateChange};
 pub use wait::{
     __WALL, __WCLONE, __WNOTHREAD, P_ALL, P_PGID, P_PID, P_PIDFD, Report, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
-    WSTOPPED, WUNTRACED, WaitOptions, WaitReady, WaitRequest, WaitTarget,
+    WSTOPPED, WUNTRACED, WaitOptions, WaitReady, WaitRequest,
 };

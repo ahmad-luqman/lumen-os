@@ -1,12 +1,14 @@
 //! The process tree: parents and children, groups and sessions, wait states,
-//! fork, release and wait. Exit is in `exit.rs`, sessions in `session.rs`.
+//! fork and wait. Exit is in `exit.rs`, sessions in `session.rs`.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+use lumen_signal::Signal;
+
 use crate::pid::PidAllocator;
 use crate::wait::{Report, WaitOptions, WaitReady, WaitRequest, WaitTarget};
-use crate::{Bug, Errno, Error, ExitStatus, INIT_PID, Signal};
+use crate::{Bug, Errno, Error, ExitStatus, INIT_PID, NoFreePid, Role, RusageSlot, SlotRef, SpawnInitError};
 
 /// A process's state as `wait` sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +40,8 @@ impl ProcState {
 #[cfg_attr(test, derive(Clone))]
 #[derive(Debug)]
 pub(crate) struct Proc {
-    /// `None` for a process the kernel started itself (init and other roots).
+    /// `None` for a root: a process the kernel started itself (init and
+    /// other roots), or one whose parent exited without a reaper.
     pub(crate) parent: Option<u32>,
     /// In Linux's children-list order: each child appended when forked or
     /// adopted (a dead parent's children appended in their order).
@@ -47,16 +50,24 @@ pub(crate) struct Proc {
     pub(crate) sid: u32,
     pub(crate) state: ProcState,
     pub(crate) execed: bool,
-    pub(crate) rusage_slot: u64,
+    /// The [`RusageSlot`]'s value: the tree owns the token until the
+    /// process leaves it.
+    pub(crate) slot: u64,
 }
 
-/// A process's wait state changed ([`ProcTree::stop`], [`ProcTree::cont`]):
-/// the kernel sends `SIGCHLD` to `parent` and wakes its waits.
+/// What [`ProcTree::stop`] or [`ProcTree::cont`] did.
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StateChanged {
-    /// The parent to notify, or `None` for a process without one.
-    pub parent: Option<u32>,
+pub enum StateChange {
+    /// The wait state changed. As Linux's `do_notify_parent_cldstop` does,
+    /// the kernel wakes `parent`'s waits, and sends it `SIGCHLD` unless its
+    /// disposition is `SIG_IGN` or it set `SA_NOCLDSTOP`.
+    Changed {
+        /// The parent to tell, or `None` for a root.
+        parent: Option<u32>,
+    },
+    /// Nothing changed (already stopped, or not stopped): nobody to tell.
+    Unchanged,
 }
 
 /// Every process the kernel knows, by pid, with the POSIX process-tree rules.
@@ -64,7 +75,9 @@ pub struct StateChanged {
 /// Its invariants, which every operation keeps:
 /// - each process's parent, if it has one, is a live process that lists it
 ///   among its children exactly once, and nothing else does (no cycles);
-/// - a zombie has no children: they went to the reaper when it exited;
+/// - a zombie has a parent and no children: its children went to the reaper
+///   (or became roots) when it exited, and a zombie without a parent (or
+///   whose parent autoreaps) leaves the tree inside [`ProcTree::exit`];
 /// - all members of a process group (live and zombie) are in one session;
 /// - no pid is handed out while a process uses the number as its pid, pgid
 ///   or sid.
@@ -99,47 +112,47 @@ impl ProcTree {
 
     // ---- creation and transitions ----
 
-    /// Adds init, pid 1, with no parent, as the leader of its own group and
-    /// session. `rusage_slot` is an opaque token the kernel gives the
-    /// process, handed back when it is reaped or released.
+    /// Adds init, pid 1 ([`INIT_PID`]), with no parent, as the leader of its
+    /// own group and session, taking its `rusage_slot` until it leaves the
+    /// tree.
     ///
-    /// [`Bug::InitExists`] while a process 1 is in the tree; `EAGAIN` while
-    /// the number is still some process's pgid or sid (it succeeds once 1
-    /// is free). Allocates infallibly (see the crate's Allocation section).
-    pub fn spawn_init(&mut self, rusage_slot: u64) -> Result<u32, Error> {
+    /// [`SpawnInitError::Exists`] while a process 1 is in the tree;
+    /// [`SpawnInitError::NumberBusy`] while the number is still some
+    /// process's pgid or sid. Allocates infallibly (see the crate's
+    /// Allocation section).
+    pub fn spawn_init(&mut self, rusage_slot: RusageSlot) -> Result<(), SpawnInitError> {
         if self.procs.contains_key(&INIT_PID) {
-            return Err(Bug::InitExists.into());
+            return Err(SpawnInitError::Exists);
         }
         if self.is_busy(INIT_PID) {
-            return Err(Errno::Again.into());
+            return Err(SpawnInitError::NumberBusy);
         }
         self.insert(INIT_PID, None, INIT_PID, INIT_PID, rusage_slot);
-        Ok(INIT_PID)
+        Ok(())
     }
 
-    /// Adds a process the kernel starts itself, with a new pid, no parent
-    /// (`getppid` 0), as the leader of its own group and session.
-    /// `rusage_slot` is an opaque token the kernel gives the process,
-    /// handed back when it is reaped or released. `EAGAIN` when no pid is
-    /// free. Allocates infallibly.
-    pub fn spawn_root(&mut self, rusage_slot: u64) -> Result<u32, Error> {
-        let pid = self.alloc_pid()?;
+    /// Adds a process the kernel starts itself, with a new pid, which it
+    /// returns, no parent (`getppid` 0), as the leader of its own group and
+    /// session, taking its `rusage_slot` until it leaves the tree.
+    /// [`NoFreePid`] when no pid is free. Allocates infallibly.
+    pub fn spawn_root(&mut self, rusage_slot: RusageSlot) -> Result<u32, NoFreePid> {
+        let pid = self.alloc_pid().map_err(|_| NoFreePid)?;
         self.insert(pid, None, pid, pid, rusage_slot);
         Ok(pid)
     }
 
     /// `fork`: a new child of `parent`, last in its children list, in its
-    /// group and session, running, not exec'd. `rusage_slot` is an opaque
-    /// token the kernel gives the child, handed back when it is reaped or
-    /// released.
+    /// group and session, running, not exec'd, taking its `rusage_slot`
+    /// until it leaves the tree.
     ///
     /// [`Bug::NotLive`] if `parent` isn't live; `ENOMEM` if room for the
     /// child in the parent's children list can't be reserved; `EAGAIN` when
     /// no pid is free. Any error leaves the tree unchanged. Besides that
-    /// fallible reservation, allocates infallibly (the tree node).
-    pub fn fork(&mut self, parent: u32, rusage_slot: u64) -> Result<u32, Error> {
+    /// fallible reservation, allocates infallibly (the process's node and
+    /// its two index entries).
+    pub fn fork(&mut self, parent: u32, rusage_slot: RusageSlot) -> Result<u32, Error> {
         let (pgid, sid) = {
-            let p = self.live(parent)?;
+            let p = self.live(parent, Role::Parent)?;
             (p.pgid, p.sid)
         };
         self.proc_mut(parent).children.try_reserve(1).map_err(|_| Errno::NoMem)?;
@@ -150,63 +163,48 @@ impl ProcTree {
         Ok(pid)
     }
 
-    /// `execve` succeeded: from now on its parent's `setpgid` on it is
-    /// `EACCES`. [`Bug::NotLive`] if `pid` isn't live.
-    pub fn exec(&mut self, pid: u32) -> Result<(), Error> {
-        self.live_mut(pid)?.execed = true;
+    /// `execve` by `pid` succeeded: from now on its parent's `setpgid` on it
+    /// is `EACCES`. [`Bug::NotLive`] if `pid` isn't live.
+    pub fn exec(&mut self, pid: u32) -> Result<(), Bug> {
+        self.live_entry_mut(pid).ok_or(Bug::NotLive { pid, role: Role::Caller })?.execed = true;
         Ok(())
     }
 
     /// A stop signal stopped `pid`: its stop is unreported until a wait with
     /// `WUNTRACED`/`WSTOPPED` reports it, and a continue not yet reported is
-    /// forgotten. The parent to notify if it changed state; `None` if it
-    /// was already stopped. `ESRCH` if `pid` isn't live: a signal reaching
-    /// a zombie (a `kill`, or a [`crate::ExitAction::HangupThenContinue`]
-    /// to a group with zombie members) stops nothing; the kernel decides
-    /// what its sender sees.
-    pub fn stop(&mut self, pid: u32, signal: Signal) -> Result<Option<StateChanged>, Errno> {
-        let p = self.live_for_signal(pid)?;
+    /// forgotten. Whether it changed state ([`StateChange`]).
+    ///
+    /// The kernel decides whether a stop happens: as Linux's `get_signal`
+    /// does, a job-control stop (`SIGTSTP`, `SIGTTIN`, `SIGTTOU`) does
+    /// nothing in an orphaned group ([`ProcTree::is_orphaned_pgrp`]), while
+    /// `SIGSTOP` always stops.
+    ///
+    /// `ESRCH` if `pid` isn't live: a zombie (a signal reaching it stops
+    /// nothing), or not in the tree (a stale pid in the kernel); the kernel
+    /// decides what the sender sees.
+    pub fn stop(&mut self, pid: u32, signal: Signal) -> Result<StateChange, Errno> {
+        let p = self.live_entry_mut(pid).ok_or(Errno::Srch)?;
         if matches!(p.state, ProcState::Stopped { .. }) {
-            return Ok(None);
+            return Ok(StateChange::Unchanged);
         }
         p.state = ProcState::Stopped { signal, reported: false };
-        Ok(Some(StateChanged { parent: p.parent }))
+        Ok(StateChange::Changed { parent: p.parent })
     }
 
     /// `SIGCONT` reached `pid`: a stopped process runs again, its continue
     /// unreported until a wait with `WCONTINUED` reports it; a stop not yet
-    /// reported is forgotten. The parent to notify if it was stopped;
-    /// `None` (no change) otherwise. `ESRCH` if `pid` isn't live, as for
-    /// [`ProcTree::stop`].
-    pub fn cont(&mut self, pid: u32) -> Result<Option<StateChanged>, Errno> {
-        let p = self.live_for_signal(pid)?;
+    /// reported is forgotten. Whether it was stopped ([`StateChange`]).
+    ///
+    /// `ESRCH` if `pid` isn't live: a zombie (expected when the kernel
+    /// carries out a [`crate::ExitAction::HangupThenContinue`] on a group
+    /// with zombie members), or not in the tree (a stale pid).
+    pub fn cont(&mut self, pid: u32) -> Result<StateChange, Errno> {
+        let p = self.live_entry_mut(pid).ok_or(Errno::Srch)?;
         if !matches!(p.state, ProcState::Stopped { .. }) {
-            return Ok(None);
+            return Ok(StateChange::Unchanged);
         }
         p.state = ProcState::Continued { reported: false };
-        Ok(Some(StateChanged { parent: p.parent }))
-    }
-
-    /// Removes the zombie `pid` without a wait (its parent ignores
-    /// `SIGCHLD` or has `SA_NOCLDWAIT`, or it has none: see
-    /// [`crate::ExitAction`]), returning how it ended. `rusage_slot` must be
-    /// the token the kernel gave it; on success that token is handed back
-    /// for the last time.
-    ///
-    /// [`Bug::NotAZombie`] if `pid` isn't a zombie; [`Bug::WrongSlot`] if
-    /// its slot isn't `rusage_slot` (the pid was reused since): either
-    /// leaves the tree unchanged. The check is only as strong as the
-    /// tokens are unique: a slot freed at a reap and handed out again to a
-    /// process that got the same pid would pass. Frees; never allocates.
-    pub fn release(&mut self, pid: u32, rusage_slot: u64) -> Result<ExitStatus, Error> {
-        let Some(&Proc { state: ProcState::Zombie(status), rusage_slot: found, .. }) = self.procs.get(&pid) else {
-            return Err(Bug::NotAZombie { pid }.into());
-        };
-        if found != rusage_slot {
-            return Err(Bug::WrongSlot { pid, expected: rusage_slot, found }.into());
-        }
-        self.remove(pid);
-        Ok(status)
+        Ok(StateChange::Changed { parent: p.parent })
     }
 
     // ---- wait ----
@@ -217,7 +215,7 @@ impl ProcTree {
     /// caller's group (resolved here, once), `-1` any child, `n < -1` any
     /// child in group `-n`. [`Bug::NotLive`] if `caller` isn't live.
     pub fn wait4_request(&self, caller: u32, pid: i32, options: u32) -> Result<WaitRequest, Error> {
-        let pgid = self.live(caller)?.pgid;
+        let pgid = self.live(caller, Role::Caller)?.pgid;
         let options = WaitOptions::wait4(options)?;
         let target = WaitTarget::from_wait4_pid(pid, pgid)?;
         Ok(WaitRequest { caller, target, options })
@@ -230,7 +228,7 @@ impl ProcTree {
     /// group `id >= 0`, `0` the caller's (resolved here, once); `P_PIDFD`
     /// refused until pidfds exist. [`Bug::NotLive`] if `caller` isn't live.
     pub fn waitid_request(&self, caller: u32, idtype: i32, id: i32, options: u32) -> Result<WaitRequest, Error> {
-        let pgid = self.live(caller)?.pgid;
+        let pgid = self.live(caller, Role::Caller)?.pgid;
         let options = WaitOptions::waitid(options)?;
         let target = WaitTarget::from_waitid(idtype, id, pgid)?;
         Ok(WaitRequest { caller, target, options })
@@ -260,7 +258,7 @@ impl ProcTree {
     /// Frees when it reaps; never allocates.
     pub fn wait(&mut self, request: WaitRequest) -> Result<WaitReady, Error> {
         let WaitRequest { caller, target, options } = request;
-        let p = self.live(caller)?;
+        let p = self.live(caller, Role::Caller)?;
         if !options.takes_sigchld_children() {
             return Err(Errno::Child.into());
         }
@@ -286,15 +284,11 @@ impl ProcTree {
         };
         let consume = options.consumes();
         let report = match state {
-            ProcState::Zombie(status) => {
-                let rusage_slot = self.proc(pid).rusage_slot;
-                if consume {
-                    self.remove(pid);
-                    Report::Reaped { pid, status, rusage_slot }
-                } else {
-                    Report::Zombie { pid, status, rusage_slot }
-                }
+            ProcState::Zombie(status) if consume => {
+                let rusage_slot = self.remove(pid);
+                Report::Reaped { pid, status, rusage_slot }
             }
+            ProcState::Zombie(status) => Report::Zombie { pid, status, lent_slot: SlotRef(self.proc(pid).slot) },
             ProcState::Stopped { signal, .. } => {
                 if consume {
                     self.proc_mut(pid).state = ProcState::Stopped { signal, reported: true };
@@ -345,13 +339,12 @@ impl ProcTree {
         self.procs.get(&pid).map(|p| p.sid)
     }
 
-    /// The `rusage_slot` the kernel gave `pid`, if it is in the tree. Valid
-    /// only while the tree stays locked: once the lock is dropped the pid
-    /// may be reaped and reused. For [`ProcTree::release`] of a zombie an
-    /// [`crate::ExitAction`] names, read it under the same lock hold as the
-    /// exit.
-    pub fn rusage_slot(&self, pid: u32) -> Option<u64> {
-        self.procs.get(&pid).map(|p| p.rusage_slot)
+    /// The pids of process group `pgid`'s members, live and zombie,
+    /// ascending: what a [`crate::ExitAction::HangupThenContinue`] or a
+    /// `kill(-pgrp)` reaches. Allocates nothing. Read under the tree's
+    /// lock: after it is dropped the group may have changed.
+    pub fn pgrp_members(&self, pgid: u32) -> impl Iterator<Item = u32> + '_ {
+        self.groups.range((pgid, 0)..=(pgid, u32::MAX)).map(|&(_, pid)| pid)
     }
 
     /// Whether process group `pgid` is orphaned, as POSIX defines it and
@@ -376,11 +369,6 @@ impl ProcTree {
 
     // ---- internals ----
 
-    /// The pids of process group `pgid`'s members, live and zombie, ascending.
-    pub(crate) fn pgrp_members(&self, pgid: u32) -> impl Iterator<Item = u32> + '_ {
-        self.groups.range((pgid, 0)..=(pgid, u32::MAX)).map(|&(_, pid)| pid)
-    }
-
     /// Whether some process, live or zombie, has `pgid` as its group.
     pub(crate) fn pgrp_exists(&self, pgid: u32) -> bool {
         self.pgrp_members(pgid).next().is_some()
@@ -392,27 +380,31 @@ impl ProcTree {
     }
 
     /// [`ProcTree::is_orphaned_pgrp`], or, with `gone` = `(pid, reaper)`,
-    /// what it will be once `pid` has exited: `pid` skipped as a member,
-    /// and its children judged with `reaper` as their parent. Both give the
-    /// same answer before and after [`ProcTree::exit`] moves the children.
-    pub(crate) fn orphaned_once_gone(&self, pgid: u32, gone: Option<(u32, u32)>) -> bool {
+    /// what it will be once `pid` has exited: its children judged with
+    /// `reaper` as their parent (no parent for `None`: no link). Only asked
+    /// about groups `pid` isn't in, so `pid` itself needs no skipping.
+    /// Gives the same answer before and after [`ProcTree::exit`] moves the
+    /// children.
+    pub(crate) fn orphaned_once_gone(&self, pgid: u32, gone: Option<(u32, Option<u32>)>) -> bool {
         !self.pgrp_members(pgid).any(|m| {
             let p = self.proc(m);
-            if !p.state.is_live() || gone.is_some_and(|(pid, _)| pid == m) {
+            debug_assert!(gone.is_none_or(|(pid, _)| pid != m), "invariant: the exiting process isn't in the group");
+            if !p.state.is_live() {
                 return false;
             }
             let parent = match (p.parent, gone) {
-                (Some(pp), Some((pid, reaper))) if pp == pid => Some(reaper),
+                (Some(pp), Some((pid, reaper))) if pp == pid => reaper,
                 (parent, _) => parent,
             };
-            match parent {
-                Some(pp) if pp != INIT_PID => {
-                    let parent = self.proc(pp);
-                    parent.pgid != pgid && parent.sid == p.sid
-                }
-                _ => false,
-            }
+            parent.is_some_and(|pp| pp != INIT_PID && self.links(pp, pgid, p.sid))
         })
+    }
+
+    /// Whether `parent` is a link for a member of group `pgid` in session
+    /// `sid`: in another group of the same session.
+    pub(crate) fn links(&self, parent: u32, pgid: u32, sid: u32) -> bool {
+        let q = self.proc(parent);
+        q.pgid != pgid && q.sid == sid
     }
 
     /// Whether a member of `pgid` is stopped, its stop reported by a wait
@@ -421,16 +413,12 @@ impl ProcTree {
         self.pgrp_members(pgid).any(|m| matches!(self.proc(m).state, ProcState::Stopped { .. }))
     }
 
-    pub(crate) fn live(&self, pid: u32) -> Result<&Proc, Error> {
-        self.procs.get(&pid).filter(|p| p.state.is_live()).ok_or(Error::Bug(Bug::NotLive { pid }))
+    pub(crate) fn live(&self, pid: u32, role: Role) -> Result<&Proc, Bug> {
+        self.procs.get(&pid).filter(|p| p.state.is_live()).ok_or(Bug::NotLive { pid, role })
     }
 
-    fn live_mut(&mut self, pid: u32) -> Result<&mut Proc, Error> {
-        self.procs.get_mut(&pid).filter(|p| p.state.is_live()).ok_or(Error::Bug(Bug::NotLive { pid }))
-    }
-
-    fn live_for_signal(&mut self, pid: u32) -> Result<&mut Proc, Errno> {
-        self.procs.get_mut(&pid).filter(|p| p.state.is_live()).ok_or(Errno::Srch)
+    fn live_entry_mut(&mut self, pid: u32) -> Option<&mut Proc> {
+        self.procs.get_mut(&pid).filter(|p| p.state.is_live())
     }
 
     pub(crate) fn proc(&self, pid: u32) -> &Proc {
@@ -448,18 +436,19 @@ impl ProcTree {
         Ok(pid)
     }
 
-    fn insert(&mut self, pid: u32, parent: Option<u32>, pgid: u32, sid: u32, rusage_slot: u64) {
+    fn insert(&mut self, pid: u32, parent: Option<u32>, pgid: u32, sid: u32, rusage_slot: RusageSlot) {
+        let slot = rusage_slot.into_raw();
         self.procs.insert(
             pid,
-            Proc { parent, children: Vec::new(), pgid, sid, state: ProcState::Running, execed: false, rusage_slot },
+            Proc { parent, children: Vec::new(), pgid, sid, state: ProcState::Running, execed: false, slot },
         );
         self.groups.insert((pgid, pid));
         self.sessions.insert((sid, pid));
     }
 
     /// Takes `pid` (a zombie, so childless) out of the tree and its parent's
-    /// children list.
-    fn remove(&mut self, pid: u32) {
+    /// children list, handing back its token.
+    pub(crate) fn remove(&mut self, pid: u32) -> RusageSlot {
         let p = self.procs.remove(&pid).expect("invariant: a removed process is in the tree");
         assert!(p.children.is_empty(), "invariant: removed process {pid} still has children");
         self.groups.remove(&(p.pgid, pid));
@@ -467,6 +456,7 @@ impl ProcTree {
         if let Some(pp) = p.parent {
             self.proc_mut(pp).children.retain(|&c| c != pid);
         }
+        RusageSlot::new(p.slot)
     }
 
     /// Whether `pid` (in the tree) is `ancestor` or below it.
@@ -508,6 +498,12 @@ impl ProcTree {
         self.procs.keys().copied()
     }
 
+    /// The value of `pid`'s token, if it is in the tree.
+    #[cfg(test)]
+    pub(crate) fn slot_of(&self, pid: u32) -> Option<u64> {
+        self.procs.get(&pid).map(|p| p.slot)
+    }
+
     /// Whether `pid` has exec'd, if it is in the tree.
     #[cfg(test)]
     pub(crate) fn has_execed(&self, pid: u32) -> Option<bool> {
@@ -533,6 +529,7 @@ impl ProcTree {
             }
             if !p.state.is_live() {
                 assert!(p.children.is_empty(), "zombie {pid} has children");
+                assert!(p.parent.is_some(), "zombie {pid} has no parent");
             }
             for &c in &p.children {
                 let child = self.procs.get(&c).expect("child missing");

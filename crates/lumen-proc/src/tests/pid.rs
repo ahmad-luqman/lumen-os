@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use super::{INIT, exit, fork, reported_pid, user, wait4};
+use super::{INIT, exit, fork, reported_pid, slot, user, wait4};
 use crate::pid::PidAllocator;
 use crate::{Errno, FIRST_PID, INIT_PID, ProcTree};
 
@@ -84,7 +84,7 @@ fn the_largest_maximum_is_accepted() {
 fn pid_wrap_around_skips_live_pids_pgids_and_sids() {
     // Pids 2..=9.
     let mut t = ProcTree::new(9);
-    t.spawn_init(0).unwrap();
+    t.spawn_init(slot(0)).unwrap();
     let a = fork(&mut t, INIT); // 2: stays live
     let b = fork(&mut t, INIT); // 3: leads group 3, then reaped; 4 stays in it
     t.setpgid(b, 0, 0).unwrap();
@@ -112,8 +112,8 @@ fn pid_wrap_around_skips_live_pids_pgids_and_sids() {
     assert_eq!(fork(&mut t, INIT), 9);
     assert_eq!(fork(&mut t, INIT), 8);
     // Now 2..=9 are all busy.
-    assert_eq!(t.fork(INIT, 0), user(Errno::Again));
-    assert_eq!(t.spawn_root(0), user(Errno::Again));
+    assert_eq!(t.fork(INIT, slot(0)), user(Errno::Again));
+    assert_eq!(t.spawn_root(slot(0)), Err(crate::NoFreePid));
     t.check_invariants();
     // Reaping the zombie frees 7; moving 4 out of group 3 frees 3.
     assert_eq!(reported_pid(&wait4(&mut t, INIT, z as i32, 0)), Some(z));
@@ -121,17 +121,17 @@ fn pid_wrap_around_skips_live_pids_pgids_and_sids() {
     assert!(!t.is_busy(b));
     assert_eq!(fork(&mut t, INIT), 3);
     assert_eq!(fork(&mut t, INIT), 7);
-    assert_eq!(t.fork(INIT, 0), user(Errno::Again));
+    assert_eq!(t.fork(INIT, slot(0)), user(Errno::Again));
 }
 
 #[test]
 fn a_failed_fork_leaves_the_tree_unchanged() {
     let mut t = ProcTree::new(3);
-    t.spawn_init(0).unwrap();
+    t.spawn_init(slot(0)).unwrap();
     fork(&mut t, INIT);
     fork(&mut t, INIT);
     let before = alloc::format!("{t:?}");
-    assert_eq!(t.fork(INIT, 0), user(Errno::Again));
+    assert_eq!(t.fork(INIT, slot(0)), user(Errno::Again));
     assert_eq!(alloc::format!("{t:?}"), before);
     assert_eq!(t.children(INIT).len(), 2);
 }

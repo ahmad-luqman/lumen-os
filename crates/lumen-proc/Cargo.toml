@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[dependencies]
+lumen-signal = { path = "../lumen-signal" }
+
 [lints]
 workspace = true
 

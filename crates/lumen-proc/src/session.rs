@@ -2,7 +2,7 @@
 //! and the checks of `tcsetpgrp`.
 
 use crate::tree::Proc;
-use crate::{Errno, Error, ProcTree};
+use crate::{Errno, Error, ProcTree, Role};
 
 /// The caller's controlling terminal, when the terminal a `tcsetpgrp` is on
 /// is it, as the kernel's terminal side knows it.
@@ -50,7 +50,7 @@ impl ProcTree {
     /// left one others are still in. [`crate::Bug::NotLive`] if `caller`
     /// isn't live. Allocates infallibly (the indexes).
     pub fn setsid(&mut self, caller: u32) -> Result<u32, Error> {
-        self.live(caller)?;
+        self.live(caller, Role::Caller)?;
         if self.pgrp_exists(caller) {
             return Err(Errno::Perm.into());
         }
@@ -74,7 +74,7 @@ impl ProcTree {
     /// [`crate::Bug::NotLive`] if `caller` isn't live. Allocates infallibly
     /// (the index).
     pub fn setpgid(&mut self, caller: u32, pid: i32, pgid: i32) -> Result<(), Error> {
-        let c_sid = self.live(caller)?.sid;
+        let c_sid = self.live(caller, Role::Caller)?.sid;
         let pid = if pid == 0 { caller as i32 } else { pid };
         let pgid = if pgid == 0 { pid } else { pgid };
         if pgid < 0 {
@@ -106,7 +106,7 @@ impl ProcTree {
     /// names no process, live or zombie, or is negative.
     /// [`crate::Bug::NotLive`] if `caller` isn't live.
     pub fn getpgid(&self, caller: u32, pid: i32) -> Result<u32, Error> {
-        self.live(caller)?;
+        self.live(caller, Role::Caller)?;
         Ok(self.by_pid(caller, pid)?.1.pgid)
     }
 
@@ -114,7 +114,7 @@ impl ProcTree {
     /// names no process, live or zombie, or is negative.
     /// [`crate::Bug::NotLive`] if `caller` isn't live.
     pub fn getsid(&self, caller: u32, pid: i32) -> Result<u32, Error> {
-        self.live(caller)?;
+        self.live(caller, Role::Caller)?;
         Ok(self.by_pid(caller, pid)?.1.sid)
     }
 
@@ -141,7 +141,7 @@ impl ProcTree {
         pgrp: i32,
         sigttou: Sigttou,
     ) -> Result<Tcsetpgrp, Error> {
-        let c = self.live(caller)?;
+        let c = self.live(caller, Role::Caller)?;
         let (c_pgid, c_sid) = (c.pgid, c.sid);
         if let Some(Controlling { foreground: Some(fg), .. }) = controlling
             && fg != c_pgid

@@ -1,10 +1,10 @@
 //! Status words against the `W*` macros of musl and glibc, and `waitid`'s
 //! `si_code`/`si_status` against Linux's derivation.
 
+use lumen_signal::Signal;
+
 use super::sig;
-use crate::{
-    CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ChildInfo, ExitStatus, Signal, WaitStatus,
-};
+use crate::{CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ChildInfo, ExitStatus, WaitStatus};
 
 /// musl's `<sys/wait.h>`, transcribed.
 mod musl {
@@ -85,7 +85,7 @@ fn linux_zombie_siginfo(status: i32) -> ChildInfo {
 }
 
 fn signals() -> impl Iterator<Item = Signal> {
-    (1..=Signal::MAX).map(sig)
+    (1..=64).map(sig)
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn killed_status_round_trips_through_the_macros() {
         for core in [false, true] {
             let st = WaitStatus::Killed { signal, core };
             let w = st.word();
-            let n = i32::from(signal.get());
+            let n = signal.number() as i32;
             assert_eq!(w, n | if core { 0x80 } else { 0 });
             assert_eq!(predicates(w), (false, true, false, false), "signal {n} core {core}");
             assert_eq!(musl::wtermsig(w), n);
@@ -136,7 +136,7 @@ fn stopped_status_round_trips_through_the_macros() {
     for signal in signals() {
         let st = WaitStatus::Stopped(signal);
         let w = st.word();
-        let n = i32::from(signal.get());
+        let n = signal.number() as i32;
         assert_eq!(w, (n << 8) | 0x7f);
         assert_eq!(predicates(w), (false, false, true, false), "signal {n}");
         assert_eq!(musl::wstopsig(w), n);
@@ -151,30 +151,6 @@ fn continued_status_round_trips_through_the_macros() {
     assert_eq!(w, 0xffff);
     assert_eq!(predicates(w), (false, false, false, true));
     assert_eq!(WaitStatus::Continued.siginfo(), ChildInfo { code: CLD_CONTINUED, status: 18 });
-}
-
-#[test]
-fn signals_are_one_to_sixty_four() {
-    assert_eq!(Signal::new(0), None);
-    assert_eq!(Signal::new(65), None);
-    assert_eq!(Signal::new(255), None);
-    assert_eq!(Signal::new(1).map(Signal::get), Some(1));
-    assert_eq!(Signal::new(64).map(Signal::get), Some(64));
-    use linux_raw_sys::general as g;
-    assert_eq!(u32::from(Signal::MAX), g::_NSIG);
-    let named = [
-        (Signal::SIGHUP, g::SIGHUP),
-        (Signal::SIGKILL, g::SIGKILL),
-        (Signal::SIGCHLD, g::SIGCHLD),
-        (Signal::SIGCONT, g::SIGCONT),
-        (Signal::SIGSTOP, g::SIGSTOP),
-        (Signal::SIGTSTP, g::SIGTSTP),
-        (Signal::SIGTTIN, g::SIGTTIN),
-        (Signal::SIGTTOU, g::SIGTTOU),
-    ];
-    for (s, n) in named {
-        assert_eq!(u32::from(s.get()), n);
-    }
 }
 
 #[test]

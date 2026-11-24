@@ -1,7 +1,9 @@
 //! `setsid`, `setpgid`, `getpgid`, `getsid` and `tcsetpgrp`.
 
-use super::{INIT, exit, fork, reported_pid, tree, user, wait4};
-use crate::{Controlling, Errno, ProcTree, Signal, Sigttou, Tcsetpgrp};
+use lumen_signal::Signal;
+
+use super::{INIT, exit, fork, reported_pid, stop, tree, user, wait4};
+use crate::{Controlling, Errno, ProcTree, Sigttou, Tcsetpgrp};
 
 /// A session leader `s` (a child of init) and its child `c`, in group `s`.
 fn session() -> (ProcTree, u32, u32) {
@@ -308,7 +310,7 @@ fn a_background_caller_gets_sigttou_unless_it_blocks_or_ignores_it() {
 fn an_orphaned_background_caller_gets_enotty() {
     let (mut t, s, _c, j, tty) = job_control();
     let k = fork(&mut t, j);
-    t.stop(k, Signal::SIGSTOP).unwrap();
+    stop(&mut t, k, Signal::STOP);
     exit(&mut t, s, 0);
     assert!(t.is_orphaned_pgrp(j));
     assert_eq!(t.tcsetpgrp(j, tty, j as i32, Sigttou::Delivered), user(Errno::NoTty));
@@ -319,5 +321,8 @@ fn an_orphaned_background_caller_gets_enotty() {
 fn a_dead_caller_is_a_bug() {
     let (mut t, _s, c, _j, tty) = job_control();
     exit(&mut t, c, 0);
-    assert_eq!(t.tcsetpgrp(c, tty, c as i32, Sigttou::Delivered), super::bug(crate::Bug::NotLive { pid: c }));
+    assert_eq!(
+        t.tcsetpgrp(c, tty, c as i32, Sigttou::Delivered),
+        super::bug(crate::Bug::NotLive { pid: c, role: crate::Role::Caller })
+    );
 }

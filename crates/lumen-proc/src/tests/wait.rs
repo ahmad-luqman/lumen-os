@@ -1,12 +1,15 @@
 //! `wait4`/`waitid`: requests, targets, options, which child wins, what is
 //! reported.
 
-use super::{INIT, bug, exit, exit_with, fork, reaped, reported, tree, user, wait4, waitid};
+use lumen_signal::Signal;
+
+use super::{INIT, bug, cont, exit, exit_with, fork, reaped, reported, slot, stop, tree, user, wait4, waitid};
+use crate::wait::WaitTarget;
 use crate::wait::{
     __WALL, __WCLONE, __WNOTHREAD, P_ALL, P_PGID, P_PID, P_PIDFD, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED,
     WUNTRACED,
 };
-use crate::{Errno, Error, ExitStatus, ProcState, ProcTree, Report, Signal, WaitReady, WaitStatus, WaitTarget};
+use crate::{Errno, Error, ExitStatus, ProcState, ProcTree, Report, SlotRef, StateChange, WaitReady, WaitStatus};
 
 const NONE_READY: Result<WaitReady, Error> = Ok(WaitReady::NoneReady);
 
@@ -158,7 +161,7 @@ fn a_caller_that_died_since_its_request_is_a_bug() {
     let z = fork(&mut t, INIT);
     let request = t.wait4_request(z, -1, 0).unwrap();
     exit(&mut t, z, 0);
-    assert_eq!(t.wait(request), bug(crate::Bug::NotLive { pid: z }));
+    assert_eq!(t.wait(request), bug(crate::Bug::NotLive { pid: z, role: crate::Role::Caller }));
 }
 
 #[test]
@@ -191,14 +194,14 @@ fn a_request_is_reused_across_retries() {
 #[test]
 fn reaping_removes_the_zombie_and_reports_its_status() {
     let mut t = tree();
-    let a = t.fork(INIT, 0xabc).unwrap();
-    let b = t.fork(INIT, 0xdef).unwrap();
-    exit_with(&mut t, a, ExitStatus::exited(7), INIT);
-    exit_with(&mut t, b, ExitStatus::Killed { signal: Signal::SIGKILL, core: true }, INIT);
+    let a = t.fork(INIT, slot(0xabc)).unwrap();
+    let b = t.fork(INIT, slot(0xdef)).unwrap();
+    exit_with(&mut t, a, ExitStatus::exited(7), Some(INIT));
+    exit_with(&mut t, b, ExitStatus::Killed { signal: Signal::KILL, core: true }, Some(INIT));
     let Ok(WaitReady::Reported(r)) = wait4(&mut t, INIT, -1, 0) else { panic!("nothing reaped") };
     assert_eq!(r.pid(), a);
     assert_eq!(r.status().word(), 7 << 8);
-    assert_eq!(r, Report::Reaped { pid: a, status: ExitStatus::Exited(7), rusage_slot: 0xabc });
+    assert_eq!(r, Report::Reaped { pid: a, status: ExitStatus::Exited(7), rusage_slot: slot(0xabc) });
     assert!(!t.contains(a));
     assert_eq!(t.children(INIT), &[b]);
     let Ok(WaitReady::Reported(r)) = wait4(&mut t, INIT, -1, 0) else { panic!("nothing reaped") };
@@ -207,8 +210,8 @@ fn reaping_removes_the_zombie_and_reports_its_status() {
         r,
         Report::Reaped {
             pid: b,
-            status: ExitStatus::Killed { signal: Signal::SIGKILL, core: true },
-            rusage_slot: 0xdef
+            status: ExitStatus::Killed { signal: Signal::KILL, core: true },
+            rusage_slot: slot(0xdef)
         }
     );
     assert_eq!(wait4(&mut t, INIT, -1, 0), echild());
@@ -233,7 +236,7 @@ fn the_first_ready_child_in_fork_order_wins() {
 fn fork_order_not_pid_order_decides_after_a_wrap() {
     // Pids 2..=4: after a wrap the older child has the higher pid.
     let mut t = ProcTree::new(4);
-    t.spawn_init(0).unwrap();
+    t.spawn_init(slot(0)).unwrap();
     let a = fork(&mut t, INIT); // 2
     let b = fork(&mut t, INIT); // 3
     exit(&mut t, a, 0);
@@ -299,31 +302,31 @@ fn a_group_target_takes_only_children_in_that_group() {
 fn stops_are_reported_once_and_only_when_asked() {
     let mut t = tree();
     let a = fork(&mut t, INIT);
-    assert!(t.stop(a, Signal::SIGSTOP).unwrap().is_some());
-    assert_eq!(t.stop(a, Signal::SIGTSTP), Ok(None));
+    assert_eq!(t.stop(a, Signal::STOP), Ok(StateChange::Changed { parent: Some(INIT) }));
+    assert_eq!(t.stop(a, Signal::TSTP), Ok(StateChange::Unchanged));
     assert_eq!(wait4(&mut t, INIT, -1, WNOHANG), NONE_READY);
     assert_eq!(wait4(&mut t, INIT, -1, WCONTINUED | WNOHANG), NONE_READY);
     let r = wait4(&mut t, INIT, -1, WUNTRACED);
-    assert_eq!(r, reported(Report::Stopped { pid: a, signal: Signal::SIGSTOP }));
+    assert_eq!(r, reported(Report::Stopped { pid: a, signal: Signal::STOP }));
     let Ok(WaitReady::Reported(r)) = r else { unreachable!() };
     assert_eq!(r.status().word(), (19 << 8) | 0x7f);
-    assert_eq!(t.state(a), Some(ProcState::Stopped { signal: Signal::SIGSTOP, reported: true }));
+    assert_eq!(t.state(a), Some(ProcState::Stopped { signal: Signal::STOP, reported: true }));
     assert_eq!(wait4(&mut t, INIT, -1, WUNTRACED | WNOHANG), NONE_READY);
     // waitid's name for it.
-    assert!(t.cont(a).unwrap().is_some());
-    t.stop(a, Signal::SIGTTIN).unwrap();
-    assert_eq!(waitid(&mut t, INIT, P_ALL, 0, WSTOPPED), reported(Report::Stopped { pid: a, signal: Signal::SIGTTIN }));
+    assert_eq!(t.cont(a), Ok(StateChange::Changed { parent: Some(INIT) }));
+    stop(&mut t, a, Signal::TTIN);
+    assert_eq!(waitid(&mut t, INIT, P_ALL, 0, WSTOPPED), reported(Report::Stopped { pid: a, signal: Signal::TTIN }));
 }
 
 #[test]
 fn continues_are_reported_once_and_only_when_asked() {
     let mut t = tree();
     let a = fork(&mut t, INIT);
-    assert_eq!(t.cont(a), Ok(None));
+    assert_eq!(t.cont(a), Ok(StateChange::Unchanged));
     assert_eq!(wait4(&mut t, INIT, -1, WCONTINUED | WNOHANG), NONE_READY);
-    t.stop(a, Signal::SIGSTOP).unwrap();
-    assert!(t.cont(a).unwrap().is_some());
-    assert_eq!(t.cont(a), Ok(None));
+    stop(&mut t, a, Signal::STOP);
+    assert_eq!(t.cont(a), Ok(StateChange::Changed { parent: Some(INIT) }));
+    assert_eq!(t.cont(a), Ok(StateChange::Unchanged));
     assert_eq!(wait4(&mut t, INIT, -1, WUNTRACED | WNOHANG), NONE_READY, "cont forgets an unreported stop");
     let r = wait4(&mut t, INIT, -1, WCONTINUED);
     assert_eq!(r, reported(Report::Continued { pid: a }));
@@ -331,12 +334,12 @@ fn continues_are_reported_once_and_only_when_asked() {
     assert_eq!(r.status().word(), 0xffff);
     assert_eq!(wait4(&mut t, INIT, -1, WCONTINUED | WNOHANG), NONE_READY);
     // A new stop forgets an unreported continue.
-    t.stop(a, Signal::SIGSTOP).unwrap();
-    t.cont(a).unwrap();
-    t.stop(a, Signal::SIGTSTP).unwrap();
+    stop(&mut t, a, Signal::STOP);
+    cont(&mut t, a);
+    stop(&mut t, a, Signal::TSTP);
     assert_eq!(
         wait4(&mut t, INIT, -1, WCONTINUED | WUNTRACED),
-        reported(Report::Stopped { pid: a, signal: Signal::SIGTSTP })
+        reported(Report::Stopped { pid: a, signal: Signal::TSTP })
     );
     assert_eq!(wait4(&mut t, INIT, -1, WCONTINUED | WUNTRACED | WNOHANG), NONE_READY);
 }
@@ -344,29 +347,29 @@ fn continues_are_reported_once_and_only_when_asked() {
 #[test]
 fn wnowait_leaves_the_zombie_and_the_reports() {
     let mut t = tree();
-    let a = t.fork(INIT, 77).unwrap();
-    exit_with(&mut t, a, ExitStatus::exited(4), INIT);
-    let peek = || reported(Report::Zombie { pid: a, status: ExitStatus::Exited(4), rusage_slot: 77 });
+    let a = t.fork(INIT, slot(77)).unwrap();
+    exit_with(&mut t, a, ExitStatus::exited(4), Some(INIT));
+    let peek = || reported(Report::Zombie { pid: a, status: ExitStatus::Exited(4), lent_slot: SlotRef(77) });
     assert_eq!(waitid(&mut t, INIT, P_ALL, 0, WEXITED | WNOWAIT), peek());
     assert_eq!(waitid(&mut t, INIT, P_PID, a as i32, WEXITED | WNOWAIT), peek());
     assert_eq!(t.state(a), Some(ProcState::Zombie(ExitStatus::Exited(4))));
     assert_eq!(WaitStatus::from(ExitStatus::Exited(4)).siginfo().status, 4);
     assert_eq!(
         waitid(&mut t, INIT, P_ALL, 0, WEXITED),
-        reported(Report::Reaped { pid: a, status: ExitStatus::Exited(4), rusage_slot: 77 })
+        reported(Report::Reaped { pid: a, status: ExitStatus::Exited(4), rusage_slot: slot(77) })
     );
     assert!(!t.contains(a));
 
     let b = fork(&mut t, INIT);
-    t.stop(b, Signal::SIGSTOP).unwrap();
+    stop(&mut t, b, Signal::STOP);
     for _ in 0..2 {
         assert_eq!(
             waitid(&mut t, INIT, P_ALL, 0, WSTOPPED | WNOWAIT),
-            reported(Report::Stopped { pid: b, signal: Signal::SIGSTOP })
+            reported(Report::Stopped { pid: b, signal: Signal::STOP })
         );
     }
-    assert_eq!(t.state(b), Some(ProcState::Stopped { signal: Signal::SIGSTOP, reported: false }));
-    t.cont(b).unwrap();
+    assert_eq!(t.state(b), Some(ProcState::Stopped { signal: Signal::STOP, reported: false }));
+    cont(&mut t, b);
     for _ in 0..2 {
         assert_eq!(waitid(&mut t, INIT, P_ALL, 0, WCONTINUED | WNOWAIT), reported(Report::Continued { pid: b }));
     }
@@ -383,9 +386,9 @@ fn waitid_without_wexited_skips_zombies() {
     assert_eq!(waitid(&mut t, INIT, P_ALL, 0, WSTOPPED | WCONTINUED | WNOHANG), echild());
     let b = fork(&mut t, INIT);
     assert_eq!(waitid(&mut t, INIT, P_ALL, 0, WSTOPPED | WNOHANG), NONE_READY);
-    t.stop(b, Signal::SIGSTOP).unwrap();
+    stop(&mut t, b, Signal::STOP);
     // The zombie, first in order, is passed over for b's stop.
-    assert_eq!(waitid(&mut t, INIT, P_ALL, 0, WSTOPPED), reported(Report::Stopped { pid: b, signal: Signal::SIGSTOP }));
+    assert_eq!(waitid(&mut t, INIT, P_ALL, 0, WSTOPPED), reported(Report::Stopped { pid: b, signal: Signal::STOP }));
     assert!(t.contains(a));
 }
 
@@ -394,9 +397,9 @@ fn a_stop_ahead_of_a_zombie_wins_with_wuntraced() {
     let mut t = tree();
     let a = fork(&mut t, INIT);
     let b = fork(&mut t, INIT);
-    t.stop(a, Signal::SIGSTOP).unwrap();
+    stop(&mut t, a, Signal::STOP);
     exit(&mut t, b, 1);
-    assert_eq!(wait4(&mut t, INIT, -1, WUNTRACED), reported(Report::Stopped { pid: a, signal: Signal::SIGSTOP }));
+    assert_eq!(wait4(&mut t, INIT, -1, WUNTRACED), reported(Report::Stopped { pid: a, signal: Signal::STOP }));
     assert_eq!(wait4(&mut t, INIT, -1, WUNTRACED), reaped(b, 1));
 }
 
@@ -404,10 +407,13 @@ fn a_stop_ahead_of_a_zombie_wins_with_wuntraced() {
 fn a_stopped_child_that_exits_is_reaped() {
     let mut t = tree();
     let a = fork(&mut t, INIT);
-    t.stop(a, Signal::SIGSTOP).unwrap();
-    let killed = ExitStatus::Killed { signal: Signal::SIGKILL, core: false };
-    exit_with(&mut t, a, killed, INIT);
-    assert_eq!(wait4(&mut t, INIT, -1, WUNTRACED), reported(Report::Reaped { pid: a, status: killed, rusage_slot: 0 }));
+    stop(&mut t, a, Signal::STOP);
+    let killed = ExitStatus::Killed { signal: Signal::KILL, core: false };
+    exit_with(&mut t, a, killed, Some(INIT));
+    assert_eq!(
+        wait4(&mut t, INIT, -1, WUNTRACED),
+        reported(Report::Reaped { pid: a, status: killed, rusage_slot: slot(0) })
+    );
 }
 
 #[test]
@@ -449,9 +455,9 @@ fn every_option_combination_picks_as_the_rules_say() {
             let cont = fork(&mut t, INIT);
             let stop = fork(&mut t, INIT);
             let zombie = fork(&mut t, INIT);
-            t.stop(cont, Signal::SIGSTOP).unwrap();
-            t.cont(cont).unwrap();
-            t.stop(stop, Signal::SIGTSTP).unwrap();
+            super::stop(&mut t, cont, Signal::STOP);
+            super::cont(&mut t, cont);
+            super::stop(&mut t, stop, Signal::TSTP);
             exit(&mut t, zombie, 6);
 
             let allowed = if waitid_call {
@@ -484,8 +490,8 @@ fn every_option_combination_picks_as_the_rules_say() {
                 }
                 (Want::Stop, Ok(WaitReady::Reported(Report::Stopped { pid, signal }))) => {
                     *pid == stop
-                        && *signal == Signal::SIGTSTP
-                        && t.state(stop) == Some(ProcState::Stopped { signal: Signal::SIGTSTP, reported: !keep })
+                        && *signal == Signal::TSTP
+                        && t.state(stop) == Some(ProcState::Stopped { signal: Signal::TSTP, reported: !keep })
                 }
                 (Want::Zombie, Ok(WaitReady::Reported(Report::Zombie { pid, .. }))) => {
                     keep && *pid == zombie && t.contains(zombie)

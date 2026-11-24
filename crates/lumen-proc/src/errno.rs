@@ -1,6 +1,6 @@
 //! Errors: the Linux x86-64 `errno` values a syscall returns ([`Errno`]),
-//! and the kernel bugs that are no user's error ([`Bug`]), together as
-//! [`Error`].
+//! the kernel bugs that are no user's error ([`Bug`]), together as
+//! [`Error`], and the errors of the calls no user makes.
 
 use core::fmt;
 
@@ -13,9 +13,7 @@ pub enum Errno {
     Srch,
     /// No child processes (`ECHILD` = 10).
     Child,
-    /// Try again (`EAGAIN` = 11): no pid is free, or (from
-    /// [`crate::ProcTree::spawn_init`]) pid 1 is still some process's
-    /// group or session id.
+    /// Try again (`EAGAIN` = 11): no pid is free.
     Again,
     /// Out of memory (`ENOMEM` = 12): a fallible reservation failed and the
     /// tree is unchanged.
@@ -59,19 +57,17 @@ impl fmt::Display for Errno {
     }
 }
 
-/// A call the kernel should never make. The tree is unchanged, and no
-/// `errno` stands for it: the kernel must handle it itself (log it, panic)
-/// rather than hand it to the user.
+/// A call the kernel should never make (a stale or wrong pid): the tree is
+/// unchanged, and no `errno` stands for it, so the kernel handles it itself
+/// (log it, panic) rather than hand it to the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bug {
-    /// [`crate::ProcTree::spawn_init`] while a process 1 (live or zombie)
-    /// is in the tree.
-    InitExists,
-    /// A pid the operation needs live (a caller, a parent to fork, a
-    /// process to exit or exec) is a zombie or not in the tree.
+    /// A pid the operation needs live is a zombie or not in the tree.
     NotLive {
         /// The pid.
         pid: u32,
+        /// What the operation needed it for.
+        role: Role,
     },
     /// [`crate::ProcTree::exit`]'s reaper isn't live, or is the exiting
     /// process or one of its descendants.
@@ -81,38 +77,47 @@ pub enum Bug {
         /// The reaper the kernel named.
         reaper: u32,
     },
-    /// [`crate::ProcTree::exit`] without a reaper of a process that has
-    /// children (live or zombie).
-    NoReaper {
-        /// The exiting process.
-        pid: u32,
-    },
-    /// [`crate::ProcTree::release`] of a pid that isn't a zombie (a live
-    /// process, or none).
-    NotAZombie {
-        /// The pid.
-        pid: u32,
-    },
-    /// [`crate::ProcTree::release`] of a zombie whose `rusage_slot` isn't
-    /// the one the kernel passed: the pid was reused since.
-    WrongSlot {
-        /// The pid.
-        pid: u32,
-        /// The slot the kernel passed.
-        expected: u64,
-        /// The slot the zombie holds.
-        found: u64,
-    },
 }
 
-/// What a fallible process-tree operation returns: an error for the user,
-/// or a kernel bug. There is deliberately no mapping from it to an `errno`.
+/// What a pid named in a [`Bug::NotLive`] was for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The process making the call (`wait*`, `setsid`, `setpgid`,
+    /// `getpgid`, `getsid`, `tcsetpgrp`, `exec`).
+    Caller,
+    /// The parent [`crate::ProcTree::fork`] forks from.
+    Parent,
+    /// The process [`crate::ProcTree::exit`] ends.
+    Exiting,
+}
+
+impl fmt::Display for Bug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::NotLive { pid, role } => write!(f, "{role:?} {pid} isn't live"),
+            Self::BadReaper { pid, reaper } => write!(f, "{reaper} can't reap the children of {pid}"),
+        }
+    }
+}
+
+/// What a fallible call made on behalf of a user returns: an error for the
+/// user, or a kernel bug. There is deliberately no mapping from it to an
+/// `errno`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The syscall fails with this `errno`.
     User(Errno),
     /// The kernel called wrongly: no `errno` stands for it.
     Bug(Bug),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User(e) => write!(f, "{e}"),
+            Self::Bug(b) => write!(f, "kernel bug: {b}"),
+        }
+    }
 }
 
 impl From<Errno> for Error {
@@ -126,3 +131,34 @@ impl From<Bug> for Error {
         Self::Bug(b)
     }
 }
+
+/// Why [`crate::ProcTree::exit`] failed. The tree is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitError {
+    /// A fallible reservation failed. The process is past the point of no
+    /// return: the kernel must not return to user space, but retry the
+    /// exit after reclaiming memory.
+    NoMem,
+    /// The kernel called wrongly.
+    Bug(Bug),
+}
+
+impl From<Bug> for ExitError {
+    fn from(b: Bug) -> Self {
+        Self::Bug(b)
+    }
+}
+
+/// Why [`crate::ProcTree::spawn_init`] failed. The tree is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnInitError {
+    /// A process 1 (live or zombie) is in the tree.
+    Exists,
+    /// Number 1 is still some process's pgid or sid; it succeeds once 1 is
+    /// free.
+    NumberBusy,
+}
+
+/// [`crate::ProcTree::spawn_root`] found no free pid. The tree is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoFreePid;

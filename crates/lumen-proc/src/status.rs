@@ -1,5 +1,7 @@
-//! Signals, exit statuses, `wait4`'s status words and `waitid`'s
+//! Exit statuses, `wait4`'s status words and `waitid`'s
 //! `si_code`/`si_status`.
+
+use lumen_signal::Signal;
 
 /// `waitid`'s `si_code`: the child called `exit`.
 pub const CLD_EXITED: i32 = 1;
@@ -11,41 +13,6 @@ pub const CLD_DUMPED: i32 = 3;
 pub const CLD_STOPPED: i32 = 5;
 /// `waitid`'s `si_code`: the stopped child was continued by `SIGCONT`.
 pub const CLD_CONTINUED: i32 = 6;
-
-/// A signal number, always in `1..=64` (Linux x86-64's signals).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Signal(u8);
-
-impl Signal {
-    /// The highest signal number (`SIGRTMAX`).
-    pub const MAX: u8 = 64;
-    /// Hangup (1): sent to a newly orphaned process group with a stopped member.
-    pub const SIGHUP: Self = Self(1);
-    /// Kill (9).
-    pub const SIGKILL: Self = Self(9);
-    /// Child status changed (17).
-    pub const SIGCHLD: Self = Self(17);
-    /// Continue (18): sent after `SIGHUP` to a newly orphaned group.
-    pub const SIGCONT: Self = Self(18);
-    /// Stop (19).
-    pub const SIGSTOP: Self = Self(19);
-    /// Terminal stop (20).
-    pub const SIGTSTP: Self = Self(20);
-    /// Background read from the terminal (21).
-    pub const SIGTTIN: Self = Self(21);
-    /// Background write or terminal control (22).
-    pub const SIGTTOU: Self = Self(22);
-
-    /// The signal numbered `n`, or `None` outside `1..=64`.
-    pub const fn new(n: u8) -> Option<Self> {
-        if n >= 1 && n <= Self::MAX { Some(Self(n)) } else { None }
-    }
-
-    /// The signal's number, in `1..=64`.
-    pub const fn get(self) -> u8 {
-        self.0
-    }
-}
 
 /// How a process ended: what a zombie holds until it is reaped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,8 +79,8 @@ impl WaitStatus {
     pub const fn word(self) -> i32 {
         match self {
             Self::Exited(code) => (code as i32) << 8,
-            Self::Killed { signal, core } => signal.0 as i32 | if core { 0x80 } else { 0 },
-            Self::Stopped(signal) => ((signal.0 as i32) << 8) | 0x7f,
+            Self::Killed { signal, core } => signal.number() as i32 | if core { 0x80 } else { 0 },
+            Self::Stopped(signal) => ((signal.number() as i32) << 8) | 0x7f,
             Self::Continued => 0xffff,
         }
     }
@@ -124,10 +91,10 @@ impl WaitStatus {
     pub const fn siginfo(self) -> ChildInfo {
         let (code, status) = match self {
             Self::Exited(code) => (CLD_EXITED, code as i32),
-            Self::Killed { signal, core: false } => (CLD_KILLED, signal.0 as i32),
-            Self::Killed { signal, core: true } => (CLD_DUMPED, signal.0 as i32),
-            Self::Stopped(signal) => (CLD_STOPPED, signal.0 as i32),
-            Self::Continued => (CLD_CONTINUED, Signal::SIGCONT.0 as i32),
+            Self::Killed { signal, core: false } => (CLD_KILLED, signal.number() as i32),
+            Self::Killed { signal, core: true } => (CLD_DUMPED, signal.number() as i32),
+            Self::Stopped(signal) => (CLD_STOPPED, signal.number() as i32),
+            Self::Continued => (CLD_CONTINUED, Signal::CONT.number() as i32),
         };
         ChildInfo { code, status }
     }

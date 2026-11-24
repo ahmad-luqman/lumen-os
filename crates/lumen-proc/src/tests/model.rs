@@ -1,10 +1,14 @@
-//! A randomized model test: random fork, exit, wait, setpgid, setsid, stop,
-//! continue, exec and tcsetpgrp sequences run on a [`ProcTree`] and on a
-//! naive reference model written here (flat maps and linear scans, sharing
-//! no code with the crate), compared after every step, with the issue's
-//! invariants checked throughout:
-//! - every live non-init process has a live parent;
-//! - a zombie is reaped exactly once;
+//! A randomized model test: random fork, spawn_root, exit (to init, to
+//! another reaper, or without one; parents autoreaping or not), wait,
+//! setpgid, setsid, stop, continue, exec and tcsetpgrp sequences run on a
+//! [`ProcTree`] and on a naive reference model written here (flat maps and
+//! linear scans, sharing no logic with the crate, only its types and
+//! constants), compared after every step, with the issue's invariants
+//! checked throughout, restated for parentless exits (item 1 of round 2):
+//! - a process's parent, if it has one, is live (a parentless exit makes
+//!   roots of its children);
+//! - a zombie leaves the tree exactly once (reaped by a wait, or released
+//!   inside an exit);
 //! - a pgid always names a live group leader or an existing group in the
 //!   same session (all members of a group share one session).
 //!
@@ -18,13 +22,15 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use super::{INIT, Rng, sig};
+use lumen_signal::Signal;
+
+use super::{INIT, Rng, bug, sig, user};
 use crate::wait::{
-    __WALL, __WCLONE, __WNOTHREAD, P_ALL, P_PGID, P_PID, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED,
+    __WALL, __WCLONE, __WNOTHREAD, P_ALL, P_PGID, P_PID, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitTarget,
 };
 use crate::{
-    Bug, Controlling, Errno, Error, ExitAction, ExitStatus, ProcState, ProcTree, Report, Signal, Sigttou, StateChanged,
-    Tcsetpgrp, WaitReady, WaitTarget,
+    Bug, Controlling, Errno, Error, ExitAction, ExitStatus, ProcState, ProcTree, Report, Role, RusageSlot, Sigttou,
+    SlotRef, StateChange, Tcsetpgrp, WaitReady,
 };
 
 const MAX_PID: u32 = 16;
@@ -53,6 +59,8 @@ struct MProc {
 struct Model {
     procs: BTreeMap<u32, MProc>,
     last: u32,
+    /// Groups fired at a live child, at a zombie child, and own groups.
+    fired: [u32; 3],
 }
 
 #[derive(Default)]
@@ -64,9 +72,14 @@ struct Seen {
     again: u32,
     wrapped: u32,
     adopted_zombies: u32,
-    orphaned: u32,
+    fired: [u32; 3],
     other_reaper: u32,
     no_reaper: u32,
+    roots: u32,
+    made_roots: u32,
+    released_children: u32,
+    autoreaped: u32,
+    released: u32,
     caller_bugs: u32,
     setpgid_ok: u32,
     setpgid_err: BTreeSet<u32>,
@@ -76,12 +89,8 @@ struct Seen {
     tc_err: BTreeSet<u32>,
 }
 
-fn user<T>(e: Errno) -> Result<T, Error> {
-    Err(Error::User(e))
-}
-
-fn not_live<T>(pid: u32) -> Result<T, Error> {
-    Err(Error::Bug(Bug::NotLive { pid }))
+fn not_live<T>(pid: u32, role: Role) -> Result<T, Error> {
+    bug(Bug::NotLive { pid, role })
 }
 
 impl Model {
@@ -99,7 +108,7 @@ impl Model {
                 slot: 0,
             },
         );
-        Self { procs, last: 1 }
+        Self { procs, last: 1, fired: [0; 3] }
     }
 
     fn live(&self, pid: u32) -> bool {
@@ -155,15 +164,24 @@ impl Model {
         self.will_become_orphaned(g, None)
     }
 
-    /// Linux's `has_stopped_jobs`, `ignored` (an exiting process: its group
-    /// exit ended its stop) left out.
-    fn has_stopped(&self, g: u32, ignored: Option<u32>) -> bool {
-        self.procs.iter().any(|(&pid, p)| p.pgid == g && Some(pid) != ignored && matches!(p.state, MState::Stop(..)))
+    /// Linux's `has_stopped_jobs`.
+    fn has_stopped(&self, g: u32) -> bool {
+        self.procs.values().any(|p| p.pgid == g && matches!(p.state, MState::Stop(..)))
+    }
+
+    fn spawn_root(&mut self, slot: u64) -> Option<u32> {
+        let pid = self.next_pid()?;
+        self.procs.insert(
+            pid,
+            MProc { parent: None, children: Vec::new(), pgid: pid, sid: pid, state: MState::Run, execed: false, slot },
+        );
+        self.last = pid;
+        Some(pid)
     }
 
     fn fork(&mut self, parent: u32, slot: u64) -> Result<u32, Error> {
         if !self.live(parent) {
-            return not_live(parent);
+            return not_live(parent, Role::Parent);
         }
         let pid = self.next_pid().ok_or(Error::User(Errno::Again))?;
         let (pgid, sid) = (self.procs[&parent].pgid, self.procs[&parent].sid);
@@ -178,40 +196,53 @@ impl Model {
 
     /// Linux's `exit_notify`, step by step: `forget_original_parent` (each
     /// child's parent set to the reaper, then `reparent_leader`: notify a
-    /// zombie, `kill_orphaned_pgrp(child, father)`), the children spliced
-    /// onto the reaper's list, `kill_orphaned_pgrp(tsk, NULL)`, the zombie,
-    /// `do_notify_parent`. A group sent `SIGCONT` has no stopped member for
-    /// the rest of the exit. `reaper` is `None` only for a childless exit.
-    fn exit(&mut self, pid: u32, status: ExitStatus, reaper: Option<u32>) -> Vec<ExitAction> {
+    /// zombie, autoreaped to the dead list if the reaper autoreaps,
+    /// `kill_orphaned_pgrp(child, father)`), the children spliced onto the
+    /// reaper's list, the zombie (its group exit ended any stop of its own),
+    /// `kill_orphaned_pgrp(tsk, NULL)`, `do_notify_parent`, then the dead
+    /// list released (`release_task`). A group sent `SIGCONT` has no stopped
+    /// member for the rest of the exit. Lumen's rule without a reaper: the
+    /// children become roots, their zombies released.
+    fn exit(&mut self, pid: u32, status: ExitStatus, reaper: Option<u32>, reaping: &BTreeSet<u32>) -> Vec<ExitAction> {
         let kids = core::mem::take(&mut self.procs.get_mut(&pid).unwrap().children);
-        let reaper = match reaper {
-            Some(r) => r,
-            None => {
-                assert!(kids.is_empty(), "no reaper for {pid}'s children");
-                pid // never used: no child to move
-            }
-        };
         let (my_pgid, my_sid) = (self.procs[&pid].pgid, self.procs[&pid].sid);
         let mut continued = BTreeSet::new();
+        let mut dead = Vec::new();
         let mut actions = Vec::new();
         for &c in &kids {
-            self.procs.get_mut(&c).unwrap().parent = Some(reaper);
+            self.procs.get_mut(&c).unwrap().parent = reaper;
             let child = self.procs[&c].clone();
-            if matches!(child.state, MState::Zombie(_)) {
-                actions.push(ExitAction::Notify { parent: reaper, child: c });
+            let zombie = matches!(child.state, MState::Zombie(_));
+            if let MState::Zombie(status) = child.state {
+                let slot = RusageSlot::new(child.slot);
+                match reaper {
+                    Some(r) if reaping.contains(&r) => {
+                        actions.push(ExitAction::Notify { parent: r, child: c, status, released: Some(slot) });
+                        dead.push(c);
+                    }
+                    Some(r) => actions.push(ExitAction::Notify { parent: r, child: c, status, released: None }),
+                    None => {
+                        actions.push(ExitAction::Released { child: c, status, slot });
+                        dead.push(c);
+                    }
+                }
             }
             let g = child.pgid;
             if my_pgid != g
                 && my_sid == child.sid
                 && self.will_become_orphaned(g, None)
                 && !continued.contains(&g)
-                && self.has_stopped(g, None)
+                && self.has_stopped(g)
             {
                 actions.push(ExitAction::HangupThenContinue { pgid: g });
                 continued.insert(g);
+                self.fired[usize::from(zombie)] += 1;
             }
         }
-        self.procs.get_mut(&reaper).unwrap().children.extend(kids);
+        if let Some(r) = reaper {
+            self.procs.get_mut(&r).unwrap().children.extend(kids);
+        }
+        self.procs.get_mut(&pid).unwrap().state = MState::Zombie(status);
         let parent = self.procs[&pid].parent;
         if let Some(pp) = parent {
             let q = &self.procs[&pp];
@@ -219,16 +250,32 @@ impl Model {
                 && q.sid == my_sid
                 && self.will_become_orphaned(my_pgid, Some(pid))
                 && !continued.contains(&my_pgid)
-                && self.has_stopped(my_pgid, Some(pid))
+                && self.has_stopped(my_pgid)
             {
                 actions.push(ExitAction::HangupThenContinue { pgid: my_pgid });
+                self.fired[2] += 1;
             }
         }
-        self.procs.get_mut(&pid).unwrap().state = MState::Zombie(status);
+        let slot = RusageSlot::new(self.procs[&pid].slot);
         actions.push(match parent {
-            Some(parent) => ExitAction::Notify { parent, child: pid },
-            None => ExitAction::ReleaseNow { child: pid },
+            Some(parent) => {
+                let autoreap = reaping.contains(&parent);
+                if autoreap {
+                    dead.push(pid);
+                }
+                ExitAction::Notify { parent, child: pid, status, released: autoreap.then_some(slot) }
+            }
+            None => {
+                dead.push(pid);
+                ExitAction::Released { child: pid, status, slot }
+            }
         });
+        for d in dead {
+            let p = self.procs.remove(&d).unwrap();
+            if let Some(pp) = p.parent {
+                self.procs.get_mut(&pp).unwrap().children.retain(|&x| x != d);
+            }
+        }
         actions
     }
 
@@ -236,7 +283,7 @@ impl Model {
     /// options (only valid ones are generated): the target.
     fn target(&self, caller: u32, waitid: bool, idtype: i32, id: i32) -> Result<WaitTarget, Error> {
         if !self.live(caller) {
-            return not_live(caller);
+            return not_live(caller, Role::Caller);
         }
         let own = self.procs[&caller].pgid;
         if waitid {
@@ -260,7 +307,7 @@ impl Model {
 
     fn wait(&mut self, caller: u32, target: WaitTarget, waitid: bool, bits: u32) -> Result<WaitReady, Error> {
         if !self.live(caller) {
-            return not_live(caller);
+            return not_live(caller, Role::Caller);
         }
         if bits & __WCLONE != 0 && bits & __WALL == 0 {
             return user(Errno::Child);
@@ -281,11 +328,15 @@ impl Model {
             match p.state {
                 MState::Zombie(status) if exited => {
                     if keep {
-                        return Ok(WaitReady::Reported(Report::Zombie { pid: c, status, rusage_slot: p.slot }));
+                        return Ok(WaitReady::Reported(Report::Zombie { pid: c, status, lent_slot: SlotRef(p.slot) }));
                     }
                     self.procs.remove(&c);
                     self.procs.get_mut(&caller).unwrap().children.retain(|&x| x != c);
-                    return Ok(WaitReady::Reported(Report::Reaped { pid: c, status, rusage_slot: p.slot }));
+                    return Ok(WaitReady::Reported(Report::Reaped {
+                        pid: c,
+                        status,
+                        rusage_slot: RusageSlot::new(p.slot),
+                    }));
                 }
                 MState::Zombie(_) => {}
                 MState::Stop(signal, false) if bits & WSTOPPED != 0 => {
@@ -308,7 +359,7 @@ impl Model {
 
     fn setpgid(&mut self, caller: u32, pid: i32, pgid: i32) -> Result<(), Error> {
         if !self.live(caller) {
-            return not_live(caller);
+            return not_live(caller, Role::Caller);
         }
         let pid = if pid == 0 { caller as i32 } else { pid };
         let pgid = if pgid == 0 { pid } else { pgid };
@@ -344,7 +395,7 @@ impl Model {
 
     fn setsid(&mut self, caller: u32) -> Result<u32, Error> {
         if !self.live(caller) {
-            return not_live(caller);
+            return not_live(caller, Role::Caller);
         }
         if self.group_exists(caller) {
             return user(Errno::Perm);
@@ -357,7 +408,7 @@ impl Model {
 
     fn tcsetpgrp(&self, caller: u32, tty: Option<Controlling>, pgrp: i32, ttou: Sigttou) -> Result<Tcsetpgrp, Error> {
         if !self.live(caller) {
-            return not_live(caller);
+            return not_live(caller, Role::Caller);
         }
         let me = &self.procs[&caller];
         if tty.and_then(|t| t.foreground).is_some_and(|fg| fg != me.pgid) && ttou == Sigttou::Delivered {
@@ -381,28 +432,28 @@ impl Model {
         Ok(Tcsetpgrp::Set(n))
     }
 
-    fn stop(&mut self, pid: u32, signal: Signal) -> Result<Option<StateChanged>, Errno> {
+    fn stop(&mut self, pid: u32, signal: Signal) -> Result<StateChange, Errno> {
         if !self.live(pid) {
             return Err(Errno::Srch);
         }
         let p = self.procs.get_mut(&pid).unwrap();
         if matches!(p.state, MState::Stop(..)) {
-            return Ok(None);
+            return Ok(StateChange::Unchanged);
         }
         p.state = MState::Stop(signal, false);
-        Ok(Some(StateChanged { parent: p.parent }))
+        Ok(StateChange::Changed { parent: p.parent })
     }
 
-    fn cont(&mut self, pid: u32) -> Result<Option<StateChanged>, Errno> {
+    fn cont(&mut self, pid: u32) -> Result<StateChange, Errno> {
         if !self.live(pid) {
             return Err(Errno::Srch);
         }
         let p = self.procs.get_mut(&pid).unwrap();
         if !matches!(p.state, MState::Stop(..)) {
-            return Ok(None);
+            return Ok(StateChange::Unchanged);
         }
         p.state = MState::Cont(false);
-        Ok(Some(StateChanged { parent: p.parent }))
+        Ok(StateChange::Changed { parent: p.parent })
     }
 }
 
@@ -417,7 +468,7 @@ fn assert_same(t: &ProcTree, m: &Model, step: &str) {
         assert_eq!(t.pgid(pid), Some(p.pgid), "{step}: pgid of {pid}");
         assert_eq!(t.sid(pid), Some(p.sid), "{step}: sid of {pid}");
         assert_eq!(t.has_execed(pid), Some(p.execed), "{step}: exec'd {pid}");
-        assert_eq!(t.rusage_slot(pid), Some(p.slot), "{step}: slot of {pid}");
+        assert_eq!(t.slot_of(pid), Some(p.slot), "{step}: slot of {pid}");
         let state = match p.state {
             MState::Run => ProcState::Running,
             MState::Stop(signal, reported) => ProcState::Stopped { signal, reported },
@@ -436,10 +487,8 @@ fn assert_invariants(t: &ProcTree, step: &str) {
     t.check_invariants();
     let live = |pid: u32| t.state(pid).is_some_and(|s| !matches!(s, ProcState::Zombie(_)));
     for pid in t.pids() {
-        if pid != INIT {
-            let parent = t.parent(pid).unwrap();
-            assert!(parent.is_some_and(live), "{step}: {pid}'s parent {parent:?} isn't live");
-        }
+        let parent = t.parent(pid).unwrap();
+        assert!(parent.is_none_or(live), "{step}: {pid}'s parent {parent:?} isn't live");
         let (pgid, sid) = (t.pgid(pid).unwrap(), t.sid(pid).unwrap());
         assert!(t.pgrp_members(pgid).all(|m| t.sid(m) == Some(sid)), "{step}: group {pgid} spans sessions");
     }
@@ -449,7 +498,7 @@ fn random_status(rng: &mut Rng) -> ExitStatus {
     if rng.chance(70) {
         ExitStatus::exited(rng.below(512) as i32 - 128)
     } else {
-        ExitStatus::Killed { signal: sig(1 + rng.below(64) as u8), core: rng.chance(30) }
+        ExitStatus::Killed { signal: sig(1 + rng.below(64) as u32), core: rng.chance(30) }
     }
 }
 
@@ -486,10 +535,12 @@ fn random_options(rng: &mut Rng, waitid: bool) -> u32 {
 fn run(seed: u64, seen: &mut Seen) {
     let mut rng = Rng::new(seed);
     let mut t = ProcTree::new(MAX_PID);
-    t.spawn_init(0).unwrap();
+    t.spawn_init(RusageSlot::new(0)).unwrap();
     let mut m = Model::new();
     let mut zombies = BTreeSet::new();
-    let (mut exits, mut reaps) = (0u32, 0u32);
+    // The parents whose SIGCHLD is SIG_IGN or SA_NOCLDWAIT.
+    let mut reaping = BTreeSet::new();
+    let (mut exits, mut left) = (0u32, 0u32);
     let mut last_pid = 1;
 
     for step in 0..STEPS {
@@ -498,9 +549,17 @@ fn run(seed: u64, seen: &mut Seen) {
         let caller = rng.pick(&live).unwrap();
         let label = alloc::format!("seed {seed} step {step}");
         match rng.below(100) {
-            0..=24 => {
+            0..=2 => {
                 let slot = rng.next();
-                let got = t.fork(caller, slot);
+                let got = t.spawn_root(RusageSlot::new(slot)).ok();
+                assert_eq!(got, m.spawn_root(slot), "{label}: spawn_root");
+                if got.is_some() {
+                    seen.roots += 1;
+                }
+            }
+            3..=24 => {
+                let slot = rng.next();
+                let got = t.fork(caller, RusageSlot::new(slot));
                 assert_eq!(got, m.fork(caller, slot), "{label}: fork by {caller}");
                 match got {
                     Ok(pid) => {
@@ -514,32 +573,32 @@ fn run(seed: u64, seen: &mut Seen) {
             }
             25..=39 => {
                 let Some(pid) = rng.pick(&others) else { continue };
-                // Mostly init; sometimes another live process outside pid's subtree.
+                // Mostly init; sometimes another live process outside pid's
+                // subtree, or none.
                 let reapers: Vec<u32> = live.iter().copied().filter(|&r| !m.is_descendant_or_self(r, pid)).collect();
-                let childless = m.procs[&pid].children.is_empty();
                 let reaper = match rng.below(100) {
-                    0..=19 if childless => None,
-                    0..=39 => Some(rng.pick(&reapers).unwrap_or(INIT)),
+                    0..=14 => None,
+                    15..=39 => Some(rng.pick(&reapers).unwrap_or(INIT)),
                     _ => Some(INIT),
                 };
+                if reaper.is_some_and(|r| r != INIT && !m.procs[&pid].children.is_empty()) {
+                    seen.other_reaper += 1;
+                }
+                let live_kids = m.procs[&pid].children.iter().any(|&c| m.live(c));
                 let status = random_status(&mut rng);
-                let got: Vec<ExitAction> = t.exit(pid, status, reaper).expect("exit").actions().collect();
-                let want = m.exit(pid, status, reaper);
+                let got: Vec<ExitAction> =
+                    t.exit(pid, status, reaper, |p| reaping.contains(&p)).expect("exit").into_iter().collect();
+                let want = m.exit(pid, status, reaper, &reaping);
                 assert_eq!(got, want, "{label}: exit {pid} to {reaper:?}");
-                for a in &want {
-                    match a {
-                        ExitAction::HangupThenContinue { .. } => seen.orphaned += 1,
-                        ExitAction::Notify { child, .. } if *child != pid => seen.adopted_zombies += 1,
-                        _ => {}
-                    }
-                }
-                match reaper {
-                    Some(r) if r != INIT && !m.procs[&r].children.is_empty() => seen.other_reaper += 1,
-                    None => seen.no_reaper += 1,
-                    _ => {}
-                }
                 assert!(zombies.insert(pid), "{label}: {pid} exited twice");
                 exits += 1;
+                if reaper.is_none() {
+                    seen.no_reaper += 1;
+                }
+                if reaper.is_none() && live_kids {
+                    seen.made_roots += 1;
+                }
+                left += account(&want, pid, &mut zombies, seen, &label);
             }
             40..=64 => {
                 // Sometimes a caller that isn't live.
@@ -572,7 +631,7 @@ fn run(seed: u64, seen: &mut Seen) {
                 match got {
                     Ok(WaitReady::Reported(Report::Reaped { pid, .. })) => {
                         assert!(zombies.remove(&pid), "{label}: reaped {pid}, not a zombie");
-                        reaps += 1;
+                        left += 1;
                         seen.reaped += 1;
                     }
                     Ok(WaitReady::Reported(Report::Zombie { pid, .. })) => {
@@ -618,18 +677,23 @@ fn run(seed: u64, seen: &mut Seen) {
             }
             82..=88 => {
                 let Some(pid) = rng.pick(&others) else { continue };
-                let signal =
-                    [Signal::SIGSTOP, Signal::SIGTSTP, Signal::SIGTTIN, Signal::SIGTTOU][rng.below(4) as usize];
+                let signal = [Signal::STOP, Signal::TSTP, Signal::TTIN, Signal::TTOU][rng.below(4) as usize];
                 assert_eq!(t.stop(pid, signal), m.stop(pid, signal), "{label}: stop {pid}");
             }
             89..=93 => {
                 let Some(pid) = rng.pick(&others) else { continue };
                 assert_eq!(t.cont(pid), m.cont(pid), "{label}: cont {pid}");
             }
-            94..=95 => {
+            94 => {
                 let Some(pid) = rng.pick(&others) else { continue };
                 t.exec(pid).unwrap();
                 m.procs.get_mut(&pid).unwrap().execed = true;
+            }
+            95 => {
+                // caller sets SIGCHLD to SIG_IGN (or SA_NOCLDWAIT), or back.
+                if !reaping.remove(&caller) {
+                    reaping.insert(caller);
+                }
             }
             _ => {
                 let me = &m.procs[&caller];
@@ -674,10 +738,13 @@ fn run(seed: u64, seen: &mut Seen) {
         let others: Vec<u32> = m.procs.keys().copied().filter(|&p| p != INIT && m.live(p)).collect();
         let Some(pid) = rng.pick(&others) else { break };
         let status = random_status(&mut rng);
-        let got: Vec<ExitAction> = t.exit(pid, status, Some(INIT)).unwrap().actions().collect();
-        assert_eq!(got, m.exit(pid, status, Some(INIT)), "seed {seed}: final exit {pid}");
+        let got: Vec<ExitAction> =
+            t.exit(pid, status, Some(INIT), |p| reaping.contains(&p)).unwrap().into_iter().collect();
+        let want = m.exit(pid, status, Some(INIT), &reaping);
+        assert_eq!(got, want, "seed {seed}: final exit {pid}");
         assert!(zombies.insert(pid));
         exits += 1;
+        left += account(&want, pid, &mut zombies, seen, "final");
     }
     for _ in 0..=MAX_PID {
         let request = t.wait4_request(INIT, -1, WNOHANG).unwrap();
@@ -686,16 +753,52 @@ fn run(seed: u64, seen: &mut Seen) {
         match got {
             Ok(WaitReady::Reported(Report::Reaped { pid, .. })) => {
                 assert!(zombies.remove(&pid), "seed {seed}: reaped {pid} twice");
-                reaps += 1;
+                left += 1;
             }
             Err(Error::User(Errno::Child)) => break,
             other => panic!("seed {seed}: drain got {other:?}"),
         }
     }
     assert!(zombies.is_empty(), "seed {seed}: unreaped {zombies:?}");
-    assert_eq!(exits, reaps, "seed {seed}");
+    assert_eq!(exits, left, "seed {seed}: every exit leaves the tree once");
     assert_eq!(t.pids().collect::<Vec<_>>(), [INIT]);
     assert_invariants(&t, "end");
+    for (all, run) in seen.fired.iter_mut().zip(m.fired) {
+        *all += run;
+    }
+}
+
+/// Counts what an exit's actions say about the zombies (`pid`, the exiting
+/// process, just added to `zombies`): those that left the tree are taken
+/// out of `zombies`. How many left.
+fn account(actions: &[ExitAction], pid: u32, zombies: &mut BTreeSet<u32>, seen: &mut Seen, label: &str) -> u32 {
+    let mut left = 0;
+    for a in actions {
+        let gone = match a {
+            ExitAction::Notify { child, released, .. } => {
+                if *child != pid {
+                    seen.adopted_zombies += 1;
+                }
+                if released.is_some() {
+                    seen.autoreaped += 1;
+                }
+                released.is_some().then_some(*child)
+            }
+            ExitAction::Released { child, .. } => {
+                seen.released += 1;
+                if *child != pid {
+                    seen.released_children += 1;
+                }
+                Some(*child)
+            }
+            ExitAction::HangupThenContinue { .. } => None,
+        };
+        if let Some(child) = gone {
+            assert!(zombies.remove(&child), "{label}: {child} left the tree, not a zombie");
+            left += 1;
+        }
+    }
+    left
 }
 
 #[test]
@@ -710,9 +813,15 @@ fn random_fork_exit_wait_setpgid_sequences_keep_the_invariants() {
     assert!(seen.again > 0, "no fork ran out of pids");
     assert!(seen.wrapped > 0, "no pid wrapped");
     assert!(seen.adopted_zombies > 0, "no zombie adopted");
-    assert!(seen.orphaned > 0, "no group orphaned with a stopped member");
+    let [live, zombie, own] = seen.fired;
+    assert!(live > 0 && zombie > 0 && own > 0, "groups fired at live {live}, zombie {zombie}, own {own}");
+    assert!(seen.roots > 0, "no spawn_root");
+    assert!(seen.autoreaped > 0, "no zombie autoreaped");
+    assert!(seen.released > 0, "no parentless zombie released");
+    assert!(seen.made_roots > 0, "no exit without a reaper left a live child a root");
+    assert!(seen.released_children > 0, "no exit without a reaper released a zombie child");
     assert!(seen.other_reaper > 0, "no children adopted by a reaper other than init");
-    assert!(seen.no_reaper > 0, "no childless exit without a reaper");
+    assert!(seen.no_reaper > 0, "no exit without a reaper");
     assert!(seen.caller_bugs > 0, "no wait by a caller that isn't live");
     assert!(seen.setpgid_ok > 0 && seen.setsid_ok > 0);
     for e in [Errno::Perm, Errno::Srch, Errno::Acces, Errno::Inval] {
