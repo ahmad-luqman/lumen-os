@@ -1,14 +1,15 @@
-//! Verifies that `Pipe::try_new`, `Pipe::with_capacity`, and `Pipe::set_capacity`
-//! return `Err(SetCapacityError::NoMemory)` instead of aborting when the heap
-//! refuses an allocation, and that a failed `set_capacity` leaves the pipe's
-//! existing capacity and queued data intact (standalone binary with a refusing
-//! global allocator, as in `crates/lumen-view/tests/oom.rs`).
+//! Verifies that `Pipe::try_new`, `Pipe::fifo`, `Pipe::with_capacity`, and
+//! `Pipe::set_capacity` return their `NoMemory` error instead of aborting when
+//! the heap refuses an allocation, and that a failed `set_capacity` leaves the
+//! pipe's existing capacity and queued data intact (standalone binary with a
+//! refusing global allocator, as in `crates/lumen-view/tests/oom.rs`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lumen_pipe::{
-    DEFAULT_CAPACITY, DEFAULT_MAX_CAPACITY, PAGE_SIZE, Pipe, ReadOutcome, SetCapacityError, WriteOutcome,
+    CreateError, DEFAULT_CAPACITY, DEFAULT_MAX_CAPACITY, NoMemory, PAGE_SIZE, Pipe, ReadOutcome, SetCapacityError,
+    WriteOutcome,
 };
 
 /// Refuse every allocation of at least this many bytes (0 = allow all).
@@ -29,24 +30,6 @@ unsafe impl GlobalAlloc for Refusing {
         unsafe { System.alloc(layout) }
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let from = REFUSE_FROM.load(Ordering::SeqCst);
-        if from != 0 && layout.size() >= from {
-            return std::ptr::null_mut();
-        }
-        // SAFETY: Caller upholds `GlobalAlloc::alloc_zeroed` preconditions.
-        unsafe { System.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let from = REFUSE_FROM.load(Ordering::SeqCst);
-        if from != 0 && new_size >= from {
-            return std::ptr::null_mut();
-        }
-        // SAFETY: Caller upholds `GlobalAlloc::realloc` preconditions.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: Caller upholds `GlobalAlloc::dealloc` preconditions.
         unsafe { System.dealloc(ptr, layout) }
@@ -65,13 +48,14 @@ fn with_refusal<T>(from: usize, f: impl FnOnce() -> T) -> T {
 
 #[test]
 fn refusing_heap_returns_no_memory_and_preserves_pipe() {
-    // Pipe::try_new refuses cleanly on OOM.
-    assert_eq!(with_refusal(DEFAULT_CAPACITY, Pipe::try_new).unwrap_err(), SetCapacityError::NoMemory);
+    // Pipe::try_new and Pipe::fifo refuse cleanly on OOM.
+    assert_eq!(with_refusal(DEFAULT_CAPACITY, Pipe::try_new).unwrap_err(), NoMemory);
+    assert_eq!(with_refusal(DEFAULT_CAPACITY, Pipe::fifo).unwrap_err(), NoMemory);
 
     // Pipe::with_capacity refuses cleanly on OOM.
     assert_eq!(
         with_refusal(PAGE_SIZE, || Pipe::with_capacity(PAGE_SIZE, DEFAULT_MAX_CAPACITY)).unwrap_err(),
-        SetCapacityError::NoMemory
+        CreateError::NoMemory
     );
 
     // Pipe::set_capacity refuses cleanly on OOM and preserves capacity & data.
