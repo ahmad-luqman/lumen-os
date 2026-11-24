@@ -2,20 +2,21 @@ use linux_raw_sys::general as linux;
 
 /// Linux's kernel termios fields, including all 19 control characters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
 pub struct Termios {
     pub c_iflag: u32,
     pub c_oflag: u32,
     pub c_cflag: u32,
     pub c_lflag: u32,
     pub c_line: u8,
-    pub c_cc: [u8; 19],
+    pub c_cc: [u8; linux::NCCS as usize],
 }
 
 impl Termios {
-    /// The console defaults in `kernel/src/linux/process.rs::default_termios`.
+    /// Lumen's console defaults (`kernel/src/linux/process.rs`'s
+    /// `default_termios()`), not Linux's `tty_std_termios`. The latter also
+    /// enables IXON, HUPCL, ECHOCTL, ECHOKE, IEXTEN and ^R/^O/^W/^V.
     pub fn linux_default() -> Self {
-        let mut c_cc = [0; 19];
+        let mut c_cc = [0; linux::NCCS as usize];
         c_cc[linux::VINTR as usize] = 3;
         c_cc[linux::VQUIT as usize] = 28;
         c_cc[linux::VERASE as usize] = 127;

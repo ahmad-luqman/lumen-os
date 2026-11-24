@@ -15,6 +15,7 @@ pub enum TimerKind {
     InterByte,
 }
 
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Readiness {
     ReturnNow(usize),
@@ -47,25 +48,13 @@ pub fn ready(vmin: u8, vtime: u8, available: usize, timer: TimerState) -> Readin
     }
 }
 
-/// Facts needed to decide job-control signalling; the kernel owns sessions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WriterFacts {
-    pub controlling_terminal: bool,
-    pub background: bool,
-    pub signal_blocked: bool,
-    pub signal_ignored: bool,
-    pub orphaned_group: bool,
-}
-
-/// Whether a write requests SIGTTOU for the foreground check. An orphaned
-/// background group instead requires EIO from the caller when TOSTOP applies
-/// and SIGTTOU is neither blocked nor ignored.
-pub fn background_write_signal(tostop: bool, facts: WriterFacts) -> Option<u32> {
-    (tostop
-        && facts.controlling_terminal
-        && facts.background
-        && !facts.signal_blocked
-        && !facts.signal_ignored
-        && !facts.orphaned_group)
-        .then_some(linux_raw_sys::general::SIGTTOU)
+/// A read's next action. Wait means no completed canonical record. A zero
+/// destination returns Raw(ReturnNow(0)) in either mode and consumes nothing.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Line,
+    Eof,
+    Wait,
+    Raw(Readiness),
 }

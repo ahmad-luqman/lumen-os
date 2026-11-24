@@ -1,107 +1,154 @@
-//! Bounded terminal line discipline, separate from `lumen-term`'s display.
+//! Terminal line discipline modelled on n_tty, separate from `lumen-term`.
 //!
-//! Input and echo storage are allocated once at construction. Receive, read,
-//! editing, mode changes and readiness never allocate. Each receive returns
-//! a borrowed echo batch, already output-processed: consume it before the
-//! next call and do not pass it through `write` again. A batch is bounded at
-//! 4096 bytes; excess echo is dropped at emission boundaries. `write` allocates
-//! one result buffer per call (at most twice the supplied byte count).
+//! Construction is fallible. All subsequent operations use fixed input
+//! storage and a caller-supplied output sink, with no allocation. Echo units
+//! are atomic; insufficient sink room drops that unit and the rest of that
+//! call's echo, reported as `Echo::Truncated`. Writes instead return the
+//! consumed prefix for retry. Only accepted output changes the column.
 //!
-//! IXON/IXOFF flow control, parity, baud-rate effects and TIOCSTI are outside
-//! this crate. A byte cannot distinguish a hardware BREAK from NUL, so
-//! IGNBRK/BRKINT have no effect on `receive`; use `receive_break` when the
-//! driver has BREAK metadata. Sessions, sleeping and signal delivery belong
-//! to the kernel. Unsupported termios bits are preserved, not implemented.
+//! Known differences from n_tty: IMAXBEL rings BEL on input overflow as a
+//! Lumen policy (Linux ignores IMAXBEL); echo truncation is explicit instead
+//! of using Linux's internal echo ring. IXON/IXOFF, parity, baud-rate effects,
+//! TIOCSTI and unlisted termios flags are not implemented. Thus VSTART/VSTOP
+//! arrive as data. Unsupported bits are preserved in the termios value.
+//!
+//! A byte cannot distinguish BREAK from NUL: drivers supply BREAK metadata
+//! with `receive_break`. The kernel owns timers per reader, drains output
+//! before applying TCSADRAIN/TCSAFLUSH, and delivers signals and wakeups.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::collections::VecDeque;
+use core::num::NonZeroUsize;
 use linux_raw_sys::general::*;
 
 mod output;
 mod readiness;
 mod termios;
-pub use readiness::{Readiness, TimerKind, TimerState, WriterFacts, background_write_signal, ready};
+use output::is_continuation;
+pub use output::{BackgroundWrite, Output, WriterFacts, Written, background_write_signal};
+pub use readiness::{Decision, Readiness, TimerKind, TimerState, ready};
 pub use termios::{Termios, Winsize};
 
+/// Physical input slots, including the canonical terminator/overflow slot.
+/// Raw mode admits 4095 bytes. Canonical lines retain 4095 plus a terminator.
 pub const BUFFER_SIZE: usize = 4096;
+const BS: u8 = 8;
+const BEL: u8 = 7;
 
-/// A signal to the foreground process group, with flushes the caller must
-/// apply to its device queues. The discipline has already flushed its input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoMemory;
+
+/// Edge notifications: polling became readable, or ordinary input room went
+/// from zero to nonzero. The caller must wake the corresponding wait queues.
+/// Raw readers with short destinations also inspect Input::Stored; those
+/// with inter-byte timers inspect timer_restart, independently of poll edges.
+#[must_use]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wake {
+    pub readers: bool,
+    pub writers: bool,
+}
+
+/// A signal to the foreground process group. When flush is true, queued
+/// discipline input and the driver's output were flushed before this call's
+/// echo. Bytes not yet supplied to receive are still delivered normally.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Signal {
     pub number: u32,
-    pub flush_input: bool,
-    pub flush_output: bool,
+    pub flush: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct Effects<'a> {
-    pub echo: &'a [u8],
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Input {
+    Stored,
+    Ignored,
+    Dropped,
+}
+
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Echo {
+    Complete,
+    Truncated,
+}
+
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Effects {
+    pub input: Input,
+    pub echo: Echo,
     pub signal: Option<Signal>,
-    /// Current readiness after this input; true also for an empty EOF record.
-    pub input_readable: bool,
+    pub wake: Wake,
+    /// A raw byte was stored with VMIN>0 and VTIME>0. Each blocked reader
+    /// owns and rearms its own inter-byte timer; this crate stores no timer.
+    pub timer_restart: bool,
 }
 
-/// Typed equivalents of TCSANOW, TCSADRAIN and TCSAFLUSH.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SetWhen {
-    Now,
-    Drain,
-    Flush,
+pub enum Read {
+    Bytes(NonZeroUsize),
+    Eof,
+    Nothing,
+}
+
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Applied {
+    pub flush_input: bool,
+    pub wake: Wake,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TermiosChange {
-    /// The caller must drain output, then call `output_drained`. Until then
-    /// the old settings and input remain active.
-    DrainRequired,
-    Applied {
-        flush_input: bool,
-        input_readable: bool,
-    },
+enum Kind {
+    Plain,
+    LineEnd,
+    Eof,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     byte: u8,
-    end: bool,
-    eof: bool,
-    width: usize,
+    kind: Kind,
+    width: u8,
 }
 
-/// Serialized terminal state. Input (including EOF markers) never exceeds
-/// 4096 slots. Canonical input reserves one slot for a delimiter. A read
-/// returns at most one completed record; short reads retain its remainder.
+struct EchoOutput<'a> {
+    out: &'a mut dyn Output,
+    status: Echo,
+}
+
+/// Terminal state whose caller serializes access with its device output
+/// queue. No internal locks, timers or staged ioctl requests are retained.
+/// Reads return at most one completed canonical record; short reads retain
+/// its remainder. Input entries occupy three bytes each.
 pub struct LineDiscipline {
     termios: Termios,
     input: VecDeque<Entry>,
-    echo: Vec<u8>,
     pending: usize,
     records: usize,
     literal: bool,
     column: usize,
-    timer: TimerState,
     winsize: Winsize,
-    deferred: Option<(Termios, SetWhen)>,
 }
 
 impl LineDiscipline {
-    pub fn new(termios: Termios) -> Self {
-        Self {
-            termios,
-            input: VecDeque::with_capacity(BUFFER_SIZE),
-            echo: Vec::with_capacity(BUFFER_SIZE),
-            pending: 0,
-            records: 0,
-            literal: false,
-            column: 0,
-            timer: TimerState::Idle,
-            winsize: Winsize::default(),
-            deferred: None,
-        }
+    /// Reserves all input storage or returns NoMemory without panicking on
+    /// allocation failure. Subsequent operations do not grow this allocation.
+    pub fn try_new(termios: Termios) -> Result<Self, NoMemory> {
+        Self::with_capacity(termios, BUFFER_SIZE)
+    }
+
+    fn with_capacity(termios: Termios, capacity: usize) -> Result<Self, NoMemory> {
+        let mut input = VecDeque::new();
+        input.try_reserve_exact(capacity).map_err(|_| NoMemory)?;
+        Ok(Self { termios, input, pending: 0, records: 0, literal: false, column: 0, winsize: Winsize::default() })
     }
 
     pub fn termios(&self) -> Termios {
@@ -111,82 +158,126 @@ impl LineDiscipline {
         self.winsize
     }
 
-    /// True exactly when any of the four window-size fields changed.
+    /// True exactly when any of the four dimensions changed (send SIGWINCH).
+    #[must_use]
     pub fn set_winsize(&mut self, winsize: Winsize) -> bool {
         let changed = self.winsize != winsize;
         self.winsize = winsize;
         changed
     }
 
-    /// Free input slots, including the canonical delimiter reserve. Editing
-    /// and signals are still processed when this returns zero.
+    /// Ordinary bytes that fit without consuming the delimiter reserve or
+    /// replacing overflow input. Zero does not prohibit editing, signals or
+    /// a canonical delimiter: use accepts for a particular next byte.
     pub fn input_room(&self) -> usize {
-        BUFFER_SIZE - self.input.len()
+        (BUFFER_SIZE - 1).saturating_sub(self.input.len())
     }
 
-    pub fn readable(&self) -> bool {
-        if self.local(ICANON) { self.records != 0 } else { matches!(self.readiness(), Readiness::ReturnNow(_)) }
+    /// Whether consuming this byte avoids input loss. Mapping, quoting and
+    /// disabled controls match receive. Editing/signals/IGNCR are accepted
+    /// even with no room. False asks a PTY master to leave this byte queued;
+    /// receive may still retain it in the canonical overflow slot if forced.
+    pub fn accepts(&self, mut byte: u8) -> bool {
+        if self.input_flag(ISTRIP) {
+            byte &= 0x7f;
+        }
+        if self.literal {
+            return self.input_room() != 0;
+        }
+        if self.signal_number(byte).is_some() {
+            return true;
+        }
+        if byte == b'\r' && self.input_flag(IGNCR) {
+            return true;
+        }
+        let (byte, _) = self.map_input(byte);
+        if self.local(ICANON) {
+            if self.cc(VERASE, byte)
+                || self.cc(VKILL, byte)
+                || self.ext_cc(VWERASE, byte)
+                || self.ext_cc(VLNEXT, byte)
+                || (self.local(ECHO) && self.ext_cc(VREPRINT, byte))
+            {
+                return true;
+            }
+            if self.kind(byte) != Kind::Plain {
+                return self.can_store();
+            }
+        }
+        self.input_room() != 0
     }
 
-    /// Current raw read decision. For canonical mode use `readable` instead.
-    pub fn readiness(&self) -> Readiness {
-        ready(self.termios.c_cc[VMIN as usize], self.termios.c_cc[VTIME as usize], self.input.len(), self.timer)
-    }
-
-    /// Supplies the current read's timer state. Begin each read with Idle;
-    /// set Running after arming and Expired when the kernel clock expires it.
-    /// Receiving a raw byte resets an inter-byte timer to Idle for rearming.
-    pub fn set_timer_state(&mut self, timer: TimerState) {
-        self.timer = timer;
-    }
-
-    /// Immediate changes apply now. Drain/Flush requests are staged until
-    /// `output_drained`, even if the caller's output queue is already empty.
-    /// A newer request supersedes any staged request.
-    pub fn set_termios(&mut self, new: Termios, when: SetWhen) -> TermiosChange {
-        self.deferred = None;
-        if when != SetWhen::Now {
-            self.deferred = Some((new, when));
-            TermiosChange::DrainRequired
+    /// Poll/select readiness, independent of any reader's timer or buffer:
+    /// canonical records (including EOF), otherwise at least one byte, or
+    /// VMIN bytes when VTIME=0. An empty raw queue is never poll-readable.
+    pub fn poll_readable(&self) -> bool {
+        if self.local(ICANON) {
+            return self.records != 0;
+        }
+        let min = if self.termios.c_cc[VTIME as usize] == 0 {
+            usize::from(self.termios.c_cc[VMIN as usize]).max(1)
         } else {
-            self.apply_termios(new, false)
+            1
+        };
+        self.input.len() >= min
+    }
+
+    pub fn read_decision(&self, dest_len: usize, timer: TimerState) -> Decision {
+        if dest_len == 0 {
+            return Decision::Raw(Readiness::ReturnNow(0));
+        }
+        if self.local(ICANON) {
+            if self.records == 0 {
+                Decision::Wait
+            } else if self.input.front().is_some_and(|e| e.kind == Kind::Eof) {
+                Decision::Eof
+            } else {
+                Decision::Line
+            }
+        } else {
+            let vmin = usize::from(self.termios.c_cc[VMIN as usize]).min(dest_len) as u8;
+            Decision::Raw(ready(vmin, self.termios.c_cc[VTIME as usize], self.input.len().min(dest_len), timer))
         }
     }
 
-    /// Applies a staged change after the caller has drained device output.
-    pub fn output_drained(&mut self) -> Option<TermiosChange> {
-        self.deferred.take().map(|(new, when)| self.apply_termios(new, when == SetWhen::Flush))
-    }
-
-    fn apply_termios(&mut self, new: Termios, flush: bool) -> TermiosChange {
+    /// Applies settings immediately. The kernel drains output first for
+    /// TCSADRAIN/TCSAFLUSH; pass flush=true for TCSAFLUSH. An interrupted drain
+    /// must never call this method. No state belonging to readers is changed.
+    pub fn set_termios(&mut self, new: Termios, flush: bool) -> Applied {
+        let before = self.edges();
         let was_canon = self.local(ICANON);
         if flush {
             self.flush_input();
         }
         self.termios = new;
         if was_canon != self.local(ICANON) {
-            // EOF is metadata, never a byte exposed by a raw read.
-            self.input.retain(|e| !e.eof);
-            for e in &mut self.input {
-                e.end = false;
+            // EOF's __DISABLED_CHAR survives canonical -> raw as NUL.
+            for entry in &mut self.input {
+                entry.kind = Kind::Plain;
             }
-            self.pending = 0;
-            self.records = 0;
-            self.literal = false;
+            self.reset_line_state();
             if self.local(ICANON)
                 && let Some(last) = self.input.back_mut()
             {
-                // n_tty exposes pre-existing raw input as one synthetic line.
-                last.end = true;
+                last.kind = Kind::LineEnd;
                 self.records = 1;
             }
         }
-        self.timer = TimerState::Idle;
-        TermiosChange::Applied { flush_input: flush, input_readable: self.readable() }
+        Applied { flush_input: flush, wake: self.wake_since(before) }
     }
 
+    fn edges(&self) -> (bool, bool) {
+        (self.poll_readable(), self.input_room() != 0)
+    }
+    fn wake_since(&self, before: (bool, bool)) -> Wake {
+        let after = self.edges();
+        Wake { readers: !before.0 && after.0, writers: !before.1 && after.1 }
+    }
     fn local(&self, flag: u32) -> bool {
         self.termios.c_lflag & flag != 0
+    }
+    fn local_all(&self, flags: u32) -> bool {
+        self.termios.c_lflag & flags == flags
     }
     fn input_flag(&self, flag: u32) -> bool {
         self.termios.c_iflag & flag != 0
@@ -194,184 +285,220 @@ impl LineDiscipline {
     fn cc(&self, index: u32, byte: u8) -> bool {
         byte != 0 && self.termios.c_cc[index as usize] == byte
     }
-    fn flush_input(&mut self) {
-        self.input.clear();
+    fn ext_cc(&self, index: u32, byte: u8) -> bool {
+        self.local(IEXTEN) && self.cc(index, byte)
+    }
+    fn reset_line_state(&mut self) {
         self.pending = 0;
         self.records = 0;
         self.literal = false;
-        self.timer = TimerState::Idle;
     }
-    fn signal(&mut self, number: u32) -> Signal {
+    fn flush_input(&mut self) {
+        self.input.clear();
+        self.reset_line_state();
+    }
+    fn signal_number(&self, byte: u8) -> Option<u32> {
+        if !self.local(ISIG) {
+            None
+        } else if self.cc(VINTR, byte) {
+            Some(SIGINT)
+        } else if self.cc(VQUIT, byte) {
+            Some(SIGQUIT)
+        } else if self.cc(VSUSP, byte) {
+            Some(SIGTSTP)
+        } else {
+            None
+        }
+    }
+    fn signal(&mut self, number: u32, out: &mut dyn Output) -> Signal {
         let flush = !self.local(NOFLSH);
         if flush {
             self.flush_input();
-            self.echo.clear();
+            out.flush();
         }
-        Signal { number, flush_input: flush, flush_output: flush }
+        Signal { number, flush }
     }
-    fn effects(&self, signal: Option<Signal>) -> Effects<'_> {
-        Effects { echo: &self.echo, signal, input_readable: self.readable() }
+    fn effects(&self, before: (bool, bool), input: Input, echo: Echo, signal: Option<Signal>) -> Effects {
+        Effects {
+            input,
+            echo,
+            signal,
+            wake: self.wake_since(before),
+            timer_restart: input == Input::Stored
+                && !self.local(ICANON)
+                && self.termios.c_cc[VMIN as usize] != 0
+                && self.termios.c_cc[VTIME as usize] != 0,
+        }
     }
 
-    /// Processes a hardware BREAK. IGNBRK wins over BRKINT; BRKINT produces
-    /// SIGINT even without ISIG, respecting NOFLSH. Otherwise a literal NUL
-    /// enters the input stream. Parity marking (PARMRK) is outside scope.
-    pub fn receive_break(&mut self) -> Effects<'_> {
-        self.echo.clear();
-        let signal = if self.input_flag(IGNBRK) {
-            None
+    /// BREAK consumes literal-next, even when ignored. IGNBRK wins over
+    /// BRKINT, which sends SIGINT without needing ISIG and respects NOFLSH.
+    /// Otherwise a NUL is stored without echo. PARMRK is outside scope.
+    pub fn receive_break(&mut self, out: &mut dyn Output) -> Effects {
+        let before = self.edges();
+        self.literal = false;
+        let mut echo = EchoOutput { out, status: Echo::Complete };
+        let (input, signal) = if self.input_flag(IGNBRK) {
+            (Input::Ignored, None)
         } else if self.input_flag(BRKINT) {
-            Some(self.signal(SIGINT))
+            (Input::Ignored, Some(self.signal(SIGINT, echo.out)))
         } else {
-            self.store(0, false, false, false);
-            None
+            (self.store(0, Kind::Plain, 0, &mut echo), None)
         };
-        self.effects(signal)
+        self.effects(before, input, echo.status, signal)
     }
 
-    /// Processes one byte without allocating. Disabled (zero) control
-    /// characters never match NUL. Literal-next bypasses mapping, editing
-    /// and signals on the following byte, but ISTRIP still applies.
-    pub fn receive(&mut self, mut byte: u8) -> Effects<'_> {
-        self.echo.clear();
+    /// Processes a byte without allocating. Input reports retention separately
+    /// from echo truncation. ISTRIP precedes signals and literal-next bypasses
+    /// mapping/editing/signals. Disabled control characters never match NUL.
+    pub fn receive(&mut self, mut byte: u8, out: &mut dyn Output) -> Effects {
+        let before = self.edges();
+        let mut echo = EchoOutput { out, status: Echo::Complete };
         if self.input_flag(ISTRIP) {
             byte &= 0x7f;
         }
-        if self.literal {
+        let (input, signal) = if self.literal {
             self.literal = false;
-            self.store(byte, false, false, true);
-            return self.effects(None);
-        }
-        if self.local(ISIG) {
-            let number = if self.cc(VINTR, byte) {
-                Some(SIGINT)
-            } else if self.cc(VQUIT, byte) {
-                Some(SIGQUIT)
-            } else if self.cc(VSUSP, byte) {
-                Some(SIGTSTP)
-            } else {
-                None
-            };
-            if let Some(number) = number {
-                let signal = self.signal(number);
-                if self.local(ECHO) {
-                    self.echo_char(byte);
-                }
-                return self.effects(Some(signal));
+            (self.store_echoed(byte, Kind::Plain, false, &mut echo), None)
+        } else if let Some(number) = self.signal_number(byte) {
+            let signal = self.signal(number, echo.out);
+            if self.local(ECHO) {
+                self.echo_char(byte, &mut echo);
             }
-        }
-        if byte == b'\r' {
-            if self.input_flag(IGNCR) {
-                return self.effects(None);
-            }
-            if self.input_flag(ICRNL) {
-                byte = b'\n';
-            }
-        } else if byte == b'\n' && self.input_flag(INLCR) {
-            byte = b'\r';
-        }
-        if self.local(ICANON) {
-            if self.cc(VERASE, byte) {
-                self.erase(false, byte);
-            } else if self.local(IEXTEN) && self.cc(VWERASE, byte) {
-                self.erase(true, byte);
-            } else if self.cc(VKILL, byte) {
-                self.kill(byte);
-            } else if self.local(IEXTEN) && self.cc(VLNEXT, byte) {
-                self.literal = true;
-                if self.local(ECHO) && self.local(ECHOCTL) {
-                    self.emit(b'^');
-                    self.emit(8);
-                }
-            } else if self.local(IEXTEN) && self.local(ECHO) && self.cc(VREPRINT, byte) {
-                self.echo_char(byte);
-                self.emit(b'\n');
-                let start = self.input.len() - self.pending;
-                for i in start..self.input.len() {
-                    let b = self.input[i].byte;
-                    let col = self.column;
-                    self.echo_char(b);
-                    self.input[i].width = self.column.saturating_sub(col);
-                }
-            } else if self.cc(VEOF, byte) {
-                self.store(0, true, true, false);
-            } else {
-                let end = byte == b'\n' || self.cc(VEOL, byte) || (self.local(IEXTEN) && self.cc(VEOL2, byte));
-                self.store(byte, end, false, false);
-            }
+            (Input::Ignored, Some(signal))
+        } else if byte == b'\r' && self.input_flag(IGNCR) {
+            (Input::Ignored, None)
         } else {
-            self.store(byte, false, false, false);
-        }
-        self.effects(None)
+            let (byte, mapped_cr) = self.map_input(byte);
+            (self.receive_mapped(byte, mapped_cr, &mut echo), None)
+        };
+        self.effects(before, input, echo.status, signal)
     }
 
-    fn store(&mut self, byte: u8, end: bool, eof: bool, quoted: bool) {
-        let canon = self.local(ICANON);
-        if self.input.len() >= BUFFER_SIZE || (canon && !end && self.input.len() >= BUFFER_SIZE - 1) {
-            // At the canonical line limit n_tty keeps processing and echoing
-            // ordinary characters, but does not retain them.
-            if self.input_flag(IMAXBEL) {
-                self.emit(7);
-            } else if canon && self.records == 0 && !eof && self.local(ECHO) {
-                self.echo_char(byte);
+    fn map_input(&self, byte: u8) -> (u8, bool) {
+        if byte == b'\r' && self.input_flag(ICRNL) {
+            (b'\n', true)
+        } else if byte == b'\n' && self.input_flag(INLCR) {
+            (b'\r', false)
+        } else {
+            (byte, false)
+        }
+    }
+    fn kind(&self, byte: u8) -> Kind {
+        if self.cc(VEOF, byte) {
+            Kind::Eof
+        } else if byte == b'\n' || self.cc(VEOL, byte) || self.ext_cc(VEOL2, byte) {
+            Kind::LineEnd
+        } else {
+            Kind::Plain
+        }
+    }
+    fn receive_mapped(&mut self, byte: u8, mapped_cr: bool, echo: &mut EchoOutput<'_>) -> Input {
+        if self.local(ICANON) {
+            if self.cc(VERASE, byte) {
+                self.erase_char(byte, echo);
+            } else if self.ext_cc(VWERASE, byte) {
+                self.erase_word(echo);
+            } else if self.cc(VKILL, byte) {
+                self.kill(byte, echo);
+            } else if self.ext_cc(VLNEXT, byte) {
+                self.literal = true;
+                if self.local_all(ECHO | ECHOCTL) {
+                    self.emit(&[b'^', BS], echo);
+                }
+            } else if self.local(ECHO) && self.ext_cc(VREPRINT, byte) {
+                self.reprint(byte, echo);
+            } else {
+                let kind = self.kind(byte);
+                return self.store_echoed(if kind == Kind::Eof { 0 } else { byte }, kind, byte == b'\n', echo);
             }
-            return;
+            Input::Ignored
+        } else {
+            self.store_echoed(byte, Kind::Plain, mapped_cr, echo)
+        }
+    }
+
+    fn can_store(&self) -> bool {
+        if self.local(ICANON) && self.records == 0 { true } else { self.input.len() < BUFFER_SIZE - 1 }
+    }
+    fn overflow_bell(&mut self, echo: &mut EchoOutput<'_>) {
+        if self.input_flag(IMAXBEL) {
+            self.emit(&[BEL], echo);
+        }
+    }
+    fn store_echoed(&mut self, byte: u8, kind: Kind, literal_newline: bool, echo: &mut EchoOutput<'_>) -> Input {
+        if !self.can_store() {
+            self.overflow_bell(echo);
+            return Input::Dropped;
         }
         let column = self.column;
-        if !eof && (self.local(ECHO) || (canon && byte == b'\n' && self.local(ECHONL))) {
-            if byte == b'\n' && !quoted {
-                self.emit(byte);
+        if kind != Kind::Eof
+            && (self.local(ECHO) || (self.local_all(ICANON | ECHONL) && byte == b'\n' && literal_newline))
+        {
+            if literal_newline && byte == b'\n' {
+                self.emit(&[byte], echo);
             } else {
-                self.echo_char(byte);
+                self.echo_char(byte, echo);
             }
         }
-        self.input.push_back(Entry { byte, end, eof, width: self.column.saturating_sub(column) });
-        if canon {
-            if end {
+        let width = self.column.saturating_sub(column).min(8) as u8;
+        self.store(byte, kind, width, echo)
+    }
+    fn store(&mut self, byte: u8, kind: Kind, width: u8, echo: &mut EchoOutput<'_>) -> Input {
+        if !self.can_store() {
+            self.overflow_bell(echo);
+            return Input::Dropped;
+        }
+        if self.input.len() == BUFFER_SIZE {
+            // No completed line: the last slot tracks the latest overflow
+            // character until a delimiter replaces it and publishes the line.
+            self.input.pop_back();
+            self.pending -= 1;
+            self.overflow_bell(echo);
+        }
+        self.input.push_back(Entry { byte, kind, width });
+        if self.local(ICANON) {
+            if kind != Kind::Plain {
                 self.pending = 0;
                 self.records += 1;
             } else {
                 self.pending += 1;
             }
-        } else if self.termios.c_cc[VMIN as usize] != 0 && self.termios.c_cc[VTIME as usize] != 0 {
-            self.timer = TimerState::Idle;
         }
+        Input::Stored
     }
 
-    fn erase(&mut self, word: bool, erase_byte: u8) {
-        let mut seen_word = false;
-        let mut removed = false;
-        while self.pending != 0 {
-            let start = self.last_character();
-            let byte = self.input[start].byte;
-            let is_word = byte.is_ascii_alphanumeric() || byte == b'_';
-            if word && seen_word && !is_word {
-                break;
-            }
-            seen_word |= is_word;
-            self.remove_character(start, self.local(ECHOE));
-            removed = true;
-            if !word {
-                break;
-            }
-        }
-        if removed && self.local(ECHO) && !self.local(ECHOE) {
-            self.echo_char(erase_byte);
-        }
-    }
-
-    fn last_character(&self) -> usize {
+    fn last_character(&self) -> Option<usize> {
         let floor = self.input.len() - self.pending;
-        let mut start = self.input.len() - 1;
-        if self.input_flag(IUTF8) {
-            while start > floor && self.input[start].byte & 0xc0 == 0x80 {
-                start -= 1;
-            }
-        }
-        start
+        // No lead byte means no partial erasure.
+        (floor..self.input.len()).rev().find(|&i| !self.input_flag(IUTF8) || !is_continuation(self.input[i].byte))
     }
-
-    fn remove_character(&mut self, start: usize, visual: bool) {
+    fn erase_char(&mut self, byte: u8, echo: &mut EchoOutput<'_>) {
+        let Some(start) = self.last_character() else {
+            return;
+        };
+        self.remove_character(start, self.local(ECHOE), echo);
+        if self.local(ECHO) && !self.local(ECHOE) {
+            self.echo_char(byte, echo);
+        }
+    }
+    fn erase_word(&mut self, echo: &mut EchoOutput<'_>) {
+        let mut seen_word = false;
+        for _ in 0..self.pending {
+            let Some(start) = self.last_character() else {
+                break;
+            };
+            let byte = self.input[start].byte;
+            // Linux lib/ctype.c's Latin-1 alnum classification.
+            let word = byte.is_ascii_alphanumeric() || byte == b'_' || (byte >= 0xc0 && byte != 0xd7 && byte != 0xf7);
+            if seen_word && !word {
+                break;
+            }
+            seen_word |= word;
+            self.remove_character(start, true, echo);
+        }
+    }
+    fn remove_character(&mut self, start: usize, visual: bool, echo: &mut EchoOutput<'_>) {
         let byte = self.input[start].byte;
         let width = if byte == b'\t' {
             self.input[start].width
@@ -380,102 +507,136 @@ impl LineDiscipline {
         } else {
             1
         };
-        let count = self.input.len() - start;
+        self.pending -= self.input.len() - start;
         self.input.truncate(start);
-        self.pending -= count;
         if self.local(ECHO) && visual {
             for _ in 0..width {
-                self.emit(8);
-                if byte != b'\t' {
-                    self.emit(b' ');
-                    self.emit(8);
+                if byte == b'\t' {
+                    self.emit(&[BS], echo);
+                } else {
+                    self.emit(&[BS, b' ', BS], echo);
                 }
             }
         }
     }
-
-    fn kill(&mut self, byte: u8) {
+    fn kill(&mut self, byte: u8, echo: &mut EchoOutput<'_>) {
         if self.pending == 0 {
             return;
         }
-        if self.local(ECHO) && self.local(ECHOE) && self.local(ECHOK) && self.local(ECHOKE) {
-            while self.pending != 0 {
-                self.remove_character(self.last_character(), true);
+        if self.local_all(ECHO | ECHOE | ECHOK | ECHOKE) {
+            for _ in 0..self.pending {
+                let Some(start) = self.last_character() else {
+                    break;
+                };
+                self.remove_character(start, true, echo);
             }
         } else {
             self.input.truncate(self.input.len() - self.pending);
             self.pending = 0;
             if self.local(ECHO) {
-                self.echo_char(byte);
+                self.echo_char(byte, echo);
                 if self.local(ECHOK) {
-                    self.emit(b'\n');
+                    self.emit(b"\n", echo);
                 }
             }
         }
     }
-
-    fn echo_char(&mut self, byte: u8) {
+    fn reprint(&mut self, byte: u8, echo: &mut EchoOutput<'_>) {
+        self.echo_char(byte, echo);
+        self.emit(b"\n", echo);
+        for i in self.input.len() - self.pending..self.input.len() {
+            let byte = self.input[i].byte;
+            let column = self.column;
+            self.echo_char(byte, echo);
+            self.input[i].width = self.column.saturating_sub(column).min(8) as u8;
+        }
+    }
+    fn echo_char(&mut self, byte: u8, echo: &mut EchoOutput<'_>) {
         if self.local(ECHOCTL) && byte.is_ascii_control() && byte != b'\t' {
-            self.emit(b'^');
-            self.emit(if byte == 127 { b'?' } else { byte + 64 });
+            self.emit(&[b'^', byte ^ 0x40], echo);
         } else {
-            self.emit(byte);
+            self.emit(&[byte], echo);
+        }
+    }
+    fn emit(&mut self, unit: &[u8], echo: &mut EchoOutput<'_>) {
+        if echo.status == Echo::Complete
+            && !output::push_unit(echo.out, unit, self.termios.c_oflag, self.input_flag(IUTF8), &mut self.column)
+        {
+            echo.status = Echo::Truncated;
         }
     }
 
-    fn emit(&mut self, byte: u8) {
-        let mut column = self.column;
-        let (bytes, n) = output::process(byte, self.termios.c_oflag, self.input_flag(IUTF8), &mut column);
-        if self.echo.len() + n <= BUFFER_SIZE {
-            self.echo.extend_from_slice(&bytes[..n]);
-            self.column = column;
-        }
-    }
-
-    /// Copies available data without waiting. Check readiness first to
-    /// distinguish no complete input from an EOF record. Empty destinations
-    /// consume nothing. Raw reads copy available bytes regardless of VMIN;
-    /// the caller uses `ready` to decide when its read should complete.
-    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+    /// Copies available input without sleeping, returning the read outcome
+    /// and wake edges. Nothing means empty/incomplete input or an empty
+    /// destination; only a consumed canonical EOF record yields Eof. Raw
+    /// callers use read_decision first to implement VMIN/VTIME waits.
+    #[must_use = "handle EOF separately and wake blocked writers"]
+    pub fn read(&mut self, buf: &mut [u8]) -> (Read, Wake) {
+        let before = self.edges();
         if buf.is_empty() || (self.local(ICANON) && self.records == 0) {
-            return 0;
+            return (Read::Nothing, Wake::default());
         }
         let mut n = 0;
-        while let Some(entry) = self.input.front().copied() {
-            if n == buf.len() && !entry.eof {
+        let mut eof = false;
+        for _ in 0..self.input.len() {
+            let entry = self.input[0];
+            if n == buf.len() && entry.kind != Kind::Eof {
                 break;
             }
             self.input.pop_front();
-            if !entry.eof {
+            if entry.kind != Kind::Eof {
                 buf[n] = entry.byte;
                 n += 1;
             }
-            if entry.end {
+            if entry.kind != Kind::Plain {
                 self.records -= 1;
-                break;
-            }
-            if n == buf.len() && !self.input.front().is_some_and(|e| e.eof) {
+                eof = entry.kind == Kind::Eof;
                 break;
             }
         }
-        n
+        let result = if let Some(n) = NonZeroUsize::new(n) {
+            Read::Bytes(n)
+        } else if eof {
+            Read::Eof
+        } else {
+            Read::Nothing
+        };
+        (result, self.wake_since(before))
     }
 
-    /// Output processing with a single allocation, sharing column tracking
-    /// with echo (including tabs, backspaces and UTF-8 continuation bytes).
-    pub fn write(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let mut result = Vec::with_capacity(bytes.len().saturating_mul(2));
+    /// Accepts a prefix without allocating. Each transformed source byte is
+    /// atomic against sink room; retry bytes[consumed..] after backpressure.
+    pub fn write(&mut self, bytes: &[u8], out: &mut dyn Output) -> Written {
+        let mut consumed = 0;
         for &byte in bytes {
-            let (out, n) = output::process(byte, self.termios.c_oflag, self.input_flag(IUTF8), &mut self.column);
-            result.extend_from_slice(&out[..n]);
+            if !output::push_unit(out, &[byte], self.termios.c_oflag, self.input_flag(IUTF8), &mut self.column) {
+                break;
+            }
+            consumed += 1;
         }
-        result
+        Written { consumed }
+    }
+
+    #[cfg(test)]
+    fn check_invariants(&self) {
+        assert!(self.input.len() <= BUFFER_SIZE);
+        assert!(self.input.capacity() >= BUFFER_SIZE);
+        let records = self.input.iter().filter(|e| e.kind != Kind::Plain).count();
+        assert_eq!(self.records, records);
+        let pending =
+            if self.local(ICANON) { self.input.iter().rev().take_while(|e| e.kind == Kind::Plain).count() } else { 0 };
+        assert_eq!(self.pending, pending);
+        if !self.local(ICANON) {
+            assert_eq!(records, 0);
+        }
+        assert!(self.input.iter().all(|e| e.width <= 8 && (e.kind != Kind::Eof || e.byte == 0)));
     }
 }
 
+#[cfg(test)]
 impl Default for LineDiscipline {
     fn default() -> Self {
-        Self::new(Termios::linux_default())
+        Self::try_new(Termios::linux_default()).unwrap()
     }
 }
 
