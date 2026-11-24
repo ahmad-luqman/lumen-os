@@ -270,7 +270,8 @@ one is its own PR that updates that doc first.
   vectors, the device status handle, the `Doorbell` a driver's interrupt
   rings, or the driver itself to wake its thread: `mouse::hold`). `blk/` (M7): `virtio_blk.rs` the
   virtio-blk driver (`DRIVER`, `VirtioBlkDevice`: a `lumen_bcache::BlockDevice` over one queue and its
-  MSI-X vector) and each device's `BlockCache` (`devices`, `device`, `cache`); `mod.rs` the `blk`
+  MSI-X vector) and each device's `BlockCache` (`devices`, `device`; a `BlkEntry`'s cache only
+  through `stats` and `into_cache`, which `vfs::init` mounts behind ext4's `LatchedCache`, #349); `mod.rs` the `blk`
   command (the devices, `read`/`write`/`flush` by sector). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
   `sources`, `stats` (the shell's `random`, rhai's `random()`), RDRAND and
   the virtio-rng driver (its own queue, one deadline per request, dropped
@@ -367,7 +368,8 @@ one is its own PR that updates that doc first.
   `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
   and the `mount`, `sync` and `vfstest` commands (`mount`'s `used`/`limit`:
   a tmpfs mount's quota, through `mounts_with_fs` and `tmpfs::quota_use`,
-  #324; `vfstest`: file
+  #324; an errored ext4 volume's mode `ro,errors`, `ro,errors=remount-ro`
+  in `/proc/mounts`, #349; `vfstest`: file
   operations from the kernel shell, for the scenarios to set up and inspect
   files around ring-3 programs);
   `vfs/tests.rs` the ktests of `mod.rs`'s code (`lumen_kernel::vfs::tests::`;
@@ -594,11 +596,17 @@ one is its own PR that updates that doc first.
   `sync`/`flush_blocks` in block order, then the device flush owed,
   `needs_device_flush`; a failed device write kept dirty and cached for the
   next writeback, its error reaching whichever call wrote the block back,
-  #331) and `MemBlockDevice` (in memory: injected errors, power loss)
-  (host-tested).
+  #331; #349: `Writeback` running, stopped (`stop_writeback_on_failure`: at
+  the first failure; `first_failure`, the first failed device write or
+  flush, kept for good) or frozen (`freeze`:
+  writes into the cache refused too), a miss with no clean slot then read
+  uncached, `read_uncached`; `stop_writeback`/`thaw` behind the `test-util`
+  feature, the ktest kernel's) and `MemBlockDevice` (in memory: injected
+  errors, power loss) (host-tested).
 - `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
   `FileSystem`/`VfsInode` traits (names as bytes, #268; `Escaped`, a name's
-  bytes as text, never lossily), the path and symlink resolver
+  bytes as text, never lossily; `FileSystem::errored`, read-only after an
+  error, a `MountInfo`'s `errored`, #349), the path and symlink resolver
   (`resolve_parent`'s `ParentTarget`, its last component a `Final`: root,
   `.`, `..` or a name, #309), the mount
   table and the Lock-9 inode and dentry caches (`VfsTables`, generic over a
