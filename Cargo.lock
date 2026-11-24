@@ -399,6 +399,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-futex"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-gfx"
 version = "0.0.1"
 
@@ -473,6 +477,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-pipe"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-png"
 version = "0.0.1"
 dependencies = [
@@ -497,6 +505,14 @@ dependencies = [
  "lumen-term",
  "shlex",
  "unicode-width",
+]
+
+[[package]]
+name = "lumen-signal"
+version = "0.0.1"
+dependencies = [
+ "linux-raw-sys",
+ "lumen-vm",
 ]
 
 [[package]]
