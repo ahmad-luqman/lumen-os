@@ -270,9 +270,10 @@ one is its own PR that updates that doc first.
   vectors, the device status handle, the `Doorbell` a driver's interrupt
   rings, or the driver itself to wake its thread: `mouse::hold`). `blk/` (M7): `virtio_blk.rs` the
   virtio-blk driver (`DRIVER`, `VirtioBlkDevice`: a `lumen_bcache::BlockDevice` over one queue and its
-  MSI-X vector) and each device's `BlockCache` (`devices`, `device`; a `BlkEntry`'s cache only
-  through `stats` and `into_cache`, which `vfs::init` mounts behind ext4's `LatchedCache`, #349); `mod.rs` the `blk`
-  command (the devices, `read`/`write`/`flush` by sector). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
+  MSI-X vector) and each device's `BlockCache` (`devices`: the bound entries; `device`: one's driver;
+  a `BlkEntry`'s cache only through `stats` and `into_cache`, which `vfs::init` mounts behind ext4's
+  `LatchedCache`, #349); `mod.rs` the `blk` command (the devices; `read`/`write` by sector and
+  `flush`, straight to the device, past its cache). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
   `sources`, `stats` (the shell's `random`, rhai's `random()`), RDRAND and
   the virtio-rng driver (its own queue, one deadline per request, dropped
   on a failed request) feeding a ChaCha20 pool. `power.rs`: `reboot` and `shutdown` (ACPI S5;
@@ -368,8 +369,7 @@ one is its own PR that updates that doc first.
   `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
   and the `mount`, `sync` and `vfstest` commands (`mount`'s `used`/`limit`:
   a tmpfs mount's quota, through `mounts_with_fs` and `tmpfs::quota_use`,
-  #324; an errored ext4 volume's mode `ro,errors`, `ro,errors=remount-ro`
-  in `/proc/mounts`, #349; `vfstest`: file
+  #324; an errored ext4 volume's mode `ro,errors`, #349; `vfstest`: file
   operations from the kernel shell, for the scenarios to set up and inspect
   files around ring-3 programs);
   `vfs/tests.rs` the ktests of `mod.rs`'s code (`lumen_kernel::vfs::tests::`;
@@ -381,7 +381,7 @@ one is its own PR that updates that doc first.
   64 MiB hard cap, one check, `admit_unreclaimable`, for a dirty or mapped
   page, `QuotaCounter` (bytes; a leak logged when dropped), the detached-inode
   quota; `read_into`/`write_from`/`resize`/`map_page`, the page I/O ext4 and
-  tmpfs share, #264, a page failing after the first a short count, #321; `mmap_page`,
+  tmpfs share, #264; a failure past the first page a short count (`page::short_count`), #321; `mmap_page`,
   re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
   for a mapping, through `VfsInode::as_any`, and `MappedPage::copy_to_frame` (under the cache lock)
   for copy-on-write, #255; `WritableMap`, the guard counting a writable
@@ -414,12 +414,12 @@ one is its own PR that updates that doc first.
   after an unlink or rmdir failed with its directory unreadable,
   `child_lost_entry`: whether the child's entry went, from its inode
   (`child_after_failed_unlink`'s `ChildReadBack`: zeroed, its first freed
-  block free by lumen-vfs's `first_block_freed`, allocated, or `Undecided`:
-  kept live and logged), #330; `Ext4DiskLayout` over lumen-vfs's `Geometry`
+  block free by lumen-vfs's `first_block_freed`, allocated, or unreadable
+  (`Undecided`, why): kept live and logged), #330; `Ext4DiskLayout` over lumen-vfs's `Geometry`
   (`block_byte`, `bit_is_clear`, `read_i_block`); `DirHash`, the htree hash
   by `s_flags` (neither flag with `dir_index` mounts read-only,
-  `forced_read_only_reason`, a lookup missing a name with a byte of 0x80 or
-  above walking the directory, `scan_dir_for`, #308; its ktests' image
+  `forced_read_only_reason`, a lookup in an htree directory missing a name
+  with a byte of 0x80 or above walking the directory, `scan_dir_for`, #308; its ktests' image
   `testdata/unsigned-hash.ext4`, made by `tools/ext4-unsigned-hash-image.py`);
   `ktest_util`, the ext4 ktest helpers `vfs/tests.rs` and `page_cache.rs`
   share: `FaultCache` (writes failed by number, pair or from one on,
@@ -431,7 +431,8 @@ one is its own PR that updates that doc first.
   `quota_use`, a mount's `QuotaUse` for `mount`, #324),
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
-  `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
+  `meminfo`, `mounts`, `version`; `mounts`: an errored ext4 volume
+  `ro,errors=remount-ro`, `format_mounts_of`, #349; `/proc/<pid>/maps` from
   `AddressSpace::format_maps`, its lines `lumen_vm::maps`'s; the node
   kinds, inode numbers, fds and numeric names `lumen_vfs::procfs`'s).
   `linux/` (M6, M7; ARCHITECTURE section 8): `linux/mod.rs` the
@@ -595,12 +596,12 @@ one is its own PR that updates that doc first.
   `PinnedBlock`/`PinnedBlockMut`, never evicted; `read_at`/`write_at`;
   `sync`/`flush_blocks` in block order, then the device flush owed,
   `needs_device_flush`; a failed device write kept dirty and cached for the
-  next writeback, its error reaching whichever call wrote the block back,
-  #331; #349: `Writeback` running, stopped (`stop_writeback_on_failure`: at
-  the first failure; `first_failure`, the first failed device write or
-  flush, kept for good) or frozen (`freeze`:
-  writes into the cache refused too), a miss with no clean slot then read
-  uncached, `read_uncached`; `stop_writeback`/`thaw` behind the `test-util`
+  next writeback (while writeback runs), its error reaching whichever call
+  wrote the block back, #331; #349: `first_failure` (every cache: the first
+  failed device write or flush, kept for good); `Writeback` running, stopped
+  (`stop_writeback_on_failure`: at the first failure) or frozen (`freeze`:
+  writes into the cache refused too), a read miss with no clean slot then
+  read uncached, `read_uncached`; `stop_writeback`/`thaw` behind the `test-util`
   feature, the ktest kernel's) and `MemBlockDevice` (in memory: injected
   errors, power loss) (host-tested).
 - `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
