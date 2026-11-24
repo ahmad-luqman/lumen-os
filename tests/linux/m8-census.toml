@@ -115,9 +115,6 @@ nr = 15
 calls = 36
 workloads = ["ash", "gcc", "git", "gpp", "make", "signals", "sqlite"]
 
-[syscalls.rt_sigreturn.errors]
-EINTR = 4
-
 [syscalls.ioctl]
 nr = 16
 calls = 184
