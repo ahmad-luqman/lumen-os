@@ -5967,7 +5967,8 @@ fixable there now, each in a PR of its own.
       so it didn't happen on the disk, though until reboot it may show in
       memory (so lumen-vfs drops the names an unlink, rmdir or rename
       touched from the dentry cache on a failure too, and `truncate`
-      unmaps the caller's pages past the end on a failure too; an
+      unmaps the caller's pages past the size the file has then on a
+      failure too, never below it; an
       `open(O_TRUNC)` that fails so doesn't). A read whose eviction met the failure is served (below), so
       the operation may not see the failure itself (a `link` would return
       `Ok`). When the last one ends, the latch settles (below). The VFS
