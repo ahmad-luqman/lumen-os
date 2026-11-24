@@ -1,0 +1,15 @@
+[package]
+name = "lumen-signal"
+description = "no_std Linux x86-64 signal policy, frames and sigreturn validation, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+linux-raw-sys = { workspace = true }
+
+[dev-dependencies]
+lumen-vm = { path = "../lumen-vm" }
+
+[lints]
+workspace = true

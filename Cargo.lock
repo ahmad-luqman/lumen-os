@@ -508,6 +508,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-signal"
+version = "0.0.1"
+dependencies = [
+ "linux-raw-sys",
+ "lumen-vm",
+]
+
+[[package]]
 name = "lumen-snake"
 version = "0.0.1"
 dependencies = [
