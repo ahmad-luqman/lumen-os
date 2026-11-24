@@ -9,6 +9,7 @@ import os
 import platform
 import signal
 import struct
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -701,17 +702,28 @@ def test_run_native_counts_a_runtest_that_never_ends_as_an_error(tmp_path):
     r = libctest.parse(transcript).results["src/functional/a-static.exe"]
     assert r.outcome is Outcome.ERROR
     assert r.output == ("src/functional/a.c:3: stuck", "runtest did not end within 2 s")
-    # The hung test itself is gone too, not just runtest.
+    # The hung test itself is dead too, not just runtest. Dead, not gone: in
+    # a container whose PID 1 doesn't reap orphans it stays a zombie.
     pid = int(pidfile.read_text())
     for _ in range(100):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not _running(pid):
             break
         time.sleep(0.05)
     else:
         os.kill(pid, signal.SIGKILL)
         pytest.fail(f"the hung test (pid {pid}) outlived run_native")
+
+
+def _running(pid: int) -> bool:
+    """Whether `pid` is a live process: not gone, and not a zombie."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    state = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+    ).stdout.strip()
+    return bool(state) and not state.startswith("Z")
 
 
 def test_run_native_refuses_a_dynamic_test_without_a_loader(tmp_path):
