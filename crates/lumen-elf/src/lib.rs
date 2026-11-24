@@ -22,6 +22,9 @@ extern crate alloc;
 pub mod loader;
 pub mod stack;
 
+pub mod args;
+pub mod shebang;
+
 use core::fmt;
 
 pub(crate) const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
