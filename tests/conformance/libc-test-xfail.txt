@@ -1,0 +1,25 @@
+# musl libc-test: the tests expected to fail in Lumen (tools/build-libc-test.sh
+# builds them; lumen_harness.libctest reads this file and judges a run).
+#
+# One test per line: its path under build/libc-test (as libc-test's FAIL lines
+# print it), then `# <reason> #<issue>`, the issue that will fix it:
+#
+#   src/functional/<name>-static.exe # <why it fails in Lumen> #<issue number>
+#
+# For a failure that isn't Lumen's (musl's own, or a libc-test check newer
+# than Alpine's musl 1.2.5), the issue is one tracking it, such as a musl bump.
+#
+# Lines that are empty or start with `#` are comments. A test is listed only
+# for a failure (`[status N]`, `[signal ...]` or `[timed out]`). A runner
+# error is never expected, whatever this list says:
+#   - `[internal]` or `[unknown]` (runtest's fork or waitpid failing among
+#     them, exit 255);
+#   - runtest's own lines `src/common/runtest.c:<line>: <program> exec
+#     failed: ...`, `... sigtimedwait failed: ...` or `... kill failed: ...`,
+#     though runtest then prints a status or a signal;
+#   - musl's loader failing to start the test (`<loader>: cannot load <test>:
+#     ...`, `<loader>: <test>: Not a valid dynamic program`, then status 1);
+#   - `[status 126]` or `[status 127]`: the test never ran (not executable, a
+#     missing library, a failed relocation).
+# A listed test that passes fails the run, so remove its line in the PR that
+# fixes it.

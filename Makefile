@@ -252,3 +252,19 @@ $(BUILD)/alpine-dev.ext4: tools/mkrootfs-dev.sh tools/alpine-lock.py tools/ext4-
 	tools/mkrootfs-dev.sh $@
 
 rootfs-dev: $(BUILD)/alpine-dev.ext4 ## Build the deterministic Alpine developer image (gcc, g++, make, git, sqlite3, vim) for M8's gates
+
+# zig, pinned, for C cross-builds only (#345): the kernel, the apps and the
+# Rust test binaries keep rustc + rust-lld. The script checks its own stamp
+# (version and host), so the target always runs it.
+.PHONY: deps-zig
+deps-zig: ## Download the pinned zig, the C cross-compiler for host-built Linux test binaries (sha256-checked)
+	tools/fetch-zig.sh
+
+# musl's libc-test (#345) at its pinned commit, built static and dynamic for
+# x86_64-linux-musl with the pinned zig into build/libc-test/ (its tests.txt,
+# and not-built.txt with each test that didn't build and why). Both scripts
+# check their own stamps, so a second run does nothing.
+.PHONY: libc-test
+libc-test: deps-zig ## Fetch musl libc-test (pinned commit) and build it with the pinned zig into build/libc-test/
+	tools/fetch-libc-test.sh
+	tools/build-libc-test.sh
