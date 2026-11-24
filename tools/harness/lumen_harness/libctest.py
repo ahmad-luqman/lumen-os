@@ -14,7 +14,8 @@ line if it failed), then one line the driver adds with runtest's exit code:
 
     EXIT <path> <code>
 
-(`runtest -t 30 src/functional/x-static.exe; echo "EXIT src/functional/x-static.exe $?"`).
+(`runtest -t 30 src/functional/x-static.exe; echo "EXIT src/functional/x-static.exe $?"`;
+30 s is this harness's choice, runtest's own default is 5 s).
 A passing test prints nothing, so a pass is only ever read from its EXIT line,
 and a test without one counts as not run, never as passed.
 
@@ -26,8 +27,14 @@ Each test is a pass, a fail or an error:
   verdict, so an expected-failure entry may cover them);
 - error: anything else: runtest's own failures (`[internal]`, `[unknown]`,
   exit 255), an exit code runtest never returns, a FAIL line naming another
-  test, or one that disagrees with the exit code. An error is a broken run,
-  not a verdict, and no expected-failure entry covers it.
+  test, or one that disagrees with the exit code. Also runner trouble that
+  runtest reports as a status or signal: one of runtest's own error lines in
+  the output (`<argv0> exec failed: ...`, then `[status 1]`, when the test
+  or its loader couldn't be executed; `fork`, `sigtimedwait`, `kill` and
+  `waitpid` failures, the second ending in `[signal Killed]`), or
+  `[status 126]` or `[status 127]` (the shell's and musl's loader's "can't
+  run it", a missing library among them). An error is a broken run, not a
+  verdict, and no expected-failure entry covers it.
 
 tests/conformance/libc-test-xfail.txt lists the tests expected to fail, one
 per line: the test's path, then `# <reason> #<issue>`, the issue that will fix
@@ -59,6 +66,12 @@ _TEST = re.compile(r"^src/(?:functional|regression)/[A-Za-z0-9_.+-]+\.exe$")
 _EXIT = re.compile(r"^EXIT (\S+) (\d+)$")
 _FAIL = re.compile(r"^FAIL (\S+) \[(.*)\]$")
 _STATUS = re.compile(r"^status ([1-9]\d*)$")
+# runtest's own error lines (t_error("%s exec failed: %s\n", argv[0], ...)):
+# its first word is a program path, never a test's `file.c:line:`.
+_RUNNER_TROUBLE = re.compile(r"^\S*[^:\s] (exec|fork|sigtimedwait|kill|waitpid) failed: ")
+# Exit statuses meaning the program never ran: 126 (found, not executable)
+# and 127 (not found; musl's loader for a missing library too).
+_NOT_RUN_STATUSES = {"status 126", "status 127"}
 _XFAIL = re.compile(r"^(?P<test>\S+)\s+#\s*(?P<reason>\S.*?)\s+#(?P<issue>[1-9]\d*)$")
 
 
@@ -117,6 +130,11 @@ def _classify(test: str, code: int, lines: list[str]) -> Result:
         return error(f"runtest exited {code} without a FAIL line")
     if code != 1:
         return error(f"runtest exited {code} after FAIL [{why}]")
+    trouble = [line for line in output if _RUNNER_TROUBLE.match(line)]
+    if trouble:
+        return error(f"runner trouble, not the test's verdict: {trouble[0]} (FAIL [{why}])")
+    if why in _NOT_RUN_STATUSES:
+        return error(f"FAIL [{why}]: the program never ran (not executable, or not found)")
     if _STATUS.match(why) or why == "timed out" or why.startswith("signal "):
         return Result(test, Outcome.FAIL, why, output)
     return error(f"runtest could not run it: FAIL [{why}]")
@@ -203,6 +221,9 @@ class Verdict:
     unknown: list[str] = field(default_factory=list)
     stale: list[Xfail] = field(default_factory=list)
     passed: list[str] = field(default_factory=list)
+    # The run's output after its last EXIT line (Run.trailing): shown, as the
+    # test it belongs to is already counted not run.
+    trailing: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -238,6 +259,9 @@ class Verdict:
             f"  LISTED BUT NOT BUILT (line {x.line} of the expected-failure list) {x.test}"
             for x in self.stale
         ]
+        if self.trailing:
+            lines.append("  OUTPUT AFTER THE LAST EXIT LINE (a test that never ended)")
+            lines += [f"    {o}" for o in self.trailing]
         return "\n".join(lines)
 
 
@@ -248,7 +272,7 @@ def compare(run: Run, xfail: dict[str, Xfail], expected: Iterable[str]) -> Verdi
     not listed, a listed test that passed, and a listed test not in
     `expected`. A listed test that failed (status, signal or timeout) passes."""
     want = set(expected)
-    v = Verdict()
+    v = Verdict(trailing=list(run.trailing))
     v.not_run = sorted(want - run.results.keys())
     v.unknown = sorted(run.results.keys() - want)
     v.stale = sorted((x for t, x in xfail.items() if t not in want), key=lambda x: x.line)
@@ -271,10 +295,18 @@ def read_tests(root: Path = BUILD) -> list[str]:
 
 
 def run_native(
-    root: Path, tests: Iterable[str], *, loader: Path | None, timeout_s: int = 30
+    root: Path,
+    tests: Iterable[str],
+    *,
+    loader: Path | None,
+    timeout_s: int = 30,
+    grace_s: int = 30,
 ) -> str:
     """Run each test on this host, one at a time, through the built runtest
-    (`-t timeout_s`), and return the transcript `parse` reads. Dynamic tests
+    (`-t timeout_s`; 30 s is this harness's choice, runtest's default is 5 s),
+    and return the transcript `parse` reads. A runtest still running
+    `grace_s` after its own timeout is killed and closed with exit code 124,
+    an error. Dynamic tests
     run through `loader`, a musl dynamic loader (Alpine's), as runtest's
     wrapper: this host needn't have musl installed.
 
@@ -300,14 +332,14 @@ def run_native(
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    timeout=timeout_s + 30,
+                    timeout=timeout_s + grace_s,
                     check=False,
                 )
                 out += proc.stdout.decode(errors="replace").splitlines()
                 code = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
             except subprocess.TimeoutExpired:
                 # runtest itself hung: an error (its exit code isn't 0 or 1).
-                out.append(f"runtest did not end within {timeout_s + 30} s")
+                out.append(f"runtest did not end within {timeout_s + grace_s} s")
                 code = 124
             out.append(f"EXIT {test} {code}")
     return "\n".join(out) + "\n"
@@ -369,6 +401,17 @@ def read_elf(path: Path) -> Elf:
 _UBSAN_RUNTIME = b"cannot be represented in type"
 
 
+def _build_problems(root: Path, name: str, elf: Elf) -> list[str]:
+    """What every built binary, test or library, must not carry."""
+    problems = []
+    if _UBSAN_RUNTIME in (root / name).read_bytes():
+        problems.append(f"{name}: carries zig's UBSan runtime (built without -fno-sanitize)")
+    debug = [s for s in elf.sections if s.startswith(".debug_")]
+    if debug:
+        problems.append(f"{name}: keeps debug sections ({', '.join(debug)})")
+    return problems
+
+
 def linkage_problems(root: Path = BUILD) -> list[str]:
     """Each built test, and the runner, linked as its name says: `-static.exe`
     with no interpreter, any other `.exe` against musl's loader. None carries
@@ -376,7 +419,8 @@ def linkage_problems(root: Path = BUILD) -> list[str]:
     16 MiB unless told otherwise, which would give every thread musl's 8 MiB
     cap instead of the 128 KiB that Alpine's gcc-built programs get), and
     none keeps a `.debug_` section (DWARF names the build's directories, so
-    two builds would differ)."""
+    two builds would differ). The tests' libraries (`src/*/*.so`) are
+    checked for the runtime and debug sections too."""
     problems = []
     for test in [RUNTEST, *read_tests(root)]:
         try:
@@ -384,17 +428,20 @@ def linkage_problems(root: Path = BUILD) -> list[str]:
         except (OSError, ValueError) as e:
             problems.append(f"{test}: {e}")
             continue
-        if _UBSAN_RUNTIME in (root / test).read_bytes():
-            problems.append(f"{test}: carries zig's UBSan runtime (built without -fno-sanitize)")
-        debug = [s for s in elf.sections if s.startswith(".debug_")]
-        if debug:
-            problems.append(f"{test}: keeps debug sections ({', '.join(debug)})")
+        problems += _build_problems(root, test, elf)
         if elf.stack_size:
             problems.append(f"{test}: PT_GNU_STACK asks for a {elf.stack_size}-byte stack")
         if is_static(test) and elf.interp is not None:
             problems.append(f"{test}: static by name, but its interpreter is {elf.interp}")
         elif not is_static(test) and elf.interp != MUSL_LOADER:
             problems.append(f"{test}: dynamic by name, but its interpreter is {elf.interp}")
+    for lib in sorted(p.relative_to(root).as_posix() for p in root.glob("src/*/*.so")):
+        try:
+            elf = read_elf(root / lib)
+        except (OSError, ValueError) as e:
+            problems.append(f"{lib}: {e}")
+            continue
+        problems += _build_problems(root, lib, elf)
     return problems
 
 

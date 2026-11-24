@@ -8,20 +8,22 @@ from __future__ import annotations
 import os
 import platform
 import struct
+import subprocess
 import sys
 
 import pytest
 from lumen_harness import BUILD_DIR, libctest
 from lumen_harness.libctest import Outcome
 
-# What a run of three tests prints: libc-test's runtest output (t_error lines,
-# then `FAIL <path> [<why>]`), each test closed by the driver's EXIT line.
-# The message lines are the format libc-test's t_error prints (file:line: ...).
-RECORDED = """\
+# A run of four tests, hand-written in runtest's format: the test's t_error
+# lines, then `FAIL <path> [<why>]`, each test closed by the driver's EXIT
+# line. The t_error line is a real one, from CI's native run of the pinned
+# libc-test (mntent-static fails natively too).
+SAMPLE = """\
 EXIT src/functional/argv-static.exe 0
-src/functional/string.c:68: strlen("abc") returned 2, want 3
-FAIL src/functional/string-static.exe [status 1]
-EXIT src/functional/string-static.exe 1
+src/functional/mntent.c:45: !strcmp(m->mnt_opts, "defaults") failed
+FAIL src/functional/mntent-static.exe [status 1]
+EXIT src/functional/mntent-static.exe 1
 FAIL src/regression/sigaltstack.exe [signal Segmentation fault]
 EXIT src/regression/sigaltstack.exe 1
 FAIL src/functional/pthread_cond.exe [timed out]
@@ -30,18 +32,18 @@ EXIT src/functional/pthread_cond.exe 1
 
 
 def test_the_parser_reads_pass_fail_signal_and_timeout():
-    run = libctest.parse(RECORDED)
+    run = libctest.parse(SAMPLE)
     r = run.results
     assert set(r) == {
         "src/functional/argv-static.exe",
-        "src/functional/string-static.exe",
+        "src/functional/mntent-static.exe",
         "src/regression/sigaltstack.exe",
         "src/functional/pthread_cond.exe",
     }
     assert r["src/functional/argv-static.exe"].outcome is Outcome.PASS
-    failed = r["src/functional/string-static.exe"]
+    failed = r["src/functional/mntent-static.exe"]
     assert (failed.outcome, failed.detail) == (Outcome.FAIL, "status 1")
-    assert failed.output == ('src/functional/string.c:68: strlen("abc") returned 2, want 3',)
+    assert failed.output == ('src/functional/mntent.c:45: !strcmp(m->mnt_opts, "defaults") failed',)
     killed = r["src/regression/sigaltstack.exe"]
     assert (killed.outcome, killed.detail) == (Outcome.FAIL, "signal Segmentation fault")
     timed_out = r["src/functional/pthread_cond.exe"]
@@ -90,9 +92,65 @@ def test_a_leading_dot_slash_and_surrounding_blanks_are_tolerated():
         # A bracket runtest doesn't print.
         (["FAIL src/functional/a.exe [status 0]"], "could not run it"),
         (["FAIL src/functional/a.exe [exploded]"], "could not run it"),
+        # runtest's own error lines, though it then prints a status or a
+        # signal: the child's execv failing (the test, or its loader as the
+        # wrapper), and the parent's fork, sigtimedwait, kill or waitpid.
+        (
+            [
+                "src/functional/a.exe exec failed: Exec format error",
+                "FAIL src/functional/a.exe [status 1]",
+            ],
+            "runner trouble",
+        ),
+        (
+            [
+                "/lib/ld-musl-x86_64.so.1 exec failed: No such file or directory",
+                "FAIL src/functional/a.exe [status 1]",
+            ],
+            "runner trouble",
+        ),
+        (
+            [
+                "src/functional/a.exe sigtimedwait failed: Interrupted system call",
+                "FAIL src/functional/a.exe [signal Killed]",
+            ],
+            "runner trouble",
+        ),
+        (
+            [
+                "src/functional/a.exe kill failed: No such process",
+                "FAIL src/functional/a.exe [status 1]",
+            ],
+            "runner trouble",
+        ),
+        (
+            [
+                "src/functional/a.exe fork failed: Resource temporarily unavailable",
+                "FAIL src/functional/a.exe [status 1]",
+            ],
+            "runner trouble",
+        ),
+        (
+            [
+                "src/functional/a.exe waitpid failed: No child processes",
+                "FAIL src/functional/a.exe [timed out]",
+            ],
+            "runner trouble",
+        ),
+        # The program never ran: not executable, or not found (musl's loader
+        # exits 127 for a missing library).
+        (["FAIL src/functional/a.exe [status 126]"], "never ran"),
+        (
+            [
+                "Error loading shared library libfoo.so: No such file or directory",
+                "FAIL src/functional/a.exe [status 127]",
+            ],
+            "never ran",
+        ),
     ],
 )
 def test_runner_trouble_is_an_error_not_a_failure(lines, why):
+    """Each of these as an ERROR, which no expected-failure entry covers."""
     code = "1"
     body = []
     for line in lines:
@@ -104,6 +162,16 @@ def test_runner_trouble_is_an_error_not_a_failure(lines, why):
     r = libctest.parse(text).results["src/functional/a.exe"]
     assert r.outcome is Outcome.ERROR, r
     assert why in r.detail
+
+
+def test_a_test_s_own_line_about_a_failed_exec_is_still_its_verdict():
+    # t_error's `file.c:line:` first word is the test's, not runtest's.
+    run = libctest.parse(
+        "src/functional/spawn.c:40: exec failed: No such file or directory\n"
+        "FAIL src/functional/spawn.exe [status 1]\nEXIT src/functional/spawn.exe 1\n"
+    )
+    r = run.results["src/functional/spawn.exe"]
+    assert (r.outcome, r.detail) == (Outcome.FAIL, "status 1")
 
 
 def test_a_truncated_run_leaves_its_last_test_not_run():
@@ -170,6 +238,7 @@ def test_xfail_entries_carry_a_reason_and_an_issue():
         "src/functional/a-static.exe # fails 400",  # issue without '#'
         "src/functional/a-static.exe # fails #400 later",  # the issue comes last
         "src/functional/a-static.exe fails # #400",  # text before the comment
+        "src/functional/a-static.exe # fails#400",  # no space before the issue
     ],
 )
 def test_an_xfail_entry_without_a_reason_and_an_issue_is_refused(line):
@@ -282,6 +351,32 @@ def test_a_result_for_a_test_that_was_not_built_fails_the_comparison():
     assert v.unknown == [C]
 
 
+def test_the_summary_names_every_kind_of_trouble():
+    run = libctest.parse(
+        "src/regression/c.c:9: lost a signal\n"
+        "FAIL src/regression/c.exe [internal]\nEXIT src/regression/c.exe 255\n"
+        "EXIT src/functional/z-static.exe 0\n"
+        "src/functional/b.c:3: started, never ended\n"
+    )
+    v = libctest.compare(run, _xfail("src/regression/gone.exe"), [A, B, C])
+    assert not v.ok
+    lines = v.summary().splitlines()
+    assert lines[0] == (
+        "0 passed, 0 failed as expected, 0 failed unexpectedly, 0 passed unexpectedly, "
+        "1 errors, 2 not run"
+    )
+    assert lines[1:] == [
+        f"  ERROR {C}: runtest exited 255 after FAIL [internal]",
+        "    src/regression/c.c:9: lost a signal",
+        f"  NOT RUN {A}",
+        f"  NOT RUN {B}",
+        "  RAN BUT NOT A BUILT TEST src/functional/z-static.exe",
+        "  LISTED BUT NOT BUILT (line 1 of the expected-failure list) src/regression/gone.exe",
+        "  OUTPUT AFTER THE LAST EXIT LINE (a test that never ended)",
+        "    src/functional/b.c:3: started, never ended",
+    ]
+
+
 # The ELF check behind the build's linkage check.
 
 
@@ -363,15 +458,32 @@ def test_read_elf_refuses_other_machines_and_non_elf_files(tmp_path):
     arm.write_bytes(_elf(None, machine=183))
     text = tmp_path / "text"
     text.write_bytes(b"#!/bin/sh\n" + bytes(64))
-    for path in (arm, text):
+    elf32 = tmp_path / "elf32"
+    elf32.write_bytes(_patched(_elf(None), 4, b"\x01"))
+    big = tmp_path / "big"
+    big.write_bytes(_patched(_elf(None), 5, b"\x02"))
+    for path in (arm, text, elf32, big):
         with pytest.raises(ValueError):
             libctest.read_elf(path)
+
+
+def _patched(data: bytes, at: int, new: bytes) -> bytes:
+    return data[:at] + new + data[at + len(new) :]
+
+
+def test_read_elf_refuses_a_section_name_table_past_the_sections(tmp_path):
+    data = _elf(None, sections=(".text",))
+    (shnum,) = struct.unpack_from("<H", data, 60)
+    bad = tmp_path / "bad"
+    bad.write_bytes(_patched(data, 62, struct.pack("<H", shnum)))  # e_shstrndx == e_shnum
+    with pytest.raises(ValueError, match="e_shstrndx"):
+        libctest.read_elf(bad)
 
 
 def test_linkage_problems_name_each_binary_built_unlike_libc_tests_build(tmp_path):
     loader = b"/lib/ld-musl-x86_64.so.1"
     binaries = {
-        libctest.RUNTEST: _elf(None, stack=0),
+        libctest.RUNTEST: _elf(loader, stack=0),
         "src/functional/good-static.exe": _elf(None, stack=0, sections=(".text", ".comment")),
         "src/functional/good.exe": _elf(loader, stack=0),
         "src/functional/a-static.exe": _elf(loader, stack=0),
@@ -383,13 +495,21 @@ def test_linkage_problems_name_each_binary_built_unlike_libc_tests_build(tmp_pat
         ),
         "src/regression/e-static.exe": _elf(None, sections=(".text", ".debug_info", ".symtab")),
     }
-    for rel, data in binaries.items():
+    # The tests' libraries: no interpreter (they're libraries), and no
+    # stack-size check, but the runtime and debug checks apply.
+    libraries = {
+        "src/functional/good_dso.so": _elf(None, stack=16 << 20, sections=(".text",)),
+        "src/functional/debug_dso.so": _elf(None, sections=(".text", ".debug_line")),
+        "src/regression/ubsan_dso.so": _elf(None, tail=b"\0 cannot be represented in type \0"),
+    }
+    for rel, data in {**binaries, **libraries}.items():
         (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / rel).write_bytes(data)
     tests = [t for t in binaries if t != libctest.RUNTEST] + ["src/regression/missing.exe"]
     (tmp_path / libctest.TESTS_FILE).write_text("\n".join(tests) + "\n")
     problems = libctest.linkage_problems(tmp_path)
     assert [p.split(": ", 1)[0] for p in problems] == [
+        libctest.RUNTEST,
         "src/functional/a-static.exe",
         "src/functional/a.exe",
         "src/functional/b.exe",
@@ -397,12 +517,38 @@ def test_linkage_problems_name_each_binary_built_unlike_libc_tests_build(tmp_pat
         "src/regression/d.exe",
         "src/regression/e-static.exe",
         "src/regression/missing.exe",
+        "src/functional/debug_dso.so",
+        "src/regression/ubsan_dso.so",
     ], problems
     assert "static by name" in problems[0]
-    assert "dynamic by name" in problems[1] and "dynamic by name" in problems[2]
-    assert "16777216-byte stack" in problems[3]
-    assert "UBSan" in problems[4]
-    assert "keeps debug sections (.debug_info)" in problems[5]
+    assert "static by name" in problems[1]
+    assert "dynamic by name" in problems[2] and "dynamic by name" in problems[3]
+    assert "16777216-byte stack" in problems[4]
+    assert "UBSan" in problems[5]
+    assert "keeps debug sections (.debug_info)" in problems[6]
+    assert "keeps debug sections (.debug_line)" in problems[8]
+    assert "UBSan" in problems[9]
+
+
+def _tree(root, binaries: dict[str, bytes]) -> None:
+    for rel, data in binaries.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(data)
+    tests = [t for t in binaries if t != libctest.RUNTEST]
+    (root / libctest.TESTS_FILE).write_text("".join(f"{t}\n" for t in tests))
+
+
+def test_main_s_linkage_command_exits_by_what_it_found(tmp_path, capsys):
+    good, bad = tmp_path / "good", tmp_path / "bad"
+    _tree(good, {libctest.RUNTEST: _elf(None), "src/functional/a-static.exe": _elf(None)})
+    _tree(bad, {libctest.RUNTEST: _elf(None), "src/functional/a.exe": _elf(None)})
+    assert libctest.main(["linkage", str(good)]) == 0
+    assert capsys.readouterr().err == ""
+    assert libctest.main(["linkage", str(bad)]) == 1
+    assert "libc-test linkage: src/functional/a.exe: dynamic by name" in capsys.readouterr().err
+    assert libctest.main([]) == 2
+    assert libctest.main(["link", str(good)]) == 2
+    assert "usage:" in capsys.readouterr().err
 
 
 # The native runner's driver, over a stand-in runtest (a shell script) that
@@ -416,7 +562,8 @@ for a in "$@"; do last=$a; done
 echo "$where $*" >> {log}
 case "$last" in
   *pass*) exit 0 ;;
-  *fail*) echo "$last.c:1: wrong"; echo "FAIL $last [status 1]"; exit 1 ;;
+  *fail*) echo "$last.c:1: wrong"; echo "$last.c:2: on stderr" >&2; echo "FAIL $last [status 1]"; exit 1 ;;
+  *segv*) ulimit -c 0; kill -SEGV $$ ;;
   *) exit 3 ;;
 esac
 """
@@ -432,6 +579,7 @@ def test_run_native_wraps_only_dynamic_tests_and_closes_each_with_its_exit_code(
         "src/functional/pass-static.exe",
         "src/functional/fail.exe",
         "src/regression/broken-static.exe",
+        "src/regression/segv-static.exe",
     ]
     for t in tests:
         (root / t).parent.mkdir(parents=True, exist_ok=True)
@@ -444,11 +592,14 @@ def test_run_native_wraps_only_dynamic_tests_and_closes_each_with_its_exit_code(
         "ok -t 7 src/functional/pass-static.exe",
         f"ok -t 7 -w {loader} src/functional/fail.exe",
         "ok -t 7 src/regression/broken-static.exe",
+        "ok -t 7 src/regression/segv-static.exe",
     ]
     assert [line for line in transcript.splitlines() if line.startswith("EXIT")] == [
         "EXIT src/functional/pass-static.exe 0",
         "EXIT src/functional/fail.exe 1",
         "EXIT src/regression/broken-static.exe 3",
+        # runtest itself killed by SIGSEGV: 128 + 11, as a shell reports it.
+        "EXIT src/regression/segv-static.exe 139",
     ]
     r = libctest.parse(transcript).results
     assert r["src/functional/pass-static.exe"].outcome is Outcome.PASS
@@ -456,9 +607,31 @@ def test_run_native_wraps_only_dynamic_tests_and_closes_each_with_its_exit_code(
     assert (fail.outcome, fail.detail, fail.output) == (
         Outcome.FAIL,
         "status 1",
-        ("src/functional/fail.exe.c:1: wrong",),
+        # stderr reaches the transcript too.
+        ("src/functional/fail.exe.c:1: wrong", "src/functional/fail.exe.c:2: on stderr"),
     )
     assert r["src/regression/broken-static.exe"].outcome is Outcome.ERROR
+    segv = r["src/regression/segv-static.exe"]
+    assert (segv.outcome, segv.detail) == (Outcome.ERROR, "runtest exited 139 without a FAIL line")
+
+
+def test_run_native_counts_a_runtest_that_never_ends_as_an_error(tmp_path, monkeypatch):
+    (tmp_path / "src").mkdir()
+    calls = []
+
+    def hang(argv, *, timeout, **kwargs):
+        calls.append(timeout)
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    monkeypatch.setattr(libctest.subprocess, "run", hang)
+    transcript = libctest.run_native(
+        tmp_path, ["src/functional/a-static.exe"], loader=None, timeout_s=5, grace_s=2
+    )
+    assert calls == [7]
+    assert transcript == ("runtest did not end within 7 s\nEXIT src/functional/a-static.exe 124\n")
+    r = libctest.parse(transcript).results["src/functional/a-static.exe"]
+    assert r.outcome is Outcome.ERROR
+    assert r.output == ("runtest did not end within 7 s",)
 
 
 def test_run_native_refuses_a_dynamic_test_without_a_loader(tmp_path):
@@ -501,9 +674,16 @@ def test_every_built_binary_is_linked_as_its_name_says():
 
 # The tests that pass when run natively on CI's Linux host (x86-64, its own
 # kernel; dynamic tests through Alpine 3.21's musl loader), at the pinned zig
-# and libc-test. The rest of tests.txt fails natively too, so its failures
-# in Lumen aren't Lumen's own. Re-record when a pin changes: a mismatch's
-# message lists how each other test failed and prints the set to paste here.
+# and libc-test: 274 of the 284, the same in two CI runs. The other 10 fail
+# natively too, all `[status 1]`, static and dynamic alike, in libc code:
+# mntent, strptime, wordexp, regex-backref-oob and regexec-backref (most
+# likely the libc-test tip checks musl fixes newer than 1.2.5). So one of
+# those failing in Lumen is no evidence of a Lumen bug. The set includes
+# timing-sensitive tests (pthread_cond-smasher, raise-race, pthread_cancel*,
+# sem_close-unmap, pthread_once-deadlock) under a 30 s per-test timeout, so a
+# badly stalled runner or a new runner image can upset it. Re-record when a
+# pin changes: a mismatch's message lists how each other test failed and
+# prints the set to paste here.
 NATIVE_PASS: frozenset[str] = frozenset(
     {
         "src/functional/argv-static.exe",

@@ -40,9 +40,11 @@
 #
 # libc-test's make never fails on a test that doesn't build (`|| echo
 # BUILDERROR`); this script lists each one, with its first error line, rather
-# than skipping it silently, and fails only if the runner itself doesn't build,
-# a built binary's linkage isn't what its name says (or it carries zig's UBSan
-# runtime, or asks for a stack size), or make itself fails.
+# than skipping it silently, and fails only if libc-test's Makefile names no
+# tests, the runner itself doesn't build, a built binary's linkage isn't what
+# its name says (or a test, the runner or a library carries zig's UBSan
+# runtime or a .debug_ section, or a test or the runner asks for a stack
+# size), or make itself fails.
 #
 # zig's caches live in build/libc-test/.zig-cache, never in the home
 # directory. A second run with the same zig, libc-test commit and script does
@@ -92,7 +94,9 @@ git -C "$SRC" archive --format=tar "$COMMIT" | tar -xf - -C "$OUT"
 # `--strip-debug`: the DWARF names the host's build directory and zig's
 # randomly named cache directories, so two builds would differ byte for byte
 # (zig's linker then strips the symbol table too; no binary keeps a .debug_
-# section, checked below). With it, two builds are identical.
+# section, checked below). With it, two builds were byte-identical when
+# checked by hand (two builds, 289 .exe and .so files); no test compares
+# builds.
 {
     echo "# Written by tools/build-libc-test.sh"
     echo "include config.mak.def"
@@ -136,7 +140,8 @@ fi
 [[ -x "$OUT/$RUNNER" ]] || die "the runner (src/common/runtest-static.exe) didn't build: see build/libc-test/build.log"
 
 # why <binary>: the first error its compile or link printed (libc-test's
-# rules keep each one's output in <object>.err and <binary>.ld.err).
+# rules keep each one's output in <object>.o.err or <object>.lo.err, and
+# <binary>.ld.err for a program or <library>.so.err for a library).
 why() {
     local bin=$OUT/$1 obj
     obj="${bin%.so}"

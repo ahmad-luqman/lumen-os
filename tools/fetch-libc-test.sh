@@ -18,8 +18,9 @@
 # committed to this repository, only fetched.
 #
 # To bump: change LIBC_TEST_COMMIT (and LIBC_TEST_DATE, for the reader) and
-# run `make libc-test`; re-record what changes (the native reference run's
-# pass set in tests/harness/test_libctest.py).
+# run `make libc-test`; re-record what changes in tests/harness/test_libctest.py
+# (NOT_BUILT, the tests that don't build, and NATIVE_PASS, the native
+# reference run's pass set).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

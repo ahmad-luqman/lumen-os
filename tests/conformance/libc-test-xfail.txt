@@ -6,7 +6,14 @@
 #
 #   src/functional/<name>-static.exe # <why it fails in Lumen> #<issue number>
 #
+# For a failure that isn't Lumen's (musl's own, or a libc-test check newer
+# than Alpine's musl 1.2.5), the issue is one tracking it, such as a musl bump.
+#
 # Lines that are empty or start with `#` are comments. A test is listed only
-# for a failure (`[status N]`, `[signal ...]` or `[timed out]`); a runner error
-# is never expected. A listed test that passes fails the run, so remove its
-# line in the PR that fixes it.
+# for a failure (`[status N]`, `[signal ...]` or `[timed out]`). A runner
+# error is never expected: runtest's own trouble (`[internal]`, `[unknown]`,
+# its `exec failed:`, `fork failed:`, `sigtimedwait failed:`, `kill failed:`
+# or `waitpid failed:` lines) and `[status 126]` or `[status 127]` (a program
+# or library that couldn't be run) are errors, whatever this list says. A
+# listed test that passes fails the run, so remove its line in the PR that
+# fixes it.
