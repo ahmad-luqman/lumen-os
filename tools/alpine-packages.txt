@@ -1,0 +1,13 @@
+# The Alpine 3.21 developer image's top-level packages (#344): one per line,
+# each with the M8 gate that needs it (the gates are D2 and D3 in #335; their
+# scenarios are in docs/ROADMAP.md, M8's last row). tools/alpine-lock.py
+# resolves their closure into tools/alpine-packages.lock, leaving out what the
+# minirootfs already has; re-run it after editing this file.
+gcc       # D2 (gcc/g++ + make, C++ and a .so): the driver, cc1, collect2, crtbegin.o
+g++       # D2: cc1plus and libstdc++'s headers
+make      # D2: the build is driven by a Makefile
+musl-dev  # D2: libc's headers, crt1.o and libc.so to link against
+binutils  # D2: as and ld (gcc depends on it too; named because D2 runs them directly)
+git       # D3 (git + sqlite3 + vim over a PTY): init, add, commit, log on a local repository
+sqlite    # D3: the sqlite3 shell
+vim       # D3: vim over a PTY
