@@ -117,6 +117,9 @@ linux-raw-sys = { version = "=0.12.1", default-features = false, features = ["no
 # select synchronous `Send + Sync` `Ext4Read`/`Ext4Write` traits backed by `Arc`
 # and `spin`, matching Lumen's SMP SleepMutex + BlockCache adapter.
 ext4plus = { version = "=0.1.0-rc.2", default-features = false, features = ["sync", "multi-threaded"] }
+lumen-futex = { path = "crates/lumen-futex" }
+lumen-signal = { path = "crates/lumen-signal" }
+lumen-pipe = { path = "crates/lumen-pipe" }
 lumen-tty = { path = "crates/lumen-tty" }
 
 # `vendor/ext4plus` is ext4plus 0.1.0-rc.2's crate file unpacked (sha256
