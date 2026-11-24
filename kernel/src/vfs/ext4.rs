@@ -1333,25 +1333,49 @@ struct WriteOp<'a> {
     /// ends, what it did there never lands ([`Self::end`]). A detached
     /// inode's operation (all in memory) never is.
     began_healthy: bool,
+    /// The ktests' guard on [`Self::end`]: a write-type operation (one
+    /// [`Ext4Shared::writable_op`] or [`Ext4Shared::memory_op`] began) must
+    /// return through it, checked when it drops.
+    #[cfg(feature = "ktest")]
+    must_end: bool,
+    #[cfg(feature = "ktest")]
+    ended: bool,
 }
 
 impl WriteOp<'_> {
+    /// A write-type operation: it returns through [`Self::end`] (checked in
+    /// the ktests).
+    #[cfg_attr(not(feature = "ktest"), allow(unused_mut))]
+    fn must_end(mut self) -> Self {
+        #[cfg(feature = "ktest")]
+        {
+            self.must_end = true;
+        }
+        self
+    }
+
     /// The operation's result, `EIO` in place of `Ok` when the volume
     /// errored while it ran (#349): its writes went into a block cache that
     /// never writes back again, so it didn't happen on the disk, whatever
     /// it returned (a read whose eviction met the failure is served, so
     /// the operation may not see the failure itself). Its own error, if it
     /// has one, stands.
-    fn end<T>(self, res: Result<T, VfsError>) -> Result<T, VfsError> {
+    #[cfg_attr(not(feature = "ktest"), allow(unused_mut))]
+    fn end<T>(mut self, res: Result<T, VfsError>) -> Result<T, VfsError> {
         let turned = self.began_healthy && !self.shared.cache.healthy() && res.is_ok();
         #[cfg(feature = "ktest")]
-        self.shared.ok_turned_eio.store(turned, Ordering::SeqCst);
+        {
+            self.shared.ok_turned_eio.store(turned, Ordering::SeqCst);
+            self.ended = true;
+        }
         if turned { Err(VfsError::Io) } else { res }
     }
 }
 
 impl Drop for WriteOp<'_> {
     fn drop(&mut self) {
+        #[cfg(feature = "ktest")]
+        debug_assert!(!self.must_end || self.ended, "write-type operation {} ended without WriteOp::end", self.op);
         let cache = &self.shared.cache;
         if self.began_healthy && !cache.healthy() && cache.tripper.load(Ordering::SeqCst) == self.thread {
             cache.name_failed_op(self.op);
@@ -1387,21 +1411,31 @@ impl Ext4Shared {
         if !op.began_healthy {
             return Err(VfsError::RoFs);
         }
-        Ok(op)
+        Ok(op.must_end())
     }
 
     /// Operation `op` begins, its writability checked by the caller.
     fn op(&self, op: &'static str) -> WriteOp<'_> {
         self.cache.ops.fetch_add(1, Ordering::SeqCst);
-        WriteOp { shared: self, op, thread: thread_id(), began_healthy: self.cache.healthy() }
+        WriteOp {
+            shared: self,
+            op,
+            thread: thread_id(),
+            began_healthy: self.cache.healthy(),
+            #[cfg(feature = "ktest")]
+            must_end: false,
+            #[cfg(feature = "ktest")]
+            ended: false,
+        }
     }
 
     /// A detached inode's operation `op` begins: all in memory, never
     /// reaching the block cache, so neither refused nor failed by the
     /// volume's errors.
     fn memory_op(&self, op: &'static str) -> WriteOp<'_> {
-        self.cache.ops.fetch_add(1, Ordering::SeqCst);
-        WriteOp { shared: self, op, thread: thread_id(), began_healthy: false }
+        let mut w = self.op(op);
+        w.began_healthy = false;
+        w.must_end()
     }
 
     /// The wall clock, for times this filesystem sets.
@@ -1576,9 +1610,17 @@ impl FileSystem for Ext4FileSystem {
         if self.shared.errored() {
             return Err(first_err.unwrap_or(VfsError::Io));
         }
-        if let Err((e, cause)) = self.shared.sync_bcache() {
-            warn!(target: "vfs", "sync: ext4 {:?} block cache: {cause}", self.shared.dev);
-            first_err.get_or_insert(e);
+        match self.shared.sync_bcache() {
+            Ok(()) => {}
+            // Another thread's failed write errored the volume since the
+            // check above (#349): `EIO`, the volume's line saying so.
+            Err((_, BlockError::ReadOnly)) if self.shared.errored() => {
+                first_err.get_or_insert(VfsError::Io);
+            }
+            Err((e, cause)) => {
+                warn!(target: "vfs", "sync: ext4 {:?} block cache: {cause}", self.shared.dev);
+                first_err.get_or_insert(e);
+            }
         }
         first_err.map_or(Ok(()), Err)
     }
@@ -5122,6 +5164,10 @@ impl VfsInode for Ext4Inode {
                 self.shared.bcache_sync_errno.store(0, Ordering::Release);
                 Ok(())
             }
+            // Another thread's failed write errored the volume since this
+            // sync's check (#349): `EIO`, not the cache's `EROFS`, the
+            // volume's line saying so.
+            Err((_, BlockError::ReadOnly)) if self.shared.errored() => Err(VfsError::Io),
             Err((e, cause)) => {
                 if self.shared.bcache_sync_errno.swap(e.to_errno(), Ordering::AcqRel) != e.to_errno() {
                     warn!(target: "vfs", "fsync: ext4 {:?} inode {}: block cache: {cause}", self.shared.dev, self.disk_ino);

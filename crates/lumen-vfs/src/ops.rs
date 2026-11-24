@@ -704,6 +704,11 @@ pub fn unlink_at(
                         let _ = env.inode_get_or_insert_if_fresh(removed_arc, end_gen);
                     }
                 }
+                // Again on a failure too: an operation can fail after its change
+                // happened in memory (ext4's errors=remount-ro, #349: `EIO` from an
+                // operation the volume errored under), and a lookup racing it may have
+                // cached the old name meanwhile.
+                env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), name);
                 return Err(err);
             }
 
@@ -753,6 +758,11 @@ pub fn unlink_at(
                 {
                     let _ = env.inode_get_or_insert_if_fresh(removed_arc, end_gen);
                 }
+                // Again on a failure too: an operation can fail after its change
+                // happened in memory (ext4's errors=remount-ro, #349: `EIO` from an
+                // operation the volume errored under), and a lookup racing it may have
+                // cached the old name meanwhile.
+                env.dentry_invalidate(target.parent.dev_id(), target.parent.ino(), name);
                 return Err(err);
             }
             let _ = guard.finish();
@@ -1053,11 +1063,12 @@ pub fn rename_at2(
             env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), old_name);
             env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), new_name);
 
-            old_target.parent.rename(old_name, &new_target.parent, new_name, flags)?;
+            let res = old_target.parent.rename(old_name, &new_target.parent, new_name, flags);
 
+            // On a failure too (see unlink's).
             env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), old_name);
             env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), new_name);
-            return Ok(());
+            return res;
         }
 
         struct PendingRenameRemoval<'a> {
@@ -1111,6 +1122,9 @@ pub fn rename_at2(
                     let _ = env.inode_get_or_insert_if_fresh(removed_arc, end_gen);
                 }
             }
+            // On a failure too (see unlink's).
+            env.dentry_invalidate(old_target.parent.dev_id(), old_target.parent.ino(), old_name);
+            env.dentry_invalidate(new_target.parent.dev_id(), new_target.parent.ino(), new_name);
             return Err(err);
         }
 

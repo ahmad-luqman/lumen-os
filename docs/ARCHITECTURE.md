@@ -5807,8 +5807,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       above).
     - `ext4plus` 0.1.0-rc.2 frees an extent-mapped file's block range again
       block by block when the range free fails (`file_blocks/utils.rs`,
-      `free_freed_ranges`), so a write that fails inside it leaves the
-      operation `Ok` (unlink and rmdir probed in the kernel, truncate on the
+      `free_freed_ranges`), so a write that fails inside it leaves
+      `ext4plus`'s call `Ok` (the operation returns `EIO` since #349, below:
+      `WriteOp::end`; unlink and rmdir probed in the kernel, truncate on the
       host in #351's review; a rename's replaced target reaches the same
       code, read from the source). A block-mapped file's free
       (`block_map.rs`) has no retry and returns the error. `free_blocks` and
@@ -5840,7 +5841,8 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       (`ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc`). On
       a 1 KiB-block extent volume, where a page needs 4 blocks, a host probe
       in #351's review (not a test; 2 KiB reaches the same code, not probed)
-      saw the shorter retry succeed: the write returns `Ok`, with up to 4
+      saw the shorter retry succeed: `ext4plus`'s write returns `Ok` (the
+      writeback then `EIO`, the volume errored, #349), with up to 4
       bits leaked (a failed bitmap write after the first leaves the earlier
       bits and both counts above the bitmap for good), and a count lowered
       twice when its own write failed.
@@ -5855,7 +5857,8 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       error is enough, and its checksum write failing leaves the permanent
       over-count. The likeliest route, though, is the bitmap's own read
       missing and its eviction of another dirty block failing: the free's
-      retry turns that into `Ok`, the allocation's into `NoSpc` (nothing
+      retry turns that into `ext4plus`'s `Ok` (the operation's `EIO` since
+      #349), the allocation's into `NoSpc` (nothing
       doubled or leaked; the victim stays dirty).
     - `ext4plus`'s allocators (`alloc_block`, `alloc_contiguous_blocks`,
       `alloc_inode`) loop forever on a group whose count promises more than
@@ -5872,8 +5875,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       `add_dir_entry` (`dir.rs`) takes a failed lookup (an eviction's write
       error) as "absent", so `Dir::link` can return `Ok`; and a rename's
       `take_out_target_entry`, when the target's `Dir::unlink` fails after
-      its entry went, carries on as if it had worked, unlogged, and the
-      rename can return `Ok`.
+      its entry went, carries on as if it had worked, unlogged. Since #349
+      the failed write errors the volume, so the link or rename returns
+      `EIO` all the same (`WriteOp::end`).
     - After a first error, the adapter's undo writes (above) report nothing
       further: a failed one is pinned in memory or logged, and the operation
       returns the first error. Among them: `undo_failed_link`,
@@ -5881,11 +5885,13 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       the inline-symlink restore, `discard_orphan`, `put_back_target`,
       `rollback_link_entry` and truncate's tail restore.
     - A rename over an existing target, once the move landed, returns `Ok`
-      whatever retiring the target does: its lowered `links_count` (pinned in
-      memory if the write fails), freeing it when that was its last link
-      (logged), and a directory target's parent's count (pinned).
+      whatever retiring the target does when the volume stays healthy: its
+      lowered `links_count` (pinned in memory if the write fails), freeing
+      it when that was its last link (logged), and a directory target's
+      parent's count (pinned); a failed device write among them makes it
+      `EIO` since #349 (`WriteOp::end`).
 
-    So a write error can't be told from operations' results (an `Ok` or a
+    So a write error can't be told from `ext4plus`'s results (an `Ok` or a
     `NoSpc` may follow one), nor from the block cache's: a failed `write_at`
     may be a failed pre-read or another block's eviction, a failed `sync` a
     failed flush or a pinned block, and an eviction's write error reaches a
@@ -5915,8 +5921,10 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       inline-symlink bytes) or `read_at` missed. A call's result alone
       decides nothing: a `write_at` can fail on a pre-read or a full cache
       with no write failing (it then errors the operation, not the volume),
-      and the operation can return `ENOSPC` (`ext4plus`'s allocation retry)
-      or `Ok` (its range-free retry, above) after one did. A data block's
+      and `ext4plus` can return `ENOSPC` (its allocation retry, which the
+      operation returns as its own error) or `Ok` (its range-free retry,
+      above; the operation then returns `EIO`, `WriteOp::end`) after one
+      did. A data block's
       failed write counts too: the cache can't tell data from metadata, and
       a file's writeback allocates blocks and writes its map in the same
       call. Read errors, `NoSpc` and `NoMem` that no failed write caused,
@@ -5942,7 +5950,10 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       `EIO` whatever it returned itself (`WriteOp::end`; its own error, if
       any, stands): what it did went into a cache that never writes back,
       so it didn't happen on the disk, though until reboot it may show in
-      memory. A read whose eviction met the failure is served (below), so
+      memory (so lumen-vfs drops the names an unlink, rmdir or rename
+      touched from the dentry cache on a failure too, and `truncate`
+      unmaps the caller's pages past the end on a failure too; an
+      `open(O_TRUNC)` that fails so doesn't). A read whose eviction met the failure is served (below), so
       the operation may not see the failure itself (a `link` would return
       `Ok`). When the last one ends, the latch settles (below). The VFS
       refuses every write-type path with

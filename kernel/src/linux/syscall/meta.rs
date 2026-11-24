@@ -211,8 +211,13 @@ fn length(raw: u64) -> Result<u64, u32> {
 fn resize(inode: &dyn VfsInode, len: u64) -> Result<u64, u32> {
     writable_mount(inode)?;
     let space = super::shrinking_space();
-    inode.truncate(len).map_err(vfs)?;
+    let res = inode.truncate(len);
+    // On a failure too: a truncate can fail after it shrank the file in
+    // memory (ext4's errors=remount-ro, #349: `EIO` from a truncate the
+    // volume errored under), and unmapping pages past `len` costs at most a
+    // refault where it didn't.
     super::unmap_past(&space, inode, len);
+    res.map_err(vfs)?;
     Ok(0)
 }
 

@@ -680,6 +680,11 @@ fn the_first_device_failure_stops_writeback_when_asked() {
     let mut span = [0u8; 8];
     cache.read_at(6 * BLOCK_SIZE as u64 - 4, &mut span).unwrap();
     assert_eq!(span, [0, 0, 0, 0, 0x66, 0x66, 0x66, 0x66]);
+    // And a whole block, read straight into the caller's buffer.
+    let mut whole = [0u8; BLOCK_SIZE];
+    cache.read_at(5 * BLOCK_SIZE as u64, &mut whole).unwrap();
+    assert_eq!(whole[..4], [0x55; 4]);
+    assert_eq!(whole[100..104], [0x5a; 4]);
     assert_eq!(cache.stats().cached, 3);
     cache.read_at(3 * BLOCK_SIZE as u64, &mut buf).unwrap();
     assert_eq!(buf[..4], [0x44; 4]);

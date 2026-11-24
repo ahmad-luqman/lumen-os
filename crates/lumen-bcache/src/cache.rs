@@ -173,6 +173,10 @@ pub struct BlockCache<B: BlockDevice> {
     total_bytes: u64,
     total_blocks: u64,
     inner: RefCell<CacheInner>,
+    /// One block's room for [`Self::read_uncached`]'s partial blocks:
+    /// allocated with the cache, so nothing is allocated (or put on the
+    /// stack) on that path.
+    scratch: RefCell<Box<[u8]>>,
 }
 
 impl<B: BlockDevice> BlockCache<B> {
@@ -200,6 +204,7 @@ impl<B: BlockDevice> BlockCache<B> {
             total_bytes,
             total_blocks,
             inner: RefCell::new(CacheInner::new(capacity)),
+            scratch: RefCell::new(alloc::vec![0u8; BLOCK_SIZE].into_boxed_slice()),
         })
     }
 
@@ -568,8 +573,11 @@ impl<B: BlockDevice> BlockCache<B> {
     /// slot still serves reads.
     fn read_uncached(&self, block_id: u64, in_block: usize, dst: &mut [u8]) -> Result<(), BlockError> {
         let (lba, valid_bytes) = self.block_extent(block_id)?;
-        // On the stack: nothing allocated while the cache's lock is held.
-        let mut block = [0u8; BLOCK_SIZE];
+        if in_block == 0 && dst.len() == valid_bytes {
+            // The whole block: straight into the caller's buffer.
+            return self.device.read_sectors(lba, dst);
+        }
+        let mut block = self.scratch.try_borrow_mut().map_err(|_| BlockError::CacheFull)?;
         self.device.read_sectors(lba, &mut block[..valid_bytes])?;
         dst.copy_from_slice(&block[in_block..in_block + dst.len()]);
         Ok(())

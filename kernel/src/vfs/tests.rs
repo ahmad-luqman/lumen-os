@@ -822,7 +822,9 @@ fn sweep_rmdir_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &
                     }
                     kassert_eq!(d.stat().map_err(|_| "stat ok")?.nlink, 0);
                     kassert!(m.fs.lookup_live_by_lock_id(d.lock_id()).is_none());
-                    if !read_only_after(&m)? {
+                    // `Ok` only on a volume no write failed under (#349).
+                    kassert!(!read_only_after(&m)?);
+                    {
                         let (nf, _) = open_inode(
                             &m.tables,
                             None,
@@ -893,6 +895,8 @@ fn sweep_rename_dir_overwrite_io_recovery(base_img: &[u8], quota_before: usize) 
 
         match res {
             Ok(()) => {
+                // `Ok` only on a volume no write failed under (#349).
+                kassert!(!m.fs.errored());
                 kassert!(dst.is_detached());
                 kassert_eq!(dst.stat().map_err(|_| "stat dst ok")?.nlink, 0);
                 kassert!(m.fs.lookup_live_by_lock_id(dst.lock_id()).is_none());
@@ -959,6 +963,8 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
 
             match res {
                 Ok(()) => {
+                    // `Ok` only on a volume no write failed under (#349).
+                    kassert!(!m.fs.errored());
                     kassert!(matches!(resolve_path(&m.tables, None, b"/sym_i", rf), Err(VfsError::NoEnt)));
                     if open {
                         kassert!(sym.is_detached());
@@ -1015,6 +1021,8 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
 
         match res {
             Ok(()) => {
+                // `Ok` only on a volume no write failed under (#349).
+                kassert!(!m.fs.errored());
                 kassert!(sym.is_detached());
                 kassert_eq!(sym.readlink().map_err(|_| "sym ren ok readlink")?, b"/real/target");
                 kassert!(m.fs.lookup_live_by_lock_id(sym.lock_id()).is_none());
@@ -1076,6 +1084,8 @@ fn sweep_inline_symlink_and_file_unlink_io_recovery(base_img: &[u8], quota_befor
 
         match res {
             Ok(()) => {
+                // `Ok` only on a volume no write failed under (#349).
+                kassert!(!m.fs.errored());
                 kassert!(uf.is_detached());
                 kassert_eq!(read_all_inode(&uf).map_err(|_| "read detached reg ok")?, pattern);
                 kassert!(m.fs.lookup_live_by_lock_id(uf.lock_id()).is_none());
@@ -1379,8 +1389,15 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
         let m = mount(snap.clone(), 39)?;
         let tf = resolve_path(&m.tables, None, b"/t8k.bin", rf).map_err(|_| "resolve t8k sweep")?.inode;
         m.cache.arm_write(fail_at);
-        let res = own_result(&m.fs, tf.truncate(100));
+        let raw = tf.truncate(100);
         m.cache.arm_write(0);
+        // A failed write errors the volume, and the truncate returns `EIO`
+        // whatever it did (#349, `WriteOp::end`); its own result decides
+        // the state checked below.
+        if m.fs.errored() {
+            kassert_eq!(raw, Err(VfsError::Io));
+        }
+        let res = own_result(&m.fs, raw);
 
         let ro_fs = remount_ro(&m, 40)?;
         let ro_tf = ro_fs.root_inode().lookup(b"t8k.bin").map_err(|_| "ro t8k")?;
