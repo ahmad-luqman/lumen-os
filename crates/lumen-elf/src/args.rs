@@ -188,17 +188,17 @@ impl ArgBudget {
         Ok(())
     }
 
-    /// Refund normalized argv[0], charge the replacement strings, and borrow
+    /// Refund normalized `argv[0]`, charge the replacement strings, and borrow
     /// `[interpreter, argument?, script_path, original[1..]...]` in one transaction.
     /// No new pointer bytes are charged. All failures leave the budget unchanged.
     ///
     /// `original` must be the argv already charged to this budget, including
-    /// the synthetic empty argv[0]'s byte when the original argc was zero.
+    /// the synthetic empty `argv[0]`'s byte when the original argc was zero.
     /// `original` and `script_path` are NUL-free C-string contents.
     /// `script_path` is Linux's `bprm->interp`: execfn for the first script,
     /// then the previous `#!` line's interpreter string, exactly as written.
     ///
-    /// Linux `remove_arg_zero` advances `bprm->p` past argv[0] and its NUL,
+    /// Linux `remove_arg_zero` advances `bprm->p` past `argv[0]` and its NUL,
     /// refunding those bytes to `bprm_hit_stack_limit`. `load_script` then
     /// copies script path, optional argument, and interpreter in that order.
     /// Only after charging does this method allocate the pointer vector,
@@ -233,7 +233,7 @@ impl ArgBudget {
     pub const fn pointer_bytes(&self) -> usize {
         self.pointer_bytes
     }
-    /// Includes execfn and one NUL per charged string, net of argv[0] refunds.
+    /// Includes execfn and one NUL per charged string, net of `argv[0]` refunds.
     pub const fn string_bytes(&self) -> usize {
         self.string_bytes
     }
@@ -306,7 +306,7 @@ fn string_length(string: &[u8]) -> Result<NonZeroUsize, BudgetError> {
     NonZeroUsize::MIN.checked_add(string.len()).ok_or(BudgetError::StringTooLong)
 }
 
-/// Borrow argv unchanged, or a static single empty argv[0] if absent.
+/// Borrow argv unchanged, or a static single empty `argv[0]` if absent.
 /// This Linux 5.18+ normalization performs no allocation or string copying.
 #[must_use]
 pub fn normalize_argv<'s, 'a>(argv: &'s [&'a [u8]]) -> &'s [&'a [u8]] {
