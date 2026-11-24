@@ -89,11 +89,29 @@ trap 'rm -rf "$WORK"; if [[ -n "$LOCKED" ]]; then rmdir "$LOCK"; fi' EXIT
 ARCHIVE="$WORK/zig.tar.xz"
 NEW="$WORK/zig"
 mkdir -p "$NEW"
-curl -fsSL --retry 3 --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
-    -o "$ARCHIVE" "https://ziglang.org/download/${ZIG_VERSION}/zig-${HOST}-${ZIG_VERSION}.tar.xz"
-GOT=$(sha256 "$ARCHIVE")
-if [[ "$GOT" != "$WANT" ]]; then
-    echo "fetch-zig: checksum mismatch for zig $ZIG_VERSION $HOST: expected $WANT, got $GOT" >&2
+# ziglang.org first, then two of zig's community mirrors
+# (https://ziglang.org/download/community-mirrors.txt), which serve the same
+# file names. ziglang.org has been seen at 40 KB/s, slow enough to time CI
+# out, so a source slower than 100 KB/s for 30 s is dropped for the next.
+# Every source is checked against the same pinned sha256, so a mirror can
+# only fail, never substitute.
+FILE="zig-${HOST}-${ZIG_VERSION}.tar.xz"
+GOT=
+for SOURCE in "https://ziglang.org/download/${ZIG_VERSION}" "https://pkg.hexops.org/zig" "https://zig.linus.dev/zig"; do
+    if curl -fsSL --retry 2 --connect-timeout 20 --speed-limit 102400 --speed-time 30 \
+        -o "$ARCHIVE" "$SOURCE/$FILE"; then
+        GOT=$(sha256 "$ARCHIVE")
+        if [[ "$GOT" == "$WANT" ]]; then
+            break
+        fi
+        echo "fetch-zig: checksum mismatch from $SOURCE: expected $WANT, got $GOT" >&2
+    else
+        echo "fetch-zig: $SOURCE/$FILE failed or was too slow; trying the next source" >&2
+    fi
+    GOT=
+done
+if [[ -z "$GOT" ]]; then
+    echo "fetch-zig: no source served zig $ZIG_VERSION for $HOST with the pinned checksum" >&2
     exit 1
 fi
 tar -xf "$ARCHIVE" -C "$NEW" --strip-components=1
