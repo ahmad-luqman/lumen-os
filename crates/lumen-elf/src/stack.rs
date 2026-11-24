@@ -319,28 +319,29 @@ pub fn build_initial_stack(
 }
 
 #[cfg(test)]
+pub(crate) fn sample_auxv(base: Option<u64>) -> AuxvInfo {
+    AuxvInfo {
+        phdr: 0x0000_5555_5555_4040,
+        phent: 56,
+        phnum: 4,
+        pagesz: PAGE_SIZE,
+        base,
+        entry: 0x0000_5555_5555_5010,
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        secure: 0,
+        clktck: DEFAULT_CLKTCK,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     extern crate std;
 
     use super::*;
     use std::{vec, vec::Vec};
-
-    fn sample_auxv(base: Option<u64>) -> AuxvInfo {
-        AuxvInfo {
-            phdr: 0x0000_5555_5555_4040,
-            phent: 56,
-            phnum: 4,
-            pagesz: PAGE_SIZE,
-            base,
-            entry: 0x0000_5555_5555_5010,
-            uid: 0,
-            euid: 0,
-            gid: 0,
-            egid: 0,
-            secure: 0,
-            clktck: DEFAULT_CLKTCK,
-        }
-    }
 
     fn read_u64_at(buf: &[u8], stack_bottom: u64, va: u64) -> u64 {
         let off = usize::try_from(va - stack_bottom).unwrap();
