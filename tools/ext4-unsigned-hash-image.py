@@ -13,8 +13,9 @@ three names with bytes of 0x80 or above,
 - `80 81 82 83 84` (not UTF-8, holding `z`),
 
 each filed in a leaf block that the *signed* hash of its name doesn't route to,
-which this script checks (the ktest's claim needs it: a lookup hashing signed,
-as ext4plus 0.1.0-rc.2 does, misses all three). It also checks the image with
+which this script checks (the ktest's claims need it: a lookup hashing signed,
+as ext4plus 0.1.0-rc.2 always did (#308) and the vendored one does with the
+flag set to signed (#313), misses all three). It also checks the image with
 `e2fsck -fn`.
 
 The names go in through `mke2fs -d` as ASCII stand-ins of the same length
