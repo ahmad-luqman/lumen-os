@@ -251,3 +251,8 @@ milestone = "M8"
 tests = [
     "harness:test_syscalls::*",
 ]
+
+[[feature]]
+name = "Deterministic Alpine developer image (gcc, g++, make, git, sqlite3, vim) from a pinned package lock"
+milestone = "M8"
+tests = ["harness:test_rootfs_dev::*"]
