@@ -34,7 +34,7 @@ use lumen_vfs::{
     VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
-use log::{error, warn};
+use log::{debug, error, warn};
 
 use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
@@ -93,23 +93,25 @@ const EXT2_FLAGS_UNSIGNED_HASH: u32 = 0x2;
 /// `s_feature_compat`'s `dir_index`: directories may be indexed (htree).
 const COMPAT_DIR_INDEX: u32 = 0x20;
 
-/// The reason [`forced_read_only_reason`] gives for [`DirHash::Unsigned`].
-const UNSIGNED_HASH_REASON: &str =
-    "its directories hash names unsigned (s_flags EXT2_FLAGS_UNSIGNED_HASH), which ext4plus can't write";
 /// The reason [`forced_read_only_reason`] gives for [`DirHash::Unknown`].
 const UNKNOWN_HASH_REASON: &str =
     "its directories may hash names unsigned (dir_index, but neither hash flag in s_flags), which ext4plus can't write";
 
 /// How a volume's htree directories hash their names' bytes, by its
-/// superblock. `ext4plus` 0.1.0-rc.2 always hashes them signed (#308), so a
-/// volume that may hash them unsigned mounts read-only, and a lookup there of
-/// a name with a byte of 0x80 or above that misses in an htree directory
-/// walks the directory's entries ([`scan_dir_for`]). Both go once `ext4plus`
-/// takes the signedness from `s_flags` (#313).
+/// superblock. The vendored `ext4plus` hashes them unsigned when `s_flags`
+/// has [`EXT2_FLAGS_UNSIGNED_HASH`], signed otherwise (#313; its release
+/// always hashed signed, #308). A volume with neither flag may have been
+/// indexed either way, so it mounts read-only, and a lookup there of a name
+/// with a byte of 0x80 or above that misses in an htree directory walks the
+/// directory's entries ([`scan_dir_for`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DirHash {
     /// `EXT2_FLAGS_SIGNED_HASH` without `EXT2_FLAGS_UNSIGNED_HASH`, or
     /// neither flag without `dir_index` (no directory has been indexed).
+    /// (`ext4plus` takes the htree path by a directory's own flag, so on a
+    /// volume whose `dir_index` was cleared after indexing with neither hash
+    /// flag, such a directory is hashed signed, which may be wrong;
+    /// `e2fsck` would clear its index.)
     Signed,
     /// `EXT2_FLAGS_UNSIGNED_HASH` (which Linux's `ext4_hash_info_init` checks
     /// first): `mke2fs` sets it where `char` is unsigned, e.g. Linux on
@@ -137,8 +139,7 @@ impl DirHash {
     /// The reason a volume hashing so mounts read-only, if it does.
     fn read_only_reason(self) -> Option<&'static str> {
         match self {
-            Self::Signed => None,
-            Self::Unsigned => Some(UNSIGNED_HASH_REASON),
+            Self::Signed | Self::Unsigned => None,
             Self::Unknown => Some(UNKNOWN_HASH_REASON),
         }
     }
@@ -1103,10 +1104,10 @@ impl Ext4FsInner {
 struct Ext4Shared {
     dev: DevId,
     read_only: bool,
-    /// The volume may hash names unsigned (its [`DirHash`] isn't `Signed`;
-    /// the mount is then read-only): a non-ASCII lookup missing in an htree
-    /// directory walks it (#308, until #313).
-    may_hash_unsigned: bool,
+    /// How the volume's htree directories hash, by its superblock. On an
+    /// `Unknown` one (the mount is then read-only) a non-ASCII lookup missing
+    /// in an htree directory walks it (#308).
+    dir_hash: DirHash,
     /// The largest file size the filesystem can map ([`max_file_size`]).
     max_file_size: u64,
     /// The errno of the last per-inode sync's (`fsync`/`fdatasync`) failed
@@ -1162,7 +1163,7 @@ impl Ext4FileSystem {
         let s_flags = u32::from_le_bytes(raw_sb[S_FLAGS_OFFSET..S_FLAGS_OFFSET + 4].try_into().unwrap());
         let compat = u32::from_le_bytes(raw_sb[COMPAT_OFFSET..COMPAT_OFFSET + 4].try_into().unwrap());
         let hash = DirHash::from_superblock(s_flags, compat);
-        let may_hash_unsigned = hash != DirHash::Signed;
+        debug!(target: "vfs", "ext4 on {dev:?}: htree directories hash names {hash:?} (s_flags {s_flags:#x})");
 
         let io = BcacheIo(Arc::clone(&bcache));
         // Probe read-only first to inspect superblock feature flags safely.
@@ -1177,8 +1178,8 @@ impl Ext4FileSystem {
         if let Some(why) = forced
             && !hw_read_only
         {
-            // `s_flags` only beside the reasons it gives (not, say, beside a
-            // journal needing recovery on a volume hashing unsigned).
+            // `s_flags` only beside the reason it gives (not, say, beside a
+            // journal needing recovery on a volume with neither hash flag).
             if forced == hash.read_only_reason() {
                 warn!(
                     target: "vfs",
@@ -1192,7 +1193,9 @@ impl Ext4FileSystem {
         // Read-only: `ext4plus` would file a new or renamed entry by the
         // signed hash, and every by-hash read but `lookup`'s (which walks
         // after a miss) sits behind a read-only check.
-        debug_assert!(!may_hash_unsigned || read_only);
+        debug_assert!(hash != DirHash::Unknown || read_only);
+        // `ext4plus` reads the flag for itself (#313): the two agree.
+        debug_assert_eq!(probe_fs.superblock().htree_hash_unsigned(), hash == DirHash::Unsigned);
 
         let ext4 = if read_only {
             probe_fs
@@ -1206,7 +1209,7 @@ impl Ext4FileSystem {
         let shared = Arc::new(Ext4Shared {
             dev,
             read_only,
-            may_hash_unsigned,
+            dir_hash: hash,
             max_file_size: max_file_size(layout.block_size(), extents),
             bcache_sync_errno: AtomicU32::new(0),
             state: SleepMutex::new(Ext4FsInner {
@@ -1296,6 +1299,10 @@ struct Ext4InodeMeta {
     nlink: u32,
     uid: u32,
     gid: u32,
+    /// A directory's, like its `blocks_512`, are `ext4plus`'s, which grows
+    /// it inside `Dir::link`: refreshed by [`Self::take_dir_geometry`] after
+    /// every create, mkdir, link, symlink and rename into it, failed ones
+    /// too (best effort, [`Ext4Inode::retake_dir_geometry`]; #357).
     size: u64,
     blksize: u32,
     blocks_512: u64,
@@ -1304,6 +1311,20 @@ struct Ext4InodeMeta {
     meta_dirty: bool,
     detached_symlink_target: Vec<u8>,
     locks: AdvisoryLocks,
+}
+
+impl Ext4InodeMeta {
+    /// A directory's size and blocks as `disk`, its inode as `ext4plus` left
+    /// it, has them: `ext4plus` grows a directory by a block inside
+    /// `Dir::link` (an entry that doesn't fit a linear directory, an htree
+    /// leaf split) and writes its inode itself, and nothing here writes them
+    /// back (#357). A create, mkdir, link or symlink that worked hands over
+    /// its `Dir`'s inode; a failed one, and a rename (both parents), re-read
+    /// it ([`Ext4Inode::retake_dir_geometry`]).
+    fn take_dir_geometry(&mut self, disk: &Inode) {
+        self.size = disk.size_in_bytes();
+        self.blocks_512 = disk.blocks();
+    }
 }
 
 /// VFS inode backed by `ext4` + unified `PageCache`.
@@ -2190,6 +2211,41 @@ impl Ext4Inode {
                 }
                 meta.meta_dirty = false;
             }
+        }
+    }
+
+    /// This directory's size and blocks re-read from its inode into `meta`
+    /// (its Lock 4 guard; Lock 6 held, as writeback takes them), where no
+    /// `Dir` that linked into it is at hand: after a rename, and after a
+    /// create, mkdir, link or symlink that failed, whose failed `Dir::link`
+    /// (or `discard_orphan`'s link) may have grown it (#357). Best effort:
+    /// an inode that can't be read leaves the cached values (logged at
+    /// debug), the operation's own result stands, and `stat` never reads
+    /// the disk.
+    fn retake_dir_geometry(&self, meta: &mut Ext4InodeMeta, ext4: &Ext4) {
+        match Inode::read(ext4, self.disk_inode_index()) {
+            Ok(disk) => meta.take_dir_geometry(&disk),
+            Err(e) => debug!(
+                target: "vfs",
+                "ext4 {:?} inode {}: keeping the directory's cached size: reading its inode failed: {e:?}",
+                self.shared.dev,
+                self.disk_ino
+            ),
+        }
+    }
+
+    /// A rename's parents' size and blocks from their inodes
+    /// ([`Self::retake_dir_geometry`]), however the rename ended: the link
+    /// into `new_dir`, or a put-back into either, may have grown it.
+    fn take_parents_geometry(
+        &self,
+        guards: &mut [LockedInode<'_>],
+        old_dir: &Arc<Ext4Inode>,
+        new_dir: &Arc<Ext4Inode>,
+    ) {
+        let inner = self.shared.state.lock();
+        for dir in [old_dir, new_dir] {
+            dir.retake_dir_geometry(find_guard_mut(guards, dir), &inner.ext4);
         }
     }
 
@@ -3497,7 +3553,7 @@ fn is_ext4_dir_empty(ext4: &Ext4, dir_inode: &Inode) -> Result<bool, VfsError> {
 /// The inode of `dir`'s entry `name`, found by walking every entry (not by
 /// its hash; `ext4plus`'s own walk for a linear directory): `ENOENT` if none
 /// has that name, and a read error is that error, never `ENOENT`. Only for
-/// lookups on a volume that may hash unsigned ([`DirHash`], #308), until #313.
+/// lookups on a volume with neither hash flag ([`DirHash::Unknown`], #308).
 fn scan_dir_for(ext4: &Ext4, dir: &Dir, name: DirEntryName<'_>) -> Result<Inode, VfsError> {
     for item in dir.read_dir().map_err(map_ext4_err)? {
         let entry = item.map_err(map_ext4_err)?;
@@ -3799,13 +3855,14 @@ impl VfsInode for Ext4Inode {
         let dir_inode = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
         let dir = Dir::open_inode(&inner.ext4, dir_inode).map_err(map_ext4_err)?;
         let child_disk = match dir.get_entry(dname) {
-            // `ext4plus` hashed the name signed: on a volume that may hash
-            // unsigned (#308; #313 fixes ext4plus and removes this), an entry
+            // `ext4plus` hashed the name signed: on a volume with neither
+            // hash flag, which may have been indexed unsigned (#308), an entry
             // whose name has a byte of 0x80 or above (the only bytes the two
             // hashes read differently) may sit in another leaf of an htree
-            // directory.
+            // directory. (One whose flag says unsigned, `ext4plus` hashes
+            // unsigned itself, #313.)
             Err(Ext4Error::NotFound)
-                if self.shared.may_hash_unsigned
+                if self.shared.dir_hash == DirHash::Unknown
                     && !name.is_ascii()
                     && dir.inode().flags().contains(InodeFlags::DIRECTORY_HTREE) =>
             {
@@ -3845,8 +3902,10 @@ impl VfsInode for Ext4Inode {
         inner.clear_nlink_bounds(child_disk.index.get());
         if let Err(e) = parent_dir.link(dname, &mut child_disk) {
             discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed create");
+            self.retake_dir_geometry(&mut meta, &inner.ext4);
             return Err(map_ext4_err(e));
         }
+        meta.take_dir_geometry(parent_dir.inode());
         let child = inner.created_inode(child_disk, &self.shared);
         meta.times.modified(now_ts);
         meta.meta_dirty = true;
@@ -3894,14 +3953,16 @@ impl VfsInode for Ext4Inode {
             drop(sub_dir);
             let mut sub_inode = Inode::read(&inner.ext4, sub_ino)?;
             let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index())?;
-            Dir::open_inode(&inner.ext4, parent_disk)?.link(dname, &mut sub_inode)?;
-            Ok(sub_inode)
+            let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk)?;
+            parent_dir.link(dname, &mut sub_inode)?;
+            Ok((sub_inode, parent_dir.inode().clone()))
         });
-        let sub_inode = match linked {
-            Ok(sub_inode) => sub_inode,
+        let (sub_inode, parent_now) = match linked {
+            Ok(linked) => linked,
             Err(e) => {
                 inner.undo_failed_link(self.disk_inode_index(), dname, self.disk_inode_index(), parent_eff);
                 discard_orphan(&mut inner, self.disk_inode_index(), dname, sub_ino, "after a failed create");
+                self.retake_dir_geometry(&mut meta, &inner.ext4);
                 return Err(map_ext4_err(e));
             }
         };
@@ -3909,6 +3970,7 @@ impl VfsInode for Ext4Inode {
         // The new directory is linked: from here on mkdir succeeds. The inode
         // `link` wrote is the current one.
         let child = inner.created_inode(sub_inode, &self.shared);
+        meta.take_dir_geometry(&parent_now);
         meta.nlink = meta.nlink.saturating_add(1);
         meta.times.modified(now_ts);
         meta.meta_dirty = true;
@@ -4134,7 +4196,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::NoEnt);
         }
 
-        {
+        let parent_now = {
             let mut inner = self.shared.state.lock();
             let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
             let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
@@ -4147,10 +4209,12 @@ impl VfsInode for Ext4Inode {
             }
             if let Err(e) = parent_dir.link(dname, &mut target_disk) {
                 inner.undo_failed_link(self.disk_inode_index(), dname, target_arc.disk_inode_index(), target_eff);
+                self.retake_dir_geometry(find_guard_mut(&mut guards, &self_arc), &inner.ext4);
                 return Err(map_ext4_err(e));
             }
             inner.clear_nlink_bounds(target_arc.disk_ino);
-        }
+            parent_dir.inode().clone()
+        };
 
         let now_ts = self.shared.now();
         let t_meta = find_guard_mut(&mut guards, &target_arc);
@@ -4158,6 +4222,7 @@ impl VfsInode for Ext4Inode {
         t_meta.times.set_ctime(now_ts);
         t_meta.meta_dirty = true;
         let p_meta = find_guard_mut(&mut guards, &self_arc);
+        p_meta.take_dir_geometry(&parent_now);
         p_meta.times.modified(now_ts);
         p_meta.meta_dirty = true;
         Ok(())
@@ -4211,10 +4276,12 @@ impl VfsInode for Ext4Inode {
                 Ok(sym) => sym,
                 Err(e) => {
                     discard_orphan(&mut inner, self.disk_inode_index(), dname, sym_ino, "after a failed create");
+                    self.retake_dir_geometry(&mut meta, &inner.ext4);
                     return Err(e);
                 }
             };
 
+        meta.take_dir_geometry(parent_dir.inode());
         let child = inner.created_inode(sym_disk, &self.shared);
         meta.times.modified(now_ts);
         meta.meta_dirty = true;
@@ -4370,6 +4437,7 @@ impl VfsInode for Ext4Inode {
                     new_dname,
                 )?
             };
+            self.take_parents_geometry(&mut guards, &old_dir_arc, &new_dir_arc);
             return outcome.apply(&mut guards, &old_child_arc, new_child_arc, &old_dir_arc, &new_dir_arc, now_ts);
         }
 
@@ -4416,6 +4484,7 @@ impl VfsInode for Ext4Inode {
                 Landed::No(_) => self.put_back_target(&mut guards, &new_dir_arc, new_dname, target),
             }
         }
+        self.take_parents_geometry(&mut guards, &old_dir_arc, &new_dir_arc);
         step2.stamp(&mut guards, &old_child_arc, &old_dir_arc, &new_dir_arc, now_ts)
     }
 
@@ -5208,6 +5277,14 @@ pub(crate) mod ktest_util {
     pub const UNSIGNED_HASH_NAMES: [(&[u8], &[u8]); 3] =
         [("é-utf8".as_bytes(), b"x"), (b"\xff\xfe-odd", b"y"), (b"\x80\x81\x82\x83\x84", b"z")];
 
+    /// Three 110-byte names whose unsigned hashes lead to leaf 1 of
+    /// [`UNSIGNED_HASH_IMAGE`]'s `/d` (block 93, 200 bytes free) and whose
+    /// signed hashes don't (e2fsprogs' `dx_hash -h 4` and `-h 1` with the
+    /// image's seed): created there, the second splits that leaf.
+    pub fn unsigned_hash_split_names() -> [Vec<u8>; 3] {
+        [8, 9, 14].map(|n| alloc::format!("{}-split-{n:03}", "é".repeat(50)).into_bytes())
+    }
+
     /// An `e2fsck`-clean ext4 image with 1 KiB blocks and no `extents`
     /// feature, so files are block-mapped and `ext4plus` writes at most one
     /// 1 KiB block per `write_at` call. 32 inodes; the root directory in
@@ -5927,13 +6004,23 @@ crate::ktest!(
         // The writable profile's bits (sparse_super, large_file, huge_file,
         // dir_nlink, extra_isize) don't.
         kassert!(forced_read_only_reason(false, 0x6b, DirHash::Signed).is_none());
-        // Directory hashes that are (or may be) unsigned (#308) do, named
-        // ahead of a ro_compat reason and behind the journal's.
-        kassert_eq!(forced_read_only_reason(false, 0x6b, DirHash::Unsigned), Some(UNSIGNED_HASH_REASON));
+        // Directory hashes that may be unsigned without a flag saying so
+        // (#308) do, named ahead of a ro_compat reason and behind the
+        // journal's; unsigned ones, which `ext4plus` hashes as such (#313),
+        // don't, and leave the ro_compat reason its say.
+        kassert!(forced_read_only_reason(false, 0x6b, DirHash::Unsigned).is_none());
         kassert_eq!(forced_read_only_reason(false, 0x6b, DirHash::Unknown), Some(UNKNOWN_HASH_REASON));
-        kassert_eq!(forced_read_only_reason(false, 0x0400, DirHash::Unsigned), Some(UNSIGNED_HASH_REASON));
-        kassert_eq!(forced_read_only_reason(false, 0x4_0000, DirHash::Unsigned), Some(UNSIGNED_HASH_REASON));
-        kassert_eq!(forced_read_only_reason(true, 0x6b, DirHash::Unsigned), Some("the journal needs recovery"));
+        kassert_eq!(forced_read_only_reason(false, 0x0400, DirHash::Unknown), Some(UNKNOWN_HASH_REASON));
+        kassert_eq!(forced_read_only_reason(false, 0x4_0000, DirHash::Unknown), Some(UNKNOWN_HASH_REASON));
+        kassert_eq!(forced_read_only_reason(true, 0x6b, DirHash::Unknown), Some("the journal needs recovery"));
+        kassert_eq!(forced_read_only_reason(false, 0x4_0000, DirHash::Unsigned), Some("unknown ro_compat feature"));
+        kassert_eq!(
+            forced_read_only_reason(false, 0x0400, DirHash::Unsigned),
+            forced_read_only_reason(false, 0x0400, DirHash::Signed)
+        );
+        kassert!(
+            forced_read_only_reason(false, 0x0400, DirHash::Signed).is_some_and(|why| why.starts_with("ro_compat"))
+        );
         // The hash by `s_flags` (signed 0x1, unsigned 0x2) and `dir_index`
         // (compat 0x20): unsigned whenever 0x2 is set (Linux checks it
         // first); neither flag is unknown only with `dir_index`.
@@ -6579,17 +6666,19 @@ crate::ktest!(
 );
 
 crate::ktest!(
-    fn ext4_an_unsigned_hash_volume_mounts_read_only_and_looks_up_every_listed_name() {
-        // #308: `ext4plus` hashes names signed. On a volume whose superblock
-        // says its htree directories hash unsigned, asked for a writable
-        // mount, the mount is read-only (its one warning, naming the flag, is
-        // pinned by test_ktest.py's VFS_EXACT_LINES); every name `/d` lists,
-        // the three with bytes of 0x80 or above too (filed in leaves their
-        // signed hashes don't lead to), is looked up to the inode listed,
-        // with its contents; a name that isn't there is still ENOENT, and a
-        // read error during the walk or before it is EIO; unlink, rmdir and
-        // create are EROFS. Only a non-ASCII miss in an htree directory walks
-        // it. With neither hash flag the same holds while `dir_index` is set.
+    fn ext4_an_unsigned_hash_volume_mounts_writable_and_hashes_names_unsigned() {
+        // #313 (#308's guard before it): on a volume whose superblock says
+        // its htree directories hash unsigned, the vendored `ext4plus`
+        // hashes names unsigned. Asked for a writable mount, it is writable
+        // (warning nothing); every name `/d` lists, the three with bytes of
+        // 0x80 or above too (filed in leaves their signed hashes don't lead
+        // to), is looked up by its hash alone (no walk: a read error in the
+        // leaf the signed hash leads to doesn't touch it); names with high
+        // bytes are created (splitting a leaf, its entries rehashed), found
+        // again on a fresh mount, unlinked and a directory removed. With
+        // neither hash flag (and `dir_index`) the volume mounts read-only and
+        // a non-ASCII miss in an htree directory walks it; with the flag set
+        // to signed, the three are ENOENT (the flag drives the hash).
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         /// The blocks `dir.lookup(name)` reads (cache hits too) when `name`
@@ -6600,7 +6689,7 @@ crate::ktest!(
             Ok(m.cache.reads.load(Ordering::Acquire) - before)
         }
         let m = mount(UNSIGNED_HASH_IMAGE.to_vec(), 308)?;
-        kassert!(m.fs.read_only());
+        kassert!(!m.fs.read_only());
         let d = m.root.lookup(b"d").map_err(|_| "lookup d")?;
         {
             let inner = m.fs.shared.state.lock();
@@ -6611,42 +6700,80 @@ crate::ktest!(
         d.readdir(0, &mut out, 256).map_err(|_| "readdir d")?;
         // `.`, `..`, 80 `entry-number-NN` and the three.
         kassert_eq!(out.len(), 85);
-        for entry in out.iter().filter(|e| e.name != b"." && e.name != b"..") {
-            let found = d.lookup(&entry.name).map_err(|_| "a listed name isn't found")?;
-            kassert_eq!(found.ino(), entry.ino);
+        /// Every name in `listed` (`.` and `..` aside) is looked up in `dir`
+        /// to the inode listed.
+        fn finds_all(dir: &Arc<dyn VfsInode>, listed: &[DirEntry], what: &'static str) -> Result<(), &'static str> {
+            for entry in listed.iter().filter(|e| e.name != b"." && e.name != b"..") {
+                kassert_eq!(dir.lookup(&entry.name).map_err(|_| what)?.ino(), entry.ino);
+            }
+            Ok(())
         }
+        finds_all(&d, &out, "a listed name isn't found")?;
         for (name, contents) in UNSIGNED_HASH_NAMES {
             kassert!(out.iter().any(|e| e.name == name));
             kassert_eq!(read_all(&d.lookup(name).map_err(|_| "lookup a name with high bytes")?)?, contents.to_vec());
-            kassert_eq!(d.unlink(name).err(), Some(VfsError::RoFs));
         }
-        kassert_eq!(read_all(&d.lookup(b"entry-number-42").map_err(|_| "lookup entry-number-42")?)?, b"42".to_vec());
 
-        // A miss is ENOENT. In `/d` (htree) a non-ASCII miss walks every
-        // block, so it reads more than an ASCII miss (a hash lookup: the root
-        // block and one leaf); in `/` (one linear block) the two read alike.
+        // A miss is ENOENT, by the hash alone: a non-ASCII miss in `/d`
+        // reads as many blocks as an ASCII one (the root block and a leaf).
         let non_ascii = miss_reads(&m, &d, b"\xff\xfe-od")?;
         let ascii = miss_reads(&m, &d, b"entry-number-80")?;
         crate::ktest::diag(format_args!("/d misses read {non_ascii} (non-ASCII) and {ascii} (ASCII) blocks"));
-        kassert!(ascii < non_ascii);
-        kassert_eq!(miss_reads(&m, &m.root, b"\xff\xfe-od")?, miss_reads(&m, &m.root, b"absent")?);
-
-        // A read error during the walk is EIO, never ENOENT: `\xff\xfe-odd`'s
-        // signed hash leads to logical leaf 1 (block 93), so the walk is the
-        // first to read leaf 2 (block 135, where the entry sits).
+        kassert_eq!(non_ascii, ascii);
+        // `\xff\xfe-odd`'s unsigned hash leads to logical leaf 2 (block 135),
+        // where it sits; its signed hash to leaf 1 (block 93). A read error
+        // in leaf 1 leaves the lookup alone; one in leaf 2 is EIO.
+        m.cache.fail_reads_in(93 * 1024, 94 * 1024, 1);
+        kassert!(d.lookup(b"\xff\xfe-odd").is_ok());
+        m.cache.clear();
         m.cache.fail_reads_in(135 * 1024, 136 * 1024, 1);
         kassert_eq!(d.lookup(b"\xff\xfe-odd").err(), Some(VfsError::Io));
         m.cache.clear();
-        kassert!(d.lookup(b"\xff\xfe-odd").is_ok());
-        // And only a miss walks: a read error in the hash lookup itself (leaf
-        // 1, block 93) is that error, not a walk that would find the name.
-        m.cache.fail_reads_in(93 * 1024, 94 * 1024, 1);
-        kassert_eq!(d.lookup(b"\xff\xfe-odd").err(), Some(VfsError::Io));
-        m.cache.clear();
 
-        kassert_eq!(m.root.rmdir(b"d").err(), Some(VfsError::RoFs));
-        kassert_eq!(d.create(b"new", 0o644).err(), Some(VfsError::RoFs));
-        drop(d);
+        // `unsigned_hash_split_names`: the second splits leaf 1, rehashing
+        // its 35 entries (`é-utf8` among them).
+        let split_names = unsigned_hash_split_names();
+        // `stat` gives the size the create that split a leaf left (#357).
+        let size_before = d.stat().map_err(|_| "stat d")?.size;
+        for (i, name) in split_names.iter().enumerate() {
+            kassert_eq!(name.len(), 110);
+            let f = d.create(name, 0o644).map_err(|_| "create a name with high bytes")?;
+            f.write_at(0, &[b'0' + i as u8]).map_err(|_| "write")?;
+            f.sync(false).map_err(|_| "sync")?;
+        }
+        let size_after = d.stat().map_err(|_| "stat d after")?.size;
+        crate::ktest::diag(format_args!("/d grew from {size_before} to {size_after} bytes"));
+        kassert_eq!(size_after, size_before + 1024);
+        let sub = d.mkdir(b"\x80-dir", 0o755).map_err(|_| "mkdir a name with high bytes")?;
+        kassert_eq!(d.lookup(b"\x80-dir").map_err(|_| "lookup the new directory")?.ino(), sub.ino());
+        drop(sub);
+        finds_all(&d, &out, "an old name isn't found after the split")?;
+        for (i, name) in split_names.iter().enumerate() {
+            kassert_eq!(read_all(&d.lookup(name).map_err(|_| "lookup a new name")?)?, vec![b'0' + i as u8]);
+        }
+        // Found again from the disk, through a fresh mount.
+        let on_disk = remount_ro(&m, 313)?;
+        let ro_d = on_disk.root_inode().lookup(b"d").map_err(|_| "ro lookup d")?;
+        finds_all(&ro_d, &out, "ro: an old name isn't found")?;
+        for (i, name) in split_names.iter().enumerate() {
+            kassert_eq!(read_all(&ro_d.lookup(name).map_err(|_| "ro: lookup a new name")?)?, vec![b'0' + i as u8]);
+        }
+        kassert!(ro_d.lookup(b"\x80-dir").is_ok());
+        drop((ro_d, on_disk));
+        // Unlink and rmdir.
+        for (name, _) in UNSIGNED_HASH_NAMES {
+            d.unlink(name).map_err(|_| "unlink a name with high bytes")?;
+            kassert_eq!(d.lookup(name).err(), Some(VfsError::NoEnt));
+        }
+        d.unlink(&split_names[1]).map_err(|_| "unlink a new name")?;
+        d.rmdir(b"\x80-dir").map_err(|_| "rmdir a name with high bytes")?;
+        let on_disk = remount_ro(&m, 314)?;
+        let ro_d = on_disk.root_inode().lookup(b"d").map_err(|_| "ro lookup d (2)")?;
+        for name in UNSIGNED_HASH_NAMES.iter().map(|(n, _)| *n).chain([&split_names[1][..], b"\x80-dir"]) {
+            kassert_eq!(ro_d.lookup(name).err(), Some(VfsError::NoEnt));
+        }
+        kassert!(ro_d.lookup(&split_names[2]).is_ok());
+        drop((ro_d, on_disk, d, m));
 
         // The same bytes with `s_flags` changed.
         let s_flags = 1024 + S_FLAGS_OFFSET;
@@ -6663,17 +6790,42 @@ crate::ktest!(
 
         // Neither hash flag, with `dir_index`: Linux may have indexed `/d`
         // unsigned without leaving a flag, so the volume mounts read-only
-        // (its own warning, pinned likewise) and gets the walk.
+        // (its warning, naming the flags' absence, is pinned by
+        // test_ktest.py's VFS_EXACT_LINES); every listed name is looked up,
+        // the three by a walk after `ext4plus`'s signed hash misses them.
         let m = mount(with_s_flags(0x0, true), 310)?;
         kassert!(m.fs.read_only());
         let d = m.root.lookup(b"d").map_err(|_| "lookup d (no flag)")?;
+        finds_all(&d, &out, "a listed name isn't found (no flag)")?;
         for (name, contents) in UNSIGNED_HASH_NAMES {
             kassert_eq!(
                 read_all(&d.lookup(name).map_err(|_| "lookup a name with high bytes (no flag)")?)?,
                 contents.to_vec()
             );
+            kassert_eq!(d.unlink(name).err(), Some(VfsError::RoFs));
         }
-        kassert_eq!(m.root.create(b"new", 0o644).err(), Some(VfsError::RoFs));
+        // A non-ASCII miss in `/d` (htree) walks every block, so it reads
+        // more than an ASCII miss (a hash lookup); in `/` (one linear block)
+        // the two read alike.
+        let non_ascii = miss_reads(&m, &d, b"\xff\xfe-od")?;
+        let ascii = miss_reads(&m, &d, b"entry-number-80")?;
+        crate::ktest::diag(format_args!("no flag: /d misses read {non_ascii} (non-ASCII) and {ascii} (ASCII) blocks"));
+        kassert!(ascii < non_ascii);
+        kassert_eq!(miss_reads(&m, &m.root, b"\xff\xfe-od")?, miss_reads(&m, &m.root, b"absent")?);
+        // A read error during the walk is EIO, never ENOENT: `\xff\xfe-odd`'s
+        // signed hash leads to leaf 1 (block 93), so the walk is the first to
+        // read leaf 2 (block 135, where the entry sits).
+        m.cache.fail_reads_in(135 * 1024, 136 * 1024, 1);
+        kassert_eq!(d.lookup(b"\xff\xfe-odd").err(), Some(VfsError::Io));
+        m.cache.clear();
+        kassert!(d.lookup(b"\xff\xfe-odd").is_ok());
+        // And only a miss walks: a read error in the hash lookup itself (leaf
+        // 1, block 93) is that error, not a walk that would find the name.
+        m.cache.fail_reads_in(93 * 1024, 94 * 1024, 1);
+        kassert_eq!(d.lookup(b"\xff\xfe-odd").err(), Some(VfsError::Io));
+        m.cache.clear();
+        kassert_eq!(m.root.rmdir(b"d").err(), Some(VfsError::RoFs));
+        kassert_eq!(d.create(b"new", 0o644).err(), Some(VfsError::RoFs));
         drop((d, m));
 
         // Neither flag without `dir_index` mounts writable, warning nothing.
@@ -6681,18 +6833,28 @@ crate::ktest!(
         kassert!(!m.fs.read_only());
         drop(m);
 
-        // A journal needing recovery outranks the unsigned flag, and its
-        // warning shows no `s_flags` (pinned likewise).
-        let mut img = UNSIGNED_HASH_IMAGE.to_vec();
+        // A journal needing recovery outranks neither hash flag: its warning
+        // names the journal and shows no `s_flags` (pinned likewise).
+        let mut img = with_s_flags(0x0, true);
         img[1024 + 0x60] |= 0x4; // incompat RECOVERY
         let m = mount(img, 312)?;
         kassert!(m.fs.read_only());
         drop(m);
 
+        // Both flags: unsigned, as Linux reads it (0x2 first). Writable,
+        // warning nothing, and the three found by their unsigned hashes.
+        let m = mount(with_s_flags(0x3, true), 315)?;
+        kassert!(!m.fs.read_only());
+        let d = m.root.lookup(b"d").map_err(|_| "lookup d (both flags)")?;
+        for (name, contents) in UNSIGNED_HASH_NAMES {
+            kassert_eq!(read_all(&d.lookup(name).map_err(|_| "lookup (both flags)")?)?, contents.to_vec());
+        }
+        drop((d, m));
+
         // The flag set to signed (`/d` still indexed by the unsigned hash):
         // the volume mounts writable, warning nothing, and gets no walk:
-        // `ext4plus`'s signed hash misses each of the three, which is the bug
-        // this image is for. An ASCII name hashes alike either way.
+        // `ext4plus`'s signed hash misses each of the three. An ASCII name
+        // hashes alike either way.
         let m = mount(with_s_flags(0x1, true), 309)?;
         kassert!(!m.fs.read_only());
         let d = m.root.lookup(b"d").map_err(|_| "lookup d (signed)")?;
@@ -6703,6 +6865,121 @@ crate::ktest!(
         // In `/`, not `/d`: a name added to `/d` would be filed by the signed
         // hash in a directory indexed by the unsigned one.
         m.root.create(b"new", 0o644).map_err(|_| "create on the signed volume")?;
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_a_directory_grown_by_ext4plus_stats_its_size_on_disk() {
+        // #357: `ext4plus` grows a directory by a block inside `Dir::link`
+        // (an entry that doesn't fit a linear directory, an htree leaf
+        // split). After a create, link, rename into it, mkdir or symlink that
+        // grew it, `stat` gives the size and blocks its inode on disk has, as
+        // a fresh mount does, from memory (it answers alike while reads of
+        // the inode fail). A removed directory's `stat` keeps its own
+        // values, even once its inode number is another file's.
+        use self::ktest_util::*;
+        use crate::kassert_eq;
+        /// `dir`'s (size, 512-byte blocks) by `stat`.
+        fn by_stat(dir: &Arc<dyn VfsInode>) -> Result<(u64, u64), &'static str> {
+            let st = dir.stat().map_err(|_| "stat")?;
+            Ok((st.size, st.blocks))
+        }
+        /// `dir`'s (size, 512-byte blocks) from its inode on disk.
+        fn on_disk(m: &Mnt, dir: &Arc<dyn VfsInode>) -> Result<(u64, u64), &'static str> {
+            let inner = m.fs.shared.state.lock();
+            let disk = Inode::read(&inner.ext4, ext4_inode(dir)?.disk_inode_index()).map_err(|_| "read")?;
+            Ok((disk.size_in_bytes(), disk.blocks()))
+        }
+        /// `stat` agrees with the disk and with a fresh mount, and the
+        /// directory grew by one block.
+        fn grew_by_a_block(
+            m: &Mnt,
+            dir: &Arc<dyn VfsInode>,
+            name: &[u8],
+            before: (u64, u64),
+            block: u64,
+            minor: u32,
+        ) -> Result<(), &'static str> {
+            let (stat, disk) = (by_stat(dir)?, on_disk(m, dir)?);
+            crate::ktest::diag(format_args!(
+                "{}: {before:?} -> stat {stat:?}, disk {disk:?}",
+                lumen_vfs::Escaped(name)
+            ));
+            kassert_eq!(disk.0, before.0 + block);
+            kassert_eq!(stat, disk);
+            let ro = remount_ro(m, minor)?;
+            kassert_eq!(by_stat(&ro.root_inode().lookup(name).map_err(|_| "ro lookup")?)?, disk);
+            Ok(())
+        }
+        /// `stat` reads only memory: with every read of `dir`'s inode
+        /// failing, it still answers, alike.
+        fn stats_from_memory(m: &Mnt, dir: &Arc<dyn VfsInode>) -> Result<(), &'static str> {
+            let at = inode_offset(&m.fs, ext4_inode(dir)?.disk_ino)?;
+            let before = by_stat(dir)?;
+            m.cache.fail_reads_in(at, at + 1, usize::MAX);
+            let during = by_stat(dir);
+            m.cache.clear();
+            kassert_eq!(during?, before);
+            Ok(())
+        }
+        // A 255-byte name: 264 bytes of entry, so 15 fill a 4 KiB block of a
+        // linear directory after `.` and `..` (24 bytes), and a 16th grows it.
+        let long = |c: u8| [&[c][..], &[b'x'; 254][..]].concat();
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 357)?;
+        // Hard links (the image has few free inodes): 16 grow `lin`.
+        let lin = m.root.mkdir(b"lin", 0o755).map_err(|_| "mkdir lin")?;
+        let f = m.root.create(b"f", 0o644).map_err(|_| "create f")?;
+        let before = by_stat(&lin)?;
+        for c in b'a'..b'a' + 16 {
+            lin.link(&long(c), &f).map_err(|_| "link")?;
+        }
+        grew_by_a_block(&m, &lin, b"lin", before, 4096, 358)?;
+        // Renames into `ren`: 16 of `lin`'s links, moved.
+        let ren = m.root.mkdir(b"ren", 0o755).map_err(|_| "mkdir ren")?;
+        let before = by_stat(&ren)?;
+        for c in b'a'..b'a' + 16 {
+            lin.rename(&long(c), &ren, &long(c), RenameFlags(0)).map_err(|_| "rename")?;
+        }
+        grew_by_a_block(&m, &ren, b"ren", before, 4096, 359)?;
+        // 15 links, then a mkdir grows `mk`; then a symlink grows `sy`.
+        for (dir_name, last) in [(&b"mk"[..], 0u8), (b"sy", 1)] {
+            let dir = m.root.mkdir(dir_name, 0o755).map_err(|_| "mkdir")?;
+            for c in b'a'..b'a' + 15 {
+                dir.link(&long(c), &f).map_err(|_| "link")?;
+            }
+            let before = by_stat(&dir)?;
+            if last == 0 {
+                dir.mkdir(&long(b'z'), 0o755).map_err(|_| "mkdir the 16th")?;
+            } else {
+                dir.symlink(&long(b'z'), b"f").map_err(|_| "symlink the 16th")?;
+            }
+            grew_by_a_block(&m, &dir, dir_name, before, 4096, 360 + u32::from(last))?;
+        }
+
+        // A removed directory still held: `stat` keeps its own values, even
+        // once a new file takes its inode number.
+        let gone = m.root.mkdir(b"gone", 0o755).map_err(|_| "mkdir gone")?;
+        let held = by_stat(&gone)?;
+        m.root.rmdir(b"gone").map_err(|_| "rmdir gone")?;
+        let reuse = m.root.create(b"reuse", 0o644).map_err(|_| "create reuse")?;
+        kassert_eq!(ext4_inode(&reuse)?.disk_ino, ext4_inode(&gone)?.disk_ino);
+        kassert_eq!(by_stat(&gone)?, held);
+        kassert_eq!(gone.stat().map_err(|_| "stat gone")?.inode_type, InodeType::Dir);
+        stats_from_memory(&m, &lin)?;
+        stats_from_memory(&m, &ren)?;
+        drop((gone, reuse, f, lin, ren, m));
+
+        // An htree directory: `unsigned_hash_split_names` split leaf 1 of
+        // UNSIGNED_HASH_IMAGE's `/d`.
+        let m = mount(UNSIGNED_HASH_IMAGE.to_vec(), 362)?;
+        let d = m.root.lookup(b"d").map_err(|_| "lookup d")?;
+        let before = by_stat(&d)?;
+        for name in unsigned_hash_split_names() {
+            d.create(&name, 0o644).map_err(|_| "create")?;
+        }
+        grew_by_a_block(&m, &d, b"d", before, 1024, 363)?;
+        stats_from_memory(&m, &d)?;
         Ok(())
     }
 );
