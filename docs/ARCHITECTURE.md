@@ -764,7 +764,9 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     `MMAP_TOP = 0x0000_7f00_0000_0000`.
   - Initial user stack top: `USER_STACK_TOP = 0x0000_7fff_f000_0000`, with an
     8 MiB demand-paged VMA (`USER_STACK_BOTTOM = 0x0000_7fff_ef80_0000`) and an
-    unmapped guard page below it.
+    unmapped guard page below it. (From M8 the size follows `RLIMIT_STACK`
+    at each `execve`, 8 MiB by default, and the bottom becomes a parameter:
+    section 8's `execve`, designed in #336.)
 - **VMA interval tree (`crates/lumen-vm`, host-tested):** tracks non-overlapping
   page-aligned virtual ranges (`start..end`), protection flags (`R`, `W`, `X`,
   or `PROT_NONE`), and backing:
@@ -1064,8 +1066,9 @@ per-frame array beside the bitmap allocator: `frame::REFS`, one
 `AtomicU32` per 4 KiB frame of the bitmap's physical span (1 MiB per GiB of
 span, 512 KiB for a 512 MiB guest), allocated from usable memory by
 `frame::init` and reserved by name (`frame refcounts`), so hard rule 2's
-check covers it. Its logic is host-tested in `lumen-mm` (`frame::RefTable`:
-`set_one`, `inc`, `dec -> Remaining`, `get`; `cargo:lumen-mm`). The count
+check covers it. B4 adds its logic to `lumen-mm` as a new module,
+host-tested (`frame::RefTable`: `set_one`, `inc`, `dec -> Remaining`, `get`;
+`cargo:lumen-mm`). The count
 is the number of user page-table leaves (present or `PTE_PROTNONE`, never
 `PTE_SHARED`) naming the frame:
 - **Set to 1** when the fault path (or the loader) maps a frame it just
@@ -1731,6 +1734,34 @@ weakening crash reporting or `make audit`.
      `lumen_isr_common` clears `AC` on entry when `SMAP_ENABLED` (preventing
      `AC = 1` from leaking into `#PF`/IRQs or across `context::switch`), and
      the fixup path clears `AC` in `frame.rflags`.
+  6. **Non-faulting user access (designed in #336, M8; added by B2).** No B
+     issue in the M8 plan owns the user-copy primitives, so B2, the
+     foundation `futex` (C4) waits on, adds two more beside the copies
+     above, for code that must touch user memory while it holds a
+     `SpinLock` (a futex bucket) or must not fault pages in:
+     - `user::read_u32_nofault(addr) -> Result<u32, Fault>`: a 4-byte,
+       4-byte-aligned load;
+     - `user::cmpxchg_u32(addr, expected, new) -> Result<u32, Fault>`: a
+       `lock cmpxchg` on user memory, returning the value it found.
+
+     Both check the range as step 2 does, and register their one faulting
+     instruction each in a separate read-only section,
+     `.lumen_fixup_nofault` (placed and audited as `.lumen_fixup` is). The
+     `#PF` handler looks a ring-0 fault's `rip` up there at its first step,
+     with `CR2` read and interrupts still off, before the step-2 assertion
+     (`irq::depth() == 0`, which a caller holding a bucket lock fails), and
+     before it enables interrupts or takes Lock 1: it sets `rip` to the
+     fixup (clearing `AC` as step 4 does) and returns, so the call answers
+     `Err(Fault)` and no page is faulted in (Linux's `pagefault_disable`
+     around `get_user`/`futex_atomic_cmpxchg_inatomic`). Neither resolves
+     a fault (a kernel address is `Err(Fault)` from the range check): a
+     caller that gets `Fault` releases its locks and faults the page in
+     with a normal `copy_from_user` (or, to check it is writable, a
+     one-byte `copy_to_user` of the value it just read), then retries.
+     Tested by `ktest:lumen_kernel::user::nofault_access_answers_fault_without_paging_in`
+     (an unmapped, a not-yet-faulted and a read-only page, each under a
+     held `SpinLock`: `Fault`, nothing mapped; then a mapped page's read
+     and exchange).
 
 ### Signals: delivery, frames and `rt_sigreturn` (designed in #336, M8)
 
@@ -1825,6 +1856,7 @@ the syscalls.
   the `WAKEUP` IPI, which arrives as soon as `iretq` turns interrupts back
   on, through the thread's own kernel stack, whose ring-3 return path
   queues the `SIGTRAP` and delivers it:
+
   | Vector | Signal, `si_code`, `si_addr` |
   |---|---|
   | `#DE` (0) | `SIGFPE`, `FPE_INTDIV`, the faulting `rip` |
@@ -4286,16 +4318,17 @@ invalidates every address space's mappings, as `ftruncate`. `openat` and
 `sched_getscheduler`, `sched_get_priority_max`, `sched_get_priority_min`
 and `sched_rr_get_interval` (142–148: no real-time policies, no census
 call; musl's pthread scheduling attributes then fail); `signalfd` and
-`signalfd4` (282, 289), with M9's other descriptor-based waits; `times`
-(100) and the CPU-time clocks (no census call). B0's census coverage check
+`signalfd4` (282, 289: no census call, and no milestone plans them yet);
+`times` (100) and the CPU-time clocks (no census call). B0 adds this list
+to `lumen_harness/syscalls.py` as a constant of its own (`ENOSYS_BY_DECISION`,
+beside `PLANNED`), and B0's census coverage check
 (`harness:test_syscalls::test_m8_table_covers_the_census`) fails if a
 census syscall is in neither `M6_SYSCALLS`, `M7_SYSCALLS`, `M8_SYSCALLS`
-nor this list.
+nor that list.
 
 - **M9 (Networking & async I/O):** BSD sockets including both `accept` (43)
   and `accept4` (288), `AF_UNIX` (`socketpair`, `SCM_RIGHTS`), `epoll_*`
-  (on section 10's readiness interface), `eventfd2`, `timerfd_*`, and
-  `signalfd4`.
+  (on section 10's readiness interface), `eventfd2`, and `timerfd_*`.
 - **M10 (JIT VM & Tier-1 runtimes):** `mremap`, `madvise` (`MADV_DONTNEED`,
   `MADV_FREE`), `memfd_create`, `inotify_*`, writable `prlimit64` (every
   resource), and full `SIGURG`/`SIGSEGV` `ucontext_t` delivery (`sysinfo`
@@ -4503,19 +4536,32 @@ hands one out, `EAGAIN` when none is free, counted by `is_busy` while the
 thread lives) and `ProcTree::remove_thread(pid, tid)`, host-tested in
 `cargo:lumen-proc`, before C3 uses them.
 
-**Init and orphans.** At boot, `linux::init` calls `ProcTree::spawn_init`:
-pid 1 is a kernel-owned process with no threads, whose `SIGCHLD`
-disposition reads as `SIG_IGN`, so `ProcTree::exit`'s `autoreap(1)` is
-true and its children's zombies leave the tree at once (the kernel frees
-their slots). Every exit names pid 1 as the reaper, so an orphan's
+**Init and orphans.** At boot, `linux::init` (a function B1 adds to
+`kernel/src/linux/mod.rs`) calls `ProcTree::spawn_init`: pid 1 is a
+kernel-owned process with no threads. It has a `PROCS.procs` entry, an
+ordinary `Process` with no `UserThread` (no address space: `mm` holds a
+placeholder empty `AddressSpace` that is never loaded), whose `SIGCHLD`
+disposition is `SIG_IGN`, so `ProcTree::exit`'s `autoreap(1)` is true. A
+`Notify` to parent 1 is then the ordinary case: its `released` is `Some`,
+so the child's zombie and `procs` entry go at once, and the `child_seq`
+bump and `child_events` wake reach no waiter (pid 1 has no thread to
+wait). Every exit names pid 1 as the reaper, so an orphan's
 `getppid` is 1, as on Linux. The `linux` shell command starts its process
 with `ProcTree::spawn_root`: a root with no parent (`getppid` 0, M6's
 row), whose end is an `ExitAction::Released` carrying the exit status the
-command prints. Pid 1 never exits and has no handlers: `kill(1, sig)`
+command prints. A root's children outlive the `linux` command: when
+the root exits they are pid 1's, still running (a background job left by
+`ash`, say), and the command returns without waiting for them. The
+scenarios that count leaked frames (`linux` prints the frames a run kept,
+`rootfs.run_busybox`) count only after every process the run started has
+ended: a test whose program leaves children kills them (or waits for
+them to exit) before it reads the count. Pid 1 never exits and has no handlers: `kill(1, sig)`
 returns 0 and does nothing, as Linux ignores a signal its init has no
 handler for (`SIGNAL_UNKILLABLE`), and `kill(-1, sig)` skips it.
 
-**Exit.** `exit` (60) ends the calling thread only (M7 ended the whole
+#### Exit (C1, C3)
+
+`exit` (60) ends the calling thread only (M7 ended the whole
 process in that arm); `exit_group` (231) and a fatal signal end the
 group:
 1. The first of them records `group_exit` under `signal` and kicks every
@@ -4528,8 +4574,13 @@ group:
    lock); walks its robust list (C4); removes its `ThreadSignals` and
    `ThreadSlot` (`PendingSignals::remove_thread`) and its `threads` entry
    and tid (`remove_thread`); drops its `UserThread`.
-3. The last thread out ends the process: switches to `kernel_root()`,
-   drops its `mm` reference (the address space is torn down when no other
+3. The last thread out ends the process. First, with no lock held, a
+   session leader with a controlling terminal sends `SIGHUP` to that
+   terminal's foreground group and clears the terminal's session and
+   foreground group under `Tty::lock` (section 9's Lock 9a, which comes
+   before `PROCS`), as Linux's `disassociate_ctty(1)` does for a PTY (for
+   its console Linux also hangs up the open descriptors; Lumen doesn't, a
+   deviation). Then it switches to `kernel_root()`, drops its `mm` reference (the address space is torn down when no other
    process shares it: a `vfork` parent may), its `files` (the table is
    closed when its last `Arc` goes, releasing locks outside every
    `SpinLock`, as M7's `take_current`) and `fs`; then, under `PROCS`,
@@ -4537,21 +4588,21 @@ group:
    `ExitOutcome`'s actions in the same hold: `Notify` bumps the parent's
    `child_seq`, wakes its `child_events` and sends it `SIGCHLD`
    (`si_code` from `WaitStatus::siginfo`, `si_pid`, `si_status`) unless its
-   disposition is `SIG_IGN`; `Released` drops the `procs` entry (and, for
-   a root, hands the status to the `linux` command); `HangupThenContinue`
-   sends `SIGHUP` then `SIGCONT` to `pgrp_members`. A session leader with
-   a controlling terminal first sends `SIGHUP` to that terminal's
-   foreground group and clears the terminal's session and foreground
-   group, as Linux's `disassociate_ctty(1)` does for a PTY (for its
-   console Linux also hangs up the open descriptors; Lumen doesn't, a
-   deviation).
+   disposition is `SIG_IGN`, and with `released: Some(slot)` (the parent
+   reaps automatically) drops the zombie's `procs` entry too; `Released`
+   drops the `procs` entry (and, for a root, hands the status to the
+   `linux` command); `HangupThenContinue` sends `SIGHUP` then `SIGCONT` to
+   `pgrp_members`. Every `Arc<Process>` leaving `procs` is extracted under
+   `PROCS` and dropped after it.
 4. The status: `group_exit`'s if set, else the leader's own `exit` code,
    as Linux's `wait_task_zombie` reads `group_exit_code` only with
    `SIGNAL_GROUP_EXIT` set. A fatal signal's status is
    `ExitStatus::Killed { core: false }`: Lumen writes no core dump, and
    Linux sets the core bit only when one was written.
 
-**Locks of the per-process parts:** `Files::table` and `FsState::inner` are
+#### The per-process locks (B1)
+
+`Files::table` and `FsState::inner` are
 IRQ-off `SpinLock`s holding no other lock; an `Arc<OpenFile>` or `Cwd`
 leaving them is extracted under the lock and dropped after it (M7's
 extract-and-drop rule, section 9). `Process::mm` is a leaf `SpinLock`
@@ -4588,8 +4639,8 @@ this order, each `-EINVAL`:
 | `CLONE_THREAD` | a new thread of the caller's process (C3) |
 | `CLONE_VFORK` | the parent sleeps, killable, until the child's `execve` or exit (as Linux's `wait_for_vfork_done`, `TASK_KILLABLE`) |
 | `CLONE_SETTLS` | the child's `fs_base` = `tls`; `tls >= USER_MAX` is `-EPERM`, as Linux's `set_new_tls` → `do_arch_prctl_64` (M6's `arch_prctl(ARCH_SET_FS)` answers that `-EINVAL`: an existing deviation) |
-| `CLONE_PARENT_SETTID` | the child's tid written to `parent_tid` in the parent's memory before the call returns (a fault is ignored, as Linux's `kernel_clone` ignores `put_user`'s result) |
-| `CLONE_CHILD_SETTID` | the child's tid written to `child_tid` in the child's memory before it first returns to user mode (a fault ignored, as Linux's `schedule_tail`) |
+| `CLONE_PARENT_SETTID` | the child's tid written to `parent_tid` in the parent's memory before the call returns, after `PROCS` is released and with no lock held (a fault is ignored, as Linux's `kernel_clone` ignores `put_user`'s result) |
+| `CLONE_CHILD_SETTID` | the child's tid written to `child_tid` in the child's memory by the child itself, with no lock held, before it first returns to user mode (a fault ignored, as Linux's `schedule_tail`) |
 | `CLONE_CHILD_CLEARTID` | `clear_child_tid = child_tid` |
 | `CLONE_SYSVSEM`, `CLONE_DETACHED`, `CLONE_IO`, `CLONE_PTRACE`, `CLONE_UNTRACED` | accepted, no effect (no System V semaphores, no ptrace; `CLONE_DETACHED` is ignored by Linux's `clone` too) |
 | `CLONE_PARENT`, `CLONE_PIDFD`, `CLONE_NEW*`, `CLONE_NEWTIME`, `CLONE_CLEAR_SIGHAND`, `CLONE_INTO_CGROUP` | `-EINVAL` (not modelled by lumen-proc; no pidfds; namespaces are M11's; the last two are `clone3`'s) |
@@ -4624,7 +4675,9 @@ limits.
 (no copy) and `Process::mm` points at the same `Arc`; the parent's thread
 waits, killable, on the child's `vfork_done` (a one-shot flag and wait
 queue in the child's `Process`), released when the child's `execve`
-installs its new address space or the child exits. musl's `posix_spawn`
+passes its point of no return (just before it installs its new address
+space, as Linux's `mm_exit_exec_release` completes `vfork_done`) or the
+child exits. musl's `posix_spawn`
 reports an `execve` failure through a `pipe2(O_CLOEXEC)` pipe (C7).
 
 #### `execve` (C2)
@@ -4654,11 +4707,24 @@ leaves the caller untouched):
 4. An ELF: the header and program headers (at most 64 KiB, Linux's
    `load_elf_phdrs` limit) parsed by `lumen_elf::loader` (`-ENOEXEC` for a
    bad one; a bad `PT_INTERP` interpreter `-ELIBBAD`, a missing one
-   `-ENOENT`, M7's rules). Neither ELF nor `#!`: `-ENOEXEC`.
+   `-ENOENT`, M7's rules). Neither ELF nor `#!`: `-ENOEXEC`. Today
+   `LoadedElf::parse(image)` takes the whole file as one slice; C2 changes
+   lumen-elf to parse from the headers alone plus the file's size
+   (`LoadedElf::parse_headers(head, file_size)`, every segment's
+   `p_offset + p_filesz` checked against `file_size` instead of the
+   slice), host-tested in `cargo:lumen-elf`.
 5. Build the new `AddressSpace` completely (`AddressSpace::from_images`,
-   the initial stack from the copied strings, `USER_STACK_SIZE` =
-   `rlimit_stack` clamped to 128 KiB..=256 MiB, rounded up to a page):
-   `-ENOMEM` if frames or heap run out. **No whole-file read:** the loader
+   the initial stack from the copied strings): `-ENOMEM` if frames or heap
+   run out. The stack's size is `rlimit_stack` clamped to 128 KiB..=256
+   MiB, rounded up to a page: lumen-vm's `USER_STACK_SIZE` (8 MiB) and
+   `USER_STACK_BOTTOM` are constants today, checked at compile time, so C2
+   makes the stack's bottom a parameter of the layout (`AddressSpace`
+   keeps it; `maps`'s `MapsLayout::stack_bottom` takes it, as it already
+   takes a value) and section 5's 8 MiB becomes the default. **No
+   whole-file read:** `ElfImage`'s `bytes` (the whole file) becomes a
+   source the loader reads segment by segment (C2 changes
+   `from_images`'s `ElfImage` to carry the file's inode, or the boot
+   module's bytes). The loader
    copies each `PT_LOAD` segment's file bytes from the page cache straight
    into the new frames, 4 KiB at a time, instead of M7's
    `read_executable` into one heap `Vec` (whose `READ_ALL_MAX`, 16 MiB,
@@ -4672,15 +4738,18 @@ leaves the caller untouched):
 6. The point of no return. Other threads: each gets `group_exit`-style
    kill and the caller waits, killable, until it is the only thread
    (Linux's `de_thread`); if the caller isn't the leader, it takes the pid
-   as its tid (Linux exchanges the tids). Then: install the new
-   `AddressSpace` (`Process::mm`), switch `CR3` to it, release a `vfork`
-   parent, drop the old one; `ProcTree::exec(pid)`; unshare a shared
+   as its tid (Linux exchanges the tids). Then, still on the old address
+   space, as Linux's `exec_mmap` runs `mm_exit_exec_release` before it
+   switches: write 0 to `clear_child_tid` and wake it (so the store lands
+   in the old space, where the waiter is), clear it and the robust list,
+   and release a `vfork` parent. Then install the new `AddressSpace`
+   (`Process::mm`), switch `CR3` to it, drop the old one;
+   `ProcTree::exec(pid)`; unshare a shared
    `Files` and close every `cloexec` descriptor (`process::release_fd`, so
    their POSIX locks go); reset every handled signal to `SIG_DFL`
    (ignored ones stay ignored), keep the mask and pending signals, clear
-   the alternate stack; reset the FPU state and `fs_base`; clear
-   `clear_child_tid` after its wake (Linux's `mm_release`, which exec runs
-   too) and the robust list; delete the process's POSIX timers; set the thread's name
+   the alternate stack; reset the FPU state and `fs_base`; delete the
+   process's POSIX timers; set the thread's name
    to the path's last component (`ThreadName::from_path`, as `linux /path`
    does) and `exe_path` to the path as given (M7's rule).
 7. Return to the new image's entry through `iretq` with M6's initial
@@ -4788,6 +4857,16 @@ documentation (the value check under the bucket lock with faults off,
 the retry after faulting the page in, the `BucketIndex` recheck on every
 return from blocking):
 
+- **Reading the word under the bucket lock:** `user::read_u32_nofault`
+  (section 6's step 6, added by B2): the ordinary `copy_from_user` can't
+  run there, since it asserts no `SpinLock` is held and its fault takes
+  Lock 1. On `Fault`, `FUTEX_WAIT` drops the bucket lock, reads the word
+  with a normal `copy_from_user` (which faults the page in; a bad address
+  is `-EFAULT`), recomputes the key and retakes the lock to check again,
+  as Linux's `futex_wait_setup` does after `futex_get_value_locked` fails
+  (a plain `get_user`, then `retry`). `FUTEX_CMP_REQUEUE` does the same
+  for `uaddr1` with both buckets released.
+
 - **Ops:** `FUTEX_WAIT` (0), `FUTEX_WAKE` (1), `FUTEX_REQUEUE` (3),
   `FUTEX_CMP_REQUEUE` (4), `FUTEX_WAIT_BITSET` (9) and `FUTEX_WAKE_BITSET`
   (10), each with or without `FUTEX_PRIVATE_FLAG` (128);
@@ -4837,9 +4916,15 @@ return from blocking):
   ptrace). musl's `pthread_mutexattr_setrobust` calls `get_robust_list`
   once and refuses robust mutexes if it fails. At a thread's exit the
   kernel walks the list as Linux's `exit_robust_list` does (at most 2048
-  entries, `ROBUST_LIST_LIMIT`): an entry whose futex word's tid bits are
-  the thread's gets `FUTEX_OWNER_DIED` and, with `FUTEX_WAITERS`, one
-  shared wake.
+  entries, `ROBUST_LIST_LIMIT`), with no lock held, reading each entry
+  with `copy_from_user` (a fault ends the walk): a futex word whose tid
+  bits are the thread's is replaced by `(word & FUTEX_WAITERS) |
+  FUTEX_OWNER_DIED` with `user::cmpxchg_u32` (section 6's step 6), retried
+  while another thread changes it meanwhile and, on `Fault`, after
+  faulting the page in writable, abandoning that entry if it can't be (as
+  Linux's `handle_futex_death` uses `futex_cmpxchg_value_locked`, then
+  `fault_in_user_writeable`), and with `FUTEX_WAITERS` it gets one shared
+  wake.
 
 `cargo:lumen-futex` checks the queues; `scenario:test_linux_proc::test_futex_timeouts_and_nanosleep`
 checks waits that time out, wakes, requeues, bitsets and private/shared
@@ -4866,8 +4951,12 @@ and C5; C6 for `rt_sigtimedwait`).
   locks inside), whose earliest deadline is also kept in an atomic. The
   boot CPU's timer tick compares that atomic with `now_ns` (one load) and,
   once it has passed, wakes the `timers` kernel thread; no signal is sent
-  from the interrupt. The thread takes each expired entry, and under the
-  process's `signal` lock either enqueues the timer's `SigInfo` (`SI_TIMER`
+  from the interrupt. The thread removes the expired entries under
+  `TIMERS` into a local list and releases it; then, with no lock held, it
+  upgrades each entry's `Weak<Process>` (a process gone is skipped, and
+  the `Arc` drops outside every `SpinLock`), and under that process's
+  `signal` lock (which comes before `TIMERS`, so a re-arm may take
+  `TIMERS` inside it) either enqueues the timer's `SigInfo` (`SI_TIMER`
   with `si_timerid` and `si_value`; `SI_KERNEL` for `ITIMER_REAL`'s
   `SIGALRM`, as Linux's `it_real_fn`) and sets `queued`, or, if its signal
   is still queued, counts an overrun; a periodic timer is re-armed by its
@@ -7717,9 +7806,10 @@ holding only locks above it.
 
 ```text
  0. Locks held across a whole call, user copies included (SleepMutex), one
-    at a time: OpenFile::pos (a read, write, readv, writev, lseek or
-    getdents64 of a regular file, a directory or a procfs file: Linux's
-    f_pos_lock) or Pipe::lock (a pipe or FIFO, lumen-pipe's contract)
+    at a time: OpenFile::pos (a B8 addition beside offset; a read, write,
+    readv, writev, lseek or getdents64 of a regular file, a directory or a
+    procfs file: Linux's f_pos_lock) or PipeObject::pipe (a pipe or FIFO,
+    lumen-pipe's contract)
  1. AddressSpace::inner (SleepMutex)
  1a. The TLB shootdown board, SHOOTDOWN (SleepMutex): taken only under
     Lock 1, with nothing numbered 2–9 held (section 5)
@@ -7783,7 +7873,9 @@ file description had one thread (M7) and becomes possible once threads,
 `fork` and `dup` share descriptions:
 
 1. **A procfs `read` racing another reader of the same description
-   dropped its offset update.** Resolved by `OpenFile::pos` (Lock 0): a
+   dropped its offset update.** Resolved by `OpenFile::pos` (Lock 0), a
+   `SleepMutex<()>` field B8 adds to lumen-vfs's `OpenFile` beside M7's
+   `offset` and `dir_cursor`: a
    `read`, `readv`, `write`, `writev`, `lseek` or `getdents64` of a regular
    file, directory or procfs file takes it before anything else and holds
    it across the user copies, so no other call on that description moves
@@ -7843,8 +7935,9 @@ fault's give-back under contention: every byte read once),
   or `Process::signal` (M8), extracts the `Arc` under
   the lock, drops the guard, and only then runs lock cleanup
   (`flock`/POSIX locks) or drops the `Arc`. The same for an
-  `Arc<AddressSpace>` (`Process::mm`) and an `Arc<Process>` leaving
-  `PROCS`.
+  `Arc<AddressSpace>` (`Process::mm`), an `Arc<Process>` leaving `PROCS`,
+  and the `Weak<Process>` entries leaving `TIMERS` (upgraded, and the
+  `Arc` dropped, only after `TIMERS` is released).
 - Never hold locks 2–9 or 9a across `copy_from_user` / `copy_to_user`
   (which may trigger `#PF` and acquire Lock 1); Lock 0 is the one
   `SleepMutex` that may be held across them.
@@ -9794,50 +9887,106 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
   (353 MiB, 289 MiB used, 3.6–4.8 s). Each gate scenario copies it with
   `rootfs.copy_dev_rootfs` (a clone on APFS, btrfs or XFS: 3 ms on macOS;
   a full copy on CI's ext4: 0.14–0.20 s) and boots it with 512 MiB of
-  guest RAM (`Machine(memory="512M")`): #344 costs a `-j1` build of its
-  C++ demo at 210–240 MiB with M7's copying loader (300–330 MiB for a file
-  including `<bits/stdc++.h>`), which the harness's default 256 MiB
-  doesn't fit; section 8's streaming loader removes the 40 MiB heap
-  high-water mark from that sum. 1 GiB would be needed only for a
-  parallel build of heavy files, which the gate doesn't run (D2 builds
-  with `make -j1`, then exercises `-j2`'s FIFO jobserver on trivial
-  rules).
+  guest RAM (`Machine(memory="512M")`; the harness's default is 256 MiB).
+- **Guest RAM for D2: 512 MiB, replacing the M8 plan's 1 GiB.** #344's
+  costs of a `make -j1` build of its C++ demo at its peak (`cc1plus -O2`
+  running), with section 8's loader (segments copied into private frames,
+  no whole-file heap buffer, so #344's 40 MiB heap high-water row is
+  gone):
+
+  | Consumer | MiB |
+  |---|---|
+  | `cc1plus`'s anonymous memory (heap, stack) | 84 (172 for a file including `<bits/stdc++.h>`) |
+  | `cc1plus`'s image, copied into private frames at `execve` | 41 |
+  | `ext4` page cache (32 after reclaim, up to the 64 MiB hard limit) | 32–64 |
+  | block cache | 4 |
+  | the `g++` driver, `make`, `sh` | about 6 |
+  | tmpfs `/tmp` (gcc's temporaries) | 0.2 |
+  | **user and cache total** | **about 167–199 (255–287 for the header file)** |
+
+  The kernel's own memory comes on top (image, frame bitmap and reference
+  counts, page tables, stacks, heap: tens of MiB), and the firmware keeps
+  some of the 512 MiB, leaving about 450–480 MiB usable: a margin of at
+  least 220 MiB for the demo and at least 140 MiB for the header file,
+  after the kernel's share. The `make -j2` step adds no compile (its rules
+  run `true`); a `-j2` build of two demo files would add about 125 MiB
+  (a second `cc1plus`'s 84 and its own 41 MiB image copy) and still fit,
+  but the gate doesn't run one. 1 GiB would be needed only for parallel
+  builds of heavy files. The numbers are #344's host measurements; D2's
+  PR checks the guest's free frames at the peak (`mem`), as a floor.
+- **The gates (D1–D4) and their scenario tests:**
+  - D1: `scenario:test_alpine::test_ash_scripts_and_pipelines` (busybox
+    `ash` scripts with pipelines, redirections, subshells, `$(...)`,
+    traps, `wait` and background jobs);
+  - D2: `scenario:test_alpine::test_gcc_gpp_compile_cpp_and_shared_lib`
+    (the dev image, 512 MiB: `make -j1` builds C++ with exceptions and a
+    `.so` and runs them, then `make -j2` on two trivial rules);
+  - D3: `scenario:test_alpine::test_local_git_and_sqlite3` (git
+    init/commit/log/diff/merge; sqlite3 with WAL and POSIX locks) and
+    `scenario:test_alpine::test_vim_edits_a_file_over_pty` (vim under
+    `ptyrun`, keys typed over the console, the file checked after);
+  - D4: `scenario:test_conformance::test_musl_libc_test_core` (below).
 - **How CI caches it.** The fetch is the one slow step: 33–44 s from
   dl-cdn on #344's Linux host, 49 minutes on a slow route from macOS.
-  `ci.yml` restores `build/deps/alpine-packages/` with its own
-  `actions/cache` entry keyed on `hashFiles('tools/alpine-packages.lock')`
-  (94.8 MiB stored), and the existing `build/deps` entry (keyed on
-  `tools/fetch-deps.sh`) leaves that directory out (`!build/deps/alpine-packages`
-  in its `path`), so the two never hold the same files; #369's `zig` and
-  `libc-test` sources get the same treatment (their own entries, left out
-  of `build/deps`'s). The image itself is not cached: it is rebuilt from
-  the packages on every run in about 5 s. The cache is not a durable
-  source: Alpine drops a superseded `-rN` package from dl-cdn, and an
-  evicted cache entry would then fail the fetch. A durable mirror (each
-  locked `.apk` as a release asset named by its sha256, the fetch trying
-  dl-cdn first and the mirror second, every file sha256-checked whichever
-  source served it) lands in its own small PR before the D2/D3/D4 gates
-  merge.
-- **libc-test (D4; built with the zig pinned by #368 and the harness of
-  #369, both proposed and not yet merged).** `make libc-test` builds
-  musl's `libc-test` (pinned commit) `src/functional` and
-  `src/regression`, static and dynamic, with `zig cc -target
-  x86_64-linux-musl` (zig 0.15.2's musl is 1.2.5, Alpine 3.21's) into
-  `build/libc-test/` (284 tests built). D4 stages that directory into an
-  image as `/libc-test`, boots it, and runs every test under libc-test's
-  own `runtest` (which forks, `execve`s, and times each out with
-  `sigtimedwait` and `kill`, so D4 needs C1, C2, C5 and C6), printing an
-  `EXIT <path> <code>` line after each; `lumen_harness.libctest` parses
-  the transcript and compares it with `tests/conformance/libc-test-xfail.txt`.
-  That list's entries each carry a reason and an issue; a runner error is
-  never covered by one; a listed test that passes fails the run (so the
-  list can't go stale); a test with no `EXIT` line counts as not run.
-  The list starts with the 10 tests that fail natively on CI's x86-64
-  Linux too (`mntent`, `strptime`, `wordexp`, `regex-backref-oob` and
-  `regexec-backref`, each static and dynamic: libc-test's tip checks
-  musl fixes newer than 1.2.5, #369's reference run), plus each test
-  Lumen fails, each with its own issue. Each test keeps runtest's 30 s
-  limit, which only a hang reaches.
+  What `ci.yml` caches today: `build/deps` (Limine, OVMF, busybox, the
+  minirootfs) in one `actions/cache` entry keyed on
+  `hashFiles('tools/fetch-deps.sh')`, and, since #369, the pinned `zig`
+  and `libc-test` sources in a second entry of their own,
+  `build/deps/zig` and `build/deps/libc-test`, keyed on
+  `hashFiles('tools/fetch-zig.sh', 'tools/fetch-libc-test.sh')`, in four
+  steps: `actions/cache/restore`; the fetch (`make deps-zig` and
+  `tools/fetch-libc-test.sh`, a 15-minute step limit); `actions/cache/save`
+  only when the fetch succeeded on a miss (so a slow but complete download
+  is kept even if a later step fails, and a failed fetch never writes the
+  key); then the build (`make libc-test`, a 10-minute limit). The two
+  entries' paths overlap (`build/deps` holds `zig` and `libc-test` too,
+  and would hold `alpine-packages`), which #369 noted and left alone.
+  **To be added** (by the durable-mirror PR below, before D2, D3 and D4
+  merge): a third entry for `build/deps/alpine-packages/`, keyed on
+  `hashFiles('tools/alpine-packages.lock')` (94.8 MiB stored), in #369's
+  four-step pattern (restore, `make deps-dev`, save on a successful fetch
+  after a miss, then `make rootfs-dev`), and exclusions in the
+  `build/deps` entry (`!build/deps/alpine-packages`, `!build/deps/zig`,
+  `!build/deps/libc-test` in its `path`) so no file sits in two entries.
+  The image itself is not cached: it is rebuilt from the packages on every
+  run in about 5 s. The cache is not a durable source: Alpine drops a
+  superseded `-rN` package from dl-cdn, and an evicted cache entry would
+  then fail the fetch. The durable mirror (each locked `.apk` as a release
+  asset named by its sha256, the fetch trying dl-cdn first and the mirror
+  second, every file sha256-checked whichever source served it) lands in
+  its own small PR with that cache step.
+- **libc-test (D4; the zig pin merged in #368, the build and harness in
+  #369).** `tools/fetch-zig.sh` (`make deps-zig`) installs zig 0.15.2 into
+  `build/deps/zig`, sha256-checked against ziglang.org's index, trying
+  ziglang.org and then two community mirrors (a source slower than
+  100 KB/s for 30 s dropped for the next), its install serialised by
+  `build/deps/zig.lock`; zig 0.15.2's musl is 1.2.5, Alpine 3.21's.
+  `make libc-test` fetches libc-test at its pinned commit
+  (`tools/fetch-libc-test.sh`, from `repo.or.cz`) and builds
+  `src/functional` and `src/regression`, static and dynamic, with `zig cc
+  -target x86_64-linux-musl` into `build/libc-test/`
+  (`tools/build-libc-test.sh`: `tests.txt`, `not-built.txt`; 284 tests
+  built, every binary's linkage checked). D4 stages that directory into an
+  image as `/libc-test` (D4 decides which image), boots it, and runs each
+  test under libc-test's own `runtest` (which forks, `execve`s, and times
+  each out with `sigtimedwait` and `kill`, so D4 needs C1, C2, C5 and C6),
+  printing an `EXIT <path> <code>` line after each, as
+  `lumen_harness.libctest`'s driver does natively (`runtest -t 30`: 30 s
+  is that harness's choice, runtest's own default is 5 s). The harness
+  parses the transcript into pass, fail and error, and compares it with
+  `tests/conformance/libc-test-xfail.txt`: each entry a test's path, a
+  reason and an issue; a runner error (`[internal]`, `[unknown]`, exit
+  255, runtest's own `exec`/`sigtimedwait`/`kill failed` lines, the
+  loader failing to start a test, status 126 or 127) is never covered by
+  one; a listed test that passes fails the run (so the list can't go
+  stale); a test with no `EXIT` line counts as not run. The checked-in
+  list is empty today (comments only). On CI's x86-64 Linux, 274 of the
+  284 pass natively (`NATIVE_PASS` in `tests/harness/test_libctest.py`,
+  recorded by #369); the 10 that fail there too (`mntent`, `strptime`,
+  `wordexp`, `regex-backref-oob` and `regexec-backref`, each static and
+  dynamic: most likely libc-test's tip checking musl fixes newer than
+  1.2.5) are added to the list by D4, with a tracking issue (a musl
+  bump), together with each test Lumen fails, each with its own issue.
 - **Which gates need the heavy tier: none in M8.** Every M8 gate runs in
   the PR tier under KVM: D1 (busybox scripts), D2 (one `-j1` C++ build of
   #344's demo, 0.85 s on the host, and a `.so`), D3 (git, sqlite3, vim)

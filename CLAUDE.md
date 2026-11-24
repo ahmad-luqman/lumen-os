@@ -921,7 +921,20 @@ one is its own PR that updates that doc first.
   `llvm-readobj` dynamic musl ELF checks, `run_busybox`: a `linux
   /bin/busybox` run's output, exit code and leaked frames (`BusyboxRun`,
   `BUSYBOX_EXIT`), #324, and `warm_up`: one uncounted
-  `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts).
+  `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts),
+  `libctest.py` (#345: musl libc-test transcripts, one `EXIT <path> <code>`
+  line per test, read as pass, fail or error, a runner error never a
+  verdict; `tests/conformance/libc-test-xfail.txt`, each entry a reason and
+  an issue, a listed pass failing the run; the built binaries' linkage
+  checked; `run_native`, the host reference run, `runtest -t 30`).
+- `tools/fetch-zig.sh` (`make deps-zig`, #368): zig 0.15.2 into
+  `build/deps/zig`, sha256-pinned per host, ziglang.org then two community
+  mirrors, installed under `build/deps/zig.lock`; a C cross-compiler for
+  host-built Linux test binaries only. `tools/build-libc-test.sh` (`make
+  libc-test`, #369, after `tools/fetch-libc-test.sh`'s pinned checkout):
+  libc-test's `src/functional` and `src/regression`, static and dynamic,
+  with `zig cc -target x86_64-linux-musl` into `build/libc-test/`
+  (`tests.txt`, `not-built.txt`).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
   assembly (`s_flags` saying signed directory hashes on every host,
   `tools/ext4-signed-hash.sh`, #308) and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
