@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import os
 import platform
+import signal
 import struct
-import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -673,27 +674,44 @@ def test_run_native_wraps_only_dynamic_tests_and_closes_each_with_its_exit_code(
     assert (segv.outcome, segv.detail) == (Outcome.ERROR, "runtest exited 139 without a FAIL line")
 
 
-def test_run_native_counts_a_runtest_that_never_ends_as_an_error(tmp_path, monkeypatch):
-    (tmp_path / "src").mkdir()
-    calls = []
+HANGING_RUNTEST = """\
+#!/bin/sh
+# A runtest that hangs with its test still running: the test (a sleep in the
+# background) writes its pid, and runtest prints a line and never ends.
+sleep 300 &
+echo $! > {pidfile}
+echo "src/functional/a.c:3: stuck"
+wait
+"""
 
-    def hang(argv, *, timeout, **kwargs):
-        calls.append(timeout)
-        # What runtest printed before it was killed comes with the exception.
-        raise subprocess.TimeoutExpired(argv, timeout, output=b"src/functional/a.c:3: stuck\n")
 
-    monkeypatch.setattr(libctest.subprocess, "run", hang)
+def test_run_native_counts_a_runtest_that_never_ends_as_an_error(tmp_path):
+    (tmp_path / "src" / "common").mkdir(parents=True)
+    runtest = tmp_path / libctest.RUNTEST
+    pidfile = tmp_path / "test.pid"
+    runtest.write_text(HANGING_RUNTEST.format(pidfile=pidfile))
+    runtest.chmod(0o755)
     transcript = libctest.run_native(
-        tmp_path, ["src/functional/a-static.exe"], loader=None, timeout_s=5, grace_s=2
+        tmp_path, ["src/functional/a-static.exe"], loader=None, timeout_s=1, grace_s=1
     )
-    assert calls == [7]
     assert transcript == (
         "src/functional/a.c:3: stuck\n"
-        "runtest did not end within 7 s\nEXIT src/functional/a-static.exe 124\n"
+        "runtest did not end within 2 s\nEXIT src/functional/a-static.exe 124\n"
     )
     r = libctest.parse(transcript).results["src/functional/a-static.exe"]
     assert r.outcome is Outcome.ERROR
-    assert r.output == ("src/functional/a.c:3: stuck", "runtest did not end within 7 s")
+    assert r.output == ("src/functional/a.c:3: stuck", "runtest did not end within 2 s")
+    # The hung test itself is gone too, not just runtest.
+    pid = int(pidfile.read_text())
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, signal.SIGKILL)
+        pytest.fail(f"the hung test (pid {pid}) outlived run_native")
 
 
 def test_run_native_refuses_a_dynamic_test_without_a_loader(tmp_path):

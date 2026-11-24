@@ -59,7 +59,9 @@ passes fails the comparison too, so the list never keeps a fixed test.
 from __future__ import annotations
 
 import enum
+import os
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -339,7 +341,9 @@ def run_native(
     (`-t timeout_s`; 30 s is this harness's choice, runtest's default is 5 s),
     and return the transcript `parse` reads. A runtest still running
     `grace_s` after its own timeout is killed and closed with exit code 124,
-    an error. Dynamic tests
+    an error. Each runtest runs in its own process group, killed whole once
+    it ends or times out, so a test (or its children) that outlives runtest
+    can't run on into the next test. Dynamic tests
     run through `loader`, a musl dynamic loader (Alpine's), as runtest's
     wrapper: this host needn't have musl installed.
 
@@ -358,27 +362,37 @@ def run_native(
                     raise ValueError(f"{test} is dynamic and no musl loader was given")
                 argv += ["-w", str(loader)]
             argv.append(test)
+            proc = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
             try:
-                proc = subprocess.run(
-                    argv,
-                    cwd=cwd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    timeout=timeout_s + grace_s,
-                    check=False,
-                )
-                out += proc.stdout.decode(errors="replace").splitlines()
+                stdout, _ = proc.communicate(timeout=timeout_s + grace_s)
+                out += stdout.decode(errors="replace").splitlines()
                 code = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
-            except subprocess.TimeoutExpired as exc:
+            except subprocess.TimeoutExpired:
                 # runtest itself hung: an error (its exit code isn't 0 or 1),
                 # after whatever it printed before it was killed.
-                if exc.output:
-                    out += exc.output.decode(errors="replace").splitlines()
+                _kill_group(proc.pid)
+                stdout, _ = proc.communicate()
+                out += stdout.decode(errors="replace").splitlines()
                 out.append(f"runtest did not end within {timeout_s + grace_s} s")
                 code = 124
+            _kill_group(proc.pid)
             out.append(f"EXIT {test} {code}")
     return "\n".join(out) + "\n"
+
+
+def _kill_group(pgid: int) -> None:
+    """SIGKILL every process left in runtest's process group, if any."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 _PT_INTERP = 3
