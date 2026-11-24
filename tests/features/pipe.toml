@@ -1,0 +1,6 @@
+# Features: pipe buffer and POSIX pipe semantics. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Pipe buffer and PIPE_BUF rules (logic)"
+milestone = "M8"
+tests = ["cargo:lumen-pipe"]

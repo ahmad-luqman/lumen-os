@@ -477,6 +477,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-pipe"
+version = "0.0.1"
+
+[[package]]
 name = "lumen-png"
 version = "0.0.1"
 dependencies = [
