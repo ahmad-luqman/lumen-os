@@ -1,14 +1,14 @@
-//! Verifies that `Pipe::read`, `Pipe::write`, `WriteProgress::step`,
-//! `fionread`, readiness predicates, and no-op/failing `set_capacity` perform
-//! zero heap allocations, using a counting global allocator in its own test
-//! binary (as in `crates/lumen-app-api/tests/decode_peak.rs`).
+//! Verifies that `Pipe::read`, `Pipe::peek`, `Pipe::consume`, `Pipe::write`,
+//! `WriteProgress::step`, `fionread`, readiness predicates, and no-op/failing
+//! `set_capacity` perform zero heap allocations, using a counting global
+//! allocator in its own test binary (as in `crates/lumen-app-api/tests/decode_peak.rs`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lumen_pipe::{
-    DEFAULT_MAX_CAPACITY, PAGE_SIZE, PIPE_BUF, Pipe, ReadOutcome, SetCapacityError, WriteOutcome, WriteProgress,
-    WriteStep,
+    ChunkError, DEFAULT_MAX_CAPACITY, PAGE_SIZE, PIPE_BUF, Pipe, ReadOutcome, SetCapacityError, WriteOutcome,
+    WriteProgress, WriteStep,
 };
 
 struct Counting;
@@ -55,8 +55,8 @@ fn count_allocs<T>(f: impl FnOnce() -> T) -> (T, usize) {
 #[test]
 fn read_and_write_perform_zero_allocations() {
     // Positive control: constructing and resizing a Pipe do allocate.
-    let (mut pipe, init_allocs) = count_allocs(Pipe::new);
-    assert!(init_allocs >= 1, "expected Pipe::new() to allocate its ring buffer");
+    let (mut pipe, init_allocs) = count_allocs(|| Pipe::try_new().unwrap());
+    assert!(init_allocs >= 1, "expected Pipe::try_new() to allocate its ring buffer");
 
     let (resized, resize_allocs) = count_allocs(|| pipe.set_capacity(2 * PAGE_SIZE, DEFAULT_MAX_CAPACITY));
     assert_eq!(resized, Ok(2 * PAGE_SIZE));
@@ -68,56 +68,95 @@ fn read_and_write_perform_zero_allocations() {
     let mut read_buf = [0u8; 3000];
 
     let (_, io_allocs) = count_allocs(|| {
-        // Repeatedly write and read across wrap boundaries.
-        for _ in 0..64 {
-            assert_eq!(pipe.write(&atomic_buf, false), WriteOutcome::Wrote(PIPE_BUF));
+        // Keep the pipe non-empty so head advances across the 8 KiB ring wrap
+        // boundary rather than resetting to 0.
+        assert_eq!(pipe.write(&[0x11; 3500]), WriteOutcome::Wrote(3500));
+        assert_eq!(pipe.read(&mut read_buf), ReadOutcome::Read(3000));
+        // 500 bytes at [3000..3500]; next 4096-byte writes and reads wrap past 8192.
+        for _ in 0..32 {
+            assert_eq!(pipe.write(&atomic_buf), WriteOutcome::Wrote(PIPE_BUF));
             assert!(pipe.readable());
-            assert!(pipe.writable());
+            assert!(!pipe.writable());
             assert!(!pipe.reader_hung_up());
             assert!(!pipe.writer_error());
-            assert_eq!(pipe.fionread(), PIPE_BUF);
+            assert_eq!(pipe.fionread(), 500 + PIPE_BUF);
 
-            assert_eq!(pipe.write(&large_buf, true), WriteOutcome::Wrote(PIPE_BUF));
-            assert!(!pipe.writable());
-            assert_eq!(pipe.write(&atomic_buf, true), WriteOutcome::WouldBlock);
-            assert_eq!(pipe.write(&large_buf, true), WriteOutcome::WouldBlock);
+            // Partial non-blocking write fills the remaining 3596 bytes across the wrap.
+            assert_eq!(pipe.write(&large_buf), WriteOutcome::Wrote(2 * PAGE_SIZE - 500 - PIPE_BUF));
+            assert_eq!(pipe.write(&atomic_buf), WriteOutcome::WouldBlock);
+            assert_eq!(pipe.write(&large_buf), WriteOutcome::WouldBlock);
 
             // Same-size and failing set_capacity must also allocate nothing.
             assert_eq!(pipe.set_capacity(2 * PAGE_SIZE, DEFAULT_MAX_CAPACITY), Ok(2 * PAGE_SIZE));
             assert_eq!(pipe.set_capacity(PAGE_SIZE, DEFAULT_MAX_CAPACITY), Err(SetCapacityError::Busy));
             assert_eq!(
                 pipe.set_capacity(DEFAULT_MAX_CAPACITY + 1, DEFAULT_MAX_CAPACITY),
-                Err(SetCapacityError::TooLarge)
+                Err(SetCapacityError::OverLimit)
             );
+            assert_eq!(pipe.set_capacity((1usize << 31) + 1, DEFAULT_MAX_CAPACITY), Err(SetCapacityError::Invalid));
 
-            // Drain across multiple reads.
-            let mut total_read = 0;
-            while total_read < 2 * PIPE_BUF {
-                match pipe.read(&mut read_buf, false) {
-                    ReadOutcome::Read(n) => total_read += n,
+            // Drain back down to 500 bytes (bounded loop, never resetting head to 0).
+            let mut drained = 0usize;
+            let target = 2 * PAGE_SIZE - 500;
+            for _ in 0..16 {
+                let want = (target - drained).min(read_buf.len());
+                if want == 0 {
+                    break;
+                }
+                match pipe.read(&mut read_buf[..want]) {
+                    ReadOutcome::Read(n) => drained += n,
                     other => panic!("unexpected read: {other:?}"),
                 }
             }
-            assert_eq!(pipe.fionread(), 0);
-            assert_eq!(pipe.read(&mut read_buf, true), ReadOutcome::WouldBlock);
+            assert_eq!(drained, target);
+            assert_eq!(pipe.fionread(), 500);
         }
 
-        // WriteProgress loop with zero allocations.
-        let mut progress = WriteProgress::new(large_buf.len());
-        assert_eq!(progress.step(&mut pipe, &large_buf), WriteStep::Done(large_buf.len()));
-        assert_eq!(pipe.read(&mut read_buf, false), ReadOutcome::Read(3000));
-        assert_eq!(pipe.read(&mut read_buf, false), ReadOutcome::Read(large_buf.len() - 3000));
+        // Position head at 8000 (500 bytes spanning [8000..8192] and [0..308])
+        // so peek and consume also execute their wrap-around path.
+        assert_eq!(pipe.write(&atomic_buf), WriteOutcome::Wrote(PIPE_BUF));
+        assert_eq!(pipe.write(&[0x22; 520]), WriteOutcome::Wrote(520));
+        assert_eq!(pipe.read(&mut read_buf), ReadOutcome::Read(3000));
+        assert_eq!(pipe.read(&mut read_buf[..1616]), ReadOutcome::Read(1616));
+        assert_eq!(pipe.fionread(), 500);
+        let peeked = pipe.peek(&mut read_buf);
+        assert_eq!(peeked, 500);
+        pipe.consume(500);
+        assert_eq!(pipe.fionread(), 0);
+        assert_eq!(pipe.read(&mut read_buf), ReadOutcome::WouldBlock);
 
-        // Reader/writer counts, EOF, and Broken paths.
-        pipe.add_writer();
-        assert_eq!(pipe.close_writer(), 1);
-        assert_eq!(pipe.close_writer(), 0);
+        // Exercise WriteProgress::step across Continue, NeedSpace (partial and
+        // zero), ChunkError, and Done with zero allocations.
+        let mut progress = WriteProgress::new(3 * PIPE_BUF);
+        assert_eq!(progress.step(&mut pipe, &[]), Err(ChunkError::Empty));
+        assert_eq!(progress.step(&mut pipe, &atomic_buf), Ok(WriteStep::Continue { wrote_now: PIPE_BUF }));
+        assert_eq!(progress.step(&mut pipe, &atomic_buf), Ok(WriteStep::NeedSpace { wrote_now: PIPE_BUF }));
+        assert_eq!(progress.step(&mut pipe, &atomic_buf), Ok(WriteStep::NeedSpace { wrote_now: 0 }));
+        assert_eq!(pipe.read(&mut read_buf), ReadOutcome::Read(3000));
+        assert_eq!(pipe.read(&mut read_buf), ReadOutcome::Read(3000));
+        assert_eq!(progress.step(&mut pipe, &atomic_buf), Ok(WriteStep::Done(3 * PIPE_BUF)));
+
+        // Drain the rest (bounded).
+        for _ in 0..16 {
+            if pipe.is_empty() {
+                break;
+            }
+            let _ = pipe.read(&mut read_buf);
+        }
+        assert!(pipe.is_empty());
+
+        // Open/release ends, EOF, and Broken paths.
+        pipe.open_writer();
+        assert_eq!(pipe.release_writer(), 1);
+        assert_eq!(pipe.release_writer(), 0);
         assert!(pipe.reader_hung_up());
-        assert_eq!(pipe.read(&mut read_buf, false), ReadOutcome::Eof);
+        assert_eq!(pipe.read(&mut read_buf), ReadOutcome::Eof);
 
-        assert_eq!(pipe.close_reader(), 0);
+        assert_eq!(pipe.release_reader(), 0);
         assert!(pipe.writer_error());
-        assert_eq!(pipe.write(&atomic_buf, false), WriteOutcome::Broken);
+        assert_eq!(pipe.write(&atomic_buf), WriteOutcome::Broken);
+        let mut broken_prog = WriteProgress::new(PIPE_BUF);
+        assert_eq!(broken_prog.step(&mut pipe, &atomic_buf), Ok(WriteStep::Broken { written: 0 }));
     });
 
     assert_eq!(io_allocs, 0, "expected zero heap allocations during pipe I/O, got {io_allocs}");
