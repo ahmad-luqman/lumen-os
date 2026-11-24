@@ -61,9 +61,11 @@ jobs:
       # musl libc-test (#345): the pinned zig and libc-test checkout, keyed on
       # the scripts that pin them (each also checks its own stamp), then the
       # build, which tests/harness/test_libctest.py checks and runs natively.
-      # Restored and saved as two steps, the save right after the build, so a
-      # slow download is kept even when a later step fails (actions/cache's
-      # own save runs only at the end of a successful job).
+      # Restore, fetch, save, build: the save follows the fetch alone, so a
+      # slow but complete download is kept even if the build or a later step
+      # fails (actions/cache's own save runs only at the end of a successful
+      # job). Never after a failed fetch: a cache key is written once, and a
+      # partial save would keep its key from ever holding a good copy.
       - name: Restore the pinned zig and libc-test sources
         id: libc-test-cache
         uses: actions/cache/restore@v6
@@ -72,17 +74,21 @@ jobs:
             build/deps/zig
             build/deps/libc-test
           key: zig-libc-test-${{ runner.os }}-${{ hashFiles('tools/fetch-zig.sh', 'tools/fetch-libc-test.sh') }}
-      - name: Build musl libc-test with the pinned zig
-        timeout-minutes: 10
-        run: make libc-test
+      - name: Fetch the pinned zig and libc-test sources
+        id: libc-test-fetch
+        timeout-minutes: 15
+        run: make deps-zig && tools/fetch-libc-test.sh
       - name: Save the pinned zig and libc-test sources
-        if: steps.libc-test-cache.outputs.cache-hit != 'true'
+        if: steps.libc-test-fetch.outcome == 'success' && steps.libc-test-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
             build/deps/zig
             build/deps/libc-test
           key: ${{ steps.libc-test-cache.outputs.cache-primary-key }}
+      - name: Build musl libc-test with the pinned zig
+        timeout-minutes: 10
+        run: make libc-test
       - run: make test-host
       - name: QEMU scenarios (boot, crash reports, in-kernel tests, golden images)
         id: scenarios

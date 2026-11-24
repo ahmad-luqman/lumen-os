@@ -10,6 +10,7 @@ import platform
 import struct
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from lumen_harness import BUILD_DIR, libctest
@@ -92,57 +93,100 @@ def test_a_leading_dot_slash_and_surrounding_blanks_are_tolerated():
         # A bracket runtest doesn't print.
         (["FAIL src/functional/a.exe [status 0]"], "could not run it"),
         (["FAIL src/functional/a.exe [exploded]"], "could not run it"),
-        # runtest's own error lines, though it then prints a status or a
-        # signal: the child's execv failing (the test, or its loader as the
-        # wrapper), and the parent's fork, sigtimedwait, kill or waitpid.
+        # runtest's own error lines (strings of the built runtest-static.exe,
+        # t_error's `src/common/runtest.c:<line>: ` first), each with the
+        # ending runtest gives it: the child's execv failing (the test, or
+        # the loader as its wrapper) ends `[status 1]`; a sigtimedwait
+        # failure kills the test, `[signal Killed]`; a kill failure, anything.
         (
             [
-                "src/functional/a.exe exec failed: Exec format error",
+                "src/common/runtest.c:29: src/functional/a.exe exec failed: Exec format error",
                 "FAIL src/functional/a.exe [status 1]",
             ],
             "runner trouble",
         ),
         (
             [
-                "/lib/ld-musl-x86_64.so.1 exec failed: No such file or directory",
+                (
+                    "src/common/runtest.c:29: /lib/ld-musl-x86_64.so.1 exec failed: "
+                    "No such file or directory"
+                ),
                 "FAIL src/functional/a.exe [status 1]",
             ],
             "runner trouble",
         ),
         (
             [
-                "src/functional/a.exe sigtimedwait failed: Interrupted system call",
+                (
+                    "src/common/runtest.c:80: src/functional/a.exe sigtimedwait failed: "
+                    "Interrupted system call"
+                ),
                 "FAIL src/functional/a.exe [signal Killed]",
             ],
             "runner trouble",
         ),
         (
             [
-                "src/functional/a.exe kill failed: No such process",
-                "FAIL src/functional/a.exe [status 1]",
-            ],
-            "runner trouble",
-        ),
-        (
-            [
-                "src/functional/a.exe fork failed: Resource temporarily unavailable",
-                "FAIL src/functional/a.exe [status 1]",
-            ],
-            "runner trouble",
-        ),
-        (
-            [
-                "src/functional/a.exe waitpid failed: No child processes",
+                "src/common/runtest.c:82: src/functional/a.exe kill failed: No such process",
                 "FAIL src/functional/a.exe [timed out]",
             ],
             "runner trouble",
         ),
-        # The program never ran: not executable, or not found (musl's loader
-        # exits 127 for a missing library).
+        (
+            [
+                "src/common/runtest.c:82: src/functional/a.exe kill failed: No such process",
+                "FAIL src/functional/a.exe [status 1]",
+            ],
+            "runner trouble",
+        ),
+        # fork and waitpid failures end `FAIL <path> [internal]` and exit 255.
+        (
+            [
+                (
+                    "src/common/runtest.c:72: src/functional/a.exe fork failed: "
+                    "Resource temporarily unavailable"
+                ),
+                "FAIL src/functional/a.exe [internal]",
+                "EXIT255",
+            ],
+            "exited 255 after FAIL [internal]",
+        ),
+        (
+            [
+                "src/common/runtest.c:85: src/functional/a.exe waitpid failed: No child processes",
+                "FAIL src/functional/a.exe [internal]",
+                "EXIT255",
+            ],
+            "exited 255 after FAIL [internal]",
+        ),
+        # musl 1.2.5's loader, as the wrapper, failing to start the test and
+        # exiting 1 (ldso/dynlink.c's own text).
+        (
+            [
+                (
+                    "/lib/ld-musl-x86_64.so.1: cannot load src/functional/a.exe: "
+                    "No such file or directory"
+                ),
+                "FAIL src/functional/a.exe [status 1]",
+            ],
+            "runner trouble",
+        ),
+        (
+            [
+                "/lib/ld-musl-x86_64.so.1: src/functional/a.exe: Not a valid dynamic program",
+                "FAIL src/functional/a.exe [status 1]",
+            ],
+            "runner trouble",
+        ),
+        # The program never ran: not executable, or musl's loader failing to
+        # load a library (`_exit(127)`, its message as dynlink.c prints it).
         (["FAIL src/functional/a.exe [status 126]"], "never ran"),
         (
             [
-                "Error loading shared library libfoo.so: No such file or directory",
+                (
+                    "Error loading shared library src/functional/a_dso.so: "
+                    "No such file or directory (needed by src/functional/a.exe)"
+                ),
                 "FAIL src/functional/a.exe [status 127]",
             ],
             "never ran",
@@ -164,11 +208,20 @@ def test_runner_trouble_is_an_error_not_a_failure(lines, why):
     assert why in r.detail
 
 
-def test_a_test_s_own_line_about_a_failed_exec_is_still_its_verdict():
-    # t_error's `file.c:line:` first word is the test's, not runtest's.
+@pytest.mark.parametrize(
+    "line",
+    [
+        # The test's own t_error lines name its file, not runtest's.
+        "src/functional/spawn.c:40: /bin/true exec failed: No such file or directory",
+        "src/regression/x.c:12: child kill failed: No such process",
+        # A loader message about another program is the test's business.
+        "/lib/ld-musl-x86_64.so.1: cannot load src/functional/other.exe: No such file",
+        "/lib/ld-musl-x86_64.so.1: ./helper: Not a valid dynamic program",
+    ],
+)
+def test_a_test_s_own_lines_about_failed_programs_are_still_its_verdict(line):
     run = libctest.parse(
-        "src/functional/spawn.c:40: exec failed: No such file or directory\n"
-        "FAIL src/functional/spawn.exe [status 1]\nEXIT src/functional/spawn.exe 1\n"
+        f"{line}\nFAIL src/functional/spawn.exe [status 1]\nEXIT src/functional/spawn.exe 1\n"
     )
     r = run.results["src/functional/spawn.exe"]
     assert (r.outcome, r.detail) == (Outcome.FAIL, "status 1")
@@ -483,7 +536,8 @@ def test_read_elf_refuses_a_section_name_table_past_the_sections(tmp_path):
 def test_linkage_problems_name_each_binary_built_unlike_libc_tests_build(tmp_path):
     loader = b"/lib/ld-musl-x86_64.so.1"
     binaries = {
-        libctest.RUNTEST: _elf(loader, stack=0),
+        # The runner is checked as a test is: here every way at once.
+        libctest.RUNTEST: _elf(loader, stack=16 << 20, sections=(".text", ".debug_info")),
         "src/functional/good-static.exe": _elf(None, stack=0, sections=(".text", ".comment")),
         "src/functional/good.exe": _elf(loader, stack=0),
         "src/functional/a-static.exe": _elf(loader, stack=0),
@@ -510,6 +564,8 @@ def test_linkage_problems_name_each_binary_built_unlike_libc_tests_build(tmp_pat
     problems = libctest.linkage_problems(tmp_path)
     assert [p.split(": ", 1)[0] for p in problems] == [
         libctest.RUNTEST,
+        libctest.RUNTEST,
+        libctest.RUNTEST,
         "src/functional/a-static.exe",
         "src/functional/a.exe",
         "src/functional/b.exe",
@@ -520,14 +576,16 @@ def test_linkage_problems_name_each_binary_built_unlike_libc_tests_build(tmp_pat
         "src/functional/debug_dso.so",
         "src/regression/ubsan_dso.so",
     ], problems
-    assert "static by name" in problems[0]
-    assert "static by name" in problems[1]
-    assert "dynamic by name" in problems[2] and "dynamic by name" in problems[3]
-    assert "16777216-byte stack" in problems[4]
-    assert "UBSan" in problems[5]
-    assert "keeps debug sections (.debug_info)" in problems[6]
-    assert "keeps debug sections (.debug_line)" in problems[8]
-    assert "UBSan" in problems[9]
+    assert "keeps debug sections (.debug_info)" in problems[0]
+    assert "16777216-byte stack" in problems[1]
+    assert "static by name" in problems[2]
+    assert "static by name" in problems[3]
+    assert "dynamic by name" in problems[4] and "dynamic by name" in problems[5]
+    assert "16777216-byte stack" in problems[6]
+    assert "UBSan" in problems[7]
+    assert "keeps debug sections (.debug_info)" in problems[8]
+    assert "keeps debug sections (.debug_line)" in problems[10]
+    assert "UBSan" in problems[11]
 
 
 def _tree(root, binaries: dict[str, bytes]) -> None:
@@ -621,17 +679,21 @@ def test_run_native_counts_a_runtest_that_never_ends_as_an_error(tmp_path, monke
 
     def hang(argv, *, timeout, **kwargs):
         calls.append(timeout)
-        raise subprocess.TimeoutExpired(argv, timeout)
+        # What runtest printed before it was killed comes with the exception.
+        raise subprocess.TimeoutExpired(argv, timeout, output=b"src/functional/a.c:3: stuck\n")
 
     monkeypatch.setattr(libctest.subprocess, "run", hang)
     transcript = libctest.run_native(
         tmp_path, ["src/functional/a-static.exe"], loader=None, timeout_s=5, grace_s=2
     )
     assert calls == [7]
-    assert transcript == ("runtest did not end within 7 s\nEXIT src/functional/a-static.exe 124\n")
+    assert transcript == (
+        "src/functional/a.c:3: stuck\n"
+        "runtest did not end within 7 s\nEXIT src/functional/a-static.exe 124\n"
+    )
     r = libctest.parse(transcript).results["src/functional/a-static.exe"]
     assert r.outcome is Outcome.ERROR
-    assert r.output == ("runtest did not end within 7 s",)
+    assert r.output == ("src/functional/a.c:3: stuck", "runtest did not end within 7 s")
 
 
 def test_run_native_refuses_a_dynamic_test_without_a_loader(tmp_path):
@@ -964,10 +1026,12 @@ NATIVE_PASS: frozenset[str] = frozenset(
 )
 
 
-def test_the_native_reference_run_passes_the_recorded_set():
+def _native_host_or_skip() -> Path:
+    """The musl loader for dynamic tests, on an x86-64 Linux host with the
+    build and `make deps` (failing rather than skipping on CI's)."""
     if sys.platform != "linux" or platform.machine() not in ("x86_64", "AMD64"):
         pytest.skip(
-            f"the native reference run needs an x86-64 Linux host (CI's), not "
+            f"running the built tests needs an x86-64 Linux host (CI's), not "
             f"{sys.platform} {platform.machine()}"
         )
     _require_build()
@@ -976,6 +1040,28 @@ def test_the_native_reference_run_passes_the_recorded_set():
         if ON_CI_LINUX:
             pytest.fail(f"{loader} is missing: CI runs `make deps` first")
         pytest.skip(f"no {loader} for the dynamic tests (run `make deps`)")
+    return loader
+
+
+def test_the_real_runner_s_trouble_on_a_missing_test_is_an_error():
+    """The built runtest (and musl's loader as its wrapper) on test paths
+    that don't exist: their real error lines, read as runner trouble."""
+    loader = _native_host_or_skip()
+    static, dynamic = "src/functional/no-such-test-static.exe", "src/functional/no-such-test.exe"
+    assert not (BUILD / static).exists() and not (BUILD / dynamic).exists()
+    transcript = libctest.run_native(BUILD, [static, dynamic], loader=loader, timeout_s=10)
+    r = libctest.parse(transcript).results
+    assert set(r) == {static, dynamic}, transcript
+    for test in (static, dynamic):
+        assert r[test].outcome is Outcome.ERROR, transcript
+        assert "runner trouble" in r[test].detail, transcript
+    # runtest's own execv failing, and musl's loader unable to load the test.
+    assert f"src/common/runtest.c:29: {static} exec failed: " in r[static].detail
+    assert f": cannot load {dynamic}: " in r[dynamic].detail
+
+
+def test_the_native_reference_run_passes_the_recorded_set():
+    loader = _native_host_or_skip()
     tests = libctest.read_tests()
     transcript = libctest.run_native(BUILD, tests, loader=loader)
     run = libctest.parse(transcript)

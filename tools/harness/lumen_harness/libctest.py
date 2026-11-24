@@ -27,14 +27,28 @@ Each test is a pass, a fail or an error:
   verdict, so an expected-failure entry may cover them);
 - error: anything else: runtest's own failures (`[internal]`, `[unknown]`,
   exit 255), an exit code runtest never returns, a FAIL line naming another
-  test, or one that disagrees with the exit code. Also runner trouble that
-  runtest reports as a status or signal: one of runtest's own error lines in
-  the output (`<argv0> exec failed: ...`, then `[status 1]`, when the test
-  or its loader couldn't be executed; `fork`, `sigtimedwait`, `kill` and
-  `waitpid` failures, the second ending in `[signal Killed]`), or
-  `[status 126]` or `[status 127]` (the shell's and musl's loader's "can't
-  run it", a missing library among them). An error is a broken run, not a
-  verdict, and no expected-failure entry covers it.
+  test, or one that disagrees with the exit code. runtest's `fork` and
+  `waitpid` failures are among these (`FAIL <path> [internal]`, exit 255).
+  Also runner trouble that runtest reports as a status or a signal:
+  - one of runtest's own error lines in the output, which t_error prefixes
+    with runtest's source location: `src/common/runtest.c:29: <argv0> exec
+    failed: ...` (the test, or the loader given as runtest's wrapper,
+    couldn't be executed: then `[status 1]`), `src/common/runtest.c:80:
+    <argv0> sigtimedwait failed: ...` (then runtest kills the test:
+    `[signal Killed]`) and `src/common/runtest.c:82: <argv0> kill failed:
+    ...` (whatever follows);
+  - musl's loader, as runtest's wrapper, failing to start the test (then
+    `[status 1]`): `<ldname>: cannot load <path>: <error>` and `<ldname>:
+    <path>: Not a valid dynamic program` (ldso/dynlink.c), naming the test;
+  - `[status 126]` or `[status 127]`: the test never ran. runtest calls
+    execv itself, so there is no shell; a 127 is musl's loader failing to
+    load a library or relocate (`Error loading shared library ... (needed by
+    ...)`, `Error relocating ...`), and a 126 can come only from the test
+    or the wrapper itself.
+  The tests' own t_error lines start with `src/functional/` or
+  `src/regression/`, never runtest's file, so they stay the test's verdict.
+  An error is a broken run, not a verdict, and no expected-failure entry
+  covers it.
 
 tests/conformance/libc-test-xfail.txt lists the tests expected to fail, one
 per line: the test's path, then `# <reason> #<issue>`, the issue that will fix
@@ -66,12 +80,29 @@ _TEST = re.compile(r"^src/(?:functional|regression)/[A-Za-z0-9_.+-]+\.exe$")
 _EXIT = re.compile(r"^EXIT (\S+) (\d+)$")
 _FAIL = re.compile(r"^FAIL (\S+) \[(.*)\]$")
 _STATUS = re.compile(r"^status ([1-9]\d*)$")
-# runtest's own error lines (t_error("%s exec failed: %s\n", argv[0], ...)):
-# its first word is a program path, never a test's `file.c:line:`.
-_RUNNER_TROUBLE = re.compile(r"^\S*[^:\s] (exec|fork|sigtimedwait|kill|waitpid) failed: ")
+# runtest's own error lines: t_error("%s exec failed: %s\n", argv[0], ...)
+# prints `src/common/runtest.c:<line>: ` first (test.h's T_LOC1), so the
+# file tells them from a test's own t_error lines.
+_RUNNER_TROUBLE = re.compile(
+    r"^src/common/runtest\.c:\d+: \S+ (exec|fork|sigtimedwait|kill|waitpid) failed: "
+)
+# musl 1.2.5's loader failing to start the program it was given, before
+# exiting 1 (ldso/dynlink.c): `%s: cannot load %s: %s` and `%s: %s: Not a
+# valid dynamic program`, ldname then the program's path.
+_LOADER_CANNOT_LOAD = re.compile(r"^\S+: cannot load (\S+): ")
+_LOADER_NOT_DYNAMIC = re.compile(r"^\S+: (\S+): Not a valid dynamic program$")
 # Exit statuses meaning the program never ran: 126 (found, not executable)
-# and 127 (not found; musl's loader for a missing library too).
+# and 127 (not found; musl's loader for a missing library or a failed
+# relocation, ldso/dynlink.c's `_exit(127)`).
 _NOT_RUN_STATUSES = {"status 126", "status 127"}
+
+
+def _loader_failure(test: str, line: str) -> bool:
+    """Whether `line` is musl's loader failing to start `test`."""
+    m = _LOADER_CANNOT_LOAD.match(line) or _LOADER_NOT_DYNAMIC.match(line)
+    return m is not None and m.group(1).removeprefix("./") == test
+
+
 _XFAIL = re.compile(r"^(?P<test>\S+)\s+#\s*(?P<reason>\S.*?)\s+#(?P<issue>[1-9]\d*)$")
 
 
@@ -130,7 +161,9 @@ def _classify(test: str, code: int, lines: list[str]) -> Result:
         return error(f"runtest exited {code} without a FAIL line")
     if code != 1:
         return error(f"runtest exited {code} after FAIL [{why}]")
-    trouble = [line for line in output if _RUNNER_TROUBLE.match(line)]
+    trouble = [
+        line for line in output if _RUNNER_TROUBLE.match(line) or _loader_failure(test, line)
+    ]
     if trouble:
         return error(f"runner trouble, not the test's verdict: {trouble[0]} (FAIL [{why}])")
     if why in _NOT_RUN_STATUSES:
@@ -337,8 +370,11 @@ def run_native(
                 )
                 out += proc.stdout.decode(errors="replace").splitlines()
                 code = proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
-            except subprocess.TimeoutExpired:
-                # runtest itself hung: an error (its exit code isn't 0 or 1).
+            except subprocess.TimeoutExpired as exc:
+                # runtest itself hung: an error (its exit code isn't 0 or 1),
+                # after whatever it printed before it was killed.
+                if exc.output:
+                    out += exc.output.decode(errors="replace").splitlines()
                 out.append(f"runtest did not end within {timeout_s + grace_s} s")
                 code = 124
             out.append(f"EXIT {test} {code}")

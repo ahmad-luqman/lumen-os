@@ -11,9 +11,15 @@
 #
 # Lines that are empty or start with `#` are comments. A test is listed only
 # for a failure (`[status N]`, `[signal ...]` or `[timed out]`). A runner
-# error is never expected: runtest's own trouble (`[internal]`, `[unknown]`,
-# its `exec failed:`, `fork failed:`, `sigtimedwait failed:`, `kill failed:`
-# or `waitpid failed:` lines) and `[status 126]` or `[status 127]` (a program
-# or library that couldn't be run) are errors, whatever this list says. A
-# listed test that passes fails the run, so remove its line in the PR that
+# error is never expected, whatever this list says:
+#   - `[internal]` or `[unknown]` (runtest's fork or waitpid failing among
+#     them, exit 255);
+#   - runtest's own lines `src/common/runtest.c:<line>: <program> exec
+#     failed: ...`, `... sigtimedwait failed: ...` or `... kill failed: ...`,
+#     though runtest then prints a status or a signal;
+#   - musl's loader failing to start the test (`<loader>: cannot load <test>:
+#     ...`, `<loader>: <test>: Not a valid dynamic program`, then status 1);
+#   - `[status 126]` or `[status 127]`: the test never ran (not executable, a
+#     missing library, a failed relocation).
+# A listed test that passes fails the run, so remove its line in the PR that
 # fixes it.

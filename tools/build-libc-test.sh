@@ -141,7 +141,8 @@ fi
 
 # why <binary>: the first error its compile or link printed (libc-test's
 # rules keep each one's output in <object>.o.err or <object>.lo.err, and
-# <binary>.ld.err for a program or <library>.so.err for a library).
+# <binary>.ld.err for a program or <name>.so.err for a library: its rule
+# writes $@.err).
 why() {
     local bin=$OUT/$1 obj
     obj="${bin%.so}"
