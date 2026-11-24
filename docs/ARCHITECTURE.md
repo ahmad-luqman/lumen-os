@@ -976,13 +976,11 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       Lock 4, through `mmap_page`); a dropped page stays alive, pinned by its
       mapping, until the unmap. `invalidate_file_from` works only on
       the address space loaded on the calling CPU (debug-asserted: the flush is a
-      local `invlpg`) until M8's shootdowns (B7, below). Subsequent accesses in the
+      local `invlpg`) until M8's shootdowns (B5, below). Subsequent accesses in the
       caller's space fault into `BusError` / `SIGBUS`, so its later file
       growth can't split-brain against stale mapped frames; another process's
-      mappings still can until those land. (In M8, multi-process mappings snapshot active
-      `Weak<AddressSpace>` holders outside the inode lock and invalidate each
-      after the truncate, as the caller's own space is: B7, in "Copy-on-write
-      `fork` and TLB shootdowns" below.)
+      mappings still can until B7 ("Copy-on-write `fork` and TLB
+      shootdowns", below) reaches every space mapping the file.
     - `msync(addr, len, flags)` (syscall 26) returns `0` immediately on
       `len == 0`, or a `len` within a page of 2^64 (Linux's rounding wraps
       it to 0), after validating page-aligned `addr` and valid `flags`;
@@ -1054,10 +1052,10 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
 
 ### Copy-on-write `fork` and TLB shootdowns (designed in #336, M8)
 
-Issues: B4 (frame reference counts, copy-on-write), B5 (the shootdown IPI
-and its call sites), B7 (truncate reaching every address space), C5 (faults
-as signals). M8 keeps 4-level paging, no PCID, and no global bit on any
-mapping.
+Issues (section 8's table, "M8's issues"): B4 (frame reference counts,
+copy-on-write), B5 (the shootdown IPI and its call sites), B7 (truncate
+reaching every address space), C5 (faults as signals). M8 keeps 4-level
+paging, no PCID, and no global bit on any mapping.
 
 **Frame reference counts (B4).** A private user frame (anonymous memory,
 a copy-on-write copy of a file page, the loader's copies of an image) can
@@ -1086,9 +1084,10 @@ is the number of user page-table leaves (present or `PTE_PROTNONE`, never
 - Kernel frames (page tables, heap, stacks, DMA) never have a count;
   page-cache pages keep M7's `Arc<CachePage>` pins in `pinned_pages`.
 
-**Copy-on-write `fork` (B4: `AddressSpace::fork_copy(&self) ->
-Result<AddressSpace, UserVmError>`).** Under the parent's Lock 1, with the
-child new and unshared:
+**Copy-on-write `fork` (B4: `AddressSpace::fork_copy(self: &Arc<Self>) ->
+Result<Arc<AddressSpace>, UserVmError>`, taking and returning `Arc`s so it
+can register the child's `Weak` as a mapper, below).** Under the parent's
+Lock 1, with the child new and unshared:
 1. Copy the VMA map, the break, `images` and `mapped_files` (each
    `KeptFile` cloned, the child registered as a mapper of each file, below).
 2. Walk the parent's lower half:
@@ -1114,22 +1113,30 @@ child new and unshared:
    child can run, so no CPU still writes through a writable entry the walk
    took away.
 
-A failure part way frees the child (its `drop` decrements what it counted)
-and leaves the parent's leaves read-only, which only costs a fault each.
-`mprotect` keeps a private leaf whose count is above 1 read-only when it
-grants `PROT_WRITE` (M7 sets `WRITABLE` from the VMA directly; Linux's
-`can_change_pte_writable` refuses the same).
+A failure part way leaves the parent's leaves read-only, which only costs
+a fault each, and drops the child after the parent's Lock 1 is released
+(its `drop` decrements what it counted). In a private VMA
+(`Backing::Anonymous { shared: false }` or a `MAP_PRIVATE` file),
+`mprotect` keeps a leaf whose count is above 1 read-only when it grants
+`PROT_WRITE` (M7 sets `WRITABLE` from the VMA directly; Linux's
+`can_change_pte_writable` refuses the same); in a shared anonymous VMA it
+sets `WRITABLE` from the VMA as M7 does, since those frames are shared on
+purpose.
 
 **The copy-on-write split (B4).** A write fault, under Lock 1, on a
-private present leaf that isn't writable in a writable VMA (`PTE_SHARED ==
-0`; section 5's file-page split for `PTE_SHARED` leaves is unchanged):
+private present leaf (`PTE_SHARED == 0`) that isn't writable in a
+writable **private** VMA (`Backing::Anonymous { shared: false }` or a
+`MAP_PRIVATE` file; a shared anonymous VMA's leaves are always mapped with
+the VMA's rights, so they never take this path; section 5's file-page split
+for `PTE_SHARED` leaves is unchanged):
 - count 1: the frame is this space's alone; set `WRITABLE`, `invlpg`
   locally, `Resolved` (an upgrade needs no shootdown: another CPU's stale
   read-only entry only faults, and the fault finds the leaf writable,
   M7's "already writable" path);
 - count above 1: `frame::alloc_user()` (`OutOfMemory` if none), copy the 4
   KiB, replace the leaf with the copy (writable), shoot the page down in
-  this space, then `dec` the old frame's count. The shootdown comes before
+  this space (`tlb::shoot_down(space, Shoot::Pages(page))`), then `dec`
+  the old frame's count. The shootdown comes before
   the decrement: a CPU still holding the old read-only entry must not
   read a frame the other holder may now reuse writable.
 
@@ -1139,7 +1146,12 @@ count (`fork` under that space's Lock 1), so a count of 1 seen under Lock 1
 stays 1.
 
 **TLB shootdown (B5).** Vector `0x3e` (`TLB_SHOOTDOWN`, reserved since M1),
-`kernel/src/mm/tlb.rs` beside M1's stack-retire generations:
+`kernel/src/mm/tlb.rs` beside M1's stack-retire generations. B5 owns the
+one entry point, `tlb::shoot_down(space: &AddressSpace, what: Shoot)`
+with `enum Shoot { Pages(Range<u64>), Full }`; until B5 merges, B4 calls a
+local-flush version of the same signature, which is exact while every
+process is single-threaded and pinned (M7's invariant, unchanged until C3
+and B6).
 - **Who may hold an entry:** each `AddressSpace` has `active: AtomicU64`,
   one bit per CPU. The context switch sets this CPU's bit in the next
   thread's space before it loads that root into `CR3`, and clears it in
@@ -1163,8 +1175,9 @@ stays 1.
   which flushes every non-global entry). The wait spins with interrupts on
   (`debug_assert!(irq::enabled() && irq::depth() == 0)`), so this CPU
   keeps taking interrupts, shootdowns and M1's `WAKEUP` included; it warns
-  every 2 s while a CPU hasn't answered (host-timed, `klog::HOST_TIMED`)
-  and keeps waiting, since the frames can't be freed before.
+  every 2 s while a CPU hasn't answered (host-timed: B5 adds the line to
+  `klog.py`'s `HOST_TIMED`) and keeps waiting, since the frames can't be
+  freed before.
 - **The handler:** if this CPU's `CR3` is the request's root, flush the
   range (or reload `CR3`); store the generation in `ACKED[cpu]`; EOI. It
   takes no lock.
@@ -1186,29 +1199,33 @@ whose `active` has another CPU in it:
   NX or becomes `PTE_PROTNONE`; an upgrade needs none;
 - `fork_copy`'s write-protect (a full flush) and the copy-on-write split
   (one page);
+- section 5's `MAP_PRIVATE` file-page split (one page): the fault replaces
+  the `PTE_SHARED` leaf after `MappedPage::copy_to_frame` has released Lock
+  5, shoots the page down, and drops the old pin only after the
+  acknowledgements;
 - `invalidate_file_from`, in each space it reaches (B7, below);
-- not `teardown` or `drop`: `teardown`, after switching its own CPU to
-  `kernel_root()`, waits until the space's `active` is empty (the other
-  threads' CPUs switching away from their last run of it) before it frees
-  anything, and `drop` runs only once no CPU holds the root.
+- not `teardown` or `drop`: `teardown` (run by whoever lowers the space's
+  `users` to 0, section 8: the last thread of the last process using it,
+  or `execve` letting its old space go), after switching its own CPU off
+  the space, waits until the space's `active` is empty (another thread's
+  CPU still running its last instructions on the root, a killed thread's
+  included) before it frees anything, and `drop` runs only once no CPU
+  holds the root.
 
-Tested by `ktest:lumen_kernel::mm::tlb_shootdown_across_cpus` (a page
-mapped and read on four CPUs, unmapped on one: none reads the old frame
-after the call returns; a full flush past 32 pages; a target that switched
-away answers through `active`), `ktest:lumen_kernel::mm::frame::refcount_and_cow_split`
-(counts through `fork_copy`, a split at count 2 and the reuse at 1,
-teardown freeing exactly the frames it owned) and
-`scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
-(threads on every CPU reading a page another thread unmaps or protects:
-each gets `SIGSEGV` afterwards, none reads stale data; C11).
+Tested by `ktest:lumen_kernel::mm::tlb::shootdown_across_cpus`,
+`ktest:lumen_kernel::mm::frame::refcount_and_cow_split`,
+`ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only`
+and `scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
+(section 15, "M8's tests", says what each checks).
 
 **Truncate reaching every address space (B7).** M7's
 `invalidate_file_from` works on the caller's space only. In M8 each
-inode's `PageCache` keeps `mappers: SpinLock<Vec<Weak<AddressSpace>>>` (a
-section 9 level-10 leaf): `mmap_file` registers its space when it adds the
-file's `mapped_files` entry (under Lock 1, before any fault can map a page
-of it; `fork_copy` registers the child), and the entry's removal
-unregisters it, dead `Weak`s pruned at each registration. A shrinking
+inode's `PageCache` keeps `mappers: SpinLock<Vec<Weak<AddressSpace>>>` (section
+9's level 10c): `AddressSpace::mmap_file` takes `self: &Arc<Self>` and
+registers the space when it adds the file's `mapped_files` entry (under
+Lock 1, before any fault can map a page of it; `fork_copy` registers the
+child), and the entry's removal unregisters it, dead `Weak`s pruned at
+each registration. A shrinking
 `truncate`, `ftruncate` or `openat(O_TRUNC)`, once the inode's truncate
 has returned and with no lock held, snapshots the list (each `Weak`
 upgraded, outside the list's lock) and calls `invalidate_file_from(file_id,
@@ -1217,21 +1234,16 @@ shootdown, so a page another process mapped from a stale size snapshot is
 unmapped as M7's rule unmaps the caller's (a space registered after the
 snapshot mapped nothing before the truncate). Tested by
 `ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space`
-(two spaces mapping one file, a third forked from one: after the truncate
-none reads past the new end).
+(section 15).
 
 **Faults as signals (C5).** Where M6 and M7 end the process
 (`UserExit::Fault`, `UserExit::BusError`, `UserExit::NonCanonicalRip`),
-M8 queues a synchronous signal to the faulting thread and returns to user
-mode through section 6's delivery: an invalid `#PF` is `SIGSEGV` with
-`si_addr` = `CR2` (`SEGV_MAPERR` with no VMA there, `SEGV_ACCERR` with a
-VMA that refuses the access); a `FaultResult::BusError` is `SIGBUS`
-`BUS_ADRERR` with `si_addr` = `CR2`; `OutOfMemory` is `SIGKILL` (Linux's
-out-of-memory handling ends a process too). Section 6 lists the other
-exceptions. With the default action the process dies by that signal
-(status `128 + n` in a shell: `exit=135` for `SIGBUS`, as M7 prints
-already, and `exit=139` for `SIGSEGV`); the M6 and M7 scenarios matching
-the old exit lines move to the signal's in C5's PR.
+M8 queues a synchronous signal to the faulting thread (section 6's table,
+`#PF`'s row: `SIGSEGV`, or `SIGBUS` for a `FaultResult::BusError`, with
+`si_addr` = `CR2`). With the default action the process dies by that
+signal (status `128 + n` in a shell: `exit=135` for `SIGBUS`, as M7
+prints already, and `exit=139` for `SIGSEGV`); the M6 and M7 scenarios
+matching the old exit lines move to the signal's in C5's PR (section 15).
 
 ### Kernel stacks (built in M1)
 
@@ -1617,8 +1629,7 @@ weakening crash reporting or `make audit`.
   and `swapgs` before `iretq`. For IST vectors—`#DF`, `NMI`, `#MC`, plus
   **`#DB` (vector 1, `IST_DEBUG = 4`, guarded IST stack registered as
   `StackKind::Debug` in `lumen-mm::stacks` as each CPU's 5th permanent stack;
-  `MAX_STACKS` is raised to 512 in M8 for multithreaded workloads, section
-  6's "Kernel threads")** so a ring-3
+  `MAX_STACKS` goes to 512 in M8, "Kernel threads")** so a ring-3
   `MOV SS`/`POP SS` + `SYSCALL` with `TF = 1` (CVE-2018-8897) cannot deliver
   `#DB` onto untrusted user `RSP` at `LSTAR`—an exception can arrive in the
   `syscall` entry or exit `swapgs` window with `CS == KERNEL_CODE`. Those IST
@@ -1670,18 +1681,18 @@ weakening crash reporting or `make audit`.
     ring-0 `#GP` (section 6, "Signals", designed in #336): an `MXCSR` with a
     bit outside the CPU's `MXCSR_MASK` is refused (`FpError::Mxcsr`, so the
     thread gets `SIGSEGV`), on the FX-only and the XSAVE path alike. Linux
-    ends the same way by another road: its 64-bit `restore_fpregs_from_user`
-    runs `FXRSTOR`/`XRSTOR` on the user frame under an exception fixup, and
-    the `#GP` such an `MXCSR` raises fails the restore (any trap but `#PF`),
-    so `rt_sigreturn` sends `SIGSEGV`; its explicit `MXCSR` check is on the
-    ia32 path (`restore_from_ia32_fxstate`). The crate also refuses the
-    value when the frame's features leave SSE out, stricter than Linux;
+    gets the same `SIGSEGV` from the `#GP` its 64-bit `FXRSTOR`/`XRSTOR` of
+    the user frame raises under an exception fixup
+    (`restore_fpregs_from_user`; its explicit `MXCSR` check is the ia32
+    path's). The crate also refuses the value when the frame's features
+    leave SSE out, stricter than Linux;
     `XSTATE_BV` outside the enabled features or a non-zero `XCOMP_BV` is
     refused too (`FpError::Features`, `FpError::Reserved`). Bad software
     metadata in the frame's `_fpx_sw_bytes` (`magic1`, `xstate_size`,
     `extended_size`, `magic2`) is not an error: the restore falls back to the
     legacy FX area alone (`FpFallback`), with the extended state reset, as
-    Linux's `check_xstate_in_sigframe` does. Pure kernel threads carry no FPU buffer. Because kernel code uses
+    Linux's `check_xstate_in_sigframe` does. Pure kernel threads carry no
+    FPU buffer. Because kernel code uses
     no SIMD/x87, user FPU state is saved/restored only on thread context
     switches and signal delivery/return (M8), not on every syscall.
   - **`make audit` exemption (hard rule 3):** `lumen_fpu_save` and
@@ -1736,32 +1747,39 @@ weakening crash reporting or `make audit`.
      the fixup path clears `AC` in `frame.rflags`.
   6. **Non-faulting user access (designed in #336, M8; added by B2).** No B
      issue in the M8 plan owns the user-copy primitives, so B2, the
-     foundation `futex` (C4) waits on, adds two more beside the copies
-     above, for code that must touch user memory while it holds a
-     `SpinLock` (a futex bucket) or must not fault pages in:
+     foundation `futex` (C4) waits on, adds three beside the copies above:
      - `user::read_u32_nofault(addr) -> Result<u32, Fault>`: a 4-byte,
        4-byte-aligned load;
      - `user::cmpxchg_u32(addr, expected, new) -> Result<u32, Fault>`: a
-       `lock cmpxchg` on user memory, returning the value it found.
+       `lock cmpxchg` on user memory, returning the value it found;
+     - `user::fault_in_writable(addr) -> Result<(), Fault>`: resolves a
+       write fault at `addr` under Lock 1, as a store there would (demand
+       paging, copy-on-write, dirty promotion), and stores nothing, as
+       Linux's `fault_in_user_writeable` does (`fixup_user_fault` with
+       `FAULT_FLAG_WRITE`); called with no lock held.
 
-     Both check the range as step 2 does, and register their one faulting
-     instruction each in a separate read-only section,
-     `.lumen_fixup_nofault` (placed and audited as `.lumen_fixup` is). The
-     `#PF` handler looks a ring-0 fault's `rip` up there at its first step,
-     with `CR2` read and interrupts still off, before the step-2 assertion
-     (`irq::depth() == 0`, which a caller holding a bucket lock fails), and
-     before it enables interrupts or takes Lock 1: it sets `rip` to the
-     fixup (clearing `AC` as step 4 does) and returns, so the call answers
-     `Err(Fault)` and no page is faulted in (Linux's `pagefault_disable`
-     around `get_user`/`futex_atomic_cmpxchg_inatomic`). Neither resolves
-     a fault (a kernel address is `Err(Fault)` from the range check): a
-     caller that gets `Fault` releases its locks and faults the page in
-     with a normal `copy_from_user` (or, to check it is writable, a
-     one-byte `copy_to_user` of the value it just read), then retries.
-     Tested by `ktest:lumen_kernel::user::nofault_access_answers_fault_without_paging_in`
+     The first two may run with a `SpinLock` held (a futex bucket) and never
+     fault a page in. They check the range as step 2 does, and register
+     their one faulting instruction each in a separate read-only section,
+     `.lumen_fixup_nofault` (placed and audited as `.lumen_fixup` is: B2
+     extends `audit:flags`'s section check to it,
+     `harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata`).
+     The `#PF` handler looks a ring-0 fault's `rip` up there at its first
+     step, with `CR2` read and interrupts still off, before the step-2
+     assertion (`irq::depth() == 0`, which a caller holding a bucket lock
+     fails), and before it enables interrupts or takes Lock 1: it sets
+     `rip` to the fixup (clearing `AC` as step 4 does) and returns, so the
+     call answers `Err(Fault)` (Linux's `pagefault_disable` around
+     `get_user`/`futex_atomic_cmpxchg_inatomic`). A kernel address is
+     `Err(Fault)` from the range check. A caller that gets `Fault` releases
+     its locks, faults the page in (`copy_from_user` to read it,
+     `fault_in_writable` to write it) and retries. Tested by
+     `ktest:lumen_kernel::user::nofault_access_answers_fault_without_paging_in`
      (an unmapped, a not-yet-faulted and a read-only page, each under a
      held `SpinLock`: `Fault`, nothing mapped; then a mapped page's read
-     and exchange).
+     and exchange; `fault_in_writable` on a not-yet-faulted and a
+     copy-on-write page, after which the exchange succeeds and the word
+     is unchanged by the fault-in).
 
 ### Signals: delivery, frames and `rt_sigreturn` (designed in #336, M8)
 
@@ -1775,57 +1793,71 @@ the syscalls.
 - **Sending:** under the target process's `signal` lock: drop the signal
   if it is ignored and not blocked by every thread that could take it (a
   stop or continue signal still runs `PendingSignals::prepare_signal`);
-  `SIGCONT` resumes a stopped group at once (C6); otherwise
+  `SIGCONT` resumes a stopped group at once (C6, below); otherwise
   `PendingSignals::enqueue` (`Target::Process` for `kill`, `Target::Thread`
   for `tkill`, `tgkill`, a fault and `SIGEV_THREAD_ID`), then pick the
   thread to tell: the target thread, or `select_target` with the process's
-  threads as `ThreadCandidate`s and the process's cursor; set its
-  `sigpending` and `sched::kick` it (section 8, "One interruptible,
-  killable blocking wait"). `SIGKILL`, and a signal whose default action
-  kills when it is the action and the chosen thread doesn't block it, set
-  `group_exit` there (Linux's `complete_signal`).
-- **Where pending signals are checked:** on every return to ring 3, with
-  interrupts on: at the end of each syscall (`SyscallExit::new(orig_rax)`
-  as the syscall context), and when `lumen_isr_common` returns to ring 3
-  from an interrupt or exception (context `None`), the timer's preemption
+  threads as `ThreadCandidate`s and `SignalState::preferred` as the cursor
+  (moved to the answer); a `None` answer (every thread blocks it, or is
+  exiting) leaves the signal pending for the first thread to unblock it.
+  The chosen thread gets `sigpending` and `sched::kick` (section 8, "One
+  interruptible, killable blocking wait"). `SIGKILL`, and a signal whose
+  default action kills when it is the action and the chosen thread
+  doesn't block it, set `group_exit` there (Linux's `complete_signal`).
+- **Where pending signals are checked:** in the syscall-exit hook B2 adds
+  (section 8), run on every return to ring 3 with interrupts on: at the
+  end of each syscall (`SyscallExit::new(orig_rax)` as the syscall
+  context), and when `lumen_isr_common` returns to ring 3 from an
+  interrupt or exception (context `None`), the timer's preemption
   included. If `sigpending` is set: a `group_exit` ends the thread (section
-  8, "Exit"); a group stop parks it (C6: a killable wait until `SIGCONT` or
-  `SIGKILL`, the parent told through `ProcTree::stop`'s `StateChange`);
-  otherwise `PendingSignals::dequeue(slot, blocked)` takes the next one,
-  and its disposition decides: ignored, dropped; default `Term` or `Core`,
-  a group exit with `ExitStatus::Killed`; default `Stop`, a group stop
-  (`SIGTSTP`, `SIGTTIN` and `SIGTTOU` dropped for an orphaned process
-  group, as Linux's `get_signal`); a handler, a frame (below). The loop
-  runs until nothing deliverable is left, then clears `sigpending` under
-  the lock; the final check with interrupts off (before `sysretq` or
-  `iretq`) loops again if a sender set it meanwhile, as Linux's
-  `exit_to_user_mode_loop`. A syscall's restart code is resolved here
-  (section 8's restart codes), even when no signal is delivered.
+  8, "Exit"); a group stop parks it (below); otherwise
+  `PendingSignals::dequeue(slot, blocked)` takes the next one, and its
+  disposition decides: ignored, dropped; default `Term` or `Core`, a group
+  exit with `ExitStatus::Killed`; default `Stop`, a group stop (`SIGTSTP`,
+  `SIGTTIN` and `SIGTTOU` dropped for an orphaned process group, as
+  Linux's `get_signal`); a handler, a frame (below). The loop runs until
+  nothing deliverable is left, then clears `sigpending` under the lock;
+  the final check with interrupts off (before `sysretq` or `iretq`) loops
+  again if a sender set it meanwhile, as Linux's `exit_to_user_mode_loop`.
+- **Stop and continue (C6):** a stop signal's dequeue sets `group_stop`
+  under `signal` and kicks the other threads; each parks in a killable
+  wait whose `ready()` reads `Process::stopped`, an atomic mirror of
+  `group_stop` written under `signal`. The last thread to park makes the
+  transition under `PROCS` then `signal`, re-checking `group_stop` under
+  both: `ProcTree::stop(pid, sig)`, whose `StateChange` wakes the parent's
+  waits and sends it `SIGCHLD` (`CLD_STOPPED`) unless its disposition is
+  `SIG_IGN` or it set `SA_NOCLDSTOP`. `SIGCONT`'s send clears `group_stop`
+  and `stopped` and wakes the parked threads, and `ProcTree::cont` and its
+  `StateChange` (`CLD_CONTINUED`) run in a `PROCS` then `signal` hold.
 - **The frame:** `lumen_fpu_save` into the thread's own buffer first, then
   `lumen_signal::frame::build(FrameInput { registers, fp, info, saved_mask,
-  blocked, handler, alt_stack, syscall, user_cs: 0x23, user_ss: 0x1b })`:
-  `registers` from the syscall or trap frame, `fp` the thread's own
-  `FXSAVE`/`XSAVE` bytes, `saved_mask` the thread's `saved_mask` (taken:
-  `rt_sigsuspend`, `ppoll`, `pselect6`) or else its mask, `handler` the
-  `KernelSigaction` (`SA_RESETHAND` applied at the dequeue, before the
-  build, as the crate requires). `build` applies the restart decision to
-  the saved registers. Its `FrameImage` is copied to `new_rsp()` with
-  `copy_to_user`, no lock held. On success the kernel installs
-  `blocked_during_handler` and `alt_stack_during_handler` under the
-  `signal` lock, resets the FPU to its initial state (Linux's
+  blocked, handler, alt_stack, syscall, user_cs, user_ss })`, with
+  `user_cs`/`user_ss` the GDT's `USER_CODE`/`USER_DATA` selectors (section
+  6's ring-3 entry): `registers` from the syscall or trap frame, `fp` the
+  thread's own `FXSAVE`/`XSAVE` bytes, `saved_mask` the thread's
+  `saved_mask` (taken: `rt_sigsuspend`, `ppoll`, `pselect6`) or else its
+  mask, `handler` the `KernelSigaction` (`SA_RESETHAND` applied at the
+  dequeue, before the build, as the crate requires). `build` applies the
+  restart decision to the saved registers. Its `FrameImage` is copied to
+  `new_rsp()` with `copy_to_user`, no lock held. On success the kernel
+  installs `blocked_during_handler` and `alt_stack_during_handler` under
+  the `signal` lock, resets the FPU to its initial state (Linux's
   `fpu__clear_user_states`), loads `entry()` into the user frame (`rip`
   the handler, `rsp` the frame, `rdi` the signal, `rsi` the `siginfo`,
   `rdx` the `ucontext`) and returns through `iretq`, M6's path for a
   rewritten frame, with its final `RFLAGS` mask and canonical-`rip` check.
-  A `build` error or a copy that faults forces `SIGSEGV` (Linux's
-  `force_sigsegv`: the default action, unblocked), with the restart code
-  still in the registers resolved by that delivery, as the crate's docs
-  say; neither the mask nor the alternate stack changes.
+  A `build` error or a copy that faults is Linux's `force_sigsegv(sig)`:
+  if the failed signal was `SIGSEGV` itself, `SIGSEGV`'s action is reset
+  to the default and unblocked, so it kills; otherwise `SIGSEGV` is sent
+  as `force_sig` sends it, so an unblocked `SIGSEGV` handler (on the
+  alternate stack, say) runs. The restart code still in the registers is
+  resolved by that delivery, as the crate's docs say; neither the mask
+  nor the alternate stack changes.
 - **`rt_sigreturn` (15):** the frame starts 8 bytes below the entry `rsp`
   (the handler's `ret` popped `pretcode`). Copy `FRAME_SIZE` bytes, then
   the FP area in the crate's two phases (`FpSnapshot`: 512 bytes, then
   `xstate_size + 4` when `magic1` matches and the size is in
-  576..=the CPU's), each `copy_from_user`, a fault forcing `SIGSEGV`. Call
+  576..=the CPU's), each with `copy_from_user`. Call
   `frame::restore(bytes, fp, config, alt_stack, entry_rsp)` with
   `RestoreConfig { current_rflags: the user's r11 at entry, user_cs,
   user_ss, mxcsr_mask, enabled_xfeatures: XCR0, xsave_size, xfeature_layout
@@ -1838,9 +1870,10 @@ the syscalls.
   its mask initialized, as the crate requires); no FP image, the initial
   state; the registers loaded into the user frame; the restart block
   cleared and no syscall context, so its `rax` is never taken for a
-  restart code; then `iretq` through the same final checks. A
-  `RestoreError` forces `SIGSEGV`. The `MXCSR`, `XSTATE_BV` and `XCOMP_BV`
-  checks are `restore`'s (section 6's user FP state).
+  restart code; then `iretq` through the same final checks. A copy fault
+  or a `RestoreError` sends `SIGSEGV` with `force_sig`, as Linux's
+  `rt_sigreturn` does through `signal_fault`. The `MXCSR`, `XSTATE_BV` and
+  `XCOMP_BV` checks are `restore`'s (section 6's user FP state).
 - **`sigaltstack`:** `AltStack::configure` with the caller's `rsp`; a
   thread's alternate stack is cleared by `clone(CLONE_VM)` without
   `CLONE_VFORK` and by `execve`.
@@ -1865,7 +1898,7 @@ the syscalls.
   | `#OF` (4), `#BR` (5), `#GP` (13), a non-canonical return `rip` | `SIGSEGV`, `SI_KERNEL`, 0 |
   | `#UD` (6) | `SIGILL`, `ILL_ILLOPN`, the faulting `rip` |
   | `#NP` (11), `#SS` (12) | `SIGBUS`, `SI_KERNEL`, 0 |
-  | `#PF` (14) | `SIGSEGV`, `SEGV_MAPERR` (no VMA) or `SEGV_ACCERR`, `CR2`; `SIGBUS`, `BUS_ADRERR`, `CR2` for `FaultResult::BusError`; `SIGKILL` for `OutOfMemory` |
+  | `#PF` (14) | `SIGSEGV`, `SEGV_MAPERR` (no VMA) or `SEGV_ACCERR`, `CR2`; `SIGBUS`, `BUS_ADRERR`, `CR2` for `FaultResult::BusError`; `SIGKILL` for `OutOfMemory` (a deviation: Linux runs its out-of-memory killer and retries the fault) |
   | `#MF` (16), `#XM` (19) | `SIGFPE`, the code from the unmasked exception bits (Linux's `fpu__exception_code`), the faulting `rip` |
   | `#AC` (17) | `SIGBUS`, `BUS_ADRALN`, 0 |
 
@@ -1874,15 +1907,8 @@ the syscalls.
   does. The one `WARN` M6 logs for a fatal ring-3 fault stays, for a
   fault whose signal kills the process.
 - Tested by `cargo:lumen-signal`, `scenario:test_linux_proc::test_signals_and_sigaltstack`
-  (handlers with `SA_SIGINFO` on and off an alternate stack, `SA_RESTART`,
-  `SA_RESETHAND`, `SA_NODEFER`, masks, `kill`/`tkill`/`tgkill`, `raise`, a
-  handled `SIGSEGV` reading `si_addr` = the faulting address, `SIGBUS`
-  past a file's end, a corrupted frame's `rt_sigreturn` killing with
-  `SIGSEGV`, XMM registers and `MXCSR` surviving a handler) and
-  `scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait` (C6:
-  `EINTR` and restarts from a blocking `read`, `wait4`, `nanosleep` and
-  `pselect6`, `SIGCHLD` waking `rt_sigsuspend`, stop and continue with
-  `WUNTRACED`/`WCONTINUED`).
+  and `scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait`
+  (section 15, "M8's tests", says what each checks).
 
 ### Kernel threads (built in M2)
 
@@ -2072,16 +2098,15 @@ threads move to idle CPUs:
 - **Tick counts (C12):** each timer tick charges the running thread's user
   or system count by the interrupted `CS`, for `getrusage`, `wait4`'s
   `rusage` and `sysinfo`-style totals.
-- Tested by `ktest:lumen_kernel::sched::threads_migrate_to_idle_cpus`
-  (migratable spinning threads started on one CPU each run on another
-  within a bounded number of balance passes, counted in passes, not time),
+- Tested by `ktest:lumen_kernel::sched::threads_migrate_to_idle_cpus`,
   `ktest:lumen_kernel::sched::pinned_threads_never_migrate`,
-  `ktest:lumen_kernel::sched::nice_scales_slices` (slice lengths in ticks
-  for nice -20, 0 and 19, from the table) and
+  `ktest:lumen_kernel::sched::nice_scales_slices`,
+  `ktest:lumen_kernel::sched::migration_keeps_user_state` and
   `scenario:test_smp::test_multithreaded_workload_uses_all_cpus` (C11:
-  every CPU's tick count for one process's threads grows).
+  threads pinned to each CPU, confirmed by `getcpu`, each make progress;
+  section 15, "M8's tests", says what each checks).
 
-**`MAX_STACKS` (B6, C3).** The stack registry's 128 slots hold five
+**`MAX_STACKS` (C3).** The stack registry's 128 slots hold five
 permanent stacks per CPU (40 at `MAX_CPUS` = 8) and every thread's
 stack. Each user thread has a kernel stack, and the gates run tens of
 processes and threads at once (make, the compiler driver and its
@@ -3946,7 +3971,8 @@ Lumen runs two kinds of user code:
 1. **Sandboxed WASM apps (M5, built):** run by `wasmi` on kernel threads with
    explicit capability handles (`Log`, `Time`, `Desktop`, `Window`, `Trace`),
    described in "Apps: WASM modules in the kernel" below.
-2. **Native ring-3 Linux x86-64 processes (M6 built, M7–M10 planned):**
+2. **Native ring-3 Linux x86-64 processes (M6 built, M7 built, M8
+   designed in #336, M9–M10 planned):**
    unmodified Linux `x86_64` ELF binaries (targeting Alpine Linux `musl`)
    entering through the standard Linux `syscall` ABI. Starting in M11, each
    Linux process/sandbox can be confined by capability-scoped VFS mount
@@ -4220,6 +4246,54 @@ each issue in the last column replaces its stubs. New clusters:
 follows section 8's three rules. "Interrupted" below means B2's wait
 returned `Interrupted`, and names the restart code the handler returns.
 
+**M8's issues.** The labels every M8 section uses, filed from this design
+once it merges (epic #335):
+
+| Label | Scope | Sections |
+|---|---|---|
+| B0 | the skeleton: `M8_SYSCALLS`, a typed `-ENOSYS` stub per row in the module below, `m8_abi_constants_match_spec`, `syscalls.py`'s `PLANNED` changes and `ENOSYS_BY_DECISION`, the census coverage test, empty scenario files, `tools/linux-m8/` | 8, 15 |
+| B1 | the process/thread split, behaviour unchanged: `Process`, `UserThread`, `PROCS`, tids, pid 1, `set_tid_address` on the new model | 8 |
+| B2 | the interruptible, killable wait, `kick`, the syscall-exit hook and restart resolution, `restart_syscall`, non-faulting user access | 6, 8 |
+| B3 | the readiness interface, `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds | 10 |
+| B4 | frame reference counts, `mm_users`, copy-on-write `fork_copy` | 5 |
+| B5 | the TLB shootdown IPI and `tlb::shoot_down` | 5, 9 |
+| B6 | SMP migration, work stealing, priorities, affinity | 6 |
+| B7 | truncate reaching every address space | 5 |
+| B8 | the five M8 hazards (section 9) | 9 |
+| C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | 8 |
+| C2 | `execve` (single-threaded), `#!`, the streaming loader | 8 |
+| C3 | threads: `clone`'s thread flags, `de_thread`, `MAX_STACKS` | 6, 8 |
+| C4 | `futex`, robust lists, `nanosleep`/`clock_nanosleep` | 8 |
+| C5 | signal delivery, frames, `rt_sigreturn`, `sigaltstack`, `kill`/`tkill`/`tgkill`, `rt_sigqueueinfo`, faults as signals | 6 |
+| C6 | `EINTR`/`SA_RESTART` everywhere, the signal waits, `pause`, `SIGCHLD`, stop and continue | 6, 8 |
+| C7 | pipes, FIFOs and `mknod`, `dup*`, `SIGPIPE` | 10 |
+| C8 | sessions and process groups | 8 |
+| C9 | PTYs, controlling terminals, job control, hangup | 10 |
+| C10 | the console as a tty | 10 |
+| C11 | multithreaded and cross-CPU scenarios | 5, 6, 15 |
+| C12 | the small syscalls and the census's leftovers | 8 |
+| C13 | `setitimer`/`alarm`/`getitimer` and POSIX timers (new: not in the epic's first list) | 8 |
+| D1–D4 | the gates: ash, gcc/g++ and make, git/sqlite3/vim, libc-test | 15 |
+
+B0's stub modules, by row: `syscall/task.rs` (`clone`, `fork`, `vfork`,
+`execve`, `exit`, `exit_group`, `wait4`, `waitid`, `getpid`, `gettid`,
+`getppid`, `set_tid_address`, the session and group calls), `syscall/signal.rs`
+(the `rt_sig*` calls, `sigaltstack`, `kill`, `tkill`, `tgkill`, `pause`,
+`restart_syscall`), `syscall/futex.rs` (`futex`, the robust-list calls,
+`nanosleep`, `clock_nanosleep`), `syscall/poll.rs` (`poll`, `ppoll`,
+`select`, `pselect6`), `syscall/pipe.rs` (`pipe`, `pipe2`, `dup`, `dup2`,
+`dup3`, `mknod`, `mknodat`), `syscall/timer.rs` (`alarm`, `getitimer`,
+`setitimer`, the `timer_*` calls), `syscall/sys.rs` (the rest: `sched_*`,
+priorities, `getrusage`, `sysinfo`, `prctl`, `statfs`, `fstatfs`,
+`clock_getres`, `getcpu`, `setfsuid`, `setfsgid`, `prlimit64`'s write).
+B0's `syscalls.py` changes: `PLANNED["M8"]` gains `sysinfo` (from M10),
+`pause`, `alarm`, `getitimer`, `setitimer`, `timer_create`,
+`timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete`,
+`mknod`, `mknodat`, `setfsuid`, `setfsgid`, `getcpu`, `set_robust_list`,
+`get_robust_list`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo` and
+`restart_syscall`; `PLANNED["M10"]` loses `sysinfo`; `ENOSYS_BY_DECISION`
+holds the "Stays `-ENOSYS`" list below.
+
 | # | Syscall | M8 behaviour | Issue |
 |---|---|---|---|
 | 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block), as Linux's `poll` | B3 |
@@ -4228,7 +4302,7 @@ returned `Interrupted`, and names the restart code the handler returns.
 | 15 | `rt_sigreturn()` | section 6, "Signals"; returns the restored `rax`; a frame `restore` refuses forces `SIGSEGV` | C5 |
 | 16 | `ioctl(fd, req, arg)` | M7's, plus `FIONREAD` on a pipe (`Pipe::fionread`) and the tty requests on PTYs and on the console as a tty (section 10, including the census's `TCFLSH`) | C7, C9, C10 |
 | 22 | `pipe(fds)` | `pipe2(fds, 0)` | C7 |
-| 23 | `select(n, readfds, writefds, exceptfds, tv)` | `n < 0` `-EINVAL`, `n` capped at `MAX_FDS`; a set naming a closed fd `-EBADF`; a negative `tv` field `-EINVAL`; bad pointers `-EFAULT`; a descriptor is readable for `POLLIN_SET`, writable for `POLLOUT_SET`, exceptional for `POLLEX_SET` (`fs/select.c`'s sets, `POLLPRI` alone for exceptions: never set on a pipe, PTY or the console, so the census's vim exception set on its pty is simply never ready); writes the time left back to `tv` (not for a zero timeout), as Linux; interrupted `-ERESTARTNOHAND` | B3 |
+| 23 | `select(n, readfds, writefds, exceptfds, tv)` | `n < 0` `-EINVAL`, `n` capped at `MAX_FDS`; a set naming a closed fd `-EBADF`; a negative `tv` field `-EINVAL`; bad pointers `-EFAULT`; a descriptor is readable for `POLLIN_SET`, writable for `POLLOUT_SET`, exceptional for `POLLEX_SET` (`fs/select.c`'s sets: `POLLEX_SET` is `POLLPRI \| POLLNVAL`, and `POLLNVAL` is in all three, though a closed fd is `-EBADF` before any mask is read; `POLLPRI` is never set on a pipe, PTY or the console, so the census's vim exception set on its pty is simply never ready); writes the time left back to `tv` (not for a zero timeout), as Linux; interrupted `-ERESTARTNOHAND` | B3 |
 | 24 | `sched_yield()` | `sched::yield_now`; 0 | C12 |
 | 32 | `dup(oldfd)` | the lowest free fd, `FD_CLOEXEC` clear, looked up and installed in one hold of the FD table (section 9's fourth hazard); `-EBADF`, `-EMFILE` | C7 |
 | 33 | `dup2(oldfd, newfd)` | `oldfd == newfd`: `newfd` if open, else `-EBADF`; `newfd >= MAX_FDS` `-EBADF`; a `newfd` reserved by an open still in progress `-EBUSY`, as Linux's `do_dup2`; a displaced descriptor closed through `process::release_fd` after the table's lock is released | C7 |
@@ -4264,10 +4338,10 @@ returned `Interrupted`, and names the restart code the handler returns.
 | 130 | `rt_sigsuspend(mask, sigsetsize)` | `sigsetsize != 8` `-EINVAL`; keeps the mask in `saved_mask`, installs `mask`, waits, interruptible; always `-ERESTARTNOHAND` (the handler's frame saves `saved_mask`, so `rt_sigreturn` restores it) | C6 |
 | 131 | `sigaltstack(ss, old)` | `AltStack::configure` and `status` (`StackError::errno`: `-EPERM` on the stack, `-ENOMEM` below `MINSIGSTKSZ`, `-EINVAL`); `-EFAULT` | C5 |
 | 133 | `mknod(path, mode, dev)` | `mknodat(AT_FDCWD, path, mode, dev)` | C7 |
-| 137 | `statfs(path, buf)` | resolves `path` as `stat` does, then the filesystem's `FileSystem::statfs` (a lumen-vfs interface addition, C12): `f_type` (`EXT4_SUPER_MAGIC` 0xEF53, `TMPFS_MAGIC` 0x01021994 for tmpfs and devfs, `PROC_SUPER_MAGIC` 0x9FA0), `f_bsize` and `f_frsize` 4096, block and inode counts (ext4's superblock; a tmpfs mount's quota), `f_fsid` from the dev id, `f_namelen` 255, `f_flags` with `ST_RDONLY` on a read-only mount; `-EFAULT` | C12 |
+| 137 | `statfs(path, buf)` | resolves `path` as `stat` does, then the filesystem's `FileSystem::statfs` (a lumen-vfs interface addition, C12): `f_type` (`EXT4_SUPER_MAGIC` 0xEF53, `TMPFS_MAGIC` 0x01021994 for tmpfs and devfs, `PROC_SUPER_MAGIC` 0x9FA0), `f_bsize` and `f_frsize` 4096, block and inode counts (ext4's superblock; a tmpfs mount's quota), `f_fsid` from the dev id, `f_namelen` 255, `f_flags` `ST_VALID` with the mount's flags (`ST_RDONLY` on a read-only mount), as Linux's `calculate_f_flags`; `-EFAULT` | C12 |
 | 138 | `fstatfs(fd, buf)` | the same for a descriptor's file (`O_PATH` too) | C12 |
-| 140 | `getpriority(which, who)` | `PRIO_PROCESS` (0: the caller), `PRIO_PGRP`, `PRIO_USER` (every process: uid 0); returns `20 - nice` of the highest-priority match, as the Linux syscall does (libc turns it back); `-ESRCH` if none, a bad `which` `-EINVAL` | C12 |
-| 141 | `setpriority(which, who, prio)` | the same targets; `prio` clamped to -20..=19, every thread of each process set (B6's `nice`); lowering it is allowed (root) | C12 |
+| 140 | `getpriority(which, who)` | `PRIO_PROCESS`: one thread (0: the caller; else the thread `who` names, a pid naming its leader), as Linux's `find_task_by_vpid`; `PRIO_PGRP` and `PRIO_USER` (uid 0: every process): every thread of the matching processes; returns `20 - nice` of the highest-priority match, as the Linux syscall does (libc turns it back); `-ESRCH` if none, a bad `which` `-EINVAL` | C12 |
+| 141 | `setpriority(which, who, prio)` | the same targets (`PRIO_PROCESS` one thread, the others every matching thread); `prio` clamped to -20..=19 into B6's `nice`; lowering it is allowed (root) | C12 |
 | 157 | `prctl(option, ...)` | `PR_SET_NAME` (15): up to 16 bytes, cut to 15 and a NUL, as the thread's name (`ThreadName`); `PR_GET_NAME` (16): 16 bytes; every other option `-EINVAL` | C12 |
 | 186 | `gettid()` | the thread's tid | B1 |
 | 200 | `tkill(tid, sig)` | `tid <= 0` `-EINVAL`; no such thread `-ESRCH`; `SI_TKILL` (`SenderClass::Other`); musl's `raise` uses it (the census) | C5 |
@@ -4277,7 +4351,7 @@ returned `Interrupted`, and names the restart code the handler returns.
 | 218 | `set_tid_address(tidptr)` | M6's; the pointer is the thread's `clear_child_tid` | B1 |
 | 219 | `restart_syscall()` | resumes the thread's restart block (B2); with none, `-EINTR` | B2 |
 | 222 | `timer_create(clockid, sevp, timerid)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (the CPU-time and alarm clocks `-EINVAL`, a deviation); `sevp` `NULL` means `SIGEV_SIGNAL` with `SIGALRM`; `SIGEV_SIGNAL`, `SIGEV_NONE`, `SIGEV_THREAD_ID` (its tid a thread of the caller's process, else `-EINVAL`); a raw `SIGEV_THREAD` is taken as `SIGEV_SIGNAL`, as Linux's `good_sigevent` takes it (libc builds the thread on `SIGEV_THREAD_ID`, as musl's `timer_create` does); a signal outside 1..=64 `-EINVAL`; at most 32 timers a process (`-EAGAIN`, Lumen's cap); ids from 0 | C13 |
-| 223 | `timer_settime(id, flags, new, old)` | `TIMER_ABSTIME` (1) or 0, else `-EINVAL`; an unknown id or a bad `itimerspec` `-EINVAL`; arms (a zero `it_value` disarms); `old` gets the previous setting | C13 |
+| 223 | `timer_settime(id, flags, new, old)` | `TIMER_ABSTIME` (1) read from `flags`, other bits ignored, as Linux's `do_timer_settime`; an unknown id or a bad `itimerspec` `-EINVAL`; arms (a zero `it_value` disarms); `old` gets the previous setting | C13 |
 | 224 | `timer_gettime(id, cur)` | the time left and the interval; `-EINVAL`, `-EFAULT` | C13 |
 | 225 | `timer_getoverrun(id)` | expiries while the timer's signal was still pending, at the last delivery (capped at `i32::MAX`) | C13 |
 | 226 | `timer_delete(id)` | disarms and frees it, discarding its pending signal; `-EINVAL` | C13 |
@@ -4286,9 +4360,9 @@ returned `Interrupted`, and names the restart code the handler returns.
 | 231 | `exit_group(status)` | ends every thread of the process (section 8, "Exit") | C1, C3 |
 | 234 | `tgkill(tgid, tid, sig)` | `tgid <= 0` or `tid <= 0` `-EINVAL`; `tid` not in `tgid` `-ESRCH`; as `tkill` | C5 |
 | 247 | `waitid(idtype, id, infop, options, rusage)` | section 8, "`wait4` and `waitid`" | C1, C6 |
-| 259 | `mknodat(dirfd, path, mode, dev)` | `S_IFIFO` (a FIFO, section 10) and `S_IFREG` or a type of 0 (an empty regular file), with `mode & !umask`; `S_IFCHR`, `S_IFBLK` and `S_IFSOCK` `-EPERM` (a deviation: Linux lets root make them); another type `-EINVAL`; a name in use `-EEXIST`; a read-only mount, devfs or procfs `-EROFS` (GNU make 4.4's `-j2` jobserver FIFO: the census); through `Start` (section 8's rule 2) and a new lumen-vfs operation, `mknod_at` | C7 |
+| 259 | `mknodat(dirfd, path, mode, dev)` | the type checked first, before the path is looked up, as Linux's `may_mknod`: `S_IFDIR` `-EPERM`, a type that isn't `S_IFREG`, `S_IFCHR`, `S_IFBLK`, `S_IFIFO`, `S_IFSOCK` or 0 `-EINVAL`; then `S_IFIFO` (a FIFO, section 10) and `S_IFREG` or 0 (an empty regular file) are made with `mode & !umask`, and `S_IFCHR`, `S_IFBLK` and `S_IFSOCK` are `-EPERM` (a deviation: Linux lets root make them); a name in use `-EEXIST`; a read-only mount, devfs or procfs `-EROFS` (GNU make 4.4's `-j2` jobserver FIFO: the census); through `Start` (section 8's rule 2) and a new lumen-vfs operation, `mknod_at` | C7 |
 | 270 | `pselect6(n, readfds, writefds, exceptfds, tsp, sig)` | as `select`, with a `timespec` (written back) and `sig`, a pointer to `{ const sigset_t *ss; size_t ss_len }`: with `ss` set, `ss_len != 8` `-EINVAL` and the mask swapped for the wait in one step (`saved_mask`), restored on return unless a handler runs, as Linux's `restore_saved_sigmask_unless`; interrupted `-ERESTARTNOHAND` (make waits here with `SIGCHLD` unblocked only for the wait: the census) | B3, C6 |
-| 271 | `ppoll(fds, nfds, tsp, sigmask, sigsetsize)` | as `poll`, with `pselect6`'s mask rule and a `timespec`; interrupted `-ERESTARTNOHAND` | B3 |
+| 271 | `ppoll(fds, nfds, tsp, sigmask, sigsetsize)` | as `poll`, with `pselect6`'s mask rule and a `timespec`, the time left written back (Linux's `poll_select_finish`); interrupted `-ERESTARTNOHAND` | B3, C6 |
 | 273, 274 | `set_robust_list`, `get_robust_list` | section 8, "`futex`" | C4 |
 | 292 | `dup3(oldfd, newfd, flags)` | `flags` other than `O_CLOEXEC` `-EINVAL`; `oldfd == newfd` `-EINVAL`; else `dup2` with `FD_CLOEXEC` from `flags` | C7 |
 | 293 | `pipe2(fds, flags)` | `O_CLOEXEC` and `O_NONBLOCK` (each end's own description); `O_DIRECT` (packet mode: a deviation) and any other flag `-EINVAL`; two slots reserved first (`-EMFILE`); a bad `fds` `-EFAULT`, both descriptors closed again; section 10 | C7 |
@@ -4306,8 +4380,8 @@ release. `mmap` (9): `MAP_SHARED | MAP_ANONYMOUS` and `/dev/zero`'s shared
 mappings stay shared across `fork` (section 5; M7 maps them as private).
 `mprotect`, `munmap`, `brk` (10, 11, 12) shoot down other CPUs' TLB
 entries. `rt_sigaction`, `rt_sigprocmask`, `ioctl`, `getpid`, `exit`,
-`getppid`, `getpgrp`, `fcntl`, `flock`, `truncate`, `ftruncate`,
-`exit_group` and `prlimit64` as in the table. `openat`'s `O_TRUNC` (257)
+`getppid`, `getpgrp`, `gettid`, `set_tid_address`, `fcntl`, `flock`,
+`truncate`, `ftruncate`, `exit_group` and `prlimit64` as in the table. `openat`'s `O_TRUNC` (257)
 invalidates every address space's mappings, as `ftruncate`. `openat` and
 `dup*` reserve their descriptor slot before they open (section 9).
 
@@ -4437,11 +4511,10 @@ a `SpinLock<BTreeMap<u64, ProcessState>>` keyed by the kernel thread's id).
 M8 splits that state into processes and threads, keeps the process tree in
 `lumen_proc::ProcTree` (#341), makes every blocking syscall interruptible,
 and adds `fork`, `vfork`, threads, `execve`, `wait4`/`waitid`, `futex`,
-sessions and process groups. Issues: B1 (the split, behaviour unchanged),
-B2 (the blocking wait), C1 (`fork`, `vfork`, exit, `wait4`, reparenting),
-C2 (`execve`), C3 (threads), C4 (`futex`, sleeps), C8 (sessions and
-groups). Pids and tids are `u32`s, as in lumen-proc; signals are
-`lumen_signal::Signal`s.
+timers, sessions and process groups. The issue labels are section 8's
+table, "M8's issues". Pids and tids are `u32`s, as in lumen-proc; signals
+are `lumen_signal::Signal`s. Every lock named here has its place in section
+9's order, which this section doesn't restate.
 
 #### The model (B1)
 
@@ -4451,55 +4524,83 @@ A `Process` is a Linux thread group: one pid and what its threads share. A
 ```rust
 // kernel/src/linux/process.rs
 pub struct Process {
-    pid: u32,                            // the thread group's id; fixed
-    mm: SpinLock<Arc<AddressSpace>>,     // replaced by execve; CLONE_VM shares the Arc
-    files: Arc<Files>,                   // CLONE_FILES shares the Arc
-    fs: Arc<FsState>,                    // cwd and umask; CLONE_FS shares the Arc
-    signal: SpinLock<SignalState>,       // below
-    child_events: WaitQueue,             // wait4/waitid sleep here
-    child_seq: AtomicU64,                // bumped on each child state change
-    vfork_done: Option<Arc<VforkDone>>,  // a CLONE_VFORK child's: released at execve or exit
-    exe_path: SpinLock<Option<String>>,  // /proc/<pid>/exe
-    usage: Usage,                        // atomic tick counts: own user/system, reaped children's
-    console: ConsoleState,               // M7's ConsoleIo, termios and stdin buffers, until C10
+    pid: u32,                                 // the thread group's id; fixed
+    mm: SpinLock<Option<Arc<AddressSpace>>>,  // replaced by execve; CLONE_VM shares it
+    files: SpinLock<Option<Arc<Files>>>,      // replaced by execve's unshare; CLONE_FILES shares it
+    fs: SpinLock<Option<Arc<FsState>>>,       // cwd and umask; CLONE_FS shares it
+    signal: SpinLock<SignalState>,            // below
+    live_threads: AtomicUsize,                // threads not yet through exit step 2
+    stopped: AtomicBool,                      // mirrors SignalState::group_stop (section 6)
+    child_events: WaitQueue,                  // wait4/waitid sleep here
+    child_seq: AtomicU64,                     // bumped on each child state change
+    vfork_done: Option<Arc<VforkDone>>,       // a CLONE_VFORK child's (below)
+    exe_path: SpinLock<Option<String>>,       // /proc/<pid>/exe
+    usage_slot: u64,                          // its lumen_proc::RusageSlot's value
+    children_ticks: [AtomicU64; 2],           // reaped children's user and system ticks
+    console: ConsoleState,                    // M7's ConsoleIo, termios and stdin buffers, until C10
 }
-pub struct Files { table: SpinLock<FdTable<FileRef>> }
-pub struct FsState { inner: SpinLock<FsInner> }   // FsInner { cwd: Cwd, umask: u16 }
+pub struct Files { table: SpinLock<FdTable<FileRef>> }  // FileRef = Arc<KernelFile>
+pub struct FsState { inner: SpinLock<FsInner> }         // FsInner { cwd: Cwd, umask: u16 }
 pub struct SignalState {
     actions: [KernelSigaction; 64],
-    pending: lumen_signal::pending::PendingSignals,   // the shared queue and one per thread
-    threads: BTreeMap<u32, ThreadSignals>,             // by tid
+    pending: lumen_signal::pending::PendingSignals,  // the shared queue and one per thread
+    threads: BTreeMap<u32, ThreadSignals>,            // by tid
+    preferred: Option<ThreadSlot>,       // select_target's cursor (Linux's curr_target)
     group_exit: Option<ExitStatus>,      // exit_group or a fatal signal: the first one wins
+    exec_waiter: Option<u32>,            // the tid in de_thread (Linux's group_exec_task)
     group_stop: Option<GroupStop>,       // the stop signal and the threads still running
-    timers: PosixTimers,                 // timer_create's timers and ITIMER_REAL (C13)
+    timers: Timers,                      // ITIMER_REAL and timer_create's timers (C13)
     ctty: Option<Arc<Tty>>,              // the session's controlling terminal (C9/C10)
     rlimit_stack: u64,                   // RLIMIT_STACK's soft limit, for the next execve
 }
 pub struct ThreadSignals {
-    slot: lumen_signal::pending::ThreadSlot,
+    slot: ThreadSlot,                    // lumen_signal::pending's
     blocked: lumen_signal::Blocked,
     saved_mask: Option<lumen_signal::Blocked>, // rt_sigsuspend/ppoll/pselect6's mask to restore
     alt_stack: lumen_signal::altstack::AltStack,
 }
 pub struct UserThread {
-    tid: u32,
+    tid: AtomicU32,                      // changed once, by execve's tid exchange
     process: Arc<Process>,
     clear_child_tid: AtomicU64,          // set_tid_address, CLONE_CHILD_CLEARTID
     robust_list: AtomicU64,              // set_robust_list's head (C4)
-    own: OwnCell<ThreadLocal>,           // touched only by this thread: fs_base, the
-                                         // restart block, the pending-#DB flag
+    own: OwnCell<ThreadLocal>,           // touched only by this thread (below)
 }
 ```
 
-`sched::Thread` gains `user: Option<Arc<UserThread>>` (fixed at spawn),
-`sigpending: AtomicBool` (B2), `affinity` and `nice` (B6) and two tick
-counts (user and system, charged by the timer interrupt by the interrupted
-`CS`, C12). A syscall finds its process through `sched::current()`'s
-`user`, without a table lookup. The FPU save area and `fs_base` stay on the
-thread (section 6). Lumen's `Process` holds what Linux splits between
-`signal_struct` and `sighand_struct` under one lock: `CLONE_SIGHAND`
-without `CLONE_THREAD` is refused (`-EINVAL`, a deviation, below), so the
-dispositions are always one thread group's.
+- `OwnCell<T>` is a cell only its own thread may borrow (asserted against
+  `sched::current()`), holding `ThreadLocal { fs_base, restart:
+  Option<RestartBlock>, pending_debug_trap }`; the FPU save area stays on
+  `sched::Thread` (section 6).
+- `sched::Thread` gains `user: Option<Arc<UserThread>>` (fixed at spawn),
+  `sigpending: AtomicBool` (B2), `affinity` and `nice` (B6), and two tick
+  counts, user and system, charged by the timer interrupt by the
+  interrupted `CS` (C12). The ticks are counted per thread; a process's own
+  totals (`RUSAGE_SELF`) are the sum over its live threads plus what its
+  dead threads added to the process at their exit, and its children's
+  (`RUSAGE_CHILDREN`) are `children_ticks`.
+- A syscall finds its process through `sched::current()`'s `user`,
+  without a table lookup.
+- Lumen's `Process` holds what Linux splits between `signal_struct` and
+  `sighand_struct` under one lock: `CLONE_SIGHAND` without `CLONE_THREAD`
+  is refused (`-EINVAL`, a deviation, below), so the dispositions are
+  always one thread group's.
+- **A `Process` drops safely anywhere.** `sched::Thread::user` keeps its
+  `UserThread`, and so its `Process`, alive until the scheduler lets go of
+  the thread, which can be in `finish_switch` with interrupts off. So
+  everything whose release needs a `SleepMutex` (closing files, a cwd,
+  tearing an address space down) is taken out of `mm`, `files` and `fs`
+  in exit step 3, in thread context; what is left (the signal state,
+  strings, an `Arc<Tty>`, whose drop frees memory only: a PTY pair is
+  released by its descriptions' closes, section 10) drops without a lock.
+- **`mm_users` (B4).** `AddressSpace::users: AtomicUsize` counts the
+  processes using a space, as Linux's `mm_users` does, apart from the
+  `Arc` count (Linux's `mm_count`: procfs readers, B7's mappers). `fork`
+  with `CLONE_VM` raises it; a process that lets
+  its space go (exit step 3, `execve`) lowers it, and the one that brings
+  it to 0 runs `teardown` there, in process context (section 5: it waits
+  until no CPU has the space loaded). The last `Arc`'s drop is then
+  lock-free.
 
 **The tables.** One kernel-wide table replaces `ACTIVE_PROCS`:
 
@@ -4512,107 +4613,111 @@ struct ProcTable {
 }
 ```
 
-`PROCS` is an IRQ-off `SpinLock` in section 9's level 10, taken before any
-process's `signal` lock. It is not a leaf: `ProcTree::fork`, `setsid` and
-`setpgid` allocate infallibly under it (B-tree inserts), and `exit`
-reserves fallibly, so the heap's locks nest inside it, as they do inside
-`POSIX_WAITERS`. An infallible insert that can't allocate panics the
-kernel, as an insert under `ACTIVE_PROCS` can in M7; the heap grows by
-mapping frames, so this needs the frames to run out first (a fallible
-tree is an open question, not M8 work). Nothing sleeps or copies user
-memory under `PROCS`. A zombie keeps its `procs` entry (for its usage) until
-its `RusageSlot` comes back to the kernel (`Report::Reaped`,
-`ExitAction::Released`, or `ExitAction::Notify` with `released`); the slot's
-value is the pid, unique while the process is in the tree. `PID_MAX` is
-32767, so pids run 2..=32767 as Linux's default `pid_max` hands out
-1..32767 (lumen-proc wraps to 2, Linux to 300: lumen-proc's documented
-choice).
+- `ProcTree::fork`, `setsid` and `setpgid` allocate infallibly under
+  `PROCS` (B-tree inserts); an insert that can't allocate panics the
+  kernel, as an insert under `ACTIVE_PROCS` can in M7. The heap grows by
+  mapping frames, so this needs the frames to run out first; a fallible
+  tree is an open question, not M8 work.
+- A zombie keeps its `procs` entry until its `RusageSlot` comes back
+  (`Report::Reaped`, `ExitAction::Released`, or `ExitAction::Notify` with
+  `released`); the kernel finds the process by the pid each of those
+  names. A slot's value is any unique number (`NEXT_USAGE_SLOT`, a
+  counter): `fork` and `spawn_root` take the slot before the pid exists.
+- `PID_MAX` is 32767, so pids run 2..=32767 as Linux's default `pid_max`
+  hands out 1..32767 (lumen-proc wraps to 2, Linux to 300: lumen-proc's
+  documented choice).
 
 **Tids from the pid space.** A thread's tid is a number from `ProcTree`'s
 allocator, so no tid is ever a live pid, pgid or sid, and the leader's tid
-is the pid. lumen-proc doesn't model threads yet: B1 adds
-`ProcTree::add_thread(pid) -> Result<u32, Errno>` (a number as `fork`
-hands one out, `EAGAIN` when none is free, counted by `is_busy` while the
-thread lives) and `ProcTree::remove_thread(pid, tid)`, host-tested in
-`cargo:lumen-proc`, before C3 uses them.
+is the pid. lumen-proc doesn't model threads yet: B1 adds, host-tested in
+`cargo:lumen-proc`:
+- `ProcTree::add_thread(pid) -> Result<u32, Error>`: a number as `fork`
+  hands one out (`EAGAIN` when none is free), counted by `is_busy` while
+  the thread lives; a pid that isn't live is a `Bug`;
+- `ProcTree::remove_thread(pid, tid) -> Result<(), Error>`: a `Bug` for a
+  tid the process doesn't have, or for the leader's tid (the pid, which
+  the process keeps until it is reaped);
+- `ProcTree::exit` accepts a process with non-leader tids still
+  registered and frees them with it (the kernel removes each as its
+  thread exits, so only a bookkeeping bug leaves one).
+
+Because a live tid counts in `is_busy`, the pgid and sid calls see it as a
+number in use: `tcsetpgrp(tid)` gives `EPERM` (the number isn't a group of
+the caller's session) where it gave `ESRCH`, and `getpgid`, `setpgid` and
+`kill` with a non-leader tid give `ESRCH` as before (lumen-proc looks
+processes up by pid).
 
 **Init and orphans.** At boot, `linux::init` (a function B1 adds to
 `kernel/src/linux/mod.rs`) calls `ProcTree::spawn_init`: pid 1 is a
 kernel-owned process with no threads. It has a `PROCS.procs` entry, an
-ordinary `Process` with no `UserThread` (no address space: `mm` holds a
-placeholder empty `AddressSpace` that is never loaded), whose `SIGCHLD`
-disposition is `SIG_IGN`, so `ProcTree::exit`'s `autoreap(1)` is true. A
-`Notify` to parent 1 is then the ordinary case: its `released` is `Some`,
-so the child's zombie and `procs` entry go at once, and the `child_seq`
-bump and `child_events` wake reach no waiter (pid 1 has no thread to
-wait). Every exit names pid 1 as the reaper, so an orphan's
-`getppid` is 1, as on Linux. The `linux` shell command starts its process
-with `ProcTree::spawn_root`: a root with no parent (`getppid` 0, M6's
-row), whose end is an `ExitAction::Released` carrying the exit status the
-command prints. A root's children outlive the `linux` command: when
-the root exits they are pid 1's, still running (a background job left by
-`ash`, say), and the command returns without waiting for them. The
-scenarios that count leaked frames (`linux` prints the frames a run kept,
-`rootfs.run_busybox`) count only after every process the run started has
-ended: a test whose program leaves children kills them (or waits for
-them to exit) before it reads the count. Pid 1 never exits and has no handlers: `kill(1, sig)`
-returns 0 and does nothing, as Linux ignores a signal its init has no
-handler for (`SIGNAL_UNKILLABLE`), and `kill(-1, sig)` skips it.
+ordinary `Process` with no `UserThread` (its `mm` a placeholder empty
+`AddressSpace` that is never loaded), whose `SIGCHLD` disposition is
+`SIG_IGN`, so `ProcTree::exit`'s `autoreap(1)` is true. A `Notify` to
+parent 1 is the ordinary case: its `released` is `Some`, so the child's
+zombie and `procs` entry go at once, and the `child_seq` bump and
+`child_events` wake reach no waiter. Every exit names pid 1 as the reaper,
+so an orphan's `getppid` is 1, as on Linux. The `linux` shell command
+starts its process with `ProcTree::spawn_root`: a root with no parent
+(`getppid` 0, M6's row), whose end is an `ExitAction::Released` carrying
+the exit status the command prints. A root's children outlive the `linux`
+command, still running under pid 1, and the command doesn't wait for them
+(section 15 says how the scenarios' leak counts treat them). Pid 1 never
+exits and has no handlers: `kill(1, sig)` returns 0 and does nothing, as
+Linux ignores a signal its init has no handler for (`SIGNAL_UNKILLABLE`),
+and `kill(-1, sig)` skips it.
 
 #### Exit (C1, C3)
 
-`exit` (60) ends the calling thread only (M7 ended the whole
-process in that arm); `exit_group` (231) and a fatal signal end the
-group:
+`exit` (60) ends the calling thread only (M7 ended the whole process in
+that arm); `exit_group` (231) and a fatal signal end the group:
+
 1. The first of them records `group_exit` under `signal` and kicks every
-   other thread (`sigpending`, and `sched::kick` out of an interruptible
-   or killable wait, B2). Each leaves at its next return-to-user check or
-   interrupted wait, through the thread exit below.
-2. A thread's exit: writes 0 to `clear_child_tid` (if set and mapped) and
-   wakes one waiter on it with a shared futex wake, as Linux's
-   `mm_release` does (the census's shared `WAKE`, musl's thread-list
-   lock); walks its robust list (C4); removes its `ThreadSignals` and
-   `ThreadSlot` (`PendingSignals::remove_thread`) and its `threads` entry
-   and tid (`remove_thread`); drops its `UserThread`.
-3. The last thread out ends the process. First, with no lock held, a
-   session leader with a controlling terminal sends `SIGHUP` to that
-   terminal's foreground group and clears the terminal's session and
-   foreground group under `Tty::lock` (section 9's Lock 9a, which comes
-   before `PROCS`), as Linux's `disassociate_ctty(1)` does for a PTY (for
-   its console Linux also hangs up the open descriptors; Lumen doesn't, a
-   deviation). Then it switches to `kernel_root()`, drops its `mm` reference (the address space is torn down when no other
-   process shares it: a `vfork` parent may), its `files` (the table is
-   closed when its last `Arc` goes, releasing locks outside every
-   `SpinLock`, as M7's `take_current`) and `fs`; then, under `PROCS`,
-   `ProcTree::exit(pid, status, Some(INIT_PID), autoreap)` and its
-   `ExitOutcome`'s actions in the same hold: `Notify` bumps the parent's
-   `child_seq`, wakes its `child_events` and sends it `SIGCHLD`
-   (`si_code` from `WaitStatus::siginfo`, `si_pid`, `si_status`) unless its
-   disposition is `SIG_IGN`, and with `released: Some(slot)` (the parent
-   reaps automatically) drops the zombie's `procs` entry too; `Released`
-   drops the `procs` entry (and, for a root, hands the status to the
-   `linux` command); `HangupThenContinue` sends `SIGHUP` then `SIGCONT` to
-   `pgrp_members`. Every `Arc<Process>` leaving `procs` is extracted under
-   `PROCS` and dropped after it.
+   other thread in `threads` (`sigpending`, and `sched::kick` out of an
+   interruptible or killable wait, B2), in the same hold. Each leaves at
+   its next return-to-user check or interrupted wait, through step 2. A
+   thread `clone` checks `group_exit` in the hold that links its thread
+   (below), so no thread escapes.
+2. A thread's exit, in this order:
+   - walks its robust list (C4; below);
+   - writes 0 to `clear_child_tid` (if set; a fault is ignored) and wakes
+     one waiter on it with a shared futex wake, as Linux's `mm_release`
+     does after `futex_exit_release` (C1 writes the 0; C4 adds the wake);
+   - adds its tick counts to the process;
+   - under `PROCS` then `signal`, in one hold: moves the `preferred`
+     cursor off its slot, removes its `ThreadSignals` and `ThreadSlot`
+     (`PendingSignals::remove_thread`), its `threads` entry and its tid
+     (`remove_thread`, except the leader's), and decrements
+     `live_threads`; the thread that takes it to 0 is the last out, a
+     decision made in that same hold. If `exec_waiter` is set and one
+     thread is left, it wakes that thread (`de_thread`, below).
+3. The last thread out ends the process, in thread context:
+   - First, with no lock held, a session leader with a controlling
+     terminal hangs up its session (C9/C10: section 10's PTYs, "Hangup").
+   - It switches to `kernel_root()`, takes `mm`, `files` and `fs` out of
+     the `Process` (each `take()` under its leaf lock), lowers the space's
+     `users` (tearing it down at 0), and drops the `Files` and `FsState`
+     (closing the table when the last `Arc` goes, releasing locks outside
+     every `SpinLock`, as M7's `take_current`).
+   - Then, under `PROCS`, `ProcTree::exit(pid, status, Some(INIT_PID),
+     autoreap)` and its `ExitOutcome`'s actions in the same hold: `Notify`
+     bumps the parent's `child_seq`, wakes its `child_events`, sends it
+     `SIGCHLD` (`si_code` from `WaitStatus::siginfo`, `si_pid`,
+     `si_status`) unless its disposition is `SIG_IGN`, and with `released`
+     drops the zombie's `procs` entry; `Released` drops the `procs` entry
+     (and, for a root, hands the status to the `linux` command);
+     `HangupThenContinue` sends `SIGHUP` then `SIGCONT` to `pgrp_members`.
+   - `ExitError::NoMem` leaves the tree unchanged: the thread, past its
+     point of no return, yields (`sched::yield_now`) and retries, with a
+     WARN at most once a second, and never returns to user mode.
 4. The status: `group_exit`'s if set, else the leader's own `exit` code,
    as Linux's `wait_task_zombie` reads `group_exit_code` only with
    `SIGNAL_GROUP_EXIT` set. A fatal signal's status is
    `ExitStatus::Killed { core: false }`: Lumen writes no core dump, and
    Linux sets the core bit only when one was written.
 
-#### The per-process locks (B1)
-
-`Files::table` and `FsState::inner` are
-IRQ-off `SpinLock`s holding no other lock; an `Arc<OpenFile>` or `Cwd`
-leaving them is extracted under the lock and dropped after it (M7's
-extract-and-drop rule, section 9). `Process::mm` is a leaf `SpinLock`
-around the `Arc` only (cloned out, never held across a fault).
-`Process::signal` is section 9's signal lock: taken after `PROCS`, before
-the scheduler's locks; `PendingSignals::enqueue` may allocate under it (a
-real-time queue's `try_reserve`). Every sender runs in thread context with
-interrupts on: syscalls, the fault path once it has turned interrupts on,
-the tty input thread, the timers thread (C13), exit. No interrupt handler
-sends a signal.
+Every sender of a signal runs in thread context with interrupts on
+(syscalls, the fault path once it has turned interrupts on, the tty input
+thread, the timers thread, exit); no interrupt handler sends one.
 
 #### `clone`, `fork` and `vfork` (C1, C3)
 
@@ -4632,14 +4737,14 @@ this order, each `-EINVAL`:
 
 | Flag | M8 |
 |---|---|
-| `CLONE_VM` | share the `AddressSpace` (`Arc` clone), else copy it on write (B4) |
+| `CLONE_VM` | share the `AddressSpace` (raising its `users`), else copy it on write (B4) |
 | `CLONE_FS` | share `FsState`, else copy cwd and umask |
-| `CLONE_FILES` | share `Files`, else copy the table (each `Arc<OpenFile>` cloned, `cloexec` kept) |
+| `CLONE_FILES` | share `Files`, else copy the table: each entry's `FileRef` cloned with its `cloexec`, and `inc_fd_ref` called on each description once per copied descriptor (`FdTable`'s derived `Clone` doesn't), so a child's `close` of a pipe end or a `flock` holder drops only its own count; reserved slots are skipped |
 | `CLONE_SIGHAND` | with `CLONE_THREAD` only |
 | `CLONE_THREAD` | a new thread of the caller's process (C3) |
 | `CLONE_VFORK` | the parent sleeps, killable, until the child's `execve` or exit (as Linux's `wait_for_vfork_done`, `TASK_KILLABLE`) |
 | `CLONE_SETTLS` | the child's `fs_base` = `tls`; `tls >= USER_MAX` is `-EPERM`, as Linux's `set_new_tls` → `do_arch_prctl_64` (M6's `arch_prctl(ARCH_SET_FS)` answers that `-EINVAL`: an existing deviation) |
-| `CLONE_PARENT_SETTID` | the child's tid written to `parent_tid` in the parent's memory before the call returns, after `PROCS` is released and with no lock held (a fault is ignored, as Linux's `kernel_clone` ignores `put_user`'s result) |
+| `CLONE_PARENT_SETTID` | the child's tid written to `parent_tid` in the parent's memory before the child can run (it is spawned behind a start gate, released after the write), with no lock held; a fault is ignored, as Linux's `kernel_clone` writes it before `wake_up_new_task` and ignores `put_user`'s result (musl's `pthread_create` relies on the order) |
 | `CLONE_CHILD_SETTID` | the child's tid written to `child_tid` in the child's memory by the child itself, with no lock held, before it first returns to user mode (a fault ignored, as Linux's `schedule_tail`) |
 | `CLONE_CHILD_CLEARTID` | `clear_child_tid = child_tid` |
 | `CLONE_SYSVSEM`, `CLONE_DETACHED`, `CLONE_IO`, `CLONE_PTRACE`, `CLONE_UNTRACED` | accepted, no effect (no System V semaphores, no ptrace; `CLONE_DETACHED` is ignored by Linux's `clone` too) |
@@ -4648,44 +4753,67 @@ this order, each `-EINVAL`:
 The census (#337) saw exactly two flag sets: `0x4111` (`posix_spawn`'s
 `CLONE_VM | CLONE_VFORK | SIGCHLD`) and `0x7d0f00` (`pthread_create`'s
 `VM | FS | FILES | SIGHAND | THREAD | SYSVSEM | SETTLS | PARENT_SETTID |
-CHILD_CLEARTID | DETACHED`); `scenario:test_linux_proc::test_pthread_create_and_join`
-and `scenario:test_linux_proc::test_fork_wait_and_exit_status` run both.
-**`clone3` (435) stays `-ENOSYS`:** no census workload calls it (musl
-1.2.5 doesn't), and glibc falls back to `clone` on `-ENOSYS`.
+CHILD_CLEARTID | DETACHED`). **`clone3` (435) stays `-ENOSYS`:** no
+census workload calls it (musl 1.2.5 doesn't), and glibc falls back to
+`clone` on `-ENOSYS`.
 
-A process clone (no `CLONE_THREAD`): `ProcTree::fork(parent, slot)` under
-`PROCS` (`-EAGAIN` with no free pid, `-ENOMEM` from its reservation); the
-child's `SignalState` copies the dispositions, an empty pending set
-(`PendingSignals::new(1, RT_QUEUE_CAP)`, `RT_QUEUE_CAP` = 1024 queued
-real-time signals per queue, `-EAGAIN` past it), the caller's mask and
-alternate stack, no timers (`timer_create`'s are per process and not
-inherited, as on Linux), the controlling terminal and `rlimit_stack`. The
-child's registers are the parent's at the `syscall`, with `rax` = 0 and
-`rsp` = `newsp` if non-zero; it returns through `iretq` (section 6). Its
-kernel thread is `sched::spawn_user_on(cpu, ..)` on the parent's CPU,
-migratable (B6). The parent gets the child's pid. A thread clone: a tid
-from `add_thread`, a `ThreadSlot` from `PendingSignals::add_thread`
-(`-ENOMEM` mapped from `PendingError::NoMemory`, the crate's note), the
-caller's mask, no alternate stack (Linux clears it for `CLONE_VM` without
-`CLONE_VFORK`), and the same `Process`. A kernel stack that can't be had
-(`MAX_STACKS`, section 6) is `-EAGAIN`, Linux's errno for its thread
-limits.
+**A process clone** (no `CLONE_THREAD`). Every step that can fail comes
+before `ProcTree::fork`, which can't be undone (lumen-proc has no
+`abort_fork`):
+1. allocate: the child's `PendingSignals::new(1, RT_QUEUE_CAP)`
+   (`RT_QUEUE_CAP` = 1024 queued real-time signals per queue, `-EAGAIN`
+   past it; `PendingError::NoMemory` is `-ENOMEM`), its `AddressSpace`
+   (`fork_copy`, B4, or the shared one), its `Files` and `FsState` copies,
+   a `RusageSlot` value, and its kernel thread
+   (`sched::spawn_user_on(cpu, ..)`, migratable, held at a start gate;
+   `MAX_STACKS`, section 6, gives `-EAGAIN`, Linux's errno for its thread
+   limits). A failure frees what was made, in thread context, with no
+   lock held (a failed `fork_copy` drops its child after Lock 1 is
+   released);
+2. under `PROCS`: `ProcTree::fork(parent, slot)` (`-EAGAIN` with no free
+   pid, `-ENOMEM` from its reservation: then step 1's allocations are
+   freed after `PROCS` is released), the `procs` and `threads` inserts;
+3. write `parent_tid`, then open the start gate.
 
-`vfork` and `posix_spawn`: the child shares the parent's `AddressSpace`
-(no copy) and `Process::mm` points at the same `Arc`; the parent's thread
-waits, killable, on the child's `vfork_done` (a one-shot flag and wait
-queue in the child's `Process`), released when the child's `execve`
-passes its point of no return (just before it installs its new address
-space, as Linux's `mm_exit_exec_release` completes `vfork_done`) or the
-child exits. musl's `posix_spawn`
-reports an `execve` failure through a `pipe2(O_CLOEXEC)` pipe (C7).
+The child's `SignalState` copies the dispositions, the caller's mask and
+alternate stack, the controlling terminal and `rlimit_stack`; it has an
+empty pending set and no timers (neither `timer_create`'s nor
+`ITIMER_REAL`: not inherited, as on Linux). The child's registers are the
+parent's at the `syscall`, with `rax` = 0 and `rsp` = `newsp` if
+non-zero; it returns through `iretq` (section 6). The parent gets the
+child's pid.
+
+**A thread clone.** The kernel thread, behind its start gate, and the
+`ThreadSlot` (`PendingSignals::add_thread`; `-ENOMEM`) come first; then,
+in one `PROCS` → `signal` hold, `add_thread` for the tid, and the checks
+Linux's `copy_process` makes under its `siglock`: a `group_exit` refuses
+the clone with `-EINTR` (the caller is dying anyway), and an
+`exec_waiter`, a `group_stop` or a signal pending for the caller with
+`-ERESTARTNOINTR` (restarted once it has been handled); otherwise the
+`threads` and `ThreadSignals` entries are linked and `live_threads`
+raised in that hold, so the group-exit kicker sees the new thread. A
+refusal undoes, in reverse order, after the hold: the tid
+(`remove_thread`), the `ThreadSlot`, the kernel thread (never started).
+The new thread has the caller's mask, no alternate stack (Linux clears it
+for `CLONE_VM` without `CLONE_VFORK`), and the same `Process`.
+
+**`vfork` and `posix_spawn`:** the child shares the parent's
+`AddressSpace` (no copy; `users` raised) and the parent's thread waits,
+killable, on the child's `vfork_done` (a one-shot flag and wait queue),
+released when the child's `execve` passes its point of no return (before
+it installs its new address space, as Linux's `mm_exit_exec_release`
+completes `vfork_done`) or the child exits. musl's `posix_spawn` reports
+an `execve` failure through a `pipe2(O_CLOEXEC)` pipe (C7).
 
 #### `execve` (C2)
 
 `execve(path, argv, envp)` (59). `execveat` (322) stays `-ENOSYS`: no
 census workload calls it, and musl's `fexecve` falls back to
-`/proc/self/fd/N` on `-ENOSYS`. In this order (each error before step 6
-leaves the caller untouched):
+`/proc/self/fd/N` on `-ENOSYS`. C2 builds the single-threaded path; C3
+adds `de_thread` and the tid exchange, C4 the robust-list walk, C13 the
+timers. In this order (each error before step 6 leaves the caller
+untouched):
+
 1. Copy `path` (`UserPath`, section 8's handler rules), resolve it from the
    cwd following symlinks: a missing file `-ENOENT`, a directory or a
    file with no execute bit or not regular `-EACCES` (M7's
@@ -4694,70 +4822,97 @@ leaves the caller untouched):
    `-EFAULT`) and start `lumen_elf::args::ArgBudget::new(argc, envc,
    limit)`, with Linux's `bprm_stack_limits`: `limit = max(min(6 MiB,
    rlimit_stack / 4), 128 KiB)`, 2 MiB at the default 8 MiB stack. Then
-   charge and copy, as the budget's docs order: `execfn` (the path as
-   given), `envp` last to first, `argv` last to first (each length from a
-   bounded `strnlen_user`; 0, a fault, is `-EFAULT`); `E2BIG` from any
+   charge and copy, in the budget's documented order: `execfn` (the path
+   as given), `envp` last to first, `argv` last to first (each length from
+   a bounded `strnlen_user`; 0, a fault, is `-EFAULT`), and, when `argc` is
+   0, the one byte of the synthetic `""` `argv[0]`; `E2BIG` from any
    `BudgetError`.
 3. Read the file's first `BINPRM_BUF_SIZE` (256) bytes through the page
-   cache. `#!` (`lumen_elf::shebang::parse`): `Nesting::follow_interpreter`
-   (`-ELOOP` past `MAX_NESTING`), `ArgBudget::rewrite` (the interpreter,
-   its argument, the script's path for `argv[0]`'s place), then resolve the
-   interpreter as in step 1 and go back to this step for it. A
-   `ShebangError` is its errno (`-ENOEXEC`, `-EACCES`).
+   cache. On `#!` (`lumen_elf::shebang::parse`; a `ShebangError` is its
+   errno, `-ENOEXEC`), in this order: `ArgBudget::rewrite` with
+   `script_path` the execfn the first time and the previous `#!` line's
+   interpreter string after that (`E2BIG`, `ENOMEM`); `Shebang::open_error`
+   (`-EACCES` for an empty interpreter path); resolve and open the
+   interpreter as in step 1 (`-ENOENT`, `-EACCES`); then
+   `Nesting::follow_interpreter` (`-ELOOP` past `MAX_NESTING`); and back to
+   this step for the interpreter.
 4. An ELF: the header and program headers (at most 64 KiB, Linux's
    `load_elf_phdrs` limit) parsed by `lumen_elf::loader` (`-ENOEXEC` for a
    bad one; a bad `PT_INTERP` interpreter `-ELIBBAD`, a missing one
    `-ENOENT`, M7's rules). Neither ELF nor `#!`: `-ENOEXEC`. Today
-   `LoadedElf::parse(image)` takes the whole file as one slice; C2 changes
-   lumen-elf to parse from the headers alone plus the file's size
-   (`LoadedElf::parse_headers(head, file_size)`, every segment's
-   `p_offset + p_filesz` checked against `file_size` instead of the
-   slice), host-tested in `cargo:lumen-elf`.
+   `LoadedElf::parse(image)` takes the whole file as one slice. C2 changes
+   lumen-elf (host-tested in `cargo:lumen-elf`) to parse from what it
+   reads of the file: the ELF header from the first bytes, then the
+   program headers at `e_phoff` and the `PT_INTERP` path at its
+   `p_offset`, each read separately (either may lie past the first 256
+   bytes), with every segment's `p_offset + p_filesz` checked against the
+   file's size instead of a slice. Each of the three modes keeps its base:
+   `parse`, `parse_with_pie_base` and `parse_interp` become
+   `parse_headers`, `parse_headers_with_pie_base` and
+   `parse_interp_headers`, taking `(ehdr, phdrs, file_size)`, with
+   `interp_range()` giving the `PT_INTERP` bytes to read.
 5. Build the new `AddressSpace` completely (`AddressSpace::from_images`,
    the initial stack from the copied strings): `-ENOMEM` if frames or heap
    run out. The stack's size is `rlimit_stack` clamped to 128 KiB..=256
    MiB, rounded up to a page: lumen-vm's `USER_STACK_SIZE` (8 MiB) and
-   `USER_STACK_BOTTOM` are constants today, checked at compile time, so C2
-   makes the stack's bottom a parameter of the layout (`AddressSpace`
-   keeps it; `maps`'s `MapsLayout::stack_bottom` takes it, as it already
-   takes a value) and section 5's 8 MiB becomes the default. **No
-   whole-file read:** `ElfImage`'s `bytes` (the whole file) becomes a
-   source the loader reads segment by segment (C2 changes
-   `from_images`'s `ElfImage` to carry the file's inode, or the boot
-   module's bytes). The loader
-   copies each `PT_LOAD` segment's file bytes from the page cache straight
-   into the new frames, 4 KiB at a time, instead of M7's
+   `USER_STACK_BOTTOM` are compile-time constants today, so C2 makes the
+   stack's bottom a parameter of the layout (`AddressSpace` keeps it;
+   `MapsLayout::stack_bottom` already takes a value), section 5's 8 MiB
+   the default. **No whole-file read:** the kernel's `ElfImage` (in
+   `mm/user_vm.rs`, not lumen-elf) carries an `ImageSource` instead of
+   the whole file's bytes, `ImageSource::File(Arc<dyn VfsInode>)` or
+   `ImageSource::Module(&'static [u8])` (a boot module), and the loader
+   copies each `PT_LOAD` segment's file bytes from the page cache
+   straight into the new frames, 4 KiB at a time, instead of M7's
    `read_executable` into one heap `Vec` (whose `READ_ALL_MAX`, 16 MiB,
    refuses `cc1plus`, 41.4 MB, and whose heap never shrinks: #344's
-   numbers). An executable's size is then bounded by memory alone, as on
-   Linux; `READ_ALL_MAX` stays for `vfstest` and the other whole-file
-   readers. The segments stay copied into private frames (M7's loader),
-   not mapped from the page cache: that keeps an executable's pages out of
-   the `ext4` cache's 64 MiB hard limit (#344: a file-backed loader would
-   pin about 32 MiB of `cc1plus` while it runs).
-6. The point of no return. Other threads: each gets `group_exit`-style
-   kill and the caller waits, killable, until it is the only thread
-   (Linux's `de_thread`); if the caller isn't the leader, it takes the pid
-   as its tid (Linux exchanges the tids). Then, still on the old address
-   space, as Linux's `exec_mmap` runs `mm_exit_exec_release` before it
-   switches: write 0 to `clear_child_tid` and wake it (so the store lands
-   in the old space, where the waiter is), clear it and the robust list,
-   and release a `vfork` parent. Then install the new `AddressSpace`
-   (`Process::mm`), switch `CR3` to it, drop the old one;
-   `ProcTree::exec(pid)`; unshare a shared
-   `Files` and close every `cloexec` descriptor (`process::release_fd`, so
-   their POSIX locks go); reset every handled signal to `SIG_DFL`
-   (ignored ones stay ignored), keep the mask and pending signals, clear
-   the alternate stack; reset the FPU state and `fs_base`; delete the
-   process's POSIX timers; set the thread's name
-   to the path's last component (`ThreadName::from_path`, as `linux /path`
-   does) and `exe_path` to the path as given (M7's rule).
+   numbers). A file that shrank meanwhile is a short read: `-EIO`. An
+   executable's size is then bounded by memory alone, as on Linux;
+   `READ_ALL_MAX` stays for `vfstest` and the other whole-file readers.
+   The segments stay copied into private frames (M7's loader), not mapped
+   from the page cache: that keeps an executable's pages out of the `ext4`
+   cache's 64 MiB hard limit (#344: a file-backed loader would pin about
+   32 MiB of `cc1plus` while it runs). Everything step 6 needs is
+   allocated here too: an unshared `Files` if the table is shared (its
+   1024 slots), the new `exe_path` string.
+6. The point of no return:
+   - **`de_thread` (C3).** Under `signal`: if `group_exit` or another
+     `exec_waiter` is set, `-EAGAIN` (Linux's `de_thread`: a concurrent
+     exec or a group exit wins). Else set `exec_waiter` to the caller's
+     tid (a flag of its own, not `group_exit`, so the caller survives) and
+     kick every other thread as a group exit does; they leave through
+     exit step 2, the last to go waking the caller, which waits, killable,
+     until `live_threads` is 1 (Linux's `notify_count`). An `exit_group`
+     or fatal signal meanwhile ends the caller too. If the caller isn't
+     the leader it takes the pid as its tid (Linux exchanges the tids):
+     under `PROCS`, its `threads` entry is re-keyed, its `UserThread::tid`
+     stored and its old tid removed.
+   - Still on the old address space, as Linux's `exec_mmap` runs
+     `mm_exit_exec_release` first: walk the robust list
+     (`futex_exit_exec_release` → `exit_robust_list`, C4) and clear its
+     head; write 0 to `clear_child_tid` and wake it (so the store lands in
+     the old space, where the waiter is) and clear it; release a `vfork`
+     parent.
+   - Install the new `AddressSpace` in `Process::mm` and switch `CR3` to
+     it; lower the old space's `users`, tearing it down at 0 through
+     `teardown`, which waits until no CPU has it loaded (a killed thread
+     may still be running on it, section 5).
+   - `ProcTree::exec(pid)`; install the unshared `Files` if one was made,
+     and close every `cloexec` descriptor (`process::release_fd`, so their
+     POSIX locks go); reset every handled signal to `SIG_DFL` (ignored
+     ones stay ignored), keep the mask and pending signals, clear the
+     alternate stack; reset the FPU state and `fs_base`.
+   - Timers (C13): delete the POSIX timers and drop every queued
+     `SI_TIMER` signal (Linux's `posixtimer_exec`: `posixtimer_delete_timers`
+     and `flush_itimer_signals`); `ITIMER_REAL` survives (an `alarm`
+     outlives `execve`, as POSIX requires; it is freed only at exit).
+   - The thread's name becomes the path's last component as given, the
+     script's for a `#!` file (`ThreadName::from_path`, as `linux /path`
+     does, and Linux's `comm`); `exe_path` the file finally loaded, the
+     interpreter's path for a `#!` script, as Linux's `bprm_identity_file`
+     makes `/proc/<pid>/exe` (the path as given, M7's rule otherwise).
 7. Return to the new image's entry through `iretq` with M6's initial
    register state (section 8, "ELF64 loader").
-
-`scenario:test_linux_proc::test_fork_cow_and_exec_shebang` checks `#!`
-(a script, a nested script, `-ELOOP`), `O_CLOEXEC` closing, a reset
-handler, `E2BIG`, and a `vfork` child's `execve` releasing its parent.
 
 #### `wait4` and `waitid` (C1, C6)
 
@@ -4767,21 +4922,22 @@ options, rusage)` (247) take the request from
 checks and errnos, lumen-proc's tests), then loop:
 1. Read `child_seq`; under `PROCS`, `ProcTree::wait(request)`.
 2. `Reported(report)`: release `PROCS`; for `Reaped`, add the child's
-   ticks to the parent's children totals and drop its `procs` entry
-   (taken out under the lock, dropped after it); write the status word
-   (`WaitStatus::word`) or `siginfo_t` (`si_signo = SIGCHLD`, `si_code` and
-   `si_status` from `WaitStatus::siginfo`, `si_pid`, `si_uid` 0) and
-   `rusage` (below); return the pid (`waitid`: 0). A bad user pointer is
-   `-EFAULT`, the child already reaped, as on Linux.
-3. `NoneReady` with `WNOHANG`: return 0 (`waitid` zeroes `infop`'s
-   `si_pid` and `si_signo`, as Linux).
+   ticks to `children_ticks` and drop its `procs` entry (taken out under
+   the lock, dropped after it); write the status word (`WaitStatus::word`)
+   or `siginfo_t` (`si_signo = SIGCHLD`, `si_code` and `si_status` from
+   `WaitStatus::siginfo`, `si_pid`, `si_uid` 0) and `rusage` (below);
+   return the pid (`waitid`: 0). A bad user pointer is `-EFAULT`, the
+   child already reaped, as on Linux.
+3. `NoneReady` with `WNOHANG`: return 0; `waitid` writes 0 to `infop`'s
+   `si_signo`, `si_errno`, `si_code`, `si_pid`, `si_uid` and `si_status`,
+   as Linux's `waitid` does.
 4. Otherwise `child_events.wait_interruptible(None, || child_seq changed)`;
    `Interrupted` returns `-ERESTARTSYS`.
 
 The census's calls use options 0 and `WNOHANG`; `WUNTRACED`/`WSTOPPED`
 and `WCONTINUED` arrive with stops (C6, for ash's job control). `rusage`
 (`struct rusage`): `ru_utime` and `ru_stime` from the reaped child's
-ticks plus its own reaped children's (Linux's `cutime`/`cstime`); every
+totals plus its own reaped children's (Linux's `cutime`/`cstime`); every
 other field 0 (Lumen counts nothing else).
 
 #### One interruptible, killable blocking wait (B2)
@@ -4806,8 +4962,10 @@ pub fn kick(thread: &Thread);             // after setting its `sigpending`
   won the race is never lost, as lumen-futex's `AlreadyWoken`); then the
   deadline (`TimedOut`); then the pending check (`Interrupted`). `ready`
   may read atomics only: a waiter whose condition lives under a
-  `SleepMutex` (a pipe, a tty) reads a sequence number its wakers bump
-  after each change, as `wait4` reads `child_seq`.
+  `SleepMutex` reads a sequence number its wakers bump after each change.
+  `PipeObject` and `Tty` (section 10) each get one, `seq: AtomicU64`, which
+  the waiter reads under its lock before releasing it, and waits for it
+  to change, as `wait4` reads `child_seq`.
 - **No lost signal:** under the queue's lock the thread pushes itself, sets
   `Blocked` (marked interruptible or killable), and only then reads its
   `sigpending` (`SeqCst`); a sender stores `sigpending` (`SeqCst`) and then
@@ -4819,9 +4977,9 @@ pub fn kick(thread: &Thread);             // after setting its `sigpending`
 - **`sigpending`** means "look at the pending signals" (Linux's
   `TIF_SIGPENDING`): a sender sets it on a thread that doesn't block the
   signal (`select_target`'s choice for a process-wide signal), and for a
-  group exit or stop on every thread; the thread clears it in its
-  return-to-user check, under `Process::signal`, when nothing deliverable
-  is left.
+  group exit or stop on every thread; the thread clears it in the
+  syscall-exit hook, under `Process::signal`, when nothing deliverable is
+  left.
 - **Uninterruptible waits stay** for kernel-internal waits that must
   finish: page-cache and block-device I/O, `run_sized`, `join`, lock
   waits inside the kernel (Linux's `TASK_UNINTERRUPTIBLE`).
@@ -4831,23 +4989,34 @@ pub fn kick(thread: &Thread);             // after setting its `sigpending`
   Linux's `locks_lock_inode_wait`) and M6's console `poll`. Each later
   issue uses it for its own waits; the syscall table names each one's
   restart code.
-- **Restart codes** (`-ERESTARTSYS`, `-ERESTARTNOINTR`, `-ERESTARTNOHAND`,
-  `-ERESTART_RESTARTBLOCK`) are a handler's result for an interrupted
-  wait. The syscall return path passes every one to
-  `lumen_signal::restart::decide` with the handling it is about to do (a
-  handler and its `SA_RESTART`, or none) and applies the
-  `RestartDecision`, so none reaches user space: `EINTR`, a restart (`rax`
-  = the original number, `rip` back 2 bytes), or `restart_syscall` (219)
-  for `ERESTART_RESTARTBLOCK` with no handler, which resumes from the
-  thread's restart block (a nanosleep's, a timed futex wait's or a
-  `poll`'s deadline and arguments; with none, `-EINTR`, Linux's
-  `do_no_restart_syscall`).
+- **The syscall-exit hook (B2).** Restart codes (`-ERESTARTSYS`,
+  `-ERESTARTNOINTR`, `-ERESTARTNOHAND`, `-ERESTART_RESTARTBLOCK`) are a
+  handler's result for an interrupted wait, and none reaches user space.
+  B2 adds the hook every return to ring 3 runs (section 6, "Signals"): it
+  resolves a restart code with no handler to deliver
+  (`lumen_signal::restart::decide` with `Handling::None`: a restart, `rax`
+  = the original number and `rip` back 2 bytes, or `restart_syscall`
+  (219) for `ERESTART_RESTARTBLOCK`, which resumes from the thread's
+  restart block, a nanosleep's, a timed futex wait's or a `poll`'s
+  deadline and arguments; with none, `-EINTR`, Linux's
+  `do_no_restart_syscall`), and clears `sigpending` when nothing is
+  deliverable. Until C5, nothing is delivered: B2's tests raise a signal
+  through a ktest-only `signal::raise_for_test(thread, sig)`. C5 adds
+  delivery to the same hook; the restart decision then runs once, through
+  `frame::build` when a handler is delivered (with its `SA_RESTART`) and
+  through `decide` when none is.
 - Tested by `ktest:lumen_kernel::sched::wait_interruptible_answers_woken_timed_out_and_interrupted`
   (each answer; a deadline answer is a floor, never early),
-  `ktest:lumen_kernel::sched::kick_racing_a_block_is_never_lost` (a kick
-  and a block raced 200 times on two CPUs, each wait ending
-  `Interrupted`), `ktest:lumen_kernel::sched::wait_killable_ignores_a_non_fatal_kick`,
-  and `ktest:lumen_kernel::linux::syscall::lock::setlkw_is_interrupted_by_a_signal`.
+  `ktest:lumen_kernel::sched::kick_racing_a_block_is_never_lost` (a
+  ktest-only delay knob, `sched::BLOCK_DELAY`, stalls the waiter between
+  setting `Blocked` and reading `sigpending` while another CPU kicks; it
+  kills the mutant that reads `sigpending` before setting `Blocked`),
+  `ktest:lumen_kernel::sched::wait_killable_ignores_a_non_fatal_kick`,
+  `ktest:lumen_kernel::linux::syscall::lock::setlkw_is_interrupted_by_a_signal`
+  and `ktest:lumen_kernel::linux::syscall::restart_with_no_handler_restarts_or_resumes`
+  (each restart code with `raise_for_test` and an ignored signal: a
+  restart, `restart_syscall` resuming a sleep's deadline, `EINTR` with no
+  restart block).
 
 #### `futex` (C4)
 
@@ -4855,39 +5024,41 @@ pub fn kick(thread: &Thread);             // after setting its `sigpending`
 `lumen_futex::FutexTable` through the protocols in that crate's
 documentation (the value check under the bucket lock with faults off,
 the retry after faulting the page in, the `BucketIndex` recheck on every
-return from blocking):
+return from blocking). Its user accesses are section 6's step 6, "Non-faulting
+user access":
 
-- **Reading the word under the bucket lock:** `user::read_u32_nofault`
-  (section 6's step 6, added by B2): the ordinary `copy_from_user` can't
-  run there, since it asserts no `SpinLock` is held and its fault takes
-  Lock 1. On `Fault`, `FUTEX_WAIT` drops the bucket lock, reads the word
-  with a normal `copy_from_user` (which faults the page in; a bad address
-  is `-EFAULT`), recomputes the key and retakes the lock to check again,
-  as Linux's `futex_wait_setup` does after `futex_get_value_locked` fails
-  (a plain `get_user`, then `retry`). `FUTEX_CMP_REQUEUE` does the same
-  for `uaddr1` with both buckets released.
-
+- **Reading the word under the bucket lock** is `user::read_u32_nofault`.
+  On `Fault`, `FUTEX_WAIT` drops the bucket lock, reads the word with a
+  normal `copy_from_user` (which faults the page in; a bad address is
+  `-EFAULT`), recomputes the key and retakes the lock to check again, as
+  Linux's `futex_wait_setup` does after `futex_get_value_locked` fails (a
+  plain `get_user`, then `retry`). `FUTEX_CMP_REQUEUE` does the same for
+  `uaddr1` with both buckets released.
 - **Ops:** `FUTEX_WAIT` (0), `FUTEX_WAKE` (1), `FUTEX_REQUEUE` (3),
   `FUTEX_CMP_REQUEUE` (4), `FUTEX_WAIT_BITSET` (9) and `FUTEX_WAKE_BITSET`
   (10), each with or without `FUTEX_PRIVATE_FLAG` (128);
   `FUTEX_CLOCK_REALTIME` (256) only with `FUTEX_WAIT_BITSET` (else
   `-ENOSYS`, Linux's `do_futex`). Every other op (`WAKE_OP`, the PI ops,
-  `WAIT_REQUEUE_PI`, `CMP_REQUEUE_PI`) is `-ENOSYS`: the census saw ops
-  0, 1, 0x80 and 0x81 only, and musl 1.2.5 uses no other. `futex_waitv`
-  (449) is `-ENOSYS` too.
+  `WAIT_REQUEUE_PI`, `CMP_REQUEUE_PI`) is `-ENOSYS`; `futex_waitv` (449)
+  too. The census saw ops 0, 1, 0x80 and 0x81 only. musl 1.2.5 also uses
+  `FUTEX_REQUEUE` (implemented) and, for priority-inheritance mutexes,
+  `FUTEX_LOCK_PI`/`FUTEX_UNLOCK_PI`: those stay `-ENOSYS`, so libc-test's
+  `pthread_mutex_pi` (static and dynamic, both passing natively) fail in
+  Lumen and D4 lists them as expected failures with a backlog issue for
+  PI futexes.
 - **Errors:** an address outside user space `-EFAULT`, not 4-byte aligned
   `-EINVAL`, a zero bitset `-EINVAL`, a negative requeue count `-EINVAL`
-  (`check_requeue_counts`, before anything else), a word that doesn't
-  match `-EAGAIN`, an unreadable word `-EFAULT`, a bad timeout
-  (`tv_nsec` past 999,999,999 or negative) `-EINVAL` (Linux's
-  `futex_init_timeout`), a deadline passed `-ETIMEDOUT`.
+  (`check_requeue_counts`, before any key lookup, fault or value
+  compare), a word that doesn't match `-EAGAIN`, an unreadable word
+  `-EFAULT`, a bad timeout (`tv_nsec` past 999,999,999 or negative)
+  `-EINVAL` (Linux's `futex_init_timeout`), a deadline passed
+  `-ETIMEDOUT`.
 - **Timeouts:** `FUTEX_WAIT`'s is relative on `CLOCK_MONOTONIC`;
   `FUTEX_WAIT_BITSET`'s absolute, on `CLOCK_MONOTONIC` or, with the flag,
   `CLOCK_REALTIME` (converted to a monotonic deadline when the wait
-  starts; a later clock change doesn't move it, a deviation). A
-  signal: `-ERESTARTSYS` without a timeout, `-ERESTART_RESTARTBLOCK`
-  with one (the restart block holds the deadline), as Linux's
-  `futex_wait`.
+  starts; a later clock change doesn't move it, a deviation). A signal:
+  `-ERESTARTSYS` without a timeout, `-ERESTART_RESTARTBLOCK` with one (the
+  restart block holds the deadline), as Linux's `futex_wait`.
 - **Keys** (`FutexKey`, `Ord + Copy` as lumen-futex asks):
   `Private { space, uaddr }` for any op with `FUTEX_PRIVATE_FLAG`, where
   `space` is the `AddressSpace`'s L4 root frame (unique while it lives);
@@ -4897,40 +5068,38 @@ return from blocking):
   address; `File { file_id, offset }` for a page-cache page (section 5's
   `file_id`), as Linux keys one by its inode and offset; `SharedFrame {
   frame, offset }` for a `MAP_SHARED | MAP_ANONYMOUS` frame shared across
-  `fork` (section 5). A private op and a shared op on the same word never
-  meet, as in Linux, whose keys differ by `FUT_OFF_MMSHARED`. The census's
-  shared `WAIT`/`WAKE` pair on musl's thread-list lock are both `Anon`
-  keys of one address space, and so is the shared wake at a thread's exit
+  `fork` (section 5; the key holds no reference, so a frame freed and
+  reused can at worst cause a spurious wake, which futex users tolerate).
+  A private op and a shared op on the same word never meet, as in Linux,
+  whose keys differ by `FUT_OFF_MMSHARED`. The census's shared
+  `WAIT`/`WAKE` pair on musl's thread-list lock are both `Anon` keys of
+  one address space, and so is the shared wake at a thread's exit
   (`clear_child_tid`), so they meet.
 - **Buckets:** `FUTEX_BUCKETS: [SpinLock<FutexTable<FutexKey,
-  Arc<FutexWaiter>>>; 256]`, indexed by a hash of the key. The bucket rule
-  is the crate's, verbatim: each bucket's lock is an IRQ-off `SpinLock`
-  that is a leaf, except that one other bucket may be nested under it in
-  ascending index order; nothing allocates, frees, or takes a
-  `SleepMutex` while one is held. The `FutexNode` and the waiter's `Arc`
-  are allocated before, and `Woken`/`Cancelled` nodes dropped after.
+  Arc<FutexWaiter>>>; 256]`, indexed by a hash of the key, under
+  lumen-futex's bucket rule (section 9, level 10d). The `FutexNode` and
+  the waiter's `Arc` are allocated before, and `Woken`/`Cancelled` nodes
+  dropped after.
 - **Robust lists:** `set_robust_list(head, len)` (273) stores the head
   (`len` other than 24, `sizeof(struct robust_list_head)`, is `-EINVAL`);
   `get_robust_list(pid, head_ptr, len_ptr)` (274) reads a thread's (0: the
-  caller's; a tid not in the caller's process `-ESRCH`, Lumen having no
-  ptrace). musl's `pthread_mutexattr_setrobust` calls `get_robust_list`
-  once and refuses robust mutexes if it fails. At a thread's exit the
-  kernel walks the list as Linux's `exit_robust_list` does (at most 2048
-  entries, `ROBUST_LIST_LIMIT`), with no lock held, reading each entry
-  with `copy_from_user` (a fault ends the walk): a futex word whose tid
-  bits are the thread's is replaced by `(word & FUTEX_WAITERS) |
-  FUTEX_OWNER_DIED` with `user::cmpxchg_u32` (section 6's step 6), retried
-  while another thread changes it meanwhile and, on `Fault`, after
-  faulting the page in writable, abandoning that entry if it can't be (as
-  Linux's `handle_futex_death` uses `futex_cmpxchg_value_locked`, then
-  `fault_in_user_writeable`), and with `FUTEX_WAITERS` it gets one shared
-  wake.
-
-`cargo:lumen-futex` checks the queues; `scenario:test_linux_proc::test_futex_timeouts_and_nanosleep`
-checks waits that time out, wakes, requeues, bitsets and private/shared
-separation (each timed wait asserted to have lasted at least its timeout,
-never at most), and `scenario:test_linux_proc::test_futex_and_pthread_mutex_stress`
-checks contended mutexes and condition variables across CPUs (C11).
+  caller's; any live tid otherwise, since every process is root and Linux
+  allows it with ptrace access; no such thread `-ESRCH`). musl's
+  `pthread_mutexattr_setrobust` calls `get_robust_list` once and refuses
+  robust mutexes if it fails. At a thread's exit, before its
+  `clear_child_tid` store, and at `execve`, the kernel walks the list as
+  Linux's `exit_robust_list` does, with no lock held: at most 2048 entries
+  (`ROBUST_LIST_LIMIT`), each read with `copy_from_user`, any fault or
+  failure abandoning the whole walk; for each entry, `handle_futex_death`:
+  a futex word whose tid bits are the thread's is replaced by `(word &
+  FUTEX_WAITERS) | FUTEX_OWNER_DIED` with `user::cmpxchg_u32`, retried
+  while the word changes under it and, on `Fault`, after
+  `user::fault_in_writable` (abandoning the walk if that fails), and with
+  `FUTEX_WAITERS` it gets one shared wake. Then the head's
+  `list_op_pending` entry, if set, is handled the same way, and wakes one
+  waiter even when the dying thread doesn't own its word (a lock it was
+  about to take or had just released), as Linux's `handle_futex_death`
+  with `pending_op`.
 
 #### Timers: `setitimer`, `alarm` and POSIX timers (C13)
 
@@ -4940,39 +5109,39 @@ timer, a helper thread waiting in `rt_sigtimedwait` for signal 32 aimed at
 it with `SIGEV_THREAD_ID`). vim 9.1's `start_timeout` prints an error
 (`e_could_not_set_timeout_str`) when `timer_create` fails, so `-ENOSYS`
 would put an error on D3's screen: M8 implements them, as C13 (after C3
-and C5; C6 for `rt_sigtimedwait`).
+and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
 
 - **State:** a process's `SignalState::timers` holds `ITIMER_REAL` and up
   to 32 POSIX timers (`PosixTimer { clock, target: Process | Thread(tid),
-  signal, sival, interval_ns, deadline, overrun, queued }`), freed at
-  `execve` and exit.
+  signal, sival, interval_ns, deadline, generation, overrun, queued }`).
+  POSIX timers are deleted at `execve` and exit; `ITIMER_REAL` only at
+  exit. `timer_delete` (and `execve`) discards the timer's queued
+  `SI_TIMER` signal, which needs a lumen-signal addition, C13's:
+  `PendingSignals::discard_if(|info| ...)`, removing queued entries a
+  predicate picks (host-tested in `cargo:lumen-signal`).
 - **Expiry:** each armed timer has an entry in `TIMERS`, a kernel-wide
-  `SpinLock<BTreeMap<(deadline, key), Weak<Process>>>` (a leaf, the heap's
-  locks inside), whose earliest deadline is also kept in an atomic. The
-  boot CPU's timer tick compares that atomic with `now_ns` (one load) and,
-  once it has passed, wakes the `timers` kernel thread; no signal is sent
-  from the interrupt. The thread removes the expired entries under
-  `TIMERS` into a local list and releases it; then, with no lock held, it
-  upgrades each entry's `Weak<Process>` (a process gone is skipped, and
-  the `Arc` drops outside every `SpinLock`), and under that process's
-  `signal` lock (which comes before `TIMERS`, so a re-arm may take
-  `TIMERS` inside it) either enqueues the timer's `SigInfo` (`SI_TIMER`
-  with `si_timerid` and `si_value`; `SI_KERNEL` for `ITIMER_REAL`'s
-  `SIGALRM`, as Linux's `it_real_fn`) and sets `queued`, or, if its signal
-  is still queued, counts an overrun; a periodic timer is re-armed by its
-  interval (skipped periods counted as overruns, as Linux's
-  `hrtimer_forward`). Dequeuing an `SI_TIMER` signal clears `queued` and
-  fills `si_overrun`, which `timer_getoverrun` then reports.
+  `SpinLock<BTreeMap<(deadline, key), (Weak<Process>, generation)>>`,
+  whose earliest deadline is also kept in an atomic. The boot CPU's timer
+  tick compares that atomic with `now_ns` (one load) and, once it has
+  passed, wakes the `timers` kernel thread; no signal is sent from the
+  interrupt. The thread moves the expired entries out of `TIMERS` into a
+  local list and releases it; then, with no lock held, it upgrades each
+  entry's `Weak<Process>` (a process gone is skipped, the `Arc` dropped
+  outside every `SpinLock`), and under that process's `signal` lock fires
+  the timer only if its `generation` still matches the entry's (a
+  `timer_settime` or `timer_delete` bumps it, so a re-armed or deleted
+  timer's stale entry does nothing): it enqueues the timer's `SigInfo`
+  (`SI_TIMER` with `si_timerid` and `si_value`; `SI_KERNEL` for
+  `ITIMER_REAL`'s `SIGALRM`, as Linux's `it_real_fn`) and sets `queued`,
+  or, if its signal is still queued, counts an overrun; a periodic timer
+  is re-armed by its interval (skipped periods counted as overruns, as
+  Linux's `hrtimer_forward`). Dequeuing an `SI_TIMER` signal clears
+  `queued` and fills `si_overrun`, which `timer_getoverrun` then reports.
 - **Clocks:** deadlines are `CLOCK_MONOTONIC` nanoseconds; a
   `CLOCK_REALTIME` absolute time is converted when the timer is armed (a
   later change of the realtime clock doesn't move it: a deviation, as for
   `futex`). A timer fires at the first tick after its deadline, never
   before.
-- Tested by `scenario:test_linux_proc::test_signals_and_sigaltstack`
-  (`alarm` and `setitimer`), `scenario:test_linux_proc::test_small_syscalls`
-  (`timer_create` with each notification, `timer_settime` absolute and
-  relative, `timer_getoverrun` after a blocked signal: each a floor) and
-  D3's vim.
 
 #### Sessions and process groups (C8)
 
@@ -4985,8 +5154,10 @@ lumen-proc's errnos (`EPERM`, `ESRCH`, `EACCES` after the child's `exec`,
 `kill(-pgid, sig)` and `kill(0, sig)` send to `pgrp_members` under
 `PROCS` (`-ESRCH` if the group has none). Controlling terminals, the
 foreground group, `tcsetpgrp` (`TIOCSPGRP`) and the job-control signals
-are section 10's. `scenario:test_linux_proc::test_sessions_and_process_groups`
-checks each call's success and errno cases and `kill` of a group.
+are section 10's.
+
+Section 15, "M8's tests", says what each of these subsections' tests
+checks.
 
 ### Capabilities and sandboxing (WASM M5; Linux namespaces M11)
 
@@ -6503,7 +6674,8 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     takes Lock 4 alone). A page mapped from a stale snapshot is still
     unmapped: the shrinking syscall's `invalidate_file_from` takes Lock 1
     after the truncate, so it runs after that fault's mapping is in place.
-    This holds for the caller's own space only until M8 (B7, section 5). A private copy-on-write copy of the end page made from
+    This holds for the caller's own space only until M8 (B7, section 5).
+    A private copy-on-write copy of the end page made from
     a stale snapshot can keep bytes past the new end (bytes a shared mapping
     stored past it).
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
@@ -7435,8 +7607,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     Each mounted filesystem receives a distinct `DevId` encoded with one
     canonical `makedev(major, minor)` used identically by `stat.st_dev`,
     `statx.stx_dev_{major,minor}`, and `/proc/self/maps` (`0:1` for root `ext4`
-    or fallback `tmpfs`, `0:2` for `/tmp`, `0:3` for `/dev`, `0:4` for `/proc`),
-    so `st_dev` is unique and cross-mount `rename`/`link` returns `-EXDEV`.
+    or fallback `tmpfs`, `0:2` for `/tmp`, `0:3` for `/dev`, `0:4` for `/proc`;
+    from M8, `0:5` for `/dev/pts` and `0:6` for the unmounted `pipefs`,
+    section 10), so `st_dev` is unique and cross-mount `rename`/`link` returns `-EXDEV`.
   - **`VfsTables<F: LockFamily>` (#264):** the three tables above, each
     behind its own lock (Lock 9, sub-order `MountTable -> DentryCache ->
     InodeCache`), and the one implementation of `VfsCacheOps` (the short
@@ -7761,6 +7934,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   `/tmp`, `/dev`, and `/proc` are then mounted, creating their mountpoint
   directories if absent on any writable root (a `tmpfs` root, or a read-write
   `ext4` root, where they persist); a mount that fails is logged at `warn`.
+  From M8 (C9, designed in #336), `devpts` is mounted at `/dev/pts` after
+  `/dev` (section 10).
 - **Shell commands:**
   - `blk`: lists bound block devices (PCI addr, capacity, read-only, flush
     support, `BlockCache` hit/miss/dirty stats).
@@ -7832,12 +8007,15 @@ holding only locks above it.
     copy or with any lock 0–9
 10. IRQ-off SpinLocks, in this sub-order:
     a. PROCS (the process table: lumen-proc's ProcTree, processes and
-       threads; not a leaf: ProcTree allocates under it)
+       threads; not a leaf: Process::signal and the locks below nest
+       under it, and ProcTree allocates under it)
     b. Process::signal (dispositions, pending signals, masks, stops,
-       timers; not a leaf: PendingSignals::enqueue may allocate)
+       timers; not a leaf: TIMERS, the scheduler's locks and the heap nest
+       under it)
     c. each a leaf but for the heap, none taken with another of them:
-       Process::mm, Files::table, FsState::inner, TIMERS, a PageCache's
-       mappers list (section 5), and `syscall/lock.rs`'s POSIX_WAITERS (a
+       Process::mm, Process::files and Process::fs (the Option<Arc> slots),
+       Files::table, FsState::inner, TIMERS, a PageCache's mappers list
+       (section 5), and `syscall/lock.rs`'s POSIX_WAITERS (a
        PosixWaitGraph record's insert and removal allocate and free under
        it; never held with PROCS, an inode's lock or the lock wait queue's)
     d. a futex bucket (a leaf, except that one other bucket may be nested
@@ -7853,8 +8031,10 @@ holding only locks above it.
 M8 adds (designed in #336, none built yet): Lock 0, Lock 1a, Lock 9a and,
 in level 10, `PROCS` (which replaces M7's leaf `ACTIVE_PROCS` in B1; until
 then `ACTIVE_PROCS` sits at `a`), `Process::signal`, `Process::mm`,
-`Files::table`, `FsState::inner`, `TIMERS`, the mappers lists, the futex
-buckets and the `PollHead` lists. Until each lands, M7's order holds
+`Process::files`, `Process::fs`, `Files::table`, `FsState::inner`,
+`TIMERS`, the mappers lists, the futex buckets and the `PollHead` lists.
+Sections 5, 6, 8 and 10 name these locks and cite this list for their
+places. Until each lands, M7's order holds
 without it.
 
 Lock 2 is held across a regular file's `read_at`/`write_at` (#254b), but
@@ -7864,9 +8044,10 @@ snapshot of the offset and moves it after, under a fresh hold, only if it
 is unchanged. `dir_cursor` (Lock 2) is held across every filesystem's
 `readdir`, procfs's included (it takes only the leaf `ACTIVE_PROCS`,
 `PROCS` from B1), and moved before it is released; never across
-`getdents64`'s copy out. From M8 every such call also holds Lock 0's
-`OpenFile::pos` for its whole length, so its Lock 2 holds are uncontended;
-they stay as M7's code takes them.
+`getdents64`'s copy out. From M8 every such call on a regular file, a
+directory or a procfs file also holds Lock 0's `OpenFile::pos` for its
+whole length, so its Lock 2 holds are uncontended; they stay as M7's code
+takes them.
 
 **The five M8 hazards, resolved (B8).** Each was impossible while an open
 file description had one thread (M7) and becomes possible once threads,
@@ -7874,20 +8055,20 @@ file description had one thread (M7) and becomes possible once threads,
 
 1. **A procfs `read` racing another reader of the same description
    dropped its offset update.** Resolved by `OpenFile::pos` (Lock 0), a
-   `SleepMutex<()>` field B8 adds to lumen-vfs's `OpenFile` beside M7's
-   `offset` and `dir_cursor`: a
-   `read`, `readv`, `write`, `writev`, `lseek` or `getdents64` of a regular
-   file, directory or procfs file takes it before anything else and holds
-   it across the user copies, so no other call on that description moves
-   the offset meanwhile and the snapshot-then-move always moves. Linux's
+   field B8 adds to lumen-vfs's `OpenFile<L: VfsLock<u64>>` beside M7's
+   `offset` and `dir_cursor`: a second `L` (its `u64` unused), so
+   `OpenFile` keeps its one lock parameter and the kernel's is a
+   `SleepMutex` like the other two. A `read`, `readv`, `write`, `writev`,
+   `lseek` or `getdents64` of a regular file, directory or procfs file
+   takes it before anything else and holds it across the user copies, so
+   no other call on that description moves the offset meanwhile and the
+   snapshot-then-move always moves. Linux's
    `fdget_pos` takes `f_pos_lock` for a file with `FMODE_ATOMIC_POS`
    (regular files and directories) when the file is shared, and for a
    directory always (`file_needs_f_pos_lock`); Lumen takes it always (one
-   uncontended `SleepMutex` when not shared). Pipes, FIFOs,
-   ttys and character devices have no position and don't take it.
-   `pread64`/`pwrite64` don't either. Holding a `SleepMutex` across a user
-   copy is allowed for Lock 0 alone: a fault under it takes Lock 1, which
-   comes after it, and nothing holding Lock 1–10 ever takes Lock 0.
+   uncontended `SleepMutex` when not shared). Pipes, FIFOs, ttys and
+   character devices have no position and don't take it, nor do
+   `pread64`/`pwrite64`.
 2. **A copy-out fault's give-back undid another reader's move.** Under
    `pos`, nothing moves the offset between a chunk and its give-back, so
    the give-back is exact.
@@ -7897,13 +8078,15 @@ file description had one thread (M7) and becomes possible once threads,
    a free slot before it opened.** The FD table moves out of
    `ACTIVE_PROCS` into `Files::table` (a `SpinLock` per table, shared by
    `CLONE_FILES`). `dup`, `dup2`, `dup3` and `F_DUPFD*` look `old` up and
-   install the new slot in one hold. Every call that creates a descriptor
-   (`openat`, `pipe2`, `dup`) first takes a slot with a lumen-vfs `FdTable`
-   addition: `reserve(from) -> Result<FdReservation, Emfile>` (the lowest
-   free slot at or above `from`, marked reserved), then `install(r,
-   entry)` or `cancel(r)`; a reserved slot is neither open (`close`,
-   `fstat`, `/proc/<pid>/fd` don't see it) nor free (`dup2` onto it is
-   `-EBUSY`, as Linux's `do_dup2`). `openat` reserves before it opens, so a
+   install the new slot in one hold. A call that drops the table's lock
+   between choosing a slot and filling it (`openat`, `pipe2`) first takes
+   the slot with a lumen-vfs `FdTable` addition: `reserve(from) ->
+   Result<FdReservation, VfsError>` (the lowest free slot at or above
+   `from`, marked reserved; `VfsError::MFile` when none), then `install(r,
+   entry)` or `cancel(r)`. A reserved slot is neither open nor free:
+   `close`, `fstat`, `/proc/<pid>/fd`, the table's copy at `fork`,
+   `drain_cloexec`, `drain_all` and `iter_open` all skip it, and `dup2`
+   onto it is `-EBUSY`, as Linux's `do_dup2`. `openat` reserves before it opens, so a
    full table is `-EMFILE` before an `O_CREAT` creates anything (Linux's
    `get_unused_fd_flags` comes first too).
 5. **`POSIX_WAITERS` and POSIX record locks were keyed by pid.** A record
@@ -7917,13 +8100,11 @@ file description had one thread (M7) and becomes possible once threads,
    an owner it finds (host-tested in `cargo:lumen-vfs`). Two threads of one
    process waiting in `F_SETLKW` keep a record each.
 
-Tested by `ktest:lumen_kernel::linux::process::shared_description_offsets_move_once`
-(two threads reading one description, regular and procfs, and a copy-out
-fault's give-back under contention: every byte read once),
+Tested by `ktest:lumen_kernel::linux::process::shared_description_offsets_move_once`,
+`ktest:lumen_kernel::linux::process::shared_description_getdents_lists_once`,
 `ktest:lumen_kernel::linux::process::dup_and_openat_reserve_their_slot`
-(a racing `dup2` onto a reserved slot is `-EBUSY`; a full table refuses an
-`O_CREAT` before it creates) and
-`ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_thread`.
+and `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_thread`
+(section 15, "M8's tests", says what each checks).
 
 **Invariants:**
 - Never acquire any `SleepMutex` while holding any `SpinLock` (enforced by
@@ -7939,8 +8120,10 @@ fault's give-back under contention: every byte read once),
   and the `Weak<Process>` entries leaving `TIMERS` (upgraded, and the
   `Arc` dropped, only after `TIMERS` is released).
 - Never hold locks 2–9 or 9a across `copy_from_user` / `copy_to_user`
-  (which may trigger `#PF` and acquire Lock 1); Lock 0 is the one
-  `SleepMutex` that may be held across them.
+  (which may trigger `#PF` and acquire Lock 1). Lock 0 is the one
+  `SleepMutex` that may be held across them: a fault under it takes Lock 1,
+  which comes after it, and nothing holding a lock numbered 1 to 10 ever
+  takes Lock 0.
 - Never wait for a TLB shootdown's acknowledgements with interrupts off or
   any `SpinLock` held (section 5).
 - No interrupt handler sends a signal or takes a level-10 lock above `f`
@@ -7977,20 +8160,23 @@ standard Linux IPC primitives:
 ### Pipes and FIFOs (C7)
 
 - **The object:** `pipe2` makes one `PipeObject { pipe: SleepMutex<lumen_pipe::Pipe>,
-  readers: WaitQueue, writers: WaitQueue, poll: PollHead }` and two open
+  seq: AtomicU64, readers: WaitQueue, writers: WaitQueue, poll: PollHead }`
+  (`seq` bumped under `pipe` by every change a waiter waits for, B2's
+  `ready` rule) and two open
   file descriptions on an anonymous inode of `pipefs` (an internal
   filesystem, never mounted, dev `0:6`; `InodeType::Fifo`, a fresh `ino`
   each, so `fstat` says `S_IFIFO` and `/proc/<pid>/fd/N` reads
   `pipe:[ino]`, as Linux): the read end `O_RDONLY`, the write end
   `O_WRONLY`, each with `O_NONBLOCK` from `pipe2`'s flags. `Pipe::try_new`
-  (64 KiB, `DEFAULT_CAPACITY`) failing is `-ENOMEM`. The pipe lock is
-  section 9's Lock 0: lumen-pipe's contract has it held across user copies
-  (`peek`, the copy out, `commit`; the non-blocking write loop), so nothing
-  holding a lock numbered 1 to 10 ever takes it.
-- **Ends:** an end's `Pipe::release_reader`/`release_writer` runs when its
-  open file description is dropped (its last descriptor closed, in any
-  process), never per descriptor: `dup` and `fork` share the description,
-  as the crate requires. `Released::Last` wakes every waiter on the other
+  (64 KiB, `DEFAULT_CAPACITY`) failing is `-ENOMEM`. `PipeObject::pipe` is
+  section 9's Lock 0, held across user copies as lumen-pipe's contract has
+  it (`peek`, the copy out, `commit`; the non-blocking write loop).
+- **Ends:** an end's `Pipe::release_reader`/`release_writer` runs at its
+  open file description's last `dec_fd_ref` (its last descriptor closed,
+  in any process: `fork`'s table copy raises the count per descriptor,
+  section 8), not when the `Arc` drops (a `/proc` reader may hold one), and
+  never per descriptor: `dup` and `fork` share the description, as the
+  crate requires. `Released::Last` wakes every waiter on the other
   end and every poller.
 - **`read`:** under the pipe lock, `peek` into a 4 KiB kernel buffer,
   `copy_to_user`, then `commit` (a fault drops the `Peeked`: the bytes stay
@@ -8020,17 +8206,19 @@ standard Linux IPC primitives:
   `O_RDONLY | O_NONBLOCK` returns at once (make's jobserver read end);
   `O_WRONLY | O_NONBLOCK` with no reader is `-ENXIO`, without
   `O_NONBLOCK` it waits for a reader; `O_RDWR` opens both ends and never
-  waits. Reads and writes then go as a pipe's.
+  waits. Reads and writes then go as a pipe's. A deviation: a reader that
+  opened with `O_NONBLOCK` before any writer polls `POLLHUP` at once
+  (lumen-pipe's `reader_hung_up` is `writers == 0`), where Linux's
+  `w_counter` guard waits for a first writer; make's jobserver opens its
+  write end right after, so it doesn't see the difference.
 - **`fcntl` and `ioctl`:** `F_GETPIPE_SZ`, `F_SETPIPE_SZ` and `FIONREAD`
   (section 8's table).
 - Tested by `cargo:lumen-pipe` and `scenario:test_linux_io::test_pipes_and_poll`
-  (a pipeline of busybox applets, `PIPE_BUF` atomicity between two
-  writers, `EOF`, `EPIPE`/`SIGPIPE`, `O_NONBLOCK`, `F_SETPIPE_SZ`, `dup2`
-  redirections, a FIFO's open rules, `poll` on both ends). D2's scenario
-  also runs `make -j2` on a two-rule Makefile of `true` commands after its
-  build: GNU make 4.4's jobserver FIFO (`mkfifo`, then `pselect6` on its
-  read end), with nothing on stderr (make prints `jobserver mkfifo:` and an
-  errno when `mkfifo` fails, then falls back to a pipe).
+  (section 15). D2's scenario also runs `make -j2` on a two-rule Makefile
+  of `true` commands after its build: GNU make 4.4's jobserver FIFO
+  (`mkfifo`, then `pselect6` on its read end), with nothing on stderr (make
+  prints `jobserver mkfifo:` and an errno when `mkfifo` fails, then falls
+  back to a pipe).
 
 ### The readiness interface (B3), for `poll` now and `epoll` in M9
 
@@ -8048,10 +8236,13 @@ pub trait PollWaker: Send + Sync {
     fn wake(&self, ready: PollMask);
 }
 pub trait Pollable: Send + Sync {
-    /// The readiness now. With a waker, also subscribes it to every later
-    /// change until the returned guard drops, in the same hold of the
-    /// source's own lock as the mask is read, so no change falls between.
-    fn poll(&self, waker: Option<&Arc<dyn PollWaker>>) -> (PollMask, Option<PollGuard>);
+    /// The readiness of one open description now (`mode`: its access mode,
+    /// since a pipe's two ends share one inode and an O_RDWR FIFO answers
+    /// for both). With a waker, also subscribes it to every later change
+    /// until the returned guard drops, in the same hold of the source's own
+    /// lock as the mask is read, so no change falls between.
+    fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>)
+        -> (PollMask, Option<PollGuard>);
 }
 pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
 // PollHead::subscribe(Arc<dyn PollWaker>) -> PollGuard; PollHead::notify(PollMask)
@@ -8064,17 +8255,22 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
   `eventfd` and `timerfd` will. `LockFamily` gains a leaf-lock type (the
   kernel's `SpinLock`, the host tests' `std` mutex): a `PollHead`'s list
   is section 9's level-10 `e`. `subscribe` allocates its slot before
-  taking that lock.
+  taking that lock. `PollGuard` is the subscription: dropping it removes
+  the waker from the head's list.
 - **A pipe's mask** (Linux's `pipe_poll`): the read end `POLLIN |
   POLLRDNORM` when `!is_empty()`, `POLLHUP` when `reader_hung_up()`; the
   write end `POLLOUT | POLLWRNORM` when `writable()`, `POLLERR` when
-  `writer_error()`. A tty's: "PTYs" below.
+  `writer_error()`; an `O_RDWR` FIFO description, the union. A tty's:
+  "PTYs" below.
 - **`poll`, `ppoll`, `select`, `pselect6`** (section 8's table) share one
-  loop: a `PollWait` (a `PollWaker` holding an `AtomicBool` and its thread)
-  subscribes to every source on the first pass; if any is ready, or the
-  timeout is 0, it drops the guards and returns; otherwise it waits with
-  B2's `wait_interruptible(deadline, || fired)` and polls again without
-  subscribing, keeping the guards until the call returns. `select` reads
+  loop: a `PollWait` (a `PollWaker` holding an `AtomicBool`, `fired`, and
+  its thread) subscribes to every source on the first pass; if any is
+  ready, or the timeout is 0, it drops the guards and returns. Otherwise
+  it waits with B2's `wait_interruptible(deadline, || fired)`, and after
+  each wake clears `fired`, then polls every source again without
+  subscribing, then waits again: a change between the poll and the wait
+  sets `fired` again, so none is missed. The guards are kept until the
+  call returns, by any way out (an interrupted wait included). `select` reads
   a mask through `fs/select.c`'s `POLLIN_SET`, `POLLOUT_SET` and
   `POLLEX_SET`.
 - **M9's `epoll`** reuses it unchanged: an interest is a `PollGuard` held
@@ -8083,60 +8279,72 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
   `wake` give edge-triggered mode its edge.
 - Tested by `cargo:lumen-vfs` (`PollMask`, `PollHead`: no change lost
   between a poll and its subscription, a dropped guard unsubscribing),
-  `ktest:lumen_kernel::linux::syscall::poll::poll_masks_of_each_file_kind`,
+  `ktest:lumen_kernel::linux::syscall::poll::poll_masks_of_each_file_kind`
+  (B3: M7's file kinds and a test `Pollable` whose readiness the ktest
+  sets; C7, C9 and C10 add rows for pipes, PTYs and the console),
   `ktest:lumen_kernel::linux::syscall::poll::poll_wakes_on_a_pipe_write`
-  and `scenario:test_linux_io::test_poll_and_select_on_console` (`poll`,
-  `ppoll`, `select` and `pselect6` on the console's stdin with and without
-  typed input, timeouts that wait at least their time, the time left
-  written back, an atomic mask in `pselect6`, `POLLNVAL`).
+  (C7) and `scenario:test_linux_io::test_poll_and_select_on_console`
+  (section 15).
 
 ### PTYs (C9)
 
 - **Nodes:** `devpts` mounted at `/dev/pts` at boot (dev `0:5`, after the
-  `/dev` mount), listing one `N` per open pair (character device `136:N`,
+  `/dev` mount: section 9's boot mount sequence), listing one `N` per open pair (character device `136:N`,
   mode `0620`); `/dev/ptmx` in devfs (`5:2`, mode `0666`). Opening
   `/dev/ptmx` allocates the lowest free number below `PTY_MAX` (256;
   `-ENOSPC` past it) and a `PtyPair`, and returns the master's description;
   `/dev/pts/N` opens the slave (`-EIO` while the pair is locked, which it
   is from creation until `TIOCSPTLCK` with 0, musl's `unlockpt`, and after
   the master's last close; Linux's rules).
-- **The pair:** `Tty { lock: SleepMutex<TtyInner>, readers, writers, poll }`
-  with `TtyInner { ld: lumen_tty::LineDiscipline, to_master: a byte ring
-  (the slave's output and its echo, 4096 bytes), session: Option<u32>,
-  foreground: Option<u32>, locked: bool, slave_opens: usize, hung_up:
-  bool }`. `Tty::lock` is section 9's Lock 9a: never held across a user
-  copy (reads and writes go through a 4 KiB kernel buffer; a slave read
-  whose copy out faults after the discipline consumed the bytes loses
-  them and returns `-EFAULT`, as Linux's tty reads through a kernel buffer
-  do) and never with a lock 0 to 9; under it the kernel may take `PROCS`
-  and a process's `signal` lock to send a job signal.
+- **The pair:** `Tty { lock: SleepMutex<TtyInner>, seq: AtomicU64,
+  readers, writers, poll }` with `TtyInner { ld: lumen_tty::LineDiscipline,
+  to_master: a byte ring (the slave's output and its echo, 4096 bytes),
+  session: Option<u32>, foreground: Option<u32>, locked: bool,
+  slave_opens: usize, hung_up: bool }`; `seq` is bumped under the lock by
+  every change a waiter waits for. `Tty::lock` is section 9's Lock 9a.
+  Reads and writes go through a 4 KiB kernel buffer: a slave read whose
+  copy out faults after the discipline consumed the bytes loses them and
+  returns `-EFAULT`, as Linux's tty reads through a kernel buffer do.
 - **Data flow:** a master `write` feeds each byte through
   `LineDiscipline::receive` while `accepts` holds (else waits, or
   `-EAGAIN` with `O_NONBLOCK`), its echo going to `to_master` through the
   `Output` sink and an `ISIG` character's `JobSignal` to the foreground
   group (`kill(-foreground)`). A slave `write` goes through
   `LineDiscipline::write` into `to_master` (`OPOST`), waiting while it is
-  full. A master `read` drains `to_master`; once the slave's last
+  full. A master's `write` and a console's input thread drop any bytes not
+  yet received when `flush_input` runs (`TCFLSH`, `TCSETSF`, a signal
+  character without `NOFLSH`), lumen-tty's flush duty for its driver. A
+  master `read` drains `to_master`; once the slave's last
   descriptor has closed (not before its first open, so a master read
   waiting for a child to open the slave just waits), with nothing queued,
   it is `-EIO`, as Linux's master read after `pty_close` sets
   `TTY_OTHER_CLOSED` (a later slave open clears it). A slave `read` asks
-  `read_decision` with the call's `ReadTimer` (`VMIN`/`VTIME`, its deadline
-  armed through B2's wait) and then `read`; interrupted `-ERESTARTSYS`.
+  `read_decision` with the call's `ReadTimer` (`VMIN`/`VTIME`) and then
+  `read`: `Decision::WaitWithTimer { deciseconds, .. }` arms a deadline
+  that many tenths of a second from now for B2's wait, `Decision::Wait` waits with the deadline already armed (or
+  none), and a `TimedOut` answer calls `timer.expire()` before the next
+  decision; interrupted `-ERESTARTSYS`.
   Every change notifies the waiters `Effects::wake` names and the poll
   head.
 - **Readiness:** the slave `POLLIN | POLLRDNORM` when `poll_readable()`,
   `POLLOUT | POLLWRNORM` while `to_master` has room, `POLLHUP` once hung
   up; the master `POLLIN | POLLRDNORM` while `to_master` holds bytes,
   `POLLOUT | POLLWRNORM` while the discipline `accepts`, `POLLHUP` after
-  the slave's last close (until a slave opens again). `POLLPRI` is never set (no packet mode), so `select`'s
-  exception set never fires on a PTY (the census's vim passes one).
+  the slave's last close (until a slave opens again). `POLLPRI` is never
+  set (no packet mode), so `select`'s exception set never fires on a PTY
+  (the census's vim passes one).
 - **Hangup:** the master's last close hangs the slave up, as Linux's
   `pty_close` → `tty_vhangup`: the slave's reads return 0 and its writes
   `-EIO`, every process of the session loses it as its controlling
   terminal, and the session's leader gets `SIGHUP` then `SIGCONT`
-  (`tty_signal_session_leader`). A session leader's exit sends `SIGHUP` to
-  its controlling terminal's foreground group (section 8, "Exit").
+  (`tty_signal_session_leader`). A session leader's exit (section 8,
+  "Exit", step 3; C9 for PTYs, C10 for the console) sends `SIGHUP` to its
+  controlling terminal's foreground group, clears the terminal's session
+  and foreground group under `Tty::lock`, and clears the controlling
+  terminal of every process of the session (Linux's `disassociate_ctty(1)`
+  and its `session_clear_tty`), so a later open of `/dev/tty` by any of
+  them is `-ENXIO`. For its console Linux also hangs up the open
+  descriptors (`tty_vhangup_session`); Lumen doesn't, a deviation.
 - **The ioctls** (on the slave, and on the master for the pair): `TCGETS`;
   `TCSETS`, `TCSETSW`, `TCSETSF` (`set_termios`, `Flush::Input` for
   `TCSETSF`; neither waits for the master to read, a deviation where Linux
@@ -8156,16 +8364,21 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
   - a session leader with no controlling terminal that opens a tty without
     `O_NOCTTY`, when the tty has no session, takes it (its session and
     foreground group become the leader's), except a PTY master and
-    `/dev/console`, which never become one (Linux's `tty_open`); `TIOCSCTTY` does the same
-    explicitly: `-EPERM` unless the caller leads its session and has no
-    controlling terminal, or if the tty is another session's (an argument
-    of 1 takes it away, as root may), or if the descriptor isn't open for
-    reading;
+    `/dev/console`, which never become one (Linux's `tty_open`), and only
+    through a descriptor open for reading (`tty_open_proc_set_tty`'s
+    `FMODE_READ`). `TIOCSCTTY` does the same explicitly (Linux's
+    `tiocsctty`): 0 at once if the caller already leads the tty's session;
+    `-EPERM` unless the caller leads its session and has no controlling
+    terminal, or if the tty is another session's (an argument of 1 takes it
+    away, as root may); its "not open for reading" `-EPERM` is waived for
+    `CAP_SYS_ADMIN`, which every Lumen process has;
   - `TIOCNOTTY` on the caller's controlling terminal drops it (a session
     leader's also sends `SIGHUP` then `SIGCONT` to the foreground group, as
     `disassociate_ctty(0)`), else `-ENOTTY`;
-  - `TIOCGPGRP` and `TIOCGSID` on a tty that isn't the caller's controlling
-    terminal are `-ENOTTY`; `TIOCSPGRP` is `ProcTree::tcsetpgrp` with the
+  - `TIOCGPGRP` and `TIOCGSID` on a slave (or the console) that isn't the
+    caller's controlling terminal are `-ENOTTY`; on a master they report
+    the slave's foreground group and session to any caller, as Linux's
+    `tiocgpgrp`/`tiocgsid` check only `tty == real_tty`; `TIOCSPGRP` is `ProcTree::tcsetpgrp` with the
     tty's `Controlling` and the caller's `SIGTTOU` disposition, taken
     under `Tty::lock` then `PROCS` (`Tcsetpgrp::Sigttou`: `SIGTTOU` to the
     caller's group and `-ERESTARTSYS`);
@@ -8176,13 +8389,9 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
     and a background `TCSETS*` whatever `TOSTOP` says,
     `background_write_signal`'s answer (`SIGTTOU` and `-ERESTARTSYS`,
     `-EIO`, or go ahead).
-- Tested by `cargo:lumen-tty` and `scenario:test_linux_io::test_pty_termios_and_job_control`
-  (a `tools/linux-m8` program opening `/dev/ptmx`, a child on the slave as
-  a session leader: canonical and raw reads, echo, `VMIN`/`VTIME`, Ctrl-C
-  as `SIGINT` to the foreground group, `TIOCSPGRP` and a background read's
-  `SIGTTIN`, `SIGWINCH`, the master's close hanging the slave up).
-  `scenario:test_alpine::test_vim_edits_a_file_over_pty` (D3) runs vim
-  under `tools/linux-m8/ptyrun`, which relays the console to a PTY master.
+- Tested by `cargo:lumen-tty`, `scenario:test_linux_io::test_pty_termios_and_job_control`
+  and D3's `scenario:test_alpine::test_vim_edits_a_file_over_pty`, which
+  runs vim under `tools/linux-m8/ptyrun` (section 15).
 
 ### The console as a tty (C10)
 
@@ -8206,10 +8415,7 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
   M7's `ConsoleIo` routing (`VfsInode::is_tty`) becomes the `Tty`'s;
   `usertest`'s capture mode keeps M7's path.
 - Tested by `scenario:test_linux_io::test_console_ash_job_control`
-  (interactive `ash -i` on the serial console: a pipeline, a background
-  job with `&` and `jobs`, Ctrl-Z stopping a foreground job and `fg`
-  continuing it, Ctrl-C ending one without ending the shell, `stty`
-  changing the discipline).
+  (section 15).
 
 ## 11. GUI and the automation API (built in M4: designed in #146, built by #147 to #157)
 
@@ -9847,52 +10053,255 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
 **M8's tests (designed in #336).**
 
 - **Scenario files.** B0 adds `tests/scenarios/test_linux_proc.py`
-  (processes, threads, signals, `futex`, sessions, the small syscalls),
-  `test_linux_io.py` (pipes, FIFOs, readiness, PTYs, the console as a tty),
-  `test_linux_vm.py` (cross-CPU shootdowns) and `test_conformance.py`
-  (libc-test), each empty until its issue's first test; the gates extend
-  `test_alpine.py`, and C11 extends `test_smp.py`. Each feature goes in
-  its area's file: `process.toml`, `signal.toml`, `futex.toml`,
-  `pipe.toml`, `tty.toml` (created by Phase A), `mm.toml` (B4, B5, B7),
-  `sched.toml` (B2, B6), `fs.toml` (B8, `mknod`), and the gates in
-  `user.toml` beside M7's `test_alpine` rows.
-- **`tools/linux-m8/` test programs** (B0's skeleton): `m8_proc`
   (processes, threads, signals, `futex`, timers, sessions, the small
-  calls), `m8_io` (pipes, FIFOs, `poll`/`select`, PTYs), `m8_vm`
+  syscalls), `test_linux_io.py` (pipes, FIFOs, readiness, PTYs, the
+  console as a tty), `test_linux_vm.py` (cross-CPU shootdowns) and
+  `test_conformance.py` (libc-test), each empty until its issue's first
+  test; the gates extend `test_alpine.py`, and C11 extends `test_smp.py`.
+- **Feature files.** Each feature goes in its area's file:
+  `process.toml` (B1, C1, C2, C3, C8, C12), `signal.toml` (C5, C6, C13),
+  `futex.toml` (C4), `pipe.toml` (B3, C7), `tty.toml` (C9, C10; these five
+  created by Phase A), `mm.toml` (B4, B5, B7), `sched.toml` (B2, B6),
+  `smp.toml` (C11), `elf.toml` (C2's lumen-elf changes), `fs.toml` (B8,
+  `mknod`), `user.toml` (B0's ABI and census tests, and the gates beside
+  M7's `test_alpine` rows).
+- **`tools/linux-m8/` test programs** (B0's skeleton): `m8_proc`
+  (processes, threads, signals, faults, `futex`, timers, sessions, the
+  small calls), `m8_io` (pipes, FIFOs, `poll`/`select`, PTYs), `m8_vm`
   (shootdowns) and `ptyrun` (D3: opens `/dev/ptmx`, starts its argument
   on the slave as a session leader with it as its controlling terminal,
   puts its own terminal (the console) in raw mode without echo, and relays
   bytes between its own stdin/stdout and the master, setting the PTY's
-  window size from its own). Dynamically linked against
-  musl, `#![no_std]`, built with the pinned `rustc --target
+  window size from its own). Dynamically linked against musl,
+  `#![no_std]`, built with the pinned `rustc --target
   x86_64-unknown-linux-musl` and `rust-lld` exactly as `tools/linux-m7/`
-  (section 15 above), into `build/linux/`, so both images stage them
-  (`tools/mkrootfs.sh` and `tools/mkrootfs-dev.sh` copy `build/linux/*`).
-  Each mode prints one `ok <check>` line per check and names the first
-  failure, exiting with its number (`m7_vfs`'s convention). A check about
-  a syscall calls it by number (inline `syscall`, raw `-errno`); a check
-  about libc's use of the kernel (`pthread_create`, `posix_spawn`,
+  (above), into `build/linux/`, so both images stage them. Each mode
+  prints one `ok <check>` line per check and names the first failure,
+  exiting with its number (`m7_vfs`'s convention). A check about a syscall
+  calls it by number (inline `syscall`, raw `-errno`); a check about
+  libc's use of the kernel (`pthread_create`, `posix_spawn`,
   `pthread_mutex_*`, `sigaction`, `alarm`, `timer_create` with
   `SIGEV_THREAD`) calls musl, which is the point there.
 - **Timed checks** obey the busy-host rule (CLAUDE.md): a sleep, a futex
   timeout, a `poll` or `select` deadline, an interval timer and a balance
   pass are each checked to have lasted at least their time (a floor),
-  never at most; a race is checked by its outcome over many rounds, not
-  by how long it took.
+  never at most. A time left written back (`nanosleep`'s `rem`,
+  `select`'s `tv`, `ppoll`'s and `pselect6`'s `timespec`) is checked only
+  to be at most the time given and at least 0.
+- **Nothing left to chance.** A cross-CPU scenario pins its threads with
+  `sched_setaffinity` and confirms each placement with `getcpu` before it
+  measures anything. A test of a signal interrupting a wait resends the
+  signal until it has seen the `EINTR` or the restart, and a futex wake or
+  requeue test loops until the expected count of waiters is queued, so
+  neither depends on who runs first. A race ktest has a ktest-only delay
+  knob at the exact point it races and names the mutant it kills.
+- **Leak counts.** The scenarios that count leaked frames (`linux` prints
+  the frames a run kept; `rootfs.run_busybox`) first confirm no process the
+  run started is still live (a root's children outlive the `linux`
+  command under pid 1, section 8): a program that leaves children kills or
+  waits for them before the count, and the scenario checks that none is
+  left with the `procs` shell command B1 adds (`PROCS`'s processes, pid 1
+  aside).
+
+**What each test checks** (the issue in brackets; every scenario check is
+one `ok` line of a `tools/linux-m8` mode):
+
+- `ktest:lumen_kernel::mm::frame::named_reservations_are_complete` (B4):
+  `frame::REFS` is reserved under its name, as hard rule 2's check covers
+  every reservation.
+- `ktest:lumen_kernel::mm::frame::refcount_and_cow_split` (B4): counts
+  through `fork_copy`; a split at count 2 and the reuse at 1; a shared
+  anonymous page staying shared, and writable in both, after `fork`;
+  `teardown` freeing exactly the frames it owned.
+- `ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only`
+  (B4): `mprotect(PROT_WRITE)` on a private leaf whose count is 2 leaves it
+  read-only, and the next write splits it; on a shared anonymous VMA it
+  sets `WRITABLE`.
+- `ktest:lumen_kernel::mm::tlb::shootdown_across_cpus` (B5): a test address
+  space loaded on three target CPUs by threads pinned there (not
+  `run_on`, whose jobs run on `kernel_root()` and would make it vacuous),
+  each probing a page with `read_u32_nofault` in a loop; one CPU unmaps
+  it: once `shoot_down` returns, every probe answers `Fault`. Also a full
+  flush past 32 pages; a target spinning with an IRQ-off `SpinLock` held
+  answering once it lets go; a target that switched away answering
+  through `active`.
+- `ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space`
+  (B7): two spaces mapping one file, the second loaded on another CPU, and
+  a third forked from one: after the truncate none reads past the new end.
+- `scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
+  (C11): threads pinned to every CPU reading a page another thread unmaps
+  or protects: each gets `SIGSEGV` afterwards and none reads stale data;
+  `fork` from a threaded parent while a sibling writes on another CPU
+  (`fork_copy`'s full flush: the child never sees a write made after the
+  fork); a copy-on-write split's single-page shootdown with a sibling
+  reading the page.
+- `scenario:test_linux_proc::test_fork_wait_and_exit_status` (C1): status
+  words for `exit` codes and fatal signals, with no core bit; `WNOHANG`
+  returning 0 and `ECHILD` with no children; `wait4` with `pid` -1, 0 and
+  `-pgid`; `waitid`'s `siginfo`, and its zeroed `infop` with `WNOHANG`;
+  `rusage` floors after a child that spins; a zombie until reaped, and an
+  orphan's `getppid` becoming 1; `SIG_IGN` and `SA_NOCLDWAIT` reaping
+  automatically (`wait` then `ECHILD`); `exit` ending one thread and
+  `exit_group` all; `kill(1, sig)` doing nothing; both census `clone`
+  flag sets; `vfork`.
+- `scenario:test_linux_proc::test_fork_cow_and_exec_shebang` (C2, C3):
+  parent and child writing the same heap, stack and file-private
+  (`MAP_PRIVATE`) page after `fork`, each seeing only its own; shared
+  anonymous memory staying shared; `#!` (a script, a nested script,
+  `-ELOOP`, an empty interpreter `-EACCES`), `/proc/self/exe` the
+  interpreter and `comm` the script; `O_CLOEXEC` closing; a reset handler,
+  an ignored signal staying ignored and a cleared alternate stack; `E2BIG`;
+  a `vfork` child's `execve` releasing its parent; a binary over 16 MiB
+  (built by `tools/linux-m8`, padded); and from a process with threads, a
+  non-leader's `execve` taking the pid, the other threads gone,
+  `clear_child_tid` written in the old space (seen by a `pthread_join`
+  there), POSIX timers deleted and an `alarm` surviving.
+- `scenario:test_linux_proc::test_pthread_create_and_join` (C3): the clone
+  flag matrix's `EINVAL` order; `CLONE_SETTLS` with `tls >= USER_MAX`
+  `EPERM`; `CLONE_FS` and `CLONE_FILES` without `CLONE_THREAD` sharing
+  what they name; the exit-signal deviation; `pthread_create`/`join`,
+  thread exit waking the joiner through `clear_child_tid`; `MAX_STACKS`
+  exhaustion giving `EAGAIN` and leaking no frames; a thread `clone`
+  racing `exit_group` never outliving it.
+- `scenario:test_linux_proc::test_futex_timeouts_and_nanosleep` (C4):
+  timed waits lasting at least their timeout; wakes, requeues and bitsets,
+  each looped until the expected count; private and shared ops on one
+  word not meeting; `File`, `SharedFrame` and `Anon` keys across `fork`
+  (a shared file page and a shared anonymous page wake across processes,
+  a private one doesn't); `WAIT` on an untouched `mmap` page and on a not
+  yet faulted file page giving `EAGAIN` or blocking, never `EFAULT`;
+  `CMP_REQUEUE` with `uaddr1` untouched; `FUTEX_CLOCK_REALTIME` with plain
+  `WAIT` `ENOSYS`; robust lists: a mutex whose holder thread exits gives
+  the next locker `EOWNERDEAD`, `get_robust_list` with `len` other than 24
+  `EINVAL`; `nanosleep` and `clock_nanosleep` floors, `TIMER_ABSTIME`
+  included.
+- `scenario:test_linux_proc::test_futex_and_pthread_mutex_stress` (C11):
+  threads pinned across CPUs incrementing a shared counter under a
+  `pthread_mutex` and handing turns through a condition variable, a fixed
+  number of iterations each, the total checked exact.
+- `scenario:test_linux_proc::test_signals_and_sigaltstack` (C5): handlers
+  with `SA_SIGINFO` on and off an alternate stack, `SA_RESTART`,
+  `SA_RESETHAND`, `SA_NODEFER`, masks, `kill`/`tkill`/`tgkill`, `raise`,
+  `rt_sigqueueinfo` (and its `EPERM` for a positive `si_code` sent to
+  another process); `m8_proc faults`, one `ok` per row of section 6's
+  table, each read by an `SA_SIGINFO` handler (`si_signo`, `si_code`,
+  `si_addr`): `#DE`, `#UD`, `#BP`, `#GP` from `hlt`, `#SS` from a bad stack
+  segment load, `#XM` with an unmasked SSE exception, `SEGV_MAPERR` against
+  `SEGV_ACCERR`, `SIGBUS` past a file's end; a blocked or ignored fault
+  signal killing; a ring-3 `#DB` (a `pushf`/`popf` setting `TF`) giving
+  `TRAP_TRACE`; `force_sigsegv` (a `SIGSEGV` handler on the alternate stack
+  catching a `SIGUSR1` frame that couldn't be written); `rt_sigreturn`'s
+  refusals, one check each: an `MXCSR` outside `MXCSR_MASK`, `XSTATE_BV`
+  outside `XCR0`, `XCOMP_BV` non-zero, a bad `CS`/`SS`, a non-canonical
+  `rip`, and bad software magic falling back to FX-only (the XMM state
+  reset); XMM registers and `MXCSR` surviving a handler. The FX-only path
+  runs with QEMU's default CPU (no `XSAVE`); the XSAVE path in the same
+  scenario on a CPU model with `XSAVE` (`Machine(cpu=...)`). `#AC` (needs
+  `CR0.AM` set, which Lumen doesn't) and `#MF` (an x87 exception with
+  `CR0.NE`) are not tested: listed as gaps.
+- `scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait` (C6):
+  `EINTR` and restarts from a blocking `read`, `wait4`, `nanosleep` and
+  `pselect6`, each signal resent until the outcome is seen;
+  `restart_syscall` after a signal with no handler (a stop and continue
+  during `nanosleep`); `SIGCHLD` waking `rt_sigsuspend`; `rt_sigtimedwait`
+  (a wanted signal, `EAGAIN` at its timeout), `rt_sigpending`, `pause`;
+  stop and continue with `WUNTRACED`/`WCONTINUED`.
+- `scenario:test_linux_proc::test_interval_and_posix_timers` (C13):
+  `alarm` and `setitimer` floors; `timer_create` with each notification
+  (`SIGEV_SIGNAL`, `SIGEV_THREAD_ID`, `SIGEV_NONE`, and musl's
+  `SIGEV_THREAD`); `timer_settime` absolute and relative; the 33rd timer
+  `EAGAIN`; `timer_getoverrun` after a blocked signal; `timer_delete`
+  discarding the pending signal; `fork` inheriting no timer.
+- `scenario:test_linux_proc::test_sessions_and_process_groups` (C8): each
+  call's success and errno cases, `kill` of a group, `tcsetpgrp` on a
+  tid giving `EPERM`.
+- `scenario:test_linux_proc::test_small_syscalls` (C12): `getcpu` after
+  pinning; `getpriority` returning `20 - nice` after `setpriority`; the
+  `prctl` name round trip; `statfs`'s magic for ext4, tmpfs and procfs;
+  `getrusage` floors; `sysinfo`; `prlimit64(RLIMIT_STACK)` and then
+  `execve`, checking the `[stack]` line's size in `/proc/self/maps` and
+  the argument budget the new limit gives.
+- `ktest:lumen_kernel::sched::nice_scales_slices` (B6) checks the
+  scheduler uses `lumen_time::slice_ticks(nice)`, a pure function B6 adds
+  with Linux's weight table (host-tested: `cargo:lumen-time`); the
+  balancer ktests
+  (`threads_migrate_to_idle_cpus`, `pinned_threads_never_migrate`) drive
+  balance passes directly through a ktest-only call, counting passes,
+  never time; `ktest:lumen_kernel::sched::migration_keeps_user_state`
+  moves a user thread between CPUs between its `syscall`s and checks its
+  XMM registers, `fs_base` and GPRs after each.
+- `ktest:lumen_kernel::linux::process::shared_description_offsets_move_once`
+  (B8): two threads reading one description, regular and procfs, every
+  byte read once, with a delay knob at the procfs snapshot (it kills the
+  mutant that drops `pos`); a copy-out fault's give-back under contention.
+  `ktest:lumen_kernel::linux::process::shared_description_getdents_lists_once`:
+  two threads listing one directory through one description, each name
+  listed once (hazard 3). `ktest:lumen_kernel::linux::process::dup_and_openat_reserve_their_slot`:
+  a racing `dup2` onto a reserved slot is `-EBUSY`; a full table refuses
+  an `O_CREAT` before it creates.
+- `scenario:test_linux_io::test_pipes_and_poll` (C7): a pipeline of
+  busybox applets, `PIPE_BUF` atomicity between two writers, `EOF`,
+  `EPIPE`/`SIGPIPE`, `O_NONBLOCK`, `F_SETPIPE_SZ`, `dup2` redirections, a
+  FIFO's open rules, `poll` on both ends; `mknodat`'s errno rows
+  (`S_IFDIR` `EPERM`, a bad type `EINVAL` before the lookup, `S_IFCHR`
+  `EPERM`, `EEXIST`, devfs `EROFS`); an ext4 FIFO, after which the image
+  passes `e2fsck -fn`.
+- `scenario:test_linux_io::test_poll_and_select_on_console` (B3): `poll`,
+  `ppoll`, `select` and `pselect6` on the console's stdin with and without
+  typed input; timeouts at least their time; the time left written back;
+  `POLLNVAL`; `pselect6`'s mask swap, deterministically (`SIGCHLD`
+  blocked, a child exits, `pselect6` with it unblocked is interrupted);
+  an interrupted `poll` leaving no `PollHead` subscriber (the console's
+  head counted through a test-only count in `serial`).
+- `scenario:test_linux_io::test_pty_termios_and_job_control` (C9): a
+  `tools/linux-m8` program opening `/dev/ptmx`, a child on the slave as a
+  session leader: canonical and raw reads, echo, `VMIN`/`VTIME`, Ctrl-C as
+  `SIGINT` to the foreground group, `TIOCSPGRP` and a background read's
+  `SIGTTIN`, a background `TCSETS`'s `SIGTTOU`, an orphaned group's read
+  `EIO`, `TIOCSCTTY` and `TIOCNOTTY`, `SIGWINCH`, the session leader's
+  exit sending `SIGHUP`, the master's close hanging the slave up.
+- `scenario:test_linux_io::test_console_ash_job_control` (C10):
+  interactive `ash -i` on the serial console: a pipeline, a background
+  job with `&` and `jobs`, Ctrl-Z stopping a foreground job and `fg`
+  continuing it, Ctrl-C ending one without ending the shell, `stty`
+  changing the discipline. Ctrl-Z and Ctrl-C are sent only after the job
+  has printed a "ready" line. The VT consoles' ttys are a stated gap: one
+  check (a line read from VT 1 through its tty) in the same scenario.
+- The gates (D1–D4):
+  - D1: `scenario:test_alpine::test_ash_scripts_and_pipelines` (busybox
+    `ash` scripts with pipelines, redirections, subshells, `$(...)`,
+    traps, `wait` and background jobs);
+  - D2: `scenario:test_alpine::test_gcc_gpp_compile_cpp_and_shared_lib`
+    (the dev image, 512 MiB: `make -j1` builds C++ with exceptions and a
+    `.so` and runs them, then `make -j2` on two trivial rules; D2 adds a
+    low-water mark of free frames to `mem`, read after the build as a
+    floor);
+  - D3: `scenario:test_alpine::test_local_git_and_sqlite3` (git
+    init/commit/log/diff/merge; sqlite3 with WAL and POSIX locks) and
+    `scenario:test_alpine::test_vim_edits_a_file_over_pty` (vim `-u NONE`
+    with `ttimeoutlen=0`, under `ptyrun`, keys typed over the console with
+    the screen confirmed between steps, the file checked after; D3 needs
+    C13);
+  - D4: `scenario:test_conformance::test_musl_libc_test_core` (below).
+- C5 moves the M6/M7 scenarios that match the old fault exits to the
+  signals': `tests/scenarios/test_linux_user.py` lines 50, 116 and 499
+  (`exit=135 (bus error)` and the fault lines).
+
 - **The developer image (#344, merged in #366).** `make deps-dev`
   fetches the 34 packages `tools/alpine-packages.lock` pins (gcc, g++,
   make, musl-dev, binutils, git, sqlite, vim and their closure; 95.3 MiB
-  of `.apk`s, sha256-checked) into `build/deps/alpine-packages/`, and
-  `make rootfs-dev` assembles `build/alpine-dev.ext4` deterministically
-  (353 MiB, 289 MiB used, 3.6–4.8 s). Each gate scenario copies it with
+  of `.apk` files, sha256-checked, 94.8 MiB once zstd-compressed in a
+  cache) into `build/deps/alpine-packages/`, and `make rootfs-dev`
+  assembles `build/alpine-dev.ext4` deterministically (353 MiB, 289 MiB
+  used, 3.6–4.8 s). Each gate scenario copies it with
   `rootfs.copy_dev_rootfs` (a clone on APFS, btrfs or XFS: 3 ms on macOS;
   a full copy on CI's ext4: 0.14–0.20 s) and boots it with 512 MiB of
   guest RAM (`Machine(memory="512M")`; the harness's default is 256 MiB).
-- **Guest RAM for D2: 512 MiB, replacing the M8 plan's 1 GiB.** #344's
-  costs of a `make -j1` build of its C++ demo at its peak (`cc1plus -O2`
-  running), with section 8's loader (segments copied into private frames,
-  no whole-file heap buffer, so #344's 40 MiB heap high-water row is
-  gone):
+- **Guest RAM for D2: 512 MiB**, replacing the M8 plan's 1 GiB (the old
+  ROADMAP row gave a range, 512 MiB–1 GiB). #344's costs of a `make -j1`
+  build of its C++ demo at its peak (`cc1plus -O2` running), with section
+  8's loader (segments copied into private frames, no whole-file heap
+  buffer, so #344's 40 MiB heap high-water row is gone):
 
   | Consumer | MiB |
   |---|---|
@@ -9904,89 +10313,62 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
   | tmpfs `/tmp` (gcc's temporaries) | 0.2 |
   | **user and cache total** | **about 167–199 (255–287 for the header file)** |
 
-  The kernel's own memory comes on top (image, frame bitmap and reference
-  counts, page tables, stacks, heap: tens of MiB), and the firmware keeps
-  some of the 512 MiB, leaving about 450–480 MiB usable: a margin of at
-  least 220 MiB for the demo and at least 140 MiB for the header file,
-  after the kernel's share. The `make -j2` step adds no compile (its rules
-  run `true`); a `-j2` build of two demo files would add about 125 MiB
-  (a second `cc1plus`'s 84 and its own 41 MiB image copy) and still fit,
-  but the gate doesn't run one. 1 GiB would be needed only for parallel
-  builds of heavy files. The numbers are #344's host measurements; D2's
-  PR checks the guest's free frames at the peak (`mem`), as a floor.
-- **The gates (D1–D4) and their scenario tests:**
-  - D1: `scenario:test_alpine::test_ash_scripts_and_pipelines` (busybox
-    `ash` scripts with pipelines, redirections, subshells, `$(...)`,
-    traps, `wait` and background jobs);
-  - D2: `scenario:test_alpine::test_gcc_gpp_compile_cpp_and_shared_lib`
-    (the dev image, 512 MiB: `make -j1` builds C++ with exceptions and a
-    `.so` and runs them, then `make -j2` on two trivial rules);
-  - D3: `scenario:test_alpine::test_local_git_and_sqlite3` (git
-    init/commit/log/diff/merge; sqlite3 with WAL and POSIX locks) and
-    `scenario:test_alpine::test_vim_edits_a_file_over_pty` (vim under
-    `ptyrun`, keys typed over the console, the file checked after);
-  - D4: `scenario:test_conformance::test_musl_libc_test_core` (below).
-- **How CI caches it.** The fetch is the one slow step: 33–44 s from
-  dl-cdn on #344's Linux host, 49 minutes on a slow route from macOS.
-  What `ci.yml` caches today: `build/deps` (Limine, OVMF, busybox, the
-  minirootfs) in one `actions/cache` entry keyed on
-  `hashFiles('tools/fetch-deps.sh')`, and, since #369, the pinned `zig`
-  and `libc-test` sources in a second entry of their own,
-  `build/deps/zig` and `build/deps/libc-test`, keyed on
-  `hashFiles('tools/fetch-zig.sh', 'tools/fetch-libc-test.sh')`, in four
-  steps: `actions/cache/restore`; the fetch (`make deps-zig` and
-  `tools/fetch-libc-test.sh`, a 15-minute step limit); `actions/cache/save`
-  only when the fetch succeeded on a miss (so a slow but complete download
-  is kept even if a later step fails, and a failed fetch never writes the
-  key); then the build (`make libc-test`, a 10-minute limit). The two
-  entries' paths overlap (`build/deps` holds `zig` and `libc-test` too,
-  and would hold `alpine-packages`), which #369 noted and left alone.
-  **To be added** (by the durable-mirror PR below, before D2, D3 and D4
-  merge): a third entry for `build/deps/alpine-packages/`, keyed on
-  `hashFiles('tools/alpine-packages.lock')` (94.8 MiB stored), in #369's
-  four-step pattern (restore, `make deps-dev`, save on a successful fetch
-  after a miss, then `make rootfs-dev`), and exclusions in the
-  `build/deps` entry (`!build/deps/alpine-packages`, `!build/deps/zig`,
-  `!build/deps/libc-test` in its `path`) so no file sits in two entries.
-  The image itself is not cached: it is rebuilt from the packages on every
-  run in about 5 s. The cache is not a durable source: Alpine drops a
-  superseded `-rN` package from dl-cdn, and an evicted cache entry would
-  then fail the fetch. The durable mirror (each locked `.apk` as a release
-  asset named by its sha256, the fetch trying dl-cdn first and the mirror
-  second, every file sha256-checked whichever source served it) lands in
-  its own small PR with that cache step.
-- **libc-test (D4; the zig pin merged in #368, the build and harness in
-  #369).** `tools/fetch-zig.sh` (`make deps-zig`) installs zig 0.15.2 into
-  `build/deps/zig`, sha256-checked against ziglang.org's index, trying
-  ziglang.org and then two community mirrors (a source slower than
-  100 KB/s for 30 s dropped for the next), its install serialised by
-  `build/deps/zig.lock`; zig 0.15.2's musl is 1.2.5, Alpine 3.21's.
-  `make libc-test` fetches libc-test at its pinned commit
-  (`tools/fetch-libc-test.sh`, from `repo.or.cz`) and builds
-  `src/functional` and `src/regression`, static and dynamic, with `zig cc
-  -target x86_64-linux-musl` into `build/libc-test/`
-  (`tools/build-libc-test.sh`: `tests.txt`, `not-built.txt`; 284 tests
-  built, every binary's linkage checked). D4 stages that directory into an
-  image as `/libc-test` (D4 decides which image), boots it, and runs each
-  test under libc-test's own `runtest` (which forks, `execve`s, and times
-  each out with `sigtimedwait` and `kill`, so D4 needs C1, C2, C5 and C6),
-  printing an `EXIT <path> <code>` line after each, as
-  `lumen_harness.libctest`'s driver does natively (`runtest -t 30`: 30 s
-  is that harness's choice, runtest's own default is 5 s). The harness
-  parses the transcript into pass, fail and error, and compares it with
-  `tests/conformance/libc-test-xfail.txt`: each entry a test's path, a
-  reason and an issue; a runner error (`[internal]`, `[unknown]`, exit
-  255, runtest's own `exec`/`sigtimedwait`/`kill failed` lines, the
-  loader failing to start a test, status 126 or 127) is never covered by
-  one; a listed test that passes fails the run (so the list can't go
-  stale); a test with no `EXIT` line counts as not run. The checked-in
-  list is empty today (comments only). On CI's x86-64 Linux, 274 of the
-  284 pass natively (`NATIVE_PASS` in `tests/harness/test_libctest.py`,
-  recorded by #369); the 10 that fail there too (`mntent`, `strptime`,
-  `wordexp`, `regex-backref-oob` and `regexec-backref`, each static and
-  dynamic: most likely libc-test's tip checking musl fixes newer than
-  1.2.5) are added to the list by D4, with a tracking issue (a musl
-  bump), together with each test Lumen fails, each with its own issue.
+  The firmware keeps some of the 512 MiB, leaving about 450–480 MiB
+  usable, and the kernel's own memory (image, frame bitmap and reference
+  counts, page tables, stacks, heap) is taken as 30 MiB: a margin of at
+  least 220 MiB for the demo and at least 130 MiB for the header file
+  (both from 450 MiB). The `make -j2` step adds no compile (its rules run
+  `true`); a `-j2` build of two demo files would add about 125 MiB (a
+  second `cc1plus`'s 84 and its own 41 MiB image copy) and still fit, but
+  the gate doesn't run one. 1 GiB would be needed only for parallel builds
+  of heavy files. The numbers are #344's host measurements; D2's free-frame
+  low-water mark checks them in the guest.
+- **How CI caches it.** The fetch is the one slow step (33–44 s from
+  dl-cdn on #344's Linux host, 49 minutes on a slow route from macOS).
+  Since #369, `ci.yml` caches the pinned zig and libc-test sources in an
+  entry of their own, in four steps: restore; fetch; save only after a
+  successful fetch on a miss; build. To be added, by the durable-mirror
+  PR before D2, D3 and D4 merge: an `actions/cache` entry for
+  `build/deps/alpine-packages/` keyed on
+  `hashFiles('tools/alpine-packages.lock')`, in the same four steps
+  (restore, `make deps-dev`, save, `make rootfs-dev`), and exclusions in
+  the existing `build/deps` entry (`!build/deps/alpine-packages`,
+  `!build/deps/zig`, `!build/deps/libc-test`) so no file sits in two
+  entries. The image itself is not cached: it is rebuilt from the packages
+  on every run in about 5 s. The cache is not a durable source: Alpine
+  drops a superseded `-rN` package from dl-cdn, and an evicted cache entry
+  would then fail the fetch. The durable mirror (each locked `.apk` as a
+  release asset named by its sha256, the fetch trying dl-cdn first and the
+  mirror second, every file sha256-checked whichever source served it)
+  lands in that PR.
+- **libc-test (D4; zig pinned by #368, the build and harness by #369).**
+  `make libc-test` builds libc-test's `src/functional` and `src/regression`,
+  static and dynamic, with the pinned zig into `build/libc-test/` (284
+  tests). D4 stages that directory into an image as `/libc-test` (D4
+  decides which image), boots it, and runs each test under libc-test's own
+  `runtest` (which forks, `execve`s, and times each out with
+  `sigtimedwait` and `kill`, so D4 needs C1, C2, C5 and C6), printing an
+  `EXIT <path> <code>` line after each, as `lumen_harness.libctest`'s
+  driver does natively (`runtest -t 30`: 30 s is that harness's choice,
+  runtest's own default is 5 s). The harness parses the transcript into
+  pass, fail and error, and compares it with
+  `tests/conformance/libc-test-xfail.txt` (each entry a test's path, a
+  reason and an issue; a runner error, which `lumen_harness.libctest`
+  lists, is never covered by one; a listed test that passes fails the
+  run; a test with no `EXIT` line counts as not run). The list is empty
+  today. 274 of the 284 pass natively on CI's x86-64 Linux (`NATIVE_PASS`
+  in `tests/harness/test_libctest.py`). D4 adds to the list, each with an
+  issue: the 10 that fail natively too (`mntent`, `strptime`, `wordexp`,
+  `regex-backref-oob` and `regexec-backref`, each static and dynamic:
+  most likely libc-test's tip checking musl fixes newer than 1.2.5;
+  tracked by a musl-bump issue); `pthread_mutex_pi` and
+  `pthread_mutex_pi-static` (PI futexes stay `-ENOSYS`, section 8; a
+  backlog issue); and each test Lumen fails. `runtest -t 30` is a ceiling
+  on the guest's clock, which a busy host stretches, so D4 extends the
+  harness: a timed-out test is its own class and is run once more before
+  it counts as failed, and an entry may be marked `flaky` (it covers a
+  fail or a timeout, never an error, and is exempt from the
+  listed-pass-fails rule), each with its issue.
 - **Which gates need the heavy tier: none in M8.** Every M8 gate runs in
   the PR tier under KVM: D1 (busybox scripts), D2 (one `-j1` C++ build of
   #344's demo, 0.85 s on the host, and a `.so`), D3 (git, sqlite3, vim)
@@ -10056,7 +10438,7 @@ crates/            no_std, host-testable libraries (lumen-acpi, lumen-app-api, l
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template
-tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), linux-hello/ (M6), linux-m7/ (M7), ext4-signed-hash.sh (mkrootfs.sh's #308 switch), ext4-unsigned-hash-image.py (makes kernel/src/vfs/testdata/unsigned-hash.ext4, #308), wallpaper.py (makes the wallpaper), harness/ (Python package)
+tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), mkrootfs-dev.sh and fetch-alpine-packages.sh (the developer image, #344), fetch-zig.sh and fetch-libc-test.sh/build-libc-test.sh (libc-test, #368, #369), linux-hello/ (M6), linux-m7/ (M7), linux-m8/ (M8, designed in #336), ext4-signed-hash.sh (mkrootfs.sh's #308 switch), ext4-unsigned-hash-image.py (makes kernel/src/vfs/testdata/unsigned-hash.ext4, #308), wallpaper.py (makes the wallpaper), harness/ (Python package)
 vendor/            patched copies of crates.io dependencies, via [patch.crates-io] (ext4plus, #313)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)
