@@ -1,0 +1,6 @@
+# Features: process. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Process tree rules: wait, reparenting, groups, sessions (logic)"
+milestone = "M8"
+tests = ["cargo:lumen-proc"]
