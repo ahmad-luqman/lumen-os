@@ -358,7 +358,7 @@ def render_toml(meta: dict[str, object], seen: dict[str, Seen]) -> str:
     number order, with its `args` and `errors` subtables when not empty."""
     out = [
         "# The M8 syscall census (#337), written by tools/syscall-census.sh: do not edit.",
-        "# Regenerate it by running that script on an x86-64 Linux Docker host.",
+        "# Regenerate it by running that script on an x86-64 Linux Docker or Podman host.",
         "",
         "[meta]",
     ]
