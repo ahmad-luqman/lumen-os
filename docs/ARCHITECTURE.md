@@ -1215,9 +1215,10 @@ whose `active` has another CPU in it:
 - not `teardown` or `drop`: `teardown` (run by whoever lowers the space's
   `users` to 0, section 8: the last thread of the last process using it,
   or `execve` letting its old space go), after switching its own CPU off
-  the space, waits until the space's `active` is empty (another thread's
-  CPU still running its last instructions on the root, a killed thread's
-  included) before it frees anything, and `drop` runs only once no CPU
+  the space, waits until the space's `active` is empty (a CPU that loaded
+  the root, such as one whose thread is between its detach and its
+  switch, not yet done with it) before it frees anything, and `drop` runs
+  only once no CPU
   holds the root.
 
 Tested by `ktest:lumen_kernel::mm::tlb::shootdown_across_cpus`,
@@ -1273,7 +1274,8 @@ its own sub-window (RW, NX, write-back; all or nothing, shared with the
 heap in `mm/window.rs`) and registers the stack. Dropping one retracts it
 from the registry, then unmaps it, frees its frames and gives its slot
 back (#300): the slot joins the window's free ranges (up to
-`FREE_RANGES`, 256; adjacent ones joined, so there is at most one more
+`FREE_RANGES`, 256 (1024 from C3, `2 * MAX_STACKS`); adjacent ones joined,
+so there is at most one more
 than the slots taken), tagged with the generation its pages were retired
 at (section 4, "Retiring stack pages"; the newest of a joined range's
 parts, which may come back out of order). `new` takes the lowest free range
@@ -1828,8 +1830,13 @@ the syscalls.
   end of each syscall (`SyscallExit::new(orig_rax)` as the syscall
   context), and when `lumen_isr_common` returns to ring 3 from an
   interrupt or exception (context `None`), the timer's preemption
-  included. If `sigpending` is set: a `group_exit` ends the thread (section
-  8, "Exit"); a group stop parks it (below); otherwise
+  included. If `sigpending` is set: a `group_exit`, or a `SIGKILL` pending
+  for the thread, ends it (section 8, "Exit"), before any group-stop park;
+  while `exec_waiter` names another thread (`de_thread`, section 8) such a
+  thread ends through exit step 2 alone and records no `group_exit`, as
+  Linux's `do_group_exit` gives code 0 and kills no one while
+  `group_exec_task` is set (a sibling's own `exit_group` then also ends only
+  itself); a group stop parks it (below); otherwise
   `PendingSignals::dequeue(slot, blocked)` takes the next one, and its
   disposition decides: ignored, dropped; default `Term` or `Core`, a group
   exit with `ExitStatus::Killed`; default `Stop`, a group stop (`SIGTSTP`,
@@ -1930,7 +1937,8 @@ the syscalls.
   the default first, so it kills, as Linux's `force_sig_info_to_task`
   does. The one `WARN` M6 logs for a fatal ring-3 fault stays, for a
   fault whose signal kills the process.
-- Tested by `cargo:lumen-signal`, `scenario:test_linux_proc::test_signals_and_sigaltstack`
+- Tested by `cargo:lumen-signal`,
+  `scenario:test_linux_proc::test_signals_and_sigaltstack`
   and `scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait`
   (section 15, "M8's tests", says what each checks).
 
@@ -4272,31 +4280,31 @@ depends on them.
 | Label | Scope | Depends on | Owns (interfaces; tests) | Sections |
 |---|---|---|---|---|
 | B0 | the skeleton | M7 done | `M8_SYSCALLS`, the stub modules below, `syscalls.py`'s `PLANNED` changes and `ENOSYS_BY_DECISION`, empty scenario files, `tools/linux-m8/`; `m8_abi_constants_match_spec`, `test_m8_table_covers_the_census` | 8, 15 |
-| B1 | the process/thread split, behaviour unchanged | M7 done | `Process`, `UserThread`, `UserThreadState::linux`, `PROCS`, tids (`ProcTree::add_thread`/`remove_thread`), pid 1 (`linux::init`), the `ps` shell command; `procs_lookup_and_lifetime`, all M6/M7 scenarios unchanged | 8 |
-| B2 | the blocking wait and the syscall-exit hook | B1 | `wait_interruptible`/`wait_killable`, `kick`, the hook, `restart_syscall`, `raise_for_test`, `user::read_u32_nofault`/`cmpxchg_u32`/`fault_in_writable`; the wait, restart and nofault ktests | 6, 8, 15 |
-| B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `test_poll_and_select_on_console` | 10 |
-| B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended) | 5, 8 |
-| B5 | the TLB shootdown IPI | M7 done | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `tlb::shoot_down`; `mm::tlb::shootdown_across_cpus` | 5, 9 |
-| B6 | SMP migration, priorities, affinity | — | `on_cpu`, `spawn_migratable`, `spawn_user_on` migratable, `slice_ticks`; the migration and slice ktests | 6 |
+| B1 | the process/thread split, behaviour unchanged | M7 done | `Process`, `UserThread`, `UserThreadState::linux`, `PROCS`, `Files::users`, tids (`ProcTree::add_thread`/`remove_thread`), pid 1 (`linux::init`), the `ps` shell command; `procs_lookup_and_lifetime`, `cargo:lumen-proc`, all M6/M7 scenarios unchanged | 8 |
+| B2 | the blocking wait and the syscall-exit hook | B1 | `wait_interruptible`/`wait_killable`, `kick`, the hook, `restart_syscall`, `raise_for_test`, `user::read_u32_nofault`/`cmpxchg_u32`/`fault_in_writable`; the wait, restart and nofault ktests, `harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata` | 6, 8, 15 |
+| B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `poll_rechecks_after_a_wake`, `test_poll_and_select_on_console` | 10 |
+| B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended) | 5, 8 |
+| B5 | the TLB shootdown IPI | B2 | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `PerCpu::loaded_space`, `tlb::shoot_down`, the shootdown warning's `HOST_TIMED` entry; `mm::tlb::shootdown_across_cpus` (its probes use B2's `read_u32_nofault`) | 5, 9 |
+| B6 | SMP migration, priorities, affinity | C1 | `on_cpu`, `spawn_migratable`, `spawn_user_on` migratable (after C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
 | B7 | truncate reaching every address space | B1, B4, B5 | the inode's mappers list, `mmap_file(self: &Arc<Self>)`; `truncate_unmaps_every_address_space` | 5 |
 | B8 | the five M8 hazards | B1 | `OpenFile::pos`, `FdTable::reserve`, `PosixWaitGraph`'s key; the hazard ktests | 8, 9 |
-| C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | B0, B1, B2, B4 | `spawn_user_on` taking the `UserThread`, pinned to the caller's CPU (B6 makes it migratable); `test_fork_wait_and_exit_status` | 8 |
+| C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | B0, B1, B2, B4 | `spawn_user_on` taking the `UserThread`, pinned to the caller's CPU (B6 makes it migratable), `Files::users` across `fork`; `test_fork_wait_and_exit_status` | 8 |
 | C2 | `execve`, single-threaded, `#!`, the streaming loader | B0, C1 | lumen-elf's header split, `ImageSource`, the stack-size parameter; `test_fork_cow_and_exec_shebang` (its single-threaded checks) | 5, 8 |
-| C3 | threads | B0, B5, B6, C1, C2, C4 | `clone`'s thread flags, `de_thread`, the tid exchange, `MAX_STACKS`; `test_pthread_create_and_join` | 6, 8 |
+| C3 | threads | B0, B5, B6, C1, C2, C4, C5, C6 | `clone`'s thread flags, `de_thread`, the tid exchange, `MAX_STACKS`; `test_pthread_create_and_join`, `clone_racing_a_group_exit_never_escapes` | 6, 8 |
 | C4 | `futex`, robust lists, sleeps | B0, B1, B2, C1, C2 | `FutexKey`, the buckets, the `clear_child_tid` wake; `test_futex_timeouts_and_nanosleep` | 8 |
 | C5 | signal delivery and faults as signals | B0, B1, B2 | frames, `rt_sigreturn`, `sigaltstack`, `kill`/`tkill`/`tgkill`, `rt_sigqueueinfo`; `test_signals_and_sigaltstack` (its `EPERM` check runs two `linux` programs at once) | 5, 6, 8 |
 | C6 | restarts, signal waits, stop and continue | B0, B3, C1, C4, C5 | `pause`, `rt_sigsuspend`/`rt_sigtimedwait`/`rt_sigpending`, `SIGCHLD`, stops; `test_sigchld_and_sigint_interrupt_wait` | 6, 8 |
-| C7 | pipes, FIFOs, `dup*`, `SIGPIPE` | B0, B3, C1, C2, C5 | `PipeObject`, `mknod_at`; `test_pipes_and_poll` | 8, 9, 10 |
-| C8 | sessions and process groups | B0, C1, C5 | `test_sessions_and_process_groups` | 8 |
+| C7 | pipes, FIFOs, `dup*`, `SIGPIPE` | B0, B3, B8, C1, C2, C5 | `PipeObject`, the FIFO slot, `mknod_at`; `test_pipes_and_poll`, `poll_wakes_on_a_pipe_write` | 8, 9, 10 |
+| C8 | sessions and process groups | B0, C1, C3, C5 | `test_sessions_and_process_groups` | 8 |
 | C9 | PTYs, controlling terminals, job control | B0, C6, C7, C8 | devpts, `Tty`; `test_pty_termios_and_job_control` | 8, 9, 10 |
 | C10 | the console as a tty | C2, C9 | the console's `Tty` and input thread; `test_console_ash_job_control` | 10 |
-| C11 | multithreaded and cross-CPU scenarios | C3, C12 | `test_cross_cpu_munmap_and_mprotect_shootdown`, `test_futex_and_pthread_mutex_stress`, `test_multithreaded_workload_uses_all_cpus` | 5, 6, 15 |
-| C12 | the small syscalls and the census's leftovers | B0, B1, B6, C1, C2 | `FileSystem::statfs`, `RLIMIT_STACK` writes; `test_small_syscalls` | 6, 8 |
+| C11 | multithreaded and cross-CPU scenarios | C3, C5, C12 | `test_cross_cpu_munmap_and_mprotect_shootdown`, `test_futex_and_pthread_mutex_stress`, `test_multithreaded_workload_uses_all_cpus` | 5, 6, 15 |
+| C12 | the small syscalls and the census's leftovers | B0, B1, B6, C1, C2 | `FileSystem::statfs`, `RLIMIT_STACK` writes, the per-thread tick counts; `test_small_syscalls` | 6, 8 |
 | C13 | `setitimer`/`alarm`/`getitimer`, POSIX timers (new: not in the epic's first list) | C2, C3, C5, C6 | `TIMERS`, the timers thread, `PendingSignals::discard_if`; `test_interval_and_posix_timers` | 8 |
 | D1 | gate: ash scripts and pipelines | C1, C2, C6, C7 | `test_ash_scripts_and_pipelines` | 15 |
-| D2 | gate: gcc/g++ and make | C1–C7, C12 | `mem`'s low-water mark; `test_gcc_gpp_compile_cpp_and_shared_lib` | 15 |
+| D2 | gate: gcc/g++ and make | C1–C7, C12 | `mem`'s low-water mark; `low_water_mark_tracks_the_minimum`, `test_gcc_gpp_compile_cpp_and_shared_lib` | 15 |
 | D3 | gate: git, sqlite3, vim over a PTY | C1–C9, C12, C13 | `test_local_git_and_sqlite3`, `test_vim_edits_a_file_over_pty` | 15 |
-| D4 | gate: musl's libc-test | C1–C7, C12 | the harness's timeout class and `flaky` kind; `test_musl_libc_test_core` | 15 |
+| D4 | gate: musl's libc-test | C1–C7, C12 | the harness's timeout class and `flaky` kind; `harness:test_libctest::test_a_timed_out_test_is_run_once_more`, `harness:test_libctest::test_a_flaky_entry_covers_a_fail_or_timeout_never_an_error`, `test_musl_libc_test_core` | 15 |
 
 **Where the code lives.** `Process`, `UserThread` and `PROCS` in
 `kernel/src/linux/process.rs` (B1; C1 and B8 edit it too); the futex
@@ -4420,7 +4428,8 @@ mappings stay shared across `fork` (section 5; M7 maps them as private).
 `mprotect`, `munmap`, `brk` (10, 11, 12) shoot down other CPUs' TLB
 entries. `rt_sigaction`, `rt_sigprocmask`, `ioctl`, `getpid`, `exit`,
 `getppid`, `getpgrp`, `gettid`, `set_tid_address`, `fcntl`, `flock`,
-`truncate`, `ftruncate`, `exit_group` and `prlimit64` as in the table. `openat`'s `O_TRUNC` (257)
+`truncate`, `ftruncate`, `exit_group` and `prlimit64` as in the table.
+`openat`'s `O_TRUNC` (257)
 invalidates every address space's mappings, as `ftruncate`. `openat` and
 `dup*` reserve their descriptor slot before they open (section 9).
 
@@ -4592,7 +4601,7 @@ pub struct SignalState {
     preferred: Option<ThreadSlot>,           // select_target's cursor
     group_exit: Option<ExitStatus>,          // the first one wins
     exec_waiter: Option<u32>,                // the tid in de_thread
-    group_stop: Option<GroupStop>,           // signal, threads still running, generation
+    group_stop: Option<GroupStop>,           // signal, running threads, generation
     timers: Timers,                          // ITIMER_REAL and POSIX timers (C13)
     ctty: Option<Arc<Tty>>,                  // controlling terminal (C9/C10)
     rlimit_stack: u64,                       // for the next execve
@@ -4606,9 +4615,9 @@ pub struct ThreadSignals {
     alt_stack: AltStack,
 }
 pub struct UserThread {
-    tid: AtomicU32,                          // set in the PROCS hold; execve's exchange
+    tid: AtomicU32,                          // set in PROCS; execve may swap it
     process: Arc<Process>,
-    clear_child_tid: AtomicU64,              // set_tid_address, CLONE_CHILD_CLEARTID
+    clear_child_tid: AtomicU64,              // set_tid_address, CHILD_CLEARTID
     robust_list: AtomicU64,                  // set_robust_list's head (C4)
 }
 ```
@@ -4618,17 +4627,19 @@ pub struct UserThread {
   user_exit_rsp, pending_debug_trap }` (`kernel/src/sched.rs`): the
   context switch loads `CR3` from its `address_space`, and the `#PF` path
   reads it lock-free (`current_address_space()`). B1 adds to it
-  `linux: Option<Arc<UserThread>>` (`None` for a ktest's `UserSpaceGuard`)
-  and the thread's restart block (B2), both touched only by the thread
-  itself, and nothing else: `fs_base`, the FPU area and the pending-`#DB`
+  `linux: Option<Arc<UserThread>>` (`None` for a ktest's `UserSpaceGuard`;
+  set at spawn, read lock-free) and the thread's restart block (B2: an
+  `UnsafeCell<Option<RestartBlock>>` read and written only by its own
+  thread with interrupts off, as `set_current_fs_base` writes `fs_base`),
+  and nothing else: `fs_base`, the FPU area and the pending-`#DB`
   flag stay where they are. `Process::mm` is the process's reference to
   the same `Arc` every one of its threads holds in `address_space` (a
   thread `clone` hands the new thread the caller's); `execve`, which runs
   with one thread left, replaces both (below). A syscall finds its process
   through `UserThreadState::linux`, without a table lookup.
 - **`UserSlot`'s `Sync`** rests today on "a thread never migrates". From
-  B6 it rests on this: only the owning thread (with interrupts off, or in
-  its own syscalls) or the CPU that has claimed it through `on_cpu`
+  B6 it rests on this: only the owning thread, with interrupts off, or the
+  CPU that has claimed it through `on_cpu`
   (section 6's migration) touches the slot, and `Drop` runs when no other
   reference exists.
 - **`spawn_user_on`** (it exists) changes: C1 makes it take the
@@ -4753,9 +4764,12 @@ that arm); `exit_group` (231) and a fatal signal end the group:
      ignored) and wakes one waiter with a shared futex wake, as Linux's
      `mm_release` does only while `mm_users > 1` (C1 writes the 0; C4 adds
      the wake);
-   - detaches from its address space (`sched::detach_user_space()`:
-     `kernel_root()` loaded, its `active` bit cleared, its `Arc` dropped),
-     so a later `teardown`'s "`active` empty" is final;
+   - clones its `Arc<UserThread>` (and with it its `Arc<Process>`) out of
+     `UserThreadState::linux` for the steps after, then detaches from its
+     address space (`sched::detach_user_space()`, which takes the whole
+     `UserThreadState`: `kernel_root()` loaded, its `active` bit cleared,
+     its `Arc<AddressSpace>` dropped), so a later `teardown`'s "`active`
+     empty" is final;
    - adds its tick counts to the process;
    - under `PROCS` then `signal`, in one hold: moves the `preferred`
      cursor off its slot, removes its `ThreadSignals` and `ThreadSlot`
@@ -4979,20 +4993,26 @@ untouched):
    from the page cache: that keeps an executable's pages out of the `ext4`
    cache's 64 MiB hard limit (#344: a file-backed loader would pin about
    32 MiB of `cc1plus` while it runs). Everything step 6 needs is
-   allocated here too: an unshared `Files` if the table is shared (its
-   1024 slots), the new `exe_path` string.
+   allocated here too: the new `exe_path` string, and an empty table for
+   an unshared `Files` (its 1024 slots) if the table's `users` is above 1
+   now.
 6. The point of no return:
    - **`de_thread` (C3).** Under `signal`: if `group_exit` or another
      `exec_waiter` is set, `-EAGAIN` (Linux's `de_thread`: a concurrent
      exec or a group exit wins). Else set `exec_waiter` to the caller's
-     tid (a flag of its own, not `group_exit`, so the caller survives) and
-     queue `SIGKILL` to every other thread (`Target::Thread`, with
-     `sigpending` and `kick`), as Linux's `zap_other_threads` does, so a
-     sibling in any killable wait (a stop park, a `vfork` wait) and the
-     syscall-exit hook end it with no new rule. They leave through exit
-     step 2; the caller waits on `Process::exec_wait`, killable, until
-     `live_threads` is 1 (Linux's `notify_count`). An `exit_group` or
-     fatal signal meanwhile ends the caller too. Either way the caller
+     tid (a flag of its own, not `group_exit`, so the caller survives);
+     clear `group_stop` and `stopped` and wake `stop_wait`; and set a
+     pending `SIGKILL` directly in each other thread's private queue (not
+     through the send path, whose group-kill rule would end the caller
+     too), with `sigpending` and `kick`, as Linux's `zap_other_threads`
+     sets `SIGKILL` in each sibling's `pending` and zeroes
+     `group_stop_count`. A sibling in any killable wait (a stop park, a
+     `vfork` wait) wakes, and the syscall-exit hook ends it through exit
+     step 2 alone (section 6). The caller waits on `Process::exec_wait`,
+     killable, until `live_threads` is 1 (Linux's `notify_count`); only a
+     real group exit (a fatal signal sent to the process through the send
+     path, which sets `group_exit`) or a `SIGKILL` sent to the caller
+     itself ends that wait, and the caller with it. Either way the caller
      clears `exec_waiter` under `signal` when its wait ends. If the caller
      isn't the leader it takes the pid as its tid (Linux exchanges the
      tids): in one `PROCS` then `signal` hold, its `PROCS.threads` and
@@ -5010,10 +5030,13 @@ untouched):
      `UserThreadState::address_space` and load its root into `CR3` (the
      `active` bits following, section 5), then store it in `Process::mm`.
      Lower the old space's `users`, tearing it down at 0 through
-     `teardown`, which waits until no CPU has it loaded (a killed thread
-     may still be running on it, section 5).
-   - `ProcTree::exec(pid)`; install the unshared `Files` if one was made
-     (lowering the old table's `users`),
+     `teardown`, which waits until no CPU has it loaded (section 5).
+   - `ProcTree::exec(pid)`; after `de_thread`, re-check `Files::users`, as
+     Linux runs `unshare_files` after `de_thread`: if it is above 1, copy
+     the table into the one step 5 allocated (or allocate one now, if a
+     sibling's `clone(CLONE_FILES)` raised it since; failing that, the
+     process gets `SIGKILL`, past its point of no return) and install it,
+     lowering the old table's `users`,
      and close every `cloexec` descriptor (`process::release_fd`, so their
      POSIX locks go); reset every handled signal to `SIG_DFL` (ignored
      ones stay ignored), keep the mask and pending signals, clear the
@@ -5125,7 +5148,8 @@ pub fn kick(thread: &Thread);             // after setting its `sigpending`
   delivery to the same hook; the restart decision then runs once, through
   `frame::build` when a handler is delivered (with its `SA_RESTART`) and
   through `decide` when none is.
-- Tested by `ktest:lumen_kernel::sched::wait_interruptible_answers_woken_timed_out_and_interrupted`
+- Tested by
+  `ktest:lumen_kernel::sched::wait_interruptible_answers_woken_timed_out_and_interrupted`
   (each answer; a deadline answer is a floor, never early),
   `ktest:lumen_kernel::sched::kick_racing_a_block_is_never_lost` (a
   ktest-only delay knob, `sched::BLOCK_DELAY`, stalls the waiter between
@@ -5261,19 +5285,21 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
   interrupt. The thread moves the expired entries out of `TIMERS` into a
   local list and releases it; then, with no lock held, it upgrades each
   entry's `Weak<Process>` (a process gone is skipped, the `Arc` dropped
-  outside every `SpinLock`). Under that process's `signal` lock it
-  decides: the timer fires only if its `generation` still matches the
-  entry's (a `timer_settime` or `timer_delete` bumps it, so a re-armed or
-  deleted timer's stale entry does nothing); a timer whose signal is
-  still `queued` counts an overrun instead; a periodic timer is re-armed
-  by its interval (skipped periods counted as overruns, as Linux's
-  `hrtimer_forward`). Then, with `signal` released, it sends the timer's
-  `SigInfo` (`SI_TIMER` with `si_timerid` and `si_value`; `SI_KERNEL` for
-  `ITIMER_REAL`'s `SIGALRM`, as Linux's `it_real_fn`) through the
-  ordinary send path (section 6), which handles `SIGCONT`, `SIGSTOP` and
-  `SIGKILL` as any sender's. `queued` is set only on
-  `Enqueued::Queued`; `Coalesced`, `Full` and `NoMemory` count as a lost
-  expiry, as Linux's `legacy_queue` drops a second standard signal.
+  outside every `SpinLock`). It then sends through the send path's timer
+  variant, all in that path's one `PROCS` then `signal` hold, as Linux's
+  `posixtimer_send_sigqueue` works under one `siglock` hold: first the
+  check, that the timer's `generation` still matches the entry's (a
+  `timer_settime` or `timer_delete` bumps it, so a re-armed or deleted
+  timer's stale entry does nothing) and that its signal isn't still
+  `queued` (an overrun instead); then the ordinary send (section 6, which
+  handles `SIGCONT`, `SIGSTOP` and `SIGKILL` as any sender's) of the
+  timer's `SigInfo` (`SI_TIMER` with `si_timerid` and `si_value`;
+  `SI_KERNEL` for `ITIMER_REAL`'s `SIGALRM`, as Linux's `it_real_fn`);
+  then the update: `queued` set only on `Enqueued::Queued` (`Coalesced`,
+  `Full` and `NoMemory` count as a lost expiry, as Linux's `legacy_queue`
+  drops a second standard signal), and a periodic timer re-armed by its
+  interval (skipped periods counted as overruns, as Linux's
+  `hrtimer_forward`).
   Dequeuing an `SI_TIMER` signal clears `queued` and fills `si_overrun`,
   which `timer_getoverrun` then reports.
 - **Clocks:** deadlines are `CLOCK_MONOTONIC` nanoseconds; a
@@ -8179,7 +8205,8 @@ M8 adds (designed in #336, none built yet): Lock 0, Lock 1a, Lock 9a and,
 in level 10, `PROCS` (which replaces M7's leaf `ACTIVE_PROCS` in B1; until
 then `ACTIVE_PROCS` sits at `a`), `Process::signal`, `Process::mm`,
 `Process::files`, `Process::fs`, `Files::table`, `FsState::inner`,
-`TIMERS`, the mappers lists, the futex buckets and the `PollHead` lists.
+`TIMERS`, the mappers lists, the FIFO slots, the futex buckets and the
+`PollHead` lists.
 Sections 5, 6, 8 and 10 name these locks and cite this list for their
 places. Until each lands, M7's order holds
 without it.
@@ -8258,7 +8285,8 @@ and `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_threa
   `SleepMutex::lock`'s `irq::enabled() && irq::depth() == 0` assertion).
 - **Extract-and-drop outside the `SpinLock`s:** any syscall (`close`,
   `chdir`, `dup*`, `execve`'s close-on-exec, exit) that removes an
-  `Arc<OpenFile>` (M7) or a `FileRef` (M8), a `Cwd` or an
+  `Arc<OpenFile>` (M7) or a `FileRef` (an `Arc<OpenFile>`, M8), a `Cwd`
+  or an
   `Arc<VfsInode>` from `ACTIVE_PROCS`'s `ProcessState` (M7), or from
   `Files::table`, `FsState::inner`, `PROCS`
   or `Process::signal` (M8), extracts the `Arc` under
@@ -8443,7 +8471,8 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
 ### PTYs (C9)
 
 - **Nodes:** `devpts` mounted at `/dev/pts` at boot (dev `0:5`, after the
-  `/dev` mount: section 9's boot mount sequence), listing one `N` per open pair (character device `136:N`,
+  `/dev` mount: section 9's boot mount sequence), listing one `N` per open
+  pair (character device `136:N`,
   mode `0620`); `/dev/ptmx` in devfs (`5:2`, mode `0666`). Opening
   `/dev/ptmx` allocates the lowest free number below `PTY_MAX` (256;
   `-ENOSPC` past it) and a `PtyPair`, and returns the master's description;
@@ -8475,7 +8504,8 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
   `TTY_OTHER_CLOSED` (a later slave open clears it). A slave `read` asks
   `read_decision` with the call's `ReadTimer` (`VMIN`/`VTIME`) and then
   `read`: `Decision::WaitWithTimer { deciseconds, .. }` arms a deadline
-  that many tenths of a second from now for B2's wait, `Decision::Wait` waits with the deadline already armed (or
+  that many tenths of a second from now for B2's wait, `Decision::Wait`
+  waits with the deadline already armed (or
   none), and a `TimedOut` answer calls `timer.expire()` before the next
   decision; interrupted `-ERESTARTSYS`.
   Every change notifies the waiters `Effects::wake` names and the poll
@@ -8537,7 +8567,8 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
     caller's controlling terminal are `-ENOTTY`, and `TIOCGSID` on a tty
     with no session is `-ENOTTY` too (Linux's `tiocgsid`); on a master they report
     the slave's foreground group and session to any caller, as Linux's
-    `tiocgpgrp`/`tiocgsid` check only `tty == real_tty`; `TIOCSPGRP` is `ProcTree::tcsetpgrp` with the
+    `tiocgpgrp`/`tiocgsid` check only `tty == real_tty`; `TIOCSPGRP` is
+    `ProcTree::tcsetpgrp` with the
     tty's `Controlling` and the caller's `SIGTTOU` disposition, taken
     under `Tty::lock` then `PROCS` (`Tcsetpgrp::Sigttou`: `SIGTTOU` to the
     caller's group and `-ERESTARTSYS`);
@@ -10271,11 +10302,13 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
   tids and state) until only pid 1 is left, under an outer limit.
 - **Shared scenarios grow by issue.** A scenario several issues extend
   tags each check with the issue that adds it, and an issue adds its
-  checks only once the issues they need have merged. The tags imply these
-  orders, which the issue table's dependencies already hold: C3 after C4
-  (`pthread_join` needs C4's `clear_child_tid` wake), C11 after C12
-  (`sched_setaffinity`, `getcpu`), C1's signal rows after C5, and C13's
-  timer checks at `execve` after C2.
+  checks only once the issues they need have merged; every tag below names
+  an issue that depends, in the issue table, on everything its checks
+  need. So C3 comes after C4 (`pthread_join` needs C4's `clear_child_tid`
+  wake), C5 and C6 (`de_thread`'s `SIGKILL` and a stopped sibling); C8
+  after C3 (non-leader tids); C11 after C5 and C12 (`SIGSEGV`,
+  `sched_setaffinity`, `getcpu`); and the checks of C1's scenario that
+  need signals, `rusage` or groups are tagged C6, C12, C8 and C9, not C1.
 
 **What each test checks** (each check tagged with the issue that adds it;
 every scenario check is one `ok` line of a `tools/linux-m8` mode):
@@ -10289,9 +10322,10 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 - `ktest:lumen_kernel::mm::frame::refcount_and_cow_split` (B4): counts
   through `fork_copy`; a split at count 2 and the reuse at 1; a shared
   anonymous page staying shared, and writable in both, after `fork`;
-  `AddressSpace::users` (a `CLONE_VM` pair: the second process's exit
-  doesn't tear the space down; an extra `Arc` held by the test doesn't
-  delay the teardown at 0); `teardown` freeing exactly the frames it
+  `AddressSpace::users`, raised and lowered directly by the ktest as a
+  `CLONE_VM` pair would (the first lowering doesn't tear the space down;
+  an extra `Arc` held by the test doesn't delay the teardown at 0);
+  `teardown` freeing exactly the frames it
   owned.
 - `ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only`
   (B4): `mprotect(PROT_WRITE)` on a private leaf whose count is 2 leaves it
@@ -10333,14 +10367,15 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   with no children, `waitid`'s `siginfo` and its zeroed `infop` with
   `WNOHANG`, a zombie until reaped, an orphan's `getppid` becoming 1,
   `SIG_IGN` and `SA_NOCLDWAIT` reaping automatically (`wait` then
-  `ECHILD`), `posix_spawn`'s flag set and `vfork`, `rusage`'s `ru_utime`
-  at least one tick after a spinning child and `RUSAGE_CHILDREN` equal to
-  the sum of the `wait4` values (C1); `HangupThenContinue` (a stopped
-  process group orphaned by its parent's exit gets `SIGHUP` then
-  `SIGCONT`), fatal-signal statuses, `kill(1, sig)` doing nothing and
-  `kill(-1, sig)` skipping pid 1 (C5); `wait4` with `pid` 0 and `-pgid`
-  (C8); `exit` ending one thread, `exit_group` all, and `pthread_create`'s
-  flag set (C3).
+  `ECHILD`), a raw `clone(0x4111)` (`posix_spawn`'s flags) whose child
+  calls `_exit`, and `vfork` (C1); `rusage`'s `ru_utime` at least one tick
+  after a spinning child and `RUSAGE_CHILDREN` equal to the sum of the
+  `wait4` values (C12); fatal-signal statuses, `kill(1, sig)` doing
+  nothing and `kill(-1, sig)` skipping pid 1 (C6); `wait4` with `pid` 0
+  and `-pgid` (C8); `HangupThenContinue` (a stopped process group
+  orphaned by its parent's exit gets `SIGHUP` then `SIGCONT`) (C9); `exit`
+  ending one thread, `exit_group` all, and `pthread_create`'s flag set
+  (C3).
 - `scenario:test_linux_proc::test_fork_cow_and_exec_shebang`: parent and
   child writing the same heap, stack and file-private (`MAP_PRIVATE`)
   page after `fork`, each seeing only its own; shared anonymous memory
@@ -10348,14 +10383,17 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   interpreter `-EACCES`), `/proc/self/exe` the interpreter and `comm` the
   script; `O_CLOEXEC` closing; an ignored signal staying ignored; `E2BIG`;
   a `vfork` child's `execve` releasing its parent; a binary over 16 MiB
-  (built by `tools/linux-m8`, padded); a `clone(CLONE_VM | SIGCHLD |
+  (built by `tools/linux-m8`, padded) (C2); a `clone(CLONE_VM | SIGCHLD |
   CLONE_CHILD_CLEARTID)` child that `execve`s and one that exits, each
   time the sharing parent's `FUTEX_WAIT` on the word returning and reading
-  0 (C2); a reset handler and a cleared alternate stack (C5); from a
-  process with threads, a non-leader's `execve` taking the pid and the
-  other threads gone, a sibling stopped before it included, and two
-  threads `execve`ing at once with exactly one image running (C3); the
-  robust-list walk at `execve` (C4); POSIX timers deleted and an `alarm`
+  0, and the robust-list walk at `execve` (C4); a reset handler and a
+  cleared alternate stack (C6); from a process with threads (C3): a
+  non-leader's `execve` taking the pid, the new image running, every
+  other thread gone and the process not killed (its later exit status the
+  new image's); a sibling stopped by `SIGSTOP` before the `execve` exiting
+  too, and the new image not stopped; a sibling's own `exit_group` during
+  the `execve` ending only that sibling; two threads `execve`ing at once
+  with exactly one image running; POSIX timers deleted and an `alarm`
   surviving (C13).
 - `scenario:test_linux_proc::test_pthread_create_and_join` (C3): the clone
   flag matrix's `EINVAL` order, `CLONE_THREAD` without `CLONE_FILES` or
@@ -10478,7 +10516,8 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `ktest:lumen_kernel::linux::process::dup_and_openat_reserve_their_slot`:
   the kernel's `dup2` helper, driven directly onto a slot the ktest holds
   reserved, is `-EBUSY`; a full table refuses an `O_CREAT` before it
-  creates. `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_thread`:
+  creates.
+  `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_thread`:
   two threads of one process blocked in `F_SETLKW` keep a record each, and
   a cycle through either is `EDEADLK`.
 - `ktest:lumen_kernel::linux::syscall::poll::poll_rechecks_after_a_wake`
@@ -10491,7 +10530,9 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 - `scenario:test_linux_io::test_pipes_and_poll` (C7): a pipeline of
   busybox applets, `PIPE_BUF` atomicity between two writers, `EOF`,
   `EPIPE`/`SIGPIPE`, `O_NONBLOCK`, `F_SETPIPE_SZ`, `dup2` redirections, a
-  FIFO's open rules, `poll` on both ends; `fork`'s `inc_fd_ref` (a child
+  FIFO's open rules, `poll` on both ends; `posix_spawn` running a program
+  and reporting a missing one's `ENOENT` through its `O_CLOEXEC` pipe;
+  `fork`'s `inc_fd_ref` (a child
   closing an inherited write end leaves the reader without `EOF`, and a
   child closing an inherited `flock` descriptor leaves the parent's lock,
   so another description's `LOCK_NB` still gets `EWOULDBLOCK`);
@@ -10620,7 +10661,9 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   harness: a timed-out test is its own class and is run once more before
   it counts as failed, and an entry may be marked `flaky` (it covers a
   fail or a timeout, never an error, and is exempt from the
-  listed-pass-fails rule), each with its issue.
+  listed-pass-fails rule), each with its issue; its self-tests are
+  `harness:test_libctest::test_a_timed_out_test_is_run_once_more` and
+  `harness:test_libctest::test_a_flaky_entry_covers_a_fail_or_timeout_never_an_error`.
 - **Which gates need the heavy tier: none in M8.** Every M8 gate runs in
   the PR tier under KVM: D1 (busybox scripts), D2 (one `-j1` C++ build of
   #344's demo, 0.85 s on the host, and a `.so`), D3 (git, sqlite3, vim)
