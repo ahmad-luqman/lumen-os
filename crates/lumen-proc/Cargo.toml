@@ -1,0 +1,15 @@
+[package]
+name = "lumen-proc"
+description = "no_std POSIX process-tree rules for the Lumen kernel: wait4/waitid selection and status words, reparenting, orphaned process groups, setsid/setpgid/tcsetpgrp, pid allocation; host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lumen-signal = { path = "../lumen-signal" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+linux-raw-sys = { workspace = true }

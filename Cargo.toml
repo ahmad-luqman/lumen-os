@@ -48,6 +48,7 @@ lumen-view = { path = "crates/lumen-view" }
 lumen-vm = { path = "crates/lumen-vm" }
 lumen-wm = { path = "crates/lumen-wm" }
 lumen-xray = { path = "crates/lumen-xray" }
+lumen-proc = { path = "crates/lumen-proc" }
 # 0.6.x needs nightly (#![feature(ptr_metadata)]); 0.5.0 is the newest stable-compatible release.
 limine = "=0.5.0"
 log = { version = "0.4", default-features = false }
@@ -120,6 +121,7 @@ ext4plus = { version = "=0.1.0-rc.2", default-features = false, features = ["syn
 lumen-futex = { path = "crates/lumen-futex" }
 lumen-signal = { path = "crates/lumen-signal" }
 lumen-pipe = { path = "crates/lumen-pipe" }
+lumen-tty = { path = "crates/lumen-tty" }
 
 # `vendor/ext4plus` is ext4plus 0.1.0-rc.2's crate file unpacked (sha256
 # 6c83a722…, the checksum Cargo.lock had for it), with Lumen's fixes on top,
