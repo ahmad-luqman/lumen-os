@@ -18,12 +18,11 @@ cd "$W"
 apk add --no-cache -q strace gcc g++ make musl-dev git sqlite vim python3 >/dev/null
 cat /etc/alpine-release >"$OUT/alpine-release"
 uname -r >"$OUT/kernel"
-# Not piped into sort: set -e would miss apk failing.
-packages=$(apk info -v)
-printf '%s\n' "$packages" | sort >"$OUT/packages"
+apk info -v >"$OUT/packages"
 
-# The tracer: every child followed; -X raw prints flags and constants as
-# numbers; -s 0 drops string contents. Split into words where it's used.
+# The tracer: every child followed; -X raw prints flag and constant arguments
+# as numbers; -s 0 drops buffer contents (paths are still printed). Split into
+# words where it's used.
 STRACE="strace -f -qq -X raw -s 0 -e signal=none"
 
 # One workload: its name, then the command.
@@ -112,6 +111,7 @@ test "$(sqlite3 wal.db 'PRAGMA journal_mode;')" = wal
 
 # 7. vim: scripted edits, then an interactive edit over a pty.
 trace vim vim -Nu NONE -es +'call setline(1, "hello")' +wq scripted.txt
+grep -q hello scripted.txt
 cat >drive_pty.py <<'PY'
 import os, pty, select, sys, time
 pid, fd = pty.fork()
