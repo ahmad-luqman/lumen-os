@@ -3,7 +3,7 @@
 //! operations use a fixed-capacity output sink. Every workload is bounded.
 
 use linux_raw_sys::general::*;
-use lumen_tty::{LineDiscipline, Output, Read, Termios, TimerState};
+use lumen_tty::{Flush, LineDiscipline, Output, Read, ReadTimer, Termios};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -81,11 +81,16 @@ fn measured<T>(f: impl FnOnce() -> T) -> (T, Counts) {
 }
 
 fn observe_readiness(d: &LineDiscipline) {
-    for timer in [TimerState::Idle, TimerState::Running, TimerState::Expired] {
-        for dest_len in [0, 1, 4096] {
-            let _ = std::hint::black_box(d.read_decision(dest_len, timer));
+    for dest_len in [0, 1, 4096] {
+        let mut timer = ReadTimer::new();
+        for step in 0..3 {
+            if step == 2 {
+                timer.expire();
+            }
+            let _ = std::hint::black_box(d.read_decision(dest_len, &mut timer));
         }
     }
+    std::hint::black_box(d.readable_bytes());
     std::hint::black_box(d.poll_readable());
     for byte in [b'x', b'\n', b'\r', 0, 3, 4, 127] {
         std::hint::black_box(d.accepts(byte));
@@ -94,7 +99,7 @@ fn observe_readiness(d: &LineDiscipline) {
 
 #[test]
 fn constructor_allocates_and_drop_frees_positive_control() {
-    let (d, counts) = measured(|| std::hint::black_box(LineDiscipline::try_new(Termios::linux_default()).unwrap()));
+    let (d, counts) = measured(|| std::hint::black_box(LineDiscipline::try_new(Termios::console_default()).unwrap()));
     assert!(counts.allocations > 0, "the allocation counter must observe try_new");
     assert_eq!(counts.frees, 0);
     assert_eq!(counts.reallocations, 0);
@@ -110,21 +115,22 @@ struct FixedOutput {
     len: usize,
 }
 impl Output for FixedOutput {
-    fn room(&self) -> usize {
-        self.bytes.len() - self.len
-    }
-    fn push(&mut self, bytes: &[u8]) {
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() > self.bytes.len() - self.len {
+            return false;
+        }
         self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
         self.len += bytes.len();
+        true
     }
-    fn flush(&mut self) {
+    fn discard(&mut self) {
         self.len = 0;
     }
 }
 
 #[test]
 fn input_editing_reads_readiness_and_mode_changes_never_allocate_or_free() {
-    let mut t = Termios::linux_default();
+    let mut t = Termios::console_default();
     t.c_lflag |= IEXTEN | ECHOCTL | ECHOKE;
     t.c_cc[VWERASE as usize] = 23;
     t.c_cc[VLNEXT as usize] = 22;
@@ -147,7 +153,7 @@ fn input_editing_reads_readiness_and_mode_changes_never_allocate_or_free() {
                 let _ = d.read(&mut buf);
             }
             assert!(!d.poll_readable());
-            out.flush();
+            out.discard();
             for _ in 0..5000 {
                 let _ = d.receive(b'x', &mut out);
             }
@@ -160,14 +166,14 @@ fn input_editing_reads_readiness_and_mode_changes_never_allocate_or_free() {
                 if !d.poll_readable() {
                     break;
                 }
-                assert_eq!(d.read(&mut buf).0, Read::Eof);
+                assert_eq!(d.read(&mut buf).read, Read::Eof);
             }
             assert!(!d.poll_readable());
             let mut raw = t;
             raw.c_lflag = 0;
             raw.c_cc[VMIN as usize] = 3;
             raw.c_cc[VTIME as usize] = 2;
-            let _ = d.set_termios(raw, false);
+            let _ = d.set_termios(raw, Flush::Keep);
             observe_readiness(&d);
             for _ in 0..5000 {
                 let _ = d.receive(b'x', &mut out);
@@ -177,19 +183,20 @@ fn input_editing_reads_readiness_and_mode_changes_never_allocate_or_free() {
             for _ in 0..11 {
                 let _ = d.receive(b'y', &mut out);
             }
-            let _ = d.set_termios(t, false);
+            let _ = d.set_termios(t, Flush::Keep);
             let _ = d.read(&mut buf);
             let _ = d.receive(b'x', &mut out);
-            let _ = d.set_termios(t, true);
+            let _ = d.set_termios(t, Flush::Input);
             observe_readiness(&d);
+            let _ = d.flush_input();
             let _ = d.receive_break(&mut out);
-            let _ = d.set_termios(t, true);
+            let _ = d.set_termios(t, Flush::Input);
             // Exercise non-flushing signal delivery as well as the flushing path.
             let mut noflush = t;
             noflush.c_lflag |= NOFLSH;
-            let _ = d.set_termios(noflush, false);
+            let _ = d.set_termios(noflush, Flush::Keep);
             let _ = d.receive(3, &mut out);
-            let _ = d.set_termios(t, false);
+            let _ = d.set_termios(t, Flush::Keep);
         }
     });
     assert_eq!(counts, Counts::default(), "operations after try_new must not touch the heap");
@@ -198,7 +205,7 @@ fn input_editing_reads_readiness_and_mode_changes_never_allocate_or_free() {
 
 #[test]
 fn write_into_fixed_sink_never_allocates_or_frees() {
-    let mut d = LineDiscipline::try_new(Termios::linux_default()).unwrap();
+    let mut d = LineDiscipline::try_new(Termios::console_default()).unwrap();
     let mut out = FixedOutput { bytes: [0; 8192], len: 0 };
     let (consumed, counts) = measured(|| {
         let consumed = d.write(&[b'\n'; 4096], &mut out).consumed;
@@ -210,11 +217,11 @@ fn write_into_fixed_sink_never_allocates_or_frees() {
     assert_eq!(out.len, 8192);
     assert!(out.bytes.as_chunks::<2>().0.iter().all(|pair| pair == b"\r\n"));
     let (_, counts) = measured(|| {
-        out.flush();
+        out.discard();
         assert_eq!(d.write(b"hello\t\r\n\x08", &mut out).consumed, 9);
-        let mut raw = Termios::linux_default();
+        let mut raw = Termios::console_default();
         raw.c_oflag = 0;
-        let _ = d.set_termios(raw, false);
+        let _ = d.set_termios(raw, Flush::Keep);
         assert_eq!(d.write(b"\r\n", &mut out).consumed, 2);
     });
     assert_eq!(counts, Counts::default());

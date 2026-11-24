@@ -1,15 +1,25 @@
 use linux_raw_sys::general::*;
 
-/// A serialized output queue. `room` guarantees that the next `push` accepts
-/// that many bytes in full. `push` must not partially accept a slice; the
-/// caller must hold the same device lock across room/push/flush. Any device
-/// backpressure beyond this queue belongs to its owner.
+/// Largest output unit. A sink must accept a MAX_UNIT-byte unit when empty
+/// (six bytes conservatively cover a processed BS SPACE BS). Backpressure may
+/// refuse a unit only until queued output has been delivered or discarded.
+pub const MAX_UNIT: usize = 6;
+pub(crate) const BS: u8 = 8;
+pub(crate) const BEL: u8 = 7;
+
+/// An output queue serialized with the discipline by its caller. A push must
+/// accept all bytes or none; only accepted units advance the discipline's
+/// column. See MAX_UNIT for the minimum empty-queue capacity.
 pub trait Output {
-    fn room(&self) -> usize;
-    fn push(&mut self, bytes: &[u8]);
-    fn flush(&mut self);
+    /// Accept the entire unit and return true, or return false without taking
+    /// any bytes. Partial acceptance violates this contract.
+    fn push(&mut self, unit: &[u8]) -> bool;
+    /// Drop everything queued and not yet delivered to the device; called
+    /// before a signal's echo. This must not send queued bytes to the device.
+    fn discard(&mut self);
 }
 
+/// The source prefix accepted by a write; the caller retries its suffix.
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Written {
@@ -18,12 +28,12 @@ pub struct Written {
     pub consumed: usize,
 }
 
-/// Facts for the writer's job-control check. All fields must be supplied.
+/// Facts for the writer's job-control check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriterFacts {
     /// This terminal controls the caller's session.
     pub controlling_terminal: bool,
-    /// The caller's process group differs from the foreground group.
+    /// The terminal has a foreground group, and the caller's group differs from it.
     pub background: bool,
     /// SIGTTOU is blocked in the calling thread.
     pub signal_blocked: bool,
@@ -33,12 +43,15 @@ pub struct WriterFacts {
     pub orphaned_group: bool,
 }
 
+/// Whether a background write may proceed, requires signalling, or fails.
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundWrite {
+    /// The job-control check permits the operation.
     Allow,
     /// Send SIGTTOU to the writer's own process group; fail with -ERESTARTSYS.
     SendSigttou,
+    /// Fail with EIO because the background process group is orphaned.
     Eio,
 }
 
@@ -84,7 +97,7 @@ fn process(byte: u8, flags: u32, utf8: bool, column: &mut usize) -> ([u8; 2], us
             *column = 0;
         }
         b'\t' => *column = column.saturating_add(8 - *column % 8),
-        super::BS => *column = column.saturating_sub(1),
+        BS => *column = column.saturating_sub(1),
         32..=255 if byte != 127 && !(utf8 && is_continuation(byte)) => *column = column.saturating_add(1),
         _ => {}
     }
@@ -94,7 +107,7 @@ fn process(byte: u8, flags: u32, utf8: bool, column: &mut usize) -> ([u8; 2], us
 /// A source unit is at most three bytes (erase's BS SPACE BS). Transform it
 /// speculatively, then commit the entire unit and its column together.
 pub(crate) fn push_unit(out: &mut dyn Output, source: &[u8], flags: u32, utf8: bool, column: &mut usize) -> bool {
-    let mut bytes = [0; 6];
+    let mut bytes = [0; MAX_UNIT];
     let mut len = 0;
     let mut next_column = *column;
     for &byte in source {
@@ -102,11 +115,8 @@ pub(crate) fn push_unit(out: &mut dyn Output, source: &[u8], flags: u32, utf8: b
         bytes[len..len + n].copy_from_slice(&processed[..n]);
         len += n;
     }
-    if out.room() < len {
+    if len != 0 && !out.push(&bytes[..len]) {
         return false;
-    }
-    if len != 0 {
-        out.push(&bytes[..len]);
     }
     *column = next_column;
     true

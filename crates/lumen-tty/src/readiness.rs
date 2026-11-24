@@ -1,60 +1,112 @@
-/// The caller supplies the clock state for the current read, never wall time.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TimerState {
-    #[default]
+use core::num::NonZeroU8;
+
+/// Which deadline the kernel must arm for a blocked read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerKind {
+    /// Starts at the read's first decision, even without input.
+    Read,
+    /// Starts with input and restarts when further bytes arrive.
+    InterByte,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
     Idle,
     Running,
     Expired,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimerKind {
-    /// Starts when a read begins, even with no input.
-    Read,
-    /// Starts with the first byte and restarts on each subsequent byte.
-    InterByte,
+/// One reader's timer protocol for one read call. Construct a new timer for
+/// each read, keep it across wakeups, and deliver the current deadline's
+/// callback through expire. Rearming must cancel the previous kernel callback.
+/// The discipline never reads a clock and never shares this state with another
+/// reader. Only read_decision arms the timer; repeated decisions do not extend
+/// a running deadline without new input or changed VMIN/VTIME settings.
+#[derive(Debug)]
+pub struct ReadTimer {
+    state: State,
+    seen: Option<u64>,
+    settings: Option<(usize, u8)>,
 }
 
-#[must_use]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Readiness {
-    ReturnNow(usize),
-    Wait,
-    WaitWithTimer { deciseconds: u8, kind: TimerKind },
-}
+impl ReadTimer {
+    /// An unarmed timer for a new read call.
+    pub const fn new() -> Self {
+        Self { state: State::Idle, seen: None, settings: None }
+    }
 
-/// The four noncanonical VMIN/VTIME cases. `available` is the queued byte
-/// count. For a short destination the caller clamps VMIN to its size, and
-/// clamps ReturnNow's count too. Running timers are left running; after a
-/// new byte, pass Idle to restart an inter-byte timer. Expiry only completes
-/// an inter-byte read after its first byte. Nonblocking I/O is caller policy.
-pub fn ready(vmin: u8, vtime: u8, available: usize, timer: TimerState) -> Readiness {
-    use Readiness::*;
-    match (vmin, vtime) {
-        (0, 0) => ReturnNow(available),
-        (0, _) if available != 0 || timer == TimerState::Expired => ReturnNow(available),
-        (0, _) => match timer {
-            TimerState::Idle => WaitWithTimer { deciseconds: vtime, kind: TimerKind::Read },
-            _ => Wait,
-        },
-        (_, _) if available >= usize::from(vmin) => ReturnNow(available),
-        (_, 0) => Wait,
-        (_, _) if available == 0 => Wait,
-        (_, _) => match timer {
-            TimerState::Expired => ReturnNow(available),
-            TimerState::Idle => WaitWithTimer { deciseconds: vtime, kind: TimerKind::InterByte },
-            TimerState::Running => Wait,
-        },
+    /// Reports expiration of the currently armed kernel timer. A callback
+    /// while unarmed has no effect; the kernel must suppress stale callbacks.
+    pub fn expire(&mut self) {
+        if self.state == State::Running {
+            self.state = State::Expired;
+        }
+    }
+
+    pub(crate) fn canonical(&mut self, stored: u64) {
+        self.state = State::Idle;
+        self.settings = None;
+        self.seen = Some(stored);
+    }
+
+    pub(crate) fn decide(&mut self, min: usize, time: u8, available: usize, stored: u64) -> Decision {
+        let changed = self.seen.is_some_and(|seen| seen != stored);
+        self.seen = Some(stored);
+        if self.settings != Some((min, time)) {
+            self.state = State::Idle;
+            self.settings = Some((min, time));
+        }
+        if min > 0 && (changed || available == 0) {
+            self.state = State::Idle;
+        }
+        if available >= min && (min > 0 || time == 0) {
+            return Decision::Read;
+        }
+        let Some(deciseconds) = NonZeroU8::new(time) else {
+            return Decision::Wait;
+        };
+        if min == 0 && available != 0 {
+            return Decision::Read;
+        }
+        if min > 0 && available == 0 {
+            return Decision::Wait;
+        }
+        match self.state {
+            State::Expired => Decision::Read,
+            State::Running => Decision::Wait,
+            State::Idle => {
+                self.state = State::Running;
+                Decision::WaitWithTimer {
+                    deciseconds,
+                    kind: if min == 0 { TimerKind::Read } else { TimerKind::InterByte },
+                }
+            }
+        }
     }
 }
 
-/// A read's next action. Wait means no completed canonical record. A zero
-/// destination returns Raw(ReturnNow(0)) in either mode and consumes nothing.
+impl Default for ReadTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A read protocol action. Read always requires calling LineDiscipline::read:
+/// it does not consume input and does not itself report bytes or EOF.
 #[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-    Line,
-    Eof,
+    /// Call read with the same destination length used for this decision.
+    Read,
+    /// Sleep until input, a mode change, a signal or the armed timer wakes you.
     Wait,
-    Raw(Readiness),
+    /// (Re)arm the timer for this duration now, replacing the previous deadline.
+    /// The ReadTimer already records Running, so the next decision won't rearm
+    /// unless input or settings have changed.
+    WaitWithTimer {
+        /// Positive duration in tenths of a second.
+        deciseconds: NonZeroU8,
+        /// Whether this is an overall read or inter-byte deadline.
+        kind: TimerKind,
+    },
 }

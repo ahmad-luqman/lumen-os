@@ -3,19 +3,25 @@ use linux_raw_sys::general as linux;
 /// Linux's kernel termios fields, including all 19 control characters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Termios {
+    /// Input processing flags.
     pub c_iflag: u32,
+    /// Output processing flags.
     pub c_oflag: u32,
+    /// Device control flags, preserved without hardware effects.
     pub c_cflag: u32,
+    /// Local discipline flags.
     pub c_lflag: u32,
+    /// Discipline number, preserved without selecting another implementation.
     pub c_line: u8,
+    /// Linux control characters and VMIN/VTIME.
     pub c_cc: [u8; linux::NCCS as usize],
 }
 
 impl Termios {
     /// Lumen's console defaults (`kernel/src/linux/process.rs`'s
     /// `default_termios()`), not Linux's `tty_std_termios`. The latter also
-    /// enables IXON, HUPCL, ECHOCTL, ECHOKE, IEXTEN and ^R/^O/^W/^V.
-    pub fn linux_default() -> Self {
+    /// enables IXON, HUPCL, ECHOCTL, ECHOKE, IEXTEN and ^R/^O/^W/^V, and lacks IUTF8.
+    pub fn console_default() -> Self {
         let mut c_cc = [0; linux::NCCS as usize];
         c_cc[linux::VINTR as usize] = 3;
         c_cc[linux::VQUIT as usize] = 28;
@@ -66,9 +72,13 @@ impl From<Termios> for linux::termios {
 /// Window dimensions; pixel dimensions participate in change detection too.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Winsize {
+    /// Rows of character cells.
     pub ws_row: u16,
+    /// Columns of character cells.
     pub ws_col: u16,
+    /// Width in pixels.
     pub ws_xpixel: u16,
+    /// Height in pixels.
     pub ws_ypixel: u16,
 }
 

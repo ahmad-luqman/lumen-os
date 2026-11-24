@@ -5,33 +5,73 @@ use alloc::{vec, vec::Vec};
 struct Sink {
     bytes: Vec<u8>,
     limit: usize,
+    occupied: usize,
     events: Vec<&'static str>,
 }
 impl Sink {
     fn new(limit: usize) -> Self {
-        Self { bytes: Vec::new(), limit, events: Vec::new() }
+        Self {
+            bytes: Vec::new(),
+            limit: limit.max(MAX_UNIT),
+            occupied: MAX_UNIT.saturating_sub(limit),
+            events: Vec::new(),
+        }
     }
 }
 impl Output for Sink {
-    fn room(&self) -> usize {
-        self.limit.saturating_sub(self.bytes.len())
-    }
-    fn push(&mut self, bytes: &[u8]) {
-        assert!(bytes.len() <= self.room());
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() > self.limit - self.occupied - self.bytes.len() {
+            return false;
+        }
         self.events.push("push");
         self.bytes.extend_from_slice(bytes);
+        true
     }
-    fn flush(&mut self) {
-        self.events.push("flush");
+    fn discard(&mut self) {
+        self.events.push("discard");
+        self.occupied = 0;
         self.bytes.clear();
     }
 }
+const INTR: u8 = 3;
+const EOF: u8 = 4;
+const REPRINT: u8 = 18;
+const KILL: u8 = 21;
+const LNEXT: u8 = 22;
+const WERASE: u8 = 23;
+const ERASE: u8 = 127;
+
+fn line() -> LineDiscipline {
+    tty(settings())
+}
+fn raw_timed(min: u8, time: u8) -> Termios {
+    let mut t = raw();
+    t.c_cc[VMIN as usize] = min;
+    t.c_cc[VTIME as usize] = time;
+    t
+}
+fn got(n: usize) -> Read {
+    Read::Bytes(NonZeroUsize::new(n).unwrap())
+}
+fn next(seed: &mut u64) -> u64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    *seed
+}
+fn fresh(d: &LineDiscipline, len: usize) -> Decision {
+    d.read_decision(len, &mut ReadTimer::new())
+}
+fn signal(kind: JobSignalKind, flush: bool) -> Input {
+    Input::Signal(JobSignal { kind, flush })
+}
+
 fn settings() -> Termios {
-    let mut t = Termios::linux_default();
+    let mut t = Termios::console_default();
     t.c_lflag |= IEXTEN | ECHOKE | ECHOCTL;
-    t.c_cc[VWERASE as usize] = 23;
-    t.c_cc[VLNEXT as usize] = 22;
-    t.c_cc[VREPRINT as usize] = 18;
+    t.c_cc[VWERASE as usize] = WERASE;
+    t.c_cc[VLNEXT as usize] = LNEXT;
+    t.c_cc[VREPRINT as usize] = REPRINT;
     t
 }
 fn with_lflag(flags: u32) -> Termios {
@@ -63,7 +103,7 @@ fn feed(d: &mut LineDiscipline, bytes: &[u8]) -> Vec<u8> {
 }
 fn bytes(d: &mut LineDiscipline) -> Vec<u8> {
     let mut buf = [0; BUFFER_SIZE];
-    let (result, _) = d.read(&mut buf);
+    let result = d.read(&mut buf).read;
     d.check_invariants();
     match result {
         Read::Bytes(n) => buf[..n.get()].to_vec(),
@@ -76,7 +116,7 @@ fn write(d: &mut LineDiscipline, bytes: &[u8]) -> Vec<u8> {
     out.bytes
 }
 fn fill(d: &mut LineDiscipline, byte: u8, count: usize) {
-    let mut out = Sink::new(0);
+    let mut out = Sink::new(65536);
     for _ in 0..count {
         let _ = d.receive(byte, &mut out);
     }
@@ -84,8 +124,8 @@ fn fill(d: &mut LineDiscipline, byte: u8, count: usize) {
 }
 
 #[test]
-fn linux_default_matches_kernel() {
-    let t = Termios::linux_default();
+fn console_default_matches_kernel() {
+    let t = Termios::console_default();
     assert_eq!((t.c_iflag, t.c_oflag, t.c_cflag, t.c_lflag, t.c_line), (0x4100, 5, 0xbf, 0x3b, 0));
     assert_eq!(t.c_cc, [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 0, 0, 0, 0, 0, 0, 0]);
 }
@@ -129,7 +169,7 @@ fn input_flags_and_mapping_precedence() {
     let mut t = settings();
     t.c_iflag |= ISTRIP;
     let (effect, echo) = receive(&mut tty(t), 0x83);
-    assert_eq!(effect.signal, Some(Signal { number: SIGINT, flush: true }));
+    assert_eq!(effect.input, signal(JobSignalKind::Int, true));
     assert_eq!(echo, b"^C");
 }
 
@@ -137,12 +177,12 @@ fn input_flags_and_mapping_precedence() {
 fn canonical_erase_and_short_reads() {
     let mut d = tty(settings());
     assert_eq!(feed(&mut d, b"ab\x7fc"), b"ab\x08 \x08c");
-    assert_eq!(d.read_decision(4, TimerState::Idle), Decision::Wait);
-    assert_eq!(d.read(&mut [0; 8]).0, Read::Nothing);
+    assert_eq!(fresh(&d, 4), Decision::Wait);
+    assert_eq!(d.read(&mut [0; 8]).read, Read::Nothing);
     assert!(receive(&mut d, b'\n').0.wake.readers);
     feed(&mut d, b"de\npartial");
     let mut one = [0];
-    assert_eq!(d.read(&mut one).0, Read::Bytes(NonZeroUsize::new(1).unwrap()));
+    assert_eq!(d.read(&mut one).read, got(1));
     assert_eq!(one, [b'a']);
     assert_eq!(bytes(&mut d), b"c\n");
     assert_eq!(bytes(&mut d), b"de\n");
@@ -213,28 +253,28 @@ fn kill_preserves_completed_lines_and_erases_utf8_once() {
 fn read_distinguishes_eof_from_empty_and_preserves_exact_boundary() {
     let mut d = tty(settings());
     let mut buf = [0; 2];
-    assert_eq!(d.read(&mut buf).0, Read::Nothing);
+    assert_eq!(d.read(&mut buf).read, Read::Nothing);
     assert_eq!(receive(&mut d, 4).1, b"");
-    assert_eq!(d.read_decision(1, TimerState::Idle), Decision::Eof);
-    assert_eq!(d.read(&mut []).0, Read::Nothing);
+    assert_eq!(fresh(&d, 1), Decision::Read);
+    assert_eq!(d.read(&mut []).read, Read::Nothing);
     assert!(d.poll_readable());
-    assert_eq!(d.read(&mut buf).0, Read::Eof);
+    assert_eq!(d.read(&mut buf).read, Read::Eof);
     assert!(!d.poll_readable());
     feed(&mut d, b"abc\x04next\n");
-    assert_eq!(d.read_decision(2, TimerState::Expired), Decision::Line);
-    assert_eq!(d.read(&mut buf).0, Read::Bytes(NonZeroUsize::new(2).unwrap()));
+    assert_eq!(fresh(&d, 2), Decision::Read);
+    assert_eq!(d.read(&mut buf).read, got(2));
     assert_eq!(&buf, b"ab");
     let mut one = [0];
-    assert_eq!(d.read(&mut one).0, Read::Bytes(NonZeroUsize::new(1).unwrap()));
+    assert_eq!(d.read(&mut one).read, got(1));
     assert_eq!(&one, b"c");
     assert_eq!(bytes(&mut d), b"next\n");
     feed(&mut d, b"\x04\x04x\n");
-    assert_eq!(d.read(&mut buf).0, Read::Eof);
-    assert_eq!(d.read(&mut buf).0, Read::Eof);
+    assert_eq!(d.read(&mut buf).read, Read::Eof);
+    assert_eq!(d.read(&mut buf).read, Read::Eof);
     assert_eq!(bytes(&mut d), b"x\n");
-    assert_eq!(d.read(&mut buf).0, Read::Nothing);
+    assert_eq!(d.read(&mut buf).read, Read::Nothing);
     let mut raw = tty(raw());
-    assert_eq!(raw.read(&mut buf).0, Read::Nothing);
+    assert_eq!(raw.read(&mut buf).read, Read::Nothing);
 }
 
 #[test]
@@ -262,7 +302,7 @@ fn literal_next_quotes_signals_delimiters_and_mapping() {
     let mut d = tty(settings());
     assert_eq!(receive(&mut d, 22).1, b"^\x08");
     let (effect, echo) = receive(&mut d, 3);
-    assert_eq!(effect.signal, None);
+    assert_eq!(effect.input, Input::Stored);
     assert_eq!(echo, b"^C");
     assert_eq!(feed(&mut d, b"\x16\x7f\x16\x04\x16\n\x16\r"), b"^\x08^?^\x08^D^\x08^J^\x08^M");
     assert!(!d.poll_readable());
@@ -326,9 +366,7 @@ fn control_without_echoctl_does_not_move_column() {
     let mut d = tty(t);
     assert_eq!(feed(&mut d, b"a\x01\x7f\t"), b"a\x01\t");
     assert_eq!(receive(&mut d, 127).1, [BS; 7]);
-    let mut t = raw();
-    t.c_iflag = 0;
-    let mut d = tty(t);
+    let mut d = tty(raw());
     assert_eq!(write(&mut d, b"\x80\x9f"), b"\x80\x9f");
     assert_eq!(d.column, 2);
 }
@@ -458,8 +496,10 @@ fn output_backpressure_retries_without_column_or_byte_loss() {
 }
 
 #[test]
-fn isig_flush_precedes_echo_and_noflsh_preserves_output() {
-    for (byte, number) in [(3, SIGINT), (28, SIGQUIT), (26, SIGTSTP)] {
+fn isig_discard_precedes_echo_and_noflsh_preserves_output() {
+    for (byte, kind, number) in
+        [(INTR, JobSignalKind::Int, SIGINT), (28, JobSignalKind::Quit, SIGQUIT), (26, JobSignalKind::Tstp, SIGTSTP)]
+    {
         for noflush in [false, true] {
             let mut t = settings();
             if noflush {
@@ -471,9 +511,9 @@ fn isig_flush_precedes_echo_and_noflsh_preserves_output() {
             out.push(b"pending");
             out.events.clear();
             let e = d.receive(byte, &mut out);
-            assert_eq!(e.input, Input::Ignored);
-            assert_eq!(e.signal, Some(Signal { number, flush: !noflush }));
-            assert_eq!(out.events, if noflush { vec!["push"] } else { vec!["flush", "push"] });
+            assert_eq!(e.input, signal(kind, !noflush));
+            assert_eq!(JobSignal { kind, flush: !noflush }.number(), number);
+            assert_eq!(out.events, if noflush { vec!["push"] } else { vec!["discard", "push"] });
             let mut expected = if noflush { b"pending".to_vec() } else { Vec::new() };
             expected.extend([b'^', byte ^ 0x40]);
             assert_eq!(out.bytes, expected);
@@ -489,10 +529,10 @@ fn isig_flush_precedes_echo_and_noflsh_preserves_output() {
     let mut d = tty(with_lflag(ISIG));
     let mut out = Sink::new(0);
     let e = d.receive(3, &mut out);
-    assert_eq!(e.signal.unwrap().number, SIGINT);
+    assert_eq!(e.input, signal(JobSignalKind::Int, true));
     assert_eq!(e.echo, Echo::Complete);
     assert!(out.bytes.is_empty());
-    assert_eq!(out.events, ["flush"]);
+    assert_eq!(out.events, ["discard"]);
     let mut t = settings();
     t.c_lflag &= !ISIG;
     let mut d = tty(t);
@@ -511,11 +551,20 @@ fn breaks_consume_literal_next_and_never_echo_nul() {
         let e = d.receive_break(&mut out);
         assert_eq!(out.bytes, b"");
         if flags == BRKINT {
-            assert_eq!(e.signal, Some(Signal { number: SIGINT, flush: true }));
+            assert_eq!(e.input, signal(JobSignalKind::Int, true));
         } else {
-            assert_eq!(e.signal, None);
+            assert!(!matches!(e.input, Input::Signal(_)));
         }
-        assert_eq!(e.input, if flags == 0 { Input::Stored } else { Input::Ignored });
+        assert_eq!(
+            e.input,
+            if flags == 0 {
+                Input::Stored
+            } else if flags == BRKINT {
+                signal(JobSignalKind::Int, true)
+            } else {
+                Input::Ignored
+            }
+        );
         let _ = receive(&mut d, b'\n');
         assert_eq!(
             bytes(&mut d),
@@ -537,7 +586,7 @@ fn breaks_consume_literal_next_and_never_echo_nul() {
     out.push(b"out");
     let _ = receive(&mut d, 0);
     let e = d.receive_break(&mut out);
-    assert_eq!(e.signal, Some(Signal { number: SIGINT, flush: false }));
+    assert_eq!(e.input, signal(JobSignalKind::Int, false));
     assert_eq!(bytes(&mut d), b"\0");
     assert_eq!(out.bytes, b"out");
 }
@@ -565,10 +614,10 @@ fn raw_capacity_is_4095_and_reports_dropped_input() {
 fn canonical_overflow_keeps_latest_character_and_reserves_terminator() {
     let mut d = tty(settings());
     fill(&mut d, b'a', 4095);
-    assert!(!d.accepts(b'b'));
+    assert!(d.accepts(b'b'));
     assert!(d.accepts(b'\n'));
     assert_eq!(receive(&mut d, b'b').0.input, Input::Stored);
-    assert_eq!(receive(&mut d, b'c').0.input, Input::Stored);
+    assert_eq!(receive(&mut d, b'c').0.input, Input::Replaced);
     assert_eq!(d.input.len(), 4096);
     assert_eq!(d.input.back().unwrap().byte, b'c');
     assert_eq!(receive(&mut d, 127).1, b"\x08 \x08");
@@ -618,92 +667,28 @@ fn completed_unread_line_blocks_full_input_including_delimiters() {
 fn accepts_accounts_for_reserve_mapping_quoting_and_ignored_input() {
     let mut d = tty(settings());
     fill(&mut d, b'a', 4095);
-    assert!(!d.accepts(b'x'));
+    assert!(d.accepts(b'x'));
     assert!(d.accepts(b'\r'));
     assert!(d.accepts(4));
     for byte in [127, 23, 21, 3, 22, 18] {
         assert!(d.accepts(byte));
     }
     let _ = receive(&mut d, 22);
-    assert!(!d.accepts(b'\n'));
+    assert!(d.accepts(b'\n'));
     let _ = receive(&mut d, b'\n');
     assert!(!d.poll_readable());
     let mut t = settings();
     t.c_iflag |= IGNCR;
-    let _ = d.set_termios(t, false);
+    let _ = d.set_termios(t, Flush::Keep);
     let e = receive(&mut d, b'\r').0;
     assert_eq!(e.input, Input::Ignored);
     assert!(d.accepts(b'\r'));
     t.c_iflag |= ISTRIP;
-    let _ = d.set_termios(t, false);
+    let _ = d.set_termios(t, Flush::Keep);
     assert!(d.accepts(0x83));
     t.c_cc = [0; NCCS as usize];
-    let _ = d.set_termios(t, false);
-    assert!(!d.accepts(0));
-}
-
-#[test]
-fn all_four_vmin_vtime_cases() {
-    use Readiness::*;
-    use TimerState::*;
-    for timer in [Idle, Running, Expired] {
-        for n in [0, 1, 2, 5] {
-            assert_eq!(ready(0, 0, n, timer), ReturnNow(n));
-            assert_eq!(ready(2, 0, n, timer), if n >= 2 { ReturnNow(n) } else { Wait });
-            if n != 0 {
-                assert_eq!(ready(0, 7, n, timer), ReturnNow(n));
-            }
-            if n >= 2 {
-                assert_eq!(ready(2, 7, n, timer), ReturnNow(n));
-            }
-        }
-        assert_eq!(ready(2, 7, 0, timer), Wait);
-    }
-    assert_eq!(ready(0, 7, 0, Idle), WaitWithTimer { deciseconds: 7, kind: TimerKind::Read });
-    assert_eq!(ready(0, 7, 0, Running), Wait);
-    assert_eq!(ready(0, 7, 0, Expired), ReturnNow(0));
-    assert_eq!(ready(2, 7, 1, Idle), WaitWithTimer { deciseconds: 7, kind: TimerKind::InterByte });
-    assert_eq!(ready(2, 7, 1, Running), Wait);
-    assert_eq!(ready(2, 7, 1, Expired), ReturnNow(1));
-}
-
-#[test]
-fn reader_timers_are_independent_and_destinations_clamp_vmin() {
-    let mut t = raw();
-    t.c_cc[VMIN as usize] = 3;
-    t.c_cc[VTIME as usize] = 2;
-    let mut d = tty(t);
-    assert!(receive(&mut d, b'a').0.timer_restart);
-    assert_eq!(d.read_decision(8, TimerState::Running), Decision::Raw(Readiness::Wait));
-    assert_eq!(d.read_decision(8, TimerState::Expired), Decision::Raw(Readiness::ReturnNow(1)));
-    assert_eq!(d.read_decision(1, TimerState::Running), Decision::Raw(Readiness::ReturnNow(1)));
-    assert_eq!(d.read_decision(0, TimerState::Running), Decision::Raw(Readiness::ReturnNow(0)));
-    let _ = d.set_termios(t, false); // must not reset either reader's timer
-    assert_eq!(d.read_decision(8, TimerState::Running), Decision::Raw(Readiness::Wait));
-    assert_eq!(d.read_decision(8, TimerState::Expired), Decision::Raw(Readiness::ReturnNow(1)));
-    let _ = d.set_termios(t, true);
-    assert_eq!(d.read_decision(8, TimerState::Expired), Decision::Raw(Readiness::Wait));
-    assert!(receive(&mut d, b'b').0.timer_restart);
-    assert_eq!(
-        d.read_decision(8, TimerState::Idle),
-        Decision::Raw(Readiness::WaitWithTimer { deciseconds: 2, kind: TimerKind::InterByte })
-    );
-    fill(&mut d, b'x', 4094);
-    assert!(!receive(&mut d, b'x').0.timer_restart);
-    for (min, time) in [(0, 0), (1, 0), (0, 2)] {
-        t.c_cc[VMIN as usize] = min;
-        t.c_cc[VTIME as usize] = time;
-        let mut d = tty(t);
-        assert!(!receive(&mut d, b'x').0.timer_restart);
-    }
-    let mut t = raw();
-    t.c_cc[VMIN as usize] = 0;
-    t.c_cc[VTIME as usize] = 9;
-    t.c_lflag = ISIG;
-    let mut d = tty(t);
-    let _ = receive(&mut d, 3);
-    assert_eq!(d.read_decision(4, TimerState::Running), Decision::Raw(Readiness::Wait));
-    assert_eq!(d.read_decision(4, TimerState::Expired), Decision::Raw(Readiness::ReturnNow(0)));
+    let _ = d.set_termios(t, Flush::Keep);
+    assert!(d.accepts(0));
 }
 
 #[test]
@@ -776,7 +761,7 @@ fn background_writer_decisions_distinguish_orphaned_groups() {
 
 #[test]
 fn winsize_reports_each_field_change() {
-    let mut d = LineDiscipline::default();
+    let mut d = line();
     assert_eq!(d.winsize(), Winsize::default());
     for ws in [
         Winsize { ws_row: 24, ..Winsize::default() },
@@ -795,77 +780,21 @@ fn winsize_reports_each_field_change() {
 fn mode_switches_preserve_eof_as_nul_and_publish_synthetic_line() {
     let mut d = tty(settings());
     feed(&mut d, b"a\nb\x04partial");
-    let _ = d.set_termios(raw(), false);
+    let _ = d.set_termios(raw(), Flush::Keep);
     assert_eq!(bytes(&mut d), b"a\nb\0partial");
     feed(&mut d, b"raw");
-    let _ = d.set_termios(settings(), false);
+    let _ = d.set_termios(settings(), Flush::Keep);
     feed(&mut d, b"new\x7f\n");
     assert_eq!(bytes(&mut d), b"raw");
     assert_eq!(bytes(&mut d), b"ne\n");
     feed(&mut d, b"part\x16");
-    assert!(d.set_termios(raw(), false).wake.readers);
-    let _ = d.set_termios(settings(), false);
+    assert!(d.set_termios(raw(), Flush::Keep).readers);
+    let _ = d.set_termios(settings(), Flush::Keep);
     assert_eq!(bytes(&mut d), b"part");
-    assert!(receive(&mut d, 3).0.signal.is_some());
-    let _ = d.set_termios(raw(), false);
-    let _ = d.set_termios(settings(), false);
+    assert!(matches!(receive(&mut d, INTR).0.input, Input::Signal(_)));
+    let _ = d.set_termios(raw(), Flush::Keep);
+    let _ = d.set_termios(settings(), Flush::Keep);
     assert!(!d.poll_readable());
-}
-
-#[test]
-fn termios_changes_apply_now_and_flush_only_when_requested() {
-    for flush in [false, true] {
-        let mut d = tty(settings());
-        feed(&mut d, b"abc");
-        let applied = d.set_termios(raw(), flush);
-        assert_eq!(applied.flush_input, flush);
-        assert_eq!(d.termios(), raw());
-        assert_eq!(bytes(&mut d), if flush { &b""[..] } else { &b"abc"[..] });
-    }
-    let mut d = tty(settings());
-    feed(&mut d, b"keep");
-    // There is no queued request to apply after an interrupted kernel drain.
-    let _ = d.set_termios(raw(), false);
-    let _ = d.set_termios(settings(), false);
-    assert_eq!(bytes(&mut d), b"keep");
-}
-
-#[test]
-fn wake_edges_cover_reads_edits_flushes_and_termios_changes() {
-    let mut d = tty(settings());
-    assert_eq!(receive(&mut d, b'a').0.wake, Wake::default());
-    assert_eq!(receive(&mut d, b'\n').0.wake, Wake { readers: true, writers: false });
-    assert_eq!(receive(&mut d, b'\n').0.wake, Wake::default());
-    let _ = d.set_termios(raw(), true);
-    fill(&mut d, b'x', 4095);
-    let (_, wake) = d.read(&mut [0]);
-    assert_eq!(wake, Wake { readers: false, writers: true });
-    assert_eq!(d.read(&mut [0]).1, Wake::default());
-    for action in [3, 21, 127] {
-        let mut d = tty(settings());
-        fill(&mut d, b'x', 4095);
-        assert_eq!(receive(&mut d, action).0.wake, Wake { readers: false, writers: true });
-    }
-    let mut d = tty(settings());
-    fill(&mut d, b'x', 4095);
-    assert_eq!(d.set_termios(settings(), true).wake, Wake { readers: false, writers: true });
-    let mut d = tty(settings());
-    feed(&mut d, b"partial");
-    assert_eq!(d.set_termios(raw(), false).wake, Wake { readers: true, writers: false });
-    let mut t = raw();
-    t.c_cc[VMIN as usize] = 4;
-    let mut d = tty(t);
-    feed(&mut d, b"ab");
-    assert!(!d.poll_readable());
-    t.c_cc[VMIN as usize] = 2;
-    assert_eq!(d.set_termios(t, false).wake, Wake { readers: true, writers: false });
-    assert_eq!(d.set_termios(t, false).wake, Wake::default());
-    let mut d = tty(settings());
-    fill(&mut d, b'x', 4095);
-    let mut t = settings();
-    t.c_lflag |= NOFLSH;
-    let _ = d.set_termios(t, false);
-    assert_eq!(receive(&mut d, 3).0.wake, Wake::default());
 }
 
 #[test]
@@ -873,6 +802,7 @@ fn fallible_constructor_and_compact_entries() {
     let d = LineDiscipline::try_new(settings()).unwrap();
     d.check_invariants();
     assert!(matches!(LineDiscipline::with_capacity(settings(), usize::MAX), Err(NoMemory)));
+    // Checks this rustc layout, not a public layout guarantee.
     assert_eq!(size_of::<Entry>(), 3);
 }
 
@@ -897,13 +827,13 @@ fn input_storage_capacity_never_grows() {
             let _ = d.read(&mut [0; 7]);
         }
         assert!(!d.poll_readable());
-        let _ = d.set_termios(raw(), false);
+        let _ = d.set_termios(raw(), Flush::Keep);
         fill(&mut d, b'a', 4095);
         let _ = d.read(&mut [0; 11]);
         fill(&mut d, b'b', 11);
-        let _ = d.set_termios(settings(), false);
+        let _ = d.set_termios(settings(), Flush::Keep);
         let _ = d.read(&mut [0; BUFFER_SIZE]);
-        let _ = d.set_termios(settings(), cycle % 2 == 0);
+        let _ = d.set_termios(settings(), if cycle % 2 == 0 { Flush::Input } else { Flush::Keep });
         assert_eq!(d.input.capacity(), capacity);
         d.check_invariants();
     }
@@ -922,9 +852,7 @@ fn randomized_canonical_reference_model() {
     let alphabet = b"abc xyz\x7f\r\n\x04\x15";
     let mut seed = 0x340badcafeu64;
     for step in 0..30_000 {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
+        next(&mut seed);
         let byte = alphabet[seed as usize % alphabet.len()];
         let b = if byte == b'\r' { b'\n' } else { byte };
         let expected = match b {
@@ -972,7 +900,7 @@ fn randomized_canonical_reference_model() {
                     lines.pop_front();
                 }
             }
-            assert_eq!(d.read(&mut buf[..size]).0, result, "read {step}");
+            assert_eq!(d.read(&mut buf[..size]).read, result, "read {step}");
             assert_eq!(&buf[..expected.len()], expected);
             d.check_invariants();
         }
@@ -992,64 +920,609 @@ fn randomized_canonical_reference_model() {
     d.check_invariants();
 }
 
+fn armed(time: u8, kind: TimerKind) -> Decision {
+    Decision::WaitWithTimer { deciseconds: core::num::NonZeroU8::new(time).unwrap(), kind }
+}
+
 #[test]
-fn seeded_bounded_all_entry_points_fuzz() {
+fn all_four_vmin_vtime_cases_and_timer_arming() {
+    let mut d = tty(raw_timed(0, 0));
+    let mut timer = ReadTimer::new();
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Read);
+    assert_eq!(d.read(&mut [0; 9]).read, Read::Nothing);
+    feed(&mut d, b"ab");
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Read);
+    assert_eq!(bytes(&mut d), b"ab");
+
+    let mut d = tty(raw_timed(3, 0));
+    let mut timer = ReadTimer::new();
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Wait);
+    feed(&mut d, b"ab");
+    timer.expire();
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Wait); // no timer was armed
+    let _ = receive(&mut d, b'c');
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Read);
+    assert_eq!(bytes(&mut d), b"abc");
+
+    let mut d = tty(raw_timed(0, 5));
+    let mut timer = ReadTimer::new();
+    assert_eq!(d.read_decision(9, &mut timer), armed(5, TimerKind::Read));
+    for _ in 0..3 {
+        assert_eq!(d.read_decision(9, &mut timer), Decision::Wait);
+    }
+    timer.expire();
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Read);
+    assert_eq!(d.read(&mut [0; 9]).read, Read::Nothing);
+    let mut timer = ReadTimer::new();
+    assert_eq!(d.read_decision(9, &mut timer), armed(5, TimerKind::Read));
+    let _ = receive(&mut d, b'x');
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Read);
+
+    let mut d = tty(raw_timed(3, 2));
+    let mut timer = ReadTimer::new();
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Wait);
+    let _ = receive(&mut d, b'a');
+    assert_eq!(d.read_decision(9, &mut timer), armed(2, TimerKind::InterByte));
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Wait);
+    let _ = receive(&mut d, b'b');
+    assert_eq!(d.read_decision(9, &mut timer), armed(2, TimerKind::InterByte));
+    timer.expire();
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Read);
+    assert_eq!(bytes(&mut d), b"ab");
+    let mut timer = ReadTimer::new();
+    feed(&mut d, b"abc");
+    assert_eq!(d.read_decision(9, &mut timer), Decision::Read);
+    assert_eq!(bytes(&mut d), b"abc");
+}
+
+#[test]
+fn reader_owned_timers_restart_on_input_flush_and_settings() {
+    let mut d = tty(raw_timed(3, 2));
+    let mut first = ReadTimer::new();
+    let mut second = ReadTimer::new();
+    let _ = receive(&mut d, b'a');
+    assert_eq!(d.read_decision(8, &mut first), armed(2, TimerKind::InterByte));
+    assert_eq!(d.read_decision(8, &mut second), armed(2, TimerKind::InterByte));
+    first.expire();
+    assert_eq!(d.read_decision(8, &mut first), Decision::Read);
+    assert_eq!(d.read_decision(8, &mut second), Decision::Wait);
+    let _ = receive(&mut d, b'b');
+    assert_eq!(d.read_decision(8, &mut first), armed(2, TimerKind::InterByte));
+    assert_eq!(d.read_decision(8, &mut second), armed(2, TimerKind::InterByte));
+    let _ = d.set_termios(d.termios(), Flush::Keep);
+    assert_eq!(d.read_decision(8, &mut first), Decision::Wait);
+    first.expire();
+    let _ = d.flush_input();
+    assert_eq!(d.read_decision(8, &mut first), Decision::Wait);
+    let _ = receive(&mut d, b'c');
+    assert_eq!(d.read_decision(8, &mut first), armed(2, TimerKind::InterByte));
+    // Flush + new input without an intervening decision must rearm too.
+    first.expire();
+    let _ = d.flush_input();
+    let _ = receive(&mut d, b'd');
+    assert_eq!(d.read_decision(8, &mut first), armed(2, TimerKind::InterByte));
+    let _ = d.set_termios(raw_timed(3, 7), Flush::Keep);
+    assert_eq!(d.read_decision(8, &mut first), armed(7, TimerKind::InterByte));
+    d.stored = u64::MAX;
+    let mut wrapped = ReadTimer::new();
+    assert_eq!(d.read_decision(8, &mut wrapped), armed(7, TimerKind::InterByte));
+    let _ = receive(&mut d, b'e');
+    assert_eq!(d.stored, 0);
+    assert_eq!(d.read_decision(8, &mut wrapped), armed(7, TimerKind::InterByte));
+}
+
+#[test]
+fn decisions_clamp_destinations_and_require_consuming_eof() {
+    let mut d = tty(raw_timed(3, 0));
+    feed(&mut d, b"ab");
+    assert_eq!(fresh(&d, 4096), Decision::Wait);
+    assert_eq!(fresh(&d, 2), Decision::Read);
+    assert_eq!(d.read(&mut [0; 2]).read, got(2));
+    for t in [settings(), raw_timed(3, 4)] {
+        let mut d = tty(t);
+        feed(&mut d, b"x");
+        assert_eq!(fresh(&d, 0), Decision::Read);
+        assert_eq!(d.read(&mut []).read, Read::Nothing);
+        assert_eq!(d.input.len(), 1);
+    }
+    let mut d = line();
+    let _ = receive(&mut d, EOF);
+    assert_eq!(fresh(&d, 1), Decision::Read);
+    assert_eq!(fresh(&d, 1), Decision::Read);
+    assert_eq!(d.read(&mut [0]).read, Read::Eof);
+    assert_eq!(fresh(&d, 1), Decision::Wait);
+}
+
+#[test]
+fn wake_all_levels_cover_short_readers_and_multiple_lines() {
+    let mut d = tty(raw_timed(3, 0));
+    for byte in b"ab" {
+        assert!(receive(&mut d, *byte).0.wake.readers);
+    }
+    assert_eq!(fresh(&d, 2), Decision::Read);
+    assert!(!d.poll_readable());
+    let read = d.read(&mut [0]);
+    assert!(read.wake_writers);
+    assert_eq!(read.read, got(1));
+    assert!(d.read(&mut [0]).wake_writers);
+    assert!(!d.read(&mut [0]).wake_writers);
+    let mut d = line();
+    for byte in b"a\nb\n" {
+        assert!(receive(&mut d, *byte).0.wake.readers);
+    }
+    assert_eq!(bytes(&mut d), b"a\n");
+    assert_eq!(bytes(&mut d), b"b\n");
+    for action in [ERASE, WERASE, KILL, INTR] {
+        feed(&mut d, b"xy");
+        assert!(receive(&mut d, action).0.wake.writers);
+        let _ = d.flush_input();
+    }
+    assert!(receive(&mut d, INTR).0.wake.writers); // flushing even an empty queue
+    let _ = receive(&mut d, EOF);
+    assert!(d.read(&mut [0]).wake_writers);
+    let mut t = settings();
+    t.c_iflag = 0;
+    let _ = d.set_termios(t, Flush::Keep);
+    let mut out = Sink::new(8);
+    assert!(d.receive_break(&mut out).wake.readers);
+}
+
+#[test]
+fn probe_b_all_termios_changes_wake_both_queues() {
+    for (before, after) in
+        [(settings(), raw_timed(0, 0)), (settings(), raw_timed(0, 5)), (raw_timed(1, 0), raw_timed(0, 0))]
+    {
+        let mut d = tty(before);
+        assert_eq!(fresh(&d, 16), Decision::Wait);
+        assert_eq!(d.set_termios(after, Flush::Keep), Wake { readers: true, writers: true });
+        assert_ne!(fresh(&d, 16), Decision::Wait);
+        assert_eq!(d.set_termios(after, Flush::Keep), Wake { readers: true, writers: true });
+    }
+}
+
+#[test]
+fn probe_c_overflow_reports_every_replacement_and_bel() {
+    let mut d = line();
+    fill(&mut d, b'a', 4095);
+    assert_eq!(receive(&mut d, b'b').0.input, Input::Stored);
+    assert_eq!(receive(&mut d, b'c').0.input, Input::Replaced);
+    assert_eq!(receive(&mut d, b'\n').0.input, Input::Replaced);
+    let data = bytes(&mut d);
+    assert_eq!(data.len(), 4096);
+    assert!(data[..4095].iter().all(|&b| b == b'a'));
+    assert_eq!(data[4095], b'\n');
+    let mut t = settings();
+    t.c_iflag |= IMAXBEL;
+    let _ = d.set_termios(t, Flush::Input);
+    fill(&mut d, b'a', 4096);
+    let stored = d.stored;
+    let (e, echo) = receive(&mut d, b'z');
+    assert_eq!(e.input, Input::Replaced);
+    assert_eq!(d.stored, stored.wrapping_add(1));
+    assert!(e.wake.readers && e.wake.writers);
+    assert_eq!(echo, [BEL, b'z']);
+}
+
+#[test]
+fn probes_a_f_master_and_reader_finish_long_and_quoted_lines() {
+    for quoted in [false, true] {
+        let mut d = line();
+        let mut out = Sink::new(65536);
+        let mut input = vec![b'a'; 5000];
+        if quoted {
+            input.insert(4095, LNEXT);
+            input.insert(4096, INTR);
+        }
+        input.push(b'\n');
+        let mut sent = 0;
+        let mut read = false;
+        let mut timer = ReadTimer::new();
+        for step in 0..10_000 {
+            if let Some(&byte) = input.get(sent)
+                && d.accepts(byte)
+            {
+                let e = d.receive(byte, &mut out);
+                assert_ne!(e.input, Input::Dropped);
+                assert!(!matches!(e.input, Input::Signal(_)));
+                sent += 1;
+            }
+            if d.read_decision(4096, &mut timer) == Decision::Read {
+                let mut buf = [0; 4096];
+                let outcome = d.read(&mut buf);
+                assert_eq!(outcome.read, got(4096));
+                assert_eq!(buf[4095], b'\n');
+                assert!(buf[..4095].iter().all(|&b| b == b'a'));
+                read = true;
+            }
+            if sent == input.len() && read {
+                break;
+            }
+            assert!(step + 1 < 10_000, "master or reader stalled at byte {sent}");
+        }
+        assert_eq!(sent, input.len());
+        assert!(read);
+    }
+    let mut d = line();
+    fill(&mut d, b'a', 4095);
+    let _ = receive(&mut d, LNEXT);
+    for byte in 0..=255 {
+        assert!(d.accepts(byte));
+    }
+    assert_eq!(receive(&mut d, INTR).0.input, Input::Stored);
+}
+
+#[test]
+fn mode_switch_at_full_capacity_and_canonical_changes() {
+    let mut d = line();
+    fill(&mut d, b'a', 4096);
+    let _ = d.set_termios(raw(), Flush::Keep);
+    assert_eq!(d.readable_bytes(), 4096);
+    assert_eq!(d.read(&mut [0; 2]).read, got(2));
+    let _ = d.set_termios(settings(), Flush::Keep);
+    assert_eq!(receive(&mut d, ERASE).0.input, Input::Ignored);
+    assert_eq!(d.readable_bytes(), 4094); // synthetic record cannot be edited
+    let _ = receive(&mut d, b'b');
+    assert_eq!(bytes(&mut d), vec![b'a'; 4094]);
+    let _ = receive(&mut d, b'\n');
+    assert_eq!(bytes(&mut d), b"b\n");
+    for complete in [false, true] {
+        let mut d = line();
+        if complete {
+            feed(&mut d, b"done\n");
+        }
+        feed(&mut d, b"part");
+        let mut t = settings();
+        t.c_iflag ^= IGNCR;
+        assert_eq!(d.set_termios(t, Flush::Keep), Wake { readers: true, writers: true });
+        assert_eq!(d.readable_bytes(), if complete { 5 } else { 0 });
+        if complete {
+            assert_eq!(bytes(&mut d), b"done\n");
+        }
+        assert_eq!(fresh(&d, 8), Decision::Wait);
+        assert_eq!(d.read(&mut [0; 8]).read, Read::Nothing);
+        let _ = receive(&mut d, b'\n');
+        assert_eq!(bytes(&mut d), b"part\n");
+    }
+}
+
+#[test]
+fn flush_input_preserves_literal_next_and_allows_interrupted_drain() {
+    for flush in [Flush::Keep, Flush::Input] {
+        let mut d = line();
+        feed(&mut d, b"abc");
+        assert_eq!(d.set_termios(raw(), flush), Wake { readers: true, writers: true });
+        assert_eq!(bytes(&mut d), if flush == Flush::Keep { &b"abc"[..] } else { &b""[..] });
+    }
+    for via_termios in [false, true] {
+        let mut d = line();
+        feed(&mut d, &[b'x', LNEXT]);
+        let wake = if via_termios { d.set_termios(settings(), Flush::Input) } else { d.flush_input() };
+        assert!(wake.writers);
+        assert_eq!(d.termios(), settings());
+        assert_eq!(d.input.len(), 0);
+        assert_eq!(receive(&mut d, INTR).0.input, Input::Stored);
+        let _ = receive(&mut d, b'\n');
+        assert_eq!(bytes(&mut d), [INTR, b'\n']);
+    }
+    let mut d = line();
+    feed(&mut d, b"pending");
+    let _ = d.flush_input(); // wait_until_sent can be interrupted here
+    assert_eq!(d.termios(), settings());
+    assert_eq!(d.input.len(), 0);
+}
+
+#[test]
+fn readable_bytes_excludes_eof_and_unfinished_canonical_input() {
+    let mut d = line();
+    feed(&mut d, b"one\nxx\x04\x04tail");
+    assert_eq!(d.readable_bytes(), 6);
+    assert_eq!(d.read(&mut [0; 2]).read, got(2));
+    assert_eq!(d.readable_bytes(), 4);
+    assert_eq!(bytes(&mut d), b"e\n");
+    assert_eq!(d.readable_bytes(), 2);
+    assert_eq!(bytes(&mut d), b"xx");
+    assert_eq!(d.readable_bytes(), 0);
+    assert!(d.poll_readable());
+    assert_eq!(d.read(&mut [0]).read, Read::Eof);
+    assert_eq!(d.readable_bytes(), 0);
+    assert!(!d.poll_readable());
+    let _ = d.set_termios(raw(), Flush::Keep);
+    assert_eq!(d.readable_bytes(), 4);
+    let _ = receive(&mut d, 0);
+    assert_eq!(d.readable_bytes(), 5);
+    let _ = d.set_termios(settings(), Flush::Keep);
+    assert_eq!(bytes(&mut d), b"tail\0"); // documented synthetic-line difference
+    let _ = d.set_termios(raw(), Flush::Keep);
+    let _ = receive(&mut d, 0);
+    let _ = d.set_termios(settings(), Flush::Keep);
+    assert_eq!(d.read(&mut [0]).read, got(1));
+}
+
+#[test]
+fn newline_precedes_eof_and_visual_kill_clears_stray_continuations() {
+    let mut t = settings();
+    t.c_cc[VEOF as usize] = b'\n';
+    let mut d = tty(t);
+    assert_eq!(receive(&mut d, b'\n').1, b"\r\n");
+    assert_eq!(bytes(&mut d), b"\n");
+    let mut d = line();
+    feed(&mut d, b"done\n\x80\x81");
+    assert_eq!(receive(&mut d, KILL).1, b"");
+    assert_eq!(d.pending, 0);
+    assert_eq!(bytes(&mut d), b"done\n");
+    let _ = receive(&mut d, b'\n');
+    assert_eq!(bytes(&mut d), b"\n");
+}
+
+#[test]
+fn erase_uses_only_actually_echoed_widths_across_echo_changes() {
+    let mut d = line();
+    let _ = receive(&mut d, b'a');
+    let mut blocked = Sink::new(0);
+    assert_eq!(d.receive(b'b', &mut blocked).echo, Echo::Truncated);
+    assert_eq!(receive(&mut d, ERASE).1, b"");
+    assert_eq!(d.column, 1);
+    assert_eq!(receive(&mut d, ERASE).1, b"\x08 \x08");
+    assert_eq!(d.column, 0);
+    let mut t = settings();
+    t.c_lflag &= !ECHO;
+    let _ = d.set_termios(t, Flush::Keep);
+    let _ = receive(&mut d, b'x');
+    let _ = d.set_termios(settings(), Flush::Keep);
+    assert_eq!(receive(&mut d, ERASE).1, b"");
+    let _ = receive(&mut d, b'y');
+    let _ = d.set_termios(t, Flush::Keep);
+    assert_eq!(receive(&mut d, ERASE).1, b"");
+    assert_eq!(d.column, 1);
+    // Width is recorded under the old ECHOCTL, not recomputed when erasing.
+    let _ = d.set_termios(settings(), Flush::Keep);
+    let _ = receive(&mut d, 1);
+    let mut plain = settings();
+    plain.c_lflag &= !ECHOCTL;
+    let _ = d.set_termios(plain, Flush::Keep);
+    assert_eq!(receive(&mut d, ERASE).1, b"\x08 \x08".repeat(2));
+}
+
+#[test]
+fn control_gates_reprint_pending_only_and_editing_fates() {
+    let mut d = line();
+    feed(&mut d, b"done\nab");
+    assert_eq!(
+        receive(&mut d, REPRINT),
+        (Effects { input: Input::Ignored, echo: Echo::Complete, wake: Wake::default() }, b"^R\r\nab".to_vec())
+    );
+    let mut t = settings();
+    t.c_lflag &= !ECHOCTL;
+    let mut d = tty(t);
+    assert_eq!(receive(&mut d, LNEXT).1, b"");
+    assert_eq!(receive(&mut d, INTR).0.input, Input::Stored);
+    let _ = receive(&mut d, b'\n');
+    assert_eq!(bytes(&mut d), [INTR, b'\n']);
+    t.c_lflag &= !ECHO;
+    let mut d = tty(t);
+    assert_eq!(receive(&mut d, REPRINT).0.input, Input::Stored); // disabled reprint becomes data
+    let _ = receive(&mut d, b'\n');
+    assert_eq!(bytes(&mut d), [REPRINT, b'\n']);
+    for control in [ERASE, WERASE, KILL, LNEXT, REPRINT] {
+        let mut d = line();
+        feed(&mut d, b"ab");
+        assert_eq!(receive(&mut d, control).0.input, Input::Ignored);
+    }
+    for byte in [0xa0, 0xaa, 0xb5, 0xbf] {
+        let mut t = settings();
+        t.c_iflag &= !IUTF8; // Latin-1 bytes, not UTF-8 continuation bytes.
+        let mut d = tty(t);
+        feed(&mut d, &[b'a', byte, b'b']);
+        let _ = receive(&mut d, WERASE);
+        let _ = receive(&mut d, b'\n');
+        assert_eq!(bytes(&mut d), [b'a', byte, b'\n']);
+    }
+}
+
+#[test]
+fn isig_precedes_igncr_and_eol_del_echo_rules() {
+    let mut t = settings();
+    t.c_iflag |= IGNCR;
+    let mut d = tty(t);
+    assert_eq!(receive(&mut d, b'\r').0.input, Input::Ignored);
+    assert_eq!(d.input.len(), 0);
+    t.c_cc[VINTR as usize] = b'\r';
+    let _ = d.set_termios(t, Flush::Keep);
+    assert_eq!(receive(&mut d, b'\r').0.input, signal(JobSignalKind::Int, true));
+    t = settings();
+    t.c_cc[VEOL as usize] = b';';
+    t.c_cc[VEOL2 as usize] = b':';
+    let mut d = tty(t);
+    assert_eq!(receive(&mut d, b';').1, b";");
+    assert_eq!(receive(&mut d, b':').1, b":");
+    assert_eq!(bytes(&mut d), b";");
+    assert_eq!(bytes(&mut d), b":");
+    t.c_lflag &= !ECHO;
+    let mut d = tty(t);
+    assert_eq!(receive(&mut d, b';').1, b"");
+    assert_eq!(receive(&mut d, b':').1, b"");
+    let mut d = tty(raw());
+    assert_eq!(write(&mut d, b"a\x7f"), b"a\x7f");
+    assert_eq!(d.column, 1);
+}
+
+#[test]
+fn output_max_unit_and_refusal_preserve_prefix_and_column() {
+    let mut out = Sink::new(MAX_UNIT);
+    assert!(out.push(&[b'x'; MAX_UNIT]));
+    assert!(!out.push(b"z"));
+    assert_eq!(out.bytes, [b'x'; MAX_UNIT]);
+    out.discard();
+    assert!(out.push(&[b'y'; MAX_UNIT]));
+    let mut d = line();
+    let mut out = Sink::new(1);
+    assert_eq!(d.write(b"\n", &mut out).consumed, 0);
+    assert_eq!(d.column, 0);
+    assert!(out.bytes.is_empty());
+    out.discard();
+    assert_eq!(d.write(b"\n", &mut out).consumed, 1);
+    assert_eq!(out.bytes, b"\r\n");
+}
+
+fn snapshot(d: &LineDiscipline) -> LineDiscipline {
+    let mut input = d.input.clone();
+    input.try_reserve_exact(BUFFER_SIZE - input.len()).unwrap();
+    LineDiscipline {
+        termios: d.termios,
+        input,
+        pending: d.pending,
+        records: d.records,
+        literal: d.literal,
+        column: d.column,
+        winsize: d.winsize,
+        stored: d.stored,
+    }
+}
+
+fn acceptance_oracle(d: &LineDiscipline) {
+    for byte in 0..=255 {
+        let mut clone = snapshot(d);
+        let mut out = Sink::new(32768);
+        let before_len = clone.input.len();
+        let before_stored = clone.stored;
+        let e = clone.receive(byte, &mut out);
+        assert_eq!(
+            d.accepts(byte),
+            e.input != Input::Dropped,
+            "byte {byte}, queued {before_len}, literal {}",
+            d.literal
+        );
+        match e.input {
+            Input::Stored => {
+                assert_eq!(clone.input.len(), before_len + 1);
+                assert_eq!(clone.stored, before_stored.wrapping_add(1));
+            }
+            Input::Replaced => {
+                assert_eq!(clone.input.len(), before_len);
+                assert_eq!(clone.stored, before_stored.wrapping_add(1));
+            }
+            Input::Dropped => {
+                assert_eq!(clone.input.len(), before_len);
+                assert_eq!(clone.stored, before_stored);
+                assert!(
+                    clone
+                        .input
+                        .iter()
+                        .zip(&d.input)
+                        .all(|(a, b)| a.byte == b.byte && a.kind == b.kind && a.width == b.width)
+                );
+            }
+            _ => {}
+        }
+        assert_eq!(e.echo, Echo::Complete); // largest possible echo fits this sink
+        clone.check_invariants();
+    }
+}
+
+#[test]
+fn seeded_probes_d_e_f_check_acceptance_wakes_and_full_buffers() {
     let mut seed = 0x0034_0364_dead_beef_u64;
-    let mut d = tty(settings());
-    let mut out = Sink::new(64);
-    for step in 0..40_000 {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        out.bytes.clear();
+    let mut d = line();
+    let mut out = Sink::new(32768);
+    let alphabet = [
+        b'a', b'b', b' ', b'.', b'\t', 0xc3, 0xa9, 0x80, b'\n', b'\r', INTR, EOF, KILL, LNEXT, WERASE, REPRINT, ERASE,
+        0, 255, b';',
+    ];
+    let mut hit4095 = false;
+    let mut hit4096 = false;
+    let mut replaced = false;
+    // Finite whole-buffer phases exercise the old fuzz's missing boundary.
+    for size in [4095, 4096, 4100] {
+        let _ = d.set_termios(settings(), Flush::Input);
+        for _ in 0..size {
+            let e = d.receive(b'a', &mut out);
+            replaced |= e.input == Input::Replaced;
+        }
+        hit4095 |= d.input.len() == 4095;
+        hit4096 |= d.input.len() == 4096;
+        d.check_invariants();
+        acceptance_oracle(&d);
+        let _ = receive(&mut d, LNEXT);
+        acceptance_oracle(&d);
+        let _ = receive(&mut d, INTR);
+        acceptance_oracle(&d);
+        out.discard();
         out.events.clear();
-        out.limit = (seed as usize >> 8) % 65;
-        let byte = (seed >> 32) as u8;
-        match seed % 10 {
+    }
+    let _ = d.set_termios(raw(), Flush::Input);
+    fill(&mut d, b'a', 4095);
+    acceptance_oracle(&d);
+    let _ = d.set_termios(settings(), Flush::Input);
+    feed(&mut d, b"done\n");
+    fill(&mut d, b'a', 4090);
+    acceptance_oracle(&d); // completed line blocks further storage
+    for step in 0..512 {
+        let r = next(&mut seed);
+        let accepted_before: [bool; 256] = core::array::from_fn(|i| d.accepts(i as u8));
+        let decisions_before = [fresh(&d, 1), fresh(&d, 4096)];
+        let mut out = Sink::new((r as usize >> 8) % 17);
+        let mut read_operation = false;
+        let wake = match r % 10 {
             0..=3 => {
-                let _ = d.accepts(byte);
-                let _ = d.receive(byte, &mut out);
+                let byte = if r & 0x100 == 0 { alphabet[(r >> 20) as usize % alphabet.len()] } else { (r >> 32) as u8 };
+                d.receive(byte, &mut out).wake
             }
-            4 => {
-                let _ = d.receive_break(&mut out);
-            }
+            4 => d.receive_break(&mut out).wake,
             5 => {
-                let mut buf = [0; 19];
-                let _ = d.read(&mut buf[..step % 20]);
+                read_operation = true;
+                let len = step % 65;
+                let mut buf = [0; 64];
+                let decision = fresh(&d, len);
+                let result = d.read(&mut buf[..len]);
+                if len == 0 {
+                    assert_eq!(decision, Decision::Read);
+                    assert_eq!(result.read, Read::Nothing);
+                }
+                if d.local(ICANON) && decision == Decision::Wait {
+                    assert_eq!(result.read, Read::Nothing);
+                }
+                Wake { readers: false, writers: result.wake_writers }
             }
             6 => {
-                let t = Termios {
-                    c_iflag: seed as u32,
-                    c_oflag: (seed >> 16) as u32,
-                    c_cflag: (seed >> 32) as u32,
-                    c_lflag: (seed >> 12) as u32,
-                    c_line: byte,
-                    c_cc: core::array::from_fn(|i| (seed.rotate_right(i as u32) >> 32) as u8),
-                };
-                let _ = d.set_termios(t, seed & 0x100 != 0);
+                let mut t = settings();
+                t.c_lflag = (r >> 12) as u32;
+                t.c_iflag = (r >> 28) as u32;
+                t.c_oflag = (r >> 36) as u32;
+                // Control collisions, not only random mostly-disabled keys.
+                for cc in &mut t.c_cc {
+                    *cc = alphabet[next(&mut seed) as usize % alphabet.len()];
+                }
+                t.c_cc[VMIN as usize] = (r >> 44) as u8 % 6;
+                t.c_cc[VTIME as usize] = (r >> 50) as u8 % 3;
+                d.set_termios(t, if r & 0x1000 == 0 { Flush::Keep } else { Flush::Input })
             }
             7 => {
-                let _ = d.write(&[byte, b'\n', b'\r', b'\t', 8, 0, 255], &mut out);
+                let _ = d.write(&[b'a', b'\n', b'\r', b'\t', BS, 0, 255], &mut out);
+                Wake::default()
             }
-            8 => {
-                for timer in [TimerState::Idle, TimerState::Running, TimerState::Expired] {
-                    let _ = d.read_decision(step % 300, timer);
-                }
-                let _ = d.poll_readable();
-                let _ = d.input_room();
-            }
+            8 => d.flush_input(),
             _ => {
                 let ws = Winsize {
-                    ws_row: seed as u16,
-                    ws_col: (seed >> 16) as u16,
-                    ws_xpixel: (seed >> 32) as u16,
-                    ws_ypixel: (seed >> 48) as u16,
+                    ws_row: r as u16,
+                    ws_col: (r >> 16) as u16,
+                    ws_xpixel: (r >> 32) as u16,
+                    ws_ypixel: (r >> 48) as u16,
                 };
                 let _ = d.set_winsize(ws);
                 assert_eq!(d.winsize(), ws);
+                Wake::default()
+            }
+        };
+        if !read_operation && decisions_before != [fresh(&d, 1), fresh(&d, 4096)] {
+            assert!(wake.readers, "changed reader decision at step {step}");
+        }
+        for byte in 0..=255 {
+            if !accepted_before[byte as usize] && d.accepts(byte) {
+                assert!(wake.writers, "writer stranded at step {step}, byte {byte}");
             }
         }
         d.check_invariants();
-        assert!(out.bytes.len() <= out.limit);
+        acceptance_oracle(&d);
     }
+    assert!(hit4095 && hit4096 && replaced, "full-buffer phases must reach and replace overflow");
 }
