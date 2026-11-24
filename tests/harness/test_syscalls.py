@@ -83,6 +83,38 @@ def test_a_resumption_of_another_call_than_the_pending_one_is_refused():
         parse_trace(lines)
 
 
+def test_a_success_strace_annotates_is_kept_and_has_no_errno():
+    lines = [
+        "7    fcntl(3, 0x3)                     = 0x8000 (flags 0x8000)",
+        "7    pselect6(4, [3], NULL, NULL, {tv_sec=0, tv_nsec=0}, NULL) = 0 (Timeout)",
+        "7    poll([{fd=0, events=0x1}], 1, -1) = 1 ([{fd=0, revents=0x1}])",
+        "7    rt_sigsuspend([], 8)              = ? ERESTARTNOHAND (To be restarted if no handler)",
+        "7    exit_group(0)                     = ?",
+    ]
+    calls = parse_trace(lines)
+    assert [(c.name, c.ret, c.errno) for c in calls] == [
+        ("fcntl", "0x8000", None),
+        ("pselect6", "0", None),
+        ("poll", "1", None),
+        ("rt_sigsuspend", "?", "ERESTARTNOHAND"),
+        ("exit_group", "?", None),
+    ]
+    assert key_values(calls[0]) == {"cmd": "0x3"}
+
+
+@pytest.mark.parametrize(
+    ("line", "match"),
+    [
+        ('open("/x", 0) = 3', "not an strace -f line"),
+        ("7    write(1, ..., 4", "not a completed syscall"),
+        ('7    write(1, "", 4) = ', "not a completed syscall"),
+    ],
+)
+def test_a_line_the_parser_cant_read_is_refused(line, match):
+    with pytest.raises(CensusError, match=match):
+        parse_trace([line])
+
+
 def test_key_values_reads_positions_named_args_and_fields():
     calls = {c.name: c for c in parse_trace(TRACE.splitlines())}
     # Named argument, its OR'd exit signal folded in: CLONE_VM|CLONE_VFORK|SIGCHLD.

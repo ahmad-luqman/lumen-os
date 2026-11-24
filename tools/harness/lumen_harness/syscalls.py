@@ -218,7 +218,11 @@ class Seen:
 _LINE = re.compile(r"^(\d+)\s+(.*)$")
 _UNFINISHED = re.compile(r"^(\w+)\((.*) <unfinished \.\.\.>$")
 _RESUMED = re.compile(r"^<\.\.\. (\w+) resumed>(.*)$")
-_COMPLETE = re.compile(r"^(\w+)\((.*)\)\s+=\s+(\S+)(?:\s+(E[A-Z0-9]+)\b.*)?$")
+# A completed call: its arguments, its return value, then whatever strace adds
+# after it: an errno (`-1 ENOENT (...)`, `? ERESTARTNOHAND (...)`) or a note
+# on a success (`0x8000 (flags 0x8000)`, `0 (Timeout)`, `1 ([{fd=0, ...}])`).
+_COMPLETE = re.compile(r"^(\w+)\((.*)\)\s+=\s+(\S+)(?:\s+(.*))?$")
+_ERRNO = re.compile(r"^(E[A-Z0-9]+)\b")
 
 
 def split_args(text: str) -> list[str]:
@@ -255,13 +259,17 @@ def parse_trace(lines) -> list[Call]:
     """The completed calls in an `strace -f -o FILE` trace, an unfinished call
     joined to its resumption (both on the same pid's lines). Signal, exit and
     `+++`/`---` lines are skipped; a call still unfinished at the end (its
-    process killed) is dropped."""
+    process killed) is dropped. Any other line is refused: a census that
+    skipped lines it couldn't read would understate the workloads."""
     pending: dict[str, tuple[str, str]] = {}
     calls: list[Call] = []
     for raw in lines:
-        m = _LINE.match(raw.rstrip("\n"))
-        if not m:
+        line = raw.rstrip("\n")
+        if not line.strip():
             continue
+        m = _LINE.match(line)
+        if not m:
+            raise CensusError(f"not an strace -f line: {line!r}")
         pid, rest = m.groups()
         if rest.startswith(("+++", "---")):
             continue
@@ -275,9 +283,10 @@ def parse_trace(lines) -> list[Call]:
             rest = f"{name}({partial}{r.group(2)}"
         c = _COMPLETE.match(rest)
         if not c:
-            continue
-        name, args, ret, errno = c.groups()
-        calls.append(Call(name, split_args(args), ret, errno))
+            raise CensusError(f"pid {pid}: not a completed syscall: {rest!r}")
+        name, args, ret, note = c.groups()
+        e = _ERRNO.match(note or "") if ret in ("-1", "?") else None
+        calls.append(Call(name, split_args(args), ret, e.group(1) if e else None))
     return calls
 
 
