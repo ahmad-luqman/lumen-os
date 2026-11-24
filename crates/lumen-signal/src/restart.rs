@@ -25,44 +25,58 @@ impl RestartCode {
     }
 }
 
+/// An interrupted syscall, supplied by the kernel rather than inferred from RAX.
+/// None represents Linux's orig_ax == -1, including every successful sigreturn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RestartSyscall {
-    Original,
-    /// Linux uses __NR_restart_syscall, not orig_rax, for RESTARTBLOCK without
-    /// a handler. The kernel must retain the associated restart-block state.
-    RestartBlock,
+pub struct SyscallExit {
+    pub result: i64,
+    pub orig_rax: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handling {
+    None,
+    Handler { sa_restart: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestartDecision {
-    Restart(RestartSyscall),
+    Unchanged,
+    Restart { rax: u64 },
     ReturnEintr,
 }
 
-/// `handler` is None when no handler runs, or Some(SA_RESTART is set).
-pub const fn decide(code: RestartCode, handler: Option<bool>) -> RestartDecision {
+/// No syscall context means no register change, even if user RAX resembles an
+/// internal restart code. RESTARTBLOCK without a handler uses restart_syscall
+/// (219); the kernel must retain its associated restart-block state.
+#[must_use]
+pub const fn decide(syscall: Option<SyscallExit>, handling: Handling) -> RestartDecision {
     use RestartCode::*;
     use RestartDecision::*;
-    match (code, handler) {
-        (NoIntr, _) | (Sys, None | Some(true)) | (NoHand, None) => Restart(RestartSyscall::Original),
-        (RestartBlock, None) => Restart(RestartSyscall::RestartBlock),
+    let Some(exit) = syscall else { return Unchanged };
+    if exit.orig_rax == u64::MAX {
+        return Unchanged;
+    }
+    let Some(code) = RestartCode::from_kernel_result(exit.result) else { return Unchanged };
+    match (code, handling) {
+        (NoIntr, _) | (Sys, Handling::None | Handling::Handler { sa_restart: true }) | (NoHand, Handling::None) => {
+            Restart { rax: exit.orig_rax }
+        }
+        (RestartBlock, Handling::None) => Restart { rax: 219 },
         _ => ReturnEintr,
     }
 }
 
 impl RestartDecision {
-    /// Apply the decision atomically. A restart with RIP below 2 is refused;
-    /// otherwise RIP is rewound by the two-byte x86-64 syscall instruction.
-    pub fn apply(self, registers: &mut Registers, orig_rax: u64) -> Result<(), RestartUnderflow> {
+    /// Apply atomically. A restart with RIP below 2 is refused; otherwise RIP
+    /// is rewound by the two-byte x86-64 syscall instruction.
+    pub fn apply(self, registers: &mut Registers) -> Result<(), RestartUnderflow> {
         match self {
+            Self::Unchanged => {}
             Self::ReturnEintr => registers.rax = (-(linux_raw_sys::errno::EINTR as i64)) as u64,
-            Self::Restart(kind) => {
+            Self::Restart { rax } => {
                 let rip = registers.rip.checked_sub(2).ok_or(RestartUnderflow)?;
-                registers.rax = match kind {
-                    RestartSyscall::Original => orig_rax,
-                    // x86-64 unistd_64.h; the host's syscall number may differ.
-                    RestartSyscall::RestartBlock => 219,
-                };
+                registers.rax = rax;
                 registers.rip = rip;
             }
         }

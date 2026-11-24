@@ -8,5 +8,8 @@ license.workspace = true
 [dependencies]
 linux-raw-sys = { workspace = true }
 
+[dev-dependencies]
+lumen-vm = { path = "../lumen-vm" }
+
 [lints]
 workspace = true

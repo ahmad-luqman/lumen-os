@@ -4,7 +4,9 @@
 //! include/uapi/asm-generic/ucontext.h, and arch/x86/include/asm/sigframe.h.
 //! linux-raw-sys 0.12.1 exposes stack_t and siginfo_t, but not x86 sigcontext,
 //! ucontext, rt_sigframe or the FP structs. Assertions below pin every field of
-//! those layouts to the Linux headers. Serialization never reads Rust padding.
+//! those layouts against transcribed Linux header literals. XSaveHeader follows
+//! arch/x86/include/asm/fpu/types.h (struct xstate_header). Serialization never
+//! reads Rust padding.
 
 use core::mem::{offset_of, size_of};
 
@@ -95,16 +97,31 @@ pub struct XSaveHeader {
     pub reserved: [u64; 6],
 }
 
+#[repr(C)]
+pub struct XSavePrefix {
+    pub legacy: FxSave,
+    pub header: XSaveHeader,
+}
+
 pub const UCONTEXT: usize = offset_of!(RtSigFrame, uc);
 pub const SIGINFO: usize = offset_of!(RtSigFrame, info);
-pub const MCONTEXT: usize = UCONTEXT + offset_of!(UContext, mcontext);
-pub const SIGMASK: usize = UCONTEXT + offset_of!(UContext, sigmask);
-pub const STACK: usize = UCONTEXT + offset_of!(UContext, stack);
+pub const MCONTEXT: usize = offset_of!(RtSigFrame, uc.mcontext);
+pub const SIGMASK: usize = offset_of!(RtSigFrame, uc.sigmask);
+pub const STACK: usize = offset_of!(RtSigFrame, uc.stack);
 pub const FRAME_SIZE: usize = size_of::<RtSigFrame>();
 pub const FXSAVE_SIZE: usize = size_of::<FxSave>();
 pub const XHEADER_SIZE: usize = size_of::<XSaveHeader>();
 pub const SW_BYTES: usize = offset_of!(FxSave, sw);
 pub const MXCSR: usize = offset_of!(FxSave, mxcsr);
+pub const SW_MAGIC1: usize = offset_of!(FxSave, sw.magic1);
+pub const SW_EXTENDED_SIZE: usize = offset_of!(FxSave, sw.extended_size);
+pub const SW_XFEATURES: usize = offset_of!(FxSave, sw.xfeatures);
+pub const SW_XSTATE_SIZE: usize = offset_of!(FxSave, sw.xstate_size);
+pub const SW_PADDING: usize = offset_of!(FxSave, sw.padding);
+pub const XSTATE_BV: usize = offset_of!(XSavePrefix, header.xstate_bv);
+pub const XCOMP_BV: usize = offset_of!(XSavePrefix, header.xcomp_bv);
+pub const XRESERVED: usize = offset_of!(XSavePrefix, header.reserved);
+pub const XHEADER_END: usize = size_of::<XSavePrefix>();
 pub const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 pub const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
 pub const UC_FP_XSTATE: u64 = 1;
@@ -134,6 +151,7 @@ offsets!(FxSave, 512;
     cwd: 0, swd: 2, twd: 4, fop: 6, rip: 8, rdp: 16, mxcsr: 24, mxcsr_mask: 28,
     st: 32, xmm: 160, reserved: 416, sw: 464,
 );
+offsets!(XSavePrefix, 576; legacy: 0, header: 512);
 offsets!(XSaveHeader, 64; xstate_bv: 0, xcomp_bv: 8, reserved: 16);
 
 #[cfg(target_pointer_width = "64")]

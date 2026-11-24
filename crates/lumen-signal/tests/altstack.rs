@@ -16,14 +16,22 @@ fn sigaltstack_configuration_and_errno_rules() {
         assert_eq!(disabled.configure(0, 0x10000, 8192, flags), Err(StackError::Invalid));
     }
     for flags in [g::SS_DISABLE, g::SS_DISABLE | g::SS_AUTODISARM] {
-        assert_eq!(stack.configure(0x30000, u64::MAX, u64::MAX, flags), Ok(disabled));
+        let result = stack.configure(0x30000, u64::MAX, u64::MAX, flags).unwrap();
+        assert_eq!(result.flags(), flags);
+        assert_eq!((result.sp(), result.size()), (0, 0));
+        assert_eq!(result.status(0x30000), flags);
         assert_eq!(stack.configure(0x10001, 0, 0, flags), Err(StackError::OnStack));
     }
     assert_eq!(StackError::OnStack.errno(), -1);
     assert_eq!(StackError::Invalid.errno(), -22);
     assert_eq!(disabled.configure(0, u64::MAX - 10, 2048, 0), Err(StackError::Invalid));
     assert_eq!(disabled.configure(0, lumen_signal::frame::USER_MAX, 2048, 0), Err(StackError::Invalid));
-    assert_eq!(disabled.configure(0, 0x10000, 2048, g::SS_ONSTACK), Ok(stack));
+    let reported = disabled.configure(0, 0x10000, 2048, g::SS_ONSTACK).unwrap();
+    assert_eq!(reported.flags(), g::SS_ONSTACK);
+    assert_eq!(reported.status(0), 0);
+    assert_eq!(reported.status(0x10001), g::SS_ONSTACK);
+    // EPERM wins even when the requested flags and size are invalid.
+    assert_eq!(stack.configure(0x10001, 0, 0, 4), Err(StackError::OnStack));
 }
 
 #[test]
