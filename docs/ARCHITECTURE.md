@@ -5458,8 +5458,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
 crate file unpacked (the first commit adding it changes nothing in it),
 through `[patch.crates-io]` in the workspace `Cargo.toml`; the dependency
 line still says `=0.1.0-rc.2`. Lumen's changes sit on top, each its own
-commit, its code changes marked `Lumen (#n)` (the crate's own tests only adjusted to new signatures), so `git log vendor/`
-lists them and a diff against the crate file shows them all. So far one:
+commit, its code changes marked `Lumen (#n)` (the crate's own tests only
+adjusted to new signatures), so `git log vendor/` lists them and a diff
+against the crate file shows them all. So far one:
 #313, the htree hash's signedness from `s_flags` (the #308 caveat below;
 `Superblock::htree_hash_unsigned`, and `htree_hash`, public only for
 `lumen-vfs`'s host test). The crate's own unit tests don't build from the
@@ -5889,12 +5890,19 @@ fixable there now, each in a PR of its own.
   - **A directory's size and blocks (#357)** are `ext4plus`'s: it grows a
     directory by a block inside `Dir::link` (an entry that doesn't fit a
     linear directory, an htree leaf split) and writes its inode itself, and
-    the adapter writes neither back. So `stat` reads them from that inode
-    (taking Lock 6 under Lock 4, as writeback does) for a directory still
-    linked, and keeps them in the cached metadata; a removed directory's
-    inode may be another's, so it keeps the cached values
+    the adapter writes neither back. So each operation that links into a
+    directory refreshes the cached values (`Ext4InodeMeta::take_dir_geometry`):
+    create, mkdir, link and symlink from the `Dir` they linked through; a
+    rename re-reads both parents' inodes after it ends, however it ended
+    (Lock 6 under their Lock 4 guards, as writeback takes them; an inode it
+    can't read leaves the cached values). `stat` itself only reads memory,
+    so it never fails, and a removed directory keeps its own values even
+    once its inode number is another file's
     (`ktest:lumen_kernel::vfs::ext4::ext4_a_directory_grown_by_ext4plus_stats_its_size_on_disk`:
-    a linear and an htree directory, against the inode and a fresh mount).
+    a linear directory grown by a link, a rename, a mkdir and a symlink, and
+    an htree one by a create's split, each against the inode and a fresh
+    mount; a removed directory whose inode a new file took). An undo
+    putting an entry back after a failed operation doesn't refresh them.
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
@@ -5998,10 +6006,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     writable. Its hashes are pinned against e2fsprogs' `ext2fs_dirhash`
     for half-MD4 and TEA, signed and unsigned
     (`cargo:lumen-vfs`'s `ext4plus_htree_hash` test); `ext4plus` has no
-    legacy hash (version 0): its hash refuses that version either way (host-tested), and Lumen
-    answers a lookup in such a directory with an unlogged `EIO` (not tested in
-    the kernel). An
-    htree lookup has no linear fallback. With neither flag on a volume with
+    legacy hash (version 0): its hash refuses that version either way
+    (host-tested), and Lumen answers a lookup in such a directory with an
+    unlogged `EIO` (not tested in the kernel). An htree lookup has no
+    linear fallback. With neither flag on a volume with
     `dir_index`, Lumen can't tell: Linux since 6.2 builds with
     `-funsigned-char` on every architecture, so its `ext4_hash_info_init`
     hashes such a volume unsigned, and it writes the flag only from

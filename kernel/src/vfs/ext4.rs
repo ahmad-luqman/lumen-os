@@ -34,7 +34,7 @@ use lumen_vfs::{
     VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
-use log::{error, warn};
+use log::{debug, error, warn};
 
 use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
@@ -1163,7 +1163,7 @@ impl Ext4FileSystem {
         let s_flags = u32::from_le_bytes(raw_sb[S_FLAGS_OFFSET..S_FLAGS_OFFSET + 4].try_into().unwrap());
         let compat = u32::from_le_bytes(raw_sb[COMPAT_OFFSET..COMPAT_OFFSET + 4].try_into().unwrap());
         let hash = DirHash::from_superblock(s_flags, compat);
-        log::debug!(target: "vfs", "ext4 on {dev:?}: htree directories hash names {hash:?} (s_flags {s_flags:#x})");
+        debug!(target: "vfs", "ext4 on {dev:?}: htree directories hash names {hash:?} (s_flags {s_flags:#x})");
 
         let io = BcacheIo(Arc::clone(&bcache));
         // Probe read-only first to inspect superblock feature flags safely.
@@ -1299,6 +1299,9 @@ struct Ext4InodeMeta {
     nlink: u32,
     uid: u32,
     gid: u32,
+    /// A directory's, like its `blocks_512`, are `ext4plus`'s, which grows
+    /// it inside `Dir::link`: refreshed by [`Self::take_dir_geometry`] after
+    /// every operation that links into it (#357).
     size: u64,
     blksize: u32,
     blocks_512: u64,
@@ -1307,6 +1310,19 @@ struct Ext4InodeMeta {
     meta_dirty: bool,
     detached_symlink_target: Vec<u8>,
     locks: AdvisoryLocks,
+}
+
+impl Ext4InodeMeta {
+    /// A directory's size and blocks as `disk`, its inode as `ext4plus` left
+    /// it, has them: `ext4plus` grows a directory by a block inside
+    /// `Dir::link` (an entry that doesn't fit a linear directory, an htree
+    /// leaf split) and writes its inode itself, and nothing here writes them
+    /// back (#357). The create, mkdir, link and symlink paths hand over their
+    /// `Dir`'s inode; a rename re-reads both parents' ([`Ext4Inode::rename`]).
+    fn take_dir_geometry(&mut self, disk: &Inode) {
+        self.size = disk.size_in_bytes();
+        self.blocks_512 = disk.blocks();
+    }
 }
 
 /// VFS inode backed by `ext4` + unified `PageCache`.
@@ -2192,6 +2208,26 @@ impl Ext4Inode {
                     meta.times.set_ctime(now);
                 }
                 meta.meta_dirty = false;
+            }
+        }
+    }
+
+    /// A rename's parents' size and blocks from their inodes (#357,
+    /// [`Ext4InodeMeta::take_dir_geometry`]), however the rename ended: the
+    /// link into `new_dir`, or a put-back into either, may have grown it.
+    /// Lock 6 under their Lock 4 guards, as writeback takes them. A parent
+    /// whose inode can't be read keeps its cached values: the rename's own
+    /// result stands, and `stat` never reads the disk.
+    fn take_parents_geometry(
+        &self,
+        guards: &mut [LockedInode<'_>],
+        old_dir: &Arc<Ext4Inode>,
+        new_dir: &Arc<Ext4Inode>,
+    ) {
+        let inner = self.shared.state.lock();
+        for dir in [old_dir, new_dir] {
+            if let Ok(disk) = Inode::read(&inner.ext4, dir.disk_inode_index()) {
+                find_guard_mut(guards, dir).take_dir_geometry(&disk);
             }
         }
     }
@@ -3759,19 +3795,7 @@ impl VfsInode for Ext4Inode {
     }
 
     fn stat(&self) -> Result<Metadata, VfsError> {
-        let mut meta = self.meta.lock();
-        // A directory's size and blocks are `ext4plus`'s: it grows the
-        // directory by a block when an entry doesn't fit or an htree leaf
-        // splits, inside `Dir::link`, writing its inode itself, and nothing
-        // here writes them back (#357). So they are read from that inode
-        // (Lock 4, meta, then Lock 6, as writeback takes them), unless the
-        // directory is gone and its inode may be another's.
-        if self.inode_type == InodeType::Dir && !self.is_detached() && meta.nlink != 0 {
-            let inner = self.shared.state.lock();
-            let disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            meta.size = disk.size_in_bytes();
-            meta.blocks_512 = disk.blocks();
-        }
+        let meta = self.meta.lock();
         // Blocks are allocated only at writeback, so until then the disk's
         // count lags what was written. Dirty pages stand in for the data
         // still to be allocated (each 8 sectors): never holes, which a
@@ -3863,6 +3887,7 @@ impl VfsInode for Ext4Inode {
             discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed create");
             return Err(map_ext4_err(e));
         }
+        meta.take_dir_geometry(parent_dir.inode());
         let child = inner.created_inode(child_disk, &self.shared);
         meta.times.modified(now_ts);
         meta.meta_dirty = true;
@@ -3910,11 +3935,12 @@ impl VfsInode for Ext4Inode {
             drop(sub_dir);
             let mut sub_inode = Inode::read(&inner.ext4, sub_ino)?;
             let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index())?;
-            Dir::open_inode(&inner.ext4, parent_disk)?.link(dname, &mut sub_inode)?;
-            Ok(sub_inode)
+            let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk)?;
+            parent_dir.link(dname, &mut sub_inode)?;
+            Ok((sub_inode, parent_dir.inode().clone()))
         });
-        let sub_inode = match linked {
-            Ok(sub_inode) => sub_inode,
+        let (sub_inode, parent_now) = match linked {
+            Ok(linked) => linked,
             Err(e) => {
                 inner.undo_failed_link(self.disk_inode_index(), dname, self.disk_inode_index(), parent_eff);
                 discard_orphan(&mut inner, self.disk_inode_index(), dname, sub_ino, "after a failed create");
@@ -3925,6 +3951,7 @@ impl VfsInode for Ext4Inode {
         // The new directory is linked: from here on mkdir succeeds. The inode
         // `link` wrote is the current one.
         let child = inner.created_inode(sub_inode, &self.shared);
+        meta.take_dir_geometry(&parent_now);
         meta.nlink = meta.nlink.saturating_add(1);
         meta.times.modified(now_ts);
         meta.meta_dirty = true;
@@ -4150,7 +4177,7 @@ impl VfsInode for Ext4Inode {
             return Err(VfsError::NoEnt);
         }
 
-        {
+        let parent_now = {
             let mut inner = self.shared.state.lock();
             let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
             let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
@@ -4166,7 +4193,8 @@ impl VfsInode for Ext4Inode {
                 return Err(map_ext4_err(e));
             }
             inner.clear_nlink_bounds(target_arc.disk_ino);
-        }
+            parent_dir.inode().clone()
+        };
 
         let now_ts = self.shared.now();
         let t_meta = find_guard_mut(&mut guards, &target_arc);
@@ -4174,6 +4202,7 @@ impl VfsInode for Ext4Inode {
         t_meta.times.set_ctime(now_ts);
         t_meta.meta_dirty = true;
         let p_meta = find_guard_mut(&mut guards, &self_arc);
+        p_meta.take_dir_geometry(&parent_now);
         p_meta.times.modified(now_ts);
         p_meta.meta_dirty = true;
         Ok(())
@@ -4231,6 +4260,7 @@ impl VfsInode for Ext4Inode {
                 }
             };
 
+        meta.take_dir_geometry(parent_dir.inode());
         let child = inner.created_inode(sym_disk, &self.shared);
         meta.times.modified(now_ts);
         meta.meta_dirty = true;
@@ -4386,6 +4416,7 @@ impl VfsInode for Ext4Inode {
                     new_dname,
                 )?
             };
+            self.take_parents_geometry(&mut guards, &old_dir_arc, &new_dir_arc);
             return outcome.apply(&mut guards, &old_child_arc, new_child_arc, &old_dir_arc, &new_dir_arc, now_ts);
         }
 
@@ -4432,6 +4463,7 @@ impl VfsInode for Ext4Inode {
                 Landed::No(_) => self.put_back_target(&mut guards, &new_dir_arc, new_dname, target),
             }
         }
+        self.take_parents_geometry(&mut guards, &old_dir_arc, &new_dir_arc);
         step2.stamp(&mut guards, &old_child_arc, &old_dir_arc, &new_dir_arc, now_ts)
     }
 
@@ -5223,6 +5255,14 @@ pub(crate) mod ktest_util {
     /// its file's contents.
     pub const UNSIGNED_HASH_NAMES: [(&[u8], &[u8]); 3] =
         [("é-utf8".as_bytes(), b"x"), (b"\xff\xfe-odd", b"y"), (b"\x80\x81\x82\x83\x84", b"z")];
+
+    /// Three 110-byte names whose unsigned hashes lead to leaf 1 of
+    /// [`UNSIGNED_HASH_IMAGE`]'s `/d` (block 93, 200 bytes free) and whose
+    /// signed hashes don't (e2fsprogs' `dx_hash -h 4` and `-h 1` with the
+    /// image's seed): created there, the second splits that leaf.
+    pub fn unsigned_hash_split_names() -> [Vec<u8>; 3] {
+        [8, 9, 14].map(|n| alloc::format!("{}-split-{n:03}", "é".repeat(50)).into_bytes())
+    }
 
     /// An `e2fsck`-clean ext4 image with 1 KiB blocks and no `extents`
     /// feature, so files are block-mapped and `ext4plus` writes at most one
@@ -6669,13 +6709,10 @@ crate::ktest!(
         kassert_eq!(d.lookup(b"\xff\xfe-odd").err(), Some(VfsError::Io));
         m.cache.clear();
 
-        // Three 110-byte names whose unsigned hashes lead to leaf 1 (block
-        // 93, 200 bytes free) and whose signed hashes don't (e2fsprogs'
-        // `dx_hash -h 4` and `-h 1` with the image's seed): the second
-        // splits it, rehashing its 35 entries (`é-utf8` among them).
-        let split_names: Vec<Vec<u8>> =
-            [8, 9, 14].iter().map(|n| alloc::format!("{}-split-{n:03}", "é".repeat(50)).into_bytes()).collect();
-        // `stat` reads a directory's size from its inode (#357).
+        // `unsigned_hash_split_names`: the second splits leaf 1, rehashing
+        // its 35 entries (`é-utf8` among them).
+        let split_names = unsigned_hash_split_names();
+        // `stat` gives the size the create that split a leaf left (#357).
         let size_before = d.stat().map_err(|_| "stat d")?.size;
         for (i, name) in split_names.iter().enumerate() {
             kassert_eq!(name.len(), 110);
@@ -6813,61 +6850,100 @@ crate::ktest!(
 
 crate::ktest!(
     fn ext4_a_directory_grown_by_ext4plus_stats_its_size_on_disk() {
-        // #357: `ext4plus` grows a directory by a block when an entry doesn't
-        // fit (a linear directory) or a leaf splits (an htree one); `stat`
-        // gives the size and blocks its inode on disk then has, as a fresh
-        // mount does.
+        // #357: `ext4plus` grows a directory by a block inside `Dir::link`
+        // (an entry that doesn't fit a linear directory, an htree leaf
+        // split). After a create, link, rename into it, mkdir or symlink that
+        // grew it, `stat` gives the size and blocks its inode on disk has, as
+        // a fresh mount does. A removed directory's `stat` keeps its own
+        // values, even once its inode number is another file's.
         use self::ktest_util::*;
-        use crate::{kassert, kassert_eq};
-        type Sizes = ((u64, u64), (u64, u64));
-        /// `dir`'s (size, 512-byte blocks): by `stat`, and from its inode on disk.
-        fn sizes(m: &Mnt, dir: &Arc<dyn VfsInode>) -> Result<Sizes, &'static str> {
+        use crate::kassert_eq;
+        /// `dir`'s (size, 512-byte blocks) by `stat`.
+        fn by_stat(dir: &Arc<dyn VfsInode>) -> Result<(u64, u64), &'static str> {
             let st = dir.stat().map_err(|_| "stat")?;
+            Ok((st.size, st.blocks))
+        }
+        /// `dir`'s (size, 512-byte blocks) from its inode on disk.
+        fn on_disk(m: &Mnt, dir: &Arc<dyn VfsInode>) -> Result<(u64, u64), &'static str> {
             let inner = m.fs.shared.state.lock();
             let disk = Inode::read(&inner.ext4, ext4_inode(dir)?.disk_inode_index()).map_err(|_| "read")?;
-            Ok(((st.size, st.blocks), (disk.size_in_bytes(), disk.blocks())))
+            Ok((disk.size_in_bytes(), disk.blocks()))
         }
-        // A linear directory (4 KiB blocks): 20 entries of 255-byte names (264
-        // bytes each) don't fit in one block. Hard links: the image has only
-        // 21 free inodes.
+        /// `stat` agrees with the disk and with a fresh mount, and the
+        /// directory grew by one block.
+        fn grew_by_a_block(
+            m: &Mnt,
+            dir: &Arc<dyn VfsInode>,
+            name: &[u8],
+            before: (u64, u64),
+            block: u64,
+            minor: u32,
+        ) -> Result<(), &'static str> {
+            let (stat, disk) = (by_stat(dir)?, on_disk(m, dir)?);
+            crate::ktest::diag(format_args!(
+                "{}: {before:?} -> stat {stat:?}, disk {disk:?}",
+                lumen_vfs::Escaped(name)
+            ));
+            kassert_eq!(disk.0, before.0 + block);
+            kassert_eq!(stat, disk);
+            let ro = remount_ro(m, minor)?;
+            kassert_eq!(by_stat(&ro.root_inode().lookup(name).map_err(|_| "ro lookup")?)?, disk);
+            Ok(())
+        }
+        // A 255-byte name: 264 bytes of entry, so 15 fill a 4 KiB block of a
+        // linear directory after `.` and `..` (24 bytes), and a 16th grows it.
+        let long = |c: u8| [&[c][..], &[b'x'; 254][..]].concat();
         let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 357)?;
+        // Hard links (the image has few free inodes): 16 grow `lin`.
         let lin = m.root.mkdir(b"lin", 0o755).map_err(|_| "mkdir lin")?;
-        let f = lin.create(b"f", 0o644).map_err(|_| "create f")?;
-        let (before, _) = sizes(&m, &lin)?;
-        let names: Vec<Vec<u8>> = (0..20u8).map(|i| [&[b'a' + i][..], &[b'x'; 254][..]].concat()).collect();
-        for name in &names {
-            lin.link(name, &f).map_err(|_| "link")?;
+        let f = m.root.create(b"f", 0o644).map_err(|_| "create f")?;
+        let before = by_stat(&lin)?;
+        for c in b'a'..b'a' + 16 {
+            lin.link(&long(c), &f).map_err(|_| "link")?;
         }
-        let (by_stat, on_disk) = sizes(&m, &lin)?;
-        crate::ktest::diag(format_args!("linear: {before:?} -> stat {by_stat:?}, disk {on_disk:?}"));
-        kassert!(on_disk.0 > before.0);
-        kassert_eq!(by_stat, on_disk);
-        let ro = remount_ro(&m, 358)?;
-        kassert_eq!(
-            ro.root_inode().lookup(b"lin").map_err(|_| "ro lookup lin")?.stat().map_err(|_| "ro stat")?.size,
-            on_disk.0
-        );
-        drop((f, lin, ro, m));
+        grew_by_a_block(&m, &lin, b"lin", before, 4096, 358)?;
+        // Renames into `ren`: 16 of `lin`'s links, moved.
+        let ren = m.root.mkdir(b"ren", 0o755).map_err(|_| "mkdir ren")?;
+        let before = by_stat(&ren)?;
+        for c in b'a'..b'a' + 16 {
+            lin.rename(&long(c), &ren, &long(c), RenameFlags(0)).map_err(|_| "rename")?;
+        }
+        grew_by_a_block(&m, &ren, b"ren", before, 4096, 359)?;
+        // 15 links, then a mkdir grows `mk`; then a symlink grows `sy`.
+        for (dir_name, last) in [(&b"mk"[..], 0u8), (b"sy", 1)] {
+            let dir = m.root.mkdir(dir_name, 0o755).map_err(|_| "mkdir")?;
+            for c in b'a'..b'a' + 15 {
+                dir.link(&long(c), &f).map_err(|_| "link")?;
+            }
+            let before = by_stat(&dir)?;
+            if last == 0 {
+                dir.mkdir(&long(b'z'), 0o755).map_err(|_| "mkdir the 16th")?;
+            } else {
+                dir.symlink(&long(b'z'), b"f").map_err(|_| "symlink the 16th")?;
+            }
+            grew_by_a_block(&m, &dir, dir_name, before, 4096, 360 + u32::from(last))?;
+        }
 
-        // An htree directory: three 110-byte names that split leaf 1 of
-        // UNSIGNED_HASH_IMAGE's `/d` (as in
-        // ext4_an_unsigned_hash_volume_mounts_writable_and_hashes_names_unsigned).
-        let m = mount(UNSIGNED_HASH_IMAGE.to_vec(), 359)?;
+        // A removed directory still held: `stat` keeps its own values, even
+        // once a new file takes its inode number.
+        let gone = m.root.mkdir(b"gone", 0o755).map_err(|_| "mkdir gone")?;
+        let held = by_stat(&gone)?;
+        m.root.rmdir(b"gone").map_err(|_| "rmdir gone")?;
+        let reuse = m.root.create(b"reuse", 0o644).map_err(|_| "create reuse")?;
+        kassert_eq!(ext4_inode(&reuse)?.disk_ino, ext4_inode(&gone)?.disk_ino);
+        kassert_eq!(by_stat(&gone)?, held);
+        kassert_eq!(gone.stat().map_err(|_| "stat gone")?.inode_type, InodeType::Dir);
+        drop((gone, reuse, f, lin, ren, m));
+
+        // An htree directory: `unsigned_hash_split_names` split leaf 1 of
+        // UNSIGNED_HASH_IMAGE's `/d`.
+        let m = mount(UNSIGNED_HASH_IMAGE.to_vec(), 362)?;
         let d = m.root.lookup(b"d").map_err(|_| "lookup d")?;
-        let (before, _) = sizes(&m, &d)?;
-        for n in [8, 9, 14] {
-            let name = alloc::format!("{}-split-{n:03}", "é".repeat(50));
-            d.create(name.as_bytes(), 0o644).map_err(|_| "create")?;
+        let before = by_stat(&d)?;
+        for name in unsigned_hash_split_names() {
+            d.create(&name, 0o644).map_err(|_| "create")?;
         }
-        let (by_stat, on_disk) = sizes(&m, &d)?;
-        crate::ktest::diag(format_args!("htree: {before:?} -> stat {by_stat:?}, disk {on_disk:?}"));
-        kassert_eq!(on_disk.0, before.0 + 1024);
-        kassert_eq!(by_stat, on_disk);
-        let ro = remount_ro(&m, 360)?;
-        kassert_eq!(
-            ro.root_inode().lookup(b"d").map_err(|_| "ro lookup d")?.stat().map_err(|_| "ro stat d")?.size,
-            on_disk.0
-        );
+        grew_by_a_block(&m, &d, b"d", before, 1024, 363)?;
         Ok(())
     }
 );

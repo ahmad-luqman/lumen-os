@@ -12,7 +12,7 @@
 //! for it in `kernel/src/vfs/testdata/unsigned-hash.ext4`, made by `e2fsck
 //! -fyD` on an unsigned-hash volume, with that image's seed (the first one
 //! here). ext4plus has no legacy hash (version 0): its hash refuses that
-//! version, signed or not, before #313 and after (checked here), and a
+//! version, signed or not (checked here, on the patched crate), and a
 //! lookup in such a directory fails, which Lumen answers with an unlogged
 //! `EIO` (not checked in the kernel).
 
