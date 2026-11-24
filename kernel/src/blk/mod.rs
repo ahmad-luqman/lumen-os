@@ -15,7 +15,7 @@ use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use crate::shell::{Ctx, sysinfo, write_in_chunks};
 
 #[allow(unused_imports, reason = "public block subsystem API for VFS (#253)")]
-pub use virtio_blk::{BlkEntry, MAX_BLK_DEVICES, VirtioBlkDevice, cache};
+pub use virtio_blk::{BlkEntry, MAX_BLK_DEVICES, VirtioBlkDevice};
 pub use virtio_blk::{DRIVER, device, devices};
 
 /// Usage string for the `blk` shell command (matching `Command::usage`).
@@ -55,7 +55,7 @@ pub fn table() -> pipe::Table {
     for entry in devices() {
         let info = entry.dev.info();
         let bytes = info.sector_count.saturating_mul(u64::from(info.sector_size));
-        let stats = entry.cache.lock().stats();
+        let stats = entry.stats();
         let mode = if entry.dev.is_failed() {
             "failed"
         } else if info.read_only {
@@ -268,8 +268,8 @@ crate::ktest!(
         verify_cache.read_at(off, &mut got).map_err(|_| "cache read_at")?;
         kassert_eq!(&got[..], &payload[..]);
 
-        // Test cache() registry lookup returns the bound device's cache.
-        kassert!(cache(0).is_some());
+        // The registry's entry for the bound device reports its cache.
+        kassert!(devices().iter().any(|e| e.id == 0 && e.stats().capacity > 0));
 
         kassert_eq!(crate::virtio::outstanding_runs(), before_runs);
         Ok(())

@@ -510,10 +510,10 @@ the console, `<command>: sync failed: <error> (the log says what failed);
 cache writes its dirty blocks back in block order and stops at the first
 that fails, before the device flush: the blocks ahead of it reached the
 device but were never flushed, and it and the ones after it are lost.
-Staying up would save them only if the failure passes (a failed block stays
-dirty for the next sync, section 9), and whoever suspects that runs the
-shell's `sync` command first, as often as they like; refusing would let a
-disk that keeps failing keep the machine from going down at all. What the
+Staying up saves nothing: on ext4 that failure makes the volume read-only
+(`errors=remount-ro`, section 9), so no later sync writes them; refusing
+would let a disk that keeps failing keep the machine from going down at
+all. What the
 ext4 rootfs holds unsynced is on the disk after either (tested:
 `test_fs::test_ext4_unsynced_writes_survive_reboot` and
 `test_fs::test_ext4_unsynced_writes_survive_shutdown`, each checking first
@@ -780,8 +780,12 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     `offset` is the page-aligned file byte offset at `Vma::start`; `shared`
     distinguishes `MAP_SHARED` (`true`) from `MAP_PRIVATE` CoW (`false`);
     `may_write` (`VM_MAYWRITE`) is `true` for `MAP_PRIVATE` and, for
-    `MAP_SHARED`, whether the descriptor is open `O_RDWR` (a read-only
-    mount can't have opened one: `EROFS`). `MappedFile::of`, the one way
+    `MAP_SHARED`, whether the descriptor is open `O_RDWR` on a mount that
+    is writable when `mmap` runs (a read-only mount can't have opened one:
+    `EROFS`; an `ext4` volume gone read-only since, section 9's
+    `errors=remount-ro`, can, so `mmap` asks the mount: a shared
+    `PROT_WRITE` mapping there is `EROFS`, and a read-only one gets no
+    `may_write`). `MappedFile::of`, the one way
     to make what `AddressSpace::mmap_file` maps, records it from the
     description (`Sharing` is `Private` or `Shared`, carrying no right of
     its own), and `mmap_file` keeps it only in the new VMA: the
@@ -789,7 +793,11 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     `VmaMap::protect`, requesting `PROT_WRITE` on a file VMA with
     `!fm.may_write` returns `VmError::Access` (mapped to `-EACCES` in
     `UserVmError::to_mprotect_errno`), preventing `mprotect` from upgrading an
-    `O_RDONLY` or read-only-mount `MAP_SHARED` mapping to writable.
+    `O_RDONLY` or read-only-mount `MAP_SHARED` mapping to writable. A
+    shared mapping that got `may_write` before its `ext4` volume went
+    read-only keeps it, so `AddressSpace::mprotect` also asks the page
+    cache (`page_cache::mapped_read_only`) and refuses `PROT_WRITE` there
+    the same way, and its store faults are bus errors (section 9).
   - **Sub-VMA splitting and coalescing invariants for file VMAs (M7):**
     - Splitting `[start, end)` at page-aligned `mid` preserves `offset`,
       `shared`, and `may_write` on the left piece `[start, mid)` and sets the
@@ -5198,6 +5206,35 @@ blocks, extent trees, and file data writeback):
     so while its writeback keeps failing, every miss that needs an eviction
     fails, reads included, even with a clean block that could make room
     (`a_failing_dirty_lru_victim_fails_every_miss_even_with_a_clean_slot`).
+- **Stopping writeback (#349):** `BlockCache::stop_writeback` makes the
+  cache write nothing more to its device and flush nothing, while it still
+  takes writes: `sync` and `flush_blocks` return `BlockError::ReadOnly`
+  without writing a block or flushing, and eviction takes only clean
+  unpinned slots, so a dirty block stays cached, still served to reads,
+  until reboot; a `read_at` miss while every unpinned slot is dirty is read
+  straight from the device into the caller's buffer, uncached (the block
+  isn't cached, so the device holds it), while a `write_at` or pin miss
+  returns `CacheFull`. Under `stop_writeback_on_failure`, a miss whose
+  eviction met the failure looks again the same way, so a read that met
+  it is served (the failure kept in `first_failure`).
+  `stop_writeback_on_failure` (off by default, when the failed block stays
+  dirty for the next writeback, above) makes the first failed device write
+  or flush stop writeback inside the call that met it, so nothing else
+  reaches the device after it. `freeze` also refuses writes into the cache
+  (`write_at` and `pin_mut` return `ReadOnly`). `thaw` (and
+  `stop_writeback` by hand) exist only with the `test-util` feature, which
+  the kernel's ktest build turns on: for the ktests that read back what
+  such a cache holds; the kernel can't thaw. The state is one `Writeback`
+  (`Running`, `Stopped`, `Frozen`), so frozen implies stopped.
+  `first_failure` keeps the first failed device write's or flush's error.
+  `writeback_failures` counts the device's failed block writebacks (an
+  eviction's or a sync's) and flushes (what was written may not be
+  durable), and `first_failure` is set at the first of them: the one
+  signal that a device write failed, since a call's error alone can't
+  say. `ext4`'s `errors=remount-ro` (below) turns
+  `stop_writeback_on_failure` on at mount, watches `first_failure`, and
+  freezes the cache when the last write-type operation running at the
+  failure ends (`LatchableCache`'s methods).
 - **Host tests (`cargo:lumen-bcache`):** verified against an in-memory
   `MemBlockDevice` with LRU eviction order, dirty writeback, RAII pin refusal
   (`CacheFull`), read-only rejection, partial tail block clamps, crash-before-
@@ -5235,7 +5272,9 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   `AddressSpace::pinned_pages`; dynamic memory-pressure reclaim arrives in M10).
   Clean `ext4` pages are evictable **only** when `Arc::strong_count(&page) == 1`
   (not pinned in any `AddressSpace` PTE or in-flight I/O); dirty `ext4` pages
-  exceeding the target are written back before eviction. Global reclaim runs on
+  exceeding the target are written back before eviction (never on a volume
+  errored by `errors=remount-ro`, below: its dirty pages stay, unwritten,
+  until reboot). Global reclaim runs on
   the calling thread **outside BOTH Lock 4 (`VfsInode`) and Lock 5 (`PageCache`)**
   (pre-reclaiming before acquiring Lock 4, or releasing Lock 5 and Lock 4,
   reclaiming victim inode B in strict global order `Lock 4(B) → Lock 5(B) →
@@ -5679,10 +5718,15 @@ fixable there now, each in a PR of its own.
     error; once the entry change itself has landed (the name is gone on
     disk), they finish the operation instead and return the later error.
     When an undo write of a `links_count` fails, the adapter keeps in-memory
-    bounds so `stat` and later operations see the true link count, and the
-    next namespace operation on that inode writes the corrected count
-    (writeback never writes `links_count`); the bounds are not persisted, so
-    an undo that never lands leaves work for `e2fsck` after a reboot. The
+    bounds so `stat` and later operations see the true link count (the
+    volume is read-only by then, `errors=remount-ro` below, so nothing
+    writes the corrected count; writeback never writes `links_count`).
+    Bounds left on a volume still writable (an undo that couldn't read an
+    inode back, a read fault erroring nothing) are written before the next
+    operation changes that count (`store_bounded_links`,
+    `ext4_a_kept_link_count_is_written_before_the_next_unlink`). The
+    bounds are not persisted, so an undo that never lands leaves work for
+    `e2fsck` after a reboot. The
     bounds are `lumen_vfs::nlink::NlinkBounds` (host-tested): one map per
     filesystem, a floor and maybe a ceiling per inode, the floor never above
     the ceiling, and `reconcile` pins a count unless the disk already holds
@@ -5762,9 +5806,9 @@ fixable there now, each in a PR of its own.
     - Every write goes into the block cache, which writes back (above): an
       operation whose blocks are only cached returns `Ok`, and the device's
       error comes from the next `FileSystem::sync` or a file's `fsync`,
-      `fdatasync` or `msync(MS_SYNC)` (`EIO`, the blocks kept dirty for the
-      next sync; `ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next`
-      checks `fsync`, `fdatasync` and `FileSystem::sync`), or from the
+      `fdatasync` or `msync(MS_SYNC)` (`EIO`, the blocks kept dirty in the
+      cache, never written: since #349 that error makes the volume read-only,
+      below: `ext4_a_failed_device_write_makes_the_volume_read_only`), or from the
       eviction that writes a block back, to whichever read or write missed
       then (a lookup or a page read can get another block's write error,
       unless `ext4plus` drops it, below). A sync stops at the first block
@@ -5778,8 +5822,9 @@ fixable there now, each in a PR of its own.
       above).
     - `ext4plus` 0.1.0-rc.2 frees an extent-mapped file's block range again
       block by block when the range free fails (`file_blocks/utils.rs`,
-      `free_freed_ranges`), so a write that fails inside it leaves the
-      operation `Ok` (unlink and rmdir probed in the kernel, truncate on the
+      `free_freed_ranges`), so a write that fails inside it leaves
+      `ext4plus`'s call `Ok` (the operation returns `EIO` since #349, below:
+      `WriteOp::end`; unlink and rmdir probed in the kernel, truncate on the
       host in #351's review; a rename's replaced target reaches the same
       code, read from the source). A block-mapped file's free
       (`block_map.rs`) has no retry and returns the error. `free_blocks` and
@@ -5788,7 +5833,7 @@ fixable there now, each in a PR of its own.
       write carrying the raised group count doubles the group's count, and
       a failed superblock write doubles the superblock's as well; a failed
       bitmap byte or bitmap-checksum write doubles nothing
-      (`ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`,
+      (`ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio`,
       by the `FaultCache`). `e2fsck` recomputes the counts (read, not
       tested).
     - `ext4plus`'s `Extent::allocate` (`extent.rs`) retries any failed
@@ -5805,11 +5850,14 @@ fixable there now, each in a PR of its own.
       for good, every later write storing them so; if the count's write
       failed, the superblock's stays one above for good (the group's is put
       right by its next write); a failed superblock write is put right by
-      the next one
+      the next one. Since #349 those later writes land only in a block cache
+      that never writes back (the volume read-only), so on the device the
+      state the failure left stays
       (`ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc`). On
       a 1 KiB-block extent volume, where a page needs 4 blocks, a host probe
       in #351's review (not a test; 2 KiB reaches the same code, not probed)
-      saw the shorter retry succeed: the write returns `Ok`, with up to 4
+      saw the shorter retry succeed: `ext4plus`'s write returns `Ok` (the
+      writeback then `EIO`, the volume errored, #349), with up to 4
       bits leaked (a failed bitmap write after the first leaves the earlier
       bits and both counts above the bitmap for good), and a count lowered
       twice when its own write failed.
@@ -5824,7 +5872,8 @@ fixable there now, each in a PR of its own.
       error is enough, and its checksum write failing leaves the permanent
       over-count. The likeliest route, though, is the bitmap's own read
       missing and its eviction of another dirty block failing: the free's
-      retry turns that into `Ok`, the allocation's into `NoSpc` (nothing
+      retry turns that into `ext4plus`'s `Ok` (the operation's `EIO` since
+      #349), the allocation's into `NoSpc` (nothing
       doubled or leaked; the victim stays dirty).
     - `ext4plus`'s allocators (`alloc_block`, `alloc_contiguous_blocks`,
       `alloc_inode`) loop forever on a group whose count promises more than
@@ -5841,8 +5890,9 @@ fixable there now, each in a PR of its own.
       `add_dir_entry` (`dir.rs`) takes a failed lookup (an eviction's write
       error) as "absent", so `Dir::link` can return `Ok`; and a rename's
       `take_out_target_entry`, when the target's `Dir::unlink` fails after
-      its entry went, carries on as if it had worked, unlogged, and the
-      rename can return `Ok`.
+      its entry went, carries on as if it had worked, unlogged. Since #349
+      the failed write errors the volume, so the link or rename returns
+      `EIO` all the same (`WriteOp::end`).
     - After a first error, the adapter's undo writes (above) report nothing
       further: a failed one is pinned in memory or logged, and the operation
       returns the first error. Among them: `undo_failed_link`,
@@ -5850,18 +5900,150 @@ fixable there now, each in a PR of its own.
       the inline-symlink restore, `discard_orphan`, `put_back_target`,
       `rollback_link_entry` and truncate's tail restore.
     - A rename over an existing target, once the move landed, returns `Ok`
-      whatever retiring the target does: its lowered `links_count` (pinned in
-      memory if the write fails), freeing it when that was its last link
-      (logged), and a directory target's parent's count (pinned).
+      whatever retiring the target does when the volume stays healthy: its
+      lowered `links_count` (pinned in memory if the write fails), freeing
+      it when that was its last link (logged), and a directory target's
+      parent's count (pinned); a failed device write among them makes it
+      `EIO` since #349 (`WriteOp::end`).
 
-    So a write error can't be told from operations' results (an `Ok` or a
+    So a write error can't be told from `ext4plus`'s results (an `Ok` or a
     `NoSpc` may follow one), nor from the block cache's: a failed `write_at`
     may be a failed pre-read or another block's eviction, a failed `sync` a
     failed flush or a pinned block, and an eviction's write error reaches a
-    read as an ordinary `Io`. What #349 needs is one latched write-back
-    failure signal inside `BlockCache`, set where a device write or flush
-    fails (`ensure_slot`'s dirty victim, `writeback_and_flush`), which
-    every route goes through.
+    read as an ordinary `Io`. #349 reads one signal inside `BlockCache`
+    instead, `first_failure`, set where a block's device write or a flush
+    first fails (`ensure_slot`'s dirty victim, `writeback_and_flush`), which
+    every route goes through. A failed flush counts: the writes before it
+    may not be durable (jbd2 aborts its journal on one too).
+  - **`errors=remount-ro` (#349):** Lumen's one policy for a write error,
+    as Linux's for a root mounted `errors=remount-ro` (whose journal also
+    aborts on a write error). `ext4plus` has no journal and writes each
+    step of an operation as it goes, so a failure can leave any of a
+    dozen partial states; rather than write on from one of them, the
+    volume stops writing.
+    - *Trigger:* the first device write or flush of the volume's that
+      fails, told by one signal, the block cache's first failure
+      (`LatchableCache::first_failure`, over `BlockCache::first_failure`,
+      above), which `LatchedCache` (the seam the mount wraps the volume's
+      cache in, which every call goes through; the volume holds it as an
+      `Arc<LatchedCache>`, and the cache's controls, `freeze` and
+      `stop_writeback_on_failure`, are on `LatchableCache`, a supertrait only
+      the caches below the latch implement) checks after each call while
+      healthy: a block written back by a `sync` (`fsync`, the filesystem's
+      sync) or by the eviction of whichever `write_at` (`ext4plus`'s, for
+      directory blocks, inodes, bitmaps, group descriptors, the superblock,
+      a file's data and map at writeback; the adapter's raw ones, `..` and
+      inline-symlink bytes) or `read_at` missed. A call's result alone
+      decides nothing: a `write_at` can fail on a pre-read or a full cache
+      with no write failing (it then errors the operation, not the volume),
+      and `ext4plus` can return `ENOSPC` (its allocation retry, which the
+      operation returns as its own error) or `Ok` (its range-free retry,
+      above; the operation then returns `EIO`, `WriteOp::end`) after one
+      did. A data block's
+      failed write counts too: the cache can't tell data from metadata, and
+      a file's writeback allocates blocks and writes its map in the same
+      call. Read errors, `NoSpc` and `NoMem` that no failed write caused,
+      and refusals made before anything is written (`EFBIG`, the page
+      cache's hard cap), don't trigger it. In the ktests the `FaultCache`
+      reports each write or sync it fails as the device's failure.
+    - *Nothing more reaches the device, from the failure on:* the block
+      cache stops writing back inside the call that met it
+      (`stop_writeback_on_failure`, above): no later eviction, sync or
+      flush writes, during the rest of that operation or after it. Syncs
+      and writebacks also stop there (`FileSystem::sync` across inodes,
+      `fsync`'s and reclaim's page loops): the pages left stay dirty in
+      memory, never written into the cache either, whose slots reads need.
+    - *Read-only from the failed write on* until reboot (nothing clears
+      it): `FileSystem::read_only()` and `errored()` say so at once, so a
+      write-type operation starting after the failure is refused (`fsync`
+      too: `EIO`; `writable_op` checks again once the operation is counted,
+      so one starting as the failure comes is either refused or counted).
+      Those running at the failure finish against the cache and memory:
+      their later writes and the failing one's undo (above) go into the
+      block cache, never to the device. Each holds a `WriteOp`; an operation
+      that began on a healthy volume and ends on an errored one returns
+      `EIO` whatever it returned itself (`WriteOp::end`; its own error, if
+      any, stands): what it did went into a cache that never writes back,
+      so it didn't happen on the disk, though until reboot it may show in
+      memory (so lumen-vfs drops the names an unlink, rmdir or rename
+      touched from the dentry cache on a failure too, and `truncate`
+      unmaps the caller's pages past the size the file has then on a
+      failure too, never below it; an
+      `open(O_TRUNC)` that fails so doesn't). A read whose eviction met the failure is served (below), so
+      the operation may not see the failure itself (a `link` would return
+      `Ok`). When the last one ends, the latch settles (below). The VFS
+      refuses every write-type path with
+      `EROFS` (create, `mkdir`, `symlink`, `link`, `unlink`, `rmdir`,
+      `rename`, an open for writing or truncating,
+      `chmod`/`chown`/`utimensat`), and the adapter's own checks refuse a
+      `write`, `truncate` and attribute change through a descriptor opened
+      before (a detached inode's, all in memory, still work, as on a
+      read-only mount). A `write` checks again after its own reclaim
+      (`EROFS`, nothing written) and after each partial page's read, either
+      of which can meet the failure: nothing of the write lands in that
+      page, so the first page's refuses the write (`EROFS`), and the last
+      page's makes it short, the pages before it taken while the volume was
+      healthy, as any write's bytes are until a sync. A new
+      shared writable mapping is `EROFS` (section 5's `may_write`); on one
+      made before the error, a store fault (a page not yet mapped, or one
+      mapped read-only by a read) is a bus error (`SIGBUS`, as Linux's
+      `page_mkwrite` on a shut-down `ext4`), and `mprotect` can't add write
+      access (`EACCES`); a PTE made writable before the error stays so, its
+      stores reaching the page cache, never the disk.
+    - *Reads keep working,* from the block and page caches (which hold the
+      failed operation's in-memory undo): the stopped cache evicts only
+      clean blocks, and a miss with no clean slot is read straight from the
+      device, uncached (`BlockCache::read_at`). A miss whose eviction met
+      the failure looks again inside the block cache (`ensure_slot`), so
+      the read that met it is served too.
+    - *Then nothing more is written to the cache either:* when the last
+      write-type operation running at the failure ends, or at once when a
+      read meets it with none running, the latch settles: it freezes the
+      block cache (`BlockCache::freeze`, above), and the seam refuses every
+      write past it (`ReadOnly`, so `EROFS`). Dirty pages and metadata are
+      never written back: reclaim evicts clean pages only, and `fsync`,
+      `fdatasync`, `msync` and `FileSystem::sync` write nothing and return
+      `EIO` (what they would write will never land; `sync(2)` still returns
+      0), without a warning per inode.
+    - *One line,* when the freeze comes:
+      `ERROR vfs: ext4 <dev>: <op> failed writing to the device (<cause>);
+      the volume is read-only until reboot (errors=remount-ro); run e2fsck
+      -f`, `<op>` the operation whose write failed (`unlink`, `rename`,
+      `writeback`, `fsync`, ...: the innermost write-type operation, begun
+      before the failure, of the thread whose call first saw it, which with
+      two operations running at the failure may be the other one's), or
+      `a read's eviction`, and `<cause>` the block cache's first failure. `mount` shows its mode as
+      `ro,errors`, `/proc/mounts` as `ro,errors=remount-ro`.
+    - *Not marked on disk:* the superblock's `s_state` error bit and
+      `s_error_count` aren't set. `ext4plus` 0.1.0-rc.2 neither reads nor
+      writes them, and the only way to the disk is the block cache, whose
+      block holding the superblock also holds the free counts the failed
+      operation changed in memory: writing it would land part of that
+      operation, on a device that has just failed a write. So nothing on
+      disk says the volume errored, and no mount refuses it for that. Nor
+      does Lumen clear `EXT2_VALID_FS` in `s_state` at a writable mount and
+      set it again at a clean unmount, as Linux does: it never unmounts
+      cleanly, so a mount that refused a volume without the bit would mount
+      every boot read-only. `e2fsck -p` therefore skips the volume: run
+      `e2fsck -f`.
+    - Tested by `ktest:lumen_kernel::vfs::ext4::ext4_a_write_error_makes_the_volume_read_only`
+      (a fault in `unlink`, `rename` and `rmdir`, then every write-type
+      operation `EROFS`, reads working, the device's bytes unchanged
+      through writes, syncs and evicting reads, the line, `ro,errors`),
+      `ext4_a_failed_device_write_makes_the_volume_read_only` (the real block
+      cache over a failing device: an `fsync`'s sync, and a read's
+      eviction, which is then served),
+      `ext4_nothing_reaches_the_device_after_the_first_failed_write` (one
+      device write failing part-way through a sync: the device's write
+      count and bytes never change again, through the rest of that sync
+      and after it, and a file cached nowhere reads back though every slot
+      is dirty), `ext4_the_latch_settles_when_the_last_write_type_operation_ends`,
+      `ext4_a_write_whose_reclaim_meets_a_failed_write_is_refused`,
+      `ext4_a_write_refused_by_the_cache_alone_leaves_the_volume_writable`,
+      `file_vm_a_volume_gone_read_only_takes_no_store_through_an_older_mapping`
+      and the fault sweeps, which check the
+      failed operation's own outcome and then that the volume went
+      read-only.
   - **Rename over an existing target:** the target is held, not removed,
     until the source has landed at its name. Its entry is taken out with
     its `links_count` unchanged (`Dir::unlink` is handed one more than the
@@ -5915,7 +6097,11 @@ Architecture adapted conceptually from Starry / `axfs_vfs` (any directly
 adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
 
 - **Core abstractions:**
-  - `FileSystem`: `dev_id()`, `root_inode()`, `sync()`, `read_only()`.
+  - `FileSystem`: `dev_id()`, `root_inode()`, `sync()`, `read_only()`
+    (asked at every check, never cached: an `ext4` volume becomes read-only
+    when it errors, section 9's `errors=remount-ro`), and `errored()`
+    (#349; `false` by default): read-only because of an error, which
+    `MountInfo::errored` carries to `mount` and `/proc/mounts`.
   - `VfsInode` (cached by `(DevId, Ino)` as `Arc<VfsInode>`, except a
     non-`cacheable()` one (below), so hard links and multiple open FDs share
     one inode, one `PageCache`, one `AdvisoryLocks`
@@ -6487,6 +6673,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `blk`: lists bound block devices (PCI addr, capacity, read-only, flush
     support, `BlockCache` hit/miss/dirty stats).
   - `mount`: lists active mounts as records (target, fs, dev, mode `ro`/`rw`,
+    or `ro,errors` for an `ext4` volume errored read-only (#349), which
+    `/proc/mounts` shows as `ro,errors=remount-ro`,
     and `used` and `limit`: a `tmpfs` mount's quota in bytes, `-` for any
     other filesystem; #324): with them an `ENOSPC` on `/tmp` can be
     checked against what its files take, a charge far past that pointing
@@ -6496,9 +6684,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `/proc/mounts` keeps
     Linux's columns.
   - `sync`: flushes every mounted filesystem (each flushing its own live
-    inodes, then its block cache), continuing past a failing inode or
-    filesystem and reporting the first error (each failure logged once at
-    `warn`, naming the inode or the block cache).
+    inodes, then its block cache), continuing past a failing filesystem
+    and reporting the first error (each failure logged once at `warn`,
+    naming the inode or the block cache). Within an `ext4` volume it stops
+    at the first failed device write, which makes the volume read-only
+    (#349); an inode failing otherwise (`ENOSPC`) doesn't stop it.
   - `vfstest <op> ...`: test-facing file operations over the VFS (`stat`,
     `cat`/`read`, `ls`, `write`, `write-pattern`/`verify-pattern`,
     `truncate`, `chmod`, `mkdir`, `rmdir`, `unlink`, `rename`, `symlink`,

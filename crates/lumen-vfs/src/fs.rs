@@ -31,8 +31,18 @@ pub trait FileSystem: Send + Sync {
     /// report of a failed global sync.
     fn sync(&self) -> Result<(), VfsError>;
 
-    /// True if the filesystem is mounted read-only.
+    /// True if the filesystem is read-only: mounted so, or (`ext4`'s
+    /// `errors=remount-ro`) gone read-only since. Asked at every check,
+    /// never cached.
     fn read_only(&self) -> bool;
+
+    /// True if the filesystem went read-only because of an error (`ext4`'s
+    /// `errors=remount-ro` after a failed write): `mount` and
+    /// `/proc/mounts` note it beside `ro`. Never true unless
+    /// [`Self::read_only`] is.
+    fn errored(&self) -> bool {
+        false
+    }
 
     /// Execute `f` while holding this filesystem's Lock 3 (`rename_lock`).
     ///

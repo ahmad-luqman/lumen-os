@@ -215,7 +215,8 @@ _DEV = r"DevId\(\d+\)"
 VFS_SWEEP_LINES = (
     (
         rf"ERROR vfs: ext4 {_DEV} inode \d+: links_count on disk is (\d+|unreadable), keeping (at least )?\d+ "
-        r"in memory until a write lands; run e2fsck if the volume is unmounted first"
+        r"in memory (until a write lands; run e2fsck if the volume is unmounted first|until reboot \(the volume is "
+        r"read-only\); run e2fsck)"
     ),
     (
         rf"ERROR vfs: ext4 {_DEV}: undoing a failed (rename|exchange) between directories \d+ and \d+ left its "
@@ -255,21 +256,29 @@ VFS_SWEEP_LINES = (
     ),
     # An unlink or rmdir whose directory couldn't be read back after
     # `delete_file` had begun freeing the inode's blocks, not yet zeroing it:
-    # forgotten, not kept live (#330; the unlink and rmdir fault sweeps).
-    (
-        rf"ERROR vfs: ext4 {_DEV} directory \d+: inode \d+ lost its entry and its blocks were being freed "
-        r"\(block \d+ is free\) when the (unlink|rmdir) failed, the directory unreadable; forgetting it; run e2fsck"
+    # forgotten, not kept live (#330; the unlink and rmdir fault sweeps), one
+    # family per op, so each must name its own.
+    *(
+        (
+            rf"ERROR vfs: ext4 {_DEV} directory \d+: inode \d+ lost its entry and its blocks were being freed "
+            rf"\(block \d+ is free\) when the {op} failed, the directory unreadable; forgetting it; run e2fsck"
+        )
+        for op in ("unlink", "rmdir")
     ),
     # One whose directory couldn't be read back and whose entry's and
     # blocks' state couldn't be told from its inode either (the inode, its
     # map or its bitmap byte unreadable, or a linked one reading corrupt):
     # kept live, saying so and why (the unlink and rmdir sweeps' legs with
     # the block bitmap unreadable, the corrupt-inode ktest, and the unlinks
-    # with every read failing).
-    (
-        rf"ERROR vfs: ext4 {_DEV} directory \d+: (unlink|rmdir) of inode \d+ failed, the directory unreadable, "
-        r"and whether its entry went and its blocks were freed can't be told \(.+\); keeping it live, so writes "
-        r"through it may reach another file if they were; run e2fsck"
+    # with every read failing), one family per op.
+    *(
+        (
+            rf"ERROR vfs: ext4 {_DEV} directory \d+: {op} of inode \d+ failed, the directory unreadable, "
+            r"and whether its entry went and its blocks were freed can't be told \(.+\); keeping it live, "
+            r"(so writes through it may reach another file if they were|the volume read-only, so nothing reaches "
+            r"another file); run e2fsck"
+        )
+        for op in ("unlink", "rmdir")
     ),
     # A rename's target put back after a failed move, the put-back failing
     # too (ext4_failed_rename_over_whose_put_back_fails_leaves_the_target_allocated).
@@ -278,6 +287,28 @@ VFS_SWEEP_LINES = (
         r"failed: \w+; its data is intact; run e2fsck"
     ),
 )
+# The volume's `errors=remount-ro` line (#349): once per ext4 volume a
+# failed write makes read-only, so once per leg of every write-fault sweep
+# (held back, inside their guards; so is any ktest erroring more than one
+# volume) and once in each other ktest that fails a write, printed outside
+# any guard: counted as present, those outside guards exactly
+# (`VFS_ERRORED_UNGUARDED`). One call site, so a guard prints it at most once.
+VFS_ERRORED_LINES = (
+    (
+        rf"ERROR vfs: ext4 {_DEV}: (unlink|rmdir|rename|link|create|mkdir|symlink|truncate|chmod|chown|"
+        r"utimensat|writeback|fsync|sync|a read's eviction) failed writing to the device \([^()]+\); the volume is read-only "
+        r"until reboot \(errors=remount-ro\); run e2fsck -f"
+    ),
+)
+VFS_HOLDABLE_LINES = (*VFS_SWEEP_LINES, *VFS_ERRORED_LINES)
+# The ktests erroring one volume outside a guard, one line each: the
+# writeback ktests (a sync stopping at a failing inode, a failing page's
+# ENOSPC, reclaim's write error, a write whose reclaim fails), vfs::tests'
+# sync stopping at a failed write and flush/reclaim write error, io's sync
+# of every filesystem, mem's msync, meta's failed chown, an older mapping's
+# volume going read-only, the latch settling at the last operation's end,
+# and the device write failing part-way through a sync (#349).
+VFS_ERRORED_UNGUARDED = 12
 VFS_EXACT_LINES = {
     # page_quota_release_saturates_and_detached_quota_reports_nospc
     r"ERROR vfs: quota ktest \(16384 bytes\): released 20480 bytes with only 8192 reserved": 1,
@@ -289,13 +320,17 @@ VFS_EXACT_LINES = {
     r"ERROR vfs: ext4 inode \d+: restoring the inline symlink target failed; run e2fsck": 1,
     # ext4_truncate_and_open_unlink_preserve_state_on_io_error
     rf"ERROR vfs: ext4 {_DEV} inode \d+: truncate failed and its tail bytes couldn't be restored on disk": 1,
-    # The writeback-error ktests (reclaim, sync, full disk, failing device,
-    # a failing page among good ones; linux::syscall::io's
-    # io_fsync_writes_an_ext4_file_back_and_reports_eio: one failed page;
-    # linux::syscall::mem::tests' mem_msync_returns_a_writeback_error_before_enomem:
-    # one failed page).
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 4,
-    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 4,
+    # The writeback-error ktests, one each. `NoSpc`: the full disk, and a
+    # block allocation's failed write coming back as ENOSPC (#331), so (#349)
+    # the sync stopping at a failing inode, a failing page's writeback,
+    # reclaim's write error and a write whose reclaim fails. `Io`: the
+    # flush/reclaim ktest's two, linux::syscall::io's
+    # io_fsync_writes_an_ext4_file_back_and_reports_eio, mem's
+    # mem_msync_returns_a_writeback_error_before_enomem, mm's older-mapping
+    # ktest, and ext4_nothing_reaches_the_device_after_the_first_failed_write
+    # (the one page whose write met the failure; the sync stops there).
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: NoSpc": 5,
+    rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of page \d+ \(offset \d+\) failed: Io": 6,
     rf"WARN  vfs: ext4 {_DEV} inode \d+: writeback of its metadata failed: Io": 1,
     # ext4_mmap_page_reports_a_failed_disk_read: two streaks (two failed
     # fills, a good one, a third failed fill), one warning each;
@@ -310,14 +345,19 @@ VFS_EXACT_LINES = {
     # mm::user_vm::file_vm_disk_read_error_is_a_bus_error: a fault's fill.
     rf"WARN  vfs: ext4 {_DEV} inode \d+: reading page 2 \(offset 8192\) failed: Io": 1,
     rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: NoSpc": 1,
-    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 1,
+    # (vfs_sync_stops_at_a_failed_write_and_reports_it's, and
+    # ext4_nothing_reaches_the_device_after_the_first_failed_write's: one
+    # each, the sync stopping at the inode whose write failed, #349)
+    rf"WARN  vfs: sync: ext4 {_DEV} inode \d+: Io": 2,
     # linux::syscall::io: io_fsync_writes_an_ext4_file_back_and_reports_eio's
     # `fsync` with the block cache's sync failing, and
     # io_sync_flushes_every_mounted_filesystem's `sync` with one volume's;
-    # and ext4_a_failed_device_write_reaches_sync_and_is_written_by_the_next
-    # (#331): one of each, the device's writes failing under the block cache.
+    # and ext4_a_failed_device_write_makes_the_volume_read_only (#331, #349):
+    # its fsync's, the device's writes failing under the block cache (the
+    # volume read-only after it, its own sync then writes nothing and warns
+    # nothing).
     rf"WARN  vfs: fsync: ext4 {_DEV} inode \d+: block cache: block device I/O error": 2,
-    rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 2,
+    rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 1,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
     # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page;
     # page_cache_insert_refuses_a_dirty_ext4_page_at_the_hard_limit,
@@ -377,7 +417,7 @@ VFS_HELD_KTESTS = sum(
 def vfs_family(line):
     """The one family of VFS_EXACT_LINES or VFS_SWEEP_LINES that vfs line
     `line` (from its level on) fits, or None; a line fitting two fails."""
-    fits = [want for want in (*VFS_EXACT_LINES, *VFS_SWEEP_LINES) if re.fullmatch(want, line)]
+    fits = [want for want in (*VFS_EXACT_LINES, *VFS_HOLDABLE_LINES) if re.fullmatch(want, line)]
     assert len(fits) <= 1, (line, fits)
     return fits[0] if fits else None
 
@@ -396,7 +436,8 @@ def check_vfs_log_lines(out):
     Every printed sweep line and every vfs summary falls inside a vfs guard,
     and the guards on serial are the kernel source's: a sweep without a guard
     fails here, not at the time bound."""
-    tally = dict.fromkeys((*VFS_EXACT_LINES, *VFS_SWEEP_LINES), 0)
+    tally = dict.fromkeys((*VFS_EXACT_LINES, *VFS_HOLDABLE_LINES), 0)
+    unguarded = 0
     problems = []
     guards = 0
     held_any = False
@@ -429,13 +470,16 @@ def check_vfs_log_lines(out):
             problems.append(("a vfs line fitting no family", line))
             continue
         tally[family] += weight
-        if not summary and family not in VFS_SWEEP_LINES:
+        if not summary and family not in VFS_HOLDABLE_LINES:
+            continue
+        if not summary and family in VFS_ERRORED_LINES and guard is None:
+            unguarded += 1  # a single fault's volume, outside any sweep
             continue
         if guard is None:
             problems.append(("a sweep line or summary outside a vfs guard", line))
         elif not summary:
             guard["printed"][family] += 1
-        elif family not in VFS_SWEEP_LINES:
+        elif family not in VFS_HOLDABLE_LINES:
             problems.append(("an exact family held back", line))
         elif family not in guard["printed"]:
             problems.append(("a summary of a family its guard didn't print", line))
@@ -446,9 +490,10 @@ def check_vfs_log_lines(out):
     assert not problems, problems
     counts = {want: tally[want] for want in VFS_EXACT_LINES}
     assert counts == VFS_EXACT_LINES, counts
-    sweeps = {want: tally[want] for want in VFS_SWEEP_LINES}
+    sweeps = {want: tally[want] for want in VFS_HOLDABLE_LINES}
     assert all(sweeps.values()), sweeps
     assert guards == VFS_HELD_KTESTS, (guards, VFS_HELD_KTESTS)
+    assert unguarded == VFS_ERRORED_UNGUARDED, (unguarded, VFS_ERRORED_UNGUARDED)
     assert held_any, "no vfs lines held back: the guards hold nothing"
 
 
