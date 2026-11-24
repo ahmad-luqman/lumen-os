@@ -4,7 +4,7 @@
 #
 #   tools/syscall-census.sh
 #
-# Needs bash, git and Docker or Podman on an x86-64 Linux kernel: a Linux
+# Needs bash and Docker or Podman on an x86-64 Linux kernel: a Linux
 # machine, or WSL2 with Docker Desktop's integration or Podman (clone the repo
 # inside the WSL filesystem, not under /mnt/c). The engine is docker if it
 # runs, else podman; CONTAINER_ENGINE=podman (or docker) picks one. Not an Apple Silicon Mac: an amd64 container

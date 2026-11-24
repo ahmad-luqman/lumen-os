@@ -18,15 +18,20 @@ cd "$W"
 apk add --no-cache -q strace gcc g++ make musl-dev git sqlite vim python3 >/dev/null
 cat /etc/alpine-release >"$OUT/alpine-release"
 uname -r >"$OUT/kernel"
-apk info -v 2>/dev/null | sort >"$OUT/packages"
+# Not piped into sort: set -e would miss apk failing.
+packages=$(apk info -v)
+printf '%s\n' "$packages" | sort >"$OUT/packages"
 
-# One workload: its name, then the command, traced with every child followed.
-# -X raw prints flags and constants as numbers; -s 0 drops string contents.
+# The tracer: every child followed; -X raw prints flags and constants as
+# numbers; -s 0 drops string contents. Split into words where it's used.
+STRACE="strace -f -qq -X raw -s 0 -e signal=none"
+
+# One workload: its name, then the command.
 trace() {
     name=$1
     shift
     echo "census: $name"
-    strace -f -qq -X raw -s 0 -e signal=none -o "$OUT/$name.strace" "$@"
+    $STRACE -o "$OUT/$name.strace" "$@"
 }
 
 # Sanity first: an x86-64 kernel names its calls (a translated trace prints
@@ -75,7 +80,7 @@ int main() {
 CPP
 trace gpp sh -c 'g++ -O2 -fPIC -shared -o libthrow.so lib.cpp && g++ -O2 -o main main.cpp -L. -lthrow -Wl,-rpath,. && ./main'
 
-# 4. make: three objects, serially and two at a time.
+# 4. make: four objects (main and three others), serially and two at a time.
 mkdir -p mk
 cd mk
 for f in a b c; do printf 'int %s(void) { return 1; }\n' "$f" >"$f.c"; done
@@ -102,6 +107,8 @@ INSERT INTO t(v) SELECT 'row' || i FROM n;
 SELECT count(*) FROM t;
 SQL
 trace sqlite sh -c 'sqlite3 journal.db <db.sql && sqlite3 wal.db "PRAGMA journal_mode=WAL;" && sqlite3 wal.db <db.sql'
+# The pragma succeeds even when the mode stays as it was; check it took.
+test "$(sqlite3 wal.db 'PRAGMA journal_mode;')" = wal
 
 # 7. vim: scripted edits, then an interactive edit over a pty.
 trace vim vim -Nu NONE -es +'call setline(1, "hello")' +wq scripted.txt
@@ -110,8 +117,7 @@ import os, pty, select, sys, time
 pid, fd = pty.fork()
 if pid == 0:
     os.environ["TERM"] = "xterm"
-    os.execvp("strace", ["strace", "-f", "-qq", "-X", "raw", "-s", "0", "-e", "signal=none",
-                         "-o", sys.argv[1], "vim", "-Nu", "NONE", "typed.txt"])
+    os.execvp(sys.argv[1], sys.argv[1:])
 def drain(seconds):
     end = time.time() + seconds
     while (left := end - time.time()) > 0:
@@ -131,10 +137,11 @@ _, status = os.waitpid(pid, 0)
 sys.exit(os.waitstatus_to_exitcode(status))
 PY
 echo "census: vim-pty"
-python3 drive_pty.py "$OUT/vim-pty.strace"
+python3 drive_pty.py $STRACE -o "$OUT/vim-pty.strace" vim -Nu NONE typed.txt
 grep -q 'hello from a pty' typed.txt
 
-# 8. pthreads: four threads taking one mutex, joined.
+# 8. pthreads: four threads taking one mutex, joined. Under strace each thread
+#    tends to finish before the next starts, so the mutex is rarely contended.
 cat >threads.c <<'C'
 #include <pthread.h>
 #include <stdio.h>
