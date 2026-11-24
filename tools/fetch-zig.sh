@@ -6,24 +6,27 @@
 #
 # zig is used only as a C cross-compiler for host-built Linux test binaries
 # (the first: musl's libc-test, #345). The kernel, the apps and the Rust test
-# binaries keep their rustc + rust-lld build (hard rule 7: Rust stays the only
-# kernel toolchain).
+# binaries keep their rustc + rust-lld build. Like every toolchain here, zig is
+# pinned and bumped only in its own PR (hard rule 7).
 #
-# Which release, and why: 0.15.2 (2025-10-11, over a year old), the newest
-# release whose x86_64-linux-musl libc is musl's C source for everything that
-# reaches the kernel. Its lib/libc/musl is musl 1.2.5 (src/internal/version.h),
-# the same musl as Alpine 3.21's /lib/ld-musl-x86_64.so.1 (its version string
-# is 1.2.5), so test binaries may be linked dynamically against Alpine's
-# loader as well as statically. In a static link zig 0.15.2 puts in its own
-# code (lib/c/*.zig) for ten pure functions only: strcmp, strncmp, strlen,
-# strcasecmp, strncasecmp (and their _l forms), bzero, abs, labs, llabs and
-# imaxabs; a dynamic binary takes those from Alpine's musl at run time.
+# Which release, and why: 0.15.2 (2025-10-11), the newest release whose
+# x86_64-linux-musl libc is musl's C source for everything that reaches the
+# kernel. Its lib/libc/musl is musl 1.2.5 (src/internal/version.h), the same
+# upstream musl as Alpine 3.21's /lib/ld-musl-x86_64.so.1 (musl 1.2.5-r12), so
+# test binaries may be linked dynamically against Alpine's loader as well as
+# statically. In a static link zig 0.15.2 puts in its own code for pure
+# functions only, none of which makes a syscall: ten from lib/c/*.zig (strcmp,
+# strncmp, strlen, strcasecmp, strncasecmp and their _l forms, bzero, abs,
+# labs, llabs, imaxabs), and from compiler_rt memcpy, memmove and part of libm
+# (sin, cos, tan and sincos in double and float; the floor and fabs families). A dynamic binary takes
+# the lib/c ones from Alpine's musl at run time.
 # 0.16.0 (2026-04-13) and 0.17.x replace kernel-facing parts of musl with zig's
-# own for musl targets (their lib/c.zig adds malloc, fcntl, sys/file, sys/mman
-# and unistd: close, access, chdir, mprotect, madvise, ...; 0.17 adds pthread),
-# which would leave a libc-test failure in Lumen ambiguous between Lumen and
-# zig's libc. Bump deliberately, in its own PR, and recheck both the musl
-# version and lib/c.zig.
+# own for musl targets (their lib/c.zig adds malloc, fcntl.h's fallocate and
+# posix_fadvise, sys/file, sys/mman:
+# mprotect, madvise, ...; sys/utsname: uname; unistd: close, access, chdir,
+# dup, pipe, execve, ...), which would leave a libc-test failure in Lumen
+# ambiguous between Lumen and zig's libc. Bump deliberately, in its own PR, and
+# recheck the musl version (this script checks it) and lib/c.zig.
 #
 # One tarball per host, each pinned by sha256: the values ziglang.org's
 # download index (download/index.json) publishes for 0.15.2, which this script
@@ -61,32 +64,93 @@ case "$(uname -s)-$(uname -m)" in
 esac
 STAMP="$ZIG_VERSION $HOST"
 
-if [[ -f "$DIR/.version" && "$(cat "$DIR/.version")" == "$STAMP" && -x "$DIR/zig" ]]; then
+MUSL_VERSION=1.2.5
+MUSL_H="lib/libc/musl/src/internal/version.h"
+
+installed() {
+    [[ -f "$DIR/.version" && "$(cat "$DIR/.version")" == "$STAMP" && -x "$DIR/zig" && -f "$DIR/$MUSL_H" ]]
+}
+if installed; then
     exit 0
 fi
 
-echo "fetch-zig: downloading zig $ZIG_VERSION for $HOST"
+# Everything happens in a fresh directory beside the old one, which is
+# replaced only once the new one is checked, so a failed or interrupted run
+# leaves the previous zig (or nothing) and never a stamp over a broken tree,
+# and two runs at once don't share files. A run killed outright (SIGKILL,
+# power loss) leaves its build/deps/zig.tmp.* (and maybe build/deps/zig.lock)
+# behind; delete those by hand.
+echo "fetch-zig: downloading zig $ZIG_VERSION for $HOST (about 50 MB)"
 mkdir -p "$DEPS"
-rm -rf "$DIR" && mkdir -p "$DIR"
-ARCHIVE="$DEPS/zig.tar.xz"
-trap 'rm -f "$ARCHIVE"' EXIT
-curl -fsSL --retry 3 -o "$ARCHIVE" "https://ziglang.org/download/${ZIG_VERSION}/zig-${HOST}-${ZIG_VERSION}.tar.xz"
-GOT=$(sha256 "$ARCHIVE")
-if [[ "$GOT" != "$WANT" ]]; then
-    echo "fetch-zig: checksum mismatch for zig $ZIG_VERSION $HOST: expected $WANT, got $GOT" >&2
-    rm -rf "$DIR"
+WORK=$(mktemp -d "$DEPS/zig.tmp.XXXXXX")
+LOCK="$DEPS/zig.lock"
+LOCKED=
+trap 'rm -rf "$WORK"; if [[ -n "$LOCKED" ]]; then rmdir "$LOCK"; fi' EXIT
+ARCHIVE="$WORK/zig.tar.xz"
+NEW="$WORK/zig"
+mkdir -p "$NEW"
+# ziglang.org first, then two of zig's community mirrors
+# (https://ziglang.org/download/community-mirrors.txt), which serve the same
+# file names. ziglang.org has been seen at 40 KB/s, slow enough to time CI
+# out, so a source slower than 100 KB/s for 30 s is dropped for the next.
+# Every source is checked against the same pinned sha256, so a mirror can
+# only fail, never substitute.
+FILE="zig-${HOST}-${ZIG_VERSION}.tar.xz"
+GOT=
+for SOURCE in "https://ziglang.org/download/${ZIG_VERSION}" "https://pkg.hexops.org/zig" "https://zig.linus.dev/zig"; do
+    if curl -fsSL --retry 2 --connect-timeout 20 --speed-limit 102400 --speed-time 30 \
+        -o "$ARCHIVE" "$SOURCE/$FILE"; then
+        GOT=$(sha256 "$ARCHIVE")
+        if [[ "$GOT" == "$WANT" ]]; then
+            break
+        fi
+        echo "fetch-zig: checksum mismatch from $SOURCE: expected $WANT, got $GOT" >&2
+    else
+        echo "fetch-zig: $SOURCE/$FILE failed or was too slow; trying the next source" >&2
+    fi
+    GOT=
+done
+if [[ -z "$GOT" ]]; then
+    echo "fetch-zig: no source served zig $ZIG_VERSION for $HOST with the pinned checksum" >&2
     exit 1
 fi
-tar -xf "$ARCHIVE" -C "$DIR" --strip-components=1
+tar -xf "$ARCHIVE" -C "$NEW" --strip-components=1
 rm -f "$ARCHIVE"
-trap - EXIT
 
-# The archive is checksummed; this catches a bad extraction or a binary that
-# won't run on this host.
-REPORTED=$("$DIR/zig" version)
-if [[ "$REPORTED" != "$ZIG_VERSION" ]]; then
-    echo "fetch-zig: build/deps/zig/zig reports version '$REPORTED', expected $ZIG_VERSION" >&2
-    rm -rf "$DIR"
+# The archive is checksummed; these catch a bad extraction, a binary that
+# won't run on this host, and a bump that silently changes zig's musl.
+if ! REPORTED=$("$NEW/zig" version 2>&1); then
+    echo "fetch-zig: zig $ZIG_VERSION won't run on this host: $REPORTED" >&2
     exit 1
 fi
-echo "$STAMP" > "$DIR/.version"
+if [[ "$REPORTED" != "$ZIG_VERSION" ]]; then
+    echo "fetch-zig: the downloaded zig reports version '$REPORTED', expected $ZIG_VERSION" >&2
+    exit 1
+fi
+if ! grep -qF "\"$MUSL_VERSION\"" "$NEW/$MUSL_H" 2>/dev/null; then
+    echo "fetch-zig: zig $ZIG_VERSION's bundled musl isn't $MUSL_VERSION ($MUSL_H)" >&2
+    exit 1
+fi
+echo "$STAMP" > "$NEW/.version"
+
+# Publishing is serialized (mkdir is atomic), and a run that finds a good
+# install published meanwhile keeps it, so two runs at once both succeed.
+for _ in $(seq 600); do
+    if mkdir "$LOCK" 2>/dev/null; then
+        LOCKED=1
+        break
+    fi
+    sleep 0.5
+done
+if [[ -z "$LOCKED" ]]; then
+    echo "fetch-zig: $LOCK has been held for 5 minutes; if no other fetch-zig is running, remove it" >&2
+    exit 1
+fi
+if installed; then
+    exit 0
+fi
+# Rename the old tree aside (the trap deletes it) so the swap is two renames.
+if [[ -e "$DIR" ]]; then
+    mv "$DIR" "$WORK/old"
+fi
+mv "$NEW" "$DIR"
