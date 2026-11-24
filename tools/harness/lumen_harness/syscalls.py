@@ -222,7 +222,8 @@ _RESUMED = re.compile(r"^<\.\.\. (\w+) resumed>(.*)$")
 # after it: an errno (`-1 ENOENT (...)`, `? ERESTARTNOHAND (...)`) or a note
 # on a success (`0x8000 (flags 0x8000)`, `0 (Timeout)`, `1 ([{fd=0, ...}])`).
 _COMPLETE = re.compile(r"^(\w+)\((.*)\)\s+=\s+(\S+)(?:\s+(.*))?$")
-_ERRNO = re.compile(r"^(E[A-Z0-9]+)\b")
+# An errno name, underscores included (`ERESTART_RESTARTBLOCK`).
+_ERRNO = re.compile(r"^(E[A-Z0-9_]+)\b")
 
 
 def split_args(text: str) -> list[str]:
@@ -285,8 +286,16 @@ def parse_trace(lines) -> list[Call]:
         if not c:
             raise CensusError(f"pid {pid}: not a completed syscall: {rest!r}")
         name, args, ret, note = c.groups()
-        e = _ERRNO.match(note or "") if ret in ("-1", "?") else None
-        calls.append(Call(name, split_args(args), ret, e.group(1) if e else None))
+        errno = None
+        if ret in ("-1", "?"):
+            # -1 always carries an errno; ? carries one or nothing (exit_group).
+            if e := _ERRNO.match(note or ""):
+                errno = e.group(1)
+            elif ret == "-1":
+                raise CensusError(f"pid {pid}: no errno after -1: {rest!r}")
+            elif note:
+                raise CensusError(f"pid {pid}: not an errno after ?: {rest!r}")
+        calls.append(Call(name, split_args(args), ret, errno))
     return calls
 
 

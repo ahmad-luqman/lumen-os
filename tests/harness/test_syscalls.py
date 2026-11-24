@@ -102,12 +102,25 @@ def test_a_success_strace_annotates_is_kept_and_has_no_errno():
     assert key_values(calls[0]) == {"cmd": "0x3"}
 
 
+def test_an_errno_with_an_underscore_is_read_whole():
+    line = (
+        "9    nanosleep({tv_sec=5, tv_nsec=0}, {tv_sec=3, tv_nsec=999979558}) "
+        "= ? ERESTART_RESTARTBLOCK (Interrupted by signal)"
+    )
+    [call] = parse_trace([line])
+    assert (call.ret, call.errno) == ("?", "ERESTART_RESTARTBLOCK")
+    assert census({"signals": [call]})["nanosleep"].errors == {"ERESTART_RESTARTBLOCK": 1}
+
+
 @pytest.mark.parametrize(
     ("line", "match"),
     [
         ('open("/x", 0) = 3', "not an strace -f line"),
         ("7    write(1, ..., 4", "not a completed syscall"),
         ('7    write(1, "", 4) = ', "not a completed syscall"),
+        ('7    open("/x", 0) = -1', "no errno after -1"),
+        ('7    open("/x", 0) = -1 (No such file or directory)', "no errno after -1"),
+        ("7    exit_group(0) = ? <unavailable>", "not an errno after \\?"),
     ],
 )
 def test_a_line_the_parser_cant_read_is_refused(line, match):
