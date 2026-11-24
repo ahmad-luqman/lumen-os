@@ -1301,7 +1301,8 @@ struct Ext4InodeMeta {
     gid: u32,
     /// A directory's, like its `blocks_512`, are `ext4plus`'s, which grows
     /// it inside `Dir::link`: refreshed by [`Self::take_dir_geometry`] after
-    /// every operation that links into it (#357).
+    /// every create, mkdir, link, symlink and rename into it, failed ones
+    /// too (best effort, [`Ext4Inode::retake_dir_geometry`]; #357).
     size: u64,
     blksize: u32,
     blocks_512: u64,
@@ -1317,8 +1318,9 @@ impl Ext4InodeMeta {
     /// it, has them: `ext4plus` grows a directory by a block inside
     /// `Dir::link` (an entry that doesn't fit a linear directory, an htree
     /// leaf split) and writes its inode itself, and nothing here writes them
-    /// back (#357). The create, mkdir, link and symlink paths hand over their
-    /// `Dir`'s inode; a rename re-reads both parents' ([`Ext4Inode::rename`]).
+    /// back (#357). A create, mkdir, link or symlink that worked hands over
+    /// its `Dir`'s inode; a failed one, and a rename (both parents), re-read
+    /// it ([`Ext4Inode::retake_dir_geometry`]).
     fn take_dir_geometry(&mut self, disk: &Inode) {
         self.size = disk.size_in_bytes();
         self.blocks_512 = disk.blocks();
@@ -2212,12 +2214,29 @@ impl Ext4Inode {
         }
     }
 
-    /// A rename's parents' size and blocks from their inodes (#357,
-    /// [`Ext4InodeMeta::take_dir_geometry`]), however the rename ended: the
-    /// link into `new_dir`, or a put-back into either, may have grown it.
-    /// Lock 6 under their Lock 4 guards, as writeback takes them. A parent
-    /// whose inode can't be read keeps its cached values: the rename's own
-    /// result stands, and `stat` never reads the disk.
+    /// This directory's size and blocks re-read from its inode into `meta`
+    /// (its Lock 4 guard; Lock 6 held, as writeback takes them), where no
+    /// `Dir` that linked into it is at hand: after a rename, and after a
+    /// create, mkdir, link or symlink that failed, whose failed `Dir::link`
+    /// (or `discard_orphan`'s link) may have grown it (#357). Best effort:
+    /// an inode that can't be read leaves the cached values (logged at
+    /// debug), the operation's own result stands, and `stat` never reads
+    /// the disk.
+    fn retake_dir_geometry(&self, meta: &mut Ext4InodeMeta, ext4: &Ext4) {
+        match Inode::read(ext4, self.disk_inode_index()) {
+            Ok(disk) => meta.take_dir_geometry(&disk),
+            Err(e) => debug!(
+                target: "vfs",
+                "ext4 {:?} inode {}: keeping the directory's cached size: reading its inode failed: {e:?}",
+                self.shared.dev,
+                self.disk_ino
+            ),
+        }
+    }
+
+    /// A rename's parents' size and blocks from their inodes
+    /// ([`Self::retake_dir_geometry`]), however the rename ended: the link
+    /// into `new_dir`, or a put-back into either, may have grown it.
     fn take_parents_geometry(
         &self,
         guards: &mut [LockedInode<'_>],
@@ -2226,9 +2245,7 @@ impl Ext4Inode {
     ) {
         let inner = self.shared.state.lock();
         for dir in [old_dir, new_dir] {
-            if let Ok(disk) = Inode::read(&inner.ext4, dir.disk_inode_index()) {
-                find_guard_mut(guards, dir).take_dir_geometry(&disk);
-            }
+            dir.retake_dir_geometry(find_guard_mut(guards, dir), &inner.ext4);
         }
     }
 
@@ -3885,6 +3902,7 @@ impl VfsInode for Ext4Inode {
         inner.clear_nlink_bounds(child_disk.index.get());
         if let Err(e) = parent_dir.link(dname, &mut child_disk) {
             discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed create");
+            self.retake_dir_geometry(&mut meta, &inner.ext4);
             return Err(map_ext4_err(e));
         }
         meta.take_dir_geometry(parent_dir.inode());
@@ -3944,6 +3962,7 @@ impl VfsInode for Ext4Inode {
             Err(e) => {
                 inner.undo_failed_link(self.disk_inode_index(), dname, self.disk_inode_index(), parent_eff);
                 discard_orphan(&mut inner, self.disk_inode_index(), dname, sub_ino, "after a failed create");
+                self.retake_dir_geometry(&mut meta, &inner.ext4);
                 return Err(map_ext4_err(e));
             }
         };
@@ -4190,6 +4209,7 @@ impl VfsInode for Ext4Inode {
             }
             if let Err(e) = parent_dir.link(dname, &mut target_disk) {
                 inner.undo_failed_link(self.disk_inode_index(), dname, target_arc.disk_inode_index(), target_eff);
+                self.retake_dir_geometry(find_guard_mut(&mut guards, &self_arc), &inner.ext4);
                 return Err(map_ext4_err(e));
             }
             inner.clear_nlink_bounds(target_arc.disk_ino);
@@ -4256,6 +4276,7 @@ impl VfsInode for Ext4Inode {
                 Ok(sym) => sym,
                 Err(e) => {
                     discard_orphan(&mut inner, self.disk_inode_index(), dname, sym_ino, "after a failed create");
+                    self.retake_dir_geometry(&mut meta, &inner.ext4);
                     return Err(e);
                 }
             };
@@ -6854,7 +6875,8 @@ crate::ktest!(
         // (an entry that doesn't fit a linear directory, an htree leaf
         // split). After a create, link, rename into it, mkdir or symlink that
         // grew it, `stat` gives the size and blocks its inode on disk has, as
-        // a fresh mount does. A removed directory's `stat` keeps its own
+        // a fresh mount does, from memory (it answers alike while reads of
+        // the inode fail). A removed directory's `stat` keeps its own
         // values, even once its inode number is another file's.
         use self::ktest_util::*;
         use crate::kassert_eq;
@@ -6888,6 +6910,17 @@ crate::ktest!(
             kassert_eq!(stat, disk);
             let ro = remount_ro(m, minor)?;
             kassert_eq!(by_stat(&ro.root_inode().lookup(name).map_err(|_| "ro lookup")?)?, disk);
+            Ok(())
+        }
+        /// `stat` reads only memory: with every read of `dir`'s inode
+        /// failing, it still answers, alike.
+        fn stats_from_memory(m: &Mnt, dir: &Arc<dyn VfsInode>) -> Result<(), &'static str> {
+            let at = inode_offset(&m.fs, ext4_inode(dir)?.disk_ino)?;
+            let before = by_stat(dir)?;
+            m.cache.fail_reads_in(at, at + 1, usize::MAX);
+            let during = by_stat(dir);
+            m.cache.clear();
+            kassert_eq!(during?, before);
             Ok(())
         }
         // A 255-byte name: 264 bytes of entry, so 15 fill a 4 KiB block of a
@@ -6933,6 +6966,8 @@ crate::ktest!(
         kassert_eq!(ext4_inode(&reuse)?.disk_ino, ext4_inode(&gone)?.disk_ino);
         kassert_eq!(by_stat(&gone)?, held);
         kassert_eq!(gone.stat().map_err(|_| "stat gone")?.inode_type, InodeType::Dir);
+        stats_from_memory(&m, &lin)?;
+        stats_from_memory(&m, &ren)?;
         drop((gone, reuse, f, lin, ren, m));
 
         // An htree directory: `unsigned_hash_split_names` split leaf 1 of
@@ -6944,6 +6979,7 @@ crate::ktest!(
             d.create(&name, 0o644).map_err(|_| "create")?;
         }
         grew_by_a_block(&m, &d, b"d", before, 1024, 363)?;
+        stats_from_memory(&m, &d)?;
         Ok(())
     }
 );

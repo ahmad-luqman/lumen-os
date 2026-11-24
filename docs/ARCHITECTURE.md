@@ -5892,17 +5892,22 @@ fixable there now, each in a PR of its own.
     linear directory, an htree leaf split) and writes its inode itself, and
     the adapter writes neither back. So each operation that links into a
     directory refreshes the cached values (`Ext4InodeMeta::take_dir_geometry`):
-    create, mkdir, link and symlink from the `Dir` they linked through; a
-    rename re-reads both parents' inodes after it ends, however it ended
-    (Lock 6 under their Lock 4 guards, as writeback takes them; an inode it
-    can't read leaves the cached values). `stat` itself only reads memory,
-    so it never fails, and a removed directory keeps its own values even
-    once its inode number is another file's
+    a create, mkdir, link or symlink that worked from the `Dir` it linked
+    through; a failed one (its failed link, or `discard_orphan`'s, may have
+    grown the directory) and a rename (both parents, however it ended)
+    re-read the inode (`Ext4Inode::retake_dir_geometry`: Lock 6 under the
+    Lock 4 guard, as writeback takes them; an inode it can't read leaves
+    the cached values, logged at debug). `stat` itself only reads memory,
+    so it never fails (it answers alike while reads of the inode fail), and
+    a removed directory keeps its own values even once its inode number is
+    another file's
     (`ktest:lumen_kernel::vfs::ext4::ext4_a_directory_grown_by_ext4plus_stats_its_size_on_disk`:
     a linear directory grown by a link, a rename, a mkdir and a symlink, and
     an htree one by a create's split, each against the inode and a fresh
-    mount; a removed directory whose inode a new file took). An undo
-    putting an entry back after a failed operation doesn't refresh them.
+    mount; `stat` while reads of the inodes fail; a removed directory
+    whose inode a new file took). The refresh after a failed create, mkdir,
+    link or symlink, and after an exchange (which keeps both names, so
+    doesn't grow a directory), is untested.
 
 ### POSIX VFS (`crates/lumen-vfs`, host-tested; kernel integration in `kernel/src/vfs/`)
 
