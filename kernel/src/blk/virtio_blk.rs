@@ -81,7 +81,7 @@ pub struct BlkEntry {
 }
 
 impl BlkEntry {
-    /// Its block cache's statistics, for `lsblk`.
+    /// Its block cache's statistics, for `blk`.
     pub fn stats(&self) -> BlockCacheStats {
         self.cache.lock().stats()
     }

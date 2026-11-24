@@ -162,7 +162,8 @@ one is its own PR that updates that doc first.
   (and, by hand, the TSC-frequency and bootloader-performance ones;
   `before_kmain`).
   `cmdline.rs`: kernel command line (flags and `key=value`, e.g.
-  `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held; a wait recorded as an X-ray `lock` event).
+  `lumen.log=debug`). `sync.rs`: `SpinLock` (interrupts off while held; a wait recorded as an X-ray `lock` event)
+  and `SleepMutex` (interrupts left on, its waiters asleep: for code that may block, e.g. the VFS's).
   `smp.rs`: starting the other CPUs, `run_on`. `sched.rs`: kernel threads
   (each named by a `lumen_trace::ThreadName`, 16 bytes inline, #276; per-CPU run queues, preemption on the timer, `sleep`, `WaitQueue`
   with or without a deadline, `spawn`/`join`, `scope`: threads borrowing from the caller, joined before it returns;
@@ -267,7 +268,12 @@ one is its own PR that updates that doc first.
   `virtio-drivers` (the `Hal`: DMA runs from the frame allocator, bounce
   buffers, probe attempts; `transport`, `VirtioTransport` and its MSI-X
   vectors, the device status handle, the `Doorbell` a driver's interrupt
-  rings, or the driver itself to wake its thread: `mouse::hold`). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
+  rings, or the driver itself to wake its thread: `mouse::hold`). `blk/` (M7): `virtio_blk.rs` the
+  virtio-blk driver (`DRIVER`, `VirtioBlkDevice`: a `lumen_bcache::BlockDevice` over one queue and its
+  MSI-X vector) and each device's `BlockCache` (`devices`: the bound entries; `device`: one's driver;
+  a `BlkEntry`'s cache only through `stats` and `into_cache`, which `vfs::init` mounts behind ext4's
+  `LatchedCache`, #349); `mod.rs` the `blk` command (the devices; `read`/`write` by sector and
+  `flush`, straight to the device, past its cache). `rng.rs`: randomness: `rng::fill`, `u64`, `below`,
   `sources`, `stats` (the shell's `random`, rhai's `random()`), RDRAND and
   the virtio-rng driver (its own queue, one deadline per request, dropped
   on a failed request) feeding a ChaCha20 pool. `power.rs`: `reboot` and `shutdown` (ACPI S5;
@@ -361,18 +367,21 @@ one is its own PR that updates that doc first.
   tables (`KernelVfsTables`: lumen-vfs's `VfsTables` on `SleepMutex`), `init` (the
   first ext4 virtio-blk volume at `/`, else a tmpfs root; `/tmp`, `/dev`,
   `/proc` over it), `sync_all` (each filesystem flushing its own inodes),
-  and the `mount`, `sync` and `vfstest` commands (`vfstest`: file
+  and the `mount`, `sync` and `vfstest` commands (`mount`'s `used`/`limit`:
+  a tmpfs mount's quota, through `mounts_with_fs` and `tmpfs::quota_use`,
+  #324; an errored ext4 volume's mode `ro,errors`, #349; `vfstest`: file
   operations from the kernel shell, for the scenarios to set up and inspect
   files around ring-3 programs);
   `vfs/tests.rs` the ktests of `mod.rs`'s code (`lumen_kernel::vfs::tests::`;
   `vfs/ext4.rs` and `vfs/page_cache.rs` keep their own; `MemBlkDev`, the
-  in-memory block device those files' ktests use too, stays in `mod.rs`);
+  in-memory block device those files' ktests use too (`fail_device_writes`:
+  the block cache's writes back failing, #331), stays in `mod.rs`);
   `vfs/page_cache.rs` the frame-backed `PageCache` shared by ext4 and tmpfs
   (dirty and writable-map tracking, the soft 32 MiB ext4 reclaim and its
   64 MiB hard cap, one check, `admit_unreclaimable`, for a dirty or mapped
   page, `QuotaCounter` (bytes; a leak logged when dropped), the detached-inode
   quota; `read_into`/`write_from`/`resize`/`map_page`, the page I/O ext4 and
-  tmpfs share, #264; `mmap_page`,
+  tmpfs share, #264; a failure past the first page a short count (`page::short_count`), #321; `mmap_page`,
   re-exported as `vfs::mmap_page`: an ext4 or tmpfs file's own cached page
   for a mapping, through `VfsInode::as_any`, and `MappedPage::copy_to_frame` (under the cache lock)
   for copy-on-write, #255; `WritableMap`, the guard counting a writable
@@ -402,16 +411,28 @@ one is its own PR that updates that doc first.
   raw from `i_block`, `read_rdev`, #292; the times through `times`'
   `InodeTimes`, clamped on load and by every setter and stored by `store`/
   `store_ctime`, and `new_inode`, the one way to make an inode, #294;
+  after an unlink or rmdir failed with its directory unreadable,
+  `child_lost_entry`: whether the child's entry went, from its inode
+  (`child_after_failed_unlink`'s `ChildReadBack`: zeroed, its first freed
+  block free by lumen-vfs's `first_block_freed`, allocated, or unreadable
+  (`Undecided`, why): kept live and logged), #330; `Ext4DiskLayout` over lumen-vfs's `Geometry`
+  (`block_byte`, `bit_is_clear`, `read_i_block`); `DirHash`, the htree hash
+  by `s_flags` (neither flag with `dir_index` mounts read-only,
+  `forced_read_only_reason`, a lookup in an htree directory missing a name
+  with a byte of 0x80 or above walking the directory, `scan_dir_for`, #308; its ktests' image
+  `testdata/unsigned-hash.ext4`, made by `tools/ext4-unsigned-hash-image.py`);
   `ktest_util`, the ext4 ktest helpers `vfs/tests.rs` and `page_cache.rs`
   share: `FaultCache` (writes failed by number, pair or from one on,
   reads by range or after a write fault), `Mnt`, `mount`, `remount_ro`,
   `set_clock`, the ktests' clock, `Ext4Shared::now`);
   `vfs/tmpfs.rs` (its quota charging inodes, directory entries and symlink
   targets besides pages, #267: `charge`, the cost model, `InodeCharge`,
-  `EntryCharge` and `Children`, the only code reserving or giving one back),
+  `EntryCharge` and `Children`, the only code reserving or giving one back;
+  `quota_use`, a mount's `QuotaUse` for `mount`, #324),
   `vfs/devfs.rs` (`null`, `zero`, `random`, `urandom`, `tty`, `console`)
   and `vfs/procfs.rs` (`self`, `<pid>/{exe,fd,maps,mounts}`, `cpuinfo`,
-  `meminfo`, `mounts`, `version`; `/proc/<pid>/maps` from
+  `meminfo`, `mounts`, `version`; `mounts`: an errored ext4 volume
+  `ro,errors=remount-ro`, `format_mounts_of`, #349; `/proc/<pid>/maps` from
   `AddressSpace::format_maps`, its lines `lumen_vm::maps`'s; the node
   kinds, inode numbers, fds and numeric names `lumen_vfs::procfs`'s).
   `linux/` (M6, M7; ARCHITECTURE section 8): `linux/mod.rs` the
@@ -569,11 +590,32 @@ one is its own PR that updates that doc first.
   edges, `[heap]`/`[stack]`, a file's device, inode and path (its bytes,
   each newline as `\012`, #268), names padded as Linux's `seq_pad`; `ImageRange`, an ELF image's named pages:
   `from_segment`, `trim`) (host-tested).
+- `crates/lumen-bcache`: block storage (M7, ARCHITECTURE section 9): the
+  `BlockDevice` trait (sectors; `BlockInfo`, `BlockError`), `BlockCache`
+  (4 KiB blocks, LRU over a fixed budget, `DEFAULT_CAPACITY`; pinned blocks,
+  `PinnedBlock`/`PinnedBlockMut`, never evicted; `read_at`/`write_at`;
+  `sync`/`flush_blocks` in block order, then the device flush owed,
+  `needs_device_flush`; a failed device write kept dirty and cached for the
+  next writeback (while writeback runs), its error reaching whichever call
+  wrote the block back, #331; #349: `first_failure` (every cache: the first
+  failed device write or flush, kept for good); `Writeback` running, stopped
+  (`stop_writeback_on_failure`: at the first failure) or frozen (`freeze`:
+  writes into the cache refused too), a read miss with no clean slot then
+  read uncached, `read_uncached`; `stop_writeback`/`thaw` behind the `test-util`
+  feature, the ktest kernel's) and `MemBlockDevice` (in memory: injected
+  errors, power loss) (host-tested).
 - `crates/lumen-vfs`: the POSIX VFS core (M7, ARCHITECTURE section 9): the
   `FileSystem`/`VfsInode` traits (names as bytes, #268; `Escaped`, a name's
-  bytes as text, never lossily), the path and symlink resolver, the mount
+  bytes as text, never lossily; `FileSystem::errored`, read-only after an
+  error, a `MountInfo`'s `errored`, #349), the path and symlink resolver
+  (`resolve_parent`'s `ParentTarget`, its last component a `Final`: root,
+  `.`, `..` or a name, #309), the mount
   table and the Lock-9 inode and dentry caches (`VfsTables`, generic over a
-  `LockFamily`: the kernel's and the host tests'), `OpenFile` (its inode,
+  `LockFamily`: the kernel's and the host tests'; `mounts_with_fs`, each
+  mount with its filesystem; `InodeCache` dropping no inode under Lock 9,
+  handing back each one it lets go, `Released`, #320, and keeping removed
+  directories' parents for `..`, `record_removed_dir`/`removed_dir_parent`,
+  #318), `OpenFile` (its inode,
   `inode()`, read from its `OpenGuard`, #264) and the `FdTable`
   (`MAX_FDS` fds), the namespace operations (`open_inode`, `mkdir_at`,
   `unlink_at`, `rename_at2`, ...), `flock` and POSIX record locks (each
@@ -586,17 +628,23 @@ one is its own PR that updates that doc first.
   a listing keyed by entry, and `fixed_namespace_ops!`, the seven namespace
   operations each `-EROFS`), `ext4` (#292, #294: what the ext4 adapter encodes and
   decodes itself, a device node's `i_block` as `st_rdev` and Linux's signed times
-  with their epoch bits, clamped as `timestamp_truncate` does), `nlink`
+  with their epoch bits, clamped as `timestamp_truncate` does; #330: the
+  first block `ext4plus`'s `delete_file` frees, `first_block_freed`, and
+  `Geometry`, a block's byte and its bitmap bit, `block_byte`,
+  `bitmap_bit`), `nlink`
   (#265: `NlinkBounds`, ext4's in-memory link-count corrections: a floor
   and maybe a ceiling per inode, never trivial, the floor never above the
-  ceiling), and `page` (#265: the page cache's arithmetic, `spans`,
-  `pages_in`, `valid_len`, `resize_tail`); `SetTime::resolve` (#302) in
-  `types` (host-tested).
+  ceiling; `raised_to`, after a raise on disk landed or failed), and `page`
+  (#265: the page cache's arithmetic, `spans` (`PageSpans`),
+  `pages_in`, `valid_len`, `resize_tail`; `short_count`, a read or write
+  failing part-way, #321); `SetTime::resolve` (#302) in
+  `types` (host-tested; `tests/ext4plus_htree_hash.rs`: the vendored
+  ext4plus's htree hash against e2fsprogs', #313).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
   `stream_of`: which ring each goes to, and typed layouts: `Switch`/`ThreadState`,
-  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free), `repeats` (`klog::hold_repeats`' table),
+  `RunQueue`, `Irq`, `LockWait`), `TextRing`, the byte ring of log lines `dmesg` reads (not lock-free), `repeats` (`klog::hold_repeats`' table; `Seen::is_held`, the logger's print-or-hold),
   and `ThreadName` (#276: a thread's name, 16 bytes inline like Linux's `comm`: at most 15 bytes cut
   at a character boundary, control characters (C0, DEL, C1) and U+2028/U+2029 as `?`; `from_path`,
   a path's last component, the name a binary run by `linux /path` gets; `From<&str>`, the kernel's
@@ -810,11 +858,14 @@ one is its own PR that updates that doc first.
   warning" check without them; `HOLDING`, `HELD_BACK`, `HELD_ALL`: a
   `klog::hold_repeats` guard's lines), `rootfs.py` (matched `e2fsprogs` discovery,
   per-test `alpine-rootfs.ext4` copy isolation, `e2fsck -fn`, `debugfs`
-  and `debugfs_names` (reading an image back, any error line failing), and
-  `llvm-readobj` dynamic musl ELF checks, and `warm_up`: one uncounted
+  and `debugfs_names` (reading an image back, any error line failing),
+  `llvm-readobj` dynamic musl ELF checks, `run_busybox`: a `linux
+  /bin/busybox` run's output, exit code and leaked frames (`BusyboxRun`,
+  `BUSYBOX_EXIT`), #324, and `warm_up`: one uncounted
   `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
-  assembly and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
+  assembly (`s_flags` saying signed directory hashes on every host,
+  `tools/ext4-signed-hash.sh`, #308) and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
   for #255's exit scenarios, and `libm7.so`;
   `m7_vfs`, #254's exit scenarios' program: `posix`, `locks`, `keep` (a
   tree left for fsck), and `lock-hold`/`lock-probe`, two processes at once,
