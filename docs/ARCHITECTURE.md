@@ -1821,7 +1821,14 @@ the syscalls.
   interruptible, killable blocking wait"). `SIGKILL`, and a signal whose
   default action kills when it is the action, the chosen thread doesn't
   block it and no thread has it in `real_blocked`, set `group_exit` there
-  (Linux's `complete_signal`: `!sigismember(&t->real_blocked, sig)`).
+  (Linux's `complete_signal`: `!sigismember(&t->real_blocked, sig)`),
+  clear `group_stop`, `stopped` and every thread's `stop_pending` and
+  `stop_dequeued`, and give every thread `sigpending`, `fatal_pending` and
+  a kick, as `complete_signal` zeroes `group_stop_count` and, for each
+  thread, clears `JOBCTL_PENDING_MASK`, sets `SIGKILL` in its queue and
+  calls `signal_wake_up(t, 1)`. The rule doesn't look at `exec_waiter`, as
+  `complete_signal` doesn't look at `group_exec_task`: a fatal signal sent
+  to the process during an `execve` ends the caller too.
   `rt_sigtimedwait` sets the caller's `real_blocked` to its mask for the
   wait and clears it after: musl's `SIGEV_THREAD` helper waits so for a
   signal it leaves at `SIG_DFL`.
@@ -1830,34 +1837,61 @@ the syscalls.
   end of each syscall (`SyscallExit::new(orig_rax)` as the syscall
   context), and when `lumen_isr_common` returns to ring 3 from an
   interrupt or exception (context `None`), the timer's preemption
-  included. If `sigpending` is set: a `group_exit`, or a `SIGKILL` pending
-  for the thread, ends it (section 8, "Exit"), before any group-stop park;
-  while `exec_waiter` names another thread (`de_thread`, section 8) such a
-  thread ends through exit step 2 alone and records no `group_exit`, as
-  Linux's `do_group_exit` gives code 0 and kills no one while
-  `group_exec_task` is set (a sibling's own `exit_group` then also ends only
-  itself); a group stop parks it (below); otherwise
-  `PendingSignals::dequeue(slot, blocked)` takes the next one, and its
-  disposition decides: ignored, dropped; default `Term` or `Core`, a group
-  exit with `ExitStatus::Killed`; default `Stop`, a group stop (`SIGTSTP`,
-  `SIGTTIN` and `SIGTTOU` dropped for an orphaned process group, as
-  Linux's `get_signal`); a handler, a frame (below). The loop runs until
+  included. If `sigpending` is set, the hook loops, each iteration one
+  hold of `signal` that starts with the kill test and only then dequeues,
+  as Linux's `get_signal` tests `SIGNAL_GROUP_EXIT` and `group_exec_task`
+  at the top of every iteration under `siglock`. The kill test: a
+  `group_exit`, a `SIGKILL` pending for the thread, or `exec_waiter`
+  naming another thread (`de_thread`, section 8) ends the thread (section
+  8, "Exit"), before any group-stop park; while `exec_waiter` names
+  another thread it ends through exit step 2 alone and records no
+  `group_exit`, as Linux's `do_group_exit` gives code 0 and kills no one
+  while `group_exec_task` is set. The hook releases `signal` before the
+  thread ends (the unwind needs no lock held: section 8, "Exit", step 2).
+  Otherwise a group stop the thread is counted in parks it (below);
+  otherwise `PendingSignals::dequeue(slot, blocked)` takes the next one,
+  and its disposition decides: ignored, dropped; default `Term` or `Core`,
+  a group exit with `ExitStatus::Killed` through exit step 1, whose own
+  hold re-checks (an `exec_waiter` that `de_thread` set after this
+  iteration's hold makes the thread end alone, the signal consumed, as
+  `do_group_exit`'s re-check under `siglock` does); default `Stop`, a
+  group stop (below); a handler, a frame (below), built after the hold,
+  so the next iteration's kill test sees whatever `de_thread` or a group
+  exit did meanwhile. The loop runs until
   nothing deliverable is left, then clears `sigpending` under the lock;
   the final check with interrupts off (before `sysretq` or `iretq`) loops
   again if a sender set it meanwhile, as Linux's `exit_to_user_mode_loop`.
-- **Stop and continue (C6):** a stop signal's dequeue sets `group_stop`
-  (with a new generation) under `signal` and kicks the other threads; each
+- **Stop and continue (C6):** a stop signal's dequeue marks the thread
+  `stop_dequeued` (`ThreadSignals`, Linux's `JOBCTL_STOP_DEQUEUED`).
+  `SIGSTOP` starts the stop in that same hold. `SIGTSTP`, `SIGTTIN` and
+  `SIGTTOU` first release `signal` to ask, under `PROCS`, whether the
+  process group is orphaned (if so the signal is dropped, as Linux's
+  `get_signal`), and start it in a `PROCS` then `signal` hold. The hold
+  that would start it refuses, the signal consumed and nothing stopped,
+  unless the thread is still `stop_dequeued` (a `SIGCONT` sent in that gap
+  clears every thread's mark) and neither `group_exit` nor `exec_waiter`
+  is set, as Linux's `do_signal_stop` returns false on
+  `!JOBCTL_STOP_DEQUEUED`, `SIGNAL_GROUP_EXIT` or `group_exec_task`; so a
+  stop can't start after `de_thread` cleared one and stop the new image.
+  Starting it sets `group_stop` (a new generation, and the count of
+  threads still to park), marks every thread `stop_pending` (Linux's
+  `JOBCTL_STOP_PENDING`) and kicks the other threads; each
   parks on `Process::stop_wait` in a killable wait whose `ready()` reads
   `Process::stopped`, an atomic mirror of `group_stop` written under
-  `signal`. The last thread to park makes the transition under `PROCS`
-  then `signal`, re-checking that `group_stop` still has the generation it
-  parked for: `ProcTree::stop(pid, sig)`. Its `StateChange` is acted on
+  `signal`. A thread's park, or its exit (section 8, "Exit", step 2, as
+  Linux's `exit_signals` calls `task_participate_group_stop`), clears its
+  mark and lowers the count, once; the one that takes the count to 0
+  makes the transition under `PROCS` then `signal`, re-checking that
+  `group_stop` still has the generation it counted for:
+  `ProcTree::stop(pid, sig)`. Its `StateChange` is acted on
   after the child's `signal` is released, still under `PROCS`: the
   parent's waits woken and `SIGCHLD` (`CLD_STOPPED`) sent under the
   parent's `signal` unless its disposition is `SIG_IGN` or it set
-  `SA_NOCLDSTOP`. `SIGCONT`'s send clears `group_stop` and `stopped` and
-  wakes `stop_wait`, and `ProcTree::cont` and its `StateChange`
-  (`CLD_CONTINUED`) run the same way.
+  `SA_NOCLDSTOP`. `SIGCONT`'s send clears `group_stop`, `stopped` and
+  every thread's `stop_pending` and `stop_dequeued` (Linux's
+  `task_clear_jobctl_pending`) and wakes `stop_wait`, and
+  `ProcTree::cont` and its `StateChange` (`CLD_CONTINUED`) run the same
+  way.
 - **The frame:** `lumen_fpu_save` into the thread's own buffer first, then
   `lumen_signal::frame::build(FrameInput { registers, fp, info, saved_mask,
   blocked, handler, alt_stack, syscall, user_cs, user_ss })`, with
@@ -2052,7 +2086,8 @@ IPI is tested; how soon the thread runs isn't, a loaded host decides it).
   `time::sleep` busy-waits (tested with a lock held, interrupts off, and
   on an idle thread; before the scheduler runs on the CPU, not tested).
   M8 adds `WaitQueue::wait_interruptible` and `wait_killable`, which a
-  signal or the thread's group exit also ends, and `sched::kick` (section
+  signal (for `wait_killable`, a fatal one: `fatal_pending`) or the
+  thread's group exit also ends, and `sched::kick` (section
   8, "One interruptible, killable blocking wait", designed in #336).
 - **Idle and boot:** each CPU's idle thread runs only when nothing is ready
   and is never queued. An AP's is its `ap_main` context (on its main
@@ -4281,7 +4316,7 @@ depends on them.
 |---|---|---|---|---|
 | B0 | the skeleton | M7 done | `M8_SYSCALLS`, the stub modules below, `syscalls.py`'s `PLANNED` changes and `ENOSYS_BY_DECISION`, empty scenario files, `tools/linux-m8/`; `m8_abi_constants_match_spec`, `test_m8_table_covers_the_census` | 8, 15 |
 | B1 | the process/thread split, behaviour unchanged | M7 done | `Process`, `UserThread`, `UserThreadState::linux`, `PROCS`, `Files::users`, tids (`ProcTree::add_thread`/`remove_thread`), pid 1 (`linux::init`), the `ps` shell command; `procs_lookup_and_lifetime`, `cargo:lumen-proc`, all M6/M7 scenarios unchanged | 8 |
-| B2 | the blocking wait and the syscall-exit hook | B1 | `wait_interruptible`/`wait_killable`, `kick`, the hook, `restart_syscall`, `raise_for_test`, `user::read_u32_nofault`/`cmpxchg_u32`/`fault_in_writable`; the wait, restart and nofault ktests, `harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata` | 6, 8, 15 |
+| B2 | the blocking wait and the syscall-exit hook | B1 | `wait_interruptible`/`wait_killable`, `kick`, `Thread::fatal_pending`, the hook, `restart_syscall`, `raise_for_test`, `user::read_u32_nofault`/`cmpxchg_u32`/`fault_in_writable`; the wait, restart and nofault ktests, `harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata` | 6, 8, 15 |
 | B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `poll_rechecks_after_a_wake`, `test_poll_and_select_on_console` | 10 |
 | B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended) | 5, 8 |
 | B5 | the TLB shootdown IPI | B2 | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `PerCpu::loaded_space`, `tlb::shoot_down`, the shootdown warning's `HOST_TIMED` entry; `mm::tlb::shootdown_across_cpus` (its probes use B2's `read_u32_nofault`) | 5, 9 |
@@ -4290,7 +4325,7 @@ depends on them.
 | B8 | the five M8 hazards | B1 | `OpenFile::pos`, `FdTable::reserve`, `PosixWaitGraph`'s key; the hazard ktests | 8, 9 |
 | C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | B0, B1, B2, B4 | `spawn_user_on` taking the `UserThread`, pinned to the caller's CPU (B6 makes it migratable), `Files::users` across `fork`; `test_fork_wait_and_exit_status` | 8 |
 | C2 | `execve`, single-threaded, `#!`, the streaming loader | B0, C1 | lumen-elf's header split, `ImageSource`, the stack-size parameter; `test_fork_cow_and_exec_shebang` (its single-threaded checks) | 5, 8 |
-| C3 | threads | B0, B5, B6, C1, C2, C4, C5, C6 | `clone`'s thread flags, `de_thread`, the tid exchange, `MAX_STACKS`; `test_pthread_create_and_join`, `clone_racing_a_group_exit_never_escapes` | 6, 8 |
+| C3 | threads. This issue's PR models every de_thread/timer interleaving listed here against Linux's code before implementation, as a host-tested state machine where practical. | B0, B5, B6, C1, C2, C4, C5, C6 | `clone`'s thread flags, `de_thread`, `process::EXEC_DELAY`, the tid exchange, `MAX_STACKS`; `test_pthread_create_and_join`, `clone_racing_a_group_exit_never_escapes`, `de_thread_refuses_a_racing_group_stop`, `exit_group_during_de_thread_ends_only_itself`, `exit_retargets_signals_and_completes_a_stop` | 6, 8 |
 | C4 | `futex`, robust lists, sleeps | B0, B1, B2, C1, C2 | `FutexKey`, the buckets, the `clear_child_tid` wake; `test_futex_timeouts_and_nanosleep` | 8 |
 | C5 | signal delivery and faults as signals | B0, B1, B2 | frames, `rt_sigreturn`, `sigaltstack`, `kill`/`tkill`/`tgkill`, `rt_sigqueueinfo`; `test_signals_and_sigaltstack` (its `EPERM` check runs two `linux` programs at once) | 5, 6, 8 |
 | C6 | restarts, signal waits, stop and continue | B0, B3, C1, C4, C5 | `pause`, `rt_sigsuspend`/`rt_sigtimedwait`/`rt_sigpending`, `SIGCHLD`, stops; `test_sigchld_and_sigint_interrupt_wait` | 6, 8 |
@@ -4300,7 +4335,7 @@ depends on them.
 | C10 | the console as a tty | C2, C9 | the console's `Tty` and input thread; `test_console_ash_job_control` | 10 |
 | C11 | multithreaded and cross-CPU scenarios | C3, C5, C12 | `test_cross_cpu_munmap_and_mprotect_shootdown`, `test_futex_and_pthread_mutex_stress`, `test_multithreaded_workload_uses_all_cpus` | 5, 6, 15 |
 | C12 | the small syscalls and the census's leftovers | B0, B1, B6, C1, C2 | `FileSystem::statfs`, `RLIMIT_STACK` writes, the per-thread tick counts; `test_small_syscalls` | 6, 8 |
-| C13 | `setitimer`/`alarm`/`getitimer`, POSIX timers (new: not in the epic's first list) | C2, C3, C5, C6 | `TIMERS`, the timers thread, `PendingSignals::discard_if`; `test_interval_and_posix_timers` | 8 |
+| C13 | `setitimer`/`alarm`/`getitimer`, POSIX timers (new: not in the epic's first list). This issue's PR models every de_thread/timer interleaving listed here against Linux's code before implementation, as a host-tested state machine where practical. | C2, C3, C5, C6 | `TIMERS` (keyed by instance), the timers thread, `PendingSignals::discard_if` and `PendingSignals::any`; `test_interval_and_posix_timers` | 8 |
 | D1 | gate: ash scripts and pipelines | C1, C2, C6, C7 | `test_ash_scripts_and_pipelines` | 15 |
 | D2 | gate: gcc/g++ and make | C1–C7, C12 | `mem`'s low-water mark; `low_water_mark_tracks_the_minimum`, `test_gcc_gpp_compile_cpp_and_shared_lib` | 15 |
 | D3 | gate: git, sqlite3, vim over a PTY | C1–C9, C12, C13 | `test_local_git_and_sqlite3`, `test_vim_edits_a_file_over_pty` | 15 |
@@ -4601,7 +4636,7 @@ pub struct SignalState {
     preferred: Option<ThreadSlot>,           // select_target's cursor
     group_exit: Option<ExitStatus>,          // the first one wins
     exec_waiter: Option<u32>,                // the tid in de_thread
-    group_stop: Option<GroupStop>,           // signal, running threads, generation
+    group_stop: Option<GroupStop>,           // signal, threads to park, generation
     timers: Timers,                          // ITIMER_REAL and POSIX timers (C13)
     ctty: Option<Arc<Tty>>,                  // controlling terminal (C9/C10)
     rlimit_stack: u64,                       // for the next execve
@@ -4613,6 +4648,8 @@ pub struct ThreadSignals {
     real_blocked: Option<Blocked>,           // the mask before rt_sigtimedwait
     saved_mask: Option<Blocked>,             // rt_sigsuspend/ppoll/pselect6's
     alt_stack: AltStack,
+    stop_pending: bool,                      // in group_stop's count, not parked
+    stop_dequeued: bool,                     // a stop signal dequeued; SIGCONT clears
 }
 pub struct UserThread {
     tid: AtomicU32,                          // set in PROCS; execve may swap it
@@ -4649,7 +4686,9 @@ pub struct UserThread {
   `UserThread::tid`, atomics stored once in the `PROCS` hold that
   allocates them, before the thread's start gate opens; nothing reads them
   before.
-- `sched::Thread` also gains `sigpending: AtomicBool` (B2), `affinity` and
+- `sched::Thread` also gains `sigpending: AtomicBool` and `fatal_pending:
+  AtomicBool` (B2: Linux's `TIF_SIGPENDING` and `__fatal_signal_pending`,
+  section 8's blocking wait), `affinity` and
   `nice` (B6), and two tick counts, user and system, charged by the timer
   interrupt by the interrupted `CS` (C12). The ticks are counted per
   thread; a process's own totals (`RUSAGE_SELF`) are the sum over its live
@@ -4750,9 +4789,19 @@ and `kill(-1, sig)` skips it.
 `exit` (60) ends the calling thread only (M7 ended the whole process in
 that arm); `exit_group` (231) and a fatal signal end the group:
 
-1. The first of them records `group_exit` under `signal` and kicks every
-   other thread in `threads` (`sigpending`, and `sched::kick` out of an
-   interruptible or killable wait, B2), in the same hold. Each leaves at
+1. The first of them records `group_exit` under `signal`, in a hold that
+   re-checks first, as Linux's `do_group_exit` re-checks under `siglock`:
+   a `group_exit` already recorded wins (this thread takes its status and
+   goes to step 2); an `exec_waiter` naming another thread (`de_thread`,
+   below) sends this thread to step 2 alone, recording nothing and kicking
+   no one (Linux's code 0), even when a fatal signal dequeued before
+   `de_thread`'s hold brought it here: that signal is consumed, Linux's
+   code-0 path, not a gap. Otherwise, in the same hold, it records
+   `group_exit`, clears `group_stop`, `stopped` (waking `stop_wait`) and
+   every thread's `stop_pending` and `stop_dequeued`, its own included,
+   and gives every other thread in `threads` `sigpending`, `fatal_pending`
+   and `sched::kick` (out of an interruptible or killable wait, B2), as
+   `zap_other_threads`. Each leaves at
    its next return-to-user check or interrupted wait, through step 2. A
    thread `clone` and a process `fork` check `group_exit` in the hold that
    links the new thread (below), so none escapes.
@@ -4769,18 +4818,42 @@ that arm); `exit_group` (231) and a fatal signal end the group:
      address space (`sched::detach_user_space()`, which takes the whole
      `UserThreadState`: `kernel_root()` loaded, its `active` bit cleared,
      its `Arc<AddressSpace>` dropped), so a later `teardown`'s "`active`
-     empty" is final;
+     empty" is final. `detach_user_space` zeroes the CPU's
+     `PerCpu::user_exit_rsp` (`kernel/src/sched.rs`), and
+     `unwind_to_kernel` asserts it non-zero and `irq::depth()` 0
+     (`kernel/src/arch/x86_64/syscall.rs`): a thread ending from ring 3
+     (`exit`, `exit_group`, the hook's kill test, a fatal fault) first
+     unwinds to `enter_ring3`'s caller with no lock held, and step 2 runs
+     there, as `user.rs`'s runner already detaches only after
+     `enter_ring3` returns; never before the unwind;
    - adds its tick counts to the process;
    - under `PROCS` then `signal`, in one hold: moves the `preferred`
      cursor off its slot, removes its `ThreadSignals` and `ThreadSlot`
      (`PendingSignals::remove_thread`), its `threads` entry and its tid
      (`remove_thread`, except the leader's), and decrements
      `live_threads`; the thread that takes it to 0 is the last out, a
-     decision made in that same hold. If `exec_waiter` is set and one
-     thread is left, it wakes `exec_wait` (`de_thread`, below).
+     decision made in that same hold. Unless `group_exit` is set, the
+     same hold does what Linux's `exit_signals` does then: a thread marked
+     `stop_pending` clears the mark and lowers the group stop's count
+     (`task_participate_group_stop`), and if that takes it to 0 this exit
+     completes the stop (`ProcTree::stop` and its `StateChange`, acted on
+     as section 6's last parker does, after `signal` is released, still
+     under `PROCS`); and the shared queue's pending signals this thread
+     didn't block are retargeted: each other live thread that doesn't
+     block one of them gets `sigpending` and a non-fatal `kick`, until
+     every such signal has a thread (`retarget_shared_pending`), so a
+     process-directed signal `select_target` aimed at a thread that
+     `de_thread` or `pthread_exit` ends isn't stranded. A caller in
+     `de_thread`'s killable wait isn't woken by that kick and takes the
+     signal at its first return to ring 3, in the new image. If
+     `exec_waiter` is set and one thread is left, it wakes `exec_wait`
+     (`de_thread`, below).
 3. The last thread out ends the process, in thread context:
    - First, with no lock held, a session leader with a controlling
      terminal hangs up its session (C9/C10: section 10's PTYs, "Hangup").
+   - It deletes its timers (C13): under `signal`, each armed one's
+     `TIMERS` entry is removed, before `ProcTree::exit` can free its pid
+     (the entries' keys name it, section 8's timers).
    - It takes `mm`, `files` and `fs` out of the `Process` (each `take()`
      under its leaf lock), lowers the space's `users` (tearing it down at
      0) and the table's `users` (draining it at 0, above), and drops the
@@ -5001,23 +5074,35 @@ untouched):
      `exec_waiter` is set, `-EAGAIN` (Linux's `de_thread`: a concurrent
      exec or a group exit wins). Else set `exec_waiter` to the caller's
      tid (a flag of its own, not `group_exit`, so the caller survives);
-     clear `group_stop` and `stopped` and wake `stop_wait`; and set a
+     clear `group_stop`, `stopped` and every thread's `stop_pending` and
+     `stop_dequeued`, the caller's included (so no mark reaches step 2's
+     count or the new image), and wake `stop_wait`; and set a
      pending `SIGKILL` directly in each other thread's private queue (not
      through the send path, whose group-kill rule would end the caller
-     too), with `sigpending` and `kick`, as Linux's `zap_other_threads`
-     sets `SIGKILL` in each sibling's `pending` and zeroes
-     `group_stop_count`. A sibling in any killable wait (a stop park, a
-     `vfork` wait) wakes, and the syscall-exit hook ends it through exit
-     step 2 alone (section 6). The caller waits on `Process::exec_wait`,
-     killable, until `live_threads` is 1 (Linux's `notify_count`); only a
-     real group exit (a fatal signal sent to the process through the send
-     path, which sets `group_exit`) or a `SIGKILL` sent to the caller
-     itself ends that wait, and the caller with it. Either way the caller
+     too), with `sigpending`, `fatal_pending` (B2) and `kick`, as Linux's
+     `zap_other_threads` zeroes `group_stop_count`, clears
+     `JOBCTL_PENDING_MASK` on the caller and every sibling, and sets
+     `SIGKILL` in each sibling's `pending` with `signal_wake_up(t, 1)`. A
+     sibling in any killable wait (a stop park, a `vfork` wait) wakes, and
+     the syscall-exit hook ends it through exit step 2 alone (section 6).
+     The caller waits on `Process::exec_wait`, killable, until
+     `live_threads` is 1 (Linux's `notify_count`); only a real group exit
+     (a fatal signal sent to the process through the send path, which
+     sets `group_exit`) or a `SIGKILL` sent to the caller itself ends that
+     wait, and the caller with it. Either way the caller
      clears `exec_waiter` under `signal` when its wait ends. If the caller
      isn't the leader it takes the pid as its tid (Linux exchanges the
      tids): in one `PROCS` then `signal` hold, its `PROCS.threads` and
      `SignalState::threads` entries are re-keyed, its `UserThread::tid`
-     stored and its old tid removed.
+     stored and its old tid removed. The interleavings this bullet, exit
+     steps 1 and 2 and section 6's hook and stop list (a stop starting in
+     its two-hold gap, a fatal signal dequeued before this hold, a
+     sibling's `exit_group`, a signal aimed at a sibling this kills, a
+     `vfork` wait) are ktests, with `process::EXEC_DELAY`, a ktest-only
+     delay knob between step 5 and this hold (section 15). This issue's
+     PR models every de_thread/timer interleaving listed here against
+     Linux's code before implementation, as a host-tested state machine
+     where practical.
    - Still on the old address space, as Linux's `exec_mmap` runs
      `mm_exit_exec_release` first: walk the robust list
      (`futex_exit_exec_release` → `exit_robust_list`, C4) and clear its
@@ -5097,7 +5182,7 @@ impl WaitQueue {
     /// The same, but only a fatal signal (SIGKILL, the group's exit) ends it.
     pub fn wait_killable(&self, deadline: Option<u64>, ready: impl FnMut() -> bool) -> Wake;
 }
-pub fn kick(thread: &Thread);             // after setting its `sigpending`
+pub fn kick(thread: &Thread);             // after its `sigpending` (and `fatal_pending`)
 ```
 
 - **Order of the answers:** `ready()` first, under the queue's lock, as
@@ -5111,12 +5196,21 @@ pub fn kick(thread: &Thread);             // after setting its `sigpending`
   to change, as `wait4` reads `child_seq`.
 - **No lost signal:** under the queue's lock the thread pushes itself, sets
   `Blocked` (marked interruptible or killable), and only then reads its
-  `sigpending` (`SeqCst`); a sender stores `sigpending` (`SeqCst`) and then
-  calls `kick`, which moves the thread out of `Blocked` (if it is blocked
-  interruptibly, or killably and the signal is fatal) as a wake does. One
-  of the two sees the other's store: Linux's `set_current_state` before
-  `signal_pending`. Every way out takes the thread's own entries off the
-  queue and its CPU's sleepers, as `wait_until_or_deadline` does.
+  `sigpending` (interruptible) or `fatal_pending` (killable), `SeqCst`; a
+  sender stores `sigpending`, and for a fatal signal `fatal_pending`
+  (`SeqCst`), and then calls `kick`, which moves the thread out of
+  `Blocked` (if it is blocked interruptibly, or killably and its
+  `fatal_pending` is set) as a wake does. One of the two sees the other's
+  store: Linux's `set_current_state` before `signal_pending`. Every way
+  out takes the thread's own entries off the queue and its CPU's
+  sleepers, as `wait_until_or_deadline` does.
+- **`fatal_pending`** is Linux's `__fatal_signal_pending` (`SIGKILL` in
+  the thread's own queue), which `signal_wake_up(t, 1)` pairs with a
+  `TASK_WAKEKILL` wake: `kick` alone can't tell that a `SIGKILL` set
+  straight in a private queue (`de_thread`'s) is fatal. It is set by the
+  send path's group-kill rule (section 6), exit step 1 (C1) and
+  `de_thread` (C3) on each thread they end, before the kick, and is never
+  cleared: a thread with it set never returns to ring 3.
 - **`sigpending`** means "look at the pending signals" (Linux's
   `TIF_SIGPENDING`): a sender sets it on a thread that doesn't block the
   signal (`select_target`'s choice for a process-wide signal), and for a
@@ -5155,6 +5249,11 @@ pub fn kick(thread: &Thread);             // after setting its `sigpending`
   ktest-only delay knob, `sched::BLOCK_DELAY`, stalls the waiter between
   setting `Blocked` and reading `sigpending` while another CPU kicks; it
   kills the mutant that reads `sigpending` before setting `Blocked`),
+  `ktest:lumen_kernel::sched::fatal_kick_racing_a_killable_block_is_never_lost`
+  (the same knob, a `wait_killable` and a kick after `fatal_pending` with
+  no `group_exit`, as `de_thread` gives: it kills the mutant that reads
+  `fatal_pending` before setting `Blocked` and the one whose `kick`
+  judges a signal fatal by `group_exit` alone),
   `ktest:lumen_kernel::sched::wait_killable_ignores_a_non_fatal_kick`,
   `ktest:lumen_kernel::linux::syscall::lock::setlkw_is_interrupted_by_a_signal`
   and `ktest:lumen_kernel::linux::syscall::restart_with_no_handler_restarts_or_resumes`
@@ -5269,16 +5368,42 @@ it with `SIGEV_THREAD_ID`). vim 9.1's `start_timeout` prints an error
 would put an error on D3's screen: M8 implements them, as C13 (after C3
 and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
 
-- **State:** a process's `SignalState::timers` holds `ITIMER_REAL` and up
-  to 32 POSIX timers (`PosixTimer { clock, target: Process | Thread(tid),
-  signal, sival, interval_ns, deadline, generation, overrun, queued }`).
+- **State:** a process's `SignalState::timers` holds `ITIMER_REAL`, up
+  to 32 POSIX timers (`PosixTimer { clock, notify, signal, sival,
+  interval_ns, deadline, instance, overrun, overrun_last }`) and
+  `next_instance: u64`. `notify` is the `sigevent`'s mode,
+  `TimerNotify::{Process, Thread(tid), None}`: `SIGEV_SIGNAL` is
+  `Process`, and so is a raw `SIGEV_THREAD`, which Linux's `good_sigevent`
+  accepts with `SIGEV_SIGNAL` (musl never passes it: its `timer_create`
+  turns `SIGEV_THREAD` into `SIGEV_THREAD_ID` aimed at its helper);
+  `SIGEV_THREAD_ID` is `Thread`, `SIGEV_NONE` `None`.
   POSIX timers are deleted at `execve` and exit; `ITIMER_REAL` only at
   exit. `timer_delete` (and `execve`) discards the timer's queued
-  `SI_TIMER` signal, which needs a lumen-signal addition, C13's:
+  `SI_TIMER` signal, and an expiry asks whether it is still queued, which
+  need two lumen-signal additions, C13's:
   `PendingSignals::discard_if(|info| ...)`, removing queued entries a
-  predicate picks (host-tested in `cargo:lumen-signal`).
-- **Expiry:** each armed timer has an entry in `TIMERS`, a kernel-wide
-  `SpinLock<BTreeMap<(deadline, key), (Weak<Process>, generation)>>`,
+  predicate picks, and `PendingSignals::any(|info| ...)`, whether a queued
+  entry matches (both host-tested in `cargo:lumen-signal`).
+- **Instances:** every `timer_settime`, `setitimer`, `alarm` and delete
+  replaces the timer's `instance`: an arming with a fresh one from the
+  process's `next_instance`, never reused (so a deleted timer's id taken
+  again by `timer_create` starts on a new instance too), a disarm or
+  delete with none, so an entry already in the timers thread's list no
+  longer matches, as Linux's `timer_settime` and `timer_delete` bump
+  `it_signal_seq`; the timers thread's periodic re-arm keeps it. A
+  `timer_settime` also discards the timer's queued `SI_TIMER` signal
+  (`discard_if`) and zeroes `overrun` and `overrun_last`, as Linux drops
+  the old setting's signal at delivery (`__posixtimer_deliver_signal`'s
+  `it_signal_seq != it_sigqueue_seq`) and `posix_timer_set_common` resets
+  the overrun count (a deviation in one corner: Linux's `rt_sigpending`
+  still shows that signal until a dequeue drops it). `TIMERS` is keyed
+  `(deadline, pid, instance)`: unique, since an instance is never reused
+  within a process and exit step 3 removes a process's entries before its
+  pid can be freed. A disarm, re-arm or delete removes the timer's current entry
+  (its key known from the timer) under `signal`, then `TIMERS`.
+- **Expiry:** each armed timer but a `SIGEV_NONE` one has an entry in
+  `TIMERS`, a kernel-wide `SpinLock<BTreeMap<(deadline, pid, instance),
+  (Weak<Process>, TimerId)>>` (`TimerId`: `Real` or a POSIX timer's id),
   whose earliest deadline is also kept in an atomic. The boot CPU's timer
   tick compares that atomic with `now_ns` (one load) and, once it has
   passed, wakes the `timers` kernel thread; no signal is sent from the
@@ -5287,21 +5412,55 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
   entry's `Weak<Process>` (a process gone is skipped, the `Arc` dropped
   outside every `SpinLock`). It then sends through the send path's timer
   variant, all in that path's one `PROCS` then `signal` hold, as Linux's
-  `posixtimer_send_sigqueue` works under one `siglock` hold: first the
-  check, that the timer's `generation` still matches the entry's (a
-  `timer_settime` or `timer_delete` bumps it, so a re-armed or deleted
-  timer's stale entry does nothing) and that its signal isn't still
-  `queued` (an overrun instead); then the ordinary send (section 6, which
-  handles `SIGCONT`, `SIGSTOP` and `SIGKILL` as any sender's) of the
-  timer's `SigInfo` (`SI_TIMER` with `si_timerid` and `si_value`;
-  `SI_KERNEL` for `ITIMER_REAL`'s `SIGALRM`, as Linux's `it_real_fn`);
-  then the update: `queued` set only on `Enqueued::Queued` (`Coalesced`,
-  `Full` and `NoMemory` count as a lost expiry, as Linux's `legacy_queue`
-  drops a second standard signal), and a periodic timer re-armed by its
-  interval (skipped periods counted as overruns, as Linux's
-  `hrtimer_forward`).
-  Dequeuing an `SI_TIMER` signal clears `queued` and fills `si_overrun`,
-  which `timer_getoverrun` then reports.
+  `posixtimer_send_sigqueue` works under one `siglock` hold, in this
+  order:
+  1. The check: the timer at that `TimerId` still has the entry's
+     `instance`. If not (re-armed, disarmed or deleted since), the entry
+     is stale and nothing else happens; this is the only branch that
+     skips the re-arm.
+  2. For a POSIX timer, whether its `SI_TIMER` signal (that `si_timerid`)
+     is still queued, asked of the queue itself (`PendingSignals::any`),
+     as `posixtimer_send_sigqueue` asks `list_empty(&q->list)`: if it is,
+     no send and `overrun` + 1. Otherwise the ordinary send (section 6,
+     which handles `SIGCONT`, `SIGSTOP` and `SIGKILL` as any sender's) of
+     the timer's `SigInfo` (`SI_TIMER` with `si_timerid` and `si_value`),
+     to the process or, for `Thread(tid)`, that thread. `ITIMER_REAL`
+     skips the question: a plain send of `SI_KERNEL` `SIGALRM` each
+     expiry, as Linux's `it_real_fn` calls `kill_pid_info`, a standard
+     signal that coalesces in the queue. With no flag of its own to
+     clear, nothing is left stuck by a signal discarded otherwise (a
+     disposition changed to `SIG_IGN`, `timer_delete`, `execve`).
+  3. The update and re-arm, before the target's `signal` is released: an
+     enqueue the queue refused (`Coalesced`: the same standard signal
+     already pending from another sender; `Full`; `NoMemory`) counts as
+     an overrun, a deviation, since Linux queues a timer's preallocated
+     `sigqueue` past `legacy_queue` and the queue limit
+     (`posixtimer_queue_sigqueue`); then a periodic timer is re-armed by
+     its interval in every branch but a stale entry's, the periods it
+     skipped counted as overruns.
+  4. With the target's `signal` released and `PROCS` still held, the
+     send's `StateChange` (a `SIGCONT` timer's `CLD_CONTINUED`) is acted
+     on as any sender's.
+
+  Re-arming at expiry is Lumen's mechanism: Linux leaves an expired
+  periodic timer stopped (`POSIX_TIMER_REQUEUE_PENDING`, and `ITIMER_REAL`
+  likewise) and re-arms it when its signal is dequeued
+  (`__posixtimer_deliver_signal`'s `timer_rearm`,
+  `posixtimer_rearm_itimer`), forwarding past the periods it missed. What
+  Lumen keeps of Linux's is the count user space sees: dequeuing an
+  `SI_TIMER` signal moves the timer's `overrun` (the expiries after the
+  one that queued it) into `si_overrun` and `overrun_last` and resets it
+  to 0; `timer_getoverrun` reports `overrun_last`, clamped to `INT_MAX`,
+  as Linux's `it_overrun_last`, which only a delivery sets and
+  `timer_settime` resets to 0.
+- **`SIGEV_NONE`:** such a timer has no `TIMERS` entry and never sends, as
+  Linux's `common_timer_set` never starts its hrtimer ("SIGEV_NONE timers
+  are not queued"); `timer_gettime` works its state out from the clock,
+  as `common_timer_get` does: a periodic one's deadline moved forward by
+  whole intervals past now (the skipped ones added to `overrun`, which no
+  delivery reports), so its `it_value` is above 0; an expired one-shot
+  reports 0. `timer_getoverrun` on it is 0, since only a delivery sets
+  `overrun_last`.
 - **Clocks:** deadlines are `CLOCK_MONOTONIC` nanoseconds; a
   `CLOCK_REALTIME` absolute time is converted when the timer is armed (a
   later change of the realtime clock doesn't move it: a deviation, as for
@@ -5312,6 +5471,10 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
   exempt a thread's `real_blocked` set from the ignored-drop and the
   group-kill shortcut, so the expiry reaches the helper and kills
   nothing.
+
+This issue's PR models every de_thread/timer interleaving listed here
+against Linux's code before implementation, as a host-tested state machine
+where practical.
 
 Tested by `scenario:test_linux_proc::test_interval_and_posix_timers`
 (section 15).
@@ -10305,8 +10468,8 @@ and 10—never carrying forward stale `"passing"` rows from an older `STATUS.md`
   checks only once the issues they need have merged; every tag below names
   an issue that depends, in the issue table, on everything its checks
   need. So C3 comes after C4 (`pthread_join` needs C4's `clear_child_tid`
-  wake), C5 and C6 (`de_thread`'s `SIGKILL` and a stopped sibling); C8
-  after C3 (non-leader tids); C11 after C5 and C12 (`SIGSEGV`,
+  wake), C5 and C6 (`de_thread`'s `SIGKILL` and its ktests' group
+  stops); C8 after C3 (non-leader tids); C11 after C5 and C12 (`SIGSEGV`,
   `sched_setaffinity`, `getcpu`); and the checks of C1's scenario that
   need signals, `rusage` or groups are tagged C6, C12, C8 and C9, not C1.
 
@@ -10390,11 +10553,13 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   cleared alternate stack (C6); from a process with threads (C3): a
   non-leader's `execve` taking the pid, the new image running, every
   other thread gone and the process not killed (its later exit status the
-  new image's); a sibling stopped by `SIGSTOP` before the `execve` exiting
-  too, and the new image not stopped; a sibling's own `exit_group` during
-  the `execve` ending only that sibling; two threads `execve`ing at once
-  with exactly one image running; POSIX timers deleted and an `alarm`
-  surviving (C13).
+  new image's); two threads `execve`ing at once with exactly one image
+  running, whichever wins; POSIX timers deleted and an `alarm` surviving
+  (C13). A scenario checks only what user space can force: the orderings
+  of a stop or an `exit_group` against `de_thread` are the C3 ktests
+  below, since a stopped sibling stops its whole group, the `execve`
+  caller too, and nothing in user space can place an `exit_group` inside
+  `de_thread`.
 - `scenario:test_linux_proc::test_pthread_create_and_join` (C3): the clone
   flag matrix's `EINVAL` order, `CLONE_THREAD` without `CLONE_FILES` or
   `CLONE_FS` included; `CLONE_SETTLS` with `tls >= USER_MAX` `EPERM`;
@@ -10408,7 +10573,33 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   (a delay knob between the clone's allocations and its hold, while
   another thread calls `exit_group`: the clone is `-EINTR` or its thread
   is killed; and `-ERESTARTNOINTR` with a `group_stop` and with an
-  `exec_waiter`).
+  `exec_waiter`), and three ktests whose `execve` stalls at
+  `process::EXEC_DELAY`, a ktest-only knob between step 5 and
+  `de_thread`'s hold:
+  - `ktest:lumen_kernel::linux::process::de_thread_refuses_a_racing_group_stop`:
+    a sibling's `SIGTSTP` stalled in its two-hold gap (a second knob,
+    `signal::STOP_GAP_DELAY`, between the orphan check and the hold that
+    starts the stop) while `de_thread` runs: the stop refused, the sibling
+    ended and the new image not stopped; a `SIGCONT` sent in the gap
+    instead: no stop; a stop completed before `de_thread`: cleared by it,
+    the new image not stopped. It kills the mutants without the
+    `exec_waiter` refusal, without the `stop_dequeued` check, and with
+    `de_thread` leaving `group_stop` set.
+  - `ktest:lumen_kernel::linux::process::exit_group_during_de_thread_ends_only_itself`:
+    exit step 1 run by a sibling with `exec_waiter` set directly (as a
+    fatal signal dequeued before `de_thread`'s hold, or an `exit_group`,
+    reaches it): no `group_exit` recorded, only the sibling ended, the
+    caller's `execve` succeeding; a sibling in a `vfork` wait ended by
+    `de_thread`'s kick, the caller's wait ending under an outer limit. It
+    kills the mutants without step 1's re-check and without `de_thread`'s
+    `fatal_pending`.
+  - `ktest:lumen_kernel::linux::process::exit_retargets_signals_and_completes_a_stop`:
+    a process-directed signal `select_target` aimed at a thread that then
+    ends (through `exit`, and killed by `de_thread`) taken by another
+    thread, the `execve` caller included once in its new image; the last
+    unparked thread of a group stop exiting, completing the stop (the
+    parent's `CLD_STOPPED`). It kills the mutants without step 2's
+    retarget and without its `stop_pending` count.
 - `scenario:test_linux_proc::test_futex_timeouts_and_nanosleep` (C4):
   timed waits lasting at least their timeout; wakes, requeues and bitsets,
   each looped until the expected count; private and shared ops on one
@@ -10472,14 +10663,21 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   after the hook, the restart block's deadline unchanged), since a
   scenario can't tell a restart from a long wait.
 - `scenario:test_linux_proc::test_interval_and_posix_timers` (C13):
-  `alarm` and `setitimer` floors; `timer_create` with each notification
-  (`SIGEV_SIGNAL`, `SIGEV_THREAD_ID`, `SIGEV_NONE`, and musl's
-  `SIGEV_THREAD`, the process surviving each expiry); `timer_settime`
-  absolute and relative, a re-armed timer firing no earlier than its new
-  deadline; the 33rd timer `EAGAIN`; `timer_getoverrun` after a blocked
-  signal; `timer_delete` discarding the pending signal, and a deleted
-  timer sending nothing for twice its old interval; `fork` inheriting no
-  timer.
+  `alarm` and `setitimer` floors; a periodic `ITIMER_REAL` delivering a
+  third `SIGALRM` after its first two were handled; `timer_create` with
+  each notification (`SIGEV_SIGNAL`, `SIGEV_THREAD_ID`, `SIGEV_NONE`, and
+  musl's `SIGEV_THREAD`, the process surviving each expiry); a
+  `SIGEV_NONE` timer sending nothing while a `SIGEV_SIGNAL` timer with the
+  same deadline fired (the positive control), its `timer_gettime`
+  reporting 0 once a one-shot has expired and, periodic, an `it_value`
+  above 0 and at most its interval, and `timer_getoverrun` 0;
+  `timer_settime` absolute and relative, a re-armed timer firing no
+  earlier than its new deadline; a new timer taking a deleted one's id
+  firing no earlier than its own deadline; the 33rd timer `EAGAIN`;
+  `timer_getoverrun` after a blocked signal; a periodic timer whose queued
+  signal a `SIG_IGN` disposition discarded firing again once a handler is
+  set; `timer_delete` discarding the pending signal, and a deleted timer
+  sending nothing for twice its old interval; `fork` inheriting no timer.
 - `scenario:test_linux_proc::test_sessions_and_process_groups` (C8): each
   call's success and errno cases, `getpgid` and `kill` with a non-leader
   tid `ESRCH`, `kill` of a group. `is_busy` counting tids (and so
