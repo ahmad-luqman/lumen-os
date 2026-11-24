@@ -18,10 +18,11 @@
 # functions only, none of which makes a syscall: ten from lib/c/*.zig (strcmp,
 # strncmp, strlen, strcasecmp, strncasecmp and their _l forms, bzero, abs,
 # labs, llabs, imaxabs), and from compiler_rt memcpy, memmove and part of libm
-# (the sin, cos, tan, sincos, floor and fabs families). A dynamic binary takes
+# (sin, cos, tan and sincos in double and float; the floor and fabs families). A dynamic binary takes
 # the lib/c ones from Alpine's musl at run time.
 # 0.16.0 (2026-04-13) and 0.17.x replace kernel-facing parts of musl with zig's
-# own for musl targets (their lib/c.zig adds malloc, fcntl, sys/file, sys/mman:
+# own for musl targets (their lib/c.zig adds malloc, fcntl.h's fallocate and
+# posix_fadvise, sys/file, sys/mman:
 # mprotect, madvise, ...; sys/utsname: uname; unistd: close, access, chdir,
 # dup, pipe, execve, ...), which would leave a libc-test failure in Lumen
 # ambiguous between Lumen and zig's libc. Bump deliberately, in its own PR, and
@@ -73,7 +74,8 @@ fi
 # Everything happens in a fresh directory beside the old one, which is
 # replaced only once the new one is checked, so a failed or interrupted run
 # leaves the previous zig (or nothing) and never a stamp over a broken tree,
-# and two runs at once don't share files.
+# and two runs at once don't share files. A run killed outright (SIGKILL,
+# power loss) leaves its build/deps/zig.tmp.* behind; delete those by hand.
 echo "fetch-zig: downloading zig $ZIG_VERSION for $HOST (about 50 MB)"
 mkdir -p "$DEPS"
 WORK=$(mktemp -d "$DEPS/zig.tmp.XXXXXX")
@@ -101,10 +103,13 @@ if [[ "$REPORTED" != "$ZIG_VERSION" ]]; then
     echo "fetch-zig: the downloaded zig reports version '$REPORTED', expected $ZIG_VERSION" >&2
     exit 1
 fi
-if ! grep -q "\"$MUSL_VERSION\"" "$NEW/$MUSL_H" 2>/dev/null; then
+if ! grep -qF "\"$MUSL_VERSION\"" "$NEW/$MUSL_H" 2>/dev/null; then
     echo "fetch-zig: zig $ZIG_VERSION's bundled musl isn't $MUSL_VERSION ($MUSL_H)" >&2
     exit 1
 fi
 echo "$STAMP" > "$NEW/.version"
-rm -rf "$DIR"
+# Rename the old tree aside (the trap deletes it) so the swap is two renames.
+if [[ -e "$DIR" ]]; then
+    mv "$DIR" "$WORK/old"
+fi
 mv "$NEW" "$DIR"
