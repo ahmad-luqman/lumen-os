@@ -1,0 +1,6 @@
+# Features: futex wait queues. See tests/features/README.md for the format.
+
+[[feature]]
+name = "Futex wait queues (logic)"
+milestone = "M8"
+tests = ["cargo:lumen-futex"]
