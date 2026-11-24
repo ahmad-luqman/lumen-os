@@ -4,10 +4,9 @@
 //! 256 bytes, or the whole file if shorter, as `prepare_binprm`'s `kernel_read`
 //! does. A short read before EOF would defeat the interpreter truncation check.
 
-use alloc::{collections::TryReserveError, vec::Vec};
 use core::fmt;
 
-use crate::{Errno, args::normalize_argv};
+use crate::Errno;
 
 /// Linux's executable header window (`include/uapi/linux/binfmts.h`).
 pub const BINPRM_BUF_SIZE: usize = 256;
@@ -19,7 +18,10 @@ pub const BINPRM_BUF_SIZE: usize = 256;
 /// Five scripts followed by a binary fit; six scripts followed by a binary do not.
 pub const MAX_NESTING: usize = 5;
 
-/// A nonempty interpreter and at most one argument borrowed from the header.
+/// An interpreter and at most one argument borrowed from the header.
+/// The interpreter may be empty only on the NUL/EOF path; [`Self::open_error`]
+/// reports that after budgeting. If whitespace trimming reaches `#!` itself
+/// (including NUL/EOF at byte 255), parsing instead returns ENOEXEC.
 ///
 /// Neither field contains NUL/newline or leading space/tab. An argument may
 /// be empty or retain trailing space/tab on the NUL/EOF path. Quotes are literal.
@@ -38,12 +40,25 @@ impl<'a> Shebang<'a> {
     pub const fn argument(&self) -> Option<&'a [u8]> {
         self.argument
     }
+
+    /// The error from opening this interpreter, if known without filesystem I/O.
+    ///
+    /// Caller sequence: [`crate::args::ArgBudget::rewrite`], the kernel's ENOENT
+    /// check for PATH_INACCESSIBLE, this check, then opening the interpreter.
+    /// This defers empty-path EACCES until after E2BIG/ENOMEM. Linux itself
+    /// checks PATH_INACCESSIBLE before copying; exact ENOENT precedence requires
+    /// that kernel precheck before rewrite as well.
+    pub const fn open_error(&self) -> Option<ShebangError> {
+        if self.interpreter.is_empty() { Some(ShebangError::EmptyInterpreterPath) } else { None }
+    }
 }
 
 /// Why a script's interpreter cannot be selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShebangError {
-    /// No interpreter before a newline, or an all-space/tab full window: ENOEXEC.
+    /// No interpreter remains before the newline/byte-255 trim endpoint: ENOEXEC.
+    /// This includes `#!` followed by whitespace through byte 254, even when
+    /// byte 255 is NUL or EOF padding.
     EmptyInterpreter,
     /// The interpreter name has no terminator in the header window: ENOEXEC.
     TruncatedInterpreter,
@@ -74,8 +89,11 @@ impl fmt::Display for ShebangError {
 fn space_tab(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
 }
-fn trim_start(bytes: &[u8]) -> &[u8] {
-    &bytes[bytes.iter().take_while(|&&b| space_tab(b)).count()..]
+fn skip_space_tab(bytes: &[u8], from: usize) -> usize {
+    from + bytes[from..].iter().take_while(|&&b| space_tab(b)).count()
+}
+fn terminator(byte: u8) -> bool {
+    byte == 0 || space_tab(byte)
 }
 fn trim_end(bytes: &[u8]) -> &[u8] {
     &bytes[..bytes.iter().rposition(|&b| !space_tab(b)).map_or(0, |i| i + 1)]
@@ -91,8 +109,9 @@ fn trim_end(bytes: &[u8]) -> &[u8] {
 /// the optional argument runs to NUL and can be empty. Byte 255 is always
 /// reserved for termination when no newline was found.
 ///
-/// Unlike the issue's simplified ENOEXEC rule, an empty NUL/EOF interpreter
-/// path is [`ShebangError::EmptyInterpreterPath`] (EACCES).
+/// An empty NUL/EOF interpreter is returned for budgeting before its
+/// [`Shebang::open_error`] (EACCES) is checked. Whitespace through byte 254,
+/// followed by NUL or EOF at byte 255, is trimmed away and yields ENOEXEC.
 pub fn parse(head: &[u8]) -> Result<Option<Shebang<'_>>, ShebangError> {
     let head = &head[..head.len().min(BINPRM_BUF_SIZE)];
     if !head.starts_with(b"#!") {
@@ -100,67 +119,36 @@ pub fn parse(head: &[u8]) -> Result<Option<Shebang<'_>>, ShebangError> {
     }
     let mut padded = [0; BINPRM_BUF_SIZE];
     padded[..head.len()].copy_from_slice(head);
-    let end = match padded.iter().position(|&b| matches!(b, 0 | b'\n')) {
-        Some(i) if padded[i] == b'\n' => i,
-        _ => {
-            let name = trim_start(&padded[2..]);
-            if name.is_empty() {
-                return Err(ShebangError::EmptyInterpreter);
-            }
-            if !name.iter().any(|&b| b == 0 || space_tab(b)) {
-                return Err(ShebangError::TruncatedInterpreter);
-            }
-            BINPRM_BUF_SIZE - 1
+    let end = if let Some(i) = padded.iter().take_while(|&&b| b != 0).position(|&b| b == b'\n') {
+        i
+    } else {
+        let start = skip_space_tab(&padded, 2);
+        if start == padded.len() {
+            return Err(ShebangError::EmptyInterpreter);
         }
+        if !padded[start..].iter().copied().any(terminator) {
+            return Err(ShebangError::TruncatedInterpreter);
+        }
+        BINPRM_BUF_SIZE - 1
     };
-    let line = trim_end(&padded[2..end]);
-    let name = trim_start(line);
-    if name.is_empty() {
+    let end = trim_end(&padded[..end]).len();
+    let start = skip_space_tab(&padded[..end], 2);
+    if start == end {
         return Err(ShebangError::EmptyInterpreter);
     }
-    let start = 2 + line.len() - name.len();
-    let split = name.iter().position(|&b| b == 0 || space_tab(b)).unwrap_or(name.len());
-    if split == 0 {
-        return Err(ShebangError::EmptyInterpreterPath);
-    }
-    let argument = if name.get(split).is_some_and(|&b| space_tab(b)) {
-        let rest = trim_start(&name[split..]);
-        if rest.is_empty() {
+    let split = (start..end).find(|&i| terminator(padded[i])).unwrap_or(end);
+    let argument = if split < end && space_tab(padded[split]) {
+        let arg_start = skip_space_tab(&padded[..end], split);
+        if arg_start == end {
             None
         } else {
-            let arg_start = start + name.len() - rest.len();
-            let len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-            Some(&head[arg_start..arg_start + len])
+            let arg_end = (arg_start..end).find(|&i| padded[i] == 0).unwrap_or(end);
+            Some(&head[arg_start..arg_end])
         }
     } else {
         None
     };
-    Ok(Some(Shebang { interpreter: &head[start..start + split], argument }))
-}
-
-/// Borrow `[interpreter, argument?, script_path, original[1..]...]`.
-///
-/// Empty original argv is normalized first; its synthetic first argument is
-/// replaced too. Only the pointer vector is allocated, fallibly (map allocation
-/// failure to ENOMEM). Charge the strings with [`crate::args::ArgBudget::rewrite`].
-#[must_use = "allocation failure must be handled"]
-pub fn argv<'a>(
-    sh: &Shebang<'a>,
-    script_path: &'a [u8],
-    original: &'a [&'a [u8]],
-) -> Result<Vec<&'a [u8]>, TryReserveError> {
-    let original = normalize_argv(original);
-    let mut result = Vec::new();
-    // A real slice's length cannot approach usize::MAX; normalization also
-    // reserves three slots when an empty original has an optional argument.
-    result.try_reserve_exact(original.len() + 2)?;
-    result.push(sh.interpreter);
-    if let Some(argument) = sh.argument {
-        result.push(argument);
-    }
-    result.push(script_path);
-    result.extend_from_slice(&original[1..]);
-    Ok(result)
+    Ok(Some(Shebang { interpreter: &head[start..split], argument }))
 }
 
 /// Handling the next interpreter would exceed Linux's exec loop depth: ELOOP.
@@ -179,13 +167,33 @@ impl fmt::Display for NestingLimit {
     }
 }
 
-/// Interpreter substitutions followed during one exec; cannot be copied.
+/// Interpreter substitutions followed during one exec; cannot be cloned,
+/// copied, or reset via `mem::take`.
+///
+/// ```compile_fail
+/// use lumen_elf::shebang::Nesting;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<Nesting>();
+/// ```
+///
+/// ```compile_fail
+/// use lumen_elf::shebang::Nesting;
+/// fn requires_copy<T: Copy>() {}
+/// requires_copy::<Nesting>();
+/// ```
+///
+/// ```compile_fail
+/// use lumen_elf::shebang::Nesting;
+/// let mut nesting = Nesting::new();
+/// let _ = core::mem::take(&mut nesting);
+/// ```
 #[must_use]
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Nesting {
     depth: usize,
 }
 
+#[expect(clippy::new_without_default, reason = "Default would let mem::take reset an exec's nesting depth")]
 impl Nesting {
     /// Start an exec with no interpreter substitutions.
     pub const fn new() -> Self {
@@ -214,7 +222,9 @@ impl Nesting {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
+
+    const ALPHABET: [u8; 6] = [0, b' ', b'\t', b'\n', b'\r', b'x'];
 
     fn assert_parse(head: &[u8], interpreter: &[u8], argument: Option<&[u8]>) {
         assert_eq!(parse(head), Ok(Some(Shebang { interpreter, argument })));
@@ -283,8 +293,10 @@ mod tests {
     #[test]
     fn parse_empty_nul_or_eof_interpreter_is_eacces() {
         for head in [b"#!".as_slice(), b"#! \t", b"#!\0sh", b"#! \t\0sh"] {
-            assert_eq!(parse(head), Err(ShebangError::EmptyInterpreterPath));
-            assert_eq!(parse(head).unwrap_err().errno(), Errno::Access);
+            let sh = parse(head).unwrap().unwrap();
+            assert_eq!(sh.interpreter(), b"");
+            assert_eq!(sh.open_error(), Some(ShebangError::EmptyInterpreterPath));
+            assert_eq!(sh.open_error().unwrap().errno(), Errno::Access);
         }
     }
 
@@ -293,7 +305,7 @@ mod tests {
         assert_parse(b"#!/bin/sh", b"/bin/sh", None);
         let mut head = vec![b'x'; BINPRM_BUF_SIZE - 1];
         head[..2].copy_from_slice(b"#!");
-        assert_parse(&head, &head[2..], None); // Short read: implicit EOF/NUL.
+        assert_parse(&head, &head[2..], None); // 255-byte file: byte 255 is EOF padding.
         head.push(b'\n'); // A newline at byte 255 fits in the header.
         assert_parse(&head, &head[2..255], None);
         head.extend_from_slice(b"ignored");
@@ -303,6 +315,24 @@ mod tests {
         assert_eq!(parse(&head), Err(ShebangError::TruncatedInterpreter));
         head[255] = 0;
         assert_parse(&head, &head[2..255], None);
+    }
+
+    #[test]
+    fn parse_nul_at_byte_255_preserves_trim_endpoint() {
+        let mut head = [b' '; 256];
+        head[..2].copy_from_slice(b"#!");
+        for i in (2..255).step_by(2) {
+            head[i] = b'\t';
+        }
+        assert_eq!(parse(&head[..255]), Err(ShebangError::EmptyInterpreter));
+        head[255] = 0;
+        assert_eq!(parse(&head), Err(ShebangError::EmptyInterpreter));
+        let sh = parse(&head[..254]).unwrap().unwrap();
+        assert_eq!(sh.interpreter(), b"");
+        assert_eq!(sh.open_error(), Some(ShebangError::EmptyInterpreterPath));
+        check_properties(&head[..254]);
+        check_properties(&head[..255]);
+        check_properties(&head);
     }
 
     #[test]
@@ -334,42 +364,10 @@ mod tests {
     }
 
     #[test]
-    fn argv_with_and_without_optional_argument() {
-        let original: &[&[u8]] = &[b"discarded", b"one", b"", b"two\xff"];
-        let sh = parse(b"#!/bin/interp\n").unwrap().unwrap();
-        assert_eq!(
-            argv(&sh, b"script path", original).unwrap(),
-            [b"/bin/interp".as_slice(), b"script path", b"one", b"", b"two\xff"]
-        );
-        let sh = parse(b"#!/bin/interp -a -b\n").unwrap().unwrap();
-        assert_eq!(
-            argv(&sh, b"script path", original).unwrap(),
-            [b"/bin/interp".as_slice(), b"-a -b", b"script path", b"one", b"", b"two\xff"]
-        );
-        let sh = parse(b"#!/bin/interp ").unwrap().unwrap();
-        assert_eq!(
-            argv(&sh, b"script path", original).unwrap(),
-            [b"/bin/interp".as_slice(), b"", b"script path", b"one", b"", b"two\xff"]
-        );
-    }
-
-    #[test]
-    fn argv_with_empty_original() {
-        let plain = parse(b"#!/bin/sh\n").unwrap().unwrap();
-        let option = parse(b"#!/bin/sh -e\n").unwrap().unwrap();
-        let empty_option = parse(b"#!/bin/sh ").unwrap().unwrap();
-        assert_eq!(argv(&plain, b"script", &[]).unwrap(), [b"/bin/sh".as_slice(), b"script"]);
-        assert_eq!(argv(&plain, b"script", &[b""]).unwrap(), [b"/bin/sh".as_slice(), b"script"]);
-        assert_eq!(argv(&option, b"script", &[]).unwrap(), [b"/bin/sh".as_slice(), b"-e", b"script"]);
-        assert_eq!(argv(&option, b"script", &[b""]).unwrap(), [b"/bin/sh".as_slice(), b"-e", b"script"]);
-        assert_eq!(argv(&empty_option, b"script", &[]).unwrap(), [b"/bin/sh".as_slice(), b"", b"script"]);
-    }
-
-    #[test]
     fn nesting_accepts_limit_and_rejects_next() {
         assert_eq!(MAX_NESTING, 5);
         let mut nesting = Nesting::new();
-        assert_eq!(nesting, Nesting::default());
+        assert_eq!(nesting.depth(), 0);
         for depth in 1..=MAX_NESTING {
             assert_eq!(nesting.follow_interpreter(), Ok(()));
             assert_eq!(nesting.depth(), depth);
@@ -461,9 +459,6 @@ mod tests {
         }
         let cstr = |start| buf[start..].iter().copied().take_while(|&b| b != 0).collect::<Vec<_>>();
         let interpreter = cstr(name);
-        if interpreter.is_empty() {
-            return Err(ShebangError::EmptyInterpreterPath);
-        }
         Ok(Some((interpreter, arg.map(cstr))))
     }
 
@@ -475,7 +470,10 @@ mod tests {
             let separator = |b: &u8| matches!(b, b' ' | b'\t');
             let newline = head.iter().take(256).take_while(|&&b| b != 0).any(|&b| b == b'\n');
             assert!(head.starts_with(b"#!"));
-            assert!(!sh.interpreter().is_empty());
+            assert_eq!(sh.open_error(), sh.interpreter().is_empty().then_some(ShebangError::EmptyInterpreterPath));
+            if newline {
+                assert!(!sh.interpreter().is_empty());
+            }
             assert!(!sh.interpreter().iter().any(separator));
             for value in core::iter::once(sh.interpreter()).chain(sh.argument()) {
                 assert!(!value.iter().any(|b| matches!(b, 0 | b'\n')));
@@ -492,17 +490,16 @@ mod tests {
 
     #[test]
     fn parse_matches_linux_for_all_short_headers() {
-        let alphabet = [0, b' ', b'\t', b'\n', b'\r', b'x'];
         let mut checked = 0;
-        // Includes every 7-byte `#!` header over the syntax alphabet
-        // (alphabet.len().pow(5)), and all other lengths from 2 through 9.
+        // Includes every 7-byte `#!` header over the syntax ALPHABET
+        // (ALPHABET.len().pow(5)), and all other lengths from 2 through 9.
         for len in 2..=9 {
-            for pattern in 0..alphabet.len().pow((len - 2) as u32) {
+            for pattern in 0..ALPHABET.len().pow((len - 2) as u32) {
                 let mut head = *b"#!xxxxxxx";
                 let mut value = pattern;
                 for byte in &mut head[2..len] {
-                    *byte = alphabet[value % alphabet.len()];
-                    value /= alphabet.len();
+                    *byte = ALPHABET[value % ALPHABET.len()];
+                    value /= ALPHABET.len();
                 }
                 check_properties(&head[..len]);
                 checked += 1;
@@ -512,8 +509,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_matches_linux_for_full_window_tails() {
+        let mut checked = 0;
+        for prefix in [b"#!sh ".as_slice(), b"#!xxx"] {
+            for pattern in 0..ALPHABET.len().pow(6) {
+                let mut head = [b'x'; 256];
+                head[..prefix.len()].copy_from_slice(prefix);
+                let mut value = pattern;
+                for byte in &mut head[250..256] {
+                    *byte = ALPHABET[value % ALPHABET.len()];
+                    value /= ALPHABET.len();
+                }
+                check_properties(&head);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 2 * 46_656);
+        for endpoint in [Some(253), Some(254), Some(255), None] {
+            for byte in [0, b' ', b'\t', b'\n'] {
+                let mut head = [b'x'; 256];
+                head[..2].copy_from_slice(b"#!");
+                if let Some(i) = endpoint {
+                    head[i] = byte;
+                }
+                check_properties(&head);
+                if endpoint.is_none() {
+                    assert_eq!(parse(&head), Err(ShebangError::TruncatedInterpreter));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parse_properties_for_arbitrary_inputs() {
-        let alphabet = [0, b' ', b'\t', b'\n', b'\r', b'x'];
         let mut successes = 0;
         let mut seed = 0x343a_2024_9876_1234u64;
         for len in 0..=300 {
@@ -523,7 +551,7 @@ mod tests {
                     seed ^= seed << 13;
                     seed ^= seed >> 7;
                     seed ^= seed << 17;
-                    *byte = if sample % 2 == 0 { seed as u8 } else { alphabet[seed as usize % alphabet.len()] };
+                    *byte = if sample % 2 == 0 { seed as u8 } else { ALPHABET[seed as usize % ALPHABET.len()] };
                 }
                 if sample % 4 != 0 && len >= 2 {
                     head[..2].copy_from_slice(b"#!");
