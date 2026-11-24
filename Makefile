@@ -252,3 +252,10 @@ $(BUILD)/alpine-dev.ext4: tools/mkrootfs-dev.sh tools/alpine-lock.py tools/ext4-
 	tools/mkrootfs-dev.sh $@
 
 rootfs-dev: $(BUILD)/alpine-dev.ext4 ## Build the deterministic Alpine developer image (gcc, g++, make, git, sqlite3, vim) for M8's gates
+
+# zig, pinned, for C cross-builds only (#345): the kernel, the apps and the
+# Rust test binaries keep rustc + rust-lld. The script checks its own stamp
+# (version and host), so the target always runs it.
+.PHONY: deps-zig
+deps-zig: ## Download the pinned zig, the C cross-compiler for host-built Linux test binaries (sha256-checked)
+	tools/fetch-zig.sh
