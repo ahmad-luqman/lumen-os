@@ -18,10 +18,11 @@
 # rather than a fixed 64M), the label and the UUID.
 #
 # Install scripts: none is ever run. tools/alpine-lock.py's `stage` checks
-# each .apk's sha256, extracts only its data segment, and prints any package
-# whose control segment carries scripts. At the lock of #344 none of the 34
-# does: no .pre-install, .post-install or trigger. The one script the
-# packages set off is the minirootfs' busybox trigger (on /bin, /usr/bin,
+# every .apk's sha256, then extracts only each one's data segment, and refuses
+# a package whose control segment carries a script its HANDLED_SCRIPTS table
+# doesn't list with how this script reproduces it. At the lock of #344 none of
+# the 34 carries one: no .pre-install, .post-install or trigger. The one script
+# the packages set off is the minirootfs' busybox trigger (on /bin, /usr/bin,
 # /sbin, /usr/sbin), which runs `busybox --install -s`: links for applets
 # with nothing at their path. The minirootfs already has every link, so it
 # would add none; a package's file replaces an applet link no package owns,
@@ -149,8 +150,24 @@ done
 
 # The size: the content, 64 MiB free and a quarter more inodes (at least
 # 4096) for what the gates write (tools/alpine-lock.py's image_size).
+SIZE_MIB='' INODES='' CONTENT='' INODES_USED=''
 SIZES=$(alpine_lock size "$STAGE")
-read -r SIZE_MIB INODES CONTENT INODES_USED <<< "$SIZES"
+while IFS='=' read -r key value; do
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "mkrootfs-dev: alpine-lock.py size gave $key=$value" >&2
+        exit 1
+    fi
+    case $key in
+    size_mib) SIZE_MIB=$value ;;
+    inodes) INODES=$value ;;
+    content) CONTENT=$value ;;
+    inodes_used) INODES_USED=$value ;;
+    esac
+done <<< "$SIZES"
+if [[ -z "$SIZE_MIB" || -z "$INODES" || -z "$CONTENT" || -z "$INODES_USED" ]]; then
+    echo "mkrootfs-dev: alpine-lock.py size left out a value: $SIZES" >&2
+    exit 1
+fi
 echo "mkrootfs-dev: content $((CONTENT / 1048576)) MiB in $INODES_USED inodes; image ${SIZE_MIB} MiB with $INODES inodes"
 
 # Normalize staged entry mtimes bottom-up (E2FSPROGS_FAKE_TIME does not rewrite `-d` mtimes).

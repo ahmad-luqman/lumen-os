@@ -320,22 +320,18 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _clone_command(master: Path, dest: Path) -> list[str]:
-    """`cp` cloning `master` to `dest` where the filesystem can: `-c`
-    (clonefile, APFS) on macOS, `--reflink=auto` (btrfs, XFS; a plain copy
-    elsewhere) on Linux."""
-    flag = "-c" if sys.platform == "darwin" else "--reflink=auto"
-    return ["cp", flag, str(master), str(dest)]
-
-
 def copy_dev_rootfs(
     dest_dir: Path, *, src: Path | None = None, name: str = "alpine-dev.ext4"
 ) -> Path:
     """Copy the master `alpine-dev.ext4` (#344, `make rootfs-dev`) into a
-    writable per-test path: a clone where the filesystem makes one
-    (`_clone_command`), else, when `cp` fails or is missing, a plain copy.
-    A clone shares the master's blocks until the test writes, so a test's
-    copy of the ~350 MiB image costs little on APFS, btrfs or XFS."""
+    writable per-test path: a clone where the filesystem makes one (`cp -c`,
+    clonefile, on macOS; `cp --reflink=auto`, btrfs or XFS, on Linux), else,
+    when `cp` fails or is missing, a plain copy. A clone shares the master's
+    blocks until the test writes, so a test's copy of the ~350 MiB image
+    costs little on APFS, btrfs or XFS. The copy is made under a temporary
+    name and renamed over `dest_dir/name`, so a failed copy leaves nothing
+    half-written there, and made writable by its owner whatever the
+    master's mode; a `dest_dir/name` that is the master is refused."""
     if not name or name in (".", "..") or Path(name).name != name or "/" in name or "\\" in name:
         raise ValueError(f"invalid rootfs filename: {name!r}")
     master = BUILD_DIR / "alpine-dev.ext4" if src is None else src
@@ -343,15 +339,27 @@ def copy_dev_rootfs(
         raise FileNotFoundError(f"rootfs image not found: {master} (run `make rootfs-dev` first)")
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / name
-    if dest.exists() or dest.is_symlink():
-        dest.unlink()
+    if dest.exists() and os.path.samefile(dest, master):
+        raise ValueError(f"{dest} is the master image itself")
+    tmp = dest_dir / f".{name}.{os.getpid()}.part"
+    tmp.unlink(missing_ok=True)
+    flag = "-c" if sys.platform == "darwin" else "--reflink=auto"
     try:
-        cloned = subprocess.run(_clone_command(master, dest), capture_output=True, check=False)
-        ok = cloned.returncode == 0
-    except OSError:
-        ok = False
-    if not ok:
-        shutil.copyfile(master, dest)
+        try:
+            cloned = subprocess.run(
+                ["cp", flag, str(master), str(tmp)], capture_output=True, check=False
+            )
+            ok = cloned.returncode == 0
+        except OSError:
+            ok = False
+        if not ok:
+            shutil.copyfile(master, tmp)
+        # cp gives the copy the master's mode: writable for QEMU even if
+        # the master is read-only.
+        tmp.chmod(tmp.stat().st_mode | 0o200)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
     return dest
 
 

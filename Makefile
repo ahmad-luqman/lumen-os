@@ -233,14 +233,19 @@ clean: ## Remove build outputs (keeps downloaded deps)
 # gcc, g++, make, musl-dev, binutils, git, sqlite and vim pinned in
 # tools/alpine-packages.lock. Not part of `make deps`, `build` or `test`; M8's
 # gate issues wire it into CI.
+# deps-dev always runs the fetch (it skips files already verified), so it
+# also repairs a deleted or corrupt .apk; the stamp only orders the image
+# after a fetch of the current lock.
 .PHONY: deps-dev rootfs-dev
 $(BUILD)/deps/alpine-packages/.lock: tools/alpine-packages.lock tools/fetch-alpine-packages.sh
 	tools/fetch-alpine-packages.sh
 	cp tools/alpine-packages.lock $@
 
-deps-dev: $(BUILD)/deps/alpine-packages/.lock ## Download the Alpine developer image's pinned packages (tools/alpine-packages.lock, sha256-checked)
+deps-dev: ## Download the Alpine developer image's pinned packages (tools/alpine-packages.lock, sha256-checked)
+	tools/fetch-alpine-packages.sh
+	@mkdir -p $(BUILD)/deps/alpine-packages && cp tools/alpine-packages.lock $(BUILD)/deps/alpine-packages/.lock
 
-$(BUILD)/alpine-dev.ext4: tools/mkrootfs-dev.sh tools/alpine-lock.py tools/alpine-packages.lock tools/ext4-signed-hash.sh $(BUILD)/deps/alpine-packages/.lock $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so
+$(BUILD)/alpine-dev.ext4: tools/mkrootfs-dev.sh tools/alpine-lock.py tools/ext4-signed-hash.sh $(BUILD)/deps/alpine-packages/.lock $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so
 	tools/mkrootfs-dev.sh $@
 
 rootfs-dev: $(BUILD)/alpine-dev.ext4 ## Build the deterministic Alpine developer image (gcc, g++, make, git, sqlite3, vim) for M8's gates

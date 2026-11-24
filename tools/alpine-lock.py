@@ -5,6 +5,7 @@ the image from it.
     uv run --frozen python tools/alpine-lock.py lock    # by hand, when bumping
     uv run --frozen python tools/alpine-lock.py stage --lock L --apk-dir D --minirootfs M DEST
     uv run --frozen python tools/alpine-lock.py size STAGE
+    uv run --frozen python tools/alpine-lock.py files [--lock L]
 
 `lock` reads Alpine v3.21's `APKINDEX.tar.gz` (`main`, then `community` for a
 name `main` lacks), resolves the closure of `tools/alpine-packages.txt` through
@@ -16,31 +17,34 @@ checked against the download, which ties the file to the index), and writes
 `tools/alpine-packages.lock`. It keeps the downloads in `build/deps/alpine-packages/`,
 where `tools/fetch-alpine-packages.sh` would put them.
 
-`stage` and `size` are `tools/mkrootfs-dev.sh`'s: `stage` checks each locked
-`.apk`'s sha256 and extracts its data segment only (never its install scripts)
-into a staged root; `size` works out the image's size and inode count from the
-staged content, the same on every host.
+`stage` and `size` are `tools/mkrootfs-dev.sh`'s: `stage` checks every locked
+`.apk`'s sha256, then extracts each one's data segment only (never its install
+scripts; a package carrying any is refused unless `HANDLED_SCRIPTS` says how
+the image reproduces them) into a staged root; `size` works out the image's
+size and inode count from the staged content, the same on every host. `files`
+is `tools/fetch-alpine-packages.sh`'s: the lock, parsed and checked here, as
+`repo file sha256` lines, so the lock has one reader.
 
-Standard library only: the harness tests import it, and it runs before `uv
-sync` matters.
+Standard library only, so the harness tests import it and `LUMEN_PYTHON` can
+run it without uv (the tests' stub trees).
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
-import functools
 import hashlib
 import io
 import os
 import re
+import shutil
 import stat
 import sys
 import tarfile
 import urllib.request
 import zlib
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -63,9 +67,20 @@ class LockError(Exception):
 
 # --- Versions (apk-tools' ordering, as far as Alpine's packages use it) ------
 
-_SUFFIX_RANK = {"alpha": 0, "beta": 1, "pre": 2, "rc": 3, "cvs": 5, "svn": 6, "git": 7, "hg": 8}
-_SUFFIX_RANK["p"] = 9
-_NO_SUFFIX = 4
+_SUFFIX_RANK = {
+    "alpha": 0,
+    "beta": 1,
+    "pre": 2,
+    "rc": 3,
+    "cvs": 5,
+    "svn": 6,
+    "git": 7,
+    "hg": 8,
+    "p": 9,
+}
+# No suffix sorts between `_rc` and `_cvs`: every key ends with it, so a
+# version whose suffixes run out compares as having this one next.
+_NO_SUFFIX = (4, 0)
 _VERSION_PARTS = re.compile(
     r"(?P<nums>[0-9]+(?:\.[0-9]+)*)(?P<letter>[a-z]?)(?P<sufs>(?:_[a-z]+[0-9]*)*)"
     r"(?:~[0-9a-f]+)?(?:-r(?P<rev>[0-9]+))?"
@@ -73,6 +88,7 @@ _VERSION_PARTS = re.compile(
 
 
 def _version_key(version: str) -> tuple:
+    """`version` as a tuple that sorts in apk's order (`vercmp`)."""
     m = _VERSION_PARTS.fullmatch(version)
     if m is None:
         raise LockError(f"can't compare version {version!r}")
@@ -83,6 +99,7 @@ def _version_key(version: str) -> tuple:
         if word not in _SUFFIX_RANK:
             raise LockError(f"unknown suffix _{word} in version {version!r}")
         sufs.append((_SUFFIX_RANK[word], int(suf[len(word) :] or 0)))
+    sufs.append(_NO_SUFFIX)
     return nums, m["letter"], tuple(sufs), int(m["rev"] or 0)
 
 
@@ -92,17 +109,8 @@ def vercmp(a: str, b: str) -> int:
     < `_cvs` < `_svn` < `_git` < `_hg` < `_p`, then `-rN`. (apk compares a
     later segment with a leading zero as a decimal fraction; no constraint
     in the closure needs that.)"""
-    (an, al, asuf, ar), (bn, bl, bsuf, br) = _version_key(a), _version_key(b)
-    if an != bn:
-        return -1 if an < bn else 1
-    if al != bl:
-        return -1 if al < bl else 1
-    for i in range(max(len(asuf), len(bsuf))):
-        x = asuf[i] if i < len(asuf) else (_NO_SUFFIX, 0)
-        y = bsuf[i] if i < len(bsuf) else (_NO_SUFFIX, 0)
-        if x != y:
-            return -1 if x < y else 1
-    return (ar > br) - (ar < br)
+    ka, kb = _version_key(a), _version_key(b)
+    return (ka > kb) - (ka < kb)
 
 
 # --- APKINDEX and the installed database --------------------------------------
@@ -227,10 +235,14 @@ def parse_wanted(text: str) -> list[str]:
 # --- Resolution ----------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class Resolution:
-    packages: list[Package]
-    repos: list[str] = field(default_factory=list)
+    packages: tuple[Package, ...]
+
+    @property
+    def repos(self) -> list[str]:
+        """The repositories the packages came from, sorted."""
+        return sorted({p.repo for p in self.packages})
 
 
 def resolve(
@@ -246,20 +258,20 @@ def resolve(
     available package of that name, or else by a provider of it: the
     highest `k:` priority, then the highest version of what it provides
     (apk's order: isl26's `so:libisl.so.23=23.3.0` over isl25's 23.2.0),
-    and a tie an error (name one in alpine-packages.txt to choose). Then, as apk does, every package whose
-    `i:` atoms are all met joins, with its dependencies, until none does.
-    A conflict (`!name`) met by the result is an error, and so is an
-    installed package too old or too new for an atom naming it."""
+    and a tie an error (name one in alpine-packages.txt to choose). Then,
+    as apk does, every package whose `i:` atoms are all met joins, with its
+    dependencies, until none does.
+    An `i:` atom `!name` holds while nothing meets `name`. A conflict
+    (`!name`) in `D:` met by the result is an error, and so is an installed
+    package too old or too new for an atom naming it."""
     chosen: dict[str, Package] = {}
 
     def met(dep: Dep) -> bool:
         return any(p.satisfies(dep) for p in (*installed.values(), *chosen.values()))
 
-    def named_but_wrong(dep: Dep) -> Package | None:
-        for p in (*installed.values(), *chosen.values()):
-            if p.name == dep.name and not dep.allows(p.version):
-                return p
-        return None
+    def holds(atom: Dep) -> bool:
+        """An `i:` atom: met, or for `!name`, not met."""
+        return met(atom) != atom.conflict
 
     def candidate(dep: Dep, needed_by: str) -> Package:
         pkg = available.get(dep.name)
@@ -273,19 +285,12 @@ def resolve(
         if not providers:
             raise LockError(f"{needed_by} needs {dep}, which no package provides")
 
-        def rank(p: Package) -> tuple[int, str | None]:
-            return p.priority, p.provided_version(dep.name)
+        def rank(p: Package) -> tuple:
+            v = p.provided_version(dep.name)
+            return p.priority, v is not None, _version_key(v) if v is not None else ()
 
-        def better(a: Package, b: Package) -> int:
-            (ak, av), (bk, bv) = rank(a), rank(b)
-            if ak != bk:
-                return 1 if ak > bk else -1
-            if av is None or bv is None:
-                return (av is not None) - (bv is not None)
-            return vercmp(av, bv)
-
-        providers.sort(key=functools.cmp_to_key(better), reverse=True)
-        if len(providers) > 1 and better(providers[0], providers[1]) == 0:
+        providers.sort(key=rank, reverse=True)
+        if len(providers) > 1 and rank(providers[0]) == rank(providers[1]):
             names = ", ".join(sorted(p.name for p in providers))
             raise LockError(
                 f"{needed_by} needs {dep}, which {names} all provide: "
@@ -304,13 +309,15 @@ def resolve(
             dep, needed_by = queue.popleft()
             if met(dep):
                 continue
-            wrong = named_but_wrong(dep)
-            if wrong is not None and wrong.name in installed:
+            # Unmet, so an installed package of that name is the wrong version.
+            if (wrong := installed.get(dep.name)) is not None:
                 raise LockError(
                     f"{needed_by} needs {dep}, but the minirootfs has {wrong.name}-{wrong.version}"
                 )
             pkg = candidate(dep, needed_by)
-            if pkg.name in chosen or pkg.name in installed:
+            # An index package chosen already would have met `dep`; one the
+            # minirootfs has at another version may provide it here.
+            if pkg.name in installed:
                 raise LockError(
                     f"{needed_by} needs {dep}, which {pkg.name}-{pkg.version} doesn't meet"
                 )
@@ -320,7 +327,9 @@ def resolve(
         if name in installed:
             continue
         if name not in available:
-            raise LockError(f"alpine-packages.txt names {name}, which the index lacks")
+            providers = sorted(p.name for p in available.values() if p.satisfies(Dep(name)))
+            hint = f" ({', '.join(providers)} provide it: name one)" if providers else ""
+            raise LockError(f"alpine-packages.txt names {name}, which the index lacks{hint}")
         choose(available[name])
     drain()
 
@@ -331,7 +340,7 @@ def resolve(
             if p.install_if
             and name not in chosen
             and name not in installed
-            and all(met(d) for d in p.install_if)
+            and all(holds(d) for d in p.install_if)
         ]
         if not joining:
             break
@@ -347,8 +356,7 @@ def resolve(
                 if clash:
                     raise LockError(f"{pkg.name} conflicts with {dep.name} ({', '.join(clash)})")
 
-    ordered = sorted(chosen.values(), key=lambda p: p.name)
-    return Resolution(ordered, sorted({p.repo for p in ordered}))
+    return Resolution(tuple(sorted(chosen.values(), key=lambda p: p.name)))
 
 
 def merge_repos(indexes: list[dict[str, Package]]) -> dict[str, Package]:
@@ -432,6 +440,9 @@ def format_lock(
         description, sha = indexes[repo]
         lines.append(f"#   {repo}/{ARCH}/APKINDEX.tar.gz {description} sha256 {sha}")
     lines += [f"# minirootfs {minirootfs}", "# name version repo sha256"]
+    missing = [p.name for p in resolution.packages if p.name not in hashes]
+    if missing:
+        raise LockError(f"no sha256 for {', '.join(missing)}")
     lines += [f"{p.name} {p.version} {p.repo} {hashes[p.name]}" for p in resolution.packages]
     return "\n".join(lines) + "\n"
 
@@ -450,16 +461,13 @@ def gzip_members(data: bytes) -> list[bytes]:
         if data[pos : pos + 2] != b"\x1f\x8b":
             raise LockError(f"no gzip member at byte {pos}")
         d = zlib.decompressobj(wbits=31)
-        i = pos
+        tail = memoryview(data)[pos:]
         while not d.eof:
-            if i >= len(data):
+            if not tail:
                 raise LockError(f"the gzip member at byte {pos} is truncated")
-            buf = data[i : i + _CHUNK]
-            i += len(buf)
-            while buf and not d.eof:
-                d.decompress(buf, _CHUNK)
-                buf = d.unconsumed_tail
-        end = i - len(d.unused_data)
+            d.decompress(tail, _CHUNK)  # the output, bounded, is dropped
+            tail = d.unconsumed_tail
+        end = len(data) - len(d.unused_data)
         members.append(data[pos:end])
         pos = end
     return members
@@ -479,25 +487,29 @@ def _member_names(member: bytes) -> list[str]:
         return tar.getnames()
 
 
-def data_segment(data: bytes) -> bytes:
-    """An `.apk`'s data segment: the last gzip member, after the control
-    segment (`.PKGINFO`, the install scripts) and, when signed, the
-    signature (`.SIGN.*`). Checked by what each holds."""
+@dataclass(frozen=True)
+class ApkParts:
+    """An `.apk` split once: the scripts its control segment carries
+    (`.pre-install`, `.post-install`, `.trigger`, ...: what `stage` never
+    runs) and its data segment (a gzipped tar)."""
+
+    scripts: tuple[str, ...]
+    data: bytes
+
+
+def split_apk(data: bytes) -> ApkParts:
+    """An `.apk`'s parts: the last gzip member is its data segment, after
+    the control segment (`.PKGINFO`, the install scripts) and, when signed,
+    the signature (`.SIGN.*`). Checked by what each holds."""
     members = gzip_members(data)
     if len(members) not in (2, 3):
         raise LockError(f"an .apk has 2 or 3 gzip members, this one {len(members)}")
-    if ".PKGINFO" not in _member_names(members[-2]):
+    control = _member_names(members[-2])
+    if ".PKGINFO" not in control:
         raise LockError("the .apk's control segment has no .PKGINFO")
     if len(members) == 3 and not all(n.startswith(".SIGN.") for n in _member_names(members[0])):
         raise LockError("the .apk's first segment isn't a signature")
-    return members[-1]
-
-
-def install_scripts(data: bytes) -> list[str]:
-    """The scripts an `.apk`'s control segment carries (`.pre-install`,
-    `.post-install`, `.trigger`, ...): what `stage` never runs."""
-    members = gzip_members(data)
-    return sorted(n for n in _member_names(members[-2]) if n != ".PKGINFO")
+    return ApkParts(tuple(sorted(n for n in control if n != ".PKGINFO")), members[-1])
 
 
 def _safe_parts(name: str) -> list[str]:
@@ -522,17 +534,52 @@ def _real_parent(dest: Path, parts: list[str]) -> Path:
     return here
 
 
-def extract_data(data: bytes, dest: Path, replaceable: set[str] | None = None) -> list[str]:
-    """Extract an `.apk`'s data segment into `dest`; the paths it wrote, in
-    archive order. Never overwrites, as apk doesn't: a path already in
-    `dest` (the minirootfs', or another package's) is an error, unless both
-    are directories or the path is in `replaceable` (taken out of it once
-    replaced). Directories get their modes at the end, so a read-only one
-    can still be filled; owners and times are left to mkrootfs-dev.sh."""
-    replaceable = set() if replaceable is None else replaceable
+@dataclass(frozen=True)
+class Extracted:
+    """What `extract_data` wrote, in archive order (directories with a
+    trailing `/`), which of the `replaceable` paths it replaced, and each
+    directory's mode from the archive, for `apply_dir_modes` once every
+    package is in."""
+
+    written: tuple[str, ...]
+    replaced: frozenset[str]
+    dir_modes: dict[Path, int]
+
+
+def apply_dir_modes(dir_modes: dict[Path, int]) -> None:
+    """Directories' modes, deepest first: last, so a read-only directory
+    (`usr/share/x` at 0555) never stops a later file going in."""
+    for path, mode in sorted(dir_modes.items(), reverse=True):
+        os.chmod(path, mode)
+
+
+def _extracted_file(dest: Path, parts: list[str]) -> Path | None:
+    """`dest/parts` if it is a regular file reached through real
+    directories only (no symlink on the way, nor at the end: `os.link`
+    would follow one, maybe out of the staged root), else None."""
+    here = dest
+    for part in parts[:-1]:
+        here = here / part
+        if here.is_symlink() or not here.is_dir():
+            return None
+    here = here / parts[-1]
+    return None if here.is_symlink() or not here.is_file() else here
+
+
+def extract_data(apk: ApkParts, dest: Path, replaceable: frozenset[str] = frozenset()) -> Extracted:
+    """Extract an `.apk`'s data segment into `dest`. Stricter than apk,
+    which overwrites any file no package owns: a path already in `dest` (the
+    minirootfs', or another package's) is an error, unless both are
+    directories or the path is in `replaceable` (the busybox applet links
+    `stage` passes, the only unowned files the minirootfs has in the way).
+    New directories are made at 0755 and their archive modes handed back
+    (`Extracted.dir_modes`), for the caller to apply when every package is
+    in (`apply_dir_modes`), so a read-only one can still be filled; owners
+    and times are left to mkrootfs-dev.sh."""
     written = []
+    replaced = set()
     dir_modes: dict[Path, int] = {}
-    with tarfile.open(fileobj=io.BytesIO(data_segment(data)), mode="r:gz") as tar:
+    with tarfile.open(fileobj=io.BytesIO(apk.data), mode="r:gz") as tar:
         for m in tar:
             parts = _safe_parts(m.name)
             parent = _real_parent(dest, parts)
@@ -546,30 +593,27 @@ def extract_data(data: bytes, dest: Path, replaceable: set[str] | None = None) -
                 written.append(rel + "/")
                 continue
             if os.path.lexists(path):
-                if rel not in replaceable:
+                if rel not in replaceable or rel in replaced:
                     raise LockError(f"{rel} is already in the image")
-                replaceable.discard(rel)
+                replaced.add(rel)
                 path.unlink()
             if m.isreg():
                 src = tar.extractfile(m)
                 assert src is not None
                 with open(path, "xb") as out:
-                    while chunk := src.read(_CHUNK):
-                        out.write(chunk)
+                    shutil.copyfileobj(src, out, _CHUNK)
                 os.chmod(path, m.mode & 0o7777)
             elif m.issym():
                 os.symlink(m.linkname, path)
             elif m.islnk():
-                target = dest.joinpath(*_safe_parts(m.linkname))
-                if target.is_symlink() or not target.is_file():
+                target = _extracted_file(dest, _safe_parts(m.linkname))
+                if target is None:
                     raise LockError(f"{rel}: hard link to {m.linkname}, not an extracted file")
-                os.link(target, path)
+                os.link(target, path, follow_symlinks=False)
             else:
                 raise LockError(f"{rel}: a device node or FIFO, which the image doesn't take")
             written.append(rel)
-    for path, mode in sorted(dir_modes.items(), reverse=True):
-        os.chmod(path, mode)
-    return written
+    return Extracted(tuple(written), frozenset(replaced), dir_modes)
 
 
 BUSYBOX = "/bin/busybox"
@@ -610,27 +654,32 @@ def busybox_links(root: Path, owned: set[str]) -> set[str]:
 
 
 def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
     with open(path, "rb") as f:
-        while chunk := f.read(_CHUNK):
-            h.update(chunk)
-    return h.hexdigest()
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
-@dataclass
+# Install scripts the image reproduces statically: (package, script) to how,
+# printed by `stage`; tools/mkrootfs-dev.sh does the reproducing. Empty: no
+# locked package carries a script (#344). A lock bump that brings one fails
+# `stage` until it is worked out and listed here.
+HANDLED_SCRIPTS: dict[tuple[str, str], str] = {}
+
+
+@dataclass(frozen=True)
 class Staged:
-    """What `stage` did beyond extracting: the packages carrying install
-    scripts (never run), with the scripts' names, and the busybox applet
-    links packages' files replaced."""
+    """What `stage` did beyond extracting: the install scripts it let pass
+    (`HANDLED_SCRIPTS`' entries, with how each is reproduced) and the
+    busybox applet links packages' files replaced."""
 
-    scripted: list[tuple[str, list[str]]]
-    replaced: list[str]
+    handled: tuple[tuple[str, str, str], ...]
+    replaced: tuple[str, ...]
 
 
 def stage(lock: Lock, apk_dir: Path, minirootfs: Path, dest: Path) -> Staged:
     """Every locked package's data into `dest` (the minirootfs already
-    copied there), in lock order, once every `.apk` has matched its
-    sha256."""
+    copied there), in lock order, once every `.apk` has matched its sha256
+    and none carries a script `HANDLED_SCRIPTS` doesn't list. Each file is
+    read once: the bytes hashed are the bytes extracted."""
     version_file = minirootfs / ".version"
     have = version_file.read_text().strip() if version_file.is_file() else None
     if have != lock.minirootfs:
@@ -638,23 +687,39 @@ def stage(lock: Lock, apk_dir: Path, minirootfs: Path, dest: Path) -> Staged:
             f"the lock was resolved against minirootfs {lock.minirootfs}, "
             f"but {minirootfs} has {have}: re-run tools/alpine-lock.py"
         )
+    apks = []
     for pkg in lock.packages:
-        apk = apk_dir / pkg.filename
-        if not apk.is_file():
-            raise LockError(f"{apk} is missing: run `make deps-dev`")
-        got = sha256_file(apk)
+        path = apk_dir / pkg.filename
+        if not path.is_file():
+            raise LockError(f"{path} is missing: run `make deps-dev`")
+        data = path.read_bytes()
+        got = hashlib.sha256(data).hexdigest()
         if got != pkg.sha256:
-            raise LockError(f"{apk}: sha256 {got}, the lock says {pkg.sha256}: run `make deps-dev`")
+            raise LockError(
+                f"{path}: sha256 {got}, the lock says {pkg.sha256}: run `make deps-dev`"
+            )
+        apks.append((pkg.name, split_apk(data)))
+    handled = []
+    for name, apk in apks:
+        for script in apk.scripts:
+            how = HANDLED_SCRIPTS.get((name, script))
+            if how is None:
+                raise LockError(
+                    f"{name} carries {script}, which the image never runs: work out what it "
+                    "does, reproduce it in tools/mkrootfs-dev.sh and list it in "
+                    "tools/alpine-lock.py's HANDLED_SCRIPTS"
+                )
+            handled.append((name, script, how))
     owned = owned_paths((minirootfs / "lib/apk/db/installed").read_text())
-    links = busybox_links(dest, owned)
-    before = set(links)
-    scripted = []
-    for pkg in lock.packages:
-        data = (apk_dir / pkg.filename).read_bytes()
-        extract_data(data, dest, links)
-        if scripts := install_scripts(data):
-            scripted.append((pkg.name, scripts))
-    return Staged(scripted, sorted(before - links))
+    links = frozenset(busybox_links(dest, owned))
+    replaced: set[str] = set()
+    dir_modes: dict[Path, int] = {}
+    for _, apk in apks:
+        out = extract_data(apk, dest, links - replaced)
+        replaced |= out.replaced
+        dir_modes |= out.dir_modes
+    apply_dir_modes(dir_modes)
+    return Staged(tuple(handled), tuple(sorted(replaced)))
 
 
 # --- Image size --------------------------------------------------------------------
@@ -731,7 +796,7 @@ def cmd_lock(a: argparse.Namespace) -> int:
     installed = parse_index(db.read_text(), "installed")
     indexes: dict[str, tuple[str, str]] = {}
     parsed = []
-    for repo in a.repo:
+    for repo in a.repo or DEFAULT_REPOS:
         url = f"{a.mirror}/{ALPINE_BRANCH}/{repo}/{ARCH}/APKINDEX.tar.gz"
         print(f"alpine-lock: reading {url}", file=sys.stderr)
         blob = _fetch(url)
@@ -743,20 +808,26 @@ def cmd_lock(a: argparse.Namespace) -> int:
     a.apk_dir.mkdir(parents=True, exist_ok=True)
     hashes = {}
     for pkg in resolution.packages:
+        # The index's size and control checksum are what tie a download to
+        # the index: a stanza without them can't be locked.
+        if pkg.checksum is None or pkg.size is None:
+            raise LockError(f"{pkg.repo}: the index gives {pkg.name} no C: or S:")
         path = a.apk_dir / pkg.filename
-        if path.is_file():
-            data = path.read_bytes()
-        else:
+        downloaded = not path.is_file()
+        if downloaded:
             url = f"{a.mirror}/{ALPINE_BRANCH}/{pkg.repo}/{ARCH}/{pkg.filename}"
             print(f"alpine-lock: downloading {pkg.filename}", file=sys.stderr)
             data = _fetch(url)
-        if pkg.size is not None and len(data) != pkg.size:
+        else:
+            data = path.read_bytes()
+        if len(data) != pkg.size:
             raise LockError(f"{pkg.filename}: {len(data)} bytes, the index says {pkg.size}")
-        if pkg.checksum is not None and control_checksum(data) != pkg.checksum:
+        if control_checksum(data) != pkg.checksum:
             raise LockError(f"{pkg.filename}: its control segment doesn't match the index's C:")
-        tmp = path.with_suffix(".apk.part")
-        tmp.write_bytes(data)
-        tmp.replace(path)
+        if downloaded:
+            tmp = path.with_suffix(".apk.part")
+            tmp.write_bytes(data)
+            tmp.replace(path)
         hashes[pkg.name] = hashlib.sha256(data).hexdigest()
 
     minirootfs = version_file.read_text().strip()
@@ -767,8 +838,8 @@ def cmd_lock(a: argparse.Namespace) -> int:
 
 def cmd_stage(a: argparse.Namespace) -> int:
     staged = stage(parse_lock(a.lock.read_text()), a.apk_dir, a.minirootfs, a.dest)
-    for name, scripts in staged.scripted:
-        print(f"install scripts not run: {name}: {' '.join(scripts)}")
+    for name, script, how in staged.handled:
+        print(f"install script not run, reproduced: {name} {script}: {how}")
     if staged.replaced:
         print(f"busybox applet links replaced: {' '.join(staged.replaced)}")
     return 0
@@ -776,7 +847,14 @@ def cmd_stage(a: argparse.Namespace) -> int:
 
 def cmd_size(a: argparse.Namespace) -> int:
     s = image_size(a.stage)
-    print(s.size_mib, s.inodes, s.content, s.inodes_used)
+    for key in ("size_mib", "inodes", "content", "inodes_used"):
+        print(f"{key}={getattr(s, key)}")
+    return 0
+
+
+def cmd_files(a: argparse.Namespace) -> int:
+    for pkg in parse_lock(a.lock.read_text()).packages:
+        print(pkg.repo, pkg.filename, pkg.sha256)
     return 0
 
 
@@ -797,12 +875,15 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--minirootfs", type=Path, required=True)
     st.add_argument("dest", type=Path)
     st.set_defaults(fn=cmd_stage)
-    sz = sub.add_parser("size", help="print the image's MiB, inodes, content bytes, inodes used")
+    sz = sub.add_parser(
+        "size", help="print size_mib=, inodes=, content= and inodes_used= lines for STAGE"
+    )
     sz.add_argument("stage", type=Path)
     sz.set_defaults(fn=cmd_size)
+    fl = sub.add_parser("files", help="print the lock's `repo file sha256` lines")
+    fl.add_argument("--lock", type=Path, default=ROOT / "tools/alpine-packages.lock")
+    fl.set_defaults(fn=cmd_files)
     a = p.parse_args(argv)
-    if a.cmd == "lock" and not a.repo:
-        a.repo = list(DEFAULT_REPOS)
     try:
         return a.fn(a)
     except (LockError, OSError, tarfile.TarError, zlib.error) as exc:
