@@ -1,7 +1,7 @@
 //! `setsid`, `setpgid`, `getpgid`, `getsid` and `tcsetpgrp`.
 
-use super::{INIT, exit, fork, sig, tree, wait4};
-use crate::{Errno, ProcTree, Sigttou, Tcsetpgrp, Terminal};
+use super::{INIT, exit, fork, reported_pid, tree, user, wait4};
+use crate::{Controlling, Errno, ProcTree, Signal, Sigttou, Tcsetpgrp};
 
 /// A session leader `s` (a child of init) and its child `c`, in group `s`.
 fn session() -> (ProcTree, u32, u32) {
@@ -31,16 +31,16 @@ fn setsid_refuses_a_group_leader() {
     let mut t = tree();
     let a = fork(&mut t, INIT);
     t.setpgid(a, 0, 0).unwrap();
-    assert_eq!(t.setsid(a), Err(Errno::Perm));
+    assert_eq!(t.setsid(a), user(Errno::Perm));
     assert_eq!(t.sid(a), Some(INIT));
     // init leads group 1 (and session 1).
-    assert_eq!(t.setsid(INIT), Err(Errno::Perm));
+    assert_eq!(t.setsid(INIT), user(Errno::Perm));
 }
 
 #[test]
 fn setsid_refuses_a_session_leader() {
     let (mut t, s, _c) = session();
-    assert_eq!(t.setsid(s), Err(Errno::Perm));
+    assert_eq!(t.setsid(s), user(Errno::Perm));
 }
 
 #[test]
@@ -53,11 +53,11 @@ fn setsid_refuses_while_a_group_still_has_its_pid() {
     t.setpgid(a, 0, s as i32).unwrap();
     assert_eq!(t.pgid(a), Some(s));
     assert_eq!(t.pgid(b), Some(a));
-    assert_eq!(t.setsid(a), Err(Errno::Perm));
+    assert_eq!(t.setsid(a), user(Errno::Perm));
     // A zombie still holds the group.
     exit(&mut t, b, 0);
-    assert_eq!(t.setsid(a), Err(Errno::Perm));
-    assert_eq!(wait4(&mut t, a, -1, 0).pid(), Some(b));
+    assert_eq!(t.setsid(a), user(Errno::Perm));
+    assert_eq!(reported_pid(&wait4(&mut t, a, -1, 0)), Some(b));
     assert_eq!(t.setsid(a), Ok(a));
     t.check_invariants();
 }
@@ -100,13 +100,13 @@ fn setpgid_moves_a_child_that_has_not_execd() {
 #[test]
 fn setpgid_refuses_a_negative_pgid_first() {
     let (mut t, s, c) = session();
-    assert_eq!(t.setpgid(c, 0, -1), Err(Errno::Inval));
-    assert_eq!(t.setpgid(c, 9999, -1), Err(Errno::Inval));
-    assert_eq!(t.setpgid(c, INIT as i32, i32::MIN), Err(Errno::Inval));
+    assert_eq!(t.setpgid(c, 0, -1), user(Errno::Inval));
+    assert_eq!(t.setpgid(c, 9999, -1), user(Errno::Inval));
+    assert_eq!(t.setpgid(c, INIT as i32, i32::MIN), user(Errno::Inval));
     // A session leader too: EINVAL comes before EPERM.
-    assert_eq!(t.setpgid(s, 0, -5), Err(Errno::Inval));
+    assert_eq!(t.setpgid(s, 0, -5), user(Errno::Inval));
     // pgid 0 takes a negative pid's value.
-    assert_eq!(t.setpgid(c, -5, 0), Err(Errno::Inval));
+    assert_eq!(t.setpgid(c, -5, 0), user(Errno::Inval));
 }
 
 #[test]
@@ -114,15 +114,15 @@ fn setpgid_is_esrch_for_neither_self_nor_child() {
     let (mut t, s, c) = session();
     let g = fork(&mut t, c);
     let sib = fork(&mut t, s);
-    assert_eq!(t.setpgid(c, 9999, 0), Err(Errno::Srch), "no such process");
-    assert_eq!(t.setpgid(c, -5, 3), Err(Errno::Srch), "negative pid");
-    assert_eq!(t.setpgid(s, g as i32, 0), Err(Errno::Srch), "grandchild");
-    assert_eq!(t.setpgid(c, sib as i32, 0), Err(Errno::Srch), "sibling");
-    assert_eq!(t.setpgid(c, s as i32, 0), Err(Errno::Srch), "parent");
-    assert_eq!(t.setpgid(c, INIT as i32, 0), Err(Errno::Srch), "init");
+    assert_eq!(t.setpgid(c, 9999, 0), user(Errno::Srch), "no such process");
+    assert_eq!(t.setpgid(c, -5, 3), user(Errno::Srch), "negative pid");
+    assert_eq!(t.setpgid(s, g as i32, 0), user(Errno::Srch), "grandchild");
+    assert_eq!(t.setpgid(c, sib as i32, 0), user(Errno::Srch), "sibling");
+    assert_eq!(t.setpgid(c, s as i32, 0), user(Errno::Srch), "parent");
+    assert_eq!(t.setpgid(c, INIT as i32, 0), user(Errno::Srch), "init");
     // A zombie that isn't the caller's child.
     exit(&mut t, g, 0);
-    assert_eq!(t.setpgid(s, g as i32, 0), Err(Errno::Srch));
+    assert_eq!(t.setpgid(s, g as i32, 0), user(Errno::Srch));
 }
 
 #[test]
@@ -130,9 +130,9 @@ fn setpgid_is_eacces_for_a_child_that_execd() {
     let (mut t, s, c) = session();
     t.exec(c).unwrap();
     assert_eq!(t.has_execed(c), Some(true));
-    assert_eq!(t.setpgid(s, c as i32, 0), Err(Errno::Acces));
+    assert_eq!(t.setpgid(s, c as i32, 0), user(Errno::Acces));
     // EACCES before the target group's EPERM.
-    assert_eq!(t.setpgid(s, c as i32, 4242), Err(Errno::Acces));
+    assert_eq!(t.setpgid(s, c as i32, 4242), user(Errno::Acces));
     // Its own setpgid still works.
     assert_eq!(t.setpgid(c, 0, 0), Ok(()));
 }
@@ -141,18 +141,18 @@ fn setpgid_is_eacces_for_a_child_that_execd() {
 fn setpgid_is_eperm_for_a_child_in_another_session() {
     let (mut t, s, c) = session();
     t.setsid(c).unwrap();
-    assert_eq!(t.setpgid(s, c as i32, s as i32), Err(Errno::Perm));
+    assert_eq!(t.setpgid(s, c as i32, s as i32), user(Errno::Perm));
     // Another session comes before exec'd.
     t.exec(c).unwrap();
-    assert_eq!(t.setpgid(s, c as i32, s as i32), Err(Errno::Perm));
+    assert_eq!(t.setpgid(s, c as i32, s as i32), user(Errno::Perm));
 }
 
 #[test]
 fn setpgid_is_eperm_for_a_session_leader() {
     let (mut t, s, _c) = session();
-    assert_eq!(t.setpgid(s, 0, 0), Err(Errno::Perm));
-    assert_eq!(t.setpgid(s, s as i32, s as i32), Err(Errno::Perm));
-    assert_eq!(t.setpgid(INIT, 0, 0), Err(Errno::Perm));
+    assert_eq!(t.setpgid(s, 0, 0), user(Errno::Perm));
+    assert_eq!(t.setpgid(s, s as i32, s as i32), user(Errno::Perm));
+    assert_eq!(t.setpgid(INIT, 0, 0), user(Errno::Perm));
 }
 
 #[test]
@@ -161,19 +161,19 @@ fn setpgid_is_eperm_for_a_group_elsewhere_or_nowhere() {
     let other = fork(&mut t, INIT);
     t.setsid(other).unwrap();
     // A group in another session.
-    assert_eq!(t.setpgid(c, 0, other as i32), Err(Errno::Perm));
-    assert_eq!(t.setpgid(c, 0, INIT as i32), Err(Errno::Perm));
+    assert_eq!(t.setpgid(c, 0, other as i32), user(Errno::Perm));
+    assert_eq!(t.setpgid(c, 0, INIT as i32), user(Errno::Perm));
     // A number no group has: unused, or a process that leads no group.
-    assert_eq!(t.setpgid(c, 0, 4242), Err(Errno::Perm));
+    assert_eq!(t.setpgid(c, 0, 4242), user(Errno::Perm));
     let d = fork(&mut t, s);
-    assert_eq!(t.setpgid(c, 0, d as i32), Err(Errno::Perm));
+    assert_eq!(t.setpgid(c, 0, d as i32), user(Errno::Perm));
     assert_eq!(t.pgid(c), Some(s));
     // A group whose leader is gone still counts.
     let l = fork(&mut t, s);
     t.setpgid(l, 0, 0).unwrap();
     let m = fork(&mut t, l);
     exit(&mut t, l, 0);
-    assert_eq!(wait4(&mut t, s, l as i32, 0).pid(), Some(l));
+    assert_eq!(reported_pid(&wait4(&mut t, s, l as i32, 0)), Some(l));
     assert_eq!(t.pgid(m), Some(l));
     assert_eq!(t.setpgid(c, 0, l as i32), Ok(()));
     t.check_invariants();
@@ -194,8 +194,8 @@ fn getpgid_and_getsid_look_up_any_process() {
     assert_eq!(t.getpgid(INIT, c as i32), Ok(c), "a zombie");
     assert_eq!(t.getsid(INIT, c as i32), Ok(s), "a zombie");
     for pid in [9999, -1, i32::MIN] {
-        assert_eq!(t.getpgid(INIT, pid), Err(Errno::Srch));
-        assert_eq!(t.getsid(INIT, pid), Err(Errno::Srch));
+        assert_eq!(t.getpgid(INIT, pid), user(Errno::Srch));
+        assert_eq!(t.getsid(INIT, pid), user(Errno::Srch));
     }
 }
 
@@ -203,12 +203,17 @@ fn getpgid_and_getsid_look_up_any_process() {
 
 /// `s`'s session with a background job `j` (its own group) and `c` in group
 /// `s`; the terminal is the session's, `s`'s group in the foreground.
-fn job_control() -> (ProcTree, u32, u32, u32, Terminal) {
+fn job_control() -> (ProcTree, u32, u32, u32, Option<Controlling>) {
     let (mut t, s, c) = session();
     let j = fork(&mut t, s);
     t.setpgid(s, j as i32, 0).unwrap();
-    let tty = Terminal { is_controlling: true, session: Some(s), foreground: Some(s) };
+    let tty = Some(Controlling { session: Some(s), foreground: Some(s) });
     (t, s, c, j, tty)
+}
+
+/// `tty` with another session or foreground group.
+fn with(tty: Option<Controlling>, session: Option<u32>, foreground: Option<u32>) -> Option<Controlling> {
+    tty.map(|_| Controlling { session, foreground })
 }
 
 #[test]
@@ -217,48 +222,57 @@ fn tcsetpgrp_sets_a_group_of_the_session() {
     assert_eq!(t.tcsetpgrp(s, tty, j as i32, Sigttou::Delivered), Ok(Tcsetpgrp::Set(j)));
     assert_eq!(t.tcsetpgrp(c, tty, s as i32, Sigttou::Delivered), Ok(Tcsetpgrp::Set(s)));
     // No foreground group: nobody is in the background.
-    let none = Terminal { foreground: None, ..tty };
+    let none = with(tty, Some(s), None);
     assert_eq!(t.tcsetpgrp(j, none, j as i32, Sigttou::Delivered), Ok(Tcsetpgrp::Set(j)));
 }
 
 #[test]
 fn tcsetpgrp_refuses_a_negative_pgrp() {
     let (t, s, _c, _j, tty) = job_control();
-    assert_eq!(t.tcsetpgrp(s, tty, -1, Sigttou::Delivered), Err(Errno::Inval));
-    let other = Terminal { is_controlling: false, ..tty };
-    assert_eq!(t.tcsetpgrp(s, other, -1, Sigttou::Delivered), Err(Errno::Inval), "EINVAL before ENOTTY");
+    assert_eq!(t.tcsetpgrp(s, tty, -1, Sigttou::Delivered), user(Errno::Inval));
+    assert_eq!(t.tcsetpgrp(s, None, -1, Sigttou::Delivered), user(Errno::Inval), "EINVAL before ENOTTY");
 }
 
 #[test]
 fn tcsetpgrp_is_enotty_off_the_callers_controlling_terminal() {
     let (t, s, _c, j, tty) = job_control();
-    let not_ctty = Terminal { is_controlling: false, ..tty };
-    assert_eq!(t.tcsetpgrp(s, not_ctty, j as i32, Sigttou::Delivered), Err(Errno::NoTty));
-    let other_session = Terminal { session: Some(INIT), ..tty };
-    assert_eq!(t.tcsetpgrp(s, other_session, j as i32, Sigttou::Delivered), Err(Errno::NoTty));
-    let no_session = Terminal { session: None, ..tty };
-    assert_eq!(t.tcsetpgrp(s, no_session, j as i32, Sigttou::Delivered), Err(Errno::NoTty));
+    assert_eq!(t.tcsetpgrp(s, None, j as i32, Sigttou::Delivered), user(Errno::NoTty));
+    let other_session = with(tty, Some(INIT), Some(s));
+    assert_eq!(t.tcsetpgrp(s, other_session, j as i32, Sigttou::Delivered), user(Errno::NoTty));
+    let no_session = with(tty, None, Some(s));
+    assert_eq!(t.tcsetpgrp(s, no_session, j as i32, Sigttou::Delivered), user(Errno::NoTty));
     // Off its controlling terminal, a background caller isn't stopped.
-    assert_eq!(t.tcsetpgrp(j, not_ctty, j as i32, Sigttou::Delivered), Err(Errno::NoTty));
+    assert_eq!(t.tcsetpgrp(j, None, j as i32, Sigttou::Delivered), user(Errno::NoTty));
+}
+
+#[test]
+fn tcsetpgrp_enotty_comes_before_esrch_and_eperm() {
+    let (t, s, _c, _j, tty) = job_control();
+    let other_session = with(tty, Some(INIT), Some(s));
+    for tty in [None, other_session] {
+        // A number nobody uses, and a group in another session.
+        assert_eq!(t.tcsetpgrp(s, tty, 4242, Sigttou::Delivered), user(Errno::NoTty));
+        assert_eq!(t.tcsetpgrp(s, tty, INIT as i32, Sigttou::Delivered), user(Errno::NoTty));
+    }
 }
 
 #[test]
 fn tcsetpgrp_is_esrch_for_a_number_nobody_uses() {
     let (t, s, _c, _j, tty) = job_control();
-    assert_eq!(t.tcsetpgrp(s, tty, 4242, Sigttou::Delivered), Err(Errno::Srch));
-    assert_eq!(t.tcsetpgrp(s, tty, 0, Sigttou::Delivered), Err(Errno::Srch));
+    assert_eq!(t.tcsetpgrp(s, tty, 4242, Sigttou::Delivered), user(Errno::Srch));
+    assert_eq!(t.tcsetpgrp(s, tty, 0, Sigttou::Delivered), user(Errno::Srch));
 }
 
 #[test]
 fn tcsetpgrp_is_eperm_for_a_group_in_another_session() {
     let (mut t, s, c, _j, tty) = job_control();
-    assert_eq!(t.tcsetpgrp(s, tty, INIT as i32, Sigttou::Delivered), Err(Errno::Perm));
+    assert_eq!(t.tcsetpgrp(s, tty, INIT as i32, Sigttou::Delivered), user(Errno::Perm));
     let other = fork(&mut t, INIT);
     t.setsid(other).unwrap();
     let o2 = fork(&mut t, other);
-    assert_eq!(t.tcsetpgrp(s, tty, other as i32, Sigttou::Delivered), Err(Errno::Perm));
+    assert_eq!(t.tcsetpgrp(s, tty, other as i32, Sigttou::Delivered), user(Errno::Perm));
     // A process that leads no group: judged by its own session, as Linux does.
-    assert_eq!(t.tcsetpgrp(s, tty, o2 as i32, Sigttou::Delivered), Err(Errno::Perm));
+    assert_eq!(t.tcsetpgrp(s, tty, o2 as i32, Sigttou::Delivered), user(Errno::Perm));
     assert_eq!(t.tcsetpgrp(s, tty, c as i32, Sigttou::Delivered), Ok(Tcsetpgrp::Set(c)));
 }
 
@@ -270,11 +284,11 @@ fn tcsetpgrp_is_eperm_for_a_number_held_only_as_a_session() {
     let e = fork(&mut t, d);
     t.setpgid(e, 0, 0).unwrap();
     exit(&mut t, d, 0);
-    assert_eq!(wait4(&mut t, INIT, d as i32, 0).pid(), Some(d));
+    assert_eq!(reported_pid(&wait4(&mut t, INIT, d as i32, 0)), Some(d));
     // d is gone and leads no group, but e's session still holds the number.
     assert!(t.is_busy(d));
-    let tty = Terminal { is_controlling: true, session: Some(d), foreground: Some(e) };
-    assert_eq!(t.tcsetpgrp(e, tty, d as i32, Sigttou::Delivered), Err(Errno::Perm));
+    let tty = Some(Controlling { session: Some(d), foreground: Some(e) });
+    assert_eq!(t.tcsetpgrp(e, tty, d as i32, Sigttou::Delivered), user(Errno::Perm));
     assert_eq!(t.tcsetpgrp(e, tty, e as i32, Sigttou::Delivered), Ok(Tcsetpgrp::Set(e)));
 }
 
@@ -287,23 +301,23 @@ fn a_background_caller_gets_sigttou_unless_it_blocks_or_ignores_it() {
     assert_eq!(t.tcsetpgrp(j, tty, 4242, Sigttou::Delivered), Ok(Tcsetpgrp::Sigttou { pgrp: j }));
     // Blocked or ignored: it goes on to the other checks.
     assert_eq!(t.tcsetpgrp(j, tty, j as i32, Sigttou::BlockedOrIgnored), Ok(Tcsetpgrp::Set(j)));
-    assert_eq!(t.tcsetpgrp(j, tty, -1, Sigttou::BlockedOrIgnored), Err(Errno::Inval));
+    assert_eq!(t.tcsetpgrp(j, tty, -1, Sigttou::BlockedOrIgnored), user(Errno::Inval));
 }
 
 #[test]
 fn an_orphaned_background_caller_gets_enotty() {
     let (mut t, s, _c, j, tty) = job_control();
     let k = fork(&mut t, j);
-    t.stop(k, sig(19)).unwrap();
+    t.stop(k, Signal::SIGSTOP).unwrap();
     exit(&mut t, s, 0);
     assert!(t.is_orphaned_pgrp(j));
-    assert_eq!(t.tcsetpgrp(j, tty, j as i32, Sigttou::Delivered), Err(Errno::NoTty));
+    assert_eq!(t.tcsetpgrp(j, tty, j as i32, Sigttou::Delivered), user(Errno::NoTty));
     assert_eq!(t.tcsetpgrp(j, tty, j as i32, Sigttou::BlockedOrIgnored), Ok(Tcsetpgrp::Set(j)));
 }
 
 #[test]
-fn a_dead_caller_is_esrch() {
+fn a_dead_caller_is_a_bug() {
     let (mut t, _s, c, _j, tty) = job_control();
     exit(&mut t, c, 0);
-    assert_eq!(t.tcsetpgrp(c, tty, c as i32, Sigttou::Delivered), Err(Errno::Srch));
+    assert_eq!(t.tcsetpgrp(c, tty, c as i32, Sigttou::Delivered), super::bug(crate::Bug::NotLive { pid: c }));
 }

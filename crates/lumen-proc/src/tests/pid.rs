@@ -2,8 +2,9 @@
 
 use alloc::vec::Vec;
 
-use super::{INIT, exit, fork, wait4};
-use crate::{Errno, FIRST_PID, INIT_PID, PidAllocator, ProcTree};
+use super::{INIT, exit, fork, reported_pid, user, wait4};
+use crate::pid::PidAllocator;
+use crate::{Errno, FIRST_PID, INIT_PID, ProcTree};
 
 #[test]
 fn pids_count_up_from_two_to_the_maximum_then_wrap() {
@@ -96,12 +97,12 @@ fn pid_wrap_around_skips_live_pids_pgids_and_sids() {
     let f = fork(&mut t, INIT); // 8: reaped, free again
     assert_eq!((a, b, c, d, e, z, f), (2, 3, 4, 5, 6, 7, 8));
     exit(&mut t, b, 0);
-    assert_eq!(wait4(&mut t, INIT, b as i32, 0).pid(), Some(b));
+    assert_eq!(reported_pid(&wait4(&mut t, INIT, b as i32, 0)), Some(b));
     exit(&mut t, d, 0);
-    assert_eq!(wait4(&mut t, INIT, d as i32, 0).pid(), Some(d));
+    assert_eq!(reported_pid(&wait4(&mut t, INIT, d as i32, 0)), Some(d));
     exit(&mut t, z, 0);
     exit(&mut t, f, 0);
-    assert_eq!(wait4(&mut t, INIT, f as i32, 0).pid(), Some(f));
+    assert_eq!(reported_pid(&wait4(&mut t, INIT, f as i32, 0)), Some(f));
     assert!(!t.contains(b) && t.pgrp_exists(b), "3 is busy only as a pgid");
     assert!(!t.contains(d) && !t.pgrp_exists(d) && t.is_busy(d), "5 is busy only as a sid");
     assert!(t.is_busy(z), "7 is a zombie's pid");
@@ -111,16 +112,16 @@ fn pid_wrap_around_skips_live_pids_pgids_and_sids() {
     assert_eq!(fork(&mut t, INIT), 9);
     assert_eq!(fork(&mut t, INIT), 8);
     // Now 2..=9 are all busy.
-    assert_eq!(t.fork(INIT, 0), Err(Errno::Again));
-    assert_eq!(t.spawn_root(0), Err(Errno::Again));
+    assert_eq!(t.fork(INIT, 0), user(Errno::Again));
+    assert_eq!(t.spawn_root(0), user(Errno::Again));
     t.check_invariants();
     // Reaping the zombie frees 7; moving 4 out of group 3 frees 3.
-    assert_eq!(wait4(&mut t, INIT, z as i32, 0).pid(), Some(z));
+    assert_eq!(reported_pid(&wait4(&mut t, INIT, z as i32, 0)), Some(z));
     t.setsid(c).unwrap();
     assert!(!t.is_busy(b));
     assert_eq!(fork(&mut t, INIT), 3);
     assert_eq!(fork(&mut t, INIT), 7);
-    assert_eq!(t.fork(INIT, 0), Err(Errno::Again));
+    assert_eq!(t.fork(INIT, 0), user(Errno::Again));
 }
 
 #[test]
@@ -130,7 +131,7 @@ fn a_failed_fork_leaves_the_tree_unchanged() {
     fork(&mut t, INIT);
     fork(&mut t, INIT);
     let before = alloc::format!("{t:?}");
-    assert_eq!(t.fork(INIT, 0), Err(Errno::Again));
+    assert_eq!(t.fork(INIT, 0), user(Errno::Again));
     assert_eq!(alloc::format!("{t:?}"), before);
     assert_eq!(t.children(INIT).len(), 2);
 }

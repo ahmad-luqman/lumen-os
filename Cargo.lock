@@ -484,6 +484,9 @@ dependencies = [
 [[package]]
 name = "lumen-proc"
 version = "0.0.1"
+dependencies = [
+ "linux-raw-sys",
+]
 
 [[package]]
 name = "lumen-queue"

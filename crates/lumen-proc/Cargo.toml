@@ -7,3 +7,6 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+linux-raw-sys = { workspace = true }

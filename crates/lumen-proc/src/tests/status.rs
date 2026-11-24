@@ -160,22 +160,28 @@ fn signals_are_one_to_sixty_four() {
     assert_eq!(Signal::new(255), None);
     assert_eq!(Signal::new(1).map(Signal::get), Some(1));
     assert_eq!(Signal::new(64).map(Signal::get), Some(64));
+    use linux_raw_sys::general as g;
+    assert_eq!(u32::from(Signal::MAX), g::_NSIG);
     let named = [
-        (Signal::SIGHUP, 1),
-        (Signal::SIGKILL, 9),
-        (Signal::SIGCHLD, 17),
-        (Signal::SIGCONT, 18),
-        (Signal::SIGSTOP, 19),
-        (Signal::SIGTSTP, 20),
-        (Signal::SIGTTIN, 21),
-        (Signal::SIGTTOU, 22),
+        (Signal::SIGHUP, g::SIGHUP),
+        (Signal::SIGKILL, g::SIGKILL),
+        (Signal::SIGCHLD, g::SIGCHLD),
+        (Signal::SIGCONT, g::SIGCONT),
+        (Signal::SIGSTOP, g::SIGSTOP),
+        (Signal::SIGTSTP, g::SIGTSTP),
+        (Signal::SIGTTIN, g::SIGTTIN),
+        (Signal::SIGTTOU, g::SIGTTOU),
     ];
     for (s, n) in named {
-        assert_eq!(s.get(), n);
+        assert_eq!(u32::from(s.get()), n);
     }
 }
 
 #[test]
 fn cld_codes_are_linuxs() {
-    assert_eq!([CLD_EXITED, CLD_KILLED, CLD_DUMPED, CLD_STOPPED, CLD_CONTINUED], [1, 2, 3, 5, 6]);
+    use linux_raw_sys::general as g;
+    assert_eq!(
+        [CLD_EXITED, CLD_KILLED, CLD_DUMPED, CLD_STOPPED, CLD_CONTINUED].map(|c| c as u32),
+        [g::CLD_EXITED, g::CLD_KILLED, g::CLD_DUMPED, g::CLD_STOPPED, g::CLD_CONTINUED]
+    );
 }
