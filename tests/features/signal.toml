@@ -1,0 +1,4 @@
+[[feature]]
+name = "POSIX signal logic (sets, actions, x86-64 frames, sigreturn checks)"
+milestone = "M8"
+tests = ["cargo:lumen-signal"]
