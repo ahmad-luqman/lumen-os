@@ -58,6 +58,18 @@ jobs:
       - run: make build
       - name: Flag audit (no SSE/AVX, no red zone, kernel code model)
         run: make audit
+      # musl libc-test (#345): the pinned zig and libc-test checkout, keyed on
+      # the scripts that pin them (each also checks its own stamp), then the
+      # build, which tests/harness/test_libctest.py checks and runs natively.
+      - name: Cache the pinned zig and libc-test sources
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/deps/zig
+            build/deps/libc-test
+          key: zig-libc-test-${{ runner.os }}-${{ hashFiles('tools/fetch-zig.sh', 'tools/fetch-libc-test.sh') }}
+      - name: Build musl libc-test with the pinned zig
+        run: make libc-test
       - run: make test-host
       - name: QEMU scenarios (boot, crash reports, in-kernel tests, golden images)
         id: scenarios

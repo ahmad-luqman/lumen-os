@@ -1,0 +1,12 @@
+# musl libc-test: the tests expected to fail in Lumen (tools/build-libc-test.sh
+# builds them; lumen_harness.libctest reads this file and judges a run).
+#
+# One test per line: its path under build/libc-test (as libc-test's FAIL lines
+# print it), then `# <reason> #<issue>`, the issue that will fix it:
+#
+#   src/functional/<name>-static.exe # <why it fails in Lumen> #<issue number>
+#
+# Lines that are empty or start with `#` are comments. A test is listed only
+# for a failure (`[status N]`, `[signal ...]` or `[timed out]`); a runner error
+# is never expected. A listed test that passes fails the run, so remove its
+# line in the PR that fixes it.
