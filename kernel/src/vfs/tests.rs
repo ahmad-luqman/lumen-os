@@ -8,7 +8,7 @@
 //! `ext4::ktest_util` (`Mnt`, `mount`, `remount_ro`).
 
 use super::*;
-use ext4::ktest_util::{Mnt, image, mount, mount_ro_image, remount_ro, went_read_only};
+use ext4::ktest_util::{Mnt, image, mount, mount_ro_image, own_result, read_only_after, remount_ro, went_read_only};
 use lumen_vfs::OpenGuard;
 
 crate::ktest!(
@@ -785,20 +785,6 @@ crate::ktest!(
     }
 );
 
-/// After a sweep's fault: whether a write failed, so the volume went
-/// read-only (`errors=remount-ro`, #349; checked: a create refused). The leg
-/// then writes nothing more, its checks of the failed operation's own
-/// outcome done. `false` when the fault fell past the operation's writes:
-/// the leg goes on as before.
-fn read_only_after(m: &Mnt) -> Result<bool, &'static str> {
-    if !m.fs.errored() {
-        // No device write failed: the fault fell past the operation's
-        // writes (a failed one errors the volume, even under an `Ok`).
-        return if m.cache.faulted() { Err("a write failed, but the volume is writable") } else { Ok(false) };
-    }
-    if went_read_only(m) { Ok(true) } else { Err("errored after a fault, but not read-only") }
-}
-
 #[inline(never)]
 fn sweep_rmdir_io_recovery(base_img: &[u8], quota_before: usize) -> Result<(), &'static str> {
     use crate::{kassert, kassert_eq};
@@ -1393,7 +1379,7 @@ fn sweep_truncate_shrink_io_recovery(base_img: &[u8]) -> Result<(), &'static str
         let m = mount(snap.clone(), 39)?;
         let tf = resolve_path(&m.tables, None, b"/t8k.bin", rf).map_err(|_| "resolve t8k sweep")?.inode;
         m.cache.arm_write(fail_at);
-        let res = tf.truncate(100);
+        let res = own_result(&m.fs, tf.truncate(100));
         m.cache.arm_write(0);
 
         let ro_fs = remount_ro(&m, 40)?;

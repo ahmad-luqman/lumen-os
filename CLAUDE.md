@@ -387,7 +387,8 @@ one is its own PR that updates that doc first.
   cache's `first_failure` (`LatchableCache`, the controls only the caches
   below the latch have) and latched at `LatchedCache`, the one seam the
   volume holds, makes the volume read-only (syncs stop there, older shared
-  mappings take no store, a miss with no clean slot read uncached) and
+  mappings get no new writable PTE, a miss with no clean slot read
+  uncached, an operation running then `EIO`, `WriteOp::end`) and
   freezes its block cache when the last write-type operation (`WriteOp`,
   naming the one that met it) ends, or at once for a read's eviction with
   none running, #349; the

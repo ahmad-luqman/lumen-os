@@ -152,9 +152,9 @@ fn syncable(inode: &dyn VfsInode) -> bool {
 /// but `O_PATH` (`EBADF`), whatever its access mode.
 ///
 /// A failure comes back as the filesystem gave it (`EIO` for a device
-/// error). On ext4 a page whose writeback failed stays dirty in the page
-/// cache, and a block cache whose sync failed keeps its blocks dirty: the
-/// next sync writes either.
+/// error). On ext4 a failed device write makes the volume read-only
+/// (`errors=remount-ro`, #349): the pages and blocks not yet written stay
+/// dirty in memory, never written, and every later `fsync` there is `EIO`.
 fn fsync(fd: Fd, data_only: bool) -> Result<u64, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;

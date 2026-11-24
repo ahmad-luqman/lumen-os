@@ -183,6 +183,11 @@ crate::ktest!(
             let private = map(P, RW, PRIVATE, fd, 0)?;
             copy_to_user(private, b"private").map_err(|_| "private store")?;
             kassert_eq!(sys_munmap(private, P), 0);
+            // Nor does `mprotect` refuse write access to a private one.
+            let private_ro = map(P, READ, PRIVATE, fd, 0)?;
+            kassert_eq!(sys_mprotect(private_ro, P, RW), 0);
+            copy_to_user(private_ro, b"private").map_err(|_| "private store after mprotect")?;
+            kassert_eq!(sys_munmap(private_ro, P), 0);
             kassert_eq!(sys_munmap(va, P), 0);
             Ok::<_, &'static str>((failed, retried))
         })??;

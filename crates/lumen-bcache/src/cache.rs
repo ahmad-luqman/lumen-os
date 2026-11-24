@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Ref, RefCell, RefMut};
 use core::ops::{Deref, DerefMut};
@@ -61,7 +60,7 @@ impl Slot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Writeback {
     Running,
-    /// [`BlockCache::stop_writeback`], or a failure under
+    /// `BlockCache::stop_writeback` (test-util), or a failure under
     /// [`BlockCache::stop_writeback_on_failure`]: nothing is written to the
     /// device or flushed; writes into the cache are still taken.
     Stopped,
@@ -244,7 +243,8 @@ impl<B: BlockDevice> BlockCache<B> {
     /// [`Self::sync`] and [`Self::flush_blocks`] return
     /// [`BlockError::ReadOnly`] without writing or flushing anything, and
     /// eviction takes only clean slots, so dirty blocks stay cached and keep
-    /// being read (a miss while every unpinned slot is dirty returns
+    /// being read (a [`Self::read_at`] miss while every unpinned slot is
+    /// dirty is read from the device, uncached; a write or pin miss returns
     /// [`BlockError::CacheFull`]). For a filesystem that stops writing after
     /// a write error (`ext4`'s `errors=remount-ro`).
     #[cfg(any(test, feature = "test-util"))]
@@ -256,7 +256,7 @@ impl<B: BlockDevice> BlockCache<B> {
     }
 
     /// From now on, the first device write or flush that fails stops
-    /// writeback ([`Self::stop_writeback`]) before the call that met it
+    /// writeback (`stop_writeback`) before the call that met it
     /// returns, so nothing else reaches the device after it. Off by
     /// default: a failed block then stays dirty and the next writeback
     /// tries it again.
@@ -264,7 +264,7 @@ impl<B: BlockDevice> BlockCache<B> {
         self.inner.borrow_mut().stop_on_failure = true;
     }
 
-    /// Whether writeback is stopped ([`Self::stop_writeback`],
+    /// Whether writeback is stopped (`stop_writeback` (test-util),
     /// [`Self::freeze`], or a failure under
     /// [`Self::stop_writeback_on_failure`]).
     pub fn writeback_stopped(&self) -> bool {
@@ -292,9 +292,10 @@ impl<B: BlockDevice> BlockCache<B> {
     /// How many block writebacks and flushes the device has failed: an
     /// eviction's (which fails the `read_at`, `write_at` or pin whose miss
     /// needed the slot, a read included), a sync's block (the sync stops
-    /// there) or a sync's flush (what it wrote may not be durable). The one
-    /// signal that a device write failed, since a call's error alone can't
-    /// say (a pre-read, a full cache): a caller compares it before and after.
+    /// there) or a sync's flush (what it wrote may not be durable), for
+    /// statistics; [`Self::first_failure`], set at the first of them, is
+    /// what tells a caller that a device write failed (a call's error alone
+    /// can't say: a pre-read, a full cache).
     pub fn writeback_failures(&self) -> u64 {
         self.inner.borrow().writeback_failures
     }
@@ -305,7 +306,7 @@ impl<B: BlockDevice> BlockCache<B> {
     }
 
     /// The first device write or flush that failed, kept for good (a
-    /// [`Self::thaw`] doesn't clear it): one call after another tells
+    /// `thaw` (test-util) doesn't clear it): one call after another tells
     /// whether a device write failed, whatever that call returned.
     pub fn first_failure(&self) -> Option<BlockError> {
         self.inner.borrow().first_failure
@@ -431,7 +432,15 @@ impl<B: BlockDevice> BlockCache<B> {
                     }
                     Ok(Err(e)) => {
                         Self::note_device_failure(&mut inner, e);
-                        return Err(e);
+                        if inner.writeback == Writeback::Running {
+                            return Err(e);
+                        }
+                        // Writeback stopped at this failure
+                        // (`stop_writeback_on_failure`): the victim stays
+                        // dirty for good, and the miss looks again, for a
+                        // clean slot or none (`CacheFull`, which a read
+                        // serves past the cache). The failure is kept in
+                        // `first_failure` for the caller to see.
                     }
                     Err(e) => return Err(e),
                 }
@@ -559,7 +568,8 @@ impl<B: BlockDevice> BlockCache<B> {
     /// slot still serves reads.
     fn read_uncached(&self, block_id: u64, in_block: usize, dst: &mut [u8]) -> Result<(), BlockError> {
         let (lba, valid_bytes) = self.block_extent(block_id)?;
-        let mut block = vec![0u8; BLOCK_SIZE];
+        // On the stack: nothing allocated while the cache's lock is held.
+        let mut block = [0u8; BLOCK_SIZE];
         self.device.read_sectors(lba, &mut block[..valid_bytes])?;
         dst.copy_from_slice(&block[in_block..in_block + dst.len()]);
         Ok(())

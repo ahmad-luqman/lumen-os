@@ -508,12 +508,6 @@ impl MappedPage {
         self.page.copy_to_frame(dst, self.valid_len());
     }
 
-    /// Count one `PRESENT | WRITABLE | PTE_SHARED` mapping of the page: mark
-    /// it dirty and raise its writable-mapping count together, before the
-    /// caller makes the PTE writable. The returned [`WritableMap`] lowers
-    /// the count again when dropped, which the VM core does only after the
-    /// PTE is cleared or made read-only and the TLB flushed (ARCHITECTURE
-    /// section 5's unmap order). This is the one way to count a mapping.
     /// Whether the page's volume has gone read-only since the mapping was
     /// made (`errors=remount-ro`, #349): a store fault on it is then a bus
     /// error, as Linux's `page_mkwrite` refuses on a shut-down `ext4`.
@@ -521,6 +515,12 @@ impl MappedPage {
         mapped_read_only(&*self.owner)
     }
 
+    /// Count one `PRESENT | WRITABLE | PTE_SHARED` mapping of the page: mark
+    /// it dirty and raise its writable-mapping count together, before the
+    /// caller makes the PTE writable. The returned [`WritableMap`] lowers
+    /// the count again when dropped, which the VM core does only after the
+    /// PTE is cleared or made read-only and the TLB flushed (ARCHITECTURE
+    /// section 5's unmap order). This is the one way to count a mapping.
     #[must_use = "dropping the guard uncounts the mapping at once"]
     pub(crate) fn map_writable(&self) -> WritableMap {
         self.page.set_dirty();
@@ -651,11 +651,14 @@ pub(crate) fn mappable(inode: &dyn VfsInode) -> bool {
     inode.inode_type() == lumen_vfs::InodeType::File && page_cache_lock(inode).is_some()
 }
 
-/// Whether `inode`'s volume refuses a new shared writable mapping
-/// (`EROFS`): an `ext4` one read-only, mounted so or errored since its
-/// descriptor was opened `O_RDWR` (`errors=remount-ro`, #349). Asked of the
-/// inode's own filesystem, so a volume outside the mount table (a ktest's)
-/// answers too; `tmpfs` never refuses.
+/// Whether `inode`'s volume refuses writing through a shared mapping: a new
+/// writable one (`EROFS`), a store fault or promotion on an older one (a
+/// bus error) and `mprotect(+W)` (`EACCES`). An `ext4` one read-only,
+/// mounted so or errored since its descriptor was opened `O_RDWR`
+/// (`errors=remount-ro`, #349), unless the file is detached (open but
+/// unlinked: all in memory, as its `write` is). Asked of the inode's own
+/// filesystem, so a volume outside the mount table (a ktest's) answers too;
+/// `tmpfs` never refuses.
 pub(crate) fn mapped_read_only(inode: &dyn VfsInode) -> bool {
     inode
         .as_any()

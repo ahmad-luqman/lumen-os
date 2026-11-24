@@ -510,10 +510,10 @@ the console, `<command>: sync failed: <error> (the log says what failed);
 cache writes its dirty blocks back in block order and stops at the first
 that fails, before the device flush: the blocks ahead of it reached the
 device but were never flushed, and it and the ones after it are lost.
-Staying up would save them only if the failure passes (a failed block stays
-dirty for the next sync, section 9), and whoever suspects that runs the
-shell's `sync` command first, as often as they like; refusing would let a
-disk that keeps failing keep the machine from going down at all. What the
+Staying up saves nothing: on ext4 that failure makes the volume read-only
+(`errors=remount-ro`, section 9), so no later sync writes them; refusing
+would let a disk that keeps failing keep the machine from going down at
+all. What the
 ext4 rootfs holds unsynced is on the disk after either (tested:
 `test_fs::test_ext4_unsynced_writes_survive_reboot` and
 `test_fs::test_ext4_unsynced_writes_survive_shutdown`, each checking first
@@ -5213,8 +5213,10 @@ blocks, extent trees, and file data writeback):
   unpinned slots, so a dirty block stays cached, still served to reads,
   until reboot; a `read_at` miss while every unpinned slot is dirty is read
   straight from the device into the caller's buffer, uncached (the block
-  isn't cached, so the device holds it), and only a pin of one returns
-  `CacheFull`.
+  isn't cached, so the device holds it), while a `write_at` or pin miss
+  returns `CacheFull`. Under `stop_writeback_on_failure`, a miss whose
+  eviction met the failure looks again the same way, so a read that met
+  it is served (the failure kept in `first_failure`).
   `stop_writeback_on_failure` (off by default, when the failed block stays
   dirty for the next writeback, above) makes the first failed device write
   or flush stop writeback inside the call that met it, so nothing else
@@ -5703,7 +5705,11 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     When an undo write of a `links_count` fails, the adapter keeps in-memory
     bounds so `stat` and later operations see the true link count (the
     volume is read-only by then, `errors=remount-ro` below, so nothing
-    writes the corrected count; writeback never writes `links_count`); the
+    writes the corrected count; writeback never writes `links_count`).
+    Bounds left on a volume still writable (an undo that couldn't read an
+    inode back, a read fault erroring nothing) are written before the next
+    operation changes that count (`store_bounded_links`,
+    `ext4_a_kept_link_count_is_written_before_the_next_unlink`). The
     bounds are not persisted, so an undo that never lands leaves work for
     `e2fsck` after a reboot. The
     bounds are `lumen_vfs::nlink::NlinkBounds` (host-tested): one map per
@@ -5811,7 +5817,7 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       write carrying the raised group count doubles the group's count, and
       a failed superblock write doubles the superblock's as well; a failed
       bitmap byte or bitmap-checksum write doubles nothing
-      (`ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`,
+      (`ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio`,
       by the `FaultCache`). `e2fsck` recomputes the counts (read, not
       tested).
     - `ext4plus`'s `Extent::allocate` (`extent.rs`) retries any failed
@@ -5927,18 +5933,30 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     - *Read-only from the failed write on* until reboot (nothing clears
       it): `FileSystem::read_only()` and `errored()` say so at once, so a
       write-type operation starting after the failure is refused (`fsync`
-      too: `EIO`). Those running at the failure finish against the cache
-      and memory: their later writes and the failing one's undo (above) go
-      into the block cache, never to the device, and the failing one
-      returns its error. Each holds a `WriteOp`; when the last one ends, the
-      latch settles (below). The VFS refuses every write-type path with
+      too: `EIO`; `writable_op` checks again once the operation is counted,
+      so one starting as the failure comes is either refused or counted).
+      Those running at the failure finish against the cache and memory:
+      their later writes and the failing one's undo (above) go into the
+      block cache, never to the device. Each holds a `WriteOp`; an operation
+      that began on a healthy volume and ends on an errored one returns
+      `EIO` whatever it returned itself (`WriteOp::end`; its own error, if
+      any, stands): what it did went into a cache that never writes back,
+      so it didn't happen on the disk, though until reboot it may show in
+      memory. A read whose eviction met the failure is served (below), so
+      the operation may not see the failure itself (a `link` would return
+      `Ok`). When the last one ends, the latch settles (below). The VFS
+      refuses every write-type path with
       `EROFS` (create, `mkdir`, `symlink`, `link`, `unlink`, `rmdir`,
       `rename`, an open for writing or truncating,
       `chmod`/`chown`/`utimensat`), and the adapter's own checks refuse a
       `write`, `truncate` and attribute change through a descriptor opened
       before (a detached inode's, all in memory, still work, as on a
-      read-only mount); a `write` checks again after its own reclaim and
-      its partial page's read, either of which can meet the failure. A new
+      read-only mount). A `write` checks again after its own reclaim
+      (`EROFS`, nothing written) and after each partial page's read, either
+      of which can meet the failure: nothing of the write lands in that
+      page, so the first page's refuses the write (`EROFS`), and the last
+      page's makes it short, the pages before it taken while the volume was
+      healthy, as any write's bytes are until a sync. A new
       shared writable mapping is `EROFS` (section 5's `may_write`); on one
       made before the error, a store fault (a page not yet mapped, or one
       mapped read-only by a read) is a bus error (`SIGBUS`, as Linux's
@@ -5948,8 +5966,9 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
     - *Reads keep working,* from the block and page caches (which hold the
       failed operation's in-memory undo): the stopped cache evicts only
       clean blocks, and a miss with no clean slot is read straight from the
-      device, uncached (`BlockCache::read_at`). A read whose eviction met
-      the failure reads again.
+      device, uncached (`BlockCache::read_at`). A miss whose eviction met
+      the failure looks again inside the block cache (`ensure_slot`), so
+      the read that met it is served too.
     - *Then nothing more is written to the cache either:* when the last
       write-type operation running at the failure ends, or at once when a
       read meets it with none running, the latch settles: it freezes the
@@ -5963,9 +5982,10 @@ CI and macOS stay free of a C cross-compiler and `make audit` stays clean.
       `ERROR vfs: ext4 <dev>: <op> failed writing to the device (<cause>);
       the volume is read-only until reboot (errors=remount-ro); run e2fsck
       -f`, `<op>` the operation whose write failed (`unlink`, `rename`,
-      `writeback`, `fsync`, ...: the innermost write-type operation of the
-      thread that met the failure and was running then), or `a read's
-      eviction`, and `<cause>` the block cache's first failure. `mount` shows its mode as
+      `writeback`, `fsync`, ...: the innermost write-type operation, begun
+      before the failure, of the thread whose call first saw it, which with
+      two operations running at the failure may be the other one's), or
+      `a read's eviction`, and `<cause>` the block cache's first failure. `mount` shows its mode as
       `ro,errors`, `/proc/mounts` as `ro,errors=remount-ro`.
     - *Not marked on disk:* the superblock's `s_state` error bit and
       `s_error_count` aren't set. `ext4plus` 0.1.0-rc.2 neither reads nor
@@ -6601,7 +6621,8 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     inodes, then its block cache), continuing past a failing filesystem
     and reporting the first error (each failure logged once at `warn`,
     naming the inode or the block cache). Within an `ext4` volume it stops
-    at the first failed write, which makes the volume read-only (#349).
+    at the first failed device write, which makes the volume read-only
+    (#349); an inode failing otherwise (`ENOSPC`) doesn't stop it.
   - `vfstest <op> ...`: test-facing file operations over the VFS (`stat`,
     `cat`/`read`, `ls`, `write`, `write-pattern`/`verify-pattern`,
     `truncate`, `chmod`, `mkdir`, `rmdir`, `unlink`, `rename`, `symlink`,

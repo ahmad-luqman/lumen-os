@@ -910,9 +910,9 @@ impl Going {
 /// the first that fails, before the device flush: the blocks ahead of it
 /// reached the device but were never flushed, and it and the ones after it
 /// are lost. On `ext4` that failure makes the volume read-only
-/// (`errors=remount-ro`, #349): it writes nothing more, so every later sync
-/// of it, this one included, is `EIO` and staying up saves nothing; the log's
-/// ERROR line already said so. Refusing to go down would only make a disk
+/// (`errors=remount-ro`, #349): it writes nothing more, so this sync
+/// returns `EIO`, and so does every later one, and staying up saves
+/// nothing; the log's ERROR line says so. Refusing to go down would only make a disk
 /// that failed keep the machine up.
 fn sync_then_announce(ctx: &mut Ctx<'_>, going: Going, sync: impl FnOnce() -> Result<(), lumen_vfs::VfsError>) {
     let (command, doing) = (going.command(), going.doing());

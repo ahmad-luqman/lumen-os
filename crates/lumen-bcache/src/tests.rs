@@ -621,7 +621,7 @@ fn a_frozen_cache_writes_nothing_and_keeps_its_dirty_blocks() {
     cache.read_at(0, &mut got).unwrap();
     assert_eq!(got, [0xaa; 4]);
     assert_eq!(cache.stats().dirty, 1);
-    // With every unpinned slot dirty a miss can't be served.
+    // With every unpinned slot dirty a pin's miss can't be served.
     {
         let _p6 = cache.pin(6).unwrap();
         let _p7 = cache.pin(7).unwrap();
@@ -641,23 +641,30 @@ fn a_frozen_cache_writes_nothing_and_keeps_its_dirty_blocks() {
 fn the_first_device_failure_stops_writeback_when_asked() {
     // A failed eviction (on a read's miss), with stop_writeback_on_failure:
     // counted, and from then on nothing reaches the device, though writes
-    // into the cache are still taken and misses served from clean slots.
+    // into the cache are still taken and misses served from clean slots;
+    // the read that met it is served too (from the clean slot it then
+    // finds), the failure kept in `first_failure`.
     let mut buf = [0u8; 16];
     let cache = BlockCache::new(MemBlockDevice::new(512, 64), 3).unwrap();
     cache.stop_writeback_on_failure();
+    cache.device().seed(3 * BLOCK_SIZE, &[0x33; 4]);
+    cache.device().seed(5 * BLOCK_SIZE, &[0x55; 4]);
+    cache.device().seed(5 * BLOCK_SIZE + 100, &[0x5a; 4]);
+    cache.device().seed(6 * BLOCK_SIZE, &[0x66; 4]);
     cache.write_at(0, &[0x11; 16]).unwrap(); // dirty, least recently used
     cache.write_at(BLOCK_SIZE as u64, &[0x22; 16]).unwrap(); // dirty
     cache.read_at(2 * BLOCK_SIZE as u64, &mut buf).unwrap(); // clean
     cache.device().inject_write_error(BlockError::Io);
-    assert_eq!(cache.read_at(3 * BLOCK_SIZE as u64, &mut buf), Err(BlockError::Io));
+    cache.device().clear_logs();
+    let before = cache.device().volatile_snapshot();
+    cache.read_at(3 * BLOCK_SIZE as u64, &mut buf).unwrap();
+    assert_eq!(buf[..4], [0x33; 4]);
     assert!(cache.writeback_stopped() && !cache.is_frozen());
     assert_eq!(cache.writeback_failures(), 1);
     assert_eq!(cache.first_failure(), Some(BlockError::Io));
-    cache.device().seed(5 * BLOCK_SIZE, &[0x55; 4]);
-    cache.device().clear_logs();
-    let before = cache.device().volatile_snapshot();
-    // Block 0 would have been the victim again: now only the clean block 2 goes.
-    cache.read_at(3 * BLOCK_SIZE as u64, &mut buf).unwrap();
+    // Block 0 stays dirty, cached; the clean block 2 went for block 3.
+    cache.read_at(0, &mut buf).unwrap();
+    assert_eq!(buf[..4], [0x11; 4]);
     cache.write_at(2 + BLOCK_SIZE as u64, &[0x33; 4]).unwrap(); // still taken
     assert_eq!(cache.sync(), Err(BlockError::ReadOnly));
     assert_eq!(cache.flush_blocks(&[0, 1]), Err(BlockError::ReadOnly));
@@ -667,12 +674,19 @@ fn the_first_device_failure_stops_writeback_when_asked() {
     cache.write_at(3 * BLOCK_SIZE as u64, &[0x44; 4]).unwrap();
     cache.read_at(5 * BLOCK_SIZE as u64, &mut buf).unwrap();
     assert_eq!(buf[..4], [0x55; 4]);
+    // From inside a block, and across two.
+    cache.read_at(5 * BLOCK_SIZE as u64 + 100, &mut buf[..4]).unwrap();
+    assert_eq!(buf[..4], [0x5a; 4]);
+    let mut span = [0u8; 8];
+    cache.read_at(6 * BLOCK_SIZE as u64 - 4, &mut span).unwrap();
+    assert_eq!(span, [0, 0, 0, 0, 0x66, 0x66, 0x66, 0x66]);
     assert_eq!(cache.stats().cached, 3);
     cache.read_at(3 * BLOCK_SIZE as u64, &mut buf).unwrap();
     assert_eq!(buf[..4], [0x44; 4]);
     // A pin can't be served that way: it needs a slot.
     assert_eq!(cache.pin(6).err(), Some(BlockError::CacheFull));
-    assert!(cache.device().write_log().is_empty());
+    // The one failed write, then nothing.
+    assert_eq!(cache.device().write_log().len(), 1);
     assert_eq!(cache.device().flush_calls(), 0);
     assert_eq!(cache.device().volatile_snapshot(), before);
     cache.read_at(BLOCK_SIZE as u64, &mut buf).unwrap();
@@ -701,4 +715,24 @@ fn the_first_device_failure_stops_writeback_when_asked() {
     cache.sync().unwrap();
     assert_eq!(cache.device().durable_snapshot()[..16], [0x77; 16]);
     assert_eq!(cache.first_failure(), Some(BlockError::Timeout));
+    // A later failure is counted, the first kept.
+    cache.write_at(0, &[0x78; 16]).unwrap();
+    cache.device().inject_flush_error(BlockError::Io);
+    assert_eq!(cache.sync(), Err(BlockError::Io));
+    assert_eq!(cache.writeback_failures(), 2);
+    assert_eq!(cache.first_failure(), Some(BlockError::Timeout));
+}
+
+#[test]
+fn a_stopped_cache_reads_a_partial_last_block_uncached() {
+    // 60 sectors: the last 4 KiB block holds 4 of its 8. With the one slot
+    // dirty, a read of it goes past the cache, reading only what exists.
+    let cache = BlockCache::new(MemBlockDevice::new(512, 60), 1).unwrap();
+    cache.device().seed(7 * BLOCK_SIZE + 10, &[0x7a; 4]);
+    cache.write_at(0, &[0x11; 4]).unwrap();
+    cache.stop_writeback();
+    let mut got = [0u8; 4];
+    cache.read_at(7 * BLOCK_SIZE as u64 + 10, &mut got).unwrap();
+    assert_eq!(got, [0x7a; 4]);
+    assert_eq!(cache.stats().cached, 1);
 }

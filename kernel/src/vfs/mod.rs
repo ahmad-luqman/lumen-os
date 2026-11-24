@@ -200,26 +200,27 @@ pub fn init() {
             continue;
         }
         let hw_ro = entry.dev.info().read_only;
-        let cache: Arc<dyn ext4::LatchableCache> = entry.cache;
+        let id = entry.id;
+        let cache: Arc<dyn ext4::LatchableCache> = entry.into_cache();
         match has_ext4_magic(&*cache) {
             Ok(true) => {}
             Ok(false) => {
-                debug!(target: "vfs", "blk{}: no ext4 superblock", entry.id);
+                debug!(target: "vfs", "blk{}: no ext4 superblock", id);
                 continue;
             }
             Err(err) => {
-                warn!(target: "vfs", "blk{}: can't read the superblock: {err:?}", entry.id);
+                warn!(target: "vfs", "blk{}: can't read the superblock: {err:?}", id);
                 continue;
             }
         }
         match ext4::Ext4FileSystem::mount(cache, DevId::ROOT, hw_ro) {
             Ok(fs) => {
                 EXT4_FILESYSTEMS.lock().push(Arc::clone(&fs));
-                mounted_ext4 = Some((entry.id, fs));
+                mounted_ext4 = Some((id, fs));
                 break;
             }
             Err(err) => {
-                warn!(target: "vfs", "blk{}: has an ext4 superblock but won't mount: {err:?}", entry.id);
+                warn!(target: "vfs", "blk{}: has an ext4 superblock but won't mount: {err:?}", id);
             }
         }
     }

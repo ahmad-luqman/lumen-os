@@ -182,10 +182,10 @@ impl LatchedCache {
     /// No write-type operation runs any more (or a read met the failure
     /// outside one): if the latch tripped (and nobody settled it yet),
     /// refuse every write from now on, freeze the cache below and log it,
-    /// once, naming the operation that met the failure. Whether it settled.
-    fn settle(&self) -> bool {
+    /// once, naming the operation that met the failure.
+    fn settle(&self) {
         if self.state.compare_exchange(TRIPPED, FROZEN, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            return false;
+            return;
         }
         self.inner.freeze();
         let cause = self.inner.first_failure().unwrap_or(BlockError::Io);
@@ -196,7 +196,6 @@ impl LatchedCache {
              (errors=remount-ro); run e2fsck -f",
             self.dev
         );
-        true
     }
 
     /// `call` on the cache below, tripping if a device write failed
@@ -222,16 +221,13 @@ impl LatchedCache {
 
 impl BlockCacheBackend for LatchedCache {
     fn read_at(&self, byte_off: u64, dst: &mut [u8]) -> Result<(), BlockError> {
+        // A read whose eviction meets the failure is served all the same
+        // (the cache below looks again for a clean slot, or reads past
+        // itself); with no write-type operation running, the latch settles
+        // here.
         let res = self.watched(|| self.inner.read_at(byte_off, dst));
-        if res.is_err() && !self.healthy() {
-            // Its eviction may have met the failure, which stopped
-            // writeback: with no write-type operation running, it ends
-            // here. Either way the cache below now evicts only clean blocks
-            // or reads past itself, so the read is tried again.
-            if self.ops.load(Ordering::SeqCst) == 0 {
-                self.settle();
-            }
-            return self.inner.read_at(byte_off, dst);
+        if !self.healthy() && self.ops.load(Ordering::SeqCst) == 0 {
+            self.settle();
         }
         res
     }
@@ -920,6 +916,8 @@ const DETACHED_SCAN_LIMIT_PAGES: usize = 4 * page_cache::DETACHED_QUOTA_PAGES;
 struct Ext4FsInner {
     dev: DevId,
     ext4: Ext4,
+    /// The same seam as [`Ext4Shared::cache`] (one `LatchedCache`), here
+    /// for the adapter's raw reads and writes under Lock 6.
     bcache: SharedBlockCache,
     layout: Ext4DiskLayout,
     live_inodes: BTreeMap<u32, Weak<Ext4Inode>>,
@@ -1313,6 +1311,11 @@ struct Ext4Shared {
     /// The ktests' clock: when set, [`Ext4Shared::now`] reads it.
     #[cfg(feature = "ktest")]
     clock: SleepMutex<Option<Timespec>>,
+    /// Whether the last write-type operation to end returned `Ok` of its
+    /// own, turned into `EIO` by [`WriteOp::end`]: for the fault sweeps,
+    /// which check each outcome's state ([`ktest_util::own_result`]).
+    #[cfg(feature = "ktest")]
+    ok_turned_eio: AtomicBool,
 }
 
 /// A write-type operation on the volume, from its start to its end (the
@@ -1325,8 +1328,26 @@ struct WriteOp<'a> {
     op: &'static str,
     /// The thread running it.
     thread: u64,
-    /// It began before the failure: it may be the one that met it.
+    /// It began on a healthy volume and reaches the block cache: it may be
+    /// the one that met the failure, and if the volume errors before it
+    /// ends, what it did there never lands ([`Self::end`]). A detached
+    /// inode's operation (all in memory) never is.
     began_healthy: bool,
+}
+
+impl WriteOp<'_> {
+    /// The operation's result, `EIO` in place of `Ok` when the volume
+    /// errored while it ran (#349): its writes went into a block cache that
+    /// never writes back again, so it didn't happen on the disk, whatever
+    /// it returned (a read whose eviction met the failure is served, so
+    /// the operation may not see the failure itself). Its own error, if it
+    /// has one, stands.
+    fn end<T>(self, res: Result<T, VfsError>) -> Result<T, VfsError> {
+        let turned = self.began_healthy && !self.shared.cache.healthy() && res.is_ok();
+        #[cfg(feature = "ktest")]
+        self.shared.ok_turned_eio.store(turned, Ordering::SeqCst);
+        if turned { Err(VfsError::Io) } else { res }
+    }
 }
 
 impl Drop for WriteOp<'_> {
@@ -1359,14 +1380,28 @@ impl Ext4Shared {
         if self.read_only() {
             return Err(VfsError::RoFs);
         }
-        Ok(self.op(op))
+        let op = self.op(op);
+        // Counted first, then checked again: a failure before the count
+        // refuses it here (the latch may have settled without it), one
+        // after waits for it to end ([`WriteOp::end`]).
+        if !op.began_healthy {
+            return Err(VfsError::RoFs);
+        }
+        Ok(op)
     }
 
-    /// Operation `op` begins, its writability checked by the caller (a
-    /// detached inode's work is in memory).
+    /// Operation `op` begins, its writability checked by the caller.
     fn op(&self, op: &'static str) -> WriteOp<'_> {
         self.cache.ops.fetch_add(1, Ordering::SeqCst);
         WriteOp { shared: self, op, thread: thread_id(), began_healthy: self.cache.healthy() }
+    }
+
+    /// A detached inode's operation `op` begins: all in memory, never
+    /// reaching the block cache, so neither refused nor failed by the
+    /// volume's errors.
+    fn memory_op(&self, op: &'static str) -> WriteOp<'_> {
+        self.cache.ops.fetch_add(1, Ordering::SeqCst);
+        WriteOp { shared: self, op, thread: thread_id(), began_healthy: false }
     }
 
     /// The wall clock, for times this filesystem sets.
@@ -1383,11 +1418,7 @@ impl Ext4Shared {
     /// the block cache has its own lock, 7). A failure comes back as the
     /// errno to report and its cause, for the caller to log once.
     fn sync_bcache(&self) -> Result<(), (VfsError, BlockError)> {
-        let bcache = {
-            let inner = self.state.lock();
-            Arc::clone(&inner.bcache)
-        };
-        bcache.sync().map_err(|e| (map_block_error(&e), e))
+        self.cache.sync().map_err(|e| (map_block_error(&e), e))
     }
 }
 
@@ -1472,6 +1503,8 @@ impl Ext4FileSystem {
             }),
             #[cfg(feature = "ktest")]
             clock: SleepMutex::new(None),
+            #[cfg(feature = "ktest")]
+            ok_turned_eio: AtomicBool::new(false),
         });
 
         let root = {
@@ -1510,18 +1543,19 @@ impl FileSystem for Ext4FileSystem {
         Arc::clone(&self.root) as Arc<dyn VfsInode>
     }
 
-    /// Flush every live inode, then the block cache, even past failures:
-    /// one inode that can't be written mustn't keep the others (and the
-    /// metadata in the block cache) off the disk. Each failure is logged;
-    /// the first is returned. A failed device write stops it there (#349):
-    /// nothing more is written, into the cache either (the cache below can
-    /// evict only clean blocks from then on).
+    /// Flush every live inode, then the block cache, going on past an
+    /// inode whose failure isn't a device write's (`ENOSPC` with nothing
+    /// written, a read): one inode that can't be written mustn't keep the
+    /// others (and the metadata in the block cache) off the disk. Each
+    /// failure is logged; the first is returned. A failed device write
+    /// stops it there (#349): nothing more is written, into the cache
+    /// either (the cache below can evict only clean blocks from then on).
     fn sync(&self) -> Result<(), VfsError> {
         if self.shared.mounted_ro {
             return Ok(());
         }
         // Errored (#349): nothing will be written again, and the volume's
-        // one line already said so.
+        // one line says so (when the operations running then end).
         if self.shared.errored() {
             return Err(VfsError::Io);
         }
@@ -1659,19 +1693,27 @@ impl Ext4Inode {
         // `load_page`, on the first page (whose error is also returned) as
         // on a later one, where the write returns short and the error goes
         // nowhere else (#321).
+        //
+        // A partial page's read may meet a failed device write (its
+        // eviction's, #349): the volume is then read-only, and nothing of
+        // the write lands in that page, so the page cache holds no byte that
+        // the disk never will from this write. Only the first and the last
+        // page can be partial: on the first the write is refused (`EROFS`,
+        // nothing written, the size and times as they were); on the last it
+        // returns short, the pages before it taken while the volume was
+        // healthy, as any write's bytes are until a sync (and those, like
+        // every unsynced byte, now never reach the disk).
         let done = pages.write_from(offset, buf, old_size, |span| {
             if !detached && !span.whole_page() && span.page_start() < old_size {
-                self.load_page(span.index(), old_size)
+                let page = self.load_page(span.index(), old_size)?;
+                if self.shared.read_only() {
+                    return Err(VfsError::RoFs);
+                }
+                Ok(page)
             } else {
                 CachePage::new_zeroed()
             }
         })?;
-        // A partial page's read may have met a failed write (its eviction,
-        // #349): the bytes are in the page cache, never to be written back,
-        // so the write is refused (the size and times left as they were).
-        if !detached && self.shared.read_only() {
-            return Err(VfsError::RoFs);
-        }
 
         let written_end = offset + done as u64;
         let now_ts = self.shared.now();
@@ -1800,13 +1842,15 @@ impl Ext4Inode {
     /// Write-type operation `op` begins on this inode: `EROFS` on a
     /// read-only volume unless the inode is detached (its work is in memory).
     fn writable_op(&self, op: &'static str) -> Result<WriteOp<'_>, VfsError> {
-        if self.is_detached() { Ok(self.shared.op(op)) } else { self.shared.writable_op(op) }
+        if self.is_detached() { Ok(self.shared.memory_op(op)) } else { self.shared.writable_op(op) }
     }
 
-    /// The volume is read-only: mounted so, or errored since
-    /// (`errors=remount-ro`, #349), for `page_cache::mapped_read_only`.
+    /// The volume is read-only for this file's shared mappings: mounted so,
+    /// or errored since (`errors=remount-ro`, #349), and the file linked (a
+    /// detached one's pages, all in memory, are written as its `write`
+    /// writes them), for `page_cache::mapped_read_only`.
     pub(super) fn volume_read_only(&self) -> bool {
-        self.shared.read_only()
+        !self.is_detached() && self.shared.read_only()
     }
 
     /// This file's page-cache lock (Lock 5), for
@@ -1879,8 +1923,9 @@ impl Ext4Inode {
 
     /// Write one dirty page's bytes below `file_size` back to disk (Lock 6
     /// and below), clearing its dirty bit first and setting it again if the
-    /// write fails, so a failed writeback is retried and the page is never
-    /// evicted as clean. The caller holds the inode's Lock 4 and Lock 5 (the
+    /// write fails, so a failed writeback is retried (unless it errored
+    /// the volume, #349: then never) and the page is never evicted as
+    /// clean. The caller holds the inode's Lock 4 and Lock 5 (the
     /// page's bytes are read under Lock 5). `Ok(None)` for a page wholly past
     /// `file_size` (nothing to write), else the new `i_blocks`.
     fn write_back_page(&self, page_idx: u64, page: &CachePage, file_size: u64) -> Result<Option<u64>, VfsError> {
@@ -4152,395 +4197,407 @@ impl VfsInode for Ext4Inode {
     }
 
     fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        let _op = self.shared.writable_op("create")?;
-        if self.inode_type != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        if name == b"." || name == b".." {
-            return Err(VfsError::Exist);
-        }
-        let mut meta = self.meta.lock();
-        if self.is_detached() || meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let dname = entry_name(name)?;
-        let now_ts = self.shared.now();
+        let op = self.shared.writable_op("create")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
+                return Err(VfsError::NotDir);
+            }
+            if name == b"." || name == b".." {
+                return Err(VfsError::Exist);
+            }
+            let mut meta = self.meta.lock();
+            if self.is_detached() || meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let dname = entry_name(name)?;
+            let now_ts = self.shared.now();
 
-        let mut inner = self.shared.state.lock();
-        let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-        let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
-        ensure_absent(&parent_dir, dname)?;
-        ensure_create_reserve(&inner.ext4)?;
+            let mut inner = self.shared.state.lock();
+            let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+            let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
+            ensure_absent(&parent_dir, dname)?;
+            ensure_create_reserve(&inner.ext4)?;
 
-        let mode = InodeMode::S_IFREG | InodeMode::from_bits_retain(mode & 0o7777);
-        let mut child_disk = new_inode(&inner.ext4, FileType::Regular, mode, now_ts).map_err(map_ext4_err)?;
-        inner.clear_nlink_bounds(child_disk.index.get());
-        if let Err(e) = parent_dir.link(dname, &mut child_disk) {
-            discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed create");
-            return Err(map_ext4_err(e));
-        }
-        let child = inner.created_inode(child_disk, &self.shared);
-        meta.times.modified(now_ts);
-        meta.meta_dirty = true;
-        Ok(child as Arc<dyn VfsInode>)
+            let mode = InodeMode::S_IFREG | InodeMode::from_bits_retain(mode & 0o7777);
+            let mut child_disk = new_inode(&inner.ext4, FileType::Regular, mode, now_ts).map_err(map_ext4_err)?;
+            inner.clear_nlink_bounds(child_disk.index.get());
+            if let Err(e) = parent_dir.link(dname, &mut child_disk) {
+                discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed create");
+                return Err(map_ext4_err(e));
+            }
+            let child = inner.created_inode(child_disk, &self.shared);
+            meta.times.modified(now_ts);
+            meta.meta_dirty = true;
+            Ok(child as Arc<dyn VfsInode>)
+        })())
     }
 
     fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        let _op = self.shared.writable_op("mkdir")?;
-        if self.inode_type != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        if name == b"." || name == b".." {
-            return Err(VfsError::Exist);
-        }
-        let mut meta = self.meta.lock();
-        if self.is_detached() || meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let dname = entry_name(name)?;
-        let now_ts = self.shared.now();
-
-        let mut inner = self.shared.state.lock();
-        let mut parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-        let parent_eff = inner.apply_nlink_bounds(self.disk_ino, u32::from(parent_disk.links_count()));
-        inner.store_bounded_links(&mut parent_disk, links_u16(parent_eff))?;
-        let parent_check = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
-        ensure_absent(&parent_check, dname)?;
-        drop(parent_check);
-        ensure_create_reserve(&inner.ext4)?;
-        // The new directory's `..` raises the parent's count; past ext4's
-        // link limit `Dir::link` would fail after the inode and its block are
-        // allocated (and so would `discard_orphan`'s own link). Refused before
-        // allocating anything (Linux says EMLINK, which `VfsError` lacks).
-        if parent_eff >= EXT4_LINK_MAX {
-            return Err(VfsError::NoSpc);
-        }
-
-        let mode = InodeMode::S_IFDIR | InodeMode::from_bits_retain(mode & 0o7777);
-        let sub_raw = new_inode(&inner.ext4, FileType::Directory, mode, now_ts).map_err(map_ext4_err)?;
-        inner.clear_nlink_bounds(sub_raw.index.get());
-        let sub_ino = sub_raw.index;
-        let linked = Dir::init(inner.ext4.clone(), sub_raw, self.disk_inode_index()).and_then(|sub_dir| {
-            drop(sub_dir);
-            let mut sub_inode = Inode::read(&inner.ext4, sub_ino)?;
-            let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index())?;
-            Dir::open_inode(&inner.ext4, parent_disk)?.link(dname, &mut sub_inode)?;
-            Ok(sub_inode)
-        });
-        let sub_inode = match linked {
-            Ok(sub_inode) => sub_inode,
-            Err(e) => {
-                inner.undo_failed_link(self.disk_inode_index(), dname, self.disk_inode_index(), parent_eff);
-                discard_orphan(&mut inner, self.disk_inode_index(), dname, sub_ino, "after a failed create");
-                return Err(map_ext4_err(e));
+        let op = self.shared.writable_op("mkdir")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
+                return Err(VfsError::NotDir);
             }
-        };
-        inner.clear_nlink_bounds(self.disk_ino);
-        // The new directory is linked: from here on mkdir succeeds. The inode
-        // `link` wrote is the current one.
-        let child = inner.created_inode(sub_inode, &self.shared);
-        meta.nlink = meta.nlink.saturating_add(1);
-        meta.times.modified(now_ts);
-        meta.meta_dirty = true;
-        Ok(child as Arc<dyn VfsInode>)
+            if name == b"." || name == b".." {
+                return Err(VfsError::Exist);
+            }
+            let mut meta = self.meta.lock();
+            if self.is_detached() || meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let dname = entry_name(name)?;
+            let now_ts = self.shared.now();
+
+            let mut inner = self.shared.state.lock();
+            let mut parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+            let parent_eff = inner.apply_nlink_bounds(self.disk_ino, u32::from(parent_disk.links_count()));
+            inner.store_bounded_links(&mut parent_disk, links_u16(parent_eff))?;
+            let parent_check = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
+            ensure_absent(&parent_check, dname)?;
+            drop(parent_check);
+            ensure_create_reserve(&inner.ext4)?;
+            // The new directory's `..` raises the parent's count; past ext4's
+            // link limit `Dir::link` would fail after the inode and its block are
+            // allocated (and so would `discard_orphan`'s own link). Refused before
+            // allocating anything (Linux says EMLINK, which `VfsError` lacks).
+            if parent_eff >= EXT4_LINK_MAX {
+                return Err(VfsError::NoSpc);
+            }
+
+            let mode = InodeMode::S_IFDIR | InodeMode::from_bits_retain(mode & 0o7777);
+            let sub_raw = new_inode(&inner.ext4, FileType::Directory, mode, now_ts).map_err(map_ext4_err)?;
+            inner.clear_nlink_bounds(sub_raw.index.get());
+            let sub_ino = sub_raw.index;
+            let linked = Dir::init(inner.ext4.clone(), sub_raw, self.disk_inode_index()).and_then(|sub_dir| {
+                drop(sub_dir);
+                let mut sub_inode = Inode::read(&inner.ext4, sub_ino)?;
+                let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index())?;
+                Dir::open_inode(&inner.ext4, parent_disk)?.link(dname, &mut sub_inode)?;
+                Ok(sub_inode)
+            });
+            let sub_inode = match linked {
+                Ok(sub_inode) => sub_inode,
+                Err(e) => {
+                    inner.undo_failed_link(self.disk_inode_index(), dname, self.disk_inode_index(), parent_eff);
+                    discard_orphan(&mut inner, self.disk_inode_index(), dname, sub_ino, "after a failed create");
+                    return Err(map_ext4_err(e));
+                }
+            };
+            inner.clear_nlink_bounds(self.disk_ino);
+            // The new directory is linked: from here on mkdir succeeds. The inode
+            // `link` wrote is the current one.
+            let child = inner.created_inode(sub_inode, &self.shared);
+            meta.nlink = meta.nlink.saturating_add(1);
+            meta.times.modified(now_ts);
+            meta.meta_dirty = true;
+            Ok(child as Arc<dyn VfsInode>)
+        })())
     }
 
     fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
-        let _op = self.shared.writable_op("unlink")?;
-        if self.inode_type != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        if name == b"." || name == b".." {
-            return Err(VfsError::IsDir);
-        }
-        let dname = entry_name(name)?;
-
-        let (self_arc, child_arc) = {
-            let self_meta = self.meta.lock();
-            if self.is_detached() || self_meta.nlink == 0 {
-                return Err(VfsError::NoEnt);
+        let op = self.shared.writable_op("unlink")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
+                return Err(VfsError::NotDir);
             }
-            let mut inner = self.shared.state.lock();
-            let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let parent_dir = Dir::open_inode(&inner.ext4, self_disk.clone()).map_err(map_ext4_err)?;
-            let child_disk = parent_dir.get_entry(dname).map_err(map_ext4_err)?;
-            if child_disk.file_type().is_dir() {
+            if name == b"." || name == b".." {
                 return Err(VfsError::IsDir);
             }
-            let self_arc = inner.get_or_create_inode(self_disk, &self.shared)?;
-            let child_arc = inner.get_or_create_inode(child_disk, &self.shared)?;
-            (self_arc, child_arc)
-        };
+            let dname = entry_name(name)?;
 
-        let mut guards = lock_inodes_ordered(&[&self_arc, &child_arc]);
-        if self_arc.is_detached() || find_guard_mut(&mut guards, &self_arc).nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
+            let (self_arc, child_arc) = {
+                let self_meta = self.meta.lock();
+                if self.is_detached() || self_meta.nlink == 0 {
+                    return Err(VfsError::NoEnt);
+                }
+                let mut inner = self.shared.state.lock();
+                let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                let parent_dir = Dir::open_inode(&inner.ext4, self_disk.clone()).map_err(map_ext4_err)?;
+                let child_disk = parent_dir.get_entry(dname).map_err(map_ext4_err)?;
+                if child_disk.file_type().is_dir() {
+                    return Err(VfsError::IsDir);
+                }
+                let self_arc = inner.get_or_create_inode(self_disk, &self.shared)?;
+                let child_arc = inner.get_or_create_inode(child_disk, &self.shared)?;
+                (self_arc, child_arc)
+            };
 
-        let now_ts = self.shared.now();
-        let child_nlink = find_guard_mut(&mut guards, &child_arc).nlink;
-        if child_arc.is_detached() || child_nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let prepared_detach = if is_last_link(false, child_nlink) && child_arc.open_count() > 0 {
-            let child_meta = find_guard_mut(&mut guards, &child_arc);
-            Self::prepare_detach(&child_arc, child_meta)?
-        } else {
-            None
-        };
-
-        let outcome = {
-            let mut inner = self.shared.state.lock();
-            Self::unlink_nondir_with_recovery(&mut inner, self.disk_inode_index(), dname, &child_arc, child_nlink)?
-        };
-
-        match outcome {
-            UnlinkDiskOutcome::Aborted { err, actual_nlink } => {
-                let child_meta = find_guard_mut(&mut guards, &child_arc);
-                Self::settle_child(&child_arc, child_meta, prepared_detach, ChildFate::Kept(actual_nlink));
-                Err(err)
+            let mut guards = lock_inodes_ordered(&[&self_arc, &child_arc]);
+            if self_arc.is_detached() || find_guard_mut(&mut guards, &self_arc).nlink == 0 {
+                return Err(VfsError::NoEnt);
             }
-            UnlinkDiskOutcome::Completed { remaining_nlink, post_err } => {
+
+            let now_ts = self.shared.now();
+            let child_nlink = find_guard_mut(&mut guards, &child_arc).nlink;
+            if child_arc.is_detached() || child_nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let prepared_detach = if is_last_link(false, child_nlink) && child_arc.open_count() > 0 {
                 let child_meta = find_guard_mut(&mut guards, &child_arc);
-                let fate = ChildFate::gone(remaining_nlink, now_ts, Some(now_ts));
-                Self::settle_child(&child_arc, child_meta, prepared_detach, fate);
-                let self_meta = find_guard_mut(&mut guards, &self_arc);
-                self_meta.times.modified(now_ts);
-                self_meta.meta_dirty = true;
-                match post_err {
-                    Some(e) => Err(e),
-                    None => Ok(()),
+                Self::prepare_detach(&child_arc, child_meta)?
+            } else {
+                None
+            };
+
+            let outcome = {
+                let mut inner = self.shared.state.lock();
+                Self::unlink_nondir_with_recovery(&mut inner, self.disk_inode_index(), dname, &child_arc, child_nlink)?
+            };
+
+            match outcome {
+                UnlinkDiskOutcome::Aborted { err, actual_nlink } => {
+                    let child_meta = find_guard_mut(&mut guards, &child_arc);
+                    Self::settle_child(&child_arc, child_meta, prepared_detach, ChildFate::Kept(actual_nlink));
+                    Err(err)
+                }
+                UnlinkDiskOutcome::Completed { remaining_nlink, post_err } => {
+                    let child_meta = find_guard_mut(&mut guards, &child_arc);
+                    let fate = ChildFate::gone(remaining_nlink, now_ts, Some(now_ts));
+                    Self::settle_child(&child_arc, child_meta, prepared_detach, fate);
+                    let self_meta = find_guard_mut(&mut guards, &self_arc);
+                    self_meta.times.modified(now_ts);
+                    self_meta.meta_dirty = true;
+                    match post_err {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    }
                 }
             }
-        }
+        })())
     }
 
     fn rmdir(&self, name: &[u8]) -> Result<(), VfsError> {
-        let _op = self.shared.writable_op("rmdir")?;
-        if self.inode_type != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        if name == b"." {
-            return Err(VfsError::Inval);
-        }
-        if name == b".." {
-            return Err(VfsError::NotEmpty);
-        }
-        let dname = entry_name(name)?;
-
-        let (self_arc, child_arc) = {
-            let self_meta = self.meta.lock();
-            if self.is_detached() || self_meta.nlink == 0 {
-                return Err(VfsError::NoEnt);
-            }
-            let mut inner = self.shared.state.lock();
-            let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let parent_dir = Dir::open_inode(&inner.ext4, self_disk.clone()).map_err(map_ext4_err)?;
-            let child_disk = parent_dir.get_entry(dname).map_err(map_ext4_err)?;
-            if !child_disk.file_type().is_dir() {
+        let op = self.shared.writable_op("rmdir")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
                 return Err(VfsError::NotDir);
             }
-            if !is_ext4_dir_empty(&inner.ext4, &child_disk)? {
+            if name == b"." {
+                return Err(VfsError::Inval);
+            }
+            if name == b".." {
                 return Err(VfsError::NotEmpty);
             }
-            let self_arc = inner.get_or_create_inode(self_disk, &self.shared)?;
-            let child_arc = inner.get_or_create_inode(child_disk, &self.shared)?;
-            (self_arc, child_arc)
-        };
+            let dname = entry_name(name)?;
 
-        let mut guards = lock_inodes_ordered(&[&self_arc, &child_arc]);
-        if self_arc.is_detached()
-            || find_guard_mut(&mut guards, &self_arc).nlink == 0
-            || child_arc.is_detached()
-            || find_guard_mut(&mut guards, &child_arc).nlink == 0
-        {
-            return Err(VfsError::NoEnt);
-        }
+            let (self_arc, child_arc) = {
+                let self_meta = self.meta.lock();
+                if self.is_detached() || self_meta.nlink == 0 {
+                    return Err(VfsError::NoEnt);
+                }
+                let mut inner = self.shared.state.lock();
+                let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                let parent_dir = Dir::open_inode(&inner.ext4, self_disk.clone()).map_err(map_ext4_err)?;
+                let child_disk = parent_dir.get_entry(dname).map_err(map_ext4_err)?;
+                if !child_disk.file_type().is_dir() {
+                    return Err(VfsError::NotDir);
+                }
+                if !is_ext4_dir_empty(&inner.ext4, &child_disk)? {
+                    return Err(VfsError::NotEmpty);
+                }
+                let self_arc = inner.get_or_create_inode(self_disk, &self.shared)?;
+                let child_arc = inner.get_or_create_inode(child_disk, &self.shared)?;
+                (self_arc, child_arc)
+            };
 
-        // Re-check emptiness with both Lock 4 mutexes held.
-        {
-            let inner = self.shared.state.lock();
-            let child_disk = Inode::read(&inner.ext4, child_arc.disk_inode_index()).map_err(map_ext4_err)?;
-            if !is_ext4_dir_empty(&inner.ext4, &child_disk)? {
-                return Err(VfsError::NotEmpty);
+            let mut guards = lock_inodes_ordered(&[&self_arc, &child_arc]);
+            if self_arc.is_detached()
+                || find_guard_mut(&mut guards, &self_arc).nlink == 0
+                || child_arc.is_detached()
+                || find_guard_mut(&mut guards, &child_arc).nlink == 0
+            {
+                return Err(VfsError::NoEnt);
             }
-        }
 
-        let child_nlink = find_guard_mut(&mut guards, &child_arc).nlink;
-        let prepared_detach = if is_last_link(true, child_nlink) && child_arc.open_count() > 0 {
-            let child_meta = find_guard_mut(&mut guards, &child_arc);
-            Self::prepare_detach(&child_arc, child_meta)?
-        } else {
-            None
-        };
-
-        let parent_nlink = find_guard_mut(&mut guards, &self_arc).nlink;
-        let outcome = {
-            let mut inner = self.shared.state.lock();
-            Self::unlink_dir_with_recovery(
-                &mut inner,
-                self.disk_inode_index(),
-                dname,
-                &child_arc,
-                child_nlink,
-                parent_nlink,
-            )?
-        };
-
-        let now_ts = self.shared.now();
-        match outcome {
-            RmdirDiskOutcome::StillPresent { err, actual_nlink } => {
-                let child_meta = find_guard_mut(&mut guards, &child_arc);
-                Self::settle_child(&child_arc, child_meta, prepared_detach, ChildFate::Kept(actual_nlink));
-                Err(err)
-            }
-            RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err } => {
-                // The child was checked live under its guard, which every
-                // detach holds, so a freed one is never detached already.
-                let child_meta = find_guard_mut(&mut guards, &child_arc);
-                // A removed directory gets no change time (as before).
-                let fate = ChildFate::gone(remaining_nlink, now_ts, None);
-                Self::settle_child(&child_arc, child_meta, prepared_detach, fate);
-                // The entry is gone, so the parent was modified whatever
-                // failed after (#325).
-                let self_meta = find_guard_mut(&mut guards, &self_arc);
-                self_meta.nlink = parent_nlink;
-                self_meta.times.modified(now_ts);
-                self_meta.meta_dirty = true;
-                match post_err {
-                    Some(e) => Err(e),
-                    None => Ok(()),
+            // Re-check emptiness with both Lock 4 mutexes held.
+            {
+                let inner = self.shared.state.lock();
+                let child_disk = Inode::read(&inner.ext4, child_arc.disk_inode_index()).map_err(map_ext4_err)?;
+                if !is_ext4_dir_empty(&inner.ext4, &child_disk)? {
+                    return Err(VfsError::NotEmpty);
                 }
             }
-        }
+
+            let child_nlink = find_guard_mut(&mut guards, &child_arc).nlink;
+            let prepared_detach = if is_last_link(true, child_nlink) && child_arc.open_count() > 0 {
+                let child_meta = find_guard_mut(&mut guards, &child_arc);
+                Self::prepare_detach(&child_arc, child_meta)?
+            } else {
+                None
+            };
+
+            let parent_nlink = find_guard_mut(&mut guards, &self_arc).nlink;
+            let outcome = {
+                let mut inner = self.shared.state.lock();
+                Self::unlink_dir_with_recovery(
+                    &mut inner,
+                    self.disk_inode_index(),
+                    dname,
+                    &child_arc,
+                    child_nlink,
+                    parent_nlink,
+                )?
+            };
+
+            let now_ts = self.shared.now();
+            match outcome {
+                RmdirDiskOutcome::StillPresent { err, actual_nlink } => {
+                    let child_meta = find_guard_mut(&mut guards, &child_arc);
+                    Self::settle_child(&child_arc, child_meta, prepared_detach, ChildFate::Kept(actual_nlink));
+                    Err(err)
+                }
+                RmdirDiskOutcome::Removed { remaining_nlink, parent_nlink, post_err } => {
+                    // The child was checked live under its guard, which every
+                    // detach holds, so a freed one is never detached already.
+                    let child_meta = find_guard_mut(&mut guards, &child_arc);
+                    // A removed directory gets no change time (as before).
+                    let fate = ChildFate::gone(remaining_nlink, now_ts, None);
+                    Self::settle_child(&child_arc, child_meta, prepared_detach, fate);
+                    // The entry is gone, so the parent was modified whatever
+                    // failed after (#325).
+                    let self_meta = find_guard_mut(&mut guards, &self_arc);
+                    self_meta.nlink = parent_nlink;
+                    self_meta.times.modified(now_ts);
+                    self_meta.meta_dirty = true;
+                    match post_err {
+                        Some(e) => Err(e),
+                        None => Ok(()),
+                    }
+                }
+            }
+        })())
     }
 
     fn link(&self, name: &[u8], target: &Arc<dyn VfsInode>) -> Result<(), VfsError> {
-        let _op = self.shared.writable_op("link")?;
-        if self.inode_type != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        if target.dev_id() != self.shared.dev {
-            return Err(VfsError::XDev);
-        }
-        if target.inode_type() == InodeType::Dir {
-            return Err(VfsError::Perm);
-        }
-        if target.is_detached() {
-            return Err(VfsError::NoEnt);
-        }
-        if name == b"." || name == b".." {
-            return Err(VfsError::Exist);
-        }
-        let dname = entry_name(name)?;
-        let target_ino = u32::try_from(target.ino()).map_err(|_| VfsError::NoEnt)?;
-
-        let (self_arc, target_arc) = {
-            let self_meta = self.meta.lock();
-            if self.is_detached() || self_meta.nlink == 0 {
+        let op = self.shared.writable_op("link")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
+                return Err(VfsError::NotDir);
+            }
+            if target.dev_id() != self.shared.dev {
+                return Err(VfsError::XDev);
+            }
+            if target.inode_type() == InodeType::Dir {
+                return Err(VfsError::Perm);
+            }
+            if target.is_detached() {
                 return Err(VfsError::NoEnt);
             }
-            let mut inner = self.shared.state.lock();
-            let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let target_disk =
-                Inode::read(&inner.ext4, NonZeroU32::new(target_ino).ok_or(VfsError::NoEnt)?).map_err(map_ext4_err)?;
-            let self_arc = inner.get_or_create_inode(self_disk, &self.shared)?;
-            let target_arc = inner.get_or_create_inode(target_disk, &self.shared)?;
-            (self_arc, target_arc)
-        };
-
-        let mut guards = lock_inodes_ordered(&[&self_arc, &target_arc]);
-        if self_arc.is_detached()
-            || target_arc.is_detached()
-            || find_guard_mut(&mut guards, &self_arc).nlink == 0
-            || find_guard_mut(&mut guards, &target_arc).nlink == 0
-        {
-            return Err(VfsError::NoEnt);
-        }
-
-        {
-            let mut inner = self.shared.state.lock();
-            let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
-            ensure_absent(&parent_dir, dname)?;
-            let mut target_disk = Inode::read(&inner.ext4, target_arc.disk_inode_index()).map_err(map_ext4_err)?;
-            let target_eff = inner.apply_nlink_bounds(target_arc.disk_ino, u32::from(target_disk.links_count()));
-            let target_eff_u16 = links_u16(target_eff);
-            if target_disk.links_count() != target_eff_u16 {
-                target_disk.set_links_count(target_eff_u16);
+            if name == b"." || name == b".." {
+                return Err(VfsError::Exist);
             }
-            if let Err(e) = parent_dir.link(dname, &mut target_disk) {
-                inner.undo_failed_link(self.disk_inode_index(), dname, target_arc.disk_inode_index(), target_eff);
-                return Err(map_ext4_err(e));
-            }
-            inner.clear_nlink_bounds(target_arc.disk_ino);
-        }
+            let dname = entry_name(name)?;
+            let target_ino = u32::try_from(target.ino()).map_err(|_| VfsError::NoEnt)?;
 
-        let now_ts = self.shared.now();
-        let t_meta = find_guard_mut(&mut guards, &target_arc);
-        t_meta.nlink = t_meta.nlink.saturating_add(1);
-        t_meta.times.set_ctime(now_ts);
-        t_meta.meta_dirty = true;
-        let p_meta = find_guard_mut(&mut guards, &self_arc);
-        p_meta.times.modified(now_ts);
-        p_meta.meta_dirty = true;
-        Ok(())
+            let (self_arc, target_arc) = {
+                let self_meta = self.meta.lock();
+                if self.is_detached() || self_meta.nlink == 0 {
+                    return Err(VfsError::NoEnt);
+                }
+                let mut inner = self.shared.state.lock();
+                let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                let target_disk = Inode::read(&inner.ext4, NonZeroU32::new(target_ino).ok_or(VfsError::NoEnt)?)
+                    .map_err(map_ext4_err)?;
+                let self_arc = inner.get_or_create_inode(self_disk, &self.shared)?;
+                let target_arc = inner.get_or_create_inode(target_disk, &self.shared)?;
+                (self_arc, target_arc)
+            };
+
+            let mut guards = lock_inodes_ordered(&[&self_arc, &target_arc]);
+            if self_arc.is_detached()
+                || target_arc.is_detached()
+                || find_guard_mut(&mut guards, &self_arc).nlink == 0
+                || find_guard_mut(&mut guards, &target_arc).nlink == 0
+            {
+                return Err(VfsError::NoEnt);
+            }
+
+            {
+                let mut inner = self.shared.state.lock();
+                let self_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                let mut parent_dir = Dir::open_inode(&inner.ext4, self_disk).map_err(map_ext4_err)?;
+                ensure_absent(&parent_dir, dname)?;
+                let mut target_disk = Inode::read(&inner.ext4, target_arc.disk_inode_index()).map_err(map_ext4_err)?;
+                let target_eff = inner.apply_nlink_bounds(target_arc.disk_ino, u32::from(target_disk.links_count()));
+                let target_eff_u16 = links_u16(target_eff);
+                if target_disk.links_count() != target_eff_u16 {
+                    target_disk.set_links_count(target_eff_u16);
+                }
+                if let Err(e) = parent_dir.link(dname, &mut target_disk) {
+                    inner.undo_failed_link(self.disk_inode_index(), dname, target_arc.disk_inode_index(), target_eff);
+                    return Err(map_ext4_err(e));
+                }
+                inner.clear_nlink_bounds(target_arc.disk_ino);
+            }
+
+            let now_ts = self.shared.now();
+            let t_meta = find_guard_mut(&mut guards, &target_arc);
+            t_meta.nlink = t_meta.nlink.saturating_add(1);
+            t_meta.times.set_ctime(now_ts);
+            t_meta.meta_dirty = true;
+            let p_meta = find_guard_mut(&mut guards, &self_arc);
+            p_meta.times.modified(now_ts);
+            p_meta.meta_dirty = true;
+            Ok(())
+        })())
     }
 
     fn symlink(&self, name: &[u8], target: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-        let _op = self.shared.writable_op("symlink")?;
-        if self.inode_type != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        if target.is_empty() {
-            return Err(VfsError::NoEnt);
-        }
-        if target.len() >= lumen_vfs::PATH_MAX {
-            return Err(VfsError::NameTooLong);
-        }
-        if name == b"." || name == b".." {
-            return Err(VfsError::Exist);
-        }
-        let mut meta = self.meta.lock();
-        if self.is_detached() || meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let dname = entry_name(name)?;
-        let now_ts = self.shared.now();
+        let op = self.shared.writable_op("symlink")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
+                return Err(VfsError::NotDir);
+            }
+            if target.is_empty() {
+                return Err(VfsError::NoEnt);
+            }
+            if target.len() >= lumen_vfs::PATH_MAX {
+                return Err(VfsError::NameTooLong);
+            }
+            if name == b"." || name == b".." {
+                return Err(VfsError::Exist);
+            }
+            let mut meta = self.meta.lock();
+            if self.is_detached() || meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let dname = entry_name(name)?;
+            let now_ts = self.shared.now();
 
-        let mut inner = self.shared.state.lock();
-        let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-        let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
-        ensure_absent(&parent_dir, dname)?;
-        ensure_create_reserve(&inner.ext4)?;
+            let mut inner = self.shared.state.lock();
+            let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+            let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
+            ensure_absent(&parent_dir, dname)?;
+            ensure_create_reserve(&inner.ext4)?;
 
-        let mode = InodeMode::S_IFLNK | InodeMode::from_bits_retain(0o777);
-        let mut sym = new_inode(&inner.ext4, FileType::Symlink, mode, now_ts).map_err(map_ext4_err)?;
-        let sym_ino = sym.index;
-        inner.clear_nlink_bounds(sym_ino.get());
-        // A target of up to 59 bytes is stored inline in `i_block` (a fast
-        // symlink, no `EXTENTS` flag, no blocks); a longer one in a data
-        // block. `ext4plus::Ext4::symlink` isn't used: when its final link
-        // fails it doesn't hand back the inode it allocated, which then
-        // couldn't be freed.
-        let built = if target.len() <= 59 {
-            Self::write_inline_symlink_target(&inner, sym, target)
-        } else {
-            ext4_write_all(&inner.ext4, &mut sym, target, 0).map_err(map_ext4_err).map(|()| sym)
-        };
-        let sym_disk =
-            match built.and_then(|mut sym| parent_dir.link(dname, &mut sym).map(|()| sym).map_err(map_ext4_err)) {
-                Ok(sym) => sym,
-                Err(e) => {
-                    discard_orphan(&mut inner, self.disk_inode_index(), dname, sym_ino, "after a failed create");
-                    return Err(e);
-                }
+            let mode = InodeMode::S_IFLNK | InodeMode::from_bits_retain(0o777);
+            let mut sym = new_inode(&inner.ext4, FileType::Symlink, mode, now_ts).map_err(map_ext4_err)?;
+            let sym_ino = sym.index;
+            inner.clear_nlink_bounds(sym_ino.get());
+            // A target of up to 59 bytes is stored inline in `i_block` (a fast
+            // symlink, no `EXTENTS` flag, no blocks); a longer one in a data
+            // block. `ext4plus::Ext4::symlink` isn't used: when its final link
+            // fails it doesn't hand back the inode it allocated, which then
+            // couldn't be freed.
+            let built = if target.len() <= 59 {
+                Self::write_inline_symlink_target(&inner, sym, target)
+            } else {
+                ext4_write_all(&inner.ext4, &mut sym, target, 0).map_err(map_ext4_err).map(|()| sym)
             };
+            let sym_disk =
+                match built.and_then(|mut sym| parent_dir.link(dname, &mut sym).map(|()| sym).map_err(map_ext4_err)) {
+                    Ok(sym) => sym,
+                    Err(e) => {
+                        discard_orphan(&mut inner, self.disk_inode_index(), dname, sym_ino, "after a failed create");
+                        return Err(e);
+                    }
+                };
 
-        let child = inner.created_inode(sym_disk, &self.shared);
-        meta.times.modified(now_ts);
-        meta.meta_dirty = true;
-        Ok(child as Arc<dyn VfsInode>)
+            let child = inner.created_inode(sym_disk, &self.shared);
+            meta.times.modified(now_ts);
+            meta.meta_dirty = true;
+            Ok(child as Arc<dyn VfsInode>)
+        })())
     }
 
     fn readlink(&self) -> Result<Vec<u8>, VfsError> {
@@ -4571,172 +4628,176 @@ impl VfsInode for Ext4Inode {
         flags: RenameFlags,
     ) -> Result<(), VfsError> {
         let flags = flags.validate()?;
-        let _op = self.shared.writable_op("rename")?;
-        if self.inode_type != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        if new_dir.dev_id() != self.shared.dev {
-            return Err(VfsError::XDev);
-        }
-        if new_dir.inode_type() != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        if new_dir.is_detached() {
-            return Err(VfsError::NoEnt);
-        }
-        if old_name == b"." || old_name == b".." || new_name == b"." || new_name == b".." {
-            return Err(VfsError::Inval);
-        }
-        let old_dname = entry_name(old_name)?;
-        let new_dname = entry_name(new_name)?;
-        let new_dir_disk_ino = u32::try_from(new_dir.ino()).map_err(|_| VfsError::NoEnt)?;
-
-        // Phase 1: probe source, destination, and live Arc<Ext4Inode>s under Lock 6.
-        let (old_dir_arc, new_dir_arc, old_child_arc, new_child_opt) = {
-            let mut inner = self.shared.state.lock();
-            if self.is_detached() || new_dir.is_detached() {
+        let op = self.shared.writable_op("rename")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
+                return Err(VfsError::NotDir);
+            }
+            if new_dir.dev_id() != self.shared.dev {
+                return Err(VfsError::XDev);
+            }
+            if new_dir.inode_type() != InodeType::Dir {
+                return Err(VfsError::NotDir);
+            }
+            if new_dir.is_detached() {
                 return Err(VfsError::NoEnt);
             }
-            let old_parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let new_parent_disk = Inode::read(&inner.ext4, NonZeroU32::new(new_dir_disk_ino).ok_or(VfsError::NoEnt)?)
-                .map_err(map_ext4_err)?;
+            if old_name == b"." || old_name == b".." || new_name == b"." || new_name == b".." {
+                return Err(VfsError::Inval);
+            }
+            let old_dname = entry_name(old_name)?;
+            let new_dname = entry_name(new_name)?;
+            let new_dir_disk_ino = u32::try_from(new_dir.ino()).map_err(|_| VfsError::NoEnt)?;
 
-            let old_dir_obj = Dir::open_inode(&inner.ext4, old_parent_disk.clone()).map_err(map_ext4_err)?;
-            let old_child_disk = old_dir_obj.get_entry(old_dname).map_err(map_ext4_err)?;
+            // Phase 1: probe source, destination, and live Arc<Ext4Inode>s under Lock 6.
+            let (old_dir_arc, new_dir_arc, old_child_arc, new_child_opt) = {
+                let mut inner = self.shared.state.lock();
+                if self.is_detached() || new_dir.is_detached() {
+                    return Err(VfsError::NoEnt);
+                }
+                let old_parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                let new_parent_disk =
+                    Inode::read(&inner.ext4, NonZeroU32::new(new_dir_disk_ino).ok_or(VfsError::NoEnt)?)
+                        .map_err(map_ext4_err)?;
 
-            let new_dir_obj = Dir::open_inode(&inner.ext4, new_parent_disk.clone()).map_err(map_ext4_err)?;
-            let new_child_disk_opt = match new_dir_obj.get_entry(new_dname) {
-                Ok(d) => Some(d),
-                Err(Ext4Error::NotFound) => None,
-                Err(e) => return Err(map_ext4_err(e)),
+                let old_dir_obj = Dir::open_inode(&inner.ext4, old_parent_disk.clone()).map_err(map_ext4_err)?;
+                let old_child_disk = old_dir_obj.get_entry(old_dname).map_err(map_ext4_err)?;
+
+                let new_dir_obj = Dir::open_inode(&inner.ext4, new_parent_disk.clone()).map_err(map_ext4_err)?;
+                let new_child_disk_opt = match new_dir_obj.get_entry(new_dname) {
+                    Ok(d) => Some(d),
+                    Err(Ext4Error::NotFound) => None,
+                    Err(e) => return Err(map_ext4_err(e)),
+                };
+
+                if flags.has_noreplace() && new_child_disk_opt.is_some() {
+                    return Err(VfsError::Exist);
+                }
+                if flags.has_exchange() && new_child_disk_opt.is_none() {
+                    return Err(VfsError::NoEnt);
+                }
+
+                if !flags.has_exchange()
+                    && let Some(ref nc) = new_child_disk_opt
+                {
+                    if nc.index == old_child_disk.index {
+                        return Ok(());
+                    }
+                    if old_child_disk.file_type().is_dir() && !nc.file_type().is_dir() {
+                        return Err(VfsError::NotDir);
+                    }
+                    if !old_child_disk.file_type().is_dir() && nc.file_type().is_dir() {
+                        return Err(VfsError::IsDir);
+                    }
+                    if nc.file_type().is_dir() && !is_ext4_dir_empty(&inner.ext4, nc)? {
+                        return Err(VfsError::NotEmpty);
+                    }
+                }
+
+                let old_dir_arc = inner.get_or_create_inode(old_parent_disk, &self.shared)?;
+                let new_dir_arc = inner.get_or_create_inode(new_parent_disk, &self.shared)?;
+                let old_child_arc = inner.get_or_create_inode(old_child_disk, &self.shared)?;
+                let new_child_opt =
+                    new_child_disk_opt.map(|d| inner.get_or_create_inode(d, &self.shared)).transpose()?;
+                (old_dir_arc, new_dir_arc, old_child_arc, new_child_opt)
             };
 
-            if flags.has_noreplace() && new_child_disk_opt.is_some() {
-                return Err(VfsError::Exist);
-            }
-            if flags.has_exchange() && new_child_disk_opt.is_none() {
+            // The disk inodes were found by number: if either directory was
+            // removed and its number reused (a `rmdir` and a `mkdir` between the
+            // caller's lookup and here), the live inode for that number is a
+            // different one, and the entry must not move into the stranger.
+            if old_dir_arc.lock_id != self.lock_id || new_dir_arc.lock_id != new_dir.lock_id() {
                 return Err(VfsError::NoEnt);
             }
 
-            if !flags.has_exchange()
-                && let Some(ref nc) = new_child_disk_opt
-            {
-                if nc.index == old_child_disk.index {
-                    return Ok(());
-                }
-                if old_child_disk.file_type().is_dir() && !nc.file_type().is_dir() {
-                    return Err(VfsError::NotDir);
-                }
-                if !old_child_disk.file_type().is_dir() && nc.file_type().is_dir() {
-                    return Err(VfsError::IsDir);
-                }
-                if nc.file_type().is_dir() && !is_ext4_dir_empty(&inner.ext4, nc)? {
-                    return Err(VfsError::NotEmpty);
-                }
-            }
-
-            let old_dir_arc = inner.get_or_create_inode(old_parent_disk, &self.shared)?;
-            let new_dir_arc = inner.get_or_create_inode(new_parent_disk, &self.shared)?;
-            let old_child_arc = inner.get_or_create_inode(old_child_disk, &self.shared)?;
-            let new_child_opt = new_child_disk_opt.map(|d| inner.get_or_create_inode(d, &self.shared)).transpose()?;
-            (old_dir_arc, new_dir_arc, old_child_arc, new_child_opt)
-        };
-
-        // The disk inodes were found by number: if either directory was
-        // removed and its number reused (a `rmdir` and a `mkdir` between the
-        // caller's lookup and here), the live inode for that number is a
-        // different one, and the entry must not move into the stranger.
-        if old_dir_arc.lock_id != self.lock_id || new_dir_arc.lock_id != new_dir.lock_id() {
-            return Err(VfsError::NoEnt);
-        }
-
-        if self.disk_ino == new_dir_disk_ino && old_name == new_name {
-            return Ok(());
-        }
-
-        // Phase 2: Acquire all Lock 4 mutexes in strict canonical order.
-        let mut to_lock: Vec<&Arc<Ext4Inode>> = Vec::with_capacity(4);
-        to_lock.push(&old_dir_arc);
-        to_lock.push(&new_dir_arc);
-        to_lock.push(&old_child_arc);
-        if let Some(ref nc) = new_child_opt {
-            to_lock.push(nc);
-        }
-        let mut guards = lock_inodes_ordered(&to_lock);
-        if old_dir_arc.is_detached()
-            || new_dir_arc.is_detached()
-            || find_guard_mut(&mut guards, &old_dir_arc).nlink == 0
-            || find_guard_mut(&mut guards, &new_dir_arc).nlink == 0
-        {
-            return Err(VfsError::NoEnt);
-        }
-
-        let now_ts = self.shared.now();
-
-        if flags.has_exchange() {
-            let new_child_arc = new_child_opt.as_ref().expect("checked Some for EXCHANGE");
-            if old_child_arc.disk_ino == new_child_arc.disk_ino {
+            if self.disk_ino == new_dir_disk_ino && old_name == new_name {
                 return Ok(());
             }
-            let outcome = {
+
+            // Phase 2: Acquire all Lock 4 mutexes in strict canonical order.
+            let mut to_lock: Vec<&Arc<Ext4Inode>> = Vec::with_capacity(4);
+            to_lock.push(&old_dir_arc);
+            to_lock.push(&new_dir_arc);
+            to_lock.push(&old_child_arc);
+            if let Some(ref nc) = new_child_opt {
+                to_lock.push(nc);
+            }
+            let mut guards = lock_inodes_ordered(&to_lock);
+            if old_dir_arc.is_detached()
+                || new_dir_arc.is_detached()
+                || find_guard_mut(&mut guards, &old_dir_arc).nlink == 0
+                || find_guard_mut(&mut guards, &new_dir_arc).nlink == 0
+            {
+                return Err(VfsError::NoEnt);
+            }
+
+            let now_ts = self.shared.now();
+
+            if flags.has_exchange() {
+                let new_child_arc = new_child_opt.as_ref().expect("checked Some for EXCHANGE");
+                if old_child_arc.disk_ino == new_child_arc.disk_ino {
+                    return Ok(());
+                }
+                let outcome = {
+                    let mut inner = self.shared.state.lock();
+                    Exchange::run(
+                        &mut inner,
+                        &old_dir_arc,
+                        &new_dir_arc,
+                        &old_child_arc,
+                        new_child_arc,
+                        old_dname,
+                        new_dname,
+                    )?
+                };
+                return outcome.apply(&mut guards, &old_child_arc, new_child_arc, &old_dir_arc, &new_dir_arc, now_ts);
+            }
+
+            // Standard overwrite / move rename. An existing target is held, not
+            // removed: its entry comes out but its inode keeps its count, so its
+            // data stays on disk until the source has landed at `new_name`. If
+            // the move fails, the entry is put back (POSIX: a failed rename
+            // leaves the target as it was); once it lands, the target loses that
+            // link and, if it was the last, its inode.
+            let held = match new_child_opt {
+                Some(ref target) => Some(self.hold_target(&mut guards, &new_dir_arc, new_dname, target)?),
+                None => None,
+            };
+
+            let old_dir_nlink_before = find_guard_mut(&mut guards, &old_dir_arc).nlink;
+            // An early error (before anything moved) still reaches the held
+            // target's put-back below.
+            let step2 = {
                 let mut inner = self.shared.state.lock();
-                Exchange::run(
+                MoveEntry::run(
                     &mut inner,
                     &old_dir_arc,
                     &new_dir_arc,
                     &old_child_arc,
-                    new_child_arc,
                     old_dname,
                     new_dname,
-                )?
+                    old_dir_nlink_before,
+                )
             };
-            return outcome.apply(&mut guards, &old_child_arc, new_child_arc, &old_dir_arc, &new_dir_arc, now_ts);
-        }
-
-        // Standard overwrite / move rename. An existing target is held, not
-        // removed: its entry comes out but its inode keeps its count, so its
-        // data stays on disk until the source has landed at `new_name`. If
-        // the move fails, the entry is put back (POSIX: a failed rename
-        // leaves the target as it was); once it lands, the target loses that
-        // link and, if it was the last, its inode.
-        let held = match new_child_opt {
-            Some(ref target) => Some(self.hold_target(&mut guards, &new_dir_arc, new_dname, target)?),
-            None => None,
-        };
-
-        let old_dir_nlink_before = find_guard_mut(&mut guards, &old_dir_arc).nlink;
-        // An early error (before anything moved) still reaches the held
-        // target's put-back below.
-        let step2 = {
-            let mut inner = self.shared.state.lock();
-            MoveEntry::run(
-                &mut inner,
-                &old_dir_arc,
-                &new_dir_arc,
-                &old_child_arc,
-                old_dname,
-                new_dname,
-                old_dir_nlink_before,
-            )
-        };
-        let step2 = match step2 {
-            Ok(step2) => step2,
-            Err(e) => {
-                if let Some(target) = held {
-                    self.put_back_target(&mut guards, &new_dir_arc, new_dname, target);
+            let step2 = match step2 {
+                Ok(step2) => step2,
+                Err(e) => {
+                    if let Some(target) = held {
+                        self.put_back_target(&mut guards, &new_dir_arc, new_dname, target);
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
 
-        step2.apply_counts(&mut guards, &old_child_arc, &old_dir_arc, &new_dir_arc);
-        if let Some(target) = held {
-            match step2.moved {
-                Landed::Yes(_) => self.retire_target(&mut guards, &new_dir_arc, target, now_ts),
-                Landed::No(_) => self.put_back_target(&mut guards, &new_dir_arc, new_dname, target),
+            step2.apply_counts(&mut guards, &old_child_arc, &old_dir_arc, &new_dir_arc);
+            if let Some(target) = held {
+                match step2.moved {
+                    Landed::Yes(_) => self.retire_target(&mut guards, &new_dir_arc, target, now_ts),
+                    Landed::No(_) => self.put_back_target(&mut guards, &new_dir_arc, new_dname, target),
+                }
             }
-        }
-        step2.stamp(&mut guards, &old_child_arc, &old_dir_arc, &new_dir_arc, now_ts)
+            step2.stamp(&mut guards, &old_child_arc, &old_dir_arc, &new_dir_arc, now_ts)
+        })())
     }
 
     /// The cursor is an entry's byte position in the directory's data, as
@@ -4836,150 +4897,158 @@ impl VfsInode for Ext4Inode {
         if new_size > self.shared.max_file_size {
             return Err(VfsError::FBig);
         }
-        let _op = self.writable_op("truncate")?;
-        let mut meta = self.meta.lock();
-        let detached = self.is_detached();
-        if !detached && meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let mut pages = self.pages.lock();
-        let old_size = meta.size;
+        let op = self.writable_op("truncate")?;
+        op.end((|| -> Result<_, VfsError> {
+            let mut meta = self.meta.lock();
+            let detached = self.is_detached();
+            if !detached && meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let mut pages = self.pages.lock();
+            let old_size = meta.size;
 
-        if new_size < old_size {
-            if !detached {
+            if new_size < old_size {
+                if !detached {
+                    let inner = self.shared.state.lock();
+                    let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                    // `ext4plus::truncate` does not zero `[new_size % 4096 .. 4096)`
+                    // on disk; zero non-zero disk tail bytes (confined to `check_len`
+                    // so sub-page files are never temporarily extended to 4096)
+                    // before truncating, and restore them if `ext4_truncate` fails.
+                    let mut saved_tail: Option<Vec<u8>> = None;
+                    if let Some(tail) = page::resize_tail(old_size, new_size)
+                        && disk.size_in_bytes() > new_size
+                    {
+                        let tail_end = (tail.index() + 1) * PAGE_SIZE as u64;
+                        let check_len = (disk.size_in_bytes().min(tail_end) - new_size) as usize;
+                        if check_len > 0 {
+                            let mut probe = vec![0u8; check_len];
+                            let got = ext4_read_full(&inner.ext4, &disk, &mut probe, new_size).map_err(map_ext4_err)?;
+                            if probe[..got].iter().any(|&b| b != 0) {
+                                let zeros = vec![0u8; got];
+                                if let Err(e) = ext4_write_all(&inner.ext4, &mut disk, &zeros, new_size) {
+                                    if ext4_write_all(&inner.ext4, &mut disk, &probe[..got], new_size).is_err() {
+                                        self.log_tail_restore_failure();
+                                    }
+                                    return Err(map_ext4_err(e));
+                                }
+                                probe.truncate(got);
+                                saved_tail = Some(probe);
+                            }
+                        }
+                    }
+                    if let Err(e) = ext4_truncate(&inner.ext4, &mut disk, new_size) {
+                        if let Some(orig_tail) = saved_tail {
+                            let mut restore_disk = Inode::read(&inner.ext4, self.disk_inode_index()).unwrap_or(disk);
+                            if ext4_write_all(&inner.ext4, &mut restore_disk, &orig_tail, new_size).is_err() {
+                                self.log_tail_restore_failure();
+                            }
+                        }
+                        return Err(map_ext4_err(e));
+                    }
+                    meta.blocks_512 = disk.blocks();
+                }
+            } else if new_size > old_size && !detached {
                 let inner = self.shared.state.lock();
                 let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-                // `ext4plus::truncate` does not zero `[new_size % 4096 .. 4096)`
-                // on disk; zero non-zero disk tail bytes (confined to `check_len`
-                // so sub-page files are never temporarily extended to 4096)
-                // before truncating, and restore them if `ext4_truncate` fails.
-                let mut saved_tail: Option<Vec<u8>> = None;
-                if let Some(tail) = page::resize_tail(old_size, new_size)
-                    && disk.size_in_bytes() > new_size
-                {
-                    let tail_end = (tail.index() + 1) * PAGE_SIZE as u64;
-                    let check_len = (disk.size_in_bytes().min(tail_end) - new_size) as usize;
-                    if check_len > 0 {
-                        let mut probe = vec![0u8; check_len];
-                        let got = ext4_read_full(&inner.ext4, &disk, &mut probe, new_size).map_err(map_ext4_err)?;
-                        if probe[..got].iter().any(|&b| b != 0) {
-                            let zeros = vec![0u8; got];
-                            if let Err(e) = ext4_write_all(&inner.ext4, &mut disk, &zeros, new_size) {
-                                if ext4_write_all(&inner.ext4, &mut disk, &probe[..got], new_size).is_err() {
-                                    self.log_tail_restore_failure();
-                                }
-                                return Err(map_ext4_err(e));
-                            }
-                            probe.truncate(got);
-                            saved_tail = Some(probe);
-                        }
-                    }
-                }
-                if let Err(e) = ext4_truncate(&inner.ext4, &mut disk, new_size) {
-                    if let Some(orig_tail) = saved_tail {
-                        let mut restore_disk = Inode::read(&inner.ext4, self.disk_inode_index()).unwrap_or(disk);
-                        if ext4_write_all(&inner.ext4, &mut restore_disk, &orig_tail, new_size).is_err() {
-                            self.log_tail_restore_failure();
-                        }
-                    }
-                    return Err(map_ext4_err(e));
-                }
+                ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
                 meta.blocks_512 = disk.blocks();
             }
-        } else if new_size > old_size && !detached {
-            let inner = self.shared.state.lock();
-            let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            ext4_truncate(&inner.ext4, &mut disk, new_size).map_err(map_ext4_err)?;
-            meta.blocks_512 = disk.blocks();
-        }
-        // The cached pages, once the disk holds the new size.
-        pages.resize(old_size, new_size);
+            // The cached pages, once the disk holds the new size.
+            pages.resize(old_size, new_size);
 
-        let now_ts = self.shared.now();
-        meta.size = new_size;
-        meta.times.modified(now_ts);
-        if !detached {
-            meta.meta_dirty = true;
-        }
-        Ok(())
+            let now_ts = self.shared.now();
+            meta.size = new_size;
+            meta.times.modified(now_ts);
+            if !detached {
+                meta.meta_dirty = true;
+            }
+            Ok(())
+        })())
     }
 
     fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
-        let _op = self.writable_op("chmod")?;
-        let mut meta = self.meta.lock();
-        if !self.is_detached() && meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let mut times = meta.times;
-        times.set_ctime(self.shared.now());
-        let perm = mode & 0o7777;
-        if !self.is_detached() {
-            let inner = self.shared.state.lock();
-            let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            let full_mode = (self.inode_type.to_mode_bits() as u16) | perm;
-            disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
-            times.store_ctime(&mut disk);
-            disk.write(&inner.ext4).map_err(map_ext4_err)?;
-        }
-        meta.mode = perm;
-        meta.times = times;
-        Ok(())
+        let op = self.writable_op("chmod")?;
+        op.end((|| -> Result<_, VfsError> {
+            let mut meta = self.meta.lock();
+            if !self.is_detached() && meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let mut times = meta.times;
+            times.set_ctime(self.shared.now());
+            let perm = mode & 0o7777;
+            if !self.is_detached() {
+                let inner = self.shared.state.lock();
+                let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                let full_mode = (self.inode_type.to_mode_bits() as u16) | perm;
+                disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
+                times.store_ctime(&mut disk);
+                disk.write(&inner.ext4).map_err(map_ext4_err)?;
+            }
+            meta.mode = perm;
+            meta.times = times;
+            Ok(())
+        })())
     }
 
     fn set_owner(&self, uid: Option<u32>, gid: Option<u32>) -> Result<(), VfsError> {
-        let _op = self.writable_op("chown")?;
-        let mut meta = self.meta.lock();
-        if !self.is_detached() && meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let mut times = meta.times;
-        times.set_ctime(self.shared.now());
-        let new_uid = uid.unwrap_or(meta.uid);
-        let new_gid = gid.unwrap_or(meta.gid);
-        // The set-id bits a chown drops, in the same hold and disk write as
-        // the owner (`VfsInode::set_owner`'s contract).
-        let new_mode = mode_after_chown(self.inode_type, meta.mode);
-        if !self.is_detached() {
-            let inner = self.shared.state.lock();
-            let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            disk.set_uid(new_uid);
-            disk.set_gid(new_gid);
-            if new_mode != meta.mode {
-                let full_mode = (self.inode_type.to_mode_bits() as u16) | new_mode;
-                disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
+        let op = self.writable_op("chown")?;
+        op.end((|| -> Result<_, VfsError> {
+            let mut meta = self.meta.lock();
+            if !self.is_detached() && meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
             }
-            times.store_ctime(&mut disk);
-            disk.write(&inner.ext4).map_err(map_ext4_err)?;
-        }
-        meta.uid = new_uid;
-        meta.gid = new_gid;
-        meta.mode = new_mode;
-        meta.times = times;
-        Ok(())
+            let mut times = meta.times;
+            times.set_ctime(self.shared.now());
+            let new_uid = uid.unwrap_or(meta.uid);
+            let new_gid = gid.unwrap_or(meta.gid);
+            // The set-id bits a chown drops, in the same hold and disk write as
+            // the owner (`VfsInode::set_owner`'s contract).
+            let new_mode = mode_after_chown(self.inode_type, meta.mode);
+            if !self.is_detached() {
+                let inner = self.shared.state.lock();
+                let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                disk.set_uid(new_uid);
+                disk.set_gid(new_gid);
+                if new_mode != meta.mode {
+                    let full_mode = (self.inode_type.to_mode_bits() as u16) | new_mode;
+                    disk.set_mode(InodeMode::from_bits_retain(full_mode)).map_err(map_ext4_err)?;
+                }
+                times.store_ctime(&mut disk);
+                disk.write(&inner.ext4).map_err(map_ext4_err)?;
+            }
+            meta.uid = new_uid;
+            meta.gid = new_gid;
+            meta.mode = new_mode;
+            meta.times = times;
+            Ok(())
+        })())
     }
 
     fn set_times(&self, atime: SetTime, mtime: SetTime) -> Result<(), VfsError> {
-        let _op = self.writable_op("utimensat")?;
-        let mut meta = self.meta.lock();
-        if !self.is_detached() && meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let now_ts = self.shared.now();
-        // Set in memory only once the disk holds them.
-        // (An omitted stamp is set to itself: unchanged, as the inode
-        // already holds it truncated.)
-        let mut times = meta.times;
-        times.set_atime(atime.resolve(times.atime(), now_ts));
-        times.set_mtime(mtime.resolve(times.mtime(), now_ts));
-        times.set_ctime(now_ts);
-        if !self.is_detached() {
-            let inner = self.shared.state.lock();
-            let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
-            times.store(&mut disk);
-            disk.write(&inner.ext4).map_err(map_ext4_err)?;
-        }
-        meta.times = times;
-        Ok(())
+        let op = self.writable_op("utimensat")?;
+        op.end((|| -> Result<_, VfsError> {
+            let mut meta = self.meta.lock();
+            if !self.is_detached() && meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let now_ts = self.shared.now();
+            // Set in memory only once the disk holds them.
+            // (An omitted stamp is set to itself: unchanged, as the inode
+            // already holds it truncated.)
+            let mut times = meta.times;
+            times.set_atime(atime.resolve(times.atime(), now_ts));
+            times.set_mtime(mtime.resolve(times.mtime(), now_ts));
+            times.set_ctime(now_ts);
+            if !self.is_detached() {
+                let inner = self.shared.state.lock();
+                let mut disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+                times.store(&mut disk);
+                disk.write(&inner.ext4).map_err(map_ext4_err)?;
+            }
+            meta.times = times;
+            Ok(())
+        })())
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
@@ -5127,7 +5196,7 @@ pub(crate) mod ktest_util {
     ///   one block shorter, so a failed write can come back as `Ok` or as
     ///   `NoSpc`, with counts or bits left wrong (ARCHITECTURE section 9,
     ///   "Write errors an operation doesn't see";
-    ///   `ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried`,
+    ///   `ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio`,
     ///   `ext4_a_failed_write_in_a_block_allocation_comes_back_as_nospc`).
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
@@ -5136,9 +5205,9 @@ pub(crate) mod ktest_util {
         pub writes: AtomicUsize,
         /// `sync` calls, failed ones included.
         pub syncs: AtomicUsize,
-        /// Writes and syncs this seam failed: device writes that failed, for
-        /// `writeback_failures` (with the cache's own below).
-        injected: AtomicU64,
+        /// A write or sync this seam failed, reported as the device's: for
+        /// `first_failure` (with the cache's own below) and `faulted`.
+        injected: AtomicBool,
         /// `stop_writeback_on_failure` was asked: an injected failure stops
         /// the cache's writeback below, as a device's failure would.
         stop_on_failure: AtomicBool,
@@ -5379,7 +5448,7 @@ pub(crate) mod ktest_util {
         }
 
         fn first_failure(&self) -> Option<BlockError> {
-            if self.injected.load(Ordering::Acquire) > 0 {
+            if self.injected.load(Ordering::Acquire) {
                 return Some(BlockError::Io);
             }
             self.inner.lock().first_failure()
@@ -5392,13 +5461,29 @@ pub(crate) mod ktest_util {
     }
 
     impl FaultCache {
-        /// A write or sync this seam fails: a device failure, counted, and
+        /// A write or sync this seam fails: a device failure, recorded, and
         /// stopping the cache's writeback below when asked.
         fn inject_failure(&self) {
-            self.injected.fetch_add(1, Ordering::AcqRel);
+            self.injected.store(true, Ordering::Release);
             if self.stop_on_failure.load(Ordering::Acquire) {
                 self.inner.lock().stop_writeback();
             }
+        }
+
+        /// Whether the volume froze the cache (`errors=remount-ro`, #349).
+        pub fn frozen(&self) -> bool {
+            self.inner.lock().is_frozen()
+        }
+
+        /// Whether this seam failed a device write (a write or sync it
+        /// failed, reported as the device's).
+        pub fn faulted(&self) -> bool {
+            self.injected.load(Ordering::Acquire)
+        }
+
+        /// The device's bytes as they are, under the block cache.
+        pub fn dev_bytes(&self) -> Vec<u8> {
+            self.dev.bytes()
         }
     }
 
@@ -5419,7 +5504,7 @@ pub(crate) mod ktest_util {
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             syncs: AtomicUsize::new(0),
-            injected: AtomicU64::new(0),
+            injected: AtomicBool::new(false),
             stop_on_failure: AtomicBool::new(false),
             fail_write_at: [const { AtomicUsize::new(0) }; 3],
             failed_write_lands: AtomicBool::new(false),
@@ -5473,17 +5558,11 @@ pub(crate) mod ktest_util {
         Ok(m.dev_bytes())
     }
 
-    impl FaultCache {
-        /// Whether the volume froze the cache (`errors=remount-ro`, #349).
-        pub fn frozen(&self) -> bool {
-            self.inner.lock().is_frozen()
-        }
-
-        /// Whether this seam failed a device write (a write or sync it
-        /// failed, counted as the device's).
-        pub fn faulted(&self) -> bool {
-            self.injected.load(Ordering::Acquire) > 0
-        }
+    /// The last write-type operation's own result, as the sweeps check its
+    /// state: `Ok` where `res` is the `EIO` [`WriteOp::end`] put in place
+    /// of its `Ok` (the volume errored while it ran, #349).
+    pub fn own_result(fs: &Ext4FileSystem, res: Result<(), lumen_vfs::VfsError>) -> Result<(), lumen_vfs::VfsError> {
+        if res == Err(lumen_vfs::VfsError::Io) && fs.shared.ok_turned_eio.load(Ordering::SeqCst) { Ok(()) } else { res }
     }
 
     /// After a write fault, the volume went read-only (`errors=remount-ro`,
@@ -5496,11 +5575,19 @@ pub(crate) mod ktest_util {
             && m.root.create(b"after-the-fault", 0o644).err() == Some(lumen_vfs::VfsError::RoFs)
     }
 
-    impl FaultCache {
-        /// The device's bytes as they are, under the block cache.
-        pub fn dev_bytes(&self) -> Vec<u8> {
-            self.dev.bytes()
+    /// After a sweep's fault: whether a write failed, so the volume went
+    /// read-only ([`went_read_only`]). The leg then writes nothing more,
+    /// its checks of the failed operation's own outcome done. `false` when
+    /// the fault fell past the operation's writes: the leg goes on as
+    /// before. Stricter than [`went_read_only`]: a fault with the volume
+    /// still writable is an error.
+    pub fn read_only_after(m: &Mnt) -> Result<bool, &'static str> {
+        if !m.fs.errored() {
+            // No device write failed: the fault fell past the operation's
+            // writes (a failed one errors the volume, even under an `Ok`).
+            return if m.cache.faulted() { Err("a write failed, but the volume is writable") } else { Ok(false) };
         }
+        if went_read_only(m) { Ok(true) } else { Err("errored after a fault, but not read-only") }
     }
 
     impl Mnt {
@@ -6778,22 +6865,102 @@ crate::ktest!(
         kassert!(!fs.errored());
         let on_disk = dev.bytes();
         dev.fail_device_writes(true);
-        let _ = root.unlink(b"v");
+        let res = root.unlink(b"v");
         dev.fail_device_writes(false);
+        // Its writes, if any landed, landed in the cache only: `EIO`.
+        kassert_eq!(res, Err(VfsError::Io));
         kassert!(fs.errored() && bcache.lock().is_frozen());
         kassert_eq!(crate::desktop::logged(&line("unlink", 277))?, 1);
         kassert_eq!(crate::desktop::logged(&line("a read's eviction", 277))?, 0);
+        kassert!(dev.bytes() == on_disk);
+        drop((b, root, fs, bcache, dev));
+
+        // A volume whose 16 slots hold a few dirty blocks, least recently
+        // used, and clean ones: a 2-page file `f`, synced and dropped from
+        // the page cache, so its blocks and the root's directory block are
+        // evicted, and a miss's eviction meets a dirty block first, then
+        // finds a clean slot.
+        let primed = |minor: u32| -> Result<_, &'static str> {
+            let (dev, bcache, fs) = volume(16, minor)?;
+            let root = fs.root_inode();
+            let f = root.create(b"f", 0o644).map_err(|_| "create f")?;
+            kassert_eq!(f.write_at(0, &pattern(2 * PAGE_SIZE, 9)).map_err(|_| "write f")?, 2 * PAGE_SIZE);
+            let d = root.mkdir(b"d", 0o755).map_err(|_| "mkdir d")?;
+            let b = root.create(b"big", 0o644).map_err(|_| "create big")?;
+            kassert_eq!(b.write_at(0, &big).map_err(|_| "write big")?, big.len());
+            fs.sync().map_err(|_| "sync")?;
+            for file in [&f, &b] {
+                let e4 = file.as_any().and_then(|a| a.downcast_ref::<Ext4Inode>()).ok_or("ext4 inode")?;
+                e4.reclaim_clean_pages(usize::MAX);
+            }
+            drop(d.create(b"x", 0o644).map_err(|_| "create d/x")?);
+            let dirty = bcache.lock().stats().dirty;
+            kassert!(dirty > 0 && dirty < 16);
+            let mut page = vec![0u8; PAGE_SIZE];
+            for i in 0..16 - dirty {
+                b.read_at((i * PAGE_SIZE) as u64, &mut page).map_err(|_| "read big")?;
+            }
+            kassert_eq!(bcache.lock().stats().dirty, dirty);
+            kassert!(!fs.errored());
+            Ok((dev, bcache, fs, root, f))
+        };
+
+        // A link whose own read meets the failed eviction goes on, in the
+        // cache (a clean slot taken), and would return `Ok`: its name never
+        // reaches the disk, so it returns `EIO`.
+        let (dev, bcache, fs, root, f) = primed(279)?;
+        let on_disk = dev.bytes();
+        let failures = bcache.lock().writeback_failures();
+        dev.fail_device_writes(true);
+        let res = root.link(b"g", &f);
+        dev.fail_device_writes(false);
+        kassert!(bcache.lock().writeback_failures() > failures);
+        kassert_eq!(res, Err(VfsError::Io));
+        kassert!(fs.errored() && bcache.lock().is_frozen());
+        kassert_eq!(crate::desktop::logged(&line("link", 279))?, 1);
+        kassert!(dev.bytes() == on_disk);
+        drop((f, root, fs, bcache, dev));
+
+        // A write into the middle of `f`'s first page, whose read meets the
+        // failed eviction: refused, nothing of it in the page cache.
+        let (dev, bcache, fs, root, f) = primed(280)?;
+        let on_disk = dev.bytes();
+        dev.fail_device_writes(true);
+        let res = f.write_at(100, b"zz");
+        dev.fail_device_writes(false);
+        kassert_eq!(res.err(), Some(VfsError::RoFs));
+        kassert!(fs.errored());
+        kassert!(read_all(&f)? == pattern(2 * PAGE_SIZE, 9));
+        kassert!(dev.bytes() == on_disk);
+        drop((f, root, fs, bcache, dev));
+
+        // A write of the whole first page and part of the second, whose
+        // read meets it: short, the first page taken while the volume was
+        // healthy, nothing of the second.
+        let (dev, _bcache, fs, _root, f) = primed(281)?;
+        let on_disk = dev.bytes();
+        let new = pattern(PAGE_SIZE + 8, 11);
+        dev.fail_device_writes(true);
+        let res = f.write_at(0, &new);
+        dev.fail_device_writes(false);
+        kassert_eq!(res.map_err(|_| "short write")?, PAGE_SIZE);
+        kassert!(fs.errored());
+        let mut want = new[..PAGE_SIZE].to_vec();
+        want.extend_from_slice(&pattern(2 * PAGE_SIZE, 9)[PAGE_SIZE..]);
+        kassert!(read_all(&f)? == want);
         kassert!(dev.bytes() == on_disk);
         Ok(())
     }
 );
 
 crate::ktest!(
-    fn ext4_unlink_can_return_ok_after_a_failed_write_that_ext4plus_retried() {
+    fn ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio() {
         // #331: `ext4plus` 0.1.0-rc.2 frees a file's extent with `free_blocks`
         // and, if that fails, frees the same blocks again one at a time
         // (`file_blocks/utils.rs`, `free_freed_ranges`), so a failed write
-        // inside the range free is absorbed: the unlink returns `Ok`. Each
+        // inside the range free is absorbed: `ext4plus` returns `Ok` (and
+        // since #349 the unlink returns `EIO` all the same: the volume
+        // errored while it ran, `WriteOp::end`). Each
         // count is raised in memory just before it is written and never put
         // back, so a failure at or after the descriptor write carrying the
         // raised group count doubles the group's count, and a failed
@@ -6835,13 +7002,14 @@ crate::ktest!(
             let res = m.root.unlink(b"f");
             kassert!(m.cache.writes.load(O::Acquire) >= k); // write k was made, and failed
             m.cache.clear();
-            // A failed write, whatever the unlink returned: read-only (#349).
+            // A failed write, whatever `ext4plus` returned: read-only, and
+            // the unlink `EIO` (#349).
             kassert!(went_read_only(&m));
-            if res.is_err() {
-                kassert_eq!(res, Err(VfsError::Io));
+            kassert_eq!(res, Err(VfsError::Io));
+            if own_result(&m.fs, res).is_err() {
                 continue;
             }
-            // The unlink returned Ok: `f` is gone, its 2 blocks free in the
+            // `ext4plus` returned Ok: `f` is gone, its 2 blocks free in the
             // bitmap, and neither count is below what was freed.
             absorbed.push(k);
             let img = image(&m)?;
@@ -6898,7 +7066,11 @@ crate::ktest!(
         // than calling it, to leave out its warning; it pins `ext4plus`, not
         // Lumen's writeback. Under #349 each failed write errors the volume
         // (asserted) and stops the block cache's writeback, so the next
-        // writeback's counts land in the cache only (read back by `image`).
+        // writeback's counts land in the cache only (read back by `image`):
+        // both writebacks inside one write-type operation, which the cache
+        // takes writes from until it ends.
+        // Each run's errors=remount-ro line held back (`klog::hold_repeats`).
+        let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::Ordering as O;
@@ -6927,6 +7099,7 @@ crate::ktest!(
         let (mut nospc, mut leaked, mut above, mut after) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for k in 1..=total {
             let m = mount(setup.clone(), 276)?;
+            let _op = m.fs.shared.op("writeback");
             m.cache.arm_write(k);
             let res = write_page(&m, &page);
             kassert!(m.cache.writes.load(O::Acquire) >= k); // write k was made, and failed
@@ -7529,8 +7702,8 @@ crate::ktest!(
                             kassert_eq!(dst.stat().map_err(|_| "stat dst")?.nlink, 1);
                             kassert_eq!(dp.lookup(b"dst2").map_err(|_| "dst2")?.stat().map_err(|_| "stat")?.nlink, 1);
                             // A fault on the count's own write leaves the disk
-                            // one high until the next namespace operation
-                            // (the true count is kept in memory, and logged).
+                            // one high for good (the volume read-only, #349;
+                            // the true count is kept in memory, and logged).
                             if !reached {
                                 kassert_eq!(other.stat().map_err(|_| "ro")?.nlink, 1);
                             }
@@ -7821,8 +7994,8 @@ crate::ktest!(
                     }
                     drop((ro_a, ro_b, at_src, at_dst, ro));
 
-                    // The volume went read-only (#349): no name comes off
-                    // and nothing new can take a number.
+                    // The volume went read-only (#349; a create refused):
+                    // nothing new can take a number.
                     kassert!(went_read_only(&m));
                     let removed = if is_dir { b.rmdir(dst_name) } else { a.unlink(b"s") };
                     kassert!(removed.is_err());
@@ -8005,9 +8178,8 @@ crate::ktest!(
         // entries back. Each name left holds its inode's data, each count in
         // memory is at least the names on disk (a file left at both names
         // keeps it, on disk with its bounds too: #322's class; the volume
-        // then goes read-only, #349, so no name comes off), and an inode the
-        // undo leaves with no name
-        // keeps a count above 0, on disk (allocated, for e2fsck's
+        // then goes read-only, #349), and an inode the undo leaves with no
+        // name keeps a count above 0, on disk (allocated, for e2fsck's
         // lost+found, which a count of 0 would clear instead: #323) and in
         // memory. At least one fault leaves a file nameless, and with reads
         // failing at least one leaves a file at both names.
@@ -8139,10 +8311,10 @@ crate::ktest!(
         // and `sub`'s entry gone, a `sub` whose blocks `delete_file` had
         // begun freeing, not yet zeroed, is forgotten like a zeroed one
         // (#330); a write fault makes the volume read-only (#349), so
-        // nothing made afterwards can get its blocks. Each leg has at least one rmdir that took the entry out
-        // and then couldn't read `a` back, and the second at least one that
-        // took rmdir's zeroed-child arm and one that forgot `sub` for its
-        // freed blocks.
+        // nothing made afterwards can get its blocks. Each leg has at least
+        // one rmdir that took the entry out and then couldn't read `a` back,
+        // and the second at least one that took rmdir's zeroed-child arm and
+        // one that forgot `sub` for its freed blocks.
         // Its repeated vfs errors held back from serial (`klog::hold_repeats`).
         let _held = crate::klog::hold_repeats("vfs");
         use self::ktest_util::*;
@@ -8362,8 +8534,8 @@ crate::ktest!(
         // rise: a weaker check, since a pair can clear a block's bit and
         // fail the counts' writes). Every fault makes the volume read-only
         // (#349): no file made afterwards can get `f`'s blocks, and a kept
-        // `f`'s writes are refused. Each forgets `f` for its freed
-        // blocks at least once, and the first keeps it live at least once.
+        // `f`'s writes are refused. Each forgets `f` for its freed blocks at
+        // least once, and the first keeps it live at least once.
         // In the fourth, an `f` whose entry went is never forgotten for its
         // freed blocks, and is kept live only when whether they were freed
         // can't be told, logged, at least once.
@@ -9093,6 +9265,10 @@ crate::ktest!(
         m.cache.clear();
         kassert!(failed.is_err() && m.fs.errored());
         drop(m.fs.shared.op("fsync"));
+        kassert!(!m.cache.frozen() && !m.fs.shared.cache.frozen());
+        // An operation through the public API is refused meanwhile, and
+        // doesn't settle it either.
+        kassert_eq!(m.root.create(b"late", 0o644).err(), Some(VfsError::RoFs));
         kassert!(!m.cache.frozen() && !m.fs.shared.cache.frozen());
         // The cache still takes the running operation's writes.
         kassert!(m.fs.shared.state.lock().bcache.write_at(off, &[0u8; 4]).is_ok());
