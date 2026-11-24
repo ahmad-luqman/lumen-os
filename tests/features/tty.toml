@@ -1,0 +1,4 @@
+[[feature]]
+name = "termios line discipline (logic)"
+milestone = "M8"
+tests = ["cargo:lumen-tty"]

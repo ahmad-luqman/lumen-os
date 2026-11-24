@@ -528,6 +528,13 @@ name = "lumen-trace"
 version = "0.0.1"
 
 [[package]]
+name = "lumen-tty"
+version = "0.0.1"
+dependencies = [
+ "linux-raw-sys",
+]
+
+[[package]]
 name = "lumen-uart"
 version = "0.0.1"
 
