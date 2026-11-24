@@ -1,0 +1,12 @@
+[package]
+name = "lumen-tty"
+description = "no_std termios line discipline and terminal readiness decisions, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+linux-raw-sys.workspace = true
+
+[lints]
+workspace = true
