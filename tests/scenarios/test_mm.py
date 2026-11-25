@@ -171,8 +171,8 @@ def test_heap_command_reports_usage(boot):
     # and the process table's nodes, #372), and the shells (their
     # editors and histories, the screen shells' threads and the keyboard's
     # wait queue they block in) is in use (91 allocations when the VFS mounts
-    # arrived, 101 with pid 1; the ceiling leaves 9 for growth); the rest of
-    # what the heap mapped is free.
+    # arrived, 95 before pid 1, 101 with it; the ceiling leaves 9 for
+    # growth); the rest of what the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap

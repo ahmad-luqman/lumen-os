@@ -59,6 +59,13 @@ struct MProc {
     tids: Vec<u32>,
 }
 
+impl MProc {
+    /// A running process that hasn't exec'd, with no children or threads.
+    fn new(parent: Option<u32>, pgid: u32, sid: u32, slot: u64) -> Self {
+        Self { parent, children: Vec::new(), pgid, sid, state: MState::Run, execed: false, slot, tids: Vec::new() }
+    }
+}
+
 struct Model {
     procs: BTreeMap<u32, MProc>,
     last: u32,
@@ -103,19 +110,7 @@ fn not_live<T>(pid: u32, role: Role) -> Result<T, Error> {
 impl Model {
     fn new() -> Self {
         let mut procs = BTreeMap::new();
-        procs.insert(
-            INIT,
-            MProc {
-                parent: None,
-                children: Vec::new(),
-                pgid: INIT,
-                sid: INIT,
-                state: MState::Run,
-                execed: false,
-                slot: 0,
-                tids: Vec::new(),
-            },
-        );
+        procs.insert(INIT, MProc::new(None, INIT, INIT, 0));
         Self { procs, last: 1, fired: [0; 3] }
     }
 
@@ -151,6 +146,11 @@ impl Model {
         let span = MAX_PID - 1; // 2..=MAX_PID
         let off = if self.last < 2 { span - 1 } else { self.last - 2 };
         (1..=span).map(|k| 2 + (off + k) % span).find(|&n| !self.busy(n))
+    }
+
+    /// Every process's non-leader tids.
+    fn all_tids(&self) -> Vec<u32> {
+        self.procs.values().flat_map(|p| p.tids.iter().copied()).collect()
     }
 
     fn group_exists(&self, g: u32) -> bool {
@@ -197,19 +197,7 @@ impl Model {
 
     fn spawn_root(&mut self, slot: u64) -> Option<u32> {
         let pid = self.next_pid()?;
-        self.procs.insert(
-            pid,
-            MProc {
-                parent: None,
-                children: Vec::new(),
-                pgid: pid,
-                sid: pid,
-                state: MState::Run,
-                execed: false,
-                slot,
-                tids: Vec::new(),
-            },
-        );
+        self.procs.insert(pid, MProc::new(None, pid, pid, slot));
         self.last = pid;
         Some(pid)
     }
@@ -220,19 +208,7 @@ impl Model {
         }
         let pid = self.next_pid().ok_or(Error::User(Errno::Again))?;
         let (pgid, sid) = (self.procs[&parent].pgid, self.procs[&parent].sid);
-        self.procs.insert(
-            pid,
-            MProc {
-                parent: Some(parent),
-                children: Vec::new(),
-                pgid,
-                sid,
-                state: MState::Run,
-                execed: false,
-                slot,
-                tids: Vec::new(),
-            },
-        );
+        self.procs.insert(pid, MProc::new(Some(parent), pgid, sid, slot));
         self.procs.get_mut(&parent).unwrap().children.push(pid);
         self.last = pid;
         Ok(pid)
@@ -555,8 +531,7 @@ fn random_number(rng: &mut Rng, m: &Model) -> i32 {
         1 => -(rng.below(4) as i32),
         2 => {
             // A tid: a number in use that names no process.
-            let tids: Vec<u32> = m.procs.values().flat_map(|p| p.tids.iter().copied()).collect();
-            rng.pick(&tids).map_or(0, |t| t as i32)
+            rng.pick(&m.all_tids()).map_or(0, |t| t as i32)
         }
         _ => {
             let pids: Vec<u32> = m.procs.keys().copied().collect();
@@ -740,7 +715,9 @@ fn run(seed: u64, seen: &mut Seen) {
                 assert_eq!(t.cont(pid), m.cont(pid), "{label}: cont {pid}");
             }
             94 => {
-                let Some(pid) = rng.pick(&others) else { continue };
+                // An execve runs with one thread left (`de_thread`).
+                let single: Vec<u32> = others.iter().copied().filter(|p| m.procs[p].tids.is_empty()).collect();
+                let Some(pid) = rng.pick(&single) else { continue };
                 t.exec(pid).unwrap();
                 m.procs.get_mut(&pid).unwrap().execed = true;
             }
@@ -768,7 +745,7 @@ fn run(seed: u64, seen: &mut Seen) {
                 // Mostly one of the process's own tids; sometimes its pid,
                 // another process's tid, or any number.
                 let pid = rng.pick(&m.procs.keys().copied().collect::<Vec<_>>()).unwrap();
-                let all: Vec<u32> = m.procs.values().flat_map(|p| p.tids.iter().copied()).collect();
+                let all = m.all_tids();
                 let tid = match rng.below(10) {
                     0 => pid,
                     1 => rng.pick(&all).unwrap_or(pid),

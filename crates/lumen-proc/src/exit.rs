@@ -260,7 +260,8 @@ impl ProcTree {
     /// there is no reaper). Any error leaves the tree unchanged.
     ///
     /// `pid`'s added threads ([`ProcTree::add_thread`]) still registered
-    /// are freed with it: their numbers are free again.
+    /// are freed with it, after every step that can fail (a refused exit
+    /// keeps them): their numbers are free again.
     ///
     /// Allocates only through those two fallible reservations; frees the
     /// nodes of the zombies that leave and the freed tids' index entries. Finding the groups to fire takes

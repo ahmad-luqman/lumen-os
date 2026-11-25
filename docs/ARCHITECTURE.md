@@ -1012,7 +1012,7 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   by Python `ctypes`/`libffi`, Ruby, and JITs).
 - **Teardown:** When a process's last thread exits (`exit_group`, running with
   interrupts ON), it switches `CR3` back to `kernel_root()`, extracts and
-  closes its FD table outside `ACTIVE_PROCS` (releasing `flock` and POSIX
+  closes its FD table outside every process lock (releasing `flock` and POSIX
   record locks), and tears down all VMAs, `pinned_pages` (sweeping `PTE_DIRTY`
   and decrementing `writable_maps` on `WRITABLE | PTE_SHARED` leaves, then
   dropping `Arc<CachePage>` pins; the earlier switch to `kernel_root()` is
@@ -4188,10 +4188,12 @@ In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (matching
 `RLIMIT_NOFILE`), storing `Option<FdEntry { file: Arc<OpenFile>, cloexec: bool }>`.
 
 **Built in #254b** (`kernel/src/linux/process.rs`, `syscall/fd.rs`,
-`syscall/dir.rs`): `ProcessState` holds `fds: FdTable<Arc<OpenFile<KernelVfsLock<u64>>>>`
+`syscall/dir.rs`; split into M8's `Process` and `Files` by B1, below): the
+process's `Files` holds `fds: FdTable<Arc<OpenFile<KernelVfsLock<u64>>>>`
 (private: a slot leaves it only through `close_current_fd`, a displacing
-`insert_current_fd`/`dup_current_fd` or `take_of` (behind `take_current`
-and the test seams' `RegisteredProcess`), which release its locks; `install_current_fd` and `insert_current_fd` take a fresh
+`insert_current_fd`/`dup_current_fd` or the takedown's `Files::leave`
+(behind `take_current` and the test seams' `RegisteredProcess`), which
+release its locks; `install_current_fd` and `insert_current_fd` take a fresh
 `OpenFile` by value, and `dup_current_fd` (`dup2`/`dup3`) and
 `dup_current_fd_from` (`F_DUPFD*`), each with a close-on-exec flag, count
 the slot they share),
@@ -4215,7 +4217,7 @@ given back to the offset). On procfs the offset's lock isn't held across
 snapshot of the offset, which moves after only if nothing moved it
 meanwhile. An `O_APPEND` write goes through `VfsInode::append`, one chunk
 at a time (a write over 4 KiB can have another appender's data land
-between its chunks). `close` takes the entry out under `ACTIVE_PROCS`
+between its chunks). `close` takes the entry out under the table's lock
 and, after it, releases the closing pid's POSIX record locks on the inode
 (any close) and, on the open file description's last `dec_fd_ref`, its
 `flock` locks; `take_current` does the same for every descriptor when the
@@ -4280,7 +4282,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 76 | `truncate(path, len)` | validates `len >= 0` (`-EINVAL`) before resolving `path` (following symlinks); a directory `-EISDIR`, any other non-regular file `-EINVAL`, a read-only mount `-EROFS`; then resizes as `ftruncate` does |
 | 77 | `ftruncate(fd, len)` | validates `len >= 0` and `fd` open for writing on a regular file (`-EINVAL` for `len < 0` first, `-EBADF` if closed or `O_PATH`, `-EINVAL` if not open for writing or not regular, `-EROFS` on a read-only mount, `-EFBIG` past the filesystem's largest file); the inode's truncate zeroes the partial final page's tail when `len % 4096 != 0` on shrink (or the old tail on grow), drops cached pages past `len.div_ceil(4096)` and updates `st_size` and `mtime`/`ctime`; then `invalidate_file_from` unmaps the caller's mapped PTEs past `align_up_page(len)` (section 5; the caller's space only until M8, when B7 reaches every space mapping the file) |
 | 79 | `getcwd(buf, size)` | returns canonical NUL-terminated path of the process's current working directory (computed/maintained across ancestor `rename`, length including NUL, `-ERANGE` if `size` too small, `-ENOENT` if cwd was unlinked / `st_nlink == 0`) |
-| 80 | `chdir(path)` | resolves `path` (following symlinks), requires directory (`-ENOTDIR`), updates process `cwd` inode and path (extracting and dropping the old `Arc<VfsInode>` outside `ACTIVE_PROCS`) |
+| 80 | `chdir(path)` | resolves `path` (following symlinks), requires directory (`-ENOTDIR`), updates process `cwd` inode and path (extracting and dropping the old `Arc<VfsInode>` outside the process's locks) |
 | 81 | `fchdir(fd)` | validates `fd` refers to an open directory (`-ENOTDIR`/`-EBADF`; `O_PATH` dirs allowed), updates process `cwd` |
 | 82 | `rename(old, new)` | shim to `renameat2(AT_FDCWD, old, AT_FDCWD, new, 0)` |
 | 83 | `mkdir(path, mode)` | shim to `mkdirat(AT_FDCWD, path, mode)` |
@@ -4606,9 +4608,10 @@ nor that list.
 
 ### Processes and threads (designed in #336, M8)
 
-M6 and M7 run one ring-3 thread per process, pinned to the CPU it started
+M6 and M7 ran one ring-3 thread per process, pinned to the CPU it started
 on, with its Linux state in `ACTIVE_PROCS` (`kernel/src/linux/process.rs`:
-a `SpinLock<BTreeMap<u64, ProcessState>>` keyed by the kernel thread's id).
+a `SpinLock<BTreeMap<u64, ProcessState>>` keyed by the kernel thread's id;
+B1 replaced it with the model below, one thread per process still).
 M8 splits that state into processes and threads, keeps the process tree in
 `lumen_proc::ProcTree` (#341), makes every blocking syscall interruptible,
 and adds `fork`, `vfork`, threads, `execve`, `wait4`/`waitid`, `futex`,
@@ -4641,7 +4644,9 @@ pub struct Process {
     exe_path: SpinLock<Option<String>>,      // /proc/<pid>/exe
     usage_slot: u64,                         // its RusageSlot's value
     children_ticks: [AtomicU64; 2],          // reaped children's user, system
-    console: ConsoleState,                   // M7's console state, until C10
+    console: SpinLock<ConsoleState>,         // M7's console state, until C10
+    allow_test_syscalls: bool,               // usertest's test syscalls (M6)
+    exit: SpinLock<Option<UserExit>>,        // M7's end, first wins, until group_exit (C1, C3)
 }
 pub struct Files {
     table: SpinLock<FdTable<FileRef>>,       // FileRef = Arc<KernelFile>
@@ -4675,8 +4680,14 @@ pub struct UserThread {
     process: Arc<Process>,
     clear_child_tid: AtomicU64,              // set_tid_address, CHILD_CLEARTID
     robust_list: AtomicU64,                  // set_robust_list's head (C4)
+    kernel_thread: u64,                      // its sched::Thread's id (ps, ktests)
 }
 ```
+
+B1 builds the fields its behaviour needs (`pid`, `mm`, `files`, `fs`,
+`signal` with `actions` and each thread's `blocked`, `exe_path`,
+`usage_slot`, `console`, `allow_test_syscalls`, `exit`; `UserThread`
+but `robust_list`); each later issue adds its own.
 
 - **One per-thread state.** `sched::Thread::user` is already a `UserSlot`
   holding `UserThreadState { address_space, fpu, fs_base, kernel_rsp,
@@ -4684,7 +4695,9 @@ pub struct UserThread {
   context switch loads `CR3` from its `address_space`, and the `#PF` path
   reads it lock-free (`current_address_space()`). B1 adds to it
   `linux: Option<Arc<UserThread>>` (`None` for a ktest's `UserSpaceGuard`;
-  set at spawn, read lock-free) and the thread's restart block (B2: an
+  set by the thread itself when its process registers until C1's
+  `spawn_user_on` sets it at spawn, cleared by its takedown before
+  `detach_user_space`; read lock-free) and the thread's restart block (B2: an
   `UnsafeCell<Option<RestartBlock>>` read and written only by its own
   thread with interrupts off, as `set_current_fs_base` writes `fs_base`),
   and nothing else: `fs_base`, the FPU area and the pending-`#DB`
@@ -4768,15 +4781,18 @@ allocator, so no tid is ever a live pid, pgid or sid, and the leader's tid
 is the pid. lumen-proc doesn't model threads yet: B1 adds, host-tested in
 `cargo:lumen-proc`:
 - `ProcTree::add_thread(pid) -> Result<u32, Error>`: a number as `fork`
-  hands one out (`EAGAIN` when none is free), counted by `is_busy` while
-  the thread lives; a pid that isn't live is a `Bug`;
+  hands one out (`EAGAIN` when none is free; `ENOMEM` when room in the
+  process's thread list can't be reserved, as `fork`'s children list),
+  counted by `is_busy` while the thread lives; a pid that isn't live is a
+  `Bug`;
 - `ProcTree::remove_thread(pid, tid) -> Result<(), Error>`: a new `Bug`
   variant, `Bug::NotThread { pid, tid }`, for a tid the process doesn't
   have or for the leader's tid (the pid, which the process keeps until it
   is reaped);
 - `ProcTree::exit` accepts a process with non-leader tids still
-  registered and frees them with it (the kernel removes each as its
-  thread exits, so only a bookkeeping bug leaves one).
+  registered and frees them with it, after its fallible steps (the kernel
+  removes each as its thread exits, so only a bookkeeping bug leaves
+  one); `ProcTree::exec` debug-asserts none is registered.
 
 Because a live tid counts in `is_busy`, the pgid and sid calls see it as a
 number in use: `tcsetpgrp(tid)` gives `EPERM` (the number isn't a group of
@@ -4784,8 +4800,8 @@ the caller's session) where it gave `ESRCH`, and `getpgid`, `setpgid` and
 `kill` with a non-leader tid give `ESRCH` as before (lumen-proc looks
 processes up by pid).
 
-**Init and orphans.** At boot, `linux::init` (a function B1 adds to
-`kernel/src/linux/mod.rs`) calls `ProcTree::spawn_init`: pid 1 is a
+**Init and orphans.** At boot, `linux::init` (a function B1 adds in
+`kernel/src/linux/init.rs`, re-exported by `linux`) calls `ProcTree::spawn_init`: pid 1 is a
 kernel-owned process with no threads. It has a `PROCS.procs` entry, an
 ordinary `Process` with no `UserThread` (its `mm` a placeholder empty
 `AddressSpace` that is never loaded), whose `SIGCHLD` disposition is
@@ -7158,7 +7174,8 @@ fixable there now, each in a PR of its own.
    (`st_nlink == 1`), **or `rmdir(path)` / `rename` overwrites an empty
    directory** (`st_nlink == 2`), while the target inode's explicit atomic
    `open_count > 0` (sum of live `OpenFile`, `AddressSpace::mapped_files`, and
-   `ProcessState::cwd` references, maintained via RAII guards and distinct from
+   `FsState`'s `cwd` references (M7's `ProcessState::cwd`), maintained via
+   RAII guards and distinct from
    `Arc<VfsInode>` cache refs):
    - The directory entry is removed/replaced immediately (so `open(path)`/
      `stat(path)` no longer find the old inode and a new file/dir can be
@@ -8271,8 +8288,10 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     records (each segment's file bytes, at its file offset; its `.bss`
     past them anonymous), trimmed by any unmap over them; the lines'
     formatting is `lumen_vm::maps`'s, host-tested), enabling `musl`'s `pthread_getattr_np` and runtime stack/mapping
-    discovery. Generated lock-order-safely by cloning `Arc<AddressSpace>` under
-    `ACTIVE_PROCS`, releasing `ACTIVE_PROCS`, locking `AddressSpace::inner`
+    discovery (empty for a process with no address space, its takedown or
+    a zombie, as Linux's). Generated lock-order-safely by cloning
+    `Arc<AddressSpace>` under `Process::mm` (found through `PROCS`), releasing
+    both, locking `AddressSpace::inner`
     (Lock 1) with no `VfsInode` lock held, formatting into a kernel buffer,
     and copying via `copy_to_user`.
   - `/proc/cpuinfo`, `/proc/meminfo` (live `MemTotal`/`MemFree`/`MemAvailable`/
@@ -8375,7 +8394,8 @@ holding only locks above it.
        under it)
     c. each a leaf but for the heap, none taken with another of them:
        Process::mm, Process::files and Process::fs (the Option<Arc> slots),
-       Files::table, FsState::inner, TIMERS, an inode's mappers list
+       Process::exe_path, Process::console and Process::exit (B1's M7
+       state), Files::table, FsState::inner, TIMERS, an inode's mappers list
        (section 5) and FIFO slot (section 10), and `syscall/lock.rs`'s POSIX_WAITERS (a
        PosixWaitGraph record's insert and removal allocate and free under
        it; never held with PROCS, an inode's lock or the lock wait queue's)
@@ -8391,12 +8411,12 @@ holding only locks above it.
        table and released before any other lock or count update
 ```
 
-M8 adds (designed in #336, none built yet): Lock 0, Lock 1a, Lock 9a and,
-in level 10, `PROCS` (which replaces M7's leaf `ACTIVE_PROCS` in B1; until
-then `ACTIVE_PROCS` sits at `a`), `Process::signal`, `Process::mm`,
-`Process::files`, `Process::fs`, `Files::table`, `FsState::inner`,
-`TIMERS`, the mappers lists, the FIFO slots, the futex buckets and the
-`PollHead` lists.
+M8 adds (designed in #336): Lock 0, Lock 1a, Lock 9a and, in level 10,
+`PROCS` (built in B1, replacing M7's leaf `ACTIVE_PROCS`),
+`Process::signal`, `Process::mm`, `Process::files`, `Process::fs`,
+`Process::exe_path`, `Process::console`, `Process::exit`, `Files::table`
+and `FsState::inner` (built in B1), `TIMERS`, the mappers lists, the FIFO
+slots, the futex buckets and the `PollHead` lists.
 Sections 5, 6, 8 and 10 name these locks and cite this list for their
 places. Until each lands, M7's order holds
 without it.
@@ -8406,9 +8426,9 @@ not across procfs's `read_at`: `/proc/<pid>/maps` takes the address
 space's Lock 1 there, which comes first, so `read` reads procfs at a
 snapshot of the offset and moves it after, under a fresh hold, only if it
 is unchanged. `dir_cursor` (Lock 2) is held across every filesystem's
-`readdir`, procfs's included (it takes only the leaf `ACTIVE_PROCS`,
-`PROCS` from B1), and moved before it is released; never across
-`getdents64`'s copy out. From M8 every such call on a regular file, a
+`readdir`, procfs's included (it takes `PROCS` and the process's leaf
+locks, M7's leaf `ACTIVE_PROCS` before B1), and moved before it is
+released; never across `getdents64`'s copy out. From M8 every such call on a regular file, a
 directory or a procfs file also holds Lock 0's `OpenFile::pos` for its
 whole length, so its Lock 2 holds are uncontended; they stay as M7's code
 takes them.
@@ -8439,8 +8459,8 @@ file description had one thread (M7) and becomes possible once threads,
 3. **`getdents64`'s put-back undid another listing's move.** The same:
    `getdents64` holds `pos` across its `readdir` and its copy out.
 4. **`dup*` looked up and installed in two holds, and `openat` checked for
-   a free slot before it opened.** The FD table moves out of
-   `ACTIVE_PROCS` into `Files::table` (a `SpinLock` per table, shared by
+   a free slot before it opened.** The FD table moved out of
+   `ACTIVE_PROCS` into `Files::table` in B1 (a `SpinLock` per table, shared by
    `CLONE_FILES`). `dup`, `dup2`, `dup3` and `F_DUPFD*` look `old` up and
    install the new slot in one hold. A call that drops the table's lock
    between choosing a slot and filling it (`openat`, `pipe2`) first takes
@@ -8477,9 +8497,8 @@ and `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_threa
   `chdir`, `dup*`, `execve`'s close-on-exec, exit) that removes an
   `Arc<OpenFile>` (M7) or a `FileRef` (an `Arc<OpenFile>`, M8), a `Cwd`
   or an
-  `Arc<VfsInode>` from `ACTIVE_PROCS`'s `ProcessState` (M7), or from
-  `Files::table`, `FsState::inner`, `PROCS`
-  or `Process::signal` (M8), extracts the `Arc` under
+  `Arc<VfsInode>` from `Files::table`, `FsState::inner`, `PROCS`
+  or `Process::signal` (`ACTIVE_PROCS`'s `ProcessState` before B1), extracts the `Arc` under
   the lock, drops the guard, and only then runs lock cleanup
   (`flock`/POSIX locks) or drops the `Arc`. The same for an
   `Arc<AddressSpace>` (`Process::mm`), an `Arc<Process>` leaving `PROCS`,
@@ -10994,7 +11013,7 @@ kernel/            the kernel (bin crate, x86_64-unknown-none)
   src/drivers.rs   the driver table and probe_all
   src/blk/         (M7, designed in #246) virtio-blk driver implementing BlockDevice, block-device registry, `blk` shell command
   src/vfs/         (M7, designed in #246) POSIX VFS kernel integration, unified PageCache, writable ext4 adapter, tmpfs, devfs, procfs, `mount`/`sync` commands
-  src/linux/       Linux x86-64 ABI (M6 built #232–#238; M7 extends #246): UAPI re-exports (mod.rs), Limine boot-module loader (modules.rs), ProcessState + FD table + console bridge (process.rs), syscall dispatcher (syscall/mod.rs; handlers by cluster in syscall/{fd,stat,ns,dir,meta,io,lock,mem,proc}.rs; the file syscalls' shared argument decoding, path copy and stat fill in syscall/at.rs)
+  src/linux/       Linux x86-64 ABI (M6 built #232–#238; M7 extends #246): UAPI re-exports (mod.rs), Limine boot-module loader (modules.rs), Process/UserThread + PROCS + FD table + console bridge (process.rs), pid 1 (init.rs), syscall dispatcher (syscall/mod.rs; handlers by cluster in syscall/{fd,stat,ns,dir,meta,io,lock,mem,proc}.rs; the file syscalls' shared argument decoding, path copy and stat fill in syscall/at.rs)
   src/user.rs      ring-3 entry/exit runner, `.lumen_fixup` safe user copies (`copy_from_user`/`copy_to_user`/`copy_cstr_from_user`), user exception handling (M6)
   src/sound.rs     the virtio-sound driver (its thread owns the device), beep, play, volume, sound
   src/virtio.rs    the adapter for virtio-drivers: the Hal (DMA runs, bounce buffers), transport, VirtioTransport

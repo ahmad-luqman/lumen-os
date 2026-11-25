@@ -351,7 +351,8 @@ impl Start {
 ///   dirfd's file: `-EBADF` if it isn't open, `-ENOTDIR` if it isn't a
 ///   directory (an `O_PATH` one is fine).
 ///
-/// Takes `ACTIVE_PROCS` briefly; the clones it takes drop after it.
+/// Takes the process's descriptor and working-directory locks briefly; the
+/// clones it takes drop after them.
 pub(super) fn start_dir(dirfd: Dirfd, path: &UserPath) -> Result<Start, u32> {
     if path.as_bytes().starts_with(b"/") {
         return Ok(Start { dir: None, base: None });

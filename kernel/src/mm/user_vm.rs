@@ -548,7 +548,6 @@ impl AddressSpace {
     /// Release one process user, tearing down the space at zero.
     /// The process must first detach its CPU from this space. Panics if
     /// no user remains; observers may keep the bare root alive afterwards.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1's process lifetime
     pub fn drop_user(&self) {
         let previous = self
             .users
@@ -1503,9 +1502,10 @@ impl AddressSpace {
 
     /// Release all user leaf references (present and `PTE_PROTNONE`) and
     /// VMAs, and free user L1/L2/L3 tables while interrupts are enabled.
-    /// `drop_user` calls this at zero; process exit also uses it until C1
-    /// wires process-user accounting. Direct teardown retires users to zero
-    /// and asserts there was at most one user. Repeated calls are harmless.
+    /// `drop_user` calls this at zero (a Linux process's takedown gives up
+    /// its user there, #372); a space no process adopted is torn down
+    /// directly. Direct teardown retires users to zero and asserts there was
+    /// at most one user. Repeated calls are harmless.
     ///
     /// Must be called only after switching `CR3` back to `kernel_root()`.
     /// Subsequent [`Drop`] frees only the bare L4 root frame without locking.
@@ -1550,7 +1550,7 @@ impl AddressSpace {
     }
 
     /// Format `/proc/<pid>/maps` strictly under Lock 1 (`AddressSpace::inner`),
-    /// with no `ACTIVE_PROCS` or `VfsInode` locks held. The lines themselves
+    /// with no `PROCS`, process or `VfsInode` locks held. The lines themselves
     /// are `lumen_vm::maps::write_maps`'s; the files they name are resolved
     /// here: a file mapping's from `mapped_files` (its inode's device and
     /// number now, which read no lock, deleted once detached by an unlink,

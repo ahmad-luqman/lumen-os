@@ -174,8 +174,14 @@ impl ProcTree {
 
     /// `execve` by `pid` succeeded: from now on its parent's `setpgid` on it
     /// is `EACCES`. [`Bug::NotLive`] if `pid` isn't live.
+    ///
+    /// An `execve` runs with one thread left (`de_thread`): the kernel
+    /// removes the others ([`ProcTree::remove_thread`]) first, and a debug
+    /// assertion checks none is registered.
     pub fn exec(&mut self, pid: u32) -> Result<(), Bug> {
-        self.live_entry_mut(pid).ok_or(Bug::NotLive { pid, role: Role::Caller })?.execed = true;
+        let p = self.live_entry_mut(pid).ok_or(Bug::NotLive { pid, role: Role::Caller })?;
+        debug_assert!(p.tids.is_empty(), "exec by {pid} with threads {:?} still registered", p.tids);
+        p.execed = true;
         Ok(())
     }
 
@@ -580,9 +586,11 @@ impl ProcTree {
         self.procs.get(&pid).map(|p| p.execed)
     }
 
-    /// Checks every structural invariant, panicking on the first broken one.
-    #[cfg(test)]
-    pub(crate) fn check_invariants(&self) {
+    /// Checks every structural invariant, panicking on the first broken one
+    /// (host tests, and the kernel's ktests through the `test-util`
+    /// feature).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn check_invariants(&self) {
         let mut groups = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         let mut group_sid: BTreeMap<u32, u32> = BTreeMap::new();
@@ -621,8 +629,8 @@ impl ProcTree {
             for &tid in &p.tids {
                 assert!(tids.insert(tid, pid).is_none(), "tid {tid} listed twice");
                 assert!(!self.procs.contains_key(&tid), "tid {tid} is a pid");
-                assert!(!groups.iter().any(|&(g, _)| g == tid), "tid {tid} is a pgid");
-                assert!(!sessions.iter().any(|&(s, _)| s == tid), "tid {tid} is a sid");
+                assert!(groups.range((tid, 0)..=(tid, u32::MAX)).next().is_none(), "tid {tid} is a pgid");
+                assert!(sessions.range((tid, 0)..=(tid, u32::MAX)).next().is_none(), "tid {tid} is a sid");
             }
         }
         assert_eq!(tids, self.tids, "tid index out of date");

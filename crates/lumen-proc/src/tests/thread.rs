@@ -147,6 +147,31 @@ fn tcsetpgrp_to_a_tid_is_eperm_not_esrch() {
 }
 
 #[test]
+fn a_refused_exit_keeps_the_threads_registered() {
+    let mut t = tree();
+    let a = fork(&mut t, INIT);
+    let child = fork(&mut t, a);
+    let tids: Vec<u32> = (0..3).map(|_| t.add_thread(a).unwrap()).collect();
+    let before = alloc::format!("{t:?}");
+    // Its own child can't reap its children: the exit is refused.
+    let got = t.exit(a, crate::ExitStatus::exited(0), Some(child), |_| false).map(drop);
+    assert_eq!(got.unwrap_err(), crate::ExitError::Bug(Bug::BadReaper { pid: a, reaper: child }));
+    assert_eq!(alloc::format!("{t:?}"), before);
+    assert_eq!(t.threads(a), tids.as_slice());
+    assert!(tids.iter().all(|&tid| t.is_busy(tid)));
+    t.check_invariants();
+}
+
+#[test]
+#[should_panic(expected = "still registered")]
+fn exec_with_threads_registered_is_a_bug() {
+    let mut t = tree();
+    let a = fork(&mut t, INIT);
+    let _tid = t.add_thread(a).unwrap();
+    let _ = t.exec(a);
+}
+
+#[test]
 fn not_thread_names_both_numbers() {
     let text = alloc::format!("{}", Bug::NotThread { pid: 4, tid: 9 });
     assert_eq!(text, "9 isn't a thread 4 added");

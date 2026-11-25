@@ -455,7 +455,7 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
     linux_syscall::dispatch(frame)
 }
 
-/// Test-only syscall hooks invoked ONLY when `ProcessState::allow_test_syscalls`
+/// Test-only syscall hooks invoked ONLY when `Process::allow_test_syscalls`
 /// is set (`usertest` runs). Normal `linux` binaries never reach these hooks.
 pub(crate) fn dispatch_test_syscall(frame: &mut SyscallFrame) -> Option<SyscallReturn> {
     match frame.rax {
@@ -587,12 +587,8 @@ fn spawn_ring3_on(
             deferred_lstar_db: lstar_after.saturating_sub(lstar_before),
             deferred_stub_db: stub_after.saturating_sub(stub_before),
         });
-        // Detach and tear down user mappings with interrupts ON before exiting.
-        if let Some(detached) = sched::detach_user_space()
-            && Arc::strong_count(&detached) == 1
-        {
-            detached.teardown();
-        }
+        // `take_current` took this thread off the space and gave up the
+        // process's user of it (torn down, with interrupts on, as the last).
     })
     .map_err(|_| "failed to spawn user thread")?;
     Ok((handle, result_slot))
@@ -1856,11 +1852,19 @@ crate::ktest!(
                 sched::yield_now();
             }
         }
-        // Let it exit whatever was seen, so the thread always ends.
+        // Let it exit whatever was seen, so the thread always ends. This
+        // thread loads the space while the process may exit on another CPU,
+        // so it holds a process user meanwhile: the process's own takedown
+        // then can't tear the space down under this CPU's CR3; whichever
+        // side drops the last user does, here only after the guard switched
+        // CR3 back. The process is still waiting for the flag, so the space
+        // can't be retired yet.
+        kassert!(space.add_user());
         let released = {
             let _active = sched::UserSpaceGuard::enter(space.clone());
             copy_to_user(TEST_DATA_VA, &1u64.to_le_bytes())
         };
+        space.drop_user();
         handle.join();
         let exit = slot.lock().take().map(|r| r.exit);
         kassert_eq!(released, Ok(()));

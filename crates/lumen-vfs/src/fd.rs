@@ -225,7 +225,7 @@ impl<L: VfsLock<u64>> OpenFile<L> {
     /// Decrement descriptor reference count, returning the new count.
     ///
     /// When this reaches `0`, the caller must release `flock(2)` locks for
-    /// `self.id` outside `ACTIVE_PROCS`.
+    /// `self.id` outside the kernel's descriptor-table lock.
     pub fn dec_fd_ref(&self) -> u32 {
         self.fd_refs.fetch_sub(1, Ordering::AcqRel) - 1
     }
@@ -316,7 +316,7 @@ impl<F> FdTable<F> {
     /// Insert or replace `fd` directly (`dup2` / `dup3` / stdio seeding).
     ///
     /// Returns the displaced `FdEntry` (if any) so the caller can drop it
-    /// outside `ACTIVE_PROCS`.
+    /// outside the kernel's descriptor-table lock.
     pub fn insert_at(&mut self, fd: i32, file: F, cloexec: bool) -> Result<Option<FdEntry<F>>, VfsError> {
         let Ok(idx) = usize::try_from(fd) else {
             return Err(VfsError::BadF);

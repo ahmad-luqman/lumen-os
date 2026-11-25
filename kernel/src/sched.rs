@@ -198,9 +198,11 @@ impl SavedRsp {
 /// Per-user-thread hardware and VM state carried across context switches,
 /// and the thread's Linux identity.
 ///
-/// Accessed only on the thread's home CPU with interrupts off (during
-/// `schedule`, `attach`/`detach`, `arch_prctl`, or a Linux process's
-/// registration and takedown), or exclusively in `Drop`.
+/// Accessed only by its own thread on its home CPU with interrupts off
+/// (`schedule`'s switch to and from it, `detach_user_space`, a
+/// `UserSpaceGuard`, `arch_prctl`, and `current_user_thread` and
+/// `set_current_user_thread`, which a Linux process's registration and
+/// takedown call), or exclusively in `Drop`.
 struct UserThreadState {
     address_space: Arc<AddressSpace>,
     fpu: UnsafeCell<arch::fpu::UserFpuState>,
@@ -209,7 +211,8 @@ struct UserThreadState {
     user_exit_rsp: AtomicU64,
     pending_debug_trap: AtomicBool,
     /// The Linux thread it runs ([`set_current_user_thread`]): `None` until
-    /// its process is registered, after it is taken down, and for a ktest's
+    /// its process is registered (B1 sets it then; C1's `spawn_user_on` will
+    /// at spawn), after it is taken down, and for a ktest's
     /// [`UserSpaceGuard`]. Read lock-free by its own thread
     /// ([`current_user_thread`]).
     linux: Option<Arc<UserThread>>,
@@ -854,16 +857,18 @@ pub fn current_user_thread() -> Option<Arc<UserThread>> {
     }
     // SAFETY: `t` is the running thread on this CPU and interrupts are off, so
     // `schedule()` cannot run or change `user`; only this thread writes
-    // `linux` (`set_current_user_thread`), and it is here.
+    // `linux` (`set_current_user_thread`) or takes the state
+    // (`detach_user_space`), and it is here.
     unsafe { (*t).user.as_ref().and_then(|u| u.linux.clone()) }
 }
 
 /// Make `linux` the current user thread's Linux thread (`None` to detach
 /// it), returning the one it replaces, which the caller drops with
-/// interrupts on. Only the thread itself sets it, with interrupts off.
+/// interrupts on. Only the thread itself sets it, with interrupts off; only
+/// `linux::process`'s registration and takedown call it.
 ///
 /// Panics if the current thread has no user state (a kernel thread).
-pub fn set_current_user_thread(linux: Option<Arc<UserThread>>) -> Option<Arc<UserThread>> {
+pub(crate) fn set_current_user_thread(linux: Option<Arc<UserThread>>) -> Option<Arc<UserThread>> {
     let _irq = arch::irq::push_off();
     let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
     assert!(!t.is_null(), "set_current_user_thread before sched::init");
@@ -904,9 +909,14 @@ pub fn set_current_fs_base(addr: u64) {
 
 /// Detach the current thread's [`UserThreadState`], switching `CR3` back to
 /// `kernel_root()` and clearing `TSS.rsp0`, `PerCpu`, and `IA32_FS_BASE`.
+/// A Linux process's thread is detached by its takedown
+/// (`linux::process::take_current`), which first clears `linux`: a debug
+/// assertion checks it is gone, so no Linux identity is dropped here
+/// unnoticed.
 ///
-/// Returns the detached [`AddressSpace`] (if any) with interrupts restored so
-/// the caller can safely call [`AddressSpace::teardown`] with interrupts ON.
+/// Returns the detached [`AddressSpace`] (if any) with interrupts restored,
+/// so the caller can tear it down (or give up its process user) with
+/// interrupts on.
 pub fn detach_user_space() -> Option<Arc<AddressSpace>> {
     let detached = {
         let _irq = arch::irq::push_off();
@@ -917,6 +927,10 @@ pub fn detach_user_space() -> Option<Arc<AddressSpace>> {
         }
         // SAFETY: `t` is the running thread on `cpu` with interrupts off.
         let prev = unsafe { (*(*t).user.slot()).take() };
+        debug_assert!(
+            prev.as_ref().is_none_or(|u| u.linux.is_none()),
+            "detach_user_space on a Linux thread its process's takedown hasn't detached"
+        );
         if prev.is_some() {
             let kroot = paging::kernel_root();
             if arch::paging::active_root() != kroot {

@@ -67,10 +67,11 @@
 //!   reaper's children list and in the exiting process's old children list,
 //!   which its [`ExitOutcome`] keeps for the actions (room means the list
 //!   holds their words: two for a zombie, four for one released, one for a
-//!   hangup; without a reaper, after the children themselves). A failed reservation
-//!   is [`ExitError::NoMem`] with the tree unchanged. It also frees the
-//!   nodes of the zombies that leave, and the index entries of any tids
-//!   the exiting process still has.
+//!   hangup; without a reaper, after the children themselves). A failed
+//!   reservation is [`ExitError::NoMem`] with the tree unchanged, the
+//!   exiting process's tids included. It also frees the nodes of the
+//!   zombies that leave, and the index entries of any tids the exiting
+//!   process still has.
 //! - **Infallible allocation (a known gap):** stable `BTreeMap`/`BTreeSet`
 //!   have no fallible insert. A new process takes three B-tree inserts (its
 //!   node and its two index entries; [`ProcTree::spawn_init`],

@@ -111,3 +111,27 @@ pub(super) fn sys_getpgid(_pid: i32) -> u64 {
 pub(super) fn sys_getsid(_pid: i32) -> u64 {
     not_implemented(general::__NR_getsid)
 }
+
+crate::ktest!(
+    fn identity_syscalls_name_the_process_and_thread() {
+        // Through `dispatch`: `set_tid_address` stores its pointer and
+        // returns the tid; the leader's tid and the process's pid and group
+        // are the pid; a root's parent is 0.
+        use crate::kassert_eq;
+        use crate::linux::process::in_test_process;
+        in_test_process(|pid| {
+            let call = |nr: u32, rdi: u64| {
+                let mut frame = SyscallFrame { rax: u64::from(nr), rdi, ..SyscallFrame::default() };
+                let _ = super::dispatch(&mut frame);
+                frame.rax
+            };
+            kassert_eq!(call(general::__NR_set_tid_address, 0x5000), u64::from(pid));
+            kassert_eq!(current_thread().clear_child_tid(), 0x5000);
+            kassert_eq!(call(general::__NR_gettid, 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getpid, 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getppid, 0), 0);
+            kassert_eq!(call(general::__NR_getpgrp, 0), u64::from(pid));
+            Ok(())
+        })?
+    }
+);

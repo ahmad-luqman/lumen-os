@@ -7,12 +7,12 @@
 use super::at::UserPtr;
 use super::{copy_pod_from_user, copy_pod_to_user, neg_errno, not_implemented};
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
-use crate::linux::process::{KernelSigaction, with_current_signals};
+use crate::linux::process::{
+    KernelSigaction, current_action, current_blocked, set_current_action, set_current_blocked,
+};
 use crate::linux::{errno, general};
 use crate::user::{copy_from_user, copy_to_user};
-
-/// Mask of unblockable signals (`SIGKILL` = 9, `SIGSTOP` = 19, 1-indexed).
-const UNBLOCKABLE_SIGS: u64 = (1u64 << (general::SIGKILL - 1)) | (1u64 << (general::SIGSTOP - 1));
+use lumen_signal::{SigSet, Signal};
 
 pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
     if sigsetsize != 8 || !(1..=64).contains(&sig) {
@@ -31,8 +31,8 @@ pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64)
         None
     };
 
-    let idx = (sig - 1) as usize;
-    let prev = with_current_signals(|actions, _| actions[idx]);
+    let signal = Signal::new(sig as u32).expect("checked to be 1..=64");
+    let prev = current_action(signal);
     if oldact != 0 {
         // Write `oldact` BEFORE mutating the table so a faulting `oldact` leaves state intact.
         // SAFETY: `KernelSigaction` has zero padding bytes.
@@ -40,9 +40,12 @@ pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64)
             return neg_errno(e.to_errno());
         }
     }
-    if let Some(mut a) = new_action {
-        a.mask &= !UNBLOCKABLE_SIGS;
-        with_current_signals(|actions, _| actions[idx] = a);
+    // `set_action` strips `SIGKILL` and `SIGSTOP` from the mask; their own
+    // dispositions were refused above.
+    if let Some(a) = new_action
+        && set_current_action(signal, a).is_none()
+    {
+        return neg_errno(errno::EINVAL);
     }
     0
 }
@@ -67,21 +70,18 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u6
         None
     };
 
-    let prev = with_current_signals(|_, me| me.blocked);
+    let prev = current_blocked();
     if oldset != 0
-        && let Err(e) = copy_to_user(oldset, &prev.to_le_bytes())
+        && let Err(e) = copy_to_user(oldset, &prev.set().0.to_le_bytes())
     {
         return neg_errno(e.to_errno());
     }
     if let Some(mask) = new_mask {
-        let updated = if how == u64::from(general::SIG_BLOCK) {
-            prev | mask
-        } else if how == u64::from(general::SIG_UNBLOCK) {
-            prev & !mask
-        } else {
-            mask
-        };
-        with_current_signals(|_, me| me.blocked = updated & !UNBLOCKABLE_SIGS);
+        // `how` was checked above; `Blocked` never blocks KILL or STOP.
+        match prev.apply(how as u32, SigSet(mask)) {
+            Ok(updated) => set_current_blocked(updated),
+            Err(_) => return neg_errno(errno::EINVAL),
+        }
     }
     0
 }
@@ -152,3 +152,93 @@ pub(super) fn sys_restart_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
     frame.rax = not_implemented(general::__NR_restart_syscall);
     SyscallReturn::Sysret
 }
+
+crate::ktest!(
+    fn sigaction_and_sigprocmask_round_trip() {
+        // Through `dispatch`: an action set and read back (its mask without
+        // SIGKILL), a faulting `oldact` leaving it unchanged, the three
+        // `how`s on the calling thread's mask (never KILL or STOP); a mask
+        // is the thread's (keyed by tid), an action the process's.
+        use crate::linux::process::{self, KTEST_USER_LEN, KTEST_USER_VA};
+        use crate::{kassert, kassert_eq};
+        use alloc::sync::Arc;
+        use lumen_signal::Blocked;
+        process::in_test_process(|_| -> Result<(), &'static str> {
+            let call = |nr: u32, rdi: u64, rsi: u64, rdx: u64, r10: u64| {
+                let mut frame = SyscallFrame { rax: u64::from(nr), rdi, rsi, rdx, r10, ..SyscallFrame::default() };
+                let _ = super::dispatch(&mut frame);
+                frame.rax
+            };
+            let (act_at, old_at, set_at, oldset_at) =
+                (KTEST_USER_VA, KTEST_USER_VA + 64, KTEST_USER_VA + 128, KTEST_USER_VA + 136);
+            let unmapped = KTEST_USER_VA + KTEST_USER_LEN;
+            let put_act = |a: &KernelSigaction| {
+                // SAFETY: `KernelSigaction` has zero padding bytes.
+                unsafe { copy_pod_to_user(act_at, a) }.map_err(|_| "copy the action in")
+            };
+            let put_set = |s: SigSet| copy_to_user(set_at, &s.0.to_le_bytes()).map_err(|_| "copy the set in");
+            let oldset = || {
+                let mut raw = [0u8; 8];
+                copy_from_user(&mut raw, oldset_at).map(|()| u64::from_le_bytes(raw)).map_err(|_| "read oldset")
+            };
+            let usr1 = u64::from(general::SIGUSR1);
+            let (sigaction, sigprocmask) = (general::__NR_rt_sigaction, general::__NR_rt_sigprocmask);
+
+            let act = KernelSigaction {
+                handler: 0x1000,
+                flags: u64::from(general::SA_RESTORER),
+                restorer: 0x2000,
+                mask: SigSet::of(&[Signal::USR2, Signal::KILL]).0,
+            };
+            put_act(&act)?;
+            kassert_eq!(call(sigaction, usr1, act_at, 0, 8), 0);
+            kassert_eq!(call(sigaction, usr1, 0, old_at, 8), 0);
+            // SAFETY: `KernelSigaction` is 4 `u64`s; all bit patterns are valid.
+            let got = unsafe { copy_pod_from_user::<KernelSigaction>(old_at) }.map_err(|_| "read oldact")?;
+            kassert_eq!(got, KernelSigaction { mask: Signal::USR2.bit(), ..act });
+            // A faulting `oldact` with a new action: EFAULT, nothing changed.
+            put_act(&KernelSigaction { handler: 0x3000, ..act })?;
+            kassert_eq!(call(sigaction, usr1, act_at, unmapped, 8), neg_errno(errno::EFAULT));
+            kassert_eq!(current_action(Signal::USR1).handler, 0x1000);
+            // SIGKILL's disposition never changes.
+            kassert_eq!(call(sigaction, u64::from(general::SIGKILL), act_at, 0, 8), neg_errno(errno::EINVAL));
+            kassert_eq!(current_action(Signal::KILL), KernelSigaction::default());
+
+            let block = u64::from(general::SIG_BLOCK);
+            put_set(SigSet::of(&[Signal::USR1, Signal::KILL, Signal::STOP]))?;
+            kassert_eq!(call(sigprocmask, block, set_at, oldset_at, 8), 0);
+            kassert_eq!(oldset()?, 0);
+            kassert_eq!(current_blocked().set(), SigSet::of(&[Signal::USR1]));
+            put_set(SigSet::of(&[Signal::USR2]))?;
+            kassert_eq!(call(sigprocmask, block, set_at, oldset_at, 8), 0);
+            kassert_eq!(oldset()?, Signal::USR1.bit());
+            put_set(SigSet::of(&[Signal::USR1]))?;
+            kassert_eq!(call(sigprocmask, u64::from(general::SIG_UNBLOCK), set_at, 0, 8), 0);
+            kassert_eq!(current_blocked().set(), SigSet::of(&[Signal::USR2]));
+            put_set(SigSet::of(&[Signal::TERM, Signal::STOP]))?;
+            kassert_eq!(call(sigprocmask, u64::from(general::SIG_SETMASK), set_at, 0, 8), 0);
+            kassert_eq!(current_blocked().set(), SigSet::of(&[Signal::TERM]));
+            kassert_eq!(call(sigprocmask, 7, set_at, 0, 8), neg_errno(errno::EINVAL));
+            kassert_eq!(call(sigprocmask, 0, 0, oldset_at, 8), 0);
+            kassert_eq!(oldset()?, Signal::TERM.bit());
+
+            // Per thread, per process: a second thread of this process keeps
+            // its own (empty) mask while this one's changes, and sees this
+            // one's action.
+            let me = process::current_process();
+            let extra = process::add_ktest_thread(&me)?;
+            let checked = (|| {
+                kassert_eq!(process::ktest_thread_blocked(&extra), Blocked::EMPTY);
+                put_set(SigSet::of(&[Signal::HUP]))?;
+                kassert_eq!(call(sigprocmask, block, set_at, 0, 8), 0);
+                kassert_eq!(current_blocked().set(), SigSet::of(&[Signal::TERM, Signal::HUP]));
+                kassert_eq!(process::ktest_thread_blocked(&extra), Blocked::EMPTY);
+                kassert!(Arc::ptr_eq(extra.process(), &me));
+                kassert_eq!(process::ktest_process_action(extra.process(), Signal::USR1).handler, 0x1000);
+                Ok(())
+            })();
+            process::remove_ktest_thread(&extra);
+            checked
+        })?
+    }
+);

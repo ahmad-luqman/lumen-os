@@ -8,4 +8,10 @@ tests = ["cargo:lumen-proc"]
 [[feature]]
 name = "Processes and threads: Process/UserThread split, PROCS lookup by pid and tid, pid 1, tids from the pid space"
 milestone = "M8"
-tests = ["ktest:lumen_kernel::linux::process::procs_lookup_and_lifetime", "cargo:lumen-proc"]
+tests = [
+    "ktest:lumen_kernel::linux::process::procs_lookup_and_lifetime",
+    "ktest:lumen_kernel::linux::process::procs_leave_no_heap_behind",
+    "ktest:lumen_kernel::linux::syscall::task::identity_syscalls_name_the_process_and_thread",
+    "ktest:lumen_kernel::linux::syscall::signal::sigaction_and_sigprocmask_round_trip",
+    "cargo:lumen-proc",
+]

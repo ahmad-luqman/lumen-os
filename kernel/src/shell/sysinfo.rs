@@ -21,6 +21,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use lumen_mm::FRAME_SIZE;
+use lumen_proc::ProcState;
 use lumen_shell::Key;
 use lumen_shell::pipe::{self, Align, Column, Kind, Value};
 use lumen_time::{NS_PER_SEC, per_second, percent};
@@ -753,8 +754,9 @@ pub fn ps(ctx: &mut Ctx<'_>, args: &[String]) {
 
 /// `ps`' table: one row per process in `linux::process`'s table. `tids`
 /// lists its threads' tids, the leader's (the pid) first; `state` is its
-/// threads' scheduler states in that order, or the process's own when it
-/// is stopped or a zombie (`-` for pid 1, which has no threads); `name` its
+/// threads' scheduler states in that order (`gone` for one whose scheduler
+/// thread ended after the rows were read), or the process's own when it is
+/// stopped or a zombie (`-` for pid 1, which has no threads); `name` its
 /// leader thread's.
 pub(crate) fn ps_table() -> pipe::Table {
     const COLUMNS: [Column; 5] = [
@@ -764,27 +766,31 @@ pub(crate) fn ps_table() -> pipe::Table {
         Column::new("state", Kind::Text, Align::Left, 8),
         Column::new("name", Kind::Text, Align::Left, 0),
     ];
-    use lumen_proc::ProcState;
+    // The rows first: a thread listed then is in `threads` unless it ended
+    // since.
+    let rows = crate::linux::process::ps_rows();
     let threads = sched::threads();
     let of = |id: u64| threads.iter().find(|t| t.id == id);
     let mut t = pipe::Table::new(&COLUMNS);
-    for row in crate::linux::process::ps_rows() {
-        let joined = |cell: &dyn Fn(u32, u64) -> String| {
-            let cells: Vec<String> = row.threads.iter().map(|&(tid, k)| cell(tid, k)).collect();
-            if cells.is_empty() { DASH } else { Value::Text(cells.join(",")) }
-        };
-        let tids = joined(&|tid, _| tid.to_string());
+    for row in rows {
+        let tids = joined_or_dash(row.threads.iter().map(|&(tid, _)| tid.to_string()));
         let state = match row.state {
             ProcState::Zombie(_) => text("zombie"),
             ProcState::Stopped { .. } => text("stopped"),
             ProcState::Running | ProcState::Continued { .. } => {
-                joined(&|_, k| String::from(of(k).map_or("gone", |t| t.state.name())))
+                joined_or_dash(row.threads.iter().map(|&(_, k)| String::from(of(k).map_or("gone", |t| t.state.name()))))
             }
         };
         let name = row.threads.first().and_then(|&(_, k)| of(k)).map_or(DASH, |t| text(t.name.as_str()));
         t.push(vec![int(row.pid), int(row.ppid), tids, state, name]);
     }
     t
+}
+
+/// `cells` joined by commas as one text cell, or `-` if there are none.
+fn joined_or_dash(cells: impl Iterator<Item = String>) -> Value {
+    let cells: Vec<String> = cells.collect();
+    if cells.is_empty() { DASH } else { Value::Text(cells.join(",")) }
 }
 
 /// `dmesg`: the newest whole log lines kept (the last `klog::RING_BYTES`

@@ -164,6 +164,28 @@ fn exit_is_enomem_and_changes_nothing_when_the_reapers_list_cant_grow() {
 }
 
 #[test]
+fn a_refused_exit_keeps_the_threads_registered() {
+    let mut t = tree();
+    // As above (init's list full at its capacity, a with two children), and
+    // a with three threads.
+    let a = t.fork(INIT, slot()).unwrap();
+    for _ in 0..3 {
+        t.fork(INIT, slot()).unwrap();
+    }
+    t.fork(a, slot()).unwrap();
+    t.fork(a, slot()).unwrap();
+    let tids: Vec<u32> = (0..3).map(|_| t.add_thread(a).unwrap()).collect();
+    let before = format!("{t:?}");
+    let got = refused(|| t.exit(a, ExitStatus::exited(0), Some(INIT), |_| false).map(drop));
+    assert_eq!(got, Err(ExitError::NoMem));
+    assert_eq!(format!("{t:?}"), before);
+    assert_eq!(t.threads(a), tids.as_slice());
+    assert!(tids.iter().all(|&tid| t.is_busy(tid)));
+    exit(&mut t, a, INIT);
+    assert!(tids.iter().all(|&tid| !t.is_busy(tid)));
+}
+
+#[test]
 fn exit_is_enomem_and_changes_nothing_when_the_actions_cant_fit() {
     let mut t = tree();
     let r = t.fork(INIT, slot()).unwrap();
