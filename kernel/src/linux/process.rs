@@ -838,9 +838,9 @@ pub fn current_thread() -> Arc<UserThread> {
 }
 
 /// Clear the running thread's pending flag under its own process's signal
-/// lock, where senders set it. C5 checks deliverable signals here first.
-pub fn settle_current_sigpending() {
-    let thread = current_thread();
+/// lock, where senders set it. `thread` is the caller's current Linux thread.
+/// C5 checks deliverable signals here first.
+pub fn settle_current_sigpending(thread: &UserThread) {
     let _signal = thread.process().signal.lock();
     sched::clear_current_sigpending();
 }
@@ -1112,8 +1112,8 @@ pub fn locks_released() {
 /// attempt and this wait isn't missed): `Woken`; or until the thread has a
 /// signal to look at: `Interrupted` (B2: the caller returns
 /// `-ERESTARTSYS`, as Linux's `locks_lock_inode_wait`). A caller refuses a
-/// wait that would never end beforehand (`F_SETLKW`'s `EDEADLK`), if it
-/// can tell.
+/// wait that only a signal would end beforehand (`F_SETLKW`'s `EDEADLK`),
+/// if it can tell.
 pub fn wait_for_lock_release(seen: u64) -> sched::Wake {
     #[cfg(feature = "ktest")]
     LOCK_WAITING.fetch_add(1, Ordering::SeqCst);

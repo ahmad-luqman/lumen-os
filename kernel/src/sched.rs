@@ -209,8 +209,9 @@ impl SavedRsp {
 /// (`detach_user_space`, a `UserSpaceGuard`, `arch_prctl`'s
 /// `set_current_fs_base`, the `#PF` path's `current_address_space`, the
 /// restart-block accessors (`set_restart_block`, `take_restart_block`,
-/// `restart_block`), and `current_user_thread`/`set_current_user_thread`,
-/// which a Linux process's registration, syscalls and takedown call); or exclusively in
+/// `restart_block`, including the syscall-exit hook's `resolve_restart`
+/// reset), and `current_user_thread`/`set_current_user_thread`, which a Linux
+/// process's registration, syscalls and takedown call); or exclusively in
 /// `Drop`.
 struct UserThreadState {
     address_space: Arc<AddressSpace>,
@@ -226,8 +227,9 @@ struct UserThreadState {
     /// ([`current_user_thread`]).
     linux: Option<Arc<UserThread>>,
     /// What `restart_syscall` resumes (B2): set by a handler that returns
-    /// `-ERESTART_RESTARTBLOCK`, taken by `restart_syscall`. Read and
-    /// written only by its own thread with interrupts off
+    /// `-ERESTART_RESTARTBLOCK`, taken by `restart_syscall`, and reset by
+    /// the syscall-exit hook's `resolve_restart`. Read and written only by
+    /// its own thread with interrupts off
     /// ([`set_restart_block`], [`take_restart_block`]).
     restart: UnsafeCell<Option<RestartBlock>>,
 }
@@ -334,9 +336,10 @@ pub struct Thread {
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `kick`'s: the ktests; C5's senders next
     me: Weak<Thread>,
     /// Linux's `TIF_SIGPENDING`, "look at the pending signals": set by a
-    /// sender before its [`kick`], cleared only by the thread itself in the
-    /// syscall-exit hook when nothing deliverable is left
-    /// (`linux::signal::settle_pending`). An interruptible wait reads it.
+    /// sender before its [`kick`]. The ktests aside, only the thread itself
+    /// clears it, in the syscall-exit hook when nothing deliverable is left
+    /// (`linux::signal::settle_pending`); production callers hold the signal
+    /// lock when the thread has a process. An interruptible wait reads it.
     sigpending: AtomicBool,
     /// Linux's `__fatal_signal_pending`: set before the [`kick`] by whatever
     /// ends the thread (a group kill, `de_thread`), never cleared. A
@@ -1069,14 +1072,15 @@ pub(crate) fn set_current_user_thread(linux: Option<Arc<UserThread>>) -> Option<
 }
 
 /// Make `block` the current user thread's restart block (`None` to clear
-/// it), returning the one it replaces: what `restart_syscall` resumes after
-/// the syscall-exit hook turned an `-ERESTART_RESTARTBLOCK` into a restart.
-/// Only the thread itself calls it, with interrupts off here.
+/// it): what `restart_syscall` resumes after the syscall-exit hook turns
+/// `-ERESTART_RESTARTBLOCK` into a restart. Handlers go through
+/// `linux::signal::interrupted_with`. Only the thread itself calls it,
+/// with interrupts off here.
 ///
 /// Panics if the current thread has no user state (a kernel thread).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's and B3's handlers next
-pub fn set_restart_block(block: Option<RestartBlock>) -> Option<RestartBlock> {
-    with_restart_block(|slot| core::mem::replace(slot, block)).expect("set_restart_block on a kernel thread")
+pub(crate) fn set_restart_block(block: Option<RestartBlock>) {
+    with_restart_block(|slot| *slot = block).expect("set_restart_block on a kernel thread");
 }
 
 /// Access the current user thread's restart block with interrupts off.
@@ -1096,14 +1100,15 @@ pub fn take_restart_block() -> Option<RestartBlock> {
     with_restart_block(Option::take).flatten()
 }
 
-/// The current user thread's restart block, left in place (ktests).
-#[cfg(feature = "ktest")]
-pub fn restart_block() -> Option<RestartBlock> {
+/// The current user thread's restart block, left in place: the handler's
+/// no-overwrite assertion and the ktests.
+pub(crate) fn restart_block() -> Option<RestartBlock> {
     with_restart_block(|slot| *slot).flatten()
 }
 
-/// Clear only the running thread's flag when nothing deliverable remains.
-/// The caller holds its process's signal lock when it has one.
+/// Clear the running thread's flag when nothing deliverable remains (the
+/// ktests aside). Production callers hold the signal lock when the thread
+/// has a process.
 pub(crate) fn clear_current_sigpending() {
     let _ = with_current(|t| t.sigpending.store(false, Ordering::SeqCst));
 }
@@ -2153,8 +2158,8 @@ fn wake(thread: Arc<Thread>) -> bool {
 /// rechecks its condition and pending flags. Never blocks; callable from
 /// any CPU while holding a signal or wait-queue lock, but not a run-queue
 /// lock or a lock nested inside it (thread stacks, heap, page tables and
-/// frame allocator).
-/// It takes the target CPU's run-queue lock; `smp::wake` takes no lock.
+/// frame allocator). It takes the target CPU's run-queue lock;
+/// `smp::wake` takes no lock.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C5's senders next
 pub fn kick(thread: &Thread) {
     // Pairs with the fence in `WaitQueue::block` between `Blocked` and its
@@ -4150,6 +4155,9 @@ fn kick_into_a_stalled_block(killable: bool, at: StallAt, deadline: bool) -> Res
         let answer = s.wait_answer(1);
         join_bounded(waiter)?;
         if BLOCK_DELAY.timed_out() {
+            crate::ktest::diag(format_args!(
+                "expired stall: at={at:?}, answer={answer:?}, before_signal={before_signal:?}, after_kick={after_kick:?}"
+            ));
             continue;
         }
         crate::kassert!(stalled);
@@ -4162,23 +4170,30 @@ fn kick_into_a_stalled_block(killable: bool, at: StallAt, deadline: bool) -> Res
     Err("no clean stalled round in five attempts")
 }
 
+/// The same stalled rounds for interruptible and killable waits.
+#[cfg(feature = "ktest")]
+fn stalled_rounds(killable: bool) -> crate::ktest::TestResult {
+    for at in [StallAt::BeforeBlocked, StallAt::AfterBlocked, StallAt::AfterRead] {
+        for _ in 0..3 {
+            let answer = kick_into_a_stalled_block(killable, at, false)?;
+            if answer != Some(wake_code(Wake::Interrupted)) {
+                crate::ktest::diag(format_args!("stalled {at:?}"));
+            }
+            crate::kassert_eq!(answer, Some(wake_code(Wake::Interrupted)));
+        }
+    }
+    Ok(())
+}
+
 crate::ktest!(
     fn kick_racing_a_block_is_never_lost() {
         // BeforeBlocked proves the waiter's pending read; AfterBlocked
         // permits either side to end the wait but checks the kick's state
         // change; AfterRead requires kick to queue the waiter. Then 300
         // unstalled rounds vary when the kick lands around the block.
-        use crate::{kassert, kassert_eq};
+        use crate::kassert;
         const ROUNDS: u64 = 300;
-        for at in [StallAt::BeforeBlocked, StallAt::AfterBlocked, StallAt::AfterRead] {
-            for _ in 0..3 {
-                let answer = kick_into_a_stalled_block(false, at, false)?;
-                if answer != Some(wake_code(Wake::Interrupted)) {
-                    crate::ktest::diag(format_args!("stalled {at:?}"));
-                }
-                kassert_eq!(answer, Some(wake_code(Wake::Interrupted)));
-            }
-        }
+        stalled_rounds(false)?;
         let s = Arc::new(Waiting::default());
         let w = s.clone();
         let waiter = spawn_test(last_cpu()?, "kicked", move || {
@@ -4227,16 +4242,7 @@ crate::ktest!(
         // sets sigpending), as de_thread does without group exit. AfterRead
         // requires kick's killable leg; each round uses a fresh thread
         // because fatal_pending is never cleared.
-        use crate::kassert_eq;
-        for at in [StallAt::BeforeBlocked, StallAt::AfterBlocked, StallAt::AfterRead] {
-            for _ in 0..3 {
-                let answer = kick_into_a_stalled_block(true, at, false)?;
-                if answer != Some(wake_code(Wake::Interrupted)) {
-                    crate::ktest::diag(format_args!("stalled {at:?}"));
-                }
-                kassert_eq!(answer, Some(wake_code(Wake::Interrupted)));
-            }
-        }
+        stalled_rounds(true)?;
         Ok(())
     }
 );

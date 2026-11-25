@@ -909,7 +909,7 @@ crate::ktest!(
             // -ERESTART_RESTARTBLOCK with a block: 219, the block kept.
             let deadline = crate::time::now_ns() + 3_000_000_000;
             let block = RestartBlock { resume, deadline: Some(deadline), args: [5, 6, 7, 8] };
-            let mut frame = frame_of(interrupted_with(block));
+            let mut frame = frame_of(finish(Err(interrupted_with(block))));
             kassert_eq!(frame.rax, restart_result(RestartCode::RestartBlock));
             raise_for_test(&me, Signal::USR1);
             exit_to_user(&mut frame, SyscallExit::new(NANOSLEEP));
@@ -940,7 +940,7 @@ crate::ktest!(
             // and a restart block is reset rather than left for a later call.
             for code in [RestartCode::NoIntr, RestartCode::RestartBlock] {
                 let mut frame = frame_of(if code == RestartCode::RestartBlock {
-                    interrupted_with(block)
+                    finish(Err(interrupted_with(block)))
                 } else {
                     restart_result(code)
                 });
@@ -951,7 +951,7 @@ crate::ktest!(
             }
             // No restart context must also discard a RestartBlock result's
             // stored block, without interpreting user registers as a syscall.
-            let mut frame = frame_of(interrupted_with(block));
+            let mut frame = frame_of(finish(Err(interrupted_with(block))));
             exit_to_user(&mut frame, None);
             kassert_eq!((frame.rax, frame.rip), (restart_result(RestartCode::RestartBlock), RIP));
             kassert!(sched::restart_block().is_none());

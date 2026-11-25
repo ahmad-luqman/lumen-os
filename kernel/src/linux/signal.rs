@@ -65,8 +65,10 @@ pub const ERESTARTSYS: u32 = RestartCode::Sys as u32;
 /// on and no lock held. `None` is passed on later passes of the loop and
 /// after `rt_sigreturn` (C5). Non-IST interrupt returns use
 /// `exit_to_user_from_interrupt`; IST vectors are excluded. Resolves a
-/// restart code in `frame.rax` (only with a syscall context: a user `rax` that looks like one is left alone), then, if the
-/// thread has `sigpending`, clears it (nothing is deliverable before C5).
+/// restart code in `frame.rax` only with a syscall context. Without one,
+/// registers stay unchanged, but a restart-block result drops the stored
+/// block. Then, if the thread has `sigpending`, clears it (nothing is
+/// deliverable before C5).
 /// Callers loop while `sigpending` is set again by the time interrupts are
 /// off, passing `None` after the first pass, so the restart runs once.
 pub fn exit_to_user(frame: &mut SyscallFrame, syscall: Option<SyscallExit>) {
@@ -92,29 +94,34 @@ pub fn exit_to_user_from_interrupt() {
 }
 
 /// Apply a restart decision to the frame: a restart sets `rax` and moves
-/// `rip` back over the 2-byte `syscall` instruction (a `rip` below 2,
-/// which no `syscall` returns to, gets `-EINTR`), `ReturnEintr` sets
-/// `-EINTR`.
+/// `rip` back over the 2-byte `syscall` instruction. A `rip` below 2 means
+/// a corrupt frame: logged and answered with `-EINTR`; `ReturnEintr` also
+/// sets `-EINTR`. A restart-block result drops the thread's stored block
+/// unless it becomes syscall 219 (Linux's `do_no_restart_syscall` reset).
 fn resolve_restart(frame: &mut SyscallFrame, decision: RestartDecision) {
-    if RestartCode::from_kernel_result(frame.rax as i64) == Some(RestartCode::RestartBlock)
-        && !(decision == RestartDecision::Restart { rax: RESTART_SYSCALL } && frame.rip >= 2)
-    {
-        let _ = sched::take_restart_block();
-    }
+    let was_restart_block = RestartCode::from_kernel_result(frame.rax as i64) == Some(RestartCode::RestartBlock);
     let eintr = (-(errno::EINTR as i64)) as u64;
-    match decision {
-        RestartDecision::Unchanged => {}
-        RestartDecision::ReturnEintr => frame.rax = eintr,
+    let keep_block = match decision {
+        RestartDecision::Unchanged => false,
+        RestartDecision::ReturnEintr => {
+            frame.rax = eintr;
+            false
+        }
         RestartDecision::Restart { rax } => match frame.rip.checked_sub(2) {
             Some(rip) => {
                 frame.rax = rax;
                 frame.rip = rip;
+                rax == RESTART_SYSCALL
             }
             None => {
                 log::error!(target: "signal", "corrupt syscall restart frame: rip {:#x} is below 2", frame.rip);
                 frame.rax = eintr;
+                false
             }
         },
+    };
+    if was_restart_block && !keep_block {
+        let _ = sched::take_restart_block();
     }
 }
 
@@ -127,16 +134,19 @@ fn settle_pending() {
         return;
     }
     match crate::linux::process::try_current_thread() {
-        Some(_) => crate::linux::process::settle_current_sigpending(),
+        Some(thread) => crate::linux::process::settle_current_sigpending(&thread),
         None => sched::clear_current_sigpending(),
     }
 }
 
-/// Store a handler's restart block and return `-ERESTART_RESTARTBLOCK`.
+/// Store a handler's restart block and return its positive errno:
+/// `return Err(interrupted_with(block))`, negated by `syscall::finish`.
+#[must_use]
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C4's and B3's handlers next
-pub fn interrupted_with(block: RestartBlock) -> u64 {
-    let _ = sched::set_restart_block(Some(block));
-    restart_result(RestartCode::RestartBlock)
+pub fn interrupted_with(block: RestartBlock) -> u32 {
+    debug_assert!(sched::restart_block().is_none(), "a handler replaced an unconsumed restart block");
+    sched::set_restart_block(Some(block));
+    RestartCode::RestartBlock as u32
 }
 
 /// `restart_syscall()` (219): take the thread's restart block and resume

@@ -23,6 +23,7 @@ use super::fd::vfs;
 use super::finish;
 use crate::linux::process::{self, FileRef, current_process};
 use crate::linux::{errno, general};
+use crate::sched::Wake;
 use crate::sync::SpinLock;
 use crate::user::{copy_from_user, copy_to_user};
 use lumen_vfs::locks::{MAX_DEADLOCK_CHAIN, fcntl_const};
@@ -150,9 +151,9 @@ fn lock_or_wait<H: Copy>(
             Step::Wait { holder, .. } => {
                 before_wait(holder, seen)?;
                 match process::wait_for_lock_release(seen) {
-                    crate::sched::Wake::Woken => {}
-                    crate::sched::Wake::Interrupted => return Err(crate::linux::signal::ERESTARTSYS),
-                    crate::sched::Wake::TimedOut => unreachable!("a lock wait has no deadline"),
+                    Wake::Woken => {}
+                    Wake::Interrupted => return Err(crate::linux::signal::ERESTARTSYS),
+                    Wake::TimedOut => unreachable!("a lock wait has no deadline"),
                 }
             }
         }
@@ -191,7 +192,7 @@ static WARNED_TRUNCATED: AtomicBool = AtomicBool::new(false);
 /// wait is decided (not before: an `EDEADLK` isn't a wait), the first time
 /// and whenever the holder changes; `EDEADLK` at debug too; and a warning,
 /// once a boot, when the cycle search was cut off (a longer cycle would
-/// hang every process in it, with no signal to end it).
+/// hang every process in it until a signal ends it).
 fn log_wait_decision(
     waiter: Waiter,
     file: &FileRef,

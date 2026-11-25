@@ -4411,7 +4411,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 
 | # | Syscall | M8 behaviour | Issue |
 |---|---|---|---|
-| 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block), as Linux's `poll` | B3 |
+| 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block, stored and returned through `Err(linux::signal::interrupted_with(block))`), as Linux's `poll` | B3 |
 | 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | M6's checks, now delivering: `sig` outside 1..=64 `-EINVAL`; unknown `sa_flags` bits are cleared before storing (and in `oldact`), as Linux's `do_sigaction` does; `SIG_IGN`, or `SIG_DFL` on a default-ignored signal, discards that signal's pending entries (`PendingSignals::disposition_changed`); `SA_RESTORER` is needed to deliver a handler (`frame::build`'s `MissingRestorer` forces `SIGSEGV`; musl always sets it); `SA_NOCLDWAIT` or `SIG_IGN` on `SIGCHLD` makes `ProcTree::exit` reap the children (`autoreap`) | C5 |
 | 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | `Blocked::apply` (a bad `how` `-EINVAL`); `sigsetsize != 8` `-EINVAL`; unblocking a pending signal sets `sigpending`, so it is delivered before the call returns | C5 |
 | 15 | `rt_sigreturn()` | section 6, "Signals"; returns the restored `rax`; a frame `restore` refuses forces `SIGSEGV` | C5 |
@@ -5362,7 +5362,9 @@ user access":
   `CLOCK_REALTIME` (converted to a monotonic deadline when the wait
   starts; a later clock change doesn't move it, a deviation). A signal:
   `-ERESTARTSYS` without a timeout, `-ERESTART_RESTARTBLOCK` with one (the
-  restart block holds the deadline), as Linux's `futex_wait`.
+  restart block holds the deadline), as Linux's `futex_wait`. The handler
+  stores that block and returns its errno through
+  `Err(linux::signal::interrupted_with(block))`; `syscall::finish` negates it.
 - **Keys** (`FutexKey`, `Ord + Copy` as lumen-futex asks):
   `Private { space, uaddr }` for any op with `FUTEX_PRIVATE_FLAG`, where
   `space` is the `AddressSpace`'s L4 root frame (unique while it lives);

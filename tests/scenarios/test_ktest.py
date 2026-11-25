@@ -84,6 +84,10 @@ def test_in_kernel_tests_pass(boot):
     for vector in ("0xef", "0xee", "0xed"):
         line = f"ERROR irq: interrupt on MSI vector {vector}, which no device has claimed"
         assert out.count(line) == 1, f"MSI vector {vector} not reported exactly once as an error"
+    # restart_with_no_handler_restarts_or_resumes rejects rip == 1 once
+    # for NoIntr and once for RestartBlock, logging both corrupt frames.
+    line = "ERROR signal: corrupt syscall restart frame: rip 0x1 is below 2"
+    assert out.count(line) == 2, "corrupt restart frames not reported exactly twice"
     # The last I/O APIC vector (no handler) is still a plain warning.
     assert out.count("WARN  irq: unexpected interrupt on vector 0x8f") == 1, "0x8f not a warning"
     # `an_unexpected_storm_is_reported_sparsely` raises 0x31 2048 times:

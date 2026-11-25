@@ -58,6 +58,9 @@ pub struct TrapFrame {
 // to undo `swapgs` before `iretq`). All other vectors route through
 // `lumen_isr_common`, which inspects saved `CS & 3` for conditional `swapgs`.
 // Both paths clear `RFLAGS.AC` on entry when `LUMEN_SMAP_ENABLED != 0`.
+// Keep IST_VECTORS exactly in step with the asm's IST routing list below.
+const _: () = assert!(matches!(IST_VECTORS, [(1, _), (2, _), (8, _), (18, _)]));
+
 global_asm!(
     r#"
     .section .text.lumen_isr, "ax"

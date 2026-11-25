@@ -153,7 +153,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Non-faulting user access (#373, B2): `user::read_u32_nofault` and `user::cmpxchg_u32` under a held spinlock answer `Fault` for an unmapped, a not-yet-faulted, a read-only (for a store) or a copy-on-write page, paging nothing in, and work on a mapped page; `user::fault_in_writable` makes a not-yet-faulted or copy-on-write page writable without storing (Dirty clear, the word unchanged, an incrementer on another CPU racing it ends exact); their fixup table `.lumen_fixup_nofault` is audited as read-only data in the rodata segment"
+name = "Non-faulting user access (#373, B2): `user::read_u32_nofault` and `user::cmpxchg_u32` under a held spinlock answer `Fault` for an unmapped, a not-yet-faulted, a read-only or copy-on-write page (for a store), paging nothing in, and work on a mapped page; `user::fault_in_writable` makes a not-yet-faulted or copy-on-write page writable without storing (Dirty clear, the word unchanged, an incrementer on another CPU racing it ends exact); their fixup table `.lumen_fixup_nofault` is audited as read-only data in the rodata segment"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::user::nofault_access_answers_fault_without_paging_in",

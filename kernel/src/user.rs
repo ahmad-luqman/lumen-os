@@ -531,10 +531,10 @@ pub fn fault_in_writable(addr: u64) -> Result<(), FaultIn> {
     match space.handle_page_fault(addr, 1 << 1) {
         crate::mm::user_vm::FaultResult::Resolved => Ok(()),
         crate::mm::user_vm::FaultResult::OutOfMemory => {
-            log::warn!(target: "mm", "out of memory resolving a writable user fault at cr2 {addr:#x}; returning ENOMEM");
+            log::warn!(target: "mm", "out of memory resolving a writable user fault at cr2 {addr:#x}; giving FaultIn::OutOfMemory");
             Err(FaultIn::OutOfMemory)
         }
-        _ => Err(FaultIn::Fault),
+        crate::mm::user_vm::FaultResult::Invalid | crate::mm::user_vm::FaultResult::BusError => Err(FaultIn::Fault),
     }
 }
 
@@ -588,25 +588,50 @@ const SYS_TEST_PREEMPT_COUNT: u64 = 0x1000_0004;
 
 #[cfg(feature = "ktest")]
 const SYS_TEST_RESTART_ONCE: u64 = 0x1000_0005;
+/// Observations from the restart test's real syscall and return path.
 #[cfg(feature = "ktest")]
-static RESTART_CALLS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "ktest")]
-static RESTART_FIRST_RIP: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "ktest")]
-static RESTART_SECOND_RIP: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "ktest")]
-static RESTART_CLEARED: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "ktest")]
-static RESTART_RETURN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+struct RestartProbe {
+    calls: AtomicU64,
+    first_rip: AtomicU64,
+    second_rip: AtomicU64,
+    cleared: AtomicBool,
+    return_rax: AtomicU64,
+    return_rip: AtomicU64,
+}
 
-/// Observe the first restart test's final frame, just before real sysretq.
-/// This checks the exact rewind without relying on what re-executed code does.
+#[cfg(feature = "ktest")]
+impl RestartProbe {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            first_rip: AtomicU64::new(0),
+            second_rip: AtomicU64::new(0),
+            cleared: AtomicBool::new(false),
+            return_rax: AtomicU64::new(0),
+            return_rip: AtomicU64::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        for value in [&self.calls, &self.first_rip, &self.second_rip, &self.return_rax, &self.return_rip] {
+            value.store(0, Ordering::SeqCst);
+        }
+        self.cleared.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "ktest")]
+static RESTART_PROBE: RestartProbe = RestartProbe::new();
+
+/// Observe the first `SYS_TEST_RESTART_ONCE` call's frame after the hook,
+/// just before `sysretq`. This checks the exact rewind without relying on
+/// what re-executed code does.
 #[cfg(feature = "ktest")]
 pub(crate) fn record_restart_return_for_test(nr: u64, frame: &SyscallFrame) {
-    if nr == SYS_TEST_RESTART_ONCE && RESTART_CALLS.load(Ordering::SeqCst) == 1 {
-        RESTART_RETURN[0].store(frame.rax, Ordering::SeqCst);
-        RESTART_RETURN[1].store(frame.rip, Ordering::SeqCst);
-        RESTART_CLEARED.store(!sched::current_sigpending(), Ordering::SeqCst);
+    if nr == SYS_TEST_RESTART_ONCE && RESTART_PROBE.calls.load(Ordering::SeqCst) == 1 {
+        RESTART_PROBE.return_rax.store(frame.rax, Ordering::SeqCst);
+        RESTART_PROBE.return_rip.store(frame.rip, Ordering::SeqCst);
+        RESTART_PROBE.cleared.store(!sched::current_sigpending(), Ordering::SeqCst);
     }
 }
 
@@ -700,13 +725,13 @@ pub(crate) fn dispatch_test_syscall(frame: &mut SyscallFrame) -> Option<SyscallR
     match frame.rax {
         #[cfg(feature = "ktest")]
         SYS_TEST_RESTART_ONCE => {
-            if RESTART_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
-                RESTART_FIRST_RIP.store(frame.rip, Ordering::SeqCst);
+            if RESTART_PROBE.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                RESTART_PROBE.first_rip.store(frame.rip, Ordering::SeqCst);
                 sched::with_current(sched::Thread::set_sigpending);
                 frame.rax = crate::linux::signal::restart_result(lumen_signal::restart::RestartCode::NoIntr);
             } else {
-                RESTART_SECOND_RIP.store(frame.rip, Ordering::SeqCst);
-                RESTART_CLEARED.fetch_and(!sched::current_sigpending(), Ordering::SeqCst);
+                RESTART_PROBE.second_rip.store(frame.rip, Ordering::SeqCst);
+                RESTART_PROBE.cleared.fetch_and(!sched::current_sigpending(), Ordering::SeqCst);
                 frame.rax = 0x1337;
             }
             Some(SyscallReturn::Sysret)
@@ -2350,13 +2375,7 @@ crate::ktest!(
 crate::ktest!(
     fn syscall_return_restarts_once_through_sysret() {
         use crate::{kassert, kassert_eq};
-        RESTART_CALLS.store(0, Ordering::SeqCst);
-        RESTART_FIRST_RIP.store(0, Ordering::SeqCst);
-        RESTART_SECOND_RIP.store(0, Ordering::SeqCst);
-        RESTART_CLEARED.store(false, Ordering::SeqCst);
-        for value in &RESTART_RETURN {
-            value.store(0, Ordering::SeqCst);
-        }
+        RESTART_PROBE.reset();
         let mut c = CodeBuf::new();
         c.mov_eax(SYS_TEST_RESTART_ONCE as u32);
         c.mov_edi(0);
@@ -2400,13 +2419,13 @@ crate::ktest!(
         let exit = slot.lock().take().map(|r| r.exit);
         kassert!(returned);
         kassert_eq!(
-            (RESTART_RETURN[0].load(Ordering::SeqCst), RESTART_RETURN[1].load(Ordering::SeqCst)),
+            (RESTART_PROBE.return_rax.load(Ordering::SeqCst), RESTART_PROBE.return_rip.load(Ordering::SeqCst)),
             (SYS_TEST_RESTART_ONCE, syscall_rip)
         );
-        kassert_eq!(RESTART_CALLS.load(Ordering::SeqCst), 2);
-        kassert_eq!(RESTART_FIRST_RIP.load(Ordering::SeqCst), syscall_rip + 2);
-        kassert_eq!(RESTART_SECOND_RIP.load(Ordering::SeqCst), syscall_rip + 2);
-        kassert!(RESTART_CLEARED.load(Ordering::SeqCst));
+        kassert_eq!(RESTART_PROBE.calls.load(Ordering::SeqCst), 2);
+        kassert_eq!(RESTART_PROBE.first_rip.load(Ordering::SeqCst), syscall_rip + 2);
+        kassert_eq!(RESTART_PROBE.second_rip.load(Ordering::SeqCst), syscall_rip + 2);
+        kassert!(RESTART_PROBE.cleared.load(Ordering::SeqCst));
         kassert!(matches!(exit, Some(UserExit::Exited(0))));
         Ok(())
     }
