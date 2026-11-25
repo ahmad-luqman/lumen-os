@@ -4329,7 +4329,7 @@ depends on them.
 | C4 | `futex`, robust lists, sleeps | B0, B1, B2, C1, C2 | `FutexKey`, the buckets, the `clear_child_tid` wake; `test_futex_timeouts_and_nanosleep` | 8 |
 | C5 | signal delivery and faults as signals | B0, B1, B2 | frames, `rt_sigreturn`, `sigaltstack`, `kill`/`tkill`/`tgkill`, `rt_sigqueueinfo`; `test_signals_and_sigaltstack` (its `EPERM` check runs two `linux` programs at once) | 5, 6, 8 |
 | C6 | restarts, signal waits, stop and continue | B0, B3, C1, C4, C5 | `pause`, `rt_sigsuspend`/`rt_sigtimedwait`/`rt_sigpending`, `SIGCHLD`, stops; `test_sigchld_and_sigint_interrupt_wait` | 6, 8 |
-| C7 | pipes, FIFOs, `dup*`, `SIGPIPE` | B0, B3, B8, C1, C2, C5 | `PipeObject`, the FIFO slot, `mknod_at`; `test_pipes_and_poll`, `poll_wakes_on_a_pipe_write` | 8, 9, 10 |
+| C7 | pipes, FIFOs, `dup*`, `SIGPIPE` | B0, B3, B8, C1, C2, C5 | `PipeObject`, the FIFO slot, `KernelFile::io_refs`, `mknod_at`; `test_pipes_and_poll`, `poll_wakes_on_a_pipe_write`, `pipe_end_outlives_its_close_while_a_write_is_in_flight` | 8, 9, 10 |
 | C8 | sessions and process groups | B0, C1, C3, C5 | `test_sessions_and_process_groups` | 8 |
 | C9 | PTYs, controlling terminals, job control | B0, C6, C7, C8 | devpts, `Tty`; `test_pty_termios_and_job_control` | 8, 9, 10 |
 | C10 | the console as a tty | C2, C9 | the console's `Tty` and input thread; `test_console_ash_job_control` | 10 |
@@ -8513,13 +8513,22 @@ standard Linux IPC primitives:
   (64 KiB, `DEFAULT_CAPACITY`) failing is `-ENOMEM`. `PipeObject::pipe` is
   section 9's Lock 0, held across user copies as lumen-pipe's contract has
   it (`peek`, the copy out, `commit`; the non-blocking write loop).
-- **Ends:** an end's `Pipe::release_reader`/`release_writer` runs at its
-  open file description's last `dec_fd_ref` (its last descriptor closed,
-  in any process: `fork`'s table copy raises the count per descriptor,
-  section 8), not when the `Arc` drops (a `/proc` reader may hold one), and
-  never per descriptor: `dup` and `fork` share the description, as the
-  crate requires. `Released::Last` wakes every waiter on the other
-  end and every poller.
+- **Ends:** an end's `Pipe::release_reader`/`release_writer` runs when
+  its open file description has neither a descriptor nor an I/O in flight:
+  the description counts descriptors (`dec_fd_ref`; `fork`'s table copy
+  raises it per descriptor, section 8) and, beside them, the syscalls using
+  it (`KernelFile::io_refs`, raised by the descriptor lookup a `read`,
+  `write`, `readv`, `writev` or `poll` takes, `Fd::file`, and dropped when
+  that syscall returns). Whichever count reaches zero last, the
+  closing thread or the syscall finishing, releases the end, in thread
+  context with no lock held. So a writer blocked on a full pipe keeps its
+  end open across another thread's `close`, as Linux's in-flight `fget`
+  reference keeps the `struct file` (and `pipe_release`) alive until the
+  I/O completes (close(2), "multithreaded processes"). A `/proc` reader's
+  metadata-only reference counts in neither, and the release is never per
+  descriptor: `dup` and `fork` share the description, as the crate
+  requires. `Released::Last` wakes every waiter on the other end and every
+  poller.
 - **`read`:** under the pipe lock, `peek` into a 4 KiB kernel buffer,
   `copy_to_user`, then `commit` (a fault drops the `Peeked`: the bytes stay
   queued, and the call returns what it moved before, or `-EFAULT`), until
@@ -8560,7 +8569,7 @@ standard Linux IPC primitives:
   write end right after, so it doesn't see the difference.
 - **`fcntl` and `ioctl`:** `F_GETPIPE_SZ`, `F_SETPIPE_SZ` and `FIONREAD`
   (section 8's table).
-- Tested by `cargo:lumen-pipe` and `scenario:test_linux_io::test_pipes_and_poll`
+- Tested by `cargo:lumen-pipe`, `ktest:lumen_kernel::linux::syscall::fd::pipe_end_outlives_its_close_while_a_write_is_in_flight` and `scenario:test_linux_io::test_pipes_and_poll`
   (section 15). D2's scenario also runs `make -j2` on a two-rule Makefile
   of `true` commands after its build: GNU make 4.4's jobserver FIFO
   (`mkfifo`, then `pselect6` on its read end), with nothing on stderr (make
@@ -10741,6 +10750,12 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `mknodat`'s errno rows (`S_IFDIR` `EPERM`, a bad type `EINVAL` before
   the lookup, `S_IFCHR` `EPERM`, `EEXIST`, devfs `EROFS`); an ext4 FIFO,
   after which the image passes `e2fsck -fn`.
+- `ktest:lumen_kernel::linux::syscall::fd::pipe_end_outlives_its_close_while_a_write_is_in_flight`
+  (C7): a writer blocked on a full pipe (its wait confirmed before the
+  close) keeps its end across another thread's `close` of the last
+  descriptor; the reader drains, receives every byte the writer then
+  completes, and sees `EOF` only after the write returns. It kills the
+  mutant that releases the end at the last `dec_fd_ref` alone.
 - `scenario:test_linux_io::test_poll_and_select_on_console` (B3): `poll`,
   `ppoll`, `select` and `pselect6` on the console's stdin with and without
   typed input; timeouts at least their time; the time left written back;
