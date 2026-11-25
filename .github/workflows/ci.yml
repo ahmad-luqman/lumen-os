@@ -200,9 +200,10 @@ jobs:
           if-no-files-found: ignore
 
       # The durable mirror's check (above) runs with continue-on-error so
-      # that the steps after it still run; its failure fails the job here.
+      # that the steps after it still run; its failure fails the job here,
+      # and so does a check cut off by its timeout (outcome `cancelled`).
       - name: Fail if the durable mirror check failed
-        if: ${{ !cancelled() && steps.mirror-check.outcome == 'failure' }}
+        if: ${{ !cancelled() && (steps.mirror-check.outcome == 'failure' || steps.mirror-check.outcome == 'cancelled') }}
         run: |
           echo "::error::the durable mirror check failed (a locked package missing, broken or not downloadable): see that step"
           exit 1

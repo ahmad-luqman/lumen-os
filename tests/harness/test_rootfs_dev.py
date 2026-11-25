@@ -1819,7 +1819,9 @@ _GH_STUB = r"""#!@PYTHON@
 # makes every `release view` fail otherwise than "not found", and
 # `view-fail-once`/`api-fail-once` the next one only; `view-garbage` gives an
 # answer that isn't an id and a draft flag; `api-error` fails every listing;
-# `lag` hides every asset from the first listing after an upload;
+# `lag` hides every asset from the first listing after an upload, and
+# `view-lag` makes the first `release view` after a create say "release not
+# found";
 # `fail-upload` makes the next upload fail after leaving a partial asset,
 # `upload-open` leaves each upload open, and `touch-source` changes the
 # source file under build/deps after it was staged. Every call is logged to
@@ -1899,7 +1901,7 @@ if args[1] == "view":
     if marked("view-error") or once("view-fail-once"):
         print("HTTP 502: Bad Gateway", file=sys.stderr)
         sys.exit(1)
-    if not os.path.isdir(assets):
+    if not os.path.isdir(assets) or once("view-hidden"):
         print("release not found", file=sys.stderr)
         sys.exit(1)
     if opt("--json") != "databaseId,isDraft" or opt("--jq") != VIEW_JQ:
@@ -1912,6 +1914,8 @@ elif args[1] == "create":
     if os.path.isdir(assets):
         refuse("the release exists")
     os.makedirs(assets)
+    if marked("view-lag"):
+        open(os.path.join(state, "view-hidden"), "w").close()
 elif args[1] == "upload":
     if not os.path.isdir(assets):
         refuse("no release")
@@ -1989,11 +1993,14 @@ def _set_durable_mirror(tools: Path, template: str) -> None:
     (tools / "fetch-alpine-packages.sh").write_text(text)
 
 
-def _run_mirror(script: Path, state: Path, gh: Path | None, *args: str):
+def _run_mirror(
+    script: Path, state: Path, gh: Path | None, *args: str, env: dict[str, str] | None = None
+):
     """The tool with `args`, through the gh stub (`gh` None: through
     whatever `gh` is on PATH, which is the guard) and CURL_STUB. gh's own
     token and configuration are emptied, so even a real gh would be signed
-    out, and its retries don't sleep."""
+    out, and its retries don't sleep. `env` overrides entries last."""
+    extra = env or {}
     guard = state.parent / "guard"
     _install_curl_stub(guard)
     (guard / "gh").write_text(_GH_GUARD)
@@ -2018,6 +2025,7 @@ def _run_mirror(script: Path, state: Path, gh: Path | None, *args: str):
         env.pop("LUMEN_GH", None)
     else:
         env["LUMEN_GH"] = str(gh)
+    env.update(extra)
     return subprocess.run(
         ["bash", str(script), *args],
         capture_output=True,
@@ -2392,6 +2400,19 @@ def test_mirror_upload_reads_a_lagging_listing_again(tmp_path):
     assert len(_calls(state, "api")) == 3  # before, lagging, again
 
 
+def test_mirror_upload_looks_up_a_new_release_again_when_it_lags(tmp_path):
+    """A release created just now that `release view` doesn't find yet: the
+    closing check's second pass looks it up again, and passes."""
+    script, state, gh = _mirror_tree(tmp_path, release=False)
+    (state / "view-lag").write_text("")
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 0, proc.stderr
+    assert "2 uploaded" in proc.stdout
+    assert "reading it again in 0s" in proc.stderr
+    assert "holds all 2 locked packages" in proc.stdout
+    assert len(_calls(state, "release", "create")) == 1
+
+
 def test_mirror_check_downloads_the_first_file_anonymously(tmp_path):
     """After the listing passes, one anonymous HEAD request at the fetch's
     URL for the first locked file (here the stub's assets, a file:// URL)."""
@@ -2402,7 +2423,34 @@ def test_mirror_check_downloads_the_first_file_anonymously(tmp_path):
     assert proc.returncode == 0, proc.stderr
     url = f"file://{state}/assets/{_sha('binutils-2.43.1-r3')}.apk"
     [probe] = (state.parent / "guard/args").read_text().splitlines()
-    assert probe == f"-q -fsIL --max-time 20 -o /dev/null {url}"
+    assert probe == f"-q -fsIL --retry 3 --retry-connrefused --max-time 20 -o /dev/null {url}"
+
+
+def test_mirror_check_probes_the_real_fetch_scripts_durable_mirror(tmp_path):
+    """The probe reads DURABLE_MIRROR out of the real, unmodified
+    tools/fetch-alpine-packages.sh (every other probe test rewrites that
+    line), so a reformatted line fails here rather than only in CI. The
+    curl stub answers the real github.com URL 404."""
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    shutil.copy2(REPO_ROOT / "tools/fetch-alpine-packages.sh", script.parent)
+    for stem in FIXTURE_APKS:
+        _asset(state, stem)
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    url = (
+        f"https://github.com/{MIRROR_REPO}/releases/download/{MIRROR_TAG}/"
+        f"{_sha('binutils-2.43.1-r3')}.apk"
+    )
+    assert f"is listed but not downloadable at {url}" in proc.stderr
+
+
+@pytest.mark.parametrize("sleep", ["2s", "0.5", "-1"])
+def test_mirror_refuses_a_retry_sleep_that_isnt_whole_seconds(tmp_path, sleep):
+    script, state, gh = _mirror_tree(tmp_path)
+    proc = _run_mirror(script, state, gh, "check", env={"LUMEN_GH_RETRY_SLEEP": sleep})
+    assert proc.returncode == 2
+    assert "LUMEN_GH_RETRY_SLEEP" in proc.stderr
+    assert _calls(state) == []
 
 
 def test_mirror_check_fails_a_release_listed_but_not_downloadable(tmp_path):

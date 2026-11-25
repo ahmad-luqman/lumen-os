@@ -43,6 +43,10 @@ REPO=ahmad-luqman/lumen-os
 TAG=alpine-apk-mirror
 GH=${LUMEN_GH:-gh}
 RETRY_SLEEP=${LUMEN_GH_RETRY_SLEEP:-2}
+if [[ ! "$RETRY_SLEEP" =~ ^[0-9]+$ ]]; then
+    echo "mirror-alpine-packages: LUMEN_GH_RETRY_SLEEP is '$RETRY_SLEEP', not a whole number of seconds" >&2
+    exit 2
+fi
 
 usage() {
     echo "usage: tools/mirror-alpine-packages.sh check|upload" >&2
@@ -182,7 +186,9 @@ download_probe() {
     read -r path file want <<< "$FILES"
     u=${durable//\{file\}/$file}
     u=${u//\{sha256\}/$want}
-    if ! curl -q -fsIL --max-time 20 -o /dev/null "$u" </dev/null; then
+    # Retried as the gh reads are, so one blip on GitHub's asset host
+    # doesn't fail CI.
+    if ! curl -q -fsIL --retry 3 --retry-connrefused --max-time 20 -o /dev/null "$u" </dev/null; then
         echo "mirror-alpine-packages: release $TAG is listed but not downloadable at $u" >&2
         exit 1
     fi
@@ -266,6 +272,8 @@ read_release quiet
 if [[ ${#MISSING[@]} -ne 0 || $BAD -ne 0 ]]; then
     echo "mirror-alpine-packages: the release's listing isn't complete yet; reading it again in $((RETRY_SLEEP * 2))s" >&2
     sleep $((RETRY_SLEEP * 2))
+    # A release created just now may not be found at once either.
+    probe_release
     read_release
 fi
 report
