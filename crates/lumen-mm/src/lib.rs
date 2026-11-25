@@ -55,6 +55,7 @@
 #![no_std]
 
 mod addr;
+pub mod frame;
 pub mod paging;
 pub mod stacks;
 pub mod window;

@@ -11,6 +11,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::sync::atomic::AtomicU32;
 
 use lumen_elf::loader::{ElfLoadError, LoadedElf, MappedRange, PageAction, Perm};
 use lumen_elf::stack::{AuxvInfo, InitialStack, StackBuildError, build_initial_stack};
@@ -170,6 +171,61 @@ pub const fn prot_to_attrs(prot: Prot) -> Attrs {
     Attrs::for_user(prot.read(), prot.write(), prot.exec())
 }
 
+fn private_backing(backing: Backing) -> bool {
+    match backing {
+        Backing::Anonymous { shared } => !shared,
+        Backing::File(fm) => !fm.shared,
+    }
+}
+
+/// Local implementation of B5's shootdown signature while spaces remain
+/// single-threaded and pinned. B5 replaces this with cross-CPU retirement.
+enum Shoot {
+    Pages(core::ops::Range<u64>),
+    Full,
+}
+
+fn shoot_down(space: &AddressSpace, what: Shoot) {
+    if arch::paging::active_root() != space.root {
+        return;
+    }
+    match what {
+        Shoot::Full => arch::paging::flush_local(),
+        Shoot::Pages(range) => {
+            for addr in range.step_by(PAGE_SIZE as usize) {
+                arch::paging::invalidate(VirtAddr::new(addr).expect("user page"));
+            }
+        }
+    }
+}
+
+/// Next populated leaf, including PROT_NONE, skipping missing subtrees.
+/// Callers hold the space's Lock 1 throughout the walk and any mutation.
+fn next_user_leaf(root: PhysFrame, addr: &mut u64, end: u64) -> Option<(VirtAddr, lumen_mm::paging::Mapping)> {
+    while *addr < end {
+        let va = VirtAddr::new(*addr).expect("user address");
+        match paging::walk_user(root, va).end() {
+            WalkEnd::Mapped(mapping) | WalkEnd::ProtNone(mapping) => {
+                *addr += PAGE_SIZE;
+                return Some((va, mapping));
+            }
+            WalkEnd::NotPresent(level) => {
+                let span = 1u64 << (12 + 9 * (u32::from(level.number()) - 1));
+                *addr = ((*addr & !(span - 1)) + span).min(end);
+            }
+            WalkEnd::Unreadable(level, frame) => panic!("unreadable user table {frame} at {level:?} for {va}"),
+        }
+    }
+    None
+}
+
+fn map_error_vm(err: MapError) -> UserVmError {
+    match err {
+        MapError::OutOfMemory => UserVmError::OutOfMemory,
+        _ => UserVmError::InvalidArg,
+    }
+}
+
 /// Convert `lumen_elf::Perm` to `lumen_vm::Prot`.
 #[inline]
 const fn perm_to_prot(perm: Perm) -> Prot {
@@ -295,6 +351,7 @@ impl MappedFile {
 /// (a relative open's joined to its directory's, not normalised; a later
 /// rename isn't seen; an unlink is, as ` (deleted)`), and the first
 /// mapping's for every later mapping of the same file while any maps it.
+#[derive(Clone)]
 struct KeptFile {
     guard: OpenGuard,
     path: Arc<[u8]>,
@@ -395,6 +452,11 @@ fn drop_range<V>(map: &mut BTreeMap<u64, V>, start: u64, end: u64) {
 /// tables), a [`VmaMap`], and a byte-granular [`Brk`] cursor, all synchronized
 /// under a sleeping, interrupt-enabled [`SleepMutex`].
 pub struct AddressSpace {
+    /// Processes using this space, independent of observer `Arc`s. A new
+    /// space starts at one; the process decrementing to zero calls teardown
+    /// after detaching its CPU. Threads of one process do not raise it.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1's process lifetime
+    pub users: AtomicU32,
     root: PhysFrame,
     inner: SleepMutex<AddressSpaceInner>,
 }
@@ -405,6 +467,7 @@ impl AddressSpace {
         let root = paging::new_user_root().ok_or(UserVmError::OutOfMemory)?;
         let brk = Brk::with_limit(USER_MIN, MMAP_TOP).expect("USER_MIN..MMAP_TOP is valid");
         Ok(Self {
+            users: AtomicU32::new(1),
             root,
             inner: SleepMutex::new(AddressSpaceInner {
                 vmas: VmaMap::new(),
@@ -466,6 +529,86 @@ impl AddressSpace {
     #[inline]
     pub fn root(&self) -> PhysFrame {
         self.root
+    }
+
+    /// Copy VM metadata and user references into a new space. Private
+    /// leaves become read-only in both spaces; shared anonymous pages are
+    /// populated before copying so even previously untouched pages share.
+    /// Cache leaves refault in the child. On failure the child is released
+    /// outside both locks; parent leaves may remain read-only and refault.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1 wires fork
+    pub fn fork_copy(self: &Arc<Self>) -> Result<Arc<Self>, UserVmError> {
+        // Declared first: rollback drops the child only after both Lock 1s.
+        let child = Arc::new(Self::new()?);
+        let parent = self.inner.lock();
+        if parent.torn_down {
+            return Err(UserVmError::InvalidArg);
+        }
+        let mut copied = child.inner.lock();
+        copied.vmas = parent.vmas.clone();
+        copied.brk = parent.brk;
+        copied.images = parent.images.clone();
+        copied.mapped_files = parent.mapped_files.clone();
+        let result: Result<(), UserVmError> = (|| {
+            // B7 registers the child as a mapper here, before these size
+            // reads, while both locks exclude faults and invalidation.
+            let mut sizes = BTreeMap::new();
+            for (&id, file) in &copied.mapped_files {
+                sizes.insert(id, file.inode().stat().map_err(|_| UserVmError::InvalidArg)?.size);
+            }
+            for vma in parent.vmas.iter() {
+                if matches!(vma.backing, Backing::Anonymous { shared: true }) {
+                    for addr in (vma.start..vma.end).step_by(PAGE_SIZE as usize) {
+                        let va = VirtAddr::new(addr).expect("valid VMA");
+                        if matches!(paging::walk_user(self.root, va).end(), WalkEnd::NotPresent(_)) {
+                            let frame = frame::alloc_user().ok_or(UserVmError::OutOfMemory)?;
+                            // SAFETY: parent Lock 1 is held; this missing
+                            // leaf takes the freshly allocated reference.
+                            unsafe { paging::map_user_page(self.root, va, frame.frame(), prot_to_attrs(vma.prot)) }
+                                .map_err(map_error_vm)?;
+                            let _ = frame.into_raw();
+                        }
+                    }
+                }
+            }
+            let mut addr = USER_MIN;
+            while let Some((va, leaf)) = next_user_leaf(self.root, &mut addr, USER_MAX) {
+                let vma = parent.vmas.find(va.as_u64()).expect("every user leaf has a VMA");
+                if leaf.shared {
+                    continue;
+                }
+                if let Backing::File(fm) = vma.backing
+                    && fm.offset + (va.as_u64() - vma.start) >= sizes[&fm.file_id]
+                {
+                    continue; // never inherit a private copy wholly past EOF
+                }
+                let mut attrs =
+                    if leaf.present { Attrs::for_user(true, leaf.writable, leaf.executable) } else { Attrs::USER_NONE };
+                if private_backing(vma.backing) {
+                    attrs = attrs.without_writable();
+                    if leaf.writable {
+                        // SAFETY: parent Lock 1 excludes mutations. The
+                        // full flush below retires every removed right,
+                        // including on failure, before child publication.
+                        unsafe { paging::protect_user_page(self.root, va, attrs) }
+                            .expect("walk just found the parent leaf");
+                    }
+                }
+                // SAFETY: the parent's leaf keeps a reference under Lock 1;
+                // private writes have been disabled before publication.
+                let reference = unsafe { frame::share_user(leaf.phys) }.ok_or(UserVmError::OutOfMemory)?;
+                // SAFETY: the child is new, its Lock 1 is held, and this
+                // fresh leaf takes the additional counted reference.
+                unsafe { paging::map_user_page(child.root, va, reference.frame(), attrs) }.map_err(map_error_vm)?;
+                let _ = reference.into_raw();
+            }
+            Ok(())
+        })();
+        shoot_down(self, Shoot::Full);
+        drop(copied);
+        drop(parent);
+        result?;
+        Ok(child)
     }
 
     /// Parse and load a static ELF64 image into this empty address space.
@@ -542,17 +685,16 @@ impl AddressSpace {
             let mut va_addr = stack_eager_start;
             while va_addr < USER_STACK_TOP {
                 let va = VirtAddr::new(va_addr).ok_or(UserVmError::InvalidArg)?;
-                let phys = frame::alloc_zeroed().ok_or(UserVmError::OutOfMemory)?;
+                let phys = frame::alloc_user().ok_or(UserVmError::OutOfMemory)?;
                 // SAFETY: `self.root` is owned by `self`, `inner` lock is held,
                 // `va` is a fresh lower-half stack page, and `phys` transfers ownership.
-                if let Err(err) = unsafe { paging::map_user_page(self.root, va, phys, Attrs::USER_RW) } {
-                    // SAFETY: `phys` was never mapped.
-                    unsafe { frame::free(phys) }.expect("freeing unmapped stack frame");
+                if let Err(err) = unsafe { paging::map_user_page(self.root, va, phys.frame(), Attrs::USER_RW) } {
                     return Err(match err {
                         MapError::OutOfMemory => UserVmError::OutOfMemory,
                         _ => UserVmError::InvalidArg,
                     });
                 }
+                let _ = phys.into_raw();
                 va_addr += PAGE_SIZE;
             }
             self.write_mapped_bytes_locked(stack_eager_start, stack_buf)?;
@@ -590,17 +732,16 @@ impl AddressSpace {
                     let attrs = prot_to_attrs(perm_to_prot(perm));
                     for i in 0..page_count {
                         let va = VirtAddr::new(vaddr + i * PAGE_SIZE).ok_or(UserVmError::InvalidArg)?;
-                        let phys = frame::alloc_zeroed().ok_or(UserVmError::OutOfMemory)?;
+                        let phys = frame::alloc_user().ok_or(UserVmError::OutOfMemory)?;
                         // SAFETY: `self.root` is owned by `self`, `inner` lock is held,
                         // `va` is a fresh lower-half page, and `phys` transfers ownership.
-                        if let Err(err) = unsafe { paging::map_user_page(self.root, va, phys, attrs) } {
-                            // SAFETY: `phys` was never mapped.
-                            unsafe { frame::free(phys) }.expect("freeing unmapped ELF frame");
+                        if let Err(err) = unsafe { paging::map_user_page(self.root, va, phys.frame(), attrs) } {
                             return Err(match err {
                                 MapError::OutOfMemory => UserVmError::OutOfMemory,
                                 _ => UserVmError::InvalidArg,
                             });
                         }
+                        let _ = phys.into_raw();
                     }
                 }
                 PageAction::UpdatePerm { vaddr, perm } => {
@@ -638,7 +779,7 @@ impl AddressSpace {
         let end = start + aligned_len;
         while addr < end {
             let va = VirtAddr::new(addr).ok_or(UserVmError::InvalidArg)?;
-            let phys = match frame::alloc_zeroed() {
+            let phys = match frame::alloc_user() {
                 Some(p) => p,
                 None => {
                     self.unmap_range_locked(&mut inner, start, addr);
@@ -648,9 +789,7 @@ impl AddressSpace {
             };
             // SAFETY: `self.root` is owned by `self`, `inner` lock is held,
             // and `phys` is a freshly allocated frame mapped into the lower half.
-            if let Err(err) = unsafe { paging::map_user_page(self.root, va, phys, attrs) } {
-                // SAFETY: `phys` was not mapped.
-                unsafe { frame::free(phys) }.expect("freeing unmapped user frame");
+            if let Err(err) = unsafe { paging::map_user_page(self.root, va, phys.frame(), attrs) } {
                 self.unmap_range_locked(&mut inner, start, addr);
                 let _ = inner.vmas.unmap(start, aligned_len);
                 return Err(match err {
@@ -658,6 +797,7 @@ impl AddressSpace {
                     _ => UserVmError::InvalidArg,
                 });
             }
+            let _ = phys.into_raw();
             addr += PAGE_SIZE;
         }
         if !bytes.is_empty() {
@@ -682,20 +822,25 @@ impl AddressSpace {
         if share_bits != priv_flag && share_bits != shared_flag {
             return Err(UserVmError::InvalidArg);
         }
-        self.map_anon_at(map_place(hint, flags), len, prot)
+        self.map_anon_at(
+            map_place(hint, flags),
+            len,
+            prot,
+            if share_bits == shared_flag { Sharing::Shared } else { Sharing::Private },
+        )
     }
 
     /// Register a lazy anonymous VMA of `len` bytes with `prot` where
-    /// `place` says (private and shared anonymous memory map alike until
-    /// M8's `fork`): `mmap_anon`, and `mmap` of `/dev/zero`.
-    pub fn map_anon_at(&self, place: MapPlace, len: u64, prot: Prot) -> Result<u64, UserVmError> {
+    /// `place` says, sharing across fork exactly when `sharing` is Shared:
+    /// `mmap_anon`, and `mmap` of `/dev/zero`.
+    pub fn map_anon_at(&self, place: MapPlace, len: u64, prot: Prot, sharing: Sharing) -> Result<u64, UserVmError> {
         // Declared before `inner`, so dropped after it is released.
         let mut gone_files = Vec::new();
         let mut inner = self.inner.lock();
         if inner.torn_down {
             return Err(UserVmError::OutOfMemory);
         }
-        let mapped = inner.vmas.map_anon(place, len, prot)?;
+        let mapped = inner.vmas.map(place, len, prot, Backing::Anonymous { shared: sharing == Sharing::Shared })?;
         self.unmap_vmas_locked(&mut inner, &mapped.unmapped, &mut gone_files);
         Ok(mapped.start)
     }
@@ -825,6 +970,8 @@ impl AddressSpace {
     /// copy-on-write, or `MAP_SHARED` dirty promotion), so each writable one
     /// loses its [`WritableMap`], dropped once the walk has flushed its TLB
     /// entry; their pins stay, `PROT_NONE` included.
+    /// Counted private leaves with multiple references also stay read-only
+    /// when write access is granted; shared anonymous leaves follow `prot`.
     pub fn mprotect(&self, addr: u64, len: u64, prot: Prot) -> Result<(), UserVmError> {
         let mut inner = self.inner.lock();
         if inner.torn_down {
@@ -855,18 +1002,27 @@ impl AddressSpace {
         let attrs = prot_to_attrs(prot);
         let active = arch::paging::active_root() == self.root;
         let writable = &inner.writable_maps;
-        // SAFETY: `self.root` is owned by `self`, `inner` lock is held, and
-        // `[addr, end)` is page-aligned and strictly in `USER_MIN..USER_MAX`.
-        unsafe {
-            paging::protect_user_range(self.root, addr, end, attrs, |leaf| {
-                // (1) downgraded (done), (2) flushed:
-                release_order::step(&leaf, release_order::Step::Cleared);
-                if active {
-                    arch::paging::invalidate(leaf.va);
-                    release_order::step(&leaf, release_order::Step::Flushed);
-                }
-                note_shared_leaf(writable, &leaf);
-            });
+        let mut cursor = addr;
+        while let Some((va, mapping)) = next_user_leaf(self.root, &mut cursor, end) {
+            let private = private_backing(inner.vmas.find(va.as_u64()).expect("protected VMA").backing);
+            let leaf_attrs = if !mapping.shared && private && frame::user_count(mapping.phys) > 1 {
+                attrs.without_writable()
+            } else {
+                attrs
+            };
+            // SAFETY: Lock 1 excludes mutations and this is a validated
+            // lower-half leaf. Choose CoW rights before making it writable.
+            unsafe {
+                paging::protect_user_range(self.root, va.as_u64(), va.as_u64() + PAGE_SIZE, leaf_attrs, |leaf| {
+                    // (1) downgraded (done), (2) flushed:
+                    release_order::step(&leaf, release_order::Step::Cleared);
+                    if active {
+                        arch::paging::invalidate(leaf.va);
+                        release_order::step(&leaf, release_order::Step::Flushed);
+                    }
+                    note_shared_leaf(writable, &leaf);
+                });
+            }
         }
         // (3) uncounted: every shared leaf in the range is read-only now.
         drop_range(&mut inner.writable_maps, addr, end);
@@ -912,6 +1068,8 @@ impl AddressSpace {
     /// - **A store to a read-only `PTE_SHARED` leaf:** copy-on-write for
     ///   `MAP_PRIVATE` (a private copy replaces it), dirty promotion for
     ///   `MAP_SHARED` (made writable, counted by a [`WritableMap`]).
+    /// - **A store to a read-only counted private leaf:** reuse at count
+    ///   one, otherwise copy the whole frame and retire the old reference.
     /// - Anything else is `Invalid`.
     ///
     /// File faults hold Lock 1 (`inner`) while [`mmap_page`] takes the
@@ -963,6 +1121,9 @@ impl AddressSpace {
                     }
                     return FaultResult::Resolved;
                 }
+                if m.user && is_write && !m.writable && !m.shared && private_backing(vma.backing) {
+                    return self.split_private_leaf(page_va, m.phys, prot_to_attrs(vma.prot));
+                }
                 return match vma.backing {
                     Backing::File(fm) if is_write && m.shared => {
                         self.store_to_shared_leaf(&mut inner, &vma, fm, page_va, from_user)
@@ -984,18 +1145,52 @@ impl AddressSpace {
             };
         }
 
-        let Some(phys) = frame::alloc_zeroed() else {
+        let Some(phys) = frame::alloc_user() else {
             return FaultResult::OutOfMemory;
         };
         let attrs = prot_to_attrs(vma.prot);
         // SAFETY: `self.root` is owned by `self`, `inner` lock is held,
         // `page_va` is in `USER_MIN..USER_MAX` and not present, and `phys` is
         // a freshly allocated zeroed frame whose ownership transfers to `self`.
-        if let Err(err) = unsafe { paging::map_user_page(self.root, page_va, phys, attrs) } {
-            // SAFETY: `phys` was never mapped.
-            unsafe { frame::free(phys) }.expect("freeing unmapped demand-page frame");
+        if let Err(err) = unsafe { paging::map_user_page(self.root, page_va, phys.frame(), attrs) } {
             return map_error_fault(err);
         }
+        let _ = phys.into_raw();
+        FaultResult::Resolved
+    }
+
+    /// Resolve a write to a counted private leaf while Lock 1 is held.
+    /// The old reference is released only after its translation is retired.
+    fn split_private_leaf(&self, va: VirtAddr, old: PhysFrame, attrs: Attrs) -> FaultResult {
+        if frame::user_count(old) == 1 {
+            // SAFETY: under Lock 1 this is the sole reference, so no other
+            // space can raise its count or observe private writes.
+            unsafe { paging::protect_user_page(self.root, va, attrs) }.expect("existing private leaf");
+            if arch::paging::active_root() == self.root {
+                arch::paging::invalidate(va);
+            }
+            return FaultResult::Resolved;
+        }
+        let Some(copy) = frame::alloc_user() else {
+            return FaultResult::OutOfMemory;
+        };
+        // SAFETY: the old leaf pins a read-only private frame under Lock 1.
+        // The new frame is exclusively ours, disjoint and HHDM-mapped.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                super::phys_to_virt(old.start()).as_ptr::<u8>(),
+                super::phys_to_virt(copy.frame().start()).as_mut_ptr::<u8>(),
+                PAGE_SIZE as usize,
+            );
+            // Unmap retains intermediate tables: replacing this existing
+            // leaf requires no allocation and cannot run out of frames.
+            paging::unmap_user_range(self.root, va.as_u64(), va.as_u64() + PAGE_SIZE, |_| {});
+            paging::map_user_page(self.root, va, copy.frame(), attrs).expect("retained private leaf tables");
+        }
+        let _ = copy.into_raw();
+        shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
+        // SAFETY: the old leaf is gone and its cached translation retired.
+        unsafe { frame::release_user(old) };
         FaultResult::Resolved
     }
 
@@ -1060,6 +1255,7 @@ impl AddressSpace {
 
     /// Map the private frame `copy` at the not-present `page_va`.
     fn map_copy(&self, page_va: VirtAddr, copy: frame::OwnedFrame, attrs: Attrs) -> FaultResult {
+        let copy = frame::UserFrame::from_owned(copy);
         // SAFETY: `self.root` is owned by `self`, the caller holds `inner`,
         // `page_va` is in `USER_MIN..USER_MAX` and not present, and `copy`
         // is a frame this call owns, handed to the page table below only if
@@ -1172,10 +1368,10 @@ impl AddressSpace {
             return;
         }
         inner.vmas = VmaMap::new();
-        let writable = &inner.writable_maps;
-        // SAFETY: `self.root` is not active in CR3 (asserted above), `inner`
-        // lock is held, and all lower-half leaves/tables belong exclusively to `self`.
-        unsafe { paging::clear_user_lower_half(self.root, |leaf| note_shared_leaf(writable, &leaf)) };
+        self.unmap_range_locked(&mut inner, USER_MIN, USER_MAX);
+        // SAFETY: the root is inactive and every leaf has been removed and
+        // released. Only this space's exclusively owned tables remain.
+        unsafe { paging::clear_user_lower_half(self.root, |_| unreachable!("all user leaves removed")) };
         inner.writable_maps.clear();
         inner.pinned_pages.clear();
         inner.images.clear();
@@ -1353,9 +1549,9 @@ impl AddressSpace {
                 }
                 note_shared_leaf(writable, &leaf);
                 if !leaf.was_shared {
-                    // SAFETY: non-shared leaf frame belonged exclusively to this address space
-                    // and has been unmapped and invalidated from the local TLB.
-                    frame::free(leaf.phys).expect("freeing unmapped user leaf frame");
+                    // SAFETY: this space owned one reference, now unmapped
+                    // and invalidated before its count can reach zero.
+                    frame::release_user(leaf.phys);
                 }
             });
         }
@@ -1569,9 +1765,18 @@ impl Drop for AddressSpace {
             unsafe { frame::free(self.root) }.expect("freeing user L4 root frame");
         } else {
             let writable = &inner.writable_maps;
-            // SAFETY: `self.root` is not active in CR3 and exclusively owns its
-            // lower-half subtree (`PTE_SHARED` leaves excepted, never freed).
-            unsafe { paging::destroy_user_root(self.root, |leaf| note_shared_leaf(writable, &leaf)) };
+            // SAFETY: no CPU holds this root, and &mut self excludes any
+            // concurrent page-table mutation. Release leaves first so the
+            // paging teardown sees only exclusively owned empty tables.
+            unsafe {
+                paging::unmap_user_range(self.root, USER_MIN, USER_MAX, |leaf| {
+                    note_shared_leaf(writable, &leaf);
+                    if !leaf.was_shared {
+                        frame::release_user(leaf.phys);
+                    }
+                });
+                paging::destroy_user_root(self.root, |_| unreachable!("all user leaves removed"));
+            }
             // No CPU holds this `CR3`: that was the flush. Dropping these
             // takes no lock (`VfsInode::drop` takes no sleeping one).
             inner.writable_maps.clear();
@@ -2835,6 +3040,150 @@ crate::ktest!(
         kassert_eq!(space.handle_page_fault(again, USER_LOAD), FaultResult::Resolved);
         kassert_eq!(space.handle_page_fault(base + 3 * P, USER_STORE), FaultResult::BusError);
         kassert_eq!(count(), before + 2);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn mprotect_keeps_a_shared_frame_read_only() {
+        use crate::sched::UserSpaceGuard;
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        const A: u64 = 0x300_0000;
+        const S: u64 = A + 4 * PAGE_SIZE;
+        let parent = Arc::new(AddressSpace::new().map_err(|_| "parent")?);
+        parent.map_eager_with_bytes(A, 2 * PAGE_SIZE, Prot::READ, b"original").map_err(|_| "eager")?;
+        parent.mprotect(A + PAGE_SIZE, PAGE_SIZE, Prot::NONE).map_err(|_| "none")?;
+        // Shared NONE is populated at fork, but must stay inaccessible.
+        parent
+            .map_anon_at(MapPlace::FixedNoReplace(S), PAGE_SIZE, Prot::NONE, Sharing::Shared)
+            .map_err(|_| "shared")?;
+        let old = file_vm_leaf(&parent, A).ok_or("parent leaf")?.phys;
+        let child = parent.fork_copy().map_err(|_| "fork")?;
+        kassert_eq!(frame::user_count(old), 2);
+        parent.mprotect(A, 2 * PAGE_SIZE, Prot::WRITE).map_err(|_| "write-only")?;
+        // WRITE-only stays present when CoW clears WRITABLE, including a
+        // previously PROT_NONE leaf. Both branches must split on a store.
+        for addr in [A, A + PAGE_SIZE] {
+            let mapping = file_vm_leaf(&parent, addr).ok_or("not present after mprotect")?;
+            kassert!(!mapping.writable);
+            kassert_eq!(frame::user_count(mapping.phys), 2);
+        }
+        {
+            let _active = UserSpaceGuard::enter(parent.clone());
+            kassert_eq!(copy_to_user(A, b"modified"), Ok(()));
+            kassert_eq!(copy_to_user(A + PAGE_SIZE, b"split"), Ok(()));
+            kassert!(file_vm_leaf(&parent, A).ok_or("copy")?.phys != old);
+        }
+        {
+            let _active = UserSpaceGuard::enter(child.clone());
+            let mut bytes = [0; 8];
+            kassert_eq!(copy_from_user(&mut bytes, A), Ok(()));
+            kassert_eq!(&bytes, b"original");
+        }
+        // Shared-anonymous count 2 must allow the upgrade in both spaces.
+        for space in [&parent, &child] {
+            space.mprotect(S, PAGE_SIZE, RW).map_err(|_| "shared upgrade")?;
+            let mapping = file_vm_leaf(space, S).ok_or("shared leaf")?;
+            kassert!(mapping.writable && !mapping.shared);
+            kassert_eq!(frame::user_count(mapping.phys), 2);
+        }
+        kassert_eq!(file_vm_leaf(&parent, S).unwrap().phys, file_vm_leaf(&child, S).unwrap().phys);
+        {
+            let _active = UserSpaceGuard::enter(parent.clone());
+            kassert_eq!(copy_to_user(S, b"shared"), Ok(()));
+        }
+        {
+            let _active = UserSpaceGuard::enter(child.clone());
+            let mut bytes = [0; 6];
+            kassert_eq!(copy_from_user(&mut bytes, S), Ok(()));
+            kassert_eq!(&bytes, b"shared");
+        }
+        parent.teardown();
+        child.teardown();
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn fork_copy_preserves_files_images_and_private_copies() {
+        use crate::sched::UserSpaceGuard;
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::vfs::page_cache::ktest_files::TmpfsVolume;
+        use crate::{kassert, kassert_eq};
+        let vol = TmpfsVolume::new(375, 8 * PAGE_SIZE as usize);
+        let f = ktest_files::file(&vol.root, "fork.bin", &ktest_files::pattern(3 * PAGE_SIZE as usize, 37))?;
+        let elf = build_relro_test_elf();
+        let plan = LoadedElf::parse(&elf).map_err(|_| "ELF plan")?;
+        let image_file = ImageFile::of(&*f, "/fork-image");
+        let image = ElfImage { plan: &plan, bytes: &elf, file: Some(&image_file) };
+        let (space, _) =
+            AddressSpace::from_images(image, None, &[b"fork"], &[], b"fork", [0; 16]).map_err(|_| "load")?;
+        let parent = Arc::new(space);
+        let heap = parent.brk(0);
+        kassert_eq!(parent.brk(heap + 101), heap + 101);
+        let base = parent
+            .mmap_file(MapPlace::Hint(None), 3 * PAGE_SIZE, RW, file_vm_open(&f)?, 0, Sharing::Private)
+            .map_err(|_| "file map")?;
+        let shared = parent
+            .mmap_file(MapPlace::Hint(None), PAGE_SIZE, RW, file_vm_open(&f)?, 0, Sharing::Shared)
+            .map_err(|_| "shared file")?;
+        {
+            let _active = UserSpaceGuard::enter(parent.clone());
+            kassert_eq!(copy_to_user(base, b"private"), Ok(()));
+            kassert_eq!(copy_to_user(base + 2 * PAGE_SIZE, b"pastEOF"), Ok(()));
+            let mut byte = [0];
+            kassert_eq!(copy_from_user(&mut byte, base + PAGE_SIZE), Ok(())); // cache leaf
+            kassert_eq!(copy_to_user(shared, b"file"), Ok(())); // writable cache leaf
+        }
+        let private = file_vm_leaf(&parent, base).ok_or("private leaf")?.phys;
+        let past_eof = file_vm_leaf(&parent, base + 2 * PAGE_SIZE).ok_or("past EOF leaf")?.phys;
+        // A shrink whose invalidation has not run yet: fork must skip the
+        // stale private leaf even though it is not a cache leaf anymore.
+        f.truncate(PAGE_SIZE + 100).map_err(|_| "truncate")?;
+        let before_maps = parent.format_maps();
+        let child = parent.fork_copy().map_err(|_| "fork")?;
+        kassert_eq!(child.format_maps(), before_maps); // VMA, image names, paths, break
+        kassert_eq!(child.brk(0), heap + 101);
+        kassert_eq!(child.mapped_file_count(), 1);
+        kassert_eq!(f.open_count(), 2);
+        kassert_eq!(child.file_page_counts(), (0, 0)); // cache leaves never inherited
+        kassert!(file_vm_leaf(&child, base + PAGE_SIZE).is_none());
+        kassert!(file_vm_leaf(&child, shared).is_none());
+        kassert!(file_vm_leaf(&child, base + 2 * PAGE_SIZE).is_none());
+        kassert_eq!(frame::user_count(past_eof), 1);
+        kassert_eq!(frame::user_count(private), 2);
+        let code = file_vm_leaf(&child, 0x40_1000).ok_or("child text")?;
+        kassert!(code.executable && !code.writable);
+        kassert_eq!(frame::user_count(code.phys), 2);
+        child.mprotect(base, PAGE_SIZE, RW).map_err(|_| "mprotect private file copy")?;
+        kassert!(!file_vm_leaf(&child, base).ok_or("child private leaf")?.writable);
+        {
+            let _active = UserSpaceGuard::enter(child.clone());
+            let mut bytes = [0; 7];
+            kassert_eq!(copy_from_user(&mut bytes, base), Ok(()));
+            kassert_eq!(&bytes, b"private");
+            kassert_eq!(copy_to_user(base, b"child!!"), Ok(()));
+            kassert!(file_vm_leaf(&child, base).ok_or("child split")?.phys != private);
+            kassert_eq!(child.handle_page_fault(base + 2 * PAGE_SIZE, 0), FaultResult::BusError);
+            kassert_eq!(copy_from_user(&mut bytes[..4], shared), Ok(()));
+            kassert_eq!(&bytes[..4], b"file");
+            kassert_eq!(file_vm_leaf(&child, shared).unwrap().phys, file_vm_leaf(&parent, shared).unwrap().phys);
+            kassert_eq!(frame::user_count(file_vm_leaf(&child, shared).unwrap().phys), 0);
+        }
+        {
+            let _active = UserSpaceGuard::enter(parent.clone());
+            let mut bytes = [0; 7];
+            kassert_eq!(copy_from_user(&mut bytes, base), Ok(()));
+            kassert_eq!(&bytes, b"private");
+        }
+        parent.teardown();
+        kassert_eq!(f.open_count(), 1);
+        kassert!(!frame::is_allocated(private) && !frame::is_allocated(past_eof));
+        kassert_eq!(frame::user_count(code.phys), 1);
+        child.teardown();
+        kassert_eq!(f.open_count(), 0);
+        kassert!(!frame::is_allocated(code.phys));
         Ok(())
     }
 );

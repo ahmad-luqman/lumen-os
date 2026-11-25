@@ -169,8 +169,8 @@ fn mmap_fd(addr: u64, len: u64, prot: lumen_vm::Prot, flags: u64, fd: Fd, off: u
     let space = sched::current_address_space().ok_or(errno::ENOMEM)?;
     let place = map_place(addr, flags);
     if dev_zero {
-        // Anonymous memory, placed as asked (shared alike until M8).
-        return space.map_anon_at(place, len, prot).map_err(|e| e.to_errno());
+        // Anonymous memory, with the requested placement and sharing.
+        return space.map_anon_at(place, len, prot, sharing).map_err(|e| e.to_errno());
     }
     space.mmap_file(place, len, prot, MappedFile::of(&file, mount_writable), off, sharing).map_err(|e| e.to_errno())
 }

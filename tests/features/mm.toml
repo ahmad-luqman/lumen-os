@@ -173,3 +173,20 @@ milestone = "M7"
 tests = [
     "scenario:test_linux_user::test_dynamic_musl_binary_and_dlopen",
 ]
+
+[[feature]]
+name = "Frame reference counts and copy-on-write fork (#375): reserved atomic counts, private splits and sole-owner reuse, shared anonymous pages, mprotect preserving CoW, process users independent of Arc observers, and teardown releasing counted frames"
+milestone = "M8"
+tests = [
+    "cargo:lumen-mm",
+    "cargo:lumen-vm",
+    "ktest:lumen_kernel::mm::frame::named_reservations_are_complete",
+    "ktest:lumen_kernel::mm::frame::refcount_and_cow_split",
+    "ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only",
+    "ktest:lumen_kernel::mm::user_vm::fork_copy_preserves_files_images_and_private_copies",
+]
+
+[[feature]]
+name = "A partially copied fork that exhausts physical frames releases the child's counted leaves and tables, leaving the parent reusable"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::mm::frame::fork_copy_out_of_frames_rolls_back"]

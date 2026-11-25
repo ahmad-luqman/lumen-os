@@ -314,7 +314,7 @@ mod tests {
     }
 
     fn anon(start: u64, end: u64, prot: Prot) -> Vma {
-        Vma { start, end, prot, backing: Backing::Anonymous }
+        Vma { start, end, prot, backing: Backing::Anonymous { shared: false } }
     }
 
     fn file(start: u64, end: u64, prot: Prot, offset: u64, shared: bool) -> Vma {
@@ -726,14 +726,19 @@ mod tests {
         // What the loader and `brk` leave: text, .data + .bss, a break grown
         // by a page and a half, a file mapping and the stack.
         let mut vmas = VmaMap::new();
-        vmas.map(MapPlace::Fixed(0x40_0000), 2 * P, RX, Backing::Anonymous).unwrap();
-        vmas.map(MapPlace::Fixed(0x40_2000), 2 * P, RW, Backing::Anonymous).unwrap();
+        vmas.map(MapPlace::Fixed(0x40_0000), 2 * P, RX, Backing::Anonymous { shared: false }).unwrap();
+        vmas.map(MapPlace::Fixed(0x40_2000), 2 * P, RW, Backing::Anonymous { shared: false }).unwrap();
         let mut brk = Brk::new(0x40_4000).unwrap();
         assert!(brk.set(&mut vmas, 0x40_5800).succeeded);
         let fm = FileMapping { file_id: 7, offset: 0x2000, shared: false, may_write: true };
         vmas.map_file(MapPlace::Fixed(0x7f00_0000_0000), P, Prot::READ, fm).unwrap();
-        vmas.map(MapPlace::Fixed(USER_STACK_BOTTOM), USER_STACK_TOP - USER_STACK_BOTTOM, RW, Backing::Anonymous)
-            .unwrap();
+        vmas.map(
+            MapPlace::Fixed(USER_STACK_BOTTOM),
+            USER_STACK_TOP - USER_STACK_BOTTOM,
+            RW,
+            Backing::Anonymous { shared: false },
+        )
+        .unwrap();
         let exe = FileInfo { major: 0, minor: 1, ino: 33, path: b"/bin/prog", deleted: false };
         let images = [
             ImageRange { start: 0x40_0000, end: 0x40_2000, offset: 0, file: exe },
