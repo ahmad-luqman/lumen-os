@@ -4,6 +4,8 @@ use super::*;
 
 /// Shared access leases cover descriptor-table operations and whole open
 /// reservations. An exclusive lease orders replacement after all of them.
+/// Nested shared leases are required: openat holds one while with_files
+/// may take another. Writers have no priority and can starve under readers.
 pub(super) struct FilesAccess {
     state: AtomicUsize,
     seq: AtomicU64,
@@ -16,7 +18,7 @@ impl FilesAccess {
         Self { state: AtomicUsize::new(0), seq: AtomicU64::new(0), waiters: sched::WaitQueue::new() }
     }
 
-    pub(super) fn acquire(&self, exclusive: bool) -> FilesAccessGuard<'_> {
+    fn acquire(&self, exclusive: bool) -> FilesAccessGuard<'_> {
         loop {
             let seen = self.seq.load(Ordering::SeqCst);
             let state = self.state.load(Ordering::Acquire);
@@ -38,7 +40,7 @@ impl FilesAccess {
         self.acquire(true)
     }
 
-    pub(super) fn release(&self, exclusive: bool) {
+    fn release(&self, exclusive: bool) {
         if exclusive {
             assert_eq!(self.state.swap(0, Ordering::AcqRel), FILES_EXCLUSIVE);
         } else {
@@ -90,21 +92,50 @@ impl Files {
         f(&mut self.table.lock())
     }
 
-    pub(super) fn reserve(self: &Arc<Self>, owner: Arc<Process>, from: i32) -> Result<ReservedFd, VfsError> {
+    pub(super) fn reserve(
+        self: &Arc<Self>,
+        access: FilesAccessGuard<'_>,
+        owner: Arc<Process>,
+        from: i32,
+    ) -> Result<ReservedFd, VfsError> {
         let reservation = self.table.lock().reserve(from)?;
-        Ok(ReservedFd { files: Arc::clone(self), owner, reservation: Some(reservation) })
+        assert!(!access.exclusive && core::ptr::eq(access.access, &owner.files_access));
+        let lease = FilesLease { owner };
+        // The owned lease takes over this reader count. Errors above drop
+        // the borrowed guard; ReservedFd always drops the owned lease.
+        core::mem::forget(access);
+        Ok(ReservedFd { files: Arc::clone(self), _lease: lease, reservation: Some(reservation) })
     }
 
     /// Another process shares it (C1's `clone(CLONE_FILES)`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`; C1's `clone` next
     pub(super) fn share(self: &Arc<Self>) -> Arc<Self> {
         let before = self.users.fetch_add(1, Ordering::AcqRel);
         assert_ne!(before, 0, "a descriptor table shared after its last user left");
         Arc::clone(self)
     }
 
+    /// Release the departing process's POSIX locks even when other users
+    /// keep this table. Snapshot descriptions under the leaf, then take inode
+    /// locks with no spinlock held. This is exit, not unshare_files.
+    pub(super) fn release_posix_for_pid(&self, pid: u32) {
+        if pid == 0 {
+            return;
+        } // an unlinked process never acquired locks
+        let files: Vec<_> = self.table.lock().iter_open().map(|(_, entry)| Arc::clone(&entry.file)).collect();
+        for file in files {
+            let mut freed = false;
+            let result = file.inode().with_locks_mut(&mut |locks| freed = locks.release_posix_for_pid(pid));
+            if let Err(error) = result {
+                log::error!(target: "linux", "pid {pid}: exit locks on {}: {error:?}", Escaped(&file.path));
+            }
+            if freed {
+                locks_released();
+            }
+        }
+    }
+
     /// Process `pid` stops sharing it: the last one closes every descriptor
-    /// (`release_fd`, outside every spinlock). Panics if no process shared
+    /// (FD references and flock, outside every spinlock). Panics if no process shared
     /// it. Takes inodes' locks: never call it holding a spinlock.
     pub(super) fn leave(self: Arc<Self>, pid: u32) {
         let before = self.users.fetch_sub(1, Ordering::AcqRel);
@@ -116,13 +147,13 @@ impl Files {
                 table.drain_all()
             };
             for entry in entries {
-                release_fd(pid, entry.file);
+                release_file(None, entry.file);
             }
         }
     }
 
     /// The processes sharing it.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`; C1's `fork` next
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2/C3 table unsharing
     pub fn users(&self) -> usize {
         self.users.load(Ordering::Acquire)
     }
@@ -202,9 +233,10 @@ impl FsInner {
 
 /// A slot kept in the exact `Files` table that reserved it. Any failed
 /// open cancels it on drop; installation consumes it. No table lock is
-/// held while the caller opens the file or copies user memory.
+/// held while the caller opens the file or copies user memory. Its owned
+/// shared files_access lease prevents table replacement until install/cancel.
 pub struct ReservedFd {
-    owner: Arc<Process>,
+    _lease: FilesLease,
     files: Arc<Files>,
     reservation: Option<FdReservation>,
 }
@@ -230,6 +262,16 @@ impl Drop for ReservedFd {
         if let Some(r) = self.reservation.take() {
             self.files.table.lock().cancel(r);
         }
+    }
+}
+
+/// Owns one shared access count independently of its creator's stack.
+struct FilesLease {
+    owner: Arc<Process>,
+}
+
+impl Drop for FilesLease {
+    fn drop(&mut self) {
         self.owner.files_access.release(false);
     }
 }

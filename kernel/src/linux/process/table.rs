@@ -81,7 +81,7 @@ impl ProcTable {
         let process = thread.process();
         let pid = self.tree.spawn_root(RusageSlot::new(process.usage_slot)).ok()?;
         process.set_pid(pid);
-        self.insert_thread(pid, thread);
+        self.insert_thread(pid, thread, Blocked::EMPTY);
         self.insert_process(pid, process);
         Some(pid)
     }
@@ -97,10 +97,11 @@ impl ProcTable {
         let child = thread.process();
         let pid = self.tree.fork(parent.process().pid(), RusageSlot::new(child.usage_slot)).map_err(tree_errno)?;
         child.set_pid(pid);
+        // PROCS is held and the child is unreachable until insert_process:
+        // no other thread can take its signal lock while we hold the parent's.
         child.inherit_signals(&signal);
         let blocked = signal.blocked(parent.tid());
-        self.insert_thread(pid, thread);
-        thread.set_blocked(blocked);
+        self.insert_thread(pid, thread, blocked);
         self.insert_process(pid, child);
         Ok(pid)
     }
@@ -112,7 +113,7 @@ impl ProcTable {
     pub(super) fn link_thread(&mut self, thread: &Arc<UserThread>) -> Result<u32, lumen_proc::Error> {
         let pid = thread.process().pid();
         let tid = self.tree.add_thread(pid)?;
-        self.insert_thread(tid, thread);
+        self.insert_thread(tid, thread, Blocked::EMPTY);
         Ok(tid)
     }
 
@@ -124,9 +125,9 @@ impl ProcTable {
 
     /// Give `thread` tid `tid` and put it in `threads` and in its process's
     /// signal state (`Process::signal` under `PROCS`, section 9's order).
-    pub(super) fn insert_thread(&mut self, tid: u32, thread: &Arc<UserThread>) {
+    pub(super) fn insert_thread(&mut self, tid: u32, thread: &Arc<UserThread>, blocked: Blocked) {
         thread.set_tid(tid);
-        thread.process().signal.lock().add_thread(tid, ThreadSignals::new(Blocked::EMPTY));
+        thread.process().signal.lock().add_thread(tid, ThreadSignals::new(blocked));
         let displaced = self.threads.insert(tid, Arc::clone(thread));
         assert!(displaced.is_none(), "tid {tid} handed out while in PROCS");
     }
@@ -153,11 +154,11 @@ impl ProcTable {
     }
 
     /// `pid`, in `procs` with no thread left (asserted), ends with `status`
-    /// in the tree, its children going to pid 1, and every action B1 can
-    /// reach carried out: the processes that left `PROCS` (a root, a child
+    /// in the tree, its children going to pid 1. Notify publishes child_changed;
+    /// the return value holds the processes that left `PROCS` (a root, a child
     /// of an autoreaping parent, and their released zombies), for the
     /// caller to drop with `PROCS` released. A process whose zombie waits
-    /// for its parent's wait (C1) stays. `NoMem` (nothing changed) if the
+    /// for its parent's wait stays. `NoMem` (nothing changed) if the
     /// heap refuses the tree's reservations or room for that list.
     pub(super) fn exit_in_tree(&mut self, pid: u32, status: ExitStatus) -> Result<Vec<Arc<Process>>, ExitError> {
         assert!(self.procs.contains_key(&pid), "pid {pid} exits while not in PROCS");

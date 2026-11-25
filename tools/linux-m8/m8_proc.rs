@@ -36,34 +36,96 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
 use common::{R, eq, ok, sys};
 use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
+const SYS_OPEN: u64 = 2;
+const SYS_CLOSE: u64 = 3;
+const SYS_POLL: u64 = 7;
+const SYS_MMAP: u64 = 9;
+const SYS_MUNMAP: u64 = 11;
+const SYS_RT_SIGACTION: u64 = 13;
+const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_GETPID: u64 = 39;
+const SYS_CLONE: u64 = 56;
+const SYS_FORK: u64 = 57;
+const SYS_VFORK: u64 = 58;
+const SYS_EXIT: u64 = 60;
+const SYS_WAIT4: u64 = 61;
+const SYS_FCNTL: u64 = 72;
+const SYS_GETCWD: u64 = 79;
+const SYS_CHDIR: u64 = 80;
+const SYS_UMASK: u64 = 95;
+const SYS_GETPPID: u64 = 110;
+const SYS_ARCH_PRCTL: u64 = 158;
+const SYS_GETTID: u64 = 186;
+const SYS_EXIT_GROUP: u64 = 231;
+const SYS_WAITID: u64 = 247;
+const SIGCHLD: u64 = 17;
+const CLONE_VM: u64 = 0x100;
+const CLONE_FS: u64 = 0x200;
+const CLONE_FILES: u64 = 0x400;
+const CLONE_SIGHAND: u64 = 0x800;
+const CLONE_PIDFD: u64 = 0x1000;
+const CLONE_VFORK: u64 = 0x4000;
+const CLONE_PARENT: u64 = 0x8000;
+const CLONE_THREAD: u64 = 0x10000;
+const CLONE_SETTLS: u64 = 0x80000;
+const CLONE_PARENT_SETTID: u64 = 0x100000;
+const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+const CLONE_CHILD_SETTID: u64 = 0x1000000;
+const CLONE_PTHREAD: u64 = 0x7d0f00;
+const SPAWN_FLAGS: u64 = CLONE_VM | CLONE_VFORK | SIGCHLD;
+const WNOHANG: u64 = 1;
+const WEXITED: u64 = 4;
+const WNOWAIT: u64 = 0x01000000;
+const P_ALL: u64 = 0;
+const P_PID: u64 = 1;
+const EPERM: i64 = 1;
+const ENOENT: i64 = 2;
+const EBADF: i64 = 9;
+const ECHILD: i64 = 10;
+const EFAULT: i64 = 14;
+const EINVAL: i64 = 22;
+const ENOSYS: i64 = 38;
+const F_GETFD: u64 = 1;
+const ARCH_GET_FS: u64 = 0x1003;
+
 fn exit(code: u64) -> ! {
-    sys(60, [code, 0, 0, 0, 0, 0]);
+    sys(SYS_EXIT, [code, 0, 0, 0, 0, 0]);
     panic!("exit returned")
 }
 
 fn fork() -> Result<i64, common::Fail> {
-    ok("fork", sys(57, [0; 6]))
+    ok("fork", sys(SYS_FORK, [0; 6]))
 }
 
 fn wait(pid: i64, code: i64) -> R {
     let mut status = -1i32;
-    eq("wait pid", sys(61, [pid as u64, &mut status as *mut _ as u64, 0, 0, 0, 0]), pid)?;
+    eq("wait pid", sys(SYS_WAIT4, [pid as u64, &mut status as *mut _ as u64, 0, 0, 0, 0]), pid)?;
     eq("exit status word", i64::from(status), (code & 255) << 8)
 }
 
+/// Fork a child that exits with code, leaving its pid for the caller to wait.
+fn child_exits(code: u64) -> Result<i64, common::Fail> {
+    let pid = fork()?;
+    if pid == 0 {
+        exit(code);
+    }
+    Ok(pid)
+}
+
+fn gone(pid: i64) -> R {
+    eq("child is reaped", sys(SYS_WAIT4, [pid as u64, 0, WNOHANG, 0, 0, 0]), -ECHILD)
+}
+
 fn statuses() -> R {
-    eq("no children", sys(61, [u64::MAX, 0, 0, 0, 0, 0]), -10)?;
+    eq("no children", sys(SYS_WAIT4, [u64::MAX, 0, 0, 0, 0, 0]), -ECHILD)?;
     for code in [0, 1, 42, 127, 255, 256, 511] {
-        let pid = fork()?;
-        if pid == 0 {
-            exit(code as u64);
-        }
+        let pid = child_exits(code as u64)?;
         wait(pid, code)?;
-        eq("already reaped", sys(61, [pid as u64, 0, 1, 0, 0, 0]), -10)?;
+        gone(pid)?;
     }
     let pid = fork()?;
     if pid == 0 {
-        sys(231, [29, 0, 0, 0, 0, 0]);
+        sys(SYS_EXIT_GROUP, [29, 0, 0, 0, 0, 0]);
         exit(99);
     }
     wait(pid, 29)
@@ -72,7 +134,7 @@ fn statuses() -> R {
 struct Shared(u64);
 impl Shared {
     fn new() -> Result<Self, common::Fail> {
-        let ptr = ok("shared mmap", sys(9, [0, 4096, 3, 0x21, u64::MAX, 0]))? as u64;
+        let ptr = ok("shared mmap", sys(SYS_MMAP, [0, 4096, 3, 0x21, u64::MAX, 0]))? as u64;
         let shared = Self(ptr);
         for i in 0..8 {
             shared.word(i).store(0, SeqCst);
@@ -91,13 +153,13 @@ impl Shared {
             if value != 0 {
                 return value;
             }
-            sys(7, [0, 0, 1, 0, 0, 0]);
+            sys(SYS_POLL, [0, 0, 1, 0, 0, 0]);
         }
     }
 }
 impl Drop for Shared {
     fn drop(&mut self) {
-        sys(11, [self.0, 4096, 0, 0, 0, 0]);
+        sys(SYS_MUNMAP, [self.0, 4096, 0, 0, 0, 0]);
     }
 }
 
@@ -109,28 +171,40 @@ fn nohang() -> R {
         exit(73);
     }
     let mut status = 0x1234i32;
-    let ret = sys(61, [pid as u64, &mut status as *mut _ as u64, 1, 0, 0, 0]);
+    let ret = sys(SYS_WAIT4, [pid as u64, &mut status as *mut _ as u64, WNOHANG, 0, 0, 0]);
     let mut info = [0x55i32; 32];
-    let idret = sys(247, [1, pid as u64, info.as_mut_ptr() as u64, 5, 0, 0]);
+    let idret = sys(SYS_WAITID, [P_PID, pid as u64, info.as_mut_ptr() as u64, WNOHANG | WEXITED, 0, 0]);
     shared.word(0).store(1, SeqCst);
     wait(pid, 73)?;
     eq("WNOHANG live child", ret, 0)?;
     eq("WNOHANG leaves status", i64::from(status), 0x1234)?;
     eq("waitid WNOHANG", idret, 0)?;
-    for i in [0, 1, 2, 4, 5, 6] {
-        eq("waitid zero field", i64::from(info[i]), 0)?;
+    check_empty_info(&info)?;
+    info.fill(0x55);
+    eq("waitid ECHILD", sys(SYS_WAITID, [P_PID, pid as u64, info.as_mut_ptr() as u64, WEXITED, 0, 0]), -ECHILD)?;
+    check_empty_info(&info)
+}
+
+fn check_empty_info(info: &[i32; 32]) -> R {
+    for (i, word) in info.iter().enumerate() {
+        eq(
+            "waitid fields and untouched padding",
+            i64::from(*word),
+            if [0, 1, 2, 4, 5, 6].contains(&i) { 0 } else { 0x55 },
+        )?;
     }
     Ok(())
 }
 
 fn zombie() -> R {
-    let pid = fork()?;
-    if pid == 0 {
-        exit(87);
-    }
+    let pid = child_exits(87)?;
     for _ in 0..2 {
         let mut info = [0i32; 32];
-        eq("waitid WNOWAIT", sys(247, [1, pid as u64, info.as_mut_ptr() as u64, 0x01000004, 0, 0]), 0)?;
+        eq(
+            "waitid WNOWAIT",
+            sys(SYS_WAITID, [P_PID, pid as u64, info.as_mut_ptr() as u64, WNOWAIT | WEXITED, 0, 0]),
+            0,
+        )?;
         eq("si_signo", i64::from(info[0]), 17)?;
         eq("si_code", i64::from(info[2]), 1)?;
         eq("si_pid", i64::from(info[4]), pid)?;
@@ -138,43 +212,35 @@ fn zombie() -> R {
         eq("si_status", i64::from(info[6]), 87)?;
     }
     wait(pid, 87)?;
-    let pid = fork()?;
-    if pid == 0 {
-        exit(44);
-    }
+    let pid = child_exits(44)?;
     let mut info = [0i32; 32];
-    eq("waitid reap", sys(247, [1, pid as u64, info.as_mut_ptr() as u64, 4, 0, 0]), 0)?;
+    eq("waitid reap", sys(SYS_WAITID, [P_PID, pid as u64, info.as_mut_ptr() as u64, WEXITED, 0, 0]), 0)?;
     eq("waitid reaped status", i64::from(info[6]), 44)?;
-    eq("waitid removed zombie", sys(61, [pid as u64, 0, 0, 0, 0, 0]), -10)
+    gone(pid)
 }
 
 fn copyout_fault() -> R {
-    let pid = fork()?;
-    if pid == 0 {
-        exit(12);
-    }
-    eq("wait4 bad pointer", sys(61, [pid as u64, 1, 0, 0, 0, 0]), -14)?;
-    eq("EFAULT still reaps", sys(61, [pid as u64, 0, 0, 0, 0, 0]), -10)?;
-    let pid = fork()?;
-    if pid == 0 {
-        exit(13);
-    }
-    eq("waitid bad pointer", sys(247, [1, pid as u64, 1, 4, 0, 0]), -14)?;
-    eq("waitid EFAULT still reaps", sys(61, [pid as u64, 0, 0, 0, 0, 0]), -10)
+    let pid = child_exits(12)?;
+    eq("wait4 bad pointer", sys(SYS_WAIT4, [pid as u64, 1, 0, 0, 0, 0]), -EFAULT)?;
+    gone(pid)?;
+    let pid = child_exits(13)?;
+    eq("waitid bad pointer", sys(SYS_WAITID, [P_PID, pid as u64, 1, WEXITED, 0, 0]), -EFAULT)?;
+    gone(pid)
 }
 
 fn autoreap() -> R {
     for (handler, flags) in [(1u64, 0u64), (0, 2)] {
         let action = [handler, flags, 0, 0];
         let mut old = [0u64; 4];
-        eq("SIGCHLD disposition", sys(13, [17, action.as_ptr() as u64, old.as_mut_ptr() as u64, 8, 0, 0]), 0)?;
-        let pid = fork()?;
-        if pid == 0 {
-            exit(33);
-        }
-        let ret = sys(61, [pid as u64, 0, 0, 0, 0, 0]);
-        eq("restore SIGCHLD", sys(13, [17, old.as_ptr() as u64, 0, 8, 0, 0]), 0)?;
-        eq("automatic reap", ret, -10)?;
+        eq(
+            "SIGCHLD disposition",
+            sys(SYS_RT_SIGACTION, [SIGCHLD, action.as_ptr() as u64, old.as_mut_ptr() as u64, 8, 0, 0]),
+            0,
+        )?;
+        let pid = child_exits(33)?;
+        let ret = sys(SYS_WAIT4, [pid as u64, 0, 0, 0, 0, 0]);
+        eq("restore SIGCHLD", sys(SYS_RT_SIGACTION, [SIGCHLD, old.as_ptr() as u64, 0, 8, 0, 0]), 0)?;
+        eq("automatic reap", ret, -ECHILD)?;
     }
     Ok(())
 }
@@ -189,20 +255,49 @@ fn orphan() -> R {
         };
         if grandchild == 0 {
             // Force a positive control before allowing our parent to exit.
-            let parent = sys(110, [0; 6]);
+            let parent = sys(SYS_GETPPID, [0; 6]);
             shared.word(0).store(parent as u32, SeqCst);
-            while sys(110, [0; 6]) != 1 {
-                sys(7, [0, 0, 1, 0, 0, 0]);
-            }
-            shared.word(1).store(1, SeqCst);
+            shared.until(2);
+            shared.word(1).store((sys(SYS_GETPPID, [0; 6]) + 1) as u32, SeqCst);
             exit(0);
         }
+        shared.word(3).store(grandchild as u32, SeqCst);
         shared.until(0);
         exit(21);
     }
     wait(pid, 21)?;
+    shared.word(2).store(1, SeqCst);
+    let parent = shared.until(1);
+    eq("orphan parent plus one is init plus one", i64::from(parent), 2)?;
+    let grandchild = shared.word(3).load(SeqCst);
+    // Wait for init to remove the orphan before the root's exact frame count.
+    // Only the scenario's outer hang guard applies; this isn't a time bound.
+    let mut path = [0u8; 32];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut digits = [0u8; 10];
+    let (mut n, mut count) = (grandchild, 0);
+    loop {
+        digits[count] = b'0' + (n % 10) as u8;
+        count += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in 0..count {
+        path[6 + i] = digits[count - 1 - i];
+    }
+    loop {
+        let fd = sys(SYS_OPEN, [path.as_ptr() as u64, 0, 0, 0, 0, 0]);
+        if fd == -ENOENT {
+            break;
+        }
+        let fd = ok("orphan proc lookup", fd)?;
+        sys(SYS_CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+        sys(SYS_POLL, [0, 0, 1, 0, 0, 0]);
+    }
     eq("original parent", i64::from(shared.word(0).load(SeqCst)), pid)?;
-    eq("orphan parent is init", i64::from(shared.until(1)), 1)
+    Ok(())
 }
 
 /// The shared-stack child never enters Rust or returns into the parent's
@@ -216,9 +311,12 @@ fn shared_clone(nr: u64, flags: u64, stack: u64, word: &AtomicU32) -> i64 {
             "syscall", "test rax, rax", "jnz 2f",
             // Block once before publishing completion, so an incorrectly
             // unblocked parent observes the missing child result.
-            "mov eax, 7", "xor edi, edi", "xor esi, esi", "mov edx, 1", "syscall",
-            "mov eax, 39", "syscall", "mov [r9], eax",
-            "mov edi, 41", "mov eax, 60", "syscall", "ud2", "2:",
+            "mov eax, {sys_poll}", "xor edi, edi", "xor esi, esi", "mov edx, 1", "syscall",
+            "mov eax, {sys_getpid}", "syscall", "mov [r9], eax",
+            "mov edi, 41", "mov eax, {sys_exit}", "syscall", "ud2", "2:",
+            sys_poll = const SYS_POLL,
+            sys_getpid = const SYS_GETPID,
+            sys_exit = const SYS_EXIT,
             inlateout("rax") nr => ret, in("rdi") flags,
             in("rsi") stack, in("rdx") 0u64, in("r10") 0u64,
             in("r8") 0u64, in("r9") word as *const _ as u64,
@@ -230,9 +328,9 @@ fn shared_clone(nr: u64, flags: u64, stack: u64, word: &AtomicU32) -> i64 {
 
 fn vforks() -> R {
     let shared = Shared::new()?;
-    for nr in [56, 58] {
+    for nr in [SYS_CLONE, SYS_VFORK] {
         shared.word(0).store(0, SeqCst);
-        let pid = ok("vfork/clone", shared_clone(nr, 0x4111, 0, shared.word(0)))?;
+        let pid = ok("vfork/clone", shared_clone(nr, SPAWN_FLAGS, 0, shared.word(0)))?;
         let seen = shared.word(0).load(SeqCst);
         wait(pid, 41)?;
         eq("child completed before parent returned", i64::from(seen), pid)?;
@@ -246,13 +344,13 @@ fn clone_tids() -> R {
     // is visible to the parent before the syscall returns.
     let mut parent_tid = 0u32;
     let mut child_tid = 0u32;
-    let flags = 17 | 0x100000 | 0x1000000;
+    let flags = SIGCHLD | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID;
     let pid = ok(
         "clone tid flags",
-        sys(56, [flags, 0, &mut parent_tid as *mut _ as u64, &mut child_tid as *mut _ as u64, 0, 0]),
+        sys(SYS_CLONE, [flags, 0, &mut parent_tid as *mut _ as u64, &mut child_tid as *mut _ as u64, 0, 0]),
     )?;
     if pid == 0 {
-        let tid = sys(186, [0; 6]);
+        let tid = sys(SYS_GETTID, [0; 6]);
         shared.word(0).store(child_tid, SeqCst);
         exit(if child_tid as i64 == tid { 0 } else { 99 });
     }
@@ -262,33 +360,51 @@ fn clone_tids() -> R {
     eq("private child tid store", i64::from(child_tid), 0)?;
     // The same word with a shared mm is set in the child and cleared at
     // exit. The assembly child never touches the parent's stack.
-    let flags = 0x4111 | 0x1000000 | 0x200000;
+    let flags = SPAWN_FLAGS | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
     let ret: i64;
     shared.word(1).store(123, SeqCst);
     // SAFETY: child_tid is mapped and aligned; the child immediately exits
     // in assembly, without returning into this shared Rust stack.
     unsafe {
         core::arch::asm!("syscall", "test rax, rax", "jnz 2f",
-            "mov eax, [r10]", "mov [r9], eax", "mov eax, 60", "xor edi, edi", "syscall", "ud2", "2:",
-            inlateout("rax") 56u64 => ret, in("rdi") flags, in("rsi") 0u64,
+            "mov eax, [r10]", "mov [r9], eax", "mov eax, {sys_exit}", "xor edi, edi", "syscall", "ud2", "2:",
+            sys_exit = const SYS_EXIT,
+            inlateout("rax") SYS_CLONE => ret, in("rdi") flags, in("rsi") 0u64,
             in("rdx") 0u64, in("r10") shared.word(1) as *const _ as u64,
             in("r8") 0u64, in("r9") shared.word(2) as *const _ as u64,
             lateout("rcx") _, lateout("r11") _, options(nostack));
     }
     let pid = ok("clone clear tid", ret)?;
+    let cleared = shared.word(1).load(SeqCst);
     wait(pid, 0)?;
     eq("shared set tid before entry", i64::from(shared.word(2).load(SeqCst)), pid)?;
-    eq("shared clear tid at exit", i64::from(shared.word(1).load(SeqCst)), 0)
+    eq("shared clear tid before vfork release", i64::from(cleared), 0)
 }
 
 fn rejected_flags() -> R {
-    for flags in [0, 9, 17 | 0x1000, 17 | 0x8000, 17 | 0x10000, 17 | 0x800, 17 | 0x900, 17 | (1 << 32), 17 | (1 << 33)]
-    {
-        eq("invalid clone flags", sys(56, [flags, 0, 0, 0, 0, 0]), -22)?;
+    for flags in [
+        0,
+        9,
+        SIGCHLD | CLONE_PIDFD,
+        SIGCHLD | CLONE_PARENT,
+        SIGCHLD | CLONE_THREAD,
+        SIGCHLD | CLONE_SIGHAND,
+        SIGCHLD | (CLONE_VM | CLONE_SIGHAND),
+    ] {
+        eq("invalid clone flags", sys(SYS_CLONE, [flags, 0, 0, 0, 0, 0]), -EINVAL)?;
     }
-    eq("invalid TLS", sys(56, [17 | 0x80000, 0, 0, 0, 1 << 63, 0]), -1)?;
-    eq("wait4 invalid options", sys(61, [u64::MAX, 0, 4, 0, 0, 0]), -22)?;
-    eq("waitid no event options", sys(247, [0, 0, 0, 1, 0, 0]), -22)
+    for high in [1 << 32, 1 << 33] {
+        let pid = ok("legacy clone ignores high flag bits", sys(SYS_CLONE, [SIGCHLD | high, 0, 0, 0, 0, 0]))?;
+        if pid == 0 {
+            exit(0);
+        }
+        wait(pid, 0)?;
+        gone(pid)?;
+    }
+    eq("thread clone belongs to C3", sys(SYS_CLONE, [CLONE_PTHREAD, 0, 0, 0, 0, 0]), -ENOSYS)?;
+    eq("invalid TLS", sys(SYS_CLONE, [SIGCHLD | CLONE_SETTLS, 0, 0, 0, 1 << 63, 0]), -EPERM)?;
+    eq("wait4 invalid options", sys(SYS_WAIT4, [u64::MAX, 0, WEXITED, 0, 0, 0]), -EINVAL)?;
+    eq("waitid no event options", sys(SYS_WAITID, [P_ALL, 0, 0, WNOHANG, 0, 0]), -EINVAL)
 }
 
 fn fork_wait() -> c_int {
@@ -311,34 +427,40 @@ fn fork_wait() -> c_int {
 
 fn clone_shared_resources() -> R {
     for share in [false, true] {
-        let old_mask = sys(95, [0o027, 0, 0, 0, 0, 0]);
-        let fd = ok("open clone descriptor", sys(2, [c"/dev/null".as_ptr() as u64, 0, 0, 0, 0, 0]))?;
-        let flags = 0x4111 | if share { 0x600 } else { 0 };
+        let old_mask = sys(SYS_UMASK, [0o027, 0, 0, 0, 0, 0]);
+        let fd = ok("open clone descriptor", sys(SYS_OPEN, [c"/dev/null".as_ptr() as u64, 0, 0, 0, 0, 0]))?;
+        let flags = SPAWN_FLAGS | if share { CLONE_FS | CLONE_FILES } else { 0 };
         let pid: i64;
         // SAFETY: the vfork child touches no Rust stack, closes its fd and
         // changes its umask through raw syscalls, then exits in assembly.
         unsafe {
             core::arch::asm!("syscall", "test rax, rax", "jnz 2f",
-                "mov eax, 3", "mov rdi, r9", "syscall",
-                "mov eax, 95", "mov edi, 0x3f", "syscall",
-                "mov eax, 60", "xor edi, edi", "syscall", "ud2", "2:",
-                inlateout("rax") 56u64 => pid, in("rdi") flags,
+                "mov eax, {sys_close}", "mov rdi, r9", "syscall",
+                "mov eax, {sys_umask}", "mov edi, 0x3f", "syscall",
+                "mov eax, {sys_exit}", "xor edi, edi", "syscall", "ud2", "2:",
+                sys_close = const SYS_CLOSE,
+                sys_exit = const SYS_EXIT,
+                sys_umask = const SYS_UMASK,
+                inlateout("rax") SYS_CLONE => pid, in("rdi") flags,
                 in("rsi") 0u64, in("rdx") 0u64, in("r10") 0u64,
                 in("r8") 0u64, in("r9") fd,
                 lateout("rcx") _, lateout("r11") _, options(nostack));
         }
         let pid = ok("clone resources", pid)?;
         wait(pid, 0)?;
-        let descriptor = sys(72, [fd as u64, 1, 0, 0, 0, 0]);
-        let mask = sys(95, [old_mask as u64, 0, 0, 0, 0, 0]);
+        let descriptor = sys(SYS_FCNTL, [fd as u64, F_GETFD, 0, 0, 0, 0]);
+        let mask = sys(SYS_UMASK, [old_mask as u64, 0, 0, 0, 0, 0]);
         if descriptor >= 0 {
-            sys(3, [fd as u64, 0, 0, 0, 0, 0]);
+            sys(SYS_CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
         }
-        eq("CLONE_FILES shares closes", descriptor, if share { -9 } else { 0 })?;
+        eq("CLONE_FILES shares closes", descriptor, if share { -EBADF } else { 0 })?;
         eq("CLONE_FS shares umask", mask, if share { 0o077 } else { 0o027 })?;
     }
     // Tid copy faults do not turn a successful clone into EFAULT.
-    let pid = ok("clone faulting tids", sys(56, [17 | 0x1100000, 0, 1, 1, 0, 0]))?;
+    let pid = ok(
+        "clone faulting tids",
+        sys(SYS_CLONE, [SIGCHLD | (CLONE_PARENT_SETTID | CLONE_CHILD_SETTID), 0, 1, 1, 0, 0]),
+    )?;
     if pid == 0 {
         exit(55);
     }
@@ -350,32 +472,40 @@ fn fork_inherited_state() -> R {
     let mut old_action = [0u64; 4];
     let mask = 1u64 << 9; // SIGUSR1
     let mut old_mask = 0u64;
-    eq("set inherited action", sys(13, [10, action.as_ptr() as u64, old_action.as_mut_ptr() as u64, 8, 0, 0]), 0)?;
-    eq("set inherited mask", sys(14, [2, &mask as *const _ as u64, &mut old_mask as *mut _ as u64, 8, 0, 0]), 0)?;
-    eq("set inherited cwd", sys(80, [c"/tmp".as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
+    eq(
+        "set inherited action",
+        sys(SYS_RT_SIGACTION, [10, action.as_ptr() as u64, old_action.as_mut_ptr() as u64, 8, 0, 0]),
+        0,
+    )?;
+    eq(
+        "set inherited mask",
+        sys(SYS_RT_SIGPROCMASK, [2, &mask as *const _ as u64, &mut old_mask as *mut _ as u64, 8, 0, 0]),
+        0,
+    )?;
+    eq("set inherited cwd", sys(SYS_CHDIR, [c"/tmp".as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
     let pid = fork()?;
     if pid == 0 {
         let mut seen_action = [0u64; 4];
         let mut seen_mask = 0u64;
         let mut cwd = [0u8; 16];
-        let a = sys(13, [10, 0, seen_action.as_mut_ptr() as u64, 8, 0, 0]);
-        let m = sys(14, [2, 0, &mut seen_mask as *mut _ as u64, 8, 0, 0]);
-        let c = sys(79, [cwd.as_mut_ptr() as u64, cwd.len() as u64, 0, 0, 0, 0]);
+        let a = sys(SYS_RT_SIGACTION, [10, 0, seen_action.as_mut_ptr() as u64, 8, 0, 0]);
+        let m = sys(SYS_RT_SIGPROCMASK, [2, 0, &mut seen_mask as *mut _ as u64, 8, 0, 0]);
+        let c = sys(SYS_GETCWD, [cwd.as_mut_ptr() as u64, cwd.len() as u64, 0, 0, 0, 0]);
         exit(if a == 0 && m == 0 && seen_action == action && seen_mask == mask && c == 5 && &cwd[..5] == b"/tmp\0" {
             0
         } else {
             99
         });
     }
-    eq("restore cwd", sys(80, [c"/".as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
-    eq("restore action", sys(13, [10, old_action.as_ptr() as u64, 0, 8, 0, 0]), 0)?;
-    eq("restore mask", sys(14, [2, &old_mask as *const _ as u64, 0, 8, 0, 0]), 0)?;
+    eq("restore cwd", sys(SYS_CHDIR, [c"/".as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
+    eq("restore action", sys(SYS_RT_SIGACTION, [10, old_action.as_ptr() as u64, 0, 8, 0, 0]), 0)?;
+    eq("restore mask", sys(SYS_RT_SIGPROCMASK, [2, &old_mask as *const _ as u64, 0, 8, 0, 0]), 0)?;
     wait(pid, 0)
 }
 
 fn fork_context() -> R {
     let mut fs_before = 0u64;
-    eq("read parent TLS", sys(158, [0x1003, &mut fs_before as *mut _ as u64, 0, 0, 0, 0]), 0)?;
+    eq("read parent TLS", sys(SYS_ARCH_PRCTL, [ARCH_GET_FS, &mut fs_before as *mut _ as u64, 0, 0, 0, 0]), 0)?;
     let mut private = 17u64;
     let pid: i64;
     let simd: u64;
@@ -385,13 +515,13 @@ fn fork_context() -> R {
     // own copied stack; all modified registers are declared to the compiler.
     unsafe {
         core::arch::asm!("movq xmm15, r9", "syscall", "movq r8, xmm15",
-            inlateout("rax") 57u64 => pid, in("r9") MARKER,
+            inlateout("rax") SYS_FORK => pid, in("r9") MARKER,
             inlateout("r15") MARKER => preserved, lateout("r8") simd,
             lateout("xmm15") _, lateout("rcx") _, lateout("r11") _, options(nostack));
     }
     let pid = ok("context fork", pid)?;
     let mut fs_after = 0u64;
-    let got_fs = sys(158, [0x1003, &mut fs_after as *mut _ as u64, 0, 0, 0, 0]);
+    let got_fs = sys(SYS_ARCH_PRCTL, [ARCH_GET_FS, &mut fs_after as *mut _ as u64, 0, 0, 0, 0]);
     if pid == 0 {
         // SAFETY: private is this child's live stack variable; volatile
         // prevents the compiler from replacing the memory check with a constant.
@@ -416,9 +546,11 @@ fn clone_stack_tls() -> R {
     // the child uses only assembly and raw syscalls with its temporary TLS.
     unsafe {
         core::arch::asm!("syscall", "test rax, rax", "jnz 2f",
-            "mov [r9], rsp", "mov eax, 158", "mov edi, 0x1003", "lea rsi, [r9+8]", "syscall",
-            "mov eax, 60", "xor edi, edi", "syscall", "ud2", "2:",
-            inlateout("rax") 56u64 => pid, in("rdi") 0x84111u64,
+            "mov [r9], rsp", "mov eax, {sys_arch_prctl}", "mov edi, 0x1003", "lea rsi, [r9+8]", "syscall",
+            "mov eax, {sys_exit}", "xor edi, edi", "syscall", "ud2", "2:",
+            sys_exit = const SYS_EXIT,
+            sys_arch_prctl = const SYS_ARCH_PRCTL,
+            inlateout("rax") SYS_CLONE => pid, in("rdi") (SPAWN_FLAGS | CLONE_SETTLS),
             in("rsi") stack, in("rdx") 0u64, in("r10") 0u64,
             in("r8") tls, in("r9") page.0,
             lateout("rcx") _, lateout("r11") _, options(nostack));
@@ -430,11 +562,21 @@ fn clone_stack_tls() -> R {
     let (seen_stack, seen_tls) = unsafe { ((page.0 as *const u64).read(), ((page.0 + 8) as *const u64).read()) };
     eq("child stack", seen_stack as i64, stack as i64)?;
     eq("child TLS", seen_tls as i64, tls as i64)?;
-    let pid = ok("clone noncanonical stack", sys(56, [17, 1 << 63, 0, 0, 0, 0]))?;
-    if pid == 0 {
-        exit(99);
+    let pid: i64;
+    // SAFETY: the child touches only the mapped marker, then exits without
+    // any stack reference. It never returns into this parent's Rust frame.
+    unsafe {
+        core::arch::asm!("syscall", "test rax, rax", "jnz 2f",
+            "mov dword ptr [r9], 1", "mov eax, {sys_exit}", "xor edi, edi", "syscall", "ud2", "2:",
+            sys_exit = const SYS_EXIT,
+            inlateout("rax") SYS_CLONE => pid, in("rdi") SPAWN_FLAGS,
+            in("rsi") 1u64 << 63, in("rdx") 0u64, in("r10") 0u64,
+            in("r8") 0u64, in("r9") page.word(4) as *const _ as u64,
+            lateout("rcx") _, lateout("r11") _, options(nostack));
     }
+    let pid = ok("clone noncanonical stack", pid)?;
     let mut status = 0i32;
-    eq("wait bad stack child", sys(61, [pid as u64, &mut status as *mut _ as u64, 0, 0, 0, 0]), pid)?;
-    eq("bad stack is child SIGBUS without core", i64::from(status), 7)
+    eq("wait bad stack child", sys(SYS_WAIT4, [pid as u64, &mut status as *mut _ as u64, 0, 0, 0, 0]), pid)?;
+    eq("noncanonical RSP reached ring 3", i64::from(page.word(4).load(SeqCst)), 1)?;
+    eq("noncanonical RSP permits a stackless exit", i64::from(status), 0)
 }

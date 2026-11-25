@@ -31,3 +31,8 @@ tests = [
     "ktest:lumen_kernel::linux::process::replace_mm_keeps_process_and_thread_in_agreement",
     "ktest:lumen_kernel::linux::process::wait_child_interrupts_and_wakes_on_exit",
 ]
+
+[[feature]]
+name = "CLONE_FILES exit releases the departing pid's POSIX record locks"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::shared_files_exit_releases_its_posix_locks"]

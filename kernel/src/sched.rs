@@ -220,8 +220,8 @@ struct UserThreadState {
     user_exit_rsp: AtomicU64,
     pending_debug_trap: AtomicBool,
     /// The Linux thread it runs ([`set_current_user_thread`]): `None` until
-    /// its process is registered (B1 sets it then; C1's `spawn_user_on` will
-    /// at spawn), after it is taken down, and for a ktest's
+    /// a root registers; fork children get it at spawn. None again after
+    /// takedown, and for a ktest's
     /// [`UserSpaceGuard`]. Read lock-free by its own thread
     /// ([`current_user_thread`]).
     linux: Option<Arc<UserThread>>,
@@ -454,7 +454,7 @@ impl Thread {
     /// Mark it as ending (a group kill, `de_thread`), also setting
     /// `sigpending`, before the [`kick`] that
     /// ends a killable wait. Never undone.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C1's and C3's group kills next
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C3's group kills next
     pub fn set_fatal_pending(&self) {
         self.set_sigpending();
         self.fatal_pending.store(true, Ordering::SeqCst);
@@ -1165,7 +1165,7 @@ pub fn set_current_fs_base(addr: u64) {
 }
 
 /// Replace the current thread's address space and load its root atomically.
-/// Process::replace_mm is the only Linux caller: it updates the process's
+/// process::replace_current_mm is the only Linux caller: it updates the process's
 /// matching reference before re-enabling interrupts, then retires the old mm.
 pub(crate) fn replace_user_space(space: Arc<AddressSpace>) -> Arc<AddressSpace> {
     let _irq = arch::irq::push_off();
@@ -1174,8 +1174,9 @@ pub(crate) fn replace_user_space(space: Arc<AddressSpace>) -> Arc<AddressSpace> 
     // SAFETY: only the current thread accesses its slot, with interrupts off.
     let user = unsafe { &mut *(*t).user.slot() }.as_mut().expect("user thread");
     let old = core::mem::replace(&mut user.address_space, space);
-    // SAFETY: the new space owns its root and shares all kernel mappings.
-    unsafe { arch::paging::write_cr3(user.address_space.root().as_u64()) };
+    // SAFETY: interrupts are off; user keeps the new space alive until its
+    // next switch/detach, and old keeps the previously loaded space alive here.
+    unsafe { AddressSpace::switch_loaded(Some(&user.address_space)) };
     old
 }
 
@@ -1482,56 +1483,43 @@ pub fn spawn_on(
     spawn_with(cpu, name.into(), STACK_SIZE, Box::new(f))
 }
 
-/// Initial user identity and TLS. Roots have no Linux identity until registration;
-/// fork children carry theirs before they are put on the run queue.
-pub struct UserStart {
-    space: Arc<AddressSpace>,
-    linux: Option<Arc<UserThread>>,
-    fs_base: u64,
-}
-
-impl From<Arc<AddressSpace>> for UserStart {
-    fn from(space: Arc<AddressSpace>) -> Self {
-        Self { space, linux: None, fs_base: 0 }
-    }
-}
-
-impl From<(Arc<AddressSpace>, Arc<UserThread>, u64)> for UserStart {
-    fn from((space, linux, fs_base): (Arc<AddressSpace>, Arc<UserThread>, u64)) -> Self {
-        Self { space, linux: Some(linux), fs_base }
-    }
-}
-
-/// Start a user thread pinned to CPU `cpu`. An address space alone starts
-/// a root with clean FPU state and zero TLS. A (space, UserThread, fs_base)
-/// tuple starts a fork child on the caller's CPU with inherited FPU state
-/// and its Linux identity installed before it becomes runnable.
-///
-/// A thread whose Linux process registered is detached and its space given
-/// up by that process's takedown (`linux::process::take_current`) before
-/// `f` returns. For one that registered none, when `f` returns,
-/// `thread_entry` detaches the address space (switching `CR3` back to
-/// `kernel_root()`) and calls `teardown()` with interrupts enabled if this
-/// thread holds the last reference.
+/// Start a pinned user thread on CPU `cpu`, with clean FPU state and zero TLS.
+/// Roots install their Linux identity at registration. Registered threads
+/// must call take_current before returning; an unregistered thread's state
+/// is detached by thread_entry. Fork children use spawn_fork_child instead;
+/// a cancelled fork child clears its identity and detaches before returning,
+/// leaving the creator to release its process-user count after joining.
 pub fn spawn_user_on(
     cpu: usize,
     name: impl Into<ThreadName>,
-    start: impl Into<UserStart>,
+    space: Arc<AddressSpace>,
     f: impl FnOnce() + Send + 'static,
 ) -> Result<JoinHandle, SpawnError> {
-    let start = start.into();
-    let mut state = UserThreadState::new(start.space);
-    if start.linux.is_some() {
-        assert_eq!(cpu, arch::cpu_index(), "fork children stay on their caller's CPU");
-        assert!(start.fs_base < arch::fpu::USER_MAX);
-        // The kernel never uses the FPU. Save the caller's live hardware
-        // state with preemption disabled, before the child can run.
+    spawn_with_user(cpu, name.into(), STACK_SIZE, Box::new(f), Some(UserThreadState::new(space)))
+}
+
+/// Spawn a fork child pinned to the caller's CPU with inherited FPU state,
+/// its Linux identity and TLS installed before enqueue. It starts behind
+/// the caller's gate; a cancelled child clears linux and detaches its space
+/// before returning, without giving up NewProcess's process-user count.
+pub(crate) fn spawn_fork_child(
+    name: impl Into<ThreadName>,
+    space: Arc<AddressSpace>,
+    linux: Arc<UserThread>,
+    fs_base: u64,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle, SpawnError> {
+    assert!(fs_base < arch::fpu::USER_MAX);
+    let mut state = UserThreadState::new(space);
+    {
+        // Kernel code never uses FPU registers. Save the caller's live
+        // state with preemption disabled before the child can run.
         let _irq = arch::irq::push_off();
         state.fpu.get_mut().save();
     }
-    state.fs_base.store(start.fs_base, Ordering::Relaxed);
-    state.linux = start.linux;
-    spawn_with_user(cpu, name.into(), STACK_SIZE, Box::new(f), Some(state))
+    state.fs_base.store(fs_base, Ordering::Relaxed);
+    state.linux = Some(linux);
+    spawn_with_user(arch::cpu_index(), name.into(), STACK_SIZE, Box::new(f), Some(state))
 }
 
 fn spawn_with(cpu: usize, name: ThreadName, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
@@ -1944,7 +1932,6 @@ enum WaitKind {
     Interruptible = 1,
     /// Only something that ends the thread (`fatal_pending`) ends it too
     /// ([`WaitQueue::wait_killable`], Linux's `TASK_KILLABLE`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C1's and C3's waits next
     Killable = 2,
 }
 
@@ -2034,7 +2021,6 @@ impl WaitQueue {
     /// the thread (`fatal_pending`: `SIGKILL`, the group's exit,
     /// `de_thread`) interrupts it, never a signal it would handle or ignore
     /// (Linux's `TASK_KILLABLE`).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C1's and C3's waits next
     pub fn wait_killable(&self, deadline: Option<u64>, ready: impl FnMut() -> bool) -> Wake {
         self.block(WaitKind::Killable, deadline, ready)
     }

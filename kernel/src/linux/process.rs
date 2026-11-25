@@ -21,15 +21,18 @@
 //!
 //! Lock discipline (ARCHITECTURE section 9, level 10): `PROCS`, then a
 //! `Process::signal`, then the leaves (a process's `mm`, `files`, `fs`,
-//! `exe_path`, `console` and `exit` slots, `Files::table`,
+//! `exe_path`, `console`, `exit` and `vfork_done` slots, `Files::table`,
 //! `FsState::inner`), never two leaves at once. All are IRQ-off
 //! [`SpinLock`]s: never held across `copy_from_user`, `copy_to_user`,
 //! blocking waits, or `AddressSpace` operations; nor across anything that
 //! takes a VFS lock (an open, `stat`, an inode's lock state): an open file
 //! or cwd leaves its lock as a clone or an extracted entry, used and
-//! dropped after.
+//! dropped after. `files_access` leases precede these locks and may sleep;
+//! never acquire a lease while holding a spinlock or with interrupts off.
 
+mod clone;
 mod files;
+pub(crate) use clone::{ProcessClone, clone_flags};
 mod signal;
 mod table;
 
@@ -232,6 +235,7 @@ pub struct Process {
     mm: SpinLock<Option<Arc<AddressSpace>>>,
     /// Its descriptors.
     files: SpinLock<Option<Arc<Files>>>,
+    /// Shared leases span fd operations/reservations; an exclusive lease orders table replacement.
     files_access: FilesAccess,
     /// Its working directory and umask.
     fs: SpinLock<Option<Arc<FsState>>>,
@@ -246,11 +250,14 @@ pub struct Process {
     /// M7's console state (until the console is a tty).
     console: SpinLock<ConsoleState>,
     allow_test_syscalls: bool,
-    /// How its run ended: the first [`UserExit`] recorded wins (C1 and C3
+    /// How its run ended: the first [`UserExit`] recorded wins (C3
     /// replace it with the group exit, `SignalState::group_exit`).
     exit: SpinLock<Option<UserExit>>,
+    /// Waiters for child state changes (wait4/waitid).
     child_events: sched::WaitQueue,
+    /// Published before a child-event wake to close the check/enqueue race.
     child_seq: AtomicU64,
+    /// Taken once when a vfork child releases its parent.
     vfork_done: SpinLock<Option<Arc<VforkDone>>>,
 }
 
@@ -328,26 +335,10 @@ impl Process {
         self.mm.lock().clone()
     }
 
-    /// Replace both references to the caller's mm with one writer. The
-    /// caller must be this process's last thread and transfer one process
-    /// user of the new space. Old mappings are retired in thread context.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2's exec
-    pub fn replace_mm(self: &Arc<Self>, space: Arc<AddressSpace>) {
-        assert!(Arc::ptr_eq(self, &current_process()));
-        assert!(!PROCS.lock().has_extra_threads(self.pid()), "exec needs one thread");
-        let old = {
-            let _irq = crate::arch::irq::push_off();
-            let old = sched::replace_user_space(Arc::clone(&space));
-            let recorded = self.mm.lock().replace(space).expect("live process's mm");
-            assert!(Arc::ptr_eq(&old, &recorded), "process and scheduler disagree on mm");
-            old
-        };
-        old.drop_user();
-    }
-
     /// `f` on its descriptor table, under the table's lock (a leaf but for
     /// the heap: nothing in `f` may take a lock or close a file); `None`
-    /// after its takedown.
+    /// after its takedown. Acquiring its lease may block: never call with
+    /// interrupts off or any spinlock held.
     fn with_files<R>(&self, f: impl FnOnce(&mut FdTable<FileRef>) -> R) -> Option<R> {
         let _access = self.files_access.read();
         let files = self.files.lock().clone()?;
@@ -362,21 +353,6 @@ impl Process {
         Some(fs.with_inner(f))
     }
 
-    /// Give this process its own descriptor table. An in-flight open
-    /// completes or cancels before the copy, so its returned fd is present
-    /// in the replacement. New reservations wait until replacement finishes.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2 exec / C3 unshare
-    pub fn unshare_files(&self) {
-        let access = self.files_access.write();
-        let old = self.files.lock().clone().expect("live process's files");
-        if old.users() > 1 {
-            let copy = Arc::new(old.fork_copy());
-            let replaced = self.files.lock().replace(copy).expect("live process's files");
-            drop(access);
-            replaced.leave(self.pid());
-        }
-    }
-
     /// Whether its `SIGCHLD` disposition is `SIG_IGN` or carries
     /// `SA_NOCLDWAIT`: its children's zombies leave at once
     /// (`ProcTree::exit`'s `autoreap`). Takes `Process::signal`: callable
@@ -388,8 +364,9 @@ impl Process {
 
     /// Exit step 3, in thread context, its last thread already off its
     /// address space: give up its user of the space (torn down at the
-    /// last, `AddressSpace::drop_user`), its share of the descriptors (the
-    /// last sharer closes them all, `Files::leave`) and its working
+    /// last, `AddressSpace::drop_user`), its POSIX record locks regardless of
+    /// table users, its share of descriptors (the last sharer closes them
+    /// all and releases flock, `Files::leave`) and its working
     /// directory, and forget its executable's path (Linux's
     /// `/proc/<pid>/exe` is `ENOENT` once `mm` is gone). Each slot is
     /// emptied under its lock and released after.
@@ -400,7 +377,9 @@ impl Process {
         }
         let files = self.files.lock().take();
         if let Some(files) = files {
-            files.leave(self.pid.load(Ordering::Acquire));
+            let pid = self.pid.load(Ordering::Acquire);
+            files.release_posix_for_pid(pid);
+            files.leave(pid);
         }
         let fs = self.fs.lock().take();
         drop(fs);
@@ -412,15 +391,16 @@ impl Process {
         *self.signal.lock() = parent.fork_copy();
     }
 
-    /// Publish a child state change before waking every waiter. Called
-    /// under PROCS, so observing the new sequence also observes the tree.
+    /// Publish a child state change before waking every waiter. The tree
+    /// change must precede this publication; readers recheck it under PROCS.
     fn child_changed(&self) {
         self.child_seq.fetch_add(1, Ordering::SeqCst);
         self.child_events.wake_all();
     }
 
     /// Release a vfork parent after detaching from the shared address space.
-    /// Exec calls this at its point of no return before installing its new mm.
+    /// Exit calls this after detach; C2 exec will call it at its point of
+    /// no return before installing its new mm.
     pub fn complete_vfork(&self) {
         let done = self.vfork_done.lock().take();
         if let Some(done) = done {
@@ -431,18 +411,15 @@ impl Process {
     fn copy_for_fork(parent: &Arc<Self>, flags: u32) -> Result<NewProcess, u32> {
         let console = parent.console.lock().fork_copy();
         let exe = parent.exe_path.lock().clone();
-        let new = NewProcess(
-            Arc::new(Self::new(None, None, None, SignalState::new(), console, parent.allow_test_syscalls, exe)),
-            true,
-        );
+        let new = NewProcess::empty(console, parent.allow_test_syscalls, exe);
         let fs = parent.fs.lock().clone().expect("live process's fs");
         let child_fs =
             if flags & general::CLONE_FS != 0 { fs } else { Arc::new(fs.fork_copy().map_err(|e| e.to_errno())?) };
-        *new.0.fs.lock() = Some(child_fs);
+        *new.process.fs.lock() = Some(child_fs);
         let files_access = parent.files_access.read();
         let files = parent.files.lock().clone().expect("live process's files");
         let child_files = if flags & general::CLONE_FILES != 0 { files.share() } else { Arc::new(files.fork_copy()) };
-        *new.0.files.lock() = Some(child_files);
+        *new.process.files.lock() = Some(child_files);
         drop(files_access);
         let mm = parent.address_space().expect("live process's mm");
         assert!(Arc::ptr_eq(&mm, &sched::current_address_space().expect("user space")));
@@ -452,9 +429,9 @@ impl Process {
         } else {
             mm.fork_copy().map_err(|e| e.to_errno())?
         };
-        *new.0.mm.lock() = Some(child_mm);
+        *new.process.mm.lock() = Some(child_mm);
         if flags & general::CLONE_VFORK != 0 {
-            *new.0.vfork_done.lock() = Some(Arc::new(VforkDone::new()));
+            *new.process.vfork_done.lock() = Some(Arc::new(VforkDone::new()));
         }
         Ok(new)
     }
@@ -463,6 +440,39 @@ impl Process {
     /// takedown's step 3 is done).
     fn released(&self) -> bool {
         self.mm.lock().is_none() && self.files.lock().is_none() && self.fs.lock().is_none()
+    }
+}
+
+/// Replace both references to the caller's mm with one writer. The
+/// caller must be this process's last thread and transfer one process
+/// user of the new space. Old mappings are retired in thread context.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2's exec
+pub fn replace_current_mm(space: Arc<AddressSpace>) {
+    let process = current_process();
+    assert!(!PROCS.lock().has_extra_threads(process.pid()), "exec needs one thread");
+    let old = {
+        let _irq = crate::arch::irq::push_off();
+        let old = sched::replace_user_space(Arc::clone(&space));
+        let recorded = process.mm.lock().replace(space).expect("live process's mm");
+        assert!(Arc::ptr_eq(&old, &recorded), "process and scheduler disagree on mm");
+        old
+    };
+    old.drop_user();
+}
+
+/// Give this process its own descriptor table. An in-flight open
+/// completes or cancels before the copy, so its returned fd is present
+/// in the replacement. New reservations wait until replacement finishes.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2 exec / C3 unshare
+pub fn unshare_current_files() {
+    let process = current_process();
+    let access = process.files_access.write();
+    let old = process.files.lock().clone().expect("live process's files");
+    if old.users() > 1 {
+        let copy = Arc::new(old.fork_copy());
+        let replaced = process.files.lock().replace(copy).expect("live process's files");
+        drop(access);
+        replaced.leave(process.pid());
     }
 }
 
@@ -479,18 +489,60 @@ impl Drop for Process {
 
 /// An unlinked process owns resources even without a pid. A refusal must
 /// release them in its creator's thread, before Process's ordinary Drop.
-struct NewProcess(Arc<Process>, bool);
+struct NewProcess {
+    process: Arc<Process>,
+    armed: bool,
+}
 
 impl NewProcess {
+    fn empty(console: ConsoleState, allow_test_syscalls: bool, exe: Option<String>) -> Self {
+        Self {
+            process: Arc::new(Process::new(None, None, None, SignalState::new(), console, allow_test_syscalls, exe)),
+            armed: true,
+        }
+    }
+
     fn linked(mut self) {
-        self.1 = false;
+        self.armed = false;
     }
 }
 
 impl Drop for NewProcess {
     fn drop(&mut self) {
-        if self.1 {
-            self.0.release_resources();
+        if self.armed {
+            self.process.release_resources();
+        }
+    }
+}
+
+/// A child cannot run until its pid and parent tid store are published.
+#[repr(u32)]
+enum Gate {
+    Wait,
+    Start,
+    Cancel,
+}
+
+/// Drop before NewProcess: cancellation joins before its resources retire.
+struct ParkedChild {
+    gate: Arc<(AtomicU32, sched::WaitQueue)>,
+    handle: Option<sched::JoinHandle>,
+}
+
+impl ParkedChild {
+    fn start(mut self) {
+        self.gate.0.store(Gate::Start as u32, Ordering::Release);
+        self.gate.1.wake_all();
+        drop(self.handle.take());
+    }
+}
+
+impl Drop for ParkedChild {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.gate.0.store(Gate::Cancel as u32, Ordering::Release);
+            self.gate.1.wake_all();
+            handle.join();
         }
     }
 }
@@ -512,7 +564,10 @@ impl VforkDone {
     }
 
     fn wait(&self) {
-        let _ = self.waiters.wait_killable(None, || self.done.load(Ordering::SeqCst));
+        let wake = self.waiters.wait_killable(None, || self.done.load(Ordering::SeqCst));
+        // Only fatal_pending interrupts this wait; C5 ends the caller before
+        // returning to user mode, even if the child still holds its completion.
+        debug_assert!(wake != sched::Wake::Interrupted || sched::with_current(|t| t.fatal_pending()).unwrap_or(false));
     }
 }
 
@@ -581,7 +636,6 @@ impl UserThread {
     }
 
     /// `set_tid_address`'s pointer (0 if none was set).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the identity ktests; C1's exit next
     pub fn clear_child_tid(&self) -> u64 {
         self.clear_child_tid.load(Ordering::Relaxed)
     }
@@ -732,8 +786,8 @@ fn tree_errno(error: lumen_proc::Error) -> u32 {
 
 /// Clone the calling process. All fallible work precedes linking its pid;
 /// the child cannot enter user mode before the parent's tid store.
-pub fn fork_current(
-    flags: u32,
+pub(crate) fn fork_current(
+    request: ProcessClone,
     newsp: u64,
     parent_tid: u64,
     child_tid: u64,
@@ -741,8 +795,13 @@ pub fn fork_current(
     frame: &crate::arch::syscall::SyscallFrame,
 ) -> Result<u64, u32> {
     let caller = current_thread();
+    if caller.process().console.lock().io == ConsoleIo::Capture {
+        info!(target: "linux", "fork: capture console unsupported until children have a shared console (C7/C10)");
+        return Err(errno::ENOSYS);
+    }
+    let flags = request.bits();
     let new = Process::copy_for_fork(caller.process(), flags)?;
-    let child = Arc::new(UserThread::new(Arc::clone(&new.0), 0));
+    let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
     if flags & general::CLONE_CHILD_CLEARTID != 0 {
         child.set_clear_child_tid(child_tid);
     }
@@ -752,64 +811,55 @@ pub fn fork_current(
         registers.rsp = newsp;
     }
     let fs_base = if flags & general::CLONE_SETTLS != 0 { tls } else { sched::current_fs_base() };
-    let space = new.0.address_space().expect("new process's space");
-    let done = new.0.vfork_done.lock().clone();
-    // 0 = wait, 1 = start, 2 = cancel. Cancellation is joined before the
-    // NewProcess releases the address-space user or open descriptors.
-    let gate = Arc::new((AtomicU32::new(0), sched::WaitQueue::new()));
+    let space = new.process.address_space().expect("new process's space");
+    let done = new.process.vfork_done.lock().clone();
+    // ParkedChild is declared after NewProcess, so a refusal joins first.
+    let gate = Arc::new((AtomicU32::new(Gate::Wait as u32), sched::WaitQueue::new()));
     let start = Arc::clone(&gate);
-    let handle =
-        sched::spawn_user_on(crate::arch::cpu_index(), "fork", (space, Arc::clone(&child), fs_base), move || {
-            start.1.wait_until(|| start.0.load(Ordering::Acquire) != 0);
-            let run = start.0.load(Ordering::Acquire) == 1;
-            drop(start);
-            if !run {
-                drop(sched::set_current_user_thread(None));
-                drop(sched::detach_user_space());
-                return;
-            }
-            if flags & general::CLONE_CHILD_SETTID != 0 {
-                let tid = current_thread().tid();
-                let _ = crate::user::copy_to_user(child_tid, &tid.to_ne_bytes());
-            }
-            // SAFETY: the scheduler installed this child's identity and space;
-            // its copied frame is resumed with user selectors and no lock held.
-            unsafe { crate::arch::syscall::enter_fork(registers) };
-            drop(take_current());
-        })
-        .map_err(|error| match error {
-            sched::SpawnError::Stack(crate::mm::stack::StackError::OutOfMemory) => errno::ENOMEM,
-            _ => errno::EAGAIN,
-        })?;
-    let linked = PROCS.lock().link_child(&caller, &child);
-    let pid = match linked {
-        Ok(pid) => pid,
-        Err(error) => {
-            gate.0.store(2, Ordering::Release);
-            gate.1.wake_all();
-            handle.join();
-            return Err(error);
+    let handle = sched::spawn_fork_child("fork", space, Arc::clone(&child), fs_base, move || {
+        start.1.wait_until(|| start.0.load(Ordering::Acquire) != Gate::Wait as u32);
+        let run = start.0.load(Ordering::Acquire) == Gate::Start as u32;
+        drop(start);
+        if !run {
+            drop(sched::set_current_user_thread(None));
+            drop(sched::detach_user_space());
+            return;
         }
-    };
+        if flags & general::CLONE_CHILD_SETTID != 0 {
+            let tid = current_thread().tid();
+            let _ = crate::user::copy_to_user(child_tid, &tid.to_ne_bytes());
+        }
+        // SAFETY: the scheduler installed this child's identity and space;
+        // its copied frame is resumed with user selectors and no lock held.
+        unsafe { crate::arch::syscall::enter_fork(registers) };
+        let ended = take_current();
+        assert!(ended.exit.is_some(), "fork child exited without recording UserExit");
+    })
+    .map_err(|error| match error {
+        sched::SpawnError::Stack(crate::mm::stack::StackError::OutOfMemory) => errno::ENOMEM,
+        _ => errno::EAGAIN,
+    })?;
+    let parked = ParkedChild { gate, handle: Some(handle) };
+    let pid = PROCS.lock().link_child(&caller, &child)?;
     new.linked();
     if flags & general::CLONE_PARENT_SETTID != 0 {
         let _ = crate::user::copy_to_user(parent_tid, &pid.to_ne_bytes());
     }
-    gate.0.store(1, Ordering::Release);
-    gate.1.wake_all();
-    drop(handle);
+    parked.start();
     if let Some(done) = done {
         done.wait();
     }
     Ok(u64::from(pid))
 }
 
-/// Validate a wait4 request against the caller's process group.
+/// Validate wait4 options and select the caller's children by pid or group;
+/// process-group selection is snapshotted under PROCS.
 pub fn wait4_request(pid: i32, options: u32) -> Result<lumen_proc::WaitRequest, u32> {
     PROCS.lock().wait4_request(current_process().pid(), pid, options)
 }
 
-/// Validate a waitid request against the caller's process group.
+/// Validate waitid idtype, id and event options for the caller; group
+/// selection is snapshotted under PROCS.
 pub fn waitid_request(idtype: i32, id: i32, options: u32) -> Result<lumen_proc::WaitRequest, u32> {
     PROCS.lock().waitid_request(current_process().pid(), idtype, id, options)
 }
@@ -859,14 +909,15 @@ fn warn_due(last: Option<u64>, now: u64) -> bool {
 /// running thread has no Linux process (or is a kernel thread). The process
 /// must have no other thread. The design's exit steps 2 and 3, then the
 /// tree:
-/// 1. the thread takes its `Arc<UserThread>` out of its scheduler state,
+/// 1. store zero to clear_child_tid if the mm has another process user
+///    (C4 adds the futex wake), then take its `Arc<UserThread>` out of scheduler state,
 ///    and its CPU leaves the address space (`sched::detach_user_space`:
-///    `CR3` back on the kernel's tables);
+///    `CR3` back on the kernel's tables); complete_vfork then releases its parent;
 /// 2. in one `PROCS` hold it leaves `PROCS` (and its process's signal
 ///    state), the last thread out (asserted);
 /// 3. the process gives up its address space (torn down at its last user),
-///    its descriptors (each closed, its locks released as `close` does,
-///    once no other process shares the table), its working directory and
+///    its POSIX locks even with a shared table, its descriptor-table user
+///    (last user closes descriptors and releases flock), its working directory and
 ///    its executable's path;
 /// 4. it exits in the tree with how its run ended (`SIGKILL` if nothing
 ///    was recorded), pid 1 its reaper, leaving `PROCS` once the tree
@@ -987,11 +1038,17 @@ impl Drop for RegisteredProcess {
 /// ([`locks_released`]). Takes the inode's Lock 4: never call it holding
 /// any spinlock (`PROCS`, `Files::table`).
 fn release_fd(pid: u32, file: FileRef) {
+    release_file(Some(pid), file);
+}
+
+// A table's last leave releases descriptions only: exit separately releases
+// its pid's record locks, while unshare must preserve them in the new table.
+fn release_file(pid: Option<u32>, file: FileRef) {
     let last = file.dec_fd_ref() == 0;
     let id = file.id;
     let mut freed = false;
     let released = file.inode().with_locks_mut(&mut |locks| {
-        freed = locks.release_posix_for_pid(pid);
+        freed = pid.is_some_and(|pid| locks.release_posix_for_pid(pid));
         if last {
             freed |= locks.release_flock(id);
         }
@@ -999,7 +1056,7 @@ fn release_fd(pid: u32, file: FileRef) {
     // Every filesystem keeps lock state today; one that refused would keep
     // this process's locks held.
     if let Err(e) = released {
-        log::error!(target: "linux", "pid {pid}: closing {}: its locks weren't released: {e:?}", Escaped(&file.path));
+        log::error!(target: "linux", "pid {pid:?}: closing {}: its locks weren't released: {e:?}", Escaped(&file.path));
     }
     if freed {
         locks_released();
@@ -1085,12 +1142,7 @@ pub fn reserve_current_fd(from: i32) -> Result<ReservedFd, VfsError> {
     let owner = current_process();
     let access = owner.files_access.read();
     let files = owner.files.lock().clone().expect("a running process has its descriptors");
-    let reserved = files.reserve(Arc::clone(&owner), from);
-    if reserved.is_ok() {
-        // ReservedFd now owns the lease and releases it after install/cancel.
-        core::mem::forget(access);
-    }
-    reserved
+    files.reserve(access, Arc::clone(&owner), from)
 }
 
 /// Put `file`, a fresh open file description (its `fd_refs` 1, for this
@@ -2232,7 +2284,7 @@ impl<R> KtestThread<R> {
 }
 
 /// Run a ktest closure as another Linux thread of the current process,
-/// on this CPU (no cross-CPU address-space sharing before C1). Each gets
+/// on this CPU (B6 adds migratable user threads). Each gets
 /// its own tid and must use a disjoint user buffer. Its identity is
 /// unlinked before completion, even when the closure returns an error.
 #[cfg(feature = "ktest")]
@@ -2717,40 +2769,40 @@ crate::ktest!(
             let before = file.fd_ref_count();
             // A private two-pid table forces the same fork refusal as a
             // full production table, without exhausting the whole kernel.
-            let root = NewProcess(
-                Arc::new(Process::new(
-                    None,
-                    None,
-                    None,
-                    SignalState::new(),
-                    ConsoleState::new(ConsoleIo::Capture, Vec::new()),
-                    false,
-                    None,
-                )),
-                true,
-            );
-            let leader = Arc::new(UserThread::new(Arc::clone(&root.0), 0));
+            let root = NewProcess::empty(ConsoleState::new(ConsoleIo::Capture, Vec::new()), false, None);
+            let leader = Arc::new(UserThread::new(Arc::clone(&root.process), 0));
             let mut table = ProcTable::new(2);
             kassert_eq!(table.link_root(&leader), Some(2));
-            for _ in 0..8 {
-                let child = Process::copy_for_fork(&parent, general::CLONE_VM).map_err(|_| "copy child")?;
-                let held = Arc::clone(&child.0);
-                let thread = Arc::new(UserThread::new(Arc::clone(&held), 0));
-                kassert_eq!(mm.users(), 2);
-                kassert_eq!(file.fd_ref_count(), before + 1);
-                kassert_eq!(table.link_child(&leader, &thread), Err(errno::EAGAIN));
-                drop(child);
-                kassert!(held.released());
-                kassert_eq!(mm.users(), 1);
-                kassert_eq!(file.fd_ref_count(), before);
+            let files = parent.files.lock().clone().ok_or("parent files")?;
+            for flags in [general::CLONE_VM, general::CLONE_VM | general::CLONE_FILES] {
+                for _ in 0..8 {
+                    let child = Process::copy_for_fork(&parent, flags).map_err(|_| "copy child")?;
+                    let held = Arc::clone(&child.process);
+                    let thread = Arc::new(UserThread::new(Arc::clone(&held), 0));
+                    let shared = flags & general::CLONE_FILES != 0;
+                    kassert_eq!(mm.users(), 2);
+                    kassert_eq!(files.users(), if shared { 2 } else { 1 });
+                    kassert_eq!(file.fd_ref_count(), before + u32::from(!shared));
+                    kassert_eq!(table.link_child(&leader, &thread), Err(errno::EAGAIN));
+                    drop(child);
+                    kassert!(held.released());
+                    kassert_eq!(mm.users(), 1);
+                    kassert_eq!(files.users(), 1);
+                    kassert_eq!(file.fd_ref_count(), before);
+                }
             }
             drop(table);
+            kassert_eq!(
+                fork_current(ProcessClone::FORK, 0, 0, 0, 0, &crate::arch::syscall::SyscallFrame::default()),
+                Err(errno::ENOSYS)
+            );
+            with_current_console(|console| console.io = ConsoleIo::Serial);
             // Also refuse after a real scheduler thread was made: the
             // pending-signal recheck must cancel and join its start gate.
             let kernel = sched::current().ok_or("current thread")?;
             kernel.set_sigpending();
             let result = fork_current(
-                general::SIGCHLD | general::CLONE_VM,
+                clone_flags(general::SIGCHLD | general::CLONE_VM, 0).expect("valid process flags"),
                 0,
                 0,
                 0,
@@ -2804,7 +2856,7 @@ crate::ktest!(
             let shared = process.files.lock().clone().ok_or("files")?.share();
             let reservation = reserve_current_fd(0).map_err(|_| "reserve")?;
             let fd = reservation.fd();
-            let swapper = spawn_test_thread(|_| current_process().unshare_files())?;
+            let swapper = spawn_test_thread(|_| unshare_current_files())?;
             let blocked = swapper.settle();
             let opened = open_kernel_file(b"/dev/null", OpenFlags::O_RDONLY, 0).map_err(|_| "open")?;
             let installed = reservation.install(opened, true);
@@ -2823,7 +2875,7 @@ crate::ktest!(
             // A cancelled reservation releases the exclusive waiter too.
             let shared = new.share();
             let cancelled = reserve_current_fd(0).map_err(|_| "reserve cancelled")?;
-            let swapper = spawn_test_thread(|_| current_process().unshare_files())?;
+            let swapper = spawn_test_thread(|_| unshare_current_files())?;
             let blocked = swapper.settle();
             drop(cancelled);
             swapper.join()?;
@@ -2849,7 +2901,7 @@ crate::ktest!(
                 new.drop_user();
                 return Err("map new mm");
             }
-            process.replace_mm(Arc::clone(&new));
+            replace_current_mm(Arc::clone(&new));
             kassert_eq!(old.users(), 0);
             kassert!(Arc::ptr_eq(&new, &sched::current_address_space().ok_or("scheduler mm")?));
             kassert!(Arc::ptr_eq(&new, &process_address_space(pid).ok_or("process mm")?));
@@ -2876,7 +2928,7 @@ crate::ktest!(
             // when its exit follows the parent's blocking wait.
             let caller = current_thread();
             let new = Process::copy_for_fork(caller.process(), general::CLONE_VM).map_err(|_| "copy child")?;
-            let child = Arc::new(UserThread::new(Arc::clone(&new.0), 0));
+            let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
             let pid = PROCS.lock().link_child(&caller, &child).map_err(|_| "link child")?;
             new.linked();
             let request = wait4_request(pid as i32, 0).expect("valid wait");
@@ -2887,12 +2939,19 @@ crate::ktest!(
             let finished = Arc::new(core::sync::atomic::AtomicBool::new(false));
             let observed = Arc::new(core::sync::atomic::AtomicBool::new(false));
             let (end, saw, exiting) = (Arc::clone(&finished), Arc::clone(&observed), Arc::clone(&child));
+            // How many waiters the exit's own wake left on the parent's
+            // queue: the worker's second wake_all frees a parent the exit
+            // forgot (a clean `not ok`, not a hang). The parent can't queue
+            // on child_events again: its next wait reaps, the last ECHILDs.
+            let rescued = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+            let (parent, left) = (Arc::clone(caller.process()), Arc::clone(&rescued));
             let worker = match sched::spawn("wait-exit", move || {
                 while kernel.state() != sched::State::Blocked && !end.load(Ordering::SeqCst) {
                     sched::yield_now();
                 }
                 saw.store(kernel.state() == sched::State::Blocked, Ordering::SeqCst);
                 retire(exiting);
+                left.store(parent.child_events.wake_all(), Ordering::SeqCst);
             }) {
                 Ok(worker) => worker,
                 Err(_) => {
@@ -2909,10 +2968,96 @@ crate::ktest!(
             let remaining = wait_child(request);
             kassert!(matches!(interrupted, Err(crate::linux::signal::ERESTARTSYS)));
             kassert!(observed.load(Ordering::SeqCst));
+            kassert_eq!(rescued.load(Ordering::SeqCst), 0);
             let report = report.map_err(|_| "blocking wait")?.ok_or("blocking wait returned no event")?;
             kassert_eq!(report.pid(), pid);
             kassert_eq!(report.status().word(), 37 << 8);
             kassert!(matches!(remaining, Err(errno::ECHILD)));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn shared_files_exit_releases_its_posix_locks() {
+        use crate::{kassert, kassert_eq};
+        fn lock(fd: i32, cmd: u32) -> Result<(u64, i16, i32), &'static str> {
+            let mut raw = [0u8; 32];
+            raw[0..2].copy_from_slice(&(general::F_WRLCK as i16).to_ne_bytes());
+            raw[16..24].copy_from_slice(&10i64.to_ne_bytes());
+            crate::user::copy_to_user(KTEST_USER_VA, &raw).map_err(|_| "write flock")?;
+            let result = hazard_call(general::__NR_fcntl, fd as u64, u64::from(cmd), KTEST_USER_VA, 0);
+            crate::user::copy_from_user(&mut raw, KTEST_USER_VA).map_err(|_| "read flock")?;
+            Ok((
+                result,
+                i16::from_ne_bytes(raw[0..2].try_into().unwrap()),
+                i32::from_ne_bytes(raw[24..28].try_into().unwrap()),
+            ))
+        }
+        in_test_process(|_| {
+            let file = open_kernel_file(b"/tmp/c1-exit-lock", OpenFlags::O_CREAT | OpenFlags::O_RDWR, 0o600)
+                .map_err(|_| "open")?;
+            let fd = install_current_fd(file, false).map_err(|_| "install")?;
+            let caller = current_thread();
+            let files = caller.process().files.lock().clone().ok_or("files")?;
+            let new = Process::copy_for_fork(caller.process(), general::CLONE_VM | general::CLONE_FILES)
+                .map_err(|_| "copy child")?;
+            let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
+            let phase = Arc::new((AtomicU32::new(0), sched::WaitQueue::new()));
+            let result = Arc::new(SpinLock::new(None));
+            let (turn, out) = (Arc::clone(&phase), Arc::clone(&result));
+            let handle = sched::spawn_fork_child(
+                "lock-child",
+                new.process.address_space().unwrap(),
+                Arc::clone(&child),
+                0,
+                move || {
+                    turn.1.wait_until(|| turn.0.load(Ordering::SeqCst) != 0);
+                    if turn.0.load(Ordering::SeqCst) == 3 {
+                        drop(sched::set_current_user_thread(None));
+                        drop(sched::detach_user_space());
+                        return;
+                    }
+                    *out.lock() = Some(lock(fd, general::F_SETLK));
+                    turn.0.store(2, Ordering::SeqCst);
+                    turn.1.wake_all();
+                    turn.1.wait_until(|| turn.0.load(Ordering::SeqCst) == 3);
+                    record_exit(UserExit::Exited(0));
+                    let ended = take_current();
+                    assert!(ended.exit.is_some());
+                },
+            )
+            .map_err(|_| "spawn child")?;
+            let linked = PROCS.lock().link_child(&caller, &child);
+            let pid = match linked {
+                Ok(pid) => pid,
+                Err(_) => {
+                    phase.0.store(3, Ordering::SeqCst);
+                    phase.1.wake_all();
+                    handle.join();
+                    return Err("link child");
+                }
+            };
+            new.linked();
+            let shared_users = files.users();
+            phase.0.store(1, Ordering::SeqCst);
+            phase.1.wake_all();
+            phase.1.wait_until(|| phase.0.load(Ordering::SeqCst) == 2);
+            let before = lock(fd, general::F_GETLK);
+            phase.0.store(3, Ordering::SeqCst);
+            phase.1.wake_all();
+            handle.join();
+            let request = wait4_request(pid as i32, 0).map_err(|_| "wait request")?;
+            kassert!(wait_child(request).map_err(|_| "reap")?.is_some());
+            kassert_eq!(shared_users, 2);
+            kassert_eq!(result.lock().take().ok_or("child result")??.0, 0);
+            kassert_eq!(before?, (0, general::F_WRLCK as i16, pid as i32));
+            kassert_eq!(files.users(), 1);
+            kassert!(current_file(fd).is_some());
+            let after = lock(fd, general::F_GETLK)?;
+            kassert_eq!(after.0, 0);
+            kassert_eq!(after.1, general::F_UNLCK as i16);
+            close_current_fd(fd).map_err(|_| "close")?;
             Ok(())
         })?
     }

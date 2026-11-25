@@ -5,7 +5,6 @@ each check an `ok` line of `tools/linux-m8/m8_proc`.
 Laid down empty by B0 (#371); each issue adds its own tests."""
 
 import re
-import time
 
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
 from lumen_harness.rootfs import copy_rootfs, warm_up
@@ -38,19 +37,6 @@ def test_fork_wait_and_exit_status(boot, tmp_path):
         "fork-inherited-state",
     ):
         assert f"ok {check}\n" in out, out
-    assert re.search(r"linux: /usr/local/bin/m8_proc exit=0 leaked_frames=-?\d+", out), out
-    # The orphan can outlive the root's command. Confirm init reaped it
-    # before any later scenario counts frames; this is an outer hang guard.
-    deadline = time.monotonic() + 30
-    while True:
-        ps = run(m, "ps")
-        pids = [
-            int(line.split()[0])
-            for line in ps.splitlines()
-            if line.split() and line.split()[0].isdigit()
-        ]
-        if pids == [1]:
-            break
-        assert time.monotonic() < deadline, ps
+    assert re.search(r"linux: /usr/local/bin/m8_proc exit=0 leaked_frames=0\b", out), out
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
