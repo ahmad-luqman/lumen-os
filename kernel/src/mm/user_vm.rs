@@ -538,10 +538,11 @@ impl AddressSpace {
         let bit = 1u64 << cpu;
         let prev_ptr = arch::percpu::loaded_space();
         let next_ptr = next.map_or(core::ptr::null(), |s| s as *const AddressSpace);
+        let target_root = next.map_or_else(paging::kernel_root, AddressSpace::root);
         if prev_ptr == next_ptr {
             debug_assert_eq!(
                 arch::paging::active_root(),
-                next.map_or_else(paging::kernel_root, AddressSpace::root),
+                target_root,
                 "CR3 out of step with PerCpu::loaded_space on cpu {cpu}"
             );
             return;
@@ -552,11 +553,14 @@ impl AddressSpace {
             // our serializing `write_cr3`.
             next_space.active.fetch_or(bit, Ordering::SeqCst);
         }
-        let target_root = next.map_or_else(paging::kernel_root, AddressSpace::root);
         // SAFETY: `target_root` is either `kernel_root()` or a user L4 root
-        // sharing kernel `L4[256..512]` verbatim.
+        // sharing kernel `L4[256..512]` verbatim, and this function maintains
+        // `AddressSpace::active` and `PerCpu::loaded_space` around the write.
         unsafe { arch::paging::write_cr3(target_root.as_u64()) };
-        arch::percpu::set_loaded_space(next_ptr);
+        // SAFETY: interrupts are disabled, `write_cr3` just loaded `next_ptr`'s
+        // root, and the caller guarantees `next` stays alive until the next
+        // `switch_loaded` replaces or clears it on this CPU.
+        unsafe { arch::percpu::set_loaded_space(next_ptr) };
         if !prev_ptr.is_null() {
             // SAFETY: caller guarantees the previously recorded space stays
             // alive until after this switch completes.
@@ -1163,13 +1167,7 @@ impl AddressSpace {
         let attrs = prot_to_attrs(prot);
         let active = arch::paging::active_root() == self.root;
         let writable = &inner.writable_maps;
-        let mut shoot_start = u64::MAX;
-        let mut shoot_end = 0u64;
-        let last_narrowed = core::cell::Cell::new(false);
-        #[cfg(feature = "ktest")]
-        let mut shared_flushed = [0u64; 64];
-        #[cfg(feature = "ktest")]
-        let mut shared_flushed_len = 0usize;
+        let mut pending = PendingShoot::new();
         // SAFETY: Lock 1 excludes mutations over this validated lower-half
         // range. Narrowing changes (losing WRITABLE, gaining NX, or becoming
         // PROT_NONE) are shot down across all active CPUs before any
@@ -1182,32 +1180,16 @@ impl AddressSpace {
                 end,
                 |va, mapping| {
                     let private = !inner.vmas.find(va.as_u64()).expect("protected VMA").backing.is_shared();
-                    let chosen = if !mapping.shared && private && frame::user_count(mapping.phys) > 1 {
+                    if !mapping.shared && private && frame::user_count(mapping.phys) > 1 {
                         attrs.without_writable()
                     } else {
                         attrs
-                    };
-                    let new_writable = if mapping.shared { false } else { chosen.writable() };
-                    let new_executable = chosen.executable();
-                    last_narrowed.set(
-                        mapping.present
-                            && (chosen.is_prot_none()
-                                || (mapping.writable && !new_writable)
-                                || (mapping.executable && !new_executable)),
-                    );
-                    chosen
+                    }
                 },
-                |leaf| {
+                |leaf, narrowed| {
                     release_order::step(&leaf, release_order::Step::Cleared);
-                    if last_narrowed.get() {
-                        let va = leaf.va.as_u64();
-                        shoot_start = shoot_start.min(va);
-                        shoot_end = shoot_end.max(va + PAGE_SIZE);
-                        #[cfg(feature = "ktest")]
-                        if leaf.was_shared && shared_flushed_len < shared_flushed.len() {
-                            shared_flushed[shared_flushed_len] = leaf.phys.as_u64();
-                            shared_flushed_len += 1;
-                        }
+                    if narrowed {
+                        pending.add(&leaf);
                     } else if active {
                         arch::paging::invalidate(leaf.va);
                         release_order::step(&leaf, release_order::Step::Flushed);
@@ -1216,13 +1198,7 @@ impl AddressSpace {
                 },
             );
         }
-        if shoot_start < shoot_end {
-            tlb::shoot_down(self, Shoot::Pages(shoot_start..shoot_end));
-            #[cfg(feature = "ktest")]
-            for &phys in &shared_flushed[..shared_flushed_len] {
-                release_order::record(phys, release_order::Step::Flushed);
-            }
-        }
+        pending.flush(self);
         // Every cache leaf in the range is now read-only and retired across
         // all active CPUs; release its writable-map guard while retaining its pin.
         drop_range(&mut inner.writable_maps, addr, end);
@@ -1398,10 +1374,14 @@ impl AddressSpace {
             });
         }
         let removed = removed.expect("split must remove one leaf");
+        // Break-before-make: retire the cleared read-only leaf across every
+        // active CPU BEFORE mapping the writable copy, so no sibling CPU can
+        // keep reading stale data through a cached old entry after stores land
+        // in the copy (Linux's `wp_page_copy`).
+        tlb::shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
         // SAFETY: Lock 1 is held and the leaf is now missing. Its tables
         // remain, so replacing it cannot allocate or run out of frames.
         unsafe { map_user_frame(self.root, va, copy, attrs) }.expect("retained private leaf tables");
-        tlb::shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
         // SAFETY: this is the counted leaf just removed, and `tlb::shoot_down`
         // retired it from every CPU that had this space loaded before we drop
         // its reference.
@@ -1565,14 +1545,18 @@ impl AddressSpace {
     /// directly. Direct teardown retires users to zero and asserts there was
     /// at most one user. Repeated calls are harmless.
     ///
-    /// Must be called only after switching `CR3` back to `kernel_root()`.
-    /// Subsequent [`Drop`] frees only the bare L4 root frame without locking.
+    /// Must be called only after switching `CR3` back to `kernel_root()`, with
+    /// interrupts enabled and no `SpinLock` held: it may block while waiting
+    /// for other CPUs to clear [`Self::active`] and while acquiring Lock 1
+    /// (`inner`). Subsequent [`Drop`] frees only the bare L4 root frame without
+    /// locking.
     ///
     /// Cache frames remain owned by the cache (`PTE_SHARED` leaves): their
     /// [`WritableMap`]s and pins are dropped after the sweep (the switch
     /// away from this `CR3` was the unmap order's flush), and the
     /// `mapped_files` references after `inner` is released.
     pub(crate) fn teardown(&self) {
+        const TEARDOWN_WARN_NS: u64 = 2_000_000_000;
         assert_ne!(
             arch::paging::active_root(),
             self.root,
@@ -1588,17 +1572,36 @@ impl AddressSpace {
         );
         let previous = self.users.swap(0, Ordering::AcqRel);
         assert!(previous <= 1, "teardown requires at most one process user");
-        // Wait until every other CPU that loaded this root (e.g., an exiting
-        // thread between detach and switch) has switched away before freeing
-        // any leaf frames, pins, or page tables.
-        if self.active.load(Ordering::Acquire) != 0 {
+        // Wait until every other CPU that still has this root loaded (a thread
+        // running on the space that is not a counted process user, such as a
+        // sibling or ktest thread not yet detached) has switched away before
+        // freeing any leaf frames, pins, or page tables.
+        let mut mask = self.active.load(Ordering::Acquire);
+        if mask != 0 {
+            crate::crash::halt_if_stopping_elsewhere();
             debug_assert!(
                 arch::irq::enabled() && arch::irq::depth() == 0,
                 "AddressSpace::teardown waiting for active CPUs with interrupts off or a SpinLock held"
             );
-            while self.active.load(Ordering::Acquire) != 0 {
+            let mut warn_at = {
+                let now = crate::time::now_ns();
+                if now == 0 { 0 } else { now.saturating_add(TEARDOWN_WARN_NS) }
+            };
+            let mut warned = false;
+            while mask != 0 {
+                if !warned {
+                    let now = crate::time::now_ns();
+                    if warn_at == 0 && now != 0 {
+                        warn_at = now.saturating_add(TEARDOWN_WARN_NS);
+                    } else if warn_at != 0 && now >= warn_at {
+                        let root = self.root;
+                        log::warn!(target: "mm", "cpus {mask:#x} still have {root} loaded: teardown waits for them");
+                        warned = true;
+                    }
+                }
                 core::hint::spin_loop();
                 crate::sched::yield_now();
+                mask = self.active.load(Ordering::Acquire);
             }
         }
         let gone_files;
@@ -1772,19 +1775,16 @@ impl AddressSpace {
     /// (`tlb::shoot_down`), then release counted references, cache writable
     /// guards, and cache pins in that order. Batches counted frames on the
     /// stack so OOM rollbacks never allocate. Returns the number of removed
-    /// leaves.
+    /// leaves. Every removal except the counted CoW split and Drop uses this
+    /// path, including cache-leaf replacement and teardown before freeing empty
+    /// page tables.
     fn unmap_range_locked(&self, inner: &mut AddressSpaceInner, start: u64, end: u64) -> usize {
         const FRAME_BATCH: usize = 64;
         let writable = &inner.writable_maps;
         let mut leaves = 0usize;
         let mut batch = [PhysFrame::from_u64(0).expect("zero is aligned"); FRAME_BATCH];
         let mut batch_len = 0usize;
-        let mut shoot_start = u64::MAX;
-        let mut shoot_end = 0u64;
-        #[cfg(feature = "ktest")]
-        let mut shared_flushed = [0u64; 64];
-        #[cfg(feature = "ktest")]
-        let mut shared_flushed_len = 0usize;
+        let mut pending = PendingShoot::new();
         // SAFETY: `self.root` is owned by `self`, `inner` lock is held, and
         // `[start, end)` is page-aligned and strictly in the lower half.
         // Removed counted frames are held until `tlb::shoot_down` retires their
@@ -1795,40 +1795,24 @@ impl AddressSpace {
                 leaves += 1;
                 release_order::step(&leaf, release_order::Step::Cleared);
                 note_shared_leaf(writable, &leaf);
-                let va = leaf.va.as_u64();
                 if leaf.was_shared {
-                    shoot_start = shoot_start.min(va);
-                    shoot_end = shoot_end.max(va + PAGE_SIZE);
-                    #[cfg(feature = "ktest")]
-                    if shared_flushed_len < shared_flushed.len() {
-                        shared_flushed[shared_flushed_len] = leaf.phys.as_u64();
-                        shared_flushed_len += 1;
-                    }
+                    pending.add(&leaf);
                     return;
                 }
                 if batch_len == FRAME_BATCH {
-                    tlb::shoot_down(self, Shoot::Pages(shoot_start..shoot_end));
+                    pending.flush(self);
                     for &phys in &batch[..batch_len] {
                         // SAFETY: removed and retired across all active CPUs above.
                         drop(frame::UserFrame::from_leaf(phys));
                     }
                     batch_len = 0;
-                    shoot_start = u64::MAX;
-                    shoot_end = 0;
                 }
                 batch[batch_len] = leaf.phys;
                 batch_len += 1;
-                shoot_start = shoot_start.min(va);
-                shoot_end = shoot_end.max(va + PAGE_SIZE);
+                pending.add(&leaf);
             });
         }
-        if shoot_start < shoot_end {
-            tlb::shoot_down(self, Shoot::Pages(shoot_start..shoot_end));
-        }
-        #[cfg(feature = "ktest")]
-        for &phys in &shared_flushed[..shared_flushed_len] {
-            release_order::record(phys, release_order::Step::Flushed);
-        }
+        pending.flush(self);
         for &phys in &batch[..batch_len] {
             // SAFETY: every leaf in `batch` was removed and shot down above.
             drop(unsafe { frame::UserFrame::from_leaf(phys) });
@@ -1851,6 +1835,58 @@ impl AddressSpace {
     #[cfg(feature = "ktest")]
     pub(crate) fn mapped_file_count(&self) -> usize {
         self.inner.lock().mapped_files.len()
+    }
+}
+
+/// Accumulates cleared or narrowed leaves across a page-table walk so they are
+/// retired with a single [`tlb::shoot_down`] call (and, under `ktest`, recorded
+/// as [`release_order::Step::Flushed`] after the shootdown completes).
+struct PendingShoot {
+    start: u64,
+    end: u64,
+    #[cfg(feature = "ktest")]
+    shared: [u64; 64],
+    #[cfg(feature = "ktest")]
+    shared_len: usize,
+}
+
+impl PendingShoot {
+    fn new() -> Self {
+        Self {
+            start: u64::MAX,
+            end: 0,
+            #[cfg(feature = "ktest")]
+            shared: [0; 64],
+            #[cfg(feature = "ktest")]
+            shared_len: 0,
+        }
+    }
+
+    fn add(&mut self, leaf: &paging::UserLeaf) {
+        let va = leaf.va.as_u64();
+        self.start = self.start.min(va);
+        self.end = self.end.max(va + PAGE_SIZE);
+        #[cfg(feature = "ktest")]
+        if leaf.was_shared && self.shared_len < self.shared.len() {
+            self.shared[self.shared_len] = leaf.phys.as_u64();
+            self.shared_len += 1;
+        }
+    }
+
+    fn flush(&mut self, space: &AddressSpace) {
+        if self.start < self.end {
+            tlb::shoot_down(space, Shoot::Pages(self.start..self.end));
+            #[cfg(feature = "ktest")]
+            for &phys in &self.shared[..self.shared_len] {
+                release_order::record(phys, release_order::Step::Flushed);
+            }
+            self.start = u64::MAX;
+            self.end = 0;
+            #[cfg(feature = "ktest")]
+            {
+                self.shared_len = 0;
+            }
+        }
     }
 }
 

@@ -152,14 +152,20 @@ pub fn user_exit_rsp() -> u64 {
 /// Read the user [`AddressSpace`] currently loaded in this CPU's `CR3`
 /// (null when running on `kernel_root()`). Call with interrupts disabled.
 #[inline]
-pub fn loaded_space() -> *const AddressSpace {
+pub(crate) fn loaded_space() -> *const AddressSpace {
     CPUS[index()].loaded_space.load(Ordering::Relaxed).cast_const()
 }
 
 /// Record the user [`AddressSpace`] loaded in this CPU's `CR3` (or null for
-/// `kernel_root()`). Call with interrupts disabled alongside the `CR3` write.
+/// `kernel_root()`).
+///
+/// # Safety
+/// Only `AddressSpace::switch_loaded` may call this, with interrupts disabled,
+/// immediately after the matching `CR3` write. Whenever `space` is non-null, it
+/// must point to a live `AddressSpace` that stays alive until the next
+/// `AddressSpace::switch_loaded` clears or replaces it on this CPU.
 #[inline]
-pub fn set_loaded_space(space: *const AddressSpace) {
+pub(crate) unsafe fn set_loaded_space(space: *const AddressSpace) {
     CPUS[index()].loaded_space.store(space.cast_mut(), Ordering::Relaxed);
 }
 

@@ -214,17 +214,20 @@ HOST_TIMED = (
         "warned about again, not host-timed); a leaked_frames count it changes fails on its own",
     ),
     HostTimed(
-        r"WARN  mm: cpus 0x[0-9a-f]+ haven't answered TLB shootdown within 2 s \(still waiting\)$",
+        r"WARN  mm: cpus 0x[0-9a-f]+ haven't answered TLB shootdown within 2 s \(unsent 0x[0-9a-f]+, still waiting\)$",
         "kernel/src/mm/tlb.rs",
-        "haven't answered TLB shootdown within 2 s (still waiting)",
-        ("WARN  mm: cpus 0x6 haven't answered TLB shootdown within 2 s (still waiting)",),
+        "haven't answered TLB shootdown within 2 s (unsent {unsent:#x}, still waiting)",
         (
-            "WARN  mm: cpus 0x4 still haven't flushed their TLBs: freed stack addresses wait for them",
+            "WARN  mm: cpus 0x6 haven't answered TLB shootdown within 2 s (unsent 0x0, still waiting)",
+        ),
+        (
+            "WARN  mm: cpus 0x6 still haven't answered TLB shootdown after 4 s (unsent 0x0)",
+            "WARN  mm: cpus 0x2 still have 0x100000 loaded: teardown waits for them",
         ),
         "a target vCPU stalled past 2 s before answering vector 0x3e (TLB_SHOOTDOWN) (#376): "
         "shoot_down keeps waiting so frames are never freed while a stale translation may remain; "
-        "mm::tlb::shootdown_across_cpus checks cross-CPU invalidation, SpinLock deferral, active-mask exit, "
-        "and teardown waiting",
+        "later 2 s repeats use distinct text that is not host-timed, so a real wedge fails a run "
+        "(nothing in QEMU exercises the 2 s wait itself)",
     ),
     HostTimed(
         UNDERRUN_WARNING + "$",
