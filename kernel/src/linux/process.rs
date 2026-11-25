@@ -441,11 +441,9 @@ impl Drop for Files {
     fn drop(&mut self) {
         let users = *self.users.get_mut();
         debug_assert_eq!(self.table.get_mut().reserved_count(), 0, "dropped table has reserved slots");
-        if users == 0 {
-            debug_assert_eq!(self.table.get_mut().open_count(), 0, "last leave did not drain the table");
-        }
-        debug_assert!(
-            users == 0 || self.table.get_mut().open_count() == 0,
+        debug_assert_eq!(
+            self.table.get_mut().open_count(),
+            0,
             "a descriptor table dropped with {users} users and descriptors open (no last `leave`)"
         );
     }
@@ -1190,8 +1188,8 @@ pub fn install_current_fd(file: KernelFile, cloexec: bool) -> Result<i32, VfsErr
 /// Put `file`, a fresh open file description, on descriptor `fd` of the
 /// current process, closing what was there (its locks released outside the
 /// table's lock). `EBUSY` for a reserved slot; `EBADF` for an fd outside
-/// `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s inode number from it and relies on
-/// that range.
+/// `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s inode
+/// number from it and relies on that range.
 pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
     place_current_fd(fd, Arc::new(file), false)
 }
@@ -2256,10 +2254,6 @@ crate::ktest!(
     }
 );
 
-/// The dup/close test's rendezvous. The correct path only publishes under
-/// its spinlock and cannot be preempted there on this CPU. A lookup moved
-/// outside that hold lets the close finish here, exposing the lost flock
-/// before the duplicate can be installed.
 #[cfg(feature = "ktest")]
 const DUP_IDLE: u32 = 0;
 #[cfg(feature = "ktest")]
@@ -2268,6 +2262,11 @@ const DUP_ARMED: u32 = 1;
 const DUP_LOOKED_UP: u32 = 2;
 #[cfg(feature = "ktest")]
 const DUP_SOURCE_CLOSED: u32 = 3;
+
+/// The dup/close test's rendezvous. The correct path only publishes under
+/// its spinlock and cannot be preempted there on this CPU. A lookup moved
+/// outside that hold lets the close finish here, exposing the lost flock
+/// before the duplicate can be installed.
 #[cfg(feature = "ktest")]
 static DUP_LOOKUP_PHASE: AtomicU32 = AtomicU32::new(DUP_IDLE);
 
@@ -2703,60 +2702,57 @@ fn duplicate_racing_close_keeps_flock() -> crate::ktest::TestResult {
     Ok(())
 }
 
-/// A real open keeps its reservation throughout the filesystem work.
-#[cfg(feature = "ktest")]
-fn open_reservation_survives_until_install() -> crate::ktest::TestResult {
-    use crate::{kassert, kassert_eq};
-    const PATH: &[u8] = b"/tmp/b8-open-reservation";
-    let slot = reserve_current_fd(0).map_err(|_| "find next open slot")?;
-    let r = slot.fd();
-    drop(slot);
-    let mut path = PATH.to_vec();
-    path.push(0);
-    crate::user::copy_to_user(KTEST_USER_VA, &path).map_err(|_| "copy paused open path")?;
-    OPEN_INSTALL_PHASE.store(OPEN_ARMED, Ordering::SeqCst);
-    let opener = spawn_test_thread(move |_| {
-        hazard_call(
-            general::__NR_openat,
-            general::AT_FDCWD as u64,
-            KTEST_USER_VA,
-            u64::from(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
-            0o600,
-        )
-    });
-    let opener = match opener {
-        Ok(opener) => opener,
-        Err(e) => {
+crate::ktest!(
+    fn open_reservation_survives_until_install() {
+        use crate::{kassert, kassert_eq};
+        in_test_process(|_| {
+            let path = c"/tmp/b8-open-reservation";
+            let r = reserve_current_fd(0).map_err(|_| "find next open slot")?.fd();
+            crate::user::copy_to_user(KTEST_USER_VA, path.to_bytes_with_nul()).map_err(|_| "copy paused open path")?;
+            OPEN_INSTALL_PHASE.store(OPEN_ARMED, Ordering::SeqCst);
+            let opener = spawn_test_thread(move |_| {
+                hazard_call(
+                    general::__NR_openat,
+                    general::AT_FDCWD as u64,
+                    KTEST_USER_VA,
+                    u64::from(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+                    0o600,
+                )
+            });
+            let opener = match opener {
+                Ok(opener) => opener,
+                Err(e) => {
+                    OPEN_INSTALL_PHASE.store(OPEN_IDLE, Ordering::SeqCst);
+                    return Err(e);
+                }
+            };
+            while OPEN_INSTALL_PHASE.load(Ordering::SeqCst) == OPEN_ARMED && !opener.finished() {
+                crate::time::sleep(1_000_000);
+            }
+            let paused = OPEN_INSTALL_PHASE.load(Ordering::SeqCst) == OPEN_PAUSED;
+            let exact = dup_current_fd(0, r, false);
+            let lowest = dup_current_fd_from(0, 0, false);
+            OPEN_INSTALL_PHASE.store(OPEN_RELEASED, Ordering::SeqCst);
+            let opened = opener.join();
             OPEN_INSTALL_PHASE.store(OPEN_IDLE, Ordering::SeqCst);
-            return Err(e);
-        }
-    };
-    while OPEN_INSTALL_PHASE.load(Ordering::SeqCst) == OPEN_ARMED && !opener.finished() {
-        crate::time::sleep(1_000_000);
+            let unlinked = lumen_vfs::unlink_at(crate::vfs::tables(), None, path.to_bytes(), false);
+            kassert!(paused);
+            // If `openat` dropped its reservation before opening, this would be `Ok(r)`.
+            kassert_eq!(exact, Err(VfsError::Busy));
+            kassert_eq!(lowest, Ok(r + 1));
+            kassert_eq!(opened?, r as u64);
+            kassert_eq!(unlinked, Ok(()));
+            kassert_eq!(close_current_fd(r), Ok(()));
+            kassert_eq!(close_current_fd(r + 1), Ok(()));
+            Ok(())
+        })?
     }
-    let paused = OPEN_INSTALL_PHASE.load(Ordering::SeqCst) == OPEN_PAUSED;
-    let exact = dup_current_fd(0, r, false);
-    let lowest = dup_current_fd_from(0, 0, false);
-    OPEN_INSTALL_PHASE.store(OPEN_RELEASED, Ordering::SeqCst);
-    let opened = opener.join();
-    OPEN_INSTALL_PHASE.store(OPEN_IDLE, Ordering::SeqCst);
-    let unlinked = lumen_vfs::unlink_at(crate::vfs::tables(), None, PATH, false);
-    kassert!(paused);
-    // K1 drops the reservation before opening: this becomes Ok(r).
-    kassert_eq!(exact, Err(VfsError::Busy));
-    kassert_eq!(lowest, Ok(r + 1));
-    kassert_eq!(opened?, r as u64);
-    kassert_eq!(unlinked, Ok(()));
-    kassert_eq!(close_current_fd(r), Ok(()));
-    kassert_eq!(close_current_fd(r + 1), Ok(()));
-    Ok(())
-}
+);
 
 crate::ktest!(
     fn dup_and_openat_reserve_their_slot() {
         use crate::{kassert, kassert_eq};
         in_test_process(|pid| {
-            open_reservation_survives_until_install()?;
             let slot = reserve_current_fd(0).map_err(|_| "reserve descriptor")?;
             let fd = slot.fd();
             kassert_eq!(fd, 3);

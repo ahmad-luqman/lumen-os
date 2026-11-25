@@ -124,13 +124,12 @@ fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
 ///   `-ENOTDIR` for one that isn't a directory, `-EINVAL` if `count` can't
 ///   hold the next entry, `-EFAULT` (what the copy says) if the records
 ///   can't be copied out (the cursor goes back if still at the published
-///   value),
-///   `-EIO` if the filesystem broke its cursor contract, and the filesystem's
-///   error from `readdir` (`-ENOENT` for a `/proc/<pid>` whose process has
-///   ended). An error after some entries were listed hands those on and
-///   comes back on the next call. A
-///   directory removed while open lists as empty (`0`; Linux says `-ENOENT`
-///   there, `IS_DEADDIR`: ARCHITECTURE section 9's deliberate difference).
+///   value), `-EIO` if the filesystem broke its cursor contract, and the
+///   filesystem's error from `readdir` (`-ENOENT` for a `/proc/<pid>` whose
+///   process has ended). An error after some entries were listed hands
+///   those on and comes back on the next call. A directory removed while
+///   open lists as empty (`0`; Linux says `-ENOENT` there, `IS_DEADDIR`:
+///   ARCHITECTURE section 9's deliberate difference).
 /// - **The directory changing between calls:** the filesystems' cursors are
 ///   stable as entries come and go (`VfsInode::readdir`'s contract), so a
 ///   listing lists every entry that stayed in the directory exactly once,

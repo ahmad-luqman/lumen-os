@@ -4200,7 +4200,7 @@ process's `Files` holds `table: SpinLock<FdTable<FileRef>>` (`FileRef` =
 (behind `take_current` and the test seams' `RegisteredProcess`), which
 release its locks; a fresh `OpenFile` gets its reserved slot through
 `ReservedFd::install`, and `insert_current_fd` takes one by value for an
-exact slot. `install_current_fd` is a ktest-only reserve-and-install helper;
+exact slot; `install_current_fd` is a ktest-only reserve-and-install helper;
 `dup_current_fd` (`dup2`/`dup3`) and
 `dup_current_fd_from` (`F_DUPFD*`), each with a close-on-exec flag, count
 the slot they share),
@@ -8459,8 +8459,10 @@ file description had one thread (M7) and becomes possible once threads,
    `lseek` or `getdents64` of a regular file, directory or procfs file
    takes it before anything else and holds it across the user copies, so
    no other call on that description moves the offset meanwhile and the
-   snapshot-then-move always moves. Linux's
-   `fdget_pos` takes `f_pos_lock` for a file with `FMODE_ATOMIC_POS`
+   snapshot-then-move always moves. The `fcntl` record-lock commands
+   also read a `SEEK_CUR` offset under it, released before Lock 4 and
+   the wait. Linux's `fdget_pos` takes `f_pos_lock` for a file with
+   `FMODE_ATOMIC_POS`
    (regular files and directories) when the file is shared, and for a
    directory always (`file_needs_f_pos_lock`); Lumen takes it always (one
    uncontended `SleepMutex` when not shared). Pipes, FIFOs, ttys and
@@ -8479,8 +8481,9 @@ file description had one thread (M7) and becomes possible once threads,
    between choosing a slot and filling it (`openat`, `pipe2`) first takes
    the slot with a lumen-vfs `FdTable` addition: `reserve(from) ->
    Result<FdReservation, VfsError>` (the lowest free slot at or above
-   `from`, marked reserved; `VfsError::MFile` when none), then `install(r,
-   entry)` or `cancel(r)`. A reserved slot is neither open nor free:
+   `from`, marked reserved; `VfsError::MFile` when none), then
+   `install(r, file, cloexec)` or `cancel(r)`. A reserved slot is neither
+   open nor free:
    `close`, `fstat`, `/proc/<pid>/fd`, the table's copy at `fork`,
    `drain_cloexec`, `drain_all` and `iter_open` all skip it, and `dup2`
    onto it is `-EBUSY`, as Linux's `do_dup2`. `openat` reserves before it opens, so a
@@ -8491,15 +8494,19 @@ file description had one thread (M7) and becomes possible once threads,
    `files_struct`, which a process's threads share; the two differ only
    for `clone(CLONE_FILES)` without `CLONE_THREAD`, a deviation. The
    `EDEADLK` records move to the waiting thread: B8 changes lumen-vfs's
-   `PosixWaitGraph` to key a record by `(tgid, tid)` and to follow, from a
-   holding process, the record of its lowest-numbered waiting thread, as
-   Linux's `what_owner_is_waiting_for` follows the first blocked lock of
+   `PosixWaitGraph` to key a record by `Waiter { tgid, tid }` and to follow,
+   from a holding process, the record of its lowest-numbered waiting
+   thread, as Linux's `what_owner_is_waiting_for` follows the first blocked lock of
    an owner it finds (host-tested in `cargo:lumen-vfs`). Two threads of one
    process waiting in `F_SETLKW` keep a record each.
 
 Tested by `ktest:lumen_kernel::linux::process::shared_description_offsets_move_once`,
 `ktest:lumen_kernel::linux::process::shared_description_getdents_lists_once`,
-`ktest:lumen_kernel::linux::process::dup_and_openat_reserve_their_slot`
+`ktest:lumen_kernel::linux::process::dup_and_openat_reserve_their_slot`,
+`ktest:lumen_kernel::linux::process::open_reservation_survives_until_install`
+(a paused `openat` keeps slot `r`: `dup2` gets `EBUSY`, `F_DUPFD`
+gets `r + 1`, and the open returns `r`),
+`ktest:lumen_kernel::linux::syscall::lock::fcntl_seek_cur_uses_committed_position`
 and `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_thread`
 (section 15, "M8's tests", says what each checks).
 
@@ -10813,6 +10820,18 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   the kernel's `dup2` helper, driven directly onto a slot the ktest holds
   reserved, is `-EBUSY`; a full table refuses an `O_CREAT` before it
   creates.
+  `ktest:lumen_kernel::linux::process::open_reservation_survives_until_install`:
+  an `openat(O_CREAT)` paused after opening and before installation keeps
+  its reserved slot `r`: `dup2` onto it is `EBUSY`, `F_DUPFD` gets
+  `r + 1`, and the open returns exactly `r`. This check runs separately
+  from `dup_and_openat_reserve_their_slot` so neither hides the other's
+  failures.
+  `ktest:lumen_kernel::linux::syscall::lock::fcntl_seek_cur_uses_committed_position`:
+  a `SEEK_CUR` context read waits under contention until a tentative
+  offset is rolled back and then sees the committed offset; `SEEK_SET`
+  does not wait for Lock 0. This models the offset publication and rollback
+  at `lock_context`; it does not test Lock 0's absence across a
+  `F_SETLKW` wait.
   `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_thread`:
   two threads of one process blocked in `F_SETLKW` keep a record each, and
   a cycle through either is `EDEADLK`.

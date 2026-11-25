@@ -374,7 +374,7 @@ impl<F> FdTable<F> {
     /// Panics for a token from a different table; nothing is displaced.
     pub fn install(&mut self, r: FdReservation, file: F, cloexec: bool) -> i32 {
         self.cancel_reservation(&r);
-        assert!(self.slots[r.fd as usize].is_none());
+        assert!(self.slots[r.fd as usize].is_none(), "reserved fd {} filled before install", r.fd);
         self.slots[r.fd as usize] = Some(FdEntry { file, cloexec });
         r.fd
     }

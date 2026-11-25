@@ -71,9 +71,10 @@ impl UserFlock {
 }
 
 /// Where `spec`'s range is measured from, for lumen-vfs: `file`'s offset
-/// (Locks 0 and 2, released before the inode's Lock 4 is taken) and, for
-/// `SEEK_END` only, its size (`stat`, which takes Lock 4 itself). Read once
-/// per call: a `F_SETLKW` keeps the range it was given while it waits.
+/// for `SEEK_CUR` only, read under Lock 0 where the file has one and under
+/// Lock 2, both released before the inode's Lock 4 is taken. For `SEEK_END`
+/// only, read its size (`stat`, which takes Lock 4 itself). Read once per
+/// call: a `F_SETLKW` keeps the range it was given while it waits.
 fn lock_context(file: &FileRef, spec: &FlockSpec) -> Result<LockContext, u32> {
     let cur_offset = if spec.l_whence == fcntl_const::SEEK_CUR {
         // Exclude a read's tentative offset until its copy or give-back
@@ -1319,13 +1320,13 @@ crate::ktest!(
             kassert!(blocked);
             kassert_eq!(offset, Ok(4));
             // Other whence values do not need the current position.
-            let _pos = file.lock_pos().expect("procfs position");
+            let pos = file.lock_pos().expect("procfs position");
             let shared = Arc::clone(&file);
             let reader = process::spawn_test_thread(move |_| {
                 lock_context(&shared, &FlockSpec { l_whence: fcntl_const::SEEK_SET, ..spec }).map(|c| c.cur_offset)
             })?;
             let blocked = reader.settle();
-            drop(_pos);
+            drop(pos);
             let offset = reader.join()?;
             kassert!(!blocked);
             kassert_eq!(offset, Ok(0));
@@ -1372,8 +1373,8 @@ crate::ktest!(
                     neg_errno(errno::EDEADLK)
                 );
                 // Free only the lowest tid's range. Its done must not erase
-                // its sibling. Wait for that sibling to publish a current
-                // record after the release before testing its cycle.
+                // its sibling. Wait for the lowest tid's call to return;
+                // the probe below then waits for its sibling's current record.
                 kassert_eq!(ktest_lk(fd, general::F_SETLK, general::F_UNLCK, general::SEEK_SET, 0, 10)?, 0);
                 while !a_seen.first_done.load(Ordering::SeqCst) && !baton.b_ended.load(Ordering::SeqCst) {
                     crate::time::sleep(1_000_000);

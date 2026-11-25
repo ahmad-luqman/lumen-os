@@ -404,3 +404,10 @@ tests = [
     "cargo:lumen-vfs",
     "ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_thread",
 ]
+
+[[feature]]
+name = "M8 openat keeps its reserved slot through filesystem work: a paused open excludes dup2 with EBUSY, F_DUPFD takes the next slot, and the open returns its reserved fd (#379)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::process::open_reservation_survives_until_install",
+]

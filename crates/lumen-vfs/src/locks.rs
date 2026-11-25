@@ -441,6 +441,7 @@ struct WaitRecord {
 }
 
 /// A waiting thread's identity, ordered by process and then by thread.
+/// Field order matters: `wait_for` scans one tgid's contiguous range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Waiter {
     pub tgid: u32,

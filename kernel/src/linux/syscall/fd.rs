@@ -9,7 +9,8 @@
 //! and polls on the console's readiness; any other goes to its inode at the
 //! file's offset, through a bounce buffer on the stack. Lock 0 (`pos`)
 //! spans each position-based call and its user copies when the file has
-//! one (a regular file, procfs file or directory); Lock 2 never spans a user copy.
+//! one (a regular file, procfs file or directory); Lock 2 never spans a
+//! user copy.
 
 #[cfg(feature = "ktest")]
 use alloc::vec::Vec;
