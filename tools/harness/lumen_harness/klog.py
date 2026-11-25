@@ -214,6 +214,19 @@ HOST_TIMED = (
         "warned about again, not host-timed); a leaked_frames count it changes fails on its own",
     ),
     HostTimed(
+        r"WARN  mm: cpus 0x[0-9a-f]+ haven't answered TLB shootdown within 2 s \(still waiting\)$",
+        "kernel/src/mm/tlb.rs",
+        "haven't answered TLB shootdown within 2 s (still waiting)",
+        ("WARN  mm: cpus 0x6 haven't answered TLB shootdown within 2 s (still waiting)",),
+        (
+            "WARN  mm: cpus 0x4 still haven't flushed their TLBs: freed stack addresses wait for them",
+        ),
+        "a target vCPU stalled past 2 s before answering vector 0x3e (TLB_SHOOTDOWN) (#376): "
+        "shoot_down keeps waiting so frames are never freed while a stale translation may remain; "
+        "mm::tlb::shootdown_across_cpus checks cross-CPU invalidation, SpinLock deferral, active-mask exit, "
+        "and teardown waiting",
+    ),
+    HostTimed(
         UNDERRUN_WARNING + "$",
         "kernel/src/sound.rs",
         "a sound found the queue empty {} times (underruns)",

@@ -17,7 +17,9 @@
 
 use core::arch::asm;
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
+
+use crate::mm::user_vm::AddressSpace;
 
 use super::cpu::{rdmsr, wrmsr};
 
@@ -37,6 +39,10 @@ pub struct PerCpu {
     kernel_rsp: AtomicU64,
     user_rsp_scratch: AtomicU64,
     user_exit_rsp: AtomicU64,
+    /// User [`AddressSpace`] whose page-table root this CPU currently has
+    /// loaded in `CR3`, or null when running on `kernel_root()`. Kept alive by
+    /// the running (or outgoing, during a switch) thread's `UserThreadState`.
+    loaded_space: AtomicPtr<AddressSpace>,
 }
 
 /// Pinned byte offsets into [`PerCpu`] for assembly entry/exit stubs.
@@ -63,6 +69,7 @@ static CPUS: [PerCpu; MAX_CPUS] = {
             kernel_rsp: AtomicU64::new(0),
             user_rsp_scratch: AtomicU64::new(0),
             user_exit_rsp: AtomicU64::new(0),
+            loaded_space: AtomicPtr::new(core::ptr::null_mut()),
         }
     }; MAX_CPUS];
     let mut i = 0;
@@ -140,6 +147,20 @@ pub fn set_user_exit_rsp(rsp: u64) {
 #[inline]
 pub fn user_exit_rsp() -> u64 {
     CPUS[index()].user_exit_rsp.load(Ordering::Relaxed)
+}
+
+/// Read the user [`AddressSpace`] currently loaded in this CPU's `CR3`
+/// (null when running on `kernel_root()`). Call with interrupts disabled.
+#[inline]
+pub fn loaded_space() -> *const AddressSpace {
+    CPUS[index()].loaded_space.load(Ordering::Relaxed).cast_const()
+}
+
+/// Record the user [`AddressSpace`] loaded in this CPU's `CR3` (or null for
+/// `kernel_root()`). Call with interrupts disabled alongside the `CR3` write.
+#[inline]
+pub fn set_loaded_space(space: *const AddressSpace) {
+    CPUS[index()].loaded_space.store(space.cast_mut(), Ordering::Relaxed);
 }
 
 /// This CPU's `IA32_GS_BASE` (for ktests).
