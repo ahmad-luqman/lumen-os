@@ -202,14 +202,15 @@ impl SavedRsp {
 }
 
 /// Per-user-thread hardware and VM state carried across context switches,
-/// and the thread's Linux identity.
+/// and the thread's Linux identity and restart block.
 ///
 /// Accessed only on its thread's home CPU with interrupts off: by
 /// `schedule` switching to and from the thread, and by the thread itself
 /// (`detach_user_space`, a `UserSpaceGuard`, `arch_prctl`'s
-/// `set_current_fs_base`, the `#PF` path's `current_address_space`, and
-/// `current_user_thread` and `set_current_user_thread`, which a Linux
-/// process's registration, syscalls and takedown call); or exclusively in
+/// `set_current_fs_base`, the `#PF` path's `current_address_space`, the
+/// restart-block accessors (`set_restart_block`, `take_restart_block`,
+/// `restart_block`), and `current_user_thread`/`set_current_user_thread`,
+/// which a Linux process's registration, syscalls and takedown call); or exclusively in
 /// `Drop`.
 struct UserThreadState {
     address_space: Arc<AddressSpace>,
@@ -310,7 +311,7 @@ pub struct Thread {
     cpu: usize,
     state: AtomicU8,
     rsp: SavedRsp,
-    /// Optional per-process user VM, FPU, TLS, and ring-3 stack state.
+    /// Optional per-process user VM, FPU, TLS, ring-3 stack and restart-block state.
     user: UserSlot,
     /// Its stack: `None` for a thread adopted from code that was already
     /// running on a stack it doesn't own (`main`, an AP's idle thread), and
@@ -335,7 +336,7 @@ pub struct Thread {
     /// Linux's `TIF_SIGPENDING`, "look at the pending signals": set by a
     /// sender before its [`kick`], cleared only by the thread itself in the
     /// syscall-exit hook when nothing deliverable is left
-    /// (`linux::signal::exit_to_user`). An interruptible wait reads it.
+    /// (`linux::signal::settle_pending`). An interruptible wait reads it.
     sigpending: AtomicBool,
     /// Linux's `__fatal_signal_pending`: set before the [`kick`] by whatever
     /// ends the thread (a group kill, `de_thread`), never cleared. A
@@ -448,17 +449,19 @@ impl Thread {
         self.sigpending.store(true, Ordering::SeqCst);
     }
 
-    /// Mark it as ending (a group kill, `de_thread`): with
-    /// [`set_sigpending`](Self::set_sigpending), before the [`kick`] that
+    /// Mark it as ending (a group kill, `de_thread`), also setting
+    /// `sigpending`, before the [`kick`] that
     /// ends a killable wait. Never undone.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C1's and C3's group kills next
     pub fn set_fatal_pending(&self) {
+        self.set_sigpending();
         self.fatal_pending.store(true, Ordering::SeqCst);
     }
 
-    /// The syscall-exit hook's clear, when nothing deliverable is left (the
-    /// thread's own, under its process's signal lock when it has one).
-    pub(crate) fn clear_sigpending(&self) {
+    /// Ktests only: release a broken syscall-exit loop so its test can
+    /// join the user thread and report the failed return assertion.
+    #[cfg(feature = "ktest")]
+    pub(crate) fn clear_sigpending_for_test(&self) {
         self.sigpending.store(false, Ordering::SeqCst);
     }
 
@@ -700,9 +703,8 @@ static HELD_SAW_JOINER: AtomicBool = AtomicBool::new(false);
 static HELD_NS: AtomicU64 = AtomicU64::new(0);
 /// Ktests: the knob that stalls one thread's next [`WaitQueue`] wait at a
 /// [`StallAt`] point, holding only the queue's lock (with interrupts off),
-/// while another CPU kicks it: on either side of setting itself `Blocked`,
-/// before it reads what is pending, the window a lost signal would fall
-/// into (`kick_racing_a_block_is_never_lost`).
+/// while another CPU kicks it: before `Blocked`, before the pending read,
+/// or after that read was false (`kick_racing_a_block_is_never_lost`).
 #[cfg(feature = "ktest")]
 pub(crate) static BLOCK_DELAY: BlockDelay = BlockDelay::new();
 
@@ -714,8 +716,12 @@ pub(crate) enum StallAt {
     /// it running and does nothing, so only its own read of what is pending,
     /// after `Blocked`, can end the wait.
     BeforeBlocked = 1,
-    /// `Blocked`, before it reads what is pending: the kick must queue it.
+    /// `Blocked`, before the pending read: either the kick or that read
+    /// can end the wait. A separate state assertion checks the kick.
     AfterBlocked = 2,
+    /// `Blocked`, after the pending read was false, before `schedule`:
+    /// only the kick can queue it and end the wait.
+    AfterRead = 3,
 }
 
 /// [`BLOCK_DELAY`]'s state: the thread to stall (0: none) and where,
@@ -751,8 +757,8 @@ impl BlockDelay {
         self.thread.store(id, Ordering::SeqCst);
     }
 
-    /// Whether the armed thread is stalled in its wait now (it is
-    /// `Blocked`, and hasn't yet read what is pending).
+    /// Whether the armed thread is at its configured `StallAt` point now;
+    /// at `BeforeBlocked` it is still running.
     pub(crate) fn stalled(&self) -> bool {
         self.stalled.load(Ordering::SeqCst)
     }
@@ -778,10 +784,18 @@ impl BlockDelay {
         }
         self.stalled.store(true, Ordering::SeqCst);
         let end = time::now_ns() + 1_000_000_000;
-        while !self.go.load(Ordering::SeqCst) && time::now_ns() < end {
+        let timed_out = loop {
+            if self.go.load(Ordering::SeqCst) {
+                break false;
+            }
+            if time::now_ns() >= end {
+                break true;
+            }
             core::hint::spin_loop();
-        }
-        self.timed_out.store(!self.go.load(Ordering::SeqCst), Ordering::SeqCst);
+        };
+        // Preserve why the loop ended: a late release must not turn an
+        // expired stall into an apparently clean round.
+        self.timed_out.store(timed_out, Ordering::SeqCst);
         self.stalled.store(false, Ordering::SeqCst);
     }
 }
@@ -1062,39 +1076,36 @@ pub(crate) fn set_current_user_thread(linux: Option<Arc<UserThread>>) -> Option<
 /// Panics if the current thread has no user state (a kernel thread).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's and B3's handlers next
 pub fn set_restart_block(block: Option<RestartBlock>) -> Option<RestartBlock> {
+    with_restart_block(|slot| core::mem::replace(slot, block)).expect("set_restart_block on a kernel thread")
+}
+
+/// Access the current user thread's restart block with interrupts off.
+fn with_restart_block<R>(f: impl FnOnce(&mut Option<RestartBlock>) -> R) -> Option<R> {
     let _irq = arch::irq::push_off();
-    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
-    assert!(!t.is_null(), "set_restart_block before sched::init");
-    // SAFETY: `t` is the running thread on this CPU with interrupts off, and
-    // only this thread touches its restart block.
-    let user = unsafe { (*t).user.as_ref() }.expect("set_restart_block on a kernel thread");
-    // SAFETY: as above: no other reference into the cell is live.
-    unsafe { core::mem::replace(&mut *user.restart.get(), block) }
+    with_current(|t| {
+        // SAFETY: only the running thread touches its user state and restart
+        // block, interrupts are off, and no reference escapes this callback.
+        unsafe { t.user.as_ref().map(|u| f(&mut *u.restart.get())) }
+    })
+    .flatten()
 }
 
 /// Take the current user thread's restart block, leaving none
 /// (`restart_syscall`): `None` if it has none, or is a kernel thread.
 pub fn take_restart_block() -> Option<RestartBlock> {
-    let _irq = arch::irq::push_off();
-    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
-    if t.is_null() {
-        return None;
-    }
-    // SAFETY: `t` is the running thread on this CPU with interrupts off, and
-    // only this thread touches its restart block.
-    unsafe { (*t).user.as_ref().and_then(|u| (*u.restart.get()).take()) }
+    with_restart_block(Option::take).flatten()
 }
 
 /// The current user thread's restart block, left in place (ktests).
 #[cfg(feature = "ktest")]
 pub fn restart_block() -> Option<RestartBlock> {
-    let _irq = arch::irq::push_off();
-    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
-    if t.is_null() {
-        return None;
-    }
-    // SAFETY: as in `take_restart_block`.
-    unsafe { (*t).user.as_ref().and_then(|u| *u.restart.get()) }
+    with_restart_block(|slot| *slot).flatten()
+}
+
+/// Clear only the running thread's flag when nothing deliverable remains.
+/// The caller holds its process's signal lock when it has one.
+pub(crate) fn clear_current_sigpending() {
+    let _ = with_current(|t| t.sigpending.store(false, Ordering::SeqCst));
 }
 
 /// Whether the running thread has a signal to look at (`sigpending`),
@@ -1884,8 +1895,20 @@ enum WaitKind {
     Killable = 2,
 }
 
+impl WaitKind {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Uninterruptible,
+            1 => Self::Interruptible,
+            2 => Self::Killable,
+            _ => unreachable!("only a WaitKind is stored"),
+        }
+    }
+}
+
 /// How a [`WaitQueue::wait_interruptible`] or [`WaitQueue::wait_killable`]
 /// ended.
+#[must_use]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
     /// Its condition held (checked first: a wake that won the race with a
@@ -1946,7 +1969,7 @@ impl WaitQueue {
     /// kept under a `SleepMutex` is read through a sequence number its
     /// changers bump), and must not block or take a lock held around a
     /// wake. A sender sets `sigpending` and then calls [`kick`]: the thread
-    /// reads it only after it is queued and `Blocked`, so of the sender's
+    /// reads it again after it is queued and `Blocked`, so of the sender's
     /// store and the thread's block one sees the other (no signal is lost).
     /// Every way out takes the thread's entries off the queue and its CPU's
     /// sleepers. Panics where the thread can't block, as `wait_until` does.
@@ -2031,7 +2054,12 @@ impl WaitQueue {
                 // switches through `schedule`, which takes it off the run
                 // queue again.
                 core::sync::atomic::fence(Ordering::SeqCst);
-                me.pending_for(kind) && me.try_change(State::Blocked, State::Running)
+                let pending = me.pending_for(kind);
+                #[cfg(feature = "ktest")]
+                if !pending {
+                    BLOCK_DELAY.stall(&me, StallAt::AfterRead);
+                }
+                pending && me.try_change(State::Blocked, State::Running)
             };
             if !interrupted {
                 schedule(cpu);
@@ -2121,8 +2149,12 @@ fn wake(thread: Arc<Thread>) -> bool {
 /// thread, `fatal_pending`): see [`WaitQueue::wait_interruptible`] for why
 /// none is lost. A thread in any other wait (or running) is left alone: it
 /// looks at `sigpending` at its next return to ring 3 or interruptible
-/// wait. Never blocks; callable from any thread or CPU, with a spinlock
-/// held (it takes the thread's CPU's run queue lock, the innermost).
+/// wait. A stale kind may spuriously wake a later wait, which harmlessly
+/// rechecks its condition and pending flags. Never blocks; callable from
+/// any CPU while holding a signal or wait-queue lock, but not a run-queue
+/// lock or a lock nested inside it (thread stacks, heap, page tables and
+/// frame allocator).
+/// It takes the target CPU's run-queue lock; `smp::wake` takes no lock.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C5's senders next
 pub fn kick(thread: &Thread) {
     // Pairs with the fence in `WaitQueue::block` between `Blocked` and its
@@ -2131,12 +2163,8 @@ pub fn kick(thread: &Thread) {
     if thread.state.load(Ordering::SeqCst) != State::Blocked as u8 {
         return;
     }
-    let ends = match thread.wait_kind.load(Ordering::SeqCst) {
-        k if k == WaitKind::Interruptible as u8 => true,
-        k if k == WaitKind::Killable as u8 => thread.fatal_pending(),
-        _ => false,
-    };
-    if !ends {
+    let kind = WaitKind::from_u8(thread.wait_kind.load(Ordering::SeqCst));
+    if !thread.pending_for(kind) {
         return;
     }
     // Upgraded only to queue it: a thread being dropped isn't blocked.
@@ -4006,7 +4034,7 @@ crate::ktest!(
             kassert_eq!(entries_of(&me, &q), (false, false));
             Ok(())
         })();
-        me.clear_sigpending();
+        clear_current_sigpending();
         unblocked?;
 
         let start = time::now_ns();
@@ -4014,13 +4042,21 @@ crate::ktest!(
         kassert!(time::now_ns() >= start + 5_000_000);
         kassert_eq!(entries_of(&me, &q), (false, false));
 
+        // A signal observed after Blocked but before scheduling must
+        // remove both its queue entry and its far-future deadline entry.
+        kassert_eq!(
+            kick_into_a_stalled_block(false, StallAt::BeforeBlocked, true)?,
+            Some(wake_code(Wake::Interrupted))
+        );
+
         // Woken by a waker on another CPU.
         let s = Arc::new(Waiting::default());
-        let w = s.clone();
+        let (w, target) = (s.clone(), me.clone());
         let waker = spawn_test(last_cpu()?, "waker", move || {
-            let _ = sleep(2_000_000);
-            w.ready.store(true, Ordering::SeqCst);
-            w.queue.wake_all();
+            if yield_until(|| target.state() == State::Blocked && entries_of(&target, &w.queue).1) {
+                w.ready.store(true, Ordering::SeqCst);
+                w.queue.wake_all();
+            }
         })?;
         let woke = s.queue.wait_interruptible(far(time::now_ns()), || s.ready.load(Ordering::SeqCst));
         join_bounded(waker)?;
@@ -4037,7 +4073,7 @@ crate::ktest!(
             }
         })?;
         let kicked = s.queue.wait_interruptible(far(time::now_ns()), || false);
-        me.clear_sigpending();
+        clear_current_sigpending();
         join_bounded(kicker)?;
         kassert_eq!(kicked, Wake::Interrupted);
         kassert_eq!(entries_of(&me, &s.queue), (false, false));
@@ -4046,77 +4082,97 @@ crate::ktest!(
         // waker comes.
         let s = Arc::new(Waiting::default());
         let (k, target) = (s.clone(), me.clone());
-        let kicker = spawn_test(last_cpu()?, "kicker", move || {
-            if yield_until(|| target.state() == State::Blocked && entries_of(&target, &k.queue).1) {
-                target.set_sigpending();
-                kick(&target);
-                let _ = sleep(5_000_000);
-                let still = target.state() == State::Blocked;
-                k.answer(1, if still { Wake::Woken } else { Wake::Interrupted });
-            }
-            k.ready.store(true, Ordering::SeqCst);
-            k.queue.wake_all();
-        })?;
-        s.queue.wait_until(|| s.ready.load(Ordering::SeqCst));
-        me.clear_sigpending();
-        join_bounded(kicker)?;
-        kassert_eq!(s.answered.load(Ordering::SeqCst), 1);
-        kassert_eq!(s.answer.load(Ordering::SeqCst), wake_code(Wake::Woken));
+        let still_blocked = AtomicBool::new(false);
+        let cpu = last_cpu()?;
+        scope(|scope| -> Result<(), &'static str> {
+            scope
+                .spawn_on(cpu, "kicker", || {
+                    if yield_until(|| target.state() == State::Blocked && entries_of(&target, &k.queue).1) {
+                        target.set_sigpending();
+                        kick(&target);
+                        let _ = sleep(5_000_000);
+                        still_blocked.store(target.state() == State::Blocked, Ordering::SeqCst);
+                    }
+                    k.ready.store(true, Ordering::SeqCst);
+                    k.queue.wake_all();
+                })
+                .map_err(|_| "spawn failed")?;
+            s.queue.wait_until(|| s.ready.load(Ordering::SeqCst));
+            clear_current_sigpending();
+            Ok(())
+        })
+        .map_err(|_| "scope failed")??;
+        kassert!(still_blocked.load(Ordering::SeqCst));
         Ok(())
     }
 );
 
-/// The race ktests' round with [`BLOCK_DELAY`]: a waiter on another CPU
-/// stalled `at` a point before its read of what is pending while this
-/// thread sets the flags (`killable`: `fatal_pending` too, as `de_thread`
-/// does, with no group exit anywhere) and kicks it, in a wait of that kind
-/// with no deadline (nothing else could end it): its answer, or `None` if
-/// the kick was lost (the waiter then let go).
+/// Exercise a configured stall, retrying only rounds whose 1 s stall
+/// bound expired on a busy host. The far-deadline round covers cleanup
+/// when the waiter observes the signal itself, without scheduling.
 #[cfg(feature = "ktest")]
-fn kick_into_a_stalled_block(killable: bool, at: StallAt) -> Result<Option<u8>, &'static str> {
-    let s = Arc::new(Waiting::default());
-    let w = s.clone();
-    let waiter = spawn_test(last_cpu()?, "stalled", move || {
-        if w.wait_go(1) {
-            let ready = || w.ready.load(Ordering::SeqCst);
-            let woke =
-                if killable { w.queue.wait_killable(None, ready) } else { w.queue.wait_interruptible(None, ready) };
-            w.answer(1, woke);
+fn kick_into_a_stalled_block(killable: bool, at: StallAt, deadline: bool) -> Result<Option<u8>, &'static str> {
+    for _ in 0..5 {
+        let s = Arc::new(Waiting::default());
+        let w = s.clone();
+        let clean_entries = Arc::new(AtomicBool::new(false));
+        let clean = clean_entries.clone();
+        let waiter = spawn_test(last_cpu()?, "stalled", move || {
+            if w.wait_go(1) {
+                let ready = || w.ready.load(Ordering::SeqCst);
+                let until = deadline.then(|| time::now_ns() + TEST_DEADLINE_NS);
+                let woke = if killable {
+                    w.queue.wait_killable(until, ready)
+                } else {
+                    w.queue.wait_interruptible(until, ready)
+                };
+                clean.store(entries_of(&current().expect("a thread"), &w.queue) == (false, false), Ordering::SeqCst);
+                w.answer(1, woke);
+            }
+        })?;
+        let t = waiter.thread.clone();
+        BLOCK_DELAY.arm(t.id, at);
+        s.go.store(1, Ordering::SeqCst);
+        let stalled = yield_until(|| BLOCK_DELAY.stalled());
+        // No pending flag means no wake, even for an interruptible kind.
+        kick(&t);
+        let before_signal = t.state();
+        if killable {
+            t.set_fatal_pending();
+        } else {
+            t.set_sigpending();
         }
-    })?;
-    let t = waiter.thread.clone();
-    BLOCK_DELAY.arm(t.id, at);
-    s.go.store(1, Ordering::SeqCst);
-    let stalled = yield_until(|| BLOCK_DELAY.stalled());
-    t.set_sigpending();
-    if killable {
-        t.set_fatal_pending();
+        kick(&t);
+        // Capture before release: after the false read only kick can
+        // change Blocked to Ready. BeforeBlocked deliberately stays Running.
+        let after_kick = t.state();
+        BLOCK_DELAY.release();
+        let answer = s.wait_answer(1);
+        join_bounded(waiter)?;
+        if BLOCK_DELAY.timed_out() {
+            continue;
+        }
+        crate::kassert!(stalled);
+        crate::kassert_eq!(before_signal, if at == StallAt::BeforeBlocked { State::Running } else { State::Blocked });
+        crate::kassert!(t.sigpending()); // a fatal flag implies pending too
+        crate::kassert_eq!(after_kick, if at == StallAt::BeforeBlocked { State::Running } else { State::Ready });
+        crate::kassert!(clean_entries.load(Ordering::SeqCst));
+        return Ok(answer);
     }
-    kick(&t);
-    BLOCK_DELAY.release();
-    let answer = s.wait_answer(1);
-    join_bounded(waiter)?;
-    crate::kassert!(stalled);
-    crate::kassert!(!BLOCK_DELAY.timed_out());
-    Ok(answer)
+    Err("no clean stalled round in five attempts")
 }
 
 crate::ktest!(
     fn kick_racing_a_block_is_never_lost() {
-        // With `BLOCK_DELAY` stalling the waiter just before and just after
-        // it sets itself `Blocked` (before it reads `sigpending`) while
-        // this CPU kicks: `Interrupted` (a waiter that read the flag before
-        // `Blocked` would miss a kick landing while it still ran, and
-        // sleep for good; a kick that didn't queue a `Blocked` waiter
-        // would leave it asleep). Then 300 rounds
-        // of one waiter on another CPU against kicks this CPU sends after a
-        // varying delay, landing before, during and after its block: every
-        // round `Interrupted`, none lost.
+        // BeforeBlocked proves the waiter's pending read; AfterBlocked
+        // permits either side to end the wait but checks the kick's state
+        // change; AfterRead requires kick to queue the waiter. Then 300
+        // unstalled rounds vary when the kick lands around the block.
         use crate::{kassert, kassert_eq};
         const ROUNDS: u64 = 300;
-        for at in [StallAt::BeforeBlocked, StallAt::AfterBlocked] {
+        for at in [StallAt::BeforeBlocked, StallAt::AfterBlocked, StallAt::AfterRead] {
             for _ in 0..3 {
-                let answer = kick_into_a_stalled_block(false, at)?;
+                let answer = kick_into_a_stalled_block(false, at, false)?;
                 if answer != Some(wake_code(Wake::Interrupted)) {
                     crate::ktest::diag(format_args!("stalled {at:?}"));
                 }
@@ -4131,7 +4187,7 @@ crate::ktest!(
                     return;
                 }
                 let woke = w.queue.wait_interruptible(None, || w.ready.load(Ordering::SeqCst));
-                current().expect("a thread").clear_sigpending();
+                clear_current_sigpending();
                 w.answer(round, woke);
             }
         })?;
@@ -4167,16 +4223,14 @@ crate::ktest!(
 
 crate::ktest!(
     fn fatal_kick_racing_a_killable_block_is_never_lost() {
-        // The same stalls in a killable wait, kicked after `fatal_pending`
-        // with no group exit (as `de_thread` gives): `Interrupted`. A waiter
-        // reading `fatal_pending` before `Blocked` (the stall before it), or
-        // a kick judging a signal fatal by anything but `fatal_pending` (the
-        // stall after it), never wakes it.
-        // Each round a fresh thread (`fatal_pending` is never cleared).
+        // The same three stalls with fatal_pending alone (its setter also
+        // sets sigpending), as de_thread does without group exit. AfterRead
+        // requires kick's killable leg; each round uses a fresh thread
+        // because fatal_pending is never cleared.
         use crate::kassert_eq;
-        for at in [StallAt::BeforeBlocked, StallAt::AfterBlocked] {
+        for at in [StallAt::BeforeBlocked, StallAt::AfterBlocked, StallAt::AfterRead] {
             for _ in 0..3 {
-                let answer = kick_into_a_stalled_block(true, at)?;
+                let answer = kick_into_a_stalled_block(true, at, false)?;
                 if answer != Some(wake_code(Wake::Interrupted)) {
                     crate::ktest::diag(format_args!("stalled {at:?}"));
                 }
@@ -4232,6 +4286,22 @@ crate::ktest!(
         kassert_eq!(woke, Some(wake_code(Wake::Woken)));
         kassert!(second_blocked);
         kassert_eq!(killed, Some(wake_code(Wake::Interrupted)));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn interrupt_return_to_kernel_keeps_sigpending() {
+        let me = current().ok_or("a thread")?;
+        crate::kassert!(arch::irq::enabled());
+        me.set_sigpending();
+        let start = time::ticks();
+        while time::ticks().wrapping_sub(start) < 3 {
+            core::hint::spin_loop();
+        }
+        let pending = me.sigpending();
+        clear_current_sigpending();
+        crate::kassert!(pending);
         Ok(())
     }
 );

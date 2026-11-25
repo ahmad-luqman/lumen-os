@@ -305,15 +305,6 @@ impl Process {
         self.signal.lock().action(signal)
     }
 
-    /// The syscall-exit hook's last step for its running thread (B2): under
-    /// `signal`, where senders set it, clear that thread's `sigpending`,
-    /// nothing being deliverable (C5 looks at the pending signals here
-    /// first).
-    pub fn settle_sigpending(&self) {
-        let _signal = self.signal.lock();
-        let _ = sched::with_current(sched::Thread::clear_sigpending);
-    }
-
     /// Its address space (a clone, dropped by the caller with no lock
     /// held), until its takedown.
     fn address_space(&self) -> Option<Arc<AddressSpace>> {
@@ -844,6 +835,14 @@ pub fn try_current_thread() -> Option<Arc<UserThread>> {
 /// syscall or fault handler always runs on one).
 pub fn current_thread() -> Arc<UserThread> {
     try_current_thread().expect("ring-3 syscall with no Linux thread")
+}
+
+/// Clear the running thread's pending flag under its own process's signal
+/// lock, where senders set it. C5 checks deliverable signals here first.
+pub fn settle_current_sigpending() {
+    let thread = current_thread();
+    let _signal = thread.process().signal.lock();
+    sched::clear_current_sigpending();
 }
 
 /// The current thread's process (see [`current_thread`]).

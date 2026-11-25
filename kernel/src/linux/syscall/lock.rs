@@ -149,8 +149,10 @@ fn lock_or_wait<H: Copy>(
             Step::Done { .. } => return Ok(()),
             Step::Wait { holder, .. } => {
                 before_wait(holder, seen)?;
-                if process::wait_for_lock_release(seen) == crate::sched::Wake::Interrupted {
-                    return Err(crate::linux::signal::ERESTARTSYS);
+                match process::wait_for_lock_release(seen) {
+                    crate::sched::Wake::Woken => {}
+                    crate::sched::Wake::Interrupted => return Err(crate::linux::signal::ERESTARTSYS),
+                    crate::sched::Wake::TimedOut => unreachable!("a lock wait has no deadline"),
                 }
             }
         }
@@ -1520,17 +1522,17 @@ crate::ktest!(
             },
             move |baton| {
                 baton.wait_for(1, &baton.a_ended)?;
-                *B_THREAD.lock() = sched::current();
-                let me = || sched::current().ok_or("a thread");
+                let me = sched::current().ok_or("a thread")?;
+                *B_THREAD.lock() = Some(me.clone());
                 let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
                 baton.go(2);
                 let setlkw = ktest_lk(fd, setw, wr, seek_set, 0, 10)?;
-                let pending = me()?.sigpending();
-                me()?.clear_sigpending();
+                let pending = me.sigpending();
+                sched::clear_current_sigpending();
                 let waiting = process::lock_waiters();
                 baton.go(3);
                 let flock = sys_flock(fd, ex);
-                me()?.clear_sigpending();
+                sched::clear_current_sigpending();
                 baton.go(4);
                 crate::kassert_eq!(setlkw, interrupted);
                 crate::kassert!(pending);

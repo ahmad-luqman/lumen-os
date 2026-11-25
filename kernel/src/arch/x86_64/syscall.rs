@@ -356,7 +356,12 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
     let mode = crate::user::dispatch_syscall(frame);
 
     // The restart decision runs once, on the first pass.
-    let mut syscall = lumen_signal::restart::SyscallExit::new(orig_rax);
+    // C5's rt_sigreturn restores user registers, not a syscall to restart.
+    let mut syscall = if orig_rax == linux_raw_sys::general::__NR_rt_sigreturn as u64 {
+        None
+    } else {
+        lumen_signal::restart::SyscallExit::new(orig_rax)
+    };
     loop {
         crate::linux::signal::exit_to_user(frame, syscall.take());
         let _ = irq::disable();
@@ -377,6 +382,8 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
         SyscallReturn::Sysret => {
             frame.rcx = frame.rip;
             frame.r11 = frame.rflags;
+            #[cfg(feature = "ktest")]
+            crate::user::record_restart_return_for_test(orig_rax, frame);
             0
         }
         SyscallReturn::Iret => {

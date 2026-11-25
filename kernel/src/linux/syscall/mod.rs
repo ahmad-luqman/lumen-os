@@ -871,7 +871,7 @@ crate::ktest!(
         // `-EINTR`. Each pass clears `sigpending`. A restart-looking `rax`
         // with no syscall context, or an ordinary result, is left alone.
         use crate::linux::process::{self, KernelSigaction, set_current_action};
-        use crate::linux::signal::{RestartBlock, exit_to_user, raise_for_test, restart_result};
+        use crate::linux::signal::{RestartBlock, exit_to_user, interrupted_with, raise_for_test, restart_result};
         use crate::sched;
         use crate::{kassert, kassert_eq};
         use lumen_signal::Signal;
@@ -909,9 +909,9 @@ crate::ktest!(
             // -ERESTART_RESTARTBLOCK with a block: 219, the block kept.
             let deadline = crate::time::now_ns() + 3_000_000_000;
             let block = RestartBlock { resume, deadline: Some(deadline), args: [5, 6, 7, 8] };
-            kassert!(sched::set_restart_block(Some(block)).is_none());
+            let mut frame = frame_of(interrupted_with(block));
+            kassert_eq!(frame.rax, restart_result(RestartCode::RestartBlock));
             raise_for_test(&me, Signal::USR1);
-            let mut frame = frame_of(restart_result(RestartCode::RestartBlock));
             exit_to_user(&mut frame, SyscallExit::new(NANOSLEEP));
             kassert_eq!((frame.rax, frame.rip), (RESTART_SYSCALL, RIP - 2));
             kassert!(!me.sigpending());
@@ -935,6 +935,26 @@ crate::ktest!(
             kassert_eq!(frame.rax, RESTART_SYSCALL);
             let _ = dispatch(&mut frame);
             kassert_eq!(frame.rax, eintr);
+
+            // A corrupt return address cannot rewind: EINTR, rip intact,
+            // and a restart block is reset rather than left for a later call.
+            for code in [RestartCode::NoIntr, RestartCode::RestartBlock] {
+                let mut frame = frame_of(if code == RestartCode::RestartBlock {
+                    interrupted_with(block)
+                } else {
+                    restart_result(code)
+                });
+                frame.rip = 1;
+                exit_to_user(&mut frame, SyscallExit::new(NANOSLEEP));
+                kassert_eq!((frame.rax, frame.rip), (eintr, 1));
+                kassert!(sched::restart_block().is_none());
+            }
+            // No restart context must also discard a RestartBlock result's
+            // stored block, without interpreting user registers as a syscall.
+            let mut frame = frame_of(interrupted_with(block));
+            exit_to_user(&mut frame, None);
+            kassert_eq!((frame.rax, frame.rip), (restart_result(RestartCode::RestartBlock), RIP));
+            kassert!(sched::restart_block().is_none());
 
             // No syscall context (an interrupt's return): nothing changes,
             // whatever `rax` holds; the flag is still cleared.

@@ -170,16 +170,21 @@ def check_sections(readobj: str) -> list[Finding]:
 READ_ONLY_WRITABLE = {".got"}
 
 
+def nm_symbols(nm: str) -> dict[str, int]:
+    """Read defined symbol addresses from llvm-nm's default output."""
+    return {
+        name: int(addr, 16)
+        for addr, _, name in re.findall(r"^([0-9a-f]+) (\w) (\S+)$", nm, re.MULTILINE)
+    }
+
+
 def check_image_bounds(readobj: str, nm: str) -> list[Finding]:
     """Check every allocated section (`llvm-readobj --sections`) lies inside
     [__kernel_start, __kernel_end), and in the segment the page tables give
     the rights it needs: writable sections in [__data_start, __kernel_end),
     executable ones in [__kernel_start, __rodata_start) (symbols from
     `llvm-nm`)."""
-    symbols = {
-        name: int(addr, 16)
-        for addr, _, name in re.findall(r"^([0-9a-f]+) (\w) (\S+)$", nm, re.MULTILINE)
-    }
+    symbols = nm_symbols(nm)
     names = ("__kernel_start", "__rodata_start", "__data_start", "__kernel_end")
     missing = [n for n in names if n not in symbols]
     if missing:
@@ -235,10 +240,7 @@ def check_fixup_sections(readobj: str, nm: str) -> list[Finding]:
     """Check each of `FIXUP_SECTIONS` (`llvm-readobj --sections`) is present,
     non-empty, neither writable nor executable, and inside
     [__rodata_start, __data_start) (symbols from `llvm-nm`)."""
-    symbols = {
-        name: int(addr, 16)
-        for addr, _, name in re.findall(r"^([0-9a-f]+) (\w) (\S+)$", nm, re.MULTILINE)
-    }
+    symbols = nm_symbols(nm)
     if "__rodata_start" not in symbols or "__data_start" not in symbols:
         return [Finding("fixup", "__rodata_start or __data_start missing from the symbol table")]
     rodata, data = symbols["__rodata_start"], symbols["__data_start"]

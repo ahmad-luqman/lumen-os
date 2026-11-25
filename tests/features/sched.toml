@@ -132,7 +132,7 @@ tests = [
 ]
 
 [[feature]]
-name = "One interruptible, killable blocking wait (#373, B2): `WaitQueue::wait_interruptible`/`wait_killable` answer `Woken` (checked first, even with a signal pending), `TimedOut` (never before the deadline) or `Interrupted`; `sched::kick` racing a block never loses the signal (a stall between `Blocked` and the read of `sigpending`, and of `fatal_pending` for a killable wait kicked as `de_thread` does); a killable wait ignores a non-fatal kick; `F_SETLKW` and a blocking `flock` interrupted answer `-ERESTARTSYS`, nothing taken"
+name = "One interruptible, killable blocking wait (#373, B2): `WaitQueue::wait_interruptible`/`wait_killable` answer `Woken` (checked first, even with a signal pending), `TimedOut` (never before the deadline) or `Interrupted`; `sched::kick` racing a block never loses the signal (stalls before `Blocked`, before the pending read, and after it was false; the blocked stalls assert `Ready` immediately after kick, for both interruptible and killable waits; expired stalls retry up to five times); a killable wait ignores a non-fatal kick; `F_SETLKW` and a blocking `flock` interrupted answer `-ERESTARTSYS`, nothing taken"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::sched::wait_interruptible_answers_woken_timed_out_and_interrupted",
@@ -143,11 +143,13 @@ tests = [
 ]
 
 [[feature]]
-name = "The syscall-exit hook and `restart_syscall` (#373, B2): with no handler to deliver, `-ERESTARTSYS`, `-ERESTARTNOINTR` and `-ERESTARTNOHAND` restart the syscall and `-ERESTART_RESTARTBLOCK` becomes `restart_syscall` (219), which resumes the thread's restart block (its deadline unchanged), or answers `-EINTR` with none; each return to ring 3 (a syscall's, or an interrupt's, the timer's preemption included) clears `sigpending` when nothing is deliverable"
+name = "The syscall-exit hook and `restart_syscall` (#373, B2): with no handler to deliver, the hook rewrites the frame to restart for `-ERESTARTSYS`, `-ERESTARTNOINTR` and `-ERESTARTNOHAND` and `-ERESTART_RESTARTBLOCK` becomes `restart_syscall` (219), which resumes the thread's restart block (its deadline unchanged), or answers `-EINTR` with none; a real syscall restarts once through `sysretq` with its original number and `rip` rewound by 2; a syscall's return to ring 3 and an interrupt's return to ring 3 (non-IST vectors, the timer's preemption included) clear `sigpending` when nothing is deliverable; returns to kernel mode keep it for at least three ticks"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::linux::syscall::restart_with_no_handler_restarts_or_resumes",
     "ktest:lumen_kernel::user::interrupt_return_to_ring3_clears_sigpending",
+    "ktest:lumen_kernel::user::syscall_return_restarts_once_through_sysret",
+    "ktest:lumen_kernel::sched::interrupt_return_to_kernel_keeps_sigpending",
 ]
 
 [[feature]]

@@ -670,17 +670,17 @@ fn handled(frame: &TrapFrame, handler: fn()) {
 /// new status bit appears); an I/O APIC vector runs its handler ([`set_irq_handler`]; one with none
 /// is unexpected), and so does an MSI vector ([`claim_msi_vector`]; one
 /// nothing claimed is unexpected, an error); anything else is unexpected
-/// ([`unexpected`]). Interrupts are off throughout (every gate is an interrupt
+/// ([`unexpected`]). Interrupts are off on entry (every gate is an interrupt
 /// gate).
 ///
-/// On a return to ring 3 through `lumen_isr_common` (not the IST vectors 1,
-/// 2, 8 and 18, which `lumen_isr_ist_common` takes), the syscall-exit
+/// On a return to ring 3 through `lumen_isr_common` (not [`IST_VECTORS`],
+/// which `lumen_isr_ist_common` takes), the syscall-exit
 /// hook's interrupt side runs last (`linux::signal::exit_to_user_from_interrupt`:
 /// with interrupts on, only if the thread has `sigpending`).
 #[unsafe(no_mangle)]
 extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
     dispatch(frame);
-    if (frame.cs & 3) != 0 && !matches!(frame.vector, 1 | 2 | 8 | 18) {
+    if (frame.cs & 3) != 0 && !IST_VECTORS.iter().any(|&(vector, _)| vector as u64 == frame.vector) {
         crate::linux::signal::exit_to_user_from_interrupt();
     }
 }
@@ -747,12 +747,15 @@ fn dispatch(frame: &mut TrapFrame) {
             // spinlock held): answered `Fault` at once, before step 2's
             // checks and with interrupts still off, nothing paged in
             // (Linux's `pagefault_disable`).
-            if !from_user && let Some(target) = crate::user::lookup_fixup_nofault(frame.rip) {
+            let in_user_range = (crate::user::USER_MIN..crate::user::USER_MAX).contains(&cr2);
+            if !from_user
+                && in_user_range
+                && let Some(target) = crate::user::lookup_fixup_nofault(frame.rip)
+            {
                 frame.rip = target;
                 frame.rflags &= !(1 << 18); // clear RFLAGS.AC
                 return;
             }
-            let in_user_range = (crate::user::USER_MIN..crate::user::USER_MAX).contains(&cr2);
             let fixup_rip = if !from_user && in_user_range { crate::user::lookup_fixup(frame.rip) } else { None };
 
             if from_user || fixup_rip.is_some() {

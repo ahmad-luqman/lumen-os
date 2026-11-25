@@ -1,6 +1,8 @@
 //! The syscall-exit hook (M8's B2, ARCHITECTURE sections 6 and 8, "One
-//! interruptible, killable blocking wait"), which every return to ring 3
-//! runs, and the restart block `restart_syscall` resumes.
+//! interruptible, killable blocking wait"), run on syscall returns and
+//! non-IST interrupt returns to ring 3, and the restart block
+//! `restart_syscall` resumes. IST vectors are excluded. The syscall loop's
+//! later passes use `None` for the restart context, so it is resolved once.
 //!
 //! A blocking syscall's interruptible wait ends `Interrupted` when its
 //! thread has a signal to look at (`sched::Thread::sigpending`), and the
@@ -21,7 +23,7 @@
 //! The ktests raise a signal through [`raise_for_test`] (the flags and a
 //! kick, nothing queued: C5 adds the pending queues).
 
-use lumen_signal::restart::{Handling, RestartCode, RestartDecision, SyscallExit, decide};
+use lumen_signal::restart::{Handling, RESTART_SYSCALL, RestartCode, RestartDecision, SyscallExit, decide};
 
 use crate::arch;
 use crate::arch::syscall::SyscallFrame;
@@ -33,7 +35,7 @@ use crate::sched;
 /// futex wait's, a `poll`'s: C4, B3), kept by the syscall-exit hook while
 /// it turns that code into `restart_syscall`, and taken by
 /// `restart_syscall`, which calls `resume` with it. Lives in the thread's
-/// scheduler state (`sched::set_restart_block`).
+/// scheduler state (stored through [`interrupted_with`]).
 #[derive(Clone, Copy, Debug)]
 pub struct RestartBlock {
     /// Resumes the interrupted call: its result (`rax`), handed this block.
@@ -59,10 +61,11 @@ pub const fn restart_result(code: RestartCode) -> u64 {
 pub const ERESTARTSYS: u32 = RestartCode::Sys as u32;
 
 /// The syscall-exit hook, at the end of each syscall (`syscall` the
-/// syscall's context: `SyscallExit::new` of its number) or on a return to
-/// ring 3 with no syscall to resolve (`None`), with interrupts on and no
-/// lock held. Resolves a restart code in `frame.rax` (only with a syscall
-/// context: a user `rax` that looks like one is left alone), then, if the
+/// syscall's context: `SyscallExit::new` of its number), with interrupts
+/// on and no lock held. `None` is passed on later passes of the loop and
+/// after `rt_sigreturn` (C5). Non-IST interrupt returns use
+/// `exit_to_user_from_interrupt`; IST vectors are excluded. Resolves a
+/// restart code in `frame.rax` (only with a syscall context: a user `rax` that looks like one is left alone), then, if the
 /// thread has `sigpending`, clears it (nothing is deliverable before C5).
 /// Callers loop while `sigpending` is set again by the time interrupts are
 /// off, passing `None` after the first pass, so the restart runs once.
@@ -93,6 +96,11 @@ pub fn exit_to_user_from_interrupt() {
 /// which no `syscall` returns to, gets `-EINTR`), `ReturnEintr` sets
 /// `-EINTR`.
 fn resolve_restart(frame: &mut SyscallFrame, decision: RestartDecision) {
+    if RestartCode::from_kernel_result(frame.rax as i64) == Some(RestartCode::RestartBlock)
+        && !(decision == RestartDecision::Restart { rax: RESTART_SYSCALL } && frame.rip >= 2)
+    {
+        let _ = sched::take_restart_block();
+    }
     let eintr = (-(errno::EINTR as i64)) as u64;
     match decision {
         RestartDecision::Unchanged => {}
@@ -102,7 +110,10 @@ fn resolve_restart(frame: &mut SyscallFrame, decision: RestartDecision) {
                 frame.rax = rax;
                 frame.rip = rip;
             }
-            None => frame.rax = eintr,
+            None => {
+                log::error!(target: "signal", "corrupt syscall restart frame: rip {:#x} is below 2", frame.rip);
+                frame.rax = eintr;
+            }
         },
     }
 }
@@ -116,11 +127,16 @@ fn settle_pending() {
         return;
     }
     match crate::linux::process::try_current_thread() {
-        Some(thread) => thread.process().settle_sigpending(),
-        None => {
-            let _ = sched::with_current(sched::Thread::clear_sigpending);
-        }
+        Some(_) => crate::linux::process::settle_current_sigpending(),
+        None => sched::clear_current_sigpending(),
     }
+}
+
+/// Store a handler's restart block and return `-ERESTART_RESTARTBLOCK`.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C4's and B3's handlers next
+pub fn interrupted_with(block: RestartBlock) -> u64 {
+    let _ = sched::set_restart_block(Some(block));
+    restart_result(RestartCode::RestartBlock)
 }
 
 /// `restart_syscall()` (219): take the thread's restart block and resume

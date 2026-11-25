@@ -445,9 +445,10 @@ pub fn copy_cstr_from_user(user_src: u64, max_len: usize) -> Result<Vec<u8>, Cop
 /// A non-faulting user access found no usable page: a bad or kernel
 /// address, a misaligned one, or a page that isn't mapped as the access
 /// needs right now (not yet faulted in, read-only for a store,
-/// copy-on-write). The caller releases its locks, faults the page in
-/// ([`copy_from_user`] to read it, [`fault_in_writable`] to write it) and
-/// tries again; one that still faults then is `-EFAULT`.
+/// copy-on-write). The caller first refuses bad or misaligned addresses
+/// with its ABI's `-EFAULT` or `-EINVAL` (futex). Only page state is retried:
+/// release locks, fault the page in ([`copy_from_user`] to read it,
+/// [`fault_in_writable`] to write it), then try again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex and B5's probes next
 pub struct Fault;
@@ -498,30 +499,42 @@ pub fn cmpxchg_u32(addr: u64, expected: u32, new: u32) -> Result<u32, Fault> {
     if rc == 0 { Ok(found) } else { Err(Fault) }
 }
 
+/// Why a writable user page could not be faulted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C4's futex next
+pub enum FaultIn {
+    Fault,
+    OutOfMemory,
+}
+
 /// Resolve a write fault at user address `addr` as a store there would
 /// (demand paging, copy-on-write, a shared file page's dirty promotion),
 /// storing nothing, as Linux's `fault_in_user_writeable`
 /// (`fixup_user_fault` with `FAULT_FLAG_WRITE`): afterwards a store or a
 /// [`cmpxchg_u32`] there succeeds unless the page goes away again.
-/// `Err(Fault)` for an address outside the user range, a thread with no
-/// address space, or a page that can't be written (unmapped, read-only,
-/// out of memory, a bus error). Takes the address space's Lock 1: called
-/// with no lock held and interrupts on.
+/// `Err(FaultIn::Fault)` for an address outside the user range, a thread
+/// with no address space, or a page that can't be written (unmapped,
+/// read-only, a bus error); `OutOfMemory` is separate and logged. Takes the
+/// address space's Lock 1: called with no lock held and interrupts on.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex next
-pub fn fault_in_writable(addr: u64) -> Result<(), Fault> {
+pub fn fault_in_writable(addr: u64) -> Result<(), FaultIn> {
     debug_assert!(
         (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
         "fault_in_writable requires interrupts enabled and no SpinLock held"
     );
     if !(USER_MIN..USER_MAX).contains(&addr) {
-        return Err(Fault);
+        return Err(FaultIn::Fault);
     }
-    let space = sched::current_address_space().ok_or(Fault)?;
+    let space = sched::current_address_space().ok_or(FaultIn::Fault)?;
     // A kernel-mode write (error code bit 1, not bit 2): what a store from a
     // user copy would raise.
     match space.handle_page_fault(addr, 1 << 1) {
         crate::mm::user_vm::FaultResult::Resolved => Ok(()),
-        _ => Err(Fault),
+        crate::mm::user_vm::FaultResult::OutOfMemory => {
+            log::warn!(target: "mm", "out of memory resolving a writable user fault at cr2 {addr:#x}; returning ENOMEM");
+            Err(FaultIn::OutOfMemory)
+        }
+        _ => Err(FaultIn::Fault),
     }
 }
 
@@ -572,6 +585,30 @@ const SYS_TEST_NONCANON_SYSRET: u64 = 0x1000_0001;
 const SYS_TEST_NONCANON_IRET: u64 = 0x1000_0002;
 const SYS_TEST_IRET_RETURN: u64 = 0x1000_0003;
 const SYS_TEST_PREEMPT_COUNT: u64 = 0x1000_0004;
+
+#[cfg(feature = "ktest")]
+const SYS_TEST_RESTART_ONCE: u64 = 0x1000_0005;
+#[cfg(feature = "ktest")]
+static RESTART_CALLS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ktest")]
+static RESTART_FIRST_RIP: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ktest")]
+static RESTART_SECOND_RIP: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ktest")]
+static RESTART_CLEARED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "ktest")]
+static RESTART_RETURN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Observe the first restart test's final frame, just before real sysretq.
+/// This checks the exact rewind without relying on what re-executed code does.
+#[cfg(feature = "ktest")]
+pub(crate) fn record_restart_return_for_test(nr: u64, frame: &SyscallFrame) {
+    if nr == SYS_TEST_RESTART_ONCE && RESTART_CALLS.load(Ordering::SeqCst) == 1 {
+        RESTART_RETURN[0].store(frame.rax, Ordering::SeqCst);
+        RESTART_RETURN[1].store(frame.rip, Ordering::SeqCst);
+        RESTART_CLEARED.store(!sched::current_sigpending(), Ordering::SeqCst);
+    }
+}
 
 /// Abort any waiting `sse_tls` peer if a user process exits non-zero.
 pub(crate) fn note_exit_status(status: i32) {
@@ -661,6 +698,19 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
 /// is set (`usertest` runs). Normal `linux` binaries never reach these hooks.
 pub(crate) fn dispatch_test_syscall(frame: &mut SyscallFrame) -> Option<SyscallReturn> {
     match frame.rax {
+        #[cfg(feature = "ktest")]
+        SYS_TEST_RESTART_ONCE => {
+            if RESTART_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                RESTART_FIRST_RIP.store(frame.rip, Ordering::SeqCst);
+                sched::with_current(sched::Thread::set_sigpending);
+                frame.rax = crate::linux::signal::restart_result(lumen_signal::restart::RestartCode::NoIntr);
+            } else {
+                RESTART_SECOND_RIP.store(frame.rip, Ordering::SeqCst);
+                RESTART_CLEARED.fetch_and(!sched::current_sigpending(), Ordering::SeqCst);
+                frame.rax = 0x1337;
+            }
+            Some(SyscallReturn::Sysret)
+        }
         SYS_TEST_NONCANON_SYSRET => {
             // Non-canonical boundary address: bit 47 = 1, bits 48..63 = 0.
             frame.rip = 0x0000_8000_0000_0000;
@@ -2078,9 +2128,10 @@ crate::ktest!(
 
 crate::ktest!(
     fn nofault_access_answers_fault_without_paging_in() {
-        // Under a held `SpinLock` (interrupts off, `irq::depth() > 0`): an
-        // unmapped, a not-yet-faulted and a read-only page (and a
-        // copy-on-write one) answer `Fault`, nothing mapped by the attempt;
+        // Under a held `SpinLock` (interrupts off, `irq::depth() > 0`):
+        // unmapped and not-yet-faulted pages answer `Fault` for either
+        // access; read-only and copy-on-write pages do so for the exchange
+        // only. Nothing is mapped by the attempt;
         // a mapped page's read and exchange work. `fault_in_writable` on a
         // not-yet-faulted page and on a copy-on-write page leaves the leaf
         // writable with its Dirty bit clear and the word unchanged (nothing
@@ -2159,9 +2210,9 @@ crate::ktest!(
                 kassert_eq!(read_u32_nofault(addr), Err(Fault));
                 kassert_eq!(cmpxchg_u32(addr, 42, 0), Err(Fault));
             }
-            kassert_eq!(fault_in_writable(UNMAPPED), Err(Fault));
-            kassert_eq!(fault_in_writable(RO), Err(Fault));
-            kassert_eq!(fault_in_writable(0xffff_ffff_8000_0000), Err(Fault));
+            kassert_eq!(fault_in_writable(UNMAPPED), Err(FaultIn::Fault));
+            kassert_eq!(fault_in_writable(RO), Err(FaultIn::Fault));
+            kassert_eq!(fault_in_writable(0xffff_ffff_8000_0000), Err(FaultIn::Fault));
 
             // Faulted in for a write, storing nothing: writable, still
             // clean, the word as it was; then the exchange works.
@@ -2278,7 +2329,8 @@ crate::ktest!(
             Vec::new(),
             None,
         )?;
-        // Registered and in ring 3 (its process listed), then raised.
+        // Wait for registration (listing alone does not prove ring-3 entry),
+        // then raise. The program spins without syscalls until released.
         let registered = sched::yield_until(|| !crate::linux::process::active_pids().is_empty());
         crate::linux::signal::raise_for_test(handle.thread(), lumen_signal::Signal::USR1);
         let cleared = sched::yield_until(|| !handle.thread().sigpending());
@@ -2290,6 +2342,71 @@ crate::ktest!(
         kassert!(registered);
         kassert!(cleared);
         kassert!(released == Some(Ok(())));
+        kassert!(matches!(exit, Some(UserExit::Exited(0))));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn syscall_return_restarts_once_through_sysret() {
+        use crate::{kassert, kassert_eq};
+        RESTART_CALLS.store(0, Ordering::SeqCst);
+        RESTART_FIRST_RIP.store(0, Ordering::SeqCst);
+        RESTART_SECOND_RIP.store(0, Ordering::SeqCst);
+        RESTART_CLEARED.store(false, Ordering::SeqCst);
+        for value in &RESTART_RETURN {
+            value.store(0, Ordering::SeqCst);
+        }
+        let mut c = CodeBuf::new();
+        c.mov_eax(SYS_TEST_RESTART_ONCE as u32);
+        c.mov_edi(0);
+        c.bytes(&[0xff, 0xc7]); // inc edi: replaying more than syscall changes this
+        let syscall_rip = TEST_CODE_VA + c.0.len() as u64;
+        c.syscall();
+        // Both real sysretq returns must resume this same two-byte syscall
+        // exactly once. Check the marker and that inc edi ran only once.
+        c.bytes(&[0x35]); // xor eax, 0x1337
+        c.bytes(&0x1337u32.to_le_bytes());
+        c.bytes(&[0x83, 0xf7, 0x01]); // xor edi, 1
+        c.bytes(&[0x09, 0xf8]); // or eax, edi
+        c.bytes(&[0x89, 0xc7]); // mov edi, eax (exit 0 only on success)
+        c.mov_eax(general::__NR_exit_group);
+        c.syscall();
+        c.ud2();
+        let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames")?);
+        space.map_eager_with_bytes(TEST_CODE_VA, FRAME_SIZE, Prot::READ | Prot::EXEC, &c.0).map_err(|_| "map code")?;
+        space
+            .map_eager_with_bytes(TEST_STACK_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[])
+            .map_err(|_| "map stack")?;
+        let (handle, slot) = spawn_ring3_on(
+            arch::cpu_index(),
+            "restart-once",
+            space,
+            TEST_CODE_VA,
+            TEST_STACK_VA + FRAME_SIZE,
+            None,
+            ConsoleIo::Capture,
+            true,
+            Vec::new(),
+            None,
+        )?;
+        // Deleting the hook leaves its sigpending loop spinning. Bound the
+        // observation, then release that broken loop solely for cleanup.
+        let returned = sched::yield_until(|| slot.lock().is_some());
+        if !returned {
+            handle.thread().clear_sigpending_for_test();
+        }
+        handle.join();
+        let exit = slot.lock().take().map(|r| r.exit);
+        kassert!(returned);
+        kassert_eq!(
+            (RESTART_RETURN[0].load(Ordering::SeqCst), RESTART_RETURN[1].load(Ordering::SeqCst)),
+            (SYS_TEST_RESTART_ONCE, syscall_rip)
+        );
+        kassert_eq!(RESTART_CALLS.load(Ordering::SeqCst), 2);
+        kassert_eq!(RESTART_FIRST_RIP.load(Ordering::SeqCst), syscall_rip + 2);
+        kassert_eq!(RESTART_SECOND_RIP.load(Ordering::SeqCst), syscall_rip + 2);
+        kassert!(RESTART_CLEARED.load(Ordering::SeqCst));
         kassert!(matches!(exit, Some(UserExit::Exited(0))));
         Ok(())
     }
