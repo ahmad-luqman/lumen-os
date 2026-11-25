@@ -12,8 +12,9 @@
 //!    and the framebuffer (those four found by translating their live virtual
 //!    addresses through the page tables rather than trusting the map's
 //!    labels), the ACPI RSDP (Limine's physical address) and the allocator's
-//!    own bitmaps. On top of that every non-usable map entry is reserved (in
-//!    case entries overlap) and so is every frame of Limine's page tables
+//!    own bitmaps and user-frame reference counts. Every non-usable map
+//!    entry is also reserved (in case entries overlap), as is every frame
+//!    of Limine's page tables
 //!    (active while the allocator is built; the kernel's own tables are then
 //!    allocated from it).
 //! 3. **Memory found later** (an ACPI table in usable memory) is reserved by
@@ -26,8 +27,11 @@
 //! page-table frame is free; then allocate every frame and check each one
 //! against the memory map and the list.
 
+use core::mem::size_of;
+use core::sync::atomic::AtomicU32;
 use limine::memory_map::{Entry, EntryType};
 use log::{debug, info, warn};
+use lumen_mm::frame::{RefError, RefTable, Remaining};
 use lumen_mm::{FRAME_SIZE, FrameAllocator, FreeError, PhysFrame, PhysRange, VirtAddr, align_down};
 
 use super::{kernel_image, pages, paging};
@@ -48,6 +52,7 @@ pub const FRAMEBUFFER: &str = "framebuffer";
 /// RSDP, later by `acpi` for each table it reads there.
 pub const ACPI_TABLE: &str = "acpi table";
 pub const BITMAP: &str = "frame bitmap";
+pub const REFCOUNTS: &str = "frame refcounts";
 const NOTHING_ALLOCATED: &str = "nothing is allocated during init";
 
 /// A named physical range the allocator must never hand out.
@@ -92,6 +97,14 @@ struct State {
 }
 
 static STATE: SpinLock<Option<State>> = SpinLock::new(None);
+/// Boot-reserved atomic user-frame counts. A leaf lock: after initialization
+/// it is taken only to copy out the table, never held while taking another
+/// lock. Count updates use the atomics after releasing it.
+static REFS: SpinLock<Option<RefTable<'static>>> = SpinLock::new(None);
+
+fn refs() -> RefTable<'static> {
+    REFS.lock().expect("frame refcounts used before mm::init")
+}
 
 /// The framebuffer as `(virtual address, length)`, if Limine gave one.
 pub fn framebuffer_virt() -> Option<(u64, u64)> {
@@ -162,7 +175,7 @@ impl core::fmt::Display for Size {
 }
 
 /// Everything the kernel uses that must never be handed out, by name. The
-/// bitmaps are added by `init` once they are placed.
+/// bitmaps and reference counts are added by `init` once they are placed.
 fn named_reservations(hhdm: u64) -> Reservations {
     let mut r = Reservations::new();
     r.push(NULL_FRAME, PhysRange::new(0, FRAME_SIZE));
@@ -212,6 +225,23 @@ fn named_reservations(hhdm: u64) -> Reservations {
     r
 }
 
+/// Reserve a frame-aligned usable hole for a boot array, excluding live
+/// reservations and non-usable entries. Panics if no hole fits or a boot
+/// page table occupies the chosen hole. Limine normally puts its tables in
+/// bootloader-reclaimable memory; check that before overwriting usable RAM.
+fn place_boot_array(entries: &[&Entry], reserved: &mut Reservations, name: &'static str, bytes: u64) -> PhysRange {
+    let avoid = reserved.as_slice().iter().map(|r| r.range).chain(non_usable(entries));
+    let start = lumen_mm::find_hole(usable(entries), avoid, bytes)
+        .unwrap_or_else(|| panic!("no usable memory large enough for {name}"));
+    let range = PhysRange::from_len(start, bytes);
+    paging::for_each_active_table(|table| {
+        assert!(!range.contains(table.as_u64()), "{name} would overwrite page table {table}");
+    })
+    .unwrap_or_else(|t| panic!("boot page table {t} is outside HHDM-mapped RAM; can't check its subtree"));
+    reserved.push(name, range);
+    range
+}
+
 /// Build the frame allocator. Called once, early in boot, before anything
 /// allocates.
 pub fn init(hhdm: u64) {
@@ -226,35 +256,39 @@ pub fn init(hhdm: u64) {
     let span = usable(entries)
         .reduce(|a, b| PhysRange::new(a.start().min(b.start()), a.end().max(b.end())))
         .expect("memory map has no usable memory");
-    let bytes = lumen_mm::storage_bytes(span);
-    let avoid = reserved.as_slice().iter().map(|r| r.range).chain(non_usable(entries));
-    let start =
-        lumen_mm::find_hole(usable(entries), avoid, bytes).expect("no usable memory large enough for the frame bitmap");
-    let bitmap = PhysRange::from_len(start, bytes);
-    // Limine allocates its page tables from bootloader-reclaimable memory, so
-    // none should be in a usable hole. Check before zeroing the bitmap over one.
-    paging::for_each_active_table(|table| {
-        assert!(!bitmap.contains(table.as_u64()), "frame bitmap would overwrite page table {table}");
-    })
-    .unwrap_or_else(|t| panic!("boot page table {t} is outside HHDM-mapped RAM; can't check its subtree"));
-
+    let bitmap = place_boot_array(entries, &mut reserved, BITMAP, lumen_mm::storage_bytes(span));
+    let start = bitmap.start();
     // SAFETY: `bitmap` lies in a usable map entry, which the HHDM maps
     // writable, and is frame-aligned (so `u64`-aligned). Limine guarantees
     // usable memory is unused and the kernel has touched none of it before
     // this point; it overlaps no reservation or non-usable entry (find_hole)
-    // and no page table (checked above). `init` runs once (asserted above),
-    // so this is the only reference. It is reserved below and never freed,
+    // and no page table (checked in place_boot_array). `init` runs once (asserted above),
+    // so this is the only reference. Its named reservation is never freed,
     // so `'static` holds.
     let storage = unsafe { core::slice::from_raw_parts_mut((hhdm + start) as *mut u64, lumen_mm::storage_words(span)) };
     let mut frames =
         FrameAllocator::new(span, storage, usable(entries)).expect("bitmap storage is sized by storage_words");
 
-    reserved.push(BITMAP, bitmap);
+    let slots = RefTable::slots(span);
+    let ref_range = place_boot_array(entries, &mut reserved, REFCOUNTS, slots as u64 * size_of::<AtomicU32>() as u64);
+    // SAFETY: the usable hole is frame-aligned, hence AtomicU32-aligned,
+    // and overlaps no live reservation or boot table. The HHDM maps it
+    // writable; Limine guarantees usable memory is unused and the kernel
+    // has not touched this hole. Init runs once, so this is the only reference;
+    // the reservation is never freed, giving the storage its 'static lifetime.
+    // All-zero bytes are a valid AtomicU32 representation.
+    let ref_storage = unsafe {
+        let ptr = (hhdm + ref_range.start()) as *mut AtomicU32;
+        core::ptr::write_bytes(ptr, 0, slots);
+        core::slice::from_raw_parts_mut(ptr, slots)
+    };
+    let table = RefTable::new(span, ref_storage).expect("refcount storage sized for span");
+    *REFS.lock() = Some(table);
     for r in reserved.as_slice() {
         let taken = frames.reserve(r.range).expect(NOTHING_ALLOCATED);
         // Live memory inside a `usable` entry means the map's labels are
         // wrong: worth knowing, though the reservation already protects it.
-        if taken > 0 && ![NULL_FRAME, BITMAP].contains(&r.name) {
+        if taken > 0 && ![NULL_FRAME, BITMAP, REFCOUNTS].contains(&r.name) {
             warn!(target: "mem", "{} {} was in usable memory", r.name, r.range);
         }
     }
@@ -333,22 +367,112 @@ pub fn alloc_contiguous(count: usize, align_frames: usize) -> Option<PhysFrame> 
 }
 
 /// Return a frame from [`alloc`] or [`alloc_zeroed`].
+/// Panics if the frame still has a counted user reference.
 ///
 /// # Safety
 /// The caller owns `f` (it allocated it, or was handed it) and nothing uses
 /// it any more; in particular no other [`OwnedFrame`] holds it, and no
 /// `paging::map` mapping does (an owned frame is what lets `map` be safe).
 pub unsafe fn free(f: PhysFrame) -> Result<(), FreeError> {
+    assert_uncounted(refs(), f);
     with_frames(|a| a.free(f.as_u64()))
 }
 
 /// Return `count` frames from [`alloc_contiguous`], all or nothing.
+/// Panics if any frame still has a counted user reference.
 ///
 /// # Safety
 /// As for [`free`], for every frame of the run.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first users: DMA buffers
 pub unsafe fn free_contiguous(first: PhysFrame, count: usize) -> Result<(), FreeError> {
+    let table = refs();
+    for f in (0..count).map_while(|i| first.as_u64().checked_add(i as u64 * FRAME_SIZE).and_then(PhysFrame::from_u64)) {
+        assert_uncounted(table, f);
+    }
     with_frames(|f| f.free_contiguous(first.as_u64(), count))
+}
+
+fn assert_uncounted(table: RefTable<'_>, f: PhysFrame) {
+    assert_eq!(table.get(f).unwrap_or(0), 0, "freeing a counted user frame");
+}
+
+/// One reference to a user frame. Dropping releases it; a successful
+/// mapping takes the reference with `into_raw`. For frames an `AddressSpace`
+/// maps, outside Lock 1's critical sections the count equals non-`PTE_SHARED`
+/// leaves naming the frame plus live `UserFrame`s. Raw paging-ktest frames
+/// are uncounted; they are never owned by an `AddressSpace`.
+#[derive(Debug)]
+#[must_use = "dropping a user frame releases its reference"]
+pub struct UserFrame(PhysFrame);
+
+impl UserFrame {
+    /// The frame this reference keeps live; the number grants no ownership.
+    pub fn frame(&self) -> PhysFrame {
+        self.0
+    }
+
+    /// Transfer an exclusively owned kernel frame into user accounting.
+    pub(super) fn from_owned(owned: OwnedFrame) -> Self {
+        refs().set_one(owned.frame()).expect("a kernel-owned frame is uncounted");
+        Self(owned.into_raw())
+    }
+
+    /// Transfer this reference to a page-table leaf.
+    #[must_use = "discarding the raw frame leaks its reference"]
+    pub(super) fn into_raw(self) -> PhysFrame {
+        let f = self.0;
+        core::mem::forget(self);
+        f
+    }
+    /// Take another reference from a live user leaf, refusing count overflow.
+    /// Panics if the frame is uncounted or outside the managed span.
+    ///
+    /// # Safety
+    /// The caller holds the leaf's address-space lock, keeping its reference
+    /// live, and prevents writes through private mappings before publishing
+    /// another mapping of the returned reference.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1 wires fork_copy
+    pub(super) unsafe fn share_leaf(f: PhysFrame) -> Option<Self> {
+        match refs().inc(f) {
+            Ok(()) => Some(Self(f)),
+            Err(RefError::Overflow) => None,
+            Err(e) => panic!("sharing an uncounted user frame: {e:?}"),
+        }
+    }
+
+    /// Reclaim a removed leaf's reference without changing its count.
+    /// Dropping the returned token releases that reference.
+    ///
+    /// # Safety
+    /// The caller exclusively owns the removed non-`PTE_SHARED` leaf's
+    /// counted reference and has retired its translation from every CPU's
+    /// TLB. No other token may reclaim the same reference.
+    pub(super) unsafe fn from_leaf(f: PhysFrame) -> Self {
+        Self(f)
+    }
+}
+
+impl Drop for UserFrame {
+    fn drop(&mut self) {
+        if refs().dec(self.0).expect("releasing a live user reference") == Remaining::Free {
+            // SAFETY: this token owns the last reference; from_leaf requires
+            // retirement before reclamation, and into_raw consumes the token.
+            unsafe { free(self.0) }.expect("freeing the last user reference");
+        }
+    }
+}
+
+/// Allocate a zero-filled user frame with count one, released on drop.
+pub(super) fn alloc_user() -> Option<UserFrame> {
+    let f = alloc_zeroed()?;
+    refs().set_one(f).expect("a freshly allocated frame is uncounted");
+    Some(UserFrame(f))
+}
+
+/// Number of counted leaves plus live `UserFrame` tokens (zero for kernel
+/// and page-cache frames). Panics outside the allocator's managed span.
+pub fn user_count(f: PhysFrame) -> u32 {
+    refs().get(f).expect("user frame is in the allocator span")
 }
 
 /// An allocated frame that only its holder may use: move-only, and freed
@@ -863,7 +987,7 @@ crate::ktest!(
     fn named_reservations_are_complete() {
         use self::checks::*;
         use crate::kassert_eq;
-        for name in [NULL_FRAME, KERNEL_IMAGE, KERNEL_FILE, BOOT_STACK, FRAMEBUFFER, ACPI_TABLE, BITMAP] {
+        for name in [NULL_FRAME, KERNEL_IMAGE, KERNEL_FILE, BOOT_STACK, FRAMEBUFFER, ACPI_TABLE, BITMAP, REFCOUNTS] {
             if reservation(name).is_err() {
                 crate::ktest::diag(format_args!("missing reservation '{name}'"));
                 return Err("a named reservation is missing");
@@ -871,6 +995,25 @@ crate::ktest!(
         }
         let limine = boot::EXECUTABLE_ADDRESS.get_response().ok_or("no executable address response")?;
         kassert_eq!(reservation(KERNEL_IMAGE)?.start(), limine.physical_base());
+        let range = reservation(REFCOUNTS)?;
+        kassert_eq!(
+            range.len(),
+            with_state(|s| RefTable::slots(s.frames.span()) as u64 * size_of::<AtomicU32>() as u64)
+        );
+        for page in pages(range.start(), range.len()) {
+            kassert_eq!(translate(hhdm()? + page).map_err(|_| "refcounts not mapped")?, page);
+            kassert_eq!(is_owned(page), false);
+            kassert_eq!(is_free(page), false);
+        }
+        let user = alloc_user().ok_or("user frame")?;
+        let base = with_state(|s| s.frames.span().start());
+        let offset = (user.frame().as_u64() - base) / FRAME_SIZE * size_of::<AtomicU32>() as u64;
+        // SAFETY: the reserved HHDM-mapped array contains an initialized
+        // AtomicU32 for every frame in the span, including this live frame.
+        let slot = unsafe { &*((hhdm()? + range.start() + offset) as *const AtomicU32) };
+        kassert_eq!(slot.load(core::sync::atomic::Ordering::Acquire), 1);
+        drop(user);
+        kassert_eq!(slot.load(core::sync::atomic::Ordering::Acquire), 0);
         Ok(())
     }
 );
@@ -1003,6 +1146,283 @@ crate::ktest!(
         kassert_eq!(unsafe { free(zeroed) }, Ok(()));
         kassert_eq!(zeroed, dirty); // the lowest free frame, so the same one
         kassert!(all_zero);
+        kassert_eq!(free_frames(), before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn refcount_and_cow_split() {
+        use crate::linux::general;
+        use crate::mm::user_vm::{AddressSpace, FaultResult};
+        use crate::sched::UserSpaceGuard;
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        use alloc::sync::Arc;
+        use lumen_vm::{PAGE_SIZE as P, Prot};
+        const RW: Prot = Prot::READ.union(Prot::WRITE);
+        const A: u64 = 0x200_0000;
+        const S: u64 = A + 4 * P;
+        use crate::mm::user_vm::ktest_any_leaf as leaf;
+        drop(alloc::vec![0u8; 64 * 1024]); // warm the heap before exact frame accounting
+        let before = free_frames();
+        let parent = Arc::new(AddressSpace::new().map_err(|_| "parent")?);
+        kassert_eq!(parent.users(), 1);
+        // Eager loader-style pages, including one protected NONE at fork.
+        let mut pattern = [0u8; P as usize];
+        for (i, byte) in pattern.iter_mut().enumerate() {
+            *byte = (i.wrapping_mul(37) ^ (i >> 8)) as u8;
+        }
+        pattern[..6].copy_from_slice(b"before");
+        parent.map_eager_with_bytes(A, 2 * P, RW, &pattern).map_err(|_| "eager")?;
+        parent.mprotect(A + P, P, Prot::NONE).map_err(|_| "none")?;
+        let old = leaf(&parent, A)?.phys;
+        let none = leaf(&parent, A + P)?.phys;
+        kassert_eq!((user_count(old), user_count(none)), (1, 1));
+        let private_flags = u64::from(general::MAP_PRIVATE | general::MAP_ANONYMOUS | general::MAP_FIXED_NOREPLACE);
+        parent.mmap_anon(A + 2 * P, P, RW, private_flags).map_err(|_| "lazy private")?;
+        let shared_flags = u64::from(general::MAP_SHARED | general::MAP_ANONYMOUS | general::MAP_FIXED_NOREPLACE);
+        parent.mmap_anon(S, 2 * P, RW, shared_flags).map_err(|_| "shared")?;
+        let child;
+        let parent_copy;
+        {
+            let _active = UserSpaceGuard::enter(parent.clone());
+            // Cache a writable parent translation before fork. The next
+            // store must fault even without switching away from this CR3.
+            kassert_eq!(copy_to_user(A, b"before"), Ok(()));
+            kassert_eq!(copy_to_user(S, b"shared"), Ok(()));
+            child = parent.fork_copy().map_err(|_| "fork_copy")?;
+            kassert_eq!(child.users(), 1);
+            kassert_eq!(user_count(old), 2);
+            kassert_eq!(user_count(none), 2);
+            kassert_eq!(leaf(&child, A)?.phys, old);
+            kassert!(!leaf(&parent, A)?.writable && !leaf(&child, A)?.writable);
+            kassert!(!leaf(&child, A + P)?.present);
+            kassert!(matches!(
+                paging::walk_user(child.root(), VirtAddr::new(A + 2 * P).unwrap()).end(),
+                paging::WalkEnd::NotPresent(_)
+            ));
+            let split_before = free_frames();
+            kassert_eq!(copy_to_user(A, b"parent"), Ok(()));
+            parent_copy = leaf(&parent, A)?.phys;
+            kassert!(parent_copy != old);
+            kassert_eq!((user_count(old), user_count(parent_copy)), (1, 1));
+            kassert_eq!(free_frames(), split_before - 1);
+            let mut page = [0u8; P as usize];
+            kassert_eq!(copy_from_user(&mut page, A), Ok(()));
+            kassert_eq!(&page[..6], b"parent");
+            kassert!(page[6..] == pattern[6..]); // every copied byte, including the final one
+        }
+        // The child's old page now has count one: reuse it, allocating nothing.
+        {
+            let _active = UserSpaceGuard::enter(child.clone());
+            let mut bytes = [0; 6];
+            kassert_eq!(copy_from_user(&mut bytes, A), Ok(()));
+            kassert_eq!(&bytes, b"before");
+            let reuse_before = free_frames();
+            kassert_eq!(copy_to_user(A, b"child!"), Ok(()));
+            kassert_eq!(leaf(&child, A)?.phys, old);
+            kassert!(leaf(&child, A)?.writable);
+            kassert_eq!(free_frames(), reuse_before);
+            // Both touched and untouched shared pages use the same frames.
+            for addr in [S, S + P] {
+                let a = leaf(&parent, addr)?;
+                let b = leaf(&child, addr)?;
+                kassert_eq!(a.phys, b.phys);
+                kassert!(a.writable && b.writable && !a.shared && !b.shared);
+                kassert_eq!(user_count(a.phys), 2);
+            }
+            kassert_eq!(copy_from_user(&mut bytes, S + P), Ok(()));
+            kassert_eq!(bytes, [0; 6]);
+            kassert_eq!(copy_to_user(S + P, b"common"), Ok(()));
+        }
+        {
+            let _active = UserSpaceGuard::enter(parent.clone());
+            let mut bytes = [0; 6];
+            kassert_eq!(copy_from_user(&mut bytes, A), Ok(()));
+            kassert_eq!(&bytes, b"parent");
+            kassert_eq!(copy_from_user(&mut bytes, S + P), Ok(()));
+            kassert_eq!(&bytes, b"common");
+        }
+        let shared = [leaf(&parent, S)?.phys, leaf(&parent, S + P)?.phys];
+        // Dropping a child without explicit teardown also uncounts its leaves.
+        drop(child);
+        kassert!(!is_allocated(old));
+        kassert_eq!(user_count(old), 0);
+        kassert_eq!(user_count(none), 1);
+        for f in shared {
+            kassert_eq!(user_count(f), 1);
+        }
+        // Model CLONE_VM's two processes directly. An observer Arc must
+        // neither count as a process nor delay teardown at users == 0.
+        let observer = parent.clone();
+        kassert!(parent.add_user());
+        kassert_eq!(parent.users(), 2);
+        parent.drop_user();
+        kassert_eq!(parent.users(), 1);
+        kassert!(leaf(&parent, A).is_ok());
+        kassert_eq!(parent.handle_page_fault(A, 0), FaultResult::Resolved);
+        parent.drop_user();
+        kassert_eq!(observer.users(), 0);
+        kassert!(!observer.add_user());
+        kassert_eq!(observer.users(), 0);
+        kassert_eq!(observer.handle_page_fault(A, 0), FaultResult::Invalid);
+        for f in [parent_copy, none, shared[0], shared[1]] {
+            kassert_eq!(user_count(f), 0);
+            kassert!(!is_allocated(f));
+        }
+        // Only the bare root remains while observer Arcs still exist.
+        kassert_eq!(free_frames(), before - 1);
+        parent.teardown(); // idempotent
+        kassert!(!parent.add_user());
+        drop(parent);
+        kassert_eq!(free_frames(), before - 1);
+        drop(observer);
+        kassert_eq!(free_frames(), before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn fork_copy_out_of_frames_rolls_back() {
+        use self::checks::*;
+        use crate::mm::user_vm::{AddressSpace, FaultResult, UserVmError, file_vm_leaf};
+        use crate::sched::UserSpaceGuard;
+        use crate::user::copy_to_user;
+        use crate::{kassert, kassert_eq};
+        use alloc::sync::Arc;
+        use lumen_vm::{PAGE_SIZE as P, Prot};
+        const A: u64 = 0x400_0000;
+        const B: u64 = A + (1 << 21); // a second L1 table in the child
+        const RW: Prot = Prot::READ.union(Prot::WRITE);
+        drop(alloc::vec![0u8; 64 * 1024]);
+        let parent = Arc::new(AddressSpace::new().map_err(|_| "parent")?);
+        parent.map_eager_with_bytes(A, P, RW, b"a").map_err(|_| "page a")?;
+        parent.map_eager_with_bytes(B, P, RW, b"b").map_err(|_| "page b")?;
+        // Warm all heap allocations used by a fork before exhausting frames.
+        let warm_child = parent.fork_copy().map_err(|_| "warm fork")?;
+        let first = file_vm_leaf(&parent, A).ok_or("a")?.phys;
+        let second = file_vm_leaf(&parent, B).ok_or("b")?.phys;
+        let before = free_frames();
+        let entries = entries()?;
+        let reserved = with_state(|s| s.reserved);
+        let chain = allocate_all(entries, reserved.as_slice());
+        let split = parent.handle_page_fault(A, 1 << 1);
+        let split_count = user_count(first);
+        let split_leaf = file_vm_leaf(&parent, A);
+        // Dropping the warm child releases five table frames (root, L3,
+        // L2, two L1s). Hold one back: four frames build the child's
+        // root/L3/L2/L1 and share the first leaf; the second needs another
+        // L1 frame and must fail.
+        drop(warm_child);
+        let held = alloc_owned();
+        let result = parent.fork_copy();
+        let left = free_frames();
+        let counts = (user_count(first), user_count(second));
+        // Restore all drained frames before any assertion or error return.
+        // SAFETY: this test owns the remaining chain and no longer uses it.
+        let (freed, problem) = unsafe { free_chain(&chain) };
+        kassert_eq!(chain.failure, None);
+        kassert_eq!(problem, None);
+        kassert_eq!(freed, chain.count);
+        kassert_eq!(split, FaultResult::OutOfMemory);
+        kassert_eq!(split_count, 2);
+        kassert!(split_leaf.is_some_and(|m| m.phys == first && !m.writable));
+        kassert!(matches!(result, Err(UserVmError::OutOfMemory)));
+        kassert!(held.is_some());
+        kassert_eq!(left, 4);
+        kassert_eq!(counts, (1, 1));
+        kassert_eq!(free_frames(), before + 4);
+        kassert!(!file_vm_leaf(&parent, A).unwrap().writable);
+        let _active = UserSpaceGuard::enter(parent.clone());
+        kassert_eq!(copy_to_user(A, b"A"), Ok(()));
+        kassert_eq!(copy_to_user(B, b"B"), Ok(()));
+        kassert_eq!(free_frames(), before + 4); // count-one reuse after rollback
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn fork_copy_shared_population_failure() {
+        use self::checks::*;
+        use crate::mm::user_vm::{AddressSpace, FaultResult, Sharing, UserVmError, file_vm_leaf};
+        use crate::{kassert, kassert_eq};
+        use alloc::sync::Arc;
+        use lumen_vm::{MapPlace, PAGE_SIZE as P, Prot};
+        const A: u64 = 0x600_0000;
+        const S: u64 = A + P;
+        const RW: Prot = Prot::READ.union(Prot::WRITE);
+        drop(alloc::vec![0u8; 64 * 1024]);
+        let before = free_frames();
+        let parent = Arc::new(AddressSpace::new().map_err(|_| "parent")?);
+        // Retain parent tables for both missing pages, so population needs
+        // exactly one frame per page. Warm the fork's metadata allocations.
+        parent.map_eager_with_bytes(A, P, RW, b"anchor").map_err(|_| "anchor")?;
+        drop(parent.fork_copy().map_err(|_| "warm fork")?);
+        parent.map_anon_at(MapPlace::FixedNoReplace(S), 2 * P, RW, Sharing::Shared).map_err(|_| "shared VMA")?;
+        let entries = entries()?;
+        let reserved = with_state(|s| s.reserved);
+        let missing = |addr| {
+            matches!(
+                paging::walk_user(parent.root(), VirtAddr::new(addr).unwrap()).end(),
+                paging::WalkEnd::NotPresent(_)
+            )
+        };
+
+        // Two free frames: one for the child root, then one remains. The
+        // precheck must refuse before populating either shared page.
+        let spare = [alloc_owned().ok_or("spare")?, alloc_owned().ok_or("spare")?];
+        let chain = allocate_all(entries, reserved.as_slice());
+        drop(spare);
+        let refused = parent.fork_copy();
+        let both_missing = missing(S) && missing(S + P);
+        let left = free_frames();
+        // SAFETY: this test owns all remaining chain frames and is done with them.
+        let (freed, problem) = unsafe { free_chain(&chain) };
+        kassert_eq!(chain.failure, None);
+        kassert_eq!(problem, None);
+        kassert_eq!(freed, chain.count);
+        kassert!(matches!(refused, Err(UserVmError::OutOfMemory)));
+        kassert!(both_missing);
+        kassert_eq!(left, 2);
+
+        // Model another allocation consuming RAM after a successful check.
+        // The real fork path sees exactly one free frame at population.
+        let mut drained = None;
+        let failed = parent.fork_copy_after_precount(|| {
+            let spare = alloc_owned().expect("precheck left a reserve");
+            drained = Some(allocate_all(entries, reserved.as_slice()));
+            drop(spare);
+        });
+        let chain = drained.ok_or("precheck unexpectedly refused")?;
+        let first = file_vm_leaf(&parent, S);
+        let second_missing = missing(S + P);
+        // SAFETY: the chain still belongs exclusively to this test; restore
+        // it before assertions or page faults can allocate more memory.
+        let (freed, problem) = unsafe { free_chain(&chain) };
+        kassert_eq!(chain.failure, None);
+        kassert_eq!(problem, None);
+        kassert_eq!(freed, chain.count);
+        kassert!(matches!(failed, Err(UserVmError::OutOfMemory)));
+        let first = first.ok_or("first page was not retained")?;
+        kassert!(first.present && first.user && first.writable && !first.executable && !first.shared);
+        kassert_eq!(user_count(first.phys), 1);
+        // SAFETY: the parent's counted leaf keeps this HHDM-mapped frame
+        // live; no CPU is running this space or writing its shared page.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(super::phys_to_virt(first.phys.start()).as_ptr::<u8>(), P as usize) };
+        kassert!(bytes.iter().all(|&b| b == 0));
+        kassert!(second_missing);
+        kassert_eq!(parent.handle_page_fault(S + P, 1 << 1), FaultResult::Resolved);
+        let second = file_vm_leaf(&parent, S + P).ok_or("second page did not fault in")?;
+        kassert_eq!(user_count(second.phys), 1);
+        parent.teardown();
+        kassert!(!parent.add_user());
+        for phys in [first.phys, second.phys] {
+            kassert_eq!(user_count(phys), 0);
+            kassert!(!is_allocated(phys));
+        }
+        drop(parent);
         kassert_eq!(free_frames(), before);
         Ok(())
     }

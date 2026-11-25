@@ -44,10 +44,12 @@
 //! - `MAP_32BIT` and `MAP_ABOVE4G` are taken and ignored: the mapping is
 //!   placed as without them.
 //! - A shared `/dev/zero` mapping is plain anonymous memory: its maps line
-//!   is an unnamed `p` one (Linux's is `s`, named `/dev/zero (deleted)`),
+//!   is an unnamed `s` one (Linux names it `/dev/zero (deleted)`; M10's
+//!   shmem backing will supply that name),
 //!   and one made through a read-only descriptor can later be made
 //!   writable with `mprotect` (Linux refuses, `EACCES`): anonymous VMAs
-//!   carry no `may_write`. Harmless until M8's `fork` shares one.
+//!   carry no `may_write`. This is no longer harmless: `fork_copy` shares
+//!   the anonymous pages, so the upgrade allows writes visible to the child.
 //! - `/proc/<pid>/maps`' file columns differ in a few ways, each listed
 //!   on `user_vm::KeptFile` (a file mapping's: the descriptor's path, not
 //!   normalised nor following a rename; the first mapping's for every
@@ -169,8 +171,8 @@ fn mmap_fd(addr: u64, len: u64, prot: lumen_vm::Prot, flags: u64, fd: Fd, off: u
     let space = sched::current_address_space().ok_or(errno::ENOMEM)?;
     let place = map_place(addr, flags);
     if dev_zero {
-        // Anonymous memory, placed as asked (shared alike until M8).
-        return space.map_anon_at(place, len, prot).map_err(|e| e.to_errno());
+        // Anonymous memory, with the requested placement and sharing.
+        return space.map_anon_at(place, len, prot, sharing).map_err(|e| e.to_errno());
     }
     space.mmap_file(place, len, prot, MappedFile::of(&file, mount_writable), off, sharing).map_err(|e| e.to_errno())
 }

@@ -1,8 +1,8 @@
 //! Memory-management logic for the Lumen kernel: the physical frame
 //! allocator (this module), typed addresses ([`PhysAddr`], [`PhysFrame`],
 //! [`VirtAddr`]), the page-table format and mapper ([`paging`]), the window
-//! tokens that say who may map where ([`window`]), and the kernel-stack
-//! layout and registry ([`stacks`]).
+//! tokens that say who may map where ([`window`]), the kernel-stack layout
+//! and registry ([`stacks`]), and atomic user-frame counts ([`frame`]).
 //!
 //! This crate is pure logic: it never touches hardware or dereferences a
 //! physical address, so all of it is tested on the host
@@ -55,6 +55,7 @@
 #![no_std]
 
 mod addr;
+pub mod frame;
 pub mod paging;
 pub mod stacks;
 pub mod window;
@@ -218,7 +219,8 @@ pub fn storage_bytes(span: PhysRange) -> u64 {
 
 /// The lowest frame-aligned address `a` such that `[a, a + size)` lies inside
 /// one of `usable` (each rounded inward to whole frames) and overlaps none of
-/// `avoid`. Used to place the allocator's own bitmaps before it exists.
+/// `avoid`. Used to place boot arrays (the allocator's bitmaps and user-frame
+/// reference counts) before allocation starts. Returns `None` if no hole fits.
 pub fn find_hole(
     usable: impl IntoIterator<Item = PhysRange>,
     avoid: impl IntoIterator<Item = PhysRange> + Clone,

@@ -100,6 +100,11 @@ impl Level {
         self as u8
     }
 
+    /// Bytes covered by one entry at this level.
+    pub const fn span(self) -> u64 {
+        1u64 << self.shift()
+    }
+
     const fn shift(self) -> u32 {
         12 + 9 * (self as u32 - 1)
     }
@@ -902,7 +907,7 @@ pub fn protect(
         }
     }
     let leaf = *steps.last().expect("a mapped walk read its leaf");
-    let effective = if m.shared { attrs.with_shared(true) } else { attrs };
+    let effective = attrs.with_shared(m.shared);
     mem.write(leaf.table, leaf.index, effective.leaf(m.phys, m.size));
     Ok(m)
 }
@@ -1355,6 +1360,7 @@ mod tests {
 
     #[test]
     fn not_present_reports_the_level() {
+        assert_eq!([Level::L1, Level::L2, Level::L3, Level::L4].map(Level::span), [4096, 1 << 21, 1 << 30, 1 << 39]);
         let (mut m, root) = FakeMem::new();
         assert_eq!(walk(&m, root, v(KERNEL)).end(), WalkEnd::NotPresent(Level::L4));
         map(&mut m, root, v(KERNEL), f(0x5000), PageSize::Size4K, Attrs::DATA).unwrap();
@@ -1687,6 +1693,25 @@ mod tests {
         let sw = walk(&m, root, sup_va);
         assert!(!sw.mapping().unwrap().user, "supervisor leaf must remain non-USER");
         assert!(!sw.steps()[3].entry.has(USER));
+    }
+
+    #[test]
+    fn protect_preserves_leaf_accounting_kind() {
+        for shared in [false, true] {
+            let (mut mem, root) = FakeMem::new();
+            let va = v(0x400000);
+            let phys = f(0x9000);
+            map(&mut mem, root, va, phys, PageSize::Size4K, Attrs::USER_RW.with_shared(shared)).unwrap();
+            for attrs in [Attrs::USER_RO, Attrs::USER_NONE, Attrs::USER_RW] {
+                let old = protect(&mut mem, root, va, attrs.with_shared(!shared)).unwrap();
+                assert_eq!((old.phys, old.shared), (phys, shared));
+                let walk = walk(&mem, root, va);
+                let leaf = walk.mapping().or_else(|| walk.prot_none_mapping()).unwrap();
+                assert_eq!((leaf.phys, leaf.shared), (phys, shared));
+                assert_eq!(leaf.present, attrs != Attrs::USER_NONE);
+            }
+            assert_eq!(unmap(&mut mem, root, va).unwrap().shared, shared);
+        }
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! with `start`, `end` and `offset` at least 8 hex digits, the device's
 //! major and minor at least 2 hex digits each and the inode in decimal, and
 //! `perms` `rwx` then `p` or `s`. A file-backed mapping is `s` when shared
-//! and `p` when private; an anonymous one is always `p`, even
-//! `MAP_SHARED | MAP_ANONYMOUS` (Linux prints `s`).
+//! and `p` when private; anonymous mappings use the same sharing indicator.
+//! Shared anonymous mappings remain unnamed: Linux's `/dev/zero (deleted)`
+//! name requires M10's shmem backing.
 //!
 //! **The name:** a file's path, or a label (`[heap]` or `[stack]`), comes
 //! after 73 characters, where Linux's `seq_pad` puts it: the fields and a
@@ -259,7 +260,7 @@ pub fn write_maps<'a, 'n, F, I, R>(
             continue;
         }
         if vma.start >= layout.stack_bottom && vma.end <= layout.stack_top {
-            Line { start, end, prot, shared: false, offset: 0, name: Name::Label(STACK) }.write(out);
+            Line { start, end, prot, shared: vma.backing.is_shared(), offset: 0, name: Name::Label(STACK) }.write(out);
             continue;
         }
         // Split at the heap's edges and the images' ranges' edges: no edge
@@ -275,7 +276,7 @@ pub fn write_maps<'a, 'n, F, I, R>(
             } else {
                 (Name::None, 0)
             };
-            Line { start: at, end: next, prot, shared: false, offset, name }.write(out);
+            Line { start: at, end: next, prot, shared: vma.backing.is_shared(), offset, name }.write(out);
             at = next;
         }
     }
@@ -299,6 +300,32 @@ mod tests {
     /// The kernel ktest's break: the initial break at 0x40_4000, one page mapped.
     const LAYOUT: MapsLayout = layout(0x40_4000, 0x40_5000);
 
+    #[test]
+    fn shared_anonymous_maps_use_s() {
+        let vmas = [
+            anon(0x10000, 0x11000, RW),
+            Vma { start: 0x12000, end: 0x13000, prot: RW, backing: Backing::Anonymous { shared: true } },
+            Vma { start: 0x14000, end: 0x15000, prot: Prot::NONE, backing: Backing::Anonymous { shared: true } },
+        ];
+        assert_eq!(
+            maps(&vmas, &LAYOUT),
+            "00010000-00011000 rw-p 00000000 00:00 0\n00012000-00013000 rw-s 00000000 00:00 0\n00014000-00015000 ---s 00000000 00:00 0\n"
+        );
+    }
+
+    #[test]
+    fn shared_anonymous_stack_uses_s() {
+        let stack = Vma {
+            start: USER_STACK_BOTTOM,
+            end: USER_STACK_TOP,
+            prot: RW,
+            backing: Backing::Anonymous { shared: true },
+        };
+        let line = maps([&stack], &LAYOUT);
+        assert!(line.contains(" rw-s 00000000 00:00 0"));
+        assert!(line.ends_with(" [stack]\n"));
+    }
+
     /// File 7: a file on `/tmp` (device 0:2).
     const TMP_FILE: FileInfo<'static> =
         FileInfo { major: 0, minor: 2, ino: 12, path: b"/tmp/data.bin", deleted: false };
@@ -314,7 +341,7 @@ mod tests {
     }
 
     fn anon(start: u64, end: u64, prot: Prot) -> Vma {
-        Vma { start, end, prot, backing: Backing::Anonymous }
+        Vma { start, end, prot, backing: Backing::Anonymous { shared: false } }
     }
 
     fn file(start: u64, end: u64, prot: Prot, offset: u64, shared: bool) -> Vma {
@@ -726,14 +753,19 @@ mod tests {
         // What the loader and `brk` leave: text, .data + .bss, a break grown
         // by a page and a half, a file mapping and the stack.
         let mut vmas = VmaMap::new();
-        vmas.map(MapPlace::Fixed(0x40_0000), 2 * P, RX, Backing::Anonymous).unwrap();
-        vmas.map(MapPlace::Fixed(0x40_2000), 2 * P, RW, Backing::Anonymous).unwrap();
+        vmas.map(MapPlace::Fixed(0x40_0000), 2 * P, RX, Backing::Anonymous { shared: false }).unwrap();
+        vmas.map(MapPlace::Fixed(0x40_2000), 2 * P, RW, Backing::Anonymous { shared: false }).unwrap();
         let mut brk = Brk::new(0x40_4000).unwrap();
         assert!(brk.set(&mut vmas, 0x40_5800).succeeded);
         let fm = FileMapping { file_id: 7, offset: 0x2000, shared: false, may_write: true };
         vmas.map_file(MapPlace::Fixed(0x7f00_0000_0000), P, Prot::READ, fm).unwrap();
-        vmas.map(MapPlace::Fixed(USER_STACK_BOTTOM), USER_STACK_TOP - USER_STACK_BOTTOM, RW, Backing::Anonymous)
-            .unwrap();
+        vmas.map(
+            MapPlace::Fixed(USER_STACK_BOTTOM),
+            USER_STACK_TOP - USER_STACK_BOTTOM,
+            RW,
+            Backing::Anonymous { shared: false },
+        )
+        .unwrap();
         let exe = FileInfo { major: 0, minor: 1, ino: 33, path: b"/bin/prog", deleted: false };
         let images = [
             ImageRange { start: 0x40_0000, end: 0x40_2000, offset: 0, file: exe },
