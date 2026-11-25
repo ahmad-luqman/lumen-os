@@ -359,6 +359,16 @@ impl ProcTree {
 
     // ---- lookups ----
 
+    /// How many processes are in the tree, live and zombie.
+    pub fn len(&self) -> usize {
+        self.procs.len()
+    }
+
+    /// Whether the tree holds no process.
+    pub fn is_empty(&self) -> bool {
+        self.procs.is_empty()
+    }
+
     /// Whether `pid` is in the tree (live or zombie).
     pub fn contains(&self, pid: u32) -> bool {
         self.procs.contains_key(&pid)

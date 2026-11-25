@@ -504,9 +504,9 @@ fn drop_range<V>(map: &mut BTreeMap<u64, V>, start: u64, end: u64) {
 /// under a sleeping, interrupt-enabled [`SleepMutex`].
 pub struct AddressSpace {
     /// Processes using this space, independent of observer `Arc`s. A new
-    /// space starts at one; the process decrementing to zero calls teardown
-    /// after detaching its CPU. Threads of one process do not raise it.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1's process lifetime
+    /// space starts at one; whoever drops the last user (`drop_user`, after
+    /// detaching its CPU) tears it down. Threads of one process do not
+    /// raise it.
     users: AtomicU32,
     root: PhysFrame,
     inner: SleepMutex<AddressSpaceInner>,

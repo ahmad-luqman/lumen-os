@@ -1011,9 +1011,11 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   `PROT_READ | PROT_WRITE | PROT_EXEC` when a Linux binary requests it (needed
   by Python `ctypes`/`libffi`, Ruby, and JITs).
 - **Teardown:** When a process's last thread exits (`exit_group`, running with
-  interrupts ON), it switches `CR3` back to `kernel_root()`, extracts and
-  closes its FD table outside every process lock (releasing `flock` and POSIX
-  record locks), and tears down all VMAs, `pinned_pages` (sweeping `PTE_DIRTY`
+  interrupts ON), it switches `CR3` back to `kernel_root()` (detaching its
+  CPU), then gives up the process's user of the space (`drop_user`: the
+  last user's drop runs `teardown`), extracts and closes its FD table
+  outside every process lock (releasing `flock` and POSIX record locks;
+  section 8, Exit step 3), and `teardown` removes all VMAs, `pinned_pages` (sweeping `PTE_DIRTY`
   and decrementing `writable_maps` on `WRITABLE | PTE_SHARED` leaves, then
   dropping `Arc<CachePage>` pins; the earlier switch to `kernel_root()` is
   the unmap order's flush step, since no CPU can still store through the
@@ -1980,6 +1982,8 @@ the syscalls.
   | `#DB` (1), and the deferred `#DB` at `LSTAR` | `SIGTRAP`, `TRAP_TRACE` for a single step, else `TRAP_BRKPT` |
   | `#BP` (3) | `SIGTRAP`, `SI_KERNEL` |
   | `#OF` (4), `#BR` (5), `#GP` (13), a non-canonical return `rip` | `SIGSEGV`, `SI_KERNEL`, 0 |
+  | coprocessor segment overrun (9) | `SIGFPE`, `SI_KERNEL`, 0 |
+  | `#TS` (10) | `SIGSEGV`, `SI_KERNEL`, 0 |
   | `#UD` (6) | `SIGILL`, `ILL_ILLOPN`, the faulting `rip` |
   | `#NP` (11), `#SS` (12) | `SIGBUS`, `SI_KERNEL`, 0 |
   | `#PF` (14) | `SIGSEGV`, `SEGV_MAPERR` (no VMA) or `SEGV_ACCERR`, `CR2`; `SIGBUS`, `BUS_ADRERR`, `CR2` for `FaultResult::BusError`; `SIGKILL` for `OutOfMemory` (a deviation: Linux runs its out-of-memory killer and retries the fault) |
@@ -4189,7 +4193,8 @@ In M7, the per-process FD table grows from 64 to `MAX_FDS = 1024` (matching
 
 **Built in #254b** (`kernel/src/linux/process.rs`, `syscall/fd.rs`,
 `syscall/dir.rs`; split into M8's `Process` and `Files` by B1, below): the
-process's `Files` holds `fds: FdTable<Arc<OpenFile<KernelVfsLock<u64>>>>`
+process's `Files` holds `table: SpinLock<FdTable<FileRef>>` (`FileRef` =
+`Arc<OpenFile<KernelVfsLock<u64>>>`)
 (private: a slot leaves it only through `close_current_fd`, a displacing
 `insert_current_fd`/`dup_current_fd` or the takedown's `Files::leave`
 (behind `take_current` and the test seams' `RegisteredProcess`), which
@@ -4336,7 +4341,7 @@ depends on them.
 | Label | Scope | Depends on | Owns (interfaces; tests) | Sections |
 |---|---|---|---|---|
 | B0 | the skeleton | M7 done | `M8_SYSCALLS`, the stub modules below, `syscalls.py`'s `PLANNED` changes and `ENOSYS_BY_DECISION`, empty scenario files, `tools/linux-m8/`; `m8_abi_constants_match_spec`, `test_m8_table_covers_the_census` | 8, 15 |
-| B1 | the process/thread split, behaviour unchanged | M7 done | `Process`, `UserThread`, `UserThreadState::linux`, `PROCS`, `Files::users`, tids (`ProcTree::add_thread`/`remove_thread`), pid 1 (`linux::init`), the `ps` shell command; `procs_lookup_and_lifetime`, `cargo:lumen-proc`, all M6/M7 scenarios unchanged | 8 |
+| B1 | the process/thread split, behaviour unchanged | M7 done | `Process`, `UserThread`, `UserThreadState::linux`, `PROCS`, `Files::users`, tids (`ProcTree::add_thread`/`remove_thread`), pid 1 (`linux::init`), the `ps` shell command; `procs_lookup_and_lifetime`, `procs_leave_no_heap_behind`, `identity_syscalls_name_the_process_and_thread`, `sigaction_and_sigprocmask_round_trip`, `cargo:lumen-proc`, all M6/M7 scenarios unchanged but for `test_mm`'s boot heap ceiling (pid 1's allocations) | 8 |
 | B2 | the blocking wait and the syscall-exit hook | B1 | `wait_interruptible`/`wait_killable`, `kick`, `Thread::fatal_pending`, the hook, `restart_syscall`, `raise_for_test`, `user::read_u32_nofault`/`cmpxchg_u32`/`fault_in_writable`; the wait, restart and nofault ktests, `harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata` | 6, 8, 15 |
 | B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `poll_rechecks_after_a_wake`, `test_poll_and_select_on_console` | 10 |
 | B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended), `fork_copy_out_of_frames_rolls_back`, `fork_copy_preserves_files_images_and_private_copies` | 5, 8 |
@@ -4778,8 +4783,8 @@ struct ProcTable {
 
 **Tids from the pid space.** A thread's tid is a number from `ProcTree`'s
 allocator, so no tid is ever a live pid, pgid or sid, and the leader's tid
-is the pid. lumen-proc doesn't model threads yet: B1 adds, host-tested in
-`cargo:lumen-proc`:
+is the pid. lumen-proc didn't model threads before B1, which added, host-tested
+in `cargo:lumen-proc`:
 - `ProcTree::add_thread(pid) -> Result<u32, Error>`: a number as `fork`
   hands one out (`EAGAIN` when none is free; `ENOMEM` when room in the
   process's thread list can't be reserved, as `fork`'s children list),
@@ -4848,8 +4853,9 @@ that arm); `exit_group` (231) and a fatal signal end the group:
      ignored) and wakes one waiter with a shared futex wake, as Linux's
      `mm_release` does only while `mm_users > 1` (C1 writes the 0; C4 adds
      the wake);
-   - clones its `Arc<UserThread>` (and with it its `Arc<Process>`) out of
-     `UserThreadState::linux` for the steps after, then detaches from its
+   - takes its `Arc<UserThread>` (and with it its `Arc<Process>`) out of
+     `UserThreadState::linux` (`set_current_user_thread(None)`, leaving it
+     `None`) for the steps after, then detaches from its
      address space (`sched::detach_user_space()`, which takes the whole
      `UserThreadState`: `kernel_root()` loaded, its `active` bit cleared,
      its `Arc<AddressSpace>` dropped), so a later `teardown`'s "`active`
@@ -4904,8 +4910,9 @@ that arm); `exit_group` (231) and a fatal signal end the group:
      (and, for a root, hands the status to the `linux` command);
      `HangupThenContinue` sends `SIGHUP` then `SIGCONT` to `pgrp_members`.
    - `ExitError::NoMem` leaves the tree unchanged: the thread, past its
-     point of no return, yields (`sched::yield_now`) and retries, with a
-     WARN at most once a second, and never returns to user mode.
+     point of no return, sleeps 1 ms (`time::sleep`, a busy wait where it
+     can't block) and retries, with a WARN at most once a second (an INFO
+     once it goes through), and never returns to user mode.
 4. The status: `group_exit`'s if set, else the leader's own `exit` code,
    as Linux's `wait_task_zombie` reads `group_exit_code` only with
    `SIGNAL_GROUP_EXIT` set. A fatal signal's status is
@@ -8461,8 +8468,8 @@ file description had one thread (M7) and becomes possible once threads,
 4. **`dup*` looked up and installed in two holds, and `openat` checked for
    a free slot before it opened.** The FD table moved out of
    `ACTIVE_PROCS` into `Files::table` in B1 (a `SpinLock` per table, shared by
-   `CLONE_FILES`). `dup`, `dup2`, `dup3` and `F_DUPFD*` look `old` up and
-   install the new slot in one hold. A call that drops the table's lock
+   `CLONE_FILES`). B8 makes `dup`, `dup2`, `dup3` and `F_DUPFD*` look `old`
+   up and install the new slot in one hold (B1 keeps M7's two holds). A call that drops the table's lock
    between choosing a slot and filling it (`openat`, `pipe2`) first takes
    the slot with a lumen-vfs `FdTable` addition: `reserve(from) ->
    Result<FdReservation, VfsError>` (the lowest free slot at or above
@@ -10540,7 +10547,17 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 - `ktest:lumen_kernel::linux::process::procs_lookup_and_lifetime` (B1):
   `PROCS` finds processes and threads by pid and tid; a process's `mm`,
   `files` and `fs` are `None` when its last `Arc` drops (the `Drop`
-  assertion, pid 1 aside); every M6 and M7 scenario passes unchanged.
+  assertion, pid 1 aside); every M6 and M7 scenario passes unchanged but
+  for `test_mm`'s boot heap ceiling (pid 1's allocations).
+- `ktest:lumen_kernel::linux::process::procs_leave_no_heap_behind` (B1): a
+  process's run gives back every heap allocation it made (live count and
+  bytes).
+- `ktest:lumen_kernel::linux::syscall::task::identity_syscalls_name_the_process_and_thread`
+  (B1): `set_tid_address`, `gettid`, `getpid`, `getppid`, `getpgrp`
+  through `dispatch`.
+- `ktest:lumen_kernel::linux::syscall::signal::sigaction_and_sigprocmask_round_trip`
+  (B1): M6's `rt_sigaction` and `rt_sigprocmask` over the split state, a
+  mask per thread and an action per process.
 - `ktest:lumen_kernel::mm::frame::named_reservations_are_complete` (it
   exists; B4 extends it): `frame::REFS` is reserved under its name.
 - `ktest:lumen_kernel::mm::frame::refcount_and_cow_split` (B4): counts

@@ -11,6 +11,10 @@ milestone = "M8"
 tests = [
     "ktest:lumen_kernel::linux::process::procs_lookup_and_lifetime",
     "ktest:lumen_kernel::linux::process::procs_leave_no_heap_behind",
+    "ktest:lumen_kernel::linux::process::exit_status_follows_traps_c",
+    "ktest:lumen_kernel::linux::process::takedown_warns_at_most_once_a_second",
+    "ktest:lumen_kernel::linux::process::signal_state_refuses_kill_and_stop",
+    "ktest:lumen_kernel::linux::process::process_state_owner_methods",
     "ktest:lumen_kernel::linux::syscall::task::identity_syscalls_name_the_process_and_thread",
     "ktest:lumen_kernel::linux::syscall::signal::sigaction_and_sigprocmask_round_trip",
     "cargo:lumen-proc",

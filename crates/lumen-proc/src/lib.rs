@@ -25,8 +25,7 @@
 //!   [`ProcTree::getpgid`], [`ProcTree::getsid`], [`ProcTree::is_orphaned_pgrp`]
 //!   and the checks of `tcsetpgrp` ([`ProcTree::tcsetpgrp`]);
 //! - **pids**: from 2 up to the tree's maximum, then wrapping, never a
-//!   number still used as a pid, a pgid, a sid or a tid
-//!   ([`ProcTree::is_busy`]);
+//!   number still used as a pid, a pgid, a sid or a tid ([`ProcTree::is_busy`]);
 //! - **tids**: a thread's number from the same allocator
 //!   ([`ProcTree::add_thread`], [`ProcTree::remove_thread`]; the leader's
 //!   tid is the pid), so no tid is ever a live pid, pgid or sid; a process's
@@ -39,9 +38,8 @@
 //!
 //! Errors are per call. The calls made on behalf of a user (`fork`,
 //! `add_thread`, `remove_thread`, `wait*`, `setsid`, `setpgid`, `getpgid`,
-//! `getsid`, `tcsetpgrp`) return
-//! [`Error`]: an [`Errno`] for the user, or a [`Bug`], a wrong or stale pid
-//! from the kernel, which maps to no `errno`. The others say only what can
+//! `getsid`, `tcsetpgrp`) return [`Error`]: an [`Errno`] for the user, or a
+//! [`Bug`], a wrong or stale pid from the kernel, which maps to no `errno`. The others say only what can
 //! happen to them: [`ProcTree::exit`] an [`ExitError`], [`ProcTree::exec`]
 //! a [`Bug`], [`ProcTree::spawn_init`] a [`SpawnInitError`],
 //! [`ProcTree::spawn_root`] [`NoFreePid`], [`ProcTree::stop`] and
@@ -50,9 +48,9 @@
 //! Threads are modelled only as numbers: a process's tids, for the pid
 //! space (`getpgid`, `setpgid` and the other calls look processes up by
 //! pid, so a non-leader tid names none). Not modelled: what a thread does,
-//! signal delivery and dispositions (the kernel sends what an
-//! operation returns, and says through `exit`'s `autoreap` which parents
-//! ignore `SIGCHLD`), `rusage` accounting (the tree only carries each
+//! signal delivery and dispositions (the kernel sends what an operation
+//! returns, and says through `exit`'s `autoreap` which parents ignore
+//! `SIGCHLD`), `rusage` accounting (the tree only carries each
 //! process's token), controlling-terminal acquisition and hangup,
 //! `CLONE_PARENT`, ptrace, child subreapers, and `PR_SET_PDEATHSIG` (the
 //! kernel reads [`ProcTree::children`] before [`ProcTree::exit`] to signal
@@ -91,10 +89,10 @@
 //!   counting allocator.
 //! - **Neither:** the lookups (including [`ProcTree::pgrp_members`]), the
 //!   request builders, a `wait` that doesn't reap, a refused
-//!   [`ProcTree::remove_thread`], [`ProcTree::exec`],
-//!   [`ProcTree::stop`], [`ProcTree::cont`], [`ProcTree::getpgid`],
-//!   [`ProcTree::getsid`] and [`ProcTree::tcsetpgrp`]; `tests/alloc.rs`
-//!   checks that they neither allocate nor free.
+//!   [`ProcTree::remove_thread`], [`ProcTree::exec`], [`ProcTree::stop`],
+//!   [`ProcTree::cont`], [`ProcTree::getpgid`], [`ProcTree::getsid`] and
+//!   [`ProcTree::tcsetpgrp`]; `tests/alloc.rs` checks that they neither
+//!   allocate nor free.
 
 #![no_std]
 

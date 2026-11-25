@@ -69,8 +69,9 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
     let fd_at = |chunk: &[u8; 8]| i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes"));
     let events_at = |chunk: &[u8; 8]| i16::from_le_bytes(chunk[4..6].try_into().expect("2 bytes"));
 
-    // The console's `io`, then the polled files, all cloned out in one more
-    // hold of the descriptor table's lock, classified (and dropped) after it.
+    // The console's `io` (under the process's console lock), then the
+    // polled files, all cloned out in one hold of the descriptor table's
+    // lock, classified (and dropped) after it.
     let io = current_io();
     let polled: Vec<i32> = raw.as_chunks::<8>().0.iter().map(fd_at).collect();
     let files = process::current_files(&polled);

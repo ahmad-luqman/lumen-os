@@ -198,11 +198,13 @@ impl SavedRsp {
 /// Per-user-thread hardware and VM state carried across context switches,
 /// and the thread's Linux identity.
 ///
-/// Accessed only by its own thread on its home CPU with interrupts off
-/// (`schedule`'s switch to and from it, `detach_user_space`, a
-/// `UserSpaceGuard`, `arch_prctl`, and `current_user_thread` and
-/// `set_current_user_thread`, which a Linux process's registration and
-/// takedown call), or exclusively in `Drop`.
+/// Accessed only on its thread's home CPU with interrupts off: by
+/// `schedule` switching to and from the thread, and by the thread itself
+/// (`detach_user_space`, a `UserSpaceGuard`, `arch_prctl`'s
+/// `set_current_fs_base`, the `#PF` path's `current_address_space`, and
+/// `current_user_thread` and `set_current_user_thread`, which a Linux
+/// process's registration, syscalls and takedown call); or exclusively in
+/// `Drop`.
 struct UserThreadState {
     address_space: Arc<AddressSpace>,
     fpu: UnsafeCell<arch::fpu::UserFpuState>,
@@ -1216,9 +1218,12 @@ pub fn spawn_on(
 /// clean [`arch::fpu::UserFpuState`], and `fs_base = 0`.
 ///
 /// M6–M7 user threads are single-threaded and pinned to their home CPU `cpu`.
-/// When `f` returns, `thread_entry` detaches the address space (switching `CR3`
-/// back to `kernel_root()`) and calls `teardown()` with interrupts enabled if
-/// this thread holds the last reference.
+/// A thread whose Linux process registered is detached and its space given
+/// up by that process's takedown (`linux::process::take_current`) before
+/// `f` returns. For one that registered none, when `f` returns,
+/// `thread_entry` detaches the address space (switching `CR3` back to
+/// `kernel_root()`) and calls `teardown()` with interrupts enabled if this
+/// thread holds the last reference.
 pub fn spawn_user_on(
     cpu: usize,
     name: impl Into<ThreadName>,
@@ -1275,9 +1280,10 @@ extern "C" fn thread_entry() -> ! {
     // returns, so it would never be dropped).
     let entry = current().expect("a thread runs on a CPU with a scheduler").entry.lock().take();
     entry.expect("a thread starts once")();
-    // If this was a user thread and its entry didn't already detach, switch
-    // CR3 back to `kernel_root()` and tear down user mappings with interrupts
-    // ON (so `AddressSpace::drop` in `finish_switch` only frees the bare L4).
+    // A user thread whose entry didn't already detach (one that registered
+    // no Linux process: a process's takedown detaches): switch CR3 back to
+    // `kernel_root()` and tear down user mappings with interrupts ON (so
+    // `AddressSpace::drop` in `finish_switch` only frees the bare L4).
     if let Some(space) = detach_user_space()
         && Arc::strong_count(&space) == 1
     {

@@ -20,6 +20,8 @@ fn a_tid_is_handed_out_as_the_next_pid_would_be() {
     assert_eq!(t.threads(a), [3, 4]);
     assert_eq!(t.threads(INIT), [6]);
     assert_eq!(t.threads(5), [] as [u32; 0]);
+    // Threads are no processes: the tree holds init, a and the fork.
+    assert_eq!((t.len(), t.is_empty()), (3, false));
     assert_eq!(t.threads(999), [] as [u32; 0]);
     t.check_invariants();
 }

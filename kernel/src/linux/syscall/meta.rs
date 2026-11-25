@@ -141,8 +141,8 @@ pub(super) fn sys_fchownat(dirfd: Dirfd, path: UserPtr, uid: u32, gid: u32, flag
 /// `umask(mask)` (95): the process's mask becomes `mask & 0o777`; the old
 /// one is returned. Never fails.
 pub(super) fn sys_umask(mask: Mode) -> u64 {
-    let new = (mask.bits() & 0o777) as u16;
-    u64::from(swap_current_umask(new))
+    // `swap_current_umask` keeps the `0o777` bits (a `u16` holds them all).
+    u64::from(swap_current_umask(mask.bits() as u16))
 }
 
 /// The two `struct timespec`s (`{ i64 tv_sec; i64 tv_nsec; }`, atime then

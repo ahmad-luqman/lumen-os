@@ -929,8 +929,8 @@ fn check_proc_of_a_process() -> Result<String, String> {
                 Ok(summary)
             }
         });
-        // Its takedown (`end`) took this thread off the space and tore it
-        // down.
+        // Its takedown (`end`) took this thread off the space and gave up
+        // the process's user of it, the only one: the space is torn down.
         drop(proc_state);
         *res_clone.lock() = Some(out);
     })

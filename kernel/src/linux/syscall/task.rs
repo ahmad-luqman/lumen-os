@@ -1,6 +1,7 @@
 //! Tasks (M8's cluster, ARCHITECTURE section 8, "B0's stubs"): M6's `exit`
 //! and `exit_group`, `getpid`, `gettid`, `getppid` and `set_tid_address`,
-//! moved here from `dispatch`'s arms unchanged (each body its arm's); and
+//! moved here from `dispatch`'s arms (B1 keeps their behaviour, reading the
+//! running thread's `UserThread` and its `Process`); and
 //! M8's `clone`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `setpgid`,
 //! `setsid`, `getpgid`, `getsid`.
 

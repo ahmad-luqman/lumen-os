@@ -1852,27 +1852,24 @@ crate::ktest!(
                 sched::yield_now();
             }
         }
-        // Let it exit whatever was seen, so the thread always ends. This
-        // thread loads the space while the process may exit on another CPU,
-        // so it holds a process user meanwhile: the process's own takedown
-        // then can't tear the space down under this CPU's CR3; whichever
-        // side drops the last user does, here only after the guard switched
-        // CR3 back. The process is still waiting for the flag, so the space
-        // can't be retired yet.
-        kassert!(space.add_user());
-        let released = {
-            let _active = sched::UserSpaceGuard::enter(space.clone());
-            copy_to_user(TEST_DATA_VA, &1u64.to_le_bytes())
-        };
-        space.drop_user();
+        // Let it exit whatever was seen, so the thread always ends: from
+        // inside its space, holding a process user of it meanwhile (the
+        // process, on this CPU, may exit as soon as the flag is set; see
+        // `with_process_user`). It is still waiting for the flag, so the
+        // space isn't retired yet, and has two users while this thread is
+        // in it. The join comes before any check, so the thread always ends.
+        let released = crate::linux::process::with_process_user(&space, || {
+            (space.users(), copy_to_user(TEST_DATA_VA, &1u64.to_le_bytes()))
+        });
         handle.join();
         let exit = slot.lock().take().map(|r| r.exit);
-        kassert_eq!(released, Ok(()));
+        kassert_eq!(released, Some((2, Ok(()))));
         let (pid, path) = seen.ok_or("the process never registered")?;
         kassert_eq!(path.as_deref(), Some(PATH));
         kassert!(matches!(exit, Some(UserExit::Exited(0))));
         kassert_eq!(process_exe_path(pid), None);
-        space.teardown();
+        // The last user given up (here or by the takedown) tore it down.
+        kassert_eq!(space.users(), 0);
         Ok(())
     }
 );

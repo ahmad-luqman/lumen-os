@@ -132,7 +132,8 @@ impl Mode {
         (self.0 & 0o1777) as u16
     }
 
-    /// The low 32 bits as given (`umask` keeps `& 0o777` of them).
+    /// The low 32 bits as given (`umask` keeps their `0o777` bits, in
+    /// `process::swap_current_umask`).
     pub(super) fn bits(self) -> u32 {
         self.0
     }

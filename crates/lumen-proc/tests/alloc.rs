@@ -190,12 +190,15 @@ fn exit_is_enomem_and_changes_nothing_when_the_actions_cant_fit() {
     let mut t = tree();
     let r = t.fork(INIT, slot()).unwrap();
     give_room(&mut t, r);
-    // Three children (a list of capacity 4) and nine words for them.
+    // Three children (a list of capacity 4) and nine words for them, and
+    // three threads: the second reservation's refusal keeps them too.
     let p = zombie_groups(&mut t, 3);
+    let tids: Vec<u32> = (0..3).map(|_| t.add_thread(p).unwrap()).collect();
     let before = format!("{t:?}");
     let got = refused(|| t.exit(p, ExitStatus::exited(0), Some(r), |_| false).map(drop));
     assert_eq!(got, Err(ExitError::NoMem));
     assert_eq!(format!("{t:?}"), before);
+    assert_eq!(t.threads(p), tids.as_slice());
     let actions = t.exit(p, ExitStatus::exited(0), Some(r), |_| false).unwrap();
     assert_eq!(actions.into_iter().count(), 7);
 }
@@ -282,7 +285,7 @@ fn the_calls_that_neither_allocate_nor_free_dont() {
         assert_eq!(t.getsid(c, b as i32), Ok(INIT));
         assert!(t.tcsetpgrp(c, tty, INIT as i32, Sigttou::Delivered).is_ok());
         let _ = (t.is_orphaned_pgrp(INIT), t.is_busy(INIT), t.pgrp_members(INIT).count(), t.children(INIT).len());
-        let _ = t.threads(b).len();
+        let _ = (t.threads(b).len(), t.len(), t.is_empty());
         // A refused removal: the leader's tid.
         assert!(t.remove_thread(b, b).is_err());
     });
