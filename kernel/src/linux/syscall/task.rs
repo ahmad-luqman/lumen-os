@@ -50,8 +50,8 @@ pub(super) fn sys_set_tid_address(frame: &mut SyscallFrame) -> SyscallReturn {
 
 /// `clone(flags, newsp, parent_tid, child_tid, tls)` (56): M8 stub, replaced by C1 (#380) and C3 (#382).
 /// Linux reads only `flags`' low 32 bits (`lower_32_bits(clone_flags)`).
-/// The frame is the parent's registers at the `syscall`, the child's
-/// starting ones.
+/// The frame is the parent's registers at the `syscall`, from which the
+/// child's starting ones are made.
 pub(super) fn sys_clone(
     _flags: u32,
     _newsp: UserPtr,
@@ -64,7 +64,8 @@ pub(super) fn sys_clone(
 }
 
 /// `fork()` (57): M8 stub, replaced by C1 (#380). The frame is the
-/// parent's registers at the `syscall`, the child's starting ones.
+/// parent's registers at the `syscall`, from which the child's starting
+/// ones are made.
 pub(super) fn sys_fork(_frame: &SyscallFrame) -> u64 {
     not_implemented(general::__NR_fork)
 }

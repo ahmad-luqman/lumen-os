@@ -119,8 +119,10 @@ pub(super) fn sys_rt_sigsuspend(_mask: UserPtr, _sigsetsize: u64) -> u64 {
     not_implemented(general::__NR_rt_sigsuspend)
 }
 
-/// `sigaltstack(ss, old_ss)` (131): M8 stub, replaced by C5 (#384).
-pub(super) fn sys_sigaltstack(_ss: UserPtr, _old_ss: UserPtr) -> u64 {
+/// `sigaltstack(ss, old_ss)` (131): M8 stub, replaced by C5 (#384). The
+/// frame holds the caller's `rsp`, which says whether it runs on the
+/// alternate stack (`SS_ONSTACK`, `-EPERM` for a change then).
+pub(super) fn sys_sigaltstack(_ss: UserPtr, _old_ss: UserPtr, _frame: &SyscallFrame) -> u64 {
     not_implemented(general::__NR_sigaltstack)
 }
 
@@ -144,8 +146,8 @@ pub(super) fn sys_pause() -> u64 {
     not_implemented(general::__NR_pause)
 }
 
-/// `restart_syscall()` (219): M8 stub, replaced by B2 (#373). It returns
-/// through the frame, as the call it restarts does.
+/// `restart_syscall()` (219): M8 stub, replaced by B2 (#373). It is passed
+/// the frame, which B2's restart may rewrite (section 6).
 pub(super) fn sys_restart_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
     frame.rax = not_implemented(general::__NR_restart_syscall);
     SyscallReturn::Sysret

@@ -7,8 +7,9 @@
 //! handlers' and `getcwd`'s, decoded by `at::reg` into its parameter types;
 //! `poll` and the rest of M6 still take raw registers, and `task`'s M6
 //! handlers the whole frame). A handler that returns through the frame
-//! (`execve`, `rt_sigreturn`, `restart_syscall`) or copies it (`clone`,
-//! `fork`, `vfork`) is passed it after its arguments.
+//! (`execve`, `rt_sigreturn`, `restart_syscall`) or reads it (`clone`,
+//! `fork`, `vfork`: the child's registers are made from it; `sigaltstack`:
+//! the caller's `rsp`) is passed it after its arguments.
 //! The handlers live in one module per cluster, so the PRs that implement
 //! M7 (#254, #255) each change only their own module, not `dispatch`:
 //!
@@ -215,8 +216,8 @@ fn first_report(nr: u64) -> bool {
     false
 }
 
-/// Log a syscall with no handler once per number, with its name when one of
-/// the kernel's tables has it.
+/// Log a syscall answered `-ENOSYS` (no arm, or an M8 stub) once per number,
+/// with its name when one of the kernel's tables has it.
 fn log_unknown_once(nr: u64) {
     if first_report(nr) {
         match u32::try_from(nr).ok().and_then(crate::linux::syscall_name) {
@@ -594,7 +595,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_sigaltstack) => {
-            frame.rax = signal::sys_sigaltstack(reg(frame.rdi), reg(frame.rsi));
+            frame.rax = signal::sys_sigaltstack(reg(frame.rdi), reg(frame.rsi), frame);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_kill) => {

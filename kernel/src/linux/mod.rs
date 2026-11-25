@@ -133,8 +133,8 @@ pub const M7_SYSCALLS: &[(u32, &str)] = &[
 /// M8 table, less the rows M6 or M7 already has and the two that stay
 /// `-ENOSYS`, `sendfile` (40) and `membarrier` (324)). `poll` (7) is one:
 /// M6 dispatches it, but M6's table of 30 never listed it. Each has its own
-/// arm in `syscall::dispatch`; every one but `poll` is a stub returning
-/// `-ENOSYS` until the issue the design names for it replaces it (#371).
+/// arm in `syscall::dispatch`; B0 (#371) made the others stubs returning
+/// `-ENOSYS` until the issue the design names for each replaces it.
 pub const M8_SYSCALLS: &[(u32, &str)] = &[
     (general::__NR_poll, "poll"),
     (general::__NR_rt_sigreturn, "rt_sigreturn"),
@@ -716,9 +716,9 @@ crate::ktest!(
         //    number. Eleven are M6's and four M7's (changed in M8, still in
         //    their tables); two stay `-ENOSYS` by decision (in no table, and
         //    `syscalls.py`'s `ENOSYS_BY_DECISION`); the other 60 are
-        //    `M8_SYSCALLS`. Each spec number is looked up with
-        //    `syscall_name`, which checks the tables' `linux-raw-sys`
-        //    constants against these numbers.
+        //    `M8_SYSCALLS`. Each spec number's name through `syscall_name`
+        //    must be the row's, so the tables' `linux-raw-sys` constants
+        //    equal these numbers.
         let m6_rows: &[(u32, &str)] = &[
             (13, "rt_sigaction"),
             (14, "rt_sigprocmask"),
