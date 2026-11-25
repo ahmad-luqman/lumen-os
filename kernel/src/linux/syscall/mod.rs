@@ -9,9 +9,9 @@
 //! The handlers live in one module per cluster, so the PRs that implement
 //! M7 (#254, #255) each change only their own module, not `dispatch`:
 //!
-//! - `fd`: descriptor I/O (`read`, `write`, `close`, `fstat`, `poll`,
-//!   `ioctl`, `readv`, `writev`; M7: `open`, `openat`, `lseek`), over the
-//!   process's FD table (#254).
+//! - `fd`: descriptor I/O (`read`, `write`, `close`, `fstat`, `ioctl`,
+//!   `readv`, `writev`; M7: `open`, `openat`, `lseek`), over the process's
+//!   FD table (#254).
 //! - `stat`: `stat`, `lstat`, `newfstatat`, `statx`, `access`, `faccessat`,
 //!   `faccessat2` (M7).
 //! - `ns`: namespace changes (`mkdir*`, `rmdir`, `unlink*`, `link*`,
@@ -23,8 +23,16 @@
 //! - `lock`: `fcntl`, `flock` (M7).
 //! - `mem`: `mmap`, `mprotect`, `munmap`, `brk` (M6); `mmap` of a file and
 //!   `msync` (M7).
-//! - `proc`: signals, `arch_prctl`, `prlimit64`, `uname`, `clock_gettime`,
+//! - `proc`: `arch_prctl`, `prlimit64`, `uname`, `clock_gettime`,
 //!   `getrandom` (M6).
+//!
+//! M8's clusters (ARCHITECTURE section 8, "B0's stubs"), M6's handlers
+//! moved into them unchanged (#371):
+//!
+//! - `task`: `exit`, `exit_group`, `getpid`, `gettid`, `getppid`,
+//!   `set_tid_address` (M6).
+//! - `signal`: `rt_sigaction`, `rt_sigprocmask` (M6).
+//! - `poll`: `poll` (M6).
 //!
 //! `at` holds what the M7 file syscalls share: their register decoders
 //! (`reg`, `FromReg`: `Fd`, `Dirfd`, `Mode`, the VFS's flag types,
@@ -48,18 +56,20 @@ mod lock;
 mod mem;
 mod meta;
 mod ns;
+mod poll;
 mod proc;
+mod signal;
 mod stat;
+mod task;
 
 use alloc::vec;
 use core::mem::{MaybeUninit, size_of};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch;
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
-use crate::linux::process::{ConsoleIo, KernelSigaction, record_exit, with_current, with_current_mut};
+use crate::linux::process::{ConsoleIo, KernelSigaction, with_current};
 use crate::linux::{Utsname, errno, general};
-use crate::user::{CopyError, UserExit, copy_from_user, copy_to_user, user_range_valid};
+use crate::user::{CopyError, copy_from_user, copy_to_user, user_range_valid};
 use at::reg;
 
 /// Maximum `iovec` count accepted by `readv`/`writev` (POSIX `UIO_MAXIOV`).
@@ -87,7 +97,7 @@ struct RawIovec {
 // Compile-time zero-padding verification for every POD ABI struct copied to/from user space.
 const _: () = {
     assert!(size_of::<RawIovec>() == size_of::<general::iovec>() && size_of::<RawIovec>() == 16);
-    assert!(size_of::<fd::RawPollFd>() == size_of::<general::pollfd>() && size_of::<fd::RawPollFd>() == 8);
+    assert!(size_of::<poll::RawPollFd>() == size_of::<general::pollfd>() && size_of::<poll::RawPollFd>() == 8);
     assert!(size_of::<general::stat>() == 144);
     assert!(size_of::<general::termios>() == 36);
     assert!(size_of::<general::winsize>() == 8);
@@ -217,7 +227,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_poll) => {
-            frame.rax = fd::sys_poll(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = poll::sys_poll(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_mmap) => {
@@ -237,11 +247,11 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_rt_sigaction) => {
-            frame.rax = proc::sys_rt_sigaction(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = signal::sys_rt_sigaction(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_rt_sigprocmask) => {
-            frame.rax = proc::sys_rt_sigprocmask(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = signal::sys_rt_sigprocmask(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_ioctl) => {
@@ -256,20 +266,8 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = fd::sys_writev(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_getpid) => {
-            frame.rax = u64::from(with_current(|p| p.pid));
-            SyscallReturn::Sysret
-        }
-        Ok(general::__NR_exit | general::__NR_exit_group) => {
-            let status = (frame.rdi & 0xff) as i32;
-            let (_, is_test) = record_exit(UserExit::Exited(status));
-            if is_test {
-                crate::user::note_exit_status(status);
-            }
-            // SAFETY: unwinds cleanly back to `enter_ring3`; no lock held and
-            // no live Rust `Drop` values on this stack frame.
-            unsafe { arch::syscall::unwind_to_kernel() }
-        }
+        Ok(general::__NR_getpid) => task::sys_getpid(frame),
+        Ok(general::__NR_exit | general::__NR_exit_group) => task::sys_exit(frame),
         Ok(general::__NR_uname) => {
             frame.rax = proc::sys_uname(frame.rdi);
             SyscallReturn::Sysret
@@ -282,10 +280,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = 0;
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_getppid) => {
-            frame.rax = u64::from(with_current(|p| p.ppid));
-            SyscallReturn::Sysret
-        }
+        Ok(general::__NR_getppid) => task::sys_getppid(frame),
         Ok(general::__NR_getpgrp) => {
             frame.rax = u64::from(with_current(|p| p.pid));
             SyscallReturn::Sysret
@@ -294,18 +289,8 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = proc::sys_arch_prctl(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_gettid) => {
-            frame.rax = u64::from(with_current(|p| p.tid));
-            SyscallReturn::Sysret
-        }
-        Ok(general::__NR_set_tid_address) => {
-            let tidptr = frame.rdi;
-            frame.rax = u64::from(with_current_mut(|p| {
-                p.clear_child_tid = tidptr;
-                p.tid
-            }));
-            SyscallReturn::Sysret
-        }
+        Ok(general::__NR_gettid) => task::sys_gettid(frame),
+        Ok(general::__NR_set_tid_address) => task::sys_set_tid_address(frame),
         Ok(general::__NR_clock_gettime) => {
             frame.rax = proc::sys_clock_gettime(frame.rdi, frame.rsi);
             SyscallReturn::Sysret

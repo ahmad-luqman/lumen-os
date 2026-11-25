@@ -1,6 +1,6 @@
-//! Descriptor I/O: `read`, `write`, `close`, `fstat`, `poll`, `ioctl`,
-//! `readv`, `writev` (M6, through the process's FD table since #254), and
-//! M7's `open`, `openat`, `lseek`.
+//! Descriptor I/O: `read`, `write`, `close`, `fstat`, `ioctl`, `readv`,
+//! `writev` (M6, through the process's FD table since #254), and M7's
+//! `open`, `openat`, `lseek`; M6's `poll` is in `poll` since #371.
 //!
 //! Every descriptor is an open file description in the process's
 //! `FdTable`. A terminal's (`VfsInode::is_tty`: `/dev/console`, which fds 0,
@@ -10,18 +10,19 @@
 //! file's offset, through a bounce buffer on the stack. No VFS lock, nor
 //! the offset's (Lock 2), is held across a copy to or from user memory.
 
-use alloc::vec;
+#[cfg(feature = "ktest")]
 use alloc::vec::Vec;
-use core::mem::size_of;
 
 use super::at::{self, Dirfd, Fd, Mode, UserPath, UserPtr};
+#[cfg(feature = "ktest")]
+use super::neg_errno;
 use super::{
-    DEFAULT_RLIMIT_NOFILE, MAX_SINGLE_IO, copy_iovecs, copy_pod_from_user, copy_pod_to_user, finish, neg_errno,
-    read_into_user, write_from_user,
+    MAX_SINGLE_IO, copy_iovecs, copy_pod_from_user, copy_pod_to_user, finish, read_into_user, write_from_user,
 };
-use crate::linux::process::{self, ConsoleIo, FileRef, KernelFile, with_current, with_current_mut};
+#[cfg(feature = "ktest")]
+use crate::linux::process::FileRef;
+use crate::linux::process::{self, ConsoleIo, KernelFile, with_current, with_current_mut};
 use crate::linux::{errno, general, ioctl};
-use crate::sched;
 use crate::user::{CopyError, copy_from_user, copy_to_user};
 use lumen_vfs::{DevId, InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsInode, VfsLock};
 
@@ -29,21 +30,12 @@ use lumen_vfs::{DevId, InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsIn
 /// on the stack (no heap, so a run's frame count is unchanged).
 pub(super) const FILE_CHUNK: usize = 4096;
 
-/// Raw Linux x86-64 `struct pollfd` layout (8 bytes, zero padding).
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub(super) struct RawPollFd {
-    fd: i32,
-    events: i16,
-    revents: i16,
-}
-
 /// A VFS error as the positive errno a handler returns.
 pub(super) fn vfs(e: VfsError) -> u32 {
     e.to_errno()
 }
 
-fn current_io() -> ConsoleIo {
+pub(super) fn current_io() -> ConsoleIo {
     with_current(|p| p.io)
 }
 
@@ -247,134 +239,6 @@ fn fstat(fd: Fd, statbuf: UserPtr) -> Result<u64, u32> {
     drop(file);
     at::write_stat(statbuf, &m)?;
     Ok(0)
-}
-
-/// How `poll` treats a descriptor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PollClass {
-    /// Not open (or `O_PATH`, which Linux's `poll` doesn't see): `POLLNVAL`.
-    Invalid,
-    /// A terminal: `POLLOUT` if writable at once, `POLLIN` once the console
-    /// has input (if readable), as M6's console fds.
-    Tty { readable: bool, writable: bool },
-    /// Anything else (a file, a directory, `/proc`, `/dev/null`...): always
-    /// ready both ways, as Linux's `DEFAULT_POLLMASK`.
-    Ready,
-}
-
-fn poll_class(file: Option<&FileRef>) -> PollClass {
-    match file {
-        None => PollClass::Invalid,
-        Some(f) if f.is_path() => PollClass::Invalid,
-        Some(f) if f.inode().is_tty() => PollClass::Tty { readable: f.is_readable(), writable: f.is_writable() },
-        Some(_) => PollClass::Ready,
-    }
-}
-
-/// `poll(2)`: always-ready files at once; terminals readiness-driven, with
-/// a timeout-aware wait for console input (Rust `std`'s
-/// `sanitize_standard_fds`, `poll([0, 1, 2], 3, 0)`, and `busybox`
-/// `lineedit`'s stdin waits). Pipes and PTYs arrive in M8.
-pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
-    if nfds > DEFAULT_RLIMIT_NOFILE {
-        return neg_errno(errno::EINVAL);
-    }
-    let timeout_ms = timeout_raw as i32;
-    let cnt = nfds as usize;
-    if cnt == 0 {
-        if timeout_ms > 0 {
-            let _ = sched::sleep((timeout_ms as u64).saturating_mul(1_000_000));
-        }
-        return 0;
-    }
-    let byte_len = cnt * size_of::<RawPollFd>();
-    let mut raw = vec![0u8; byte_len];
-    if let Err(e) = copy_from_user(&mut raw, fds_ptr) {
-        return neg_errno(e.to_errno());
-    }
-    let fd_at = |chunk: &[u8; 8]| i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes"));
-    let events_at = |chunk: &[u8; 8]| i16::from_le_bytes(chunk[4..6].try_into().expect("2 bytes"));
-
-    // The console's `io`, then the polled files, all cloned out in one more
-    // hold of `ACTIVE_PROCS`, classified (and dropped) after it.
-    let io = current_io();
-    let polled: Vec<i32> = raw.as_chunks::<8>().0.iter().map(fd_at).collect();
-    let files = process::current_files(&polled);
-    let classes: Vec<PollClass> = files.iter().map(|f| poll_class(f.as_ref())).collect();
-    drop(files);
-
-    let deadline = if timeout_ms > 0 {
-        Some(crate::time::now_ns().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
-    } else {
-        None
-    };
-
-    // Only touch stdin readiness if at least one entry actually asks for
-    // POLLIN on a readable terminal.
-    let pollin = general::POLLIN as i16;
-    let pollout = general::POLLOUT as i16;
-    let needs_stdin = raw.as_chunks::<8>().0.iter().zip(&classes).any(|(chunk, class)| {
-        fd_at(chunk) >= 0 && matches!(class, PollClass::Tty { readable: true, .. }) && (events_at(chunk) & pollin) != 0
-    });
-    let always = (general::POLLIN | general::POLLOUT | general::POLLRDNORM | general::POLLWRNORM) as i16;
-
-    let ready = loop {
-        let mut ready = 0u64;
-        let mut waiting_stdin = false;
-        let stdin_avail = if needs_stdin { process::stdin_ready(io) } else { false };
-
-        for (chunk, class) in raw.as_chunks_mut::<8>().0.iter_mut().zip(&classes) {
-            let fd = fd_at(chunk);
-            let events = events_at(chunk);
-            let revents: i16 = if fd < 0 {
-                0
-            } else {
-                match *class {
-                    PollClass::Invalid => general::POLLNVAL as i16,
-                    PollClass::Ready => events & always,
-                    PollClass::Tty { readable, writable } => {
-                        let mut r = if writable { events & pollout } else { 0 };
-                        if readable && (events & pollin) != 0 {
-                            if stdin_avail {
-                                r |= pollin;
-                            } else {
-                                waiting_stdin = true;
-                            }
-                        }
-                        r
-                    }
-                }
-            };
-            if revents != 0 {
-                ready += 1;
-            }
-            chunk[6..8].copy_from_slice(&revents.to_le_bytes());
-        }
-
-        if ready > 0 || timeout_ms == 0 {
-            break ready;
-        }
-        if !waiting_stdin {
-            if let Some(dl) = deadline {
-                let rem = dl.saturating_sub(crate::time::now_ns());
-                if rem > 0 {
-                    let _ = sched::sleep(rem);
-                }
-            }
-            break 0;
-        }
-        if let Some(dl) = deadline
-            && crate::time::now_ns() >= dl
-        {
-            break 0;
-        }
-        process::wait_stdin_step(io, deadline);
-    };
-
-    if let Err(e) = copy_to_user(fds_ptr, &raw) {
-        return neg_errno(e.to_errno());
-    }
-    ready
 }
 
 pub(super) fn sys_ioctl(fd: Fd, req: u32, arg: u64) -> u64 {
@@ -1163,6 +1027,7 @@ crate::ktest!(
 
 crate::ktest!(
     fn fd_poll_reports_files_ready_terminals_by_direction_and_the_rest_invalid() {
+        use super::poll::sys_poll;
         use crate::kassert_eq;
         use crate::user::copy_from_user;
         process::in_test_process(|_| {
