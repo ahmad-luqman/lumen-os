@@ -90,7 +90,6 @@ use lumen_mm::stacks::{StackKind, StackRange};
 use crate::arch::{self, MAX_CPUS};
 use crate::linux::process::UserThread;
 use crate::linux::signal::RestartBlock;
-use crate::mm::paging;
 use crate::mm::stack::{KernelStack, STACK_SIZE, StackError};
 use crate::mm::user_vm::AddressSpace;
 use crate::sync::SpinLock;
@@ -1190,11 +1189,9 @@ pub fn detach_user_space() -> Option<Arc<AddressSpace>> {
             "detach_user_space on a Linux thread its process's takedown hasn't detached"
         );
         if prev.is_some() {
-            let kroot = paging::kernel_root();
-            if arch::paging::active_root() != kroot {
-                // SAFETY: restoring the kernel's own page-table root.
-                unsafe { arch::paging::write_cr3(kroot.as_u64()) };
-            }
+            // SAFETY: interrupts are off on `cpu`; `prev` keeps the previously
+            // loaded `AddressSpace` alive across the `CR3` switch.
+            unsafe { AddressSpace::switch_loaded(None) };
             // SAFETY: interrupts are off on `cpu` and no user context is active.
             unsafe {
                 arch::gdt::set_rsp0(cpu, 0);
@@ -1232,12 +1229,12 @@ impl UserSpaceGuard {
             // SAFETY: `t` is the running thread on `cpu` with interrupts off.
             let slot = unsafe { &mut *(*t).user.slot() };
             assert!(slot.is_none(), "nested UserSpaceGuard on cpu {cpu}");
-            let root = state.address_space.root();
             *slot = Some(state);
             let installed = slot.as_ref().expect("just stored");
-            // SAFETY: `root` shares kernel `L4[256..512]` verbatim, interrupts are off.
+            // SAFETY: interrupts are off on `cpu`; `installed.address_space` is
+            // alive in `(*t).user` and no prior user space was loaded.
             unsafe {
-                arch::paging::write_cr3(root.as_u64());
+                AddressSpace::switch_loaded(Some(&installed.address_space));
                 arch::gdt::set_rsp0(cpu, 0);
                 arch::fpu::write_fs_base(0);
                 installed.restore_fpu();
@@ -1662,13 +1659,12 @@ unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thre
         pu.pending_debug_trap.store(arch::percpu::take_pending_debug_trap(), Ordering::Relaxed);
     }
 
-    // 2. Switch CR3 to `next`'s AddressSpace root or back to `kernel_root()`.
-    let target_root = next_user.map_or_else(paging::kernel_root, |nu| nu.address_space.root());
-    if arch::paging::active_root() != target_root {
-        // SAFETY: `target_root` is either `kernel_root()` or a user L4 root
-        // copying kernel `L4[256..512]` verbatim.
-        unsafe { arch::paging::write_cr3(target_root.as_u64()) };
-    }
+    // 2. Switch CR3 to `next`'s AddressSpace root or back to `kernel_root()`,
+    //    updating `AddressSpace::active` and `PerCpu::loaded_space`.
+    // SAFETY: interrupts are off on `cpu`; both `prev` (whose space
+    // `PerCpu::loaded_space` records) and `next` remain alive in
+    // `CPUS[cpu].switched_from` and `CPUS[cpu].current` until `finish_switch`.
+    unsafe { AddressSpace::switch_loaded(next_user.map(|nu| &*nu.address_space)) };
 
     // 3. Restore incoming user thread's TSS.rsp0, PerCpu, IA32_FS_BASE, and FPU,
     //    or clear all user CPU state for a kernel/idle thread.

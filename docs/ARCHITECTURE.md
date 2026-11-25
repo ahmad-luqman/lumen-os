@@ -974,9 +974,8 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       `WritableMap`s and `pinned_pages` entries). The truncate syscall never
       holds Lock 1 and Lock 4 together (the fault path does, Lock 1 then
       Lock 4, through `mmap_page`); a dropped page stays alive, pinned by its
-      mapping, until the unmap. `invalidate_file_from` works only on
-      the address space loaded on the calling CPU (debug-asserted: the flush is a
-      local `invlpg`) until M8's shootdowns (B5, below). Subsequent accesses in the
+      mapping, until the unmap. `invalidate_file_from` retires its leaves on
+      every CPU holding that address space (`tlb::shoot_down`, B5 below). Subsequent accesses in the
       caller's space fault into `BusError` / `SIGBUS`, so its later file
       growth can't split-brain against stale mapped frames; another process's
       mappings still can until B7 ("Copy-on-write `fork` and TLB
@@ -1144,26 +1143,24 @@ for `PTE_SHARED` leaves is unchanged):
   read-only entry only faults, and the fault finds the leaf writable,
   M7's "already writable" path);
 - count above 1: `frame::alloc_owned()` (`OutOfMemory` if none), copy the 4
-  KiB, convert with `UserFrame::from_owned`, replace the leaf with the copy
-  (writable), shoot the page down in
-  this space (`tlb::shoot_down(space, Shoot::Pages(page))`), then `dec`
-  the old frame's count. The shootdown comes before
-  the decrement: a CPU still holding the old read-only entry must not
-  read a frame the other holder may now reuse writable.
+  KiB, convert with `UserFrame::from_owned`, clear the leaf, shoot the page
+  down in this space (`tlb::shoot_down(space, Shoot::Pages(page))`), map the
+  copy (writable), then `dec` the old frame's count. Break-before-make (as
+  Linux's `wp_page_copy`) ensures no sibling CPU keeps reading stale data from
+  a cached old read-only entry after stores land in the new copy, and the
+  shootdown comes before the decrement so a CPU still holding the old entry
+  never reads a frame the other holder may reuse writable.
 
 Two spaces splitting one frame at once may both copy; the second
 decrement then frees it. Only a space that maps a frame can raise its
 count (`fork` under that space's Lock 1), so a count of 1 seen under Lock 1
 stays 1.
 
-**TLB shootdown (B5).** Vector `0x3e` (free today: section 6's vector map
-names it, and B5 adds the `idt::TLB_SHOOTDOWN` constant and its handler),
+**TLB shootdown (B5, built).** Vector `0x3e` (section 6's vector map
+names `idt::TLB_SHOOTDOWN`, handled lock-free by `mm::tlb::on_shootdown_ipi`),
 `kernel/src/mm/tlb.rs` beside M1's stack-retire generations. B5 owns the
 one entry point, `tlb::shoot_down(space: &AddressSpace, what: Shoot)`
-with `enum Shoot { Pages(Range<u64>), Full }`; until B5 merges, B4 calls a
-local-flush version of the same signature, which is exact while every
-process is single-threaded and pinned (M7's invariant, unchanged until C3
-and B6).
+(`pub(in crate::mm)`) with `enum Shoot { Pages(Range<u64>), Full }`.
 - **Who may hold an entry:** each `AddressSpace` has `active: AtomicU64`,
   one bit per CPU. Each CPU records the space whose root it has loaded
   (`PerCpu::loaded_space`, a raw pointer kept alive by the running
@@ -1180,23 +1177,29 @@ and B6).
   the bit again.
 - **The board:** `SHOOTDOWN: SleepMutex<Board>`, one request at a time
   kernel-wide (section 9's Lock 1a: taken only under the space's Lock 1,
-  nothing numbered 2–9 held). `Board` holds the request (the root, a page
-  range or `Full`) and its generation in atomics the handler reads without
-  a lock, and each CPU's acknowledged generation, `ACKED[cpu]`.
-- **The request:** with the PTEs already changed under Lock 1: (1) with
-  interrupts off (so the thread can't migrate in between), flush this CPU
-  (`invlpg` per page, or a `CR3` reload for `Full` or past `FULL_FLUSH_PAGES`
-  = 32 pages, about Linux's `tlb_single_page_flush_ceiling` of 33), read
-  `active` (`SeqCst`, after the PTE stores) less this CPU, publish the
-  request with a new generation and send `0x3e` to each CPU left; (2) with
-  interrupts on again, wait until each target's `ACKED` reaches the
-  generation or its bit has left `active` (it has loaded another root,
-  which flushes every non-global entry). The wait spins with interrupts on
-  (`debug_assert!(irq::enabled() && irq::depth() == 0)`), so this CPU
-  keeps taking interrupts, shootdowns and M1's `WAKEUP` included; it warns
-  every 2 s while a CPU hasn't answered (host-timed: B5 adds the line to
-  `klog.py`'s `HOST_TIMED`) and keeps waiting, since the frames can't be
-  freed before.
+  with no lock below it held (2 through 10, 9a included)). `Board` holds
+  only the writer's generation counter; the published request
+  (`REQUEST_GEN`, `REQUEST_ROOT`, `REQUEST_START`, `REQUEST_END`,
+  `REQUEST_FULL`) and each CPU's acknowledged generation (`ACKED[cpu]`)
+  live in module-level atomics the handler reads without a lock.
+- **The request:** with the PTEs already changed under Lock 1: a fast path
+  flushes this CPU with interrupts off (`invlpg` per page, or a `CR3`
+  reload for `Full` or past `FULL_FLUSH_PAGES` = 32 pages, about Linux's
+  `tlb_single_page_flush_ceiling` of 33), issues a `SeqCst` fence, then
+  reads `active` less this CPU, returning without taking `SHOOTDOWN` when
+  no other CPU has the space loaded. Otherwise it acquires `SHOOTDOWN` and:
+  (1) with interrupts off (so the thread can't migrate in between), flushes
+  this CPU if it migrated, issues a `SeqCst` fence, then reads `active`
+  less this CPU, publishes the request with a new generation and sends
+  `0x3e` to each CPU left; (2) with interrupts on again, waits until each
+  target's `ACKED` reaches the generation or its bit has left `active` (it
+  has loaded another root, which flushes every non-global entry). The wait
+  spins with interrupts on (`debug_assert!(irq::enabled() && irq::depth()
+  == 0)`), so this CPU keeps taking interrupts, shootdowns and M1's
+  `WAKEUP` included; it warns at 2 s (host-timed: B5 adds that first line
+  to `klog.py`'s `HOST_TIMED`) and every 2 s thereafter with distinct
+  non-host-timed text naming the elapsed time and unsent mask, keeping
+  waiting since the frames can't be freed before.
 - **The handler:** if this CPU's `CR3` is the request's root, flush the
   range (or reload `CR3`); store the generation in `ACKED[cpu]`; EOI. It
   takes no lock.
@@ -1216,6 +1219,7 @@ whose `active` has another CPU in it:
   the loader's rollback, a stale or copy-on-write leaf), by its range;
 - `protect_user_range_with` (`mprotect`) when a leaf loses `WRITABLE`, gains
   NX or becomes `PTE_PROTNONE`; an upgrade needs none;
+- `map_elf_image_locked`'s `PageAction::UpdatePerm` (`ProtectPage`), one page;
 - `fork_copy`'s write-protect (a full flush) and the copy-on-write split
   (one page);
 - section 5's `MAP_PRIVATE` file-page split (one page): the fault replaces
@@ -1226,16 +1230,16 @@ whose `active` has another CPU in it:
 - not `teardown` or `drop`: `teardown` (run by whoever lowers the space's
   `users` to 0, section 8: the last thread of the last process using it,
   or `execve` letting its old space go), after switching its own CPU off
-  the space, waits until the space's `active` is empty (a CPU that loaded
-  the root, such as one whose thread is between its detach and its
-  switch, not yet done with it) before it frees anything, and `drop` runs
-  only once no CPU
-  holds the root.
+  the space, waits until the space's `active` is empty (a CPU running a
+  thread on the space that isn't a counted process user, such as a sibling
+  or ktest thread not yet detached) before it frees anything, and `drop`
+  runs only once no CPU holds the root.
 
-Tested by `ktest:lumen_kernel::mm::tlb::shootdown_across_cpus`,
-`ktest:lumen_kernel::mm::frame::refcount_and_cow_split`,
-`ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only`
-and `scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
+Tested by `ktest:lumen_kernel::mm::tlb::shootdown_across_cpus` (B5),
+`ktest:lumen_kernel::mm::frame::refcount_and_cow_split` (B4),
+`ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only` (B4),
+and (future, C11: cross-CPU `fork` write-protect)
+`scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
 (section 15, "M8's tests", says what each checks).
 
 **Truncate reaching every address space (B7).** M7's
@@ -1408,8 +1412,8 @@ reserves room in its queues so the timer never allocates.
   calls `lumen_exception_dispatch`.
 - **Vector map** (`arch/x86_64/idt.rs`): 0-31 CPU exceptions; 0x20-0x2f the
   8259 PICs, remapped there and masked (only a spurious IRQ 7 or 15 should
-  arrive); 0x30-0x3d unused (ktests raise 0x30 and 0x31); 0x3e reserved for
-  the `TLB_SHOOTDOWN` IPI (M8); 0x3f the `WAKEUP` IPI, whose handler also
+  arrive); 0x30-0x3d unused (ktests raise 0x30 and 0x31); 0x3e the
+  `TLB_SHOOTDOWN` IPI (M8, B5), handled lock-free by `mm::tlb::on_shootdown_ipi`; 0x3f the `WAKEUP` IPI, whose handler also
   catches up a retired-stack TLB flush (section 4, "Other CPUs"); 0x40 the local APIC
   timer; 0x50 + n global system interrupt n (GSIs 0-63, up to 0x8f),
   once a driver routes it (`interrupts::route_isa_irq`; every other I/O
@@ -8396,7 +8400,8 @@ holding only locks above it.
  1. AddressSpace::inner (SleepMutex); two only in fork_copy, the parent's
     then the child's (the child is new: nothing else holds it)
  1a. The TLB shootdown board, SHOOTDOWN (SleepMutex): taken only under
-    Lock 1, with nothing numbered 2–9 held (section 5)
+    Lock 1, with no lock below it held (2 through 10, 9a included)
+    (section 5)
  2. OpenFile::offset / dir_cursor (SleepMutex)
  3. Per-filesystem rename_lock (SleepMutex)
  4. VfsInode metadata / directory / AdvisoryLocks lock (SleepMutex)
@@ -10623,12 +10628,17 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `run_on`, whose jobs run on `kernel_root()`), each first reporting one
   successful `read_u32_nofault` of the page, then probing it in a loop;
   one CPU unmaps it: once `shoot_down` returns, every probe answers
-  `Fault`. Also a full flush past 32 pages; a target spinning with an
+  `Fault`. Also a full flush past 32 pages; narrowing `mprotect`
+  (`PROT_NONE`) across the three target CPUs; a target spinning with an
   IRQ-off `SpinLock` held, released only after the request is published
-  (its `ACKED` still behind), answering once it lets go; a target that
-  switched away answering through `active`; `teardown` waiting for
-  `active` to empty (a pinned thread's switch delayed by a knob). It fails
-  on fewer than 4 CPUs.
+  (its `ACKED` still behind and the unmapped frame's refcount still >= 1),
+  answering once it lets go (refcount then 0); a break-before-make
+  copy-on-write split on a `fork_copy` page (during the shootdown window,
+  the leaf is unmapped and the old frame's refcount is still 2; after
+  release, the reader sees the copy's bytes); a target that switched away
+  answering through `active`; `teardown` waiting for `active` to empty (a
+  pinned thread's switch delayed by `allow_switch`). It fails on fewer
+  than 4 CPUs.
 - `ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space`
   (B7): two spaces mapping one file, the second loaded on another CPU, and
   a third forked from one: after the truncate none reads past the new end.

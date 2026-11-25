@@ -599,11 +599,11 @@ pub unsafe fn protect_user_range(
     start: u64,
     end: u64,
     attrs: Attrs,
-    on_protected: impl FnMut(UserLeaf),
+    mut on_protected: impl FnMut(UserLeaf),
 ) {
     assert!(attrs.user(), "protect_user_range requires user-mode attributes");
     // SAFETY: the caller supplies the same root, range and retirement guarantees.
-    unsafe { protect_user_range_with(root, start, end, |_, _| attrs, on_protected) };
+    unsafe { protect_user_range_with(root, start, end, |_, _| attrs, |leaf, _| on_protected(leaf)) };
 }
 
 /// Update attributes of every already-mapped leaf (present or `PTE_PROTNONE`)
@@ -614,7 +614,9 @@ pub unsafe fn protect_user_range(
 /// For `PTE_SHARED` leaves, clears `WRITABLE` (`attrs.without_writable().with_shared(true)`)
 /// while keeping `PRESENT = 1` for non-`PROT_NONE` protections (including
 /// write-only `PROT_WRITE`) so dirty/CoW fault tracking and `writable_maps`
-/// stay exact. Invokes `on_protected(leaf)` with the pre-update leaf snapshot.
+/// stay exact. Invokes `on_protected(leaf, narrowed)` with the pre-update leaf
+/// snapshot and whether rights narrowed (a present leaf became `PTE_PROTNONE`,
+/// lost `WRITABLE`, or gained NX, requiring a cross-CPU TLB shootdown).
 ///
 /// # Safety
 /// `root` must be an L4 root allocated by [`new_user_root`] (never
@@ -629,7 +631,7 @@ pub unsafe fn protect_user_range_with(
     start: u64,
     end: u64,
     mut attrs_for: impl FnMut(VirtAddr, Mapping) -> Attrs,
-    mut on_protected: impl FnMut(UserLeaf),
+    mut on_protected: impl FnMut(UserLeaf, bool),
 ) {
     assert_ne!(root, kernel_root(), "protect_user_range_with must never mutate kernel_root()");
     assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
@@ -645,14 +647,21 @@ pub unsafe fn protect_user_range_with(
                 let leaf_attrs = if m.shared { attrs.without_writable().with_shared(true) } else { attrs };
                 let prev = pt::protect(&mut Hhdm, root, va, leaf_attrs).expect("walk just found mapped user leaf");
                 debug_assert_eq!(prev.size, PageSize::Size4K);
-                on_protected(UserLeaf {
-                    va,
-                    phys: prev.phys,
-                    was_present: prev.present,
-                    was_writable: prev.writable,
-                    was_shared: prev.shared,
-                    was_dirty: prev.dirty,
-                });
+                let narrowed = prev.present
+                    && (leaf_attrs.is_prot_none()
+                        || (prev.writable && !leaf_attrs.writable())
+                        || (prev.executable && !leaf_attrs.executable()));
+                on_protected(
+                    UserLeaf {
+                        va,
+                        phys: prev.phys,
+                        was_present: prev.present,
+                        was_writable: prev.writable,
+                        was_shared: prev.shared,
+                        was_dirty: prev.dirty,
+                    },
+                    narrowed,
+                );
                 addr += FRAME_SIZE;
             }
             WalkEnd::NotPresent(level) => {

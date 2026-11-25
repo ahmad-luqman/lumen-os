@@ -376,9 +376,13 @@ pub const IOAPIC_LAST: u8 = 0x8f;
 pub const MSI_BASE: u8 = 0x90;
 /// The last MSI vector.
 pub const MSI_LAST: u8 = 0xef;
-/// Free: no source uses 0x30-0x3e (ktests raise 0x30 and 0x31 by `int`).
+/// Free: no source uses 0x30-0x3d (ktests raise 0x30 and 0x31 by `int`).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub const UNUSED: u8 = 0x30;
+/// An IPI that shoots down stale user TLB translations on another CPU
+/// (`mm::tlb::shoot_down`): handled lock-free by `mm::tlb::on_shootdown_ipi`
+/// and an EOI.
+pub const TLB_SHOOTDOWN: u8 = 0x3e;
 /// An IPI that wakes its CPU (`smp::run_on`, `smp::wake`) and has it catch
 /// up retired TLB generations (`mm::tlb::sync`): handled by
 /// `mm::tlb::catch_up` and an EOI.
@@ -392,7 +396,8 @@ pub const SPURIOUS: u8 = 0xff;
 const _: () = assert!(
     32 <= PIC_BASE
         && PIC_BASE + 16 <= UNUSED
-        && UNUSED < WAKEUP
+        && UNUSED < TLB_SHOOTDOWN
+        && TLB_SHOOTDOWN < WAKEUP
         && WAKEUP < TIMER
         && TIMER < IOAPIC_BASE
         && IOAPIC_BASE < IOAPIC_LAST
@@ -540,6 +545,7 @@ pub enum VectorUse {
     /// An 8259 line (`n`), masked: only spurious IRQs 7 and 15 should come.
     Pic(u8),
     Timer,
+    TlbShootdown,
     Wakeup,
     /// I/O APIC global system interrupt `n`.
     Gsi(u8),
@@ -556,6 +562,7 @@ pub fn vector_use(vector: u8) -> VectorUse {
         0..=31 => VectorUse::Exception,
         v @ PIC_BASE..=PIC_LAST => VectorUse::Pic(v - PIC_BASE),
         TIMER => VectorUse::Timer,
+        TLB_SHOOTDOWN => VectorUse::TlbShootdown,
         WAKEUP => VectorUse::Wakeup,
         v @ IOAPIC_BASE..=IOAPIC_LAST => VectorUse::Gsi(v - IOAPIC_BASE),
         v @ MSI_BASE..=MSI_LAST => VectorUse::Msi(v - MSI_BASE),
@@ -571,6 +578,7 @@ impl core::fmt::Display for VectorUse {
             VectorUse::Exception => f.write_str("exception"),
             VectorUse::Pic(n) => write!(f, "8259 IRQ {n}"),
             VectorUse::Timer => f.write_str("local APIC timer"),
+            VectorUse::TlbShootdown => f.write_str("TLB shootdown IPI"),
             VectorUse::Wakeup => f.write_str("wakeup IPI"),
             VectorUse::Gsi(n) => write!(f, "GSI {n}"),
             VectorUse::Msi(n) => write!(f, "MSI {n}"),
@@ -863,6 +871,10 @@ fn dispatch(frame: &mut TrapFrame) {
         SPURIOUS => {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
         }
+        TLB_SHOOTDOWN => {
+            crate::mm::tlb::on_shootdown_ipi();
+            super::apic::eoi();
+        }
         WAKEUP => {
             #[cfg(feature = "ktest")]
             WAKEUPS[super::percpu::index()].fetch_add(1, Ordering::Relaxed);
@@ -928,10 +940,12 @@ crate::ktest!(
         // The ends of the I/O APIC and MSI ranges, as `irqs` names them.
         use crate::kassert_eq;
         use alloc::format;
+        kassert_eq!(vector_use(TLB_SHOOTDOWN), VectorUse::TlbShootdown);
         kassert_eq!(vector_use(IOAPIC_LAST), VectorUse::Gsi(63));
         kassert_eq!(vector_use(MSI_BASE), VectorUse::Msi(0));
         kassert_eq!(vector_use(MSI_LAST), VectorUse::Msi(95));
         kassert_eq!(vector_use(0xf0), VectorUse::Unused);
+        kassert_eq!(format!("{}", vector_use(0x3e)), "TLB shootdown IPI");
         kassert_eq!(format!("{}", vector_use(0x8f)), "GSI 63");
         kassert_eq!(format!("{}", vector_use(0x90)), "MSI 0");
         kassert_eq!(format!("{}", vector_use(0xef)), "MSI 95");

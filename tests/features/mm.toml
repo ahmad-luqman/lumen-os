@@ -195,3 +195,10 @@ tests = [
     "ktest:lumen_kernel::mm::frame::fork_copy_out_of_frames_rolls_back",
     "ktest:lumen_kernel::mm::frame::fork_copy_shared_population_failure",
 ]
+
+[[feature]]
+name = "Cross-CPU user TLB shootdown IPI (vector 0x3e, #376): AddressSpace::active bitmask and PerCpu::loaded_space tracked across CR3 switches, lock-free IPI handler flushing page ranges or reloading CR3 past 32 pages, synchronous tlb::shoot_down verified across CPUs for single-page and >32-page munmap, narrowing mprotect (PROT_NONE), break-before-make copy-on-write splits, frame release ordering (frames stay referenced until after acknowledgements), IRQ-off SpinLock deferral, active-mask exit on switch-away, and teardown waiting for active CPUs to leave (cross-CPU fork write-protect is verified in C11, #390)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::mm::tlb::shootdown_across_cpus",
+]

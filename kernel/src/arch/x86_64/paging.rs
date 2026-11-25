@@ -79,7 +79,9 @@ pub fn flush_local() {
 /// # Safety
 /// `root` must be a 4 KiB-aligned physical L4 root table (below 2^52) whose
 /// upper half (`L4[256..512]`) maps the running kernel identically to the
-/// kernel hierarchy.
+/// kernel hierarchy. Any load of a user address space root (or switch away from
+/// one) must go through `AddressSpace::switch_loaded`, which keeps
+/// `AddressSpace::active` and `PerCpu::loaded_space` in step with `CR3`.
 pub unsafe fn write_cr3(root: u64) {
     debug_assert!(PhysFrame::from_u64(root).is_some(), "CR3 root {root:#x} is not a 4 KiB physical frame");
     debug_assert!(read_cr4() & CR4_PCIDE == 0, "CR4.PCIDE must remain 0");

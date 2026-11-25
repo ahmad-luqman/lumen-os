@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use lumen_elf::loader::{ElfLoadError, LoadedElf, MappedRange, PageAction, Perm};
 use lumen_elf::stack::{AuxvInfo, InitialStack, StackBuildError, build_initial_stack};
@@ -24,6 +24,7 @@ use lumen_vm::{
     VmaMap,
 };
 
+use super::tlb::{self, Shoot};
 use super::{frame, paging};
 use crate::arch;
 use crate::linux::{errno, general};
@@ -169,31 +170,6 @@ impl fmt::Display for UserVmError {
 #[inline]
 pub const fn prot_to_attrs(prot: Prot) -> Attrs {
     Attrs::for_user(prot.read(), prot.write(), prot.exec())
-}
-
-/// Local implementation of B5's shootdown signature while spaces remain
-/// single-threaded and pinned. B5 replaces this with cross-CPU retirement.
-enum Shoot {
-    Pages(core::ops::Range<u64>),
-    Full,
-}
-
-/// Retire local translations only if this space is loaded here; otherwise
-/// do nothing. With CR4.PCIDE = 0, a CPU that switched away holds none of
-/// the root's entries. M7's single-threaded, pinned invariant covers the rest.
-/// B5 must replace this with cross-CPU retirement before that invariant ends.
-fn shoot_down(space: &AddressSpace, what: Shoot) {
-    if arch::paging::active_root() != space.root {
-        return;
-    }
-    match what {
-        Shoot::Full => arch::paging::flush_local(),
-        Shoot::Pages(range) => {
-            for addr in range.step_by(PAGE_SIZE as usize) {
-                arch::paging::invalidate(VirtAddr::new(addr).expect("user page"));
-            }
-        }
-    }
 }
 
 /// Next populated leaf, including PROT_NONE, skipping missing subtrees.
@@ -508,6 +484,10 @@ pub struct AddressSpace {
     /// detaching its CPU) tears it down. Threads of one process do not
     /// raise it.
     users: AtomicU32,
+    /// Bitmask of CPUs (bit `cpu`) that currently have this space's root
+    /// loaded in `CR3`. Set before `write_cr3`, cleared after switching away
+    /// ([`Self::switch_loaded`]).
+    active: AtomicU64,
     root: PhysFrame,
     inner: SleepMutex<AddressSpaceInner>,
 }
@@ -519,6 +499,7 @@ impl AddressSpace {
         let brk = Brk::with_limit(USER_MIN, MMAP_TOP).expect("USER_MIN..MMAP_TOP is valid");
         Ok(Self {
             users: AtomicU32::new(1),
+            active: AtomicU64::new(0),
             root,
             inner: SleepMutex::new(AddressSpaceInner {
                 vmas: VmaMap::new(),
@@ -531,6 +512,65 @@ impl AddressSpace {
                 fault_warned: None,
             }),
         })
+    }
+
+    /// Bitmask of CPUs that currently have this address space loaded in `CR3`.
+    #[inline]
+    pub(crate) fn active_mask(&self) -> u64 {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// Switch this CPU's `CR3` to `next`'s root (or `kernel_root()` if `None`),
+    /// updating [`Self::active`] and `PerCpu::loaded_space` in shootdown-safe
+    /// order: set this CPU's bit in `next` before `write_cr3`, and clear it in
+    /// the previously recorded space after `write_cr3`.
+    ///
+    /// Skips the `CR3` reload when the recorded space is unchanged, so two
+    /// threads sharing one address space keep the bit set.
+    ///
+    /// # Safety
+    /// Interrupts must be disabled on this CPU. `next` (if `Some`) must stay
+    /// alive until a later [`Self::switch_loaded`] on this CPU replaces or
+    /// clears it (as `percpu::set_loaded_space` requires), and the space
+    /// currently recorded in `PerCpu::loaded_space` (if non-null) must remain
+    /// alive for the duration of this call.
+    pub(crate) unsafe fn switch_loaded(next: Option<&AddressSpace>) {
+        debug_assert!(!arch::irq::enabled(), "AddressSpace::switch_loaded called with interrupts enabled");
+        let cpu = arch::cpu_index();
+        let bit = 1u64 << cpu;
+        let prev_ptr = arch::percpu::loaded_space();
+        let next_ptr = next.map_or(core::ptr::null(), |s| s as *const AddressSpace);
+        let target_root = next.map_or_else(paging::kernel_root, AddressSpace::root);
+        if prev_ptr == next_ptr {
+            debug_assert_eq!(
+                arch::paging::active_root(),
+                target_root,
+                "CR3 out of step with PerCpu::loaded_space on cpu {cpu}"
+            );
+            return;
+        }
+        if let Some(next_space) = next {
+            // Set before `write_cr3` so a concurrent `tlb::shoot_down` either
+            // observes this CPU in `active` or orders its PTE writes before
+            // our serializing `write_cr3`.
+            next_space.active.fetch_or(bit, Ordering::SeqCst);
+        }
+        // SAFETY: `target_root` is either `kernel_root()` or a user L4 root
+        // sharing kernel `L4[256..512]` verbatim, and this function maintains
+        // `AddressSpace::active` and `PerCpu::loaded_space` around the write.
+        unsafe { arch::paging::write_cr3(target_root.as_u64()) };
+        // SAFETY: interrupts are disabled, `write_cr3` just loaded `next_ptr`'s
+        // root, and the caller guarantees `next` stays alive until the next
+        // `switch_loaded` replaces or clears it on this CPU.
+        unsafe { arch::percpu::set_loaded_space(next_ptr) };
+        if !prev_ptr.is_null() {
+            // SAFETY: caller guarantees the previously recorded space stays
+            // alive until after this switch completes.
+            let prev_space = unsafe { &*prev_ptr };
+            // Clear after `write_cr3` so every non-global TLB entry of
+            // `prev_space` has been flushed from this CPU first.
+            prev_space.active.fetch_and(!bit, Ordering::SeqCst);
+        }
     }
 
     /// Add a process user, refusing zero so a retired space never revives.
@@ -667,7 +707,7 @@ impl AddressSpace {
             self.fork_populate_shared_anon(&parent, &mut populated)?;
             self.fork_share_leaves(&parent, &child, &mut copied, &sizes)
         });
-        shoot_down(self, Shoot::Full);
+        tlb::shoot_down(self, Shoot::Full);
         drop(copied);
         drop(parent);
         if let Err(error) = &result
@@ -842,10 +882,9 @@ impl AddressSpace {
         let new_brk = Brk::with_limit(initial_brk, brk_limit)?;
 
         let stack_buf = stack.buf.as_slice();
-        let active = arch::paging::active_root() == self.root;
         let load_result = (|| -> Result<(), UserVmError> {
             for image in core::iter::once(main).chain(interp) {
-                self.map_elf_image_locked(image, active)?;
+                self.map_elf_image_locked(image)?;
             }
 
             // Eagerly map ONLY the top pages required by `build_initial_stack`.
@@ -885,7 +924,7 @@ impl AddressSpace {
     /// Map one validated ELF image's pages (`plan.plan_pages()`), copying its
     /// file bytes from `image.bytes`. The caller holds `inner` and has checked
     /// the image's ranges are free; on error it unmaps what was mapped.
-    fn map_elf_image_locked(&self, image: ElfImage<'_>, active: bool) -> Result<(), UserVmError> {
+    fn map_elf_image_locked(&self, image: ElfImage<'_>) -> Result<(), UserVmError> {
         for action in image.plan.plan_pages() {
             match action {
                 PageAction::MapZero { vaddr, page_count, perm } => {
@@ -901,9 +940,7 @@ impl AddressSpace {
                     let attrs = prot_to_attrs(perm_to_prot(perm));
                     // SAFETY: `self.root` is owned by `self` and `inner` lock is held.
                     unsafe { paging::protect_user_page(self.root, va, attrs) }.map_err(|_| UserVmError::InvalidArg)?;
-                    if active {
-                        arch::paging::invalidate(va);
-                    }
+                    tlb::shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
                 }
                 PageAction::CopyBytes { vaddr, file_offset, len } => {
                     let bytes = image.bytes.get(file_offset..file_offset + len).ok_or(UserVmError::InvalidArg)?;
@@ -1065,20 +1102,10 @@ impl AddressSpace {
     /// mapping, until this unmaps it. Returns how many leaves (present or
     /// `PROT_NONE`) were unmapped; pages never faulted in count for nothing.
     ///
-    /// **The current process's address space only, until M8's shootdowns:**
-    /// the flush is a local `invlpg`, which reaches only a space loaded on
-    /// this CPU. Called on another process's space running elsewhere, it
-    /// could leave that CPU a stale writable entry to a cache frame whose
-    /// last pin this unmap releases (hard rule 2). Debug-asserted, before
-    /// even the `torn_down` check: M8's design for other processes' spaces
-    /// (shootdowns, or holding their pins until their CPUs flush) must
-    /// replace this assertion, not extend it.
+    /// Retires translations across every CPU that currently has this space
+    /// loaded (`tlb::shoot_down`) before dropping the removed pages' cache
+    /// guards, pins, or private-copy references.
     pub fn invalidate_file_from(&self, file_id: u64, new_size: u64) -> usize {
-        debug_assert_eq!(
-            arch::paging::active_root(),
-            self.root,
-            "invalidate_file_from on an address space not loaded on this CPU (needs M8 shootdowns)"
-        );
         let Some(cut) = lumen_vm::align_up_page(new_size) else {
             return 0; // no page starts past such a size
         };
@@ -1107,9 +1134,9 @@ impl AddressSpace {
     ///
     /// `PTE_SHARED` leaves always become read-only (the next store faults:
     /// copy-on-write, or `MAP_SHARED` dirty promotion), so each writable one
-    /// loses its [`WritableMap`], dropped after the walk retires its entry
-    /// (a local flush only if loaded here; M7 excludes remote users). Their
-    /// pins stay, `PROT_NONE` included.
+    /// loses its [`WritableMap`], dropped after the walk retires its entry on
+    /// every CPU holding this space (`tlb::shoot_down`). Their pins stay,
+    /// `PROT_NONE` included.
     /// Counted private leaves with multiple references also stay read-only
     /// when write access is granted; shared anonymous leaves follow `prot`.
     pub fn mprotect(&self, addr: u64, len: u64, prot: Prot) -> Result<(), UserVmError> {
@@ -1142,10 +1169,12 @@ impl AddressSpace {
         let attrs = prot_to_attrs(prot);
         let active = arch::paging::active_root() == self.root;
         let writable = &inner.writable_maps;
+        let mut pending = PendingShoot::new();
         // SAFETY: Lock 1 excludes mutations over this validated lower-half
-        // range. Choose CoW rights before granting writes, then flush each
-        // changed leaf if loaded here. M7's single-threaded, pinned processes
-        // exclude remote cached translations; B5 replaces that invariant.
+        // range. Narrowing changes (losing WRITABLE, gaining NX, or becoming
+        // PROT_NONE) are shot down across all active CPUs before any
+        // `WritableMap` guard is released; pure upgrades need only a local
+        // refresh if loaded here.
         unsafe {
             paging::protect_user_range_with(
                 self.root,
@@ -1159,9 +1188,11 @@ impl AddressSpace {
                         attrs
                     }
                 },
-                |leaf| {
+                |leaf, narrowed| {
                     release_order::step(&leaf, release_order::Step::Cleared);
-                    if active {
+                    if narrowed {
+                        pending.add(&leaf);
+                    } else if active {
                         arch::paging::invalidate(leaf.va);
                         release_order::step(&leaf, release_order::Step::Flushed);
                     }
@@ -1169,8 +1200,9 @@ impl AddressSpace {
                 },
             );
         }
-        // Every cache leaf in the range is now read-only and retired;
-        // release its writable-map guard while retaining its cache pin.
+        pending.flush(self);
+        // Every cache leaf in the range is now read-only and retired across
+        // all active CPUs; release its writable-map guard while retaining its pin.
         drop_range(&mut inner.writable_maps, addr, end);
         Ok(())
     }
@@ -1215,9 +1247,9 @@ impl AddressSpace {
     ///   `MAP_PRIVATE` (a private copy replaces it), dirty promotion for
     ///   `MAP_SHARED` (made writable, counted by a [`WritableMap`]).
     /// - **A store to a read-only counted private leaf:** reuse at count
-    ///   one, otherwise copy the whole frame into a new counted reference.
-    ///   The old reference is released after translation retirement through
-    ///   `shoot_down` (local only until B5, a no-op unless loaded here).
+    ///   one (local `invlpg` only), otherwise copy the whole frame into a new
+    ///   counted reference. The old reference is released only after
+    ///   `tlb::shoot_down` retires the translation across all active CPUs.
     /// - Anything else is `Invalid`.
     ///
     /// File faults hold Lock 1 (`inner`) while [`mmap_page`] takes the
@@ -1313,7 +1345,11 @@ impl AddressSpace {
             // SAFETY: under Lock 1 this is the sole reference, so no other
             // space can raise its count or observe private writes.
             unsafe { paging::protect_user_page(self.root, va, attrs) }.expect("existing private leaf");
-            shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
+            // Upgrading RO -> RW needs no cross-CPU shootdown: another CPU's
+            // stale RO entry simply faults and finds the leaf writable.
+            if arch::paging::active_root() == self.root {
+                arch::paging::invalidate(va);
+            }
             return FaultResult::Resolved;
         }
         let Some(copy) = frame::alloc_owned() else {
@@ -1340,13 +1376,17 @@ impl AddressSpace {
             });
         }
         let removed = removed.expect("split must remove one leaf");
+        // Break-before-make: retire the cleared read-only leaf across every
+        // active CPU BEFORE mapping the writable copy, so no sibling CPU can
+        // keep reading stale data through a cached old entry after stores land
+        // in the copy (Linux's `wp_page_copy`).
+        tlb::shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
         // SAFETY: Lock 1 is held and the leaf is now missing. Its tables
         // remain, so replacing it cannot allocate or run out of frames.
         unsafe { map_user_frame(self.root, va, copy, attrs) }.expect("retained private leaf tables");
-        shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
-        // SAFETY: this is the counted leaf just removed; shoot_down flushed
-        // it if loaded here. With PCIDE=0 switched-away CPUs hold none of its
-        // entries, and M7's single-threaded, pinned invariant excludes others.
+        // SAFETY: this is the counted leaf just removed, and `tlb::shoot_down`
+        // retired it from every CPU that had this space loaded before we drop
+        // its reference.
         drop(unsafe { frame::UserFrame::from_leaf(removed.phys) });
         FaultResult::Resolved
     }
@@ -1507,8 +1547,11 @@ impl AddressSpace {
     /// directly. Direct teardown retires users to zero and asserts there was
     /// at most one user. Repeated calls are harmless.
     ///
-    /// Must be called only after switching `CR3` back to `kernel_root()`.
-    /// Subsequent [`Drop`] frees only the bare L4 root frame without locking.
+    /// Must be called only after switching `CR3` back to `kernel_root()`, with
+    /// interrupts enabled and no `SpinLock` held: it may block while waiting
+    /// for other CPUs to clear [`Self::active`] and while acquiring Lock 1
+    /// (`inner`). Subsequent [`Drop`] frees only the bare L4 root frame without
+    /// locking.
     ///
     /// Cache frames remain owned by the cache (`PTE_SHARED` leaves): their
     /// [`WritableMap`]s and pins are dropped after the sweep (the switch
@@ -1521,13 +1564,43 @@ impl AddressSpace {
             "AddressSpace::teardown called while CR3 still holds {}",
             self.root
         );
+        let here_bit = 1u64 << arch::cpu_index();
+        assert_eq!(
+            self.active.load(Ordering::Acquire) & here_bit,
+            0,
+            "AddressSpace::teardown called while this CPU is still active on {}",
+            self.root
+        );
         let previous = self.users.swap(0, Ordering::AcqRel);
         assert!(previous <= 1, "teardown requires at most one process user");
+        // Wait until every other CPU that still has this root loaded (a thread
+        // running on the space that is not a counted process user, such as a
+        // sibling or ktest thread not yet detached) has switched away before
+        // freeing any leaf frames, pins, or page tables.
+        let mut mask = self.active.load(Ordering::Acquire);
+        if mask != 0 {
+            crate::crash::halt_if_stopping_elsewhere();
+            debug_assert!(
+                arch::irq::enabled() && arch::irq::depth() == 0,
+                "AddressSpace::teardown waiting for active CPUs with interrupts off or a SpinLock held"
+            );
+            let mut timer = tlb::WaitTimer::new();
+            while mask != 0 {
+                if let Some((true, _)) = timer.poll() {
+                    let root = self.root;
+                    log::warn!(target: "mm", "cpus {mask:#x} still have {root} loaded: teardown waits for them");
+                }
+                core::hint::spin_loop();
+                crate::sched::yield_now();
+                mask = self.active.load(Ordering::Acquire);
+            }
+        }
         let gone_files;
         let mut inner = self.inner.lock();
         if inner.torn_down {
             return;
         }
+        debug_assert_eq!(self.active.load(Ordering::Acquire), 0, "teardown entered while CPUs still active");
         inner.vmas = VmaMap::new();
         self.unmap_range_locked(&mut inner, USER_MIN, USER_MAX);
         // SAFETY: the root is inactive and every leaf has been removed and
@@ -1689,34 +1762,51 @@ impl AddressSpace {
     }
 
     /// Unmap populated leaves in page-aligned `[start, end)`: clear each
-    /// leaf, flush it if this root is loaded here, then release its counted
-    /// reference. After the walk, release cache writable guards and pins.
-    /// M7's single-threaded, pinned processes exclude remote cached entries.
-    /// Returns the number of removed leaves. Every removal except the
-    /// counted CoW split and Drop uses this path, including cache-leaf
-    /// replacement and teardown before freeing empty page tables.
+    /// leaf, shoot down stale translations across every active CPU
+    /// (`tlb::shoot_down`), then release counted references, cache writable
+    /// guards, and cache pins in that order. Batches counted frames on the
+    /// stack so OOM rollbacks never allocate. Returns the number of removed
+    /// leaves. Every removal except the counted CoW split and Drop uses this
+    /// path, including cache-leaf replacement and teardown before freeing empty
+    /// page tables.
     fn unmap_range_locked(&self, inner: &mut AddressSpaceInner, start: u64, end: u64) -> usize {
-        let active = arch::paging::active_root() == self.root;
+        const FRAME_BATCH: usize = 64;
         let writable = &inner.writable_maps;
-        let mut leaves = 0;
+        let mut leaves = 0usize;
+        let mut batch = [PhysFrame::from_u64(0).expect("zero is aligned"); FRAME_BATCH];
+        let mut batch_len = 0usize;
+        let mut pending = PendingShoot::new();
         // SAFETY: `self.root` is owned by `self`, `inner` lock is held, and
         // `[start, end)` is page-aligned and strictly in the lower half.
-        // The callback retires each translation before releasing its reference:
-        // local invalidation if loaded, otherwise the PCIDE=0 CR3 switch;
-        // M7's single-threaded, pinned invariant excludes remote entries.
+        // Removed counted frames are held until `tlb::shoot_down` retires their
+        // translations on every active CPU; cache writable guards and pins are
+        // dropped only after the final shootdown.
         unsafe {
             paging::unmap_user_range(self.root, start, end, |leaf| {
                 leaves += 1;
                 release_order::step(&leaf, release_order::Step::Cleared);
-                if active {
-                    arch::paging::invalidate(leaf.va);
-                    release_order::step(&leaf, release_order::Step::Flushed);
-                }
                 note_shared_leaf(writable, &leaf);
-                // SAFETY: removed and flushed if loaded here; PCIDE=0 and
-                // M7's single-threaded, pinned invariant exclude other entries.
-                release_removed_leaf(&leaf);
+                if leaf.was_shared {
+                    pending.add(&leaf);
+                    return;
+                }
+                if batch_len == FRAME_BATCH {
+                    pending.flush(self);
+                    for &phys in &batch[..batch_len] {
+                        // SAFETY: removed and retired across all active CPUs above.
+                        drop(frame::UserFrame::from_leaf(phys));
+                    }
+                    batch_len = 0;
+                }
+                batch[batch_len] = leaf.phys;
+                batch_len += 1;
+                pending.add(&leaf);
             });
+        }
+        pending.flush(self);
+        for &phys in &batch[..batch_len] {
+            // SAFETY: every leaf in `batch` was removed and shot down above.
+            drop(unsafe { frame::UserFrame::from_leaf(phys) });
         }
         drop_range(&mut inner.writable_maps, start, end);
         drop_range(&mut inner.pinned_pages, start, end);
@@ -1736,6 +1826,61 @@ impl AddressSpace {
     #[cfg(feature = "ktest")]
     pub(crate) fn mapped_file_count(&self) -> usize {
         self.inner.lock().mapped_files.len()
+    }
+}
+
+/// Accumulates cleared or narrowed leaves across a page-table walk so they are
+/// retired with a single [`tlb::shoot_down`] call (and, under `ktest`, recorded
+/// as [`release_order::Step::Flushed`] after the shootdown completes).
+struct PendingShoot {
+    start: u64,
+    end: u64,
+    #[cfg(feature = "ktest")]
+    shared: [u64; 64],
+    #[cfg(feature = "ktest")]
+    shared_len: usize,
+}
+
+impl PendingShoot {
+    fn new() -> Self {
+        Self {
+            start: u64::MAX,
+            end: 0,
+            #[cfg(feature = "ktest")]
+            shared: [0; 64],
+            #[cfg(feature = "ktest")]
+            shared_len: 0,
+        }
+    }
+
+    fn add(&mut self, leaf: &paging::UserLeaf) {
+        let va = leaf.va.as_u64();
+        self.start = self.start.min(va);
+        self.end = self.end.max(va + PAGE_SIZE);
+        #[cfg(feature = "ktest")]
+        if leaf.was_shared && self.shared_len < self.shared.len() {
+            self.shared[self.shared_len] = leaf.phys.as_u64();
+            self.shared_len += 1;
+        }
+    }
+
+    fn flush(&mut self, space: &AddressSpace) {
+        if self.start < self.end {
+            tlb::shoot_down(space, Shoot::Pages(self.start..self.end));
+            #[cfg(feature = "ktest")]
+            for &phys in &self.shared[..self.shared_len] {
+                release_order::record(phys, release_order::Step::Flushed);
+            }
+            // Mark flushed before replacing so `Drop` on the old value passes.
+            self.start = u64::MAX;
+            *self = Self::new();
+        }
+    }
+}
+
+impl Drop for PendingShoot {
+    fn drop(&mut self) {
+        debug_assert!(self.start >= self.end, "PendingShoot dropped unflushed");
     }
 }
 
@@ -1931,6 +2076,8 @@ fn release_unmapped_files(inner: &mut AddressSpaceInner, gone: &mut Vec<KeptFile
 impl Drop for AddressSpace {
     fn drop(&mut self) {
         assert_ne!(arch::paging::active_root(), self.root, "AddressSpace dropped while CR3 still holds {}", self.root);
+        let active = self.active.load(Ordering::Acquire);
+        assert_eq!(active, 0, "AddressSpace dropped while active on CPUs {active:#x}");
         // No sleeping lock needed: `&mut self` guarantees exclusive access, so
         // `Drop` is safe even inside `sched::finish_switch` with interrupts off.
         let inner = self.inner.get_mut();
