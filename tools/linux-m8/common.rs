@@ -1,12 +1,14 @@
 //! What M8's test programs share (`mod common;` in each; ARCHITECTURE
 //! section 15, "M8's tests"): the raw `syscall`, a line written in one
-//! `write`, the panic handler, argument bytes, and the checks' `Fail`.
+//! `write`, the panic handler, argument bytes, and the checks' runner.
 //!
-//! Each program prints one `ok <check>` line per check passed; the first
-//! failed check prints `FAIL <check>: <what> (got <value>)` and the program
-//! exits with the check's number (from 1), as `m7_vfs` does. A check about a
-//! syscall calls it by number ([`sys`], the raw `-errno`); a check about
-//! libc's use of the kernel calls musl.
+//! A mode runs its checks through [`run_checks`]: one `ok <check>` line per
+//! check passed; the first failed check prints `FAIL <check>: <what> (got
+//! <value>)` and the program exits with the check's number (from 1), as
+//! `m7_vfs` does. A mode has fewer than 64 checks, so that number is never
+//! [`USAGE_EXIT`] (or 127, a panic's). A check about a syscall calls it by
+//! number ([`sys`], the raw `-errno`); a check about libc's use of the
+//! kernel calls musl.
 
 #![allow(dead_code)]
 
@@ -57,6 +59,7 @@ pub fn sys(n: u64, a: [u64; 6]) -> i64 {
 }
 
 /// A line built in a fixed buffer, then written to stdout in one `write`.
+/// One longer than the buffer is cut, and still ends in its newline.
 pub struct Line {
     buf: [u8; 512],
     len: usize,
@@ -68,6 +71,9 @@ impl Line {
     }
 
     pub fn send(&mut self) {
+        if self.len == self.buf.len() {
+            self.buf[self.len - 1] = b'\n';
+        }
         let mut off = 0;
         while off < self.len {
             let rest = &self.buf[off..self.len];
@@ -121,6 +127,33 @@ pub fn eq(what: &'static str, got: i64, want: i64) -> R {
     if got == want { Ok(()) } else { Err(Fail { what, got }) }
 }
 
+/// `cond`, or a [`Fail`] saying `what` with `got`.
+pub fn ensure(what: &'static str, cond: bool, got: i64) -> R {
+    if cond { Ok(()) } else { Err(Fail { what, got }) }
+}
+
+/// A syscall that returns a descriptor or a count: its value, or a [`Fail`].
+pub fn ok(what: &'static str, ret: i64) -> Result<i64, Fail> {
+    if ret >= 0 { Ok(ret) } else { Err(Fail { what, got: ret }) }
+}
+
+/// Run a mode's checks in order, printing `ok <name>` for each that passes;
+/// the first that fails prints why and is the program's exit code, its
+/// number. 0 when all pass.
+pub fn run_checks(checks: &[(&str, &dyn Fn() -> R)]) -> c_int {
+    assert!(checks.len() < USAGE_EXIT as usize, "a mode has fewer than 64 checks");
+    for (i, (name, check)) in checks.iter().enumerate() {
+        match check() {
+            Ok(()) => say!("ok {name}"),
+            Err(Fail { what, got }) => {
+                say!("FAIL {name}: {what} (got {got})");
+                return (i + 1) as c_int;
+            }
+        }
+    }
+    0
+}
+
 /// The NUL-terminated C string at `p` as bytes.
 ///
 /// # Safety
@@ -135,14 +168,20 @@ pub unsafe fn arg(p: *const u8) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(p, n) }
 }
 
-/// `main`'s arguments as bytes, at most 16 of them (the rest dropped).
+/// `main`'s arguments as bytes, at most 16 of them: more is a usage error,
+/// printed, and the program exits [`USAGE_EXIT`].
 ///
 /// # Safety
 /// `argv` holds `argc` pointers to NUL-terminated strings that outlive the
 /// program (the kernel's initial stack).
 pub unsafe fn args(argc: c_int, argv: *const *const u8) -> ([&'static [u8]; 16], usize) {
     let mut out: [&[u8]; 16] = [b""; 16];
-    let n = (argc.max(0) as usize).min(out.len());
+    let n = argc.max(0) as usize;
+    if n > out.len() {
+        say!("too many arguments ({n}, at most {})", out.len());
+        // SAFETY: `_exit` terminates the process immediately without unwinding.
+        unsafe { _exit(USAGE_EXIT) }
+    }
     for (i, slot) in out[..n].iter_mut().enumerate() {
         // SAFETY: the caller's contract: `argv[i]` for `i < argc` is valid.
         *slot = unsafe { arg(*argv.add(i)) };
