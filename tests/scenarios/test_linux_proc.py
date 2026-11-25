@@ -44,7 +44,11 @@ def test_fork_wait_and_exit_status(boot, tmp_path):
     deadline = time.monotonic() + 30
     while True:
         ps = run(m, "ps")
-        pids = [int(line.split()[0]) for line in ps.splitlines() if line.split() and line.split()[0].isdigit()]
+        pids = [
+            int(line.split()[0])
+            for line in ps.splitlines()
+            if line.split() and line.split()[0].isdigit()
+        ]
         if pids == [1]:
             break
         assert time.monotonic() < deadline, ps
