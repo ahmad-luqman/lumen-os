@@ -10872,10 +10872,15 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   Since #369, `ci.yml` caches the pinned zig and libc-test sources in an
   entry of their own, in four steps: restore; fetch; save only after a
   successful fetch on a miss; build. Since #399 the developer image's
-  packages have their own entry the same way: `build/deps/alpine-packages/`
-  keyed on `hashFiles('tools/alpine-packages.lock')`, in the same four
-  steps (restore, `make deps-dev`, save, `make rootfs-dev`). The existing
-  entry's path is `build/deps/*` less the others' (`!build/deps/zig`,
+  packages have their own entry the same way, in five steps: the durable
+  mirror's check first, before the restore (below), then restore, `make
+  deps-dev`, save and `make rootfs-dev`. Its key is
+  `hashFiles('tools/alpine-packages.lock')`, with `alpine-packages-` as a
+  restore key: the fetch keeps the verified files and prunes the rest, so
+  a lock bump downloads only what changed. The fetch step sets
+  `LUMEN_APK_MAX_TIME` (300 s), each try's total time, so a dl-cdn that
+  trickles still gives way to the durable mirror. The existing entry's
+  path is `build/deps/*` less the others' (`!build/deps/zig`,
   `!build/deps/zig.lock`, `!build/deps/zig.tmp.*`, `!build/deps/libc-test`,
   `!build/deps/alpine-packages`), so no file sits in two entries; a bare
   `build/deps` would be one match, archived whole, which no exclusion
@@ -10894,12 +10899,20 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `tools/mirror-alpine-packages.sh upload` fills the release from
   `build/deps/alpine-packages/` (the lead runs it in a lock-changing PR),
   checking every missing file against the lock before it uploads any. CI
-  runs its `check` before the fetch: it reads the release's asset list and
-  fails naming each locked file the release lacks or holds only as a
-  partial or mismatched upload, so CI fails a lock change until its files
-  are mirrored. CI checks only the current lock, so an older lock's files
-  are mirrored best-effort, and a lock bump from a fork stays red until
-  the lead uploads its files.
+  runs its `check` first: it reads the release's asset list, failing on
+  each locked file the release lacks or holds only as a partial or
+  mismatched upload, then downloads the first locked file's headers
+  anonymously at the fetch's URL. So CI fails a lock change until its
+  files are mirrored. The check's failure doesn't hide the job's other
+  results: the step continues on error, and the job's last step fails the
+  job. CI checks only the current lock, so an older lock's files are
+  mirrored best-effort, and a lock bump from a fork stays red until the
+  lead uploads its files. The release has two limits: GitHub caps a
+  release at 1000 assets, and the repository's "immutable releases"
+  setting would refuse new uploads to a published release. Either way the
+  remedy is a new tag, and a change to the fetch so that its durable
+  mirror names both releases (today `DURABLE_MIRROR` is one URL, which
+  the advice and the 403 rule compare against).
 - **libc-test (D4; zig pinned by #368, the build and harness by #369).**
   `make libc-test` builds libc-test's `src/functional` and `src/regression`,
   static and dynamic, with the pinned zig into `build/libc-test/` (284
