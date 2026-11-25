@@ -49,23 +49,37 @@ pub(super) fn sys_set_tid_address(frame: &mut SyscallFrame) -> SyscallReturn {
 }
 
 /// `clone(flags, newsp, parent_tid, child_tid, tls)` (56): M8 stub, replaced by C1 (#380) and C3 (#382).
-pub(super) fn sys_clone(_flags: u64, _newsp: UserPtr, _parent_tid: UserPtr, _child_tid: UserPtr, _tls: u64) -> u64 {
+/// Linux reads only `flags`' low 32 bits (`lower_32_bits(clone_flags)`).
+/// The frame is the parent's registers at the `syscall`, the child's
+/// starting ones.
+pub(super) fn sys_clone(
+    _flags: u32,
+    _newsp: UserPtr,
+    _parent_tid: UserPtr,
+    _child_tid: UserPtr,
+    _tls: u64,
+    _frame: &SyscallFrame,
+) -> u64 {
     not_implemented(general::__NR_clone)
 }
 
-/// `fork()` (57): M8 stub, replaced by C1 (#380).
-pub(super) fn sys_fork() -> u64 {
+/// `fork()` (57): M8 stub, replaced by C1 (#380). The frame is the
+/// parent's registers at the `syscall`, the child's starting ones.
+pub(super) fn sys_fork(_frame: &SyscallFrame) -> u64 {
     not_implemented(general::__NR_fork)
 }
 
-/// `vfork()` (58): M8 stub, replaced by C1 (#380).
-pub(super) fn sys_vfork() -> u64 {
+/// `vfork()` (58): M8 stub, replaced by C1 (#380). The frame as `fork`'s.
+pub(super) fn sys_vfork(_frame: &SyscallFrame) -> u64 {
     not_implemented(general::__NR_vfork)
 }
 
-/// `execve(path, argv, envp)` (59): M8 stub, replaced by C2 (#381).
-pub(super) fn sys_execve(_path: UserPtr, _argv: UserPtr, _envp: UserPtr) -> u64 {
-    not_implemented(general::__NR_execve)
+/// `execve(path, argv, envp)` (59): M8 stub, replaced by C2 (#381). It
+/// returns through the frame, which a successful `execve` rewrites to the
+/// new image's entry.
+pub(super) fn sys_execve(_path: UserPtr, _argv: UserPtr, _envp: UserPtr, frame: &mut SyscallFrame) -> SyscallReturn {
+    frame.rax = not_implemented(general::__NR_execve);
+    SyscallReturn::Sysret
 }
 
 /// `wait4(pid, wstatus, options, rusage)` (61): M8 stub, replaced by C1 (#380) and C6 (#385).

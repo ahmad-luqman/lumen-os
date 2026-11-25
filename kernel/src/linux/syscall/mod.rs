@@ -3,9 +3,12 @@
 //! `dispatch` maps each syscall number to its handler, each number in one
 //! `match` arm (its constant as the pattern, so the compiler refuses one
 //! routed twice), passing the registers of the syscall's Linux signature
-//! (an M7 handler's, and since #254 the M6 descriptor handlers' and
-//! `getcwd`'s, decoded by `at::reg` into its parameter types; `poll` and
-//! the rest of M6 still take raw registers).
+//! (an M7 handler's, an M8 stub's, and since #254 the M6 descriptor
+//! handlers' and `getcwd`'s, decoded by `at::reg` into its parameter types;
+//! `poll` and the rest of M6 still take raw registers, and `task`'s M6
+//! handlers the whole frame). A handler that returns through the frame
+//! (`execve`, `rt_sigreturn`, `restart_syscall`) or copies it (`clone`,
+//! `fork`, `vfork`) is passed it after its arguments.
 //! The handlers live in one module per cluster, so the PRs that implement
 //! M7 (#254, #255) each change only their own module, not `dispatch`:
 //!
@@ -32,7 +35,8 @@
 //!
 //! - `task`: `exit`, `exit_group`, `getpid`, `gettid`, `getppid`,
 //!   `set_tid_address` (M6); `clone`, `fork`, `vfork`, `execve`, `wait4`,
-//!   `waitid`, the session and group calls.
+//!   `waitid`, the session and group calls (M6's `getpgrp` still an arm in
+//!   `dispatch`).
 //! - `signal`: `rt_sigaction`, `rt_sigprocmask` (M6); `rt_sigreturn`, the
 //!   other `rt_sig*` calls, `sigaltstack`, `kill`, `tkill`, `tgkill`,
 //!   `pause`, `restart_syscall`.
@@ -211,20 +215,21 @@ fn first_report(nr: u64) -> bool {
     false
 }
 
+/// Log a syscall with no handler once per number, with its name when one of
+/// the kernel's tables has it.
 fn log_unknown_once(nr: u64) {
     if first_report(nr) {
-        log::debug!(target: "linux", "unimplemented syscall #{nr}");
+        match u32::try_from(nr).ok().and_then(crate::linux::syscall_name) {
+            Some(name) => log::debug!(target: "linux", "unimplemented syscall #{nr} ({name})"),
+            None => log::debug!(target: "linux", "unimplemented syscall #{nr}"),
+        }
     }
 }
 
 /// The body of an M8 syscall's stub until the issue its doc names replaces
-/// it: log once per number, as an unknown syscall does but with its name,
-/// and return `-ENOSYS`.
+/// it: logged as an unknown syscall is, and `-ENOSYS`.
 fn not_implemented(nr: u32) -> u64 {
-    if first_report(u64::from(nr)) {
-        let name = crate::linux::syscall_name(nr).unwrap_or("?");
-        log::debug!(target: "linux", "unimplemented syscall #{nr} ({name})");
-    }
+    log_unknown_once(u64::from(nr));
     neg_errno(errno::ENOSYS)
 }
 
@@ -530,21 +535,19 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         // doc names replaces it. Each arm passes the arguments of the
         // syscall's Linux x86-64 signature, decoded by `reg` (`at.rs`).
         Ok(general::__NR_clone) => {
-            frame.rax = task::sys_clone(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
+            frame.rax =
+                task::sys_clone(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8), frame);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_fork) => {
-            frame.rax = task::sys_fork();
+            frame.rax = task::sys_fork(frame);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_vfork) => {
-            frame.rax = task::sys_vfork();
+            frame.rax = task::sys_vfork(frame);
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_execve) => {
-            frame.rax = task::sys_execve(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
-            SyscallReturn::Sysret
-        }
+        Ok(general::__NR_execve) => task::sys_execve(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), frame),
         Ok(general::__NR_wait4) => {
             frame.rax = task::sys_wait4(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
             SyscallReturn::Sysret
@@ -569,10 +572,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = task::sys_getsid(reg(frame.rdi));
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_rt_sigreturn) => {
-            frame.rax = signal::sys_rt_sigreturn();
-            SyscallReturn::Sysret
-        }
+        Ok(general::__NR_rt_sigreturn) => signal::sys_rt_sigreturn(frame),
         Ok(general::__NR_rt_sigpending) => {
             frame.rax = signal::sys_rt_sigpending(reg(frame.rdi), reg(frame.rsi));
             SyscallReturn::Sysret
@@ -613,10 +613,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = signal::sys_pause();
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_restart_syscall) => {
-            frame.rax = signal::sys_restart_syscall();
-            SyscallReturn::Sysret
-        }
+        Ok(general::__NR_restart_syscall) => signal::sys_restart_syscall(frame),
         Ok(general::__NR_futex) => {
             frame.rax = futex::sys_futex(
                 reg(frame.rdi),

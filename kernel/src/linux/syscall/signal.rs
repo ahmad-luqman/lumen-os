@@ -6,6 +6,7 @@
 
 use super::at::UserPtr;
 use super::{copy_pod_from_user, copy_pod_to_user, neg_errno, not_implemented};
+use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::linux::process::{KernelSigaction, with_current, with_current_mut};
 use crate::linux::{errno, general};
 use crate::user::{copy_from_user, copy_to_user};
@@ -85,9 +86,12 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u6
     0
 }
 
-/// `rt_sigreturn()` (15): M8 stub, replaced by C5 (#384).
-pub(super) fn sys_rt_sigreturn() -> u64 {
-    not_implemented(general::__NR_rt_sigreturn)
+/// `rt_sigreturn()` (15): M8 stub, replaced by C5 (#384). It returns
+/// through the frame, which C5 restores from the signal frame on the user
+/// stack (an `iretq`, `SyscallReturn::Iret`).
+pub(super) fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> SyscallReturn {
+    frame.rax = not_implemented(general::__NR_rt_sigreturn);
+    SyscallReturn::Sysret
 }
 
 /// `rt_sigpending(set, sigsetsize)` (127): M8 stub, replaced by C6 (#385).
@@ -140,7 +144,9 @@ pub(super) fn sys_pause() -> u64 {
     not_implemented(general::__NR_pause)
 }
 
-/// `restart_syscall()` (219): M8 stub, replaced by B2 (#373).
-pub(super) fn sys_restart_syscall() -> u64 {
-    not_implemented(general::__NR_restart_syscall)
+/// `restart_syscall()` (219): M8 stub, replaced by B2 (#373). It returns
+/// through the frame, as the call it restarts does.
+pub(super) fn sys_restart_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
+    frame.rax = not_implemented(general::__NR_restart_syscall);
+    SyscallReturn::Sysret
 }

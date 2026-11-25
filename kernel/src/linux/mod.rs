@@ -78,8 +78,7 @@ pub const M6_SYSCALLS: &[(u32, &str)] = &[
 
 /// The 47 Linux x86-64 syscalls M7 adds (`docs/ARCHITECTURE.md` section 8's
 /// M7 table, less `mmap` (9) and `getcwd` (79), which M6 already has and M7
-/// extends). Each has its own arm in `syscall::dispatch`; one not yet
-/// implemented is a stub returning `-ENOSYS`.
+/// extends). Each has its own arm in `syscall::dispatch`.
 pub const M7_SYSCALLS: &[(u32, &str)] = &[
     (general::__NR_open, "open"),
     (general::__NR_stat, "stat"),
@@ -717,8 +716,9 @@ crate::ktest!(
         //    number. Eleven are M6's and four M7's (changed in M8, still in
         //    their tables); two stay `-ENOSYS` by decision (in no table, and
         //    `syscalls.py`'s `ENOSYS_BY_DECISION`); the other 60 are
-        //    `M8_SYSCALLS`, whose `linux-raw-sys` constants `syscall_name`
-        //    checks against these.
+        //    `M8_SYSCALLS`. Each spec number is looked up with
+        //    `syscall_name`, which checks the tables' `linux-raw-sys`
+        //    constants against these numbers.
         let m6_rows: &[(u32, &str)] = &[
             (13, "rt_sigaction"),
             (14, "rt_sigprocmask"),
@@ -845,6 +845,11 @@ crate::ktest!(
         crate::kassert_eq!(general::__NR_execveat, 322);
         crate::kassert_eq!(general::__NR_futex_waitv, 449);
         crate::kassert_eq!(general::__NR_sched_setparam, 142);
+        crate::kassert_eq!(general::__NR_sched_getparam, 143);
+        crate::kassert_eq!(general::__NR_sched_setscheduler, 144);
+        crate::kassert_eq!(general::__NR_sched_getscheduler, 145);
+        crate::kassert_eq!(general::__NR_sched_get_priority_max, 146);
+        crate::kassert_eq!(general::__NR_sched_get_priority_min, 147);
         crate::kassert_eq!(general::__NR_sched_rr_get_interval, 148);
         crate::kassert_eq!(general::__NR_signalfd, 282);
         crate::kassert_eq!(general::__NR_signalfd4, 289);
@@ -1077,6 +1082,24 @@ crate::ktest!(
         crate::kassert_eq!(offset_of!(general::siginfo__bindgen_ty_1__bindgen_ty_1, si_errno), 4);
         crate::kassert_eq!(offset_of!(general::siginfo__bindgen_ty_1__bindgen_ty_1, si_code), 8);
         crate::kassert_eq!(offset_of!(general::siginfo__bindgen_ty_1__bindgen_ty_1, _sifields), 16);
+        //    Each kind's fields, offsets in the union: `kill`'s sender,
+        //    a POSIX timer's (C13), `sigqueue`'s value, `SIGCHLD`'s status
+        //    and times (`waitid`, C6) and a fault's address (C5).
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_1, _pid), 0);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_1, _uid), 4);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_2, _tid), 0);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_2, _overrun), 4);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_2, _sigval), 8);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_3, _pid), 0);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_3, _uid), 4);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_3, _sigval), 8);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _pid), 0);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _uid), 4);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _status), 8);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _utime), 16);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _stime), 24);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_5, _addr), 0);
+        crate::kassert_eq!(size_of::<general::sigval_t>(), 8);
         //    `stack_t` (`sigaltstack`).
         crate::kassert_eq!(size_of::<general::stack_t>(), 24);
         crate::kassert_eq!(offset_of!(general::stack_t, ss_flags), 8);

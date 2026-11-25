@@ -27,7 +27,7 @@ pub(super) fn sys_timer_create(_clockid: i32, _sevp: UserPtr, _timerid: UserPtr)
 }
 
 /// `timer_settime(timerid, flags, new_value, old_value)` (223): M8 stub, replaced by C13 (#392).
-pub(super) fn sys_timer_settime(_timerid: i32, _flags: i32, _new_value: UserPtr, _old_value: UserPtr) -> u64 {
+pub(super) fn sys_timer_settime(_timerid: i32, _flags: u32, _new_value: UserPtr, _old_value: UserPtr) -> u64 {
     not_implemented(general::__NR_timer_settime)
 }
 
