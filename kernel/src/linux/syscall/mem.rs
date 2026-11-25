@@ -48,8 +48,8 @@
 //!   shmem backing will supply that name),
 //!   and one made through a read-only descriptor can later be made
 //!   writable with `mprotect` (Linux refuses, `EACCES`): anonymous VMAs
-//!   carry no `may_write`. This difference persists across `fork_copy`,
-//!   which shares the anonymous pages and their writes.
+//!   carry no `may_write`. This is no longer harmless: `fork_copy` shares
+//!   the anonymous pages, so the upgrade allows writes visible to the child.
 //! - `/proc/<pid>/maps`' file columns differ in a few ways, each listed
 //!   on `user_vm::KeptFile` (a file mapping's: the descriptor's path, not
 //!   normalised nor following a rename; the first mapping's for every

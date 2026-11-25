@@ -20,7 +20,9 @@ pub enum RefError {
 /// Whether a decrement released the last reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remaining {
+    /// This decrement released the last reference; the caller may reclaim the frame.
     Free,
+    /// References remain; the value is the count immediately after this decrement.
     Live(u32),
 }
 
@@ -221,28 +223,43 @@ mod tests {
 
     #[test]
     fn concurrent_last_decrement_frees_once() {
-        const FRAMES: usize = 1024;
-        const THREADS: usize = 8;
+        const FRAMES: usize = 16_384;
+        let threads = std::thread::available_parallelism().map_or(2, usize::from).max(2);
         let mut storage = [const { AtomicU32::new(0) }; FRAMES];
         let table = RefTable::new(PhysRange::new(0, FRAMES as u64 * FRAME_SIZE), &mut storage).unwrap();
         let freed = [const { AtomicU32::new(0) }; FRAMES];
-        // A spin rendezvous avoids serializing the decrement attempts on
-        // the host condition variable's wakeups. Each thread owns one of
-        // the references, including the one that will be released last.
+        // A spin/yield/sleep rendezvous per frame, so every thread's
+        // decrement of a frame races the others' (a condition variable's
+        // wakeups would serialize them). It has no iteration cap: a cap is a
+        // time limit, which a busy host can trip with a descheduled peer. A
+        // broken `dec` that panics a peer leaves the rest waiting, at little
+        // CPU thanks to the sleeps, until the test runner (or mut-guard) stops
+        // them. Each thread owns one of a frame's references, including the
+        // one released last.
         let ready = [const { AtomicU32::new(0) }; FRAMES];
         for n in 0..FRAMES {
             table.set_one(f(n as u64)).unwrap();
-            for _ in 1..THREADS {
+            for _ in 1..threads {
                 table.inc(f(n as u64)).unwrap();
             }
         }
         std::thread::scope(|scope| {
-            for _ in 0..THREADS {
+            for _ in 0..threads {
                 scope.spawn(|| {
                     for (n, frees) in freed.iter().enumerate() {
                         ready[n].fetch_add(1, Ordering::AcqRel);
-                        while ready[n].load(Ordering::Acquire) != THREADS as u32 {
-                            core::hint::spin_loop();
+                        let mut attempt = 0u32;
+                        while ready[n].load(Ordering::Acquire) != threads as u32 {
+                            if attempt < 32 {
+                                core::hint::spin_loop();
+                            } else if attempt.is_multiple_of(1024) {
+                                // yield_now need not schedule another thread:
+                                // back off while a participant is descheduled.
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            } else {
+                                std::thread::yield_now();
+                            }
+                            attempt = attempt.wrapping_add(1);
                         }
                         if table.dec(f(n as u64)).unwrap() == Remaining::Free {
                             frees.fetch_add(1, Ordering::Relaxed);

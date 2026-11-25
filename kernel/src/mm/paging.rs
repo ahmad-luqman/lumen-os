@@ -493,8 +493,9 @@ pub fn new_user_root() -> Option<PhysFrame> {
 /// # Safety
 /// `root` must be an L4 root allocated by [`new_user_root`] (never
 /// [`kernel_root`]), the caller must have exclusive write access to its lower
-/// half. A writable private mapping must have the frame's only user
-/// reference. A non-shared `phys` must carry a counted reference transferred to
+/// half. A writable leaf of a private VMA must hold the frame's only counted
+/// reference; a shared anonymous VMA's leaves may be writable at any count.
+/// A non-shared `phys` must carry a counted reference transferred to
 /// the new leaf on success: unmap retires the translation then releases that
 /// reference with `UserFrame::from_leaf` / drop, never `frame::free`. Raw
 /// paging ktests may instead transfer an exclusively owned, uncounted frame
@@ -520,6 +521,8 @@ pub fn walk_user(root: PhysFrame, virt: VirtAddr) -> Walk {
 /// `root` must be an L4 root allocated by [`new_user_root`] (never
 /// [`kernel_root`]), and the caller must have exclusive write access to its
 /// lower half and flush the TLB if `root` is active and the page was present.
+/// A writable leaf of a private VMA must hold the frame's only counted
+/// reference; a shared anonymous VMA's leaves may be writable at any count.
 pub unsafe fn protect_user_page(root: PhysFrame, virt: VirtAddr, attrs: Attrs) -> Result<Mapping, ProtectError> {
     assert_ne!(root, kernel_root(), "protect_user_page must never mutate kernel_root()");
     assert!(attrs.user(), "protect_user_page requires user-mode attributes");
@@ -527,7 +530,7 @@ pub unsafe fn protect_user_page(root: PhysFrame, virt: VirtAddr, attrs: Attrs) -
 }
 
 /// Per-leaf snapshot reported to callbacks of [`unmap_user_range`],
-/// [`protect_user_range`], [`clear_user_lower_half`], and [`destroy_user_root`].
+/// [`protect_user_range_with`], [`clear_user_lower_half`], and [`destroy_user_root`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserLeaf {
     /// Page-aligned lower-half user virtual address.
@@ -578,7 +581,7 @@ pub unsafe fn unmap_user_range(root: PhysFrame, start: u64, end: u64, mut on_unm
                 addr += FRAME_SIZE;
             }
             WalkEnd::NotPresent(level) => {
-                let span = 1u64 << (12 + 9 * (u32::from(level.number()) - 1));
+                let span = level.span();
                 let next = (addr & !(span - 1)).saturating_add(span);
                 addr = next.min(end);
             }
@@ -589,8 +592,22 @@ pub unsafe fn unmap_user_range(root: PhysFrame, start: u64, end: u64, mut on_unm
     }
 }
 
+/// Constant-attribute ktest wrapper; safety requirements are protect_user_range_with's.
+#[cfg(feature = "ktest")]
+pub unsafe fn protect_user_range(
+    root: PhysFrame,
+    start: u64,
+    end: u64,
+    attrs: Attrs,
+    on_protected: impl FnMut(UserLeaf),
+) {
+    assert!(attrs.user(), "protect_user_range requires user-mode attributes");
+    // SAFETY: the caller supplies the same root, range and retirement guarantees.
+    unsafe { protect_user_range_with(root, start, end, |_, _| attrs, on_protected) };
+}
+
 /// Update attributes of every already-mapped leaf (present or `PTE_PROTNONE`)
-/// in lower-half page-aligned `[start, end)` under `root` to `attrs` via
+/// in lower-half page-aligned `[start, end)` under `root` to `attrs_for(va, mapping)` via
 /// `lumen_mm::paging::protect`, preserving physical frames and skipping empty
 /// subtrees in O(1).
 ///
@@ -604,25 +621,9 @@ pub unsafe fn unmap_user_range(root: PhysFrame, start: u64, end: u64, mut on_unm
 /// [`kernel_root`]), `[start, end)` must be page-aligned and strictly in the
 /// lower half, and the caller must have exclusive write access to `root`'s
 /// lower half and flush the TLB if `root` is active.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // constant-attribute wrapper for raw paging callers
-pub unsafe fn protect_user_range(
-    root: PhysFrame,
-    start: u64,
-    end: u64,
-    attrs: Attrs,
-    on_protected: impl FnMut(UserLeaf),
-) {
-    // SAFETY: the caller supplies the same root, range and retirement guarantees.
-    unsafe { protect_user_range_with(root, start, end, |_, _| attrs, on_protected) };
-}
-
-/// Update each populated leaf using the attributes returned by `attrs_for`.
-/// Preserves frames, skips empty subtrees and reports the old leaf through
-/// `on_protected`. Page-cache leaves retain `PTE_SHARED` and lose write access.
-///
-/// # Safety
-/// The caller meets protect_user_range's root, range, exclusive-access and
-/// TLB-retirement requirements; attrs_for must return user attributes.
+/// A writable leaf of a private VMA must hold the frame's only counted
+/// reference; a shared anonymous VMA's leaves may be writable at any count.
+/// Panics unless every attrs_for result has user attributes.
 pub unsafe fn protect_user_range_with(
     root: PhysFrame,
     start: u64,
@@ -630,17 +631,17 @@ pub unsafe fn protect_user_range_with(
     mut attrs_for: impl FnMut(VirtAddr, Mapping) -> Attrs,
     mut on_protected: impl FnMut(UserLeaf),
 ) {
-    assert_ne!(root, kernel_root(), "protect_user_range must never mutate kernel_root()");
+    assert_ne!(root, kernel_root(), "protect_user_range_with must never mutate kernel_root()");
     assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
     let mut addr = start;
     while addr < end {
         let va = VirtAddr::new(addr).expect("lower-half user address is canonical");
-        assert!(va.is_lower_half(), "protect_user_range called on upper-half {va}");
+        assert!(va.is_lower_half(), "protect_user_range_with called on upper-half {va}");
         let w = pt::walk(&Hhdm, root, va);
         match w.end() {
             WalkEnd::Mapped(m) | WalkEnd::ProtNone(m) => {
                 let attrs = attrs_for(va, m);
-                assert!(attrs.user(), "protect_user_range requires user-mode attributes");
+                assert!(attrs.user(), "protect_user_range_with requires user-mode attributes");
                 let leaf_attrs = if m.shared { attrs.without_writable().with_shared(true) } else { attrs };
                 let prev = pt::protect(&mut Hhdm, root, va, leaf_attrs).expect("walk just found mapped user leaf");
                 debug_assert_eq!(prev.size, PageSize::Size4K);
@@ -655,7 +656,7 @@ pub unsafe fn protect_user_range_with(
                 addr += FRAME_SIZE;
             }
             WalkEnd::NotPresent(level) => {
-                let span = 1u64 << (12 + 9 * (u32::from(level.number()) - 1));
+                let span = level.span();
                 let next = (addr & !(span - 1)).saturating_add(span);
                 addr = next.min(end);
             }

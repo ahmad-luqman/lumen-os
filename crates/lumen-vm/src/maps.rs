@@ -313,6 +313,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_anonymous_stack_uses_s() {
+        let stack = Vma {
+            start: USER_STACK_BOTTOM,
+            end: USER_STACK_TOP,
+            prot: RW,
+            backing: Backing::Anonymous { shared: true },
+        };
+        let line = maps([&stack], &LAYOUT);
+        assert!(line.contains(" rw-s 00000000 00:00 0"));
+        assert!(line.ends_with(" [stack]\n"));
+    }
+
     /// File 7: a file on `/tmp` (device 0:2).
     const TMP_FILE: FileInfo<'static> =
         FileInfo { major: 0, minor: 2, ino: 12, path: b"/tmp/data.bin", deleted: false };

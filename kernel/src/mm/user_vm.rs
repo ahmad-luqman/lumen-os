@@ -179,7 +179,8 @@ enum Shoot {
 }
 
 /// Retire local translations only if this space is loaded here; otherwise
-/// do nothing. M7's single-threaded, pinned processes exclude remote users.
+/// do nothing. With CR4.PCIDE = 0, a CPU that switched away holds none of
+/// the root's entries. M7's single-threaded, pinned invariant covers the rest.
 /// B5 must replace this with cross-CPU retirement before that invariant ends.
 fn shoot_down(space: &AddressSpace, what: Shoot) {
     if arch::paging::active_root() != space.root {
@@ -252,14 +253,16 @@ unsafe fn map_zeroed_user_page(root: PhysFrame, va: VirtAddr, attrs: Attrs) -> R
     unsafe { map_user_frame(root, va, reference, attrs) }
 }
 
-fn fork_map_result(result: Result<(), MapError>) -> Result<(), UserVmError> {
-    if result == Err(MapError::OutOfMemory) {
-        return Err(UserVmError::OutOfMemory);
+/// Translate allocation failure; any other mapping error violates fork's
+/// missing-leaf/user-attributes invariant and panics with the original error.
+fn fork_map_error(err: MapError) -> UserVmError {
+    match err {
+        MapError::OutOfMemory => UserVmError::OutOfMemory,
+        err => panic!("fork maps a missing lower-half leaf with valid user attributes: {err:?}"),
     }
-    result.expect("fork maps a missing lower-half leaf with valid user attributes");
-    Ok(())
 }
 
+/// Snapshot sizes while Lock 1 keeps every mapped-file reference live.
 fn file_sizes(inner: &AddressSpaceInner) -> Result<BTreeMap<u64, u64>, UserVmError> {
     inner
         .mapped_files
@@ -533,6 +536,7 @@ impl AddressSpace {
     /// Add a process user, refusing zero so a retired space never revives.
     /// Panics on count overflow. Observer `Arc`s do not count as users.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1's process lifetime
+    #[must_use = "a refused add means the space is retired; the caller must not use it"]
     pub fn add_user(&self) -> bool {
         self.users
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -550,7 +554,6 @@ impl AddressSpace {
             .users
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
             .expect("dropping an address-space user at zero");
-        assert!(previous > 0, "a process user must exist");
         if previous == 1 {
             self.teardown();
         }
@@ -612,19 +615,38 @@ impl AddressSpace {
     }
 
     /// Copy VM metadata and counted user leaves, including `PROT_NONE`,
-    /// into a new space. Private leaves become read-only in both spaces;
+    /// into a new space. Leaves of private VMAs become read-only in both spaces;
     /// shared anonymous pages are populated first so untouched pages share.
     /// Page-cache leaves and private file copies wholly past EOF are omitted
     /// and refault in the child. Mapping sharing is unrelated to `PTE_SHARED`,
     /// which marks an uncounted page-cache leaf.
     ///
     /// Allocation/count exhaustion and failed file-size reads return
-    /// `OutOfMemory`; invalid page-table states are invariant violations.
+    /// `OutOfMemory`; a torn-down parent also returns `OutOfMemory` (and
+    /// asserts in debug builds). Invalid page-table states are invariant
+    /// violations. Missing shared anonymous pages are counted before
+    /// population; a conservative table allowance and 16-frame reserve
+    /// refuse requests that would exhaust the current free-frame snapshot.
+    /// Other allocations can still consume those frames after the check.
     /// On failure the child is released outside both locks, parent private
     /// leaves may remain read-only, and newly populated shared anonymous
     /// pages stay as demand-zero-equivalent pages at count one.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1 wires fork
     pub fn fork_copy(self: &Arc<Self>) -> Result<Arc<Self>, UserVmError> {
+        self.fork_copy_inner(|| {})
+    }
+
+    /// Test allocator contention after preflight, without bypassing the
+    /// production precheck, population, or rollback paths.
+    #[cfg(feature = "ktest")]
+    pub(super) fn fork_copy_after_precount(
+        self: &Arc<Self>,
+        after_precount: impl FnOnce(),
+    ) -> Result<Arc<Self>, UserVmError> {
+        self.fork_copy_inner(after_precount)
+    }
+
+    fn fork_copy_inner(self: &Arc<Self>, after_precount: impl FnOnce()) -> Result<Arc<Self>, UserVmError> {
         // Declared first: rollback drops the child only after both Lock 1s.
         let child = Arc::new(Self::new()?);
         let parent = self.inner.lock();
@@ -637,33 +659,72 @@ impl AddressSpace {
         copied.brk = parent.brk;
         copied.images = parent.images.clone();
         copied.mapped_files = parent.mapped_files.clone();
-        // B7 registers the child before reading sizes, while both locks
+        // B7 will register the child before reading sizes, while both locks
         // exclude faults and invalidation.
         let mut populated = 0;
         let result = file_sizes(&copied).and_then(|sizes| {
+            self.fork_check_shared_anon(&parent)?;
+            after_precount();
             self.fork_populate_shared_anon(&parent, &mut populated)?;
             self.fork_share_leaves(&parent, &child, &mut copied, &sizes)
         });
         shoot_down(self, Shoot::Full);
         drop(copied);
         drop(parent);
-        if result.is_err() && populated != 0 {
-            log::warn!(target: "mm", "failed fork retained {populated} demand-zero shared anonymous pages");
+        if let Err(error) = &result
+            && populated != 0
+        {
+            log::warn!(target: "mm", "failed fork ({error:?}) retained {populated} demand-zero shared anonymous pages");
         }
         result?;
         Ok(child)
     }
 
+    /// Refuse eager population that would consume the free-frame snapshot,
+    /// leaving 16 frames (64 KiB) for other work. Count each missing leaf and
+    /// conservatively allow every intermediate table its walk could need.
+    /// Lock 1 stabilizes the leaves; this check does not reserve physical RAM.
+    fn fork_check_shared_anon(&self, parent: &AddressSpaceInner) -> Result<(), UserVmError> {
+        const RESERVE: usize = 16;
+        let budget = frame::free_frames().saturating_sub(RESERVE);
+        let mut needed = 0;
+        for vma in parent.vmas.iter().filter(|v| matches!(v.backing, Backing::Anonymous { shared: true })) {
+            for addr in (vma.start..vma.end).step_by(PAGE_SIZE as usize) {
+                let va = VirtAddr::new(addr).expect("valid VMA");
+                match paging::walk_user(self.root, va).end() {
+                    WalkEnd::Mapped(_) | WalkEnd::ProtNone(_) => {}
+                    WalkEnd::NotPresent(level) => {
+                        needed += usize::from(level.number());
+                        if needed > budget {
+                            return Err(UserVmError::OutOfMemory);
+                        }
+                    }
+                    WalkEnd::Unreadable(level, frame) => panic!("unreadable user table {frame} at {level:?} for {va}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Populate missing shared anonymous leaves under parent Lock 1,
+    /// recording successful pages even if a later allocation fails.
     fn fork_populate_shared_anon(&self, parent: &AddressSpaceInner, populated: &mut usize) -> Result<(), UserVmError> {
         for vma in parent.vmas.iter() {
             if matches!(vma.backing, Backing::Anonymous { shared: true }) {
                 for addr in (vma.start..vma.end).step_by(PAGE_SIZE as usize) {
                     let va = VirtAddr::new(addr).expect("valid VMA");
-                    if matches!(paging::walk_user(self.root, va).end(), WalkEnd::NotPresent(_)) {
-                        // SAFETY: parent Lock 1 is held; the missing leaf
-                        // takes a freshly allocated counted reference.
-                        fork_map_result(unsafe { map_zeroed_user_page(self.root, va, prot_to_attrs(vma.prot)) })?;
-                        *populated += 1;
+                    match paging::walk_user(self.root, va).end() {
+                        WalkEnd::Mapped(_) | WalkEnd::ProtNone(_) => {}
+                        WalkEnd::NotPresent(_) => {
+                            // SAFETY: parent Lock 1 is held; this missing
+                            // leaf takes a freshly allocated counted reference.
+                            unsafe { map_zeroed_user_page(self.root, va, prot_to_attrs(vma.prot)) }
+                                .map_err(fork_map_error)?;
+                            *populated += 1;
+                        }
+                        WalkEnd::Unreadable(level, frame) => {
+                            panic!("unreadable user table {frame} at {level:?} for {va}")
+                        }
                     }
                 }
             }
@@ -671,6 +732,9 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Copy counted leaves while both Lock 1 guards remain held. `_copied`
+    /// proves the child's lock is held; fork_copy flushes the parent before
+    /// publishing the child or releasing either guard on failure.
     fn fork_share_leaves(
         &self,
         parent: &AddressSpaceInner,
@@ -703,11 +767,15 @@ impl AddressSpace {
                 }
             }
             // SAFETY: the parent's leaf keeps a reference under Lock 1;
-            // private writes have been disabled before publication.
-            let reference = unsafe { frame::UserFrame::share_leaf(leaf.phys) }.ok_or(UserVmError::OutOfMemory)?;
+            // its private PTE is write-protected. The full flush follows
+            // before the child is published, retiring cached write access.
+            let reference = unsafe { frame::UserFrame::share_leaf(leaf.phys) }.ok_or_else(|| {
+                log::error!(target: "mm", "fork reference count overflow for frame {}", leaf.phys);
+                UserVmError::OutOfMemory
+            })?;
             // SAFETY: child Lock 1 is held and its missing leaf takes the
             // additional counted reference.
-            fork_map_result(unsafe { map_user_frame(child.root, va, reference, attrs) })?;
+            unsafe { map_user_frame(child.root, va, reference, attrs) }.map_err(fork_map_error)?;
         }
         Ok(())
     }
@@ -1102,7 +1170,8 @@ impl AddressSpace {
                 },
             );
         }
-        // (3) uncounted: every shared leaf in the range is read-only now.
+        // Every cache leaf in the range is now read-only and retired;
+        // release its writable-map guard while retaining its cache pin.
         drop_range(&mut inner.writable_maps, addr, end);
         Ok(())
     }
@@ -1262,19 +1331,24 @@ impl AddressSpace {
             );
         }
         let copy = frame::UserFrame::from_owned(copy);
+        let mut removed = None;
         // SAFETY: Lock 1 excludes mutations. Retain the old reference until
         // its translation is retired below; unmap retains the table frames.
         unsafe {
             paging::unmap_user_range(self.root, va.as_u64(), va.as_u64() + PAGE_SIZE, |leaf| {
-                debug_assert!(leaf.phys == old && !leaf.was_shared, "split must remove the counted old leaf");
+                assert!(leaf.phys == old && !leaf.was_shared, "split must remove the counted old leaf");
+                removed = Some(leaf);
             });
         }
+        let removed = removed.expect("split must remove one leaf");
         // SAFETY: Lock 1 is held and the leaf is now missing. Its tables
         // remain, so replacing it cannot allocate or run out of frames.
         unsafe { map_user_frame(self.root, va, copy, attrs) }.expect("retained private leaf tables");
         shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
-        // SAFETY: the old leaf is gone and its cached translation retired.
-        drop(unsafe { frame::UserFrame::from_leaf(old) });
+        // SAFETY: this is the counted leaf just removed; shoot_down flushed
+        // it if loaded here. With PCIDE=0 switched-away CPUs hold none of its
+        // entries, and M7's single-threaded, pinned invariant excludes others.
+        drop(unsafe { frame::UserFrame::from_leaf(removed.phys) });
         FaultResult::Resolved
     }
 
@@ -1340,10 +1414,11 @@ impl AddressSpace {
     /// Map the private frame `copy` at the not-present `page_va`.
     fn map_copy(&self, page_va: VirtAddr, copy: frame::OwnedFrame, attrs: Attrs) -> FaultResult {
         let copy = frame::UserFrame::from_owned(copy);
+        debug_assert_eq!(frame::user_count(copy.frame()), 1, "private copy has one counted reference");
         // SAFETY: `self.root` is owned by `self`, the caller holds `inner`,
         // `page_va` is in `USER_MIN..USER_MAX` and not present, and `copy`
-        // is a frame this call owns, handed to the page table below only if
-        // the mapping succeeds.
+        // holds the only counted reference, transferred to the leaf only
+        // if mapping succeeds (otherwise the token releases it).
         match unsafe { map_user_frame(self.root, page_va, copy, attrs) } {
             Ok(()) => FaultResult::Resolved,
             Err(err) => map_error_fault(err), // the unmapped reference was released
@@ -1429,7 +1504,8 @@ impl AddressSpace {
     /// Release all user leaf references (present and `PTE_PROTNONE`) and
     /// VMAs, and free user L1/L2/L3 tables while interrupts are enabled.
     /// `drop_user` calls this at zero; process exit also uses it until C1
-    /// wires process-user accounting. Repeated calls are harmless.
+    /// wires process-user accounting. Direct teardown retires users to zero
+    /// and asserts there was at most one user. Repeated calls are harmless.
     ///
     /// Must be called only after switching `CR3` back to `kernel_root()`.
     /// Subsequent [`Drop`] frees only the bare L4 root frame without locking.
@@ -1445,6 +1521,8 @@ impl AddressSpace {
             "AddressSpace::teardown called while CR3 still holds {}",
             self.root
         );
+        let previous = self.users.swap(0, Ordering::AcqRel);
+        assert!(previous <= 1, "teardown requires at most one process user");
         let gone_files;
         let mut inner = self.inner.lock();
         if inner.torn_down {
@@ -1584,8 +1662,10 @@ impl AddressSpace {
                 _ => return Err(UserVmError::InvalidArg),
             };
             let dst = super::phys_to_virt(phys.start()).as_mut_ptr::<u8>();
-            // SAFETY: `phys` is an allocated usable RAM frame owned by `self`,
-            // mapped RW through the HHDM, and `off + chunk <= PAGE_SIZE`.
+            debug_assert_eq!(frame::user_count(phys), 1, "loader writes only fresh private pages");
+            // SAFETY: callers hold Lock 1 and write only newly mapped count-1
+            // private pages, never a shared frame. The HHDM maps this usable
+            // RAM writable, and off + chunk <= PAGE_SIZE.
             unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(off), chunk) };
             va += chunk as u64;
             bytes = &bytes[chunk..];
@@ -1612,14 +1692,18 @@ impl AddressSpace {
     /// leaf, flush it if this root is loaded here, then release its counted
     /// reference. After the walk, release cache writable guards and pins.
     /// M7's single-threaded, pinned processes exclude remote cached entries.
-    /// Every removal uses this path except CoW splits and Drop; teardown
-    /// uses it before freeing empty page tables.
+    /// Returns the number of removed leaves. Every removal except the
+    /// counted CoW split and Drop uses this path, including cache-leaf
+    /// replacement and teardown before freeing empty page tables.
     fn unmap_range_locked(&self, inner: &mut AddressSpaceInner, start: u64, end: u64) -> usize {
         let active = arch::paging::active_root() == self.root;
         let writable = &inner.writable_maps;
         let mut leaves = 0;
         // SAFETY: `self.root` is owned by `self`, `inner` lock is held, and
         // `[start, end)` is page-aligned and strictly in the lower half.
+        // The callback retires each translation before releasing its reference:
+        // local invalidation if loaded, otherwise the PCIDE=0 CR3 switch;
+        // M7's single-threaded, pinned invariant excludes remote entries.
         unsafe {
             paging::unmap_user_range(self.root, start, end, |leaf| {
                 leaves += 1;
@@ -1629,12 +1713,9 @@ impl AddressSpace {
                     release_order::step(&leaf, release_order::Step::Flushed);
                 }
                 note_shared_leaf(writable, &leaf);
-                if !leaf.was_shared {
-                    // SAFETY: this leaf is removed and flushed above if loaded
-                    // here. M7's single-threaded, pinned processes exclude
-                    // remote cached entries, so its reference may be released.
-                    drop(frame::UserFrame::from_leaf(leaf.phys));
-                }
+                // SAFETY: removed and flushed if loaded here; PCIDE=0 and
+                // M7's single-threaded, pinned invariant exclude other entries.
+                release_removed_leaf(&leaf);
             });
         }
         drop_range(&mut inner.writable_maps, start, end);
@@ -1655,6 +1736,18 @@ impl AddressSpace {
     #[cfg(feature = "ktest")]
     pub(crate) fn mapped_file_count(&self) -> usize {
         self.inner.lock().mapped_files.len()
+    }
+}
+
+/// Release a removed counted leaf's reference; cache leaves are held by pins.
+///
+/// # Safety
+/// The leaf was removed exactly once and its translation retired from all
+/// CPUs. The caller owns its reference; cache pins are released separately.
+unsafe fn release_removed_leaf(leaf: &paging::UserLeaf) {
+    if !leaf.was_shared {
+        // SAFETY: caller owns this removed, retired counted leaf's reference.
+        drop(unsafe { frame::UserFrame::from_leaf(leaf.phys) });
     }
 }
 
@@ -1853,12 +1946,14 @@ impl Drop for AddressSpace {
             unsafe {
                 paging::unmap_user_range(self.root, USER_MIN, USER_MAX, |leaf| {
                     note_shared_leaf(writable, &leaf);
-                    if !leaf.was_shared {
-                        drop(frame::UserFrame::from_leaf(leaf.phys));
-                    }
+                    // SAFETY: the leaf is removed, no CPU holds this root,
+                    // and PCIDE=0 retired translations on switching away.
+                    release_removed_leaf(&leaf);
                 });
-                paging::destroy_user_root(self.root, |_| unreachable!("all user leaves removed"));
             }
+            // SAFETY: all leaves were removed above; only exclusively owned
+            // empty tables remain, and no CPU holds this root.
+            unsafe { paging::destroy_user_root(self.root, |_| unreachable!("all user leaves removed")) };
             // No CPU holds this `CR3`: that was the flush. Dropping these
             // takes no lock (`VfsInode::drop` takes no sleeping one).
             inner.writable_maps.clear();
@@ -3198,6 +3293,45 @@ crate::ktest!(
             let mut bytes = [0; 6];
             kassert_eq!(copy_from_user(&mut bytes, S), Ok(()));
             kassert_eq!(&bytes, b"shared");
+        }
+        parent.teardown();
+        child.teardown();
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn mprotect_decides_each_leaf() {
+        use crate::sched::UserSpaceGuard;
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        const A: u64 = 0x380_0000;
+        const S: u64 = A + 2 * PAGE_SIZE;
+        let parent = Arc::new(AddressSpace::new().map_err(|_| "parent")?);
+        parent.map_eager_with_bytes(A, 2 * PAGE_SIZE, Prot::READ, b"original").map_err(|_| "eager")?;
+        parent
+            .map_anon_at(MapPlace::FixedNoReplace(S), PAGE_SIZE, Prot::READ, Sharing::Shared)
+            .map_err(|_| "shared")?;
+        let child = parent.fork_copy().map_err(|_| "fork")?;
+        child.munmap(A, PAGE_SIZE).map_err(|_| "child munmap")?;
+        let sole = file_vm_leaf(&parent, A).ok_or("sole")?.phys;
+        let both = file_vm_leaf(&parent, A + PAGE_SIZE).ok_or("both")?.phys;
+        kassert_eq!((frame::user_count(sole), frame::user_count(both)), (1, 2));
+        // One call over a count-1 private leaf, a count-2 private leaf and a
+        // shared anonymous leaf: each gets its own answer.
+        parent.mprotect(A, 3 * PAGE_SIZE, RW).map_err(|_| "mprotect")?;
+        kassert!(file_vm_leaf(&parent, A).ok_or("A")?.writable);
+        kassert!(!file_vm_leaf(&parent, A + PAGE_SIZE).ok_or("A+P")?.writable);
+        kassert!(file_vm_leaf(&parent, S).ok_or("S")?.writable);
+        {
+            let _active = UserSpaceGuard::enter(parent.clone());
+            kassert_eq!(copy_to_user(A + PAGE_SIZE, b"parent!!"), Ok(()));
+        }
+        {
+            let _active = UserSpaceGuard::enter(child.clone());
+            let mut bytes = [0; 8];
+            kassert_eq!(copy_from_user(&mut bytes, A + PAGE_SIZE), Ok(()));
+            kassert_eq!(bytes, [0; 8]); // the parent's store never reached the shared frame
         }
         parent.teardown();
         child.teardown();

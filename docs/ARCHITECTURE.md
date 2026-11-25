@@ -1017,9 +1017,10 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   and decrementing `writable_maps` on `WRITABLE | PTE_SHARED` leaves, then
   dropping `Arc<CachePage>` pins; the earlier switch to `kernel_root()` is
   the unmap order's flush step, since no CPU can still store through the
-  process's entries), and user page-table mappings (walking L4
-  entries 0–255, freeing **only** non-`PTE_SHARED` leaf frames—decrementing
-  refcounts from M8 onward—and user L1/L2/L3 tables). Removed `mapped_files`
+  process's entries), and user page-table mappings (unmapping counted
+  leaves and releasing their references, then freeing empty L1/L2/L3
+  tables). Direct `teardown` retires `users` to zero, asserting its old
+  value is at most one, so `add_user` cannot revive the space. Removed `mapped_files`
   `OpenGuard` entries (from `teardown()`, `munmap()`, `MAP_FIXED`
   replacement or a `brk` shrink) are extracted and dropped **after** releasing
   `AddressSpace::inner` (decrementing `inode.open_count` atomically via an RAII
@@ -1069,10 +1070,12 @@ check covers it. B4 adds its logic to `lumen-mm` as a new module,
 host-tested (`frame::RefTable`: `set_one`, `inc`, `dec -> Remaining`, `get`;
 `cargo:lumen-mm`). The count
 is the number of user page-table leaves (present or `PTE_PROTNONE`, never
-`PTE_SHARED`) naming the frame:
+`PTE_SHARED`) naming the frame plus live `UserFrame` tokens, outside
+Lock 1's critical sections. Raw paging-ktest frames remain uncounted:
 - **Set to 1** when the fault path (or the loader) maps a frame it just
-  allocated: `frame::alloc_user() -> UserFrame`, a move-only frame whose
-  count is 1.
+  allocated: `frame::alloc_user() -> Option<UserFrame>`, a zero-filled,
+  move-only frame whose count is 1, or `UserFrame::from_owned` after a
+  private copy has been filled in an exclusively owned kernel frame.
 - **Incremented** by `fork` for each private leaf it copies (and for each
   frame of a `MAP_SHARED | MAP_ANONYMOUS` mapping, below), under the
   parent's Lock 1. A count that would pass `u32::MAX` refuses the `fork`
@@ -1138,8 +1141,9 @@ for `PTE_SHARED` leaves is unchanged):
   locally, `Resolved` (an upgrade needs no shootdown: another CPU's stale
   read-only entry only faults, and the fault finds the leaf writable,
   M7's "already writable" path);
-- count above 1: `frame::alloc_user()` (`OutOfMemory` if none), copy the 4
-  KiB, replace the leaf with the copy (writable), shoot the page down in
+- count above 1: `frame::alloc_owned()` (`OutOfMemory` if none), copy the 4
+  KiB, convert with `UserFrame::from_owned`, replace the leaf with the copy
+  (writable), shoot the page down in
   this space (`tlb::shoot_down(space, Shoot::Pages(page))`), then `dec`
   the old frame's count. The shootdown comes before
   the decrement: a CPU still holding the old read-only entry must not
@@ -1208,7 +1212,7 @@ and B6).
 whose `active` has another CPU in it:
 - `unmap_range_locked` (`munmap`, `MAP_FIXED` replacement, `brk` shrink,
   the loader's rollback, a stale or copy-on-write leaf), by its range;
-- `protect_user_range` (`mprotect`) when a leaf loses `WRITABLE`, gains
+- `protect_user_range_with` (`mprotect`) when a leaf loses `WRITABLE`, gains
   NX or becomes `PTE_PROTNONE`; an upgrade needs none;
 - `fork_copy`'s write-protect (a full flush) and the copy-on-write split
   (one page);
