@@ -1737,6 +1737,10 @@ def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer)
         "linux/hello",
         "linux/m7_test",
         "linux/m7_vfs",
+        "linux/m8_proc",
+        "linux/m8_io",
+        "linux/m8_vm",
+        "linux/ptyrun",
         "deps/alpine-packages/.lock",
         "alpine-dev.ext4",
     ]
@@ -1750,6 +1754,10 @@ def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer)
                 "tools/ext4-signed-hash.sh",
                 "tools/alpine-packages.lock",
                 "tools/fetch-alpine-packages.sh",
+                *(
+                    f"tools/linux-m8/{n}.rs"
+                    for n in ("common", "m8_proc", "m8_io", "m8_vm", "ptyrun")
+                ),
             )
         )
         + 200
