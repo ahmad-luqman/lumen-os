@@ -4185,10 +4185,13 @@ Lumen runs two kinds of user code:
   is `-ENOSYS`, though recent Linux reads only `eax`), passing the
   registers of the syscall's Linux signature, in order, to a handler in its
   cluster's module (`fd`, `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's
-  `mem` and `proc`). An M7 syscall not yet implemented is a stub logging
-  like an unknown one (with its name) and returning `-ENOSYS`. Wave 3's
+  `mem` and `proc`; M8's `task`, `signal`, `futex`, `poll`, `pipe`, `timer`
+  and `sys`, listed under "B0's stubs" below, #371). An M8 syscall not yet
+  implemented is a typed stub (its doc saying "M8 stub" and naming the
+  issues that replace it) logging like an unknown one (with its name) and
+  returning `-ENOSYS`; every M7 syscall is implemented. M7's and M8's
   handlers follow three rules:
-  1. **Decode first.** An M7 arm decodes each register with
+  1. **Decode first.** An M7 or M8 arm decodes each register with
      `syscall/at.rs`'s `reg` into the handler's parameter type, as Linux
      reads it: an `int`, `mode_t` or flags argument is the register's low
      32 bits (`Fd`, `Dirfd`, where `AT_FDCWD` sign- or zero-extended is the

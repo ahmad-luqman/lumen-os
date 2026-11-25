@@ -177,7 +177,8 @@ one is its own PR that updates that doc first.
   window (`run_in_window`, #155): `mod.rs` the consoles (`Console::place`: anywhere, a virtual terminal
   or a window; `closed`) and `Ctx` (keys through `poll_key`/`wait_key`, the screen
   through `canvas`), their commands (`commands.rs`: each row carries its
-  help line; the system ones in `sysinfo.rs`), pipelines (`pipe.rs`: `cpus |
+  help line; the system ones in `sysinfo.rs`, `ps` among them: the Linux
+  processes and their threads, #372), pipelines (`pipe.rs`: `cpus |
   where busy > 50`), deliberate faults (`crash.rs`) and `trace runq`/`trace xray`
   (`xray.rs`: run queues by X-ray and the scheduler, `park` holding the shell's CPU still, `spin` keeping
   threads spinning on the last CPU until stopped, #208). `fb.rs`:
@@ -223,7 +224,12 @@ one is its own PR that updates that doc first.
   button per window, the `Clock` (the RTC polled without animating, `rtc::now_quiet`, its last reading kept
   on errors; `desktop tick` moves it a minute ahead), its `taskbar` owner thread
   (`lumen.taskbar_wake_delay_ms=` holds back a poke's handling, for the scenarios). `klog.rs`: logger (and the ring `dmesg` reads; ktest kernels: `hold_repeats`, a sweep's repeated lines kept off serial, summarized, #347). `rtc.rs`: the CMOS RTC (`date`, `now_quiet` for pollers; `arch/x86_64/cmos.rs` its ports). `symbols.rs`: symbol lookup.
-  `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`.
+  `mm/frame.rs`: physical frame allocator, its reservations, `OwnedFrame`;
+  `REFS`, one count per frame of the bitmap's span (reserved by name as
+  `frame refcounts`; lumen-mm's `RefTable`), and `UserFrame` (#375: a
+  counted user frame, move-only; `alloc_user`, `from_owned`, `share_leaf`,
+  `from_leaf`, `into_raw`, `crate::mm` alone moving a reference; dropping
+  the last frees it; `user_count`).
   `mm/window.rs`: all-or-nothing mapping of fresh frames into a window
   (heap and stacks), through `paging::map` with a `Window` token.
   `mm/heap.rs`: the `#[global_allocator]`, growing in the heap window.
@@ -237,13 +243,20 @@ one is its own PR that updates that doc first.
   `join` at the top of `smp::ap_main`, `sync`: IPIs and a bounded wait,
   only outside critical sections, `still_stuck` after a timeout).
   `mm/paging.rs`: the kernel's page tables (HHDM, W^X image, map/unmap,
-  MMIO window, crash-report walk). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
+  MMIO window, crash-report walk; `protect_user_range_with`, one walk
+  deciding each user leaf's rights, #375). `arch/x86_64/paging.rs`: CR3, TLB, NX/WP,
   PAT.
   `mm/user_vm.rs`: per-process address spaces (`AddressSpace`: VMAs,
   ELF loading, anonymous and file-backed `mmap` (`mmap_file`, `Sharing`,
   #255), `munmap`/`mprotect`/`brk`, the page-fault paths (zero-fill, the
   page cache's pages, copy-on-write, dirty promotion, `FaultResult::BusError`),
-  `invalidate_file_from`, teardown; `pinned_pages`, `writable_maps` and
+  `invalidate_file_from`, teardown (every counted frame released);
+  #375's `fork_copy` (private leaves read-only in both spaces with their
+  counts raised, shared anonymous pages populated and shared, page-cache
+  leaves refaulted), the copy-on-write split (`split_private_leaf`: reuse at
+  count 1, else copy, shoot down, then release), `users` with
+  `add_user`/`drop_user` (teardown at 0), and `shoot_down`, this CPU's
+  flush until B5 (#376); `pinned_pages`, `writable_maps` and
   `mapped_files` (`KeptFile`: a mapping's open reference and path; the
   `MappedFile` that `mmap_file` takes also carries its description's
   shared-write right, `O_RDWR` or not, which only `mmap_file` reads, into
@@ -435,31 +448,58 @@ one is its own PR that updates that doc first.
   `ro,errors=remount-ro`, `format_mounts_of`, #349; `/proc/<pid>/maps` from
   `AddressSpace::format_maps`, its lines `lumen_vm::maps`'s; the node
   kinds, inode numbers, fds and numeric names `lumen_vfs::procfs`'s).
-  `linux/` (M6, M7; ARCHITECTURE section 8): `linux/mod.rs` the
-  `linux-raw-sys` re-exports, `M6_SYSCALLS` and `M7_SYSCALLS` (the numbers,
-  `syscall_name`; pinned by the `abi_constants_match_spec` and
-  `m7_abi_constants_match_spec` ktests, the latter with M7's flags and
-  struct layouts), `uname`'s payload and the `linux` command (`linux /path`
+  `linux/` (M6, M7, M8; ARCHITECTURE section 8): `linux/mod.rs` the
+  `linux-raw-sys` re-exports, `M6_SYSCALLS`, `M7_SYSCALLS` and
+  `M8_SYSCALLS` (the numbers, `syscall_name`; pinned by the
+  `abi_constants_match_spec`, `m7_abi_constants_match_spec` and
+  `m8_abi_constants_match_spec` ktests, the latter two with their flags and
+  struct layouts, #371), `uname`'s payload and the `linux` command (`linux /path`
   from the VFS, `run_exec`: load, run, count frames, the path as `exe`, the thread named after the path's last component, #276);
+  `linux/init.rs` `linux::init`, pid 1 started at boot after the VFS
+  (`process::start_init`: a kernel-owned process with no threads, every
+  exit's reaper, #372);
   `linux/exec.rs` `Exec` (#255: a binary and its `PT_INTERP` interpreter
   read and parsed once, each read from a file with its `ImageFile` (none
   for a boot module), naming its maps lines and giving its path, `load` through `AddressSpace::from_images`;
   `ExecError`, each read naming its file);
-  `linux/process.rs` `ProcessState` (#254: the private 1024-slot FD table
-  of `OpenFile`s, `install_current_fd`/`insert_current_fd`/`dup_current_fd`(`_from`)/
-  `close_current_fd`, close and exit releasing POSIX and `flock` locks
-  outside `ACTIVE_PROCS` (`release_fd`); the advisory locks' one wait
+  `linux/process.rs` processes and threads (#372, the split): `Process`
+  (a thread group: pid, `mm`, `files`, `fs`, `signal`, `exe_path`, console
+  state, `exit`, each written only through its owner methods such as
+  `record_exit`), `UserThread` (a tid, its process, `clear_child_tid`; held
+  in the scheduler thread's `UserThreadState::linux`, so a syscall finds it
+  lock-free through `current_thread`/`current_process`), `PROCS` (`ProcTable`:
+  lumen-proc's tree, processes by pid, threads by tid; its methods
+  `link_init`, `link_root`, `link_thread`, `unlink_thread`, `exit_in_tree`
+  its only writers, `check` cross-checking them in the ktests), `lookup`/
+  `lookup_thread`, `register_current` and `take_current` (a run's takedown in
+  the design's exit order: detach, unlink, release `mm`/`files`/`fs`, then
+  the tree, its `NoMem` retried), `Files` (the 1024-slot FD table of
+  `OpenFile`s and its `users`, `share`/`leave`; `install_current_fd`/
+  `insert_current_fd`/`dup_current_fd`(`_from`)/`close_current_fd`, close
+  and exit releasing POSIX and `flock` locks outside `PROCS` (`release_fd`)),
+  `FsState` (`Cwd` and umask, `swap_current_umask`), `SignalState`
+  (dispositions behind `action`/`set_action`, per-thread lumen-signal
+  `Blocked` masks), `ps_rows` for the shell's `ps`; the advisory locks' one wait
   queue and release count (`lock_releases`, `locks_released`,
   `wait_for_lock_release`: `F_SETLKW` and blocking `flock`, #254);
   `Stdio`: fds 0/1/2 on `/dev/console` and `/` as
-  cwd, opened before a run or it is refused; `Cwd`, `umask`;
-  `open_kernel_file`; the console bridge; `in_test_process` for ktests;
+  cwd, opened before a run or it is refused;
+  `open_kernel_file`; the console bridge; `in_test_process` for ktests
+  (`add_ktest_thread` a second thread in it; `with_process_user`, holding
+  a running process's space for a ktest that loads it);
   `RegisteredProcess`: the test seams' process, taken down when it drops, #264);
   `linux/modules.rs` the Limine boot modules; `linux/syscall/`: `mod.rs`
   `dispatch` (each number in one arm, its constant as the pattern) and the
   shared copy helpers, a module per cluster holding its handlers (`fd`,
   `stat`, `ns`, `dir`, `meta`, `io`, `lock`; M6's `mem`, with #255's
   `mmap` of a descriptor and `msync` (ktests in `mem/tests.rs`), `proc`;
+  M8's clusters, #371: `task` (`exit`, the ids, `set_tid_address`; `clone`,
+  `fork`, `execve`, the waits, sessions and groups), `signal`
+  (`rt_sigaction`, `rt_sigprocmask` and the other signal calls), `futex`
+  (futexes, robust lists, sleeps), `poll` (`poll`, `ppoll`, `select`),
+  `pipe` (pipes, `dup*`, `mknod`), `timer` and `sys`; each M8 syscall not
+  yet implemented a typed stub whose doc says "M8 stub" and names the
+  issues replacing it, returning `-ENOSYS` through `not_implemented`;
   `fd` holds `open`/`openat`/`lseek` and the descriptor I/O through the table,
   terminals by `VfsInode::is_tty` to the console, and the syscall ktests'
   shared helpers (`ktest_user_path`, `ktest_fd`, `ktest_fd_of`: a failure
@@ -586,13 +626,18 @@ one is its own PR that updates that doc first.
   kernel-stack layout (`StackWindow`: `StackSlot`s, freed ones kept as
   joined free ranges tagged with a TLB `Generation`, first fit once a
   `Flushed` covers it, #300; a model with out-of-order give-backs and a
-  page-table count host-test it) and lock-free stack registry.
+  page-table count host-test it), lock-free stack registry, and
+  `frame::RefTable` (#375: the kernel's per-frame reference counts over
+  caller storage, `set_one`/`inc`/`dec` giving `Remaining`, overflow,
+  underflow and re-initialisation refused; host-tested incl. a model and
+  racing last decrements).
 - `crates/lumen-heap`: heap allocator logic (address-ordered free list,
   coalescing; host-tested, incl. a randomized stress test against a shadow map).
 - `crates/lumen-vm`: a process's user address space as logic: the user
   layout (`USER_MIN`/`USER_MAX`, `PIE_BASE`, `MMAP_TOP`, the initial stack's
   `USER_STACK_TOP`/`USER_STACK_SIZE`/`USER_STACK_BOTTOM`), `Prot`, `Vma`s
-  anonymous or file-backed (`Backing`, `FileMapping`), the `VmaMap` (sorted
+  anonymous (private or shared, `Backing::Anonymous { shared }`, #375) or
+  file-backed (`Backing`, `Backing::is_shared`, `FileMapping`), the `VmaMap` (sorted
   by start in a `BTreeMap`: `map` with `MapPlace` hint/fixed/no-replace,
   `unmap`, `protect`, coalescing), the `Brk` cursor, and `maps`
   (`write_maps`: `/proc/<pid>/maps` lines, the heap split at the break's
@@ -695,7 +740,9 @@ one is its own PR that updates that doc first.
   `ExitAction`s (`Notify`, `Released`, `HangupThenContinue`), `stop`/`cont`
   giving a `StateChange`; `wait4_request`/`waitid_request` and `wait`
   (`WaitReady`, `Report`); `setsid`, `setpgid`, `getpgid`, `getsid`,
-  `tcsetpgrp`, `pgrp_members`, `is_orphaned_pgrp`), `WaitStatus` (`word`,
+  `tcsetpgrp`, `pgrp_members`, `is_orphaned_pgrp`; a process's threads,
+  `add_thread`/`remove_thread`/`threads`, their tids busy, #372;
+  `check_invariants` behind `test-util`), `WaitStatus` (`word`,
   `siginfo`), `ExitStatus`, `RusageSlot`/`SlotRef`, `Errno`/`Bug`/`Error`
   (host-tested, incl. a model and what each operation allocates,
   `tests/alloc.rs`).
@@ -941,8 +988,14 @@ one is its own PR that updates that doc first.
   for #255's exit scenarios, and `libm7.so`;
   `m7_vfs`, #254's exit scenarios' program: `posix`, `locks`, `keep` (a
   tree left for fsck), and `lock-hold`/`lock-probe`, two processes at once,
-  every check a raw syscall by number).
-- `tests/scenarios/`: QEMU tests. `tests/harness/`: harness self-tests
+  every check a raw syscall by number). `tools/linux-m8/` (#371): M8's
+  test programs, built the same way into `build/linux/` and staged in both
+  images: `m8_proc`, `m8_io`, `m8_vm` and `ptyrun` (D3's relay), sharing
+  `common.rs` (the raw syscall, `say!`, argv, `Fail`); each prints its
+  usage and exits 64 until its issues add a mode.
+- `tests/scenarios/`: QEMU tests (M8's `test_linux_proc.py`,
+  `test_linux_io.py`, `test_linux_vm.py` and `test_conformance.py` empty
+  until each issue's first test, #371). `tests/harness/`: harness self-tests
   (incl. `test_rootfs.py`),
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs
   `# unconfirmed: <why>`, and lumen_harness types raw only where it
