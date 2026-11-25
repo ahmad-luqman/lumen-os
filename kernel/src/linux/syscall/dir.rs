@@ -123,13 +123,13 @@ fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
 /// - **Errors:** `-EBADF` for a descriptor not open or opened `O_PATH`,
 ///   `-ENOTDIR` for one that isn't a directory, `-EINVAL` if `count` can't
 ///   hold the next entry, `-EFAULT` (what the copy says) if the records
-///   can't be copied out (the cursor then goes back to where it was, unless
-///   something moved it meanwhile), `-EIO` if the filesystem broke its
-///   cursor contract, and the filesystem's error from `readdir` (`-ENOENT`
-///   for a `/proc/<pid>` whose process has ended). An error after some
-///   entries were listed hands those on and comes back on the next call. A
-///   directory removed while open lists as empty (`0`; Linux says `-ENOENT`
-///   there, `IS_DEADDIR`: ARCHITECTURE section 9's deliberate difference).
+///   can't be copied out (the cursor goes back if still at the published
+///   value), `-EIO` if the filesystem broke its cursor contract, and the
+///   filesystem's error from `readdir` (`-ENOENT` for a `/proc/<pid>` whose
+///   process has ended). An error after some entries were listed hands
+///   those on and comes back on the next call. A directory removed while
+///   open lists as empty (`0`; Linux says `-ENOENT` there, `IS_DEADDIR`:
+///   ARCHITECTURE section 9's deliberate difference).
 /// - **The directory changing between calls:** the filesystems' cursors are
 ///   stable as entries come and go (`VfsInode::readdir`'s contract), so a
 ///   listing lists every entry that stayed in the directory exactly once,
@@ -142,13 +142,16 @@ fn push_dirent(buf: &mut Vec<u8>, entry: &DirEntry, limit: usize) -> bool {
 ///
 /// The cursor's lock is held while the entries are listed and packed in a
 /// kernel buffer, and the cursor moved past them; not across the copy out,
-/// which gives the position back if it fails.
+/// which gives the position back if it fails and the cursor still equals
+/// the published value (a defensive check). `pos` (Lock 0) spans both, so
+/// no other listing or seek can change that value meanwhile.
 pub(super) fn sys_getdents64(fd: Fd, dirp: UserPtr, count: u32) -> u64 {
     finish(getdents64(fd, dirp, count))
 }
 
 fn getdents64(fd: Fd, dirp: UserPtr, count: u32) -> Result<u64, u32> {
     let file = fd.file()?;
+    let _pos = file.lock_pos();
     file.require_non_path().map_err(VfsError::to_errno)?;
     // Here, not left to `readdir`: the trait has no default, so this is the
     // one place the rule holds for every filesystem.
@@ -166,12 +169,16 @@ fn getdents64(fd: Fd, dirp: UserPtr, count: u32) -> Result<u64, u32> {
         *cursor = next;
         (pos, next, buf)
     };
-    // Not across the copy out: a refused one gives the position back, if
-    // nothing moved it meanwhile.
+    // Lock 2 is released before the user copy; Lock 0 still excludes
+    // another listing or seek, including while a failed copy gives back.
+    #[cfg(feature = "ktest")]
+    process::position_window::hold(&file, process::position_window::Point::DirCopy);
     if !buf.is_empty()
         && let Err(e) = copy_to_user(dirp.addr(), &buf)
     {
         let mut cursor = file.dir_cursor.lock();
+        // Defensive under Lock 0: no other listing or seek can move it.
+        debug_assert_eq!(*cursor, next, "directory cursor changed under Lock 0");
         if *cursor == next {
             *cursor = pos;
         }

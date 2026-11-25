@@ -378,3 +378,36 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_a_directory_grown_by_ext4plus_stats_its_size_on_disk",
     "scenario:test_fs::test_ext4_htree_names_with_high_bytes_fsck_clean[*]",
 ]
+
+[[feature]]
+name = "M8 shared open descriptions serialize whole position-based calls and fcntl SEEK_CUR sees committed offsets: regular and procfs readers move each byte once, a failed copy gives its position back under contention, and concurrent getdents64 callers list each name once (#379)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::linux::process::shared_description_offsets_move_once",
+    "ktest:lumen_kernel::linux::process::shared_description_getdents_lists_once",
+    "ktest:lumen_kernel::linux::syscall::lock::fcntl_seek_cur_uses_committed_position",
+]
+
+[[feature]]
+name = "M8 descriptor reservations are neither open nor free, survive drains, and a fork copy of the table leaves them out; openat holds its slot through installation, dup2 returns EBUSY, and reservations refuse a full-table O_CREAT before creating anything; duplication uses one table hold (#379)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::linux::process::dup_and_openat_reserve_their_slot",
+]
+
+[[feature]]
+name = "M8 POSIX record-lock waiters are keyed by (tgid, tid): sibling threads keep separate records and deadlock detection follows the lowest waiting tid of each holding process (#379)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_thread",
+]
+
+[[feature]]
+name = "M8 openat keeps its reserved slot through filesystem work: a paused open excludes dup2 with EBUSY, F_DUPFD takes the next slot, and the open returns its reserved fd (#379)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::process::open_reservation_survives_until_install",
+]

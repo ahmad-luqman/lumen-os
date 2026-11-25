@@ -37,11 +37,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 pub use cache::{DentryCache, DentryTarget, InodeCache};
 pub use error::VfsError;
-pub use fd::{FdEntry, FdTable, LocalLock, LockFamily, OpenFile, OpenFileId, VfsLock};
+pub use fd::{FdEntry, FdReservation, FdTable, LocalLock, LockFamily, OpenFile, OpenFileId, VfsLock};
 pub use fs::{FileSystem, OpenGuard, VfsInode};
 pub use locks::{
     AdvisoryLocks, Deadlock, FlockKind, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixLockType, PosixWaitGraph,
-    RecordLockOutcome, WaitSearch,
+    RecordLockOutcome, WaitSearch, Waiter,
 };
 pub use mount::{MountInfo, MountTable, VfsCacheOps, VfsTables};
 pub use ops::{
