@@ -856,3 +856,114 @@ fn copy_iovecs(user_iov: u64, iovcnt: u64) -> Result<alloc::vec::Vec<RawIovec>, 
     }
     Ok(iovs)
 }
+
+crate::ktest!(
+    fn restart_with_no_handler_restarts_or_resumes() {
+        // In a test process, with a signal raised on its thread through
+        // `raise_for_test` and nothing delivered (an ignored signal), the
+        // syscall-exit hook turns each restart code into what Linux's
+        // no-handler path gives: `-ERESTARTSYS`, `-ERESTARTNOINTR` and
+        // `-ERESTARTNOHAND` a restart (`rax` the syscall's number, `rip`
+        // back over the `syscall`, the arguments as they were);
+        // `-ERESTART_RESTARTBLOCK` `restart_syscall` (219), the restart
+        // block kept with its deadline unchanged, which `restart_syscall`
+        // then resumes (taking it); with no block, `restart_syscall` is
+        // `-EINTR`. Each pass clears `sigpending`. A restart-looking `rax`
+        // with no syscall context, or an ordinary result, is left alone.
+        use crate::linux::process::{self, KernelSigaction, set_current_action};
+        use crate::linux::signal::{RestartBlock, exit_to_user, interrupted_with, raise_for_test, restart_result};
+        use crate::sched;
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::Signal;
+        use lumen_signal::restart::{RESTART_SYSCALL, RestartCode, SyscallExit};
+
+        /// What the test's resume saw: its block's deadline and first argument.
+        static RESUMED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+        fn resume(block: &RestartBlock) -> u64 {
+            RESUMED[0].store(block.deadline.unwrap_or(0), Ordering::SeqCst);
+            RESUMED[1].store(block.args[0], Ordering::SeqCst);
+            block.args[0] + 100
+        }
+        const RIP: u64 = 0x40_1002;
+        // `fcntl` and `nanosleep` (as numbers: `general::__NR_` names belong
+        // to `dispatch`'s arms, which the syscall census reads).
+        const NR: u64 = 72;
+        const NANOSLEEP: u64 = 35;
+        let eintr = neg_errno(errno::EINTR);
+        process::in_test_process(move |_| -> crate::ktest::TestResult {
+            let me = sched::current().ok_or("a thread")?;
+            // SIGUSR1 ignored: raised, nothing is delivered, as before C5.
+            set_current_action(Signal::USR1, KernelSigaction { handler: 1, ..KernelSigaction::default() });
+            let frame_of =
+                |rax: u64| SyscallFrame { rax, rip: RIP, rdi: 3, rsi: 7, rdx: 0x1234, ..SyscallFrame::default() };
+            for code in [RestartCode::Sys, RestartCode::NoIntr, RestartCode::NoHand] {
+                raise_for_test(&me, Signal::USR1);
+                kassert!(me.sigpending());
+                let mut frame = frame_of(restart_result(code));
+                exit_to_user(&mut frame, SyscallExit::new(NR));
+                kassert_eq!((frame.rax, frame.rip), (NR, RIP - 2));
+                kassert_eq!((frame.rdi, frame.rsi, frame.rdx), (3, 7, 0x1234));
+                kassert!(!me.sigpending());
+            }
+
+            // -ERESTART_RESTARTBLOCK with a block: 219, the block kept.
+            let deadline = crate::time::now_ns() + 3_000_000_000;
+            let block = RestartBlock { resume, deadline: Some(deadline), args: [5, 6, 7, 8] };
+            let mut frame = frame_of(finish(Err(interrupted_with(block))));
+            kassert_eq!(frame.rax, restart_result(RestartCode::RestartBlock));
+            raise_for_test(&me, Signal::USR1);
+            exit_to_user(&mut frame, SyscallExit::new(NANOSLEEP));
+            kassert_eq!((frame.rax, frame.rip), (RESTART_SYSCALL, RIP - 2));
+            kassert!(!me.sigpending());
+            kassert_eq!(sched::restart_block().and_then(|b| b.deadline), Some(deadline));
+            // The restarted `restart_syscall` resumes it, taking it.
+            let mut restarted = frame_of(RESTART_SYSCALL);
+            let _ = dispatch(&mut restarted);
+            kassert_eq!(restarted.rax, 105);
+            kassert_eq!(RESUMED[0].load(Ordering::SeqCst), deadline);
+            kassert_eq!(RESUMED[1].load(Ordering::SeqCst), 5);
+            kassert!(sched::restart_block().is_none());
+            // Its own exit: an ordinary result, left alone.
+            exit_to_user(&mut restarted, SyscallExit::new(RESTART_SYSCALL));
+            kassert_eq!((restarted.rax, restarted.rip), (105, RIP));
+
+            // No block: `restart_syscall` is -EINTR, also when the hook
+            // made the call one.
+            raise_for_test(&me, Signal::USR1);
+            let mut frame = frame_of(restart_result(RestartCode::RestartBlock));
+            exit_to_user(&mut frame, SyscallExit::new(NANOSLEEP));
+            kassert_eq!(frame.rax, RESTART_SYSCALL);
+            let _ = dispatch(&mut frame);
+            kassert_eq!(frame.rax, eintr);
+
+            // A corrupt return address cannot rewind: EINTR, rip intact,
+            // and a restart block is reset rather than left for a later call.
+            for code in [RestartCode::NoIntr, RestartCode::RestartBlock] {
+                let mut frame = frame_of(if code == RestartCode::RestartBlock {
+                    finish(Err(interrupted_with(block)))
+                } else {
+                    restart_result(code)
+                });
+                frame.rip = 1;
+                exit_to_user(&mut frame, SyscallExit::new(NANOSLEEP));
+                kassert_eq!((frame.rax, frame.rip), (eintr, 1));
+                kassert!(sched::restart_block().is_none());
+            }
+            // No restart context must also discard a RestartBlock result's
+            // stored block, without interpreting user registers as a syscall.
+            let mut frame = frame_of(finish(Err(interrupted_with(block))));
+            exit_to_user(&mut frame, None);
+            kassert_eq!((frame.rax, frame.rip), (restart_result(RestartCode::RestartBlock), RIP));
+            kassert!(sched::restart_block().is_none());
+
+            // No syscall context (an interrupt's return): nothing changes,
+            // whatever `rax` holds; the flag is still cleared.
+            raise_for_test(&me, Signal::USR1);
+            let mut frame = frame_of(restart_result(RestartCode::Sys));
+            exit_to_user(&mut frame, None);
+            kassert_eq!((frame.rax, frame.rip), (restart_result(RestartCode::Sys), RIP));
+            kassert!(!me.sigpending());
+            Ok(())
+        })?
+    }
+);

@@ -56,20 +56,52 @@ struct FixupEntry {
 unsafe extern "C" {
     static __lumen_fixup_start: [FixupEntry; 0];
     static __lumen_fixup_end: [FixupEntry; 0];
+    static __lumen_fixup_nofault_start: [FixupEntry; 0];
+    static __lumen_fixup_nofault_end: [FixupEntry; 0];
+}
+
+/// The fixup of `rip` in the read-only table between `start` and `end`.
+///
+/// # Safety
+/// `start..end` must be one of the linker's fixup sections: initialized
+/// `FixupEntry` pairs, never written.
+unsafe fn lookup_in(start: *const FixupEntry, end: *const FixupEntry, rip: u64) -> Option<u64> {
+    let bytes = (end as usize).saturating_sub(start as usize);
+    debug_assert!(start as usize <= end as usize && bytes.is_multiple_of(core::mem::size_of::<FixupEntry>()));
+    let count = bytes / core::mem::size_of::<FixupEntry>();
+    // SAFETY: upheld by the caller.
+    let entries = unsafe { core::slice::from_raw_parts(start, count) };
+    entries.iter().find_map(|e| (e.fault_ip == rip).then_some(e.fixup_ip))
 }
 
 /// Look up `rip` in the read-only `.lumen_fixup` table. Returns the fixup
 /// recovery address if `rip` is a registered user-copy faulting instruction.
 pub fn lookup_fixup(rip: u64) -> Option<u64> {
-    let start = (&raw const __lumen_fixup_start).cast::<FixupEntry>();
-    let end = (&raw const __lumen_fixup_end).cast::<FixupEntry>();
-    let bytes = (end as usize).saturating_sub(start as usize);
-    debug_assert!(start as usize <= end as usize && bytes.is_multiple_of(core::mem::size_of::<FixupEntry>()));
-    let count = bytes / core::mem::size_of::<FixupEntry>();
     // SAFETY: `.lumen_fixup` is a read-only linker section of initialized
     // `FixupEntry` pairs between `__lumen_fixup_start` and `__lumen_fixup_end`.
-    let entries = unsafe { core::slice::from_raw_parts(start, count) };
-    entries.iter().find_map(|e| (e.fault_ip == rip).then_some(e.fixup_ip))
+    unsafe {
+        lookup_in(
+            (&raw const __lumen_fixup_start).cast::<FixupEntry>(),
+            (&raw const __lumen_fixup_end).cast::<FixupEntry>(),
+            rip,
+        )
+    }
+}
+
+/// Look up `rip` in the read-only `.lumen_fixup_nofault` table: the fixup
+/// if `rip` is a non-faulting access's one faulting instruction
+/// ([`read_u32_nofault`], [`cmpxchg_u32`]), which the `#PF` handler answers
+/// at once, paging nothing in.
+pub fn lookup_fixup_nofault(rip: u64) -> Option<u64> {
+    // SAFETY: `.lumen_fixup_nofault` is a read-only linker section of
+    // initialized `FixupEntry` pairs between its two symbols.
+    unsafe {
+        lookup_in(
+            (&raw const __lumen_fixup_nofault_start).cast::<FixupEntry>(),
+            (&raw const __lumen_fixup_nofault_end).cast::<FixupEntry>(),
+            rip,
+        )
+    }
 }
 
 // Fault-safe user memory copy routines.
@@ -175,9 +207,96 @@ lumen_user_copy_cstr_raw:
     options(att_syntax)
 );
 
+// Non-faulting user accesses (ARCHITECTURE section 6, step 6): one
+// faulting instruction each, registered in `.lumen_fixup_nofault`, whose
+// faults the `#PF` handler answers at once (no paging, interrupts left off),
+// so they may run with a spinlock held. `stac`/`clac` as above.
+global_asm!(
+    r#"
+    .pushsection .text.lumen_uaccess_nofault, "ax", @progbits
+    .globl lumen_user_read_u32_nofault
+    .type lumen_user_read_u32_nofault, @function
+    .balign 16
+lumen_user_read_u32_nofault:
+    # System V AMD64: rdi = user addr (4-byte aligned, range checked),
+    # rsi = kernel *mut u32. Returns 0 (the word stored at rsi) or 1 (fault).
+    movb LUMEN_SMAP_ENABLED(%rip), %r8b
+    testb %r8b, %r8b
+    jz 1f
+    stac
+1:
+2:
+    movl (%rdi), %eax
+    testb %r8b, %r8b
+    jz 3f
+    clac
+3:
+    movl %eax, (%rsi)
+    xorl %eax, %eax
+    ret
+4:
+    testb %r8b, %r8b
+    jz 5f
+    clac
+5:
+    movl $1, %eax
+    ret
+    .size lumen_user_read_u32_nofault, . - lumen_user_read_u32_nofault
+
+    .pushsection .lumen_fixup_nofault, "a", @progbits
+    .balign 8
+    .quad 2b
+    .quad 4b
+    .popsection
+
+    .globl lumen_user_cmpxchg_u32_nofault
+    .type lumen_user_cmpxchg_u32_nofault, @function
+    .balign 16
+lumen_user_cmpxchg_u32_nofault:
+    # System V AMD64: rdi = user addr (4-byte aligned, range checked),
+    # esi = expected, edx = new, rcx = kernel *mut u32 (the value found).
+    # Returns 0 (found stored at rcx) or 1 (fault, nothing stored).
+    movl %esi, %eax
+    movb LUMEN_SMAP_ENABLED(%rip), %r8b
+    testb %r8b, %r8b
+    jz 1f
+    stac
+1:
+2:
+    lock cmpxchgl %edx, (%rdi)
+    testb %r8b, %r8b
+    jz 3f
+    clac
+3:
+    movl %eax, (%rcx)
+    xorl %eax, %eax
+    ret
+4:
+    testb %r8b, %r8b
+    jz 5f
+    clac
+5:
+    movl $1, %eax
+    ret
+    .size lumen_user_cmpxchg_u32_nofault, . - lumen_user_cmpxchg_u32_nofault
+
+    .pushsection .lumen_fixup_nofault, "a", @progbits
+    .balign 8
+    .quad 2b
+    .quad 4b
+    .popsection
+    .popsection
+"#,
+    options(att_syntax)
+);
+
 unsafe extern "C" {
     fn lumen_user_copy_raw(dst: *mut u8, src: *const u8, len: usize) -> u64;
     fn lumen_user_copy_cstr_raw(dst: *mut u8, src: *const u8, max_len: usize) -> i64;
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `read_u32_nofault`'s
+    fn lumen_user_read_u32_nofault(addr: *const u32, out: *mut u32) -> u64;
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `cmpxchg_u32`'s
+    fn lumen_user_cmpxchg_u32_nofault(addr: *mut u32, expected: u32, new: u32, found: *mut u32) -> u64;
 }
 
 /// Failure modes for [`copy_from_user`], [`copy_to_user`], and [`copy_cstr_from_user`].
@@ -323,6 +442,102 @@ pub fn copy_cstr_from_user(user_src: u64, max_len: usize) -> Result<Vec<u8>, Cop
     }
 }
 
+/// A non-faulting user access found no usable page: a bad or kernel
+/// address, a misaligned one, or a page that isn't mapped as the access
+/// needs right now (not yet faulted in, read-only for a store,
+/// copy-on-write). The caller first refuses bad or misaligned addresses
+/// with its ABI's `-EFAULT` or `-EINVAL` (futex). Only page state is retried:
+/// release locks, fault the page in ([`copy_from_user`] to read it,
+/// [`fault_in_writable`] to write it), then try again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex and B5's probes next
+pub struct Fault;
+
+/// Whether `addr` is a word a non-faulting access may touch: in the user
+/// range (as [`copy_from_user`] checks it) and 4-byte aligned (an aligned
+/// word never straddles a page, and a `lock cmpxchg` on it never splits a
+/// cache line).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex and B5's probes next
+fn nofault_word_ok(addr: u64) -> bool {
+    addr.is_multiple_of(4) && user_range_valid(addr, 4)
+}
+
+/// Read the 4-byte, 4-byte-aligned user word at `addr` without faulting
+/// anything in: `Err(Fault)` if it isn't mapped readable now (nothing is
+/// mapped by the attempt). May run with a spinlock held and interrupts off
+/// (a futex bucket's), as Linux's `get_user` under `pagefault_disable`.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex and B5's probes next
+pub fn read_u32_nofault(addr: u64) -> Result<u32, Fault> {
+    if !nofault_word_ok(addr) {
+        return Err(Fault);
+    }
+    let mut word = 0u32;
+    // SAFETY: `addr` is an aligned word inside `USER_MIN..USER_MAX`; the
+    // load is the routine's one faulting instruction, registered in
+    // `.lumen_fixup_nofault`, so a `#PF` on it returns 1 without paging;
+    // `word` is writable kernel memory.
+    let rc = unsafe { lumen_user_read_u32_nofault(addr as *const u32, &mut word) };
+    if rc == 0 { Ok(word) } else { Err(Fault) }
+}
+
+/// `lock cmpxchg` on the 4-byte, 4-byte-aligned user word at `addr`: if it
+/// holds `expected`, store `new`. Returns the value it found (`expected`
+/// when it stored). `Err(Fault)` if the page isn't mapped writable now (not
+/// yet faulted in, read-only, copy-on-write): nothing is stored or mapped.
+/// May run with a spinlock held and interrupts off, as Linux's
+/// `futex_atomic_cmpxchg_inatomic`.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex next
+pub fn cmpxchg_u32(addr: u64, expected: u32, new: u32) -> Result<u32, Fault> {
+    if !nofault_word_ok(addr) {
+        return Err(Fault);
+    }
+    let mut found = 0u32;
+    // SAFETY: as in `read_u32_nofault`; the `lock cmpxchg` is the routine's
+    // one faulting instruction (a locked write cycle even when the compare
+    // fails, so a read-only page always faults).
+    let rc = unsafe { lumen_user_cmpxchg_u32_nofault(addr as *mut u32, expected, new, &mut found) };
+    if rc == 0 { Ok(found) } else { Err(Fault) }
+}
+
+/// Why a writable user page could not be faulted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C4's futex next
+pub enum FaultIn {
+    Fault,
+    OutOfMemory,
+}
+
+/// Resolve a write fault at user address `addr` as a store there would
+/// (demand paging, copy-on-write, a shared file page's dirty promotion),
+/// storing nothing, as Linux's `fault_in_user_writeable`
+/// (`fixup_user_fault` with `FAULT_FLAG_WRITE`): afterwards a store or a
+/// [`cmpxchg_u32`] there succeeds unless the page goes away again.
+/// `Err(FaultIn::Fault)` for an address outside the user range, a thread
+/// with no address space, or a page that can't be written (unmapped,
+/// read-only, a bus error); `OutOfMemory` is separate and logged. Takes the
+/// address space's Lock 1: called with no lock held and interrupts on.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex next
+pub fn fault_in_writable(addr: u64) -> Result<(), FaultIn> {
+    debug_assert!(
+        (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
+        "fault_in_writable requires interrupts enabled and no SpinLock held"
+    );
+    if !(USER_MIN..USER_MAX).contains(&addr) {
+        return Err(FaultIn::Fault);
+    }
+    let space = sched::current_address_space().ok_or(FaultIn::Fault)?;
+    // A kernel-mode write (error code bit 1, not bit 2): what a store from a
+    // user copy would raise.
+    match space.handle_page_fault(addr, 1 << 1) {
+        crate::mm::user_vm::FaultResult::Resolved => Ok(()),
+        crate::mm::user_vm::FaultResult::OutOfMemory => {
+            log::warn!(target: "mm", "out of memory resolving a writable user fault at cr2 {addr:#x}; giving FaultIn::OutOfMemory");
+            Err(FaultIn::OutOfMemory)
+        }
+        crate::mm::user_vm::FaultResult::Invalid | crate::mm::user_vm::FaultResult::BusError => Err(FaultIn::Fault),
+    }
+}
+
 /// How a ring-3 execution terminated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserExit {
@@ -370,6 +585,55 @@ const SYS_TEST_NONCANON_SYSRET: u64 = 0x1000_0001;
 const SYS_TEST_NONCANON_IRET: u64 = 0x1000_0002;
 const SYS_TEST_IRET_RETURN: u64 = 0x1000_0003;
 const SYS_TEST_PREEMPT_COUNT: u64 = 0x1000_0004;
+
+#[cfg(feature = "ktest")]
+const SYS_TEST_RESTART_ONCE: u64 = 0x1000_0005;
+/// Observations from the restart test's real syscall and return path.
+#[cfg(feature = "ktest")]
+struct RestartProbe {
+    calls: AtomicU64,
+    first_rip: AtomicU64,
+    second_rip: AtomicU64,
+    cleared: AtomicBool,
+    return_rax: AtomicU64,
+    return_rip: AtomicU64,
+}
+
+#[cfg(feature = "ktest")]
+impl RestartProbe {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            first_rip: AtomicU64::new(0),
+            second_rip: AtomicU64::new(0),
+            cleared: AtomicBool::new(false),
+            return_rax: AtomicU64::new(0),
+            return_rip: AtomicU64::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        for value in [&self.calls, &self.first_rip, &self.second_rip, &self.return_rax, &self.return_rip] {
+            value.store(0, Ordering::SeqCst);
+        }
+        self.cleared.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "ktest")]
+static RESTART_PROBE: RestartProbe = RestartProbe::new();
+
+/// Observe the first `SYS_TEST_RESTART_ONCE` call's frame after the hook,
+/// just before `sysretq`. This checks the exact rewind without relying on
+/// what re-executed code does.
+#[cfg(feature = "ktest")]
+pub(crate) fn record_restart_return_for_test(nr: u64, frame: &SyscallFrame) {
+    if nr == SYS_TEST_RESTART_ONCE && RESTART_PROBE.calls.load(Ordering::SeqCst) == 1 {
+        RESTART_PROBE.return_rax.store(frame.rax, Ordering::SeqCst);
+        RESTART_PROBE.return_rip.store(frame.rip, Ordering::SeqCst);
+        RESTART_PROBE.cleared.store(!sched::current_sigpending(), Ordering::SeqCst);
+    }
+}
 
 /// Abort any waiting `sse_tls` peer if a user process exits non-zero.
 pub(crate) fn note_exit_status(status: i32) {
@@ -459,6 +723,19 @@ pub fn dispatch_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
 /// is set (`usertest` runs). Normal `linux` binaries never reach these hooks.
 pub(crate) fn dispatch_test_syscall(frame: &mut SyscallFrame) -> Option<SyscallReturn> {
     match frame.rax {
+        #[cfg(feature = "ktest")]
+        SYS_TEST_RESTART_ONCE => {
+            if RESTART_PROBE.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                RESTART_PROBE.first_rip.store(frame.rip, Ordering::SeqCst);
+                sched::with_current(sched::Thread::set_sigpending);
+                frame.rax = crate::linux::signal::restart_result(lumen_signal::restart::RestartCode::NoIntr);
+            } else {
+                RESTART_PROBE.second_rip.store(frame.rip, Ordering::SeqCst);
+                RESTART_PROBE.cleared.fetch_and(!sched::current_sigpending(), Ordering::SeqCst);
+                frame.rax = 0x1337;
+            }
+            Some(SyscallReturn::Sysret)
+        }
         SYS_TEST_NONCANON_SYSRET => {
             // Non-canonical boundary address: bit 47 = 1, bits 48..63 = 0.
             frame.rip = 0x0000_8000_0000_0000;
@@ -1870,6 +2147,286 @@ crate::ktest!(
         kassert_eq!(process_exe_path(pid), None);
         // The last user given up (here or by the takedown) tore it down.
         kassert_eq!(space.users(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn nofault_access_answers_fault_without_paging_in() {
+        // Under a held `SpinLock` (interrupts off, `irq::depth() > 0`):
+        // unmapped and not-yet-faulted pages answer `Fault` for either
+        // access; read-only and copy-on-write pages do so for the exchange
+        // only. Nothing is mapped by the attempt;
+        // a mapped page's read and exchange work. `fault_in_writable` on a
+        // not-yet-faulted page and on a copy-on-write page leaves the leaf
+        // writable with its Dirty bit clear and the word unchanged (nothing
+        // stored), after which the exchange succeeds; and an incrementer on
+        // another CPU, exchanging on the same word while this CPU faults it
+        // in over and over, ends with the count exact.
+        use crate::mm::user_vm::{file_vm_leaf, ktest_any_leaf as leaf};
+        use crate::{kassert, kassert_eq};
+        const P: u64 = FRAME_SIZE;
+        const RW: Prot = Prot::READ.union(Prot::WRITE);
+        const MAPPED: u64 = TEST_DATA_VA;
+        const UNMAPPED: u64 = TEST_DATA_VA + P;
+        const LAZY: u64 = TEST_DATA_VA + 2 * P;
+        const RO: u64 = TEST_DATA_VA + 3 * P;
+        const COW: u64 = TEST_DATA_VA + 4 * P;
+        const FAULT_INS: u32 = 2_000;
+
+        let read = |addr: u64| -> Result<u32, &'static str> {
+            let mut w = [0u8; 4];
+            copy_from_user(&mut w, addr).map_err(|_| "copy the word out")?;
+            Ok(u32::from_le_bytes(w))
+        };
+        let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames for AddressSpace")?);
+        let lazy_flags = u64::from(general::MAP_PRIVATE | general::MAP_ANONYMOUS | general::MAP_FIXED_NOREPLACE);
+        let mapped = space
+            .mmap_anon(LAZY, P, RW, lazy_flags)
+            .map(|_| ())
+            .and_then(|()| space.map_eager_with_bytes(RO, P, Prot::READ, &9u32.to_le_bytes()))
+            .and_then(|()| space.map_eager_with_bytes(COW, P, RW, &5u32.to_le_bytes()));
+        if mapped.is_err() {
+            space.teardown();
+            return Err("map the test pages");
+        }
+        let checked = (|| -> crate::ktest::TestResult {
+            // The copy-on-write page: shared with a child (count 2,
+            // read-only in both). The mapped page comes after, the
+            // parent's alone.
+            let child = space.fork_copy().map_err(|_| "fork_copy")?;
+            space.map_eager_with_bytes(MAPPED, P, RW, &41u32.to_le_bytes()).map_err(|_| "map the mapped page")?;
+            let _active = sched::UserSpaceGuard::enter(space.clone());
+            kassert!(!leaf(&space, COW)?.writable);
+
+            let held = SpinLock::new(());
+            let (unmapped, lazy, ro, cow, ro_read) = {
+                let _guard = held.lock();
+                (
+                    (read_u32_nofault(UNMAPPED), cmpxchg_u32(UNMAPPED, 0, 1)),
+                    (read_u32_nofault(LAZY), cmpxchg_u32(LAZY, 0, 1)),
+                    cmpxchg_u32(RO, 9, 10),
+                    cmpxchg_u32(COW, 5, 6),
+                    read_u32_nofault(RO),
+                )
+            };
+            kassert_eq!(unmapped, (Err(Fault), Err(Fault)));
+            kassert_eq!(lazy, (Err(Fault), Err(Fault)));
+            kassert_eq!(ro, Err(Fault));
+            kassert_eq!(cow, Err(Fault));
+            kassert_eq!(ro_read, Ok(9));
+            // Nothing mapped or changed by the attempts.
+            kassert!(file_vm_leaf(&space, UNMAPPED).is_none() && file_vm_leaf(&space, LAZY).is_none());
+            kassert!(!leaf(&space, COW)?.writable);
+            kassert_eq!(read(RO)?, 9);
+            kassert_eq!(read(COW)?, 5);
+
+            // A mapped page: read and exchange (a failed compare stores
+            // nothing).
+            {
+                let _guard = held.lock();
+                kassert_eq!(read_u32_nofault(MAPPED), Ok(41));
+                kassert_eq!(cmpxchg_u32(MAPPED, 41, 42), Ok(41));
+                kassert_eq!(cmpxchg_u32(MAPPED, 41, 43), Ok(42));
+            }
+            kassert_eq!(read(MAPPED)?, 42);
+            // Misaligned, kernel and out-of-range words: refused unread.
+            for addr in [MAPPED + 2, 0, USER_MIN - 4, USER_MAX, 0xffff_ffff_8000_0000] {
+                kassert_eq!(read_u32_nofault(addr), Err(Fault));
+                kassert_eq!(cmpxchg_u32(addr, 42, 0), Err(Fault));
+            }
+            kassert_eq!(fault_in_writable(UNMAPPED), Err(FaultIn::Fault));
+            kassert_eq!(fault_in_writable(RO), Err(FaultIn::Fault));
+            kassert_eq!(fault_in_writable(0xffff_ffff_8000_0000), Err(FaultIn::Fault));
+
+            // Faulted in for a write, storing nothing: writable, still
+            // clean, the word as it was; then the exchange works.
+            for (addr, was) in [(LAZY, 0u32), (COW, 5)] {
+                kassert_eq!(fault_in_writable(addr), Ok(()));
+                let l = leaf(&space, addr)?;
+                kassert!(l.writable && !l.dirty);
+                kassert_eq!(read_u32_nofault(addr), Ok(was));
+                kassert!(!leaf(&space, addr)?.dirty);
+                kassert_eq!(cmpxchg_u32(addr, was, was + 1), Ok(was));
+            }
+            // The child keeps the copy-on-write page's old word.
+            drop(_active);
+            {
+                let _child = sched::UserSpaceGuard::enter(child.clone());
+                kassert_eq!(read(COW)?, 5);
+            }
+            drop(child);
+
+            // The race: the lazy page (writable now) counted up on another
+            // CPU, its own tally kept, while this one faults it in a fixed
+            // number of times; any store by the fault-in would lose
+            // increments. The incrementer stops when told (or gives up if
+            // it can't fault the page in), and is joined before any check.
+            let _active = sched::UserSpaceGuard::enter(space.clone());
+            kassert_eq!(cmpxchg_u32(LAZY, 1, 0), Ok(1));
+            #[derive(Default)]
+            struct Race {
+                started: AtomicBool,
+                stop: AtomicBool,
+                tally: AtomicU64,
+                gave_up: AtomicBool,
+            }
+            let race = Arc::new(Race::default());
+            let (s, r) = (space.clone(), race.clone());
+            let cpu = *sched::running_cpus().iter().rfind(|&&c| c != arch::cpu_index()).ok_or("no other CPU")?;
+            let incrementer = sched::spawn_on(cpu, "nofault-inc", move || {
+                let _active = sched::UserSpaceGuard::enter(s);
+                r.started.store(true, Ordering::Release);
+                let mut tally = 0u64;
+                'count: while !r.stop.load(Ordering::Acquire) {
+                    loop {
+                        let seen = read_u32_nofault(LAZY).unwrap_or(0);
+                        match cmpxchg_u32(LAZY, seen, seen.wrapping_add(1)) {
+                            Ok(found) if found == seen => break,
+                            Ok(_) => {}
+                            Err(Fault) => {
+                                if fault_in_writable(LAZY).is_err() {
+                                    r.gave_up.store(true, Ordering::Release);
+                                    break 'count;
+                                }
+                            }
+                        }
+                    }
+                    tally += 1;
+                }
+                r.tally.store(tally, Ordering::Release);
+            })
+            .map_err(|_| "spawn the incrementer")?;
+            let started = sched::yield_until(|| race.started.load(Ordering::Acquire));
+            let mut failed_fault_ins = 0u32;
+            for _ in 0..FAULT_INS {
+                if fault_in_writable(LAZY).is_err() {
+                    failed_fault_ins += 1;
+                }
+            }
+            race.stop.store(true, Ordering::Release);
+            sched::join_bounded(incrementer)?;
+            let tally = race.tally.load(Ordering::Acquire);
+            crate::ktest::diag(format_args!("{FAULT_INS} fault-ins raced {tally} increments"));
+            kassert!(started);
+            kassert_eq!(failed_fault_ins, 0);
+            kassert!(!race.gave_up.load(Ordering::Acquire));
+            kassert_eq!(read_u32_nofault(LAZY).map(u64::from), Ok(tally));
+            Ok(())
+        })();
+        space.teardown();
+        checked
+    }
+);
+
+crate::ktest!(
+    fn interrupt_return_to_ring3_clears_sigpending() {
+        // A ring-3 process spinning on another CPU (no syscall) is raised a
+        // signal: the syscall-exit hook's interrupt side, at its next
+        // return to ring 3 from an interrupt (the timer's), finds nothing
+        // to deliver and clears `sigpending`. Then a word ends the spin.
+        use crate::kassert;
+        let mut c = CodeBuf::new();
+        c.bytes(&[0xf3, 0x90]); // loop: pause
+        c.bytes(&[0x48, 0xb8]); // mov rax, TEST_DATA_VA
+        c.bytes(&TEST_DATA_VA.to_le_bytes());
+        c.bytes(&[0x48, 0x8b, 0x00]); // mov rax, [rax]
+        c.bytes(&[0x48, 0x85, 0xc0]); // test rax, rax
+        c.bytes(&[0x74, 0xec]); // jz loop (-20)
+        c.exit_group_imm(0);
+        c.ud2();
+        let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames for AddressSpace")?);
+        space.map_eager_with_bytes(TEST_CODE_VA, FRAME_SIZE, Prot::READ | Prot::EXEC, &c.0).map_err(|_| "map code")?;
+        space
+            .map_eager_with_bytes(TEST_STACK_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[])
+            .map_err(|_| "map stack")?;
+        space.map_eager_with_bytes(TEST_DATA_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[]).map_err(|_| "map data")?;
+        let cpu = *sched::running_cpus().iter().rfind(|&&c| c != arch::cpu_index()).ok_or("no other CPU")?;
+        let (handle, slot) = spawn_ring3_on(
+            cpu,
+            "hook-spin",
+            space.clone(),
+            TEST_CODE_VA,
+            TEST_STACK_VA + FRAME_SIZE,
+            None,
+            ConsoleIo::Capture,
+            true,
+            Vec::new(),
+            None,
+        )?;
+        // Wait for registration (listing alone does not prove ring-3 entry),
+        // then raise. The program spins without syscalls until released.
+        let registered = sched::yield_until(|| !crate::linux::process::active_pids().is_empty());
+        crate::linux::signal::raise_for_test(handle.thread(), lumen_signal::Signal::USR1);
+        let cleared = sched::yield_until(|| !handle.thread().sigpending());
+        // End it whatever was seen (see `exe_path_reaches_the_process`).
+        let released =
+            crate::linux::process::with_process_user(&space, || copy_to_user(TEST_DATA_VA, &1u64.to_le_bytes()));
+        handle.join();
+        let exit = slot.lock().take().map(|r| r.exit);
+        kassert!(registered);
+        kassert!(cleared);
+        kassert!(released == Some(Ok(())));
+        kassert!(matches!(exit, Some(UserExit::Exited(0))));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn syscall_return_restarts_once_through_sysret() {
+        use crate::{kassert, kassert_eq};
+        RESTART_PROBE.reset();
+        let mut c = CodeBuf::new();
+        c.mov_eax(SYS_TEST_RESTART_ONCE as u32);
+        c.mov_edi(0);
+        c.bytes(&[0xff, 0xc7]); // inc edi: replaying more than syscall changes this
+        let syscall_rip = TEST_CODE_VA + c.0.len() as u64;
+        c.syscall();
+        // Both real sysretq returns must resume this same two-byte syscall
+        // exactly once. Check the marker and that inc edi ran only once.
+        c.bytes(&[0x35]); // xor eax, 0x1337
+        c.bytes(&0x1337u32.to_le_bytes());
+        c.bytes(&[0x83, 0xf7, 0x01]); // xor edi, 1
+        c.bytes(&[0x09, 0xf8]); // or eax, edi
+        c.bytes(&[0x89, 0xc7]); // mov edi, eax (exit 0 only on success)
+        c.mov_eax(general::__NR_exit_group);
+        c.syscall();
+        c.ud2();
+        let space = Arc::new(AddressSpace::new().map_err(|_| "out of frames")?);
+        space.map_eager_with_bytes(TEST_CODE_VA, FRAME_SIZE, Prot::READ | Prot::EXEC, &c.0).map_err(|_| "map code")?;
+        space
+            .map_eager_with_bytes(TEST_STACK_VA, FRAME_SIZE, Prot::READ | Prot::WRITE, &[])
+            .map_err(|_| "map stack")?;
+        let (handle, slot) = spawn_ring3_on(
+            arch::cpu_index(),
+            "restart-once",
+            space,
+            TEST_CODE_VA,
+            TEST_STACK_VA + FRAME_SIZE,
+            None,
+            ConsoleIo::Capture,
+            true,
+            Vec::new(),
+            None,
+        )?;
+        // Deleting the hook leaves its sigpending loop spinning. Bound the
+        // observation, then release that broken loop solely for cleanup.
+        let returned = sched::yield_until(|| slot.lock().is_some());
+        if !returned {
+            handle.thread().clear_sigpending_for_test();
+        }
+        handle.join();
+        let exit = slot.lock().take().map(|r| r.exit);
+        kassert!(returned);
+        kassert_eq!(
+            (RESTART_PROBE.return_rax.load(Ordering::SeqCst), RESTART_PROBE.return_rip.load(Ordering::SeqCst)),
+            (SYS_TEST_RESTART_ONCE, syscall_rip)
+        );
+        kassert_eq!(RESTART_PROBE.calls.load(Ordering::SeqCst), 2);
+        kassert_eq!(RESTART_PROBE.first_rip.load(Ordering::SeqCst), syscall_rip + 2);
+        kassert_eq!(RESTART_PROBE.second_rip.load(Ordering::SeqCst), syscall_rip + 2);
+        kassert!(RESTART_PROBE.cleared.load(Ordering::SeqCst));
+        kassert!(matches!(exit, Some(UserExit::Exited(0))));
         Ok(())
     }
 );

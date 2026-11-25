@@ -10,6 +10,7 @@ pub mod exec;
 mod init;
 pub mod modules;
 pub mod process;
+pub mod signal;
 pub mod syscall;
 
 pub use init::init;

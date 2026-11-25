@@ -7,6 +7,8 @@ behave the same:
 Binary checks (the built kernel ELFs):
   * ELF64 x86-64 executable, every allocated section in the top 2 GiB
     (0xffffffff80000000+), as the kernel code model requires.
+  * The exception fixup tables (`.lumen_fixup`, `.lumen_fixup_nofault`)
+    present, non-empty, and read-only data in the rodata segment.
   * Every allocated section inside [__kernel_start, __kernel_end): the
     kernel's page tables map exactly that range and the frame allocator
     reserves it, so a section the linker script doesn't place (an orphan,
@@ -168,16 +170,21 @@ def check_sections(readobj: str) -> list[Finding]:
 READ_ONLY_WRITABLE = {".got"}
 
 
+def nm_symbols(nm: str) -> dict[str, int]:
+    """Read defined symbol addresses from llvm-nm's default output."""
+    return {
+        name: int(addr, 16)
+        for addr, _, name in re.findall(r"^([0-9a-f]+) (\w) (\S+)$", nm, re.MULTILINE)
+    }
+
+
 def check_image_bounds(readobj: str, nm: str) -> list[Finding]:
     """Check every allocated section (`llvm-readobj --sections`) lies inside
     [__kernel_start, __kernel_end), and in the segment the page tables give
     the rights it needs: writable sections in [__data_start, __kernel_end),
     executable ones in [__kernel_start, __rodata_start) (symbols from
     `llvm-nm`)."""
-    symbols = {
-        name: int(addr, 16)
-        for addr, _, name in re.findall(r"^([0-9a-f]+) (\w) (\S+)$", nm, re.MULTILINE)
-    }
+    symbols = nm_symbols(nm)
     names = ("__kernel_start", "__rodata_start", "__data_start", "__kernel_end")
     missing = [n for n in names if n not in symbols]
     if missing:
@@ -216,6 +223,47 @@ def check_image_bounds(readobj: str, nm: str) -> list[Finding]:
                     "image",
                     f"section {s.name} [{lo:#x}, {hi:#x}) belongs in the {segment} segment "
                     f"[{lo_ok:#x}, {hi_ok:#x}), which gives it the rights it needs",
+                )
+            )
+    return findings
+
+
+# The exception fixup tables (`kernel/linker.ld`): `.lumen_fixup` for the
+# user copies, `.lumen_fixup_nofault` for the non-faulting accesses (B2). The
+# `#PF` handler redirects `rip` through them, so each must exist, hold
+# entries, and be mapped read-only: in the rodata segment, neither writable
+# nor executable (docs/ARCHITECTURE.md section 6, steps 3 and 6).
+FIXUP_SECTIONS = (".lumen_fixup", ".lumen_fixup_nofault")
+
+
+def check_fixup_sections(readobj: str, nm: str) -> list[Finding]:
+    """Check each of `FIXUP_SECTIONS` (`llvm-readobj --sections`) is present,
+    non-empty, neither writable nor executable, and inside
+    [__rodata_start, __data_start) (symbols from `llvm-nm`)."""
+    symbols = nm_symbols(nm)
+    if "__rodata_start" not in symbols or "__data_start" not in symbols:
+        return [Finding("fixup", "__rodata_start or __data_start missing from the symbol table")]
+    rodata, data = symbols["__rodata_start"], symbols["__data_start"]
+    by_name = {s.name: s for s in alloc_sections(readobj)[0]}
+    findings: list[Finding] = []
+    for name in FIXUP_SECTIONS:
+        s = by_name.get(name)
+        if s is None:
+            findings.append(Finding("fixup", f"no allocated {name} section"))
+            continue
+        if not s.size:
+            findings.append(Finding("fixup", f"{name} is empty"))
+            continue
+        if s.flags & {"SHF_WRITE", "SHF_EXECINSTR"}:
+            findings.append(
+                Finding("fixup", f"{name} is writable or executable: {sorted(s.flags)}")
+            )
+        if not (rodata <= s.addr and s.addr + s.size <= data):
+            findings.append(
+                Finding(
+                    "fixup",
+                    f"{name} [{s.addr:#x}, {s.addr + s.size:#x}) is outside the rodata segment "
+                    f"[{rodata:#x}, {data:#x})",
                 )
             )
     return findings
@@ -277,7 +325,12 @@ def run_audit(kernels: list[Path]) -> int:
             [objdump, "-d", "--no-show-raw-insn", "--x86-asm-syntax=att", str(k)], text=True
         )
         syms = subprocess.check_output([nm, str(k)], text=True)
-        found = check_sections(hdr) + check_image_bounds(hdr, syms) + scan_disassembly(dis)
+        found = (
+            check_sections(hdr)
+            + check_image_bounds(hdr, syms)
+            + check_fixup_sections(hdr, syms)
+            + scan_disassembly(dis)
+        )
         n_insns = sum(1 for line in dis.splitlines() if INSN.match(line))
         status = "ok" if not found else f"{len(found)} finding(s)"
         print(f"audit: {k}: {n_insns} instructions scanned, {status}")

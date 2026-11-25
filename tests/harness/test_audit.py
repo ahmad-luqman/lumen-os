@@ -1,6 +1,12 @@
 """The flag audit must actually catch the problems it claims to catch."""
 
-from lumen_harness.audit import check_image_bounds, check_ir, check_sections, scan_disassembly
+from lumen_harness.audit import (
+    check_fixup_sections,
+    check_image_bounds,
+    check_ir,
+    check_sections,
+    scan_disassembly,
+)
 
 CLEAN = """
 ffffffff80001000 <lumen_kernel::kmain>:
@@ -279,6 +285,42 @@ def test_unparseable_readobj_fails():
     ]
     garbled = IMAGE_READOBJ.replace("Address: 0xFFFFFFFF80001000", "Address: ???")
     assert "elf" in [f.check for f in check_sections(garbled)]
+
+
+PLAIN_FIXUP = section(".lumen_fixup", 0xFFFFFFFF80001400, 64, "")
+NOFAULT_FIXUP = section(".lumen_fixup_nofault", 0xFFFFFFFF80001440, 32, "")
+
+
+def test_nofault_fixup_section_is_read_only_and_in_rodata():
+    # Both fixup tables in the rodata segment, read-only: clean, and inside
+    # the image as the bounds check sees it.
+    image = IMAGE_READOBJ + PLAIN_FIXUP + NOFAULT_FIXUP
+    assert check_fixup_sections(image, IMAGE_NM) == []
+    assert check_image_bounds(image, IMAGE_NM) == []
+    # The kernel as built before B2 (no nofault table): the #PF handler
+    # would have nothing to look up.
+    found = check_fixup_sections(IMAGE_READOBJ + PLAIN_FIXUP, IMAGE_NM)
+    assert [f.check for f in found] == ["fixup"] and ".lumen_fixup_nofault" in found[0].detail
+    nofault = ".lumen_fixup_nofault"
+    bad = {
+        # Writable (the linker's "aw"): a stray store could redirect a fault.
+        "writable": section(nofault, 0xFFFFFFFF80001440, 32, "SHF_WRITE"),
+        "executable": section(nofault, 0xFFFFFFFF80001440, 32, "SHF_EXECINSTR"),
+        # In the data segment, or in the text one: mapped writable or executable.
+        "in data": section(nofault, 0xFFFFFFFF80002800, 32, ""),
+        "in text": section(nofault, 0xFFFFFFFF80000800, 32, ""),
+        "straddling": section(nofault, 0xFFFFFFFF80001FF0, 32, ""),
+        # Empty: no access registered (KEEP lost, or the routines gone).
+        "empty": section(nofault, 0xFFFFFFFF80001440, 0, ""),
+    }
+    for why, nofault_section in bad.items():
+        found = check_fixup_sections(IMAGE_READOBJ + PLAIN_FIXUP + nofault_section, IMAGE_NM)
+        assert [f.check for f in found] == ["fixup"], why
+        assert nofault in found[0].detail, why
+    # The user copies' table is checked the same way.
+    misplaced = section(".lumen_fixup", 0xFFFFFFFF80002800, 64, "")
+    found = check_fixup_sections(IMAGE_READOBJ + misplaced + NOFAULT_FIXUP, IMAGE_NM)
+    assert [f.check for f in found] == ["fixup"] and nofault not in found[0].detail
 
 
 IR_OK = """

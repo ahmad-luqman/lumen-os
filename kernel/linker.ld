@@ -50,6 +50,15 @@ SECTIONS
         __lumen_fixup_end = .;
     } :rodata
 
+    /* The same for the non-faulting user accesses (read_u32_nofault,
+     * cmpxchg_u32), which may run with a spinlock held: the #PF handler
+     * answers a fault here at once, paging nothing in. */
+    .lumen_fixup_nofault : ALIGN(8) {
+        __lumen_fixup_nofault_start = .;
+        KEEP(*(.lumen_fixup_nofault))
+        __lumen_fixup_nofault_end = .;
+    } :rodata
+
     /* Precompiled compiler_builtins calls `memcpy` and friends through the
      * GOT. With static relocation its entries are link-time constants, so it
      * is read-only data. Without this rule the linker placed it after

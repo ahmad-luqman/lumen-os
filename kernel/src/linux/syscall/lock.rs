@@ -11,8 +11,9 @@
 //! displacement giving locks up (`process::release_fd`). `F_SETLKW` refuses
 //! a wait that would close a cycle of waiting processes (`EDEADLK`, from
 //! lumen-vfs's `PosixWaitGraph` in `POSIX_WAITERS`); a blocking `flock`
-//! gives up the lock its description holds before it waits, as Linux. No
-//! signal ends a wait (M7 delivers none, so no `EINTR`).
+//! gives up the lock its description holds before it waits, as Linux. A
+//! wait is interruptible (B2): a pending signal ends it with
+//! `-ERESTARTSYS`, which the syscall-exit hook resolves.
 
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,7 @@ use super::fd::vfs;
 use super::finish;
 use crate::linux::process::{self, FileRef, current_process};
 use crate::linux::{errno, general};
+use crate::sched::Wake;
 use crate::sync::SpinLock;
 use crate::user::{copy_from_user, copy_to_user};
 use lumen_vfs::locks::{MAX_DEADLOCK_CHAIN, fcntl_const};
@@ -126,7 +128,8 @@ enum Step<H> {
 /// before each wait and may refuse it (`EDEADLK`). The release count
 /// (`seen`) is read before each try, so a release between a try and the
 /// wait ends the wait at once. A try that released something wakes the
-/// waiters, which retry (and wait again if they still conflict).
+/// waiters, which retry (and wait again if they still conflict). A signal
+/// ending a wait returns `-ERESTARTSYS` with nothing taken.
 fn lock_or_wait<H: Copy>(
     file: &FileRef,
     mut attempt: impl FnMut(&mut AdvisoryLocks) -> Result<Step<H>, VfsError>,
@@ -147,7 +150,11 @@ fn lock_or_wait<H: Copy>(
             Step::Done { .. } => return Ok(()),
             Step::Wait { holder, .. } => {
                 before_wait(holder, seen)?;
-                process::wait_for_lock_release(seen);
+                match process::wait_for_lock_release(seen) {
+                    Wake::Woken => {}
+                    Wake::Interrupted => return Err(crate::linux::signal::ERESTARTSYS),
+                    Wake::TimedOut => unreachable!("a lock wait has no deadline"),
+                }
             }
         }
     }
@@ -185,7 +192,7 @@ static WARNED_TRUNCATED: AtomicBool = AtomicBool::new(false);
 /// wait is decided (not before: an `EDEADLK` isn't a wait), the first time
 /// and whenever the holder changes; `EDEADLK` at debug too; and a warning,
 /// once a boot, when the cycle search was cut off (a longer cycle would
-/// hang every process in it, with no signal to end it).
+/// hang every process in it until a signal ends it).
 fn log_wait_decision(
     waiter: Waiter,
     file: &FileRef,
@@ -1467,6 +1474,78 @@ crate::ktest!(
                 Ok(())
             },
         );
+        ktest_unlink_after(PATH, ret)
+    }
+);
+
+crate::ktest!(
+    fn setlkw_is_interrupted_by_a_signal() {
+        // A holds a write lock and an exclusive flock. B blocks in F_SETLKW,
+        // then in a blocking flock; a signal raised on B's thread (B2's
+        // `raise_for_test`, before C5 delivers anything) ends each wait:
+        // `-ERESTARTSYS` (the syscall-exit hook's to resolve), B no longer
+        // counted as waiting, nothing taken (A still holds both).
+        use crate::linux::signal::{ERESTARTSYS, raise_for_test};
+        use lumen_signal::Signal;
+        const PATH: &[u8] = b"/tmp/lock-ktest-setlkw-signal";
+        static B_THREAD: SpinLock<Option<Arc<sched::Thread>>> = SpinLock::new(None);
+        let (set, setw, wr) = (general::F_SETLK, general::F_SETLKW, general::F_WRLCK);
+        let (ex, nb) = (general::LOCK_EX, general::LOCK_NB);
+        let seek_set = general::SEEK_SET;
+        let interrupted = neg_errno(ERESTARTSYS);
+        // Raise on B once it is blocked, and wait (bounded) for its call to
+        // come back as step `next`: if the signal didn't end the wait, A
+        // fails and ends, its exit giving its locks up so B's call returns
+        // (0, failing B too).
+        let raise_on_b = |baton: &Baton, next: u32| -> TestResult {
+            baton.wait_for_b_blocked();
+            let b = B_THREAD.lock().clone().ok_or("B's thread wasn't published")?;
+            raise_for_test(&b, Signal::USR1);
+            let deadline = crate::time::now_ns() + 10_000_000_000;
+            while baton.step.load(Ordering::SeqCst) < next && !baton.b_ended.load(Ordering::SeqCst) {
+                if crate::time::now_ns() > deadline {
+                    return Err("the signal didn't end B's wait");
+                }
+                crate::time::sleep(1_000_000);
+            }
+            Ok(())
+        };
+        let ret = two_processes(
+            move |baton| {
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+                crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 0)?, 0);
+                crate::kassert_eq!(sys_flock(fd, ex), 0);
+                baton.go(1);
+                baton.wait_for(2, &baton.b_ended)?;
+                raise_on_b(baton, 3)?;
+                raise_on_b(baton, 4)?;
+                Ok(())
+            },
+            move |baton| {
+                baton.wait_for(1, &baton.a_ended)?;
+                let me = sched::current().ok_or("a thread")?;
+                *B_THREAD.lock() = Some(me.clone());
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
+                baton.go(2);
+                let setlkw = ktest_lk(fd, setw, wr, seek_set, 0, 10)?;
+                let pending = me.sigpending();
+                sched::clear_current_sigpending();
+                let waiting = process::lock_waiters();
+                baton.go(3);
+                let flock = sys_flock(fd, ex);
+                sched::clear_current_sigpending();
+                baton.go(4);
+                crate::kassert_eq!(setlkw, interrupted);
+                crate::kassert!(pending);
+                crate::kassert_eq!(waiting, 0);
+                crate::kassert_eq!(flock, interrupted);
+                // Nothing taken: A still holds both.
+                crate::kassert_eq!(ktest_lk(fd, set, wr, seek_set, 0, 10)?, neg_errno(errno::EAGAIN));
+                crate::kassert_eq!(sys_flock(fd, ex | nb), neg_errno(errno::EWOULDBLOCK));
+                Ok(())
+            },
+        );
+        *B_THREAD.lock() = None;
         ktest_unlink_after(PATH, ret)
     }
 );

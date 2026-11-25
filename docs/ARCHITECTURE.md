@@ -1786,11 +1786,13 @@ weakening crash reporting or `make audit`.
        4-byte-aligned load;
      - `user::cmpxchg_u32(addr, expected, new) -> Result<u32, Fault>`: a
        `lock cmpxchg` on user memory, returning the value it found;
-     - `user::fault_in_writable(addr) -> Result<(), Fault>`: resolves a
+     - `user::fault_in_writable(addr) -> Result<(), FaultIn>`: resolves a
        write fault at `addr` under Lock 1, as a store there would (demand
        paging, copy-on-write, dirty promotion), and stores nothing, as
        Linux's `fault_in_user_writeable` does (`fixup_user_fault` with
-       `FAULT_FLAG_WRITE`); called with no lock held.
+       `FAULT_FLAG_WRITE`); called with no lock held. `FaultIn::Fault`
+       covers invalid/unwritable pages; `FaultIn::OutOfMemory` is logged
+       and lets callers return `ENOMEM`.
 
      The first two may run with a `SpinLock` held (a futex bucket) and never
      fault a page in. They check the range as step 2 does, and register
@@ -1799,18 +1801,20 @@ weakening crash reporting or `make audit`.
      extends `audit:flags`'s section check to it,
      `harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata`).
      The `#PF` handler looks a ring-0 fault's `rip` up there at its first
-     step, with `CR2` read and interrupts still off, before the step-2
-     assertion (`irq::depth() == 0`, which a caller holding a bucket lock
+     step, only for `CR2` in the user range, with interrupts still off,
+     before the step-2 assertion (`irq::depth() == 0`, which a caller holding a bucket lock
      fails), and before it enables interrupts or takes Lock 1: it sets
      `rip` to the fixup (clearing `AC` as step 4 does) and returns, so the
      call answers `Err(Fault)` (Linux's `pagefault_disable` around
      `get_user`/`futex_atomic_cmpxchg_inatomic`). A kernel address is
-     `Err(Fault)` from the range check. A caller that gets `Fault` releases
-     its locks, faults the page in (`copy_from_user` to read it,
-     `fault_in_writable` to write it) and retries. Tested by
+     `Err(Fault)` from the range check. Callers first refuse bad or
+     misaligned addresses with their ABI's `EFAULT`/`EINVAL`; only page
+     state is retried after releasing locks and faulting the page in
+     (`copy_from_user` to read it, `fault_in_writable` to write it). Tested by
      `ktest:lumen_kernel::user::nofault_access_answers_fault_without_paging_in`
-     (an unmapped, a not-yet-faulted and a read-only page, each under a
-     held `SpinLock`: `Fault`, nothing mapped; then a mapped page's read
+     (unmapped and not-yet-faulted pages: `Fault` for both accesses;
+     read-only and copy-on-write pages: `Fault` for the exchange only,
+     each under a held `SpinLock`, nothing mapped; then a mapped page's read
      and exchange; `fault_in_writable` on a not-yet-faulted and a
      copy-on-write page, after which the exchange succeeds and the word
      is unchanged by the fault-in).
@@ -1854,7 +1858,8 @@ the syscalls.
   wait and clears it after: musl's `SIGEV_THREAD` helper waits so for a
   signal it leaves at `SIG_DFL`.
 - **Where pending signals are checked:** in the syscall-exit hook B2 adds
-  (section 8), run on every return to ring 3 with interrupts on: at the
+  (section 8), run on returns to ring 3 with interrupts on, excluding
+  `IST_VECTORS` (debug, NMI, double fault and machine check): at the
   end of each syscall (`SyscallExit::new(orig_rax)` as the syscall
   context), and when `lumen_isr_common` returns to ring 3 from an
   interrupt or exception (context `None`), the timer's preemption
@@ -4406,7 +4411,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 
 | # | Syscall | M8 behaviour | Issue |
 |---|---|---|---|
-| 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block), as Linux's `poll` | B3 |
+| 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block, stored and returned through `Err(linux::signal::interrupted_with(block))`), as Linux's `poll` | B3 |
 | 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | M6's checks, now delivering: `sig` outside 1..=64 `-EINVAL`; unknown `sa_flags` bits are cleared before storing (and in `oldact`), as Linux's `do_sigaction` does; `SIG_IGN`, or `SIG_DFL` on a default-ignored signal, discards that signal's pending entries (`PendingSignals::disposition_changed`); `SA_RESTORER` is needed to deliver a handler (`frame::build`'s `MissingRestorer` forces `SIGSEGV`; musl always sets it); `SA_NOCLDWAIT` or `SIG_IGN` on `SIGCHLD` makes `ProcTree::exit` reap the children (`autoreap`) | C5 |
 | 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | `Blocked::apply` (a bad `how` `-EINVAL`); `sigsetsize != 8` `-EINVAL`; unblocking a pending signal sets `sigpending`, so it is delivered before the call returns | C5 |
 | 15 | `rt_sigreturn()` | section 6, "Signals"; returns the restored `rax`; a frame `restore` refuses forces `SIGSEGV` | C5 |
@@ -5266,16 +5271,17 @@ pub fn kick(thread: &Thread);             // after its `sigpending` (and `fatal_
 - **Uninterruptible waits stay** for kernel-internal waits that must
   finish: page-cache and block-device I/O, `run_sized`, `join`, lock
   waits inside the kernel (Linux's `TASK_UNINTERRUPTIBLE`).
-- **What B2 converts:** a console read (serial and VT), the serial input
-  queue's wait, `F_SETLKW` and blocking `flock`
+- **What B2 converts:** `F_SETLKW` and blocking `flock`
   (`process::wait_for_lock_release`: `Interrupted` is `-ERESTARTSYS`, as
-  Linux's `locks_lock_inode_wait`) and M6's console `poll`. Each later
-  issue uses it for its own waits; the syscall table names each one's
-  restart code.
+  Linux's `locks_lock_inode_wait`). Console reads (serial and VT) and the
+  serial input queue's wait move to C10 (#389); the console `poll` moves
+  to B3 (#374). Each later issue uses the wait for its own calls; the
+  syscall table names each one's restart code.
 - **The syscall-exit hook (B2).** Restart codes (`-ERESTARTSYS`,
   `-ERESTARTNOINTR`, `-ERESTARTNOHAND`, `-ERESTART_RESTARTBLOCK`) are a
   handler's result for an interrupted wait, and none reaches user space.
-  B2 adds the hook every return to ring 3 runs (section 6, "Signals"): it
+  B2 adds the hook for syscall and non-IST interrupt returns to ring 3
+  (section 6, "Signals"): it
   resolves a restart code with no handler to deliver
   (`lumen_signal::restart::decide` with `Handling::None`: a restart, `rax`
   = the original number and `rip` back 2 bytes, or `restart_syscall`
@@ -5292,21 +5298,28 @@ pub fn kick(thread: &Thread);             // after its `sigpending` (and `fatal_
   `ktest:lumen_kernel::sched::wait_interruptible_answers_woken_timed_out_and_interrupted`
   (each answer; a deadline answer is a floor, never early),
   `ktest:lumen_kernel::sched::kick_racing_a_block_is_never_lost` (a
-  ktest-only delay knob, `sched::BLOCK_DELAY`, stalls the waiter between
-  setting `Blocked` and reading `sigpending` while another CPU kicks; it
-  kills the mutant that reads `sigpending` before setting `Blocked`),
+  ktest-only delay knob, `sched::BLOCK_DELAY`, stalls before `Blocked`
+  to check the waiter's pending read, after `Blocked` before the read
+  (either side can end it), and after the read was false (only kick can
+  queue it). Both blocked stalls assert `Ready` immediately after kick,
+  before release. Timed-out stalls are retried, up to five attempts),
   `ktest:lumen_kernel::sched::fatal_kick_racing_a_killable_block_is_never_lost`
-  (the same knob, a `wait_killable` and a kick after `fatal_pending` with
-  no `group_exit`, as `de_thread` gives: it kills the mutant that reads
-  `fatal_pending` before setting `Blocked` and the one whose `kick`
-  judges a signal fatal by `group_exit` alone),
+  (the same three stalls with `fatal_pending`, no `group_exit`, as
+  `de_thread` gives; the after-read state assertion detects a late
+  `wait_kind` store or a disabled killable kick),
   `ktest:lumen_kernel::sched::wait_killable_ignores_a_non_fatal_kick`,
   `ktest:lumen_kernel::linux::syscall::lock::setlkw_is_interrupted_by_a_signal`
   and `ktest:lumen_kernel::linux::syscall::restart_with_no_handler_restarts_or_resumes`
   (each restart code with `raise_for_test` and an ignored signal: a
   restart, `rax == 219` after the hook with the restart block's deadline
   unchanged and `restart_syscall` then resuming it, `EINTR` with no
-  restart block).
+  restart block),
+  `ktest:lumen_kernel::user::syscall_return_restarts_once_through_sysret`
+  (a real ring-3 syscall returns `-ERESTARTNOINTR`, restarts at the same
+  two-byte instruction with its original number, and returns a marker;
+  the second call sees `sigpending` cleared), and
+  `ktest:lumen_kernel::sched::interrupt_return_to_kernel_keeps_sigpending`
+  (at least three ticks returning to a kernel thread keep its flag).
 
 #### `futex` (C4)
 
@@ -5349,7 +5362,9 @@ user access":
   `CLOCK_REALTIME` (converted to a monotonic deadline when the wait
   starts; a later clock change doesn't move it, a deviation). A signal:
   `-ERESTARTSYS` without a timeout, `-ERESTART_RESTARTBLOCK` with one (the
-  restart block holds the deadline), as Linux's `futex_wait`.
+  restart block holds the deadline), as Linux's `futex_wait`. The handler
+  stores that block and returns its errno through
+  `Err(linux::signal::interrupted_with(block))`; `syscall::finish` negates it.
 - **Keys** (`FutexKey`, `Ord + Copy` as lumen-futex asks):
   `Private { space, uaddr }` for any op with `FUTEX_PRIVATE_FLAG`, where
   `space` is the `AddressSpace`'s L4 root frame (unique while it lives);
@@ -8189,8 +8204,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     wakes every waiter (`process::locks_released`), after Lock 4 is
     released. `released` and the release functions are `#[must_use]`, and
     `VfsInode::with_locks_mut` is `Err` only when its closure didn't run,
-    so no release is dropped on the way. No signal ends a wait (no `EINTR` until signals are
-    delivered).
+    so no release is dropped on the way. B2 makes these waits interruptible:
+    a pending signal ends the wait with `-ERESTARTSYS`, which the
+    syscall-exit hook resolves before returning to user space.
   - **`EDEADLK` (`PosixWaitGraph`, host-tested):** before it waits,
     `F_SETLKW` records that its thread `(tgid, tid)` waits for `holder`,
     stamped with the release count it read before its try, in the kernel's
@@ -10593,8 +10609,9 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   cache leaves and private copies at or past EOF, including nonzero file
   offsets, while sharing private copies below EOF and splitting on writes.
 - `ktest:lumen_kernel::user::nofault_access_answers_fault_without_paging_in`
-  (B2): an unmapped, a not-yet-faulted and a read-only page, each under a
-  held `SpinLock`: `Fault`, nothing mapped; a mapped page's read and
+  (B2): unmapped and not-yet-faulted pages return `Fault` for both accesses;
+  read-only and copy-on-write pages return `Fault` for the exchange only,
+  each under a held `SpinLock`, nothing mapped; a mapped page's read and
   exchange; `fault_in_writable` on a not-yet-faulted page and on a
   copy-on-write page leaves the leaf writable with its Dirty bit still
   clear (nothing stored), and, with an incrementer on another CPU racing
