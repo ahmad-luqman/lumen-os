@@ -19,8 +19,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use lumen_vfs::pseudo::fill_readdir;
 use lumen_vfs::{
-    AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, SetTime, Timespec, VfsError, VfsInode,
-    mode_after_chown, next_lock_id,
+    AccessMode, AdvisoryLocks, DevId, DirEntry, FileSystem, Ino, InodeType, Metadata, PollGuard, PollMask, PollWaker,
+    Pollable, SetTime, Timespec, VfsError, VfsInode, mode_after_chown, next_lock_id,
 };
 
 use crate::klog;
@@ -368,6 +368,47 @@ impl VfsInode for DevfsInode {
         let mut locks = self.locks.lock();
         f(&mut locks);
         Ok(())
+    }
+
+    fn pollable(&self) -> Option<&dyn Pollable> {
+        match self.kind {
+            DevKind::Console | DevKind::Tty => Some(self),
+            _ => None,
+        }
+    }
+}
+
+impl Pollable for DevfsInode {
+    fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>) -> (PollMask, Option<PollGuard>) {
+        // Match `read_at`/`write_at` when called outside a registered Linux
+        // process: `/dev/console` falls back to non-blocking EOF / `klog`
+        // (same readiness as `Capture`), while `/dev/tty` has no controlling
+        // console (`ENODEV`) and reports `POLLERR`.
+        let io = match self.kind {
+            DevKind::Console => process::try_current_io().unwrap_or(process::ConsoleIo::Capture),
+            DevKind::Tty => match process::try_current_io() {
+                Some(io) => io,
+                None => return (PollMask::ERR, None),
+            },
+            _ => return (PollMask::ALWAYS_READY, None),
+        };
+        let readable = mode.can_read();
+        let writable = mode.can_write();
+        // Subscribe before reading readiness so an IRQ 4 arrival between
+        // reading `stdin_ready` and the caller's wait still wakes the caller.
+        let guard = if readable && matches!(io, process::ConsoleIo::Serial) {
+            waker.map(|w| crate::serial_in::subscribe_poll(Arc::clone(w)))
+        } else {
+            None
+        };
+        let mut mask = PollMask::EMPTY;
+        if writable {
+            mask |= PollMask::OUT | PollMask::WRNORM;
+        }
+        if readable && process::stdin_ready(io) {
+            mask |= PollMask::IN | PollMask::RDNORM;
+        }
+        (mask, guard)
     }
 }
 

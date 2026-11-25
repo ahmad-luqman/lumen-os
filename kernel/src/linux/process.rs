@@ -1678,24 +1678,6 @@ pub fn stdin_ready(io: ConsoleIo) -> bool {
     }
 }
 
-/// Block briefly waiting for stdin input up to optional monotonic `deadline` (ns).
-/// Must be called with interrupts on and no `SpinLock` held.
-pub fn wait_stdin_step(io: ConsoleIo, deadline: Option<u64>) {
-    match io {
-        ConsoleIo::Serial => serial_in::wait_until(deadline),
-        ConsoleIo::Vt(_) => {
-            let slice = match deadline {
-                Some(dl) => dl.saturating_sub(crate::time::now_ns()).min(5_000_000),
-                None => 5_000_000,
-            };
-            if slice > 0 {
-                let _ = crate::sched::sleep(slice);
-            }
-        }
-        ConsoleIo::Capture => {}
-    }
-}
-
 /// Read up to `dst.len()` bytes from the process's console stdin, blocking until
 /// at least 1 byte arrives (or returning `0` on EOF).
 ///
@@ -2324,6 +2306,10 @@ pub(crate) struct KtestThread<R> {
 
 #[cfg(feature = "ktest")]
 impl<R> KtestThread<R> {
+    pub(crate) fn thread(&self) -> &sched::Thread {
+        self.handle.thread()
+    }
+
     pub(crate) fn finished(&self) -> bool {
         self.handle.is_finished()
     }

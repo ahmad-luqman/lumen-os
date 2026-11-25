@@ -259,9 +259,9 @@ pub static COMMANDS: Table<Run> = Table(&[
     },
     Command {
         name: "serial",
-        args: &[],
-        usage: "",
-        about: "how COM1's input comes (by IRQ 4 or polled), and how the serial shell's waits for it ended",
+        args: &[&["poll"]],
+        usage: "[poll]",
+        about: "how COM1's input comes (by IRQ 4 or polled), and how the serial shell's waits ended (poll: poll/select safety-step hits, wakes, subscribers)",
         run: crate::serial_in::serial_command,
     },
     Command {

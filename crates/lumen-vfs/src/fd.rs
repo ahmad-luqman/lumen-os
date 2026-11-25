@@ -32,12 +32,14 @@ pub trait VfsLock<T> {
 }
 
 /// A family of [`VfsLock`]s, one lock type for any `T`: what
-/// [`VfsTables`](crate::VfsTables) is generic over (#264). The kernel's is
-/// `vfs::KernelLocks` (`SleepMutex`); the host tests' is `TestLocks`, a
-/// `std` mutex recording which Lock-9 tables a thread holds and aborting
-/// the test binary on an out-of-order or repeated take.
+/// [`VfsTables`](crate::VfsTables) and [`PollHead`](crate::PollHead) are
+/// generic over (#264, #374). `Lock` is the sleeping mutex for Lock-9 tables
+/// (the kernel's `SleepMutex`; the host tests' `TestLock`). `LeafLock` is the
+/// level-10e spin lock for `PollHead`'s subscriber list (the kernel's
+/// `SpinLock`; the host tests' `std` mutex).
 pub trait LockFamily {
     type Lock<T>: VfsLock<T>;
+    type LeafLock<T: Send>: VfsLock<T> + Send + Sync;
 }
 
 /// Zero-`unsafe` single-threaded `VfsLock` backed by `core::cell::RefCell`.
@@ -214,12 +216,12 @@ impl<L: VfsLock<u64>> OpenFile<L> {
 
     /// True if readable (`O_RDONLY` or `O_RDWR`, and not `O_PATH`).
     pub fn is_readable(&self) -> bool {
-        !self.is_path && matches!(self.access_mode, AccessMode::ReadOnly | AccessMode::ReadWrite)
+        !self.is_path && self.access_mode.can_read()
     }
 
     /// True if writable (`O_WRONLY` or `O_RDWR`, and not `O_PATH`).
     pub fn is_writable(&self) -> bool {
-        !self.is_path && matches!(self.access_mode, AccessMode::WriteOnly | AccessMode::ReadWrite)
+        !self.is_path && self.access_mode.can_write()
     }
 
     /// Return `Ok(())` if readable, else `Err(BadF)`.

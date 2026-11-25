@@ -269,6 +269,16 @@ impl AccessMode {
             Self::ReadWrite => OpenFlags::O_RDWR,
         }
     }
+
+    /// True if this access mode allows reading (`O_RDONLY` or `O_RDWR`).
+    pub const fn can_read(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    /// True if this access mode allows writing (`O_WRONLY` or `O_RDWR`).
+    pub const fn can_write(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
 }
 
 /// Linux x86-64 `open` / `openat` flags.

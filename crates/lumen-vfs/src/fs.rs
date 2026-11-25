@@ -6,6 +6,7 @@ use core::fmt;
 
 use crate::error::VfsError;
 use crate::locks::AdvisoryLocks;
+use crate::poll::Pollable;
 use crate::types::{DevId, DirEntry, Ino, InodeType, Metadata, RenameFlags, SetTime};
 
 /// Mounted filesystem interface (`ext4`, `tmpfs`, `devfs`, `procfs`).
@@ -248,6 +249,14 @@ pub trait VfsInode: Send + Sync {
     /// once `f` has run, its changes stand and the call is `Ok`, so a caller
     /// never loses a release `f` made (and must wake waiters for).
     fn with_locks_mut(&self, f: &mut dyn FnMut(&mut AdvisoryLocks)) -> Result<(), VfsError>;
+
+    /// Readiness source for `poll`/`ppoll`/`select`/`pselect6` (and M9's
+    /// `epoll`). `None` (the default) means always ready
+    /// ([`PollMask::ALWAYS_READY`](crate::PollMask::ALWAYS_READY): regular
+    /// files, directories, procfs and always-ready devices).
+    fn pollable(&self) -> Option<&dyn Pollable> {
+        None
+    }
 
     /// The concrete inode, which this crate's types can't name: the
     /// kernel's `vfs::mmap_page` and `page_cache_lock` downcast to the
