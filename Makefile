@@ -89,6 +89,30 @@ $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs: $(BUILD)/linux/%: tools/linux-m7/%
 
 $(BUILD)/linux/m7_test: $(BUILD)/linux/libm7.so
 
+# M8's dynamic musl test programs (#371; ARCHITECTURE section 15, "M8's
+# tests"), built as the M7 ones are; each `mod common;`s tools/linux-m8/common.rs.
+M8_LINUX := m8_proc m8_io m8_vm ptyrun
+M8_LINUX_OUT := $(addprefix $(BUILD)/linux/,$(M8_LINUX))
+$(M8_LINUX_OUT): $(BUILD)/linux/%: tools/linux-m8/%.rs tools/linux-m8/common.rs $(BUILD)/deps/alpine-minirootfs/.version rust-toolchain.toml
+	@mkdir -p $(BUILD)/linux
+	SYSROOT=$$(rustc --print sysroot) && HOST=$$(rustc --print host-tuple) && \
+	MUSL_SC="$$SYSROOT/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained" && \
+	rustc --edition 2024 -O --target x86_64-unknown-linux-musl \
+		-C panic=abort \
+		-C strip=symbols \
+		-C target-feature=-crt-static \
+		-C linker="$$SYSROOT/lib/rustlib/$$HOST/bin/rust-lld" \
+		-C linker-flavor=ld.lld \
+		-C link-self-contained=no \
+		-C default-linker-libraries=no \
+		-C link-arg="$$MUSL_SC/Scrt1.o" \
+		-C link-arg="$$MUSL_SC/crti.o" \
+		-C link-arg="$$MUSL_SC/crtn.o" \
+		-C link-arg="$(BUILD)/deps/alpine-minirootfs/lib/ld-musl-x86_64.so.1" \
+		-C link-arg=--dynamic-linker=/lib/ld-musl-x86_64.so.1 \
+		$< -o $@
+	PYTHONPATH=tools/harness uv run --frozen python -m lumen_harness.rootfs $@ --rootfs-dir $(BUILD)/deps/alpine-minirootfs
+
 # Two kernels: the normal one (the shells) and the in-kernel test build.
 # `| apps`: built first (order-only: the kernel rebuilds when cargo says).
 $(BUILD)/lumen-kernel: $(KERNEL_SRCS) | apps
@@ -99,7 +123,7 @@ $(BUILD)/lumen-kernel-ktest: $(KERNEL_SRCS) | apps
 	$(CARGO_KERNEL) --features ktest
 	@mkdir -p $(BUILD) && cp $(KERNEL_OUT) $@
 
-build: apps $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps, Linux test binaries, and both kernels
+build: apps $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(M8_LINUX_OUT) $(BUILD)/lumen-kernel $(BUILD)/lumen-kernel-ktest ## Build the apps, Linux test binaries, and both kernels
 
 # Apps (M5; the layout: ARCHITECTURE section 8, "Building and bundling"):
 # apps/ is its own workspace, and its crates that build a `cdylib` are WASM
@@ -145,7 +169,7 @@ $(BUILD)/lumen-ktest.iso: $(BUILD)/lumen-kernel-ktest $(ISO_DEPS)
 
 iso: $(BUILD)/lumen.iso $(BUILD)/lumen-qemutest.iso $(BUILD)/lumen-ktest.iso ## Build all bootable ISOs
 
-$(BUILD)/alpine-rootfs.ext4: tools/mkrootfs.sh tools/ext4-signed-hash.sh $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so
+$(BUILD)/alpine-rootfs.ext4: tools/mkrootfs.sh tools/ext4-signed-hash.sh $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(M8_LINUX_OUT)
 	tools/mkrootfs.sh $@
 
 rootfs: $(BUILD)/alpine-rootfs.ext4 ## Build deterministic Alpine minirootfs ext4 image
@@ -202,13 +226,13 @@ lint: ## clippy on host crates (incl. their tests), the kernel and the apps; ruf
 fmt: ## Format Rust and Python
 	cargo fmt --all
 	cd apps && cargo fmt --all
-	rustfmt --edition 2024 tools/linux-hello/hello.rs tools/linux-m7/*.rs
+	rustfmt --edition 2024 tools/linux-hello/hello.rs tools/linux-m7/*.rs tools/linux-m8/*.rs
 	uv run --frozen ruff format tools tests
 
 fmt-check: ## Check formatting
 	cargo fmt --all -- --check
 	cd apps && cargo fmt --all -- --check
-	rustfmt --edition 2024 --check tools/linux-hello/hello.rs tools/linux-m7/*.rs
+	rustfmt --edition 2024 --check tools/linux-hello/hello.rs tools/linux-m7/*.rs tools/linux-m8/*.rs
 	uv run --frozen ruff format --check tools tests
 
 status: ## Regenerate docs/STATUS.md from the last test results
@@ -248,7 +272,7 @@ deps-dev: ## Download the Alpine developer image's pinned packages (tools/alpine
 	@mkdir -p $(BUILD)/deps/alpine-packages
 	@cmp -s tools/alpine-packages.lock $(BUILD)/deps/alpine-packages/.lock || cp tools/alpine-packages.lock $(BUILD)/deps/alpine-packages/.lock
 
-$(BUILD)/alpine-dev.ext4: tools/mkrootfs-dev.sh tools/alpine-lock.py tools/ext4-signed-hash.sh $(BUILD)/deps/alpine-packages/.lock $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so
+$(BUILD)/alpine-dev.ext4: tools/mkrootfs-dev.sh tools/alpine-lock.py tools/ext4-signed-hash.sh $(BUILD)/deps/alpine-packages/.lock $(BUILD)/deps/alpine-minirootfs/.version $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(M8_LINUX_OUT)
 	tools/mkrootfs-dev.sh $@
 
 rootfs-dev: $(BUILD)/alpine-dev.ext4 ## Build the deterministic Alpine developer image (gcc, g++, make, git, sqlite3, vim) for M8's gates
