@@ -9,6 +9,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only whatever the repository's default token permissions: the
+# checkout and the durable mirror's check only read.
+permissions:
+  contents: read
+
 jobs:
   ci:
     name: build, audit, test
@@ -48,13 +53,17 @@ jobs:
 
       # Only tools/fetch-deps.sh's own downloads: the zig and libc-test
       # sources and the developer image's packages have entries of their own
-      # (below), so no file sits in two entries.
+      # (below), so no file sits in two entries. `build/deps/*`, not
+      # `build/deps`: the bare directory is one match, archived whole, so an
+      # exclusion of a path inside it drops nothing.
       - name: Cache boot and userspace dependencies (Limine, OVMF, busybox, Alpine minirootfs)
         uses: actions/cache@v6
         with:
           path: |
-            build/deps
+            build/deps/*
             !build/deps/zig
+            !build/deps/zig.lock
+            !build/deps/zig.tmp.*
             !build/deps/libc-test
             !build/deps/alpine-packages
           key: deps-${{ hashFiles('tools/fetch-deps.sh') }}
@@ -96,12 +105,22 @@ jobs:
       - name: Build musl libc-test with the pinned zig
         timeout-minutes: 10
         run: make libc-test
-      # The Alpine developer image (#344) for M8's gates: its packages
-      # (tools/alpine-packages.lock) in the same four steps as above, keyed on
-      # the lock (the fetch keeps exactly the lock's files); the image itself
-      # is rebuilt from them every run (about 5 s), not cached. A cold cache
-      # fetches from dl-cdn, then the durable mirror for a build dl-cdn
-      # dropped (tools/fetch-alpine-packages.sh).
+      # The Alpine developer image (#344) for M8's gates, in five steps.
+      # First the durable mirror's check, which reads only the release's
+      # asset list (under 10 s), so a lock whose files aren't mirrored fails
+      # before a cold fetch: CI fails a lock change until its files are
+      # mirrored (tools/mirror-alpine-packages.sh upload). Then the packages
+      # (tools/alpine-packages.lock) in the same restore, fetch, save, build
+      # steps as above, keyed on the lock (the fetch keeps exactly the lock's
+      # files); the image itself is rebuilt from them every run (about 5 s),
+      # not cached. A cold cache fetches from dl-cdn, and the durable mirror
+      # serves any file dl-cdn doesn't give (a dropped build, or dl-cdn down;
+      # tools/fetch-alpine-packages.sh).
+      - name: Check the durable mirror holds every locked package
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/mirror-alpine-packages.sh check
       - name: Restore the Alpine developer image's packages
         id: apk-cache
         uses: actions/cache/restore@v6
@@ -118,14 +137,8 @@ jobs:
         with:
           path: build/deps/alpine-packages
           key: ${{ steps.apk-cache.outputs.cache-primary-key }}
-      # The durable mirror holds every locked package, so a lock change can't
-      # merge until its files are mirrored (tools/mirror-alpine-packages.sh
-      # upload). Reads the release's asset names only.
-      - name: Check the durable mirror holds every locked package
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: tools/mirror-alpine-packages.sh check
       - name: Build the Alpine developer image
+        timeout-minutes: 5
         run: make rootfs-dev
       - run: make test-host
       - name: QEMU scenarios (boot, crash reports, in-kernel tests, golden images)
