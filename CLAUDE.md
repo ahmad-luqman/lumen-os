@@ -482,7 +482,16 @@ one is its own PR that updates that doc first.
 - `crates/lumen-demo`: fixed-point Mandelbrot, dealing image rows to CPUs
   in bands, and Game of Life with its patterns (host-tested; the `life`
   command's and the Life app's, a path dependency of `apps/`, #202).
-- `crates/lumen-elf`: ELF symbol-table reader (host-tested).
+- `crates/lumen-elf`: ELF symbol-table reader (host-tested); `shebang`
+  (#343: a `#!` header from a file's first `BINPRM_BUF_SIZE` (256) bytes,
+  as Linux's `load_script`: `parse` giving a `Shebang` (interpreter, at most
+  one argument) or a `ShebangError` with its errno; `Nesting`, at most
+  `MAX_NESTING` (5) interpreters an exec, else `ELOOP`) and `args` (#343:
+  `ArgBudget`, `execve`'s byte budget for argv, envp and execfn charged
+  string by string in `do_execveat_common`'s order before each copy,
+  `rewrite` swapping `argv[0]` for an interpreter's words in one
+  transaction, `E2BIG` before `ENOMEM`; `MAX_ARG_STRLEN`, `MAX_ARG_STRINGS`,
+  `check`, `normalize_argv`) (host-tested).
 - `crates/lumen-perf`: the sampling profiler's logic (#205): `Buffer`, a
   lock-free sample buffer with one writer (a CPU's timer interrupt) armed
   for a count (an arming generation in its state word), `by_function`/
@@ -640,6 +649,56 @@ one is its own PR that updates that doc first.
   failing part-way, #321); `SetTime::resolve` (#302) in
   `types` (host-tested; `tests/ext4plus_htree_hash.rs`: the vendored
   ext4plus's htree hash against e2fsprogs', #313).
+- `crates/lumen-futex`: futex wait queues as logic (M8, #338; ARCHITECTURE
+  section 8): `FutexTable<K, W>` (an opaque key, FIFO per key: `enqueue`,
+  `wake` with a bitset and Linux's count rule, `requeue`, `requeue_into`
+  across buckets, `cancel`), caller-allocated `FutexNode`s, `Woken` drained
+  after the bucket lock drops, `BucketIndex` (Linux's `lock_ptr` recheck:
+  `cancel_in` finds a requeued waiter's bucket, `CancelOutcome::AlreadyWoken`
+  for a wake that won), `check_requeue_counts`; the `futex(2)` protocols in
+  its crate docs (host-tested, incl. a model, and no allocation in any queue
+  operation, `tests/zero_alloc.rs`).
+- `crates/lumen-signal`: Linux x86-64 signals as logic (M8, #339;
+  ARCHITECTURE section 6): `Signal`, `SigSet`, `Blocked` (never `SIGKILL`
+  or `SIGSTOP`), `DefaultAction`; `pending` (`PendingSignals`: a process's
+  shared queue and one per thread, `ThreadSlot`, `Target`, `SigInfo`
+  (`fault` with `si_addr`), `SenderClass`, `Disposition`, stop/continue
+  cancellation, `select_target`); `frame` (`build`: an `rt_sigframe` image,
+  `FrameImage`; `restore`: `rt_sigreturn`'s checks, `Restored`,
+  `ValidatedFp`, `FpFallback`, `RestoreConfig`); `restart` (`decide`:
+  `ERESTART*` against the handler and `SA_RESTART`, `RESTART_SYSCALL`);
+  `altstack` (`AltStack::configure`, `SS_AUTODISARM`); `abi` (the frame's
+  layouts, pinned) (host-tested).
+- `crates/lumen-pipe`: a POSIX pipe as logic (M8, #342; ARCHITECTURE
+  section 10): `Pipe` (a byte ring of `DEFAULT_CAPACITY`, `set_capacity`
+  for `F_SETPIPE_SZ`, `PIPE_BUF` writes all or nothing, `peek` and a
+  `Peeked` committed after the copy out, reader and writer counts,
+  `Released::Last`, `readable`/`writable`/`reader_hung_up`/`writer_error`,
+  `fionread`; `fifo`, no ends open), `WriteProgress` (a blocking write's
+  chunks and its wake rules; `WriteStep`, `InterruptedWrite`,
+  `FaultedWrite`) (host-tested, incl. no allocation outside creation and
+  `set_capacity`, `tests/zero_alloc.rs`).
+- `crates/lumen-tty`: a terminal line discipline as logic, after Linux's
+  n_tty (M8, #340; ARCHITECTURE section 10): `LineDiscipline` (`receive`
+  each input byte: canonical editing, echo, `ISIG`'s `JobSignal`; `read`
+  after `read_decision`'s `Decision` with a `ReadTimer` for
+  `VMIN`/`VTIME`; `write` through `OPOST`; `set_termios` with `Flush`,
+  `flush_input`, `set_winsize` saying whether `SIGWINCH` is due,
+  `poll_readable`, `readable_bytes`, `accepts`), `Termios`
+  (`console_default`), `Winsize`, the `Output` sink, `Effects`/`Wake`, and
+  `background_write_signal` (`SIGTTOU` or `EIO` for a background writer)
+  (host-tested, incl. no allocation after construction).
+- `crates/lumen-proc`: the POSIX process tree as logic (M8, #341;
+  ARCHITECTURE section 8): `ProcTree` (pids from 2 to a maximum, wrapping,
+  never one in use as a pid, pgid or sid; `spawn_init`, `spawn_root`,
+  `fork`, `exec`, `exit` with a reaper giving an `ExitOutcome` of
+  `ExitAction`s (`Notify`, `Released`, `HangupThenContinue`), `stop`/`cont`
+  giving a `StateChange`; `wait4_request`/`waitid_request` and `wait`
+  (`WaitReady`, `Report`); `setsid`, `setpgid`, `getpgid`, `getsid`,
+  `tcsetpgrp`, `pgrp_members`, `is_orphaned_pgrp`), `WaitStatus` (`word`,
+  `siginfo`), `ExitStatus`, `RusageSlot`/`SlotRef`, `Errno`/`Bug`/`Error`
+  (host-tested, incl. a model and what each operation allocates,
+  `tests/alloc.rs`).
 - `crates/lumen-trace`: lock-free trace ring (host-tested, incl. threads;
   `read_since`: a polling reader's events since a sequence number, each
   number copied or counted missed once), `kind` (every kind's number, `Stream` and
@@ -862,7 +921,20 @@ one is its own PR that updates that doc first.
   `llvm-readobj` dynamic musl ELF checks, `run_busybox`: a `linux
   /bin/busybox` run's output, exit code and leaked frames (`BusyboxRun`,
   `BUSYBOX_EXIT`), #324, and `warm_up`: one uncounted
-  `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts).
+  `linux /bin/busybox true`, leaking 0 frames or 1, before exact counts),
+  `libctest.py` (#345: musl libc-test transcripts, one `EXIT <path> <code>`
+  line per test, read as pass, fail or error, a runner error never a
+  verdict; `tests/conformance/libc-test-xfail.txt`, each entry a reason and
+  an issue, a listed pass failing the run; the built binaries' linkage
+  checked; `run_native`, the host reference run, `runtest -t 30`).
+- `tools/fetch-zig.sh` (`make deps-zig`, #368): zig 0.15.2 into
+  `build/deps/zig`, sha256-pinned per host, ziglang.org then two community
+  mirrors, installed under `build/deps/zig.lock`; a C cross-compiler for
+  host-built Linux test binaries only. `tools/build-libc-test.sh` (`make
+  libc-test`, #369, after `tools/fetch-libc-test.sh`'s pinned checkout):
+  libc-test's `src/functional` and `src/regression`, static and dynamic,
+  with `zig cc -target x86_64-linux-musl` into `build/libc-test/`
+  (`tests.txt`, `not-built.txt`).
 - `tools/mkrootfs.sh`, `tools/linux-m7/`: deterministic `build/alpine-rootfs.ext4`
   assembly (`s_flags` saying signed directory hashes on every host,
   `tools/ext4-signed-hash.sh`, #308) and `#![no_std]` dynamic musl test binaries (`m7_test`, its modes
