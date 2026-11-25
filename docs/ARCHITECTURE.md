@@ -4320,7 +4320,7 @@ depends on them.
 | B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `poll_rechecks_after_a_wake`, `test_poll_and_select_on_console` | 10 |
 | B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended) | 5, 8 |
 | B5 | the TLB shootdown IPI | B2 | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `PerCpu::loaded_space`, `tlb::shoot_down`, the shootdown warning's `HOST_TIMED` entry; `mm::tlb::shootdown_across_cpus` (its probes use B2's `read_u32_nofault`) | 5, 9 |
-| B6 | SMP migration, priorities, affinity | C1 | `on_cpu`, `spawn_migratable`, `spawn_user_on` migratable (after C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
+| B6 | SMP migration, priorities, affinity | B5, C1 | `on_cpu`, `spawn_migratable`, `spawn_user_on` migratable (after C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
 | B7 | truncate reaching every address space | B1, B4, B5 | the inode's mappers list, `mmap_file(self: &Arc<Self>)`; `truncate_unmaps_every_address_space` | 5 |
 | B8 | the five M8 hazards | B1 | `OpenFile::pos`, `FdTable::reserve`, `PosixWaitGraph`'s key; the hazard ktests | 8, 9 |
 | C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | B0, B1, B2, B4 | `spawn_user_on` taking the `UserThread`, pinned to the caller's CPU (B6 makes it migratable), `Files::users` across `fork`; `test_fork_wait_and_exit_status` | 8 |
@@ -5372,11 +5372,15 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
   to 32 POSIX timers (`PosixTimer { clock, notify, signal, sival,
   interval_ns, deadline, instance, overrun, overrun_last }`) and
   `next_instance: u64`. `notify` is the `sigevent`'s mode,
-  `TimerNotify::{Process, Thread(tid), None}`: `SIGEV_SIGNAL` is
+  `TimerNotify::{Process, Thread(Weak<UserThread>), None}`: `SIGEV_SIGNAL` is
   `Process`, and so is a raw `SIGEV_THREAD`, which Linux's `good_sigevent`
   accepts with `SIGEV_SIGNAL` (musl never passes it: its `timer_create`
   turns `SIGEV_THREAD` into `SIGEV_THREAD_ID` aimed at its helper);
-  `SIGEV_THREAD_ID` is `Thread`, `SIGEV_NONE` `None`.
+  `SIGEV_THREAD_ID` is `Thread`, holding the target's identity, not its
+  tid, so a tid reused after the target exits is never signalled (Linux's
+  timer holds the target's `struct pid`, `it_pid`, and `pid_task` finds no
+  task once it has exited); an expiry whose target has gone sends nothing
+  and still re-arms. `SIGEV_NONE` is `None`.
   POSIX timers are deleted at `execve` and exit; `ITIMER_REAL` only at
   exit. `timer_delete` (and `execve`) discards the timer's queued
   `SI_TIMER` signal, and an expiry asks whether it is still queued, which
@@ -5424,7 +5428,7 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
      no send and `overrun` + 1. Otherwise the ordinary send (section 6,
      which handles `SIGCONT`, `SIGSTOP` and `SIGKILL` as any sender's) of
      the timer's `SigInfo` (`SI_TIMER` with `si_timerid` and `si_value`),
-     to the process or, for `Thread(tid)`, that thread. `ITIMER_REAL`
+     to the process or, for `Thread`, that thread if it is still alive. `ITIMER_REAL`
      skips the question: a plain send of `SI_KERNEL` `SIGALRM` each
      expiry, as Linux's `it_real_fn` calls `kill_pid_info`, a standard
      signal that coalesces in the queue. With no flag of its own to
