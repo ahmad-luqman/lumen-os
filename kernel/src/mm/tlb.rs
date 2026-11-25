@@ -281,8 +281,46 @@ pub fn behind() -> u64 {
 /// of 33).
 pub(in crate::mm) const FULL_FLUSH_PAGES: u64 = 32;
 
-/// How often [`shoot_down`] warns while waiting for a target CPU to answer.
-const SHOOTDOWN_WARN_NS: u64 = 2_000_000_000;
+/// Interval at which [`shoot_down`] and `AddressSpace::teardown` warn while
+/// waiting on a stalled CPU.
+pub(in crate::mm) const STALL_WARN_NS: u64 = 2_000_000_000;
+
+/// Tracks elapsed wait time for [`STALL_WARN_NS`] stall warnings, starting on
+/// the first nonzero `time::now_ns()` reading (if a wait begins before clock
+/// calibration).
+pub(in crate::mm) struct WaitTimer {
+    start: u64,
+    next_warn: u64,
+    warned: bool,
+}
+
+impl WaitTimer {
+    pub(in crate::mm) fn new() -> Self {
+        let start = time::now_ns();
+        let next_warn = if start == 0 { 0 } else { start.saturating_add(STALL_WARN_NS) };
+        Self { start, next_warn, warned: false }
+    }
+
+    /// Return `Some((is_first_warning, elapsed_secs))` whenever the next
+    /// [`STALL_WARN_NS`] deadline elapses, advancing the deadline.
+    pub(in crate::mm) fn poll(&mut self) -> Option<(bool, u64)> {
+        let now = time::now_ns();
+        if self.start == 0 {
+            if now != 0 {
+                self.start = now;
+                self.next_warn = now.saturating_add(STALL_WARN_NS);
+            }
+            return None;
+        }
+        if now < self.next_warn {
+            return None;
+        }
+        let first = !self.warned;
+        self.warned = true;
+        self.next_warn = now.saturating_add(STALL_WARN_NS);
+        Some((first, now.saturating_sub(self.start) / 1_000_000_000))
+    }
+}
 
 /// What translations [`shoot_down`] retires in an [`AddressSpace`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -308,10 +346,11 @@ impl Flush {
         match what {
             Shoot::Full => Some(Self::All),
             Shoot::Pages(range) => {
+                debug_assert!(range.start <= range.end, "tlb::shoot_down inverted range {range:#x?}");
+                assert!(range.end <= USER_MAX, "tlb::shoot_down range {range:#x?} exceeds USER_MAX");
                 if range.start >= range.end {
                     return None;
                 }
-                assert!(range.end <= USER_MAX, "tlb::shoot_down range {range:#x?} exceeds USER_MAX");
                 debug_assert!(
                     range.start.is_multiple_of(FRAME_SIZE) && range.end.is_multiple_of(FRAME_SIZE),
                     "tlb::shoot_down range {range:#x?} is not page-aligned"
@@ -341,7 +380,8 @@ impl Flush {
 }
 
 /// Exclusive writer token for the global shootdown board (ARCHITECTURE §9
-/// Lock 1a: taken only under Lock 1, with nothing numbered 2–9 or 10 held).
+/// Lock 1a: taken only under Lock 1, with no lock below it held (2 through 10,
+/// 9a included)).
 struct Board {
     /// Last published even generation; incremented by 1 (odd) while updating
     /// the request fields, then by 1 again (even) once published.
@@ -391,8 +431,8 @@ static ACKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static FULL_FLUSH_IPIS: AtomicU64 = AtomicU64::new(0);
 
 /// Flush `flush` on this CPU if `space` is loaded here (unless already flushed
-/// on this CPU), order prior PTE stores globally before reading `space.active`,
-/// and return `(here, other_active_cpus)`. Must be called with interrupts off.
+/// on this CPU) and return `(here, other_active_cpus)`. Must be called with
+/// interrupts off.
 fn flush_here(space: &AddressSpace, flush: Flush, already_flushed_cpu: Option<usize>) -> (usize, u64) {
     let here = arch::cpu_index();
     if already_flushed_cpu != Some(here) && arch::paging::active_root() == space.root() {
@@ -403,6 +443,14 @@ fn flush_here(space: &AddressSpace, flush: Flush, already_flushed_cpu: Option<us
     fence(Ordering::SeqCst);
     let targets = space.active_mask() & !(1u64 << here);
     (here, targets)
+}
+
+/// Send vector `0x3e` ([`arch::idt::TLB_SHOOTDOWN`]) to active target `cpu`,
+/// panicking if that CPU is not online.
+fn send_shootdown(cpu: usize) -> bool {
+    let lapic = smp::online_lapic_id(cpu)
+        .unwrap_or_else(|| panic!("tlb::shoot_down target cpu {cpu} is active but not online"));
+    arch::apic::send_ipi(lapic, arch::idt::TLB_SHOOTDOWN)
 }
 
 /// Handle vector `0x3e` ([`arch::idt::TLB_SHOOTDOWN`]), lock-free with
@@ -450,8 +498,8 @@ pub fn on_shootdown_ipi() {
 /// (or switched away from `space`).
 ///
 /// Must be called after the updated PTEs are written while `space`'s Lock 1
-/// (`AddressSpace::inner`) is still held, with no locks numbered 2–9 or 10
-/// held and interrupts enabled (`irq::depth() == 0`).
+/// (`AddressSpace::inner`) is still held, with no lock below it held
+/// (2 through 10, 9a included) and interrupts enabled (`irq::depth() == 0`).
 pub(in crate::mm) fn shoot_down(space: &AddressSpace, what: Shoot) {
     let Some(flush) = Flush::from_shoot(what) else {
         return;
@@ -484,9 +532,7 @@ pub(in crate::mm) fn shoot_down(space: &AddressSpace, what: Shoot) {
         let generation = board.publish(space.root().as_u64(), flush);
         let mut sent = 0u64;
         for i in (0..MAX_CPUS).filter(|&i| targets & (1u64 << i) != 0) {
-            let lapic = smp::online_lapic_id(i)
-                .unwrap_or_else(|| panic!("tlb::shoot_down target cpu {i} is active but not online"));
-            if arch::apic::send_ipi(lapic, arch::idt::TLB_SHOOTDOWN) {
+            if send_shootdown(i) {
                 sent |= 1u64 << i;
             }
         }
@@ -500,9 +546,7 @@ pub(in crate::mm) fn shoot_down(space: &AddressSpace, what: Shoot) {
         arch::irq::enabled() && arch::irq::depth() == 0,
         "tlb::shoot_down waiting with interrupts off or a SpinLock held"
     );
-    let mut wait_start = time::now_ns();
-    let mut next_warn = if wait_start == 0 { 0 } else { wait_start.saturating_add(SHOOTDOWN_WARN_NS) };
-    let mut warned_once = false;
+    let mut timer = WaitTimer::new();
     loop {
         let active = space.active_mask();
         let mut remaining = 0u64;
@@ -512,37 +556,26 @@ pub(in crate::mm) fn shoot_down(space: &AddressSpace, what: Shoot) {
                 continue;
             }
             remaining |= bit;
-            if sent & bit == 0 {
-                let lapic = smp::online_lapic_id(i)
-                    .unwrap_or_else(|| panic!("tlb::shoot_down target cpu {i} is active but not online"));
-                if arch::apic::send_ipi(lapic, arch::idt::TLB_SHOOTDOWN) {
-                    sent |= bit;
-                }
+            if sent & bit == 0 && send_shootdown(i) {
+                sent |= bit;
             }
         }
         if remaining == 0 {
             return;
         }
-        let now = time::now_ns();
-        if wait_start == 0 && now != 0 {
-            wait_start = now;
-            next_warn = now.saturating_add(SHOOTDOWN_WARN_NS);
-        } else if next_warn != 0 && now >= next_warn {
+        if let Some((first, secs)) = timer.poll() {
             let unsent = remaining & !sent;
-            if !warned_once {
+            if first {
                 warn!(
                     target: "mm",
                     "cpus {remaining:#x} haven't answered TLB shootdown within 2 s (unsent {unsent:#x}, still waiting)"
                 );
-                warned_once = true;
             } else {
-                let secs = now.saturating_sub(wait_start) / 1_000_000_000;
                 warn!(
                     target: "mm",
                     "cpus {remaining:#x} still haven't answered TLB shootdown after {secs} s (unsent {unsent:#x})"
                 );
             }
-            next_warn = now.saturating_add(SHOOTDOWN_WARN_NS);
         }
         core::hint::spin_loop();
     }
@@ -571,56 +604,95 @@ crate::ktest!(
     fn shootdown_across_cpus() {
         use alloc::sync::Arc;
         use alloc::vec::Vec;
+        use core::sync::atomic::AtomicU32;
         use lumen_vm::{PAGE_SIZE, Prot};
 
         use super::{frame, paging};
         use crate::sync::SpinLock;
-        use crate::user::read_u32_nofault;
+        use crate::user::{copy_to_user, read_u32_nofault};
         use crate::{kassert, kassert_eq, sched};
 
-        /// Anti-wedge bound for spin loops with interrupts off (well above any
-        /// host stall, safely below `sched::TEST_DEADLINE_NS` of 10 s); never
-        /// decides a test verdict on its own.
+        /// Anti-wedge bound for helper spin loops with interrupts off (well
+        /// above any host stall, safely below `sched::TEST_DEADLINE_NS` of
+        /// 10 s). A spin that hits this bound sets `wedged` so the section
+        /// reports an explicit anti-wedge failure rather than a misleading
+        /// protocol error.
         const ANTI_WEDGE_NS: u64 = 7_000_000_000;
 
-        /// Sets an atomic flag on drop so a failing assertion never leaves a
-        /// helper thread spinning.
-        struct SetOnDrop(Arc<AtomicBool>);
-        impl Drop for SetOnDrop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Release);
+        fn spin_or_wedge(wedged: &AtomicBool, mut done: impl FnMut() -> bool) -> bool {
+            let deadline = time::now_ns().saturating_add(ANTI_WEDGE_NS);
+            while !done() {
+                if time::now_ns() >= deadline {
+                    wedged.store(true, Ordering::Release);
+                    return false;
+                }
+                core::hint::spin_loop();
+            }
+            true
+        }
+
+        fn check_not_wedged(wedged: &AtomicBool) -> crate::ktest::TestResult {
+            if wedged.load(Ordering::Acquire) {
+                crate::ktest::diag(format_args!("anti-wedge expired: host stalled > 7 s"));
+                return Err("anti-wedge expired: host stalled > 7 s");
+            }
+            Ok(())
+        }
+
+        /// Owns a section's release flags and spawned helper threads.
+        /// On drop (early `?` return or partial spawn failure), sets every
+        /// release flag first and then joins every spawned thread. On the
+        /// happy path, [`Self::join`] joins without setting flags.
+        struct Helpers {
+            flags: Vec<Arc<AtomicBool>>,
+            handles: Vec<sched::JoinHandle>,
+        }
+
+        impl Helpers {
+            fn new(flags: impl IntoIterator<Item = Arc<AtomicBool>>) -> Self {
+                Self { flags: flags.into_iter().collect(), handles: Vec::new() }
+            }
+
+            fn add(&mut self, handle: sched::JoinHandle) {
+                self.handles.push(handle);
+            }
+
+            fn join(mut self) {
+                for h in self.handles.drain(..) {
+                    h.join();
+                }
             }
         }
 
-        /// Joins a spawned thread on drop if not explicitly joined first.
-        struct JoinOnDrop(Option<sched::JoinHandle>);
-        impl JoinOnDrop {
-            fn join(mut self) {
-                if let Some(h) = self.0.take() {
-                    h.join();
+        impl Drop for Helpers {
+            fn drop(&mut self) {
+                if !self.handles.is_empty() {
+                    for f in &self.flags {
+                        f.store(true, Ordering::Release);
+                    }
+                    for h in self.handles.drain(..) {
+                        h.join();
+                    }
                 }
             }
         }
-        impl Drop for JoinOnDrop {
-            fn drop(&mut self) {
-                if let Some(h) = self.0.take() {
-                    h.join();
-                }
-            }
+
+        struct ProbeState {
+            primed: [AtomicBool; 3],
+            after: AtomicBool,
+            stop: Arc<AtomicBool>,
+            faults_after: [AtomicU64; 3],
+            stale_after: [AtomicU64; 3],
+            bad_val: [AtomicBool; 3],
         }
 
         /// Three pinned probe threads on `targets` probing `page_count` pages
-        /// starting at `base_va`. Always stops and joins all probes on drop.
+        /// starting at `base_va`, cleaned up via [`Helpers`] on drop.
         struct Probes {
             space: Arc<AddressSpace>,
             target_bits: u64,
-            primed: Arc<[AtomicBool; 3]>,
-            after: Arc<AtomicBool>,
-            stop: Arc<AtomicBool>,
-            faults_after: Arc<[AtomicU64; 3]>,
-            stale_after: Arc<[AtomicU64; 3]>,
-            bad_val: Arc<[AtomicBool; 3]>,
-            handles: Vec<sched::JoinHandle>,
+            state: Arc<ProbeState>,
+            helpers: Helpers,
         }
 
         impl Probes {
@@ -633,47 +705,41 @@ crate::ktest!(
                 sentinel: u32,
             ) -> Result<Self, &'static str> {
                 let target_bits = (1u64 << targets[0]) | (1u64 << targets[1]) | (1u64 << targets[2]);
-                let mut probes = Self {
-                    space: space.clone(),
-                    target_bits,
-                    primed: Arc::new([const { AtomicBool::new(false) }; 3]),
-                    after: Arc::new(AtomicBool::new(false)),
-                    stop: Arc::new(AtomicBool::new(false)),
-                    faults_after: Arc::new([const { AtomicU64::new(0) }; 3]),
-                    stale_after: Arc::new([const { AtomicU64::new(0) }; 3]),
-                    bad_val: Arc::new([const { AtomicBool::new(false) }; 3]),
-                    handles: Vec::new(),
-                };
+                let stop = Arc::new(AtomicBool::new(false));
+                let state = Arc::new(ProbeState {
+                    primed: [const { AtomicBool::new(false) }; 3],
+                    after: AtomicBool::new(false),
+                    stop: stop.clone(),
+                    faults_after: [const { AtomicU64::new(0) }; 3],
+                    stale_after: [const { AtomicU64::new(0) }; 3],
+                    bad_val: [const { AtomicBool::new(false) }; 3],
+                });
+                let mut helpers = Helpers::new([stop]);
                 for (idx, &cpu) in targets.iter().enumerate() {
-                    let primed = probes.primed.clone();
-                    let after = probes.after.clone();
-                    let stop = probes.stop.clone();
-                    let faults_after = probes.faults_after.clone();
-                    let stale_after = probes.stale_after.clone();
-                    let bad_val = probes.bad_val.clone();
+                    let state = state.clone();
                     let h = sched::spawn_user_on(cpu, name, space.clone(), move || {
                         for p in 0..page_count {
                             if read_u32_nofault(base_va + p * PAGE_SIZE) != Ok(sentinel ^ (p as u32)) {
-                                bad_val[idx].store(true, Ordering::Release);
+                                state.bad_val[idx].store(true, Ordering::Release);
                             }
                         }
-                        primed[idx].store(true, Ordering::Release);
+                        state.primed[idx].store(true, Ordering::Release);
                         let mut p = 0u64;
-                        while !stop.load(Ordering::Acquire) {
-                            let retired = after.load(Ordering::Acquire);
+                        while !state.stop.load(Ordering::Acquire) {
+                            let retired = state.after.load(Ordering::Acquire);
                             let va = base_va + p * PAGE_SIZE;
                             match read_u32_nofault(va) {
                                 Ok(v) => {
                                     if v != (sentinel ^ (p as u32)) {
-                                        bad_val[idx].store(true, Ordering::Release);
+                                        state.bad_val[idx].store(true, Ordering::Release);
                                     }
                                     if retired {
-                                        stale_after[idx].fetch_add(1, Ordering::Relaxed);
+                                        state.stale_after[idx].fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 Err(_) => {
                                     if retired {
-                                        faults_after[idx].fetch_add(1, Ordering::Relaxed);
+                                        state.faults_after[idx].fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -682,40 +748,36 @@ crate::ktest!(
                         }
                     })
                     .map_err(|_| "spawn probe thread")?;
-                    probes.handles.push(h);
+                    helpers.add(h);
                 }
-                Ok(probes)
+                Ok(Self { space, target_bits, state, helpers })
             }
 
             fn wait_primed(&self) -> crate::ktest::TestResult {
-                kassert!(sched::yield_until(|| (0..3).all(|i| self.primed[i].load(Ordering::Acquire))));
+                kassert!(sched::yield_until(|| (0..3).all(|i| self.state.primed[i].load(Ordering::Acquire))));
                 kassert!(sched::yield_until(|| (self.space.active_mask() & self.target_bits) == self.target_bits));
                 Ok(())
             }
 
-            fn finish_and_check(mut self, min_faults: u64) -> crate::ktest::TestResult {
-                self.after.store(true, Ordering::Release);
-                kassert!(sched::yield_until(
-                    || (0..3).all(|i| self.faults_after[i].load(Ordering::Relaxed) >= min_faults)
-                ));
-                self.stop.store(true, Ordering::Release);
-                for h in self.handles.drain(..) {
-                    h.join();
-                }
+            fn stop_and_join(self) {
+                self.state.stop.store(true, Ordering::Release);
+                self.helpers.join();
+            }
+
+            fn finish_and_check(self, min_faults: u64) -> crate::ktest::TestResult {
+                let state = self.state.clone();
+                state.after.store(true, Ordering::Release);
+                kassert!(sched::yield_until(|| {
+                    (0..3).all(|i| state.faults_after[i].load(Ordering::Relaxed) >= min_faults)
+                        || (0..3).any(|i| state.stale_after[i].load(Ordering::Relaxed) > 0)
+                }));
+                self.stop_and_join();
                 for i in 0..3 {
-                    kassert!(!self.bad_val[i].load(Ordering::Acquire));
-                    kassert_eq!(self.stale_after[i].load(Ordering::Relaxed), 0);
+                    kassert!(!state.bad_val[i].load(Ordering::Acquire));
+                    kassert_eq!(state.stale_after[i].load(Ordering::Relaxed), 0);
+                    kassert!(state.faults_after[i].load(Ordering::Relaxed) >= min_faults);
                 }
                 Ok(())
-            }
-        }
-
-        impl Drop for Probes {
-            fn drop(&mut self) {
-                self.stop.store(true, Ordering::Release);
-                for h in self.handles.drain(..) {
-                    h.join();
-                }
             }
         }
 
@@ -734,8 +796,7 @@ crate::ktest!(
         if found < 3 {
             return Err("shootdown_across_cpus requires at least 4 online CPUs");
         }
-        let [t0, t1, t2] = targets;
-        let target_bits = (1u64 << t0) | (1u64 << t1) | (1u64 << t2);
+        let [t0, t1, _] = targets;
 
         const SENTINEL: u32 = 0x5a5a_c3c3;
         const SINGLE_VA: u64 = 0x2000_0000;
@@ -743,6 +804,7 @@ crate::ktest!(
         const BULK_PAGES: u64 = FULL_FLUSH_PAGES + 2; // 34 pages (> 32)
         const MPROT_VA: u64 = 0x2018_0000;
         const LOCK_VA: u64 = 0x2020_0000;
+        const COW_VA: u64 = 0x2028_0000;
         const SWITCH_VA: u64 = 0x2030_0000;
         const TD_VA: u64 = 0x2040_0000;
 
@@ -775,9 +837,9 @@ crate::ktest!(
             let full_before = FULL_FLUSH_IPIS.load(Ordering::Relaxed);
             space.munmap(BULK_VA, BULK_PAGES * PAGE_SIZE).map_err(|_| "munmap bulk pages")?;
             // `FULL_FLUSH_IPIS` counts full-flush requests acknowledged in
-            // `on_shootdown_ipi`; only assert the full count of 3 if none of
-            // the three targets switched away mid-shootdown.
-            if (space.active_mask() & target_bits) == target_bits {
+            // `on_shootdown_ipi`; only assert the full count of 3 if all three
+            // still have the space loaded afterwards.
+            if (space.active_mask() & probes.target_bits) == probes.target_bits {
                 kassert!(FULL_FLUSH_IPIS.load(Ordering::Relaxed) >= full_before + 3);
             }
             probes.finish_and_check(2 * BULK_PAGES)?;
@@ -810,16 +872,18 @@ crate::ktest!(
             let lock_held = Arc::new(AtomicBool::new(false));
             let release_lock = Arc::new(AtomicBool::new(false));
             let abort = Arc::new(AtomicBool::new(false));
+            let wedged = Arc::new(AtomicBool::new(false));
             let unmap_done = Arc::new(AtomicBool::new(false));
             let probe_ok_before = Arc::new(AtomicBool::new(false));
             let probe_fault_after = Arc::new(AtomicBool::new(false));
 
-            // Declare join guards before drop-setters so early returns release
-            // the threads first, then join them.
-            let h_target = JoinOnDrop(Some({
+            // `Helpers` releases both flags before joining any started thread on error.
+            let mut helpers = Helpers::new([release_lock.clone(), abort.clone()]);
+            helpers.add({
                 let lock_held = lock_held.clone();
                 let release_lock = release_lock.clone();
                 let abort = abort.clone();
+                let wedged = wedged.clone();
                 let unmap_done = unmap_done.clone();
                 let probe_ok_before = probe_ok_before.clone();
                 let probe_fault_after = probe_fault_after.clone();
@@ -829,29 +893,18 @@ crate::ktest!(
                     {
                         let _g = guard_lock.lock();
                         lock_held.store(true, Ordering::Release);
-                        let deadline = time::now_ns().saturating_add(ANTI_WEDGE_NS);
-                        while !release_lock.load(Ordering::Acquire) && time::now_ns() < deadline {
-                            core::hint::spin_loop();
-                        }
+                        spin_or_wedge(&wedged, || release_lock.load(Ordering::Acquire));
                     }
                     // Interrupts are now back on; the pending `0x3e` IPI runs immediately.
-                    let deadline = time::now_ns().saturating_add(ANTI_WEDGE_NS);
-                    while !unmap_done.load(Ordering::Acquire)
-                        && !abort.load(Ordering::Acquire)
-                        && time::now_ns() < deadline
-                    {
-                        core::hint::spin_loop();
-                    }
+                    spin_or_wedge(&wedged, || unmap_done.load(Ordering::Acquire) || abort.load(Ordering::Acquire));
                     probe_fault_after.store(read_u32_nofault(LOCK_VA).is_err(), Ordering::Release);
                 })
                 .map_err(|_| "spawn spinlock target")?
-            }));
-            let _release_on_drop = SetOnDrop(release_lock.clone());
-            let _abort_on_drop = SetOnDrop(abort.clone());
+            });
 
             kassert!(sched::yield_until(|| lock_held.load(Ordering::Acquire)));
             let gen_before = REQUEST_GEN.load(Ordering::Acquire);
-            let h_unmap = JoinOnDrop(Some({
+            helpers.add({
                 let space = space.clone();
                 let unmap_done = unmap_done.clone();
                 sched::spawn_on(t1, "tlb-unmap-lock", move || {
@@ -859,7 +912,7 @@ crate::ktest!(
                     unmap_done.store(true, Ordering::Release);
                 })
                 .map_err(|_| "spawn unmap thread")?
-            }));
+            });
 
             // Wait until the shootdown request is published while `t0` still holds the lock.
             kassert!(sched::yield_until(|| {
@@ -873,8 +926,8 @@ crate::ktest!(
             kassert!(frame::user_count(lock_phys) >= 1);
 
             release_lock.store(true, Ordering::Release);
-            h_unmap.join();
-            h_target.join();
+            helpers.join();
+            check_not_wedged(&wedged)?;
             kassert_eq!(frame::user_count(lock_phys), 0);
             kassert!(probe_ok_before.load(Ordering::Acquire));
             kassert!(probe_fault_after.load(Ordering::Acquire));
@@ -882,19 +935,112 @@ crate::ktest!(
             kassert!(ACKED[t0].load(Ordering::Acquire) >= published);
         }
 
-        // 5. Target that switches away answers through `active` while `ACKED` is still behind.
+        // 5. Break-before-make copy-on-write split: the old read-only leaf is
+        //    cleared and shot down BEFORE the writable copy is mapped or the
+        //    old frame's count is decremented.
+        {
+            const OLD_VAL: u32 = 0x1122_3344;
+            const NEW_VAL: u32 = 0x5566_7788;
+            let parent = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new cow")?);
+            parent
+                .map_eager_with_bytes(COW_VA, PAGE_SIZE, Prot::READ | Prot::WRITE, &OLD_VAL.to_ne_bytes())
+                .map_err(|_| "map cow page")?;
+            let old_phys = paging::walk_user(parent.root(), VirtAddr::new(COW_VA).unwrap())
+                .mapping()
+                .ok_or("cow page not mapped")?
+                .phys;
+            let child = parent.fork_copy().map_err(|_| "fork_copy cow")?;
+            kassert_eq!(frame::user_count(old_phys), 2);
+
+            let lock_held = Arc::new(AtomicBool::new(false));
+            let release_lock = Arc::new(AtomicBool::new(false));
+            let abort = Arc::new(AtomicBool::new(false));
+            let wedged = Arc::new(AtomicBool::new(false));
+            let split_done = Arc::new(AtomicBool::new(false));
+            let split_ok = Arc::new(AtomicBool::new(false));
+            let read_before = Arc::new(AtomicU32::new(0));
+            let read_after = Arc::new(AtomicU32::new(0));
+
+            let mut helpers = Helpers::new([release_lock.clone(), abort.clone()]);
+            helpers.add({
+                let lock_held = lock_held.clone();
+                let release_lock = release_lock.clone();
+                let abort = abort.clone();
+                let wedged = wedged.clone();
+                let split_done = split_done.clone();
+                let read_before = read_before.clone();
+                let read_after = read_after.clone();
+                sched::spawn_user_on(t0, "tlb-cow-read", parent.clone(), move || {
+                    read_before.store(read_u32_nofault(COW_VA).unwrap_or(0), Ordering::Release);
+                    let guard_lock = SpinLock::new(());
+                    {
+                        let _g = guard_lock.lock();
+                        lock_held.store(true, Ordering::Release);
+                        spin_or_wedge(&wedged, || release_lock.load(Ordering::Acquire));
+                    }
+                    spin_or_wedge(&wedged, || split_done.load(Ordering::Acquire) || abort.load(Ordering::Acquire));
+                    read_after.store(read_u32_nofault(COW_VA).unwrap_or(0), Ordering::Release);
+                })
+                .map_err(|_| "spawn cow reader")?
+            });
+
+            kassert!(sched::yield_until(|| lock_held.load(Ordering::Acquire)));
+            let gen_before = REQUEST_GEN.load(Ordering::Acquire);
+            helpers.add({
+                let split_done = split_done.clone();
+                let split_ok = split_ok.clone();
+                sched::spawn_user_on(t1, "tlb-cow-write", parent.clone(), move || {
+                    let ok = copy_to_user(COW_VA, &NEW_VAL.to_ne_bytes()).is_ok();
+                    split_ok.store(ok, Ordering::Release);
+                    split_done.store(true, Ordering::Release);
+                })
+                .map_err(|_| "spawn cow writer")?
+            });
+
+            // Wait until the CoW split's shootdown is published while `t0` still holds its lock.
+            kassert!(sched::yield_until(|| {
+                let g = REQUEST_GEN.load(Ordering::Acquire);
+                g >= gen_before + 2 && (g & 1) == 0
+            }));
+            let published = REQUEST_GEN.load(Ordering::Acquire);
+            kassert!(ACKED[t0].load(Ordering::Acquire) < published);
+            kassert!(!split_done.load(Ordering::Acquire));
+            // Break-before-make: the leaf must be unmapped (not yet replaced with
+            // the writable copy) and the old frame's count still 2 during shootdown.
+            kassert!(paging::walk_user(parent.root(), VirtAddr::new(COW_VA).unwrap()).mapping().is_none());
+            kassert_eq!(frame::user_count(old_phys), 2);
+
+            release_lock.store(true, Ordering::Release);
+            helpers.join();
+            check_not_wedged(&wedged)?;
+            kassert!(split_ok.load(Ordering::Acquire));
+            kassert_eq!(read_before.load(Ordering::Acquire), OLD_VAL);
+            kassert_eq!(read_after.load(Ordering::Acquire), NEW_VAL);
+            kassert_eq!(frame::user_count(old_phys), 1);
+            kassert!(ACKED[t0].load(Ordering::Acquire) >= published);
+
+            child.teardown();
+            parent.teardown();
+            kassert_eq!(child.active_mask(), 0);
+            kassert_eq!(parent.active_mask(), 0);
+        }
+
+        // 6. Target that switches away answers through `active` while `ACKED` is still behind.
         {
             space
                 .map_eager_with_bytes(SWITCH_VA, PAGE_SIZE, Prot::READ | Prot::WRITE, &SENTINEL.to_ne_bytes())
                 .map_err(|_| "map switch page")?;
             let ready = Arc::new(AtomicBool::new(false));
             let abort = Arc::new(AtomicBool::new(false));
+            let wedged = Arc::new(AtomicBool::new(false));
             let unmap_done = Arc::new(AtomicBool::new(false));
             let answered_via_active = Arc::new(AtomicBool::new(false));
 
-            let h_target = JoinOnDrop(Some({
+            let mut helpers = Helpers::new([abort.clone()]);
+            helpers.add({
                 let ready = ready.clone();
                 let abort = abort.clone();
+                let wedged = wedged.clone();
                 let unmap_done = unmap_done.clone();
                 let answered_via_active = answered_via_active.clone();
                 sched::spawn_user_on(t0, "tlb-switch", space.clone(), move || {
@@ -907,24 +1053,20 @@ crate::ktest!(
                     let were_on = arch::irq::disable();
                     let gen_before = REQUEST_GEN.load(Ordering::Acquire);
                     ready.store(true, Ordering::Release);
-                    let pub_deadline = time::now_ns().saturating_add(ANTI_WEDGE_NS);
                     let mut published = 0u64;
-                    while !abort.load(Ordering::Acquire) && time::now_ns() < pub_deadline {
+                    spin_or_wedge(&wedged, || {
+                        if abort.load(Ordering::Acquire) {
+                            return true;
+                        }
                         let g = REQUEST_GEN.load(Ordering::Acquire);
                         if g >= gen_before + 2 && (g & 1) == 0 {
                             published = g;
-                            break;
+                            return true;
                         }
-                        core::hint::spin_loop();
-                    }
+                        false
+                    });
                     let detached = sched::detach_user_space();
-                    let wait_deadline = time::now_ns().saturating_add(ANTI_WEDGE_NS);
-                    while !unmap_done.load(Ordering::Acquire)
-                        && !abort.load(Ordering::Acquire)
-                        && time::now_ns() < wait_deadline
-                    {
-                        core::hint::spin_loop();
-                    }
+                    spin_or_wedge(&wedged, || unmap_done.load(Ordering::Acquire) || abort.load(Ordering::Acquire));
                     let ok = published != 0
                         && unmap_done.load(Ordering::Acquire)
                         && ACKED[t0].load(Ordering::Acquire) < published;
@@ -933,17 +1075,17 @@ crate::ktest!(
                     drop(detached);
                 })
                 .map_err(|_| "spawn switch target")?
-            }));
-            let _abort_on_drop = SetOnDrop(abort.clone());
+            });
 
             kassert!(sched::yield_until(|| ready.load(Ordering::Acquire)));
             space.munmap(SWITCH_VA, PAGE_SIZE).map_err(|_| "munmap switch page")?;
             unmap_done.store(true, Ordering::Release);
-            h_target.join();
+            helpers.join();
+            check_not_wedged(&wedged)?;
             kassert!(answered_via_active.load(Ordering::Acquire));
         }
 
-        // 6. `teardown` waits for `active` to empty while a pinned thread's switch is delayed
+        // 7. `teardown` waits for `active` to empty while a pinned thread's switch is delayed
         //    by `allow_switch`.
         {
             let td_space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new td")?);
@@ -955,7 +1097,8 @@ crate::ktest!(
             let teardown_entered = Arc::new(AtomicBool::new(false));
             let teardown_done = Arc::new(AtomicBool::new(false));
 
-            let h_hold = JoinOnDrop(Some({
+            let mut helpers = Helpers::new([allow_switch.clone()]);
+            helpers.add({
                 let loaded = loaded.clone();
                 let allow_switch = allow_switch.clone();
                 sched::spawn_user_on(t0, "tlb-td-hold", td_space.clone(), move || {
@@ -967,13 +1110,12 @@ crate::ktest!(
                     // Returning from `spawn_user_on` detaches `td_space` and switches away.
                 })
                 .map_err(|_| "spawn teardown holder")?
-            }));
-            let _allow_on_drop = SetOnDrop(allow_switch.clone());
+            });
 
             kassert!(sched::yield_until(|| loaded.load(Ordering::Acquire)));
             kassert!(sched::yield_until(|| (td_space.active_mask() & (1u64 << t0)) == (1u64 << t0)));
 
-            let h_td = JoinOnDrop(Some({
+            helpers.add({
                 let td_space = td_space.clone();
                 let teardown_entered = teardown_entered.clone();
                 let teardown_done = teardown_done.clone();
@@ -983,7 +1125,7 @@ crate::ktest!(
                     teardown_done.store(true, Ordering::Release);
                 })
                 .map_err(|_| "spawn teardown runner")?
-            }));
+            });
 
             kassert!(sched::yield_until(|| teardown_entered.load(Ordering::Acquire)));
             let _ = sched::sleep(20_000_000);
@@ -991,8 +1133,7 @@ crate::ktest!(
             kassert!(!teardown_done.load(Ordering::Acquire));
 
             allow_switch.store(true, Ordering::Release);
-            h_hold.join();
-            h_td.join();
+            helpers.join();
             kassert!(teardown_done.load(Ordering::Acquire));
             kassert_eq!(td_space.active_mask(), 0);
         }

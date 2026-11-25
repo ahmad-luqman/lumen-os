@@ -1177,26 +1177,29 @@ one entry point, `tlb::shoot_down(space: &AddressSpace, what: Shoot)`
   the bit again.
 - **The board:** `SHOOTDOWN: SleepMutex<Board>`, one request at a time
   kernel-wide (section 9's Lock 1a: taken only under the space's Lock 1,
-  nothing numbered 2–9 or 10 held). `Board` holds only the writer's
-  generation counter; the published request (`REQUEST_GEN`, `REQUEST_ROOT`,
-  `REQUEST_START`, `REQUEST_END`, `REQUEST_FULL`) and each CPU's
-  acknowledged generation (`ACKED[cpu]`) live in module-level atomics the
-  handler reads without a lock.
-- **The request:** with the PTEs already changed under Lock 1: (1) with
-  interrupts off (so the thread can't migrate in between), flush this CPU
-  (`invlpg` per page, or a `CR3` reload for `Full` or past `FULL_FLUSH_PAGES`
-  = 32 pages, about Linux's `tlb_single_page_flush_ceiling` of 33), read
-  `active` (`SeqCst`, after the PTE stores) less this CPU, publish the
-  request with a new generation and send `0x3e` to each CPU left; (2) with
-  interrupts on again, wait until each target's `ACKED` reaches the
-  generation or its bit has left `active` (it has loaded another root,
-  which flushes every non-global entry). The wait spins with interrupts on
-  (`debug_assert!(irq::enabled() && irq::depth() == 0)`), so this CPU
-  keeps taking interrupts, shootdowns and M1's `WAKEUP` included; it warns
-  at 2 s (host-timed: B5 adds that first line to `klog.py`'s `HOST_TIMED`)
-  and every 2 s thereafter with distinct non-host-timed text naming the
-  elapsed time and unsent mask, keeping waiting since the frames can't be
-  freed before.
+  with no lock below it held (2 through 10, 9a included)). `Board` holds
+  only the writer's generation counter; the published request
+  (`REQUEST_GEN`, `REQUEST_ROOT`, `REQUEST_START`, `REQUEST_END`,
+  `REQUEST_FULL`) and each CPU's acknowledged generation (`ACKED[cpu]`)
+  live in module-level atomics the handler reads without a lock.
+- **The request:** with the PTEs already changed under Lock 1: a fast path
+  flushes this CPU with interrupts off (`invlpg` per page, or a `CR3`
+  reload for `Full` or past `FULL_FLUSH_PAGES` = 32 pages, about Linux's
+  `tlb_single_page_flush_ceiling` of 33), issues a `SeqCst` fence, then
+  reads `active` less this CPU, returning without taking `SHOOTDOWN` when
+  no other CPU has the space loaded. Otherwise it acquires `SHOOTDOWN` and:
+  (1) with interrupts off (so the thread can't migrate in between), flushes
+  this CPU if it migrated, issues a `SeqCst` fence, then reads `active`
+  less this CPU, publishes the request with a new generation and sends
+  `0x3e` to each CPU left; (2) with interrupts on again, waits until each
+  target's `ACKED` reaches the generation or its bit has left `active` (it
+  has loaded another root, which flushes every non-global entry). The wait
+  spins with interrupts on (`debug_assert!(irq::enabled() && irq::depth()
+  == 0)`), so this CPU keeps taking interrupts, shootdowns and M1's
+  `WAKEUP` included; it warns at 2 s (host-timed: B5 adds that first line
+  to `klog.py`'s `HOST_TIMED`) and every 2 s thereafter with distinct
+  non-host-timed text naming the elapsed time and unsent mask, keeping
+  waiting since the frames can't be freed before.
 - **The handler:** if this CPU's `CR3` is the request's root, flush the
   range (or reload `CR3`); store the generation in `ACKED[cpu]`; EOI. It
   takes no lock.
@@ -1235,7 +1238,7 @@ whose `active` has another CPU in it:
 Tested by `ktest:lumen_kernel::mm::tlb::shootdown_across_cpus` (B5),
 `ktest:lumen_kernel::mm::frame::refcount_and_cow_split` (B4),
 `ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only` (B4),
-and (future, C11: cross-CPU `fork` write-protect and copy-on-write split)
+and (future, C11: cross-CPU `fork` write-protect)
 `scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
 (section 15, "M8's tests", says what each checks).
 
@@ -8397,7 +8400,8 @@ holding only locks above it.
  1. AddressSpace::inner (SleepMutex); two only in fork_copy, the parent's
     then the child's (the child is new: nothing else holds it)
  1a. The TLB shootdown board, SHOOTDOWN (SleepMutex): taken only under
-    Lock 1, with nothing numbered 2–9 or 10 held (section 5)
+    Lock 1, with no lock below it held (2 through 10, 9a included)
+    (section 5)
  2. OpenFile::offset / dir_cursor (SleepMutex)
  3. Per-filesystem rename_lock (SleepMutex)
  4. VfsInode metadata / directory / AdvisoryLocks lock (SleepMutex)
@@ -10628,7 +10632,10 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   (`PROT_NONE`) across the three target CPUs; a target spinning with an
   IRQ-off `SpinLock` held, released only after the request is published
   (its `ACKED` still behind and the unmapped frame's refcount still >= 1),
-  answering once it lets go (refcount then 0); a target that switched away
+  answering once it lets go (refcount then 0); a break-before-make
+  copy-on-write split on a `fork_copy` page (during the shootdown window,
+  the leaf is unmapped and the old frame's refcount is still 2; after
+  release, the reader sees the copy's bytes); a target that switched away
   answering through `active`; `teardown` waiting for `active` to empty (a
   pinned thread's switch delayed by `allow_switch`). It fails on fewer
   than 4 CPUs.

@@ -529,9 +529,11 @@ impl AddressSpace {
     /// threads sharing one address space keep the bit set.
     ///
     /// # Safety
-    /// Interrupts must be disabled on this CPU. Both `next` (if `Some`) and the
-    /// space currently recorded in `PerCpu::loaded_space` (if non-null) must
-    /// remain alive for the duration of this call.
+    /// Interrupts must be disabled on this CPU. `next` (if `Some`) must stay
+    /// alive until a later [`Self::switch_loaded`] on this CPU replaces or
+    /// clears it (as `percpu::set_loaded_space` requires), and the space
+    /// currently recorded in `PerCpu::loaded_space` (if non-null) must remain
+    /// alive for the duration of this call.
     pub(crate) unsafe fn switch_loaded(next: Option<&AddressSpace>) {
         debug_assert!(!arch::irq::enabled(), "AddressSpace::switch_loaded called with interrupts enabled");
         let cpu = arch::cpu_index();
@@ -1132,9 +1134,9 @@ impl AddressSpace {
     ///
     /// `PTE_SHARED` leaves always become read-only (the next store faults:
     /// copy-on-write, or `MAP_SHARED` dirty promotion), so each writable one
-    /// loses its [`WritableMap`], dropped after the walk retires its entry
-    /// (a local flush only if loaded here; M7 excludes remote users). Their
-    /// pins stay, `PROT_NONE` included.
+    /// loses its [`WritableMap`], dropped after the walk retires its entry on
+    /// every CPU holding this space (`tlb::shoot_down`). Their pins stay,
+    /// `PROT_NONE` included.
     /// Counted private leaves with multiple references also stay read-only
     /// when write access is granted; shared anonymous leaves follow `prot`.
     pub fn mprotect(&self, addr: u64, len: u64, prot: Prot) -> Result<(), UserVmError> {
@@ -1556,7 +1558,6 @@ impl AddressSpace {
     /// away from this `CR3` was the unmap order's flush), and the
     /// `mapped_files` references after `inner` is released.
     pub(crate) fn teardown(&self) {
-        const TEARDOWN_WARN_NS: u64 = 2_000_000_000;
         assert_ne!(
             arch::paging::active_root(),
             self.root,
@@ -1583,21 +1584,11 @@ impl AddressSpace {
                 arch::irq::enabled() && arch::irq::depth() == 0,
                 "AddressSpace::teardown waiting for active CPUs with interrupts off or a SpinLock held"
             );
-            let mut warn_at = {
-                let now = crate::time::now_ns();
-                if now == 0 { 0 } else { now.saturating_add(TEARDOWN_WARN_NS) }
-            };
-            let mut warned = false;
+            let mut timer = tlb::WaitTimer::new();
             while mask != 0 {
-                if !warned {
-                    let now = crate::time::now_ns();
-                    if warn_at == 0 && now != 0 {
-                        warn_at = now.saturating_add(TEARDOWN_WARN_NS);
-                    } else if warn_at != 0 && now >= warn_at {
-                        let root = self.root;
-                        log::warn!(target: "mm", "cpus {mask:#x} still have {root} loaded: teardown waits for them");
-                        warned = true;
-                    }
+                if let Some((true, _)) = timer.poll() {
+                    let root = self.root;
+                    log::warn!(target: "mm", "cpus {mask:#x} still have {root} loaded: teardown waits for them");
                 }
                 core::hint::spin_loop();
                 crate::sched::yield_now();
@@ -1880,13 +1871,16 @@ impl PendingShoot {
             for &phys in &self.shared[..self.shared_len] {
                 release_order::record(phys, release_order::Step::Flushed);
             }
+            // Mark flushed before replacing so `Drop` on the old value passes.
             self.start = u64::MAX;
-            self.end = 0;
-            #[cfg(feature = "ktest")]
-            {
-                self.shared_len = 0;
-            }
+            *self = Self::new();
         }
+    }
+}
+
+impl Drop for PendingShoot {
+    fn drop(&mut self) {
+        debug_assert!(self.start >= self.end, "PendingShoot dropped unflushed");
     }
 }
 
