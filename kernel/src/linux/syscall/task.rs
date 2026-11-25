@@ -9,8 +9,9 @@ use super::at::UserPtr;
 use super::not_implemented;
 use crate::arch;
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
-use crate::linux::general;
+use crate::linux::process;
 use crate::linux::process::{current_process, current_thread, record_exit};
+use crate::linux::{errno, general};
 use crate::user::UserExit;
 
 /// `exit` and `exit_group` (one arm in `dispatch`).
@@ -48,31 +49,67 @@ pub(super) fn sys_set_tid_address(frame: &mut SyscallFrame) -> SyscallReturn {
     SyscallReturn::Sysret
 }
 
-/// `clone(flags, newsp, parent_tid, child_tid, tls)` (56): M8 stub, replaced by C1 (#380) and C3 (#382).
-/// Linux reads only `flags`' low 32 bits (`lower_32_bits(clone_flags)`).
-/// The frame is the parent's registers at the `syscall`, from which the
-/// child's starting ones are made.
+/// Validate M8's process-clone flags before allocating anything.
+fn clone_flags(flags: u32, tls: u64) -> Result<(), u32> {
+    let allowed = general::CSIGNAL
+        | general::CLONE_VM
+        | general::CLONE_FS
+        | general::CLONE_FILES
+        | general::CLONE_SIGHAND
+        | general::CLONE_THREAD
+        | general::CLONE_VFORK
+        | general::CLONE_SETTLS
+        | general::CLONE_PARENT_SETTID
+        | general::CLONE_CHILD_SETTID
+        | general::CLONE_CHILD_CLEARTID
+        | general::CLONE_SYSVSEM
+        | general::CLONE_DETACHED
+        | general::CLONE_IO
+        | general::CLONE_PTRACE
+        | general::CLONE_UNTRACED;
+    if flags & !allowed != 0
+        || (flags & general::CLONE_THREAD != 0 && flags & general::CLONE_SIGHAND == 0)
+        || (flags & general::CLONE_SIGHAND != 0 && flags & general::CLONE_VM == 0)
+        || (flags & general::CLONE_SIGHAND != 0 && flags & general::CLONE_THREAD == 0)
+        || (flags & general::CLONE_THREAD == 0 && flags & general::CSIGNAL != general::SIGCHLD)
+        || (flags & general::CLONE_THREAD != 0
+            && flags & (general::CLONE_FILES | general::CLONE_FS) != (general::CLONE_FILES | general::CLONE_FS))
+    {
+        return Err(errno::EINVAL);
+    }
+    if flags & general::CLONE_SETTLS != 0 && tls >= crate::user::USER_MAX {
+        return Err(errno::EPERM);
+    }
+    // Thread creation and group exit are C3; never silently create a process
+    // for a request to create a thread.
+    if flags & general::CLONE_THREAD != 0 {
+        return Err(errno::ENOSYS);
+    }
+    Ok(())
+}
+
+/// A process clone returns its pid to the parent and zero to the child.
 pub(super) fn sys_clone(
-    _flags: u32,
-    _newsp: UserPtr,
-    _parent_tid: UserPtr,
-    _child_tid: UserPtr,
-    _tls: u64,
-    _frame: &SyscallFrame,
+    flags: u64,
+    newsp: UserPtr,
+    parent_tid: UserPtr,
+    child_tid: UserPtr,
+    tls: u64,
+    frame: &SyscallFrame,
 ) -> u64 {
-    not_implemented(general::__NR_clone)
+    super::finish((|| {
+        let flags = u32::try_from(flags).map_err(|_| errno::EINVAL)?;
+        clone_flags(flags, tls)?;
+        process::fork_current(flags, newsp.addr(), parent_tid.addr(), child_tid.addr(), tls, frame)
+    })())
 }
 
-/// `fork()` (57): M8 stub, replaced by C1 (#380). The frame is the
-/// parent's registers at the `syscall`, from which the child's starting
-/// ones are made.
-pub(super) fn sys_fork(_frame: &SyscallFrame) -> u64 {
-    not_implemented(general::__NR_fork)
+pub(super) fn sys_fork(frame: &SyscallFrame) -> u64 {
+    super::finish(process::fork_current(general::SIGCHLD, 0, 0, 0, 0, frame))
 }
 
-/// `vfork()` (58): M8 stub, replaced by C1 (#380). The frame as `fork`'s.
-pub(super) fn sys_vfork(_frame: &SyscallFrame) -> u64 {
-    not_implemented(general::__NR_vfork)
+pub(super) fn sys_vfork(frame: &SyscallFrame) -> u64 {
+    super::finish(process::fork_current(general::CLONE_VM | general::CLONE_VFORK | general::SIGCHLD, 0, 0, 0, 0, frame))
 }
 
 /// `execve(path, argv, envp)` (59): M8 stub, replaced by C2 (#381). It
@@ -83,14 +120,56 @@ pub(super) fn sys_execve(_path: UserPtr, _argv: UserPtr, _envp: UserPtr, frame: 
     SyscallReturn::Sysret
 }
 
-/// `wait4(pid, wstatus, options, rusage)` (61): M8 stub, replaced by C1 (#380) and C6 (#385).
-pub(super) fn sys_wait4(_pid: i32, _wstatus: UserPtr, _options: u32, _rusage: UserPtr) -> u64 {
-    not_implemented(general::__NR_wait4)
+/// Reap before copyout, as Linux does even when a status pointer faults.
+pub(super) fn sys_wait4(pid: i32, wstatus: UserPtr, options: u32, rusage: UserPtr) -> u64 {
+    super::finish((|| {
+        let request = process::wait4_request(pid, options)?;
+        let Some(report) = process::wait_child(request)? else {
+            return Ok(0);
+        };
+        if !wstatus.is_null() {
+            crate::user::copy_to_user(wstatus.addr(), &report.status().word().to_ne_bytes())
+                .map_err(|_| errno::EFAULT)?;
+        }
+        write_rusage(rusage)?;
+        Ok(u64::from(report.pid()))
+    })())
 }
 
-/// `waitid(idtype, id, infop, options, rusage)` (247): M8 stub, replaced by C1 (#380) and C6 (#385).
-pub(super) fn sys_waitid(_idtype: i32, _id: i32, _infop: UserPtr, _options: u32, _rusage: UserPtr) -> u64 {
-    not_implemented(general::__NR_waitid)
+/// A nonblocking wait with no event clears the siginfo fields. WNOWAIT
+/// reports a zombie without releasing its pid or process-table entry.
+pub(super) fn sys_waitid(idtype: i32, id: i32, infop: UserPtr, options: u32, rusage: UserPtr) -> u64 {
+    super::finish((|| {
+        let request = process::waitid_request(idtype, id, options)?;
+        let report = process::wait_child(request)?;
+        if report.is_some() {
+            write_rusage(rusage)?;
+        }
+        if !infop.is_null() {
+            // siginfo_t's child fields: three ints, padding, pid, uid,
+            // status, padding, utime and stime. Zeroed bytes avoid exposing
+            // kernel padding; C12 supplies tick accounting.
+            let mut info = [0u8; core::mem::size_of::<general::siginfo_t>()];
+            if let Some(report) = report {
+                let status = report.status().siginfo();
+                info[0..4].copy_from_slice(&general::SIGCHLD.to_ne_bytes());
+                info[8..12].copy_from_slice(&status.code.to_ne_bytes());
+                info[16..20].copy_from_slice(&report.pid().to_ne_bytes());
+                info[24..28].copy_from_slice(&status.status.to_ne_bytes());
+            }
+            crate::user::copy_to_user(infop.addr(), &info).map_err(|_| errno::EFAULT)?;
+        }
+        Ok(0)
+    })())
+}
+
+fn write_rusage(ptr: UserPtr) -> Result<(), u32> {
+    if !ptr.is_null() {
+        // Tick accounting is C12. No other resource counters are maintained.
+        crate::user::copy_to_user(ptr.addr(), &[0; core::mem::size_of::<general::rusage>()])
+            .map_err(|_| errno::EFAULT)?;
+    }
+    Ok(())
 }
 
 /// `setpgid(pid, pgid)` (109): M8 stub, replaced by C8 (#387).

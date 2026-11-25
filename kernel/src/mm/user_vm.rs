@@ -598,8 +598,7 @@ impl AddressSpace {
         }
     }
 
-    /// Process users, excluding observer `Arc`s, for the ktests.
-    #[cfg(feature = "ktest")]
+    /// Process users, excluding observer `Arc`s (exit and the ktests).
     pub fn users(&self) -> u32 {
         self.users.load(Ordering::Acquire)
     }

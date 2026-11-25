@@ -223,6 +223,7 @@ lumen_syscall_entry:
     swapgs
     sysretq
 1:
+lumen_fork_iret:
     popq %r15
     popq %r14
     popq %r13
@@ -285,6 +286,30 @@ lumen_enter_ring3_call:
     iretq
     .size lumen_enter_ring3_call, . - lumen_enter_ring3_call
 
+    .globl lumen_enter_fork_call
+    .type lumen_enter_fork_call, @function
+    .balign 16
+lumen_enter_fork_call:
+    # Save the same unwind frame as lumen_enter_ring3_call.
+    pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    subq $8, %rsp
+    movq %rdi, %r12
+    movq %rsp, %rdi
+    call lumen_set_ring3_stack
+    subq $160, %rsp
+    movq %rsp, %rdi
+    movq %r12, %rsi
+    movq $20, %rcx
+    cld
+    rep movsq
+    jmp lumen_fork_iret
+    .size lumen_enter_fork_call, . - lumen_enter_fork_call
+
     .globl lumen_user_unwind
     .type lumen_user_unwind, @function
     .balign 16
@@ -313,6 +338,7 @@ unsafe extern "C" {
     fn lumen_syscall_entry();
     fn lumen_enter_ring3_call(rip: u64, user_rsp: u64, rflags: u64);
     fn lumen_user_unwind() -> !;
+    fn lumen_enter_fork_call(frame: *const SyscallFrame);
 }
 
 /// Address of `lumen_syscall_entry` (`IA32_LSTAR`).
@@ -490,6 +516,48 @@ pub unsafe fn enter_ring3(rip: u64, user_rsp: u64, rflags: u64) {
     let cpu = percpu::index();
     // SAFETY: interrupts are off on `cpu` and no ring-3 context is active.
     unsafe { gdt::set_rsp0(cpu, 0) };
+    percpu::set_kernel_rsp(0);
+    percpu::set_pending_debug_trap(false);
+    irq::restore(were_on);
+}
+
+/// Resume a fork child's saved user registers, returning after its exit.
+///
+/// # Safety
+/// The current user address space is the child's, its identity is installed,
+/// interrupts are enabled, and no lock or other ring-3 context is active.
+pub unsafe fn enter_fork(mut frame: SyscallFrame) {
+    assert!(irq::enabled() && irq::depth() == 0);
+    assert_eq!(percpu::user_exit_rsp(), 0);
+    frame.cs = u64::from(USER_CODE);
+    frame.ss = u64::from(USER_DATA);
+    frame.rflags = sanitize_user_rflags(frame.rflags);
+    // A bad inherited return address must end the child, never cause a
+    // ring-0 #GP at iretq with user GS loaded.
+    if frame.rip >= USER_MAX {
+        crate::linux::process::record_exit(crate::user::UserExit::NonCanonicalRip(frame.rip));
+        return;
+    }
+    if frame.rsp >> 47 != 0 && frame.rsp >> 47 != 0x1ffff {
+        // IRET checks canonicality before reaching ring 3. Model its #SS
+        // as the child's fault instead of taking it with kernel CS/user GS.
+        crate::linux::process::record_exit(crate::user::UserExit::Fault {
+            vector: 12,
+            error_code: 0,
+            rip: frame.rip,
+            cr2: 0,
+        });
+        return;
+    }
+    let were_on = irq::disable();
+    percpu::set_pending_debug_trap(false);
+    // SAFETY: the MSR exists, the frame has fixed user selectors and safe
+    // flags, and the caller keeps the child's address space installed.
+    unsafe {
+        wrmsr(percpu::IA32_KERNEL_GS_BASE, 0);
+        lumen_enter_fork_call(&frame);
+        gdt::set_rsp0(percpu::index(), 0);
+    }
     percpu::set_kernel_rsp(0);
     percpu::set_pending_debug_trap(false);
     irq::restore(were_on);

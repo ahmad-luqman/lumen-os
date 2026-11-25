@@ -1164,6 +1164,21 @@ pub fn set_current_fs_base(addr: u64) {
     user.fs_base.store(addr, Ordering::Relaxed);
 }
 
+/// Replace the current thread's address space and load its root atomically.
+/// Process::replace_mm is the only Linux caller: it updates the process's
+/// matching reference before re-enabling interrupts, then retires the old mm.
+pub(crate) fn replace_user_space(space: Arc<AddressSpace>) -> Arc<AddressSpace> {
+    let _irq = arch::irq::push_off();
+    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
+    assert!(!t.is_null());
+    // SAFETY: only the current thread accesses its slot, with interrupts off.
+    let user = unsafe { &mut *(*t).user.slot() }.as_mut().expect("user thread");
+    let old = core::mem::replace(&mut user.address_space, space);
+    // SAFETY: the new space owns its root and shares all kernel mappings.
+    unsafe { arch::paging::write_cr3(user.address_space.root().as_u64()) };
+    old
+}
+
 /// Detach the current thread's [`UserThreadState`], switching `CR3` back to
 /// `kernel_root()` and clearing `TSS.rsp0`, `PerCpu`, and `IA32_FS_BASE`.
 /// A Linux process's thread is detached by its takedown
@@ -1467,10 +1482,31 @@ pub fn spawn_on(
     spawn_with(cpu, name.into(), STACK_SIZE, Box::new(f))
 }
 
-/// Start a pinned user thread on CPU `cpu` with its own [`AddressSpace`],
-/// clean [`arch::fpu::UserFpuState`], and `fs_base = 0`.
+/// Initial user identity and TLS. Roots have no Linux identity until registration;
+/// fork children carry theirs before they are put on the run queue.
+pub struct UserStart {
+    space: Arc<AddressSpace>,
+    linux: Option<Arc<UserThread>>,
+    fs_base: u64,
+}
+
+impl From<Arc<AddressSpace>> for UserStart {
+    fn from(space: Arc<AddressSpace>) -> Self {
+        Self { space, linux: None, fs_base: 0 }
+    }
+}
+
+impl From<(Arc<AddressSpace>, Arc<UserThread>, u64)> for UserStart {
+    fn from((space, linux, fs_base): (Arc<AddressSpace>, Arc<UserThread>, u64)) -> Self {
+        Self { space, linux: Some(linux), fs_base }
+    }
+}
+
+/// Start a user thread pinned to CPU `cpu`. An address space alone starts
+/// a root with clean FPU state and zero TLS. A (space, UserThread, fs_base)
+/// tuple starts a fork child on the caller's CPU with inherited FPU state
+/// and its Linux identity installed before it becomes runnable.
 ///
-/// M6–M7 user threads are single-threaded and pinned to their home CPU `cpu`.
 /// A thread whose Linux process registered is detached and its space given
 /// up by that process's takedown (`linux::process::take_current`) before
 /// `f` returns. For one that registered none, when `f` returns,
@@ -1480,10 +1516,22 @@ pub fn spawn_on(
 pub fn spawn_user_on(
     cpu: usize,
     name: impl Into<ThreadName>,
-    address_space: Arc<AddressSpace>,
+    start: impl Into<UserStart>,
     f: impl FnOnce() + Send + 'static,
 ) -> Result<JoinHandle, SpawnError> {
-    spawn_with_user(cpu, name.into(), STACK_SIZE, Box::new(f), Some(UserThreadState::new(address_space)))
+    let start = start.into();
+    let mut state = UserThreadState::new(start.space);
+    if start.linux.is_some() {
+        assert_eq!(cpu, arch::cpu_index(), "fork children stay on their caller's CPU");
+        assert!(start.fs_base < arch::fpu::USER_MAX);
+        // The kernel never uses the FPU. Save the caller's live hardware
+        // state with preemption disabled, before the child can run.
+        let _irq = arch::irq::push_off();
+        state.fpu.get_mut().save();
+    }
+    state.fs_base.store(start.fs_base, Ordering::Relaxed);
+    state.linux = start.linux;
+    spawn_with_user(cpu, name.into(), STACK_SIZE, Box::new(f), Some(state))
 }
 
 fn spawn_with(cpu: usize, name: ThreadName, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
@@ -1500,7 +1548,11 @@ fn spawn_with_user(
     if !running_on(cpu) {
         return Err(SpawnError::NotRunning);
     }
+    let linux = user.as_ref().and_then(|u| u.linux.clone());
     let thread = Thread::spawned(name, cpu, stack_size, f, user)?;
+    if let Some(linux) = linux {
+        linux.bind_kernel_thread(&thread);
+    }
     {
         let mut q = CPUS[cpu].lock();
         q.home();

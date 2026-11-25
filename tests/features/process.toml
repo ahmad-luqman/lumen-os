@@ -19,3 +19,15 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::signal::sigaction_and_sigprocmask_round_trip",
     "cargo:lumen-proc",
 ]
+
+[[feature]]
+name = "Process lifecycle: fork, vfork, process clone, exit, zombies, wait4/waitid and reparenting to pid 1"
+milestone = "M8"
+tests = [
+    "scenario:test_linux_proc::test_fork_wait_and_exit_status",
+    "ktest:lumen_kernel::linux::process::fork_refusal_releases_unlinked_resources",
+    "ktest:lumen_kernel::linux::process::fork_files_count_slots_and_skip_reservations",
+    "ktest:lumen_kernel::linux::process::files_unshare_waits_for_open_reservations",
+    "ktest:lumen_kernel::linux::process::replace_mm_keeps_process_and_thread_in_agreement",
+    "ktest:lumen_kernel::linux::process::wait_child_interrupts_and_wakes_on_exit",
+]
