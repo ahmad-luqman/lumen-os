@@ -1089,8 +1089,11 @@ Result<Arc<AddressSpace>, UserVmError>`, taking and returning `Arc`s so it
 can register the child's `Weak` as a mapper, below).** Under the parent's
 Lock 1, with the child new and unshared:
 1. Copy the VMA map, the break, `images` and `mapped_files` (each
-   `KeptFile` cloned, the child registered as a mapper of each file, below).
-2. Walk the parent's lower half:
+   `KeptFile` cloned, the child registered as a mapper of each file, below),
+   then read each mapped file's size (after its registration: B7's order).
+2. Walk the parent's lower half (a leaf of a file-backed VMA at or past
+   the size step 1 read for its file is not copied, whatever its kind: the
+   child refaults it, `SIGBUS` past EOF):
    - a private leaf (`PTE_SHARED == 0`) of a private VMA: clear `WRITABLE`
      in the parent's leaf if it was set (a copy-on-write leaf is one that
      isn't writable in a writable VMA), map the same frame read-only in the
@@ -1236,17 +1239,27 @@ SleepMutex<PageCache>`, `mappers: SpinLock<Vec<Weak<AddressSpace>>>`
 `vfs/page_cache.rs`), never under the `pages` lock. `AddressSpace::mmap_file`
 takes `self: &Arc<Self>` (B7) and registers the space when it adds the
 file's `mapped_files` entry (under Lock 1, before any fault can map a
-page of it; `fork_copy` registers the child while it still holds the
-child's Lock 1, section 8), and the entry's removal unregisters it, dead
-`Weak`s pruned at each registration. A shrinking
+page of it), and the entry's removal unregisters it, dead `Weak`s pruned
+at each registration. `fork_copy` (section 8) registers the child for
+each mapped file before it copies any of that file's leaves, then reads
+the file's size and copies only leaves below it, private copies
+included; a leaf at or past it is left unmapped, so the child's access
+refaults against the file (`SIGBUS` past EOF). The `mappers` lock orders
+the two: either the registration comes first and the truncate's snapshot
+holds the child, or the snapshot comes first, after the truncate set the
+size, and the size the fork reads after registering is already the new
+one. (Linux serializes the same pair on `i_mmap_rwsem`, which
+`dup_mmap`'s VMA link and `unmap_mapping_range` both take.) A shrinking
 `truncate`, `ftruncate` or `openat(O_TRUNC)`, once the inode's truncate
 has returned and with no lock held, snapshots the list (each `Weak`
 upgraded, outside the list's lock) and calls `invalidate_file_from(file_id,
 new_size)` on each space in turn, each under its own Lock 1 with its own
 shootdown, so a page another process mapped from a stale size snapshot is
 unmapped as M7's rule unmaps the caller's (a space registered after the
-snapshot mapped nothing before the truncate). Tested by
+snapshot mapped nothing past the new size: a fault checks the size, and
+a fork copies only below the size it reads after registering). Tested by
 `ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space`
+and `ktest:lumen_kernel::mm::user_vm::fork_racing_a_truncate_copies_nothing_past_eof`
 (section 15).
 
 **Faults as signals (C5).** Where M6 and M7 end the process
@@ -4321,7 +4334,7 @@ depends on them.
 | B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended) | 5, 8 |
 | B5 | the TLB shootdown IPI | B2 | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `PerCpu::loaded_space`, `tlb::shoot_down`, the shootdown warning's `HOST_TIMED` entry; `mm::tlb::shootdown_across_cpus` (its probes use B2's `read_u32_nofault`) | 5, 9 |
 | B6 | SMP migration, priorities, affinity | B5, C1 | `on_cpu`, `spawn_migratable`, `spawn_user_on` migratable (after C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
-| B7 | truncate reaching every address space | B1, B4, B5 | the inode's mappers list, `mmap_file(self: &Arc<Self>)`; `truncate_unmaps_every_address_space` | 5 |
+| B7 | truncate reaching every address space | B1, B4, B5 | the inode's mappers list, `mmap_file(self: &Arc<Self>)`; `truncate_unmaps_every_address_space`, `fork_racing_a_truncate_copies_nothing_past_eof` | 5 |
 | B8 | the five M8 hazards | B1 | `OpenFile::pos`, `FdTable::reserve`, `PosixWaitGraph`'s key; the hazard ktests | 8, 9 |
 | C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | B0, B1, B2, B4 | `spawn_user_on` taking the `UserThread`, pinned to the caller's CPU (B6 makes it migratable), `Files::users` across `fork`; `test_fork_wait_and_exit_status` | 8 |
 | C2 | `execve`, single-threaded, `#!`, the streaming loader | B0, C1 | lumen-elf's header split, `ImageSource`, the stack-size parameter; `test_fork_cow_and_exec_shebang` (its single-threaded checks) | 5, 8 |
@@ -4933,7 +4946,9 @@ before `ProcTree::fork`, which can't be undone (lumen-proc has no
    (`fork_copy`, B4, or the shared one; `fork_copy` takes the child's Lock
    1 under the parent's, the one place two Lock 1s nest, and holds both
    through the copy and the child's mapper registration, so a truncate
-   reaching the child waits for the copy), its `Files` and `FsState`
+   reaching the child waits for the copy, and one that snapshotted the
+   mappers before the registration has already set the size the copy
+   stops at, B7), its `Files` and `FsState`
    copies, a `RusageSlot` value, and its kernel thread
    (`sched::spawn_user_on(cpu, ..)`, held at a start gate;
    `MAX_STACKS`, section 6, gives `-EAGAIN`, Linux's errno for its thread
@@ -10536,6 +10551,13 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 - `ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space`
   (B7): two spaces mapping one file, the second loaded on another CPU, and
   a third forked from one: after the truncate none reads past the new end.
+- `ktest:lumen_kernel::mm::user_vm::fork_racing_a_truncate_copies_nothing_past_eof`
+  (B7): a parent with private (copied) and page-cache leaves of a file
+  past the new end; the truncate's mapper snapshot is taken through a seam
+  while `fork_copy` holds the parent's Lock 1 before registering the
+  child, then the truncate finishes: the child's read past the new end is
+  a bus error, not the old page. It kills the mutant that copies leaves
+  without the size check.
 - `scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
   (C11): readers pinned to every CPU, each confirming a read first, then
   reading a page another thread unmaps or protects: each gets `SIGSEGV`
