@@ -8,8 +8,8 @@
 //! as M6 did (`read_into_user`, `write_from_user`), takes the tty `ioctl`s
 //! and polls on the console's readiness; any other goes to its inode at the
 //! file's offset, through a bounce buffer on the stack. Lock 0 (`pos`)
-//! spans each position-based call and its user copies; Lock 2 never spans
-//! a user copy.
+//! spans each position-based call and its user copies when the file has
+//! one (a regular file, procfs file or directory); Lock 2 never spans a user copy.
 
 #[cfg(feature = "ktest")]
 use alloc::vec::Vec;
@@ -83,6 +83,8 @@ fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError
     process::position_window::hold(file, process::position_window::Point::Snapshot);
     let end = pos.saturating_add(checked_len(file.inode().read_at(pos, kbuf)?, kbuf.len())? as u64);
     let mut off = file.offset.lock();
+    // Defensive under Lock 0: no other position-based call can move it.
+    debug_assert_eq!(*off, pos, "procfs offset changed under Lock 0");
     if *off == pos {
         *off = end;
     }
@@ -91,8 +93,10 @@ fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError
 
 /// Read up to `count` bytes (at most `MAX_SINGLE_IO`) from `file` at its
 /// offset into user memory at `user_buf`, a chunk at a time until EOF or a
-/// short read. The caller holds `pos` across the whole call; a chunk the copy
-/// refuses is given back (the offset moves only by what reached the caller).
+/// short read. The caller holds `pos` across the whole call when the file
+/// has one (a regular file, procfs file or directory). A chunk the copy
+/// refuses is given back; the equality guard remains necessary for devices,
+/// whose offset another call can move without Lock 0.
 pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     if file.inode().inode_type() == InodeType::Dir {
         return Err(errno::EISDIR);
@@ -418,6 +422,8 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
     }
+    #[cfg(feature = "ktest")]
+    process::open_install_window();
     let fd = slot.install(file, flags.has_cloexec());
     Ok(fd as u64)
 }

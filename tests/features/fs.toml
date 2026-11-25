@@ -380,16 +380,17 @@ tests = [
 ]
 
 [[feature]]
-name = "M8 shared open descriptions serialize whole position-based calls: regular and procfs readers move each byte once, a failed copy gives its position back under contention, and concurrent getdents64 callers list each name once (#379)"
+name = "M8 shared open descriptions serialize whole position-based calls and fcntl SEEK_CUR sees committed offsets: regular and procfs readers move each byte once, a failed copy gives its position back under contention, and concurrent getdents64 callers list each name once (#379)"
 milestone = "M8"
 tests = [
     "cargo:lumen-vfs",
     "ktest:lumen_kernel::linux::process::shared_description_offsets_move_once",
     "ktest:lumen_kernel::linux::process::shared_description_getdents_lists_once",
+    "ktest:lumen_kernel::linux::syscall::lock::fcntl_seek_cur_uses_committed_position",
 ]
 
 [[feature]]
-name = "M8 descriptor reservations are neither open nor free, survive drains only in their original table, exclude dup2 with EBUSY and refuse a full-table O_CREAT before creating anything; duplication uses one table hold (#379)"
+name = "M8 descriptor reservations are neither open nor free, survive drains, and a fork copy of the table leaves them out; openat holds its slot through installation, dup2 returns EBUSY, and reservations refuse a full-table O_CREAT before creating anything; duplication uses one table hold (#379)"
 milestone = "M8"
 tests = [
     "cargo:lumen-vfs",

@@ -79,7 +79,7 @@ pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
     fd_refs: AtomicU32,
     /// Serializes a whole position-based call, including user copies (Lock 0).
     /// Its value is unused; positional I/O and streams do not take it.
-    pub pos: L,
+    pub(crate) pos: L,
     pub offset: L,
     /// A directory's position (Lock 2): the `readdir` cursor `getdents64`
     /// resumes at, `0` at the start; `lseek` sets it. Opaque: `0` or a
@@ -144,6 +144,7 @@ impl<L: VfsLock<u64>> OpenFile<L> {
     /// directory listing of a regular file (including procfs) or directory.
     /// Streams and devices have no atomic position and return no guard.
     /// Take this before other VFS locks; never for pread or pwrite.
+    #[must_use = "hold the position guard for the whole call"]
     pub fn lock_pos(&self) -> Option<L::Guard<'_>> {
         matches!(self.inode().inode_type(), InodeType::File | InodeType::Dir).then(|| self.pos.lock())
     }
@@ -273,6 +274,8 @@ pub struct FdEntry<F> {
 
 /// A slot reserved in one table: consumed by `install` or `cancel` on that
 /// same table. Not cloneable; neither an open descriptor nor a free slot.
+/// Dropping this token leaves its slot reserved for the table's life.
+/// The kernel uses its RAII `ReservedFd` wrapper, which cancels on drop.
 #[derive(Debug)]
 #[must_use = "install or cancel the reserved descriptor"]
 pub struct FdReservation {
@@ -337,19 +340,21 @@ impl<F> FdTable<F> {
     /// Allocate the lowest free FD `>= min_fd` in `[0, MAX_FDS)` (`F_DUPFD` / `F_DUPFD_CLOEXEC`).
     ///
     /// Returns `Err(Inval)` if `min_fd < 0 || min_fd >= MAX_FDS as i32`,
-    /// or `Err(MFile)` if all slots in `[min_fd, MAX_FDS)` are occupied.
+    /// or `Err(MFile)` if every slot in `[min_fd, MAX_FDS)` is open or reserved.
     pub fn alloc_from(&mut self, min_fd: i32, file: F, cloexec: bool) -> Result<i32, VfsError> {
-        if min_fd < 0 || min_fd as usize >= MAX_FDS {
+        let fd = self.lowest_free(min_fd)?;
+        self.slots.resize_with(self.slots.len().max(fd as usize + 1), || None);
+        self.slots[fd as usize] = Some(FdEntry { file, cloexec });
+        Ok(fd)
+    }
+
+    fn lowest_free(&self, from: i32) -> Result<i32, VfsError> {
+        if from < 0 || from as usize >= MAX_FDS {
             return Err(VfsError::Inval);
         }
-        for fd in min_fd..MAX_FDS as i32 {
-            if self.get(fd).is_none() && !self.reserved.contains_key(&fd) {
-                self.slots.resize_with(self.slots.len().max(fd as usize + 1), || None);
-                self.slots[fd as usize] = Some(FdEntry { file, cloexec });
-                return Ok(fd);
-            }
-        }
-        Err(VfsError::MFile)
+        (from..MAX_FDS as i32)
+            .find(|&fd| self.get(fd).is_none() && !self.reserved.contains_key(&fd))
+            .ok_or(VfsError::MFile)
     }
 
     /// Reserve the lowest free slot at or above `from`, before doing work
@@ -357,27 +362,20 @@ impl<F> FdTable<F> {
     /// `MFile` if none is free. Reserved slots are skipped by all open-FD
     /// operations, drains and clones, and cannot be displaced by dup2.
     pub fn reserve(&mut self, from: i32) -> Result<FdReservation, VfsError> {
-        if from < 0 || from as usize >= MAX_FDS {
-            return Err(VfsError::Inval);
-        }
-        for fd in from..MAX_FDS as i32 {
-            if self.get(fd).is_none() && !self.reserved.contains_key(&fd) {
-                self.slots.resize_with(self.slots.len().max(fd as usize + 1), || None);
-                let id = NEXT_RESERVATION.fetch_add(1, Ordering::Relaxed);
-                assert_ne!(id, 0, "FD reservation identity exhausted");
-                self.reserved.insert(fd, id);
-                return Ok(FdReservation { fd, id });
-            }
-        }
-        Err(VfsError::MFile)
+        let fd = self.lowest_free(from)?;
+        self.slots.resize_with(self.slots.len().max(fd as usize + 1), || None);
+        let id = NEXT_RESERVATION.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(id, 0, "FD reservation identity exhausted");
+        self.reserved.insert(fd, id);
+        Ok(FdReservation { fd, id })
     }
 
     /// Install an entry in its reserved slot, returning its descriptor.
     /// Panics for a token from a different table; nothing is displaced.
-    pub fn install(&mut self, r: FdReservation, entry: FdEntry<F>) -> i32 {
+    pub fn install(&mut self, r: FdReservation, file: F, cloexec: bool) -> i32 {
         self.cancel_reservation(&r);
-        debug_assert!(self.slots[r.fd as usize].is_none());
-        self.slots[r.fd as usize] = Some(entry);
+        assert!(self.slots[r.fd as usize].is_none());
+        self.slots[r.fd as usize] = Some(FdEntry { file, cloexec });
         r.fd
     }
 
@@ -394,6 +392,7 @@ impl<F> FdTable<F> {
 
     /// Insert or replace `fd` directly (`dup2` / `dup3` / stdio seeding).
     ///
+    /// Returns `Err(Busy)` for a reserved slot, `Err(BadF)` outside the table.
     /// Returns the displaced `FdEntry` (if any) so the caller can drop it
     /// outside every spinlock (the kernel's descriptor-table lock among them).
     pub fn insert_at(&mut self, fd: i32, file: F, cloexec: bool) -> Result<Option<FdEntry<F>>, VfsError> {
@@ -459,6 +458,11 @@ impl<F> FdTable<F> {
     /// Iterate over `(fd, entry)` for all open descriptors.
     pub fn iter_open(&self) -> impl Iterator<Item = (i32, &FdEntry<F>)> {
         self.slots.iter().enumerate().filter_map(|(i, slot)| slot.as_ref().map(|e| (i as i32, e)))
+    }
+
+    /// Number of reserved slots awaiting installation or cancellation.
+    pub fn reserved_count(&self) -> usize {
+        self.reserved.len()
     }
 
     /// Number of currently open descriptors.

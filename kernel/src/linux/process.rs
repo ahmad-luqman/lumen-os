@@ -41,8 +41,7 @@ use log::{info, warn};
 use lumen_proc::{ExitAction, ExitError, ExitStatus, INIT_PID, ProcState, ProcTree, RusageSlot};
 use lumen_signal::{Blocked, SigSet, Signal};
 use lumen_vfs::{
-    Escaped, FdEntry, FdReservation, FdTable, InodeType, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode,
-    open_inode_guarded,
+    Escaped, FdReservation, FdTable, InodeType, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded,
 };
 
 use crate::keyboard::{Key as KbdKey, KeyCode};
@@ -399,14 +398,6 @@ impl Files {
         Ok(ReservedFd { files: Arc::clone(self), reservation: Some(reservation) })
     }
 
-    fn install(&self, r: FdReservation, entry: FdEntry<FileRef>) -> i32 {
-        self.table.lock().install(r, entry)
-    }
-
-    fn cancel(&self, r: FdReservation) {
-        self.table.lock().cancel(r);
-    }
-
     /// Another process shares it (C1's `clone(CLONE_FILES)`).
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`; C1's `clone` next
     pub(super) fn share(self: &Arc<Self>) -> Arc<Self> {
@@ -422,7 +413,11 @@ impl Files {
         let before = self.users.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(before, 0, "pid {pid} left a descriptor table nobody shared");
         if before == 1 {
-            let entries = self.table.lock().drain_all();
+            let entries = {
+                let mut table = self.table.lock();
+                debug_assert_eq!(table.reserved_count(), 0, "last user left with an open in flight");
+                table.drain_all()
+            };
             for entry in entries {
                 release_fd(pid, entry.file);
             }
@@ -445,6 +440,10 @@ impl Files {
 impl Drop for Files {
     fn drop(&mut self) {
         let users = *self.users.get_mut();
+        debug_assert_eq!(self.table.get_mut().reserved_count(), 0, "dropped table has reserved slots");
+        if users == 0 {
+            debug_assert_eq!(self.table.get_mut().open_count(), 0, "last leave did not drain the table");
+        }
         debug_assert!(
             users == 0 || self.table.get_mut().open_count() == 0,
             "a descriptor table dropped with {users} users and descriptors open (no last `leave`)"
@@ -1149,25 +1148,32 @@ pub struct ReservedFd {
 }
 
 impl ReservedFd {
+    /// The reserved descriptor number (not open until installed).
+    #[cfg(feature = "ktest")]
+    pub fn fd(&self) -> i32 {
+        self.reservation.as_ref().expect("unconsumed reservation").fd()
+    }
+
     /// Install a fresh description, whose one FD reference becomes this
     /// slot. The reserved descriptor cannot have been taken by a dup.
     pub fn install(mut self, file: KernelFile, cloexec: bool) -> i32 {
-        let entry = FdEntry { file: Arc::new(file), cloexec };
+        let file = Arc::new(file);
         let r = self.reservation.take().expect("unconsumed reservation");
-        self.files.install(r, entry)
+        self.files.table.lock().install(r, file, cloexec)
     }
 }
 
 impl Drop for ReservedFd {
     fn drop(&mut self) {
         if let Some(r) = self.reservation.take() {
-            self.files.cancel(r);
+            self.files.table.lock().cancel(r);
         }
     }
 }
 
-/// Reserve the lowest free descriptor before an open can create or
-/// truncate anything. Its guard cancels the slot on every failure path.
+/// Reserve the lowest free descriptor at or above `from` before an open
+/// can create or truncate anything. Its guard cancels the slot on every
+/// failure path.
 pub fn reserve_current_fd(from: i32) -> Result<ReservedFd, VfsError> {
     let files = current_process().files.lock().clone().expect("a running process has its descriptors");
     files.reserve(from)
@@ -1176,18 +1182,15 @@ pub fn reserve_current_fd(from: i32) -> Result<ReservedFd, VfsError> {
 /// Put `file`, a fresh open file description (its `fd_refs` 1, for this
 /// slot), in the current process's lowest free slot: the descriptor, or
 /// `EMFILE`.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // pre-opened files in the ktests
+#[cfg(feature = "ktest")]
 pub fn install_current_fd(file: KernelFile, cloexec: bool) -> Result<i32, VfsError> {
-    let file = Arc::new(file);
-    // A clone goes in, so a refused one drops under the table's lock without
-    // being the last reference; `file` drops after the lock is released.
-    with_current_fds(|t| t.alloc(Arc::clone(&file), cloexec))
+    Ok(reserve_current_fd(0)?.install(file, cloexec))
 }
 
 /// Put `file`, a fresh open file description, on descriptor `fd` of the
 /// current process, closing what was there (its locks released outside the
-/// table's lock). `EBADF` for an fd outside `0..lumen_vfs::MAX_FDS`:
-/// procfs builds `/proc/<pid>/fd/<fd>`'s inode number from it and relies on
+/// table's lock). `EBUSY` for a reserved slot; `EBADF` for an fd outside
+/// `0..lumen_vfs::MAX_FDS`: procfs builds `/proc/<pid>/fd/<fd>`'s inode number from it and relies on
 /// that range.
 pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
     place_current_fd(fd, Arc::new(file), false)
@@ -2253,19 +2256,48 @@ crate::ktest!(
     }
 );
 
-/// The dup/close test's rendezvous: 0 idle, 1 armed, 2 looked up,
-/// 3 source closed. The corrected path only publishes under its spinlock;
-/// a lookup accidentally moved outside that hold lets the close finish
-/// here, exposing the lost flock before the duplicate can be installed.
+/// The dup/close test's rendezvous. The correct path only publishes under
+/// its spinlock and cannot be preempted there on this CPU. A lookup moved
+/// outside that hold lets the close finish here, exposing the lost flock
+/// before the duplicate can be installed.
 #[cfg(feature = "ktest")]
-static DUP_LOOKUP_PHASE: AtomicU32 = AtomicU32::new(0);
+const DUP_IDLE: u32 = 0;
+#[cfg(feature = "ktest")]
+const DUP_ARMED: u32 = 1;
+#[cfg(feature = "ktest")]
+const DUP_LOOKED_UP: u32 = 2;
+#[cfg(feature = "ktest")]
+const DUP_SOURCE_CLOSED: u32 = 3;
+#[cfg(feature = "ktest")]
+static DUP_LOOKUP_PHASE: AtomicU32 = AtomicU32::new(DUP_IDLE);
 
 #[cfg(feature = "ktest")]
 fn dup_lookup_window() {
-    if DUP_LOOKUP_PHASE.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    if DUP_LOOKUP_PHASE.compare_exchange(DUP_ARMED, DUP_LOOKED_UP, Ordering::SeqCst, Ordering::SeqCst).is_ok()
         && crate::arch::irq::depth() == 0
     {
-        while DUP_LOOKUP_PHASE.load(Ordering::SeqCst) != 3 {
+        while DUP_LOOKUP_PHASE.load(Ordering::SeqCst) != DUP_SOURCE_CLOSED {
+            crate::time::sleep(1_000_000);
+        }
+    }
+}
+
+#[cfg(feature = "ktest")]
+const OPEN_IDLE: u32 = 0;
+#[cfg(feature = "ktest")]
+const OPEN_ARMED: u32 = 1;
+#[cfg(feature = "ktest")]
+const OPEN_PAUSED: u32 = 2;
+#[cfg(feature = "ktest")]
+const OPEN_RELEASED: u32 = 3;
+#[cfg(feature = "ktest")]
+static OPEN_INSTALL_PHASE: AtomicU32 = AtomicU32::new(OPEN_IDLE);
+
+/// Pause one open after its filesystem work and before installing its slot.
+#[cfg(feature = "ktest")]
+pub(crate) fn open_install_window() {
+    if OPEN_INSTALL_PHASE.compare_exchange(OPEN_ARMED, OPEN_PAUSED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        while OPEN_INSTALL_PHASE.load(Ordering::SeqCst) != OPEN_RELEASED {
             crate::time::sleep(1_000_000);
         }
     }
@@ -2289,6 +2321,14 @@ impl<R> KtestThread<R> {
     pub(crate) fn blocked(&self) -> bool {
         let id = self.handle.thread().id();
         sched::threads().iter().any(|t| t.id == id && t.state == sched::State::Blocked)
+    }
+
+    /// Wait until this thread blocks or finishes; return whether it blocked.
+    pub(crate) fn settle(&self) -> bool {
+        while !self.blocked() && !self.finished() {
+            crate::time::sleep(1_000_000);
+        }
+        self.blocked()
     }
 
     pub(crate) fn join(self) -> Result<R, &'static str> {
@@ -2409,12 +2449,7 @@ fn position_race(
 ) -> Result<Vec<u8>, &'static str> {
     let pause = position_window::arm(file, point);
     let a = spawn_test_thread(first)?;
-    if let Err(e) = pause.wait(&a) {
-        drop(pause);
-        let _ = a.join();
-        return Err(e);
-    }
-    let b = match spawn_test_thread(second) {
+    let b = match pause.wait(&a).and_then(|()| spawn_test_thread(second)) {
         Ok(b) => b,
         Err(e) => {
             drop(pause);
@@ -2422,10 +2457,7 @@ fn position_race(
             return Err(e);
         }
     };
-    while !b.blocked() && !b.finished() {
-        crate::time::sleep(1_000_000);
-    }
-    let blocked = b.blocked();
+    let blocked = b.settle();
     drop(pause);
     let a = a.join();
     let b = b.join();
@@ -2525,12 +2557,9 @@ crate::ktest!(
                         (general::__NR_pwrite64, buf, 2, 10, 2, false),
                     ] {
                         kassert_eq!(hazard_call(general::__NR_lseek, fd, 0, 0, 0), 0);
-                        let pos = file.pos.lock();
+                        let pos = file.lock_pos().expect("regular file position");
                         let worker = spawn_test_thread(move |_| hazard_call(nr, fd, arg, count, delta))?;
-                        while !worker.blocked() && !worker.finished() {
-                            crate::time::sleep(1_000_000);
-                        }
-                        let blocked = worker.blocked();
+                        let blocked = worker.settle();
                         drop(pos);
                         let ret = worker.join()?;
                         kassert_eq!((nr, blocked), (nr, atomic));
@@ -2639,27 +2668,27 @@ fn duplicate_racing_close_keeps_flock() -> crate::ktest::TestResult {
             })
             .map_err(|_| "lock dup source")?;
         kassert_eq!(locked, Ok(FlockOutcome::Granted { released: false }));
-        DUP_LOOKUP_PHASE.store(1, Ordering::SeqCst);
+        DUP_LOOKUP_PHASE.store(DUP_ARMED, Ordering::SeqCst);
         let closer = spawn_test_thread(move |_| {
-            while DUP_LOOKUP_PHASE.load(Ordering::SeqCst) < 2 {
+            while DUP_LOOKUP_PHASE.load(Ordering::SeqCst) < DUP_LOOKED_UP {
                 crate::time::sleep(1_000_000);
             }
             let ret = close_current_fd(old);
-            DUP_LOOKUP_PHASE.store(3, Ordering::SeqCst);
+            DUP_LOOKUP_PHASE.store(DUP_SOURCE_CLOSED, Ordering::SeqCst);
             ret
         });
         let closer = match closer {
             Ok(c) => c,
             Err(e) => {
-                DUP_LOOKUP_PHASE.store(0, Ordering::SeqCst);
+                DUP_LOOKUP_PHASE.store(DUP_IDLE, Ordering::SeqCst);
                 return Err(e);
             }
         };
         let duplicated = if lowest { dup_current_fd_from(old, 100, true) } else { dup_current_fd(old, 100, false) };
         // Release the closer even if a regression refused before lookup.
-        DUP_LOOKUP_PHASE.fetch_max(2, Ordering::SeqCst);
+        DUP_LOOKUP_PHASE.fetch_max(DUP_LOOKED_UP, Ordering::SeqCst);
         let closed = closer.join();
-        DUP_LOOKUP_PHASE.store(0, Ordering::SeqCst);
+        DUP_LOOKUP_PHASE.store(DUP_IDLE, Ordering::SeqCst);
         kassert_eq!(closed?, Ok(()));
         kassert_eq!(duplicated, Ok(100));
         kassert_eq!(file.fd_ref_count(), 1);
@@ -2674,12 +2703,62 @@ fn duplicate_racing_close_keeps_flock() -> crate::ktest::TestResult {
     Ok(())
 }
 
+/// A real open keeps its reservation throughout the filesystem work.
+#[cfg(feature = "ktest")]
+fn open_reservation_survives_until_install() -> crate::ktest::TestResult {
+    use crate::{kassert, kassert_eq};
+    const PATH: &[u8] = b"/tmp/b8-open-reservation";
+    let slot = reserve_current_fd(0).map_err(|_| "find next open slot")?;
+    let r = slot.fd();
+    drop(slot);
+    let mut path = PATH.to_vec();
+    path.push(0);
+    crate::user::copy_to_user(KTEST_USER_VA, &path).map_err(|_| "copy paused open path")?;
+    OPEN_INSTALL_PHASE.store(OPEN_ARMED, Ordering::SeqCst);
+    let opener = spawn_test_thread(move |_| {
+        hazard_call(
+            general::__NR_openat,
+            general::AT_FDCWD as u64,
+            KTEST_USER_VA,
+            u64::from(OpenFlags::O_CREAT | OpenFlags::O_RDWR),
+            0o600,
+        )
+    });
+    let opener = match opener {
+        Ok(opener) => opener,
+        Err(e) => {
+            OPEN_INSTALL_PHASE.store(OPEN_IDLE, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    while OPEN_INSTALL_PHASE.load(Ordering::SeqCst) == OPEN_ARMED && !opener.finished() {
+        crate::time::sleep(1_000_000);
+    }
+    let paused = OPEN_INSTALL_PHASE.load(Ordering::SeqCst) == OPEN_PAUSED;
+    let exact = dup_current_fd(0, r, false);
+    let lowest = dup_current_fd_from(0, 0, false);
+    OPEN_INSTALL_PHASE.store(OPEN_RELEASED, Ordering::SeqCst);
+    let opened = opener.join();
+    OPEN_INSTALL_PHASE.store(OPEN_IDLE, Ordering::SeqCst);
+    let unlinked = lumen_vfs::unlink_at(crate::vfs::tables(), None, PATH, false);
+    kassert!(paused);
+    // K1 drops the reservation before opening: this becomes Ok(r).
+    kassert_eq!(exact, Err(VfsError::Busy));
+    kassert_eq!(lowest, Ok(r + 1));
+    kassert_eq!(opened?, r as u64);
+    kassert_eq!(unlinked, Ok(()));
+    kassert_eq!(close_current_fd(r), Ok(()));
+    kassert_eq!(close_current_fd(r + 1), Ok(()));
+    Ok(())
+}
+
 crate::ktest!(
     fn dup_and_openat_reserve_their_slot() {
         use crate::{kassert, kassert_eq};
         in_test_process(|pid| {
+            open_reservation_survives_until_install()?;
             let slot = reserve_current_fd(0).map_err(|_| "reserve descriptor")?;
-            let fd = slot.reservation.as_ref().ok_or("reservation")?.fd();
+            let fd = slot.fd();
             kassert_eq!(fd, 3);
             let source = current_file(0).ok_or("source descriptor")?;
             let refs = source.fd_ref_count();
@@ -2711,7 +2790,7 @@ crate::ktest!(
                     -(super::errno::ENOENT as i64)
                 );
                 let free = reserve_current_fd(0).map_err(|_| "reserve after failed open")?;
-                kassert_eq!(free.reservation.as_ref().map(FdReservation::fd), Some(5));
+                kassert_eq!(free.fd(), 5);
             }
             // Fill with reservations, not opens: open_count alone cannot
             // detect that no slot is free.
@@ -2731,14 +2810,7 @@ crate::ktest!(
             );
             kassert!(matches!(crate::vfs::resolve_path_from_root("/tmp/b8-must-not-exist"), Err(VfsError::NoEnt)));
             drop(held);
-            kassert_eq!(
-                reserve_current_fd(0)
-                    .map_err(|_| "cancelled slots reusable")?
-                    .reservation
-                    .as_ref()
-                    .map(FdReservation::fd),
-                Some(5)
-            );
+            kassert_eq!(reserve_current_fd(0).map_err(|_| "cancelled slots reusable")?.fd(), 5);
             duplicate_racing_close_keeps_flock()
         })?
     }

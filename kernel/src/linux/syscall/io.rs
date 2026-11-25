@@ -5,7 +5,7 @@
 //! a chunk at a time through a bounce buffer on the stack as `fd.rs`'s
 //! `read`/`write` do (the write side through its `write_chunks_from_user`),
 //! and never read or move the open file's offset, so they take no offset
-//! lock (Lock 2); no VFS lock is held across a copy to or from user memory.
+//! lock (Lock 2) nor `pos` (Lock 0); no VFS lock is held across a copy to or from user memory.
 //! `fsync` and `fdatasync` are the inode's own `VfsInode::sync` (ext4: its
 //! dirty pages and metadata, then the block cache and the device's flush);
 //! `sync` is `vfs::sync_all`.

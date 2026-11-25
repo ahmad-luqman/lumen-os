@@ -4198,8 +4198,10 @@ process's `Files` holds `table: SpinLock<FdTable<FileRef>>` (`FileRef` =
 (private: a slot leaves it only through `close_current_fd`, a displacing
 `insert_current_fd`/`dup_current_fd` or the takedown's `Files::leave`
 (behind `take_current` and the test seams' `RegisteredProcess`), which
-release its locks; `install_current_fd` and `insert_current_fd` take a fresh
-`OpenFile` by value, and `dup_current_fd` (`dup2`/`dup3`) and
+release its locks; a fresh `OpenFile` gets its reserved slot through
+`ReservedFd::install`, and `insert_current_fd` takes one by value for an
+exact slot. `install_current_fd` is a ktest-only reserve-and-install helper;
+`dup_current_fd` (`dup2`/`dup3`) and
 `dup_current_fd_from` (`F_DUPFD*`), each with a close-on-exec flag, count
 the slot they share),
 `cwd: Cwd` (an `OpenGuard` on a directory and its path, computed from the
@@ -4228,9 +4230,9 @@ and, after it, releases the closing pid's POSIX record locks on the inode
 `flock` locks; `take_current` does the same for every descriptor when the
 process ends, and so does `dup2`'s displacement of the slot it fills (all
 through `process::release_fd`, which wakes blocked lockers when anything
-went). `openat` checks for a free slot before it opens (a full
-table is `-EMFILE` before anything is created), and `getcwd` computes the
-path from the cwd's inode (`compute_cwd_path`). `umask` sets the mask
+went). `openat` reserves a slot before it opens and keeps it until
+installation (a full table is `-EMFILE` before anything is created), and
+`getcwd` computes the path from the cwd's inode (`compute_cwd_path`). `umask` sets the mask
 (`syscall/meta.rs`). `chdir` and `fchdir` set the cwd (its kept path
 computed from the inode too, so relative `chdir`s never grow it), and
 `getdents64` lists a directory from its open file's `dir_cursor`, the
@@ -4946,7 +4948,7 @@ this order, each `-EINVAL`:
 |---|---|
 | `CLONE_VM` | share the `AddressSpace` (without `CLONE_THREAD`, raising its `users`), else copy it on write (B4) |
 | `CLONE_FS` | share `FsState`, else copy cwd and umask |
-| `CLONE_FILES` | share `Files` (without `CLONE_THREAD`, raising its `users`), else copy the table: each entry's `FileRef` cloned with its `cloexec`, and `inc_fd_ref` called on each description once per copied descriptor (`FdTable`'s derived `Clone` doesn't), so a child's `close` of a pipe end or a `flock` holder drops only its own count; reserved slots are skipped |
+| `CLONE_FILES` | share `Files` (without `CLONE_THREAD`, raising its `users`), else copy the table: each entry's `FileRef` cloned with its `cloexec`, and `inc_fd_ref` called on each description once per copied descriptor (`FdTable`'s hand-written `Clone` copies open entries, dropping reservations, but doesn't increment these counts), so a child's `close` of a pipe end or a `flock` holder drops only its own count; reserved slots are skipped |
 | `CLONE_SIGHAND` | with `CLONE_THREAD` only |
 | `CLONE_THREAD` | a new thread of the caller's process (C3); without both `CLONE_FILES` and `CLONE_FS` it is `-EINVAL`, a deviation (`files` and `fs` live on `Process`, so a thread can't have its own; musl always passes both, as do the census's flags) |
 | `CLONE_VFORK` | the parent sleeps, killable, until the child's `execve` or exit (as Linux's `wait_for_vfork_done`, `TASK_KILLABLE`) |
@@ -8190,12 +8192,14 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     so no release is dropped on the way. No signal ends a wait (no `EINTR` until signals are
     delivered).
   - **`EDEADLK` (`PosixWaitGraph`, host-tested):** before it waits,
-    `F_SETLKW` records that its pid waits for `holder`, stamped with the
-    release count it read before its try, in the kernel's `POSIX_WAITERS`
+    `F_SETLKW` records that its thread `(tgid, tid)` waits for `holder`,
+    stamped with the release count it read before its try, in the kernel's
+    `POSIX_WAITERS`
     (a `PosixWaitGraph` behind a spinlock, the count passed in as `now`).
     The wait is refused with `-EDEADLK` where following the holder's
-    record, its holder's, and so on leads back to the caller, through at
-    most `MAX_DEADLOCK_CHAIN` = 11 records: Linux's loop checks
+    lowest-tid current record, its holder's lowest-tid current record, and
+    so on leads back to the caller's tgid, through at most
+    `MAX_DEADLOCK_CHAIN` = 11 records: Linux's loop checks
     `i++ > MAX_DEADLK_ITERATIONS` (10) before each comparison, so it
     compares 11 blockers too. A search cut off there says so
     (`WaitSearch::Truncated`) and the kernel warns once a boot: with no
@@ -8209,7 +8213,9 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     wait ends at once and it retries with a fresh view. **Approximation:** each waiter records one
     holder, as Linux's `posix_locks_deadlock` follows each waiter's single
     `fl_blocker`, so a cycle through a second holder of the same range
-    isn't found (that waiter waits, as on Linux). `flock` detects no
+    isn't found (that waiter waits, as on Linux). A cycle through another
+    sibling's edge is also unseen: Lumen chooses the lowest current tid;
+    Linux follows one blocked lock per owner. `flock` detects no
     deadlock (nor does Linux).
 
 ### Pseudo-filesystems (`/tmp`, `/dev`, `/proc`)

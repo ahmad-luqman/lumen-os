@@ -41,7 +41,7 @@ pub use fd::{FdEntry, FdReservation, FdTable, LocalLock, LockFamily, OpenFile, O
 pub use fs::{FileSystem, OpenGuard, VfsInode};
 pub use locks::{
     AdvisoryLocks, Deadlock, FlockKind, FlockOp, FlockOutcome, FlockSpec, LockContext, PosixLockType, PosixWaitGraph,
-    RecordLockOutcome, WaitSearch,
+    RecordLockOutcome, WaitSearch, Waiter,
 };
 pub use mount::{MountInfo, MountTable, VfsCacheOps, VfsTables};
 pub use ops::{

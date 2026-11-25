@@ -7,6 +7,7 @@ fn reservations_are_neither_open_nor_free() {
     let mut t = FdTable::new();
     let r = t.reserve(0).unwrap();
     assert_eq!(r.fd(), 0);
+    assert_eq!(t.reserved_count(), 1);
     assert!(t.get(0).is_none());
     assert!(t.get_mut(0).is_none());
     assert_eq!(t.remove(0).unwrap_err(), VfsError::BadF);
@@ -18,17 +19,21 @@ fn reservations_are_neither_open_nor_free() {
     assert_eq!(t.alloc(10, true), Ok(1));
     assert_eq!(t.alloc_from(0, 20, false), Ok(2));
     let mut fork = t.clone();
+    assert_eq!(fork.reserved_count(), 0);
     assert_eq!(fork.alloc(30, false), Ok(0));
     assert_eq!(t.drain_cloexec().len(), 1);
     assert_eq!(t.drain_all().len(), 1);
+    assert_eq!(t.reserved_count(), 1);
     // Drains do not steal or cancel the in-flight open.
     assert_eq!(t.alloc(40, false), Ok(1));
-    assert_eq!(t.install(r, FdEntry { file: 50, cloexec: true }), 0);
+    assert_eq!(t.install(r, 50, true), 0);
+    assert_eq!(t.reserved_count(), 0);
     assert_eq!(t.get(0).unwrap().file, 50);
     assert_eq!(t.get_cloexec(0), Ok(true));
     let r = t.reserve(2).unwrap();
     assert_eq!(r.fd(), 2);
     t.cancel(r);
+    assert_eq!(t.reserved_count(), 0);
     assert_eq!(t.alloc(60, false), Ok(2));
 }
 
@@ -44,6 +49,7 @@ fn reservations_fill_the_table_and_cancel_reuses_the_lowest_slot() {
         held.push(r);
     }
     assert_eq!(t.open_count(), 0);
+    assert_eq!(t.reserved_count(), MAX_FDS);
     assert_eq!(t.reserve(0).unwrap_err(), VfsError::MFile);
     assert_eq!(t.alloc(1, false), Err(VfsError::MFile));
     let r = held.remove(500);
@@ -51,7 +57,7 @@ fn reservations_fill_the_table_and_cancel_reuses_the_lowest_slot() {
     assert_eq!(t.reserve(501).unwrap_err(), VfsError::MFile);
     let r = t.reserve(400).unwrap();
     assert_eq!(r.fd(), 500);
-    assert_eq!(t.install(r, FdEntry { file: 77, cloexec: false }), 500);
+    assert_eq!(t.install(r, 77, false), 500);
     for r in held {
         t.cancel(r);
     }
@@ -66,42 +72,55 @@ fn reservation_cannot_install_in_a_different_table() {
     let ra = a.reserve(0).unwrap();
     let rb = b.reserve(0).unwrap();
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        b.install(ra, FdEntry { file: 1, cloexec: false });
+        b.install(ra, 1, false);
     }));
     assert!(refused.is_err());
-    assert_eq!(b.install(rb, FdEntry { file: 2, cloexec: false }), 0);
+    assert_eq!(b.install(rb, 2, false), 0);
     assert_eq!(b.get(0).unwrap().file, 2);
+}
+
+#[test]
+fn dropped_reservation_stays_reserved_for_the_table_lifetime() {
+    let mut t = FdTable::<u32>::new();
+    {
+        let _r = t.reserve(0).unwrap();
+    }
+    assert_eq!(t.reserved_count(), 1);
+    assert_eq!(t.open_count(), 0);
+    assert!(t.drain_all().is_empty());
+    assert_eq!(t.alloc(1, false), Ok(1));
+    assert_eq!(t.insert_at(0, 2, false).unwrap_err(), VfsError::Busy);
 }
 
 #[test]
 fn posix_wait_graph_keeps_threads_and_follows_the_lowest_live_tid() {
     let mut g = PosixWaitGraph::new();
     // Insert the higher tid first: selection is by tid, not insertion.
-    assert_eq!(g.wait_for((1, 19), 3, 0, 0), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for((1, 11), 2, 0, 0), Ok(WaitSearch::Clear));
-    assert!(g.is_recorded((1, 11)) && g.is_recorded((1, 19)));
-    assert_eq!(g.wait_for((2, 20), 1, 0, 0), Err(Deadlock));
+    assert_eq!(g.wait_for(Waiter { tgid: 1, tid: 19 }, 3, 0, 0), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(Waiter { tgid: 1, tid: 11 }, 2, 0, 0), Ok(WaitSearch::Clear));
+    assert!(g.is_recorded(Waiter { tgid: 1, tid: 11 }) && g.is_recorded(Waiter { tgid: 1, tid: 19 }));
+    assert_eq!(g.wait_for(Waiter { tgid: 2, tid: 20 }, 1, 0, 0), Err(Deadlock));
     // Only the selected thread's blocker is followed (the documented
     // Linux approximation, not a search of all a process's edges).
-    assert_eq!(g.wait_for((3, 30), 1, 0, 0), Ok(WaitSearch::Clear));
-    g.done((3, 30));
-    g.done((1, 11));
-    assert!(g.is_recorded((1, 19)));
-    assert_eq!(g.wait_for((3, 30), 1, 0, 0), Err(Deadlock));
+    assert_eq!(g.wait_for(Waiter { tgid: 3, tid: 30 }, 1, 0, 0), Ok(WaitSearch::Clear));
+    g.done(Waiter { tgid: 3, tid: 30 });
+    g.done(Waiter { tgid: 1, tid: 11 });
+    assert!(g.is_recorded(Waiter { tgid: 1, tid: 19 }));
+    assert_eq!(g.wait_for(Waiter { tgid: 3, tid: 30 }, 1, 0, 0), Err(Deadlock));
     // A reused tid in a different group is a distinct key.
-    assert_eq!(g.wait_for((4, 19), 5, 0, 0), Ok(WaitSearch::Clear));
-    g.done((4, 19));
-    assert!(g.is_recorded((1, 19)));
+    assert_eq!(g.wait_for(Waiter { tgid: 4, tid: 19 }, 5, 0, 0), Ok(WaitSearch::Clear));
+    g.done(Waiter { tgid: 4, tid: 19 });
+    assert!(g.is_recorded(Waiter { tgid: 1, tid: 19 }));
     // Stale lower tids are no longer waiting: use the lowest live one.
-    assert_eq!(g.wait_for((1, 11), 2, 0, 0), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for((1, 19), 3, 1, 1), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for((3, 30), 1, 1, 1), Err(Deadlock));
-    assert_eq!(g.wait_for((1, 11), 2, 0, 1), Ok(WaitSearch::StaleCaller));
-    assert!(!g.is_recorded((1, 11)) && g.is_recorded((1, 19)));
+    assert_eq!(g.wait_for(Waiter { tgid: 1, tid: 11 }, 2, 0, 0), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(Waiter { tgid: 1, tid: 19 }, 3, 1, 1), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for(Waiter { tgid: 3, tid: 30 }, 1, 1, 1), Err(Deadlock));
+    assert_eq!(g.wait_for(Waiter { tgid: 1, tid: 11 }, 2, 0, 1), Ok(WaitSearch::StaleCaller));
+    assert!(!g.is_recorded(Waiter { tgid: 1, tid: 11 }) && g.is_recorded(Waiter { tgid: 1, tid: 19 }));
 }
 
 #[test]
-fn open_file_position_serializes_snapshot_and_rollback() {
+fn open_file_position_serializes_offset_updates() {
     let (env, _) = setup_vfs();
     let (inode, _) =
         open_inode(&env, None, b"/position", OpenFlags(OpenFlags::O_CREAT | OpenFlags::O_RDWR), 0o644, 0).unwrap();

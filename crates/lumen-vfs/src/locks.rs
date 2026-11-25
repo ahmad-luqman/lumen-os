@@ -440,12 +440,22 @@ struct WaitRecord {
     seen: u64,
 }
 
-/// Who waits for whom among the processes blocked in `F_SETLKW`, for
+/// A waiting thread's identity, ordered by process and then by thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Waiter {
+    pub tgid: u32,
+    pub tid: u32,
+}
+
+/// Who waits for whom among the threads blocked in `F_SETLKW`, for
 /// `EDEADLK`: each waiter's `(tgid, tid)` and the holder it waits for (the
 /// owner of the first conflicting lock, [`RecordLockOutcome::WouldBlock`]'s
 /// `holder`). Like Linux's `posix_locks_deadlock`, which follows each
 /// waiter's single `fl_blocker`, a cycle through a second holder of the
-/// same range isn't seen.
+/// same range isn't seen. From a holder process the search follows its
+/// lowest-tid current record, so a cycle through another sibling's edge
+/// isn't seen either. Lumen chooses the lowest tid; Linux also follows
+/// one blocked lock per owner.
 ///
 /// One graph for every inode: the kernel keeps it behind a spinlock (not
 /// under any inode's Lock 4), with a count of lock releases. A waiter reads
@@ -456,7 +466,7 @@ struct WaitRecord {
 /// woken since, maybe about to get its lock) is never followed.
 #[derive(Debug, Default)]
 pub struct PosixWaitGraph {
-    waits: BTreeMap<(u32, u32), WaitRecord>,
+    waits: BTreeMap<Waiter, WaitRecord>,
 }
 
 impl PosixWaitGraph {
@@ -464,9 +474,10 @@ impl PosixWaitGraph {
         Self { waits: BTreeMap::new() }
     }
 
-    /// Thread `waiter = (tgid, tid)` is about to wait for `holder`, its try
+    /// Thread `waiter` is about to wait for `holder`, its try
     /// having failed with the release count at `seen` (normally `now`):
-    /// record it, unless following `holder`'s record, its holder's, and so
+    /// record it, unless following `holder`'s lowest-tid current record,
+    /// its holder's lowest-tid current record, and so
     /// on through at most [`MAX_DEADLOCK_CHAIN`] records leads back to
     /// its tgid (`Err(Deadlock)`, nothing recorded). `Ok` says whether the
     /// search reached the end of the chain ([`WaitSearch::Clear`]) or was
@@ -478,21 +489,24 @@ impl PosixWaitGraph {
     /// retries with a fresh view. Checking it could follow a record made
     /// after that release (by the very holder it saw, now waiting on it in
     /// turn) and report a cycle that its fresh try wouldn't be in.
-    pub fn wait_for(&mut self, waiter: (u32, u32), holder: u32, seen: u64, now: u64) -> Result<WaitSearch, Deadlock> {
+    pub fn wait_for(&mut self, waiter: Waiter, holder: u32, seen: u64, now: u64) -> Result<WaitSearch, Deadlock> {
         if seen != now {
             self.waits.remove(&waiter);
             return Ok(WaitSearch::StaleCaller);
         }
         // Follow the lowest-numbered currently waiting thread of the
         // holding process, like Linux's first blocked lock for an owner.
-        let current = |waits: &BTreeMap<(u32, u32), WaitRecord>, p: u32| {
-            waits.range((p, 0)..=(p, u32::MAX)).find(|(_, w)| w.seen == now).map(|(_, w)| w.holder)
+        let current = |waits: &BTreeMap<Waiter, WaitRecord>, p: u32| {
+            waits
+                .range(Waiter { tgid: p, tid: 0 }..=Waiter { tgid: p, tid: u32::MAX })
+                .find(|(_, w)| w.seen == now)
+                .map(|(_, w)| w.holder)
         };
         // Compare `holder`, then each pid reached by following a record.
         let mut next = holder;
         let mut followed = 0;
         let search = loop {
-            if next == waiter.0 {
+            if next == waiter.tgid {
                 return Err(Deadlock);
             }
             match current(&self.waits, next) {
@@ -509,12 +523,12 @@ impl PosixWaitGraph {
     }
 
     /// Only this thread no longer waits (its lock call returned).
-    pub fn done(&mut self, waiter: (u32, u32)) {
+    pub fn done(&mut self, waiter: Waiter) {
         self.waits.remove(&waiter);
     }
 
-    /// Whether this thread has a record (including a stale one).
-    pub fn is_recorded(&self, waiter: (u32, u32)) -> bool {
+    /// Whether this thread has a record, including a stale one (for tests).
+    pub fn is_recorded(&self, waiter: Waiter) -> bool {
         self.waits.contains_key(&waiter)
     }
 }
