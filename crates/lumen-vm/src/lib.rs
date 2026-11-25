@@ -192,12 +192,25 @@ pub struct FileMapping {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backing {
     /// Demand-zeroed memory, shared across fork when `shared` is true.
-    Anonymous { shared: bool },
+    Anonymous {
+        /// Share writes across fork. Unrelated to `PTE_SHARED` / `Mapping::shared`,
+        /// which mark an uncounted page-cache leaf in the page-table layer.
+        shared: bool,
+    },
     /// File-backed mapping (`MAP_SHARED` or `MAP_PRIVATE`).
     File(FileMapping),
 }
 
 impl Backing {
+    /// Whether writes are shared (`MAP_SHARED`), independent of page-cache
+    /// leaf accounting (`PTE_SHARED` / `Mapping::shared`).
+    pub const fn is_shared(self) -> bool {
+        match self {
+            Self::Anonymous { shared } => shared,
+            Self::File(fm) => fm.shared,
+        }
+    }
+
     /// Advance a file backing by `byte_delta` bytes (no-op for anonymous).
     /// Returns `None` if advancing `FileMapping::offset` overflows `u64`.
     pub const fn advance(self, byte_delta: u64) -> Option<Self> {
@@ -717,6 +730,19 @@ impl Brk {
 
 #[cfg(test)]
 mod tests {
+    const ANON: Backing = Backing::Anonymous { shared: false };
+
+    #[test]
+    fn backing_sharing_is_independent_of_file_write_rights() {
+        assert!(!ANON.is_shared());
+        assert!(Backing::Anonymous { shared: true }.is_shared());
+        for shared in [false, true] {
+            for may_write in [false, true] {
+                assert_eq!(Backing::File(FileMapping { file_id: 1, offset: 0, shared, may_write }).is_shared(), shared);
+            }
+        }
+    }
+
     extern crate std;
     use super::*;
     use std::format;
@@ -789,7 +815,7 @@ mod tests {
         let cloned = map.clone();
         map.map_anon(MapPlace::Fixed(base + 2 * P), P, RW).unwrap();
         assert_eq!(cloned.find(base + 2 * P).unwrap().backing, shared);
-        assert_eq!(map.find(base + 2 * P).unwrap().backing, Backing::Anonymous { shared: false });
+        assert_eq!(map.find(base + 2 * P).unwrap().backing, ANON);
         assert_invariants(&map);
         assert_invariants(&cloned);
     }
@@ -900,27 +926,17 @@ mod tests {
         assert_eq!(
             removed,
             vec![
-                Vma { start: base + 2 * P, end: base + 4 * P, prot: RW, backing: Backing::Anonymous { shared: false } },
-                Vma { start: base + 6 * P, end: base + 8 * P, prot: RX, backing: Backing::Anonymous { shared: false } },
+                Vma { start: base + 2 * P, end: base + 4 * P, prot: RW, backing: ANON },
+                Vma { start: base + 6 * P, end: base + 8 * P, prot: RX, backing: ANON },
             ]
         );
         let vmas: Vec<_> = map.iter().copied().collect();
         assert_eq!(
             vmas,
             vec![
-                Vma { start: base, end: base + 2 * P, prot: RW, backing: Backing::Anonymous { shared: false } },
-                Vma {
-                    start: base + 2 * P,
-                    end: base + 8 * P,
-                    prot: Prot::READ,
-                    backing: Backing::Anonymous { shared: false }
-                },
-                Vma {
-                    start: base + 8 * P,
-                    end: base + 10 * P,
-                    prot: RX,
-                    backing: Backing::Anonymous { shared: false }
-                },
+                Vma { start: base, end: base + 2 * P, prot: RW, backing: ANON },
+                Vma { start: base + 2 * P, end: base + 8 * P, prot: Prot::READ, backing: ANON },
+                Vma { start: base + 8 * P, end: base + 10 * P, prot: RX, backing: ANON },
             ]
         );
         assert_invariants(&map);
@@ -951,15 +967,7 @@ mod tests {
 
         // Split middle out of one VMA.
         let mid = map.unmap(base + 3 * P, 2 * P).unwrap();
-        assert_eq!(
-            mid,
-            vec![Vma {
-                start: base + 3 * P,
-                end: base + 5 * P,
-                prot: RW,
-                backing: Backing::Anonymous { shared: false }
-            }]
-        );
+        assert_eq!(mid, vec![Vma { start: base + 3 * P, end: base + 5 * P, prot: RW, backing: ANON }]);
         assert_eq!(map.len(), 2);
         assert_eq!(map.find(base + 2 * P).unwrap().end, base + 3 * P);
         assert!(map.find(base + 3 * P).is_none());
@@ -973,8 +981,8 @@ mod tests {
         assert_eq!(
             span,
             vec![
-                Vma { start: base + 2 * P, end: base + 3 * P, prot: RW, backing: Backing::Anonymous { shared: false } },
-                Vma { start: base + 5 * P, end: base + 6 * P, prot: RW, backing: Backing::Anonymous { shared: false } },
+                Vma { start: base + 2 * P, end: base + 3 * P, prot: RW, backing: ANON },
+                Vma { start: base + 5 * P, end: base + 6 * P, prot: RW, backing: ANON },
             ]
         );
         let remaining: Vec<_> = map.iter().map(|v| (v.start, v.end)).collect();
@@ -1043,10 +1051,7 @@ mod tests {
         assert_eq!((g1.current, g1.succeeded), (init + 1, true));
         assert!(g1.unmapped.is_empty());
         assert_eq!(brk.mapped_end(), init + P);
-        assert_eq!(
-            map.find(init).unwrap(),
-            &Vma { start: init, end: init + P, prot: RW, backing: Backing::Anonymous { shared: false } }
-        );
+        assert_eq!(map.find(init).unwrap(), &Vma { start: init, end: init + P, prot: RW, backing: ANON });
 
         // Grow within same page -> no new VMA change.
         let g2 = brk.set(&mut map, init + 1234);
@@ -1079,15 +1084,7 @@ mod tests {
         // Shrink across two pages returns exact unmapped sub-range.
         let s2 = brk.set(&mut map, init + P + 10);
         assert_eq!((s2.current, s2.succeeded), (init + P + 10, true));
-        assert_eq!(
-            s2.unmapped,
-            vec![Vma {
-                start: init + 2 * P,
-                end: init + 4 * P,
-                prot: RW,
-                backing: Backing::Anonymous { shared: false }
-            }]
-        );
+        assert_eq!(s2.unmapped, vec![Vma { start: init + 2 * P, end: init + 4 * P, prot: RW, backing: ANON }]);
         assert_eq!(brk.mapped_end(), init + 2 * P);
         assert!(map.find(init + 4 * P).is_some(), "blocker VMA untouched");
 
@@ -1102,10 +1099,7 @@ mod tests {
         // Shrink all the way back to initial unmaps the rest of brk.
         let s3 = brk.set(&mut map, init);
         assert_eq!((s3.current, s3.succeeded), (init, true));
-        assert_eq!(
-            s3.unmapped,
-            vec![Vma { start: init, end: init + 2 * P, prot: RW, backing: Backing::Anonymous { shared: false } }]
-        );
+        assert_eq!(s3.unmapped, vec![Vma { start: init, end: init + 2 * P, prot: RW, backing: ANON }]);
         assert_eq!(brk.mapped_end(), init);
         assert_invariants(&map);
     }
@@ -1166,7 +1160,7 @@ mod tests {
                         {
                             last.end = e;
                         } else {
-                            out.push(Vma { start: s, end: e, prot, backing: Backing::Anonymous { shared: false } });
+                            out.push(Vma { start: s, end: e, prot, backing: ANON });
                         }
                     }
                 }
@@ -1516,7 +1510,7 @@ mod tests {
             map.iter().copied().collect::<Vec<_>>(),
             vec![
                 Vma { start: base, end: base + 2 * P, prot: RW, backing: Backing::File(fm) },
-                Vma { start: base + 2 * P, end: base + 4 * P, prot: RW, backing: Backing::Anonymous { shared: false } },
+                Vma { start: base + 2 * P, end: base + 4 * P, prot: RW, backing: ANON },
                 Vma {
                     start: base + 4 * P,
                     end: base + 6 * P,
@@ -1534,15 +1528,7 @@ mod tests {
         // Overwriting the middle with matching contiguous FileMapping coalesces all 6 pages back.
         let mid_fm = FileMapping { file_id: 21, offset: 0x1_2000, shared: false, may_write: true };
         let m2 = map.map_file(MapPlace::Fixed(base + 2 * P), 2 * P, RW, mid_fm).unwrap();
-        assert_eq!(
-            m2.unmapped,
-            vec![Vma {
-                start: base + 2 * P,
-                end: base + 4 * P,
-                prot: RW,
-                backing: Backing::Anonymous { shared: false }
-            }]
-        );
+        assert_eq!(m2.unmapped, vec![Vma { start: base + 2 * P, end: base + 4 * P, prot: RW, backing: ANON }]);
         assert_eq!(map.len(), 1);
         assert_eq!(
             *map.find(base).unwrap(),
@@ -1575,7 +1561,7 @@ mod tests {
 
             let to_vma_backing = |pb: PageBacking| -> Backing {
                 match pb {
-                    PageBacking::Anon => Backing::Anonymous { shared: false },
+                    PageBacking::Anon => ANON,
                     PageBacking::File { file_id, offset, shared, may_write } => {
                         Backing::File(FileMapping { file_id, offset, shared, may_write })
                     }
@@ -1655,7 +1641,7 @@ mod tests {
                     shared: rng.below(2) == 0,
                     may_write: rng.below(2) == 0,
                 };
-                let backing = if is_file { Backing::File(fm) } else { Backing::Anonymous { shared: false } };
+                let backing = if is_file { Backing::File(fm) } else { ANON };
 
                 let fill_model = |model: &mut [Option<(Prot, PageBacking)>; N], lo: usize, pages: usize| {
                     for (idx, slot) in model[lo..lo + pages].iter_mut().enumerate() {

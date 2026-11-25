@@ -6,8 +6,9 @@
 //! with `start`, `end` and `offset` at least 8 hex digits, the device's
 //! major and minor at least 2 hex digits each and the inode in decimal, and
 //! `perms` `rwx` then `p` or `s`. A file-backed mapping is `s` when shared
-//! and `p` when private; an anonymous one is always `p`, even
-//! `MAP_SHARED | MAP_ANONYMOUS` (Linux prints `s`).
+//! and `p` when private; anonymous mappings use the same sharing indicator.
+//! Shared anonymous mappings remain unnamed: Linux's `/dev/zero (deleted)`
+//! name requires M10's shmem backing.
 //!
 //! **The name:** a file's path, or a label (`[heap]` or `[stack]`), comes
 //! after 73 characters, where Linux's `seq_pad` puts it: the fields and a
@@ -259,7 +260,7 @@ pub fn write_maps<'a, 'n, F, I, R>(
             continue;
         }
         if vma.start >= layout.stack_bottom && vma.end <= layout.stack_top {
-            Line { start, end, prot, shared: false, offset: 0, name: Name::Label(STACK) }.write(out);
+            Line { start, end, prot, shared: vma.backing.is_shared(), offset: 0, name: Name::Label(STACK) }.write(out);
             continue;
         }
         // Split at the heap's edges and the images' ranges' edges: no edge
@@ -275,7 +276,7 @@ pub fn write_maps<'a, 'n, F, I, R>(
             } else {
                 (Name::None, 0)
             };
-            Line { start: at, end: next, prot, shared: false, offset, name }.write(out);
+            Line { start: at, end: next, prot, shared: vma.backing.is_shared(), offset, name }.write(out);
             at = next;
         }
     }
@@ -298,6 +299,19 @@ mod tests {
 
     /// The kernel ktest's break: the initial break at 0x40_4000, one page mapped.
     const LAYOUT: MapsLayout = layout(0x40_4000, 0x40_5000);
+
+    #[test]
+    fn shared_anonymous_maps_use_s() {
+        let vmas = [
+            anon(0x10000, 0x11000, RW),
+            Vma { start: 0x12000, end: 0x13000, prot: RW, backing: Backing::Anonymous { shared: true } },
+            Vma { start: 0x14000, end: 0x15000, prot: Prot::NONE, backing: Backing::Anonymous { shared: true } },
+        ];
+        assert_eq!(
+            maps(&vmas, &LAYOUT),
+            "00010000-00011000 rw-p 00000000 00:00 0\n00012000-00013000 rw-s 00000000 00:00 0\n00014000-00015000 ---s 00000000 00:00 0\n"
+        );
+    }
 
     /// File 7: a file on `/tmp` (device 0:2).
     const TMP_FILE: FileInfo<'static> =

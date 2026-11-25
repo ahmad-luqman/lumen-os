@@ -100,6 +100,11 @@ impl Level {
         self as u8
     }
 
+    /// Bytes covered by one entry at this level.
+    pub const fn span(self) -> u64 {
+        1u64 << self.shift()
+    }
+
     const fn shift(self) -> u32 {
         12 + 9 * (self as u32 - 1)
     }
@@ -1355,6 +1360,7 @@ mod tests {
 
     #[test]
     fn not_present_reports_the_level() {
+        assert_eq!([Level::L1, Level::L2, Level::L3, Level::L4].map(Level::span), [4096, 1 << 21, 1 << 30, 1 << 39]);
         let (mut m, root) = FakeMem::new();
         assert_eq!(walk(&m, root, v(KERNEL)).end(), WalkEnd::NotPresent(Level::L4));
         map(&mut m, root, v(KERNEL), f(0x5000), PageSize::Size4K, Attrs::DATA).unwrap();

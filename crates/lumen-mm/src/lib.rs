@@ -2,7 +2,7 @@
 //! allocator (this module), typed addresses ([`PhysAddr`], [`PhysFrame`],
 //! [`VirtAddr`]), the page-table format and mapper ([`paging`]), the window
 //! tokens that say who may map where ([`window`]), and the kernel-stack
-//! layout and registry ([`stacks`]).
+//! layout and registry ([`stacks`]), and atomic user-frame counts ([`frame`]).
 //!
 //! This crate is pure logic: it never touches hardware or dereferences a
 //! physical address, so all of it is tested on the host

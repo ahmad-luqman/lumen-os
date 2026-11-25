@@ -175,7 +175,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Frame reference counts and copy-on-write fork (#375): reserved atomic counts, private splits and sole-owner reuse, shared anonymous pages, mprotect preserving CoW, process users independent of Arc observers, and teardown releasing counted frames"
+name = "Frame reference counts and copy-on-write address-space copy for fork (#375, AddressSpace::fork_copy; the syscall is C1's): reserved atomic counts, private splits and sole-owner reuse, shared anonymous and /dev/zero pages, mprotect preserving CoW, process users independent of Arc observers, and teardown releasing counted frames; fork_copy_preserves_files_images_and_private_copies checks break and image names, mapped-file references, omitted cache leaves, and private copies below versus at EOF with nonzero file offsets"
 milestone = "M8"
 tests = [
     "cargo:lumen-mm",
@@ -184,6 +184,7 @@ tests = [
     "ktest:lumen_kernel::mm::frame::refcount_and_cow_split",
     "ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only",
     "ktest:lumen_kernel::mm::user_vm::fork_copy_preserves_files_images_and_private_copies",
+    "ktest:lumen_kernel::linux::syscall::mem::tests::mem_mmap_dev_zero_is_anonymous_memory",
 ]
 
 [[feature]]

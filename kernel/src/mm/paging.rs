@@ -493,10 +493,14 @@ pub fn new_user_root() -> Option<PhysFrame> {
 /// # Safety
 /// `root` must be an L4 root allocated by [`new_user_root`] (never
 /// [`kernel_root`]), the caller must have exclusive write access to its lower
-/// half, and `phys` must be an allocated physical frame whose ownership is
-/// transferred to `root` (freed on [`destroy_user_root`] or unmap), or, with
-/// `attrs.shared()` (`PTE_SHARED`), a page-cache frame the caller keeps
-/// allocated (pinned) for as long as the leaf maps it: no unmap or teardown
+/// half. A writable private mapping must have the frame's only user
+/// reference. A non-shared `phys` must carry a counted reference transferred to
+/// the new leaf on success: unmap retires the translation then releases that
+/// reference with `UserFrame::from_leaf` / drop, never `frame::free`. Raw
+/// paging ktests may instead transfer an exclusively owned, uncounted frame
+/// and reclaim it after retirement. With `attrs.shared()` (`PTE_SHARED`),
+/// `phys` instead names a page-cache frame the caller keeps allocated
+/// (pinned) for as long as the leaf maps it: no unmap or teardown
 /// path frees a `PTE_SHARED` leaf's frame.
 pub unsafe fn map_user_page(root: PhysFrame, virt: VirtAddr, phys: PhysFrame, attrs: Attrs) -> Result<(), MapError> {
     assert_ne!(root, kernel_root(), "map_user_page must never mutate kernel_root()");
@@ -548,7 +552,9 @@ pub struct UserLeaf {
 /// `root` must be an L4 root allocated by [`new_user_root`] (never
 /// [`kernel_root`]), `[start, end)` must be page-aligned and strictly in the
 /// lower half, and the caller must have exclusive write access to `root`'s
-/// lower half, flush the TLB, and free non-shared (`!leaf.was_shared`) frames.
+/// lower half. Retire each removed leaf from the TLB, then release the
+/// reference each non-shared leaf held with `UserFrame::from_leaf` / drop.
+/// Only raw, uncounted paging ktest leaves may be returned with `frame::free`.
 pub unsafe fn unmap_user_range(root: PhysFrame, start: u64, end: u64, mut on_unmapped: impl FnMut(UserLeaf)) {
     assert_ne!(root, kernel_root(), "unmap_user_range must never mutate kernel_root()");
     assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
@@ -598,15 +604,33 @@ pub unsafe fn unmap_user_range(root: PhysFrame, start: u64, end: u64, mut on_unm
 /// [`kernel_root`]), `[start, end)` must be page-aligned and strictly in the
 /// lower half, and the caller must have exclusive write access to `root`'s
 /// lower half and flush the TLB if `root` is active.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // constant-attribute wrapper for raw paging callers
 pub unsafe fn protect_user_range(
     root: PhysFrame,
     start: u64,
     end: u64,
     attrs: Attrs,
+    on_protected: impl FnMut(UserLeaf),
+) {
+    // SAFETY: the caller supplies the same root, range and retirement guarantees.
+    unsafe { protect_user_range_with(root, start, end, |_, _| attrs, on_protected) };
+}
+
+/// Update each populated leaf using the attributes returned by `attrs_for`.
+/// Preserves frames, skips empty subtrees and reports the old leaf through
+/// `on_protected`. Page-cache leaves retain `PTE_SHARED` and lose write access.
+///
+/// # Safety
+/// The caller meets protect_user_range's root, range, exclusive-access and
+/// TLB-retirement requirements; attrs_for must return user attributes.
+pub unsafe fn protect_user_range_with(
+    root: PhysFrame,
+    start: u64,
+    end: u64,
+    mut attrs_for: impl FnMut(VirtAddr, Mapping) -> Attrs,
     mut on_protected: impl FnMut(UserLeaf),
 ) {
     assert_ne!(root, kernel_root(), "protect_user_range must never mutate kernel_root()");
-    assert!(attrs.user(), "protect_user_range requires user-mode attributes");
     assert!(start.is_multiple_of(FRAME_SIZE) && end.is_multiple_of(FRAME_SIZE) && start <= end);
     let mut addr = start;
     while addr < end {
@@ -615,6 +639,8 @@ pub unsafe fn protect_user_range(
         let w = pt::walk(&Hhdm, root, va);
         match w.end() {
             WalkEnd::Mapped(m) | WalkEnd::ProtNone(m) => {
+                let attrs = attrs_for(va, m);
+                assert!(attrs.user(), "protect_user_range requires user-mode attributes");
                 let leaf_attrs = if m.shared { attrs.without_writable().with_shared(true) } else { attrs };
                 let prev = pt::protect(&mut Hhdm, root, va, leaf_attrs).expect("walk just found mapped user leaf");
                 debug_assert_eq!(prev.size, PageSize::Size4K);
@@ -641,12 +667,16 @@ pub unsafe fn protect_user_range(
 }
 
 /// Recursively sweep all lower-half leaves (present or `PTE_PROTNONE`),
-/// invoking `on_leaf` for each, freeing non-shared leaf frames and all
+/// invoking `on_leaf` for each, freeing uncounted non-shared frames and all
 /// intermediate L3/L2/L1 tables under a user L4 subtree.
 ///
 /// # Safety
 /// Every table frame and non-`PTE_SHARED` leaf frame in `table`'s subtree
-/// must be exclusively owned by an inactive user address space.
+/// must be exclusively owned and uncounted in an inactive user root.
+/// `AddressSpace` removes every counted leaf first and releases its reference
+/// after TLB retirement with `UserFrame::from_leaf` / drop. This leaf-freeing
+/// path serves only raw uncounted frames in paging ktests; a counted leaf
+/// reaching `frame::free` would panic.
 unsafe fn free_user_subtree(
     table: PhysFrame,
     level: pt::Level,
@@ -671,7 +701,8 @@ unsafe fn free_user_subtree(
                 let va = VirtAddr::new(entry_base).expect("lower-half leaf VA is canonical");
                 on_leaf(UserLeaf { va, phys, was_present, was_writable, was_shared, was_dirty });
                 if !was_shared {
-                    // SAFETY: non-shared leaf frame belongs exclusively to this user address space.
+                    // SAFETY: the caller guarantees this raw leaf is exclusively owned,
+                    // uncounted and inactive; AddressSpace removes all counted leaves first.
                     unsafe { frame::free(phys) }.expect("freeing owned user leaf frame");
                 }
             }
@@ -694,14 +725,16 @@ unsafe fn free_user_subtree(
 }
 
 /// Sweep all lower-half (`L4[0..256]`) leaf frames (present and `PTE_PROTNONE`),
-/// invoking `on_leaf` for each, free non-`PTE_SHARED` leaf frames and all
+/// invoking `on_leaf` for each, free uncounted non-`PTE_SHARED` frames and all
 /// intermediate L3/L2/L1 tables under `root`, and zero `L4[0..256]`, keeping
 /// `root` itself allocated (and leaving kernel `L4[256..512]` untouched).
 ///
 /// # Safety
 /// `root` must not be loaded in `CR3` on any CPU, and every intermediate table
 /// and non-`PTE_SHARED` lower-half leaf under `root` must be exclusively owned
-/// by this address space.
+/// and uncounted. `AddressSpace` must unmap every counted leaf and release
+/// it with `UserFrame::from_leaf` / drop after retirement before this sweep.
+/// Only paging ktests use the raw uncounted leaf-freeing path.
 pub unsafe fn clear_user_lower_half(root: PhysFrame, mut on_leaf: impl FnMut(UserLeaf)) {
     assert_ne!(root, kernel_root(), "clear_user_lower_half must never mutate kernel_root()");
     assert_ne!(hw::active_root(), root, "cannot clear active CR3 root {root}");
@@ -725,14 +758,16 @@ pub unsafe fn clear_user_lower_half(root: PhysFrame, mut on_leaf: impl FnMut(Use
 }
 
 /// Tear down a user L4 root created by [`new_user_root`]: sweeps all lower-half
-/// leaf frames via `on_leaf`, frees non-`PTE_SHARED` leaf frames, all
+/// leaf frames via `on_leaf`, frees uncounted non-`PTE_SHARED` frames, all
 /// lower-half L3/L2/L1 page-table frames, and `root` itself, without modifying
 /// the shared kernel upper half (`L4[256..512]`).
 ///
 /// # Safety
 /// `root` must not be loaded in `CR3` on any CPU, and every intermediate table
 /// and non-`PTE_SHARED` lower-half leaf mapped in `root` must be exclusively
-/// owned by this address space.
+/// owned and uncounted. `AddressSpace` must first unmap every counted leaf
+/// and release it with `UserFrame::from_leaf` / drop after retirement. The
+/// sweep frees raw leaves only for paging ktests; counted leaves would panic.
 pub unsafe fn destroy_user_root(root: PhysFrame, on_leaf: impl FnMut(UserLeaf)) {
     // SAFETY: upheld by the caller.
     unsafe { clear_user_lower_half(root, on_leaf) };

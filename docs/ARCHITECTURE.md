@@ -1027,10 +1027,11 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
   disappears never holds `AddressSpace::inner`. `AddressSpace::drop` (which may
   run inside `sched::finish_switch` with interrupts off once no CPU holds its
   `CR3`) runs lock-free: if `!torn_down` (error rollback or ktest), its
-  `destroy_user_root` sweep still skips `frame::free` on `PTE_SHARED` leaves
-  and propagates `PTE_DIRTY` + decrements `writable_maps` before dropping
-  `pinned_pages` (no CPU holding its `CR3` is the unmap order's flush
-  step), and `VfsInode::drop` never takes a sleeping lock.
+  unmap walk first releases each counted leaf's reference and propagates
+  `PTE_DIRTY` from cache leaves. With no CPU holding its `CR3`, translations
+  are already retired. After the walk, `destroy_user_root` frees only the
+  empty page tables and root, then `writable_maps` and `pinned_pages` are
+  dropped. `VfsInode::drop` never takes a sleeping lock.
   Kernel upper-half tables (256–511) are untouched.
 - **Lock ordering across VM and VFS (M7–M8):** Because `copy_from_user` and
   `copy_to_user` may fault into `#PF` → `AddressSpace` → `PageCache` →
@@ -1106,8 +1107,7 @@ Lock 1, with the child new and unshared:
    - a leaf of a `MAP_SHARED | MAP_ANONYMOUS` VMA (and `/dev/zero`'s shared
      mappings): copied with its rights, `inc` its count, so both processes
      write the same frame. B4 records the sharing in `lumen_vm::Backing`
-     (`Anonymous { shared }`), which M7 doesn't keep ("shared alike until
-     M8" in `syscall/mem.rs`), and first populates the parent's missing
+     (`Anonymous { shared }`), and first populates the parent's missing
      pages of such a VMA with zeroed frames, so a page neither process had
      touched is still shared after the fork. (Linux backs these with a
      shmem inode; that design, with `memfd_create`, is M10's.) The census's
@@ -1118,7 +1118,9 @@ Lock 1, with the child new and unshared:
 
 A failure part way leaves the parent's leaves read-only, which only costs
 a fault each, and drops the child after the parent's Lock 1 is released
-(its `drop` decrements what it counted). In a private VMA
+(its `drop` decrements what it counted). Any shared anonymous pages
+populated before failure remain as zero-filled pages at count 1, equivalent
+to demand-zero; a warning reports how many were retained. In a private VMA
 (`Backing::Anonymous { shared: false }` or a `MAP_PRIVATE` file),
 `mprotect` keeps a leaf whose count is above 1 read-only when it grants
 `PROT_WRITE` (M7 sets `WRITABLE` from the VMA directly; Linux's
@@ -4331,7 +4333,7 @@ depends on them.
 | B1 | the process/thread split, behaviour unchanged | M7 done | `Process`, `UserThread`, `UserThreadState::linux`, `PROCS`, `Files::users`, tids (`ProcTree::add_thread`/`remove_thread`), pid 1 (`linux::init`), the `ps` shell command; `procs_lookup_and_lifetime`, `cargo:lumen-proc`, all M6/M7 scenarios unchanged | 8 |
 | B2 | the blocking wait and the syscall-exit hook | B1 | `wait_interruptible`/`wait_killable`, `kick`, `Thread::fatal_pending`, the hook, `restart_syscall`, `raise_for_test`, `user::read_u32_nofault`/`cmpxchg_u32`/`fault_in_writable`; the wait, restart and nofault ktests, `harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata` | 6, 8, 15 |
 | B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `poll_rechecks_after_a_wake`, `test_poll_and_select_on_console` | 10 |
-| B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended) | 5, 8 |
+| B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended), `fork_copy_out_of_frames_rolls_back`, `fork_copy_preserves_files_images_and_private_copies` | 5, 8 |
 | B5 | the TLB shootdown IPI | B2 | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `PerCpu::loaded_space`, `tlb::shoot_down`, the shootdown warning's `HOST_TIMED` entry; `mm::tlb::shootdown_across_cpus` (its probes use B2's `read_u32_nofault`) | 5, 9 |
 | B6 | SMP migration, priorities, affinity | B5, C1 | `on_cpu`, `spawn_migratable`, `spawn_user_on` migratable (after C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
 | B7 | truncate reaching every address space | B1, B4, B5 | the inode's mappers list, `mmap_file(self: &Arc<Self>)`; `truncate_unmaps_every_address_space`, `fork_racing_a_truncate_copies_nothing_past_eof` | 5 |
@@ -8380,7 +8382,9 @@ holding only locks above it.
        nests inside it)
     f. VirtioHal::TABLE; WaitQueue locks; the scheduler's run queues (two
        at once only for a steal, in ascending CPU order, section 6)
-    g. heap -> page tables -> frame allocator (section 5)
+    g. heap -> page tables -> frame allocator (section 5);
+       frame::REFS is a leaf lock, taken only to copy out its boot-reserved
+       table and released before any other lock or count update
 ```
 
 M8 adds (designed in #336, none built yet): Lock 0, Lock 1a, Lock 9a and,
@@ -10519,15 +10523,22 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 - `ktest:lumen_kernel::mm::frame::refcount_and_cow_split` (B4): counts
   through `fork_copy`; a split at count 2 and the reuse at 1; a shared
   anonymous page staying shared, and writable in both, after `fork`;
-  `AddressSpace::users`, raised and lowered directly by the ktest as a
+  `AddressSpace::users`, raised and lowered through `add_user`/`drop_user` as a
   `CLONE_VM` pair would (the first lowering doesn't tear the space down;
   an extra `Arc` held by the test doesn't delay the teardown at 0);
-  `teardown` freeing exactly the frames it
-  owned.
+  `teardown` releasing its references and freeing frames only at zero.
 - `ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only`
   (B4): `mprotect(PROT_WRITE)` on a private leaf whose count is 2 leaves it
-  read-only, and the next write splits it; on a shared anonymous VMA it
-  sets `WRITABLE`.
+  read-only, and the next write splits it (including a PROT_NONE page);
+  shared anonymous PROT_NONE pages stay inaccessible in both copies until
+  upgraded, when `mprotect` sets `WRITABLE`.
+- `ktest:lumen_kernel::mm::frame::fork_copy_out_of_frames_rolls_back` (B4):
+  exhaustion during a split leaves the old leaf unchanged; a partial fork
+  releases the child's references and tables and leaves the parent reusable.
+- `ktest:lumen_kernel::mm::user_vm::fork_copy_preserves_files_images_and_private_copies`
+  (B4): preserves the break, image names and mapped-file references; skips
+  cache leaves and private copies at or past EOF, including nonzero file
+  offsets, while sharing private copies below EOF and splitting on writes.
 - `ktest:lumen_kernel::user::nofault_access_answers_fault_without_paging_in`
   (B2): an unmapped, a not-yet-faulted and a read-only page, each under a
   held `SpinLock`: `Fault`, nothing mapped; a mapped page's read and

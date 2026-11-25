@@ -44,10 +44,12 @@
 //! - `MAP_32BIT` and `MAP_ABOVE4G` are taken and ignored: the mapping is
 //!   placed as without them.
 //! - A shared `/dev/zero` mapping is plain anonymous memory: its maps line
-//!   is an unnamed `p` one (Linux's is `s`, named `/dev/zero (deleted)`),
+//!   is an unnamed `s` one (Linux names it `/dev/zero (deleted)`; M10's
+//!   shmem backing will supply that name),
 //!   and one made through a read-only descriptor can later be made
 //!   writable with `mprotect` (Linux refuses, `EACCES`): anonymous VMAs
-//!   carry no `may_write`. Harmless until M8's `fork` shares one.
+//!   carry no `may_write`. This difference persists across `fork_copy`,
+//!   which shares the anonymous pages and their writes.
 //! - `/proc/<pid>/maps`' file columns differ in a few ways, each listed
 //!   on `user_vm::KeptFile` (a file mapping's: the descriptor's path, not
 //!   normalised nor following a rename; the first mapping's for every

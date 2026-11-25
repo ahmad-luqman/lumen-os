@@ -457,6 +457,17 @@ crate::ktest!(
             let zero_rw = ktest_open(3, b"/dev/zero", OpenFlags::O_RDWR)?;
             let shared = map(P, RW, SHARED, zero_rw, 0)?;
             copy_to_user(shared, b"shared-zero").map_err(|_| "store shared")?;
+            let parent = crate::sched::current_address_space().ok_or("current space")?;
+            let child = parent.fork_copy().map_err(|_| "fork dev zero")?;
+            let parent_leaf = crate::mm::user_vm::file_vm_leaf(&parent, shared).ok_or("parent zero leaf")?;
+            let child_leaf = crate::mm::user_vm::file_vm_leaf(&child, shared).ok_or("child zero leaf")?;
+            kassert_eq!(child_leaf.phys, parent_leaf.phys);
+            kassert!(parent_leaf.writable && child_leaf.writable);
+            kassert!(!parent_leaf.shared && !child_leaf.shared);
+            kassert_eq!(crate::mm::frame::user_count(child_leaf.phys), 2);
+            kassert!(line(&parent.format_maps_text(), shared)?.ends_with(" rw-s 00000000 00:00 0"));
+            drop(child);
+            kassert_eq!(crate::mm::frame::user_count(parent_leaf.phys), 1);
             kassert_eq!(sys_munmap(shared, P), 0);
             Ok::<(), &'static str>(())
         })?

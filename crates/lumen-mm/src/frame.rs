@@ -7,9 +7,13 @@ use crate::{FRAME_SIZE, PhysFrame, PhysRange};
 /// A refused update never changes the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefError {
+    /// The frame is outside the managed physical span.
     OutOfRange,
+    /// Initialization refused because the count is already nonzero.
     AlreadyLive,
+    /// Increment or decrement refused because the count is zero.
     NotLive,
+    /// Increment refused because the count is `u32::MAX`.
     Overflow,
 }
 
@@ -26,7 +30,8 @@ pub enum Remaining {
 /// live count below `u32::MAX`, and `dec` accepts only a live count. Overflow
 /// and underflow return errors without wrapping or changing the count.
 /// The caller owns allocation and reclamation: it must hold a reference
-/// while incrementing and retire every mapping before decrementing.
+/// while incrementing and retire the mapping whose reference it releases
+/// before decrementing.
 #[derive(Clone, Copy)]
 pub struct RefTable<'a> {
     span: PhysRange,
@@ -83,7 +88,10 @@ impl<'a> RefTable<'a> {
     pub fn dec(&self, frame: PhysFrame) -> Result<Remaining, RefError> {
         self.slot(frame)?
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
-            .map(|n| if n == 1 { Remaining::Free } else { Remaining::Live(n - 1) })
+            .map(|n| match n {
+                1 => Remaining::Free,
+                n => Remaining::Live(n - 1),
+            })
             .map_err(|_| RefError::NotLive)
     }
 }
@@ -209,5 +217,43 @@ mod tests {
         });
         assert_eq!(table.get(f(1)), Some(1));
         assert_eq!(table.dec(f(1)), Ok(Remaining::Free));
+    }
+
+    #[test]
+    fn concurrent_last_decrement_frees_once() {
+        const FRAMES: usize = 1024;
+        const THREADS: usize = 8;
+        let mut storage = [const { AtomicU32::new(0) }; FRAMES];
+        let table = RefTable::new(PhysRange::new(0, FRAMES as u64 * FRAME_SIZE), &mut storage).unwrap();
+        let freed = [const { AtomicU32::new(0) }; FRAMES];
+        // A spin rendezvous avoids serializing the decrement attempts on
+        // the host condition variable's wakeups. Each thread owns one of
+        // the references, including the one that will be released last.
+        let ready = [const { AtomicU32::new(0) }; FRAMES];
+        for n in 0..FRAMES {
+            table.set_one(f(n as u64)).unwrap();
+            for _ in 1..THREADS {
+                table.inc(f(n as u64)).unwrap();
+            }
+        }
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for (n, frees) in freed.iter().enumerate() {
+                        ready[n].fetch_add(1, Ordering::AcqRel);
+                        while ready[n].load(Ordering::Acquire) != THREADS as u32 {
+                            core::hint::spin_loop();
+                        }
+                        if table.dec(f(n as u64)).unwrap() == Remaining::Free {
+                            frees.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        for (n, frees) in freed.iter().enumerate() {
+            assert_eq!(frees.load(Ordering::Relaxed), 1);
+            assert_eq!(table.get(f(n as u64)), Some(0));
+        }
     }
 }
