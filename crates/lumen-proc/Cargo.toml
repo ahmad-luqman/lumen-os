@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 lumen-signal = { path = "../lumen-signal" }
 
+[features]
+# `ProcTree::check_invariants` for the kernel's ktests.
+test-util = []
+
 [lints]
 workspace = true
 

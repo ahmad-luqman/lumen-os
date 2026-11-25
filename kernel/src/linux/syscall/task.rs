@@ -1,6 +1,7 @@
 //! Tasks (M8's cluster, ARCHITECTURE section 8, "B0's stubs"): M6's `exit`
 //! and `exit_group`, `getpid`, `gettid`, `getppid` and `set_tid_address`,
-//! moved here from `dispatch`'s arms unchanged (each body its arm's); and
+//! moved here from `dispatch`'s arms (B1 keeps their behaviour, reading the
+//! running thread's `UserThread` and its `Process`); and
 //! M8's `clone`, `fork`, `vfork`, `execve`, `wait4`, `waitid`, `setpgid`,
 //! `setsid`, `getpgid`, `getsid`.
 
@@ -9,7 +10,7 @@ use super::not_implemented;
 use crate::arch;
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::linux::general;
-use crate::linux::process::{record_exit, with_current, with_current_mut};
+use crate::linux::process::{current_process, current_thread, record_exit};
 use crate::user::UserExit;
 
 /// `exit` and `exit_group` (one arm in `dispatch`).
@@ -25,26 +26,25 @@ pub(super) fn sys_exit(frame: &mut SyscallFrame) -> SyscallReturn {
 }
 
 pub(super) fn sys_getpid(frame: &mut SyscallFrame) -> SyscallReturn {
-    frame.rax = u64::from(with_current(|p| p.pid));
+    frame.rax = u64::from(current_process().pid());
     SyscallReturn::Sysret
 }
 
 pub(super) fn sys_getppid(frame: &mut SyscallFrame) -> SyscallReturn {
-    frame.rax = u64::from(with_current(|p| p.ppid));
+    frame.rax = u64::from(current_process().ppid());
     SyscallReturn::Sysret
 }
 
 pub(super) fn sys_gettid(frame: &mut SyscallFrame) -> SyscallReturn {
-    frame.rax = u64::from(with_current(|p| p.tid));
+    frame.rax = u64::from(current_thread().tid());
     SyscallReturn::Sysret
 }
 
 pub(super) fn sys_set_tid_address(frame: &mut SyscallFrame) -> SyscallReturn {
     let tidptr = frame.rdi;
-    frame.rax = u64::from(with_current_mut(|p| {
-        p.clear_child_tid = tidptr;
-        p.tid
-    }));
+    let thread = current_thread();
+    thread.set_clear_child_tid(tidptr);
+    frame.rax = u64::from(thread.tid());
     SyscallReturn::Sysret
 }
 
@@ -112,3 +112,27 @@ pub(super) fn sys_getpgid(_pid: i32) -> u64 {
 pub(super) fn sys_getsid(_pid: i32) -> u64 {
     not_implemented(general::__NR_getsid)
 }
+
+crate::ktest!(
+    fn identity_syscalls_name_the_process_and_thread() {
+        // Through `dispatch`: `set_tid_address` stores its pointer and
+        // returns the tid; the leader's tid and the process's pid and group
+        // are the pid; a root's parent is 0.
+        use crate::kassert_eq;
+        use crate::linux::process::in_test_process;
+        in_test_process(|pid| {
+            let call = |nr: u32, rdi: u64| {
+                let mut frame = SyscallFrame { rax: u64::from(nr), rdi, ..SyscallFrame::default() };
+                let _ = super::dispatch(&mut frame);
+                frame.rax
+            };
+            kassert_eq!(call(general::__NR_set_tid_address, 0x5000), u64::from(pid));
+            kassert_eq!(current_thread().clear_child_tid(), 0x5000);
+            kassert_eq!(call(general::__NR_gettid, 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getpid, 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getppid, 0), 0);
+            kassert_eq!(call(general::__NR_getpgrp, 0), u64::from(pid));
+            Ok(())
+        })?
+    }
+);

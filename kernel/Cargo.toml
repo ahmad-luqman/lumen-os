@@ -14,7 +14,7 @@ bench = false
 [features]
 # Build the in-kernel test runner: instead of the shells, run every
 # `ktest!` and report TAP over serial.
-ktest = ["lumen-bcache/test-util"]
+ktest = ["lumen-bcache/test-util", "lumen-proc/test-util"]
 
 [dependencies]
 lumen-acpi.workspace = true
@@ -30,9 +30,11 @@ lumen-mm.workspace = true
 lumen-pci.workspace = true
 lumen-perf.workspace = true
 lumen-png.workspace = true
+lumen-proc.workspace = true
 lumen-queue.workspace = true
 lumen-rand.workspace = true
 lumen-shell.workspace = true
+lumen-signal.workspace = true
 lumen-synth.workspace = true
 lumen-term.workspace = true
 lumen-time.workspace = true

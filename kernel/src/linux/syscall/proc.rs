@@ -4,7 +4,7 @@
 
 use super::{DEFAULT_RLIMIT_NOFILE, IO_CHUNK, copy_pod_from_user, copy_pod_to_user, neg_errno};
 use crate::arch;
-use crate::linux::process::with_current;
+use crate::linux::process::current_process;
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, default_utsname, errno, general};
 use crate::sched;
 use crate::user::{USER_MAX, copy_to_user, user_range_valid};
@@ -69,7 +69,7 @@ pub(super) fn sys_clock_gettime(clockid: u64, tp: u64) -> u64 {
 }
 
 pub(super) fn sys_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: u64) -> u64 {
-    let current_pid = with_current(|p| p.pid);
+    let current_pid = current_process().pid();
     if pid != 0 && pid != u64::from(current_pid) {
         return neg_errno(errno::ESRCH);
     }

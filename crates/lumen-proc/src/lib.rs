@@ -25,7 +25,11 @@
 //!   [`ProcTree::getpgid`], [`ProcTree::getsid`], [`ProcTree::is_orphaned_pgrp`]
 //!   and the checks of `tcsetpgrp` ([`ProcTree::tcsetpgrp`]);
 //! - **pids**: from 2 up to the tree's maximum, then wrapping, never a
-//!   number still used as a pid, a pgid or a sid ([`ProcTree::is_busy`]).
+//!   number still used as a pid, a pgid, a sid or a tid ([`ProcTree::is_busy`]);
+//! - **tids**: a thread's number from the same allocator
+//!   ([`ProcTree::add_thread`], [`ProcTree::remove_thread`]; the leader's
+//!   tid is the pid), so no tid is ever a live pid, pgid or sid; a process's
+//!   exit frees any it still has.
 //!
 //! Ids are plain `u32`s; arguments a syscall passes signed (`wait4`'s `pid`,
 //! `waitid`'s `idtype` and `id`, `setpgid`'s two, `getpgid`'s, `getsid`'s
@@ -33,18 +37,20 @@
 //! Linux's errors. Signals are `lumen_signal::Signal`s.
 //!
 //! Errors are per call. The calls made on behalf of a user (`fork`,
-//! `wait*`, `setsid`, `setpgid`, `getpgid`, `getsid`, `tcsetpgrp`) return
-//! [`Error`]: an [`Errno`] for the user, or a [`Bug`], a wrong or stale pid
-//! from the kernel, which maps to no `errno`. The others say only what can
+//! `add_thread`, `remove_thread`, `wait*`, `setsid`, `setpgid`, `getpgid`,
+//! `getsid`, `tcsetpgrp`) return [`Error`]: an [`Errno`] for the user, or a
+//! [`Bug`], a wrong or stale pid from the kernel, which maps to no `errno`. The others say only what can
 //! happen to them: [`ProcTree::exit`] an [`ExitError`], [`ProcTree::exec`]
 //! a [`Bug`], [`ProcTree::spawn_init`] a [`SpawnInitError`],
 //! [`ProcTree::spawn_root`] [`NoFreePid`], [`ProcTree::stop`] and
 //! [`ProcTree::cont`] `ESRCH`.
 //!
-//! Not modelled: threads (every process is one thread group with one
-//! thread), signal delivery and dispositions (the kernel sends what an
-//! operation returns, and says through `exit`'s `autoreap` which parents
-//! ignore `SIGCHLD`), `rusage` accounting (the tree only carries each
+//! Threads are modelled only as numbers: a process's tids, for the pid
+//! space (`getpgid`, `setpgid` and the other calls look processes up by
+//! pid, so a non-leader tid names none). Not modelled: what a thread does,
+//! signal delivery and dispositions (the kernel sends what an operation
+//! returns, and says through `exit`'s `autoreap` which parents ignore
+//! `SIGCHLD`), `rusage` accounting (the tree only carries each
 //! process's token), controlling-terminal acquisition and hangup,
 //! `CLONE_PARENT`, ptrace, child subreapers, and `PR_SET_PDEATHSIG` (the
 //! kernel reads [`ProcTree::children`] before [`ProcTree::exit`] to signal
@@ -59,29 +65,34 @@
 //!   reaper's children list and in the exiting process's old children list,
 //!   which its [`ExitOutcome`] keeps for the actions (room means the list
 //!   holds their words: two for a zombie, four for one released, one for a
-//!   hangup; without a reaper, after the children themselves). A failed reservation
-//!   is [`ExitError::NoMem`] with the tree unchanged. It also frees the
-//!   nodes of the zombies that leave.
+//!   hangup; without a reaper, after the children themselves). A failed
+//!   reservation is [`ExitError::NoMem`] with the tree unchanged, the
+//!   exiting process's tids included. It also frees the nodes of the
+//!   zombies that leave, and the index entries of any tids the exiting
+//!   process still has.
 //! - **Infallible allocation (a known gap):** stable `BTreeMap`/`BTreeSet`
 //!   have no fallible insert. A new process takes three B-tree inserts (its
 //!   node and its two index entries; [`ProcTree::spawn_init`],
-//!   [`ProcTree::spawn_root`], [`ProcTree::fork`]), and
-//!   [`ProcTree::setsid`] and [`ProcTree::setpgid`] move index entries; any
-//!   of them can abort on out-of-memory, and the kernel issue must settle
-//!   it. A review counted up to 8 allocations in a `fork` (node splits), 7
-//!   in a `spawn_root`, 4 in a `setsid` and 2 in a `setpgid`; only `fork`'s
-//!   reservation in the parent's children list is fallible (`ENOMEM`, the
-//!   tree unchanged). These calls can also free.
+//!   [`ProcTree::spawn_root`], [`ProcTree::fork`]), a new thread one (its
+//!   tid's index entry; [`ProcTree::add_thread`]), and [`ProcTree::setsid`]
+//!   and [`ProcTree::setpgid`] move index entries; any of them can abort on
+//!   out-of-memory, and the kernel issue must settle it. A review counted up
+//!   to 8 allocations in a `fork` (node splits), 7 in a `spawn_root`, 4 in a
+//!   `setsid` and 2 in a `setpgid`; only `fork`'s reservation in the
+//!   parent's children list and `add_thread`'s in the process's thread list
+//!   are fallible (`ENOMEM`, the tree unchanged). These calls can also free.
 //! - **Freeing only:** [`ProcTree::wait`] when it reaps frees the zombie's
-//!   node and index entries. Dropping an [`ExitOutcome`]'s actions frees
-//!   their list. That a reaping `wait` never allocates rests on liballoc's
-//!   current `BTreeMap::remove` and `Vec::retain`; `tests/alloc.rs` checks
-//!   it with a counting allocator.
+//!   node and index entries, and [`ProcTree::remove_thread`] the tid's.
+//!   Dropping an [`ExitOutcome`]'s actions frees their list. That a reaping
+//!   `wait` and `remove_thread` never allocate rests on liballoc's current
+//!   `BTreeMap::remove` and `Vec::retain`; `tests/alloc.rs` checks it with a
+//!   counting allocator.
 //! - **Neither:** the lookups (including [`ProcTree::pgrp_members`]), the
-//!   request builders, a `wait` that doesn't reap, [`ProcTree::exec`],
-//!   [`ProcTree::stop`], [`ProcTree::cont`], [`ProcTree::getpgid`],
-//!   [`ProcTree::getsid`] and [`ProcTree::tcsetpgrp`]; `tests/alloc.rs`
-//!   checks that they neither allocate nor free.
+//!   request builders, a `wait` that doesn't reap, a refused
+//!   [`ProcTree::remove_thread`], [`ProcTree::exec`], [`ProcTree::stop`],
+//!   [`ProcTree::cont`], [`ProcTree::getpgid`], [`ProcTree::getsid`] and
+//!   [`ProcTree::tcsetpgrp`]; `tests/alloc.rs` checks that they neither
+//!   allocate nor free.
 
 #![no_std]
 

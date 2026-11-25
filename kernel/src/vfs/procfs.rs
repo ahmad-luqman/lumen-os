@@ -433,7 +433,7 @@ impl VfsInode for ProcfsInode {
     fn readlink(&self) -> Result<Vec<u8>, VfsError> {
         match self.kind {
             // A kernel thread (the shell) has no pid: `/proc/self` dangles.
-            ProcKind::SelfLink => Ok(format!("{}", process::current_pid().ok_or(VfsError::NoEnt)?).into_bytes()),
+            ProcKind::SelfLink => Ok(format!("{}", process::try_current_pid().ok_or(VfsError::NoEnt)?).into_bytes()),
             // No path recorded (a process not loaded from the VFS): no target,
             // the same answer `resolve_magic_link` gives.
             ProcKind::PidExe(pid) => process::process_exe_path(pid).map(String::into_bytes).ok_or(VfsError::NoEnt),
@@ -546,10 +546,7 @@ impl VfsInode for ProcfsInode {
             ProcKind::Meminfo => format_meminfo().into_bytes(),
             ProcKind::Mounts | ProcKind::PidMounts(_) => format_mounts().into_bytes(),
             ProcKind::Version => format_version().into_bytes(),
-            ProcKind::PidMaps(pid) => match process::process_address_space(pid) {
-                Some(aspace) => aspace.format_maps(),
-                None => return Err(VfsError::NoEnt),
-            },
+            ProcKind::PidMaps(pid) => process::process_maps(pid).ok_or(VfsError::NoEnt)?,
             _ => return Err(VfsError::Inval),
         };
         Ok(slice_read(&text, offset, buf))
@@ -723,14 +720,9 @@ fn short_process_resolving_its_proc_nodes() -> Result<u32, String> {
             }
             Ok(())
         })();
-        // Ended before the address space is detached, a failed check
-        // included.
+        // Ended, a failed check included: its takedown takes this thread off
+        // the space and tears it down.
         drop(registered);
-        if let Some(detached) = sched::detach_user_space()
-            && Arc::strong_count(&detached) == 1
-        {
-            detached.teardown();
-        }
         *res_clone.lock() = Some(checks.map(|()| pid));
     })
     .map_err(|e| format!("spawn_user_on: {e:?}"))?;

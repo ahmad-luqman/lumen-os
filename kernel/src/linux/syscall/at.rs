@@ -132,7 +132,8 @@ impl Mode {
         (self.0 & 0o1777) as u16
     }
 
-    /// The low 32 bits as given (`umask` keeps `& 0o777` of them).
+    /// The low 32 bits as given (`umask` keeps their `0o777` bits, in
+    /// `process::swap_current_umask`).
     pub(super) fn bits(self) -> u32 {
         self.0
     }
@@ -351,7 +352,8 @@ impl Start {
 ///   dirfd's file: `-EBADF` if it isn't open, `-ENOTDIR` if it isn't a
 ///   directory (an `O_PATH` one is fine).
 ///
-/// Takes `ACTIVE_PROCS` briefly; the clones it takes drop after it.
+/// Takes the process's descriptor and working-directory locks briefly; the
+/// clones it takes drop after them.
 pub(super) fn start_dir(dirfd: Dirfd, path: &UserPath) -> Result<Start, u32> {
     if path.as_bytes().starts_with(b"/") {
         return Ok(Start { dir: None, base: None });

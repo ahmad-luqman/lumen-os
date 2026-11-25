@@ -77,13 +77,21 @@ pub enum Bug {
         /// The reaper the kernel named.
         reaper: u32,
     },
+    /// [`crate::ProcTree::remove_thread`]'s `tid` isn't one of `pid`'s
+    /// added threads (the leader's tid, the pid, is never one).
+    NotThread {
+        /// The process.
+        pid: u32,
+        /// The tid.
+        tid: u32,
+    },
 }
 
 /// What a pid named in a [`Bug::NotLive`] was for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     /// The process making the call (`wait*`, `setsid`, `setpgid`,
-    /// `getpgid`, `getsid`, `tcsetpgrp`, `exec`).
+    /// `getpgid`, `getsid`, `tcsetpgrp`, `exec`, `add_thread`).
     Caller,
     /// The parent [`crate::ProcTree::fork`] forks from.
     Parent,
@@ -96,6 +104,7 @@ impl fmt::Display for Bug {
         match *self {
             Self::NotLive { pid, role } => write!(f, "{role:?} {pid} isn't live"),
             Self::BadReaper { pid, reaper } => write!(f, "{reaper} can't reap the children of {pid}"),
+            Self::NotThread { pid, tid } => write!(f, "{tid} isn't a thread {pid} added"),
         }
     }
 }

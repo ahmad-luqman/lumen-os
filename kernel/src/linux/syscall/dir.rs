@@ -157,7 +157,7 @@ fn getdents64(fd: Fd, dirp: UserPtr, count: u32) -> Result<u64, u32> {
     }
     let limit = (count as usize).min(GETDENTS_MAX);
     // Held across `readdir` (Lock 2 before the filesystem's Locks 4 to 9
-    // and procfs's leaf `ACTIVE_PROCS`), and moved before it is released,
+    // and procfs's `PROCS` and process locks), and moved before it is released,
     // so two calls on one open file never list the same entries.
     let (pos, next, buf) = {
         let mut cursor = file.dir_cursor.lock();
@@ -285,7 +285,7 @@ static CWD_PATH_WARNED: AtomicU64 = AtomicU64::new(0);
 /// Make `guard`'s directory the working directory: `ENOTDIR` if it isn't a
 /// directory (checked here first, so a file isn't warned about as a path
 /// that couldn't be computed; `Cwd::new` checks again). The old one drops
-/// outside `ACTIVE_PROCS`.
+/// outside the process's locks.
 ///
 /// The path kept with it (what a relative open's `/proc/<pid>/fd` path is
 /// joined to) is computed from the inode, as `getcwd`'s is, so it stays

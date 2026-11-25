@@ -5,6 +5,7 @@ mod model;
 mod pid;
 mod session;
 mod status;
+mod thread;
 mod wait;
 
 use alloc::vec::Vec;

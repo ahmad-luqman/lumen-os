@@ -167,14 +167,16 @@ def test_heap_command_reports_usage(boot):
     # What boot keeps (`acpi::Info`, for one), the four virtual terminals
     # (each grid's cells, scrollback, tab stops and dirty marks), the VFS
     # boot mounts (`/`, `/tmp`, `/dev` + 6 char nodes, `/proc`, and the
-    # mount/inode tables), and the shells (their editors and histories, the
-    # screen shells' threads and the keyboard's wait queue they block in) is
-    # in use (91 allocations when the VFS mounts arrived; the ceiling leaves
-    # 9 for growth); the rest of what the heap mapped is free.
+    # mount/inode tables), pid 1 (its process, its placeholder address space
+    # and the process table's nodes, #372), and the shells (their
+    # editors and histories, the screen shells' threads and the keyboard's
+    # wait queue they block in) is in use (91 allocations when the VFS mounts
+    # arrived, 95 before pid 1, 101 with it; the ceiling leaves 9 for
+    # growth); the rest of what the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert 0 < heap["live"] <= 100, (
+    assert 0 < heap["live"] <= 110, (
         f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     )
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap

@@ -774,7 +774,7 @@ fn check_proc_static() -> Result<(), String> {
 /// `/proc/self`, `/proc/self/exe`, the `/proc/self/fd/*` magic links (a
 /// deleted file's too), `/proc/self/maps`, and what `/dev/tty` and
 /// `/dev/console` write (`ConsoleIo::Capture`), from a user thread with a
-/// real `AddressSpace` and `ProcessState`: the run's summary
+/// real `AddressSpace` and `Process`: the run's summary
 /// (`pid=<pid> maps_ok tty_ok`).
 fn check_proc_of_a_process() -> Result<String, String> {
     use crate::linux::process;
@@ -929,12 +929,9 @@ fn check_proc_of_a_process() -> Result<String, String> {
                 Ok(summary)
             }
         });
+        // Its takedown (`end`) took this thread off the space and gave up
+        // the process's user of it, the only one: the space is torn down.
         drop(proc_state);
-        if let Some(detached) = sched::detach_user_space()
-            && Arc::strong_count(&detached) == 1
-        {
-            detached.teardown();
-        }
         *res_clone.lock() = Some(out);
     })
     .map_err(|e| format!("spawn_user_on: {e:?}"))?;

@@ -361,6 +361,13 @@ pub static COMMANDS: Table<Run> = Table(&[
         run: sysinfo::threads,
     },
     Command {
+        name: "ps",
+        args: &[],
+        usage: "",
+        about: "each Linux process: its pid, parent, threads' tids and states, and name",
+        run: sysinfo::ps,
+    },
+    Command {
         name: "grep",
         args: &[],
         usage: "<text>",

@@ -119,6 +119,12 @@ impl<T> SpinLock<T> {
         Some(SpinLockGuard { lock: self, _irq: irq })
     }
 
+    /// The value, through exclusive access to the lock (`Drop`, say): no
+    /// one can hold it, so nothing is taken.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     /// Whether this CPU holds the lock (for the ktests).
     #[cfg(feature = "ktest")]
     fn held_here(&self) -> bool {

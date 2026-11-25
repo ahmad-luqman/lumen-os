@@ -87,7 +87,7 @@ use core::mem::{MaybeUninit, size_of};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
-use crate::linux::process::{ConsoleIo, KernelSigaction, with_current};
+use crate::linux::process::{ConsoleIo, KernelSigaction, current_process};
 use crate::linux::{Utsname, errno, general};
 use crate::user::{CopyError, copy_from_user, copy_to_user, user_range_valid};
 use at::reg;
@@ -314,7 +314,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         }
         Ok(general::__NR_getppid) => task::sys_getppid(frame),
         Ok(general::__NR_getpgrp) => {
-            frame.rax = u64::from(with_current(|p| p.pid));
+            frame.rax = u64::from(current_process().pid());
             SyscallReturn::Sysret
         }
         Ok(general::__NR_arch_prctl) => {
@@ -779,7 +779,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         }
 
         _ => {
-            if with_current(|p| p.allow_test_syscalls)
+            if current_process().allow_test_syscalls()
                 && let Some(ret) = crate::user::dispatch_test_syscall(frame)
             {
                 return ret;

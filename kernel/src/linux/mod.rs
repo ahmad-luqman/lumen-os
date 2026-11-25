@@ -7,9 +7,12 @@
 //! one canonical ABI surface.
 
 pub mod exec;
+mod init;
 pub mod modules;
 pub mod process;
 pub mod syscall;
+
+pub use init::init;
 
 use alloc::borrow::Cow;
 use alloc::string::String;
@@ -1226,13 +1229,14 @@ fn run_spinning(exec: Exec, module_name: &'static str, argv0: &'static str) -> R
         let id = crate::shell::sysinfo::int(ktid);
         crate::shell::sysinfo::thread_table().rows().iter().find(|r| r.get(1) == Some(&id)).cloned()
     });
-    let released = match seen.as_ref().and_then(|(_, _, space)| space.clone()) {
-        Some(space) => {
-            let _active = crate::sched::UserSpaceGuard::enter(space);
-            copy_to_user(SPIN_FLAG, &1u64.to_le_bytes()).is_ok()
-        }
-        None => false,
-    };
+    // From inside its space, holding a process user of it meanwhile (the
+    // process, on this CPU, may exit as soon as the flag is set; see
+    // `with_process_user`); a space already retired (the process gone)
+    // isn't entered.
+    let released = seen.as_ref().and_then(|(_, _, space)| space.as_ref()).is_some_and(|space| {
+        crate::linux::process::with_process_user(space, || copy_to_user(SPIN_FLAG, &1u64.to_le_bytes()).is_ok())
+            == Some(true)
+    });
     runner.join();
     let ran = slot.lock().take();
     let (pid, exe_path, _) = seen.ok_or("the process never registered")?;

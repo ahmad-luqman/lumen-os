@@ -83,6 +83,7 @@ use log::{info, warn};
 use lumen_mm::stacks::{StackKind, StackRange};
 
 use crate::arch::{self, MAX_CPUS};
+use crate::linux::process::UserThread;
 use crate::mm::paging;
 use crate::mm::stack::{KernelStack, STACK_SIZE, StackError};
 use crate::mm::user_vm::AddressSpace;
@@ -194,10 +195,16 @@ impl SavedRsp {
     }
 }
 
-/// Per-user-thread hardware and VM state carried across context switches.
+/// Per-user-thread hardware and VM state carried across context switches,
+/// and the thread's Linux identity.
 ///
-/// Accessed only on the thread's home CPU with interrupts off (during
-/// `schedule`, `attach`/`detach`, or `arch_prctl`), or exclusively in `Drop`.
+/// Accessed only on its thread's home CPU with interrupts off: by
+/// `schedule` switching to and from the thread, and by the thread itself
+/// (`detach_user_space`, a `UserSpaceGuard`, `arch_prctl`'s
+/// `set_current_fs_base`, the `#PF` path's `current_address_space`, and
+/// `current_user_thread` and `set_current_user_thread`, which a Linux
+/// process's registration, syscalls and takedown call); or exclusively in
+/// `Drop`.
 struct UserThreadState {
     address_space: Arc<AddressSpace>,
     fpu: UnsafeCell<arch::fpu::UserFpuState>,
@@ -205,6 +212,12 @@ struct UserThreadState {
     kernel_rsp: AtomicU64,
     user_exit_rsp: AtomicU64,
     pending_debug_trap: AtomicBool,
+    /// The Linux thread it runs ([`set_current_user_thread`]): `None` until
+    /// its process is registered (B1 sets it then; C1's `spawn_user_on` will
+    /// at spawn), after it is taken down, and for a ktest's
+    /// [`UserSpaceGuard`]. Read lock-free by its own thread
+    /// ([`current_user_thread`]).
+    linux: Option<Arc<UserThread>>,
 }
 
 impl UserThreadState {
@@ -216,6 +229,7 @@ impl UserThreadState {
             kernel_rsp: AtomicU64::new(0),
             user_exit_rsp: AtomicU64::new(0),
             pending_debug_trap: AtomicBool::new(false),
+            linux: None,
         }
     }
 
@@ -835,6 +849,39 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     unsafe { (*t).user.as_ref().map(|u| u.address_space.clone()) }
 }
 
+/// The current thread's Linux thread (a clone), if it is a user thread whose
+/// process is registered (lock-free, safe from syscall and fault handlers).
+pub fn current_user_thread() -> Option<Arc<UserThread>> {
+    let _irq = arch::irq::push_off();
+    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
+    if t.is_null() {
+        return None;
+    }
+    // SAFETY: `t` is the running thread on this CPU and interrupts are off, so
+    // `schedule()` cannot run or change `user`; only this thread writes
+    // `linux` (`set_current_user_thread`) or takes the state
+    // (`detach_user_space`), and it is here.
+    unsafe { (*t).user.as_ref().and_then(|u| u.linux.clone()) }
+}
+
+/// Make `linux` the current user thread's Linux thread (`None` to detach
+/// it), returning the one it replaces, which the caller drops with
+/// interrupts on. Only the thread itself sets it, with interrupts off; only
+/// `linux::process`'s registration and takedown call it.
+///
+/// Panics if the current thread has no user state (a kernel thread).
+pub(crate) fn set_current_user_thread(linux: Option<Arc<UserThread>>) -> Option<Arc<UserThread>> {
+    let _irq = arch::irq::push_off();
+    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
+    assert!(!t.is_null(), "set_current_user_thread before sched::init");
+    // SAFETY: `t` is the running thread on this CPU with interrupts off, and
+    // no other reference into its slot is live: none is held across a call
+    // into this module, and nothing else on this CPU runs meanwhile.
+    let slot = unsafe { &mut *(*t).user.slot() };
+    let user = slot.as_mut().expect("set_current_user_thread on a kernel thread");
+    core::mem::replace(&mut user.linux, linux)
+}
+
 /// The current user thread's `IA32_FS_BASE` (`0` for non-user threads).
 pub fn current_fs_base() -> u64 {
     let _irq = arch::irq::push_off();
@@ -864,9 +911,14 @@ pub fn set_current_fs_base(addr: u64) {
 
 /// Detach the current thread's [`UserThreadState`], switching `CR3` back to
 /// `kernel_root()` and clearing `TSS.rsp0`, `PerCpu`, and `IA32_FS_BASE`.
+/// A Linux process's thread is detached by its takedown
+/// (`linux::process::take_current`), which first clears `linux`: a debug
+/// assertion checks it is gone, so no Linux identity is dropped here
+/// unnoticed.
 ///
-/// Returns the detached [`AddressSpace`] (if any) with interrupts restored so
-/// the caller can safely call [`AddressSpace::teardown`] with interrupts ON.
+/// Returns the detached [`AddressSpace`] (if any) with interrupts restored,
+/// so the caller can tear it down (or give up its process user) with
+/// interrupts on.
 pub fn detach_user_space() -> Option<Arc<AddressSpace>> {
     let detached = {
         let _irq = arch::irq::push_off();
@@ -877,6 +929,10 @@ pub fn detach_user_space() -> Option<Arc<AddressSpace>> {
         }
         // SAFETY: `t` is the running thread on `cpu` with interrupts off.
         let prev = unsafe { (*(*t).user.slot()).take() };
+        debug_assert!(
+            prev.as_ref().is_none_or(|u| u.linux.is_none()),
+            "detach_user_space on a Linux thread its process's takedown hasn't detached"
+        );
         if prev.is_some() {
             let kroot = paging::kernel_root();
             if arch::paging::active_root() != kroot {
@@ -1162,9 +1218,12 @@ pub fn spawn_on(
 /// clean [`arch::fpu::UserFpuState`], and `fs_base = 0`.
 ///
 /// M6–M7 user threads are single-threaded and pinned to their home CPU `cpu`.
-/// When `f` returns, `thread_entry` detaches the address space (switching `CR3`
-/// back to `kernel_root()`) and calls `teardown()` with interrupts enabled if
-/// this thread holds the last reference.
+/// A thread whose Linux process registered is detached and its space given
+/// up by that process's takedown (`linux::process::take_current`) before
+/// `f` returns. For one that registered none, when `f` returns,
+/// `thread_entry` detaches the address space (switching `CR3` back to
+/// `kernel_root()`) and calls `teardown()` with interrupts enabled if this
+/// thread holds the last reference.
 pub fn spawn_user_on(
     cpu: usize,
     name: impl Into<ThreadName>,
@@ -1221,9 +1280,10 @@ extern "C" fn thread_entry() -> ! {
     // returns, so it would never be dropped).
     let entry = current().expect("a thread runs on a CPU with a scheduler").entry.lock().take();
     entry.expect("a thread starts once")();
-    // If this was a user thread and its entry didn't already detach, switch
-    // CR3 back to `kernel_root()` and tear down user mappings with interrupts
-    // ON (so `AddressSpace::drop` in `finish_switch` only frees the bare L4).
+    // A user thread whose entry didn't already detach (one that registered
+    // no Linux process: a process's takedown detaches): switch CR3 back to
+    // `kernel_root()` and tear down user mappings with interrupts ON (so
+    // `AddressSpace::drop` in `finish_switch` only frees the bare L4).
     if let Some(space) = detach_user_space()
         && Arc::strong_count(&space) == 1
     {
