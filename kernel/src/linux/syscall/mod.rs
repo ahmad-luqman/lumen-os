@@ -117,7 +117,6 @@ struct RawIovec {
 // Compile-time zero-padding verification for every POD ABI struct copied to/from user space.
 const _: () = {
     assert!(size_of::<RawIovec>() == size_of::<general::iovec>() && size_of::<RawIovec>() == 16);
-    assert!(size_of::<poll::RawPollFd>() == size_of::<general::pollfd>() && size_of::<poll::RawPollFd>() == 8);
     assert!(size_of::<general::stat>() == 144);
     assert!(size_of::<general::termios>() == 36);
     assert!(size_of::<general::winsize>() == 8);

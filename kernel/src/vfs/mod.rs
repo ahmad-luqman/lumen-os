@@ -104,7 +104,7 @@ impl<T> VfsLock<T> for KernelLeafLock<T> {
 }
 
 /// The kernel's [`LockFamily`]: [`KernelVfsLock`] (`SleepMutex`) for Lock-9
-/// tables and [`KernelLeafLock`] (`SpinLock`) for level-10 `e` leaf structures.
+/// tables and [`KernelLeafLock`] (`SpinLock`) for `PollHead`'s level-10e spin lock.
 pub struct KernelLocks;
 
 impl LockFamily for KernelLocks {

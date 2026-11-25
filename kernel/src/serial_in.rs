@@ -109,11 +109,15 @@ static LATE: AtomicU64 = AtomicU64::new(0);
 /// Waits that found input at their deadline, no interrupt having brought
 /// any (or one having, without waking the reader).
 static AT_DEADLINE: AtomicU64 = AtomicU64::new(0);
-/// `poll`/`select` waits on `/dev/console` that found input on the 100 ms
-/// safety step without an IRQ 4 `PollHead::notify` wake.
+/// `poll`/`select` waits on `/dev/console` that found queued input on the
+/// 100 ms safety step without an IRQ 4 `PollHead::notify` wake.
 static POLL_AT_SAFETY_STEP: AtomicU64 = AtomicU64::new(0);
-/// Whether the one-shot warning for [`POLL_AT_SAFETY_STEP`] has been logged.
-static POLL_SAFETY_WARNED: AtomicBool = AtomicBool::new(false);
+/// `poll`/`select` waits on `/dev/console` woken by IRQ 4's `PollHead::notify`.
+static POLL_WOKEN: AtomicU64 = AtomicU64::new(0);
+/// Sequence bracketing [`queue_waiting`]'s drain-to-notify section (odd while
+/// the boot-CPU handler is between pushing into [`QUEUE`] and completing
+/// `POLL_HEAD.notify`; even otherwise).
+static POLL_NOTIFY_SEQ: AtomicU64 = AtomicU64::new(0);
 /// When those are worth a warning (the serial shell's only).
 static MISSED: SpinLock<MissedInterrupts> = SpinLock::new(MissedInterrupts::new());
 
@@ -121,8 +125,9 @@ static MISSED: SpinLock<MissedInterrupts> = SpinLock::new(MissedInterrupts::new(
 /// doc). On the boot CPU, once. Without a usable route the shell polls;
 /// without a UART it blocks for good where it can block, else yields.
 pub fn init() {
-    // Initialize `POLL_HEAD` once up front (outside any lock) before any early
-    // return so `queue_waiting` never needs lazy initialization.
+    // Initialize `POLL_HEAD` eagerly (outside any lock) before any early
+    // return so `subscribe_poll` never hits its lazy allocation path in the
+    // shell kernel.
     let _ = ensure_poll_head();
     if !arch::serial::present() {
         return;
@@ -182,6 +187,10 @@ fn on_irq() {
 /// the queue's only producer.
 fn queue_waiting() -> usize {
     let room = QUEUE_SIZE - QUEUE.len();
+    if room == 0 {
+        return 0;
+    }
+    POLL_NOTIFY_SEQ.fetch_add(1, Ordering::SeqCst);
     let queued = arch::serial::drain(room, |b| {
         let fit = QUEUE.push(b);
         debug_assert!(fit, "drained only as much as the queue has room for");
@@ -198,6 +207,7 @@ fn queue_waiting() -> usize {
             head.notify(PollMask::IN | PollMask::RDNORM);
         }
     }
+    POLL_NOTIFY_SEQ.fetch_add(1, Ordering::SeqCst);
     queued
 }
 
@@ -207,8 +217,19 @@ fn ensure_poll_head() -> KernelPollHead {
     }
     // Allocate outside `POLL_HEAD`'s spinlock so no heap allocation runs under it.
     let fresh = KernelPollHead::new();
-    let mut slot = POLL_HEAD.lock();
-    slot.get_or_insert(fresh).clone()
+    let (head, unused) = {
+        let mut slot = POLL_HEAD.lock();
+        if let Some(existing) = slot.as_ref() {
+            (existing.clone(), Some(fresh))
+        } else {
+            *slot = Some(fresh.clone());
+            (fresh, None)
+        }
+    };
+    // Drop any losing allocation after releasing `POLL_HEAD` so deallocation
+    // never runs under the spinlock.
+    drop(unused);
+    head
 }
 
 /// Subscribe `waker` to serial input arrivals until the returned [`PollGuard`] drops.
@@ -219,21 +240,6 @@ pub fn subscribe_poll(waker: Arc<dyn PollWaker>) -> PollGuard {
 /// Whether COM1 input arrives via IRQ 4 (else `poll` falls back to short timed rechecks).
 pub fn by_interrupt() -> bool {
     BY_INTERRUPT.load(Ordering::Acquire)
-}
-
-/// Record a `poll`/`select` wait on `/dev/console` that ended on the 100 ms
-/// safety step and found input readable without an IRQ 4 `PollHead::notify`
-/// wake; logs a warning once.
-pub fn record_poll_safety_hit() {
-    POLL_AT_SAFETY_STEP.fetch_add(1, Ordering::Relaxed);
-    if !POLL_SAFETY_WARNED.swap(true, Ordering::Relaxed) {
-        warn!(
-            target: "serial",
-            "COM1 poll found input at the 100 ms safety step without IRQ 4 waking it (GSI {}, vector {:#04x})",
-            GSI.load(Ordering::Relaxed),
-            VECTOR.load(Ordering::Relaxed)
-        );
-    }
 }
 
 /// Number of active `PollHead` subscribers on serial input.
@@ -317,16 +323,48 @@ fn wait_with_deadline() {
     }
 }
 
+/// Classify a `/dev/console` `poll`/`select` wait that ended on the 100 ms
+/// IRQ 4 safety step and then found the console ready: counts a hit (and warns
+/// once) only when input is already in [`QUEUE`] (the IRQ handler ran and
+/// completed its `PollHead::notify` pass) while `fired()` is still false.
+/// Input sitting in the UART alone (FIFO trigger / character-timeout window)
+/// or a concurrent handler between push and notify is a late IRQ, not a lost
+/// one.
+pub fn note_poll_safety_step(fired: impl Fn() -> bool) {
+    let s1 = POLL_NOTIFY_SEQ.load(Ordering::SeqCst);
+    if (s1 & 1) != 0 || QUEUE.is_empty() || fired() {
+        return;
+    }
+    if POLL_NOTIFY_SEQ.load(Ordering::SeqCst) != s1 {
+        return;
+    }
+    if POLL_AT_SAFETY_STEP.fetch_add(1, Ordering::Relaxed) == 0 {
+        warn!(
+            target: "serial",
+            "COM1 poll found queued input at the 100 ms safety step without IRQ 4 waking it (GSI {}, vector {:#04x})",
+            GSI.load(Ordering::Relaxed),
+            VECTOR.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Record a `/dev/console` `poll`/`select` wait woken by IRQ 4's
+/// `PollHead::notify`.
+pub fn note_poll_woken() {
+    POLL_WOKEN.fetch_add(1, Ordering::Relaxed);
+}
+
 /// `serial [poll]`: how COM1's input comes, and how the serial shell's waits
-/// for it ended (`serial poll` reports `poll`/`select` safety-step hits and
-/// active `PollHead` subscribers).
+/// for it ended (`serial poll` reports `poll`/`select` safety-step hits,
+/// IRQ-woken waits, and active `PollHead` subscribers).
 pub fn serial_command(ctx: &mut Ctx<'_>, args: &[String]) {
     if args.len() == 1 && args[0] == "poll" {
         let mut t = String::new();
         let _ = writeln!(
             t,
-            "serial: poll safety-step hits: {}, subscribers: {}",
+            "serial: poll safety-step hits: {}, woken: {}, subscribers: {}",
             POLL_AT_SAFETY_STEP.load(Ordering::Relaxed),
+            POLL_WOKEN.load(Ordering::Relaxed),
             poll_subscribers()
         );
         let _ = ctx.out.write_str(&t);

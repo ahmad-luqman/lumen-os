@@ -25,18 +25,6 @@ use crate::types::AccessMode;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PollMask(u16);
 
-impl AccessMode {
-    /// True if this access mode allows reading (`O_RDONLY` or `O_RDWR`).
-    pub const fn can_read(self) -> bool {
-        matches!(self, Self::ReadOnly | Self::ReadWrite)
-    }
-
-    /// True if this access mode allows writing (`O_WRONLY` or `O_RDWR`).
-    pub const fn can_write(self) -> bool {
-        matches!(self, Self::WriteOnly | Self::ReadWrite)
-    }
-}
-
 impl PollMask {
     /// No events ready.
     pub const EMPTY: Self = Self(0);
@@ -166,8 +154,9 @@ pub trait PollWaker: Send + Sync {
 pub trait Pollable: Send + Sync {
     /// The readiness of one open description now (`mode`: its access mode,
     /// since a pipe's two ends share one inode and an `O_RDWR` FIFO answers
-    /// for both). With a waker, return a guard unless the caller re-polls you;
-    /// subscribe no later than the mask is read, so no change falls between.
+    /// for both). With a waker, return a guard unless it has no wake source
+    /// and the caller re-polls it on a timer (`console_step`); subscribe no
+    /// later than the mask is read, so no change falls between.
     fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>) -> (PollMask, Option<PollGuard>);
 }
 
@@ -222,13 +211,13 @@ impl<F: LockFamily + 'static> PollHeadOps for PollHeadInner<F> {
             }
         };
         // Drop the removed list node and its `Arc<dyn PollWaker>` outside the
-        // leaf lock so deallocation never runs under `PollHead`'s lock.
+        // level-10e spin lock so deallocation never runs under `PollHead`'s lock.
         drop(removed);
     }
 }
 
 /// Subscriber list for a [`Pollable`] readiness source, protected by `F`'s
-/// leaf lock (section 9, level-10 `e`).
+/// level-10e spin lock (section 9, level-10 `e`).
 pub struct PollHead<F: LockFamily> {
     inner: Arc<PollHeadInner<F>>,
 }
@@ -253,15 +242,15 @@ impl<F: LockFamily> PollHead<F> {
 
     /// Subscribe `waker` to subsequent [`Self::notify`] calls until the
     /// returned [`PollGuard`] drops. Allocates the list node before taking the
-    /// leaf lock.
+    /// level-10e spin lock.
     pub fn subscribe(&self, waker: Arc<dyn PollWaker>) -> PollGuard
     where
         F: 'static,
     {
         let id = NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
         assert_ne!(id, 0, "poll subscriber id exhausted");
-        // Allocate the list node before acquiring the leaf lock so splicing
-        // under the lock performs zero heap allocations.
+        // Allocate the list node before acquiring the level-10e spin lock so
+        // splicing under the lock performs zero heap allocations.
         let mut node = LinkedList::new();
         node.push_back(Subscriber { id, waker });
         {

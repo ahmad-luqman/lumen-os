@@ -12,6 +12,16 @@ from lumen_harness.shell import run
 
 BOOT_TIMEOUT = 60
 M8_IO = "/usr/local/bin/m8_io"
+SERIAL_POLL = re.compile(
+    r"serial: poll safety-step hits: (?P<hits>\d+), woken: (?P<woken>\d+), subscribers: (?P<subs>\d+)\n"
+)
+
+
+def _serial_poll(m) -> tuple[int, int, int]:
+    out = run(m, "serial poll")
+    found = SERIAL_POLL.fullmatch(out)
+    assert found, out
+    return int(found["hits"]), int(found["woken"]), int(found["subs"])
 
 
 def boot_shell(boot, *, devices=None):
@@ -25,11 +35,15 @@ def test_poll_and_select_on_console(boot, tmp_path):
     without typed input; timeouts last at least their requested floor; remaining
     time is written back (0 on timeout; `rem < asked` and `rem + elapsed >= asked`
     when woken); invalid/O_PATH descriptors report POLLNVAL / ready / EBADF;
-    IRQ 4 wakes the typed-byte waits without falling back to the 100 ms safety step."""
+    `serial poll` confirms blocked waits woke via IRQ 4 (`woken >= 1`), none
+    fell back to the 100 ms safety step (`hits == 0`), and all subscribers
+    unsubscribed on exit. Without `fork` or a second serial channel, the
+    scenario cannot confirm each individual wait blocked before typing, so a
+    byte arriving before `sys_*` blocks is read on pass 1 (as in `test_serial.py`)."""
     disk = copy_rootfs(tmp_path)
     m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
 
-    assert run(m, "serial poll") == "serial: poll safety-step hits: 0, subscribers: 0\n"
+    assert _serial_poll(m) == (0, 0, 0)
 
     start = len(m.output)
     m.send_line(f"linux {M8_IO} console-poll")
@@ -43,8 +57,8 @@ def test_poll_and_select_on_console(boot, tmp_path):
     ):
         m.expect(re.compile(rf"^ok {check}\r?$", re.MULTILINE), 20)
 
-    # Interactive readiness checks: wait for each prompt from `m8_io`, send
-    # serial bytes, and confirm the corresponding syscall wakes and reads them.
+    # Interactive readiness checks: `m8_io` prints `ready <tag>` immediately
+    # before each syscall; send the serial bytes and confirm the check passes.
     for tag, payload, check in (
         ("poll", "ab", "poll_with_input"),
         ("ppoll", "c", "ppoll_with_input"),
@@ -59,9 +73,12 @@ def test_poll_and_select_on_console(boot, tmp_path):
     m.expect(r"lumen> ", 10)
     assert CRASH_BEGIN not in m.output[start:]
 
-    # Every typed-byte wait woke via IRQ 4's `PollHead::notify`, never the
-    # 100 ms safety step, and all subscribers unsubscribed on exit.
-    assert run(m, "serial poll") == "serial: poll safety-step hits: 0, subscribers: 0\n"
+    # Blocked typed-byte waits woke via IRQ 4's `PollHead::notify`, never fell
+    # back to the 100 ms safety step, and all subscribers unsubscribed on exit.
+    hits, woken, subs = _serial_poll(m)
+    assert hits == 0, (hits, woken, subs)
+    assert woken >= 1, (hits, woken, subs)
+    assert subs == 0, (hits, woken, subs)
 
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS

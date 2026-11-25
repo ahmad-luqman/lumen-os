@@ -20,7 +20,7 @@ use lumen_signal::restart::RestartCode;
 use lumen_signal::{Blocked, SigSet};
 use lumen_vfs::{MAX_FDS, PollGuard, PollMask, PollWaker};
 
-use super::at::{FromReg, UserPtr};
+use super::at::{FromReg, UserPtr, reg};
 use super::fd::current_io;
 use super::{DEFAULT_RLIMIT_NOFILE, copy_pod_from_user, copy_pod_to_user, finish};
 use crate::linux::process::{self, ConsoleIo, FileRef};
@@ -50,7 +50,7 @@ const CONSOLE_POLL_STEP_NS: u64 = 5 * NS_PER_MS;
 /// Raw Linux x86-64 `struct pollfd` layout (8 bytes, zero padding).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub(super) struct RawPollFd {
+struct RawPollFd {
     fd: i32,
     events: i16,
     revents: i16,
@@ -176,11 +176,21 @@ impl Drop for MaskGuard {
     }
 }
 
-/// Optional console recheck step for [`wait_ready`]: `(step_ns, is_serial_irq_step)`.
+/// Optional console recheck step for [`wait_ready`]: caps each sleep at
+/// `step_ns` and flags IRQ 4's 100 ms safety-net step.
 #[derive(Clone, Copy)]
 struct ConsoleStep {
     step_ns: u64,
     serial_irq_safety: bool,
+}
+
+/// How the previous `wait_interruptible` in [`wait_ready`] ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LastWait {
+    None,
+    Woken,
+    TimedOut,
+    SafetyStep,
 }
 
 /// Shared readiness wait loop for `poll`, `ppoll`, `select` and `pselect6`
@@ -198,45 +208,40 @@ fn wait_ready(
 ) -> WaitResult {
     let mut guards = Vec::new();
     let deadline = match timeout {
-        WaitTimeout::Zero => {
+        WaitTimeout::Deadline(dl) if crate::time::now_ns() < dl => Some(dl),
+        WaitTimeout::Zero | WaitTimeout::Deadline(_) => {
             let ready = pass(None, &mut guards);
             return if ready > 0 { WaitResult::Ready(ready) } else { WaitResult::TimedOut };
         }
-        WaitTimeout::Deadline(dl) if crate::time::now_ns() >= dl => {
-            let ready = pass(None, &mut guards);
-            return if ready > 0 { WaitResult::Ready(ready) } else { WaitResult::TimedOut };
-        }
-        WaitTimeout::Deadline(dl) => Some(dl),
         WaitTimeout::Forever => None,
     };
 
     let waiter = PollWait::new();
-    let waker: Arc<dyn PollWaker> = Arc::clone(&waiter) as Arc<dyn PollWaker>;
-    let mut first = true;
-    let mut woke_by_safety_step = false;
+    let mut subscribe: Option<Arc<dyn PollWaker>> = Some(Arc::clone(&waiter) as Arc<dyn PollWaker>);
+    let mut last_wait = LastWait::None;
 
     loop {
-        let sub = if first {
-            first = false;
-            Some(&waker)
-        } else {
-            None
-        };
-        let ready = pass(sub, &mut guards);
+        let sub = subscribe.take();
+        let ready = pass(sub.as_ref(), &mut guards);
         if ready > 0 {
-            if woke_by_safety_step && !waiter.fired.load(Ordering::SeqCst) {
-                crate::serial_in::record_poll_safety_hit();
+            match last_wait {
+                LastWait::SafetyStep => {
+                    crate::serial_in::note_poll_safety_step(|| waiter.fired.load(Ordering::SeqCst));
+                }
+                LastWait::Woken if console_step.is_some_and(|cs| cs.serial_irq_safety) => {
+                    crate::serial_in::note_poll_woken();
+                }
+                _ => {}
             }
             return WaitResult::Ready(ready);
         }
-        woke_by_safety_step = false;
 
         if let Some(dl) = deadline
             && crate::time::now_ns() >= dl
         {
             return WaitResult::TimedOut;
         }
-        let (step_dl, used_safety_step) = match (deadline, console_step) {
+        let (step_dl, is_safety_step) = match (deadline, console_step) {
             (Some(dl), Some(cs)) => {
                 let cap = crate::time::now_ns().saturating_add(cs.step_ns);
                 (Some(dl.min(cap)), cs.serial_irq_safety && cap < dl)
@@ -251,13 +256,12 @@ fn wait_ready(
                 // `fired` again and wakes the next `wait_interruptible`
                 // immediately.
                 waiter.fired.store(false, Ordering::SeqCst);
+                last_wait = LastWait::Woken;
                 #[cfg(feature = "ktest")]
                 recheck_window::pause_if_armed();
             }
             sched::Wake::TimedOut => {
-                if used_safety_step {
-                    woke_by_safety_step = true;
-                }
+                last_wait = if is_safety_step { LastWait::SafetyStep } else { LastWait::TimedOut };
             }
             sched::Wake::Interrupted => {
                 return WaitResult::Interrupted;
@@ -269,19 +273,30 @@ fn wait_ready(
 /// Read the current readiness of an open, non-`O_PATH` descriptor, subscribing
 /// `waker` when provided and pushing any returned [`PollGuard`] onto `guards`.
 fn poll_file(file: &FileRef, waker: Option<&Arc<dyn PollWaker>>, guards: &mut Vec<PollGuard>) -> PollMask {
+    static WARNED_NO_GUARD: AtomicBool = AtomicBool::new(false);
     match file.inode().pollable() {
         Some(pollable) => {
             let (mask, guard) = pollable.poll(file.access_mode(), waker);
             match guard {
                 Some(g) => guards.push(g),
-                None if waker.is_some() && mask.is_empty() && !file.inode().is_tty() => {
-                    log::warn!(
-                        target: "poll",
-                        "pollable inode {:?}:{} returned empty mask without a PollGuard",
-                        file.inode().dev_id(),
-                        file.inode().ino(),
-                    );
-                    debug_assert!(false, "pollable returned empty mask without a PollGuard");
+                None if waker.is_some()
+                    && !mask.intersects(PollMask::ERR | PollMask::HUP | PollMask::NVAL)
+                    && !file.inode().is_tty() =>
+                {
+                    if !WARNED_NO_GUARD.swap(true, Ordering::Relaxed) {
+                        log::warn!(
+                            target: "poll",
+                            "pollable inode {:?}:{} returned mask {:#x} without a PollGuard",
+                            file.inode().dev_id(),
+                            file.inode().ino(),
+                            mask.bits(),
+                        );
+                    }
+                    // `debug-assertions = true` in every Lumen profile, so this
+                    // panics in release builds too (a `Pollable` without a wake
+                    // source that is not re-polled via `console_step` would
+                    // otherwise sleep forever).
+                    debug_assert!(false, "pollable returned non-terminal mask without a PollGuard");
                 }
                 None => {}
             }
@@ -365,22 +380,16 @@ fn write_remaining_timeval(ptr: UserPtr, timeout: WaitTimeout, timed_out: bool) 
 }
 
 /// Apply Linux's `poll_select_finish` write-back rule for `ppoll`, `select`,
-/// and `pselect6`: a failed timeout write-back keeps a ready/timeout count,
-/// and turns `-ERESTARTNOHAND` into `-EINTR` so the call cannot restart with
-/// an un-updated timeout.
-fn finish_timed(
-    result: Result<(u64, bool), u32>,
-    write_back: impl FnOnce(bool) -> Result<(), u32>,
-) -> Result<u64, u32> {
+/// and `pselect6`: writes the remaining time back on every outcome (ready,
+/// timed out, or any error after the timeout was read). A failed write-back
+/// keeps a ready/timeout count or non-restart error, and turns
+/// `-ERESTARTNOHAND` into `-EINTR` so the call cannot restart with an
+/// un-updated timeout.
+fn finish_timed(result: Result<u64, u32>, write_back: impl FnOnce(bool) -> Result<(), u32>) -> Result<u64, u32> {
+    let wb = write_back(matches!(result, Ok(0)));
     match result {
-        Ok((ready, timed_out)) => {
-            let _ = write_back(timed_out);
-            Ok(ready)
-        }
-        Err(e) if e == ERESTARTNOHAND => match write_back(false) {
-            Ok(()) => Err(ERESTARTNOHAND),
-            Err(_) => Err(errno::EINTR),
-        },
+        Ok(ready) => Ok(ready),
+        Err(ERESTARTNOHAND) if wb.is_err() => Err(errno::EINTR),
         Err(e) => Err(e),
     }
 }
@@ -427,33 +436,34 @@ fn write_revents(fds_ptr: u64, entries: &[RawPollFd]) -> Result<(), u32> {
 
 /// Core `poll`/`ppoll` body, shared with [`resume_poll`].
 ///
-/// Returns `Ok((ready, timed_out))` on completion, or `Err(errno)` (including
+/// Returns `Ok(ready)` (`0` on timeout), or `Err(errno)` (including
 /// `ERESTART_RESTARTBLOCK` when `restartable` is true and `ERESTARTNOHAND` when
 /// false). Writes back each entry's `revents` even on signal interruption,
 /// returning `EFAULT` if the user array is unwritable.
-fn run_poll(fds_ptr: u64, nfds: u32, timeout: WaitTimeout, restartable: bool) -> Result<(u64, bool), u32> {
+fn run_poll(fds_ptr: u64, nfds: u32, timeout: WaitTimeout, restartable: bool) -> Result<u64, u32> {
     if u64::from(nfds) > DEFAULT_RLIMIT_NOFILE {
         return Err(errno::EINVAL);
     }
     let cnt = nfds as usize;
-    let mut entries = Vec::with_capacity(cnt);
-    if cnt > 0 {
-        let mut raw = vec![0u8; cnt * size_of::<RawPollFd>()];
-        copy_from_user(&mut raw, fds_ptr).map_err(CopyError::to_errno)?;
-        for chunk in raw.as_chunks::<8>().0 {
-            entries.push(RawPollFd {
-                fd: i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes")),
-                events: i16::from_le_bytes(chunk[4..6].try_into().expect("2 bytes")),
-                revents: 0,
-            });
-        }
-    }
+    let mut raw = vec![0u8; cnt * size_of::<RawPollFd>()];
+    copy_from_user(&mut raw, fds_ptr).map_err(CopyError::to_errno)?;
+    let mut entries: Vec<RawPollFd> = raw
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| RawPollFd {
+            fd: i32::from_le_bytes(chunk[0..4].try_into().expect("4 bytes")),
+            events: i16::from_le_bytes(chunk[4..6].try_into().expect("2 bytes")),
+            revents: 0,
+        })
+        .collect();
 
     let polled_fds: Vec<i32> = entries.iter().map(|e| e.fd).collect();
-    let files = if polled_fds.is_empty() { Vec::new() } else { process::current_files(&polled_fds) };
-    let has_readable_tty = entries.iter().zip(&files).any(|(e, file)| {
-        e.fd >= 0 && file.as_ref().is_some_and(|f| !f.is_path() && f.is_readable() && f.inode().is_tty())
-    });
+    let files = process::current_files(&polled_fds);
+    let has_readable_tty = entries
+        .iter()
+        .zip(&files)
+        .any(|(e, file)| e.fd >= 0 && file.as_ref().is_some_and(|f| f.is_readable() && f.inode().is_tty()));
     let step = console_step(has_readable_tty);
 
     let outcome = wait_ready(timeout, step, |waker, guards| {
@@ -482,8 +492,8 @@ fn run_poll(fds_ptr: u64, nfds: u32, timeout: WaitTimeout, restartable: bool) ->
 
     write_revents(fds_ptr, &entries)?;
     match outcome {
-        WaitResult::Ready(ready) => Ok((ready, false)),
-        WaitResult::TimedOut => Ok((0, true)),
+        WaitResult::Ready(ready) => Ok(ready),
+        WaitResult::TimedOut => Ok(0),
         WaitResult::Interrupted => {
             if restartable {
                 Err(interrupted_with(encode_poll_restart(fds_ptr, nfds, timeout)))
@@ -498,19 +508,20 @@ fn run_poll(fds_ptr: u64, nfds: u32, timeout: WaitTimeout, restartable: bool) ->
 /// original deadline.
 fn resume_poll(block: &RestartBlock) -> u64 {
     let (fds_ptr, nfds, timeout) = decode_poll_restart(block);
-    finish(run_poll(fds_ptr, nfds, timeout, true).map(|(ready, _)| ready))
+    finish(run_poll(fds_ptr, nfds, timeout, true))
 }
 
 /// `poll(fds, nfds, timeout_ms)` (7).
 pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
-    let nfds = nfds as u32;
-    let timeout_ms = timeout_raw as i32;
+    let fds = reg::<UserPtr>(fds_ptr);
+    let nfds = reg::<u32>(nfds);
+    let timeout_ms = reg::<i32>(timeout_raw);
     let timeout = if timeout_ms < 0 {
         WaitTimeout::Forever
     } else {
         WaitTimeout::after_ns((timeout_ms as u64).saturating_mul(NS_PER_MS))
     };
-    finish(run_poll(fds_ptr, nfds, timeout, true).map(|(ready, _)| ready))
+    finish(run_poll(fds.addr(), nfds, timeout, true))
 }
 
 /// `ppoll(fds, nfds, tsp, sigmask, sigsetsize)` (271).
@@ -575,16 +586,17 @@ fn set_fd_bit(words: &mut [u64], fd: usize) {
 
 /// Core `select`/`pselect6` body.
 ///
-/// Returns `Ok((ready_bits, timed_out))`, or `Err(errno)` (`ERESTARTNOHAND` on
-/// signal interruption). Only a closed descriptor returns `EBADF`; an `O_PATH`
-/// descriptor answers `PollMask::NVAL` (matching Linux's `select_poll_one`).
+/// Returns `Ok(ready_bits)` (`0` on timeout), or `Err(errno)` (`ERESTARTNOHAND`
+/// on signal interruption). Only a closed descriptor returns `EBADF`; an
+/// `O_PATH` descriptor answers `PollMask::NVAL` (matching Linux's
+/// `select_poll_one`).
 fn run_select(
     n: i32,
     readfds: UserPtr,
     writefds: UserPtr,
     exceptfds: UserPtr,
     timeout: WaitTimeout,
-) -> Result<(u64, bool), u32> {
+) -> Result<u64, u32> {
     if n < 0 {
         return Err(errno::EINVAL);
     }
@@ -615,14 +627,14 @@ fn run_select(
         }
     }
 
-    let raw_files = if wanted_fds.is_empty() { Vec::new() } else { process::current_files(&wanted_fds) };
+    let raw_files = process::current_files(&wanted_fds);
     let mut entries = Vec::with_capacity(wanted_fds.len());
     let mut has_readable_tty = false;
     for ((fd, (want_r, want_w, want_x)), file) in wanted_fds.into_iter().zip(flags).zip(raw_files) {
         let Some(file) = file else {
             return Err(errno::EBADF);
         };
-        if !file.is_path() && want_r && file.is_readable() && file.inode().is_tty() {
+        if want_r && file.is_readable() && file.inode().is_tty() {
             has_readable_tty = true;
         }
         entries.push(SelectEntry { fd: fd as usize, want_r, want_w, want_x, file });
@@ -657,15 +669,15 @@ fn run_select(
     });
     drop(entries);
 
-    let (ready, timed_out) = match outcome {
-        WaitResult::Ready(ready) => (ready, false),
-        WaitResult::TimedOut => (0, true),
+    let ready = match outcome {
+        WaitResult::Ready(ready) => ready,
+        WaitResult::TimedOut => 0,
         WaitResult::Interrupted => return Err(ERESTARTNOHAND),
     };
     copy_fd_set_out(readfds, &read_out)?;
     copy_fd_set_out(writefds, &write_out)?;
     copy_fd_set_out(exceptfds, &except_out)?;
-    Ok((ready, timed_out))
+    Ok(ready)
 }
 
 /// `select(n, readfds, writefds, exceptfds, tv)` (23).
@@ -688,15 +700,20 @@ pub(super) fn sys_pselect6(
     sig: UserPtr,
 ) -> u64 {
     finish((|| {
-        // Read `sig` before `tsp`, matching Linux's `SYSCALL_DEFINE6(pselect6)`.
-        let mask = if sig.is_null() {
+        // Read `sig`'s `{ ss, ss_len }` argpack before `tsp` (Linux's
+        // `SYSCALL_DEFINE6(pselect6)`), then `tsp`, then `copy_sigmask` (as
+        // `do_pselect` orders them).
+        let sig_arg = if sig.is_null() {
             None
         } else {
             // SAFETY: `RawPselectSig` is two `u64`s (16 bytes, zero padding); every bit pattern is valid.
-            let arg = unsafe { copy_pod_from_user::<RawPselectSig>(sig.addr()) }.map_err(CopyError::to_errno)?;
-            copy_sigmask(UserPtr::from_reg(arg.ss), arg.ss_len)?
+            Some(unsafe { copy_pod_from_user::<RawPselectSig>(sig.addr()) }.map_err(CopyError::to_errno)?)
         };
         let timeout = copy_timespec(tsp)?;
+        let mask = match sig_arg {
+            Some(arg) => copy_sigmask(UserPtr::from_reg(arg.ss), arg.ss_len)?,
+            None => None,
+        };
         let _mask_guard = MaskGuard::install(mask);
         finish_timed(run_select(n, readfds, writefds, exceptfds, timeout), |timed_out| {
             write_remaining_timespec(tsp, timeout, timed_out)
@@ -760,7 +777,7 @@ mod ktest_pollable {
         PollMask, PollWaker, Pollable, SetTime, Timespec, VfsError, VfsInode, next_lock_id,
     };
 
-    use super::{ERESTARTNOHAND, RawTimespec, RawTimeval, copy_pod_to_user};
+    use super::{FromReg, RawTimespec, RawTimeval, UserPtr, copy_pod_to_user, sys_ppoll, sys_pselect6, sys_select};
     use crate::linux::process::{self, KernelFile, KtestThread, open_kernel_file};
     use crate::linux::signal::raise_for_test;
     use crate::sync::SpinLock;
@@ -996,23 +1013,56 @@ mod ktest_pollable {
         Ok(())
     }
 
+    pub(super) fn ppoll_at(fds: u64, nfds: u32, tsp: u64, sigmask: u64, sigsetsize: u64) -> u64 {
+        sys_ppoll(UserPtr::from_reg(fds), nfds, UserPtr::from_reg(tsp), UserPtr::from_reg(sigmask), sigsetsize)
+    }
+
+    pub(super) fn select_at(n: i32, readfds: u64, writefds: u64, exceptfds: u64, tv: u64) -> u64 {
+        sys_select(
+            n,
+            UserPtr::from_reg(readfds),
+            UserPtr::from_reg(writefds),
+            UserPtr::from_reg(exceptfds),
+            UserPtr::from_reg(tv),
+        )
+    }
+
+    pub(super) fn pselect6_at(n: i32, readfds: u64, writefds: u64, exceptfds: u64, tsp: u64, sig: u64) -> u64 {
+        sys_pselect6(
+            n,
+            UserPtr::from_reg(readfds),
+            UserPtr::from_reg(writefds),
+            UserPtr::from_reg(exceptfds),
+            UserPtr::from_reg(tsp),
+            UserPtr::from_reg(sig),
+        )
+    }
+
+    pub(super) fn raise_usr1_on_self() {
+        if let Some(me) = crate::sched::current() {
+            raise_for_test(&me, lumen_signal::Signal::USR1);
+        }
+    }
+
     /// Spawn a waiter running `call`, wait until subscribed and blocked on
-    /// `inode`, raise `SIGUSR1`, and verify `-ERESTARTNOHAND`, no restart
+    /// `inode`, raise `SIGUSR1`, and verify return value `want`, no restart
     /// block, and `subscriber_count() == 0`.
-    pub(super) fn expect_nohand(
+    pub(super) fn expect_interrupted(
         inode: &Arc<TestPollableInode>,
+        want: u64,
         call: impl FnOnce() -> u64 + Send + 'static,
     ) -> crate::ktest::TestResult {
         inode.set_mask_quiet(PollMask::EMPTY);
         let t: KtestThread<(u64, bool)> = process::spawn_test_thread(move |_| {
             let r = call();
+            let no_block = crate::sched::restart_block().is_none();
             crate::sched::clear_current_sigpending();
-            (r, crate::sched::restart_block().is_none())
+            (r, no_block)
         })?;
         wait_for(|| inode.subscriber_count() == 1 && t.blocked())?;
         raise_for_test(t.thread(), lumen_signal::Signal::USR1);
         let (ret, no_block) = t.join()?;
-        crate::kassert_eq!(ret, super::super::neg_errno(ERESTARTNOHAND));
+        crate::kassert_eq!(ret, want);
         crate::kassert!(no_block);
         crate::kassert_eq!(inode.subscriber_count(), 0);
         Ok(())
@@ -1026,8 +1076,8 @@ crate::ktest!(
         use super::neg_errno;
         use crate::{kassert, kassert_eq};
         use ktest_pollable::{
-            TestPollableInode, open_tmp_regular, read_fd_set_has, read_revents, write_fd_set, write_pollfds,
-            write_timespec, write_timeval,
+            TestPollableInode, open_tmp_regular, ppoll_at, pselect6_at, read_fd_set_has, read_revents, select_at,
+            write_fd_set, write_pollfds, write_timespec, write_timeval,
         };
         use lumen_signal::{Blocked, SigSet, Signal};
         use lumen_vfs::{AccessMode, OpenFlags};
@@ -1133,16 +1183,7 @@ crate::ktest!(
                 write_fd_set(rset_va, &[tp_rw.raw()])?;
                 write_fd_set(wset_va, &[tp_rw.raw()])?;
                 write_fd_set(xset_va, &[tp_rw.raw()])?;
-                kassert_eq!(
-                    sys_select(
-                        max_n,
-                        UserPtr::from_reg(rset_va),
-                        UserPtr::from_reg(wset_va),
-                        UserPtr::from_reg(xset_va),
-                        UserPtr::from_reg(tv_va),
-                    ),
-                    want_ret
-                );
+                kassert_eq!(select_at(max_n, rset_va, wset_va, xset_va, tv_va), want_ret);
                 kassert_eq!(read_fd_set_has(rset_va, tp_rw.raw())?, want_r);
                 kassert_eq!(read_fd_set_has(wset_va, tp_rw.raw())?, want_w);
                 kassert_eq!(read_fd_set_has(xset_va, tp_rw.raw())?, want_x);
@@ -1162,16 +1203,7 @@ crate::ktest!(
             write_fd_set(rset_va, &[path_fd.raw()])?;
             write_fd_set(wset_va, &[path_fd.raw()])?;
             write_fd_set(xset_va, &[path_fd.raw()])?;
-            kassert_eq!(
-                sys_select(
-                    path_fd.raw() + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(wset_va),
-                    UserPtr::from_reg(xset_va),
-                    UserPtr::from_reg(tv_va),
-                ),
-                3
-            );
+            kassert_eq!(select_at(path_fd.raw() + 1, rset_va, wset_va, xset_va, tv_va), 3);
             kassert!(read_fd_set_has(rset_va, path_fd.raw())?);
             kassert!(read_fd_set_has(wset_va, path_fd.raw())?);
             kassert!(read_fd_set_has(xset_va, path_fd.raw())?);
@@ -1181,183 +1213,77 @@ crate::ktest!(
             kassert_eq!(sys_poll(unmapped, 1, 0), neg_errno(errno::EFAULT));
             kassert_eq!(sys_poll(0, 0, 0), 0);
 
-            kassert_eq!(
-                sys_select(-1, UserPtr::from_reg(0), UserPtr::from_reg(0), UserPtr::from_reg(0), UserPtr::from_reg(0)),
-                neg_errno(errno::EINVAL)
-            );
-            // Closed fd in select -> EBADF.
+            kassert_eq!(select_at(-1, 0, 0, 0, 0), neg_errno(errno::EINVAL));
+            // Closed fd in select -> EBADF, and remaining time is written back.
             write_fd_set(rset_va, &[99])?;
-            kassert_eq!(
-                sys_select(
-                    100,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(tv_va),
-                ),
-                neg_errno(errno::EBADF)
-            );
+            write_timeval(tv_va, 5, 0)?;
+            kassert_eq!(select_at(100, rset_va, 0, 0, tv_va), neg_errno(errno::EBADF));
+            // SAFETY: `RawTimeval` is two `i64`s; every bit pattern is valid.
+            let tv_after_ebadf = unsafe { copy_pod_from_user::<RawTimeval>(tv_va) }.map_err(|_| "read tv")?;
+            let rem_ebadf_us = (tv_after_ebadf.tv_sec as u64) * US_PER_SEC + tv_after_ebadf.tv_usec as u64;
+            kassert!(rem_ebadf_us < 5 * US_PER_SEC);
             // Negative timeval field -> EINVAL; bad pointers -> EFAULT.
             write_timeval(tv_va, -1, 0)?;
-            kassert_eq!(
-                sys_select(
-                    0,
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(tv_va),
-                ),
-                neg_errno(errno::EINVAL)
-            );
+            kassert_eq!(select_at(0, 0, 0, 0, tv_va), neg_errno(errno::EINVAL));
             write_timeval(tv_va, 0, -5)?;
-            kassert_eq!(
-                sys_select(
-                    0,
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(tv_va),
-                ),
-                neg_errno(errno::EINVAL)
-            );
-            kassert_eq!(
-                sys_select(
-                    1,
-                    UserPtr::from_reg(unmapped),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                ),
-                neg_errno(errno::EFAULT)
-            );
-            kassert_eq!(
-                sys_select(
-                    0,
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(unmapped),
-                ),
-                neg_errno(errno::EFAULT)
-            );
+            kassert_eq!(select_at(0, 0, 0, 0, tv_va), neg_errno(errno::EINVAL));
+            kassert_eq!(select_at(1, unmapped, 0, 0, 0), neg_errno(errno::EFAULT));
+            kassert_eq!(select_at(0, 0, 0, 0, unmapped), neg_errno(errno::EFAULT));
 
-            // `pselect6` reads `sig` before `tsp` (bad `sig` wins over bad `tsp`).
+            // `pselect6` reads `sig`'s argpack before `tsp` (bad `sig` beats
+            // bad `tsp`), then `tsp` before `copy_sigmask` (bad `tsp` beats
+            // bad `sig.ss_len`, as Linux's `do_pselect` orders them).
             write_timespec(ts_va, 0, NS_PER_SEC as i64)?;
-            kassert_eq!(
-                sys_pselect6(
-                    0,
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ts_va),
-                    UserPtr::from_reg(unmapped),
-                ),
-                neg_errno(errno::EFAULT)
-            );
-            kassert_eq!(
-                sys_ppoll(UserPtr::from_reg(fds_va), 0, UserPtr::from_reg(ts_va), UserPtr::from_reg(0), 8),
-                neg_errno(errno::EINVAL)
-            );
-            kassert_eq!(
-                sys_pselect6(
-                    0,
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ts_va),
-                    UserPtr::from_reg(0),
-                ),
-                neg_errno(errno::EINVAL)
-            );
+            kassert_eq!(pselect6_at(0, 0, 0, 0, ts_va, unmapped), neg_errno(errno::EFAULT));
+            // SAFETY: `RawPselectSig` has zero padding bytes.
+            unsafe { copy_pod_to_user(sig_va, &RawPselectSig { ss: mask_va, ss_len: 4 }) }.map_err(|_| "write sig")?;
+            kassert_eq!(pselect6_at(0, 0, 0, 0, unmapped, sig_va), neg_errno(errno::EFAULT));
+            kassert_eq!(ppoll_at(fds_va, 0, ts_va, 0, 8), neg_errno(errno::EINVAL));
+            kassert_eq!(pselect6_at(0, 0, 0, 0, ts_va, 0), neg_errno(errno::EINVAL));
             write_timespec(ts_va, 0, 0)?;
             let initial_mask = Blocked::new(SigSet::of(&[Signal::USR1]));
             process::set_current_blocked(initial_mask);
             copy_to_user(mask_va, &SigSet::of(&[Signal::USR2]).0.to_le_bytes()).map_err(|_| "write mask")?;
-            kassert_eq!(
-                sys_ppoll(UserPtr::from_reg(fds_va), 0, UserPtr::from_reg(ts_va), UserPtr::from_reg(mask_va), 4),
-                neg_errno(errno::EINVAL)
-            );
+            kassert_eq!(ppoll_at(fds_va, 0, ts_va, mask_va, 4), neg_errno(errno::EINVAL));
             kassert_eq!(process::current_blocked(), initial_mask);
-            kassert_eq!(
-                sys_ppoll(UserPtr::from_reg(fds_va), 0, UserPtr::from_reg(ts_va), UserPtr::from_reg(mask_va), 8),
-                0
-            );
+            kassert_eq!(ppoll_at(fds_va, 0, ts_va, mask_va, 8), 0);
             kassert_eq!(process::current_blocked(), initial_mask);
             // SAFETY: `RawPselectSig` has zero padding bytes.
             unsafe { copy_pod_to_user(sig_va, &RawPselectSig { ss: mask_va, ss_len: 4 }) }.map_err(|_| "write sig")?;
-            kassert_eq!(
-                sys_pselect6(
-                    0,
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ts_va),
-                    UserPtr::from_reg(sig_va),
-                ),
-                neg_errno(errno::EINVAL)
-            );
+            kassert_eq!(pselect6_at(0, 0, 0, 0, ts_va, sig_va), neg_errno(errno::EINVAL));
             // SAFETY: `RawPselectSig` has zero padding bytes.
             unsafe { copy_pod_to_user(sig_va, &RawPselectSig { ss: 0, ss_len: 99 }) }.map_err(|_| "write sig")?;
-            kassert_eq!(
-                sys_pselect6(
-                    0,
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ts_va),
-                    UserPtr::from_reg(sig_va),
-                ),
-                0
-            );
+            kassert_eq!(pselect6_at(0, 0, 0, 0, ts_va, sig_va), 0);
             // SAFETY: `RawPselectSig` has zero padding bytes.
             unsafe { copy_pod_to_user(sig_va, &RawPselectSig { ss: mask_va, ss_len: 8 }) }.map_err(|_| "write sig")?;
-            kassert_eq!(
-                sys_pselect6(
-                    0,
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ts_va),
-                    UserPtr::from_reg(sig_va),
-                ),
-                0
-            );
+            kassert_eq!(pselect6_at(0, 0, 0, 0, ts_va, sig_va), 0);
             kassert_eq!(process::current_blocked(), initial_mask);
 
             // Failed timeout write-back on a read-only page keeps the ready
-            // count on success for `ppoll`, `select`, and `pselect6` (Linux's
-            // `poll_select_finish`).
+            // count on success, `0` on timeout, and non-restart errors such as
+            // `-EBADF` (Linux's `poll_select_finish`).
             write_timespec(ro_page, 5, 0)?;
             write_timeval(ro_page + 32, 5, 0)?;
+            write_timespec(ro_page + 64, 0, 1)?;
+            write_timeval(ro_page + 96, 0, 1)?;
             kassert_eq!(sys_mprotect(ro_page, 4096, u64::from(general::PROT_READ)), 0);
             write_pollfds(fds_va, &[(reg_fd.raw(), PollMask::IN.bits())])?;
-            kassert_eq!(
-                sys_ppoll(UserPtr::from_reg(fds_va), 1, UserPtr::from_reg(ro_page), UserPtr::from_reg(0), 8),
-                1
-            );
+            kassert_eq!(ppoll_at(fds_va, 1, ro_page, 0, 8), 1);
             write_fd_set(rset_va, &[reg_fd.raw()])?;
-            kassert_eq!(
-                sys_select(
-                    reg_fd.raw() + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ro_page + 32),
-                ),
-                1
-            );
+            kassert_eq!(select_at(reg_fd.raw() + 1, rset_va, 0, 0, ro_page + 32), 1);
             write_fd_set(rset_va, &[reg_fd.raw()])?;
-            kassert_eq!(
-                sys_pselect6(
-                    reg_fd.raw() + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ro_page),
-                    UserPtr::from_reg(0),
-                ),
-                1
-            );
+            kassert_eq!(pselect6_at(reg_fd.raw() + 1, rset_va, 0, 0, ro_page, 0), 1);
+            // Timed out with read-only timeout -> 0, not `-EFAULT`.
+            test_inode.set_mask_quiet(PollMask::EMPTY);
+            write_pollfds(fds_va, &[(tp_rw.raw(), PollMask::IN.bits())])?;
+            kassert_eq!(ppoll_at(fds_va, 1, ro_page + 64, 0, 8), 0);
+            write_fd_set(rset_va, &[tp_rw.raw()])?;
+            kassert_eq!(select_at(max_n, rset_va, 0, 0, ro_page + 96), 0);
+            write_fd_set(rset_va, &[tp_rw.raw()])?;
+            kassert_eq!(pselect6_at(max_n, rset_va, 0, 0, ro_page + 64, 0), 0);
+            // Non-restart error with read-only timeout keeps `-EBADF`.
+            write_fd_set(rset_va, &[99])?;
+            kassert_eq!(select_at(100, rset_va, 0, 0, ro_page + 32), neg_errno(errno::EBADF));
             kassert_eq!(sys_mprotect(ro_page, 4096, u64::from(general::PROT_READ | general::PROT_WRITE)), 0);
 
             kassert_eq!(test_inode.subscriber_count(), 0);
@@ -1377,8 +1303,8 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::AtomicU64;
         use ktest_pollable::{
-            TestPollableInode, expect_nohand, read_revents, wait_for, write_fd_set, write_pollfds, write_timespec,
-            write_timeval,
+            TestPollableInode, expect_interrupted, ppoll_at, pselect6_at, raise_usr1_on_self, read_revents, select_at,
+            wait_for, write_fd_set, write_pollfds, write_timespec, write_timeval,
         };
         use lumen_signal::Signal;
         use lumen_vfs::OpenFlags;
@@ -1439,9 +1365,7 @@ crate::ktest!(
             //     `-ERESTART_RESTARTBLOCK`.
             fn flip_then_raise(inode: &TestPollableInode) {
                 inode.set_mask(PollMask::IN | PollMask::RDNORM);
-                if let Some(me) = sched::current() {
-                    raise_for_test(&me, Signal::USR1);
-                }
+                raise_usr1_on_self();
             }
             test_inode.set_mask_quiet(PollMask::EMPTY);
             test_inode.set_after_read_hook(2, flip_then_raise);
@@ -1497,22 +1421,11 @@ crate::ktest!(
 
             // 4a-ro. Interrupted `poll` with read-only `fds` returns `-EFAULT`
             //        (without storing a RestartBlock), as Linux's `do_sys_poll`.
-            test_inode.set_mask_quiet(PollMask::EMPTY);
             write_pollfds(ro_page, &[(fd_num, PollMask::IN.bits())])?;
             kassert_eq!(sys_mprotect(ro_page, 4096, u64::from(general::PROT_READ)), 0);
-            let t = process::spawn_test_thread(move |_| {
-                let r = sys_poll(ro_page, 1, 5_000);
-                let no_block = sched::restart_block().is_none();
-                sched::clear_current_sigpending();
-                (r, no_block)
-            })?;
-            wait_for(|| test_inode.subscriber_count() == 1 && t.blocked())?;
-            raise_for_test(t.thread(), Signal::USR1);
-            let (ret, no_block) = t.join()?;
+            let ro_res = expect_interrupted(&test_inode, neg_errno(errno::EFAULT), move || sys_poll(ro_page, 1, 5_000));
             kassert_eq!(sys_mprotect(ro_page, 4096, u64::from(general::PROT_READ | general::PROT_WRITE)), 0);
-            kassert_eq!(ret, neg_errno(errno::EFAULT));
-            kassert!(no_block);
-            kassert_eq!(test_inode.subscriber_count(), 0);
+            ro_res?;
 
             // 4b. `poll(NULL, 0, 5000)` interrupted -> `-ERESTART_RESTARTBLOCK` with deadline.
             let t = process::spawn_test_thread(move |_| {
@@ -1529,36 +1442,18 @@ crate::ktest!(
 
             // 4c/4d. `ppoll`, `select`, and `pselect6` interrupted -> `-ERESTARTNOHAND`,
             //        PollGuards dropped.
+            let nohand = neg_errno(ERESTARTNOHAND);
             write_pollfds(fds_va, &[(fd_num, PollMask::IN.bits())])?;
             write_timespec(ts_va, 5, 0)?;
-            expect_nohand(&test_inode, move || {
-                sys_ppoll(UserPtr::from_reg(fds_va), 1, UserPtr::from_reg(ts_va), UserPtr::from_reg(0), 8)
-            })?;
+            expect_interrupted(&test_inode, nohand, move || ppoll_at(fds_va, 1, ts_va, 0, 8))?;
 
             write_fd_set(rset_va, &[fd_num])?;
             write_timeval(tv_va, 5, 0)?;
-            expect_nohand(&test_inode, move || {
-                sys_select(
-                    fd_num + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(tv_va),
-                )
-            })?;
+            expect_interrupted(&test_inode, nohand, move || select_at(fd_num + 1, rset_va, 0, 0, tv_va))?;
 
             write_fd_set(rset_va, &[fd_num])?;
             write_timespec(ts_va, 5, 0)?;
-            expect_nohand(&test_inode, move || {
-                sys_pselect6(
-                    fd_num + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ts_va),
-                    UserPtr::from_reg(0),
-                )
-            })?;
+            expect_interrupted(&test_inode, nohand, move || pselect6_at(fd_num + 1, rset_va, 0, 0, ts_va, 0))?;
 
             Ok(())
         })?
@@ -1569,9 +1464,7 @@ crate::ktest!(
     fn poll_resume_honours_the_saved_deadline() {
         use super::fd::ktest_install_file;
         use crate::kassert_eq;
-        use crate::linux::signal::raise_for_test;
-        use ktest_pollable::{TestPollableInode, write_pollfds};
-        use lumen_signal::Signal;
+        use ktest_pollable::{TestPollableInode, raise_usr1_on_self, write_pollfds};
         use lumen_vfs::OpenFlags;
 
         process::in_test_process(|_| -> crate::ktest::TestResult {
@@ -1584,9 +1477,7 @@ crate::ktest!(
             // rather than block (which only the signal would end). Kills the
             // mutant that drops the saved deadline into `Forever`.
             let got = process::spawn_test_thread(move |_| {
-                if let Some(me) = sched::current() {
-                    raise_for_test(&me, Signal::USR1);
-                }
+                raise_usr1_on_self();
                 let past = crate::time::now_ns().saturating_sub(1);
                 let block = encode_poll_restart(fds_va, 1, WaitTimeout::Deadline(past));
                 let r = resume_poll(&block);
@@ -1607,19 +1498,46 @@ crate::ktest!(
         use super::fd::ktest_install_file;
         use super::mem::sys_mprotect;
         use super::neg_errno;
-        use crate::linux::signal::raise_for_test;
         use crate::sync::SpinLock;
         use crate::{kassert, kassert_eq};
-        use ktest_pollable::{TestPollableInode, write_fd_set, write_pollfds, write_timespec, write_timeval};
+        use ktest_pollable::{
+            TestPollableInode, ppoll_at, pselect6_at, raise_usr1_on_self, select_at, write_fd_set, write_pollfds,
+            write_timespec, write_timeval,
+        };
         use lumen_signal::{Blocked, SigSet, Signal};
         use lumen_vfs::OpenFlags;
 
         static SEEN: SpinLock<Option<Blocked>> = SpinLock::new(None);
         fn record_then_raise(_inode: &TestPollableInode) {
             *SEEN.lock() = Some(process::current_blocked());
-            if let Some(me) = sched::current() {
-                raise_for_test(&me, Signal::USR1);
-            }
+            raise_usr1_on_self();
+        }
+
+        fn interrupted(
+            inode: &Arc<TestPollableInode>,
+            initial: Option<Blocked>,
+            call: impl FnOnce() -> u64 + Send + 'static,
+        ) -> Result<(u64, Option<Blocked>, Blocked, u64), &'static str> {
+            inode.set_after_read_hook(1, record_then_raise);
+            let (ret, after, elapsed) = process::spawn_test_thread(move |_| {
+                if let Some(mask) = initial {
+                    process::set_current_blocked(mask);
+                }
+                let t0 = crate::time::now_ns();
+                let r = call();
+                let elapsed = crate::time::now_ns() - t0;
+                let after = process::current_blocked();
+                sched::clear_current_sigpending();
+                (r, after, elapsed)
+            })?
+            .join()?;
+            Ok((ret, SEEN.lock().take(), after, elapsed))
+        }
+
+        fn check_rem(rem: u64, asked: u64, elapsed: u64) -> crate::ktest::TestResult {
+            kassert!(rem < asked);
+            kassert!(rem + elapsed >= asked);
+            Ok(())
         }
 
         process::in_test_process(|_| -> crate::ktest::TestResult {
@@ -1645,85 +1563,43 @@ crate::ktest!(
             //    and writes remaining `timespec` back.
             write_pollfds(fds_va, &[(fd_num, PollMask::IN.bits())])?;
             write_timespec(ts_va, 5, 0)?;
-            test_inode.set_after_read_hook(1, record_then_raise);
-            let (ret, after, t0, t1) = process::spawn_test_thread(move |_| {
-                process::set_current_blocked(initial);
-                let t0 = crate::time::now_ns();
-                let r =
-                    sys_ppoll(UserPtr::from_reg(fds_va), 1, UserPtr::from_reg(ts_va), UserPtr::from_reg(mask_va), 8);
-                let t1 = crate::time::now_ns();
-                let after = process::current_blocked();
-                sched::clear_current_sigpending();
-                (r, after, t0, t1)
-            })?
-            .join()?;
+            let (ret, seen, after, elapsed) =
+                interrupted(&test_inode, Some(initial), move || ppoll_at(fds_va, 1, ts_va, mask_va, 8))?;
             kassert_eq!(ret, neg_errno(ERESTARTNOHAND));
-            kassert_eq!(SEEN.lock().take(), Some(temp));
+            kassert_eq!(seen, Some(temp));
             kassert_eq!(after, initial);
             // SAFETY: `RawTimespec` is two `i64`s; every bit pattern is valid.
             let ts = unsafe { copy_pod_from_user::<RawTimespec>(ts_va) }.map_err(|_| "read ts")?;
-            let rem = (ts.tv_sec as u64) * NS_PER_SEC + ts.tv_nsec as u64;
-            kassert!(rem < 5 * NS_PER_SEC);
-            kassert!(rem + (t1 - t0) >= 5 * NS_PER_SEC);
+            check_rem((ts.tv_sec as u64) * NS_PER_SEC + ts.tv_nsec as u64, 5 * NS_PER_SEC, elapsed)?;
             kassert_eq!(test_inode.subscriber_count(), 0);
 
             // 2. `pselect6`: installs temporary mask, restores on `-ERESTARTNOHAND`,
             //    and writes remaining `timespec` back.
             write_fd_set(rset_va, &[fd_num])?;
             write_timespec(ts_va, 5, 0)?;
-            test_inode.set_after_read_hook(1, record_then_raise);
-            let (ret, after, t0, t1) = process::spawn_test_thread(move |_| {
-                process::set_current_blocked(initial);
-                let t0 = crate::time::now_ns();
-                let r = sys_pselect6(
-                    fd_num + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ts_va),
-                    UserPtr::from_reg(sig_va),
-                );
-                let t1 = crate::time::now_ns();
-                let after = process::current_blocked();
-                sched::clear_current_sigpending();
-                (r, after, t0, t1)
-            })?
-            .join()?;
+            let (ret, seen, after, elapsed) =
+                interrupted(&test_inode, Some(initial), move || pselect6_at(fd_num + 1, rset_va, 0, 0, ts_va, sig_va))?;
             kassert_eq!(ret, neg_errno(ERESTARTNOHAND));
-            kassert_eq!(SEEN.lock().take(), Some(temp));
+            kassert_eq!(seen, Some(temp));
             kassert_eq!(after, initial);
             // SAFETY: `RawTimespec` is two `i64`s; every bit pattern is valid.
             let ts = unsafe { copy_pod_from_user::<RawTimespec>(ts_va) }.map_err(|_| "read ts")?;
-            let rem = (ts.tv_sec as u64) * NS_PER_SEC + ts.tv_nsec as u64;
-            kassert!(rem < 5 * NS_PER_SEC);
-            kassert!(rem + (t1 - t0) >= 5 * NS_PER_SEC);
+            check_rem((ts.tv_sec as u64) * NS_PER_SEC + ts.tv_nsec as u64, 5 * NS_PER_SEC, elapsed)?;
             kassert_eq!(test_inode.subscriber_count(), 0);
 
             // 3. `select`: writes remaining `timeval` back on `-ERESTARTNOHAND`.
             write_fd_set(rset_va, &[fd_num])?;
             write_timeval(tv_va, 5, 0)?;
-            test_inode.set_after_read_hook(1, record_then_raise);
-            let (ret, t0, t1) = process::spawn_test_thread(move |_| {
-                let t0 = crate::time::now_ns();
-                let r = sys_select(
-                    fd_num + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(tv_va),
-                );
-                let t1 = crate::time::now_ns();
-                sched::clear_current_sigpending();
-                (r, t0, t1)
-            })?
-            .join()?;
+            let (ret, _, _, elapsed) =
+                interrupted(&test_inode, None, move || select_at(fd_num + 1, rset_va, 0, 0, tv_va))?;
             kassert_eq!(ret, neg_errno(ERESTARTNOHAND));
-            let _ = SEEN.lock().take();
             // SAFETY: `RawTimeval` is two `i64`s; every bit pattern is valid.
             let tv = unsafe { copy_pod_from_user::<RawTimeval>(tv_va) }.map_err(|_| "read tv")?;
-            let rem_us = (tv.tv_sec as u64) * US_PER_SEC + tv.tv_usec as u64;
-            kassert!(rem_us < 5 * US_PER_SEC);
-            kassert!(rem_us + (t1 - t0).div_ceil(NS_PER_US) >= 5 * US_PER_SEC);
+            check_rem(
+                (tv.tv_sec as u64) * US_PER_SEC + tv.tv_usec as u64,
+                5 * US_PER_SEC,
+                elapsed.div_ceil(NS_PER_US),
+            )?;
 
             // 4. Read-only timeout pointer on `-ERESTARTNOHAND` turns into
             //    `-EINTR` (Linux's `poll_select_finish`), for `ppoll`, `select`,
@@ -1732,49 +1608,17 @@ crate::ktest!(
             write_timeval(ro_page + 32, 5, 0)?;
             kassert_eq!(sys_mprotect(ro_page, 4096, u64::from(general::PROT_READ)), 0);
 
-            test_inode.set_after_read_hook(1, record_then_raise);
-            let r_ppoll = process::spawn_test_thread(move |_| {
-                let r = sys_ppoll(UserPtr::from_reg(fds_va), 1, UserPtr::from_reg(ro_page), UserPtr::from_reg(0), 8);
-                sched::clear_current_sigpending();
-                r
-            })?
-            .join()?;
-            let _ = SEEN.lock().take();
+            let (r_ppoll, _, _, _) = interrupted(&test_inode, None, move || ppoll_at(fds_va, 1, ro_page, 0, 8))?;
             kassert_eq!(r_ppoll, neg_errno(errno::EINTR));
 
             write_fd_set(rset_va, &[fd_num])?;
-            test_inode.set_after_read_hook(1, record_then_raise);
-            let r_select = process::spawn_test_thread(move |_| {
-                let r = sys_select(
-                    fd_num + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ro_page + 32),
-                );
-                sched::clear_current_sigpending();
-                r
-            })?
-            .join()?;
-            let _ = SEEN.lock().take();
+            let (r_select, _, _, _) =
+                interrupted(&test_inode, None, move || select_at(fd_num + 1, rset_va, 0, 0, ro_page + 32))?;
             kassert_eq!(r_select, neg_errno(errno::EINTR));
 
             write_fd_set(rset_va, &[fd_num])?;
-            test_inode.set_after_read_hook(1, record_then_raise);
-            let r_pselect = process::spawn_test_thread(move |_| {
-                let r = sys_pselect6(
-                    fd_num + 1,
-                    UserPtr::from_reg(rset_va),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(0),
-                    UserPtr::from_reg(ro_page),
-                    UserPtr::from_reg(0),
-                );
-                sched::clear_current_sigpending();
-                r
-            })?
-            .join()?;
-            let _ = SEEN.lock().take();
+            let (r_pselect, _, _, _) =
+                interrupted(&test_inode, None, move || pselect6_at(fd_num + 1, rset_va, 0, 0, ro_page, 0))?;
             kassert_eq!(r_pselect, neg_errno(errno::EINTR));
 
             kassert_eq!(sys_mprotect(ro_page, 4096, u64::from(general::PROT_READ | general::PROT_WRITE)), 0);

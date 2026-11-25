@@ -216,12 +216,12 @@ impl<L: VfsLock<u64>> OpenFile<L> {
 
     /// True if readable (`O_RDONLY` or `O_RDWR`, and not `O_PATH`).
     pub fn is_readable(&self) -> bool {
-        !self.is_path && matches!(self.access_mode, AccessMode::ReadOnly | AccessMode::ReadWrite)
+        !self.is_path && self.access_mode.can_read()
     }
 
     /// True if writable (`O_WRONLY` or `O_RDWR`, and not `O_PATH`).
     pub fn is_writable(&self) -> bool {
-        !self.is_path && matches!(self.access_mode, AccessMode::WriteOnly | AccessMode::ReadWrite)
+        !self.is_path && self.access_mode.can_write()
     }
 
     /// Return `Ok(())` if readable, else `Err(BadF)`.

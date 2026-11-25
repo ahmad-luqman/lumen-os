@@ -44,6 +44,7 @@ const NS_PER_US: i64 = 1_000;
 const NS_PER_MS: i64 = 1_000_000;
 const NS_PER_SEC: i64 = 1_000_000_000;
 const US_PER_SEC: i64 = 1_000_000;
+const ASK_SEC: i64 = 5;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -96,6 +97,11 @@ fn read_one_byte(want: u8) -> R {
     let mut b = [0u8; 1];
     eq("read(0, 1)", sys(SYS_READ, [0, b.as_mut_ptr() as u64, 1, 0, 0, 0]), 1)?;
     eq("read byte", i64::from(b[0]), i64::from(want))
+}
+
+fn check_rem(what: &'static str, rem: i64, asked: i64, elapsed: i64) -> R {
+    ensure(what, (0..asked).contains(&rem), rem)?;
+    ensure(what, rem.saturating_add(elapsed) >= asked, rem)
 }
 
 fn check_poll_nval() -> R {
@@ -188,7 +194,7 @@ fn check_select_timeout_no_input() -> R {
     ensure("select elapsed >= 50ms", elapsed >= 50 * NS_PER_MS, elapsed)?;
     eq("select rem == 0 on timeout", tv.us(), 0)?;
 
-    // Zero timeout returns 0 immediately without writing back `tv`.
+    // Zero timeout returns 0 immediately and clears the empty bitset.
     rset[0] = 1;
     let mut zero_tv = Timeval { tv_sec: 0, tv_usec: 0 };
     eq(
@@ -236,9 +242,9 @@ fn check_pselect6_timeout_no_input() -> R {
 }
 
 fn check_poll_with_input() -> R {
-    say!("ready poll");
     let mut fds = [PollFd { fd: 0, events: POLLIN, revents: 0 }];
-    eq("poll(0, 5000ms) with input", sys(SYS_POLL, [fds.as_mut_ptr() as u64, 1, 5_000, 0, 0, 0]), 1)?;
+    say!("ready poll");
+    eq("poll(0, 5000ms) with input", sys(SYS_POLL, [fds.as_mut_ptr() as u64, 1, (ASK_SEC * 1000) as u64, 0, 0, 0]), 1)?;
     ensure("poll revents has POLLIN", (fds[0].revents & POLLIN) != 0, i64::from(fds[0].revents))?;
     read_one_byte(b'a')?;
 
@@ -251,11 +257,10 @@ fn check_poll_with_input() -> R {
 }
 
 fn check_ppoll_with_input() -> R {
-    say!("ready ppoll");
     let mut fds = [PollFd { fd: 0, events: POLLIN, revents: 0 }];
-    let requested = 5 * NS_PER_SEC;
-    let mut ts = Timespec { tv_sec: 5, tv_nsec: 0 };
+    let mut ts = Timespec { tv_sec: ASK_SEC, tv_nsec: 0 };
     let t0 = now_ns()?;
+    say!("ready ppoll");
     eq(
         "ppoll(0, 5s) with input",
         sys(SYS_PPOLL, [fds.as_mut_ptr() as u64, 1, &mut ts as *mut Timespec as u64, 0, 8, 0]),
@@ -263,18 +268,15 @@ fn check_ppoll_with_input() -> R {
     )?;
     let t1 = now_ns()?;
     ensure("ppoll revents has POLLIN", (fds[0].revents & POLLIN) != 0, i64::from(fds[0].revents))?;
-    let rem = ts.ns();
-    ensure("ppoll rem >= 0 and < requested", (0..requested).contains(&rem), rem)?;
-    ensure("ppoll rem + elapsed >= requested", rem.saturating_add(t1 - t0) >= requested, rem)?;
+    check_rem("ppoll rem", ts.ns(), ASK_SEC * NS_PER_SEC, t1 - t0)?;
     read_one_byte(b'c')
 }
 
 fn check_select_with_input() -> R {
-    say!("ready select");
     let mut rset = [1u64; 1];
-    let requested_us = 5 * US_PER_SEC;
-    let mut tv = Timeval { tv_sec: 5, tv_usec: 0 };
+    let mut tv = Timeval { tv_sec: ASK_SEC, tv_usec: 0 };
     let t0 = now_ns()?;
+    say!("ready select");
     eq(
         "select(0, 5s) with input",
         sys(SYS_SELECT, [1, rset.as_mut_ptr() as u64, 0, 0, &mut tv as *mut Timeval as u64, 0]),
@@ -282,20 +284,17 @@ fn check_select_with_input() -> R {
     )?;
     let t1 = now_ns()?;
     eq("select rset bit 0", rset[0] as i64, 1)?;
-    let rem_us = tv.us();
-    ensure("select rem_us >= 0 and < requested", (0..requested_us).contains(&rem_us), rem_us)?;
     let elapsed_us_ceil = (t1 - t0).saturating_add(NS_PER_US - 1) / NS_PER_US;
-    ensure("select rem_us + elapsed_us >= requested", rem_us.saturating_add(elapsed_us_ceil) >= requested_us, rem_us)?;
+    check_rem("select rem_us", tv.us(), ASK_SEC * US_PER_SEC, elapsed_us_ceil)?;
     read_one_byte(b'd')
 }
 
 fn check_pselect6_with_input() -> R {
-    say!("ready pselect6");
     let mut rset = [1u64; 1];
-    let requested = 5 * NS_PER_SEC;
-    let mut ts = Timespec { tv_sec: 5, tv_nsec: 0 };
+    let mut ts = Timespec { tv_sec: ASK_SEC, tv_nsec: 0 };
     let sig = PselectSig { ss: 0, ss_len: 0 };
     let t0 = now_ns()?;
+    say!("ready pselect6");
     eq(
         "pselect6(0, 5s) with input",
         sys(
@@ -306,9 +305,7 @@ fn check_pselect6_with_input() -> R {
     )?;
     let t1 = now_ns()?;
     eq("pselect6 rset bit 0", rset[0] as i64, 1)?;
-    let rem = ts.ns();
-    ensure("pselect6 rem >= 0 and < requested", (0..requested).contains(&rem), rem)?;
-    ensure("pselect6 rem + elapsed >= requested", rem.saturating_add(t1 - t0) >= requested, rem)?;
+    check_rem("pselect6 rem", ts.ns(), ASK_SEC * NS_PER_SEC, t1 - t0)?;
     read_one_byte(b'e')
 }
 

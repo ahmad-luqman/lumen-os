@@ -4350,7 +4350,7 @@ depends on them.
 | B0 | the skeleton | M7 done | `M8_SYSCALLS`, the stub modules below, `syscalls.py`'s `PLANNED` changes and `ENOSYS_BY_DECISION`, empty scenario files, `tools/linux-m8/`; `m8_abi_constants_match_spec`, `test_m8_table_covers_the_census` | 8, 15 |
 | B1 | the process/thread split, behaviour unchanged | M7 done | `Process`, `UserThread`, `UserThreadState::linux`, `PROCS`, `Files::users`, tids (`ProcTree::add_thread`/`remove_thread`), pid 1 (`linux::init`), the `ps` shell command; `procs_lookup_and_lifetime`, `procs_leave_no_heap_behind`, `identity_syscalls_name_the_process_and_thread`, `sigaction_and_sigprocmask_round_trip`, `cargo:lumen-proc`, all M6/M7 scenarios unchanged but for `test_mm`'s boot heap ceiling (pid 1's allocations) | 8 |
 | B2 | the blocking wait and the syscall-exit hook | B1 | `wait_interruptible`/`wait_killable`, `kick`, `Thread::fatal_pending`, the hook, `restart_syscall`, `raise_for_test`, `user::read_u32_nofault`/`cmpxchg_u32`/`fault_in_writable`; the wait, restart and nofault ktests, `harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata` | 6, 8, 15 |
-| B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `poll_rechecks_after_a_wake`, `test_poll_and_select_on_console` | 10 |
+| B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `poll_rechecks_after_a_wake`, `poll_resume_honours_the_saved_deadline`, `ppoll_installs_its_mask_and_writes_back_when_interrupted`, `test_poll_and_select_on_console` | 10 |
 | B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended), `fork_copy_out_of_frames_rolls_back`, `fork_copy_preserves_files_images_and_private_copies` | 5, 8 |
 | B5 | the TLB shootdown IPI | B2 | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `PerCpu::loaded_space`, `tlb::shoot_down`, the shootdown warning's `HOST_TIMED` entry; `mm::tlb::shootdown_across_cpus` (its probes use B2's `read_u32_nofault`) | 5, 9 |
 | B6 | SMP migration, priorities, affinity | B5, C1 | `on_cpu`, `spawn_migratable`, `spawn_user_on` migratable (after C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
@@ -4411,7 +4411,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 
 | # | Syscall | M8 behaviour | Issue |
 |---|---|---|---|
-| 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block, stored and returned through `Err(linux::signal::interrupted_with(block))`), as Linux's `poll` | B3 |
+| 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` is the low 32 bits, past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed or `O_PATH` fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; only each entry's `revents` is written back, including after an interrupt; an interrupted `poll` with an unwritable `fds` is `-EFAULT` with no restart block; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block, stored and returned through `Err(linux::signal::interrupted_with(block))`), as Linux's `poll` | B3 |
 | 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | M6's checks, now delivering: `sig` outside 1..=64 `-EINVAL`; unknown `sa_flags` bits are cleared before storing (and in `oldact`), as Linux's `do_sigaction` does; `SIG_IGN`, or `SIG_DFL` on a default-ignored signal, discards that signal's pending entries (`PendingSignals::disposition_changed`); `SA_RESTORER` is needed to deliver a handler (`frame::build`'s `MissingRestorer` forces `SIGSEGV`; musl always sets it); `SA_NOCLDWAIT` or `SIG_IGN` on `SIGCHLD` makes `ProcTree::exit` reap the children (`autoreap`) | C5 |
 | 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | `Blocked::apply` (a bad `how` `-EINVAL`); `sigsetsize != 8` `-EINVAL`; unblocking a pending signal sets `sigpending`, so it is delivered before the call returns | C5 |
 | 15 | `rt_sigreturn()` | section 6, "Signals"; returns the restored `rax`; a frame `restore` refuses forces `SIGSEGV` | C5 |
@@ -8682,9 +8682,9 @@ pub trait PollWaker: Send + Sync {
 pub trait Pollable: Send + Sync {
     /// The readiness of one open description now (`mode`: its access mode,
     /// since a pipe's two ends share one inode and an O_RDWR FIFO answers
-    /// for both). With a waker, return a guard unless the caller re-polls
-    /// you; subscribe no later than the mask is read, so no change falls
-    /// between.
+    /// for both). With a waker, return a guard unless it has no wake source
+    /// and the caller re-polls it on a timer (`console_step`); subscribe no
+    /// later than the mask is read, so no change falls between.
     fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>)
         -> (PollMask, Option<PollGuard>);
 }
@@ -10884,8 +10884,8 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   returns `0` (killing the mutant that turns the saved deadline into
   `Forever`), and `ppoll_installs_its_mask_and_writes_back_when_interrupted`
   checks that `ppoll`/`pselect6` install their temporary mask during the
-  wait, restore it on `-ERESTARTNOHAND`, write remaining time back
-  (`rem < asked`, `rem + elapsed >= asked`, for `select` too), and turn
+  call (its first pass), restore it on `-ERESTARTNOHAND`, write remaining time
+  back (`rem < asked`, `rem + elapsed >= asked`, for `select` too), and turn
   `-ERESTARTNOHAND` into `-EINTR` when the timeout pointer is read-only.
 - `scenario:test_linux_io::test_pipes_and_poll` (C7): a pipeline of
   busybox applets, `PIPE_BUF` atomicity between two writers, `EOF`,
@@ -10914,7 +10914,8 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
 - `scenario:test_linux_io::test_poll_and_select_on_console` (B3): `poll`,
   `ppoll`, `select` and `pselect6` on the console's stdin with and without
   typed input; timeouts at least their time; the time left written back;
-  `POLLNVAL`.
+  `POLLNVAL`; and `serial poll` confirming blocked waits woke via IRQ 4
+  (`woken >= 1`), `safety-step hits: 0`, and `subscribers: 0` on exit.
 - `scenario:test_linux_io::test_pty_termios_and_job_control` (C9): a
   `tools/linux-m8` program opening `/dev/ptmx`, a child on the slave as a
   session leader: canonical and raw reads, echo, `VMIN`/`VTIME`, Ctrl-C as
