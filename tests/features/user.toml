@@ -237,3 +237,11 @@ milestone = "M7"
 tests = [
     "scenario:test_fs::test_flock_and_atomic_rename",
 ]
+
+[[feature]]
+name = "The M8 syscall table, pinned from #337's census (#371): ARCHITECTURE section 8's M8 rows by number (M8_SYSCALLS: the 60 numbers M8 adds, each dispatched, all but M6's poll a typed -ENOSYS stub naming the issue that replaces it), M8's flags, codes, errnos and struct layouts (siginfo, stack_t, sigevent, itimerval, rusage, sysinfo, statfs, robust_list_head, fd_set) against linux-raw-sys, and every census syscall in M6_SYSCALLS, M7_SYSCALLS or M8_SYSCALLS or -ENOSYS by a recorded decision (ENOSYS_BY_DECISION)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::m8_abi_constants_match_spec",
+    "harness:test_syscalls::test_m8_table_covers_the_census",
+]
