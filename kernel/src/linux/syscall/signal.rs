@@ -151,10 +151,11 @@ pub(super) fn sys_pause() -> u64 {
     not_implemented(general::__NR_pause)
 }
 
-/// `restart_syscall()` (219): M8 stub, replaced by B2 (#373). It is passed
-/// the frame, which B2's restart may rewrite (section 6).
+/// `restart_syscall()` (219, B2): resumes the thread's restart block
+/// (`linux::signal::restart_syscall`), `-EINTR` with none. The syscall-exit
+/// hook makes a call interrupted with `-ERESTART_RESTARTBLOCK` this one.
 pub(super) fn sys_restart_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
-    frame.rax = not_implemented(general::__NR_restart_syscall);
+    frame.rax = crate::linux::signal::restart_syscall();
     SyscallReturn::Sysret
 }
 

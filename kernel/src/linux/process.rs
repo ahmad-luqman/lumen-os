@@ -305,6 +305,15 @@ impl Process {
         self.signal.lock().action(signal)
     }
 
+    /// The syscall-exit hook's last step for its running thread (B2): under
+    /// `signal`, where senders set it, clear that thread's `sigpending`,
+    /// nothing being deliverable (C5 looks at the pending signals here
+    /// first).
+    pub fn settle_sigpending(&self) {
+        let _signal = self.signal.lock();
+        let _ = sched::with_current(sched::Thread::clear_sigpending);
+    }
+
     /// Its address space (a clone, dropped by the caller with no lock
     /// held), until its takedown.
     fn address_space(&self) -> Option<Arc<AddressSpace>> {
@@ -1101,15 +1110,18 @@ pub fn locks_released() {
 
 /// Block until [`locks_released`] has been called since [`lock_releases`]
 /// read `seen` (at once if it already has, so a release between a failed
-/// attempt and this wait isn't missed). No signal ends the wait (M7 has no
-/// signal delivery): a caller refuses a wait that would never end
-/// beforehand (`F_SETLKW`'s `EDEADLK`), if it can tell.
-pub fn wait_for_lock_release(seen: u64) {
+/// attempt and this wait isn't missed): `Woken`; or until the thread has a
+/// signal to look at: `Interrupted` (B2: the caller returns
+/// `-ERESTARTSYS`, as Linux's `locks_lock_inode_wait`). A caller refuses a
+/// wait that would never end beforehand (`F_SETLKW`'s `EDEADLK`), if it
+/// can tell.
+pub fn wait_for_lock_release(seen: u64) -> sched::Wake {
     #[cfg(feature = "ktest")]
     LOCK_WAITING.fetch_add(1, Ordering::SeqCst);
-    LOCK_WAITERS.wait_until(|| LOCK_RELEASES.load(Ordering::SeqCst) != seen);
+    let woke = LOCK_WAITERS.wait_interruptible(None, || LOCK_RELEASES.load(Ordering::SeqCst) != seen);
     #[cfg(feature = "ktest")]
     LOCK_WAITING.fetch_sub(1, Ordering::SeqCst);
+    woke
 }
 
 /// How many threads are blocked in a lock call now (ktests).

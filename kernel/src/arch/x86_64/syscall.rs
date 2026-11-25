@@ -337,7 +337,10 @@ extern "C" fn lumen_set_ring3_stack(rsp: u64) {
 ///
 /// Re-enables interrupts via `irq::restore(true)` (respecting
 /// `irq::disabled_for_good()`), checks for a deferred `#DB` at `LSTAR`,
-/// dispatches the syscall, disables interrupts, sanitizes `RFLAGS`, and
+/// dispatches the syscall, runs the syscall-exit hook
+/// (`linux::signal::exit_to_user`: restart codes resolved, `sigpending`
+/// looked at) until `sigpending` is still clear once interrupts are off
+/// (Linux's `exit_to_user_mode_loop`), sanitizes `RFLAGS`, and
 /// validates `rip < USER_MAX` before returning to the `sysretq`/`iretq`
 /// assembly epilogue.
 #[unsafe(no_mangle)]
@@ -349,9 +352,19 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
         crate::user::handle_deferred_debug_trap(frame);
     }
 
+    let orig_rax = frame.rax;
     let mode = crate::user::dispatch_syscall(frame);
 
-    let _ = irq::disable();
+    // The restart decision runs once, on the first pass.
+    let mut syscall = lumen_signal::restart::SyscallExit::new(orig_rax);
+    loop {
+        crate::linux::signal::exit_to_user(frame, syscall.take());
+        let _ = irq::disable();
+        if !crate::sched::current_sigpending() {
+            break;
+        }
+        irq::restore(true);
+    }
     frame.rflags = sanitize_user_rflags(frame.rflags);
 
     // Canonical RIP check BEFORE `swapgs` or `sysretq`/`iretq` (both raise
