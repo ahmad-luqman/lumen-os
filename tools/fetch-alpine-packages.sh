@@ -1,24 +1,40 @@
 #!/usr/bin/env bash
 # Fetch every .apk in tools/alpine-packages.lock into build/deps/alpine-packages/,
-# sha256-checked (#344). tools/mkrootfs-dev.sh builds build/alpine-dev.ext4 from them.
+# sha256-checked (#344), for tools/mkrootfs-dev.sh to build build/alpine-dev.ext4.
 #
 #   tools/fetch-alpine-packages.sh        (`make deps-dev`)
 #
 # The lock is read by tools/alpine-lock.py (`files`), its one parser. A file
-# already there with the locked sha256 is kept; one with another sha256 is
-# fetched again; .apk files the lock doesn't name are removed, so the
-# directory's .apk files are exactly the lock's (what CI caches, besides the
-# Makefile's stamp).
+# already there with the locked sha256 is kept, one with another is fetched
+# again, and .apk files the lock doesn't name are removed, so the directory's
+# .apk files are exactly the lock's (what CI caches, besides the Makefile's
+# stamp).
 #
-# Mirrors: LUMEN_APK_MIRROR, a list split on spaces or newlines, tried in order, then
-# LUMEN_APK_CDN (dl-cdn's https://dl-cdn.alpinelinux.org/alpine unless set;
-# the harness's tests point it at a local directory). An entry is either a
-# base URL laid out as Alpine's mirrors are (<base>/v3.21/<repo>/x86_64/<file>),
-# or a template for a flat directory holding `{file}` (the .apk's name) or
-# `{sha256}` (its locked sha256, for a store that renames names with `+`, as
-# GitHub's release assets may: name each asset <sha256>.apk):
-#   LUMEN_APK_MIRROR='https://github.com/<owner>/<repo>/releases/download/<tag>/{sha256}.apk'
-# Any other `{` or `}` in an entry is refused.
+# Sources, tried in this order for each file until one gives the locked
+# sha256 (every file is checked, whichever source served it):
+#   1. LUMEN_APK_MIRROR: a local or faster mirror to prefer (default: none);
+#   2. LUMEN_APK_CDN: default dl-cdn, https://dl-cdn.alpinelinux.org/alpine
+#      (the harness's tests point it at a local directory);
+#   3. LUMEN_APK_FALLBACK: default the durable mirror, DURABLE_MIRROR below:
+#      the repository's `alpine-apk-mirror` release, each locked file an
+#      asset named by its sha256 (tools/mirror-alpine-packages.sh fills it,
+#      and CI's check fails a lock it doesn't hold all of).
+# Each variable is a list split on spaces, tabs and newlines (a YAML block's
+# lines too); unset means its default, set empty means none. An entry is
+# either a base URL laid out as Alpine's mirrors are
+# (<base>/v3.21/<repo>/x86_64/<file>), or a template for a flat directory
+# holding `{file}` (the .apk's name) or `{sha256}` (its locked sha256, for a
+# store that renames names with `+`, as GitHub's release assets may), such
+# as `file:///srv/apks/{sha256}.apk`. Any other `{` or `}` is refused.
+#
+# Each try has curl's timeouts: 15 s to connect, under 1 KiB/s for 30 s
+# aborts it, retries stop starting after 60 s. LUMEN_APK_MAX_TIME (seconds;
+# unset or empty: none) caps each try's total time too (`--max-time`; CI sets
+# it), so a source that trickles above that floor still gives way. A source
+# that couldn't be reached, however it failed (a single dropped connection
+# included), is skipped for the rest of the run: a dead dl-cdn costs one
+# file's timeouts, and the durable mirror, which holds every file the lock
+# names, serves the rest.
 #
 # LUMEN_PYTHON, if set, runs tools/alpine-lock.py instead of the project's uv
 # environment (the harness's tests, on a stub tree with no uv project).
@@ -27,21 +43,24 @@
 # a branch, so a locked `name-1.2-r3.apk` disappears once `-r4` lands
 # (tools/fetch-deps.sh's busybox has the same problem). The strategy:
 #   1. CI restores build/deps/alpine-packages/ from actions/cache, keyed by
-#      the lockfile's hash (wired by the gate issues); a warm cache never
-#      downloads, so a dropped file breaks only a cold cache.
-#   2. A durable mirror in LUMEN_APK_MIRROR (proposed in #344's PR: the
-#      locked files as a GitHub release's assets; not created yet).
-#   3. When every mirror answers that a file isn't there, this script fails,
-#      naming it and saying to re-run tools/alpine-lock.py, which re-resolves
-#      against the current index and rewrites the lock (its own PR, like any
-#      bump). When a mirror can't be reached, or serves other bytes under the
-#      name, it fails saying so instead: neither is a reason to bump the lock.
+#      the lockfile's hash; a warm cache never downloads.
+#   2. A cold cache tries dl-cdn, then the durable mirror (source 3 above).
+#   3. A file every source answers isn't there fails the fetch, naming it.
+#      The durable mirror should hold it: run tools/mirror-alpine-packages.sh
+#      `check`, then `upload` from a machine that has the file. Or re-run
+#      tools/alpine-lock.py, which re-resolves against the current index and
+#      rewrites the lock (its own PR, like any bump). A source that can't be
+#      reached, or serves other bytes under the name, fails saying so
+#      instead: neither is a reason to bump the lock.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LOCK="$ROOT/tools/alpine-packages.lock"
 DIR="$ROOT/build/deps/alpine-packages"
-CDN=${LUMEN_APK_CDN:-https://dl-cdn.alpinelinux.org/alpine}
+# tools/mirror-alpine-packages.sh uploads to this release (its REPO and TAG);
+# tests/harness/test_rootfs_dev.py checks the two agree.
+DURABLE_MIRROR='https://github.com/ahmad-luqman/lumen-os/releases/download/alpine-apk-mirror/{sha256}.apk'
+DEFAULT_CDN=https://dl-cdn.alpinelinux.org/alpine
 
 sha256() {
     if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -66,11 +85,20 @@ url() {
     fi
 }
 
-# Mirrors split on spaces, tabs and newlines (a YAML block's lines too).
+# The sources in order: LUMEN_APK_MIRROR's (NMIRROR of them), LUMEN_APK_CDN's
+# (up to FIRST), then LUMEN_APK_FALLBACK's. Unset means the default, empty
+# means none, for all three alike.
 MIRRORS=()
-read -r -d '' -a MIRRORS <<< "${LUMEN_APK_MIRROR:-}" || true
-MIRRORS+=("$CDN")
-for mirror in "${MIRRORS[@]}"; do
+read -r -d '' -a MIRRORS <<< "${LUMEN_APK_MIRROR-}" || true
+NMIRROR=${#MIRRORS[@]}
+CDNS=()
+read -r -d '' -a CDNS <<< "${LUMEN_APK_CDN-$DEFAULT_CDN}" || true
+MIRRORS+=(${CDNS[@]+"${CDNS[@]}"})
+FIRST=${#MIRRORS[@]}
+FALLBACK=()
+read -r -d '' -a FALLBACK <<< "${LUMEN_APK_FALLBACK-$DURABLE_MIRROR}" || true
+MIRRORS+=(${FALLBACK[@]+"${FALLBACK[@]}"})
+for mirror in ${MIRRORS[@]+"${MIRRORS[@]}"}; do
     rest=${mirror//\{file\}/}
     rest=${rest//\{sha256\}/}
     if [[ "$rest" == *"{"* || "$rest" == *"}"* ]]; then
@@ -78,6 +106,14 @@ for mirror in "${MIRRORS[@]}"; do
         exit 1
     fi
 done
+MAX_TIME=()
+if [[ -n "${LUMEN_APK_MAX_TIME:-}" ]]; then
+    if [[ ! "$LUMEN_APK_MAX_TIME" =~ ^[0-9]+$ ]]; then
+        echo "fetch-alpine-packages: LUMEN_APK_MAX_TIME is '$LUMEN_APK_MAX_TIME', not a number of seconds" >&2
+        exit 1
+    fi
+    MAX_TIME=(--max-time "$LUMEN_APK_MAX_TIME")
+fi
 
 # The lock, as alpine-lock.py checks it: `mirror-path file sha256` lines,
 # the path laid out as Alpine's mirrors are (alpine-lock.py's mirror_path).
@@ -90,7 +126,11 @@ trap 'rm -f "$PART"' EXIT
 # The locked files, space-separated (bash 3.2, macOS's, has no associative arrays).
 WANTED=" "
 fetched=0
+from_fallback=0
 kept=0
+# The sources (by their place in MIRRORS) that couldn't be reached: skipped for
+# the rest of the run (see the header).
+DEAD=" "
 while read -r path file want; do
     if [[ -z "$path" || -z "$file" || -z "$want" ]]; then
         echo "fetch-alpine-packages: alpine-lock.py files gave a short line: '$path $file $want'" >&2
@@ -101,47 +141,118 @@ while read -r path file want; do
         kept=$((kept + 1))
         continue
     fi
+    if [[ ${#MIRRORS[@]} -eq 0 ]]; then
+        echo "fetch-alpine-packages: $file needs fetching, but there is no source to try: LUMEN_APK_MIRROR, LUMEN_APK_CDN and LUMEN_APK_FALLBACK are all empty" >&2
+        exit 1
+    fi
     ok=false
+    # What the sources answered for this file, for the advice below.
     unreachable=false
     mismatch=false
+    durable_missing=false
+    cdn_missing=false
     tried=()
+    i=0
     for mirror in "${MIRRORS[@]}"; do
+        i=$((i + 1))
         u=$(url "$mirror" "$path" "$file" "$want")
-        tried+=("$u")
-        rc=0
-        code=$(curl -fsSL --retry 3 --retry-connrefused -w '%{http_code}' -o "$PART" "$u") || rc=$?
-        if [[ $rc -ne 0 ]]; then
-            # Not found: an HTTP 403, 404 or 410 (stores answer a missing
-            # object with any of them), or a file:// path that isn't there.
-            # Anything else (no connection, a 5xx) is an unreachable mirror.
-            [[ $rc -eq 37 || ($rc -eq 22 && "$code" =~ ^(403|404|410)$) ]] || unreachable=true
+        if [[ "$DEAD" == *" $i "* ]]; then
+            tried+=("$u: skipped (unreachable earlier in this run)")
+            unreachable=true
             continue
         fi
-        got=$(sha256 "$PART")
-        if [[ "$got" == "$want" ]]; then
-            ok=true
-            break
+        rc=0
+        note=""
+        code=$(curl -fsSL --retry 3 --retry-connrefused --retry-max-time 60 --connect-timeout 15 \
+            --speed-limit 1024 --speed-time 30 ${MAX_TIME[@]+"${MAX_TIME[@]}"} \
+            -w '%{http_code}' -o "$PART" "$u") || rc=$?
+        if [[ $rc -eq 0 ]]; then
+            got=$(sha256 "$PART")
+            if [[ "$got" == "$want" ]]; then
+                ok=true
+                break
+            fi
+            outcome="other bytes (sha256 $got)"
+            mismatch=true
+        else
+            # By the HTTP code whatever curl's exit (macOS's curl exits 56,
+            # not 22, on an HTTP/2 404). Not found: a file:// path that isn't
+            # there, or an HTTP 403, 404 or 410 (stores answer a missing
+            # object with any of them), except a 403 from the durable mirror:
+            # GitHub answers a missing asset with a 404, so a 403 there is a
+            # refusal. A local error (curl can't write the part file, a bad
+            # URL, curl missing) stops the fetch at once. Anything else (no
+            # connection, a timeout, a 5xx or another HTTP error) is an
+            # unreachable source.
+            where=other
+            if [[ "$mirror" == "$DURABLE_MIRROR" ]]; then where=durable; fi
+            case "$rc:$code:$where" in
+            23:*:* | 26:*:*) outcome="local error (curl exit $rc): can't write $PART" ;;
+            1:*:* | 3:*:*) outcome="local error (curl exit $rc): bad source URL" ;;
+            2:*:* | 27:*:* | 127:*:*) outcome="local error (curl exit $rc)" ;;
+            37:*:*) outcome="not found (no such file)" ;;
+            *:403:durable) outcome="refused (HTTP 403)" ;;
+            *:403:* | *:404:* | *:410:*) outcome="not found (HTTP $code)" ;;
+            28:*:*) outcome="unreachable (too slow or timed out)" ;;
+            *:[45][0-9][0-9]:*) outcome="unreachable (HTTP $code)" ;;
+            *) outcome="unreachable (curl exit $rc)" ;;
+            esac
+            case "$outcome" in
+            local*)
+                echo "fetch-alpine-packages: $u: $outcome" >&2
+                exit 1
+                ;;
+            not\ found*)
+                if [[ $where == durable ]]; then durable_missing=true; fi
+                if [[ $i -gt $NMIRROR && $i -le $FIRST ]]; then cdn_missing=true; fi
+                ;;
+            *)
+                unreachable=true
+                DEAD+="$i "
+                note=" (skipped for the rest of this run)"
+                ;;
+            esac
         fi
-        mismatch=true
-        echo "fetch-alpine-packages: $u: sha256 $got, the lock says $want" >&2
+        tried+=("$u: $outcome")
+        if [[ $i -lt ${#MIRRORS[@]} ]]; then
+            echo "fetch-alpine-packages: $u: $outcome$note, trying the next source" >&2
+        fi
     done
     if ! $ok; then
         echo "fetch-alpine-packages: no mirror gave $file with sha256 $want; tried:" >&2
         printf '  %s\n' "${tried[@]}" >&2
+        # Every line that applies, from what the sources answered.
         if $unreachable; then
             echo "  A mirror couldn't be reached (curl's error above): check the network and retry." >&2
-        elif $mismatch; then
+        fi
+        if $mismatch; then
             # Alpine never changes the bytes behind a name (a rebuild is a new -rN).
             echo "  A mirror served other bytes under that name (a proxy, a captive portal or a corrupt" >&2
             echo "  mirror): fix or drop that mirror; that is no reason to re-lock." >&2
-        else
+        fi
+        if $durable_missing; then
+            echo "  The durable mirror should hold every locked file: run tools/mirror-alpine-packages.sh check," >&2
+            echo "  then \`tools/mirror-alpine-packages.sh upload\` from a machine that has it." >&2
+        fi
+        if $cdn_missing; then
             echo "  Alpine drops a package's older -rN builds. Re-run tools/alpine-lock.py to lock the current" >&2
             echo "  ones (its own PR), or point LUMEN_APK_MIRROR at a mirror that kept these." >&2
+        fi
+        if [[ ${#CDNS[@]} -eq 0 ]]; then
+            echo "  LUMEN_APK_CDN is set empty, so dl-cdn wasn't tried: unset it to try $DEFAULT_CDN." >&2
+        fi
+        # Unset, LUMEN_APK_FALLBACK is the durable mirror: no entries means set empty.
+        if [[ ${#FALLBACK[@]} -eq 0 ]]; then
+            echo "  LUMEN_APK_FALLBACK is set empty, so the durable mirror wasn't tried: unset it to try" >&2
+            echo "  $DURABLE_MIRROR." >&2
         fi
         exit 1
     fi
     mv -f "$PART" "$DIR/$file"
     fetched=$((fetched + 1))
+    if [[ $i -gt $FIRST ]]; then
+        from_fallback=$((from_fallback + 1))
+    fi
 done <<< "$FILES"
 
 removed=0
@@ -152,4 +263,4 @@ for f in "$DIR"/*.apk; do
         removed=$((removed + 1))
     fi
 done
-echo "fetch-alpine-packages: $((fetched + kept)) packages ($fetched fetched, $kept already there, $removed stale removed)"
+echo "fetch-alpine-packages: $((fetched + kept)) packages ($fetched fetched ($from_fallback from the fallback), $kept already there, $removed stale removed)"

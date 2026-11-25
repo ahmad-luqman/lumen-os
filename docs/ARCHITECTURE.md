@@ -10871,20 +10871,48 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   dl-cdn on #344's Linux host, 49 minutes on a slow route from macOS).
   Since #369, `ci.yml` caches the pinned zig and libc-test sources in an
   entry of their own, in four steps: restore; fetch; save only after a
-  successful fetch on a miss; build. To be added, by the durable-mirror
-  PR before D2, D3 and D4 merge: an `actions/cache` entry for
-  `build/deps/alpine-packages/` keyed on
-  `hashFiles('tools/alpine-packages.lock')`, in the same four steps
-  (restore, `make deps-dev`, save, `make rootfs-dev`), and exclusions in
-  the existing `build/deps` entry (`!build/deps/alpine-packages`,
-  `!build/deps/zig`, `!build/deps/libc-test`) so no file sits in two
-  entries. The image itself is not cached: it is rebuilt from the packages
-  on every run in about 5 s. The cache is not a durable source: Alpine
-  drops a superseded `-rN` package from dl-cdn, and an evicted cache entry
-  would then fail the fetch. The durable mirror (each locked `.apk` as a
-  release asset named by its sha256, the fetch trying dl-cdn first and the
-  mirror second, every file sha256-checked whichever source served it)
-  lands in that PR.
+  successful fetch on a miss; build. Since #399 the developer image's
+  packages have their own entry the same way, in five steps: the durable
+  mirror's check first, before the restore (below), then restore, `make
+  deps-dev`, save and `make rootfs-dev`. Its key is
+  `hashFiles('tools/alpine-packages.lock')`, with `alpine-packages-` as a
+  restore key: the fetch keeps the verified files and prunes the rest, so
+  a lock bump downloads only what changed. The fetch step sets
+  `LUMEN_APK_MAX_TIME` (300 s), each try's total time, so a dl-cdn that
+  trickles still gives way to the durable mirror. The existing entry's
+  path is `build/deps/*` less the others' (`!build/deps/zig`,
+  `!build/deps/zig.lock`, `!build/deps/zig.tmp.*`, `!build/deps/libc-test`,
+  `!build/deps/alpine-packages`), so no file sits in two entries; a bare
+  `build/deps` would be one match, archived whole, which no exclusion
+  trims. The image itself is not cached: it is rebuilt from the packages
+  on every run in about 5 s, so `test_rootfs_dev`'s tests of the built
+  image run in CI too (and fail there without it, rather than skip). The
+  cache alone is not durable: Alpine drops a superseded `-rN` package from
+  dl-cdn, and an evicted cache entry would then fail the fetch. The
+  durable mirror is the repository's `alpine-apk-mirror` release (a
+  prerelease), every locked `.apk` an asset named `<sha256>.apk`;
+  `tools/mirror-alpine-packages.sh`'s policy is never to replace or delete
+  an asset, so an older lock's files stay fetchable.
+  `tools/fetch-alpine-packages.sh` tries `LUMEN_APK_MIRROR` (none unless
+  set), then dl-cdn, then `LUMEN_APK_FALLBACK` (unset: the release), every
+  file sha256-checked whichever source served it.
+  `tools/mirror-alpine-packages.sh upload` fills the release from
+  `build/deps/alpine-packages/` (the lead runs it in a lock-changing PR),
+  checking every missing file against the lock before it uploads any. CI
+  runs its `check` first: it reads the release's asset list, failing on
+  each locked file the release lacks or holds only as a partial or
+  mismatched upload, then downloads the first locked file's headers
+  anonymously at the fetch's URL. So CI fails a lock change until its
+  files are mirrored. The check's failure doesn't hide the job's other
+  results: the step continues on error, and the job's last step fails the
+  job. CI checks only the current lock, so an older lock's files are
+  mirrored best-effort, and a lock bump from a fork stays red until the
+  lead uploads its files. The release has two limits: GitHub caps a
+  release at 1000 assets, and the repository's "immutable releases"
+  setting would refuse new uploads to a published release. Either way the
+  remedy is a new tag, and a change to the fetch so that its durable
+  mirror names both releases (today `DURABLE_MIRROR` is one URL, which
+  the advice and the 403 rule compare against).
 - **libc-test (D4; zig pinned by #368, the build and harness by #369).**
   `make libc-test` builds libc-test's `src/functional` and `src/regression`,
   static and dynamic, with the pinned zig into `build/libc-test/` (284
@@ -10984,7 +11012,7 @@ crates/            no_std, host-testable libraries (lumen-acpi, lumen-app-api, l
 assets/fonts/      the desktop's UI font (Atkinson Hyperlegible, SIL OFL 1.1) with its licence and source
 assets/wallpaper/  the desktop's wallpaper (original, made by tools/wallpaper.py; README.md)
 boot/limine.conf   bootloader config template
-tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), mkrootfs-dev.sh and fetch-alpine-packages.sh (the developer image, #344), fetch-zig.sh and fetch-libc-test.sh/build-libc-test.sh (libc-test, #368, #369), linux-hello/ (M6), linux-m7/ (M7), linux-m8/ (M8, designed in #336), ext4-signed-hash.sh (mkrootfs.sh's #308 switch), ext4-unsigned-hash-image.py (makes kernel/src/vfs/testdata/unsigned-hash.ext4, #308), wallpaper.py (makes the wallpaper), harness/ (Python package)
+tools/             fetch-deps.sh, mkiso.sh, mkrootfs.sh (M7), mkrootfs-dev.sh and fetch-alpine-packages.sh (the developer image, #344), mirror-alpine-packages.sh (its packages' durable mirror, #399), fetch-zig.sh and fetch-libc-test.sh/build-libc-test.sh (libc-test, #368, #369), linux-hello/ (M6), linux-m7/ (M7), linux-m8/ (M8, designed in #336), ext4-signed-hash.sh (mkrootfs.sh's #308 switch), ext4-unsigned-hash-image.py (makes kernel/src/vfs/testdata/unsigned-hash.ext4, #308), wallpaper.py (makes the wallpaper), harness/ (Python package)
 vendor/            patched copies of crates.io dependencies, via [patch.crates-io] (ext4plus, #313)
 tests/             scenarios/, harness/, golden/, features/*.toml
 docs/              ARCHITECTURE.md, ROADMAP.md, STATUS.md (generated)

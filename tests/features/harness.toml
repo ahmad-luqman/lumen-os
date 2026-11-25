@@ -253,7 +253,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Alpine developer image tooling (#344): the package resolver, lockfile and .apk staging (install scripts refused unless handled, extraction confined to the stage), the sha256-checked fetch with mirrors, and mkrootfs-dev.sh building the same ext4 twice, all on fixture packages; the built image's own tests (gcc, g++, make, git, sqlite3, vim and their toolchain present and resolving, e2fsck, a rebuild matching it) skip without build/alpine-dev.ext4, which CI doesn't build until the gate issues wire it"
+name = "Alpine developer image tooling (#344): the package resolver, lockfile and .apk staging (install scripts refused unless handled, extraction confined to the stage), the sha256-checked fetch with mirrors (any LUMEN_APK_MIRROR first, then dl-cdn, then the durable mirror: the `alpine-apk-mirror` release, its assets named by sha256; each source's answer in a failure's advice), mirror-alpine-packages.sh (against a stub gh) checking that release holds every locked file as a finished upload of its bytes, and uploading only the missing ones after checking all of them against the lock, and mkrootfs-dev.sh building the same ext4 twice, all on fixture packages; the built image's own tests (gcc, g++, make, git, sqlite3, vim and their toolchain present and resolving, e2fsck, a rebuild matching it) on build/alpine-dev.ext4, which CI builds from the locked packages (cached on the lock's hash)"
 milestone = "M8"
 tests = ["harness:test_rootfs_dev::*"]
 

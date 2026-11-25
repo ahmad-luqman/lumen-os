@@ -1,13 +1,14 @@
 """Self-tests for the Alpine developer image (#344): tools/alpine-lock.py's
 resolver, lockfile and .apk extraction, tools/fetch-alpine-packages.sh,
-tools/mkrootfs-dev.sh and `rootfs.copy_dev_rootfs`.
+tools/mirror-alpine-packages.sh (against a stub `gh`), tools/mkrootfs-dev.sh
+and `rootfs.copy_dev_rootfs`.
 
 Nearly everything runs on fixtures (made-up APKINDEX stanzas, .apk files
-built here, `file://` mirrors), with no network. Two parts read what
-`make deps-dev` and `make rootfs-dev` leave in build/: the check that no
-locked package carries an unhandled install script, and the last group, on
-the built image, `build/alpine-dev.ext4`; each skips without them, as in CI
-until the gate issues build them there.
+built here, `file://` mirrors, stub `curl` and `gh`), with no network. Two
+parts read what `make deps-dev` and `make rootfs-dev` leave in build/: the
+check that no locked package carries an unhandled install script, and the
+last group, on the built image, `build/alpine-dev.ext4`. Each skips without
+them locally and fails under CI, which builds both.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import hashlib
 import http.server
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -49,6 +51,15 @@ LOCK = REPO_ROOT / "tools" / "alpine-packages.lock"
 WANTED = REPO_ROOT / "tools" / "alpine-packages.txt"
 DEV_IMAGE = BUILD_DIR / "alpine-dev.ext4"
 GATE_TOOLS = ("gcc", "g++", "make", "git", "sqlite3", "vim")
+
+
+@pytest.fixture(autouse=True)
+def _no_durable_mirror(monkeypatch):
+    """A backstop: unset, LUMEN_APK_FALLBACK means the real durable mirror on
+    github.com, which no test here may reach, so every run sees it empty
+    unless the test sets it (`_run_fetch` sets it itself, and its curl stub
+    keeps even an unset one offline)."""
+    monkeypatch.setenv("LUMEN_APK_FALLBACK", "")
 
 
 # --- Fixtures: .apk files ------------------------------------------------------
@@ -709,6 +720,12 @@ FIXTURE_APKS = {
     ),
     "hello-1.0-r0": _apk(DATA[:6]),
 }
+
+
+def _sha(stem: str) -> str:
+    return hashlib.sha256(FIXTURE_APKS[stem]).hexdigest()
+
+
 SCRIPTED_APK = {
     "scripted-1.0-r0": _apk(
         [("etc", "d", None, 0o755), ("etc/scripted.conf", "f", b"x", 0o644)],
@@ -859,15 +876,27 @@ def test_stage_refuses_install_scripts_handled_scripts_doesnt_list(tmp_path, mon
     assert not (dest / "etc/post-install-ran").exists()
 
 
+def _built_or_skip(what: Path, ready: bool, make: str) -> None:
+    """Skips a test of what `make` leaves in build/ when it isn't there:
+    locally only. CI builds it before the tests, so there a missing one is a
+    failure, not a silent skip."""
+    if ready:
+        return
+    why = f"{what} isn't built (`{make}`)"
+    if os.environ.get("CI"):
+        pytest.fail(why)
+    pytest.skip(why)
+
+
 def test_the_locked_packages_carry_no_unhandled_install_scripts():
     """Every package in tools/alpine-packages.lock that build/deps holds
     carries only scripts HANDLED_SCRIPTS lists (none at #344's lock), so
-    the image needs nothing a script would have done. Skipped without the
-    fetched packages (`make deps-dev`), as CI is until the gate issues."""
+    the image needs nothing a script would have done. Skipped locally
+    without the fetched packages, failed under CI (which fetches them)."""
     apk_dir = BUILD_DIR / "deps/alpine-packages"
     lock = al.parse_lock(LOCK.read_text())
-    if not all((apk_dir / p.filename).is_file() for p in lock.packages):
-        pytest.skip(f"{apk_dir} doesn't hold every locked package (`make deps-dev`)")
+    ready = all((apk_dir / p.filename).is_file() for p in lock.packages)
+    _built_or_skip(apk_dir, ready, "make deps-dev")
     for pkg in lock.packages:
         data = (apk_dir / pkg.filename).read_bytes()
         assert hashlib.sha256(data).hexdigest() == pkg.sha256, pkg.filename
@@ -1088,15 +1117,125 @@ def _fetch_tree(tmp_path: Path):
     return tools / "fetch-alpine-packages.sh", tmp_path / "repo/build/deps/alpine-packages", flat
 
 
-def _run_fetch(script: Path, tmp_path: Path, mirror: str = ""):
+CURL_STUB = """#!/bin/sh
+# The tests' curl: every call's arguments logged to `args`; the real curl
+# (-q first, so no ~/.curlrc applies) for file:// and 127.0.0.1 URLs; any
+# other URL logged to `urls` and answered as the file `answer` says (the
+# HTTP code curl prints, then its exit), by default `404 22`, curl -f's on a
+# 404: no test reaches the network.
+here=$(dirname "$0")
+echo "$*" >> "$here/args"
+for a in "$@"; do url=$a; done
+case "$url" in
+file://* | http://127.0.0.1:*) exec {real} -q "$@" ;;
+esac
+echo "$url" >> "$here/urls"
+set -- $(cat "$here/answer" 2>/dev/null || echo 404 22)
+printf %s "$1"
+exit "$2"
+"""
+
+# Taken out of every run's environment: a proxy would send even the
+# loopback HTTP mirrors elsewhere.
+PROXY_VARS = (
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+)
+
+
+def _install_curl_stub(bin_dir: Path, answer: str | None = None) -> None:
+    bin_dir.mkdir(exist_ok=True)
+    real = shutil.which("curl")
+    assert real, "no curl on PATH"
+    (bin_dir / "curl").write_text(CURL_STUB.format(real=real))
+    (bin_dir / "curl").chmod(0o755)
+    if answer is not None:
+        (bin_dir / "answer").write_text(answer)
+
+
+def _run_fetch(
+    script: Path,
+    tmp_path: Path,
+    mirror: str = "",
+    *,
+    cdn: str | None = None,
+    fallback: str | None = "",
+    unset: tuple[str, ...] = (),
+    answer: str | None = None,
+    env_extra: dict[str, str] | None = None,
+):
+    """Runs the fetch offline: `cdn` defaults to the tree's stand-in, a
+    `fallback` of None leaves LUMEN_APK_FALLBACK unset (the real durable
+    mirror, which only CURL_STUB answers, as `answer` says), and `unset`
+    takes variables out."""
+    bin_dir = tmp_path / "bin"
+    _install_curl_stub(bin_dir, answer)
     env = {
         **os.environ,
-        "LUMEN_APK_CDN": f"file://{tmp_path}/cdn",
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "LUMEN_APK_CDN": f"file://{tmp_path}/cdn" if cdn is None else cdn,
         "LUMEN_APK_MIRROR": mirror,
         "LUMEN_PYTHON": sys.executable,
+        **(env_extra or {}),
     }
+    if fallback is None:
+        env.pop("LUMEN_APK_FALLBACK", None)
+    else:
+        env["LUMEN_APK_FALLBACK"] = fallback
+    for name in (*unset, *PROXY_VARS):
+        env.pop(name, None)
     return subprocess.run(
-        ["bash", str(script)], capture_output=True, text=True, check=False, env=env
+        ["bash", str(script)], capture_output=True, text=True, check=False, env=env, timeout=120
+    )
+
+
+def _put_fixtures(directory: Path, *stems: str, by_sha: bool = False) -> None:
+    """The fixture packages (all, or `stems`) in a flat directory, each named
+    by its file name, or with `by_sha` by its sha256."""
+    for stem in stems or FIXTURE_APKS:
+        name = f"{_sha(stem)}.apk" if by_sha else f"{stem}.apk"
+        (directory / name).write_bytes(FIXTURE_APKS[stem])
+
+
+def _assert_fetched(out: Path) -> None:
+    for stem, data in FIXTURE_APKS.items():
+        assert (out / f"{stem}.apk").read_bytes() == data, stem
+
+
+def _curl_args(tmp_path: Path) -> list[str]:
+    """Each curl call's arguments, as CURL_STUB logged them."""
+    log = tmp_path / "bin/args"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _offline_urls(tmp_path: Path) -> list[str]:
+    """The URLs CURL_STUB answered instead of the network."""
+    log = tmp_path / "bin/urls"
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _tried(stderr: str) -> list[tuple[str, str]]:
+    """A failed fetch's `tried:` lines, as (URL, what it answered)."""
+    lines = stderr.split("; tried:\n", 1)[1].splitlines()
+    tried = []
+    for line in lines:
+        m = re.fullmatch(r"  ([a-z]+://\S+): (.+)", line)
+        if not m:
+            break
+        tried.append((m[1], m[2]))
+    return tried
+
+
+def _summary(fetched: int, fallback: int, kept: int, removed: int) -> str:
+    return (
+        f"{fetched + kept} packages ({fetched} fetched ({fallback} from the fallback), "
+        f"{kept} already there, {removed} stale removed)"
     )
 
 
@@ -1109,10 +1248,13 @@ def test_fetch_tries_mirrors_in_order_and_checks_each_sha256(tmp_path):
     (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
     proc = _run_fetch(script, tmp_path, f"file://{flat}/{{file}}")
     assert proc.returncode == 0, proc.stderr
-    assert "binutils-2.43.1-r3.apk: sha256" in proc.stderr
-    assert "2 packages (2 fetched, 0 already there, 0 stale removed)" in proc.stdout
-    for stem, data in FIXTURE_APKS.items():
-        assert (out / f"{stem}.apk").read_bytes() == data
+    other = hashlib.sha256(b"not binutils").hexdigest()
+    assert (
+        f"file://{flat}/binutils-2.43.1-r3.apk: other bytes (sha256 {other}), trying the next source"
+        in proc.stderr
+    )
+    assert _summary(2, 0, 0, 0) in proc.stdout
+    _assert_fetched(out)
 
 
 def test_fetch_keeps_verified_files_refetches_bad_ones_and_prunes_stale_ones(tmp_path):
@@ -1123,7 +1265,7 @@ def test_fetch_keeps_verified_files_refetches_bad_ones_and_prunes_stale_ones(tmp
     (out / "notes.txt").write_text("not an .apk: kept")
     proc = _run_fetch(script, tmp_path)
     assert proc.returncode == 0, proc.stderr
-    assert "2 packages (1 fetched, 1 already there, 1 stale removed)" in proc.stdout
+    assert _summary(1, 0, 1, 1) in proc.stdout
     assert (out / "hello-1.0-r0.apk").read_bytes() == FIXTURE_APKS["hello-1.0-r0"]
     assert sorted(p.name for p in out.iterdir()) == [
         "binutils-2.43.1-r3.apk",
@@ -1133,15 +1275,28 @@ def test_fetch_keeps_verified_files_refetches_bad_ones_and_prunes_stale_ones(tmp
 
 
 def test_fetch_fails_clearly_when_a_pinned_file_is_gone_everywhere(tmp_path):
+    """Every source answers not found: each tried URL with its answer, the
+    advice to re-lock (the CDN answered not found), and (`_run_fetch`'s
+    default, an empty fallback) that the durable mirror wasn't tried."""
     script, out, flat = _fetch_tree(tmp_path)
     (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
     proc = _run_fetch(script, tmp_path, f"file://{flat}/{{file}} file://{tmp_path}/nowhere")
     assert proc.returncode == 1
     assert "no mirror gave hello-1.0-r0.apk with sha256" in proc.stderr
-    assert f"file://{flat}/hello-1.0-r0.apk" in proc.stderr
-    assert f"file://{tmp_path}/nowhere/v3.21/main/x86_64/hello-1.0-r0.apk" in proc.stderr
+    assert _tried(proc.stderr) == [
+        (f"file://{flat}/hello-1.0-r0.apk", "not found (no such file)"),
+        (
+            f"file://{tmp_path}/nowhere/v3.21/main/x86_64/hello-1.0-r0.apk",
+            "not found (no such file)",
+        ),
+        (f"file://{tmp_path}/cdn/v3.21/main/x86_64/hello-1.0-r0.apk", "not found (no such file)"),
+    ]
     assert "Re-run tools/alpine-lock.py" in proc.stderr
+    assert "LUMEN_APK_FALLBACK is set empty, so the durable mirror wasn't tried" in proc.stderr
     assert "couldn't be reached" not in proc.stderr
+    assert "served other bytes" not in proc.stderr
+    assert "The durable mirror should hold" not in proc.stderr
+    assert "LUMEN_APK_CDN is set empty" not in proc.stderr
     assert not (out / "hello-1.0-r0.apk").exists()
     assert not [p for p in out.iterdir() if p.name.startswith(".part")]
 
@@ -1177,31 +1332,37 @@ def _http_mirror(status: int, body: bytes = b""):
         server.server_close()
 
 
+PORTAL = b"<html>captive portal</html>"
+
+
 @pytest.mark.parametrize(
-    ("status", "body", "advice", "not_advice"),
+    ("status", "body", "outcome", "advice", "not_advice"),
     [
-        (404, b"", "Re-run tools/alpine-lock.py", "couldn't be reached"),
-        (403, b"", "Re-run tools/alpine-lock.py", "couldn't be reached"),
-        (410, b"", "Re-run tools/alpine-lock.py", "couldn't be reached"),
-        (503, b"", "couldn't be reached", "Re-run tools/alpine-lock.py"),
-        (200, b"<html>captive portal</html>", "served other bytes", "Re-run tools/alpine-lock.py"),
+        (404, b"", "not found (HTTP 404)", "Re-run tools/alpine-lock.py", "couldn't be reached"),
+        (403, b"", "not found (HTTP 403)", "Re-run tools/alpine-lock.py", "couldn't be reached"),
+        (410, b"", "not found (HTTP 410)", "Re-run tools/alpine-lock.py", "couldn't be reached"),
+        (503, b"", "unreachable (HTTP 503)", "couldn't be reached", "Re-run tools/alpine-lock.py"),
+        (
+            200,
+            PORTAL,
+            f"other bytes (sha256 {hashlib.sha256(PORTAL).hexdigest()})",
+            "served other bytes",
+            "Re-run tools/alpine-lock.py",
+        ),
     ],
 )
 def test_fetch_tells_a_dropped_file_from_a_broken_mirror_over_http(
-    tmp_path, status, body, advice, not_advice
+    tmp_path, status, body, outcome, advice, not_advice
 ):
     """Over HTTP, as dl-cdn answers: a 403, 404 or 410 everywhere means the
     file is gone (re-lock); a 5xx means the mirror is down, and other bytes
     under the name a proxy or corrupt mirror: neither is a reason to
-    re-lock."""
+    re-lock. The tried line says which."""
     script, out, _ = _fetch_tree(tmp_path)
     with _http_mirror(status, body) as base:
-        env = {**os.environ, "LUMEN_APK_CDN": base, "LUMEN_PYTHON": sys.executable}
-        env.pop("LUMEN_APK_MIRROR", None)
-        proc = subprocess.run(
-            ["bash", str(script)], capture_output=True, text=True, check=False, env=env, timeout=120
-        )
+        proc = _run_fetch(script, tmp_path, cdn=base)
     assert proc.returncode == 1
+    assert _tried(proc.stderr) == [(f"{base}/v3.21/main/x86_64/binutils-2.43.1-r3.apk", outcome)]
     assert advice in proc.stderr
     assert not_advice not in proc.stderr
     assert not list(out.glob("*.apk"))
@@ -1231,40 +1392,27 @@ def _serve_dir(root: Path, redirect: dict[str, str] | None = None):
 def test_fetch_follows_a_mirrors_redirect(tmp_path):
     script, out, flat = _fetch_tree(tmp_path)
     shutil.rmtree(tmp_path / "cdn")
-    for stem, data in FIXTURE_APKS.items():
-        (flat / f"{stem}.apk").write_bytes(data)
+    _put_fixtures(flat)
     redirect = {f"/r/{s}.apk": f"/{s}.apk" for s in FIXTURE_APKS}
     srv = _serve_dir(flat, redirect)
     try:
-        env = {
-            **os.environ,
-            "LUMEN_APK_CDN": f"file://{tmp_path}/none",
-            "LUMEN_PYTHON": sys.executable,
-            "LUMEN_APK_MIRROR": f"http://127.0.0.1:{srv.server_port}/r/{{file}}",
-        }
-        proc = subprocess.run(
-            ["bash", str(script)], check=False, capture_output=True, text=True, env=env, timeout=120
+        proc = _run_fetch(
+            script,
+            tmp_path,
+            f"http://127.0.0.1:{srv.server_port}/r/{{file}}",
+            cdn=f"file://{tmp_path}/none",
         )
     finally:
         srv.shutdown()
         srv.server_close()
     assert proc.returncode == 0, proc.stderr
-    for stem, data in FIXTURE_APKS.items():
-        assert (out / f"{stem}.apk").read_bytes() == data
+    _assert_fetched(out)
 
 
 def test_fetch_other_bytes_everywhere_fail_without_a_part_file(tmp_path):
     script, out, _ = _fetch_tree(tmp_path)
     (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").write_bytes(b"other bytes")
-    env = {
-        **os.environ,
-        "LUMEN_APK_CDN": f"file://{tmp_path}/cdn",
-        "LUMEN_PYTHON": sys.executable,
-        "LUMEN_APK_MIRROR": "",
-    }
-    proc = subprocess.run(
-        ["bash", str(script)], check=False, capture_output=True, text=True, env=env, timeout=120
-    )
+    proc = _run_fetch(script, tmp_path)
     assert proc.returncode == 1
     assert "served other bytes" in proc.stderr
     assert "Re-run tools/alpine-lock.py" not in proc.stderr
@@ -1272,26 +1420,33 @@ def test_fetch_other_bytes_everywhere_fail_without_a_part_file(tmp_path):
     assert not [p for p in out.iterdir() if p.name.startswith(".part")]
 
 
+def test_fetch_prints_every_advice_line_that_applies(tmp_path):
+    """One source serving other bytes, the next unreachable: both lines of
+    advice, each from its own answer, and no re-lock."""
+    script, _, flat = _fetch_tree(tmp_path)
+    (flat / "binutils-2.43.1-r3.apk").write_bytes(b"not binutils")
+    proc = _run_fetch(script, tmp_path, f"file://{flat}/{{file}}", cdn="http://127.0.0.1:9")
+    assert proc.returncode == 1
+    assert [o for _, o in _tried(proc.stderr)] == [
+        f"other bytes (sha256 {hashlib.sha256(b'not binutils').hexdigest()})",
+        "unreachable (curl exit 7)",
+    ]
+    assert "served other bytes" in proc.stderr
+    assert "couldn't be reached" in proc.stderr
+    assert "Re-run tools/alpine-lock.py" not in proc.stderr
+
+
 def test_fetch_stops_at_the_first_good_mirror(tmp_path):
     script, out, flat = _fetch_tree(tmp_path)
-    for stem, data in FIXTURE_APKS.items():
-        (flat / f"{stem}.apk").write_bytes(data)
+    _put_fixtures(flat)
     # The CDN, tried second, gives wrong bytes: never consulted.
     for p in (tmp_path / "cdn/v3.21/main/x86_64").iterdir():
         p.write_bytes(b"wrong")
-    env = {
-        **os.environ,
-        "LUMEN_APK_CDN": f"file://{tmp_path}/cdn",
-        "LUMEN_PYTHON": sys.executable,
-        "LUMEN_APK_MIRROR": f"file://{flat}/{{file}}",
-    }
-    proc = subprocess.run(
-        ["bash", str(script)], check=False, capture_output=True, text=True, env=env, timeout=120
-    )
+    proc = _run_fetch(script, tmp_path, f"file://{flat}/{{file}}")
     assert proc.returncode == 0, proc.stderr
     assert "sha256" not in proc.stderr
-    for stem, data in FIXTURE_APKS.items():
-        assert (out / f"{stem}.apk").read_bytes() == data
+    assert "trying the next source" not in proc.stderr
+    _assert_fetched(out)
 
 
 def test_fetch_reads_mirrors_one_per_line(tmp_path):
@@ -1299,27 +1454,23 @@ def test_fetch_reads_mirrors_one_per_line(tmp_path):
     line's mirror is used, not dropped."""
     script, out, flat = _fetch_tree(tmp_path)
     shutil.rmtree(tmp_path / "cdn")
-    for stem, data in FIXTURE_APKS.items():
-        (flat / f"{stem}.apk").write_bytes(data)
+    _put_fixtures(flat)
     proc = _run_fetch(
         script, tmp_path, f"file://{tmp_path}/nowhere/{{file}}\nfile://{flat}/{{file}}"
     )
     assert proc.returncode == 0, proc.stderr
-    for stem, data in FIXTURE_APKS.items():
-        assert (out / f"{stem}.apk").read_bytes() == data
+    _assert_fetched(out)
 
 
 def test_fetch_says_an_unreachable_mirror_is_no_reason_to_relock(tmp_path):
     """A mirror that can't be reached (nothing listens on port 9) fails the
     fetch with "check the network", not the advice to re-run the lock."""
     script, _, _ = _fetch_tree(tmp_path)
-    env_cdn = "http://127.0.0.1:9"
-    env = {**os.environ, "LUMEN_APK_CDN": env_cdn, "LUMEN_PYTHON": sys.executable}
-    env.pop("LUMEN_APK_MIRROR", None)
-    proc = subprocess.run(
-        ["bash", str(script)], capture_output=True, text=True, check=False, env=env, timeout=120
-    )
+    proc = _run_fetch(script, tmp_path, cdn="http://127.0.0.1:9")
     assert proc.returncode == 1
+    assert _tried(proc.stderr) == [
+        ("http://127.0.0.1:9/v3.21/main/x86_64/binutils-2.43.1-r3.apk", "unreachable (curl exit 7)")
+    ]
     assert "couldn't be reached" in proc.stderr
     assert "Re-run tools/alpine-lock.py" not in proc.stderr
 
@@ -1327,12 +1478,10 @@ def test_fetch_says_an_unreachable_mirror_is_no_reason_to_relock(tmp_path):
 def test_fetch_takes_a_sha256_template_and_refuses_other_braces(tmp_path):
     script, out, flat = _fetch_tree(tmp_path)
     shutil.rmtree(tmp_path / "cdn")
-    for stem, data in FIXTURE_APKS.items():
-        (flat / f"{hashlib.sha256(data).hexdigest()}.apk").write_bytes(data)
+    _put_fixtures(flat, by_sha=True)
     proc = _run_fetch(script, tmp_path, f"file://{flat}/{{sha256}}.apk")
     assert proc.returncode == 0, proc.stderr
-    for stem, data in FIXTURE_APKS.items():
-        assert (out / f"{stem}.apk").read_bytes() == data
+    _assert_fetched(out)
     proc = _run_fetch(script, tmp_path, f"file://{flat}/{{name}}.apk")
     assert proc.returncode == 1
     assert "a template takes only {file} and {sha256}" in proc.stderr
@@ -1365,7 +1514,7 @@ def test_fetch_keeps_a_last_lock_line_without_a_newline(tmp_path):
     lock.write_text(lock.read_text().rstrip("\n"))
     proc = _run_fetch(script, tmp_path)
     assert proc.returncode == 0, proc.stderr
-    assert "2 packages (2 fetched, 0 already there, 0 stale removed)" in proc.stdout
+    assert _summary(2, 0, 0, 0) in proc.stdout
     assert sorted(p.name for p in out.glob("*.apk")) == sorted(f"{s}.apk" for s in FIXTURE_APKS)
 
 
@@ -1388,10 +1537,932 @@ def test_files_prints_the_locks_mirror_path_file_and_sha256(tmp_path, capsys):
     lock.write_text(_fixture_lock(tmp_path / "apks"))
     assert al.main(["files", "--lock", str(lock)]) == 0
     want = [
-        f"v3.21/main/x86_64/{stem}.apk {stem}.apk {hashlib.sha256(data).hexdigest()}"
-        for stem, data in sorted(FIXTURE_APKS.items())
+        f"v3.21/main/x86_64/{stem}.apk {stem}.apk {_sha(stem)}" for stem in sorted(FIXTURE_APKS)
     ]
     assert capsys.readouterr().out.splitlines() == want
+
+
+def test_fetch_tries_the_durable_mirror_only_after_the_cdn(tmp_path):
+    """LUMEN_APK_FALLBACK comes after dl-cdn: a file the CDN dropped comes
+    from it, saying so, while one the CDN still has comes from the CDN (the
+    fallback's wrong copy is never read)."""
+    script, out, flat = _fetch_tree(tmp_path)
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
+    (flat / f"{_sha('hello-1.0-r0')}.apk").write_bytes(FIXTURE_APKS["hello-1.0-r0"])
+    (flat / f"{_sha('binutils-2.43.1-r3')}.apk").write_bytes(b"wrong")
+    proc = _run_fetch(script, tmp_path, fallback=f"file://{flat}/{{sha256}}.apk")
+    assert proc.returncode == 0, proc.stderr
+    assert "sha256" not in proc.stderr  # the fallback's wrong binutils never fetched
+    assert (
+        f"file://{tmp_path}/cdn/v3.21/main/x86_64/hello-1.0-r0.apk: not found (no such file), "
+        "trying the next source" in proc.stderr
+    )
+    assert _summary(2, 1, 0, 0) in proc.stdout
+    _assert_fetched(out)
+
+
+def test_fetch_falls_back_past_an_unreachable_cdn(tmp_path):
+    """dl-cdn down: every file comes from the durable mirror, and the run
+    succeeds without the "couldn't be reached" advice. The dead CDN is tried
+    for the first file only, then skipped for the rest of the run, so a
+    stalled dl-cdn costs one file's timeouts, not every file's."""
+    script, out, flat = _fetch_tree(tmp_path)
+    _put_fixtures(flat, by_sha=True)
+    proc = _run_fetch(
+        script, tmp_path, cdn="http://127.0.0.1:9", fallback=f"file://{flat}/{{sha256}}.apk"
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (
+        "unreachable (curl exit 7) (skipped for the rest of this run), trying the next source"
+        in proc.stderr
+    )
+    assert proc.stderr.count("127.0.0.1:9") == 1  # the second file never tries it
+    assert "couldn't be reached" not in proc.stderr
+    assert _summary(2, 2, 0, 0) in proc.stdout
+    _assert_fetched(out)
+
+
+def test_fetch_reads_the_fallback_as_a_list(tmp_path):
+    """LUMEN_APK_FALLBACK split like LUMEN_APK_MIRROR: its second entry is
+    tried after its first."""
+    script, out, flat = _fetch_tree(tmp_path)
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
+    (flat / f"{_sha('hello-1.0-r0')}.apk").write_bytes(FIXTURE_APKS["hello-1.0-r0"])
+    nowhere = f"file://{tmp_path}/nowhere/{{sha256}}.apk"
+    proc = _run_fetch(script, tmp_path, fallback=f"{nowhere}\nfile://{flat}/{{sha256}}.apk")
+    assert proc.returncode == 0, proc.stderr
+    assert (
+        f"file://{tmp_path}/nowhere/{_sha('hello-1.0-r0')}.apk: not found (no such file), "
+        "trying the next source" in proc.stderr
+    )
+    assert _summary(2, 1, 0, 0) in proc.stdout
+    assert (out / "hello-1.0-r0.apk").read_bytes() == FIXTURE_APKS["hello-1.0-r0"]
+
+
+def test_fetch_refuses_a_bad_fallback_template(tmp_path):
+    script, out, _ = _fetch_tree(tmp_path)
+    proc = _run_fetch(script, tmp_path, fallback="file:///srv/apks/{name}.apk")
+    assert proc.returncode == 1
+    assert "mirror file:///srv/apks/{name}.apk: a template takes only {file} and {sha256}" in (
+        proc.stderr
+    )
+    assert not out.exists() or not list(out.glob("*.apk"))
+
+
+def test_fetch_empty_fallback_means_none(tmp_path):
+    """LUMEN_APK_FALLBACK set but empty tries no fallback: a file the CDN
+    dropped fails the fetch, naming only the CDN's URL, and says the durable
+    mirror wasn't tried."""
+    script, _, _ = _fetch_tree(tmp_path)
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
+    proc = _run_fetch(script, tmp_path, fallback="")
+    assert proc.returncode == 1
+    assert [u for u, _ in _tried(proc.stderr)] == [
+        f"file://{tmp_path}/cdn/v3.21/main/x86_64/hello-1.0-r0.apk"
+    ]
+    assert "LUMEN_APK_FALLBACK is set empty, so the durable mirror wasn't tried" in proc.stderr
+    assert _offline_urls(tmp_path) == []
+
+
+def test_fetch_unset_fallback_tries_the_durable_mirror_last(tmp_path):
+    """Unset, LUMEN_APK_FALLBACK is the real durable mirror (offline here:
+    CURL_STUB answers it 404). It is tried after the CDN, and its not-found
+    says the mirror should hold the file."""
+    script, _, _ = _fetch_tree(tmp_path)
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
+    proc = _run_fetch(script, tmp_path, fallback=None)
+    assert proc.returncode == 1
+    release = (
+        "https://github.com/ahmad-luqman/lumen-os/releases/download/alpine-apk-mirror/"
+        f"{_sha('hello-1.0-r0')}.apk"
+    )
+    assert _tried(proc.stderr) == [
+        (f"file://{tmp_path}/cdn/v3.21/main/x86_64/hello-1.0-r0.apk", "not found (no such file)"),
+        (release, "not found (HTTP 404)"),
+    ]
+    assert _offline_urls(tmp_path) == [release]
+    assert "The durable mirror should hold every locked file" in proc.stderr
+    assert "tools/mirror-alpine-packages.sh upload" in proc.stderr
+    assert "LUMEN_APK_FALLBACK is set empty" not in proc.stderr
+
+
+def test_fetch_empty_cdn_means_none(tmp_path):
+    """LUMEN_APK_CDN set but empty tries no CDN (it once meant dl-cdn), and
+    says so. Only a mirror answered not found, not dl-cdn: no advice to
+    re-lock."""
+    script, _, flat = _fetch_tree(tmp_path)
+    _put_fixtures(flat, "hello-1.0-r0")
+    proc = _run_fetch(script, tmp_path, f"file://{flat}/{{file}}", cdn="")
+    assert proc.returncode == 1
+    assert _tried(proc.stderr) == [
+        (f"file://{flat}/binutils-2.43.1-r3.apk", "not found (no such file)")
+    ]
+    assert _offline_urls(tmp_path) == []
+    assert "LUMEN_APK_CDN is set empty, so dl-cdn wasn't tried" in proc.stderr
+    assert "Re-run tools/alpine-lock.py" not in proc.stderr
+
+
+def test_fetch_unset_cdn_means_dl_cdn(tmp_path):
+    """Unset, LUMEN_APK_CDN is dl-cdn (offline: CURL_STUB answers it)."""
+    script, _, _ = _fetch_tree(tmp_path)
+    proc = _run_fetch(script, tmp_path, unset=("LUMEN_APK_CDN", "LUMEN_APK_MIRROR"))
+    assert proc.returncode == 1
+    url = "https://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/binutils-2.43.1-r3.apk"
+    assert _tried(proc.stderr) == [(url, "not found (HTTP 404)")]
+    assert _offline_urls(tmp_path) == [url]
+
+
+def test_fetch_a_skipped_dead_cdn_still_counts_as_unreachable(tmp_path):
+    """dl-cdn down, the fallback holding only the first file: the second
+    file's failure lists the CDN as skipped and advises the network, not a
+    re-lock."""
+    script, _, flat = _fetch_tree(tmp_path)
+    _put_fixtures(flat, "binutils-2.43.1-r3", by_sha=True)
+    proc = _run_fetch(
+        script, tmp_path, cdn="http://127.0.0.1:9", fallback=f"file://{flat}/{{sha256}}.apk"
+    )
+    assert proc.returncode == 1
+    assert _tried(proc.stderr) == [
+        (
+            "http://127.0.0.1:9/v3.21/main/x86_64/hello-1.0-r0.apk",
+            "skipped (unreachable earlier in this run)",
+        ),
+        (f"file://{flat}/{_sha('hello-1.0-r0')}.apk", "not found (no such file)"),
+    ]
+    assert "couldn't be reached" in proc.stderr
+    assert "Re-run tools/alpine-lock.py" not in proc.stderr
+
+
+def test_fetch_advice_comes_from_the_failing_files_answers_alone(tmp_path):
+    """binutils meets other bytes on the flat mirror, then comes from the
+    CDN; hello is gone everywhere: its advice is the re-lock, not the
+    earlier file's mismatch."""
+    script, _, flat = _fetch_tree(tmp_path)
+    (flat / "binutils-2.43.1-r3.apk").write_bytes(b"not binutils")
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
+    proc = _run_fetch(script, tmp_path, f"file://{flat}/{{file}}")
+    assert proc.returncode == 1
+    advice = proc.stderr.split("; tried:\n", 1)[1]
+    assert "Re-run tools/alpine-lock.py" in advice
+    assert "served other bytes" not in advice
+
+
+def test_fetch_reads_a_404_by_its_code_whatever_curls_exit(tmp_path):
+    """macOS's curl exits 56, not 22, on an HTTP/2 404: still not found, by
+    the code. The mirror answering so isn't skipped for the next file, and
+    the durable mirror's 404 says it should hold the file."""
+    script, _, _ = _fetch_tree(tmp_path)
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
+    mirror = "https://mirror.example/alpine"
+    proc = _run_fetch(script, tmp_path, mirror, fallback=None, answer="404 56")
+    assert proc.returncode == 1
+    release = (
+        f"https://github.com/{MIRROR_REPO}/releases/download/{MIRROR_TAG}/"
+        f"{_sha('hello-1.0-r0')}.apk"
+    )
+    assert _tried(proc.stderr) == [
+        (f"{mirror}/v3.21/main/x86_64/hello-1.0-r0.apk", "not found (HTTP 404)"),
+        (f"file://{tmp_path}/cdn/v3.21/main/x86_64/hello-1.0-r0.apk", "not found (no such file)"),
+        (release, "not found (HTTP 404)"),
+    ]
+    assert "skipped" not in proc.stderr
+    assert "couldn't be reached" not in proc.stderr
+    assert "The durable mirror should hold every locked file" in proc.stderr
+    assert "Re-run tools/alpine-lock.py" in proc.stderr
+
+
+def test_fetch_reads_a_403_from_the_durable_mirror_as_refused(tmp_path):
+    """GitHub answers a missing asset with a 404, so the durable mirror's
+    403 is a refusal: unreachable, not a file to upload."""
+    script, _, _ = _fetch_tree(tmp_path)
+    (tmp_path / "cdn/v3.21/main/x86_64/hello-1.0-r0.apk").unlink()
+    proc = _run_fetch(script, tmp_path, fallback=None, answer="403 22")
+    assert proc.returncode == 1
+    assert _tried(proc.stderr)[-1][1] == "refused (HTTP 403)"
+    assert "couldn't be reached" in proc.stderr
+    assert "The durable mirror should hold" not in proc.stderr
+
+
+def test_fetch_stops_at_once_on_a_local_error(tmp_path):
+    """curl can't write its part file (a read-only build/deps/alpine-packages,
+    curl's exit 23): the fetch stops at the first source with that error,
+    tries no other, and gives no network advice."""
+    script, out, flat = _fetch_tree(tmp_path)
+    _put_fixtures(flat, by_sha=True)
+    out.mkdir(parents=True)
+    out.chmod(0o555)
+    try:
+        proc = _run_fetch(script, tmp_path, fallback=f"file://{flat}/{{sha256}}.apk")
+    finally:
+        out.chmod(0o755)
+    assert proc.returncode == 1
+    assert f"local error (curl exit 23): can't write {out}/.part." in proc.stderr
+    assert len(_curl_args(tmp_path)) == 1
+    for text in ("tried:", "trying the next source", "couldn't be reached", "Re-run"):
+        assert text not in proc.stderr
+
+
+def test_fetch_caps_each_try_with_lumen_apk_max_time(tmp_path):
+    script, _, _ = _fetch_tree(tmp_path)
+    proc = _run_fetch(script, tmp_path, env_extra={"LUMEN_APK_MAX_TIME": "7"})
+    assert proc.returncode == 0, proc.stderr
+    args = _curl_args(tmp_path)
+    assert len(args) == 2 and all(" --max-time 7 " in a for a in args)
+    (tmp_path / "bin/args").unlink()
+    shutil.rmtree(tmp_path / "repo/build")
+    assert _run_fetch(script, tmp_path, env_extra={"LUMEN_APK_MAX_TIME": ""}).returncode == 0
+    assert not any("--max-time" in a for a in _curl_args(tmp_path))
+    proc = _run_fetch(script, tmp_path, env_extra={"LUMEN_APK_MAX_TIME": "5m"})
+    assert proc.returncode == 1
+    assert "LUMEN_APK_MAX_TIME is '5m', not a number of seconds" in proc.stderr
+
+
+def test_fetch_needs_no_source_when_every_file_is_already_there(tmp_path):
+    """All three variables empty: fine while every file is verified; the
+    first one that needs fetching fails, saying there is no source."""
+    script, out, _ = _fetch_tree(tmp_path)
+    assert _run_fetch(script, tmp_path).returncode == 0
+    proc = _run_fetch(script, tmp_path, cdn="")
+    assert proc.returncode == 0, proc.stderr
+    assert _summary(0, 0, 2, 0) in proc.stdout
+    (out / "hello-1.0-r0.apk").write_bytes(b"corrupt")
+    proc = _run_fetch(script, tmp_path, cdn="")
+    assert proc.returncode == 1
+    assert "hello-1.0-r0.apk needs fetching, but there is no source to try" in proc.stderr
+
+
+def _script_value(path: Path, name: str) -> str:
+    m = re.search(rf"^{name}=(.*)$", path.read_text(), re.MULTILINE)
+    assert m, f"{path.name} sets no {name}"
+    return m.group(1).strip("'\"")
+
+
+def test_the_fetchs_durable_mirror_is_the_release_the_mirror_tool_fills():
+    fetch = REPO_ROOT / "tools/fetch-alpine-packages.sh"
+    tool = REPO_ROOT / "tools/mirror-alpine-packages.sh"
+    repo, tag = _script_value(tool, "REPO"), _script_value(tool, "TAG")
+    assert _script_value(fetch, "DURABLE_MIRROR") == (
+        f"https://github.com/{repo}/releases/download/{tag}/{{sha256}}.apk"
+    )
+
+
+# --- tools/mirror-alpine-packages.sh -----------------------------------------------------
+
+MIRROR_REPO = "ahmad-luqman/lumen-os"
+MIRROR_TAG = "alpine-apk-mirror"
+
+_GH_STUB = r"""#!@PYTHON@
+# A stand-in for gh over a fake release in $GH_STATE: its assets are the
+# files in assets/ (no such directory: no release), each one's digest the
+# sha256 of its bytes, listed 2 to a page; a name in `partial` is an upload
+# still open. Marker files: `draft` makes the release a draft; `view-error`
+# makes every `release view` fail otherwise than "not found", and
+# `view-fail-once`/`api-fail-once` the next one only; `view-garbage` gives an
+# answer that isn't an id and a draft flag; `api-error` fails every listing;
+# `lag` hides every asset from the first listing after an upload, and
+# `view-lag` makes the first `release view` after a create say "release not
+# found";
+# `fail-upload` makes the next upload fail after leaving a partial asset,
+# `upload-open` leaves each upload open, and `touch-source` changes the
+# source file under build/deps after it was staged. Every call is logged to
+# `calls`, one JSON list a line. It refuses what the script must never send:
+# another tag or repository, an unexpected --jq, or --clobber.
+import hashlib, json, os, shutil, sys
+
+args = sys.argv[1:]
+state = os.environ["GH_STATE"]
+assets = os.path.join(state, "assets")
+with open(os.path.join(state, "calls"), "a") as f:
+    print(json.dumps(args), file=f)
+REPO, TAG, ID = "@REPO@", "@TAG@", "4242"
+VIEW_JQ = '"\\(.databaseId) \\(.isDraft)"'
+ASSETS_JQ = '.[] | [.name, .state, (.digest // "")] | @tsv'
+
+
+def refuse(why):
+    print(f"gh stub: {why}: {args}", file=sys.stderr)
+    sys.exit(3)
+
+
+def opt(name):
+    if name not in args:
+        refuse(f"no {name}")
+    return args[args.index(name) + 1]
+
+
+def marked(name):
+    return os.path.exists(os.path.join(state, name))
+
+
+def once(name):
+    if marked(name):
+        os.remove(os.path.join(state, name))
+        return True
+    return False
+
+
+def listed():
+    partial = set()
+    if marked("partial"):
+        with open(os.path.join(state, "partial")) as f:
+            partial = set(f.read().split())
+    rows = []
+    for name in sorted(os.listdir(assets)):
+        with open(os.path.join(assets, name), "rb") as f:
+            digest = "sha256:" + hashlib.sha256(f.read()).hexdigest()
+        rows.append([name, "open" if name in partial else "uploaded", digest])
+    return rows
+
+
+if "--clobber" in args:
+    refuse("--clobber")
+if args[:1] == ["api"]:
+    path = [a for a in args[1:] if a != "--paginate"][0]
+    if path.split("?")[0] != f"repos/{REPO}/releases/{ID}/assets":
+        refuse("another endpoint")
+    if opt("--jq") != ASSETS_JQ:
+        refuse("another --jq")
+    if marked("api-error") or once("api-fail-once"):
+        print("HTTP 500: Internal Server Error", file=sys.stderr)
+        sys.exit(1)
+    if once("lagging"):
+        sys.exit(0)
+    rows = listed()
+    for row in rows if "--paginate" in args else rows[:2]:
+        print("\t".join(row))
+    sys.exit(0)
+if args[:1] != ["release"] or len(args) < 3:
+    refuse("unexpected call")
+if args[2] != TAG:
+    refuse("another tag")
+if opt("--repo") != REPO:
+    refuse("another repository")
+if args[1] == "view":
+    if marked("view-error") or once("view-fail-once"):
+        print("HTTP 502: Bad Gateway", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isdir(assets) or once("view-hidden"):
+        print("release not found", file=sys.stderr)
+        sys.exit(1)
+    if opt("--json") != "databaseId,isDraft" or opt("--jq") != VIEW_JQ:
+        refuse("another --json or --jq")
+    if marked("view-garbage"):
+        print("null null")
+        sys.exit(0)
+    print(ID, "true" if marked("draft") else "false")
+elif args[1] == "create":
+    if os.path.isdir(assets):
+        refuse("the release exists")
+    os.makedirs(assets)
+    if marked("view-lag"):
+        open(os.path.join(state, "view-hidden"), "w").close()
+elif args[1] == "upload":
+    if not os.path.isdir(assets):
+        refuse("no release")
+    src, _, label = args[-1].partition("#")
+    name = os.path.basename(src)
+    dest = os.path.join(assets, name)
+    if os.path.exists(dest):
+        print(f"asset under the same name already exists: {name}", file=sys.stderr)
+        sys.exit(1)
+    if marked("fail-upload"):
+        os.remove(os.path.join(state, "fail-upload"))
+        with open(src, "rb") as f, open(dest, "wb") as out:
+            out.write(f.read()[:3])
+        with open(os.path.join(state, "partial"), "a") as f:
+            print(name, file=f)
+        print("connection reset", file=sys.stderr)
+        sys.exit(1)
+    if marked("touch-source"):
+        with open(os.path.join(os.environ["DEPS_DIR"], label), "ab") as f:
+            f.write(b"changed after staging")
+    shutil.copy(src, dest)
+    if marked("lag"):
+        os.rename(os.path.join(state, "lag"), os.path.join(state, "lagging"))
+    if marked("upload-open"):
+        with open(os.path.join(state, "partial"), "a") as f:
+            print(name, file=f)
+    with open(os.path.join(state, "labels"), "a") as f:
+        print(name, label, file=f)
+else:
+    refuse("unexpected call")
+"""
+
+# What stands in for the real gh on PATH: a test that reached it fails.
+_GH_GUARD = """#!/bin/sh
+echo "gh guard: the real gh is off limits in tests" >&2
+exit 99
+"""
+
+
+def _mirror_tree(tmp_path: Path, *, release: bool = True, fetched: bool = True):
+    """A stub repository for mirror-alpine-packages.sh: the script, a lock
+    of the fixture packages, and the fetch script, whose DURABLE_MIRROR (the
+    download probe's URL) is the stub's assets directory; with `fetched`,
+    those packages in build/deps; with `release`, the gh stub's release
+    (with no assets)."""
+    tools = tmp_path / "repo/tools"
+    tools.mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "tools/mirror-alpine-packages.sh", tools)
+    shutil.copy2(REPO_ROOT / "tools/alpine-lock.py", tools)
+    (tools / "alpine-packages.lock").write_text(_fixture_lock(tmp_path / "src"))
+    state = tmp_path / "gh"
+    _set_durable_mirror(tools, f"file://{state}/assets/{{sha256}}.apk")
+    if fetched:
+        deps = tmp_path / "repo/build/deps/alpine-packages"
+        deps.mkdir(parents=True)
+        _put_fixtures(deps)
+    state.mkdir()
+    (state / "tmp").mkdir()
+    if release:
+        (state / "assets").mkdir()
+    gh = tmp_path / "gh-stub"
+    stub = _GH_STUB.replace("@PYTHON@", sys.executable)
+    gh.write_text(stub.replace("@REPO@", MIRROR_REPO).replace("@TAG@", MIRROR_TAG))
+    gh.chmod(0o755)
+    return tools / "mirror-alpine-packages.sh", state, gh
+
+
+def _set_durable_mirror(tools: Path, template: str) -> None:
+    """tools/fetch-alpine-packages.sh, copied with another DURABLE_MIRROR."""
+    text = (REPO_ROOT / "tools/fetch-alpine-packages.sh").read_text()
+    text, n = re.subn(
+        r"^DURABLE_MIRROR=.*$", f"DURABLE_MIRROR='{template}'", text, flags=re.MULTILINE
+    )
+    assert n == 1
+    (tools / "fetch-alpine-packages.sh").write_text(text)
+
+
+def _run_mirror(
+    script: Path, state: Path, gh: Path | None, *args: str, env: dict[str, str] | None = None
+):
+    """The tool with `args`, through the gh stub (`gh` None: through
+    whatever `gh` is on PATH, which is the guard) and CURL_STUB. gh's own
+    token and configuration are emptied, so even a real gh would be signed
+    out, and its retries don't sleep. `env` overrides entries last."""
+    extra = env or {}
+    guard = state.parent / "guard"
+    _install_curl_stub(guard)
+    (guard / "gh").write_text(_GH_GUARD)
+    (guard / "gh").chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{guard}{os.pathsep}{os.environ['PATH']}",
+        "GH_TOKEN": "",
+        "GITHUB_TOKEN": "",
+        "GH_CONFIG_DIR": str(state / "gh-config"),
+        "GH_STATE": str(state),
+        "LUMEN_GH_RETRY_SLEEP": "0",
+        "LUMEN_PYTHON": sys.executable,
+        "TMPDIR": str(state / "tmp"),
+        "DEPS_DIR": str(state.parent / "repo/build/deps/alpine-packages"),
+    }
+    if (state.parent / "bin").is_dir():
+        env["PATH"] = f"{state.parent / 'bin'}{os.pathsep}{env['PATH']}"
+    for name in PROXY_VARS:
+        env.pop(name, None)
+    if gh is None:
+        env.pop("LUMEN_GH", None)
+    else:
+        env["LUMEN_GH"] = str(gh)
+    env.update(extra)
+    return subprocess.run(
+        ["bash", str(script), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        timeout=120,
+    )
+
+
+def _calls(state: Path, *prefix: str) -> list[list[str]]:
+    """The gh stub's calls, or those starting with `prefix`."""
+    path = state / "calls"
+    calls = [json.loads(ln) for ln in path.read_text().splitlines()] if path.exists() else []
+    return [c for c in calls if c[: len(prefix)] == list(prefix)]
+
+
+def _writes(calls: list[list[str]]) -> list[list[str]]:
+    return [c for c in calls if c[:2] in (["release", "create"], ["release", "upload"])]
+
+
+def _assert_fetched_assets(state: Path) -> None:
+    for stem, data in FIXTURE_APKS.items():
+        assert (state / "assets" / f"{_sha(stem)}.apk").read_bytes() == data, stem
+
+
+def _asset(state: Path, stem: str, data: bytes | None = None) -> Path:
+    """The fixture package `stem` as the release's asset, its bytes or `data`."""
+    path = state / "assets" / f"{_sha(stem)}.apk"
+    path.write_bytes(FIXTURE_APKS[stem] if data is None else data)
+    return path
+
+
+def test_mirror_check_names_each_locked_file_the_release_lacks(tmp_path):
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    _asset(state, "hello-1.0-r0")
+    (state / "assets/unrelated.apk").write_bytes(b"x")
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    assert (
+        f"binutils-2.43.1-r3.apk (sha256 {_sha('binutils-2.43.1-r3')}) isn't in release"
+        in proc.stderr
+    )
+    assert "hello-1.0-r0.apk" not in proc.stderr
+    assert "1 locked package(s) not mirrored, 0 broken" in proc.stderr
+    _asset(state, "binutils-2.43.1-r3")
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 0, proc.stderr
+    assert "holds all 2 locked packages" in proc.stdout
+    calls = _calls(state)
+    assert calls and _writes(calls) == []  # check never writes
+    assert {c[0] if c[0] == "api" else c[1] for c in calls} == {"api", "view"}
+
+
+def test_mirror_check_names_every_missing_file(tmp_path):
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    for stem in FIXTURE_APKS:
+        assert f"{stem}.apk (sha256 {_sha(stem)}) isn't in release {MIRROR_TAG}" in proc.stderr
+    assert "2 locked package(s) not mirrored, 0 broken" in proc.stderr
+
+
+def test_mirror_check_reads_every_page_of_assets(tmp_path):
+    """Five assets, two to a page, the locked ones sorted last: found only
+    by reading every page."""
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    for name in ("0-a.apk", "0-b.apk", "0-c.apk"):
+        (state / "assets" / name).write_bytes(b"x")
+    for stem in FIXTURE_APKS:
+        _asset(state, stem)
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 0, proc.stderr
+    [api] = _calls(state, "api")
+    assert "--paginate" in api
+
+
+def test_mirror_check_fails_saying_why_without_a_release(tmp_path):
+    script, state, gh = _mirror_tree(tmp_path, release=False, fetched=False)
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    assert (
+        f"can't list release {MIRROR_TAG} of {MIRROR_REPO}: release not found, "
+        "or a draft this token can't see" in proc.stderr
+    )
+    assert "isn't in release" not in proc.stderr
+    assert len(_calls(state, "release", "view")) == 1  # an answer, never retried
+    assert _writes(_calls(state)) == []
+
+
+@pytest.mark.parametrize("mode", ["check", "upload"])
+def test_mirror_refuses_a_draft_release(tmp_path, mode):
+    script, state, gh = _mirror_tree(tmp_path)
+    (state / "draft").write_text("")
+    proc = _run_mirror(script, state, gh, mode)
+    assert proc.returncode == 1
+    assert f"release {MIRROR_TAG} of {MIRROR_REPO} is a draft" in proc.stderr
+    assert _writes(_calls(state)) == []
+
+
+def test_mirror_upload_stops_on_a_gh_error_other_than_not_found(tmp_path):
+    """Only "release not found" means no release: any other failure of the
+    probe is printed, and nothing is created."""
+    script, state, gh = _mirror_tree(tmp_path, release=False)
+    (state / "view-error").write_text("")
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 1
+    assert f"can't read release {MIRROR_TAG} of {MIRROR_REPO}: HTTP 502: Bad Gateway" in (
+        proc.stderr
+    )
+    assert len(_calls(state, "release", "view")) == 3  # tried 3 times
+    assert _writes(_calls(state)) == []
+
+
+@pytest.mark.parametrize("mode", ["check", "upload"])
+@pytest.mark.parametrize("damage", ["partial", "other bytes"])
+def test_mirror_refuses_a_locked_name_that_isnt_a_finished_upload(tmp_path, mode, damage):
+    """A locked file's name whose asset is still open, or whose digest isn't
+    the name's sha256, counts as broken, not mirrored: an error naming it and
+    the command that deletes it. `upload` writes nothing then (binutils,
+    missing, isn't uploaded either), and never touches the asset."""
+    script, state, gh = _mirror_tree(tmp_path)
+    sha = _sha("hello-1.0-r0")
+    if damage == "partial":
+        asset = _asset(state, "hello-1.0-r0")
+        (state / "partial").write_text(f"{sha}.apk\n")
+        state_word, digest = "open", sha
+    else:
+        asset = _asset(state, "hello-1.0-r0", b"other bytes")
+        state_word, digest = "uploaded", hashlib.sha256(b"other bytes").hexdigest()
+    before = asset.read_bytes()
+    proc = _run_mirror(script, state, gh, mode)
+    assert proc.returncode == 1
+    assert (
+        f"release {MIRROR_TAG} holds {sha}.apk (hello-1.0-r0.apk), but its state is "
+        f"'{state_word}' and its digest 'sha256:{digest}'" in proc.stderr
+    )
+    assert f"gh release delete-asset {MIRROR_TAG} {sha}.apk --repo {MIRROR_REPO}" in proc.stderr
+    if mode == "check":
+        assert "1 locked package(s) not mirrored, 1 broken" in proc.stderr
+    else:
+        assert "nothing uploaded: delete the broken asset(s) above first" in proc.stderr
+    assert _writes(_calls(state)) == []
+    assert asset.read_bytes() == before
+
+
+def test_mirror_upload_creates_the_release_and_uploads_only_whats_missing(tmp_path):
+    script, state, gh = _mirror_tree(tmp_path, release=False)
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 0, proc.stderr
+    assert "2 uploaded" in proc.stdout
+    assert "holds all 2 locked packages" in proc.stdout  # its closing check
+    [create] = _calls(state, "release", "create")
+    assert create[:-1] == [
+        "release",
+        "create",
+        MIRROR_TAG,
+        "--repo",
+        MIRROR_REPO,
+        "--prerelease",
+        "--title",
+        "Alpine packages for the developer image",
+        "--notes",
+    ]
+    notes = create[-1]
+    assert "3.21" not in notes  # each package's branch is in its lock
+    assert "aports on branch X.Y-stable" in notes
+    assets = state / "assets"
+    _assert_fetched_assets(state)
+    labels = (state / "labels").read_text().splitlines()
+    assert sorted(labels) == sorted(f"{_sha(s)}.apk {s}.apk" for s in FIXTURE_APKS)
+    # Each upload is a staged copy under TMPDIR, removed afterwards.
+    for c in _calls(state, "release", "upload"):
+        assert Path(c[-1]).parent.name.startswith("lumen-apk-mirror.")
+        assert Path(c[-1]).parent.parent == state / "tmp"
+    assert list((state / "tmp").iterdir()) == []
+    # Run again with one asset gone: only that one is uploaded, nothing replaced.
+    (assets / f"{_sha('hello-1.0-r0')}.apk").unlink()
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 0, proc.stderr
+    assert "1 uploaded" in proc.stdout
+    uploads = _calls(state, "release", "upload")
+    assert len(uploads) == 3
+    assert uploads[-1][-1].endswith(f"/{_sha('hello-1.0-r0')}.apk#hello-1.0-r0.apk")
+    assert len(_calls(state, "release", "create")) == 1
+
+
+def test_mirror_upload_with_nothing_missing_writes_nothing(tmp_path):
+    script, state, gh = _mirror_tree(tmp_path)
+    for stem in FIXTURE_APKS:
+        _asset(state, stem)
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 0, proc.stderr
+    assert "0 uploaded" in proc.stdout
+    assert "holds all 2 locked packages" in proc.stdout
+    assert _writes(_calls(state)) == []
+
+
+@pytest.mark.parametrize("damage", ["missing", "other bytes"])
+def test_mirror_upload_uploads_nothing_while_a_file_isnt_the_locked_one(tmp_path, damage):
+    """binutils is fine, hello isn't: every missing file is checked before
+    any write, so neither is uploaded and the release isn't created."""
+    script, state, gh = _mirror_tree(tmp_path, release=False)
+    local = tmp_path / "repo/build/deps/alpine-packages/hello-1.0-r0.apk"
+    if damage == "missing":
+        local.unlink()
+    else:
+        local.write_bytes(b"other bytes")
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 1
+    if damage == "missing":
+        assert f"{local} is missing" in proc.stderr
+    else:
+        assert f"{local} has sha256 {hashlib.sha256(b'other bytes').hexdigest()}" in proc.stderr
+    assert "nothing uploaded: 1 file(s) aren't the locked ones: run `make deps-dev` first" in (
+        proc.stderr
+    )
+    assert _writes(_calls(state)) == []
+    assert not (state / "assets").exists()
+
+
+def test_mirror_upload_names_a_failed_upload_and_check_finds_its_remains(tmp_path):
+    script, state, gh = _mirror_tree(tmp_path)
+    (state / "fail-upload").write_text("")
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 1
+    sha = _sha("binutils-2.43.1-r3")
+    assert f"uploading binutils-2.43.1-r3.apk as {sha}.apk failed" in proc.stderr
+    assert "may now hold a partial asset" in proc.stderr
+    uploads = _calls(state, "release", "upload")
+    assert len(uploads) == 1  # stopped at the first failure
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    assert f"gh release delete-asset {MIRROR_TAG} {sha}.apk --repo {MIRROR_REPO}" in proc.stderr
+
+
+@pytest.mark.parametrize("args", [["sync"], ["check", "extra"], []])
+def test_mirror_takes_check_or_upload_only(tmp_path, args):
+    script, state, gh = _mirror_tree(tmp_path)
+    proc = _run_mirror(script, state, gh, *args)
+    assert proc.returncode == 2
+    assert "usage:" in proc.stderr
+    assert _calls(state) == []
+
+
+def test_mirror_never_runs_the_real_gh(tmp_path):
+    """Without LUMEN_GH the tool runs `gh` from PATH, which in these tests
+    is the guard: so a test whose stub stopped applying fails instead of
+    reaching GitHub."""
+    script, state, _ = _mirror_tree(tmp_path)
+    proc = _run_mirror(script, state, None, "upload")
+    assert proc.returncode == 1
+    assert "gh guard: the real gh is off limits in tests" in proc.stderr
+    assert _calls(state) == []
+    assert _writes(_calls(state)) == []
+
+
+@pytest.mark.parametrize("damage", ["partial", "other bytes"])
+def test_mirror_check_fails_on_a_broken_asset_with_nothing_missing(tmp_path, damage):
+    """Nothing missing, one asset broken: still a failure, saying to delete
+    it first."""
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    _asset(state, "binutils-2.43.1-r3")
+    if damage == "partial":
+        _asset(state, "hello-1.0-r0")
+        (state / "partial").write_text(f"{_sha('hello-1.0-r0')}.apk\n")
+    else:
+        _asset(state, "hello-1.0-r0", b"other bytes")
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    assert "0 locked package(s) not mirrored, 1 broken: delete each broken asset named above" in (
+        proc.stderr
+    )
+    assert "holds all" not in proc.stdout
+
+
+def test_mirror_upload_fails_when_its_closing_check_does(tmp_path):
+    """Every upload left open: the closing check, read twice, fails the run."""
+    script, state, gh = _mirror_tree(tmp_path)
+    (state / "upload-open").write_text("")
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 1
+    assert "2 uploaded" in proc.stdout
+    assert "but its state is 'open'" in proc.stderr
+    assert "if no upload is running, delete it by hand" in proc.stderr
+    assert "reading it again" in proc.stderr
+    assert "holds all" not in proc.stdout
+
+
+@pytest.mark.parametrize("mode", ["check", "upload"])
+def test_mirror_stops_when_the_asset_listing_fails(tmp_path, mode):
+    script, state, gh = _mirror_tree(tmp_path)
+    (state / "api-error").write_text("")
+    proc = _run_mirror(script, state, gh, mode)
+    assert proc.returncode == 1
+    assert (
+        f"can't list the assets of release {MIRROR_TAG} of {MIRROR_REPO}: "
+        "HTTP 500: Internal Server Error" in proc.stderr
+    )
+    assert "isn't in release" not in proc.stderr
+    assert _writes(_calls(state)) == []
+
+
+@pytest.mark.parametrize("mode", ["check", "upload"])
+def test_mirror_stops_on_a_release_view_answer_it_cant_read(tmp_path, mode):
+    script, state, gh = _mirror_tree(tmp_path)
+    (state / "view-garbage").write_text("")
+    proc = _run_mirror(script, state, gh, mode)
+    assert proc.returncode == 1
+    assert f"release {MIRROR_TAG} of {MIRROR_REPO}: gh answered 'null null'" in proc.stderr
+    assert _writes(_calls(state)) == []
+
+
+def test_mirror_check_matches_whole_asset_names(tmp_path):
+    """An asset whose name only ends with a locked name doesn't count."""
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    _asset(state, "binutils-2.43.1-r3")
+    sha = _sha("hello-1.0-r0")
+    (state / "assets" / f"x{sha}.apk").write_bytes(FIXTURE_APKS["hello-1.0-r0"])
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    assert f"hello-1.0-r0.apk (sha256 {sha}) isn't in release" in proc.stderr
+
+
+def test_mirror_upload_rehashes_the_staged_copy(tmp_path):
+    """A cp that alters the staged copy: the re-hash catches it before any upload."""
+    script, state, gh = _mirror_tree(tmp_path)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    real = shutil.which("cp")
+    (bin_dir / "cp").write_text(f'#!/bin/sh\n{real} "$@" && printf x >> "$2"\n')
+    (bin_dir / "cp").chmod(0o755)
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 1
+    assert "changed while uploading" in proc.stderr
+    assert _calls(state, "release", "upload") == []
+
+
+def test_mirror_upload_sends_the_staged_copy_not_the_source(tmp_path):
+    """The source changing after staging doesn't change what is uploaded."""
+    script, state, gh = _mirror_tree(tmp_path)
+    (state / "touch-source").write_text("")
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 0, proc.stderr
+    _assert_fetched_assets(state)
+
+
+@pytest.mark.parametrize("marker", ["view-fail-once", "api-fail-once"])
+def test_mirror_retries_a_gh_read_that_failed_once(tmp_path, marker):
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    for stem in FIXTURE_APKS:
+        _asset(state, stem)
+    (state / marker).write_text("")
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 0, proc.stderr
+    assert "HTTP 500" in proc.stderr or "HTTP 502" in proc.stderr
+    assert "trying again in 0s" in proc.stderr
+    call = ("release", "view") if marker.startswith("view") else ("api",)
+    assert len(_calls(state, *call)) == 2
+
+
+def test_mirror_upload_reads_a_lagging_listing_again(tmp_path):
+    """The first listing after the uploads shows nothing: the closing check
+    reads it once more and passes."""
+    script, state, gh = _mirror_tree(tmp_path)
+    (state / "lag").write_text("")
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 0, proc.stderr
+    assert "reading it again in 0s" in proc.stderr
+    assert "isn't in release" not in proc.stderr  # the lagging pass is quiet
+    assert "holds all 2 locked packages" in proc.stdout
+    assert len(_calls(state, "api")) == 3  # before, lagging, again
+
+
+def test_mirror_upload_looks_up_a_new_release_again_when_it_lags(tmp_path):
+    """A release created just now that `release view` doesn't find yet: the
+    closing check's second pass looks it up again, and passes."""
+    script, state, gh = _mirror_tree(tmp_path, release=False)
+    (state / "view-lag").write_text("")
+    proc = _run_mirror(script, state, gh, "upload")
+    assert proc.returncode == 0, proc.stderr
+    assert "2 uploaded" in proc.stdout
+    assert "reading it again in 0s" in proc.stderr
+    assert "holds all 2 locked packages" in proc.stdout
+    assert len(_calls(state, "release", "create")) == 1
+
+
+def test_mirror_check_downloads_the_first_file_anonymously(tmp_path):
+    """After the listing passes, one anonymous HEAD request at the fetch's
+    URL for the first locked file (here the stub's assets, a file:// URL)."""
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    for stem in FIXTURE_APKS:
+        _asset(state, stem)
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 0, proc.stderr
+    url = f"file://{state}/assets/{_sha('binutils-2.43.1-r3')}.apk"
+    [probe] = (state.parent / "guard/args").read_text().splitlines()
+    assert probe == f"-q -fsIL --retry 3 --retry-connrefused --max-time 20 -o /dev/null {url}"
+
+
+def test_mirror_check_probes_the_real_fetch_scripts_durable_mirror(tmp_path):
+    """The probe reads DURABLE_MIRROR out of the real, unmodified
+    tools/fetch-alpine-packages.sh (every other probe test rewrites that
+    line), so a reformatted line fails here rather than only in CI. The
+    curl stub answers the real github.com URL 404."""
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    shutil.copy2(REPO_ROOT / "tools/fetch-alpine-packages.sh", script.parent)
+    for stem in FIXTURE_APKS:
+        _asset(state, stem)
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    url = (
+        f"https://github.com/{MIRROR_REPO}/releases/download/{MIRROR_TAG}/"
+        f"{_sha('binutils-2.43.1-r3')}.apk"
+    )
+    assert f"is listed but not downloadable at {url}" in proc.stderr
+
+
+@pytest.mark.parametrize("sleep", ["2s", "0.5", "-1"])
+def test_mirror_refuses_a_retry_sleep_that_isnt_whole_seconds(tmp_path, sleep):
+    script, state, gh = _mirror_tree(tmp_path)
+    proc = _run_mirror(script, state, gh, "check", env={"LUMEN_GH_RETRY_SLEEP": sleep})
+    assert proc.returncode == 2
+    assert "LUMEN_GH_RETRY_SLEEP" in proc.stderr
+    assert _calls(state) == []
+
+
+def test_mirror_check_fails_a_release_listed_but_not_downloadable(tmp_path):
+    script, state, gh = _mirror_tree(tmp_path, fetched=False)
+    for stem in FIXTURE_APKS:
+        _asset(state, stem)
+    _set_durable_mirror(script.parent, f"file://{tmp_path}/nowhere/{{sha256}}.apk")
+    proc = _run_mirror(script, state, gh, "check")
+    assert proc.returncode == 1
+    assert "holds all 2 locked packages" in proc.stdout
+    url = f"file://{tmp_path}/nowhere/{_sha('binutils-2.43.1-r3')}.apk"
+    assert f"release {MIRROR_TAG} is listed but not downloadable at {url}" in proc.stderr
 
 
 # --- tools/mkrootfs-dev.sh on fixtures ---------------------------------------------------
@@ -1688,7 +2759,8 @@ def test_copy_dev_rootfs_leaves_no_partial_file_when_the_copy_fails(tmp_path, mo
 
 def test_make_deps_build_and_test_leave_the_dev_image_out():
     """deps-dev and rootfs-dev are their own targets; `make deps`, `build`
-    and `test` don't build the developer image (the gate issues wire CI)."""
+    and `test` don't build the developer image (CI runs its targets as steps
+    of their own)."""
     for target in ("deps", "build", "test"):
         # -B: every recipe printed, whatever is up to date.
         dry = subprocess.run(
@@ -1771,11 +2843,15 @@ def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer)
     assert "mkrootfs-dev.sh" in run("-W", newer)
 
 
-# --- The built image (skipped without build/alpine-dev.ext4) ------------------------------------
+# --- The built image (skipped locally without build/alpine-dev.ext4, failed in CI) -----------
 
-needs_image = pytest.mark.skipif(
-    not DEV_IMAGE.is_file(), reason=f"{DEV_IMAGE} not built (`make rootfs-dev`)"
-)
+
+@pytest.fixture
+def _dev_image():
+    _built_or_skip(DEV_IMAGE, DEV_IMAGE.is_file(), "make rootfs-dev")
+
+
+needs_image = pytest.mark.usefixtures("_dev_image")
 
 
 @needs_image
