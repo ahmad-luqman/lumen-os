@@ -4,3 +4,13 @@
 name = "Pipe buffer and PIPE_BUF rules (logic)"
 milestone = "M8"
 tests = ["cargo:lumen-pipe"]
+
+[[feature]]
+name = "Readiness interface (`PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`) and `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds (#374, B3)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::linux::syscall::poll::poll_masks_of_each_file_kind",
+    "ktest:lumen_kernel::linux::syscall::poll::poll_rechecks_after_a_wake",
+    "scenario:test_linux_io::test_poll_and_select_on_console",
+]

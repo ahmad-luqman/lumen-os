@@ -25,6 +25,7 @@ pub mod mount;
 pub mod nlink;
 pub mod ops;
 pub mod page;
+pub mod poll;
 pub mod procfs;
 pub mod pseudo;
 pub mod resolve;
@@ -47,6 +48,7 @@ pub use mount::{MountInfo, MountTable, VfsCacheOps, VfsTables};
 pub use ops::{
     Opened, link_at, mkdir_at, open_inode, open_inode_guarded, readlink_at, rename_at2, symlink_at, unlink_at,
 };
+pub use poll::{PollGuard, PollHead, PollMask, PollWaker, Pollable};
 pub use resolve::{
     Final, ParentTarget, ResolveFlags, ResolvedPath, check_access, compute_cwd_path, resolve_parent, resolve_path,
 };

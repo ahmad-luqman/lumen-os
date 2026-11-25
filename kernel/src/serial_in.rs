@@ -54,12 +54,14 @@
 #![cfg_attr(feature = "ktest", allow(dead_code))]
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use log::{debug, warn};
 use lumen_queue::ByteQueue;
 use lumen_uart::{MissedInterrupts, WaitEnd, WaitMode};
+use lumen_vfs::{PollGuard, PollMask, PollWaker};
 
 use crate::arch;
 use crate::arch::apic::{Polarity, Trigger};
@@ -67,6 +69,7 @@ use crate::interrupts;
 use crate::sched::WaitQueue;
 use crate::shell::Ctx;
 use crate::sync::SpinLock;
+use crate::vfs::KernelPollHead;
 
 /// The ISA IRQ COM1 interrupts on.
 const COM1_IRQ: u8 = 4;
@@ -81,6 +84,9 @@ const WAIT_NS: u64 = 100_000_000;
 static QUEUE: ByteQueue<QUEUE_SIZE> = ByteQueue::new();
 /// The serial shell waits here for a byte.
 static WAITING: WaitQueue = WaitQueue::new();
+/// Readiness subscribers waiting on `/dev/console` serial input (`poll`/`select`,
+/// B3; replaced by `Tty` in C10).
+static POLL_HEAD: SpinLock<Option<KernelPollHead>> = SpinLock::new(None);
 /// Whether IRQ 4 brings the bytes (else the shell polls).
 static BY_INTERRUPT: AtomicBool = AtomicBool::new(false);
 /// IRQ 4's GSI and vector, once routed (for `serial` and the warning).
@@ -135,6 +141,7 @@ pub fn init() {
         return;
     }
     arch::serial::enable_rx_interrupt();
+    let _ = poll_head();
     BY_INTERRUPT.store(true, Ordering::Release);
     interrupts::set_masked(route, false);
     {
@@ -171,10 +178,43 @@ fn queue_waiting() -> usize {
         let fit = QUEUE.push(b);
         debug_assert!(fit, "drained only as much as the queue has room for");
     });
-    if queued > 0 && WAITING.wake_all() > 0 {
-        READER_WOKEN.fetch_add(1, Ordering::Relaxed);
+    if queued > 0 {
+        if WAITING.wake_all() > 0 {
+            READER_WOKEN.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(head) = POLL_HEAD.lock().as_ref() {
+            head.notify(PollMask::IN | PollMask::RDNORM);
+        }
     }
     queued
+}
+
+fn poll_head() -> KernelPollHead {
+    let mut slot = POLL_HEAD.lock();
+    if let Some(head) = slot.as_ref() {
+        return head.clone();
+    }
+    let head = KernelPollHead::new();
+    *slot = Some(head.clone());
+    head
+}
+
+/// Subscribe `waker` to serial input arrivals until the returned [`PollGuard`] drops.
+pub fn subscribe_poll(waker: Arc<dyn PollWaker>) -> PollGuard {
+    let head = poll_head();
+    head.subscribe(waker)
+}
+
+/// Whether COM1 input arrives via IRQ 4 (else `poll` falls back to short timed rechecks).
+pub fn by_interrupt() -> bool {
+    BY_INTERRUPT.load(Ordering::Acquire)
+}
+
+/// Number of active `PollHead` subscribers on serial input (ktests and C6).
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+pub fn poll_subscribers() -> usize {
+    let head = POLL_HEAD.lock().clone();
+    head.map_or(0, |h| h.subscriber_count())
 }
 
 /// Whether a byte waits for [`read_byte`], in the queue or the UART.

@@ -3638,6 +3638,7 @@ struct TestLocks;
 
 impl LockFamily for TestLocks {
     type Lock<T> = TestLock<T>;
+    type LeafLock<T: Send> = StdLock<T>;
 }
 
 /// The kernel's own Lock-9 tables (`VfsTables`) over [`TestLock`]s.

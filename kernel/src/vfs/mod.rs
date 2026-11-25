@@ -46,7 +46,7 @@ use lumen_vfs::{
 };
 
 use crate::shell::{Ctx, sysinfo, write_in_chunks};
-use crate::sync::{SleepMutex, SleepMutexGuard};
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock, SpinLockGuard};
 
 /// Kernel `VfsLock` backed by [`SleepMutex`]: Lock 2, and Lock 9 through
 /// [`KernelLocks`].
@@ -80,12 +80,40 @@ impl<T> KernelVfsLock<T> {
     }
 }
 
-/// The kernel's [`LockFamily`]: [`KernelVfsLock`] (`SleepMutex`).
+/// Kernel leaf `VfsLock` backed by [`SpinLock`]: section 9's level-10 `e`
+/// (`PollHead`'s subscriber list).
+pub struct KernelLeafLock<T>(SpinLock<T>);
+
+impl<T> VfsLock<T> for KernelLeafLock<T> {
+    type Guard<'a>
+        = SpinLockGuard<'a, T>
+    where
+        T: 'a;
+
+    fn new(val: T) -> Self {
+        Self(SpinLock::new(val))
+    }
+
+    fn lock(&self) -> Self::Guard<'_> {
+        self.0.lock()
+    }
+
+    fn get_mut(&mut self) -> &mut T {
+        self.0.get_mut()
+    }
+}
+
+/// The kernel's [`LockFamily`]: [`KernelVfsLock`] (`SleepMutex`) for Lock-9
+/// tables and [`KernelLeafLock`] (`SpinLock`) for level-10 `e` leaf structures.
 pub struct KernelLocks;
 
 impl LockFamily for KernelLocks {
     type Lock<T> = KernelVfsLock<T>;
+    type LeafLock<T: Send> = KernelLeafLock<T>;
 }
+
+/// The kernel's [`lumen_vfs::PollHead`] over [`SpinLock`].
+pub type KernelPollHead = lumen_vfs::PollHead<KernelLocks>;
 
 /// The kernel's Lock-9 VFS lookup tables: lumen-vfs's [`VfsTables`] (the
 /// ones its host tests run) over `SleepMutex`.

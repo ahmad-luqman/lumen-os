@@ -32,12 +32,14 @@ pub trait VfsLock<T> {
 }
 
 /// A family of [`VfsLock`]s, one lock type for any `T`: what
-/// [`VfsTables`](crate::VfsTables) is generic over (#264). The kernel's is
-/// `vfs::KernelLocks` (`SleepMutex`); the host tests' is `TestLocks`, a
-/// `std` mutex recording which Lock-9 tables a thread holds and aborting
-/// the test binary on an out-of-order or repeated take.
+/// [`VfsTables`](crate::VfsTables) and [`PollHead`](crate::PollHead) are
+/// generic over (#264, #374). `Lock` is the sleeping mutex for Lock-9 tables
+/// (the kernel's `SleepMutex`; the host tests' `TestLock`). `LeafLock` is the
+/// leaf lock for level-10 `e` structures like `PollHead`'s subscriber list
+/// (the kernel's `SpinLock`; the host tests' `std` mutex).
 pub trait LockFamily {
     type Lock<T>: VfsLock<T>;
+    type LeafLock<T: Send>: VfsLock<T> + Send + Sync;
 }
 
 /// Zero-`unsafe` single-threaded `VfsLock` backed by `core::cell::RefCell`.
