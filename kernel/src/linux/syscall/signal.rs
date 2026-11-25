@@ -1,7 +1,11 @@
 //! Signals (M8's cluster, ARCHITECTURE section 8, "B0's stubs"): M6's
-//! `rt_sigaction` and `rt_sigprocmask`, moved here from `proc` unchanged.
+//! `rt_sigaction` and `rt_sigprocmask`, moved here from `proc` unchanged;
+//! and M8's `rt_sigreturn`, `rt_sigpending`, `rt_sigtimedwait`,
+//! `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigsuspend`, `sigaltstack`,
+//! `kill`, `tkill`, `tgkill`, `pause`, `restart_syscall`.
 
-use super::{copy_pod_from_user, copy_pod_to_user, neg_errno};
+use super::at::UserPtr;
+use super::{copy_pod_from_user, copy_pod_to_user, neg_errno, not_implemented};
 use crate::linux::process::{KernelSigaction, with_current, with_current_mut};
 use crate::linux::{errno, general};
 use crate::user::{copy_from_user, copy_to_user};
@@ -79,4 +83,64 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u6
         with_current_mut(|p| p.sigmask = updated & !UNBLOCKABLE_SIGS);
     }
     0
+}
+
+/// `rt_sigreturn()` (15): M8 stub, replaced by C5 (#384).
+pub(super) fn sys_rt_sigreturn() -> u64 {
+    not_implemented(general::__NR_rt_sigreturn)
+}
+
+/// `rt_sigpending(set, sigsetsize)` (127): M8 stub, replaced by C6 (#385).
+pub(super) fn sys_rt_sigpending(_set: UserPtr, _sigsetsize: u64) -> u64 {
+    not_implemented(general::__NR_rt_sigpending)
+}
+
+/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` (128): M8 stub, replaced by C6 (#385).
+pub(super) fn sys_rt_sigtimedwait(_set: UserPtr, _info: UserPtr, _timeout: UserPtr, _sigsetsize: u64) -> u64 {
+    not_implemented(general::__NR_rt_sigtimedwait)
+}
+
+/// `rt_sigqueueinfo(tgid, sig, info)` (129): M8 stub, replaced by C5 (#384).
+pub(super) fn sys_rt_sigqueueinfo(_tgid: i32, _sig: i32, _info: UserPtr) -> u64 {
+    not_implemented(general::__NR_rt_sigqueueinfo)
+}
+
+/// `rt_tgsigqueueinfo(tgid, tid, sig, info)` (297): M8 stub, replaced by C5 (#384).
+pub(super) fn sys_rt_tgsigqueueinfo(_tgid: i32, _tid: i32, _sig: i32, _info: UserPtr) -> u64 {
+    not_implemented(general::__NR_rt_tgsigqueueinfo)
+}
+
+/// `rt_sigsuspend(mask, sigsetsize)` (130): M8 stub, replaced by C6 (#385).
+pub(super) fn sys_rt_sigsuspend(_mask: UserPtr, _sigsetsize: u64) -> u64 {
+    not_implemented(general::__NR_rt_sigsuspend)
+}
+
+/// `sigaltstack(ss, old_ss)` (131): M8 stub, replaced by C5 (#384).
+pub(super) fn sys_sigaltstack(_ss: UserPtr, _old_ss: UserPtr) -> u64 {
+    not_implemented(general::__NR_sigaltstack)
+}
+
+/// `kill(pid, sig)` (62): M8 stub, replaced by C5 (#384) and C8 (#387).
+pub(super) fn sys_kill(_pid: i32, _sig: i32) -> u64 {
+    not_implemented(general::__NR_kill)
+}
+
+/// `tkill(tid, sig)` (200): M8 stub, replaced by C5 (#384).
+pub(super) fn sys_tkill(_tid: i32, _sig: i32) -> u64 {
+    not_implemented(general::__NR_tkill)
+}
+
+/// `tgkill(tgid, tid, sig)` (234): M8 stub, replaced by C5 (#384).
+pub(super) fn sys_tgkill(_tgid: i32, _tid: i32, _sig: i32) -> u64 {
+    not_implemented(general::__NR_tgkill)
+}
+
+/// `pause()` (34): M8 stub, replaced by C6 (#385).
+pub(super) fn sys_pause() -> u64 {
+    not_implemented(general::__NR_pause)
+}
+
+/// `restart_syscall()` (219): M8 stub, replaced by B2 (#373).
+pub(super) fn sys_restart_syscall() -> u64 {
+    not_implemented(general::__NR_restart_syscall)
 }

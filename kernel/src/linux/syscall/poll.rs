@@ -1,12 +1,14 @@
 //! Readiness (M8's cluster, ARCHITECTURE section 8, "B0's stubs"): M6's
-//! `poll`, moved here from `fd` unchanged.
+//! `poll`, moved here from `fd` unchanged; and M8's `select`, `pselect6`,
+//! `ppoll`.
 
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
+use super::at::UserPtr;
 use super::fd::current_io;
-use super::{DEFAULT_RLIMIT_NOFILE, neg_errno};
+use super::{DEFAULT_RLIMIT_NOFILE, neg_errno, not_implemented};
 use crate::linux::process::{self, FileRef};
 use crate::linux::{errno, general};
 use crate::sched;
@@ -147,4 +149,26 @@ pub(super) fn sys_poll(fds_ptr: u64, nfds: u64, timeout_raw: u64) -> u64 {
         return neg_errno(e.to_errno());
     }
     ready
+}
+
+/// `select(n, readfds, writefds, exceptfds, tv)` (23): M8 stub, replaced by B3 (#374).
+pub(super) fn sys_select(_n: i32, _readfds: UserPtr, _writefds: UserPtr, _exceptfds: UserPtr, _tv: UserPtr) -> u64 {
+    not_implemented(general::__NR_select)
+}
+
+/// `pselect6(n, readfds, writefds, exceptfds, tsp, sig)` (270): M8 stub, replaced by B3 (#374) and C6 (#385).
+pub(super) fn sys_pselect6(
+    _n: i32,
+    _readfds: UserPtr,
+    _writefds: UserPtr,
+    _exceptfds: UserPtr,
+    _tsp: UserPtr,
+    _sig: UserPtr,
+) -> u64 {
+    not_implemented(general::__NR_pselect6)
+}
+
+/// `ppoll(fds, nfds, tsp, sigmask, sigsetsize)` (271): M8 stub, replaced by B3 (#374) and C6 (#385).
+pub(super) fn sys_ppoll(_fds: UserPtr, _nfds: u32, _tsp: UserPtr, _sigmask: UserPtr, _sigsetsize: u64) -> u64 {
+    not_implemented(general::__NR_ppoll)
 }
