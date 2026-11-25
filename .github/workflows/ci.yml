@@ -46,10 +46,17 @@ jobs:
             . -> target
             apps -> ../target-apps
 
+      # Only tools/fetch-deps.sh's own downloads: the zig and libc-test
+      # sources and the developer image's packages have entries of their own
+      # (below), so no file sits in two entries.
       - name: Cache boot and userspace dependencies (Limine, OVMF, busybox, Alpine minirootfs)
         uses: actions/cache@v6
         with:
-          path: build/deps
+          path: |
+            build/deps
+            !build/deps/zig
+            !build/deps/libc-test
+            !build/deps/alpine-packages
           key: deps-${{ hashFiles('tools/fetch-deps.sh') }}
 
       - run: make deps
@@ -89,6 +96,37 @@ jobs:
       - name: Build musl libc-test with the pinned zig
         timeout-minutes: 10
         run: make libc-test
+      # The Alpine developer image (#344) for M8's gates: its packages
+      # (tools/alpine-packages.lock) in the same four steps as above, keyed on
+      # the lock (the fetch keeps exactly the lock's files); the image itself
+      # is rebuilt from them every run (about 5 s), not cached. A cold cache
+      # fetches from dl-cdn, then the durable mirror for a build dl-cdn
+      # dropped (tools/fetch-alpine-packages.sh).
+      - name: Restore the Alpine developer image's packages
+        id: apk-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/deps/alpine-packages
+          key: alpine-packages-${{ hashFiles('tools/alpine-packages.lock') }}
+      - name: Fetch the Alpine developer image's packages
+        id: apk-fetch
+        timeout-minutes: 15
+        run: make deps-dev
+      - name: Save the Alpine developer image's packages
+        if: steps.apk-fetch.outcome == 'success' && steps.apk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: build/deps/alpine-packages
+          key: ${{ steps.apk-cache.outputs.cache-primary-key }}
+      # The durable mirror holds every locked package, so a lock change can't
+      # merge until its files are mirrored (tools/mirror-alpine-packages.sh
+      # upload). Reads the release's asset names only.
+      - name: Check the durable mirror holds every locked package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/mirror-alpine-packages.sh check
+      - name: Build the Alpine developer image
+        run: make rootfs-dev
       - run: make test-host
       - name: QEMU scenarios (boot, crash reports, in-kernel tests, golden images)
         id: scenarios

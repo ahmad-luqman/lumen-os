@@ -231,8 +231,8 @@ clean: ## Remove build outputs (keeps downloaded deps)
 
 # The Alpine developer image (#344): the minirootfs plus the closure of
 # gcc, g++, make, musl-dev, binutils, git, sqlite and vim pinned in
-# tools/alpine-packages.lock. Not part of `make deps`, `build` or `test`; M8's
-# gate issues wire it into CI.
+# tools/alpine-packages.lock. Not part of `make deps`, `build` or `test`; CI
+# runs both targets as steps of their own (ci.yml, its packages cached).
 # deps-dev always runs the fetch (it skips files already verified), so it
 # also repairs a deleted or corrupt .apk; the stamp orders the image after a
 # fetch of the current lock, and deps-dev rewrites it only when the lock

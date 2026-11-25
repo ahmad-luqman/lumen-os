@@ -10,9 +10,18 @@
 # directory's .apk files are exactly the lock's (what CI caches, besides the
 # Makefile's stamp).
 #
-# Mirrors: LUMEN_APK_MIRROR, a list split on spaces or newlines, tried in order, then
-# LUMEN_APK_CDN (dl-cdn's https://dl-cdn.alpinelinux.org/alpine unless set;
-# the harness's tests point it at a local directory). An entry is either a
+# Sources, tried in this order for each file until one gives the locked sha256:
+#   1. LUMEN_APK_MIRROR: a list split on spaces or newlines, tried in order
+#      (empty unless set: a local or faster mirror to prefer);
+#   2. LUMEN_APK_CDN (dl-cdn's https://dl-cdn.alpinelinux.org/alpine unless
+#      set; the harness's tests point it at a local directory);
+#   3. LUMEN_APK_FALLBACK: a list like LUMEN_APK_MIRROR's, unset meaning the
+#      durable mirror, DURABLE_MIRROR below (set it empty for none): every
+#      locked file as an asset of the repository's `alpine-apk-mirror`
+#      release, named by its sha256 (tools/mirror-alpine-packages.sh keeps it
+#      complete, and CI's check fails a lock it doesn't hold).
+# Every file is sha256-checked against the lock whichever source served it.
+# An entry is either a
 # base URL laid out as Alpine's mirrors are (<base>/v3.21/<repo>/x86_64/<file>),
 # or a template for a flat directory holding `{file}` (the .apk's name) or
 # `{sha256}` (its locked sha256, for a store that renames names with `+`, as
@@ -27,10 +36,9 @@
 # a branch, so a locked `name-1.2-r3.apk` disappears once `-r4` lands
 # (tools/fetch-deps.sh's busybox has the same problem). The strategy:
 #   1. CI restores build/deps/alpine-packages/ from actions/cache, keyed by
-#      the lockfile's hash (wired by the gate issues); a warm cache never
-#      downloads, so a dropped file breaks only a cold cache.
-#   2. A durable mirror in LUMEN_APK_MIRROR (proposed in #344's PR: the
-#      locked files as a GitHub release's assets; not created yet).
+#      the lockfile's hash; a warm cache never downloads.
+#   2. The durable mirror, tried after dl-cdn (LUMEN_APK_FALLBACK above), so a
+#      dropped file still comes back on a cold cache.
 #   3. When every mirror answers that a file isn't there, this script fails,
 #      naming it and saying to re-run tools/alpine-lock.py, which re-resolves
 #      against the current index and rewrites the lock (its own PR, like any
@@ -42,6 +50,9 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 LOCK="$ROOT/tools/alpine-packages.lock"
 DIR="$ROOT/build/deps/alpine-packages"
 CDN=${LUMEN_APK_CDN:-https://dl-cdn.alpinelinux.org/alpine}
+# tools/mirror-alpine-packages.sh uploads to this release (its REPO and TAG);
+# tests/harness/test_rootfs_dev.py checks the two agree.
+DURABLE_MIRROR='https://github.com/ahmad-luqman/lumen-os/releases/download/alpine-apk-mirror/{sha256}.apk'
 
 sha256() {
     if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
@@ -70,6 +81,9 @@ url() {
 MIRRORS=()
 read -r -d '' -a MIRRORS <<< "${LUMEN_APK_MIRROR:-}" || true
 MIRRORS+=("$CDN")
+FALLBACK=()
+read -r -d '' -a FALLBACK <<< "${LUMEN_APK_FALLBACK-$DURABLE_MIRROR}" || true
+MIRRORS+=(${FALLBACK[@]+"${FALLBACK[@]}"})
 for mirror in "${MIRRORS[@]}"; do
     rest=${mirror//\{file\}/}
     rest=${rest//\{sha256\}/}

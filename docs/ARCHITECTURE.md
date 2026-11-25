@@ -10871,20 +10871,28 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   dl-cdn on #344's Linux host, 49 minutes on a slow route from macOS).
   Since #369, `ci.yml` caches the pinned zig and libc-test sources in an
   entry of their own, in four steps: restore; fetch; save only after a
-  successful fetch on a miss; build. To be added, by the durable-mirror
-  PR before D2, D3 and D4 merge: an `actions/cache` entry for
-  `build/deps/alpine-packages/` keyed on
+  successful fetch on a miss; build. The developer image's packages have
+  their own entry the same way (the durable-mirror PR, before D2, D3 and
+  D4): `build/deps/alpine-packages/` keyed on
   `hashFiles('tools/alpine-packages.lock')`, in the same four steps
-  (restore, `make deps-dev`, save, `make rootfs-dev`), and exclusions in
-  the existing `build/deps` entry (`!build/deps/alpine-packages`,
-  `!build/deps/zig`, `!build/deps/libc-test`) so no file sits in two
-  entries. The image itself is not cached: it is rebuilt from the packages
-  on every run in about 5 s. The cache is not a durable source: Alpine
-  drops a superseded `-rN` package from dl-cdn, and an evicted cache entry
-  would then fail the fetch. The durable mirror (each locked `.apk` as a
-  release asset named by its sha256, the fetch trying dl-cdn first and the
-  mirror second, every file sha256-checked whichever source served it)
-  lands in that PR.
+  (restore, `make deps-dev`, save, `make rootfs-dev`), and the existing
+  `build/deps` entry excludes the others' directories
+  (`!build/deps/alpine-packages`, `!build/deps/zig`,
+  `!build/deps/libc-test`) so no file sits in two entries. The image itself
+  is not cached: it is rebuilt from the packages on every run in about
+  5 s, so `test_rootfs_dev`'s tests of the built image run in CI too. The
+  cache is not a durable source: Alpine drops a superseded `-rN` package
+  from dl-cdn, and an evicted cache entry would then fail the fetch. The
+  durable mirror is the repository's `alpine-apk-mirror` release, every
+  locked `.apk` an asset named `<sha256>.apk`, assets never replaced or
+  deleted (an older lock's files stay fetchable).
+  `tools/fetch-alpine-packages.sh` tries `LUMEN_APK_MIRROR` (empty unless
+  set), then dl-cdn, then `LUMEN_APK_FALLBACK` (unset: the release), every
+  file sha256-checked whichever source served it.
+  `tools/mirror-alpine-packages.sh upload` fills the release from
+  `build/deps/alpine-packages/` (the lead runs it in a lock-changing PR),
+  and CI runs its `check`, which reads the release's asset names and fails
+  naming each locked file it lacks, so a lock can't merge unmirrored.
 - **libc-test (D4; zig pinned by #368, the build and harness by #369).**
   `make libc-test` builds libc-test's `src/functional` and `src/regression`,
   static and dynamic, with the pinned zig into `build/libc-test/` (284
