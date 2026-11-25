@@ -239,7 +239,7 @@ tests = [
 ]
 
 [[feature]]
-name = "The M8 syscall table, pinned from #337's census (#371): ARCHITECTURE section 8's M8 rows by number (M8_SYSCALLS: the 60 numbers M8 adds, each dispatched), M8's flags, codes, errnos and struct layouts (siginfo and each kind's fields, stack_t, sigevent, itimerval, rusage, sysinfo, statfs, robust_list_head, fd_set) against linux-raw-sys, and every census syscall in M6_SYSCALLS, M7_SYSCALLS or M8_SYSCALLS or -ENOSYS by a recorded decision (section 8's list, ENOSYS_BY_DECISION); every dispatch arm passing its signature's registers in order to the handler named after its syscall, and every M8 stub returning only -ENOSYS for its own number, its doc naming the issue that replaces it"
+name = "The M8 syscall table, pinned from #337's census (#371): ARCHITECTURE section 8's M8 rows by number (M8_SYSCALLS: the 60 numbers M8 adds, each dispatched), M8's flags, codes, errnos and struct layouts (siginfo and each kind's fields, stack_t, sigevent, itimerval, rusage, sysinfo, statfs, robust_list_head, fd_set) against linux-raw-sys, and every census syscall in M6_SYSCALLS, M7_SYSCALLS or M8_SYSCALLS or -ENOSYS by a recorded decision (section 8's list, ENOSYS_BY_DECISION); every dispatch arm (but M6's two inline ones) passing its first argument registers in order to the handler named after its syscall, an M8 syscall's arm its own and reading Linux's argument count, and every M8 stub (its doc says so) returning only -ENOSYS for its own number, its doc naming the issues the design's table names for it"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::linux::m8_abi_constants_match_spec",

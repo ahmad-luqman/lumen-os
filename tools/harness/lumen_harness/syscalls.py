@@ -523,8 +523,8 @@ def dispatched(dispatch_rs: str) -> set[str]:
     count. A `general::__NR_` anywhere else, or no arms at all, is a
     `CensusError`: the arms changed shape, and the report would quietly call
     implemented syscalls unplanned."""
+    names = {n for arm in dispatch_arms(dispatch_rs) for n in arm.names}
     code = re.sub(r"//[^\n]*", "", dispatch_rs)
-    names = {n for arm in _ARM.findall(code) for n in re.findall(r"__NR_(\w+)", arm)}
     if stray := sorted(set(re.findall(r"general::__NR_(\w+)", _ARM.sub("", code)))):
         raise CensusError(f"general::__NR_ outside an arm the report can read: {', '.join(stray)}")
     if not names:
@@ -534,6 +534,38 @@ def dispatched(dispatch_rs: str) -> set[str]:
 
 # The registers a syscall's arguments arrive in, in order (the x86-64 ABI).
 ARG_REGISTERS = ("rdi", "rsi", "rdx", "r10", "r8", "r9")
+
+# How many arguments each of M8_SYSCALLS takes: Linux's x86-64 signatures
+# (`SYSCALL_DEFINE<n>`), so its arm reads that many registers.
+# fmt: off
+M8_ARGS: dict[str, int] = {
+    # task
+    "clone": 5, "fork": 0, "vfork": 0, "execve": 3, "wait4": 4, "waitid": 5, "setpgid": 2,
+    "setsid": 0, "getpgid": 1, "getsid": 1,
+    # signal
+    "rt_sigreturn": 0, "rt_sigpending": 2, "rt_sigtimedwait": 4, "rt_sigqueueinfo": 3,
+    "rt_tgsigqueueinfo": 4, "rt_sigsuspend": 2, "sigaltstack": 2, "kill": 2, "tkill": 2,
+    "tgkill": 3, "pause": 0, "restart_syscall": 0,
+    # futex
+    "futex": 6, "set_robust_list": 2, "get_robust_list": 3, "nanosleep": 2,
+    "clock_nanosleep": 4,
+    # poll
+    "poll": 3, "select": 5, "pselect6": 6, "ppoll": 5,
+    # pipe
+    "pipe": 1, "pipe2": 2, "dup": 1, "dup2": 2, "dup3": 3, "mknod": 3, "mknodat": 4,
+    # timer
+    "alarm": 1, "getitimer": 2, "setitimer": 3, "timer_create": 3, "timer_settime": 4,
+    "timer_gettime": 2, "timer_getoverrun": 1, "timer_delete": 1,
+    # sys
+    "sched_yield": 0, "sched_setaffinity": 3, "sched_getaffinity": 3, "getpriority": 2,
+    "setpriority": 3, "getrusage": 2, "sysinfo": 1, "prctl": 5, "statfs": 2, "fstatfs": 2,
+    "clock_getres": 2, "getcpu": 3, "setfsuid": 1, "setfsgid": 1,
+}
+# fmt: on
+
+# The arms written inline in `dispatch`, calling no handler (M6's), by their
+# first syscall.
+INLINE_ARMS = frozenset({"getuid", "getpgrp"})
 
 
 @dataclass(frozen=True)
@@ -553,11 +585,13 @@ def dispatch_arms(dispatch_rs: str) -> list[Arm]:
     out."""
     code = re.sub(r"//[^\n]*", "", dispatch_rs)
     found = list(_ARM.finditer(code))
+    regs = "|".join(ARG_REGISTERS)
     arms = []
     for i, m in enumerate(found):
-        end = found[i + 1].start() if i + 1 < len(found) else len(code)
-        body = re.split(r"\n\s*_\s*=>", code[m.end() : end])[0]
-        regs = "|".join(ARG_REGISTERS)
+        if i + 1 < len(found):
+            body = code[m.end() : found[i + 1].start()]
+        else:
+            body = re.split(r"\n\s*_\s*=>", code[m.end() :])[0]
         arms.append(
             Arm(
                 names=tuple(re.findall(r"__NR_(\w+)", m.group(1))),
@@ -569,71 +603,120 @@ def dispatch_arms(dispatch_rs: str) -> list[Arm]:
 
 
 def arm_problems(arms: Iterable[Arm]) -> list[str]:
-    """What's wrong with the arms: one calling a handler not named after the
-    first syscall of its pattern (`sys_<name>`), or more than one, or reading
-    argument registers other than the first few in order (ARCHITECTURE
-    section 8: each arm passes its signature's registers, in order). An arm
-    with no handler (written inline, M6's `getuid`) is only checked for the
-    registers."""
+    """What's wrong with the arms (ARCHITECTURE section 8: each arm passes its
+    signature's registers, in order, to its handler):
+    - one calling a handler not named after the first syscall of its pattern
+      (`sys_<name>`), or more than one, or none (but `INLINE_ARMS`);
+    - one reading argument registers other than the first few in order;
+    - an M8 syscall's (`M8_ARGS`) reading other than its argument count, or
+      sharing its arm."""
     problems = []
     for arm in arms:
         first = arm.names[0]
-        if arm.handlers and arm.handlers != (f"sys_{first}",):
-            problems.append(f"{first}: calls {', '.join(arm.handlers)}")
+        if arm.handlers != (f"sys_{first}",) and not (not arm.handlers and first in INLINE_ARMS):
+            problems.append(f"{first}: calls {', '.join(arm.handlers) or 'no handler'}")
         if arm.registers != ARG_REGISTERS[: len(arm.registers)]:
             problems.append(f"{first}: reads {', '.join(arm.registers)}")
+        elif first in M8_ARGS and len(arm.registers) != M8_ARGS[first]:
+            problems.append(f"{first}: reads {len(arm.registers)} registers, not {M8_ARGS[first]}")
+        if len(arm.names) > 1 and set(arm.names) & M8_ARGS.keys():
+            problems.append(f"{first}: shares its arm with {', '.join(arm.names[1:])}")
     return problems
 
 
 # A handler in a cluster file (kernel/src/linux/syscall/*.rs): its doc lines,
 # its name and its body, which ends at the first `}` in column 0.
 _HANDLER = re.compile(
-    r"((?:^[ \t]*///[^\n]*\n)*)^pub\(super\) fn (sys_\w+)\(.*?\)[^{;]*\{\n(.*?)^\}",
+    r"((?:^[ \t]*///[^\n]*\n)*)^(?:pub(?:\([\w ]+\))? )?fn (sys_\w+)\(.*?\)[^{;]*\{\n(.*?)^\}",
     re.DOTALL | re.MULTILINE,
 )
-# An M8 stub's doc names the issue(s) replacing it: "replaced by C7 (#386)."
-_REPLACED_BY = re.compile(r"replaced by [^.]*\(#\d+\)")
+# What marks a handler as an M8 stub: its doc, "M8 stub, replaced by C7 (#386)."
+STUB_MARK = "M8 stub"
+# The issues a stub's doc names: "replaced by C1 (#380) and C3 (#382)."
+_REPLACED_BY = re.compile(r"replaced by ([^.]*)\.")
+_ISSUE = re.compile(r"\b([BCD]\d+) \(#(\d+)\)")
 
 
 @dataclass(frozen=True)
 class Stub:
-    """A handler whose body calls `not_implemented` (an M8 stub): the syscall
-    it is named after, its doc and its body, whitespace collapsed."""
+    """An M8 stub (its doc says `STUB_MARK`): its doc's text without the `///`
+    markers, and its body, whitespace collapsed."""
 
-    name: str
     doc: str
     body: str
 
 
 def stubs(cluster_sources: Iterable[str]) -> dict[str, Stub]:
-    """The stubs in the cluster files' sources, by syscall."""
+    """The M8 stubs in the cluster files' sources, by syscall. A `fn sys_*`
+    this can't read (a one-line body, say) is a `CensusError`: a stub could
+    hide there."""
     found = {}
     for source in cluster_sources:
-        for doc, fn, body in _HANDLER.findall(source):
-            if "not_implemented" in body:
-                name = fn.removeprefix("sys_")
-                found[name] = Stub(name, " ".join(doc.split()), " ".join(body.split()))
+        read = _HANDLER.findall(source)
+        if len(read) != len(re.findall(r"\bfn sys_\w+", source)):
+            names = sorted(set(re.findall(r"\bfn (sys_\w+)", source)) - {fn for _, fn, _ in read})
+            raise CensusError(f"a handler of a shape this can't read: {', '.join(names) or '?'}")
+        for doc, fn, body in read:
+            text = " ".join(re.sub(r"^[ \t]*///", "", doc, flags=re.MULTILINE).split())
+            if STUB_MARK in text:
+                found[fn.removeprefix("sys_")] = Stub(text, " ".join(body.split()))
     return found
 
 
-def stub_problems(found: dict[str, Stub]) -> list[str]:
+def stub_problems(
+    found: dict[str, Stub], design: dict[str, tuple[str, ...]], issues: dict[str, int]
+) -> list[str]:
     """What's wrong with the stubs: a body that does more than return
     `not_implemented(general::__NR_<its name>)` (as `frame.rax` for one that
-    returns through the frame), or a doc not naming the issue that replaces
-    it ("replaced by C7 (#386)")."""
+    returns through the frame), or a doc not naming exactly the issues the
+    design's table names for it (`design`, from `design_issues`), each with
+    its number (`issues`: label to GitHub issue)."""
     problems = []
     for name, stub in found.items():
         call = f"not_implemented(general::__NR_{name})"
         if stub.body not in (call, f"frame.rax = {call}; SyscallReturn::Sysret"):
             problems.append(f"{name}: body {stub.body!r}")
-        if not _REPLACED_BY.search(stub.doc):
-            problems.append(f"{name}: its doc names no issue replacing it")
+        clause = _REPLACED_BY.search(stub.doc)
+        named = tuple(_ISSUE.findall(clause.group(1))) if clause else ()
+        want = tuple((label, str(issues.get(label, "?"))) for label in design.get(name, ()))
+        if not named or named != want:
+            said = ", ".join(f"{label} (#{n})" for label, n in named) or "none"
+            problems.append(f"{name}: its doc names {said}, the design {want or 'no row'}")
     return problems
 
 
 def cluster_sources(syscall_dir: Path) -> list[str]:
     """The sources of `kernel/src/linux/syscall/`'s files."""
     return [f.read_text() for f in sorted(syscall_dir.glob("*.rs"))]
+
+
+# A row of ARCHITECTURE section 8's M8 syscall table: `| 122, 123 |
+# \`setfsuid(uid)\`, \`setfsgid(gid)\` | <its rules> | C12 |`, a `|` inside a
+# cell escaped (`\|`).
+_DESIGN_ROW = re.compile(r"^\| *\d+(?:, *\d+)* *\|.*\| *$", re.MULTILINE)
+
+
+def design_issues(architecture_md: str) -> dict[str, tuple[str, ...]]:
+    """The issues ARCHITECTURE section 8's M8 syscall table names for each of
+    its syscalls (its last column; `—` none), by syscall. A row whose numbers
+    and names disagree is a `CensusError`."""
+    start = architecture_md.find("#### M8 processes")
+    if start < 0:
+        raise CensusError("no M8 syscall table in ARCHITECTURE.md")
+    end = architecture_md.find("\n#### ", start + 1)
+    rows: dict[str, tuple[str, ...]] = {}
+    for line in _DESIGN_ROW.findall(architecture_md[start:end]):
+        cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)[1:-1]]
+        nrs, cell, labels = cells[0], cells[1], cells[-1]
+        names = re.findall(r"`(\w+)[(`]", cell)
+        numbers = [int(n) for n in nrs.split(",")]
+        if [X86_64.get(n) for n in names] != numbers:
+            raise CensusError(f"M8 table: row {nrs} names {', '.join(names)}")
+        for name in names:
+            rows[name] = tuple(re.findall(r"[BCD]\d+", labels))
+    if not rows:
+        raise CensusError("no rows in ARCHITECTURE.md's M8 syscall table")
+    return rows
 
 
 # The kernel's syscall tables (kernel/src/linux/mod.rs): `pub const M6_SYSCALLS:
@@ -716,8 +799,8 @@ def report(data: dict, implemented: set[str], verbose: bool = False) -> str:
             out += ["", f"{cls} ({len(rows[cls])}):", *rows[cls]]
     out += [
         "",
-        "implemented: the kernel dispatches the number to a handler (an M8 stub returning",
-        "-ENOSYS until its issue lands is listed under its milestone); neither the arguments",
+        "implemented: the kernel dispatches the number (an M8 stub returning -ENOSYS until",
+        "its issue lands is listed under its milestone); neither the arguments",
         "seen nor the semantics (a thread's exit, each ioctl request) are checked. ENOSYS:",
         "-ENOSYS by a decision ARCHITECTURE section 8 records (ENOSYS_BY_DECISION).",
         "ERESTART* errors: the kernel's restart codes, where a signal interrupted the call;",
