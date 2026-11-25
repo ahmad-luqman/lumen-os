@@ -2306,6 +2306,10 @@ pub(crate) struct KtestThread<R> {
 
 #[cfg(feature = "ktest")]
 impl<R> KtestThread<R> {
+    pub(crate) fn thread(&self) -> &sched::Thread {
+        self.handle.thread()
+    }
+
     pub(crate) fn finished(&self) -> bool {
         self.handle.is_finished()
     }

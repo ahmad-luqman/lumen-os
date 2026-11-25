@@ -80,8 +80,8 @@ impl<T> KernelVfsLock<T> {
     }
 }
 
-/// Kernel leaf `VfsLock` backed by [`SpinLock`]: section 9's level-10 `e`
-/// (`PollHead`'s subscriber list).
+/// Kernel level-10e spin lock `VfsLock` backed by [`SpinLock`]: `PollHead`'s
+/// subscriber list.
 pub struct KernelLeafLock<T>(SpinLock<T>);
 
 impl<T> VfsLock<T> for KernelLeafLock<T> {

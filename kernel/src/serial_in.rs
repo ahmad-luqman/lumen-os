@@ -109,6 +109,11 @@ static LATE: AtomicU64 = AtomicU64::new(0);
 /// Waits that found input at their deadline, no interrupt having brought
 /// any (or one having, without waking the reader).
 static AT_DEADLINE: AtomicU64 = AtomicU64::new(0);
+/// `poll`/`select` waits on `/dev/console` that found input on the 100 ms
+/// safety step without an IRQ 4 `PollHead::notify` wake.
+static POLL_AT_SAFETY_STEP: AtomicU64 = AtomicU64::new(0);
+/// Whether the one-shot warning for [`POLL_AT_SAFETY_STEP`] has been logged.
+static POLL_SAFETY_WARNED: AtomicBool = AtomicBool::new(false);
 /// When those are worth a warning (the serial shell's only).
 static MISSED: SpinLock<MissedInterrupts> = SpinLock::new(MissedInterrupts::new());
 
@@ -116,6 +121,9 @@ static MISSED: SpinLock<MissedInterrupts> = SpinLock::new(MissedInterrupts::new(
 /// doc). On the boot CPU, once. Without a usable route the shell polls;
 /// without a UART it blocks for good where it can block, else yields.
 pub fn init() {
+    // Initialize `POLL_HEAD` once up front (outside any lock) before any early
+    // return so `queue_waiting` never needs lazy initialization.
+    let _ = ensure_poll_head();
     if !arch::serial::present() {
         return;
     }
@@ -141,7 +149,6 @@ pub fn init() {
         return;
     }
     arch::serial::enable_rx_interrupt();
-    let _ = poll_head();
     BY_INTERRUPT.store(true, Ordering::Release);
     interrupts::set_masked(route, false);
     {
@@ -169,9 +176,10 @@ fn on_irq() {
 }
 
 /// Move the waiting bytes into the queue while it has room (the rest stay
-/// in the UART), then wake the reader if any came (counting a wake that
-/// readied it); how many. With interrupts off, on the boot CPU: the
-/// queue's only producer.
+/// in the UART), then wake the serial shell's wait queue (counting a wake that
+/// readied it) and notify [`POLL_HEAD`] subscribers with `POLLIN | POLLRDNORM`;
+/// returns how many bytes were queued. With interrupts off, on the boot CPU:
+/// the queue's only producer.
 fn queue_waiting() -> usize {
     let room = QUEUE_SIZE - QUEUE.len();
     let queued = arch::serial::drain(room, |b| {
@@ -182,27 +190,30 @@ fn queue_waiting() -> usize {
         if WAITING.wake_all() > 0 {
             READER_WOKEN.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(head) = POLL_HEAD.lock().as_ref() {
+        // Clone the `Arc`-backed head out and release `POLL_HEAD` before
+        // taking the head's level-10e subscriber lock in `notify`. Because
+        // `POLL_HEAD` retains its own clone, dropping `head` here never frees.
+        let head = POLL_HEAD.lock().clone();
+        if let Some(head) = head {
             head.notify(PollMask::IN | PollMask::RDNORM);
         }
     }
     queued
 }
 
-fn poll_head() -> KernelPollHead {
-    let mut slot = POLL_HEAD.lock();
-    if let Some(head) = slot.as_ref() {
-        return head.clone();
+fn ensure_poll_head() -> KernelPollHead {
+    if let Some(head) = POLL_HEAD.lock().clone() {
+        return head;
     }
-    let head = KernelPollHead::new();
-    *slot = Some(head.clone());
-    head
+    // Allocate outside `POLL_HEAD`'s spinlock so no heap allocation runs under it.
+    let fresh = KernelPollHead::new();
+    let mut slot = POLL_HEAD.lock();
+    slot.get_or_insert(fresh).clone()
 }
 
 /// Subscribe `waker` to serial input arrivals until the returned [`PollGuard`] drops.
 pub fn subscribe_poll(waker: Arc<dyn PollWaker>) -> PollGuard {
-    let head = poll_head();
-    head.subscribe(waker)
+    ensure_poll_head().subscribe(waker)
 }
 
 /// Whether COM1 input arrives via IRQ 4 (else `poll` falls back to short timed rechecks).
@@ -210,8 +221,22 @@ pub fn by_interrupt() -> bool {
     BY_INTERRUPT.load(Ordering::Acquire)
 }
 
-/// Number of active `PollHead` subscribers on serial input (ktests and C6).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+/// Record a `poll`/`select` wait on `/dev/console` that ended on the 100 ms
+/// safety step and found input readable without an IRQ 4 `PollHead::notify`
+/// wake; logs a warning once.
+pub fn record_poll_safety_hit() {
+    POLL_AT_SAFETY_STEP.fetch_add(1, Ordering::Relaxed);
+    if !POLL_SAFETY_WARNED.swap(true, Ordering::Relaxed) {
+        warn!(
+            target: "serial",
+            "COM1 poll found input at the 100 ms safety step without IRQ 4 waking it (GSI {}, vector {:#04x})",
+            GSI.load(Ordering::Relaxed),
+            VECTOR.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// Number of active `PollHead` subscribers on serial input.
 pub fn poll_subscribers() -> usize {
     let head = POLL_HEAD.lock().clone();
     head.map_or(0, |h| h.subscriber_count())
@@ -244,37 +269,12 @@ pub fn read_byte() -> Option<u8> {
 /// block for good, or yield once. The serial shell's only, on the boot
 /// CPU.
 pub fn wait() {
-    wait_until(None);
-}
-
-/// Wait for a received byte up to an optional monotonic `deadline` (ns).
-///
-/// When `deadline` is `None`, preserves the serial shell's full safety-net
-/// accounting and missed-interrupt warning (`wait_with_deadline`). When
-/// `deadline` is `Some(dl)`, caps the wait to `dl` (without an extra grace
-/// period past `dl`, and sleeping until `dl` rather than forever when no UART
-/// is present) so Linux `poll(2)` timeouts remain accurate.
-pub fn wait_until(deadline: Option<u64>) {
     debug_assert!(arch::cpu_index() == 0, "the serial shell waits on the boot CPU");
     let present = arch::serial::present();
     let by_interrupt = BY_INTERRUPT.load(Ordering::Acquire);
     match lumen_uart::wait_mode(present, by_interrupt, crate::sched::can_block_now()) {
-        WaitMode::Forever => match deadline {
-            Some(dl) => {
-                let rem = dl.saturating_sub(crate::time::now_ns());
-                if rem > 0 {
-                    let _ = crate::sched::sleep(rem);
-                }
-            }
-            None => WAITING.wait_until(|| false),
-        },
-        WaitMode::Deadline => match deadline {
-            Some(dl) => {
-                let cap = crate::time::now_ns().saturating_add(WAIT_NS);
-                let _ = WAITING.wait_until_or_deadline(dl.min(cap), available_locked);
-            }
-            None => wait_with_deadline(),
-        },
+        WaitMode::Forever => WAITING.wait_until(|| false),
+        WaitMode::Deadline => wait_with_deadline(),
         WaitMode::Yield => crate::sched::yield_now(),
     }
 }
@@ -317,11 +317,23 @@ fn wait_with_deadline() {
     }
 }
 
-/// `serial`: how COM1's input comes, and how the serial shell's waits for
-/// it ended.
+/// `serial [poll]`: how COM1's input comes, and how the serial shell's waits
+/// for it ended (`serial poll` reports `poll`/`select` safety-step hits and
+/// active `PollHead` subscribers).
 pub fn serial_command(ctx: &mut Ctx<'_>, args: &[String]) {
+    if args.len() == 1 && args[0] == "poll" {
+        let mut t = String::new();
+        let _ = writeln!(
+            t,
+            "serial: poll safety-step hits: {}, subscribers: {}",
+            POLL_AT_SAFETY_STEP.load(Ordering::Relaxed),
+            poll_subscribers()
+        );
+        let _ = ctx.out.write_str(&t);
+        return;
+    }
     if !args.is_empty() {
-        return ctx.fail("usage: serial");
+        return ctx.fail("usage: serial [poll]");
     }
     let mut t = String::new();
     if !arch::serial::present() {

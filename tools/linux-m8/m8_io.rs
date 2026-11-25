@@ -40,6 +40,7 @@ const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
 const POLLNVAL: i16 = 0x0020;
 
+const NS_PER_US: i64 = 1_000;
 const NS_PER_MS: i64 = 1_000_000;
 const NS_PER_SEC: i64 = 1_000_000_000;
 const US_PER_SEC: i64 = 1_000_000;
@@ -59,11 +60,23 @@ struct Timespec {
     tv_nsec: i64,
 }
 
+impl Timespec {
+    fn ns(self) -> i64 {
+        self.tv_sec.saturating_mul(NS_PER_SEC).saturating_add(self.tv_nsec)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Timeval {
     tv_sec: i64,
     tv_usec: i64,
+}
+
+impl Timeval {
+    fn us(self) -> i64 {
+        self.tv_sec.saturating_mul(US_PER_SEC).saturating_add(self.tv_usec)
+    }
 }
 
 #[repr(C)]
@@ -76,7 +89,7 @@ struct PselectSig {
 fn now_ns() -> Result<i64, common::Fail> {
     let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
     eq("clock_gettime", sys(SYS_CLOCK_GETTIME, [CLOCK_MONOTONIC, &mut ts as *mut Timespec as u64, 0, 0, 0, 0]), 0)?;
-    Ok(ts.tv_sec.saturating_mul(NS_PER_SEC).saturating_add(ts.tv_nsec))
+    Ok(ts.ns())
 }
 
 fn read_one_byte(want: u8) -> R {
@@ -98,22 +111,42 @@ fn check_poll_nval() -> R {
     eq("fd 99 revents", i64::from(fds[2].revents), i64::from(POLLNVAL))?;
     eq("fd -1 revents", i64::from(fds[3].revents), 0)?;
 
-    // O_PATH descriptor answers POLLNVAL in poll/ppoll and -EBADF in select/pselect6.
+    // An `O_PATH` descriptor reports `POLLNVAL` in `poll`/`ppoll`, and in
+    // `select`/`pselect6` (where `POLLNVAL` is in `POLLIN_SET`, `POLLOUT_SET`
+    // and `POLLEX_SET`) reports ready in every requested set rather than EBADF.
     let path = b"/tmp\0";
     let pfd = ok("openat(/tmp, O_PATH)", sys(SYS_OPENAT, [AT_FDCWD, path.as_ptr() as u64, O_PATH, 0, 0, 0]))? as i32;
     let mut one = [PollFd { fd: pfd, events: POLLIN, revents: 0 }];
     let zero_ts = Timespec { tv_sec: 0, tv_nsec: 0 };
     let r = sys(SYS_PPOLL, [one.as_mut_ptr() as u64, 1, &zero_ts as *const Timespec as u64, 0, 8, 0]);
     let mut rset = [0u64; 16];
-    rset[(pfd as usize) / 64] |= 1u64 << ((pfd as usize) % 64);
+    let mut wset = [0u64; 16];
+    let mut xset = [0u64; 16];
+    let idx = (pfd as usize) / 64;
+    let bit = 1u64 << ((pfd as usize) % 64);
+    rset[idx] |= bit;
+    wset[idx] |= bit;
+    xset[idx] |= bit;
     let mut zero_tv = Timeval { tv_sec: 0, tv_usec: 0 };
-    let sr =
-        sys(SYS_SELECT, [(pfd + 1) as u64, rset.as_mut_ptr() as u64, 0, 0, &mut zero_tv as *mut Timeval as u64, 0]);
+    let sr = sys(
+        SYS_SELECT,
+        [
+            (pfd + 1) as u64,
+            rset.as_mut_ptr() as u64,
+            wset.as_mut_ptr() as u64,
+            xset.as_mut_ptr() as u64,
+            &mut zero_tv as *mut Timeval as u64,
+            0,
+        ],
+    );
     let _ = sys(SYS_CLOSE, [pfd as u64, 0, 0, 0, 0, 0]);
 
     eq("ppoll(O_PATH)", r, 1)?;
     eq("ppoll(O_PATH) revents", i64::from(one[0].revents), i64::from(POLLNVAL))?;
-    eq("select(O_PATH)", sr, EBADF)?;
+    eq("select(O_PATH)", sr, 3)?;
+    ensure("select(O_PATH) rset", (rset[idx] & bit) != 0, rset[idx] as i64)?;
+    ensure("select(O_PATH) wset", (wset[idx] & bit) != 0, wset[idx] as i64)?;
+    ensure("select(O_PATH) xset", (xset[idx] & bit) != 0, xset[idx] as i64)?;
 
     // Closed fd in select -> -EBADF.
     let mut bad_set = [0u64; 16];
@@ -142,8 +175,7 @@ fn check_ppoll_timeout_no_input() -> R {
     let elapsed = now_ns()? - t0;
     eq("ppoll revents on timeout", i64::from(fds[0].revents), 0)?;
     ensure("ppoll elapsed >= 50ms", elapsed >= 50 * NS_PER_MS, elapsed)?;
-    let rem = ts.tv_sec.saturating_mul(NS_PER_SEC).saturating_add(ts.tv_nsec);
-    ensure("ppoll rem in [0, 50ms]", (0..=50 * NS_PER_MS).contains(&rem), rem)
+    eq("ppoll rem == 0 on timeout", ts.ns(), 0)
 }
 
 fn check_select_timeout_no_input() -> R {
@@ -154,10 +186,9 @@ fn check_select_timeout_no_input() -> R {
     let elapsed = now_ns()? - t0;
     eq("select clears rset", rset[0] as i64, 0)?;
     ensure("select elapsed >= 50ms", elapsed >= 50 * NS_PER_MS, elapsed)?;
-    let rem_us = tv.tv_sec.saturating_mul(US_PER_SEC).saturating_add(tv.tv_usec);
-    ensure("select rem in [0, 50ms]", (0..=50_000).contains(&rem_us), rem_us)?;
+    eq("select rem == 0 on timeout", tv.us(), 0)?;
 
-    // Zero timeout returns 0 immediately and leaves tv at {0, 0}.
+    // Zero timeout returns 0 immediately without writing back `tv`.
     rset[0] = 1;
     let mut zero_tv = Timeval { tv_sec: 0, tv_usec: 0 };
     eq(
@@ -170,7 +201,7 @@ fn check_select_timeout_no_input() -> R {
 
 fn check_pselect6_timeout_no_input() -> R {
     // Set an initial signal mask, pass a different mask to pselect6, and
-    // verify the original mask is restored on return.
+    // verify the initial mask is restored on return.
     let orig_mask: u64 = 1u64 << 9; // SIGUSR1
     let mut old: u64 = 0;
     eq(
@@ -195,12 +226,11 @@ fn check_pselect6_timeout_no_input() -> R {
     let elapsed = now_ns()? - t0;
     eq("pselect6 clears rset", rset[0] as i64, 0)?;
     ensure("pselect6 elapsed >= 50ms", elapsed >= 50 * NS_PER_MS, elapsed)?;
-    let rem = ts.tv_sec.saturating_mul(NS_PER_SEC).saturating_add(ts.tv_nsec);
-    ensure("pselect6 rem in [0, 50ms]", (0..=50 * NS_PER_MS).contains(&rem), rem)?;
+    eq("pselect6 rem == 0 on timeout", ts.ns(), 0)?;
 
     let mut after: u64 = 0;
     eq("sigprocmask read after", sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, 0, &mut after as *mut u64 as u64, 8, 0, 0]), 0)?;
-    // Restore original empty mask before leaving.
+    // Restore the previous mask saved before this check.
     let _ = sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, &old as *const u64 as u64, 0, 8, 0, 0]);
     eq("pselect6 restored mask", after as i64, orig_mask as i64)
 }
@@ -223,38 +253,49 @@ fn check_poll_with_input() -> R {
 fn check_ppoll_with_input() -> R {
     say!("ready ppoll");
     let mut fds = [PollFd { fd: 0, events: POLLIN, revents: 0 }];
+    let requested = 5 * NS_PER_SEC;
     let mut ts = Timespec { tv_sec: 5, tv_nsec: 0 };
+    let t0 = now_ns()?;
     eq(
         "ppoll(0, 5s) with input",
         sys(SYS_PPOLL, [fds.as_mut_ptr() as u64, 1, &mut ts as *mut Timespec as u64, 0, 8, 0]),
         1,
     )?;
+    let t1 = now_ns()?;
     ensure("ppoll revents has POLLIN", (fds[0].revents & POLLIN) != 0, i64::from(fds[0].revents))?;
-    let rem = ts.tv_sec.saturating_mul(NS_PER_SEC).saturating_add(ts.tv_nsec);
-    ensure("ppoll rem in [0, 5s]", (0..=5 * NS_PER_SEC).contains(&rem), rem)?;
+    let rem = ts.ns();
+    ensure("ppoll rem >= 0 and < requested", (0..requested).contains(&rem), rem)?;
+    ensure("ppoll rem + elapsed >= requested", rem.saturating_add(t1 - t0) >= requested, rem)?;
     read_one_byte(b'c')
 }
 
 fn check_select_with_input() -> R {
     say!("ready select");
     let mut rset = [1u64; 1];
+    let requested_us = 5 * US_PER_SEC;
     let mut tv = Timeval { tv_sec: 5, tv_usec: 0 };
+    let t0 = now_ns()?;
     eq(
         "select(0, 5s) with input",
         sys(SYS_SELECT, [1, rset.as_mut_ptr() as u64, 0, 0, &mut tv as *mut Timeval as u64, 0]),
         1,
     )?;
+    let t1 = now_ns()?;
     eq("select rset bit 0", rset[0] as i64, 1)?;
-    let rem_us = tv.tv_sec.saturating_mul(US_PER_SEC).saturating_add(tv.tv_usec);
-    ensure("select rem in [0, 5s]", (0..=5 * US_PER_SEC).contains(&rem_us), rem_us)?;
+    let rem_us = tv.us();
+    ensure("select rem_us >= 0 and < requested", (0..requested_us).contains(&rem_us), rem_us)?;
+    let elapsed_us_ceil = (t1 - t0).saturating_add(NS_PER_US - 1) / NS_PER_US;
+    ensure("select rem_us + elapsed_us >= requested", rem_us.saturating_add(elapsed_us_ceil) >= requested_us, rem_us)?;
     read_one_byte(b'd')
 }
 
 fn check_pselect6_with_input() -> R {
     say!("ready pselect6");
     let mut rset = [1u64; 1];
+    let requested = 5 * NS_PER_SEC;
     let mut ts = Timespec { tv_sec: 5, tv_nsec: 0 };
     let sig = PselectSig { ss: 0, ss_len: 0 };
+    let t0 = now_ns()?;
     eq(
         "pselect6(0, 5s) with input",
         sys(
@@ -263,9 +304,11 @@ fn check_pselect6_with_input() -> R {
         ),
         1,
     )?;
+    let t1 = now_ns()?;
     eq("pselect6 rset bit 0", rset[0] as i64, 1)?;
-    let rem = ts.tv_sec.saturating_mul(NS_PER_SEC).saturating_add(ts.tv_nsec);
-    ensure("pselect6 rem in [0, 5s]", (0..=5 * NS_PER_SEC).contains(&rem), rem)?;
+    let rem = ts.ns();
+    ensure("pselect6 rem >= 0 and < requested", (0..requested).contains(&rem), rem)?;
+    ensure("pselect6 rem + elapsed >= requested", rem.saturating_add(t1 - t0) >= requested, rem)?;
     read_one_byte(b'e')
 }
 

@@ -380,6 +380,10 @@ impl VfsInode for DevfsInode {
 
 impl Pollable for DevfsInode {
     fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>) -> (PollMask, Option<PollGuard>) {
+        // Match `read_at`/`write_at` when called outside a registered Linux
+        // process: `/dev/console` falls back to non-blocking EOF / `klog`
+        // (same readiness as `Capture`), while `/dev/tty` has no controlling
+        // console (`ENODEV`) and reports `POLLERR`.
         let io = match self.kind {
             DevKind::Console => process::try_current_io().unwrap_or(process::ConsoleIo::Capture),
             DevKind::Tty => match process::try_current_io() {
@@ -388,8 +392,8 @@ impl Pollable for DevfsInode {
             },
             _ => return (PollMask::ALWAYS_READY, None),
         };
-        let readable = matches!(mode, AccessMode::ReadOnly | AccessMode::ReadWrite);
-        let writable = matches!(mode, AccessMode::WriteOnly | AccessMode::ReadWrite);
+        let readable = mode.can_read();
+        let writable = mode.can_write();
         // Subscribe before reading readiness so an IRQ 4 arrival between
         // reading `stdin_ready` and the caller's wait still wakes the caller.
         let guard = if readable && matches!(io, process::ConsoleIo::Serial) {

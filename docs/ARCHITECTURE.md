@@ -4417,7 +4417,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 15 | `rt_sigreturn()` | section 6, "Signals"; returns the restored `rax`; a frame `restore` refuses forces `SIGSEGV` | C5 |
 | 16 | `ioctl(fd, req, arg)` | M7's, plus `FIONREAD` on a pipe (`Pipe::fionread`) and the tty requests on PTYs and on the console as a tty (section 10, including the census's `TCFLSH`) | C7, C9, C10 |
 | 22 | `pipe(fds)` | `pipe2(fds, 0)` | C7 |
-| 23 | `select(n, readfds, writefds, exceptfds, tv)` | `n < 0` `-EINVAL`, `n` capped at `MAX_FDS`; a set naming a closed fd `-EBADF`; a negative `tv` field `-EINVAL`; bad pointers `-EFAULT`; a descriptor is readable for `POLLIN_SET`, writable for `POLLOUT_SET`, exceptional for `POLLEX_SET` (`fs/select.c`'s sets: `POLLEX_SET` is `POLLPRI \| POLLNVAL`, and `POLLNVAL` is in all three, though a closed fd is `-EBADF` before any mask is read; `POLLPRI` is never set on a pipe, PTY or the console, so the census's vim exception set on its pty is simply never ready); writes the time left back to `tv` (not for a zero timeout), as Linux; interrupted `-ERESTARTNOHAND` | B3 |
+| 23 | `select(n, readfds, writefds, exceptfds, tv)` | `n < 0` `-EINVAL`, `n` capped at `MAX_FDS`; a set naming a closed fd `-EBADF`; a negative `tv` field `-EINVAL`; bad pointers `-EFAULT`; an `O_PATH` fd is open (`max_select_fd` uses `open_fds`) and answers `POLLNVAL` (`select_poll_one`), which sits in all three sets; any other descriptor is readable for `POLLIN_SET`, writable for `POLLOUT_SET`, exceptional for `POLLEX_SET` (`fs/select.c`'s sets: `POLLEX_SET` is `POLLPRI \| POLLNVAL`, and `POLLNVAL` is in all three; `POLLPRI` is never set on a pipe, PTY or the console, so the census's vim exception set on its pty is simply never ready); writes the time left back to `tv` (not for a zero timeout; a failed write-back keeps a ready count and turns `-ERESTARTNOHAND` into `-EINTR`, as Linux's `poll_select_finish`); interrupted `-ERESTARTNOHAND` | B3 |
 | 24 | `sched_yield()` | `sched::yield_now`; 0 | C12 |
 | 32 | `dup(oldfd)` | the lowest free fd, `FD_CLOEXEC` clear, looked up and installed in one hold of the FD table (section 9's fourth hazard); `-EBADF`, `-EMFILE` | C7 |
 | 33 | `dup2(oldfd, newfd)` | `oldfd == newfd`: `newfd` if open, else `-EBADF`; `newfd >= MAX_FDS` `-EBADF`; a `newfd` reserved by an open still in progress `-EBUSY`, as Linux's `do_dup2`; a displaced descriptor closed through `process::release_fd` after the table's lock is released | C7 |
@@ -8432,7 +8432,9 @@ holding only locks above it.
        under it in ascending index order; nothing allocates or frees
        under it: lumen-futex's rule)
     e. a PollHead's subscriber list (section 10; M9's epoll ready list
-       nests inside it)
+       nests inside it); and B3's interim `serial_in::POLL_HEAD` holder
+       (cloned and released before calling `notify`, never nested with
+       another lock; gone once C10 moves the console to `Tty`)
     f. VirtioHal::TABLE; WaitQueue locks; the scheduler's run queues (two
        at once only for a steal, in ascending CPU order, section 6)
     g. heap -> page tables -> frame allocator (section 5);
@@ -8548,7 +8550,9 @@ and `ktest:lumen_kernel::linux::syscall::lock::setlkw_records_each_waiting_threa
 - Never wait for a TLB shootdown's acknowledgements with interrupts off or
   any `SpinLock` held (section 5).
 - No interrupt handler sends a signal or takes a level-10 lock above `f`
-  (section 8).
+  (section 8), except B3's interim serial console wake on IRQ 4
+  (`serial_in::POLL_HEAD` and its `PollHead` subscriber list, level `e`,
+  until C10 moves the notify to the tty's input thread).
 - **Snapshot-and-release for level-9 tables:** `sync()` snapshots
   `Vec<Arc<dyn FileSystem>>` from `MountTable` and `Vec<Arc<VfsInode>>` from
   `InodeCache`, releases the table lock, and only then locks `VfsInode` →
@@ -8678,43 +8682,55 @@ pub trait PollWaker: Send + Sync {
 pub trait Pollable: Send + Sync {
     /// The readiness of one open description now (`mode`: its access mode,
     /// since a pipe's two ends share one inode and an O_RDWR FIFO answers
-    /// for both). With a waker, also subscribes it to every later change
-    /// until the returned guard drops, in the same hold of the source's own
-    /// lock as the mask is read, so no change falls between.
+    /// for both). With a waker, return a guard unless the caller re-polls
+    /// you; subscribe no later than the mask is read, so no change falls
+    /// between.
     fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>)
         -> (PollMask, Option<PollGuard>);
 }
-pub struct PollHead<F: LockFamily> { /* subscribers behind F's leaf lock */ }
+pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lock */ }
 // PollHead::subscribe(Arc<dyn PollWaker>) -> PollGuard; PollHead::notify(PollMask)
 ```
 
 - An `O_PATH` descriptor answers `POLLNVAL` before any `pollable` is
-  asked, as a closed one does.
+  asked (`poll`/`ppoll`: `POLLNVAL`; `select`/`pselect6`: mask `POLLNVAL`,
+  which is in `POLLIN_SET`, `POLLOUT_SET` and `POLLEX_SET`; only a closed
+  fd is `-EBADF`).
 - `VfsInode::pollable(&self) -> Option<&dyn Pollable>`, `None` by default:
   regular files, directories, procfs and devfs's always-ready devices
   answer `POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM` (M7's rule). Pipes,
   FIFOs, both PTY ends and the console tty implement it; M9's sockets,
-  `eventfd` and `timerfd` will. `LockFamily` gains a leaf-lock type (the
-  kernel's `SpinLock`, the host tests' `std` mutex): a `PollHead`'s list
-  is section 9's level-10 `e`. `subscribe` allocates its slot before
-  taking that lock. `PollGuard` is the subscription: dropping it removes
-  the waker from the head's list.
+  `eventfd` and `timerfd` will. `LockFamily` gains a level-10e spin lock
+  (`LeafLock`: the kernel's `SpinLock`, the host tests' `std` mutex) for
+  `PollHead`'s subscriber list. `subscribe` allocates its slot before
+  taking that lock, and `PollGuard`'s `Drop` removes the waker and frees
+  the slot after releasing it.
+- **Interim console readiness (B3, replaced by C10):** devfs's `Console`
+  and `Tty` nodes implement `Pollable`, reading `process::stdin_ready` and
+  (on `ConsoleIo::Serial`) subscribing to `serial_in::POLL_HEAD`, which
+  `serial_in::queue_waiting` notifies from IRQ 4 after releasing the
+  holder lock. Waiters on a readable console take a 5 ms step for VT
+  consoles and polled serial, and a 100 ms safety-net step under IRQ 4
+  (any hit that finds input without an IRQ 4 wake is counted, logged once,
+  and shown by `serial poll`). C10 replaces all of this with the console's
+  `Tty` and input thread.
 - **A pipe's mask** (Linux's `pipe_poll`): the read end `POLLIN |
   POLLRDNORM` when `!is_empty()`, `POLLHUP` when `reader_hung_up()`; the
   write end `POLLOUT | POLLWRNORM` when `writable()`, `POLLERR` when
   `writer_error()`; an `O_RDWR` FIFO description, the union. A tty's:
   "PTYs" below.
 - **`poll`, `ppoll`, `select`, `pselect6`** (section 8's table) share one
-  loop: a `PollWait` (a `PollWaker` holding an `AtomicBool`, `fired`, and
-  its thread) subscribes to every source on the first pass; if any is
-  ready, or the timeout is 0, it drops the guards and returns. Otherwise
-  it waits with B2's `wait_interruptible(deadline, || fired)`, and after
-  each wake clears `fired`, then polls every source again without
-  subscribing, then waits again: a change between the poll and the wait
-  sets `fired` again, so none is missed. The guards are kept until the
-  call returns, by any way out (an interrupted wait included). `select` reads
-  a mask through `fs/select.c`'s `POLLIN_SET`, `POLLOUT_SET` and
-  `POLLEX_SET`.
+  loop: a zero or already-expired timeout runs one unsubscribed pass and
+  returns immediately. Otherwise a `PollWait` (a `PollWaker` holding an
+  `AtomicBool`, `fired`, and a per-call `WaitQueue`) subscribes to every
+  source on pass 1; if any is ready, it drops the guards and returns.
+  Otherwise it waits with B2's `wait_interruptible(deadline, || fired)`,
+  and after each wake clears `fired` before re-polling every source
+  without re-subscribing, then waits again: a change during or after the
+  re-poll sets `fired` again, so none is missed. The guards are kept until
+  the call returns, by any way out (an interrupted wait included).
+  `select` reads a mask through `fs/select.c`'s `POLLIN_SET`, `POLLOUT_SET`
+  and `POLLEX_SET`.
 - **M9's `epoll`** reuses it unchanged: an interest is a `PollGuard` held
   as long as the descriptor is in the set, and the epoll instance's waker
   queues the descriptor on its ready list; the `ready` bits passed to
@@ -10854,11 +10870,23 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   a cycle through either is `EDEADLK`.
 - `ktest:lumen_kernel::linux::syscall::poll::poll_rechecks_after_a_wake`
   (B3): with B3's test `Pollable`, a delay knob between clearing `fired`
-  and the re-poll, and a change landing there, the wait still ends; and a
-  waiter whose `ready` reads a `seq` counter wakes for a change made
-  between its read and its block (it kills the mutant that re-polls before
-  clearing `fired`). An interrupted wait's guards are dropped, through
-  `raise_for_test`: the test `Pollable`'s subscriber count goes back to 0.
+  and the re-poll, and a change landing there, the wait still ends; a
+  no-timeout (`-1`) re-poll hook that flips the source ready and raises
+  `USR1` during the re-poll still returns `1` (killing the mutant that
+  clears `fired` after re-polling, which loses `fired` and returns
+  `-ERESTART_RESTARTBLOCK`); a waiter whose `ready` reads a `seq` counter
+  wakes for a change made between its read and its block; and interrupted
+  waits (`poll`, `ppoll`, `select`, `pselect6`, through `raise_for_test`)
+  drop their `PollGuard`s (subscriber count back to 0) and write back
+  `revents` on `poll` (`-EFAULT` with no `RestartBlock` on read-only
+  `fds`). Beside it, `poll_resume_honours_the_saved_deadline` invokes
+  `resume_poll` with a past deadline and a pending signal and checks it
+  returns `0` (killing the mutant that turns the saved deadline into
+  `Forever`), and `ppoll_installs_its_mask_and_writes_back_when_interrupted`
+  checks that `ppoll`/`pselect6` install their temporary mask during the
+  wait, restore it on `-ERESTARTNOHAND`, write remaining time back
+  (`rem < asked`, `rem + elapsed >= asked`, for `select` too), and turn
+  `-ERESTARTNOHAND` into `-EINTR` when the timeout pointer is read-only.
 - `scenario:test_linux_io::test_pipes_and_poll` (C7): a pipeline of
   busybox applets, `PIPE_BUF` atomicity between two writers, `EOF`,
   `EPIPE`/`SIGPIPE`, `O_NONBLOCK`, `F_SETPIPE_SZ`, `dup2` redirections, a

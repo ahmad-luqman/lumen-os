@@ -6,10 +6,11 @@
 //! kinds returning `None` are always ready ([`PollMask::ALWAYS_READY`]).
 //!
 //! A [`PollHead`] holds subscribed [`PollWaker`]s behind its [`LockFamily`]'s
-//! leaf lock (section 9, level-10 `e`). [`PollHead::subscribe`] allocates its
-//! list node before taking the leaf lock, and [`PollGuard`]'s `Drop` splices
-//! it out and frees it after releasing the lock, so neither subscribing,
-//! notifying nor unsubscribing allocates or frees while the leaf lock is held.
+//! level-10e spin lock (section 9, level-10 `e`). [`PollHead::subscribe`]
+//! allocates its list node before taking that lock, and [`PollGuard`]'s `Drop`
+//! splices it out and frees it after releasing the lock, so neither
+//! subscribing, notifying nor unsubscribing allocates or frees while the
+//! level-10e spin lock is held.
 
 use alloc::collections::LinkedList;
 use alloc::sync::{Arc, Weak};
@@ -22,7 +23,19 @@ use crate::types::AccessMode;
 
 /// Linux `poll(2)` / `epoll(7)` readiness bitmask (x86-64 `asm-generic/poll.h`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct PollMask(pub u16);
+pub struct PollMask(u16);
+
+impl AccessMode {
+    /// True if this access mode allows reading (`O_RDONLY` or `O_RDWR`).
+    pub const fn can_read(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    /// True if this access mode allows writing (`O_WRONLY` or `O_RDWR`).
+    pub const fn can_write(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+}
 
 impl PollMask {
     /// No events ready.
@@ -153,9 +166,8 @@ pub trait PollWaker: Send + Sync {
 pub trait Pollable: Send + Sync {
     /// The readiness of one open description now (`mode`: its access mode,
     /// since a pipe's two ends share one inode and an `O_RDWR` FIFO answers
-    /// for both). With a waker, also subscribes it to every later change
-    /// until the returned guard drops, in the same hold of the source's own
-    /// lock as the mask is read, so no change falls between.
+    /// for both). With a waker, return a guard unless the caller re-polls you;
+    /// subscribe no later than the mask is read, so no change falls between.
     fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>) -> (PollMask, Option<PollGuard>);
 }
 
@@ -442,10 +454,10 @@ mod tests {
 
     #[test]
     fn poll_head_loses_no_change_between_poll_and_subscription() {
-        // Model a real `Pollable` source whose readiness state and
-        // `PollHead::subscribe` / `PollHead::notify` are serialized by the
-        // source's own lock: across thousands of concurrent flips, the
-        // consumer must never observe an empty mask AND miss the wake.
+        // Exercises this mock source's lock-ordered subscribe-and-read protocol
+        // against concurrent `PollHead::notify` calls: across thousands of
+        // flips, the consumer must never observe an empty mask AND miss the
+        // wake.
         struct MockSource {
             state: Mutex<PollMask>,
             head: PollHead<HostLocks>,
