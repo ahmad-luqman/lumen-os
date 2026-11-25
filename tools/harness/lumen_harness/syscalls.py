@@ -164,8 +164,11 @@ PRESENCE_LABELS = frozenset({"new_limit"})
 # The milestones that plan each syscall. M8: ROADMAP M8's rows, plus the calls
 # the M8 issues name that those rows don't (waitid in #336; tkill, waitid and
 # pselect6 in #337) and the rest of their families (getpgid, getsid,
-# sched_setaffinity, the priorities, the signal waits). M9 and M10: ROADMAP's
-# rows.
+# sched_setaffinity, the priorities, the signal waits), and what the design
+# (#336) added from the census: sysinfo (from M10), the timers, mknod, the
+# fsuid calls, getcpu, the robust lists, the sigqueueinfo calls and
+# restart_syscall. Since B0 (#371) it is exactly the kernel's M8_SYSCALLS
+# (test_m8_table_covers_the_census). M9 and M10: ROADMAP's rows.
 # fmt: off
 PLANNED: dict[str, frozenset[str]] = {
     "M8": frozenset({
@@ -175,6 +178,10 @@ PLANNED: dict[str, frozenset[str]] = {
         "rt_sigtimedwait", "pipe", "pipe2", "dup", "dup2", "dup3", "poll", "ppoll", "select",
         "pselect6", "setsid", "setpgid", "getpgid", "getsid", "sched_yield", "sched_getaffinity",
         "sched_setaffinity", "getpriority", "setpriority",
+        "sysinfo", "pause", "alarm", "getitimer", "setitimer", "timer_create", "timer_settime",
+        "timer_gettime", "timer_getoverrun", "timer_delete", "mknod", "mknodat", "setfsuid",
+        "setfsgid", "getcpu", "set_robust_list", "get_robust_list", "rt_sigqueueinfo",
+        "rt_tgsigqueueinfo", "restart_syscall",
     }),
     "M9": frozenset({
         "socket", "socketpair", "bind", "listen", "accept", "accept4", "connect", "sendto",
@@ -185,10 +192,22 @@ PLANNED: dict[str, frozenset[str]] = {
     }),
     "M10": frozenset({
         "mremap", "madvise", "memfd_create", "inotify_init", "inotify_init1", "inotify_add_watch",
-        "inotify_rm_watch", "sysinfo", "rseq", "io_uring_setup", "io_uring_enter",
+        "inotify_rm_watch", "rseq", "io_uring_setup", "io_uring_enter",
         "io_uring_register",
     }),
 }
+# fmt: on
+
+# The syscalls M8 leaves -ENOSYS, each by a decision ARCHITECTURE section 8
+# records ("Stays `-ENOSYS` in M8, and why"): sendfile and membarrier (the
+# callers fall back), clone3 and execveat, futex_waitv, the scheduler-policy
+# calls (no real-time policies), signalfd and signalfd4, and times.
+# fmt: off
+ENOSYS_BY_DECISION: frozenset[str] = frozenset({
+    "sendfile", "membarrier", "clone3", "execveat", "futex_waitv", "sched_setparam",
+    "sched_getparam", "sched_setscheduler", "sched_getscheduler", "sched_get_priority_max",
+    "sched_get_priority_min", "sched_rr_get_interval", "signalfd", "signalfd4", "times",
+})
 # fmt: on
 
 # Calls Linux normally answers from the vDSO, so strace doesn't see them. Lumen maps no
@@ -513,11 +532,51 @@ def dispatched(dispatch_rs: str) -> set[str]:
     return names
 
 
+# The kernel's syscall tables (kernel/src/linux/mod.rs): `pub const M6_SYSCALLS:
+# &[(u32, &str)] = &[ ... ];` and its M7 and M8 siblings, each row
+# `(general::__NR_<name>, "<name>"),`.
+_TABLE = re.compile(r"pub const (M\d+)_SYSCALLS: &\[\(u32, &str\)\] = &\[(.*?)\];", re.DOTALL)
+_ROW = re.compile(r'\(general::__NR_(\w+), "(\w+)"\),?')
+
+
+def kernel_tables(linux_mod_rs: str) -> dict[str, list[str]]:
+    """The syscall names in each of `kernel/src/linux/mod.rs`'s tables, by
+    milestone (`M6`, `M7`, `M8`), in their order. A row whose constant and
+    name differ, a name x86-64 doesn't have, anything in a table that isn't a
+    row, or no tables at all is a `CensusError`."""
+    code = re.sub(r"//[^\n]*", "", linux_mod_rs)
+    tables: dict[str, list[str]] = {}
+    for milestone, body in _TABLE.findall(code):
+        names = []
+        for const, name in _ROW.findall(body):
+            if const != name:
+                raise CensusError(f"{milestone}_SYSCALLS: __NR_{const} named {name!r}")
+            if name not in X86_64:
+                raise CensusError(f"{milestone}_SYSCALLS: {name!r} isn't an x86-64 syscall")
+            names.append(name)
+        if rest := _ROW.sub("", body).strip():
+            raise CensusError(f"{milestone}_SYSCALLS: not a row: {rest.split()[0]!r}")
+        tables[milestone] = names
+    if not tables:
+        raise CensusError("no `pub const M<n>_SYSCALLS` tables")
+    return tables
+
+
+def uncovered(census_names: Iterable[str], tables: dict[str, list[str]]) -> list[str]:
+    """The census's syscalls that are in none of the kernel's tables and not
+    -ENOSYS by a recorded decision (`ENOSYS_BY_DECISION`), in number order:
+    M8's table must leave none (ARCHITECTURE section 8)."""
+    known = set(ENOSYS_BY_DECISION).union(*tables.values())
+    return sorted(set(census_names) - known, key=X86_64.__getitem__)
+
+
 def classify(name: str, implemented: set[str]) -> str:
-    """`implemented`, the milestone planning it (`M8`, `M9`, `M10`), or
-    `unplanned`."""
+    """`implemented`, `ENOSYS` (by decision), the milestone planning it
+    (`M8`, `M9`, `M10`), or `unplanned`."""
     if name in implemented:
         return "implemented"
+    if name in ENOSYS_BY_DECISION:
+        return "ENOSYS"
     for milestone, names in PLANNED.items():
         if name in names:
             return milestone
@@ -545,13 +604,15 @@ def report(data: dict, implemented: set[str], verbose: bool = False) -> str:
             f"(kernel {meta['kernel']}): {len(data['syscalls'])} syscalls."
         ),
     ]
-    for cls in ("unplanned", *PLANNED, "implemented"):
+    for cls in ("unplanned", "ENOSYS", *PLANNED, "implemented"):
         if cls in rows:
             out += ["", f"{cls} ({len(rows[cls])}):", *rows[cls]]
     out += [
         "",
-        "implemented: the kernel dispatches the number; neither the arguments seen nor the",
-        "semantics (a thread's exit, each ioctl request) are checked.",
+        "implemented: the kernel dispatches the number (an M8 stub returning -ENOSYS until its",
+        "issue lands counts); neither the arguments seen nor the semantics (a thread's exit,",
+        "each ioctl request) are checked. ENOSYS: -ENOSYS by a decision ARCHITECTURE section 8",
+        "records (ENOSYS_BY_DECISION).",
         "ERESTART* errors: the kernel's restart codes, where a signal interrupted the call;",
         "the program saw EINTR or a restart, by the code, the handler and SA_RESTART.",
         "",

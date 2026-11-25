@@ -421,6 +421,7 @@ def test_the_syscall_table_is_linux_x86_64s():
         assert planned <= X86_64.keys()
     assert set(syscalls.KEY_ARGS) <= X86_64.keys()
     assert set(syscalls.VDSO) <= X86_64.keys()
+    assert syscalls.ENOSYS_BY_DECISION <= X86_64.keys()
 
 
 DISPATCH_RS = """
@@ -454,7 +455,7 @@ def test_dispatched_reads_the_arms_only():
 
 
 def test_the_planned_milestones_are_disjoint():
-    milestones = list(syscalls.PLANNED.values())
+    milestones = [*syscalls.PLANNED.values(), syscalls.ENOSYS_BY_DECISION]
     for i, a in enumerate(milestones):
         for b in milestones[i + 1 :]:
             assert not a & b, a & b
@@ -468,7 +469,8 @@ def test_report_classifies_against_the_dispatch_table():
     assert classify("clone", implemented) == "M8"
     assert classify("socket", implemented) == "M9"
     assert classify("mremap", implemented) == "M10"
-    assert classify("membarrier", implemented) == "unplanned"
+    assert classify("membarrier", implemented) == "ENOSYS"
+    assert classify("ptrace", implemented) == "unplanned"
     data = {
         "meta": {"workloads": ["ash", "make"], "alpine": "3.21.10", "kernel": "6.6"},
         "syscalls": {
@@ -478,11 +480,19 @@ def test_report_classifies_against_the_dispatch_table():
             "socket": {"nr": 41, "calls": 1, "workloads": ["make"]},
             "mremap": {"nr": 25, "calls": 1, "workloads": ["make"]},
             "membarrier": {"nr": 324, "calls": 1, "workloads": ["ash"], "args": {"cmd": ["0x0"]}},
+            "ptrace": {"nr": 101, "calls": 1, "workloads": ["make"]},
         },
     }
     text = report(data, implemented, verbose=True)
-    assert "Census of ash, make on Alpine 3.21.10 (kernel 6.6): 6 syscalls." in text
-    headers = ["unplanned (1):", "M8 (2):", "M9 (1):", "M10 (1):", "implemented (1):"]
+    assert "Census of ash, make on Alpine 3.21.10 (kernel 6.6): 7 syscalls." in text
+    headers = [
+        "unplanned (1):",
+        "ENOSYS (1):",
+        "M8 (2):",
+        "M9 (1):",
+        "M10 (1):",
+        "implemented (1):",
+    ]
     at = [text.index(h) for h in headers]
     assert at == sorted(at)
     rows = [line for line in text.splitlines() if re.match(r"  +\d+ \w", line)]
@@ -562,3 +572,60 @@ def test_the_checked_in_census_matches_the_table_and_the_script():
         assert entry["nr"] == X86_64[name], name
         assert entry["calls"] > 0, name
         assert set(entry["workloads"]) <= set(meta["workloads"]), name
+
+
+LINUX_MOD_RS = ROOT / "kernel/src/linux/mod.rs"
+DISPATCH_FILE = ROOT / "kernel/src/linux/syscall/mod.rs"
+
+TABLES_RS = """
+pub const M6_SYSCALLS: &[(u32, &str)] = &[
+    (general::__NR_read, "read"),
+    // a comment: (general::__NR_write, "write"),
+    (general::__NR_exit, "exit"),
+];
+pub const M8_SYSCALLS: &[(u32, &str)] = &[(general::__NR_fork, "fork"), (general::__NR_pipe, "pipe")];
+"""
+
+
+def test_kernel_tables_reads_each_milestones_rows():
+    assert syscalls.kernel_tables(TABLES_RS) == {"M6": ["read", "exit"], "M8": ["fork", "pipe"]}
+    with pytest.raises(CensusError, match="no `pub const"):
+        syscalls.kernel_tables("fn main() {}")
+    with pytest.raises(CensusError, match="__NR_fork named 'vfork'"):
+        syscalls.kernel_tables(TABLES_RS.replace('"fork"', '"vfork"'))
+    with pytest.raises(CensusError, match="not a row: 'general::__NR_pipe'"):
+        syscalls.kernel_tables(
+            TABLES_RS.replace('(general::__NR_pipe, "pipe")', "general::__NR_pipe")
+        )
+    bogus = TABLES_RS.replace('__NR_fork, "fork"', '__NR_frok, "frok"')
+    with pytest.raises(CensusError, match="'frok' isn't an x86-64 syscall"):
+        syscalls.kernel_tables(bogus)
+
+
+def test_m8_table_covers_the_census():
+    """ARCHITECTURE section 8: every syscall the M8 census (#337) saw is in
+    M6_SYSCALLS, M7_SYSCALLS or M8_SYSCALLS, or -ENOSYS by a recorded
+    decision (ENOSYS_BY_DECISION); M8's table is the plan's (PLANNED["M8"]),
+    each of its numbers dispatched, and no decided -ENOSYS one dispatched or
+    in a table."""
+    tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
+    assert set(tables) == {"M6", "M7", "M8"}
+    rows = [name for names in tables.values() for name in names]
+    assert len(rows) == len(set(rows)), "a syscall in two tables, or twice in one"
+    assert (len(tables["M6"]), len(tables["M7"]), len(tables["M8"])) == (30, 47, 60)
+
+    census_names = tomllib.loads(CENSUS.read_text())["syscalls"].keys()
+    assert syscalls.uncovered(census_names, tables) == []
+    # The check could have failed: a census syscall in no table and no
+    # decision is reported, and so is one a table lost.
+    assert syscalls.uncovered([*census_names, "socket", "mremap"], tables) == ["mremap", "socket"]
+    without_pipe = {**tables, "M8": [n for n in tables["M8"] if n != "pipe"]}
+    assert syscalls.uncovered(census_names, without_pipe) == ["pipe"]
+
+    assert set(tables["M8"]) == syscalls.PLANNED["M8"]
+    assert not syscalls.ENOSYS_BY_DECISION & set(rows)
+    implemented = syscalls.dispatched(DISPATCH_FILE.read_text())
+    assert set(tables["M8"]) <= implemented
+    assert not syscalls.ENOSYS_BY_DECISION & implemented
+    # The two the census saw are among the decisions.
+    assert {"sendfile", "membarrier"} <= census_names & syscalls.ENOSYS_BY_DECISION
