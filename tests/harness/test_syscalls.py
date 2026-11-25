@@ -421,6 +421,7 @@ def test_the_syscall_table_is_linux_x86_64s():
         assert planned <= X86_64.keys()
     assert set(syscalls.KEY_ARGS) <= X86_64.keys()
     assert set(syscalls.VDSO) <= X86_64.keys()
+    assert syscalls.ENOSYS_BY_DECISION <= X86_64.keys()
 
 
 DISPATCH_RS = """
@@ -454,7 +455,7 @@ def test_dispatched_reads_the_arms_only():
 
 
 def test_the_planned_milestones_are_disjoint():
-    milestones = list(syscalls.PLANNED.values())
+    milestones = [*syscalls.PLANNED.values(), syscalls.ENOSYS_BY_DECISION]
     for i, a in enumerate(milestones):
         for b in milestones[i + 1 :]:
             assert not a & b, a & b
@@ -468,7 +469,8 @@ def test_report_classifies_against_the_dispatch_table():
     assert classify("clone", implemented) == "M8"
     assert classify("socket", implemented) == "M9"
     assert classify("mremap", implemented) == "M10"
-    assert classify("membarrier", implemented) == "unplanned"
+    assert classify("membarrier", implemented) == "ENOSYS"
+    assert classify("ptrace", implemented) == "unplanned"
     data = {
         "meta": {"workloads": ["ash", "make"], "alpine": "3.21.10", "kernel": "6.6"},
         "syscalls": {
@@ -478,11 +480,19 @@ def test_report_classifies_against_the_dispatch_table():
             "socket": {"nr": 41, "calls": 1, "workloads": ["make"]},
             "mremap": {"nr": 25, "calls": 1, "workloads": ["make"]},
             "membarrier": {"nr": 324, "calls": 1, "workloads": ["ash"], "args": {"cmd": ["0x0"]}},
+            "ptrace": {"nr": 101, "calls": 1, "workloads": ["make"]},
         },
     }
     text = report(data, implemented, verbose=True)
-    assert "Census of ash, make on Alpine 3.21.10 (kernel 6.6): 6 syscalls." in text
-    headers = ["unplanned (1):", "M8 (2):", "M9 (1):", "M10 (1):", "implemented (1):"]
+    assert "Census of ash, make on Alpine 3.21.10 (kernel 6.6): 7 syscalls." in text
+    headers = [
+        "unplanned (1):",
+        "ENOSYS (1):",
+        "M8 (2):",
+        "M9 (1):",
+        "M10 (1):",
+        "implemented (1):",
+    ]
     at = [text.index(h) for h in headers]
     assert at == sorted(at)
     rows = [line for line in text.splitlines() if re.match(r"  +\d+ \w", line)]
@@ -562,3 +572,246 @@ def test_the_checked_in_census_matches_the_table_and_the_script():
         assert entry["nr"] == X86_64[name], name
         assert entry["calls"] > 0, name
         assert set(entry["workloads"]) <= set(meta["workloads"]), name
+
+
+LINUX_MOD_RS = ROOT / "kernel/src/linux/mod.rs"
+DISPATCH_FILE = ROOT / "kernel/src/linux/syscall/mod.rs"
+
+TABLES_RS = """
+pub const M6_SYSCALLS: &[(u32, &str)] = &[
+    (general::__NR_read, "read"),
+    // a comment: (general::__NR_write, "write"),
+    (general::__NR_exit, "exit"),
+];
+pub const M8_SYSCALLS: &[(u32, &str)] = &[(general::__NR_fork, "fork"), (general::__NR_pipe, "pipe")];
+"""
+
+
+def test_kernel_tables_reads_each_milestones_rows():
+    assert syscalls.kernel_tables(TABLES_RS) == {"M6": ["read", "exit"], "M8": ["fork", "pipe"]}
+    with pytest.raises(CensusError, match="no `pub const"):
+        syscalls.kernel_tables("fn main() {}")
+    with pytest.raises(CensusError, match="a shape this can't read: M9_SYSCALLS"):
+        syscalls.kernel_tables(TABLES_RS + "pub const M9_SYSCALLS: &[(u32, &'static str)] = &[];")
+    with pytest.raises(CensusError, match="__NR_fork named 'vfork'"):
+        syscalls.kernel_tables(TABLES_RS.replace('"fork"', '"vfork"'))
+    with pytest.raises(CensusError, match="not a row: 'general::__NR_pipe'"):
+        syscalls.kernel_tables(
+            TABLES_RS.replace('(general::__NR_pipe, "pipe")', "general::__NR_pipe")
+        )
+    bogus = TABLES_RS.replace('__NR_fork, "fork"', '__NR_frok, "frok"')
+    with pytest.raises(CensusError, match="'frok' isn't an x86-64 syscall"):
+        syscalls.kernel_tables(bogus)
+
+
+def test_m8_table_covers_the_census():
+    """ARCHITECTURE section 8: every syscall the M8 census (#337) saw is in
+    M6_SYSCALLS, M7_SYSCALLS or M8_SYSCALLS, or -ENOSYS by a recorded
+    decision (ENOSYS_BY_DECISION); M8's table is the plan's (PLANNED["M8"]),
+    each of its numbers dispatched, and no decided -ENOSYS one dispatched or
+    in a table."""
+    tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
+    assert set(tables) == {"M6", "M7", "M8"}
+    rows = [name for names in tables.values() for name in names]
+    assert len(rows) == len(set(rows)), "a syscall in two tables, or twice in one"
+    assert (len(tables["M6"]), len(tables["M7"]), len(tables["M8"])) == (30, 47, 60)
+
+    census_names = tomllib.loads(CENSUS.read_text())["syscalls"].keys()
+    assert syscalls.uncovered(census_names, tables) == []
+    # The check could have failed: a census syscall in no table and no
+    # decision is reported, and so is one a table lost.
+    assert syscalls.uncovered([*census_names, "socket", "mremap"], tables) == ["mremap", "socket"]
+    without_pipe = {**tables, "M8": [n for n in tables["M8"] if n != "pipe"]}
+    assert syscalls.uncovered(census_names, without_pipe) == ["pipe"]
+
+    assert set(tables["M8"]) == syscalls.PLANNED["M8"] == syscalls.M8_ARGS.keys()
+    assert not syscalls.ENOSYS_BY_DECISION & set(rows)
+    implemented = syscalls.dispatched(DISPATCH_FILE.read_text())
+    assert set(tables["M8"]) <= implemented
+    assert not syscalls.ENOSYS_BY_DECISION & implemented
+    # The two the census saw are among the decisions, which are section 8's
+    # "Stays `-ENOSYS` in M8" list.
+    assert {"sendfile", "membarrier"} <= census_names & syscalls.ENOSYS_BY_DECISION
+    assert syscalls.ENOSYS_BY_DECISION == {
+        "sendfile", "membarrier", "clone3", "execveat", "futex_waitv", "sched_setparam",
+        "sched_getparam", "sched_setscheduler", "sched_getscheduler", "sched_get_priority_max",
+        "sched_get_priority_min", "sched_rr_get_interval", "signalfd", "signalfd4", "times",
+    }  # fmt: skip
+
+
+ARMS_RS = """
+    match nr {
+        Ok(general::__NR_read) => {
+            frame.rax = fd::sys_read(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_exit | general::__NR_exit_group) => task::sys_exit(frame),
+        Ok(general::__NR_getuid | general::__NR_getgid) => {
+            frame.rax = 0;
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_execve) => task::sys_execve(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), frame),
+        Ok(general::__NR_clone) => {
+            // The frame's registers: frame.r9 in a comment isn't read.
+            frame.rax = task::sys_clone(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8), frame);
+            SyscallReturn::Sysret
+        }
+        _ => {
+            log_unknown_once(frame.r9);
+        }
+    }
+"""
+
+
+def test_dispatch_arms_reads_each_arms_handlers_and_registers():
+    five = ("rdi", "rsi", "rdx", "r10", "r8")
+    assert syscalls.dispatch_arms(ARMS_RS) == [
+        syscalls.Arm(("read",), ("sys_read",), ("rdi", "rsi", "rdx")),
+        syscalls.Arm(("exit", "exit_group"), ("sys_exit",), ()),
+        syscalls.Arm(("getuid", "getgid"), (), ()),
+        syscalls.Arm(("execve",), ("sys_execve",), ("rdi", "rsi", "rdx")),
+        syscalls.Arm(("clone",), ("sys_clone",), five),
+    ]
+    assert syscalls.arm_problems(syscalls.dispatch_arms(ARMS_RS)) == []
+
+
+EXECVE_ARM = "task::sys_execve(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), frame),"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "problems"),
+    [
+        ("fd::sys_read(", "fd::sys_write(", ["read: calls sys_write"]),
+        ("reg(frame.rsi), reg(frame.rdx));", "reg(frame.rdx), reg(frame.rsi));", ["read: reads rdi, rdx, rsi"]),
+        (", reg(frame.r8), frame)", ", frame)", ["clone: reads 4 registers, not 5"]),
+        (", reg(frame.r8), frame)", ", reg(frame.r8), reg(frame.r9), frame)", ["clone: reads 6 registers, not 5"]),
+        (EXECVE_ARM, "{ frame.rax = 0; SyscallReturn::Sysret }", ["execve: calls no handler", "execve: reads 0 registers, not 3"]),
+        ("__NR_execve)", "__NR_execve | general::__NR_execveat)", ["execve: shares its arm with execveat"]),
+        ("frame.rax = 0;", "frame.rax = proc::sys_uname(frame.rdi);", ["getuid: calls sys_uname"]),
+    ],
+)  # fmt: skip
+def test_arm_problems_catch_a_wrong_handler_or_register(old, new, problems):
+    assert old in ARMS_RS
+    assert syscalls.arm_problems(syscalls.dispatch_arms(ARMS_RS.replace(old, new, 1))) == problems
+
+
+def test_each_arm_calls_its_own_handler_with_its_registers_in_order():
+    """ARCHITECTURE section 8: each dispatch arm passes the registers of its
+    syscall's Linux signature, in order, to the handler named after it (but
+    M6's two inline arms); an M8 syscall's arm is its own, and reads Linux's
+    argument count."""
+    assert syscalls.arm_problems(syscalls.dispatch_arms(DISPATCH_FILE.read_text())) == []
+
+
+STUBS_RS = """
+/// `pipe2(fds, flags)` (293): M8 stub, replaced by C7 (#386).
+pub(super) fn sys_pipe2(_fds: UserPtr, _flags: OpenFlags) -> u64 {
+    not_implemented(general::__NR_pipe2)
+}
+
+/// `execve(path, argv, envp)` (59): M8 stub, replaced by C2 (#381). It
+/// returns through the frame.
+pub(super) fn sys_execve(
+    _path: UserPtr,
+    frame: &mut SyscallFrame,
+) -> SyscallReturn {
+    frame.rax = not_implemented(general::__NR_execve);
+    SyscallReturn::Sysret
+}
+
+/// `getpid()` (39): not a stub.
+pub(super) fn sys_getpid(frame: &mut SyscallFrame) -> SyscallReturn {
+    frame.rax = 1;
+    SyscallReturn::Sysret
+}
+"""
+STUBS_DESIGN = {"pipe2": ("C7",), "execve": ("C2",), "getpid": ("B1",)}
+STUBS_ISSUES = {"C7": 386, "C2": 381, "B1": 372}
+
+
+def test_stubs_reads_each_stub_and_its_doc():
+    found = syscalls.stubs([STUBS_RS])
+    assert set(found) == {"pipe2", "execve"}
+    assert found["pipe2"].body == "not_implemented(general::__NR_pipe2)"
+    assert found["execve"].doc.endswith("replaced by C2 (#381). It returns through the frame.")
+    assert syscalls.stub_problems(found, STUBS_DESIGN, STUBS_ISSUES) == []
+    # Any visibility is read; a handler of a shape it can't read is refused.
+    assert set(
+        syscalls.stubs([STUBS_RS.replace("pub(super) fn sys_pipe2", "pub(crate) fn sys_pipe2")])
+    ) == {"pipe2", "execve"}
+    one_line = (
+        STUBS_RS + "\npub(super) fn sys_pause() -> u64 { not_implemented(general::__NR_pause) }\n"
+    )
+    with pytest.raises(CensusError, match="a handler of a shape this can't read: sys_pause"):
+        syscalls.stubs([one_line])
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "problem"),
+    [
+        ("not_implemented(general::__NR_pipe2)", "0", "pipe2: body '0'"),
+        ("not_implemented(general::__NR_pipe2)", "not_implemented(general::__NR_pipe)", "pipe2: body"),
+        ("not_implemented(general::__NR_pipe2)", "neg_errno(errno::ENOSYS)", "pipe2: body"),
+        ("frame.rax = not_implemented(general::__NR_execve);", "frame.rax = 0;", "execve: body"),
+        ("C7 (#386)", "C13 (#392)", "pipe2: its doc names C13 (#392), the design (('C7', '386'),)"),
+        ("C7 (#386)", "C7 (#999)", "pipe2: its doc names C7 (#999)"),
+        ("C7 (#386)", "C7 (#386) and C1 (#380)", "pipe2: its doc names C7 (#386), C1 (#380)"),
+        (", replaced by C7 (#386).", ".", "pipe2: its doc names none"),
+    ],
+)  # fmt: skip
+def test_stub_problems_catch_a_stub_doing_more_or_naming_other_issues(old, new, problem):
+    assert old in STUBS_RS
+    found = syscalls.stubs([STUBS_RS.replace(old, new, 1)])
+    problems = syscalls.stub_problems(found, STUBS_DESIGN, STUBS_ISSUES)
+    assert len(problems) == 1 and problems[0].startswith(problem), problems
+
+
+ARCHITECTURE_MD = ROOT / "docs/ARCHITECTURE.md"
+# M8's issue labels and their GitHub issues (filed from ARCHITECTURE section 8's
+# "M8's issues", epic #335).
+# fmt: off
+M8_ISSUES = {
+    "B0": 371, "B1": 372, "B2": 373, "B3": 374, "B4": 375, "B5": 376, "B6": 377, "B7": 378,
+    "B8": 379, "C1": 380, "C2": 381, "C3": 382, "C4": 383, "C5": 384, "C6": 385, "C7": 386,
+    "C8": 387, "C9": 388, "C10": 389, "C11": 390, "C12": 391, "C13": 392, "D1": 393,
+    "D2": 394, "D3": 395, "D4": 396,
+}
+# fmt: on
+
+
+def test_design_issues_reads_the_m8_tables_last_column():
+    design = syscalls.design_issues(ARCHITECTURE_MD.read_text())
+    tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
+    assert set(tables["M8"]) <= design.keys()
+    assert design["clone"] == ("C1", "C3")
+    assert design["setfsuid"] == design["setfsgid"] == ("C12",)
+    assert design["sendfile"] == ()
+    with pytest.raises(CensusError, match="row 57 names vfork"):
+        syscalls.design_issues(
+            ARCHITECTURE_MD.read_text().replace("| 57 | `fork()`", "| 57 | `vfork()`")
+        )
+    with pytest.raises(CensusError, match="no M8 syscall table"):
+        syscalls.design_issues("# nothing")
+
+
+def test_each_m8_stub_returns_enosys_and_names_its_issue():
+    """ARCHITECTURE section 8, "B0's stubs": a stub (its doc says "M8 stub")
+    only returns `not_implemented`'s -ENOSYS for its own number, and its doc
+    names the issues the design's table names for it; every stub is an M8
+    syscall's."""
+    found = syscalls.stubs(syscalls.cluster_sources(DISPATCH_FILE.parent))
+    design = syscalls.design_issues(ARCHITECTURE_MD.read_text())
+    assert syscalls.stub_problems(found, design, M8_ISSUES) == []
+    tables = syscalls.kernel_tables(LINUX_MOD_RS.read_text())
+    assert set(found) <= set(tables["M8"])
+
+
+def test_the_report_lists_a_stub_under_its_milestone(capsys):
+    stubbed = set(syscalls.stubs(syscalls.cluster_sources(DISPATCH_FILE.parent)))
+    assert syscalls.main(["report"]) == 0
+    sections = re.split(r"\n\n", capsys.readouterr().out)
+    implemented = next(s for s in sections if s.startswith("implemented ("))
+    m8 = next((s for s in sections if s.startswith("M8 (")), "")
+    for name in stubbed & tomllib.loads(CENSUS.read_text())["syscalls"].keys():
+        assert re.search(rf"^ +\d+ {name} ", m8, re.MULTILINE), name
+        assert not re.search(rf"^ +\d+ {name} ", implemented, re.MULTILINE), name

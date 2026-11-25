@@ -2801,6 +2801,10 @@ def test_make_deps_dev_fetches_even_with_its_stamp_up_to_date(tmp_path):
     assert "tools/fetch-alpine-packages.sh" in dry.stdout
 
 
+# The Makefile's M8_LINUX: M8's test programs, prerequisites of both images.
+M8_PROGRAMS = ("m8_proc", "m8_io", "m8_vm", "ptyrun")
+
+
 @pytest.mark.parametrize("newer", ["tools/alpine-packages.lock", "tools/alpine-lock.py"])
 def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer):
     files = [
@@ -2809,6 +2813,7 @@ def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer)
         "linux/hello",
         "linux/m7_test",
         "linux/m7_vfs",
+        *(f"linux/{n}" for n in M8_PROGRAMS),
         "deps/alpine-packages/.lock",
         "alpine-dev.ext4",
     ]
@@ -2822,6 +2827,7 @@ def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer)
                 "tools/ext4-signed-hash.sh",
                 "tools/alpine-packages.lock",
                 "tools/fetch-alpine-packages.sh",
+                *(f"tools/linux-m8/{n}.rs" for n in ("common", *M8_PROGRAMS)),
             )
         )
         + 200

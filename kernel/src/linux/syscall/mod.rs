@@ -3,15 +3,19 @@
 //! `dispatch` maps each syscall number to its handler, each number in one
 //! `match` arm (its constant as the pattern, so the compiler refuses one
 //! routed twice), passing the registers of the syscall's Linux signature
-//! (an M7 handler's, and since #254 the M6 descriptor handlers' and
-//! `getcwd`'s, decoded by `at::reg` into its parameter types; `poll` and
-//! the rest of M6 still take raw registers).
+//! (an M7 handler's, an M8 stub's, and since #254 the M6 descriptor
+//! handlers' and `getcwd`'s, decoded by `at::reg` into its parameter types;
+//! `poll` and the rest of M6 still take raw registers, and `task`'s M6
+//! handlers the whole frame). A handler that returns through the frame
+//! (`execve`, `rt_sigreturn`, `restart_syscall`) or reads it (`clone`,
+//! `fork`, `vfork`: the child's registers are made from it; `sigaltstack`:
+//! the caller's `rsp`) is passed it after its arguments.
 //! The handlers live in one module per cluster, so the PRs that implement
 //! M7 (#254, #255) each change only their own module, not `dispatch`:
 //!
-//! - `fd`: descriptor I/O (`read`, `write`, `close`, `fstat`, `poll`,
-//!   `ioctl`, `readv`, `writev`; M7: `open`, `openat`, `lseek`), over the
-//!   process's FD table (#254).
+//! - `fd`: descriptor I/O (`read`, `write`, `close`, `fstat`, `ioctl`,
+//!   `readv`, `writev`; M7: `open`, `openat`, `lseek`), over the process's
+//!   FD table (#254).
 //! - `stat`: `stat`, `lstat`, `newfstatat`, `statx`, `access`, `faccessat`,
 //!   `faccessat2` (M7).
 //! - `ns`: namespace changes (`mkdir*`, `rmdir`, `unlink*`, `link*`,
@@ -23,8 +27,28 @@
 //! - `lock`: `fcntl`, `flock` (M7).
 //! - `mem`: `mmap`, `mprotect`, `munmap`, `brk` (M6); `mmap` of a file and
 //!   `msync` (M7).
-//! - `proc`: signals, `arch_prctl`, `prlimit64`, `uname`, `clock_gettime`,
+//! - `proc`: `arch_prctl`, `prlimit64`, `uname`, `clock_gettime`,
 //!   `getrandom` (M6).
+//!
+//! M8's clusters (ARCHITECTURE section 8, "B0's stubs"), M6's handlers
+//! moved into them unchanged (#371). Each new M8 number is a stub
+//! (`not_implemented`) until the issue its doc names replaces it:
+//!
+//! - `task`: `exit`, `exit_group`, `getpid`, `gettid`, `getppid`,
+//!   `set_tid_address` (M6); `clone`, `fork`, `vfork`, `execve`, `wait4`,
+//!   `waitid`, the session and group calls (M6's `getpgrp` still an arm in
+//!   `dispatch`).
+//! - `signal`: `rt_sigaction`, `rt_sigprocmask` (M6); `rt_sigreturn`, the
+//!   other `rt_sig*` calls, `sigaltstack`, `kill`, `tkill`, `tgkill`,
+//!   `pause`, `restart_syscall`.
+//! - `futex`: `futex`, the robust-list calls, `nanosleep`,
+//!   `clock_nanosleep`.
+//! - `poll`: `poll` (M6); `select`, `pselect6`, `ppoll`.
+//! - `pipe`: `pipe`, `pipe2`, `dup`, `dup2`, `dup3`, `mknod`, `mknodat`.
+//! - `timer`: `alarm`, `getitimer`, `setitimer`, the `timer_*` calls.
+//! - `sys`: `sched_yield`, the affinity and priority calls, `getrusage`,
+//!   `sysinfo`, `prctl`, `statfs`, `fstatfs`, `clock_getres`, `getcpu`,
+//!   `setfsuid`, `setfsgid`.
 //!
 //! `at` holds what the M7 file syscalls share: their register decoders
 //! (`reg`, `FromReg`: `Fd`, `Dirfd`, `Mode`, the VFS's flag types,
@@ -43,23 +67,29 @@
 mod at;
 mod dir;
 mod fd;
+mod futex;
 mod io;
 mod lock;
 mod mem;
 mod meta;
 mod ns;
+mod pipe;
+mod poll;
 mod proc;
+mod signal;
 mod stat;
+mod sys;
+mod task;
+mod timer;
 
 use alloc::vec;
 use core::mem::{MaybeUninit, size_of};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch;
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
-use crate::linux::process::{ConsoleIo, KernelSigaction, record_exit, with_current, with_current_mut};
+use crate::linux::process::{ConsoleIo, KernelSigaction, with_current};
 use crate::linux::{Utsname, errno, general};
-use crate::user::{CopyError, UserExit, copy_from_user, copy_to_user, user_range_valid};
+use crate::user::{CopyError, copy_from_user, copy_to_user, user_range_valid};
 use at::reg;
 
 /// Maximum `iovec` count accepted by `readv`/`writev` (POSIX `UIO_MAXIOV`).
@@ -87,7 +117,7 @@ struct RawIovec {
 // Compile-time zero-padding verification for every POD ABI struct copied to/from user space.
 const _: () = {
     assert!(size_of::<RawIovec>() == size_of::<general::iovec>() && size_of::<RawIovec>() == 16);
-    assert!(size_of::<fd::RawPollFd>() == size_of::<general::pollfd>() && size_of::<fd::RawPollFd>() == 8);
+    assert!(size_of::<poll::RawPollFd>() == size_of::<general::pollfd>() && size_of::<poll::RawPollFd>() == 8);
     assert!(size_of::<general::stat>() == 144);
     assert!(size_of::<general::termios>() == 36);
     assert!(size_of::<general::winsize>() == 8);
@@ -186,10 +216,22 @@ fn first_report(nr: u64) -> bool {
     false
 }
 
+/// Log a syscall answered `-ENOSYS` (no arm, or an M8 stub) once per number,
+/// with its name when one of the kernel's tables has it.
 fn log_unknown_once(nr: u64) {
     if first_report(nr) {
-        log::debug!(target: "linux", "unimplemented syscall #{nr}");
+        match u32::try_from(nr).ok().and_then(crate::linux::syscall_name) {
+            Some(name) => log::debug!(target: "linux", "unimplemented syscall #{nr} ({name})"),
+            None => log::debug!(target: "linux", "unimplemented syscall #{nr}"),
+        }
     }
+}
+
+/// The body of an M8 syscall's stub until the issue its doc names replaces
+/// it: logged as an unknown syscall is, and `-ENOSYS`.
+fn not_implemented(nr: u32) -> u64 {
+    log_unknown_once(u64::from(nr));
+    neg_errno(errno::ENOSYS)
 }
 
 /// Dispatch one Linux x86-64 syscall (`rax` = nr, `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` = args).
@@ -217,7 +259,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_poll) => {
-            frame.rax = fd::sys_poll(frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = poll::sys_poll(frame.rdi, frame.rsi, frame.rdx);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_mmap) => {
@@ -237,11 +279,11 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             SyscallReturn::Sysret
         }
         Ok(general::__NR_rt_sigaction) => {
-            frame.rax = proc::sys_rt_sigaction(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = signal::sys_rt_sigaction(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_rt_sigprocmask) => {
-            frame.rax = proc::sys_rt_sigprocmask(frame.rdi, frame.rsi, frame.rdx, frame.r10);
+            frame.rax = signal::sys_rt_sigprocmask(frame.rdi, frame.rsi, frame.rdx, frame.r10);
             SyscallReturn::Sysret
         }
         Ok(general::__NR_ioctl) => {
@@ -256,20 +298,8 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = fd::sys_writev(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_getpid) => {
-            frame.rax = u64::from(with_current(|p| p.pid));
-            SyscallReturn::Sysret
-        }
-        Ok(general::__NR_exit | general::__NR_exit_group) => {
-            let status = (frame.rdi & 0xff) as i32;
-            let (_, is_test) = record_exit(UserExit::Exited(status));
-            if is_test {
-                crate::user::note_exit_status(status);
-            }
-            // SAFETY: unwinds cleanly back to `enter_ring3`; no lock held and
-            // no live Rust `Drop` values on this stack frame.
-            unsafe { arch::syscall::unwind_to_kernel() }
-        }
+        Ok(general::__NR_getpid) => task::sys_getpid(frame),
+        Ok(general::__NR_exit | general::__NR_exit_group) => task::sys_exit(frame),
         Ok(general::__NR_uname) => {
             frame.rax = proc::sys_uname(frame.rdi);
             SyscallReturn::Sysret
@@ -282,10 +312,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = 0;
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_getppid) => {
-            frame.rax = u64::from(with_current(|p| p.ppid));
-            SyscallReturn::Sysret
-        }
+        Ok(general::__NR_getppid) => task::sys_getppid(frame),
         Ok(general::__NR_getpgrp) => {
             frame.rax = u64::from(with_current(|p| p.pid));
             SyscallReturn::Sysret
@@ -294,18 +321,8 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
             frame.rax = proc::sys_arch_prctl(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
         }
-        Ok(general::__NR_gettid) => {
-            frame.rax = u64::from(with_current(|p| p.tid));
-            SyscallReturn::Sysret
-        }
-        Ok(general::__NR_set_tid_address) => {
-            let tidptr = frame.rdi;
-            frame.rax = u64::from(with_current_mut(|p| {
-                p.clear_child_tid = tidptr;
-                p.tid
-            }));
-            SyscallReturn::Sysret
-        }
+        Ok(general::__NR_gettid) => task::sys_gettid(frame),
+        Ok(general::__NR_set_tid_address) => task::sys_set_tid_address(frame),
         Ok(general::__NR_clock_gettime) => {
             frame.rax = proc::sys_clock_gettime(frame.rdi, frame.rsi);
             SyscallReturn::Sysret
@@ -511,6 +528,253 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         }
         Ok(general::__NR_flock) => {
             frame.rax = lock::sys_flock(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+
+        // M8 (`crate::linux::M8_SYSCALLS`, but `poll`, M6's, above), by
+        // cluster: each number's stub returns `-ENOSYS` until the issue its
+        // doc names replaces it. Each arm passes the arguments of the
+        // syscall's Linux x86-64 signature, decoded by `reg` (`at.rs`).
+        Ok(general::__NR_clone) => {
+            frame.rax =
+                task::sys_clone(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8), frame);
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_fork) => {
+            frame.rax = task::sys_fork(frame);
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_vfork) => {
+            frame.rax = task::sys_vfork(frame);
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_execve) => task::sys_execve(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), frame),
+        Ok(general::__NR_wait4) => {
+            frame.rax = task::sys_wait4(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_waitid) => {
+            frame.rax = task::sys_waitid(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_setpgid) => {
+            frame.rax = task::sys_setpgid(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_setsid) => {
+            frame.rax = task::sys_setsid();
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getpgid) => {
+            frame.rax = task::sys_getpgid(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getsid) => {
+            frame.rax = task::sys_getsid(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_rt_sigreturn) => signal::sys_rt_sigreturn(frame),
+        Ok(general::__NR_rt_sigpending) => {
+            frame.rax = signal::sys_rt_sigpending(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_rt_sigtimedwait) => {
+            frame.rax = signal::sys_rt_sigtimedwait(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_rt_sigqueueinfo) => {
+            frame.rax = signal::sys_rt_sigqueueinfo(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_rt_tgsigqueueinfo) => {
+            frame.rax = signal::sys_rt_tgsigqueueinfo(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_rt_sigsuspend) => {
+            frame.rax = signal::sys_rt_sigsuspend(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_sigaltstack) => {
+            frame.rax = signal::sys_sigaltstack(reg(frame.rdi), reg(frame.rsi), frame);
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_kill) => {
+            frame.rax = signal::sys_kill(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_tkill) => {
+            frame.rax = signal::sys_tkill(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_tgkill) => {
+            frame.rax = signal::sys_tgkill(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_pause) => {
+            frame.rax = signal::sys_pause();
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_restart_syscall) => signal::sys_restart_syscall(frame),
+        Ok(general::__NR_futex) => {
+            frame.rax = futex::sys_futex(
+                reg(frame.rdi),
+                reg(frame.rsi),
+                reg(frame.rdx),
+                reg(frame.r10),
+                reg(frame.r8),
+                reg(frame.r9),
+            );
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_set_robust_list) => {
+            frame.rax = futex::sys_set_robust_list(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_get_robust_list) => {
+            frame.rax = futex::sys_get_robust_list(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_nanosleep) => {
+            frame.rax = futex::sys_nanosleep(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_clock_nanosleep) => {
+            frame.rax = futex::sys_clock_nanosleep(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_select) => {
+            frame.rax = poll::sys_select(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_pselect6) => {
+            frame.rax = poll::sys_pselect6(
+                reg(frame.rdi),
+                reg(frame.rsi),
+                reg(frame.rdx),
+                reg(frame.r10),
+                reg(frame.r8),
+                reg(frame.r9),
+            );
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_ppoll) => {
+            frame.rax = poll::sys_ppoll(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_pipe) => {
+            frame.rax = pipe::sys_pipe(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_pipe2) => {
+            frame.rax = pipe::sys_pipe2(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_dup) => {
+            frame.rax = pipe::sys_dup(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_dup2) => {
+            frame.rax = pipe::sys_dup2(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_dup3) => {
+            frame.rax = pipe::sys_dup3(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_mknod) => {
+            frame.rax = pipe::sys_mknod(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_mknodat) => {
+            frame.rax = pipe::sys_mknodat(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_alarm) => {
+            frame.rax = timer::sys_alarm(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getitimer) => {
+            frame.rax = timer::sys_getitimer(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_setitimer) => {
+            frame.rax = timer::sys_setitimer(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_timer_create) => {
+            frame.rax = timer::sys_timer_create(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_timer_settime) => {
+            frame.rax = timer::sys_timer_settime(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_timer_gettime) => {
+            frame.rax = timer::sys_timer_gettime(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_timer_getoverrun) => {
+            frame.rax = timer::sys_timer_getoverrun(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_timer_delete) => {
+            frame.rax = timer::sys_timer_delete(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_sched_yield) => {
+            frame.rax = sys::sys_sched_yield();
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_sched_setaffinity) => {
+            frame.rax = sys::sys_sched_setaffinity(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_sched_getaffinity) => {
+            frame.rax = sys::sys_sched_getaffinity(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getpriority) => {
+            frame.rax = sys::sys_getpriority(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_setpriority) => {
+            frame.rax = sys::sys_setpriority(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getrusage) => {
+            frame.rax = sys::sys_getrusage(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_sysinfo) => {
+            frame.rax = sys::sys_sysinfo(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_prctl) => {
+            frame.rax = sys::sys_prctl(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx), reg(frame.r10), reg(frame.r8));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_statfs) => {
+            frame.rax = sys::sys_statfs(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_fstatfs) => {
+            frame.rax = sys::sys_fstatfs(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_clock_getres) => {
+            frame.rax = sys::sys_clock_getres(reg(frame.rdi), reg(frame.rsi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_getcpu) => {
+            frame.rax = sys::sys_getcpu(reg(frame.rdi), reg(frame.rsi), reg(frame.rdx));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_setfsuid) => {
+            frame.rax = sys::sys_setfsuid(reg(frame.rdi));
+            SyscallReturn::Sysret
+        }
+        Ok(general::__NR_setfsgid) => {
+            frame.rax = sys::sys_setfsgid(reg(frame.rdi));
             SyscallReturn::Sysret
         }
 

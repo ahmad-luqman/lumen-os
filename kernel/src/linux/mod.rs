@@ -78,8 +78,7 @@ pub const M6_SYSCALLS: &[(u32, &str)] = &[
 
 /// The 47 Linux x86-64 syscalls M7 adds (`docs/ARCHITECTURE.md` section 8's
 /// M7 table, less `mmap` (9) and `getcwd` (79), which M6 already has and M7
-/// extends). Each has its own arm in `syscall::dispatch`; one not yet
-/// implemented is a stub returning `-ENOSYS`.
+/// extends). Each has its own arm in `syscall::dispatch`.
 pub const M7_SYSCALLS: &[(u32, &str)] = &[
     (general::__NR_open, "open"),
     (general::__NR_stat, "stat"),
@@ -130,9 +129,78 @@ pub const M7_SYSCALLS: &[(u32, &str)] = &[
     (general::__NR_fchmodat2, "fchmodat2"),
 ];
 
-/// Look up the name of an M6 or M7 Linux x86-64 syscall by number.
+/// The 60 Linux x86-64 syscalls M8 adds (`docs/ARCHITECTURE.md` section 8's
+/// M8 table, less the rows M6 or M7 already has and the two that stay
+/// `-ENOSYS`, `sendfile` (40) and `membarrier` (324)). `poll` (7) is one:
+/// M6 dispatches it, but M6's table of 30 never listed it. Each has its own
+/// arm in `syscall::dispatch`; B0 (#371) made the others stubs returning
+/// `-ENOSYS` until the issue the design names for each replaces it.
+pub const M8_SYSCALLS: &[(u32, &str)] = &[
+    (general::__NR_poll, "poll"),
+    (general::__NR_rt_sigreturn, "rt_sigreturn"),
+    (general::__NR_pipe, "pipe"),
+    (general::__NR_select, "select"),
+    (general::__NR_sched_yield, "sched_yield"),
+    (general::__NR_dup, "dup"),
+    (general::__NR_dup2, "dup2"),
+    (general::__NR_pause, "pause"),
+    (general::__NR_nanosleep, "nanosleep"),
+    (general::__NR_getitimer, "getitimer"),
+    (general::__NR_alarm, "alarm"),
+    (general::__NR_setitimer, "setitimer"),
+    (general::__NR_clone, "clone"),
+    (general::__NR_fork, "fork"),
+    (general::__NR_vfork, "vfork"),
+    (general::__NR_execve, "execve"),
+    (general::__NR_wait4, "wait4"),
+    (general::__NR_kill, "kill"),
+    (general::__NR_getrusage, "getrusage"),
+    (general::__NR_sysinfo, "sysinfo"),
+    (general::__NR_setpgid, "setpgid"),
+    (general::__NR_setsid, "setsid"),
+    (general::__NR_getpgid, "getpgid"),
+    (general::__NR_setfsuid, "setfsuid"),
+    (general::__NR_setfsgid, "setfsgid"),
+    (general::__NR_getsid, "getsid"),
+    (general::__NR_rt_sigpending, "rt_sigpending"),
+    (general::__NR_rt_sigtimedwait, "rt_sigtimedwait"),
+    (general::__NR_rt_sigqueueinfo, "rt_sigqueueinfo"),
+    (general::__NR_rt_sigsuspend, "rt_sigsuspend"),
+    (general::__NR_sigaltstack, "sigaltstack"),
+    (general::__NR_mknod, "mknod"),
+    (general::__NR_statfs, "statfs"),
+    (general::__NR_fstatfs, "fstatfs"),
+    (general::__NR_getpriority, "getpriority"),
+    (general::__NR_setpriority, "setpriority"),
+    (general::__NR_prctl, "prctl"),
+    (general::__NR_tkill, "tkill"),
+    (general::__NR_futex, "futex"),
+    (general::__NR_sched_setaffinity, "sched_setaffinity"),
+    (general::__NR_sched_getaffinity, "sched_getaffinity"),
+    (general::__NR_restart_syscall, "restart_syscall"),
+    (general::__NR_timer_create, "timer_create"),
+    (general::__NR_timer_settime, "timer_settime"),
+    (general::__NR_timer_gettime, "timer_gettime"),
+    (general::__NR_timer_getoverrun, "timer_getoverrun"),
+    (general::__NR_timer_delete, "timer_delete"),
+    (general::__NR_clock_getres, "clock_getres"),
+    (general::__NR_clock_nanosleep, "clock_nanosleep"),
+    (general::__NR_tgkill, "tgkill"),
+    (general::__NR_waitid, "waitid"),
+    (general::__NR_mknodat, "mknodat"),
+    (general::__NR_pselect6, "pselect6"),
+    (general::__NR_ppoll, "ppoll"),
+    (general::__NR_set_robust_list, "set_robust_list"),
+    (general::__NR_get_robust_list, "get_robust_list"),
+    (general::__NR_dup3, "dup3"),
+    (general::__NR_pipe2, "pipe2"),
+    (general::__NR_rt_tgsigqueueinfo, "rt_tgsigqueueinfo"),
+    (general::__NR_getcpu, "getcpu"),
+];
+
+/// Look up the name of an M6, M7 or M8 Linux x86-64 syscall by number.
 pub fn syscall_name(nr: u32) -> Option<&'static str> {
-    M6_SYSCALLS.iter().chain(M7_SYSCALLS).find_map(|&(num, name)| (num == nr).then_some(name))
+    M6_SYSCALLS.iter().chain(M7_SYSCALLS).chain(M8_SYSCALLS).find_map(|&(num, name)| (num == nr).then_some(name))
 }
 
 /// Copy an ASCII string into a fixed-size NUL-terminated `c_char` field,
@@ -185,9 +253,10 @@ pub fn log_abi_summary() {
     let mods = modules::list();
     log::debug!(
         target: "linux",
-        "abi: {} M6 syscalls, {} M7 (#{uname_nr} {uname_name}: {} {} {}, -ENOSYS={}), {} boot module(s)",
+        "abi: {} M6 syscalls, {} M7, {} M8 (#{uname_nr} {uname_name}: {} {} {}, -ENOSYS={}), {} boot module(s)",
         M6_SYSCALLS.len(),
         M7_SYSCALLS.len(),
+        M8_SYSCALLS.len(),
         read_uts_field(&uts.sysname),
         read_uts_field(&uts.release),
         read_uts_field(&uts.machine),
@@ -634,6 +703,451 @@ crate::ktest!(
         crate::kassert_eq!(offset_of!(general::flock, l_start), 8);
         crate::kassert_eq!(offset_of!(general::flock, l_len), 16);
         crate::kassert_eq!(offset_of!(general::flock, l_pid), 24);
+
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn m8_abi_constants_match_spec() {
+        use core::mem::{offset_of, size_of};
+
+        // 1. Every row of ARCHITECTURE.md section 8's M8 syscall table, by
+        //    number. Eleven are M6's and four M7's (changed in M8, still in
+        //    their tables); two stay `-ENOSYS` by decision (in no table, and
+        //    `syscalls.py`'s `ENOSYS_BY_DECISION`); the other 60 are
+        //    `M8_SYSCALLS`. Each spec number's name through `syscall_name`
+        //    must be the row's, so the tables' `linux-raw-sys` constants
+        //    equal these numbers.
+        let m6_rows: &[(u32, &str)] = &[
+            (13, "rt_sigaction"),
+            (14, "rt_sigprocmask"),
+            (16, "ioctl"),
+            (39, "getpid"),
+            (60, "exit"),
+            (110, "getppid"),
+            (111, "getpgrp"),
+            (186, "gettid"),
+            (218, "set_tid_address"),
+            (231, "exit_group"),
+            (302, "prlimit64"),
+        ];
+        let m7_rows: &[(u32, &str)] = &[(72, "fcntl"), (73, "flock"), (76, "truncate"), (77, "ftruncate")];
+        let enosys_rows: &[(u32, u32)] = &[(40, general::__NR_sendfile), (324, general::__NR_membarrier)];
+        let m8_rows: &[(u32, &str)] = &[
+            (7, "poll"),
+            (15, "rt_sigreturn"),
+            (22, "pipe"),
+            (23, "select"),
+            (24, "sched_yield"),
+            (32, "dup"),
+            (33, "dup2"),
+            (34, "pause"),
+            (35, "nanosleep"),
+            (36, "getitimer"),
+            (37, "alarm"),
+            (38, "setitimer"),
+            (56, "clone"),
+            (57, "fork"),
+            (58, "vfork"),
+            (59, "execve"),
+            (61, "wait4"),
+            (62, "kill"),
+            (98, "getrusage"),
+            (99, "sysinfo"),
+            (109, "setpgid"),
+            (112, "setsid"),
+            (121, "getpgid"),
+            (122, "setfsuid"),
+            (123, "setfsgid"),
+            (124, "getsid"),
+            (127, "rt_sigpending"),
+            (128, "rt_sigtimedwait"),
+            (129, "rt_sigqueueinfo"),
+            (130, "rt_sigsuspend"),
+            (131, "sigaltstack"),
+            (133, "mknod"),
+            (137, "statfs"),
+            (138, "fstatfs"),
+            (140, "getpriority"),
+            (141, "setpriority"),
+            (157, "prctl"),
+            (200, "tkill"),
+            (202, "futex"),
+            (203, "sched_setaffinity"),
+            (204, "sched_getaffinity"),
+            (219, "restart_syscall"),
+            (222, "timer_create"),
+            (223, "timer_settime"),
+            (224, "timer_gettime"),
+            (225, "timer_getoverrun"),
+            (226, "timer_delete"),
+            (229, "clock_getres"),
+            (230, "clock_nanosleep"),
+            (234, "tgkill"),
+            (247, "waitid"),
+            (259, "mknodat"),
+            (270, "pselect6"),
+            (271, "ppoll"),
+            (273, "set_robust_list"),
+            (274, "get_robust_list"),
+            (292, "dup3"),
+            (293, "pipe2"),
+            (297, "rt_tgsigqueueinfo"),
+            (309, "getcpu"),
+        ];
+        crate::kassert_eq!(M8_SYSCALLS.len(), 60);
+        crate::kassert_eq!(m8_rows.len(), M8_SYSCALLS.len());
+        let in_m6 = |nr: u32| M6_SYSCALLS.iter().any(|&(n, _)| n == nr);
+        let in_m7 = |nr: u32| M7_SYSCALLS.iter().any(|&(n, _)| n == nr);
+        let in_m8 = |nr: u32| M8_SYSCALLS.iter().any(|&(n, _)| n == nr);
+        for &(nr, name) in m6_rows {
+            crate::kassert!(in_m6(nr) && !in_m7(nr) && !in_m8(nr));
+            crate::kassert_eq!(syscall_name(nr), Some(name));
+        }
+        for &(nr, name) in m7_rows {
+            crate::kassert!(in_m7(nr) && !in_m6(nr) && !in_m8(nr));
+            crate::kassert_eq!(syscall_name(nr), Some(name));
+        }
+        for &(nr, name) in m8_rows {
+            crate::kassert!(in_m8(nr) && !in_m6(nr) && !in_m7(nr));
+            crate::kassert_eq!(syscall_name(nr), Some(name));
+        }
+        for &(spec_nr, actual) in enosys_rows {
+            crate::kassert_eq!(actual, spec_nr);
+            crate::kassert_eq!(syscall_name(spec_nr), None);
+        }
+        // No number twice: with the lengths above, `M8_SYSCALLS` is exactly
+        // the 60 rows.
+        for (i, &(nr, _)) in M8_SYSCALLS.iter().enumerate() {
+            crate::kassert!(M8_SYSCALLS[i + 1..].iter().all(|&(other, _)| other != nr));
+        }
+        //    The other `-ENOSYS` decisions (section 8, "Stays `-ENOSYS` in
+        //    M8"): no table has them either.
+        for nr in [
+            general::__NR_clone3,
+            general::__NR_execveat,
+            general::__NR_futex_waitv,
+            general::__NR_sched_setparam,
+            general::__NR_sched_getparam,
+            general::__NR_sched_setscheduler,
+            general::__NR_sched_getscheduler,
+            general::__NR_sched_get_priority_max,
+            general::__NR_sched_get_priority_min,
+            general::__NR_sched_rr_get_interval,
+            general::__NR_signalfd,
+            general::__NR_signalfd4,
+            general::__NR_times,
+        ] {
+            crate::kassert_eq!(syscall_name(nr), None);
+        }
+        crate::kassert_eq!(general::__NR_clone3, 435);
+        crate::kassert_eq!(general::__NR_execveat, 322);
+        crate::kassert_eq!(general::__NR_futex_waitv, 449);
+        crate::kassert_eq!(general::__NR_sched_setparam, 142);
+        crate::kassert_eq!(general::__NR_sched_getparam, 143);
+        crate::kassert_eq!(general::__NR_sched_setscheduler, 144);
+        crate::kassert_eq!(general::__NR_sched_getscheduler, 145);
+        crate::kassert_eq!(general::__NR_sched_get_priority_max, 146);
+        crate::kassert_eq!(general::__NR_sched_get_priority_min, 147);
+        crate::kassert_eq!(general::__NR_sched_rr_get_interval, 148);
+        crate::kassert_eq!(general::__NR_signalfd, 282);
+        crate::kassert_eq!(general::__NR_signalfd4, 289);
+        crate::kassert_eq!(general::__NR_times, 100);
+
+        // 2. The flags, commands and codes the M8 syscalls take (Linux
+        //    x86-64 values).
+        //    `clone`'s flags: `fork`'s exit signal sits in the low byte.
+        crate::kassert_eq!(general::CSIGNAL, 0xff);
+        crate::kassert_eq!(general::CLONE_VM, 0x100);
+        crate::kassert_eq!(general::CLONE_FS, 0x200);
+        crate::kassert_eq!(general::CLONE_FILES, 0x400);
+        crate::kassert_eq!(general::CLONE_SIGHAND, 0x800);
+        crate::kassert_eq!(general::CLONE_PIDFD, 0x1000);
+        crate::kassert_eq!(general::CLONE_PTRACE, 0x2000);
+        crate::kassert_eq!(general::CLONE_VFORK, 0x4000);
+        crate::kassert_eq!(general::CLONE_PARENT, 0x8000);
+        crate::kassert_eq!(general::CLONE_THREAD, 0x1_0000);
+        crate::kassert_eq!(general::CLONE_NEWNS, 0x2_0000);
+        crate::kassert_eq!(general::CLONE_SYSVSEM, 0x4_0000);
+        crate::kassert_eq!(general::CLONE_SETTLS, 0x8_0000);
+        crate::kassert_eq!(general::CLONE_PARENT_SETTID, 0x10_0000);
+        crate::kassert_eq!(general::CLONE_CHILD_CLEARTID, 0x20_0000);
+        crate::kassert_eq!(general::CLONE_DETACHED, 0x40_0000);
+        crate::kassert_eq!(general::CLONE_UNTRACED, 0x80_0000);
+        crate::kassert_eq!(general::CLONE_CHILD_SETTID, 0x100_0000);
+        //    `wait4`/`waitid` options and `waitid`'s id types.
+        crate::kassert_eq!(general::WNOHANG, 1);
+        crate::kassert_eq!(general::WUNTRACED, 2);
+        crate::kassert_eq!(general::WSTOPPED, 2);
+        crate::kassert_eq!(general::WEXITED, 4);
+        crate::kassert_eq!(general::WCONTINUED, 8);
+        crate::kassert_eq!(general::WNOWAIT, 0x100_0000);
+        crate::kassert_eq!(general::__WNOTHREAD, 0x2000_0000);
+        crate::kassert_eq!(general::__WALL, 0x4000_0000);
+        crate::kassert_eq!(general::__WCLONE, 0x8000_0000);
+        crate::kassert_eq!(general::P_ALL, 0);
+        crate::kassert_eq!(general::P_PID, 1);
+        crate::kassert_eq!(general::P_PGID, 2);
+        crate::kassert_eq!(general::P_PIDFD, 3);
+        //    Signal numbers: the 31 standard ones, then the real-time range.
+        let signals: &[(u32, u32)] = &[
+            (general::SIGHUP, 1),
+            (general::SIGINT, 2),
+            (general::SIGQUIT, 3),
+            (general::SIGILL, 4),
+            (general::SIGTRAP, 5),
+            (general::SIGABRT, 6),
+            (general::SIGBUS, 7),
+            (general::SIGFPE, 8),
+            (general::SIGKILL, 9),
+            (general::SIGUSR1, 10),
+            (general::SIGSEGV, 11),
+            (general::SIGUSR2, 12),
+            (general::SIGPIPE, 13),
+            (general::SIGALRM, 14),
+            (general::SIGTERM, 15),
+            (general::SIGSTKFLT, 16),
+            (general::SIGCHLD, 17),
+            (general::SIGCONT, 18),
+            (general::SIGSTOP, 19),
+            (general::SIGTSTP, 20),
+            (general::SIGTTIN, 21),
+            (general::SIGTTOU, 22),
+            (general::SIGURG, 23),
+            (general::SIGXCPU, 24),
+            (general::SIGXFSZ, 25),
+            (general::SIGVTALRM, 26),
+            (general::SIGPROF, 27),
+            (general::SIGWINCH, 28),
+            (general::SIGIO, 29),
+            (general::SIGPWR, 30),
+            (general::SIGSYS, 31),
+            (general::SIGRTMIN, 32),
+            (general::_NSIG, 64),
+        ];
+        for &(actual, spec) in signals {
+            crate::kassert_eq!(actual, spec);
+        }
+        //    `rt_sigaction`'s flags and `rt_sigprocmask`'s `how`.
+        crate::kassert_eq!(general::SA_NOCLDSTOP, 1);
+        crate::kassert_eq!(general::SA_NOCLDWAIT, 2);
+        crate::kassert_eq!(general::SA_SIGINFO, 4);
+        crate::kassert_eq!(general::SA_RESTORER, 0x400_0000);
+        crate::kassert_eq!(general::SA_ONSTACK, 0x800_0000);
+        crate::kassert_eq!(general::SA_RESTART, 0x1000_0000);
+        crate::kassert_eq!(general::SA_NODEFER, 0x4000_0000);
+        crate::kassert_eq!(general::SA_RESETHAND, 0x8000_0000);
+        crate::kassert_eq!(general::SIG_BLOCK, 0);
+        crate::kassert_eq!(general::SIG_UNBLOCK, 1);
+        crate::kassert_eq!(general::SIG_SETMASK, 2);
+        //    `sigaltstack`'s flags and sizes.
+        crate::kassert_eq!(general::SS_ONSTACK, 1);
+        crate::kassert_eq!(general::SS_DISABLE, 2);
+        crate::kassert_eq!(general::SS_AUTODISARM, 0x8000_0000);
+        crate::kassert_eq!(general::MINSIGSTKSZ, 2048);
+        crate::kassert_eq!(general::SIGSTKSZ, 8192);
+        //    `siginfo`'s codes: who sent a signal, and `SIGCHLD`'s,
+        //    `SIGSEGV`'s and `SIGBUS`'s reasons.
+        crate::kassert_eq!(general::SI_USER, 0);
+        crate::kassert_eq!(general::SI_KERNEL, 0x80);
+        crate::kassert_eq!(general::SI_QUEUE, -1);
+        crate::kassert_eq!(general::SI_TIMER, -2);
+        crate::kassert_eq!(general::SI_TKILL, -6);
+        crate::kassert_eq!(general::CLD_EXITED, 1);
+        crate::kassert_eq!(general::CLD_KILLED, 2);
+        crate::kassert_eq!(general::CLD_DUMPED, 3);
+        crate::kassert_eq!(general::CLD_TRAPPED, 4);
+        crate::kassert_eq!(general::CLD_STOPPED, 5);
+        crate::kassert_eq!(general::CLD_CONTINUED, 6);
+        crate::kassert_eq!(general::SEGV_MAPERR, 1);
+        crate::kassert_eq!(general::SEGV_ACCERR, 2);
+        crate::kassert_eq!(general::BUS_ADRERR, 2);
+        //    Timers: `sigevent`'s notifications, `TIMER_ABSTIME`, the
+        //    interval timers, and the clocks M8 refuses (`-EINVAL`).
+        crate::kassert_eq!(general::SIGEV_SIGNAL, 0);
+        crate::kassert_eq!(general::SIGEV_NONE, 1);
+        crate::kassert_eq!(general::SIGEV_THREAD, 2);
+        crate::kassert_eq!(general::SIGEV_THREAD_ID, 4);
+        crate::kassert_eq!(general::TIMER_ABSTIME, 1);
+        crate::kassert_eq!(general::ITIMER_REAL, 0);
+        crate::kassert_eq!(general::ITIMER_VIRTUAL, 1);
+        crate::kassert_eq!(general::ITIMER_PROF, 2);
+        crate::kassert_eq!(general::CLOCK_PROCESS_CPUTIME_ID, 2);
+        crate::kassert_eq!(general::CLOCK_THREAD_CPUTIME_ID, 3);
+        crate::kassert_eq!(general::CLOCK_REALTIME_ALARM, 8);
+        crate::kassert_eq!(general::CLOCK_BOOTTIME_ALARM, 9);
+        crate::kassert_eq!(general::CLOCK_TAI, 11);
+        //    `futex`'s operations, flags and robust-list words.
+        crate::kassert_eq!(general::FUTEX_WAIT, 0);
+        crate::kassert_eq!(general::FUTEX_WAKE, 1);
+        crate::kassert_eq!(general::FUTEX_REQUEUE, 3);
+        crate::kassert_eq!(general::FUTEX_CMP_REQUEUE, 4);
+        crate::kassert_eq!(general::FUTEX_WAKE_OP, 5);
+        crate::kassert_eq!(general::FUTEX_LOCK_PI, 6);
+        crate::kassert_eq!(general::FUTEX_WAIT_BITSET, 9);
+        crate::kassert_eq!(general::FUTEX_WAKE_BITSET, 10);
+        crate::kassert_eq!(general::FUTEX_PRIVATE_FLAG, 0x80);
+        crate::kassert_eq!(general::FUTEX_CLOCK_REALTIME, 0x100);
+        crate::kassert_eq!(general::FUTEX_CMD_MASK, !0x180);
+        crate::kassert_eq!(general::FUTEX_BITSET_MATCH_ANY, 0xffff_ffff);
+        crate::kassert_eq!(general::FUTEX_WAITERS, 0x8000_0000);
+        crate::kassert_eq!(general::FUTEX_OWNER_DIED, 0x4000_0000);
+        crate::kassert_eq!(general::FUTEX_TID_MASK, 0x3fff_ffff);
+        crate::kassert_eq!(general::ROBUST_LIST_LIMIT, 2048);
+        //    `poll` events (`select`'s sets are made of them).
+        crate::kassert_eq!(general::POLLIN, 0x1);
+        crate::kassert_eq!(general::POLLPRI, 0x2);
+        crate::kassert_eq!(general::POLLOUT, 0x4);
+        crate::kassert_eq!(general::POLLERR, 0x8);
+        crate::kassert_eq!(general::POLLHUP, 0x10);
+        crate::kassert_eq!(general::POLLNVAL, 0x20);
+        crate::kassert_eq!(general::POLLRDNORM, 0x40);
+        crate::kassert_eq!(general::POLLRDBAND, 0x80);
+        crate::kassert_eq!(general::POLLWRNORM, 0x100);
+        crate::kassert_eq!(general::POLLWRBAND, 0x200);
+        //    Pipes: `pipe2`'s and `dup3`'s flags, `fcntl`'s pipe sizes,
+        //    `FIONREAD`; `mknod`'s file types.
+        crate::kassert_eq!(general::O_NONBLOCK, 0o4000);
+        crate::kassert_eq!(general::O_DIRECT, 0o40_000);
+        crate::kassert_eq!(general::O_CLOEXEC, 0o2_000_000);
+        crate::kassert_eq!(general::F_SETPIPE_SZ, 1031);
+        crate::kassert_eq!(general::F_GETPIPE_SZ, 1032);
+        crate::kassert_eq!(ioctl::FIONREAD, 0x541b);
+        crate::kassert_eq!(general::S_IFMT, 0o170_000);
+        crate::kassert_eq!(general::S_IFSOCK, 0o140_000);
+        crate::kassert_eq!(general::S_IFREG, 0o100_000);
+        crate::kassert_eq!(general::S_IFBLK, 0o60_000);
+        crate::kassert_eq!(general::S_IFDIR, 0o40_000);
+        crate::kassert_eq!(general::S_IFCHR, 0o20_000);
+        crate::kassert_eq!(general::S_IFIFO, 0o10_000);
+        //    The terminal requests M8's PTYs and console take.
+        crate::kassert_eq!(ioctl::TCFLSH, 0x540b);
+        crate::kassert_eq!(ioctl::TIOCSCTTY, 0x540e);
+        crate::kassert_eq!(ioctl::TIOCGPGRP, 0x540f);
+        crate::kassert_eq!(ioctl::TIOCSPGRP, 0x5410);
+        crate::kassert_eq!(ioctl::TIOCSWINSZ, 0x5414);
+        crate::kassert_eq!(ioctl::TIOCNOTTY, 0x5422);
+        crate::kassert_eq!(ioctl::TIOCGSID, 0x5429);
+        crate::kassert_eq!(ioctl::TIOCGPTN, 0x8004_5430);
+        crate::kassert_eq!(ioctl::TIOCSPTLCK, 0x4004_5431);
+        //    The small calls: priorities, `getrusage`'s `who`, `prctl`'s
+        //    names, `statfs`'s magic numbers, `RLIMIT_STACK`.
+        crate::kassert_eq!(general::PRIO_PROCESS, 0);
+        crate::kassert_eq!(general::PRIO_PGRP, 1);
+        crate::kassert_eq!(general::PRIO_USER, 2);
+        crate::kassert_eq!(general::RUSAGE_SELF, 0);
+        crate::kassert_eq!(general::RUSAGE_CHILDREN, -1);
+        crate::kassert_eq!(general::RUSAGE_THREAD, 1);
+        crate::kassert_eq!(prctl::PR_SET_NAME, 15);
+        crate::kassert_eq!(prctl::PR_GET_NAME, 16);
+        crate::kassert_eq!(general::EXT4_SUPER_MAGIC, 0xef53);
+        crate::kassert_eq!(general::TMPFS_MAGIC, 0x0102_1994);
+        crate::kassert_eq!(general::PROC_SUPER_MAGIC, 0x9fa0);
+        crate::kassert_eq!(general::RLIMIT_STACK, 3);
+        crate::kassert_eq!(general::RLIM_INFINITY, !0);
+
+        // 3. The errnos the M8 table returns.
+        let errnos: &[(u32, u32)] = &[
+            (errno::EPERM, 1),
+            (errno::ESRCH, 3),
+            (errno::EINTR, 4),
+            (errno::E2BIG, 7),
+            (errno::ENOEXEC, 8),
+            (errno::EBADF, 9),
+            (errno::ECHILD, 10),
+            (errno::EAGAIN, 11),
+            (errno::ENOMEM, 12),
+            (errno::EFAULT, 14),
+            (errno::EBUSY, 16),
+            (errno::EEXIST, 17),
+            (errno::EINVAL, 22),
+            (errno::EMFILE, 24),
+            (errno::ENOTTY, 25),
+            (errno::ESPIPE, 29),
+            (errno::EROFS, 30),
+            (errno::EPIPE, 32),
+            (errno::EDEADLK, 35),
+            (errno::ENOSYS, 38),
+            (errno::EOPNOTSUPP, 95),
+            (errno::ETIMEDOUT, 110),
+        ];
+        for &(actual, spec) in errnos {
+            crate::kassert_eq!(actual, spec);
+        }
+
+        // 4. The user-visible M8 structs' Linux x86-64 sizes and key offsets.
+        //    `siginfo`: 128 bytes, the union of each kind's fields at 16.
+        crate::kassert_eq!(size_of::<general::siginfo>(), 128);
+        crate::kassert_eq!(offset_of!(general::siginfo__bindgen_ty_1__bindgen_ty_1, si_errno), 4);
+        crate::kassert_eq!(offset_of!(general::siginfo__bindgen_ty_1__bindgen_ty_1, si_code), 8);
+        crate::kassert_eq!(offset_of!(general::siginfo__bindgen_ty_1__bindgen_ty_1, _sifields), 16);
+        //    Each kind's fields, offsets in the union: `kill`'s sender,
+        //    a POSIX timer's (C13), `sigqueue`'s value, `SIGCHLD`'s status
+        //    and times (`waitid`, C6) and a fault's address (C5).
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_1, _pid), 0);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_1, _uid), 4);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_2, _tid), 0);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_2, _overrun), 4);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_2, _sigval), 8);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_3, _pid), 0);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_3, _uid), 4);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_3, _sigval), 8);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _pid), 0);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _uid), 4);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _status), 8);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _utime), 16);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_4, _stime), 24);
+        crate::kassert_eq!(offset_of!(general::__sifields__bindgen_ty_5, _addr), 0);
+        crate::kassert_eq!(size_of::<general::sigval_t>(), 8);
+        //    `stack_t` (`sigaltstack`).
+        crate::kassert_eq!(size_of::<general::stack_t>(), 24);
+        crate::kassert_eq!(offset_of!(general::stack_t, ss_flags), 8);
+        crate::kassert_eq!(offset_of!(general::stack_t, ss_size), 16);
+        //    `sigevent` (`timer_create`).
+        crate::kassert_eq!(size_of::<general::sigevent>(), 64);
+        crate::kassert_eq!(offset_of!(general::sigevent, sigev_signo), 8);
+        crate::kassert_eq!(offset_of!(general::sigevent, sigev_notify), 12);
+        crate::kassert_eq!(offset_of!(general::sigevent, _sigev_un), 16);
+        //    The time structs: `timeval` (`select`, `getrusage`), `itimerval`
+        //    (`setitimer`), `itimerspec` (`timer_settime`).
+        crate::kassert_eq!(size_of::<general::timeval>(), 16);
+        crate::kassert_eq!(size_of::<general::__kernel_old_timeval>(), 16);
+        crate::kassert_eq!(size_of::<general::itimerval>(), 32);
+        crate::kassert_eq!(offset_of!(general::itimerval, it_value), 16);
+        crate::kassert_eq!(size_of::<general::__kernel_itimerspec>(), 32);
+        crate::kassert_eq!(offset_of!(general::__kernel_itimerspec, it_value), 16);
+        //    `struct rusage`: two `timeval`s, then 14 longs.
+        crate::kassert_eq!(size_of::<general::rusage>(), 144);
+        crate::kassert_eq!(offset_of!(general::rusage, ru_stime), 16);
+        crate::kassert_eq!(offset_of!(general::rusage, ru_maxrss), 32);
+        crate::kassert_eq!(offset_of!(general::rusage, ru_nivcsw), 136);
+        //    `struct sysinfo`.
+        crate::kassert_eq!(size_of::<system::sysinfo>(), 112);
+        crate::kassert_eq!(offset_of!(system::sysinfo, totalram), 32);
+        crate::kassert_eq!(offset_of!(system::sysinfo, bufferram), 56);
+        crate::kassert_eq!(offset_of!(system::sysinfo, procs), 80);
+        crate::kassert_eq!(offset_of!(system::sysinfo, totalhigh), 88);
+        crate::kassert_eq!(offset_of!(system::sysinfo, mem_unit), 104);
+        //    `struct statfs`.
+        crate::kassert_eq!(size_of::<general::statfs>(), 120);
+        crate::kassert_eq!(offset_of!(general::statfs, f_bsize), 8);
+        crate::kassert_eq!(offset_of!(general::statfs, f_fsid), 56);
+        crate::kassert_eq!(offset_of!(general::statfs, f_namelen), 64);
+        crate::kassert_eq!(offset_of!(general::statfs, f_frsize), 72);
+        crate::kassert_eq!(offset_of!(general::statfs, f_flags), 80);
+        //    `struct robust_list_head` (`set_robust_list`'s `len`).
+        crate::kassert_eq!(size_of::<general::robust_list_head>(), 24);
+        crate::kassert_eq!(offset_of!(general::robust_list_head, futex_offset), 8);
+        crate::kassert_eq!(offset_of!(general::robust_list_head, list_op_pending), 16);
+        //    `struct pollfd`, `select`'s `fd_set` (1024 bits) and the kernel's
+        //    `sigset_t` (8 bytes: every `sigsetsize` M8 takes).
+        crate::kassert_eq!(size_of::<general::pollfd>(), 8);
+        crate::kassert_eq!(offset_of!(general::pollfd, events), 4);
+        crate::kassert_eq!(offset_of!(general::pollfd, revents), 6);
+        crate::kassert_eq!(size_of::<general::__kernel_fd_set>(), 128);
+        crate::kassert_eq!(size_of::<general::kernel_sigset_t>(), 8);
+        crate::kassert_eq!(size_of::<general::kernel_sigaction>(), 32);
 
         Ok(())
     }

@@ -1,12 +1,13 @@
-//! Process and system calls: `rt_sigaction`, `rt_sigprocmask`, `uname`,
-//! `arch_prctl`, `clock_gettime`, `prlimit64`, `getrandom` (M6).
+//! Process and system calls: `uname`, `arch_prctl`, `clock_gettime`,
+//! `prlimit64`, `getrandom` (M6). M6's `rt_sigaction` and `rt_sigprocmask`
+//! are in `signal` since #371.
 
 use super::{DEFAULT_RLIMIT_NOFILE, IO_CHUNK, copy_pod_from_user, copy_pod_to_user, neg_errno};
 use crate::arch;
-use crate::linux::process::{KernelSigaction, with_current, with_current_mut};
+use crate::linux::process::with_current;
 use crate::linux::{ARCH_GET_FS, ARCH_SET_FS, default_utsname, errno, general};
 use crate::sched;
-use crate::user::{USER_MAX, copy_from_user, copy_to_user, user_range_valid};
+use crate::user::{USER_MAX, copy_to_user, user_range_valid};
 
 /// Cap bytes returned by a single `getrandom(2)` call to avoid issuing
 /// thousands of synchronous `virtio-rng` requests in one syscall.
@@ -15,81 +16,6 @@ const MAX_GETRANDOM: usize = 4096;
 /// Default stack rlimit advertised by M6 `prlimit64`: the initial user
 /// stack's size (8 MiB).
 const DEFAULT_RLIMIT_STACK: u64 = lumen_vm::USER_STACK_SIZE;
-
-/// Mask of unblockable signals (`SIGKILL` = 9, `SIGSTOP` = 19, 1-indexed).
-const UNBLOCKABLE_SIGS: u64 = (1u64 << (general::SIGKILL - 1)) | (1u64 << (general::SIGSTOP - 1));
-
-pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
-    if sigsetsize != 8 || !(1..=64).contains(&sig) {
-        return neg_errno(errno::EINVAL);
-    }
-    if act != 0 && (sig == u64::from(general::SIGKILL) || sig == u64::from(general::SIGSTOP)) {
-        return neg_errno(errno::EINVAL);
-    }
-    let new_action = if act != 0 {
-        // SAFETY: `KernelSigaction` is 4 `u64`s (32 bytes); all bit patterns are valid.
-        match unsafe { copy_pod_from_user::<KernelSigaction>(act) } {
-            Ok(a) => Some(a),
-            Err(e) => return neg_errno(e.to_errno()),
-        }
-    } else {
-        None
-    };
-
-    let idx = (sig - 1) as usize;
-    let prev = with_current(|p| p.sigactions[idx]);
-    if oldact != 0 {
-        // Write `oldact` BEFORE mutating the table so a faulting `oldact` leaves state intact.
-        // SAFETY: `KernelSigaction` has zero padding bytes.
-        if let Err(e) = unsafe { copy_pod_to_user(oldact, &prev) } {
-            return neg_errno(e.to_errno());
-        }
-    }
-    if let Some(mut a) = new_action {
-        a.mask &= !UNBLOCKABLE_SIGS;
-        with_current_mut(|p| p.sigactions[idx] = a);
-    }
-    0
-}
-
-pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
-    if sigsetsize != 8 {
-        return neg_errno(errno::EINVAL);
-    }
-    let new_mask = if set != 0 {
-        if how != u64::from(general::SIG_BLOCK)
-            && how != u64::from(general::SIG_UNBLOCK)
-            && how != u64::from(general::SIG_SETMASK)
-        {
-            return neg_errno(errno::EINVAL);
-        }
-        let mut raw = [0u8; 8];
-        if let Err(e) = copy_from_user(&mut raw, set) {
-            return neg_errno(e.to_errno());
-        }
-        Some(u64::from_le_bytes(raw))
-    } else {
-        None
-    };
-
-    let prev = with_current(|p| p.sigmask);
-    if oldset != 0
-        && let Err(e) = copy_to_user(oldset, &prev.to_le_bytes())
-    {
-        return neg_errno(e.to_errno());
-    }
-    if let Some(mask) = new_mask {
-        let updated = if how == u64::from(general::SIG_BLOCK) {
-            prev | mask
-        } else if how == u64::from(general::SIG_UNBLOCK) {
-            prev & !mask
-        } else {
-            mask
-        };
-        with_current_mut(|p| p.sigmask = updated & !UNBLOCKABLE_SIGS);
-    }
-    0
-}
 
 pub(super) fn sys_uname(buf: u64) -> u64 {
     let uts = default_utsname();
