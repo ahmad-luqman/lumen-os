@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::at::{self, Fd, UserPtr};
 use super::fd::vfs;
 use super::finish;
-use crate::linux::process::{self, FileRef, with_current};
+use crate::linux::process::{self, FileRef, current_process};
 use crate::linux::{errno, general};
 use crate::sync::SpinLock;
 use crate::user::{copy_from_user, copy_to_user};
@@ -259,7 +259,7 @@ fn fcntl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
 fn getlk(file: &FileRef, at: UserPtr) -> Result<u64, u32> {
     let mut flock = UserFlock::copy_in(at)?;
     let ctx = lock_context(file, &flock.spec)?;
-    let pid = with_current(|p| p.pid);
+    let pid = current_process().pid();
     let mut spec = flock.spec;
     with_locks(file, |locks| locks.getlk(pid, &mut spec, ctx.cur_offset, ctx.file_size))?;
     flock.spec = spec;
@@ -277,7 +277,7 @@ fn getlk(file: &FileRef, at: UserPtr) -> Result<u64, u32> {
 fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
     let spec = UserFlock::copy_in(at)?.spec;
     let ctx = lock_context(file, &spec)?;
-    let pid = with_current(|p| p.pid);
+    let pid = current_process().pid();
     let mut logged = None;
     let result = lock_or_wait(
         file,
@@ -323,7 +323,7 @@ pub(super) fn sys_flock(fd: Fd, operation: u32) -> u64 {
 fn flock(fd: Fd, operation: u32) -> Result<u64, u32> {
     if operation & general::LOCK_MAND != 0 {
         if !SEEN_LOCK_MAND.swap(true, Ordering::Relaxed) {
-            let pid = with_current(|p| p.pid);
+            let pid = current_process().pid();
             log::info!(target: "linux", "pid {pid}: flock with LOCK_MAND is ignored (no mandatory locks)");
         }
         return Ok(0);
@@ -343,7 +343,7 @@ fn flock(fd: Fd, operation: u32) -> Result<u64, u32> {
         },
         |(), _| {
             if !logged {
-                let pid = with_current(|p| p.pid);
+                let pid = current_process().pid();
                 log::debug!(target: "linux", "pid {pid}: flock on {} waits", Escaped(&file.path));
                 logged = true;
             }

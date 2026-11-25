@@ -259,8 +259,11 @@ impl ProcTree {
     /// one released, one for a hangup; after the children themselves when
     /// there is no reaper). Any error leaves the tree unchanged.
     ///
+    /// `pid`'s added threads ([`ProcTree::add_thread`]) still registered
+    /// are freed with it: their numbers are free again.
+    ///
     /// Allocates only through those two fallible reservations; frees the
-    /// nodes of the zombies that leave. Finding the groups to fire takes
+    /// nodes of the zombies that leave and the freed tids' index entries. Finding the groups to fire takes
     /// O(children² + children × group size), done twice (once to size the
     /// reservation).
     pub fn exit(
@@ -331,6 +334,9 @@ impl ProcTree {
         }
         assert_eq!(list.len(), words, "invariant: exit's two passes agree");
         self.proc_mut(pid).state = ProcState::Zombie(status);
+        // Any thread still registered goes with it (the kernel removes each
+        // as its thread exits, so only a bookkeeping bug leaves one).
+        self.free_threads(pid);
 
         let own_group = parent.is_some_and(|pp| self.links(pp, own_pgid, own_sid))
             && self.is_orphaned_pgrp(own_pgid)

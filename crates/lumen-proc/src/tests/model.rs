@@ -1,6 +1,7 @@
 //! A randomized model test: random fork, spawn_root, exit (to init, to
 //! another reaper, or without one; parents autoreaping or not), wait,
-//! setpgid, setsid, stop, continue, exec and tcsetpgrp sequences run on a
+//! setpgid, setsid, stop, continue, exec, tcsetpgrp, add_thread and
+//! remove_thread sequences run on a
 //! [`ProcTree`] and on a naive reference model written here (flat maps and
 //! linear scans, sharing no logic with the crate, only its types and
 //! constants), compared after every step, with the issue's invariants
@@ -54,6 +55,8 @@ struct MProc {
     state: MState,
     execed: bool,
     slot: u64,
+    /// Non-leader tids, in the order they were added.
+    tids: Vec<u32>,
 }
 
 struct Model {
@@ -87,6 +90,10 @@ struct Seen {
     sigttou: u32,
     tc_set: u32,
     tc_err: BTreeSet<u32>,
+    threads_added: u32,
+    threads_removed: u32,
+    thread_refusals: u32,
+    exits_with_threads: u32,
 }
 
 fn not_live<T>(pid: u32, role: Role) -> Result<T, Error> {
@@ -106,6 +113,7 @@ impl Model {
                 state: MState::Run,
                 execed: false,
                 slot: 0,
+                tids: Vec::new(),
             },
         );
         Self { procs, last: 1, fired: [0; 3] }
@@ -116,7 +124,25 @@ impl Model {
     }
 
     fn busy(&self, n: u32) -> bool {
-        self.procs.contains_key(&n) || self.procs.values().any(|p| p.pgid == n || p.sid == n)
+        self.procs.contains_key(&n) || self.procs.values().any(|p| p.pgid == n || p.sid == n || p.tids.contains(&n))
+    }
+
+    fn add_thread(&mut self, pid: u32) -> Result<u32, Error> {
+        if !self.live(pid) {
+            return not_live(pid, Role::Caller);
+        }
+        let tid = self.next_pid().ok_or(Error::User(Errno::Again))?;
+        self.procs.get_mut(&pid).unwrap().tids.push(tid);
+        self.last = tid;
+        Ok(tid)
+    }
+
+    fn remove_thread(&mut self, pid: u32, tid: u32) -> Result<(), Error> {
+        let Some(p) = self.procs.get_mut(&pid).filter(|p| p.tids.contains(&tid)) else {
+            return bug(Bug::NotThread { pid, tid });
+        };
+        p.tids.retain(|&t| t != tid);
+        Ok(())
     }
 
     /// The pid the crate's cyclic allocation hands out next: after the last
@@ -173,7 +199,16 @@ impl Model {
         let pid = self.next_pid()?;
         self.procs.insert(
             pid,
-            MProc { parent: None, children: Vec::new(), pgid: pid, sid: pid, state: MState::Run, execed: false, slot },
+            MProc {
+                parent: None,
+                children: Vec::new(),
+                pgid: pid,
+                sid: pid,
+                state: MState::Run,
+                execed: false,
+                slot,
+                tids: Vec::new(),
+            },
         );
         self.last = pid;
         Some(pid)
@@ -187,7 +222,16 @@ impl Model {
         let (pgid, sid) = (self.procs[&parent].pgid, self.procs[&parent].sid);
         self.procs.insert(
             pid,
-            MProc { parent: Some(parent), children: Vec::new(), pgid, sid, state: MState::Run, execed: false, slot },
+            MProc {
+                parent: Some(parent),
+                children: Vec::new(),
+                pgid,
+                sid,
+                state: MState::Run,
+                execed: false,
+                slot,
+                tids: Vec::new(),
+            },
         );
         self.procs.get_mut(&parent).unwrap().children.push(pid);
         self.last = pid;
@@ -204,6 +248,8 @@ impl Model {
     /// member for the rest of the exit. Lumen's rule without a reaper: the
     /// children become roots, their zombies released.
     fn exit(&mut self, pid: u32, status: ExitStatus, reaper: Option<u32>, reaping: &BTreeSet<u32>) -> Vec<ExitAction> {
+        // Its threads still registered go with it.
+        self.procs.get_mut(&pid).unwrap().tids.clear();
         let kids = core::mem::take(&mut self.procs.get_mut(&pid).unwrap().children);
         let (my_pgid, my_sid) = (self.procs[&pid].pgid, self.procs[&pid].sid);
         let mut continued = BTreeSet::new();
@@ -469,6 +515,7 @@ fn assert_same(t: &ProcTree, m: &Model, step: &str) {
         assert_eq!(t.sid(pid), Some(p.sid), "{step}: sid of {pid}");
         assert_eq!(t.has_execed(pid), Some(p.execed), "{step}: exec'd {pid}");
         assert_eq!(t.slot_of(pid), Some(p.slot), "{step}: slot of {pid}");
+        assert_eq!(t.threads(pid), p.tids.as_slice(), "{step}: threads of {pid}");
         let state = match p.state {
             MState::Run => ProcState::Running,
             MState::Stop(signal, reported) => ProcState::Stopped { signal, reported },
@@ -503,9 +550,14 @@ fn random_status(rng: &mut Rng) -> ExitStatus {
 }
 
 fn random_number(rng: &mut Rng, m: &Model) -> i32 {
-    match rng.below(4) {
+    match rng.below(5) {
         0 => rng.below(u64::from(MAX_PID) + 3) as i32,
         1 => -(rng.below(4) as i32),
+        2 => {
+            // A tid: a number in use that names no process.
+            let tids: Vec<u32> = m.procs.values().flat_map(|p| p.tids.iter().copied()).collect();
+            rng.pick(&tids).map_or(0, |t| t as i32)
+        }
         _ => {
             let pids: Vec<u32> = m.procs.keys().copied().collect();
             rng.pick(&pids).unwrap() as i32
@@ -548,7 +600,7 @@ fn run(seed: u64, seen: &mut Seen) {
         let others: Vec<u32> = live.iter().copied().filter(|&p| p != INIT).collect();
         let caller = rng.pick(&live).unwrap();
         let label = alloc::format!("seed {seed} step {step}");
-        match rng.below(100) {
+        match rng.below(108) {
             0..=2 => {
                 let slot = rng.next();
                 let got = t.spawn_root(RusageSlot::new(slot)).ok();
@@ -585,6 +637,9 @@ fn run(seed: u64, seen: &mut Seen) {
                     seen.other_reaper += 1;
                 }
                 let live_kids = m.procs[&pid].children.iter().any(|&c| m.live(c));
+                if !m.procs[&pid].tids.is_empty() {
+                    seen.exits_with_threads += 1;
+                }
                 let status = random_status(&mut rng);
                 let got: Vec<ExitAction> =
                     t.exit(pid, status, reaper, |p| reaping.contains(&p)).expect("exit").into_iter().collect();
@@ -693,6 +748,40 @@ fn run(seed: u64, seen: &mut Seen) {
                 // caller sets SIGCHLD to SIG_IGN (or SA_NOCLDWAIT), or back.
                 if !reaping.remove(&caller) {
                     reaping.insert(caller);
+                }
+            }
+            100..=104 => {
+                // Sometimes a process that isn't live (a zombie, or none).
+                let pid = if rng.chance(10) { rng.below(u64::from(MAX_PID) + 2) as u32 } else { caller };
+                let got = t.add_thread(pid);
+                assert_eq!(got, m.add_thread(pid), "{label}: add_thread to {pid}");
+                match got {
+                    Ok(tid) => {
+                        assert!(t.is_busy(tid), "{label}: tid {tid} not busy");
+                        seen.threads_added += 1;
+                    }
+                    Err(Error::User(Errno::Again)) => seen.again += 1,
+                    Err(_) => seen.thread_refusals += 1,
+                }
+            }
+            105..=107 => {
+                // Mostly one of the process's own tids; sometimes its pid,
+                // another process's tid, or any number.
+                let pid = rng.pick(&m.procs.keys().copied().collect::<Vec<_>>()).unwrap();
+                let all: Vec<u32> = m.procs.values().flat_map(|p| p.tids.iter().copied()).collect();
+                let tid = match rng.below(10) {
+                    0 => pid,
+                    1 => rng.pick(&all).unwrap_or(pid),
+                    2 => rng.below(u64::from(MAX_PID) + 2) as u32,
+                    _ => rng.pick(&m.procs[&pid].tids).unwrap_or(pid),
+                };
+                let got = t.remove_thread(pid, tid);
+                assert_eq!(got, m.remove_thread(pid, tid), "{label}: remove_thread {tid} of {pid}");
+                if got.is_ok() {
+                    assert!(!t.is_busy(tid), "{label}: removed tid {tid} still busy");
+                    seen.threads_removed += 1;
+                } else {
+                    seen.thread_refusals += 1;
                 }
             }
             _ => {
@@ -831,4 +920,7 @@ fn random_fork_exit_wait_setpgid_sequences_keep_the_invariants() {
     for e in [Errno::Perm, Errno::Srch, Errno::Inval, Errno::NoTty] {
         assert!(seen.tc_err.contains(&e.to_errno()), "tcsetpgrp never gave {e}");
     }
+    assert!(seen.threads_added > 0 && seen.threads_removed > 0, "no thread added or removed");
+    assert!(seen.thread_refusals > 0, "no add_thread or remove_thread refused");
+    assert!(seen.exits_with_threads > 0, "no exit with threads still registered");
 }

@@ -1,8 +1,9 @@
 //! The crate's Allocation section, checked with an allocator that counts
 //! or refuses this thread's calls (the test harness's other threads
 //! allocate when they like): `exit` and `fork` turn a refused reservation
-//! into `ENOMEM` with the tree unchanged; `exit` allocates nothing else;
-//! a reaping `wait` never allocates; the calls documented as neither
+//! into `ENOMEM` with the tree unchanged, and so does `add_thread`; `exit`
+//! allocates nothing else, its process's threads still registered
+//! included; a reaping `wait` and `remove_thread` never allocate; the calls documented as neither
 //! allocating nor freeing call the allocator not at all; dropping an
 //! `ExitOutcome`'s actions frees their list.
 
@@ -259,6 +260,47 @@ fn the_calls_that_neither_allocate_nor_free_dont() {
         assert_eq!(t.getsid(c, b as i32), Ok(INIT));
         assert!(t.tcsetpgrp(c, tty, INIT as i32, Sigttou::Delivered).is_ok());
         let _ = (t.is_orphaned_pgrp(INIT), t.is_busy(INIT), t.pgrp_members(INIT).count(), t.children(INIT).len());
+        let _ = t.threads(b).len();
+        // A refused removal: the leader's tid.
+        assert!(t.remove_thread(b, b).is_err());
     });
     assert_eq!((allocs, frees), (0, 0), "allocated or freed");
+}
+
+#[test]
+fn add_thread_is_enomem_and_changes_nothing_when_its_list_cant_grow() {
+    let mut t = tree();
+    let a = t.fork(INIT, slot()).unwrap();
+    let before = format!("{t:?}");
+    assert_eq!(refused(|| t.add_thread(a)), Err(Error::User(Errno::NoMem)));
+    assert_eq!(format!("{t:?}"), before);
+    assert!(t.add_thread(a).is_ok());
+}
+
+#[test]
+fn remove_thread_never_allocates() {
+    let mut t = tree();
+    let a = t.fork(INIT, slot()).unwrap();
+    let tids: Vec<u32> = (0..8).map(|_| t.add_thread(a).unwrap()).collect();
+    let ((), allocs, _) = counted(|| {
+        for &tid in &tids {
+            t.remove_thread(a, tid).unwrap();
+        }
+    });
+    assert_eq!(allocs, 0, "allocated");
+    assert!(t.threads(a).is_empty());
+}
+
+#[test]
+fn exit_with_threads_still_registered_allocates_nothing() {
+    let mut t = tree();
+    let a = t.fork(INIT, slot()).unwrap();
+    for _ in 0..8 {
+        t.add_thread(a).unwrap();
+    }
+    let (out, allocs, frees) = counted(|| t.exit(a, ExitStatus::exited(0), Some(INIT), |_| false).unwrap());
+    assert_eq!(allocs, 0, "exit allocated");
+    assert!(frees > 0, "the threads' index entries and list weren't freed");
+    out.into_iter().for_each(drop);
+    assert!(t.threads(a).is_empty());
 }

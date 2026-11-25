@@ -406,9 +406,9 @@ fn ktest_mkdir_and_rmdir(base: &str) -> kt::R {
     kassert_eq!(sys_mkdir(up(0, &d)?, mode(0o777)), 0);
     kassert_eq!(lstat(&d).map(|s| (s.0, s.1)), Ok((InodeType::Dir, 0o755)));
     // Another umask applies as it is; setuid and setgid go, sticky stays.
-    let umask = process::with_current_mut(|p| core::mem::replace(&mut p.umask, 0o027));
+    let umask = process::with_current_fs(|fs| core::mem::replace(&mut fs.umask, 0o027));
     let made = sys_mkdir(up(1, &p("d/s"))?, mode(0o7777));
-    process::with_current_mut(|p| p.umask = umask);
+    process::with_current_fs(|fs| fs.umask = umask);
     kassert_eq!(made, 0);
     kassert_eq!(lstat(&p("d/s")).map(|s| s.1), Ok(0o1750));
     // From a dirfd (an `O_PATH` one); an absolute path ignores even a bad one.

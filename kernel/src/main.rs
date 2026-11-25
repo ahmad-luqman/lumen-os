@@ -241,6 +241,7 @@ extern "C" fn kmain_on_kernel_stack() -> ! {
     // Randomness: RDRAND, and the virtio-rng the probe brought up.
     rng::init();
     vfs::init();
+    linux::init();
     linux::log_abi_summary();
     vfs::log_ext4_crate_summary();
 

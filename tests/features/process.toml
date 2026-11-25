@@ -4,3 +4,8 @@
 name = "Process tree rules: wait, reparenting, groups, sessions (logic)"
 milestone = "M8"
 tests = ["cargo:lumen-proc"]
+
+[[feature]]
+name = "Processes and threads: Process/UserThread split, PROCS lookup by pid and tid, pid 1, tids from the pid space"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::procs_lookup_and_lifetime", "cargo:lumen-proc"]

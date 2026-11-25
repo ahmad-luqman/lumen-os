@@ -53,6 +53,10 @@ pub(crate) struct Proc {
     /// The [`RusageSlot`]'s value: the tree owns the token until the
     /// process leaves it.
     pub(crate) slot: u64,
+    /// Its threads' tids but the leader's (whose tid is the pid), in the
+    /// order [`ProcTree::add_thread`] handed them out. Empty once it is a
+    /// zombie.
+    pub(crate) tids: Vec<u32>,
 }
 
 /// What [`ProcTree::stop`] or [`ProcTree::cont`] did.
@@ -80,7 +84,9 @@ pub enum StateChange {
 ///   whose parent autoreaps) leaves the tree inside [`ProcTree::exit`];
 /// - all members of a process group (live and zombie) are in one session;
 /// - no pid is handed out while a process uses the number as its pid, pgid
-///   or sid.
+///   or sid, or a live thread uses it as its tid;
+/// - each tid ([`ProcTree::add_thread`]) belongs to exactly one live
+///   process, and is never a pid, pgid or sid.
 ///
 /// A breach of them is a bug in this crate: it panics with a message
 /// starting "invariant:".
@@ -92,6 +98,8 @@ pub struct ProcTree {
     groups: BTreeSet<(u32, u32)>,
     /// `(sid, pid)` for every process, live and zombie.
     sessions: BTreeSet<(u32, u32)>,
+    /// Every non-leader tid, with the pid of the process it belongs to.
+    tids: BTreeMap<u32, u32>,
     pids: PidAllocator,
 }
 
@@ -106,6 +114,7 @@ impl ProcTree {
             procs: BTreeMap::new(),
             groups: BTreeSet::new(),
             sessions: BTreeSet::new(),
+            tids: BTreeMap::new(),
             pids: PidAllocator::new(max_pid),
         }
     }
@@ -167,6 +176,42 @@ impl ProcTree {
     /// is `EACCES`. [`Bug::NotLive`] if `pid` isn't live.
     pub fn exec(&mut self, pid: u32) -> Result<(), Bug> {
         self.live_entry_mut(pid).ok_or(Bug::NotLive { pid, role: Role::Caller })?.execed = true;
+        Ok(())
+    }
+
+    /// A new thread of `pid` (`clone` with `CLONE_THREAD`): its tid, a number
+    /// handed out as [`ProcTree::fork`] hands out a pid (after the last one,
+    /// wrapping, never a number in use), counted by [`ProcTree::is_busy`]
+    /// until [`ProcTree::remove_thread`] or `pid`'s exit frees it. The
+    /// leader's tid is the pid itself and is never added.
+    ///
+    /// [`Bug::NotLive`] (as [`Role::Caller`]) if `pid` isn't live; `ENOMEM`
+    /// if room for the tid in its thread list can't be reserved; `EAGAIN`
+    /// when no number is free. Any error leaves the tree unchanged. Besides
+    /// that fallible reservation, allocates infallibly (one index entry).
+    pub fn add_thread(&mut self, pid: u32) -> Result<u32, Error> {
+        self.live(pid, Role::Caller)?;
+        self.proc_mut(pid).tids.try_reserve(1).map_err(|_| Errno::NoMem)?;
+        let tid = self.alloc_pid()?;
+        self.tids.insert(tid, pid);
+        // No allocation: the room was reserved above.
+        self.proc_mut(pid).tids.push(tid);
+        Ok(tid)
+    }
+
+    /// Thread `tid` of `pid` ended: its number is free again.
+    ///
+    /// [`Bug::NotThread`] if `tid` isn't one of `pid`'s added threads: the
+    /// leader's tid (the pid, which the process keeps until it is reaped),
+    /// another process's tid, a number no thread has, or any tid of a
+    /// zombie (its exit freed them). The tree is then unchanged. Frees;
+    /// never allocates.
+    pub fn remove_thread(&mut self, pid: u32, tid: u32) -> Result<(), Error> {
+        if self.tids.get(&tid) != Some(&pid) {
+            return Err(Bug::NotThread { pid, tid }.into());
+        }
+        self.tids.remove(&tid);
+        self.proc_mut(pid).tids.retain(|&t| t != tid);
         Ok(())
     }
 
@@ -329,6 +374,12 @@ impl ProcTree {
         self.procs.get(&pid).map_or(&[], |p| &p.children)
     }
 
+    /// `pid`'s threads' tids but the leader's, in the order they were added
+    /// (empty if it isn't in the tree, or is a zombie).
+    pub fn threads(&self, pid: u32) -> &[u32] {
+        self.procs.get(&pid).map_or(&[], |p| &p.tids)
+    }
+
     /// `pid`'s process group, if it is in the tree.
     pub fn pgid(&self, pid: u32) -> Option<u32> {
         self.procs.get(&pid).map(|p| p.pgid)
@@ -360,9 +411,11 @@ impl ProcTree {
     }
 
     /// Whether number `n` is in use as a pid, a pgid or a sid (by a live or
-    /// zombie process): no new process gets it as its pid.
+    /// zombie process) or as a live thread's tid: no new process or thread
+    /// gets it.
     pub fn is_busy(&self, n: u32) -> bool {
         self.procs.contains_key(&n)
+            || self.tids.contains_key(&n)
             || self.pgrp_exists(n)
             || self.sessions.range((n, 0)..=(n, u32::MAX)).next().is_some()
     }
@@ -440,7 +493,16 @@ impl ProcTree {
         let slot = rusage_slot.into_raw();
         self.procs.insert(
             pid,
-            Proc { parent, children: Vec::new(), pgid, sid, state: ProcState::Running, execed: false, slot },
+            Proc {
+                parent,
+                children: Vec::new(),
+                pgid,
+                sid,
+                state: ProcState::Running,
+                execed: false,
+                slot,
+                tids: Vec::new(),
+            },
         );
         self.groups.insert((pgid, pid));
         self.sessions.insert((sid, pid));
@@ -451,6 +513,7 @@ impl ProcTree {
     pub(crate) fn remove(&mut self, pid: u32) -> RusageSlot {
         let p = self.procs.remove(&pid).expect("invariant: a removed process is in the tree");
         assert!(p.children.is_empty(), "invariant: removed process {pid} still has children");
+        assert!(p.tids.is_empty(), "invariant: removed process {pid} still has threads");
         self.groups.remove(&(p.pgid, pid));
         self.sessions.remove(&(p.sid, pid));
         if let Some(pp) = p.parent {
@@ -472,6 +535,13 @@ impl ProcTree {
             }
         }
         panic!("invariant: no cycle above {pid}");
+    }
+
+    /// Frees every tid of `pid` (its exit). Frees; never allocates.
+    pub(crate) fn free_threads(&mut self, pid: u32) {
+        for tid in core::mem::take(&mut self.proc_mut(pid).tids) {
+            self.tids.remove(&tid);
+        }
     }
 
     /// Moves `pid` to group `pgid`, keeping the index.
@@ -545,5 +615,16 @@ impl ProcTree {
         }
         assert_eq!(groups, self.groups, "group index out of date");
         assert_eq!(sessions, self.sessions, "session index out of date");
+        let mut tids = BTreeMap::new();
+        for (&pid, p) in &self.procs {
+            assert!(p.state.is_live() || p.tids.is_empty(), "zombie {pid} has threads {:?}", p.tids);
+            for &tid in &p.tids {
+                assert!(tids.insert(tid, pid).is_none(), "tid {tid} listed twice");
+                assert!(!self.procs.contains_key(&tid), "tid {tid} is a pid");
+                assert!(!groups.iter().any(|&(g, _)| g == tid), "tid {tid} is a pgid");
+                assert!(!sessions.iter().any(|&(s, _)| s == tid), "tid {tid} is a sid");
+            }
+        }
+        assert_eq!(tids, self.tids, "tid index out of date");
     }
 }

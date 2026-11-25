@@ -7,9 +7,12 @@
 //! one canonical ABI surface.
 
 pub mod exec;
+mod init;
 pub mod modules;
 pub mod process;
 pub mod syscall;
+
+pub use init::init;
 
 use alloc::borrow::Cow;
 use alloc::string::String;

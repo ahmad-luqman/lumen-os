@@ -83,6 +83,7 @@ use log::{info, warn};
 use lumen_mm::stacks::{StackKind, StackRange};
 
 use crate::arch::{self, MAX_CPUS};
+use crate::linux::process::UserThread;
 use crate::mm::paging;
 use crate::mm::stack::{KernelStack, STACK_SIZE, StackError};
 use crate::mm::user_vm::AddressSpace;
@@ -194,10 +195,12 @@ impl SavedRsp {
     }
 }
 
-/// Per-user-thread hardware and VM state carried across context switches.
+/// Per-user-thread hardware and VM state carried across context switches,
+/// and the thread's Linux identity.
 ///
 /// Accessed only on the thread's home CPU with interrupts off (during
-/// `schedule`, `attach`/`detach`, or `arch_prctl`), or exclusively in `Drop`.
+/// `schedule`, `attach`/`detach`, `arch_prctl`, or a Linux process's
+/// registration and takedown), or exclusively in `Drop`.
 struct UserThreadState {
     address_space: Arc<AddressSpace>,
     fpu: UnsafeCell<arch::fpu::UserFpuState>,
@@ -205,6 +208,11 @@ struct UserThreadState {
     kernel_rsp: AtomicU64,
     user_exit_rsp: AtomicU64,
     pending_debug_trap: AtomicBool,
+    /// The Linux thread it runs ([`set_current_user_thread`]): `None` until
+    /// its process is registered, after it is taken down, and for a ktest's
+    /// [`UserSpaceGuard`]. Read lock-free by its own thread
+    /// ([`current_user_thread`]).
+    linux: Option<Arc<UserThread>>,
 }
 
 impl UserThreadState {
@@ -216,6 +224,7 @@ impl UserThreadState {
             kernel_rsp: AtomicU64::new(0),
             user_exit_rsp: AtomicU64::new(0),
             pending_debug_trap: AtomicBool::new(false),
+            linux: None,
         }
     }
 
@@ -833,6 +842,37 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
     // SAFETY: `t` is the running thread on this CPU and interrupts are off so
     // `schedule()` cannot run or mutate `user`.
     unsafe { (*t).user.as_ref().map(|u| u.address_space.clone()) }
+}
+
+/// The current thread's Linux thread (a clone), if it is a user thread whose
+/// process is registered (lock-free, safe from syscall and fault handlers).
+pub fn current_user_thread() -> Option<Arc<UserThread>> {
+    let _irq = arch::irq::push_off();
+    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
+    if t.is_null() {
+        return None;
+    }
+    // SAFETY: `t` is the running thread on this CPU and interrupts are off, so
+    // `schedule()` cannot run or change `user`; only this thread writes
+    // `linux` (`set_current_user_thread`), and it is here.
+    unsafe { (*t).user.as_ref().and_then(|u| u.linux.clone()) }
+}
+
+/// Make `linux` the current user thread's Linux thread (`None` to detach
+/// it), returning the one it replaces, which the caller drops with
+/// interrupts on. Only the thread itself sets it, with interrupts off.
+///
+/// Panics if the current thread has no user state (a kernel thread).
+pub fn set_current_user_thread(linux: Option<Arc<UserThread>>) -> Option<Arc<UserThread>> {
+    let _irq = arch::irq::push_off();
+    let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
+    assert!(!t.is_null(), "set_current_user_thread before sched::init");
+    // SAFETY: `t` is the running thread on this CPU with interrupts off, and
+    // no other reference into its slot is live: none is held across a call
+    // into this module, and nothing else on this CPU runs meanwhile.
+    let slot = unsafe { &mut *(*t).user.slot() };
+    let user = slot.as_mut().expect("set_current_user_thread on a kernel thread");
+    core::mem::replace(&mut user.linux, linux)
 }
 
 /// The current user thread's `IA32_FS_BASE` (`0` for non-user threads).

@@ -9,7 +9,7 @@ use super::not_implemented;
 use crate::arch;
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::linux::general;
-use crate::linux::process::{record_exit, with_current, with_current_mut};
+use crate::linux::process::{current_process, current_thread, record_exit};
 use crate::user::UserExit;
 
 /// `exit` and `exit_group` (one arm in `dispatch`).
@@ -25,26 +25,25 @@ pub(super) fn sys_exit(frame: &mut SyscallFrame) -> SyscallReturn {
 }
 
 pub(super) fn sys_getpid(frame: &mut SyscallFrame) -> SyscallReturn {
-    frame.rax = u64::from(with_current(|p| p.pid));
+    frame.rax = u64::from(current_process().pid());
     SyscallReturn::Sysret
 }
 
 pub(super) fn sys_getppid(frame: &mut SyscallFrame) -> SyscallReturn {
-    frame.rax = u64::from(with_current(|p| p.ppid));
+    frame.rax = u64::from(current_process().ppid());
     SyscallReturn::Sysret
 }
 
 pub(super) fn sys_gettid(frame: &mut SyscallFrame) -> SyscallReturn {
-    frame.rax = u64::from(with_current(|p| p.tid));
+    frame.rax = u64::from(current_thread().tid());
     SyscallReturn::Sysret
 }
 
 pub(super) fn sys_set_tid_address(frame: &mut SyscallFrame) -> SyscallReturn {
     let tidptr = frame.rdi;
-    frame.rax = u64::from(with_current_mut(|p| {
-        p.clear_child_tid = tidptr;
-        p.tid
-    }));
+    let thread = current_thread();
+    thread.set_clear_child_tid(tidptr);
+    frame.rax = u64::from(thread.tid());
     SyscallReturn::Sysret
 }
 

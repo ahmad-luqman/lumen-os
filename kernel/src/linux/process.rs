@@ -1,13 +1,28 @@
-//! Per-process Linux x86-64 state, console I/O bridge, and exit tracking (M6),
-//! with the VFS-backed FD table, working directory and umask (M7, #254).
+//! Linux processes and threads (M8's split, #372), the console I/O bridge
+//! and exit tracking (M6), and the VFS-backed FD table, working directory
+//! and umask (M7, #254).
 //!
-//! Each ring-3 run registers a [`ProcessState`] keyed by its kernel scheduler
-//! thread id in [`ACTIVE_PROCS`] and removes it cleanly when the thread exits
-//! or faults. Lock discipline: `ACTIVE_PROCS` is an IRQ-off [`SpinLock`] and
-//! must NEVER be held across `copy_from_user`, `copy_to_user`, blocking waits,
-//! or `AddressSpace` operations; nor across anything that takes a VFS lock
-//! (an open, `stat`, an inode's lock state): an open file or cwd leaves the
-//! table under it as a clone or an extracted entry, used and dropped after.
+//! A [`Process`] is a Linux thread group: one pid and what its threads
+//! share (address space, descriptors, working directory and umask,
+//! dispositions, console state). A [`UserThread`] is one ring-3 thread's
+//! Linux identity, held in its scheduler thread's user state
+//! (`sched::current_user_thread`), so a syscall finds its process without a
+//! table lookup. [`PROCS`] holds every process by pid and every user thread
+//! by tid, with lumen-proc's [`ProcTree`]; pid 1 is the kernel's
+//! ([`start_init`], from `linux::init`), a process with no threads. Each
+//! `linux` run registers a root process on its thread
+//! ([`register_current`]) and takes it down when ring 3 exits or faults
+//! ([`take_current`]).
+//!
+//! Lock discipline (ARCHITECTURE section 9, level 10): `PROCS`, then a
+//! `Process::signal`, then the leaves (a process's `mm`, `files`, `fs`,
+//! `exe_path`, `console` and `exit` slots, `Files::table`,
+//! `FsState::inner`), never two leaves at once. All are IRQ-off
+//! [`SpinLock`]s: never held across `copy_from_user`, `copy_to_user`,
+//! blocking waits, or `AddressSpace` operations; nor across anything that
+//! takes a VFS lock (an open, `stat`, an inode's lock state): an open file
+//! or cwd leaves its lock as a clone or an extracted entry, used and
+//! dropped after.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -15,8 +30,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use log::warn;
+use lumen_proc::{ExitAction, ExitError, ExitStatus, INIT_PID, ProcState, ProcTree, RusageSlot};
+use lumen_signal::Signal;
 use lumen_vfs::{Escaped, FdTable, InodeType, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded};
 
 use crate::keyboard::{Key as KbdKey, KeyCode};
@@ -25,7 +43,7 @@ use crate::linux::general;
 use crate::mm::user_vm::AddressSpace;
 use crate::sched;
 use crate::serial_in;
-use crate::sync::SpinLock;
+use crate::sync::{SpinLock, SpinLockGuard};
 use crate::term;
 use crate::user::UserExit;
 use crate::vfs::KernelVfsLock;
@@ -121,8 +139,8 @@ impl Stdio {
 /// Where a ring-3 process's console fds (0, 1, 2) connect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleIo {
-    /// `usertest` capture mode: stdout captured into `ProcessState::stdout`,
-    /// stdin served from pre-seeded `ProcessState::stdin`.
+    /// `usertest` capture mode: stdout captured into `ConsoleState::stdout`,
+    /// stdin served from pre-seeded `ConsoleState::stdin`.
     Capture,
     /// Interactive serial console (`serial_in` + `klog::LockedSerial`).
     Serial,
@@ -174,124 +192,365 @@ pub fn default_termios() -> general::termios {
     }
 }
 
-/// Per-process Linux state owned by one active ring-3 thread.
-pub struct ProcessState {
-    pub pid: u32,
-    pub ppid: u32,
-    pub tid: u32,
-    /// Open descriptors (`lumen_vfs::MAX_FDS` slots): 0, 1 and 2 on
-    /// `/dev/console` at the start. Private: a slot leaves it only through
-    /// `close_current_fd`, `insert_current_fd`'s displacement or `take_of`
-    /// (`take_current`, `RegisteredProcess`), which release its locks
-    /// outside `ACTIVE_PROCS`.
-    fds: FdTable<FileRef>,
+/// `SIG_IGN` as a `sa_handler` value (Linux's `(void (*)(int))1`).
+const SIG_IGN: u64 = 1;
+
+/// The largest pid (and tid) [`PROCS`]' tree hands out: pids run
+/// `2..=PID_MAX`, as Linux's default `pid_max` hands out `1..32767`
+/// (lumen-proc wraps to 2).
+pub const PID_MAX: u32 = 32767;
+
+/// A Linux thread group: one pid and what its threads share. Its `mm`,
+/// `files` and `fs` slots are emptied by its takedown ([`take_current`]),
+/// in thread context, so dropping the last reference anywhere frees memory
+/// only (a debug assertion in `Drop`, pid 1 aside).
+pub struct Process {
+    /// Stored once, in the [`PROCS`] hold that allocates it, before any
+    /// thread of it runs.
+    pid: AtomicU32,
+    /// Its address space: the `Arc` every one of its threads holds in its
+    /// scheduler state (for procfs). Pid 1's is an empty placeholder that is
+    /// never loaded.
+    mm: SpinLock<Option<Arc<AddressSpace>>>,
+    /// Its descriptors.
+    files: SpinLock<Option<Arc<Files>>>,
+    /// Its working directory and umask.
+    fs: SpinLock<Option<Arc<FsState>>>,
+    /// Its signal dispositions, and each thread's mask.
+    signal: SpinLock<SignalState>,
+    /// The executable's path for `/proc/<pid>/exe`: set by `linux /path`
+    /// (the path as typed) and by `vfstest dev-tmp-proc`'s checks (and the
+    /// ktests running them).
+    exe_path: SpinLock<Option<String>>,
+    /// Its `RusageSlot`'s value in [`PROCS`]' tree.
+    usage_slot: u64,
+    /// M7's console state (until the console is a tty).
+    console: SpinLock<ConsoleState>,
+    allow_test_syscalls: bool,
+    /// How its run ended, once it has.
+    exit: SpinLock<Option<UserExit>>,
+}
+
+impl Process {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        mm: Option<Arc<AddressSpace>>,
+        files: Option<Arc<Files>>,
+        fs: Option<Arc<FsState>>,
+        signal: SignalState,
+        console: ConsoleState,
+        allow_test_syscalls: bool,
+        exe_path: Option<String>,
+    ) -> Self {
+        Self {
+            pid: AtomicU32::new(0),
+            mm: SpinLock::new(mm),
+            files: SpinLock::new(files),
+            fs: SpinLock::new(fs),
+            signal: SpinLock::new(signal),
+            exe_path: SpinLock::new(exe_path),
+            usage_slot: NEXT_USAGE_SLOT.fetch_add(1, Ordering::Relaxed),
+            console: SpinLock::new(console),
+            allow_test_syscalls,
+            exit: SpinLock::new(None),
+        }
+    }
+
+    /// Its pid (the thread group id).
+    pub fn pid(&self) -> u32 {
+        self.pid.load(Ordering::Acquire)
+    }
+
+    /// Its parent's pid, or 0 without one (a root `linux` started, as M6's
+    /// `getppid`).
+    pub fn ppid(&self) -> u32 {
+        PROCS.lock().tree.parent(self.pid()).flatten().unwrap_or(0)
+    }
+
+    /// Whether its run may make `usertest`'s test syscalls.
+    pub fn allow_test_syscalls(&self) -> bool {
+        self.allow_test_syscalls
+    }
+
+    /// Its address space (a clone), until its takedown.
+    pub fn address_space(&self) -> Option<Arc<AddressSpace>> {
+        self.mm.lock().clone()
+    }
+
+    /// Its descriptors (a clone), until its takedown.
+    pub fn files(&self) -> Option<Arc<Files>> {
+        self.files.lock().clone()
+    }
+
+    /// Its working directory and umask (a clone), until its takedown.
+    pub fn fs(&self) -> Option<Arc<FsState>> {
+        self.fs.lock().clone()
+    }
+
+    /// Whether its `SIGCHLD` disposition is `SIG_IGN` or carries
+    /// `SA_NOCLDWAIT`: its children's zombies leave at once
+    /// (`ProcTree::exit`'s `autoreap`). Takes `Process::signal`: callable
+    /// under `PROCS`.
+    fn autoreaps(&self) -> bool {
+        let chld = self.signal.lock().actions[general::SIGCHLD as usize - 1];
+        chld.handler == SIG_IGN || chld.flags & u64::from(general::SA_NOCLDWAIT) != 0
+    }
+
+    /// Exit step 3: empty its `mm`, `files` and `fs` slots, in thread
+    /// context. The process that brings its descriptors' `Files::users` to 0
+    /// closes every descriptor ([`release_fd`], outside every spinlock).
+    fn release_resources(&self) {
+        let pid = self.pid();
+        // Each taken out under its lock and dropped after it is released
+        // (a working directory's last open reference may take VFS locks).
+        let mm = self.mm.lock().take();
+        drop(mm);
+        let files = self.files.lock().take();
+        if let Some(files) = files
+            && files.users.fetch_sub(1, Ordering::AcqRel) == 1
+        {
+            let entries = files.table.lock().drain_all();
+            for entry in entries {
+                release_fd(pid, entry.file);
+            }
+        }
+        let fs = self.fs.lock().take();
+        drop(fs);
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let pid = *self.pid.get_mut();
+        debug_assert!(
+            pid == INIT_PID || (self.mm.lock().is_none() && self.files.lock().is_none() && self.fs.lock().is_none()),
+            "pid {pid} dropped before its takedown emptied mm, files and fs"
+        );
+    }
+}
+
+/// A descriptor table, shared by the processes `clone(CLONE_FILES)` links
+/// (M8).
+pub struct Files {
+    table: SpinLock<FdTable<FileRef>>,
+    /// The processes sharing it: the one that brings it to 0 closes every
+    /// descriptor (`Process::release_resources`), so the last `Arc` (a
+    /// procfs reader's, say) frees memory only.
+    users: AtomicUsize,
+}
+
+impl Files {
+    fn new(table: FdTable<FileRef>) -> Self {
+        Self { table: SpinLock::new(table), users: AtomicUsize::new(1) }
+    }
+
+    /// The processes sharing it.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`; C1's `fork` next
+    pub fn users(&self) -> usize {
+        self.users.load(Ordering::Acquire)
+    }
+
+    /// How many descriptors are open.
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`
+    pub fn open_count(&self) -> usize {
+        self.table.lock().open_count()
+    }
+}
+
+/// A process's working directory and umask, shared by the processes
+/// `clone(CLONE_FS)` links (M8).
+pub struct FsState {
+    inner: SpinLock<FsInner>,
+}
+
+/// What [`FsState`] holds.
+pub struct FsInner {
     /// The working directory (`set_current_cwd` swaps it).
     cwd: Cwd,
     /// The file mode creation mask (`0o777` bits).
     pub umask: u16,
-    pub sigactions: [KernelSigaction; 64],
-    pub sigmask: u64,
-    pub clear_child_tid: u64,
-    pub termios: general::termios,
-    pub io: ConsoleIo,
-    pub allow_test_syscalls: bool,
-    pub exit: Option<UserExit>,
-    pub stdout: Vec<u8>,
-    /// The process's address space, for `/proc/<pid>/maps`.
-    pub address_space: Option<Arc<AddressSpace>>,
-    /// The executable's path for `/proc/<pid>/exe`: set by `linux /path`
-    /// (the path as typed) and by `vfstest dev-tmp-proc`'s checks (and the
-    /// ktests running them).
-    pub exe_path: Option<String>,
-    stdin: Vec<u8>,
-    stdin_pos: usize,
-    /// Small lookahead / UTF-8 tail buffer for stdin (up to 4 bytes).
-    unread: [u8; 4],
-    unread_pos: u8,
-    unread_len: u8,
-    /// Incomplete trailing UTF-8 bytes pending across `write`/`writev` chunks on a VT.
-    vt_utf8: [u8; 4],
-    vt_utf8_len: u8,
 }
 
-impl ProcessState {
-    fn new(
-        pid: u32,
-        io: ConsoleIo,
-        allow_test_syscalls: bool,
-        stdin: Vec<u8>,
-        address_space: Option<Arc<AddressSpace>>,
-        exe_path: Option<String>,
-        stdio: Stdio,
-    ) -> Self {
-        Self {
-            pid,
-            ppid: 0,
-            tid: pid,
-            fds: stdio.fds,
-            cwd: stdio.cwd,
-            umask: DEFAULT_UMASK,
-            sigactions: [KernelSigaction::default(); 64],
-            sigmask: 0,
-            clear_child_tid: 0,
-            termios: default_termios(),
-            io,
-            allow_test_syscalls,
-            exit: None,
-            stdout: Vec::new(),
-            address_space,
-            exe_path,
-            stdin,
-            stdin_pos: 0,
-            unread: [0; 4],
-            unread_pos: 0,
-            unread_len: 0,
-            vt_utf8: [0; 4],
-            vt_utf8_len: 0,
-        }
-    }
-
-    #[inline]
-    fn has_unread(&self) -> bool {
-        self.unread_pos < self.unread_len
-    }
-
-    #[inline]
-    fn pop_unread(&mut self) -> Option<u8> {
-        if self.unread_pos < self.unread_len {
-            let b = self.unread[self.unread_pos as usize];
-            self.unread_pos += 1;
-            if self.unread_pos == self.unread_len {
-                self.unread_pos = 0;
-                self.unread_len = 0;
-            }
-            Some(b)
-        } else {
-            None
-        }
-    }
-
-    fn push_unread_bytes(&mut self, bytes: &[u8]) {
-        debug_assert!(!self.has_unread(), "push_unread_bytes called with unread bytes pending");
-        let n = bytes.len().min(self.unread.len());
-        self.unread[..n].copy_from_slice(&bytes[..n]);
-        self.unread_pos = 0;
-        self.unread_len = n as u8;
+impl FsState {
+    fn new(cwd: Cwd) -> Self {
+        Self { inner: SpinLock::new(FsInner { cwd, umask: DEFAULT_UMASK }) }
     }
 }
 
-static ACTIVE_PROCS: SpinLock<BTreeMap<u64, ProcessState>> = SpinLock::new(BTreeMap::new());
-static NEXT_PID: AtomicU32 = AtomicU32::new(1);
+/// A process's signal dispositions and its threads' masks. M8's delivery
+/// (pending signals, stops, the alternate stack) adds to it.
+pub struct SignalState {
+    pub actions: [KernelSigaction; 64],
+    /// By tid.
+    threads: BTreeMap<u32, ThreadSignals>,
+}
+
+impl SignalState {
+    const fn new() -> Self {
+        Self { actions: [KernelSigaction { handler: 0, flags: 0, restorer: 0, mask: 0 }; 64], threads: BTreeMap::new() }
+    }
+}
+
+/// One thread's signal state.
+#[derive(Default)]
+pub struct ThreadSignals {
+    /// The signals it blocks (`rt_sigprocmask`), a bit per signal.
+    pub blocked: u64,
+}
+
+/// One ring-3 thread's Linux identity: held by its scheduler thread's user
+/// state (`sched::current_user_thread`) and by [`PROCS`] while it lives.
+pub struct UserThread {
+    /// Stored once, in the [`PROCS`] hold that allocates it, before the
+    /// thread enters ring 3. The leader's is the pid.
+    tid: AtomicU32,
+    process: Arc<Process>,
+    /// `set_tid_address`'s pointer (M8: `CLONE_CHILD_CLEARTID`'s too).
+    clear_child_tid: AtomicU64,
+    /// Its scheduler thread's id (`sched::threads()`' id).
+    kernel_thread: u64,
+}
+
+impl UserThread {
+    fn new(process: Arc<Process>, kernel_thread: u64) -> Self {
+        Self { tid: AtomicU32::new(0), process, clear_child_tid: AtomicU64::new(0), kernel_thread }
+    }
+
+    /// Its tid.
+    pub fn tid(&self) -> u32 {
+        self.tid.load(Ordering::Acquire)
+    }
+
+    /// Its process.
+    pub fn process(&self) -> &Arc<Process> {
+        &self.process
+    }
+
+    /// Record `set_tid_address`'s pointer.
+    pub fn set_clear_child_tid(&self, tidptr: u64) {
+        self.clear_child_tid.store(tidptr, Ordering::Relaxed);
+    }
+
+    /// `set_tid_address`'s pointer (0 if none was set).
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`; C1's exit next
+    pub fn clear_child_tid(&self) -> u64 {
+        self.clear_child_tid.load(Ordering::Relaxed)
+    }
+}
+
+/// Every process by pid and every user thread by tid, with the process
+/// tree ([`PROCS`]).
+struct ProcTable {
+    tree: ProcTree,
+    /// Live processes and zombies, by pid.
+    procs: BTreeMap<u32, Arc<Process>>,
+    /// Live user threads, by tid.
+    threads: BTreeMap<u32, Arc<UserThread>>,
+}
+
+/// The kernel's process table (section 9's Lock 10a): taken before any
+/// `Process::signal`, which may nest under it, and before the leaf locks.
+/// The tree allocates under it.
+static PROCS: SpinLock<ProcTable> =
+    SpinLock::new(ProcTable { tree: ProcTree::new(PID_MAX), procs: BTreeMap::new(), threads: BTreeMap::new() });
+
+/// Each process's `RusageSlot` value: any unique number, taken before its
+/// pid exists.
+static NEXT_USAGE_SLOT: AtomicU64 = AtomicU64::new(0);
+
+/// Start pid 1 (`linux::init`, at boot): a kernel-owned process with no
+/// threads, an empty placeholder address space and no descriptors, whose
+/// `SIGCHLD` is `SIG_IGN`, so an orphan's zombie (and a child of a root's)
+/// goes at once. Every exit names it as the reaper.
+///
+/// Panics if it can't (no frame for its placeholder address space at boot,
+/// or a second call).
+pub(crate) fn start_init() {
+    let mm = AddressSpace::new().unwrap_or_else(|e| panic!("pid 1's address space: {e}"));
+    let mut signal = SignalState::new();
+    signal.actions[general::SIGCHLD as usize - 1].handler = SIG_IGN;
+    let init = Arc::new(Process::new(
+        Some(Arc::new(mm)),
+        None,
+        None,
+        signal,
+        ConsoleState::new(ConsoleIo::Capture, Vec::new()),
+        false,
+        None,
+    ));
+    init.pid.store(INIT_PID, Ordering::Release);
+    let started = {
+        let mut t = PROCS.lock();
+        let started = t.tree.spawn_init(RusageSlot::new(init.usage_slot));
+        if started.is_ok() {
+            t.procs.insert(INIT_PID, Arc::clone(&init));
+        }
+        started
+    };
+    if let Err(e) = started {
+        panic!("pid 1 can't start: {e:?}");
+    }
+}
 
 #[inline]
 fn current_kernel_tid() -> u64 {
     sched::running_here().expect("ring-3 syscall/exception requires a running thread").0
 }
 
-/// Register a fresh [`ProcessState`] for the current user thread, starting
-/// with `stdio` (opened by the caller first, so a failure stops the run
-/// before it starts), with the executable's path for `/proc/<pid>/exe` if it
-/// was loaded by path, and return its PID.
+/// The current Linux thread, if the running thread is a registered user
+/// thread (`None` on a kernel thread, a ktest's `UserSpaceGuard`, or before
+/// registration and after takedown).
+pub fn try_current_thread() -> Option<Arc<UserThread>> {
+    sched::current_user_thread()
+}
+
+/// The current Linux thread: panics outside a registered user thread (a
+/// syscall or fault handler always runs on one).
+pub fn current_thread() -> Arc<UserThread> {
+    try_current_thread().expect("ring-3 syscall with no Linux thread")
+}
+
+/// The current thread's process (see [`current_thread`]).
+pub fn current_process() -> Arc<Process> {
+    Arc::clone(current_thread().process())
+}
+
+/// The process `pid`, live or a zombie, while [`PROCS`] holds it.
+pub fn lookup(pid: u32) -> Option<Arc<Process>> {
+    PROCS.lock().procs.get(&pid).cloned()
+}
+
+/// The live user thread `tid`.
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`; C5's `tkill` next
+pub fn lookup_thread(tid: u32) -> Option<Arc<UserThread>> {
+    PROCS.lock().threads.get(&tid).cloned()
+}
+
+/// How a process's run ended, as the process tree records it: an exit's
+/// status byte, or the signal Linux would have killed it with for a fault
+/// (M8 delivers those as signals).
+fn exit_status(exit: &UserExit) -> ExitStatus {
+    let signal = match *exit {
+        UserExit::Exited(code) => return ExitStatus::exited(code),
+        UserExit::Fault { vector, .. } => match vector {
+            0 | 16 | 19 => Signal::FPE,
+            1 | 3 => Signal::TRAP,
+            6 => Signal::ILL,
+            12 | 17 => Signal::BUS,
+            _ => Signal::SEGV,
+        },
+        UserExit::NonCanonicalRip(_) => Signal::SEGV,
+        UserExit::BusError { .. } => Signal::BUS,
+    };
+    ExitStatus::Killed { signal, core: false }
+}
+
+/// Register a fresh process for the current user thread, as a root (no
+/// parent: `getppid` 0), starting with `stdio` (opened by the caller first,
+/// so a failure stops the run before it starts), with the executable's path
+/// for `/proc/<pid>/exe` if it was loaded by path, and return its pid.
+///
+/// Panics if no pid is free (every pid up to [`PID_MAX`] in use).
 pub fn register_current(
     io: ConsoleIo,
     allow_test_syscalls: bool,
@@ -299,45 +558,131 @@ pub fn register_current(
     exe_path: Option<String>,
     stdio: Stdio,
 ) -> u32 {
-    let ktid = current_kernel_tid();
-    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
-    let address_space = sched::current_address_space();
-    let state = ProcessState::new(pid, io, allow_test_syscalls, stdin, address_space, exe_path, stdio);
-    let prev = ACTIVE_PROCS.lock().insert(ktid, state);
-    debug_assert!(prev.is_none(), "ring-3 process registered twice on thread {ktid}");
+    let process = Arc::new(Process::new(
+        sched::current_address_space(),
+        Some(Arc::new(Files::new(stdio.fds))),
+        Some(Arc::new(FsState::new(stdio.cwd))),
+        SignalState::new(),
+        ConsoleState::new(io, stdin),
+        allow_test_syscalls,
+        exe_path,
+    ));
+    let thread = Arc::new(UserThread::new(Arc::clone(&process), current_kernel_tid()));
+    let pid = {
+        let mut t = PROCS.lock();
+        let pid = t.tree.spawn_root(RusageSlot::new(process.usage_slot));
+        if let Ok(pid) = pid {
+            process.pid.store(pid, Ordering::Release);
+            thread.tid.store(pid, Ordering::Release);
+            process.signal.lock().threads.insert(pid, ThreadSignals::default());
+            t.procs.insert(pid, Arc::clone(&process));
+            t.threads.insert(pid, Arc::clone(&thread));
+        }
+        pid
+    };
+    let pid = pid.unwrap_or_else(|_| panic!("no pid is free for a new process"));
+    let prev = sched::set_current_user_thread(Some(thread));
+    debug_assert!(prev.is_none(), "a Linux process registered twice on thread {}", current_kernel_tid());
     pid
 }
 
-/// Remove and return the current thread's [`ProcessState`] after ring-3
-/// exits, its descriptors closed (each lock released as `close` does, outside
-/// `ACTIVE_PROCS`); its working directory goes when it drops.
-pub fn take_current() -> ProcessState {
-    take_of(current_kernel_tid()).expect("active process state missing after ring-3 exit")
+/// What a process's takedown hands back: its pid, how its run ended, and
+/// what its console captured (`ConsoleIo::Capture`).
+pub struct Ended {
+    pub pid: u32,
+    pub exit: Option<UserExit>,
+    pub stdout: Vec<u8>,
 }
 
-/// Remove thread `ktid`'s [`ProcessState`], if it has one, and close its
-/// descriptors outside `ACTIVE_PROCS`: the one way a process is taken down
-/// ([`take_current`] and [`RegisteredProcess`] both come here).
-fn take_of(ktid: u64) -> Option<ProcessState> {
-    let mut proc = ACTIVE_PROCS.lock().remove(&ktid)?;
-    for entry in proc.fds.drain_all() {
-        release_fd(proc.pid, entry.file);
+/// Take the current thread's process down after ring 3 exits
+/// ([`take_current_if_any`]).
+pub fn take_current() -> Ended {
+    take_current_if_any().expect("no Linux process to take down after ring-3 exit")
+}
+
+/// Take the current thread's process down, if it has one: the one way a
+/// process is taken down ([`take_current`] and [`RegisteredProcess`] both
+/// come here). The thread leaves its scheduler state; its process's `mm`,
+/// `files` (each descriptor closed, its locks released as `close` does,
+/// once no other process shares the table) and `fs` are emptied; then it
+/// leaves [`PROCS`] and exits in the tree (`ProcTree::exit`, pid 1 its
+/// reaper). The process must have no other thread.
+fn take_current_if_any() -> Option<Ended> {
+    let thread = sched::set_current_user_thread(None)?;
+    let process = Arc::clone(thread.process());
+    let (pid, tid) = (process.pid(), thread.tid());
+    let exit = process.exit.lock().take();
+    process.release_resources();
+    let status = exit.as_ref().map_or(ExitStatus::Killed { signal: Signal::KILL, core: false }, exit_status);
+    let (gone_thread, gone) = {
+        let mut t = PROCS.lock();
+        let gone_thread = t.threads.remove(&tid);
+        process.signal.lock().threads.remove(&tid);
+        debug_assert!(
+            t.tree.threads(pid).is_empty() && !t.threads.values().any(|th| Arc::ptr_eq(th.process(), &process)),
+            "pid {pid} taken down with other threads still live"
+        );
+        (gone_thread, exit_in_tree(t, pid, status))
+    };
+    debug_assert!(gone_thread.is_some_and(|g| Arc::ptr_eq(&g, &thread)), "thread {tid} wasn't in PROCS");
+    debug_assert!(gone.iter().any(|g| Arc::ptr_eq(g, &process)), "pid {pid} stayed in PROCS after its exit");
+    drop(gone);
+    let stdout = core::mem::take(&mut process.console.lock().stdout);
+    Some(Ended { pid, exit, stdout })
+}
+
+/// `pid` ends with `status` in [`PROCS`]' tree, holding `t`, its children
+/// going to pid 1. Returns the processes that left [`PROCS`] (a root, a
+/// child of an autoreaping parent, and their released zombies), for the
+/// caller to drop after `t` is released. A failed reservation (the heap
+/// refusing) is retried, `PROCS` released between tries.
+fn exit_in_tree(mut t: SpinLockGuard<'_, ProcTable>, pid: u32, status: ExitStatus) -> Vec<Arc<Process>> {
+    let mut warned = false;
+    loop {
+        let ProcTable { tree, procs, .. } = &mut *t;
+        let autoreap = |parent: u32| procs.get(&parent).is_some_and(|p| p.autoreaps());
+        match tree.exit(pid, status, Some(INIT_PID), autoreap) {
+            Ok(outcome) => {
+                let mut gone = Vec::new();
+                for action in outcome {
+                    match action {
+                        ExitAction::Released { child, .. } | ExitAction::Notify { child, released: Some(_), .. } => {
+                            gone.extend(procs.remove(&child));
+                        }
+                        // A zombie waits for its parent's wait (M8's `wait4`).
+                        ExitAction::Notify { released: None, .. } => {}
+                        // Nothing to signal before M8's signal delivery.
+                        ExitAction::HangupThenContinue { .. } => {}
+                    }
+                }
+                return gone;
+            }
+            Err(ExitError::NoMem) => {
+                drop(t);
+                if !warned {
+                    warn!(target: "linux", "pid {pid}'s exit is waiting for memory");
+                    warned = true;
+                }
+                sched::yield_now();
+                t = PROCS.lock();
+            }
+            Err(ExitError::Bug(bug)) => panic!("pid {pid}'s exit: {bug}"),
+        }
     }
-    Some(proc)
 }
 
 /// A process the kernel's own checks register on the current user thread,
-/// taken down (its descriptors closed, by [`take_of`]) when this drops, so
-/// an early return can't leave it in `ACTIVE_PROCS`, where it would stay in
-/// `/proc` for good. It starts with `ConsoleIo::Capture`, no test syscalls,
-/// no stdin and no executable path. Real runs (`user.rs`) register and take
-/// their process themselves.
+/// taken down (its descriptors closed, by [`take_current_if_any`]) when this
+/// drops, so an early return can't leave it in [`PROCS`], where it would
+/// stay in `/proc` for good. It starts with `ConsoleIo::Capture`, no test
+/// syscalls, no stdin and no executable path. Real runs (`user.rs`)
+/// register and take their process themselves.
 ///
-/// - Drop it, or [`end`](Self::end) it and drop the [`ProcessState`] that
-///   returns, before `sched::detach_user_space`: the state holds the
-///   thread's address space, so with it still alive then the detached
-///   space isn't the last reference, its teardown there is skipped, and
-///   the space is only freed when its last `Arc` drops.
+/// - Drop it, or [`end`](Self::end) it, before `sched::detach_user_space`:
+///   the process holds the thread's address space until its takedown, so
+///   with it still registered then the detached space isn't the last
+///   reference, its teardown there is skipped, and the space is only freed
+///   when its last `Arc` drops.
 /// - Never call [`take_current`] while it lives: its own takedown would
 ///   find no process, a panic.
 /// - Bind it to a named variable: `#[must_use]` catches a bare call, not
@@ -363,24 +708,23 @@ impl RegisteredProcess {
         self.pid
     }
 
-    /// Take the process down now ([`take_of`]) and return its state (what
+    /// Take the process down now and return what it [`Ended`] with (what
     /// its console captured, say).
-    pub(crate) fn end(self) -> ProcessState {
-        let proc = self.take();
+    pub(crate) fn end(self) -> Ended {
+        let ended = self.take();
         // Taken, so `Drop` must not take it again; nothing else in `self`
         // needs dropping.
         core::mem::forget(self);
-        proc
+        ended
     }
 
     /// Take the current thread's process down: this one's, or a panic.
-    fn take(&self) -> ProcessState {
-        let ktid = current_kernel_tid();
-        let proc = take_of(ktid).unwrap_or_else(|| {
-            panic!("pid {}: thread {ktid} has no process left to take down", self.pid);
+    fn take(&self) -> Ended {
+        let ended = take_current_if_any().unwrap_or_else(|| {
+            panic!("pid {}: thread {} has no process left to take down", self.pid, current_kernel_tid());
         });
-        debug_assert_eq!(proc.pid, self.pid, "thread {ktid}'s process (left) isn't this RegisteredProcess's (right)");
-        proc
+        debug_assert_eq!(ended.pid, self.pid, "the thread's process (left) isn't this RegisteredProcess's (right)");
+        ended
     }
 }
 
@@ -395,7 +739,7 @@ impl Drop for RegisteredProcess {
 /// (as Linux), and its `flock` locks with the last slot of the open file
 /// description; if any went, the blocked lockers are woken to retry
 /// ([`locks_released`]). Takes the inode's Lock 4: never call it holding
-/// `ACTIVE_PROCS` (or any spinlock).
+/// any spinlock (`PROCS`, `Files::table`).
 fn release_fd(pid: u32, file: FileRef) {
     let last = file.dec_fd_ref() == 0;
     let id = file.id;
@@ -439,9 +783,9 @@ pub fn lock_releases() -> u64 {
 
 /// Say that an advisory lock (`flock` or a POSIX record lock) may have been
 /// given up or weakened, waking every blocked locker to retry. Call it
-/// after the inode's lock state is released, never under it, under
-/// `ACTIVE_PROCS` or under another spinlock: `wake_all` takes the wait
-/// queue's lock and each woken thread's run-queue lock.
+/// after the inode's lock state is released, never under it or under a
+/// spinlock (`PROCS`, `Files::table`): `wake_all` takes the wait queue's
+/// lock and each woken thread's run-queue lock.
 pub fn locks_released() {
     LOCK_RELEASES.fetch_add(1, Ordering::SeqCst);
     LOCK_WAITERS.wake_all();
@@ -466,16 +810,25 @@ pub(crate) fn lock_waiters() -> u32 {
     LOCK_WAITING.load(Ordering::SeqCst)
 }
 
+/// Run a short non-blocking closure on the current process's descriptor
+/// table, under its `Files::table` lock (a leaf: nothing in `f` may take a
+/// lock, allocate under the page-table or frame lock, or close a file).
+fn with_current_fds<R>(f: impl FnOnce(&mut FdTable<FileRef>) -> R) -> R {
+    let files = current_process().files().expect("a running process has its descriptors");
+    let mut table = files.table.lock();
+    f(&mut table)
+}
+
 /// The current process's open file on `fd` (a clone, taken and released
-/// under `ACTIVE_PROCS`), or `None` if `fd` isn't open.
+/// under its table's lock), or `None` if `fd` isn't open.
 pub fn current_file(fd: i32) -> Option<FileRef> {
-    with_current(|p| p.fds.get(fd).map(|e| Arc::clone(&e.file)))
+    with_current_fds(|t| t.get(fd).map(|e| Arc::clone(&e.file)))
 }
 
 /// The current process's open files on each of `fds` (clones, all taken in
-/// one hold of `ACTIVE_PROCS`; `None` where one isn't open), for `poll`.
+/// one hold of its table's lock; `None` where one isn't open), for `poll`.
 pub fn current_files(fds: &[i32]) -> Vec<Option<FileRef>> {
-    with_current(|p| fds.iter().map(|&fd| p.fds.get(fd).map(|e| Arc::clone(&e.file))).collect())
+    with_current_fds(|t| fds.iter().map(|&fd| t.get(fd).map(|e| Arc::clone(&e.file))).collect())
 }
 
 /// Whether the current process has a free descriptor slot. `openat` checks
@@ -483,7 +836,7 @@ pub fn current_files(fds: &[i32]) -> Vec<Option<FileRef>> {
 /// (Linux reserves the slot; this only checks: from M8, another thread could
 /// fill the table between this check and the install, after an `O_CREAT`).
 pub fn current_has_free_fd() -> bool {
-    with_current(|p| p.fds.open_count() < lumen_vfs::MAX_FDS)
+    with_current_fds(|t| t.open_count() < lumen_vfs::MAX_FDS)
 }
 
 /// Put `file`, a fresh open file description (its `fd_refs` 1, for this
@@ -491,14 +844,14 @@ pub fn current_has_free_fd() -> bool {
 /// `EMFILE`.
 pub fn install_current_fd(file: KernelFile, cloexec: bool) -> Result<i32, VfsError> {
     let file = Arc::new(file);
-    // A clone goes in, so a refused one drops under `ACTIVE_PROCS` without
+    // A clone goes in, so a refused one drops under the table's lock without
     // being the last reference; `file` drops after the lock is released.
-    with_current_mut(|p| p.fds.alloc(Arc::clone(&file), cloexec))
+    with_current_fds(|t| t.alloc(Arc::clone(&file), cloexec))
 }
 
 /// Put `file`, a fresh open file description, on descriptor `fd` of the
-/// current process, closing what was there (its locks released outside
-/// `ACTIVE_PROCS`). `EBADF` for an fd outside `0..lumen_vfs::MAX_FDS`:
+/// current process, closing what was there (its locks released outside the
+/// table's lock). `EBADF` for an fd outside `0..lumen_vfs::MAX_FDS`:
 /// procfs builds `/proc/<pid>/fd/<fd>`'s inode number from it and relies on
 /// that range.
 pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
@@ -510,9 +863,9 @@ pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
 /// the new slot, and what `new` held is closed. `EBADF` if `old` isn't open
 /// or `new` is out of range; `old == new` changes nothing.
 ///
-/// `old`'s lookup and `new`'s install are two holds of `ACTIVE_PROCS`: from
-/// M8, another thread could close `old` between them (the file stays alive
-/// through this call's reference, so the dup still succeeds).
+/// `old`'s lookup and `new`'s install are two holds of the table's lock:
+/// from M8, another thread could close `old` between them (the file stays
+/// alive through this call's reference, so the dup still succeeds).
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // M8's `dup2`/`dup3` call it; the ktests until then
 pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError> {
     let file = current_file(old).ok_or(VfsError::BadF)?;
@@ -534,13 +887,13 @@ pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError
 /// file description, close-on-exec as `cloexec` says (`fcntl(F_DUPFD)`,
 /// `F_DUPFD_CLOEXEC`, `dup`): the descriptor. `EBADF` if `old` isn't open,
 /// `EINVAL` if `min` is out of range, `EMFILE` if no slot at or above it is
-/// free. Two holds of `ACTIVE_PROCS`, as [`dup_current_fd`].
+/// free. Two holds of the table's lock, as [`dup_current_fd`].
 pub fn dup_current_fd_from(old: i32, min: i32, cloexec: bool) -> Result<i32, VfsError> {
     let file = current_file(old).ok_or(VfsError::BadF)?;
     file.inc_fd_ref();
     // A clone goes in, so a refused one never drops the last reference
-    // under `ACTIVE_PROCS`.
-    let placed = with_current_mut(|p| p.fds.alloc_from(min, Arc::clone(&file), cloexec));
+    // under the table's lock.
+    let placed = with_current_fds(|t| t.alloc_from(min, Arc::clone(&file), cloexec));
     if placed.is_err() {
         file.dec_fd_ref();
     }
@@ -548,9 +901,10 @@ pub fn dup_current_fd_from(old: i32, min: i32, cloexec: bool) -> Result<i32, Vfs
 }
 
 /// Put `file` (its `fd_refs` already counting this slot) on `fd`, releasing
-/// what it displaces outside `ACTIVE_PROCS`.
+/// what it displaces outside the table's lock.
 fn place_current_fd(fd: i32, file: FileRef, cloexec: bool) -> Result<(), VfsError> {
-    let (pid, displaced) = with_current_mut(|p| (p.pid, p.fds.insert_at(fd, Arc::clone(&file), cloexec)));
+    let pid = current_process().pid();
+    let displaced = with_current_fds(|t| t.insert_at(fd, Arc::clone(&file), cloexec));
     if let Some(old) = displaced? {
         release_fd(pid, old.file);
     }
@@ -558,9 +912,11 @@ fn place_current_fd(fd: i32, file: FileRef, cloexec: bool) -> Result<(), VfsErro
 }
 
 /// Close descriptor `fd` of the current process (`close`): `EBADF` if it
-/// isn't open. The entry is taken out under `ACTIVE_PROCS` and released after.
+/// isn't open. The entry is taken out under the table's lock and released
+/// after.
 pub fn close_current_fd(fd: i32) -> Result<(), VfsError> {
-    let (pid, removed) = with_current_mut(|p| (p.pid, p.fds.remove(fd)));
+    let pid = current_process().pid();
+    let removed = with_current_fds(|t| t.remove(fd));
     release_fd(pid, removed?.file);
     Ok(())
 }
@@ -568,95 +924,128 @@ pub fn close_current_fd(fd: i32) -> Result<(), VfsError> {
 /// Whether descriptor `fd` of the current process is close-on-exec, or
 /// `EBADF`.
 pub fn current_cloexec(fd: i32) -> Result<bool, VfsError> {
-    with_current(|p| p.fds.get_cloexec(fd))
+    with_current_fds(|t| t.get_cloexec(fd))
 }
 
 /// Set or clear descriptor `fd`'s close-on-exec flag (`FIOCLEX`,
 /// `FIONCLEX`), or `EBADF`.
 pub fn set_current_cloexec(fd: i32, cloexec: bool) -> Result<(), VfsError> {
-    with_current_mut(|p| p.fds.set_cloexec(fd, cloexec))
+    with_current_fds(|t| t.set_cloexec(fd, cloexec))
+}
+
+/// Run a short non-blocking closure on the current process's working
+/// directory and umask, under its `FsState` lock (a leaf: nothing in `f`
+/// may take a lock or drop a working directory).
+pub fn with_current_fs<R>(f: impl FnOnce(&mut FsInner) -> R) -> R {
+    let fs = current_process().fs().expect("a running process has its working directory");
+    let mut inner = fs.inner.lock();
+    f(&mut inner)
 }
 
 /// The current process's working directory: its inode and its stored path
 /// (clones).
 pub fn current_cwd() -> (Arc<dyn VfsInode>, Arc<[u8]>) {
-    with_current(|p| (Arc::clone(p.cwd.inode()), Arc::clone(p.cwd.path())))
+    with_current_fs(|fs| (Arc::clone(fs.cwd.inode()), Arc::clone(fs.cwd.path())))
 }
 
 /// Make `cwd` the current process's working directory; the old one drops
-/// after `ACTIVE_PROCS` is released (`chdir`, `fchdir`).
+/// after its lock is released (`chdir`, `fchdir`).
 pub fn set_current_cwd(cwd: Cwd) {
-    let old = with_current_mut(|p| core::mem::replace(&mut p.cwd, cwd));
+    let old = with_current_fs(|fs| core::mem::replace(&mut fs.cwd, cwd));
     drop(old);
 }
 
 /// The current process's file mode creation mask.
 pub fn current_umask() -> u16 {
-    with_current(|p| p.umask)
+    with_current_fs(|fs| fs.umask)
+}
+
+/// Run a short non-blocking closure on the current thread's signal mask
+/// and its process's dispositions, under `Process::signal`.
+pub fn with_current_signals<R>(f: impl FnOnce(&mut [KernelSigaction; 64], &mut ThreadSignals) -> R) -> R {
+    let thread = current_thread();
+    let tid = thread.tid();
+    let mut signal = thread.process().signal.lock();
+    let SignalState { actions, threads } = &mut *signal;
+    let me = threads.get_mut(&tid).expect("a running thread has its signal state");
+    f(actions, me)
+}
+
+/// Run a short non-blocking closure on the current process's console
+/// state, under its lock (a leaf).
+pub fn with_current_console<R>(f: impl FnOnce(&mut ConsoleState) -> R) -> R {
+    let process = current_process();
+    let mut console = process.console.lock();
+    f(&mut console)
 }
 
 /// Non-panicking lookup of the current thread's [`ConsoleIo`], returning `None`
-/// if called outside an active ring-3 [`ProcessState`] (e.g., from a kernel thread).
+/// if called outside a registered Linux thread (e.g., from a kernel thread).
 pub fn try_current_io() -> Option<ConsoleIo> {
-    let ktid = sched::running_here()?.0;
-    ACTIVE_PROCS.lock().get(&ktid).map(|p| p.io)
+    try_current_thread().map(|t| t.process().console.lock().io)
 }
 
-/// Non-panicking lookup of the current thread's Linux PID.
+/// Non-panicking lookup of the current thread's Linux pid.
 pub fn current_pid() -> Option<u32> {
-    let ktid = sched::running_here()?.0;
-    ACTIVE_PROCS.lock().get(&ktid).map(|p| p.pid)
+    try_current_thread().map(|t| t.process().pid())
 }
 
-/// Snapshot all active Linux PIDs (sorted).
+/// The pids of the processes running user code (sorted): every process in
+/// [`PROCS`] but pid 1, the kernel's, which has no threads, descriptors or
+/// working directory (`/proc` lists these).
 pub fn active_pids() -> Vec<u32> {
-    let guard = ACTIVE_PROCS.lock();
-    let mut pids: Vec<u32> = guard.values().map(|p| p.pid).collect();
-    pids.sort_unstable();
-    pids
+    PROCS.lock().procs.keys().copied().filter(|&pid| pid != INIT_PID).collect()
 }
 
-/// True if `pid` corresponds to an active [`ProcessState`].
+/// True if `pid` is one of [`active_pids`].
 pub fn has_pid(pid: u32) -> bool {
-    ACTIVE_PROCS.lock().values().any(|p| p.pid == pid)
+    pid != INIT_PID && PROCS.lock().procs.contains_key(&pid)
 }
 
-/// Clone the `Arc<AddressSpace>` for `pid` and release `ACTIVE_PROCS` before returning.
+/// The process `pid` if it is one of [`active_pids`] (a clone, `PROCS`
+/// released before returning).
+fn active(pid: u32) -> Option<Arc<Process>> {
+    if pid == INIT_PID {
+        return None;
+    }
+    lookup(pid)
+}
+
+/// Clone the `Arc<AddressSpace>` for `pid`, every lock released before returning.
 pub fn process_address_space(pid: u32) -> Option<Arc<AddressSpace>> {
-    let guard = ACTIVE_PROCS.lock();
-    guard.values().find(|p| p.pid == pid).and_then(|p| p.address_space.as_ref().map(Arc::clone))
+    active(pid)?.address_space()
 }
 
-/// The kernel thread `pid` runs on (its id in `sched::threads()`, which
-/// the shell's `threads` lists), while it runs.
+/// The kernel thread `pid`'s leader runs on (its id in `sched::threads()`,
+/// which the shell's `threads` lists), while it runs.
 #[cfg(feature = "ktest")]
 pub fn process_thread_id(pid: u32) -> Option<u64> {
-    ACTIVE_PROCS.lock().iter().find(|(_, p)| p.pid == pid).map(|(&ktid, _)| ktid)
+    PROCS.lock().threads.get(&pid).map(|t| t.kernel_thread)
 }
 
 /// Snapshot the executable path recorded for `pid`, if any.
 pub fn process_exe_path(pid: u32) -> Option<String> {
-    let guard = ACTIVE_PROCS.lock();
-    guard.values().find(|p| p.pid == pid).and_then(|p| p.exe_path.clone())
+    active(pid)?.exe_path.lock().clone()
 }
 
-/// Set the executable's path on the current [`ProcessState`], as given (not
+/// Set the executable's path on the current process, as given (not
 /// resolved: symlinks and `..` stay).
 pub fn set_current_exe_path(path: &str) {
-    let Some(ktid) = sched::running_here().map(|id| id.0) else {
+    let Some(thread) = try_current_thread() else {
         return;
     };
     let path = String::from(path);
-    let mut guard = ACTIVE_PROCS.lock();
-    if let Some(proc) = guard.get_mut(&ktid) {
-        proc.exe_path = Some(path);
-    }
+    let old = thread.process().exe_path.lock().replace(path);
+    drop(old);
 }
 
 /// Return sorted open descriptor numbers for `pid`.
 pub fn process_open_fds(pid: u32) -> Vec<i32> {
-    let guard = ACTIVE_PROCS.lock();
-    guard.values().find(|p| p.pid == pid).map(|p| p.fds.iter_open().map(|(fd, _)| fd).collect()).unwrap_or_default()
+    let Some(files) = active(pid).and_then(|p| p.files()) else {
+        return Vec::new();
+    };
+    let table = files.table.lock();
+    table.iter_open().map(|(fd, _)| fd).collect()
 }
 
 /// What `/proc/<pid>/fd/<fd>` points at: the open file's inode and the path
@@ -666,14 +1055,12 @@ pub type FdTarget = (Option<Arc<dyn VfsInode>>, Vec<u8>);
 /// Snapshot `/proc/<pid>/fd/<fd>`'s [`FdTarget`], ` (deleted)` added to the
 /// path once unlinked.
 ///
-/// Releases `ACTIVE_PROCS` before inspecting `VfsInode::stat()` or dropping
+/// Releases every lock before inspecting `VfsInode::stat()` or dropping
 /// the file it cloned.
 pub fn process_fd_target(pid: u32, fd: i32) -> Option<FdTarget> {
-    let file = {
-        let guard = ACTIVE_PROCS.lock();
-        let proc = guard.values().find(|p| p.pid == pid)?;
-        Arc::clone(&proc.fds.get(fd)?.file)
-    };
+    let files = active(pid)?.files()?;
+    let file = Arc::clone(&files.table.lock().get(fd)?.file);
+    drop(files);
     let inode = Arc::clone(file.inode());
     let mut path = file.path.to_vec();
     drop(file);
@@ -684,41 +1071,122 @@ pub fn process_fd_target(pid: u32, fd: i32) -> Option<FdTarget> {
     Some((Some(inode), path))
 }
 
-/// Run a short non-blocking closure with immutable access to the current process state.
-pub fn with_current<R>(f: impl FnOnce(&ProcessState) -> R) -> R {
-    let ktid = current_kernel_tid();
-    let guard = ACTIVE_PROCS.lock();
-    let proc = guard.get(&ktid).expect("ring-3 syscall with no active ProcessState");
-    f(proc)
-}
-
-/// Run a short non-blocking closure with mutable access to the current process state.
-pub fn with_current_mut<R>(f: impl FnOnce(&mut ProcessState) -> R) -> R {
-    let ktid = current_kernel_tid();
-    let mut guard = ACTIVE_PROCS.lock();
-    let proc = guard.get_mut(&ktid).expect("ring-3 syscall with no active ProcessState");
-    f(proc)
-}
-
 /// Record the process's terminal [`UserExit`] and return `(pid, allow_test_syscalls)`.
 pub fn record_exit(exit: UserExit) -> (u32, bool) {
-    with_current_mut(|proc| {
-        proc.exit = Some(exit);
-        (proc.pid, proc.allow_test_syscalls)
-    })
+    let process = current_process();
+    *process.exit.lock() = Some(exit);
+    (process.pid(), process.allow_test_syscalls)
+}
+
+/// One process as `ps` lists it ([`ps_rows`]).
+pub struct PsRow {
+    pub pid: u32,
+    pub ppid: u32,
+    /// Its threads: each tid with its scheduler thread's id, the leader's
+    /// first.
+    pub threads: Vec<(u32, u64)>,
+    /// Its state in the process tree.
+    pub state: ProcState,
+}
+
+/// Every process in [`PROCS`], pid 1 included, by pid: the `ps` command's
+/// rows (read in one hold of `PROCS`).
+pub fn ps_rows() -> Vec<PsRow> {
+    let t = PROCS.lock();
+    let mut rows: Vec<PsRow> = t
+        .procs
+        .keys()
+        .map(|&pid| PsRow {
+            pid,
+            ppid: t.tree.parent(pid).flatten().unwrap_or(0),
+            threads: Vec::new(),
+            state: t.tree.state(pid).unwrap_or(ProcState::Running),
+        })
+        .collect();
+    for (&tid, thread) in &t.threads {
+        if let Some(row) = rows.iter_mut().find(|r| r.pid == thread.process().pid()) {
+            let entry = (tid, thread.kernel_thread);
+            if tid == row.pid { row.threads.insert(0, entry) } else { row.threads.push(entry) }
+        }
+    }
+    rows
+}
+
+/// A process's M7 console state: where its console fds connect, the
+/// terminal settings `TCGETS` reports, and the console bridge's buffers.
+pub struct ConsoleState {
+    pub io: ConsoleIo,
+    pub termios: general::termios,
+    /// What `ConsoleIo::Capture` captured (at most `CAPTURE_STDOUT_LIMIT`
+    /// bytes).
+    stdout: Vec<u8>,
+    stdin: Vec<u8>,
+    stdin_pos: usize,
+    /// Small lookahead / UTF-8 tail buffer for stdin (up to 4 bytes).
+    unread: [u8; 4],
+    unread_pos: u8,
+    unread_len: u8,
+    /// Incomplete trailing UTF-8 bytes pending across `write`/`writev` chunks on a VT.
+    vt_utf8: [u8; 4],
+    vt_utf8_len: u8,
+}
+
+impl ConsoleState {
+    fn new(io: ConsoleIo, stdin: Vec<u8>) -> Self {
+        Self {
+            io,
+            termios: default_termios(),
+            stdout: Vec::new(),
+            stdin,
+            stdin_pos: 0,
+            unread: [0; 4],
+            unread_pos: 0,
+            unread_len: 0,
+            vt_utf8: [0; 4],
+            vt_utf8_len: 0,
+        }
+    }
+
+    #[inline]
+    fn has_unread(&self) -> bool {
+        self.unread_pos < self.unread_len
+    }
+
+    #[inline]
+    fn pop_unread(&mut self) -> Option<u8> {
+        if self.unread_pos < self.unread_len {
+            let b = self.unread[self.unread_pos as usize];
+            self.unread_pos += 1;
+            if self.unread_pos == self.unread_len {
+                self.unread_pos = 0;
+                self.unread_len = 0;
+            }
+            Some(b)
+        } else {
+            None
+        }
+    }
+
+    fn push_unread_bytes(&mut self, bytes: &[u8]) {
+        debug_assert!(!self.has_unread(), "push_unread_bytes called with unread bytes pending");
+        let n = bytes.len().min(self.unread.len());
+        self.unread[..n].copy_from_slice(&bytes[..n]);
+        self.unread_pos = 0;
+        self.unread_len = n as u8;
+    }
 }
 
 /// Write `bytes` (already copied from user space) to the process's console target.
 ///
-/// Never called while holding `ACTIVE_PROCS` for `Serial` or `Vt`; for `Capture`
-/// it acquires `ACTIVE_PROCS` briefly to append up to `CAPTURE_STDOUT_LIMIT`.
+/// Never called while holding a spinlock; for `Capture` it takes the
+/// process's console state briefly to append up to `CAPTURE_STDOUT_LIMIT`.
 pub fn write_console(io: ConsoleIo, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
     match io {
         ConsoleIo::Capture => {
-            with_current_mut(|proc| {
+            with_current_console(|proc| {
                 let room = CAPTURE_STDOUT_LIMIT.saturating_sub(proc.stdout.len());
                 proc.stdout.extend_from_slice(&bytes[..bytes.len().min(room)]);
             });
@@ -736,7 +1204,7 @@ pub fn write_console(io: ConsoleIo, bytes: &[u8]) {
 /// multi-byte UTF-8 sequences across chunk/write boundaries and replacing only
 /// genuinely invalid byte sequences with U+FFFD.
 fn write_vt_utf8(vt: usize, bytes: &[u8]) {
-    let (mut tail, mut tail_len) = with_current_mut(|proc| {
+    let (mut tail, mut tail_len) = with_current_console(|proc| {
         let t = proc.vt_utf8;
         let l = proc.vt_utf8_len as usize;
         proc.vt_utf8_len = 0;
@@ -783,7 +1251,7 @@ fn write_vt_utf8(vt: usize, bytes: &[u8]) {
         }
     }
 
-    with_current_mut(|proc| {
+    with_current_console(|proc| {
         proc.vt_utf8 = tail;
         proc.vt_utf8_len = tail_len as u8;
     });
@@ -824,16 +1292,16 @@ fn vt_key_to_bytes(key: KbdKey, out: &mut [u8; 4]) -> usize {
 pub fn stdin_ready(io: ConsoleIo) -> bool {
     match io {
         ConsoleIo::Capture => true,
-        ConsoleIo::Serial => with_current(ProcessState::has_unread) || serial_in::available(),
+        ConsoleIo::Serial => with_current_console(|c| c.has_unread()) || serial_in::available(),
         ConsoleIo::Vt(vt) => {
-            if with_current(ProcessState::has_unread) {
+            if with_current_console(|c| c.has_unread()) {
                 return true;
             }
             while let Some(key) = crate::vt::read_key(vt) {
                 let mut enc = [0u8; 4];
                 let n = vt_key_to_bytes(key, &mut enc);
                 if n > 0 {
-                    with_current_mut(|p| p.push_unread_bytes(&enc[..n]));
+                    with_current_console(|p| p.push_unread_bytes(&enc[..n]));
                     return true;
                 }
             }
@@ -869,7 +1337,7 @@ pub fn read_console(io: ConsoleIo, dst: &mut [u8]) -> usize {
         return 0;
     }
     match io {
-        ConsoleIo::Capture => with_current_mut(|proc| {
+        ConsoleIo::Capture => with_current_console(|proc| {
             let avail = &proc.stdin[proc.stdin_pos..];
             if avail.is_empty() {
                 return 0;
@@ -894,7 +1362,7 @@ pub fn read_console(io: ConsoleIo, dst: &mut [u8]) -> usize {
 }
 
 fn read_serial(dst: &mut [u8]) -> usize {
-    let first = with_current_mut(ProcessState::pop_unread).unwrap_or_else(|| {
+    let first = with_current_console(ConsoleState::pop_unread).unwrap_or_else(|| {
         loop {
             if let Some(b) = serial_in::read_byte() {
                 return b;
@@ -918,7 +1386,7 @@ fn read_serial(dst: &mut [u8]) -> usize {
             break;
         };
         if b == 0x04 {
-            with_current_mut(|proc| proc.push_unread_bytes(&[0x04]));
+            with_current_console(|proc| proc.push_unread_bytes(&[0x04]));
             break;
         }
         dst[n] = if b == b'\r' { b'\n' } else { b };
@@ -928,14 +1396,14 @@ fn read_serial(dst: &mut [u8]) -> usize {
 }
 
 fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
-    if let Some(first) = with_current_mut(ProcessState::pop_unread) {
+    if let Some(first) = with_current_console(ConsoleState::pop_unread) {
         if first == 0x04 {
             return 0;
         }
         dst[0] = first;
         let mut n = 1;
         while n < dst.len() {
-            let next = with_current_mut(|proc| {
+            let next = with_current_console(|proc| {
                 if proc.has_unread() && proc.unread[proc.unread_pos as usize] == 0x04 {
                     return None;
                 }
@@ -962,7 +1430,7 @@ fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
         let n = len.min(dst.len());
         dst[..n].copy_from_slice(&enc[..n]);
         if n < len {
-            with_current_mut(|proc| proc.push_unread_bytes(&enc[n..len]));
+            with_current_console(|proc| proc.push_unread_bytes(&enc[n..len]));
         }
         return n;
     }
@@ -1013,6 +1481,136 @@ pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send
     space.teardown();
     result
 }
+
+/// Register a non-leader thread of `process` in [`PROCS`] with a tid from
+/// its tree (`ProcTree::add_thread`), as M8's `clone` will: the lookup
+/// ktest's second tid. It runs nowhere (its scheduler thread id is 0).
+#[cfg(feature = "ktest")]
+fn add_ktest_thread(process: &Arc<Process>) -> Result<Arc<UserThread>, &'static str> {
+    let thread = Arc::new(UserThread::new(Arc::clone(process), 0));
+    let mut t = PROCS.lock();
+    let tid = t.tree.add_thread(process.pid()).map_err(|_| "ProcTree::add_thread refused")?;
+    thread.tid.store(tid, Ordering::Release);
+    process.signal.lock().threads.insert(tid, ThreadSignals::default());
+    t.threads.insert(tid, Arc::clone(&thread));
+    Ok(thread)
+}
+
+/// Take a thread [`add_ktest_thread`] registered out of [`PROCS`] again.
+#[cfg(feature = "ktest")]
+fn remove_ktest_thread(thread: &Arc<UserThread>) -> Result<(), &'static str> {
+    let (pid, tid) = (thread.process().pid(), thread.tid());
+    let gone = {
+        let mut t = PROCS.lock();
+        t.tree.remove_thread(pid, tid).map_err(|_| "ProcTree::remove_thread refused")?;
+        thread.process().signal.lock().threads.remove(&tid);
+        t.threads.remove(&tid)
+    };
+    if gone.is_some_and(|g| Arc::ptr_eq(&g, thread)) { Ok(()) } else { Err("the thread wasn't in PROCS") }
+}
+
+crate::ktest!(
+    fn procs_lookup_and_lifetime() {
+        use crate::shell::sysinfo::{DASH, int};
+        use crate::{kassert, kassert_eq};
+        use lumen_shell::pipe::Value;
+
+        // Pid 1: the kernel's, in PROCS with no threads, its placeholder
+        // space but no descriptors or working directory, its SIGCHLD
+        // ignored (its children's zombies go at once); `ps` lists it, /proc
+        // doesn't.
+        let init = lookup(INIT_PID).ok_or("pid 1 isn't in PROCS")?;
+        kassert_eq!(init.pid(), INIT_PID);
+        kassert!(init.address_space().is_some() && init.files().is_none() && init.fs().is_none());
+        kassert!(init.autoreaps());
+        kassert!(lookup_thread(INIT_PID).is_none());
+        kassert!(!has_pid(INIT_PID) && !active_pids().contains(&INIT_PID));
+        kassert!(ps_rows().iter().any(|r| r.pid == INIT_PID && r.threads.is_empty() && r.ppid == 0));
+        let ps = crate::shell::sysinfo::ps_table();
+        let row = ps.rows().iter().find(|r| r.first() == Some(&int(INIT_PID))).ok_or("`ps` lacks pid 1")?;
+        kassert_eq!(&row[1..4], [int(0), DASH, DASH]);
+        drop(init);
+
+        // How an end is recorded in the tree.
+        kassert_eq!(exit_status(&UserExit::Exited(256 + 3)), ExitStatus::Exited(3));
+        let bus = UserExit::BusError { rip: 0, cr2: 0 };
+        kassert_eq!(exit_status(&bus), ExitStatus::Killed { signal: Signal::BUS, core: false });
+        let pf = UserExit::Fault { vector: 14, error_code: 0, rip: 0, cr2: 0 };
+        kassert_eq!(exit_status(&pf), ExitStatus::Killed { signal: Signal::SEGV, core: false });
+
+        type Seen = (u32, u32, Arc<Process>, Arc<Files>, (u32, bool, bool, bool));
+        let (pid, tid, held, files, inner) = in_test_process(|pid| -> Result<Seen, &'static str> {
+            // By pid and by tid, the running thread's own process and thread.
+            let me = current_thread();
+            let process = lookup(pid).ok_or("its process isn't in PROCS")?;
+            kassert!(pid != INIT_PID);
+            kassert_eq!(me.tid(), pid);
+            kassert!(Arc::ptr_eq(me.process(), &process));
+            kassert!(lookup_thread(pid).is_some_and(|t| Arc::ptr_eq(&t, &me)));
+            kassert_eq!((process.pid(), process.ppid()), (pid, 0));
+            kassert_eq!(current_pid(), Some(pid));
+            me.set_clear_child_tid(0x1234);
+            kassert_eq!(current_thread().clear_child_tid(), 0x1234);
+            let files = process.files().ok_or("no descriptors")?;
+            kassert_eq!((files.users(), files.open_count()), (1, 3));
+
+            // A second thread: its tid finds it and the same process; a tid
+            // is no pid. Removed before the takedown whatever the checks
+            // say.
+            let extra = add_ktest_thread(&process)?;
+            let tid = extra.tid();
+            let checked = (|| {
+                kassert!(tid != pid && tid != INIT_PID);
+                kassert!(lookup_thread(tid).is_some_and(|t| Arc::ptr_eq(&t, &extra)));
+                kassert!(Arc::ptr_eq(extra.process(), &process));
+                kassert!(lookup(tid).is_none() && !has_pid(tid));
+                let row = ps_rows().into_iter().find(|r| r.pid == pid).ok_or("ps lacks the process")?;
+                let tids: Vec<u32> = row.threads.iter().map(|&(t, _)| t).collect();
+                kassert_eq!(tids, [pid, tid]);
+                // `ps`: the leader's tid first, its state the running
+                // thread's (the extra one runs nowhere: id 0 is no thread's).
+                let ps = crate::shell::sysinfo::ps_table();
+                let row = ps.rows().iter().find(|r| r.first() == Some(&int(pid))).ok_or("`ps` lacks the process")?;
+                kassert_eq!(row[2], Value::Text(alloc::format!("{pid},{tid}")));
+                kassert_eq!(row[3], Value::Text(String::from("running,gone")));
+                // A second process at once, on its own thread: its pid and
+                // tid find it, not this one.
+                let inner = in_test_process(move |inner| {
+                    let mine = current_process();
+                    let by_pid = lookup(inner).is_some_and(|p| Arc::ptr_eq(&p, &mine));
+                    let by_tid = lookup_thread(inner).is_some_and(|t| Arc::ptr_eq(t.process(), &mine));
+                    let outer = lookup(pid).is_some_and(|p| !Arc::ptr_eq(&p, &mine))
+                        && lookup_thread(tid).is_some_and(|t| !Arc::ptr_eq(t.process(), &mine));
+                    (inner, by_pid, by_tid, outer)
+                })?;
+                Ok(inner)
+            })();
+            let removed = remove_ktest_thread(&extra);
+            let inner: (u32, bool, bool, bool) = checked?;
+            removed?;
+            kassert!(lookup_thread(tid).is_none());
+            kassert!(!PROCS.lock().tree.is_busy(tid));
+            Ok((pid, tid, process, files, inner))
+        })??;
+
+        let (inner_pid, by_pid, by_tid, outer) = inner;
+        kassert!(inner_pid != pid && inner_pid != tid && inner_pid != INIT_PID);
+        kassert!(by_pid && by_tid && outer);
+        kassert!(lookup(inner_pid).is_none());
+
+        // Taken down: gone from PROCS by pid and tid, its slots emptied, its
+        // descriptors closed (it was their only user), and the test's
+        // reference the last one.
+        kassert!(lookup(pid).is_none() && lookup_thread(pid).is_none() && !has_pid(pid));
+        kassert!(!ps_rows().iter().any(|r| r.pid == pid));
+        kassert!(held.address_space().is_none() && held.files().is_none() && held.fs().is_none());
+        kassert_eq!((files.users(), files.open_count()), (0, 0));
+        let weak = Arc::downgrade(&held);
+        drop(held);
+        kassert!(weak.upgrade().is_none());
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn in_test_process_takes_its_process_down() {

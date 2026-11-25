@@ -7,7 +7,7 @@
 use super::at::UserPtr;
 use super::{copy_pod_from_user, copy_pod_to_user, neg_errno, not_implemented};
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
-use crate::linux::process::{KernelSigaction, with_current, with_current_mut};
+use crate::linux::process::{KernelSigaction, with_current_signals};
 use crate::linux::{errno, general};
 use crate::user::{copy_from_user, copy_to_user};
 
@@ -32,7 +32,7 @@ pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64)
     };
 
     let idx = (sig - 1) as usize;
-    let prev = with_current(|p| p.sigactions[idx]);
+    let prev = with_current_signals(|actions, _| actions[idx]);
     if oldact != 0 {
         // Write `oldact` BEFORE mutating the table so a faulting `oldact` leaves state intact.
         // SAFETY: `KernelSigaction` has zero padding bytes.
@@ -42,7 +42,7 @@ pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64)
     }
     if let Some(mut a) = new_action {
         a.mask &= !UNBLOCKABLE_SIGS;
-        with_current_mut(|p| p.sigactions[idx] = a);
+        with_current_signals(|actions, _| actions[idx] = a);
     }
     0
 }
@@ -67,7 +67,7 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u6
         None
     };
 
-    let prev = with_current(|p| p.sigmask);
+    let prev = with_current_signals(|_, me| me.blocked);
     if oldset != 0
         && let Err(e) = copy_to_user(oldset, &prev.to_le_bytes())
     {
@@ -81,7 +81,7 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u6
         } else {
             mask
         };
-        with_current_mut(|p| p.sigmask = updated & !UNBLOCKABLE_SIGS);
+        with_current_signals(|_, me| me.blocked = updated & !UNBLOCKABLE_SIGS);
     }
     0
 }

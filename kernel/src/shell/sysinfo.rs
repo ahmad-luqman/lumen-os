@@ -79,7 +79,7 @@ pub type MakeTable = fn(&[String]) -> Option<Result<pipe::Table, String>>;
 
 /// The system commands that give records in a pipeline (instead of their
 /// text), and the tables they give.
-pub const RECORDS: [(&str, MakeTable); 14] = [
+pub const RECORDS: [(&str, MakeTable); 15] = [
     ("apps", |a| no_args(a, crate::app::table)),
     ("blk", crate::blk::records),
     ("cpus", |a| no_args(a, cpu_table)),
@@ -90,6 +90,7 @@ pub const RECORDS: [(&str, MakeTable); 14] = [
     ("mem", |a| no_args(a, mem_table)),
     ("mount", crate::vfs::mount_records),
     ("mouse", mouse_records),
+    ("ps", |a| no_args(a, ps_table)),
     ("sound", |a| no_args(a, crate::sound::table)),
     ("threads", |a| no_args(a, thread_table)),
     ("ui", crate::ui::records),
@@ -733,6 +734,55 @@ pub(crate) fn thread_table() -> pipe::Table {
     let mut t = pipe::Table::new(&COLUMNS);
     for th in sched::threads() {
         t.push(vec![text(th.name.as_str()), int(th.id), int(th.cpu), text(th.state.name()), int(th.ticks)]);
+    }
+    t
+}
+
+/// `ps`: every Linux process, pid 1 included: its pid, its parent's, its
+/// threads' tids and their states, and its leader thread's name.
+pub fn ps(ctx: &mut Ctx<'_>, args: &[String]) {
+    if extra_args(ctx, "ps", args) {
+        return;
+    }
+    let table = ps_table();
+    let mut t = String::new();
+    let _ = writeln!(t, "ps: {}", table.rows().len());
+    table.render(&mut t);
+    emit(ctx, &t);
+}
+
+/// `ps`' table: one row per process in `linux::process`'s table. `tids`
+/// lists its threads' tids, the leader's (the pid) first; `state` is its
+/// threads' scheduler states in that order, or the process's own when it
+/// is stopped or a zombie (`-` for pid 1, which has no threads); `name` its
+/// leader thread's.
+pub(crate) fn ps_table() -> pipe::Table {
+    const COLUMNS: [Column; 5] = [
+        Column::new("pid", Kind::Int, Align::Right, 5),
+        Column::new("ppid", Kind::Int, Align::Right, 5),
+        Column::new("tids", Kind::Text, Align::Left, 8),
+        Column::new("state", Kind::Text, Align::Left, 8),
+        Column::new("name", Kind::Text, Align::Left, 0),
+    ];
+    use lumen_proc::ProcState;
+    let threads = sched::threads();
+    let of = |id: u64| threads.iter().find(|t| t.id == id);
+    let mut t = pipe::Table::new(&COLUMNS);
+    for row in crate::linux::process::ps_rows() {
+        let joined = |cell: &dyn Fn(u32, u64) -> String| {
+            let cells: Vec<String> = row.threads.iter().map(|&(tid, k)| cell(tid, k)).collect();
+            if cells.is_empty() { DASH } else { Value::Text(cells.join(",")) }
+        };
+        let tids = joined(&|tid, _| tid.to_string());
+        let state = match row.state {
+            ProcState::Zombie(_) => text("zombie"),
+            ProcState::Stopped { .. } => text("stopped"),
+            ProcState::Running | ProcState::Continued { .. } => {
+                joined(&|_, k| String::from(of(k).map_or("gone", |t| t.state.name())))
+            }
+        };
+        let name = row.threads.first().and_then(|&(_, k)| of(k)).map_or(DASH, |t| text(t.name.as_str()));
+        t.push(vec![int(row.pid), int(row.ppid), tids, state, name]);
     }
     t
 }

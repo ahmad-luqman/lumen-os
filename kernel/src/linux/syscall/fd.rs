@@ -21,7 +21,7 @@ use super::{
 };
 #[cfg(feature = "ktest")]
 use crate::linux::process::FileRef;
-use crate::linux::process::{self, ConsoleIo, KernelFile, with_current, with_current_mut};
+use crate::linux::process::{self, ConsoleIo, KernelFile, with_current_console};
 use crate::linux::{errno, general, ioctl};
 use crate::user::{CopyError, copy_from_user, copy_to_user};
 use lumen_vfs::{DevId, InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsInode, VfsLock};
@@ -36,7 +36,7 @@ pub(super) fn vfs(e: VfsError) -> u32 {
 }
 
 pub(super) fn current_io() -> ConsoleIo {
-    with_current(|p| p.io)
+    with_current_console(|c| c.io)
 }
 
 /// `n` bytes moved before an error: the count if any, else the error.
@@ -268,7 +268,7 @@ fn ioctl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
 /// A terminal's `ioctl`s (M6's): `TCGETS`, `TCSETS*`, `TIOCGWINSZ`.
 fn tty_ioctl(cmd: u32, arg: u64) -> Result<u64, u32> {
     if cmd == ioctl::TCGETS {
-        let t = with_current(|p| p.termios);
+        let t = with_current_console(|c| c.termios);
         // SAFETY: `general::termios` is 36 bytes with zero implicit padding.
         unsafe { copy_pod_to_user(arg, &t) }.map_err(CopyError::to_errno)?;
         return Ok(0);
@@ -276,7 +276,7 @@ fn tty_ioctl(cmd: u32, arg: u64) -> Result<u64, u32> {
     if cmd == ioctl::TCSETS || cmd == ioctl::TCSETSW || cmd == ioctl::TCSETSF {
         // SAFETY: `general::termios` is 36 integer bytes; all bit patterns are valid.
         let t = unsafe { copy_pod_from_user::<general::termios>(arg) }.map_err(CopyError::to_errno)?;
-        with_current_mut(|p| p.termios = t);
+        with_current_console(|c| c.termios = t);
         return Ok(0);
     }
     if cmd == ioctl::TIOCGWINSZ {
@@ -719,13 +719,13 @@ crate::ktest!(
             kassert_eq!(sys_ioctl(a, ioctl::FIONBIO, 0), neg_errno(errno::EFAULT));
             // On the console (serial here, with no input waiting), a read
             // with `O_NONBLOCK` is `-EAGAIN`, not a wait.
-            let io = with_current(|p| p.io);
-            with_current_mut(|p| p.io = ConsoleIo::Serial);
+            let io = with_current_console(|c| c.io);
+            with_current_console(|c| c.io = ConsoleIo::Serial);
             copy_to_user(int_at, &1i32.to_le_bytes()).map_err(|_| "copy the int")?;
             let set = sys_ioctl(at::reg(0), ioctl::FIONBIO, int_at);
             let pending = process::stdin_ready(ConsoleIo::Serial);
             let read = sys_read(at::reg(0), at::reg(process::KTEST_USER_VA + 2048), 4);
-            with_current_mut(|p| p.io = io);
+            with_current_console(|c| c.io = io);
             kassert_eq!(set, 0);
             if !pending {
                 kassert_eq!(read, neg_errno(errno::EAGAIN));
