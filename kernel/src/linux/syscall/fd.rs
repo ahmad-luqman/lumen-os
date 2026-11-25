@@ -7,8 +7,9 @@
 //! 1 and 2 start on, and `/dev/tty`) reads and writes the process's console
 //! as M6 did (`read_into_user`, `write_from_user`), takes the tty `ioctl`s
 //! and polls on the console's readiness; any other goes to its inode at the
-//! file's offset, through a bounce buffer on the stack. No VFS lock, nor
-//! the offset's (Lock 2), is held across a copy to or from user memory.
+//! file's offset, through a bounce buffer on the stack. Lock 0 (`pos`)
+//! spans each position-based call and its user copies; Lock 2 never spans
+//! a user copy.
 
 #[cfg(feature = "ktest")]
 use alloc::vec::Vec;
@@ -78,6 +79,8 @@ fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError
         return Ok((pos, end));
     }
     let pos = *file.offset.lock();
+    #[cfg(feature = "ktest")]
+    process::position_window::hold(file, process::position_window::Point::Snapshot);
     let end = pos.saturating_add(checked_len(file.inode().read_at(pos, kbuf)?, kbuf.len())? as u64);
     let mut off = file.offset.lock();
     if *off == pos {
@@ -88,7 +91,7 @@ fn read_chunk(file: &KernelFile, kbuf: &mut [u8]) -> Result<(u64, u64), VfsError
 
 /// Read up to `count` bytes (at most `MAX_SINGLE_IO`) from `file` at its
 /// offset into user memory at `user_buf`, a chunk at a time until EOF or a
-/// short read. No lock is held across a chunk's copy out; a chunk the copy
+/// short read. The caller holds `pos` across the whole call; a chunk the copy
 /// refuses is given back (the offset moves only by what reached the caller).
 pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     if file.inode().inode_type() == InodeType::Dir {
@@ -110,6 +113,8 @@ pub(super) fn read_file(file: &KernelFile, user_buf: u64, count: u64) -> Result<
         if n == 0 {
             break;
         }
+        #[cfg(feature = "ktest")]
+        process::position_window::hold(file, process::position_window::Point::ReadCopy);
         if copy_to_user(addr, &kbuf[..n]).is_err() {
             let mut off = file.offset.lock();
             if *off == end {
@@ -160,7 +165,7 @@ pub(super) fn write_file(file: &KernelFile, user_buf: u64, count: u64) -> Result
 /// chunk)` (`done`: the bytes written before it), which says how many it
 /// wrote. Until all of it, a short write, a copy that faults or an error:
 /// the bytes written by then if any, else the errno. No lock is held
-/// across a copy in.
+/// across a copy in except the caller's position lock, when applicable.
 pub(super) fn write_chunks_from_user(
     user_buf: u64,
     limit: usize,
@@ -205,6 +210,7 @@ fn read_tty(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
 
 fn read(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     let file = fd.file()?;
+    let _pos = file.lock_pos();
     file.require_readable().map_err(vfs)?;
     if file.inode().is_tty() {
         return read_tty(&file, buf.addr(), count);
@@ -218,6 +224,7 @@ pub(super) fn sys_write(fd: Fd, buf: UserPtr, count: u64) -> u64 {
 
 fn write(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     let file = fd.file()?;
+    let _pos = file.lock_pos();
     file.require_writable().map_err(vfs)?;
     if file.inode().is_tty() {
         return write_from_user(current_io(), buf.addr(), count).map(|n| n as u64);
@@ -304,6 +311,7 @@ pub(super) fn sys_readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> u64 {
 
 fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let file = fd.file()?;
+    let _pos = file.lock_pos();
     file.require_readable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
     if file.inode().is_tty() {
@@ -347,6 +355,7 @@ pub(super) fn sys_writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> u64 {
 
 fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let file = fd.file()?;
+    let _pos = file.lock_pos();
     file.require_writable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
     let tty = file.inode().is_tty().then(current_io);
@@ -391,9 +400,7 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     let path = UserPath::copy_in(path, false)?;
     // Linux takes the slot right after copying the path in: a full table
     // refuses before the dirfd is looked at or anything is opened or created.
-    if !process::current_has_free_fd() {
-        return Err(errno::EMFILE);
-    }
+    let slot = process::reserve_current_fd(0).map_err(vfs)?;
     let start = at::start_dir(dirfd, &path)?;
     // `O_TRUNC` without `O_PATH` truncates a regular file (`O_PATH` opens
     // without truncating): the space to unmap from is taken first, as
@@ -411,7 +418,7 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
     }
-    let fd = process::install_current_fd(file, flags.has_cloexec()).map_err(vfs)?;
+    let fd = slot.install(file, flags.has_cloexec());
     Ok(fd as u64)
 }
 
@@ -439,6 +446,7 @@ pub(super) fn sys_lseek(fd: Fd, offset: u64, whence: u32) -> u64 {
 
 fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
     let file = fd.file()?;
+    let _pos = file.lock_pos();
     file.require_non_path().map_err(vfs)?;
     if file.inode().is_tty() {
         return Err(errno::ESPIPE);

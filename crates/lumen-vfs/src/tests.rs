@@ -1829,20 +1829,20 @@ fn advisory_locks_ranges_past_the_largest_offset_overflow() {
 fn posix_wait_graph_finds_two_and_three_process_cycles() {
     let mut g = PosixWaitGraph::new();
     // 1 waits for 2; 2 asking to wait for 1 closes the cycle.
-    assert_eq!(g.wait_for(1, 2, 7, 7), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(2, 1, 7, 7), Err(Deadlock));
-    assert!(!g.is_recorded(2));
+    assert_eq!(g.wait_for((1, 1), 2, 7, 7), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((2, 2), 1, 7, 7), Err(Deadlock));
+    assert!(!g.is_recorded((2, 2)));
     // 2 waits for 3 instead; 3 asking to wait for 1 closes 3 -> 1 -> 2 -> 3.
-    assert_eq!(g.wait_for(2, 3, 7, 7), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(3, 1, 7, 7), Err(Deadlock));
+    assert_eq!(g.wait_for((2, 2), 3, 7, 7), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((3, 3), 1, 7, 7), Err(Deadlock));
     // Waiting for a process that doesn't wait is no cycle.
-    assert_eq!(g.wait_for(3, 4, 7, 7), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((3, 3), 4, 7, 7), Ok(WaitSearch::Clear));
     // 4 -> 2 -> 3 -> 4 is a cycle; once 1's call returns, 4 waiting for 1
     // isn't.
-    assert_eq!(g.wait_for(4, 2, 7, 7), Err(Deadlock));
-    g.done(1);
-    assert!(!g.is_recorded(1));
-    assert_eq!(g.wait_for(4, 1, 7, 7), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((4, 4), 2, 7, 7), Err(Deadlock));
+    g.done((1, 1));
+    assert!(!g.is_recorded((1, 1)));
+    assert_eq!(g.wait_for((4, 4), 1, 7, 7), Ok(WaitSearch::Clear));
 }
 
 #[test]
@@ -1854,10 +1854,10 @@ fn posix_wait_graph_follows_eleven_records_as_linux_and_reports_the_cut_off() {
     fn caller_search(others: u32) -> Result<WaitSearch, Deadlock> {
         let mut g = PosixWaitGraph::new();
         for p in 1..others {
-            assert_eq!(g.wait_for(p, p + 1, 1, 1), Ok(WaitSearch::Clear));
+            assert_eq!(g.wait_for((p, p), p + 1, 1, 1), Ok(WaitSearch::Clear));
         }
-        assert_eq!(g.wait_for(others, 0, 1, 1), Ok(WaitSearch::Clear));
-        g.wait_for(0, 1, 1, 1)
+        assert_eq!(g.wait_for((others, others), 0, 1, 1), Ok(WaitSearch::Clear));
+        g.wait_for((0, 0), 1, 1, 1)
     }
     assert_eq!(crate::locks::MAX_DEADLOCK_CHAIN, 11);
     assert_eq!(caller_search(1), Err(Deadlock));
@@ -1871,9 +1871,9 @@ fn posix_wait_graph_follows_eleven_records_as_linux_and_reports_the_cut_off() {
     fn chain_search(len: u32) -> Result<WaitSearch, Deadlock> {
         let mut g = PosixWaitGraph::new();
         for p in 1..=len {
-            assert_eq!(g.wait_for(p, p + 1, 1, 1), Ok(WaitSearch::Clear));
+            assert_eq!(g.wait_for((p, p), p + 1, 1, 1), Ok(WaitSearch::Clear));
         }
-        g.wait_for(0, 1, 1, 1)
+        g.wait_for((0, 0), 1, 1, 1)
     }
     assert_eq!(chain_search(11), Ok(WaitSearch::Clear));
     assert_eq!(chain_search(12), Ok(WaitSearch::Truncated));
@@ -1883,28 +1883,28 @@ fn posix_wait_graph_follows_eleven_records_as_linux_and_reports_the_cut_off() {
 fn posix_wait_graph_never_follows_a_record_older_than_the_last_release() {
     let mut g = PosixWaitGraph::new();
     // 1 -> 2 -> 3, recorded at count 4.
-    assert_eq!(g.wait_for(1, 2, 4, 4), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(2, 3, 4, 4), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((1, 1), 2, 4, 4), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((2, 2), 3, 4, 4), Ok(WaitSearch::Clear));
     // A release (count 5) woke 1 and 2. 3 waiting for 1 at count 5: 1's
     // record (made at 4) isn't followed, so no cycle is seen and 3 is
     // recorded.
-    assert_eq!(g.wait_for(3, 1, 5, 5), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((3, 3), 1, 5, 5), Ok(WaitSearch::Clear));
     // 1 and 2, retrying, still conflict and record themselves again at 5:
     // the second to close the cycle is refused.
-    assert_eq!(g.wait_for(1, 2, 5, 5), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(2, 3, 5, 5), Err(Deadlock));
+    assert_eq!(g.wait_for((1, 1), 2, 5, 5), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((2, 2), 3, 5, 5), Err(Deadlock));
 
     // A stale link in the middle of a chain stops the walk there: 4 -> 1
     // -> 2 (recorded at 7, before the release that made the count 8) is no
     // cycle yet ...
     let mut g = PosixWaitGraph::new();
-    assert_eq!(g.wait_for(2, 3, 7, 7), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(1, 2, 8, 8), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(3, 4, 8, 8), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(4, 1, 8, 8), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((2, 2), 3, 7, 7), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((1, 1), 2, 8, 8), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((3, 3), 4, 8, 8), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((4, 4), 1, 8, 8), Ok(WaitSearch::Clear));
     // ... until 2, woken by that release, records itself again: then it
     // is the one closing 2 -> 3 -> 4 -> 1 -> 2.
-    assert_eq!(g.wait_for(2, 3, 8, 8), Err(Deadlock));
+    assert_eq!(g.wait_for((2, 2), 3, 8, 8), Err(Deadlock));
 }
 
 #[test]
@@ -1915,15 +1915,15 @@ fn posix_wait_graph_neither_checks_nor_records_a_stale_caller() {
     // checked or recorded, and retries.
     let (a, b) = (1, 2);
     let mut g = PosixWaitGraph::new();
-    assert_eq!(g.wait_for(a, b, 4, 4), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(b, a, 3, 4), Ok(WaitSearch::StaleCaller));
-    assert!(!g.is_recorded(b));
+    assert_eq!(g.wait_for((a, a), b, 4, 4), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((b, b), a, 3, 4), Ok(WaitSearch::StaleCaller));
+    assert!(!g.is_recorded((b, b)));
     // Its fresh try conflicting with A again would be a real cycle.
-    assert_eq!(g.wait_for(b, a, 4, 4), Err(Deadlock));
+    assert_eq!(g.wait_for((b, b), a, 4, 4), Err(Deadlock));
     // A stale caller's own old record goes too.
-    assert_eq!(g.wait_for(3, 9, 4, 4), Ok(WaitSearch::Clear));
-    assert_eq!(g.wait_for(3, 9, 4, 5), Ok(WaitSearch::StaleCaller));
-    assert!(!g.is_recorded(3));
+    assert_eq!(g.wait_for((3, 3), 9, 4, 4), Ok(WaitSearch::Clear));
+    assert_eq!(g.wait_for((3, 3), 9, 4, 5), Ok(WaitSearch::StaleCaller));
+    assert!(!g.is_recorded((3, 3)));
 }
 
 #[test]
@@ -9475,3 +9475,5 @@ fn getcwd_rechecks_a_directory_removed_while_its_parent_is_read() {
     assert_eq!(compute_cwd_path(env, &c).unwrap(), b"/x/c");
     drop(guard);
 }
+
+mod hazards;

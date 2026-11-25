@@ -145,9 +145,8 @@ fn lock_or_wait<H: Copy>(
     }
 }
 
-/// Who waits for whom among the processes blocked in `F_SETLKW` (keyed by
-/// pid: from M8, two threads of one process would overwrite each other's
-/// record). Not a leaf lock: a record's insert and removal allocate and
+/// Who waits for whom among threads blocked in `F_SETLKW`, keyed by
+/// `(tgid, tid)`, so each thread keeps its own record. Not a leaf lock: a record's insert and removal allocate and
 /// free, so the heap's locks nest inside it (ARCHITECTURE section 9, level
 /// 10). Never taken under an inode's lock or another spinlock.
 static POSIX_WAITERS: SpinLock<PosixWaitGraph> = SpinLock::new(PosixWaitGraph::new());
@@ -161,10 +160,10 @@ static POSIX_WAITERS: SpinLock<PosixWaitGraph> = SpinLock::new(PosixWaitGraph::n
 /// nor recorded (`WaitSearch::StaleCaller`: its wait ends at once and it
 /// retries). The count is read under `POSIX_WAITERS`, so of two processes
 /// about to wait for each other with a current view, the second is refused.
-fn record_wait_unless_deadlock(pid: u32, holder: u32, seen: u64) -> Result<WaitSearch, u32> {
+fn record_wait_unless_deadlock(waiter: (u32, u32), holder: u32, seen: u64) -> Result<WaitSearch, u32> {
     let mut graph = POSIX_WAITERS.lock();
     let now = process::lock_releases();
-    graph.wait_for(pid, holder, seen, now).map_err(|_| errno::EDEADLK)
+    graph.wait_for(waiter, holder, seen, now).map_err(|_| errno::EDEADLK)
 }
 
 /// Whether a deadlock search has been cut off at `MAX_DEADLOCK_CHAIN`
@@ -278,6 +277,7 @@ fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
     let spec = UserFlock::copy_in(at)?.spec;
     let ctx = lock_context(file, &spec)?;
     let pid = current_process().pid();
+    let waiter = (pid, process::current_thread().tid());
     let mut logged = None;
     let result = lock_or_wait(
         file,
@@ -288,14 +288,14 @@ fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
             })
         },
         |holder, seen| {
-            let decided = record_wait_unless_deadlock(pid, holder, seen);
+            let decided = record_wait_unless_deadlock(waiter, holder, seen);
             log_wait_decision(pid, file, holder, decided, &mut logged)
         },
     );
     if blocking {
         // Its record, if any, goes once the call returns (a record left
         // between waits is stale after the release that woke it anyway).
-        POSIX_WAITERS.lock().done(pid);
+        POSIX_WAITERS.lock().done(waiter);
     }
     result.map(|()| 0)
 }
@@ -1274,6 +1274,130 @@ crate::ktest!(
                 crate::kassert_eq!(got?, 0);
                 baton.b_done.store(true, Ordering::SeqCst);
                 crate::kassert!(baton.releasing.load(Ordering::SeqCst));
+                Ok(())
+            },
+        );
+        ktest_unlink_after(PATH, ret)
+    }
+);
+
+crate::ktest!(
+    fn setlkw_records_each_waiting_thread() {
+        use crate::{kassert, kassert_eq};
+        const PATH: &[u8] = b"/tmp/b8-thread-waiters";
+        struct Waiters {
+            pid: AtomicU32,
+            tids: [AtomicU32; 2],
+            done: [AtomicBool; 2],
+        }
+        let observed = Arc::new(Waiters {
+            pid: AtomicU32::new(0),
+            tids: [AtomicU32::new(0), AtomicU32::new(0)],
+            done: [AtomicBool::new(false), AtomicBool::new(false)],
+        });
+        let a_seen = Arc::clone(&observed);
+        let ret = two_processes(
+            move |baton| {
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR | OpenFlags::O_CREAT)?;
+                kassert_eq!(ktest_lk(fd, general::F_SETLK, general::F_WRLCK, general::SEEK_SET, 0, 20)?, 0);
+                baton.go(1);
+                baton.wait_for(2, &baton.b_ended)?;
+                while process::lock_waiters() != 2 && !baton.b_ended.load(Ordering::SeqCst) {
+                    crate::time::sleep(1_000_000);
+                }
+                kassert_eq!(process::lock_waiters(), 2);
+                let pid = a_seen.pid.load(Ordering::SeqCst);
+                let keys = a_seen.tids.each_ref().map(|t| (pid, t.load(Ordering::SeqCst)));
+                kassert!(keys[0].1 != keys[1].1 && keys.iter().all(|k| k.1 != 0));
+                {
+                    let graph = POSIX_WAITERS.lock();
+                    kassert!(keys.iter().all(|&key| graph.is_recorded(key)));
+                }
+                // Both wait on A; following B's lowest tid detects A -> B -> A.
+                kassert_eq!(
+                    ktest_lk(fd, general::F_SETLKW, general::F_WRLCK, general::SEEK_SET, 20, 10)?,
+                    neg_errno(errno::EDEADLK)
+                );
+                // Free only the lowest tid's range. Its done must not erase
+                // its sibling; the release makes that sibling retry first.
+                kassert_eq!(ktest_lk(fd, general::F_SETLK, general::F_UNLCK, general::SEEK_SET, 0, 10)?, 0);
+                while !a_seen.done[0].load(Ordering::SeqCst) && !baton.b_ended.load(Ordering::SeqCst) {
+                    crate::time::sleep(1_000_000);
+                }
+                kassert!(a_seen.done[0].load(Ordering::SeqCst));
+                let me = (current_process().pid(), process::current_thread().tid());
+                // Observe the second thread's fresh record without putting
+                // A to sleep on a not-yet-refreshed edge. No timeout bound.
+                loop {
+                    let result = record_wait_unless_deadlock(me, pid, process::lock_releases());
+                    POSIX_WAITERS.lock().done(me);
+                    if result == Err(errno::EDEADLK) {
+                        break;
+                    }
+                    kassert!(!baton.b_ended.load(Ordering::SeqCst));
+                    crate::time::sleep(1_000_000);
+                }
+                {
+                    let graph = POSIX_WAITERS.lock();
+                    kassert!(!graph.is_recorded(keys[0]));
+                    kassert!(graph.is_recorded(keys[1]));
+                }
+                // Now the same syscall's cycle passes through the sibling.
+                kassert_eq!(
+                    ktest_lk(fd, general::F_SETLKW, general::F_WRLCK, general::SEEK_SET, 20, 10)?,
+                    neg_errno(errno::EDEADLK)
+                );
+                kassert_eq!(ktest_lk(fd, general::F_SETLK, general::F_UNLCK, general::SEEK_SET, 10, 10)?, 0);
+                Ok(())
+            },
+            move |baton| {
+                baton.wait_for(1, &baton.a_ended)?;
+                let fd = ktest_open(0, PATH, OpenFlags::O_RDWR)?;
+                observed.pid.store(current_process().pid(), Ordering::SeqCst);
+                kassert_eq!(ktest_lk(fd, general::F_SETLK, general::F_WRLCK, general::SEEK_SET, 20, 10)?, 0);
+                // Distinct user flock buffers: the siblings cannot rewrite
+                // one another's request while either syscall copies it in.
+                for i in 0..2 {
+                    let mut raw = [0u8; FLOCK_SIZE];
+                    raw[..2].copy_from_slice(&(general::F_WRLCK as i16).to_le_bytes());
+                    raw[8..16].copy_from_slice(&(i as i64 * 10).to_le_bytes());
+                    raw[16..24].copy_from_slice(&10i64.to_le_bytes());
+                    copy_to_user(KTEST_FLOCK_AT + i * 64, &raw).map_err(|_| "copy sibling flock")?;
+                }
+                let first_seen = Arc::clone(&observed);
+                let first = process::spawn_test_thread(move |tid| {
+                    first_seen.tids[0].store(tid, Ordering::SeqCst);
+                    let ret = sys_fcntl(fd, general::F_SETLKW, KTEST_FLOCK_AT);
+                    first_seen.done[0].store(true, Ordering::SeqCst);
+                    ret
+                })?;
+                // Allocate the first tid first, regardless of scheduling.
+                while observed.tids[0].load(Ordering::SeqCst) == 0 && !first.finished() {
+                    crate::time::sleep(1_000_000);
+                }
+                let second_seen = Arc::clone(&observed);
+                let second = process::spawn_test_thread(move |tid| {
+                    second_seen.tids[1].store(tid, Ordering::SeqCst);
+                    let ret = sys_fcntl(fd, general::F_SETLKW, KTEST_FLOCK_AT + 64);
+                    second_seen.done[1].store(true, Ordering::SeqCst);
+                    ret
+                });
+                let second = match second {
+                    Ok(second) => second,
+                    Err(e) => {
+                        baton.b_ended.store(true, Ordering::SeqCst);
+                        let _ = first.join();
+                        return Err(e);
+                    }
+                };
+                baton.go(2);
+                let a = first.join();
+                let b = second.join();
+                kassert_eq!(a?, 0);
+                kassert_eq!(b?, 0);
+                let pid = current_process().pid();
+                let graph = POSIX_WAITERS.lock();
+                kassert!(observed.tids.iter().all(|tid| !graph.is_recorded((pid, tid.load(Ordering::SeqCst)))));
                 Ok(())
             },
         );

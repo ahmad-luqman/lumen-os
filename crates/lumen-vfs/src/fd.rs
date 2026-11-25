@@ -1,19 +1,21 @@
 //! Open file descriptions (`OpenFile`) and per-process 1024-entry `FdTable`.
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{RefCell, RefMut};
 use core::fmt;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::error::VfsError;
 use crate::fs::{OpenGuard, VfsInode};
 use crate::ops::Opened;
-use crate::types::{AccessMode, OpenFlags};
+use crate::types::{AccessMode, InodeType, OpenFlags};
 use crate::{MAX_FDS, next_open_file_id};
 
-/// Synchronization abstraction for `OpenFile::offset` and `dir_cursor` (Lock 2)
+/// Synchronization abstraction for `OpenFile::pos` (Lock 0),
+/// `OpenFile::offset` and `dir_cursor` (Lock 2)
 /// and, through a [`LockFamily`], the `VfsTables` (Lock 9).
 ///
 /// The kernel implements this over `SleepMutex<T>`; single-threaded host tests
@@ -75,6 +77,9 @@ pub struct OpenFile<L: VfsLock<u64> = LocalLock<u64>> {
     is_path: bool,
     status_flags: AtomicU32,
     fd_refs: AtomicU32,
+    /// Serializes a whole position-based call, including user copies (Lock 0).
+    /// Its value is unused; positional I/O and streams do not take it.
+    pub pos: L,
     pub offset: L,
     /// A directory's position (Lock 2): the `readdir` cursor `getdents64`
     /// resumes at, `0` at the start; `lseek` sets it. Opaque: `0` or a
@@ -128,10 +133,19 @@ impl<L: VfsLock<u64>> OpenFile<L> {
             is_path,
             status_flags: AtomicU32::new(status_bits),
             fd_refs: AtomicU32::new(1),
+            pos: L::new(0),
             offset: L::new(0),
             dir_cursor: L::new(0),
             open_guard: guard,
         })
+    }
+
+    /// Hold the position across a whole read, write, vector I/O, seek or
+    /// directory listing of a regular file (including procfs) or directory.
+    /// Streams and devices have no atomic position and return no guard.
+    /// Take this before other VFS locks; never for pread or pwrite.
+    pub fn lock_pos(&self) -> Option<L::Guard<'_>> {
+        matches!(self.inode().inode_type(), InodeType::File | InodeType::Dir).then(|| self.pos.lock())
     }
 
     /// The inode this description is open on: always the one its open
@@ -257,11 +271,38 @@ pub struct FdEntry<F> {
     pub cloexec: bool,
 }
 
+/// A slot reserved in one table: consumed by `install` or `cancel` on that
+/// same table. Not cloneable; neither an open descriptor nor a free slot.
+#[derive(Debug)]
+#[must_use = "install or cancel the reserved descriptor"]
+pub struct FdReservation {
+    fd: i32,
+    id: u64,
+}
+
+impl FdReservation {
+    /// The reserved descriptor number (not open until installed).
+    pub fn fd(&self) -> i32 {
+        self.fd
+    }
+}
+
+static NEXT_RESERVATION: AtomicU64 = AtomicU64::new(1);
+
 /// Per-process file descriptor table with capacity [`MAX_FDS`] (1024),
 /// lazily grown and extract-and-drop friendly for IRQ-off `SpinLock` callers.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FdTable<F> {
     slots: Vec<Option<FdEntry<F>>>,
+    reserved: BTreeMap<i32, u64>,
+}
+
+impl<F: Clone> Clone for FdTable<F> {
+    /// Copy only open entries: another thread's in-flight open belongs to
+    /// the original table, never its fork copy.
+    fn clone(&self) -> Self {
+        Self { slots: self.slots.clone(), reserved: BTreeMap::new() }
+    }
 }
 
 impl<F> Default for FdTable<F> {
@@ -273,7 +314,7 @@ impl<F> Default for FdTable<F> {
 impl<F> FdTable<F> {
     /// Create an empty descriptor table without pre-allocating 1024 slots.
     pub const fn new() -> Self {
-        Self { slots: Vec::new() }
+        Self { slots: Vec::new(), reserved: BTreeMap::new() }
     }
 
     /// Borrow descriptor `fd`, if open.
@@ -301,17 +342,54 @@ impl<F> FdTable<F> {
         if min_fd < 0 || min_fd as usize >= MAX_FDS {
             return Err(VfsError::Inval);
         }
-        let start = min_fd as usize;
-        for idx in start..MAX_FDS {
-            if idx >= self.slots.len() {
-                self.slots.resize_with(idx + 1, || None);
-            }
-            if self.slots[idx].is_none() {
-                self.slots[idx] = Some(FdEntry { file, cloexec });
-                return Ok(idx as i32);
+        for fd in min_fd..MAX_FDS as i32 {
+            if self.get(fd).is_none() && !self.reserved.contains_key(&fd) {
+                self.slots.resize_with(self.slots.len().max(fd as usize + 1), || None);
+                self.slots[fd as usize] = Some(FdEntry { file, cloexec });
+                return Ok(fd);
             }
         }
         Err(VfsError::MFile)
+    }
+
+    /// Reserve the lowest free slot at or above `from`, before doing work
+    /// outside the table lock. `Inval` for an out-of-range minimum,
+    /// `MFile` if none is free. Reserved slots are skipped by all open-FD
+    /// operations, drains and clones, and cannot be displaced by dup2.
+    pub fn reserve(&mut self, from: i32) -> Result<FdReservation, VfsError> {
+        if from < 0 || from as usize >= MAX_FDS {
+            return Err(VfsError::Inval);
+        }
+        for fd in from..MAX_FDS as i32 {
+            if self.get(fd).is_none() && !self.reserved.contains_key(&fd) {
+                self.slots.resize_with(self.slots.len().max(fd as usize + 1), || None);
+                let id = NEXT_RESERVATION.fetch_add(1, Ordering::Relaxed);
+                assert_ne!(id, 0, "FD reservation identity exhausted");
+                self.reserved.insert(fd, id);
+                return Ok(FdReservation { fd, id });
+            }
+        }
+        Err(VfsError::MFile)
+    }
+
+    /// Install an entry in its reserved slot, returning its descriptor.
+    /// Panics for a token from a different table; nothing is displaced.
+    pub fn install(&mut self, r: FdReservation, entry: FdEntry<F>) -> i32 {
+        self.cancel_reservation(&r);
+        debug_assert!(self.slots[r.fd as usize].is_none());
+        self.slots[r.fd as usize] = Some(entry);
+        r.fd
+    }
+
+    /// Return a reserved slot to the free set. Panics for a token from a
+    /// different table. Draining open entries does not cancel reservations.
+    pub fn cancel(&mut self, r: FdReservation) {
+        self.cancel_reservation(&r);
+    }
+
+    fn cancel_reservation(&mut self, r: &FdReservation) {
+        assert_eq!(self.reserved.get(&r.fd), Some(&r.id), "FD reservation belongs to another table");
+        self.reserved.remove(&r.fd);
     }
 
     /// Insert or replace `fd` directly (`dup2` / `dup3` / stdio seeding).
@@ -324,6 +402,9 @@ impl<F> FdTable<F> {
         };
         if idx >= MAX_FDS {
             return Err(VfsError::BadF);
+        }
+        if self.reserved.contains_key(&fd) {
+            return Err(VfsError::Busy);
         }
         if idx >= self.slots.len() {
             self.slots.resize_with(idx + 1, || None);
