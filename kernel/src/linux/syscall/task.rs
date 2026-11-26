@@ -100,7 +100,7 @@ fn execve(path: UserPtr, argv: UserPtr, envp: UserPtr) -> Result<crate::mm::user
     let path = super::at::UserPath::copy_in(path, false)?;
     let file = open_exec(path.as_bytes()).map_err(|e| e.to_errno())?;
     current_process().check_exec()?;
-    let stack = lumen_vm::StackSize::DEFAULT;
+    let stack = lumen_vm::StackSize::from_rlimit(current_process().stack_limit(None).soft());
     let (argv, envp, mut budget) = copy_exec_args(path.as_bytes(), argv.addr(), envp.addr(), stack.arg_limit())?;
     let (file, argv) = follow_scripts(file, path.as_bytes(), argv, &mut budget)?;
     let (prepared, program) = prepare_exec(file, argv, envp, path.as_bytes(), stack)?;
@@ -168,7 +168,7 @@ struct PreparedExec {
     space: alloc::sync::Arc<crate::mm::user_vm::AddressSpace>,
     files: process::PreparedFiles,
     exe: Option<alloc::sync::Arc<[u8]>>,
-    name: lumen_trace::ThreadName,
+    name: crate::sched::TaskName,
 }
 
 fn prepare_exec(
@@ -183,7 +183,7 @@ fn prepare_exec(
     let (space, program) =
         exec.load_with_stack(&argv.refs()?, &envp.refs()?, execfn, stack).map_err(|e| e.to_errno())?;
     let files = process::prepare_exec_files()?;
-    let name = lumen_trace::ThreadName::from_path(&crate::linux::exec::display_path(execfn).map_err(|e| e.to_errno())?);
+    let name = crate::sched::TaskName::from_comm(execfn.rsplit(|&b| b == b'/').next().unwrap_or_default());
     Ok((PreparedExec { space: alloc::sync::Arc::new(space), files, exe, name }, program))
 }
 
@@ -342,13 +342,13 @@ pub(super) fn sys_wait4(pid: i32, wstatus: UserPtr, options: u32, rusage: UserPt
 
 fn wait4(pid: i32, wstatus: UserPtr, options: u32, rusage: UserPtr) -> Result<u64, u32> {
     let request = process::wait4_request(pid, options)?;
-    let Some(report) = process::wait_child(request)? else {
+    let Some((report, ticks)) = process::wait_child_with_usage(request)? else {
         return Ok(0);
     };
     if !wstatus.is_null() {
         crate::user::copy_to_user(wstatus.addr(), &report.status().word().to_ne_bytes()).map_err(|_| errno::EFAULT)?;
     }
-    write_rusage(rusage)?;
+    write_rusage(rusage, ticks)?;
     Ok(u64::from(report.pid()))
 }
 
@@ -368,9 +368,9 @@ pub(super) fn sys_waitid(idtype: i32, id: i32, infop: UserPtr, options: u32, rus
 fn waitid(idtype: i32, id: i32, infop: UserPtr, options: u32, rusage: UserPtr) -> Result<u64, u32> {
     // Linux's SYSCALL_DEFINE5(waitid) writes these fields even when
     // kernel_waitid returns an error. A bad copyout supersedes that error.
-    let result = process::waitid_request(idtype, id, options).and_then(process::wait_child);
-    let (signo, code, pid, status) = if let Ok(Some(report)) = &result {
-        write_rusage(rusage)?;
+    let result = process::waitid_request(idtype, id, options).and_then(process::wait_child_with_usage);
+    let (signo, code, pid, status) = if let Ok(Some((report, ticks))) = &result {
+        write_rusage(rusage, *ticks)?;
         let status = report.status().siginfo();
         (general::SIGCHLD, status.code as u32, report.pid(), status.status as u32)
     } else {
@@ -391,11 +391,9 @@ fn waitid(idtype: i32, id: i32, infop: UserPtr, options: u32, rusage: UserPtr) -
     result.map(|_| 0)
 }
 
-fn write_rusage(ptr: UserPtr) -> Result<(), u32> {
+fn write_rusage(ptr: UserPtr, ticks: [u64; 2]) -> Result<(), u32> {
     if !ptr.is_null() {
-        // Tick accounting is C12. No other resource counters are maintained.
-        crate::user::copy_to_user(ptr.addr(), &[0; core::mem::size_of::<general::rusage>()])
-            .map_err(|_| errno::EFAULT)?;
+        super::sys::write_usage(ptr, ticks)?;
     }
     Ok(())
 }

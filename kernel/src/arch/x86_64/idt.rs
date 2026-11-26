@@ -889,7 +889,7 @@ fn dispatch(frame: &mut TrapFrame) {
             if cpu == 0 {
                 crate::term::on_tick(tick);
             }
-            crate::sched::tick();
+            crate::sched::tick(frame.cs & 3 == 3);
         }
         SPURIOUS => {
             SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);

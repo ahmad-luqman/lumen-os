@@ -14,10 +14,77 @@ pub(super) struct ProcTable {
     threads: BTreeMap<u32, Arc<UserThread>>,
 }
 
+pub(super) struct WaitResult {
+    pub ready: lumen_proc::WaitReady,
+    pub gone: Option<Arc<Process>>,
+    pub ticks: [u64; 2],
+}
+
 impl ProcTable {
     pub(super) const fn new(max_pid: u32) -> Self {
         Self { tree: ProcTree::new(max_pid), procs: BTreeMap::new(), threads: BTreeMap::new() }
     }
+    pub(super) fn live_process_count(&self) -> usize {
+        self.procs.keys().filter(|&&pid| !matches!(self.tree.state(pid), Some(ProcState::Zombie(_)))).count()
+    }
+
+    pub(super) fn process_time(&self, pid: u32) -> [u64; 2] {
+        let Some(process) = self.procs.get(&pid) else { return [0; 2] };
+        let mut ticks = process.dead_ticks.each_ref().map(|t| t.load(Ordering::Relaxed));
+        for thread in self.threads.values().filter(|t| t.process().pid() == pid) {
+            if let Some(kernel) = thread.scheduler_thread() {
+                let live = kernel.cpu_time();
+                for i in 0..2 {
+                    ticks[i] = ticks[i].saturating_add(live[i]);
+                }
+            }
+        }
+        ticks
+    }
+
+    pub(super) fn priority(&self, caller: &UserThread, which: i32, who: i32, nice: Option<i32>) -> Result<u64, u32> {
+        if !(0..=2).contains(&which) {
+            return Err(errno::EINVAL);
+        }
+        let group = if which == 1 && who == 0 {
+            self.tree.getpgid(caller.process().pid(), 0).map_err(tree_errno)? as i32
+        } else {
+            who
+        };
+        let matches = |tid: u32, pid: u32| match which {
+            0 => tid == if who == 0 { caller.tid() } else { who as u32 },
+            1 => self.tree.getpgid(caller.process().pid(), pid as i32).ok() == Some(group as u32),
+            _ => who == 0,
+        };
+        let mut best = None;
+        for (&tid, thread) in &self.threads {
+            if matches(tid, thread.process().pid())
+                && let Some(kernel) = thread.scheduler_thread()
+            {
+                if let Some(nice) = nice {
+                    kernel.set_nice(nice);
+                }
+                let value = (20 - i32::from(kernel.nice())) as u64;
+                best = Some(best.unwrap_or(0).max(value));
+            }
+        }
+        // Linux retains the leader task until reap, even after its last
+        // runnable thread and scheduler state have gone away.
+        for (&pid, process) in &self.procs {
+            if !matches(pid, pid) {
+                continue;
+            }
+            let mut retained = process.exited_leader_nice.lock();
+            if let Some(value) = retained.as_mut() {
+                if let Some(nice) = nice {
+                    *value = nice.clamp(-20, 19) as i8;
+                }
+                best = Some(best.unwrap_or(0).max((20 - i32::from(*value)) as u64));
+            }
+        }
+        best.ok_or(errno::ESRCH)
+    }
+
     /// Record a successful single-threaded exec in the process tree.
     pub(super) fn exec(&mut self, pid: u32) {
         self.tree.exec(pid).expect("exec of a live process");
@@ -53,21 +120,28 @@ impl ProcTable {
     ) -> Result<lumen_proc::WaitRequest, u32> {
         self.tree.waitid_request(caller, idtype, id, options).map_err(tree_errno)
     }
-    pub(super) fn wait(
-        &mut self,
-        parent: &Process,
-        request: lumen_proc::WaitRequest,
-    ) -> Result<(lumen_proc::WaitReady, Option<Arc<Process>>), u32> {
+    pub(super) fn wait(&mut self, parent: &Process, request: lumen_proc::WaitRequest) -> Result<WaitResult, u32> {
         let ready = self.tree.wait(request).map_err(tree_errno)?;
+        let ticks = match &ready {
+            lumen_proc::WaitReady::Reported(report) => {
+                let own = self.process_time(report.pid());
+                let children = self.procs.get(&report.pid()).expect("reported process").children_time();
+                core::array::from_fn(|i| own[i].saturating_add(children[i]))
+            }
+            _ => [0; 2],
+        };
         let gone = match &ready {
             lumen_proc::WaitReady::Reported(lumen_proc::Report::Reaped { pid, .. }) => {
                 let gone = self.procs.remove(pid).expect("reaped process in PROCS");
+                for (counter, ticks) in parent.children_ticks.iter().zip(ticks) {
+                    counter.fetch_add(ticks, Ordering::Relaxed);
+                }
                 parent.child_changed();
                 Some(gone)
             }
             _ => None,
         };
-        Ok((ready, gone))
+        Ok(WaitResult { ready, gone, ticks })
     }
 
     /// Link `init` as pid 1 (`ProcTree::spawn_init`), setting its pid, or
@@ -154,6 +228,14 @@ impl ProcTable {
             && let Err(e) = self.tree.remove_thread(pid, tid)
         {
             panic!("thread {tid} of {pid} unlinked: {e}");
+        }
+        if let Some(kernel) = thread.scheduler_thread() {
+            if tid == pid {
+                *thread.process().exited_leader_nice.lock() = Some(kernel.nice());
+            }
+            for (counter, ticks) in thread.process().dead_ticks.iter().zip(kernel.cpu_time()) {
+                counter.fetch_add(ticks, Ordering::Relaxed);
+            }
         }
         thread.process().signal.lock().remove_thread(tid);
         let gone = self.threads.remove(&tid).unwrap_or_else(|| panic!("thread {tid} wasn't in PROCS"));
@@ -320,3 +402,56 @@ impl ProcTable {
         if found { Ok(()) } else { Err(errno::ESRCH) }
     }
 }
+
+crate::ktest!(
+    fn reaped_usage_includes_descendants_once() {
+        use crate::{kassert, kassert_eq};
+        fn process() -> Arc<Process> {
+            Arc::new(Process::new(
+                None,
+                None,
+                None,
+                SignalState::new(),
+                ConsoleState::new(ConsoleIo::Capture, Vec::new()),
+                false,
+                None,
+            ))
+        }
+        let mut table = ProcTable::new(PID_MAX);
+        let init = process();
+        table.link_init(&init).map_err(|_| "init")?;
+        let parent = Arc::new(UserThread::unbound_for_ktest(process()));
+        table.link_root(&parent).ok_or("parent")?;
+        let child = Arc::new(UserThread::unbound_for_ktest(process()));
+        let pid = table.link_child(&parent, &child, ProcessClone::FORK).map_err(|_| "child")?;
+        kassert_eq!(table.live_process_count(), 3);
+        for (counter, value) in child.process().dead_ticks.iter().zip([7, 11]) {
+            counter.store(value, Ordering::Relaxed);
+        }
+        for (counter, value) in child.process().children_ticks.iter().zip([13, 17]) {
+            counter.store(value, Ordering::Relaxed);
+        }
+        kassert_eq!(table.process_time(pid), [7, 11]);
+        drop(table.unlink_thread(&child));
+        drop(table.exit_in_tree(pid, ExitStatus::Exited(0)).map_err(|_| "exit")?);
+        kassert_eq!(table.live_process_count(), 2);
+        let peek = table
+            .waitid_request(parent.process().pid(), 1, pid as i32, general::WEXITED | general::WNOWAIT)
+            .map_err(|_| "peek request")?;
+        for _ in 0..2 {
+            let result = table.wait(parent.process(), peek).map_err(|_| "peek")?;
+            kassert_eq!(result.ticks, [20, 28]);
+            kassert!(result.gone.is_none());
+            kassert_eq!(parent.process().children_time(), [0, 0]);
+        }
+        let reap = table.wait4_request(parent.process().pid(), pid as i32, 0).map_err(|_| "wait4 request")?;
+        let result = table.wait(parent.process(), reap).map_err(|_| "reap")?;
+        kassert_eq!(result.ticks, [20, 28]);
+        kassert!(result.gone.is_some());
+        kassert_eq!(parent.process().children_time(), [20, 28]);
+        kassert_eq!(table.process_time(parent.process().pid()), [0, 0]);
+        kassert!(matches!(table.wait(parent.process(), reap), Err(errno::ECHILD)));
+        kassert_eq!(parent.process().children_time(), [20, 28]);
+        Ok(())
+    }
+);

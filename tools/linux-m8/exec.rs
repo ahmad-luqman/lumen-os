@@ -428,7 +428,7 @@ pub fn child_exit() -> c_int {
     if sys(SYS_FCNTL, [99, F_GETFD, 0, 0, 0, 0]) == -EBADF { 42 } else { 95 }
 }
 
-fn copy_self(path: &CStr) -> R {
+pub(super) fn copy_self(path: &CStr) -> R {
     let src = ok("open self", sys(SYS_OPEN, [SELF.as_ptr() as u64, O_RDONLY, 0, 0, 0, 0]))? as u64;
     let dst = create_fd(path)?;
     let mut buf = [0; 4096];

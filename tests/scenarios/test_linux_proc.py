@@ -143,6 +143,7 @@ def test_fork_wait_and_exit_status(boot, tmp_path):
         "clone-stack-tls",
         "clone-shared-resources",
         "fork-inherited-state",
+        "rusage",
     ):
         assert f"ok {check}\n" in out, out
     assert re.search(r"linux: /usr/local/bin/m8_proc exit=0 leaked_frames=0\b", out), out
@@ -205,6 +206,41 @@ def test_futex_timeouts_and_nanosleep(boot, tmp_path):
         "futex-clear-child-tid-exit-exec",
         "futex-robust-exec",
     ], out
+    assert f"linux: {PROC} exit=0 " in out, out
+    assert "FAIL" not in out, out
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_small_syscalls(boot, tmp_path):
+    """C12: scheduling, names, accounting, capacity and stack-limit exec behavior."""
+    m = boot(
+        "qemutest", extra=["-smp", "2"], devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True)
+    )
+    m.expect(r"lumen> ", 60)
+    memory = run(m, "mem | where area = frames")
+    frames = re.search(r"^\s*frames\s+(\d+)\s+\d+\s+\d+\s*$", memory, re.MULTILINE)
+    assert frames, memory
+    out = run(m, f"linux {PROC} small-syscalls", 180)
+    assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+        "affinity-getcpu",
+        "priority-name-ids",
+        "fork-raw-comm",
+        "exec-raw-comm",
+        "zombie-priority",
+        "name-page-end",
+        "syscall-error-order",
+        "statfs",
+        "rusage",
+        "sysinfo-clocks",
+        "stack-reduced",
+        "stack-reduced-budget",
+        "stack-exec",
+    ], out
+    info = re.search(r"sysinfo totalram=(\d+) uptime=(\d+) before=(\d+)", out)
+    assert info, out
+    assert int(info[1]) == int(frames[1]), out
+    assert int(info[2]) >= int(info[3]), out
     assert f"linux: {PROC} exit=0 " in out, out
     assert "FAIL" not in out, out
     m.send_line("exit")

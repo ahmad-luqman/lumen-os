@@ -296,12 +296,41 @@ impl UserSlot {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TaskName {
+    display: ThreadName,
+    bytes: [u8; 16],
+}
+impl TaskName {
+    /// At most fifteen raw comm bytes, NUL-terminated and zero-padded,
+    /// with a separately sanitized display name.
+    pub(crate) fn from_comm(comm: &[u8]) -> Self {
+        let end = comm.iter().take(15).position(|&b| b == 0).unwrap_or(comm.len().min(15));
+        let mut bytes = [0; 16];
+        bytes[..end].copy_from_slice(&comm[..end]);
+        let display = ThreadName::new(&alloc::string::String::from_utf8_lossy(&bytes[..end]));
+        Self { display, bytes }
+    }
+
+    fn from_display(display: ThreadName) -> Self {
+        let mut bytes = [0; 16];
+        bytes[..display.as_str().len()].copy_from_slice(display.as_str().as_bytes());
+        Self { display, bytes }
+    }
+}
+
+impl From<&str> for TaskName {
+    fn from(name: &str) -> Self {
+        Self::from_display(ThreadName::from(name))
+    }
+}
+
 /// A schedulable thread whose saved state belongs exclusively to its
 /// `on_cpu` owner, or is available for a new owner under its run queue lock.
 pub struct Thread {
     id: u64,
     /// Leaf lock; only this thread changes its name after construction.
-    name: SpinLock<ThreadName>,
+    name: SpinLock<TaskName>,
     /// Its queue's CPU, or the CPU it last ran on; changed under both queues.
     cpu: AtomicUsize,
     /// Held through the complete outgoing context save, including the stack.
@@ -326,6 +355,7 @@ pub struct Thread {
     exited: WaitQueue,
     /// Timer ticks that found it running.
     ticks: AtomicU64,
+    cpu_time: [AtomicU64; 2],
     /// Its [`WaitQueue`] waits that the timer ended at their deadline, not
     /// a waker (for the ktests: [`deadline_wakes_in`]).
     #[cfg(feature = "ktest")]
@@ -372,7 +402,6 @@ impl Placement {
 
 /// Why an affinity change is refused (both map to EINVAL for C12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "C12 adds the syscall callers"))]
 pub enum AffinityError {
     /// The requested mask contains no online CPU.
     NoOnlineCpu,
@@ -384,7 +413,7 @@ impl Thread {
     /// A ready thread on CPU `cpu` with a fresh stack of `stack_size` bytes,
     /// that starts by running `entry`.
     fn spawned(
-        name: ThreadName,
+        name: TaskName,
         cpu: usize,
         stack_size: u64,
         entry: Entry,
@@ -406,7 +435,7 @@ impl Thread {
     fn adopted(name: ThreadName) -> Arc<Thread> {
         register(Arc::new_cyclic(|me| {
             Thread::new(
-                name,
+                TaskName::from_display(name),
                 arch::cpu_index(),
                 State::Running,
                 0,
@@ -421,7 +450,7 @@ impl Thread {
 
     #[allow(clippy::too_many_arguments)]
     fn new(
-        name: ThreadName,
+        name: TaskName,
         cpu: usize,
         state: State,
         rsp: u64,
@@ -447,6 +476,7 @@ impl Thread {
             reaped: AtomicBool::new(false),
             exited: WaitQueue::new(),
             ticks: AtomicU64::new(0),
+            cpu_time: [const { AtomicU64::new(0) }; 2],
             #[cfg(feature = "ktest")]
             deadline_wakes: AtomicU64::new(0),
             me,
@@ -461,9 +491,29 @@ impl Thread {
         self.id
     }
 
+    /// Both name representations, copied together for fork.
+    pub(crate) fn task_name(&self) -> TaskName {
+        *self.name.lock()
+    }
+
     /// Its current displayed name, updated by exec from the path as given.
     pub fn name(&self) -> ThreadName {
-        *self.name.lock()
+        self.name.lock().display
+    }
+
+    fn charge_tick(&self, from_user: bool) {
+        self.ticks.fetch_add(1, Ordering::Relaxed);
+        self.cpu_time[usize::from(!from_user)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// User and system CPU time in timer ticks (one millisecond each).
+    pub fn cpu_time(&self) -> [u64; 2] {
+        self.cpu_time.each_ref().map(|t| t.load(Ordering::Relaxed))
+    }
+
+    /// Linux comm bytes, NUL-terminated and zero-filled to sixteen bytes.
+    pub fn comm(&self) -> [u8; 16] {
+        self.name.lock().bytes
     }
 
     /// The queue CPU, or the CPU this thread last ran on.
@@ -477,7 +527,6 @@ impl Thread {
     }
 
     /// Set the priority used when the next slice starts.
-    #[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "C12 adds setpriority"))]
     pub fn set_nice(&self, nice: i32) {
         self.nice.store(nice.clamp(-20, 19) as i8, Ordering::Relaxed);
     }
@@ -495,7 +544,6 @@ impl Thread {
     /// every change. A running thread leaves an excluded CPU at its next
     /// switch; sleepers and blocked threads move only after waking.
     /// Callers must not hold a run queue lock.
-    #[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "C12 adds the syscall callers"))]
     pub fn set_affinity(&self, mask: u64) -> Result<(), AffinityError> {
         if self.pinned {
             return Err(AffinityError::Pinned);
@@ -599,7 +647,7 @@ impl Thread {
             let was = State::from_raw(was).map_or("?", State::name);
             panic!(
                 "thread {} (id {}, cpu {}) was {was}, not {}, on its way to {}",
-                self.name.try_lock().map(|n| *n).unwrap_or(ThreadName::new("?")),
+                self.name.try_lock().map(|n| n.display).unwrap_or(ThreadName::new("?")),
                 self.id,
                 self.cpu(),
                 from.name(),
@@ -614,7 +662,7 @@ impl fmt::Debug for Thread {
         write!(
             f,
             "{} (id {}, cpu {}, {})",
-            self.name.try_lock().map(|n| *n).unwrap_or(ThreadName::new("?")),
+            self.name.try_lock().map(|n| n.display).unwrap_or(ThreadName::new("?")),
             self.id,
             self.cpu(),
             self.state().name()
@@ -936,7 +984,7 @@ impl BlockDelay {
 static TICKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 /// Change only the calling thread's name after exec.
-pub fn set_current_name(name: ThreadName) {
+pub(crate) fn set_current_name(name: TaskName) {
     with_current(|t| *t.name.lock() = name).expect("exec on a running thread");
 }
 
@@ -1150,7 +1198,8 @@ pub fn running_here() -> Option<(u64, ThreadName)> {
     let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
     // SAFETY: a non-null `CURRENT` points into an `Arc<Thread>` that stays
     // alive while it is stored there (see `CURRENT`).
-    (!t.is_null()).then(|| unsafe { ((*t).id, (*t).name.try_lock().map(|n| *n).unwrap_or(ThreadName::new("?"))) })
+    (!t.is_null())
+        .then(|| unsafe { ((*t).id, (*t).name.try_lock().map(|n| n.display).unwrap_or(ThreadName::new("?"))) })
 }
 
 /// Total context switches performed on CPU `cpu` so far (0 for out-of-range CPU).
@@ -1657,14 +1706,8 @@ pub fn spawn_user_on(
     space: Arc<AddressSpace>,
     f: impl FnOnce() + Send + 'static,
 ) -> Result<JoinHandle, SpawnError> {
-    spawn_configured(
-        cpu,
-        name.into(),
-        STACK_SIZE,
-        Box::new(f),
-        Some(UserThreadState::new(space)),
-        Placement::migratable(),
-    )
+    let name = TaskName::from_display(name.into());
+    spawn_configured(cpu, name, STACK_SIZE, Box::new(f), Some(UserThreadState::new(space)), Placement::migratable())
 }
 
 /// Start a user probe permanently pinned to `cpu`, with clean FPU and TLS.
@@ -1675,14 +1718,8 @@ pub fn spawn_user_pinned_on(
     space: Arc<AddressSpace>,
     f: impl FnOnce() + Send + 'static,
 ) -> Result<JoinHandle, SpawnError> {
-    spawn_configured(
-        cpu,
-        name.into(),
-        STACK_SIZE,
-        Box::new(f),
-        Some(UserThreadState::new(space)),
-        Placement::pinned(cpu),
-    )
+    let name = TaskName::from_display(name.into());
+    spawn_configured(cpu, name, STACK_SIZE, Box::new(f), Some(UserThreadState::new(space)), Placement::pinned(cpu))
 }
 
 /// Spawn a fork child with inherited affinity, nice and FPU state, on the
@@ -1693,7 +1730,7 @@ pub fn spawn_user_pinned_on(
 /// cancellation without releasing the creator's process-user count. This
 /// function supplies neither the gate nor that cleanup.
 pub(crate) fn spawn_fork_child(
-    name: impl Into<ThreadName>,
+    name: impl Into<TaskName>,
     space: Arc<AddressSpace>,
     linux: Arc<UserThread>,
     fs_base: u64,
@@ -1718,7 +1755,7 @@ pub(crate) fn spawn_fork_child(
 }
 
 /// CPUs whose schedulers can accept threads. CPU hot-unplug is unsupported.
-fn online_mask() -> u64 {
+pub fn online_mask() -> u64 {
     (0..MAX_CPUS).filter(|&cpu| running_on(cpu)).fold(0, |mask, cpu| mask | (1 << cpu))
 }
 
@@ -1887,16 +1924,18 @@ pub fn spawn_migratable(
     name: impl Into<ThreadName>,
     f: impl FnOnce() + Send + 'static,
 ) -> Result<JoinHandle, SpawnError> {
-    spawn_configured(arch::cpu_index(), name.into(), STACK_SIZE, Box::new(f), None, Placement::migratable())
+    let name = TaskName::from_display(name.into());
+    spawn_configured(arch::cpu_index(), name, STACK_SIZE, Box::new(f), None, Placement::migratable())
 }
 
 fn spawn_with(cpu: usize, name: ThreadName, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
+    let name = TaskName::from_display(name);
     spawn_configured(cpu, name, stack_size, f, None, Placement::pinned(cpu))
 }
 
 fn spawn_configured(
     cpu: usize,
-    name: ThreadName,
+    name: TaskName,
     stack_size: u64,
     f: Entry,
     user: Option<UserThreadState>,
@@ -2298,7 +2337,7 @@ fn hold_if_asked(r: &Released) {
 /// to honor their affinity. Switch if another thread is ready and the slice
 /// expired (or idle runs), or force a switch if the running thread's mask
 /// excludes this CPU.
-pub fn tick() {
+pub fn tick(from_user: bool) {
     let cpu = arch::cpu_index();
     if !running_on(cpu) {
         if ARMED[cpu].load(Ordering::Acquire) {
@@ -2325,7 +2364,7 @@ pub fn tick() {
         let mut q = CPUS[cpu].lock();
         // Counted before waking anyone: the thread this tick interrupted.
         TICKED[cpu].fetch_add(1, Ordering::Relaxed);
-        q.running().ticks.fetch_add(1, Ordering::Relaxed);
+        q.running().charge_tick(from_user);
         if q.on_idle() {
             IDLE_TICKS[cpu].fetch_add(1, Ordering::Release);
         }
@@ -4806,8 +4845,8 @@ crate::ktest!(
 crate::ktest!(
     fn exec_name_reaches_crash_snapshot_without_blocking() {
         use crate::kassert_eq;
-        let old = with_current(|t| t.name()).ok_or("thread")?;
-        set_current_name(ThreadName::new("exec-name"));
+        let old = with_current(|t| t.task_name()).ok_or("thread")?;
+        set_current_name(TaskName::from_comm(b"exec-name"));
         let name = running_here().ok_or("snapshot")?.1;
         let busy = with_current(|t| {
             let _held = t.name.lock();
@@ -4870,7 +4909,7 @@ crate::ktest!(
                 let cpu = arch::cpu_index();
                 let start = CPUS[cpu].lock().slice_left;
                 let after = if start > 1 {
-                    tick();
+                    tick(false);
                     Some(CPUS[cpu].lock().slice_left)
                 } else {
                     None // a final tick switches away and refills on return
@@ -5539,5 +5578,54 @@ crate::ktest!(
             return Ok(());
         }
         Err("no complete switch stall in five attempts")
+    }
+);
+
+/// Set the caller's Linux comm and its sanitized display snapshot under one lock.
+pub fn set_current_comm(bytes: [u8; 16]) {
+    let name = TaskName::from_comm(&bytes);
+    with_current(|t| *t.name.lock() = name).expect("running thread");
+}
+
+crate::ktest!(
+    fn task_name_normalizes_raw_comm() {
+        use crate::kassert_eq;
+        for (input, expected, display) in [
+            (b"".as_slice(), [0; 16], ""),
+            (b"a\0trailing", *b"a\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", "a"),
+            (b"abcdefghijklmnopq", *b"abcdefghijklmno\0", "abcdefghijklmno"),
+            (b"a\nb", *b"a\nb\0\0\0\0\0\0\0\0\0\0\0\0\0", "a?b"),
+            (b"a\xffb", *b"a\xffb\0\0\0\0\0\0\0\0\0\0\0\0\0", "a�b"),
+        ] {
+            let name = TaskName::from_comm(input);
+            kassert_eq!(name.bytes, expected);
+            kassert_eq!(name.display.as_str(), display);
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn cpu_ticks_distinguish_user_and_system() {
+        use crate::kassert_eq;
+        // An unregistered thread: synthetic charges cannot perturb live CPU totals.
+        let t = Thread::new(
+            TaskName::from_display(ThreadName::new("tick-test")),
+            0,
+            State::Blocked,
+            0,
+            None,
+            None,
+            None,
+            Weak::new(),
+            Placement::pinned(0),
+        );
+        kassert_eq!(t.cpu_time(), [0, 0]);
+        t.charge_tick(true);
+        t.charge_tick(false);
+        t.charge_tick(false);
+        kassert_eq!(t.cpu_time(), [1, 2]);
+        kassert_eq!(t.ticks.load(Ordering::Relaxed), 3);
+        Ok(())
     }
 );

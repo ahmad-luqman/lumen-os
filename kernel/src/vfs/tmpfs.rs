@@ -128,6 +128,15 @@ const _: () = {
 };
 
 impl FileSystem for Tmpfs {
+    fn statfs(&self) -> Result<lumen_vfs::fs::StatFs, VfsError> {
+        let quota = &self.shared.quota;
+        Ok(lumen_vfs::fs::StatFs::quota(
+            quota.limit_bytes() as u64,
+            quota.used_bytes() as u64,
+            charge::INODE_COST as u64,
+        ))
+    }
+
     fn dev_id(&self) -> DevId {
         self.shared.dev
     }

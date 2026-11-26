@@ -13,10 +13,6 @@ use crate::user::{USER_MAX, copy_to_user, user_range_valid};
 /// thousands of synchronous `virtio-rng` requests in one syscall.
 const MAX_GETRANDOM: usize = 4096;
 
-/// Default stack rlimit advertised by M6 `prlimit64`: the initial user
-/// stack's size (8 MiB).
-const DEFAULT_RLIMIT_STACK: u64 = lumen_vm::USER_STACK_SIZE;
-
 pub(super) fn sys_uname(buf: u64) -> u64 {
     let uts = default_utsname();
     // SAFETY: `Utsname` (`system::new_utsname`) is 6 x `[c_char; 65]` (390 bytes), zero padding.
@@ -76,23 +72,26 @@ pub(super) fn sys_prlimit64(pid: u64, resource: u64, new_limit: u64, old_limit: 
     if resource >= u64::from(general::RLIM_NLIMITS) {
         return neg_errno(errno::EINVAL);
     }
-    if new_limit != 0 {
-        // Validate user pointer and `rlim_cur <= rlim_max` even though M6 limits are read-only.
-        // SAFETY: `general::rlimit64` is two `u64`s (16 bytes); all bit patterns valid.
+    let new = if new_limit != 0 {
+        // SAFETY: rlimit64 is two u64s and every bit pattern is valid.
         match unsafe { copy_pod_from_user::<general::rlimit64>(new_limit) } {
-            Ok(rlim) if rlim.rlim_cur > rlim.rlim_max => return neg_errno(errno::EINVAL),
-            Ok(_) => {}
+            Ok(r) if r.rlim_cur > r.rlim_max => return neg_errno(errno::EINVAL),
+            Ok(r) => Some([r.rlim_cur, r.rlim_max]),
             Err(e) => return neg_errno(e.to_errno()),
         }
-    }
+    } else {
+        None
+    };
+    let old = if resource as u32 == general::RLIMIT_STACK {
+        let new = new.map(|[soft, hard]| lumen_vm::StackLimit::new(soft, hard).expect("validated rlimit"));
+        let old = current_process().stack_limit(new);
+        [old.soft(), old.hard()]
+    } else {
+        [if resource as u32 == general::RLIMIT_NOFILE { DEFAULT_RLIMIT_NOFILE } else { u64::MAX }; 2]
+    };
     if old_limit != 0 {
-        let limit = match resource as u32 {
-            general::RLIMIT_STACK => DEFAULT_RLIMIT_STACK,
-            general::RLIMIT_NOFILE => DEFAULT_RLIMIT_NOFILE,
-            _ => u64::MAX,
-        };
-        let rlim = general::rlimit64 { rlim_cur: limit, rlim_max: limit };
-        // SAFETY: `general::rlimit64` is two `u64`s (16 bytes) with zero padding.
+        let rlim = general::rlimit64 { rlim_cur: old[0], rlim_max: old[1] };
+        // SAFETY: rlimit64 is two u64s without padding.
         if let Err(e) = unsafe { copy_pod_to_user(old_limit, &rlim) } {
             return neg_errno(e.to_errno());
         }
