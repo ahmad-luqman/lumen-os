@@ -4532,7 +4532,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 109 | `setpgid(pid, pgid)` | `ProcTree::setpgid` | C8 |
 | 110 | `getppid()` | the parent's pid; 1 for an orphan; 0 for a root started by `linux` | C1 |
 | 111 | `getpgrp()` | the caller's process group | C8 |
-| 112 | `setsid()` | `ProcTree::setsid`, clearing the controlling terminal | C8 |
+| 112 | `setsid()` | `ProcTree::setsid` (C8); clearing the controlling terminal (`SignalState::ctty`) deferred to C9 | C8, C9 |
 | 121 | `getpgid(pid)` | `ProcTree::getpgid` | C8 |
 | 122, 123 | `setfsuid(uid)`, `setfsgid(gid)` | return 0, the previous id (every process runs as root), and change nothing until M11's credentials (vim over the pty calls them: the census) | C12 |
 | 124 | `getsid(pid)` | `ProcTree::getsid` | C8 |
@@ -5745,8 +5745,9 @@ Tested by `scenario:test_linux_proc::test_interval_and_posix_timers`
 `getpgrp()` (111, now `getpgid(0)`) and `getsid(pid)` (124) are
 `ProcTree::setsid`/`setpgid`/`getpgid`/`getsid` under `PROCS`, with
 lumen-proc's errnos (`EPERM`, `ESRCH`, `EACCES` after the child's `exec`,
-`EINVAL`). `setsid` also clears the caller's controlling terminal
-(`SignalState::ctty`), as Linux's `ksys_setsid` does (`proc_clear_tty`).
+`EINVAL`). Clearing the caller's controlling terminal
+(`SignalState::ctty`, as Linux's `ksys_setsid` does via `proc_clear_tty`)
+is deferred to C9, which introduces `ctty`.
 `kill(-pgid, sig)` and `kill(0, sig)` send to `pgrp_members` under
 `PROCS` (`-ESRCH` if the group has none). Controlling terminals, the
 foreground group, `tcsetpgrp` (`TIOCSPGRP`) and the job-control signals

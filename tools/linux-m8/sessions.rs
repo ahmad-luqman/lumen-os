@@ -462,25 +462,29 @@ fn nonleader_tid_esrch() -> R {
                     sys(SYS_FUTEX, [&probe.ready as *const _ as u64, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, 0, 0, 0]);
                 }
                 let tid = i64::from(probe.tid.load(SeqCst));
-                ensure("non-leader tid differs from pid", tid > 0 && tid != me, tid)?;
-                eq("thread getpgid(0)", i64::from(probe.pgid.load(SeqCst)), s)?;
-                eq("thread getpgrp()", i64::from(probe.pgrp.load(SeqCst)), s)?;
-                eq("thread getsid(0)", i64::from(probe.sid.load(SeqCst)), s)?;
-                // Positive control: the tid is live.
-                eq("tkill(tid, 0)", sys(SYS_TKILL, [tid as u64, 0, 0, 0, 0, 0]), 0)?;
-                // Lumen design (ARCHITECTURE section 8 & 15): process lookup by pid only.
-                eq("getpgid(tid) ESRCH", getpgid(tid), -ESRCH)?;
-                eq("getsid(tid) ESRCH", getsid(tid), -ESRCH)?;
-                eq("setpgid(tid, 0) ESRCH", setpgid(tid, 0), -ESRCH)?;
-                eq("setpgid(0, tid) EPERM", setpgid(0, tid), -EPERM)?;
-                eq("kill(tid, 0) ESRCH", kill(tid, 0), -ESRCH)?;
-                eq("kill(tid, SIGUSR1) ESRCH", kill(tid, SIGUSR1), -ESRCH)?;
-
+                let check = (|| -> R {
+                    ensure("non-leader tid differs from pid", tid > 0 && tid != me, tid)?;
+                    eq("thread getpgid(0)", i64::from(probe.pgid.load(SeqCst)), s)?;
+                    eq("thread getpgrp()", i64::from(probe.pgrp.load(SeqCst)), s)?;
+                    eq("thread getsid(0)", i64::from(probe.sid.load(SeqCst)), s)?;
+                    // Positive control: the tid is live.
+                    eq("tkill(tid, 0)", sys(SYS_TKILL, [tid as u64, 0, 0, 0, 0, 0]), 0)?;
+                    // Lumen design (ARCHITECTURE section 8 & 15): process lookup by pid only.
+                    eq("getpgid(tid) ESRCH", getpgid(tid), -ESRCH)?;
+                    eq("getsid(tid) ESRCH", getsid(tid), -ESRCH)?;
+                    eq("setpgid(tid, 0) ESRCH", setpgid(tid, 0), -ESRCH)?;
+                    eq("setpgid(0, tid) EPERM", setpgid(0, tid), -EPERM)?;
+                    eq("kill(tid, 0) ESRCH", kill(tid, 0), -ESRCH)?;
+                    eq("kill(tid, SIGUSR1) ESRCH", kill(tid, SIGUSR1), -ESRCH)
+                })();
                 probe.release.store(1, SeqCst);
                 sys(SYS_FUTEX, [&probe.release as *const _ as u64, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1, 0, 0, 0]);
                 let mut ret = core::ptr::null_mut();
-                // SAFETY: handle is a joinable pthread created above.
-                eq("pthread_join", i64::from(unsafe { pthread_join(handle, &mut ret) }), 0)
+                // SAFETY: handle is a joinable pthread created above; joined unconditionally
+                // before `probe` goes out of scope, even if a check above failed.
+                let join_rc = unsafe { pthread_join(handle, &mut ret) };
+                check?;
+                eq("pthread_join", i64::from(join_rc), 0)
             })();
             match res {
                 Ok(()) => exit(0),
@@ -691,6 +695,47 @@ pub fn wait_pgrp() -> R {
         eq("wait4(0)", sys(SYS_WAIT4, [0, &mut st as *mut _ as u64, 0, 0, 0, 0]), a)?;
         eq("wait4(0) status", i64::from(st), 11 << 8)?;
         eq("wait4(0) ECHILD", sys(SYS_WAIT4, [0, 0, WNOHANG, 0, 0, 0]), -ECHILD)?;
+
+        // Prove wait4(0) filters out children in other process groups: keep an
+        // own-group child live while an out-of-group child is a confirmed zombie.
+        let p_own = pipe(0)?;
+        let live_own = fork()?;
+        if live_own == 0 {
+            let _ = close(p_own[1]);
+            let _ = read_byte(p_own[0]);
+            exit(55);
+        }
+        close(p_own[0])?;
+        let p_other = pipe(0)?;
+        let other_z = fork()?;
+        if other_z == 0 {
+            let _ = close(p_other[1]);
+            let _ = read_byte(p_other[0]);
+            exit(66);
+        }
+        close(p_other[0])?;
+        eq("setpgid(other_z, 0)", setpgid(other_z, 0), 0)?;
+        write_byte(p_other[1], b'G')?;
+        close(p_other[1])?;
+        wait_zombie(other_z)?;
+        st = -1;
+        eq(
+            "wait4(0, WNOHANG) ignores other-group zombie",
+            sys(SYS_WAIT4, [0, &mut st as *mut _ as u64, WNOHANG, 0, 0, 0]),
+            0,
+        )?;
+        wait_zombie(other_z)?;
+        write_byte(p_own[1], b'G')?;
+        close(p_own[1])?;
+        eq("wait4(0) reaps own-group child", sys(SYS_WAIT4, [0, &mut st as *mut _ as u64, 0, 0, 0, 0]), live_own)?;
+        eq("wait4(0) own-group status", i64::from(st), 55 << 8)?;
+        eq("wait4(0) ECHILD with other-group zombie", sys(SYS_WAIT4, [0, 0, WNOHANG, 0, 0, 0]), -ECHILD)?;
+        eq(
+            "reap other-group zombie",
+            sys(SYS_WAIT4, [(-other_z) as u64, &mut st as *mut _ as u64, 0, 0, 0, 0]),
+            other_z,
+        )?;
+        eq("other-group zombie status", i64::from(st), 66 << 8)?;
 
         // waitid(P_PGID, ...) with explicit pgid and 0 (caller's group).
         let c = child_exits(33)?;
