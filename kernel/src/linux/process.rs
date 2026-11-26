@@ -42,7 +42,10 @@ use files::FilesAccess;
 pub use files::{Files, FsInner, FsState, ReservedFd};
 #[cfg(feature = "ktest")]
 pub use signal::send_thread;
-pub use signal::{Delivery, HandlerDelivery, SignalState, send_process_checked, send_thread_checked};
+pub use signal::{
+    Delivery, HandlerDelivery, SignalState, current_pending, send_current_signal, send_process_checked,
+    send_thread_checked,
+};
 use table::ProcTable;
 
 use alloc::collections::BTreeMap;
@@ -75,12 +78,186 @@ use crate::user::UserExit;
 use crate::vfs::KernelVfsLock;
 
 /// An open file description as the kernel's FD tables hold it (Lock 2 its
-/// offset and directory cursor, Lock 0 its whole-call position).
-pub type KernelFile = OpenFile<KernelVfsLock<u64>>;
+/// offset and directory cursor, Lock 0 its whole-call position), together with
+/// its combined end reference count and optional pipe/FIFO end ownership.
+pub struct KernelFile {
+    inner: OpenFile<KernelVfsLock<u64>>,
+    /// Active in-flight syscall references (`Fd::file`, `poll`).
+    #[cfg(feature = "ktest")]
+    io_refs: AtomicU32,
+    /// Combined descriptor + in-flight syscall count (`fd_refs + io_refs`),
+    /// starting at 1. Transitioning 1 -> 0 runs pipe/FIFO end release once.
+    end_refs: AtomicU32,
+    /// Shared pipe state for anonymous pipes and opened (non-`O_PATH`) FIFOs.
+    pipe: Option<Arc<crate::linux::pipe::PipeObject>>,
+    /// Zero except for a nonblocking FIFO reader opened with no writer,
+    /// which snapshots w_opens. Otherwise w_opens >= 1 when open returns.
+    /// Copied from PipeEnd so polling need not take the pipe_end lock.
+    writer_generation: u64,
+    /// End ownership released once when `end_refs` reaches 0.
+    pipe_end: SpinLock<Option<crate::linux::pipe::PipeEnd>>,
+}
+
+impl KernelFile {
+    fn from_open_file(inner: OpenFile<KernelVfsLock<u64>>) -> Self {
+        Self {
+            inner,
+            #[cfg(feature = "ktest")]
+            io_refs: AtomicU32::new(0),
+            end_refs: AtomicU32::new(1),
+            pipe: None,
+            writer_generation: 0,
+            pipe_end: SpinLock::new(None),
+        }
+    }
+
+    /// Wrap an already-checked VFS open (`open_inode_guarded`).
+    pub fn from_opened(opened: lumen_vfs::Opened) -> Result<Self, VfsError> {
+        Ok(Self::from_open_file(OpenFile::from_opened(opened)?))
+    }
+
+    /// Construct a fresh open file description without open-time checks (ktests).
+    #[cfg(feature = "ktest")]
+    pub fn new_unchecked_flags(inode: Arc<dyn VfsInode>, path: Arc<[u8]>, flags: OpenFlags) -> Result<Self, VfsError> {
+        Ok(Self::from_open_file(OpenFile::new_unchecked_flags(inode, path, flags)?))
+    }
+
+    /// Construct an open file description for one end of an anonymous pipe.
+    pub fn new_pipe_end(
+        inode: Arc<dyn VfsInode>,
+        path: Arc<[u8]>,
+        flags: OpenFlags,
+        end: crate::linux::pipe::PipeEnd,
+    ) -> Result<Self, VfsError> {
+        let mut file = Self::from_open_file(OpenFile::new_unchecked_flags(inode, path, flags)?);
+        file.attach_pipe_end(end);
+        Ok(file)
+    }
+
+    /// Attach an opened FIFO/pipe end before installing into an FD table.
+    pub fn attach_pipe_end(&mut self, end: crate::linux::pipe::PipeEnd) {
+        debug_assert!(self.pipe.is_none() && self.pipe_end.get_mut().is_none());
+        self.writer_generation = end.writer_generation();
+        self.pipe = Some(Arc::clone(end.pipe()));
+        *self.pipe_end.get_mut() = Some(end);
+    }
+
+    pub fn is_nonblock(&self) -> bool {
+        self.status_flags() & OpenFlags::O_NONBLOCK != 0
+    }
+
+    pub fn writer_generation(&self) -> u64 {
+        self.writer_generation
+    }
+
+    /// Borrow the underlying `PipeObject` if this is a pipe or opened FIFO.
+    pub fn pipe(&self) -> Option<&Arc<crate::linux::pipe::PipeObject>> {
+        self.pipe.as_ref()
+    }
+
+    /// Count of descriptors sharing this description, raising both `fd_refs`
+    /// and the combined end-lifetime count (`dup`, `fork`, `exec`).
+    /// Caller holds the FD table lock with an existing counted descriptor.
+    pub fn inc_fd_ref(&self) {
+        self.inner.inc_fd_ref();
+        let prev = self.end_refs.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(prev > 0, "inc_fd_ref after last pipe end release");
+    }
+
+    /// Release one descriptor reference; if neither descriptors nor in-flight
+    /// syscalls remain, releases any attached pipe/FIFO end in thread context.
+    /// May take Lock 0: never hold locks 1–10 or OpenFile::pos here.
+    pub fn dec_fd_ref(&self) -> u32 {
+        let rem = self.inner.dec_fd_ref();
+        if self.end_refs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.release_pipe_end();
+        }
+        rem
+    }
+
+    /// Current in-flight syscall reference count.
+    #[cfg(feature = "ktest")]
+    pub fn io_refs(&self) -> u32 {
+        self.io_refs.load(Ordering::Acquire)
+    }
+
+    fn inc_io_ref(&self) {
+        let prev = self.end_refs.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(prev > 0, "inc_io_ref after last pipe end release");
+        #[cfg(feature = "ktest")]
+        self.io_refs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn dec_io_ref(&self) {
+        #[cfg(feature = "ktest")]
+        self.io_refs.fetch_sub(1, Ordering::Relaxed);
+        if self.end_refs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.release_pipe_end();
+        }
+    }
+
+    fn release_pipe_end(&self) {
+        let end = self.pipe_end.lock().take();
+        if let Some(end) = end {
+            end.release();
+        }
+    }
+}
+
+impl core::ops::Deref for KernelFile {
+    type Target = OpenFile<KernelVfsLock<u64>>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl core::ops::DerefMut for KernelFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for KernelFile {
+    fn drop(&mut self) {
+        if let Some(end) = self.pipe_end.get_mut().take() {
+            // Only a never-installed description retains its initial reference.
+            debug_assert_eq!(*self.end_refs.get_mut(), 1);
+            debug_assert_eq!(self.inner.fd_ref_count(), 1);
+            end.release();
+        }
+    }
+}
 
 /// A descriptor's open file description: shared by the slots `dup` (M8)
 /// fills, its `fd_refs` counting them.
 pub type FileRef = Arc<KernelFile>;
+
+/// An in-flight syscall reference to an open file description (`Fd::file`,
+/// `poll`/`select`): raises `KernelFile::end_refs` under `Files::table` and releases it
+/// on drop, running pipe/FIFO end release if all descriptors closed meanwhile.
+pub struct IoFile(FileRef);
+
+impl IoFile {
+    /// Caller holds the FD table lock over an existing descriptor.
+    fn new(file: &FileRef) -> Self {
+        file.inc_io_ref();
+        Self(Arc::clone(file))
+    }
+}
+
+impl core::ops::Deref for IoFile {
+    type Target = KernelFile;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// Dropping may take Lock 0: no locks 1–10 or OpenFile::pos may be held.
+impl Drop for IoFile {
+    fn drop(&mut self) {
+        self.0.dec_io_ref();
+    }
+}
 
 /// A new process's file mode creation mask (`umask`).
 pub const DEFAULT_UMASK: u16 = 0o022;
@@ -123,7 +300,7 @@ impl Cwd {
 /// for kernel callers (a process's stdio, `vfstest`, the ktests). May sleep.
 pub fn open_kernel_file(path: &[u8], flags: u32, mode: u16) -> Result<KernelFile, VfsError> {
     let opened = open_inode_guarded(crate::vfs::tables(), None, path, OpenFlags::from_bits(flags), mode, 0)?;
-    OpenFile::from_opened(opened)
+    KernelFile::from_opened(opened)
 }
 
 /// What a process starts with, opened before it is registered: fd 0 on
@@ -1256,16 +1433,24 @@ fn with_current_fds<R>(f: impl FnOnce(&mut FdTable<FileRef>) -> R) -> R {
     current_process().with_files(f).expect("a running process has its descriptors")
 }
 
-/// The current process's open file on `fd` (a clone, taken and released
-/// under its table's lock), or `None` if `fd` isn't open.
-pub fn current_file(fd: i32) -> Option<FileRef> {
-    with_current_fds(|t| t.get(fd).map(|e| Arc::clone(&e.file)))
+/// The current process's open file on `fd` for an in-flight syscall, raising
+/// `KernelFile::end_refs` under `Files::table` and releasing it on drop.
+pub fn current_io_file(fd: i32) -> Option<IoFile> {
+    with_current_fds(|t| t.get(fd).map(|e| IoFile::new(&e.file)))
 }
 
-/// The current process's open files on each of `fds` (clones, all taken in
-/// one hold of its table's lock; `None` where one isn't open), for `poll`.
-pub fn current_files(fds: &[i32]) -> Vec<Option<FileRef>> {
-    with_current_fds(|t| fds.iter().map(|&fd| t.get(fd).map(|e| Arc::clone(&e.file))).collect())
+/// The current process's open files on each of `fds` for `poll`/`select`,
+/// raising `KernelFile::end_refs` under one hold of `Files::table`.
+pub fn current_io_files(fds: &[i32]) -> Vec<Option<IoFile>> {
+    with_current_fds(|t| fds.iter().map(|&fd| t.get(fd).map(|e| IoFile::new(&e.file))).collect())
+}
+
+/// The current process's open file on `fd` (a metadata/test clone without
+/// raising `end_refs` or keeping a pipe end open), or `None` if closed.
+/// Its last drop can take Lock 0; never drop under locks 1–10 or `pos`.
+#[cfg(feature = "ktest")]
+pub fn current_file(fd: i32) -> Option<FileRef> {
+    with_current_fds(|t| t.get(fd).map(|e| Arc::clone(&e.file)))
 }
 
 /// Reserve the lowest free descriptor at or above `from` before an open
@@ -1299,7 +1484,6 @@ pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
 ///
 /// Lookup, reference counting and installation use one table hold;
 /// displaced entries are released after it. A reserved target is `EBUSY`.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C7's dup2/dup3 next
 pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError> {
     let process = current_process();
     let _access = process.files_access.read();

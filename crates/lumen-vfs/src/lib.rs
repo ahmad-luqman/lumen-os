@@ -46,7 +46,7 @@ pub use locks::{
 };
 pub use mount::{MountInfo, MountTable, VfsCacheOps, VfsTables};
 pub use ops::{
-    Opened, link_at, mkdir_at, open_inode, open_inode_guarded, readlink_at, rename_at2, symlink_at, unlink_at,
+    Opened, link_at, mkdir_at, mknod_at, open_inode, open_inode_guarded, readlink_at, rename_at2, symlink_at, unlink_at,
 };
 pub use poll::{PollGuard, PollHead, PollMask, PollWaker, Pollable};
 pub use resolve::{

@@ -60,6 +60,7 @@ impl Tmpfs {
             _charged: InodeCharge::uncharged_root(&shared.quota),
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
+            fifo: None,
             meta: SleepMutex::new(TmpfsMeta {
                 mode: 0o755,
                 nlink: 2,
@@ -203,6 +204,8 @@ enum Node {
     Dir(Dir),
     /// The target, as given (charged to the quota with the inode).
     Symlink(Box<[u8]>),
+    /// Named pipe (`S_IFIFO`); its runtime pipe lives in `TmpfsInode::fifo`.
+    Fifo,
 }
 
 impl Node {
@@ -211,6 +214,7 @@ impl Node {
             Node::File => InodeType::File,
             Node::Dir(_) => InodeType::Dir,
             Node::Symlink(_) => InodeType::Symlink,
+            Node::Fifo => InodeType::Fifo,
         }
     }
 }
@@ -261,6 +265,7 @@ mod charge {
                 Node::File => 0,
                 Node::Dir(_) => DIR_COST,
                 Node::Symlink(target) => heap_block(target.len()),
+                Node::Fifo => heap_block(size_of::<crate::linux::pipe::FifoSlot>()),
             }
     }
 
@@ -559,12 +564,18 @@ pub struct TmpfsInode {
     _charged: InodeCharge,
     open_count: AtomicU32,
     detached: AtomicBool,
+    /// FIFO pipe attachment slot (present iff `inode_type == InodeType::Fifo`).
+    fifo: Option<Box<crate::linux::pipe::FifoSlot>>,
     meta: SleepMutex<TmpfsMeta>,
     pages: SleepMutex<PageCache>,
     mappers: Mappers,
 }
 
 impl TmpfsInode {
+    /// Borrow the FIFO attachment slot when this inode is a named pipe.
+    pub(crate) fn fifo_slot(&self) -> Option<&crate::linux::pipe::FifoSlot> {
+        self.fifo.as_deref()
+    }
     /// `write_at` at `offset`, or at the end (`append`, `None`): the size is
     /// read under the same hold of `meta` (Lock 4) the write is made in.
     /// Returns where the write began and how much was written.
@@ -597,8 +608,9 @@ impl TmpfsInode {
         let charged = InodeCharge::reserve(&shared.quota, &node)?;
         let size = match &node {
             Node::Symlink(target) => target.len(),
-            Node::File | Node::Dir(_) => 0,
+            Node::File | Node::Dir(_) | Node::Fifo => 0,
         };
+        let fifo = matches!(node, Node::Fifo).then(|| Box::new(crate::linux::pipe::FifoSlot::new()));
         let now = time::realtime_timespec();
         let ino = shared.next_ino.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new_cyclic(|weak_self| Self {
@@ -610,6 +622,7 @@ impl TmpfsInode {
             _charged: charged,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
+            fifo,
             meta: SleepMutex::new(TmpfsMeta {
                 mode: mode & 0o7777,
                 nlink,
@@ -815,6 +828,21 @@ impl VfsInode for TmpfsInode {
     }
 
     fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+        self.mknod(name, InodeType::File, mode, DevId::default())
+    }
+
+    fn mknod(
+        &self,
+        name: &[u8],
+        inode_type: InodeType,
+        mode: u16,
+        _rdev: DevId,
+    ) -> Result<Arc<dyn VfsInode>, VfsError> {
+        let node = match inode_type {
+            InodeType::File => Node::File,
+            InodeType::Fifo => Node::Fifo,
+            _ => return Err(VfsError::Perm),
+        };
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
         }
@@ -828,7 +856,7 @@ impl VfsInode for TmpfsInode {
         }
         let children = &mut meta.dir_mut()?.children;
         let entry = children.reserve_new(name)?;
-        let child = Self::new_child(&self.shared, Node::File, mode, 1)?;
+        let child = Self::new_child(&self.shared, node, mode, 1)?;
         children.add(Arc::clone(&child), entry);
         let now = time::realtime_timespec();
         meta.mtime = now;
@@ -1027,7 +1055,7 @@ impl VfsInode for TmpfsInode {
     fn readlink(&self) -> Result<Vec<u8>, VfsError> {
         match &self.meta.lock().node {
             Node::Symlink(target) => Ok(target.to_vec()),
-            Node::File | Node::Dir(_) => Err(VfsError::Inval),
+            Node::File | Node::Dir(_) | Node::Fifo => Err(VfsError::Inval),
         }
     }
 
@@ -1324,6 +1352,10 @@ impl VfsInode for TmpfsInode {
         let mut meta = self.meta.lock();
         f(&mut meta.locks);
         Ok(())
+    }
+
+    fn pollable(&self) -> Option<&dyn lumen_vfs::Pollable> {
+        self.fifo.as_deref().map(|f| f as &dyn lumen_vfs::Pollable)
     }
 
     /// For `vfs::mmap_page` and `page_cache_lock`, and the root's for

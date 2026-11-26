@@ -30,6 +30,7 @@ lumen-input.workspace = true
 lumen-mm.workspace = true
 lumen-pci.workspace = true
 lumen-perf.workspace = true
+lumen-pipe.workspace = true
 lumen-png.workspace = true
 lumen-proc.workspace = true
 lumen-queue.workspace = true

@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use super::at::{self, Fd, UserPtr};
 use super::fd::vfs;
 use super::finish;
-use crate::linux::process::{self, FileRef, current_process};
+use crate::linux::process::{self, KernelFile, current_process};
 use crate::linux::{errno, general};
 use crate::sched::Wake;
 use crate::sync::SpinLock;
@@ -77,7 +77,7 @@ impl UserFlock {
 /// Lock 2, both released before the inode's Lock 4 is taken. For `SEEK_END`
 /// only, read its size (`stat`, which takes Lock 4 itself). Read once per
 /// call: a `F_SETLKW` keeps the range it was given while it waits.
-fn lock_context(file: &FileRef, spec: &FlockSpec) -> Result<LockContext, u32> {
+fn lock_context(file: &KernelFile, spec: &FlockSpec) -> Result<LockContext, u32> {
     let cur_offset = if spec.l_whence == fcntl_const::SEEK_CUR {
         // Exclude a read's tentative offset until its copy or give-back
         // commits. Never keep Lock 0 across the inode lock or a lock wait.
@@ -96,7 +96,7 @@ fn lock_context(file: &FileRef, spec: &FlockSpec) -> Result<LockContext, u32> {
 /// said (a release it made must still wake the waiters), and a filesystem
 /// breaking that contract is logged. One that says yes without running `f`
 /// is a bug in it too: logged, and `EIO`.
-fn with_locks<T>(file: &FileRef, mut f: impl FnMut(&mut AdvisoryLocks) -> Result<T, VfsError>) -> Result<T, u32> {
+fn with_locks<T>(file: &KernelFile, mut f: impl FnMut(&mut AdvisoryLocks) -> Result<T, VfsError>) -> Result<T, u32> {
     let mut out = None;
     let called = file.inode().with_locks_mut(&mut |locks| out = Some(f(locks)));
     match (out, called) {
@@ -131,7 +131,7 @@ enum Step<H> {
 /// waiters, which retry (and wait again if they still conflict). A signal
 /// ending a wait returns `-ERESTARTSYS` with nothing taken.
 fn lock_or_wait<H: Copy>(
-    file: &FileRef,
+    file: &KernelFile,
     mut attempt: impl FnMut(&mut AdvisoryLocks) -> Result<Step<H>, VfsError>,
     mut before_wait: impl FnMut(H, u64) -> Result<(), u32>,
 ) -> Result<(), u32> {
@@ -195,7 +195,7 @@ static WARNED_TRUNCATED: AtomicBool = AtomicBool::new(false);
 /// hang every process in it until a signal ends it).
 fn log_wait_decision(
     waiter: Waiter,
-    file: &FileRef,
+    file: &KernelFile,
     holder: u32,
     decided: Result<WaitSearch, u32>,
     logged: &mut Option<u32>,
@@ -264,6 +264,14 @@ fn fcntl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
         general::F_GETLK => getlk(&file, at::reg(arg)),
         general::F_SETLK => setlk(&file, at::reg(arg), false),
         general::F_SETLKW => setlk(&file, at::reg(arg), true),
+        general::F_GETPIPE_SZ => {
+            let pipe = file.pipe().ok_or(errno::EBADF)?;
+            Ok(pipe.capacity() as u64)
+        }
+        general::F_SETPIPE_SZ => {
+            let pipe = file.pipe().ok_or(errno::EBADF)?;
+            pipe.set_capacity(argi as u32).map(|cap| cap as u64)
+        }
         _ => Err(errno::EINVAL),
     }
 }
@@ -274,7 +282,7 @@ fn fcntl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
 /// and the rest left as given. The access mode isn't checked (Linux
 /// doesn't); an `F_UNLCK` request is `-EINVAL` (checked first, as Linux),
 /// a range past the largest offset `-EOVERFLOW`.
-fn getlk(file: &FileRef, at: UserPtr) -> Result<u64, u32> {
+fn getlk(file: &KernelFile, at: UserPtr) -> Result<u64, u32> {
     let mut flock = UserFlock::copy_in(at)?;
     let ctx = lock_context(file, &flock.spec)?;
     let pid = current_process().pid();
@@ -292,7 +300,7 @@ fn getlk(file: &FileRef, at: UserPtr) -> Result<u64, u32> {
 /// (`-EINVAL`, `-EOVERFLOW` past the largest offset), then the type
 /// (`-EINVAL`), then the access mode: `F_RDLCK` needs a readable descriptor
 /// and `F_WRLCK` a writable one (`-EBADF`).
-fn setlk(file: &FileRef, at: UserPtr, blocking: bool) -> Result<u64, u32> {
+fn setlk(file: &KernelFile, at: UserPtr, blocking: bool) -> Result<u64, u32> {
     let spec = UserFlock::copy_in(at)?.spec;
     let ctx = lock_context(file, &spec)?;
     let pid = current_process().pid();

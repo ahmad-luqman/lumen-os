@@ -870,16 +870,17 @@ fn is_inline_symlink(inode: &Inode) -> bool {
         && inode.size_in_bytes() <= 60
 }
 
-/// Whether `i_block` holds something other than block numbers that
-/// `ext4plus`'s `delete_file` would still free as blocks: an inline symlink's
-/// target text, or a character or block device's device number (Linux keeps
-/// `rdev` in `i_block` and allocates no blocks; old-style 1:3 is `0x0103`,
-/// i.e. block 259).
+/// Whether i_block contains inline data or no data, never block numbers:
+/// blockless symlinks (including partial creates), and non-EXTENTS devices,
+/// FIFOs and sockets. Special inodes may count an external xattr block in
+/// i_blocks, but Linux never
+/// truncates their i_block. ext4plus otherwise mistakes a device's rdev for
+/// block numbers (old-style 1:3 is 0x0103, i.e. someone else's block 259).
 fn i_block_holds_no_block_numbers(inode: &Inode) -> bool {
     is_inline_symlink(inode)
-        || (matches!(inode.file_type(), FileType::CharacterDevice | FileType::BlockDevice)
+        || (!matches!(inode.file_type(), FileType::Regular | FileType::Directory)
             && !inode.flags().contains(InodeFlags::EXTENTS)
-            && inode.blocks() == 0)
+            && (!inode.file_type().is_symlink() || inode.blocks() == 0))
 }
 
 fn entry_name(name: &[u8]) -> Result<DirEntryName<'_>, VfsError> {
@@ -1700,12 +1701,18 @@ pub struct Ext4Inode {
     /// A listing found the directory's records and `ReadDir` disagreeing,
     /// or a malformed record, and said so (once).
     warned_bad_listing: AtomicBool,
+    /// FIFO pipe attachment slot (present iff `inode_type == InodeType::Fifo`).
+    fifo: Option<alloc::boxed::Box<crate::linux::pipe::FifoSlot>>,
     meta: SleepMutex<Ext4InodeMeta>,
     pages: SleepMutex<PageCache>,
     mappers: Mappers,
 }
 
 impl Ext4Inode {
+    /// Borrow the FIFO attachment slot when this inode is a named pipe.
+    pub(crate) fn fifo_slot(&self) -> Option<&crate::linux::pipe::FifoSlot> {
+        self.fifo.as_deref()
+    }
     /// `write_at` at `offset`, or at the end (`append`, `None`): the size is
     /// read under the same hold of `meta` (Lock 4) the write is made in.
     /// Returns where the write began and how much was written.
@@ -1813,18 +1820,21 @@ impl Ext4Inode {
             detached_symlink_target: Vec::new(),
             locks: AdvisoryLocks::new(),
         };
+        let inode_type = map_file_type(disk.file_type());
+        let fifo = (inode_type == InodeType::Fifo).then(|| alloc::boxed::Box::new(crate::linux::pipe::FifoSlot::new()));
         Arc::new(Self {
             lock_id: next_lock_id(),
             shared,
             disk_ino,
             ino: AtomicU64::new(u64::from(disk_ino)),
-            inode_type: map_file_type(disk.file_type()),
+            inode_type,
             rdev,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
             writeback_errno: AtomicU32::new(0),
             read_errno: AtomicU32::new(0),
             warned_bad_listing: AtomicBool::new(false),
+            fifo,
             meta: SleepMutex::new(meta),
             pages: SleepMutex::new(PageCache::new_ext4()),
             mappers: Mappers::new(),
@@ -2180,8 +2190,8 @@ impl Ext4Inode {
         Ok(buf)
     }
 
-    /// Zero an inline (fast) symlink's or a device node's size and `i_block`
-    /// on disk before the unlink that frees it, and hand back the bytes to
+    /// Zero an inline (fast) symlink's or special inode's size and `i_block`
+    /// (device, FIFO or socket) before the unlink that frees it. Return bytes to
     /// restore if the unlink fails. `ext4plus`'s `delete_file` reads `i_block`
     /// as block numbers (it has no fast-symlink or device case), so freeing an
     /// inode whose `i_block` holds target text or a device number would free
@@ -4108,7 +4118,7 @@ fn try_discard_orphan(
         let parent_links = Inode::read(ext4, parent_ino).map_err(map_ext4_err)?.links_count();
         let mut orphan = Inode::read(ext4, orphan_ino).map_err(map_ext4_err)?;
         let is_dir = orphan.file_type().is_dir();
-        if orphan.file_type().is_symlink() && !orphan.flags().contains(InodeFlags::EXTENTS) && orphan.blocks() == 0 {
+        if i_block_holds_no_block_numbers(&orphan) {
             orphan.set_links_count(0);
             orphan.write(ext4).map_err(map_ext4_err)?;
             orphan = Ext4Inode::zero_inline_symlink_before_unlink(inner, orphan_ino.get(), orphan, 0)?.0;
@@ -4331,6 +4341,87 @@ impl VfsInode for Ext4Inode {
             inner.clear_nlink_bounds(child_disk.index.get());
             if let Err(e) = parent_dir.link(dname, &mut child_disk) {
                 discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed create");
+                self.retake_dir_geometry(&mut meta, &inner.ext4);
+                return Err(map_ext4_err(e));
+            }
+            meta.take_dir_geometry(parent_dir.inode());
+            let child = inner.created_inode(child_disk, &self.shared);
+            meta.times.modified(now_ts);
+            meta.meta_dirty = true;
+            Ok(child as Arc<dyn VfsInode>)
+        })())
+    }
+
+    fn mknod(
+        &self,
+        name: &[u8],
+        inode_type: InodeType,
+        mode: u16,
+        _rdev: DevId,
+    ) -> Result<Arc<dyn VfsInode>, VfsError> {
+        let (file_type, mode_type) = match inode_type {
+            InodeType::File => (FileType::Regular, InodeMode::S_IFREG),
+            InodeType::Fifo => (FileType::Fifo, InodeMode::S_IFIFO),
+            _ => return Err(VfsError::Perm),
+        };
+        let op = self.shared.writable_op("mknod")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
+                return Err(VfsError::NotDir);
+            }
+            if name == b"." || name == b".." {
+                return Err(VfsError::Exist);
+            }
+            let mut meta = self.meta.lock();
+            if self.is_detached() || meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let dname = entry_name(name)?;
+            let now_ts = self.shared.now();
+
+            let mut inner = self.shared.state.lock();
+            let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+            let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
+            ensure_absent(&parent_dir, dname)?;
+            ensure_create_reserve(&inner.ext4)?;
+
+            let mode = mode_type | InodeMode::from_bits_retain(mode & 0o7777);
+            let mut child_disk = new_inode(&inner.ext4, file_type, mode, now_ts).map_err(map_ext4_err)?;
+            inner.clear_nlink_bounds(child_disk.index.get());
+            // Special files must not carry EXTENTS or a non-zero i_block
+            // (e2fsck rejects them); with the extents feature,
+            // ext4plus::create_inode sets EXTENTS and
+            // initializes an empty extent header. Zero i_block BEFORE clearing
+            // EXTENTS: a failure must never expose that header as block numbers
+            // for discard_orphan to free. Re-reading below preserves the zeros.
+            if inode_type == InodeType::Fifo {
+                let cleared = (|| -> Result<Inode, VfsError> {
+                    let off = inner.layout.inode_disk_offset(&inner.bcache, child_disk.index.get())?;
+                    let zero = [0u8; 60];
+                    inner.bcache.write_at(off + I_BLOCK_OFFSET, &zero).map_err(|e| map_block_error(&e))?;
+                    // Re-read so writing flags cannot restore the old extent header.
+                    child_disk = Inode::read(&inner.ext4, child_disk.index).map_err(map_ext4_err)?;
+                    child_disk.set_flags(child_disk.flags().difference(InodeFlags::EXTENTS));
+                    child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
+                    Ok(child_disk.clone())
+                })();
+                match cleared {
+                    Ok(disk) => child_disk = disk,
+                    Err(e) => {
+                        discard_orphan(
+                            &mut inner,
+                            self.disk_inode_index(),
+                            dname,
+                            child_disk.index,
+                            "after a failed mknod",
+                        );
+                        self.retake_dir_geometry(&mut meta, &inner.ext4);
+                        return Err(e);
+                    }
+                }
+            }
+            if let Err(e) = parent_dir.link(dname, &mut child_disk) {
+                discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed mknod");
                 self.retake_dir_geometry(&mut meta, &inner.ext4);
                 return Err(map_ext4_err(e));
             }
@@ -5261,6 +5352,10 @@ impl VfsInode for Ext4Inode {
         Ok(())
     }
 
+    fn pollable(&self) -> Option<&dyn lumen_vfs::Pollable> {
+        self.fifo.as_deref().map(|f| f as &dyn lumen_vfs::Pollable)
+    }
+
     /// For `vfs::mmap_page`.
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
@@ -5325,6 +5420,8 @@ pub(crate) mod ktest_util {
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         pub(in crate::vfs) dev: MemBlkDev,
+        /// Optional raw bytes captured just before an injected read error.
+        pub read_failure_snapshot: SleepMutex<Option<(u64, [u8; 128])>>,
         pub reads: AtomicUsize,
         pub writes: AtomicUsize,
         /// `sync` calls, failed ones included.
@@ -5509,6 +5606,9 @@ pub(crate) mod ktest_util {
                 let armed = self.fail_range_reads.load(Ordering::Acquire) > 0;
                 let skipped = armed && take_one(&self.range_skip);
                 if !skipped && take_one(&self.fail_range_reads) {
+                    if let Some((offset, bytes)) = self.read_failure_snapshot.lock().as_mut() {
+                        self.inner.lock().read_at(*offset, bytes)?;
+                    }
                     return Err(BlockError::Io);
                 }
             }
@@ -5625,6 +5725,7 @@ pub(crate) mod ktest_util {
         let cache = Arc::new(FaultCache {
             inner: SleepMutex::new(BlockCache::new(dev.clone(), 64).map_err(|_| "bcache")?),
             dev,
+            read_failure_snapshot: SleepMutex::new(None),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             syncs: AtomicUsize::new(0),
@@ -6043,40 +6144,82 @@ crate::ktest!(
     }
 );
 
+#[cfg(feature = "ktest")]
+fn ktest_unlink_device(with_xattr: bool) -> crate::ktest::TestResult {
+    // A device node keeps its device number in `i_block` (Linux and
+    // mke2fs -d make them; the adapter can't). Here its "device number"
+    // is the block holding another file's data: unlinking the node must
+    // free its inode and nothing else.
+    use self::ktest_util::*;
+    use crate::{kassert, kassert_eq};
+    let m = mount(build_1k_blockmap_image(512), 202)?;
+    let keep = m.root.create(b"keep.bin", 0o644).map_err(|_| "create keep")?;
+    let data = pattern(BS, 3);
+    kassert_eq!(keep.write_at(0, &data).map_err(|_| "write keep")?, data.len());
+    keep.sync(false).map_err(|_| "sync keep")?;
+    let dev = m.root.create(b"null", 0o644).map_err(|_| "create node")?;
+    if with_xattr {
+        // Allocate the future external xattr block through the ordinary
+        // allocator, then import its pointer in i_file_acl below.
+        dev.write_at(0, &[0; BS]).map_err(|_| "allocate xattr block")?;
+        dev.sync(false).map_err(|_| "sync xattr block")?;
+    }
+    let (keep_ino, dev_ino) = (keep.ino(), dev.ino());
+    drop((keep, dev));
+    m.fs.sync().map_err(|_| "fs sync")?;
+    let mut img = image(&m)?;
+    drop(m);
+    let keep_block = u32::from_le_bytes(img[inode_off(keep_ino) + I_BLOCK..][..4].try_into().unwrap());
+    kassert!(keep_block != 0);
+    if with_xattr {
+        let off = inode_off(dev_ino);
+        let block = u32::from_le_bytes(img[off + I_BLOCK..][..4].try_into().unwrap());
+        kassert!(block != 0 && block != keep_block);
+        kassert_eq!(u32::from_le_bytes(img[off + 0x1c..][..4].try_into().unwrap()), 2);
+        img[off + 0x04..off + 0x08].fill(0); // size: special inode has no file data
+        img[off + 0x68..off + 0x6c].copy_from_slice(&block.to_le_bytes());
+        img[1024 + 0x5c] |= 8; // EXT_ATTR compatible feature
+        let attr = &mut img[block as usize * BS..][..BS];
+        attr.fill(0);
+        attr[..4].copy_from_slice(&0xea020000u32.to_le_bytes());
+        attr[4..8].copy_from_slice(&1u32.to_le_bytes()); // reference count
+        attr[8..12].copy_from_slice(&1u32.to_le_bytes()); // blocks
+        attr[32] = 4; // name length
+        attr[33] = 1; // user namespace: user.test = x
+        attr[34..36].copy_from_slice(&1020u16.to_le_bytes());
+        attr[40..44].copy_from_slice(&1u32.to_le_bytes());
+        let hash = b"test".iter().fold(0u32, |h, &b| h.rotate_left(5) ^ u32::from(b)).rotate_left(16) ^ 0x78;
+        attr[44..48].copy_from_slice(&hash.to_le_bytes());
+        attr[48..52].copy_from_slice(b"test");
+        attr[1020] = b'x';
+    }
+    let d = &mut img[inode_off(dev_ino)..][..ISZ];
+    d[0..2].copy_from_slice(&0o020666u16.to_le_bytes());
+    d[I_BLOCK..I_BLOCK + 4].copy_from_slice(&keep_block.to_le_bytes());
+
+    let m = mount(img, 203)?;
+    let (inodes, blocks) = (free_inodes(&m.fs), free_blocks(&m.fs));
+    m.root.unlink(b"null").map_err(|_| "unlink node")?;
+    kassert_eq!(free_inodes(&m.fs), inodes + 1);
+    kassert_eq!(free_blocks(&m.fs), blocks);
+    let ro = remount_ro(&m, 204)?;
+    kassert_eq!(free_blocks(&ro), blocks);
+    kassert_eq!(read_all(&ro.root_inode().lookup(b"keep.bin").map_err(|_| "ro lookup")?)?, data);
+    Ok(())
+}
+
 crate::ktest!(
     fn ext4_unlinking_a_device_node_frees_no_blocks() {
-        // A device node keeps its device number in `i_block` (Linux and
-        // mke2fs -d make them; the adapter can't). Here its "device number"
-        // is the block holding another file's data: unlinking the node must
-        // free its inode and nothing else.
-        use self::ktest_util::*;
-        use crate::{kassert, kassert_eq};
-        let m = mount(build_1k_blockmap_image(512), 202)?;
-        let keep = m.root.create(b"keep.bin", 0o644).map_err(|_| "create keep")?;
-        let data = pattern(BS, 3);
-        kassert_eq!(keep.write_at(0, &data).map_err(|_| "write keep")?, data.len());
-        keep.sync(false).map_err(|_| "sync keep")?;
-        let dev = m.root.create(b"null", 0o644).map_err(|_| "create node")?;
-        let (keep_ino, dev_ino) = (keep.ino(), dev.ino());
-        drop((keep, dev));
-        m.fs.sync().map_err(|_| "fs sync")?;
-        let mut img = image(&m)?;
-        drop(m);
-        let keep_block = u32::from_le_bytes(img[inode_off(keep_ino) + I_BLOCK..][..4].try_into().unwrap());
-        kassert!(keep_block != 0);
-        let d = &mut img[inode_off(dev_ino)..][..ISZ];
-        d[0..2].copy_from_slice(&0o020666u16.to_le_bytes());
-        d[I_BLOCK..I_BLOCK + 4].copy_from_slice(&keep_block.to_le_bytes());
+        ktest_unlink_device(false)
+    }
+);
 
-        let m = mount(img, 203)?;
-        let (inodes, blocks) = (free_inodes(&m.fs), free_blocks(&m.fs));
-        m.root.unlink(b"null").map_err(|_| "unlink node")?;
-        kassert_eq!(free_inodes(&m.fs), inodes + 1);
-        kassert_eq!(free_blocks(&m.fs), blocks);
-        let ro = remount_ro(&m, 204)?;
-        kassert_eq!(free_blocks(&ro), blocks);
-        kassert_eq!(read_all(&ro.root_inode().lookup(b"keep.bin").map_err(|_| "ro lookup")?)?, data);
-        Ok(())
+crate::ktest!(
+    fn ext4_unlinking_a_device_with_xattr_preserves_foreign_blocks() {
+        // i_blocks includes the external xattr block. It must not make the
+        // device number into a data block pointer. Xattr reclamation itself
+        // is outside this check (ext4plus delete_file does not reclaim it).
+        ktest_unlink_device(true)
     }
 );
 
@@ -9846,6 +9989,60 @@ crate::ktest!(
             kassert_eq!(mode_cell(&m), Value::Text(String::from("ro,errors")));
             kassert_eq!(crate::vfs::procfs::format_mounts_of(rows), "/dev/vda / ext4 ro,errors=remount-ro 0 0\n");
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_fifo_mknod_descriptor_fault_never_frees_foreign_blocks() {
+        use crate::{kassert, kassert_eq};
+        use ktest_util::*;
+        // Sweep descriptor reads: this includes the adapter's inode offset
+        // lookup between inode creation and clearing i_block. Inspect that
+        // failure boundary too: orphan pre-zeroing is a second defense and
+        // must not hide an unsafe intermediate state from this regression.
+        let mut reached_fifo = false;
+        let mut reached_success = false;
+        for skip in 0..32 {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 386)?;
+            let bitmap = block_bitmap_offset(&m.fs)? as usize;
+            let before = image(&m)?;
+            let free_i = free_inodes(&m.fs);
+            let off = inode_offset(&m.fs, 11)?;
+            *m.cache.read_failure_snapshot.lock() = Some((off, [0; 128]));
+            m.cache.fail_reads_in_after(4096, 4160, skip, 1);
+            let result = m.root.mknod(b"fifo", InodeType::Fifo, 0o600, DevId::default());
+            let hit = m.cache.range_reads_left() == 0;
+            kassert!(!hit || result.is_err());
+            m.cache.clear();
+            if hit {
+                let (_, raw) = m.cache.read_failure_snapshot.lock().take().ok_or("snapshot")?;
+                let mode = u16::from_le_bytes(raw[0..2].try_into().unwrap());
+                if mode & 0xf000 == 0x1000 {
+                    reached_fifo = true;
+                    let flags = u32::from_le_bytes(raw[32..36].try_into().unwrap());
+                    kassert!(flags & InodeFlags::EXTENTS.bits() != 0 || raw[40..100].iter().all(|&b| b == 0));
+                }
+            }
+            if result.is_ok() {
+                m.root.unlink(b"fifo").map_err(|_| "unlink fifo")?;
+                reached_success |= !hit;
+            } else {
+                kassert_eq!(result.err(), Some(VfsError::Io));
+                kassert_eq!(m.root.lookup(b"fifo").err(), Some(VfsError::NoEnt));
+            }
+            let after = image(&m)?;
+            kassert_eq!(&after[bitmap..bitmap + 4096], &before[bitmap..bitmap + 4096]);
+            kassert_eq!(counts_4k(&after, bitmap as u64), counts_4k(&before, bitmap as u64));
+            kassert_eq!(free_inodes(&m.fs), free_i);
+            kassert!(!m.fs.errored() && !m.fs.read_only());
+            let ro = mount_ro_image(after, 387)?;
+            kassert_eq!(ro.root_inode().lookup(b"fifo").err(), Some(VfsError::NoEnt));
+            if reached_success {
+                break;
+            }
+        }
+        kassert!(reached_fifo && reached_success);
         Ok(())
     }
 );

@@ -16,3 +16,33 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::poll::ppoll_installs_its_mask_and_writes_back_when_interrupted",
     "scenario:test_linux_io::test_poll_and_select_on_console",
 ]
+
+[[feature]]
+name = "Pipes, FIFOs, `dup`/`dup2`/`dup3`, `O_CLOEXEC`, `SIGPIPE`, `F_SETPIPE_SZ`/`F_GETPIPE_SZ`, `FIONREAD`, and pipe/FIFO readiness and in-flight end lifetimes (#386, C7)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-pipe",
+    "ktest:lumen_kernel::linux::syscall::poll::poll_masks_of_each_file_kind",
+    "ktest:lumen_kernel::linux::syscall::poll::poll_wakes_on_a_pipe_write",
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_end_outlives_its_close_while_a_write_is_in_flight",
+    "ktest:lumen_kernel::linux::syscall::fd::fifo_reopen_during_a_blocked_read_reaches_that_reader",
+    "scenario:test_linux_io::test_pipes_and_poll",
+]
+
+[[feature]]
+name = "C7 atomic writers wait for the whole record, broken blocked writes return EPIPE, and FIFO opens handshake or detach on interruption"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_atomic_writer_waits_for_the_entire_record",
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_blocked_writer_gets_epipe_when_reader_closes",
+    "ktest:lumen_kernel::linux::syscall::fd::fifo_blocking_opens_wait_for_peers_and_interrupt_detaches",
+    "scenario:test_linux_io::test_pipes_and_poll",
+]
+
+[[feature]]
+name = "Pipe readv holds one read critical section across spans and consumes only the copied prefix on faults"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_readv_keeps_spans_in_one_read",
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_readv_fault_commits_only_the_copied_prefix",
+]

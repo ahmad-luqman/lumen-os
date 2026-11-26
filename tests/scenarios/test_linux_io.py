@@ -7,7 +7,7 @@ import re
 
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import copy_rootfs
+from lumen_harness.rootfs import copy_rootfs, debugfs, debugfs_names, e2fsck_check
 from lumen_harness.shell import run
 
 BOOT_TIMEOUT = 60
@@ -106,3 +106,63 @@ def test_poll_and_select_on_console(boot, tmp_path):
 
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_pipes_and_poll(boot, tmp_path):
+    """M8 C7 ring-3 check of pipes, FIFOs, `dup`/`dup2`/`dup3`, `O_CLOEXEC`,
+    `SIGPIPE`, `F_SETPIPE_SZ`, `FIONREAD`, `posix_spawn`, `fork`'s `inc_fd_ref`
+    for pipes and `flock`, `mknodat` errno rows, and an ext4 FIFO checked with
+    host `e2fsck -fn`."""
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+
+    start = len(m.output)
+    m.send_line(f"linux {M8_IO} pipes")
+
+    for check in (
+        "busybox_pipeline",
+        "pipe_buf_atomicity",
+        "eof_fionread_and_sigpipe",
+        "nonblock_and_setpipe_sz",
+        "pipe_writev_and_faults",
+        "blocked_sigpipe_and_writev",
+        "proc_pipe_reopen_and_large_write",
+        "dup_redirections",
+        "fifo_open_rules_and_poll",
+        "posix_spawn_cloexec",
+        "fork_inc_fd_ref",
+        "mknodat_and_ext4_fifo",
+    ):
+        m.expect(re.compile(rf"^ok {check}\r?$", re.MULTILINE), 30)
+
+    m.expect(rf"linux: {re.escape(M8_IO)} exit=0 leaked_frames=-?\d+\n", 20)
+    m.expect(r"lumen> ", 10)
+    assert CRASH_BEGIN not in m.output[start:]
+
+    run(m, "sync")
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+    # Confirm the ext4 FIFO created (and the second one unlinked) on the rootfs
+    # leave an e2fsck-clean ext4 image.
+    e2fsck_check(disk)
+
+    names = debugfs_names(disk, "/")
+    assert "ext4-fifo-keep" in names
+    assert "ext4-fifo-del" not in names
+    stat = debugfs(disk, "stat /ext4-fifo-keep")
+    assert "Type: FIFO" in stat, stat
+    flags = re.search(r"Flags:\s+(0x[0-9a-fA-F]+)", stat)
+    assert flags and int(flags[1], 16) & 0x80000 == 0, stat
+    assert "Blockcount: 0" in stat, stat
+    # imap gives the on-disk inode position; inspect all 60 i_block bytes,
+    # including bytes debugfs's block listing may omit for special files.
+    location = debugfs(disk, "imap /ext4-fifo-keep")
+    match = re.search(r"block (\d+), offset (0x[0-9a-fA-F]+)", location)
+    assert match, location
+    stats = debugfs(disk, "stats")
+    block_size = re.search(r"Block size:\s+(\d+)", stats)
+    assert block_size, stats
+    with disk.open("rb") as image:
+        image.seek(int(match[1]) * int(block_size[1]) + int(match[2], 16) + 40)
+        assert image.read(60) == bytes(60)

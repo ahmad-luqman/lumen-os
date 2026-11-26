@@ -40,8 +40,8 @@ pub fn fill_readdir<N: Into<Vec<u8>>>(
     }
 }
 
-/// The seven namespace operations of a filesystem whose names no caller can
-/// change (`create`, `mkdir`, `unlink`, `rmdir`, `link`, `symlink`,
+/// The eight namespace operations of a filesystem whose names no caller can
+/// change (`create`, `mkdir`, `mknod`, `unlink`, `rmdir`, `link`, `symlink`,
 /// `rename`), each `-EROFS`, inside its `impl VfsInode`.
 #[macro_export]
 macro_rules! fixed_namespace_ops {
@@ -58,6 +58,16 @@ macro_rules! fixed_namespace_ops {
             &self,
             _name: &[u8],
             _mode: u16,
+        ) -> Result<$crate::pseudo::__Arc<dyn $crate::VfsInode>, $crate::VfsError> {
+            Err($crate::VfsError::RoFs)
+        }
+
+        fn mknod(
+            &self,
+            _name: &[u8],
+            _inode_type: $crate::InodeType,
+            _mode: u16,
+            _rdev: $crate::DevId,
         ) -> Result<$crate::pseudo::__Arc<dyn $crate::VfsInode>, $crate::VfsError> {
             Err($crate::VfsError::RoFs)
         }

@@ -411,3 +411,26 @@ milestone = "M8"
 tests = [
     "ktest:lumen_kernel::linux::process::open_reservation_survives_until_install",
 ]
+
+[[feature]]
+name = "M8 `mknod`/`mknodat` creates FIFOs and empty regular files on tmpfs and ext4 (`mknod_at`, `VfsInode::mknod`), rejects unsupported types before path lookup and devfs/read-only mounts with `EROFS`, and leaves ext4 images e2fsck-clean (#386, C7)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::linux::syscall::fd::fifo_reopen_during_a_blocked_read_reaches_that_reader",
+    "scenario:test_linux_io::test_pipes_and_poll",
+]
+
+[[feature]]
+name = "C7 FIFO mknod descriptor read failures preserve block ownership and safe i_block encoding"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_fifo_mknod_descriptor_fault_never_frees_foreign_blocks",
+]
+
+[[feature]]
+name = "Special ext4 inode i_block is never freed as data when i_blocks counts external xattrs (#386)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_unlinking_a_device_with_xattr_preserves_foreign_blocks",
+]

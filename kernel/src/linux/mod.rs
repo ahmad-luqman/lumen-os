@@ -10,6 +10,7 @@ pub mod exec;
 pub mod futex;
 mod init;
 pub mod modules;
+pub mod pipe;
 pub mod process;
 pub mod signal;
 pub mod syscall;

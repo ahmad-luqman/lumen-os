@@ -1,6 +1,7 @@
 //! What M8's test programs share (`mod common;` in each; ARCHITECTURE
 //! section 15, "M8's tests"): the raw `syscall`, a line written in one
-//! `write`, the panic handler, argument bytes, and the checks' runner.
+//! `write`, the panic handler, argument bytes, the checks' runner, syscall
+//! numbers and errno constants, and close/pipe/fstat_mode helpers.
 //!
 //! A mode runs its checks through [`run_checks`]: one `ok <check>` line per
 //! check passed; the first failed check prints `FAIL <check>: <what> (got
@@ -187,4 +188,76 @@ pub unsafe fn args(argc: c_int, argv: *const *const u8) -> ([&'static [u8]; 16],
         *slot = unsafe { arg(*argv.add(i)) };
     }
     (out, n)
+}
+
+// Linux x86-64 syscall numbers.
+pub const SYS_READ: u64 = 0;
+pub const SYS_WRITE: u64 = 1;
+pub const SYS_CLOSE: u64 = 3;
+pub const SYS_FSTAT: u64 = 5;
+pub const SYS_POLL: u64 = 7;
+pub const SYS_LSEEK: u64 = 8;
+pub const SYS_RT_SIGACTION: u64 = 13;
+pub const SYS_RT_SIGPROCMASK: u64 = 14;
+pub const SYS_IOCTL: u64 = 16;
+pub const SYS_PREAD64: u64 = 17;
+pub const SYS_PWRITE64: u64 = 18;
+pub const SYS_PIPE: u64 = 22;
+pub const SYS_READV: u64 = 19;
+pub const SYS_WRITEV: u64 = 20;
+pub const SYS_GETPID: u64 = 39;
+pub const SYS_RT_SIGPENDING: u64 = 127;
+pub const SYS_MMAP: u64 = 9;
+pub const SYS_MUNMAP: u64 = 11;
+pub const SYS_SELECT: u64 = 23;
+pub const SYS_DUP: u64 = 32;
+pub const SYS_DUP2: u64 = 33;
+pub const SYS_FORK: u64 = 57;
+pub const SYS_EXECVE: u64 = 59;
+pub const SYS_EXIT: u64 = 60;
+pub const SYS_WAIT4: u64 = 61;
+pub const SYS_FCNTL: u64 = 72;
+pub const SYS_FLOCK: u64 = 73;
+pub const SYS_FSYNC: u64 = 74;
+pub const SYS_UNLINK: u64 = 87;
+pub const SYS_READLINK: u64 = 89;
+pub const SYS_CLOCK_GETTIME: u64 = 228;
+pub const SYS_OPENAT: u64 = 257;
+pub const SYS_MKNODAT: u64 = 259;
+pub const SYS_PSELECT6: u64 = 270;
+pub const SYS_PPOLL: u64 = 271;
+pub const SYS_DUP3: u64 = 292;
+pub const SYS_PIPE2: u64 = 293;
+
+pub const EPERM: i64 = -1;
+/// Positive errno returned by libc posix_spawn, unlike raw syscall errors.
+pub const ENOENT_POSITIVE: i32 = 2;
+pub const ENXIO: i64 = -6;
+pub const EBADF: i64 = -9;
+pub const EAGAIN: i64 = -11;
+pub const EFAULT: i64 = -14;
+pub const EBUSY: i64 = -16;
+pub const EEXIST: i64 = -17;
+pub const EINVAL: i64 = -22;
+pub const ESPIPE: i64 = -29;
+pub const EROFS: i64 = -30;
+pub const EPIPE: i64 = -32;
+
+/// Close a descriptor, checking the syscall result.
+pub fn close(fd: i32) -> R {
+    eq("close", sys(SYS_CLOSE, [fd as u64, 0, 0, 0, 0, 0]), 0)
+}
+
+/// A fresh pipe with the requested pipe2 flags.
+pub fn pipe(flags: u64) -> Result<[i32; 2], Fail> {
+    let mut pair = [-1; 2];
+    eq("pipe2", sys(SYS_PIPE2, [pair.as_mut_ptr() as u64, flags, 0, 0, 0, 0]), 0)?;
+    Ok(pair)
+}
+
+/// Linux x86-64 stat's st_mode (offset 24).
+pub fn fstat_mode(fd: i32) -> Result<u32, Fail> {
+    let mut stat = [0u8; 144];
+    eq("fstat", sys(SYS_FSTAT, [fd as u64, stat.as_mut_ptr() as u64, 0, 0, 0, 0]), 0)?;
+    Ok(u32::from_le_bytes(stat[24..28].try_into().unwrap()))
 }

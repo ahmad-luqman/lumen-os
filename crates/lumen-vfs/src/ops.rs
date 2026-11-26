@@ -639,6 +639,51 @@ pub fn mkdir_at(
     Ok(created_dir.expect("mkdir run returns Ok only after setting created_dir"))
 }
 
+/// `mknodat(2)`: create a special or regular node with `(mode & 0o7777) & !umask`.
+///
+/// Serializes under Lock 3 (`FileSystem::with_rename_lock`) and publishes the
+/// new inode into `InodeCache`/`DentryCache`. A trailing slash returns `EEXIST`
+/// if the name exists and `ENOENT` (or `lookup`'s error) otherwise; a read-only
+/// mount returns `EROFS`.
+pub fn mknod_at(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    inode_type: InodeType,
+    mode: u16,
+    umask: u16,
+    rdev: DevId,
+) -> Result<Arc<dyn VfsInode>, VfsError> {
+    let target = resolve_parent(env, start_dir, path)?;
+    let name = match target.final_component() {
+        Final::Root | Final::Dot | Final::DotDot => return Err(VfsError::Exist),
+        Final::Name(name) => name,
+    };
+    if target.has_trailing_slash {
+        return match target.parent.lookup(name) {
+            Ok(_) => Err(VfsError::Exist),
+            Err(e) => Err(e),
+        };
+    }
+    if env.fs_read_only(target.parent.dev_id()) {
+        return Err(VfsError::RoFs);
+    }
+    let eff_mode = (mode & 0o7777) & !umask;
+    let fs_opt = env.fs_by_dev(target.parent.dev_id());
+    let mut created_node: Option<Arc<dyn VfsInode>> = None;
+    let mut run = || -> Result<(), VfsError> {
+        let (dentry_gen, inode_gen) = env.cache_gens();
+        let node = target.parent.mknod(name, inode_type, eff_mode, rdev)?;
+        created_node = Some(publish_created_inode(env, &target.parent, name, node, dentry_gen, inode_gen));
+        Ok(())
+    };
+    match fs_opt {
+        Some(fs) => fs.with_rename_lock(&mut run)?,
+        None => run()?,
+    }
+    Ok(created_node.expect("mknod run returns Ok only after setting created_node"))
+}
+
 /// `unlinkat(2)`: unlink a non-directory (`remove_dir == false`) or remove an
 /// empty directory (`remove_dir == true`).
 ///

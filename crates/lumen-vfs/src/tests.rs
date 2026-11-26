@@ -463,6 +463,42 @@ impl VfsInode for MemInode {
         Ok(dir)
     }
 
+    fn mknod(&self, name: &[u8], inode_type: InodeType, mode: u16, rdev: DevId) -> Result<Arc<dyn VfsInode>, VfsError> {
+        if self.inode_type != InodeType::Dir {
+            return Err(VfsError::NotDir);
+        }
+        if self.is_detached() {
+            return Err(VfsError::NoEnt);
+        }
+        if !matches!(inode_type, InodeType::File | InodeType::Fifo) {
+            return Err(VfsError::Perm);
+        }
+        let mut g = self.inner.lock().unwrap();
+        if g.children.contains_key(name) {
+            return Err(VfsError::Exist);
+        }
+        let node = match inode_type {
+            InodeType::File => MemInode::new_file(
+                self.dev,
+                self.alloc_ino(),
+                mode & 0o7777,
+                Arc::clone(&self.registry),
+                Arc::clone(&self.next_ino),
+            ),
+            _ => MemInode::new_special(
+                self.dev,
+                self.alloc_ino(),
+                inode_type,
+                mode & 0o7777,
+                rdev,
+                Arc::clone(&self.registry),
+                Arc::clone(&self.next_ino),
+            ),
+        };
+        g.children.insert(name.to_vec(), Arc::clone(&node));
+        Ok(node)
+    }
+
     fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
         if self.inode_type != InodeType::Dir {
             return Err(VfsError::NotDir);
@@ -2014,6 +2050,16 @@ fn lock9_is_never_held_during_inode_calls() {
             assert_test_lock9_free();
             self.inner.mkdir(name, mode)
         }
+        fn mknod(
+            &self,
+            name: &[u8],
+            inode_type: InodeType,
+            mode: u16,
+            rdev: DevId,
+        ) -> Result<Arc<dyn VfsInode>, VfsError> {
+            assert_test_lock9_free();
+            self.inner.mknod(name, inode_type, mode, rdev)
+        }
         fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
             assert_test_lock9_free();
             self.inner.unlink(name)
@@ -2152,6 +2198,16 @@ fn dotdot_unifies_through_inode_cache_and_crosses_stacked_mounts() {
         }
         fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
             let child = self.inner.mkdir(name, mode)?;
+            Ok(Arc::new(FreshDotDotInode { inner: child }))
+        }
+        fn mknod(
+            &self,
+            name: &[u8],
+            inode_type: InodeType,
+            mode: u16,
+            rdev: DevId,
+        ) -> Result<Arc<dyn VfsInode>, VfsError> {
+            let child = self.inner.mknod(name, inode_type, mode, rdev)?;
             Ok(Arc::new(FreshDotDotInode { inner: child }))
         }
         fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
@@ -3087,6 +3143,15 @@ fn lookup_component_does_not_resurrect_dentry_across_concurrent_rename_unlink_or
         fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
             self.inner.mkdir(name, mode)
         }
+        fn mknod(
+            &self,
+            name: &[u8],
+            inode_type: InodeType,
+            mode: u16,
+            rdev: DevId,
+        ) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.mknod(name, inode_type, mode, rdev)
+        }
         fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
             self.inner.unlink(name)
         }
@@ -3303,6 +3368,15 @@ fn open_creat_retries_on_concurrent_exist_race_across_winner_types() {
         }
         fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
             self.inner.mkdir(name, mode)
+        }
+        fn mknod(
+            &self,
+            name: &[u8],
+            inode_type: InodeType,
+            mode: u16,
+            rdev: DevId,
+        ) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.mknod(name, inode_type, mode, rdev)
         }
         fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
             self.inner.unlink(name)
@@ -4146,6 +4220,15 @@ impl VfsInode for ReusingHandle {
             hook();
         }
         res
+    }
+    fn mknod(
+        &self,
+        _name: &[u8],
+        _inode_type: InodeType,
+        _mode: u16,
+        _rdev: DevId,
+    ) -> Result<Arc<dyn VfsInode>, VfsError> {
+        Err(VfsError::Perm)
     }
     fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
         assert_test_lock9_free();
@@ -6688,6 +6771,15 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
         fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
             self.inner.mkdir(name, mode)
         }
+        fn mknod(
+            &self,
+            name: &[u8],
+            inode_type: InodeType,
+            mode: u16,
+            rdev: DevId,
+        ) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.mknod(name, inode_type, mode, rdev)
+        }
         fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
             self.inner.unlink(name)
         }
@@ -6790,6 +6882,15 @@ fn overflow_and_magic_link_race_retries_preserve_unification() {
         }
         fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
             self.inner.mkdir(name, mode)
+        }
+        fn mknod(
+            &self,
+            name: &[u8],
+            inode_type: InodeType,
+            mode: u16,
+            rdev: DevId,
+        ) -> Result<Arc<dyn VfsInode>, VfsError> {
+            self.inner.mknod(name, inode_type, mode, rdev)
         }
         fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
             self.inner.unlink(name)
@@ -7975,7 +8076,7 @@ fn setup_dynfs() -> (TestTables, Arc<uncached::DynFs>, Arc<dyn VfsInode>) {
 }
 
 /// `fixed_namespace_ops!`, which the fake procfs's inodes expand as the
-/// kernel's devfs and procfs do, refuses each of its seven operations with
+/// kernel's devfs and procfs do, refuses each of its eight operations with
 /// `-EROFS`, asked directly (the read-only mount refuses first by path);
 /// `mkdir` and `symlink` onto a name in use too (ARCHITECTURE section 9:
 /// `-EROFS` where Linux says `-EEXIST`).
@@ -7985,6 +8086,7 @@ fn fixed_namespace_ops_refuse_each_change_with_erofs() {
     let other: Arc<dyn VfsInode> = proc_root.clone();
     let rofs = Err(VfsError::RoFs);
     assert_eq!(proc_root.create(b"n", 0o644).map(|_| ()), rofs);
+    assert_eq!(proc_root.mknod(b"n", InodeType::Fifo, 0o600, DevId::default()).map(|_| ()), rofs);
     assert_eq!(proc_root.mkdir(b"n", 0o755).map(|_| ()), rofs);
     assert!(proc_root.lookup(b"version").is_ok());
     assert_eq!(proc_root.mkdir(b"version", 0o755).map(|_| ()), rofs);
@@ -8307,6 +8409,15 @@ impl VfsInode for GateInode {
         Ok(f)
     }
     fn mkdir(&self, _name: &[u8], _mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
+        Err(VfsError::Perm)
+    }
+    fn mknod(
+        &self,
+        _name: &[u8],
+        _inode_type: InodeType,
+        _mode: u16,
+        _rdev: DevId,
+    ) -> Result<Arc<dyn VfsInode>, VfsError> {
         Err(VfsError::Perm)
     }
     fn unlink(&self, name: &[u8]) -> Result<(), VfsError> {
@@ -9475,6 +9586,55 @@ fn getcwd_rechecks_a_directory_removed_while_its_parent_is_read() {
     }));
     assert_eq!(compute_cwd_path(env, &c).unwrap(), b"/x/c");
     drop(guard);
+}
+
+#[test]
+fn mknod_at_creates_fifo_and_regular_and_checks_errors() {
+    let fs = MemFs::new(DevId::ROOT, "memfs", false);
+    let tables = mounted_tables(Arc::clone(&fs) as Arc<dyn FileSystem>);
+    let env = tables.as_ref();
+
+    // Create a FIFO with umask applied.
+    let fifo = mknod_at(env, None, b"/jobserver", InodeType::Fifo, 0o666, 0o022, DevId::default()).unwrap();
+    assert_eq!(fifo.inode_type(), InodeType::Fifo);
+    assert_eq!(fifo.stat().unwrap().mode, 0o644);
+    // Duplicate name is EEXIST.
+    assert_eq!(
+        mknod_at(env, None, b"/jobserver", InodeType::Fifo, 0o666, 0, DevId::default()).unwrap_err(),
+        VfsError::Exist
+    );
+    // Trailing slash on existing name is EEXIST, on missing name is ENOENT.
+    assert_eq!(
+        mknod_at(env, None, b"/jobserver/", InodeType::Fifo, 0o666, 0, DevId::default()).unwrap_err(),
+        VfsError::Exist
+    );
+    assert_eq!(
+        mknod_at(env, None, b"/missing/", InodeType::Fifo, 0o666, 0, DevId::default()).unwrap_err(),
+        VfsError::NoEnt
+    );
+    // Root / dot / dotdot are EEXIST.
+    for p in [&b"/"[..], b".", b".."] {
+        assert_eq!(
+            mknod_at(env, Some(&fs.root_inode()), p, InodeType::Fifo, 0o666, 0, DevId::default()).unwrap_err(),
+            VfsError::Exist
+        );
+    }
+    // Regular file via mknod_at.
+    let reg = mknod_at(env, None, b"/reg", InodeType::File, 0o640, 0o027, DevId::default()).unwrap();
+    assert_eq!(reg.inode_type(), InodeType::File);
+    assert_eq!(reg.stat().unwrap().mode, 0o640 & !0o027);
+    // Unsupported special node type returns EPERM.
+    assert_eq!(
+        mknod_at(env, None, b"/chr", InodeType::CharDevice, 0o666, 0, DevId::makedev(1, 3)).unwrap_err(),
+        VfsError::Perm
+    );
+    // Read-only mount returns EROFS.
+    let ro = MemFs::new(DevId::ROOT, "ro", true);
+    let ro_tables = mounted_tables(Arc::clone(&ro) as Arc<dyn FileSystem>);
+    assert_eq!(
+        mknod_at(ro_tables.as_ref(), None, b"/f", InodeType::Fifo, 0o666, 0, DevId::default()).unwrap_err(),
+        VfsError::RoFs
+    );
 }
 
 mod hazards;

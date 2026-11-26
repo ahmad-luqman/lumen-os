@@ -26,7 +26,7 @@ use crate::linux::process::FileRef;
 use crate::linux::process::{self, ConsoleIo, KernelFile, with_current_console};
 use crate::linux::{errno, general, ioctl};
 use crate::user::{CopyError, copy_from_user, copy_to_user};
-use lumen_vfs::{DevId, InodeType, OpenFile, OpenFlags, SeekFrom, VfsError, VfsInode, VfsLock};
+use lumen_vfs::{DevId, InodeType, OpenFlags, SeekFrom, VfsError, VfsInode, VfsLock};
 
 /// Bytes moved per step between a file and user memory: the bounce buffer,
 /// on the stack (no heap, so a run's frame count is unchanged).
@@ -207,7 +207,7 @@ pub(super) fn sys_read(fd: Fd, buf: UserPtr, count: u64) -> u64 {
 /// waiting it is `-EAGAIN` instead of a wait.
 fn read_tty(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
     let io = current_io();
-    if count != 0 && file.status_flags() & OpenFlags::O_NONBLOCK != 0 && !process::stdin_ready(io) {
+    if count != 0 && file.is_nonblock() && !process::stdin_ready(io) {
         return Err(errno::EAGAIN);
     }
     read_into_user(io, user_buf, count).map(|n| n as u64)
@@ -217,6 +217,10 @@ fn read(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     let _pos = file.lock_pos();
     file.require_readable().map_err(vfs)?;
+    if let Some(pipe) = file.pipe() {
+        let nonblock = file.is_nonblock();
+        return pipe.read(buf.addr(), count, nonblock);
+    }
     if file.inode().is_tty() {
         return read_tty(&file, buf.addr(), count);
     }
@@ -231,6 +235,10 @@ fn write(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     let file = fd.file()?;
     let _pos = file.lock_pos();
     file.require_writable().map_err(vfs)?;
+    if let Some(pipe) = file.pipe() {
+        let nonblock = file.is_nonblock();
+        return pipe.write(buf.addr(), count, nonblock);
+    }
     if file.inode().is_tty() {
         return write_from_user(current_io(), buf.addr(), count).map(|n| n as u64);
     }
@@ -270,6 +278,15 @@ fn ioctl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
             // SAFETY: an `int`: every bit pattern is a valid `i32`.
             let on = unsafe { copy_pod_from_user::<i32>(arg) }.map_err(CopyError::to_errno)?;
             file.set_nonblock(on != 0).map_err(vfs)?;
+            Ok(0)
+        }
+        ioctl::FIONREAD => {
+            let Some(pipe) = file.pipe() else {
+                return Err(errno::ENOTTY);
+            };
+            let n = i32::try_from(pipe.fionread()).unwrap_or(i32::MAX);
+            // SAFETY: `i32` is 4 bytes with no padding.
+            unsafe { copy_pod_to_user(arg, &n) }.map_err(CopyError::to_errno)?;
             Ok(0)
         }
         _ if file.inode().is_tty() => tty_ioctl(cmd, arg),
@@ -319,6 +336,33 @@ fn readv(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let _pos = file.lock_pos();
     file.require_readable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
+    if let Some(pipe) = file.pipe() {
+        // copy_iovecs already checked that the sum fits isize::MAX.
+        let planned = iovs.iter().map(|span| span.len as usize).sum();
+        return pipe.read_with(planned, file.is_nonblock(), |mut offset, mut buf| {
+            let mut copied = 0;
+            for span in &iovs {
+                if offset >= span.len as usize {
+                    offset -= span.len as usize;
+                    continue;
+                }
+                let n = buf.len().min(span.len as usize - offset);
+                let Some(addr) = span.base.checked_add(offset as u64) else { return copied };
+                let moved = crate::user::copy_to_user_partial(addr, &buf[..n]);
+                copied += moved;
+                if moved < n {
+                    return copied;
+                }
+                buf = &buf[n..];
+                if buf.is_empty() {
+                    return copied;
+                }
+                offset = 0;
+            }
+            debug_assert!(false, "pipe read requested bytes beyond the checked iovec total");
+            copied
+        });
+    }
     if file.inode().is_tty() {
         // Standard tty short-read semantics: return as soon as the first
         // non-empty span receives data (or EOF/error) so musl
@@ -363,6 +407,29 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let _pos = file.lock_pos();
     file.require_writable().map_err(vfs)?;
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
+    if let Some(pipe) = file.pipe() {
+        let nonblock = file.is_nonblock();
+        // copy_iovecs already checked that the sum fits isize::MAX.
+        let planned = iovs.iter().map(|span| span.len as usize).sum();
+        return pipe.write_with(planned, nonblock, |mut offset, mut buf| {
+            for span in &iovs {
+                if offset >= span.len as usize {
+                    offset -= span.len as usize;
+                    continue;
+                }
+                let n = buf.len().min(span.len as usize - offset);
+                let addr = span.base.checked_add(offset as u64).ok_or(errno::EFAULT)?;
+                copy_from_user(&mut buf[..n], addr).map_err(|_| errno::EFAULT)?;
+                buf = &mut buf[n..];
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                offset = 0;
+            }
+            debug_assert!(false, "pipe write requested bytes beyond the checked iovec total");
+            Err(errno::EFAULT)
+        });
+    }
     let tty = file.inode().is_tty().then(current_io);
     let mut total = 0usize;
     for span in iovs {
@@ -411,7 +478,7 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     // without truncating).
     let truncating = flags.has_trunc() && !flags.is_path();
     let opened = start.open(&path, flags, mode)?;
-    let mut file = OpenFile::from_opened(opened).map_err(vfs)?;
+    let mut file = KernelFile::from_opened(opened).map_err(vfs)?;
     if truncating && file.inode().inode_type() == InodeType::File {
         // The open truncated it to 0 (exactly when `open_inode_guarded`
         // does): unmap every address space's pages, as `truncate` does.
@@ -419,6 +486,10 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
     }
     if let Some(full) = start.display_path(&file.path) {
         file.path = full;
+    }
+    if !flags.is_path() && file.inode().inode_type() == InodeType::Fifo {
+        let end = crate::linux::pipe::open_fifo(file.inode(), file.access_mode(), flags.has_nonblock())?;
+        file.attach_pipe_end(end);
     }
     #[cfg(feature = "ktest")]
     process::open_install_window();
@@ -468,6 +539,7 @@ fn lseek(fd: Fd, delta: i64, whence: u32) -> Result<u64, u32> {
         // at 0, whatever is asked (Linux's `null_lseek`; their offset is
         // never read).
         InodeType::CharDevice => Ok(0),
+        InodeType::Fifo | InodeType::Socket => Err(errno::ESPIPE),
         _ => {
             let mut off = file.offset.lock();
             let new = seek_target(whence, delta, *off, || file.inode().stat().map(|m| m.size).map_err(vfs))?;
@@ -768,7 +840,7 @@ fn current_file_flags(fd: Fd) -> Option<u32> {
 
 #[cfg(feature = "ktest")]
 fn current_file(fd: Fd) -> Option<FileRef> {
-    fd.file().ok()
+    process::current_file(fd.raw())
 }
 
 /// Write `spans` as a `struct iovec` array at `at` in user memory (ktests).
@@ -1192,5 +1264,351 @@ crate::ktest!(
             kassert!(ktest_unlink(b"/tmp/fd-ktest-reg").is_ok());
             Ok(())
         })?
+    }
+);
+
+#[cfg(feature = "ktest")]
+use super::poll::ktest_pollable::wait_for;
+#[cfg(feature = "ktest")]
+use alloc::sync::Arc;
+
+#[cfg(feature = "ktest")]
+fn ktest_pipe() -> Result<(Fd, Fd, Arc<crate::linux::pipe::PipeObject>), &'static str> {
+    let pair_va = process::KTEST_USER_VA + 512;
+    crate::kassert_eq!(super::pipe::sys_pipe(at::reg(pair_va)), 0);
+    // SAFETY: `[i32; 2]` has no padding and all bit patterns are valid.
+    let pair = unsafe { copy_pod_from_user::<[i32; 2]>(pair_va) }.map_err(|_| "pipe fds")?;
+    let pipe = process::current_file(pair[0]).and_then(|f| f.pipe().cloned()).ok_or("pipe")?;
+    Ok((at::reg(pair[0] as u64), at::reg(pair[1] as u64), pipe))
+}
+
+crate::ktest!(
+    fn pipe_readv_keeps_spans_in_one_read() {
+        use crate::kassert_eq;
+        process::in_test_process(|_| {
+            let (r, w, pipe) = ktest_pipe()?;
+            let base = process::KTEST_USER_VA;
+            let data = base + 1024;
+            let iov = base + 2048;
+            let out = base + 3072;
+            copy_to_user(data, b"ABCD").map_err(|_| "copy data")?;
+            kassert_eq!(sys_write(w, at::reg(data), 4), 4);
+            let spans = ktest_iovs(iov, &[(out, 1), (0, 0), (out + 16, 1)])?;
+            let before = pipe.read_lock_acquisitions();
+            kassert_eq!(sys_readv(r, spans, 3), 2);
+            // Structural seam: splitting the spans into separate pipe reads
+            // reacquires Lock 0 and permits another reader between A and B.
+            // This assertion fails deterministically even without that race.
+            kassert_eq!(pipe.read_lock_acquisitions() - before, 1);
+            let mut got = [0; 2];
+            copy_from_user(&mut got[..1], out).map_err(|_| "first span")?;
+            copy_from_user(&mut got[1..], out + 16).map_err(|_| "second span")?;
+            kassert_eq!(&got, b"AB");
+            kassert_eq!(pipe.fionread(), 2);
+            kassert_eq!(sys_read(r, at::reg(out), 2), 2);
+            copy_from_user(&mut got, out).map_err(|_| "remaining bytes")?;
+            kassert_eq!(&got, b"CD");
+
+            // Empty nonblocking and EOF, and a short read with a writer still
+            // open: filling one span must not wait for the next span's bytes.
+            kassert_eq!(
+                super::lock::sys_fcntl(r, lumen_vfs::locks::fcntl_const::F_SETFL as u32, OpenFlags::O_NONBLOCK as u64),
+                0
+            );
+            kassert_eq!(sys_readv(r, spans, 3), super::neg_errno(errno::EAGAIN));
+            kassert_eq!(sys_readv(r, ktest_iovs(iov, &[(0, 0)])?, 1), 0);
+            kassert_eq!(super::lock::sys_fcntl(r, lumen_vfs::locks::fcntl_const::F_SETFL as u32, 0), 0);
+            let spans = ktest_iovs(iov, &[(out, 1), (out + 16, 1)])?;
+            let reader = process::spawn_test_thread(move |_| sys_readv(r, spans, 2))?;
+            wait_for(|| pipe.waiting_readers() == 1 && reader.blocked())?;
+            kassert_eq!(sys_write(w, at::reg(data), 1), 1);
+            kassert_eq!(reader.join()?, 1);
+            kassert_eq!(sys_close(w), 0);
+            kassert_eq!(sys_readv(r, spans, 2), 0);
+            kassert_eq!(sys_close(r), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn pipe_readv_fault_commits_only_the_copied_prefix() {
+        use crate::kassert_eq;
+        process::in_test_process(|_| {
+            let (r, w, pipe) = ktest_pipe()?;
+            let base = process::KTEST_USER_VA;
+            let data = base + 1024;
+            let iov = base + 2048;
+            let out = base + 3072;
+            let edge = base + process::KTEST_USER_LEN - 1;
+            for spans in [
+                [(0, 1), (out, 2)],    // first byte faults: consume nothing
+                [(out, 1), (0, 2)],    // fault at the next span
+                [(out, 1), (edge, 2)], // fault inside a span, across a page
+            ] {
+                copy_to_user(data, b"ABCD").map_err(|_| "copy data")?;
+                kassert_eq!(sys_write(w, at::reg(data), 4), 4);
+                let copied = if spans[0].0 == 0 {
+                    0
+                } else if spans[1].0 == 0 {
+                    1
+                } else {
+                    2
+                };
+                let expected = if copied == 0 { super::neg_errno(errno::EFAULT) } else { copied };
+                kassert_eq!(sys_readv(r, ktest_iovs(iov, &spans)?, 2), expected);
+                kassert_eq!(pipe.fionread(), 4 - copied as usize);
+                let mut got = [0; 4];
+                if copied > 0 {
+                    copy_from_user(&mut got[..1], out).map_err(|_| "first copied byte")?;
+                    kassert_eq!(got[0], b'A');
+                }
+                if copied == 2 {
+                    copy_from_user(&mut got[..1], edge).map_err(|_| "last mapped byte")?;
+                    kassert_eq!(got[0], b'B');
+                }
+                kassert_eq!(sys_read(r, at::reg(out), 4), 4 - copied);
+                copy_from_user(&mut got[..4 - copied as usize], out).map_err(|_| "remaining data")?;
+                kassert_eq!(&got[..4 - copied as usize], &b"ABCD"[copied as usize..]);
+            }
+            kassert_eq!(sys_close(r), 0);
+            kassert_eq!(sys_close(w), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn pipe_end_outlives_its_close_while_a_write_is_in_flight() {
+        use crate::{kassert, kassert_eq};
+        use alloc::sync::Arc;
+
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            let base = process::KTEST_USER_VA;
+            let pair_va = base + 512;
+            let fill_va = base + 4096;
+            let payload_va = base + 2 * 4096;
+            let drain_va = base + 3 * 4096;
+
+            kassert_eq!(super::pipe::sys_pipe(at::reg(pair_va)), 0);
+            // SAFETY: `[i32; 2]` is 8 bytes with no padding.
+            let pair = unsafe { copy_pod_from_user::<[i32; 2]>(pair_va) }.map_err(|_| "read pipe pair")?;
+            let (r_fd, w_fd): (Fd, Fd) = (at::reg(pair[0] as u64), at::reg(pair[1] as u64));
+
+            // Shrink to one page (4096 bytes) and fill completely so the next write blocks.
+            kassert_eq!(super::lock::sys_fcntl(w_fd, general::F_SETPIPE_SZ, 4096), 4096);
+            let filler = alloc::vec![0xAAu8; 4096];
+            copy_to_user(fill_va, &filler).map_err(|_| "copy filler")?;
+            kassert_eq!(sys_write(w_fd, at::reg(fill_va), 4096), 4096);
+
+            let w_file = current_file(w_fd).ok_or("write end file")?;
+            let pipe = Arc::clone(w_file.pipe().ok_or("pipe object")?);
+
+            const PAYLOAD: &[u8] = b"in-flight-write-payload";
+            copy_to_user(payload_va, PAYLOAD).map_err(|_| "copy payload")?;
+            let writer =
+                process::spawn_test_thread(move |_| sys_write(w_fd, at::reg(payload_va), PAYLOAD.len() as u64))?;
+
+            // Confirm the writer is blocked in the pipe write wait with an active io_ref.
+            wait_for(|| pipe.waiting_writers() == 1 && writer.blocked())?;
+            kassert!(w_file.io_refs() >= 1);
+
+            // Close the last write descriptor while the write is blocked in flight.
+            kassert_eq!(sys_close(w_fd), 0);
+            kassert_eq!(w_file.fd_ref_count(), 0);
+            kassert!(w_file.io_refs() >= 1);
+            let poll_va = base + 544;
+            super::poll::ktest_pollable::write_pollfds(poll_va, &[(r_fd.raw(), lumen_vfs::PollMask::IN.bits())])?;
+            kassert_eq!(super::poll::sys_poll(poll_va, 1, 0), 1);
+            kassert_eq!(super::poll::ktest_pollable::read_revents(poll_va, 1)?[0], lumen_vfs::PollMask::IN.bits());
+
+            // Drain the filler: wakes the blocked writer, whose end stayed open.
+            kassert_eq!(sys_read(r_fd, at::reg(drain_va), 4096), 4096);
+            kassert_eq!(writer.join()?, PAYLOAD.len() as u64);
+
+            // The reader receives every byte the in-flight writer wrote, and
+            // observes EOF only after that write completes.
+            kassert_eq!(sys_read(r_fd, at::reg(drain_va), 64), PAYLOAD.len() as u64);
+            let mut got = [0u8; PAYLOAD.len()];
+            copy_from_user(&mut got, drain_va).map_err(|_| "copy out payload")?;
+            kassert_eq!(&got, PAYLOAD);
+
+            kassert_eq!(sys_read(r_fd, at::reg(drain_va), 64), 0);
+            kassert_eq!(w_file.io_refs(), 0);
+            kassert_eq!(sys_close(r_fd), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn fifo_reopen_during_a_blocked_read_reaches_that_reader() {
+        use crate::{kassert, kassert_eq};
+        use alloc::sync::Arc;
+
+        const FIFO_PATH: &[u8] = b"/tmp/ktest-fifo-reopen";
+        let _ = ktest_unlink(FIFO_PATH);
+
+        let res = process::in_test_process(|_| -> crate::ktest::TestResult {
+            let base = process::KTEST_USER_VA;
+            let read_va = base + 4096;
+            let write_va = base + 2 * 4096;
+
+            let path_ptr = ktest_user_path(0, FIFO_PATH)?;
+            kassert_eq!(
+                super::pipe::sys_mknodat(Dirfd::Cwd, path_ptr, at::reg(u64::from(general::S_IFIFO | 0o666)), 0,),
+                0
+            );
+
+            let rw_fd = ktest_open(1, FIFO_PATH, OpenFlags::O_RDWR)?;
+            let rw_file = current_file(rw_fd).ok_or("fifo O_RDWR file")?;
+            let pipe = Arc::clone(rw_file.pipe().ok_or("fifo pipe object")?);
+            let inode = Arc::clone(rw_file.inode());
+
+            let reader = process::spawn_test_thread(move |_| sys_read(rw_fd, at::reg(read_va), 64))?;
+
+            // Confirm the reader is blocked on the empty FIFO before closing.
+            wait_for(|| pipe.waiting_readers() == 1 && reader.blocked())?;
+            kassert!(rw_file.io_refs() >= 1);
+
+            // Close the last open descriptor on the FIFO while the read is blocked.
+            kassert_eq!(sys_close(rw_fd), 0);
+            kassert_eq!(rw_file.fd_ref_count(), 0);
+            kassert_eq!(pipe.waiting_readers(), 1);
+
+            // Reopen the same FIFO O_WRONLY: must join the same PipeObject
+            // without blocking (the blocked reader kept the slot attached).
+            let w_fd = ktest_open(2, FIFO_PATH, OpenFlags::O_WRONLY)?;
+            let w_file = current_file(w_fd).ok_or("fifo O_WRONLY file")?;
+            kassert!(Arc::ptr_eq(w_file.pipe().ok_or("reopened fifo pipe")?, &pipe));
+
+            const MSG: &[u8] = b"reopened-fifo";
+            copy_to_user(write_va, MSG).map_err(|_| "copy fifo msg")?;
+            kassert_eq!(sys_write(w_fd, at::reg(write_va), MSG.len() as u64), MSG.len() as u64);
+
+            // The blocked reader wakes and receives the bytes written by the reopen.
+            kassert_eq!(reader.join()?, MSG.len() as u64);
+            let mut got = [0u8; MSG.len()];
+            copy_from_user(&mut got, read_va).map_err(|_| "copy read msg")?;
+            kassert_eq!(&got, MSG);
+
+            kassert_eq!(rw_file.io_refs(), 0);
+            kassert_eq!(sys_close(w_fd), 0);
+            // With all opens and in-flight I/Os finished, the FIFO slot detaches.
+            let slot = crate::linux::pipe::fifo_slot_of(&*inode).ok_or("fifo slot")?;
+            kassert!(slot.pipe().is_none());
+            Ok(())
+        });
+
+        let _ = ktest_unlink(FIFO_PATH);
+        res?
+    }
+);
+
+crate::ktest!(
+    fn pipe_atomic_writer_waits_for_the_entire_record() {
+        use crate::{kassert, kassert_eq};
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            let (r, w, pipe) = ktest_pipe()?;
+            let buf = process::KTEST_USER_VA + 4096;
+            copy_to_user(buf, &[0x6a; 4000]).map_err(|_| "payload")?;
+            kassert_eq!(pipe.set_capacity(4096), Ok(4096));
+            kassert_eq!(sys_write(w, at::reg(buf), 100), 100);
+            let writer = process::spawn_test_thread(move |_| sys_write(w, at::reg(buf), 4000))?;
+            wait_for(|| pipe.waiting_writers() == 1 && writer.blocked())?;
+            kassert_eq!(pipe.fionread(), 100);
+            kassert_eq!(sys_read(r, at::reg(buf + 4096), 100), 100);
+            kassert_eq!(writer.join()?, 4000);
+            kassert_eq!(pipe.fionread(), 4000);
+            kassert_eq!(sys_read(r, at::reg(buf + 4096), 4000), 4000);
+            let mut got = [0; 4000];
+            copy_from_user(&mut got, buf + 4096).map_err(|_| "read payload")?;
+            kassert!(got.iter().all(|&b| b == 0x6a));
+            kassert_eq!(sys_close(r), 0);
+            kassert_eq!(sys_close(w), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn pipe_blocked_writer_gets_epipe_when_reader_closes() {
+        use crate::kassert_eq;
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            let (r, w, pipe) = ktest_pipe()?;
+            let buf = process::KTEST_USER_VA + 4096;
+            copy_to_user(buf, &[0x31; 4096]).map_err(|_| "payload")?;
+            kassert_eq!(pipe.set_capacity(4096), Ok(4096));
+            kassert_eq!(sys_write(w, at::reg(buf), 4096), 4096);
+            let mask_at = buf + 4096;
+            copy_to_user(mask_at, &lumen_signal::Signal::PIPE.bit().to_le_bytes()).map_err(|_| "signal mask")?;
+            let writer = process::spawn_test_thread(move |_| -> Result<_, &'static str> {
+                kassert_eq!(super::signal::sys_rt_sigprocmask(u64::from(general::SIG_BLOCK), mask_at, 0, 8), 0);
+                Ok((sys_write(w, at::reg(buf), 1), process::current_pending()))
+            })?;
+            wait_for(|| pipe.waiting_writers() == 1 && writer.blocked())?;
+            kassert_eq!(sys_close(r), 0);
+            let (written, pending) = writer.join()??;
+            kassert_eq!(written, super::neg_errno(errno::EPIPE));
+            kassert_eq!(pending.0 & lumen_signal::Signal::PIPE.bit(), lumen_signal::Signal::PIPE.bit());
+            kassert_eq!(sys_close(w), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn fifo_blocking_opens_wait_for_peers_and_interrupt_detaches() {
+        use crate::linux::pipe::{fifo_slot_of, open_fifo};
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::AccessMode;
+        const PATH: &[u8] = b"/tmp/ktest-fifo-handshake";
+        let _ = ktest_unlink(PATH);
+        let result = process::in_test_process(|_| -> crate::ktest::TestResult {
+            let path = ktest_user_path(0, PATH)?;
+            kassert_eq!(super::pipe::sys_mknodat(Dirfd::Cwd, path, at::reg(u64::from(general::S_IFIFO | 0o600)), 0), 0);
+            let pathfd = ktest_open(1, PATH, OpenFlags::O_PATH)?;
+            let inode = Arc::clone(current_file(pathfd).ok_or("fifo")?.inode());
+            kassert_eq!(sys_close(pathfd), 0);
+            let slot = fifo_slot_of(&*inode).ok_or("slot")?;
+            for (mode, peer) in
+                [(AccessMode::ReadOnly, AccessMode::WriteOnly), (AccessMode::WriteOnly, AccessMode::ReadOnly)]
+            {
+                let child_inode = Arc::clone(&inode);
+                let opener = process::spawn_test_thread(move |_| open_fifo(&child_inode, mode, false))?;
+                wait_for(|| opener.blocked() && slot.pipe().is_some())?;
+                let end = open_fifo(&inode, peer, false).map_err(|_| "peer open")?;
+                let opened = opener.join()?.map_err(|_| "blocked open")?;
+                opened.release();
+                end.release();
+                kassert!(slot.pipe().is_none());
+            }
+            for mode in [AccessMode::ReadOnly, AccessMode::WriteOnly] {
+                // Keep a same-side description alive so a leaked end count
+                // cannot disappear when the interrupted open detaches its slot.
+                let bootstrap = open_fifo(&inode, AccessMode::ReadWrite, false).map_err(|_| "bootstrap")?;
+                let keeper = open_fifo(&inode, mode, true).map_err(|_| "keeper")?;
+                bootstrap.release();
+                let pipe = slot.pipe().ok_or("kept pipe")?;
+                let counts = if mode == AccessMode::ReadOnly { (1, 0) } else { (0, 1) };
+                kassert_eq!(pipe.end_counts(), counts);
+                let child_inode = Arc::clone(&inode);
+                let opener = process::spawn_test_thread(move |_| {
+                    let result = open_fifo(&child_inode, mode, false);
+                    crate::sched::clear_current_sigpending();
+                    result
+                })?;
+                wait_for(|| opener.blocked() && slot.pipe().is_some())?;
+                crate::linux::signal::raise_for_test(opener.thread(), lumen_signal::Signal::USR1);
+                kassert_eq!(opener.join()?.err(), Some(crate::linux::signal::ERESTARTSYS));
+                kassert_eq!(pipe.end_counts(), counts);
+                kassert!(Arc::ptr_eq(&slot.pipe().ok_or("keeper detached")?, &pipe));
+                keeper.release();
+                kassert!(slot.pipe().is_none());
+            }
+            Ok(())
+        });
+        let _ = ktest_unlink(PATH);
+        result?
     }
 );
