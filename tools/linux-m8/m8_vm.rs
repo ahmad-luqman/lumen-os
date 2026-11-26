@@ -294,9 +294,11 @@ extern "C" fn probe_reader(arg: *mut c_void) -> *mut c_void {
             }
         }
     } else {
-        let va = s.base + w.slot;
-        if try_store_u32(va, SENTINEL ^ w.cpu).is_err() {
-            s.bad_before.fetch_add(1, Ordering::AcqRel);
+        for p in 0..s.pages {
+            let va = s.base + p * PAGE_SIZE + w.slot;
+            if try_store_u32(va, SENTINEL ^ (p as u32) ^ w.cpu).is_err() {
+                s.bad_before.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
     s.primed.fetch_add(1, Ordering::AcqRel);
@@ -312,11 +314,11 @@ extern "C" fn probe_reader(arg: *mut c_void) -> *mut c_void {
             {
                 s.bad_before.fetch_add(1, Ordering::AcqRel);
             }
-            page_idx = (page_idx + 1) % s.pages;
         } else {
-            let va = s.base + w.slot;
-            let _ = try_store_u32(va, SENTINEL ^ w.cpu);
+            let va = s.base + page_idx * PAGE_SIZE + w.slot;
+            let _ = try_store_u32(va, SENTINEL ^ (page_idx as u32) ^ w.cpu);
         }
+        page_idx = (page_idx + 1) % s.pages;
         core::hint::spin_loop();
     }
     if s.abort.load(Ordering::Acquire) != 0 {
@@ -326,11 +328,11 @@ extern "C" fn probe_reader(arg: *mut c_void) -> *mut c_void {
     // After shootdown returns: every single probe on every page must fault with `expected_code`.
     let count = POST_PROBES.max(2 * s.pages);
     for i in 0..count {
+        let p = i % s.pages;
         let res = if s.mode == 0 {
-            let p = i % s.pages;
             try_load_u32(s.base + p * PAGE_SIZE).map(|_| ())
         } else {
-            try_store_u32(s.base + w.slot, 0xbad0_0000 | w.cpu)
+            try_store_u32(s.base + p * PAGE_SIZE + w.slot, 0xbad0_0000 | w.cpu)
         };
         match res {
             Ok(()) => {
@@ -345,9 +347,11 @@ extern "C" fn probe_reader(arg: *mut c_void) -> *mut c_void {
         }
     }
     if s.mode == 1 {
-        // Under PROT_READ, reading the slot must still succeed and match the pre-protect value.
-        if try_load_u32(s.base + w.slot) != Ok(SENTINEL ^ w.cpu) {
-            s.bad_before.fetch_add(1, Ordering::AcqRel);
+        // Under PROT_READ, reading every slot must still succeed and match the pre-protect value.
+        for p in 0..s.pages {
+            if try_load_u32(s.base + p * PAGE_SIZE + w.slot) != Ok(SENTINEL ^ (p as u32) ^ w.cpu) {
+                s.bad_before.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
     core::ptr::null_mut()
@@ -408,7 +412,13 @@ fn run_probe_round(
                 )?;
             }
         } else {
-            ensure("cpu0 prime store", try_store_u32(base, SENTINEL ^ cpus[0]).is_ok(), 0)?;
+            for p in 0..pages {
+                ensure(
+                    "cpu0 prime store",
+                    try_store_u32(base + p * PAGE_SIZE, SENTINEL ^ (p as u32) ^ cpus[0]).is_ok(),
+                    p as i64,
+                )?;
+            }
         }
         Ok(())
     })();
@@ -474,22 +484,28 @@ fn mprotect_shootdown() -> R {
     let (orig_mask, cpus, count) = discover_online_cpus()?;
     let cpus = &cpus[..count];
     let res = (|| {
-        let map = Mapping::new(PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS)?;
-        // SAFETY: freshly mapped writable private page.
-        unsafe { (map.addr as *mut u32).write_volatile(SENTINEL) };
+        for pages in [1u64, BULK_PAGES] {
+            let len = pages * PAGE_SIZE;
+            let map = Mapping::new(len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS)?;
+            for p in 0..pages {
+                // SAFETY: freshly mapped writable private page.
+                unsafe { ((map.addr + p * PAGE_SIZE) as *mut u32).write_volatile(SENTINEL ^ (p as u32)) };
+            }
 
-        // 1. RW -> PROT_NONE: every CPU's load must fault with SEGV_ACCERR.
-        run_probe_round(cpus, map.addr, 1, 0, SEGV_ACCERR, || {
-            eq("mprotect PROT_NONE", sys(SYS_MPROTECT, [map.addr, PAGE_SIZE, PROT_NONE, 0, 0, 0]), 0)
-        })?;
+            // 1. RW -> PROT_NONE: every CPU's load across every page must fault with SEGV_ACCERR.
+            run_probe_round(cpus, map.addr, pages, 0, SEGV_ACCERR, || {
+                eq("mprotect PROT_NONE", sys(SYS_MPROTECT, [map.addr, len, PROT_NONE, 0, 0, 0]), 0)
+            })?;
 
-        // 2. Restore RW, prime writable TLBs on every CPU, then narrow RW -> PROT_READ:
-        // every CPU's store must fault with SEGV_ACCERR while reads stay intact.
-        eq("mprotect RW", sys(SYS_MPROTECT, [map.addr, PAGE_SIZE, PROT_READ | PROT_WRITE, 0, 0, 0]), 0)?;
-        run_probe_round(cpus, map.addr, 1, 1, SEGV_ACCERR, || {
-            eq("mprotect PROT_READ", sys(SYS_MPROTECT, [map.addr, PAGE_SIZE, PROT_READ, 0, 0, 0]), 0)
-        })?;
-        map.unmap()
+            // 2. Restore RW, prime writable TLBs on every CPU, then narrow RW -> PROT_READ:
+            // every CPU's store across every page must fault with SEGV_ACCERR while reads stay intact.
+            eq("mprotect RW", sys(SYS_MPROTECT, [map.addr, len, PROT_READ | PROT_WRITE, 0, 0, 0]), 0)?;
+            run_probe_round(cpus, map.addr, pages, 1, SEGV_ACCERR, || {
+                eq("mprotect PROT_READ", sys(SYS_MPROTECT, [map.addr, len, PROT_READ, 0, 0, 0]), 0)
+            })?;
+            map.unmap()?;
+        }
+        Ok(())
     })();
     set_affinity_mask(orig_mask)?;
     res

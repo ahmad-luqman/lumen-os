@@ -109,14 +109,22 @@ pub mod invalidate_watch {
     static HITS: AtomicU32 = AtomicU32::new(0);
 
     /// RAII guard recording [`super::invalidate`] calls on `va` while `root` is active.
-    pub struct Watch;
+    #[must_use]
+    pub struct Watch {
+        _private: (),
+    }
 
     impl Watch {
         pub fn new(root: PhysFrame, va: u64) -> Self {
+            assert!(va != 0, "invalidate_watch requires a nonzero virtual address");
+            assert!(
+                WATCH_VA.compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire).is_ok(),
+                "overlapping invalidate_watch::Watch"
+            );
             HITS.store(0, Ordering::Relaxed);
             WATCH_ROOT.store(root.as_u64(), Ordering::Relaxed);
             WATCH_VA.store(va, Ordering::Release);
-            Self
+            Self { _private: () }
         }
 
         pub fn hits(&self) -> u32 {

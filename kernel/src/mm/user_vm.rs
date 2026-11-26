@@ -4283,14 +4283,23 @@ mod cow_split_seam {
     static ARRIVED: AtomicU32 = AtomicU32::new(0);
     static RELEASED: AtomicBool = AtomicBool::new(false);
 
-    pub(super) struct Arm;
+    #[must_use]
+    pub(super) struct Arm {
+        _private: (),
+    }
 
     impl Arm {
         pub(super) fn new(target: PhysFrame) -> Self {
+            let phys = target.start().as_u64();
+            assert!(phys != 0, "cow_split_seam requires a nonzero physical frame");
+            assert!(
+                TARGET_PHYS.compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire).is_ok(),
+                "overlapping cow_split_seam::Arm"
+            );
             ARRIVED.store(0, Ordering::Relaxed);
             RELEASED.store(false, Ordering::Relaxed);
-            TARGET_PHYS.store(target.start().as_u64(), Ordering::Release);
-            Self
+            TARGET_PHYS.store(phys, Ordering::Release);
+            Self { _private: () }
         }
 
         pub(super) fn arrived(&self) -> u32 {
@@ -4481,8 +4490,11 @@ crate::ktest!(
             kassert_eq!(read_u32_nofault(VA2), Ok(NEXT_WORD));
         }
         // Negative control: when `parent` is not loaded in CR3, count-1 reuse does not invlpg.
+        // Watch the root actually loaded in CR3 so an unconditional `invlpg` is counted.
         {
-            let watch = arch::paging::invalidate_watch::Watch::new(parent.root(), VA3);
+            let active_root = arch::paging::active_root();
+            kassert!(active_root != parent.root());
+            let watch = arch::paging::invalidate_watch::Watch::new(active_root, VA3);
             kassert_eq!(parent.handle_page_fault(VA3, 0x7), FaultResult::Resolved);
             kassert_eq!(watch.hits(), 0);
         }
