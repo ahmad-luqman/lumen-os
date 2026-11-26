@@ -2,3 +2,13 @@
 name = "termios line discipline (logic)"
 milestone = "M8"
 tests = ["cargo:lumen-tty"]
+
+[[feature]]
+name = "PTYs, controlling terminals and job control"
+milestone = "M8"
+tests = ["cargo:lumen-tty", "scenario:test_linux_io::test_pty_termios_and_job_control"]
+
+[[feature]]
+name = "Controlling-terminal detach preserves a concurrent acquisition; expired PID reservations are reclaimed"
+milestone = "M8"
+tests = ["cargo:lumen-proc", "ktest:lumen_kernel::tty::pty_detach_preserves_a_new_controlling_terminal"]

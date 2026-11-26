@@ -10,6 +10,7 @@
 //! this file's code).
 
 pub mod devfs;
+pub mod devpts;
 pub mod ext4;
 pub mod page_cache;
 pub mod procfs;
@@ -299,6 +300,10 @@ pub fn init() {
         }
     }
 
+    match resolve_path_from_root("/dev/pts").and_then(|mp| TABLES.mount(mp, "/dev/pts", devpts::Devpts::new())) {
+        Ok(()) => mounted.push_str(" /dev/pts"),
+        Err(e) => warn!(target: "vfs", "can't mount /dev/pts: {e:?}"),
+    }
     let others = if mounted.is_empty() { String::new() } else { format!(" +{mounted}") };
     info!(target: "vfs", "mounted / ({}, {}){others}", root_fs.name(), if root_ro { "ro" } else { "rw" });
 }

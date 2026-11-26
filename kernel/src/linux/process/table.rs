@@ -24,6 +24,12 @@ pub(super) struct WaitResult {
 }
 
 impl ProcTable {
+    pub(super) fn with_tty_processes<R>(
+        &mut self,
+        f: impl FnOnce(&mut ProcTree, &BTreeMap<u32, Arc<Process>>) -> R,
+    ) -> R {
+        f(&mut self.tree, &self.procs)
+    }
     pub(super) const fn new(max_pid: u32) -> Self {
         Self { tree: ProcTree::new(max_pid), procs: BTreeMap::new(), threads: BTreeMap::new() }
     }
@@ -358,16 +364,24 @@ impl ProcTable {
         for action in outcome {
             match action {
                 ExitAction::Released { child, .. } => {
-                    gone.push(procs.remove(&child).expect("released process"));
+                    gone.push(self.procs.remove(&child).expect("released process"));
                 }
                 ExitAction::Notify { parent, child, status, released } => {
-                    Self::notify_child(procs.get(&parent).expect("live parent"), child, status.into());
+                    Self::notify_child(self.procs.get(&parent).expect("live parent"), child, status.into());
                     if released.is_some() {
-                        gone.push(procs.remove(&child).expect("released zombie"));
+                        gone.push(self.procs.remove(&child).expect("released zombie"));
                     }
                 }
-                // Nothing to signal before M8's signal delivery.
-                ExitAction::HangupThenContinue { .. } => {}
+                ExitAction::HangupThenContinue { pgid } => {
+                    for signal in [Signal::HUP, Signal::CONT] {
+                        let _ = self.send_process(
+                            INIT_PID,
+                            -(pgid as i32),
+                            Ok(Some(SigInfo::new(signal, general::SI_KERNEL as i32))),
+                            SenderClass::SiUser,
+                        );
+                    }
+                }
             }
         }
         Ok(gone)

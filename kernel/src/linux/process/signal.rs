@@ -52,6 +52,7 @@ pub struct SignalState {
     group_exit: Option<GroupEnd>,
     pub(super) exec_waiter: Option<u32>,
     pub(super) rlimit_stack: lumen_vm::StackLimit,
+    pub(super) ctty: Option<Arc<crate::tty::Tty>>,
     group_stop: Option<GroupStop>,
     stop_generation: u64,
 }
@@ -156,6 +157,7 @@ impl SignalState {
             group_exit: None,
             exec_waiter: None,
             rlimit_stack: lumen_vm::StackLimit::DEFAULT,
+            ctty: None,
             group_stop: None,
             stop_generation: 0,
         }
@@ -184,7 +186,7 @@ impl SignalState {
         Some(core::mem::replace(&mut self.actions[signal.index()], action))
     }
     pub(super) fn fork_copy(&self) -> Self {
-        Self { actions: self.actions, rlimit_stack: self.rlimit_stack, ..Self::new() }
+        Self { actions: self.actions, rlimit_stack: self.rlimit_stack, ctty: self.ctty.clone(), ..Self::new() }
     }
     pub(super) fn fatal_signal(&self) -> Option<Signal> {
         match self.group_exit {

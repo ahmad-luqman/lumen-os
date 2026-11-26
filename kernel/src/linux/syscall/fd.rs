@@ -202,10 +202,13 @@ pub(super) fn sys_read(fd: Fd, buf: UserPtr, count: u64) -> u64 {
     finish(read(fd, buf, count))
 }
 
-/// A terminal's read: M6's console read (blocking for the first byte, then
-/// what is queued), except that with `O_NONBLOCK` (`FIONBIO`) and no input
-/// waiting it is `-EAGAIN` instead of a wait.
+/// PTY reads use their line discipline's canonical lines and VMIN/VTIME rules.
+/// The console fallback blocks for its first byte, then reads what is queued;
+/// with `O_NONBLOCK` (`FIONBIO`), empty console input returns `-EAGAIN`.
 fn read_tty(file: &KernelFile, user_buf: u64, count: u64) -> Result<u64, u32> {
+    if let Some(tty) = file.tty() {
+        return tty.read(user_buf, count, file.is_nonblock());
+    }
     let io = current_io();
     if count != 0 && file.is_nonblock() && !process::stdin_ready(io) {
         return Err(errno::EAGAIN);
@@ -238,6 +241,9 @@ fn write(fd: Fd, buf: UserPtr, count: u64) -> Result<u64, u32> {
     if let Some(pipe) = file.pipe() {
         let nonblock = file.is_nonblock();
         return pipe.write(buf.addr(), count, nonblock);
+    }
+    if let Some(tty) = file.tty() {
+        return tty.write(buf.addr(), count, file.is_nonblock());
     }
     if file.inode().is_tty() {
         return write_from_user(current_io(), buf.addr(), count).map(|n| n as u64);
@@ -280,6 +286,7 @@ fn ioctl(fd: Fd, cmd: u32, arg: u64) -> Result<u64, u32> {
             file.set_nonblock(on != 0).map_err(vfs)?;
             Ok(0)
         }
+        _ if file.tty().is_some() => file.tty().unwrap().ioctl(cmd, arg),
         ioctl::FIONREAD => {
             let Some(pipe) = file.pipe() else {
                 return Err(errno::ENOTTY);
@@ -442,6 +449,7 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
         }
         let want = span.len.min(room as u64);
         let wrote = match tty {
+            _ if file.tty().is_some() => file.tty().unwrap().write(span.base, want, file.is_nonblock()),
             Some(io) => write_from_user(io, span.base, want).map(|n| n as u64),
             None => write_file(&file, span.base, want),
         };
@@ -491,6 +499,7 @@ fn openat(dirfd: Dirfd, path: UserPtr, flags: OpenFlags, mode: Mode) -> Result<u
         let end = crate::linux::pipe::open_fifo(file.inode(), file.access_mode(), flags.has_nonblock())?;
         file.attach_pipe_end(end);
     }
+    let file = crate::vfs::devpts::open(file, flags)?;
     #[cfg(feature = "ktest")]
     process::open_install_window();
     let fd = slot.install(file, flags.has_cloexec());
@@ -824,7 +833,7 @@ crate::ktest!(
             kassert_eq!(sys_ioctl(a, ioctl::TCGETS, out), neg_errno(errno::ENOTTY));
             kassert_eq!(sys_ioctl(a, ioctl::TIOCGWINSZ, out), neg_errno(errno::ENOTTY));
             kassert_eq!(sys_ioctl(at::reg(0), ioctl::TCGETS, out), 0);
-            let tty_fd = ktest_open(2, b"/dev/tty", OpenFlags::O_RDWR)?;
+            let tty_fd = ktest_open(2, b"/dev/console", OpenFlags::O_RDWR)?;
             kassert_eq!(sys_ioctl(tty_fd, ioctl::TIOCGWINSZ, out), 0);
             kassert!(current_file(tty_fd).is_some_and(|f| f.inode().is_tty()));
             Ok(())

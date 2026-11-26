@@ -418,10 +418,9 @@ fn run_poll(fds_ptr: u64, nfds: u32, timeout: WaitTimeout, restartable: bool) ->
 
     let polled_fds: Vec<i32> = entries.iter().map(|e| e.fd).collect();
     let files = process::current_io_files(&polled_fds);
-    let has_readable_tty = entries
-        .iter()
-        .zip(&files)
-        .any(|(e, file)| e.fd >= 0 && file.as_ref().is_some_and(|f| f.is_readable() && f.inode().is_tty()));
+    let has_readable_tty = entries.iter().zip(&files).any(|(e, file)| {
+        e.fd >= 0 && file.as_ref().is_some_and(|f| f.is_readable() && f.inode().is_tty() && f.tty().is_none())
+    });
     let step = console_step(has_readable_tty);
 
     let outcome = wait_ready(timeout, step, |waker, guards| {
@@ -595,7 +594,7 @@ fn run_select(
         let Some(file) = file else {
             return Err(errno::EBADF);
         };
-        if want_r && file.is_readable() && file.inode().is_tty() {
+        if want_r && file.is_readable() && file.inode().is_tty() && file.tty().is_none() {
             has_readable_tty = true;
         }
         entries.push(SelectEntry { fd: fd as usize, want_r, want_w, want_x, file });
@@ -1063,7 +1062,7 @@ crate::ktest!(
             let unmapped = process::KTEST_USER_VA + process::KTEST_USER_LEN;
 
             // Open every M7 file kind: regular tmpfs file, directory, procfs
-            // file and directory, devfs always-ready devices, console/tty, and
+            // file and directory, devfs always-ready devices, consoles, and
             // O_PATH.
             let reg_fd = ktest_install_file(open_tmp_regular(TMP_FILE).map_err(|_| "open tmp file")?)?;
             let dir_fd = ktest_open(0, b"/tmp", OpenFlags::O_RDONLY)?;
@@ -1073,7 +1072,7 @@ crate::ktest!(
             let zero_fd = ktest_open(0, b"/dev/zero", OpenFlags::O_RDWR)?;
             let urandom_fd = ktest_open(0, b"/dev/urandom", OpenFlags::O_RDONLY)?;
             let console_rw_fd = ktest_open(0, b"/dev/console", OpenFlags::O_RDWR)?;
-            let tty_rw_fd = ktest_open(0, b"/dev/tty", OpenFlags::O_RDWR)?;
+            let tty_rw_fd = ktest_open(0, b"/dev/console", OpenFlags::O_RDWR)?;
             let path_fd = ktest_open(0, b"/tmp", OpenFlags::O_PATH)?;
 
             // Every M7 always-ready kind reports `POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM`
@@ -1090,7 +1089,7 @@ crate::ktest!(
                 (null_fd.raw(), all_ev, always),
                 (zero_fd.raw(), all_ev, always),
                 (urandom_fd.raw(), all_ev, always),
-                // Stdio fds 0/1/2 and /dev/console, /dev/tty by AccessMode (Capture mode).
+                // Stdio fds 0/1/2 and /dev/console by AccessMode (Capture mode).
                 (0, all_ev, in_only),
                 (1, all_ev, out_only),
                 (console_rw_fd.raw(), all_ev, always),

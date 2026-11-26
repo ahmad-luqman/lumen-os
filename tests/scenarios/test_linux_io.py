@@ -166,3 +166,23 @@ def test_pipes_and_poll(boot, tmp_path):
     with disk.open("rb") as image:
         image.seek(int(match[1]) * int(block_size[1]) + int(match[2], 16) + 40)
         assert image.read(60) == bytes(60)
+
+
+def test_pty_termios_and_job_control(boot, tmp_path):
+    """C9: real PTY data, timers, process groups, session detach and hangup."""
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+    start = len(m.output)
+    program = "/usr/local/bin/m8_pty"
+    m.send_line(f"linux {program}")
+    for check in (
+        "pty_data_and_timers",
+        "pty_job_control_and_hangup",
+        "pty_orphans_and_leader_exit",
+    ):
+        m.expect(re.compile(rf"^ok {check}\r?$", re.MULTILINE), 60)
+    m.expect(rf"linux: {re.escape(program)} exit=0 leaked_frames=-?\d+\n", 30)
+    m.expect(r"lumen> ", 10)
+    assert CRASH_BEGIN not in m.output[start:]
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

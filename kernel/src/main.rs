@@ -67,6 +67,7 @@ mod term;
 mod termwin;
 mod time;
 mod trace;
+mod tty;
 mod ui;
 mod user;
 mod vfs;

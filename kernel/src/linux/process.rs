@@ -98,6 +98,7 @@ pub struct KernelFile {
     writer_generation: u64,
     /// End ownership released once when `end_refs` reaches 0.
     pipe_end: SpinLock<Option<crate::linux::pipe::PipeEnd>>,
+    tty: Option<crate::vfs::devpts::TtyEnd>,
 }
 
 impl KernelFile {
@@ -110,6 +111,7 @@ impl KernelFile {
             pipe: None,
             writer_generation: 0,
             pipe_end: SpinLock::new(None),
+            tty: None,
         }
     }
 
@@ -142,6 +144,21 @@ impl KernelFile {
         self.writer_generation = end.writer_generation();
         self.pipe = Some(Arc::clone(end.pipe()));
         *self.pipe_end.get_mut() = Some(end);
+    }
+
+    pub(crate) fn new_tty_end(
+        inode: Arc<dyn VfsInode>,
+        path: Arc<[u8]>,
+        flags: OpenFlags,
+        end: crate::vfs::devpts::TtyEnd,
+    ) -> Result<Self, VfsError> {
+        let mut file = Self::from_open_file(OpenFile::new_unchecked_flags(inode, path, flags)?);
+        file.tty = Some(end);
+        Ok(file)
+    }
+
+    pub(crate) fn tty(&self) -> Option<&crate::vfs::devpts::TtyEnd> {
+        self.tty.as_ref()
     }
 
     pub fn is_nonblock(&self) -> bool {
@@ -201,6 +218,9 @@ impl KernelFile {
     fn release_pipe_end(&self) {
         let end = self.pipe_end.lock().take();
         if let Some(end) = end {
+            end.release();
+        }
+        if let Some(end) = &self.tty {
             end.release();
         }
     }
@@ -585,6 +605,16 @@ impl Process {
     /// Its disposition of `signal`.
     pub fn action(&self, signal: Signal) -> KernelSigaction {
         self.signal.lock().action(signal)
+    }
+
+    pub(crate) fn controlling_tty(&self) -> Option<Arc<crate::tty::Tty>> {
+        self.signal.lock().ctty.clone()
+    }
+
+    /// Replace the association under the signal lock; callers hold PROCS,
+    /// and terminal-driven changes additionally hold the TTY lock.
+    pub(crate) fn replace_controlling_tty(&self, tty: Option<Arc<crate::tty::Tty>>) {
+        self.signal.lock().ctty = tty;
     }
 
     /// Its address space (a clone, dropped by the caller with no lock
@@ -1336,10 +1366,28 @@ pub fn waitid_request(idtype: i32, id: i32, options: u32) -> Result<lumen_proc::
 }
 
 /// Start a new session and process group led by the caller; returns the new sid.
-/// C9 clears `SignalState::ctty` here once controlling terminals exist.
 pub fn setsid() -> Result<u32, u32> {
-    let caller = current_process().pid();
-    PROCS.lock().setsid(caller)
+    let caller = current_process();
+    let mut table = PROCS.lock();
+    let sid = table.setsid(caller.pid())?;
+    caller.replace_controlling_tty(None);
+    Ok(sid)
+}
+
+/// Run terminal identity checks with the tree pinned; only signal locks may nest.
+pub(crate) fn with_tty_processes<R>(f: impl FnOnce(&mut ProcTree, &BTreeMap<u32, Arc<Process>>) -> R) -> R {
+    PROCS.lock().with_tty_processes(f)
+}
+
+/// A kernel-generated terminal signal, also valid during process teardown.
+pub(crate) fn tty_signal(target: i32, signal: Signal) {
+    use lumen_signal::pending::{SenderClass, SigInfo};
+    let _ = PROCS.lock().send_process(
+        INIT_PID,
+        target,
+        Ok(Some(SigInfo::new(signal, general::SI_KERNEL as i32))),
+        SenderClass::SiUser,
+    );
 }
 
 /// Move `pid` (0: caller) into process group `pgid` (0: target's pid).
@@ -1469,6 +1517,9 @@ pub fn take_current() -> Ended {
         return Ended { pid, exit: Some(own_exit), stdout: Vec::new() };
     }
     let exit = process.take_exit();
+    if let Some(tty) = process.controlling_tty() {
+        tty.leader_exit(pid);
+    }
     process.release_resources();
     debug_assert!(process.released(), "pid {pid} exits in the tree before giving up mm, files and fs");
     let status = exit.as_ref().map_or(ExitStatus::Killed { signal: Signal::KILL, core: false }, exit_status);
@@ -3855,6 +3906,27 @@ fn ktest_reap(pid: u32, handle: sched::JoinHandle) -> Result<i32, &'static str> 
     let report =
         wait_child(wait4_request(pid as i32, 0).map_err(|_| "request")?).map_err(|_| "wait")?.ok_or("no child exit")?;
     Ok(report.status().word())
+}
+
+/// Run a child that inherits the current fixture's session and controlling
+/// terminal. Its exit and reap complete before returning the closure's result.
+#[cfg(feature = "ktest")]
+pub(crate) fn in_test_child(
+    f: impl FnOnce(u32) -> crate::ktest::TestResult + Send + 'static,
+) -> crate::ktest::TestResult {
+    let result = Arc::new(SpinLock::new(None));
+    let out = Arc::clone(&result);
+    let (pid, parked) = ktest_fork_child(move || {
+        let value = f(current_process().pid());
+        record_thread_exit(UserExit::Exited(0));
+        let _ = take_current();
+        *out.lock() = Some(value);
+    })?;
+    let status = ktest_reap(pid, parked.start())?;
+    if status != 0 {
+        return Err("test child exit status");
+    }
+    result.lock().take().ok_or("test child result")?
 }
 
 crate::ktest!(

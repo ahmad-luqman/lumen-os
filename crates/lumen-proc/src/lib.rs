@@ -25,7 +25,8 @@
 //!   [`ProcTree::getpgid`], [`ProcTree::getsid`], [`ProcTree::is_orphaned_pgrp`]
 //!   and the checks of `tcsetpgrp` ([`ProcTree::tcsetpgrp`]);
 //! - **pids**: from 2 up to the tree's maximum, then wrapping, never a
-//!   number still used as a pid, a pgid, a sid or a tid ([`ProcTree::is_busy`]);
+//!   number still used as a pid, a pgid, a sid or a tid, or retained by a
+//!   terminal's [`PidRef`] ([`ProcTree::is_busy`], [`ProcTree::retain_pid`]);
 //! - **tids**: a thread's number from the same allocator
 //!   ([`ProcTree::add_thread`], [`ProcTree::remove_thread`]; the leader's
 //!   tid is the pid), so no tid is ever a live pid, pgid or sid; a process's
@@ -81,6 +82,9 @@
 //!   `setsid` and 2 in a `setpgid`; only `fork`'s reservation in the
 //!   parent's children list and `add_thread`'s in the process's thread list
 //!   are fallible (`ENOMEM`, the tree unchanged). These calls can also free.
+//!   [`ProcTree::retain_pid`] allocates an Arc and an index entry for a new
+//!   reservation; repeated references only clone the Arc. It and PID
+//!   allocation reclaim expired weak entries.
 //! - **Freeing only:** [`ProcTree::wait`] when it reaps frees the zombie's
 //!   node and index entries, and [`ProcTree::remove_thread`] the tid's.
 //!   Dropping an [`ExitOutcome`]'s actions frees their list. That a reaping
@@ -118,7 +122,7 @@ pub use pid::{FIRST_PID, INIT_PID};
 pub use session::{Controlling, Sigttou, Tcsetpgrp};
 pub use slot::{RusageSlot, SlotRef};
 pub use status::{CLD_CONTINUED, CLD_DUMPED, CLD_EXITED, CLD_KILLED, CLD_STOPPED, ChildInfo, ExitStatus, WaitStatus};
-pub use tree::{ProcState, ProcTree, StateChange};
+pub use tree::{PidRef, ProcState, ProcTree, StateChange};
 pub use wait::{
     __WALL, __WCLONE, __WNOTHREAD, P_ALL, P_PGID, P_PID, P_PIDFD, Report, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
     WSTOPPED, WUNTRACED, WaitOptions, WaitReady, WaitRequest,

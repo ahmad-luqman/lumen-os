@@ -97,7 +97,7 @@ $(BUILD)/linux/m7_test: $(BUILD)/linux/libm7.so
 
 # M8's (#371; ARCHITECTURE section 15, "M8's tests"); each `mod common;`s
 # tools/linux-m8/common.rs.
-M8_LINUX := m8_proc m8_io m8_vm ptyrun
+M8_LINUX := m8_proc m8_io m8_vm ptyrun m8_pty
 M8_LINUX_OUT := $(addprefix $(BUILD)/linux/,$(M8_LINUX))
 $(M8_LINUX_OUT): $(BUILD)/linux/%: tools/linux-m8/%.rs tools/linux-m8/common.rs $(BUILD)/deps/alpine-minirootfs/.version rust-toolchain.toml
 	$(MUSL_EXE)

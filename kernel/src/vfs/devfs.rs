@@ -1,4 +1,4 @@
-//! The `/dev` namespace (`devfs`, `dev = 0:3`) with 6 `S_ISCHR` nodes.
+//! The `/dev` namespace (`devfs`, `dev = 0:3`) with terminal devices and the devpts mountpoint.
 //!
 //! A writable mount, as Linux's devtmpfs (`FileSystem::read_only` is
 //! false, #301), whose names never change: lumen-vfs's own checks answer
@@ -38,26 +38,29 @@ enum DevKind {
     Urandom,
     Tty,
     Console,
+    Ptmx,
+    Pts,
 }
 
 impl DevKind {
     const fn rdev(self) -> DevId {
         match self {
-            Self::Root => DevId::makedev(0, 0),
+            Self::Root | Self::Pts => DevId::makedev(0, 0),
             Self::Null => DevId::makedev(1, 3),
             Self::Zero => DevId::makedev(1, 5),
             Self::Random => DevId::makedev(1, 8),
             Self::Urandom => DevId::makedev(1, 9),
             Self::Tty => DevId::makedev(5, 0),
             Self::Console => DevId::makedev(5, 1),
+            Self::Ptmx => DevId::makedev(5, 2),
         }
     }
 
     const fn mode(self) -> u16 {
         match self {
-            Self::Root => 0o755,
+            Self::Root | Self::Pts => 0o755,
             Self::Console => 0o620,
-            Self::Null | Self::Zero | Self::Random | Self::Urandom | Self::Tty => 0o666,
+            Self::Null | Self::Zero | Self::Random | Self::Urandom | Self::Tty | Self::Ptmx => 0o666,
         }
     }
 }
@@ -87,6 +90,8 @@ impl Devfs {
         let entries = alloc::vec![
             ("console", mk_dev(7, DevKind::Console)),
             ("null", mk_dev(2, DevKind::Null)),
+            ("ptmx", mk_dev(8, DevKind::Ptmx)),
+            ("pts", mk_dev(9, DevKind::Pts)),
             ("random", mk_dev(4, DevKind::Random)),
             ("tty", mk_dev(6, DevKind::Tty)),
             ("urandom", mk_dev(5, DevKind::Urandom)),
@@ -173,14 +178,31 @@ impl DevfsInode {
     /// the syscall layer's `writable_mount` lets every devfs inode through,
     /// and `vfstest chmod` calls the setters directly.
     fn changeable_meta(&self) -> Result<SleepMutexGuard<'_, DevfsMeta>, VfsError> {
-        if self.kind == DevKind::Root {
+        if matches!(self.kind, DevKind::Root | DevKind::Pts) {
             return Err(VfsError::RoFs);
         }
         Ok(self.meta.lock())
     }
 }
 
+pub(crate) enum TerminalOpen {
+    Ptmx,
+    Alias,
+}
+
+pub(crate) fn terminal_open(inode: &dyn VfsInode) -> Option<TerminalOpen> {
+    match inode.as_any()?.downcast_ref::<DevfsInode>()?.kind {
+        DevKind::Ptmx => Some(TerminalOpen::Ptmx),
+        DevKind::Tty => Some(TerminalOpen::Alias),
+        _ => None,
+    }
+}
+
 impl VfsInode for DevfsInode {
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
     fn lock_id(&self) -> u64 {
         self.lock_id
     }
@@ -195,7 +217,7 @@ impl VfsInode for DevfsInode {
 
     fn inode_type(&self) -> InodeType {
         match self.kind {
-            DevKind::Root => InodeType::Dir,
+            DevKind::Root | DevKind::Pts => InodeType::Dir,
             _ => InodeType::CharDevice,
         }
     }
@@ -223,7 +245,7 @@ impl VfsInode for DevfsInode {
             ino: self.ino,
             inode_type: self.inode_type(),
             mode: meta.mode,
-            nlink: if self.kind == DevKind::Root { 2 } else { 1 },
+            nlink: if matches!(self.kind, DevKind::Root | DevKind::Pts) { 2 } else { 1 },
             uid: meta.uid,
             gid: meta.gid,
             rdev: self.kind.rdev(),
@@ -237,7 +259,7 @@ impl VfsInode for DevfsInode {
     }
 
     fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError> {
-        if self.kind != DevKind::Root {
+        if !matches!(self.kind, DevKind::Root | DevKind::Pts) {
             return Err(VfsError::NotDir);
         }
         if name == b"." || name == b".." {
@@ -257,19 +279,19 @@ impl VfsInode for DevfsInode {
     }
 
     fn readdir(&self, cursor: u64, out: &mut Vec<DirEntry>, max_entries: usize) -> Result<(), VfsError> {
-        if self.kind != DevKind::Root {
+        if !matches!(self.kind, DevKind::Root | DevKind::Pts) {
             return Err(VfsError::NotDir);
         }
         // Each entry's key is its index: the names never change.
         let entries = [(1, InodeType::Dir, "."), (1, InodeType::Dir, "..")]
             .into_iter()
-            .chain(self.nodes.iter().map(|&(name, ref node)| (node.ino, InodeType::CharDevice, name)));
+            .chain(self.nodes.iter().map(|&(name, ref node)| (node.ino, node.inode_type(), name)));
         fill_readdir(out, cursor, max_entries, (0u64..).zip(entries));
         Ok(())
     }
 
     fn truncate(&self, _size: u64) -> Result<(), VfsError> {
-        if self.kind == DevKind::Root { Err(VfsError::IsDir) } else { Err(VfsError::Inval) }
+        if matches!(self.kind, DevKind::Root | DevKind::Pts) { Err(VfsError::IsDir) } else { Err(VfsError::Inval) }
     }
 
     fn set_mode(&self, mode: u16) -> Result<(), VfsError> {
@@ -304,7 +326,8 @@ impl VfsInode for DevfsInode {
 
     fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
         match self.kind {
-            DevKind::Root => Err(VfsError::IsDir),
+            DevKind::Root | DevKind::Pts => Err(VfsError::IsDir),
+            DevKind::Ptmx => Err(VfsError::Io),
             DevKind::Null => Ok(0),
             DevKind::Zero => {
                 buf.fill(0);
@@ -332,7 +355,8 @@ impl VfsInode for DevfsInode {
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
         match self.kind {
-            DevKind::Root => Err(VfsError::IsDir),
+            DevKind::Root | DevKind::Pts => Err(VfsError::IsDir),
+            DevKind::Ptmx => Err(VfsError::Io),
             DevKind::Null | DevKind::Zero | DevKind::Random | DevKind::Urandom => Ok(buf.len()),
             DevKind::Tty => match process::try_current_io() {
                 Some(io) => {
@@ -432,6 +456,7 @@ crate::ktest!(
             ("urandom", 1, 9, 0o666),
             ("tty", 5, 0, 0o666),
             ("console", 5, 1, 0o620),
+            ("ptmx", 5, 2, 0o666),
         ] {
             let node = root.lookup(name.as_bytes()).map_err(|_| "lookup")?.stat().map_err(|_| "stat")?;
             kassert_eq!(node.inode_type, InodeType::CharDevice);

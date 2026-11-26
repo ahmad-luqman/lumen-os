@@ -141,18 +141,10 @@ impl ProcTree {
         pgrp: i32,
         sigttou: Sigttou,
     ) -> Result<Tcsetpgrp, Error> {
-        let c = self.live(caller, Role::Caller)?;
-        let (c_pgid, c_sid) = (c.pgid, c.sid);
-        if let Some(Controlling { foreground: Some(fg), .. }) = controlling
-            && fg != c_pgid
-            && sigttou == Sigttou::Delivered
-        {
-            return if self.is_orphaned_pgrp(c_pgid) {
-                Err(Errno::NoTty.into())
-            } else {
-                Ok(Tcsetpgrp::Sigttou { pgrp: c_pgid })
-            };
+        if let Some(pgrp) = self.tcsetpgrp_job_control(caller, controlling, sigttou)? {
+            return Ok(Tcsetpgrp::Sigttou { pgrp });
         }
+        let c_sid = self.live(caller, Role::Caller)?.sid;
         if pgrp < 0 {
             return Err(Errno::Inval.into());
         }
@@ -168,6 +160,26 @@ impl ProcTree {
             return Err(Errno::Perm.into());
         }
         Ok(Tcsetpgrp::Set(n))
+    }
+
+    /// Check `TIOCSPGRP` job control before its argument is copied from userspace.
+    /// Returns the group to signal, `ENOTTY` for an orphaned background group,
+    /// or `None` to proceed. The full check must run again after the copy.
+    /// Neither allocates nor frees. [`crate::Bug::NotLive`] for a dead caller.
+    pub fn tcsetpgrp_job_control(
+        &self,
+        caller: u32,
+        controlling: Option<Controlling>,
+        sigttou: Sigttou,
+    ) -> Result<Option<u32>, Error> {
+        let c_pgid = self.live(caller, Role::Caller)?.pgid;
+        if let Some(Controlling { foreground: Some(fg), .. }) = controlling
+            && fg != c_pgid
+            && sigttou == Sigttou::Delivered
+        {
+            return if self.is_orphaned_pgrp(c_pgid) { Err(Errno::NoTty.into()) } else { Ok(Some(c_pgid)) };
+        }
+        Ok(None)
     }
 
     /// The process `pid` names (0: `caller`), live or zombie, with its pid;
