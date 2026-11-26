@@ -380,7 +380,7 @@ crate::ktest!(
                 kassert_eq!(sys_pread64(at::reg(fd), at::reg(out), 1, 0), neg_errno(errno::ESPIPE));
                 kassert_eq!(sys_pwrite64(at::reg(fd), at::reg(base), 1, 0), neg_errno(errno::ESPIPE));
             }
-            let tty_fd = ktest_open(1, b"/dev/tty", OpenFlags::O_RDWR)?;
+            let tty_fd = ktest_open(1, b"/dev/console", OpenFlags::O_RDWR)?;
             kassert_eq!(sys_pread64(tty_fd, at::reg(out), 1, 0), neg_errno(errno::ESPIPE));
             kassert_eq!(sys_pwrite64(tty_fd, at::reg(base), 1, 0), neg_errno(errno::ESPIPE));
             // The wrong direction, `O_PATH`, or not open: `EBADF`.

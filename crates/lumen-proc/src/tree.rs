@@ -2,6 +2,7 @@
 //! fork and wait. Exit is in `exit.rs`, sessions in `session.rs`.
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use lumen_signal::Signal;
@@ -74,6 +75,20 @@ pub enum StateChange {
     Unchanged,
 }
 
+/// A PID number reserved against reuse until the last clone is dropped.
+///
+/// It retains identity, not a process or group membership: a terminal signal
+/// to a reaped group finds no recipients, never a new group with that number.
+#[derive(Clone, Debug)]
+pub struct PidRef(Arc<u32>);
+
+impl PidRef {
+    /// The reserved PID, process-group or session number.
+    pub fn number(&self) -> u32 {
+        *self.0
+    }
+}
+
 /// Every process the kernel knows, by pid, with the POSIX process-tree rules.
 ///
 /// Its invariants, which every operation keeps:
@@ -84,7 +99,7 @@ pub enum StateChange {
 ///   whose parent autoreaps) leaves the tree inside [`ProcTree::exit`];
 /// - all members of a process group (live and zombie) are in one session;
 /// - no pid is handed out while a process uses the number as its pid, pgid
-///   or sid, or a live thread uses it as its tid;
+///   or sid, a live thread uses it as its tid, or a [`PidRef`] retains it;
 /// - each tid ([`ProcTree::add_thread`]) belongs to exactly one live
 ///   process, and is never a pid, pgid or sid.
 ///
@@ -100,6 +115,8 @@ pub struct ProcTree {
     sessions: BTreeSet<(u32, u32)>,
     /// Every non-leader tid, with the pid of the process it belongs to.
     tids: BTreeMap<u32, u32>,
+    /// Weak entries never keep a reservation alive; creation/allocation prunes them.
+    references: BTreeMap<u32, Weak<u32>>,
     pids: PidAllocator,
 }
 
@@ -115,6 +132,7 @@ impl ProcTree {
             groups: BTreeSet::new(),
             sessions: BTreeSet::new(),
             tids: BTreeMap::new(),
+            references: BTreeMap::new(),
             pids: PidAllocator::new(max_pid),
         }
     }
@@ -427,13 +445,37 @@ impl ProcTree {
     }
 
     /// Whether number `n` is in use as a pid, a pgid or a sid (by a live or
-    /// zombie process) or as a live thread's tid: no new process or thread
-    /// gets it.
+    /// zombie process), as a live thread's tid, or by a [`PidRef`]: no new
+    /// process or thread gets it.
     pub fn is_busy(&self, n: u32) -> bool {
         self.procs.contains_key(&n)
             || self.tids.contains_key(&n)
             || self.pgrp_exists(n)
             || self.sessions.range((n, 0)..=(n, u32::MAX)).next().is_some()
+            || self.references.get(&n).is_some_and(|reference| reference.strong_count() != 0)
+    }
+
+    /// Reserve an already-used number until the last returned reference drops.
+    /// Returns `None` for a free number. Allocates infallibly for a new
+    /// reservation; repeated references share it. Expired weak entries are
+    /// reclaimed here and before PID allocation. Dropping a reference needs
+    /// no process-tree lock and never allocates.
+    pub fn retain_pid(&mut self, number: u32) -> Option<PidRef> {
+        if !self.is_busy(number) {
+            return None;
+        }
+        if let Some(reference) = self.references.get(&number).and_then(Weak::upgrade) {
+            return Some(PidRef(reference));
+        }
+        self.references.retain(|_, reference| reference.strong_count() != 0);
+        let reference = Arc::new(number);
+        self.references.insert(number, Arc::downgrade(&reference));
+        Some(PidRef(reference))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_pid_entries(&self) -> usize {
+        self.references.len()
     }
 
     // ---- internals ----
@@ -499,6 +541,7 @@ impl ProcTree {
     }
 
     fn alloc_pid(&mut self) -> Result<u32, Errno> {
+        self.references.retain(|_, reference| reference.strong_count() != 0);
         let mut pids = self.pids;
         let pid = pids.alloc(|n| self.is_busy(n))?;
         self.pids = pids;

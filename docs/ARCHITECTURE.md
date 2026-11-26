@@ -4355,9 +4355,11 @@ route through the VFS and real process working directory:
 - **`poll` (7):** regular files, directories, `/proc/*`, and always-ready
   character devices (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`)
   report `POLLIN | POLLOUT` immediately (matching Linux), while console FDs
-  0/1/2, `/dev/tty`, and `/dev/console` preserve M6's readiness-driven polling
+  0/1/2 and `/dev/console` preserve M6's readiness-driven polling
   (`POLLOUT` immediately on a writable one; `POLLIN` on a readable one, gated on `stdin_ready(io)` with
-  timeout-aware blocking wait).
+  timeout-aware blocking wait). `/dev/tty` follows its controlling terminal's
+  readiness: a PTY uses its line discipline's canonical or `VMIN`/`VTIME`
+  rules (§10), rather than `stdin_ready(io)`.
 - **`mmap` (9):** M7 widens `sys_mmap` dispatch from M6's 4 arguments to all 6
   Linux arguments `(rdi, rsi, rdx, r10, r8 = fd, r9 = off)`.
 
@@ -8506,10 +8508,14 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `read` → `crate::rng` (`-EAGAIN` while the pool is unseeded: neither
     RDRAND nor virtio-rng has fed it, never a clock-seeded fallback),
     `write` → `count`, `lseek` → 0.
-  - `/dev/tty` (`5:0`, `0o666`) and `/dev/console` (`5:1`, `0o620`): route to
-    the calling process's `ConsoleIo` (supporting `read`/`write`/`ioctl`
-    `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`poll`; `/dev/ptmx` and `/dev/pts/*` join
-    in M8, and both become ttys of their own: section 10, designed in #336).
+  - `/dev/tty` (`5:0`, `0o666`): opens the caller's controlling terminal,
+    the PTY slave when one is associated; `-ENXIO` without one.
+  - `/dev/console` (`5:1`, `0o620`): routes to the calling process's
+    `ConsoleIo`, supporting `read`/`write`/`ioctl`
+    `TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`poll`. Console `Tty` integration is C10.
+  - `/dev/ptmx` (`5:2`, `0o666`) allocates a PTY; `/dev/pts/N` is its
+    slave in the boot-mounted `devpts` (`0:5`), with line discipline,
+    controlling-terminal and job-control behavior described in section 10.
 - **`/proc` (`procfs`, `dev = 0:4`):** read-only dynamically generated views
   (`st_size == 0` on virtual regular files, matching Linux):
   - `/proc/self` → symlink to `<current_pid>`; `/proc/<pid>` resolves for the
@@ -9038,8 +9044,12 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lo
 - **The pair:** `Tty { lock: SleepMutex<TtyInner>, seq: AtomicU64,
   readers, writers, poll }` with `TtyInner { ld: lumen_tty::LineDiscipline,
   to_master: a byte ring (the slave's output and its echo, 4096 bytes),
-  session: Option<u32>, foreground: Option<u32>, locked: bool,
+  session: Option<PidRef>, foreground: Option<PidRef>, locked: bool,
   slave_opens: usize, hung_up: bool }` (`seq`: B2's `ready` rule).
+  `ProcTree::retain_pid` reserves each referenced number against reuse,
+  including after the last group member is reaped. Signal dispatch keeps
+  the reference alive; replacing or clearing the terminal identity drops
+  it. Once the last reference is gone, the PID allocator may reuse it.
   `Tty::lock` is section 9's Lock 9a.
   Reads and writes go through a 4 KiB kernel buffer: a slave read whose
   copy out faults after the discipline consumed the bytes loses them and
@@ -9100,6 +9110,8 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lo
   `set_winsize` reports a change); `TIOCGPGRP`, `TIOCSPGRP`, `TIOCGSID`,
   `TIOCSCTTY`, `TIOCNOTTY` (below); `FIONREAD`/`TIOCINQ`
   (`readable_bytes`), `TIOCOUTQ` (the bytes in `to_master` for the slave);
+  a hung-up slave rejects tty ioctls with `-EIO`, except `TIOCSPGRP`
+  with `-ENOTTY`, before touching user buffers or terminal state;
   on the master only, `TIOCGPTN`, `TIOCSPTLCK`, `TIOCGPTLCK`; M7's
   `FIONBIO`/`FIOCLEX`/`FIONCLEX`. `TIOCPKT` is `-EINVAL` (no packet mode,
   a deviation); every other request `-ENOTTY`.
@@ -9126,7 +9138,9 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lo
     `tiocgpgrp`/`tiocgsid` check only `tty == real_tty`; `TIOCSPGRP` is
     `ProcTree::tcsetpgrp` with the
     tty's `Controlling` and the caller's `SIGTTOU` disposition, taken
-    under `Tty::lock` then `PROCS` (`Tcsetpgrp::Sigttou`: `SIGTTOU` to the
+    under `Tty::lock` then `PROCS`. Its job-control check precedes the
+    argument copy; locks are dropped for that copy, then the full check
+    runs again (`Tcsetpgrp::Sigttou`: `SIGTTOU` to the
     caller's group and `-ERESTARTSYS`);
   - a read by a background process on its controlling terminal: `-EIO` if
     `SIGTTIN` is blocked or ignored or its group is orphaned, else

@@ -449,6 +449,7 @@ dependencies = [
  "lumen-term",
  "lumen-time",
  "lumen-trace",
+ "lumen-tty",
  "lumen-uart",
  "lumen-ui",
  "lumen-vfs",

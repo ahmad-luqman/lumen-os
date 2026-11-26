@@ -166,21 +166,26 @@ def test_heap_command_reports_usage(boot):
     heap = shell_heap(m)
     # What boot keeps (`acpi::Info`, for one), the four virtual terminals
     # (each grid's cells, scrollback, tab stops and dirty marks), the VFS
-    # boot mounts (`/`, `/tmp`, `/dev` + 6 char nodes, `/proc`, and the
-    # mount/inode tables), pid 1 (its process, its placeholder address space
-    # and the process table's nodes, #372), and the shells (their
-    # editors and histories, the screen shells' threads and the keyboard's
+    # boot mounts (`/`, `/tmp`, `/dev` + 7 char nodes + the pts mountpoint,
+    # `/proc`, `/dev/pts`, and the mount/inode tables), pid 1 (its process,
+    # its placeholder address space and the process table's nodes, #372),
+    # and the shells (their editors and histories, the screen shells' threads and the keyboard's
     # wait queue they block in) is in use (91 allocations when the VFS mounts
     # arrived, 95 before pid 1, 101 with it, 102 on main before B6, and
     # 116 allocations with B6's per-CPU run-queue reservations). B6 keeps
     # ready and sleeper buffers for all 8 CPU slots: CPU 0 already had both,
     # so the other 7 slots add 14 allocations, even in this single-CPU boot.
-    # The ceiling leaves the same 9 for growth; the rest of what the heap
-    # mapped is free.
+    # C9 (#388), measured over three settled boots each: main 5d17fc0a has
+    # 118 live blocks, C9 6de0195d has 129. The 11 extra blocks are two
+    # devfs nodes (ptmx, pts), the devpts filesystem and root inode, its
+    # mount-path string, and six dentry-cache allocations from resolving
+    # /dev/pts (two names, each kept in the map and eviction queue, plus
+    # those containers' initial buffers). Allow five blocks of margin
+    # above the measured 129; the rest of what the heap mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert 0 < heap["live"] <= 125, (
+    assert 0 < heap["live"] <= 134, (
         f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     )
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap

@@ -135,3 +135,75 @@ fn a_failed_fork_leaves_the_tree_unchanged() {
     assert_eq!(alloc::format!("{t:?}"), before);
     assert_eq!(t.children(INIT).len(), 2);
 }
+
+#[test]
+fn terminal_reference_keeps_a_reaped_foreground_group_from_pid_reuse() {
+    let mut t = ProcTree::new(4);
+    t.spawn_init(slot(0)).unwrap();
+    let group = fork(&mut t, INIT);
+    t.setpgid(group, 0, 0).unwrap();
+    let foreground = t.retain_pid(group).unwrap();
+    let other_terminal = t.retain_pid(group).unwrap();
+    let in_flight_signal = foreground.clone();
+    assert_eq!(t.pgrp_members(foreground.number()).collect::<Vec<_>>(), [group]);
+    exit(&mut t, group, 0);
+    assert_eq!(reported_pid(&wait4(&mut t, INIT, group as i32, 0)), Some(group));
+    assert!(!t.contains(group) && !t.pgrp_exists(group));
+    // Wrap the allocator while a terminal still names the reaped group.
+    let next = fork(&mut t, INIT);
+    t.setpgid(next, 0, 0).unwrap();
+    assert_eq!(next, 3);
+    assert_eq!(t.add_thread(next), Ok(4));
+    assert_eq!(t.fork(INIT, slot(0)), user(Errno::Again));
+    assert_eq!(t.add_thread(next), user(Errno::Again));
+    assert!(t.pgrp_members(foreground.number()).next().is_none(), "terminal signal has no recipients");
+    assert_eq!(t.pgrp_members(next).collect::<Vec<_>>(), [next]);
+    drop(foreground);
+    drop(other_terminal);
+    assert!(t.is_busy(group), "an in-flight terminal signal still reserves the number");
+    drop(in_flight_signal);
+    assert!(!t.is_busy(group));
+    assert!(t.retain_pid(group).is_none(), "a free number cannot be retained");
+    assert_eq!(fork(&mut t, INIT), group, "reuse is safe after every terminal reference is gone");
+    t.check_invariants();
+}
+
+#[test]
+fn pid_allocation_prunes_expired_terminal_reservations() {
+    let mut t = ProcTree::new(128);
+    t.spawn_init(slot(0)).unwrap();
+    let live = t.retain_pid(INIT).unwrap();
+    for _ in 0..16 {
+        let pid = fork(&mut t, INIT);
+        // Inspect before retain_pid could hide a missing allocator prune.
+        assert_eq!(t.retained_pid_entries(), 1, "PID allocation must prune expired reservations");
+        let reference = t.retain_pid(pid).unwrap();
+        assert_eq!(t.retained_pid_entries(), 2);
+        exit(&mut t, pid, 0);
+        assert_eq!(reported_pid(&wait4(&mut t, INIT, pid as i32, 0)), Some(pid));
+        drop(reference);
+    }
+    fork(&mut t, INIT);
+    assert_eq!(t.retained_pid_entries(), 1, "PID allocation must prune expired reservations");
+    drop(live);
+}
+
+#[test]
+fn retaining_a_pid_prunes_expired_terminal_reservations() {
+    let mut t = ProcTree::new(128);
+    t.spawn_init(slot(0)).unwrap();
+    // Allocate distinct identities up front so no allocator prune can mask
+    // a missing prune when a new terminal reservation is created.
+    let pids: Vec<_> = (0..16).map(|_| fork(&mut t, INIT)).collect();
+    let live = t.retain_pid(INIT).unwrap();
+    for pid in pids {
+        let reference = t.retain_pid(pid).unwrap();
+        assert_eq!(t.retained_pid_entries(), 2, "retaining a PID must prune expired reservations");
+        exit(&mut t, pid, 0);
+        assert_eq!(reported_pid(&wait4(&mut t, INIT, pid as i32, 0)), Some(pid));
+        drop(reference);
+    }
+    fork(&mut t, INIT);
+    assert_eq!(t.retained_pid_entries(), 1);
+    drop(live);
+}

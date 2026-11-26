@@ -2802,7 +2802,7 @@ def test_make_deps_dev_fetches_even_with_its_stamp_up_to_date(tmp_path):
 
 
 # The Makefile's M8_LINUX: M8's test programs, prerequisites of both images.
-M8_PROGRAMS = ("m8_proc", "m8_io", "m8_vm", "ptyrun")
+M8_PROGRAMS = ("m8_proc", "m8_io", "m8_vm", "ptyrun", "m8_pty")
 
 
 @pytest.mark.parametrize("newer", ["tools/alpine-packages.lock", "tools/alpine-lock.py"])
