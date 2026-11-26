@@ -247,3 +247,10 @@ tests = [
     "harness:test_syscalls::test_each_arm_calls_its_own_handler_with_its_registers_in_order",
     "harness:test_syscalls::test_each_m8_stub_returns_enosys_and_names_its_issue",
 ]
+
+[[feature]]
+name = "M8 D1 ash scripts and pipelines on the Alpine developer image, 512 MiB (#393): external commands streaming beyond pipe capacity, last-stage pipeline status, truncating/appending/input/stderr and ordered dup redirections, subshell cwd and variable isolation, command substitution and its status, executable shebang scripts with quoted argv and environment, USR1 and EXIT traps, FIFO-coordinated background jobs with selected waits, wait-all returning 0 and leaving both children reaped (blocking while alive is not asserted), and persisted ext4 output checked with debugfs and e2fsck"
+milestone = "M8"
+tests = [
+    "scenario:test_alpine::test_ash_scripts_and_pipelines",
+]
