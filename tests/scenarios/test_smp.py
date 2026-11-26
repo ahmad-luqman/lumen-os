@@ -13,8 +13,10 @@ from typing import NamedTuple
 
 import pytest
 from lumen_harness import crash
-from lumen_harness.qemu import EXIT_CRASH
+from lumen_harness.qemu import EXIT_CRASH, EXIT_SUCCESS, Devices
+from lumen_harness.rootfs import copy_rootfs
 from lumen_harness.screen import PROMPT
+from lumen_harness.shell import run
 from test_crash import SCREEN_DONE
 from test_mm import OVERFLOW, assert_main_stack_overflow
 from test_shell import HELD, PARKED_CMDLINE, expect_screen_shells_parked
@@ -284,3 +286,27 @@ def test_crash_on_a_cpu_that_isnt_online_is_refused(boot):
     m.expect(r"crash: usage: crash <kind> \[cpu\|thread\]\n", 10)
     m.send_line("echo still here")
     m.expect(r"still here\n", 10)
+
+
+def test_multithreaded_workload_uses_all_cpus(boot, tmp_path):
+    """C11: one process's threads, pinned one to each CPU and confirmed by getcpu, each make progress."""
+    m = boot(
+        "qemutest",
+        extra=["-smp", "4"],
+        devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True),
+    )
+    m.expect(r"lumen> ", 60)
+    assert "INFO  smp: 4 CPUs online\n" in m.output, m.output
+    # First run warms multi-thread stack-window page tables; the second identical
+    # run must return every frame.
+    for attempt in range(2):
+        out = run(m, "linux /usr/local/bin/m8_proc smp-workload", 180)
+        assert "smp: cpus=4\n" in out, out
+        assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == ["smp-all-cpus"], out
+        assert "FAIL" not in out, out
+        if attempt == 0:
+            assert "linux: /usr/local/bin/m8_proc exit=0 " in out, out
+        else:
+            assert re.search(r"linux: /usr/local/bin/m8_proc exit=0 leaked_frames=0\b", out), out
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

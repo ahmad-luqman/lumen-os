@@ -430,3 +430,56 @@ def test_interval_and_posix_timers(boot, tmp_path):
     assert "FAIL" not in out, out
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_futex_and_pthread_mutex_stress(boot, tmp_path):
+    """C11: cross-CPU pthread_mutex counter contention, pthread_cond handoffs, and kernel blocking."""
+    m = boot(
+        "qemutest",
+        extra=["-smp", "4"],
+        devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True),
+    )
+    m.expect(r"lumen> ", 60)
+    assert "INFO  smp: 4 CPUs online\n" in m.output, m.output
+    # First run warms multi-thread stack-window page tables; the second identical
+    # run must return every frame.
+    for attempt in range(2):
+        out = run(m, f"linux {PROC} futex-stress", 180)
+        assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+            "pthread-mutex-stress",
+            "pthread-cond-turns",
+        ], out
+        assert "FAIL" not in out, out
+        if attempt == 0:
+            assert f"linux: {PROC} exit=0 " in out, out
+        else:
+            assert re.search(rf"linux: {PROC} exit=0 leaked_frames=0\b", out), out
+
+    # Confirm musl pthread_mutex_lock and pthread_cond_wait genuinely block
+    # contenders in the kernel (not spinning on EAGAIN) before the owner wakes them.
+    def all_four_blocked(pid):
+        deadline = time.monotonic() + 30 * m.timeout_scale
+        while True:
+            out = run(m, "ps")
+            if re.search(
+                rf"^\s*{pid}\s+\d+\s+\S+\s+blocked,blocked,blocked,blocked\s",
+                out,
+                re.MULTILINE,
+            ):
+                return
+            assert time.monotonic() < deadline, out
+
+    confirmed_keys(m, ["alt", "f2"])
+    type_confirmed(m, "clear\n")
+    expect_screen(m, r"\Alumen>\s*\Z")
+    type_confirmed(m, f"linux {PROC} futex-block\n")
+    pid = int(expect_screen(m, r"^futex-block: mutex pid=(\d+) ready$", 30)[1])
+    all_four_blocked(pid)
+    confirmed_keys(m, "m")
+    pid2 = int(expect_screen(m, r"^futex-block: cond pid=(\d+) ready$", 30)[1])
+    assert pid2 == pid
+    all_four_blocked(pid)
+    confirmed_keys(m, "c")
+    expect_screen(m, rf"^ok futex-kernel-blocking\nlinux: {PROC} exit=0 leaked_frames=0$", 30)
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

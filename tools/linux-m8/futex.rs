@@ -103,6 +103,18 @@ unsafe extern "C" {
     fn pthread_mutex_consistent(mutex: *mut c_void) -> c_int;
     fn pthread_mutex_unlock(mutex: *mut c_void) -> c_int;
     fn pthread_mutex_destroy(mutex: *mut c_void) -> c_int;
+    fn pthread_cond_init(cond: *mut c_void, attr: *const c_void) -> c_int;
+    fn pthread_cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int;
+    fn pthread_cond_signal(cond: *mut c_void) -> c_int;
+    fn pthread_cond_broadcast(cond: *mut c_void) -> c_int;
+    fn pthread_cond_destroy(cond: *mut c_void) -> c_int;
+    fn pthread_create(
+        thread: *mut usize,
+        attr: *const c_void,
+        run: extern "C" fn(*mut c_void) -> *mut c_void,
+        arg: *mut c_void,
+    ) -> c_int;
+    fn pthread_join(thread: usize, result: *mut *mut c_void) -> c_int;
 }
 extern "C" fn waiter(arg: *mut c_void) -> c_int {
     // SAFETY: spawn passes a live WaitArgs retained until this child is reaped.
@@ -563,4 +575,664 @@ pub fn run() -> c_int {
         ("futex-clear-child-tid-exit-exec", &clear_child_tid),
         ("futex-robust-exec", &robust_exec),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// C11: Cross-CPU pthread_mutex and pthread_cond stress
+// ---------------------------------------------------------------------------
+
+const SYS_SCHED_YIELD: u64 = 24;
+const SYS_SCHED_SETAFFINITY: u64 = 203;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
+const SYS_GETCPU: u64 = 309;
+const MAX_STRESS_CPUS: usize = 8;
+const MUTEX_ITERS: u64 = 2000;
+const COND_TURNS: u64 = 250;
+
+/// Over-sized, 8-byte aligned interior-mutable backing for musl x86-64
+/// `pthread_mutex_t` (40 B) and `pthread_cond_t` (48 B).
+#[repr(C, align(8))]
+struct PthreadBuf(core::cell::UnsafeCell<[u64; 8]>);
+
+impl PthreadBuf {
+    const fn zeroed() -> Self {
+        Self(core::cell::UnsafeCell::new([0; 8]))
+    }
+    fn as_ptr(&self) -> *mut c_void {
+        self.0.get().cast::<c_void>()
+    }
+}
+
+fn join_or_abort(tid: usize) {
+    let mut res = core::ptr::null_mut();
+    // SAFETY: `tid` is a live joinable pthread.
+    let rc = unsafe { pthread_join(tid, &mut res) };
+    if rc != 0 {
+        say!("FAIL pthread_join: failed (got {rc})");
+        common::exit_group(99);
+    }
+}
+
+fn stress_online_cpus() -> Result<([u32; MAX_STRESS_CPUS], usize), common::Fail> {
+    let mut mask = 0u64;
+    eq("sched_getaffinity", sys(SYS_SCHED_GETAFFINITY, [0, 8, &mut mask as *mut _ as u64, 0, 0, 0]), 8)?;
+    let mut cpus = [0u32; MAX_STRESS_CPUS];
+    let mut count = 0usize;
+    for cpu in 0..64u32 {
+        if (mask & (1u64 << cpu)) != 0 && count < MAX_STRESS_CPUS {
+            cpus[count] = cpu;
+            count += 1;
+        }
+    }
+    ensure("futex stress requires at least 4 online CPUs", count >= 4, count as i64)?;
+    Ok((cpus, count))
+}
+
+fn pin_cpu(cpu: u32) -> R {
+    let mask = 1u64 << cpu;
+    eq("sched_setaffinity", sys(SYS_SCHED_SETAFFINITY, [0, 8, &mask as *const _ as u64, 0, 0, 0]), 0)?;
+    loop {
+        eq("sched_yield", sys(SYS_SCHED_YIELD, [0; 6]), 0)?;
+        let mut here = u32::MAX;
+        let mut node = u32::MAX;
+        eq("getcpu", sys(SYS_GETCPU, [&mut here as *mut _ as u64, &mut node as *mut _ as u64, 0, 0, 0, 0]), 0)?;
+        eq("getcpu node zero", i64::from(node), 0)?;
+        if here == cpu {
+            return Ok(());
+        }
+    }
+}
+
+struct MutexStressState {
+    mutex: PthreadBuf,
+    ready: AtomicU32,
+    go: AtomicU32,
+    abort: AtomicU32,
+    err: common::WorkerError,
+    torn: AtomicU32,
+    counter: core::cell::UnsafeCell<u64>,
+    shadow: core::cell::UnsafeCell<u64>,
+}
+
+struct MutexWorkerArg {
+    cpu: u32,
+    state: *const MutexStressState,
+}
+
+extern "C" fn mutex_stress_worker(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: parent keeps `MutexWorkerArg` and `MutexStressState` alive until `pthread_join`.
+    let w = unsafe { &*(arg as *const MutexWorkerArg) };
+    // SAFETY: `w.state` points to the live stack-allocated `MutexStressState`.
+    let s = unsafe { &*w.state };
+    if let Err(e) = pin_cpu(w.cpu) {
+        s.err.record(e);
+        s.abort.store(1, SeqCst);
+        s.ready.fetch_add(1, SeqCst);
+        return core::ptr::null_mut();
+    }
+    s.ready.fetch_add(1, SeqCst);
+    while s.go.load(SeqCst) == 0 && s.abort.load(SeqCst) == 0 {
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    if s.abort.load(SeqCst) != 0 {
+        return core::ptr::null_mut();
+    }
+    for _ in 0..MUTEX_ITERS {
+        if s.abort.load(SeqCst) != 0 {
+            return core::ptr::null_mut();
+        }
+        // SAFETY: `s.mutex` is initialized and remains live until all workers join.
+        let rc = unsafe { pthread_mutex_lock(s.mutex.as_ptr()) };
+        if rc != 0 {
+            s.err.record(common::Fail { what: "pthread_mutex_lock", got: i64::from(rc) });
+            s.abort.store(1, SeqCst);
+            return core::ptr::null_mut();
+        }
+        // SAFETY: `s.mutex` serializes access to `counter` and `shadow`.
+        unsafe {
+            let a = s.counter.get().read_volatile();
+            let b = s.shadow.get().read_volatile();
+            if a != b {
+                s.torn.fetch_add(1, SeqCst);
+            }
+            s.counter.get().write_volatile(a + 1);
+            for _ in 0..8 {
+                core::hint::spin_loop();
+            }
+            s.shadow.get().write_volatile(b + 1);
+        }
+        // SAFETY: this thread currently owns `s.mutex`.
+        let rc = unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) };
+        if rc != 0 {
+            s.err.record(common::Fail { what: "pthread_mutex_unlock", got: i64::from(rc) });
+            s.abort.store(1, SeqCst);
+            return core::ptr::null_mut();
+        }
+    }
+    core::ptr::null_mut()
+}
+
+fn pthread_mutex_stress() -> R {
+    let (cpus, count) = stress_online_cpus()?;
+    let state = MutexStressState {
+        mutex: PthreadBuf::zeroed(),
+        ready: AtomicU32::new(0),
+        go: AtomicU32::new(0),
+        abort: AtomicU32::new(0),
+        err: common::WorkerError::new(),
+        torn: AtomicU32::new(0),
+        counter: core::cell::UnsafeCell::new(0),
+        shadow: core::cell::UnsafeCell::new(0),
+    };
+    // SAFETY: `state.mutex` is aligned, large enough for `pthread_mutex_t`, and destroyed below.
+    eq("pthread_mutex_init", i64::from(unsafe { pthread_mutex_init(state.mutex.as_ptr(), core::ptr::null()) }), 0)?;
+
+    let mut args = [const { MutexWorkerArg { cpu: 0, state: core::ptr::null() } }; MAX_STRESS_CPUS];
+    let mut tids = [0usize; MAX_STRESS_CPUS];
+    let mut started = 0usize;
+    for i in 0..count {
+        args[i] = MutexWorkerArg { cpu: cpus[i], state: &state };
+        // SAFETY: `tids[i]` is writable; `args[i]` and `state` outlive every joined thread.
+        let rc = unsafe {
+            pthread_create(&mut tids[i], core::ptr::null(), mutex_stress_worker, (&args[i] as *const _) as *mut c_void)
+        };
+        if rc != 0 {
+            state.abort.store(1, SeqCst);
+            for tid in &tids[..started] {
+                join_or_abort(*tid);
+            }
+            // SAFETY: all started workers joined; destroy initialized mutex.
+            unsafe { pthread_mutex_destroy(state.mutex.as_ptr()) };
+            return Err(common::Fail { what: "pthread_create mutex worker", got: i64::from(rc) });
+        }
+        started += 1;
+    }
+
+    while state.ready.load(SeqCst) < started as u32 && state.abort.load(SeqCst) == 0 {
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    state.go.store(1, SeqCst);
+
+    for tid in &tids[..started] {
+        join_or_abort(*tid);
+    }
+
+    // SAFETY: all threads have joined; reading non-atomic totals and destroying the mutex.
+    let (counter, shadow, destroy) =
+        unsafe { (state.counter.get().read(), state.shadow.get().read(), pthread_mutex_destroy(state.mutex.as_ptr())) };
+    eq("pthread_mutex_destroy", i64::from(destroy), 0)?;
+    state.err.check()?;
+    eq("mutex torn updates", i64::from(state.torn.load(SeqCst)), 0)?;
+    let want = (count as u64 * MUTEX_ITERS) as i64;
+    eq("mutex exact counter", counter as i64, want)?;
+    eq("mutex exact shadow", shadow as i64, want)
+}
+
+struct CondTurnsState {
+    mutex: PthreadBuf,
+    cond: PthreadBuf,
+    n_threads: usize,
+    use_broadcast: bool,
+    ready: AtomicU32,
+    abort: AtomicU32,
+    err: common::WorkerError,
+    turn: core::cell::UnsafeCell<usize>,
+    total: core::cell::UnsafeCell<u64>,
+    per_thread: core::cell::UnsafeCell<[u64; MAX_STRESS_CPUS]>,
+}
+
+struct CondWorkerArg {
+    id: usize,
+    cpu: u32,
+    state: *const CondTurnsState,
+}
+
+fn abort_cond_state(s: &CondTurnsState) {
+    s.abort.store(1, SeqCst);
+    // SAFETY: acquiring `s.mutex` around `pthread_cond_broadcast` ensures no
+    // worker misses the abort wakeup before entering `pthread_cond_wait`.
+    unsafe {
+        if pthread_mutex_lock(s.mutex.as_ptr()) == 0 {
+            let _ = pthread_cond_broadcast(s.cond.as_ptr());
+            let _ = pthread_mutex_unlock(s.mutex.as_ptr());
+        } else {
+            let _ = pthread_cond_broadcast(s.cond.as_ptr());
+        }
+    }
+}
+
+extern "C" fn cond_turns_worker(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: parent keeps `CondWorkerArg` and `CondTurnsState` alive until `pthread_join`.
+    let w = unsafe { &*(arg as *const CondWorkerArg) };
+    // SAFETY: `w.state` points to the live stack-allocated `CondTurnsState`.
+    let s = unsafe { &*w.state };
+    if let Err(e) = pin_cpu(w.cpu) {
+        s.err.record(e);
+        s.ready.fetch_add(1, SeqCst);
+        abort_cond_state(s);
+        return core::ptr::null_mut();
+    }
+    s.ready.fetch_add(1, SeqCst);
+    while s.ready.load(SeqCst) < s.n_threads as u32 && s.abort.load(SeqCst) == 0 {
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    if s.abort.load(SeqCst) != 0 {
+        return core::ptr::null_mut();
+    }
+    for _ in 0..COND_TURNS {
+        // SAFETY: `s.mutex` and `s.cond` are initialized and live until join.
+        let rc = unsafe { pthread_mutex_lock(s.mutex.as_ptr()) };
+        if rc != 0 {
+            s.err.record(common::Fail { what: "pthread_mutex_lock", got: i64::from(rc) });
+            abort_cond_state(s);
+            return core::ptr::null_mut();
+        }
+        loop {
+            if s.abort.load(SeqCst) != 0 {
+                // SAFETY: unlock before aborting.
+                unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) };
+                return core::ptr::null_mut();
+            }
+            // SAFETY: `s.mutex` is held.
+            let cur = unsafe { s.turn.get().read_volatile() };
+            if cur == w.id {
+                break;
+            }
+            // SAFETY: `s.mutex` is held and `s.cond` is initialized.
+            let rc = unsafe { pthread_cond_wait(s.cond.as_ptr(), s.mutex.as_ptr()) };
+            if rc != 0 {
+                s.err.record(common::Fail { what: "pthread_cond_wait", got: i64::from(rc) });
+                // SAFETY: unlock before aborting.
+                unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) };
+                abort_cond_state(s);
+                return core::ptr::null_mut();
+            }
+        }
+        // SAFETY: `s.mutex` is held; exclusively update turn state.
+        unsafe {
+            let total = s.total.get().read_volatile();
+            s.total.get().write_volatile(total + 1);
+            let counts = &mut *s.per_thread.get();
+            counts[w.id] += 1;
+            s.turn.get().write_volatile((w.id + 1) % s.n_threads);
+        }
+        // SAFETY: `s.cond` is initialized and live.
+        let wake_rc = unsafe {
+            if s.use_broadcast { pthread_cond_broadcast(s.cond.as_ptr()) } else { pthread_cond_signal(s.cond.as_ptr()) }
+        };
+        if wake_rc != 0 {
+            s.err.record(common::Fail { what: "pthread_cond wake", got: i64::from(wake_rc) });
+            // SAFETY: unlock before aborting.
+            unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) };
+            abort_cond_state(s);
+            return core::ptr::null_mut();
+        }
+        // SAFETY: this thread currently holds `s.mutex`.
+        let rc = unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) };
+        if rc != 0 {
+            s.err.record(common::Fail { what: "pthread_mutex_unlock", got: i64::from(rc) });
+            abort_cond_state(s);
+            return core::ptr::null_mut();
+        }
+    }
+    core::ptr::null_mut()
+}
+
+fn run_cond_turns(cpus: &[u32], use_broadcast: bool) -> R {
+    let n = cpus.len();
+    let state = CondTurnsState {
+        mutex: PthreadBuf::zeroed(),
+        cond: PthreadBuf::zeroed(),
+        n_threads: n,
+        use_broadcast,
+        ready: AtomicU32::new(0),
+        abort: AtomicU32::new(0),
+        err: common::WorkerError::new(),
+        turn: core::cell::UnsafeCell::new(0),
+        total: core::cell::UnsafeCell::new(0),
+        per_thread: core::cell::UnsafeCell::new([0; MAX_STRESS_CPUS]),
+    };
+    // SAFETY: aligned zeroed buffers sized for musl x86-64 pthread_mutex_t / pthread_cond_t.
+    unsafe {
+        eq("cond mutex init", i64::from(pthread_mutex_init(state.mutex.as_ptr(), core::ptr::null())), 0)?;
+        if let Err(e) = eq("cond init", i64::from(pthread_cond_init(state.cond.as_ptr(), core::ptr::null())), 0) {
+            pthread_mutex_destroy(state.mutex.as_ptr());
+            return Err(e);
+        }
+    }
+
+    let mut args = [const { CondWorkerArg { id: 0, cpu: 0, state: core::ptr::null() } }; MAX_STRESS_CPUS];
+    let mut tids = [0usize; MAX_STRESS_CPUS];
+    let mut started = 0usize;
+    for i in 0..n {
+        args[i] = CondWorkerArg { id: i, cpu: cpus[i], state: &state };
+        // SAFETY: `args[i]` and `state` stay alive until all threads are joined below.
+        let rc = unsafe {
+            pthread_create(&mut tids[i], core::ptr::null(), cond_turns_worker, (&args[i] as *const _) as *mut c_void)
+        };
+        if rc != 0 {
+            abort_cond_state(&state);
+            for tid in &tids[..started] {
+                join_or_abort(*tid);
+            }
+            // SAFETY: all started workers joined; destroy primitives.
+            unsafe {
+                pthread_cond_destroy(state.cond.as_ptr());
+                pthread_mutex_destroy(state.mutex.as_ptr());
+            }
+            return Err(common::Fail { what: "pthread_create cond worker", got: i64::from(rc) });
+        }
+        started += 1;
+    }
+    for tid in &tids[..started] {
+        join_or_abort(*tid);
+    }
+
+    // SAFETY: all threads have joined; inspect state and destroy synchronization primitives.
+    let (turn, total, per_thread, c_rc, m_rc) = unsafe {
+        (
+            state.turn.get().read(),
+            state.total.get().read(),
+            state.per_thread.get().read(),
+            pthread_cond_destroy(state.cond.as_ptr()),
+            pthread_mutex_destroy(state.mutex.as_ptr()),
+        )
+    };
+    eq("pthread_cond_destroy", i64::from(c_rc), 0)?;
+    eq("pthread_mutex_destroy", i64::from(m_rc), 0)?;
+    state.err.check()?;
+    eq("cond final turn", turn as i64, 0)?;
+    eq("cond total handoffs", total as i64, (n as u64 * COND_TURNS) as i64)?;
+    for &c in &per_thread[..n] {
+        eq("cond per-thread turns", c as i64, COND_TURNS as i64)?;
+    }
+    Ok(())
+}
+
+fn pthread_cond_turns() -> R {
+    let (cpus, count) = stress_online_cpus()?;
+    // 4-CPU round-robin handoffs with pthread_cond_broadcast (FUTEX_REQUEUE).
+    run_cond_turns(&cpus[..count], true)?;
+    // 2-CPU ping-pong handoffs across CPUs 0 and 1 with pthread_cond_signal.
+    run_cond_turns(&cpus[..2], false)
+}
+
+pub fn stress() -> c_int {
+    common::run_checks(&[("pthread-mutex-stress", &pthread_mutex_stress), ("pthread-cond-turns", &pthread_cond_turns)])
+}
+
+// ---------------------------------------------------------------------------
+// C11: Kernel-blocking witness for musl pthread_mutex_lock & pthread_cond_wait
+// ---------------------------------------------------------------------------
+
+struct BlockWitnessState {
+    mutex: PthreadBuf,
+    cond: PthreadBuf,
+    ready: AtomicU32,
+    acquired: AtomicU32,
+    waiters_in: AtomicU32,
+    woken: AtomicU32,
+    go: AtomicU32,
+    abort: AtomicU32,
+    err: common::WorkerError,
+}
+
+struct BlockWorkerArg {
+    cpu: u32,
+    state: *const BlockWitnessState,
+}
+
+extern "C" fn mutex_block_contender(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: parent retains `BlockWorkerArg` and `BlockWitnessState` until join.
+    let w = unsafe { &*(arg as *const BlockWorkerArg) };
+    // SAFETY: `w.state` points to the live stack-allocated `BlockWitnessState`.
+    let s = unsafe { &*w.state };
+    if let Err(e) = pin_cpu(w.cpu) {
+        s.err.record(e);
+        s.abort.store(1, SeqCst);
+        s.ready.fetch_add(1, SeqCst);
+        return core::ptr::null_mut();
+    }
+    s.ready.fetch_add(1, SeqCst);
+    // SAFETY: `s.mutex` is initialized and held by the leader; this blocks in FUTEX_WAIT.
+    let rc = unsafe { pthread_mutex_lock(s.mutex.as_ptr()) };
+    if rc != 0 {
+        s.err.record(common::Fail { what: "contender mutex_lock", got: i64::from(rc) });
+        return core::ptr::null_mut();
+    }
+    s.acquired.fetch_add(1, SeqCst);
+    // SAFETY: this thread owns `s.mutex`.
+    let rc = unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) };
+    if rc != 0 {
+        s.err.record(common::Fail { what: "contender mutex_unlock", got: i64::from(rc) });
+    }
+    core::ptr::null_mut()
+}
+
+extern "C" fn cond_block_waiter(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: parent retains `BlockWorkerArg` and `BlockWitnessState` until join.
+    let w = unsafe { &*(arg as *const BlockWorkerArg) };
+    // SAFETY: `w.state` points to the live stack-allocated `BlockWitnessState`.
+    let s = unsafe { &*w.state };
+    if let Err(e) = pin_cpu(w.cpu) {
+        s.err.record(e);
+        s.abort.store(1, SeqCst);
+        s.waiters_in.fetch_add(1, SeqCst);
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `s.mutex` and `s.cond` are initialized and live until join.
+    let rc = unsafe { pthread_mutex_lock(s.mutex.as_ptr()) };
+    if rc != 0 {
+        s.err.record(common::Fail { what: "cond waiter mutex_lock", got: i64::from(rc) });
+        s.abort.store(1, SeqCst);
+        s.waiters_in.fetch_add(1, SeqCst);
+        return core::ptr::null_mut();
+    }
+    s.waiters_in.fetch_add(1, SeqCst);
+    while s.go.load(SeqCst) == 0 && s.abort.load(SeqCst) == 0 {
+        // SAFETY: `s.mutex` is held; this blocks in FUTEX_WAIT until broadcast.
+        let rc = unsafe { pthread_cond_wait(s.cond.as_ptr(), s.mutex.as_ptr()) };
+        if rc != 0 {
+            s.err.record(common::Fail { what: "cond waiter cond_wait", got: i64::from(rc) });
+            s.abort.store(1, SeqCst);
+            break;
+        }
+    }
+    if s.abort.load(SeqCst) == 0 {
+        s.woken.fetch_add(1, SeqCst);
+    }
+    // SAFETY: this thread owns `s.mutex`.
+    let rc = unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) };
+    if rc != 0 {
+        s.err.record(common::Fail { what: "cond waiter mutex_unlock", got: i64::from(rc) });
+    }
+    core::ptr::null_mut()
+}
+
+fn futex_kernel_blocking() -> R {
+    let (cpus, count) = stress_online_cpus()?;
+    let remotes = count - 1;
+    let pid = sys(SYS_GETPID, [0; 6]);
+    pin_cpu(cpus[0])?;
+
+    let state = BlockWitnessState {
+        mutex: PthreadBuf::zeroed(),
+        cond: PthreadBuf::zeroed(),
+        ready: AtomicU32::new(0),
+        acquired: AtomicU32::new(0),
+        waiters_in: AtomicU32::new(0),
+        woken: AtomicU32::new(0),
+        go: AtomicU32::new(0),
+        abort: AtomicU32::new(0),
+        err: common::WorkerError::new(),
+    };
+    // SAFETY: aligned interior-mutable buffers sized for musl x86-64 primitives.
+    unsafe {
+        eq("block mutex init", i64::from(pthread_mutex_init(state.mutex.as_ptr(), core::ptr::null())), 0)?;
+        if let Err(e) = eq("block cond init", i64::from(pthread_cond_init(state.cond.as_ptr(), core::ptr::null())), 0) {
+            pthread_mutex_destroy(state.mutex.as_ptr());
+            return Err(e);
+        }
+    }
+
+    // Phase 1: hold `mutex` on CPU 0 while contenders on CPUs 1..count block in `pthread_mutex_lock`.
+    // SAFETY: `state.mutex` is initialized.
+    eq("leader mutex lock", i64::from(unsafe { pthread_mutex_lock(state.mutex.as_ptr()) }), 0)?;
+    let mut args = [const { BlockWorkerArg { cpu: 0, state: core::ptr::null() } }; MAX_STRESS_CPUS];
+    let mut tids = [0usize; MAX_STRESS_CPUS];
+    let mut started = 0usize;
+    for i in 0..remotes {
+        args[i] = BlockWorkerArg { cpu: cpus[i + 1], state: &state };
+        // SAFETY: `args[i]` and `state` outlive every joined worker.
+        let rc = unsafe {
+            pthread_create(
+                &mut tids[i],
+                core::ptr::null(),
+                mutex_block_contender,
+                (&args[i] as *const _) as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            // SAFETY: release mutex so already-started contenders can exit.
+            unsafe { pthread_mutex_unlock(state.mutex.as_ptr()) };
+            for tid in &tids[..started] {
+                join_or_abort(*tid);
+            }
+            // SAFETY: all workers joined.
+            unsafe {
+                pthread_cond_destroy(state.cond.as_ptr());
+                pthread_mutex_destroy(state.mutex.as_ptr());
+            }
+            return Err(common::Fail { what: "pthread_create mutex contender", got: i64::from(rc) });
+        }
+        started += 1;
+    }
+    while state.ready.load(SeqCst) < started as u32 {
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    let mut byte = [0u8; 1];
+    let read1 = if state.err.has_error() {
+        0
+    } else {
+        say!("futex-block: mutex pid={pid} ready");
+        sys(SYS_READ, [0, byte.as_mut_ptr() as u64, 1, 0, 0, 0])
+    };
+    // SAFETY: leader still owns `state.mutex`.
+    let unlock1 = unsafe { pthread_mutex_unlock(state.mutex.as_ptr()) };
+    for tid in &tids[..started] {
+        join_or_abort(*tid);
+    }
+    if state.err.has_error() || unlock1 != 0 || read1 != 1 || state.acquired.load(SeqCst) != remotes as u32 {
+        // SAFETY: all phase-1 workers joined; destroy before returning error.
+        unsafe {
+            pthread_cond_destroy(state.cond.as_ptr());
+            pthread_mutex_destroy(state.mutex.as_ptr());
+        }
+        state.err.check()?;
+        eq("leader mutex unlock", i64::from(unlock1), 0)?;
+        eq("mutex control byte", read1, 1)?;
+        eq("all contenders acquired mutex", i64::from(state.acquired.load(SeqCst)), remotes as i64)?;
+    }
+
+    // Phase 2: waiters on CPUs 1..count enter `pthread_cond_wait` before the leader broadcasts.
+    started = 0;
+    for i in 0..remotes {
+        args[i] = BlockWorkerArg { cpu: cpus[i + 1], state: &state };
+        // SAFETY: `args[i]` and `state` outlive every joined worker.
+        let rc = unsafe {
+            pthread_create(&mut tids[i], core::ptr::null(), cond_block_waiter, (&args[i] as *const _) as *mut c_void)
+        };
+        if rc != 0 {
+            state.abort.store(1, SeqCst);
+            // SAFETY: wake already-started waiters under mutex before joining.
+            unsafe {
+                if pthread_mutex_lock(state.mutex.as_ptr()) == 0 {
+                    let _ = pthread_cond_broadcast(state.cond.as_ptr());
+                    let _ = pthread_mutex_unlock(state.mutex.as_ptr());
+                }
+            }
+            for tid in &tids[..started] {
+                join_or_abort(*tid);
+            }
+            // SAFETY: all workers joined.
+            unsafe {
+                pthread_cond_destroy(state.cond.as_ptr());
+                pthread_mutex_destroy(state.mutex.as_ptr());
+            }
+            return Err(common::Fail { what: "pthread_create cond waiter", got: i64::from(rc) });
+        }
+        started += 1;
+    }
+    // Wait until every waiter has incremented `waiters_in` under `mutex` and released `mutex`
+    // into `pthread_cond_wait`.
+    loop {
+        // SAFETY: `state.mutex` is initialized.
+        let l = unsafe { pthread_mutex_lock(state.mutex.as_ptr()) };
+        if l != 0 {
+            state.abort.store(1, SeqCst);
+            // SAFETY: wake already-started waiters before joining.
+            unsafe { pthread_cond_broadcast(state.cond.as_ptr()) };
+            for tid in &tids[..started] {
+                join_or_abort(*tid);
+            }
+            // SAFETY: all workers joined.
+            unsafe {
+                pthread_cond_destroy(state.cond.as_ptr());
+                pthread_mutex_destroy(state.mutex.as_ptr());
+            }
+            return Err(common::Fail { what: "leader cond poll lock", got: i64::from(l) });
+        }
+        let n_in = state.waiters_in.load(SeqCst);
+        // SAFETY: leader owns `state.mutex`.
+        let u = unsafe { pthread_mutex_unlock(state.mutex.as_ptr()) };
+        if u != 0 {
+            state.abort.store(1, SeqCst);
+            // SAFETY: wake already-started waiters before joining.
+            unsafe { pthread_cond_broadcast(state.cond.as_ptr()) };
+            for tid in &tids[..started] {
+                join_or_abort(*tid);
+            }
+            // SAFETY: all workers joined.
+            unsafe {
+                pthread_cond_destroy(state.cond.as_ptr());
+                pthread_mutex_destroy(state.mutex.as_ptr());
+            }
+            return Err(common::Fail { what: "leader cond poll unlock", got: i64::from(u) });
+        }
+        if n_in >= started as u32 || state.err.has_error() {
+            break;
+        }
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    let read2 = if state.err.has_error() {
+        0
+    } else {
+        say!("futex-block: cond pid={pid} ready");
+        sys(SYS_READ, [0, byte.as_mut_ptr() as u64, 1, 0, 0, 0])
+    };
+    // SAFETY: wake all waiters under `state.mutex`.
+    let (l2, b2, u2) = unsafe {
+        let l = pthread_mutex_lock(state.mutex.as_ptr());
+        state.go.store(1, SeqCst);
+        let b = pthread_cond_broadcast(state.cond.as_ptr());
+        let u = if l == 0 { pthread_mutex_unlock(state.mutex.as_ptr()) } else { 0 };
+        (l, b, u)
+    };
+    for tid in &tids[..started] {
+        join_or_abort(*tid);
+    }
+    // SAFETY: all workers joined; destroy primitives.
+    let (cd, md) = unsafe { (pthread_cond_destroy(state.cond.as_ptr()), pthread_mutex_destroy(state.mutex.as_ptr())) };
+    eq("block cond destroy", i64::from(cd), 0)?;
+    eq("block mutex destroy", i64::from(md), 0)?;
+    state.err.check()?;
+    eq("leader cond wake lock", i64::from(l2), 0)?;
+    eq("leader cond broadcast", i64::from(b2), 0)?;
+    eq("leader cond wake unlock", i64::from(u2), 0)?;
+    eq("cond control byte", read2, 1)?;
+    eq("all cond waiters woken", i64::from(state.woken.load(SeqCst)), remotes as i64)
+}
+
+pub fn block_witness() -> c_int {
+    common::run_checks(&[("futex-kernel-blocking", &futex_kernel_blocking)])
 }

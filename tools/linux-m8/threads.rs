@@ -363,3 +363,172 @@ pub fn run() -> c_int {
         ("thread-exit-status", &exits),
     ])
 }
+
+// ---------------------------------------------------------------------------
+// C11: Multithreaded workload pinned across every online CPU
+// ---------------------------------------------------------------------------
+
+const SYS_SCHED_YIELD: u64 = 24;
+const SYS_SCHED_SETAFFINITY: u64 = 203;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
+const SYS_GETCPU: u64 = 309;
+const MAX_SMP_CPUS: usize = 8;
+const HALF_WORK: u32 = 20_000;
+
+struct SmpShared {
+    n_cpus: u32,
+    ready: AtomicU32,
+    midpoint: AtomicU32,
+    abort: AtomicU32,
+    err: common::WorkerError,
+    migrated: AtomicU32,
+    progress: [AtomicU32; MAX_SMP_CPUS],
+    checksum: [core::sync::atomic::AtomicU64; MAX_SMP_CPUS],
+}
+
+struct SmpWorkerArg {
+    idx: usize,
+    cpu: u32,
+    shared: *const SmpShared,
+}
+
+fn join_or_abort(tid: usize) {
+    let mut res = core::ptr::null_mut();
+    // SAFETY: `tid` is a live joinable pthread.
+    let rc = unsafe { pthread_join(tid, &mut res) };
+    if rc != 0 {
+        say!("FAIL pthread_join: failed (got {rc})");
+        common::exit_group(99);
+    }
+}
+
+fn pin_and_confirm(cpu: u32) -> R {
+    let mask = 1u64 << cpu;
+    eq("sched_setaffinity", sys(SYS_SCHED_SETAFFINITY, [0, 8, &mask as *const _ as u64, 0, 0, 0]), 0)?;
+    loop {
+        eq("sched_yield", sys(SYS_SCHED_YIELD, [0; 6]), 0)?;
+        let mut here = u32::MAX;
+        let mut node = u32::MAX;
+        eq("getcpu", sys(SYS_GETCPU, [&mut here as *mut _ as u64, &mut node as *mut _ as u64, 0, 0, 0, 0]), 0)?;
+        eq("getcpu node zero", i64::from(node), 0)?;
+        if here == cpu {
+            return Ok(());
+        }
+    }
+}
+
+fn expected_checksum(cpu: u32) -> u64 {
+    let mut acc = 0xcbf2_9ce4_8422_2325u64 ^ u64::from(cpu);
+    for i in 0..(2 * HALF_WORK) {
+        acc = acc.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(i);
+    }
+    acc
+}
+
+extern "C" fn smp_worker(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: parent retains `SmpWorkerArg` and `SmpShared` until `pthread_join`.
+    let w = unsafe { &*(arg as *const SmpWorkerArg) };
+    // SAFETY: `w.shared` points to the live stack-allocated `SmpShared`.
+    let s = unsafe { &*w.shared };
+    if let Err(e) = pin_and_confirm(w.cpu) {
+        s.err.record(e);
+        s.abort.store(1, SeqCst);
+        s.ready.fetch_add(1, SeqCst);
+        s.midpoint.fetch_add(1, SeqCst);
+        return core::ptr::null_mut();
+    }
+    s.ready.fetch_add(1, SeqCst);
+    while s.ready.load(SeqCst) < s.n_cpus && s.abort.load(SeqCst) == 0 {
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    if s.abort.load(SeqCst) != 0 {
+        return core::ptr::null_mut();
+    }
+
+    let mut acc = 0xcbf2_9ce4_8422_2325u64 ^ u64::from(w.cpu);
+    for phase in 0..2u32 {
+        let base = phase * HALF_WORK;
+        for step in 0..HALF_WORK {
+            acc = acc.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(base + step);
+            if step % 2000 == 0 {
+                let mut here = u32::MAX;
+                let mut node = u32::MAX;
+                let rc = sys(SYS_GETCPU, [&mut here as *mut _ as u64, &mut node as *mut _ as u64, 0, 0, 0, 0]);
+                if rc != 0 || node != 0 || here != w.cpu {
+                    s.migrated.fetch_add(1, SeqCst);
+                }
+            }
+        }
+        s.progress[w.idx].fetch_add(HALF_WORK, SeqCst);
+        if phase == 0 {
+            s.midpoint.fetch_add(1, SeqCst);
+            while s.midpoint.load(SeqCst) < s.n_cpus && s.abort.load(SeqCst) == 0 {
+                sys(SYS_SCHED_YIELD, [0; 6]);
+            }
+            if s.abort.load(SeqCst) != 0 {
+                return core::ptr::null_mut();
+            }
+        }
+    }
+    s.checksum[w.idx].store(acc, SeqCst);
+    core::ptr::null_mut()
+}
+
+fn smp_all_cpus() -> R {
+    let mut mask = 0u64;
+    eq("sched_getaffinity", sys(SYS_SCHED_GETAFFINITY, [0, 8, &mut mask as *mut _ as u64, 0, 0, 0]), 8)?;
+    let mut cpus = [0u32; MAX_SMP_CPUS];
+    let mut count = 0usize;
+    for cpu in 0..64u32 {
+        if (mask & (1u64 << cpu)) != 0 && count < MAX_SMP_CPUS {
+            cpus[count] = cpu;
+            count += 1;
+        }
+    }
+    ensure("smp workload requires at least 4 online CPUs", count >= 4, count as i64)?;
+
+    let shared = SmpShared {
+        n_cpus: count as u32,
+        ready: AtomicU32::new(0),
+        midpoint: AtomicU32::new(0),
+        abort: AtomicU32::new(0),
+        err: common::WorkerError::new(),
+        migrated: AtomicU32::new(0),
+        progress: [const { AtomicU32::new(0) }; MAX_SMP_CPUS],
+        checksum: [const { core::sync::atomic::AtomicU64::new(0) }; MAX_SMP_CPUS],
+    };
+    let mut args = [const { SmpWorkerArg { idx: 0, cpu: 0, shared: core::ptr::null() } }; MAX_SMP_CPUS];
+    let mut tids = [0usize; MAX_SMP_CPUS];
+    let mut started = 0usize;
+    for i in 0..count {
+        args[i] = SmpWorkerArg { idx: i, cpu: cpus[i], shared: &shared };
+        match create(smp_worker, &args[i] as *const SmpWorkerArg as usize) {
+            Ok(tid) => {
+                tids[i] = tid;
+                started += 1;
+            }
+            Err(e) => {
+                shared.abort.store(1, SeqCst);
+                for tid in &tids[..started] {
+                    join_or_abort(*tid);
+                }
+                return Err(e);
+            }
+        }
+    }
+    for tid in &tids[..started] {
+        join_or_abort(*tid);
+    }
+    shared.err.check()?;
+    eq("smp pinned thread migrations", i64::from(shared.migrated.load(SeqCst)), 0)?;
+    for i in 0..count {
+        eq("smp cpu progress", i64::from(shared.progress[i].load(SeqCst)), i64::from(2 * HALF_WORK))?;
+        eq("smp cpu checksum", shared.checksum[i].load(SeqCst) as i64, expected_checksum(cpus[i]) as i64)?;
+    }
+    say!("smp: cpus={count}");
+    Ok(())
+}
+
+pub fn smp_workload() -> c_int {
+    common::run_checks(&[("smp-all-cpus", &smp_all_cpus)])
+}
