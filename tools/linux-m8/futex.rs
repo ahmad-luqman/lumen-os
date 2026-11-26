@@ -149,6 +149,9 @@ fn errors_and_demand() -> R {
     eq("CMP_REQUEUE faults in source", fx(third.addr, FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG, 0, 0, map.addr, 0), 0)?;
     eq("CMP_REQUEUE mismatch", fx(third.addr, FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG, 0, 0, map.addr, 1), -EAGAIN)?;
     eq("plain WAIT realtime", fx(map.addr, FUTEX_WAIT | FUTEX_CLOCK_REALTIME, 0, relative.ptr(), 0, 0), -ENOSYS)?;
+    for command in [FUTEX_WAIT, FUTEX_WAIT_BITSET] {
+        eq("realtime wait timeout fault", fx(map.addr, command | FUTEX_CLOCK_REALTIME, 0, u64::MAX, 0, 1), -EFAULT)?;
+    }
     eq("misaligned", fx(map.addr + 1, FUTEX_WAKE, 1, 0, 0, 0), -EINVAL)?;
     eq("alignment precedes user range", fx(u64::MAX, FUTEX_WAKE, 1, 0, 0, 0), -EINVAL)?;
     eq("outside user", fx(u64::MAX - 3, FUTEX_WAKE, 1, 0, 0, 0), -EFAULT)?;
@@ -158,6 +161,13 @@ fn errors_and_demand() -> R {
     eq("zero wake bitset", fx(map.addr, FUTEX_WAKE_BITSET, 1, 0, 0, 0), -EINVAL)?;
     for bad in [Timespec { sec: -1, nsec: 0 }, Timespec { sec: 0, nsec: -1 }, Timespec { sec: 0, nsec: NS as i64 }] {
         eq("bad futex timeout", fx(map.addr, FUTEX_WAIT, 0, bad.ptr(), 0, 0), -EINVAL)?;
+        for command in [FUTEX_WAIT, FUTEX_WAIT_BITSET] {
+            eq(
+                "realtime wait timeout invalid",
+                fx(map.addr, command | FUTEX_CLOCK_REALTIME, 0, bad.ptr(), 0, 1),
+                -EINVAL,
+            )?;
+        }
         eq("bad nanosleep", sys(SYS_NANOSLEEP, [bad.ptr(), 0, 0, 0, 0, 0]), -EINVAL)?;
     }
     for op in [FUTEX_REQUEUE, FUTEX_CMP_REQUEUE] {
@@ -185,36 +195,47 @@ fn errors_and_demand() -> R {
 fn sleep_floors() -> R {
     let map = Mapping::anon(false)?;
     let req = Timespec::of(INTERVAL);
-    let before = now(1)?;
+    let before = now(CLOCK_MONOTONIC)?;
     eq("relative futex timeout", fx(map.addr, FUTEX_WAIT, 0, req.ptr(), 0, 0), -ETIMEDOUT)?;
-    ensure("futex timeout floor", now(1)? - before >= INTERVAL, 0)?;
-    for clock in [1, 0] {
+    ensure("futex timeout floor", now(CLOCK_MONOTONIC)? - before >= INTERVAL, 0)?;
+    for clock in [CLOCK_MONOTONIC, CLOCK_REALTIME] {
         let until = now(clock)? + INTERVAL;
         let req = Timespec::of(until);
         eq(
             "absolute futex timeout",
-            fx(map.addr, FUTEX_WAIT_BITSET | if clock == 0 { FUTEX_CLOCK_REALTIME } else { 0 }, 0, req.ptr(), 0, 1),
+            fx(
+                map.addr,
+                FUTEX_WAIT_BITSET | if clock == CLOCK_REALTIME { FUTEX_CLOCK_REALTIME } else { 0 },
+                0,
+                req.ptr(),
+                0,
+                1,
+            ),
             -ETIMEDOUT,
         )?;
         ensure("absolute futex floor", now(clock)? >= until, 0)?;
     }
-    let before = now(1)?;
+    let before = now(CLOCK_MONOTONIC)?;
     eq("nanosleep", sys(SYS_NANOSLEEP, [req.ptr(), 0, 0, 0, 0, 0]), 0)?;
-    ensure("nanosleep floor", now(1)? - before >= INTERVAL, 0)?;
-    for clock in [0, 1, 7] {
+    ensure("nanosleep floor", now(CLOCK_MONOTONIC)? - before >= INTERVAL, 0)?;
+    for clock in [CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME] {
         let before = now(clock)?;
         eq("clock_nanosleep relative", sys(SYS_CLOCK_NANOSLEEP, [clock, 0, req.ptr(), 0, 0, 0]), 0)?;
         ensure("relative sleep floor", now(clock)? - before >= INTERVAL, 0)?;
         let until = now(clock)? + INTERVAL;
         let absolute = Timespec::of(until);
-        eq("absolute sleep ignores bad rem", sys(SYS_CLOCK_NANOSLEEP, [clock, 1, absolute.ptr(), u64::MAX, 0, 0]), 0)?;
+        eq(
+            "absolute sleep ignores bad rem",
+            sys(SYS_CLOCK_NANOSLEEP, [clock, TIMER_ABSTIME, absolute.ptr(), u64::MAX, 0, 0]),
+            0,
+        )?;
         ensure("absolute sleep floor", now(clock)? >= until, 0)?;
     }
-    for clock in [4, 5, 6] {
-        eq("known clock cannot sleep", sys(SYS_CLOCK_NANOSLEEP, [clock, 0, req.ptr(), 0, 0, 0]), -95)?;
+    for clock in [CLOCK_THREAD_CPUTIME_ID, CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE, CLOCK_MONOTONIC_COARSE] {
+        eq("known clock cannot sleep", sys(SYS_CLOCK_NANOSLEEP, [clock, 0, req.ptr(), 0, 0, 0]), -EOPNOTSUPP)?;
     }
-    for clock in [2, 3, 11, 99] {
-        eq("CPU or invalid clock", sys(SYS_CLOCK_NANOSLEEP, [clock, 0, req.ptr(), 0, 0, 0]), -EINVAL)?;
+    for clock in [CLOCK_PROCESS_CPUTIME_ID, CLOCK_TAI, CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM, 99] {
+        eq("unsupported or invalid clock", sys(SYS_CLOCK_NANOSLEEP, [clock, 0, req.ptr(), 0, 0, 0]), -EINVAL)?;
     }
     Ok(())
 }
@@ -250,7 +271,7 @@ fn wakes_requeues_bitsets() -> R {
         }
         // A positive control on this exact word proves a wrong-domain wake
         // would have a waiter to find. Probe while requeue confirms it queued.
-        let a = args(map.addr, private, 0);
+        let a = args(map.addr, FUTEX_WAIT | private, 0);
         let child = spawn(&a, &stacks[0])?;
         loop {
             if fx(map.addr, FUTEX_REQUEUE | private, 0, 1, map.addr, 0) == 1 {
@@ -274,8 +295,8 @@ fn requeue_wake_limits() -> R {
     for private in [0, FUTEX_PRIVATE_FLAG] {
         for command in [FUTEX_REQUEUE, FUTEX_CMP_REQUEUE] {
             for nr_requeue in [0, 1] {
-                let a = args(map.addr, private, 0);
-                let b = args(map.addr, private, 0);
+                let a = args(map.addr, FUTEX_WAIT | private, 0);
+                let b = args(map.addr, FUTEX_WAIT | private, 0);
                 let c1 = spawn(&a, &stacks[0])?;
                 let c2 = spawn(&b, &stacks[1])?;
                 // No timing assumption: requeue-to-self confirms both nodes exist.
@@ -303,8 +324,8 @@ fn requeue_wake_limits() -> R {
                 )?;
                 c1.join()?;
                 c2.join()?;
-                eq("requeue woke first waiter", a.result.load(SeqCst), 0)?;
-                eq("wake found remaining waiter", b.result.load(SeqCst), 0)?;
+                eq("first waiter returned zero", a.result.load(SeqCst), 0)?;
+                eq("second waiter returned zero", b.result.load(SeqCst), 0)?;
             }
         }
     }
@@ -331,17 +352,21 @@ fn across_fork() -> R {
         let pid = ok("fork waiter", sys(SYS_FORK, [0; 6]))?;
         if pid == 0 {
             let timeout = Timespec::of(INTERVAL);
-            let before = now(1).unwrap_or(0);
+            let before = now(CLOCK_MONOTONIC).unwrap_or(0);
             let got = fx(map.addr, FUTEX_WAIT, 0, if kind == 2 { timeout.ptr() } else { 0 }, 0, 0);
             control.word(0).store(1, SeqCst);
             let check = eq("cross-fork wait", got, if kind == 2 { -ETIMEDOUT } else { 0 }).and_then(|()| {
-                if kind == 2 { ensure("private Anon timeout floor", now(1)? - before >= INTERVAL, 0) } else { Ok(()) }
+                if kind == 2 {
+                    ensure("private Anon timeout floor", now(CLOCK_MONOTONIC)? - before >= INTERVAL, 0)
+                } else {
+                    Ok(())
+                }
             });
             child_exit(check);
         }
         let child = Child(pid);
         if kind != 2 {
-            wake_until(map.addr, 1, 0)?;
+            wake_until(map.addr, FUTEX_WAKE, 0)?;
         } else {
             let mut probes = 0;
             while control.word(0).load(SeqCst) == 0 {
@@ -359,7 +384,7 @@ fn across_fork() -> R {
 fn private_file_cow() -> R {
     let map = file_map(false)?;
     let stack = Mapping::new(65536, MAP_PRIVATE | MAP_ANONYMOUS, u64::MAX)?;
-    let a = args(map.addr, 0, 0);
+    let a = args(map.addr, FUTEX_WAIT, 0);
     let child = spawn(&a, &stack)?;
     // Requeue-to-self confirms WAIT is queued, but can itself fault in the
     // private copy. The kernel CoW test confirms blocking without resolving
@@ -389,6 +414,7 @@ fn robust_mutex() -> R {
     eq("robust head size", len as i64, 24)?;
     let original = head;
     eq("set opaque robust head", sys(SYS_SET_ROBUST_LIST, [0x1234, 24, 0, 0, 0, 0]), 0)?;
+    len = 0;
     let got = sys(SYS_GET_ROBUST_LIST, [0, &mut head as *mut _ as u64, &mut len as *mut _ as u64, 0, 0, 0]);
     eq("restore robust head", sys(SYS_SET_ROBUST_LIST, [original, 24, 0, 0, 0, 0]), 0)?;
     eq("get registered robust head", got, 0)?;
@@ -422,7 +448,7 @@ fn robust_mutex() -> R {
     // SAFETY: child exited while owning this live process-shared mutex;
     // OWNER_DIED transfers it to us, consistent repairs it before unlock.
     unsafe {
-        eq("owner died", pthread_mutex_lock(mutex) as i64, 130)?;
+        eq("owner died", pthread_mutex_lock(mutex) as i64, EOWNERDEAD)?;
         eq("mark consistent", pthread_mutex_consistent(mutex) as i64, 0)?;
         eq("unlock recovered", pthread_mutex_unlock(mutex) as i64, 0)?;
         eq("lock recovered", pthread_mutex_lock(mutex) as i64, 0)?;
@@ -480,7 +506,7 @@ fn clear_child_tid() -> R {
         while map.word(0).load(SeqCst) == 0 {
             nap();
         }
-        let mut a = args(map.addr, 0, 0);
+        let mut a = args(map.addr, FUTEX_WAIT, 0);
         a.value = map.word(0).load(SeqCst) as u64;
         let waiting = spawn(&a, &stacks[1])?;
         loop {
@@ -522,7 +548,7 @@ fn robust_exec() -> R {
         child_exit(Err(common::Fail { what: "exec returned", got: result }));
     }
     Child(pid).join()?;
-    eq("exec released old robust owner", map.word(40).load(SeqCst) as i64, 0x4000_0000)
+    eq("exec released old robust owner", map.word(40).load(SeqCst) as i64, FUTEX_OWNER_DIED)
 }
 
 pub fn run() -> c_int {

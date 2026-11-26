@@ -33,7 +33,7 @@ pub struct RestartBlock {
 }
 
 /// A restart code as the handler's `rax` (its negated value).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // ktests and poll restart checks
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests
 pub const fn restart_result(code: RestartCode) -> u64 {
     (-(code as i64)) as u64
 }

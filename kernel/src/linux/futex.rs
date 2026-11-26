@@ -30,6 +30,7 @@ pub(crate) enum KeyResolution {
 }
 
 const BUCKETS: usize = 256;
+const _: () = assert!(BUCKETS.is_power_of_two());
 
 impl FutexKey {
     fn bucket(self) -> usize {
@@ -221,7 +222,7 @@ fn owner_died(addr: u64, tid: u32, pending: bool, pi: bool) -> Result<(), u32> {
         let word = read_word(addr)?;
         if word & general::FUTEX_TID_MASK != tid {
             if pending && !pi && word & general::FUTEX_TID_MASK == 0 {
-                wake(addr, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY)?;
+                let _ = wake(addr, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY);
             }
             return Ok(());
         }
@@ -231,7 +232,7 @@ fn owner_died(addr: u64, tid: u32, pending: bool, pi: bool) -> Result<(), u32> {
             Ok(found) if found != word => continue,
             Ok(_) => {
                 if !pi && word & general::FUTEX_WAITERS != 0 {
-                    wake(addr, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY)?;
+                    let _ = wake(addr, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY);
                 }
                 return Ok(());
             }
@@ -270,7 +271,7 @@ fn walk_robust(head: u64, tid: u32) -> Result<(), u32> {
 
 /// Release a thread's robust list on its old address space, before clearing
 /// its child tid. A malformed list aborts cleanup, never the thread's exit.
-pub fn exit_robust_list(thread: &UserThread) {
+fn exit_robust_list(thread: &UserThread) {
     let head = thread.take_robust_list();
     if head != 0
         && let Err(error) = walk_robust(head, thread.tid())
@@ -280,7 +281,7 @@ pub fn exit_robust_list(thread: &UserThread) {
 }
 
 /// Release robust locks on the old mm, then clear and wake the child-tid
-/// word when another mm user can be waiting. User faults do not prevent exit.
+/// word when another mm user can be waiting. User faults do not prevent exit or exec.
 pub fn release_user_sync(thread: &UserThread, mm_shared: bool) {
     exit_robust_list(thread);
     let clear = thread.clear_child_tid();
@@ -412,19 +413,20 @@ crate::ktest!(
 
             // Pending cleanup may wake a waiter without owning the word;
             // a non-pending entry may not. Check all branches with real nodes.
-            for (word, pending, should_wake) in [
-                (0, true, true),
-                (general::FUTEX_WAITERS, true, true),
-                (tid + 1, true, false),
-                ((tid + 1) | general::FUTEX_WAITERS, true, false),
-                (0, false, false),
+            for (word, pending, pi, should_wake) in [
+                (0, true, false, true),
+                (general::FUTEX_WAITERS, true, false, true),
+                (tid + 1, true, false, false),
+                ((tid + 1) | general::FUTEX_WAITERS, true, false, false),
+                (0, false, false, false),
+                (0, true, true, false),
             ] {
                 put32(entry + 8, word)?;
                 let key = key(entry + 8, false).map_err(|_| "key")?;
                 let waiter = Arc::new(FutexWaiter::new(key.bucket()));
                 let node = Box::new(FutexNode::new(waiter.clone(), ANY));
                 FUTEX_BUCKETS[key.bucket()].lock().enqueue(key, node);
-                let handled = owner_died(entry + 8, tid, pending, false);
+                let handled = owner_died(entry + 8, tid, pending, pi);
                 let cancelled = cancel(&waiter);
                 kassert_eq!(handled, Ok(()));
                 kassert_eq!(read_word(entry + 8), Ok(word));

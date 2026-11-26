@@ -30,7 +30,9 @@ use crate::linux::{errno, general};
 use crate::sched;
 use crate::user::{CopyError, copy_from_user, copy_to_user};
 
-use super::time::{ERESTARTNOHAND, NS_PER_SEC, RawTimespec, read_timespec, write_timespec};
+#[cfg(feature = "ktest")]
+use super::time::RawTimespec;
+use super::time::{ERESTARTNOHAND, NS_PER_SEC, read_timespec, write_timespec};
 
 /// Microseconds per second.
 const US_PER_SEC: u64 = 1_000_000;
@@ -76,9 +78,6 @@ const _: () = {
     assert!(
         offset_of!(RawPollFd, revents) == offset_of!(general::pollfd, revents) && offset_of!(RawPollFd, revents) == 6
     );
-    assert!(size_of::<RawTimespec>() == size_of::<general::timespec>() && size_of::<RawTimespec>() == 16);
-    assert!(offset_of!(RawTimespec, tv_sec) == offset_of!(general::timespec, tv_sec));
-    assert!(offset_of!(RawTimespec, tv_nsec) == offset_of!(general::timespec, tv_nsec));
     assert!(size_of::<RawTimeval>() == size_of::<general::timeval>() && size_of::<RawTimeval>() == 16);
     assert!(offset_of!(RawTimeval, tv_sec) == offset_of!(general::timeval, tv_sec));
     assert!(offset_of!(RawTimeval, tv_usec) == offset_of!(general::timeval, tv_usec));

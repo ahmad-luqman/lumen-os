@@ -8,7 +8,7 @@ use super::{at::UserPtr, finish};
 use crate::linux::{errno, futex, general, process, signal};
 use crate::{sched, time, user};
 
-use super::time::{ERESTARTNOHAND, NS_PER_SEC as NS, read_timespec as timespec, write_timespec};
+use super::time::{ERESTARTNOHAND, NS_PER_SEC, read_timespec, write_timespec};
 
 fn deadline(duration: u64, absolute: bool, realtime: bool) -> u64 {
     if !absolute {
@@ -19,7 +19,7 @@ fn deadline(duration: u64, absolute: bool, realtime: bool) -> u64 {
     }
     // Read monotonic after realtime so conversion cannot shorten a sleep.
     let (sec, nsec) = time::realtime_sec_nsec();
-    let now = sec.saturating_mul(NS).saturating_add(nsec);
+    let now = sec.saturating_mul(NS_PER_SEC).saturating_add(nsec);
     time::now_ns().saturating_add(duration.saturating_sub(now))
 }
 
@@ -55,17 +55,18 @@ fn do_futex(addr: u64, op: u32, val: u32, timeout: u64, dest: u64, val3: u32) ->
     let command = op & !(general::FUTEX_PRIVATE_FLAG | general::FUTEX_CLOCK_REALTIME);
     let private = op & general::FUTEX_PRIVATE_FLAG != 0;
     let realtime = op & general::FUTEX_CLOCK_REALTIME != 0;
+    // Linux's sys_futex reads wait timeouts before do_futex rejects flags.
+    let until = if timeout != 0 && matches!(command, general::FUTEX_WAIT | general::FUTEX_WAIT_BITSET) {
+        Some(deadline(read_timespec(timeout)?, command == general::FUTEX_WAIT_BITSET, realtime))
+    } else {
+        None
+    };
     if realtime && command != general::FUTEX_WAIT_BITSET {
         return Err(errno::ENOSYS);
     }
     match command {
         general::FUTEX_WAIT | general::FUTEX_WAIT_BITSET => {
             let bits = if command == general::FUTEX_WAIT { lumen_futex::FUTEX_BITSET_MATCH_ANY.get() } else { val3 };
-            let until = if timeout == 0 {
-                None
-            } else {
-                Some(deadline(timespec(timeout)?, command == general::FUTEX_WAIT_BITSET, realtime))
-            };
             wait(addr, private, val, NonZeroU32::new(bits).ok_or(errno::EINVAL)?, until)
         }
         general::FUTEX_WAKE | general::FUTEX_WAKE_BITSET => {
@@ -144,7 +145,7 @@ fn resume_sleep(block: &signal::RestartBlock) -> u64 {
 /// `nanosleep(req, rem)` (35): sleep for at least req on the monotonic clock.
 /// Preserve its deadline across restart_syscall and report remaining time on interruption.
 pub(super) fn sys_nanosleep(req: UserPtr, rem: UserPtr) -> u64 {
-    finish(timespec(req.addr()).and_then(|ns| sleep(deadline(ns, false, false), rem.addr(), false)))
+    finish(read_timespec(req.addr()).and_then(|ns| sleep(deadline(ns, false, false), rem.addr(), false)))
 }
 
 /// `clock_nanosleep(clockid, flags, req, rem)` (230): relative sleeps restart
@@ -154,13 +155,17 @@ pub(super) fn sys_clock_nanosleep(clockid: i32, flags: u32, req: UserPtr, rem: U
     finish((|| {
         match clockid as u32 {
             general::CLOCK_REALTIME | general::CLOCK_MONOTONIC | general::CLOCK_BOOTTIME => {}
-            general::CLOCK_MONOTONIC_RAW | general::CLOCK_REALTIME_COARSE | general::CLOCK_MONOTONIC_COARSE => {
+            general::CLOCK_THREAD_CPUTIME_ID
+            | general::CLOCK_MONOTONIC_RAW
+            | general::CLOCK_REALTIME_COARSE
+            | general::CLOCK_MONOTONIC_COARSE => {
                 return Err(errno::EOPNOTSUPP);
             }
-            // CLOCK_TAI and CPU-time sleeps are unsupported deviations.
+            // CLOCK_TAI, CLOCK_PROCESS_CPUTIME_ID and the alarm clocks (8/9)
+            // are unsupported deviations.
             _ => return Err(errno::EINVAL),
         }
-        let ns = timespec(req.addr())?;
+        let ns = read_timespec(req.addr())?;
         let absolute = flags & general::TIMER_ABSTIME != 0;
         sleep(deadline(ns, absolute, clockid as u32 == general::CLOCK_REALTIME), rem.addr(), absolute)
     })())
@@ -172,7 +177,7 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         in_test_process(|_| {
             let me = sched::current().ok_or("scheduler thread")?;
-            let until = time::now_ns().saturating_add(60 * NS);
+            let until = time::now_ns().saturating_add(60 * NS_PER_SEC);
             signal::raise_for_test(&me, lumen_signal::Signal::USR1);
             user::copy_to_user(A, &[0xff; 16]).map_err(|_| "prefill rem")?;
             kassert_eq!(sleep(until, A, false), Err(RestartCode::RestartBlock as u32));
@@ -180,8 +185,8 @@ crate::ktest!(
             let block = sched::take_restart_block().ok_or("sleep restart block")?;
             kassert_eq!(block.deadline, Some(until));
             kassert_eq!(block.args[0], A);
-            let remaining = timespec(A).map_err(|_| "remaining time")?;
-            kassert!(remaining <= 60 * NS);
+            let remaining = read_timespec(A).map_err(|_| "remaining time")?;
+            kassert!(remaining <= 60 * NS_PER_SEC);
             kassert!(remaining >= until.saturating_sub(after));
             kassert_eq!(interrupted_sleep(0, u64::MAX, false), Ok(0));
             // A saved expired deadline must win over a pending signal, without

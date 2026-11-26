@@ -4510,7 +4510,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 225 | `timer_getoverrun(id)` | expiries while the timer's signal was still pending, at the last delivery (capped at `i32::MAX`) | C13 |
 | 226 | `timer_delete(id)` | disarms and frees it, discarding its pending signal; `-EINVAL` | C13 |
 | 229 | `clock_getres(clockid, res)` | the six clocks `clock_gettime` takes, each 1 ns (each read from the TSC; Linux reports its tick for the two coarse clocks, a deviation); `res` may be `NULL`; another clock `-EINVAL` | C12 |
-| 230 | `clock_nanosleep(clockid, flags, req, rem)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (`CLOCK_MONOTONIC_RAW` and the `*_COARSE` clocks `-EOPNOTSUPP`; `CLOCK_TAI` and CPU-time clocks `-EINVAL`, unsupported deviations); `TIMER_ABSTIME`: until that time, interrupted `-ERESTARTNOHAND` and `rem` untouched; relative: as `nanosleep`, interrupted `-ERESTART_RESTARTBLOCK` (Linux's `hrtimer_nanosleep`) | C4 |
+| 230 | `clock_nanosleep(clockid, flags, req, rem)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (`CLOCK_THREAD_CPUTIME_ID`, `CLOCK_MONOTONIC_RAW` and the `*_COARSE` clocks `-EOPNOTSUPP`; `CLOCK_TAI`, `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_REALTIME_ALARM` (8) and `CLOCK_BOOTTIME_ALARM` (9) `-EINVAL`, unsupported deviations); `TIMER_ABSTIME`: until that time, interrupted `-ERESTARTNOHAND` and `rem` untouched; relative: as `nanosleep`, interrupted `-ERESTART_RESTARTBLOCK` (Linux's `hrtimer_nanosleep`) | C4 |
 | 231 | `exit_group(status)` | ends every thread of the process (section 8, "Exit") | C1, C3 |
 | 234 | `tgkill(tgid, tid, sig)` | `tgid <= 0` or `tid <= 0` `-EINVAL`; `tid` not in `tgid` `-ESRCH`; as `tkill` | C5 |
 | 247 | `waitid(idtype, id, infop, options, rusage)` | section 8, "`wait4` and `waitid`" | C1, C6 |
@@ -5464,7 +5464,8 @@ user access":
   PI futexes.
 - **Errors:** alignment is checked before the user range: not 4-byte aligned
   `-EINVAL`, otherwise an address outside user space `-EFAULT`; timeout
-  copying/validation precedes a zero bitset's `-EINVAL`; a negative requeue count `-EINVAL`
+  copying/validation for wait commands precedes flag rejection (`-ENOSYS`)
+  and a zero bitset's `-EINVAL`; a negative requeue count `-EINVAL`
   (`check_requeue_counts`, before any key lookup, fault or value
   compare), a word that doesn't match `-EAGAIN`, an unreadable word
   `-EFAULT`, a bad timeout (a negative `tv_sec`, or a `tv_nsec` negative
@@ -10993,7 +10994,7 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   covers alignment/range and timeout/bitset; `get_robust_list` round-trips
   a registered head and rejects an absent tid. Unsupported futex operations
   and `futex_waitv` return ENOSYS. Known nonsleeping clocks return EOPNOTSUPP;
-  CPU-time, TAI and invalid clocks return EINVAL. A `CLONE_VM | SIGCHLD`
+  Process CPU-time, TAI, alarm and invalid clocks return EINVAL. A `CLONE_VM | SIGCHLD`
   child registers `set_tid_address`, then exits or execs; a second process
   sharing its mm waits on the word and returns 0 after the store/wake.
   The robust walk at exec marks the old shared word OWNER_DIED.

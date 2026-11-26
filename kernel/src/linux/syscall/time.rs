@@ -6,6 +6,7 @@ use crate::user::CopyError;
 
 /// Positive restart errno for calls that restart only without a handler.
 pub(super) const ERESTARTNOHAND: u32 = lumen_signal::restart::RestartCode::NoHand as u32;
+/// Nanoseconds per second.
 pub(super) const NS_PER_SEC: u64 = 1_000_000_000;
 
 /// Linux x86-64 timespec, with every bit initialized and no padding.
