@@ -103,6 +103,18 @@ unsafe extern "C" {
     fn pthread_mutex_consistent(mutex: *mut c_void) -> c_int;
     fn pthread_mutex_unlock(mutex: *mut c_void) -> c_int;
     fn pthread_mutex_destroy(mutex: *mut c_void) -> c_int;
+    fn pthread_cond_init(cond: *mut c_void, attr: *const c_void) -> c_int;
+    fn pthread_cond_wait(cond: *mut c_void, mutex: *mut c_void) -> c_int;
+    fn pthread_cond_signal(cond: *mut c_void) -> c_int;
+    fn pthread_cond_broadcast(cond: *mut c_void) -> c_int;
+    fn pthread_cond_destroy(cond: *mut c_void) -> c_int;
+    fn pthread_create(
+        thread: *mut usize,
+        attr: *const c_void,
+        run: extern "C" fn(*mut c_void) -> *mut c_void,
+        arg: *mut c_void,
+    ) -> c_int;
+    fn pthread_join(thread: usize, result: *mut *mut c_void) -> c_int;
 }
 extern "C" fn waiter(arg: *mut c_void) -> c_int {
     // SAFETY: spawn passes a live WaitArgs retained until this child is reaped.
@@ -563,4 +575,308 @@ pub fn run() -> c_int {
         ("futex-clear-child-tid-exit-exec", &clear_child_tid),
         ("futex-robust-exec", &robust_exec),
     ])
+}
+
+// ---------------------------------------------------------------------------
+// C11: Cross-CPU pthread_mutex and pthread_cond stress
+// ---------------------------------------------------------------------------
+
+const SYS_SCHED_YIELD: u64 = 24;
+const SYS_SCHED_SETAFFINITY: u64 = 203;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
+const SYS_GETCPU: u64 = 309;
+const MAX_STRESS_CPUS: usize = 8;
+const MUTEX_ITERS: u64 = 2000;
+const COND_TURNS: u64 = 250;
+
+/// Over-sized, 8-byte aligned backing for musl x86-64 `pthread_mutex_t` (40 B)
+/// and `pthread_cond_t` (48 B).
+#[repr(C, align(8))]
+struct PthreadBuf([u64; 8]);
+
+impl PthreadBuf {
+    const fn zeroed() -> Self {
+        Self([0; 8])
+    }
+    fn as_ptr(&self) -> *mut c_void {
+        self.0.as_ptr() as *mut c_void
+    }
+}
+
+fn stress_online_cpus() -> Result<([u32; MAX_STRESS_CPUS], usize), common::Fail> {
+    let mut mask = 0u64;
+    eq("sched_getaffinity", sys(SYS_SCHED_GETAFFINITY, [0, 8, &mut mask as *mut _ as u64, 0, 0, 0]), 8)?;
+    let mut cpus = [0u32; MAX_STRESS_CPUS];
+    let mut count = 0usize;
+    for cpu in 0..64u32 {
+        if (mask & (1u64 << cpu)) != 0 && count < MAX_STRESS_CPUS {
+            cpus[count] = cpu;
+            count += 1;
+        }
+    }
+    ensure("futex stress requires at least 4 online CPUs", count >= 4, count as i64)?;
+    Ok((cpus, count))
+}
+
+fn pin_cpu(cpu: u32) -> R {
+    let mask = 1u64 << cpu;
+    eq("sched_setaffinity", sys(SYS_SCHED_SETAFFINITY, [0, 8, &mask as *const _ as u64, 0, 0, 0]), 0)?;
+    loop {
+        eq("sched_yield", sys(SYS_SCHED_YIELD, [0; 6]), 0)?;
+        let mut here = u32::MAX;
+        let mut node = u32::MAX;
+        eq("getcpu", sys(SYS_GETCPU, [&mut here as *mut _ as u64, &mut node as *mut _ as u64, 0, 0, 0, 0]), 0)?;
+        eq("getcpu node zero", i64::from(node), 0)?;
+        if here == cpu {
+            return Ok(());
+        }
+    }
+}
+
+struct MutexStressState {
+    mutex: PthreadBuf,
+    ready: AtomicU32,
+    go: AtomicU32,
+    errors: AtomicU32,
+    torn: AtomicU32,
+    counter: core::cell::UnsafeCell<u64>,
+    shadow: core::cell::UnsafeCell<u64>,
+}
+
+struct MutexWorkerArg {
+    cpu: u32,
+    state: *const MutexStressState,
+}
+
+extern "C" fn mutex_stress_worker(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: parent keeps `MutexWorkerArg` and `MutexStressState` alive until `pthread_join`.
+    let w = unsafe { &*(arg as *const MutexWorkerArg) };
+    // SAFETY: `w.state` points to the live stack-allocated `MutexStressState`.
+    let s = unsafe { &*w.state };
+    if pin_cpu(w.cpu).is_err() {
+        s.errors.fetch_add(1, SeqCst);
+        s.ready.fetch_add(1, SeqCst);
+        return core::ptr::null_mut();
+    }
+    s.ready.fetch_add(1, SeqCst);
+    while s.go.load(SeqCst) == 0 {
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    for _ in 0..MUTEX_ITERS {
+        // SAFETY: `s.mutex` is initialized and remains live until all workers join.
+        if unsafe { pthread_mutex_lock(s.mutex.as_ptr()) } != 0 {
+            s.errors.fetch_add(1, SeqCst);
+            return core::ptr::null_mut();
+        }
+        // SAFETY: `s.mutex` serializes access to `counter` and `shadow`.
+        unsafe {
+            let a = s.counter.get().read_volatile();
+            let b = s.shadow.get().read_volatile();
+            if a != b {
+                s.torn.fetch_add(1, SeqCst);
+            }
+            s.counter.get().write_volatile(a + 1);
+            for _ in 0..8 {
+                core::hint::spin_loop();
+            }
+            s.shadow.get().write_volatile(b + 1);
+        }
+        // SAFETY: this thread currently owns `s.mutex`.
+        if unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) } != 0 {
+            s.errors.fetch_add(1, SeqCst);
+            return core::ptr::null_mut();
+        }
+    }
+    core::ptr::null_mut()
+}
+
+fn pthread_mutex_stress() -> R {
+    let (cpus, count) = stress_online_cpus()?;
+    let state = MutexStressState {
+        mutex: PthreadBuf::zeroed(),
+        ready: AtomicU32::new(0),
+        go: AtomicU32::new(0),
+        errors: AtomicU32::new(0),
+        torn: AtomicU32::new(0),
+        counter: core::cell::UnsafeCell::new(0),
+        shadow: core::cell::UnsafeCell::new(0),
+    };
+    // SAFETY: `state.mutex` is aligned, large enough for `pthread_mutex_t`, and destroyed below.
+    eq("pthread_mutex_init", i64::from(unsafe { pthread_mutex_init(state.mutex.as_ptr(), core::ptr::null()) }), 0)?;
+
+    let mut args = [const { MutexWorkerArg { cpu: 0, state: core::ptr::null() } }; MAX_STRESS_CPUS];
+    let mut tids = [0usize; MAX_STRESS_CPUS];
+    for i in 0..count {
+        args[i] = MutexWorkerArg { cpu: cpus[i], state: &state };
+        // SAFETY: `tids[i]` is writable; `args[i]` and `state` outlive every joined thread.
+        let rc = unsafe {
+            pthread_create(&mut tids[i], core::ptr::null(), mutex_stress_worker, (&args[i] as *const _) as *mut c_void)
+        };
+        eq("pthread_create mutex worker", i64::from(rc), 0)?;
+    }
+
+    while state.ready.load(SeqCst) < count as u32 {
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    state.go.store(1, SeqCst);
+
+    for tid in &tids[..count] {
+        let mut res = core::ptr::null_mut();
+        // SAFETY: `tid` is a live joinable pthread.
+        eq("pthread_join mutex worker", i64::from(unsafe { pthread_join(*tid, &mut res) }), 0)?;
+    }
+
+    // SAFETY: all threads have joined; reading non-atomic totals and destroying the mutex.
+    let (counter, shadow, destroy) =
+        unsafe { (state.counter.get().read(), state.shadow.get().read(), pthread_mutex_destroy(state.mutex.as_ptr())) };
+    eq("pthread_mutex_destroy", i64::from(destroy), 0)?;
+    eq("mutex worker errors", i64::from(state.errors.load(SeqCst)), 0)?;
+    eq("mutex torn updates", i64::from(state.torn.load(SeqCst)), 0)?;
+    let want = (count as u64 * MUTEX_ITERS) as i64;
+    eq("mutex exact counter", counter as i64, want)?;
+    eq("mutex exact shadow", shadow as i64, want)
+}
+
+struct CondTurnsState {
+    mutex: PthreadBuf,
+    cond: PthreadBuf,
+    n_threads: usize,
+    use_broadcast: bool,
+    ready: AtomicU32,
+    errors: AtomicU32,
+    turn: core::cell::UnsafeCell<usize>,
+    total: core::cell::UnsafeCell<u64>,
+    per_thread: core::cell::UnsafeCell<[u64; MAX_STRESS_CPUS]>,
+}
+
+struct CondWorkerArg {
+    id: usize,
+    cpu: u32,
+    state: *const CondTurnsState,
+}
+
+extern "C" fn cond_turns_worker(arg: *mut c_void) -> *mut c_void {
+    // SAFETY: parent keeps `CondWorkerArg` and `CondTurnsState` alive until `pthread_join`.
+    let w = unsafe { &*(arg as *const CondWorkerArg) };
+    // SAFETY: `w.state` points to the live stack-allocated `CondTurnsState`.
+    let s = unsafe { &*w.state };
+    if pin_cpu(w.cpu).is_err() {
+        s.errors.fetch_add(1, SeqCst);
+        s.ready.fetch_add(1, SeqCst);
+        return core::ptr::null_mut();
+    }
+    s.ready.fetch_add(1, SeqCst);
+    while s.ready.load(SeqCst) < s.n_threads as u32 {
+        sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    for _ in 0..COND_TURNS {
+        // SAFETY: `s.mutex` and `s.cond` are initialized and live until join.
+        if unsafe { pthread_mutex_lock(s.mutex.as_ptr()) } != 0 {
+            s.errors.fetch_add(1, SeqCst);
+            return core::ptr::null_mut();
+        }
+        loop {
+            // SAFETY: `s.mutex` is held.
+            let cur = unsafe { s.turn.get().read_volatile() };
+            if cur == w.id {
+                break;
+            }
+            // SAFETY: `s.mutex` is held and `s.cond` is initialized.
+            if unsafe { pthread_cond_wait(s.cond.as_ptr(), s.mutex.as_ptr()) } != 0 {
+                s.errors.fetch_add(1, SeqCst);
+                // SAFETY: unlock before bailing out.
+                unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) };
+                return core::ptr::null_mut();
+            }
+        }
+        // SAFETY: `s.mutex` is held; exclusively update turn state.
+        unsafe {
+            let total = s.total.get().read_volatile();
+            s.total.get().write_volatile(total + 1);
+            let counts = &mut *s.per_thread.get();
+            counts[w.id] += 1;
+            s.turn.get().write_volatile((w.id + 1) % s.n_threads);
+        }
+        // SAFETY: `s.cond` is initialized and live.
+        let wake_rc = unsafe {
+            if s.use_broadcast { pthread_cond_broadcast(s.cond.as_ptr()) } else { pthread_cond_signal(s.cond.as_ptr()) }
+        };
+        if wake_rc != 0 {
+            s.errors.fetch_add(1, SeqCst);
+        }
+        // SAFETY: this thread currently holds `s.mutex`.
+        if unsafe { pthread_mutex_unlock(s.mutex.as_ptr()) } != 0 {
+            s.errors.fetch_add(1, SeqCst);
+            return core::ptr::null_mut();
+        }
+    }
+    core::ptr::null_mut()
+}
+
+fn run_cond_turns(cpus: &[u32], use_broadcast: bool) -> R {
+    let n = cpus.len();
+    let state = CondTurnsState {
+        mutex: PthreadBuf::zeroed(),
+        cond: PthreadBuf::zeroed(),
+        n_threads: n,
+        use_broadcast,
+        ready: AtomicU32::new(0),
+        errors: AtomicU32::new(0),
+        turn: core::cell::UnsafeCell::new(0),
+        total: core::cell::UnsafeCell::new(0),
+        per_thread: core::cell::UnsafeCell::new([0; MAX_STRESS_CPUS]),
+    };
+    // SAFETY: aligned zeroed buffers sized for musl x86-64 pthread_mutex_t / pthread_cond_t.
+    unsafe {
+        eq("cond mutex init", i64::from(pthread_mutex_init(state.mutex.as_ptr(), core::ptr::null())), 0)?;
+        eq("cond init", i64::from(pthread_cond_init(state.cond.as_ptr(), core::ptr::null())), 0)?;
+    }
+
+    let mut args = [const { CondWorkerArg { id: 0, cpu: 0, state: core::ptr::null() } }; MAX_STRESS_CPUS];
+    let mut tids = [0usize; MAX_STRESS_CPUS];
+    for i in 0..n {
+        args[i] = CondWorkerArg { id: i, cpu: cpus[i], state: &state };
+        // SAFETY: `args[i]` and `state` stay alive until all threads are joined below.
+        let rc = unsafe {
+            pthread_create(&mut tids[i], core::ptr::null(), cond_turns_worker, (&args[i] as *const _) as *mut c_void)
+        };
+        eq("pthread_create cond worker", i64::from(rc), 0)?;
+    }
+    for tid in &tids[..n] {
+        let mut res = core::ptr::null_mut();
+        // SAFETY: `tid` is a live joinable pthread.
+        eq("pthread_join cond worker", i64::from(unsafe { pthread_join(*tid, &mut res) }), 0)?;
+    }
+
+    // SAFETY: all threads have joined; inspect state and destroy synchronization primitives.
+    let (turn, total, per_thread, c_rc, m_rc) = unsafe {
+        (
+            state.turn.get().read(),
+            state.total.get().read(),
+            state.per_thread.get().read(),
+            pthread_cond_destroy(state.cond.as_ptr()),
+            pthread_mutex_destroy(state.mutex.as_ptr()),
+        )
+    };
+    eq("pthread_cond_destroy", i64::from(c_rc), 0)?;
+    eq("pthread_mutex_destroy", i64::from(m_rc), 0)?;
+    eq("cond worker errors", i64::from(state.errors.load(SeqCst)), 0)?;
+    eq("cond final turn", turn as i64, 0)?;
+    eq("cond total handoffs", total as i64, (n as u64 * COND_TURNS) as i64)?;
+    for &c in &per_thread[..n] {
+        eq("cond per-thread turns", c as i64, COND_TURNS as i64)?;
+    }
+    Ok(())
+}
+
+fn pthread_cond_turns() -> R {
+    let (cpus, count) = stress_online_cpus()?;
+    // 4-CPU round-robin handoffs with pthread_cond_broadcast (FUTEX_REQUEUE).
+    run_cond_turns(&cpus[..count], true)?;
+    // 2-CPU ping-pong handoffs across CPUs 0 and 1 with pthread_cond_signal.
+    run_cond_turns(&cpus[..2], false)
+}
+
+pub fn stress() -> c_int {
+    common::run_checks(&[("pthread-mutex-stress", &pthread_mutex_stress), ("pthread-cond-turns", &pthread_cond_turns)])
 }

@@ -430,3 +430,29 @@ def test_interval_and_posix_timers(boot, tmp_path):
     assert "FAIL" not in out, out
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_futex_and_pthread_mutex_stress(boot, tmp_path):
+    """C11: cross-CPU pthread_mutex counter contention and pthread_cond turn handoffs."""
+    m = boot(
+        "qemutest",
+        extra=["-smp", "4"],
+        devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True),
+    )
+    m.expect(r"lumen> ", 60)
+    assert "INFO  smp: 4 CPUs online\n" in m.output, m.output
+    # First run warms multi-thread stack-window page tables; the second identical
+    # run must return every frame.
+    for attempt in range(2):
+        out = run(m, f"linux {PROC} futex-stress", 180)
+        assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+            "pthread-mutex-stress",
+            "pthread-cond-turns",
+        ], out
+        assert "FAIL" not in out, out
+        if attempt == 0:
+            assert f"linux: {PROC} exit=0 " in out, out
+        else:
+            assert re.search(rf"linux: {PROC} exit=0 leaked_frames=0\b", out), out
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
