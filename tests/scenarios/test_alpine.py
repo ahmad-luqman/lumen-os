@@ -194,7 +194,7 @@ def test_ash_scripts_and_pipelines(boot, tmp_path):
 
     External commands carry more than a pipe's capacity through three stages;
     redirections, subshell isolation, command substitution, signal/EXIT traps
-    and selected background waits preserve data and exit statuses. FIFO
+    and background waits preserve data, exit statuses and child reaping. FIFO
     handshakes establish readiness before releasing either background job.
     The changed ext4 files survive sync and pass the host's fsck.
     """
@@ -246,7 +246,7 @@ else
 fi
 printf 'substitution-status=%s,%s\n' "$status" "$captured"
 
-# Execute a file through the kernel's shebang path, retaining argv and env.
+# Execute a shell script, retaining argv and env.
 cat > child.sh <<'CHILD'
 #!/bin/sh
 printf 'script=%s,%s,%s,%s\n' "$#" "$1" "$D1_VALUE" "$PWD"
@@ -257,11 +257,27 @@ export D1_VALUE=inherited
 if ./child.sh 'two words'; then status=0; else status=$?; fi
 printf 'script-status=%s\n' "$status"
 
+# cat prints the source; ash's ENOEXEC fallback would execute its echo.
+# This distinguishes the kernel's shebang handling from that fallback.
+cat > cat.sh <<'CAT'
+#!/bin/busybox cat
+echo ash-fallback
+CAT
+/bin/busybox chmod 755 cat.sh
+./cat.sh
+
 trapped=missing
 trap 'trapped=USR1' USR1
 /bin/busybox kill -USR1 "$$"
 printf 'trap=%s\n' "$trapped"
 trap - USR1
+
+assert_reaped() {
+    if kill -0 "$1" 2>/dev/null; then
+        printf 'not-reaped=%s\n' "$2"
+        exit 31
+    fi
+}
 
 # Both children announce readiness before the parent releases the second
 # first. The first cannot finish until after wait has selected the second.
@@ -276,6 +292,7 @@ trap - USR1
 first=$!
 read -r ready_name < ready
 [ "$ready_name" = first ]
+kill -0 "$first"
 (
     printf 'second\n' > ready
     read -r token < second-go
@@ -287,19 +304,28 @@ second=$!
 read -r ready_name < ready
 [ "$ready_name" = second ]
 [ "$first" != "$second" ]
+kill -0 "$second"
 printf 'release-second\n' > second-go
 if wait "$second"; then status=0; else status=$?; fi
 printf 'wait-second=%s\n' "$status"
+assert_reaped "$second" selected-second
 [ ! -e first-result ]
 /bin/busybox cat second-result
 printf 'release-first\n' > first-go
 if wait "$first"; then status=0; else status=$?; fi
 printf 'wait-first=%s\n' "$status"
+assert_reaped "$first" selected-first
 /bin/busybox cat first-result
 
 (printf 'all-a\n' > all-a) &
+all_a=$!
 (printf 'all-b\n' > all-b) &
+all_b=$!
 wait
+# File contents alone cannot prove wait ran: both writers may finish first.
+# kill -0 still succeeds on a zombie, so require both children to be reaped.
+assert_reaped "$all_a" wait-all-a
+assert_reaped "$all_b" wait-all-b
 /bin/busybox cat all-a all-b
 /bin/busybox rm ready first-go second-go
 trap 'printf "exit-trap=%s\n" "$?"' EXIT
@@ -333,6 +359,8 @@ exit 23
         "substitution-status=19,failed-value",
         "script=1,two words,inherited,/ash-d1",
         "script-status=17",
+        "#!/bin/busybox cat",
+        "echo ash-fallback",
         "trap=USR1",
         "wait-second=9",
         "second-done",
@@ -366,6 +394,7 @@ exit 23
         "merged",
         "ordered",
         "child.sh",
+        "cat.sh",
         "first-result",
         "second-result",
         "all-a",
