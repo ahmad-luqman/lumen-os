@@ -35,6 +35,7 @@ MAX_LEN = 15  # lumen_trace::ThreadName::MAX_LEN
 # Each function taking a thread's name, and which argument it is.
 NAME_ARG = {
     "spawn": 0,
+    "spawn_migratable": 0,
     "run_sized": 0,
     "run_elf_process": 0,
     "hold_with": 0,
@@ -42,11 +43,14 @@ NAME_ARG = {
     "spawned": 0,
     "spawn_on": 1,
     "spawn_user_on": 1,
+    "spawn_user_pinned_on": 1,
     "spawn_fork_child": 0,
     "spawn_test": 1,
+    "spawn_test_migratable": 0,
     "spawn_ring3_on": 1,
     "spawn_with": 1,
     "spawn_with_user": 1,
+    "spawn_configured": 1,
     # A boot module's name for its thread (`ThreadName::new(module_name)`).
     "run_exec": 1,
     "run_spinning": 1,

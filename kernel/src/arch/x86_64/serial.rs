@@ -25,7 +25,7 @@
 //! empties hangs its writer.
 //!
 //! **The UART has one reader:** `serial_in` (through [`read_next`],
-//! [`available`] and [`drain`], on the boot CPU, asserted), plus the two
+//! [`available`] and [`drain`], under its interrupts-off receive lock), plus the two
 //! ktests that read COM1 in the test kernel (the loopback round trip and
 //! the absent port), where `serial_in` isn't set up. Received bytes keep
 //! their order only while that holds.
@@ -148,22 +148,19 @@ pub(crate) fn enable_rx_interrupt() {
 #[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
 /// The interrupt handler's drain: up to `room` received bytes to `push`
 /// (`lumen_uart::drain`); how many. The rest stay in the UART. With
-/// interrupts off, on the boot CPU (asserted).
+/// interrupts off and `serial_in`'s receive lock held.
 pub(crate) fn drain(room: usize, push: impl FnMut(u8)) -> usize {
-    debug_assert!(!super::irq::enabled() && super::percpu::index() == 0, "COM1 is drained on the boot CPU");
+    debug_assert!(!super::irq::enabled(), "COM1 receive lock requires interrupts off");
     lumen_uart::drain(&mut com1(), mode(), room, push)
 }
 
 #[cfg_attr(feature = "ktest", allow(dead_code))] // the serial shell's input
 /// The reader's next byte: `popped` (from the handler's queue), else the
 /// UART's (`lumen_uart::read_next`). Never waits. The caller keeps the
-/// handler from running from its pop to the end of this call: interrupts
-/// off on the boot CPU, where IRQ 4 arrives (asserted).
+/// handler and other readers from consuming input from its pop through
+/// this call, with `serial_in`'s interrupts-off receive lock.
 pub(crate) fn read_next(popped: Option<u8>) -> Option<u8> {
-    debug_assert!(
-        !super::irq::enabled() && super::percpu::index() == 0,
-        "COM1 is read on the boot CPU, interrupts off"
-    );
+    debug_assert!(!super::irq::enabled(), "COM1 receive lock requires interrupts off");
     lumen_uart::read_next(&mut com1(), mode(), popped)
 }
 

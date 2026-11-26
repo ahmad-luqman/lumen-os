@@ -717,7 +717,7 @@ crate::ktest!(
                 let mut helpers = Helpers::new([stop]);
                 for (idx, &cpu) in targets.iter().enumerate() {
                     let state = state.clone();
-                    let h = sched::spawn_user_on(cpu, name, space.clone(), move || {
+                    let h = sched::spawn_user_pinned_on(cpu, name, space.clone(), move || {
                         for p in 0..page_count {
                             if read_u32_nofault(base_va + p * PAGE_SIZE) != Ok(sentinel ^ (p as u32)) {
                                 state.bad_val[idx].store(true, Ordering::Release);
@@ -887,7 +887,7 @@ crate::ktest!(
                 let unmap_done = unmap_done.clone();
                 let probe_ok_before = probe_ok_before.clone();
                 let probe_fault_after = probe_fault_after.clone();
-                sched::spawn_user_on(t0, "tlb-spinlock", space.clone(), move || {
+                sched::spawn_user_pinned_on(t0, "tlb-spinlock", space.clone(), move || {
                     probe_ok_before.store(read_u32_nofault(LOCK_VA) == Ok(SENTINEL), Ordering::Release);
                     let guard_lock = SpinLock::new(());
                     {
@@ -970,7 +970,7 @@ crate::ktest!(
                 let split_done = split_done.clone();
                 let read_before = read_before.clone();
                 let read_after = read_after.clone();
-                sched::spawn_user_on(t0, "tlb-cow-read", parent.clone(), move || {
+                sched::spawn_user_pinned_on(t0, "tlb-cow-read", parent.clone(), move || {
                     read_before.store(read_u32_nofault(COW_VA).unwrap_or(0), Ordering::Release);
                     let guard_lock = SpinLock::new(());
                     {
@@ -989,7 +989,7 @@ crate::ktest!(
             helpers.add({
                 let split_done = split_done.clone();
                 let split_ok = split_ok.clone();
-                sched::spawn_user_on(t1, "tlb-cow-write", parent.clone(), move || {
+                sched::spawn_user_pinned_on(t1, "tlb-cow-write", parent.clone(), move || {
                     let ok = copy_to_user(COW_VA, &NEW_VAL.to_ne_bytes()).is_ok();
                     split_ok.store(ok, Ordering::Release);
                     split_done.store(true, Ordering::Release);
@@ -1043,7 +1043,7 @@ crate::ktest!(
                 let wedged = wedged.clone();
                 let unmap_done = unmap_done.clone();
                 let answered_via_active = answered_via_active.clone();
-                sched::spawn_user_on(t0, "tlb-switch", space.clone(), move || {
+                sched::spawn_user_pinned_on(t0, "tlb-switch", space.clone(), move || {
                     if read_u32_nofault(SWITCH_VA) != Ok(SENTINEL) {
                         return;
                     }
@@ -1101,13 +1101,13 @@ crate::ktest!(
             helpers.add({
                 let loaded = loaded.clone();
                 let allow_switch = allow_switch.clone();
-                sched::spawn_user_on(t0, "tlb-td-hold", td_space.clone(), move || {
+                sched::spawn_user_pinned_on(t0, "tlb-td-hold", td_space.clone(), move || {
                     let _ = read_u32_nofault(TD_VA);
                     loaded.store(true, Ordering::Release);
                     while !allow_switch.load(Ordering::Acquire) {
                         core::hint::spin_loop();
                     }
-                    // Returning from `spawn_user_on` detaches `td_space` and switches away.
+                    // Returning from `spawn_user_pinned_on` detaches `td_space` and switches away.
                 })
                 .map_err(|_| "spawn teardown holder")?
             });

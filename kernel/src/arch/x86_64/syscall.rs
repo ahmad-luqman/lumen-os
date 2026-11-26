@@ -517,9 +517,9 @@ pub unsafe fn enter_ring3(rip: u64, user_rsp: u64, rflags: u64) {
 /// Run an entry trampoline with kernel GS, interrupts off and no active
 /// user context, then restore the kernel's entry bookkeeping after unwind.
 fn run_ring3(enter: impl FnOnce()) {
-    assert!(irq::enabled() && irq::depth() == 0, "ring-3 entry requires interrupts on and no SpinLock held");
-    assert_eq!(percpu::user_exit_rsp(), 0, "nested ring-3 entry on CPU {}", percpu::index());
     let were_on = irq::disable();
+    assert!(were_on && irq::depth() == 0, "ring-3 entry requires interrupts on and no SpinLock held");
+    assert_eq!(percpu::user_exit_rsp(), 0, "nested ring-3 entry on CPU {}", percpu::index());
     percpu::set_pending_debug_trap(None);
     // SAFETY: `IA32_KERNEL_GS_BASE` exists on every x86-64 CPU; resetting it
     // to 0 ensures ring 3 starts with a clean user GS base after `swapgs`.

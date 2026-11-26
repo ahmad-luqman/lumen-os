@@ -949,7 +949,9 @@ pub(crate) fn fork_current(
         },
     )
     .map_err(|error| match error {
-        sched::SpawnError::Stack(crate::mm::stack::StackError::OutOfMemory) => errno::ENOMEM,
+        sched::SpawnError::NoMemory | sched::SpawnError::Stack(crate::mm::stack::StackError::OutOfMemory) => {
+            errno::ENOMEM
+        }
         _ => errno::EAGAIN,
     })?;
     let pid = PROCS.lock().link_child(&caller, &child, request)?;
@@ -1865,7 +1867,7 @@ pub(crate) const KTEST_USER_VA: u64 = 0x0000_0000_0060_0000;
 #[cfg(feature = "ktest")]
 pub(crate) const KTEST_USER_LEN: u64 = 4 * 4096;
 
-/// Run `f` as a Linux process for a ktest: on a user thread with its own
+/// Run `f` as a Linux process for a ktest: on a pinned user thread with its own
 /// address space ([`KTEST_USER_LEN`] bytes mapped at [`KTEST_USER_VA`], so
 /// handlers can copy to and from user memory) and a [`RegisteredProcess`],
 /// handed its pid. `f`'s result comes back once the process is taken down,
@@ -1885,13 +1887,14 @@ pub(crate) fn in_test_process<R: Send + 'static>(f: impl FnOnce(u32) -> R + Send
     };
     let slot: Arc<SpinLock<Option<R>>> = Arc::new(SpinLock::new(None));
     let out = Arc::clone(&slot);
-    let spawned = sched::spawn_user_on(crate::arch::cpu_index(), "ktest-process", Arc::clone(&space), move || {
-        let registered = RegisteredProcess::register(stdio);
-        let result = f(registered.pid());
-        // Its takedown takes this thread off the space and tears it down.
-        drop(registered);
-        *out.lock() = Some(result);
-    });
+    let spawned =
+        sched::spawn_user_pinned_on(crate::arch::cpu_index(), "ktest-process", Arc::clone(&space), move || {
+            let registered = RegisteredProcess::register(stdio);
+            let result = f(registered.pid());
+            // Its takedown takes this thread off the space and tears it down.
+            drop(registered);
+            *out.lock() = Some(result);
+        });
     match spawned {
         Ok(handle) => {
             handle.join();
@@ -3334,6 +3337,49 @@ fn ktest_reap(pid: u32, handle: sched::JoinHandle) -> Result<i32, &'static str> 
         wait_child(wait4_request(pid as i32, 0).map_err(|_| "request")?).map_err(|_| "wait")?.ok_or("no child exit")?;
     Ok(report.status().word())
 }
+
+crate::ktest!(
+    fn fork_inherits_affinity_and_nice() {
+        use crate::{kassert, kassert_eq};
+        let space = Arc::new(AddressSpace::new().map_err(|_| "parent space")?);
+        let stdio = Stdio::open().map_err(|_| "parent stdio")?;
+        let result = Arc::new(SpinLock::new(None));
+        let out = result.clone();
+        // A separate migratable parent: never change the ktest runner's pin.
+        let parent = sched::spawn_test_migratable("fork-affinity", move || {
+            let _space = sched::UserSpaceGuard::enter(space);
+            let _registered = RegisteredProcess::register(stdio);
+            *out.lock() = Some((|| {
+                let here = crate::arch::cpu_index();
+                let there = sched::running_cpus().into_iter().find(|&cpu| cpu != here).ok_or("second CPU")?;
+                let mask = (1 << here) | (1 << there);
+                let me = sched::current().expect("parent");
+                kassert_eq!(me.set_affinity(mask), Ok(()));
+                me.set_nice(5);
+                let seen = Arc::new(SpinLock::new(None));
+                let child_out = seen.clone();
+                let (pid, parked) = ktest_fork_child(move || {
+                    let child = sched::current().expect("child");
+                    let inherited = (child.affinity(), child.nice());
+                    let changed = child.set_affinity(1 << there);
+                    sched::yield_now();
+                    *child_out.lock() = Some((inherited, changed, crate::arch::cpu_index()));
+                    record_exit(UserExit::Exited(0));
+                    let _ = take_current();
+                })?;
+                kassert_eq!(ktest_reap(pid, parked.start())?, 0);
+                let (inherited, changed, cpu) = seen.lock().take().ok_or("child result")?;
+                kassert_eq!(inherited, (mask, 5));
+                kassert_eq!(changed, Ok(()));
+                kassert_eq!(cpu, there);
+                kassert!(mask & (1 << cpu) != 0);
+                Ok(())
+            })());
+        })?;
+        sched::join_bounded(parent)?;
+        result.lock().take().ok_or("parent result")?
+    }
+);
 
 crate::ktest!(
     fn fork_child_fault_is_delivered_and_reaped() {

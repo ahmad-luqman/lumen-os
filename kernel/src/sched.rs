@@ -2,13 +2,11 @@
 //!
 //! A [`Thread`] has its own kernel stack from `mm::stack` (with a guard page,
 //! hard rule 4), its saved `rsp` while it isn't running, and a [`State`].
-//! [`spawn`] starts one on this CPU, [`spawn_on`] on another; **a thread
-//! never moves**: it runs only on the CPU it was spawned on (its home), so
-//! only that CPU ever takes threads off its queue, and once the spawner has
-//! laid out its first frame (published by the run queue's lock), a thread's
-//! saved registers are touched only by its home CPU, with interrupts off.
-//! Waking a thread from another CPU puts it on its home's queue and sends
-//! that CPU the `WAKEUP` IPI (in case it is halted in its idle loop).
+//! [`spawn`] and [`spawn_on`] pin kernel threads. User threads and
+//! [`spawn_migratable`] threads may move between allowed CPUs while Ready,
+//! after `finish_switch` releases their `on_cpu` ownership. Run queue locks
+//! serialize placement; the outgoing CPU saves all state before releasing
+//! ownership, and the incoming CPU acquires it before restoring state.
 //!
 //! **Switching** ([`schedule`]) happens only with interrupts off and no
 //! critical section open (`arch::irq::depth() == 0`, asserted): a held
@@ -39,19 +37,18 @@
 //!
 //! A thread that returns from its entry point (or calls [`exit`]) is dead;
 //! the next thread to run on its CPU frees its stack and is done with it
-//! ([`FINISHING`]), and only then does [`JoinHandle::join`] return. The unmap's TLB flush is local: the home CPU
-//! ran on the stack; a spawner on another CPU wrote its first frame (and a
-//! [`scope`]d thread may have borrowed from it) and may keep stale entries
-//! for its pages. Nothing uses them until the stack's addresses are
+//! ([`FINISHING`]), and only then does [`JoinHandle::join`] return. The
+//! unmap's TLB flush is local; CPUs that ran the thread earlier, its
+//! spawner and a scoped thread's caller may keep stale entries for its pages. Nothing uses them until the stack's addresses are
 //! reused, and they are reused only once every CPU has flushed them
 //! (`mm::tlb`, #300).
 //!
-//! Lock order: a wait queue's lock, then a CPU's run queue (only
-//! a wait with a deadline nests them, to put the thread on
-//! its CPU's sleepers too; [`kick`] takes only the run queue's, so a sender
-//! may hold its own locks), then a thread's `stack` lock (only
+//! Lock order: a wait queue's lock, then run queues in ascending CPU order
+//! (steals, affinity relocation after a wake/kick/tick, and finish_switch
+//! may hold two; a signal sender may hold its signal lock around [`kick`]),
+//! then a thread's `stack` lock (only
 //! [`exit`] nests it); then the heap, page tables and frame allocator. Every
-//! thread homed on a CPU has room reserved in its queues ([`Cpu::homed`],
+//! live thread has room reserved in every CPU's queues ([`Cpu::reserved`],
 //! asserted on every push), so the timer interrupt never allocates. It can
 //! free, in [`finish_switch`]: a dead thread's stack (through the page
 //! tables and frame allocator), and on the heap its joiners' list (a
@@ -82,7 +79,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use log::{info, warn};
 use lumen_mm::stacks::{StackKind, StackRange};
@@ -92,15 +89,17 @@ use crate::linux::process::UserThread;
 use crate::linux::signal::RestartBlock;
 use crate::mm::stack::{KernelStack, STACK_SIZE, StackError};
 use crate::mm::user_vm::AddressSpace;
-use crate::sync::SpinLock;
+use crate::sync::{SpinLock, SpinLockGuard};
 use crate::trace;
 use crate::{smp, time};
 use lumen_trace::ThreadName;
 use lumen_trace::kind::{RunQueue, RunQueueOp, Switch, ThreadState};
 
 /// Timer ticks (1 ms each) a thread runs before the next ready thread on its
-/// CPU gets a turn.
+/// CPU gets a turn, at nice 0.
 pub const SLICE_TICKS: u32 = 10;
+const _: () = assert!(MAX_CPUS <= 64);
+const ALL_CPUS: u64 = u64::MAX >> (64 - MAX_CPUS);
 
 /// How long [`init`] waits, in all, for every CPU's scheduler to start.
 const START_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -173,19 +172,17 @@ type Entry = Box<dyn FnOnce() + Send>;
 /// never loaded, `schedule` asserts).
 struct SavedRsp(UnsafeCell<u64>);
 
-// SAFETY: only the thread's home CPU touches the value after the thread is
-// shared, inside `schedule` with interrupts off: it saves into it while
-// switching away from the thread and reads it while switching to it, and a
-// thread is never on two CPUs (it never moves; `schedule` asserts both
-// threads are its CPU's). The value the spawner stores before the thread is
-// shared is published by the run queue's lock.
+// SAFETY: the CPU owning `on_cpu` alone accesses the saved context, with
+// interrupts off. A Release in finish_switch publishes the completed save;
+// queue locks and an Acquire of on_cpu precede the next CPU's claim. Initial
+// context is published by the first enqueue's lock.
 unsafe impl Sync for SavedRsp {}
 
 impl SavedRsp {
     /// Where `switch` saves it.
     ///
     /// # Safety
-    /// On the thread's home CPU, with interrupts off.
+    /// On the thread's owning CPU, with interrupts off.
     unsafe fn slot(&self) -> *mut u64 {
         self.0.get()
     }
@@ -193,7 +190,7 @@ impl SavedRsp {
     /// What `switch` loads.
     ///
     /// # Safety
-    /// On the thread's home CPU, with interrupts off, the thread not running.
+    /// On the thread's owning CPU, with interrupts off, the thread not running.
     unsafe fn get(&self) -> u64 {
         // SAFETY: upheld by the caller: nothing writes it meanwhile.
         unsafe { *self.0.get() }
@@ -203,7 +200,7 @@ impl SavedRsp {
 /// Per-user-thread hardware and VM state carried across context switches,
 /// and the thread's Linux identity and restart block.
 ///
-/// Accessed only on its thread's home CPU with interrupts off: by
+/// Accessed only on its thread's owning CPU with interrupts off: by
 /// `schedule` switching to and from the thread, and by the thread itself
 /// (`detach_user_space`, a `UserSpaceGuard`, `arch_prctl`'s
 /// `set_current_fs_base`, the `#PF` path's `current_address_space`, the
@@ -250,18 +247,18 @@ impl UserThreadState {
     /// Save the live CPU FPU/SSE/AVX registers into this thread's buffer.
     ///
     /// # Safety
-    /// Called on this thread's home CPU with interrupts disabled.
+    /// Called on this thread's owning CPU with interrupts disabled.
     unsafe fn save_fpu(&self) {
-        // SAFETY: exclusive access on the home CPU with interrupts off.
+        // SAFETY: exclusive access on the owning CPU with interrupts off.
         unsafe { (*self.fpu.get()).save() };
     }
 
     /// Restore the CPU's FPU/SSE/AVX registers from this thread's buffer.
     ///
     /// # Safety
-    /// Called on this thread's home CPU with interrupts disabled.
+    /// Called on this thread's owning CPU with interrupts disabled.
     unsafe fn restore_fpu(&self) {
-        // SAFETY: exclusive access on the home CPU with interrupts off.
+        // SAFETY: exclusive access on the owning CPU with interrupts off.
         unsafe { (*self.fpu.get()).restore() };
     }
 }
@@ -269,10 +266,9 @@ impl UserThreadState {
 /// Thread-local slot for optional [`UserThreadState`].
 struct UserSlot(UnsafeCell<Option<UserThreadState>>);
 
-// SAFETY: a thread never migrates between CPUs (M6–M7 single-CPU invariant).
-// After the spawner publishes the thread via the run-queue lock, only the
-// thread's home CPU touches `UserSlot`, and only with interrupts disabled (or
-// in `Drop` when no other reference exists).
+// SAFETY: only the owning thread with interrupts off, or the CPU claiming
+// it through on_cpu, accesses the slot. Release after the full switch and
+// Acquire before the next claim serialize migration. Drop is exclusive.
 unsafe impl Sync for UserSlot {}
 
 impl UserSlot {
@@ -283,7 +279,7 @@ impl UserSlot {
     /// Borrow the inner `Option<UserThreadState>`.
     ///
     /// # Safety
-    /// Called on the thread's home CPU with interrupts disabled.
+    /// Called on the thread's owning CPU with interrupts disabled.
     unsafe fn as_ref(&self) -> Option<&UserThreadState> {
         // SAFETY: upheld by the caller.
         unsafe { (*self.0.get()).as_ref() }
@@ -292,24 +288,27 @@ impl UserSlot {
     /// Raw mutable pointer to the inner `Option<UserThreadState>`.
     ///
     /// # Safety
-    /// Called on the thread's home CPU with interrupts disabled, with no
+    /// Called on the thread's owning CPU with interrupts disabled, with no
     /// overlapping reference into this slot.
     unsafe fn slot(&self) -> *mut Option<UserThreadState> {
         self.0.get()
     }
 }
 
-/// A kernel thread. Threads never move between CPUs: if that ever changes,
-/// `SavedRsp`'s `Sync` argument, a woken thread sitting on its queue while
-/// it still runs (see [`WaitQueue::wait_until`]), the callers that keep
-/// `cpu_index()` across a switch, and freeing stacks with a local TLB flush
-/// (their reuse waits for every CPU's, `mm::tlb`) all have to be revisited.
+/// A schedulable thread whose saved state belongs exclusively to its
+/// `on_cpu` owner, or is available for a new owner under its run queue lock.
 pub struct Thread {
     id: u64,
     /// Leaf lock; only this thread changes its name after construction.
     name: SpinLock<ThreadName>,
-    /// Its home CPU, the only one it runs on.
-    cpu: usize,
+    /// Its queue's CPU, or the CPU it last ran on; changed under both queues.
+    cpu: AtomicUsize,
+    /// Held through the complete outgoing context save, including the stack.
+    on_cpu: AtomicBool,
+    affinity: AtomicU64,
+    /// Immutable: kernel pins and CPU-local user probes cannot be widened.
+    pinned: bool,
+    nice: AtomicI8,
     state: AtomicU8,
     rsp: SavedRsp,
     /// Optional per-process user VM, FPU, TLS, ring-3 stack and restart-block state.
@@ -351,6 +350,33 @@ pub struct Thread {
     wait_kind: AtomicU8,
 }
 
+/// Placement and priority installed before a thread is published.
+#[derive(Clone, Copy)]
+struct Placement {
+    affinity: u64,
+    pinned: bool,
+    nice: i8,
+}
+
+impl Placement {
+    const fn pinned(cpu: usize) -> Self {
+        // Invalid spawn targets are rejected before constructing the thread.
+        Self { affinity: if cpu < MAX_CPUS { 1 << cpu } else { 0 }, pinned: true, nice: 0 }
+    }
+
+    const fn migratable() -> Self {
+        Self { affinity: ALL_CPUS, pinned: false, nice: 0 }
+    }
+}
+
+/// Why an affinity change is refused (both map to EINVAL for C12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "C12 adds the syscall callers"))]
+pub enum AffinityError {
+    NoOnlineCpu,
+    Pinned,
+}
+
 impl Thread {
     /// A ready thread on CPU `cpu` with a fresh stack of `stack_size` bytes,
     /// that starts by running `entry`.
@@ -360,6 +386,7 @@ impl Thread {
         stack_size: u64,
         entry: Entry,
         user: Option<UserThreadState>,
+        placement: Placement,
     ) -> Result<Arc<Thread>, SpawnError> {
         let stack = KernelStack::new(stack_size, StackKind::Thread).map_err(SpawnError::Stack)?;
         // SAFETY: a fresh, mapped stack (page-aligned top) nothing runs on;
@@ -367,7 +394,7 @@ impl Thread {
         // and its CPU has switched away from it.
         let rsp = unsafe { arch::context::prepare(stack.range().top, thread_entry) };
         Ok(register(Arc::new_cyclic(|me| {
-            Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry), user, me.clone())
+            Thread::new(name, cpu, State::Ready, rsp, Some(stack), Some(entry), user, me.clone(), placement)
         })))
     }
 
@@ -375,7 +402,17 @@ impl Thread {
     /// own.
     fn adopted(name: ThreadName) -> Arc<Thread> {
         register(Arc::new_cyclic(|me| {
-            Thread::new(name, arch::cpu_index(), State::Running, 0, None, None, None, me.clone())
+            Thread::new(
+                name,
+                arch::cpu_index(),
+                State::Running,
+                0,
+                None,
+                None,
+                None,
+                me.clone(),
+                Placement::pinned(arch::cpu_index()),
+            )
         }))
     }
 
@@ -389,11 +426,16 @@ impl Thread {
         entry: Option<Entry>,
         user: Option<UserThreadState>,
         me: Weak<Thread>,
+        placement: Placement,
     ) -> Thread {
         Thread {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name: SpinLock::new(name),
-            cpu,
+            cpu: AtomicUsize::new(cpu),
+            on_cpu: AtomicBool::new(state == State::Running),
+            affinity: AtomicU64::new(placement.affinity),
+            pinned: placement.pinned,
+            nice: AtomicI8::new(placement.nice),
             state: AtomicU8::new(state as u8),
             rsp: SavedRsp(UnsafeCell::new(rsp)),
             user: UserSlot::new(user),
@@ -419,6 +461,67 @@ impl Thread {
     /// Its current displayed name, updated by exec from the path as given.
     pub fn name(&self) -> ThreadName {
         *self.name.lock()
+    }
+
+    /// The queue CPU, or the CPU this thread last ran on.
+    pub fn cpu(&self) -> usize {
+        self.cpu.load(Ordering::Acquire)
+    }
+
+    /// The scheduling priority, clamped to Linux's nice range.
+    pub fn nice(&self) -> i8 {
+        self.nice.load(Ordering::Relaxed)
+    }
+
+    /// Set the priority used when the next slice starts.
+    #[allow(dead_code)] // C12's setpriority
+    pub fn set_nice(&self, nice: i32) {
+        self.nice.store(nice.clamp(-20, 19) as i8, Ordering::Relaxed);
+    }
+
+    /// CPUs on which this thread may next run.
+    pub fn affinity(&self) -> u64 {
+        self.affinity.load(Ordering::Acquire)
+    }
+
+    fn allows(&self, cpu: usize) -> bool {
+        self.affinity() & (1 << cpu) != 0
+    }
+
+    /// Set a CPU mask with at least one online CPU. Immutable pins refuse
+    /// every change. A running thread leaves an excluded CPU at its next
+    /// switch; sleepers and blocked threads move only after waking.
+    /// Callers must not hold a run queue lock.
+    #[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "C12 adds the syscall callers"))]
+    pub fn set_affinity(&self, mask: u64) -> Result<(), AffinityError> {
+        if self.pinned {
+            return Err(AffinityError::Pinned);
+        }
+        let mask = mask & ALL_CPUS;
+        if mask & online_mask() == 0 {
+            return Err(AffinityError::NoOnlineCpu);
+        }
+        let (cpu, q) = lock_queue_of(self);
+        self.affinity.store(mask, Ordering::Release);
+        drop(q);
+        relocate_disallowed(self);
+        let _ = smp::wake(cpu);
+        Ok(())
+    }
+
+    /// Claim the saved context under its queue lock before restoring it.
+    fn claim(&self) {
+        assert!(!self.on_cpu.swap(true, Ordering::Acquire), "next thread still on a CPU");
+    }
+
+    /// Publish a complete context save; the caller holds the queue lock or
+    /// the thread is dead, so no new owner races the remaining cleanup.
+    fn release(&self) {
+        self.on_cpu.store(false, Ordering::Release);
+    }
+
+    fn may_move_to(&self, cpu: usize) -> bool {
+        !self.pinned && self.state() == State::Ready && self.allows(cpu) && !self.on_cpu.load(Ordering::Acquire)
     }
 
     pub fn state(&self) -> State {
@@ -495,7 +598,7 @@ impl Thread {
                 "thread {} (id {}, cpu {}) was {was}, not {}, on its way to {}",
                 self.name.try_lock().map(|n| *n).unwrap_or(ThreadName::new("?")),
                 self.id,
-                self.cpu,
+                self.cpu(),
                 from.name(),
                 to.name()
             );
@@ -510,7 +613,7 @@ impl fmt::Debug for Thread {
             "{} (id {}, cpu {}, {})",
             self.name.try_lock().map(|n| *n).unwrap_or(ThreadName::new("?")),
             self.id,
-            self.cpu,
+            self.cpu(),
             self.state().name()
         )
     }
@@ -531,10 +634,10 @@ struct Cpu {
     /// The thread it last switched away from, kept alive until the switch
     /// is finished ([`finish_switch`]: a dead one's stack is freed there).
     switched_from: Option<Arc<Thread>>,
-    /// Threads homed here, not yet reaped (the idle thread aside): `ready`
-    /// and `sleepers` always have room for this many, so pushing onto them
-    /// never allocates (the timer interrupt pushes onto them).
-    homed: usize,
+    /// Published non-idle threads plus unpublished reservations counted
+    /// here. Both ready and sleeper capacity cover this count, independent
+    /// of placement; a thread is published only after reserving every CPU.
+    reserved: usize,
     /// Ticks left in the current thread's slice.
     slice_left: u32,
 }
@@ -547,26 +650,31 @@ impl Cpu {
             ready: VecDeque::new(),
             sleepers: Vec::new(),
             switched_from: None,
-            homed: 0,
+            reserved: 0,
             slice_left: SLICE_TICKS,
         }
     }
 
-    /// Count one more thread homed here, and make room for it.
-    fn home(&mut self) {
-        self.homed += 1;
-        self.ready.reserve(self.homed.saturating_sub(self.ready.len()));
-        self.sleepers.reserve(self.homed.saturating_sub(self.sleepers.len()));
+    /// Reserve for one more live thread. Failure leaves the count unchanged;
+    /// a successful earlier buffer growth may remain available for reuse.
+    fn try_home(&mut self) -> Result<(), SpawnError> {
+        let reserved = self.reserved.checked_add(1).ok_or(SpawnError::NoMemory)?;
+        self.ready.try_reserve(reserved.saturating_sub(self.ready.len())).map_err(|_| SpawnError::NoMemory)?;
+        self.sleepers.try_reserve(reserved.saturating_sub(self.sleepers.len())).map_err(|_| SpawnError::NoMemory)?;
+        self.reserved = reserved;
+        Ok(())
     }
 
-    /// Take the thread this CPU switched away from; a dead one is no longer
-    /// homed here.
+    /// Runnable work includes the current non-idle thread only while it is
+    /// Running; an outgoing Ready thread is already counted in the queue.
+    fn runnable(&self) -> usize {
+        self.ready.len()
+            + usize::from(self.current.as_ref().is_some_and(|t| !self.is_idle_thread(t) && t.state() == State::Running))
+    }
+
+    /// Take the thread this CPU has finished switching away from.
     fn take_switched_from(&mut self) -> Option<Arc<Thread>> {
-        let prev = self.switched_from.take();
-        if prev.as_ref().is_some_and(|p| p.state() == State::Dead) {
-            self.homed -= 1;
-        }
-        prev
+        self.switched_from.take()
     }
 
     fn running(&self) -> &Arc<Thread> {
@@ -585,14 +693,21 @@ impl Cpu {
     /// the queue goes through here or [`pop_ready`](Self::pop_ready), each
     /// recording a `runq` event in the CPU's X-ray ring under its lock.
     fn push_ready(&mut self, cpu: usize, t: Arc<Thread>) {
-        assert!(self.ready.len() < self.ready.capacity(), "queueing thread {t:?}, which isn't homed on cpu {cpu}");
+        assert!(self.ready.len() < self.ready.capacity(), "queueing thread {t:?}, which isn't reserved on cpu {cpu}");
         let id = t.id;
         self.ready.push_back(t);
         self.queue_changed(cpu, id, RunQueueOp::Enqueue);
     }
 
+    /// Take the oldest eligible thread with a complete saved context, or
+    /// this CPU's current thread woken before it switched away.
     fn pop_ready(&mut self, cpu: usize) -> Option<Arc<Thread>> {
-        let t = self.ready.pop_front()?;
+        let at = self.ready.iter().position(|t| {
+            t.allows(cpu)
+                && (!t.on_cpu.load(Ordering::Acquire)
+                    || core::ptr::eq(Arc::as_ptr(t), CURRENT[cpu].load(Ordering::Acquire)))
+        })?;
+        let t = self.ready.remove(at).expect("position exists");
         self.queue_changed(cpu, t.id, RunQueueOp::Dequeue);
         Some(t)
     }
@@ -730,6 +845,8 @@ pub(crate) enum StallAt {
     /// `Blocked`, after the pending read was false, before `schedule`:
     /// only the kick can queue it and end the wait.
     AfterRead = 3,
+    /// User state saved, before assembly saves the outgoing kernel stack.
+    MidSwitch = 4,
 }
 
 /// [`BLOCK_DELAY`]'s state: the thread to stall (0: none) and where,
@@ -914,7 +1031,7 @@ pub fn threads() -> Vec<ThreadInfo> {
         .map(|t| ThreadInfo {
             id: t.id,
             name: t.name(),
-            cpu: t.cpu,
+            cpu: t.cpu(),
             state: t.state(),
             ticks: t.ticks.load(Ordering::Relaxed),
         })
@@ -1016,14 +1133,17 @@ pub(crate) fn deadline_wakes_in<R>(f: impl FnOnce() -> R) -> (R, u64) {
 
 /// The thread running on this CPU, once its threads are set up.
 pub fn current() -> Option<Arc<Thread>> {
+    let _irq = arch::irq::push_off();
     CPUS[arch::cpu_index()].lock().current.clone()
 }
 
-/// The running thread's id and name, for the crash report: a nonblocking leaf-lock read on
-/// the CPU that crashed (whose current thread can't change any more). Set
+/// The running thread's id and name, with a nonblocking leaf-lock read
+/// and `?` if busy. Preemption is excluded while selecting its CPU and
+/// reading the current slot. Set
 /// from when this CPU's threads are set up (`sched::init` on the boot CPU,
 /// coming online on an AP).
 pub fn running_here() -> Option<(u64, ThreadName)> {
+    let _irq = arch::irq::push_off();
     let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
     // SAFETY: a non-null `CURRENT` points into an `Arc<Thread>` that stays
     // alive while it is stored there (see `CURRENT`).
@@ -1164,9 +1284,10 @@ pub fn with_current<R>(f: impl FnOnce(&Thread) -> R) -> Option<R> {
         let _irq = arch::irq::push_off();
         CURRENT[arch::cpu_index()].load(Ordering::Acquire)
     };
-    // SAFETY: the running thread's `CURRENT` entry stays this thread while
-    // it runs (a switch away and back restores it), and the `Arc` its CPU
-    // holds keeps it alive meanwhile; `f` borrows it only for the call.
+    // SAFETY: this points to the calling thread, whose execution keeps it
+    // alive. A switch transfers its owning Arc through the run queue and
+    // current slots, even across CPUs; on resume it is the same thread.
+    // No borrowed UserSlot state may escape an IRQ-off caller's section.
     (!t.is_null()).then(|| f(unsafe { &*t }))
 }
 
@@ -1191,7 +1312,7 @@ pub fn set_current_fs_base(addr: u64) {
     assert!(!t.is_null(), "set_current_fs_base before sched::init");
     // SAFETY: `t` is the running thread on this CPU with interrupts off.
     let user = unsafe { (*t).user.as_ref() }.expect("set_current_fs_base on a kernel thread");
-    // SAFETY: interrupts are off on this thread's home CPU and `write_fs_base`
+    // SAFETY: interrupts are off on this thread's owning CPU and `write_fs_base`
     // asserts `addr < USER_MAX`.
     unsafe { arch::fpu::write_fs_base(addr) };
     user.fs_base.store(addr, Ordering::Relaxed);
@@ -1314,29 +1435,33 @@ pub fn running_id_here() -> Option<(u64, bool)> {
 
 /// Can the running thread block here? Only with interrupts on and
 /// everything [`blockable_but_for_interrupts`] asks.
-fn can_block(cpu: usize) -> bool {
-    arch::irq::enabled() && blockable_but_for_interrupts(cpu)
+fn can_block() -> bool {
+    arch::irq::enabled() && blockable_but_for_interrupts()
 }
 
 /// Could the running thread block here if interrupts were on? For the crash
 /// path (`crash::halt_if_stopping_elsewhere`), with interrupts off.
 pub(crate) fn can_block_with_interrupts_on() -> bool {
-    blockable_but_for_interrupts(arch::cpu_index())
+    blockable_but_for_interrupts()
 }
 
-/// Everything [`can_block`] asks but interrupts on: this CPU's scheduler
-/// runs, no critical section is open (a lock held; it doesn't tell an
-/// interrupt handler, which opens none, from a thread), and the running
-/// thread isn't the idle thread (which must always be ready to run). In
-/// that order: the run queue's lock is taken last, only outside every
-/// critical section.
-fn blockable_but_for_interrupts(cpu: usize) -> bool {
-    running_on(cpu) && arch::irq::depth() == 0 && !CPUS[cpu].lock().on_idle()
+/// Everything [`can_block`] asks but interrupts on: first reject an open
+/// critical section, then disable interrupts to select the current CPU,
+/// check its scheduler and finally its run queue for a non-idle thread.
+/// An interrupt handler that opens no section is not distinguished from
+/// a thread here; can_block also requires interrupts enabled.
+fn blockable_but_for_interrupts() -> bool {
+    if arch::irq::depth() != 0 {
+        return false;
+    }
+    let _irq = arch::irq::push_off();
+    let cpu = arch::cpu_index();
+    running_on(cpu) && !CPUS[cpu].lock().on_idle()
 }
 
 /// Whether the running thread can block here (see [`can_block`]).
 pub fn can_block_now() -> bool {
-    can_block(arch::cpu_index())
+    can_block()
 }
 
 /// Why [`spawn_on`] refused.
@@ -1345,6 +1470,8 @@ pub enum SpawnError {
     /// That CPU's scheduler doesn't run (no such CPU, not online, before
     /// [`init`], or its timer doesn't tick).
     NotRunning,
+    /// No room to reserve the per-CPU queues.
+    NoMemory,
     /// No stack for it.
     Stack(StackError),
     /// [`run_sized`] or [`scope`] on a thread that can't wait for another
@@ -1356,6 +1483,7 @@ impl fmt::Display for SpawnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SpawnError::NotRunning => f.write_str("that CPU runs no scheduler"),
+            SpawnError::NoMemory => f.write_str("no memory for scheduler queues"),
             SpawnError::Stack(e) => write!(f, "no stack: {e}"),
             SpawnError::CantWait => f.write_str("this thread can't wait for it"),
         }
@@ -1380,7 +1508,7 @@ impl JoinHandle {
     /// stuck with interrupts off): poll this, then join.
     pub fn is_finished(&self) -> bool {
         let t = &self.thread;
-        t.reaped.load(Ordering::Acquire) && FINISHING[t.cpu].load(Ordering::Acquire) != t.id
+        t.reaped.load(Ordering::Acquire) && FINISHING[t.cpu()].load(Ordering::Acquire) != t.id
     }
 
     /// Wait until the thread has finished and its CPU's [`finish_switch`]
@@ -1397,7 +1525,7 @@ impl JoinHandle {
         PAST_REAPED.store(t.id, Ordering::Release);
         // Normally done already; longer if that vCPU is paused, or held by a
         // ktest (`HOLD_FINISHING`).
-        while FINISHING[t.cpu].load(Ordering::Acquire) == t.id {
+        while FINISHING[t.cpu()].load(Ordering::Acquire) == t.id {
             yield_now();
         }
     }
@@ -1424,7 +1552,7 @@ pub fn run_sized<'a>(
     #[cfg(not(panic = "abort"))]
     compile_error!("sched::run_sized relies on panic = \"abort\"");
     let cpu = arch::cpu_index();
-    if !can_block(cpu) {
+    if !can_block() {
         return Err(SpawnError::CantWait);
     }
     let f: Box<dyn FnOnce() + Send + 'a> = Box::new(f);
@@ -1452,7 +1580,7 @@ pub fn scope<'env, R>(f: impl FnOnce(&Scope<'env>) -> R) -> Result<R, SpawnError
     // kernel, not unwind past the joins.
     #[cfg(not(panic = "abort"))]
     compile_error!("sched::scope relies on panic = \"abort\"");
-    if !can_block(arch::cpu_index()) {
+    if !can_block() {
         return Err(SpawnError::CantWait);
     }
     let scope = Scope { threads: core::cell::RefCell::new(Vec::new()), _env: core::marker::PhantomData };
@@ -1516,7 +1644,7 @@ pub fn spawn_on(
     spawn_with(cpu, name.into(), STACK_SIZE, Box::new(f))
 }
 
-/// Start a pinned user thread on CPU `cpu`, with clean FPU state and zero TLS.
+/// Start a migratable user thread on CPU `cpu`, with clean FPU state and zero TLS.
 /// Roots install their Linux identity at registration. Registered threads
 /// must call take_current before returning; an unregistered thread's state
 /// is detached by thread_entry. Fork children use spawn_fork_child.
@@ -1529,7 +1657,26 @@ pub fn spawn_user_on(
     spawn_with_user(cpu, name.into(), STACK_SIZE, Box::new(f), Some(UserThreadState::new(space)))
 }
 
-/// Spawn a fork child pinned to the caller's CPU with inherited FPU state,
+/// Start a user probe permanently pinned to `cpu`, with clean FPU and TLS.
+/// The registration and cleanup contract is the same as [`spawn_user_on`].
+pub fn spawn_user_pinned_on(
+    cpu: usize,
+    name: impl Into<ThreadName>,
+    space: Arc<AddressSpace>,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle, SpawnError> {
+    spawn_configured(
+        cpu,
+        name.into(),
+        STACK_SIZE,
+        Box::new(f),
+        Some(UserThreadState::new(space)),
+        Placement::pinned(cpu),
+    )
+}
+
+/// Spawn a fork child with inherited affinity, nice and FPU state, on the
+/// caller's CPU if allowed, otherwise its lowest allowed online CPU. It has
 /// its Linux identity and TLS installed before enqueue. The closure f must
 /// hold itself at a start gate until its identity is linked. Before returning,
 /// f must either call take_current, or clear linux and detach the space on
@@ -1544,15 +1691,181 @@ pub(crate) fn spawn_fork_child(
 ) -> Result<JoinHandle, SpawnError> {
     assert!(fs_base < arch::fpu::USER_MAX);
     let mut state = UserThreadState::new(space);
-    {
-        // Kernel code never uses FPU registers. Save the caller's live
-        // state with preemption disabled before the child can run.
+    let (cpu, placement) = {
+        // Snapshot placement with the caller's FPU state: migration cannot
+        // change the current CPU between selecting its mask and its queue.
         let _irq = arch::irq::push_off();
         state.fpu.get_mut().save();
-    }
+        let me = current().expect("fork on a running thread");
+        let affinity = me.affinity();
+        let here = arch::cpu_index();
+        let cpu = if affinity & (1 << here) != 0 { here } else { (affinity & online_mask()).trailing_zeros() as usize };
+        (cpu, Placement { affinity, pinned: false, nice: me.nice() })
+    };
     state.fs_base.store(fs_base, Ordering::Relaxed);
     state.linux = Some(linux);
-    spawn_with_user(arch::cpu_index(), name.into(), STACK_SIZE, Box::new(f), Some(state))
+    spawn_configured(cpu, name.into(), STACK_SIZE, Box::new(f), Some(state), placement)
+}
+
+/// CPUs whose schedulers can accept threads. CPU hot-unplug is unsupported.
+fn online_mask() -> u64 {
+    (0..MAX_CPUS).filter(|&cpu| running_on(cpu)).fold(0, |mask, cpu| mask | (1 << cpu))
+}
+
+/// Reserve before publishing a new thread. Every CPU can receive it later,
+/// including as a sleeper; neither migration nor a timer tick may allocate.
+fn reserve_thread() -> Result<Reservation<'static>, SpawnError> {
+    reserve_queues(&CPUS)
+}
+
+fn reserve_queues(queues: &[SpinLock<Cpu>]) -> Result<Reservation<'_>, SpawnError> {
+    let mut reservation = Reservation { queues, cpus: 0 };
+    for q in queues {
+        q.lock().try_home()?;
+        reservation.cpus += 1;
+    }
+    Ok(reservation)
+}
+
+/// Counts owned by an unpublished thread. A failed reservation or stack
+/// creation rolls them back; enqueue transfers them to finish_switch.
+struct Reservation<'a> {
+    queues: &'a [SpinLock<Cpu>],
+    cpus: usize,
+}
+
+impl Reservation<'_> {
+    fn commit(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        for q in &self.queues[..self.cpus] {
+            q.lock().reserved -= 1;
+        }
+    }
+}
+
+/// Lock the queue owning a thread, retrying a concurrent relocation.
+fn lock_queue_of(thread: &Thread) -> (usize, SpinLockGuard<'static, Cpu>) {
+    loop {
+        let cpu = thread.cpu();
+        let queue = CPUS[cpu].lock();
+        if thread.cpu() == cpu {
+            return (cpu, queue);
+        }
+    }
+}
+
+const BALANCE_TICKS: u64 = 100;
+
+/// Hold two queues in CPU-index order. No caller holds a queue already.
+fn with_queues<R>(a: usize, b: usize, f: impl FnOnce(&mut Cpu, &mut Cpu) -> R) -> R {
+    assert_ne!(a, b);
+    let (low, high) = (a.min(b), a.max(b));
+    let mut first = CPUS[low].lock();
+    let mut second = CPUS[high].lock();
+    if a == low { f(&mut first, &mut second) } else { f(&mut second, &mut first) }
+}
+
+/// Move a saved Ready thread while both queue locks are held.
+fn move_ready(from: usize, source: &mut Cpu, to: usize, dest: &mut Cpu, at: usize) {
+    let thread = source.ready.remove(at).expect("queued thread");
+    assert_eq!(thread.state(), State::Ready);
+    assert!(!thread.on_cpu.load(Ordering::Acquire));
+    source.forget_deadline(&thread);
+    source.queue_changed(from, thread.id, RunQueueOp::Dequeue);
+    thread.cpu.store(to, Ordering::Release);
+    dest.push_ready(to, thread);
+}
+
+/// One balancing pass: the busiest online queue donates its last eligible
+/// saved thread, only when it has at least two more runnable threads.
+fn balance(cpu: usize) -> bool {
+    #[cfg(feature = "ktest")]
+    if !AUTO_BALANCE.load(Ordering::Relaxed) {
+        return false;
+    }
+    balance_pass(cpu)
+}
+
+fn balance_pass(cpu: usize) -> bool {
+    let Some(from) = (0..MAX_CPUS)
+        .filter(|&other| other != cpu && running_on(other))
+        .max_by_key(|&other| READY[other].load(Ordering::Acquire))
+    else {
+        return false;
+    };
+    // No queued donor, or even counting its running thread cannot meet
+    // the threshold. Recheck the exact runnable counts under both locks.
+    let ready = READY[from].load(Ordering::Acquire);
+    if ready == 0 || ready + 1 < READY[cpu].load(Ordering::Acquire) + 2 {
+        return false;
+    }
+    let moved = with_queues(from, cpu, |source, dest| {
+        if source.runnable() < dest.runnable() + 2 {
+            return false;
+        }
+        let Some(at) = source.ready.iter().rposition(|t| t.may_move_to(cpu)) else {
+            return false;
+        };
+        move_ready(from, source, cpu, dest, at);
+        true
+    });
+    if moved {
+        let _ = smp::wake(cpu);
+    }
+    moved
+}
+
+/// Affinity redirects only a fully saved Ready thread. Wakes racing the
+/// outgoing switch stay on its old queue until finish_switch releases it.
+fn relocate_disallowed(thread: &Thread) {
+    loop {
+        let from = thread.cpu();
+        let mask = thread.affinity();
+        if mask & (1 << from) != 0 {
+            return;
+        }
+        let to = (mask & online_mask()).trailing_zeros() as usize;
+        let retry = with_queues(from, to, |source, dest| {
+            if thread.cpu() != from || thread.affinity() != mask {
+                return true;
+            }
+            if thread.state() == State::Ready
+                && !thread.on_cpu.load(Ordering::Acquire)
+                && let Some(at) = source.ready.iter().position(|t| t.id == thread.id)
+            {
+                move_ready(from, source, to, dest, at);
+            }
+            false
+        });
+        if !retry {
+            let _ = smp::wake(to);
+            return;
+        }
+    }
+}
+
+/// Route sleepers just woken by a tick after releasing their queue lock.
+fn route_ready(cpu: usize) {
+    loop {
+        let thread =
+            CPUS[cpu].lock().ready.iter().find(|t| !t.allows(cpu) && !t.on_cpu.load(Ordering::Acquire)).cloned();
+        let Some(thread) = thread else { return };
+        relocate_disallowed(&thread);
+    }
+}
+
+/// Start a kernel thread on this CPU, eligible to run on every online CPU.
+#[allow(dead_code)] // public scheduler API; exercised by the ktests
+pub fn spawn_migratable(
+    name: impl Into<ThreadName>,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle, SpawnError> {
+    spawn_configured(arch::cpu_index(), name.into(), STACK_SIZE, Box::new(f), None, Placement::migratable())
 }
 
 fn spawn_with(cpu: usize, name: ThreadName, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
@@ -1566,30 +1879,31 @@ fn spawn_with_user(
     f: Entry,
     user: Option<UserThreadState>,
 ) -> Result<JoinHandle, SpawnError> {
+    let placement = if user.is_some() { Placement::migratable() } else { Placement::pinned(cpu) };
+    spawn_configured(cpu, name, stack_size, f, user, placement)
+}
+
+fn spawn_configured(
+    cpu: usize,
+    name: ThreadName,
+    stack_size: u64,
+    f: Entry,
+    user: Option<UserThreadState>,
+    placement: Placement,
+) -> Result<JoinHandle, SpawnError> {
     if !running_on(cpu) {
         return Err(SpawnError::NotRunning);
     }
+    let reservation = reserve_thread()?;
     let linux = user.as_ref().and_then(|u| u.linux.clone());
-    let thread = Thread::spawned(name, cpu, stack_size, f, user)?;
+    let thread = Thread::spawned(name, cpu, stack_size, f, user, placement)?;
     if let Some(linux) = linux {
         linux.bind_kernel_thread(&thread);
     }
-    {
-        let mut q = CPUS[cpu].lock();
-        q.home();
-        q.push_ready(cpu, thread.clone());
-    }
-    let _ = smp::wake(cpu); // as in `enqueue`
+    reservation.commit();
+    CPUS[cpu].lock().push_ready(cpu, thread.clone());
+    let _ = smp::wake(cpu); // the next timer tick also finds it if the IPI fails
     Ok(JoinHandle { thread })
-}
-
-/// Put a ready thread on its CPU's queue, and wake that CPU if it isn't this
-/// one (it may be halted in its idle loop). If the wakeup IPI can't be sent,
-/// the CPU's next tick finds the thread (its scheduler runs, so it ticks).
-fn enqueue(thread: Arc<Thread>) {
-    let cpu = thread.cpu;
-    CPUS[cpu].lock().push_ready(cpu, thread);
-    let _ = smp::wake(cpu);
 }
 
 /// Where every spawned thread starts (through `arch::context`), on its own
@@ -1622,11 +1936,12 @@ extern "C" fn thread_entry() -> ! {
 /// stays ready and gets its turn again. Returns at once before the
 /// scheduler runs on this CPU. Outside every critical section.
 pub fn yield_now() {
+    let were_on = arch::irq::disable();
     let cpu = arch::cpu_index();
     if !running_on(cpu) {
+        arch::irq::restore(were_on);
         return;
     }
-    let were_on = arch::irq::disable();
     schedule(cpu);
     arch::irq::restore(were_on);
 }
@@ -1671,12 +1986,12 @@ pub fn yield_until_blocked<'a>(threads: impl Iterator<Item = &'a JoinHandle> + C
 /// (see [`can_block`]): `time::sleep` busy-waits then.
 #[must_use = "false means it didn't sleep"]
 pub fn sleep(ns: u64) -> bool {
-    let cpu = arch::cpu_index();
-    if !can_block(cpu) {
+    if !can_block() {
         return false;
     }
     let deadline = time::now_ns().saturating_add(ns);
     let were_on = arch::irq::disable();
+    let cpu = arch::cpu_index();
     {
         let mut q = CPUS[cpu].lock();
         let me = q.running().clone();
@@ -1693,9 +2008,9 @@ pub fn sleep(ns: u64) -> bool {
 /// is freed by the next thread on its CPU, and then its joiners wake. Only a
 /// spawned thread can exit (not `main` or an idle thread; not tested).
 pub fn exit() -> ! {
+    let _ = arch::irq::disable();
     let cpu = arch::cpu_index();
     assert!(running_on(cpu), "exit where no scheduler runs");
-    let _ = arch::irq::disable();
     {
         let q = CPUS[cpu].lock();
         let me = q.running();
@@ -1713,9 +2028,9 @@ pub fn exit() -> ! {
 /// already have their `CR3`, FPU, TLS, and `TSS.rsp0`/`PerCpu` installed.
 ///
 /// # Safety
-/// Must be called on `cpu` with interrupts disabled, no locks held, `prev` and
-/// `next` homed on `cpu`, `prev != next`, and both pointers alive until
-/// `finish_switch` runs.
+/// Must be called on `cpu` with interrupts disabled, no locks held, both
+/// contexts owned by `cpu` through on_cpu, `prev != next`, and both pointers
+/// alive until `finish_switch` runs.
 unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thread) {
     // SAFETY: upheld by caller; interrupts are off on `cpu` and both threads
     // are kept alive by `CPUS[cpu].switched_from` and `CPUS[cpu].current`.
@@ -1725,7 +2040,7 @@ unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thre
 
     // 1. Save outgoing user thread's FPU and PerCpu ring-3 fields.
     if let Some(pu) = prev_user {
-        // SAFETY: interrupts are off on `prev`'s home CPU.
+        // SAFETY: interrupts are off on `prev`'s owning CPU.
         unsafe { pu.save_fpu() };
         pu.kernel_rsp.store(arch::percpu::kernel_rsp(), Ordering::Relaxed);
         pu.user_exit_rsp.store(arch::percpu::user_exit_rsp(), Ordering::Relaxed);
@@ -1778,7 +2093,7 @@ fn schedule(cpu: usize) {
         let mut q = CPUS[cpu].lock();
         assert!(q.switched_from.is_none(), "the last switch on cpu {cpu} wasn't finished");
         let prev = q.current.take().expect("a running scheduler has a current thread");
-        assert_eq!(prev.cpu, cpu, "thread {prev:?} isn't cpu {cpu}'s");
+        assert_eq!(prev.cpu(), cpu, "thread {prev:?} isn't cpu {cpu}'s");
         let idle = q.is_idle_thread(&prev);
         // Only this CPU moves its running thread out of Running; one still
         // running (not the idle thread, never queued) goes back on the queue.
@@ -1789,7 +2104,7 @@ fn schedule(cpu: usize) {
         // Queued and taken straight off again, it just keeps running,
         // recording no run-queue change (a thread polling by yielding would
         // fill the X-ray ring otherwise).
-        let keep = requeue && q.ready.is_empty();
+        let keep = requeue && prev.allows(cpu) && q.ready.is_empty();
         if requeue && !keep {
             q.push_ready(cpu, prev.clone());
         }
@@ -1798,14 +2113,15 @@ fn schedule(cpu: usize) {
         } else {
             q.pop_ready(cpu).unwrap_or_else(|| q.idle.clone().expect("a running scheduler has an idle thread"))
         };
-        q.slice_left = SLICE_TICKS;
-        assert_eq!(next.cpu, cpu, "thread {next:?} isn't cpu {cpu}'s");
+        q.slice_left = lumen_time::slice_ticks(next.nice());
+        assert_eq!(next.cpu(), cpu, "thread {next:?} isn't cpu {cpu}'s");
         next.change(State::Ready, State::Running);
         if Arc::ptr_eq(&next, &prev) {
             q.current = Some(next);
             return;
         }
-        // SAFETY: this CPU is both threads' home (asserted), interrupts are
+        next.claim();
+        // SAFETY: this CPU owns both threads through on_cpu; interrupts are
         // off, and `next` isn't running.
         let (save, load) = unsafe { (prev.rsp.slot(), next.rsp.get()) };
         // Checked before `CURRENT` names `next`, so a crash here names `prev`,
@@ -1825,6 +2141,10 @@ fn schedule(cpu: usize) {
     // SAFETY: interrupts are off, `prev_ptr` and `next_ptr` stay alive in
     // `CPUS[cpu].switched_from` and `CPUS[cpu].current` until `finish_switch`.
     unsafe { switch_user_context(cpu, prev_ptr, next_ptr) };
+    #[cfg(feature = "ktest")]
+    // SAFETY: switched_from keeps prev_ptr alive until the actual switch;
+    // its on_cpu ownership still excludes every other CPU's execution.
+    SWITCH_DELAY.stall(unsafe { &*prev_ptr }, StallAt::MidSwitch);
     // SAFETY: interrupts are off (asserted above); `save` is the running
     // thread's `rsp` slot, which `switched_from` keeps alive until the next
     // thread has finished the switch; `load` was saved by `switch` (or made
@@ -1832,18 +2152,29 @@ fn schedule(cpu: usize) {
     // dies and is switched away from, and which no CPU runs on (`next` is
     // this CPU's, and wasn't running).
     unsafe { arch::context::switch(save, load) };
-    finish_switch(cpu);
+    finish_switch(arch::cpu_index());
 }
 
-/// Finish a switch on CPU `cpu`, on the thread switched to: let go of the
-/// thread switched away from, and if it is dead, publish it in
-/// [`FINISHING`], free its stack (on its own CPU, which ran on it: see the
+/// Finish the complete outgoing save on the CPU now running this stack.
+/// A live thread releases on_cpu under its queue locks and relocates if
+/// Ready and disallowed here. A dead thread is published in
+/// [`FINISHING`]: free its stack (on the CPU it died on: see the
 /// module docs on the TLB), mark it reaped, wake its joiners, then free
 /// their list and drop the reference ([`Released`]), and clear `FINISHING`
 /// last. Interrupts off.
 fn finish_switch(cpu: usize) {
     let prev = CPUS[cpu].lock().take_switched_from();
-    let Some(prev) = prev.filter(|p| p.state() == State::Dead) else { return };
+    let Some(prev) = prev else { return };
+    // Decide while ownership still excludes execution elsewhere: after
+    // release a live thread might run and die before this CPU reads it.
+    if prev.state() != State::Dead {
+        release_previous(prev);
+        return;
+    }
+    prev.release();
+    for q in &CPUS {
+        q.lock().reserved -= 1;
+    }
     // Published before `reaped`, so a joiner that sees `reaped` then sees
     // this id or a later store: the clearing below, or a later dead
     // thread's id (never its own). Release, so that a later id carries the
@@ -1864,6 +2195,47 @@ fn finish_switch(cpu: usize) {
     // Must stay after `drop(released)`: a drop guard for this clear would run
     // before `released` drops (locals drop in reverse order), reopening #183.
     FINISHING[cpu].store(0, Ordering::Release);
+}
+
+/// Publish the completed save and release this CPU's reference before a
+/// new CPU can run the thread. Otherwise it could die and be joined while
+/// this CPU still holds a reference whose later drop frees its metadata.
+fn release_previous(mut prev: Arc<Thread>) {
+    loop {
+        let from = prev.cpu(); // stable while this CPU still owns on_cpu
+        let mask = prev.affinity();
+        if mask & (1 << from) != 0 {
+            let q = CPUS[from].lock();
+            if !prev.allows(from) {
+                continue;
+            }
+            prev.release();
+            drop(prev);
+            drop(q);
+            return;
+        }
+        let to = (mask & online_mask()).trailing_zeros() as usize;
+        match with_queues(from, to, |source, dest| {
+            if prev.affinity() != mask {
+                return Err(prev);
+            }
+            prev.release();
+            if prev.state() == State::Ready {
+                let at = source.ready.iter().position(|t| t.id == prev.id).expect("Ready outgoing thread queued");
+                move_ready(from, source, to, dest, at);
+            }
+            // Still under the queues: nobody can claim the released thread
+            // until this CPU has let go of its last reference to it.
+            drop(prev);
+            Ok(())
+        }) {
+            Ok(()) => {
+                let _ = smp::wake(to);
+                return;
+            }
+            Err(thread) => prev = thread,
+        }
+    }
 }
 
 /// What [`finish_switch`] releases for a dead thread, as this drops: its
@@ -1934,7 +2306,10 @@ pub fn tick() {
         PREV_TICK_NS[cpu].store(LAST_TICK_NS[cpu].load(Ordering::Relaxed), Ordering::Relaxed);
         LAST_TICK_NS[cpu].store(now, Ordering::Relaxed);
     }
-    let switch = {
+    if TICKED[cpu].load(Ordering::Relaxed).wrapping_add(1).is_multiple_of(BALANCE_TICKS) {
+        balance(cpu);
+    }
+    {
         let mut q = CPUS[cpu].lock();
         // Counted before waking anyone: the thread this tick interrupted.
         TICKED[cpu].fetch_add(1, Ordering::Relaxed);
@@ -1944,7 +2319,11 @@ pub fn tick() {
         }
         q.wake_sleepers(cpu, now);
         q.slice_left = q.slice_left.saturating_sub(1);
-        !q.ready.is_empty() && (q.slice_left == 0 || q.on_idle())
+    }
+    route_ready(cpu);
+    let switch = {
+        let q = CPUS[cpu].lock();
+        (!q.ready.is_empty() && (q.slice_left == 0 || q.on_idle())) || !q.running().allows(cpu)
     };
     if switch {
         schedule(cpu);
@@ -2061,15 +2440,15 @@ impl WaitQueue {
     /// Every wait: block, as `kind` says, until `ready()`, `deadline` or
     /// what interrupts a wait of that kind.
     fn block(&self, kind: WaitKind, deadline: Option<u64>, mut ready: impl FnMut() -> bool) -> Wake {
-        let cpu = arch::cpu_index();
-        if !can_block(cpu) {
+        if !can_block() {
             // Or halt for another CPU's crash report (#106).
             crate::crash::halt_if_stopping_elsewhere();
             panic!("blocking where a thread can't (no scheduler, interrupts off, a lock held, or the idle thread)");
         }
-        let me = CPUS[cpu].lock().running().clone();
+        let me = current().expect("a blocking thread");
         loop {
             let were_on = arch::irq::disable();
+            let cpu = arch::cpu_index();
             let interrupted = {
                 let mut waiters = self.waiters.lock();
                 let answer = if ready() {
@@ -2141,8 +2520,9 @@ impl WaitQueue {
             // entry from an earlier wait that a deadline ended), or not
             // switched away at all (interrupted before it did): then its
             // entries must come off, so no waker or tick finds it later,
-            // blocked on something else. (The timer can't run on this CPU
-            // before the deadline entry is gone: interrupts are still off.)
+            // blocked on something else. `cpu` deliberately names the old
+            // queue: migration already removed its deadline before moving
+            // us. Without migration its timer still cannot run (IRQs off).
             self.forget(&me);
             if deadline.is_some() {
                 CPUS[cpu].lock().forget_deadline(&me);
@@ -2205,13 +2585,20 @@ impl Drop for WaitQueue {
 
 /// Make a thread taken off a wait queue ready: whether it did. It is
 /// blocked unless something else woke it first (its deadline, or a waker
-/// holding an entry from an earlier wait); then it isn't queued again, and
-/// it takes its own entries off once it runs.
+/// holding an entry from an earlier wait); then it is not queued again.
+/// Removes its old deadline before enqueueing on its stable queue CPU,
+/// then relocates if affinity excludes that CPU and the context is saved.
+/// An on_cpu thread stays put until finish_switch completes the save.
 fn wake(thread: Arc<Thread>) -> bool {
+    let (cpu, mut q) = lock_queue_of(&thread);
     if !thread.try_change(State::Blocked, State::Ready) {
         return false;
     }
-    enqueue(thread);
+    q.forget_deadline(&thread);
+    q.push_ready(cpu, thread.clone());
+    drop(q);
+    relocate_disallowed(&thread);
+    let _ = smp::wake(thread.cpu());
     true
 }
 
@@ -2225,8 +2612,9 @@ fn wake(thread: Arc<Thread>) -> bool {
 /// rechecks its condition and pending flags. Never blocks; callable from
 /// any CPU while holding a signal or wait-queue lock, but not a run-queue
 /// lock or a lock nested inside it (thread stacks, heap, page tables and
-/// frame allocator). It takes the target CPU's run-queue lock;
-/// `smp::wake` takes no lock.
+/// frame allocator). It locks the target's queue and may then take both
+/// source and destination queues in ascending CPU order to honor affinity.
+/// It never takes a wait-queue lock; `smp::wake` takes no lock.
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C5's senders next
 pub fn kick(thread: &Thread) {
     // Pairs with the fence in `WaitQueue::block` between `Blocked` and its
@@ -2264,10 +2652,17 @@ pub fn init() {
     assert_eq!(arch::cpu_index(), 0, "sched::init is for the boot CPU");
     assert!(time::timer_published(), "sched::init before time::init");
     assert!(arch::irq::enabled(), "sched::init with interrupts off: no tick could start a scheduler");
-    let idle = Thread::spawned("idle".into(), 0, STACK_SIZE, Box::new(|| idle_loop(0, || false, || {})), None)
-        .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
+    let idle = Thread::spawned(
+        "idle".into(),
+        0,
+        STACK_SIZE,
+        Box::new(|| idle_loop(0, || false, || {})),
+        None,
+        Placement::pinned(0),
+    )
+    .unwrap_or_else(|e| panic!("the boot CPU's idle thread: {e}"));
     install(0, Thread::adopted("main".into()), idle);
-    CPUS[0].lock().home(); // `main`: it can sleep and block too
+    reserve_thread().expect("reserve main thread queues").commit(); // main can sleep and block too
     // The boot CPU's timer already runs (`time::init`).
     ARMED[0].store(true, Ordering::Release);
     let aps: Vec<usize> = (1..MAX_CPUS).filter(|&c| smp::online_lapic_id(c).is_some()).collect();
@@ -2320,6 +2715,9 @@ fn idle_loop(cpu: usize, has_job: impl Fn() -> bool, run_job: impl Fn()) {
                 ARMED[cpu].store(true, Ordering::Release);
             }
         }
+        if running_on(cpu) {
+            balance(cpu);
+        }
         // Checked with interrupts off: a wakeup can't slip in before the halt.
         arch::irq::wait_unless(|| {
             READY[cpu].load(Ordering::Acquire) > 0
@@ -2356,6 +2754,18 @@ fn spawn_test(cpu: usize, name: &'static str, f: impl FnOnce() + Send + 'static)
     })
 }
 
+/// `spawn_migratable` for tests, retaining the spawn failure's diagnosis.
+#[cfg(feature = "ktest")]
+pub(crate) fn spawn_test_migratable(
+    name: &'static str,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<JoinHandle, &'static str> {
+    spawn_migratable(name, f).map_err(|e| {
+        crate::ktest::diag(format_args!("spawning migratable {name}: {e}"));
+        "spawn failed"
+    })
+}
+
 /// Yield until `done()` or the test deadline; whether `done()`.
 #[cfg(feature = "ktest")]
 pub(crate) fn yield_until(done: impl Fn() -> bool) -> bool {
@@ -2378,8 +2788,8 @@ pub(crate) fn join_bounded(h: JoinHandle) -> crate::ktest::TestResult {
         crate::ktest::diag(format_args!("{t:?} wasn't reaped"));
         return Err("a thread didn't finish");
     }
-    if !yield_until(|| FINISHING[t.cpu].load(Ordering::Acquire) != t.id) {
-        crate::ktest::diag(format_args!("cpu {} is still finishing {t:?}", t.cpu));
+    if !yield_until(|| FINISHING[t.cpu()].load(Ordering::Acquire) != t.id) {
+        crate::ktest::diag(format_args!("cpu {} is still finishing {t:?}", t.cpu()));
         return Err("a thread's CPU didn't let go of it");
     }
     h.join();
@@ -3028,7 +3438,7 @@ crate::ktest!(
 
 crate::ktest!(
     fn every_homed_thread_has_room_in_its_queues() {
-        // The timer never allocates: with 40 threads homed on a CPU (blocked,
+        // The timer never allocates: with 40 threads reserved on every CPU (blocked,
         // so on neither queue) its ready and sleeper queues already have room
         // for all of them (pushing asserts it too); once they are reaped the
         // count is back.
@@ -3037,7 +3447,7 @@ crate::ktest!(
         let cpu = last_cpu()?;
         let room = || {
             let q = CPUS[cpu].lock();
-            (q.homed, q.ready.capacity() >= q.homed && q.sleepers.capacity() >= q.homed)
+            (q.reserved, q.ready.capacity() >= q.reserved && q.sleepers.capacity() >= q.reserved)
         };
         let base = room().0;
         let s = Arc::new((WaitQueue::new(), AtomicBool::new(false)));
@@ -3045,8 +3455,8 @@ crate::ktest!(
         for i in 0..N {
             let t = s.clone();
             handles.push(spawn_test(cpu, "parked", move || t.0.wait_until(|| t.1.load(Ordering::Acquire)))?);
-            let (homed, ok) = room();
-            kassert_eq!(homed, base + i + 1);
+            let (reserved, ok) = room();
+            kassert_eq!(reserved, base + i + 1);
             kassert!(ok);
         }
         kassert!(yield_until(|| s.0.waiters.lock().len() == N));
@@ -3267,6 +3677,7 @@ crate::ktest!(
         // A CPU index past the limit, and every index no online CPU has.
         use crate::kassert;
         kassert!(matches!(spawn_on(MAX_CPUS, "nowhere", || {}), Err(SpawnError::NotRunning)));
+        kassert!(matches!(spawn_on(usize::MAX, "nowhere", || {}), Err(SpawnError::NotRunning)));
         for cpu in (0..MAX_CPUS).filter(|&c| smp::online_lapic_id(c).is_none()) {
             kassert!(matches!(spawn_on(cpu, "offline", || {}), Err(SpawnError::NotRunning)));
         }
@@ -3277,7 +3688,7 @@ crate::ktest!(
 /// Ktests: whether `t` has a deadline entry on its CPU, or is on `queue`.
 #[cfg(feature = "ktest")]
 fn entries_of(t: &Arc<Thread>, queue: &WaitQueue) -> (bool, bool) {
-    let deadline = CPUS[t.cpu].lock().sleepers.iter().any(|s| s.on_queue && Arc::ptr_eq(&s.thread, t));
+    let deadline = CPUS[t.cpu()].lock().sleepers.iter().any(|s| s.on_queue && Arc::ptr_eq(&s.thread, t));
     let queued = queue.waiters.lock().iter().any(|w| Arc::ptr_eq(w, t));
     (deadline, queued)
 }
@@ -4394,5 +4805,657 @@ crate::ktest!(
         kassert_eq!(name, ThreadName::new("exec-name"));
         kassert_eq!(busy, Some(ThreadName::new("?")));
         Ok(())
+    }
+);
+
+/// Tests drive balance passes explicitly; ordinary timer/idle balancing is
+/// paused only for the duration of these sequential ktests.
+#[cfg(feature = "ktest")]
+static AUTO_BALANCE: AtomicBool = AtomicBool::new(true);
+
+#[cfg(feature = "ktest")]
+struct ManualBalance;
+
+#[cfg(feature = "ktest")]
+impl ManualBalance {
+    fn new() -> Self {
+        assert!(AUTO_BALANCE.swap(false, Ordering::SeqCst));
+        Self
+    }
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for ManualBalance {
+    fn drop(&mut self) {
+        AUTO_BALANCE.store(true, Ordering::SeqCst);
+    }
+}
+
+crate::ktest!(
+    fn nice_scales_slices() {
+        use crate::kassert_eq;
+        let _manual = ManualBalance::new();
+        let observed = Arc::new(SpinLock::new(Vec::with_capacity(40)));
+        let out = observed.clone();
+        let cpu = last_cpu()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let peer = spawn_test(cpu, "nice-peer", move || {
+            let end = time::now_ns() + TEST_DEADLINE_NS;
+            while !done.load(Ordering::Acquire) && time::now_ns() < end {
+                yield_now();
+            }
+        })?;
+        let h = spawn_test(cpu, "nice-slices", move || {
+            let me = current().expect("thread");
+            for nice in -20..=19 {
+                me.set_nice(nice);
+                let were_on = arch::irq::disable();
+                // The peer has nice 0: returning must refill with this
+                // incoming thread's priority, not the outgoing peer's.
+                yield_now();
+                let cpu = arch::cpu_index();
+                let start = CPUS[cpu].lock().slice_left;
+                let after = if start > 1 {
+                    tick();
+                    Some(CPUS[cpu].lock().slice_left)
+                } else {
+                    None // a final tick switches away and refills on return
+                };
+                out.lock().push((nice, start, after));
+                arch::irq::restore(were_on);
+            }
+        })?;
+        let joined = join_bounded(h);
+        stop.store(true, Ordering::Release);
+        join_bounded(peer)?;
+        joined?;
+        let observed = observed.lock();
+        kassert_eq!(observed.len(), 40);
+        for &(nice, start, after) in observed.iter() {
+            kassert_eq!(start, lumen_time::slice_ticks(nice as i8));
+            if let Some(after) = after {
+                kassert_eq!(after, start - 1);
+            }
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn threads_migrate_to_idle_cpus() {
+        use crate::{kassert, kassert_eq};
+        let _manual = ManualBalance::new();
+        let here = arch::cpu_index();
+        let cpus = running_cpus();
+        kassert!(cpus.len() > 1);
+        let results = Arc::new([const { AtomicUsize::new(usize::MAX) }; MAX_CPUS]);
+        let mut handles = Vec::with_capacity(cpus.len());
+        let mut passes = 0;
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut balanced = true;
+        let refused;
+        {
+            // Keep every new thread queued on this CPU until the explicit
+            // passes. A remote CPU may execute a stolen thread immediately.
+            let _irq = arch::irq::push_off();
+            for i in 0..cpus.len() {
+                let out = results.clone();
+                let stop = stop.clone();
+                handles.push(spawn_test_migratable("migrate", move || {
+                    out[i].store(arch::cpu_index(), Ordering::Release);
+                    let end = time::now_ns() + TEST_DEADLINE_NS;
+                    while !stop.load(Ordering::Acquire) && time::now_ns() < end {
+                        core::hint::spin_loop();
+                    }
+                })?);
+            }
+            for &cpu in cpus.iter().filter(|&&cpu| cpu != here) {
+                if balance_pass(cpu) {
+                    passes += 1;
+                } else {
+                    balanced = false;
+                }
+            }
+            let target = *cpus.iter().find(|&&cpu| cpu != here).unwrap();
+            let end = time::now_ns() + TEST_DEADLINE_NS;
+            while !results.iter().any(|v| v.load(Ordering::Acquire) == target) && time::now_ns() < end {
+                core::hint::spin_loop();
+            }
+            // Source: this runner plus one ready thread. Destination: one
+            // running worker. A runnable difference of one must not steal.
+            refused = !balance_pass(target);
+        }
+        stop.store(true, Ordering::Release);
+        for h in handles {
+            join_bounded(h)?;
+        }
+        kassert!(balanced && refused);
+        kassert_eq!(passes, cpus.len() - 1);
+        let mut seen: Vec<_> = results[..cpus.len()].iter().map(|v| v.load(Ordering::Acquire)).collect();
+        seen.sort_unstable();
+        kassert_eq!(seen, cpus);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn pinned_threads_never_migrate() {
+        use crate::{kassert, kassert_eq};
+        let _manual = ManualBalance::new();
+        let here = arch::cpu_index();
+        let there = last_cpu()?;
+        kassert!(here != there);
+        let ran = Arc::new([const { AtomicUsize::new(usize::MAX) }; 3]);
+        let mut hs = Vec::with_capacity(3);
+        {
+            let _irq = arch::irq::push_off();
+            let r = ran.clone();
+            hs.push(spawn_test(here, "pinned", move || r[0].store(arch::cpu_index(), Ordering::Release))?);
+            let r = ran.clone();
+            hs.push(spawn_test_migratable("movable", move || r[1].store(arch::cpu_index(), Ordering::Release))?);
+            let r = ran.clone();
+            hs.push(spawn_test(here, "pinned-last", move || r[2].store(arch::cpu_index(), Ordering::Release))?);
+            // The last queued thread is pinned: the pass must search back
+            // and move the unpinned control in this very same pass.
+            kassert!(balance_pass(there));
+            kassert_eq!(hs[0].thread.cpu(), here);
+            kassert_eq!(hs[1].thread.cpu(), there);
+            kassert_eq!(hs[2].thread.cpu(), here);
+        }
+        for h in hs {
+            join_bounded(h)?;
+        }
+        kassert_eq!(ran.each_ref().map(|v| v.load(Ordering::Acquire)), [here, there, here]);
+        // With the helpers gone, only this runner is runnable. These
+        // trailing passes are refused by the runnable-count threshold.
+        for _ in 0..8 {
+            kassert!(!balance_pass(there));
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn affinity_wakes_and_kicks_follow_migration() {
+        use crate::{kassert, kassert_eq};
+        let _manual = ManualBalance::new();
+        let here = arch::cpu_index();
+        let there = last_cpu()?;
+        let waiting = Arc::new(Waiting::default());
+        let w = waiting.clone();
+        let seen = Arc::new([const { AtomicUsize::new(usize::MAX) }; 2]);
+        let out = seen.clone();
+        let h = spawn_test_migratable("affinity-wake", move || {
+            for round in 1..=2 {
+                let deadline = Some(time::now_ns() + TEST_DEADLINE_NS);
+                let answer = if round == 1 {
+                    w.queue.wait_interruptible(deadline, || w.ready.load(Ordering::SeqCst))
+                } else {
+                    w.queue.wait_killable(deadline, || w.ready.load(Ordering::SeqCst))
+                };
+                out[round as usize - 1].store(arch::cpu_index(), Ordering::Release);
+                w.answer(round, answer);
+            }
+        })?;
+        let t = h.thread.clone();
+        kassert_eq!(t.set_affinity(0), Err(AffinityError::NoOnlineCpu));
+        kassert!(yield_until(|| t.state() == State::Blocked && !t.on_cpu.load(Ordering::Acquire)));
+        kassert_eq!(t.set_affinity(1 << there), Ok(()));
+        kassert_eq!(t.cpu(), here); // blocked threads do not move
+        t.set_sigpending();
+        {
+            // The old CPU cannot run route_ready before this assertion:
+            // a fully saved wait must be relocated by wake itself.
+            let _irq = arch::irq::push_off();
+            kick(&t);
+            kassert_eq!(t.cpu(), there);
+        }
+        kassert_eq!(waiting.wait_answer(1), Some(wake_code(Wake::Interrupted)));
+        kassert!(yield_until(|| t.state() == State::Blocked && !t.on_cpu.load(Ordering::Acquire)));
+        kassert_eq!(t.set_affinity(1 << here), Ok(()));
+        t.set_fatal_pending();
+        kick(&t);
+        kassert_eq!(waiting.wait_answer(2), Some(wake_code(Wake::Interrupted)));
+        join_bounded(h)?;
+        kassert_eq!(seen.each_ref().map(|v| v.load(Ordering::Acquire)), [there, here]);
+        kassert!(t.sigpending() && t.fatal_pending());
+        for q in &CPUS {
+            kassert!(!q.lock().sleepers.iter().any(|s| s.thread.id == t.id));
+        }
+        Ok(())
+    }
+);
+
+/// A ring-3 program with live register sentinels across nine syscall rounds.
+/// Each round publishes snapshots and waits for the kernel test's go-ahead.
+#[cfg(feature = "ktest")]
+fn migration_program() -> (Vec<u8>, Vec<u8>, Vec<u64>) {
+    const DATA: u64 = 0x60_0000;
+    let mut code = Vec::new();
+    let mut data = alloc::vec![0u8; 4096];
+    // TLS at +0x300, XMM input at +0x100, snapshots at +0x400.
+    for (i, b) in data[0x100..0x200].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+    }
+    data[0x300..0x308].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes());
+    fn mov_imm(code: &mut Vec<u8>, reg: u8, value: u64) {
+        code.extend_from_slice(&[0x48 | (reg >> 3), 0xb8 | (reg & 7)]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+    fn mem(code: &mut Vec<u8>, prefix: &[u8], reg: u8, offset: u32) {
+        code.extend_from_slice(prefix);
+        code.push(0x83 | ((reg & 7) << 3)); // [rbx + disp32]
+        code.extend_from_slice(&offset.to_le_bytes());
+    }
+    // arch_prctl(ARCH_SET_FS, DATA + 0x300)
+    mov_imm(&mut code, 0, 158);
+    mov_imm(&mut code, 7, 0x1002);
+    mov_imm(&mut code, 6, DATA + 0x300);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    mov_imm(&mut code, 3, DATA);
+    for reg in 0..16 {
+        let prefix = if reg < 8 { &[0xf3, 0x0f, 0x6f][..] } else { &[0xf3, 0x44, 0x0f, 0x6f][..] };
+        mem(&mut code, prefix, reg, 0x100 + u32::from(reg) * 16);
+    }
+    // All syscall-preserved GPRs, including caller-saved r8/r9/r10.
+    const REGS: [u8; 12] = [3, 5, 7, 6, 2, 8, 9, 10, 12, 13, 14, 15];
+    let mut expected = Vec::new();
+    for reg in REGS {
+        let value = if reg == 3 { DATA } else { 0x1020_3040_5060_7000 + u64::from(reg) };
+        mov_imm(&mut code, reg, value);
+        expected.push(value);
+    }
+    for round in 1..=9u32 {
+        code.extend_from_slice(&[0xb8, 39, 0, 0, 0, 0x0f, 0x05]); // getpid; syscall
+        for reg in 0..16 {
+            let prefix = if reg < 8 { &[0xf3, 0x0f, 0x7f][..] } else { &[0xf3, 0x44, 0x0f, 0x7f][..] };
+            mem(&mut code, prefix, reg, 0x400 + u32::from(reg) * 16);
+        }
+        for (i, reg) in REGS.into_iter().enumerate() {
+            mem(&mut code, &[0x48 | ((reg >> 3) << 2), 0x89], reg, 0x600 + i as u32 * 8);
+        }
+        // mov rax, fs:[0]; mov [rbx+0x700], rax; snapshot rsp too.
+        code.extend_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+        mem(&mut code, &[0x48, 0x89], 0, 0x700);
+        mem(&mut code, &[0x48, 0x89], 4, 0x708);
+        code.extend_from_slice(&[0xc7, 0x03]); // mov dword [rbx], round
+        code.extend_from_slice(&round.to_le_bytes());
+        code.extend_from_slice(&[0x83, 0x7b, 4, round as u8, 0x72, 0xfa]); // wait [rbx+4] >= round
+    }
+    code.extend_from_slice(&[0xb8, 231, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, 0x0f, 0x0b]);
+    (code, data, expected)
+}
+
+crate::ktest!(
+    fn migration_keeps_user_state() {
+        use crate::linux::process::{self, ConsoleIo, Stdio};
+        use crate::user::{copy_from_user, copy_to_user};
+        use crate::{kassert, kassert_eq};
+        use lumen_vm::Prot;
+        const CODE: u64 = 0x40_0000;
+        const STACK: u64 = 0x50_0000;
+        const DATA: u64 = 0x60_0000;
+        let _manual = ManualBalance::new();
+        let cpus = running_cpus();
+        kassert!(cpus.len() > 1);
+        let (code, data, gprs) = migration_program();
+        let space = Arc::new(AddressSpace::new().map_err(|_| "space")?);
+        space.map_eager_with_bytes(CODE, 4096, Prot::READ | Prot::EXEC, &code).map_err(|_| "code")?;
+        space.map_eager_with_bytes(STACK, 4096, Prot::READ | Prot::WRITE, &[]).map_err(|_| "stack")?;
+        space.map_eager_with_bytes(DATA, 4096, Prot::READ | Prot::WRITE, &data).map_err(|_| "data")?;
+        let stdio = Stdio::open().map_err(|_| "stdio")?;
+        let exit = Arc::new(SpinLock::new(None));
+        let out = exit.clone();
+        let h = spawn_user_on(cpus[0], "migrate-user", space.clone(), move || {
+            process::register_current(ConsoleIo::Capture, false, Vec::new(), None, stdio);
+            // SAFETY: spawn_user_on installed the address space; code and
+            // stack are mapped user pages and the entry runs with IRQs on.
+            unsafe { arch::syscall::enter_ring3(CODE, STACK + 4096, 0x202) };
+            *out.lock() = process::take_current().exit;
+        })
+        .map_err(|_| "spawn user")?;
+        let t = h.thread.clone();
+        // Keep mappings alive if the user exits as soon as the last
+        // checkpoint is released, before this CPU detaches its guard.
+        kassert!(space.add_user());
+        let guard = UserSpaceGuard::enter(space.clone());
+        let mut moves = 0;
+        let result = (|| {
+            for round in 1..=9u32 {
+                kassert!(yield_until(|| {
+                    let mut mark = [0u8; 4];
+                    copy_from_user(&mut mark, DATA).is_ok() && u32::from_le_bytes(mark) == round
+                }));
+                let mut xmm = [0u8; 256];
+                copy_from_user(&mut xmm, DATA + 0x400).map_err(|_| "read XMM")?;
+                kassert_eq!(xmm.as_slice(), &data[0x100..0x200]);
+                let mut regs = [0u8; 96];
+                copy_from_user(&mut regs, DATA + 0x600).map_err(|_| "read GPRs")?;
+                for (bytes, &expected) in regs.as_chunks::<8>().0.iter().zip(&gprs) {
+                    kassert_eq!(u64::from_le_bytes(*bytes), expected);
+                }
+                let mut tls_rsp = [0u8; 16];
+                copy_from_user(&mut tls_rsp, DATA + 0x700).map_err(|_| "read TLS/RSP")?;
+                kassert_eq!(&tls_rsp[..8], &data[0x300..0x308]);
+                kassert_eq!(u64::from_le_bytes(tls_rsp[8..].try_into().unwrap()), STACK + 4096);
+                if round < 9 {
+                    let target = cpus[round as usize % cpus.len()];
+                    kassert_eq!(t.set_affinity(1 << target), Ok(()));
+                    // First confirm placement, then require a tick charged
+                    // there: a queued thread has not necessarily run yet.
+                    kassert!(yield_until(|| t.cpu() == target));
+                    let before = t.ticks.load(Ordering::Acquire);
+                    kassert!(yield_until(|| t.ticks.load(Ordering::Acquire) > before));
+                    kassert!(space.active_mask() & (1 << target) != 0);
+                    moves += 1;
+                }
+                copy_to_user(DATA + 4, &round.to_le_bytes()).map_err(|_| "release round")?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            // Release every checkpoint so a failed assertion still joins.
+            let _ = copy_to_user(DATA + 4, &9u32.to_le_bytes());
+        }
+        drop(guard);
+        space.drop_user();
+        join_bounded(h)?;
+        result?;
+        kassert_eq!(moves, 8);
+        kassert!(matches!(*exit.lock(), Some(crate::user::UserExit::Exited(0))));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn migration_keeps_deferred_state() {
+        use crate::{kassert, kassert_eq};
+        use arch::percpu::{DebugCode, DebugOrigin, DebugTrap};
+        let _manual = ManualBalance::new();
+        let cpus = running_cpus();
+        let space = Arc::new(AddressSpace::new().map_err(|_| "space")?);
+        let mm = space.clone();
+        let result = Arc::new(SpinLock::new(None));
+        let out = result.clone();
+        let h = spawn_test_migratable("migrate-debug", move || {
+            let _space = UserSpaceGuard::enter(mm.clone());
+            let me = current().expect("thread");
+            let run = || -> crate::ktest::TestResult {
+                me.set_sigpending();
+                me.set_fatal_pending();
+                for cpu in cpus.into_iter().cycle().take(8) {
+                    let were_on = arch::irq::disable();
+                    arch::percpu::set_kernel_rsp(0x1234_5000);
+                    arch::percpu::set_user_exit_rsp(0x2345_6000);
+                    arch::percpu::set_pending_debug_trap(Some(DebugTrap {
+                        code: DebugCode::Trace,
+                        rip: 0x4567_8000,
+                        origin: DebugOrigin::Lstar,
+                    }));
+                    me.set_affinity(1 << cpu).expect("migratable thread");
+                    yield_now();
+                    let landed = arch::cpu_index();
+                    let krsp = arch::percpu::kernel_rsp();
+                    let exit_rsp = arch::percpu::user_exit_rsp();
+                    let debug = arch::percpu::take_pending_debug_trap();
+                    let loaded = arch::percpu::loaded_space();
+                    // Clear the synthetic state before restoring IRQs.
+                    arch::percpu::set_kernel_rsp(0);
+                    arch::percpu::set_user_exit_rsp(0);
+                    arch::irq::restore(were_on);
+                    kassert_eq!(landed, cpu);
+                    kassert_eq!(krsp, 0x1234_5000);
+                    kassert_eq!(exit_rsp, 0x2345_6000);
+                    let debug = debug.ok_or("lost deferred trap")?;
+                    kassert!(matches!(debug.code, DebugCode::Trace));
+                    kassert_eq!(debug.origin, DebugOrigin::Lstar);
+                    kassert_eq!(debug.rip, 0x4567_8000);
+                    kassert_eq!(loaded, Arc::as_ptr(&mm));
+                    kassert_eq!(mm.active_mask(), 1 << cpu);
+                    kassert!(me.sigpending() && me.fatal_pending());
+                }
+                Ok(())
+            };
+            *out.lock() = Some(run());
+        })?;
+        join_bounded(h)?;
+        result.lock().take().ok_or("missing result")??;
+        kassert_eq!(space.active_mask(), 0);
+        Ok(())
+    }
+);
+
+#[cfg(feature = "ktest")]
+static SWITCH_DELAY: BlockDelay = BlockDelay::new();
+
+crate::ktest!(
+    fn automatic_balancer_moves_runnable_threads() {
+        use crate::{kassert, kassert_eq};
+        let here = arch::cpu_index();
+        kassert!(running_cpus().len() >= 4);
+        let seen = Arc::new([const { AtomicUsize::new(usize::MAX) }; 3]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::with_capacity(3);
+        {
+            let _irq = arch::irq::push_off();
+            for i in 0..3 {
+                let seen = seen.clone();
+                let stop = stop.clone();
+                handles.push(spawn_test_migratable("auto-migrate", move || {
+                    let end = time::now_ns() + TEST_DEADLINE_NS;
+                    while !stop.load(Ordering::Acquire) && time::now_ns() < end {
+                        let cpu = arch::cpu_index();
+                        if cpu != here {
+                            seen[i].store(cpu, Ordering::Release);
+                        }
+                        core::hint::spin_loop();
+                    }
+                })?);
+            }
+        }
+        // Stay runnable too: four runnable threads on four CPUs must spread
+        // all three workers away. No explicit balance call or timed rate.
+        let end = time::now_ns() + TEST_DEADLINE_NS;
+        while seen.iter().any(|v| v.load(Ordering::Acquire) == usize::MAX) && time::now_ns() < end {
+            core::hint::spin_loop();
+        }
+        let cpus = seen.each_ref().map(|v| v.load(Ordering::Acquire));
+        stop.store(true, Ordering::Release);
+        for h in handles {
+            join_bounded(h)?;
+        }
+        kassert_eq!(cpus.iter().filter(|&&cpu| cpu != usize::MAX && cpu != here).count(), 3);
+        Ok(())
+    }
+);
+
+#[cfg(feature = "ktest")]
+fn deadline_follows_affinity(on_queue: bool) -> crate::ktest::TestResult {
+    use crate::{kassert, kassert_eq};
+    let _manual = ManualBalance::new();
+    let here = arch::cpu_index();
+    let there = last_cpu()?;
+    for _ in 0..5 {
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let answer = Arc::new(SpinLock::new(None));
+        let (out, result) = (seen.clone(), answer.clone());
+        let h = spawn_test_migratable("deadline-move", move || {
+            let wake = if on_queue {
+                WaitQueue::new().wait_interruptible(Some(time::now_ns() + 100_000_000), || false)
+            } else {
+                assert!(sleep(100_000_000));
+                Wake::TimedOut
+            };
+            out.store(arch::cpu_index(), Ordering::Release);
+            *result.lock() = Some(wake);
+        })?;
+        let t = h.thread.clone();
+        let state = if on_queue { State::Blocked } else { State::Sleeping };
+        let waiting = yield_until(|| t.state() == state && !t.on_cpu.load(Ordering::Acquire) || h.is_finished());
+        let changed = {
+            // The timer on the original CPU cannot expire this deadline
+            // between checking the state and setting its affinity.
+            let _irq = arch::irq::push_off();
+            if waiting && t.state() == state {
+                kassert_eq!(t.set_affinity(1 << there), Ok(()));
+                kassert_eq!(t.state(), state);
+                kassert_eq!(t.cpu(), here);
+                true
+            } else {
+                false
+            }
+        };
+        let finished = yield_until(|| h.is_finished());
+        // Rescue a broken route_ready before asserting: the disallowed
+        // Ready thread otherwise remains stranded on its old queue.
+        if !finished {
+            t.set_affinity(1 << here).expect("migratable helper");
+        }
+        join_bounded(h)?;
+        if !changed {
+            continue; // the deadline passed before we changed the mask
+        }
+        kassert!(finished);
+        kassert_eq!(seen.load(Ordering::Acquire), there);
+        kassert_eq!(*answer.lock(), Some(Wake::TimedOut));
+        kassert!(!CPUS[here].lock().sleepers.iter().any(|s| s.thread.id == t.id));
+        return Ok(());
+    }
+    Err("no sleeping affinity change in five attempts")
+}
+
+crate::ktest!(
+    fn sleeping_deadline_follows_affinity() {
+        deadline_follows_affinity(false)
+    }
+);
+
+crate::ktest!(
+    fn wait_deadline_follows_affinity() {
+        deadline_follows_affinity(true)
+    }
+);
+
+crate::ktest!(
+    fn affinity_refuses_immutable_pins() {
+        use crate::{kassert, kassert_eq};
+        let here = arch::cpu_index();
+        let me = current().expect("runner");
+        let original = me.affinity();
+        kassert_eq!(me.set_affinity(ALL_CPUS), Err(AffinityError::Pinned));
+        kassert_eq!(me.affinity(), original);
+        let idle = CPUS[here].lock().idle.clone().expect("idle");
+        kassert_eq!(idle.set_affinity(ALL_CPUS), Err(AffinityError::Pinned));
+        let space = Arc::new(AddressSpace::new().map_err(|_| "space")?);
+        let result = Arc::new(SpinLock::new(None));
+        let out = result.clone();
+        let h = spawn_user_pinned_on(here, "pinned-user", space, move || {
+            let me = current().expect("user probe");
+            *out.lock() = Some((me.cpu(), me.affinity(), me.set_affinity(ALL_CPUS)));
+        })
+        .map_err(|e| {
+            crate::ktest::diag(format_args!("pinned user: {e}"));
+            "spawn pinned user"
+        })?;
+        kassert!(h.thread.pinned);
+        kassert_eq!(h.thread.affinity(), 1 << here);
+        join_bounded(h)?;
+        kassert_eq!(*result.lock(), Some((here, 1 << here, Err(AffinityError::Pinned))));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn queue_reservations_fail_and_roll_back() {
+        use crate::{kassert, kassert_eq};
+        let queues = [SpinLock::new(Cpu::new()), SpinLock::new(Cpu::new())];
+        // The first queue can reserve without allocating; the second has
+        // no buffers. Its real try_reserve failure must roll back the first.
+        queues[0].lock().try_home().map_err(|_| "prepare queue")?;
+        queues[0].lock().reserved -= 1;
+        crate::mm::heap::refuse_from(0);
+        let failed = reserve_queues(&queues);
+        crate::mm::heap::refuse_from(usize::MAX);
+        kassert!(matches!(failed, Err(SpawnError::NoMemory)));
+        for q in &queues {
+            kassert_eq!(q.lock().reserved, 0);
+        }
+        let reserved = reserve_queues(&queues).map_err(|_| "reserve queues")?;
+        for q in &queues {
+            kassert_eq!(q.lock().reserved, 1);
+        }
+        drop(reserved); // a later Thread::spawned failure uses this same rollback
+        for q in &queues {
+            kassert_eq!(q.lock().reserved, 0);
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn migration_waits_for_complete_switch() {
+        use crate::{kassert, kassert_eq};
+        let _manual = ManualBalance::new();
+        let source = last_cpu()?;
+        let target = running_cpus()
+            .into_iter()
+            .find(|&cpu| cpu != source && cpu != arch::cpu_index())
+            .ok_or("needs three CPUs")?;
+        for _ in 0..5 {
+            let gate = Arc::new(AtomicBool::new(false));
+            let started = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let ran = Arc::new(AtomicUsize::new(usize::MAX));
+            let (g, s, r) = (gate.clone(), started.clone(), ran.clone());
+            let owner = spawn_test_migratable("switch-owner", move || {
+                current().unwrap().set_affinity(1 << source).expect("migratable owner");
+                yield_now();
+                s.store(true, Ordering::SeqCst);
+                let end = time::now_ns() + TEST_DEADLINE_NS;
+                while !g.load(Ordering::SeqCst) && time::now_ns() < end {
+                    core::hint::spin_loop();
+                }
+                yield_now();
+                r.store(arch::cpu_index(), Ordering::SeqCst);
+            })?;
+            kassert!(yield_until(|| started.load(Ordering::SeqCst)));
+            let mut peers = Vec::new();
+            for _ in 0..2 {
+                let done = stop.clone();
+                peers.push(spawn_test(source, "switch-peer", move || {
+                    let end = time::now_ns() + TEST_DEADLINE_NS;
+                    while !done.load(Ordering::SeqCst) && time::now_ns() < end {
+                        core::hint::spin_loop();
+                    }
+                })?);
+            }
+            let t = owner.thread.clone();
+            SWITCH_DELAY.arm(t.id, StallAt::MidSwitch);
+            t.set_affinity((1 << source) | (1 << target)).expect("migratable thread");
+            gate.store(true, Ordering::SeqCst);
+            let stalled = yield_until(|| SWITCH_DELAY.stalled());
+            // The owner is queued Ready but still runs on its unsaved stack.
+            let state = t.state();
+            let on_cpu = t.on_cpu.load(Ordering::Acquire);
+            let stolen = balance_pass(target);
+            t.set_affinity(1 << target).expect("migratable thread");
+            let before_release = t.cpu();
+            SWITCH_DELAY.release();
+            stop.store(true, Ordering::SeqCst);
+            join_bounded(owner)?;
+            for h in peers {
+                join_bounded(h)?;
+            }
+            if SWITCH_DELAY.timed_out() {
+                continue;
+            }
+            kassert!(stalled && on_cpu && !stolen);
+            kassert_eq!(state, State::Ready);
+            kassert_eq!(before_release, source);
+            kassert_eq!(ran.load(Ordering::SeqCst), target);
+            return Ok(());
+        }
+        Err("no complete switch stall in five attempts")
     }
 );
