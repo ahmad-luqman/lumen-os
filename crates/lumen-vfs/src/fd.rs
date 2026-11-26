@@ -322,6 +322,23 @@ impl<F> FdTable<F> {
         Self { slots: Vec::new(), reserved: BTreeMap::new() }
     }
 
+    /// Allocate all empty slots up front so later insert_at calls cannot allocate.
+    pub fn try_preallocated() -> Result<Self, VfsError> {
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(MAX_FDS).map_err(|_| VfsError::NoMem)?;
+        slots.resize_with(MAX_FDS, || None);
+        Ok(Self { slots, reserved: BTreeMap::new() })
+    }
+
+    /// Lowest open CLOEXEC descriptor at or above `from`, skipping empty slots.
+    pub fn next_cloexec(&self, from: usize) -> Option<i32> {
+        self.slots
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find_map(|(fd, entry)| entry.as_ref().filter(|e| e.cloexec).map(|_| fd as i32))
+    }
+
     /// Borrow descriptor `fd`, if open.
     pub fn get(&self, fd: i32) -> Option<&FdEntry<F>> {
         let idx = usize::try_from(fd).ok()?;
@@ -470,5 +487,28 @@ impl<F> FdTable<F> {
     /// Number of currently open descriptors.
     pub fn open_count(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
+    }
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+    #[test]
+    fn preallocated_table_keeps_capacity_through_insert_and_remove() {
+        let mut table = FdTable::try_preallocated().unwrap();
+        let storage = table.slots.as_ptr();
+        for fd in 0..MAX_FDS as i32 {
+            assert!(table.insert_at(fd, fd, fd % 2 == 0).unwrap().is_none());
+            assert_eq!(table.slots.as_ptr(), storage);
+        }
+        assert_eq!(table.next_cloexec(1), Some(2));
+        assert_eq!(table.next_cloexec(MAX_FDS), None);
+        assert_eq!(table.alloc(0, false), Err(VfsError::MFile));
+        for fd in 0..MAX_FDS as i32 {
+            let entry = table.remove(fd).unwrap();
+            assert_eq!((entry.file, entry.cloexec), (fd, fd % 2 == 0));
+        }
+        assert_eq!(table.slots.as_ptr(), storage);
+        assert_eq!(table.alloc(42, false), Ok(0));
     }
 }

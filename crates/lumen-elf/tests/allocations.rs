@@ -149,3 +149,34 @@ fn rewrite_borrows_strings_with_one_allocation() {
     // Empty argv plus optional argument needs all three reserved slots.
     assert_eq!(empty, [b"/bin/sh".as_slice(), b"-e", b"script"]);
 }
+
+#[test]
+fn header_planning_is_bounded_and_allocation_failure_is_recoverable() {
+    use lumen_elf::loader::{ElfHeader, ElfLoadError, LoadedElf};
+    isolated("header_planning_is_bounded_and_allocation_failure_is_recoverable", || {
+        let mut head = [0; 64];
+        head[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        head[16..18].copy_from_slice(&2u16.to_le_bytes());
+        head[18..20].copy_from_slice(&62u16.to_le_bytes());
+        head[20..24].copy_from_slice(&1u32.to_le_bytes());
+        head[24..32].copy_from_slice(&0x401000u64.to_le_bytes());
+        head[32..40].copy_from_slice(&64u64.to_le_bytes());
+        head[54..56].copy_from_slice(&56u16.to_le_bytes());
+        head[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let (header, count) = measured(true, || ElfHeader::parse(&head));
+        assert_eq!(count, 0);
+        let header = header.unwrap();
+        let mut phdr = [0; 56];
+        phdr[..4].copy_from_slice(&1u32.to_le_bytes());
+        phdr[4..8].copy_from_slice(&5u32.to_le_bytes());
+        phdr[16..24].copy_from_slice(&0x401000u64.to_le_bytes());
+        phdr[32..40].copy_from_slice(&(32u64 << 20).to_le_bytes());
+        phdr[40..48].copy_from_slice(&(32u64 << 20).to_le_bytes());
+        let (failed, count) = measured(true, || LoadedElf::parse_headers(&header, &phdr, 32 << 20));
+        assert_eq!(failed, Err(ElfLoadError::NoMemory));
+        assert_eq!(count, 1);
+        let (plan, count) = measured(false, || LoadedElf::parse_headers(&header, &phdr, 32 << 20));
+        assert_eq!(count, 2); // plan vectors only, independent of the 32 MiB payload
+        assert_eq!(plan.unwrap().segments()[0].filesz, 32 << 20);
+    });
+}

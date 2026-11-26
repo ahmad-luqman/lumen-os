@@ -12,6 +12,7 @@
 
 #[macro_use]
 mod common;
+mod exec;
 mod signals;
 
 use core::ffi::c_int;
@@ -25,6 +26,15 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     let (args, n) = unsafe { common::args(argc, argv) };
     match &args[..n] {
         [_, b"fork-wait"] => fork_wait(),
+        [_, b"fork-exec"] => exec::run(),
+        [_, b"exec-exit", ..] => exec::child_exit(),
+        [_, b"exec-hold"] => exec::child_hold(),
+        [_, b"exec-relative"] => exec::child_relative(),
+        [_, b"exec-reexec"] => exec::child_reexec(),
+        [_, b"exec-byte", ..] => exec::child_byte(),
+        [_, b"exec-unnamed"] => exec::child_unnamed(),
+        [_, b"exec-random"] => exec::child_random(),
+        [_, b"exec-check", ..] => exec::child_check(&args[..n]),
         [_, b"signal-spin"] => signals::spin(),
         [_, b"signals"] => signals::signals(),
         [_, b"faults"] => signals::faults(),
@@ -80,6 +90,12 @@ const SYS_EXIT_GROUP: u64 = 231;
 const SYS_WAITID: u64 = 247;
 const SIGCHLD: u64 = 17;
 const SIGUSR1: u64 = 10;
+const SIGUSR2: u64 = 12;
+const SIG_BLOCK: u64 = 0;
+const SS_DISABLE: u64 = 2;
+const AT_RANDOM: usize = 25;
+const SYS_RENAME: u64 = 82;
+const SYS_LSEEK: u64 = 8;
 const SIG_SETMASK: u64 = 2;
 const CLD_EXITED: i64 = 1;
 const SI_SIGNO: usize = 0;
@@ -613,3 +629,26 @@ fn clone_stack_tls() -> R {
     wait(pid, 0)?;
     eq("noncanonical RSP reached ring 3", i64::from(page.word(4).load(SeqCst)), 1)
 }
+
+const SYS_WRITE: u64 = 1;
+const SYS_BRK: u64 = 12;
+const SYS_EXECVE: u64 = 59;
+const SYS_UNLINK: u64 = 87;
+const SYS_READLINK: u64 = 89;
+const SYS_PAUSE: u64 = 34;
+const SIGKILL: u64 = 9;
+const F_DUPFD: u64 = 0;
+const F_DUPFD_CLOEXEC: u64 = 1030;
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_CREAT: u64 = 0x40;
+const O_TRUNC: u64 = 0x200;
+const PROT_READ: u64 = 1;
+const PROT_WRITE: u64 = 2;
+const MAP_PRIVATE: u64 = 2;
+const EACCES: i64 = 13;
+const ENOEXEC: i64 = 8;
+const E2BIG: i64 = 7;
+const ELOOP: i64 = 40;
+
+const O_RDONLY: u64 = 0;

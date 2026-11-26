@@ -150,7 +150,7 @@ pub trait VfsInode: Send + Sync {
         true
     }
 
-    /// Magic symlink target override (e.g. `/proc/<pid>/fd/*` and `/proc/<pid>/exe`).
+    /// Magic symlink target override (e.g. `/proc/<pid>/fd/*`).
     /// When `Some`, path traversal jumps directly to the returned inode while
     /// `readlink()` continues to return the link's path bytes.
     fn resolve_magic_link(&self) -> Option<Arc<dyn VfsInode>> {

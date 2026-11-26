@@ -8,7 +8,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Dynamic ELF64 PT_INTERP parser (optional single PT_INTERP, PATH_MAX/NUL/bounds/AT_PHDR validation, lifetime-free interp_path), ET_DYN interpreter validation (NestedInterp, min_vaddr load_bias), and dynamic AuxvInfo (AT_BASE) (#251)"
+name = "Dynamic ELF64 PT_INTERP parser (optional single PT_INTERP, PATH_MAX/NUL/bounds/AT_PHDR validation, lifetime-free interp_range), ET_DYN interpreter validation (NestedInterp, min_vaddr load_bias), and dynamic AuxvInfo (AT_BASE) (#251)"
 milestone = "M7"
 tests = [
     "cargo:lumen-elf",
@@ -16,7 +16,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Dynamic ELF64 loader (#255): `linux /path` loads a binary from the VFS (symlinks followed; EACCES for a file without an execute bit, ENOMEM when the heap cannot hold it) and records the path for `/proc/<pid>/exe`, and one with `PT_INTERP` maps its interpreter, read through the VFS (ENOENT when absent, EACCES when not a regular file with an execute bit, ELIBBAD when not an ET_DYN or nested), at INTERP_BASE with AT_BASE its load bias, AT_PHDR/AT_ENTRY and brk the main binary's (brk stopping below the stack's guard page), and the interpreter's entry as the first instruction, refusing images that overlap each other, a binary reaching the stack or its guard page, or an interpreter not below that guard page, with no frames taken; Alpine's dynamic `/bin/busybox echo` runs off the ext4 rootfs through `/lib/ld-musl-x86_64.so.1`, and a static binary by path, with zero leaked frames"
+name = "Dynamic ELF64 loader (#255): `linux /path` loads a binary from the VFS (symlinks followed; EACCES for a file without an execute bit, ENOMEM when the heap cannot hold the bounded program-header table) and records the path for `/proc/<pid>/exe`, and one with `PT_INTERP` maps its interpreter, read through the VFS (ENOENT when absent, EACCES when not a regular file with an execute bit, ELIBBAD when not an ET_DYN or nested), at INTERP_BASE with AT_BASE its load bias, AT_PHDR/AT_ENTRY and brk the main binary's (brk stopping below the stack's guard page), and the interpreter's entry as the first instruction, refusing images that overlap each other, a binary reaching the stack or its guard page, or an interpreter not below that guard page, with no frames taken; Alpine's dynamic `/bin/busybox echo` runs off the ext4 rootfs through `/lib/ld-musl-x86_64.so.1`, and a static binary by path, with zero leaked frames"
 milestone = "M7"
 tests = [
     "ktest:lumen_kernel::linux::exec::dynamic_elf_maps_interp_and_sets_auxv",
@@ -39,3 +39,21 @@ tests = [
 name = "#! scripts and execve argument limits (logic)"
 milestone = "M8"
 tests = ["cargo:lumen-elf"]
+
+[[feature]]
+name = "Streaming ELF headers and executable sources held open, no whole-file size cap, per-exec stack layout"
+milestone = "M8"
+tests = [
+    "cargo:lumen-elf",
+    "ktest:lumen_kernel::linux::exec::streaming_exec_keeps_sources_and_uses_sized_stack",
+]
+
+[[feature]]
+name = "Exec loading releases live heap storage and frames after teardown"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::exec::exec_load_releases_heap_and_frames"]
+
+[[feature]]
+name = "Shell loading and execve share AT_RANDOM fallback and warn once without a seeded RNG"
+milestone = "M8"
+tests = ["scenario:test_linux_proc::test_exec_uses_unseeded_random_fallback"]

@@ -46,6 +46,7 @@ pub use signal::{Delivery, HandlerDelivery, SignalState, send_process_checked, s
 use table::ProcTable;
 
 use alloc::collections::BTreeMap;
+#[cfg(feature = "ktest")]
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -247,10 +248,9 @@ pub struct Process {
     fs: SpinLock<Option<Arc<FsState>>>,
     /// Its signal dispositions, and each thread's mask.
     signal: SpinLock<SignalState>,
-    /// The executable's path for `/proc/<pid>/exe`: set by `linux /path`
-    /// (the path as typed) and by `vfstest dev-tmp-proc`'s checks (and the
-    /// ktests running them).
-    exe_path: SpinLock<Option<String>>,
+    /// The executable's canonical byte path for `/proc/<pid>/exe`, when known.
+    /// A snapshot: subsequent renames can leave it stale.
+    exe_path: SpinLock<Option<Arc<[u8]>>>,
     /// Its `RusageSlot`'s value in `PROCS`' tree.
     usage_slot: u64,
     /// M7's console state (until the console is a tty).
@@ -275,7 +275,7 @@ impl Process {
         signal: SignalState,
         console: ConsoleState,
         allow_test_syscalls: bool,
-        exe_path: Option<String>,
+        exe_path: Option<Arc<[u8]>>,
     ) -> Self {
         Self {
             pid: AtomicU32::new(0),
@@ -415,7 +415,7 @@ impl Process {
     }
 
     /// Release a vfork parent after detaching from the shared address space.
-    /// Exit calls this after detach; C2 exec will call it at its point of
+    /// Exit calls this after detach; exec calls it at its point of
     /// no return before installing its new mm.
     pub fn complete_vfork(&self) {
         let done = self.vfork_done.lock().take();
@@ -462,7 +462,6 @@ impl Process {
 /// Replace both references to the caller's mm with one writer. The
 /// caller must be this process's last thread and transfer one process
 /// user of the new space. Old mappings are retired in thread context.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2's exec
 pub fn replace_current_mm(space: Arc<AddressSpace>) {
     let process = current_process();
     assert!(!PROCS.lock().has_extra_threads(process.pid()), "exec needs one thread");
@@ -476,20 +475,80 @@ pub fn replace_current_mm(space: Arc<AddressSpace>) {
     old.drop_user();
 }
 
-/// Give this process its own descriptor table. An in-flight open
-/// completes or cancels before the copy, so its returned fd is present
-/// in the replacement. New reservations wait until replacement finishes.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2 exec / C3 unshare
-pub fn unshare_current_files() {
+/// Mark that the current process has performed an exec, even without an identity.
+pub fn mark_exec() {
+    let pid = current_process().pid();
+    PROCS.lock().exec(pid);
+}
+
+/// Publish the replacement image's raw identity, clearing any old path if unnamed.
+pub fn set_exe_path(path: Option<Arc<[u8]>>) {
+    let old = core::mem::replace(&mut *current_process().exe_path.lock(), path);
+    drop(old);
+}
+
+/// Close open CLOEXEC slots through release_fd; reset handled dispositions,
+/// alternate stack and fault/frame diagnostics, preserving masks and pending signals.
+pub fn finish_exec() {
+    let process = current_process();
+    let mut next = 0;
+    while let Some(fd) = process.with_files(|table| table.next_cloexec(next)).flatten() {
+        close_current_fd(fd).expect("exec owns its unshared descriptor table");
+        next = fd as usize + 1;
+    }
+    process.exec_signals(current_thread().tid());
+}
+
+/// Prepared before exec commits. A private table cannot acquire a new sharer
+/// while its single owning thread executes this syscall.
+pub enum PreparedFiles {
+    Private,
+    Copy(Arc<Files>),
+}
+
+/// Allocate all descriptor-copy storage before replacing the address space.
+pub fn prepare_exec_files() -> Result<PreparedFiles, u32> {
+    let process = current_process();
+    let files = process.files.lock().clone().expect("live files");
+    if files.users() > 1 {
+        Ok(PreparedFiles::Copy(Arc::new(Files::prepare_exec().map_err(|e| e.to_errno())?)))
+    } else {
+        Ok(PreparedFiles::Private)
+    }
+}
+
+/// Install a prepared private table without allocation. The exclusive lease
+/// waits for open reservations to finish, with no spinlock held.
+pub fn commit_unshare(prepared: PreparedFiles) {
     let process = current_process();
     let access = process.files_access.write();
     let old = process.files.lock().clone().expect("live process's files");
-    if old.users() > 1 {
-        let copy = Arc::new(old.fork_copy(process.pid()));
-        let replaced = process.files.lock().replace(copy).expect("live process's files");
-        drop(access);
-        replaced.leave(process.pid());
+    match prepared {
+        PreparedFiles::Private => assert_eq!(old.users(), 1, "single-threaded private files gained a sharer"),
+        PreparedFiles::Copy(copy) if old.users() > 1 => {
+            old.copy_exec_into(&copy, process.pid());
+            let replaced = process.files.lock().replace(copy).expect("live process's files");
+            drop(access);
+            replaced.leave(process.pid());
+        }
+        PreparedFiles::Copy(_) => {}
     }
+}
+
+/// Ktest helper: reserve the replacement before waiting for open reservations.
+#[cfg(feature = "ktest")]
+pub fn unshare_current_files() -> Result<(), u32> {
+    commit_unshare(prepare_exec_files()?);
+    Ok(())
+}
+
+#[cfg(feature = "ktest")]
+pub(crate) fn with_test_shared_files<R>(f: impl FnOnce() -> R) -> R {
+    let files = current_process().files.lock().clone().expect("live files");
+    let shared = files.share();
+    let result = f();
+    shared.leave(0);
+    result
 }
 
 impl Drop for Process {
@@ -511,7 +570,7 @@ struct NewProcess {
 }
 
 impl NewProcess {
-    fn empty(console: ConsoleState, allow_test_syscalls: bool, exe: Option<String>) -> Self {
+    fn empty(console: ConsoleState, allow_test_syscalls: bool, exe: Option<Arc<[u8]>>) -> Self {
         Self {
             process: Arc::new(Process::new(None, None, None, SignalState::new(), console, allow_test_syscalls, exe)),
             armed: true,
@@ -813,7 +872,7 @@ pub fn register_current(
     io: ConsoleIo,
     allow_test_syscalls: bool,
     stdin: Vec<u8>,
-    exe_path: Option<String>,
+    exe_path: Option<Arc<[u8]>>,
     stdio: Stdio,
 ) -> u32 {
     let process = Arc::new(Process::new(
@@ -871,18 +930,24 @@ pub(crate) fn fork_current(
     let space = new.process.address_space().expect("new process's space");
     let done = new.process.vfork_done.lock().clone();
     // ParkedChild is declared after NewProcess, so a refusal joins first.
-    let parked = ParkedChild::spawn("fork", space, Arc::clone(&child), fs_base, move || {
-        if flags & general::CLONE_CHILD_SETTID != 0 {
-            let tid = current_thread().tid();
-            // Linux ignores this put_user's failure.
-            let _ = crate::user::copy_to_user(child_tid, &tid.to_ne_bytes());
-        }
-        // SAFETY: the scheduler installed this child's identity and space;
-        // its copied frame is resumed with user selectors and no lock held.
-        unsafe { crate::arch::syscall::enter_fork(registers) };
-        let ended = take_current();
-        assert!(ended.exit.is_some(), "fork child exited without recording UserExit");
-    })
+    let parked = ParkedChild::spawn(
+        sched::with_current(|t| t.name()).expect("forking thread"),
+        space,
+        Arc::clone(&child),
+        fs_base,
+        move || {
+            if flags & general::CLONE_CHILD_SETTID != 0 {
+                let tid = current_thread().tid();
+                // Linux ignores this put_user's failure.
+                let _ = crate::user::copy_to_user(child_tid, &tid.to_ne_bytes());
+            }
+            // SAFETY: the scheduler installed this child's identity and space;
+            // its copied frame is resumed with user selectors and no lock held.
+            unsafe { crate::arch::syscall::enter_fork(registers) };
+            let ended = take_current();
+            assert!(ended.exit.is_some(), "fork child exited without recording UserExit");
+        },
+    )
     .map_err(|error| match error {
         sched::SpawnError::Stack(crate::mm::stack::StackError::OutOfMemory) => errno::ENOMEM,
         _ => errno::EAGAIN,
@@ -1412,7 +1477,7 @@ pub fn process_thread_id(pid: u32) -> Option<u64> {
 }
 
 /// Snapshot the executable path recorded for `pid`, if any.
-pub fn process_exe_path(pid: u32) -> Option<String> {
+pub fn process_exe_path(pid: u32) -> Option<Arc<[u8]>> {
     active(pid)?.exe_path.lock().clone()
 }
 
@@ -1422,7 +1487,7 @@ pub fn set_current_exe_path(path: &str) {
     let Some(thread) = try_current_thread() else {
         return;
     };
-    let path = String::from(path);
+    let path = Arc::from(path.as_bytes());
     let old = thread.process().exe_path.lock().replace(path);
     drop(old);
 }
@@ -1447,8 +1512,8 @@ pub fn process_fd_target(pid: u32, fd: i32) -> Option<FdTarget> {
     let mut path = file.path.to_vec();
     drop(file);
     let unlinked = inode.is_detached() || inode.stat().ok().is_some_and(|m| m.nlink == 0);
-    if unlinked && !path.ends_with(b" (deleted)") {
-        path.extend_from_slice(b" (deleted)");
+    if unlinked && !path.ends_with(lumen_vfs::DELETED_SUFFIX) {
+        path.extend_from_slice(lumen_vfs::DELETED_SUFFIX);
     }
     Some((Some(inode), path))
 }
@@ -2860,6 +2925,8 @@ crate::ktest!(
             // pending-signal recheck must cancel and join its start gate.
             let kernel = sched::current().ok_or("current thread")?;
             kernel.set_sigpending();
+            let name = kernel.name();
+            let named_before = sched::threads().iter().filter(|t| t.name == name).count();
             let result = fork_current(
                 clone_flags(general::SIGCHLD | general::CLONE_VM, 0).expect("valid process flags"),
                 0,
@@ -2872,7 +2939,7 @@ crate::ktest!(
             kassert_eq!(result, Err(lumen_signal::restart::RestartCode::NoIntr as u32));
             kassert_eq!(mm.users(), 1);
             kassert_eq!(file.fd_ref_count(), before);
-            kassert!(!sched::threads().iter().any(|t| t.name == "fork"));
+            kassert_eq!(sched::threads().iter().filter(|t| t.name == name).count(), named_before);
             Ok(())
         })?
     }
@@ -2916,7 +2983,7 @@ crate::ktest!(
             let shared = original.share();
             let reservation = reserve_current_fd(0).map_err(|_| "reserve")?;
             let fd = reservation.fd();
-            let swapper = spawn_test_thread(|_| unshare_current_files())?;
+            let swapper = spawn_test_thread(|_| unshare_current_files().expect("unshare"))?;
             let blocked = swapper.settle();
             let opened = open_kernel_file(b"/dev/null", OpenFlags::O_RDONLY, 0).map_err(|_| "open")?;
             let installed = reservation.install(opened, true);
@@ -2935,7 +3002,7 @@ crate::ktest!(
             // A cancelled reservation releases the exclusive waiter too.
             let shared = new.share();
             let cancelled = reserve_current_fd(0).map_err(|_| "reserve cancelled")?;
-            let swapper = spawn_test_thread(|_| unshare_current_files())?;
+            let swapper = spawn_test_thread(|_| unshare_current_files().expect("unshare"))?;
             let blocked = swapper.settle();
             drop(cancelled);
             swapper.join()?;

@@ -390,12 +390,92 @@ pub fn resolve_path(
     resolve_path_with_depth(env, start_dir, path, flags, &mut symlink_depth)
 }
 
+/// Resolve an executable's inode and absolute identity. Ordinary links and
+/// dot components are followed; the final name is joined to its physical parent.
+/// A magic file link's textual identity is followed with the same symlink budget,
+/// and must still name the inode it returned (otherwise ENOENT). A detached
+/// file retains its absolute, deleted description if that name no longer exists.
+/// Directory identities use the same mount-aware reconstruction as getcwd.
+/// Naming failures never discard an inode that resolved successfully.
+#[derive(Debug)]
+pub struct NamedPath {
+    pub resolved: ResolvedPath,
+    pub identity: Result<Vec<u8>, VfsError>,
+}
+
+/// Resolve the inode first, with best-effort canonical naming kept separate.
+pub fn resolve_named_path(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    flags: ResolveFlags,
+) -> Result<NamedPath, VfsError> {
+    let mut depth = 0;
+    let mut location = None;
+    let first = resolve_path_inner(env, start_dir, path, flags, &mut depth, Some(&mut location))?;
+    let identity = (|| {
+        loop {
+            match location.take() {
+                Some(PathIdentity::Named(path)) => return path,
+                Some(PathIdentity::Magic { parent, path }) => {
+                    let path = path?;
+                    let next =
+                        match resolve_path_inner(env, Some(&parent), &path, flags, &mut depth, Some(&mut location)) {
+                            Ok(next) => next,
+                            Err(VfsError::NoEnt)
+                                if first.inode.is_detached()
+                                    && path.starts_with(b"/")
+                                    && path.ends_with(crate::DELETED_SUFFIX) =>
+                            {
+                                let parent = resolve_parent_with_depth(env, Some(&parent), &path, &mut depth)?;
+                                if parent.parent.dev_id() != first.inode.dev_id() {
+                                    return Err(VfsError::NoEnt);
+                                }
+                                let name = match parent.final_component() {
+                                    Final::Name(name) => name,
+                                    _ => return Err(VfsError::NoEnt),
+                                };
+                                let path = named_child_path(env, &parent.parent, name)?;
+                                return Ok(path);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                    if next.inode.dev_id() != first.inode.dev_id() || next.inode.ino() != first.inode.ino() {
+                        return Err(VfsError::NoEnt);
+                    }
+                }
+                None => {
+                    let path = compute_cwd_path(env, &first.inode)?;
+                    return Ok(path);
+                }
+            }
+        }
+    })();
+    Ok(NamedPath { resolved: first, identity })
+}
+
+enum PathIdentity {
+    Named(Result<Vec<u8>, VfsError>),
+    Magic { parent: Arc<dyn VfsInode>, path: Result<Vec<u8>, VfsError> },
+}
+
 pub(crate) fn resolve_path_with_depth(
     env: &dyn VfsCacheOps,
     start_dir: Option<&Arc<dyn VfsInode>>,
     path: &[u8],
     flags: ResolveFlags,
     symlink_depth: &mut usize,
+) -> Result<ResolvedPath, VfsError> {
+    resolve_path_inner(env, start_dir, path, flags, symlink_depth, None)
+}
+
+fn resolve_path_inner(
+    env: &dyn VfsCacheOps,
+    start_dir: Option<&Arc<dyn VfsInode>>,
+    path: &[u8],
+    flags: ResolveFlags,
+    symlink_depth: &mut usize,
+    mut identity: Option<&mut Option<PathIdentity>>,
 ) -> Result<ResolvedPath, VfsError> {
     if path.len() >= PATH_MAX {
         return Err(VfsError::NameTooLong);
@@ -485,6 +565,12 @@ pub(crate) fn resolve_path_with_depth(
             }
 
             if let Some(magic_target) = resolve_and_unify_magic_target(env, &child) {
+                if is_last
+                    && magic_target.inode_type() != InodeType::Dir
+                    && let Some(identity) = identity.as_deref_mut()
+                {
+                    *identity = Some(PathIdentity::Magic { parent: Arc::clone(&cur), path: child.readlink() });
+                }
                 cur = cross_mounts_down(env, magic_target);
                 cursor = tail_start;
                 continue;
@@ -515,6 +601,12 @@ pub(crate) fn resolve_path_with_depth(
             continue;
         }
 
+        if is_last
+            && child.inode_type() != InodeType::Dir
+            && let Some(identity) = identity.as_deref_mut()
+        {
+            *identity = Some(PathIdentity::Named(named_child_path(env, &cur, comp)));
+        }
         cur = cross_mounts_down(env, child);
         if trailing_after_comp && is_last && cur.inode_type() != InodeType::Dir {
             return Err(VfsError::NotDir);
@@ -527,6 +619,20 @@ pub(crate) fn resolve_path_with_depth(
     }
 
     Ok(ResolvedPath { inode: cur, has_trailing_slash })
+}
+
+fn named_child_path(env: &dyn VfsCacheOps, parent: &Arc<dyn VfsInode>, name: &[u8]) -> Result<Vec<u8>, VfsError> {
+    let mut path = compute_cwd_path(env, parent)?;
+    let separator = usize::from(!path.ends_with(b"/"));
+    if path.len() + separator + name.len() >= PATH_MAX {
+        return Err(VfsError::NameTooLong);
+    }
+    path.try_reserve_exact(separator + name.len()).map_err(|_| VfsError::NoMem)?;
+    if separator != 0 {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    Ok(path)
 }
 
 /// Resolve the parent directory and final component for namespace-mutating

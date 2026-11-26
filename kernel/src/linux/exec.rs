@@ -1,24 +1,26 @@
-//! Loading a Linux binary for `linux` (and, later, `execve`): the binary and
-//! the interpreter its `PT_INTERP` names are read and parsed once, before
-//! anything is mapped, then loaded into a fresh [`AddressSpace`]
+//! Loading a Linux binary for `linux` and `execve`: bounded headers are
+//! validated before segment bytes stream into a fresh [`AddressSpace`].
+//! Sources stay open throughout planning and loading
 //! (ARCHITECTURE section 8, "Dynamic linking").
 
 use alloc::borrow::Cow;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::fmt::Write;
 
-use lumen_elf::loader::{ElfLoadError, LoadedElf};
+use lumen_elf::loader::{EHDR_SIZE, ElfHeader, ElfLoadError, LoadedElf, validate_interp};
 use lumen_vfs::VfsError;
 use lumen_vm::{INTERP_BASE, PIE_BASE};
 
 use crate::linux::errno;
-use crate::mm::user_vm::{AddressSpace, ElfImage, ImageFile, LoadedProgram, UserVmError};
+use crate::mm::user_vm::{AddressSpace, ElfImage, ImageFile, ImageSource, LoadedProgram, UserVmError};
 use crate::vfs;
 
 /// Why a binary could not be loaded. The read and interpreter errors name
-/// the file they are about; `Load` is about the binary, which the caller
-/// names. Its `Debug` shows a path that isn't UTF-8 `Escaped`.
+/// the file they are about; `Load` can concern either image. Byte paths
+/// that are not UTF-8 are shown escaped.
 #[derive(Clone, PartialEq, Eq)]
 pub enum ExecError {
     /// The binary could not be read (`ENOENT`, `EACCES` when it is not a
@@ -26,25 +28,19 @@ pub enum ExecError {
     Read { path: String, err: VfsError },
     /// The interpreter its `PT_INTERP` names could not be read.
     InterpRead { path: String, err: VfsError },
-    /// The interpreter's path is not UTF-8: exec paths stay text (the VFS
-    /// takes any bytes since #268, ARCHITECTURE section 9), so it is refused
-    /// as `ENOENT`; `path` is its bytes, shown `Escaped`.
-    InterpPathNotUtf8 { path: Vec<u8> },
     /// The interpreter is not a loadable `ET_DYN` without its own
     /// `PT_INTERP` (`ELIBBAD`).
     InterpBad { path: String, err: ElfLoadError },
-    /// The binary could not be loaded.
+    /// The binary or its interpreter could not be loaded.
     Load(UserVmError),
 }
 
 impl ExecError {
     /// The Linux `errno` an `execve(2)` failing this way returns (the
-    /// syscall arrives with #254; the ktests use it now).
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+    /// syscall and the shell share this loader).
     pub const fn to_errno(&self) -> u32 {
         match self {
             ExecError::Read { err, .. } | ExecError::InterpRead { err, .. } => err.to_errno(),
-            ExecError::InterpPathNotUtf8 { .. } => errno::ENOENT,
             ExecError::InterpBad { .. } => errno::ELIBBAD,
             ExecError::Load(e) => e.to_errno(),
         }
@@ -57,9 +53,6 @@ impl fmt::Debug for ExecError {
             ExecError::Read { path, err } => f.debug_struct("Read").field("path", path).field("err", err).finish(),
             ExecError::InterpRead { path, err } => {
                 f.debug_struct("InterpRead").field("path", path).field("err", err).finish()
-            }
-            ExecError::InterpPathNotUtf8 { path } => {
-                f.debug_struct("InterpPathNotUtf8").field("path", &lumen_vfs::Escaped(path)).finish()
             }
             ExecError::InterpBad { path, err } => {
                 f.debug_struct("InterpBad").field("path", path).field("err", err).finish()
@@ -74,9 +67,6 @@ impl fmt::Display for ExecError {
         match self {
             ExecError::Read { path, err } => write!(f, "cannot read '{path}': {err}"),
             ExecError::InterpRead { path, err } => write!(f, "cannot read its interpreter '{path}': {err}"),
-            ExecError::InterpPathNotUtf8 { path } => {
-                write!(f, "cannot read its interpreter '{}' (not UTF-8): {}", lumen_vfs::Escaped(path), VfsError::NoEnt)
-            }
             ExecError::InterpBad { path, err } => {
                 write!(f, "bad interpreter '{path}': {err}: ELIBBAD ({})", errno::ELIBBAD)
             }
@@ -85,114 +75,270 @@ impl fmt::Display for ExecError {
     }
 }
 
-/// An executable file read for loading: its bytes, and the file as its
-/// `/proc/<pid>/maps` lines name it.
-type ExecFile = (Vec<u8>, ImageFile);
-
-/// Read the executable at `path` (`vfs::read_executable`) as an [`ExecFile`].
-fn read_file(path: &str) -> Result<ExecFile, VfsError> {
-    vfs::read_executable(path).map(|(bytes, inode)| (bytes, ImageFile::of(&*inode, path)))
+/// An open executable source and its maps identity.
+pub struct ExecFile {
+    pub source: ImageSource<'static>,
+    pub image: Option<ImageFile>,
 }
 
-/// One ELF file: its bytes and its plan, parsed once, and the file it was
-/// read from (none for a boot module), which names its maps lines and
-/// gives its path.
+fn read_file(path: &[u8]) -> Result<ExecFile, VfsError> {
+    open_path(None, path)
+}
+
+/// Display UTF-8 paths unchanged and escape other byte paths without losing bytes.
+pub fn display_path(path: &[u8]) -> Result<String, VfsError> {
+    let mut text = String::new();
+    text.try_reserve_exact(path.len().checked_mul(4).ok_or(VfsError::NoMem)?).map_err(|_| VfsError::NoMem)?;
+    if let Ok(path) = core::str::from_utf8(path) {
+        text.push_str(path);
+    } else {
+        write!(text, "{}", lumen_vfs::Escaped(path)).expect("reserved escaped path");
+    }
+    Ok(text)
+}
+
+/// Resolve bytes from cwd, storing the reached file's identity for procfs and maps.
+pub fn open_path(cwd: Option<&Arc<dyn lumen_vfs::VfsInode>>, path: &[u8]) -> Result<ExecFile, VfsError> {
+    let named = lumen_vfs::resolve_named_path(
+        vfs::tables(),
+        cwd,
+        path,
+        lumen_vfs::ResolveFlags { follow_final: true, empty_path: false, require_dir: false },
+    )?;
+    let identity = match named.identity {
+        Ok(path) => Some(Arc::from(path)),
+        Err(VfsError::NoMem) => return Err(VfsError::NoMem),
+        Err(error) => {
+            log::debug!(target: "exec", "{}: no executable identity: {error}", lumen_vfs::Escaped(path));
+            None
+        }
+    };
+    open_inode(named.resolved.inode, identity)
+}
+
+/// Hold an executable inode open through loading. Non-regular files or files
+/// with no execute bit return EACCES; this does not deny concurrent writes.
+pub fn open_inode(
+    inode: alloc::sync::Arc<dyn lumen_vfs::VfsInode>,
+    path: Option<Arc<[u8]>>,
+) -> Result<ExecFile, VfsError> {
+    let guard = lumen_vfs::OpenGuard::try_new(inode)?;
+    let inode = guard.inode();
+    if inode.inode_type() != lumen_vfs::InodeType::File || inode.stat()?.mode & 0o111 == 0 {
+        return Err(VfsError::Acces);
+    }
+    let image = path.map(|path| ImageFile::of(inode.as_ref(), path));
+    Ok(ExecFile { source: ImageSource::File(guard), image })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Main,
+    Interpreter,
+}
+
 struct Image {
-    bytes: Cow<'static, [u8]>,
+    source: ImageSource<'static>,
     plan: LoadedElf,
     file: Option<ImageFile>,
 }
 
 impl Image {
     fn elf(&self) -> ElfImage<'_> {
-        ElfImage { plan: &self.plan, bytes: &self.bytes, file: self.file.as_ref() }
+        ElfImage { plan: &self.plan, source: &self.source, file: self.file.as_ref() }
     }
 
-    fn path(&self) -> Option<&str> {
+    fn path(&self) -> Option<&[u8]> {
         self.file.as_ref().map(|f| &*f.path)
     }
 
-    /// The interpreter at `raw` (the `PT_INTERP` path), read with `read`
-    /// and planned at `INTERP_BASE`.
-    fn read_interp(raw: &[u8], read: impl FnOnce(&str) -> Result<ExecFile, VfsError>) -> Result<Self, ExecError> {
-        let Ok(path) = core::str::from_utf8(raw) else {
-            return Err(ExecError::InterpPathNotUtf8 { path: raw.to_vec() });
+    fn parse(source: ImageSource<'static>, file: Option<ImageFile>, role: Role) -> Result<Self, ExecError> {
+        let path = file.as_ref().map_or(b"".as_slice(), |file| &*file.path);
+        let read_error = |err| {
+            if role == Role::Interpreter {
+                ExecError::InterpRead { path: String::from_utf8_lossy(path).into_owned(), err }
+            } else {
+                ExecError::Read { path: String::from_utf8_lossy(path).into_owned(), err }
+            }
         };
-        let (bytes, file) = match read(path) {
-            Ok(read) => read,
-            Err(err) => return Err(ExecError::InterpRead { path: String::from(path), err }),
+        let bad = |err| {
+            if role == Role::Interpreter && err != ElfLoadError::NoMemory {
+                ExecError::InterpBad { path: String::from_utf8_lossy(path).into_owned(), err }
+            } else {
+                ExecError::Load(UserVmError::from(err))
+            }
         };
-        match LoadedElf::parse_interp(&bytes, INTERP_BASE) {
-            Ok(plan) => Ok(Self { bytes: Cow::Owned(bytes), plan, file: Some(file) }),
-            Err(err) => Err(ExecError::InterpBad { path: String::from(path), err }),
+        let size = source.len().map_err(read_error)?;
+        if size < EHDR_SIZE as u64 {
+            return Err(bad(ElfLoadError::Truncated));
         }
+        let mut head = [0; EHDR_SIZE];
+        source.read_exact(0, &mut head).map_err(read_error)?;
+        let header = ElfHeader::parse(&head).map_err(bad)?;
+        let range = header.phdr_range();
+        if range.end > size {
+            return Err(bad(ElfLoadError::Truncated));
+        }
+        let mut phdrs = Vec::new();
+        phdrs.try_reserve_exact((range.end - range.start) as usize).map_err(|_| read_error(VfsError::NoMem))?;
+        phdrs.resize((range.end - range.start) as usize, 0);
+        source.read_exact(range.start, &mut phdrs).map_err(read_error)?;
+        let plan = if role == Role::Interpreter {
+            LoadedElf::parse_interp_headers(&header, &phdrs, size, INTERP_BASE)
+        } else {
+            LoadedElf::parse_headers_with_pie_base(&header, &phdrs, size, PIE_BASE)
+        }
+        .map_err(bad)?;
+        Ok(Self { source, plan, file })
     }
 }
 
-/// A binary ready to load: its file (parsed once), and its interpreter's
-/// file, read and planned. Every file is read when this is made, so
-/// `linux` counts frames after the page cache has taken its share.
+/// A main image and its optional interpreter, with sources held open and validated headers.
 pub struct Exec {
     main: Image,
     interp: Option<Image>,
 }
 
 impl Exec {
-    /// The executable at absolute `path` in the VFS (symlinks followed), its
-    /// interpreter read through the VFS too; `exe_path` is `path` as given.
+    /// Open the executable at absolute `path`, retaining its inode through loading.
     pub fn from_path(path: &str) -> Result<Self, ExecError> {
-        let (bytes, file) = read_file(path).map_err(|err| ExecError::Read { path: String::from(path), err })?;
-        Self::new(Cow::Owned(bytes), Some(file), read_file)
+        let file = read_file(path.as_bytes()).map_err(|err| ExecError::Read { path: String::from(path), err })?;
+        Self::from_source(file.source, file.image, read_file)
     }
 
-    /// A binary already in memory (a boot module), its interpreter, if it
-    /// names one, read through the VFS; no `exe_path`.
+    /// Plan a boot module or an in-memory test executable.
     pub fn from_image(bytes: Cow<'static, [u8]>) -> Result<Self, ExecError> {
-        Self::new(bytes, None, read_file)
+        Self::from_source(ImageSource::Bytes(bytes), None, read_file)
     }
 
-    /// Parse `bytes` (`ET_DYN` at `PIE_BASE`), read from `file` if from a
-    /// file, and read and plan the interpreter it names with `read_interp`.
-    fn new(
-        bytes: Cow<'static, [u8]>,
+    /// Plan the main image and open its PT_INTERP using the caller's path resolver.
+    pub fn from_source(
+        source: ImageSource<'static>,
         file: Option<ImageFile>,
-        read_interp: impl FnOnce(&str) -> Result<ExecFile, VfsError>,
+        read_interp: impl FnOnce(&[u8]) -> Result<ExecFile, VfsError>,
     ) -> Result<Self, ExecError> {
-        let plan =
-            LoadedElf::parse_with_pie_base(&bytes, PIE_BASE).map_err(|e| ExecError::Load(UserVmError::Elf(e)))?;
-        let interp = plan.interp_path(&bytes).map(|raw| Image::read_interp(raw, read_interp)).transpose()?;
-        Ok(Self { main: Image { bytes, plan, file }, interp })
+        let main = Image::parse(source, file, Role::Main)?;
+        let interp = if let Some(range) = main.plan.interp_range() {
+            let mut bytes = [0u8; lumen_elf::loader::PATH_MAX];
+            let bytes = &mut bytes[..(range.end - range.start) as usize];
+            main.source.read_exact(range.start, bytes).map_err(|err| ExecError::Read {
+                path: String::from_utf8_lossy(main.path().unwrap_or(b"")).into_owned(),
+                err,
+            })?;
+            let raw = validate_interp(bytes).map_err(|e| ExecError::Load(UserVmError::from(e)))?;
+            let file = read_interp(raw)
+                .map_err(|err| ExecError::InterpRead { path: String::from_utf8_lossy(raw).into_owned(), err })?;
+            Some(Image::parse(file.source, file.image, Role::Interpreter)?)
+        } else {
+            None
+        };
+        Ok(Self { main, interp })
     }
 
-    /// The path the binary was read from, as given, for `/proc/<pid>/exe`.
-    pub fn exe_path(&self) -> Option<&str> {
-        self.main.path()
+    /// The loaded main image's path, for /proc/pid/exe.
+    pub fn exe_path(&self) -> Option<Arc<[u8]>> {
+        self.main.file.as_ref().map(|file| Arc::clone(&file.path))
     }
 
-    /// The interpreter's path, for a dynamically linked binary.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
-    pub fn interp_path(&self) -> Option<&str> {
+    pub fn interp_path(&self) -> Option<&[u8]> {
         self.interp.as_ref().and_then(Image::path)
     }
 
-    /// The main image and its interpreter's, as [`AddressSpace::from_images`]
-    /// takes them.
     fn images(&self) -> (ElfImage<'_>, Option<ElfImage<'_>>) {
         (self.main.elf(), self.interp.as_ref().map(Image::elf))
     }
 
-    /// Load the binary and its interpreter into a brand-new address space
-    /// ([`AddressSpace::from_images`]), each image read from a file named
-    /// after that file in `/proc/<pid>/maps`.
+    /// Load both images with a fresh AT_RANDOM and the default stack limit.
     pub fn load(
+        &self,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        execfn: &[u8],
+    ) -> Result<(AddressSpace, LoadedProgram), ExecError> {
+        self.load_with_stack(argv, envp, execfn, lumen_vm::StackSize::DEFAULT)
+    }
+
+    /// Load both images with a fresh AT_RANDOM and this exec's stack size.
+    pub fn load_with_stack(
+        &self,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        execfn: &[u8],
+        stack: lumen_vm::StackSize,
+    ) -> Result<(AddressSpace, LoadedProgram), ExecError> {
+        self.load_inner(argv, envp, execfn, at_random_bytes(), stack)
+    }
+
+    fn load_inner(
+        &self,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        execfn: &[u8],
+        random: [u8; 16],
+        stack: lumen_vm::StackSize,
+    ) -> Result<(AddressSpace, LoadedProgram), ExecError> {
+        let (main, interp) = self.images();
+        AddressSpace::from_images_with_stack(main, interp, argv, envp, execfn, random, stack).map_err(ExecError::Load)
+    }
+
+    /// Deterministic AT_RANDOM for stack/auxv assertions only.
+    #[cfg(feature = "ktest")]
+    fn load_seeded(
         &self,
         argv: &[&[u8]],
         envp: &[&[u8]],
         execfn: &[u8],
         random: [u8; 16],
     ) -> Result<(AddressSpace, LoadedProgram), ExecError> {
-        let (main, interp) = self.images();
-        AddressSpace::from_images(main, interp, argv, envp, execfn, random).map_err(ExecError::Load)
+        self.load_inner(argv, envp, execfn, random, lumen_vm::StackSize::DEFAULT)
+    }
+}
+
+/// AT_RANDOM is always available, with one warning if boot entropy was unavailable.
+fn at_random_bytes() -> [u8; 16] {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let mut out = [0; 16];
+    if crate::rng::fill(&mut out).is_err() {
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!(target: "exec", "AT_RANDOM: no seeded RNG; using TSC/time fallback");
+        }
+        let a = crate::time::now_ns() ^ crate::arch::rdtsc().rotate_left(13);
+        let b = crate::arch::rdtsc().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ a.rotate_right(29);
+        out[..8].copy_from_slice(&a.to_le_bytes());
+        out[8..].copy_from_slice(&b.to_le_bytes());
+    }
+    out
+}
+
+/// A temporary executable removed through the namespace API even on test failure.
+#[cfg(feature = "ktest")]
+pub(crate) struct ExecFixture {
+    pub inode: alloc::sync::Arc<dyn lumen_vfs::VfsInode>,
+    path: &'static str,
+}
+#[cfg(feature = "ktest")]
+impl ExecFixture {
+    pub fn symlink(path: &'static str, target: &[u8]) -> Result<Self, &'static str> {
+        let (parent, name) = path.rsplit_once('/').ok_or("fixture path")?;
+        let dir = vfs::resolve_path_from_root(parent).map_err(|_| "fixture parent")?;
+        let inode = dir.symlink(name.as_bytes(), target).map_err(|_| "symlink fixture")?;
+        Ok(Self { inode, path })
+    }
+    pub fn new(path: &'static str, bytes: &[u8]) -> Result<Self, &'static str> {
+        let (parent, name) = path.rsplit_once('/').ok_or("fixture path")?;
+        let dir = vfs::resolve_path_from_root(parent).map_err(|_| "fixture parent")?;
+        let inode = dir.create(name.as_bytes(), 0o755).map_err(|_| "create fixture")?;
+        let fixture = Self { inode, path };
+        fixture.inode.write_at(0, bytes).map_err(|_| "write fixture")?;
+        Ok(fixture)
+    }
+}
+#[cfg(feature = "ktest")]
+impl Drop for ExecFixture {
+    fn drop(&mut self) {
+        let _ = lumen_vfs::unlink_at(vfs::tables(), None, self.path.as_bytes(), false);
     }
 }
 
@@ -277,8 +423,10 @@ fn read_test_auxv(rsp: u64) -> Result<Vec<(u64, u64)>, &'static str> {
 #[cfg(feature = "ktest")]
 fn test_exec(main: Vec<u8>, interp: Result<Vec<u8>, VfsError>) -> Result<Exec, ExecError> {
     let file =
-        |path: &str| ImageFile { dev: lumen_vfs::DevId::makedev(0, 0), ino: 0, path: alloc::sync::Arc::from(path) };
-    Exec::new(Cow::Owned(main), None, |path| interp.map(|bytes| (bytes, file(path))))
+        |path: &[u8]| ImageFile { dev: lumen_vfs::DevId::makedev(0, 0), ino: 0, path: alloc::sync::Arc::from(path) };
+    Exec::from_source(ImageSource::Bytes(Cow::Owned(main)), None, |path| {
+        interp.map(|bytes| ExecFile { source: ImageSource::Bytes(Cow::Owned(bytes)), image: Some(file(path)) })
+    })
 }
 
 crate::ktest!(
@@ -320,14 +468,15 @@ crate::ktest!(
             Err(ExecError::InterpRead { path: String::from("/tmp/ld-lumen-ktest.so"), err: VfsError::Acces })
         );
         let exec = exec.map_err(|_| "Exec::from_path failed")?;
-        kassert_eq!(exec.exe_path(), Some("/tmp/lumen-ktest-main"));
-        kassert_eq!(exec.interp_path(), Some("/tmp/ld-lumen-ktest.so"));
+        kassert_eq!(exec.exe_path().as_deref(), Some(b"/tmp/lumen-ktest-main".as_slice()));
+        kassert_eq!(exec.interp_path(), Some(b"/tmp/ld-lumen-ktest.so".as_slice()));
 
         let _warm: Vec<u8> = alloc::vec![0u8; 64 * 1024];
         drop(_warm);
         let free_before = frame::free_frames();
         {
-            let (space, prog) = exec.load(&[b"/t"], &[b"K=V"], b"/t", [7; 16]).map_err(|_| "dynamic load failed")?;
+            let (space, prog) =
+                exec.load_seeded(&[b"/t"], &[b"K=V"], b"/t", [7; 16]).map_err(|_| "dynamic load failed")?;
             kassert_eq!(prog.entry, INTERP_BASE + 0x1020);
             kassert_eq!(prog.initial_brk, PIE_BASE + 0x2000);
             // The interpreter's pages keep their own rights (W^X), and each
@@ -375,7 +524,7 @@ crate::ktest!(
                 .map_err(|_| "static Exec failed")?;
             kassert_eq!(elf.interp_path(), None);
             kassert_eq!(elf.exe_path(), None);
-            let (space, prog) = elf.load(&[b"/s"], &[], b"/s", [7; 16]).map_err(|_| "static load failed")?;
+            let (space, prog) = elf.load_seeded(&[b"/s"], &[], b"/s", [7; 16]).map_err(|_| "static load failed")?;
             kassert_eq!(prog.entry, 0x40_1000);
             kassert_eq!(prog.initial_brk, 0x40_4000);
             let space = Arc::new(space);
@@ -412,12 +561,12 @@ crate::ktest!(
         // Load an ET_EXEC main image spanning `vbase..vbase + 0x2000`.
         let main_at = |vbase: u64| -> Result<AddressSpace, ExecError> {
             let exec = test_exec(test_dynamic_main(ET_EXEC, vbase, LD), interp())?;
-            exec.load(&[b"/t"], &[], b"/t", [0; 16]).map(|(space, _)| space)
+            exec.load_seeded(&[b"/t"], &[], b"/t", [0; 16]).map(|(space, _)| space)
         };
         let load_main_at = |vbase: u64| main_at(vbase).map(|space| space.teardown());
         let load_interp = |img: Vec<u8>| -> Result<(), ExecError> {
             let exec = test_exec(test_dynamic_main(ET_DYN, 0, LD), Ok(img))?;
-            exec.load(&[b"/t"], &[], b"/t", [0; 16]).map(|(space, _)| space.teardown())
+            exec.load_seeded(&[b"/t"], &[], b"/t", [0; 16]).map(|(space, _)| space.teardown())
         };
         let layout = |c: LayoutClash| -> Result<(), ExecError> { Err(ExecError::Load(UserVmError::Layout(c))) };
 
@@ -497,16 +646,24 @@ crate::ktest!(
         kassert_eq!(shown, Err(String::from("cannot read its interpreter '/no/such/ld-lumen.so': ENOENT (2)")));
         let dir = Exec::from_image(Cow::Owned(test_dynamic_main(ET_DYN, 0, b"/"))).map(|_| ());
         kassert_eq!(dir, Err(ExecError::InterpRead { path: String::from("/"), err: VfsError::Acces }));
-        // A path that is not UTF-8 is refused (exec paths stay text), and says
-        // so with its bytes escaped: two such paths never show the same.
-        let odd = test_exec(test_dynamic_main(ET_DYN, 0, b"/lib/\xffld.so"), Ok(Vec::new())).map(|_| ());
-        kassert_eq!(odd, Err(ExecError::InterpPathNotUtf8 { path: b"/lib/\xffld.so".to_vec() }));
+        // The resolver receives byte paths, including a non-UTF-8 PT_INTERP.
+        let odd = test_exec(test_dynamic_main(ET_DYN, 0, b"/lib/\xffld.so"), Err(VfsError::NoEnt)).map(|_| ());
         kassert_eq!(odd.as_ref().map_err(ExecError::to_errno), Err(errno::ENOENT));
-        let debug = odd.as_ref().map_err(|e| alloc::format!("{e:?}"));
-        kassert_eq!(debug, Err(String::from("InterpPathNotUtf8 { path: \"/lib/\\xffld.so\" }")));
+        let odd =
+            test_exec(test_dynamic_main(ET_DYN, 0, b"/lib/\xffld.so"), Ok(test_interp(ET_DYN, 0, 0x1000, 0x1000, &[])))
+                .map_err(|_| "non-UTF-8 interpreter")?;
+        kassert_eq!(odd.interp_path(), Some(b"/lib/\xffld.so".as_slice()));
+        // Keep the interpreter spelling even when escaping would need a refused allocation.
+        let image = test_dynamic_main(ET_DYN, 0, b"/no/such/ld-lumen.so");
+        let refused = Exec::from_source(ImageSource::Bytes(Cow::Owned(image)), None, |raw| {
+            crate::mm::heap::refuse_from(raw.len() * 2);
+            Err(VfsError::NoMem)
+        })
+        .map(|_| ());
+        crate::mm::heap::refuse_from(usize::MAX);
         kassert_eq!(
-            odd.map_err(|e| alloc::format!("{e}")),
-            Err(String::from("cannot read its interpreter '/lib/\\xffld.so' (not UTF-8): ENOENT (2)"))
+            refused,
+            Err(ExecError::InterpRead { path: String::from("/no/such/ld-lumen.so"), err: VfsError::NoMem })
         );
         // The binary itself missing, by path.
         let gone = Exec::from_path("/no/such/binary").map(|_| ());
@@ -524,31 +681,102 @@ crate::ktest!(
         use crate::kassert_eq;
         use crate::mm::heap;
 
-        // A 64 KiB executable, read while the heap refuses 32 KiB or more:
-        // ENOMEM, not a heap panic, and readable again once it gives.
-        const NAME: &str = "lumen-ktest-big";
-        let tmp = vfs::resolve_path_from_root("/tmp").map_err(|_| "no /tmp")?;
-        let file = tmp.create(NAME.as_bytes(), 0o755).map_err(|_| "create")?;
-        let written = file.write_at(0, &[0x5a; 64 * 1024]);
-        drop(file);
-        // And one past the 16 MiB cap is EFBIG from its size, before any
-        // buffer is asked for.
-        const HUGE: &str = "lumen-ktest-huge";
-        let huge = tmp.create(HUGE.as_bytes(), 0o755).map_err(|_| "create huge")?;
-        let grown = huge.truncate((16 << 20) + 1);
-        drop(huge);
+        use lumen_elf::loader::{ET_EXEC, PF_R, PF_X, PT_LOAD};
+        let tmp = vfs::resolve_path_from_root("/tmp").map_err(|_| "tmp")?;
+        let file = tmp.create(b"lumen-ktest-big", 0o755).map_err(|_| "create")?;
+        let mut image = crate::user::build_elf_with_phdrs(
+            ET_EXEC,
+            0x401000,
+            &[(PT_LOAD, PF_R | PF_X, 0, 0x401000, 64, 4096)],
+            64 + 65536,
+            &[],
+        );
+        image[54..56].copy_from_slice(&64u16.to_le_bytes());
+        image[56..58].copy_from_slice(&1024u16.to_le_bytes());
+        file.write_at(0, &image).map_err(|_| "write")?;
         heap::refuse_from(32 * 1024);
         let refused = Exec::from_path("/tmp/lumen-ktest-big").map(|_| ());
-        let too_big = vfs::read_executable("/tmp/lumen-ktest-huge").map(|(b, _)| b.len());
         heap::refuse_from(usize::MAX);
-        let read = vfs::read_executable("/tmp/lumen-ktest-big").map(|(b, _)| b.len());
-        let unlinked = (tmp.unlink(NAME.as_bytes()), tmp.unlink(HUGE.as_bytes()));
-        kassert_eq!(written, Ok(64 * 1024));
-        kassert_eq!(grown, Ok(()));
-        kassert_eq!(too_big, Err(VfsError::FBig));
-        kassert_eq!(refused, Err(ExecError::Read { path: String::from("/tmp/lumen-ktest-big"), err: VfsError::NoMem }));
-        kassert_eq!(read, Ok(64 * 1024));
-        kassert_eq!(unlinked, (Ok(()), Ok(())));
+        let read = Exec::from_path("/tmp/lumen-ktest-big").map(|_| ());
+        lumen_vfs::unlink_at(vfs::tables(), None, b"/tmp/lumen-ktest-big", false).map_err(|_| "unlink")?;
+        kassert_eq!(refused.as_ref().map_err(ExecError::to_errno), Err(errno::ENOMEM));
+        crate::kassert!(matches!(refused, Err(ExecError::Read { err: VfsError::NoMem, .. })));
+        kassert_eq!(read, Ok(()));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn streaming_exec_keeps_sources_and_uses_sized_stack() {
+        use crate::{kassert, kassert_eq};
+        use lumen_elf::loader::{ET_EXEC, PF_R, PF_X, PT_LOAD};
+        use lumen_vm::{PAGE_SIZE, USER_STACK_TOP};
+        let tmp = vfs::resolve_path_from_root("/tmp").map_err(|_| "tmp")?;
+        let file = tmp.create(b"streaming-exec", 0o755).map_err(|_| "create")?;
+        const OFFSET: u64 = 20 << 20;
+        let header = crate::user::build_elf_with_phdrs(
+            ET_EXEC,
+            0x401000,
+            &[(PT_LOAD, PF_R | PF_X, OFFSET, 0x401000, 8, 0x2000)],
+            256,
+            &[],
+        );
+        file.write_at(0, &header).map_err(|_| "header")?;
+        file.write_at(OFFSET, b"streamed").map_err(|_| "payload")?;
+        crate::mm::heap::refuse_from(32 * 1024);
+        let planned = Exec::from_path("/tmp/streaming-exec");
+        crate::mm::heap::refuse_from(usize::MAX);
+        let exec = planned.map_err(|_| "whole file allocation or header parse")?;
+        lumen_vfs::unlink_at(vfs::tables(), None, b"/tmp/streaming-exec", false).map_err(|_| "unlink")?;
+        kassert_eq!(file.open_count(), 1);
+        for (size, size_rounded) in [(0, 131072), (131073, 135168), (67108864, 67108864), (u64::MAX, 268435456)] {
+            let (space, _) = exec
+                .load_inner(&[b"stream"], &[], b"stream", [0; 16], lumen_vm::StackSize::from_rlimit(size))
+                .map_err(|_| "stream load")?;
+            let bottom = USER_STACK_TOP - size_rounded;
+            kassert!(space.contains_vma(bottom));
+            kassert!(!space.contains_vma(bottom - PAGE_SIZE));
+            let maps = space.format_maps_text();
+            kassert!(maps.contains(&alloc::format!("{bottom:08x}-")) && maps.contains("[stack]"));
+            let space = alloc::sync::Arc::new(space);
+            {
+                let _active = crate::sched::UserSpaceGuard::enter(space.clone());
+                let mut bytes = [0; 8];
+                kassert_eq!(crate::user::copy_from_user(&mut bytes, 0x401000), Ok(()));
+                kassert_eq!(&bytes, b"streamed");
+                kassert_eq!(crate::user::copy_from_user(&mut bytes, 0x402000), Ok(()));
+                kassert_eq!(bytes, [0; 8]);
+            }
+            let child = space.fork_copy().map_err(|_| "fork sized stack")?;
+            kassert_eq!(child.format_maps(), space.format_maps());
+            child.teardown();
+            space.teardown();
+        }
+        file.truncate(OFFSET + 7).map_err(|_| "shrink")?;
+        let free = crate::mm::frame::free_frames();
+        let shortened = exec.load_seeded(&[b"stream"], &[], b"stream", [0; 16]);
+        kassert!(matches!(shortened, Err(ExecError::Load(UserVmError::ImageRead(VfsError::Io)))));
+        kassert_eq!(crate::mm::frame::free_frames(), free);
+        drop(exec);
+        kassert_eq!(file.open_count(), 0);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn exec_load_releases_heap_and_frames() {
+        use crate::kassert_eq;
+        let exec = Exec::from_image(Cow::Owned(crate::mm::user_vm::build_relro_test_elf())).map_err(|_| "plan")?;
+        let (warm, _) = exec.load(&[b"warm"], &[], b"warm").map_err(|_| "warm load")?;
+        warm.teardown();
+        drop(warm);
+        let used = crate::mm::heap::stats().used;
+        let frames = crate::mm::frame::free_frames();
+        let (space, _) = exec.load(&[b"warm"], &[], b"warm").map_err(|_| "load")?;
+        space.teardown();
+        drop(space);
+        kassert_eq!(crate::mm::heap::stats().used, used);
+        kassert_eq!(crate::mm::frame::free_frames(), frames);
         Ok(())
     }
 );

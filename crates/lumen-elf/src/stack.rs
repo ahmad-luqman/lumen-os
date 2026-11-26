@@ -726,7 +726,11 @@ mod tests {
         build_phdr(&mut main_img, 2, PT_LOAD, PF_R | PF_X, 0x1000, 0x1000, 0x100, 0x100);
 
         let main = LoadedElf::parse_with_pie_base(&main_img, PIE_BASE).unwrap();
-        assert_eq!(main.interp_path(&main_img), Some(b"/lib/ld-musl-x86_64.so.1".as_slice()));
+        assert_eq!(
+            main.interp_range()
+                .map(|r| crate::loader::validate_interp(&main_img[r.start as usize..r.end as usize]).unwrap()),
+            Some(b"/lib/ld-musl-x86_64.so.1".as_slice())
+        );
 
         // ET_DYN interpreter with min_vaddr = 0x2000 -> load_bias = INTERP_BASE - 0x2000.
         let mut interp_img = vec![0u8; 0x2000];

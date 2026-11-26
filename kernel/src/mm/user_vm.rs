@@ -8,6 +8,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
+#[cfg(feature = "ktest")]
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -33,9 +34,9 @@ use crate::vfs::page_cache::{self, CachePage, WritableMap};
 use crate::vfs::{MappedPage, mmap_page};
 
 // The initial user stack's size and bottom live in `lumen_vm`, next to
-// `USER_STACK_TOP`: `[USER_STACK_BOTTOM, USER_STACK_TOP)` is the range that
-// the maps listing labels `[stack]`.
-use lumen_vm::{USER_STACK_BOTTOM, USER_STACK_SIZE};
+// `USER_STACK_TOP`. USER_STACK_BOTTOM is only the default: maps labels
+// each address space's [stack_bottom, USER_STACK_TOP) as `[stack]`.
+use lumen_vm::USER_STACK_BOTTOM;
 
 const _: () = {
     assert!(FRAME_SIZE == PAGE_SIZE);
@@ -54,14 +55,51 @@ pub struct LoadedProgram {
     pub initial_brk: u64,
 }
 
-/// One ELF image to map: its validated plan, the file bytes its segments
-/// copy from, and the file they were read from (none for a boot module),
-/// which names the image's `/proc/<pid>/maps` lines.
+/// One ELF image to map: its header plan, the source to stream, and
+/// its optional file identity, which names the image's `/proc/<pid>/maps` lines.
+/// PT_INTERP contents must separately pass `validate_interp` before loading
+/// an interpreter.
 #[derive(Clone, Copy)]
 pub struct ElfImage<'a> {
     pub plan: &'a LoadedElf,
-    pub bytes: &'a [u8],
+    pub source: &'a ImageSource<'a>,
     pub file: Option<&'a ImageFile>,
+}
+
+/// An executable file held open, or bytes supplied by a boot module/test image.
+pub enum ImageSource<'a> {
+    File(OpenGuard),
+    Bytes(alloc::borrow::Cow<'a, [u8]>),
+}
+
+impl ImageSource<'_> {
+    /// The current source length; files may shrink after this snapshot.
+    pub fn len(&self) -> Result<u64, VfsError> {
+        match self {
+            Self::File(file) => Ok(file.inode().stat()?.size),
+            Self::Bytes(bytes) => Ok(bytes.len() as u64),
+        }
+    }
+
+    /// Read the entire requested range, returning EIO on a short read.
+    pub fn read_exact(&self, offset: u64, bytes: &mut [u8]) -> Result<(), VfsError> {
+        match self {
+            Self::File(file) => {
+                if file.inode().read_at(offset, bytes)? != bytes.len() {
+                    return Err(VfsError::Io);
+                }
+            }
+            Self::Bytes(source) => copy_image_bytes(source, offset, bytes)?,
+        }
+        Ok(())
+    }
+}
+
+fn copy_image_bytes(source: &[u8], offset: u64, bytes: &mut [u8]) -> Result<(), VfsError> {
+    let end = offset.checked_add(bytes.len() as u64).ok_or(VfsError::Io)?;
+    let from = source.get(offset as usize..end as usize).ok_or(VfsError::Io)?;
+    bytes.copy_from_slice(from);
+    Ok(())
 }
 
 /// Which parts of a program's layout collide ([`UserVmError::Layout`]).
@@ -119,6 +157,13 @@ pub enum UserVmError {
     /// `mmap` of a file with no pages to map: anything but a regular `ext4`
     /// or `tmpfs` file.
     NoDev,
+    ImageRead(VfsError),
+}
+
+impl From<ElfLoadError> for UserVmError {
+    fn from(error: ElfLoadError) -> Self {
+        if error == ElfLoadError::NoMemory { Self::OutOfMemory } else { Self::Elf(error) }
+    }
 }
 
 impl UserVmError {
@@ -132,6 +177,7 @@ impl UserVmError {
             UserVmError::Elf(_) => errno::ENOEXEC,
             UserVmError::Stack(_) => errno::E2BIG,
             UserVmError::NoDev => errno::ENODEV,
+            UserVmError::ImageRead(e) => e.to_errno(),
         }
     }
 
@@ -162,6 +208,7 @@ impl fmt::Display for UserVmError {
             UserVmError::Vm(e) => write!(f, "VM error: {e}"),
             UserVmError::InvalidArg => f.write_str("invalid argument"),
             UserVmError::NoDev => f.write_str("the file can't be mapped"),
+            UserVmError::ImageRead(e) => write!(f, "executable read: {e}"),
         }
     }
 }
@@ -282,6 +329,7 @@ pub fn prot_from_linux(raw: u64) -> Option<Prot> {
 }
 
 struct AddressSpaceInner {
+    stack_bottom: u64,
     vmas: VmaMap,
     brk: Brk,
     torn_down: bool,
@@ -514,20 +562,20 @@ struct ForkSeams<R, S, P> {
 /// inode number and path when it was loaded. A snapshot, holding no
 /// reference: unlike a file mapping's, an image's lines don't show
 /// ` (deleted)` once the file is unlinked, and keep the inode number it
-/// had (Linux maps the segments from the file, so it shows both); and the
-/// path is the one the binary was run by (`linux /path`, or `PT_INTERP`'s),
-/// a symlink in it not resolved.
+/// had (Linux maps the segments from the file, so it shows both). The raw
+/// canonical path is escaped only when maps text is formatted; later renames
+/// can leave this snapshot stale.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageFile {
     pub dev: DevId,
     pub ino: Ino,
-    pub path: Arc<str>,
+    pub path: Arc<[u8]>,
 }
 
 impl ImageFile {
     /// `inode`, read from `path`, as its maps lines name it.
-    pub fn of(inode: &dyn VfsInode, path: &str) -> Self {
-        Self { dev: inode.dev_id(), ino: inode.ino(), path: Arc::from(path) }
+    pub fn of(inode: &dyn VfsInode, path: Arc<[u8]>) -> Self {
+        Self { dev: inode.dev_id(), ino: inode.ino(), path }
     }
 }
 
@@ -576,7 +624,7 @@ fn name_image_locked(images: &mut Vec<ImageRange<Arc<ImageFile>>>, plan: &Loaded
             None if filesz > 0 => log::debug!(
                 target: "mm",
                 "maps: {}'s segment at {vaddr:#x} (file offset {offset:#x}, {filesz:#x} bytes) left unnamed",
-                file.path
+                lumen_vfs::Escaped(&file.path)
             ),
             None => {}
         }
@@ -621,6 +669,7 @@ impl AddressSpace {
             active: AtomicU64::new(0),
             root,
             inner: SleepMutex::new(AddressSpaceInner {
+                stack_bottom: USER_STACK_BOTTOM,
                 vmas: VmaMap::new(),
                 brk,
                 torn_down: false,
@@ -732,17 +781,25 @@ impl AddressSpace {
         execfn: &[u8],
         random: [u8; 16],
     ) -> Result<(Self, LoadedProgram), UserVmError> {
-        let plan = LoadedElf::parse(image).map_err(UserVmError::Elf)?;
-        Self::from_images(ElfImage { plan: &plan, bytes: image, file: None }, None, argv, envp, execfn, random)
+        let plan = LoadedElf::parse(image).map_err(UserVmError::from)?;
+        Self::from_images(
+            ElfImage { plan: &plan, source: &ImageSource::Bytes(alloc::borrow::Cow::Borrowed(image)), file: None },
+            None,
+            argv,
+            envp,
+            execfn,
+            random,
+        )
     }
 
     /// Load a main image and, when it names one, its interpreter into a
     /// brand-new [`AddressSpace`] (ARCHITECTURE section 8, "Dynamic linking").
     ///
-    /// `main` is planned by `LoadedElf::parse` or `parse_with_pie_base`
+    /// `main` is planned by `LoadedElf::parse`, `parse_headers` or `parse_headers_with_pie_base`
     /// (`ET_DYN` at `PIE_BASE`, `ET_EXEC` where it says); `interp` by
-    /// `LoadedElf::parse_interp` at `INTERP_BASE`, given exactly when `main`
-    /// has `PT_INTERP` (`InvalidArg` otherwise). With an interpreter,
+    /// `LoadedElf::parse_interp_headers` at `INTERP_BASE`, given exactly when `main`
+    /// has `PT_INTERP` (`InvalidArg` otherwise), after `validate_interp`
+    /// accepts the separately read path. With an interpreter,
     /// `AT_BASE` is its load bias, `AT_PHDR`/`AT_ENTRY` stay the main image's,
     /// and the process starts at the interpreter's entry; `brk` is always the
     /// main image's. The images and the user stack with its guard page are
@@ -757,8 +814,21 @@ impl AddressSpace {
         execfn: &[u8],
         random: [u8; 16],
     ) -> Result<(Self, LoadedProgram), UserVmError> {
+        Self::from_images_with_stack(main, interp, argv, envp, execfn, random, lumen_vm::StackSize::DEFAULT)
+    }
+
+    /// Load with StackSize's page-rounded 128 KiB..=256 MiB reservation.
+    pub fn from_images_with_stack(
+        main: ElfImage<'_>,
+        interp: Option<ElfImage<'_>>,
+        argv: &[&[u8]],
+        envp: &[&[u8]],
+        execfn: &[u8],
+        random: [u8; 16],
+        stack_size: lumen_vm::StackSize,
+    ) -> Result<(Self, LoadedProgram), UserVmError> {
         // Validate the initial stack before allocating any page-table root.
-        let stack = StackPages::build(main, interp, argv, envp, execfn, random)?;
+        let stack = StackPages::build(main, interp, argv, envp, execfn, random, stack_size)?;
         let space = Self::new()?;
         let prog = space.commit_loaded_elf(main, interp, &stack)?;
         Ok((space, prog))
@@ -818,6 +888,7 @@ impl AddressSpace {
         let mut copied = child.inner.lock();
         copied.vmas = parent.vmas.clone();
         copied.brk = parent.brk;
+        copied.stack_bottom = parent.stack_bottom;
         copied.images = parent.images.clone();
         (seams.before_register)();
         // Register the child before reading sizes, while both Lock 1s exclude
@@ -959,9 +1030,10 @@ impl AddressSpace {
         execfn: &[u8],
         random: [u8; 16],
     ) -> Result<LoadedProgram, UserVmError> {
-        let plan = LoadedElf::parse(image).map_err(UserVmError::Elf)?;
-        let main = ElfImage { plan: &plan, bytes: image, file: None };
-        let stack = StackPages::build(main, None, argv, envp, execfn, random)?;
+        let plan = LoadedElf::parse(image).map_err(UserVmError::from)?;
+        let main =
+            ElfImage { plan: &plan, source: &ImageSource::Bytes(alloc::borrow::Cow::Borrowed(image)), file: None };
+        let stack = StackPages::build(main, None, argv, envp, execfn, random, lumen_vm::StackSize::DEFAULT)?;
         self.commit_loaded_elf(main, None, &stack)
     }
 
@@ -986,14 +1058,14 @@ impl AddressSpace {
 
         let main_ranges = main.plan.mapped_ranges();
         let interp_ranges = interp.map(|i| i.plan.mapped_ranges()).unwrap_or_default();
-        check_layout(&main_ranges, &interp_ranges)?;
+        check_layout(&main_ranges, &interp_ranges, stack.bottom)?;
         let mapped_ranges: alloc::vec::Vec<MappedRange> = main_ranges.into_iter().chain(interp_ranges).collect();
 
         let mut new_vmas = VmaMap::new();
         for range in &mapped_ranges {
             new_vmas.map_fixed_noreplace(range.start, range.end - range.start, perm_to_prot(range.perm))?;
         }
-        new_vmas.map_fixed_noreplace(USER_STACK_BOTTOM, USER_STACK_SIZE, Prot::READ | Prot::WRITE)?;
+        new_vmas.map_fixed_noreplace(stack.bottom, USER_STACK_TOP - stack.bottom, Prot::READ | Prot::WRITE)?;
 
         let initial_brk = main.plan.initial_brk;
         // `brk` grows up to the mmap area, or, for an image above it, up to
@@ -1001,8 +1073,8 @@ impl AddressSpace {
         // VMAs, and the guard page is none), or to the top of user space.
         let brk_limit = if initial_brk <= MMAP_TOP {
             MMAP_TOP
-        } else if initial_brk < USER_STACK_BOTTOM {
-            USER_STACK_BOTTOM - PAGE_SIZE
+        } else if initial_brk < stack.bottom {
+            stack.bottom - PAGE_SIZE
         } else {
             USER_MAX
         };
@@ -1039,6 +1111,7 @@ impl AddressSpace {
 
         inner.vmas = new_vmas;
         inner.brk = new_brk;
+        inner.stack_bottom = stack.bottom;
         for image in core::iter::once(main).chain(interp) {
             if let Some(file) = image.file {
                 name_image_locked(&mut inner.images, image.plan, file);
@@ -1049,7 +1122,7 @@ impl AddressSpace {
     }
 
     /// Map one validated ELF image's pages (`plan.plan_pages()`), copying its
-    /// file bytes from `image.bytes`. The caller holds `inner` and has checked
+    /// file bytes from `image.source`. The caller holds `inner` and has checked
     /// the image's ranges are free; on error it unmaps what was mapped.
     fn map_elf_image_locked(&self, image: ElfImage<'_>) -> Result<(), UserVmError> {
         for action in image.plan.plan_pages() {
@@ -1070,8 +1143,15 @@ impl AddressSpace {
                     tlb::shoot_down(self, Shoot::Pages(va.as_u64()..va.as_u64() + PAGE_SIZE));
                 }
                 PageAction::CopyBytes { vaddr, file_offset, len } => {
-                    let bytes = image.bytes.get(file_offset..file_offset + len).ok_or(UserVmError::InvalidArg)?;
-                    self.write_mapped_bytes_locked(vaddr, bytes)?;
+                    let mut buffer = [0u8; PAGE_SIZE as usize];
+                    for off in (0..len).step_by(buffer.len()) {
+                        let count = (len - off).min(buffer.len());
+                        image
+                            .source
+                            .read_exact((file_offset + off) as u64, &mut buffer[..count])
+                            .map_err(UserVmError::ImageRead)?;
+                        self.write_mapped_bytes_locked(vaddr + off as u64, &buffer[..count])?;
+                    }
                 }
             }
         }
@@ -1777,11 +1857,11 @@ impl AddressSpace {
         let layout = MapsLayout {
             brk_initial: inner.brk.initial(),
             brk_mapped_end: inner.brk.mapped_end(),
-            stack_bottom: USER_STACK_BOTTOM,
+            stack_bottom: inner.stack_bottom,
             stack_top: USER_STACK_TOP,
         };
         fn image_file(f: &Arc<ImageFile>) -> FileInfo<'_> {
-            FileInfo { major: f.dev.major(), minor: f.dev.minor(), ino: f.ino, path: f.path.as_bytes(), deleted: false }
+            FileInfo { major: f.dev.major(), minor: f.dev.minor(), ino: f.ino, path: &f.path, deleted: false }
         }
         let files = |id: u64| {
             let Some(m) = inner.mapped_files.get(&id) else {
@@ -2253,6 +2333,7 @@ impl Drop for AddressSpace {
 /// The initial stack's top pages (`argv`, `envp`, `execfn`, `AT_RANDOM`'s
 /// bytes and `auxv`), built before any page table or frame is allocated.
 struct StackPages {
+    bottom: u64,
     buf: alloc::vec::Vec<u8>,
     initial: InitialStack,
 }
@@ -2268,6 +2349,7 @@ impl StackPages {
         envp: &[&[u8]],
         execfn: &[u8],
         random: [u8; 16],
+        stack_size: lumen_vm::StackSize,
     ) -> Result<Self, UserVmError> {
         let auxv = match (main.plan.has_interp(), interp) {
             (false, None) => AuxvInfo::from_loaded(main.plan),
@@ -2280,17 +2362,19 @@ impl StackPages {
             Err(e) => return Err(UserVmError::Stack(e)),
             Ok(info) => info.bytes_written,
         };
-        if (required as u64) > USER_STACK_SIZE {
+        if (required as u64) > stack_size.bytes() {
             return Err(UserVmError::Stack(StackBuildError::BufferTooSmall {
                 required,
-                available: USER_STACK_SIZE as usize,
+                available: stack_size.bytes() as usize,
             }));
         }
         let buf_len = lumen_vm::align_up_page((required as u64).max(1)).ok_or(UserVmError::InvalidArg)? as usize;
-        let mut buf = vec![0u8; buf_len];
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(buf_len).map_err(|_| UserVmError::OutOfMemory)?;
+        buf.resize(buf_len, 0);
         let initial = build_initial_stack(&mut buf, USER_STACK_TOP, argv, envp, execfn, random, &auxv)
             .map_err(UserVmError::Stack)?;
-        Ok(Self { buf, initial })
+        Ok(Self { buf, initial, bottom: stack_size.bottom() })
     }
 }
 
@@ -2298,8 +2382,8 @@ impl StackPages {
 /// page, the interpreter is not wholly below the guard page (ARCHITECTURE
 /// section 8), or the two overlap (each is already disjoint within itself),
 /// before anything is mapped.
-fn check_layout(main: &[MappedRange], interp: &[MappedRange]) -> Result<(), UserVmError> {
-    let stack_guard_bottom = USER_STACK_BOTTOM - PAGE_SIZE;
+fn check_layout(main: &[MappedRange], interp: &[MappedRange], stack_bottom: u64) -> Result<(), UserVmError> {
+    let stack_guard_bottom = stack_bottom - PAGE_SIZE;
     if main.iter().any(|a| a.end > stack_guard_bottom && a.start < USER_STACK_TOP) {
         return Err(UserVmError::Layout(LayoutClash::MainOnStack));
     }
@@ -3655,8 +3739,12 @@ crate::ktest!(
         let f = ktest_files::file(&vol.root, "fork.bin", &ktest_files::pattern(3 * PAGE_SIZE as usize, 37))?;
         let elf = build_relro_test_elf();
         let plan = LoadedElf::parse(&elf).map_err(|_| "ELF plan")?;
-        let image_file = ImageFile::of(&*f, "/fork-image");
-        let image = ElfImage { plan: &plan, bytes: &elf, file: Some(&image_file) };
+        let image_file = ImageFile::of(&*f, Arc::from(b"/fork-image".as_slice()));
+        let image = ElfImage {
+            plan: &plan,
+            source: &ImageSource::Bytes(alloc::borrow::Cow::Borrowed(&elf)),
+            file: Some(&image_file),
+        };
         let (space, _) =
             AddressSpace::from_images(image, None, &[b"fork"], &[], b"fork", [0; 16]).map_err(|_| "load")?;
         let parent = Arc::new(space);

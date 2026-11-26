@@ -389,12 +389,12 @@ fn checked() -> Result<FreeList, &'static str> {
 
 /// Blocks a test allocated to use up every free block (see [`fill`]).
 #[cfg(feature = "ktest")]
-type Filler = alloc::vec::Vec<(*mut u8, Layout)>;
+pub(crate) type Filler = alloc::vec::Vec<(*mut u8, Layout)>;
 
 /// Allocate every free block whole, so the next allocation must grow the
 /// heap, whatever earlier tests left. Free them with [`unfill`].
 #[cfg(feature = "ktest")]
-fn fill() -> Result<Filler, &'static str> {
+pub(crate) fn fill() -> Result<Filler, &'static str> {
     let mut filler = Filler::with_capacity(2 * checked()?.blocks + 16);
     loop {
         let largest = checked()?.largest;
@@ -415,7 +415,7 @@ fn fill() -> Result<Filler, &'static str> {
 }
 
 #[cfg(feature = "ktest")]
-fn unfill(filler: Filler) {
+pub(crate) fn unfill(filler: Filler) {
     for (p, layout) in filler {
         // SAFETY: allocated by `fill` with this layout.
         unsafe { alloc::alloc::dealloc(p, layout) };

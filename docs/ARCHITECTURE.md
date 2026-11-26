@@ -762,11 +762,14 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
     the user stack's guard page).
   - Anonymous (M6) and file-backed (M7) `mmap` regions allocate top-down below
     `MMAP_TOP = 0x0000_7f00_0000_0000`.
-  - Initial user stack top: `USER_STACK_TOP = 0x0000_7fff_f000_0000`, with an
-    8 MiB demand-paged VMA (`USER_STACK_BOTTOM = 0x0000_7fff_ef80_0000`) and an
-    unmapped guard page below it. (From M8 the size follows `RLIMIT_STACK`
-    at each `execve`, 8 MiB by default, and the bottom becomes a parameter:
-    section 8's `execve`, designed in #336.)
+  - Initial user stack top: `USER_STACK_TOP = 0x0000_7fff_f000_0000`, with a
+    demand-paged VMA and an unmapped guard page below it. Each address space
+    retains its own `stack_bottom`, also used for `[stack]` in maps and fork.
+    `lumen_vm::StackSize::from_rlimit` clamps the reservation to 128 KiB..=256 MiB,
+    rounds up to a page, and exposes `bytes()`, `bottom()` and Linux's
+    `arg_limit()` (the argument budget uses the original, unrounded rlimit).
+    The default remains 8 MiB (`USER_STACK_BOTTOM = 0x0000_7fff_ef80_0000`);
+    stored RLIMIT_STACK writes arrive in C12.
 - **VMA interval tree (`crates/lumen-vm`, host-tested):** tracks non-overlapping
   page-aligned virtual ranges (`start..end`), protection flags (`R`, `W`, `X`,
   or `PROT_NONE`), and backing:
@@ -2051,9 +2054,11 @@ from `mm::stack` (a guard page below it, hard rule 4; registered as a
 `thread` stack), its saved `rsp`, and a state: ready, running, sleeping,
 blocked or dead. (`main` and the APs' idle threads run on stacks they don't
 own.) Its name (#276) is a `lumen_trace::ThreadName`, 16 bytes inline like
-Linux's `comm`, fixed when it is made and read without a lock (the crash
-report's `thread:` line): at most 15 bytes, a longer name cut to the
-longest prefix ending on a character, then each control character (C0, DEL,
+Linux's `comm`, protected by one leaf `SpinLock`. Spawn initializes it,
+fork inherits the parent's `name()`, and only the owner changes it on exec.
+The crash report's `thread:` line uses `try_lock`, falling back to `?` if
+busy, without blocking or allocating. The name is at most 15 bytes, a
+longer name cut to the longest prefix ending on a character, then each control character (C0, DEL,
 C1) and U+2028/U+2029 replaced by one `?`. The spawn functions take any
 `Into<ThreadName>` (a `&str`). The cut is for names from outside the source
 (`linux /path`, section 9): every name written as a literal at a call
@@ -4593,17 +4598,18 @@ nor that list.
   control). Interactive `lineedit`, pipes, and external subprocesses require
   `fork`/`pipe`/`dup2`/`wait4`/PTYs and arrive in M8.
 - **Dynamic linking (`PT_INTERP` → `/lib/ld-musl-x86_64.so.1`; designed in #246, built in #255 (the loader copies segment bytes; the file-backed part is ld-musl's `mmap(fd)` of libraries); `dlopen` of `libm7.so` checked by `test_linux_user::test_dynamic_musl_binary_and_dlopen`, M7):**
-  - **`crates/lumen-elf` parser extension:** `LoadedElf::parse_with_pie_base(image, pie_base)`
+  - **`crates/lumen-elf` parser extension:** `LoadedElf::parse_headers_with_pie_base(ehdr, phdrs, file_size, pie_base)`
     accepts an optional `PT_INTERP` header (at most one; rejects duplicate
     `PT_INTERP`, `p_filesz <= 1` (empty or NUL-only), `p_filesz > PATH_MAX`,
-    out-of-bounds slice, missing trailing NUL, or interior NUL before the final
-    byte), stores its `(offset, len)` inside `LoadedElf` (keeping `LoadedElf`
-    lifetime-free), and exposes `interp_path<'a>(&self, image: &'a [u8]) -> Option<&'a [u8]>`.
+    out-of-file ranges), stores its `(offset, len)` inside lifetime-free
+    `LoadedElf`, and exposes `interp_range()`. Separately read path bytes
+    must pass `validate_interp` (trailing NUL, no interior NUL).
     Main dynamic executables may be `ET_DYN` (PIE, mapped at `PIE_BASE =
     0x0000_5555_5555_4000`, which Alpine ships by default) or `ET_EXEC`
     (`load_bias = 0`), and dynamic ELFs must have a mapped `AT_PHDR`
     (`phdr_vaddr.is_some()`, required by `ld-musl` to locate `PT_DYNAMIC`).
-  - **Interpreter loading:** when `interp_path` is `Some(path)` (e.g.
+  - **Interpreter loading:** when the separately read `interp_range` bytes
+    pass `validate_interp` (e.g.
     `"/lib/ld-musl-x86_64.so.1"`), the kernel resolves and reads the interpreter
     file from VFS (returning `-ENOENT` if absent, `-EACCES` if it is not a
     regular file with an execute bit, `-ELIBBAD` if invalid) and
@@ -4621,8 +4627,9 @@ nor that list.
     `AddressSpace::from_elf` continues to reject `PT_INTERP` (returning
     `ElfLoadError::DynamicInterpreterUnsupported`) so M6's `usertest bad_elf` /
     `test_bad_elf_rejected` passes unchanged, while `linux::exec::Exec` (#255)
-    reads the binary and its interpreter from the VFS, parses each once, and
-    loads both with `AddressSpace::from_images(main, interp)`; M7 adds tests
+    holds both sources open, parses bounded headers, and streams 4 KiB
+    chunks into private frames through `AddressSpace::from_images_with_stack`;
+    M7 adds tests
     for malformed/duplicate/empty/nested `PT_INTERP`.
   - **Auxiliary vector and entry point for dynamic binaries:**
     - `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, and `AT_ENTRY` describe the **main
@@ -5118,18 +5125,23 @@ untouched):
 1. Copy `path` (`UserPath`, section 8's handler rules), resolve it from the
    cwd following symlinks: a missing file `-ENOENT`, a directory or a
    file with no execute bit or not regular `-EACCES` (M7's
-   `vfs::read_executable` rule). The resolved file is held open from here
+   `exec::open_inode` rule). The resolved file is held open from here
    by an `OpenGuard` (`OpenGuard::try_new`, as `KeptFile` does), so an
    unlink can't free its inode while the exec streams it.
-2. Count `argv` and `envp` (copying the pointer arrays; a bad pointer
-   `-EFAULT`) and start `lumen_elf::args::ArgBudget::new(argc, envc,
+2. Count `argv` then `envp` without storing pointers: a bad word gives
+   `-EFAULT`, `MAX_ARG_STRINGS` gives `-E2BIG`, and each iteration checks
+   fatal pending state (`-EINTR`, consumed by syscall exit). Then start `lumen_elf::args::ArgBudget::new(argc, envc,
    limit)`, with Linux's `bprm_stack_limits`: `limit = max(min(6 MiB,
    rlimit_stack / 4), 128 KiB)`, 2 MiB at the default 8 MiB stack. Then
    charge and copy, in the budget's documented order: `execfn` (the path
    as given), `envp` last to first, `argv` last to first (each length from
    a bounded `strnlen_user`; 0, a fault, is `-EFAULT`), and, when `argc` is
    0, the one byte of the synthetic `""` `argv[0]`; `E2BIG` from any
-   `BudgetError`.
+   `BudgetError`. Only after this pointer budget succeeds may storage be
+   allocated. Each vector uses a compact byte arena plus `Vec<u32>` ends:
+   read pointers last-to-first for bounded strlen and charging, reserve the
+   exact byte total, then re-read pointers to copy. A changed NULL or an
+   unmapped word gives `-EFAULT`; both passes check fatal pending state.
 3. Read the file's first `BINPRM_BUF_SIZE` (256) bytes through the page
    cache. On `#!` (`lumen_elf::shebang::parse`; a `ShebangError` is its
    errno, `-ENOEXEC`), in this order: Linux's check that the script's own
@@ -5145,44 +5157,41 @@ untouched):
 4. An ELF: the header and program headers (at most 64 KiB, Linux's
    `load_elf_phdrs` limit) parsed by `lumen_elf::loader` (`-ENOEXEC` for a
    bad one; a bad `PT_INTERP` interpreter `-ELIBBAD`, a missing one
-   `-ENOENT`, M7's rules). Neither ELF nor `#!`: `-ENOEXEC`. Today
-   `LoadedElf::parse(image)` takes the whole file as one slice. C2 splits
-   lumen-elf (host-tested in `cargo:lumen-elf`) to parse from what the
-   kernel reads of the file:
+   `-ENOENT`, M7's rules). Neither ELF nor `#!`: `-ENOEXEC`.
+   lumen-elf's header-split API (host-tested in `cargo:lumen-elf`) parses
+   the bounded pieces the kernel reads:
    - `ElfHeader::parse(head) -> Result<ElfHeader, ElfLoadError>`, a public
-     parse of the 64-byte ELF header giving `e_phoff` and `e_phnum` (the
-     kernel then reads the program headers there, which may lie past the
-     first 256 bytes);
+     parse of the `EHDR_SIZE`-byte ELF header with private geometry and a
+     `phdr_range()` accessor, bounded by `MAX_PHDR_BYTES` (64 KiB). The
+     table can lie past the first 256 bytes; the supplied table slice must
+     contain exactly that range's bytes;
    - `parse_headers`, `parse_headers_with_pie_base` and
      `parse_interp_headers`, each taking `(ehdr, phdrs, file_size)` and
-     keeping its mode's base as `parse`, `parse_with_pie_base` and
-     `parse_interp` do, every segment's `p_offset + p_filesz` checked
-     against `file_size` instead of a slice;
+     keeping its mode's load bias, with every segment's
+     `p_offset + p_filesz` checked against `file_size` instead of a slice;
    - `LoadedElf::interp_range() -> Option<Range<u64>>`, the `PT_INTERP`
-     bytes' file range (at most `PATH_MAX`), replacing
-     `interp_path(image)`; the kernel reads them and passes them to
+     bytes' file range (at most `PATH_MAX`); the kernel reads them and passes them to
      `validate_interp(bytes)`, which keeps today's checks (NUL-terminated,
      no inner NUL, `InvalidInterp`);
-   - `LoadSegment::file_range()`, replacing `file_bytes(image)`, the
+   - `LoadSegment::file_range()`, the
      segment's file bytes' range, which the loader copies from the page
      cache.
-5. Build the new `AddressSpace` completely (`AddressSpace::from_images`,
+5. Build the new `AddressSpace` completely (`AddressSpace::from_images_with_stack`,
    the initial stack from the copied strings): `-ENOMEM` if frames or heap
    run out. The stack's size is `rlimit_stack` clamped to 128 KiB..=256
-   MiB, rounded up to a page: lumen-vm's `USER_STACK_SIZE` (8 MiB) and
-   `USER_STACK_BOTTOM` are compile-time constants today, so C2 makes the
-   stack's bottom a parameter of the layout (`AddressSpace` keeps it;
-   `MapsLayout::stack_bottom` already takes a value), section 5's 8 MiB
-   the default. **No whole-file read:** the kernel's `ElfImage` (in
+   MiB, rounded up to a page by `StackSize` (section 5), whose argument
+   budget also supplies step 2. Each `AddressSpace` retains the bottom.
+   **No whole-file read:** the kernel's `ElfImage` (in
    `mm/user_vm.rs`, not lumen-elf; its `file: Option<&ImageFile>` stays)
    carries an `ImageSource` instead of the whole file's bytes,
    `ImageSource::File(OpenGuard)` (step 1's) or
-   `ImageSource::Module(&'static [u8])` (a boot module), and the loader
-   copies each `PT_LOAD` segment's file bytes from the page cache
+   `ImageSource::Bytes(Cow<'a, [u8]>)` (a boot module or owned test image).
+   The loader copies each `PT_LOAD` segment's file bytes from the page cache
    straight into the new frames, 4 KiB at a time, instead of M7's
-   `read_executable` into one heap `Vec` (whose `READ_ALL_MAX`, 16 MiB,
+   whole-file reads into one heap `Vec` (whose `READ_ALL_MAX`, 16 MiB,
    refuses `cc1plus`, 41.4 MB, and whose heap never shrinks: #344's
-   numbers). A file that shrank meanwhile is a short read: `-EIO`. An
+   numbers). A short read gives `ImageRead(VfsError::Io)` / `-EIO`;
+   `ElfLoadError::NoMemory` converts to `OutOfMemory` / `-ENOMEM`. An
    executable's size is then bounded by memory alone, as on Linux;
    `READ_ALL_MAX` stays for `vfstest` and the other whole-file readers.
    The segments stay copied into private frames (M7's loader), not mapped
@@ -5191,8 +5200,11 @@ untouched):
    32 MiB of `cc1plus` while it runs). Everything step 6 needs is
    allocated here too: the new `exe_path` string, and an empty table for
    an unshared `Files` (its 1024 slots) if the table's `users` is above 1
-   now.
-6. The point of no return:
+   now. Until C3 implements de_thread, a multithreaded or group-exiting
+   process is refused with `-EAGAIN` before commit. `prepare_exec` packages
+   the new mm, identity, task name and `PreparedFiles` token into `PreparedExec`.
+6. The point of no return: C2's `commit_exec` is infallible; all storage
+   was prepared in step 5. C3 extends the single-thread boundary below:
    - **`de_thread` (C3).** Under `signal`: if `group_exit` or another
      `exec_waiter` is set, `-EAGAIN` (Linux's `de_thread`: a concurrent
      exec or a group exit wins). Else set `exec_waiter` to the caller's
@@ -5229,10 +5241,17 @@ untouched):
    - Still on the old address space, as Linux's `exec_mmap` runs
      `mm_exit_exec_release` first: walk the robust list
      (`futex_exit_exec_release` → `exit_robust_list`, C4) and clear its
-     head; clear `clear_child_tid`, storing 0 and waking it first only if
+     head; clear `clear_child_tid`, storing 0 and (C4) waking it first only if
      the space's `users` is above 1 (a `vfork` parent sharing it), as
      Linux's `mm_release` stores only while `mm_users > 1`, which after
-     `de_thread` holds only for a sharer; release a `vfork` parent.
+     `de_thread` holds only for a sharer. Before releasing a `vfork` parent,
+     `commit_unshare(PreparedFiles)` installs the private files table and
+     `finish_exec` closes its CLOEXEC descriptors. `Private` asserts
+     `users() == 1`; `Copy` uses the prepared table if still shared, otherwise
+     discards it. The exclusive `files_access` lease waits for reservations
+     without spinlocks held. C3 must revisit this with de_thread concurrency.
+     Then release the parent, so it cannot change the child's old shared table
+     while the child is still copying or closing it.
    - Install the new space: with interrupts off, as
      `UserSpaceGuard::enter` does, replace the calling thread's
      `UserThreadState::address_space` and load its root with
@@ -5241,18 +5260,12 @@ untouched):
      `replace_current_mm`.
      Lower the old space's `users`, tearing it down at 0 through
      `teardown`, which waits until no CPU has it loaded (section 5).
-   - `ProcTree::exec(pid)`; after `de_thread`, re-check `Files::users`, as
-     Linux runs `unshare_files` after `de_thread`: if it is above 1, copy
-     the table into the one step 5 allocated (or allocate one now, if a
-     sibling's `clone(CLONE_FILES)` raised it since; failing that, the
-     process gets `SIGKILL`, past its point of no return) and install it,
-     lowering the old table's `users`. `unshare_current_files` holds an
-     exclusive `files_access` lease: all open reservations finish or cancel
-     before the copy/swap, and new fd operations wait until it finishes.
-     This lease is acquired without spinlocks held. Then close every `cloexec`
-     descriptor (`process::release_fd`, so their POSIX locks go); reset every handled signal to `SIG_DFL` (ignored
-     ones stay ignored), keep the mask and pending signals, clear the
-     alternate stack; reset the FPU state and `fs_base`.
+   - `ProcTree::exec(pid)` marks even an unnamed exec; install the prepared
+     optional `exe_path`, clearing the previous identity when absent.
+     `finish_exec` also resets handled signals to default, keeping ignored
+     dispositions, masks and pending queues, and clears the alternate stack
+     and fault/frame_failure diagnostics. Reset FPU, `fs_base` and
+     `restart_block`. C2's commit is infallible: all allocations precede it.
    - Timers (C13): delete the POSIX timers and drop every queued
      `SI_TIMER` signal (Linux's `posixtimer_exec`: `posixtimer_delete_timers`
      and `flush_itimer_signals`); `ITIMER_REAL` survives (an `alarm`
@@ -5261,9 +5274,30 @@ untouched):
      script's for a `#!` file (`ThreadName::from_path`, as `linux /path`
      does, and Linux's `comm`); `exe_path` the file finally loaded, the
      interpreter's path for a `#!` script, as Linux's `bprm_identity_file`
-     makes `/proc/<pid>/exe` (the path as given, M7's rule otherwise).
+     makes `/proc/<pid>/exe`. `resolve_named_path` supplies the reached file's
+     absolute identity, including for PT_INTERP: ordinary symlinks and dot
+     components are resolved, and the final name is joined to its physical
+     parent's path. Magic file links use their target identity, followed with
+     the same symlink budget and checked against the reached inode; a detached
+     file may retain its description's absolute ` (deleted)` path. Original bytes remain in script argv
+     and AT_EXECFN. Identity retains raw bytes: `/proc/<pid>/exe` readlink
+     returns them unchanged; maps text and comm escape non-UTF-8 paths.
+     `NamedPath` separates the resolved inode from `identity: Result<Vec<u8>,
+     VfsError>`. Only an identity ENOMEM aborts exec; any other naming failure
+     is debug-logged and runs the reached file unnamed, with unnamed maps
+     lines and `/proc/<pid>/exe` returning ENOENT. This includes fd execution
+     after rename, where the descriptor still reaches the file but its
+     recorded path is stale.
 7. Return to the new image's entry through `iretq` with M6's initial
    register state (section 8, "ELF64 loader").
+
+Both the shell loader and execve draw AT_RANDOM inside `Exec::load`/`load_with_stack`. If the
+RNG pool is unseeded, a single warning accompanies the infallible TSC/time
+fallback (not cryptographic entropy). Unlike Linux, executable sources have
+no deny_write_access/ETXTBSY exclusion: holding an OpenGuard keeps an unlinked
+inode alive but does not prevent writes or truncation while streaming.
+Another Linux difference: executable identity is a stored path, not a pinned
+inode/dentry; a rename or unlink after exec can leave it stale.
 
 Tested by `scenario:test_linux_proc::test_fork_cow_and_exec_shebang`
 (section 15).
@@ -8383,9 +8417,12 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     descriptor can observe the new process. This differs from Linux's
     pinned `struct pid`; C1 documents the difference rather than changing
     procfs ownership.
-  - `/proc/<pid>/exe` → symlink to the executable's path as given to
-    `linux /path` (e.g. `/bin/busybox`; not resolved: Linux's resolved path
-    once `readlink` lands, #254).
+  - `/proc/<pid>/exe` → symlink to the reached executable's absolute identity,
+    with symlinks and dot components resolved. PT_INTERP uses the same rule.
+    It expands its stored path in the caller's resolver, sharing the 40-link
+    limit rather than recursively starting a fresh resolver; cycles give ELOOP.
+    The stored path is not an inode pin and can go stale on rename/unlink.
+    Readlink retains raw identity bytes; an unnamed exec gives ENOENT.
   - `/proc/<pid>/fd` → directory of **magic symlinks** `0`, `1`, `2`, ...:
     `readlink` returns each open FD's path (appending ` (deleted)` if
     unlinked), while traversing `/proc/<pid>/fd/<n>` (e.g. `open`/`stat`)
@@ -8458,14 +8495,19 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
   - `linux /path/to/bin [args...]` (built in #255): when `args[0]` begins
     with `/`, loads the static or dynamic (`PT_INTERP`) ELF from VFS
     (following symlinks; a regular file with an execute bit, else `EACCES`),
-    records the path as given (not resolved) as `exe_path`, which
+    records the reached file's absolute byte identity, when known, as `exe_path`, which
     `/proc/<pid>/exe` reads, and runs it in ring 3, on a thread named after
     the path's last component as given (not a symlink's target, as Linux's
     `comm` after `execve`), cut and sanitised as any thread's name (section
     6, "Kernel threads"; #276): `linux /usr/local/bin/hello` runs as
     `hello`. Commands without a leading `/` continue to use M6's Limine
     boot-module lookup (`linux hello`, `linux busybox ash -s`), on a thread
-    named after the module.
+    named after the module. `leaked_frames=` is the exact free-frame
+    difference around the counted load/run, after one uncounted load and
+    teardown establishes cache metadata and heap high-water storage. No
+    cache or heap-growth term is subtracted. It cannot detect leaked heap
+    objects that fit within already mapped capacity; a loader ktest also
+    checks exact live heap bytes after teardown.
 
 ### Global lock ordering (M7–M8; M8's locks designed in #336)
 
@@ -8524,7 +8566,9 @@ holding only locks above it.
        another lock; gone once C10 moves the console to `Tty`)
     f. VirtioHal::TABLE; WaitQueue locks; the scheduler's run queues (two
        at once only for a steal, in ascending CPU order, section 6)
-    g. heap -> page tables -> frame allocator (section 5);
+    g. Thread::name (a leaf, no allocation, no further locks; only the
+       owner writes after construction; crash readers use try_lock)
+    h. heap -> page tables -> frame allocator (section 5);
        frame::REFS is a leaf lock, taken only to copy out its boot-reserved
        table and released before any other lock or count update
 ```
@@ -10829,14 +10873,24 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   child writing the same heap, stack and file-private (`MAP_PRIVATE`)
   page after `fork`, each seeing only its own; shared anonymous memory
   staying shared; `#!` (a script, a nested script, `-ELOOP`, an empty
-  interpreter `-EACCES`), `/proc/self/exe` the interpreter and `comm` the
-  script; `O_CLOEXEC` closing; an ignored signal staying ignored; `E2BIG`;
-  a `vfork` child's `execve` releasing its parent; a binary over 16 MiB
+  interpreter `-EACCES`, exactly five scripts accepted and six refused),
+  exact nested argv and two ordered envp entries, `/proc/self/exe` the
+  interpreter or canonical executable, and byte-path exec whose raw-byte
+  readlink and subsequent open succeed. Each absolute, relative and nested
+  script tail selects exactly one argv shape. Self-reexec via `/proc/self/exe`
+  and fd aliases leaves a real binary identity that can be opened. A renamed
+  fd still execs, clearing the old identity to ENOENT; AT_RANDOM differs
+  between two exec'd children.
+  `comm` is checked
+  by the exec frame ktest. C2 checks CLOEXEC, ignored signals, handled
+  disposition reset, a cleared alternate stack, FPU reset, E2BIG and the
+  MAX_ARG_STRLEN boundary; pending signals are checked only by the ktest;
+  a `vfork` child's `execve` releasing its parent before the child exits
+  (the exec'd image confirms its CLOEXEC check with SIGUSR1 before its parent kills it); a binary over 16 MiB
   (built by `tools/linux-m8`, padded) (C2); a `clone(CLONE_VM | SIGCHLD |
   CLONE_CHILD_CLEARTID)` child that `execve`s and one that exits, each
   time the sharing parent's `FUTEX_WAIT` on the word returning and reading
-  0, and the robust-list walk at `execve` (C4); a reset handler and a
-  cleared alternate stack (C6); from a process with threads (C3): a
+  0, and the robust-list walk at `execve` (C4); from a process with threads (C3): a
   non-leader's `execve` taking the pid, the new image running, every
   other thread gone and the process not killed (its later exit status the
   new image's); two threads `execve`ing at once with exactly one image
@@ -10846,6 +10900,32 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   below, since a stopped sibling stops its whole group, the `execve`
   caller too, and nothing in user space can place an `exit_group` inside
   `de_thread`.
+- C2 ktests: `procfs_exe_cycles_share_the_symlink_limit` checks direct and
+  indirect stored exe cycles return ELOOP and ordinary resolution recovers;
+  `exec_pointer_count_is_bounded_before_allocation` checks E2BIG
+  without mapped heap growth and EFAULT after a long pointer walk;
+  `exec_argument_walk_observes_fatal_signal` checks EINTR during the walk;
+  `execve_replaces_frame_and_preserves_failed_call` checks script comm,
+  registers/TLS/mm/identity, including ENOMEM after loading while preparing
+  shared Files; `exec_signal_reset_preserves_pending_and_refuses_threads`
+  checks both pending queues, the mask, and thread/group-exit refusal;
+  `exec_name_reaches_crash_snapshot_without_blocking` checks the shared name
+  and busy-lock fallback; `exec_load_releases_heap_and_frames` checks exact
+  live allocations and frames; `a_binary_the_heap_cannot_hold_is_enomem`
+  refuses a 64 KiB header table and then succeeds; and
+  `streaming_exec_keeps_sources_and_uses_sized_stack` checks unlink retention,
+  distant payloads, literal stack limits and short-read rollback.
+  `cargo:lumen-elf` checks split-header sizes, interpreter bounds and fallible
+  allocation; `cargo:lumen-vm` checks StackSize; `cargo:lumen-vfs` checks
+  prepared descriptor capacity and next-CLOEXEC selection, plus the host tests
+  `named_resolution_follows_links_dotdot_and_magic_identities` and
+  `named_resolution_preserves_inode_when_identity_fails`: canonical names,
+  bounded aliases, equal-ino cross-device rejection and preservation of the
+  same resolved Arc even when naming fails.
+- `scenario:test_linux_proc::test_exec_uses_unseeded_random_fallback` (C2):
+  without a seeded RNG, shell loading and execve both succeed, emit one
+  fallback warning per boot, AT_RANDOM differs between two exec'd children,
+  and a second shell load leaks zero frames.
 - `scenario:test_linux_proc::test_pthread_create_and_join` (C3): the clone
   flag matrix's `EINVAL` order, `CLONE_THREAD` without `CLONE_FILES` or
   `CLONE_FS` included; `CLONE_SETTLS` with `tls >= USER_MAX` `EPERM`;

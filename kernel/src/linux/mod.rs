@@ -269,19 +269,6 @@ pub fn log_abi_summary() {
     );
 }
 
-/// Build 16 random bytes for `AT_RANDOM`, using `crate::rng::fill` when an
-/// entropy source is present and falling back to TSC/time mixing otherwise.
-fn at_random_bytes() -> [u8; 16] {
-    let mut out = [0u8; 16];
-    if crate::rng::fill(&mut out).is_err() {
-        let a = crate::time::now_ns() ^ arch::rdtsc().rotate_left(13);
-        let b = arch::rdtsc().wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ a.rotate_right(29);
-        out[0..8].copy_from_slice(&a.to_le_bytes());
-        out[8..16].copy_from_slice(&b.to_le_bytes());
-    }
-    out
-}
-
 /// Why [`run_exec`] did not run a program to its end.
 #[derive(Debug)]
 enum RunError {
@@ -297,8 +284,8 @@ enum RunError {
 /// runs as `hello`), or `module_name` for a boot module, with its path
 /// (when it was read by path) recorded for
 /// `/proc/<pid>/exe`: how it ended and how many frames it leaked, counted
-/// around the load and the run (every file was read when `exec` was made,
-/// so the page cache's frames are not counted).
+/// around the load and run after an uncounted load/teardown warms the cache
+/// and heap. No cache or heap term is subtracted from the frame difference.
 fn run_exec(
     exec: &Exec,
     module_name: &'static str,
@@ -307,19 +294,25 @@ fn run_exec(
     io: ConsoleIo,
 ) -> Result<(UserExit, i64), RunError> {
     let envp: [&[u8]; 3] = [b"PATH=/bin:/usr/bin", b"HOME=/", b"TERM=vt100"];
-    let random = at_random_bytes();
 
     // Pre-warm kernel heap so process/VMA/stack metadata reuses mapped heap
     // pages and physical frame accounting reflects only user-space frames.
     let _warm: Vec<u8> = vec![0u8; 32 * 1024];
     drop(_warm);
 
+    // Establish the cache and heap high-water mark before exact frame accounting.
+    let (warm, _) = exec.load(argv, &envp, execfn).map_err(RunError::Load)?;
+    warm.teardown();
+    drop(warm);
     let frames_before = frame::free_frames();
-    let (space, prog) = exec.load(argv, &envp, execfn, random).map_err(RunError::Load)?;
+    let (space, prog) = exec.load(argv, &envp, execfn).map_err(RunError::Load)?;
     let space = Arc::new(space);
     let exe_path = exec.exe_path();
-    let thread_name = exe_path.map_or(ThreadName::new(module_name), ThreadName::from_path);
-    let exe_path = exe_path.map(String::from);
+    let thread_name = if execfn.starts_with(b"/") {
+        ThreadName::from_path(core::str::from_utf8(execfn).unwrap_or(module_name))
+    } else {
+        ThreadName::new(module_name)
+    };
     let exit = run_elf_process(thread_name, space, prog.entry, prog.rsp, io, exe_path).map_err(RunError::Run)?;
     let frames_after = frame::free_frames();
     Ok((exit, frames_before as i64 - frames_after as i64))
@@ -356,7 +349,7 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
     };
 
     let name = &args[0];
-    // Every file, the interpreter's too, is read here, before frames are counted.
+    // Open and validate both images here; their segment bytes stream during load.
     // A binary read by path runs under its file's name (`run_exec`), a
     // boot module under the module's. The path arm's `"linux"` is never
     // used: `Exec::from_path` always records the path.
@@ -1204,7 +1197,7 @@ type Ran = Result<(UserExit, i64), RunError>;
 struct Spun {
     pid: u32,
     /// The process's recorded path (`/proc/<pid>/exe`).
-    exe_path: Option<String>,
+    exe_path: Option<Arc<[u8]>>,
     /// Its thread's row in `threads`' table (thread, id, ...).
     row: Option<Vec<lumen_shell::pipe::Value>>,
     /// Whether the flag was set, letting it exit.
@@ -1271,22 +1264,19 @@ crate::ktest!(
         // 16 bytes: the thread's name keeps 15, as Linux's comm.
         const NAME: &str = "lumen-ktest-spin";
         const PATH: &str = "/tmp/lumen-ktest-spin";
+        const ALIAS: &str = "/tmp/lumen-ktest-link";
         let elf = spin_elf();
-        let tmp = crate::vfs::resolve_path_from_root("/tmp").map_err(|_| "no /tmp")?;
-        let file = tmp.create(NAME.as_bytes(), 0o755).map_err(|_| "create")?;
-        let written = file.write_at(0, &elf);
-        drop(file);
-        let exec = Exec::from_path(PATH);
-        let unlinked = tmp.unlink(NAME.as_bytes());
-        kassert_eq!(written, Ok(elf.len()));
-        kassert_eq!(unlinked, Ok(()));
-        let exec = exec.map_err(|_| "Exec::from_path failed")?;
+        let fixture = exec::ExecFixture::new(PATH, &elf)?;
+        let alias = exec::ExecFixture::symlink(ALIAS, NAME.as_bytes())?;
+        let exec = Exec::from_path(ALIAS).map_err(|_| "Exec::from_path failed")?;
+        drop(alias);
+        drop(fixture);
 
-        let spun = run_spinning(exec, "exe-route", PATH)?;
+        let spun = run_spinning(exec, "exe-route", ALIAS)?;
         kassert!(spun.released);
-        kassert_eq!(spun.exe_path.as_deref(), Some(PATH));
+        kassert_eq!(spun.exe_path.as_deref(), Some(PATH.as_bytes()));
         let row = spun.row.ok_or("the process's thread isn't in `threads`")?;
-        kassert_eq!(row.first(), Some(&text("lumen-ktest-spi")));
+        kassert_eq!(row.first(), Some(&text("lumen-ktest-lin")));
         kassert!(matches!(spun.ran, Some(Ok((UserExit::Exited(0), _)))));
         kassert_eq!(process_exe_path(spun.pid), None);
         Ok(())

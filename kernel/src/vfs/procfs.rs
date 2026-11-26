@@ -1,9 +1,10 @@
 //! Read-only `/proc` virtual filesystem (`procfs`, `dev = 0:4`).
 //!
 //! All regular virtual files report `st_size == 0` in `stat()` and generate
-//! fresh content dynamically on `read_at()`. Magic symlinks (`/proc/<pid>/fd/*`
-//! and `/proc/<pid>/exe`) implement `resolve_magic_link()` while keeping
-//! `readlink()` textual.
+//! fresh content dynamically on `read_at()`. Magic symlinks (`/proc/<pid>/fd/*`)
+//! implement `resolve_magic_link()` while keeping `readlink()` textual.
+//! Exe links expand their stored path in the caller's bounded symlink walk;
+//! they never start a nested resolver with a fresh depth counter.
 
 use alloc::format;
 use alloc::string::String;
@@ -339,10 +340,10 @@ impl VfsInode for ProcfsInode {
         #[cfg(feature = "ktest")]
         ASKED_MAGIC.fetch_add(1, Ordering::Relaxed);
         match self.kind {
-            ProcKind::PidExe(pid) => {
-                let path = process::process_exe_path(pid)?;
-                super::resolve_path_from_root(&path).ok()
-            }
+            // Exe has only a stored path, not a held inode. Let readlink feed
+            // that path into the caller's existing MAX_SYMLINK_DEPTH budget.
+            // This also bounds cycles through another exe, fd, or ordinary link.
+            ProcKind::PidExe(_) => None,
             ProcKind::PidFdLink(pid, fd) => process::process_fd_target(pid, fd.get()).and_then(|(inode, _)| inode),
             _ => None,
         }
@@ -436,7 +437,7 @@ impl VfsInode for ProcfsInode {
             ProcKind::SelfLink => Ok(format!("{}", process::try_current_pid().ok_or(VfsError::NoEnt)?).into_bytes()),
             // No path recorded (a process not loaded from the VFS): no target,
             // the same answer `resolve_magic_link` gives.
-            ProcKind::PidExe(pid) => process::process_exe_path(pid).map(String::into_bytes).ok_or(VfsError::NoEnt),
+            ProcKind::PidExe(pid) => process::process_exe_path(pid).map(|path| path.to_vec()).ok_or(VfsError::NoEnt),
             ProcKind::PidFdLink(pid, fd) => {
                 process::process_fd_target(pid, fd.get()).map(|(_, path)| path).ok_or(VfsError::NoEnt)
             }
@@ -873,6 +874,29 @@ crate::ktest!(
             kassert!(Arc::ptr_eq(&fd3, &inode));
             kassert!(unlink_at(tables, None, PATH, false).is_ok());
             kassert_eq!(link(3), Ok(b"/tmp/procfs-ktest-fd (deleted)".to_vec()));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn procfs_exe_cycles_share_the_symlink_limit() {
+        use crate::kassert_eq;
+        process::in_test_process(|pid| {
+            let target = format!("/proc/{pid}/exe");
+            process::set_exe_path(Some(Arc::from(target.as_bytes())));
+            kassert_eq!(super::resolve_path_from_root("/proc/self/exe").err(), Some(VfsError::Loop));
+            // An ordinary symlink in the recorded identity must share the budget too.
+            let tmp = super::resolve_path_from_root("/tmp").map_err(|_| "tmp")?;
+            tmp.symlink(b"exe-cycle", b"/proc/self/exe").map_err(|_| "symlink")?;
+            process::set_exe_path(Some(Arc::from(b"/tmp/exe-cycle".as_slice())));
+            let error = super::resolve_path_from_root("/proc/self/exe").err();
+            lumen_vfs::unlink_at(super::tables(), None, b"/tmp/exe-cycle", false).map_err(|_| "unlink")?;
+            kassert_eq!(error, Some(VfsError::Loop));
+            // A normal target still resolves after the cycle was refused.
+            process::set_exe_path(Some(Arc::from(b"/dev/null".as_slice())));
+            let inode = super::resolve_path_from_root("/proc/self/exe").map_err(|_| "noncyclic exe")?;
+            kassert_eq!(inode.inode_type(), InodeType::CharDevice);
             Ok(())
         })?
     }

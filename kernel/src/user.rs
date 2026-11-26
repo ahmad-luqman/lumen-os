@@ -845,7 +845,7 @@ fn spawn_ring3_on(
     io: ConsoleIo,
     allow_test_syscalls: bool,
     stdin: Vec<u8>,
-    exe_path: Option<String>,
+    exe_path: Option<Arc<[u8]>>,
 ) -> Result<(sched::JoinHandle, ResultSlot), &'static str> {
     // Stdio first: a process never starts without fds 0, 1 and 2 (logged).
     let stdio = Stdio::open().map_err(|_| "cannot open the process's stdio")?;
@@ -893,7 +893,7 @@ pub fn run_elf_process(
     entry: u64,
     rsp: u64,
     io: ConsoleIo,
-    exe_path: Option<String>,
+    exe_path: Option<Arc<[u8]>>,
 ) -> Result<UserExit, &'static str> {
     let cpu = if matches!(io, ConsoleIo::Serial) { 0 } else { arch::cpu_index() };
     let (handle, slot) = spawn_ring3_on(cpu, name, space, entry, rsp, None, io, false, Vec::new(), exe_path)?;
@@ -2132,7 +2132,7 @@ crate::ktest!(
             ConsoleIo::Capture,
             true,
             Vec::new(),
-            Some(String::from(PATH)),
+            Some(Arc::from(PATH.as_bytes())),
         )?;
 
         // While it spins, its process (the only one) carries the path, read
@@ -2159,7 +2159,7 @@ crate::ktest!(
         let exit = slot.lock().take().map(|r| r.exit);
         kassert_eq!(released, Some((2, Ok(()))));
         let (pid, path) = seen.ok_or("the process never registered")?;
-        kassert_eq!(path.as_deref(), Some(PATH));
+        kassert_eq!(path.as_deref(), Some(PATH.as_bytes()));
         kassert!(matches!(exit, Some(UserExit::Exited(0))));
         kassert_eq!(process_exe_path(pid), None);
         // The last user given up (here or by the takedown) tore it down.
