@@ -271,6 +271,20 @@ pub fn read_byte() -> Option<u8> {
     arch::serial::read_next(popped)
 }
 
+/// Supply a received byte to a kernel test, using the real queue and wakes.
+#[cfg(feature = "ktest")]
+pub(crate) fn inject_for_test(byte: u8) {
+    {
+        let _receive = RECEIVE.lock();
+        assert!(QUEUE.push(byte), "test input queue full");
+    }
+    WAITING.wake_all();
+    let head = POLL_HEAD.lock().clone();
+    if let Some(head) = head {
+        head.notify(PollMask::IN | PollMask::RDNORM);
+    }
+}
+
 /// Wait for a received byte (see [`read_byte`]; the caller looks again
 /// afterwards), as `lumen_uart::wait_mode` says: block with the deadline,
 /// block for good, or yield once. Safe for a reader on any CPU; another

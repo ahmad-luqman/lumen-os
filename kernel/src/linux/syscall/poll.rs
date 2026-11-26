@@ -135,35 +135,6 @@ impl PollWaker for PollWait {
     }
 }
 
-/// Temporarily replaces the calling thread's signal mask for `ppoll` /
-/// `pselect6`, restoring it on drop on every exit path.
-///
-/// Handlers now run on syscall exit. Restoring this early is inexact until
-/// C6 supplies `saved_mask` (`restore_saved_sigmask_unless`) for that delivery.
-#[must_use = "dropping MaskGuard immediately restores the signal mask"]
-struct MaskGuard {
-    prev: Option<Blocked>,
-}
-
-impl MaskGuard {
-    fn install(mask: Option<SigSet>) -> Self {
-        let prev = mask.map(|set| {
-            let old = process::current_blocked();
-            process::set_current_blocked(Blocked::new(set));
-            old
-        });
-        Self { prev }
-    }
-}
-
-impl Drop for MaskGuard {
-    fn drop(&mut self) {
-        if let Some(old) = self.prev.take() {
-            process::set_current_blocked(old);
-        }
-    }
-}
-
 /// Optional console recheck step for [`wait_ready`]: caps each sleep at
 /// `step_ns` and flags IRQ 4's 100 ms safety-net step.
 #[derive(Clone, Copy)]
@@ -516,10 +487,13 @@ pub(super) fn sys_ppoll(fds: UserPtr, nfds: u32, tsp: UserPtr, sigmask: UserPtr,
     finish((|| {
         let timeout = copy_timespec(tsp)?;
         let mask = copy_sigmask(sigmask, sigsetsize)?;
-        let _mask_guard = MaskGuard::install(mask);
-        finish_timed(run_poll(fds.addr(), nfds, timeout, false), |timed_out| {
-            write_remaining_timespec(tsp, timeout, timed_out)
-        })
+        let thread = process::current_thread();
+        if let Some(mask) = mask {
+            thread.install_temporary_mask(Blocked::new(mask));
+        }
+        let result = run_poll(fds.addr(), nfds, timeout, false);
+        thread.restore_saved_sigmask_unless(result == Err(ERESTARTNOHAND));
+        finish_timed(result, |timed_out| write_remaining_timespec(tsp, timeout, timed_out))
     })())
 }
 
@@ -701,10 +675,13 @@ pub(super) fn sys_pselect6(
             Some(arg) => copy_sigmask(UserPtr::from_reg(arg.ss), arg.ss_len)?,
             None => None,
         };
-        let _mask_guard = MaskGuard::install(mask);
-        finish_timed(run_select(n, readfds, writefds, exceptfds, timeout), |timed_out| {
-            write_remaining_timespec(tsp, timeout, timed_out)
-        })
+        let thread = process::current_thread();
+        if let Some(mask) = mask {
+            thread.install_temporary_mask(Blocked::new(mask));
+        }
+        let result = run_select(n, readfds, writefds, exceptfds, timeout);
+        thread.restore_saved_sigmask_unless(result == Err(ERESTARTNOHAND));
+        finish_timed(result, |timed_out| write_remaining_timespec(tsp, timeout, timed_out))
     })())
 }
 
@@ -1552,6 +1529,10 @@ crate::ktest!(
                 let t0 = crate::time::now_ns();
                 let r = call();
                 let elapsed = crate::time::now_ns() - t0;
+                // No queued signal in this fixture: exercise the exit hook's
+                // no-handler restoration after the synthetic interruption.
+                let mut frame = crate::arch::syscall::SyscallFrame { rax: r, rip: 0x400002, ..Default::default() };
+                crate::linux::signal::exit_to_user(&mut frame, lumen_signal::restart::SyscallExit::new(271));
                 let after = process::current_blocked();
                 sched::clear_current_sigpending();
                 (r, after, elapsed)
@@ -1585,7 +1566,7 @@ crate::ktest!(
             // SAFETY: `RawPselectSig` has zero padding bytes.
             unsafe { copy_pod_to_user(sig_va, &RawPselectSig { ss: mask_va, ss_len: 8 }) }.map_err(|_| "write sig")?;
 
-            // 1. `ppoll`: installs temporary mask, restores on `-ERESTARTNOHAND`,
+            // 1. `ppoll`: installs temporary mask, restores at the no-handler exit hook,
             //    and writes remaining `timespec` back.
             write_pollfds(fds_va, &[(fd_num, PollMask::IN.bits())])?;
             write_timespec(ts_va, 5, 0)?;
@@ -1599,7 +1580,7 @@ crate::ktest!(
             check_rem((ts.tv_sec as u64) * NS_PER_SEC + ts.tv_nsec as u64, 5 * NS_PER_SEC, elapsed)?;
             kassert_eq!(test_inode.subscriber_count(), 0);
 
-            // 2. `pselect6`: installs temporary mask, restores on `-ERESTARTNOHAND`,
+            // 2. `pselect6`: installs temporary mask, restores at the no-handler exit hook,
             //    and writes remaining `timespec` back.
             write_fd_set(rset_va, &[fd_num])?;
             write_timespec(ts_va, 5, 0)?;

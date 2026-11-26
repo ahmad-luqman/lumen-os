@@ -245,3 +245,103 @@ def test_small_syscalls(boot, tmp_path):
     assert "FAIL" not in out, out
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_sigchld_and_sigint_interrupt_wait(boot, tmp_path):
+    """C6: real handlers, signal waits, mask swaps, restart and stop/continue."""
+    from lumen_harness.screen import read_screen
+
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    out = run(m, f"linux {PROC} signal-waits", 120)
+    assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+        "signal-wanted-and-timeout",
+        "signal-child-mask-swap",
+        "signal-stop-continue",
+    ], out
+    assert f"linux: {PROC} exit=0 " in out, out
+
+    attempts = 20
+
+    def blocked(pid):
+        for _ in range(attempts):
+            out = run(m, "ps")
+            if re.search(rf"^\s*{pid}\s+\d+\s+{pid}\s+blocked\s", out, re.MULTILINE):
+                return
+        raise AssertionError(f"waiter {pid} never blocked: {out}")
+
+    confirmed_keys(m, ["alt", "f2"])
+    for kind in [
+        "read",
+        "wait4",
+        "nanosleep",
+        "pselect6",
+        "ppoll",
+        "pause",
+        "suspend",
+        "timedwait",
+    ]:
+        for mode in ["eintr", "restart"]:
+            type_confirmed(m, "clear\n")
+            expect_screen(m, r"\Alumen>\s*\Z")
+            type_confirmed(m, f"linux {PROC} c6-wait {kind} {mode}\n")
+            ready = expect_screen(m, r"^c6: pid=(\d+) child=(\d+) ready$", 30)
+            pid, child = map(int, ready.groups())
+            blocked(pid)
+            # A signal can land after the ready line but before the wait.
+            # Resend for a bounded number of confirmed attempts.
+            restarts = mode == "restart" and kind in ("read", "wait4")
+            for _ in range(attempts):
+                sent = run(m, f"linux {PROC} c6-kill {pid} 2", 30)
+                screen = read_screen(m).text
+                assert "FAIL" not in screen, screen
+                if (restarts and "c6: handler" in screen) or (
+                    not restarts and "ok c6-blocking" in screen
+                ):
+                    break
+                assert "ok c6-send" in sent, sent
+            else:
+                raise AssertionError(f"signal never interrupted {kind}: {screen}")
+            if restarts:
+                blocked(pid)
+                if kind == "read":
+                    confirmed_keys(m, "z")
+                else:
+                    sent = run(m, f"linux {PROC} c6-kill {child} 9", 30)
+                    assert "ok c6-send" in sent, sent
+            expect_screen(m, rf"^ok c6-blocking\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
+
+    # A background child polls serial with events=0, so these serial-shell
+    # queries cannot satisfy its wait. Confirm each effect before proceeding.
+    serial_start = len(m.output)
+    out = run(m, f"linux {PROC} c6-wait poll eintr")
+    child = re.search(r"^c6: poll-child=(\d+)$", out, re.MULTILINE)
+    assert child, out
+    pid = int(child[1])
+    for _ in range(attempts):
+        # A serial ps command itself wakes this subscriber. Sample on VT2,
+        # confirming all keys, then read the snapshot. Retry if a keyboard
+        # confirmation's serial traffic caught the poller before it reblocked.
+        type_confirmed(m, "ps\n")
+        screen = read_screen(m).text
+        if re.search(rf"^\s*{pid}\s+\d+\s+{pid}\s+blocked\s", screen, re.MULTILINE):
+            break
+    else:
+        raise AssertionError(f"serial poller never blocked: {screen}")
+    for _ in range(attempts):
+        out = run(m, "serial poll")
+        if re.search(r"subscribers: 1\n", out):
+            break
+    else:
+        raise AssertionError(f"poll never subscribed: {out}")
+    out = run(m, f"linux {PROC} c6-kill {pid} 2")
+    assert "ok c6-send" in out, out
+    for _ in range(attempts):
+        out = run(m, "serial poll")
+        if "ok c6-blocking" in m.output[serial_start:] and re.search(r"subscribers: 0\n", out):
+            break
+    else:
+        raise AssertionError(f"interrupted poll did not finish and unsubscribe: {out}")
+    assert "FAIL" not in m.output[serial_start:], m.output[serial_start:]
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

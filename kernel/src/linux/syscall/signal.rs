@@ -1,9 +1,9 @@
 //! Linux signal dispositions, masks, senders, frames and alternate stacks.
 //! User copies happen outside the signal lock, with Linux's install-before-
-//! copy-out ordering. Signal wait and stop/continue syscalls belong to C6.
+//! copy-out ordering. Interruptible waits retain masks until signal delivery.
 
 use super::at::UserPtr;
-use super::{copy_pod_from_user, copy_pod_to_user, neg_errno, not_implemented};
+use super::{copy_pod_from_user, copy_pod_to_user, neg_errno};
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::linux::process::{
     KernelSigaction, current_action, current_blocked, current_process, current_thread, send_process_checked,
@@ -102,9 +102,32 @@ pub(super) fn sys_rt_sigpending(set: UserPtr, sigsetsize: u64) -> u64 {
     }
 }
 
-/// `rt_sigtimedwait(set, info, timeout, sigsetsize)` (128): M8 stub, replaced by C6 (#385).
-pub(super) fn sys_rt_sigtimedwait(_set: UserPtr, _info: UserPtr, _timeout: UserPtr, _sigsetsize: u64) -> u64 {
-    not_implemented(general::__NR_rt_sigtimedwait)
+/// Consume a wanted pending signal, or wait interruptibly until its deadline.
+/// The signal is consumed even when copying its siginfo fails.
+pub(super) fn sys_rt_sigtimedwait(set: UserPtr, info: UserPtr, timeout: UserPtr, sigsetsize: u64) -> u64 {
+    super::finish((|| {
+        let wanted = read_mask(set, sigsetsize)?;
+        let deadline = if timeout.is_null() {
+            None
+        } else {
+            let ns = super::time::read_timespec(timeout.addr())?;
+            Some(crate::time::now_ns().saturating_add(ns))
+        };
+        let got = current_thread().wait_signal(wanted, deadline)?;
+        if !info.is_null() {
+            copy_to_user(info.addr(), got.bytes()).map_err(|e| e.to_errno())?;
+        }
+        Ok(u64::from(got.signal().number()))
+    })())
+}
+
+fn read_mask(ptr: UserPtr, size: u64) -> Result<SigSet, u32> {
+    if size != 8 {
+        return Err(errno::EINVAL);
+    }
+    let mut bytes = [0; 8];
+    copy_from_user(&mut bytes, ptr.addr()).map_err(|e| e.to_errno())?;
+    Ok(SigSet(u64::from_ne_bytes(bytes)).unblockable_stripped())
 }
 
 fn read_info(info: UserPtr) -> Result<[u8; 128], u32> {
@@ -149,9 +172,14 @@ pub(super) fn sys_rt_tgsigqueueinfo(tgid: i32, tid: i32, sig: i32, info: UserPtr
     }))
 }
 
-/// `rt_sigsuspend(mask, sigsetsize)` (130): M8 stub, replaced by C6 (#385).
-pub(super) fn sys_rt_sigsuspend(_mask: UserPtr, _sigsetsize: u64) -> u64 {
-    not_implemented(general::__NR_rt_sigsuspend)
+/// Wait with a temporary mask; the delivered frame restores the original mask.
+pub(super) fn sys_rt_sigsuspend(mask: UserPtr, sigsetsize: u64) -> u64 {
+    let mask = match read_mask(mask, sigsetsize) {
+        Ok(mask) => mask,
+        Err(error) => return neg_errno(error),
+    };
+    current_thread().install_temporary_mask(lumen_signal::Blocked::new(mask));
+    sys_pause()
 }
 
 /// sigaltstack(ss, old_ss) (131): configure using the interrupted rsp; an on-stack change is EPERM.
@@ -215,9 +243,10 @@ fn thread_kill(tgid: Option<u32>, tid: i32, sig: i32) -> u64 {
     sent(send_thread_checked(tgid, tid as u32, sender_info(sig, general::SI_TKILL), SenderClass::Other))
 }
 
-/// `pause()` (34): M8 stub, replaced by C6 (#385).
+/// Wait for pending work; only delivery of a handler makes this return EINTR.
 pub(super) fn sys_pause() -> u64 {
-    not_implemented(general::__NR_pause)
+    let _ = crate::sched::WaitQueue::new().wait_interruptible(None, || false);
+    neg_errno(lumen_signal::restart::RestartCode::NoHand as u32)
 }
 
 /// `restart_syscall()` (219, B2): resumes the thread's restart block
@@ -227,6 +256,163 @@ pub(super) fn sys_restart_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
     frame.rax = crate::linux::signal::restart_syscall();
     SyscallReturn::Sysret
 }
+
+crate::ktest!(
+    fn signal_waits_validate_and_consume_pending() {
+        use super::at::FromReg;
+        use crate::linux::process::{self, KTEST_USER_VA as A};
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::Blocked;
+        process::in_test_process(|pid| {
+            let ptr = UserPtr::from_reg;
+            let mask = SigSet::of(&[Signal::USR1, Signal::USR2]);
+            set_current_blocked(Blocked::new(mask));
+            copy_to_user(A, &mask.0.to_ne_bytes()).map_err(|_| "mask")?;
+            copy_to_user(A + 16, &[0; 16]).map_err(|_| "timeout")?;
+            let send = |sig| send_process_checked(pid as i32, Ok(Some(SigInfo::new(sig, 0))), SenderClass::SiUser);
+            send(Signal::USR1).map_err(|_| "send")?;
+            process::send_thread(None, pid, Some(SigInfo::new(Signal::USR2, 0)), SenderClass::SiUser)
+                .map_err(|_| "private send")?;
+            kassert_eq!(sys_rt_sigpending(ptr(A + 64), 9), neg_errno(errno::EINVAL));
+            kassert_eq!(sys_rt_sigpending(ptr(A + 64), 8), 0);
+            let mut bits = [0; 8];
+            copy_from_user(&mut bits, A + 64).map_err(|_| "pending")?;
+            kassert_eq!(u64::from_ne_bytes(bits), mask.0);
+            kassert_eq!(sys_rt_sigpending(ptr(0), 0), 0);
+            kassert_eq!(sys_rt_sigpending(ptr(0), 8), neg_errno(errno::EFAULT));
+            kassert_eq!(sys_rt_sigtimedwait(ptr(A), ptr(0), ptr(A + 16), 4), neg_errno(errno::EINVAL));
+            kassert_eq!(sys_rt_sigtimedwait(ptr(A), ptr(A + 128), ptr(A + 16), 8), u64::from(Signal::USR2.number()));
+            let info = read_info(ptr(A + 128)).map_err(|_| "siginfo")?;
+            kassert_eq!(info[0], Signal::USR2.number() as u8);
+            // Copyout failure still consumes the shared signal.
+            kassert_eq!(sys_rt_sigtimedwait(ptr(A), ptr(1), ptr(A + 16), 8), neg_errno(errno::EFAULT));
+            kassert_eq!(sys_rt_sigtimedwait(ptr(A), ptr(0), ptr(A + 16), 8), neg_errno(errno::EAGAIN));
+            kassert_eq!(current_blocked().set(), mask);
+            kassert_eq!(crate::linux::process::current_pending(), SigSet::EMPTY);
+            // A positive timeout must wait for its deadline, not just return
+            // EAGAIN. Only a floor is asserted: a stalled host may add time.
+            const INTERVAL: u64 = 30_000_000;
+            super::time::write_timespec(A + 16, INTERVAL).map_err(|_| "positive timeout")?;
+            let start = crate::time::now_ns();
+            kassert_eq!(sys_rt_sigtimedwait(ptr(A), ptr(0), ptr(A + 16), 8), neg_errno(errno::EAGAIN));
+            kassert!(crate::time::now_ns() - start >= INTERVAL);
+            // Block until a default-fatal signal is sent. real_blocked must
+            // prevent complete_signal from turning this into a group exit.
+            for sig in [Signal::USR1, Signal::CHLD] {
+                set_current_blocked(Blocked::new(SigSet::of(&[Signal::USR1, Signal::USR2, Signal::CHLD])));
+                let worker = process::spawn_test_thread(move |tid| {
+                    let me = current_thread();
+                    me.set_blocked(Blocked::new(SigSet::of(&[sig])));
+                    let got = me.wait_signal(SigSet::of(&[sig]), None);
+                    (tid, got, crate::sched::current_sigpending(), me.blocked())
+                })?;
+                let blocked = worker.settle();
+                let sent = send(sig);
+                let (_, got, pending, restored) = worker.join()?;
+                kassert!(blocked);
+                kassert_eq!(sent, Ok(()));
+                kassert_eq!(got.map(|i| i.signal()), Ok(sig));
+                kassert!(!pending);
+                kassert_eq!(restored, Blocked::new(SigSet::of(&[sig])));
+            }
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn temporary_masks_survive_until_handler_and_sigreturn() {
+        use crate::linux::process::{self, KTEST_USER_LEN, KTEST_USER_VA as A};
+        use crate::linux::signal;
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::{Blocked, restart::SyscallExit};
+        process::in_test_process(|pid| {
+            for nr in [general::__NR_ppoll, general::__NR_pselect6, general::__NR_rt_sigsuspend, general::__NR_pause] {
+                let mask = Blocked::new(SigSet::of(&[Signal::USR1]));
+                set_current_blocked(if nr == general::__NR_pause { Blocked::EMPTY } else { mask });
+                set_current_action(
+                    Signal::USR1,
+                    KernelSigaction {
+                        handler: 0x400100,
+                        restorer: 0x400200,
+                        flags: u64::from(general::SA_RESTORER | general::SA_RESTART),
+                        mask: 0,
+                    },
+                );
+                send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::USR1, 0))), SenderClass::SiUser)
+                    .map_err(|_| "send")?;
+                copy_to_user(A, &0u64.to_ne_bytes()).map_err(|_| "temporary mask")?;
+                copy_to_user(A + 16, &A.to_ne_bytes()).map_err(|_| "mask pointer")?;
+                copy_to_user(A + 24, &8u64.to_ne_bytes()).map_err(|_| "mask length")?;
+                let mut frame = SyscallFrame {
+                    rax: u64::from(nr),
+                    rip: 0x400002,
+                    rsp: A + KTEST_USER_LEN,
+                    cs: 0x23,
+                    ss: 0x1b,
+                    rflags: 0x202,
+                    ..Default::default()
+                };
+                match nr {
+                    general::__NR_ppoll => {
+                        frame.r10 = A;
+                        frame.r8 = 8;
+                    }
+                    general::__NR_pselect6 => {
+                        frame.r9 = A + 16;
+                    }
+                    general::__NR_rt_sigsuspend => {
+                        frame.rdi = A;
+                        frame.rsi = 8;
+                    }
+                    _ => {}
+                }
+                super::dispatch(&mut frame);
+                kassert_eq!(frame.rax, neg_errno(lumen_signal::restart::RestartCode::NoHand as u32));
+                kassert_eq!(current_blocked(), Blocked::EMPTY);
+                kassert!(signal::exit_to_user(&mut frame, SyscallExit::new(u64::from(nr))));
+                kassert_eq!(frame.rip, 0x400100);
+                frame.rsp += 8;
+                frame.r11 = 0x202;
+                signal::frame::restore(&mut frame).map_err(|_| "sigreturn")?;
+                kassert_eq!(frame.rax, neg_errno(errno::EINTR));
+                kassert_eq!(frame.rip, 0x400002);
+                kassert_eq!(current_blocked(), if nr == general::__NR_pause { Blocked::EMPTY } else { mask });
+                kassert!(!signal::exit_to_user(&mut frame, None));
+                kassert_eq!(frame.rip, 0x400002);
+            }
+            // Conversely, a temporary mask that blocks an already-notified
+            // signal must allow the wait to time out, not spuriously interrupt.
+            set_current_blocked(Blocked::EMPTY);
+            send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::USR1, 0))), SenderClass::SiUser)
+                .map_err(|_| "send before masking")?;
+            copy_to_user(A, &Signal::USR1.bit().to_ne_bytes()).map_err(|_| "blocking mask")?;
+            copy_to_user(A + 32, &[0; 16]).map_err(|_| "timeout seconds")?;
+            copy_to_user(A + 40, &1_000_000u64.to_ne_bytes()).map_err(|_| "timeout nanos")?;
+            let mut frame = SyscallFrame {
+                rax: u64::from(general::__NR_ppoll),
+                rdx: A + 32,
+                r10: A,
+                r8: 8,
+                rip: 0x400002,
+                rsp: A + KTEST_USER_LEN,
+                cs: 0x23,
+                ss: 0x1b,
+                rflags: 0x202,
+                ..Default::default()
+            };
+            super::dispatch(&mut frame);
+            kassert_eq!(frame.rax, 0);
+            kassert_eq!(current_blocked(), Blocked::EMPTY);
+            kassert!(signal::exit_to_user(&mut frame, SyscallExit::new(u64::from(general::__NR_ppoll))));
+            frame.rsp += 8;
+            frame.r11 = 0x202;
+            signal::frame::restore(&mut frame).map_err(|_| "sigreturn after timeout")?;
+            kassert_eq!(frame.rax, 0);
+            Ok(())
+        })?
+    }
+);
 
 crate::ktest!(
     fn sigaction_and_sigprocmask_round_trip() {

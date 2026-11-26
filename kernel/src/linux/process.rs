@@ -444,6 +444,11 @@ pub struct Process {
     child_events: sched::WaitQueue,
     /// Published before a child-event wake to close the check/enqueue race.
     child_seq: AtomicU64,
+    /// Mirror of group_stop, published under signal before any park or wake.
+    stopped: core::sync::atomic::AtomicBool,
+    /// Advances on cancellation so a new stop cannot hide a previous continue.
+    stop_seq: AtomicU64,
+    stop_wait: sched::WaitQueue,
     /// Taken once when a vfork child releases its parent.
     vfork_done: SpinLock<Option<Arc<VforkDone>>>,
 }
@@ -475,6 +480,9 @@ impl Process {
             exit: SpinLock::new(None),
             child_events: sched::WaitQueue::new(),
             child_seq: AtomicU64::new(0),
+            stopped: core::sync::atomic::AtomicBool::new(false),
+            stop_seq: AtomicU64::new(0),
+            stop_wait: sched::WaitQueue::new(),
             vfork_done: SpinLock::new(None),
         }
     }
@@ -528,6 +536,7 @@ impl Process {
     pub fn record_exit(&self, exit: UserExit) {
         let mut signal = self.signal.lock();
         signal.record_exit();
+        let _ = signal.cancel_stop(self);
         let exit = signal
             .fatal_signal()
             .map_or(exit, |sig| if exit.signal() == Some(sig) { exit } else { UserExit::Signaled(sig) });
@@ -1987,11 +1996,21 @@ pub fn stdin_ready(io: ConsoleIo) -> bool {
 ///
 /// Must be called with interrupts enabled and no `SpinLock` held.
 pub fn read_console(io: ConsoleIo, dst: &mut [u8]) -> usize {
+    read_console_inner(io, dst, false).expect("uninterruptible console read")
+}
+
+/// A console read interrupted before its first byte returns ERESTARTSYS.
+/// Once a byte has been consumed, the short read wins over a pending signal.
+pub fn read_console_interruptible(io: ConsoleIo, dst: &mut [u8]) -> Result<usize, u32> {
+    read_console_inner(io, dst, true)
+}
+
+fn read_console_inner(io: ConsoleIo, dst: &mut [u8], interruptible: bool) -> Result<usize, u32> {
     if dst.is_empty() {
-        return 0;
+        return Ok(0);
     }
     match io {
-        ConsoleIo::Capture => with_current_console(|proc| {
+        ConsoleIo::Capture => Ok(with_current_console(|proc| {
             let avail = &proc.stdin[proc.stdin_pos..];
             if avail.is_empty() {
                 return 0;
@@ -2009,25 +2028,71 @@ pub fn read_console(io: ConsoleIo, dst: &mut [u8]) -> usize {
             }
             proc.stdin_pos += n;
             n
-        }),
-        ConsoleIo::Serial => read_serial(dst),
-        ConsoleIo::Vt(vt) => read_vt(vt, dst),
+        })),
+        ConsoleIo::Serial => read_serial(dst, interruptible),
+        ConsoleIo::Vt(vt) => read_vt(vt, dst, interruptible),
     }
 }
 
-fn read_serial(dst: &mut [u8]) -> usize {
-    let first = with_current_console(ConsoleState::pop_unread).unwrap_or_else(|| {
+struct ConsoleReadWait {
+    queue: sched::WaitQueue,
+    fired: core::sync::atomic::AtomicBool,
+}
+impl lumen_vfs::PollWaker for ConsoleReadWait {
+    fn wake(&self, _: lumen_vfs::PollMask) {
+        self.fired.store(true, Ordering::SeqCst);
+        self.queue.wake_all();
+    }
+}
+
+/// Subscribe before rechecking input, so an IRQ cannot fall between the
+/// empty read and the park. VT input retains its existing periodic recheck.
+fn wait_console(io: ConsoleIo) -> Result<(), u32> {
+    let wait =
+        Arc::new(ConsoleReadWait { queue: sched::WaitQueue::new(), fired: core::sync::atomic::AtomicBool::new(false) });
+    let _guard = if io == ConsoleIo::Serial {
+        Some(serial_in::subscribe_poll(Arc::clone(&wait) as Arc<dyn lumen_vfs::PollWaker>))
+    } else {
+        None
+    };
+    if stdin_ready(io) {
+        return Ok(());
+    }
+    let deadline = Some(crate::time::now_ns().saturating_add(5_000_000));
+    // The serial interruption fixture controls both wake sources. Remove the
+    // safety deadline there so a host stall cannot masquerade as its second
+    // read and cause the rescue byte to beat the pending signal.
+    #[cfg(feature = "ktest")]
+    let deadline =
+        if io == ConsoleIo::Serial && SERIAL_READ_PHASE.load(Ordering::SeqCst) != 0 { None } else { deadline };
+    if wait.queue.wait_interruptible(deadline, || wait.fired.load(Ordering::SeqCst)) == sched::Wake::Interrupted {
+        Err(super::signal::ERESTARTSYS)
+    } else {
+        Ok(())
+    }
+}
+
+fn read_serial(dst: &mut [u8], interruptible: bool) -> Result<usize, u32> {
+    let first = if let Some(byte) = with_current_console(ConsoleState::pop_unread) {
+        byte
+    } else {
         loop {
             if let Some(b) = serial_in::read_byte() {
-                return b;
+                break b;
             }
-            serial_in::wait();
+            #[cfg(feature = "ktest")]
+            serial_read_window();
+            if interruptible {
+                wait_console(ConsoleIo::Serial)?;
+            } else {
+                serial_in::wait();
+            }
         }
-    });
+    };
 
     // Ctrl-D at start of read -> EOF (0 bytes).
     if first == 0x04 {
-        return 0;
+        return Ok(0);
     }
 
     dst[0] = if first == b'\r' { b'\n' } else { first };
@@ -2046,47 +2111,73 @@ fn read_serial(dst: &mut [u8]) -> usize {
         dst[n] = if b == b'\r' { b'\n' } else { b };
         n += 1;
     }
-    n
+    Ok(n)
 }
 
-fn read_vt(vt: usize, dst: &mut [u8]) -> usize {
-    if let Some(first) = with_current_console(ConsoleState::pop_unread) {
-        if first == 0x04 {
-            return 0;
+#[cfg(feature = "ktest")]
+static SERIAL_READ_PHASE: AtomicU32 = AtomicU32::new(0);
+
+/// Pause the first empty read before choosing its wait, then record a
+/// second empty read so the test can supply data (also rescuing a mutant).
+#[cfg(feature = "ktest")]
+fn serial_read_window() {
+    if SERIAL_READ_PHASE.compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        while SERIAL_READ_PHASE.load(Ordering::SeqCst) == 2 {
+            crate::time::sleep(1_000_000);
         }
-        dst[0] = first;
-        let mut n = 1;
-        while n < dst.len() {
-            let next = with_current_console(|proc| {
-                if proc.has_unread() && proc.unread[proc.unread_pos as usize] == 0x04 {
-                    return None;
-                }
-                proc.pop_unread()
-            });
-            let Some(b) = next else {
-                break;
-            };
-            dst[n] = b;
-            n += 1;
-        }
-        return n;
+    } else {
+        let _ = SERIAL_READ_PHASE.compare_exchange(3, 4, Ordering::SeqCst, Ordering::SeqCst);
     }
+}
+
+fn read_vt(vt: usize, dst: &mut [u8], interruptible: bool) -> Result<usize, u32> {
     loop {
-        let key = crate::vt::wait_key(vt);
+        if let Some(first) = with_current_console(ConsoleState::pop_unread) {
+            if first == 0x04 {
+                return Ok(0);
+            }
+            dst[0] = first;
+            let mut n = 1;
+            while n < dst.len() {
+                let next = with_current_console(|proc| {
+                    if proc.has_unread() && proc.unread[proc.unread_pos as usize] == 0x04 {
+                        return None;
+                    }
+                    proc.pop_unread()
+                });
+                let Some(b) = next else {
+                    break;
+                };
+                dst[n] = b;
+                n += 1;
+            }
+            return Ok(n);
+        }
+        let key = if interruptible {
+            match crate::vt::read_key(vt) {
+                Some(key) => key,
+                None => {
+                    wait_console(ConsoleIo::Vt(vt))?;
+                    continue;
+                }
+            }
+        } else {
+            crate::vt::wait_key(vt)
+        };
         let mut enc = [0u8; 4];
         let len = vt_key_to_bytes(key, &mut enc);
         if len == 0 {
             continue;
         }
         if len == 1 && enc[0] == 0x04 {
-            return 0;
+            return Ok(0);
         }
         let n = len.min(dst.len());
         dst[..n].copy_from_slice(&enc[..n]);
         if n < len {
             with_current_console(|proc| proc.push_unread_bytes(&enc[n..len]));
         }
-        return n;
+        return Ok(n);
     }
 }
 
@@ -3798,3 +3889,108 @@ pub fn priority(which: i32, who: i32, nice: Option<i32>) -> Result<u64, u32> {
     let caller = current_thread();
     PROCS.lock().priority(&caller, which, who, nice)
 }
+
+crate::ktest!(
+    fn serial_read_interrupts_and_restarts_after_sigreturn() {
+        use crate::arch::syscall::SyscallFrame;
+        use crate::linux::{signal as delivery, syscall};
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        use lumen_signal::restart::{RestartCode, SyscallExit};
+        in_test_process(|_| {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    SERIAL_READ_PHASE.store(0, Ordering::SeqCst);
+                }
+            }
+            let _reset = Reset;
+            with_current_console(|c| c.io = ConsoleIo::Serial);
+            kassert!(!stdin_ready(ConsoleIo::Serial));
+            for restart in [false, true] {
+                set_current_action(
+                    Signal::INT,
+                    KernelSigaction {
+                        handler: 0x400100,
+                        restorer: 0x400200,
+                        flags: u64::from(general::SA_RESTORER | if restart { general::SA_RESTART } else { 0 }),
+                        ..Default::default()
+                    },
+                );
+                let tid = Arc::new(AtomicU32::new(0));
+                let child_tid = Arc::clone(&tid);
+                SERIAL_READ_PHASE.store(1, Ordering::SeqCst);
+                let worker = spawn_test_thread(move |tid| {
+                    child_tid.store(tid, Ordering::SeqCst);
+                    let mut frame = SyscallFrame {
+                        rax: u64::from(general::__NR_read),
+                        rdi: 0,
+                        rsi: KTEST_USER_VA,
+                        rdx: 1,
+                        rip: 0x400002,
+                        rsp: KTEST_USER_VA + KTEST_USER_LEN,
+                        cs: 0x23,
+                        ss: 0x1b,
+                        rflags: 0x202,
+                        ..Default::default()
+                    };
+                    syscall::dispatch(&mut frame);
+                    kassert_eq!(frame.rax, delivery::restart_result(RestartCode::Sys));
+                    kassert!(delivery::exit_to_user(&mut frame, SyscallExit::new(u64::from(general::__NR_read))));
+                    kassert_eq!(frame.rip, 0x400100);
+                    frame.rsp += 8;
+                    frame.r11 = 0x202;
+                    delivery::frame::restore(&mut frame).map_err(|_| "serial read sigreturn")?;
+                    if restart {
+                        kassert_eq!(frame.rax, u64::from(general::__NR_read));
+                        kassert_eq!(frame.rip, 0x400000);
+                        // Execute the rewound read again. It finds no input;
+                        // only after that is observed does the parent inject z.
+                        frame.rip += 2;
+                        syscall::dispatch(&mut frame);
+                        kassert_eq!(frame.rax, 1);
+                        let mut byte = [0];
+                        crate::user::copy_from_user(&mut byte, KTEST_USER_VA).map_err(|_| "serial read byte")?;
+                        kassert_eq!(byte, [b'z']);
+                    } else {
+                        kassert_eq!(frame.rax, (-(errno::EINTR as i64)) as u64);
+                        kassert_eq!(frame.rip, 0x400002);
+                    }
+                    kassert!(!delivery::exit_to_user(&mut frame, None));
+                    Ok(())
+                })?;
+                while SERIAL_READ_PHASE.load(Ordering::SeqCst) != 2 && !worker.finished() {
+                    crate::time::sleep(1_000_000);
+                }
+                let empty = !serial_in::available();
+                let reached = SERIAL_READ_PHASE.load(Ordering::SeqCst) == 2;
+                let sent = send_thread(
+                    None,
+                    tid.load(Ordering::SeqCst),
+                    Some(SigInfo::new(Signal::INT, 0)),
+                    SenderClass::SiUser,
+                );
+                SERIAL_READ_PHASE.store(3, Ordering::SeqCst);
+                while SERIAL_READ_PHASE.load(Ordering::SeqCst) != 4 && !worker.finished() {
+                    crate::time::sleep(1_000_000);
+                }
+                let second_empty = SERIAL_READ_PHASE.load(Ordering::SeqCst) == 4;
+                if second_empty {
+                    // Also rescues an uninterruptible first read: that mutant
+                    // returns a byte and fails the ERESTARTSYS assertion.
+                    serial_in::inject_for_test(b'z');
+                }
+                let result = worker.join()?;
+                SERIAL_READ_PHASE.store(0, Ordering::SeqCst);
+                let leftover = serial_in::read_byte();
+                result?;
+                kassert!(reached && empty);
+                kassert_eq!(sent, Ok(()));
+                kassert_eq!(second_empty, restart);
+                kassert_eq!(leftover, None);
+                kassert_eq!(serial_in::poll_subscribers(), 0);
+            }
+            Ok(())
+        })?
+    }
+);
