@@ -91,9 +91,11 @@ impl Drop for IrqOff {
     }
 }
 
-/// How many critical sections are open on this CPU.
+/// How many critical sections are open on the calling thread's CPU.
+/// Enabled interrupts imply zero: every section clears IF and switching
+/// requires depth zero. Otherwise IF is clear, so the CPU index is stable.
 pub fn depth() -> usize {
-    DEPTH[percpu::index()].load(Ordering::Relaxed)
+    if enabled() { 0 } else { DEPTH[percpu::index()].load(Ordering::Relaxed) }
 }
 
 /// Turn interrupts on, outside any critical section (boot, once everything

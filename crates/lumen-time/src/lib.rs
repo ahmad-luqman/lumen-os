@@ -22,6 +22,17 @@ use core::fmt;
 pub mod handoff;
 pub mod rtc;
 
+/// A round-robin scheduler's slice at Linux nice `nice`: ten ticks at nice zero,
+/// scaled by Linux's sched_prio_to_weight, rounded down and clamped to
+/// 1..=100 ticks. Inputs outside -20..=19 use the nearest endpoint.
+pub fn slice_ticks(nice: i8) -> u32 {
+    const WEIGHTS: [u32; 40] = [
+        88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501,
+        1991, 1586, 1277, 1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+    ];
+    (10 * WEIGHTS[(nice.clamp(-20, 19) + 20) as usize] / 1024).clamp(1, 100)
+}
+
 pub const NS_PER_SEC: u64 = 1_000_000_000;
 /// The PIT's input clock.
 pub const PIT_HZ: u64 = 1_193_182;
@@ -841,6 +852,23 @@ mod tests {
     use std::string::ToString;
 
     use super::*;
+
+    #[test]
+    fn nice_slices_follow_linux_weights_and_clamp() {
+        let expected = [
+            100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 93, 74, 59, 47, 38, 30, 24, 19, 15, 12, 10, 8, 6, 5, 4,
+            3, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        ];
+        for (nice, ticks) in (-20..=19).zip(expected) {
+            assert_eq!(slice_ticks(nice), ticks, "nice {nice}");
+        }
+        for nice in i8::MIN..-20 {
+            assert_eq!(slice_ticks(nice), 100);
+        }
+        for nice in 20..=i8::MAX {
+            assert_eq!(slice_ticks(nice), 1);
+        }
+    }
 
     fn window(tsc: u64, start_gap: u64, end_gap: u64) -> Window {
         Window { tsc, reference: 1, polls: 1, start_gap, end_gap }

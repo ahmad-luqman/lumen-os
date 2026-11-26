@@ -3950,7 +3950,7 @@ crate::ktest!(
                 stop,
                 handle: Some({
                     let probe = probe.clone();
-                    sched::spawn_user_on(other_cpu, "b7-trunc-probe", space2.clone(), move || {
+                    sched::spawn_user_pinned_on(other_cpu, "b7-trunc-probe", space2.clone(), move || {
                         let ok0 = read_u32_nofault(s2_shared) == Ok(P0_VAL);
                         let ok1 = read_u32_nofault(s2_shared + P) == Ok(P1_VAL);
                         let ok2 = read_u32_nofault(s2_shared + 2 * P) == Ok(P2_VAL);

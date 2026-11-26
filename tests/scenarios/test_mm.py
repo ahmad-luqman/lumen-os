@@ -171,12 +171,16 @@ def test_heap_command_reports_usage(boot):
     # and the process table's nodes, #372), and the shells (their
     # editors and histories, the screen shells' threads and the keyboard's
     # wait queue they block in) is in use (91 allocations when the VFS mounts
-    # arrived, 95 before pid 1, 101 with it; the ceiling leaves 9 for
-    # growth); the rest of what the heap mapped is free.
+    # arrived, 95 before pid 1, 101 with it, 102 on main before B6, and
+    # 116 allocations with B6's per-CPU run-queue reservations). B6 keeps
+    # ready and sleeper buffers for all 8 CPU slots: CPU 0 already had both,
+    # so the other 7 slots add 14 allocations, even in this single-CPU boot.
+    # The ceiling leaves the same 9 for growth; the rest of what the heap
+    # mapped is free.
     # (`discovery_keeps_nothing_it_does_not_return` checks that ACPI
     # discovery frees what it doesn't keep.)
     assert heap["base"] == HEAP_BASE, heap
-    assert 0 < heap["live"] <= 110, (
+    assert 0 < heap["live"] <= 125, (
         f"{heap}: nothing kept at boot (did acpi::init fail?), or a leak"
     )
     assert 0 < heap["largest"] <= heap["free"] < heap["mapped"], heap

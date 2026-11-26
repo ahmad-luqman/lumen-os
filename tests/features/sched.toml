@@ -159,3 +159,59 @@ tests = [
     "ktest:lumen_kernel::user::nofault_access_answers_fault_without_paging_in",
     "harness:test_audit::test_nofault_fixup_section_is_read_only_and_in_rodata",
 ]
+
+[[feature]]
+name = "SMP work stealing and affinity: explicit balance passes move saved Ready threads to idle CPUs, preserve pinned threads; wakes and signal kicks follow affinity and remove old deadlines (#377, B6)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::sched::threads_migrate_to_idle_cpus",
+    "ktest:lumen_kernel::sched::balancing_skips_pinned_donor_and_moves_user_roots",
+    "ktest:lumen_kernel::sched::pinned_threads_never_migrate",
+    "ktest:lumen_kernel::sched::affinity_wakes_and_kicks_follow_migration",
+]
+
+[[feature]]
+name = "Nice priorities scale round-robin time slices using Linux's weights, clamped to 1 through 100 ticks (#377, B6)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::sched::nice_scales_slices",
+    "cargo:lumen-time",
+]
+
+[[feature]]
+name = "User migration preserves XMM registers, GPRs, TLS, stacks, deferred debug traps and pending-signal flags, and tracks the loaded address space on its new CPU (#377, B6)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::sched::migration_keeps_user_state",
+    "ktest:lumen_kernel::sched::migration_keeps_deferred_state",
+]
+
+[[feature]]
+name = "Migration waits for the outgoing stack save: a real context switch stalled before assembly leaves its Ready thread on_cpu, unstealable and unmoved by affinity until finish_switch (#377, B6)"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::sched::migration_waits_for_complete_switch"]
+
+[[feature]]
+name = "Fork inherits affinity and nice; serial input is safe on non-boot CPUs (#377, B6)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::process::fork_inherits_affinity_and_nice",
+    "ktest:lumen_kernel::serial_in::reads_queued_input_on_non_boot_cpu",
+]
+
+[[feature]]
+name = "Automatic balancing counts runnable threads; timer wakes honor affinity for sleeps and deadline waits (#377, B6)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::sched::automatic_balancer_moves_runnable_threads",
+    "ktest:lumen_kernel::sched::sleeping_deadline_follows_affinity",
+    "ktest:lumen_kernel::sched::wait_deadline_follows_affinity",
+]
+
+[[feature]]
+name = "Kernel and user-probe pins are immutable; fallible queue reservations roll back unpublished counts (#377, B6)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::sched::affinity_refuses_immutable_pins",
+    "ktest:lumen_kernel::sched::queue_reservations_fail_and_roll_back",
+]

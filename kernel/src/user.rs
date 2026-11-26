@@ -832,8 +832,9 @@ impl Drop for Dr0Guard {
 
 type ResultSlot = Arc<SpinLock<Option<RunResult>>>;
 
-/// Spawn a pinned user thread on `cpu` executing `(entry, rsp)` inside `space`,
-/// returning `(JoinHandle, result_slot)`.
+/// Spawn a user thread executing `(entry, rsp)` inside `space`, returning
+/// `(JoinHandle, result_slot)`. Test programs and DR0 probes are pinned at
+/// birth for their CPU-local measurements; ordinary roots may migrate.
 #[allow(clippy::too_many_arguments)]
 fn spawn_ring3_on(
     cpu: usize,
@@ -851,7 +852,8 @@ fn spawn_ring3_on(
     let stdio = Stdio::open().map_err(|_| "cannot open the process's stdio")?;
     let result_slot: ResultSlot = Arc::new(SpinLock::new(None));
     let out = result_slot.clone();
-    let handle = sched::spawn_user_on(cpu, name, space, move || {
+    let pinned = allow_test_syscalls || dr0_target.is_some();
+    let run = move || {
         let _pid = register_current(io, allow_test_syscalls, stdin, exe_path, stdio);
 
         let lstar_before = arch::idt::DEFERRED_LSTAR_DB.load(Ordering::Relaxed);
@@ -877,14 +879,19 @@ fn spawn_ring3_on(
         });
         // `take_current` took this thread off the space and gave up the
         // process's user of it (torn down, with interrupts on, as the last).
-    })
+    };
+    let handle = if pinned {
+        sched::spawn_user_pinned_on(cpu, name, space, run)
+    } else {
+        sched::spawn_user_on(cpu, name, space, run)
+    }
     .map_err(|_| "failed to spawn user thread")?;
     Ok((handle, result_slot))
 }
 
 /// Run a loaded Linux ELF64 process in ring 3 with the given interactive
-/// console target (`allow_test_syscalls == false`). Serial console processes
-/// are pinned to CPU 0 because `serial_in` drains COM1 IRQ 4 on the boot CPU.
+/// console target (`allow_test_syscalls == false`), eligible on every CPU.
+/// `serial_in` serializes migrated readers with COM1 IRQ 4.
 /// `exe_path` is recorded for `/proc/<pid>/exe` (a binary loaded by path).
 #[cfg_attr(feature = "ktest", allow(dead_code))]
 pub fn run_elf_process(
@@ -895,7 +902,7 @@ pub fn run_elf_process(
     io: ConsoleIo,
     exe_path: Option<Arc<[u8]>>,
 ) -> Result<UserExit, &'static str> {
-    let cpu = if matches!(io, ConsoleIo::Serial) { 0 } else { arch::cpu_index() };
+    let cpu = arch::cpu_index();
     let (handle, slot) = spawn_ring3_on(cpu, name, space, entry, rsp, None, io, false, Vec::new(), exe_path)?;
     handle.join();
     let res = slot.lock().take().expect("linux process finished without RunResult");

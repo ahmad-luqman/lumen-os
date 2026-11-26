@@ -19,8 +19,8 @@
 //! - **Interrupt:** moves the waiting bytes into [`QUEUE`] while it has
 //!   room, and wakes the reader. Bytes past its room stay in the UART
 //!   (QEMU holds the rest back; a real UART overruns and drops them).
-//! - **Reading** ([`read_byte`], the serial shell on the boot CPU's `main`
-//!   thread, with interrupts off so the handler can't run in between): the
+//! - **Reading** ([`read_byte`], on any CPU, serialized with IRQ 4
+//!   by the interrupts-off receive lock): the
 //!   queue first, then the UART, for bytes the handler left there. In the
 //!   worst case the design guards against, the interrupt is an edge and no
 //!   new one comes until the reader lowers the line by taking them, so
@@ -50,7 +50,7 @@
 //!   the thread can block (not before the boot CPU's scheduler runs);
 //!   otherwise, or without the interrupt (no route, or one refused), yield
 //!   once per look: the shell polls, as it used to.
-// (The test kernel runs no shell: nothing here is called there.)
+// The test kernel runs no shell; its receive test supplies queued bytes.
 #![cfg_attr(feature = "ktest", allow(dead_code))]
 
 use alloc::string::String;
@@ -79,9 +79,14 @@ const QUEUE_SIZE: usize = 256;
 /// safety net for an interrupt that doesn't come. (The CPU halts between.)
 const WAIT_NS: u64 = 100_000_000;
 
-/// Received bytes, from the interrupt handler (the producer: the boot CPU
-/// with interrupts off) to [`read_byte`] (the consumer: the serial shell).
+/// Received bytes passed from the interrupt handler to [`read_byte`].
+/// Every push and pop holds `RECEIVE`, which serializes access across CPUs
+/// and also protects the UART fallback and interrupt drain.
 static QUEUE: ByteQueue<QUEUE_SIZE> = ByteQueue::new();
+/// Serializes queue consumption, UART reads and IRQ 4 drains. Never held
+/// while waking waiters or notifying poll subscribers (their readiness
+/// callbacks may take this lock).
+static RECEIVE: SpinLock<()> = SpinLock::new(());
 /// The serial shell waits here for a byte.
 static WAITING: WaitQueue = WaitQueue::new();
 /// Readiness subscribers waiting on `/dev/console` serial input (`poll`/`select`,
@@ -183,9 +188,10 @@ fn on_irq() {
 /// Move the waiting bytes into the queue while it has room (the rest stay
 /// in the UART), then wake the serial shell's wait queue (counting a wake that
 /// readied it) and notify [`POLL_HEAD`] subscribers with `POLLIN | POLLRDNORM`;
-/// returns how many bytes were queued. With interrupts off, on the boot CPU:
-/// the queue's only producer.
+/// returns how many bytes were queued. Every push holds `RECEIVE`, as does
+/// every pop by a reader; the lock is released before wake/notify.
 fn queue_waiting() -> usize {
+    let receive = RECEIVE.lock();
     let room = QUEUE_SIZE - QUEUE.len();
     if room == 0 {
         return 0;
@@ -195,6 +201,7 @@ fn queue_waiting() -> usize {
         let fit = QUEUE.push(b);
         debug_assert!(fit, "drained only as much as the queue has room for");
     });
+    drop(receive);
     if queued > 0 {
         if WAITING.wake_all() > 0 {
             READER_WOKEN.fetch_add(1, Ordering::Relaxed);
@@ -248,34 +255,27 @@ pub fn poll_subscribers() -> usize {
     head.map_or(0, |h| h.subscriber_count())
 }
 
-/// Whether a byte waits for [`read_byte`], in the queue or the UART.
-/// Caller must hold interrupts off on the boot CPU so IRQ 4 cannot drain
-/// between checking the queue and reading LSR.
-fn available_locked() -> bool {
+/// Whether a byte waits, serialized with the handler's drain and other
+/// readers. Safe from wait-queue readiness callbacks on any CPU.
+pub fn available() -> bool {
+    let _receive = RECEIVE.lock();
     arch::serial::available(!QUEUE.is_empty())
 }
 
-/// Whether a byte waits for [`read_byte`], in the queue or the UART.
-pub fn available() -> bool {
-    let _off = arch::irq::push_off();
-    available_locked()
-}
-
-/// The next received byte, if one is waiting: the queue's, else the UART's
-/// (the module doc). Never blocks. The serial shell's only (the queue's
-/// one consumer), on the boot CPU.
+/// The next received byte, queue first and then UART. Never blocks. The
+/// receive lock serializes multiple CPUs with each other and IRQ 4, so
+/// only one consumer advances the queue or reads the UART at a time.
 pub fn read_byte() -> Option<u8> {
-    let _off = arch::irq::push_off();
+    let _receive = RECEIVE.lock();
     let popped = QUEUE.pop();
     arch::serial::read_next(popped)
 }
 
 /// Wait for a received byte (see [`read_byte`]; the caller looks again
 /// afterwards), as `lumen_uart::wait_mode` says: block with the deadline,
-/// block for good, or yield once. The serial shell's only, on the boot
-/// CPU.
+/// block for good, or yield once. Safe for a reader on any CPU; another
+/// reader may consume the byte before the caller runs, so it rechecks.
 pub fn wait() {
-    debug_assert!(arch::cpu_index() == 0, "the serial shell waits on the boot CPU");
     let present = arch::serial::present();
     let by_interrupt = BY_INTERRUPT.load(Ordering::Acquire);
     match lumen_uart::wait_mode(present, by_interrupt, crate::sched::can_block_now()) {
@@ -291,7 +291,7 @@ fn wait_with_deadline() {
     let woken_before = READER_WOKEN.load(Ordering::Relaxed);
     FIRST_INPUT_IRQ_NS.store(u64::MAX, Ordering::Relaxed);
     let deadline = crate::time::now_ns() + WAIT_NS;
-    let found = WAITING.wait_until_or_deadline(deadline, available_locked);
+    let found = WAITING.wait_until_or_deadline(deadline, available);
     let woken = || READER_WOKEN.load(Ordering::Relaxed) != woken_before;
     let past_deadline = crate::time::now_ns() >= deadline;
     if lumen_uart::another_period(found, woken(), !QUEUE.is_empty(), past_deadline) {
@@ -392,3 +392,40 @@ pub fn serial_command(ctx: &mut Ctx<'_>, args: &[String]) {
     }
     let _ = ctx.out.write_str(&t);
 }
+
+crate::ktest!(
+    fn reads_queued_input_on_non_boot_cpu() {
+        use crate::{kassert, kassert_eq, sched};
+        let cpu = sched::running_cpus().into_iter().find(|&cpu| cpu != 0).ok_or("needs an AP")?;
+        const INPUT: &[u8; 4] = b"B6\r\n";
+        {
+            let _receive = RECEIVE.lock();
+            kassert!(QUEUE.is_empty());
+            for &byte in INPUT {
+                kassert!(QUEUE.push(byte));
+            }
+        }
+        let result = Arc::new(SpinLock::new(None));
+        let out = result.clone();
+        let h = sched::spawn_on(cpu, "serial-reader", move || {
+            wait(); // the test kernel uses the polled path, on this AP
+            let ready = available();
+            let bytes = core::array::from_fn::<_, 4, _>(|_| read_byte());
+            // Exercise the UART fallback too, after consuming the queue.
+            let empty = read_byte();
+            *out.lock() = Some((arch::cpu_index(), ready, bytes, empty));
+        })
+        .map_err(|e| {
+            crate::ktest::diag(format_args!("serial reader: {e}"));
+            "spawn serial reader"
+        })?;
+        sched::join_bounded(h)?;
+        let (ran, ready, bytes, empty) = result.lock().take().ok_or("reader result")?;
+        kassert_eq!(ran, cpu);
+        kassert!(ready);
+        kassert_eq!(bytes, INPUT.map(Some));
+        kassert_eq!(empty, None);
+        kassert!(QUEUE.is_empty());
+        Ok(())
+    }
+);

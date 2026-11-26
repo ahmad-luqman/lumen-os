@@ -118,8 +118,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
    Reading is by interrupt once the shells start (`serial_in`, #120; not
    in the test kernel, whose two ktests that read COM1 read it
    themselves). The UART has one reader, `serial_in` (plus those ktests in
-   the test kernel; its calls assert the boot CPU): received bytes keep
-   their order only while that holds. ISA IRQ 4 is routed like the
+   the test kernel). Its interrupts-off receive lock serializes readers
+   on any CPU with IRQ 4's drain, preserving queue/UART ordering. ISA IRQ 4 is routed like the
    keyboard's (section 6, "Keyboard"); a route that is level-triggered or
    active-low (a MADT override; `Route::trigger` and `polarity` say so)
    isn't used (a warning; the shell polls; not tested). The UART
@@ -134,8 +134,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
    is an edge that doesn't come again until the reader lowers the line by
    taking the waiting bytes (QEMU raises it again whenever bytes wait), so
    the reader takes the queue's bytes, then the UART's, with interrupts
-   off on the boot CPU (the queue's producer), and the serial shell blocks
-   only while neither holds a byte (`lumen_uart::read_next` and
+   off under the receive lock. The handler releases it before wake/notify,
+   and a reader blocks only while neither holds a byte (`lumen_uart::read_next` and
    `available`, host-tested against a model of that worst case). The
    block has a 100 ms deadline as a safety net: input whose interrupt
    never wakes the shell is still read, within 200 ms (input found at the
@@ -2070,15 +2070,15 @@ on another; both return a `JoinHandle`, whose `join` blocks until the
 thread has finished and its CPU's `finish_switch` is done with it (its
 stack and joiners' list freed, its reference dropped), so nothing that CPU
 frees for it lands after `join` returns (#183; its record goes when a later
-spawn prunes it). In M2–M7, a thread **never moves between CPUs** (M8 lifts
-this for user threads and threads spawned migratable, with work stealing
-and section 5's `TLB_SHOOTDOWN` IPIs: "SMP migration" below): each
-CPU has its own run queue (a FIFO) and only that CPU takes
-threads off it, so once its spawner has laid out its first frame, a
-thread's saved registers are touched only by its home CPU with interrupts
-off. A wake from another CPU queues the thread there and sends the
-`WAKEUP` IPI, so a halted CPU needn't wait for its next tick to run it (the
-IPI is tested; how soon the thread runs isn't, a loaded host decides it).
+spawn prunes it). `spawn` and `spawn_on` keep kernel threads pinned;
+unpinned user threads (roots, and fork children within the inherited mask)
+and `spawn_migratable` threads may move between allowed CPUs
+(M8 B6, "SMP migration" below). Each CPU has a round-robin run queue.
+Only a Ready thread with its full context saved (`on_cpu` clear) moves;
+source and destination queue locks serialize placement. A wake from any
+CPU queues the thread on its current queue, then redirects it if affinity
+requires, after its outgoing save completes. `WAKEUP` IPIs wake halted
+CPUs (the IPI is tested; how soon a thread runs depends on the host).
 
 - **Switching** (`arch::context::switch`, naked asm): pushes the
   callee-saved registers (rbx, rbp, r12-r15), saves `rsp`, loads the next
@@ -2096,7 +2096,8 @@ IPI is tested; how soon the thread runs isn't, a loaded host decides it).
   its return address, which calls `sched::thread_entry` with `rbp` = 0, so
   its backtraces end there.
 - **Preemption:** round robin on every CPU's 1 kHz local APIC timer: a
-  thread runs 10 ticks (`SLICE_TICKS`) before the next ready thread on its
+  thread at nice 0 runs 10 ticks (`SLICE_TICKS`), scaled by its Linux nice
+  weight and clamped to 1..=100, before the next ready thread on its
   CPU gets a turn (the idle thread gives way at once when the wakeup IPI
   ends its halt, or at the next tick while it runs a `run_on` job); the
   timer interrupt (after its EOI) switches, and the preempted thread later
@@ -2104,8 +2105,11 @@ IPI is tested; how soon the thread runs isn't, a loaded host decides it).
   own ticks (a ktest checks two threads' turns 20 ticks apart). Under TCG
   ticks arrive late, so slices are longer in time; tests bound waits by
   progress. The timer never allocates: each CPU's queues have room for
-  every thread homed there (checked by a ktest, and asserted on every
-  push).
+  every live thread, regardless of its placement (checked by ktests and
+  asserted on every push). Each spawn reserves ready and sleeper slots
+  on all eight CPU slots before constructing or publishing its thread;
+  allocation failure returns `SpawnError::NoMemory`, and a reservation
+  guard rolls back counts on failure.
 - **Calls:** `yield_now`; `sleep(ns)` (a deadline from `now_ns`, checked by
   each tick on the thread's CPU, so it never wakes early; it runs once its
   turn comes after that); `exit` (returning from the entry point does it);
@@ -2178,9 +2182,8 @@ IPI is tested; how soon the thread runs isn't, a loaded host decides it).
 - **Observability:** every switch records a `switch` trace event (previous
   and next thread's ids, the previous thread's state), and the serial crash
   report names the running thread (`thread: <name> (id N)`).
-- **Not yet:** priorities, migration or load balancing, and a per-thread
-  CPU time count (`top`, #63); M8 adds the first three and the tick counts
-  below (designed in #336).
+- **Accounting:** `top` samples per-thread timer ticks; C12 supplies the
+  user/system split and syscall-visible tick counts below.
 
 **SMP migration, priorities and affinity (designed in #336, M8; B6).**
 M8's threads share address spaces and its gate runs parallel builds, so
@@ -2193,34 +2196,56 @@ threads move to idle CPUs:
   until that CPU's `finish_switch` after switching away, Linux's
   `task_on_cpu`) keeps a thread whose registers aren't saved yet from
   being taken: only a `Ready` thread with `on_cpu` clear moves. A thread
-  that is running, sleeping, blocked or dead never moves; a wake queues it
-  on its `cpu` (if its affinity still allows that CPU, else on the lowest
-  allowed online one) and sends `WAKEUP`, as today. A dead thread's stack
+  that is running, sleeping, blocked or dead never moves. A wake locks its
+  current queue, removes its old deadline, and queues it there. If affinity
+  excludes that CPU, it moves to the lowest allowed online CPU once its
+  save is complete: immediately when `on_cpu` is clear, otherwise in
+  `finish_switch`. Timer-expired sleepers are routed after dropping the
+  old queue lock (`route_ready`), including deadline waits also on a
+  WaitQueue. The destination receives `WAKEUP`. A dead thread's stack
   is still freed by the next thread on the CPU it died on.
 - **Work stealing:** an idle CPU, in `idle_loop` before it halts, and
   every CPU every `BALANCE_TICKS` (100) ticks, looks for the online CPU
-  with the most ready threads; if that CPU has at least two more than it
-  has, it takes the ready thread queued last there that may run on it
+  with the most queued threads; under both queue locks it compares
+  runnable counts (queued plus a running non-idle thread). If the donor
+  has at least two more runnable threads, it takes the ready thread
+  queued last there that may run on it
   (affinity) and isn't `on_cpu`, holding both run queues' locks in
   ascending CPU order, and records an X-ray `runq` event on both. The
-  timer must not allocate (section 5's heap rule), so each spawn reserves
-  a slot in every CPU's run queue, not only its home's: a steal never
-  grows a queue (32 KiB at `MAX_STACKS` threads on 8 CPUs).
+  next donor is tried if the busiest queue has no eligible thread or no
+  longer meets the threshold. The timer must not allocate (section 5's heap
+  rule), so each spawn reserves a ready slot and a sleeper slot in every CPU's queues, not only its
+  home's: neither migration nor a timer tick grows either queue.
+  `Cpu::reserved` counts live threads plus pending spawn reservations.
+  `try_reserve` fails with `NoMemory` before `Thread::spawned`; the guard
+  rolls back all counts acquired so far. Fork maps that error to `ENOMEM`.
 - **Priorities:** `Thread::nice` (-20..=19, 0 at spawn, inherited by
   `fork` and `clone`; `setpriority`) scales the slice: `SLICE_TICKS` (10)
   times the thread's weight over nice 0's, from Linux's
   `sched_prio_to_weight` table (1024 at nice 0, each step about 1.25
-  times), clamped to 1..=100 ticks. The run queue stays one FIFO per CPU:
+  times), clamped to 1..=100 ticks. Each CPU remains round-robin:
   a thread of higher priority runs longer when its turn comes, not sooner.
-- **Affinity:** `Thread::affinity` (a CPU mask). Every M2–M7 kernel thread
-  stays where it is: `spawn` and `spawn_on` give a mask of the one CPU
-  they start it on, so the idle threads (never queued), `run_on` jobs (run
-  on the idle thread), `sched::scope`'s threads, `perf burn`, `trace xray
-  spin` and every driver thread keep their CPU. `spawn_migratable(name,
-  f)` starts a thread allowed on every CPU; `spawn_user_on` (ring-3
-  threads, from `fork` and `clone`) does so too, and `sched_setaffinity`
-  narrows a user thread's mask (a running thread moves at its next
-  switch).
+- **Affinity and immutable pins:** `Thread::affinity` is a CPU mask.
+  `spawn` and `spawn_on` install a permanent pin and a one-CPU mask, so
+  idle threads (never queued), `run_on` jobs, scoped threads, `perf burn`,
+  X-ray spin workers and driver threads keep their CPU. `set_affinity`
+  refuses all changes to pinned threads (`AffinityError::Pinned`) and
+  masks with no online CPU (`NoOnlineCpu`); C12 maps both to `EINVAL`.
+  `spawn_migratable` and root `spawn_user_on` threads start with all
+  `MAX_CPUS` bits; target selection intersects the stored mask with online
+  CPUs. `spawn_user_pinned_on` pins CPU-local test programs and DR0 probes
+  at construction, before they can run. `spawn_fork_child` inherits the
+  parent's mask and nice with interrupts off, along with its FPU snapshot:
+  it starts on the caller's CPU if allowed, otherwise the lowest allowed
+  online CPU. A running thread excluded by a new mask leaves at its next
+  switch, forced by the next timer tick even if its slice remains; a blocked
+  or sleeping thread moves only after waking.
+- **Serial-console readers:** roots and children may read on any CPU.
+  `serial_in::RECEIVE`, an interrupts-off lock, serializes queue consumers
+  and their UART fallback with IRQ 4's drain. The handler releases it
+  before waking waiters or notifying poll subscribers; readiness callbacks
+  can take it without reversing the wait-queue lock order. Serial roots
+  therefore need no CPU-0 affinity restriction.
 - **Per-thread CPU state on migration:** a user thread's `fs_base`, FPU
   state, `TSS.rsp0` and `PerCpu.kernel_rsp` are already loaded at every
   switch to it from its own fields (the switch order above), and saved at
@@ -2231,10 +2256,19 @@ threads move to idle CPUs:
   answer runs pinned or with interrupts off, as before.
 - **Tick counts (C12):** section 8's model.
 - Tested by `ktest:lumen_kernel::sched::threads_migrate_to_idle_cpus`,
+  `ktest:lumen_kernel::sched::balancing_skips_pinned_donor_and_moves_user_roots`
+  (a pinned busiest donor cannot hide movable user roots on another CPU),
   `ktest:lumen_kernel::sched::pinned_threads_never_migrate`,
   `ktest:lumen_kernel::sched::nice_scales_slices`,
-  `ktest:lumen_kernel::sched::migration_keeps_user_state` and
-  `scenario:test_smp::test_multithreaded_workload_uses_all_cpus` (C11:
+  `ktest:lumen_kernel::sched::migration_keeps_user_state`,
+  `ktest:lumen_kernel::sched::automatic_balancer_moves_runnable_threads`,
+  `ktest:lumen_kernel::sched::sleeping_deadline_follows_affinity`,
+  `ktest:lumen_kernel::sched::wait_deadline_follows_affinity`,
+  `ktest:lumen_kernel::sched::affinity_refuses_immutable_pins`,
+  `ktest:lumen_kernel::sched::queue_reservations_fail_and_roll_back`,
+  `ktest:lumen_kernel::linux::process::fork_inherits_affinity_and_nice`,
+  `ktest:lumen_kernel::serial_in::reads_queued_input_on_non_boot_cpu`,
+  and `scenario:test_smp::test_multithreaded_workload_uses_all_cpus` (C11:
   threads pinned to each CPU, confirmed by `getcpu`, each make progress;
   section 15, "M8's tests", says what each checks).
 
@@ -2713,7 +2747,7 @@ pipelines, `pipe.rs`; the deliberate faults, `crash.rs`; `trace runq` and
     started (the share of ticks that didn't find the idle thread running:
     the scheduler counts each tick against the running thread and, on the
     idle thread, as idle; sampling at 1 kHz; a ktest spins on a CPU and
-    leaves it idle and checks both), and the threads homed there
+    leaves it idle and checks both), and the threads currently placed there
     (`sched::threads`, a registry of weak references); then CPUs stuck
     starting, and in the header those halted past `MAX_CPUS` (neither
     tested). An idle boot CPU reads nearly 100% busy only where the serial
@@ -4768,15 +4802,13 @@ but `robust_list`); each later issue adds its own.
   thread `clone` hands the new thread the caller's); `execve`, which runs
   with one thread left, replaces both (below). A syscall finds its process
   through `UserThreadState::linux`, without a table lookup.
-- **`UserSlot`'s `Sync`** rests today on "a thread never migrates". From
-  B6 it rests on this: only the owning thread, with interrupts off, or the
-  CPU that has claimed it through `on_cpu`
+- **`UserSlot`'s `Sync`** rests on exclusive ownership: only the owning
+  thread, with interrupts off, or the CPU that has claimed it through `on_cpu`
   (section 6's migration) touches the slot, and `Drop` runs when no other
   reference exists.
-- **`spawn_user_on`** keeps its root-thread interface. C1 adds
-  **`spawn_fork_child`**, taking the `Arc<UserThread>`, address space and
-  TLS base, inheriting the caller's FPU state and pinning to its CPU;
-  B6 makes fork children migratable. A thread spawned before its pid or
+- **`spawn_user_on`** starts migratable roots. **`spawn_fork_child`** takes
+  the `Arc<UserThread>`, address space and TLS base, inheriting the caller's
+  FPU state, affinity and nice. Fork children may migrate within that mask. A thread spawned before its pid or
   tid exists (`fork`, `clone` step 1) gets them through `Process::pid` and
   `UserThread::tid`, atomics stored once in the `PROCS` hold that
   allocates them, before the thread's start gate opens; nothing reads them
@@ -8564,11 +8596,17 @@ holding only locks above it.
        nests inside it); and B3's interim `serial_in::POLL_HEAD` holder
        (cloned and released before calling `notify`, never nested with
        another lock; gone once C10 moves the console to `Tty`)
-    f. VirtioHal::TABLE; WaitQueue locks; the scheduler's run queues (two
-       at once only for a steal, in ascending CPU order, section 6)
-    g. Thread::name (a leaf, no allocation, no further locks; only the
+    f. VirtioHal::TABLE; WaitQueue locks; the scheduler's run queues
+       (two in ascending CPU order for stealing, affinity relocation from
+       set_affinity/wake/kick/route_ready, or finish_switch, section 6).
+       Signal locks may enclose kick; no run queue holder takes a wait
+       queue lock
+    g. serial_in::RECEIVE (a leaf taken under a 10f wait-queue lock by
+       readiness callbacks, and by readers and IRQ 4; the handler releases
+       it before wake/notify)
+    h. Thread::name (a leaf, no allocation, no further locks; only the
        owner writes after construction; crash readers use try_lock)
-    h. heap -> page tables -> frame allocator (section 5);
+    i. heap -> page tables -> frame allocator (section 5);
        frame::REFS is a leaf lock, taken only to copy out its boot-reserved
        table and released before any other lock or count update
 ```
@@ -11084,14 +11122,33 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `/proc/self/maps` and the argument budget the new limit gives;
   `gettid` and `set_tid_address` on the new model.
 - `ktest:lumen_kernel::sched::nice_scales_slices` (B6) checks the
-  scheduler uses `lumen_time::slice_ticks(nice)`, a pure function B6 adds
-  with Linux's weight table (host-tested: `cargo:lumen-time`);
+  scheduler uses the incoming thread's `lumen_time::slice_ticks(nice)`
+  after yielding to a nice-0 peer, with automatic balancing paused. The
+  pure Linux-weight calculation is host-tested by `cargo:lumen-time`;
   `threads_migrate_to_idle_cpus` and `pinned_threads_never_migrate` drive
   balance passes directly through a ktest-only call, counting passes,
   never time, the second with an unpinned thread that the same pass does
   move; `ktest:lumen_kernel::sched::migration_keeps_user_state` moves a
   user thread between CPUs between its `syscall`s and checks its XMM
   registers, `fs_base` and GPRs after each.
+  `automatic_balancer_moves_runnable_threads` keeps the runner and three
+  migratable workers runnable and checks all three workers leave the
+  original CPU, without explicit balance calls or timing ratios.
+  `sleeping_deadline_follows_affinity` and `wait_deadline_follows_affinity`
+  change a sleeping/blocked thread's mask, then check its timer wake runs
+  on the allowed CPU (automatic balancing paused); a late observation
+  retries rather than asserting a timing bound.
+  `affinity_refuses_immutable_pins` checks kernel, idle and user-probe pins.
+  `balancing_skips_pinned_donor_and_moves_user_roots` skips a busiest queue
+  containing only pins and migrates an ordinary user root from the next donor.
+  `queue_reservations_fail_and_roll_back` refuses a real queue allocation
+  after an earlier queue reserved successfully, then checks both counts
+  rolled back, and checks dropping a successful unpublished reservation.
+  `ktest:lumen_kernel::linux::process::fork_inherits_affinity_and_nice`
+  gives a separate migratable parent a two-CPU mask and nice 5, verifies
+  both in the child, then moves it within that mask.
+  `ktest:lumen_kernel::serial_in::reads_queued_input_on_non_boot_cpu`
+  consumes queued input and checks the empty UART fallback on an AP.
   `scenario:test_smp::test_multithreaded_workload_uses_all_cpus`
   (C11): one process's threads, pinned one to each CPU and confirmed by
   `getcpu`, each make progress.

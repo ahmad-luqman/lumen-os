@@ -335,8 +335,8 @@ pub enum StartError {
     Stopping(usize),
     /// That CPU has no scheduler (or doesn't exist).
     NoSuchCpu(usize),
-    /// The thread couldn't be made: `spawn_on` gives only `Stack` here (no
-    /// stack), its `NotRunning` being [`StartError::NoSuchCpu`].
+    /// The thread could not reserve its queues or stack; `NotRunning` is
+    /// reported as [`StartError::NoSuchCpu`].
     Spawn(SpawnError),
     /// Told to stop waiting before the thread (on that CPU) was in its
     /// loop: it is spawned and stoppable, just not confirmed.
@@ -347,7 +347,7 @@ pub enum StartError {
 fn start_error(cpu: usize, e: SpawnError) -> StartError {
     match e {
         SpawnError::NotRunning => StartError::NoSuchCpu(cpu),
-        e @ (SpawnError::Stack(_) | SpawnError::CantWait) => StartError::Spawn(e),
+        e @ (SpawnError::NoMemory | SpawnError::Stack(_) | SpawnError::CantWait) => StartError::Spawn(e),
     }
 }
 
@@ -741,6 +741,7 @@ crate::ktest!(
         let no_stack = SpawnError::Stack(StackError::OutOfMemory);
         kassert_eq!(start_error(3, no_stack), StartError::Spawn(no_stack));
         kassert_eq!(start_error(3, SpawnError::CantWait), StartError::Spawn(SpawnError::CantWait));
+        kassert_eq!(start_error(3, SpawnError::NoMemory), StartError::Spawn(SpawnError::NoMemory));
         let says = |e| start_message(e);
         kassert_eq!(says(StartError::Spawn(no_stack)), "perf burn: no stack: out of memory");
         kassert_eq!(says(StartError::NoSuchCpu(7)), "perf burn: no scheduler runs on cpu 7");
