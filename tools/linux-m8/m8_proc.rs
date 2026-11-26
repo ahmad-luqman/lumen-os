@@ -19,6 +19,7 @@ mod signal_waits;
 mod signals;
 mod small;
 mod threads;
+mod timers;
 
 use core::ffi::c_int;
 
@@ -34,6 +35,8 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
         [_, b"sessions"] => sessions::run(),
         [_, b"sessions-exec-hold"] => sessions::exec_hold(),
         [_, b"threads"] => threads::run(),
+        [_, b"timers"] => timers::run(),
+        [_, b"timer-image"] => timers::image(),
         [_, b"thread-exhaust"] => threads::exhaust(),
         [_, b"thread-root-exec"] => threads::root(true),
         [_, b"thread-root-exit"] => threads::root(false),

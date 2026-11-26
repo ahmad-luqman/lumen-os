@@ -888,6 +888,7 @@ fn dispatch(frame: &mut TrapFrame) {
             super::apic::eoi();
             if cpu == 0 {
                 crate::term::on_tick(tick);
+                crate::linux::timer::on_tick();
             }
             crate::sched::tick(frame.cs & 3 == 3);
         }

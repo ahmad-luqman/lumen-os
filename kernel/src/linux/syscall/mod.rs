@@ -3,7 +3,7 @@
 //! `dispatch` maps each syscall number to its handler, each number in one
 //! `match` arm (its constant as the pattern, so the compiler refuses one
 //! routed twice), passing the registers of the syscall's Linux signature
-//! (an M7 handler's, an M8 stub's, and since #254 the M6 descriptor
+//! (an M7 or M8 handler's, and since #254 the M6 descriptor
 //! handlers' and `getcwd`'s, decoded by `at::reg` into its parameter types;
 //! `poll` and the rest of M6 still take raw registers, and `task`'s M6
 //! handlers the whole frame). A handler that returns through the frame
@@ -31,8 +31,9 @@
 //!   `getrandom` (M6).
 //!
 //! M8's clusters (ARCHITECTURE section 8, "B0's stubs"), M6's handlers
-//! moved into them unchanged (#371). Each new M8 number is a stub
-//! (`not_implemented`) until the issue its doc names replaces it:
+//! moved into them unchanged (#371). Each M8 number began as a stub
+//! answering `-ENOSYS`; the issue its doc names replaced it, the last
+//! ones in C8 and C13:
 //!
 //! - `task`: `exit`, `exit_group`, `getpid`, `gettid`, `getppid`,
 //!   `set_tid_address` (M6); `clone`, `fork`, `vfork`, `execve`, `wait4`,
@@ -205,7 +206,7 @@ fn first_report(nr: u64) -> bool {
     false
 }
 
-/// Log a syscall answered `-ENOSYS` (no arm, or an M8 stub) once per number,
+/// Log a syscall answered `-ENOSYS` (a number with no arm) once per number,
 /// with its name when one of the kernel's tables has it.
 fn log_unknown_once(nr: u64) {
     if first_report(nr) {
@@ -214,13 +215,6 @@ fn log_unknown_once(nr: u64) {
             None => log::debug!(target: "linux", "unimplemented syscall #{nr}"),
         }
     }
-}
-
-/// The body of an M8 syscall's stub until the issue its doc names replaces
-/// it: logged as an unknown syscall is, and `-ENOSYS`.
-fn not_implemented(nr: u32) -> u64 {
-    log_unknown_once(u64::from(nr));
-    neg_errno(errno::ENOSYS)
 }
 
 /// Dispatch one Linux x86-64 syscall (`rax` = nr, `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` = args).
@@ -521,8 +515,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         }
 
         // M8 (`crate::linux::M8_SYSCALLS`, but `poll`, M6's, above), by
-        // cluster: each number's stub returns `-ENOSYS` until the issue its
-        // doc names replaces it. Each arm passes the arguments of the
+        // cluster. Each arm passes the arguments of the
         // syscall's Linux x86-64 signature, decoded by `reg` (`at.rs`).
         Ok(general::__NR_clone) => {
             frame.rax =

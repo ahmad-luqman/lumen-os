@@ -4457,7 +4457,7 @@ depends on them.
 | C10 | the console as a tty | C2, C9 | the console's `Tty` and input thread; `test_console_ash_job_control` | 10 |
 | C11 | multithreaded and cross-CPU scenarios | C3, C5, C12 | `test_cross_cpu_munmap_and_mprotect_shootdown`, `test_futex_and_pthread_mutex_stress`, `test_multithreaded_workload_uses_all_cpus` | 5, 6, 15 |
 | C12 | the small syscalls and the census's leftovers | B0, B1, B6, C1, C2 | `FileSystem::statfs`, `RLIMIT_STACK` writes, the per-thread tick counts; `test_small_syscalls` | 6, 8 |
-| C13 | `setitimer`/`alarm`/`getitimer`, POSIX timers (new: not in the epic's first list). This issue's PR models every de_thread/timer interleaving listed here against Linux's code before implementation, as a host-tested state machine where practical. | C2, C3, C5, C6 | `TIMERS` (keyed by instance), the timers thread, `PendingSignals::discard_if` and `PendingSignals::any`; `test_interval_and_posix_timers` | 8 |
+| C13 | `setitimer`/`alarm`/`getitimer`, POSIX timers (new: not in the epic's first list). This issue's PR models every de_thread/timer interleaving listed here against Linux's code before implementation, as a host-tested state machine where practical. | C2, C3, C5, C6 | `TIMERS` (keyed by instance), the timers thread, `PendingSignals::{any_timer, discard_timer, discard_timers}`; `test_interval_and_posix_timers` | 8 |
 | D1 | gate: ash scripts and pipelines | C1, C2, C6, C7 | `test_ash_scripts_and_pipelines` | 15 |
 | D2 | gate: gcc/g++ and make | C1–C7, C12 | `mem`'s low-water mark; `low_water_mark_tracks_the_minimum`, `test_gcc_gpp_compile_cpp_and_shared_lib` | 15 |
 | D3 | gate: git, sqlite3, vim over a PTY | C1–C9, C12, C13 | `test_local_git_and_sqlite3`, `test_vim_edits_a_file_over_pty` | 15 |
@@ -4554,10 +4554,10 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 204 | `sched_getaffinity(tid, len, mask)` | `len` below 8 or not a multiple of 8 `-EINVAL`, as Linux's checks for 8 CPUs; writes the mask ∩ online CPUs and returns 8 (git calls it: the census) | C12 |
 | 218 | `set_tid_address(tidptr)` | M6's; the pointer is the thread's `clear_child_tid` | B1 |
 | 219 | `restart_syscall()` | resumes the thread's restart block (B2); with none, `-EINTR` | B2 |
-| 222 | `timer_create(clockid, sevp, timerid)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (the CPU-time and alarm clocks `-EINVAL`, a deviation); `sevp` `NULL` means `SIGEV_SIGNAL` with `SIGALRM`; `SIGEV_SIGNAL`, `SIGEV_NONE`, `SIGEV_THREAD_ID` (its tid a thread of the caller's process, else `-EINVAL`); a raw `SIGEV_THREAD` is taken as `SIGEV_SIGNAL`, as Linux's `good_sigevent` takes it (libc builds the thread on `SIGEV_THREAD_ID`, as musl's `timer_create` does); a signal outside 1..=64 `-EINVAL`; at most 32 timers a process (`-EAGAIN`, Lumen's cap); ids from 0 | C13 |
-| 223 | `timer_settime(id, flags, new, old)` | `TIMER_ABSTIME` (1) read from `flags`, other bits ignored, as Linux's `do_timer_settime`; an unknown id or a bad `itimerspec` `-EINVAL`; arms (a zero `it_value` disarms); `old` gets the previous setting | C13 |
+| 222 | `timer_create(clockid, sevp, timerid)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (the CPU-time and alarm clocks `-EINVAL`, a deviation); `sevp` `NULL` means `SIGEV_SIGNAL` with `SIGALRM`; `SIGEV_SIGNAL`, `SIGEV_NONE`, `SIGEV_THREAD_ID` (its tid a thread of the caller's process, else `-EINVAL`); a raw `SIGEV_THREAD` is taken as `SIGEV_SIGNAL`, as Linux's `good_sigevent` takes it (libc builds the thread on `SIGEV_THREAD_ID`, as musl's `timer_create` does); `SIGEV_NONE` ignores its signo; for the other notifications a signal outside 1..=64 `-EINVAL`; at most 32 timers a process (`-EAGAIN`, Lumen's cap); ids from 0 | C13 |
+| 223 | `timer_settime(id, flags, new, old)` | `TIMER_ABSTIME` (1) read from `flags`, other bits ignored, as Linux's `do_timer_settime`; a `NULL` new value `-EINVAL` before any copy or id lookup; an unknown id or a bad `itimerspec` `-EINVAL`; arms (a zero `it_value` disarms and clears the interval); `old` gets the previous setting | C13 |
 | 224 | `timer_gettime(id, cur)` | the time left and the interval; `-EINVAL`, `-EFAULT` | C13 |
-| 225 | `timer_getoverrun(id)` | expiries while the timer's signal was still pending, at the last delivery (capped at `i32::MAX`) | C13 |
+| 225 | `timer_getoverrun(id)` | expiries while the timer's signal was still pending, at the last delivery (capped at `i32::MAX`); a refused one-shot enqueue reports its lost expiry immediately (Lumen deviation) | C13 |
 | 226 | `timer_delete(id)` | disarms and frees it, discarding its pending signal; `-EINVAL` | C13 |
 | 229 | `clock_getres(clockid, res)` | the six clocks `clock_gettime` takes, each 1 ns (each read from the TSC; Linux reports its tick for the two coarse clocks, a deviation); `res` may be `NULL`; another clock `-EINVAL` | C12 |
 | 230 | `clock_nanosleep(clockid, flags, req, rem)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (`CLOCK_THREAD_CPUTIME_ID`, `CLOCK_MONOTONIC_RAW` and the `*_COARSE` clocks `-EOPNOTSUPP`; `CLOCK_TAI`, `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_REALTIME_ALARM` (8) and `CLOCK_BOOTTIME_ALARM` (9) `-EINVAL`, unsupported deviations); `TIMER_ABSTIME`: until that time, interrupted `-ERESTARTNOHAND` and `rem` untouched; relative: as `nanosleep`, interrupted `-ERESTART_RESTARTBLOCK` (Linux's `hrtimer_nanosleep`) | C4 |
@@ -5339,7 +5339,7 @@ untouched):
      `restart_block`. There is no recoverable failure after commit starts;
      this does not imply allocation-free retirement of the old resources.
    - Timers (C13): delete the POSIX timers and drop every queued
-     `SI_TIMER` signal (Linux's `posixtimer_exec`: `posixtimer_delete_timers`
+     notification carrying kernel timer provenance (Linux's `posixtimer_exec`: `posixtimer_delete_timers`
      and `flush_itimer_signals`); `ITIMER_REAL` survives (an `alarm`
      outlives `execve`, as POSIX requires; it is freed only at exit).
    - The thread's name becomes the path's last component as given, the
@@ -5639,11 +5639,18 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
   and still re-arms. `SIGEV_NONE` is `None`.
   POSIX timers are deleted at `execve` and exit; `ITIMER_REAL` only at
   exit. `timer_delete` (and `execve`) discards the timer's queued
-  `SI_TIMER` signal, and an expiry asks whether it is still queued, which
-  need two lumen-signal additions, C13's:
-  `PendingSignals::discard_if(|info| ...)`, removing queued entries a
-  predicate picks, and `PendingSignals::any(|info| ...)`, whether a queued
-  entry matches (both host-tested in `cargo:lumen-signal`).
+  `SI_TIMER` signal, and an expiry asks whether it is still queued. These
+  use C13's provenance-aware lumen-signal operations:
+  `PendingSignals::any_timer(instance)` finds a queued arming instance,
+  `discard_timer(instance)` removes that instance, and `discard_timers()`
+  removes all trusted timer notifications at exec, from private and shared
+  queues (host-tested in `cargo:lumen-signal`). Timer identity
+  is separate, kernel-owned queue metadata: the arming instance attached
+  only by the timer send path, never inferred from user `SI_TIMER` bytes.
+  The queue's timer-specific search/removal and dequeue accounting use
+  that provenance, like Linux's `SIGQUEUE_PREALLOC`. Disarming either
+  kind of timer clears its interval; disarming `ITIMER_REAL` preserves
+  an already-pending `SIGALRM`.
 - **Instances:** every `timer_settime`, `setitimer`, `alarm` and delete
   replaces the timer's `instance`: an arming with a fresh one from the
   process's `next_instance`, never reused (so a deleted timer's id taken
@@ -5652,7 +5659,7 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
   longer matches, as Linux's `timer_settime` and `timer_delete` bump
   `it_signal_seq`; the timers thread's periodic re-arm keeps it. A
   `timer_settime` also discards the timer's queued `SI_TIMER` signal
-  (`discard_if`) and zeroes `overrun` and `overrun_last`, as Linux drops
+  (`discard_timer` matching the arming instance) and zeroes `overrun` and `overrun_last`, as Linux drops
   the old setting's signal at delivery (`__posixtimer_deliver_signal`'s
   `it_signal_seq != it_sigqueue_seq`) and `posix_timer_set_common` resets
   the overrun count (a deviation in one corner: Linux's `rt_sigpending`
@@ -5676,10 +5683,11 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
   order:
   1. The check: the timer at that `TimerId` still has the entry's
      `instance`. If not (re-armed, disarmed or deleted since), the entry
-     is stale and nothing else happens; this is the only branch that
-     skips the re-arm.
-  2. For a POSIX timer, whether its `SI_TIMER` signal (that `si_timerid`)
-     is still queued, asked of the queue itself (`PendingSignals::any`),
+     is stale and nothing else happens. Delivery may also already have
+     forwarded the timer beyond this batch's timestamp and installed its
+     next entry; that captured expiry then does nothing.
+  2. For a POSIX timer, whether its kernel-owned arming instance
+     is still queued, asked of the queue itself (`PendingSignals::any_timer`),
      as `posixtimer_send_sigqueue` asks `list_empty(&q->list)`: if it is,
      no send and `overrun` + 1. Otherwise the ordinary send (section 6,
      which handles `SIGCONT`, `SIGSTOP` and `SIGKILL` as any sender's) of
@@ -5697,7 +5705,10 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
      `sigqueue` past `legacy_queue` and the queue limit
      (`posixtimer_queue_sigqueue`); then a periodic timer is re-armed by
      its interval in every branch but a stale entry's, the periods it
-     skipped counted as overruns.
+     skipped counted as overruns. A refused one-shot has no later delivery:
+     its lost expiry is immediately published in `overrun_last`, observable
+     through `timer_getoverrun` until replacement or deletion. This is part
+     of Lumen's queue-refusal deviation, not a successful delivery.
   4. With the target's `signal` released and `PROCS` still held, the
      send's `StateChange` (a `SIGCONT` timer's `CLD_CONTINUED`) is acted
      on as any sender's.
@@ -5707,12 +5718,19 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
   likewise) and re-arms it when its signal is dequeued
   (`__posixtimer_deliver_signal`'s `timer_rearm`,
   `posixtimer_rearm_itimer`), forwarding past the periods it missed. What
-  Lumen keeps of Linux's is the count user space sees: dequeuing an
-  `SI_TIMER` signal moves the timer's `overrun` (the expiries after the
-  one that queued it) into `si_overrun` and `overrun_last` and resets it
-  to 0; `timer_getoverrun` reports `overrun_last`, clamped to `INT_MAX`,
-  as Linux's `it_overrun_last`, which only a delivery sets and
-  `timer_settime` resets to 0.
+  Lumen keeps of Linux's is the count user space sees: dequeuing a
+  kernel timer notification first forwards through the delivery time
+  under `signal`, adding all periods the worker has not accounted yet and
+  replacing the timer's global entry. It then moves `overrun` (the expiries
+  after the one that queued it) into `si_overrun` and `overrun_last` and
+  resets it to 0; `timer_getoverrun` reports `overrun_last`, clamped to `INT_MAX`,
+  as Linux's `it_overrun_last`, which a delivery sets and
+  `timer_settime` resets to 0 (apart from the refused one-shot deviation
+  above). For a periodic POSIX timer with a trusted notification pending,
+  `timer_gettime` and `timer_settime`'s old value report the remainder after
+  forwarding past now, as Linux's `common_timer_get`. Lumen projects that
+  remainder from a copy: reads do not move the live deadline or consume
+  periods that later worker/delivery accounting must include.
 - **`SIGEV_NONE`:** such a timer has no `TIMERS` entry and never sends, as
   Linux's `common_timer_set` never starts its hrtimer ("SIGEV_NONE timers
   are not queued"); `timer_gettime` works its state out from the clock,
@@ -5724,8 +5742,10 @@ and C5; C6 for `rt_sigtimedwait`), and D3 depends on C13.
 - **Clocks:** deadlines are `CLOCK_MONOTONIC` nanoseconds; a
   `CLOCK_REALTIME` absolute time is converted when the timer is armed (a
   later change of the realtime clock doesn't move it: a deviation, as for
-  `futex`). A timer fires at the first tick after its deadline, never
-  before.
+  `futex`). A tick wakes the timers worker after a deadline is due;
+  the worker then generates the signal, never early, with no latency
+  guarantee. A past absolute realtime expiry retains its periodic phase,
+  including when its converted deadline predates monotonic zero.
 - **musl's `SIGEV_THREAD` helper** blocks signal 32, leaves it at
   `SIG_DFL` and waits for it in `rt_sigtimedwait`: section 6's send rules
   exempt a thread's `real_blocked` set from the ignored-drop and the

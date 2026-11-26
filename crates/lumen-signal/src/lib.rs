@@ -10,6 +10,7 @@ pub mod altstack;
 pub mod frame;
 pub mod pending;
 pub mod restart;
+pub mod timer;
 
 use linux_raw_sys::general;
 

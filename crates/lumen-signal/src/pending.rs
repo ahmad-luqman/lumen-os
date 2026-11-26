@@ -48,6 +48,25 @@ impl SigInfo {
         &self.0
     }
 
+    /// A POSIX timer notification with Linux's x86-64 timer payload.
+    pub fn timer(signal: Signal, id: i32, value: u64) -> Self {
+        let mut info = Self::new(signal, general::SI_TIMER);
+        info.0[16..20].copy_from_slice(&id.to_le_bytes());
+        info.0[24..32].copy_from_slice(&value.to_le_bytes());
+        info
+    }
+
+    /// The timer id only for SI_TIMER; other union layouts cannot match.
+    pub fn timer_id(&self) -> Option<i32> {
+        (i32::from_le_bytes(self.0[8..12].try_into().unwrap()) == general::SI_TIMER)
+            .then(|| i32::from_le_bytes(self.0[16..20].try_into().unwrap()))
+    }
+
+    /// Stamp the last delivery's bounded overrun count.
+    pub fn set_timer_overrun(&mut self, overrun: i32) {
+        self.0[20..24].copy_from_slice(&overrun.to_le_bytes());
+    }
+
     /// A fault siginfo with si_addr (offset 16 on x86-64) set to the fault address.
     pub fn fault(signal: Signal, code: i32, address: u64) -> Self {
         let mut info = Self::new(signal, code);
@@ -111,14 +130,33 @@ impl PendingError {
     }
 }
 
+/// Queue-owned origin, separate from the user-visible siginfo image. Only
+/// enqueue_timer attaches an instance; ordinary enqueue never infers one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingSignal {
+    info: SigInfo,
+    timer_instance: Option<u64>,
+}
+impl PendingSignal {
+    pub fn info(self) -> SigInfo {
+        self.info
+    }
+    pub fn timer_instance(self) -> Option<u64> {
+        self.timer_instance
+    }
+    fn signal(&self) -> Signal {
+        self.info.signal()
+    }
+}
+
 /// One pending set, mutated only through PendingSignals so generation always
 /// performs process-wide stop/continue cancellation. Capacity is per queue,
 /// not Linux's per-user RLIMIT_SIGPENDING accounting.
 #[derive(Debug)]
 struct Pending {
     set: SigSet,
-    standard: [Option<SigInfo>; 31],
-    realtime: VecDeque<SigInfo>,
+    standard: [Option<PendingSignal>; 31],
+    realtime: VecDeque<PendingSignal>,
     cap: usize,
 }
 
@@ -127,7 +165,7 @@ impl Pending {
         Self { set: SigSet::EMPTY, standard: [None; 31], realtime: VecDeque::new(), cap }
     }
 
-    fn enqueue(&mut self, info: SigInfo, sender: SenderClass) -> Result<Enqueued, PendingError> {
+    fn enqueue(&mut self, info: PendingSignal, sender: SenderClass) -> Result<Enqueued, PendingError> {
         let signal = info.signal();
         if signal.is_realtime() {
             let capacity = if self.realtime.len() == self.cap {
@@ -163,8 +201,35 @@ impl Pending {
         self.set.remove(signal);
     }
 
+    fn any(&self, predicate: &mut impl FnMut(&PendingSignal) -> bool) -> bool {
+        self.standard.iter().flatten().chain(self.realtime.iter()).any(predicate)
+    }
+
+    fn discard_if(&mut self, predicate: &mut impl FnMut(&PendingSignal) -> bool) {
+        for slot in &mut self.standard {
+            if slot.as_ref().is_some_and(&mut *predicate) {
+                self.set.remove(slot.take().unwrap().signal());
+            }
+        }
+        let mut removed = SigSet::EMPTY;
+        self.realtime.retain(|info| {
+            if predicate(info) {
+                removed.insert(info.signal());
+                false
+            } else {
+                true
+            }
+        });
+        // Preserve other entries of the same number, and overflow-only bits
+        // that had no matching queued entry to remove.
+        for info in &self.realtime {
+            removed.remove(info.signal());
+        }
+        self.set.0 &= !removed.0;
+    }
+
     #[must_use]
-    fn dequeue_mask(&mut self, mask: SigSet) -> Option<SigInfo> {
+    fn dequeue_mask(&mut self, mask: SigSet) -> Option<PendingSignal> {
         // kernel/signal.c SYNCHRONOUS_MASK (ABRT is deliberately absent).
         const SYNCHRONOUS: SigSet =
             SigSet::of(&[Signal::SEGV, Signal::BUS, Signal::ILL, Signal::TRAP, Signal::FPE, Signal::SYS]);
@@ -185,7 +250,7 @@ impl Pending {
             }
             self.set.remove(signal);
             // Linux collect_signal's minimal fallback: zero payload and SI_USER.
-            Some(SigInfo::new(signal, general::SI_USER as i32))
+            Some(PendingSignal { info: SigInfo::new(signal, general::SI_USER as i32), timer_instance: None })
         } else {
             self.set.remove(signal);
             self.standard[signal.index()].take()
@@ -339,6 +404,40 @@ impl PendingSignals {
         Ok(self.pending(slot)?.0 & !blocked.set().0 != 0)
     }
 
+    /// Whether any queued siginfo in any live private or shared queue matches.
+    /// Overflow-only pending bits have no siginfo and are not inspected.
+    pub fn any(&self, mut predicate: impl FnMut(&SigInfo) -> bool) -> bool {
+        self.any_entry(&mut |entry| predicate(&entry.info))
+    }
+
+    /// Remove matching siginfos from all queues, preserving unrelated entries,
+    /// FIFO order, and pending bits for retained or overflow-only signals.
+    pub fn discard_if(&mut self, mut predicate: impl FnMut(&SigInfo) -> bool) {
+        self.discard_entries(&mut |entry| predicate(&entry.info));
+    }
+
+    fn any_entry(&self, predicate: &mut impl FnMut(&PendingSignal) -> bool) -> bool {
+        self.shared.any(predicate) || self.threads.iter().flatten().any(|t| t.pending.any(predicate))
+    }
+    fn discard_entries(&mut self, predicate: &mut impl FnMut(&PendingSignal) -> bool) {
+        self.shared.discard_if(predicate);
+        for thread in self.threads.iter_mut().flatten() {
+            thread.pending.discard_if(predicate);
+        }
+    }
+    /// Inspect only the kernel-owned instance, never si_code or si_timerid.
+    pub fn any_timer(&self, instance: u64) -> bool {
+        self.any_entry(&mut |entry| entry.timer_instance == Some(instance))
+    }
+    /// Retire a timer's notifications without discarding user SI_TIMER images.
+    pub fn discard_timer(&mut self, instance: u64) {
+        self.discard_entries(&mut |entry| entry.timer_instance == Some(instance));
+    }
+    /// Exec retires every notification carrying kernel timer provenance.
+    pub fn discard_timers(&mut self) {
+        self.discard_entries(&mut |entry| entry.timer_instance.is_some());
+    }
+
     fn discard_all(&mut self, signal: Signal) {
         self.shared.discard(signal);
         for pending in self.threads.iter_mut().flatten() {
@@ -372,6 +471,20 @@ impl PendingSignals {
     /// With no queued entry, dequeue synthesizes minimal SI_USER siginfo. Taking
     /// the last queued entry clears the bit: an overflow adds no extra delivery.
     pub fn enqueue(&mut self, target: Target, info: SigInfo, sender: SenderClass) -> Result<Enqueued, PendingError> {
+        self.enqueue_entry(target, PendingSignal { info, timer_instance: None }, sender)
+    }
+
+    /// Kernel timer send only: attaches trusted process-local arming identity.
+    pub fn enqueue_timer(&mut self, target: Target, info: SigInfo, instance: u64) -> Result<Enqueued, PendingError> {
+        self.enqueue_entry(target, PendingSignal { info, timer_instance: Some(instance) }, SenderClass::Other)
+    }
+
+    fn enqueue_entry(
+        &mut self,
+        target: Target,
+        info: PendingSignal,
+        sender: SenderClass,
+    ) -> Result<Enqueued, PendingError> {
         if let Target::Thread(slot) = target {
             self.thread(slot)?;
         }
@@ -387,16 +500,28 @@ impl PendingSignals {
     /// and STOP; this function does not alter it.
     #[must_use = "A dequeued signal must be consumed or delivered"]
     pub fn dequeue(&mut self, slot: ThreadSlot, blocked: Blocked) -> Result<Option<SigInfo>, PendingError> {
+        self.dequeue_entry(slot, blocked).map(|entry| entry.map(PendingSignal::info))
+    }
+    /// Dequeue with trusted provenance for kernel timer accounting.
+    pub fn dequeue_entry(&mut self, slot: ThreadSlot, blocked: Blocked) -> Result<Option<PendingSignal>, PendingError> {
         self.dequeue_mask(slot, blocked.set())
     }
 
     /// sigwait takes only wanted signals, always excluding KILL/STOP.
     #[must_use = "A dequeued signal must be consumed or delivered"]
     pub fn dequeue_wanted(&mut self, slot: ThreadSlot, wanted: SigSet) -> Result<Option<SigInfo>, PendingError> {
+        self.dequeue_wanted_entry(slot, wanted).map(|entry| entry.map(PendingSignal::info))
+    }
+    /// sigwait dequeue with trusted provenance for kernel timer accounting.
+    pub fn dequeue_wanted_entry(
+        &mut self,
+        slot: ThreadSlot,
+        wanted: SigSet,
+    ) -> Result<Option<PendingSignal>, PendingError> {
         self.dequeue_mask(slot, SigSet(!wanted.unblockable_stripped().0))
     }
 
-    fn dequeue_mask(&mut self, slot: ThreadSlot, mask: SigSet) -> Result<Option<SigInfo>, PendingError> {
+    fn dequeue_mask(&mut self, slot: ThreadSlot, mask: SigSet) -> Result<Option<PendingSignal>, PendingError> {
         let private = self.thread_mut(slot)?.dequeue_mask(mask);
         Ok(private.or_else(|| self.shared.dequeue_mask(mask)))
     }

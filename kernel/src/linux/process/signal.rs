@@ -42,7 +42,8 @@ pub struct SignalState {
     /// Per-signal dispositions, shared by every thread.
     actions: [KernelSigaction; 64],
     /// Shared and private queues, owning each linked ThreadSlot.
-    pending: PendingSignals,
+    pub(super) pending: PendingSignals,
+    pub(super) timers: super::timer::Timers,
     /// Live signal state in ascending tid order.
     threads: BTreeMap<u32, ThreadSignals>,
     /// Cursor for process-directed target selection.
@@ -149,6 +150,7 @@ impl SignalState {
         Self {
             actions: [KernelSigaction::default(); 64],
             pending: PendingSignals::new(0, 1024).expect("empty pending queues").0,
+            timers: super::timer::Timers::default(),
             threads: BTreeMap::new(),
             preferred: None,
             group_exit: None,
@@ -371,6 +373,15 @@ impl SignalState {
         self.set_blocked(tid, mask);
     }
     pub(super) fn send(&mut self, tid: Option<u32>, info: SigInfo, sender: SenderClass) -> Result<(), u32> {
+        self.send_result(tid, info, sender, None).map(|_| ())
+    }
+    pub(super) fn send_result(
+        &mut self,
+        tid: Option<u32>,
+        info: SigInfo,
+        sender: SenderClass,
+        timer_instance: Option<u64>,
+    ) -> Result<Option<lumen_signal::pending::Enqueued>, u32> {
         let sig = info.signal();
         let thread = tid.map(|tid| self.threads.get(&tid).ok_or(errno::ESRCH)).transpose()?;
         let directed = thread.map(|t| (t, t.blocked.contains(sig)));
@@ -381,13 +392,17 @@ impl SignalState {
             |t| t.blocked.contains(sig) || real_blocks(t),
         );
         if self.ending() {
-            return Ok(());
+            return Ok(None);
         }
         self.pending.prepare_signal(sig);
         if ignored(self.action(sig), sig) && !keep_ignored {
-            return Ok(());
+            return Ok(None);
         }
-        self.pending.enqueue(target, info, sender).map_err(|_| errno::EAGAIN)?;
+        let enqueued = match timer_instance {
+            Some(instance) => self.pending.enqueue_timer(target, info, instance),
+            None => self.pending.enqueue(target, info, sender),
+        }
+        .map_err(|_| errno::EAGAIN)?;
         let chosen = match target {
             // A stopped target retains even an unblocked default-fatal
             // signal until continue; only SIGKILL may end the stop.
@@ -413,7 +428,7 @@ impl SignalState {
                 }
             }
         }
-        Ok(())
+        Ok(Some(enqueued))
     }
     /// Force on the current linked tid. Reset the disposition when requested or
     /// blocked/ignored; once ending, drop the request. None preserves the fault slot.
@@ -465,10 +480,11 @@ impl SignalState {
             if self.group_stop.is_some() {
                 return Delivery::Park;
             }
-            let Some(info) = self.pending.dequeue(t.slot, t.blocked).expect("current slot") else {
+            let Some(info) = self.pending.dequeue_entry(t.slot, t.blocked).expect("current slot") else {
                 sched::clear_current_sigpending();
                 return Delivery::None;
             };
+            let info = self.timers.delivered(info);
             let sig = info.signal();
             let action = self.actions[sig.index()];
             if action.handler == 0 && sig.default_action() == DefaultAction::Stop {
@@ -565,9 +581,12 @@ impl Process {
     }
 
     /// Reset handled dispositions, the alternate stack, fault and frame-failure
-    /// diagnostics, preserving pending queues and the blocked mask.
+    /// diagnostics, preserving non-timer pending signals and the blocked mask.
+    /// POSIX timers and their queued notifications are retired; REAL survives.
     pub fn exec_signals(&self, tid: u32) {
         let mut state = self.signal.lock();
+        state.timers.clear(self.pid(), false);
+        state.pending.discard_timers();
         for action in &mut state.actions {
             let handler = if action.handler == SIG_IGN { SIG_IGN } else { 0 };
             *action = KernelSigaction { handler, ..KernelSigaction::default() };
@@ -679,9 +698,9 @@ impl UserThread {
             let mut state = self.process.signal.lock();
             let t = state.thread(tid).expect("current signal tid");
             let slot = t.slot;
-            if let Some(info) = state.pending.dequeue_wanted(slot, wanted).expect("live slot") {
+            if let Some(info) = state.pending.dequeue_wanted_entry(slot, wanted).expect("live slot") {
                 state.refresh_current(tid);
-                return Ok(info);
+                return Ok(state.timers.delivered(info));
             }
             if deadline.is_some_and(|dl| crate::time::now_ns() >= dl) {
                 return Err(errno::EAGAIN);
@@ -697,7 +716,8 @@ impl UserThread {
         let t = state.threads.get_mut(&tid).expect("current signal tid");
         let slot = t.slot;
         let mask = t.real_blocked.take().expect("signal wait mask");
-        let info = state.pending.dequeue_wanted(slot, wanted).expect("live slot");
+        let info = state.pending.dequeue_wanted_entry(slot, wanted).expect("live slot");
+        let info = info.map(|info| state.timers.delivered(info));
         state.set_blocked(tid, mask);
         // A consumed wanted signal must not interrupt the next blocking call.
         state.refresh_current(tid);

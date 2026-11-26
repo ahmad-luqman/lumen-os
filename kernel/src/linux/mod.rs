@@ -16,6 +16,7 @@ pub mod signal;
 pub mod syscall;
 
 pub use init::init;
+pub use process::timer;
 
 use alloc::borrow::Cow;
 use alloc::string::String;
