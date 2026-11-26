@@ -58,19 +58,11 @@ pub(super) fn sys_clone(
     tls: u64,
     frame: &SyscallFrame,
 ) -> u64 {
-    super::finish(clone(flags, newsp, parent_tid, child_tid, tls, frame))
-}
-
-fn clone(
-    flags: u32,
-    newsp: UserPtr,
-    parent_tid: UserPtr,
-    child_tid: UserPtr,
-    tls: u64,
-    frame: &SyscallFrame,
-) -> Result<u64, u32> {
-    let flags = clone_flags(flags, tls)?;
-    process::fork_current(flags, newsp.addr(), parent_tid.addr(), child_tid.addr(), tls, frame)
+    super::finish(
+        clone_flags(flags, tls).and_then(|flags| {
+            process::fork_current(flags, newsp.addr(), parent_tid.addr(), child_tid.addr(), tls, frame)
+        }),
+    )
 }
 
 /// `fork()` (57): return the child's pid to its parent, zero to the child.
@@ -125,15 +117,14 @@ fn waitid(idtype: i32, id: i32, infop: UserPtr, options: u32, rusage: UserPtr) -
     // Linux's SYSCALL_DEFINE5(waitid) writes these fields even when
     // kernel_waitid returns an error. A bad copyout supersedes that error.
     let result = process::waitid_request(idtype, id, options).and_then(process::wait_child);
-    let mut fields = [(SI_SIGNO, 0u32), (SI_ERRNO, 0), (SI_CODE, 0), (SI_PID, 0), (SI_UID, 0), (SI_STATUS, 0)];
-    if let Ok(Some(report)) = &result {
+    let (signo, code, pid, status) = if let Ok(Some(report)) = &result {
         write_rusage(rusage)?;
         let status = report.status().siginfo();
-        fields[0].1 = general::SIGCHLD;
-        fields[2].1 = status.code as u32;
-        fields[3].1 = report.pid();
-        fields[5].1 = status.status as u32;
-    }
+        (general::SIGCHLD, status.code as u32, report.pid(), status.status as u32)
+    } else {
+        (0, 0, 0, 0)
+    };
+    let fields = [(SI_SIGNO, signo), (SI_ERRNO, 0), (SI_CODE, code), (SI_PID, pid), (SI_UID, 0), (SI_STATUS, status)];
     if !infop.is_null() {
         // Linux checks the full siginfo address range but touches only these
         // fields: inaccessible padding must not make an otherwise valid write fail.

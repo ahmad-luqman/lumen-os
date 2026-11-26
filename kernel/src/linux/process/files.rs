@@ -18,14 +18,14 @@ impl FilesAccess {
         Self { state: AtomicUsize::new(0), seq: AtomicU64::new(0), waiters: sched::WaitQueue::new() }
     }
 
-    fn acquire(&self, exclusive: bool) -> FilesAccessGuard<'_> {
+    fn acquire(&self, exclusive: bool) {
         loop {
             let seen = self.seq.load(Ordering::SeqCst);
             let state = self.state.load(Ordering::Acquire);
             if state != FILES_EXCLUSIVE && (!exclusive || state == 0) {
                 let next = if exclusive { FILES_EXCLUSIVE } else { state.checked_add(1).expect("fd leases overflow") };
                 if self.state.compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                    return FilesAccessGuard { access: self, exclusive };
+                    return;
                 }
                 continue;
             }
@@ -34,10 +34,12 @@ impl FilesAccess {
     }
 
     pub(super) fn read(&self) -> FilesAccessGuard<'_> {
-        self.acquire(false)
+        self.acquire(false);
+        FilesAccessGuard { access: self, exclusive: false }
     }
     pub(super) fn write(&self) -> FilesAccessGuard<'_> {
-        self.acquire(true)
+        self.acquire(true);
+        FilesAccessGuard { access: self, exclusive: true }
     }
 
     fn release(&self, exclusive: bool) {
@@ -65,115 +67,149 @@ impl Drop for FilesAccessGuard<'_> {
 /// A descriptor table, shared by the processes `clone(CLONE_FILES)` links
 /// (M8).
 pub struct Files {
-    table: SpinLock<FdTable<FileRef>>,
-    /// The processes sharing it: the one that brings it to 0 closes every
-    /// descriptor (`Files::leave`), so the last `Arc` (a procfs reader's,
-    /// say) frees memory only.
-    users: AtomicUsize,
+    table: SpinLock<Shared>,
+    /// Shared by all table users: descriptor removal/release versus leave.
+    close_access: FilesAccess,
+}
+
+/// Descriptor slots and their process owners change under the same leaf lock.
+struct Shared {
+    fds: FdTable<FileRef>,
+    /// Zero reserves membership for a process not linked to a pid yet.
+    members: Vec<u32>,
 }
 
 impl Files {
-    pub(super) fn new(table: FdTable<FileRef>) -> Self {
-        Self { table: SpinLock::new(table), users: AtomicUsize::new(1) }
+    pub(super) fn new(fds: FdTable<FileRef>) -> Self {
+        Self { table: SpinLock::new(Shared { fds, members: alloc::vec![0] }), close_access: FilesAccess::new() }
     }
 
-    /// Copy open descriptors, preserving cloexec and counting each slot.
+    /// Copy open descriptors and cloexec, counting each slot for member.
     /// Reservations belong to the original table and are never inherited.
-    pub(super) fn fork_copy(&self) -> Self {
+    pub(super) fn fork_copy(&self, member: u32) -> Self {
         let table = self.table.lock();
-        let copy = table.clone();
+        let copy = table.fds.clone();
         for (_, entry) in copy.iter_open() {
             entry.file.inc_fd_ref();
         }
-        Self::new(copy)
+        Self {
+            table: SpinLock::new(Shared { fds: copy, members: alloc::vec![member] }),
+            close_access: FilesAccess::new(),
+        }
     }
 
     pub(super) fn with_table<R>(&self, f: impl FnOnce(&mut FdTable<FileRef>) -> R) -> R {
-        f(&mut self.table.lock())
+        f(&mut self.table.lock().fds)
     }
 
-    pub(super) fn reserve(
-        self: &Arc<Self>,
-        access: FilesAccessGuard<'_>,
-        owner: Arc<Process>,
-        from: i32,
-    ) -> Result<ReservedFd, VfsError> {
-        let reservation = self.table.lock().reserve(from)?;
-        assert!(!access.exclusive && core::ptr::eq(access.access, &owner.files_access));
-        let lease = FilesLease { owner };
-        // The owned lease takes over this reader count. Errors above drop
-        // the borrowed guard; ReservedFd always drops the owned lease.
-        core::mem::forget(access);
+    fn reserve(self: &Arc<Self>, lease: FilesLease, from: i32) -> Result<ReservedFd, VfsError> {
+        let reservation = self.table.lock().fds.reserve(from)?;
         Ok(ReservedFd { files: Arc::clone(self), _lease: lease, reservation: Some(reservation) })
     }
 
-    /// Another process shares it (C1's `clone(CLONE_FILES)`).
+    /// Hold from before removing a descriptor until its inode lock release
+    /// finishes. The caller must drop this lease before calling leave.
+    pub(super) fn closing(&self) -> FilesAccessGuard<'_> {
+        self.close_access.read()
+    }
+
+    /// Reserve membership for another process before its pid is linked.
     pub(super) fn share(self: &Arc<Self>) -> Arc<Self> {
-        let before = self.users.fetch_add(1, Ordering::AcqRel);
-        assert_ne!(before, 0, "a descriptor table shared after its last user left");
+        let mut table = self.table.lock();
+        assert!(!table.members.is_empty(), "a descriptor table shared after its last user left");
+        table.members.push(0);
         Arc::clone(self)
+    }
+
+    /// Replace one reserved membership with its assigned pid, without allocating.
+    pub(super) fn enrol(&self, pid: u32) {
+        assert_ne!(pid, 0);
+        let mut table = self.table.lock();
+        *table.members.iter_mut().find(|member| **member == 0).expect("unlinked Files member") = pid;
+    }
+
+    /// Release all current members' POSIX locks while the caller holds the
+    /// inode lock. Membership cannot outlive reaping/pid reuse, and no new
+    /// lock on this inode can be acquired during this allocation-free scan.
+    pub(super) fn release_members(&self, locks: &mut lumen_vfs::AdvisoryLocks) -> bool {
+        let table = self.table.lock();
+        let mut freed = false;
+        for &pid in &table.members {
+            if pid != 0 {
+                freed |= locks.release_posix_for_pid(pid);
+            }
+        }
+        freed
     }
 
     /// Release the departing process's POSIX locks even when other users
     /// keep this table. Snapshot descriptions under the leaf, then take inode
-    /// locks with no spinlock held. This is exit, not unshare_files.
+    /// locks with no spinlock held. Unshare does not perform this exit sweep.
     pub(super) fn release_posix_for_pid(&self, pid: u32) {
+        // An unlinked process never acquired locks.
         if pid == 0 {
             return;
-        } // an unlinked process never acquired locks
-        let files: Vec<_> = self.table.lock().iter_open().map(|(_, entry)| Arc::clone(&entry.file)).collect();
+        }
+        let files: Vec<_> = self.table.lock().fds.iter_open().map(|(_, entry)| Arc::clone(&entry.file)).collect();
         for file in files {
-            let mut freed = false;
-            let result = file.inode().with_locks_mut(&mut |locks| freed = locks.release_posix_for_pid(pid));
-            if let Err(error) = result {
-                log::error!(target: "linux", "pid {pid}: exit locks on {}: {error:?}", Escaped(&file.path));
-            }
-            if freed {
-                locks_released();
-            }
+            release_locks(&file, LockOwners::Pid(pid), false);
         }
     }
 
-    /// Process `pid` stops sharing it: the last one closes every descriptor
-    /// (FD references and flock, outside every spinlock). Panics if no process shared
-    /// it. Takes inodes' locks: never call it holding a spinlock.
+    /// Remove exactly one membership; the last member drains descriptors
+    /// and flock outside the table lock. pid is only for member removal and
+    /// the panic message: exit releases its POSIX locks before calling leave.
+    /// Takes inode locks: never call with a spinlock or closing lease held.
     pub(super) fn leave(self: Arc<Self>, pid: u32) {
-        let before = self.users.fetch_sub(1, Ordering::AcqRel);
-        assert_ne!(before, 0, "pid {pid} left a descriptor table nobody shared");
-        if before == 1 {
-            let entries = {
-                let mut table = self.table.lock();
-                debug_assert_eq!(table.reserved_count(), 0, "last user left with an open in flight");
-                table.drain_all()
-            };
-            for entry in entries {
-                release_file(None, entry.file);
+        // Either an in-flight close scans this pid before leave removes it,
+        // or leave wins before removal and exit's preceding sweep saw the fd.
+        // This lease is table-wide; a process's files_access only orders swaps.
+        let _exclusive = self.close_access.write();
+        let entries = {
+            let mut table = self.table.lock();
+            let member = table.members.iter().position(|&member| member == pid);
+            debug_assert!(member.is_some(), "pid {pid} left a descriptor table it wasn't using");
+            let Some(member) = member else { return };
+            table.members.swap_remove(member);
+            if !table.members.is_empty() {
+                return;
             }
+            debug_assert_eq!(table.fds.reserved_count(), 0, "last user left with an open in flight");
+            table.fds.drain_all()
+        };
+        for entry in entries {
+            release_fd(&self, entry.file);
         }
     }
 
-    /// The processes sharing it.
+    /// The processes sharing it, including reserved unlinked members.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2/C3 table unsharing
     pub fn users(&self) -> usize {
-        self.users.load(Ordering::Acquire)
+        self.table.lock().members.len()
     }
 
     /// How many descriptors are open.
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`
     pub fn open_count(&self) -> usize {
-        self.table.lock().open_count()
+        self.table.lock().fds.open_count()
     }
 }
 
 impl Drop for Files {
     fn drop(&mut self) {
-        let users = *self.users.get_mut();
-        debug_assert_eq!(self.table.get_mut().reserved_count(), 0, "dropped table has reserved slots");
-        debug_assert_eq!(
-            self.table.get_mut().open_count(),
-            0,
-            "a descriptor table dropped with {users} users and descriptors open (no last `leave`)"
-        );
+        let table = self.table.get_mut();
+        assert!(table.members.is_empty(), "Files dropped before its last leave");
+        debug_assert_eq!(table.fds.reserved_count(), 0, "dropped table has reserved slots");
+        debug_assert_eq!(table.fds.open_count(), 0, "dropped table has open descriptors");
+    }
+}
+
+impl Process {
+    /// Reserve in this process's table while its owned lease prevents replacement.
+    pub(super) fn reserve_fd(self: Arc<Self>, from: i32) -> Result<ReservedFd, VfsError> {
+        let lease = FilesLease::read(self);
+        let files = lease.owner.files.lock().clone().expect("a running process has its descriptors");
+        files.reserve(lease, from)
     }
 }
 
@@ -253,14 +289,14 @@ impl ReservedFd {
     pub fn install(mut self, file: KernelFile, cloexec: bool) -> i32 {
         let file = Arc::new(file);
         let r = self.reservation.take().expect("unconsumed reservation");
-        self.files.table.lock().install(r, file, cloexec)
+        self.files.table.lock().fds.install(r, file, cloexec)
     }
 }
 
 impl Drop for ReservedFd {
     fn drop(&mut self) {
         if let Some(r) = self.reservation.take() {
-            self.files.table.lock().cancel(r);
+            self.files.table.lock().fds.cancel(r);
         }
     }
 }
@@ -268,6 +304,13 @@ impl Drop for ReservedFd {
 /// Owns one shared access count independently of its creator's stack.
 struct FilesLease {
     owner: Arc<Process>,
+}
+
+impl FilesLease {
+    fn read(owner: Arc<Process>) -> Self {
+        owner.files_access.acquire(false);
+        Self { owner }
+    }
 }
 
 impl Drop for FilesLease {

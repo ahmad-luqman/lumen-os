@@ -59,6 +59,15 @@ const SYS_GETTID: u64 = 186;
 const SYS_EXIT_GROUP: u64 = 231;
 const SYS_WAITID: u64 = 247;
 const SIGCHLD: u64 = 17;
+const SIGUSR1: u64 = 10;
+const SIG_SETMASK: u64 = 2;
+const CLD_EXITED: i64 = 1;
+const SI_SIGNO: usize = 0;
+const SI_ERRNO: usize = 1;
+const SI_CODE: usize = 2;
+const SI_PID: usize = 4;
+const SI_UID: usize = 5;
+const SI_STATUS: usize = 6;
 const CLONE_VM: u64 = 0x100;
 const CLONE_FS: u64 = 0x200;
 const CLONE_FILES: u64 = 0x400;
@@ -190,7 +199,7 @@ fn check_empty_info(info: &[i32; 32]) -> R {
         eq(
             "waitid fields and untouched padding",
             i64::from(*word),
-            if [0, 1, 2, 4, 5, 6].contains(&i) { 0 } else { 0x55 },
+            if [SI_SIGNO, SI_ERRNO, SI_CODE, SI_PID, SI_UID, SI_STATUS].contains(&i) { 0 } else { 0x55 },
         )?;
     }
     Ok(())
@@ -205,17 +214,17 @@ fn zombie() -> R {
             sys(SYS_WAITID, [P_PID, pid as u64, info.as_mut_ptr() as u64, WNOWAIT | WEXITED, 0, 0]),
             0,
         )?;
-        eq("si_signo", i64::from(info[0]), 17)?;
-        eq("si_code", i64::from(info[2]), 1)?;
-        eq("si_pid", i64::from(info[4]), pid)?;
-        eq("si_uid", i64::from(info[5]), 0)?;
-        eq("si_status", i64::from(info[6]), 87)?;
+        eq("si_signo", i64::from(info[SI_SIGNO]), SIGCHLD as i64)?;
+        eq("si_code", i64::from(info[SI_CODE]), CLD_EXITED)?;
+        eq("si_pid", i64::from(info[SI_PID]), pid)?;
+        eq("si_uid", i64::from(info[SI_UID]), 0)?;
+        eq("si_status", i64::from(info[SI_STATUS]), 87)?;
     }
     wait(pid, 87)?;
     let pid = child_exits(44)?;
     let mut info = [0i32; 32];
     eq("waitid reap", sys(SYS_WAITID, [P_PID, pid as u64, info.as_mut_ptr() as u64, WEXITED, 0, 0]), 0)?;
-    eq("waitid reaped status", i64::from(info[6]), 44)?;
+    eq("waitid reaped status", i64::from(info[SI_STATUS]), 44)?;
     gone(pid)
 }
 
@@ -245,6 +254,25 @@ fn autoreap() -> R {
     Ok(())
 }
 
+fn proc_path(pid: u32) -> [u8; 32] {
+    let mut path = [0u8; 32];
+    path[..6].copy_from_slice(b"/proc/");
+    let mut digits = [0u8; 10];
+    let (mut n, mut count) = (pid, 0);
+    loop {
+        digits[count] = b'0' + (n % 10) as u8;
+        count += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for i in 0..count {
+        path[6 + i] = digits[count - 1 - i];
+    }
+    path
+}
+
 fn orphan() -> R {
     let shared = Shared::new()?;
     let pid = fork()?;
@@ -272,21 +300,7 @@ fn orphan() -> R {
     let grandchild = shared.word(3).load(SeqCst);
     // Wait for init to remove the orphan before the root's exact frame count.
     // Only the scenario's outer hang guard applies; this isn't a time bound.
-    let mut path = [0u8; 32];
-    path[..6].copy_from_slice(b"/proc/");
-    let mut digits = [0u8; 10];
-    let (mut n, mut count) = (grandchild, 0);
-    loop {
-        digits[count] = b'0' + (n % 10) as u8;
-        count += 1;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    for i in 0..count {
-        path[6 + i] = digits[count - 1 - i];
-    }
+    let path = proc_path(grandchild);
     loop {
         let fd = sys(SYS_OPEN, [path.as_ptr() as u64, 0, 0, 0, 0, 0]);
         if fd == -ENOENT {
@@ -470,16 +484,16 @@ fn clone_shared_resources() -> R {
 fn fork_inherited_state() -> R {
     let action = [1u64, 0, 0, 0];
     let mut old_action = [0u64; 4];
-    let mask = 1u64 << 9; // SIGUSR1
+    let mask = 1u64 << (SIGUSR1 - 1);
     let mut old_mask = 0u64;
     eq(
         "set inherited action",
-        sys(SYS_RT_SIGACTION, [10, action.as_ptr() as u64, old_action.as_mut_ptr() as u64, 8, 0, 0]),
+        sys(SYS_RT_SIGACTION, [SIGUSR1, action.as_ptr() as u64, old_action.as_mut_ptr() as u64, 8, 0, 0]),
         0,
     )?;
     eq(
         "set inherited mask",
-        sys(SYS_RT_SIGPROCMASK, [2, &mask as *const _ as u64, &mut old_mask as *mut _ as u64, 8, 0, 0]),
+        sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, &mask as *const _ as u64, &mut old_mask as *mut _ as u64, 8, 0, 0]),
         0,
     )?;
     eq("set inherited cwd", sys(SYS_CHDIR, [c"/tmp".as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
@@ -488,8 +502,8 @@ fn fork_inherited_state() -> R {
         let mut seen_action = [0u64; 4];
         let mut seen_mask = 0u64;
         let mut cwd = [0u8; 16];
-        let a = sys(SYS_RT_SIGACTION, [10, 0, seen_action.as_mut_ptr() as u64, 8, 0, 0]);
-        let m = sys(SYS_RT_SIGPROCMASK, [2, 0, &mut seen_mask as *mut _ as u64, 8, 0, 0]);
+        let a = sys(SYS_RT_SIGACTION, [SIGUSR1, 0, seen_action.as_mut_ptr() as u64, 8, 0, 0]);
+        let m = sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, 0, &mut seen_mask as *mut _ as u64, 8, 0, 0]);
         let c = sys(SYS_GETCWD, [cwd.as_mut_ptr() as u64, cwd.len() as u64, 0, 0, 0, 0]);
         exit(if a == 0 && m == 0 && seen_action == action && seen_mask == mask && c == 5 && &cwd[..5] == b"/tmp\0" {
             0
@@ -498,8 +512,8 @@ fn fork_inherited_state() -> R {
         });
     }
     eq("restore cwd", sys(SYS_CHDIR, [c"/".as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
-    eq("restore action", sys(SYS_RT_SIGACTION, [10, old_action.as_ptr() as u64, 0, 8, 0, 0]), 0)?;
-    eq("restore mask", sys(SYS_RT_SIGPROCMASK, [2, &old_mask as *const _ as u64, 0, 8, 0, 0]), 0)?;
+    eq("restore action", sys(SYS_RT_SIGACTION, [SIGUSR1, old_action.as_ptr() as u64, 0, 8, 0, 0]), 0)?;
+    eq("restore mask", sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, &old_mask as *const _ as u64, 0, 8, 0, 0]), 0)?;
     wait(pid, 0)
 }
 
@@ -546,10 +560,11 @@ fn clone_stack_tls() -> R {
     // the child uses only assembly and raw syscalls with its temporary TLS.
     unsafe {
         core::arch::asm!("syscall", "test rax, rax", "jnz 2f",
-            "mov [r9], rsp", "mov eax, {sys_arch_prctl}", "mov edi, 0x1003", "lea rsi, [r9+8]", "syscall",
+            "mov [r9], rsp", "mov eax, {sys_arch_prctl}", "mov edi, {arch_get_fs}", "lea rsi, [r9+8]", "syscall",
             "mov eax, {sys_exit}", "xor edi, edi", "syscall", "ud2", "2:",
             sys_exit = const SYS_EXIT,
             sys_arch_prctl = const SYS_ARCH_PRCTL,
+            arch_get_fs = const ARCH_GET_FS,
             inlateout("rax") SYS_CLONE => pid, in("rdi") (SPAWN_FLAGS | CLONE_SETTLS),
             in("rsi") stack, in("rdx") 0u64, in("r10") 0u64,
             in("r8") tls, in("r9") page.0,
@@ -575,8 +590,6 @@ fn clone_stack_tls() -> R {
             lateout("rcx") _, lateout("r11") _, options(nostack));
     }
     let pid = ok("clone noncanonical stack", pid)?;
-    let mut status = 0i32;
-    eq("wait bad stack child", sys(SYS_WAIT4, [pid as u64, &mut status as *mut _ as u64, 0, 0, 0, 0]), pid)?;
-    eq("noncanonical RSP reached ring 3", i64::from(page.word(4).load(SeqCst)), 1)?;
-    eq("noncanonical RSP permits a stackless exit", i64::from(status), 0)
+    wait(pid, 0)?;
+    eq("noncanonical RSP reached ring 3", i64::from(page.word(4).load(SeqCst)), 1)
 }

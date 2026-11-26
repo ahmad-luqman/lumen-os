@@ -28,7 +28,7 @@ impl ProcTable {
     pub(super) fn active_pids(&self) -> Vec<u32> {
         self.procs.keys().copied().filter(|&pid| pid != INIT_PID).collect()
     }
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
+    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2's exec single-thread check
     pub(super) fn has_extra_threads(&self, pid: u32) -> bool {
         !self.tree.threads(pid).is_empty()
     }
@@ -86,6 +86,9 @@ impl ProcTable {
         Some(pid)
     }
 
+    /// Return the child's pid, holding the parent's signal throughout; refuse
+    /// with EINTR (exiting/fatal), ERESTARTNOINTR (pending signal), or the
+    /// tree's errno (EAGAIN when no pid is free).
     pub(super) fn link_child(&mut self, parent: &UserThread, thread: &Arc<UserThread>) -> Result<u32, u32> {
         let signal = parent.process().signal.lock();
         if parent.process().exit.lock().is_some() || sched::with_current(|t| t.fatal_pending()).unwrap_or(false) {

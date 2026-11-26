@@ -1662,13 +1662,12 @@ weakening crash reporting or `make audit`.
     return via `swapgs; sysretq` and rewritten register frames (`execve`,
     `fork` child, `rt_sigreturn`) return via `swapgs; iretq` (with
     `USER_CODE`/`USER_DATA`).
-  - **Fork RSP:** do not reject a noncanonical saved RSP before IRET. It
-    need not be dereferenced: C1's scenario resumes a stackless child at
-    ring 3, publishes a marker, and exits with RSP = 1 << 63. A subsequent
-    invalid stack access belongs to the normal user-exception path. An
-    offline QEMU 11.1.3 TCG probe reached ring 3 and raised #GP at `push`
-    (CPL 3), rather than #SS; the test does not assume that emulator fault
-    choice is universal or synthesize a stack fault in the kernel.
+  - **Fork RSP:** the SDM's 64-bit IRET checks the new RIP for
+    canonicality, not RSP. Do not reject a noncanonical saved RSP before
+    IRET: the scenario's stackless child publishes a marker and exits at
+    ring 3 with RSP = 1 << 63, showing the entry itself is safe. A later
+    noncanonical stack reference is `#SS(0)` per the SDM (QEMU TCG reports
+    `#GP`); that fault at first stack use is not part of this scenario.
 - **Conditional `SWAPGS` and IST protection (incl. `#DB` / CVE-2018-8897):**
   `lumen_isr_common` inspects the saved `CS` on the stack (`cs & 3 != 0`): if
   the interrupt or exception came from ring 3, it executes `swapgs` on entry
@@ -4241,13 +4240,13 @@ snapshot of the offset, which moves after only if nothing moved it
 meanwhile. An `O_APPEND` write goes through `VfsInode::append`, one chunk
 at a time (a write over 4 KiB can have another appender's data land
 between its chunks). `close` takes the entry out under the table's lock
-and, after it, releases the closing pid's POSIX record locks on the inode
-(any close) and, on the open file description's last `dec_fd_ref`, its
-`flock` locks; `take_current` does the same for every descriptor when the
-process ends, and so does `dup2`'s displacement of the slot it fills (all
-through `process::release_fd`, which wakes blocked lockers when anything
-went). `openat` reserves a slot before it opens and keeps it until
-installation (a full table is `-EMFILE` before anything is created), and
+and, after it, releases every current table member's POSIX record locks
+on the inode (any close) and, on the description's last `dec_fd_ref`, its
+`flock` locks. `dup2`/`dup3` displacement uses the same `release_fd` path.
+Exit separately sweeps the departing pid's locks before `Files::leave`;
+the last member drains FD references and flock. Both paths share
+`release_locks`, which wakes blocked lockers after releasing inode/table
+locks. `openat` reserves a slot before it opens and keeps it until installation (a full table is `-EMFILE` before anything is created), and
 `getcwd` computes the path from the cwd's inode (`compute_cwd_path`). `umask` sets the mask
 (`syscall/meta.rs`). `chdir` and `fchdir` set the cwd (its kept path
 computed from the inode too, so relative `chdir`s never grow it), and
@@ -4673,8 +4672,12 @@ pub struct Process {
     exit: SpinLock<Option<UserExit>>,        // M7's end, first wins, until group_exit (C3)
 }
 pub struct Files {
-    table: SpinLock<FdTable<FileRef>>,       // FileRef = Arc<KernelFile>
-    users: AtomicUsize,                      // processes sharing it
+    table: SpinLock<Shared>,                // slots and members, one leaf
+    close_access: FilesAccess,              // shared close versus exclusive leave
+}
+struct Shared {
+    fds: FdTable<FileRef>,                   // FileRef = Arc<KernelFile>
+    members: Vec<u32>,                      // pid, or 0 before linking
 }
 pub struct FsState { inner: SpinLock<FsInner> }  // FsInner { cwd: Cwd, umask: u16 }
 pub struct SignalState {
@@ -4768,13 +4771,24 @@ but `robust_list`); each later issue adds its own.
   `CLONE_THREAD` (`vfork`, `posix_spawn`) raises it; a process letting its
   space go (exit step 3, `execve`) lowers it, and the one that brings it
   to 0 runs `teardown` there, in process context (section 5).
-- **`Files::users`** counts the processes sharing a table (`CLONE_FILES`
-  without `CLONE_THREAD` raises it). A procfs reader of `/proc/<pid>/fd`
-  clones the `Arc<Files>` while holding Locks 0 and 2, so the last `Arc`
-  must not close anything: the process that brings `users` to 0 (exit step
-  3, `execve`'s unshare) drains the table there (`drain_all`, then
-  `process::release_fd` for each entry, outside every `SpinLock`), and the
-  last `Arc`'s drop frees memory only.
+- **`Files::users`** is the member vector's length, under the same leaf
+  spinlock as descriptor slots. `new` and `share` reserve a 0 member;
+  `Process::set_pid` calls `enrol` to replace one 0 without allocating,
+  taking the files slot and table locks separately. `fork_copy(member)`
+  starts with that member (0 for fork, the caller's pid for unshare).
+  `leave(pid)` removes exactly one member. A departing process first
+  sweeps its own POSIX locks on open inodes; the last member drains slots
+  and releases FD references/flock outside the spinlock. The last `Arc`
+  (including a procfs reader's) only frees memory and asserts no members
+  remain. Unshare copies with the caller's pid then leaves the old table;
+  it does not perform exit's pid-lock sweep. A table-wide `close_access`
+  lease spans descriptor removal through inode-lock cleanup; `leave` takes
+  it exclusively after the exit sweep. Thus a close either still scans the
+  departing pid, or removes the descriptor after the exit sweep saw it.
+  This reuses `FilesAccess` independently of the process's table-swap lease.
+  Close takes process-read then table-read; leave holds neither a shared
+  lease nor an inode lock on entry, and unshare drops its process-write
+  lease before calling leave. The last-user drain does not reacquire read.
 
 **The tables.** One kernel-wide table replaces `ACTIVE_PROCS`:
 
@@ -8548,8 +8562,15 @@ file description had one thread (M7) and becomes possible once threads,
 5. **`POSIX_WAITERS` and POSIX record locks were keyed by pid.** A record
    lock's owner stays the process (its tgid): Linux's owner is the
    `files_struct`, which a process's threads share; the two differ only
-   for `clone(CLONE_FILES)` without `CLONE_THREAD`, a deviation. The
-   `EDEADLK` records move to the waiting thread: B8 changes lumen-vfs's
+   for `clone(CLONE_FILES)` without `CLONE_THREAD`, a deviation. A close
+   or descriptor displacement releases every current Files member's locks
+   on that inode. While holding the inode lock, it reads the member set
+   under the table's leaf spinlock and releases each nonzero pid without
+   allocating. Membership ends before reaping can recycle the pid, and a
+   new lock on this inode needs the inode lock already held. After unshare,
+   locks still follow the pid into the new table; Linux keeps them with the
+   old files_struct (C3 will change the ownership key). The `EDEADLK`
+   records move to the waiting thread: B8 changes lumen-vfs's
    `PosixWaitGraph` to key a record by `Waiter { tgid, tid }` and to follow,
    from a holding process, the record of its lowest-numbered waiting
    thread, as Linux's `what_owner_is_waiting_for` follows the first blocked lock of
@@ -10739,7 +10760,12 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   checks ERESTARTSYS and a blocked wait's exit wake (a rescue wake must find
   zero waiters, making a missing wake fail cleanly);
   `shared_files_exit_releases_its_posix_locks` checks a CLONE_FILES child's
-  F_SETLK goes away at its exit while the parent's table stays open.
+  F_SETLK goes away at its exit while the parent's table stays open;
+  `shared_files_close_releases_all_members_posix_locks` checks that close,
+  dup displacement and slot replacement drop the child's lock before it exits;
+  `shared_files_leave_waits_for_inflight_close` holds an inode lock to force
+  removal before the exit sweep, checks leave blocks with both members still
+  present, and checks no record lock survives after both operations finish.
 - `scenario:test_linux_proc::test_fork_cow_and_exec_shebang`: parent and
   child writing the same heap, stack and file-private (`MAP_PRIVATE`)
   page after `fork`, each seeing only its own; shared anonymous memory

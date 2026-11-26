@@ -1486,9 +1486,7 @@ pub fn spawn_on(
 /// Start a pinned user thread on CPU `cpu`, with clean FPU state and zero TLS.
 /// Roots install their Linux identity at registration. Registered threads
 /// must call take_current before returning; an unregistered thread's state
-/// is detached by thread_entry. Fork children use spawn_fork_child instead;
-/// a cancelled fork child clears its identity and detaches before returning,
-/// leaving the creator to release its process-user count after joining.
+/// is detached by thread_entry. Fork children use spawn_fork_child.
 pub fn spawn_user_on(
     cpu: usize,
     name: impl Into<ThreadName>,
@@ -1499,9 +1497,11 @@ pub fn spawn_user_on(
 }
 
 /// Spawn a fork child pinned to the caller's CPU with inherited FPU state,
-/// its Linux identity and TLS installed before enqueue. It starts behind
-/// the caller's gate; a cancelled child clears linux and detaches its space
-/// before returning, without giving up NewProcess's process-user count.
+/// its Linux identity and TLS installed before enqueue. The closure f must
+/// hold itself at a start gate until its identity is linked. Before returning,
+/// f must either call take_current, or clear linux and detach the space on
+/// cancellation without releasing the creator's process-user count. This
+/// function supplies neither the gate nor that cleanup.
 pub(crate) fn spawn_fork_child(
     name: impl Into<ThreadName>,
     space: Arc<AddressSpace>,

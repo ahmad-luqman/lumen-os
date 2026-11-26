@@ -514,7 +514,7 @@ pub unsafe fn enter_ring3(rip: u64, user_rsp: u64, rflags: u64) {
 /// user context, then restore the kernel's entry bookkeeping after unwind.
 fn run_ring3(enter: impl FnOnce()) {
     assert!(irq::enabled() && irq::depth() == 0, "ring-3 entry requires interrupts on and no SpinLock held");
-    assert_eq!(percpu::user_exit_rsp(), 0, "nested ring-3 entry");
+    assert_eq!(percpu::user_exit_rsp(), 0, "nested ring-3 entry on CPU {}", percpu::index());
     let were_on = irq::disable();
     percpu::set_pending_debug_trap(false);
     // SAFETY: this MSR exists on x86-64; swapgs must load a clean user GS.
@@ -534,8 +534,6 @@ fn run_ring3(enter: impl FnOnce()) {
 /// The current user address space is the child's, its identity is installed,
 /// interrupts are enabled, and no lock or other ring-3 context is active.
 pub unsafe fn enter_fork(mut frame: SyscallFrame) {
-    assert!(irq::enabled() && irq::depth() == 0);
-    assert_eq!(percpu::user_exit_rsp(), 0);
     frame.cs = u64::from(USER_CODE);
     frame.ss = u64::from(USER_DATA);
     frame.rflags = sanitize_user_rflags(frame.rflags);

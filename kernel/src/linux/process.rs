@@ -29,6 +29,8 @@
 //! or cwd leaves its lock as a clone or an extracted entry, used and
 //! dropped after. `files_access` leases precede these locks and may sleep;
 //! never acquire a lease while holding a spinlock or with interrupts off.
+//! Close takes the process lease, then Files::close_access shared; leave
+//! takes only close_access exclusive, with no shared lease or inode lock held.
 
 mod clone;
 mod files;
@@ -294,6 +296,10 @@ impl Process {
         if let Err(had) = self.pid.compare_exchange(0, pid, Ordering::AcqRel, Ordering::Acquire) {
             panic!("process {had} given a second pid, {pid}");
         }
+        let files = self.files.lock().clone();
+        if let Some(files) = files {
+            files.enrol(pid);
+        }
     }
 
     /// Its pid (the thread group id): set before anything can read it.
@@ -418,7 +424,7 @@ impl Process {
         *new.process.fs.lock() = Some(child_fs);
         let files_access = parent.files_access.read();
         let files = parent.files.lock().clone().expect("live process's files");
-        let child_files = if flags & general::CLONE_FILES != 0 { files.share() } else { Arc::new(files.fork_copy()) };
+        let child_files = if flags & general::CLONE_FILES != 0 { files.share() } else { Arc::new(files.fork_copy(0)) };
         *new.process.files.lock() = Some(child_files);
         drop(files_access);
         let mm = parent.address_space().expect("live process's mm");
@@ -469,7 +475,7 @@ pub fn unshare_current_files() {
     let access = process.files_access.write();
     let old = process.files.lock().clone().expect("live process's files");
     if old.users() > 1 {
-        let copy = Arc::new(old.fork_copy());
+        let copy = Arc::new(old.fork_copy(process.pid()));
         let replaced = process.files.lock().replace(copy).expect("live process's files");
         drop(access);
         replaced.leave(process.pid());
@@ -523,25 +529,69 @@ enum Gate {
     Cancel,
 }
 
+/// A one-shot start/cancel decision; only the creator opens it.
+struct StartGate {
+    state: AtomicU32,
+    waiters: sched::WaitQueue,
+}
+
+impl StartGate {
+    fn new() -> Self {
+        Self { state: AtomicU32::new(Gate::Wait as u32), waiters: sched::WaitQueue::new() }
+    }
+
+    fn open(&self, decision: Gate) {
+        self.state.store(decision as u32, Ordering::Release);
+        self.waiters.wake_all();
+    }
+
+    fn started(&self) -> bool {
+        self.waiters.wait_until(|| self.state.load(Ordering::Acquire) != Gate::Wait as u32);
+        self.state.load(Ordering::Acquire) == Gate::Start as u32
+    }
+}
+
 /// Drop before NewProcess: cancellation joins before its resources retire.
 struct ParkedChild {
-    gate: Arc<(AtomicU32, sched::WaitQueue)>,
+    gate: Arc<StartGate>,
     handle: Option<sched::JoinHandle>,
 }
 
 impl ParkedChild {
-    fn start(mut self) {
-        self.gate.0.store(Gate::Start as u32, Ordering::Release);
-        self.gate.1.wake_all();
-        drop(self.handle.take());
+    /// The child's run closure starts only after publication. Cancellation
+    /// detaches its scheduler state without releasing the creator's resources.
+    fn spawn(
+        name: impl Into<lumen_trace::ThreadName>,
+        space: Arc<AddressSpace>,
+        linux: Arc<UserThread>,
+        fs_base: u64,
+        run: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, sched::SpawnError> {
+        let gate = Arc::new(StartGate::new());
+        let start = Arc::clone(&gate);
+        let handle = sched::spawn_fork_child(name, space, linux, fs_base, move || {
+            let started = start.started();
+            drop(start);
+            if started {
+                run();
+            } else {
+                drop(sched::set_current_user_thread(None));
+                drop(sched::detach_user_space());
+            }
+        })?;
+        Ok(Self { gate, handle: Some(handle) })
+    }
+
+    fn start(mut self) -> sched::JoinHandle {
+        self.gate.open(Gate::Start);
+        self.handle.take().expect("parked child's handle")
     }
 }
 
 impl Drop for ParkedChild {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
-            self.gate.0.store(Gate::Cancel as u32, Ordering::Release);
-            self.gate.1.wake_all();
+            self.gate.open(Gate::Cancel);
             handle.join();
         }
     }
@@ -814,19 +864,10 @@ pub(crate) fn fork_current(
     let space = new.process.address_space().expect("new process's space");
     let done = new.process.vfork_done.lock().clone();
     // ParkedChild is declared after NewProcess, so a refusal joins first.
-    let gate = Arc::new((AtomicU32::new(Gate::Wait as u32), sched::WaitQueue::new()));
-    let start = Arc::clone(&gate);
-    let handle = sched::spawn_fork_child("fork", space, Arc::clone(&child), fs_base, move || {
-        start.1.wait_until(|| start.0.load(Ordering::Acquire) != Gate::Wait as u32);
-        let run = start.0.load(Ordering::Acquire) == Gate::Start as u32;
-        drop(start);
-        if !run {
-            drop(sched::set_current_user_thread(None));
-            drop(sched::detach_user_space());
-            return;
-        }
+    let parked = ParkedChild::spawn("fork", space, Arc::clone(&child), fs_base, move || {
         if flags & general::CLONE_CHILD_SETTID != 0 {
             let tid = current_thread().tid();
+            // Linux ignores this put_user's failure.
             let _ = crate::user::copy_to_user(child_tid, &tid.to_ne_bytes());
         }
         // SAFETY: the scheduler installed this child's identity and space;
@@ -839,13 +880,13 @@ pub(crate) fn fork_current(
         sched::SpawnError::Stack(crate::mm::stack::StackError::OutOfMemory) => errno::ENOMEM,
         _ => errno::EAGAIN,
     })?;
-    let parked = ParkedChild { gate, handle: Some(handle) };
     let pid = PROCS.lock().link_child(&caller, &child)?;
     new.linked();
     if flags & general::CLONE_PARENT_SETTID != 0 {
+        // Linux ignores this put_user's failure.
         let _ = crate::user::copy_to_user(parent_tid, &pid.to_ne_bytes());
     }
-    parked.start();
+    drop(parked.start());
     if let Some(done) = done {
         done.wait();
     }
@@ -1031,32 +1072,36 @@ impl Drop for RegisteredProcess {
     }
 }
 
-/// Give back one descriptor's slot on `file` (`close`, exit, `dup2`
-/// displacing it): `pid`'s POSIX record locks on its inode go on any close
-/// (as Linux), and its `flock` locks with the last slot of the open file
-/// description; if any went, the blocked lockers are woken to retry
-/// ([`locks_released`]). Takes the inode's Lock 4: never call it holding
-/// any spinlock (`PROCS`, `Files::table`).
-fn release_fd(pid: u32, file: FileRef) {
-    release_file(Some(pid), file);
+/// Release a removed/displaced descriptor from its original Files table.
+/// Every current member loses its POSIX locks on this inode; the last FD
+/// reference also releases flock. Exit separately sweeps its departing pid
+/// before leave drains the last table user's descriptors. No spinlock may
+/// be held: the inode lock precedes the Files leaf used to read members.
+fn release_fd(files: &Files, file: FileRef) {
+    let last = file.dec_fd_ref() == 0;
+    release_locks(&file, LockOwners::Members(files), last);
 }
 
-// A table's last leave releases descriptions only: exit separately releases
-// its pid's record locks, while unshare must preserve them in the new table.
-fn release_file(pid: Option<u32>, file: FileRef) {
-    let last = file.dec_fd_ref() == 0;
-    let id = file.id;
+enum LockOwners<'a> {
+    Members(&'a Files),
+    Pid(u32),
+}
+
+/// Release record locks and optionally flock under one inode lock, then
+/// wake lockers with all inode/table locks released.
+fn release_locks(file: &FileRef, owners: LockOwners<'_>, flock: bool) {
     let mut freed = false;
     let released = file.inode().with_locks_mut(&mut |locks| {
-        freed = pid.is_some_and(|pid| locks.release_posix_for_pid(pid));
-        if last {
-            freed |= locks.release_flock(id);
+        freed = match owners {
+            LockOwners::Members(files) => files.release_members(locks),
+            LockOwners::Pid(pid) => locks.release_posix_for_pid(pid),
+        };
+        if flock {
+            freed |= locks.release_flock(file.id);
         }
     });
-    // Every filesystem keeps lock state today; one that refused would keep
-    // this process's locks held.
-    if let Err(e) = released {
-        log::error!(target: "linux", "pid {pid:?}: closing {}: its locks weren't released: {e:?}", Escaped(&file.path));
+    if let Err(error) = released {
+        log::error!(target: "linux", "releasing locks on {}: {error:?}", Escaped(&file.path));
     }
     if freed {
         locks_released();
@@ -1139,10 +1184,7 @@ pub fn current_files(fds: &[i32]) -> Vec<Option<FileRef>> {
 /// can create or truncate anything. Its guard cancels the slot on every
 /// failure path.
 pub fn reserve_current_fd(from: i32) -> Result<ReservedFd, VfsError> {
-    let owner = current_process();
-    let access = owner.files_access.read();
-    let files = owner.files.lock().clone().expect("a running process has its descriptors");
-    files.reserve(access, Arc::clone(&owner), from)
+    current_process().reserve_fd(from)
 }
 
 /// Put `file`, a fresh open file description (its `fd_refs` 1, for this
@@ -1172,23 +1214,24 @@ pub fn insert_current_fd(fd: i32, file: KernelFile) -> Result<(), VfsError> {
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C7's dup2/dup3 next
 pub fn dup_current_fd(old: i32, new: i32, cloexec: bool) -> Result<i32, VfsError> {
     let process = current_process();
-    let displaced = process
-        .with_files(|t| {
-            let file = t.get(old).map(|e| Arc::clone(&e.file)).ok_or(VfsError::BadF)?;
-            #[cfg(feature = "ktest")]
-            dup_lookup_window();
-            if old == new {
-                return Ok::<_, VfsError>(None);
-            }
-            // Even on refusal the source slot keeps this clone from being
-            // the last Arc dropped under the table lock.
-            let displaced = t.insert_at(new, Arc::clone(&file), cloexec)?;
-            file.inc_fd_ref();
-            Ok(displaced)
-        })
-        .expect("a running process has its descriptors")?;
+    let _access = process.files_access.read();
+    let files = process.files.lock().clone().expect("a running process has its descriptors");
+    let _closing = files.closing();
+    let displaced = files.with_table(|t| {
+        let file = t.get(old).map(|e| Arc::clone(&e.file)).ok_or(VfsError::BadF)?;
+        #[cfg(feature = "ktest")]
+        dup_lookup_window();
+        if old == new {
+            return Ok::<_, VfsError>(None);
+        }
+        // Even on refusal the source slot keeps this clone from being
+        // the last Arc dropped under the table lock.
+        let displaced = t.insert_at(new, Arc::clone(&file), cloexec)?;
+        file.inc_fd_ref();
+        Ok(displaced)
+    })?;
     if let Some(old) = displaced {
-        release_fd(process.pid(), old.file);
+        release_fd(&files, old.file);
     }
     Ok(new)
 }
@@ -1211,9 +1254,12 @@ pub fn dup_current_fd_from(old: i32, min: i32, cloexec: bool) -> Result<i32, Vfs
 /// what it displaces outside the table's lock.
 fn place_current_fd(fd: i32, file: FileRef, cloexec: bool) -> Result<(), VfsError> {
     let process = current_process();
-    let displaced = process.with_files(|t| t.insert_at(fd, Arc::clone(&file), cloexec));
-    if let Some(old) = displaced.expect("a running process has its descriptors")? {
-        release_fd(process.pid(), old.file);
+    let _access = process.files_access.read();
+    let files = process.files.lock().clone().expect("a running process has its descriptors");
+    let _closing = files.closing();
+    let displaced = files.with_table(|t| t.insert_at(fd, Arc::clone(&file), cloexec));
+    if let Some(old) = displaced? {
+        release_fd(&files, old.file);
     }
     Ok(())
 }
@@ -1223,8 +1269,11 @@ fn place_current_fd(fd: i32, file: FileRef, cloexec: bool) -> Result<(), VfsErro
 /// after.
 pub fn close_current_fd(fd: i32) -> Result<(), VfsError> {
     let process = current_process();
-    let removed = process.with_files(|t| t.remove(fd)).expect("a running process has its descriptors");
-    release_fd(process.pid(), removed?.file);
+    let _access = process.files_access.read();
+    let files = process.files.lock().clone().expect("a running process has its descriptors");
+    let _closing = files.closing();
+    let removed = files.with_table(|t| t.remove(fd));
+    release_fd(&files, removed?.file);
     Ok(())
 }
 
@@ -1876,7 +1925,7 @@ crate::ktest!(
             // A second sharer leaving closes nothing: only the last does.
             let shared = files.share();
             kassert_eq!(files.users(), 2);
-            shared.leave(pid);
+            shared.leave(0);
             kassert_eq!((files.users(), files.open_count()), (1, 3));
 
             // A second thread: its tid finds it and the same process; a tid
@@ -2822,24 +2871,24 @@ crate::ktest!(
 crate::ktest!(
     fn fork_files_count_slots_and_skip_reservations() {
         use crate::{kassert, kassert_eq};
-        in_test_process(|pid| {
+        in_test_process(|_| {
             let file = current_file(0).ok_or("stdin")?;
             kassert_eq!(dup_current_fd(0, 9, true), Ok(9));
             let reserved = reserve_current_fd(0).map_err(|_| "reserve")?;
             let fd = reserved.fd();
             let files = current_process().files.lock().clone().ok_or("files")?;
-            let copy = Arc::new(files.fork_copy());
+            let copy = Arc::new(files.fork_copy(0));
             kassert_eq!(file.fd_ref_count(), 4);
             kassert_eq!(copy.users(), 1);
             kassert_eq!(copy.with_table(|t| t.get_cloexec(9)), Ok(true));
             kassert!(copy.with_table(|t| t.get(fd).is_none()));
             kassert_eq!(copy.with_table(|t| t.reserved_count()), 0);
-            copy.leave(pid);
+            copy.leave(0);
             kassert_eq!(file.fd_ref_count(), 2);
             let sharer = files.share();
             kassert_eq!(files.users(), 2);
             kassert_eq!(file.fd_ref_count(), 2);
-            sharer.leave(pid);
+            sharer.leave(0);
             kassert_eq!(files.users(), 1);
             kassert_eq!(file.fd_ref_count(), 2);
             drop(reserved);
@@ -2851,9 +2900,10 @@ crate::ktest!(
 crate::ktest!(
     fn files_unshare_waits_for_open_reservations() {
         use crate::{kassert, kassert_eq};
-        in_test_process(|pid| {
+        in_test_process(|_| {
             let process = current_process();
-            let shared = process.files.lock().clone().ok_or("files")?.share();
+            let original = process.files.lock().clone().ok_or("files")?;
+            let shared = original.share();
             let reservation = reserve_current_fd(0).map_err(|_| "reserve")?;
             let fd = reservation.fd();
             let swapper = spawn_test_thread(|_| unshare_current_files())?;
@@ -2868,7 +2918,7 @@ crate::ktest!(
             kassert_eq!(current_cloexec(fd), Ok(true));
             let file = current_file(fd).ok_or("open's returned fd missing after swap")?;
             kassert_eq!(file.fd_ref_count(), 2);
-            shared.leave(pid);
+            shared.leave(0);
             kassert_eq!(file.fd_ref_count(), 1);
             kassert_eq!(close_current_fd(fd), Ok(()));
             kassert_eq!(file.fd_ref_count(), 0);
@@ -2879,7 +2929,7 @@ crate::ktest!(
             let blocked = swapper.settle();
             drop(cancelled);
             swapper.join()?;
-            shared.leave(pid);
+            shared.leave(0);
             kassert!(blocked);
             kassert_eq!(reserve_current_fd(0).map_err(|_| "cancelled slot free")?.fd(), fd);
             Ok(())
@@ -2978,86 +3028,203 @@ crate::ktest!(
     }
 );
 
+#[cfg(feature = "ktest")]
+#[derive(Clone, Copy)]
+enum LockCleanup {
+    Exit,
+    Close,
+    Dup,
+    Replace,
+}
+
+#[cfg(feature = "ktest")]
+fn shared_files_lock_cleanup(cleanup: LockCleanup) -> crate::ktest::TestResult {
+    use crate::{kassert, kassert_eq};
+    fn lock(fd: i32, cmd: u32) -> Result<(u64, i16, i32), &'static str> {
+        let mut raw = [0u8; 32];
+        raw[0..2].copy_from_slice(&(general::F_WRLCK as i16).to_ne_bytes());
+        raw[16..24].copy_from_slice(&10i64.to_ne_bytes());
+        crate::user::copy_to_user(KTEST_USER_VA, &raw).map_err(|_| "write flock")?;
+        let result = hazard_call(general::__NR_fcntl, fd as u64, u64::from(cmd), KTEST_USER_VA, 0);
+        crate::user::copy_from_user(&mut raw, KTEST_USER_VA).map_err(|_| "read flock")?;
+        Ok((
+            result,
+            i16::from_ne_bytes(raw[0..2].try_into().unwrap()),
+            i32::from_ne_bytes(raw[24..28].try_into().unwrap()),
+        ))
+    }
+    in_test_process(move |_| {
+        let file = open_kernel_file(b"/tmp/c1-exit-lock", OpenFlags::O_CREAT | OpenFlags::O_RDWR, 0o600)
+            .map_err(|_| "open")?;
+        let fd = install_current_fd(file, false).map_err(|_| "install")?;
+        kassert_eq!(fd, 3);
+        let probe = dup_current_fd_from(fd, 0, false).map_err(|_| "probe descriptor")?;
+        // Allocate the replacement before the child runs, so failures cannot
+        // strand a child behind its exit handshake.
+        let replacement = open_kernel_file(b"/dev/null", OpenFlags::O_RDWR, 0).map_err(|_| "replacement")?;
+        let caller = current_thread();
+        let files = caller.process().files.lock().clone().ok_or("files")?;
+        let new = Process::copy_for_fork(caller.process(), general::CLONE_VM | general::CLONE_FILES)
+            .map_err(|_| "copy child")?;
+        let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
+        let locked = Arc::new(VforkDone::new());
+        let finish = Arc::new(VforkDone::new());
+        let result = Arc::new(SpinLock::new(None));
+        let (ready, end, out) = (Arc::clone(&locked), Arc::clone(&finish), Arc::clone(&result));
+        let parked =
+            ParkedChild::spawn("lock-child", new.process.address_space().unwrap(), Arc::clone(&child), 0, move || {
+                *out.lock() = Some(lock(fd, general::F_SETLK));
+                ready.complete();
+                end.wait();
+                record_exit(UserExit::Exited(0));
+                let ended = take_current();
+                assert!(ended.exit.is_some());
+            })
+            .map_err(|_| "spawn child")?;
+        let pid = PROCS.lock().link_child(&caller, &child).map_err(|_| "link child")?;
+        new.linked();
+        let shared_users = files.users();
+        let handle = parked.start();
+        locked.wait();
+        let before = lock(probe, general::F_GETLK);
+        let released = match cleanup {
+            LockCleanup::Exit => Ok(()),
+            LockCleanup::Close => close_current_fd(fd),
+            LockCleanup::Dup => dup_current_fd(0, fd, false).map(|_| ()),
+            LockCleanup::Replace => insert_current_fd(fd, replacement),
+        };
+        // Capture the result while the child is alive, before its exit sweep
+        // could hide a close that only released the parent's locks.
+        let after_close = lock(probe, general::F_GETLK);
+        let alive = !handle.is_finished();
+        finish.complete();
+        handle.join();
+        let request = wait4_request(pid as i32, 0).map_err(|_| "wait request")?;
+        kassert!(wait_child(request).map_err(|_| "reap")?.is_some());
+        kassert_eq!(shared_users, 2);
+        kassert_eq!(result.lock().take().ok_or("child result")??.0, 0);
+        kassert_eq!(before?, (0, general::F_WRLCK as i16, pid as i32));
+        kassert!(alive);
+        kassert_eq!(released, Ok(()));
+        kassert_eq!(files.users(), 1);
+        if !matches!(cleanup, LockCleanup::Exit) {
+            kassert_eq!(after_close?.1, general::F_UNLCK as i16);
+        } else {
+            kassert!(current_file(fd).is_some());
+            kassert_eq!(after_close?.1, general::F_WRLCK as i16);
+        }
+        let after_exit = lock(probe, general::F_GETLK)?;
+        kassert_eq!(after_exit.0, 0);
+        kassert_eq!(after_exit.1, general::F_UNLCK as i16);
+        if current_file(fd).is_some() {
+            close_current_fd(fd).map_err(|_| "close")?;
+        }
+        close_current_fd(probe).map_err(|_| "close probe")?;
+        Ok(())
+    })?
+}
+
 crate::ktest!(
     fn shared_files_exit_releases_its_posix_locks() {
-        use crate::{kassert, kassert_eq};
-        fn lock(fd: i32, cmd: u32) -> Result<(u64, i16, i32), &'static str> {
-            let mut raw = [0u8; 32];
-            raw[0..2].copy_from_slice(&(general::F_WRLCK as i16).to_ne_bytes());
-            raw[16..24].copy_from_slice(&10i64.to_ne_bytes());
-            crate::user::copy_to_user(KTEST_USER_VA, &raw).map_err(|_| "write flock")?;
-            let result = hazard_call(general::__NR_fcntl, fd as u64, u64::from(cmd), KTEST_USER_VA, 0);
-            crate::user::copy_from_user(&mut raw, KTEST_USER_VA).map_err(|_| "read flock")?;
-            Ok((
-                result,
-                i16::from_ne_bytes(raw[0..2].try_into().unwrap()),
-                i32::from_ne_bytes(raw[24..28].try_into().unwrap()),
-            ))
+        shared_files_lock_cleanup(LockCleanup::Exit)
+    }
+);
+
+crate::ktest!(
+    fn shared_files_close_releases_all_members_posix_locks() {
+        for cleanup in [LockCleanup::Close, LockCleanup::Dup, LockCleanup::Replace] {
+            shared_files_lock_cleanup(cleanup)?;
         }
-        in_test_process(|_| {
-            let file = open_kernel_file(b"/tmp/c1-exit-lock", OpenFlags::O_CREAT | OpenFlags::O_RDWR, 0o600)
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn shared_files_leave_waits_for_inflight_close() {
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::locks::fcntl_const;
+        use lumen_vfs::{FlockSpec, LockContext, RecordLockOutcome};
+        in_test_process(|pid| {
+            // A stand-in process member exercises the exact sweep/leave path
+            // without needing a second user program or a production pause hook.
+            const MEMBER: u32 = 0x7fff_ffff;
+            let opened = open_kernel_file(b"/tmp/c1-close-leave", OpenFlags::O_CREAT | OpenFlags::O_RDWR, 0o600)
                 .map_err(|_| "open")?;
-            let fd = install_current_fd(file, false).map_err(|_| "install")?;
-            let caller = current_thread();
-            let files = caller.process().files.lock().clone().ok_or("files")?;
-            let new = Process::copy_for_fork(caller.process(), general::CLONE_VM | general::CLONE_FILES)
-                .map_err(|_| "copy child")?;
-            let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
-            let phase = Arc::new((AtomicU32::new(0), sched::WaitQueue::new()));
-            let result = Arc::new(SpinLock::new(None));
-            let (turn, out) = (Arc::clone(&phase), Arc::clone(&result));
-            let handle = sched::spawn_fork_child(
-                "lock-child",
-                new.process.address_space().unwrap(),
-                Arc::clone(&child),
-                0,
-                move || {
-                    turn.1.wait_until(|| turn.0.load(Ordering::SeqCst) != 0);
-                    if turn.0.load(Ordering::SeqCst) == 3 {
-                        drop(sched::set_current_user_thread(None));
-                        drop(sched::detach_user_space());
-                        return;
-                    }
-                    *out.lock() = Some(lock(fd, general::F_SETLK));
-                    turn.0.store(2, Ordering::SeqCst);
-                    turn.1.wake_all();
-                    turn.1.wait_until(|| turn.0.load(Ordering::SeqCst) == 3);
-                    record_exit(UserExit::Exited(0));
-                    let ended = take_current();
-                    assert!(ended.exit.is_some());
-                },
-            )
-            .map_err(|_| "spawn child")?;
-            let linked = PROCS.lock().link_child(&caller, &child);
-            let pid = match linked {
-                Ok(pid) => pid,
-                Err(_) => {
-                    phase.0.store(3, Ordering::SeqCst);
-                    phase.1.wake_all();
-                    handle.join();
-                    return Err("link child");
-                }
+            let fd = install_current_fd(opened, false).map_err(|_| "install")?;
+            let file = current_file(fd).ok_or("file")?;
+            let files = current_process().files.lock().clone().ok_or("files")?;
+            let shared = files.share();
+            shared.enrol(MEMBER);
+            let spec = FlockSpec {
+                l_type: fcntl_const::F_WRLCK,
+                l_whence: fcntl_const::SEEK_SET,
+                l_start: 0,
+                l_len: 10,
+                l_pid: 0,
             };
-            new.linked();
-            let shared_users = files.users();
-            phase.0.store(1, Ordering::SeqCst);
-            phase.1.wake_all();
-            phase.1.wait_until(|| phase.0.load(Ordering::SeqCst) == 2);
-            let before = lock(fd, general::F_GETLK);
-            phase.0.store(3, Ordering::SeqCst);
-            phase.1.wake_all();
-            handle.join();
-            let request = wait4_request(pid as i32, 0).map_err(|_| "wait request")?;
-            kassert!(wait_child(request).map_err(|_| "reap")?.is_some());
-            kassert_eq!(shared_users, 2);
-            kassert_eq!(result.lock().take().ok_or("child result")??.0, 0);
-            kassert_eq!(before?, (0, general::F_WRLCK as i16, pid as i32));
+            let ctx = LockContext { cur_offset: 0, file_size: 0, readable: true, writable: true };
+            let mut closer = None;
+            let mut leaver = None;
+            let mut removed = false;
+            let mut close_blocked = false;
+            let mut leave_blocked = false;
+            let mut members_while_blocked = 0;
+            let mut outcome = Ok(());
+            let held = file.inode().with_locks_mut(&mut |locks| {
+                outcome = (|| {
+                    kassert_eq!(
+                        locks.setlk(MEMBER, spec, ctx, false),
+                        Ok(RecordLockOutcome::Granted { released: false })
+                    );
+                    let mut before = spec;
+                    locks.getlk(pid, &mut before, 0, 0).map_err(|_| "initial GETLK")?;
+                    kassert_eq!(before.l_pid, MEMBER as i32);
+                    closer = Some(spawn_test_thread(move |_| close_current_fd(fd))?);
+                    close_blocked = closer.as_ref().unwrap().settle();
+                    removed = current_file(fd).is_none();
+                    if !removed {
+                        return Ok(());
+                    }
+                    // The inode's sleeping lock pins the close after removal.
+                    // The exit sweep must miss this inode (no fd remains), then
+                    // leave must wait until the closer has scanned its member.
+                    let leaving = Arc::clone(&shared);
+                    leaver = Some(spawn_test_thread(move |_| {
+                        leaving.release_posix_for_pid(MEMBER);
+                        leaving.leave(MEMBER);
+                    })?);
+                    leave_blocked = leaver.as_ref().unwrap().settle();
+                    members_while_blocked = files.users();
+                    Ok(())
+                })();
+            });
+            // Release the inode lock and join before any failing assertion.
+            let closed = closer.map(|thread| thread.join()).transpose();
+            if let Some(thread) = leaver {
+                thread.join()?;
+            } else {
+                shared.release_posix_for_pid(MEMBER);
+                Arc::clone(&shared).leave(MEMBER);
+            }
+            let mut after = spec;
+            let mut queried = Err(VfsError::Io);
+            file.inode()
+                .with_locks_mut(&mut |locks| {
+                    queried = locks.getlk(pid, &mut after, 0, 0);
+                    // Clean up a broken leave/close implementation too, after
+                    // capturing its result so it cannot hide the regression.
+                    let _ = locks.release_posix_for_pid(MEMBER); // no locker waits on this fixture inode
+                })
+                .map_err(|_| "final inode lock")?;
+            held.map_err(|_| "held inode lock")?;
+            outcome?;
+            kassert_eq!(closed?, Some(Ok(())));
+            kassert!(close_blocked && removed);
+            kassert!(leave_blocked);
+            kassert_eq!(members_while_blocked, 2);
             kassert_eq!(files.users(), 1);
-            kassert!(current_file(fd).is_some());
-            let after = lock(fd, general::F_GETLK)?;
-            kassert_eq!(after.0, 0);
-            kassert_eq!(after.1, general::F_UNLCK as i16);
-            close_current_fd(fd).map_err(|_| "close")?;
+            kassert_eq!(queried, Ok(()));
+            kassert_eq!(after.l_type, fcntl_const::F_UNLCK);
             Ok(())
         })?
     }
