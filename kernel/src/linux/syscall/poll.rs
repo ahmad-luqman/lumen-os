@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "ktest")]
 use lumen_signal::restart::RestartCode;
 use lumen_signal::{Blocked, SigSet};
 use lumen_vfs::{MAX_FDS, PollGuard, PollMask, PollWaker};
@@ -29,12 +30,8 @@ use crate::linux::{errno, general};
 use crate::sched;
 use crate::user::{CopyError, copy_from_user, copy_to_user};
 
-/// `-ERESTARTNOHAND` as a positive errno for [`finish`]: restarted unless a
-/// signal handler is delivered (Linux's `select`, `pselect6`, `ppoll`).
-const ERESTARTNOHAND: u32 = RestartCode::NoHand as u32;
+use super::time::{ERESTARTNOHAND, NS_PER_SEC, RawTimespec, read_timespec, write_timespec};
 
-/// `timespec` / `timeval` nanoseconds per second.
-const NS_PER_SEC: u64 = 1_000_000_000;
 /// Microseconds per second.
 const US_PER_SEC: u64 = 1_000_000;
 /// Nanoseconds per microsecond.
@@ -54,14 +51,6 @@ struct RawPollFd {
     fd: i32,
     events: i16,
     revents: i16,
-}
-
-/// Raw Linux x86-64 `struct timespec` layout (16 bytes, zero padding).
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct RawTimespec {
-    tv_sec: i64,
-    tv_nsec: i64,
 }
 
 /// Raw Linux x86-64 `struct timeval` layout (16 bytes, zero padding).
@@ -329,13 +318,7 @@ fn copy_timespec(ptr: UserPtr) -> Result<WaitTimeout, u32> {
     if ptr.is_null() {
         return Ok(WaitTimeout::Forever);
     }
-    // SAFETY: `RawTimespec` is two `i64`s (16 bytes, zero padding); every bit pattern is valid.
-    let ts = unsafe { copy_pod_from_user::<RawTimespec>(ptr.addr()) }.map_err(CopyError::to_errno)?;
-    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= NS_PER_SEC as i64 {
-        return Err(errno::EINVAL);
-    }
-    let dur = (ts.tv_sec as u64).saturating_mul(NS_PER_SEC).saturating_add(ts.tv_nsec as u64);
-    Ok(WaitTimeout::after_ns(dur))
+    Ok(WaitTimeout::after_ns(read_timespec(ptr.addr())?))
 }
 
 fn copy_timeval(ptr: UserPtr) -> Result<WaitTimeout, u32> {
@@ -360,9 +343,7 @@ fn write_remaining_timespec(ptr: UserPtr, timeout: WaitTimeout, timed_out: bool)
         return Ok(());
     }
     let rem_ns = if timed_out { 0 } else { dl.saturating_sub(crate::time::now_ns()) };
-    let ts = RawTimespec { tv_sec: (rem_ns / NS_PER_SEC) as i64, tv_nsec: (rem_ns % NS_PER_SEC) as i64 };
-    // SAFETY: `RawTimespec` has zero padding bytes.
-    unsafe { copy_pod_to_user(ptr.addr(), &ts) }.map_err(CopyError::to_errno)
+    write_timespec(ptr.addr(), rem_ns)
 }
 
 fn write_remaining_timeval(ptr: UserPtr, timeout: WaitTimeout, timed_out: bool) -> Result<(), u32> {

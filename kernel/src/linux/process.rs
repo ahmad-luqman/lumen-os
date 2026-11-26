@@ -700,7 +700,7 @@ pub struct UserThread {
     /// `set_tid_address`'s pointer (M8: `CLONE_CHILD_CLEARTID`'s too).
     clear_child_tid: AtomicU64,
     /// The registered robust-list head, cleared at exec and exit.
-    pub(crate) robust_list: AtomicU64,
+    robust_list: AtomicU64,
     /// Its scheduler thread's id (`sched::threads()`' id).
     kernel_thread: AtomicU64,
     /// Shared notification target: bound before a real thread becomes runnable.
@@ -768,6 +768,21 @@ impl UserThread {
     /// Make `blocked` the signals it blocks.
     pub fn set_blocked(&self, blocked: Blocked) {
         self.process.signal.lock().set_blocked(self.tid(), blocked);
+    }
+
+    /// Store an opaque robust-list head for cleanup on the current mm.
+    pub fn set_robust_list(&self, head: u64) {
+        self.robust_list.store(head, Ordering::Relaxed);
+    }
+
+    /// The registered robust-list head, or zero when none is registered.
+    pub fn robust_list(&self) -> u64 {
+        self.robust_list.load(Ordering::Relaxed)
+    }
+
+    /// Take the registered head exactly once for exit or exec cleanup.
+    pub(crate) fn take_robust_list(&self) -> u64 {
+        self.robust_list.swap(0, Ordering::Relaxed)
     }
 
     /// Record `set_tid_address`'s pointer.
@@ -851,7 +866,6 @@ pub fn lookup(pid: u32) -> Option<Arc<Process>> {
 }
 
 /// The live user thread `tid`.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`; C5's `tkill` next
 pub fn lookup_thread(tid: u32) -> Option<Arc<UserThread>> {
     PROCS.lock().lookup_thread(tid)
 }
@@ -1040,12 +1054,7 @@ fn warn_due(last: Option<u64>, now: u64) -> bool {
 ///    releases it; an exit the heap refuses is retried, every millisecond.
 pub fn take_current() -> Ended {
     let current = current_thread();
-    super::futex::exit_robust_list(&current);
-    let clear = current.clear_child_tid();
-    if clear != 0 && sched::current_address_space().is_some_and(|mm| mm.users() > 1) {
-        let _ = crate::user::copy_to_user(clear, &0u32.to_ne_bytes());
-        let _ = super::futex::wake(clear, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY);
-    }
+    super::futex::release_user_sync(&current, sched::current_address_space().is_some_and(|mm| mm.users() > 1));
     drop(current);
     let thread = sched::set_current_user_thread(None).expect("no Linux process to take down after ring-3 exit");
     drop(sched::detach_user_space());

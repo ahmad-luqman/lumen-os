@@ -198,6 +198,7 @@ def test_futex_timeouts_and_nanosleep(boot, tmp_path):
         "futex-errors-and-demand",
         "futex-and-sleep-floors",
         "futex-wakes-requeues-bitsets",
+        "futex-requeue-wake-limits",
         "futex-keys-across-fork",
         "futex-private-file-cow",
         "futex-robust-owner-death",

@@ -80,6 +80,7 @@ mod signal;
 mod stat;
 mod sys;
 mod task;
+mod time;
 mod timer;
 
 use alloc::vec;

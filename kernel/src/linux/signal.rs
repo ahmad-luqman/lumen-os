@@ -27,15 +27,13 @@ pub struct RestartBlock {
     pub resume: fn(&RestartBlock) -> u64,
     /// The interrupted call's deadline (`time::now_ns`), if it had one: a
     /// restart resumes toward the same deadline, never a fresh one.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // read by C4's and B3's resumes
     pub deadline: Option<u64>,
     /// The rest of its arguments, as its `resume` reads them.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // read by C4's and B3's resumes
     pub args: [u64; 4],
 }
 
 /// A restart code as the handler's `rax` (its negated value).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's and B3's handlers next
+#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // ktests and poll restart checks
 pub const fn restart_result(code: RestartCode) -> u64 {
     (-(code as i64)) as u64
 }
@@ -253,7 +251,6 @@ fn resolve_restart(frame: &mut SyscallFrame, decision: RestartDecision) {
 /// Store a handler's restart block and return its positive errno:
 /// `return Err(interrupted_with(block))`, negated by `syscall::finish`.
 #[must_use]
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C4's and B3's handlers next
 pub fn interrupted_with(block: RestartBlock) -> u32 {
     debug_assert!(sched::restart_block().is_none(), "a handler replaced an unconsumed restart block");
     sched::set_restart_block(Some(block));

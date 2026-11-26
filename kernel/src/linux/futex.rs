@@ -1,4 +1,4 @@
-//! Backing identities and allocation-free locked futex queues. User faults,
+//! Robust lists, backing identities and allocation-free locked futex queues. User faults,
 //! scheduler notifications and node destruction happen outside bucket locks.
 
 use alloc::{boxed::Box, sync::Arc};
@@ -13,11 +13,23 @@ use crate::{sched, sync::SpinLock, time, user};
 /// virtual address. Shared keys identify the backing observed under Lock 1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FutexKey {
+    /// A private operation, scoped to one address space and virtual word.
     Private { space: u64, uaddr: u64 },
+    /// A shared operation on process-private memory, scoped to its address space.
     Anon { space: u64, uaddr: u64 },
+    /// A page-cache word identified by file identity and byte offset.
     File { file_id: u64, offset: u64 },
+    /// A shared anonymous word; this key holds no reference to the frame.
     SharedFrame { frame: u64, offset: u64 },
 }
+
+/// Resolution may require breaking a writable private file mapping's CoW.
+pub(crate) enum KeyResolution {
+    Key(FutexKey),
+    NeedsWriteFault,
+}
+
+const BUCKETS: usize = 256;
 
 impl FutexKey {
     fn bucket(self) -> usize {
@@ -30,7 +42,7 @@ impl FutexKey {
         let mut h = a.rotate_left(17) ^ b ^ tag;
         h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        ((h ^ (h >> 31)) & 255) as usize
+        (h ^ (h >> 31)) as usize & (BUCKETS - 1)
     }
 }
 
@@ -40,15 +52,25 @@ struct FutexWaiter {
     queue: sched::WaitQueue,
 }
 
+impl FutexWaiter {
+    fn new(bucket: usize) -> Self {
+        Self { bucket: BucketIndex::new(bucket), woken: AtomicBool::new(false), queue: sched::WaitQueue::new() }
+    }
+}
+
+fn cancel(waiter: &Arc<FutexWaiter>) -> CancelOutcome<FutexKey, Arc<FutexWaiter>> {
+    waiter.bucket.cancel_in(|b| FUTEX_BUCKETS[b].lock(), |w| Arc::ptr_eq(w, waiter))
+}
+
 type Table = FutexTable<FutexKey, Arc<FutexWaiter>>;
-static FUTEX_BUCKETS: [SpinLock<Table>; 256] = [const { SpinLock::new(FutexTable::new()) }; 256];
+static FUTEX_BUCKETS: [SpinLock<Table>; BUCKETS] = [const { SpinLock::new(FutexTable::new()) }; BUCKETS];
 
 fn validate_address(addr: u64) -> Result<(), u32> {
-    if !(lumen_vm::USER_MIN..lumen_vm::USER_MAX).contains(&addr) {
-        return Err(errno::EFAULT);
-    }
     if !addr.is_multiple_of(4) {
         return Err(errno::EINVAL);
+    }
+    if !(lumen_vm::USER_MIN..lumen_vm::USER_MAX).contains(&addr) {
+        return Err(errno::EFAULT);
     }
     Ok(())
 }
@@ -74,7 +96,7 @@ fn key(addr: u64, private: bool) -> Result<FutexKey, u32> {
     }
     loop {
         read_word(addr)?;
-        if let Some(key) = space.futex_key(addr)? {
+        if let KeyResolution::Key(key) = space.futex_key(addr)? {
             return Ok(key);
         }
         // A writable private file mapping must be keyed by its private copy
@@ -110,11 +132,7 @@ pub(super) fn wait(
     deadline: Option<u64>,
 ) -> Result<u64, u32> {
     validate_address(addr)?;
-    let waiter = Arc::new(FutexWaiter {
-        bucket: BucketIndex::new(0),
-        woken: AtomicBool::new(false),
-        queue: sched::WaitQueue::new(),
-    });
+    let waiter = Arc::new(FutexWaiter::new(0));
     let mut node = Box::new(FutexNode::new(waiter.clone(), bits));
     loop {
         let key = key(addr, private)?;
@@ -135,11 +153,11 @@ pub(super) fn wait(
         let reason = waiter.queue.wait_interruptible(deadline, || waiter.woken.load(Ordering::Acquire));
         #[cfg(feature = "ktest")]
         cancel_window::pause(addr);
-        match waiter.bucket.cancel_in(|b| FUTEX_BUCKETS[b].lock(), |w| Arc::ptr_eq(w, &waiter)) {
+        match cancel(&waiter) {
             CancelOutcome::AlreadyWoken => return Ok(0),
             CancelOutcome::Cancelled(cancelled) => node = cancelled,
         }
-        if deadline.is_some_and(|d| time::now_ns() >= d) {
+        if reason == sched::Wake::TimedOut || deadline.is_some_and(|d| time::now_ns() >= d) {
             return Err(errno::ETIMEDOUT);
         }
         if reason == sched::Wake::Interrupted {
@@ -155,10 +173,10 @@ pub(super) fn requeue(
     private: bool,
     count: i32,
     dest: u64,
-    moved: i32,
+    nr_requeue: i32,
     expected: Option<u32>,
 ) -> Result<u64, u32> {
-    lumen_futex::check_requeue_counts(count, moved).map_err(|_| errno::EINVAL)?;
+    lumen_futex::check_requeue_counts(count, nr_requeue).map_err(|_| errno::EINVAL)?;
     loop {
         let from = key(addr, private)?;
         let to = key(dest, private)?;
@@ -180,9 +198,9 @@ pub(super) fn requeue(
         let mark = |waiter: &Arc<FutexWaiter>, _| waiter.bucket.set(b2);
         let result = if let Some(second) = second.as_mut() {
             let (src, dst) = if b1 < b2 { (&mut first, second) } else { (second, &mut first) };
-            src.requeue_into(from, dst, to, count, moved, mark)
+            src.requeue_into(from, dst, to, count, nr_requeue, mark)
         } else {
-            first.requeue(from, to, count, moved, mark)
+            first.requeue(from, to, count, nr_requeue, mark)
         };
         drop(second);
         drop(first);
@@ -197,12 +215,12 @@ fn read_u64(addr: u64) -> Result<u64, u32> {
     Ok(u64::from_ne_bytes(word))
 }
 
-fn owner_died(addr: u64, tid: u32, pending: bool) -> Result<(), u32> {
+fn owner_died(addr: u64, tid: u32, pending: bool, pi: bool) -> Result<(), u32> {
     validate_address(addr)?;
     loop {
         let word = read_word(addr)?;
         if word & general::FUTEX_TID_MASK != tid {
-            if pending && (word & general::FUTEX_TID_MASK == 0 || word & general::FUTEX_WAITERS == 0) {
+            if pending && !pi && word & general::FUTEX_TID_MASK == 0 {
                 wake(addr, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY)?;
             }
             return Ok(());
@@ -212,7 +230,7 @@ fn owner_died(addr: u64, tid: u32, pending: bool) -> Result<(), u32> {
             Err(_) => fault_write(addr)?,
             Ok(found) if found != word => continue,
             Ok(_) => {
-                if word & general::FUTEX_WAITERS != 0 {
+                if !pi && word & general::FUTEX_WAITERS != 0 {
                     wake(addr, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY)?;
                 }
                 return Ok(());
@@ -222,23 +240,30 @@ fn owner_died(addr: u64, tid: u32, pending: bool) -> Result<(), u32> {
 }
 
 fn walk_robust(head: u64, tid: u32) -> Result<(), u32> {
-    let mut entry = read_u64(head)?;
-    let offset = read_u64(head.checked_add(8).ok_or(errno::EFAULT)?)?;
-    let pending = read_u64(head.checked_add(16).ok_or(errno::EFAULT)?)?;
-    for _ in 0..2048 {
+    let mut bytes = [0; size_of::<general::robust_list_head>()];
+    user::copy_from_user(&mut bytes, head).map_err(|_| errno::EFAULT)?;
+    // SAFETY: the x86-64 UAPI POD consists of two raw pointers and a long;
+    // every bit pattern is valid, all bytes were copied, and no pointer is dereferenced here.
+    let header = unsafe { bytes.as_ptr().cast::<general::robust_list_head>().read_unaligned() };
+    let mut entry = header.list.next as u64;
+    let offset = header.futex_offset as u64;
+    let pending = header.list_op_pending as u64;
+    for _ in 0..general::ROBUST_LIST_LIMIT {
         let address = entry & !1;
         if address == head {
             break;
         }
-        let next = read_u64(address)?;
-        // The low pointer bit denotes a PI entry, unsupported by this ABI.
-        if entry & 1 == 0 && address != pending & !1 {
-            owner_died(address.wrapping_add(offset), tid, false)?;
+        let next = read_u64(address);
+        // Lumen has no PI futexes. Still mark a PI owner's death, but leave
+        // its wake to PI machinery (Linux's exit_pi_state), never futex_wake.
+        if address != pending & !1 {
+            owner_died(address.wrapping_add(offset), tid, false, entry & 1 != 0)?;
         }
-        entry = next;
+        // Even an unreadable next pointer must not prevent handling this owner.
+        entry = next?;
     }
-    if pending != 0 && pending & 1 == 0 {
-        owner_died(pending.wrapping_add(offset), tid, true)?;
+    if pending & !1 != 0 {
+        owner_died((pending & !1).wrapping_add(offset), tid, true, pending & 1 != 0)?;
     }
     Ok(())
 }
@@ -246,10 +271,24 @@ fn walk_robust(head: u64, tid: u32) -> Result<(), u32> {
 /// Release a thread's robust list on its old address space, before clearing
 /// its child tid. A malformed list aborts cleanup, never the thread's exit.
 pub fn exit_robust_list(thread: &UserThread) {
-    let head = thread.robust_list.swap(0, Ordering::Relaxed);
-    if head != 0 {
-        let _ = walk_robust(head, thread.tid());
+    let head = thread.take_robust_list();
+    if head != 0
+        && let Err(error) = walk_robust(head, thread.tid())
+    {
+        log::debug!(target: "futex", "robust cleanup abandoned: tid={} head={head:#x} errno={error}", thread.tid());
     }
+}
+
+/// Release robust locks on the old mm, then clear and wake the child-tid
+/// word when another mm user can be waiting. User faults do not prevent exit.
+pub fn release_user_sync(thread: &UserThread, mm_shared: bool) {
+    exit_robust_list(thread);
+    let clear = thread.clear_child_tid();
+    if clear != 0 && mm_shared {
+        let _ = user::copy_to_user(clear, &0u32.to_ne_bytes());
+        let _ = wake(clear, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY);
+    }
+    thread.set_clear_child_tid(0);
 }
 
 /// A one-shot test pause after a wait returns and before it cancels its node.
@@ -287,6 +326,26 @@ crate::ktest!(
                     .find(|&addr| key(addr, true).is_ok_and(|k| (k.bucket() == source.bucket()) == same_bucket))
                     .ok_or("no destination bucket")?;
                 let destination = key(dest, true).map_err(|_| "destination key")?;
+                // Exercise requeue's notification before any scheduler race:
+                // woken is the condition its real blocked thread must observe.
+                let waiters: [Arc<FutexWaiter>; 2] =
+                    core::array::from_fn(|_| Arc::new(FutexWaiter::new(source.bucket())));
+                for waiter in &waiters {
+                    let node = Box::new(FutexNode::new(waiter.clone(), ANY));
+                    FUTEX_BUCKETS[source.bucket()].lock().enqueue(source, node);
+                }
+                let requeued = requeue(A, true, 1, dest, 1, Some(0));
+                let first_notified = waiters[0].woken.load(Ordering::Acquire);
+                let second_notified = waiters[1].woken.load(Ordering::Acquire);
+                let wake_rest = wake(dest, true, 2, ANY);
+                for waiter in &waiters {
+                    drop(cancel(waiter));
+                }
+                kassert_eq!(requeued, Ok(2));
+                kassert!(first_notified);
+                kassert!(!second_notified);
+                kassert_eq!(wake_rest, Ok(1));
+                kassert!(waiters[1].woken.load(Ordering::Acquire));
                 let child = spawn_test_thread(move |_| {
                     let result = wait(A, true, 0, ANY, None);
                     sched::clear_current_sigpending();
@@ -299,7 +358,7 @@ crate::ktest!(
                 kassert_eq!(FUTEX_BUCKETS[destination.bucket()].lock().count_for_key(destination), 0);
             }
             // Force a signal return, then let a wake claim the node before
-            // cancellation. Returning EINTR without checking AlreadyWoken fails.
+            // cancellation. Returning ERESTARTSYS without checking AlreadyWoken fails.
             let pause = Arc::new(cancel_window::Pause {
                 addr: A,
                 entered: AtomicBool::new(false),
@@ -345,9 +404,9 @@ crate::ktest!(
             put64(entry, head)?;
             put32(entry + 8, tid | general::FUTEX_WAITERS)?;
             put32(pending + 8, tid)?;
-            current_thread().robust_list.store(head, Ordering::Relaxed);
+            current_thread().set_robust_list(head);
             exit_robust_list(&current_thread());
-            kassert_eq!(current_thread().robust_list.load(Ordering::Relaxed), 0);
+            kassert_eq!(current_thread().robust_list(), 0);
             kassert_eq!(read_word(entry + 8), Ok(general::FUTEX_WAITERS | general::FUTEX_OWNER_DIED));
             kassert_eq!(read_word(pending + 8), Ok(general::FUTEX_OWNER_DIED));
 
@@ -356,32 +415,58 @@ crate::ktest!(
             for (word, pending, should_wake) in [
                 (0, true, true),
                 (general::FUTEX_WAITERS, true, true),
-                (tid + 1, true, true),
+                (tid + 1, true, false),
                 ((tid + 1) | general::FUTEX_WAITERS, true, false),
                 (0, false, false),
             ] {
                 put32(entry + 8, word)?;
                 let key = key(entry + 8, false).map_err(|_| "key")?;
-                let waiter = Arc::new(FutexWaiter {
-                    bucket: BucketIndex::new(key.bucket()),
-                    woken: AtomicBool::new(false),
-                    queue: sched::WaitQueue::new(),
-                });
+                let waiter = Arc::new(FutexWaiter::new(key.bucket()));
                 let node = Box::new(FutexNode::new(waiter.clone(), ANY));
                 FUTEX_BUCKETS[key.bucket()].lock().enqueue(key, node);
-                let handled = owner_died(entry + 8, tid, pending);
-                let cancelled = waiter.bucket.cancel_in(|b| FUTEX_BUCKETS[b].lock(), |w| Arc::ptr_eq(w, &waiter));
+                let handled = owner_died(entry + 8, tid, pending, false);
+                let cancelled = cancel(&waiter);
                 kassert_eq!(handled, Ok(()));
                 kassert_eq!(read_word(entry + 8), Ok(word));
                 kassert_eq!(waiter.woken.load(Ordering::Acquire), should_wake);
                 kassert_eq!(matches!(cancelled, CancelOutcome::AlreadyWoken), should_wake);
             }
-            // A fault in the next pointer aborts before mutating its word or
-            // touching pending. A negative offset is handled as signed addition.
-            put64(head, 0x4000)?;
-            put32(A + 72, tid)?;
+            // PI owners are marked dead, but never get an ordinary wake.
+            // A pending entry also linked in the list is processed just once.
+            for pi in [false, true] {
+                for is_pending in [false, true] {
+                    let tagged = entry | u64::from(pi);
+                    put64(head, tagged)?;
+                    put64(head + 16, if is_pending { tagged } else { 0 })?;
+                    put64(entry, head)?;
+                    put32(entry + 8, tid | general::FUTEX_WAITERS)?;
+                    let key = key(entry + 8, false).map_err(|_| "PI key")?;
+                    let waiters: [Arc<FutexWaiter>; 2] =
+                        core::array::from_fn(|_| Arc::new(FutexWaiter::new(key.bucket())));
+                    for waiter in &waiters {
+                        let node = Box::new(FutexNode::new(waiter.clone(), ANY));
+                        FUTEX_BUCKETS[key.bucket()].lock().enqueue(key, node);
+                    }
+                    let result = walk_robust(head, tid);
+                    for waiter in &waiters {
+                        drop(cancel(waiter));
+                    }
+                    kassert_eq!(result, Ok(()));
+                    kassert_eq!(read_word(entry + 8), Ok(general::FUTEX_WAITERS | general::FUTEX_OWNER_DIED));
+                    kassert_eq!(waiters.iter().filter(|w| w.woken.load(Ordering::Acquire)).count(), usize::from(!pi));
+                }
+            }
+            // The next pointer is unreadable but the current futex lies just
+            // before it on a mapped page. Handle this owner, then abandon pending.
+            let hole = A + super::process::KTEST_USER_LEN;
+            put64(head, hole)?;
+            put64(head + 8, (-4i64) as u64)?;
+            put64(head + 16, pending)?;
+            put32(hole - 4, tid)?;
+            put32(pending - 4, tid)?;
             kassert_eq!(walk_robust(head, tid), Err(errno::EFAULT));
-            kassert_eq!(read_word(A + 72), Ok(tid));
+            kassert_eq!(read_word(hole - 4), Ok(general::FUTEX_OWNER_DIED));
+            kassert_eq!(read_word(pending - 4), Ok(tid));
             put64(head, entry)?;
             put64(head + 8, (-4i64) as u64)?;
             put64(head + 16, 0)?;

@@ -1442,10 +1442,11 @@ impl AddressSpace {
         self.inner.lock().vmas.find(addr).is_some()
     }
 
-    /// Snapshot a resident shared futex's backing under Lock 1. `None`
-    /// requests a writable fault before retrying a private file's cache page.
-    pub(crate) fn futex_key(&self, addr: u64) -> Result<Option<crate::linux::futex::FutexKey>, u32> {
-        use crate::linux::futex::FutexKey;
+    /// Resolve backing for every non-private futex operation under Lock 1.
+    /// Unmapped, nonresident, non-user and PROT_NONE pages return EFAULT.
+    /// A writable private file cache leaf requests a write fault before retry.
+    pub(crate) fn futex_key(&self, addr: u64) -> Result<crate::linux::futex::KeyResolution, u32> {
+        use crate::linux::futex::{FutexKey, KeyResolution};
         let inner = self.inner.lock();
         let vma = inner.vmas.find(addr).ok_or(errno::EFAULT)?;
         let WalkEnd::Mapped(leaf) = paging::walk_user(self.root, VirtAddr::new(addr).ok_or(errno::EFAULT)?).end()
@@ -1455,17 +1456,25 @@ impl AddressSpace {
         if !leaf.user || vma.prot.is_none() {
             return Err(errno::EFAULT);
         }
+        let anon = FutexKey::Anon { space: self.root.as_u64(), uaddr: addr };
         let key = match vma.backing {
-            Backing::File(file) if !file.shared && vma.prot.write() && leaf.shared => return Ok(None),
-            Backing::File(file) if leaf.shared => {
-                FutexKey::File { file_id: file.file_id, offset: file.offset + addr - vma.start }
+            Backing::File(file) => {
+                debug_assert!(!file.shared || leaf.shared, "MAP_SHARED file must retain a page-cache leaf");
+                if !file.shared && vma.prot.write() && leaf.shared {
+                    return Ok(KeyResolution::NeedsWriteFault);
+                }
+                if leaf.shared {
+                    FutexKey::File { file_id: file.file_id, offset: file.offset + addr - vma.start }
+                } else {
+                    anon
+                }
             }
             Backing::Anonymous { shared: true } => {
                 FutexKey::SharedFrame { frame: leaf.phys.as_u64(), offset: addr % PAGE_SIZE }
             }
-            _ => FutexKey::Anon { space: self.root.as_u64(), uaddr: addr },
+            Backing::Anonymous { shared: false } => anon,
         };
-        Ok(Some(key))
+        Ok(KeyResolution::Key(key))
     }
 
     /// Resolve a demand-paging `#PF` at `fault_addr` with CPU `error_code`.

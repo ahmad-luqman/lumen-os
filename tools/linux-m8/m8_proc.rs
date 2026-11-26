@@ -59,6 +59,30 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
 use common::{R, eq, ok, sys};
 use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
+// C4 futex and sleep ABI constants shared by the ring-3 checks.
+const SYS_FUTEX: u64 = 202;
+const SYS_NANOSLEEP: u64 = 35;
+const SYS_CLOCK_NANOSLEEP: u64 = 230;
+const SYS_CLOCK_GETTIME: u64 = 228;
+const SYS_SET_TID_ADDRESS: u64 = 218;
+const SYS_SET_ROBUST_LIST: u64 = 273;
+const SYS_GET_ROBUST_LIST: u64 = 274;
+const SYS_FUTEX_WAITV: u64 = 449;
+const SYS_MPROTECT: u64 = 10;
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_CMP_REQUEUE: u64 = 4;
+const FUTEX_WAIT_BITSET: u64 = 9;
+const FUTEX_WAKE_BITSET: u64 = 10;
+const FUTEX_PRIVATE_FLAG: u64 = 128;
+const FUTEX_CLOCK_REALTIME: u64 = 256;
+const MAP_SHARED: u64 = 1;
+const MAP_ANONYMOUS: u64 = 0x20;
+const EAGAIN: i64 = 11;
+const ETIMEDOUT: i64 = 110;
+const ESRCH: i64 = 3;
+
 const SYS_READ: u64 = 0;
 const SYS_KILL: u64 = 62;
 const SYS_FTRUNCATE: u64 = 77;
