@@ -194,8 +194,9 @@ def test_ash_scripts_and_pipelines(boot, tmp_path):
 
     External commands carry more than a pipe's capacity through three stages;
     redirections, subshell isolation, command substitution, signal/EXIT traps
-    and background waits preserve data, exit statuses and child reaping. FIFO
-    handshakes establish readiness before releasing either background job.
+    and selected background waits preserve data, exit statuses and child reaping.
+    FIFO handshakes establish readiness for selected waits. Bare wait returns
+    zero and leaves both children reaped; this does not prove it blocked.
     The changed ext4 files survive sync and pass the host's fsck.
     """
     disk = copy_dev_rootfs(tmp_path)
@@ -317,13 +318,15 @@ printf 'wait-first=%s\n' "$status"
 assert_reaped "$first" selected-first
 /bin/busybox cat first-result
 
-(printf 'all-a\n' > all-a) &
+# Bare wait returns zero despite distinct non-zero child statuses, and leaves
+# both children reaped. This does not prove it blocked while they were alive:
+# ash can incidentally reap finished children before the kill -0 checks.
+(printf 'all-a\n' > all-a; exit 3) &
 all_a=$!
-(printf 'all-b\n' > all-b) &
+(printf 'all-b\n' > all-b; exit 5) &
 all_b=$!
-wait
-# File contents alone cannot prove wait ran: both writers may finish first.
-# kill -0 still succeeds on a zombie, so require both children to be reaped.
+if wait; then status=0; else status=$?; fi
+printf 'wait-all=%s\n' "$status"
 assert_reaped "$all_a" wait-all-a
 assert_reaped "$all_b" wait-all-b
 /bin/busybox cat all-a all-b
@@ -366,6 +369,7 @@ exit 23
         "second-done",
         "wait-first=7",
         "first-done",
+        "wait-all=0",
         "all-a",
         "all-b",
         "exit-trap=23",
