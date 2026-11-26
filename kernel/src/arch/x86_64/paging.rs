@@ -94,6 +94,52 @@ pub unsafe fn write_cr3(root: u64) {
 pub fn invalidate(virt: VirtAddr) {
     // SAFETY: invlpg only discards a cached translation.
     unsafe { asm!("invlpg [{}]", in(reg) virt.as_u64(), options(nostack, preserves_flags)) }
+    #[cfg(feature = "ktest")]
+    invalidate_watch::record(virt);
+}
+
+/// Ktest-only observer of local [`invalidate`] calls for a single `(root, va)`.
+#[cfg(feature = "ktest")]
+pub mod invalidate_watch {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use lumen_mm::{PhysFrame, VirtAddr};
+
+    static WATCH_ROOT: AtomicU64 = AtomicU64::new(0);
+    static WATCH_VA: AtomicU64 = AtomicU64::new(0);
+    static HITS: AtomicU32 = AtomicU32::new(0);
+
+    /// RAII guard recording [`super::invalidate`] calls on `va` while `root` is active.
+    pub struct Watch;
+
+    impl Watch {
+        pub fn new(root: PhysFrame, va: u64) -> Self {
+            HITS.store(0, Ordering::Relaxed);
+            WATCH_ROOT.store(root.as_u64(), Ordering::Relaxed);
+            WATCH_VA.store(va, Ordering::Release);
+            Self
+        }
+
+        pub fn hits(&self) -> u32 {
+            HITS.load(Ordering::Acquire)
+        }
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            WATCH_VA.store(0, Ordering::Release);
+            WATCH_ROOT.store(0, Ordering::Release);
+        }
+    }
+
+    pub(super) fn record(virt: VirtAddr) {
+        let va = WATCH_VA.load(Ordering::Acquire);
+        if va == 0 || va != virt.as_u64() {
+            return;
+        }
+        if super::active_root().as_u64() == WATCH_ROOT.load(Ordering::Relaxed) {
+            HITS.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// Make the CPU honour the NX bit and read-only pages in supervisor mode.

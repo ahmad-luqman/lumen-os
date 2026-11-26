@@ -1241,9 +1241,10 @@ whose `active` has another CPU in it:
 Tested by `ktest:lumen_kernel::mm::tlb::shootdown_across_cpus` (B5),
 `ktest:lumen_kernel::mm::frame::refcount_and_cow_split` (B4),
 `ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only` (B4),
-and (future, C11: cross-CPU `fork` write-protect)
-`scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
-(section 15, "M8's tests", says what each checks).
+`ktest:lumen_kernel::mm::user_vm::concurrent_cow_split_frees_old_frame_once` (C11),
+and `scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
+(C11: cross-CPU `munmap`, `mprotect`, `fork` write-protect, and CoW split;
+section 15, "M8's tests", says what each checks).
 
 **Truncate reaching every address space (B7, built).** M7's
 `invalidate_file_from` works on one space at a time. In M8 each
@@ -10891,6 +10892,16 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `CLONE_VM` pair would (the first lowering doesn't tear the space down;
   an extra `Arc` held by the test doesn't delay the teardown at 0);
   `teardown` releasing its references and freeing frames only at zero.
+- `ktest:lumen_kernel::mm::user_vm::concurrent_cow_split_frees_old_frame_once`
+  (C11, routed from B4 review): two address spaces (parent and forked child)
+  entered on two CPUs concurrently store to one count-2 private page, held
+  at the ktest-only `cow_split_seam` after the count check so both take the
+  copy path and the second release reaches `Remaining::Free`: both leaves end
+  distinct and writable at count 1, the old frame is freed exactly once (net
+  `-1` free-frame delta), and each space reads its own bytes; also proves
+  count-1 reuse calls `arch::paging::invalidate` on the active address space
+  via `arch::paging::invalidate_watch` before user writes proceed (and skips
+  it when the space is inactive).
 - `ktest:lumen_kernel::mm::user_vm::mprotect_keeps_a_shared_frame_read_only`
   (B4): `mprotect(PROT_WRITE)` on a private leaf whose count is 2 leaves it
   read-only, and the next write splits it (including a PROT_NONE page);

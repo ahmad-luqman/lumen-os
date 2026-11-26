@@ -42,7 +42,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Cross-CPU ring-3 TLB shootdowns (#390, C11): pinned readers on every CPU observe SIGSEGV with zero stale reads after single-page and >32-page munmap and narrowing mprotect (PROT_NONE and PROT_READ), threaded fork write-protect flushes remote writers so children never see post-fork writes, and CoW splits shoot down sibling readers; concurrent two-CPU CoW splits free the shared frame exactly once and count-1 reuse invalidates the local TLB immediately"
+name = "Cross-CPU ring-3 TLB shootdowns (#390, C11): pinned readers on every CPU observe SIGSEGV with zero stale reads after single-page and >32-page munmap and narrowing mprotect to PROT_NONE, pinned writers observe SIGSEGV with zero stale stores while reads still succeed after narrowing mprotect to PROT_READ, threaded fork write-protect flushes remote writers so children never see post-fork writes, and CoW splits shoot down sibling readers; concurrent two-CPU CoW splits free the shared frame exactly once and count-1 reuse invalidates the local TLB immediately"
 milestone = "M8"
 tests = [
     "scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown",
@@ -50,7 +50,7 @@ tests = [
 ]
 
 [[feature]]
-name = "Cross-CPU userspace synchronization stress (#390, C11): threads pinned across every online CPU contend on a musl pthread_mutex counter and hand turns through pthread_cond_broadcast and pthread_cond_signal with exact totals and zero torn updates"
+name = "Cross-CPU userspace synchronization stress (#390, C11): threads pinned across every online CPU contend on a musl pthread_mutex counter and hand turns through pthread_cond_broadcast and pthread_cond_signal with exact totals and zero torn updates, with ps confirming contenders block in the kernel before mutex unlock and cond broadcast"
 milestone = "M8"
 tests = [
     "scenario:test_linux_proc::test_futex_and_pthread_mutex_stress",

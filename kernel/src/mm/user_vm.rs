@@ -4341,6 +4341,7 @@ crate::ktest!(
         use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
         const VA: u64 = 0x3c0_0000;
         const VA2: u64 = VA + PAGE_SIZE;
+        const VA3: u64 = VA + 2 * PAGE_SIZE;
         const INIT_WORD: u32 = 0x1122_3344;
         const NEXT_WORD: u32 = 0x5566_7788;
 
@@ -4356,18 +4357,20 @@ crate::ktest!(
         }
         pattern[..8].copy_from_slice(b"original");
 
-        let mut two_pages = alloc::vec![0u8; 2 * PAGE_SIZE as usize];
-        two_pages[..PAGE_SIZE as usize].copy_from_slice(&pattern);
-        two_pages[PAGE_SIZE as usize..PAGE_SIZE as usize + 4].copy_from_slice(&INIT_WORD.to_ne_bytes());
+        let mut three_pages = alloc::vec![0u8; 3 * PAGE_SIZE as usize];
+        three_pages[..PAGE_SIZE as usize].copy_from_slice(&pattern);
+        three_pages[PAGE_SIZE as usize..PAGE_SIZE as usize + 4].copy_from_slice(&INIT_WORD.to_ne_bytes());
+        three_pages[2 * PAGE_SIZE as usize..2 * PAGE_SIZE as usize + 4].copy_from_slice(&INIT_WORD.to_ne_bytes());
 
         let parent = Arc::new(AddressSpace::new().map_err(|_| "parent")?);
-        parent.map_eager_with_bytes(VA, 2 * PAGE_SIZE, RW, &two_pages).map_err(|_| "eager")?;
+        parent.map_eager_with_bytes(VA, 3 * PAGE_SIZE, RW, &three_pages).map_err(|_| "eager")?;
         let old = file_vm_leaf(&parent, VA).ok_or("old leaf")?.phys;
         let old2 = file_vm_leaf(&parent, VA2).ok_or("old2 leaf")?.phys;
-        kassert_eq!((frame::user_count(old), frame::user_count(old2)), (1, 1));
+        let old3 = file_vm_leaf(&parent, VA3).ok_or("old3 leaf")?.phys;
+        kassert_eq!((frame::user_count(old), frame::user_count(old2), frame::user_count(old3)), (1, 1, 1));
 
         let child = parent.fork_copy().map_err(|_| "fork_copy")?;
-        kassert_eq!((frame::user_count(old), frame::user_count(old2)), (2, 2));
+        kassert_eq!((frame::user_count(old), frame::user_count(old2), frame::user_count(old3)), (2, 2, 2));
 
         let seam = cow_split_seam::Arm::new(old);
         let ready = AtomicU32::new(0);
@@ -4456,25 +4459,39 @@ crate::ktest!(
             kassert!(page[8..] == pattern[8..]);
         }
 
-        // Part 2: count-1 reuse must execute `invlpg` on the active space so a
-        // subsequent nofault write succeeds immediately without a stale-TLB fault.
-        child.munmap(VA2, PAGE_SIZE).map_err(|_| "child munmap VA2")?;
-        kassert_eq!(frame::user_count(old2), 1);
+        // Part 2: count-1 reuse must execute `invlpg` on the active space before
+        // returning (verified directly via `invalidate_watch` so TCG's split
+        // read/write softmmu TLB cannot mask a missing `invlpg`).
+        child.munmap(VA2, 2 * PAGE_SIZE).map_err(|_| "child munmap VA2..VA3")?;
+        kassert_eq!((frame::user_count(old2), frame::user_count(old3)), (1, 1));
         kassert!(!file_vm_leaf(&parent, VA2).ok_or("parent VA2")?.writable);
+        kassert!(!file_vm_leaf(&parent, VA3).ok_or("parent VA3")?.writable);
         {
             let _active = UserSpaceGuard::enter(parent.clone());
             // Prime TLB with the read-only translation and confirm a nofault store faults.
             kassert_eq!(read_u32_nofault(VA2), Ok(INIT_WORD));
             kassert_eq!(cmpxchg_u32(VA2, INIT_WORD, NEXT_WORD), Err(Fault));
+            let watch = arch::paging::invalidate_watch::Watch::new(parent.root(), VA2);
             // Resolve write fault directly (present | write | user); count-1 path reuses & invlpgs.
             kassert_eq!(parent.handle_page_fault(VA2, 0x7), FaultResult::Resolved);
-            // Without `invlpg`, the cached RO TLB entry makes this nofault store fail with Fault.
+            // Deterministic proof that count-1 reuse flushed `VA2` on the active CR3.
+            kassert_eq!(watch.hits(), 1);
+            drop(watch);
             kassert_eq!(cmpxchg_u32(VA2, INIT_WORD, NEXT_WORD), Ok(INIT_WORD));
             kassert_eq!(read_u32_nofault(VA2), Ok(NEXT_WORD));
+        }
+        // Negative control: when `parent` is not loaded in CR3, count-1 reuse does not invlpg.
+        {
+            let watch = arch::paging::invalidate_watch::Watch::new(parent.root(), VA3);
+            kassert_eq!(parent.handle_page_fault(VA3, 0x7), FaultResult::Resolved);
+            kassert_eq!(watch.hits(), 0);
         }
         let reused = file_vm_leaf(&parent, VA2).ok_or("parent VA2 after reuse")?;
         kassert_eq!(reused.phys, old2);
         kassert!(reused.writable);
+        let reused3 = file_vm_leaf(&parent, VA3).ok_or("parent VA3 after reuse")?;
+        kassert_eq!(reused3.phys, old3);
+        kassert!(reused3.writable);
 
         child.teardown();
         parent.teardown();

@@ -46,6 +46,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
         [_, b"c6-wait", kind, mode] => signal_waits::blocking(kind, *mode == b"restart"),
         [_, b"futex"] => futex::run(),
         [_, b"futex-stress"] => futex::stress(),
+        [_, b"futex-block"] => futex::block_witness(),
         [_, b"smp-workload"] => threads::smp_workload(),
         [_, b"small-syscalls"] => small::run(),
         [_, b"small-comm"] => small::comm_child(),

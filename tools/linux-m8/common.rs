@@ -215,6 +215,7 @@ pub const SYS_DUP2: u64 = 33;
 pub const SYS_FORK: u64 = 57;
 pub const SYS_EXECVE: u64 = 59;
 pub const SYS_EXIT: u64 = 60;
+pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_WAIT4: u64 = 61;
 pub const SYS_FCNTL: u64 = 72;
 pub const SYS_FLOCK: u64 = 73;
@@ -253,6 +254,66 @@ pub fn pipe(flags: u64) -> Result<[i32; 2], Fail> {
     let mut pair = [-1; 2];
     eq("pipe2", sys(SYS_PIPE2, [pair.as_mut_ptr() as u64, flags, 0, 0, 0, 0]), 0)?;
     Ok(pair)
+}
+
+/// Terminate every thread of the process immediately without returning through
+/// borrowed stack frames.
+pub fn exit_group(code: u64) -> ! {
+    sys(SYS_EXIT_GROUP, [code, 0, 0, 0, 0, 0]);
+    // SAFETY: fallback termination if exit_group ever returned.
+    unsafe { _exit(code as c_int) }
+}
+
+/// Lock-free first-error slot shared across worker threads so a worker failure
+/// preserves the operation name and errno without hanging or allocating.
+pub struct WorkerError {
+    state: core::sync::atomic::AtomicU32, // 0 = ok, 1 = writing, 2 = published
+    what_ptr: core::sync::atomic::AtomicU64,
+    what_len: core::sync::atomic::AtomicU64,
+    got: core::sync::atomic::AtomicI64,
+}
+
+impl WorkerError {
+    pub const fn new() -> Self {
+        use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64};
+        Self {
+            state: AtomicU32::new(0),
+            what_ptr: AtomicU64::new(0),
+            what_len: AtomicU64::new(0),
+            got: AtomicI64::new(0),
+        }
+    }
+
+    pub fn record(&self, fail: Fail) {
+        use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+        if self.state.compare_exchange(0, 1, AcqRel, Acquire).is_ok() {
+            self.what_ptr.store(fail.what.as_ptr() as u64, Relaxed);
+            self.what_len.store(fail.what.len() as u64, Relaxed);
+            self.got.store(fail.got, Relaxed);
+            self.state.store(2, Release);
+        }
+    }
+
+    pub fn has_error(&self) -> bool {
+        self.state.load(core::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    pub fn check(&self) -> R {
+        use core::sync::atomic::Ordering::{Acquire, Relaxed};
+        if self.state.load(Acquire) == 0 {
+            return Ok(());
+        }
+        while self.state.load(Acquire) != 2 {
+            core::hint::spin_loop();
+        }
+        // SAFETY: `what_ptr` and `what_len` came from a `&'static str` published
+        // before state transitioned to 2.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(self.what_ptr.load(Relaxed) as *const u8, self.what_len.load(Relaxed) as usize)
+        };
+        let what = core::str::from_utf8(bytes).unwrap_or("worker error");
+        Err(Fail { what, got: self.got.load(Relaxed) })
+    }
 }
 
 /// Linux x86-64 stat's st_mode (offset 24).

@@ -379,7 +379,8 @@ struct SmpShared {
     n_cpus: u32,
     ready: AtomicU32,
     midpoint: AtomicU32,
-    errors: AtomicU32,
+    abort: AtomicU32,
+    err: common::WorkerError,
     migrated: AtomicU32,
     progress: [AtomicU32; MAX_SMP_CPUS],
     checksum: [core::sync::atomic::AtomicU64; MAX_SMP_CPUS],
@@ -389,6 +390,16 @@ struct SmpWorkerArg {
     idx: usize,
     cpu: u32,
     shared: *const SmpShared,
+}
+
+fn join_or_abort(tid: usize) {
+    let mut res = core::ptr::null_mut();
+    // SAFETY: `tid` is a live joinable pthread.
+    let rc = unsafe { pthread_join(tid, &mut res) };
+    if rc != 0 {
+        say!("FAIL pthread_join: failed (got {rc})");
+        common::exit_group(99);
+    }
 }
 
 fn pin_and_confirm(cpu: u32) -> R {
@@ -419,15 +430,19 @@ extern "C" fn smp_worker(arg: *mut c_void) -> *mut c_void {
     let w = unsafe { &*(arg as *const SmpWorkerArg) };
     // SAFETY: `w.shared` points to the live stack-allocated `SmpShared`.
     let s = unsafe { &*w.shared };
-    if pin_and_confirm(w.cpu).is_err() {
-        s.errors.fetch_add(1, SeqCst);
+    if let Err(e) = pin_and_confirm(w.cpu) {
+        s.err.record(e);
+        s.abort.store(1, SeqCst);
         s.ready.fetch_add(1, SeqCst);
         s.midpoint.fetch_add(1, SeqCst);
         return core::ptr::null_mut();
     }
     s.ready.fetch_add(1, SeqCst);
-    while s.ready.load(SeqCst) < s.n_cpus {
+    while s.ready.load(SeqCst) < s.n_cpus && s.abort.load(SeqCst) == 0 {
         sys(SYS_SCHED_YIELD, [0; 6]);
+    }
+    if s.abort.load(SeqCst) != 0 {
+        return core::ptr::null_mut();
     }
 
     let mut acc = 0xcbf2_9ce4_8422_2325u64 ^ u64::from(w.cpu);
@@ -447,8 +462,11 @@ extern "C" fn smp_worker(arg: *mut c_void) -> *mut c_void {
         s.progress[w.idx].fetch_add(HALF_WORK, SeqCst);
         if phase == 0 {
             s.midpoint.fetch_add(1, SeqCst);
-            while s.midpoint.load(SeqCst) < s.n_cpus {
+            while s.midpoint.load(SeqCst) < s.n_cpus && s.abort.load(SeqCst) == 0 {
                 sys(SYS_SCHED_YIELD, [0; 6]);
+            }
+            if s.abort.load(SeqCst) != 0 {
+                return core::ptr::null_mut();
             }
         }
     }
@@ -473,21 +491,35 @@ fn smp_all_cpus() -> R {
         n_cpus: count as u32,
         ready: AtomicU32::new(0),
         midpoint: AtomicU32::new(0),
-        errors: AtomicU32::new(0),
+        abort: AtomicU32::new(0),
+        err: common::WorkerError::new(),
         migrated: AtomicU32::new(0),
         progress: [const { AtomicU32::new(0) }; MAX_SMP_CPUS],
         checksum: [const { core::sync::atomic::AtomicU64::new(0) }; MAX_SMP_CPUS],
     };
     let mut args = [const { SmpWorkerArg { idx: 0, cpu: 0, shared: core::ptr::null() } }; MAX_SMP_CPUS];
     let mut tids = [0usize; MAX_SMP_CPUS];
+    let mut started = 0usize;
     for i in 0..count {
         args[i] = SmpWorkerArg { idx: i, cpu: cpus[i], shared: &shared };
-        tids[i] = create(smp_worker, &args[i] as *const SmpWorkerArg as usize)?;
+        match create(smp_worker, &args[i] as *const SmpWorkerArg as usize) {
+            Ok(tid) => {
+                tids[i] = tid;
+                started += 1;
+            }
+            Err(e) => {
+                shared.abort.store(1, SeqCst);
+                for tid in &tids[..started] {
+                    join_or_abort(*tid);
+                }
+                return Err(e);
+            }
+        }
     }
-    for tid in &tids[..count] {
-        join(*tid, 0)?;
+    for tid in &tids[..started] {
+        join_or_abort(*tid);
     }
-    eq("smp worker pin errors", i64::from(shared.errors.load(SeqCst)), 0)?;
+    shared.err.check()?;
     eq("smp pinned thread migrations", i64::from(shared.migrated.load(SeqCst)), 0)?;
     for i in 0..count {
         eq("smp cpu progress", i64::from(shared.progress[i].load(SeqCst)), i64::from(2 * HALF_WORK))?;

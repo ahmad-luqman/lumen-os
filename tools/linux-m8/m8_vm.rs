@@ -210,10 +210,14 @@ fn spawn_pthread(run: extern "C" fn(*mut c_void) -> *mut c_void, arg: *mut c_voi
     Ok(tid)
 }
 
-fn join_pthread(tid: usize) -> R {
+fn join_pthread_or_abort(tid: usize) {
     let mut res = core::ptr::null_mut();
     // SAFETY: `tid` is a live joinable pthread created by `spawn_pthread`.
-    eq("pthread_join", i64::from(unsafe { pthread_join(tid, &mut res) }), 0)
+    let rc = unsafe { pthread_join(tid, &mut res) };
+    if rc != 0 {
+        say!("FAIL pthread_join: failed (got {rc})");
+        common::exit_group(99);
+    }
 }
 
 struct Mapping {
@@ -254,7 +258,8 @@ struct ProbeShared {
     expected_code: i64,
     primed: AtomicU32,
     after: AtomicU32,
-    pin_fail: AtomicU32,
+    abort: AtomicU32,
+    err: common::WorkerError,
     bad_before: AtomicU32,
     stale_after: AtomicU64,
     wrong_code: AtomicU64,
@@ -272,8 +277,9 @@ extern "C" fn probe_reader(arg: *mut c_void) -> *mut c_void {
     let w = unsafe { &*(arg as *const ProbeWorker) };
     // SAFETY: `w.shared` points to the live stack-allocated `ProbeShared`.
     let s = unsafe { &*w.shared };
-    if pin_to_cpu(w.cpu).is_err() {
-        s.pin_fail.fetch_add(1, Ordering::AcqRel);
+    if let Err(e) = pin_to_cpu(w.cpu) {
+        s.err.record(e);
+        s.abort.store(1, Ordering::Release);
         s.primed.fetch_add(1, Ordering::AcqRel);
         return core::ptr::null_mut();
     }
@@ -295,9 +301,9 @@ extern "C" fn probe_reader(arg: *mut c_void) -> *mut c_void {
     }
     s.primed.fetch_add(1, Ordering::AcqRel);
 
-    // Probe continuously until the mutator completes its syscall and sets `after`.
+    // Probe continuously until the mutator completes its syscall and sets `after` (or aborts).
     let mut page_idx = 0u64;
-    while s.after.load(Ordering::Acquire) == 0 {
+    while s.after.load(Ordering::Acquire) == 0 && s.abort.load(Ordering::Acquire) == 0 {
         if s.mode == 0 {
             let va = s.base + page_idx * PAGE_SIZE;
             let want = SENTINEL ^ (page_idx as u32);
@@ -312,6 +318,9 @@ extern "C" fn probe_reader(arg: *mut c_void) -> *mut c_void {
             let _ = try_store_u32(va, SENTINEL ^ w.cpu);
         }
         core::hint::spin_loop();
+    }
+    if s.abort.load(Ordering::Acquire) != 0 {
+        return core::ptr::null_mut();
     }
 
     // After shootdown returns: every single probe on every page must fault with `expected_code`.
@@ -360,7 +369,8 @@ fn run_probe_round(
         expected_code,
         primed: AtomicU32::new(0),
         after: AtomicU32::new(0),
-        pin_fail: AtomicU32::new(0),
+        abort: AtomicU32::new(0),
+        err: common::WorkerError::new(),
         bad_before: AtomicU32::new(0),
         stale_after: AtomicU64::new(0),
         wrong_code: AtomicU64::new(0),
@@ -369,39 +379,70 @@ fn run_probe_round(
     let remotes = cpus.len() - 1;
     let mut workers = [const { ProbeWorker { cpu: 0, slot: 0, shared: core::ptr::null() } }; MAX_WORKERS];
     let mut tids = [0usize; MAX_WORKERS];
+    let mut started = 0usize;
     for i in 0..remotes {
         workers[i] = ProbeWorker { cpu: cpus[i + 1], slot: ((i + 1) as u64) * 64, shared: &shared };
-        tids[i] = spawn_pthread(probe_reader, (&workers[i] as *const ProbeWorker) as *mut c_void)?;
+        match spawn_pthread(probe_reader, (&workers[i] as *const ProbeWorker) as *mut c_void) {
+            Ok(tid) => {
+                tids[i] = tid;
+                started += 1;
+            }
+            Err(e) => {
+                shared.abort.store(1, Ordering::Release);
+                for tid in &tids[..started] {
+                    join_pthread_or_abort(*tid);
+                }
+                return Err(e);
+            }
+        }
     }
 
     // Confirm CPU 0 itself primes its TLB before mutating.
-    if mode == 0 {
-        for p in 0..pages {
-            eq(
-                "cpu0 prime load",
-                i64::from(try_load_u32(base + p * PAGE_SIZE).unwrap_or(0)),
-                i64::from(SENTINEL ^ (p as u32)),
-            )?;
+    let prime_res = (|| -> R {
+        if mode == 0 {
+            for p in 0..pages {
+                eq(
+                    "cpu0 prime load",
+                    i64::from(try_load_u32(base + p * PAGE_SIZE).unwrap_or(0)),
+                    i64::from(SENTINEL ^ (p as u32)),
+                )?;
+            }
+        } else {
+            ensure("cpu0 prime store", try_store_u32(base, SENTINEL ^ cpus[0]).is_ok(), 0)?;
         }
-    } else {
-        ensure("cpu0 prime store", try_store_u32(base, SENTINEL ^ cpus[0]).is_ok(), 0)?;
+        Ok(())
+    })();
+    if let Err(e) = prime_res {
+        shared.abort.store(1, Ordering::Release);
+        for tid in &tids[..started] {
+            join_pthread_or_abort(*tid);
+        }
+        return Err(e);
     }
 
-    while shared.primed.load(Ordering::Acquire) < remotes as u32 {
+    while shared.primed.load(Ordering::Acquire) < started as u32 && !shared.err.has_error() {
         sys(SYS_SCHED_YIELD, [0; 6]);
     }
+    if shared.err.has_error() {
+        shared.abort.store(1, Ordering::Release);
+        for tid in &tids[..started] {
+            join_pthread_or_abort(*tid);
+        }
+        return shared.err.check();
+    }
+
     let mutate_res = mutate();
     shared.after.store(1, Ordering::Release);
 
     // Check CPU 0 immediately after mutation as well.
     let cpu0_res = if mode == 0 { try_load_u32(base).map(|_| ()) } else { try_store_u32(base, 0xbad0_0000) };
 
-    for tid in &tids[..remotes] {
-        join_pthread(*tid)?;
+    for tid in &tids[..started] {
+        join_pthread_or_abort(*tid);
     }
+    shared.err.check()?;
     mutate_res?;
     eq("cpu0 fault code", cpu0_res.err().unwrap_or(0), expected_code)?;
-    eq("reader pin failures", i64::from(shared.pin_fail.load(Ordering::Acquire)), 0)?;
     eq("reader pre-check errors", i64::from(shared.bad_before.load(Ordering::Acquire)), 0)?;
     eq("stale accesses after shootdown", shared.stale_after.load(Ordering::Acquire) as i64, 0)?;
     eq("unexpected si_code after shootdown", shared.wrong_code.load(Ordering::Acquire) as i64, 0)?;
@@ -463,7 +504,7 @@ struct ForkShared {
     post_fork: AtomicU32,
     child_check: AtomicU32,
     stop: AtomicU32,
-    pin_fail: AtomicU32,
+    err: common::WorkerError,
     started: [AtomicU32; MAX_WORKERS],
     pre_writes: [AtomicU32; MAX_WORKERS],
     post_written: [AtomicU32; MAX_WORKERS],
@@ -482,9 +523,11 @@ extern "C" fn fork_writer(arg: *mut c_void) -> *mut c_void {
     let w = unsafe { &*(arg as *const ForkWriterArg) };
     // SAFETY: `w.shared` lies in the live `MAP_SHARED` control page.
     let s = unsafe { &*w.shared };
-    if pin_to_cpu(w.cpu).is_err() {
-        s.pin_fail.fetch_add(1, Ordering::AcqRel);
+    if let Err(e) = pin_to_cpu(w.cpu) {
+        s.err.record(e);
+        s.stop.store(1, Ordering::Release);
         s.started[w.idx].store(1, Ordering::Release);
+        s.post_written[w.idx].store(1, Ordering::Release);
         return core::ptr::null_mut();
     }
 
@@ -539,6 +582,7 @@ fn fork_write_protect_shootdown() -> R {
                 [const { ForkWriterArg { idx: 0, cpu: 0, priv_active: 0, priv_primed: 0, shared: core::ptr::null() } };
                     MAX_WORKERS];
             let mut tids = [0usize; MAX_WORKERS];
+            let mut started = 0usize;
             for i in 0..remotes {
                 args[i] = ForkWriterArg {
                     idx: i,
@@ -547,19 +591,47 @@ fn fork_write_protect_shootdown() -> R {
                     priv_primed: priv_primed.addr,
                     shared,
                 };
-                tids[i] = spawn_pthread(fork_writer, (&args[i] as *const ForkWriterArg) as *mut c_void)?;
+                match spawn_pthread(fork_writer, (&args[i] as *const ForkWriterArg) as *mut c_void) {
+                    Ok(tid) => {
+                        tids[i] = tid;
+                        started += 1;
+                    }
+                    Err(e) => {
+                        shared.stop.store(1, Ordering::Release);
+                        for tid in &tids[..started] {
+                            join_pthread_or_abort(*tid);
+                        }
+                        return Err(e);
+                    }
+                }
             }
 
             // Wait until every sibling is confirmed running on its CPU and actively writing.
             for i in 0..remotes {
-                while shared.started[i].load(Ordering::Acquire) == 0 || shared.pre_writes[i].load(Ordering::Acquire) < 4
+                while !shared.err.has_error()
+                    && (shared.started[i].load(Ordering::Acquire) == 0
+                        || shared.pre_writes[i].load(Ordering::Acquire) < 4)
                 {
                     sys(SYS_SCHED_YIELD, [0; 6]);
                 }
             }
+            if shared.err.has_error() {
+                shared.stop.store(1, Ordering::Release);
+                for tid in &tids[..started] {
+                    join_pthread_or_abort(*tid);
+                }
+                return shared.err.check();
+            }
 
             // Raw `fork` from this multithreaded parent while siblings are actively writing on other CPUs.
-            let pid = ok("threaded fork", sys(SYS_FORK, [0; 6]))?;
+            let pid = sys(SYS_FORK, [0; 6]);
+            if pid < 0 {
+                shared.stop.store(1, Ordering::Release);
+                for tid in &tids[..started] {
+                    join_pthread_or_abort(*tid);
+                }
+                return Err(common::Fail { what: "threaded fork", got: pid });
+            }
             if pid == 0 {
                 // Child: wait until every sibling has performed its post-fork writes in the parent,
                 // then verify none of those post-fork writes reached either private page here.
@@ -594,7 +666,7 @@ fn fork_write_protect_shootdown() -> R {
             // Parent: let every sibling perform its post-fork writes on its remote CPU.
             shared.post_fork.store(1, Ordering::Release);
             for i in 0..remotes {
-                while shared.post_written[i].load(Ordering::Acquire) == 0 {
+                while !shared.err.has_error() && shared.post_written[i].load(Ordering::Acquire) == 0 {
                     sys(SYS_SCHED_YIELD, [0; 6]);
                 }
             }
@@ -605,11 +677,11 @@ fn fork_write_protect_shootdown() -> R {
             let wait_res = sys(SYS_WAIT4, [pid as u64, &mut status as *mut _ as u64, 0, 0, 0, 0]);
 
             shared.stop.store(1, Ordering::Release);
-            for tid in &tids[..remotes] {
-                join_pthread(*tid)?;
+            for tid in &tids[..started] {
+                join_pthread_or_abort(*tid);
             }
 
-            eq("fork writer pin failures", i64::from(shared.pin_fail.load(Ordering::Acquire)), 0)?;
+            shared.err.check()?;
             eq("wait4 child", wait_res, pid)?;
             eq("child saw no post-fork writes", i64::from(status), 0)?;
 
@@ -639,7 +711,8 @@ struct CowReaderShared {
     page: u64,
     primed: AtomicU32,
     split_done: AtomicU32,
-    pin_fail: AtomicU32,
+    abort: AtomicU32,
+    err: common::WorkerError,
     bad_before: AtomicU32,
     stale_after: AtomicU64,
     bad_value: AtomicU64,
@@ -655,8 +728,9 @@ extern "C" fn cow_reader(arg: *mut c_void) -> *mut c_void {
     let w = unsafe { &*(arg as *const CowReaderArg) };
     // SAFETY: `w.shared` points to the live stack-allocated `CowReaderShared`.
     let s = unsafe { &*w.shared };
-    if pin_to_cpu(w.cpu).is_err() {
-        s.pin_fail.fetch_add(1, Ordering::AcqRel);
+    if let Err(e) = pin_to_cpu(w.cpu) {
+        s.err.record(e);
+        s.abort.store(1, Ordering::Release);
         s.primed.fetch_add(1, Ordering::AcqRel);
         return core::ptr::null_mut();
     }
@@ -668,13 +742,16 @@ extern "C" fn cow_reader(arg: *mut c_void) -> *mut c_void {
     }
     s.primed.fetch_add(1, Ordering::AcqRel);
 
-    while s.split_done.load(Ordering::Acquire) == 0 {
+    while s.split_done.load(Ordering::Acquire) == 0 && s.abort.load(Ordering::Acquire) == 0 {
         // SAFETY: `s.page` remains readable throughout the CoW split.
         let v = unsafe { (*ptr).load(Ordering::Relaxed) };
         if v != OLD_VAL && v != NEW_VAL {
             s.bad_value.fetch_add(1, Ordering::AcqRel);
         }
         core::hint::spin_loop();
+    }
+    if s.abort.load(Ordering::Acquire) != 0 {
+        return core::ptr::null_mut();
     }
 
     // After the split and store completed on CPU 0, every remote reader must
@@ -722,20 +799,45 @@ fn cow_split_shootdown() -> R {
                 page: priv_page.addr,
                 primed: AtomicU32::new(0),
                 split_done: AtomicU32::new(0),
-                pin_fail: AtomicU32::new(0),
+                abort: AtomicU32::new(0),
+                err: common::WorkerError::new(),
                 bad_before: AtomicU32::new(0),
                 stale_after: AtomicU64::new(0),
                 bad_value: AtomicU64::new(0),
             };
             let mut args = [const { CowReaderArg { cpu: 0, shared: core::ptr::null() } }; MAX_WORKERS];
             let mut tids = [0usize; MAX_WORKERS];
+            let mut started = 0usize;
             for i in 0..remotes {
                 args[i] = CowReaderArg { cpu: cpus[i + 1], shared: &shared };
-                tids[i] = spawn_pthread(cow_reader, (&args[i] as *const CowReaderArg) as *mut c_void)?;
+                match spawn_pthread(cow_reader, (&args[i] as *const CowReaderArg) as *mut c_void) {
+                    Ok(tid) => {
+                        tids[i] = tid;
+                        started += 1;
+                    }
+                    Err(e) => {
+                        shared.abort.store(1, Ordering::Release);
+                        for tid in &tids[..started] {
+                            join_pthread_or_abort(*tid);
+                        }
+                        release_child.store(1, Ordering::Release);
+                        let _ = sys(SYS_WAIT4, [pid as u64, 0, 0, 0, 0, 0]);
+                        return Err(e);
+                    }
+                }
             }
 
-            while shared.primed.load(Ordering::Acquire) < remotes as u32 {
+            while shared.primed.load(Ordering::Acquire) < started as u32 && !shared.err.has_error() {
                 sys(SYS_SCHED_YIELD, [0; 6]);
+            }
+            if shared.err.has_error() {
+                shared.abort.store(1, Ordering::Release);
+                for tid in &tids[..started] {
+                    join_pthread_or_abort(*tid);
+                }
+                release_child.store(1, Ordering::Release);
+                let _ = sys(SYS_WAIT4, [pid as u64, 0, 0, 0, 0, 0]);
+                return shared.err.check();
             }
 
             // Trigger the copy-on-write split on CPU 0 while every sibling CPU holds
@@ -744,15 +846,15 @@ fn cow_split_shootdown() -> R {
             unsafe { (*(priv_page.addr as *const AtomicU32)).store(NEW_VAL, Ordering::Release) };
             shared.split_done.store(1, Ordering::Release);
 
-            for tid in &tids[..remotes] {
-                join_pthread(*tid)?;
+            for tid in &tids[..started] {
+                join_pthread_or_abort(*tid);
             }
 
             release_child.store(1, Ordering::Release);
             let mut status = -1i32;
             eq("wait4 cow child", sys(SYS_WAIT4, [pid as u64, &mut status as *mut _ as u64, 0, 0, 0, 0]), pid)?;
             eq("cow child preserved OLD_VAL", i64::from(status), 0)?;
-            eq("cow reader pin failures", i64::from(shared.pin_fail.load(Ordering::Acquire)), 0)?;
+            shared.err.check()?;
             eq("cow reader pre-check errors", i64::from(shared.bad_before.load(Ordering::Acquire)), 0)?;
             eq("stale OLD_VAL reads after CoW split", shared.stale_after.load(Ordering::Acquire) as i64, 0)?;
             eq("unexpected values during CoW split", shared.bad_value.load(Ordering::Acquire) as i64, 0)?;
