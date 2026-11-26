@@ -11,6 +11,7 @@ from lumen_harness.rootfs import copy_rootfs
 from lumen_harness.shell import run
 
 BOOT_TIMEOUT = 60
+ATTEMPTS = 20
 M8_IO = "/usr/local/bin/m8_io"
 SERIAL_POLL = re.compile(
     r"serial: poll safety-step hits: (?P<hits>\d+), woken: (?P<woken>\d+), subscribers: (?P<subs>\d+)\n"
@@ -30,21 +31,8 @@ def boot_shell(boot, *, devices=None):
     return m
 
 
-def test_poll_and_select_on_console(boot, tmp_path):
-    """`poll`, `ppoll`, `select` and `pselect6` on the console's stdin with and
-    without typed input; timeouts last at least their requested floor; remaining
-    time is written back (0 on timeout; `rem < asked` and `rem + elapsed >= asked`
-    when woken); invalid/O_PATH descriptors report POLLNVAL / ready / EBADF;
-    `serial poll` confirms blocked waits woke via IRQ 4 (`woken >= 1`), none
-    fell back to the 100 ms safety step (`hits == 0`), and all subscribers
-    unsubscribed on exit. Without `fork` or a second serial channel, the
-    scenario cannot confirm each individual wait blocked before typing, so a
-    byte arriving before `sys_*` blocks is read on pass 1 (as in `test_serial.py`)."""
-    disk = copy_rootfs(tmp_path)
-    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
-
-    assert _serial_poll(m) == (0, 0, 0)
-
+def _console_poll_run(m) -> tuple[int, int, int]:
+    """Run every console readiness check and return the checked poll counters."""
     start = len(m.output)
     m.send_line(f"linux {M8_IO} console-poll")
 
@@ -73,12 +61,48 @@ def test_poll_and_select_on_console(boot, tmp_path):
     m.expect(r"lumen> ", 10)
     assert CRASH_BEGIN not in m.output[start:]
 
-    # Blocked typed-byte waits woke via IRQ 4's `PollHead::notify`, never fell
-    # back to the 100 ms safety step, and all subscribers unsubscribed on exit.
+    # A safety-step hit means the wait found IRQ-queued input at the 100 ms
+    # step without a notify setting `fired` (a dropped notify). It does not
+    # detect an IRQ that never queued input. Check cleanup on every exit too.
     hits, woken, subs = _serial_poll(m)
     assert hits == 0, (hits, woken, subs)
-    assert woken >= 1, (hits, woken, subs)
     assert subs == 0, (hits, woken, subs)
+
+    return hits, woken, subs
+
+
+def test_poll_and_select_on_console(boot, tmp_path):
+    """`poll`, `ppoll`, `select` and `pselect6` on the console's stdin with and
+    without typed input; timeouts last at least their requested floor; remaining
+    time is written back (0 on timeout; `rem < asked` and `rem + elapsed >= asked`
+    when woken); invalid/O_PATH descriptors report POLLNVAL / ready / EBADF.
+
+    COM1 must report input by interrupt. `serial poll` requires no wait to find
+    IRQ-queued input at the 100 ms safety step without a notify (`hits == 0`),
+    and all subscribers to unsubscribe on every exit. Repeat up to `ATTEMPTS` runs:
+    a run with no wake is legitimate (input can arrive before syscall entry),
+    but `ATTEMPTS` without one fails. `woken >= 1` proves notify reached a subscriber
+    and set `fired`, not that IRQ 4 readied the thread promptly: a dropped
+    `wake_one()` with `fired` kept is still counted as woken at the safety step.
+    """
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+
+    serial = run(m, "serial")
+    assert "serial: COM1 input by interrupt (ISA IRQ 4," in serial, serial
+    assert _serial_poll(m) == (0, 0, 0)
+
+    # `ready` precedes syscall entry, not the block. Repeat up to ATTEMPTS
+    # successful runs: one with no wake is legitimate, ATTEMPTS without one
+    # fails. Bound the run count so a missing wake cannot hang the CI job.
+    for _ in range(ATTEMPTS):
+        hits, woken, subs = _console_poll_run(m)
+        if woken >= 1:
+            break
+    else:
+        raise AssertionError(
+            f"no console wait was woken by IRQ 4's notify in {ATTEMPTS} runs: {(hits, woken, subs)}"
+        )
 
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
