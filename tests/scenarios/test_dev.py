@@ -276,9 +276,9 @@ class EgdServer:
                         conn.sendall(os.urandom(count))
                     with self._lock:
                         self._answered += 1
-        except OSError as e:
+        except BaseException as e:  # noqa: BLE001 -- any death is reported, not swallowed
             if not self._stop.is_set():
-                self.error = str(e)
+                self.error = repr(e)
 
 
 @pytest.mark.parametrize(
@@ -292,8 +292,9 @@ class EgdServer:
 def test_a_virtio_rng_that_stops_answering_is_dropped(boot, cpu, left):
     # An EGD backend answers immediately throughout boot (firmware and the
     # driver's probe); only after boot confirms virtio-rng is bound do we
-    # silence it, so the very next `random` misses its 1000 ms deadline
-    # deterministically, with no timing precondition on boot or host load.
+    # silence it, so the very next `random` misses its 1000 ms deadline: the
+    # device stops on cue, not by a quota the firmware can drain (#410). The
+    # probe's own 1 s deadline remains, as in every virtio-rng scenario.
     with EgdServer() as egd:
         m = shell(boot, extra=egd.qemu_args, cpu=cpu)
         assert egd.error is None, egd.error
@@ -311,13 +312,14 @@ def test_a_virtio_rng_that_stops_answering_is_dropped(boot, cpu, left):
             m.output,
         )
         assert lost, m.output[-2000:]
-        assert egd.wait_ignored() and egd.ignored == 1
+        assert egd.wait_ignored(5 * m.timeout_scale)
+        asked = egd.ignored
         assert lspci_driver(m, "virtio rng") == [
             f"virtio-rng: failed: {lost[1]} (1 DMA run leaked)"
         ]
         # The pool goes on answering, without asking the device again.
         assert_random_works(m)
-        assert egd.ignored == 1 and egd.error is None
+        assert egd.ignored == asked and egd.error is None
         assert run(m, "random --stats").startswith(
             f"rng: sources: {'RDRAND' if cpu else 'none'}; pool: "
         )
