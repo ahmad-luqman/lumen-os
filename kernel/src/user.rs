@@ -119,7 +119,7 @@ global_asm!(
     .balign 16
 lumen_user_copy_raw:
     # System V AMD64: rdi = dst, rsi = src, rdx = len.
-    # Returns 0 on success, 1 on user page fault.
+    # Returns the number of bytes not copied (0 on success).
     movq %rdx, %rcx
     cld
     movb LUMEN_SMAP_ENABLED(%rip), %r8b
@@ -140,7 +140,7 @@ lumen_user_copy_raw:
     jz 5f
     clac
 5:
-    movl $1, %eax
+    movq %rcx, %rax
     ret
     .size lumen_user_copy_raw, . - lumen_user_copy_raw
 
@@ -385,6 +385,25 @@ pub fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), CopyError> {
     // caught by `.lumen_fixup`.
     let rc = unsafe { lumen_user_copy_raw(user_dst as *mut u8, src.as_ptr(), src.len()) };
     if rc == 0 { Ok(()) } else { Err(CopyError::Fault) }
+}
+
+/// Copy the accessible prefix of `src` to user memory, returning bytes copied.
+/// A fault leaves the uncopied suffix untouched. The interrupt/lock preconditions
+/// are the same as [`copy_to_user`].
+pub fn copy_to_user_partial(user_dst: u64, src: &[u8]) -> usize {
+    debug_assert!(
+        (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
+        "copy_to_user_partial requires interrupts enabled and no SpinLock held"
+    );
+    if src.is_empty() || !(USER_MIN..USER_MAX).contains(&user_dst) {
+        return 0;
+    }
+    let len = src.len().min((USER_MAX - user_dst) as usize);
+    // SAFETY: `src` is readable for `len` bytes, the destination prefix is
+    // inside user space, and `.lumen_fixup` catches faults on its stores.
+    // REP MOVSB preserves RCX as the uncopied byte count on a fault.
+    let remaining = unsafe { lumen_user_copy_raw(user_dst as *mut u8, src.as_ptr(), len) };
+    len - remaining as usize
 }
 
 /// Fault-safely copy a NUL-terminated byte string of up to `max_len` bytes

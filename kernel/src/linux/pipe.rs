@@ -6,7 +6,7 @@
 //!
 //! Lock ordering (ARCHITECTURE section 9):
 //! - `PipeObject::pipe` is Lock 0 (`SleepMutex`), held across user copies
-//!   (`peek` / `copy_to_user` / `commit`; non-blocking chunked writes), never
+//!   (`peek` / `copy_to_user_partial` / `commit_prefix`; non-blocking chunked writes), never
 //!   taken while holding locks 1–10.
 //! - `KernelFile::pipe_end` and `FifoSlot::inner` are level-10c leaf spinlocks
 //!   (no allocation under either; detached ends and `Arc<PipeObject>`s dropped
@@ -36,7 +36,7 @@ use crate::linux::{errno, general};
 use crate::sched::{self, WaitQueue};
 use crate::sync::{SleepMutex, SpinLock};
 use crate::time;
-use crate::user::{copy_from_user, copy_to_user};
+use crate::user::{copy_from_user, copy_to_user_partial};
 use crate::vfs::KernelPollHead;
 use crate::vfs::ext4::Ext4Inode;
 use crate::vfs::tmpfs::TmpfsInode;
@@ -62,6 +62,8 @@ pub struct PipeObject {
     poll: KernelPollHead,
     #[cfg(feature = "ktest")]
     waiting_readers: AtomicU32,
+    #[cfg(feature = "ktest")]
+    read_lock_acquisitions: AtomicU64,
     #[cfg(feature = "ktest")]
     waiting_writers: AtomicU32,
 }
@@ -90,6 +92,8 @@ impl PipeObject {
             poll: KernelPollHead::new(),
             #[cfg(feature = "ktest")]
             waiting_readers: AtomicU32::new(0),
+            #[cfg(feature = "ktest")]
+            read_lock_acquisitions: AtomicU64::new(0),
             #[cfg(feature = "ktest")]
             waiting_writers: AtomicU32::new(0),
         })
@@ -140,10 +144,25 @@ impl PipeObject {
     ///
     /// Returns bytes transferred (`0` on EOF or `count == 0`), `-EAGAIN` with
     /// `nonblock` when empty with writers open, `-ERESTARTSYS` when interrupted
-    /// before transferring any byte, or `-EFAULT` if the first chunk's copy out
-    /// faults (leaving the peeked bytes queued).
+    /// before transferring any byte, or `-EFAULT` if the first byte's copy out
+    /// faults (leaving the uncopied bytes queued).
     pub fn read(&self, user_buf: u64, count: u64, nonblock: bool) -> Result<u64, u32> {
-        let limit = count.min(MAX_SINGLE_IO as u64) as usize;
+        self.read_with(count as usize, nonblock, |offset, buf| {
+            user_buf.checked_add(offset as u64).map_or(0, |addr| copy_to_user_partial(addr, buf))
+        })
+    }
+
+    /// One logical read across all spans: hold Lock 0 across every chunk and
+    /// copy, dropping it only to wait before any progress or to finish. `fill`
+    /// returns the copied prefix length; a short copy faults and commits only
+    /// that prefix. It must not take locks preceding Lock 0.
+    pub fn read_with(
+        &self,
+        count: usize,
+        nonblock: bool,
+        mut fill: impl FnMut(usize, &[u8]) -> usize,
+    ) -> Result<u64, u32> {
+        let limit = count.min(MAX_SINGLE_IO);
         if limit == 0 {
             return Ok(0);
         }
@@ -153,26 +172,25 @@ impl PipeObject {
 
         loop {
             let mut pipe = self.pipe.lock();
+            #[cfg(feature = "ktest")]
+            self.read_lock_acquisitions.fetch_add(1, Ordering::SeqCst);
             let mut faulted = false;
             let mut saw_eof = false;
 
             while done < limit {
                 let want = (limit - done).min(kbuf.len());
-                let Some(addr) = user_buf.checked_add(done as u64) else {
-                    faulted = true;
-                    break;
-                };
                 match pipe.peek(&mut kbuf[..want]) {
                     PeekOutcome::Data(peeked) => {
                         let n = peeked.len();
-                        if copy_to_user(addr, &kbuf[..n]).is_err() {
-                            drop(peeked);
-                            faulted = true;
-                            break;
-                        }
-                        let consumed = peeked.commit();
+                        let copied = fill(done, &kbuf[..n]);
+                        debug_assert!(copied <= n, "read copy exceeded the peeked bytes");
+                        let consumed = peeked.commit_prefix(copied);
+                        faulted = copied < n;
                         done += consumed.n;
                         wake_writers |= consumed.wake_writers;
+                        if faulted {
+                            break;
+                        }
                     }
                     PeekOutcome::Eof => {
                         saw_eof = true;
@@ -513,6 +531,13 @@ impl PipeObject {
     pub fn end_counts(&self) -> (usize, usize) {
         let pipe = self.pipe.lock();
         (pipe.readers(), pipe.writers())
+    }
+
+    /// Actual read-loop Lock 0 acquisitions, including retries after waits.
+    /// Pins readv's single critical section independently of reader scheduling.
+    #[cfg(feature = "ktest")]
+    pub fn read_lock_acquisitions(&self) -> u64 {
+        self.read_lock_acquisitions.load(Ordering::SeqCst)
     }
 
     /// Number of threads currently blocked in a read wait (ktests).

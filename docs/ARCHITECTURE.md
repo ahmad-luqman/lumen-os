@@ -8757,9 +8757,12 @@ standard Linux IPC primitives:
   `pipe_release` from running until I/O completes. Metadata-only `FileRef`
   clones keep the description allocated but do not count in `end_refs`.
   `Released::Last` wakes every waiter on the other end and every poller.
-- **`read`:** under the pipe lock, `peek` into a 4 KiB kernel buffer,
-  `copy_to_user`, then `commit` (a fault drops the `Peeked`: the bytes stay
-  queued, and the call returns what it moved before, or `-EFAULT`), until
+- **`read` / `readv`:** one `read_with` holds the pipe lock across every
+  span and chunk, so competing readers cannot interleave the spans. `peek`
+  into a 4 KiB kernel buffer, copy out, then `commit_prefix` only the bytes
+  copied (including a prefix before a fault within a span). A fault leaves
+  the uncopied bytes queued and returns the partial count, or `-EFAULT`
+  if no byte was copied. Repeat under the same lock until
   the count is met or the pipe is empty; empty with writers: `-EAGAIN`
   with `O_NONBLOCK`, else B2's interruptible wait on `readers` with the
   lock released (interrupted `-ERESTARTSYS`); empty with no writers: 0.
@@ -8816,6 +8819,11 @@ standard Linux IPC primitives:
 - Tested by `cargo:lumen-pipe`, `ktest:lumen_kernel::linux::syscall::fd::pipe_end_outlives_its_close_while_a_write_is_in_flight`,
   `ktest:lumen_kernel::linux::syscall::fd::fifo_reopen_during_a_blocked_read_reaches_that_reader` and `scenario:test_linux_io::test_pipes_and_poll`
   (section 15), plus these ktests:
+  `ktest:lumen_kernel::linux::syscall::fd::pipe_readv_keeps_spans_in_one_read`
+  (one read-lock acquisition across spans, `AB` read and `CD` left queued,
+  empty/nonblocking, blocking short read and EOF),
+  `ktest:lumen_kernel::linux::syscall::fd::pipe_readv_fault_commits_only_the_copied_prefix`
+  (faults on the first byte, between spans and within a span),
   `ktest:lumen_kernel::linux::syscall::fd::pipe_atomic_writer_waits_for_the_entire_record`,
   `ktest:lumen_kernel::linux::syscall::fd::pipe_blocked_writer_gets_epipe_when_reader_closes`,
   `ktest:lumen_kernel::linux::syscall::fd::fifo_blocking_opens_wait_for_peers_and_interrupt_detaches`,

@@ -38,3 +38,11 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::fd::fifo_blocking_opens_wait_for_peers_and_interrupt_detaches",
     "scenario:test_linux_io::test_pipes_and_poll",
 ]
+
+[[feature]]
+name = "Pipe readv holds one read critical section across spans and consumes only the copied prefix on faults"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_readv_keeps_spans_in_one_read",
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_readv_fault_commits_only_the_copied_prefix",
+]
