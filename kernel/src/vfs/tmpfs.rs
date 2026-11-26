@@ -657,7 +657,7 @@ impl TmpfsInode {
     }
 
     /// Address spaces currently mapping this file (level 10c leaf spinlock;
-    /// never acquired under `pages`), for `page_cache::page_cache_mappers`.
+    /// never acquired under `pages`), for `page_cache::mappable_parts`.
     pub(super) fn mappers(&self) -> &Mappers {
         &self.mappers
     }

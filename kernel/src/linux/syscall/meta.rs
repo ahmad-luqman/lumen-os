@@ -12,10 +12,9 @@
 //! there reach devfs's setters, which keep a node's new mode, owner and
 //! times in memory and refuse `/dev` itself (#293).
 //!
-//! A truncate then unmaps the current process's mapped pages of the file
-//! past its new end (`AddressSpace::invalidate_file_from`), so a later
-//! access there is a bus error. Other processes' mappings aren't reached
-//! until M8 (issue #255).
+//! A shrinking truncate then unmaps every address space's mapped pages of
+//! the file past its new end (`user_vm::invalidate_file_mappings`, B7), so
+//! a later access there is a bus error.
 
 use alloc::sync::Arc;
 
@@ -894,6 +893,11 @@ mod tests {
                 check_page: u64,
                 shrink: impl FnOnce() -> Result<(), &'static str>,
             ) -> Result<(), &'static str> {
+                use crate::sched::{self, UserSpaceGuard};
+                use crate::user::copy_from_user;
+                use core::sync::atomic::{AtomicBool, Ordering};
+
+                const KEEP: &[u8; 8] = b"keep-p0!";
                 let other = Arc::new(AddressSpace::new().map_err(|_| "other AddressSpace::new")?);
                 let rw = Prot::READ | Prot::WRITE;
                 let shared = other
@@ -907,10 +911,43 @@ mod tests {
                 kassert_eq!(other.handle_page_fault(priv_va + off, 1 << 1), FaultResult::Resolved);
                 kassert!(file_vm_leaf(&other, shared + off).is_some());
                 kassert!(file_vm_leaf(&other, priv_va + off).is_some());
+
+                // When the shrink leaves a nonzero file size (`check_page > 0`),
+                // write private page 0 and verify its leaf and bytes survive.
+                let kept_p0 = if check_page > 0 {
+                    let wrote = Arc::new(AtomicBool::new(false));
+                    let wrote_t = wrote.clone();
+                    let space_t = other.clone();
+                    sched::spawn("b7-meta-w0", move || {
+                        let _active = UserSpaceGuard::enter(space_t);
+                        wrote_t.store(copy_to_user(priv_va, KEEP).is_ok(), Ordering::Release);
+                    })
+                    .map_err(|_| "spawn write p0")?
+                    .join();
+                    kassert!(wrote.load(Ordering::Acquire));
+                    Some(file_vm_leaf(&other, priv_va).ok_or("priv p0 missing")?.phys)
+                } else {
+                    None
+                };
+
                 shrink()?;
                 for va in [shared + off, priv_va + off] {
                     kassert!(file_vm_leaf(&other, va).is_none());
                     kassert_eq!(other.handle_page_fault(va, 0), FaultResult::BusError);
+                }
+                if let Some(p0_phys) = kept_p0 {
+                    kassert_eq!(file_vm_leaf(&other, priv_va).map(|m| m.phys), Some(p0_phys));
+                    let ok = Arc::new(AtomicBool::new(false));
+                    let ok_t = ok.clone();
+                    let space_t = other.clone();
+                    sched::spawn("b7-meta-r0", move || {
+                        let _active = UserSpaceGuard::enter(space_t);
+                        let mut got = [0u8; 8];
+                        ok_t.store(copy_from_user(&mut got, priv_va).is_ok() && &got == KEEP, Ordering::Release);
+                    })
+                    .map_err(|_| "spawn read p0")?
+                    .join();
+                    kassert!(ok.load(Ordering::Acquire));
                 }
                 other.teardown();
                 Ok(())

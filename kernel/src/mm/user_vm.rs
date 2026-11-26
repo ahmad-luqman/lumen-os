@@ -361,10 +361,16 @@ impl Mappers {
 
     fn unregister_one(&self, space: &Weak<AddressSpace>) {
         let mut list = self.0.lock();
-        if let Some(idx) = list.iter().position(|w| Weak::ptr_eq(w, space)) {
+        let found = list.iter().position(|w| Weak::ptr_eq(w, space));
+        debug_assert!(
+            found.is_some() || space.strong_count() == 0,
+            "unregister_one called for a live space absent from Mappers"
+        );
+        if let Some(idx) = found {
             list.swap_remove(idx);
         }
         if list.is_empty() {
+            // Release the backing buffer once no space maps the file.
             *list = Vec::new();
         }
     }
@@ -767,8 +773,8 @@ impl AddressSpace {
     /// Copy VM metadata and counted user leaves, including `PROT_NONE`,
     /// into a new space. Leaves of private VMAs become read-only in both spaces;
     /// shared anonymous pages are populated first so untouched pages share.
-    /// Page-cache leaves and private file copies wholly past EOF are omitted
-    /// and refault in the child. Mapping sharing is unrelated to `PTE_SHARED`,
+    /// Page-cache leaves are never copied, nor private file copies wholly past
+    /// EOF; both refault in the child. Mapping sharing is unrelated to `PTE_SHARED`,
     /// which marks an uncounted page-cache leaf.
     ///
     /// Allocation/count exhaustion and failed file-size reads return
@@ -3140,7 +3146,6 @@ crate::ktest!(
             kassert_eq!(space.mmap_anon(base, P, RW, fixed), Ok(base));
             kassert_eq!(counts(), (0, 0));
             kassert_eq!((space.mapped_file_count(), f.open_count(), file_vm_mappers(&*f)), (0, opens, 0));
-            // A file mapped over itself keeps its reference and registration.
             space
                 .mmap_file(MapPlace::Fixed(base), P, RW, file_vm_open(&f)?, 0, Sharing::Shared)
                 .map_err(|_| "map 3")?;
@@ -3148,6 +3153,7 @@ crate::ktest!(
             // ... and a file page faulted in there is released by the next.
             kassert_eq!(space.handle_page_fault(base, 1 << 1), FaultResult::Resolved);
             kassert_eq!((counts(), space.file_page_counts()), ((1, 0), (1, 1)));
+            // A file mapped over itself keeps its reference and registration.
             space
                 .mmap_file(MapPlace::Fixed(base), P, RW, file_vm_open(&f)?, P, Sharing::Shared)
                 .map_err(|_| "map 4")?;
@@ -3921,8 +3927,8 @@ crate::ktest!(
                 kassert_eq!(space.handle_page_fault(va, 0), FaultResult::BusError);
             }
 
-            // Both spaces released the shared CoW copy of page 2 and the
-            // writable page-cache guards of page 2.
+            // Spaces 1 and 3 released the shared CoW copy of page 2 and the
+            // writable page-cache guards of page 2 (space 2 only read).
             kassert!(!frame::is_allocated(priv_p2_phys));
             kassert_eq!(page2_cache.page().writable_maps(), 0);
 
@@ -4098,6 +4104,43 @@ crate::ktest!(
             parent.teardown();
             kassert_eq!(file_vm_mappers(&*f), 0);
             kassert_eq!(f.open_count(), 0);
+            Ok(())
+        })
+    }
+);
+
+crate::ktest!(
+    fn mappers_multiset_keeps_registration_across_late_drop() {
+        // B7: `Mappers` is a multiset so a `Mapped` dropped after Lock 1 is
+        // released (from an earlier `munmap`) never erases a fresh registration
+        // from a concurrent `mmap_file` of the same file.
+        use crate::{kassert, kassert_eq};
+        const P: u64 = PAGE_SIZE;
+
+        file_vm_on_both(382, |dir| {
+            let f = ktest_files::file(dir, "multiset.bin", &ktest_files::pattern(2 * P as usize, 47))?;
+            let space = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
+
+            // Stands in for an earlier `munmap`'s removed `Mapped` entry that
+            // has not yet run `Drop` when a concurrent `mmap_file` registers.
+            let late = Mapped::register(file_vm_open(&f)?.kept, &space);
+            let va = space
+                .mmap_file(MapPlace::Hint(None), 2 * P, RW, file_vm_open(&f)?, 0, Sharing::Shared)
+                .map_err(|_| "mmap_file")?;
+            kassert_eq!(file_vm_mappers(&*f), 2);
+
+            drop(late);
+            kassert_eq!(file_vm_mappers(&*f), 1);
+
+            kassert_eq!(space.handle_page_fault(va + P, 1 << 1), FaultResult::Resolved);
+            kassert!(file_vm_leaf(&space, va + P).is_some());
+            f.truncate(P).map_err(|_| "truncate")?;
+            kassert_eq!(invalidate_file_mappings(&*f, P), 1);
+            kassert!(file_vm_leaf(&space, va + P).is_none());
+            kassert_eq!(space.handle_page_fault(va + P, 0), FaultResult::BusError);
+
+            space.teardown();
+            kassert_eq!(file_vm_mappers(&*f), 0);
             Ok(())
         })
     }
