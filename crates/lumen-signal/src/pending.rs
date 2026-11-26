@@ -208,13 +208,17 @@ impl Disposition {
 }
 
 /// Process-local identity minted by new/add_thread, not a candidate position.
-/// Slots are never reused. The kernel must keep a slot with its owning process.
+/// Vacancies are reused with a fresh generation; removed handles stay invalid.
+/// The kernel must keep a slot with its owning process.
 /// ```compile_fail
 /// use lumen_signal::pending::ThreadSlot;
-/// let forged = ThreadSlot(0);
+/// let forged = ThreadSlot { index: 0, generation: 0 };
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ThreadSlot(usize);
+pub struct ThreadSlot {
+    index: usize,
+    generation: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -222,7 +226,12 @@ pub enum Target {
     Thread(ThreadSlot),
 }
 
-type SlotStorage = Option<Box<Pending>>;
+struct ThreadPending {
+    generation: u64,
+    pending: Pending,
+}
+
+type SlotStorage = Option<Box<ThreadPending>>;
 
 /// Private queues are boxed; removing one releases its queue and leaves only a
 /// pointer-sized vacancy. The owner serializes operations and retains dispositions
@@ -230,6 +239,7 @@ type SlotStorage = Option<Box<Pending>>;
 pub struct PendingSignals {
     shared: Pending,
     threads: Vec<SlotStorage>,
+    next_generation: u64,
     cap: usize,
 }
 
@@ -242,18 +252,18 @@ impl fmt::Debug for PendingSignals {
     }
 }
 
-fn boxed_pending(cap: usize) -> Result<Box<Pending>, PendingError> {
-    // SAFETY: Pending is nonzero-sized, and its Layout supplies the size and
+fn boxed_pending(cap: usize, generation: u64) -> Result<Box<ThreadPending>, PendingError> {
+    // SAFETY: ThreadPending is nonzero-sized, and its Layout supplies the size and
     // alignment required by the global allocator. A null allocation is handled.
-    let pointer = unsafe { alloc(Layout::new::<Pending>()) }.cast::<Pending>();
+    let pointer = unsafe { alloc(Layout::new::<ThreadPending>()) }.cast::<ThreadPending>();
     if pointer.is_null() {
         return Err(PendingError::NoMemory);
     }
-    // SAFETY: pointer uniquely owns a correctly aligned Pending allocation.
+    // SAFETY: pointer uniquely owns a correctly aligned ThreadPending allocation.
     // new does not allocate or panic. Initialize before transferring ownership
     // to Box, which deallocates through the same global allocator and Layout.
     unsafe {
-        pointer.write(Pending::new(cap));
+        pointer.write(ThreadPending { generation, pending: Pending::new(cap) });
         Ok(Box::from_raw(pointer))
     }
 }
@@ -264,31 +274,58 @@ impl PendingSignals {
         let mut slots = Vec::new();
         threads.try_reserve(thread_count).map_err(|_| PendingError::NoMemory)?;
         slots.try_reserve(thread_count).map_err(|_| PendingError::NoMemory)?;
-        for index in 0..thread_count {
-            threads.push(Some(boxed_pending(realtime_cap)?));
-            slots.push(ThreadSlot(index));
+        let mut state = Self { shared: Pending::new(realtime_cap), threads, next_generation: 0, cap: realtime_cap };
+        for _ in 0..thread_count {
+            slots.push(state.add_thread()?);
         }
-        Ok((Self { shared: Pending::new(realtime_cap), threads, cap: realtime_cap }, slots))
+        Ok((state, slots))
     }
 
+    /// Reuses a vacancy before extending storage. Generations never wrap: once
+    /// exhausted, returns NoMemory without changing any queue or live handle.
     pub fn add_thread(&mut self) -> Result<ThreadSlot, PendingError> {
-        self.threads.try_reserve(1).map_err(|_| PendingError::NoMemory)?;
-        let pending = boxed_pending(self.cap)?;
-        let slot = ThreadSlot(self.threads.len());
-        self.threads.push(Some(pending));
-        Ok(slot)
+        let generation = self.next_generation.checked_add(1).ok_or(PendingError::NoMemory)?;
+        let index = self.threads.iter().position(Option::is_none).unwrap_or(self.threads.len());
+        if index == self.threads.len() {
+            self.threads.try_reserve(1).map_err(|_| PendingError::NoMemory)?;
+        }
+        let pending = boxed_pending(self.cap, generation)?;
+        if index == self.threads.len() {
+            self.threads.push(Some(pending));
+        } else {
+            self.threads[index] = Some(pending);
+        }
+        self.next_generation = generation;
+        Ok(ThreadSlot { index, generation })
+    }
+
+    /// Number of slot entries scanned by process-wide signal cancellation,
+    /// including vacancies; bounded by the peak number of simultaneously live queues.
+    pub fn slot_count(&self) -> usize {
+        self.threads.len()
     }
 
     fn thread(&self, slot: ThreadSlot) -> Result<&Pending, PendingError> {
-        self.threads.get(slot.0).and_then(Option::as_deref).ok_or(PendingError::InvalidThread)
+        self.threads
+            .get(slot.index)
+            .and_then(Option::as_deref)
+            .filter(|thread| thread.generation == slot.generation)
+            .map(|thread| &thread.pending)
+            .ok_or(PendingError::InvalidThread)
     }
     fn thread_mut(&mut self, slot: ThreadSlot) -> Result<&mut Pending, PendingError> {
-        self.threads.get_mut(slot.0).and_then(Option::as_deref_mut).ok_or(PendingError::InvalidThread)
+        self.threads
+            .get_mut(slot.index)
+            .and_then(Option::as_deref_mut)
+            .filter(|thread| thread.generation == slot.generation)
+            .map(|thread| &mut thread.pending)
+            .ok_or(PendingError::InvalidThread)
     }
 
     /// Drops only this thread's private pending state. Shared state survives.
     pub fn remove_thread(&mut self, slot: ThreadSlot) -> Result<(), PendingError> {
-        self.threads.get_mut(slot.0).and_then(Option::take).ok_or(PendingError::InvalidThread)?;
+        self.thread(slot)?;
+        self.threads[slot.index] = None;
         Ok(())
     }
 
@@ -305,7 +342,7 @@ impl PendingSignals {
     fn discard_all(&mut self, signal: Signal) {
         self.shared.discard(signal);
         for pending in self.threads.iter_mut().flatten() {
-            pending.discard(signal);
+            pending.pending.discard(signal);
         }
     }
 
@@ -414,6 +451,57 @@ pub fn select_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_slots_reuse_vacancies_and_refuse_stale_handles() {
+        let (mut pending, slots) = PendingSignals::new(1, 0).unwrap();
+        let mut stale = pending.add_thread().unwrap();
+        pending.remove_thread(stale).unwrap();
+        for _ in 0..4096 {
+            let live = pending.add_thread().unwrap();
+            assert_eq!(pending.slot_count(), 2, "slot storage exceeds peak live queues");
+            assert_eq!(live.index, stale.index);
+            assert_ne!(live, stale);
+            assert_eq!(pending.pending(live), Ok(SigSet::EMPTY));
+            pending.enqueue(Target::Thread(live), SigInfo::new(Signal::USR1, 0), SenderClass::SiUser).unwrap();
+            pending.enqueue(Target::Process, SigInfo::new(Signal::STOP, 0), SenderClass::SiUser).unwrap();
+            assert_eq!(pending.pending(stale), Err(PendingError::InvalidThread));
+            assert_eq!(pending.has_deliverable(stale, Blocked::default()), Err(PendingError::InvalidThread));
+            assert_eq!(pending.remove_thread(stale), Err(PendingError::InvalidThread));
+            assert_eq!(pending.dequeue(stale, Blocked::default()), Err(PendingError::InvalidThread));
+            assert_eq!(pending.dequeue_wanted(stale, SigSet::ALL), Err(PendingError::InvalidThread));
+            // A stale CONT send must not cancel the shared STOP before refusal.
+            assert_eq!(
+                pending.enqueue(Target::Thread(stale), SigInfo::new(Signal::CONT, 0), SenderClass::SiUser),
+                Err(PendingError::InvalidThread)
+            );
+            let candidates = [ThreadCandidate {
+                slot: live,
+                mask: Blocked::default(),
+                state: ThreadState::Running,
+                has_pending: true,
+            }];
+            assert_eq!(select_target(Signal::USR1, &candidates, stale), Err(BadCursor));
+            assert_eq!(pending.pending(live), Ok(SigSet::of(&[Signal::USR1, Signal::STOP])));
+            assert_eq!(pending.dequeue(slots[0], Blocked::default()), Ok(Some(SigInfo::new(Signal::STOP, 0))));
+            // The next occupant must not inherit this thread's private USR1.
+            pending.remove_thread(live).unwrap();
+            stale = live;
+        }
+    }
+
+    #[test]
+    fn thread_slot_generation_exhaustion_does_not_reuse_an_identity() {
+        let (mut pending, slots) = PendingSignals::new(1, 0).unwrap();
+        pending.next_generation = u64::MAX - 1;
+        let last = pending.add_thread().unwrap();
+        assert_eq!(last.generation, u64::MAX);
+        pending.remove_thread(last).unwrap();
+        assert_eq!(pending.add_thread(), Err(PendingError::NoMemory));
+        assert_eq!(pending.slot_count(), 2);
+        assert_eq!(pending.pending(last), Err(PendingError::InvalidThread));
+        assert_eq!(pending.pending(slots[0]), Ok(SigSet::EMPTY));
+    }
 
     #[test]
     fn vacant_thread_slot_is_one_word() {

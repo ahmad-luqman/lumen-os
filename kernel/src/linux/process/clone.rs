@@ -1,4 +1,4 @@
-//! Validated process-clone requests; construction excludes thread clones.
+//! Validated process and thread clone requests.
 
 use crate::linux::{errno, general};
 
@@ -17,6 +17,10 @@ impl ProcessClone {
 
     pub(super) fn bits(self) -> u32 {
         self.0
+    }
+
+    pub(super) fn is_thread(self) -> bool {
+        self.0 & general::CLONE_THREAD != 0
     }
 }
 
@@ -50,11 +54,6 @@ pub(crate) fn clone_flags(flags: u32, tls: u64) -> Result<ProcessClone, u32> {
     }
     if flags & general::CLONE_SETTLS != 0 && tls >= crate::user::USER_MAX {
         return Err(errno::EPERM);
-    }
-    // Thread creation and group exit are C3; never silently create a process
-    // for a request to create a thread.
-    if flags & general::CLONE_THREAD != 0 {
-        return Err(errno::ENOSYS);
     }
     Ok(ProcessClone(flags))
 }

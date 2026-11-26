@@ -27,7 +27,10 @@ pub const GUARD_SIZE: u64 = FRAME_SIZE;
 /// How many stacks can be registered at once: five per CPU (main, #DF, NMI,
 /// #MC, #DB) for up to eight CPUs, and the rest for kernel threads (one each)
 /// and tests.
-pub const MAX_STACKS: usize = 128;
+pub const MAX_STACKS: usize = 512;
+
+/// Slots unavailable to user threads, keeping kernel workers spawnable.
+pub const KERNEL_STACK_RESERVE: usize = 32;
 
 /// What a stack is for (names it in crash reports). Stored in the registry as
 /// one byte, so a reader gets it in one atomic load.
@@ -485,13 +488,25 @@ impl Registry {
     /// the null page (a caller bug; a malformed entry would break every
     /// reader).
     pub unsafe fn register(&self, kind: StackKind, range: StackRange) -> Option<Handle> {
+        self.register_in(kind, range, MAX_STACKS)
+    }
+
+    /// Register a user thread's kernel stack without consuming the kernel reserve.
+    ///
+    /// # Safety
+    /// The mapping and lifetime requirements are those of [`Self::register`].
+    pub unsafe fn register_user(&self, range: StackRange) -> Option<Handle> {
+        self.register_in(StackKind::Thread, range, MAX_STACKS - KERNEL_STACK_RESERVE)
+    }
+
+    fn register_in(&self, kind: StackKind, range: StackRange, limit: usize) -> Option<Handle> {
         assert!(range.is_valid(), "malformed stack range {range:?}");
         debug_assert_eq!(StackKind::from_raw(kind as u8), Some(kind), "StackKind::ALL is missing {kind:?}");
         // Claiming (EMPTY -> FILLING) makes this writer the slot's only one.
-        let (i, slot) =
-            self.slots.iter().enumerate().find(|(_, s)| {
-                s.state.compare_exchange(EMPTY, FILLING, Ordering::Acquire, Ordering::Relaxed).is_ok()
-            })?;
+        let (i, slot) = self.slots[..limit]
+            .iter()
+            .enumerate()
+            .find(|(_, s)| s.state.compare_exchange(EMPTY, FILLING, Ordering::Acquire, Ordering::Relaxed).is_ok())?;
         slot.write(|| {
             slot.bottom.store(range.bottom, Ordering::Relaxed);
             slot.top.store(range.top, Ordering::Relaxed);
@@ -954,7 +969,7 @@ mod tests {
     #[test]
     fn a_full_registry_refuses_and_slots_are_reused() {
         let reg = Registry::new();
-        let mut w = StackWindow::new(window(BASE, BASE + 4096 * K));
+        let mut w = StackWindow::new(window(BASE, BASE + (MAX_STACKS as u64 + 2) * 2 * FRAME_SIZE));
         let mut handles: Vec<_> = (0..MAX_STACKS)
             .map(|_| register(&reg, StackKind::Test, take(&mut w, FRAME_SIZE).unwrap()).unwrap())
             .collect();
@@ -986,6 +1001,28 @@ mod tests {
         }
         assert_eq!(StackKind::from_raw(EMPTY), None);
         assert_eq!(StackKind::from_raw(FILLING), None);
+    }
+
+    #[test]
+    fn user_stacks_preserve_kernel_reserve_and_reuse_slots() {
+        let reg = Registry::new();
+        let range = StackRange { bottom: BASE + GUARD_SIZE, top: BASE + GUARD_SIZE + FRAME_SIZE };
+        // SAFETY: this model never dereferences the registered addresses.
+        let user = || unsafe { reg.register_user(range) };
+        let mut handles: Vec<_> = (0..MAX_STACKS - KERNEL_STACK_RESERVE).map(|_| user().unwrap()).collect();
+        assert!(user().is_none());
+        for _ in 0..KERNEL_STACK_RESERVE {
+            handles.push(register(&reg, StackKind::Thread, range).unwrap());
+        }
+        assert!(register(&reg, StackKind::Thread, range).is_none());
+        reg.unregister(handles.remove(0));
+        let reused = user().unwrap();
+        assert!(user().is_none());
+        reg.unregister(reused);
+        for handle in handles {
+            reg.unregister(handle);
+        }
+        assert_eq!(reg.iter().count(), 0);
     }
 
     /// Readers racing a writer that keeps registering and retracting stacks

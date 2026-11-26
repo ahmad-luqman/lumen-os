@@ -49,6 +49,7 @@ pub struct SignalState {
     preferred: Option<ThreadSlot>,
     /// First-wins end decision; Process::exit records its diagnostic.
     group_exit: Option<GroupEnd>,
+    pub(super) exec_waiter: Option<u32>,
     pub(super) rlimit_stack: lumen_vm::StackLimit,
     group_stop: Option<GroupStop>,
     stop_generation: u64,
@@ -151,6 +152,7 @@ impl SignalState {
             threads: BTreeMap::new(),
             preferred: None,
             group_exit: None,
+            exec_waiter: None,
             rlimit_stack: lumen_vm::StackLimit::DEFAULT,
             group_stop: None,
             stop_generation: 0,
@@ -194,6 +196,70 @@ impl SignalState {
     pub(super) fn record_exit(&mut self) {
         self.group_exit.get_or_insert(GroupEnd::Exit);
     }
+    pub(super) fn record_signal(&mut self, signal: Signal) {
+        self.group_exit.get_or_insert(GroupEnd::Signal(signal));
+    }
+
+    /// The link and its refusal checks share the caller's signal lock.
+    pub(super) fn check_clone(&self) -> Result<(), u32> {
+        if self.ending() {
+            return Err(errno::EINTR);
+        }
+        if self.exec_waiter.is_some() || self.group_stop.is_some() || sched::current_sigpending() {
+            return Err(lumen_signal::restart::RestartCode::NoIntr as u32);
+        }
+        if sched::with_current(|t| t.fatal_pending()).unwrap_or(false) {
+            return Err(errno::EINTR);
+        }
+        Ok(())
+    }
+
+    pub(super) fn notify_group_exit(&self, caller: u32) {
+        for (&tid, t) in &self.threads {
+            if tid != caller {
+                t.notify(true);
+            }
+        }
+    }
+
+    /// Kill siblings privately; the exec caller is exempt from these kills.
+    pub(super) fn begin_exec(&mut self, process: &Process, caller: u32) -> Result<(), u32> {
+        if self.ending() || self.exec_waiter.is_some() {
+            return Err(errno::EAGAIN);
+        }
+        self.exec_waiter = Some(caller);
+        self.cancel_stop(process);
+        for (&tid, t) in &self.threads {
+            if tid != caller {
+                self.pending
+                    .enqueue(Target::Thread(t.slot), SigInfo::new(Signal::KILL, 0), SenderClass::SiUser)
+                    .expect("standard private SIGKILL");
+                t.notify(true);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn exchange_tid(&mut self, old: u32, pid: u32) {
+        let signals = self.threads.remove(&old).expect("exec caller's signals");
+        assert!(self.threads.insert(pid, signals).is_none(), "exec leader still linked");
+    }
+
+    #[cfg(feature = "ktest")]
+    pub(super) fn prefer_thread(&mut self, tid: u32) {
+        self.preferred = Some(self.thread(tid).expect("test target").slot);
+    }
+
+    #[cfg(feature = "ktest")]
+    pub(super) fn stop_remaining(&self) -> Option<usize> {
+        self.group_stop.map(|s| s.remaining)
+    }
+
+    #[cfg(feature = "ktest")]
+    pub(super) fn ktest_dequeue_stop(&mut self, tid: u32, process: &Process) {
+        assert!(matches!(self.next(tid), Delivery::Stop(Signal::STOP)));
+        self.start_stop(tid, Signal::STOP, process);
+    }
     pub(super) fn thread_init(&self, tid: u32, request: ProcessClone) -> ThreadInit {
         let t = self.thread(tid).expect("live parent signal tid");
         ThreadInit {
@@ -207,10 +273,10 @@ impl SignalState {
             t.notify(true);
         }
     }
-    /// Insert a linked tid; panics if the tid already exists or its queue cannot be allocated.
-    pub(super) fn add_thread(&mut self, tid: u32, owner: &UserThread, init: ThreadInit) {
-        let slot = self.pending.add_thread().expect("allocate thread signal queue");
-        let signals = ThreadSignals {
+    /// Reserve a private queue before publishing any tid.
+    pub(super) fn prepare_thread(&mut self, owner: &UserThread, init: ThreadInit) -> Result<ThreadSignals, u32> {
+        let slot = self.pending.add_thread().map_err(|_| errno::ENOMEM)?;
+        Ok(ThreadSignals {
             slot,
             thread: Arc::clone(&owner.kernel_handle),
             synthetic: owner.synthetic,
@@ -222,9 +288,24 @@ impl SignalState {
             alt_stack: init.alt_stack,
             fault: None,
             frame_failure: None,
-        };
+        })
+    }
+    pub(super) fn cancel_thread(&mut self, signals: ThreadSignals) {
+        self.pending.remove_thread(signals.slot).expect("reserved signal slot");
+    }
+    #[cfg(feature = "ktest")]
+    pub(super) fn slot_count(&self) -> usize {
+        self.pending.slot_count()
+    }
+    pub(super) fn insert_thread(&mut self, tid: u32, signals: ThreadSignals) {
+        let slot = signals.slot;
         assert!(self.threads.insert(tid, signals).is_none(), "duplicate signal tid");
         self.preferred.get_or_insert(slot);
+    }
+    #[cfg(feature = "ktest")]
+    pub(super) fn add_thread(&mut self, tid: u32, owner: &UserThread, init: ThreadInit) {
+        let signals = self.prepare_thread(owner, init).expect("test signal queue");
+        self.insert_thread(tid, signals);
     }
     /// Remove a live tid and private queue; panics if it was not linked.
     pub(super) fn remove_thread(&mut self, tid: u32) {
@@ -235,7 +316,7 @@ impl SignalState {
         }
         // Shared pending signals survive the departing private queue.
         for t in self.threads.values() {
-            if self.pending.has_deliverable(t.slot, t.blocked).expect("live slot") {
+            if !self.ending() && self.pending.has_deliverable(t.slot, t.blocked).expect("live slot") {
                 t.notify(false);
             }
         }
@@ -378,6 +459,9 @@ impl SignalState {
                 Some(GroupEnd::Signal(signal)) => return Delivery::Fatal(signal, t.take_fault(signal)),
                 None => {}
             }
+            if self.exec_waiter.is_some_and(|caller| caller != tid) {
+                return Delivery::Fatal(Signal::KILL, None);
+            }
             if self.group_stop.is_some() {
                 return Delivery::Park;
             }
@@ -393,7 +477,10 @@ impl SignalState {
             }
             if ignored(action, sig) || action.handler == 0 {
                 if kills_by_default(action, sig) {
-                    self.start_group_exit(sig);
+                    // The fatal dequeue is not the group decision. Like
+                    // get_signal -> do_group_exit, the later locked recheck
+                    // must allow a concurrent de_thread to win this gap.
+                    return Delivery::Fatal(sig, t.take_fault(sig));
                 }
                 continue;
             }
@@ -436,10 +523,9 @@ impl SignalState {
     }
 
     pub(super) fn start_stop(&mut self, tid: u32, sig: Signal, process: &Process) {
-        if self.ending() || !self.thread(tid).is_some_and(|t| t.stop_dequeued) {
+        if self.ending() || self.exec_waiter.is_some() || !self.thread(tid).is_some_and(|t| t.stop_dequeued) {
             return;
         }
-        // C3's de_thread must also refuse a start while exec_waiter is set.
         if self.group_stop.is_none() {
             self.stop_generation = self.stop_generation.checked_add(1).expect("stop generation overflow");
             self.group_stop =
@@ -469,9 +555,10 @@ impl SignalState {
 }
 
 impl Process {
-    /// Refuse multi-threaded exec until de_thread is available, and refuse group exit.
+    /// Refuse exec when another group action has already won.
     pub fn check_exec(&self) -> Result<(), u32> {
-        if PROCS.lock().has_extra_threads(self.pid()) || self.signal.lock().ending() {
+        let state = self.signal.lock();
+        if state.ending() || state.exec_waiter.is_some() {
             return Err(errno::EAGAIN);
         }
         Ok(())
@@ -506,11 +593,13 @@ impl Process {
         next
     }
 
-    /// Job-control stops recheck the dequeue mark under PROCS then signal;
+    /// Job-control stops recheck the dequeue mark after the orphan check;
     /// a racing continue clears it, preventing a late stop of the group.
     pub fn start_job_stop(&self, tid: u32, sig: Signal) {
-        if sig != Signal::STOP {
-            PROCS.lock().start_job_stop(self, tid, sig);
+        if sig != Signal::STOP && !PROCS.lock().orphaned(self) {
+            #[cfg(feature = "ktest")]
+            delay_window(&STOP_GAP_DELAY);
+            self.signal.lock().start_stop(tid, sig, self);
         }
     }
 
@@ -537,6 +626,9 @@ impl Process {
         self.signal.lock().force(tid, info, reset, fault);
     }
 }
+
+#[cfg(feature = "ktest")]
+pub(super) static STOP_GAP_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
 
 #[cfg(feature = "ktest")]
 struct StopPublicationPause {
@@ -904,7 +996,7 @@ crate::ktest!(
         kassert!(matches!(state.next(9), Delivery::Park));
         state.group_stop = None;
         kassert!(matches!(state.next(9), Delivery::Fatal(Signal::TERM, None)));
-        kassert_eq!(state.fatal_signal(), Some(Signal::TERM));
+        kassert_eq!(state.fatal_signal(), None); // exit step 1 records the decision
         let mut state = one_thread_state();
         state.group_stop = Some(GroupStop { generation: 1, signal: Signal::STOP, remaining: 0 });
         state.send(Some(9), SigInfo::new(Signal::KILL, 0), SenderClass::Other).map_err(|_| "send KILL")?;
@@ -1020,7 +1112,7 @@ crate::ktest!(
             let extra = add_ktest_thread(me.process())?;
             let refused = me.process().check_exec();
             remove_ktest_thread(&extra);
-            kassert_eq!(refused, Err(errno::EAGAIN));
+            kassert_eq!(refused, Ok(()));
             kassert_eq!(me.process().check_exec(), Ok(()));
             let mask = Blocked::new(SigSet::of(&[Signal::USR1]));
             me.set_blocked(mask);

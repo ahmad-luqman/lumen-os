@@ -440,6 +440,15 @@ pub struct Process {
     /// The recorded exit diagnostic/status. A pending fatal signal under
     /// `signal` overrides an ordinary exit until the last thread unlinks.
     exit: SpinLock<Option<UserExit>>,
+    /// Ordinary leader exit, used only when no group-end decision wins.
+    leader_exit: SpinLock<Option<UserExit>>,
+    live_threads: AtomicUsize,
+    exec_wait: sched::WaitQueue,
+    /// A shell/root runner remains alive after its Linux thread leaves, so
+    /// its join reports the whole group's outcome and captured output.
+    run_waiting: core::sync::atomic::AtomicBool,
+    run_result: SpinLock<Option<Ended>>,
+    run_wait: sched::WaitQueue,
     /// Waiters for child state changes (wait4/waitid).
     child_events: sched::WaitQueue,
     /// Published before a child-event wake to close the check/enqueue race.
@@ -478,6 +487,12 @@ impl Process {
             console: SpinLock::new(console),
             allow_test_syscalls,
             exit: SpinLock::new(None),
+            leader_exit: SpinLock::new(None),
+            live_threads: AtomicUsize::new(0),
+            exec_wait: sched::WaitQueue::new(),
+            run_waiting: core::sync::atomic::AtomicBool::new(false),
+            run_result: SpinLock::new(None),
+            run_wait: sched::WaitQueue::new(),
             child_events: sched::WaitQueue::new(),
             child_seq: AtomicU64::new(0),
             stopped: core::sync::atomic::AtomicBool::new(false),
@@ -534,18 +549,35 @@ impl Process {
     /// Record the first group-end decision and its exit diagnostic under siglock.
     /// An earlier fatal signal wins; a later signal cannot replace a recorded exit.
     pub fn record_exit(&self, exit: UserExit) {
+        let tid =
+            try_current_thread().filter(|t| core::ptr::eq(t.process().as_ref(), self)).map_or(self.pid(), |t| t.tid());
+        self.record_group_exit(tid, exit);
+    }
+
+    fn record_group_exit(&self, tid: u32, exit: UserExit) {
         let mut signal = self.signal.lock();
-        signal.record_exit();
+        // do_group_exit rechecks group_exec_task under siglock: a sibling
+        // reaching here after de_thread ends alone, even for a fatal dequeue.
+        if !signal.ending() && signal.exec_waiter.is_some_and(|caller| caller != tid) {
+            return;
+        }
+        if let Some(sig) = exit.signal() {
+            signal.record_signal(sig);
+        } else {
+            signal.record_exit();
+        }
         let _ = signal.cancel_stop(self);
         let exit = signal
             .fatal_signal()
             .map_or(exit, |sig| if exit.signal() == Some(sig) { exit } else { UserExit::Signaled(sig) });
         self.exit.lock().get_or_insert(exit);
+        signal.notify_group_exit(tid);
     }
 
     /// Take the recorded outcome once during takedown, without reconciling other state.
     fn take_exit(&self) -> Option<UserExit> {
-        self.exit.lock().take()
+        let group = self.exit.lock().take();
+        group.or_else(|| self.leader_exit.lock().take())
     }
 
     /// Its disposition of `signal`.
@@ -689,6 +721,64 @@ pub fn mark_exec() {
     PROCS.lock().exec(pid);
 }
 
+/// Serialize exec against group actions, wait for detached siblings, and take
+/// the leader's tid. A real fatal send still aborts the caller's killable wait.
+pub(crate) fn de_thread() -> Result<(), u32> {
+    #[cfg(feature = "ktest")]
+    delay_window(&EXEC_DELAY);
+    let caller = current_thread();
+    let process = caller.process();
+    process.signal.lock().begin_exec(process, caller.tid())?;
+    let wake = process.exec_wait.wait_killable(None, || process.live_threads.load(Ordering::SeqCst) == 1);
+    #[cfg(feature = "ktest")]
+    delay_window(&EXEC_WAKE_DELAY);
+    let mut table = PROCS.lock();
+    let mut state = process.signal.lock();
+    assert_eq!(state.exec_waiter, Some(caller.tid()));
+    state.exec_waiter = None;
+    if wake == sched::Wake::Interrupted || state.ending() || sched::with_current(|t| t.fatal_pending()).unwrap_or(false)
+    {
+        return Err(errno::EAGAIN);
+    }
+    // Linux begin_new_exec runs de_thread/exchange_tids before exec_mmap's
+    // robust-list cleanup. Like handle_futex_death(task_pid_vnr(curr)), our
+    // later release_user_sync compares owner bits against the new leader tid;
+    // a mutex still naming this caller's old tid is not marked OWNER_DIED.
+    table.take_leader_tid(&caller, &mut state);
+    Ok(())
+}
+
+/// Deterministic one-shot pause with no elapsed-time assertion.
+#[cfg(feature = "ktest")]
+pub(super) struct TransitionDelay {
+    tid: u32,
+    reached: VforkDone,
+    release: VforkDone,
+}
+
+#[cfg(feature = "ktest")]
+pub(super) static EXEC_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
+#[cfg(feature = "ktest")]
+static EXEC_WAKE_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
+#[cfg(feature = "ktest")]
+static EXEC_FILES_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
+#[cfg(feature = "ktest")]
+static CLONE_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
+
+#[cfg(feature = "ktest")]
+pub(super) fn delay_window(slot: &SpinLock<Option<Arc<TransitionDelay>>>) {
+    let pause = slot.lock().as_ref().filter(|p| p.tid == current_thread().tid()).cloned();
+    if let Some(pause) = pause {
+        pause.reached.complete();
+        pause.release.waiters.wait_until(|| pause.release.done.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(feature = "ktest")]
+fn clone_window() {
+    delay_window(&CLONE_DELAY);
+}
+
 /// Publish the replacement image's raw identity, clearing any old path if unnamed.
 pub fn set_exe_path(path: Option<Arc<[u8]>>) {
     let old = core::mem::replace(&mut *current_process().exe_path.lock(), path);
@@ -707,39 +797,31 @@ pub fn finish_exec() {
     process.exec_signals(current_thread().tid());
 }
 
-/// Prepared before exec commits. A private table cannot acquire a new sharer
-/// while its single owning thread executes this syscall.
-pub enum PreparedFiles {
-    Private,
-    Copy(Arc<Files>),
-}
+/// Storage reserved before teardown, whether or not the table is shared yet.
+pub struct PreparedFiles(Arc<Files>);
 
 /// Allocate all descriptor-copy storage before replacing the address space.
 pub fn prepare_exec_files() -> Result<PreparedFiles, u32> {
-    let process = current_process();
-    let files = process.files.lock().clone().expect("live files");
-    if files.users() > 1 {
-        Ok(PreparedFiles::Copy(Arc::new(Files::prepare_exec().map_err(|e| e.to_errno())?)))
-    } else {
-        Ok(PreparedFiles::Private)
-    }
+    #[cfg(feature = "ktest")]
+    delay_window(&EXEC_FILES_DELAY);
+    // A sibling can fork a Files sharer and exit during preparation. Only
+    // after de_thread can commit_unshare decide that no copy is needed.
+    Ok(PreparedFiles(Arc::new(Files::prepare_exec().map_err(|e| e.to_errno())?)))
 }
 
-/// Install a prepared private table without allocation. The exclusive lease
-/// waits for open reservations to finish, with no spinlock held.
+/// Copy descriptors using reserved storage, then retire the old table.
+/// The copy does not allocate; retirement may allocate its drain vector if
+/// the last other sharer has left. No page-table or frame-allocator lock is
+/// held. The exclusive lease waits for reservations without spinlocks held.
 pub fn commit_unshare(prepared: PreparedFiles) {
     let process = current_process();
     let access = process.files_access.write();
     let old = process.files.lock().clone().expect("live process's files");
-    match prepared {
-        PreparedFiles::Private => assert_eq!(old.users(), 1, "single-threaded private files gained a sharer"),
-        PreparedFiles::Copy(copy) if old.users() > 1 => {
-            old.copy_exec_into(&copy, process.pid());
-            let replaced = process.files.lock().replace(copy).expect("live process's files");
-            drop(access);
-            replaced.leave(process.pid());
-        }
-        PreparedFiles::Copy(_) => {}
+    if old.users() > 1 {
+        old.copy_exec_into(&prepared.0, process.pid());
+        let replaced = process.files.lock().replace(prepared.0).expect("live process's files");
+        drop(access);
+        replaced.leave(process.pid());
     }
 }
 
@@ -915,6 +997,11 @@ pub struct UserThread {
     kernel_handle: Arc<SpinLock<Weak<sched::Thread>>>,
     /// Only explicit ktest stand-ins may have no scheduler notification target.
     synthetic: bool,
+    /// Owns register_current's kernel continuation and result slot.
+    run_owner: bool,
+    /// Completion for CLONE_THREAD | CLONE_VFORK, owned by this task alone.
+    vfork_done: SpinLock<Option<Arc<VforkDone>>>,
+    exit: SpinLock<Option<UserExit>>,
 }
 
 impl UserThread {
@@ -927,6 +1014,9 @@ impl UserThread {
             kernel_thread: AtomicU64::new(0),
             kernel_handle: Arc::new(SpinLock::new(Weak::new())),
             synthetic: false,
+            run_owner: false,
+            vfork_done: SpinLock::new(None),
+            exit: SpinLock::new(None),
         }
     }
 
@@ -953,6 +1043,17 @@ impl UserThread {
     fn set_tid(&self, tid: u32) {
         if let Err(had) = self.tid.compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire) {
             panic!("thread {had} given a second tid, {tid}");
+        }
+    }
+
+    /// Only the table's sole-survivor exec transition may replace a tid.
+    fn exchange_tid(&self, old: u32, pid: u32) {
+        assert_eq!(self.tid.compare_exchange(old, pid, Ordering::AcqRel, Ordering::Acquire), Ok(old));
+    }
+
+    pub(crate) fn complete_vfork(&self) {
+        if let Some(done) = self.vfork_done.lock().take() {
+            done.complete();
         }
     }
 
@@ -1114,7 +1215,7 @@ pub fn register_current(
         allow_test_syscalls,
         exe_path,
     ));
-    let thread = Arc::new(UserThread::for_current(process));
+    let thread = Arc::new(UserThread { run_owner: true, ..UserThread::for_current(process) });
     let spawned = PROCS.lock().link_root(&thread);
     let pid = spawned.unwrap_or_else(|| panic!("no pid is free for a new process"));
     let prev = sched::set_current_user_thread(Some(thread));
@@ -1130,7 +1231,7 @@ fn tree_errno(error: lumen_proc::Error) -> u32 {
     }
 }
 
-/// Clone the calling process. All fallible work precedes linking its pid;
+/// Clone the calling process or thread. All fallible work precedes linking its tid;
 /// the child cannot enter user mode before the parent's tid store.
 pub(crate) fn fork_current(
     request: ProcessClone,
@@ -1141,13 +1242,17 @@ pub(crate) fn fork_current(
     frame: &crate::arch::syscall::SyscallFrame,
 ) -> Result<u64, u32> {
     let caller = current_thread();
-    if caller.process().console.lock().io == ConsoleIo::Capture {
+    if !request.is_thread() && caller.process().console.lock().io == ConsoleIo::Capture {
         info!(target: "linux", "fork: capture console unsupported until children have a shared console (C7/C10)");
         return Err(errno::ENOSYS);
     }
     let flags = request.bits();
-    let new = Process::copy_for_fork(caller.process(), flags)?;
-    let child = Arc::new(UserThread::new(Arc::clone(&new.process)));
+    let new = if request.is_thread() { None } else { Some(Process::copy_for_fork(caller.process(), flags)?) };
+    let process = new.as_ref().map_or(caller.process(), |new| &new.process);
+    let child = Arc::new(UserThread::new(Arc::clone(process)));
+    if request.is_thread() && flags & general::CLONE_VFORK != 0 {
+        *child.vfork_done.lock() = Some(Arc::new(VforkDone::new()));
+    }
     if flags & general::CLONE_CHILD_CLEARTID != 0 {
         child.set_clear_child_tid(child_tid);
     }
@@ -1157,8 +1262,8 @@ pub(crate) fn fork_current(
         registers.rsp = newsp;
     }
     let fs_base = if flags & general::CLONE_SETTLS != 0 { tls } else { sched::current_fs_base() };
-    let space = new.process.address_space().expect("new process's space");
-    let done = new.process.vfork_done.lock().clone();
+    let space = process.address_space().expect("child's space");
+    let done = if request.is_thread() { child.vfork_done.lock().clone() } else { process.vfork_done.lock().clone() };
     // ParkedChild is declared after NewProcess, so a refusal joins first.
     let parked = ParkedChild::spawn(
         sched::with_current(|t| t.task_name()).expect("forking thread"),
@@ -1184,8 +1289,25 @@ pub(crate) fn fork_current(
         }
         _ => errno::EAGAIN,
     })?;
-    let pid = PROCS.lock().link_child(&caller, &child, request)?;
-    new.linked();
+    let signals = if request.is_thread() {
+        let mut state = caller.process().signal.lock();
+        let init = state.thread_init(caller.tid(), request);
+        Some(state.prepare_thread(&child, init)?)
+    } else {
+        None
+    };
+    #[cfg(feature = "ktest")]
+    clone_window();
+    let pid = if let Some(signals) = signals {
+        let mut table = PROCS.lock();
+        let mut state = caller.process().signal.lock();
+        table.link_thread(&child, signals, &mut state)?
+    } else {
+        PROCS.lock().link_child(&caller, &child, request)?
+    };
+    if let Some(new) = new {
+        new.linked();
+    }
     if flags & general::CLONE_PARENT_SETTID != 0 {
         // Linux ignores this put_user's failure.
         let _ = crate::user::copy_to_user(parent_tid, &pid.to_ne_bytes());
@@ -1255,18 +1377,18 @@ fn warn_due(last: Option<u64>, now: u64) -> bool {
     last.is_none_or(|at| now.saturating_sub(at) >= lumen_time::NS_PER_SEC)
 }
 
-/// Take the current thread's process down, the one way a process is taken
-/// down (after ring 3 exits, and by [`RegisteredProcess`]): panics if the
-/// running thread has no Linux process (or is a kernel thread). The process
-/// must have no other thread. The design's exit steps 2 and 3, then the
-/// tree:
+/// End the current Linux thread; the last thread releases the process and
+/// publishes its wait status. Panics if the running thread has no Linux
+/// identity. A root runner waits for the group's result after unlinking,
+/// allowing a sibling's exec to complete even when the original leader exits.
+/// The design's exit steps 2 and 3, then the tree:
 /// 1. release robust futexes, then clear and wake clear_child_tid if the mm
-///    has another process user; take its `Arc<UserThread>` out of scheduler state,
+///    has another thread or process user; take its `Arc<UserThread>` out of scheduler state,
 ///    and its CPU leaves the address space (`sched::detach_user_space`:
 ///    `CR3` back on the kernel's tables); complete_vfork then releases its parent;
 /// 2. in one `PROCS` hold it leaves `PROCS` (and its process's signal
-///    state), the last thread out (asserted);
-/// 3. the process gives up its address space (torn down at its last user),
+///    state), retargeting pending signals and completing stop participation;
+/// 3. the last thread gives up its address space (torn down at its last user),
 ///    its POSIX locks even with a shared table, its descriptor-table user
 ///    (last user closes descriptors and releases flock), its working directory and
 ///    its executable's path;
@@ -1275,20 +1397,48 @@ fn warn_due(last: Option<u64>, now: u64) -> bool {
 ///    releases it; an exit the heap refuses is retried, every millisecond.
 pub fn take_current() -> Ended {
     let current = current_thread();
-    super::futex::release_user_sync(&current, sched::current_address_space().is_some_and(|mm| mm.users() > 1));
+    super::futex::release_user_sync(
+        &current,
+        current.process().live_threads.load(Ordering::SeqCst) > 1
+            || sched::current_address_space().is_some_and(|mm| mm.users() > 1),
+    );
     drop(current);
     let thread = sched::set_current_user_thread(None).expect("no Linux process to take down after ring-3 exit");
     drop(sched::detach_user_space());
+    thread.complete_vfork();
     let process = Arc::clone(thread.process());
-    process.complete_vfork();
     let pid = process.pid();
-    let unlinked = {
+    let run_owner = thread.run_owner;
+    let (unlinked, last) = {
         let mut t = PROCS.lock();
         let unlinked = t.unlink_thread(&thread);
-        assert!(t.no_thread_left(pid), "pid {pid} taken down while another of its threads is linked");
-        unlinked
+        let last = t.no_thread_left(pid);
+        if !last && run_owner {
+            process.run_waiting.store(true, Ordering::Release);
+        }
+        if last {
+            // Zombie sends succeed without queueing. Preserve the leader's
+            // ordinary status without turning earlier thread exits into group exits.
+            let mut state = process.signal.lock();
+            if let Some(sig) = state.fatal_signal() {
+                process.exit.lock().get_or_insert(UserExit::Signaled(sig));
+            }
+            state.record_exit();
+        }
+        (unlinked, last)
     };
+    let own_exit = thread.exit.lock().take().unwrap_or(UserExit::Exited(0));
+    if thread.tid() == pid || last {
+        process.complete_vfork();
+    }
     drop((unlinked, thread));
+    if !last {
+        if run_owner {
+            process.run_wait.wait_until(|| process.run_result.lock().is_some());
+            return process.run_result.lock().take().expect("last thread published the root's result");
+        }
+        return Ended { pid, exit: Some(own_exit), stdout: Vec::new() };
+    }
     let exit = process.take_exit();
     process.release_resources();
     debug_assert!(process.released(), "pid {pid} exits in the tree before giving up mm, files and fs");
@@ -1314,6 +1464,11 @@ pub fn take_current() -> Ended {
     }
     drop(gone);
     let stdout = core::mem::take(&mut process.console.lock().stdout);
+    if process.run_waiting.load(Ordering::Acquire) {
+        *process.run_result.lock() = Some(Ended { pid, exit, stdout });
+        process.run_wait.wake_all();
+        return Ended { pid, exit, stdout: Vec::new() };
+    }
     Ended { pid, exit, stdout }
 }
 
@@ -1765,7 +1920,20 @@ pub fn process_fd_target(pid: u32, fd: i32) -> Option<FdTarget> {
 pub fn record_exit(exit: UserExit) -> (u32, bool) {
     let thread = current_thread();
     let process = thread.process();
+    thread.exit.lock().get_or_insert(exit);
     process.record_exit(exit);
+    (process.pid(), process.allow_test_syscalls)
+}
+
+/// End only the caller; retain the leader's code for the eventual last exit.
+pub fn record_thread_exit(exit: UserExit) -> (u32, bool) {
+    let thread = current_thread();
+    let process = thread.process();
+    let state = process.signal.lock();
+    thread.exit.lock().get_or_insert(exit);
+    if thread.tid() == process.pid() && state.exec_waiter.is_none() {
+        process.leader_exit.lock().get_or_insert(exit);
+    }
     (process.pid(), process.allow_test_syscalls)
 }
 
@@ -2263,7 +2431,7 @@ pub(crate) fn with_process_user<R>(space: &Arc<AddressSpace>, f: impl FnOnce() -
 #[cfg(feature = "ktest")]
 pub(crate) fn add_ktest_thread(process: &Arc<Process>) -> Result<Arc<UserThread>, &'static str> {
     let thread = Arc::new(UserThread::unbound_for_ktest(Arc::clone(process)));
-    PROCS.lock().link_thread(&thread).map_err(|_| "ProcTree::add_thread refused")?;
+    PROCS.lock().link_ktest_thread(&thread).map_err(|_| "ProcTree::add_thread refused")?;
     Ok(thread)
 }
 
@@ -2744,7 +2912,7 @@ pub(crate) fn spawn_test_thread<R: Send + 'static>(
     let handle = sched::spawn_on(crate::arch::cpu_index(), "hazard-thread", move || {
         let ran = with_process_user(&space, || {
             let thread = Arc::new(UserThread::for_current(process));
-            PROCS.lock().link_thread(&thread).map_err(|_| "link the test thread")?;
+            PROCS.lock().link_ktest_thread(&thread).map_err(|_| "link the test thread")?;
             let tid = thread.tid();
             let prev = sched::set_current_user_thread(Some(Arc::clone(&thread)));
             assert!(prev.is_none());
@@ -3990,6 +4158,593 @@ crate::ktest!(
                 kassert_eq!(leftover, None);
                 kassert_eq!(serial_in::poll_subscribers(), 0);
             }
+            Ok(())
+        })?
+    }
+);
+
+#[cfg(feature = "ktest")]
+fn ktest_sibling(run: impl FnOnce() + Send + 'static) -> Result<(Arc<UserThread>, ParkedChild), &'static str> {
+    let caller = current_thread();
+    let thread = Arc::new(UserThread::new(Arc::clone(caller.process())));
+    let parked = ParkedChild::spawn(
+        "c3-sibling",
+        caller.process().address_space().unwrap(),
+        Arc::clone(&thread),
+        0,
+        move || {
+            run();
+            let _ = take_current();
+        },
+    )
+    .map_err(|_| "spawn sibling")?;
+    let mut table = PROCS.lock();
+    let mut state = caller.process().signal.lock();
+    let init = state.thread_init(caller.tid(), clone_flags(0x10f00, 0).unwrap());
+    let signals = state.prepare_thread(&thread, init).map_err(|_| "sibling signals")?;
+    table.link_thread(&thread, signals, &mut state).map_err(|_| "link sibling")?;
+    Ok((thread, parked))
+}
+
+#[cfg(feature = "ktest")]
+fn transition_delay(tid: u32) -> Arc<TransitionDelay> {
+    Arc::new(TransitionDelay { tid, reached: VforkDone::new(), release: VforkDone::new() })
+}
+
+#[cfg(feature = "ktest")]
+fn ktest_exec() -> u64 {
+    crate::user::copy_to_user(KTEST_USER_VA, b"/tmp/c3-exec\0").expect("exec path");
+    hazard_call(general::__NR_execve, KTEST_USER_VA, 0, 0, 0)
+}
+
+crate::ktest!(
+    fn clone_and_join_reuses_signal_slots() {
+        use crate::arch::gdt;
+        use crate::{kassert, kassert_eq};
+        in_test_process(|_| {
+            const CODE: u64 = 0x800000;
+            let process = current_process();
+            process
+                .address_space()
+                .unwrap()
+                .map_eager_with_bytes(
+                    CODE,
+                    4096,
+                    lumen_vm::Prot::READ | lumen_vm::Prot::EXEC,
+                    // mov eax, __NR_exit; xor edi, edi; syscall; ud2
+                    &[0xb8, 60, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, 0x0f, 0x0b],
+                )
+                .map_err(|_| "map thread exit program")?;
+            let frame = crate::arch::syscall::SyscallFrame {
+                rip: CODE,
+                rsp: KTEST_USER_VA + KTEST_USER_LEN,
+                cs: u64::from(gdt::USER_CODE),
+                ss: u64::from(gdt::USER_DATA),
+                rflags: 0x202,
+                ..Default::default()
+            };
+            let request = clone_flags(
+                general::CLONE_THREAD
+                    | general::CLONE_VM
+                    | general::CLONE_SIGHAND
+                    | general::CLONE_FILES
+                    | general::CLONE_FS
+                    | general::CLONE_CHILD_CLEARTID,
+                0,
+            )
+            .unwrap();
+            kassert_eq!(process.signal.lock().slot_count(), 1);
+            for _ in 0..128 {
+                crate::user::copy_to_user(KTEST_USER_VA, &1u32.to_ne_bytes()).map_err(|_| "set join word")?;
+                let tid = fork_current(request, 0, 0, KTEST_USER_VA, 0, &frame).map_err(|_| "clone thread")?;
+                // Wait beyond clear_child_tid: unlinking also releases the signal
+                // slot. Confirm that effect before starting the next clone.
+                while lookup_thread(tid as u32).is_some() {
+                    crate::time::sleep(1_000_000);
+                }
+                let mut cleared = [0xff; 4];
+                crate::user::copy_from_user(&mut cleared, KTEST_USER_VA).map_err(|_| "read join word")?;
+                kassert_eq!(u32::from_ne_bytes(cleared), 0);
+                kassert_eq!(process.live_threads.load(Ordering::SeqCst), 1);
+                kassert_eq!(process.signal.lock().slot_count(), 2);
+                kassert!(process.signal.lock().has_thread(current_thread().tid()));
+            }
+            PROCS.lock().check()?;
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn exec_reserves_private_files_before_teardown() {
+        use crate::{kassert, kassert_eq};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        for with_sibling in [false, true] {
+            in_test_process(move |_| {
+                let process = current_process();
+                let old_mm = process.address_space().unwrap();
+                let old_files = process.files.lock().clone().unwrap();
+                // Positive control: the same ELF, argv and env load under
+                // this threshold. Files' 1024-slot reservation is larger.
+                let exec = crate::linux::exec::Exec::from_path("/tmp/c3-exec").map_err(|_| "plan")?;
+                crate::mm::heap::refuse_from(16 * 1024);
+                let loaded = exec.load(&[b""], &[], b"/tmp/c3-exec");
+                crate::mm::heap::refuse_from(usize::MAX);
+                loaded.map_err(|_| "load below Files threshold")?.0.teardown();
+
+                let finish = Arc::new(VforkDone::new());
+                let sibling = if with_sibling {
+                    let done = Arc::clone(&finish);
+                    let (thread, parked) = ktest_sibling(move || {
+                        done.wait();
+                        record_thread_exit(UserExit::Exited(0));
+                    })?;
+                    let handle = parked.start();
+                    while handle.thread().state() != sched::State::Blocked {
+                        sched::yield_now();
+                    }
+                    Some((thread, handle))
+                } else {
+                    None
+                };
+                let users_before = old_files.users();
+                let threads_before = process.live_threads.load(Ordering::SeqCst);
+                crate::mm::heap::refuse_from(16 * 1024);
+                let ret = ktest_exec();
+                crate::mm::heap::refuse_from(usize::MAX);
+                let threads_after = process.live_threads.load(Ordering::SeqCst);
+                let sibling_killed = sibling.as_ref().is_some_and(|(_, h)| h.thread().fatal_pending());
+                // Clean up before asserting, including if a mutant ran exec.
+                finish.complete();
+                if let Some((_, handle)) = sibling {
+                    handle.join();
+                }
+                kassert_eq!(users_before, 1);
+                kassert_eq!(threads_before, 1 + usize::from(with_sibling));
+                kassert_eq!(ret as i64, -i64::from(errno::ENOMEM));
+                kassert_eq!(threads_after, threads_before);
+                kassert!(!sibling_killed);
+                kassert_eq!(process.signal.lock().exec_waiter, None);
+                kassert!(Arc::ptr_eq(&old_mm, &process.address_space().unwrap()));
+                kassert!(Arc::ptr_eq(&old_files, &process.files.lock().clone().unwrap()));
+                Ok(())
+            })??;
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn exec_unshares_files_after_a_sibling_clones_and_exits() {
+        use crate::{arch::gdt, kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        in_test_process(|pid| {
+            const CODE: u64 = 0x800000;
+            let process = current_process();
+            // The real process clone waits in pause until cleanup kills it.
+            process
+                .address_space()
+                .unwrap()
+                .map_eager_with_bytes(
+                    CODE,
+                    4096,
+                    lumen_vm::Prot::READ | lumen_vm::Prot::EXEC,
+                    &[0xb8, 34, 0, 0, 0, 0x0f, 0x05, 0xeb, 0xf7],
+                )
+                .map_err(|_| "map clone program")?;
+            with_current_console(|c| c.io = ConsoleIo::Serial);
+            let file = open_kernel_file(b"/dev/null", OpenFlags::O_RDWR, 0).map_err(|_| "open")?;
+            let fd = install_current_fd(file, true).map_err(|_| "cloexec descriptor")?;
+            let original = process.files.lock().clone().unwrap();
+            let delay = transition_delay(pid);
+            let pause = Arc::clone(&delay);
+            let cloned = Arc::new(SpinLock::new(None));
+            let out = Arc::clone(&cloned);
+            let (_, parked) = ktest_sibling(move || {
+                pause.reached.wait();
+                let request = clone_flags(general::CLONE_FILES | general::SIGCHLD, 0).unwrap();
+                let frame = crate::arch::syscall::SyscallFrame {
+                    rip: CODE,
+                    rsp: KTEST_USER_VA + KTEST_USER_LEN,
+                    cs: u64::from(gdt::USER_CODE),
+                    ss: u64::from(gdt::USER_DATA),
+                    rflags: 0x202,
+                    ..Default::default()
+                };
+                *out.lock() = Some(fork_current(request, 0, 0, 0, 0, &frame));
+                record_thread_exit(UserExit::Exited(0));
+            })?;
+            let before = (original.users(), process.live_threads.load(Ordering::SeqCst));
+            *EXEC_FILES_DELAY.lock() = Some(Arc::clone(&delay));
+            let sibling = parked.start();
+            let (p, old, pause) = (Arc::clone(&process), Arc::clone(&original), Arc::clone(&delay));
+            let changed = Arc::new(SpinLock::new(None));
+            let observed = Arc::clone(&changed);
+            let controller = sched::spawn("c3-files-race", move || {
+                sibling.join();
+                *observed.lock() = Some((old.users(), p.live_threads.load(Ordering::SeqCst)));
+                pause.release.complete();
+            })
+            .map_err(|_| "files controller")?;
+            let ret = ktest_exec();
+            controller.join();
+            *EXEC_FILES_DELAY.lock() = None;
+            let child_pid = cloned.lock().take().ok_or("clone result")?.map_err(|_| "sibling clone")? as u32;
+            let child = lookup(child_pid).ok_or("cloned child")?;
+            let private = !Arc::ptr_eq(&original, &process.files.lock().clone().unwrap());
+            let child_kept_fd = child.with_files(|t| t.get(fd).is_some());
+            let exec_closed_fd = process.with_files(|t| t.get(fd).is_none());
+            let remaining_users = original.users();
+            send_process_checked(child_pid as i32, Ok(Some(SigInfo::new(Signal::KILL, 0))), SenderClass::SiUser)
+                .map_err(|_| "kill clone")?;
+            let reaped = wait_child(wait4_request(child_pid as i32, 0).unwrap()).map_err(|_| "reap clone")?;
+            kassert_eq!(before, (1, 2));
+            kassert_eq!(*changed.lock(), Some((2, 1)));
+            kassert_eq!(ret, 0);
+            kassert!(private);
+            kassert_eq!(remaining_users, 1);
+            kassert_eq!(child_kept_fd, Some(true));
+            kassert_eq!(exec_closed_fd, Some(true));
+            kassert!(reaped.is_some());
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn de_thread_fatal_send_during_wait_refuses_and_clears_waiter() {
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        in_test_process(|pid| {
+            let process = current_process();
+            let old_mm = process.address_space().unwrap();
+            let caller = sched::current().unwrap();
+            let finish = Arc::new(VforkDone::new());
+            let held = Arc::clone(&finish);
+            let (_, parked) = ktest_sibling(move || {
+                // Ignore de_thread's fatal kick until the controller has
+                // observed the caller asleep and sent its own SIGKILL.
+                held.waiters.wait_until(|| held.done.load(Ordering::SeqCst));
+                record_thread_exit(UserExit::Exited(0));
+            })?;
+            let sibling = parked.start();
+            let delay = transition_delay(pid);
+            *EXEC_WAKE_DELAY.lock() = Some(Arc::clone(&delay));
+            let (p, pause) = (Arc::clone(&process), Arc::clone(&delay));
+            let result = Arc::new(SpinLock::new(None));
+            let out = Arc::clone(&result);
+            let controller = sched::spawn("c3-exec-kill", move || {
+                while p.signal.lock().exec_waiter != Some(pid) || caller.state() != sched::State::Blocked {
+                    sched::yield_now();
+                }
+                let live_at_send = p.live_threads.load(Ordering::SeqCst);
+                let sent = send_thread(Some(pid), pid, Some(SigInfo::new(Signal::KILL, 0)), SenderClass::SiUser);
+                pause.reached.wait();
+                finish.complete();
+                sibling.join();
+                // Keep the mutant's tid-exchange precondition valid: it
+                // must fail the errno assertion, not an incidental panic.
+                let live_after_exit = p.live_threads.load(Ordering::SeqCst);
+                *out.lock() = Some((live_at_send, sent, live_after_exit));
+                pause.release.complete();
+            })
+            .map_err(|_| "kill controller")?;
+            let ret = ktest_exec();
+            controller.join();
+            *EXEC_WAKE_DELAY.lock() = None;
+            kassert_eq!(*result.lock(), Some((2, Ok(()), 1)));
+            kassert_eq!(ret as i64, -i64::from(errno::EAGAIN));
+            kassert_eq!(process.signal.lock().exec_waiter, None);
+            kassert!(process.signal.lock().ending());
+            kassert!(Arc::ptr_eq(&old_mm, &process.address_space().unwrap()));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn clone_racing_a_group_exit_never_escapes() {
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        for race in 0..3 {
+            in_test_process(move |pid| {
+                let process = current_process();
+                let delay = transition_delay(pid);
+                *CLONE_DELAY.lock() = Some(Arc::clone(&delay));
+                let (p, pause) = (Arc::clone(&process), Arc::clone(&delay));
+                let kernel = sched::current().unwrap();
+                let controller = sched::spawn("c3-clone-race", move || {
+                    pause.reached.wait();
+                    match race {
+                        0 => p.record_group_exit(pid, UserExit::Exited(37)),
+                        1 => p.signal.lock().exec_waiter = Some(pid),
+                        _ => {
+                            let mut state = p.signal.lock();
+                            state.send(Some(pid), SigInfo::new(Signal::STOP, 0), SenderClass::SiUser).unwrap();
+                            state.ktest_dequeue_stop(pid, &p);
+                            kernel.clear_sigpending_for_test();
+                            drop(state);
+                        }
+                    }
+                    pause.release.complete();
+                })
+                .map_err(|_| "controller")?;
+                let result = fork_current(clone_flags(0x10f00, 0).unwrap(), 0, 0, 0, 0, &Default::default());
+                controller.join();
+                *CLONE_DELAY.lock() = None;
+                process.signal.lock().exec_waiter = None;
+                let _ = process.signal.lock().cancel_stop(&process);
+                kassert_eq!(
+                    result,
+                    Err(if race == 0 { errno::EINTR } else { lumen_signal::restart::RestartCode::NoIntr as u32 })
+                );
+                kassert_eq!(process.live_threads.load(Ordering::SeqCst), 1);
+                kassert_eq!(process.address_space().unwrap().users(), 1);
+                PROCS.lock().check()?;
+                Ok(())
+            })??;
+        }
+        in_test_process(|pid| {
+            let mask = Blocked::new(SigSet::of(&[Signal::USR1]));
+            set_current_blocked(mask);
+            current_thread()
+                .configure_alt_stack(0, Some((KTEST_USER_VA, 8192, 0)))
+                .map_err(|_| "parent alternate stack")?;
+            let (child, parked) = ktest_sibling(|| {
+                record_exit(UserExit::Exited(99));
+            })?;
+            kassert_eq!(child.blocked(), mask);
+            kassert_eq!(child.alt_stack(), lumen_signal::altstack::AltStack::DISABLED);
+            current_process().record_group_exit(pid, UserExit::Exited(37));
+            kassert!(child.scheduler_thread().unwrap().fatal_pending());
+            parked.start().join();
+            kassert_eq!(*current_process().exit.lock(), Some(UserExit::Exited(37)));
+            kassert!(lookup_thread(child.tid()).is_none());
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn exit_group_during_de_thread_ends_only_itself() {
+        use crate::{kassert, kassert_eq};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        for fatal_dequeue in [false, true] {
+            in_test_process(move |pid| {
+                let done = Arc::new(VforkDone::new());
+                let waiting = Arc::clone(&done);
+                let result = Arc::new(SpinLock::new(None));
+                let out = Arc::clone(&result);
+                let (child, parked) = ktest_sibling(move || {
+                    if fatal_dequeue {
+                        let me = current_thread();
+                        me.set_blocked(Blocked::new(SigSet::of(&[Signal::TERM])));
+                        send_thread(
+                            None,
+                            me.tid(),
+                            Some(lumen_signal::pending::SigInfo::new(Signal::TERM, 0)),
+                            lumen_signal::pending::SenderClass::SiUser,
+                        )
+                        .unwrap();
+                        me.set_blocked(Blocked::EMPTY);
+                        assert!(matches!(me.process().next_signal(me.tid()), Delivery::Fatal(Signal::TERM, None)));
+                    }
+                    waiting.wait(); // The actual vfork TASK_KILLABLE wait.
+                    let me = current_thread();
+                    let exec = me.process().signal.lock().exec_waiter;
+                    record_exit(if fatal_dequeue { UserExit::Signaled(Signal::TERM) } else { UserExit::Exited(42) });
+                    *out.lock() = Some((
+                        exec,
+                        me.process().signal.lock().ending(),
+                        sched::with_current(|t| t.fatal_pending()).unwrap(),
+                    ));
+                })?;
+                let handle = parked.start();
+                while handle.thread().state() != sched::State::Blocked {
+                    sched::yield_now();
+                }
+                let delay = transition_delay(pid);
+                *EXEC_DELAY.lock() = Some(Arc::clone(&delay));
+                let pause = Arc::clone(&delay);
+                let controller = sched::spawn("c3-exec-race", move || {
+                    pause.reached.wait();
+                    pause.release.complete();
+                })
+                .map_err(|_| "controller")?;
+                let ret = ktest_exec();
+                controller.join();
+                *EXEC_DELAY.lock() = None;
+                done.complete(); // cleanup even if exec was refused
+                sched::join_bounded(handle)?;
+                kassert_eq!(ret, 0);
+                kassert_eq!(*result.lock(), Some((Some(pid), false, true)));
+                kassert!(lookup_thread(child.tid()).is_none());
+                kassert!(!current_process().signal.lock().ending());
+                kassert_eq!(current_thread().tid(), pid);
+                Ok(())
+            })??;
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn de_thread_refuses_a_racing_group_stop() {
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        // Isolate the exec guard from begin_exec's independent clearing of
+        // the dequeue mark: either protection alone must retain its contract.
+        in_job_control_process(|pid| {
+            let process = current_process();
+            send_thread(None, pid, Some(SigInfo::new(Signal::TSTP, 0)), SenderClass::SiUser).map_err(|_| "job stop")?;
+            kassert!(matches!(process.next_signal(pid), Delivery::Stop(Signal::TSTP)));
+            process.signal.lock().exec_waiter = Some(pid);
+            process.start_job_stop(pid, Signal::TSTP);
+            let stopped = process.stopped.load(Ordering::SeqCst);
+            process.signal.lock().exec_waiter = None;
+            process.signal.lock().cancel_stop(&process);
+            kassert!(!stopped);
+            Ok(())
+        })?;
+        for continued in [false, true] {
+            in_job_control_process(move |pid| {
+                let start = Arc::new(VforkDone::new());
+                let go = Arc::clone(&start);
+                let (child, parked) = ktest_sibling(move || {
+                    go.wait();
+                    let me = current_thread();
+                    let next = me.process().next_signal(me.tid());
+                    assert!(matches!(next, Delivery::Stop(Signal::TSTP)));
+                    me.process().start_job_stop(me.tid(), Signal::TSTP);
+                })?;
+                let gap = transition_delay(child.tid());
+                *signal::STOP_GAP_DELAY.lock() = Some(Arc::clone(&gap));
+                let sent = send_thread(None, child.tid(), Some(SigInfo::new(Signal::TSTP, 0)), SenderClass::SiUser);
+                let handle = parked.start();
+                start.complete();
+                gap.reached.wait();
+                if continued {
+                    send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::CONT, 0))), SenderClass::SiUser)
+                        .map_err(|_| "continue")?;
+                    gap.release.complete();
+                    handle.join();
+                    *signal::STOP_GAP_DELAY.lock() = None;
+                    kassert!(!current_process().stopped.load(Ordering::SeqCst));
+                    kassert_eq!(ktest_exec(), 0);
+                } else {
+                    let process = current_process();
+                    let delay = transition_delay(pid);
+                    *EXEC_DELAY.lock() = Some(Arc::clone(&delay));
+                    let (p, exec, stop) = (Arc::clone(&process), Arc::clone(&delay), Arc::clone(&gap));
+                    let controller = sched::spawn("c3-stop-gap", move || {
+                        exec.reached.wait();
+                        exec.release.complete();
+                        while p.signal.lock().exec_waiter.is_none() {
+                            sched::yield_now();
+                        }
+                        stop.release.complete();
+                    })
+                    .map_err(|_| "stop controller")?;
+                    let ret = ktest_exec();
+                    controller.join();
+                    handle.join();
+                    *EXEC_DELAY.lock() = None;
+                    *signal::STOP_GAP_DELAY.lock() = None;
+                    kassert_eq!(ret, 0);
+                    kassert!(!process.stopped.load(Ordering::SeqCst));
+                    kassert_eq!(process.signal.lock().stop_remaining(), None);
+                    kassert!(!process.signal.lock().ending());
+                }
+                kassert_eq!(sent, Ok(()));
+                Ok(())
+            })?;
+        }
+        in_test_process(|pid| {
+            let process = current_process();
+            send_thread(None, pid, Some(SigInfo::new(Signal::STOP, 0)), SenderClass::SiUser).map_err(|_| "stop")?;
+            kassert!(matches!(process.next_signal(pid), Delivery::Stop(Signal::STOP)));
+            let stop = process.signal.lock().participate_stop(pid).ok_or("completed stop")?;
+            PROCS.lock().complete_stop(&process, stop);
+            kassert_eq!(process.signal.lock().stop_remaining(), Some(0));
+            kassert_eq!(ktest_exec(), 0);
+            kassert!(!process.stopped.load(Ordering::SeqCst));
+            kassert_eq!(process.signal.lock().stop_remaining(), None);
+            kassert!(!matches!(ps_rows().into_iter().find(|p| p.pid == pid).unwrap().state, ProcState::Stopped { .. }));
+            Ok(())
+        })?
+    }
+);
+
+/// A child in its own group, with a live parent in another group of the
+/// same session: job-control stops exercise the real orphan check.
+#[cfg(feature = "ktest")]
+fn in_job_control_process(
+    f: impl FnOnce(u32) -> crate::ktest::TestResult + Send + 'static,
+) -> crate::ktest::TestResult {
+    in_test_process(move |parent| {
+        let result = Arc::new(SpinLock::new(None));
+        let out = Arc::clone(&result);
+        let (pid, parked) = ktest_fork_child(move || {
+            *out.lock() = Some(f(current_process().pid()));
+            record_thread_exit(UserExit::Exited(0));
+            let _ = take_current();
+        })?;
+        PROCS.lock().child_group_for_ktest(parent, pid);
+        let _ = ktest_reap(pid, parked.start())?;
+        result.lock().take().ok_or("job-control child result")?
+    })?
+}
+
+crate::ktest!(
+    fn exit_retargets_signals_and_completes_a_stop() {
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        for exec in [false, true] {
+            in_test_process(move |pid| {
+                let process = current_process();
+                set_current_action(Signal::USR1, KernelSigaction { handler: 0x400000, ..Default::default() });
+                let done = Arc::new(VforkDone::new());
+                let waiting = Arc::clone(&done);
+                let (child, parked) = ktest_sibling(move || {
+                    waiting.wait();
+                    record_thread_exit(UserExit::Exited(0));
+                })?;
+                let handle = parked.start();
+                while handle.thread().state() != sched::State::Blocked {
+                    sched::yield_now();
+                }
+                process.signal.lock().prefer_thread(child.tid());
+                send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::USR1, 0))), SenderClass::SiUser)
+                    .map_err(|_| "shared signal")?;
+                kassert!(!sched::current_sigpending());
+                kassert!(child.scheduler_thread().unwrap().sigpending());
+                if exec {
+                    kassert_eq!(ktest_exec(), 0);
+                } else {
+                    done.complete();
+                }
+                handle.join();
+                kassert!(sched::current_sigpending());
+                set_current_action(Signal::USR1, KernelSigaction { handler: 0x400000, ..Default::default() });
+                kassert!(matches!(process.next_signal(pid), Delivery::Handler(_)));
+                kassert!(matches!(process.next_signal(pid), Delivery::None));
+                Ok(())
+            })??;
+        }
+        in_test_process(|_| {
+            set_current_blocked(Blocked::new(SigSet::of(&[Signal::CHLD])));
+            let done = Arc::new(VforkDone::new());
+            let end = Arc::clone(&done);
+            let (pid, parked) = ktest_fork_child(move || {
+                end.wait();
+                record_thread_exit(UserExit::Exited(0));
+                let _ = take_current();
+            })?;
+            let child = lookup(pid).ok_or("stop child")?;
+            let extra = add_ktest_thread(&child)?;
+            // The child leader will participate through next_signal before
+            // being allowed to finish; the synthetic last participant exits.
+            send_thread(None, pid, Some(SigInfo::new(Signal::STOP, 0)), SenderClass::SiUser)
+                .map_err(|_| "stop child")?;
+            let mut state = child.signal.lock();
+            state.ktest_dequeue_stop(pid, &child);
+            let _ = state.participate_stop(pid);
+            drop(state);
+            remove_ktest_thread(&extra);
+            let report = wait_child(wait4_request(pid as i32, general::WUNTRACED | general::WNOHANG).unwrap())
+                .map_err(|_| "stop report")?;
+            let info = current_thread().wait_signal(SigSet::of(&[Signal::CHLD]), Some(crate::time::now_ns()));
+            send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::CONT, 0))), SenderClass::SiUser)
+                .map_err(|_| "continue")?;
+            done.complete();
+            kassert_eq!(ktest_reap(pid, parked.start())?, 0);
+            kassert!(report.is_some_and(|r| r.status() == lumen_proc::WaitStatus::Stopped(Signal::STOP)));
+            let info = info.map_err(|_| "CLD_STOPPED")?;
+            kassert_eq!(i32::from_ne_bytes(info.bytes()[8..12].try_into().unwrap()), 5);
             Ok(())
         })?
     }

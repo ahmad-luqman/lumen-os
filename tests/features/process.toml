@@ -150,3 +150,39 @@ tests = [
 name = "Task comm display handles invalid UTF-8 without heap allocation"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::sched::task_name_display_needs_no_heap"]
+
+[[feature]]
+name = "C3 threads: clone flags, pthread join, group exit, de_thread and leader tid exchange"
+milestone = "M8"
+tests = [
+    "cargo:lumen-proc",
+    "cargo:lumen-mm",
+    "scenario:test_linux_proc::test_pthread_create_and_join",
+    "scenario:test_linux_proc::test_fork_cow_and_exec_shebang",
+    "ktest:lumen_kernel::linux::process::clone_racing_a_group_exit_never_escapes",
+    "ktest:lumen_kernel::linux::process::de_thread_refuses_a_racing_group_stop",
+    "ktest:lumen_kernel::linux::process::exit_group_during_de_thread_ends_only_itself",
+    "ktest:lumen_kernel::linux::process::exit_retargets_signals_and_completes_a_stop",
+]
+
+[[feature]]
+name = "C3 exec handles late Files sharers and fatal sends during sibling teardown"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::process::exec_unshares_files_after_a_sibling_clones_and_exits",
+    "ktest:lumen_kernel::linux::process::de_thread_fatal_send_during_wait_refuses_and_clears_waiter",
+    "cargo:lumen-proc",
+]
+
+[[feature]]
+name = "C3 exec reserves Files copy storage even for an initially private table"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::exec_reserves_private_files_before_teardown"]
+
+[[feature]]
+name = "C3 thread signal queues reuse vacant slots without accepting stale handles"
+milestone = "M8"
+tests = [
+    "cargo:lumen-signal",
+    "ktest:lumen_kernel::linux::process::clone_and_join_reuses_signal_slots",
+]

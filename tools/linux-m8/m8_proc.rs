@@ -17,6 +17,7 @@ mod futex;
 mod signal_waits;
 mod signals;
 mod small;
+mod threads;
 
 use core::ffi::c_int;
 
@@ -29,6 +30,11 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     let (args, n) = unsafe { common::args(argc, argv) };
     match &args[..n] {
         [_, b"fork-wait"] => fork_wait(),
+        [_, b"threads"] => threads::run(),
+        [_, b"thread-exhaust"] => threads::exhaust(),
+        [_, b"thread-root-exec"] => threads::root(true),
+        [_, b"thread-root-exit"] => threads::root(false),
+        [_, b"thread-image", tids @ ..] => threads::image(tids),
         [_, b"signal-waits"] => signal_waits::run(),
         [_, b"c6-kill", pid, sig] => signal_waits::send(pid, sig),
         [_, b"c6-wait", kind, mode] => signal_waits::blocking(kind, *mode == b"restart"),
@@ -41,7 +47,10 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
             1
         }
         [_, b"small-stack"] => small::stack_child(64 * 1024 * 1024),
-        [_, b"fork-exec"] => exec::run(),
+        [_, b"fork-exec"] => {
+            let result = exec::run();
+            if result == 0 { threads::exec_checks() } else { result }
+        }
         [_, b"exec-exit", ..] => exec::child_exit(),
         [_, b"exec-hold"] => exec::child_hold(),
         [_, b"exec-relative"] => exec::child_relative(),
@@ -505,7 +514,6 @@ fn rejected_flags() -> R {
         wait(pid, 0)?;
         gone(pid)?;
     }
-    eq("thread clone belongs to C3", sys(SYS_CLONE, [CLONE_PTHREAD, 0, 0, 0, 0, 0]), -ENOSYS)?;
     eq("invalid TLS", sys(SYS_CLONE, [SIGCHLD | CLONE_SETTLS, 0, 0, 0, 1 << 63, 0]), -EPERM)?;
     eq("wait4 invalid options", sys(SYS_WAIT4, [u64::MAX, 0, WEXITED, 0, 0, 0]), -EINVAL)?;
     eq("waitid no event options", sys(SYS_WAITID, [P_ALL, 0, 0, WNOHANG, 0, 0]), -EINVAL)
