@@ -388,15 +388,17 @@ pub fn mem(ctx: &mut Ctx<'_>, args: &[String]) {
     let frames = crate::mm::frame::counts();
     let heap = crate::mm::heap::stats();
     let kinds = stack_kinds();
-    let (owned, free) = (frames.owned as u64, frames.free as u64);
+    let (owned, free, min_free) = (frames.owned as u64, frames.free as u64, frames.min_free as u64);
     let mut t = String::new();
     let _ = writeln!(t, "mem: frames, heap and kernel stacks");
     let _ = writeln!(
         t,
-        "  frames  {} of {} used ({} frames of {owned} free, 4 KiB each)",
+        "  frames  {} of {} used ({} frames of {owned} free, 4 KiB each; low {}, {} frames)",
         Bytes((owned - free) * FRAME_SIZE),
         Bytes(owned * FRAME_SIZE),
-        free
+        free,
+        Bytes(min_free * FRAME_SIZE),
+        min_free,
     );
     let _ = writeln!(
         t,

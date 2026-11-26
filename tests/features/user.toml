@@ -254,3 +254,11 @@ milestone = "M8"
 tests = [
     "scenario:test_alpine::test_ash_scripts_and_pipelines",
 ]
+
+[[feature]]
+name = "M8 D2 gcc/g++ and GNU make gate on the Alpine developer image, 512 MiB (#394): `make -j1` builds a C helper with `gcc -O2`, a C++ shared library (`libthrow.so`) with `g++ -O2 -fPIC -shared`, and a C++ executable linked with `-Wl,-rpath,.` that catches a `std::runtime_error` thrown and unwound with RAII destructors across the `.so` boundary; `make -j1 -q` confirms targets are up to date; `make -j2` runs two trivial rules using GNU make 4.4's FIFO jobserver (`--jobserver-auth=fifo:`, empty stderr); `mem` tracks the physical frame allocator's low-water mark (at least 64 MiB free throughout the build); and the synced ext4 image passes `e2fsck -fn` with build outputs verified via `debugfs`"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::mm::frame::low_water_mark_tracks_the_minimum",
+    "scenario:test_alpine::test_gcc_gpp_compile_cpp_and_shared_lib",
+]
