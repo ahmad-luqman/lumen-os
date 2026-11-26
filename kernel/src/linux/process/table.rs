@@ -1,6 +1,6 @@
 //! Process-tree ownership and atomic identity/lifetime transitions.
 
-use super::signal::ThreadInit;
+use super::signal::{ThreadInit, ThreadSignals};
 use super::*;
 use lumen_signal::pending::{SenderClass, SigInfo};
 
@@ -158,9 +158,17 @@ impl ProcTable {
     /// changed) when no pid is free.
     pub(super) fn link_root(&mut self, thread: &Arc<UserThread>) -> Option<u32> {
         let process = thread.process();
-        let pid = self.tree.spawn_root(RusageSlot::new(process.usage_slot)).ok()?;
+        let mut signal = process.signal.lock();
+        let signals = signal.prepare_thread(thread, ThreadInit::ROOT).ok()?;
+        let pid = match self.tree.spawn_root(RusageSlot::new(process.usage_slot)) {
+            Ok(pid) => pid,
+            Err(_) => {
+                signal.cancel_thread(signals);
+                return None;
+            }
+        };
         process.set_pid(pid);
-        self.insert_thread(pid, thread, ThreadInit::ROOT);
+        self.insert_thread(pid, thread, signals, &mut signal);
         self.insert_process(pid, process);
         Some(pid)
     }
@@ -175,20 +183,23 @@ impl ProcTable {
         request: ProcessClone,
     ) -> Result<u32, u32> {
         let signal = parent.process().signal.lock();
-        if signal.ending() || sched::with_current(|t| t.fatal_pending()).unwrap_or(false) {
-            return Err(errno::EINTR);
-        }
-        if sched::current_sigpending() {
-            return Err(lumen_signal::restart::RestartCode::NoIntr as u32);
-        }
+        signal.check_clone()?;
         let child = thread.process();
-        let pid = self.tree.fork(parent.process().pid(), RusageSlot::new(child.usage_slot)).map_err(tree_errno)?;
-        child.set_pid(pid);
         // PROCS is held and the child is unreachable until insert_process:
         // no other thread can take its signal lock while we hold the parent's.
         child.inherit_signals(&signal);
         let init = signal.thread_init(parent.tid(), request);
-        self.insert_thread(pid, thread, init);
+        let mut child_signal = child.signal.lock();
+        let signals = child_signal.prepare_thread(thread, init)?;
+        let pid = match self.tree.fork(parent.process().pid(), RusageSlot::new(child.usage_slot)) {
+            Ok(pid) => pid,
+            Err(e) => {
+                child_signal.cancel_thread(signals);
+                return Err(tree_errno(e));
+            }
+        };
+        child.set_pid(pid);
+        self.insert_thread(pid, thread, signals, &mut child_signal);
         self.insert_process(pid, child);
         Ok(pid)
     }
@@ -196,12 +207,57 @@ impl ProcTable {
     /// Link `thread`, a non-leader thread of its (linked) process, with a
     /// tid from the tree (`ProcTree::add_thread`): the tid, or the tree's
     /// refusal (nothing changed).
-    #[cfg(feature = "ktest")] // M8's `clone(CLONE_THREAD)` (C3) next
-    pub(super) fn link_thread(&mut self, thread: &Arc<UserThread>) -> Result<u32, lumen_proc::Error> {
+    pub(super) fn link_thread(
+        &mut self,
+        thread: &Arc<UserThread>,
+        signals: ThreadSignals,
+        signal: &mut SignalState,
+    ) -> Result<u32, u32> {
         let pid = thread.process().pid();
-        let tid = self.tree.add_thread(pid)?;
-        self.insert_thread(tid, thread, ThreadInit::ROOT);
+        let tid = match signal.check_clone().and_then(|()| self.tree.add_thread(pid).map_err(tree_errno)) {
+            Ok(tid) => tid,
+            Err(e) => {
+                signal.cancel_thread(signals);
+                return Err(e);
+            }
+        };
+        self.insert_thread(tid, thread, signals, signal);
         Ok(tid)
+    }
+
+    #[cfg(feature = "ktest")]
+    pub(super) fn link_ktest_thread(&mut self, thread: &Arc<UserThread>) -> Result<u32, u32> {
+        let mut state = thread.process().signal.lock();
+        let signals = state.prepare_thread(thread, ThreadInit::ROOT)?;
+        let tid = match self.tree.add_thread(thread.process().pid()) {
+            Ok(tid) => tid,
+            Err(e) => {
+                state.cancel_thread(signals);
+                return Err(tree_errno(e));
+            }
+        };
+        self.insert_thread(tid, thread, signals, &mut state);
+        Ok(tid)
+    }
+
+    /// Re-key the sole survivor without changing its queue slot or identity.
+    pub(super) fn take_leader_tid(&mut self, thread: &Arc<UserThread>, signal: &mut SignalState) {
+        let (old, pid) = (thread.tid(), thread.process().pid());
+        assert_eq!(thread.process().live_threads.load(Ordering::SeqCst), 1);
+        if old != pid {
+            assert!(!self.threads.contains_key(&pid));
+            let entry = self.threads.remove(&old).expect("exec caller linked");
+            assert!(Arc::ptr_eq(&entry, thread));
+            signal.exchange_tid(old, pid);
+            thread.exchange_tid(old, pid);
+            self.threads.insert(pid, entry);
+            self.tree.remove_thread(pid, old).expect("exec caller's old tid");
+            *thread.process().exited_leader_nice.lock() = None;
+        }
+        *thread.process().leader_exit.lock() = None;
+        // A completed stop can still be recorded in the tree after siglock's
+        // cancellation. Exec resumes the image without generating SIGCONT.
+        let _ = self.tree.cont(pid).expect("exec process in tree");
     }
 
     /// Put `process` in `procs` as `pid`: panics if the pid is taken.
@@ -212,11 +268,18 @@ impl ProcTable {
 
     /// Give `thread` tid `tid` and put it in `threads` and in its process's
     /// signal state (`Process::signal` under `PROCS`, section 9's order).
-    pub(super) fn insert_thread(&mut self, tid: u32, thread: &Arc<UserThread>, init: ThreadInit) {
+    pub(super) fn insert_thread(
+        &mut self,
+        tid: u32,
+        thread: &Arc<UserThread>,
+        signals: ThreadSignals,
+        signal: &mut SignalState,
+    ) {
         thread.set_tid(tid);
-        thread.process().signal.lock().add_thread(tid, thread, init);
+        signal.insert_thread(tid, signals);
         let displaced = self.threads.insert(tid, Arc::clone(thread));
         assert!(displaced.is_none(), "tid {tid} handed out while in PROCS");
+        thread.process().live_threads.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Unlink `thread`: out of `threads`, its process's signal state and,
@@ -241,6 +304,11 @@ impl ProcTable {
             let mut state = thread.process().signal.lock();
             let completed = state.participate_stop(tid);
             state.remove_thread(tid);
+            let before = thread.process().live_threads.fetch_sub(1, Ordering::SeqCst);
+            assert!(before > 0);
+            if before == 2 && state.exec_waiter.is_some() {
+                thread.process().exec_wait.wake_all();
+            }
             completed
         };
         if let Some(stop) = completed {
@@ -447,11 +515,14 @@ impl ProcTable {
         result
     }
 
-    pub(super) fn start_job_stop(&self, process: &Process, tid: u32, sig: Signal) {
+    pub(super) fn orphaned(&self, process: &Process) -> bool {
         let group = self.tree.pgid(process.pid()).expect("live stop group");
-        if !self.tree.is_orphaned_pgrp(group) {
-            process.signal.lock().start_stop(tid, sig, process);
-        }
+        self.tree.is_orphaned_pgrp(group)
+    }
+
+    #[cfg(feature = "ktest")]
+    pub(super) fn child_group_for_ktest(&mut self, parent: u32, child: u32) {
+        self.tree.setpgid(parent, child as i32, child as i32).expect("child in the parent's session");
     }
 
     pub(super) fn complete_stop(&mut self, process: &Process, stop: super::signal::GroupStop) {

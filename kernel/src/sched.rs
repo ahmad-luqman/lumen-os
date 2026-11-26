@@ -435,7 +435,12 @@ impl Thread {
         user: Option<UserThreadState>,
         placement: Placement,
     ) -> Result<Arc<Thread>, SpawnError> {
-        let stack = KernelStack::new(stack_size, StackKind::Thread).map_err(SpawnError::Stack)?;
+        let stack = if user.is_some() {
+            KernelStack::new_user(stack_size)
+        } else {
+            KernelStack::new(stack_size, StackKind::Thread)
+        }
+        .map_err(SpawnError::Stack)?;
         // SAFETY: a fresh, mapped stack (page-aligned top) nothing runs on;
         // the thread owns it, and it is freed only after the thread has died
         // and its CPU has switched away from it.

@@ -17,7 +17,11 @@ use crate::user::UserExit;
 /// `exit` and `exit_group` (one arm in `dispatch`).
 pub(super) fn sys_exit(frame: &mut SyscallFrame) -> SyscallReturn {
     let status = (frame.rdi & 0xff) as i32;
-    let (_, is_test) = record_exit(UserExit::Exited(status));
+    let (_, is_test) = if frame.rax == u64::from(general::__NR_exit_group) {
+        record_exit(UserExit::Exited(status))
+    } else {
+        process::record_thread_exit(UserExit::Exited(status))
+    };
     if is_test {
         crate::user::note_exit_status(status);
     }
@@ -49,7 +53,7 @@ pub(super) fn sys_set_tid_address(frame: &mut SyscallFrame) -> SyscallReturn {
     SyscallReturn::Sysret
 }
 
-/// `clone` (56): the low 32 flag bits select a process clone. C3 adds threads.
+/// `clone` (56): validate the low 32 flag bits and create a process or thread.
 pub(super) fn sys_clone(
     flags: u32,
     newsp: UserPtr,
@@ -75,7 +79,7 @@ pub(super) fn sys_vfork(frame: &SyscallFrame) -> u64 {
     super::finish(process::fork_current(ProcessClone::VFORK, 0, 0, 0, 0, frame))
 }
 
-/// Replace the single-threaded process image, returning through a fresh iret frame.
+/// End sibling threads and replace the image, returning through a fresh iret frame.
 pub(super) fn sys_execve(path: UserPtr, argv: UserPtr, envp: UserPtr, frame: &mut SyscallFrame) -> SyscallReturn {
     match execve(path, argv, envp) {
         Ok(program) => {
@@ -104,8 +108,7 @@ fn execve(path: UserPtr, argv: UserPtr, envp: UserPtr) -> Result<crate::mm::user
     let (argv, envp, mut budget) = copy_exec_args(path.as_bytes(), argv.addr(), envp.addr(), stack.arg_limit())?;
     let (file, argv) = follow_scripts(file, path.as_bytes(), argv, &mut budget)?;
     let (prepared, program) = prepare_exec(file, argv, envp, path.as_bytes(), stack)?;
-    // C3 adds de_thread here; until then only one live thread may commit.
-    current_process().check_exec()?;
+    process::de_thread()?;
     commit_exec(prepared);
     Ok(program)
 }
@@ -196,6 +199,7 @@ fn commit_exec(prepared: PreparedExec) {
     process::commit_unshare(prepared.files);
     process::finish_exec();
     current_process().complete_vfork();
+    thread.complete_vfork();
     process::replace_current_mm(prepared.space);
     process::mark_exec();
     process::set_exe_path(prepared.exe);

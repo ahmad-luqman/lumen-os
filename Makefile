@@ -103,6 +103,7 @@ $(M8_LINUX_OUT): $(BUILD)/linux/%: tools/linux-m8/%.rs tools/linux-m8/common.rs 
 	$(MUSL_EXE)
 
 $(BUILD)/linux/m8_proc: tools/linux-m8/signal_waits.rs tools/linux-m8/signals.rs tools/linux-m8/exec.rs tools/linux-m8/futex.rs tools/linux-m8/small.rs
+$(BUILD)/linux/m8_proc: tools/linux-m8/threads.rs
 
 # Every Linux test binary: built by `build`, staged by both images.
 LINUX_TEST_BINS := $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(M8_LINUX_OUT)

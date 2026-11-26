@@ -152,7 +152,7 @@ def test_fork_wait_and_exit_status(boot, tmp_path):
 
 
 def test_fork_cow_and_exec_shebang(boot, tmp_path):
-    """C2: private CoW, scripts, exec state, vfork and streaming a padded ELF."""
+    """C2/C3: CoW, scripts, exec state, vfork, and competing non-leader execs."""
     m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
     m.expect(r"lumen> ", 60)
     out = run(m, f"linux {PROC} fork-exec", 180)
@@ -167,6 +167,9 @@ def test_fork_cow_and_exec_shebang(boot, tmp_path):
         "exec-nesting-limit",
         "vfork-exec-files",
         "exec-over-16m",
+        "thread-exec-image",
+        "thread-exec-image",
+        "thread-exec",
     ], out
     assert f"linux: {PROC} exit=0 " in out, out
     assert "FAIL" not in out, out
@@ -343,5 +346,45 @@ def test_sigchld_and_sigint_interrupt_wait(boot, tmp_path):
     else:
         raise AssertionError(f"interrupted poll did not finish and unsubscribe: {out}")
     assert "FAIL" not in m.output[serial_start:], m.output[serial_start:]
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_pthread_create_and_join(boot, tmp_path):
+    """C3: clone ABI, musl joining, exec tid exchange and a reserved kernel stack."""
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    out = run(m, f"linux {PROC} threads", 180)
+    assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+        "thread-clone-flags",
+        "thread-parent-tid-and-clear",
+        "pthread-create-join-mask-tls",
+        "thread-exit-status",
+    ], out
+    assert f"linux: {PROC} exit=0 " in out, out
+    assert "FAIL" not in out, out
+    for mode, marker, status in [
+        ("exec", "thread-exec-image", 42),
+        ("exit", "root-leader-exited", 23),
+    ]:
+        out = run(m, f"linux {PROC} thread-root-{mode}", 180)
+        assert f"ok {marker}\nlinux: {PROC} exit={status} " in out, out
+    confirmed_keys(m, ["alt", "f2"])
+    # Warm the registry, heap and page tables; the second identical run must
+    # return all frames. Readiness comes from a confirmed exhaustion result.
+    for attempt in range(2):
+        type_confirmed(m, "clear\n")
+        expect_screen(m, r"\Alumen>\s*\Z")
+        type_confirmed(m, f"linux {PROC} thread-exhaust\n")
+        expect_screen(m, r"^threads: exhausted count=\d+ errno=11 ready$", 180)
+        assert run(m, "rhai -e '382'", 60) == "382\n"
+        confirmed_keys(m, "x")
+        done = expect_screen(
+            m,
+            rf"^ok thread-stack-exhaustion\nlinux: {PROC} exit=0 leaked_frames=(-?\d+)$",
+            180,
+        )
+        if attempt:
+            assert int(done[1]) == 0
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS

@@ -198,6 +198,15 @@ pub struct KernelStack {
 impl KernelStack {
     /// A new stack of `size` bytes (whole pages), registered as `kind`.
     pub fn new(size: u64, kind: StackKind) -> Result<KernelStack, StackError> {
+        Self::allocate(size, kind, false)
+    }
+
+    /// A user thread's guarded stack, preserving the registry's kernel reserve.
+    pub fn new_user(size: u64) -> Result<KernelStack, StackError> {
+        Self::allocate(size, StackKind::Thread, true)
+    }
+
+    fn allocate(size: u64, kind: StackKind, user: bool) -> Result<KernelStack, StackError> {
         let mut slot = take(size).ok_or(StackError::WindowFull)?;
         let range = slot.range();
         // Hard rule 4 holds for a reused range too: whatever was mapped
@@ -213,7 +222,10 @@ impl KernelStack {
             Err(e) => panic!("mm: mapping a {} stack at {:#x} failed: {e}", kind.name(), range.bottom),
         }
         // SAFETY: mapped just above; it stays mapped until `drop` retracts it.
-        let Some(handle) = (unsafe { stacks::REGISTRY.register(kind, range) }) else {
+        let handle = unsafe {
+            if user { stacks::REGISTRY.register_user(range) } else { stacks::REGISTRY.register(kind, range) }
+        };
+        let Some(handle) = handle else {
             // SAFETY: mapped just above; nothing has used it.
             unsafe { window::unmap_and_free(slot.window(), range.span()) };
             // SAFETY: unmapped just above.
