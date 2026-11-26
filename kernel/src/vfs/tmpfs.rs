@@ -828,25 +828,7 @@ impl VfsInode for TmpfsInode {
     }
 
     fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
-        if self.inode_type != InodeType::Dir {
-            return Err(VfsError::NotDir);
-        }
-        Self::validate_name(name)?;
-        if name == b"." || name == b".." {
-            return Err(VfsError::Exist);
-        }
-        let mut meta = self.meta.lock();
-        if self.is_detached() || meta.nlink == 0 {
-            return Err(VfsError::NoEnt);
-        }
-        let children = &mut meta.dir_mut()?.children;
-        let entry = children.reserve_new(name)?;
-        let child = Self::new_child(&self.shared, Node::File, mode, 1)?;
-        children.add(Arc::clone(&child), entry);
-        let now = time::realtime_timespec();
-        meta.mtime = now;
-        meta.ctime = now;
-        Ok(child as Arc<dyn VfsInode>)
+        self.mknod(name, InodeType::File, mode, DevId::default())
     }
 
     fn mknod(

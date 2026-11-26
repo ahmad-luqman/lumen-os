@@ -17,7 +17,7 @@ use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
-use common::{R, ensure, eq, ok, run_checks, sys};
+use common::*;
 
 const USAGE: &str = "usage: m8_io <console-poll|pipes>";
 
@@ -32,39 +32,6 @@ unsafe extern "C" {
         envp: *const *const c_char,
     ) -> c_int;
 }
-
-// Linux x86-64 syscall numbers.
-const SYS_READ: u64 = 0;
-const SYS_WRITE: u64 = 1;
-const SYS_CLOSE: u64 = 3;
-const SYS_FSTAT: u64 = 5;
-const SYS_POLL: u64 = 7;
-const SYS_LSEEK: u64 = 8;
-const SYS_RT_SIGACTION: u64 = 13;
-const SYS_RT_SIGPROCMASK: u64 = 14;
-const SYS_IOCTL: u64 = 16;
-const SYS_PREAD64: u64 = 17;
-const SYS_PWRITE64: u64 = 18;
-const SYS_PIPE: u64 = 22;
-const SYS_SELECT: u64 = 23;
-const SYS_DUP: u64 = 32;
-const SYS_DUP2: u64 = 33;
-const SYS_FORK: u64 = 57;
-const SYS_EXECVE: u64 = 59;
-const SYS_EXIT: u64 = 60;
-const SYS_WAIT4: u64 = 61;
-const SYS_FCNTL: u64 = 72;
-const SYS_FLOCK: u64 = 73;
-const SYS_FSYNC: u64 = 74;
-const SYS_UNLINK: u64 = 87;
-const SYS_READLINK: u64 = 89;
-const SYS_CLOCK_GETTIME: u64 = 228;
-const SYS_OPENAT: u64 = 257;
-const SYS_MKNODAT: u64 = 259;
-const SYS_PSELECT6: u64 = 270;
-const SYS_PPOLL: u64 = 271;
-const SYS_DUP3: u64 = 292;
-const SYS_PIPE2: u64 = 293;
 
 const CLOCK_MONOTONIC: u64 = 1;
 const AT_FDCWD: u64 = (-100i64) as u64;
@@ -99,19 +66,6 @@ const S_IFDIR: u32 = 0o040_000;
 const S_IFBLK: u32 = 0o060_000;
 const S_IFREG: u32 = 0o100_000;
 const S_IFSOCK: u32 = 0o140_000;
-
-const EPERM: i64 = -1;
-const ENOENT: i32 = 2;
-const ENXIO: i64 = -6;
-const EBADF: i64 = -9;
-const EAGAIN: i64 = -11;
-const EFAULT: i64 = -14;
-const EBUSY: i64 = -16;
-const EEXIST: i64 = -17;
-const EINVAL: i64 = -22;
-const ESPIPE: i64 = -29;
-const EROFS: i64 = -30;
-const EPIPE: i64 = -32;
 
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0004;
@@ -397,9 +351,16 @@ unsafe extern "C" {
 }
 
 static SIGPIPE_SEEN: AtomicU64 = AtomicU64::new(0);
+static SIGPIPE_INFO_OK: AtomicU64 = AtomicU64::new(0);
 
-extern "C" fn sigpipe_handler(sig: c_int) {
+extern "C" fn sigpipe_handler(sig: c_int, info: *const u8, _context: *const c_void) {
     SIGPIPE_SEEN.store(sig as u64, SeqCst);
+    // SAFETY: SA_SIGINFO passes a readable 128-byte siginfo to this handler.
+    let bytes = unsafe { core::slice::from_raw_parts(info, 128) };
+    let code = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    let pid = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let uid = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+    SIGPIPE_INFO_OK.store(u64::from(code == 0 && i64::from(pid) == sys(SYS_GETPID, [0; 6]) && uid == 0), SeqCst);
 }
 
 fn exit_child(code: u64) -> ! {
@@ -488,11 +449,11 @@ fn check_busybox_pipeline() -> R {
 }
 
 fn check_pipe_buf_atomicity() -> R {
-    const CHUNK: usize = 4096;
+    const CHUNK: usize = 4000;
     const ROUNDS: usize = 24;
     let mut p = [-1i32; 2];
     eq("pipe", sys(SYS_PIPE, [p.as_mut_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
-    // Shrink to 8 KiB so the two 4 KiB writers contend and block on the pipe.
+    // 4000-byte records do not divide 8192: a torn write would cross records.
     eq("F_SETPIPE_SZ 8192", sys(SYS_FCNTL, [p[1] as u64, F_SETPIPE_SZ, 8192, 0, 0, 0]), 8192)?;
 
     let spawn_writer = |fill: u8| -> Result<i64, common::Fail> {
@@ -549,9 +510,7 @@ fn check_eof_fionread_and_sigpipe() -> R {
     eq("pipe", sys(SYS_PIPE, [p.as_mut_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
 
     // fstat reports S_IFIFO and /proc/self/fd/N starts with "pipe:[".
-    let mut st = [0u8; 144];
-    eq("fstat pipe", sys(SYS_FSTAT, [p[0] as u64, st.as_mut_ptr() as u64, 0, 0, 0, 0]), 0)?;
-    let st_mode = u32::from_le_bytes([st[24], st[25], st[26], st[27]]);
+    let st_mode = fstat_mode(p[0])?;
     eq("fstat S_IFIFO", i64::from(st_mode & S_IFMT), i64::from(S_IFIFO))?;
 
     let mut proc_path = [0u8; 32];
@@ -612,34 +571,36 @@ fn check_eof_fionread_and_sigpipe() -> R {
     let st_dfl = wait_status(c_dfl)?;
     eq("SIGPIPE kills with 13", i64::from(st_dfl & 0x7f), SIGPIPE as i64)?;
 
-    // SIGPIPE ignored -> write returns -EPIPE (and bad ptr still -EPIPE first).
-    let c_ign = ok("fork sigpipe ign", sys(SYS_FORK, [0; 6]))?;
-    if c_ign == 0 {
-        let act = [SIG_IGN, 0, 0, 0];
-        if sys(SYS_RT_SIGACTION, [SIGPIPE, act.as_ptr() as u64, 0, 8, 0, 0]) != 0 {
-            exit_child(20);
+    for flags in [0, O_NONBLOCK] {
+        // SIGPIPE ignored -> write returns -EPIPE (and bad ptr still -EPIPE first).
+        let c_ign = ok("fork sigpipe ign", sys(SYS_FORK, [0; 6]))?;
+        if c_ign == 0 {
+            let act = [SIG_IGN, 0, 0, 0];
+            if sys(SYS_RT_SIGACTION, [SIGPIPE, act.as_ptr() as u64, 0, 8, 0, 0]) != 0 {
+                exit_child(20);
+            }
+            let mut q = [-1i32; 2];
+            if sys(SYS_PIPE2, [q.as_mut_ptr() as u64, flags, 0, 0, 0, 0]) != 0 {
+                exit_child(21);
+            }
+            let _ = sys(SYS_CLOSE, [q[0] as u64, 0, 0, 0, 0, 0]);
+            if sys(SYS_WRITE, [q[1] as u64, b"x".as_ptr() as u64, 1, 0, 0, 0]) != EPIPE {
+                exit_child(22);
+            }
+            // Bad pointer with no readers must still return -EPIPE before -EFAULT.
+            if sys(SYS_WRITE, [q[1] as u64, 0, 4, 0, 0, 0]) != EPIPE {
+                exit_child(23);
+            }
+            exit_child(0);
         }
-        let mut q = [-1i32; 2];
-        if sys(SYS_PIPE, [q.as_mut_ptr() as u64, 0, 0, 0, 0, 0]) != 0 {
-            exit_child(21);
-        }
-        let _ = sys(SYS_CLOSE, [q[0] as u64, 0, 0, 0, 0, 0]);
-        if sys(SYS_WRITE, [q[1] as u64, b"x".as_ptr() as u64, 1, 0, 0, 0]) != EPIPE {
-            exit_child(22);
-        }
-        // Bad pointer with no readers must still return -EPIPE before -EFAULT.
-        if sys(SYS_WRITE, [q[1] as u64, 0, 4, 0, 0, 0]) != EPIPE {
-            exit_child(23);
-        }
-        exit_child(0);
+        eq("SIGPIPE ignored exit", i64::from(wait_status(c_ign)?), 0)?;
     }
-    eq("SIGPIPE ignored exit", i64::from(wait_status(c_ign)?), 0)?;
 
     // SIGPIPE caught by handler -> handler runs and write returns -EPIPE.
     let c_catch = ok("fork sigpipe catch", sys(SYS_FORK, [0; 6]))?;
     if c_catch == 0 {
         SIGPIPE_SEEN.store(0, SeqCst);
-        let act = [sigpipe_handler as *const () as u64, SA_RESTORER, m8_io_sigreturn as *const () as u64, 0];
+        let act = [sigpipe_handler as *const () as u64, SA_RESTORER | 4, m8_io_sigreturn as *const () as u64, 0];
         if sys(SYS_RT_SIGACTION, [SIGPIPE, act.as_ptr() as u64, 0, 8, 0, 0]) != 0 {
             exit_child(30);
         }
@@ -651,7 +612,7 @@ fn check_eof_fionread_and_sigpipe() -> R {
         if sys(SYS_WRITE, [q[1] as u64, b"x".as_ptr() as u64, 1, 0, 0, 0]) != EPIPE {
             exit_child(32);
         }
-        if SIGPIPE_SEEN.load(SeqCst) != SIGPIPE {
+        if SIGPIPE_SEEN.load(SeqCst) != SIGPIPE || SIGPIPE_INFO_OK.load(SeqCst) != 1 {
             exit_child(33);
         }
         exit_child(0);
@@ -679,6 +640,19 @@ fn check_nonblock_and_setpipe_sz() -> R {
     eq("get 4096", sys(SYS_FCNTL, [p[0] as u64, F_GETPIPE_SZ, 0, 0, 0, 0]), 4096)?;
     eq("over max EPERM", sys(SYS_FCNTL, [p[1] as u64, F_SETPIPE_SZ, 2 * 1024 * 1024, 0, 0, 0]), EPERM)?;
 
+    let large = [0x5a; 4097];
+    eq("seed 100", sys(SYS_WRITE, [p[1] as u64, large.as_ptr() as u64, 100, 0, 0, 0]), 100)?;
+    eq("atomic 4096 EAGAIN", sys(SYS_WRITE, [p[1] as u64, large.as_ptr() as u64, 4096, 0, 0, 0]), EAGAIN)?;
+    let mut queued = -1i32;
+    eq(
+        "FIONREAD after atomic refusal",
+        sys(SYS_IOCTL, [p[0] as u64, FIONREAD, &mut queued as *mut i32 as u64, 0, 0, 0]),
+        0,
+    )?;
+    eq("atomic refusal kept 100", i64::from(queued), 100)?;
+    eq("4097 partial 3996", sys(SYS_WRITE, [p[1] as u64, large.as_ptr() as u64, 4097, 0, 0, 0]), 3996)?;
+    let mut drain = [0; 4096];
+    eq("drain deterministic row", sys(SYS_READ, [p[0] as u64, drain.as_mut_ptr() as u64, 4096, 0, 0, 0]), 4096)?;
     let page = [0x5Au8; 4096];
     eq("fill 4096", sys(SYS_WRITE, [p[1] as u64, page.as_ptr() as u64, 4096, 0, 0, 0]), 4096)?;
     eq("nonblock write full", sys(SYS_WRITE, [p[1] as u64, page.as_ptr() as u64, 1, 0, 0, 0]), EAGAIN)?;
@@ -695,6 +669,136 @@ fn check_nonblock_and_setpipe_sz() -> R {
     let _ = sys(SYS_CLOSE, [p[0] as u64, 0, 0, 0, 0, 0]);
     let _ = sys(SYS_CLOSE, [p[1] as u64, 0, 0, 0, 0, 0]);
     Ok(())
+}
+
+#[repr(C)]
+struct IoVec {
+    base: u64,
+    len: u64,
+}
+
+fn check_pipe_writev_and_faults() -> R {
+    let p = pipe(O_NONBLOCK)?;
+    eq("writev capacity", sys(SYS_FCNTL, [p[1] as u64, F_SETPIPE_SZ, 4096, 0, 0, 0]), 4096)?;
+    let payload = [0x42; 4097];
+    let mut out = [0u8; 4096];
+    write_exact_all(p[1], &payload[..100])?;
+    let spans = [IoVec { base: payload.as_ptr() as u64, len: 4096 }, IoVec { base: payload.as_ptr() as u64, len: 1 }];
+    eq("writev total 4097 partial 3996", sys(SYS_WRITEV, [p[1] as u64, spans.as_ptr() as u64, 2, 0, 0, 0]), 3996)?;
+    eq("writev drain", sys(SYS_READ, [p[0] as u64, out.as_mut_ptr() as u64, 4096, 0, 0, 0]), 4096)?;
+    ensure("writev bytes", out.iter().all(|&b| b == 0x42), 0)?;
+    let split =
+        [IoVec { base: payload.as_ptr() as u64, len: 2000 }, IoVec { base: payload.as_ptr() as u64, len: 2097 }];
+    write_exact_all(p[1], &payload[..100])?;
+    eq("writev partial crosses spans", sys(SYS_WRITEV, [p[1] as u64, split.as_ptr() as u64, 2, 0, 0, 0]), 3996)?;
+    eq("writev second drain", sys(SYS_READ, [p[0] as u64, out.as_mut_ptr() as u64, 4096, 0, 0, 0]), 4096)?;
+    close(p[0])?;
+    close(p[1])?;
+    for flags in [0, O_NONBLOCK] {
+        let p = pipe(flags)?;
+        let faulty = [IoVec { base: payload.as_ptr() as u64, len: 100 }, IoVec { base: 0, len: 100 }];
+        eq("atomic writev EFAULT", sys(SYS_WRITEV, [p[1] as u64, faulty.as_ptr() as u64, 2, 0, 0, 0]), EFAULT)?;
+        let mut queued = -1i32;
+        eq(
+            "faulted writev FIONREAD",
+            sys(SYS_IOCTL, [p[0] as u64, FIONREAD, &mut queued as *mut i32 as u64, 0, 0, 0]),
+            0,
+        )?;
+        eq("faulted atomic writev queued nothing", i64::from(queued), 0)?;
+        let good =
+            [IoVec { base: payload.as_ptr() as u64, len: 100 }, IoVec { base: payload.as_ptr() as u64, len: 200 }];
+        eq("atomic writev success", sys(SYS_WRITEV, [p[1] as u64, good.as_ptr() as u64, 2, 0, 0, 0]), 300)?;
+        let dst = [
+            IoVec { base: out.as_mut_ptr() as u64, len: 120 },
+            IoVec { base: out.as_mut_ptr() as u64 + 120, len: 180 },
+        ];
+        eq("readv pipe", sys(SYS_READV, [p[0] as u64, dst.as_ptr() as u64, 2, 0, 0, 0]), 300)?;
+        ensure("readv bytes", out[..300].iter().all(|&b| b == 0x42), 0)?;
+        close(p[0])?;
+        close(p[1])?;
+    }
+    Ok(())
+}
+
+fn check_blocked_sigpipe_and_writev() -> R {
+    // Each child proves EPIPE, pending SIGPIPE and survival while blocked,
+    // then default delivery on unblocking. Includes the nonblocking write
+    // site: merely checking EPIPE with SIG_IGN cannot detect a missing send.
+    for (flags, vectored, len) in [(O_NONBLOCK, false, 1), (0, true, 1), (O_NONBLOCK, true, 1), (0, true, 4097)] {
+        let child = ok("fork blocked SIGPIPE", sys(SYS_FORK, [0; 6]))?;
+        if child == 0 {
+            let result = (|| -> R {
+                let mask = 1u64 << (SIGPIPE - 1);
+                eq("block SIGPIPE", sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, &mask as *const u64 as u64, 0, 8, 0, 0]), 0)?;
+                let p = pipe(flags)?;
+                close(p[0])?;
+                let data = [0x23; 4097];
+                let spans = [IoVec { base: data.as_ptr() as u64, len }];
+                let ret = if vectored {
+                    sys(SYS_WRITEV, [p[1] as u64, spans.as_ptr() as u64, 1, 0, 0, 0])
+                } else {
+                    sys(SYS_WRITE, [p[1] as u64, data.as_ptr() as u64, len, 0, 0, 0])
+                };
+                eq("blocked SIGPIPE write EPIPE", ret, EPIPE)?;
+                let mut pending = 0u64;
+                eq("sigpending oversized set", sys(SYS_RT_SIGPENDING, [0, 9, 0, 0, 0, 0]), EINVAL)?;
+                eq("sigpending bad pointer", sys(SYS_RT_SIGPENDING, [0, 8, 0, 0, 0, 0]), EFAULT)?;
+                eq("sigpending zero size", sys(SYS_RT_SIGPENDING, [0, 0, 0, 0, 0, 0]), 0)?;
+                eq("rt_sigpending", sys(SYS_RT_SIGPENDING, [&mut pending as *mut u64 as u64, 8, 0, 0, 0, 0]), 0)?;
+                eq("SIGPIPE pending bit 13", (pending & mask) as i64, mask as i64)?;
+                say!("ok SIGPIPE pending while blocked");
+                let empty = 0u64;
+                sys(SYS_RT_SIGPROCMASK, [SIG_SETMASK, &empty as *const u64 as u64, 0, 8, 0, 0]);
+                Err(common::Fail { what: "survived SIGPIPE unblock", got: 0 })
+            })();
+            if let Err(e) = result {
+                say!("FAIL blocked SIGPIPE: {} (got {})", e.what, e.got);
+            }
+            exit_child(90);
+        }
+        eq("SIGPIPE unblocked terminates child", i64::from(wait_status(child)? & 0x7f), SIGPIPE as i64)?;
+    }
+    Ok(())
+}
+
+fn check_proc_pipe_reopen_and_large_write() -> R {
+    // Keep each orphaned end reachable at a known /proc magic link.
+    for (keep, reopen) in [(0usize, O_RDONLY), (1, O_WRONLY | O_NONBLOCK), (1, O_WRONLY)] {
+        let p = pipe(0)?;
+        eq("dup pipe for proc reopen", sys(SYS_DUP2, [p[keep] as u64, 20, 0, 0, 0, 0]), 20)?;
+        close(p[0])?;
+        close(p[1])?;
+        let fd = ok(
+            "proc pipe reopen without partner",
+            sys(SYS_OPENAT, [AT_FDCWD, c"/proc/self/fd/20".as_ptr() as u64, reopen, 0, 0, 0]),
+        )? as i32;
+        close(fd)?;
+        close(20)?;
+    }
+    const LEN: usize = 1024 * 1024 + 4096;
+    let ptr = ok("large write mmap", sys(SYS_MMAP, [0, LEN as u64, 3, 0x22, u64::MAX, 0]))? as u64;
+    let p = pipe(0)?;
+    let child = ok("fork large writer", sys(SYS_FORK, [0; 6]))?;
+    if child == 0 {
+        let _ = close(p[0]);
+        let n = sys(SYS_WRITE, [p[1] as u64, ptr, LEN as u64, 0, 0, 0]);
+        exit_child(if n == LEN as i64 { 0 } else { 91 });
+    }
+    close(p[1])?;
+    let mut buf = [0; 4096];
+    let mut total = 0;
+    loop {
+        let n =
+            ok("large write drain", sys(SYS_READ, [p[0] as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0]))?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    eq("large blocking write count", total, LEN as i64)?;
+    eq("large writer exit", i64::from(wait_status(child)?), 0)?;
+    close(p[0])?;
+    eq("large write munmap", sys(SYS_MUNMAP, [ptr, LEN as u64, 0, 0, 0, 0]), 0)
 }
 
 fn check_dup_redirections() -> R {
@@ -714,6 +818,9 @@ fn check_dup_redirections() -> R {
     // dup3 validation and O_CLOEXEC flag.
     eq("dup3 same EINVAL", sys(SYS_DUP3, [p[1] as u64, p[1] as u64, 0, 0, 0, 0]), EINVAL)?;
     eq("dup3 bad flag EINVAL", sys(SYS_DUP3, [p[1] as u64, 20, O_NONBLOCK, 0, 0, 0]), EINVAL)?;
+    eq("dup3 failed target uninstalled", sys(SYS_FCNTL, [20, F_GETFD, 0, 0, 0, 0]), EBADF)?;
+    eq("dup3 flags before EBADF", sys(SYS_DUP3, [999, 21, O_NONBLOCK, 0, 0, 0]), EINVAL)?;
+    eq("dup3 same before EBADF", sys(SYS_DUP3, [999, 999, 0, 0, 0, 0]), EINVAL)?;
     eq("dup3 O_CLOEXEC", sys(SYS_DUP3, [p[1] as u64, 20, O_CLOEXEC, 0, 0, 0]), 20)?;
     eq("dup3 cloexec set", sys(SYS_FCNTL, [20, F_GETFD, 0, 0, 0, 0]), FD_CLOEXEC as i64)?;
 
@@ -746,8 +853,8 @@ fn check_fifo_open_rules_and_poll() -> R {
         ok("fifo rdonly nonblock", sys(SYS_OPENAT, [AT_FDCWD, path.as_ptr() as u64, O_RDONLY | O_NONBLOCK, 0, 0, 0]))?
             as i32;
     let mut pf = [PollFd { fd: r, events: POLLIN, revents: 0 }];
-    eq("poll fifo no writer", sys(SYS_POLL, [pf.as_mut_ptr() as u64, 1, 0, 0, 0, 0]), 1)?;
-    eq("poll fifo HUP", i64::from(pf[0].revents), i64::from(POLLHUP))?;
+    eq("poll fifo no writer", sys(SYS_POLL, [pf.as_mut_ptr() as u64, 1, 0, 0, 0, 0]), 0)?;
+    eq("poll fifo no initial HUP", i64::from(pf[0].revents), 0)?;
 
     // O_WRONLY | O_NONBLOCK now succeeds because reader is open.
     let w =
@@ -767,6 +874,22 @@ fn check_fifo_open_rules_and_poll() -> R {
     let mut buf = [0u8; 16];
     eq("read fifo", sys(SYS_READ, [r as u64, buf.as_mut_ptr() as u64, 16, 0, 0, 0]), 7)?;
     ensure("fifo bytes", &buf[..7] == b"fifo-ok", 7)?;
+    // A reader opened while a writer exists must also see its departure.
+    let r2 = ok("fifo second reader", sys(SYS_OPENAT, [AT_FDCWD, path.as_ptr() as u64, O_NONBLOCK, 0, 0, 0]))? as i32;
+    close(w)?;
+    let mut readers = [PollFd { fd: r, events: POLLIN, revents: 0 }, PollFd { fd: r2, events: POLLIN, revents: 0 }];
+    eq("fifo writer departed", sys(SYS_POLL, [readers.as_mut_ptr() as u64, 2, 0, 0, 0, 0]), 2)?;
+    eq("first FIFO reader HUP", i64::from(readers[0].revents), i64::from(POLLHUP))?;
+    eq("second FIFO reader HUP", i64::from(readers[1].revents), i64::from(POLLHUP))?;
+    close(r2)?;
+    // A new nonblocking description starts a new observation generation,
+    // even though an older reader keeps the same pipe object attached.
+    let r3 = ok("fifo third reader", sys(SYS_OPENAT, [AT_FDCWD, path.as_ptr() as u64, O_NONBLOCK, 0, 0, 0]))? as i32;
+    let mut fresh = [PollFd { fd: r3, events: POLLIN, revents: 0 }];
+    eq("fresh FIFO reader no stale HUP", sys(SYS_POLL, [fresh.as_mut_ptr() as u64, 1, 0, 0, 0, 0]), 0)?;
+    close(r3)?;
+    let w = ok("fifo reopen writer", sys(SYS_OPENAT, [AT_FDCWD, path.as_ptr() as u64, O_WRONLY | O_NONBLOCK, 0, 0, 0]))?
+        as i32;
 
     let _ = sys(SYS_CLOSE, [r as u64, 0, 0, 0, 0, 0]);
     let mut pw = [PollFd { fd: w, events: POLLOUT, revents: 0 }];
@@ -938,9 +1061,7 @@ fn check_mknodat_and_ext4_fifo() -> R {
     )?;
 
     let fd = ok("open ext4 fifo", sys(SYS_OPENAT, [AT_FDCWD, ext4_keep.as_ptr() as u64, O_RDWR, 0, 0, 0]))? as i32;
-    let mut st = [0u8; 144];
-    eq("fstat ext4 fifo", sys(SYS_FSTAT, [fd as u64, st.as_mut_ptr() as u64, 0, 0, 0, 0]), 0)?;
-    let st_mode = u32::from_le_bytes([st[24], st[25], st[26], st[27]]);
+    let st_mode = fstat_mode(fd)?;
     eq("ext4 fifo S_IFIFO", i64::from(st_mode & S_IFMT), i64::from(S_IFIFO))?;
     write_exact_all(fd, b"ext4-fifo")?;
     let mut got = [0u8; 16];
@@ -972,6 +1093,9 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
             ("pipe_buf_atomicity", &check_pipe_buf_atomicity),
             ("eof_fionread_and_sigpipe", &check_eof_fionread_and_sigpipe),
             ("nonblock_and_setpipe_sz", &check_nonblock_and_setpipe_sz),
+            ("pipe_writev_and_faults", &check_pipe_writev_and_faults),
+            ("blocked_sigpipe_and_writev", &check_blocked_sigpipe_and_writev),
+            ("proc_pipe_reopen_and_large_write", &check_proc_pipe_reopen_and_large_write),
             ("dup_redirections", &check_dup_redirections),
             ("fifo_open_rules_and_poll", &check_fifo_open_rules_and_poll),
             ("posix_spawn_cloexec", &check_posix_spawn_cloexec),

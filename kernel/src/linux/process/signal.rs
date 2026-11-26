@@ -432,11 +432,31 @@ pub fn send_process_checked(pid: i32, info: Result<Option<SigInfo>, u32>, sender
     PROCS.lock().send_process(caller, pid, info, sender)
 }
 
+/// Blocked signals pending in the calling thread's private or shared queue.
+/// Snapshot both queues and the mask under one signal-lock hold.
+pub fn current_pending() -> SigSet {
+    let me = current_thread();
+    let state = me.process().signal.lock();
+    let thread = state.threads.get(&me.tid()).expect("current signal tid");
+    let pending = state.pending.pending(thread.slot).expect("current signal slot");
+    SigSet(pending.0 & thread.blocked.set().0)
+}
+
 /// Queue a standard signal on the calling thread (`SIGPIPE` from `pipe_write`),
 /// honouring `SIG_IGN` and the thread's blocked mask (Linux `send_sig`).
 pub fn send_current_signal(sig: Signal) {
     let me = current_thread();
-    let _ = me.process().signal.lock().send(Some(me.tid()), SigInfo::new(sig, 0), SenderClass::SiUser);
+    debug_assert!(!sig.is_realtime());
+    let mut bytes = [0; 128];
+    bytes[8..12].copy_from_slice(&(general::SI_USER as i32).to_le_bytes());
+    bytes[16..20].copy_from_slice(&me.process().pid().to_le_bytes());
+    // Lumen currently has only uid 0, as sys_kill's sender_info does.
+    let info = SigInfo::from_user(sig, bytes);
+    me.process()
+        .signal
+        .lock()
+        .send(Some(me.tid()), info, SenderClass::SiUser)
+        .expect("current thread is linked and standard signals cannot exhaust the queue");
 }
 
 crate::ktest!(

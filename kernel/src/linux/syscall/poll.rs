@@ -274,6 +274,13 @@ fn wait_ready(
 /// `waker` when provided and pushing any returned [`PollGuard`] onto `guards`.
 fn poll_file(file: &KernelFile, waker: Option<&Arc<dyn PollWaker>>, guards: &mut Vec<PollGuard>) -> PollMask {
     static WARNED_NO_GUARD: AtomicBool = AtomicBool::new(false);
+    if let Some(pipe) = file.pipe() {
+        let (mask, guard) = pipe.poll_open(file.access_mode(), file.writer_generation(), waker);
+        if let Some(guard) = guard {
+            guards.push(guard);
+        }
+        return mask;
+    }
     match file.inode().pollable() {
         Some(pollable) => {
             let (mask, guard) = pollable.poll(file.access_mode(), waker);
@@ -766,7 +773,7 @@ mod recheck_window {
 }
 
 #[cfg(feature = "ktest")]
-mod ktest_pollable {
+pub(super) mod ktest_pollable {
     use alloc::sync::Arc;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -957,7 +964,7 @@ mod ktest_pollable {
         open_kernel_file(path, OpenFlags::O_RDWR | OpenFlags::O_CREAT, 0o644)
     }
 
-    pub(super) fn write_pollfds(va: u64, entries: &[(i32, u16)]) -> Result<(), &'static str> {
+    pub(crate) fn write_pollfds(va: u64, entries: &[(i32, u16)]) -> Result<(), &'static str> {
         let mut buf = Vec::with_capacity(entries.len() * 8);
         for &(fd, ev) in entries {
             buf.extend_from_slice(&fd.to_le_bytes());
@@ -967,7 +974,7 @@ mod ktest_pollable {
         copy_to_user(va, &buf).map_err(|_| "write pollfds")
     }
 
-    pub(super) fn read_revents(va: u64, count: usize) -> Result<Vec<u16>, &'static str> {
+    pub(crate) fn read_revents(va: u64, count: usize) -> Result<Vec<u16>, &'static str> {
         let mut buf = vec![0u8; count * 8];
         copy_from_user(&mut buf, va).map_err(|_| "read pollfds")?;
         Ok(buf.as_chunks::<8>().0.iter().map(|c| u16::from_le_bytes(c[6..8].try_into().expect("2 bytes"))).collect())
@@ -1004,7 +1011,7 @@ mod ktest_pollable {
     }
 
     /// Poll `cond` every 1 ms until true, or fail after 5 seconds.
-    pub(super) fn wait_for(mut cond: impl FnMut() -> bool) -> crate::ktest::TestResult {
+    pub(crate) fn wait_for(mut cond: impl FnMut() -> bool) -> crate::ktest::TestResult {
         let dl = crate::time::now_ns() + 5_000_000_000;
         while !cond() {
             crate::kassert!(crate::time::now_ns() < dl);

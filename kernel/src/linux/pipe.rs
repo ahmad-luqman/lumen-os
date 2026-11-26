@@ -8,8 +8,9 @@
 //! - `PipeObject::pipe` is Lock 0 (`SleepMutex`), held across user copies
 //!   (`peek` / `copy_to_user` / `commit`; non-blocking chunked writes), never
 //!   taken while holding locks 1–10.
-//! - `FifoSlot::inner` is a level-10c leaf `SpinLock` (no allocation under it;
-//!   detached `Arc<PipeObject>` dropped after releasing it).
+//! - `KernelFile::pipe_end` and `FifoSlot::inner` are level-10c leaf spinlocks
+//!   (no allocation under either; detached ends and `Arc<PipeObject>`s dropped
+//!   after releasing them).
 //! - `PipeObject::poll` (`KernelPollHead`) is level 10e.
 //! - `PipeObject::readers` / `writers` (`WaitQueue`) are level 10f.
 
@@ -69,31 +70,21 @@ impl PipeObject {
     /// Create a fresh anonymous pipe (1 reader, 1 writer, 64 KiB buffer).
     pub fn new_pipe() -> Result<Arc<Self>, u32> {
         let pipe = Pipe::try_new().map_err(|_| errno::ENOMEM)?;
-        Ok(Arc::new(Self {
-            pipe: SleepMutex::new(pipe),
-            read_seq: AtomicU64::new(0),
-            write_seq: AtomicU64::new(0),
-            r_opens: AtomicU64::new(1),
-            w_opens: AtomicU64::new(1),
-            readers: WaitQueue::new(),
-            writers: WaitQueue::new(),
-            poll: KernelPollHead::new(),
-            #[cfg(feature = "ktest")]
-            waiting_readers: AtomicU32::new(0),
-            #[cfg(feature = "ktest")]
-            waiting_writers: AtomicU32::new(0),
-        }))
+        Ok(Self::from_pipe(pipe, 1))
     }
 
     /// Create a fresh FIFO pipe buffer (0 readers, 0 writers, 64 KiB buffer).
     pub fn new_fifo() -> Result<Arc<Self>, u32> {
-        let pipe = Pipe::fifo().map_err(|_| errno::ENOMEM)?;
-        Ok(Arc::new(Self {
+        Ok(Self::from_pipe(Pipe::fifo().map_err(|_| errno::ENOMEM)?, 0))
+    }
+
+    fn from_pipe(pipe: Pipe, opens: u64) -> Arc<Self> {
+        Arc::new(Self {
             pipe: SleepMutex::new(pipe),
             read_seq: AtomicU64::new(0),
             write_seq: AtomicU64::new(0),
-            r_opens: AtomicU64::new(0),
-            w_opens: AtomicU64::new(0),
+            r_opens: AtomicU64::new(opens),
+            w_opens: AtomicU64::new(opens),
             readers: WaitQueue::new(),
             writers: WaitQueue::new(),
             poll: KernelPollHead::new(),
@@ -101,17 +92,17 @@ impl PipeObject {
             waiting_readers: AtomicU32::new(0),
             #[cfg(feature = "ktest")]
             waiting_writers: AtomicU32::new(0),
-        }))
+        })
     }
 
     /// Readiness mask for one open description (`fs/pipe.c` `pipe_poll`).
-    fn poll_mask(pipe: &Pipe, mode: AccessMode) -> PollMask {
+    fn poll_mask(pipe: &Pipe, mode: AccessMode, writer_seen: bool) -> PollMask {
         let mut mask = PollMask::EMPTY;
         if mode.can_read() {
             if !pipe.is_empty() {
                 mask |= PollMask::IN | PollMask::RDNORM;
             }
-            if pipe.reader_hung_up() {
+            if pipe.reader_hung_up() && writer_seen {
                 mask |= PollMask::HUP;
             }
         }
@@ -131,10 +122,14 @@ impl PipeObject {
         self.poll.notify(PollMask::IN | PollMask::RDNORM);
     }
 
-    fn wake_next_writer_if_space(&self) {
+    fn has_space(pipe: &Pipe) -> bool {
+        pipe.fionread() < pipe.capacity()
+    }
+
+    fn wake_writers_if_space(&self) {
         let has_space = {
             let pipe = self.pipe.lock();
-            pipe.fionread() < pipe.capacity()
+            Self::has_space(&pipe)
         };
         if has_space {
             self.writers.wake_all();
@@ -226,21 +221,37 @@ impl PipeObject {
         }
     }
 
-    /// Write up to `count` bytes (capped at `MAX_SINGLE_IO`) from user memory,
-    /// enforcing `PIPE_BUF` atomicity and delivering `SIGPIPE` + `-EPIPE` when
-    /// no readers remain.
+    /// Write from user memory, enforcing `PIPE_BUF` atomicity and delivering
+    /// `SIGPIPE` + `EPIPE` before a user copy when no readers remain.
+    /// Blocking writes may sleep and are not capped at `MAX_SINGLE_IO`.
     pub fn write(&self, user_buf: u64, count: u64, nonblock: bool) -> Result<u64, u32> {
-        let limit = count.min(MAX_SINGLE_IO as u64) as usize;
+        self.write_with(count as usize, nonblock, |offset, buf| {
+            let addr = user_buf.checked_add(offset as u64).ok_or(errno::EFAULT)?;
+            copy_from_user(buf, addr).map_err(|_| errno::EFAULT)
+        })
+    }
+
+    /// One logical write, including all iovecs. `fill` must support retries at
+    /// the same offset after a wait. An atomic write fills its entire buffer
+    /// before queuing anything, so a later span's fault cannot tear it.
+    pub fn write_with(
+        &self,
+        count: usize,
+        nonblock: bool,
+        mut fill: impl FnMut(usize, &mut [u8]) -> Result<(), u32>,
+    ) -> Result<u64, u32> {
+        let limit = if nonblock { count.min(MAX_SINGLE_IO) } else { count };
         if limit == 0 {
             return Ok(0);
         }
-        if nonblock {
-            return self.write_nonblock(user_buf, limit);
-        }
-        self.write_blocking(user_buf, limit)
+        if nonblock { self.write_nonblock(limit, &mut fill) } else { self.write_blocking(limit, &mut fill) }
     }
 
-    fn write_nonblock(&self, user_buf: u64, limit: usize) -> Result<u64, u32> {
+    fn write_nonblock(
+        &self,
+        limit: usize,
+        fill: &mut impl FnMut(usize, &mut [u8]) -> Result<(), u32>,
+    ) -> Result<u64, u32> {
         let mut written = 0usize;
         let mut kbuf = [0u8; PIPE_BUF];
         let mut pipe = self.pipe.lock();
@@ -267,15 +278,7 @@ impl PipeObject {
                 }
                 (limit - written).min(avail).min(kbuf.len())
             };
-            let Some(addr) = user_buf.checked_add(written as u64) else {
-                drop(pipe);
-                if written > 0 {
-                    self.notify_readers();
-                    return Ok(written as u64);
-                }
-                return Err(errno::EFAULT);
-            };
-            if copy_from_user(&mut kbuf[..chunk_len], addr).is_err() {
+            if fill(written, &mut kbuf[..chunk_len]).is_err() {
                 drop(pipe);
                 if written > 0 {
                     self.notify_readers();
@@ -311,7 +314,11 @@ impl PipeObject {
         }
     }
 
-    fn write_blocking(&self, user_buf: u64, limit: usize) -> Result<u64, u32> {
+    fn write_blocking(
+        &self,
+        limit: usize,
+        fill: &mut impl FnMut(usize, &mut [u8]) -> Result<(), u32>,
+    ) -> Result<u64, u32> {
         // Check readers before the first copy_from_user so a bad pointer with
         // no readers returns SIGPIPE + EPIPE rather than EFAULT.
         if self.pipe.lock().writer_error() {
@@ -326,12 +333,9 @@ impl PipeObject {
 
         loop {
             let range = progress.next_chunk(kbuf.len());
-            let copied = user_buf
-                .checked_add(range.start as u64)
-                .is_some_and(|addr| copy_from_user(&mut kbuf[..range.len()], addr).is_ok());
-            if !copied {
+            if fill(range.start, &mut kbuf[..range.len()]).is_err() {
                 if slept {
-                    self.wake_next_writer_if_space();
+                    self.wake_writers_if_space();
                 }
                 return match progress.faulted() {
                     lumen_pipe::FaultedWrite::Partial(n) => Ok(n as u64),
@@ -344,7 +348,7 @@ impl PipeObject {
                 Ok(step) => step,
                 Err(err) => {
                     log::error!(target: "pipe", "invalid write chunk: {err:?}");
-                    let wake = slept && pipe.fionread() < pipe.capacity();
+                    let wake = slept && Self::has_space(&pipe);
                     drop(pipe);
                     if wake {
                         self.writers.wake_all();
@@ -387,7 +391,7 @@ impl PipeObject {
                     }
                     if interrupted {
                         if slept {
-                            self.wake_next_writer_if_space();
+                            self.wake_writers_if_space();
                         }
                         return match progress.interrupted() {
                             InterruptedWrite::Partial(n) => Ok(n as u64),
@@ -403,7 +407,7 @@ impl PipeObject {
                     interrupted = wake == sched::Wake::Interrupted;
                 }
                 WriteStep::Broken { written } => {
-                    let wake = slept && pipe.fionread() < pipe.capacity();
+                    let wake = slept && Self::has_space(&pipe);
                     drop(pipe);
                     if wake {
                         self.writers.wake_all();
@@ -413,118 +417,6 @@ impl PipeObject {
                 }
             }
         }
-    }
-
-    /// Write an already-copied kernel buffer (`<= PIPE_BUF` atomic `writev`).
-    pub fn write_kbuf(&self, data: &[u8], nonblock: bool) -> Result<u64, u32> {
-        if data.is_empty() {
-            return Ok(0);
-        }
-        if nonblock {
-            let mut pipe = self.pipe.lock();
-            match pipe.write(data) {
-                WriteOutcome::Wrote(n) => {
-                    if n > 0 {
-                        self.read_seq.fetch_add(1, Ordering::Release);
-                    }
-                    drop(pipe);
-                    if n > 0 {
-                        self.notify_readers();
-                    }
-                    return Ok(n as u64);
-                }
-                WriteOutcome::WouldBlock => return Err(errno::EAGAIN),
-                WriteOutcome::Broken => {
-                    drop(pipe);
-                    deliver_sigpipe();
-                    return Err(errno::EPIPE);
-                }
-            }
-        }
-
-        let mut progress = WriteProgress::new(data.len());
-        let mut slept = false;
-        let mut interrupted = false;
-        loop {
-            let range = progress.next_chunk(PIPE_BUF);
-            let mut pipe = self.pipe.lock();
-            let step = match progress.step(&mut pipe, &data[range]) {
-                Ok(step) => step,
-                Err(err) => {
-                    log::error!(target: "pipe", "invalid kernel write chunk: {err:?}");
-                    let wake = slept && pipe.fionread() < pipe.capacity();
-                    drop(pipe);
-                    if wake {
-                        self.writers.wake_all();
-                    }
-                    return Err(errno::EIO);
-                }
-            };
-            match step {
-                WriteStep::Done { total, wake_next_writer } => {
-                    if total > 0 {
-                        self.read_seq.fetch_add(1, Ordering::Release);
-                    }
-                    drop(pipe);
-                    if total > 0 {
-                        self.notify_readers();
-                    }
-                    if wake_next_writer {
-                        self.writers.wake_all();
-                    }
-                    return Ok(total as u64);
-                }
-                WriteStep::Continue { wrote_now } => {
-                    if wrote_now > 0 {
-                        self.read_seq.fetch_add(1, Ordering::Release);
-                    }
-                    drop(pipe);
-                    if wrote_now > 0 {
-                        self.notify_readers();
-                    }
-                }
-                WriteStep::NeedSpace { wrote_now } => {
-                    if wrote_now > 0 {
-                        self.read_seq.fetch_add(1, Ordering::Release);
-                    }
-                    let seen = self.write_seq.load(Ordering::Acquire);
-                    drop(pipe);
-                    if wrote_now > 0 {
-                        self.notify_readers();
-                    }
-                    if interrupted {
-                        if slept {
-                            self.wake_next_writer_if_space();
-                        }
-                        return match progress.interrupted() {
-                            InterruptedWrite::Partial(n) => Ok(n as u64),
-                            InterruptedWrite::Restart => Err(ERESTARTSYS),
-                        };
-                    }
-                    slept = true;
-                    #[cfg(feature = "ktest")]
-                    self.waiting_writers.fetch_add(1, Ordering::SeqCst);
-                    let wake = self.writers.wait_interruptible(None, || self.write_seq.load(Ordering::Acquire) != seen);
-                    #[cfg(feature = "ktest")]
-                    self.waiting_writers.fetch_sub(1, Ordering::SeqCst);
-                    interrupted = wake == sched::Wake::Interrupted;
-                }
-                WriteStep::Broken { written } => {
-                    let wake = slept && pipe.fionread() < pipe.capacity();
-                    drop(pipe);
-                    if wake {
-                        self.writers.wake_all();
-                    }
-                    deliver_sigpipe();
-                    return if written > 0 { Ok(written as u64) } else { Err(errno::EPIPE) };
-                }
-            }
-        }
-    }
-
-    /// True if no open readers remain (`writer_error()`).
-    pub fn has_no_readers(&self) -> bool {
-        self.pipe.lock().writer_error()
     }
 
     /// Number of unread bytes currently queued (`ioctl(FIONREAD)`).
@@ -563,8 +455,9 @@ impl PipeObject {
     /// Release one open reader and/or writer description on this pipe.
     ///
     /// Called in thread context with no lock held when the description's last
-    /// descriptor and last in-flight syscall reference both reach zero.
-    pub fn release_end(&self, reader: bool, writer: bool) {
+    /// descriptor and last in-flight syscall reference both reach zero, or
+    /// when rolling back an open that was never installed.
+    fn release_end(&self, reader: bool, writer: bool) {
         let (wake_writers, wake_readers) = {
             let mut pipe = self.pipe.lock();
             let mut ww = false;
@@ -601,6 +494,20 @@ impl PipeObject {
         }
     }
 
+    /// Description-aware FIFO readiness; subscribe before reading either the
+    /// generation or counts under Lock 0, preserving the poll wake contract.
+    pub fn poll_open(
+        &self,
+        mode: AccessMode,
+        writer_generation: u64,
+        waker: Option<&Arc<dyn PollWaker>>,
+    ) -> (PollMask, Option<PollGuard>) {
+        let guard = waker.map(|w| self.poll.subscribe(Arc::clone(w)));
+        let pipe = self.pipe.lock();
+        let writer_seen = self.w_opens.load(Ordering::Acquire) != writer_generation;
+        (Self::poll_mask(&pipe, mode, writer_seen), guard)
+    }
+
     /// Number of threads currently blocked in a read wait (ktests).
     #[cfg(feature = "ktest")]
     pub fn waiting_readers(&self) -> u32 {
@@ -626,7 +533,7 @@ impl Pollable for PipeObject {
         // mask and returning can be missed.
         let guard = waker.map(|w| self.poll.subscribe(Arc::clone(w)));
         let pipe = self.pipe.lock();
-        (Self::poll_mask(&pipe, mode), guard)
+        (Self::poll_mask(&pipe, mode, true), guard)
     }
 }
 
@@ -683,7 +590,9 @@ impl FifoSlot {
     fn detach(&self) {
         let detached = {
             let mut slot = self.inner.lock();
-            debug_assert!(slot.opens > 0, "FIFO slot open count underflow");
+            if slot.opens == 0 {
+                log::error!(target: "pipe", "FIFO slot open count underflow");
+            }
             slot.opens = slot.opens.saturating_sub(1);
             if slot.opens == 0 { slot.pipe.take() } else { None }
         };
@@ -700,6 +609,8 @@ impl Pollable for FifoSlot {
     fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>) -> (PollMask, Option<PollGuard>) {
         match self.pipe() {
             Some(pipe) => pipe.poll(mode, waker),
+            // No opened description: ordinary descriptor polling uses
+            // KernelFile's attached pipe and per-open writer generation.
             None => (PollMask::HUP | PollMask::ERR, None),
         }
     }
@@ -718,8 +629,10 @@ pub fn fifo_slot_of(inode: &dyn VfsInode) -> Option<&FifoSlot> {
 }
 
 /// Ownership of one open pipe or FIFO end, released once when its description's
-/// `fd_refs` and `io_refs` both reach zero.
+/// combined `end_refs` reaches zero (or an uninstalled open is dropped).
+#[must_use = "an opened end must be attached or released"]
 pub struct PipeEnd {
+    writer_generation: u64,
     pipe: Arc<PipeObject>,
     reader: bool,
     writer: bool,
@@ -728,7 +641,11 @@ pub struct PipeEnd {
 
 impl PipeEnd {
     fn new(pipe: Arc<PipeObject>, reader: bool, writer: bool, fifo_inode: Option<Arc<dyn VfsInode>>) -> Self {
-        Self { pipe, reader, writer, fifo_inode }
+        Self { pipe, reader, writer, fifo_inode, writer_generation: 0 }
+    }
+
+    pub fn writer_generation(&self) -> u64 {
+        self.writer_generation
     }
 
     /// Borrow the underlying [`PipeObject`].
@@ -754,12 +671,16 @@ struct FifoOpenGuard {
     opened_reader: bool,
     opened_writer: bool,
     committed: bool,
+    writer_generation: u64,
 }
 
 impl FifoOpenGuard {
     fn commit(mut self) -> PipeEnd {
         self.committed = true;
-        PipeEnd::new(Arc::clone(&self.pipe), self.opened_reader, self.opened_writer, self.fifo_inode.take())
+        let mut end =
+            PipeEnd::new(Arc::clone(&self.pipe), self.opened_reader, self.opened_writer, self.fifo_inode.take());
+        end.writer_generation = self.writer_generation;
+        end
     }
 }
 
@@ -792,17 +713,35 @@ pub fn open_fifo(inode: &Arc<dyn VfsInode>, mode: AccessMode, nonblock: bool) ->
         return Err(errno::ENXIO);
     };
 
-    let mut guard = FifoOpenGuard { pipe, fifo_inode, opened_reader: false, opened_writer: false, committed: false };
+    let is_pipe = fifo_inode.is_none();
+    let mut guard = FifoOpenGuard {
+        pipe,
+        fifo_inode,
+        opened_reader: false,
+        opened_writer: false,
+        committed: false,
+        writer_generation: 0,
+    };
 
     match mode {
         AccessMode::ReadOnly => {
             let wait_w = {
                 let mut p = guard.pipe.pipe.lock();
+                // Linux suppresses HUP only for a nonblocking FIFO reader
+                // that has not yet seen a writer. Readers joining a writer
+                // must observe HUP when that existing writer closes too.
+                if !is_pipe && nonblock && p.writers() == 0 {
+                    guard.writer_generation = guard.pipe.w_opens.load(Ordering::Acquire);
+                }
                 p.open_reader();
                 guard.opened_reader = true;
                 guard.pipe.r_opens.fetch_add(1, Ordering::Release);
                 guard.pipe.write_seq.fetch_add(1, Ordering::Release);
-                if nonblock || p.writers() > 0 { None } else { Some(guard.pipe.w_opens.load(Ordering::Acquire)) }
+                if is_pipe || nonblock || p.writers() > 0 {
+                    None
+                } else {
+                    Some(guard.pipe.w_opens.load(Ordering::Acquire))
+                }
             };
             guard.pipe.writers.wake_all();
             guard.pipe.poll.notify(PollMask::OUT | PollMask::WRNORM);
@@ -819,14 +758,18 @@ pub fn open_fifo(inode: &Arc<dyn VfsInode>, mode: AccessMode, nonblock: bool) ->
         AccessMode::WriteOnly => {
             let wait_r = {
                 let mut p = guard.pipe.pipe.lock();
-                if nonblock && p.readers() == 0 {
+                if !is_pipe && nonblock && p.readers() == 0 {
                     return Err(errno::ENXIO);
                 }
                 p.open_writer();
                 guard.opened_writer = true;
                 guard.pipe.w_opens.fetch_add(1, Ordering::Release);
                 guard.pipe.read_seq.fetch_add(1, Ordering::Release);
-                if nonblock || p.readers() > 0 { None } else { Some(guard.pipe.r_opens.load(Ordering::Acquire)) }
+                if is_pipe || nonblock || p.readers() > 0 {
+                    None
+                } else {
+                    Some(guard.pipe.r_opens.load(Ordering::Acquire))
+                }
             };
             guard.pipe.readers.wake_all();
             guard.pipe.poll.notify(PollMask::IN | PollMask::RDNORM);

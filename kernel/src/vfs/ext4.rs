@@ -877,7 +877,7 @@ fn is_inline_symlink(inode: &Inode) -> bool {
 /// i.e. block 259).
 fn i_block_holds_no_block_numbers(inode: &Inode) -> bool {
     is_inline_symlink(inode)
-        || (matches!(inode.file_type(), FileType::CharacterDevice | FileType::BlockDevice)
+        || (!matches!(inode.file_type(), FileType::Regular | FileType::Directory)
             && !inode.flags().contains(InodeFlags::EXTENTS)
             && inode.blocks() == 0)
 }
@@ -4117,7 +4117,10 @@ fn try_discard_orphan(
         let parent_links = Inode::read(ext4, parent_ino).map_err(map_ext4_err)?.links_count();
         let mut orphan = Inode::read(ext4, orphan_ino).map_err(map_ext4_err)?;
         let is_dir = orphan.file_type().is_dir();
-        if orphan.file_type().is_symlink() && !orphan.flags().contains(InodeFlags::EXTENTS) && orphan.blocks() == 0 {
+        if !matches!(orphan.file_type(), FileType::Regular | FileType::Directory)
+            && !orphan.flags().contains(InodeFlags::EXTENTS)
+            && orphan.blocks() == 0
+        {
             orphan.set_links_count(0);
             orphan.write(ext4).map_err(map_ext4_err)?;
             orphan = Ext4Inode::zero_inline_symlink_before_unlink(inner, orphan_ino.get(), orphan, 0)?.0;
@@ -4388,16 +4391,19 @@ impl VfsInode for Ext4Inode {
             let mut child_disk = new_inode(&inner.ext4, file_type, mode, now_ts).map_err(map_ext4_err)?;
             inner.clear_nlink_bounds(child_disk.index.get());
             // Special files must not carry EXTENTS or a non-zero i_block
-            // (e2fsck rejects them); ext4plus::create_inode sets EXTENTS and
+            // (e2fsck rejects them); with the extents feature,
+            // ext4plus::create_inode sets EXTENTS and
             // initializes an empty extent header, so clear both before linking.
             if inode_type == InodeType::Fifo {
                 let cleared = (|| -> Result<Inode, VfsError> {
-                    child_disk.set_flags(child_disk.flags().difference(InodeFlags::EXTENTS));
-                    child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
                     let off = inner.layout.inode_disk_offset(&inner.bcache, child_disk.index.get())?;
                     let zero = [0u8; 60];
                     inner.bcache.write_at(off + I_BLOCK_OFFSET, &zero).map_err(|e| map_block_error(&e))?;
-                    Inode::read(&inner.ext4, child_disk.index).map_err(map_ext4_err)
+                    // Re-read so writing flags cannot restore the old extent header.
+                    child_disk = Inode::read(&inner.ext4, child_disk.index).map_err(map_ext4_err)?;
+                    child_disk.set_flags(child_disk.flags().difference(InodeFlags::EXTENTS));
+                    child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
+                    Ok(child_disk.clone())
                 })();
                 match cleared {
                     Ok(disk) => child_disk = disk,
@@ -4409,6 +4415,7 @@ impl VfsInode for Ext4Inode {
                             child_disk.index,
                             "after a failed mknod",
                         );
+                        self.retake_dir_geometry(&mut meta, &inner.ext4);
                         return Err(e);
                     }
                 }
@@ -5413,6 +5420,8 @@ pub(crate) mod ktest_util {
     pub struct FaultCache {
         inner: SleepMutex<BlockCache<MemBlkDev>>,
         pub(in crate::vfs) dev: MemBlkDev,
+        /// Optional raw bytes captured just before an injected read error.
+        pub read_failure_snapshot: SleepMutex<Option<(u64, [u8; 128])>>,
         pub reads: AtomicUsize,
         pub writes: AtomicUsize,
         /// `sync` calls, failed ones included.
@@ -5597,6 +5606,9 @@ pub(crate) mod ktest_util {
                 let armed = self.fail_range_reads.load(Ordering::Acquire) > 0;
                 let skipped = armed && take_one(&self.range_skip);
                 if !skipped && take_one(&self.fail_range_reads) {
+                    if let Some((offset, bytes)) = self.read_failure_snapshot.lock().as_mut() {
+                        self.inner.lock().read_at(*offset, bytes)?;
+                    }
                     return Err(BlockError::Io);
                 }
             }
@@ -5713,6 +5725,7 @@ pub(crate) mod ktest_util {
         let cache = Arc::new(FaultCache {
             inner: SleepMutex::new(BlockCache::new(dev.clone(), 64).map_err(|_| "bcache")?),
             dev,
+            read_failure_snapshot: SleepMutex::new(None),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             syncs: AtomicUsize::new(0),
@@ -9934,6 +9947,59 @@ crate::ktest!(
             kassert_eq!(mode_cell(&m), Value::Text(String::from("ro,errors")));
             kassert_eq!(crate::vfs::procfs::format_mounts_of(rows), "/dev/vda / ext4 ro,errors=remount-ro 0 0\n");
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_fifo_mknod_descriptor_fault_never_frees_foreign_blocks() {
+        use crate::{kassert, kassert_eq};
+        use ktest_util::*;
+        // Sweep descriptor reads: this includes the adapter's inode offset
+        // lookup between inode creation and clearing i_block. Inspect that
+        // failure boundary too: orphan pre-zeroing is a second defense and
+        // must not hide an unsafe intermediate state from this regression.
+        let mut reached_fifo = false;
+        let mut reached_success = false;
+        for skip in 0..32 {
+            let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 386)?;
+            let bitmap = block_bitmap_offset(&m.fs)? as usize;
+            let before = image(&m)?;
+            let free_i = free_inodes(&m.fs);
+            let off = inode_offset(&m.fs, 11)?;
+            *m.cache.read_failure_snapshot.lock() = Some((off, [0; 128]));
+            m.cache.fail_reads_in_after(4096, 4160, skip, 1);
+            let result = m.root.mknod(b"fifo", InodeType::Fifo, 0o600, DevId::default());
+            let hit = m.cache.range_reads_left() == 0;
+            m.cache.clear();
+            if hit {
+                let (_, raw) = m.cache.read_failure_snapshot.lock().take().ok_or("snapshot")?;
+                let mode = u16::from_le_bytes(raw[0..2].try_into().unwrap());
+                if mode & 0xf000 == 0x1000 {
+                    reached_fifo = true;
+                    let flags = u32::from_le_bytes(raw[32..36].try_into().unwrap());
+                    kassert!(flags & InodeFlags::EXTENTS.bits() != 0 || raw[40..100].iter().all(|&b| b == 0));
+                }
+            }
+            if result.is_ok() {
+                m.root.unlink(b"fifo").map_err(|_| "unlink fifo")?;
+                reached_success |= !hit;
+            } else {
+                kassert_eq!(result.err(), Some(VfsError::Io));
+                kassert_eq!(m.root.lookup(b"fifo").err(), Some(VfsError::NoEnt));
+            }
+            let after = image(&m)?;
+            kassert_eq!(&after[bitmap..bitmap + 4096], &before[bitmap..bitmap + 4096]);
+            kassert_eq!(counts_4k(&after, bitmap as u64), counts_4k(&before, bitmap as u64));
+            kassert_eq!(free_inodes(&m.fs), free_i);
+            kassert!(!m.fs.errored() && !m.fs.read_only());
+            let ro = mount_ro_image(after, 387)?;
+            kassert_eq!(ro.root_inode().lookup(b"fifo").err(), Some(VfsError::NoEnt));
+            if reached_success {
+                break;
+            }
+        }
+        kassert!(reached_fifo && reached_success);
         Ok(())
     }
 );

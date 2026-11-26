@@ -28,3 +28,13 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::fd::fifo_reopen_during_a_blocked_read_reaches_that_reader",
     "scenario:test_linux_io::test_pipes_and_poll",
 ]
+
+[[feature]]
+name = "C7 atomic writers wait for the whole record, broken blocked writes return EPIPE, and FIFO opens handshake or detach on interruption"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_atomic_writer_waits_for_the_entire_record",
+    "ktest:lumen_kernel::linux::syscall::fd::pipe_blocked_writer_gets_epipe_when_reader_closes",
+    "ktest:lumen_kernel::linux::syscall::fd::fifo_blocking_opens_wait_for_peers_and_interrupt_detaches",
+    "scenario:test_linux_io::test_pipes_and_poll",
+]

@@ -7,7 +7,7 @@ import re
 
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import copy_rootfs, e2fsck_check
+from lumen_harness.rootfs import copy_rootfs, debugfs, debugfs_names, e2fsck_check
 from lumen_harness.shell import run
 
 BOOT_TIMEOUT = 60
@@ -124,6 +124,9 @@ def test_pipes_and_poll(boot, tmp_path):
         "pipe_buf_atomicity",
         "eof_fionread_and_sigpipe",
         "nonblock_and_setpipe_sz",
+        "pipe_writev_and_faults",
+        "blocked_sigpipe_and_writev",
+        "proc_pipe_reopen_and_large_write",
         "dup_redirections",
         "fifo_open_rules_and_poll",
         "posix_spawn_cloexec",
@@ -143,3 +146,23 @@ def test_pipes_and_poll(boot, tmp_path):
     # Confirm the ext4 FIFO created (and the second one unlinked) on the rootfs
     # leave an e2fsck-clean ext4 image.
     e2fsck_check(disk)
+
+    names = debugfs_names(disk, "/")
+    assert "ext4-fifo-keep" in names
+    assert "ext4-fifo-del" not in names
+    stat = debugfs(disk, "stat /ext4-fifo-keep")
+    assert "Type: FIFO" in stat, stat
+    flags = re.search(r"Flags:\s+(0x[0-9a-fA-F]+)", stat)
+    assert flags and int(flags[1], 16) & 0x80000 == 0, stat
+    assert "Blockcount: 0" in stat, stat
+    # imap gives the on-disk inode position; inspect all 60 i_block bytes,
+    # including bytes debugfs's block listing may omit for special files.
+    location = debugfs(disk, "imap /ext4-fifo-keep")
+    match = re.search(r"block (\d+), offset (0x[0-9a-fA-F]+)", location)
+    assert match, location
+    stats = debugfs(disk, "stats")
+    block_size = re.search(r"Block size:\s+(\d+)", stats)
+    assert block_size, stats
+    with disk.open("rb") as image:
+        image.seek(int(match[1]) * int(block_size[1]) + int(match[2], 16) + 40)
+        assert image.read(60) == bytes(60)

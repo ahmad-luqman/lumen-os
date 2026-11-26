@@ -420,3 +420,10 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::fd::fifo_reopen_during_a_blocked_read_reaches_that_reader",
     "scenario:test_linux_io::test_pipes_and_poll",
 ]
+
+[[feature]]
+name = "C7 FIFO mknod descriptor read failures preserve block ownership and safe i_block encoding"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_fifo_mknod_descriptor_fault_never_frees_foreign_blocks",
+]

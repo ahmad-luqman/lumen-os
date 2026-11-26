@@ -15,6 +15,7 @@ pub(super) fn sys_pipe(fds: UserPtr) -> u64 {
 
 /// `pipe2(fds, flags)` (293): create an anonymous pipe (`O_CLOEXEC` and
 /// `O_NONBLOCK` accepted; `O_DIRECT` and any other flag `-EINVAL`).
+/// Deviation: Linux supports O_DIRECT packet-mode pipes; Lumen does not.
 pub(super) fn sys_pipe2(fds: UserPtr, flags: OpenFlags) -> u64 {
     finish(pipe2(fds, flags))
 }
@@ -72,6 +73,8 @@ pub(super) fn sys_mknod(path: UserPtr, mode: Mode, dev: u32) -> u64 {
 
 /// `mknodat(dirfd, path, mode, dev)` (259): create a FIFO (`S_IFIFO`) or
 /// regular file (`S_IFREG` or 0), checking the file type before path lookup.
+/// Deviation: S_IFCHR/S_IFBLK/S_IFSOCK return EPERM even for root, whereas
+/// Linux allows root to create these node types.
 pub(super) fn sys_mknodat(dirfd: Dirfd, path: UserPtr, mode: Mode, dev: u32) -> u64 {
     finish(mknodat(dirfd, path, mode, dev))
 }

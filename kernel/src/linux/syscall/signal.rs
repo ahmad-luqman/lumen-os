@@ -89,9 +89,17 @@ pub(super) fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> SyscallReturn {
     SyscallReturn::Iret
 }
 
-/// `rt_sigpending(set, sigsetsize)` (127): M8 stub, replaced by C6 (#385).
-pub(super) fn sys_rt_sigpending(_set: UserPtr, _sigsetsize: u64) -> u64 {
-    not_implemented(general::__NR_rt_sigpending)
+/// `rt_sigpending(set, sigsetsize)` (127): blocked private | shared pending
+/// signals, accepting short output sets as Linux's do_sigpending does.
+pub(super) fn sys_rt_sigpending(set: UserPtr, sigsetsize: u64) -> u64 {
+    if sigsetsize > 8 {
+        return neg_errno(errno::EINVAL);
+    }
+    let pending = crate::linux::process::current_pending().0.to_le_bytes();
+    match copy_to_user(set.addr(), &pending[..sigsetsize as usize]) {
+        Ok(()) => 0,
+        Err(e) => neg_errno(e.to_errno()),
+    }
 }
 
 /// `rt_sigtimedwait(set, info, timeout, sigsetsize)` (128): M8 stub, replaced by C6 (#385).

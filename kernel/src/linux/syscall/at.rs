@@ -87,7 +87,7 @@ impl Fd {
     }
 
     /// The current process's open file on this descriptor (an in-flight I/O
-    /// reference raising `KernelFile::io_refs`), or `EBADF`: every handler's
+    /// reference raising `KernelFile::end_refs`), or `EBADF`: every handler's
     /// descriptor lookup.
     pub(super) fn file(self) -> Result<IoFile, u32> {
         process::current_io_file(self.0).ok_or(errno::EBADF)
