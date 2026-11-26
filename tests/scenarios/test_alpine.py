@@ -4,8 +4,11 @@ M7 checks individual applets and ash built-ins; M8's D1 gate runs ash
 scripts, external commands, pipelines and background jobs (#393).
 """
 
+import os
 import re
+import sys
 
+import pytest
 from lumen_harness import BUILD_DIR
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.klog import unexpected_warnings
@@ -199,6 +202,14 @@ def test_ash_scripts_and_pipelines(boot, tmp_path):
     zero and leaves both children reaped; this does not prove it blocked.
     The changed ext4 files survive sync and pass the host's fsck.
     """
+    # The developer image is its own target (`make rootfs-dev`): `make test`
+    # leaves it out (test_make_deps_build_and_test_leave_the_dev_image_out),
+    # so a local run without it skips. CI builds it first, so there a missing
+    # image fails rather than skips, and the gate can't pass unchecked.
+    if not (BUILD_DIR / "alpine-dev.ext4").is_file():
+        if os.environ.get("CI") and sys.platform == "linux":
+            pytest.fail("build/alpine-dev.ext4 is missing: CI runs `make rootfs-dev` first")
+        pytest.skip("no build/alpine-dev.ext4 (run `make rootfs-dev`)")
     disk = copy_dev_rootfs(tmp_path)
     script = tmp_path / "d1.sh"
     script.write_text(
