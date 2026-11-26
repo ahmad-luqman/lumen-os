@@ -1,9 +1,8 @@
-"""Unmodified Alpine Linux software on Lumen's writable ext4 rootfs (M7, #255).
+"""Unmodified Alpine Linux software on Lumen's writable ext4 rootfs.
 
-Each applet of Alpine's dynamic `/bin/busybox` runs as its own `linux
-/bin/busybox <applet> ...` line: no ring-3 process can fork or exec yet, so
-neither the Lumen shell nor ash can pipe one Linux process into another, and
-ash can't start external commands (fork, exec, pipe and dup2 arrive in M8)."""
+M7 checks individual applets and ash built-ins; M8's D1 gate runs ash
+scripts, external commands, pipelines and background jobs (#393).
+"""
 
 import re
 
@@ -12,6 +11,7 @@ from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.klog import unexpected_warnings
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
 from lumen_harness.rootfs import (
+    copy_dev_rootfs,
     copy_rootfs,
     debugfs,
     debugfs_names,
@@ -187,3 +187,187 @@ def test_alpine_minirootfs_coreutils(boot, tmp_path):
     assert debugfs(disk, "cat /group.sed") == edited
     assert debugfs(disk, "cat /untar/passwd") == passwd
     assert debugfs(disk, "cat /untar/group") == group
+
+
+def test_ash_scripts_and_pipelines(boot, tmp_path):
+    """D1: real ash scripts on the developer image, with exact output and status.
+
+    External commands carry more than a pipe's capacity through three stages;
+    redirections, subshell isolation, command substitution, signal/EXIT traps
+    and selected background waits preserve data and exit statuses. FIFO
+    handshakes establish readiness before releasing either background job.
+    The changed ext4 files survive sync and pass the host's fsck.
+    """
+    disk = copy_dev_rootfs(tmp_path)
+    script = tmp_path / "d1.sh"
+    script.write_text(
+        r"""set -eu
+export PATH=/bin:/usr/bin
+/bin/busybox mkdir /ash-d1
+cd /ash-d1
+
+# Explicit busybox paths force external execs, even for ash built-ins.
+# 108894 bytes, larger than the default 65536-byte pipe, and EOF at each hop.
+/bin/busybox seq 1 20000 | /bin/busybox cat | /bin/busybox awk '
+    NR == 1 { first = $1 }
+    NF != 1 || $1 != NR { exit 31 }
+    { sum += $1; last = $1 }
+    END { printf "pipeline=%d,%d,%d,%d\n", NR, first, last, sum }
+'
+/bin/busybox false | /bin/busybox true
+left=$?
+if /bin/busybox true | /bin/busybox false; then right=0; else right=$?; fi
+printf 'pipeline-status=%s,%s\n' "$left" "$right"
+
+printf 'discard this longer content\n' > data
+printf 'alpha\n' > data
+printf 'beta\n' >> data
+/bin/busybox cat < data
+{ printf 'stdout\n'; printf 'stderr\n' >&2; } > out 2> err
+/bin/busybox cat out err
+{ printf 'merged-out\n'; printf 'merged-err\n' >&2; } > merged 2>&1
+/bin/busybox cat merged
+# Order matters: stderr keeps the old stdout while stdout goes to a file.
+{ printf 'file-only\n'; printf 'console-only\n' >&2; } 2>&1 > ordered
+/bin/busybox cat ordered
+printf 'stdout-restored\n'
+
+value=parent
+(cd /tmp; value=child; printf 'subshell=%s,%s\n' "$PWD" "$value")
+printf 'parent=%s,%s\n' "$PWD" "$value"
+captured=$(/bin/busybox printf 'first\nsecond\n\n')
+[ "$captured" = 'first
+second' ]
+printf 'substitution=<%s>\n' "$captured"
+if captured=$(/bin/busybox ash -c 'printf failed-value; exit 19'); then
+    status=0
+else
+    status=$?
+fi
+printf 'substitution-status=%s,%s\n' "$status" "$captured"
+
+# Execute a file through the kernel's shebang path, retaining argv and env.
+cat > child.sh <<'CHILD'
+#!/bin/sh
+printf 'script=%s,%s,%s,%s\n' "$#" "$1" "$D1_VALUE" "$PWD"
+exit 17
+CHILD
+/bin/busybox chmod 755 child.sh
+export D1_VALUE=inherited
+if ./child.sh 'two words'; then status=0; else status=$?; fi
+printf 'script-status=%s\n' "$status"
+
+trapped=missing
+trap 'trapped=USR1' USR1
+/bin/busybox kill -USR1 "$$"
+printf 'trap=%s\n' "$trapped"
+trap - USR1
+
+# Both children announce readiness before the parent releases the second
+# first. The first cannot finish until after wait has selected the second.
+/bin/busybox mkfifo ready first-go second-go
+(
+    printf 'first\n' > ready
+    read -r token < first-go
+    [ "$token" = release-first ]
+    printf 'first-done\n' > first-result
+    exit 7
+) &
+first=$!
+read -r ready_name < ready
+[ "$ready_name" = first ]
+(
+    printf 'second\n' > ready
+    read -r token < second-go
+    [ "$token" = release-second ]
+    printf 'second-done\n' > second-result
+    exit 9
+) &
+second=$!
+read -r ready_name < ready
+[ "$ready_name" = second ]
+[ "$first" != "$second" ]
+printf 'release-second\n' > second-go
+if wait "$second"; then status=0; else status=$?; fi
+printf 'wait-second=%s\n' "$status"
+[ ! -e first-result ]
+/bin/busybox cat second-result
+printf 'release-first\n' > first-go
+if wait "$first"; then status=0; else status=$?; fi
+printf 'wait-first=%s\n' "$status"
+/bin/busybox cat first-result
+
+(printf 'all-a\n' > all-a) &
+(printf 'all-b\n' > all-b) &
+wait
+/bin/busybox cat all-a all-b
+/bin/busybox rm ready first-go second-go
+trap 'printf "exit-trap=%s\n" "$?"' EXIT
+exit 23
+""",
+        encoding="utf-8",
+    )
+    # Stage only this test's disk, before QEMU opens it. The script never
+    # travels through the console, so echoed source cannot satisfy a check.
+    debugfs(disk, f'write "{script}" /d1.sh', write=True)
+    m = boot("qemutest", memory="512M", devices=Devices(blk_image=disk, rng=True))
+    m.expect(PROMPT, BOOT_TIMEOUT)
+    done = run_busybox(m, "ash /d1.sh")
+    assert done.status == 23, done.raw
+    assert done.output.splitlines() == [
+        "pipeline=20000,1,20000,200010000",
+        "pipeline-status=0,1",
+        "alpha",
+        "beta",
+        "stdout",
+        "stderr",
+        "merged-out",
+        "merged-err",
+        "console-only",
+        "file-only",
+        "stdout-restored",
+        "subshell=/tmp,child",
+        "parent=/ash-d1,parent",
+        "substitution=<first",
+        "second>",
+        "substitution-status=19,failed-value",
+        "script=1,two words,inherited,/ash-d1",
+        "script-status=17",
+        "trap=USR1",
+        "wait-second=9",
+        "second-done",
+        "wait-first=7",
+        "first-done",
+        "all-a",
+        "all-b",
+        "exit-trap=23",
+    ], done.raw
+    assert CRASH_BEGIN not in m.output
+    assert run(m, "sync", 60) == "sync: ok\n"
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    e2fsck_check(disk)
+    for name, contents in {
+        "data": "alpha\nbeta\n",
+        "out": "stdout\n",
+        "err": "stderr\n",
+        "merged": "merged-out\nmerged-err\n",
+        "ordered": "file-only\n",
+        "first-result": "first-done\n",
+        "second-result": "second-done\n",
+        "all-a": "all-a\n",
+        "all-b": "all-b\n",
+    }.items():
+        assert debugfs(disk, f"cat /ash-d1/{name}") == contents, name
+    assert debugfs_names(disk, "/ash-d1") == {
+        "data",
+        "out",
+        "err",
+        "merged",
+        "ordered",
+        "child.sh",
+        "first-result",
+        "second-result",
+        "all-a",
+        "all-b",
+    }
