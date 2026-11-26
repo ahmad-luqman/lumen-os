@@ -17,7 +17,6 @@
 
 use core::arch::asm;
 use core::mem::offset_of;
-use core::num::NonZeroU8;
 use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use crate::mm::user_vm::AddressSpace;
@@ -35,12 +34,11 @@ pub const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
 #[repr(C)]
 pub struct PerCpu {
     index: u32,
-    pending_debug_trap: AtomicU8,
-    _pad: [u8; 3],
+    _pad: [u8; 4],
     kernel_rsp: AtomicU64,
     user_rsp_scratch: AtomicU64,
     user_exit_rsp: AtomicU64,
-    pending_debug_rip: AtomicU64,
+    pending_debug_trap: AtomicDebugTrap,
     /// User [`AddressSpace`] whose page-table root this CPU currently has
     /// loaded in `CR3`, or null when running on `kernel_root()`. Kept alive by
     /// the running (or outgoing, during a switch) thread's `UserThreadState`.
@@ -49,14 +47,12 @@ pub struct PerCpu {
 
 /// Pinned byte offsets into [`PerCpu`] for assembly entry/exit stubs.
 pub const OFFSET_INDEX: usize = offset_of!(PerCpu, index);
-pub const OFFSET_PENDING_DEBUG_TRAP: usize = offset_of!(PerCpu, pending_debug_trap);
 pub const OFFSET_KERNEL_RSP: usize = offset_of!(PerCpu, kernel_rsp);
 pub const OFFSET_USER_RSP_SCRATCH: usize = offset_of!(PerCpu, user_rsp_scratch);
 pub const OFFSET_USER_EXIT_RSP: usize = offset_of!(PerCpu, user_exit_rsp);
 
 const _: () = {
     assert!(OFFSET_INDEX == 0);
-    assert!(OFFSET_PENDING_DEBUG_TRAP == 4);
     assert!(OFFSET_KERNEL_RSP == 8);
     assert!(OFFSET_USER_RSP_SCRATCH == 16);
     assert!(OFFSET_USER_EXIT_RSP == 24);
@@ -66,12 +62,11 @@ static CPUS: [PerCpu; MAX_CPUS] = {
     let mut cpus = [const {
         PerCpu {
             index: 0,
-            pending_debug_trap: AtomicU8::new(0),
-            _pad: [0; 3],
+            _pad: [0; 4],
             kernel_rsp: AtomicU64::new(0),
             user_rsp_scratch: AtomicU64::new(0),
             user_exit_rsp: AtomicU64::new(0),
-            pending_debug_rip: AtomicU64::new(0),
+            pending_debug_trap: AtomicDebugTrap::new(),
             loaded_space: AtomicPtr::new(core::ptr::null_mut()),
         }
     }; MAX_CPUS];
@@ -127,32 +122,64 @@ pub fn kernel_rsp() -> u64 {
     CPUS[index()].kernel_rsp.load(Ordering::Relaxed)
 }
 
-/// A deferred debug trap's original address and nonzero Linux si_code.
+/// Linux debug si_codes emitted by x86 debug exceptions.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum DebugCode {
+    Breakpoint = 1,
+    Trace = 2,
+}
+impl DebugCode {
+    pub const fn to_raw(self) -> u8 {
+        self as u8
+    }
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => None,
+            1 => Some(Self::Breakpoint),
+            2 => Some(Self::Trace),
+            _ => panic!("invalid debug si_code"),
+        }
+    }
+}
+
+/// A deferred debug trap's original address and Linux si_code.
 #[derive(Clone, Copy, Debug)]
 pub struct DebugTrap {
-    pub code: NonZeroU8,
+    pub code: DebugCode,
     pub rip: u64,
 }
-impl DebugTrap {
-    pub fn new(code: u8, rip: u64) -> Self {
-        Self { code: NonZeroU8::new(code).expect("nonzero debug si_code"), rip }
+
+/// A debug record accessed with interrupts off by its owning CPU/thread.
+/// The pair is not a general concurrently writable atomic snapshot.
+pub struct AtomicDebugTrap {
+    code: AtomicU8,
+    rip: AtomicU64,
+}
+impl AtomicDebugTrap {
+    pub const fn new() -> Self {
+        Self { code: AtomicU8::new(0), rip: AtomicU64::new(0) }
+    }
+    pub fn store(&self, trap: Option<DebugTrap>) {
+        self.rip.store(trap.map_or(0, |t| t.rip), Ordering::Relaxed);
+        self.code.store(trap.map_or(0, |t| t.code.to_raw()), Ordering::Release);
+    }
+    pub fn take(&self) -> Option<DebugTrap> {
+        DebugCode::from_raw(self.code.swap(0, Ordering::AcqRel))
+            .map(|code| DebugTrap { code, rip: self.rip.load(Ordering::Relaxed) })
     }
 }
 
 /// Record or clear a deferred #DB, with interrupts off on its owning CPU.
 #[inline]
 pub fn set_pending_debug_trap(trap: Option<DebugTrap>) {
-    let cpu = &CPUS[index()];
-    cpu.pending_debug_rip.store(trap.map_or(0, |t| t.rip), Ordering::Relaxed);
-    cpu.pending_debug_trap.store(trap.map_or(0, |t| t.code.get()), Ordering::Release);
+    CPUS[index()].pending_debug_trap.store(trap);
 }
 
 /// Take the original RIP and si_code, with interrupts off on the owning CPU.
 #[inline]
 pub fn take_pending_debug_trap() -> Option<DebugTrap> {
-    let cpu = &CPUS[index()];
-    NonZeroU8::new(cpu.pending_debug_trap.swap(0, Ordering::AcqRel))
-        .map(|code| DebugTrap { code, rip: cpu.pending_debug_rip.load(Ordering::Relaxed) })
+    CPUS[index()].pending_debug_trap.take()
 }
 
 /// Set the saved kernel stack pointer used to unwind cleanly from ring 3 back

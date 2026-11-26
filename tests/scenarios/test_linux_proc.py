@@ -17,6 +17,9 @@ SIGNALS = [
     "blocked_pending_and_sigqueue",
     "nodefer_and_resethand",
     "alternate_stack",
+    "fork_altstack",
+    "vfork_altstack",
+    "clone_vm_clears_altstack",
     "fp_and_mxcsr",
     "sigreturn_ss_sanitized",
     "sigreturn_rax_is_not_restart",
@@ -44,9 +47,14 @@ def test_signals_and_sigaltstack(boot, tmp_path, cpu):
     checks("signals", SIGNALS)
     checks("faults", FAULTS)
     for kind in ["mxcsr", "cs", "rip", "segvframe"] + (["xstate", "xcomp"] if cpu == "max" else []):
+        serial_start = len(m.output)
         out = run(m, f"linux {PROC} signal-bad {kind}", 60)
         assert f"linux: {PROC} exit=139 signal=11 " in out, out
         assert "survived" not in out, out
+        serial = m.output[serial_start:]
+        assert (
+            len(re.findall(r"INFO  signal: pid \d+: could not deliver SIG11: .+", serial)) == 1
+        ), serial
     if cpu == "max":
         checks("signal-bad magic", ["fx_fallback"])
     for kind in ["blocked", "ignored"]:

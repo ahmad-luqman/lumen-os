@@ -393,29 +393,14 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
 
     // The restart decision runs once, on the first pass.
     // C5's rt_sigreturn restores user registers, not a syscall to restart.
-    let mut syscall = if pending_db.is_some() || orig_rax == linux_raw_sys::general::__NR_rt_sigreturn as u64 {
+    let syscall = if pending_db.is_some() || orig_rax == linux_raw_sys::general::__NR_rt_sigreturn as u64 {
         None
     } else {
         lumen_signal::restart::SyscallExit::new(orig_rax)
     };
-    loop {
-        if frame.rip >= USER_MAX {
-            crate::user::handle_non_canonical_return(frame.rip);
-        }
-        if crate::linux::signal::exit_to_user(frame, syscall.take()) {
-            mode = SyscallReturn::Iret;
-        }
-        let _ = irq::disable();
-        if !crate::sched::current_sigpending() {
-            break;
-        }
-        irq::restore(true);
+    if settle_user_return(frame, syscall) {
+        mode = SyscallReturn::Iret;
     }
-    frame.rflags = sanitize_user_rflags(frame.rflags);
-
-    // Delivery must already have handled an invalid RIP before any return
-    // instruction can raise a ring-0 #GP with user GS loaded.
-    assert!(frame.rip < USER_MAX, "signal hook returned invalid RIP");
 
     match mode {
         SyscallReturn::Sysret => {
@@ -559,11 +544,20 @@ pub unsafe fn enter_fork(mut frame: SyscallFrame) {
 #[unsafe(no_mangle)]
 extern "C" fn lumen_fork_exit_to_user(frame: &mut SyscallFrame) {
     irq::restore(true);
+    settle_user_return(frame, None);
+}
+
+/// Settle syscall/fork return work, ending IRQ-off with safe flags and RIP.
+/// Interrupt returns deliberately keep their own loop: a fault may have a non-user RIP.
+fn settle_user_return(frame: &mut SyscallFrame, mut syscall: Option<lumen_signal::restart::SyscallExit>) -> bool {
+    let mut rewritten = false;
     loop {
         if frame.rip >= USER_MAX {
             crate::user::handle_non_canonical_return(frame.rip);
         }
-        crate::linux::signal::exit_to_user(frame, None);
+        if crate::linux::signal::exit_to_user(frame, syscall.take()) {
+            rewritten = true;
+        }
         let _ = irq::disable();
         if !crate::sched::current_sigpending() {
             break;
@@ -571,7 +565,12 @@ extern "C" fn lumen_fork_exit_to_user(frame: &mut SyscallFrame) {
         irq::restore(true);
     }
     frame.rflags = sanitize_user_rflags(frame.rflags);
-    assert!(frame.rip < USER_MAX, "signal hook returned invalid fork RIP");
+
+    // Delivery must already have handled an invalid RIP before any return
+    // instruction can raise a ring-0 #GP with user GS loaded.
+    assert!(frame.rip < USER_MAX, "signal hook returned invalid RIP");
+
+    rewritten
 }
 
 /// Unwind directly back to the caller of [`enter_ring3`] on this CPU.

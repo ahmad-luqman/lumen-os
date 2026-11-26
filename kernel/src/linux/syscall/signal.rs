@@ -6,11 +6,13 @@ use super::at::UserPtr;
 use super::{copy_pod_from_user, copy_pod_to_user, neg_errno, not_implemented};
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::linux::process::{
-    KernelSigaction, current_action, current_blocked, set_current_action, set_current_blocked,
+    KernelSigaction, current_action, current_blocked, current_process, current_thread, send_process_checked,
+    send_thread_checked, set_current_action, set_current_blocked,
 };
-use crate::linux::process::{current_process, current_thread, send_process_checked, send_thread_checked};
 use crate::linux::{errno, general};
 use crate::user::{copy_from_user, copy_to_user};
+use core::mem::{offset_of, size_of};
+use lumen_signal::abi;
 use lumen_signal::{
     SigSet, Signal,
     pending::{SenderClass, SigInfo},
@@ -18,6 +20,7 @@ use lumen_signal::{
 
 /// Install the new disposition in one hold, then copy the replaced action
 /// out. An output fault does not roll back the installation (Linux order).
+/// rt_sigaction(sig, act, oldact, sigsetsize) (13): swap under siglock before copying oldact.
 pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
     if sigsetsize != 8 {
         return neg_errno(errno::EINVAL);
@@ -48,6 +51,7 @@ pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64)
     0
 }
 
+/// rt_sigprocmask(how, set, oldset, sigsetsize) (14): apply before copying oldset.
 pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
     if sigsetsize != 8 {
         return neg_errno(errno::EINVAL);
@@ -77,9 +81,10 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u6
 }
 
 /// Restore a validated frame and return every GPR through iretq.
+/// rt_sigreturn() (15): validate and restore the user frame or force SIGSEGV.
 pub(super) fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> SyscallReturn {
-    if crate::linux::signal::frame::restore(frame).is_err() {
-        crate::linux::signal::force_sigsegv(None);
+    if let Err(error) = crate::linux::signal::frame::restore(frame) {
+        crate::linux::signal::force_sigsegv(None, error);
     }
     SyscallReturn::Iret
 }
@@ -115,6 +120,7 @@ fn signal_info(sig: i32, bytes: [u8; 128]) -> Result<Option<SigInfo>, u32> {
 fn sent(result: Result<(), u32>) -> u64 {
     super::finish(result.map(|()| 0))
 }
+/// rt_sigqueueinfo(tgid, sig, info) (129): copy, check sender code, then find and queue.
 pub(super) fn sys_rt_sigqueueinfo(tgid: i32, sig: i32, info: UserPtr) -> u64 {
     sent(read_info(info).and_then(|bytes| {
         let info = queued_info(tgid, sig, bytes)?;
@@ -124,6 +130,7 @@ pub(super) fn sys_rt_sigqueueinfo(tgid: i32, sig: i32, info: UserPtr) -> u64 {
         send_process_checked(tgid, info, SenderClass::Other)
     }))
 }
+/// rt_tgsigqueueinfo(tgid, tid, sig, info) (297): copy before ID checks and send to one tid.
 pub(super) fn sys_rt_tgsigqueueinfo(tgid: i32, tid: i32, sig: i32, info: UserPtr) -> u64 {
     sent(read_info(info).and_then(|bytes| {
         if tgid <= 0 || tid <= 0 {
@@ -139,29 +146,33 @@ pub(super) fn sys_rt_sigsuspend(_mask: UserPtr, _sigsetsize: u64) -> u64 {
     not_implemented(general::__NR_rt_sigsuspend)
 }
 
+/// sigaltstack(ss, old_ss) (131): configure using the interrupted rsp; an on-stack change is EPERM.
 pub(super) fn sys_sigaltstack(ss: UserPtr, old_ss: UserPtr, frame: &SyscallFrame) -> u64 {
     let new = if ss.addr() == 0 {
         None
     } else {
-        let mut bytes = [0; 24];
+        let mut bytes = [0; size_of::<abi::Stack>()];
         if let Err(e) = copy_from_user(&mut bytes, ss.addr()) {
             return neg_errno(e.to_errno());
         }
         Some((
-            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-            u64::from_le_bytes(bytes[16..].try_into().unwrap()),
-            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            u64::from_le_bytes(bytes[offset_of!(abi::Stack, sp)..offset_of!(abi::Stack, sp) + 8].try_into().unwrap()),
+            u64::from_le_bytes(bytes[offset_of!(abi::Stack, size)..].try_into().unwrap()),
+            u32::from_le_bytes(
+                bytes[offset_of!(abi::Stack, flags)..offset_of!(abi::Stack, flags) + 4].try_into().unwrap(),
+            ),
         ))
     };
-    let old = match crate::linux::process::current_thread().configure_alt_stack(frame.rsp, new) {
+    let old = match current_thread().configure_alt_stack(frame.rsp, new) {
         Ok(old) => old,
         Err(e) => return e.errno() as i64 as u64,
     };
     if old_ss.addr() != 0 {
-        let mut bytes = [0; 24];
-        bytes[..8].copy_from_slice(&old.sp().to_le_bytes());
-        bytes[8..12].copy_from_slice(&old.status(frame.rsp).to_le_bytes());
-        bytes[16..].copy_from_slice(&old.size().to_le_bytes());
+        let mut bytes = [0; size_of::<abi::Stack>()];
+        bytes[offset_of!(abi::Stack, sp)..offset_of!(abi::Stack, sp) + 8].copy_from_slice(&old.sp().to_le_bytes());
+        bytes[offset_of!(abi::Stack, flags)..offset_of!(abi::Stack, flags) + 4]
+            .copy_from_slice(&old.status(frame.rsp).to_le_bytes());
+        bytes[offset_of!(abi::Stack, size)..].copy_from_slice(&old.size().to_le_bytes());
         if let Err(e) = copy_to_user(old_ss.addr(), &bytes) {
             return neg_errno(e.to_errno());
         }
@@ -174,12 +185,15 @@ fn sender_info(sig: i32, code: i32) -> Result<Option<SigInfo>, u32> {
     bytes[16..20].copy_from_slice(&current_process().pid().to_le_bytes());
     signal_info(sig, bytes)
 }
+/// kill(pid, sig) (62): find process/group targets before checking the signal number.
 pub(super) fn sys_kill(pid: i32, sig: i32) -> u64 {
     sent(send_process_checked(pid, sender_info(sig, general::SI_USER as i32), SenderClass::SiUser))
 }
+/// tkill(tid, sig) (200): validate a positive tid and send SI_TKILL.
 pub(super) fn sys_tkill(tid: i32, sig: i32) -> u64 {
     thread_kill(None, tid, sig)
 }
+/// tgkill(tgid, tid, sig) (234): send only when the tid belongs to the requested group.
 pub(super) fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> u64 {
     if tgid <= 0 {
         return neg_errno(errno::EINVAL);

@@ -381,38 +381,37 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         Err(RunError::Run(e)) => return ctx.fail(format_args!("linux: failed to run '{name}': {e}")),
     };
 
+    let signal = exit.signal().map_or(0, |sig| sig.number());
+    let status = match exit {
+        UserExit::Exited(code) => code,
+        _ => 128 + signal as i32,
+    };
     match exit {
-        UserExit::Exited(code) => {
-            let _ = writeln!(ctx.out, "linux: {name} exit={code} leaked_frames={leaked_frames}");
+        UserExit::Exited(_) => {
+            let _ = writeln!(ctx.out, "linux: {name} exit={status} leaked_frames={leaked_frames}");
         }
-        UserExit::Signaled(sig) => {
-            let _ = writeln!(
-                ctx.out,
-                "linux: {name} exit={} signal={} leaked_frames={leaked_frames}",
-                128 + sig.number(),
-                sig.number()
-            );
+        UserExit::Signaled(_) => {
+            let _ = writeln!(ctx.out, "linux: {name} exit={} signal={} leaked_frames={leaked_frames}", status, signal);
         }
         UserExit::Fault { vector, error_code, rip, cr2 } => {
             let _ = writeln!(
                 ctx.out,
                 "linux: {name} exit={} signal={} vector={vector} ({}) error={error_code:#x} rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}",
-                128 + exit.signal().unwrap().number(),
-                exit.signal().unwrap().number(),
+                status,
+                signal,
                 arch::idt::exception_name(vector),
             );
         }
         UserExit::NonCanonicalRip(rip) => {
             let _ = writeln!(
                 ctx.out,
-                "linux: {name} exit=139 signal=11 non-canonical rip={rip:#x} leaked_frames={leaked_frames}"
+                "linux: {name} exit={status} signal={signal} non-canonical rip={rip:#x} leaked_frames={leaked_frames}"
             );
         }
         UserExit::BusError { rip, cr2 } => {
             let _ = writeln!(
                 ctx.out,
-                "linux: {name} exit={} signal=7 rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}",
-                UserExit::BUS_ERROR_STATUS
+                "linux: {name} exit={status} signal={signal} rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}"
             );
         }
     }

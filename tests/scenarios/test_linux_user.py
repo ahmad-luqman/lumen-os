@@ -126,7 +126,9 @@ def test_non_canonical_sysret_does_not_crash_kernel(boot):
         m.expect(r"lumen> ", 10)
         chunk = m.output[start:]
         assert CRASH_BEGIN not in chunk, chunk
-        warns = re.findall(r"WARN  user: pid \d+: killed by signal 11: NonCanonicalRip", chunk)
+        warns = re.findall(
+            r"WARN  user: pid \d+: killed by signal 11: invalid user return rip=", chunk
+        )
         assert len(warns) == 1, chunk
 
     # Kernel remains healthy and can still run a clean ring-3 program afterwards.
@@ -490,7 +492,7 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
         m,
         f"linux {M7_TEST} sigbus /tmp/m7-bus",
         60,
-        allow=r"WARN  user: pid \d+: killed by signal 7: BusError",
+        allow=r"WARN  user: pid \d+: killed by signal 7: file-backed page fault",
     )
     touched = re.search(r"^m7_test: sigbus: touching (0x[0-9a-f]+) past EOF$", out, re.MULTILINE)
     assert touched, out

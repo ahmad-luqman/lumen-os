@@ -10,6 +10,11 @@ impl ProcessClone {
     pub(crate) const FORK: Self = Self(general::SIGCHLD);
     pub(crate) const VFORK: Self = Self(general::CLONE_VM | general::CLONE_VFORK | general::SIGCHLD);
 
+    /// Linux clears the alternate stack only for shared VM without vfork.
+    pub(super) fn keeps_alt_stack(self) -> bool {
+        self.0 & (general::CLONE_VM | general::CLONE_VFORK) != general::CLONE_VM
+    }
+
     pub(super) fn bits(self) -> u32 {
         self.0
     }

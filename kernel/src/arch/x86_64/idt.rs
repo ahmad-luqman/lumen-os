@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Register state saved by the entry stub, lowest address first.
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TrapFrame {
     pub r15: u64,
     pub r14: u64,
@@ -703,6 +703,16 @@ fn user_exception(frame: &TrapFrame, cr2: u64, bus: bool, oom: bool) {
     let _ = super::irq::disable();
 }
 
+/// Save a vector-1 trap without blocking on its IST stack.
+fn defer_debug_trap(frame: &mut TrapFrame) {
+    use super::percpu::{DebugCode, DebugTrap};
+    debug_assert_eq!(frame.vector, 1);
+    let code = if super::cpu::read_dr6() & (1 << 14) != 0 { DebugCode::Trace } else { DebugCode::Breakpoint };
+    super::cpu::write_dr6(0);
+    frame.rflags &= !(1 << 8);
+    super::percpu::set_pending_debug_trap(Some(DebugTrap { code, rip: frame.rip }));
+}
+
 /// [`lumen_exception_dispatch`]'s work for one vector.
 fn dispatch(frame: &mut TrapFrame) {
     let vector = frame.vector;
@@ -712,17 +722,6 @@ fn dispatch(frame: &mut TrapFrame) {
     if vector < 32 {
         crate::ktrace!(crate::trace::Kind::Exception, vector, frame.rip, frame.error_code);
         let from_user = (frame.cs & 3) != 0;
-
-        let debug_code = if vector == 1 {
-            let dr6: u64;
-            // SAFETY: DR6 is readable in ring 0; sample before clearing it.
-            unsafe {
-                asm!("mov {}, dr6", out(reg) dr6, options(nomem, nostack, preserves_flags));
-            }
-            if dr6 & (1 << 14) != 0 { 2 } else { 1 }
-        } else {
-            0
-        };
 
         // Deferred `#DB` from ring 3 (CVE-2018-8897 handoff):
         // - `MOV SS; SYSCALL` with `TF = 1` delivers `#DB` on `IST_DEBUG` at
@@ -743,10 +742,8 @@ fn dispatch(frame: &mut TrapFrame) {
         //   unwind directly off `IST_DEBUG` via `user::handle_user_exception`.
         if vector == 1 && !from_user {
             if frame.rip == super::syscall::entry_addr() {
-                frame.rflags &= !(1 << 8); // clear TF
-                frame.rflags |= 1 << 16; // set RF so any DR0 breakpoint on LSTAR advances past `swapgs`
-                super::cpu::write_dr6(0);
-                super::percpu::set_pending_debug_trap(Some(super::percpu::DebugTrap::new(debug_code, frame.rip)));
+                defer_debug_trap(frame);
+                frame.rflags |= 1 << 16; // RF lets an LSTAR breakpoint advance past swapgs
                 DEFERRED_LSTAR_DB.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -754,7 +751,8 @@ fn dispatch(frame: &mut TrapFrame) {
                 super::cpu::write_dr6(0);
                 DEFERRED_STUB_DB.fetch_add(1, Ordering::Relaxed);
                 // The nested IST frame is unusable; this emergency unwind does not
-                // end sibling threads until C3 supplies group teardown.
+                // end siblings until C3 (#382) supplies group teardown. MOV SS;
+                // ICEBP is the one remaining kill without signal delivery.
                 crate::user::handle_user_exception(frame, 0);
             }
             if is_user_exception_stub_entry(frame.rip) {
@@ -857,9 +855,10 @@ fn dispatch(frame: &mut TrapFrame) {
             if vector == 1 {
                 // IST cannot copy a user frame or block. Keep the original RIP
                 // and si_code and request delivery on a non-IST interrupt return.
-                super::cpu::write_dr6(0);
-                frame.rflags &= !(1 << 8);
-                super::percpu::set_pending_debug_trap(Some(super::percpu::DebugTrap::new(debug_code, frame.rip)));
+                defer_debug_trap(frame);
+                // A lost self-IPI leaves the trap pending for the next interrupt.
+                // If a syscall arrives first, its hook treats it as the LSTAR
+                // case: queues SIGTRAP and re-runs the syscall on handler return.
                 let _ = super::apic::send_ipi(super::apic::lapic_id(), WAKEUP);
                 return;
             }

@@ -374,10 +374,14 @@ impl UserFpuState {
             if let FpuMode::XSave { .. } = mode() {
                 let bv = match fp.kind() {
                     FpKind::Fxsave => 3,
-                    FpKind::Xsave { xfeatures } => u64::from_le_bytes(bytes[512..520].try_into().unwrap()) & xfeatures,
+                    FpKind::Xsave { xfeatures } => {
+                        u64::from_le_bytes(
+                            bytes[lumen_signal::abi::XSTATE_BV..lumen_signal::abi::XCOMP_BV].try_into().unwrap(),
+                        ) & xfeatures
+                    }
                 };
-                bytes[512..520].copy_from_slice(&bv.to_le_bytes());
-                bytes[520..576].fill(0);
+                bytes[lumen_signal::abi::XSTATE_BV..lumen_signal::abi::XCOMP_BV].copy_from_slice(&bv.to_le_bytes());
+                bytes[lumen_signal::abi::XCOMP_BV..lumen_signal::abi::XHEADER_END].fill(0);
             }
         }
         self.restore();
@@ -391,7 +395,12 @@ impl UserFpuState {
 
     /// x87 status word, including pending exception bits.
     pub fn fsw(&self) -> u16 {
-        u16::from_le_bytes(self.as_bytes()[2..4].try_into().unwrap())
+        u16::from_le_bytes(
+            self.as_bytes()[core::mem::offset_of!(lumen_signal::abi::FxSave, swd)
+                ..core::mem::offset_of!(lumen_signal::abi::FxSave, twd)]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// SSE control/status register (`MXCSR`, offset 24).

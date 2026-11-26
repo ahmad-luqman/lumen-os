@@ -588,10 +588,9 @@ pub enum UserExit {
     Exited(i32),
     /// Termination by a delivered signal.
     Signaled(lumen_signal::Signal),
-    /// Fatal ring-3 CPU exception (or deferred `#DB` at `LSTAR`).
+    /// Diagnostic retained when a CPU exception (including deferred #DB) ends in a fatal signal.
     Fault { vector: u64, error_code: u64, rip: u64, cr2: u64 },
-    /// Kernel refused to execute `sysretq`/`iretq` to a non-canonical or
-    /// kernel-half return `rip`.
+    /// Diagnostic of fatal SIGSEGV from a non-canonical or kernel-half return RIP.
     NonCanonicalRip(u64),
     /// A ring-3 access to a file-backed page that can't be had
     /// (`FaultResult::BusError`): wholly past the file's end, unreadable, or
@@ -613,10 +612,6 @@ impl UserExit {
             Self::Fault { vector, .. } => vector_signal(vector),
         })
     }
-
-    /// The status a shell reports for a process killed by `SIGBUS`
-    /// (`128 + 7`).
-    pub const BUS_ERROR_STATUS: i32 = 128 + general::SIGBUS as i32;
 }
 
 /// Synchronization state for the concurrent same-CPU `sse_tls` preemption test.
@@ -699,10 +694,9 @@ pub(crate) fn note_exit_status(status: i32) {
     }
 }
 
-/// Handle a ring-3 exception (`(frame.cs & 3) != 0`) from `lumen_exception_dispatch`.
-///
-/// Logs one `WARN` naming pid, vector, `rip`, and `cr2`, and unwinds cleanly
-/// back to the kernel ring-3 runner—never calling `crash::exception`.
+/// Emergency unwind for MOV SS; ICEBP's overwritten nested IST debug frame.
+/// This bypasses signal delivery, logs the diagnostic and ends the current run;
+/// C3 (#382) supplies sibling teardown.
 pub fn handle_user_exception(frame: &TrapFrame, cr2: u64) -> ! {
     let exit = UserExit::Fault { vector: frame.vector, error_code: frame.error_code, rip: frame.rip, cr2 };
     let (pid, is_test) = record_exit(exit);
@@ -723,7 +717,6 @@ pub fn handle_user_exception(frame: &TrapFrame, cr2: u64) -> ! {
     unsafe { arch::syscall::unwind_to_kernel() }
 }
 
-/// Queue the deferred LSTAR debug trap on the thread's own kernel stack.
 /// Queue SIGSEGV before attempting a return to a non-user RIP.
 pub fn handle_non_canonical_return(rip: u64) {
     crate::linux::signal::force_fault(

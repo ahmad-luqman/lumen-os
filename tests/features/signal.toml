@@ -12,3 +12,13 @@ tests = ["scenario:test_linux_proc::test_signals_and_sigaltstack[*]", "ktest:lum
 name = "Forked children receive fault signals and fatal wakeups"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::linux::process::fork_child_fault_is_delivered_and_reaped", "ktest:lumen_kernel::linux::process::kill_wakes_fork_child_and_wins_over_exit"]
+
+[[feature]]
+name = "Signal exit ordering and fork entry delivery"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::recorded_exit_wins_over_later_signals", "ktest:lumen_kernel::linux::process::fork_pending_signal_precedes_first_user_instruction", "ktest:lumen_kernel::linux::process::signal::forcing_without_a_fault_preserves_another_signal_diagnostic"]
+
+[[feature]]
+name = "Deferred debug traps preserve the original address across interrupt delivery"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::signal::frame::deferred_debug_trap_keeps_original_address"]

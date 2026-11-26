@@ -12,31 +12,68 @@ use lumen_signal::pending::{
 };
 use lumen_signal::{DefaultAction, SigSet};
 
-/// Dispositions, queues and fatal-signal intent, serialized by Process::signal.
+/// The first reason the group started ending, serialized by the signal lock.
+#[derive(Clone, Copy)]
+enum GroupEnd {
+    Exit,
+    Signal(Signal),
+}
+
+/// Initial per-thread state, copied under the parent's signal lock.
+#[derive(Clone, Copy)]
+pub(super) struct ThreadInit {
+    pub blocked: Blocked,
+    pub alt_stack: AltStack,
+}
+impl ThreadInit {
+    pub const ROOT: Self = Self { blocked: Blocked::EMPTY, alt_stack: AltStack::DISABLED };
+}
+
+/// Dispositions, queues and the first group-end decision, serialized by Process::signal.
 pub struct SignalState {
+    /// Per-signal dispositions, shared by every thread.
     actions: [KernelSigaction; 64],
+    /// Shared and private queues, owning each linked ThreadSlot.
     pending: PendingSignals,
+    /// Live signal state in ascending tid order.
     threads: BTreeMap<u32, ThreadSignals>,
+    /// Cursor for process-directed target selection.
     preferred: Option<ThreadSlot>,
-    group_exit: Option<Signal>,
+    /// First-wins end decision; Process::exit records its diagnostic.
+    group_exit: Option<GroupEnd>,
 }
 
 /// One linked thread's queue slot, notification handle, mask and alternate stack.
 pub struct ThreadSignals {
+    /// Private queue identity, valid until remove_thread.
     slot: ThreadSlot,
+    /// Shared with UserThread so binding updates the notification target.
     thread: Arc<SpinLock<Weak<sched::Thread>>>,
+    /// Explicit ktest stand-in with no runnable scheduler thread.
     synthetic: bool,
+    /// Sanitized mask, never containing SIGKILL or SIGSTOP.
     blocked: Blocked,
+    /// Validated alternate-stack configuration.
     alt_stack: AltStack,
+    /// Last synchronous diagnostic; only its matching signal consumes it.
     fault: Option<UserFault>,
+    /// Failed frame origin, discarded when SEGV reaches a handler.
+    frame_failure: Option<crate::linux::signal::frame::FrameFailure>,
 }
 
 impl ThreadSignals {
-    fn set_blocked(&mut self, blocked: Blocked) {
-        self.blocked = blocked;
-    }
-    fn set_fault(&mut self, fault: Option<UserFault>) {
-        self.fault = fault;
+    fn candidate(&self) -> ThreadCandidate {
+        let thread = self.thread.lock().upgrade();
+        ThreadCandidate {
+            slot: self.slot,
+            mask: self.blocked,
+            state: match thread.as_ref().map(|t| t.state()) {
+                Some(sched::State::Running) => ThreadState::Running,
+                Some(sched::State::Dead) | None => ThreadState::Exiting,
+                _ => ThreadState::Sleeping,
+            },
+            has_pending: thread.is_some_and(|t| t.sigpending()),
+        }
     }
     fn take_fault(&mut self, signal: Signal) -> Option<UserFault> {
         if self.fault.is_some_and(|fault| fault.signal() == signal) { self.fault.take() } else { None }
@@ -51,9 +88,6 @@ impl ThreadSignals {
             }
             sched::kick(&thread);
         }
-    }
-    fn install(&mut self, alt_stack: AltStack) {
-        self.alt_stack = alt_stack;
     }
 }
 
@@ -124,27 +158,46 @@ impl SignalState {
         Self { actions: self.actions, ..Self::new() }
     }
     pub(super) fn fatal_signal(&self) -> Option<Signal> {
-        self.group_exit
+        match self.group_exit {
+            Some(GroupEnd::Signal(sig)) => Some(sig),
+            _ => None,
+        }
+    }
+    pub(super) fn ending(&self) -> bool {
+        self.group_exit.is_some()
+    }
+    pub(super) fn record_exit(&mut self) {
+        self.group_exit.get_or_insert(GroupEnd::Exit);
+    }
+    pub(super) fn thread_init(&self, tid: u32, request: ProcessClone) -> ThreadInit {
+        let t = self.thread(tid).expect("live parent signal tid");
+        ThreadInit {
+            blocked: t.blocked,
+            alt_stack: if request.keeps_alt_stack() { t.alt_stack } else { AltStack::DISABLED },
+        }
     }
     fn start_group_exit(&mut self, sig: Signal) {
-        self.group_exit.get_or_insert(sig);
+        self.group_exit.get_or_insert(GroupEnd::Signal(sig));
         for t in self.threads.values() {
             t.notify(true);
         }
     }
-    pub(super) fn add_thread(&mut self, tid: u32, owner: &UserThread, blocked: Blocked) {
+    /// Insert a linked tid; panics if the tid already exists or its queue cannot be allocated.
+    pub(super) fn add_thread(&mut self, tid: u32, owner: &UserThread, init: ThreadInit) {
         let slot = self.pending.add_thread().expect("allocate thread signal queue");
         let signals = ThreadSignals {
             slot,
             thread: Arc::clone(&owner.kernel_handle),
-            synthetic: cfg!(feature = "ktest") && owner.kernel_thread.load(Ordering::Acquire) == 0,
-            blocked,
-            alt_stack: AltStack::DISABLED,
+            synthetic: owner.synthetic,
+            blocked: init.blocked,
+            alt_stack: init.alt_stack,
             fault: None,
+            frame_failure: None,
         };
         assert!(self.threads.insert(tid, signals).is_none(), "duplicate signal tid");
         self.preferred.get_or_insert(slot);
     }
+    /// Remove a live tid and private queue; panics if it was not linked.
     pub(super) fn remove_thread(&mut self, tid: u32) {
         let removed = self.threads.remove(&tid).expect("live signal tid");
         self.pending.remove_thread(removed.slot).expect("live pending slot");
@@ -166,15 +219,18 @@ impl SignalState {
         self.thread(tid).is_some()
     }
     #[cfg(feature = "ktest")]
+    /// Linked tids in ascending order.
     pub(super) fn tids(&self) -> impl Iterator<Item = u32> + '_ {
         self.threads.keys().copied()
     }
+    /// Its sanitized mask; panics if tid is not linked.
     pub(super) fn blocked(&self, tid: u32) -> Blocked {
         self.thread(tid).expect("live signal tid").blocked
     }
+    /// Replace the mask and notify if pending work is now deliverable; panics for an unlinked tid.
     pub(super) fn set_blocked(&mut self, tid: u32, blocked: Blocked) {
         let t = self.threads.get_mut(&tid).expect("live signal tid");
-        t.set_blocked(blocked);
+        t.blocked = blocked;
         if self.pending.has_deliverable(t.slot, blocked).expect("live slot") {
             t.notify(false);
         }
@@ -183,68 +239,55 @@ impl SignalState {
         let t = self.threads.get_mut(&tid).expect("current signal tid");
         let old = t.alt_stack;
         if let Some((sp, size, flags)) = new {
-            t.install(old.configure(rsp, sp, size, flags)?);
+            t.alt_stack = old.configure(rsp, sp, size, flags)?;
         }
         Ok(old)
     }
     fn install_context(&mut self, tid: u32, mask: Blocked, stack: AltStack) {
-        self.threads.get_mut(&tid).expect("current signal tid").install(stack);
+        self.threads.get_mut(&tid).expect("current signal tid").alt_stack = stack;
         self.set_blocked(tid, mask);
     }
     pub(super) fn send(&mut self, tid: Option<u32>, info: SigInfo, sender: SenderClass) -> Result<(), u32> {
         let sig = info.signal();
-        let target = match tid {
-            Some(tid) => Target::Thread(self.thread(tid).ok_or(errno::ESRCH)?.slot),
-            None => Target::Process,
-        };
+        let thread = tid.map(|tid| self.threads.get(&tid).ok_or(errno::ESRCH)).transpose()?;
+        let directed = thread.map(|t| (t, t.blocked.contains(sig)));
+        let target = thread.map_or(Target::Process, |t| Target::Thread(t.slot));
+        let keep_ignored =
+            directed.map_or_else(|| self.threads.values().all(|t| t.blocked.contains(sig)), |(_, blocked)| blocked);
+        if self.ending() {
+            return Ok(());
+        }
         self.pending.prepare_signal(sig);
-        let keep_ignored = match tid {
-            Some(tid) => {
-                let t = self.thread(tid).expect("checked tid");
-                t.blocked.contains(sig)
-            }
-            None => self.threads.values().all(|t| t.blocked.contains(sig)),
-        };
         if ignored(self.action(sig), sig) && !keep_ignored {
             return Ok(());
         }
         self.pending.enqueue(target, info, sender).map_err(|_| errno::EAGAIN)?;
         let chosen = match target {
-            Target::Thread(slot) => Some(slot),
+            Target::Thread(_) => directed,
             Target::Process => {
-                let candidates: Vec<_> = self
-                    .threads
-                    .values()
-                    .map(|t| {
-                        let thread = t.thread.lock().upgrade();
-                        ThreadCandidate {
-                            slot: t.slot,
-                            mask: t.blocked,
-                            state: match thread.as_ref().map(|t| t.state()) {
-                                Some(sched::State::Running) => ThreadState::Running,
-                                Some(sched::State::Dead) | None => ThreadState::Exiting,
-                                _ => ThreadState::Sleeping,
-                            },
-                            has_pending: thread.is_some_and(|t| t.sigpending()),
-                        }
-                    })
-                    .collect();
-                self.preferred.and_then(|p| select_target(sig, &candidates, p).expect("live cursor"))
+                let candidates: Vec<_> = self.threads.values().map(ThreadSignals::candidate).collect();
+                self.preferred.and_then(|p| select_target(sig, &candidates, p).expect("live cursor")).map(|slot| {
+                    let t = self.threads.values().find(|t| t.slot == slot).expect("chosen slot");
+                    (t, t.blocked.contains(sig))
+                })
             }
         };
-        if let Some(slot) = chosen {
-            self.preferred = Some(slot);
-            let t = self.threads.values().find(|t| t.slot == slot).expect("chosen slot");
-            if !t.blocked.contains(sig) && kills_by_default(self.action(sig), sig) {
-                self.start_group_exit(sig);
-            } else if !t.blocked.contains(sig) {
-                t.notify(false);
+        if let Some((t, blocked)) = chosen {
+            self.preferred = Some(t.slot);
+            if !blocked {
+                if kills_by_default(self.action(sig), sig) {
+                    self.start_group_exit(sig);
+                } else {
+                    t.notify(false);
+                }
             }
         }
         Ok(())
     }
+    /// Force on the current linked tid. Reset the disposition when requested or
+    /// blocked/ignored; once ending, drop the request. None preserves the fault slot.
     fn force(&mut self, tid: u32, info: SigInfo, reset: bool, fault: Option<UserFault>) {
-        if self.group_exit.is_some() {
+        if self.ending() {
             return;
         }
         let sig = info.signal();
@@ -255,15 +298,35 @@ impl SignalState {
             mask.remove(sig);
             self.set_blocked(tid, Blocked::new(mask));
         }
-        self.threads.get_mut(&tid).expect("current signal tid").set_fault(fault);
+        if fault.is_some() {
+            self.threads.get_mut(&tid).expect("current signal tid").fault = fault;
+        }
         debug_assert!(!sig.is_realtime());
         self.send(Some(tid), info, SenderClass::SiUser).expect("standard forced signal");
+    }
+    fn force_frame_failure(
+        &mut self,
+        tid: u32,
+        failed: Option<Signal>,
+        reason: crate::linux::signal::frame::FailureReason,
+    ) {
+        if self.ending() {
+            return;
+        }
+        self.threads.get_mut(&tid).expect("current signal tid").frame_failure =
+            Some(crate::linux::signal::frame::FrameFailure { signal: failed.unwrap_or(Signal::SEGV), reason });
+        self.force(tid, SigInfo::new(Signal::SEGV, general::SI_KERNEL as i32), failed == Some(Signal::SEGV), None);
+    }
+    fn take_frame_failure(&mut self, tid: u32) -> Option<crate::linux::signal::frame::FrameFailure> {
+        self.threads.get_mut(&tid).expect("current signal tid").frame_failure.take()
     }
     fn next(&mut self, tid: u32) -> Delivery {
         loop {
             let t = self.threads.get_mut(&tid).expect("current signal tid");
-            if let Some(signal) = self.group_exit {
-                return Delivery::Fatal(signal, t.take_fault(signal));
+            match self.group_exit {
+                Some(GroupEnd::Exit) => return Delivery::Fatal(Signal::KILL, None),
+                Some(GroupEnd::Signal(signal)) => return Delivery::Fatal(signal, t.take_fault(signal)),
+                None => {}
             }
             let Some(info) = self.pending.dequeue(t.slot, t.blocked).expect("current slot") else {
                 sched::clear_current_sigpending();
@@ -271,19 +334,18 @@ impl SignalState {
             };
             let sig = info.signal();
             let action = self.actions[sig.index()];
-            if ignored(action, sig) {
-                continue;
-            }
-            if action.handler == 0 {
-                if matches!(sig.default_action(), DefaultAction::Term | DefaultAction::Core) {
+            if ignored(action, sig) || action.handler == 0 {
+                if kills_by_default(action, sig) {
                     self.start_group_exit(sig);
-                    continue;
                 }
                 // Group stop/continue delivery is supplied by C6.
                 continue;
             }
             if action.flags & u64::from(general::SA_RESETHAND) != 0 {
                 self.actions[sig.index()].handler = 0;
+            }
+            if sig == Signal::SEGV {
+                t.frame_failure = None;
             }
             return Delivery::Handler(HandlerDelivery {
                 info,
@@ -302,14 +364,23 @@ impl Process {
         debug_assert_eq!(tid, current_thread().tid());
         self.signal.lock().next(tid)
     }
+    /// Force a synchronous signal on the current thread and activate its return hook.
     pub fn force_signal(&self, tid: u32, info: SigInfo, reset: bool, fault: Option<UserFault>) {
         debug_assert_eq!(tid, current_thread().tid());
-        // Synchronous faults must be noticed even if notification binding is broken.
+        // sigpending gates the interrupt return hook; synchronous faults set it directly.
         sched::with_current(|t| t.set_sigpending());
         self.signal.lock().force(tid, info, reset, fault);
     }
 }
 impl UserThread {
+    /// Queue SIGSEGV with the failed frame's diagnostic.
+    pub fn force_frame_failure(&self, failed: Option<Signal>, reason: crate::linux::signal::frame::FailureReason) {
+        sched::with_current(|t| t.set_sigpending());
+        self.process.signal.lock().force_frame_failure(self.tid(), failed, reason);
+    }
+    pub fn take_frame_failure(&self) -> Option<crate::linux::signal::frame::FrameFailure> {
+        self.process.signal.lock().take_frame_failure(self.tid())
+    }
     pub fn alt_stack(&self) -> AltStack {
         self.process.signal.lock().thread(self.tid()).expect("current signal tid").alt_stack
     }
@@ -382,9 +453,7 @@ crate::ktest!(
     fn fatal_signal_precedes_handlers_and_keeps_first_status() {
         use crate::{kassert, kassert_eq};
         let fault = UserFault::Trap { vector: 14, error_code: 4, rip: 0x400000, cr2: 0x12345000 };
-        let mut state = SignalState::new();
-        // No scheduler thread owns this local queue: notifications are inert.
-        state.add_thread(9, &UserThread::new(Arc::clone(&lookup(INIT_PID).expect("init")), 0), Blocked::EMPTY);
+        let mut state = one_thread_state();
         state.set_action(Signal::USR1, KernelSigaction { handler: 0x400000, ..Default::default() });
         state.send(Some(9), SigInfo::new(Signal::USR1, 0), SenderClass::Other).map_err(|_| "send handler")?;
         state.force(9, SigInfo::fault(Signal::SEGV, 1, 0x12345000), false, Some(fault));
@@ -393,8 +462,7 @@ crate::ktest!(
         kassert_eq!(sig, Signal::SEGV);
         kassert!(matches!(diagnostic, Some(UserFault::Trap { vector: 14, .. })));
 
-        let mut state = SignalState::new();
-        state.add_thread(9, &UserThread::new(Arc::clone(&lookup(INIT_PID).expect("init")), 0), Blocked::EMPTY);
+        let mut state = one_thread_state();
         state.set_action(Signal::SEGV, KernelSigaction { handler: 0x400000, ..Default::default() });
         state.force(9, SigInfo::fault(Signal::SEGV, 1, 0x12345000), false, Some(fault));
         state.send(Some(9), SigInfo::new(Signal::KILL, 0), SenderClass::Other).map_err(|_| "send kill")?;
@@ -402,8 +470,7 @@ crate::ktest!(
         kassert_eq!(sig, Signal::KILL);
         // A superseded fault must not replace the kill's exit status.
         kassert!(diagnostic.is_none());
-        let mut state = SignalState::new();
-        state.add_thread(9, &UserThread::new(Arc::clone(&lookup(INIT_PID).expect("init")), 0), Blocked::EMPTY);
+        let mut state = one_thread_state();
         for sig in [Signal::TRAP, Signal::SEGV] {
             state.set_action(sig, KernelSigaction { handler: 0x400000, ..Default::default() });
         }
@@ -417,3 +484,28 @@ crate::ktest!(
         Ok(())
     }
 );
+
+crate::ktest!(
+    fn forcing_without_a_fault_preserves_another_signal_diagnostic() {
+        use crate::{kassert, kassert_eq};
+        let mut state = one_thread_state();
+        for sig in [Signal::TRAP, Signal::SEGV] {
+            state.set_action(sig, KernelSigaction { handler: 0x400000, ..Default::default() });
+        }
+        let fault = UserFault::Trap { vector: 1, error_code: 0, rip: 0x400100, cr2: 0 };
+        state.force(9, SigInfo::fault(Signal::TRAP, 2, 0x400100), false, Some(fault));
+        state.force(9, SigInfo::new(Signal::SEGV, general::SI_KERNEL as i32), false, None);
+        let Delivery::Handler(handler) = state.next(9) else { return Err("trap handler missing") };
+        kassert_eq!(handler.fault, Some(fault));
+        kassert!(matches!(state.next(9), Delivery::Handler(_)));
+        Ok(())
+    }
+);
+
+#[cfg(feature = "ktest")]
+fn one_thread_state() -> SignalState {
+    let mut state = SignalState::new();
+    let owner = UserThread::unbound_for_ktest(Arc::clone(&lookup(INIT_PID).expect("init")));
+    state.add_thread(9, &owner, ThreadInit::ROOT);
+    state
+}

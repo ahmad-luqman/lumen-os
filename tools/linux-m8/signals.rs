@@ -4,7 +4,10 @@ use crate::common::{self, R, ensure, eq, ok, sys};
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 
-const USR1: u64 = 10;
+use crate::{
+    SIGUSR1 as USR1, SYS_FCNTL, SYS_FTRUNCATE, SYS_GETTID, SYS_KILL, SYS_MMAP, SYS_OPENAT, SYS_READ, SYS_RT_SIGACTION,
+    SYS_RT_SIGPROCMASK, SYS_RT_SIGQUEUEINFO, SYS_RT_TGSIGQUEUEINFO, SYS_SIGALTSTACK, SYS_TGKILL, SYS_TKILL,
+};
 const SEGV: u64 = 11;
 const INFO: u64 = 4;
 const RESTORER: u64 = 0x04000000;
@@ -27,6 +30,13 @@ const BAD_SS: u64 = 16;
 const RESTART_RAX: u64 = 17;
 const WAIT: u64 = 18;
 const RESET_HAND: u64 = 19;
+const SI_CODE_BYTES: usize = 8;
+const SI_ADDR_BYTES: usize = 16;
+const FP_MXCSR: usize = 24;
+const FP_MAGIC1: usize = 464;
+const FP_XSTATE_BV: usize = 512;
+const FP_XCOMP_BV: usize = 520;
+const SI_VALUE_BYTES: usize = 24;
 const UC_MCONTEXT: usize = 40;
 const MC_RAX: usize = 104;
 const MC_RSP: usize = 120;
@@ -54,6 +64,8 @@ static TRAP: AtomicU64 = AtomicU64::new(0);
 static VALUE: AtomicU64 = AtomicU64::new(0);
 static RESET_ACTION: AtomicU64 = AtomicU64::new(u64::MAX);
 #[unsafe(no_mangle)]
+static C5_TRAP_RIP: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
 static C5_RESUME: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
 static C5_STACK: AtomicU64 = AtomicU64::new(0);
@@ -72,6 +84,7 @@ unsafe extern "C" {
     fn c5_db();
     fn c5_load(addr: u64);
     fn c5_bad_stack(tid: u64);
+    fn c5_alt_clone(nr: u64, flags: u64, stack: u64, base: u64, keep: u64) -> i64;
     fn c5_fp(tid: u64, output: *mut u8, avx: u64);
     fn raise(sig: i32) -> i32;
 }
@@ -94,10 +107,15 @@ fault_start c5_de
     xor edx, edx
     mov eax, 1
     xor ecx, ecx
-    div rcx
+    lea rax, [rip + 1f]
+    mov [rip + C5_TRAP_RIP], rax
+    mov eax, 1
+1:  div rcx
 9: ret
 fault_start c5_ud
-    ud2
+    lea rax, [rip + 1f]
+    mov [rip + C5_TRAP_RIP], rax
+1:  ud2
 9: ret
 fault_start c5_bp
     int3
@@ -116,16 +134,20 @@ fault_start c5_xm
     ldmxcsr [rip + c5_unmask]
     pxor xmm0, xmm0
     movss xmm1, [rip + c5_one]
-    divss xmm1, xmm0
+    lea rax, [rip + 1f]
+    mov [rip + C5_TRAP_RIP], rax
+1:  divss xmm1, xmm0
 9:  stmxcsr [rip + C5_MXCSR]
     ldmxcsr [rip + c5_default]
     ret
 fault_start c5_db
+    lea rax, [rip + 2f]
+    mov [rip + C5_TRAP_RIP], rax
     pushfq
     or qword ptr [rsp], 0x100
     popfq
-    nop
-1:  jmp 1b
+1:  pause
+2:  jmp 1b
 9:  ret
 fault_start c5_bad_stack
     mov rsp, 0
@@ -156,6 +178,35 @@ c5_fp:
     pop r12
     pop rbx
     ret
+.global c5_alt_clone
+c5_alt_clone:
+    push r12
+    push r13
+    push r14
+    mov r12, rcx
+    mov r13, r8
+    mov r14, rdx
+    mov rax, rdi
+    mov rdi, rsi
+    mov rsi, rdx
+    xor edx, edx
+    xor r10d, r10d
+    xor r8d, r8d
+    syscall
+    test rax, rax
+    jnz 9f
+    mov rsp, r14
+    mov rdi, r12
+    mov rsi, r13
+    call c5_alt_child
+    mov edi, eax
+    mov eax, 60
+    syscall
+    ud2
+9:  pop r14
+    pop r13
+    pop r12
+    ret
 .section .rodata
 .balign 32
 c5_pattern: .quad 0x1122334455667788, 0x99aabbccddeeff00, 0x123456789abcdef0, 0xfedcba9876543210
@@ -180,29 +231,29 @@ extern "C" fn handler(sig: u64, info: *const u8, uc: *mut u8) {
     SIGNO.store(sig, SeqCst);
     // SAFETY: SA_SIGINFO provides 128 readable bytes, offsets are Linux ABI.
     unsafe {
-        CODE.store(core::ptr::read_unaligned(info.add(8).cast::<i32>()) as i64 as u64, SeqCst);
-        ADDR.store(core::ptr::read_unaligned(info.add(16).cast::<u64>()), SeqCst);
-        VALUE.store(core::ptr::read_unaligned(info.add(24).cast::<u64>()), SeqCst);
+        CODE.store(core::ptr::read_unaligned(info.add(SI_CODE_BYTES).cast::<i32>()) as i64 as u64, SeqCst);
+        ADDR.store(core::ptr::read_unaligned(info.add(SI_ADDR_BYTES).cast::<u64>()), SeqCst);
+        VALUE.store(core::ptr::read_unaligned(info.add(SI_VALUE_BYTES).cast::<u64>()), SeqCst);
     }
     let mut mask = 0u64;
-    let _ = sys(14, [0, 0, &mut mask as *mut _ as u64, 8, 0, 0]);
+    let _ = sys(SYS_RT_SIGPROCMASK, [0, 0, &mut mask as *mut _ as u64, 8, 0, 0]);
     MASK.store(mask, SeqCst);
     let mut old = [0u64; 3];
-    let _ = sys(131, [0, old.as_mut_ptr() as u64, 0, 0, 0, 0]);
+    let _ = sys(SYS_SIGALTSTACK, [0, old.as_mut_ptr() as u64, 0, 0, 0, 0]);
     STACK_STATUS.store(old[1], SeqCst);
     let disable = [0u64, 2, 0];
-    STACK_CHANGE.store(sys(131, [disable.as_ptr() as u64, 0, 0, 0, 0, 0]) as u64, SeqCst);
+    STACK_CHANGE.store(sys(SYS_SIGALTSTACK, [disable.as_ptr() as u64, 0, 0, 0, 0, 0]) as u64, SeqCst);
     let mode = MODE.load(SeqCst);
     if mode == WAIT {
         say!("signal-wait: handler");
     }
     if mode == RESET_HAND {
         let mut old = [0u64; 4];
-        let _ = sys(13, [USR1, 0, old.as_mut_ptr() as u64, 8, 0, 0]);
+        let _ = sys(SYS_RT_SIGACTION, [USR1, 0, old.as_mut_ptr() as u64, 8, 0, 0]);
         RESET_ACTION.store(old[0], SeqCst);
     }
     if mode == NESTED && count == 0 {
-        let _ = sys(200, [tid(), USR1, 0, 0, 0, 0]);
+        let _ = sys(SYS_TKILL, [tid(), USR1, 0, 0, 0, 0]);
     }
     // SAFETY: all offsets are within sigcontext or its advertised FP area.
     // Corruptions deliberately exercise sigreturn; no corrupt value is used
@@ -222,12 +273,12 @@ extern "C" fn handler(sig: u64, info: *const u8, uc: *mut u8) {
                 core::ptr::write_unaligned(mc.add(MC_RIP).cast::<u64>(), C5_RESUME.load(SeqCst));
                 core::ptr::write_unaligned(mc.add(MC_RSP).cast::<u64>(), C5_STACK.load(SeqCst));
             }
-            BAD_MXCSR => core::ptr::write_unaligned(fp.add(24).cast::<u32>(), 0x80000000),
-            BAD_XSTATE => core::ptr::write_unaligned(fp.add(512).cast::<u64>(), 1 << 63),
-            BAD_XCOMP => core::ptr::write_unaligned(fp.add(520).cast::<u64>(), 1 << 63),
+            BAD_MXCSR => core::ptr::write_unaligned(fp.add(FP_MXCSR).cast::<u32>(), 0x80000000),
+            BAD_XSTATE => core::ptr::write_unaligned(fp.add(FP_XSTATE_BV).cast::<u64>(), 1 << 63),
+            BAD_XCOMP => core::ptr::write_unaligned(fp.add(FP_XCOMP_BV).cast::<u64>(), 1 << 63),
             BAD_CS => core::ptr::write_unaligned(mc.add(MC_CS).cast::<u16>(), 8),
             BAD_RIP => core::ptr::write_unaligned(mc.add(MC_RIP).cast::<u64>(), 1 << 63),
-            FX_FALLBACK => core::ptr::write_unaligned(fp.add(464).cast::<u32>(), 0),
+            FX_FALLBACK => core::ptr::write_unaligned(fp.add(FP_MAGIC1).cast::<u32>(), 0),
             BAD_SS => core::ptr::write_unaligned(mc.add(MC_SS).cast::<u16>(), 0xffff),
             RESTART_RAX => core::ptr::write_unaligned(mc.add(MC_RAX).cast::<u64>(), (-512i64) as u64),
             _ => {}
@@ -239,16 +290,16 @@ extern "C" fn handler(sig: u64, info: *const u8, uc: *mut u8) {
 }
 
 fn tid() -> u64 {
-    sys(186, [0; 6]) as u64
+    sys(SYS_GETTID, [0; 6]) as u64
 }
 fn action(sig: u64, flags: u64, mask: u64) -> R {
     let a = [handler as *const () as u64, flags | RESTORER, c5_restorer as *const () as u64, mask];
-    eq("sigaction", sys(13, [sig, a.as_ptr() as u64, 0, 8, 0, 0]), 0)
+    eq("sigaction", sys(SYS_RT_SIGACTION, [sig, a.as_ptr() as u64, 0, 8, 0, 0]), 0)
 }
 fn altstack() -> Result<u64, common::Fail> {
-    let base = ok("mmap altstack", sys(9, [0, 32768, 3, 0x22, u64::MAX, 0]))? as u64;
+    let base = ok("mmap altstack", sys(SYS_MMAP, [0, 32768, 3, 0x22, u64::MAX, 0]))? as u64;
     let stack = [base, 0, 32768];
-    eq("sigaltstack", sys(131, [stack.as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
+    eq("sigaltstack", sys(SYS_SIGALTSTACK, [stack.as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;
     Ok(base)
 }
 fn reset(mode: u64) {
@@ -269,9 +320,9 @@ pub fn signals() -> i32 {
             reset(NORMAL);
             action(USR1, INFO, 1 << 11)?;
             for (nr, args, code) in [
-                (62, [tid(), USR1, 0, 0, 0, 0], 0),
-                (200, [tid(), USR1, 0, 0, 0, 0], -6),
-                (234, [tid(), tid(), USR1, 0, 0, 0], -6),
+                (SYS_KILL, [tid(), USR1, 0, 0, 0, 0], 0),
+                (SYS_TKILL, [tid(), USR1, 0, 0, 0, 0], -6),
+                (SYS_TGKILL, [tid(), tid(), USR1, 0, 0, 0], -6),
             ] {
                 send(nr, args)?;
                 eq("si_code", CODE.load(SeqCst) as i64, code)?;
@@ -280,22 +331,32 @@ pub fn signals() -> i32 {
             eq("deliveries", COUNT.load(SeqCst) as i64, 3)?;
             eq("handler mask", MASK.load(SeqCst) as i64, (1 << 9) | (1 << 11))?;
             let mut after = 9u64;
-            eq("get mask", sys(14, [0, 0, &mut after as *mut _ as u64, 8, 0, 0]), 0)?;
+            eq("get mask", sys(SYS_RT_SIGPROCMASK, [0, 0, &mut after as *mut _ as u64, 8, 0, 0]), 0)?;
             eq("restored mask", after as i64, 0)?;
-            eq("wrong tgid", sys(234, [tid() + 1, tid(), USR1, 0, 0, 0]), -3)?;
-            eq("bad tid", sys(200, [0, USR1, 0, 0, 0, 0]), -22)?;
-            eq("missing pid", sys(62, [32767, 0, 0, 0, 0, 0]), -3)?;
-            for (nr, args) in
-                [(62, [32767, 65, 0, 0, 0, 0]), (200, [32767, 65, 0, 0, 0, 0]), (234, [32767, 32767, 65, 0, 0, 0])]
-            {
+            eq("wrong tgid", sys(SYS_TGKILL, [tid() + 1, tid(), USR1, 0, 0, 0]), -3)?;
+            eq("bad tid", sys(SYS_TKILL, [0, USR1, 0, 0, 0, 0]), -22)?;
+            eq("missing pid", sys(SYS_KILL, [32767, 0, 0, 0, 0, 0]), -3)?;
+            for (nr, args) in [
+                (SYS_KILL, [32767, 65, 0, 0, 0, 0]),
+                (SYS_TKILL, [32767, 65, 0, 0, 0, 0]),
+                (SYS_TGKILL, [32767, 32767, 65, 0, 0, 0]),
+            ] {
                 eq("missing target before invalid signal", sys(nr, args), -3)?;
             }
             let mut info = [0u64; 16];
             info[1] = (-1i32) as u32 as u64;
-            eq("queue missing target before invalid signal", sys(129, [32767, 65, info.as_ptr() as u64, 0, 0, 0]), -3)?;
-            eq("queue copy before invalid ids", sys(297, [0, 0, 65, 1, 0, 0]), -14)?;
-            eq("queue invalid ids after valid copy", sys(297, [0, 0, 65, info.as_ptr() as u64, 0, 0]), -22)?;
-            eq("signal zero", sys(62, [tid(), 0, 0, 0, 0, 0]), 0)
+            eq(
+                "queue missing target before invalid signal",
+                sys(SYS_RT_SIGQUEUEINFO, [32767, 65, info.as_ptr() as u64, 0, 0, 0]),
+                -3,
+            )?;
+            eq("queue copy before invalid ids", sys(SYS_RT_TGSIGQUEUEINFO, [0, 0, 65, 1, 0, 0]), -14)?;
+            eq(
+                "queue invalid ids after valid copy",
+                sys(SYS_RT_TGSIGQUEUEINFO, [0, 0, 65, info.as_ptr() as u64, 0, 0]),
+                -22,
+            )?;
+            eq("signal zero", sys(SYS_KILL, [tid(), 0, 0, 0, 0, 0]), 0)
         }),
         ("raise_without_siginfo", &|| {
             reset(NORMAL);
@@ -308,40 +369,40 @@ pub fn signals() -> i32 {
             reset(NORMAL);
             action(USR1, INFO, 0)?;
             let mask = 1u64 << 9;
-            eq("block", sys(14, [0, &mask as *const _ as u64, 0, 8, 0, 0]), 0)?;
+            eq("block", sys(SYS_RT_SIGPROCMASK, [0, &mask as *const _ as u64, 0, 8, 0, 0]), 0)?;
             let mut info = [0u64; 16];
             info[1] = (-1i32) as u32 as u64;
             info[3] = 0xabc;
-            send(129, [tid(), 0, info.as_ptr() as u64, 0, 0, 0])?;
-            send(297, [tid(), tid(), 0, info.as_ptr() as u64, 0, 0])?;
+            send(SYS_RT_SIGQUEUEINFO, [tid(), 0, info.as_ptr() as u64, 0, 0, 0])?;
+            send(SYS_RT_TGSIGQUEUEINFO, [tid(), tid(), 0, info.as_ptr() as u64, 0, 0])?;
             eq("signal zero queues nothing", COUNT.load(SeqCst) as i64, 0)?;
-            send(129, [tid(), USR1, info.as_ptr() as u64, 0, 0, 0])?;
+            send(SYS_RT_SIGQUEUEINFO, [tid(), USR1, info.as_ptr() as u64, 0, 0, 0])?;
             eq("blocked", COUNT.load(SeqCst) as i64, 0)?;
-            eq("unblock", sys(14, [1, &mask as *const _ as u64, 0, 8, 0, 0]), 0)?;
+            eq("unblock", sys(SYS_RT_SIGPROCMASK, [1, &mask as *const _ as u64, 0, 8, 0, 0]), 0)?;
             eq("delivered on unblock", COUNT.load(SeqCst) as i64, 1)?;
             eq("queued value", VALUE.load(SeqCst) as i64, 0xabc)?;
-            send(297, [tid(), tid(), USR1, info.as_ptr() as u64, 0, 0])?;
+            send(SYS_RT_TGSIGQUEUEINFO, [tid(), tid(), USR1, info.as_ptr() as u64, 0, 0])?;
             eq("thread queue", COUNT.load(SeqCst) as i64, 2)
         }),
         ("nodefer_and_resethand", &|| {
             reset(NESTED);
             action(USR1, INFO | NODEFER, 0)?;
-            send(200, [tid(), USR1, 0, 0, 0, 0])?;
+            send(SYS_TKILL, [tid(), USR1, 0, 0, 0, 0])?;
             eq("nested handler", COUNT.load(SeqCst) as i64, 2)?;
             eq("nodefer mask", MASK.load(SeqCst) as i64, 0)?;
             reset(RESET_HAND);
             action(USR1, INFO | RESETHAND, 0)?;
-            send(200, [tid(), USR1, 0, 0, 0, 0])?;
+            send(SYS_TKILL, [tid(), USR1, 0, 0, 0, 0])?;
             eq("reset before handler", RESET_ACTION.load(SeqCst) as i64, 0)?;
             let mut old = [0u64; 4];
-            eq("read reset action", sys(13, [USR1, 0, old.as_mut_ptr() as u64, 8, 0, 0]), 0)?;
+            eq("read reset action", sys(SYS_RT_SIGACTION, [USR1, 0, old.as_mut_ptr() as u64, 8, 0, 0]), 0)?;
             eq("reset before return", old[0] as i64, 0)
         }),
         ("alternate_stack", &|| {
             let base = altstack()?;
             reset(NORMAL);
             action(USR1, INFO | ONSTACK, 0)?;
-            send(200, [tid(), USR1, 0, 0, 0, 0])?;
+            send(SYS_TKILL, [tid(), USR1, 0, 0, 0, 0])?;
             ensure(
                 "handler stack",
                 (base..base + 32768).contains(&HANDLER_SP.load(SeqCst)),
@@ -350,12 +411,15 @@ pub fn signals() -> i32 {
             eq("SS_ONSTACK", STACK_STATUS.load(SeqCst) as i64, 1)?;
             eq("onstack change EPERM", STACK_CHANGE.load(SeqCst) as i64, -1)
         }),
+        ("fork_altstack", &|| inherited_altstack(crate::SYS_FORK, true)),
+        ("vfork_altstack", &|| inherited_altstack(crate::SYS_VFORK, true)),
+        ("clone_vm_clears_altstack", &|| inherited_altstack(crate::SYS_CLONE, false)),
         ("fp_and_mxcsr", &|| fp_check(NORMAL)),
         ("sigreturn_ss_sanitized", &|| fp_check(BAD_SS)),
         ("sigreturn_rax_is_not_restart", &|| {
             reset(RESTART_RAX);
             action(USR1, INFO, 0)?;
-            eq("restored rax", sys(200, [tid(), USR1, 0, 0, 0, 0]), -512)
+            eq("restored rax", sys(SYS_TKILL, [tid(), USR1, 0, 0, 0, 0]), -512)
         }),
         ("force_sigsegv", &|| {
             let _ = altstack()?;
@@ -432,14 +496,14 @@ pub fn faults() -> i32 {
         }),
         ("maperr", &|| memory_fault(0x12345000, 11, 1)),
         ("accerr", &|| {
-            let p = ok("mmap PROT_NONE", sys(9, [0, 4096, 0, 0x22, u64::MAX, 0]))?;
+            let p = ok("mmap PROT_NONE", sys(SYS_MMAP, [0, 4096, 0, 0x22, u64::MAX, 0]))?;
             memory_fault(p as u64, 11, 2)
         }),
         ("bus", &|| {
             let path = b"/tmp/c5-bus\0";
-            let fd = ok("open bus", sys(257, [(-100i64) as u64, path.as_ptr() as u64, 0x242, 0o600, 0, 0]))?;
-            eq("truncate", sys(77, [fd as u64, 4096, 0, 0, 0, 0]), 0)?;
-            let p = ok("mmap file", sys(9, [0, 8192, 1, 1, fd as u64, 0]))?;
+            let fd = ok("open bus", sys(SYS_OPENAT, [(-100i64) as u64, path.as_ptr() as u64, 0x242, 0o600, 0, 0]))?;
+            eq("truncate", sys(SYS_FTRUNCATE, [fd as u64, 4096, 0, 0, 0, 0]), 0)?;
+            let p = ok("mmap file", sys(SYS_MMAP, [0, 8192, 1, 1, fd as u64, 0]))?;
             memory_fault(p as u64 + 4096, 7, 2)
         }),
         ("db", &|| {
@@ -449,8 +513,8 @@ pub fn faults() -> i32 {
             unsafe {
                 c5_db();
             }
-            // The trap and the deferred IPI both point at the one-instruction
-            // spin loop; the handler resumes at the saved return label.
+            // Single-step PAUSE: si_addr must name the following jump. The
+            // later interrupt may stop at either instruction in the loop.
             eq("debug handler", COUNT.load(SeqCst) as i64, 1)?;
             check_fault(5, 2, None)?;
             metadata(1, 0, 0)
@@ -474,7 +538,10 @@ fn check_fault(sig: u64, code: i64, addr: Option<u64>) -> R {
     if let Some(addr) = addr {
         eq("fault address", ADDR.load(SeqCst) as i64, addr as i64)?;
     } else {
-        eq("fault instruction address", ADDR.load(SeqCst) as i64, SAVED_RIP.load(SeqCst) as i64)?;
+        eq("fault instruction address", ADDR.load(SeqCst) as i64, C5_TRAP_RIP.load(SeqCst) as i64)?;
+        if TRAP.load(SeqCst) != 1 {
+            eq("fault context RIP", SAVED_RIP.load(SeqCst) as i64, C5_TRAP_RIP.load(SeqCst) as i64)?;
+        }
     }
     Ok(())
 }
@@ -499,7 +566,7 @@ pub fn bad(kind: &[u8]) -> i32 {
         // A SEGV frame that cannot be built must reset the SEGV action and
         // terminate, rather than retrying the same unusable handler forever.
         let broken = [handler as *const () as u64, INFO, 0, 0];
-        let _ = sys(13, [SEGV, broken.as_ptr() as u64, 0, 8, 0, 0]);
+        let _ = sys(SYS_RT_SIGACTION, [SEGV, broken.as_ptr() as u64, 0, 8, 0, 0]);
         // SAFETY: deliberate unmapped load; no handler can return from it.
         unsafe {
             c5_load(0x12345000);
@@ -522,7 +589,7 @@ pub fn bad(kind: &[u8]) -> i32 {
     if action(USR1, INFO, 0).is_err() {
         return 90;
     }
-    let _ = sys(200, [tid(), USR1, 0, 0, 0, 0]);
+    let _ = sys(SYS_TKILL, [tid(), USR1, 0, 0, 0, 0]);
     say!("FAIL malformed sigreturn survived");
     99
 }
@@ -532,10 +599,10 @@ pub fn fatal(kind: &[u8]) -> i32 {
     }
     if kind == b"blocked" {
         let mask = 1u64 << 10;
-        let _ = sys(14, [0, &mask as *const _ as u64, 0, 8, 0, 0]);
+        let _ = sys(SYS_RT_SIGPROCMASK, [0, &mask as *const _ as u64, 0, 8, 0, 0]);
     } else {
         let ignore = [1u64, 0, 0, 0];
-        let _ = sys(13, [SEGV, ignore.as_ptr() as u64, 0, 8, 0, 0]);
+        let _ = sys(SYS_RT_SIGACTION, [SEGV, ignore.as_ptr() as u64, 0, 8, 0, 0]);
     }
     // SAFETY: intended unmapped load must terminate before returning.
     unsafe {
@@ -549,18 +616,19 @@ pub fn hold() -> i32 {
         Err(_) => return 90,
     };
     let lock = [1u64, 0, 0, 0]; // F_WRLCK, SEEK_SET, through EOF
-    if sys(72, [fd, 6, lock.as_ptr() as u64, 0, 0, 0]) != 0 {
+    if sys(SYS_FCNTL, [fd, 6, lock.as_ptr() as u64, 0, 0, 0]) != 0 {
         return 91;
     }
     say!("signal-hold: pid={} ready", tid());
     let mut byte = 0u8;
-    let _ = sys(0, [0, &mut byte as *mut _ as u64, 1, 0, 0, 0]);
+    let _ = sys(SYS_READ, [0, &mut byte as *mut _ as u64, 1, 0, 0, 0]);
     say!("signal-hold: done");
     0
 }
 fn lock_file() -> Result<u64, common::Fail> {
     let path = b"/tmp/c5-restart\0";
-    ok("open lock file", sys(257, [(-100i64) as u64, path.as_ptr() as u64, 0x42, 0o600, 0, 0])).map(|fd| fd as u64)
+    ok("open lock file", sys(SYS_OPENAT, [(-100i64) as u64, path.as_ptr() as u64, 0x42, 0o600, 0, 0]))
+        .map(|fd| fd as u64)
 }
 pub fn wait(restart: bool) -> i32 {
     common::run_checks(&[(if restart { "sa_restart" } else { "eintr" }, &|| {
@@ -569,23 +637,27 @@ pub fn wait(restart: bool) -> i32 {
         let fd = lock_file()?;
         let lock = [1u64, 0, 0, 0];
         say!("signal-wait: pid={} ready", tid());
-        let result = sys(72, [fd, 7, lock.as_ptr() as u64, 0, 0, 0]);
+        let result = sys(SYS_FCNTL, [fd, 7, lock.as_ptr() as u64, 0, 0, 0]);
         eq("interrupted lock result", result, if restart { 0 } else { -4 })?;
         eq("handler ran", COUNT.load(SeqCst) as i64, 1)
     })])
 }
 pub fn kill(arg: &[u8]) -> i32 {
     let pid = parse_pid(arg);
-    common::run_checks(&[("send_usr1", &|| send(62, [pid, USR1, 0, 0, 0, 0]))])
+    common::run_checks(&[("send_usr1", &|| send(SYS_KILL, [pid, USR1, 0, 0, 0, 0]))])
 }
 pub fn probe(arg: &[u8]) -> i32 {
     let pid = parse_pid(arg);
     common::run_checks(&[("sigqueue_permission", &|| {
         let mut info = [0u64; 16];
         info[1] = 128;
-        eq("positive code to another process", sys(129, [pid, USR1, info.as_ptr() as u64, 0, 0, 0]), -1)?;
+        eq(
+            "positive code to another process",
+            sys(SYS_RT_SIGQUEUEINFO, [pid, USR1, info.as_ptr() as u64, 0, 0, 0]),
+            -1,
+        )?;
         info[1] = (-6i32) as u32 as u64;
-        eq("SI_TKILL to another process", sys(129, [pid, USR1, info.as_ptr() as u64, 0, 0, 0]), -1)
+        eq("SI_TKILL to another process", sys(SYS_RT_SIGQUEUEINFO, [pid, USR1, info.as_ptr() as u64, 0, 0, 0]), -1)
     })])
 }
 
@@ -603,4 +675,44 @@ pub fn spin() -> i32 {
         }
         eq("handler ran", COUNT.load(SeqCst) as i64, 1)
     })])
+}
+
+fn inherited_altstack(nr: u64, keep: bool) -> R {
+    let base = altstack()?;
+    let child_stack = ok("child stack", sys(SYS_MMAP, [0, 32768, 3, 0x22, u64::MAX, 0]))? as u64;
+    reset(NORMAL);
+    action(USR1, INFO | ONSTACK, 0)?;
+    // SAFETY: the child switches to its own writable stack before calling Rust;
+    // the vfork child exits in assembly and never touches the parent's stack.
+    let pid = ok("clone altstack", unsafe {
+        c5_alt_clone(nr, crate::CLONE_VM | crate::SIGCHLD, child_stack + 32768, base, u64::from(keep))
+    })?;
+    crate::wait(pid, 0)?;
+    let mut old = [0u64; 3];
+    eq("parent sigaltstack", sys(SYS_SIGALTSTACK, [0, old.as_mut_ptr() as u64, 0, 0, 0, 0]), 0)?;
+    eq("parent stack retained", old[0] as i64, base as i64)?;
+    eq("parent stack flags", old[1] as i64, 0)?;
+    eq("unmap child stack", sys(crate::SYS_MUNMAP, [child_stack, 32768, 0, 0, 0, 0]), 0)
+}
+#[unsafe(no_mangle)]
+extern "C" fn c5_alt_child(base: u64, keep: u64) -> i32 {
+    let mut old = [0u64; 3];
+    if sys(SYS_SIGALTSTACK, [0, old.as_mut_ptr() as u64, 0, 0, 0, 0]) != 0 {
+        return 81;
+    }
+    let expected = if keep != 0 { [base, 0, 32768] } else { [0, 2, 0] };
+    if old != expected {
+        return 82;
+    }
+    if sys(SYS_TKILL, [tid(), USR1, 0, 0, 0, 0]) != 0 {
+        return 83;
+    }
+    if COUNT.load(SeqCst) != 1 {
+        return 84;
+    }
+    let on_stack = (base..base + 32768).contains(&HANDLER_SP.load(SeqCst));
+    if on_stack != (keep != 0) {
+        return 85;
+    }
+    0
 }

@@ -1,18 +1,19 @@
-//! Signal delivery on syscall and non-IST interrupt returns. Queue transitions
+//! Signal delivery on syscall, fork-entry and non-IST interrupt returns. Queue transitions
 //! are serialized by the process signal lock; frames and user copies happen
 //! after releasing it. Restart context is consumed once, never after sigreturn.
 
-pub mod frame;
 use crate::linux::{general, process};
 use lumen_signal::restart::{Handling, RESTART_SYSCALL, RestartCode, RestartDecision, SyscallExit, decide};
 use lumen_signal::{Signal, pending::SigInfo};
 
 use crate::arch;
+use crate::arch::percpu::DebugCode;
 use crate::arch::syscall::SyscallFrame;
 use crate::linux::errno;
 use crate::sched;
 use crate::user::{UserFault, vector_signal};
-use core::num::NonZeroU8;
+
+pub mod frame;
 
 /// What `restart_syscall` resumes (Linux's `struct restart_block`): set by
 /// a handler that returns `-ERESTART_RESTARTBLOCK` (a nanosleep's, a timed
@@ -78,7 +79,7 @@ pub fn exit_to_user(frame: &mut SyscallFrame, mut syscall: Option<SyscallExit>) 
                     rewritten = true;
                     syscall = None;
                 }
-                Err(sig) => force_sigsegv(Some(sig)),
+                Err(failure) => force_sigsegv(Some(failure.signal), failure.reason),
             },
         }
     }
@@ -117,14 +118,8 @@ pub fn force_fault(info: SigInfo, fault: Option<UserFault>) {
 
 /// A failed SEGV frame resets its disposition. Other failures may be caught
 /// by an unblocked SEGV handler, for example on an alternate stack.
-pub fn force_sigsegv(failed: Option<Signal>) {
-    let me = process::current_thread();
-    me.process().force_signal(
-        me.tid(),
-        SigInfo::new(Signal::SEGV, general::SI_KERNEL as i32),
-        failed == Some(Signal::SEGV),
-        None,
-    );
+pub fn force_sigsegv(failed: Option<Signal>, reason: frame::FailureReason) {
+    process::current_thread().force_frame_failure(failed, reason);
 }
 
 fn terminate(sig: Signal, fault: Option<UserFault>) -> ! {
@@ -133,8 +128,21 @@ fn terminate(sig: Signal, fault: Option<UserFault>) -> ! {
     if is_test {
         crate::user::note_exit_status(128 + sig.number() as i32);
     }
-    if let Some(fault) = fault {
-        log::warn!(target: "user", "pid {pid}: killed by signal {}: {:?}", sig.number(), fault.into_exit());
+    let failure = process::current_thread().take_frame_failure();
+    if let Some(failure) = failure.filter(|_| sig == Signal::SEGV) {
+        log::info!(target: "signal", "pid {pid}: could not deliver SIG{}: {}", failure.signal.number(), failure.reason);
+    } else if let Some(fault) = fault {
+        match fault {
+            UserFault::Trap { vector, error_code, rip, cr2 } => {
+                log::warn!(target: "user", "pid {pid}: killed by signal {}: trap {vector} error={error_code:#x} rip={rip:#x} cr2={cr2:#x}", sig.number())
+            }
+            UserFault::Bus { rip, cr2, error_code } => {
+                log::warn!(target: "user", "pid {pid}: killed by signal 7: file-backed page fault error={error_code:#x} rip={rip:#x} cr2={cr2:#x}")
+            }
+            UserFault::NonCanonicalRip(rip) => {
+                log::warn!(target: "user", "pid {pid}: killed by signal 11: invalid user return rip={rip:#x}")
+            }
+        }
     }
     // SAFETY: signal delivery runs on the current user's kernel stack; all
     // signal/table guards and owning references have been dropped.
@@ -142,9 +150,9 @@ fn terminate(sig: Signal, fault: Option<UserFault>) -> ! {
 }
 
 /// Queue a deferred debug signal using the original trap's address.
-pub fn force_debug_trap(code: NonZeroU8, rip: u64) {
+pub fn force_debug_trap(code: DebugCode, rip: u64) {
     force_fault(
-        SigInfo::fault(Signal::TRAP, i32::from(code.get()), rip),
+        SigInfo::fault(Signal::TRAP, i32::from(code.to_raw()), rip),
         Some(UserFault::Trap { vector: 1, error_code: 0, rip, cr2: 0 }),
     );
 }

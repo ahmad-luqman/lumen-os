@@ -47,6 +47,15 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
 use common::{R, eq, ok, sys};
 use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
+const SYS_READ: u64 = 0;
+const SYS_KILL: u64 = 62;
+const SYS_FTRUNCATE: u64 = 77;
+const SYS_RT_SIGQUEUEINFO: u64 = 129;
+const SYS_SIGALTSTACK: u64 = 131;
+const SYS_TKILL: u64 = 200;
+const SYS_TGKILL: u64 = 234;
+const SYS_OPENAT: u64 = 257;
+const SYS_RT_TGSIGQUEUEINFO: u64 = 297;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_POLL: u64 = 7;

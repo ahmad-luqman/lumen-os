@@ -218,8 +218,7 @@ struct UserThreadState {
     fs_base: AtomicU64,
     kernel_rsp: AtomicU64,
     user_exit_rsp: AtomicU64,
-    pending_debug_trap: AtomicU8,
-    pending_debug_rip: AtomicU64,
+    pending_debug_trap: arch::percpu::AtomicDebugTrap,
     /// The Linux thread it runs ([`set_current_user_thread`]): `None` until
     /// a root registers; fork children get it at spawn. None again after
     /// takedown, and for a ktest's
@@ -242,8 +241,7 @@ impl UserThreadState {
             fs_base: AtomicU64::new(0),
             kernel_rsp: AtomicU64::new(0),
             user_exit_rsp: AtomicU64::new(0),
-            pending_debug_trap: AtomicU8::new(0),
-            pending_debug_rip: AtomicU64::new(0),
+            pending_debug_trap: arch::percpu::AtomicDebugTrap::new(),
             linux: None,
             restart: UnsafeCell::new(None),
         }
@@ -1721,9 +1719,7 @@ unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thre
         unsafe { pu.save_fpu() };
         pu.kernel_rsp.store(arch::percpu::kernel_rsp(), Ordering::Relaxed);
         pu.user_exit_rsp.store(arch::percpu::user_exit_rsp(), Ordering::Relaxed);
-        let debug = arch::percpu::take_pending_debug_trap();
-        pu.pending_debug_trap.store(debug.map_or(0, |t| t.code.get()), Ordering::Relaxed);
-        pu.pending_debug_rip.store(debug.map_or(0, |t| t.rip), Ordering::Relaxed);
+        pu.pending_debug_trap.store(arch::percpu::take_pending_debug_trap());
     }
 
     // 2. Switch CR3 to `next`'s AddressSpace root or back to `kernel_root()`,
@@ -1746,10 +1742,7 @@ unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thre
         }
         arch::percpu::set_kernel_rsp(krsp);
         arch::percpu::set_user_exit_rsp(nu.user_exit_rsp.load(Ordering::Relaxed));
-        arch::percpu::set_pending_debug_trap(
-            core::num::NonZeroU8::new(nu.pending_debug_trap.load(Ordering::Relaxed))
-                .map(|code| arch::percpu::DebugTrap { code, rip: nu.pending_debug_rip.load(Ordering::Relaxed) }),
-        );
+        arch::percpu::set_pending_debug_trap(nu.pending_debug_trap.take());
     } else {
         // SAFETY: interrupts are off on `cpu`; clearing user state for kernel/idle.
         unsafe {

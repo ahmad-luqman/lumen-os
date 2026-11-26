@@ -1870,7 +1870,8 @@ the syscalls.
   (section 8), run on returns to ring 3 with interrupts on, excluding
   `IST_VECTORS` (debug, NMI, double fault and machine check): at the
   end of each syscall (`SyscallExit::new(orig_rax)` as the syscall
-  context), and when `lumen_isr_common` returns to ring 3 from an
+  context), before a fork child's first IRET (`lumen_fork_exit_to_user`,
+  context `None`), and when `lumen_isr_common` returns to ring 3 from an
   interrupt or exception (context `None`), the timer's preemption
   included. Interrupt returns skip the hook when neither `sigpending` nor
   a deferred debug trap is set. Syscall returns always check once (also
@@ -1963,9 +1964,9 @@ the syscalls.
   `frame::restore(bytes, fp, config, alt_stack, entry_rsp)` with
   `RestoreConfig { current_rflags: the user's r11 at entry, user_cs,
   user_ss, mxcsr_mask, enabled_xfeatures: XCR0, xsave_size, xfeature_layout
-  }` (the last four read from `FXSAVE`'s `MXCSR_MASK` field, 0xFFBF when it
-  is 0, and CPUID leaf 0Dh during each `rt_sigreturn`; the enabled mode
-  and size were configured at boot). A `Restored`: the
+  }`: `mxcsr_mask` comes from the thread's saved FP image (0xFFBF when
+  zero); the AVX layout comes from CPUID leaf 0Dh on each call; XCR0 and
+  the configured size come from the boot-selected `fpu::mode()`. A `Restored`: the
   mask and alternate stack installed under the `signal` lock; its
   `ValidatedFp` bytes copied into the thread's aligned buffer and restored
   with its `FpKind` (with an FX-only fallback on an XSAVE CPU, every
@@ -4424,7 +4425,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | # | Syscall | M8 behaviour | Issue |
 |---|---|---|---|
 | 7 | `poll(fds, nfds, timeout_ms)` | every descriptor through the readiness interface (section 10); `nfds` is the low 32 bits, past `RLIMIT_NOFILE` (1024) `-EINVAL`; a bad `fds` `-EFAULT`; `timeout_ms < 0` waits forever; per entry: `fd < 0` gives `revents` 0, a closed or `O_PATH` fd `POLLNVAL`, else the mask masked by `events \| POLLERR \| POLLHUP`; only each entry's `revents` is written back, including after an interrupt; an interrupted `poll` with an unwritable `fds` is `-EFAULT` with no restart block; returns how many entries have `revents`, 0 on timeout; interrupted `-ERESTART_RESTARTBLOCK` (the deadline in the restart block, stored and returned through `Err(linux::signal::interrupted_with(block))`), as Linux's `poll` | B3 |
-| 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | `sigsetsize != 8` is `-EINVAL`; copy `act` first (`-EFAULT` precedes invalid `sig`); `sig` outside 1..=64 is `-EINVAL`; atomically swap the action under `signal`, then copy `oldact` (its `-EFAULT` does not undo the install); unknown `sa_flags` bits are cleared before storing (and in `oldact`), as Linux's `do_sigaction` does; `SIG_IGN`, or `SIG_DFL` on a default-ignored signal, discards that signal's pending entries (`PendingSignals::disposition_changed`); `SA_RESTORER` is needed to deliver a handler (`frame::build`'s `MissingRestorer` forces `SIGSEGV`; musl always sets it); `SA_NOCLDWAIT` or `SIG_IGN` on `SIGCHLD` makes `ProcTree::exit` reap the children (`autoreap`) | C5 |
+| 13 | `rt_sigaction(sig, act, oldact, sigsetsize)` | `sigsetsize != 8` is `-EINVAL`; copy `act` first (`-EFAULT` precedes invalid `sig`); `sig` outside 1..=64 is `-EINVAL`; a non-null `act` for `SIGKILL`/`SIGSTOP` is `-EINVAL`; atomically swap the action under `signal`, then copy `oldact` (its `-EFAULT` does not undo the install); unknown `sa_flags` bits are cleared before storing (and in `oldact`), as Linux's `do_sigaction` does; `SIG_IGN`, or `SIG_DFL` on a default-ignored signal, discards that signal's pending entries (`PendingSignals::disposition_changed`); `SA_RESTORER` is needed to deliver a handler (`frame::build`'s `MissingRestorer` forces `SIGSEGV`; musl always sets it); `SA_NOCLDWAIT` or `SIG_IGN` on `SIGCHLD` makes `ProcTree::exit` reap the children (`autoreap`) | C5 |
 | 14 | `rt_sigprocmask(how, set, oldset, sigsetsize)` | `sigsetsize != 8` is `-EINVAL`; copy `set` first (`-EFAULT` precedes bad `how`); `Blocked::apply` (a bad `how` is `-EINVAL` when `set` is non-null), then copy `oldset` (its `-EFAULT` does not undo the mask); unblocking a pending signal sets `sigpending`, so it is delivered before the call returns | C5 |
 | 15 | `rt_sigreturn()` | section 6, "Signals"; returns the restored `rax`; a frame `restore` refuses forces `SIGSEGV` | C5 |
 | 16 | `ioctl(fd, req, arg)` | M7's, plus `FIONREAD` on a pipe (`Pipe::fionread`) and the tty requests on PTYs and on the console as a tty (section 10, including the census's `TCFLSH`) | C7, C9, C10 |
@@ -4446,7 +4447,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 59 | `execve(path, argv, envp)` | section 8, "`execve`" | C2 |
 | 60 | `exit(status)` | ends the calling thread only; the last thread's exit ends the process (section 8, "Exit") | C1, C3 |
 | 61 | `wait4(pid, wstatus, options, rusage)` | section 8, "`wait4` and `waitid`" | C1, C6 |
-| 62 | `kill(pid, sig)` | `pid > 0` the process, 0 the caller's group, -1 every process but pid 1 and the caller, `< -1` the group `-pid`; `sig` outside 0..=64 `-EINVAL`; nothing found `-ESRCH`; `sig` 0 only checks; `SI_USER` with the caller's pid (`SenderClass::SiUser`) | C5, C8 |
+| 62 | `kill(pid, sig)` | `pid > 0` the process, 0 the caller's group, -1 every process but pid 1 and the caller, `< -1` the group `-pid`; nothing found `-ESRCH` before checking `sig` outside 0..=64 (`-EINVAL`); `sig` 0 only checks; `SI_USER` with the caller's pid (`SenderClass::SiUser`) | C5, C8 |
 | 72 | `fcntl(fd, cmd, arg)` | M7's, plus `F_SETPIPE_SZ` (1031: `Pipe::set_capacity` with `DEFAULT_MAX_CAPACITY`, 1 MiB, as the bound for everyone, `-EPERM` past it, a deviation for root, whom Linux lets past `pipe-max-size`; fewer bytes than are queued `-EBUSY`) and `F_GETPIPE_SZ` (1032), both `-EBADF` on anything but a pipe; `F_SETFL`'s `O_NONBLOCK` on pipes and ttys; `F_SETLKW` interrupted `-ERESTARTSYS` | B2, C7 |
 | 73 | `flock(fd, op)` | M7's; a blocking request interrupted `-ERESTARTSYS` | B2 |
 | 76, 77 | `truncate`, `ftruncate` | M7's, invalidating the mappings of every address space that maps the file (section 5) | B7 |
@@ -4493,7 +4494,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 273, 274 | `set_robust_list`, `get_robust_list` | section 8, "`futex`" | C4 |
 | 292 | `dup3(oldfd, newfd, flags)` | `flags` other than `O_CLOEXEC` `-EINVAL`; `oldfd == newfd` `-EINVAL`; else `dup2` with `FD_CLOEXEC` from `flags` | C7 |
 | 293 | `pipe2(fds, flags)` | `O_CLOEXEC` and `O_NONBLOCK` (each end's own description); `O_DIRECT` (packet mode: a deviation) and any other flag `-EINVAL`; two slots reserved first (`-EMFILE`); a bad `fds` `-EFAULT`, both descriptors closed again; section 10 | C7 |
-| 297 | `rt_tgsigqueueinfo(tgid, tid, sig, info)` | as `rt_sigqueueinfo`, to one thread | C5 |
+| 297 | `rt_tgsigqueueinfo(tgid, tid, sig, info)` | copy `info` first (`-EFAULT`); then `tgid`/`tid <= 0` gives `-EINVAL`; otherwise as `rt_sigqueueinfo`, to one thread | C5 |
 | 302 | `prlimit64(pid, res, new, old)` | M6's checks; a write to `RLIMIT_STACK` (`rlim_cur > rlim_max` `-EINVAL`) is kept and used by the next `execve` (its stack and argument budget, section 8); every other resource's write is still checked and ignored until M10. The census: gcc and g++ raise the stack to 64 MiB and `cc1`/`cc1plus` read it back | C12 |
 | 309 | `getcpu(cpu, node, cache)` | the current CPU's index and node 0 (either pointer may be `NULL`); with no vDSO, musl's `sched_getcpu` makes this syscall | C12 |
 | 324 | `membarrier(cmd, flags, cpu_id)` | **`-ENOSYS`**: musl registers `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED` when it starts a thread, ignores the result, and its barrier falls back to signalling each thread (the census: git, pthread, vim over the pty) | — |
@@ -4682,12 +4683,13 @@ struct Shared {
     members: Vec<u32>,                      // pid, or 0 before linking
 }
 pub struct FsState { inner: SpinLock<FsInner> }  // FsInner { cwd: Cwd, umask: u16 }
+enum GroupEnd { Exit, Signal(Signal) }
 pub struct SignalState {
     actions: [KernelSigaction; 64],
     pending: PendingSignals,                 // shared queue and one per thread
     threads: BTreeMap<u32, ThreadSignals>,   // by tid
     preferred: Option<ThreadSlot>,           // select_target's cursor
-    group_exit: Option<ExitStatus>,          // the first one wins
+    group_exit: Option<GroupEnd>,            // first-wins exit/signal decision
     exec_waiter: Option<u32>,                // the tid in de_thread
     group_stop: Option<GroupStop>,           // signal, threads to park, generation
     timers: Timers,                          // ITIMER_REAL and POSIX timers (C13)
@@ -4696,11 +4698,13 @@ pub struct SignalState {
 }
 pub struct ThreadSignals {
     slot: ThreadSlot,                        // lumen_signal::pending's
-    thread: Weak<sched::Thread>,             // for sigpending and kick
+    thread: Arc<SpinLock<Weak<sched::Thread>>>, // shared notification handle
     blocked: Blocked,
     real_blocked: Option<Blocked>,           // the mask before rt_sigtimedwait
     saved_mask: Option<Blocked>,             // rt_sigsuspend/ppoll/pselect6's
     alt_stack: AltStack,
+    fault: Option<UserFault>,               // last synchronous diagnostic
+    frame_failure: Option<FrameFailure>,    // failed delivery/sigreturn origin
     stop_pending: bool,                      // in group_stop's count, not parked
     stop_dequeued: bool,                     // a stop signal dequeued; SIGCONT clears
 }
@@ -4710,6 +4714,7 @@ pub struct UserThread {
     clear_child_tid: AtomicU64,              // set_tid_address, CHILD_CLEARTID
     robust_list: AtomicU64,                  // set_robust_list's head (C4)
     kernel_thread: AtomicU64,                // its sched::Thread's id (ps, ktests)
+    kernel_handle: Arc<SpinLock<Weak<sched::Thread>>>, // bound before runnable
 }
 ```
 
@@ -4865,7 +4870,15 @@ and `kill(-1, sig)` skips it.
 `exit` (60) ends the calling thread only (M7 ended the whole process in
 that arm); `exit_group` (231) and a fatal signal end the group:
 
-1. The first of them records `group_exit` under `signal`, in a hold that
+1. The first end decision records `group_exit: Option<GroupEnd>` under
+   `signal`: `Exit` for an ordinary exit, `Signal(sig)` for a fatal signal.
+   `record_exit` inserts `Exit` only if unset, refines a prior `Signal(sig)`
+   to that signal's matching fault diagnostic (otherwise `Signaled(sig)`),
+   and inserts `Process::exit` only if unset. `take_exit` only takes that
+   recorded outcome; it never merges later signal state. Once ending,
+   sends succeed without queueing (including sends to zombies), after the
+   target's existence check; a later SIGKILL cannot replace `Exited(n)`.
+   C3 extends group teardown in a hold that
    re-checks first, as Linux's `do_group_exit` re-checks under `siglock`:
    a `group_exit` already recorded wins (this thread takes its status and
    goes to step 2); an `exec_waiter` naming another thread (`de_thread`,
@@ -5040,7 +5053,8 @@ before `ProcTree::fork`, which can't be undone (lumen-proc has no
 3. write `parent_tid`, then open the start gate.
 
 The child's `SignalState` copies the dispositions, the caller's mask and
-alternate stack, the controlling terminal and `rlimit_stack`; it has an
+alternate stack (cleared only for `CLONE_VM` without `CLONE_VFORK`),
+the controlling terminal and `rlimit_stack`; it has an
 empty pending set and no timers (neither `timer_create`'s nor
 `ITIMER_REAL`: not inherited, as on Linux). The child's registers are the
 parent's at the `syscall`, with `rax` = 0 and `rsp` = `newsp` if
@@ -10879,13 +10893,25 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
     `CR0.AM`, which Lumen doesn't set), `#MF` (an x87 exception with
     `CR0.NE`) and the out-of-memory `SIGKILL`. Real `#SS` delivery is not
     tested under TCG (the non-canonical push raises `#GP`), nor real `#XM`
-    delivery (TCG sets its status without trapping).
+    delivery (TCG sets its status without trapping). `ok ss` accepts TCG's
+    #GP fallback and `ok xm` accepts its checked unmasked-status fallback;
+    neither line claims that TCG delivered #SS/#XM.
     `ktest:lumen_kernel::linux::signal::frame::stack_and_simd_exceptions_map_to_signals`
     checks these mappings and that a spurious `#MF`/`#XM` sends nothing.
   - `ktest:lumen_kernel::linux::process::fork_child_fault_is_delivered_and_reaped`
     checks a fork child's `#UD` signal and wait status;
     `ktest:lumen_kernel::linux::process::kill_wakes_fork_child_and_wins_over_exit`
-    checks a blocking fork child wakes on `SIGKILL` and the signal wins over exit.
+    checks a killable fork child wakes on `fatal_pending` and SIGKILL wins
+    over a later exit. `recorded_exit_wins_over_later_signals` checks the
+    reverse ordering and discarding sends to ending processes/zombies.
+    `fork_pending_signal_precedes_first_user_instruction` checks the fork
+    return hook delivers before entry. The guest's `fork_altstack`,
+    `vfork_altstack` and `clone_vm_clears_altstack` query inherited stack
+    state and check where the child's SA_ONSTACK handler actually runs.
+    `ktest:lumen_kernel::linux::signal::frame::deferred_debug_trap_keeps_original_address`
+    gives the interrupt hook distinct trap and interrupt RIPs and checks the
+    copied siginfo/context. The guest DB loop checks its recorded trap address,
+    but TCG may deliver the self-IPI before that loop advances.
 - `scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait` (C6):
   `EINTR` and restarts from a blocking `read`, `wait4`, `nanosleep` and
   `pselect6`, each waiter confirmed blocked first and each signal resent

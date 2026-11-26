@@ -324,28 +324,20 @@ impl Process {
         self.allow_test_syscalls
     }
 
-    /// Record the first exit, with a pending group-fatal signal taking precedence.
+    /// Record the first group-end decision and its exit diagnostic under siglock.
+    /// An earlier fatal signal wins; a later signal cannot replace a recorded exit.
     pub fn record_exit(&self, exit: UserExit) {
-        let signal = self.signal.lock();
+        let mut signal = self.signal.lock();
+        signal.record_exit();
         let exit = signal
             .fatal_signal()
             .map_or(exit, |sig| if exit.signal() == Some(sig) { exit } else { UserExit::Signaled(sig) });
-        let mut recorded = self.exit.lock();
-        if signal.fatal_signal().is_some() {
-            *recorded = Some(exit);
-        } else {
-            recorded.get_or_insert(exit);
-        }
+        self.exit.lock().get_or_insert(exit);
     }
 
-    /// Take how its run ended (its takedown), if it was recorded.
+    /// Take the recorded outcome once during takedown, without reconciling other state.
     fn take_exit(&self) -> Option<UserExit> {
-        let signal = self.signal.lock();
-        let exit = self.exit.lock().take();
-        signal
-            .fatal_signal()
-            .map(|sig| exit.filter(|e| e.signal() == Some(sig)).unwrap_or(UserExit::Signaled(sig)))
-            .or(exit)
+        self.exit.lock().take()
     }
 
     /// Its disposition of `signal`.
@@ -650,23 +642,36 @@ pub struct UserThread {
     clear_child_tid: AtomicU64,
     /// Its scheduler thread's id (`sched::threads()`' id).
     kernel_thread: AtomicU64,
+    /// Shared notification target: bound before a real thread becomes runnable.
     kernel_handle: Arc<SpinLock<Weak<sched::Thread>>>,
+    /// Only explicit ktest stand-ins may have no scheduler notification target.
+    synthetic: bool,
 }
 
 impl UserThread {
-    fn new(process: Arc<Process>, kernel_thread: u64) -> Self {
+    fn new(process: Arc<Process>) -> Self {
         Self {
             tid: AtomicU32::new(0),
             process,
             clear_child_tid: AtomicU64::new(0),
-            kernel_thread: AtomicU64::new(kernel_thread),
-            kernel_handle: Arc::new(SpinLock::new(
-                sched::current().filter(|t| t.id() == kernel_thread).map_or_else(Weak::new, |t| Arc::downgrade(&t)),
-            )),
+            kernel_thread: AtomicU64::new(0),
+            kernel_handle: Arc::new(SpinLock::new(Weak::new())),
+            synthetic: false,
         }
     }
 
-    /// Bind the scheduler identity before the child is made runnable.
+    fn for_current(process: Arc<Process>) -> Self {
+        let thread = Self::new(process);
+        thread.bind_kernel_thread(&sched::current().expect("current scheduler thread"));
+        thread
+    }
+
+    #[cfg(feature = "ktest")]
+    fn unbound_for_ktest(process: Arc<Process>) -> Self {
+        Self { synthetic: true, ..Self::new(process) }
+    }
+
+    /// Bind the scheduler identity and notification target before the child is runnable.
     pub(crate) fn bind_kernel_thread(&self, kernel: &Arc<sched::Thread>) {
         assert_eq!(self.kernel_thread.swap(kernel.id(), Ordering::AcqRel), 0);
         *self.kernel_handle.lock() = Arc::downgrade(kernel);
@@ -820,7 +825,7 @@ pub fn register_current(
         allow_test_syscalls,
         exe_path,
     ));
-    let thread = Arc::new(UserThread::new(process, current_kernel_tid()));
+    let thread = Arc::new(UserThread::for_current(process));
     let spawned = PROCS.lock().link_root(&thread);
     let pid = spawned.unwrap_or_else(|| panic!("no pid is free for a new process"));
     let prev = sched::set_current_user_thread(Some(thread));
@@ -853,7 +858,7 @@ pub(crate) fn fork_current(
     }
     let flags = request.bits();
     let new = Process::copy_for_fork(caller.process(), flags)?;
-    let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
+    let child = Arc::new(UserThread::new(Arc::clone(&new.process)));
     if flags & general::CLONE_CHILD_CLEARTID != 0 {
         child.set_clear_child_tid(child_tid);
     }
@@ -882,7 +887,7 @@ pub(crate) fn fork_current(
         sched::SpawnError::Stack(crate::mm::stack::StackError::OutOfMemory) => errno::ENOMEM,
         _ => errno::EAGAIN,
     })?;
-    let pid = PROCS.lock().link_child(&caller, &child)?;
+    let pid = PROCS.lock().link_child(&caller, &child, request)?;
     new.linked();
     if flags & general::CLONE_PARENT_SETTID != 0 {
         // Linux ignores this put_user's failure.
@@ -1867,7 +1872,7 @@ pub(crate) fn with_process_user<R>(space: &Arc<AddressSpace>, f: impl FnOnce() -
 /// second tid. It runs nowhere (its scheduler thread id is 0).
 #[cfg(feature = "ktest")]
 pub(crate) fn add_ktest_thread(process: &Arc<Process>) -> Result<Arc<UserThread>, &'static str> {
-    let thread = Arc::new(UserThread::new(Arc::clone(process), 0));
+    let thread = Arc::new(UserThread::unbound_for_ktest(Arc::clone(process)));
     PROCS.lock().link_thread(&thread).map_err(|_| "ProcTree::add_thread refused")?;
     Ok(thread)
 }
@@ -2348,7 +2353,7 @@ pub(crate) fn spawn_test_thread<R: Send + 'static>(
     let out = Arc::clone(&result);
     let handle = sched::spawn_on(crate::arch::cpu_index(), "hazard-thread", move || {
         let ran = with_process_user(&space, || {
-            let thread = Arc::new(UserThread::new(process, current_kernel_tid()));
+            let thread = Arc::new(UserThread::for_current(process));
             PROCS.lock().link_thread(&thread).map_err(|_| "link the test thread")?;
             let tid = thread.tid();
             let prev = sched::set_current_user_thread(Some(Arc::clone(&thread)));
@@ -2821,7 +2826,7 @@ crate::ktest!(
             // A private two-pid table forces the same fork refusal as a
             // full production table, without exhausting the whole kernel.
             let root = NewProcess::empty(ConsoleState::new(ConsoleIo::Capture, Vec::new()), false, None);
-            let leader = Arc::new(UserThread::new(Arc::clone(&root.process), 0));
+            let leader = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&root.process)));
             let mut table = ProcTable::new(2);
             kassert_eq!(table.link_root(&leader), Some(2));
             let files = parent.files.lock().clone().ok_or("parent files")?;
@@ -2829,12 +2834,15 @@ crate::ktest!(
                 for _ in 0..8 {
                     let child = Process::copy_for_fork(&parent, flags).map_err(|_| "copy child")?;
                     let held = Arc::clone(&child.process);
-                    let thread = Arc::new(UserThread::new(Arc::clone(&held), 0));
+                    let thread = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&held)));
                     let shared = flags & general::CLONE_FILES != 0;
                     kassert_eq!(mm.users(), 2);
                     kassert_eq!(files.users(), if shared { 2 } else { 1 });
                     kassert_eq!(file.fd_ref_count(), before + u32::from(!shared));
-                    kassert_eq!(table.link_child(&leader, &thread), Err(errno::EAGAIN));
+                    kassert_eq!(
+                        table.link_child(&leader, &thread, clone_flags(flags | general::SIGCHLD, 0).unwrap()),
+                        Err(errno::EAGAIN)
+                    );
                     drop(child);
                     kassert!(held.released());
                     kassert_eq!(mm.users(), 1);
@@ -2980,8 +2988,11 @@ crate::ktest!(
             // when its exit follows the parent's blocking wait.
             let caller = current_thread();
             let new = Process::copy_for_fork(caller.process(), general::CLONE_VM).map_err(|_| "copy child")?;
-            let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
-            let pid = PROCS.lock().link_child(&caller, &child).map_err(|_| "link child")?;
+            let child = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&new.process)));
+            let pid = PROCS
+                .lock()
+                .link_child(&caller, &child, clone_flags(general::CLONE_VM | general::SIGCHLD, 0).unwrap())
+                .map_err(|_| "link child")?;
             new.linked();
             let request = wait4_request(pid as i32, 0).expect("valid wait");
             let kernel = sched::current().expect("current thread");
@@ -3068,7 +3079,7 @@ fn shared_files_lock_cleanup(cleanup: LockCleanup) -> crate::ktest::TestResult {
         let files = caller.process().files.lock().clone().ok_or("files")?;
         let new = Process::copy_for_fork(caller.process(), general::CLONE_VM | general::CLONE_FILES)
             .map_err(|_| "copy child")?;
-        let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
+        let child = Arc::new(UserThread::unbound_for_ktest(Arc::clone(&new.process)));
         let locked = Arc::new(VforkDone::new());
         let finish = Arc::new(VforkDone::new());
         let result = Arc::new(SpinLock::new(None));
@@ -3083,7 +3094,10 @@ fn shared_files_lock_cleanup(cleanup: LockCleanup) -> crate::ktest::TestResult {
                 assert!(ended.exit.is_some());
             })
             .map_err(|_| "spawn child")?;
-        let pid = PROCS.lock().link_child(&caller, &child).map_err(|_| "link child")?;
+        let pid = PROCS
+            .lock()
+            .link_child(&caller, &child, clone_flags(general::CLONE_VM | general::SIGCHLD, 0).unwrap())
+            .map_err(|_| "link child")?;
         new.linked();
         let shared_users = files.users();
         let handle = parked.start();
@@ -3232,6 +3246,28 @@ crate::ktest!(
     }
 );
 
+/// Link a real child behind its start gate, sharing the fixture's VM.
+#[cfg(feature = "ktest")]
+fn ktest_fork_child(run: impl FnOnce() + Send + 'static) -> Result<(u32, ParkedChild), &'static str> {
+    let caller = current_thread();
+    let request = clone_flags(general::CLONE_VM | general::SIGCHLD, 0).unwrap();
+    let new = Process::copy_for_fork(caller.process(), request.bits()).map_err(|_| "copy child")?;
+    let child = Arc::new(UserThread::new(Arc::clone(&new.process)));
+    let parked = ParkedChild::spawn("signal-child", new.process.address_space().unwrap(), Arc::clone(&child), 0, run)
+        .map_err(|_| "spawn child")?;
+    let pid = PROCS.lock().link_child(&caller, &child, request).map_err(|_| "link child")?;
+    new.linked();
+    Ok((pid, parked))
+}
+
+#[cfg(feature = "ktest")]
+fn ktest_reap(pid: u32, handle: sched::JoinHandle) -> Result<i32, &'static str> {
+    handle.join();
+    let report =
+        wait_child(wait4_request(pid as i32, 0).map_err(|_| "request")?).map_err(|_| "wait")?.ok_or("no child exit")?;
+    Ok(report.status().word())
+}
+
 crate::ktest!(
     fn fork_child_fault_is_delivered_and_reaped() {
         use crate::{
@@ -3243,16 +3279,13 @@ crate::ktest!(
         };
         in_test_process(|_| {
             const CODE: u64 = 0x800000;
-            let caller = current_thread();
-            let new = Process::copy_for_fork(caller.process(), general::CLONE_VM).map_err(|_| "copy child")?;
-            let space = new.process.address_space().ok_or("child space")?;
+            let space = current_process().address_space().ok_or("child space")?;
             space
                 .map_eager_with_bytes(CODE, 4096, lumen_vm::Prot::READ | lumen_vm::Prot::EXEC, &[0x0f, 0x0b])
                 .map_err(|_| "map UD2")?;
-            let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
             let result = Arc::new(SpinLock::new(None));
             let out = Arc::clone(&result);
-            let parked = ParkedChild::spawn("signal-fault", space, Arc::clone(&child), 0, move || {
+            let (pid, parked) = ktest_fork_child(move || {
                 let frame = SyscallFrame {
                     rip: CODE,
                     rsp: KTEST_USER_VA + KTEST_USER_LEN,
@@ -3267,15 +3300,8 @@ crate::ktest!(
                     syscall::enter_fork(frame);
                 }
                 *out.lock() = take_current().exit;
-            })
-            .map_err(|_| "spawn child")?;
-            let pid = PROCS.lock().link_child(&caller, &child).map_err(|_| "link child")?;
-            new.linked();
-            parked.start().join();
-            let report = wait_child(wait4_request(pid as i32, 0).map_err(|_| "request")?)
-                .map_err(|_| "wait")?
-                .ok_or("no child exit")?;
-            kassert_eq!(report.status().word(), Signal::ILL.number() as i32);
+            })?;
+            kassert_eq!(ktest_reap(pid, parked.start())?, Signal::ILL.number() as i32);
             kassert_eq!(*result.lock(), Some(UserExit::Fault { vector: 6, error_code: 0, rip: CODE, cr2: 0 }));
             Ok(())
         })?
@@ -3288,29 +3314,17 @@ crate::ktest!(
         use core::sync::atomic::AtomicBool;
         use lumen_signal::pending::{SenderClass, SigInfo};
         in_test_process(|_| {
-            let caller = current_thread();
-            let new = Process::copy_for_fork(caller.process(), general::CLONE_VM).map_err(|_| "copy child")?;
-            let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
             let queue = Arc::new(sched::WaitQueue::new());
             let rescue = Arc::new(AtomicBool::new(false));
             let result = Arc::new(SpinLock::new(None));
             let (q, stop, out) = (Arc::clone(&queue), Arc::clone(&rescue), Arc::clone(&result));
-            let parked = ParkedChild::spawn(
-                "signal-sleep",
-                new.process.address_space().unwrap(),
-                Arc::clone(&child),
-                0,
-                move || {
-                    let wake = q.wait_interruptible(None, || stop.load(Ordering::SeqCst));
-                    *out.lock() = Some(wake);
-                    // A pending fatal signal must override an ordinary exit racing it.
-                    record_exit(UserExit::Exited(42));
-                    let _ = take_current();
-                },
-            )
-            .map_err(|_| "spawn child")?;
-            let pid = PROCS.lock().link_child(&caller, &child).map_err(|_| "link child")?;
-            new.linked();
+            let (pid, parked) = ktest_fork_child(move || {
+                let wake = q.wait_killable(None, || stop.load(Ordering::SeqCst));
+                *out.lock() = Some(wake);
+                // A pending fatal signal must override an ordinary exit racing it.
+                record_exit(UserExit::Exited(42));
+                let _ = take_current();
+            })?;
             let handle = parked.start();
             while handle.thread().state() != sched::State::Blocked && !handle.is_finished() {
                 crate::time::sleep(1_000_000);
@@ -3325,14 +3339,101 @@ crate::ktest!(
                 queue.wake_all();
             }
             crate::arch::irq::restore(was_on);
-            handle.join();
-            let report = wait_child(wait4_request(pid as i32, 0).map_err(|_| "request")?)
-                .map_err(|_| "wait")?
-                .ok_or("no child exit")?;
+            let status = ktest_reap(pid, handle)?;
             kassert_eq!(sent, Ok(()));
             kassert!(woke);
             kassert_eq!(*result.lock(), Some(sched::Wake::Interrupted));
-            kassert_eq!(report.status().word(), Signal::KILL.number() as i32);
+            kassert_eq!(status, Signal::KILL.number() as i32);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn recorded_exit_wins_over_later_signals() {
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        in_test_process(|_| {
+            let recorded = Arc::new(VforkDone::new());
+            let finish = Arc::new(VforkDone::new());
+            let (ready, end) = (Arc::clone(&recorded), Arc::clone(&finish));
+            let (pid, parked) = ktest_fork_child(move || {
+                record_exit(UserExit::Exited(0));
+                ready.complete();
+                end.wait();
+                let _ = take_current();
+            })?;
+            let handle = parked.start();
+            recorded.wait();
+            let killed = send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::KILL, 0))), SenderClass::SiUser);
+            let rt = SigInfo::new(Signal::new(35).unwrap(), -1);
+            let queued = (0..1025).all(|_| send_process_checked(pid as i32, Ok(Some(rt)), SenderClass::Other).is_ok());
+            finish.complete();
+            while !handle.is_finished() {
+                crate::time::sleep(1_000_000);
+            }
+            // A zombie remains a valid process target, but queues no signal.
+            let zombie = (0..1025).all(|_| send_process_checked(pid as i32, Ok(Some(rt)), SenderClass::Other).is_ok());
+            let status = ktest_reap(pid, handle)?;
+            kassert_eq!(killed, Ok(()));
+            kassert!(queued && zombie);
+            kassert_eq!(status, 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn fork_pending_signal_precedes_first_user_instruction() {
+        use crate::{
+            arch::{
+                gdt,
+                syscall::{self, SyscallFrame},
+            },
+            kassert_eq,
+        };
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        in_test_process(|_| {
+            const CODE: u64 = 0x800000;
+            // Entry exits 42; the handler exits 0. No instruction at entry
+            // may run before the already-pending handler gets control.
+            let mut code = [0x90; 32];
+            code[..12].copy_from_slice(&[0xbf, 42, 0, 0, 0, 0xb8, 60, 0, 0, 0, 0x0f, 0x05]);
+            code[16..28].copy_from_slice(&[0xbf, 0, 0, 0, 0, 0xb8, 60, 0, 0, 0, 0x0f, 0x05]);
+            current_process()
+                .address_space()
+                .unwrap()
+                .map_eager_with_bytes(CODE, 4096, lumen_vm::Prot::READ | lumen_vm::Prot::EXEC, &code)
+                .map_err(|_| "map program")?;
+            set_current_action(
+                Signal::USR1,
+                KernelSigaction {
+                    handler: CODE + 16,
+                    restorer: CODE,
+                    flags: u64::from(general::SA_RESTORER),
+                    ..Default::default()
+                },
+            );
+            let (pid, parked) = ktest_fork_child(move || {
+                let frame = SyscallFrame {
+                    rip: CODE,
+                    rsp: KTEST_USER_VA + KTEST_USER_LEN,
+                    cs: u64::from(gdt::USER_CODE),
+                    ss: u64::from(gdt::USER_DATA),
+                    rflags: 0x202,
+                    ..Default::default()
+                };
+                // SAFETY: the child's shared fixture VM maps code and stack;
+                // its identity is bound and no lock is held with interrupts on.
+                unsafe {
+                    syscall::enter_fork(frame);
+                }
+                let _ = take_current();
+            })?;
+            let sent = send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::USR1, 0))), SenderClass::SiUser);
+            let status = ktest_reap(pid, parked.start())?;
+            kassert_eq!(sent, Ok(()));
+            kassert_eq!(status, 0);
             Ok(())
         })?
     }
