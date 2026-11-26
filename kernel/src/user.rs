@@ -450,14 +450,12 @@ pub fn copy_cstr_from_user(user_src: u64, max_len: usize) -> Result<Vec<u8>, Cop
 /// release locks, fault the page in ([`copy_from_user`] to read it,
 /// [`fault_in_writable`] to write it), then try again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex and B5's probes next
 pub struct Fault;
 
 /// Whether `addr` is a word a non-faulting access may touch: in the user
 /// range (as [`copy_from_user`] checks it) and 4-byte aligned (an aligned
 /// word never straddles a page, and a `lock cmpxchg` on it never splits a
 /// cache line).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex and B5's probes next
 fn nofault_word_ok(addr: u64) -> bool {
     addr.is_multiple_of(4) && user_range_valid(addr, 4)
 }
@@ -466,7 +464,6 @@ fn nofault_word_ok(addr: u64) -> bool {
 /// anything in: `Err(Fault)` if it isn't mapped readable now (nothing is
 /// mapped by the attempt). May run with a spinlock held and interrupts off
 /// (a futex bucket's), as Linux's `get_user` under `pagefault_disable`.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex and B5's probes next
 pub fn read_u32_nofault(addr: u64) -> Result<u32, Fault> {
     if !nofault_word_ok(addr) {
         return Err(Fault);
@@ -486,7 +483,6 @@ pub fn read_u32_nofault(addr: u64) -> Result<u32, Fault> {
 /// yet faulted in, read-only, copy-on-write): nothing is stored or mapped.
 /// May run with a spinlock held and interrupts off, as Linux's
 /// `futex_atomic_cmpxchg_inatomic`.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex next
 pub fn cmpxchg_u32(addr: u64, expected: u32, new: u32) -> Result<u32, Fault> {
     if !nofault_word_ok(addr) {
         return Err(Fault);
@@ -501,7 +497,6 @@ pub fn cmpxchg_u32(addr: u64, expected: u32, new: u32) -> Result<u32, Fault> {
 
 /// Why a writable user page could not be faulted in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C4's futex next
 pub enum FaultIn {
     Fault,
     OutOfMemory,
@@ -516,7 +511,6 @@ pub enum FaultIn {
 /// with no address space, or a page that can't be written (unmapped,
 /// read-only, a bus error); `OutOfMemory` is separate and logged. Takes the
 /// address space's Lock 1: called with no lock held and interrupts on.
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's futex next
 pub fn fault_in_writable(addr: u64) -> Result<(), FaultIn> {
     debug_assert!(
         (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,

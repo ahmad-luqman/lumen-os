@@ -4495,7 +4495,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 32 | `dup(oldfd)` | the lowest free fd, `FD_CLOEXEC` clear, looked up and installed in one hold of the FD table (section 9's fourth hazard); `-EBADF`, `-EMFILE` | C7 |
 | 33 | `dup2(oldfd, newfd)` | `oldfd == newfd`: `newfd` if open, else `-EBADF`; `newfd >= MAX_FDS` `-EBADF`; a `newfd` reserved by an open still in progress `-EBUSY`, as Linux's `do_dup2`; a displaced descriptor closed through `process::release_fd` after the table's lock is released | C7 |
 | 34 | `pause()` | waits, interruptible, for a signal; interrupted `-ERESTARTNOHAND` (musl's `pause` calls it on x86-64) | C6 |
-| 35 | `nanosleep(req, rem)` | `-EFAULT`; `tv_sec < 0` or `tv_nsec` outside 0..1e9 `-EINVAL`; sleeps at least `req` on `CLOCK_MONOTONIC`; interrupted `-ERESTART_RESTARTBLOCK`, with the time left written to `rem` (if not `NULL`) | C4 |
+| 35 | `nanosleep(req, rem)` | `-EFAULT`; `tv_sec < 0` or `tv_nsec` outside 0..1e9 `-EINVAL`; sleeps at least `req` on `CLOCK_MONOTONIC`; interrupted `-ERESTART_RESTARTBLOCK`, with the time left written to `rem` (if not `NULL`); if no time remains after interruption, returns 0 | C4 |
 | 36 | `getitimer(which, value)` | `ITIMER_REAL`: the time left and the interval; `ITIMER_VIRTUAL`, `ITIMER_PROF` and anything else `-EINVAL` (Lumen has no CPU-time timers: a deviation); `-EFAULT` | C13 |
 | 37 | `alarm(seconds)` | `setitimer(ITIMER_REAL)` for `seconds`, returning the old timer's seconds rounded as Linux's `alarm_setitimer` | C13 |
 | 38 | `setitimer(which, new, old)` | `ITIMER_REAL` only (others `-EINVAL`, as `getitimer`); a `timeval` field out of range `-EINVAL`; `new` `NULL` disarms (Linux still accepts it); arms the process's `ITIMER_REAL`, which sends `SIGALRM` (`SI_KERNEL`) to the process at expiry and re-arms by its interval (musl's `alarm` is this call: the census's signals workload) | C13 |
@@ -4544,7 +4544,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 225 | `timer_getoverrun(id)` | expiries while the timer's signal was still pending, at the last delivery (capped at `i32::MAX`) | C13 |
 | 226 | `timer_delete(id)` | disarms and frees it, discarding its pending signal; `-EINVAL` | C13 |
 | 229 | `clock_getres(clockid, res)` | the six clocks `clock_gettime` takes, each 1 ns (each read from the TSC; Linux reports its tick for the two coarse clocks, a deviation); `res` may be `NULL`; another clock `-EINVAL` | C12 |
-| 230 | `clock_nanosleep(clockid, flags, req, rem)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (the CPU-time clocks `-EINVAL`, a deviation); `TIMER_ABSTIME`: until that time, interrupted `-ERESTARTNOHAND` and `rem` untouched; relative: as `nanosleep`, interrupted `-ERESTART_RESTARTBLOCK` (Linux's `hrtimer_nanosleep`) | C4 |
+| 230 | `clock_nanosleep(clockid, flags, req, rem)` | `CLOCK_REALTIME`, `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` (`CLOCK_THREAD_CPUTIME_ID`, `CLOCK_MONOTONIC_RAW` and the `*_COARSE` clocks `-EOPNOTSUPP`; `CLOCK_TAI`, `CLOCK_PROCESS_CPUTIME_ID`, `CLOCK_REALTIME_ALARM` (8) and `CLOCK_BOOTTIME_ALARM` (9) `-EINVAL`, unsupported deviations); `TIMER_ABSTIME`: until that time, interrupted `-ERESTARTNOHAND` and `rem` untouched; relative: as `nanosleep`, interrupted `-ERESTART_RESTARTBLOCK` (Linux's `hrtimer_nanosleep`) | C4 |
 | 231 | `exit_group(status)` | ends every thread of the process (section 8, "Exit") | C1, C3 |
 | 234 | `tgkill(tgid, tid, sig)` | `tgid <= 0` or `tid <= 0` `-EINVAL`; `tid` not in `tgid` `-ESRCH`; as `tkill` | C5 |
 | 247 | `waitid(idtype, id, infop, options, rusage)` | section 8, "`wait4` and `waitid`" | C1, C6 |
@@ -5273,8 +5273,8 @@ untouched):
    - Still on the old address space, as Linux's `exec_mmap` runs
      `mm_exit_exec_release` first: walk the robust list
      (`futex_exit_exec_release` → `exit_robust_list`, C4) and clear its
-     head; clear `clear_child_tid`, storing 0 and (C4) waking it first only if
-     the space's `users` is above 1 (a `vfork` parent sharing it), as
+     head; clear `clear_child_tid`, storing 0 and then (C4) waking one waiter
+     only if the space's `users` is above 1 (a `vfork` parent sharing it), as
      Linux's `mm_release` stores only while `mm_users > 1`, which after
      `de_thread` holds only for a sharer. Before releasing a `vfork` parent,
      `commit_unshare(PreparedFiles)` installs the private files table and
@@ -5494,8 +5494,10 @@ user access":
   `pthread_mutex_pi` (static and dynamic, both passing natively) fail in
   Lumen and D4 lists them as expected failures with a backlog issue for
   PI futexes.
-- **Errors:** an address outside user space `-EFAULT`, not 4-byte aligned
-  `-EINVAL`, a zero bitset `-EINVAL`, a negative requeue count `-EINVAL`
+- **Errors:** alignment is checked before the user range: not 4-byte aligned
+  `-EINVAL`, otherwise an address outside user space `-EFAULT`; timeout
+  copying/validation for wait commands precedes flag rejection (`-ENOSYS`)
+  and a zero bitset's `-EINVAL`; a negative requeue count `-EINVAL`
   (`check_requeue_counts`, before any key lookup, fault or value
   compare), a word that doesn't match `-EAGAIN`, an unreadable word
   `-EFAULT`, a bad timeout (a negative `tv_sec`, or a `tv_nsec` negative
@@ -5546,23 +5548,30 @@ user access":
   robust mutexes if it fails. At a thread's exit, before its
   `clear_child_tid` store, and at `execve`, the kernel walks the list as
   Linux's `exit_robust_list` does, with no lock held: at most 2048 entries
-  (`ROBUST_LIST_LIMIT`), each read with `copy_from_user`, any fault or
-  failure abandoning the whole walk; for each entry, `handle_futex_death`:
-  a futex word whose tid bits are the thread's is replaced by `(word &
-  FUTEX_WAITERS) | FUTEX_OWNER_DIED` with `user::cmpxchg_u32`, retried
-  while the word changes under it and, on `Fault`, after
-  `user::fault_in_writable` (abandoning the walk if that fails), and with
-  `FUTEX_WAITERS` it gets one shared wake. Then the head's
-  `list_op_pending` entry, if set, is handled the same way; when its
-  word's tid bits aren't the thread's (a lock it was about to take or had
-  just released), the word is left unchanged and one waiter is woken
-  only if the word has no owner or no `FUTEX_WAITERS`, as Linux's
-  `handle_futex_death` with `pending_op`.
+  (`ROBUST_LIST_LIMIT`), each read with `copy_from_user`. A fault reading
+  an entry's next pointer is propagated after handling that entry's owner;
+  any failure abandons the remaining walk and logs tid, head and errno at
+  debug level. For each entry, `handle_futex_death`: a futex word whose tid
+  bits are the thread's is replaced by `(word & FUTEX_WAITERS) |
+  FUTEX_OWNER_DIED` with `user::cmpxchg_u32`, retried while the word changes
+  and, on `Fault`, after `user::fault_in_writable` (abandoning the walk if
+  that fails). With `FUTEX_WAITERS` a non-PI entry gets one shared wake.
+  PI list entries and PI pending entries still get `OWNER_DIED`, but no
+  ordinary wake: Linux leaves their wake to `exit_pi_state`; Lumen has no
+  PI futexes. The head's `list_op_pending` entry is skipped in the loop and
+  handled once afterwards, if set. When it names a different owner the
+  word is unchanged; a non-PI pending entry wakes one waiter only when its
+  owner bits are zero. This narrower pending-wake rule is a deviation from
+  Linux sources with `FUTEX_ROBUST_UNLOCK`, which also wake when another
+  owner has not set `FUTEX_WAITERS`.
 
 Tested by `cargo:lumen-futex`,
-`scenario:test_linux_proc::test_futex_timeouts_and_nanosleep` and
-`scenario:test_linux_proc::test_futex_and_pthread_mutex_stress` (section
-15).
+`scenario:test_linux_proc::test_futex_timeouts_and_nanosleep`,
+`ktest:lumen_kernel::linux::futex::futex_cancel_follows_requeue_and_wake_wins`,
+`ktest:lumen_kernel::linux::futex::robust_walk_checks_owners_pending_and_faults`,
+`ktest:lumen_kernel::linux::futex::futex_file_keys_and_private_cow_before_wait`,
+`ktest:lumen_kernel::linux::syscall::futex::sleep_and_futex_restart_preserve_deadlines`,
+and `scenario:test_linux_proc::test_futex_and_pthread_mutex_stress` (section 15).
 
 #### Timers: `setitimer`, `alarm` and POSIX timers (C13)
 
@@ -10925,10 +10934,7 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   MAX_ARG_STRLEN boundary; pending signals are checked only by the ktest;
   a `vfork` child's `execve` releasing its parent before the child exits
   (the exec'd image confirms its CLOEXEC check with SIGUSR1 before its parent kills it); a binary over 16 MiB
-  (built by `tools/linux-m8`, padded) (C2); a `clone(CLONE_VM | SIGCHLD |
-  CLONE_CHILD_CLEARTID)` child that `execve`s and one that exits, each
-  time the sharing parent's `FUTEX_WAIT` on the word returning and reading
-  0, and the robust-list walk at `execve` (C4); from a process with threads (C3): a
+  (built by `tools/linux-m8`, padded) (C2); from a process with threads (C3): a
   non-leader's `execve` taking the pid, the new image running, every
   other thread gone and the process not killed (its later exit status the
   new image's); two threads `execve`ing at once with exactly one image
@@ -11018,7 +11024,31 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   process-shared robust mutex in `MAP_SHARED` memory whose holder
   *process* exits gives the next locker `EOWNERDEAD`, and
   `set_robust_list` with `len` other than 24 is `EINVAL`; `nanosleep` and
-  `clock_nanosleep` floors, `TIMER_ABSTIME` included.
+  `clock_nanosleep` floors, `TIMER_ABSTIME` included. Requeue wakes one and
+  moves one of two confirmed waiters; zero requeue count leaves the second
+  waiter on the source; CMP_REQUEUE compares a source distinct from its
+  destination word; high requeue-count bits are ignored. Private WAIT and
+  CMP_REQUEUE on unmapped and PROT_NONE pages return EFAULT. Error ordering
+  covers alignment/range and timeout/bitset; `get_robust_list` round-trips
+  a registered head and rejects an absent tid. Unsupported futex operations
+  and `futex_waitv` return ENOSYS. Known nonsleeping clocks return EOPNOTSUPP;
+  Process CPU-time, TAI, alarm and invalid clocks return EINVAL. A `CLONE_VM | SIGCHLD`
+  child registers `set_tid_address`, then exits or execs; a second process
+  sharing its mm waits on the word and returns 0 after the store/wake.
+  The robust walk at exec marks the old shared word OWNER_DIED.
+  Four kernel tests supplement the scenario:
+  - `ktest:lumen_kernel::linux::futex::futex_cancel_follows_requeue_and_wake_wins`:
+    cancellation follows same- and different-bucket requeues; a claimed wake
+    wins over ERESTARTSYS.
+  - `ktest:lumen_kernel::linux::futex::robust_walk_checks_owners_pending_and_faults`:
+    ownership, pending once-only handling, PI death without ordinary wake,
+    next-pointer faults, negative offsets and bounded cyclic lists.
+  - `ktest:lumen_kernel::linux::futex::futex_file_keys_and_private_cow_before_wait`:
+    file aliases/offsets and a writable private-file WAIT confirmed blocked
+    before the parent resolves its key or writes the page.
+  - `ktest:lumen_kernel::linux::syscall::futex::sleep_and_futex_restart_preserve_deadlines`:
+    saved deadlines, interrupted relative sleep completion, absolute-sleep
+    restart codes, failed copyout, and remaining-time floors and ceilings.
 - `scenario:test_linux_proc::test_futex_and_pthread_mutex_stress` (C11):
   threads pinned across CPUs incrementing a shared counter under a
   `pthread_mutex` and handing turns through a condition variable, a fixed

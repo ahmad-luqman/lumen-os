@@ -4,3 +4,19 @@
 name = "Futex wait queues (logic)"
 milestone = "M8"
 tests = ["cargo:lumen-futex"]
+
+[[feature]]
+name = "Futex backing keys, wake/requeue/bitsets, robust lists and interruptible sleeps"
+milestone = "M8"
+tests = [
+    "scenario:test_linux_proc::test_futex_timeouts_and_nanosleep",
+    "cargo:lumen-futex",
+    "ktest:lumen_kernel::linux::futex::futex_cancel_follows_requeue_and_wake_wins",
+    "ktest:lumen_kernel::linux::futex::robust_walk_checks_owners_pending_and_faults",
+    "ktest:lumen_kernel::linux::syscall::futex::sleep_and_futex_restart_preserve_deadlines",
+]
+
+[[feature]]
+name = "Futex file aliases and offsets, and private-file CoW before WAIT"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::futex::futex_file_keys_and_private_cow_before_wait"]

@@ -1442,6 +1442,41 @@ impl AddressSpace {
         self.inner.lock().vmas.find(addr).is_some()
     }
 
+    /// Resolve backing for every non-private futex operation under Lock 1.
+    /// Unmapped, nonresident, non-user and PROT_NONE pages return EFAULT.
+    /// A writable private file cache leaf requests a write fault before retry.
+    pub(crate) fn futex_key(&self, addr: u64) -> Result<crate::linux::futex::KeyResolution, u32> {
+        use crate::linux::futex::{FutexKey, KeyResolution};
+        let inner = self.inner.lock();
+        let vma = inner.vmas.find(addr).ok_or(errno::EFAULT)?;
+        let WalkEnd::Mapped(leaf) = paging::walk_user(self.root, VirtAddr::new(addr).ok_or(errno::EFAULT)?).end()
+        else {
+            return Err(errno::EFAULT);
+        };
+        if !leaf.user || vma.prot.is_none() {
+            return Err(errno::EFAULT);
+        }
+        let anon = FutexKey::Anon { space: self.root.as_u64(), uaddr: addr };
+        let key = match vma.backing {
+            Backing::File(file) => {
+                debug_assert!(!file.shared || leaf.shared, "MAP_SHARED file must retain a page-cache leaf");
+                if !file.shared && vma.prot.write() && leaf.shared {
+                    return Ok(KeyResolution::NeedsWriteFault);
+                }
+                if leaf.shared {
+                    FutexKey::File { file_id: file.file_id, offset: file.offset + addr - vma.start }
+                } else {
+                    anon
+                }
+            }
+            Backing::Anonymous { shared: true } => {
+                FutexKey::SharedFrame { frame: leaf.phys.as_u64(), offset: addr % PAGE_SIZE }
+            }
+            Backing::Anonymous { shared: false } => anon,
+        };
+        Ok(KeyResolution::Key(key))
+    }
+
     /// Resolve a demand-paging `#PF` at `fault_addr` with CPU `error_code`.
     ///
     /// Must be called with interrupts enabled and `irq::depth() == 0` (step 3

@@ -23,6 +23,7 @@ lumen-bcache.workspace = true
 lumen-demo.workspace = true
 lumen-elf.workspace = true
 lumen-font.workspace = true
+lumen-futex.workspace = true
 lumen-gfx.workspace = true
 lumen-heap.workspace = true
 lumen-input.workspace = true

@@ -189,14 +189,10 @@ fn prepare_exec(
 
 /// Commit a fully prepared replacement without a recoverable error.
 fn commit_exec(prepared: PreparedExec) {
-    // Point of no return. C4 adds the robust-list walk and futex wake here.
+    // Point of no return: release the old image's userspace synchronization.
     let thread = current_thread();
     let old = crate::sched::current_address_space().expect("exec in user space");
-    let clear = thread.clear_child_tid();
-    if clear != 0 && old.users() > 1 {
-        let _ = crate::user::copy_to_user(clear, &0u32.to_ne_bytes());
-    }
-    thread.set_clear_child_tid(0);
+    crate::linux::futex::release_user_sync(&thread, old.users() > 1);
     process::commit_unshare(prepared.files);
     process::finish_exec();
     current_process().complete_vfork();
