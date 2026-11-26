@@ -15,7 +15,7 @@
 //! whose `error!` takes the log's leaf lock.
 
 use alloc::collections::BTreeMap;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -27,8 +27,8 @@ use lumen_vfs::{DevId, VfsError, VfsInode};
 use crate::arch;
 use crate::mm;
 use crate::mm::frame::{self, OwnedFrame};
-use crate::mm::user_vm::AddressSpace;
-use crate::sync::{SleepMutex, SpinLock};
+use crate::mm::user_vm::Mappers;
+use crate::sync::SleepMutex;
 
 pub use lumen_vfs::page::PAGE_SIZE;
 
@@ -542,13 +542,13 @@ impl MappedPage {
     /// size once Lock 4 is released, even while the fault holds
     /// `AddressSpace::inner` (Lock 1), since the truncate takes Lock 4 alone.
     /// A page mapped from a stale snapshot is unmapped all the same: the
-    /// shrinking syscall's `invalidate_file_from` takes Lock 1 after the
-    /// truncate, and so runs once that fault's mapping is in place
-    /// (ARCHITECTURE section 5's rules: the caller's own space only until
-    /// M8). A private copy-on-write copy of the end
-    /// page made from a stale snapshot can keep bytes past the new end
-    /// (bytes a shared mapping stored past it). (The fault path needs only
-    /// [`valid_len`](Self::valid_len), through `copy_to_frame`.)
+    /// shrinking syscall's `invalidate_file_mappings` runs `invalidate_file_from`
+    /// under each mapped space's Lock 1 after the truncate, and so runs once
+    /// that fault's mapping is in place (ARCHITECTURE section 5). A private
+    /// copy-on-write copy of the end page made from a stale snapshot can keep
+    /// bytes past the new end (bytes a shared mapping stored past it). (The
+    /// fault path needs only [`valid_len`](Self::valid_len), through
+    /// `copy_to_frame`.)
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests' check of the snapshot
     pub(crate) fn file_size(&self) -> u64 {
         self.file_size
@@ -619,8 +619,8 @@ impl Drop for WritableMap {
 ///   one a mapping still holds. The page stays alive, pinned by that mapping,
 ///   until ARCHITECTURE section 5's truncate invalidation, which the
 ///   shrinking syscall (`truncate`, `ftruncate`, `openat(O_TRUNC)`) runs
-///   once the truncate has returned, unmaps it (with section 5's limit: the
-///   caller's own space only until M8).
+///   through `invalidate_file_mappings` once the truncate has returned,
+///   unmaps it from every address space mapping the file.
 /// - **Other inodes:** `NoDev` for anything but a regular file of `ext4`
 ///   or `tmpfs` (directories, symlinks, `devfs`, `procfs`). `NoEnt` for an
 ///   `ext4` inode unlinked and not open, as `read_at` says.
@@ -645,11 +645,22 @@ pub(crate) fn mmap_page(inode: &Arc<dyn VfsInode>, index: u64) -> Result<MappedP
     Ok(MappedPage::new(page, index, file_size, Arc::clone(inode)))
 }
 
+/// The `PageCache` lock (Lock 5) and [`Mappers`] list (level 10c) of an
+/// `ext4` or `tmpfs` inode: one downcast shared by [`mappable`],
+/// [`page_cache_lock`] and [`page_cache_mappers`].
+fn mappable_parts(inode: &dyn VfsInode) -> Option<(&SleepMutex<PageCache>, &Mappers)> {
+    let any = inode.as_any()?;
+    if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
+        return Some((ext4.page_cache_lock(), ext4.mappers()));
+    }
+    any.downcast_ref::<super::tmpfs::TmpfsInode>().map(|t| (t.page_cache_lock(), t.mappers()))
+}
+
 /// Whether [`mmap_page`] can hand out pages of `inode`: a regular file of
 /// `ext4` or `tmpfs`. (`mmap` refuses anything else with `ENODEV` up front,
 /// instead of a `SIGBUS` at the first fault.)
 pub(crate) fn mappable(inode: &dyn VfsInode) -> bool {
-    inode.inode_type() == lumen_vfs::InodeType::File && page_cache_lock(inode).is_some()
+    inode.inode_type() == lumen_vfs::InodeType::File && mappable_parts(inode).is_some()
 }
 
 /// Whether `inode`'s volume refuses writing through a shared mapping: a new
@@ -669,21 +680,13 @@ pub(crate) fn mapped_read_only(inode: &dyn VfsInode) -> bool {
 
 /// The `PageCache` lock (Lock 5) of an `ext4` or `tmpfs` inode.
 fn page_cache_lock(inode: &dyn VfsInode) -> Option<&SleepMutex<PageCache>> {
-    let any = inode.as_any()?;
-    if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
-        return Some(ext4.page_cache_lock());
-    }
-    any.downcast_ref::<super::tmpfs::TmpfsInode>().map(super::tmpfs::TmpfsInode::page_cache_lock)
+    mappable_parts(inode).map(|(pages, _)| pages)
 }
 
 /// The address spaces currently mapping an `ext4` or `tmpfs` inode (level 10c
 /// leaf spinlock; never acquired under [`page_cache_lock`]).
-pub(crate) fn page_cache_mappers(inode: &dyn VfsInode) -> Option<&SpinLock<Vec<Weak<AddressSpace>>>> {
-    let any = inode.as_any()?;
-    if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
-        return Some(ext4.mappers());
-    }
-    any.downcast_ref::<super::tmpfs::TmpfsInode>().map(super::tmpfs::TmpfsInode::mappers)
+pub(crate) fn page_cache_mappers(inode: &dyn VfsInode) -> Option<&Mappers> {
+    mappable_parts(inode).map(|(_, mappers)| mappers)
 }
 
 /// `Range` unless page `index` starts below `file_size` (an overflowing

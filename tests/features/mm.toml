@@ -209,4 +209,6 @@ milestone = "M8"
 tests = [
     "ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space",
     "ktest:lumen_kernel::mm::user_vm::fork_racing_a_truncate_copies_nothing_past_eof",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_writable_maps_balance_through_mprotect_unmap_and_teardown",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_and_open_trunc_unmap_a_second_address_space",
 ]

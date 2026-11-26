@@ -36,8 +36,8 @@ use lumen_vfs::{
 
 use log::{debug, error, warn};
 
-use crate::mm::user_vm::AddressSpace;
-use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
+use crate::mm::user_vm::Mappers;
+use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
 use super::page_cache::{self, CachePage, DetachedQuotaGuard, PAGE_SIZE, PageCache};
@@ -1702,7 +1702,7 @@ pub struct Ext4Inode {
     warned_bad_listing: AtomicBool,
     meta: SleepMutex<Ext4InodeMeta>,
     pages: SleepMutex<PageCache>,
-    mappers: SpinLock<Vec<Weak<AddressSpace>>>,
+    mappers: Mappers,
 }
 
 impl Ext4Inode {
@@ -1827,7 +1827,7 @@ impl Ext4Inode {
             warned_bad_listing: AtomicBool::new(false),
             meta: SleepMutex::new(meta),
             pages: SleepMutex::new(PageCache::new_ext4()),
-            mappers: SpinLock::new(Vec::new()),
+            mappers: Mappers::new(),
         })
     }
 
@@ -1928,7 +1928,7 @@ impl Ext4Inode {
 
     /// Address spaces currently mapping this file (level 10c leaf spinlock;
     /// never acquired under `pages`), for `page_cache::page_cache_mappers`.
-    pub(super) fn mappers(&self) -> &SpinLock<Vec<Weak<AddressSpace>>> {
+    pub(super) fn mappers(&self) -> &Mappers {
         &self.mappers
     }
 

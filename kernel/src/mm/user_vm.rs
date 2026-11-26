@@ -28,7 +28,7 @@ use super::tlb::{self, Shoot};
 use super::{frame, paging};
 use crate::arch;
 use crate::linux::{errno, general};
-use crate::sync::SleepMutex;
+use crate::sync::{SleepMutex, SpinLock};
 use crate::vfs::page_cache::{self, CachePage, WritableMap};
 use crate::vfs::{MappedPage, mmap_page};
 
@@ -285,12 +285,13 @@ struct AddressSpaceInner {
     vmas: VmaMap,
     brk: Brk,
     torn_down: bool,
-    /// An open reference on each file some VMA maps, keyed by its
-    /// `FileMapping::file_id` ([`file_id_of`]): kept while any VMA (or a
-    /// piece of one split by `mprotect` or `munmap`) references it, so
-    /// closing the descriptor after `mmap` keeps the mapping valid. Entries
-    /// removed are dropped only after `inner` is released.
-    mapped_files: BTreeMap<u64, KeptFile>,
+    /// An open reference and mappers-list registration on each file some VMA
+    /// maps, keyed by its `FileMapping::file_id` ([`file_id_of`]): kept while
+    /// any VMA (or a piece of one split by `mprotect` or `munmap`) references
+    /// it, so closing the descriptor after `mmap` keeps the mapping valid.
+    /// Entries removed are dropped only after `inner` is released, which
+    /// unregisters the space from the inode's [`Mappers`] list.
+    mapped_files: BTreeMap<u64, Mapped>,
     /// The ELF images' file-backed parts, loaded by copying into anonymous
     /// VMAs, as `/proc/<pid>/maps` names them (recorded by
     /// `commit_loaded_elf` with the pages they name): trimmed wherever their
@@ -330,81 +331,70 @@ pub enum Sharing {
 
 /// The `FileMapping::file_id` of a file mapped from `inode`: its `lock_id`,
 /// unique among all inodes of every filesystem and fixed for its lifetime
-/// (unlike `ino`, which a detached unlink changes). `truncate`,
-/// `ftruncate` and `openat(O_TRUNC)` name the file to
-/// [`AddressSpace::invalidate_file_from`] by it.
+/// (unlike `ino`, which a detached unlink changes). [`invalidate_file_mappings`]
+/// names the file to [`AddressSpace::invalidate_file_from`] by it.
 pub fn file_id_of(inode: &dyn VfsInode) -> u64 {
     inode.lock_id()
 }
 
-/// Register `space` on `inode`'s mappers list (level 10c leaf spinlock),
-/// pruning dead `Weak` entries and avoiding duplicates. Called under `space`'s
-/// Lock 1 when `inode` enters `mapped_files` (never under Lock 5).
-fn register_mapper(inode: &dyn VfsInode, space: &Arc<AddressSpace>) {
-    let lock = page_cache::page_cache_mappers(inode).expect("every mapped file has a mappers list");
-    let ptr = Arc::as_ptr(space);
-    let mut mappers = lock.lock();
-    let mut present = false;
-    mappers.retain(|w| {
-        if w.strong_count() == 0 {
-            return false;
-        }
-        if core::ptr::eq(w.as_ptr(), ptr) {
-            present = true;
-        }
-        true
-    });
-    if !present {
-        mappers.push(Arc::downgrade(space));
-    }
-}
+/// Multiset of address spaces currently mapping one file (ARCHITECTURE
+/// section 5, B7; section 9 level 10c leaf spinlock, never acquired under
+/// the inode's `pages` lock).
+///
+/// Entries are owned by [`Mapped`] values inside each space's `mapped_files`.
+/// Keeping a multiset (register always pushes; drop removes one matching
+/// entry via `Weak::ptr_eq`) ensures a `Mapped` dropped after Lock 1 is
+/// released can never erase a fresh registration from a concurrent `mmap_file`
+/// of the same file. Dead `Weak`s are pruned at each registration.
+pub struct Mappers(SpinLock<Vec<Weak<AddressSpace>>>);
 
-/// Remove `space` (and any dead `Weak` entries) from `inode`'s mappers list.
-/// Frees the list's backing buffer when empty.
-fn unregister_mapper(inode: &dyn VfsInode, space: *const AddressSpace) {
-    let Some(lock) = page_cache::page_cache_mappers(inode) else {
-        return;
-    };
-    let mut mappers = lock.lock();
-    mappers.retain(|w| w.strong_count() > 0 && !core::ptr::eq(w.as_ptr(), space));
-    if mappers.is_empty() {
-        *mappers = Vec::new();
+impl Mappers {
+    pub const fn new() -> Self {
+        Self(SpinLock::new(Vec::new()))
     }
-}
 
-/// Snapshot all live address spaces currently registered on `inode`'s mappers
-/// list, upgrading each `Weak` outside the list's spinlock.
-fn snapshot_mappers(inode: &dyn VfsInode) -> Vec<Arc<AddressSpace>> {
-    let Some(lock) = page_cache::page_cache_mappers(inode) else {
-        return Vec::new();
-    };
-    let weaks: Vec<Weak<AddressSpace>> = {
-        let mut mappers = lock.lock();
-        mappers.retain(|w| w.strong_count() > 0);
-        if mappers.is_empty() {
-            *mappers = Vec::new();
-            return Vec::new();
+    fn register(&self, space: &Arc<AddressSpace>) {
+        let mut list = self.0.lock();
+        list.retain(|w| w.strong_count() > 0);
+        list.push(Arc::downgrade(space));
+    }
+
+    fn unregister_one(&self, space: &Weak<AddressSpace>) {
+        let mut list = self.0.lock();
+        if let Some(idx) = list.iter().position(|w| Weak::ptr_eq(w, space)) {
+            list.swap_remove(idx);
         }
-        mappers.clone()
-    };
-    weaks.into_iter().filter_map(|w| w.upgrade()).collect()
+        if list.is_empty() {
+            *list = Vec::new();
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Arc<AddressSpace>> {
+        let weaks = self.0.lock().clone();
+        weaks.into_iter().filter_map(|w| w.upgrade()).collect()
+    }
+
+    #[cfg(feature = "ktest")]
+    pub(crate) fn len(&self) -> usize {
+        self.0.lock().len()
+    }
 }
 
 /// Unmap every page of `inode` at or past `align_up_page(new_size)` in every
 /// address space currently mapping it (ARCHITECTURE section 5, B7).
 ///
 /// Must be called once the inode's truncate has returned, with no VFS or
-/// address-space lock held and interrupts enabled. Snapshots `inode`'s mappers
-/// list (upgrading each `Weak` outside the list's spinlock) and calls
-/// [`AddressSpace::invalidate_file_from`] on each space in turn, each under
-/// its own Lock 1 with its own cross-CPU TLB shootdown. Returns the total
-/// number of unmapped leaves across all spaces.
+/// address-space lock held and interrupts enabled. Snapshots `inode`'s
+/// [`Mappers`] list (upgrading each `Weak` outside the list's spinlock) and
+/// calls [`AddressSpace::invalidate_file_from`] on each space in turn, each
+/// under its own Lock 1 with its own cross-CPU TLB shootdown. Returns the
+/// total number of unmapped leaves across all spaces.
 pub fn invalidate_file_mappings(inode: &dyn VfsInode, new_size: u64) -> usize {
     invalidate_file_mappings_with(inode, new_size, || {})
 }
 
 fn invalidate_file_mappings_with(inode: &dyn VfsInode, new_size: u64, after_snapshot: impl FnOnce()) -> usize {
-    let spaces = snapshot_mappers(inode);
+    let spaces = page_cache::page_cache_mappers(inode).map_or_else(Vec::new, Mappers::snapshot);
     after_snapshot();
     let file_id = file_id_of(inode);
     spaces.into_iter().map(|space| space.invalidate_file_from(file_id, new_size)).sum()
@@ -462,6 +452,56 @@ impl KeptFile {
     fn inode(&self) -> &Arc<dyn VfsInode> {
         self.guard.inode()
     }
+}
+
+/// An address space's live registration on a mapped file's [`Mappers`] list,
+/// paired with its [`KeptFile`] open reference. Intentionally not `Clone`:
+/// copying into a forked child must go through [`Self::fork_for`], which
+/// registers the child; dropping removes one matching entry from the inode's
+/// mappers list (taking only the level 10c leaf spinlock, never a sleeping
+/// lock).
+struct Mapped {
+    kept: KeptFile,
+    space: Weak<AddressSpace>,
+}
+
+impl Mapped {
+    fn register(kept: KeptFile, space: &Arc<AddressSpace>) -> Self {
+        page_cache::page_cache_mappers(&**kept.inode()).expect("every mapped file has a mappers list").register(space);
+        Self { kept, space: Arc::downgrade(space) }
+    }
+
+    fn fork_for(&self, child: &Arc<AddressSpace>) -> Self {
+        Self::register(self.kept.clone(), child)
+    }
+
+    fn inode(&self) -> &Arc<dyn VfsInode> {
+        self.kept.inode()
+    }
+
+    fn path(&self) -> &[u8] {
+        &self.kept.path
+    }
+
+    fn guard(&self) -> &OpenGuard {
+        &self.kept.guard
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        page_cache::page_cache_mappers(&**self.kept.inode())
+            .expect("every mapped file has a mappers list")
+            .unregister_one(&self.space);
+    }
+}
+
+/// Named test seams for [`AddressSpace::fork_copy_inner`]; no-ops in
+/// production calls.
+struct ForkSeams<R, S, P> {
+    before_register: R,
+    before_sizes: S,
+    after_precount: P,
 }
 
 /// A file as `/proc/<pid>/maps` names an ELF image's lines: its device,
@@ -742,32 +782,27 @@ impl AddressSpace {
     /// leaves may remain read-only, and newly populated shared anonymous
     /// pages stay as demand-zero-equivalent pages at count one.
     pub fn fork_copy(self: &Arc<Self>) -> Result<Arc<Self>, UserVmError> {
-        self.fork_copy_inner(|| {}, || {})
+        self.fork_copy_inner(ForkSeams { before_register: || {}, before_sizes: || {}, after_precount: || {} })
     }
 
-    /// Test allocator contention after preflight, without bypassing the
-    /// production precheck, population, or rollback paths.
+    /// Run a test hook after child mapper registration, `file_sizes`, and the
+    /// shared-anonymous precount, without bypassing the production check,
+    /// population, or rollback paths (used for allocator contention and for
+    /// B7's post-registration truncate race).
     #[cfg(feature = "ktest")]
     pub(super) fn fork_copy_after_precount(
         self: &Arc<Self>,
         after_precount: impl FnOnce(),
     ) -> Result<Arc<Self>, UserVmError> {
-        self.fork_copy_inner(|| {}, after_precount)
+        self.fork_copy_inner(ForkSeams { before_register: || {}, before_sizes: || {}, after_precount })
     }
 
-    /// Test a truncate taking its mapper snapshot while `fork_copy` holds both
-    /// Lock 1s right before registering the child on each mapped file.
-    #[cfg(feature = "ktest")]
-    fn fork_copy_before_register(self: &Arc<Self>, before_register: impl FnOnce()) -> Result<Arc<Self>, UserVmError> {
-        self.fork_copy_inner(before_register, || {})
-    }
-
-    fn fork_copy_inner(
+    fn fork_copy_inner<R: FnOnce(), S: FnOnce(), P: FnOnce()>(
         self: &Arc<Self>,
-        before_register: impl FnOnce(),
-        after_precount: impl FnOnce(),
+        seams: ForkSeams<R, S, P>,
     ) -> Result<Arc<Self>, UserVmError> {
-        // Declared first: rollback drops the child only after both Lock 1s.
+        // Declared first: rollback drops the child (and its `Mapped` entries)
+        // only after both Lock 1s are released.
         let child = Arc::new(Self::new()?);
         let parent = self.inner.lock();
         if parent.torn_down {
@@ -778,30 +813,22 @@ impl AddressSpace {
         copied.vmas = parent.vmas.clone();
         copied.brk = parent.brk;
         copied.images = parent.images.clone();
-        copied.mapped_files = parent.mapped_files.clone();
-        before_register();
+        (seams.before_register)();
         // Register the child before reading sizes, while both Lock 1s exclude
         // faults and invalidation (ARCHITECTURE section 5, B7): a truncate
         // that snapshotted mappers before this registration has already set
         // the new size that `file_sizes` reads next; one snapshotting after
         // holds `child` and waits on `child.inner` until this copy finishes.
-        for kept in copied.mapped_files.values() {
-            register_mapper(&**kept.inode(), &child);
-        }
+        copied.mapped_files = parent.mapped_files.iter().map(|(&id, m)| (id, m.fork_for(&child))).collect();
+        (seams.before_sizes)();
         let mut populated = 0;
         let result = file_sizes(&copied).and_then(|sizes| {
             self.fork_check_shared_anon(&parent)?;
-            after_precount();
+            (seams.after_precount)();
             self.fork_populate_shared_anon(&parent, &mut populated)?;
             self.fork_share_leaves(&parent, &child, &mut copied, &sizes)
         });
         tlb::shoot_down(self, Shoot::Full);
-        if result.is_err() {
-            let child_ptr = Arc::as_ptr(&child);
-            for kept in copied.mapped_files.values() {
-                unregister_mapper(&**kept.inode(), child_ptr);
-            }
-        }
         drop(copied);
         drop(parent);
         if let Err(error) = &result
@@ -1128,13 +1155,16 @@ impl AddressSpace {
     /// refuses `mmap` of one that isn't (`EACCES`), and the syscall checks
     /// that before calling this.
     ///
-    /// Nothing is mapped until a fault ([`Self::handle_page_fault`]). The
-    /// address space keeps `file`'s open reference while any VMA maps the
-    /// file, so closing the descriptor keeps the mapping valid; when the
-    /// file is mapped already, the first mapping's reference (and so its
-    /// path, for `/proc/<pid>/maps`) is the one kept ([`KeptFile`]), and
-    /// `file`'s is dropped once `inner` is released. `MAP_FIXED` releases
-    /// what it replaces as `munmap` does.
+    /// Nothing is mapped until a fault ([`Self::handle_page_fault`]). Takes
+    /// `self: &Arc<Self>` so it can register this space on the inode's
+    /// [`Mappers`] list (via [`Mapped`]) when inserting the file's
+    /// `mapped_files` entry under Lock 1, before any fault can map a page of
+    /// it. The address space keeps `file`'s open reference and registration
+    /// while any VMA maps the file, so closing the descriptor keeps the
+    /// mapping valid; when the file is mapped already, the first mapping's
+    /// reference (and so its path, for `/proc/<pid>/maps`) is the one kept
+    /// ([`KeptFile`]), and `file`'s is dropped once `inner` is released.
+    /// `MAP_FIXED` releases what it replaces as `munmap` does.
     pub fn mmap_file(
         self: &Arc<Self>,
         place: MapPlace,
@@ -1164,9 +1194,7 @@ impl AddressSpace {
         }
         let mapped = inner.vmas.map_file(place, len, prot, mapping)?;
         if let alloc::collections::btree_map::Entry::Vacant(slot) = inner.mapped_files.entry(file_id) {
-            let kept = spare.take().expect("taken once");
-            register_mapper(&**kept.inode(), self);
-            slot.insert(kept);
+            slot.insert(Mapped::register(spare.take().expect("taken once"), self));
         }
         self.unmap_vmas_locked(&mut inner, &mapped.unmapped, &mut gone_files);
         Ok(mapped.start)
@@ -1189,14 +1217,15 @@ impl AddressSpace {
 
     /// Unmap every page of file `file_id` ([`file_id_of`]) at or past
     /// `align_up_page(new_size)`, in every VMA mapping it: the cache's pages
-    /// released and private-copy references dropped, in the unmap order. The VMAs stay,
-    /// so a later access past the new end faults into
-    /// [`FaultResult::BusError`]. `truncate` and `ftruncate`
-    /// (`syscall::meta`) and `openat(O_TRUNC)` (`syscall::fd`) call it once
-    /// the inode's truncate has returned, holding no VFS lock (ARCHITECTURE
-    /// section 5): a page the cache has dropped stays alive, pinned by the
-    /// mapping, until this unmaps it. Returns how many leaves (present or
-    /// `PROT_NONE`) were unmapped; pages never faulted in count for nothing.
+    /// released and private-copy references dropped, in the unmap order. The
+    /// VMAs stay, so a later access past the new end faults into
+    /// [`FaultResult::BusError`]. Reached through [`invalidate_file_mappings`],
+    /// once per registered address space, after `truncate`/`ftruncate`
+    /// (`syscall::meta`) or `openat(O_TRUNC)` (`syscall::fd`) has returned
+    /// from the inode's truncate with no VFS lock held (ARCHITECTURE section
+    /// 5): a page the cache has dropped stays alive, pinned by the mapping,
+    /// until this unmaps it. Returns how many leaves (present or `PROT_NONE`)
+    /// were unmapped; pages never faulted in count for nothing.
     ///
     /// Retires translations across every CPU that currently has this space
     /// loaded (`tlb::shoot_down`) before dropping the removed pages' cache
@@ -1712,10 +1741,6 @@ impl AddressSpace {
         inner.pinned_pages.clear();
         inner.images.clear();
         gone_files = core::mem::take(&mut inner.mapped_files);
-        let me = self as *const AddressSpace;
-        for kept in gone_files.values() {
-            unregister_mapper(&**kept.inode(), me);
-        }
         inner.torn_down = true;
         drop(inner);
         drop(gone_files);
@@ -1768,7 +1793,7 @@ impl AddressSpace {
                 major: dev.major(),
                 minor: dev.minor(),
                 ino: inode.ino(),
-                path: &m.path,
+                path: m.path(),
                 deleted: inode.is_detached(),
             })
         };
@@ -1820,7 +1845,7 @@ impl AddressSpace {
                     .get(&fm.file_id)
                     .expect("a mapped file stays in mapped_files while a VMA maps it");
                 seen.push(fm.file_id);
-                found.shared.push(mapped.guard.clone());
+                found.shared.push(mapped.guard().clone());
             }
         }
         if covered < end {
@@ -1853,13 +1878,14 @@ impl AddressSpace {
     }
 
     /// Unmap the PTEs of `removed` (VMAs `VmaMap` just took out) and move
-    /// the open references of files no VMA maps any more into `gone`.
-    fn unmap_vmas_locked(&self, inner: &mut AddressSpaceInner, removed: &[Vma], gone: &mut Vec<KeptFile>) {
+    /// the open references and mappers registrations of files no VMA maps any
+    /// more into `gone`.
+    fn unmap_vmas_locked(&self, inner: &mut AddressSpaceInner, removed: &[Vma], gone: &mut Vec<Mapped>) {
         for vma in removed {
             self.unmap_range_locked(inner, vma.start, vma.end);
             ImageRange::trim(&mut inner.images, vma.start, vma.end);
         }
-        release_unmapped_files(self as *const AddressSpace, inner, gone);
+        release_unmapped_files(inner, gone);
     }
 
     /// [`Self::unmap_range_locked`] for the one page at `page_va`.
@@ -2158,12 +2184,12 @@ fn map_error_fault(err: MapError) -> FaultResult {
     }
 }
 
-/// Move the open references of files no VMA maps any more out of
-/// `mapped_files` into `gone`, unregistering `space` from each removed file's
-/// mappers list under Lock 1; the caller drops `gone` once `inner` is
-/// released. Liveness is read from the VMAs as they are now, so a
-/// `MAP_FIXED` replace by the same file keeps its reference and registration.
-fn release_unmapped_files(space: *const AddressSpace, inner: &mut AddressSpaceInner, gone: &mut Vec<KeptFile>) {
+/// Move the [`Mapped`] entries of files no VMA maps any more out of
+/// `mapped_files` into `gone`, which the caller drops once `inner` is
+/// released (unregistering each from its inode's [`Mappers`] list and
+/// dropping its open reference). Liveness is read from the VMAs as they are
+/// now, so a `MAP_FIXED` replace by the same file keeps its entry.
+fn release_unmapped_files(inner: &mut AddressSpaceInner, gone: &mut Vec<Mapped>) {
     if inner.mapped_files.is_empty() {
         return;
     }
@@ -2174,9 +2200,8 @@ fn release_unmapped_files(space: *const AddressSpace, inner: &mut AddressSpaceIn
         .filter(|&id| !inner.vmas.iter().any(|v| matches!(v.backing, Backing::File(fm) if fm.file_id == id)))
         .collect();
     for id in unused {
-        if let Some(guard) = inner.mapped_files.remove(&id) {
-            unregister_mapper(&**guard.inode(), space);
-            gone.push(guard);
+        if let Some(mapped) = inner.mapped_files.remove(&id) {
+            gone.push(mapped);
         }
     }
 }
@@ -2188,7 +2213,6 @@ impl Drop for AddressSpace {
         assert_eq!(active, 0, "AddressSpace dropped while active on CPUs {active:#x}");
         // No sleeping lock needed: `&mut self` guarantees exclusive access, so
         // `Drop` is safe even inside `sched::finish_switch` with interrupts off.
-        let me = core::ptr::from_ref(self);
         let inner = self.inner.get_mut();
         if inner.torn_down {
             // SAFETY: lower half was already cleared by `teardown()`; only the
@@ -2210,13 +2234,9 @@ impl Drop for AddressSpace {
             // SAFETY: all leaves were removed above; only exclusively owned
             // empty tables remain, and no CPU holds this root.
             unsafe { paging::destroy_user_root(self.root, |_| unreachable!("all user leaves removed")) };
-            // No CPU holds this `CR3`: that was the flush. Unregister from
-            // every mapped inode's mappers list and drop the kept references
-            // (taking no sleeping lock: `mappers` is a leaf spinlock and
-            // `VfsInode::drop` takes no sleeping lock).
-            for kept in inner.mapped_files.values() {
-                unregister_mapper(&**kept.inode(), me);
-            }
+            // No CPU holds this `CR3`: that was the flush. Dropping each
+            // `Mapped` unregisters from its inode's leaf `Mappers` spinlock
+            // and drops its open reference (taking no sleeping lock).
             inner.writable_maps.clear();
             inner.pinned_pages.clear();
             inner.mapped_files.clear();
@@ -2503,6 +2523,12 @@ pub(crate) fn ktest_any_leaf(space: &AddressSpace, addr: u64) -> Result<lumen_mm
 #[cfg(feature = "ktest")]
 pub(crate) fn file_vm_leaf(space: &AddressSpace, va: u64) -> Option<lumen_mm::paging::Mapping> {
     paging::walk_user(space.root(), VirtAddr::new(va)?).mapping()
+}
+
+/// Number of entries currently on `inode`'s [`Mappers`] list, for ktests.
+#[cfg(feature = "ktest")]
+pub(crate) fn file_vm_mappers(inode: &dyn VfsInode) -> usize {
+    page_cache::page_cache_mappers(inode).map_or(0, Mappers::len)
 }
 
 /// Run `check` in a fresh `tmpfs`'s root, then in a fresh `ext4` volume's
@@ -3053,8 +3079,10 @@ crate::ktest!(
         // `writable_maps`, and every way out uncounts it: `mprotect` (to
         // read-only, or `PROT_NONE`, which keeps the pin), a store after it
         // counting again, a partial `munmap`, `MAP_FIXED` replacing it,
-        // `teardown`, and `Drop` without a teardown. `mapped_files` keeps
-        // the file open until its last VMA goes.
+        // `brk` shrinking over it, `teardown`, and `Drop` without a teardown.
+        // `mapped_files` keeps the file open and registered on its `Mappers`
+        // list until its last VMA goes (a `MAP_FIXED` replace by the same file
+        // keeps its registration).
         use crate::user::{CopyError, copy_from_user, copy_to_user};
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
@@ -3093,12 +3121,12 @@ crate::ktest!(
                 kassert_eq!(counts(), (1, 1));
                 space.munmap(base + P, P).map_err(|_| "munmap half")?;
                 kassert_eq!(counts(), (1, 0));
-                kassert_eq!(space.mapped_file_count(), 1); // the other half still maps it
+                kassert_eq!((space.mapped_file_count(), file_vm_mappers(&*f)), (1, 1)); // the other half still maps it
             }
             space.teardown();
             kassert_eq!(counts(), (0, 0));
             kassert_eq!(space.file_page_counts(), (0, 0));
-            kassert_eq!((space.mapped_file_count(), f.open_count()), (0, opens));
+            kassert_eq!((space.mapped_file_count(), f.open_count(), file_vm_mappers(&*f)), (0, opens, 0));
             drop(space);
 
             // `MAP_FIXED` over a mapping: released as by `munmap`.
@@ -3111,11 +3139,12 @@ crate::ktest!(
             let fixed = u64::from(general::MAP_PRIVATE | general::MAP_ANONYMOUS | general::MAP_FIXED);
             kassert_eq!(space.mmap_anon(base, P, RW, fixed), Ok(base));
             kassert_eq!(counts(), (0, 0));
-            kassert_eq!((space.mapped_file_count(), f.open_count()), (0, opens));
-            // A file mapped over itself keeps its reference.
+            kassert_eq!((space.mapped_file_count(), f.open_count(), file_vm_mappers(&*f)), (0, opens, 0));
+            // A file mapped over itself keeps its reference and registration.
             space
                 .mmap_file(MapPlace::Fixed(base), P, RW, file_vm_open(&f)?, 0, Sharing::Shared)
                 .map_err(|_| "map 3")?;
+            kassert_eq!(file_vm_mappers(&*f), 1);
             // ... and a file page faulted in there is released by the next.
             kassert_eq!(space.handle_page_fault(base, 1 << 1), FaultResult::Resolved);
             kassert_eq!((counts(), space.file_page_counts()), ((1, 0), (1, 1)));
@@ -3123,7 +3152,7 @@ crate::ktest!(
                 .mmap_file(MapPlace::Fixed(base), P, RW, file_vm_open(&f)?, P, Sharing::Shared)
                 .map_err(|_| "map 4")?;
             kassert_eq!((counts(), space.file_page_counts()), ((0, 0), (0, 0)));
-            kassert_eq!((space.mapped_file_count(), f.open_count()), (1, opens + 1));
+            kassert_eq!((space.mapped_file_count(), f.open_count(), file_vm_mappers(&*f)), (1, opens + 1, 1));
             {
                 let _active = crate::sched::UserSpaceGuard::enter(space.clone());
                 let mut head = [0u8; 8];
@@ -3131,21 +3160,30 @@ crate::ktest!(
                 kassert!(head[..] == ktest_files::read(&f, P, 8)?[..]); // file page 1 now
             }
 
-            // A `brk` shrink over a file mapped inside the heap: released.
+            // A full `munmap` and a `brk` shrink over a file mapped inside the
+            // heap both release its reference and mappers registration.
             let heap = Arc::new(AddressSpace::new().map_err(|_| "AddressSpace::new")?);
+            let unmapped = heap
+                .mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(&f)?, 0, Sharing::Shared)
+                .map_err(|_| "map munmap")?;
+            kassert_eq!(file_vm_mappers(&*f), 2);
+            heap.munmap(unmapped, P).map_err(|_| "full munmap")?;
+            kassert_eq!((heap.mapped_file_count(), file_vm_mappers(&*f)), (0, 1));
             let b0 = heap.brk(0);
             kassert_eq!(heap.brk(b0 + 2 * P), b0 + 2 * P);
             heap.mmap_file(MapPlace::Fixed(b0 + P), P, RW, file_vm_open(&f)?, 0, Sharing::Shared)
                 .map_err(|_| "map 5")?;
+            kassert_eq!(file_vm_mappers(&*f), 2);
             kassert_eq!(heap.handle_page_fault(b0 + P, 1 << 1), FaultResult::Resolved);
             kassert_eq!(counts(), (1, 0));
             kassert_eq!(heap.brk(b0), b0);
             kassert_eq!((counts(), heap.file_page_counts()), ((0, 0), (0, 0)));
-            kassert_eq!((heap.mapped_file_count(), f.open_count()), (0, opens + 1)); // `space` still maps it
+            kassert_eq!((heap.mapped_file_count(), f.open_count(), file_vm_mappers(&*f)), (0, opens + 1, 1)); // `space` still maps it
             drop(heap);
 
             // `Drop` without a teardown (an error path) releases too: the
-            // count, the pin, a private copy (freed), and the reference.
+            // count, the pin, a private copy (freed), the reference, and the
+            // mappers registration.
             kassert_eq!(space.handle_page_fault(base, 1 << 1), FaultResult::Resolved);
             kassert_eq!(counts(), (0, 1));
             kassert!(Arc::strong_count(p1.page()) > 2); // the pin and the guard too
@@ -3160,7 +3198,7 @@ crate::ktest!(
             kassert_eq!(Arc::strong_count(p1.page()), 2); // the cache's and `p1`'s
             kassert!(!frame::is_allocated(copy));
             kassert!(frame::is_allocated(p1.page().phys_frame()));
-            kassert_eq!(f.open_count(), opens);
+            kassert_eq!((f.open_count(), file_vm_mappers(&*f)), (opens, 0));
             Ok(())
         })
     }
@@ -3331,11 +3369,11 @@ crate::ktest!(
 crate::ktest!(
     fn file_vm_store_after_a_truncate_maps_the_files_current_page() {
         // A truncate that doesn't invalidate mappings (`VfsInode::truncate`
-        // called directly; another process's mapping until M8) lets the cache
-        // drop a page a read-only leaf still maps. A store before it
-        // regrows is a bus error that drops the leaf; after it regrows, a
-        // store maps the file's current page (`MAP_SHARED`) or copies it
-        // (`MAP_PRIVATE`), not the dropped one.
+        // called directly, or a kernel-side truncate that skips invalidation)
+        // lets the cache drop a page a read-only leaf still maps. A store
+        // before it regrows is a bus error that drops the leaf; after it
+        // regrows, a store maps the file's current page (`MAP_SHARED`) or
+        // copies it (`MAP_PRIVATE`), not the dropped one.
         use crate::user::{copy_from_user, copy_to_user};
         use crate::{kassert, kassert_eq};
         const P: u64 = PAGE_SIZE;
@@ -3703,10 +3741,22 @@ crate::ktest!(
     }
 );
 
-/// Number of entries currently on `inode`'s mappers list, for B7 ktests.
+/// Signals `stop` and joins a spawned ktest helper thread on drop, so early
+/// errors never leave a background thread behind.
 #[cfg(feature = "ktest")]
-fn mappers_count(inode: &dyn VfsInode) -> usize {
-    page_cache::page_cache_mappers(inode).map_or(0, |lock| lock.lock().len())
+struct StopOnDrop {
+    stop: Arc<core::sync::atomic::AtomicBool>,
+    handle: Option<crate::sched::JoinHandle>,
+}
+
+#[cfg(feature = "ktest")]
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            h.join();
+        }
+    }
 }
 
 crate::ktest!(
@@ -3714,12 +3764,13 @@ crate::ktest!(
         // B7: two spaces mapping one file, the second loaded on another CPU,
         // and a third forked from the first. A shrinking truncate invalidates
         // every mapped space (shooting down the remote CPU's TLB) so none
-        // reads past the new end; spaces torn down or dropped beforehand are
-        // removed from the inode's mappers list.
+        // reads past the new end; unregistration on munmap/MAP_FIXED/brk/
+        // teardown/Drop is checked in
+        // `file_vm_writable_maps_balance_through_mprotect_unmap_and_teardown`.
         use crate::arch::MAX_CPUS;
-        use crate::sched::{self, JoinHandle, UserSpaceGuard};
+        use crate::sched::{self, UserSpaceGuard};
         use crate::smp;
-        use crate::user::{CopyError, copy_from_user, copy_to_user, read_u32_nofault};
+        use crate::user::{copy_from_user, copy_to_user, read_u32_nofault};
         use crate::{kassert, kassert_eq};
         use core::sync::atomic::AtomicBool;
         const P: u64 = PAGE_SIZE;
@@ -3729,25 +3780,15 @@ crate::ktest!(
             .find(|&cpu| cpu != here && smp::online_lapic_id(cpu).is_some())
             .ok_or("truncate_unmaps_every_address_space requires at least 2 online CPUs")?;
 
-        struct JoinGuard {
+        struct ProbeState {
+            primed: AtomicBool,
+            after: AtomicBool,
             stop: Arc<AtomicBool>,
-            handle: Option<JoinHandle>,
-        }
-        impl JoinGuard {
-            fn join(mut self) {
-                self.stop.store(true, Ordering::Release);
-                if let Some(h) = self.handle.take() {
-                    h.join();
-                }
-            }
-        }
-        impl Drop for JoinGuard {
-            fn drop(&mut self) {
-                self.stop.store(true, Ordering::Release);
-                if let Some(h) = self.handle.take() {
-                    h.join();
-                }
-            }
+            bad_before: AtomicBool,
+            stale_after: AtomicU64,
+            faults_after: AtomicU64,
+            p0_ok_after: AtomicBool,
+            p1_tail_zero: AtomicBool,
         }
 
         const P0_VAL: u32 = 0x1122_3344;
@@ -3761,35 +3802,6 @@ crate::ktest!(
             data[2 * P as usize..2 * P as usize + 4].copy_from_slice(&P2_VAL.to_ne_bytes());
             let f = ktest_files::file(dir, "multi.bin", &data)?;
             let page2_cache = mmap_page(&f, 2).map_err(|_| "mmap_page 2")?;
-
-            // A space that unmaps its last VMA, a space torn down, and a space
-            // dropped without teardown all leave the inode's mappers list.
-            {
-                let gone_unmap = Arc::new(AddressSpace::new().map_err(|_| "gone_unmap")?);
-                let u_va = gone_unmap
-                    .mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(&f)?, 0, Sharing::Shared)
-                    .map_err(|_| "map gone_unmap")?;
-                kassert_eq!(mappers_count(&*f), 1);
-                gone_unmap.munmap(u_va, P).map_err(|_| "munmap gone_unmap")?;
-                kassert_eq!(mappers_count(&*f), 0);
-                gone_unmap.teardown();
-
-                let gone_td = Arc::new(AddressSpace::new().map_err(|_| "gone_td")?);
-                gone_td
-                    .mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(&f)?, 0, Sharing::Shared)
-                    .map_err(|_| "map gone_td")?;
-                kassert_eq!(mappers_count(&*f), 1);
-                gone_td.teardown();
-                kassert_eq!(mappers_count(&*f), 0);
-
-                let gone_drop = Arc::new(AddressSpace::new().map_err(|_| "gone_drop")?);
-                gone_drop
-                    .mmap_file(MapPlace::Hint(None), P, Prot::READ, file_vm_open(&f)?, 0, Sharing::Shared)
-                    .map_err(|_| "map gone_drop")?;
-                kassert_eq!(mappers_count(&*f), 1);
-                drop(gone_drop);
-                kassert_eq!(mappers_count(&*f), 0);
-            }
 
             // Space 1: shared + private mappings of `f`, faulted in on all 3 pages.
             let space1 = Arc::new(AddressSpace::new().map_err(|_| "space1")?);
@@ -3816,8 +3828,6 @@ crate::ktest!(
             let s2_shared = space2
                 .mmap_file(MapPlace::Hint(None), 3 * P, RW, file_vm_open(&f)?, 0, Sharing::Shared)
                 .map_err(|_| "s2 shared")?;
-            // Pre-fault pages 0, 1, 2 into space2's page tables so `other_cpu`
-            // can load them straight into its TLB with `read_u32_nofault`.
             for p in 0..3 {
                 kassert_eq!(space2.handle_page_fault(s2_shared + p * P, 0), FaultResult::Resolved);
             }
@@ -3826,68 +3836,56 @@ crate::ktest!(
             // page 2 and registers itself on `f`'s mappers list during fork).
             let space3 = space1.fork_copy().map_err(|_| "fork space3")?;
             kassert_eq!(frame::user_count(priv_p2_phys), 2);
-            // Also fault in page 2 of space 3's shared mapping so it holds both
-            // a page-cache leaf and a private CoW leaf past the future EOF.
             kassert_eq!(space3.handle_page_fault(s1_shared + 2 * P, 1 << 1), FaultResult::Resolved);
-            kassert_eq!(mappers_count(&*f), 3);
+            kassert_eq!(file_vm_mappers(&*f), 3);
 
             // Launch the probe thread on `other_cpu` holding `space2` in CR3.
-            let primed = Arc::new(AtomicBool::new(false));
-            let after = Arc::new(AtomicBool::new(false));
             let stop = Arc::new(AtomicBool::new(false));
-            let bad_before = Arc::new(AtomicBool::new(false));
-            let stale_after = Arc::new(AtomicU64::new(0));
-            let faults_after = Arc::new(AtomicU64::new(0));
-            let p0_ok_after = Arc::new(AtomicBool::new(false));
-            let p1_tail_zero = Arc::new(AtomicBool::new(false));
-
-            let guard = JoinGuard {
+            let probe = Arc::new(ProbeState {
+                primed: AtomicBool::new(false),
+                after: AtomicBool::new(false),
                 stop: stop.clone(),
+                bad_before: AtomicBool::new(false),
+                stale_after: AtomicU64::new(0),
+                faults_after: AtomicU64::new(0),
+                p0_ok_after: AtomicBool::new(false),
+                p1_tail_zero: AtomicBool::new(false),
+            });
+
+            let guard = StopOnDrop {
+                stop,
                 handle: Some({
-                    let primed = primed.clone();
-                    let after = after.clone();
-                    let stop = stop.clone();
-                    let bad_before = bad_before.clone();
-                    let stale_after = stale_after.clone();
-                    let faults_after = faults_after.clone();
-                    let p0_ok_after = p0_ok_after.clone();
-                    let p1_tail_zero = p1_tail_zero.clone();
+                    let probe = probe.clone();
                     sched::spawn_user_on(other_cpu, "b7-trunc-probe", space2.clone(), move || {
-                        // Prime TLB entries for pages 0, 1, 2 on `other_cpu`.
                         let ok0 = read_u32_nofault(s2_shared) == Ok(P0_VAL);
                         let ok1 = read_u32_nofault(s2_shared + P) == Ok(P1_VAL);
                         let ok2 = read_u32_nofault(s2_shared + 2 * P) == Ok(P2_VAL);
                         if !(ok0 && ok1 && ok2) {
-                            bad_before.store(true, Ordering::Release);
+                            probe.bad_before.store(true, Ordering::Release);
                         }
-                        primed.store(true, Ordering::Release);
-                        while !stop.load(Ordering::Acquire) {
-                            let retired = after.load(Ordering::Acquire);
+                        probe.primed.store(true, Ordering::Release);
+                        while !probe.stop.load(Ordering::Acquire) {
+                            let retired = probe.after.load(Ordering::Acquire);
                             match read_u32_nofault(s2_shared + 2 * P) {
-                                Ok(_) => {
-                                    if retired {
-                                        stale_after.fetch_add(1, Ordering::Relaxed);
-                                    }
+                                Ok(_) if retired => {
+                                    probe.stale_after.fetch_add(1, Ordering::Relaxed);
                                 }
-                                Err(_) => {
-                                    if retired {
-                                        faults_after.fetch_add(1, Ordering::Relaxed);
-                                    }
+                                Err(_) if retired => {
+                                    probe.faults_after.fetch_add(1, Ordering::Relaxed);
                                 }
+                                _ => {}
                             }
                             core::hint::spin_loop();
                         }
-                        // Pages below the new end stay readable on `other_cpu`,
-                        // and page 1's tail past `P + 100` was zeroed.
-                        p0_ok_after.store(read_u32_nofault(s2_shared) == Ok(P0_VAL), Ordering::Release);
-                        p1_tail_zero.store(read_u32_nofault(s2_shared + P + 200) == Ok(0), Ordering::Release);
+                        probe.p0_ok_after.store(read_u32_nofault(s2_shared) == Ok(P0_VAL), Ordering::Release);
+                        probe.p1_tail_zero.store(read_u32_nofault(s2_shared + P + 200) == Ok(0), Ordering::Release);
                     })
                     .map_err(|_| "spawn remote probe")?
                 }),
             };
 
             let remote_bit = 1u64 << other_cpu;
-            kassert!(sched::yield_until(|| primed.load(Ordering::Acquire)));
+            kassert!(sched::yield_until(|| probe.primed.load(Ordering::Acquire)));
             kassert!(sched::yield_until(|| (space2.active_mask() & remote_bit) == remote_bit));
 
             // Shrink `f` to `P + 100` (pages 0 and 1 survive; page 2 is past EOF)
@@ -3899,36 +3897,28 @@ crate::ktest!(
 
             // Confirm `other_cpu` immediately faults on page 2 with zero stale
             // reads (proving B5's cross-CPU shootdown ran before we returned).
-            after.store(true, Ordering::Release);
+            probe.after.store(true, Ordering::Release);
             kassert!(sched::yield_until(|| {
-                faults_after.load(Ordering::Relaxed) >= 32 || stale_after.load(Ordering::Relaxed) > 0
+                probe.faults_after.load(Ordering::Relaxed) >= 32 || probe.stale_after.load(Ordering::Relaxed) > 0
             }));
-            guard.join();
-            kassert!(!bad_before.load(Ordering::Acquire));
-            kassert_eq!(stale_after.load(Ordering::Relaxed), 0);
-            kassert!(faults_after.load(Ordering::Relaxed) >= 32);
-            kassert!(p0_ok_after.load(Ordering::Acquire));
-            kassert!(p1_tail_zero.load(Ordering::Acquire));
+            drop(guard);
+            kassert!(!probe.bad_before.load(Ordering::Acquire));
+            kassert_eq!(probe.stale_after.load(Ordering::Relaxed), 0);
+            kassert!(probe.faults_after.load(Ordering::Relaxed) >= 32);
+            kassert!(probe.p0_ok_after.load(Ordering::Acquire));
+            kassert!(probe.p1_tail_zero.load(Ordering::Acquire));
 
-            // Check space 1, space 2, and space 3: none reads past the new end;
-            // pages below the new end stay intact.
-            for (space, shared_va) in [(&space1, s1_shared), (&space2, s2_shared), (&space3, s1_shared)] {
-                kassert!(file_vm_leaf(space, shared_va + 2 * P).is_none());
-                kassert_eq!(space.handle_page_fault(shared_va + 2 * P, 0), FaultResult::BusError);
-                let _active = UserSpaceGuard::enter(space.clone());
-                let mut byte = [0u8; 4];
-                kassert_eq!(copy_from_user(&mut byte, shared_va + 2 * P), Err(CopyError::Fault));
-                kassert_eq!(copy_from_user(&mut byte, shared_va), Ok(()));
-                kassert_eq!(byte, P0_VAL.to_ne_bytes());
-            }
-            for space in [&space1, &space3] {
-                kassert!(file_vm_leaf(space, s1_priv + 2 * P).is_none());
-                kassert_eq!(space.handle_page_fault(s1_priv + 2 * P, 0), FaultResult::BusError);
-                let _active = UserSpaceGuard::enter(space.clone());
-                let mut buf = [0u8; 7];
-                kassert_eq!(copy_from_user(&mut buf, s1_priv + 2 * P), Err(CopyError::Fault));
-                kassert_eq!(copy_from_user(&mut buf, s1_priv), Ok(()));
-                kassert_eq!(&buf, b"keep-p0");
+            // Every space's page-2 leaves (shared and private CoW) are gone
+            // and refault into `BusError`.
+            for (space, va) in [
+                (&space1, s1_shared + 2 * P),
+                (&space1, s1_priv + 2 * P),
+                (&space2, s2_shared + 2 * P),
+                (&space3, s1_shared + 2 * P),
+                (&space3, s1_priv + 2 * P),
+            ] {
+                kassert!(file_vm_leaf(space, va).is_none());
+                kassert_eq!(space.handle_page_fault(va, 0), FaultResult::BusError);
             }
 
             // Both spaces released the shared CoW copy of page 2 and the
@@ -3939,7 +3929,7 @@ crate::ktest!(
             space1.teardown();
             space2.teardown();
             space3.teardown();
-            kassert_eq!(mappers_count(&*f), 0);
+            kassert_eq!(file_vm_mappers(&*f), 0);
             kassert_eq!(f.open_count(), 0);
             Ok(())
         })
@@ -3949,41 +3939,28 @@ crate::ktest!(
 crate::ktest!(
     fn fork_racing_a_truncate_copies_nothing_past_eof() {
         // B7: a parent with private (copied) and page-cache leaves of a file
-        // past the new end. Both orderings around the `mappers` lock leave the
+        // past the new end. Both orderings around the `Mappers` lock leave the
         // child with nothing past EOF:
-        // 1. Truncate's mapper snapshot runs through a seam while `fork_copy`
-        //    holds the parent's Lock 1 BEFORE registering the child (so the
-        //    snapshot misses the child); `fork_copy` reads the file's size
-        //    after registering and copies nothing at or past the new end.
-        // 2. Truncate's mapper snapshot runs AFTER `fork_copy` registered the
-        //    child and read the old size; the snapshot includes the child,
-        //    waits on the child's Lock 1, and unmaps the copied leaf once
-        //    `fork_copy` releases it.
-        use crate::sched::{self, JoinHandle, UserSpaceGuard};
+        // 1. Truncate's mapper snapshot runs through `before_register` while
+        //    `fork_copy` holds both Lock 1s BEFORE registering the child (the
+        //    truncate thread asserts `mappers == 1`, so its snapshot misses
+        //    the child); `fork_copy` registers the child (`before_sizes`
+        //    asserts `mappers == 2`), then reads the new size and copies
+        //    nothing at or past EOF.
+        // 2. Truncate's mapper snapshot runs through `after_precount` AFTER
+        //    `fork_copy` registered the child (`mappers == 2`) and read the
+        //    old size; the snapshot includes the child and invalidates each
+        //    space in turn, each once `fork_copy` releases its Lock 1.
+        use crate::sched::{self, UserSpaceGuard};
         use crate::user::{CopyError, copy_from_user, copy_to_user};
         use crate::{kassert, kassert_eq};
-        use core::sync::atomic::AtomicBool;
+        use core::sync::atomic::{AtomicBool, AtomicU8};
         const P: u64 = PAGE_SIZE;
 
-        struct ThreadGuard {
-            abort: Arc<AtomicBool>,
-            handle: Option<JoinHandle>,
-        }
-        impl ThreadGuard {
-            fn join(mut self) {
-                if let Some(h) = self.handle.take() {
-                    h.join();
-                }
-            }
-        }
-        impl Drop for ThreadGuard {
-            fn drop(&mut self) {
-                self.abort.store(true, Ordering::Release);
-                if let Some(h) = self.handle.take() {
-                    h.join();
-                }
-            }
-        }
+        const TRUNC_PENDING: u8 = 0;
+        const TRUNC_OK: u8 = 1;
+        const TRUNC_BAD_MAPPERS: u8 = 2;
+        const TRUNC_ERR: u8 = 3;
 
         file_vm_on_both(380, |dir| {
             let f = ktest_files::file(dir, "race.bin", &ktest_files::pattern(3 * P as usize, 43))?;
@@ -3997,6 +3974,7 @@ crate::ktest!(
             let priv_ro_va = parent
                 .mmap_file(MapPlace::Hint(None), 3 * P, RW, file_vm_open(&f)?, 0, Sharing::Private)
                 .map_err(|_| "map priv ro")?;
+            let past_vas = [priv_va + 2 * P, shared_va + 2 * P, priv_ro_va + 2 * P];
 
             // Populate private (copied) and page-cache (both writable and
             // read-only) leaves past the future EOF (page 2), plus page 0 below.
@@ -4007,164 +3985,118 @@ crate::ktest!(
                 kassert_eq!(copy_to_user(priv_va + 2 * P, b"past-priv"), Ok(()));
                 kassert_eq!(copy_to_user(shared_va + 2 * P, b"past-shrd"), Ok(()));
                 kassert_eq!(copy_from_user(&mut byte, priv_ro_va + 2 * P), Ok(()));
-                let phys = file_vm_leaf(parent, priv_va + 2 * P).ok_or("priv p2 missing")?.phys;
-                kassert!(!file_vm_leaf(parent, priv_va + 2 * P).unwrap().shared);
-                kassert!(file_vm_leaf(parent, shared_va + 2 * P).unwrap().shared);
-                kassert!(file_vm_leaf(parent, priv_ro_va + 2 * P).unwrap().shared);
-                Ok(phys)
+                let priv_leaf = file_vm_leaf(parent, priv_va + 2 * P).ok_or("priv p2 missing")?;
+                kassert!(!priv_leaf.shared);
+                kassert!(file_vm_leaf(parent, shared_va + 2 * P).ok_or("shared p2 missing")?.shared);
+                kassert!(file_vm_leaf(parent, priv_ro_va + 2 * P).ok_or("priv ro p2 missing")?.shared);
+                Ok(priv_leaf.phys)
             };
 
-            // Phase 1: truncate snapshots mappers BEFORE `fork_copy` registers
-            // the child (the exact seam described in ARCHITECTURE §15).
-            {
-                let priv_p2_phys = populate(&parent)?;
-                let at_seam = Arc::new(AtomicBool::new(false));
-                let snapshot_done = Arc::new(AtomicBool::new(false));
-                let trunc_done = Arc::new(AtomicBool::new(false));
-                let abort = Arc::new(AtomicBool::new(false));
-                let trunc_err = Arc::new(AtomicBool::new(false));
-
-                let trunc = ThreadGuard {
-                    abort: abort.clone(),
-                    handle: Some({
-                        let f = f.clone();
-                        let at_seam = at_seam.clone();
-                        let snapshot_done = snapshot_done.clone();
-                        let trunc_done = trunc_done.clone();
-                        let abort = abort.clone();
-                        let trunc_err = trunc_err.clone();
-                        sched::spawn("b7-race-trunc1", move || {
-                            while !at_seam.load(Ordering::Acquire) && !abort.load(Ordering::Acquire) {
-                                sched::yield_now();
-                            }
-                            if abort.load(Ordering::Acquire) {
-                                return;
-                            }
-                            if f.truncate(P).is_err() {
-                                trunc_err.store(true, Ordering::Release);
-                                snapshot_done.store(true, Ordering::Release);
-                                return;
-                            }
-                            // Snapshot sees only `parent` (child is not yet
-                            // registered), then blocks on `parent.inner` until
-                            // `fork_copy` finishes.
-                            invalidate_file_mappings_with(&*f, P, || {
-                                snapshot_done.store(true, Ordering::Release);
-                            });
-                            trunc_done.store(true, Ordering::Release);
-                        })
-                        .map_err(|_| "spawn trunc1")?
-                    }),
-                };
-
-                let child = parent
-                    .fork_copy_before_register(|| {
-                        at_seam.store(true, Ordering::Release);
-                        while !snapshot_done.load(Ordering::Acquire) && !abort.load(Ordering::Acquire) {
-                            sched::yield_now();
-                        }
-                    })
-                    .map_err(|_| "fork_copy_before_register")?;
-
-                trunc.join();
-                kassert!(!trunc_err.load(Ordering::Acquire));
-                kassert!(trunc_done.load(Ordering::Acquire));
-
-                // Neither child nor parent has any leaf past the new end, and
-                // every access there in the child is a bus error.
-                for space in [&child, &parent] {
-                    for va in [priv_va + 2 * P, shared_va + 2 * P, priv_ro_va + 2 * P] {
+            let check_past_eof = |child: &Arc<AddressSpace>, priv_p2_phys: PhysFrame| -> Result<(), &'static str> {
+                for space in [child, &parent] {
+                    for va in past_vas {
                         kassert!(file_vm_leaf(space, va).is_none());
                         kassert_eq!(space.handle_page_fault(va, 0), FaultResult::BusError);
                     }
                     let _active = UserSpaceGuard::enter(space.clone());
                     let mut buf = [0u8; 9];
-                    for va in [priv_va + 2 * P, shared_va + 2 * P, priv_ro_va + 2 * P] {
+                    for va in past_vas {
                         kassert_eq!(copy_from_user(&mut buf, va), Err(CopyError::Fault));
                     }
-                    // Page 0 (below the new end) is still present and intact.
                     kassert_eq!(copy_from_user(&mut buf, priv_va), Ok(()));
                     kassert_eq!(&buf, b"below-eof");
                 }
                 kassert!(!frame::is_allocated(priv_p2_phys));
-                child.teardown();
-            }
+                Ok(())
+            };
 
-            // Phase 2: truncate snapshots mappers AFTER `fork_copy` registered
-            // the child and read the old size (`after_precount`), so the child
-            // copies the stale leaf and the truncate's snapshot must reach it.
-            {
-                f.truncate(3 * P).map_err(|_| "regrow")?;
-                kassert_eq!(f.write_at(2 * P, b"regrown-page2").map_err(|_| "rewrite")?, 13);
-                let priv_p2_phys = populate(&parent)?;
-                let at_seam = Arc::new(AtomicBool::new(false));
-                let snapshot_done = Arc::new(AtomicBool::new(false));
-                let trunc_done = Arc::new(AtomicBool::new(false));
-                let abort = Arc::new(AtomicBool::new(false));
-                let trunc_err = Arc::new(AtomicBool::new(false));
+            type ForkFn<'a> = &'a mut dyn FnMut(&dyn Fn()) -> Result<Arc<AddressSpace>, &'static str>;
 
-                let trunc = ThreadGuard {
-                    abort: abort.clone(),
-                    handle: Some({
-                        let f = f.clone();
-                        let at_seam = at_seam.clone();
-                        let snapshot_done = snapshot_done.clone();
-                        let trunc_done = trunc_done.clone();
-                        let abort = abort.clone();
-                        let trunc_err = trunc_err.clone();
-                        sched::spawn("b7-race-trunc2", move || {
-                            while !at_seam.load(Ordering::Acquire) && !abort.load(Ordering::Acquire) {
-                                sched::yield_now();
-                            }
-                            if abort.load(Ordering::Acquire) {
-                                return;
-                            }
-                            if f.truncate(P).is_err() {
-                                trunc_err.store(true, Ordering::Release);
-                                snapshot_done.store(true, Ordering::Release);
-                                return;
-                            }
-                            // Snapshot sees both `parent` and `child`, then
-                            // waits for both Lock 1s before invalidating both.
-                            invalidate_file_mappings_with(&*f, P, || {
-                                snapshot_done.store(true, Ordering::Release);
-                            });
-                            trunc_done.store(true, Ordering::Release);
-                        })
-                        .map_err(|_| "spawn trunc2")?
-                    }),
-                };
+            // Spawn a truncate thread synchronized with `run_fork`'s seam: the
+            // thread checks `file_vm_mappers(&*f) == expected_mappers`, shrinks
+            // `f` to `P`, snapshots mappers, wakes the seam, and invalidates
+            // each space in turn once `fork_copy` releases its Lock 1.
+            let race =
+                |name: &'static str, expected_mappers: usize, run_fork: ForkFn<'_>| -> Result<(), &'static str> {
+                    let priv_p2_phys = populate(&parent)?;
+                    let at_seam = Arc::new(AtomicBool::new(false));
+                    let snapshot_done = Arc::new(AtomicBool::new(false));
+                    let stop = Arc::new(AtomicBool::new(false));
+                    let status = Arc::new(AtomicU8::new(TRUNC_PENDING));
 
-                let child = parent
-                    .fork_copy_after_precount(|| {
+                    let trunc = StopOnDrop {
+                        stop: stop.clone(),
+                        handle: Some({
+                            let f = f.clone();
+                            let at_seam = at_seam.clone();
+                            let snapshot_done = snapshot_done.clone();
+                            let stop = stop.clone();
+                            let status = status.clone();
+                            sched::spawn(name, move || {
+                                while !at_seam.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+                                    sched::yield_now();
+                                }
+                                if stop.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                if file_vm_mappers(&*f) != expected_mappers {
+                                    status.store(TRUNC_BAD_MAPPERS, Ordering::Release);
+                                    snapshot_done.store(true, Ordering::Release);
+                                    return;
+                                }
+                                if f.truncate(P).is_err() {
+                                    status.store(TRUNC_ERR, Ordering::Release);
+                                    snapshot_done.store(true, Ordering::Release);
+                                    return;
+                                }
+                                invalidate_file_mappings_with(&*f, P, || {
+                                    snapshot_done.store(true, Ordering::Release);
+                                });
+                                status.store(TRUNC_OK, Ordering::Release);
+                            })
+                            .map_err(|_| "spawn trunc")?
+                        }),
+                    };
+
+                    let trigger = || {
                         at_seam.store(true, Ordering::Release);
-                        while !snapshot_done.load(Ordering::Acquire) && !abort.load(Ordering::Acquire) {
+                        while !snapshot_done.load(Ordering::Acquire) {
                             sched::yield_now();
                         }
+                    };
+                    let child = run_fork(&trigger)?;
+                    drop(trunc);
+                    kassert_eq!(status.load(Ordering::Acquire), TRUNC_OK);
+                    check_past_eof(&child, priv_p2_phys)?;
+                    child.teardown();
+                    Ok(())
+                };
+
+            // Phase 1: snapshot BEFORE registration (`mappers == 1`), then
+            // register (`mappers == 2` before `file_sizes`), then read new EOF.
+            let mut mappers_before_sizes = 0;
+            race("b7-race-trunc1", 1, &mut |trigger| {
+                parent
+                    .fork_copy_inner(ForkSeams {
+                        before_register: trigger,
+                        before_sizes: || mappers_before_sizes = file_vm_mappers(&*f),
+                        after_precount: || {},
                     })
-                    .map_err(|_| "fork_copy_after_precount")?;
+                    .map_err(|_| "fork_copy phase 1")
+            })?;
+            kassert_eq!(mappers_before_sizes, 2);
 
-                trunc.join();
-                kassert!(!trunc_err.load(Ordering::Acquire));
-                kassert!(trunc_done.load(Ordering::Acquire));
-
-                for space in [&child, &parent] {
-                    for va in [priv_va + 2 * P, shared_va + 2 * P, priv_ro_va + 2 * P] {
-                        kassert!(file_vm_leaf(space, va).is_none());
-                        kassert_eq!(space.handle_page_fault(va, 0), FaultResult::BusError);
-                    }
-                    let _active = UserSpaceGuard::enter(space.clone());
-                    let mut buf = [0u8; 9];
-                    kassert_eq!(copy_from_user(&mut buf, priv_va + 2 * P), Err(CopyError::Fault));
-                    kassert_eq!(copy_from_user(&mut buf, priv_va), Ok(()));
-                    kassert_eq!(&buf, b"below-eof");
-                }
-                kassert!(!frame::is_allocated(priv_p2_phys));
-                child.teardown();
-            }
+            // Phase 2: snapshot AFTER registration (`mappers == 2`) and after
+            // `file_sizes` saw the old size; invalidates each space in turn,
+            // each once `fork_copy` releases its Lock 1.
+            f.truncate(3 * P).map_err(|_| "regrow")?;
+            kassert_eq!(f.write_at(2 * P, b"regrown-page2").map_err(|_| "rewrite")?, 13);
+            race("b7-race-trunc2", 2, &mut |trigger| {
+                parent.fork_copy_after_precount(trigger).map_err(|_| "fork_copy phase 2")
+            })?;
 
             parent.teardown();
-            kassert_eq!(mappers_count(&*f), 0);
+            kassert_eq!(file_vm_mappers(&*f), 0);
             kassert_eq!(f.open_count(), 0);
             Ok(())
         })

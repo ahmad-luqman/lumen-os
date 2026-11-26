@@ -131,21 +131,12 @@ const fn neg_errno(code: u32) -> u64 {
     -(code as i64) as u64
 }
 
-/// The current process's address space, for a syscall that shrinks a file
-/// (`truncate`, `ftruncate`, `openat(O_TRUNC)`) and must then unmap the
-/// caller's pages of it: taken before the file changes, so a caller
-/// without one (none: these syscalls run on a process's thread) panics
-/// with the file untouched.
-fn shrinking_space() -> alloc::sync::Arc<crate::mm::user_vm::AddressSpace> {
-    crate::sched::current_address_space().expect("a file-shrinking syscall runs on a thread with an address space")
-}
-
 /// Unmap every address space's pages of `inode` past `size` once a shrink of
 /// it (`truncate`, `ftruncate`, `openat(O_TRUNC)`) has returned (Lock 4
 /// released before each space's `invalidate_file_from` takes Lock 1: the
 /// syscall never holds both), shooting down stale translations on every CPU
 /// that has a mapping space loaded (ARCHITECTURE section 5, B7).
-fn unmap_past(_space: &crate::mm::user_vm::AddressSpace, inode: &dyn lumen_vfs::VfsInode, size: u64) {
+fn unmap_past(inode: &dyn lumen_vfs::VfsInode, size: u64) {
     crate::mm::user_vm::invalidate_file_mappings(inode, size);
 }
 

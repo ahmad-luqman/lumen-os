@@ -19,8 +19,8 @@ use lumen_vfs::{
     VfsError, VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
-use crate::mm::user_vm::AddressSpace;
-use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
+use crate::mm::user_vm::Mappers;
+use crate::sync::{SleepMutex, SleepMutexGuard};
 use crate::time;
 
 use super::page_cache::{CachePage, PAGE_SIZE, PageCache, QuotaCounter};
@@ -76,7 +76,7 @@ impl Tmpfs {
                 locks: AdvisoryLocks::new(),
             }),
             pages: SleepMutex::new(PageCache::new_tmpfs(Arc::clone(&shared.quota))),
-            mappers: SpinLock::new(Vec::new()),
+            mappers: Mappers::new(),
         });
         Arc::new(Self { shared, rename_lock: SleepMutex::new(()), root })
     }
@@ -561,7 +561,7 @@ pub struct TmpfsInode {
     detached: AtomicBool,
     meta: SleepMutex<TmpfsMeta>,
     pages: SleepMutex<PageCache>,
-    mappers: SpinLock<Vec<Weak<AddressSpace>>>,
+    mappers: Mappers,
 }
 
 impl TmpfsInode {
@@ -623,7 +623,7 @@ impl TmpfsInode {
                 locks: AdvisoryLocks::new(),
             }),
             pages: SleepMutex::new(PageCache::new_tmpfs(Arc::clone(&shared.quota))),
-            mappers: SpinLock::new(Vec::new()),
+            mappers: Mappers::new(),
         }))
     }
 
@@ -658,7 +658,7 @@ impl TmpfsInode {
 
     /// Address spaces currently mapping this file (level 10c leaf spinlock;
     /// never acquired under `pages`), for `page_cache::page_cache_mappers`.
-    pub(super) fn mappers(&self) -> &SpinLock<Vec<Weak<AddressSpace>>> {
+    pub(super) fn mappers(&self) -> &Mappers {
         &self.mappers
     }
 
