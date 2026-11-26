@@ -351,8 +351,9 @@ class Devices:
     keyboard: bool = False
     rng: bool = False
     # virtio-rng limited to `max-bytes` per `period` ms (QEMU's properties):
-    # attaches virtio-rng (whatever `rng` says), a device that stops
-    # answering in time.
+    # attaches virtio-rng (whatever `rng` says). The firmware's reads share
+    # the quota, so the device may run dry before the kernel's probe (#410):
+    # not a reliable way to make it stop answering on cue.
     rng_rate: tuple[int, int] | None = None
     # virtio-rng without an MSI-X capability (QEMU's `vectors=0`): attaches
     # virtio-rng (whatever `rng` says), a device left with INTx only, which
