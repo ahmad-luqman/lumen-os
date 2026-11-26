@@ -737,8 +737,16 @@ pub fn wait_pgrp() -> R {
         )?;
         eq("other-group zombie status", i64::from(st), 66 << 8)?;
 
-        // waitid(P_PGID, ...) with explicit pgid and 0 (caller's group).
-        let c = child_exits(33)?;
+        // waitid(P_PGID, ...) with 0 (caller's group) and explicit pgid: keep an
+        // own-group child live while an out-of-group child is a confirmed zombie.
+        let p_c = pipe(0)?;
+        let c = fork()?;
+        if c == 0 {
+            let _ = close(p_c[1]);
+            let _ = read_byte(p_c[0]);
+            exit(33);
+        }
+        close(p_c[0])?;
         let p_d = pipe(0)?;
         let d = fork()?;
         if d == 0 {
@@ -750,14 +758,31 @@ pub fn wait_pgrp() -> R {
         eq("setpgid(d, 0)", setpgid(d, 0), 0)?;
         write_byte(p_d[1], b'G')?;
         close(p_d[1])?;
-        let mut info = [0i32; 32];
-        eq("waitid P_PGID d", sys(SYS_WAITID, [P_PGID, d as u64, info.as_mut_ptr() as u64, WEXITED, 0, 0]), 0)?;
-        eq("waitid P_PGID d pid", i64::from(info[SI_PID]), d)?;
-        eq("waitid P_PGID d status", i64::from(info[SI_STATUS]), 44)?;
+        wait_zombie(d)?;
+        let mut info = [-1i32; 32];
+        eq(
+            "waitid P_PGID 0 WNOHANG",
+            sys(SYS_WAITID, [P_PGID, 0, info.as_mut_ptr() as u64, WEXITED | WNOHANG, 0, 0]),
+            0,
+        )?;
+        eq("waitid(P_PGID, 0, WNOHANG) ignores other-group zombie", i64::from(info[SI_PID]), 0)?;
+        eq("waitid(P_PGID, 0, WNOHANG) clears si_signo", i64::from(info[SI_SIGNO]), 0)?;
+        wait_zombie(d)?;
+        write_byte(p_c[1], b'G')?;
+        close(p_c[1])?;
         info.fill(0);
         eq("waitid P_PGID 0", sys(SYS_WAITID, [P_PGID, 0, info.as_mut_ptr() as u64, WEXITED, 0, 0]), 0)?;
         eq("waitid P_PGID 0 pid", i64::from(info[SI_PID]), c)?;
-        eq("waitid P_PGID 0 status", i64::from(info[SI_STATUS]), 33)
+        eq("waitid P_PGID 0 status", i64::from(info[SI_STATUS]), 33)?;
+        eq(
+            "waitid P_PGID 0 ECHILD with other-group zombie",
+            sys(SYS_WAITID, [P_PGID, 0, info.as_mut_ptr() as u64, WEXITED | WNOHANG, 0, 0]),
+            -ECHILD,
+        )?;
+        info.fill(0);
+        eq("waitid P_PGID d", sys(SYS_WAITID, [P_PGID, d as u64, info.as_mut_ptr() as u64, WEXITED, 0, 0]), 0)?;
+        eq("waitid P_PGID d pid", i64::from(info[SI_PID]), d)?;
+        eq("waitid P_PGID d status", i64::from(info[SI_STATUS]), 44)
     })
 }
 
