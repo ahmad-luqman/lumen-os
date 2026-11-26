@@ -1,6 +1,7 @@
 //! What M8's test programs share (`mod common;` in each; ARCHITECTURE
 //! section 15, "M8's tests"): the raw `syscall`, a line written in one
-//! `write`, the panic handler, argument bytes, and the checks' runner.
+//! `write`, the panic handler, argument bytes, the checks' runner, syscall
+//! numbers and errno constants, and close/pipe/fstat_mode helpers.
 //!
 //! A mode runs its checks through [`run_checks`]: one `ok <check>` line per
 //! check passed; the first failed check prints `FAIL <check>: <what> (got
@@ -229,7 +230,8 @@ pub const SYS_DUP3: u64 = 292;
 pub const SYS_PIPE2: u64 = 293;
 
 pub const EPERM: i64 = -1;
-pub const ENOENT: i32 = 2;
+/// Positive errno returned by libc posix_spawn, unlike raw syscall errors.
+pub const ENOENT_POSITIVE: i32 = 2;
 pub const ENXIO: i64 = -6;
 pub const EBADF: i64 = -9;
 pub const EAGAIN: i64 = -11;

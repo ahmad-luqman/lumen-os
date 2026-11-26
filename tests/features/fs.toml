@@ -427,3 +427,10 @@ milestone = "M8"
 tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_fifo_mknod_descriptor_fault_never_frees_foreign_blocks",
 ]
+
+[[feature]]
+name = "Special ext4 inode i_block is never freed as data when i_blocks counts external xattrs (#386)"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::vfs::ext4::ext4_unlinking_a_device_with_xattr_preserves_foreign_blocks",
+]

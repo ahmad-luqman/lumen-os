@@ -57,6 +57,7 @@ const LOCK_NB: u64 = 4;
 
 const SIGPIPE: u64 = 13;
 const SIG_IGN: u64 = 1;
+const SA_SIGINFO: u64 = 4;
 const SA_RESTORER: u64 = 0x0400_0000;
 
 const S_IFMT: u32 = 0o170_000;
@@ -600,7 +601,8 @@ fn check_eof_fionread_and_sigpipe() -> R {
     let c_catch = ok("fork sigpipe catch", sys(SYS_FORK, [0; 6]))?;
     if c_catch == 0 {
         SIGPIPE_SEEN.store(0, SeqCst);
-        let act = [sigpipe_handler as *const () as u64, SA_RESTORER | 4, m8_io_sigreturn as *const () as u64, 0];
+        let act =
+            [sigpipe_handler as *const () as u64, SA_RESTORER | SA_SIGINFO, m8_io_sigreturn as *const () as u64, 0];
         if sys(SYS_RT_SIGACTION, [SIGPIPE, act.as_ptr() as u64, 0, 8, 0, 0]) != 0 {
             exit_child(30);
         }
@@ -763,7 +765,7 @@ fn check_blocked_sigpipe_and_writev() -> R {
 
 fn check_proc_pipe_reopen_and_large_write() -> R {
     // Keep each orphaned end reachable at a known /proc magic link.
-    for (keep, reopen) in [(0usize, O_RDONLY), (1, O_WRONLY | O_NONBLOCK), (1, O_WRONLY)] {
+    for (keep, reopen) in [(0usize, O_RDONLY), (0, O_RDONLY | O_NONBLOCK), (1, O_WRONLY | O_NONBLOCK), (1, O_WRONLY)] {
         let p = pipe(0)?;
         eq("dup pipe for proc reopen", sys(SYS_DUP2, [p[keep] as u64, 20, 0, 0, 0, 0]), 20)?;
         close(p[0])?;
@@ -772,6 +774,11 @@ fn check_proc_pipe_reopen_and_large_write() -> R {
             "proc pipe reopen without partner",
             sys(SYS_OPENAT, [AT_FDCWD, c"/proc/self/fd/20".as_ptr() as u64, reopen, 0, 0, 0]),
         )? as i32;
+        if keep == 0 {
+            let mut poll = [PollFd { fd, events: POLLIN, revents: 0 }];
+            eq("orphaned anonymous reader poll", sys(SYS_POLL, [poll.as_mut_ptr() as u64, 1, 0, 0, 0, 0]), 1)?;
+            eq("orphaned anonymous reader immediate HUP", i64::from(poll[0].revents), i64::from(POLLHUP))?;
+        }
         close(fd)?;
         close(20)?;
     }
@@ -945,7 +952,7 @@ fn check_posix_spawn_cloexec() -> R {
     let rc_bad = unsafe {
         posix_spawn(&mut bad_pid, bad_path.as_ptr(), ptr::null(), ptr::null(), bad_argv.as_ptr(), envp.as_ptr())
     };
-    eq("posix_spawn ENOENT", i64::from(rc_bad), i64::from(ENOENT))
+    eq("posix_spawn ENOENT", i64::from(rc_bad), i64::from(ENOENT_POSITIVE))
 }
 
 fn check_fork_inc_fd_ref() -> R {

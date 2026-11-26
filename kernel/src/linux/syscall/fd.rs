@@ -409,9 +409,8 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
     let iovs = copy_iovecs(iov.addr(), iovcnt)?;
     if let Some(pipe) = file.pipe() {
         let nonblock = file.is_nonblock();
-        let planned = iovs.iter().try_fold(0usize, |total, span| {
-            total.checked_add(span.len as usize).filter(|&n| n <= isize::MAX as usize).ok_or(errno::EINVAL)
-        })?;
+        // copy_iovecs already checked that the sum fits isize::MAX.
+        let planned = iovs.iter().map(|span| span.len as usize).sum();
         return pipe.write_with(planned, nonblock, |mut offset, mut buf| {
             for span in &iovs {
                 if offset >= span.len as usize {
@@ -427,6 +426,7 @@ fn writev(fd: Fd, iov: UserPtr, iovcnt: u64) -> Result<u64, u32> {
                 }
                 offset = 0;
             }
+            debug_assert!(false, "pipe write requested bytes beyond the checked iovec total");
             Err(errno::EFAULT)
         });
     }
@@ -1444,10 +1444,17 @@ crate::ktest!(
             copy_to_user(buf, &[0x31; 4096]).map_err(|_| "payload")?;
             kassert_eq!(pipe.set_capacity(4096), Ok(4096));
             kassert_eq!(sys_write(w, at::reg(buf), 4096), 4096);
-            let writer = process::spawn_test_thread(move |_| sys_write(w, at::reg(buf), 1))?;
+            let mask_at = buf + 4096;
+            copy_to_user(mask_at, &lumen_signal::Signal::PIPE.bit().to_le_bytes()).map_err(|_| "signal mask")?;
+            let writer = process::spawn_test_thread(move |_| -> Result<_, &'static str> {
+                kassert_eq!(super::signal::sys_rt_sigprocmask(u64::from(general::SIG_BLOCK), mask_at, 0, 8), 0);
+                Ok((sys_write(w, at::reg(buf), 1), process::current_pending()))
+            })?;
             wait_for(|| pipe.waiting_writers() == 1 && writer.blocked())?;
             kassert_eq!(sys_close(r), 0);
-            kassert_eq!(writer.join()?, super::neg_errno(errno::EPIPE));
+            let (written, pending) = writer.join()??;
+            kassert_eq!(written, super::neg_errno(errno::EPIPE));
+            kassert_eq!(pending.0 & lumen_signal::Signal::PIPE.bit(), lumen_signal::Signal::PIPE.bit());
             kassert_eq!(sys_close(w), 0);
             Ok(())
         })?
@@ -1481,6 +1488,14 @@ crate::ktest!(
                 kassert!(slot.pipe().is_none());
             }
             for mode in [AccessMode::ReadOnly, AccessMode::WriteOnly] {
+                // Keep a same-side description alive so a leaked end count
+                // cannot disappear when the interrupted open detaches its slot.
+                let bootstrap = open_fifo(&inode, AccessMode::ReadWrite, false).map_err(|_| "bootstrap")?;
+                let keeper = open_fifo(&inode, mode, true).map_err(|_| "keeper")?;
+                bootstrap.release();
+                let pipe = slot.pipe().ok_or("kept pipe")?;
+                let counts = if mode == AccessMode::ReadOnly { (1, 0) } else { (0, 1) };
+                kassert_eq!(pipe.end_counts(), counts);
                 let child_inode = Arc::clone(&inode);
                 let opener = process::spawn_test_thread(move |_| {
                     let result = open_fifo(&child_inode, mode, false);
@@ -1490,6 +1505,9 @@ crate::ktest!(
                 wait_for(|| opener.blocked() && slot.pipe().is_some())?;
                 crate::linux::signal::raise_for_test(opener.thread(), lumen_signal::Signal::USR1);
                 kassert_eq!(opener.join()?.err(), Some(crate::linux::signal::ERESTARTSYS));
+                kassert_eq!(pipe.end_counts(), counts);
+                kassert!(Arc::ptr_eq(&slot.pipe().ok_or("keeper detached")?, &pipe));
+                keeper.release();
                 kassert!(slot.pipe().is_none());
             }
             Ok(())

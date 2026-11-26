@@ -90,7 +90,9 @@ pub struct KernelFile {
     end_refs: AtomicU32,
     /// Shared pipe state for anonymous pipes and opened (non-`O_PATH`) FIFOs.
     pipe: Option<Arc<crate::linux::pipe::PipeObject>>,
-    /// FIFO writer generation observed at open (zero when a writer was seen).
+    /// Zero except for a nonblocking FIFO reader opened with no writer,
+    /// which snapshots w_opens. Otherwise w_opens >= 1 when open returns.
+    /// Copied from PipeEnd so polling need not take the pipe_end lock.
     writer_generation: u64,
     /// End ownership released once when `end_refs` reaches 0.
     pipe_end: SpinLock<Option<crate::linux::pipe::PipeEnd>>,

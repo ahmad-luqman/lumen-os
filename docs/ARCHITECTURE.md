@@ -4514,7 +4514,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 231 | `exit_group(status)` | ends every thread of the process (section 8, "Exit") | C1, C3 |
 | 234 | `tgkill(tgid, tid, sig)` | `tgid <= 0` or `tid <= 0` `-EINVAL`; `tid` not in `tgid` `-ESRCH`; as `tkill` | C5 |
 | 247 | `waitid(idtype, id, infop, options, rusage)` | section 8, "`wait4` and `waitid`" | C1, C6 |
-| 259 | `mknodat(dirfd, path, mode, dev)` | the type checked first, before the path is looked up, as Linux's `may_mknod`: `S_IFDIR` `-EPERM`, a type that isn't `S_IFREG`, `S_IFCHR`, `S_IFBLK`, `S_IFIFO`, `S_IFSOCK` or 0 `-EINVAL`; then `S_IFIFO` (a FIFO, section 10) and `S_IFREG` or 0 (an empty regular file) are made with `mode & !umask`, and `S_IFCHR`, `S_IFBLK` and `S_IFSOCK` are `-EPERM` (a deviation: Linux lets root make them); a name in use `-EEXIST`; a read-only mount, devfs or procfs `-EROFS` (GNU make 4.4's `-j2` jobserver FIFO: the census); through `Start` (section 8's rule 2) and a new lumen-vfs operation, `mknod_at`, over a new `VfsInode::mknod` method (ext4 and tmpfs implement it; `fixed_namespace_ops!` grows from seven operations to eight, devfs and procfs answering `-EROFS`) | C7 |
+| 259 | `mknodat(dirfd, path, mode, dev)` | the type checked first, before the path is looked up, as Linux's `may_mknod`: `S_IFDIR` `-EPERM`, a type that isn't `S_IFREG`, `S_IFCHR`, `S_IFBLK`, `S_IFIFO`, `S_IFSOCK` or 0 `-EINVAL`; then `S_IFIFO` (a FIFO, section 10) and `S_IFREG` or 0 (an empty regular file) are made with `mode & !umask`, and `S_IFCHR`, `S_IFBLK` and `S_IFSOCK` are `-EPERM` (a deviation: Linux allows any user to make socket nodes with directory access, and requires `CAP_MKNOD` only for character/block devices); a name in use `-EEXIST`; a read-only mount, devfs or procfs `-EROFS` (GNU make 4.4's `-j2` jobserver FIFO: the census); through `Start` (section 8's rule 2) and a new lumen-vfs operation, `mknod_at`, over a new `VfsInode::mknod` method (ext4 and tmpfs implement it; `fixed_namespace_ops!` grows from seven operations to eight, devfs and procfs answering `-EROFS`) | C7 |
 | 270 | `pselect6(n, readfds, writefds, exceptfds, tsp, sig)` | as `select`, with a `timespec` (written back) and `sig`, a pointer to `{ const sigset_t *ss; size_t ss_len }`: with `ss` set, `ss_len != 8` `-EINVAL` and the mask swapped for the wait in one step (`saved_mask`), restored on return unless a handler runs, as Linux's `restore_saved_sigmask_unless`; interrupted `-ERESTARTNOHAND` (make waits here with `SIGCHLD` unblocked only for the wait: the census) | B3, C6 |
 | 271 | `ppoll(fds, nfds, tsp, sigmask, sigsetsize)` | as `poll`, with `pselect6`'s mask rule and a `timespec`, the time left written back (Linux's `poll_select_finish`); interrupted `-ERESTARTNOHAND` | B3, C6 |
 | 273, 274 | `set_robust_list`, `get_robust_list` | section 8, "`futex`" | C4 |
@@ -8748,9 +8748,9 @@ standard Linux IPC primitives:
   once. `inc_fd_ref` raises it for `dup` and `fork`; every `Fd::file`
   caller, and `poll`/`ppoll`/`select`/`pselect6`, obtains an `IoFile`
   under `Files::table`, raising it before the table lock is released.
-  Dropping the `IoFile` lowers it; `io_refs` separately observes that count
-  in ktests only. End release takes Lock 0 in thread context, never under
-  locks 1–10 or `OpenFile::pos`. A never-installed description's `Drop`
+  Dropping the `IoFile` lowers it; ktest-only `io_refs` counts just the
+  in-flight references, excluding descriptors. End release takes Lock 0 in
+  thread context, never under locks 1–10 or `OpenFile::pos`. A never-installed description's `Drop`
   releases its attached end too, asserting that only its initial reference
   remains. A writer blocked on a full pipe therefore keeps its end across
   another thread's `close`, as Linux's in-flight `fget` reference keeps
@@ -8787,11 +8787,10 @@ standard Linux IPC primitives:
   and raises `opens` under the lock. If absent, it allocates `Pipe::fifo`
   (no ends open) outside the spinlock, then rechecks and raises `opens`
   under the lock. An attaching competitor wins; the unused
-  allocation is dropped after releasing the lock; each end's release (the Ends
-  rule above: no descriptor and no I/O in flight, not the last
-  `dec_fd_ref`) lowers it, and the one that reaches 0 detaches the
-  `PipeObject` under the same lock, dropping its bytes, as Linux frees a
-  FIFO's pipe in `pipe_release` at the description's last `fput`. So a
+  allocation is dropped after releasing the lock. Each end's release (the
+  Ends rule above, not the last `dec_fd_ref`) lowers `opens`. Reaching 0
+  detaches the `PipeObject` under that lock; its bytes are dropped outside
+  the lock, as Linux frees a FIFO's pipe at the description's last `fput`. So a
   read blocked on a FIFO whose last descriptor another thread closed keeps
   the slot attached, and a reopen of the FIFO meanwhile joins that same
   pipe: its writes reach and wake the blocked reader. The
@@ -8816,7 +8815,12 @@ standard Linux IPC primitives:
   (section 8's table).
 - Tested by `cargo:lumen-pipe`, `ktest:lumen_kernel::linux::syscall::fd::pipe_end_outlives_its_close_while_a_write_is_in_flight`,
   `ktest:lumen_kernel::linux::syscall::fd::fifo_reopen_during_a_blocked_read_reaches_that_reader` and `scenario:test_linux_io::test_pipes_and_poll`
-  (section 15). D2's scenario also runs `make -j2` on a two-rule Makefile
+  (section 15), plus these ktests:
+  `ktest:lumen_kernel::linux::syscall::fd::pipe_atomic_writer_waits_for_the_entire_record`,
+  `ktest:lumen_kernel::linux::syscall::fd::pipe_blocked_writer_gets_epipe_when_reader_closes`,
+  `ktest:lumen_kernel::linux::syscall::fd::fifo_blocking_opens_wait_for_peers_and_interrupt_detaches`,
+  and `ktest:lumen_kernel::vfs::ext4::ext4_fifo_mknod_descriptor_fault_never_frees_foreign_blocks`.
+  D2's scenario also runs `make -j2` on a two-rule Makefile
   of `true` commands after its build: GNU make 4.4's jobserver FIFO
   (`mkfifo`, then `pselect6` on its read end), with nothing on stderr (make
   prints `jobserver mkfifo:` and an errno when `mkfifo` fails, then falls
@@ -11184,11 +11188,17 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   blocked, with exactly 100 still queued; draining those 100 lets it finish
   and queues all 4000 unchanged bytes.
 - `ktest:lumen_kernel::linux::syscall::fd::pipe_blocked_writer_gets_epipe_when_reader_closes`:
-  a confirmed blocked writer on a full pipe wakes with `EPIPE` when its
-  reader closes, exercising `WriteStep::Broken`.
+  a confirmed blocked writer on a full pipe wakes with `EPIPE` and blocked
+  `SIGPIPE` pending when its reader closes, exercising `WriteStep::Broken`.
 - `ktest:lumen_kernel::linux::syscall::fd::fifo_blocking_opens_wait_for_peers_and_interrupt_detaches`:
   both blocking open modes are confirmed asleep before the peer opens;
-  interrupting either mode returns `ERESTARTSYS` and detaches the slot.
+  interrupting either mode returns `ERESTARTSYS` without leaking end counts
+  while a second same-side description keeps the slot attached. Closing that
+  description then detaches the slot.
+- `ktest:lumen_kernel::vfs::ext4::ext4_unlinking_a_device_with_xattr_preserves_foreign_blocks`:
+  an imported character device has an external xattr block (`i_blocks != 0`)
+  and an rdev numerically equal to another file's data block. Unlinking it
+  preserves the block allocation and the other file's contents after remount.
 - `ktest:lumen_kernel::vfs::ext4::ext4_fifo_mknod_descriptor_fault_never_frees_foreign_blocks`:
   descriptor-read fault injection inspects the inode at the failure
   boundary (either `EXTENTS` or zero `i_block`), verifies unchanged block

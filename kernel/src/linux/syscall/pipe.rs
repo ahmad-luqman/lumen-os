@@ -74,7 +74,8 @@ pub(super) fn sys_mknod(path: UserPtr, mode: Mode, dev: u32) -> u64 {
 /// `mknodat(dirfd, path, mode, dev)` (259): create a FIFO (`S_IFIFO`) or
 /// regular file (`S_IFREG` or 0), checking the file type before path lookup.
 /// Deviation: S_IFCHR/S_IFBLK/S_IFSOCK return EPERM even for root, whereas
-/// Linux allows root to create these node types.
+/// Linux allows any user to create socket nodes (subject to directory access);
+/// only character and block device creation requires CAP_MKNOD.
 pub(super) fn sys_mknodat(dirfd: Dirfd, path: UserPtr, mode: Mode, dev: u32) -> u64 {
     finish(mknodat(dirfd, path, mode, dev))
 }

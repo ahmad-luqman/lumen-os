@@ -494,8 +494,8 @@ impl PipeObject {
         }
     }
 
-    /// Description-aware FIFO readiness; subscribe before reading either the
-    /// generation or counts under Lock 0, preserving the poll wake contract.
+    /// Description-aware anonymous pipe and FIFO readiness. Subscribe before
+    /// reading the generation or counts under Lock 0, preserving the wake contract.
     pub fn poll_open(
         &self,
         mode: AccessMode,
@@ -506,6 +506,13 @@ impl PipeObject {
         let pipe = self.pipe.lock();
         let writer_seen = self.w_opens.load(Ordering::Acquire) != writer_generation;
         (Self::poll_mask(&pipe, mode, writer_seen), guard)
+    }
+
+    /// Reader and writer description counts, for interrupted-open ktests.
+    #[cfg(feature = "ktest")]
+    pub fn end_counts(&self) -> (usize, usize) {
+        let pipe = self.pipe.lock();
+        (pipe.readers(), pipe.writers())
     }
 
     /// Number of threads currently blocked in a read wait (ktests).
@@ -609,8 +616,10 @@ impl Pollable for FifoSlot {
     fn poll(&self, mode: AccessMode, waker: Option<&Arc<dyn PollWaker>>) -> (PollMask, Option<PollGuard>) {
         match self.pipe() {
             Some(pipe) => pipe.poll(mode, waker),
-            // No opened description: ordinary descriptor polling uses
-            // KernelFile's attached pipe and per-open writer generation.
+            // An inode-only poll (including an O_PATH inode reference) can
+            // reach an unattached slot. No live ends or wake source exist,
+            // so report terminal HUP|ERR. Descriptor polling rejects O_PATH
+            // and otherwise uses KernelFile's attached pipe and generation.
             None => (PollMask::HUP | PollMask::ERR, None),
         }
     }
@@ -644,11 +653,16 @@ impl PipeEnd {
         Self { pipe, reader, writer, fifo_inode, writer_generation: 0 }
     }
 
+    /// Zero except for a nonblocking FIFO reader opened with no writer,
+    /// which snapshots w_opens. Otherwise w_opens is at least 1 by the time
+    /// open returns, so zero makes a departed writer report HUP immediately.
+    /// KernelFile copies this value to poll without taking its pipe_end lock.
     pub fn writer_generation(&self) -> u64 {
         self.writer_generation
     }
 
-    /// Borrow the underlying [`PipeObject`].
+    /// Borrow the underlying [`PipeObject`]; KernelFile keeps an Arc copy so
+    /// I/O and polling do not need its pipe_end ownership lock.
     pub fn pipe(&self) -> &Arc<PipeObject> {
         &self.pipe
     }
