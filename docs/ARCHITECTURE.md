@@ -1988,11 +1988,17 @@ the syscalls.
   A ring-3 `#DB` arrives on the per-CPU `IST_DEBUG` stack, where nothing
   may block: as M6's deferred `#DB` at `LSTAR` does, its handler clears
   `TF` in the saved `RFLAGS`, records the trap in the thread's
-  pending-debug-trap `si_code` together with its original `rip` and returns; for a `#DB` from ring 3 (not the
+  pending-debug-trap `si_code` together with its original `rip` and
+  `User`/`Lstar` origin and returns; for a `#DB` from ring 3 (not the
   `LSTAR` case, which the syscall entry checks) it also sends its own CPU
   the `WAKEUP` IPI. Its eventual return on the thread's own kernel stack
   queues `SIGTRAP` with the original trap address and delivers it; the
-  interrupted register context belongs to that later return:
+  interrupted register context belongs to that later return. If a syscall
+  arrives before that IPI, a `User` record queues its original address and the
+  syscall executes, keeping its result and normal restart decision. A `Lstar`
+  record instead reports the syscall's return RIP, rewinds it by two bytes,
+  skips dispatch and drops restart context so the handler re-runs that call.
+  `AtomicDebugTrap` packs the origin in bit 7 of its si_code byte.
 
   | Vector | Signal, `si_code`, `si_addr` |
   |---|---|
@@ -10912,6 +10918,11 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
     gives the interrupt hook distinct trap and interrupt RIPs and checks the
     copied siginfo/context. The guest DB loop checks its recorded trap address,
     but TCG may deliver the self-IPI before that loop advances.
+    `deferred_user_debug_trap_keeps_syscall_result` and
+    `deferred_user_debug_trap_keeps_syscall_restart` drive the syscall dispatcher
+    with a distinct user trap address, checking the copied frame and sigreturn
+    for successful and restartable results. `deferred_lstar_debug_trap_reexecutes_syscall`
+    checks the LSTAR origin skips execution, rewinds once and drops restart context.
 - `scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait` (C6):
   `EINTR` and restarts from a blocking `read`, `wait4`, `nanosleep` and
   `pselect6`, each waiter confirmed blocked first and each signal resent

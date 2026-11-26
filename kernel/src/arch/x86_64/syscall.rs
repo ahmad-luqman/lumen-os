@@ -368,7 +368,7 @@ extern "C" fn lumen_set_ring3_stack(rsp: u64) {
 /// Rust syscall dispatcher called by `lumen_syscall_entry` with interrupts off.
 ///
 /// Re-enables interrupts via `irq::restore(true)` (respecting
-/// `irq::disabled_for_good()`), checks for a deferred `#DB` at `LSTAR`,
+/// `irq::disabled_for_good()`), checks the origin of a deferred `#DB`,
 /// dispatches the syscall, runs the syscall-exit hook
 /// (`linux::signal::exit_to_user`: restart codes resolved, `sigpending`
 /// looked at) until `sigpending` is still clear once interrupts are off
@@ -381,8 +381,12 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
     irq::restore(true);
 
     let orig_rax = frame.rax;
-    let mut mode = if let Some(debug) = pending_db {
-        crate::linux::signal::force_debug_trap(debug.code, frame.rip);
+    let deferred_lstar = pending_db.is_some_and(|debug| debug.origin == percpu::DebugOrigin::Lstar);
+    if let Some(debug) = pending_db {
+        let rip = if deferred_lstar { frame.rip } else { debug.rip };
+        crate::linux::signal::force_debug_trap(debug.code, rip);
+    }
+    let mut mode = if deferred_lstar {
         // The deferred trap precedes syscall execution. A returning handler
         // resumes at that syscall, unless it edits its saved context.
         frame.rip = frame.rip.saturating_sub(2);
@@ -393,7 +397,7 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
 
     // The restart decision runs once, on the first pass.
     // C5's rt_sigreturn restores user registers, not a syscall to restart.
-    let syscall = if pending_db.is_some() || orig_rax == linux_raw_sys::general::__NR_rt_sigreturn as u64 {
+    let syscall = if deferred_lstar || orig_rax == linux_raw_sys::general::__NR_rt_sigreturn as u64 {
         None
     } else {
         lumen_signal::restart::SyscallExit::new(orig_rax)
@@ -416,6 +420,12 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
             1
         }
     }
+}
+
+/// Drive the complete syscall dispatcher from an IRQ-off user-thread ktest.
+#[cfg(feature = "ktest")]
+pub(crate) fn dispatch_for_test(frame: &mut SyscallFrame) -> u64 {
+    lumen_syscall_dispatch(frame)
 }
 
 /// Detect `(smep, smap)` support via `CPUID(7, 0).ebx`.

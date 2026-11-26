@@ -143,16 +143,28 @@ impl DebugCode {
     }
 }
 
-/// A deferred debug trap's original address and Linux si_code.
+/// Where a deferred debug exception was taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DebugOrigin {
+    /// A ring-3 instruction, waiting for delivery on the thread's kernel stack.
+    User = 0,
+    /// Kernel syscall entry, before the syscall has executed.
+    Lstar = 0x80,
+}
+
+/// A deferred debug trap's original address, Linux si_code and origin.
 #[derive(Clone, Copy, Debug)]
 pub struct DebugTrap {
     pub code: DebugCode,
     pub rip: u64,
+    pub origin: DebugOrigin,
 }
 
 /// A debug record accessed with interrupts off by its owning CPU/thread.
 /// The pair is not a general concurrently writable atomic snapshot.
 pub struct AtomicDebugTrap {
+    // Bit 7 identifies LSTAR; low bits hold si_code. Zero means no trap.
     code: AtomicU8,
     rip: AtomicU64,
 }
@@ -162,11 +174,16 @@ impl AtomicDebugTrap {
     }
     pub fn store(&self, trap: Option<DebugTrap>) {
         self.rip.store(trap.map_or(0, |t| t.rip), Ordering::Relaxed);
-        self.code.store(trap.map_or(0, |t| t.code.to_raw()), Ordering::Release);
+        self.code.store(trap.map_or(0, |t| t.code.to_raw() | t.origin as u8), Ordering::Release);
     }
     pub fn take(&self) -> Option<DebugTrap> {
-        DebugCode::from_raw(self.code.swap(0, Ordering::AcqRel))
-            .map(|code| DebugTrap { code, rip: self.rip.load(Ordering::Relaxed) })
+        let raw = self.code.swap(0, Ordering::AcqRel);
+        let origin = if raw & DebugOrigin::Lstar as u8 != 0 { DebugOrigin::Lstar } else { DebugOrigin::User };
+        DebugCode::from_raw(raw & !(DebugOrigin::Lstar as u8)).map(|code| DebugTrap {
+            code,
+            rip: self.rip.load(Ordering::Relaxed),
+            origin,
+        })
     }
 }
 
@@ -176,7 +193,7 @@ pub fn set_pending_debug_trap(trap: Option<DebugTrap>) {
     CPUS[index()].pending_debug_trap.store(trap);
 }
 
-/// Take the original RIP and si_code, with interrupts off on the owning CPU.
+/// Take the original RIP, si_code and origin, with interrupts off on the owning CPU.
 #[inline]
 pub fn take_pending_debug_trap() -> Option<DebugTrap> {
     CPUS[index()].pending_debug_trap.take()

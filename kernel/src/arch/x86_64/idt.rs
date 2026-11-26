@@ -704,13 +704,13 @@ fn user_exception(frame: &TrapFrame, cr2: u64, bus: bool, oom: bool) {
 }
 
 /// Save a vector-1 trap without blocking on its IST stack.
-fn defer_debug_trap(frame: &mut TrapFrame) {
+fn defer_debug_trap(frame: &mut TrapFrame, origin: super::percpu::DebugOrigin) {
     use super::percpu::{DebugCode, DebugTrap};
     debug_assert_eq!(frame.vector, 1);
     let code = if super::cpu::read_dr6() & (1 << 14) != 0 { DebugCode::Trace } else { DebugCode::Breakpoint };
     super::cpu::write_dr6(0);
     frame.rflags &= !(1 << 8);
-    super::percpu::set_pending_debug_trap(Some(DebugTrap { code, rip: frame.rip }));
+    super::percpu::set_pending_debug_trap(Some(DebugTrap { code, rip: frame.rip, origin }));
 }
 
 /// [`lumen_exception_dispatch`]'s work for one vector.
@@ -742,7 +742,7 @@ fn dispatch(frame: &mut TrapFrame) {
         //   unwind directly off `IST_DEBUG` via `user::handle_user_exception`.
         if vector == 1 && !from_user {
             if frame.rip == super::syscall::entry_addr() {
-                defer_debug_trap(frame);
+                defer_debug_trap(frame, super::percpu::DebugOrigin::Lstar);
                 frame.rflags |= 1 << 16; // RF lets an LSTAR breakpoint advance past swapgs
                 DEFERRED_LSTAR_DB.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -855,10 +855,11 @@ fn dispatch(frame: &mut TrapFrame) {
             if vector == 1 {
                 // IST cannot copy a user frame or block. Keep the original RIP
                 // and si_code and request delivery on a non-IST interrupt return.
-                defer_debug_trap(frame);
+                defer_debug_trap(frame, super::percpu::DebugOrigin::User);
                 // A lost self-IPI leaves the trap pending for the next interrupt.
-                // If a syscall arrives first, its hook treats it as the LSTAR
-                // case: queues SIGTRAP and re-runs the syscall on handler return.
+                // If a syscall arrives first, the User origin keeps the original
+                // trap address. The syscall executes and retains its own result
+                // and restart decision; only an LSTAR trap re-runs an unexecuted call.
                 let _ = super::apic::send_ipi(super::apic::lapic_id(), WAKEUP);
                 return;
             }

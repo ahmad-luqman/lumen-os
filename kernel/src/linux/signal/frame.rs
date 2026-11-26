@@ -368,7 +368,11 @@ crate::ktest!(
                 ..Default::default()
             };
             let were_on = irq::disable();
-            percpu::set_pending_debug_trap(Some(percpu::DebugTrap { code: percpu::DebugCode::Trace, rip: TRAP_RIP }));
+            percpu::set_pending_debug_trap(Some(percpu::DebugTrap {
+                code: percpu::DebugCode::Trace,
+                rip: TRAP_RIP,
+                origin: percpu::DebugOrigin::User,
+            }));
             signal::exit_to_user_from_interrupt(&mut trap);
             irq::restore(were_on);
             kassert_eq!(trap.rip, action.handler);
@@ -379,5 +383,115 @@ crate::ktest!(
             kassert_eq!(word(&bytes, offset_of!(abi::RtSigFrame, uc.mcontext.trapno)), 1);
             Ok(())
         })?
+    }
+);
+
+#[cfg(feature = "ktest")]
+const DEBUG_TRAP_RIP: u64 = 0x400100;
+#[cfg(feature = "ktest")]
+const DEBUG_SYSCALL_RIP: u64 = 0x400202;
+
+/// Exercise the actual syscall dispatcher and inspect its copied handler frame.
+#[cfg(feature = "ktest")]
+fn deferred_debug_syscall(
+    origin: crate::arch::percpu::DebugOrigin,
+    nr: u64,
+    flags: u32,
+    expected: (u64, u64, u64),
+) -> crate::ktest::TestResult {
+    use crate::arch::{irq, percpu, syscall};
+    use crate::kassert_eq;
+    use crate::linux::{general, signal};
+    use lumen_signal::{Signal, restart::RestartCode};
+    const SI_ADDR: usize = 16;
+    const SI_CODE: usize = 8;
+    fn interrupted(_: &signal::RestartBlock) -> u64 {
+        signal::restart_result(RestartCode::Sys)
+    }
+    process::in_test_process(move |_| {
+        let action = process::KernelSigaction {
+            handler: 0x400000,
+            restorer: 0x400080,
+            flags: u64::from(general::SA_RESTORER | general::SA_SIGINFO | flags),
+            mask: 0,
+        };
+        process::set_current_action(Signal::TRAP, action);
+        if nr == u64::from(general::__NR_restart_syscall) {
+            sched::set_restart_block(Some(signal::RestartBlock { resume: interrupted, deadline: None, args: [0; 4] }));
+        }
+        let mut frame = SyscallFrame {
+            rax: nr,
+            rip: DEBUG_SYSCALL_RIP,
+            rsp: process::KTEST_USER_VA + process::KTEST_USER_LEN,
+            cs: u64::from(gdt::USER_CODE),
+            ss: u64::from(gdt::USER_DATA),
+            rflags: 0x202,
+            r11: 0x202,
+            ..Default::default()
+        };
+        let were_on = irq::disable();
+        percpu::set_pending_debug_trap(Some(percpu::DebugTrap {
+            code: percpu::DebugCode::Trace,
+            rip: DEBUG_TRAP_RIP,
+            origin,
+        }));
+        let mode = syscall::dispatch_for_test(&mut frame);
+        irq::restore(were_on);
+        kassert_eq!(mode, 1);
+        kassert_eq!(frame.rip, action.handler);
+        let mut bytes = [0; abi::FRAME_SIZE];
+        user::copy_from_user(&mut bytes, frame.rsp).map_err(|_| "read syscall debug signal frame")?;
+        let (addr, rip, rax) = expected;
+        kassert_eq!(word(&bytes, abi::SIGINFO + SI_ADDR), addr);
+        kassert_eq!(word(&bytes, offset_of!(abi::RtSigFrame, uc.mcontext.rip)), rip);
+        kassert_eq!(word(&bytes, offset_of!(abi::RtSigFrame, uc.mcontext.rax)), rax);
+        kassert_eq!(dword(&bytes, abi::SIGINFO + SI_CODE), 2);
+        // Sigreturn must retain the same result/context, not interpret it again.
+        frame.rsp += 8;
+        frame.r11 = 0x202;
+        restore(&mut frame).map_err(|_| "restore syscall debug signal frame")?;
+        kassert_eq!((frame.rip, frame.rax), (rip, rax));
+        Ok(())
+    })?
+}
+
+crate::ktest!(
+    fn deferred_user_debug_trap_keeps_syscall_result() {
+        deferred_debug_syscall(
+            crate::arch::percpu::DebugOrigin::User,
+            u64::from(crate::linux::general::__NR_getuid),
+            0,
+            (DEBUG_TRAP_RIP, DEBUG_SYSCALL_RIP, 0),
+        )
+    }
+);
+
+crate::ktest!(
+    fn deferred_user_debug_trap_keeps_syscall_restart() {
+        use crate::linux::{errno, general};
+        let nr = u64::from(general::__NR_restart_syscall);
+        for (flags, rip, rax) in
+            [(0, DEBUG_SYSCALL_RIP, (-(errno::EINTR as i64)) as u64), (general::SA_RESTART, DEBUG_SYSCALL_RIP - 2, nr)]
+        {
+            deferred_debug_syscall(crate::arch::percpu::DebugOrigin::User, nr, flags, (DEBUG_TRAP_RIP, rip, rax))?;
+        }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn deferred_lstar_debug_trap_reexecutes_syscall() {
+        use crate::linux::{general, signal};
+        // Neither the real syscall nor a restart-shaped RAX has executed yet.
+        // Both survive unchanged so the handler resumes at the syscall itself.
+        for nr in [u64::from(general::__NR_getuid), signal::restart_result(lumen_signal::restart::RestartCode::Sys)] {
+            deferred_debug_syscall(
+                crate::arch::percpu::DebugOrigin::Lstar,
+                nr,
+                0,
+                (DEBUG_SYSCALL_RIP, DEBUG_SYSCALL_RIP - 2, nr),
+            )?;
+        }
+        Ok(())
     }
 );
