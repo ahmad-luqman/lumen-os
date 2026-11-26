@@ -15,6 +15,7 @@ mod common;
 mod exec;
 mod futex;
 mod signals;
+mod small;
 
 use core::ffi::c_int;
 
@@ -28,6 +29,14 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     match &args[..n] {
         [_, b"fork-wait"] => fork_wait(),
         [_, b"futex"] => futex::run(),
+        [_, b"small-syscalls"] => small::run(),
+        [_, b"small-comm"] => small::comm_child(),
+        [_, b"small-stack-reduced"] => small::stack_child(512 * 1024),
+        [_, b"small-budget-must-fail"] => {
+            say!("FAIL reduced argument budget: exec succeeded");
+            1
+        }
+        [_, b"small-stack"] => small::stack_child(64 * 1024 * 1024),
         [_, b"fork-exec"] => exec::run(),
         [_, b"exec-exit", ..] => exec::child_exit(),
         [_, b"exec-hold"] => exec::child_hold(),
@@ -513,6 +522,7 @@ fn fork_wait() -> c_int {
         ("clone-stack-tls", &clone_stack_tls),
         ("clone-shared-resources", &clone_shared_resources),
         ("fork-inherited-state", &fork_inherited_state),
+        ("rusage", &small::usage),
     ])
 }
 

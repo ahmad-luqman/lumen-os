@@ -108,6 +108,10 @@ impl Devfs {
 }
 
 impl FileSystem for Devfs {
+    fn statfs(&self) -> Result<lumen_vfs::fs::StatFs, VfsError> {
+        Ok(lumen_vfs::fs::StatFs { magic: lumen_vfs::fs::StatFs::TMPFS, ..Default::default() })
+    }
+
     fn dev_id(&self) -> DevId {
         self.dev
     }

@@ -474,6 +474,8 @@ fn map_ext4_err(err: Ext4Error) -> VfsError {
 
 #[derive(Clone, Copy)]
 struct Ext4DiskLayout {
+    inode_count: u64,
+    reserved_blocks: u64,
     inode_size: u16,
     inodes_per_group: u32,
     desc_size: u16,
@@ -506,7 +508,18 @@ impl Ext4DiskLayout {
         if geometry.is_64bit() && desc_size != 64 {
             return Err(refuse(&format_args!("s_desc_size {desc_size} on a 64-bit volume, not 64")));
         }
-        Ok(Self { inode_size, inodes_per_group, desc_size, geometry })
+        let inode_count = u64::from(u32::from_le_bytes(sb[0..4].try_into().unwrap()));
+        let reserved_low = u64::from(u32::from_le_bytes(sb[8..12].try_into().unwrap()));
+        let reserved_high =
+            if geometry.is_64bit() { u64::from(u32::from_le_bytes(sb[0x154..0x158].try_into().unwrap())) } else { 0 };
+        Ok(Self {
+            inode_count,
+            reserved_blocks: reserved_low | (reserved_high << 32),
+            inode_size,
+            inodes_per_group,
+            desc_size,
+            geometry,
+        })
     }
 
     fn block_size(&self) -> u64 {
@@ -1570,6 +1583,21 @@ impl Ext4FileSystem {
 }
 
 impl FileSystem for Ext4FileSystem {
+    fn statfs(&self) -> Result<lumen_vfs::fs::StatFs, VfsError> {
+        let state = self.shared.state.lock();
+        let sb = state.ext4.superblock();
+        let units = |blocks: u64| blocks.saturating_mul(state.layout.block_size()) / 4096;
+        let free = sb.free_blocks_count();
+        Ok(lumen_vfs::fs::StatFs {
+            magic: lumen_vfs::fs::StatFs::EXT4,
+            blocks: units(sb.blocks_count()),
+            free_blocks: units(free),
+            available_blocks: units(free.saturating_sub(state.layout.reserved_blocks)),
+            files: state.layout.inode_count,
+            free_files: u64::from(sb.free_inodes_count()),
+        })
+    }
+
     fn dev_id(&self) -> DevId {
         self.shared.dev
     }
@@ -10043,6 +10071,34 @@ crate::ktest!(
             }
         }
         kassert!(reached_fifo && reached_success);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_statfs_matches_superblock_counts() {
+        use crate::kassert_eq;
+        // This image has 128 one-KiB blocks, 14 used blocks, 32 inodes,
+        // and ten reserved inodes. Statistics use four-KiB units.
+        for (reserved, available) in [(3u32, 27u64), (200, 0)] {
+            let mut image = ktest_util::build_1k_blockmap_image(128);
+            image[1024 + 8..1024 + 12].copy_from_slice(&reserved.to_le_bytes());
+            // No 64-bit feature: the high reserved-count word must be ignored.
+            image[1024 + 0x154..1024 + 0x158].copy_from_slice(&1u32.to_le_bytes());
+            let fs = ktest_util::mount_ro_image(image, 391)?;
+            let stats = fs.statfs().map_err(|_| "statfs")?;
+            kassert_eq!(
+                stats,
+                lumen_vfs::fs::StatFs {
+                    magic: 0xef53,
+                    blocks: 32,
+                    free_blocks: 28,
+                    available_blocks: available,
+                    files: 32,
+                    free_files: 22,
+                }
+            );
+        }
         Ok(())
     }
 );

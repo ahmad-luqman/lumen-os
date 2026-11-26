@@ -94,3 +94,59 @@ tests = ["scenario:test_linux_proc::test_fork_cow_and_exec_shebang", "scenario:t
 name = "Fatal signals interrupt exec while walking user argument pointers"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::linux::syscall::task::exec_argument_walk_observes_fatal_signal"]
+
+[[feature]]
+name = "Small syscalls: affinity, priorities, rusage, comm, statfs, clocks, sysinfo, getcpu and writable RLIMIT_STACK across exec"
+milestone = "M8"
+tests = [
+    "scenario:test_linux_proc::test_small_syscalls",
+    "ktest:lumen_kernel::linux::syscall::sys::tests::small_syscalls_copyout_and_errors",
+    "ktest:lumen_kernel::linux::syscall::sys::tests::small_syscalls_names_and_stack_limits",
+    "cargo:lumen-vfs",
+]
+
+[[feature]]
+name = "Timer accounting distinguishes interrupted user and kernel execution"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::sched::cpu_ticks_distinguish_user_and_system"]
+
+[[feature]]
+name = "Priority target selection and CPU accounting include live and exited non-leaders; tmpfs statistics follow quota use"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::sys::tests::priority_and_usage_include_nonleader_threads",
+    "ktest:lumen_kernel::linux::syscall::sys::tests::statfs_tmpfs_tracks_quota_consumption",
+]
+
+[[feature]]
+name = "Reaping transfers own and descendant CPU usage once; WNOWAIT never transfers it"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::process::table::reaped_usage_includes_descendants_once",
+    "scenario:test_linux_proc::test_fork_wait_and_exit_status",
+]
+
+[[feature]]
+name = "C12 review: raw comm fork inheritance, page-boundary names, Linux error precedence, CPU 1 affinity, reduced exec stacks and exact filesystem/cache statistics"
+milestone = "M8"
+tests = [
+    "scenario:test_linux_proc::test_small_syscalls",
+    "ktest:lumen_kernel::vfs::ext4::ext4_statfs_matches_superblock_counts",
+    "ktest:lumen_kernel::linux::syscall::sys::tests::sysinfo_reports_populated_page_cache",
+]
+
+[[feature]]
+name = "C12 round 2: raw exec comm, zombie priorities, rounded uptime, exact sysinfo counters and validated stack limits"
+milestone = "M8"
+tests = [
+    "scenario:test_linux_proc::test_small_syscalls",
+    "ktest:lumen_kernel::sched::task_name_normalizes_raw_comm",
+    "ktest:lumen_kernel::linux::syscall::sys::tests::sysinfo_uptime_rounds_up",
+    "ktest:lumen_kernel::linux::syscall::sys::tests::sysinfo_reports_free_frames_and_live_processes",
+    "cargo:lumen-vm",
+]
+
+[[feature]]
+name = "Task comm display handles invalid UTF-8 without heap allocation"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::sched::task_name_display_needs_no_heap"]

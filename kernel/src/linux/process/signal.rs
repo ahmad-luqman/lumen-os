@@ -41,6 +41,7 @@ pub struct SignalState {
     preferred: Option<ThreadSlot>,
     /// First-wins end decision; Process::exit records its diagnostic.
     group_exit: Option<GroupEnd>,
+    pub(super) rlimit_stack: lumen_vm::StackLimit,
 }
 
 /// One linked thread's queue slot, notification handle, mask and alternate stack.
@@ -129,6 +130,7 @@ impl SignalState {
             threads: BTreeMap::new(),
             preferred: None,
             group_exit: None,
+            rlimit_stack: lumen_vm::StackLimit::DEFAULT,
         }
     }
     pub fn action(&self, signal: Signal) -> KernelSigaction {
@@ -155,7 +157,7 @@ impl SignalState {
         Some(core::mem::replace(&mut self.actions[signal.index()], action))
     }
     pub(super) fn fork_copy(&self) -> Self {
-        Self { actions: self.actions, ..Self::new() }
+        Self { actions: self.actions, rlimit_stack: self.rlimit_stack, ..Self::new() }
     }
     pub(super) fn fatal_signal(&self) -> Option<Signal> {
         match self.group_exit {

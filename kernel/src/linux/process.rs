@@ -430,6 +430,10 @@ pub struct Process {
     exe_path: SpinLock<Option<Arc<[u8]>>>,
     /// Its `RusageSlot`'s value in `PROCS`' tree.
     usage_slot: u64,
+    dead_ticks: [AtomicU64; 2],
+    children_ticks: [AtomicU64; 2],
+    /// The exited leader's nice, retained until the process is reaped.
+    exited_leader_nice: SpinLock<Option<i8>>,
     /// M7's console state (until the console is a tty).
     console: SpinLock<ConsoleState>,
     allow_test_syscalls: bool,
@@ -463,6 +467,9 @@ impl Process {
             signal: SpinLock::new(signal),
             exe_path: SpinLock::new(exe_path),
             usage_slot: NEXT_USAGE_SLOT.fetch_add(1, Ordering::Relaxed),
+            dead_ticks: [const { AtomicU64::new(0) }; 2],
+            children_ticks: [const { AtomicU64::new(0) }; 2],
+            exited_leader_nice: SpinLock::new(None),
             console: SpinLock::new(console),
             allow_test_syscalls,
             exit: SpinLock::new(None),
@@ -488,6 +495,21 @@ impl Process {
         let pid = self.pid.load(Ordering::Acquire);
         debug_assert_ne!(pid, 0, "a process's pid read before it was set");
         pid
+    }
+
+    /// Read or atomically replace the soft and hard stack limits; return the previous pair.
+    pub fn stack_limit(&self, new: Option<lumen_vm::StackLimit>) -> lumen_vm::StackLimit {
+        let mut state = self.signal.lock();
+        let old = state.rlimit_stack;
+        if let Some(new) = new {
+            state.rlimit_stack = new;
+        }
+        old
+    }
+
+    /// CPU ticks accumulated by children reaped by this process.
+    pub fn children_time(&self) -> [u64; 2] {
+        self.children_ticks.each_ref().map(|t| t.load(Ordering::Relaxed))
     }
 
     /// Its parent's pid, or 0 without one (a root `linux` started, as M6's
@@ -807,7 +829,7 @@ impl ParkedChild {
     /// The child's run closure starts only after publication. Cancellation
     /// detaches its scheduler state without releasing the creator's resources.
     fn spawn(
-        name: impl Into<lumen_trace::ThreadName>,
+        name: impl Into<sched::TaskName>,
         space: Arc<AddressSpace>,
         linux: Arc<UserThread>,
         fs_base: u64,
@@ -930,6 +952,11 @@ impl UserThread {
         let tid = self.tid.load(Ordering::Acquire);
         debug_assert_ne!(tid, 0, "a thread's tid read before it was set");
         tid
+    }
+
+    /// A live scheduler handle, if this thread has one.
+    pub fn scheduler_thread(&self) -> Option<Arc<sched::Thread>> {
+        self.kernel_handle.lock().upgrade()
     }
 
     /// Its process.
@@ -1125,7 +1152,7 @@ pub(crate) fn fork_current(
     let done = new.process.vfork_done.lock().clone();
     // ParkedChild is declared after NewProcess, so a refusal joins first.
     let parked = ParkedChild::spawn(
-        sched::with_current(|t| t.name()).expect("forking thread"),
+        sched::with_current(|t| t.task_name()).expect("forking thread"),
         space,
         Arc::clone(&child),
         fs_base,
@@ -1176,14 +1203,20 @@ pub fn waitid_request(idtype: i32, id: i32, options: u32) -> Result<lumen_proc::
 /// Wait for a matching child state change; WNOHANG returns None. A reap
 /// removes both tree and process-table entries before user copyout, even
 /// when that copy faults. No process lock is held while sleeping.
+#[cfg(feature = "ktest")]
 pub fn wait_child(request: lumen_proc::WaitRequest) -> Result<Option<lumen_proc::Report>, u32> {
+    wait_child_with_usage(request).map(|result| result.map(|(report, _)| report))
+}
+
+/// Wait and snapshot the reported child's own and reaped-descendant ticks before removing it.
+pub fn wait_child_with_usage(request: lumen_proc::WaitRequest) -> Result<Option<(lumen_proc::Report, [u64; 2])>, u32> {
     let parent = current_process();
     loop {
         let seen = parent.child_seq.load(Ordering::SeqCst);
-        let (ready, gone) = PROCS.lock().wait(&parent, request)?;
+        let table::WaitResult { ready, gone, ticks } = PROCS.lock().wait(&parent, request)?;
         drop(gone);
         match ready {
-            lumen_proc::WaitReady::Reported(report) => return Ok(Some(report)),
+            lumen_proc::WaitReady::Reported(report) => return Ok(Some((report, ticks))),
             lumen_proc::WaitReady::NoneReady if request.options().nohang() => return Ok(None),
             lumen_proc::WaitReady::NoneReady => {}
         }
@@ -3749,3 +3782,19 @@ crate::ktest!(
         })?
     }
 );
+
+/// The live processes counted by sysinfo, including init but excluding zombies.
+pub fn live_process_count() -> usize {
+    PROCS.lock().live_process_count()
+}
+
+/// Snapshot a process's live and exited threads under the table's lifetime lock.
+pub fn process_time(pid: u32) -> [u64; 2] {
+    PROCS.lock().process_time(pid)
+}
+
+/// Read the highest priority of the selected threads, optionally setting each one's nice.
+pub fn priority(which: i32, who: i32, nice: Option<i32>) -> Result<u64, u32> {
+    let caller = current_thread();
+    PROCS.lock().priority(&caller, which, who, nice)
+}

@@ -45,6 +45,28 @@ pub const USER_STACK_SIZE: u64 = 8 * 1024 * 1024;
 /// Default bottom of the user stack; each address space retains its StackSize bottom.
 pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
 
+/// A soft/hard stack limit pair whose soft limit never exceeds its hard limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackLimit {
+    soft: u64,
+    hard: u64,
+}
+impl StackLimit {
+    pub const DEFAULT: Self = Self { soft: USER_STACK_SIZE, hard: USER_STACK_SIZE };
+
+    /// Refuse a soft limit greater than the hard limit; infinity is `u64::MAX`.
+    pub const fn new(soft: u64, hard: u64) -> Option<Self> {
+        if soft <= hard { Some(Self { soft, hard }) } else { None }
+    }
+    /// The limit sizing the next exec's stack and argument budget.
+    pub const fn soft(self) -> u64 {
+        self.soft
+    }
+    pub const fn hard(self) -> u64 {
+        self.hard
+    }
+}
+
 /// Per-exec stack reservation and Linux argument-string budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StackSize {
@@ -77,6 +99,18 @@ impl StackSize {
 #[cfg(test)]
 mod stack_size_tests {
     use super::*;
+    #[test]
+    fn stack_limit_validates_soft_and_hard() {
+        assert_eq!(StackLimit::new(USER_STACK_SIZE, USER_STACK_SIZE), Some(StackLimit::DEFAULT));
+        for (soft, hard) in [(0, 0), (0, u64::MAX), (512 * 1024, u64::MAX), (u64::MAX, u64::MAX)] {
+            let limit = StackLimit::new(soft, hard).unwrap();
+            assert_eq!((limit.soft(), limit.hard()), (soft, hard));
+        }
+        for (soft, hard) in [(1, 0), (513 * 1024, 512 * 1024), (u64::MAX, u64::MAX - 1)] {
+            assert_eq!(StackLimit::new(soft, hard), None);
+        }
+    }
+
     #[test]
     fn rlimit_stack_clamps_rounds_and_budgets() {
         assert_eq!(StackSize::DEFAULT, StackSize::from_rlimit(USER_STACK_SIZE));

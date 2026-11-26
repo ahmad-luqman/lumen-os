@@ -2053,13 +2053,20 @@ closure)
 from `mm::stack` (a guard page below it, hard rule 4; registered as a
 `thread` stack), its saved `rsp`, and a state: ready, running, sleeping,
 blocked or dead. (`main` and the APs' idle threads run on stacks they don't
-own.) Its name (#276) is a `lumen_trace::ThreadName`, 16 bytes inline like
-Linux's `comm`, protected by one leaf `SpinLock`. Spawn initializes it,
-fork inherits the parent's `name()`, and only the owner changes it on exec.
-The crash report's `thread:` line uses `try_lock`, falling back to `?` if
-busy, without blocking or allocating. The name is at most 15 bytes, a
+own.) Its name is a `TaskName` protected by one leaf `SpinLock`: raw Linux
+comm bytes (15 bytes plus NUL, zero-filled to 16) for `prctl`, and a sanitized
+`lumen_trace::ThreadName` (#276) for display. Spawn initializes both from its
+display name; fork copies the whole `TaskName`. Only the owner changes it:
+exec's `set_current_name` replaces both from the path's raw last component, while
+`PR_SET_NAME` copies at most 15 user bytes, adds a NUL, then
+`TaskName::from_comm` normalizes the terminator and trailing zeros, builds the
+sanitized display, and `set_current_comm` replaces both under the
+same lock. `PR_GET_NAME` returns the raw bytes, including non-UTF-8 and
+control bytes. The crash report's `thread:` line reads the display through
+`try_lock`, falling back to `?` if busy, without blocking or allocating.
+The displayed name is at most 15 bytes, a
 longer name cut to the longest prefix ending on a character, then each control character (C0, DEL,
-C1) and U+2028/U+2029 replaced by one `?`. The spawn functions take any
+C1) and U+2028/U+2029 replaced by one `?`. Ordinary spawn functions take any
 `Into<ThreadName>` (a `&str`). The cut is for names from outside the source
 (`linux /path`, section 9): every name written as a literal at a call
 that names a thread fits (`tests/harness/test_thread_names.py`; names
@@ -4512,7 +4519,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 73 | `flock(fd, op)` | M7's; a blocking request interrupted `-ERESTARTSYS` | B2 |
 | 76, 77 | `truncate`, `ftruncate` | M7's (and `openat(O_TRUNC)`), invalidating the mappings of every address space that maps the file via `invalidate_file_mappings` (section 5) | B7 |
 | 98 | `getrusage(who, usage)` | `RUSAGE_SELF` (0) the process's ticks, `RUSAGE_CHILDREN` (-1) its reaped children's, `RUSAGE_THREAD` (1) the caller's; any other `-EINVAL`; `ru_utime`/`ru_stime` from the timer interrupt's charge by the interrupted `CS` (1 ms ticks), every other field 0; `-EFAULT` | C12 |
-| 99 | `sysinfo(info)` | **moved from M10** (gcc, g++, make and vim call it: 35 census calls): `uptime` from `time::since_boot_ns`, `loads` 0, `totalram`/`freeram` from the frame allocator, `bufferram` the page cache's bytes, `sharedram`/`totalswap`/`freeswap`/`totalhigh`/`freehigh` 0, `procs` the live processes, `mem_unit` 1; `-EFAULT` | C12 |
+| 99 | `sysinfo(info)` | **moved from M10** (gcc, g++, make and vim call it: 35 census calls): `uptime` from `time::now_ns`, the same clock as `CLOCK_BOOTTIME`, rounded up to whole seconds, `loads` 0, `totalram`/`freeram` from the frame allocator, `bufferram` the page cache's bytes, `sharedram`/`totalswap`/`freeswap`/`totalhigh`/`freehigh` 0, `procs` the live processes, `mem_unit` 1; `-EFAULT` | C12 |
 | 109 | `setpgid(pid, pgid)` | `ProcTree::setpgid` | C8 |
 | 110 | `getppid()` | the parent's pid; 1 for an orphan; 0 for a root started by `linux` | C1 |
 | 111 | `getpgrp()` | the caller's process group | C8 |
@@ -4528,9 +4535,9 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 133 | `mknod(path, mode, dev)` | `mknodat(AT_FDCWD, path, mode, dev)` | C7 |
 | 137 | `statfs(path, buf)` | resolves `path` as `stat` does, then the filesystem's `FileSystem::statfs` (a lumen-vfs interface addition, C12): `f_type` (`EXT4_SUPER_MAGIC` 0xEF53, `TMPFS_MAGIC` 0x01021994 for tmpfs and devfs, `PROC_SUPER_MAGIC` 0x9FA0), `f_bsize` and `f_frsize` 4096, block and inode counts (ext4's superblock; a tmpfs mount's quota), `f_fsid` from the dev id, `f_namelen` 255, `f_flags` `ST_VALID` with the mount's flags (`ST_RDONLY` on a read-only mount), as Linux's `calculate_f_flags`; `-EFAULT` | C12 |
 | 138 | `fstatfs(fd, buf)` | the same for a descriptor's file (`O_PATH` too) | C12 |
-| 140 | `getpriority(which, who)` | `PRIO_PROCESS`: one thread (0: the caller; else the thread `who` names, a pid naming its leader), as Linux's `find_task_by_vpid`; `PRIO_PGRP` and `PRIO_USER` (uid 0: every process): every thread of the matching processes; returns `20 - nice` of the highest-priority match, as the Linux syscall does (libc turns it back); `-ESRCH` if none, a bad `which` `-EINVAL` | C12 |
+| 140 | `getpriority(which, who)` | `PRIO_PROCESS`: one thread (0: the caller; else the thread `who` names, a pid naming its leader), as Linux's `find_task_by_vpid`; `PRIO_PGRP` and `PRIO_USER` (uid 0: every process): every thread of the matching processes; an exited leader retains its nice until reap (including zombie reads and writes); returns `20 - nice` of the highest-priority match, as the Linux syscall does (libc turns it back); `-ESRCH` if none, a bad `which` `-EINVAL` | C12 |
 | 141 | `setpriority(which, who, prio)` | the same targets (`PRIO_PROCESS` one thread, the others every matching thread); `prio` clamped to -20..=19 into B6's `nice`; lowering it is allowed (root) | C12 |
-| 157 | `prctl(option, ...)` | `PR_SET_NAME` (15): up to 16 bytes, cut to 15 and a NUL, as the thread's name (`ThreadName`); `PR_GET_NAME` (16): 16 bytes; every other option `-EINVAL` | C12 |
+| 157 | `prctl(option, ...)` | `PR_SET_NAME` (15): reads at most 15 bytes, stopping at NUL, then stores a zero-filled 16-byte raw comm and its sanitized display together in `TaskName`; fork inherits both; `PR_GET_NAME` (16): the 16 raw bytes; every other option `-EINVAL` | C12 |
 | 186 | `gettid()` | the thread's tid | B1 |
 | 200 | `tkill(tid, sig)` | `tid <= 0` `-EINVAL`; no such thread `-ESRCH`; `SI_TKILL` (`SenderClass::Other`); musl's `raise` uses it (the census) | C5 |
 | 202 | `futex(...)` | section 8, "`futex`" | C4 |
@@ -4756,7 +4763,7 @@ pub struct SignalState {
     group_stop: Option<GroupStop>,           // signal, threads to park, generation
     timers: Timers,                          // ITIMER_REAL and POSIX timers (C13)
     ctty: Option<Arc<Tty>>,                  // controlling terminal (C9/C10)
-    rlimit_stack: u64,                       // for the next execve
+    rlimit_stack: StackLimit,                 // private soft <= hard; only soft sizes the next execve
 }
 pub struct ThreadSignals {
     slot: ThreadSlot,                        // lumen_signal::pending's
@@ -5210,7 +5217,7 @@ untouched):
      cache.
 5. Build the new `AddressSpace` completely (`AddressSpace::from_images_with_stack`,
    the initial stack from the copied strings): `-ENOMEM` if frames or heap
-   run out. The stack's size is `rlimit_stack` clamped to 128 KiB..=256
+   run out. The stack's size is the soft limit `rlimit_stack.soft()` clamped to 128 KiB..=256
    MiB, rounded up to a page by `StackSize` (section 5), whose argument
    budget also supplies step 2. Each `AddressSpace` retains the bottom.
    **No whole-file read:** the kernel's `ElfImage` (in

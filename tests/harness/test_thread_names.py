@@ -14,7 +14,7 @@ replace and no escape.
 
 It fails closed: a name argument holding no literal must be one of the
 variable forms in `VARIABLES` (each a name passed on, or one taken from a
-table), and every function in kernel/src with a `ThreadName` parameter must
+table), and every function in kernel/src with a `ThreadName` or `TaskName` parameter must
 be in `NAME_ARG` (or `NOT_NAMING`, saying why). Names kept in a table or a
 variable (the desktop's demo table, the shells' `shell-vt<n>`, `spawn_test`'s
 lists) aren't read here: `From<&str>`, the spawn functions' conversion,
@@ -59,9 +59,12 @@ NOT_NAMING = {
     # `Thread::new`: only `spawned` and `adopted` call it, with the name
     # they were given.
     "new": "sched.rs's Thread::new, called by spawned and adopted",
-    # `execve`'s name for the running thread, from its path (`from_path`
-    # cuts it), never a literal.
-    "set_current_name": "sched.rs's Thread::set_exec_name, called by execve with ThreadName::from_path",
+    # `execve`'s raw basename, normalized by `TaskName::from_comm`;
+    # its display is sanitized separately, never a source literal.
+    "set_current_name": "sched.rs's set_current_name, called by execve with TaskName::from_comm",
+    # `TaskName::from_display`: wraps a `ThreadName` already made (a
+    # spawn's name) with its raw comm bytes.
+    "from_display": "sched.rs's TaskName::from_display, wrapping an existing ThreadName",
 }
 # A name argument holding no literal: a name passed on by a wrapper, or one
 # taken from a table (checked when converted: `From<&str>`'s assertion).
@@ -162,10 +165,12 @@ def scan(src: str) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
 
 
 def naming_functions(src: str) -> list[str]:
-    """Each function in `src` with a `ThreadName` parameter."""
+    """Each function in `src` with a display or complete task-name parameter."""
     code = strip_comments(src)
     return [
-        m.group(1) for m in FN.finditer(code) if "ThreadName" in ",".join(arguments(code, m.end()))
+        m.group(1)
+        for m in FN.finditer(code)
+        if any(kind in ",".join(arguments(code, m.end())) for kind in ("ThreadName", "TaskName"))
     ]
 
 
@@ -274,3 +279,8 @@ def test_the_scan_reads_each_form_and_refuses_what_wont_fit():
     assert naming_functions("pub fn spawn_on<F: Fn()>(cpu: usize, name: ThreadName) {}") == [
         "spawn_on"
     ]
+
+    assert naming_functions("fn spawn_fork_child(name: impl Into<TaskName>) {}") == [
+        "spawn_fork_child"
+    ]
+    assert naming_functions("fn task_name() -> TaskName {}") == []

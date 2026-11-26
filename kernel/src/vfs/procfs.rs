@@ -90,6 +90,10 @@ impl Procfs {
 }
 
 impl FileSystem for Procfs {
+    fn statfs(&self) -> Result<lumen_vfs::fs::StatFs, VfsError> {
+        Ok(lumen_vfs::fs::StatFs { magic: lumen_vfs::fs::StatFs::PROC, ..Default::default() })
+    }
+
     fn dev_id(&self) -> DevId {
         self.dev
     }

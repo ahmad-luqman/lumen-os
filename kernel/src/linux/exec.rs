@@ -8,7 +8,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use core::fmt::Write;
 
 use lumen_elf::loader::{EHDR_SIZE, ElfHeader, ElfLoadError, LoadedElf, validate_interp};
 use lumen_vfs::VfsError;
@@ -83,18 +82,6 @@ pub struct ExecFile {
 
 fn read_file(path: &[u8]) -> Result<ExecFile, VfsError> {
     open_path(None, path)
-}
-
-/// Display UTF-8 paths unchanged and escape other byte paths without losing bytes.
-pub fn display_path(path: &[u8]) -> Result<String, VfsError> {
-    let mut text = String::new();
-    text.try_reserve_exact(path.len().checked_mul(4).ok_or(VfsError::NoMem)?).map_err(|_| VfsError::NoMem)?;
-    if let Ok(path) = core::str::from_utf8(path) {
-        text.push_str(path);
-    } else {
-        write!(text, "{}", lumen_vfs::Escaped(path)).expect("reserved escaped path");
-    }
-    Ok(text)
 }
 
 /// Resolve bytes from cwd, storing the reached file's identity for procfs and maps.

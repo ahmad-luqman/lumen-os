@@ -20,6 +20,12 @@ pub trait FileSystem: Send + Sync {
     /// Human-readable filesystem type name (e.g. `"ext4"`, `"tmpfs"`, `"devfs"`, `"procfs"`).
     fn name(&self) -> &'static str;
 
+    /// Filesystem capacity and free space. The caller must hold no VFS table lock.
+    /// Filesystems without statistics return EOPNOTSUPP.
+    fn statfs(&self) -> Result<StatFs, VfsError> {
+        Err(VfsError::OpNotSupp)
+    }
+
     /// Root directory inode of this filesystem.
     fn root_inode(&self) -> Arc<dyn VfsInode>;
 
@@ -410,5 +416,82 @@ impl Drop for OpenGuard {
             self.inode.ino()
         );
         let _ = self.inode.dec_open_count();
+    }
+}
+
+/// Filesystem statistics in 4096-byte units; inode counts use the filesystem's quota.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatFs {
+    pub magic: u64,
+    pub blocks: u64,
+    pub free_blocks: u64,
+    pub available_blocks: u64,
+    pub files: u64,
+    pub free_files: u64,
+}
+
+impl StatFs {
+    pub const EXT4: u64 = 0xef53;
+    pub const TMPFS: u64 = 0x0102_1994;
+    pub const PROC: u64 = 0x9fa0;
+
+    /// Capacity under one shared byte quota, including charges for metadata.
+    pub fn quota(limit: u64, used: u64, inode_cost: u64) -> Self {
+        let free = limit.saturating_sub(used);
+        Self {
+            magic: Self::TMPFS,
+            blocks: limit / 4096,
+            free_blocks: free / 4096,
+            available_blocks: free / 4096,
+            files: limit / inode_cost,
+            free_files: free / inode_cost,
+        }
+    }
+
+    /// Linux x86-64 statfs words, including zero spare fields and ST_VALID.
+    pub fn words(self, dev: DevId, read_only: bool) -> [u64; 15] {
+        [
+            self.magic,
+            4096,
+            self.blocks,
+            self.free_blocks,
+            self.available_blocks,
+            self.files,
+            self.free_files,
+            dev.raw(),
+            255,
+            4096,
+            0x20 | u64::from(read_only),
+            0,
+            0,
+            0,
+            0,
+        ]
+    }
+}
+
+#[cfg(test)]
+mod statfs_tests {
+    use super::*;
+    #[test]
+    fn statfs_quota_counts_metadata_and_rounds_down() {
+        let stats = StatFs::quota(16384, 4097, 256);
+        assert_eq!((stats.blocks, stats.free_blocks, stats.available_blocks), (4, 2, 2));
+        assert_eq!((stats.files, stats.free_files), (64, 47));
+        assert_eq!(StatFs::quota(4096, 8192, 256).free_blocks, 0);
+    }
+    #[test]
+    fn statfs_words_keep_identity_flags_and_zero_spares() {
+        let stats = StatFs {
+            magic: StatFs::EXT4,
+            blocks: 101,
+            free_blocks: 30,
+            available_blocks: 20,
+            files: 50,
+            free_files: 12,
+        };
+        let dev = DevId::makedev(8, 1);
+        assert_eq!(stats.words(dev, true), [0xef53, 4096, 101, 30, 20, 50, 12, dev.raw(), 255, 4096, 0x21, 0, 0, 0, 0]);
+        assert_eq!(stats.words(dev, false)[10], 0x20);
     }
 }
