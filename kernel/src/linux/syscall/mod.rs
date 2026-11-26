@@ -891,7 +891,7 @@ crate::ktest!(
         let eintr = neg_errno(errno::EINTR);
         process::in_test_process(move |_| -> crate::ktest::TestResult {
             let me = sched::current().ok_or("a thread")?;
-            // SIGUSR1 ignored: raised, nothing is delivered, as before C5.
+            // SIGUSR1 ignored: raising it discards the pending signal.
             set_current_action(Signal::USR1, KernelSigaction { handler: 1, ..KernelSigaction::default() });
             let frame_of =
                 |rax: u64| SyscallFrame { rax, rip: RIP, rdi: 3, rsi: 7, rdx: 0x1234, ..SyscallFrame::default() };

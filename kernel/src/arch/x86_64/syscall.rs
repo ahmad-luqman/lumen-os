@@ -292,7 +292,7 @@ lumen_enter_ring3_call:
     .type lumen_enter_fork_call, @function
     .balign 16
 # SysV entry: RDI -> readable 160-byte SyscallFrame, valid user selectors,
-# canonical user RIP, safe flags, child CR3, kernel GS, interrupts off.
+# safe flags, child CR3, kernel GS, interrupts off. The return hook checks RIP.
 lumen_enter_fork_call:
     # Save the same unwind frame as lumen_enter_ring3_call.
     pushq %rbp
@@ -311,6 +311,8 @@ lumen_enter_fork_call:
     movq $20, %rcx                 # 20 qwords = the full 160-byte SyscallFrame
     cld
     rep movsq
+    movq %rsp, %rdi
+    call lumen_fork_exit_to_user
     jmp lumen_fork_iret
     .size lumen_enter_fork_call, . - lumen_enter_fork_call
 
@@ -378,22 +380,31 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
     let pending_db = percpu::take_pending_debug_trap();
     irq::restore(true);
 
-    if pending_db {
-        crate::user::handle_deferred_debug_trap(frame);
-    }
-
     let orig_rax = frame.rax;
-    let mode = crate::user::dispatch_syscall(frame);
+    let mut mode = if let Some(debug) = pending_db {
+        crate::linux::signal::force_debug_trap(debug.code, frame.rip);
+        // The deferred trap precedes syscall execution. A returning handler
+        // resumes at that syscall, unless it edits its saved context.
+        frame.rip = frame.rip.saturating_sub(2);
+        SyscallReturn::Iret
+    } else {
+        crate::user::dispatch_syscall(frame)
+    };
 
     // The restart decision runs once, on the first pass.
     // C5's rt_sigreturn restores user registers, not a syscall to restart.
-    let mut syscall = if orig_rax == linux_raw_sys::general::__NR_rt_sigreturn as u64 {
+    let mut syscall = if pending_db.is_some() || orig_rax == linux_raw_sys::general::__NR_rt_sigreturn as u64 {
         None
     } else {
         lumen_signal::restart::SyscallExit::new(orig_rax)
     };
     loop {
-        crate::linux::signal::exit_to_user(frame, syscall.take());
+        if frame.rip >= USER_MAX {
+            crate::user::handle_non_canonical_return(frame.rip);
+        }
+        if crate::linux::signal::exit_to_user(frame, syscall.take()) {
+            mode = SyscallReturn::Iret;
+        }
         let _ = irq::disable();
         if !crate::sched::current_sigpending() {
             break;
@@ -402,11 +413,9 @@ extern "C" fn lumen_syscall_dispatch(frame: &mut SyscallFrame) -> u64 {
     }
     frame.rflags = sanitize_user_rflags(frame.rflags);
 
-    // Canonical RIP check BEFORE `swapgs` or `sysretq`/`iretq` (both raise
-    // ring-0 `#GP(0)` with user GS loaded if RIP is non-canonical).
-    if frame.rip >= USER_MAX {
-        crate::user::handle_non_canonical_return(frame.rip);
-    }
+    // Delivery must already have handled an invalid RIP before any return
+    // instruction can raise a ring-0 #GP with user GS loaded.
+    assert!(frame.rip < USER_MAX, "signal hook returned invalid RIP");
 
     match mode {
         SyscallReturn::Sysret => {
@@ -516,15 +525,16 @@ fn run_ring3(enter: impl FnOnce()) {
     assert!(irq::enabled() && irq::depth() == 0, "ring-3 entry requires interrupts on and no SpinLock held");
     assert_eq!(percpu::user_exit_rsp(), 0, "nested ring-3 entry on CPU {}", percpu::index());
     let were_on = irq::disable();
-    percpu::set_pending_debug_trap(false);
-    // SAFETY: this MSR exists on x86-64; swapgs must load a clean user GS.
+    percpu::set_pending_debug_trap(None);
+    // SAFETY: `IA32_KERNEL_GS_BASE` exists on every x86-64 CPU; resetting it
+    // to 0 ensures ring 3 starts with a clean user GS base after `swapgs`.
     unsafe { wrmsr(percpu::IA32_KERNEL_GS_BASE, 0) };
     enter();
     // The trampoline unwound with interrupts off and no active user frame.
     // SAFETY: this CPU's TSS is ours to update with interrupts disabled.
     unsafe { gdt::set_rsp0(percpu::index(), 0) };
     percpu::set_kernel_rsp(0);
-    percpu::set_pending_debug_trap(false);
+    percpu::set_pending_debug_trap(None);
     irq::restore(were_on);
 }
 
@@ -537,17 +547,31 @@ pub unsafe fn enter_fork(mut frame: SyscallFrame) {
     frame.cs = u64::from(USER_CODE);
     frame.ss = u64::from(USER_DATA);
     frame.rflags = sanitize_user_rflags(frame.rflags);
-    // A bad inherited return address must end the child, never cause a
-    // ring-0 #GP at iretq with user GS loaded.
-    if frame.rip >= USER_MAX {
-        crate::linux::process::record_exit(crate::user::UserExit::NonCanonicalRip(frame.rip));
-        return;
-    }
     run_ring3(|| {
-        // SAFETY: the current space is the child's; selectors/flags and RIP
-        // are checked, and run_ring3 supplies the entry preconditions.
+        // SAFETY: the current space is the child's; selectors/flags are safe,
+        // the trampoline checks RIP, and run_ring3 supplies the entry preconditions.
         unsafe { lumen_enter_fork_call(&frame) };
     });
+}
+
+/// The fork trampoline has established its unwind target and full saved frame.
+/// Run delivery before its first IRET, with the same final IRQ-off checks.
+#[unsafe(no_mangle)]
+extern "C" fn lumen_fork_exit_to_user(frame: &mut SyscallFrame) {
+    irq::restore(true);
+    loop {
+        if frame.rip >= USER_MAX {
+            crate::user::handle_non_canonical_return(frame.rip);
+        }
+        crate::linux::signal::exit_to_user(frame, None);
+        let _ = irq::disable();
+        if !crate::sched::current_sigpending() {
+            break;
+        }
+        irq::restore(true);
+    }
+    frame.rflags = sanitize_user_rflags(frame.rflags);
+    assert!(frame.rip < USER_MAX, "signal hook returned invalid fork RIP");
 }
 
 /// Unwind directly back to the caller of [`enter_ring3`] on this CPU.

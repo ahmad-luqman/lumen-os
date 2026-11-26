@@ -1,87 +1,419 @@
-//! Signal disposition and thread-mask ownership; delivery is C5.
+//! Process-owned signal queues and delivery transitions. All queue operations
+//! run under the process's signal lock; sends by tid also hold PROCS so an
+//! unlink or tid reuse cannot race lookup and enqueue.
 
 use super::*;
+use crate::linux::errno;
+use crate::user::UserFault;
+use alloc::sync::Weak;
+use lumen_signal::altstack::{AltStack, StackError};
+use lumen_signal::pending::{
+    Disposition, PendingSignals, SenderClass, SigInfo, Target, ThreadCandidate, ThreadSlot, ThreadState, select_target,
+};
+use lumen_signal::{DefaultAction, SigSet};
 
-/// A process's signal dispositions and its threads' masks. M8's delivery
-/// (pending signals, stops, the alternate stack) adds to it.
+/// Dispositions, queues and fatal-signal intent, serialized by Process::signal.
 pub struct SignalState {
-    /// By signal number - 1.
     actions: [KernelSigaction; 64],
-    /// By tid.
+    pending: PendingSignals,
     threads: BTreeMap<u32, ThreadSignals>,
+    preferred: Option<ThreadSlot>,
+    group_exit: Option<Signal>,
+}
+
+/// One linked thread's queue slot, notification handle, mask and alternate stack.
+pub struct ThreadSignals {
+    slot: ThreadSlot,
+    thread: Arc<SpinLock<Weak<sched::Thread>>>,
+    synthetic: bool,
+    blocked: Blocked,
+    alt_stack: AltStack,
+    fault: Option<UserFault>,
+}
+
+impl ThreadSignals {
+    fn set_blocked(&mut self, blocked: Blocked) {
+        self.blocked = blocked;
+    }
+    fn set_fault(&mut self, fault: Option<UserFault>) {
+        self.fault = fault;
+    }
+    fn take_fault(&mut self, signal: Signal) -> Option<UserFault> {
+        if self.fault.is_some_and(|fault| fault.signal() == signal) { self.fault.take() } else { None }
+    }
+    fn notify(&self, fatal: bool) {
+        let thread = self.thread.lock().upgrade();
+        debug_assert!(thread.is_some() || self.synthetic, "linked thread has no notification target");
+        if let Some(thread) = thread {
+            thread.set_sigpending();
+            if fatal {
+                thread.set_fatal_pending();
+            }
+            sched::kick(&thread);
+        }
+    }
+    fn install(&mut self, alt_stack: AltStack) {
+        self.alt_stack = alt_stack;
+    }
+}
+
+/// A dequeue result; a fatal diagnostic belongs only to the winning signal.
+pub enum Delivery {
+    None,
+    Fatal(Signal, Option<UserFault>),
+    Handler(HandlerDelivery),
+}
+
+/// A handler selected under siglock, consumed after releasing the lock.
+pub struct HandlerDelivery {
+    pub info: SigInfo,
+    pub action: KernelSigaction,
+    pub blocked: Blocked,
+    pub stack: AltStack,
+    pub fault: Option<UserFault>,
+}
+
+fn disposition(a: KernelSigaction) -> Disposition {
+    match a.handler {
+        0 => Disposition::Default,
+        1 => Disposition::Ignore,
+        _ => Disposition::Handler,
+    }
+}
+fn kills_by_default(a: KernelSigaction, sig: Signal) -> bool {
+    a.handler == 0 && matches!(sig.default_action(), DefaultAction::Term | DefaultAction::Core)
+}
+fn ignored(a: KernelSigaction, sig: Signal) -> bool {
+    a.handler == 1 || (a.handler == 0 && matches!(sig.default_action(), DefaultAction::Ign | DefaultAction::Cont))
 }
 
 impl SignalState {
     pub(super) fn new() -> Self {
-        Self { actions: [KernelSigaction::default(); 64], threads: BTreeMap::new() }
+        Self {
+            actions: [KernelSigaction::default(); 64],
+            pending: PendingSignals::new(0, 1024).expect("empty pending queues").0,
+            threads: BTreeMap::new(),
+            preferred: None,
+            group_exit: None,
+        }
     }
-
-    pub(super) fn fork_copy(&self) -> Self {
-        Self { actions: self.actions, threads: BTreeMap::new() }
-    }
-
-    /// `signal`'s disposition.
     pub fn action(&self, signal: Signal) -> KernelSigaction {
         self.actions[signal.index()]
     }
-
-    /// Install `action` for `signal`, its mask stripped of `SIGKILL` and
-    /// `SIGSTOP`: the action it replaces, or `None` (nothing changed) for
-    /// `SIGKILL` or `SIGSTOP`, whose dispositions never change.
+    /// Replace an action, returning its predecessor; KILL/STOP return None.
+    /// Strip unknown flags and unblockable mask bits, and discard ignored pending entries.
     pub fn set_action(&mut self, signal: Signal, mut action: KernelSigaction) -> Option<KernelSigaction> {
         if signal.is_unblockable() {
             return None;
         }
         action.mask = SigSet(action.mask).unblockable_stripped().0;
+        action.flags &= u64::from(
+            general::SA_NOCLDSTOP
+                | general::SA_NOCLDWAIT
+                | general::SA_SIGINFO
+                | general::SA_RESTORER
+                | general::SA_ONSTACK
+                | general::SA_RESTART
+                | general::SA_NODEFER
+                | general::SA_RESETHAND,
+        );
+        self.pending.disposition_changed(signal, disposition(action));
         Some(core::mem::replace(&mut self.actions[signal.index()], action))
     }
-
-    /// Add thread `tid`'s signal state: panics if it already has one.
-    pub(super) fn add_thread(&mut self, tid: u32, signals: ThreadSignals) {
-        let displaced = self.threads.insert(tid, signals);
-        assert!(displaced.is_none(), "tid {tid} already had signal state");
+    pub(super) fn fork_copy(&self) -> Self {
+        Self { actions: self.actions, ..Self::new() }
     }
-
-    /// Remove thread `tid`'s signal state: panics if it has none.
+    pub(super) fn fatal_signal(&self) -> Option<Signal> {
+        self.group_exit
+    }
+    fn start_group_exit(&mut self, sig: Signal) {
+        self.group_exit.get_or_insert(sig);
+        for t in self.threads.values() {
+            t.notify(true);
+        }
+    }
+    pub(super) fn add_thread(&mut self, tid: u32, owner: &UserThread, blocked: Blocked) {
+        let slot = self.pending.add_thread().expect("allocate thread signal queue");
+        let signals = ThreadSignals {
+            slot,
+            thread: Arc::clone(&owner.kernel_handle),
+            synthetic: cfg!(feature = "ktest") && owner.kernel_thread.load(Ordering::Acquire) == 0,
+            blocked,
+            alt_stack: AltStack::DISABLED,
+            fault: None,
+        };
+        assert!(self.threads.insert(tid, signals).is_none(), "duplicate signal tid");
+        self.preferred.get_or_insert(slot);
+    }
     pub(super) fn remove_thread(&mut self, tid: u32) {
-        let removed = self.threads.remove(&tid);
-        assert!(removed.is_some(), "thread {tid} had no signal state");
+        let removed = self.threads.remove(&tid).expect("live signal tid");
+        self.pending.remove_thread(removed.slot).expect("live pending slot");
+        if self.preferred == Some(removed.slot) {
+            self.preferred = self.threads.values().next().map(|t| t.slot);
+        }
+        // Shared pending signals survive the departing private queue.
+        for t in self.threads.values() {
+            if self.pending.has_deliverable(t.slot, t.blocked).expect("live slot") {
+                t.notify(false);
+            }
+        }
     }
-
-    /// Whether thread `tid` has signal state here.
+    pub fn thread(&self, tid: u32) -> Option<&ThreadSignals> {
+        self.threads.get(&tid)
+    }
     #[cfg(feature = "ktest")]
     pub(super) fn has_thread(&self, tid: u32) -> bool {
-        self.threads.contains_key(&tid)
+        self.thread(tid).is_some()
     }
-
-    /// The tids with signal state here, ascending.
     #[cfg(feature = "ktest")]
     pub(super) fn tids(&self) -> impl Iterator<Item = u32> + '_ {
         self.threads.keys().copied()
     }
-
-    /// The signals thread `tid` blocks: panics if it isn't one of this
-    /// process's live threads.
     pub(super) fn blocked(&self, tid: u32) -> Blocked {
-        self.threads.get(&tid).unwrap_or_else(|| panic!("thread {tid} has no signal state")).blocked
+        self.thread(tid).expect("live signal tid").blocked
     }
-
-    /// Make `blocked` the signals thread `tid` blocks: panics if it isn't
-    /// one of this process's live threads.
     pub(super) fn set_blocked(&mut self, tid: u32, blocked: Blocked) {
-        self.threads.get_mut(&tid).unwrap_or_else(|| panic!("thread {tid} has no signal state")).blocked = blocked;
+        let t = self.threads.get_mut(&tid).expect("live signal tid");
+        t.set_blocked(blocked);
+        if self.pending.has_deliverable(t.slot, blocked).expect("live slot") {
+            t.notify(false);
+        }
+    }
+    fn configure_stack(&mut self, tid: u32, rsp: u64, new: Option<(u64, u64, u32)>) -> Result<AltStack, StackError> {
+        let t = self.threads.get_mut(&tid).expect("current signal tid");
+        let old = t.alt_stack;
+        if let Some((sp, size, flags)) = new {
+            t.install(old.configure(rsp, sp, size, flags)?);
+        }
+        Ok(old)
+    }
+    fn install_context(&mut self, tid: u32, mask: Blocked, stack: AltStack) {
+        self.threads.get_mut(&tid).expect("current signal tid").install(stack);
+        self.set_blocked(tid, mask);
+    }
+    pub(super) fn send(&mut self, tid: Option<u32>, info: SigInfo, sender: SenderClass) -> Result<(), u32> {
+        let sig = info.signal();
+        let target = match tid {
+            Some(tid) => Target::Thread(self.thread(tid).ok_or(errno::ESRCH)?.slot),
+            None => Target::Process,
+        };
+        self.pending.prepare_signal(sig);
+        let keep_ignored = match tid {
+            Some(tid) => {
+                let t = self.thread(tid).expect("checked tid");
+                t.blocked.contains(sig)
+            }
+            None => self.threads.values().all(|t| t.blocked.contains(sig)),
+        };
+        if ignored(self.action(sig), sig) && !keep_ignored {
+            return Ok(());
+        }
+        self.pending.enqueue(target, info, sender).map_err(|_| errno::EAGAIN)?;
+        let chosen = match target {
+            Target::Thread(slot) => Some(slot),
+            Target::Process => {
+                let candidates: Vec<_> = self
+                    .threads
+                    .values()
+                    .map(|t| {
+                        let thread = t.thread.lock().upgrade();
+                        ThreadCandidate {
+                            slot: t.slot,
+                            mask: t.blocked,
+                            state: match thread.as_ref().map(|t| t.state()) {
+                                Some(sched::State::Running) => ThreadState::Running,
+                                Some(sched::State::Dead) | None => ThreadState::Exiting,
+                                _ => ThreadState::Sleeping,
+                            },
+                            has_pending: thread.is_some_and(|t| t.sigpending()),
+                        }
+                    })
+                    .collect();
+                self.preferred.and_then(|p| select_target(sig, &candidates, p).expect("live cursor"))
+            }
+        };
+        if let Some(slot) = chosen {
+            self.preferred = Some(slot);
+            let t = self.threads.values().find(|t| t.slot == slot).expect("chosen slot");
+            if !t.blocked.contains(sig) && kills_by_default(self.action(sig), sig) {
+                self.start_group_exit(sig);
+            } else if !t.blocked.contains(sig) {
+                t.notify(false);
+            }
+        }
+        Ok(())
+    }
+    fn force(&mut self, tid: u32, info: SigInfo, reset: bool, fault: Option<UserFault>) {
+        if self.group_exit.is_some() {
+            return;
+        }
+        let sig = info.signal();
+        let t = self.thread(tid).expect("current signal tid");
+        if reset || t.blocked.contains(sig) || self.action(sig).handler == 1 {
+            self.set_action(sig, KernelSigaction::default());
+            let mut mask = self.blocked(tid).set();
+            mask.remove(sig);
+            self.set_blocked(tid, Blocked::new(mask));
+        }
+        self.threads.get_mut(&tid).expect("current signal tid").set_fault(fault);
+        debug_assert!(!sig.is_realtime());
+        self.send(Some(tid), info, SenderClass::SiUser).expect("standard forced signal");
+    }
+    fn next(&mut self, tid: u32) -> Delivery {
+        loop {
+            let t = self.threads.get_mut(&tid).expect("current signal tid");
+            if let Some(signal) = self.group_exit {
+                return Delivery::Fatal(signal, t.take_fault(signal));
+            }
+            let Some(info) = self.pending.dequeue(t.slot, t.blocked).expect("current slot") else {
+                sched::clear_current_sigpending();
+                return Delivery::None;
+            };
+            let sig = info.signal();
+            let action = self.actions[sig.index()];
+            if ignored(action, sig) {
+                continue;
+            }
+            if action.handler == 0 {
+                if matches!(sig.default_action(), DefaultAction::Term | DefaultAction::Core) {
+                    self.start_group_exit(sig);
+                    continue;
+                }
+                // Group stop/continue delivery is supplied by C6.
+                continue;
+            }
+            if action.flags & u64::from(general::SA_RESETHAND) != 0 {
+                self.actions[sig.index()].handler = 0;
+            }
+            return Delivery::Handler(HandlerDelivery {
+                info,
+                action,
+                blocked: t.blocked,
+                stack: t.alt_stack,
+                fault: t.take_fault(sig),
+            });
+        }
     }
 }
 
-/// One thread's signal state.
-pub struct ThreadSignals {
-    /// The signals it blocks (`rt_sigprocmask`): never `SIGKILL` or
-    /// `SIGSTOP`.
-    blocked: Blocked,
-}
-
-impl ThreadSignals {
-    pub(super) fn new(blocked: Blocked) -> Self {
-        Self { blocked }
+impl Process {
+    /// Dequeue and choose an action in one signal hold, fatal state first.
+    pub fn next_signal(&self, tid: u32) -> Delivery {
+        debug_assert_eq!(tid, current_thread().tid());
+        self.signal.lock().next(tid)
+    }
+    pub fn force_signal(&self, tid: u32, info: SigInfo, reset: bool, fault: Option<UserFault>) {
+        debug_assert_eq!(tid, current_thread().tid());
+        // Synchronous faults must be noticed even if notification binding is broken.
+        sched::with_current(|t| t.set_sigpending());
+        self.signal.lock().force(tid, info, reset, fault);
     }
 }
+impl UserThread {
+    pub fn alt_stack(&self) -> AltStack {
+        self.process.signal.lock().thread(self.tid()).expect("current signal tid").alt_stack
+    }
+    pub fn configure_alt_stack(&self, rsp: u64, new: Option<(u64, u64, u32)>) -> Result<AltStack, StackError> {
+        self.process.signal.lock().configure_stack(self.tid(), rsp, new)
+    }
+    pub fn install_signal_context(&self, mask: Blocked, stack: AltStack) {
+        self.process.signal.lock().install_context(self.tid(), mask, stack);
+    }
+}
+
+/// Lookup and generation are serialized against unlink and tid reuse.
+#[cfg(feature = "ktest")]
+pub fn send_thread(tgid: Option<u32>, tid: u32, info: Option<SigInfo>, sender: SenderClass) -> Result<(), u32> {
+    send_thread_checked(tgid, tid, Ok(info), sender)
+}
+/// Defer signal validation errors until the target has been found.
+pub fn send_thread_checked(
+    tgid: Option<u32>,
+    tid: u32,
+    info: Result<Option<SigInfo>, u32>,
+    sender: SenderClass,
+) -> Result<(), u32> {
+    PROCS.lock().send_thread(tgid, tid, info, sender)
+}
+pub fn send_process_checked(pid: i32, info: Result<Option<SigInfo>, u32>, sender: SenderClass) -> Result<(), u32> {
+    let caller = current_process().pid();
+    PROCS.lock().send_process(caller, pid, info, sender)
+}
+
+crate::ktest!(
+    fn signal_send_refuses_unlinked_tid_and_discards_ignored_pending() {
+        use crate::{kassert, kassert_eq};
+        in_test_process(|_| {
+            let me = current_thread();
+            let extra = add_ktest_thread(me.process())?;
+            let tid = extra.tid();
+            remove_ktest_thread(&extra);
+            kassert_eq!(send_thread(None, tid, None, SenderClass::Other), Err(errno::ESRCH));
+            let info = SigInfo::new(Signal::USR1, 0);
+            kassert_eq!(
+                send_thread(Some(me.process().pid() + 1), me.tid(), Some(info), SenderClass::Other),
+                Err(errno::ESRCH)
+            );
+            me.set_blocked(Blocked::new(SigSet::of(&[Signal::USR1])));
+            kassert_eq!(send_thread(None, me.tid(), Some(info), SenderClass::Other), Ok(()));
+            set_current_action(Signal::USR1, KernelSigaction { handler: 1, flags: u64::MAX, ..Default::default() });
+            kassert_eq!(current_action(Signal::USR1).flags & 0x100, 0);
+            me.set_blocked(Blocked::EMPTY);
+            kassert!(matches!(me.process().next_signal(me.tid()), Delivery::None));
+            // An unblocked ignored send is discarded at generation, not
+            // merely skipped later by dequeue under the old disposition.
+            send_thread(None, me.tid(), Some(info), SenderClass::Other).map_err(|_| "send ignored")?;
+            set_current_action(Signal::USR1, KernelSigaction { handler: 0x400000, ..Default::default() });
+            kassert!(matches!(me.process().next_signal(me.tid()), Delivery::None));
+            set_current_action(Signal::USR1, KernelSigaction { handler: 1, ..Default::default() });
+            // Ignored, blocked signals stay pending until the disposition is
+            // changed; once a handler is installed they become deliverable.
+            me.set_blocked(Blocked::new(SigSet::of(&[Signal::USR1])));
+            send_thread(None, me.tid(), Some(info), SenderClass::Other).map_err(|_| "send blocked ignored")?;
+            set_current_action(Signal::USR1, KernelSigaction { handler: 0x400000, ..Default::default() });
+            me.set_blocked(Blocked::EMPTY);
+            kassert!(matches!(me.process().next_signal(me.tid()), Delivery::Handler(_)));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn fatal_signal_precedes_handlers_and_keeps_first_status() {
+        use crate::{kassert, kassert_eq};
+        let fault = UserFault::Trap { vector: 14, error_code: 4, rip: 0x400000, cr2: 0x12345000 };
+        let mut state = SignalState::new();
+        // No scheduler thread owns this local queue: notifications are inert.
+        state.add_thread(9, &UserThread::new(Arc::clone(&lookup(INIT_PID).expect("init")), 0), Blocked::EMPTY);
+        state.set_action(Signal::USR1, KernelSigaction { handler: 0x400000, ..Default::default() });
+        state.send(Some(9), SigInfo::new(Signal::USR1, 0), SenderClass::Other).map_err(|_| "send handler")?;
+        state.force(9, SigInfo::fault(Signal::SEGV, 1, 0x12345000), false, Some(fault));
+        state.force(9, SigInfo::fault(Signal::ILL, 2, 0x400000), false, None);
+        let Delivery::Fatal(sig, diagnostic) = state.next(9) else { return Err("handler preceded fatal signal") };
+        kassert_eq!(sig, Signal::SEGV);
+        kassert!(matches!(diagnostic, Some(UserFault::Trap { vector: 14, .. })));
+
+        let mut state = SignalState::new();
+        state.add_thread(9, &UserThread::new(Arc::clone(&lookup(INIT_PID).expect("init")), 0), Blocked::EMPTY);
+        state.set_action(Signal::SEGV, KernelSigaction { handler: 0x400000, ..Default::default() });
+        state.force(9, SigInfo::fault(Signal::SEGV, 1, 0x12345000), false, Some(fault));
+        state.send(Some(9), SigInfo::new(Signal::KILL, 0), SenderClass::Other).map_err(|_| "send kill")?;
+        let Delivery::Fatal(sig, diagnostic) = state.next(9) else { return Err("kill did not win") };
+        kassert_eq!(sig, Signal::KILL);
+        // A superseded fault must not replace the kill's exit status.
+        kassert!(diagnostic.is_none());
+        let mut state = SignalState::new();
+        state.add_thread(9, &UserThread::new(Arc::clone(&lookup(INIT_PID).expect("init")), 0), Blocked::EMPTY);
+        for sig in [Signal::TRAP, Signal::SEGV] {
+            state.set_action(sig, KernelSigaction { handler: 0x400000, ..Default::default() });
+        }
+        state.force(9, SigInfo::fault(Signal::TRAP, 2, 0x400100), false, None);
+        state.force(9, SigInfo::fault(Signal::SEGV, 1, 0x12345000), false, Some(fault));
+        let Delivery::Handler(handler) = state.next(9) else { return Err("missing trap handler") };
+        kassert_eq!(handler.info.signal(), Signal::TRAP);
+        kassert!(handler.fault.is_none());
+        let Delivery::Handler(handler) = state.next(9) else { return Err("missing segv handler") };
+        kassert_eq!(handler.fault, Some(fault));
+        Ok(())
+    }
+);

@@ -692,8 +692,15 @@ fn handled(frame: &TrapFrame, handler: fn()) {
 extern "C" fn lumen_exception_dispatch(frame: &mut TrapFrame) {
     dispatch(frame);
     if (frame.cs & 3) != 0 && !IST_VECTORS.iter().any(|&(vector, _)| vector as u64 == frame.vector) {
-        crate::linux::signal::exit_to_user_from_interrupt();
+        crate::linux::signal::exit_to_user_from_interrupt(frame);
     }
+}
+
+/// Queue a resolved user fault with blocking permitted, then restore IRQ-off entry state.
+fn user_exception(frame: &TrapFrame, cr2: u64, bus: bool, oom: bool) {
+    super::irq::restore(true);
+    crate::linux::signal::exception(frame, cr2, bus, oom);
+    let _ = super::irq::disable();
 }
 
 /// [`lumen_exception_dispatch`]'s work for one vector.
@@ -706,16 +713,29 @@ fn dispatch(frame: &mut TrapFrame) {
         crate::ktrace!(crate::trace::Kind::Exception, vector, frame.rip, frame.error_code);
         let from_user = (frame.cs & 3) != 0;
 
+        let debug_code = if vector == 1 {
+            let dr6: u64;
+            // SAFETY: DR6 is readable in ring 0; sample before clearing it.
+            unsafe {
+                asm!("mov {}, dr6", out(reg) dr6, options(nomem, nostack, preserves_flags));
+            }
+            if dr6 & (1 << 14) != 0 { 2 } else { 1 }
+        } else {
+            0
+        };
+
         // Deferred `#DB` from ring 3 (CVE-2018-8897 handoff):
         // - `MOV SS; SYSCALL` with `TF = 1` delivers `#DB` on `IST_DEBUG` at
         //   `LSTAR` before `swapgs`. Clear `TF`, set `RF`, clear `DR6`, flag
         //   this CPU's pending debug trap, and `iretq` back to `LSTAR` so
-        //   `lumen_syscall_entry` terminates cleanly on the normal kernel stack.
+        //   the syscall hook queues catchable SIGTRAP on the normal kernel stack;
+        //   a returning handler re-runs the syscall.
         // - `MOV SS; INT3` / `MOV SS; <non-IST exception>` with `TF = 1`
         //   delivers `#DB` on `IST_DEBUG` at the target exception stub's first
         //   instruction (before `lumen_isr_common`'s `swapgs`). Clear `TF`, set
         //   `RF`, clear `DR6`, and `iretq` back to the stub, which immediately
-        //   runs `lumen_isr_common` and terminates only the offending process.
+        //   runs `lumen_isr_common`: the target exception is delivered, the
+        //   deferred #DB is dropped.
         // - `MOV SS; ICEBP (0xF1)` with `TF = 1` delivers a nested `#DB` at
         //   `stub_entry_addr(1)`, overwriting the outer frame on `IST_DEBUG`.
         //   Returning via `iretq` would loop forever, so when a ring-3 context
@@ -726,13 +746,15 @@ fn dispatch(frame: &mut TrapFrame) {
                 frame.rflags &= !(1 << 8); // clear TF
                 frame.rflags |= 1 << 16; // set RF so any DR0 breakpoint on LSTAR advances past `swapgs`
                 super::cpu::write_dr6(0);
-                super::percpu::set_pending_debug_trap(true);
+                super::percpu::set_pending_debug_trap(Some(super::percpu::DebugTrap::new(debug_code, frame.rip)));
                 DEFERRED_LSTAR_DB.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             if frame.rip == stub_entry_addr(1) && super::percpu::user_exit_rsp() != 0 {
                 super::cpu::write_dr6(0);
                 DEFERRED_STUB_DB.fetch_add(1, Ordering::Relaxed);
+                // The nested IST frame is unusable; this emergency unwind does not
+                // end sibling threads until C3 supplies group teardown.
                 crate::user::handle_user_exception(frame, 0);
             }
             if is_user_exception_stub_entry(frame.rip) {
@@ -815,33 +837,34 @@ fn dispatch(frame: &mut TrapFrame) {
                     frame.rflags &= !(1 << 18); // clear RFLAGS.AC
                     return;
                 }
-                if fault == Some(crate::mm::user_vm::FaultResult::BusError) {
-                    crate::user::handle_user_bus_error(frame, cr2);
-                }
-                if fault == Some(crate::mm::user_vm::FaultResult::OutOfMemory) {
-                    // Otherwise indistinguishable from a segfault below.
-                    log::warn!(
-                        target: "mm",
-                        "out of memory resolving a user page fault at cr2 {cr2:#x} (rip {:#x}); ending the process",
-                        frame.rip
-                    );
-                }
-                crate::user::handle_user_exception(frame, cr2);
+                user_exception(
+                    frame,
+                    cr2,
+                    fault == Some(crate::mm::user_vm::FaultResult::BusError),
+                    fault == Some(crate::mm::user_vm::FaultResult::OutOfMemory),
+                );
+                return;
             }
 
             // Ring-0 `#PF` outside `.lumen_fixup`: kernel bug.
             crate::crash::exception(frame);
         }
 
-        // Any other synchronous exception originating in ring 3 terminates only
-        // the offending user context, never the kernel. Stop-NMIs (2), `#DF` (8),
+        // Recoverable ring-3 exceptions become signals on the owning stack. Stop-NMIs (2), `#DF` (8),
         // and `#MC` (18) are never user-recoverable and always go to
         // `crash::exception` even if they interrupt ring 3.
         if from_user && !matches!(vector, 2 | 8 | 18) {
             if vector == 1 {
+                // IST cannot copy a user frame or block. Keep the original RIP
+                // and si_code and request delivery on a non-IST interrupt return.
                 super::cpu::write_dr6(0);
+                frame.rflags &= !(1 << 8);
+                super::percpu::set_pending_debug_trap(Some(super::percpu::DebugTrap::new(debug_code, frame.rip)));
+                let _ = super::apic::send_ipi(super::apic::lapic_id(), WAKEUP);
+                return;
             }
-            crate::user::handle_user_exception(frame, 0);
+            user_exception(frame, 0, false, false);
+            return;
         }
 
         // Kernel-mode `#BP` resume (guarded by `!from_user` above).

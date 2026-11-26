@@ -40,12 +40,14 @@ mod table;
 
 use files::FilesAccess;
 pub use files::{Files, FsInner, FsState, ReservedFd};
-pub use signal::{SignalState, ThreadSignals};
+#[cfg(feature = "ktest")]
+pub use signal::send_thread;
+pub use signal::{Delivery, HandlerDelivery, SignalState, send_process_checked, send_thread_checked};
 use table::ProcTable;
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
@@ -53,7 +55,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use log::{info, warn};
 use lumen_proc::{ExitAction, ExitError, ExitStatus, INIT_PID, ProcState, ProcTree, RusageSlot};
-use lumen_signal::{Blocked, SigSet, Signal};
+#[cfg(feature = "ktest")]
+use lumen_signal::SigSet;
+use lumen_signal::{Blocked, Signal};
 use lumen_vfs::{
     Escaped, FdReservation, FdTable, InodeType, OpenFile, OpenFlags, OpenGuard, VfsError, VfsInode, open_inode_guarded,
 };
@@ -252,8 +256,8 @@ pub struct Process {
     /// M7's console state (until the console is a tty).
     console: SpinLock<ConsoleState>,
     allow_test_syscalls: bool,
-    /// How its run ended: the first [`UserExit`] recorded wins (C3
-    /// replace it with the group exit, `SignalState::group_exit`).
+    /// The recorded exit diagnostic/status. A pending fatal signal under
+    /// `signal` overrides an ordinary exit until the last thread unlinks.
     exit: SpinLock<Option<UserExit>>,
     /// Waiters for child state changes (wait4/waitid).
     child_events: sched::WaitQueue,
@@ -320,14 +324,28 @@ impl Process {
         self.allow_test_syscalls
     }
 
-    /// Record how its run ended: the first one recorded wins.
+    /// Record the first exit, with a pending group-fatal signal taking precedence.
     pub fn record_exit(&self, exit: UserExit) {
-        let _ = self.exit.lock().get_or_insert(exit);
+        let signal = self.signal.lock();
+        let exit = signal
+            .fatal_signal()
+            .map_or(exit, |sig| if exit.signal() == Some(sig) { exit } else { UserExit::Signaled(sig) });
+        let mut recorded = self.exit.lock();
+        if signal.fatal_signal().is_some() {
+            *recorded = Some(exit);
+        } else {
+            recorded.get_or_insert(exit);
+        }
     }
 
     /// Take how its run ended (its takedown), if it was recorded.
     fn take_exit(&self) -> Option<UserExit> {
-        self.exit.lock().take()
+        let signal = self.signal.lock();
+        let exit = self.exit.lock().take();
+        signal
+            .fatal_signal()
+            .map(|sig| exit.filter(|e| e.signal() == Some(sig)).unwrap_or(UserExit::Signaled(sig)))
+            .or(exit)
     }
 
     /// Its disposition of `signal`.
@@ -632,6 +650,7 @@ pub struct UserThread {
     clear_child_tid: AtomicU64,
     /// Its scheduler thread's id (`sched::threads()`' id).
     kernel_thread: AtomicU64,
+    kernel_handle: Arc<SpinLock<Weak<sched::Thread>>>,
 }
 
 impl UserThread {
@@ -641,12 +660,16 @@ impl UserThread {
             process,
             clear_child_tid: AtomicU64::new(0),
             kernel_thread: AtomicU64::new(kernel_thread),
+            kernel_handle: Arc::new(SpinLock::new(
+                sched::current().filter(|t| t.id() == kernel_thread).map_or_else(Weak::new, |t| Arc::downgrade(&t)),
+            )),
         }
     }
 
     /// Bind the scheduler identity before the child is made runnable.
     pub(crate) fn bind_kernel_thread(&self, kernel: &Arc<sched::Thread>) {
         assert_eq!(self.kernel_thread.swap(kernel.id(), Ordering::AcqRel), 0);
+        *self.kernel_handle.lock() = Arc::downgrade(kernel);
     }
 
     /// Store its tid, once: panics if it already has one. (C3's
@@ -746,14 +769,6 @@ pub fn current_thread() -> Arc<UserThread> {
     try_current_thread().expect("ring-3 syscall with no Linux thread")
 }
 
-/// Clear the running thread's pending flag under its own process's signal
-/// lock, where senders set it. `thread` is the caller's current Linux thread.
-/// C5 checks deliverable signals here first.
-pub fn settle_current_sigpending(thread: &UserThread) {
-    let _signal = thread.process().signal.lock();
-    sched::clear_current_sigpending();
-}
-
 /// The current thread's process (see [`current_thread`]).
 pub fn current_process() -> Arc<Process> {
     Arc::clone(current_thread().process())
@@ -774,25 +789,12 @@ pub fn lookup_thread(tid: u32) -> Option<Arc<UserThread>> {
     PROCS.lock().lookup_thread(tid)
 }
 
-/// How a process's run ended, as the process tree records it: an exit's
-/// status byte, or the signal Linux's `traps.c` kills it with for a fault
-/// (ARCHITECTURE section 6; M8 delivers those as signals). A page fault
-/// ends as `SIGSEGV` whatever its cause, an out-of-memory one included,
-/// until M8 tells them apart.
+/// The tree's exit status, with fault diagnostics using the delivery mapping.
 fn exit_status(exit: &UserExit) -> ExitStatus {
-    let signal = match *exit {
-        UserExit::Exited(code) => return ExitStatus::exited(code),
-        UserExit::Fault { vector, .. } => match vector {
-            0 | 9 | 16 | 19 => Signal::FPE,
-            1 | 3 => Signal::TRAP,
-            6 => Signal::ILL,
-            11 | 12 | 17 => Signal::BUS,
-            _ => Signal::SEGV,
-        },
-        UserExit::NonCanonicalRip(_) => Signal::SEGV,
-        UserExit::BusError { .. } => Signal::BUS,
-    };
-    ExitStatus::Killed { signal, core: false }
+    match *exit {
+        UserExit::Exited(code) => ExitStatus::exited(code),
+        _ => ExitStatus::Killed { signal: exit.signal().expect("signal exit"), core: false },
+    }
 }
 
 /// Register a fresh process for the current user thread, as a root (no
@@ -3225,6 +3227,112 @@ crate::ktest!(
             kassert_eq!(files.users(), 1);
             kassert_eq!(queried, Ok(()));
             kassert_eq!(after.l_type, fcntl_const::F_UNLCK);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn fork_child_fault_is_delivered_and_reaped() {
+        use crate::{
+            arch::{
+                gdt,
+                syscall::{self, SyscallFrame},
+            },
+            kassert_eq,
+        };
+        in_test_process(|_| {
+            const CODE: u64 = 0x800000;
+            let caller = current_thread();
+            let new = Process::copy_for_fork(caller.process(), general::CLONE_VM).map_err(|_| "copy child")?;
+            let space = new.process.address_space().ok_or("child space")?;
+            space
+                .map_eager_with_bytes(CODE, 4096, lumen_vm::Prot::READ | lumen_vm::Prot::EXEC, &[0x0f, 0x0b])
+                .map_err(|_| "map UD2")?;
+            let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
+            let result = Arc::new(SpinLock::new(None));
+            let out = Arc::clone(&result);
+            let parked = ParkedChild::spawn("signal-fault", space, Arc::clone(&child), 0, move || {
+                let frame = SyscallFrame {
+                    rip: CODE,
+                    rsp: KTEST_USER_VA + KTEST_USER_LEN,
+                    cs: u64::from(gdt::USER_CODE),
+                    ss: u64::from(gdt::USER_DATA),
+                    rflags: 0x202,
+                    ..Default::default()
+                };
+                // SAFETY: the child owns the active address space; entry and stack
+                // are mapped, interrupts are enabled and no lock is held.
+                unsafe {
+                    syscall::enter_fork(frame);
+                }
+                *out.lock() = take_current().exit;
+            })
+            .map_err(|_| "spawn child")?;
+            let pid = PROCS.lock().link_child(&caller, &child).map_err(|_| "link child")?;
+            new.linked();
+            parked.start().join();
+            let report = wait_child(wait4_request(pid as i32, 0).map_err(|_| "request")?)
+                .map_err(|_| "wait")?
+                .ok_or("no child exit")?;
+            kassert_eq!(report.status().word(), Signal::ILL.number() as i32);
+            kassert_eq!(*result.lock(), Some(UserExit::Fault { vector: 6, error_code: 0, rip: CODE, cr2: 0 }));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn kill_wakes_fork_child_and_wins_over_exit() {
+        use crate::{kassert, kassert_eq};
+        use core::sync::atomic::AtomicBool;
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        in_test_process(|_| {
+            let caller = current_thread();
+            let new = Process::copy_for_fork(caller.process(), general::CLONE_VM).map_err(|_| "copy child")?;
+            let child = Arc::new(UserThread::new(Arc::clone(&new.process), 0));
+            let queue = Arc::new(sched::WaitQueue::new());
+            let rescue = Arc::new(AtomicBool::new(false));
+            let result = Arc::new(SpinLock::new(None));
+            let (q, stop, out) = (Arc::clone(&queue), Arc::clone(&rescue), Arc::clone(&result));
+            let parked = ParkedChild::spawn(
+                "signal-sleep",
+                new.process.address_space().unwrap(),
+                Arc::clone(&child),
+                0,
+                move || {
+                    let wake = q.wait_interruptible(None, || stop.load(Ordering::SeqCst));
+                    *out.lock() = Some(wake);
+                    // A pending fatal signal must override an ordinary exit racing it.
+                    record_exit(UserExit::Exited(42));
+                    let _ = take_current();
+                },
+            )
+            .map_err(|_| "spawn child")?;
+            let pid = PROCS.lock().link_child(&caller, &child).map_err(|_| "link child")?;
+            new.linked();
+            let handle = parked.start();
+            while handle.thread().state() != sched::State::Blocked && !handle.is_finished() {
+                crate::time::sleep(1_000_000);
+            }
+            // Both threads run on this CPU. Observe kick before the child runs;
+            // rescue a broken notifier so assertions never strand the child.
+            let was_on = crate::arch::irq::disable();
+            let sent = send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::KILL, 0))), SenderClass::SiUser);
+            let woke = handle.thread().state() == sched::State::Ready;
+            if !woke {
+                rescue.store(true, Ordering::SeqCst);
+                queue.wake_all();
+            }
+            crate::arch::irq::restore(was_on);
+            handle.join();
+            let report = wait_child(wait4_request(pid as i32, 0).map_err(|_| "request")?)
+                .map_err(|_| "wait")?
+                .ok_or("no child exit")?;
+            kassert_eq!(sent, Ok(()));
+            kassert!(woke);
+            kassert_eq!(*result.lock(), Some(sched::Wake::Interrupted));
+            kassert_eq!(report.status().word(), Signal::KILL.number() as i32);
             Ok(())
         })?
     }

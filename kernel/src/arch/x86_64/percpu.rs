@@ -17,6 +17,7 @@
 
 use core::arch::asm;
 use core::mem::offset_of;
+use core::num::NonZeroU8;
 use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use crate::mm::user_vm::AddressSpace;
@@ -39,6 +40,7 @@ pub struct PerCpu {
     kernel_rsp: AtomicU64,
     user_rsp_scratch: AtomicU64,
     user_exit_rsp: AtomicU64,
+    pending_debug_rip: AtomicU64,
     /// User [`AddressSpace`] whose page-table root this CPU currently has
     /// loaded in `CR3`, or null when running on `kernel_root()`. Kept alive by
     /// the running (or outgoing, during a switch) thread's `UserThreadState`.
@@ -69,6 +71,7 @@ static CPUS: [PerCpu; MAX_CPUS] = {
             kernel_rsp: AtomicU64::new(0),
             user_rsp_scratch: AtomicU64::new(0),
             user_exit_rsp: AtomicU64::new(0),
+            pending_debug_rip: AtomicU64::new(0),
             loaded_space: AtomicPtr::new(core::ptr::null_mut()),
         }
     }; MAX_CPUS];
@@ -124,16 +127,32 @@ pub fn kernel_rsp() -> u64 {
     CPUS[index()].kernel_rsp.load(Ordering::Relaxed)
 }
 
-/// Record or clear a deferred `#DB` trap at `LSTAR` (CVE-2018-8897 handoff).
-#[inline]
-pub fn set_pending_debug_trap(pending: bool) {
-    CPUS[index()].pending_debug_trap.store(u8::from(pending), Ordering::Release);
+/// A deferred debug trap's original address and nonzero Linux si_code.
+#[derive(Clone, Copy, Debug)]
+pub struct DebugTrap {
+    pub code: NonZeroU8,
+    pub rip: u64,
+}
+impl DebugTrap {
+    pub fn new(code: u8, rip: u64) -> Self {
+        Self { code: NonZeroU8::new(code).expect("nonzero debug si_code"), rip }
+    }
 }
 
-/// Atomically take and clear the deferred `#DB` trap flag for this CPU.
+/// Record or clear a deferred #DB, with interrupts off on its owning CPU.
 #[inline]
-pub fn take_pending_debug_trap() -> bool {
-    CPUS[index()].pending_debug_trap.swap(0, Ordering::AcqRel) != 0
+pub fn set_pending_debug_trap(trap: Option<DebugTrap>) {
+    let cpu = &CPUS[index()];
+    cpu.pending_debug_rip.store(trap.map_or(0, |t| t.rip), Ordering::Relaxed);
+    cpu.pending_debug_trap.store(trap.map_or(0, |t| t.code.get()), Ordering::Release);
+}
+
+/// Take the original RIP and si_code, with interrupts off on the owning CPU.
+#[inline]
+pub fn take_pending_debug_trap() -> Option<DebugTrap> {
+    let cpu = &CPUS[index()];
+    NonZeroU8::new(cpu.pending_debug_trap.swap(0, Ordering::AcqRel))
+        .map(|code| DebugTrap { code, rip: cpu.pending_debug_rip.load(Ordering::Relaxed) })
 }
 
 /// Set the saved kernel stack pointer used to unwind cleanly from ring 3 back

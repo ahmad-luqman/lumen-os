@@ -102,6 +102,8 @@ M8_LINUX_OUT := $(addprefix $(BUILD)/linux/,$(M8_LINUX))
 $(M8_LINUX_OUT): $(BUILD)/linux/%: tools/linux-m8/%.rs tools/linux-m8/common.rs $(BUILD)/deps/alpine-minirootfs/.version rust-toolchain.toml
 	$(MUSL_EXE)
 
+$(BUILD)/linux/m8_proc: tools/linux-m8/signals.rs
+
 # Every Linux test binary: built by `build`, staged by both images.
 LINUX_TEST_BINS := $(BUILD)/linux/hello $(BUILD)/linux/m7_test $(BUILD)/linux/m7_vfs $(BUILD)/linux/libm7.so $(M8_LINUX_OUT)
 

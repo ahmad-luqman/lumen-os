@@ -2,3 +2,13 @@
 name = "POSIX signal logic (sets, actions, x86-64 frames, sigreturn checks)"
 milestone = "M8"
 tests = ["cargo:lumen-signal"]
+
+[[feature]]
+name = "Signal delivery, alternate stacks, sigreturn and faults as signals"
+milestone = "M8"
+tests = ["scenario:test_linux_proc::test_signals_and_sigaltstack[*]", "ktest:lumen_kernel::linux::signal::frame::signal_frames_restore_registers_masks_and_restart_once", "ktest:lumen_kernel::linux::signal::frame::stack_and_simd_exceptions_map_to_signals", "ktest:lumen_kernel::linux::process::signal::signal_send_refuses_unlinked_tid_and_discards_ignored_pending", "ktest:lumen_kernel::linux::process::signal::fatal_signal_precedes_handlers_and_keeps_first_status"]
+
+[[feature]]
+name = "Forked children receive fault signals and fatal wakeups"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::fork_child_fault_is_delivered_and_reaped", "ktest:lumen_kernel::linux::process::kill_wakes_fork_child_and_wins_over_exit"]

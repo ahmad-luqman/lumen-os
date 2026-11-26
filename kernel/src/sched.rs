@@ -218,7 +218,8 @@ struct UserThreadState {
     fs_base: AtomicU64,
     kernel_rsp: AtomicU64,
     user_exit_rsp: AtomicU64,
-    pending_debug_trap: AtomicBool,
+    pending_debug_trap: AtomicU8,
+    pending_debug_rip: AtomicU64,
     /// The Linux thread it runs ([`set_current_user_thread`]): `None` until
     /// a root registers; fork children get it at spawn. None again after
     /// takedown, and for a ktest's
@@ -241,7 +242,8 @@ impl UserThreadState {
             fs_base: AtomicU64::new(0),
             kernel_rsp: AtomicU64::new(0),
             user_exit_rsp: AtomicU64::new(0),
-            pending_debug_trap: AtomicBool::new(false),
+            pending_debug_trap: AtomicU8::new(0),
+            pending_debug_rip: AtomicU64::new(0),
             linux: None,
             restart: UnsafeCell::new(None),
         }
@@ -1070,6 +1072,29 @@ pub(crate) fn set_current_user_thread(linux: Option<Arc<UserThread>>) -> Option<
     core::mem::replace(&mut user.linux, linux)
 }
 
+/// Snapshot the running user's live FP state with context switches excluded.
+pub fn snapshot_user_fpu() -> Option<arch::fpu::UserFpuState> {
+    with_user_fpu(|fp| {
+        fp.save();
+        fp.clone()
+    })
+}
+
+/// Restore only an image validated by lumen-signal, or the initial state.
+pub fn restore_signal_fpu(fp: Option<lumen_signal::frame::ValidatedFp<'_>>) {
+    with_user_fpu(|state| state.install_signal(fp)).expect("signal on a user thread");
+}
+
+fn with_user_fpu<R>(f: impl FnOnce(&mut arch::fpu::UserFpuState) -> R) -> Option<R> {
+    let _irq = arch::irq::push_off();
+    with_current(|t| {
+        // SAFETY: this is the owning thread with interrupts off. The callback
+        // cannot retain the borrow, block, or access this buffer recursively.
+        unsafe { t.user.as_ref().map(|u| f(&mut *u.fpu.get())) }
+    })
+    .flatten()
+}
+
 /// Make `block` the current user thread's restart block (`None` to clear
 /// it): what `restart_syscall` resumes after the syscall-exit hook turns
 /// `-ERESTART_RESTARTBLOCK` into a restart. Handlers go through
@@ -1215,7 +1240,7 @@ pub fn detach_user_space() -> Option<Arc<AddressSpace>> {
             }
             arch::percpu::set_kernel_rsp(0);
             arch::percpu::set_user_exit_rsp(0);
-            arch::percpu::set_pending_debug_trap(false);
+            arch::percpu::set_pending_debug_trap(None);
         }
         prev
     };
@@ -1257,7 +1282,7 @@ impl UserSpaceGuard {
             }
             arch::percpu::set_kernel_rsp(0);
             arch::percpu::set_user_exit_rsp(0);
-            arch::percpu::set_pending_debug_trap(false);
+            arch::percpu::set_pending_debug_trap(None);
         }
         Self { _not_send: core::marker::PhantomData }
     }
@@ -1696,7 +1721,9 @@ unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thre
         unsafe { pu.save_fpu() };
         pu.kernel_rsp.store(arch::percpu::kernel_rsp(), Ordering::Relaxed);
         pu.user_exit_rsp.store(arch::percpu::user_exit_rsp(), Ordering::Relaxed);
-        pu.pending_debug_trap.store(arch::percpu::take_pending_debug_trap(), Ordering::Relaxed);
+        let debug = arch::percpu::take_pending_debug_trap();
+        pu.pending_debug_trap.store(debug.map_or(0, |t| t.code.get()), Ordering::Relaxed);
+        pu.pending_debug_rip.store(debug.map_or(0, |t| t.rip), Ordering::Relaxed);
     }
 
     // 2. Switch CR3 to `next`'s AddressSpace root or back to `kernel_root()`,
@@ -1719,7 +1746,10 @@ unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thre
         }
         arch::percpu::set_kernel_rsp(krsp);
         arch::percpu::set_user_exit_rsp(nu.user_exit_rsp.load(Ordering::Relaxed));
-        arch::percpu::set_pending_debug_trap(nu.pending_debug_trap.load(Ordering::Relaxed));
+        arch::percpu::set_pending_debug_trap(
+            core::num::NonZeroU8::new(nu.pending_debug_trap.load(Ordering::Relaxed))
+                .map(|code| arch::percpu::DebugTrap { code, rip: nu.pending_debug_rip.load(Ordering::Relaxed) }),
+        );
     } else {
         // SAFETY: interrupts are off on `cpu`; clearing user state for kernel/idle.
         unsafe {
@@ -1728,7 +1758,7 @@ unsafe fn switch_user_context(cpu: usize, prev: *const Thread, next: *const Thre
         }
         arch::percpu::set_kernel_rsp(0);
         arch::percpu::set_user_exit_rsp(0);
-        arch::percpu::set_pending_debug_trap(false);
+        arch::percpu::set_pending_debug_trap(None);
     }
 }
 

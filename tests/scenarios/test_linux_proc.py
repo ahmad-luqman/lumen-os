@@ -1,14 +1,114 @@
-"""M8 ring-3 scenarios of processes, threads, signals, `futex`, timers,
-sessions and the small syscalls (ARCHITECTURE section 15, "M8's tests"),
-each check an `ok` line of `tools/linux-m8/m8_proc`.
-
-Laid down empty by B0 (#371); each issue adds its own tests."""
+"""M8 process and signal behavior through real ring-3 programs."""
 
 import re
+import time
 
+import pytest
+from lumen_harness.gui import confirmed_keys, type_confirmed
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
 from lumen_harness.rootfs import copy_rootfs, warm_up
+from lumen_harness.screen import expect_screen
 from lumen_harness.shell import run
+
+PROC = "/usr/local/bin/m8_proc"
+SIGNALS = [
+    "senders_and_masks",
+    "raise_without_siginfo",
+    "blocked_pending_and_sigqueue",
+    "nodefer_and_resethand",
+    "alternate_stack",
+    "fp_and_mxcsr",
+    "sigreturn_ss_sanitized",
+    "sigreturn_rax_is_not_restart",
+    "force_sigsegv",
+]
+FAULTS = ["de", "ud", "bp", "gp", "ss", "xm", "maperr", "accerr", "bus", "db"]
+
+
+@pytest.mark.parametrize("cpu", ["qemu64", "max"])
+def test_signals_and_sigaltstack(boot, tmp_path, cpu):
+    """Signals, real trap recovery, and sigreturn's hardware safety on FX/XSAVE."""
+    m = boot("qemutest", cpu=cpu, devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    if cpu == "max":
+        assert "INFO  fpu: XSAVE64" in m.output
+    else:
+        assert "INFO  fpu: FXSAVE64" in m.output
+
+    def checks(mode, names):
+        out = run(m, f"linux {PROC} {mode}", 90)
+        assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == names, out
+        assert f"linux: {PROC} exit=0 " in out, out
+        assert "FAIL" not in out, out
+
+    checks("signals", SIGNALS)
+    checks("faults", FAULTS)
+    for kind in ["mxcsr", "cs", "rip", "segvframe"] + (["xstate", "xcomp"] if cpu == "max" else []):
+        out = run(m, f"linux {PROC} signal-bad {kind}", 60)
+        assert f"linux: {PROC} exit=139 signal=11 " in out, out
+        assert "survived" not in out, out
+    if cpu == "max":
+        checks("signal-bad magic", ["fx_fallback"])
+    for kind in ["blocked", "ignored"]:
+        out = run(
+            m,
+            f"linux {PROC} signal-fatal {kind}",
+            60,
+            allow=r"WARN  user: pid \d+: killed by signal 11",
+        )
+        assert f"linux: {PROC} exit=139 signal=11 " in out, out
+
+    # Two independent linux runs: the target is confirmed alive before the
+    # sender attempts a privileged si_code. No fork/clone dependency.
+    confirmed_keys(m, ["alt", "f2"])
+    expect_screen(m, r"\Alumen>\s*\Z")
+    type_confirmed(m, f"linux {PROC} signal-hold\n")
+    pid = int(expect_screen(m, r"^signal-hold: pid=(\d+) ready$", 30)[1])
+    checks(f"signal-probe {pid}", ["sigqueue_permission"])
+    confirmed_keys(m, "n")
+    expect_screen(m, rf"^signal-hold: done\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
+
+    def blocked(pid):
+        deadline = time.monotonic() + 30 * m.timeout_scale
+        while True:
+            out = run(m, "ps")
+            if re.search(rf"^\s*{pid}\s+\d+\s+{pid}\s+blocked\s", out, re.MULTILINE):
+                return
+            assert time.monotonic() < deadline, out
+
+    for mode in ["eintr", "restart"]:
+        confirmed_keys(m, ["alt", "f2"])
+        type_confirmed(m, "clear\n")
+        expect_screen(m, r"\Alumen>\s*\Z")
+        type_confirmed(m, f"linux {PROC} signal-hold\n")
+        expect_screen(m, r"^signal-hold: pid=\d+ ready$", 30)
+        confirmed_keys(m, ["alt", "f3"])
+        type_confirmed(m, "clear\n")
+        expect_screen(m, r"\Alumen>\s*\Z")
+        type_confirmed(m, f"linux {PROC} signal-wait {mode}\n")
+        waiter = int(expect_screen(m, r"^signal-wait: pid=(\d+) ready$", 30)[1])
+        blocked(waiter)  # Confirm F_SETLKW blocked before sending.
+        checks(f"signal-kill {waiter}", ["send_usr1"])
+        expect_screen(m, r"^signal-wait: handler$", 30)
+        if mode == "eintr":
+            expect_screen(m, rf"^ok eintr\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
+        else:
+            blocked(waiter)  # SA_RESTART re-entered the contended lock wait.
+        confirmed_keys(m, ["alt", "f2"])
+        confirmed_keys(m, "n")
+        expect_screen(m, rf"^signal-hold: done\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
+        confirmed_keys(m, ["alt", "f3"])
+        if mode == "restart":
+            expect_screen(m, rf"^ok sa_restart\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
+    confirmed_keys(m, ["alt", "f2"])
+    type_confirmed(m, "clear\n")
+    expect_screen(m, r"\Alumen>\s*\Z")
+    type_confirmed(m, f"linux {PROC} signal-spin\n")
+    spinner = int(expect_screen(m, r"^signal-spin: pid=(\d+) ready$", 30)[1])
+    checks(f"signal-kill {spinner}", ["send_usr1"])
+    expect_screen(m, rf"^ok async_delivery\nlinux: {PROC} exit=0 leaked_frames=-?\d+$", 30)
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
 
 
 def test_fork_wait_and_exit_status(boot, tmp_path):

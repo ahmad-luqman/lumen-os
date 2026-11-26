@@ -1,10 +1,6 @@
-//! Signals (M8's cluster, ARCHITECTURE section 8, "B0's stubs"): M6's
-//! `rt_sigaction` and `rt_sigprocmask`, moved here from `proc` (B1 keeps
-//! their behaviour, over the process's `SignalState` and each thread's
-//! `Blocked` mask);
-//! and M8's `rt_sigreturn`, `rt_sigpending`, `rt_sigtimedwait`,
-//! `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `rt_sigsuspend`, `sigaltstack`,
-//! `kill`, `tkill`, `tgkill`, `pause`, `restart_syscall`.
+//! Linux signal dispositions, masks, senders, frames and alternate stacks.
+//! User copies happen outside the signal lock, with Linux's install-before-
+//! copy-out ordering. Signal wait and stop/continue syscalls belong to C6.
 
 use super::at::UserPtr;
 use super::{copy_pod_from_user, copy_pod_to_user, neg_errno, not_implemented};
@@ -12,45 +8,42 @@ use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::linux::process::{
     KernelSigaction, current_action, current_blocked, set_current_action, set_current_blocked,
 };
+use crate::linux::process::{current_process, current_thread, send_process_checked, send_thread_checked};
 use crate::linux::{errno, general};
 use crate::user::{copy_from_user, copy_to_user};
-use lumen_signal::{SigSet, Signal};
+use lumen_signal::{
+    SigSet, Signal,
+    pending::{SenderClass, SigInfo},
+};
 
-/// `rt_sigaction(sig, act, oldact, sigsetsize)` (13), M6's order: the
-/// arguments checked, `act` copied in, `oldact` written before the action
-/// changes (so a faulting `oldact` changes nothing), two holds of the
-/// process's signal state (C5 moves it to Linux's order, one hold).
+/// Install the new disposition in one hold, then copy the replaced action
+/// out. An output fault does not roll back the installation (Linux order).
 pub(super) fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
-    let signal = u32::try_from(sig).ok().and_then(Signal::new);
-    let Some(signal) = signal.filter(|_| sigsetsize == 8) else {
-        return neg_errno(errno::EINVAL);
-    };
-    if act != 0 && signal.is_unblockable() {
+    if sigsetsize != 8 {
         return neg_errno(errno::EINVAL);
     }
-    let new_action = if act != 0 {
-        // SAFETY: `KernelSigaction` is 4 `u64`s (32 bytes); all bit patterns are valid.
+    let new = if act == 0 {
+        None
+    } else {
+        // SAFETY: KernelSigaction is four u64s, with no padding or invalid bits.
         match unsafe { copy_pod_from_user::<KernelSigaction>(act) } {
             Ok(a) => Some(a),
             Err(e) => return neg_errno(e.to_errno()),
         }
-    } else {
-        None
     };
-
-    let prev = current_action(signal);
+    let Some(sig) = Signal::new(sig as u32) else { return neg_errno(errno::EINVAL) };
+    let prev = match new {
+        Some(a) => match set_current_action(sig, a) {
+            Some(old) => old,
+            None => return neg_errno(errno::EINVAL),
+        },
+        None => current_action(sig),
+    };
     if oldact != 0 {
-        // Write `oldact` BEFORE mutating the table so a faulting `oldact` leaves state intact.
-        // SAFETY: `KernelSigaction` has zero padding bytes.
+        // SAFETY: KernelSigaction has no padding.
         if let Err(e) = unsafe { copy_pod_to_user(oldact, &prev) } {
             return neg_errno(e.to_errno());
         }
-    }
-    // `set_action` strips `SIGKILL` and `SIGSTOP` from the mask; their own
-    // dispositions were refused above, so it never refuses here.
-    if let Some(a) = new_action {
-        let replaced = set_current_action(signal, a);
-        debug_assert!(replaced.is_some(), "{signal:?}'s disposition refused after the check");
     }
     0
 }
@@ -59,44 +52,36 @@ pub(super) fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u6
     if sigsetsize != 8 {
         return neg_errno(errno::EINVAL);
     }
-    let new_mask = if set != 0 {
-        if how != u64::from(general::SIG_BLOCK)
-            && how != u64::from(general::SIG_UNBLOCK)
-            && how != u64::from(general::SIG_SETMASK)
-        {
-            return neg_errno(errno::EINVAL);
-        }
-        let mut raw = [0u8; 8];
-        if let Err(e) = copy_from_user(&mut raw, set) {
+    let new = if set == 0 {
+        None
+    } else {
+        let mut bytes = [0; 8];
+        if let Err(e) = copy_from_user(&mut bytes, set) {
             return neg_errno(e.to_errno());
         }
-        Some(u64::from_le_bytes(raw))
-    } else {
-        None
+        Some(SigSet(u64::from_le_bytes(bytes)))
     };
-
     let prev = current_blocked();
+    if let Some(mask) = new {
+        match prev.apply(how as u32, mask) {
+            Ok(mask) => set_current_blocked(mask),
+            Err(_) => return neg_errno(errno::EINVAL),
+        }
+    }
     if oldset != 0
         && let Err(e) = copy_to_user(oldset, &prev.set().0.to_le_bytes())
     {
         return neg_errno(e.to_errno());
     }
-    if let Some(mask) = new_mask {
-        // `how` was checked above; `Blocked` never blocks KILL or STOP.
-        match prev.apply(how as u32, SigSet(mask)) {
-            Ok(updated) => set_current_blocked(updated),
-            Err(_) => return neg_errno(errno::EINVAL),
-        }
-    }
     0
 }
 
-/// `rt_sigreturn()` (15): M8 stub, replaced by C5 (#384). It returns
-/// through the frame, which C5 restores from the signal frame on the user
-/// stack (an `iretq`, `SyscallReturn::Iret`).
+/// Restore a validated frame and return every GPR through iretq.
 pub(super) fn sys_rt_sigreturn(frame: &mut SyscallFrame) -> SyscallReturn {
-    frame.rax = not_implemented(general::__NR_rt_sigreturn);
-    SyscallReturn::Sysret
+    if crate::linux::signal::frame::restore(frame).is_err() {
+        crate::linux::signal::force_sigsegv(None);
+    }
+    SyscallReturn::Iret
 }
 
 /// `rt_sigpending(set, sigsetsize)` (127): M8 stub, replaced by C6 (#385).
@@ -109,14 +94,44 @@ pub(super) fn sys_rt_sigtimedwait(_set: UserPtr, _info: UserPtr, _timeout: UserP
     not_implemented(general::__NR_rt_sigtimedwait)
 }
 
-/// `rt_sigqueueinfo(tgid, sig, info)` (129): M8 stub, replaced by C5 (#384).
-pub(super) fn sys_rt_sigqueueinfo(_tgid: i32, _sig: i32, _info: UserPtr) -> u64 {
-    not_implemented(general::__NR_rt_sigqueueinfo)
+fn read_info(info: UserPtr) -> Result<[u8; 128], u32> {
+    let mut bytes = [0; 128];
+    copy_from_user(&mut bytes, info.addr()).map_err(|e| e.to_errno())?;
+    Ok(bytes)
 }
-
-/// `rt_tgsigqueueinfo(tgid, tid, sig, info)` (297): M8 stub, replaced by C5 (#384).
-pub(super) fn sys_rt_tgsigqueueinfo(_tgid: i32, _tid: i32, _sig: i32, _info: UserPtr) -> u64 {
-    not_implemented(general::__NR_rt_tgsigqueueinfo)
+fn queued_info(target: i32, sig: i32, bytes: [u8; 128]) -> Result<Result<Option<SigInfo>, u32>, u32> {
+    let code = i32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if (code >= 0 || code == general::SI_TKILL) && target as u32 != current_thread().tid() {
+        return Err(errno::EPERM);
+    }
+    Ok(signal_info(sig, bytes))
+}
+fn signal_info(sig: i32, bytes: [u8; 128]) -> Result<Option<SigInfo>, u32> {
+    if sig == 0 {
+        return Ok(None);
+    }
+    Ok(Some(SigInfo::from_user(Signal::new(sig as u32).ok_or(errno::EINVAL)?, bytes)))
+}
+fn sent(result: Result<(), u32>) -> u64 {
+    super::finish(result.map(|()| 0))
+}
+pub(super) fn sys_rt_sigqueueinfo(tgid: i32, sig: i32, info: UserPtr) -> u64 {
+    sent(read_info(info).and_then(|bytes| {
+        let info = queued_info(tgid, sig, bytes)?;
+        if tgid <= 0 {
+            return Err(errno::ESRCH);
+        }
+        send_process_checked(tgid, info, SenderClass::Other)
+    }))
+}
+pub(super) fn sys_rt_tgsigqueueinfo(tgid: i32, tid: i32, sig: i32, info: UserPtr) -> u64 {
+    sent(read_info(info).and_then(|bytes| {
+        if tgid <= 0 || tid <= 0 {
+            return Err(errno::EINVAL);
+        }
+        let info = queued_info(tid, sig, bytes)?;
+        send_thread_checked(Some(tgid as u32), tid as u32, info, SenderClass::Other)
+    }))
 }
 
 /// `rt_sigsuspend(mask, sigsetsize)` (130): M8 stub, replaced by C6 (#385).
@@ -124,26 +139,58 @@ pub(super) fn sys_rt_sigsuspend(_mask: UserPtr, _sigsetsize: u64) -> u64 {
     not_implemented(general::__NR_rt_sigsuspend)
 }
 
-/// `sigaltstack(ss, old_ss)` (131): M8 stub, replaced by C5 (#384). The
-/// frame holds the caller's `rsp`, which says whether it runs on the
-/// alternate stack (`SS_ONSTACK`, `-EPERM` for a change then).
-pub(super) fn sys_sigaltstack(_ss: UserPtr, _old_ss: UserPtr, _frame: &SyscallFrame) -> u64 {
-    not_implemented(general::__NR_sigaltstack)
+pub(super) fn sys_sigaltstack(ss: UserPtr, old_ss: UserPtr, frame: &SyscallFrame) -> u64 {
+    let new = if ss.addr() == 0 {
+        None
+    } else {
+        let mut bytes = [0; 24];
+        if let Err(e) = copy_from_user(&mut bytes, ss.addr()) {
+            return neg_errno(e.to_errno());
+        }
+        Some((
+            u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            u64::from_le_bytes(bytes[16..].try_into().unwrap()),
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        ))
+    };
+    let old = match crate::linux::process::current_thread().configure_alt_stack(frame.rsp, new) {
+        Ok(old) => old,
+        Err(e) => return e.errno() as i64 as u64,
+    };
+    if old_ss.addr() != 0 {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&old.sp().to_le_bytes());
+        bytes[8..12].copy_from_slice(&old.status(frame.rsp).to_le_bytes());
+        bytes[16..].copy_from_slice(&old.size().to_le_bytes());
+        if let Err(e) = copy_to_user(old_ss.addr(), &bytes) {
+            return neg_errno(e.to_errno());
+        }
+    }
+    0
 }
-
-/// `kill(pid, sig)` (62): M8 stub, replaced by C5 (#384) and C8 (#387).
-pub(super) fn sys_kill(_pid: i32, _sig: i32) -> u64 {
-    not_implemented(general::__NR_kill)
+fn sender_info(sig: i32, code: i32) -> Result<Option<SigInfo>, u32> {
+    let mut bytes = [0; 128];
+    bytes[8..12].copy_from_slice(&code.to_le_bytes());
+    bytes[16..20].copy_from_slice(&current_process().pid().to_le_bytes());
+    signal_info(sig, bytes)
 }
-
-/// `tkill(tid, sig)` (200): M8 stub, replaced by C5 (#384).
-pub(super) fn sys_tkill(_tid: i32, _sig: i32) -> u64 {
-    not_implemented(general::__NR_tkill)
+pub(super) fn sys_kill(pid: i32, sig: i32) -> u64 {
+    sent(send_process_checked(pid, sender_info(sig, general::SI_USER as i32), SenderClass::SiUser))
 }
-
-/// `tgkill(tgid, tid, sig)` (234): M8 stub, replaced by C5 (#384).
-pub(super) fn sys_tgkill(_tgid: i32, _tid: i32, _sig: i32) -> u64 {
-    not_implemented(general::__NR_tgkill)
+pub(super) fn sys_tkill(tid: i32, sig: i32) -> u64 {
+    thread_kill(None, tid, sig)
+}
+pub(super) fn sys_tgkill(tgid: i32, tid: i32, sig: i32) -> u64 {
+    if tgid <= 0 {
+        return neg_errno(errno::EINVAL);
+    }
+    thread_kill(Some(tgid as u32), tid, sig)
+}
+fn thread_kill(tgid: Option<u32>, tid: i32, sig: i32) -> u64 {
+    if tid <= 0 {
+        return neg_errno(errno::EINVAL);
+    }
+    sent(send_thread_checked(tgid, tid as u32, sender_info(sig, general::SI_TKILL), SenderClass::Other))
 }
 
 /// `pause()` (34): M8 stub, replaced by C6 (#385).
@@ -162,7 +209,7 @@ pub(super) fn sys_restart_syscall(frame: &mut SyscallFrame) -> SyscallReturn {
 crate::ktest!(
     fn sigaction_and_sigprocmask_round_trip() {
         // Through `dispatch`: an action set and read back (its mask without
-        // SIGKILL), a faulting `oldact` leaving it unchanged, the three
+        // SIGKILL), a faulting `oldact` retaining the new action, the three
         // `how`s on the calling thread's mask (never KILL or STOP); a mask
         // is the thread's (keyed by tid), an action the process's.
         use crate::linux::process::{self, KTEST_USER_LEN, KTEST_USER_VA};
@@ -202,10 +249,10 @@ crate::ktest!(
             // SAFETY: `KernelSigaction` is 4 `u64`s; all bit patterns are valid.
             let got = unsafe { copy_pod_from_user::<KernelSigaction>(old_at) }.map_err(|_| "read oldact")?;
             kassert_eq!(got, KernelSigaction { mask: Signal::USR2.bit(), ..act });
-            // A faulting `oldact` with a new action: EFAULT, nothing changed.
+            // A faulting oldact: EFAULT after installing the new action.
             put_act(&KernelSigaction { handler: 0x3000, ..act })?;
             kassert_eq!(call(sigaction, usr1, act_at, unmapped, 8), neg_errno(errno::EFAULT));
-            kassert_eq!(current_action(Signal::USR1).handler, 0x1000);
+            kassert_eq!(current_action(Signal::USR1).handler, 0x3000);
             // SIGKILL's disposition never changes: EINVAL, an `oldact`
             // holding a sentinel untouched.
             let sentinel = KernelSigaction { handler: 0x5e17, flags: 1, restorer: 2, mask: 3 };
@@ -235,6 +282,17 @@ crate::ktest!(
             kassert_eq!(call(sigprocmask, 0, 0, oldset_at, 8), 0);
             kassert_eq!(oldset()?, Signal::TERM.bit());
 
+            // Input faults precede semantic checks; output faults follow install.
+            kassert_eq!(call(sigaction, 0, unmapped, 0, 8), neg_errno(errno::EFAULT));
+            kassert_eq!(call(sigprocmask, 7, unmapped, 0, 8), neg_errno(errno::EFAULT));
+            put_set(SigSet::of(&[Signal::ALRM]))?;
+            kassert_eq!(
+                call(sigprocmask, u64::from(general::SIG_SETMASK), set_at, unmapped, 8),
+                neg_errno(errno::EFAULT)
+            );
+            kassert_eq!(current_blocked().set(), SigSet::of(&[Signal::ALRM]));
+            set_current_blocked(Blocked::new(SigSet::of(&[Signal::TERM])));
+
             // Per thread, per process: a second thread of this process keeps
             // its own (empty) mask, unchanged by the leader's call, and sees
             // the leader's action; then, the running thread made that second
@@ -252,7 +310,7 @@ crate::ktest!(
                 kassert_eq!(current_blocked().set(), SigSet::of(&[Signal::TERM, Signal::HUP]));
                 kassert_eq!(extra.blocked(), Blocked::EMPTY);
                 kassert!(Arc::ptr_eq(extra.process(), &me));
-                kassert_eq!(extra.process().action(Signal::USR1).handler, 0x1000);
+                kassert_eq!(extra.process().action(Signal::USR1).handler, 0x3000);
 
                 let swapped = crate::sched::set_current_user_thread(Some(Arc::clone(&extra)));
                 let as_extra = (|| {

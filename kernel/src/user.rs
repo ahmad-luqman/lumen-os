@@ -538,11 +538,56 @@ pub fn fault_in_writable(addr: u64) -> Result<(), FaultIn> {
     }
 }
 
+/// The signal for a CPU exception; shared by delivery and exit reporting.
+pub fn vector_signal(vector: u64) -> lumen_signal::Signal {
+    use lumen_signal::Signal;
+    match vector {
+        0 | 9 | 16 | 19 => Signal::FPE,
+        1 | 3 => Signal::TRAP,
+        6 => Signal::ILL,
+        11 | 12 | 17 => Signal::BUS,
+        _ => Signal::SEGV,
+    }
+}
+
+/// A synchronous user fault, independent of whether a handler catches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserFault {
+    Trap { vector: u64, error_code: u64, rip: u64, cr2: u64 },
+    Bus { rip: u64, cr2: u64, error_code: u64 },
+    NonCanonicalRip(u64),
+}
+impl UserFault {
+    pub fn signal(self) -> lumen_signal::Signal {
+        match self {
+            Self::Trap { vector, .. } => vector_signal(vector),
+            Self::Bus { .. } => lumen_signal::Signal::BUS,
+            Self::NonCanonicalRip(_) => lumen_signal::Signal::SEGV,
+        }
+    }
+    pub fn trap_metadata(self) -> (u64, u64, u64) {
+        match self {
+            Self::Trap { vector, error_code, cr2, .. } => (vector, error_code, cr2),
+            Self::Bus { error_code, cr2, .. } => (14, error_code, cr2),
+            Self::NonCanonicalRip(_) => (13, 0, 0),
+        }
+    }
+    pub fn into_exit(self) -> UserExit {
+        match self {
+            Self::Trap { vector, error_code, rip, cr2 } => UserExit::Fault { vector, error_code, rip, cr2 },
+            Self::Bus { rip, cr2, .. } => UserExit::BusError { rip, cr2 },
+            Self::NonCanonicalRip(rip) => UserExit::NonCanonicalRip(rip),
+        }
+    }
+}
+
 /// How a ring-3 execution terminated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserExit {
     /// Clean exit via `exit(2)` / `exit_group(2)`.
     Exited(i32),
+    /// Termination by a delivered signal.
+    Signaled(lumen_signal::Signal),
     /// Fatal ring-3 CPU exception (or deferred `#DB` at `LSTAR`).
     Fault { vector: u64, error_code: u64, rip: u64, cr2: u64 },
     /// Kernel refused to execute `sysretq`/`iretq` to a non-canonical or
@@ -551,12 +596,24 @@ pub enum UserExit {
     /// A ring-3 access to a file-backed page that can't be had
     /// (`FaultResult::BusError`): wholly past the file's end, unreadable, or
     /// refused by the page cache (a quota, the `ext4` hard limit, an
-    /// unlinked inode). Linux sends `SIGBUS`; Lumen ends the process
-    /// (signals arrive in M8).
+    /// unlinked inode). Retained only as the diagnostic for a fatal SIGBUS.
     BusError { rip: u64, cr2: u64 },
 }
 
 impl UserExit {
+    /// Signal responsible for termination; diagnostic fault variants retain
+    /// their trap details while reporting the same POSIX status.
+    pub fn signal(self) -> Option<lumen_signal::Signal> {
+        use lumen_signal::Signal;
+        Some(match self {
+            Self::Exited(_) => return None,
+            Self::Signaled(sig) => sig,
+            Self::NonCanonicalRip(_) => Signal::SEGV,
+            Self::BusError { .. } => Signal::BUS,
+            Self::Fault { vector, .. } => vector_signal(vector),
+        })
+    }
+
     /// The status a shell reports for a process killed by `SIGBUS`
     /// (`128 + 7`).
     pub const BUS_ERROR_STATUS: i32 = 128 + general::SIGBUS as i32;
@@ -666,52 +723,13 @@ pub fn handle_user_exception(frame: &TrapFrame, cr2: u64) -> ! {
     unsafe { arch::syscall::unwind_to_kernel() }
 }
 
-/// End the active ring-3 context for a page fault that resolved to a bus
-/// error (`FaultResult::BusError`): one `WARN` naming the pid, `rip` and
-/// `cr2`, then back to the kernel ring-3 runner, as
-/// [`handle_user_exception`].
-pub fn handle_user_bus_error(frame: &TrapFrame, cr2: u64) -> ! {
-    let (pid, is_test) = record_exit(UserExit::BusError { rip: frame.rip, cr2 });
-    if is_test {
-        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
-    }
-    warn!(
-        target: "user",
-        "pid {pid}: bus error (SIGBUS): file page unavailable (past EOF, unreadable or refused) at cr2 {cr2:#x} (rip {:#x}); terminating process",
-        frame.rip
+/// Queue the deferred LSTAR debug trap on the thread's own kernel stack.
+/// Queue SIGSEGV before attempting a return to a non-user RIP.
+pub fn handle_non_canonical_return(rip: u64) {
+    crate::linux::signal::force_fault(
+        lumen_signal::pending::SigInfo::fault(lumen_signal::Signal::SEGV, general::SI_KERNEL as i32, 0),
+        Some(UserFault::NonCanonicalRip(rip)),
     );
-    // SAFETY: called on the CPU running the active ring-3 context; lock guard
-    // from `record_exit` is already dropped (`irq::depth() == 0`).
-    unsafe { arch::syscall::unwind_to_kernel() }
-}
-
-/// Handle a deferred `#DB` trap caught at `LSTAR` (CVE-2018-8897 handoff),
-/// running on the thread's normal kernel stack inside `lumen_syscall_dispatch`.
-pub fn handle_deferred_debug_trap(frame: &SyscallFrame) -> ! {
-    let exit = UserExit::Fault { vector: 1, error_code: 0, rip: frame.rip, cr2: 0 };
-    let (pid, is_test) = record_exit(exit);
-    if is_test {
-        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
-    }
-    warn!(
-        target: "user",
-        "pid {pid}: fatal deferred #DB at LSTAR (vector 1, rip {:#x}, cr2 0x0)",
-        frame.rip
-    );
-    // SAFETY: called on the CPU running the active ring-3 context, no lock held.
-    unsafe { arch::syscall::unwind_to_kernel() }
-}
-
-/// Terminate the active user context when the return `rip` is non-canonical or
-/// `>= USER_MAX`, before `swapgs` or `sysretq`/`iretq` ever runs.
-pub fn handle_non_canonical_return(rip: u64) -> ! {
-    let (pid, is_test) = record_exit(UserExit::NonCanonicalRip(rip));
-    if is_test {
-        SSE_TLS_SYNC.aborted.store(true, Ordering::Release);
-    }
-    warn!(target: "user", "pid {pid}: non-canonical user return rip {rip:#x}; terminating process");
-    // SAFETY: called on the CPU running the active ring-3 context, no lock held.
-    unsafe { arch::syscall::unwind_to_kernel() }
 }
 
 /// Dispatch a Linux x86-64 ring-3 syscall through `crate::linux::syscall`.
@@ -1949,17 +1967,23 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
             let text = core::str::from_utf8(&result.stdout).unwrap_or("<non-utf8>").trim_end_matches('\n');
             let _ = writeln!(ctx.out, "usertest: exit={status} stdout=\"{text}\"");
         }
+        UserExit::Signaled(sig) => {
+            let _ = writeln!(ctx.out, "usertest: exit={} signal={}", 128 + sig.number(), sig.number());
+        }
         UserExit::Fault { vector, error_code, rip, cr2 } => {
+            let signal = result.exit.signal().unwrap().number();
             let _ = writeln!(
                 ctx.out,
-                "usertest: fault vector={vector} ({}) error={error_code:#x} rip={rip:#x} cr2={cr2:#x} deferred_lstar={} deferred_stub={}",
+                "usertest: exit={} signal={} vector={vector} ({}) error={error_code:#x} rip={rip:#x} cr2={cr2:#x} deferred_lstar={} deferred_stub={}",
+                128 + signal,
+                signal,
                 arch::idt::exception_name(vector),
                 result.deferred_lstar_db,
                 result.deferred_stub_db
             );
         }
         UserExit::NonCanonicalRip(rip) => {
-            let _ = writeln!(ctx.out, "usertest: non-canonical rip={rip:#x}");
+            let _ = writeln!(ctx.out, "usertest: exit=139 signal=11 non-canonical rip={rip:#x}");
         }
         UserExit::BusError { rip, cr2 } => {
             let _ = writeln!(ctx.out, "usertest: bus error rip={rip:#x} cr2={cr2:#x}");
