@@ -296,6 +296,7 @@ def test_a_virtio_rng_that_stops_answering_is_dropped(boot, cpu, left):
     # deterministically, with no timing precondition on boot or host load.
     with EgdServer() as egd:
         m = shell(boot, extra=egd.qemu_args, cpu=cpu)
+        assert egd.error is None, egd.error
         sources = "RDRAND, virtio-rng" if cpu else "virtio-rng"
         assert f"INFO  rng: sources: {sources}\n" in m.output
         assert "WARN  rng" not in m.output
