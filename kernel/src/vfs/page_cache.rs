@@ -15,7 +15,7 @@
 //! whose `error!` takes the log's leaf lock.
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -27,7 +27,8 @@ use lumen_vfs::{DevId, VfsError, VfsInode};
 use crate::arch;
 use crate::mm;
 use crate::mm::frame::{self, OwnedFrame};
-use crate::sync::SleepMutex;
+use crate::mm::user_vm::AddressSpace;
+use crate::sync::{SleepMutex, SpinLock};
 
 pub use lumen_vfs::page::PAGE_SIZE;
 
@@ -673,6 +674,16 @@ fn page_cache_lock(inode: &dyn VfsInode) -> Option<&SleepMutex<PageCache>> {
         return Some(ext4.page_cache_lock());
     }
     any.downcast_ref::<super::tmpfs::TmpfsInode>().map(super::tmpfs::TmpfsInode::page_cache_lock)
+}
+
+/// The address spaces currently mapping an `ext4` or `tmpfs` inode (level 10c
+/// leaf spinlock; never acquired under [`page_cache_lock`]).
+pub(crate) fn page_cache_mappers(inode: &dyn VfsInode) -> Option<&SpinLock<Vec<Weak<AddressSpace>>>> {
+    let any = inode.as_any()?;
+    if let Some(ext4) = any.downcast_ref::<super::ext4::Ext4Inode>() {
+        return Some(ext4.mappers());
+    }
+    any.downcast_ref::<super::tmpfs::TmpfsInode>().map(super::tmpfs::TmpfsInode::mappers)
 }
 
 /// `Range` unless page `index` starts below `file_size` (an overflowing

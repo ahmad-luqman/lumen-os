@@ -36,7 +36,8 @@ use lumen_vfs::{
 
 use log::{debug, error, warn};
 
-use crate::sync::{SleepMutex, SleepMutexGuard};
+use crate::mm::user_vm::AddressSpace;
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::time;
 
 use super::page_cache::{self, CachePage, DetachedQuotaGuard, PAGE_SIZE, PageCache};
@@ -1701,6 +1702,7 @@ pub struct Ext4Inode {
     warned_bad_listing: AtomicBool,
     meta: SleepMutex<Ext4InodeMeta>,
     pages: SleepMutex<PageCache>,
+    mappers: SpinLock<Vec<Weak<AddressSpace>>>,
 }
 
 impl Ext4Inode {
@@ -1825,6 +1827,7 @@ impl Ext4Inode {
             warned_bad_listing: AtomicBool::new(false),
             meta: SleepMutex::new(meta),
             pages: SleepMutex::new(PageCache::new_ext4()),
+            mappers: SpinLock::new(Vec::new()),
         })
     }
 
@@ -1921,6 +1924,12 @@ impl Ext4Inode {
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
     pub(super) fn page_cache_lock(&self) -> &SleepMutex<PageCache> {
         &self.pages
+    }
+
+    /// Address spaces currently mapping this file (level 10c leaf spinlock;
+    /// never acquired under `pages`), for `page_cache::page_cache_mappers`.
+    pub(super) fn mappers(&self) -> &SpinLock<Vec<Weak<AddressSpace>>> {
+        &self.mappers
     }
 
     /// This file's cached page `index`, filled when missing, and its size

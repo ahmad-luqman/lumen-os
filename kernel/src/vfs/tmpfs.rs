@@ -19,7 +19,8 @@ use lumen_vfs::{
     VfsError, VfsInode, mode_after_chown, next_detached_ino, next_lock_id,
 };
 
-use crate::sync::{SleepMutex, SleepMutexGuard};
+use crate::mm::user_vm::AddressSpace;
+use crate::sync::{SleepMutex, SleepMutexGuard, SpinLock};
 use crate::time;
 
 use super::page_cache::{CachePage, PAGE_SIZE, PageCache, QuotaCounter};
@@ -75,6 +76,7 @@ impl Tmpfs {
                 locks: AdvisoryLocks::new(),
             }),
             pages: SleepMutex::new(PageCache::new_tmpfs(Arc::clone(&shared.quota))),
+            mappers: SpinLock::new(Vec::new()),
         });
         Arc::new(Self { shared, rename_lock: SleepMutex::new(()), root })
     }
@@ -109,18 +111,18 @@ pub struct QuotaUse {
 /// number of pages of data: under a page, so such a mount still runs out
 /// of data pages exactly where a quota of only those pages would, as long
 /// as the files' charges ([`INODE_COST`] and [`entry_cost`] each, a
-/// directory's [`DIR_COST`] too) fit in it: six files named with up to 16
-/// bytes at most (656 bytes each as of #267), or one directory and three
-/// such files (both checked below at compile time). Past that the files'
-/// charges take the data's room: creating them still works, but the mount
-/// runs out of data pages early.
+/// directory's [`DIR_COST`] too) fit in it: five files named with up to 16
+/// bytes at most (688 bytes each with B7's mappers list), or one directory
+/// and three such files (both checked below at compile time). Past that the
+/// files' charges take the data's room: creating them still works, but the
+/// mount runs out of data pages early.
 #[cfg(feature = "ktest")]
 pub(crate) const KTEST_METADATA_ROOM: usize = PAGE_SIZE - 1;
 
 #[cfg(feature = "ktest")]
 const _: () = {
     let file = INODE_COST + entry_cost(16);
-    assert!(6 * file <= KTEST_METADATA_ROOM);
+    assert!(5 * file <= KTEST_METADATA_ROOM);
     assert!(INODE_COST + DIR_COST + entry_cost(16) + 3 * file <= KTEST_METADATA_ROOM);
 };
 
@@ -559,6 +561,7 @@ pub struct TmpfsInode {
     detached: AtomicBool,
     meta: SleepMutex<TmpfsMeta>,
     pages: SleepMutex<PageCache>,
+    mappers: SpinLock<Vec<Weak<AddressSpace>>>,
 }
 
 impl TmpfsInode {
@@ -620,6 +623,7 @@ impl TmpfsInode {
                 locks: AdvisoryLocks::new(),
             }),
             pages: SleepMutex::new(PageCache::new_tmpfs(Arc::clone(&shared.quota))),
+            mappers: SpinLock::new(Vec::new()),
         }))
     }
 
@@ -650,6 +654,12 @@ impl TmpfsInode {
     #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // first user: file-backed MAP_PRIVATE CoW (#255)
     pub(super) fn page_cache_lock(&self) -> &SleepMutex<PageCache> {
         &self.pages
+    }
+
+    /// Address spaces currently mapping this file (level 10c leaf spinlock;
+    /// never acquired under `pages`), for `page_cache::page_cache_mappers`.
+    pub(super) fn mappers(&self) -> &SpinLock<Vec<Weak<AddressSpace>>> {
+        &self.mappers
     }
 
     /// This file's page `index`, a zero page allocated for a hole, and its

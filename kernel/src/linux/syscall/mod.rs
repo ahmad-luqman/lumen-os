@@ -140,15 +140,13 @@ fn shrinking_space() -> alloc::sync::Arc<crate::mm::user_vm::AddressSpace> {
     crate::sched::current_address_space().expect("a file-shrinking syscall runs on a thread with an address space")
 }
 
-/// Unmap `space`'s pages of `inode` past `size` once a shrink of it has
-/// returned (Lock 4 released before `invalidate_file_from` takes Lock 1:
-/// the syscall never holds both), so a later access there is a bus error,
-/// not the old bytes or a store to a page the cache let go. The caller's
-/// address space only, until M8 finds the other mappers and shoots their
-/// TLB entries down (#255): another process mapping the file keeps its
-/// pages, holding them alive.
-fn unmap_past(space: &crate::mm::user_vm::AddressSpace, inode: &dyn lumen_vfs::VfsInode, size: u64) {
-    space.invalidate_file_from(crate::mm::user_vm::file_id_of(inode), size);
+/// Unmap every address space's pages of `inode` past `size` once a shrink of
+/// it (`truncate`, `ftruncate`, `openat(O_TRUNC)`) has returned (Lock 4
+/// released before each space's `invalidate_file_from` takes Lock 1: the
+/// syscall never holds both), shooting down stale translations on every CPU
+/// that has a mapping space loaded (ARCHITECTURE section 5, B7).
+fn unmap_past(_space: &crate::mm::user_vm::AddressSpace, inode: &dyn lumen_vfs::VfsInode, size: u64) {
+    crate::mm::user_vm::invalidate_file_mappings(inode, size);
 }
 
 /// A handler's result as `rax`: the value, or its positive errno negated
