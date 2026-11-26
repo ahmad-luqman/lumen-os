@@ -5297,7 +5297,14 @@ untouched):
    - Still on the old address space, as Linux's `exec_mmap` runs
      `mm_exit_exec_release` first: walk the robust list
      (`futex_exit_exec_release` → `exit_robust_list`, C4) and clear its
-     head; clear `clear_child_tid`, storing 0 and then (C4) waking one waiter
+     head. Linux's `begin_new_exec` calls `de_thread` (including
+     `exchange_tids`) before `exec_mmap` → `mm_exit_exec_release` →
+     `futex_exit_exec_release` → `futex_cleanup` → `exit_robust_list`.
+     `handle_futex_death` compares owner bits with `task_pid_vnr(curr)`,
+     so a non-leader's walk uses its **new leader tid**. Lumen preserves
+     that order: a robust mutex still owned by the caller's old tid is
+     not marked `FUTEX_OWNER_DIED` by this exec cleanup.
+     Clear `clear_child_tid`, storing 0 and then (C4) waking one waiter
      only if the space's `users` is above 1 (a `vfork` parent sharing it), as
      Linux's `mm_release` stores only while `mm_users > 1`, which after
      `de_thread` holds only for a sharer. Before releasing a `vfork` parent,

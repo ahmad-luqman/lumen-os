@@ -178,3 +178,11 @@ tests = [
 name = "C3 exec reserves Files copy storage even for an initially private table"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::linux::process::exec_reserves_private_files_before_teardown"]
+
+[[feature]]
+name = "C3 thread signal queues reuse vacant slots without accepting stale handles"
+milestone = "M8"
+tests = [
+    "cargo:lumen-signal",
+    "ktest:lumen_kernel::linux::process::clone_and_join_reuses_signal_slots",
+]

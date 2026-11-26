@@ -293,6 +293,10 @@ impl SignalState {
     pub(super) fn cancel_thread(&mut self, signals: ThreadSignals) {
         self.pending.remove_thread(signals.slot).expect("reserved signal slot");
     }
+    #[cfg(feature = "ktest")]
+    pub(super) fn slot_count(&self) -> usize {
+        self.pending.slot_count()
+    }
     pub(super) fn insert_thread(&mut self, tid: u32, signals: ThreadSignals) {
         let slot = signals.slot;
         assert!(self.threads.insert(tid, signals).is_none(), "duplicate signal tid");

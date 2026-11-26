@@ -740,6 +740,10 @@ pub(crate) fn de_thread() -> Result<(), u32> {
     {
         return Err(errno::EAGAIN);
     }
+    // Linux begin_new_exec runs de_thread/exchange_tids before exec_mmap's
+    // robust-list cleanup. Like handle_futex_death(task_pid_vnr(curr)), our
+    // later release_user_sync compares owner bits against the new leader tid;
+    // a mutex still naming this caller's old tid is not marked OWNER_DIED.
     table.take_leader_tid(&caller, &mut state);
     Ok(())
 }
@@ -4192,6 +4196,64 @@ fn ktest_exec() -> u64 {
     crate::user::copy_to_user(KTEST_USER_VA, b"/tmp/c3-exec\0").expect("exec path");
     hazard_call(general::__NR_execve, KTEST_USER_VA, 0, 0, 0)
 }
+
+crate::ktest!(
+    fn clone_and_join_reuses_signal_slots() {
+        use crate::arch::gdt;
+        use crate::{kassert, kassert_eq};
+        in_test_process(|_| {
+            const CODE: u64 = 0x800000;
+            let process = current_process();
+            process
+                .address_space()
+                .unwrap()
+                .map_eager_with_bytes(
+                    CODE,
+                    4096,
+                    lumen_vm::Prot::READ | lumen_vm::Prot::EXEC,
+                    // mov eax, __NR_exit; xor edi, edi; syscall; ud2
+                    &[0xb8, 60, 0, 0, 0, 0x31, 0xff, 0x0f, 0x05, 0x0f, 0x0b],
+                )
+                .map_err(|_| "map thread exit program")?;
+            let frame = crate::arch::syscall::SyscallFrame {
+                rip: CODE,
+                rsp: KTEST_USER_VA + KTEST_USER_LEN,
+                cs: u64::from(gdt::USER_CODE),
+                ss: u64::from(gdt::USER_DATA),
+                rflags: 0x202,
+                ..Default::default()
+            };
+            let request = clone_flags(
+                general::CLONE_THREAD
+                    | general::CLONE_VM
+                    | general::CLONE_SIGHAND
+                    | general::CLONE_FILES
+                    | general::CLONE_FS
+                    | general::CLONE_CHILD_CLEARTID,
+                0,
+            )
+            .unwrap();
+            kassert_eq!(process.signal.lock().slot_count(), 1);
+            for _ in 0..128 {
+                crate::user::copy_to_user(KTEST_USER_VA, &1u32.to_ne_bytes()).map_err(|_| "set join word")?;
+                let tid = fork_current(request, 0, 0, KTEST_USER_VA, 0, &frame).map_err(|_| "clone thread")?;
+                // Wait beyond clear_child_tid: unlinking also releases the signal
+                // slot. Confirm that effect before starting the next clone.
+                while lookup_thread(tid as u32).is_some() {
+                    crate::time::sleep(1_000_000);
+                }
+                let mut cleared = [0xff; 4];
+                crate::user::copy_from_user(&mut cleared, KTEST_USER_VA).map_err(|_| "read join word")?;
+                kassert_eq!(u32::from_ne_bytes(cleared), 0);
+                kassert_eq!(process.live_threads.load(Ordering::SeqCst), 1);
+                kassert_eq!(process.signal.lock().slot_count(), 2);
+                kassert!(process.signal.lock().has_thread(current_thread().tid()));
+            }
+            PROCS.lock().check()?;
+            Ok(())
+        })?
+    }
+);
 
 crate::ktest!(
     fn exec_reserves_private_files_before_teardown() {
