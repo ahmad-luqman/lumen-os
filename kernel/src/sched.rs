@@ -303,12 +303,27 @@ pub(crate) struct TaskName {
 }
 impl TaskName {
     /// At most fifteen raw comm bytes, NUL-terminated and zero-padded,
-    /// with a separately sanitized display name.
+    /// with a separately sanitized display name, without allocating.
+    /// Each invalid UTF-8 sequence displays as `?`.
     pub(crate) fn from_comm(comm: &[u8]) -> Self {
         let end = comm.iter().take(15).position(|&b| b == 0).unwrap_or(comm.len().min(15));
         let mut bytes = [0; 16];
         bytes[..end].copy_from_slice(&comm[..end]);
-        let display = ThreadName::new(&alloc::string::String::from_utf8_lossy(&bytes[..end]));
+        let mut display_bytes = [0; 15];
+        let mut len = 0;
+        // Valid chunks plus one ASCII byte per invalid sequence cannot
+        // exceed the raw comm's length. Controls use ThreadName's rule.
+        for chunk in bytes[..end].utf8_chunks() {
+            let valid = chunk.valid().as_bytes();
+            display_bytes[len..len + valid.len()].copy_from_slice(valid);
+            len += valid.len();
+            if !chunk.invalid().is_empty() {
+                display_bytes[len] = b'?';
+                len += 1;
+            }
+        }
+        let display =
+            ThreadName::new(core::str::from_utf8(&display_bytes[..len]).expect("valid UTF-8 chunks and ASCII"));
         Self { display, bytes }
     }
 
@@ -5595,12 +5610,46 @@ crate::ktest!(
             (b"a\0trailing", *b"a\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0", "a"),
             (b"abcdefghijklmnopq", *b"abcdefghijklmno\0", "abcdefghijklmno"),
             (b"a\nb", *b"a\nb\0\0\0\0\0\0\0\0\0\0\0\0\0", "a?b"),
-            (b"a\xffb", *b"a\xffb\0\0\0\0\0\0\0\0\0\0\0\0\0", "a�b"),
+            (b"a\xffb", *b"a\xffb\0\0\0\0\0\0\0\0\0\0\0\0\0", "a?b"),
         ] {
             let name = TaskName::from_comm(input);
             kassert_eq!(name.bytes, expected);
             kassert_eq!(name.display.as_str(), display);
         }
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn task_name_display_needs_no_heap() {
+        use crate::kassert_eq;
+        let inputs: [&[u8]; 6] = [
+            b"a\xffb",
+            b"\xf0\x9f",
+            b"\xc0\xaf",
+            b"a\xe2\x82b",
+            b"\xff\xc2\x85\xe2\x80\xa8\xc3\xa9",
+            b"abcdefghijklmn\xc3\xa9",
+        ];
+        let (names, displayed, converted) = {
+            let _irq = arch::irq::push_off();
+            crate::mm::heap::refuse_from(0);
+            let names = inputs.map(TaskName::from_comm);
+            let displayed = TaskName::from_display(ThreadName::new("display"));
+            let converted = TaskName::from("converted");
+            crate::mm::heap::refuse_from(usize::MAX);
+            (names, displayed, converted)
+        };
+        for ((name, input), expected) in
+            names.iter().zip(inputs).zip(["a?b", "?", "??", "a?b", "???é", "abcdefghijklmn?"])
+        {
+            let len = input.len().min(15);
+            kassert_eq!(&name.bytes[..len], &input[..len]);
+            kassert_eq!(name.bytes[len], 0);
+            kassert_eq!(name.display.as_str(), expected);
+        }
+        kassert_eq!(displayed.display.as_str(), "display");
+        kassert_eq!(converted.display.as_str(), "converted");
         Ok(())
     }
 );

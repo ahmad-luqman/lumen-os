@@ -145,3 +145,8 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::sys::tests::sysinfo_reports_free_frames_and_live_processes",
     "cargo:lumen-vm",
 ]
+
+[[feature]]
+name = "Task comm display handles invalid UTF-8 without heap allocation"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::sched::task_name_display_needs_no_heap"]
