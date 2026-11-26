@@ -159,7 +159,11 @@ pub fn force_debug_trap(code: DebugCode, rip: u64) {
 
 /// Translate a synchronous CPU fault after VM resolution, on the owning stack.
 pub fn exception(trap: &arch::idt::TrapFrame, cr2: u64, bus: bool, oom: bool) {
-    if let Some(debug) = arch::percpu::take_pending_debug_trap() {
+    let debug = {
+        let _irq = arch::irq::push_off();
+        arch::percpu::take_pending_debug_trap()
+    };
+    if let Some(debug) = debug {
         force_debug_trap(debug.code, debug.rip);
     }
     let (sig, code, addr, fault) = if oom {

@@ -79,9 +79,9 @@ const QUEUE_SIZE: usize = 256;
 /// safety net for an interrupt that doesn't come. (The CPU halts between.)
 const WAIT_NS: u64 = 100_000_000;
 
-/// Received bytes, from the interrupt handler (the producer: the boot CPU
-/// with interrupts off) to [`read_byte`]. `RECEIVE` serializes consumers
-/// across CPUs and their UART fallback with the interrupt producer.
+/// Received bytes passed from the interrupt handler to [`read_byte`].
+/// Every push and pop holds `RECEIVE`, which serializes access across CPUs
+/// and also protects the UART fallback and interrupt drain.
 static QUEUE: ByteQueue<QUEUE_SIZE> = ByteQueue::new();
 /// Serializes queue consumption, UART reads and IRQ 4 drains. Never held
 /// while waking waiters or notifying poll subscribers (their readiness
@@ -188,8 +188,8 @@ fn on_irq() {
 /// Move the waiting bytes into the queue while it has room (the rest stay
 /// in the UART), then wake the serial shell's wait queue (counting a wake that
 /// readied it) and notify [`POLL_HEAD`] subscribers with `POLLIN | POLLRDNORM`;
-/// returns how many bytes were queued. With interrupts off, on the boot CPU:
-/// the queue's only producer.
+/// returns how many bytes were queued. Every push holds `RECEIVE`, as does
+/// every pop by a reader; the lock is released before wake/notify.
 fn queue_waiting() -> usize {
     let receive = RECEIVE.lock();
     let room = QUEUE_SIZE - QUEUE.len();

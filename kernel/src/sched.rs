@@ -2,7 +2,8 @@
 //!
 //! A [`Thread`] has its own kernel stack from `mm::stack` (with a guard page,
 //! hard rule 4), its saved `rsp` while it isn't running, and a [`State`].
-//! [`spawn`] and [`spawn_on`] pin kernel threads. User threads and
+//! [`spawn`] and [`spawn_on`] pin kernel threads. Unpinned user threads
+//! (roots, and fork children within the inherited mask) and
 //! [`spawn_migratable`] threads may move between allowed CPUs while Ready,
 //! after `finish_switch` releases their `on_cpu` ownership. Run queue locks
 //! serialize placement; the outgoing CPU saves all state before releasing
@@ -373,7 +374,9 @@ impl Placement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "C12 adds the syscall callers"))]
 pub enum AffinityError {
+    /// The requested mask contains no online CPU.
     NoOnlineCpu,
+    /// The thread has an immutable pin (including idle threads).
     Pinned,
 }
 
@@ -474,7 +477,7 @@ impl Thread {
     }
 
     /// Set the priority used when the next slice starts.
-    #[allow(dead_code)] // C12's setpriority
+    #[cfg_attr(not(feature = "ktest"), expect(dead_code, reason = "C12 adds setpriority"))]
     pub fn set_nice(&self, nice: i32) {
         self.nice.store(nice.clamp(-20, 19) as i8, Ordering::Relaxed);
     }
@@ -768,7 +771,7 @@ static ARMED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CP
 /// moves to true.
 static RUNNING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 /// How many threads are on each CPU's run queue, so its idle loop can check
-/// for work without the lock.
+/// for work without the lock and balance_pass can select donors.
 static READY: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 /// Each CPU's current thread, for the crash reporter (lock-free); only that
 /// CPU stores it. It points into an `Arc` that CPU's scheduler holds:
@@ -1654,7 +1657,14 @@ pub fn spawn_user_on(
     space: Arc<AddressSpace>,
     f: impl FnOnce() + Send + 'static,
 ) -> Result<JoinHandle, SpawnError> {
-    spawn_with_user(cpu, name.into(), STACK_SIZE, Box::new(f), Some(UserThreadState::new(space)))
+    spawn_configured(
+        cpu,
+        name.into(),
+        STACK_SIZE,
+        Box::new(f),
+        Some(UserThreadState::new(space)),
+        Placement::migratable(),
+    )
 }
 
 /// Start a user probe permanently pinned to `cpu`, with clean FPU and TLS.
@@ -1699,7 +1709,7 @@ pub(crate) fn spawn_fork_child(
         let me = current().expect("fork on a running thread");
         let affinity = me.affinity();
         let here = arch::cpu_index();
-        let cpu = if affinity & (1 << here) != 0 { here } else { (affinity & online_mask()).trailing_zeros() as usize };
+        let cpu = if affinity & (1 << here) != 0 { here } else { lowest_online(affinity) };
         (cpu, Placement { affinity, pinned: false, nice: me.nice() })
     };
     state.fs_base.store(fs_base, Ordering::Relaxed);
@@ -1710,6 +1720,13 @@ pub(crate) fn spawn_fork_child(
 /// CPUs whose schedulers can accept threads. CPU hot-unplug is unsupported.
 fn online_mask() -> u64 {
     (0..MAX_CPUS).filter(|&cpu| running_on(cpu)).fold(0, |mask, cpu| mask | (1 << cpu))
+}
+
+/// The lowest online CPU allowed by a nonempty effective affinity mask.
+fn lowest_online(mask: u64) -> usize {
+    let online = mask & online_mask();
+    debug_assert!(online != 0);
+    online.trailing_zeros() as usize
 }
 
 /// Reserve before publishing a new thread. Every CPU can receive it later,
@@ -1792,32 +1809,37 @@ fn balance(cpu: usize) -> bool {
 }
 
 fn balance_pass(cpu: usize) -> bool {
-    let Some(from) = (0..MAX_CPUS)
-        .filter(|&other| other != cpu && running_on(other))
-        .max_by_key(|&other| READY[other].load(Ordering::Acquire))
-    else {
-        return false;
-    };
-    // No queued donor, or even counting its running thread cannot meet
-    // the threshold. Recheck the exact runnable counts under both locks.
-    let ready = READY[from].load(Ordering::Acquire);
-    if ready == 0 || ready + 1 < READY[cpu].load(Ordering::Acquire) + 2 {
-        return false;
-    }
-    let moved = with_queues(from, cpu, |source, dest| {
-        if source.runnable() < dest.runnable() + 2 {
-            return false;
-        }
-        let Some(at) = source.ready.iter().rposition(|t| t.may_move_to(cpu)) else {
+    let mut tried = 1u64 << cpu;
+    loop {
+        let Some(from) = (0..MAX_CPUS)
+            .filter(|&other| tried & (1 << other) == 0 && running_on(other))
+            .max_by_key(|&other| READY[other].load(Ordering::Acquire))
+        else {
             return false;
         };
-        move_ready(from, source, cpu, dest, at);
-        true
-    });
-    if moved {
-        let _ = smp::wake(cpu);
+        tried |= 1 << from;
+        // No queued donor, or even counting its running thread cannot meet
+        // the threshold. Recheck exact runnable counts under both locks.
+        let ready = READY[from].load(Ordering::Acquire);
+        if ready == 0 || ready + 1 < READY[cpu].load(Ordering::Acquire) + 2 {
+            continue;
+        }
+        let moved = with_queues(from, cpu, |source, dest| {
+            if source.runnable() < dest.runnable() + 2 {
+                return false;
+            }
+            let Some(at) = source.ready.iter().rposition(|t| t.may_move_to(cpu)) else {
+                return false;
+            };
+            move_ready(from, source, cpu, dest, at);
+            true
+        });
+        if moved {
+            let _ = smp::wake(cpu);
+            return true;
+        }
+        // Pinned or still-running queued threads must not hide another donor.
     }
-    moved
 }
 
 /// Affinity redirects only a fully saved Ready thread. Wakes racing the
@@ -1829,7 +1851,7 @@ fn relocate_disallowed(thread: &Thread) {
         if mask & (1 << from) != 0 {
             return;
         }
-        let to = (mask & online_mask()).trailing_zeros() as usize;
+        let to = lowest_online(mask);
         let retry = with_queues(from, to, |source, dest| {
             if thread.cpu() != from || thread.affinity() != mask {
                 return true;
@@ -1869,18 +1891,7 @@ pub fn spawn_migratable(
 }
 
 fn spawn_with(cpu: usize, name: ThreadName, stack_size: u64, f: Entry) -> Result<JoinHandle, SpawnError> {
-    spawn_with_user(cpu, name, stack_size, f, None)
-}
-
-fn spawn_with_user(
-    cpu: usize,
-    name: ThreadName,
-    stack_size: u64,
-    f: Entry,
-    user: Option<UserThreadState>,
-) -> Result<JoinHandle, SpawnError> {
-    let placement = if user.is_some() { Placement::migratable() } else { Placement::pinned(cpu) };
-    spawn_configured(cpu, name, stack_size, f, user, placement)
+    spawn_configured(cpu, name, stack_size, f, None, Placement::pinned(cpu))
 }
 
 fn spawn_configured(
@@ -2214,7 +2225,7 @@ fn release_previous(mut prev: Arc<Thread>) {
             drop(q);
             return;
         }
-        let to = (mask & online_mask()).trailing_zeros() as usize;
+        let to = lowest_online(mask);
         match with_queues(from, to, |source, dest| {
             if prev.affinity() != mask {
                 return Err(prev);
@@ -2283,9 +2294,10 @@ fn hold_if_asked(r: &Released) {
 /// The timer interrupt on this CPU (interrupts off, EOI sent): the first
 /// tick of an armed CPU starts its scheduler; after that, count the tick
 /// (against the running thread, and as idle if that is the idle thread),
-/// wake the sleepers whose deadline has passed, and switch threads if
-/// another is ready and the running one's slice is used up (or the idle
-/// thread runs).
+/// periodically balance runnable work, wake expired sleepers and route_ready
+/// to honor their affinity. Switch if another thread is ready and the slice
+/// expired (or idle runs), or force a switch if the running thread's mask
+/// excludes this CPU.
 pub fn tick() {
     let cpu = arch::cpu_index();
     if !running_on(cpu) {
@@ -2702,7 +2714,8 @@ pub fn run_ap_idle(has_job: impl Fn() -> bool, run_job: impl Fn()) -> ! {
 
 /// A CPU's idle thread: halt until there is work (a ready thread, a job, or
 /// for an AP whose timer isn't started yet, the timer's count), then do it.
-/// It never blocks: a job that sleeps busy-waits, and one that waits on a
+/// It attempts to steal runnable work before halting. It never blocks:
+/// a job that sleeps busy-waits, and one that waits on a
 /// queue panics.
 fn idle_loop(cpu: usize, has_job: impl Fn() -> bool, run_job: impl Fn()) {
     loop {
@@ -3187,7 +3200,7 @@ crate::ktest!(
     fn wait_queue_wakes_a_blocked_thread() {
         // A thread waiting on a queue blocks until its condition holds and
         // it is woken: on this CPU, and from another (the remote wake path:
-        // its home's queue and a wakeup IPI). Woken without its condition,
+        // its current queue and a wakeup IPI). Woken without its condition,
         // it checks again (counted) and blocks again.
         use crate::{kassert, kassert_eq};
         #[derive(Default)]
@@ -4940,6 +4953,68 @@ crate::ktest!(
 );
 
 crate::ktest!(
+    fn balancing_skips_pinned_donor_and_moves_user_roots() {
+        use crate::{kassert, kassert_eq};
+        let _manual = ManualBalance::new();
+        let here = arch::cpu_index();
+        let cpus = running_cpus();
+        let mut others = cpus.iter().copied().filter(|&cpu| cpu != here);
+        let donor = others.next().ok_or("needs three CPUs")?;
+        let target = others.next().ok_or("needs three CPUs")?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
+        let (done, ready) = (stop.clone(), held.clone());
+        let holder = spawn_test(donor, "donor-holder", move || {
+            // Keep both roots queued until the explicit balance pass.
+            let _irq = arch::irq::push_off();
+            ready.store(true, Ordering::Release);
+            let end = time::now_ns() + TEST_DEADLINE_NS;
+            while !done.load(Ordering::Acquire) && time::now_ns() < end {
+                core::hint::spin_loop();
+            }
+        })?;
+        kassert!(yield_until(|| held.load(Ordering::Acquire)));
+        let ran = Arc::new([const { AtomicUsize::new(usize::MAX) }; 2]);
+        let mut handles = Vec::with_capacity(5);
+        let moved;
+        {
+            let _irq = arch::irq::push_off();
+            // The busiest queue has only immutable pins. The next donor
+            // has two ordinary user roots; neither has changed its affinity.
+            for _ in 0..3 {
+                handles.push(spawn_test(here, "pinned-donor", || {})?);
+            }
+            for i in 0..2 {
+                let out = ran.clone();
+                let space = Arc::new(AddressSpace::new().map_err(|_| "root space")?);
+                handles.push(
+                    spawn_user_on(donor, "user-root", space, move || {
+                        out[i].store(arch::cpu_index(), Ordering::Release);
+                    })
+                    .map_err(|e| {
+                        crate::ktest::diag(format_args!("spawn user root: {e}"));
+                        "spawn user root"
+                    })?,
+                );
+            }
+            moved = balance_pass(target);
+        }
+        stop.store(true, Ordering::Release);
+        join_bounded(holder)?;
+        for handle in handles {
+            join_bounded(handle)?;
+        }
+        kassert!(moved);
+        let mut seen = ran.each_ref().map(|v| v.load(Ordering::Acquire));
+        seen.sort_unstable();
+        let mut expected = [donor, target];
+        expected.sort_unstable();
+        kassert_eq!(seen, expected);
+        Ok(())
+    }
+);
+
+crate::ktest!(
     fn pinned_threads_never_migrate() {
         use crate::{kassert, kassert_eq};
         let _manual = ManualBalance::new();
@@ -5374,13 +5449,20 @@ crate::ktest!(
         // no buffers. Its real try_reserve failure must roll back the first.
         queues[0].lock().try_home().map_err(|_| "prepare queue")?;
         queues[0].lock().reserved -= 1;
-        crate::mm::heap::refuse_from(0);
-        let failed = reserve_queues(&queues);
-        crate::mm::heap::refuse_from(usize::MAX);
+        queues[1].lock().reserved = 4095;
+        let failed = {
+            let _irq = arch::irq::push_off();
+            // 4096 Arc slots require at least 32 KiB; small unrelated
+            // allocations remain available while this reservation fails.
+            crate::mm::heap::refuse_from(16 * 1024);
+            let failed = reserve_queues(&queues);
+            crate::mm::heap::refuse_from(usize::MAX);
+            failed
+        };
         kassert!(matches!(failed, Err(SpawnError::NoMemory)));
-        for q in &queues {
-            kassert_eq!(q.lock().reserved, 0);
-        }
+        kassert_eq!(queues[0].lock().reserved, 0);
+        kassert_eq!(queues[1].lock().reserved, 4095);
+        queues[1].lock().reserved = 0;
         let reserved = reserve_queues(&queues).map_err(|_| "reserve queues")?;
         for q in &queues {
             kassert_eq!(q.lock().reserved, 1);

@@ -161,16 +161,17 @@ tests = [
 ]
 
 [[feature]]
-name = "SMP work stealing and affinity (#377, B6): explicit balance passes move saved Ready threads to idle CPUs, preserve pinned threads, and skip a Ready thread still on_cpu; wakes and signal kicks follow affinity and remove old deadlines"
+name = "SMP work stealing and affinity: explicit balance passes move saved Ready threads to idle CPUs, preserve pinned threads; wakes and signal kicks follow affinity and remove old deadlines (#377, B6)"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::sched::threads_migrate_to_idle_cpus",
+    "ktest:lumen_kernel::sched::balancing_skips_pinned_donor_and_moves_user_roots",
     "ktest:lumen_kernel::sched::pinned_threads_never_migrate",
     "ktest:lumen_kernel::sched::affinity_wakes_and_kicks_follow_migration",
 ]
 
 [[feature]]
-name = "Nice priorities scale FIFO time slices using Linux's weights, clamped to 1 through 100 ticks (#377, B6)"
+name = "Nice priorities scale round-robin time slices using Linux's weights, clamped to 1 through 100 ticks (#377, B6)"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::sched::nice_scales_slices",
@@ -190,9 +191,8 @@ name = "Migration waits for the outgoing stack save: a real context switch stall
 milestone = "M8"
 tests = ["ktest:lumen_kernel::sched::migration_waits_for_complete_switch"]
 
-
 [[feature]]
-name = "B6 review: fork inherits affinity and nice; serial input is safe on non-boot CPUs"
+name = "Fork inherits affinity and nice; serial input is safe on non-boot CPUs (#377, B6)"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::linux::process::fork_inherits_affinity_and_nice",
@@ -200,7 +200,7 @@ tests = [
 ]
 
 [[feature]]
-name = "B6 review: automatic balancing counts runnable threads; timer wakes honor affinity for sleeps and deadline waits"
+name = "Automatic balancing counts runnable threads; timer wakes honor affinity for sleeps and deadline waits (#377, B6)"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::sched::automatic_balancer_moves_runnable_threads",
@@ -209,7 +209,7 @@ tests = [
 ]
 
 [[feature]]
-name = "B6 review: kernel and user-probe pins are immutable; fallible queue reservations roll back unpublished counts"
+name = "Kernel and user-probe pins are immutable; fallible queue reservations roll back unpublished counts (#377, B6)"
 milestone = "M8"
 tests = [
     "ktest:lumen_kernel::sched::affinity_refuses_immutable_pins",

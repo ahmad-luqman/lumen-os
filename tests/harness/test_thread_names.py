@@ -49,7 +49,6 @@ NAME_ARG = {
     "spawn_test_migratable": 0,
     "spawn_ring3_on": 1,
     "spawn_with": 1,
-    "spawn_with_user": 1,
     "spawn_configured": 1,
     # A boot module's name for its thread (`ThreadName::new(module_name)`).
     "run_exec": 1,

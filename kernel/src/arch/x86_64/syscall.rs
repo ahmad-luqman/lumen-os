@@ -591,7 +591,10 @@ fn settle_user_return(frame: &mut SyscallFrame, mut syscall: Option<lumen_signal
 /// critical sections (`irq::depth() == 0`).
 pub unsafe fn unwind_to_kernel() -> ! {
     assert_eq!(irq::depth(), 0, "unwind_to_kernel with open critical section");
-    assert_ne!(percpu::user_exit_rsp(), 0, "unwind_to_kernel with no active ring-3 context");
+    {
+        let _irq = irq::push_off();
+        assert_ne!(percpu::user_exit_rsp(), 0, "unwind_to_kernel with no active ring-3 context");
+    }
     // SAFETY: `user_exit_rsp` holds the saved frame from `lumen_enter_ring3_call`.
     unsafe { lumen_user_unwind() }
 }

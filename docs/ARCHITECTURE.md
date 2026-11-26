@@ -134,8 +134,8 @@ tests (for example `lumen-elf`, the symbol-table reader).
    is an edge that doesn't come again until the reader lowers the line by
    taking the waiting bytes (QEMU raises it again whenever bytes wait), so
    the reader takes the queue's bytes, then the UART's, with interrupts
-   off under the receive lock (released before wake/notify), and a reader blocks
-   only while neither holds a byte (`lumen_uart::read_next` and
+   off under the receive lock. The handler releases it before wake/notify,
+   and a reader blocks only while neither holds a byte (`lumen_uart::read_next` and
    `available`, host-tested against a model of that worst case). The
    block has a 100 ms deadline as a safety net: input whose interrupt
    never wakes the shell is still read, within 200 ms (input found at the
@@ -2071,7 +2071,8 @@ thread has finished and its CPU's `finish_switch` is done with it (its
 stack and joiners' list freed, its reference dropped), so nothing that CPU
 frees for it lands after `join` returns (#183; its record goes when a later
 spawn prunes it). `spawn` and `spawn_on` keep kernel threads pinned;
-user roots and `spawn_migratable` threads may move between allowed CPUs
+unpinned user threads (roots, and fork children within the inherited mask)
+and `spawn_migratable` threads may move between allowed CPUs
 (M8 B6, "SMP migration" below). Each CPU has a round-robin run queue.
 Only a Ready thread with its full context saved (`on_cpu` clear) moves;
 source and destination queue locks serialize placement. A wake from any
@@ -2211,8 +2212,9 @@ threads move to idle CPUs:
   queued last there that may run on it
   (affinity) and isn't `on_cpu`, holding both run queues' locks in
   ascending CPU order, and records an X-ray `runq` event on both. The
-  timer must not allocate (section 5's heap rule), so each spawn reserves
-  a ready slot and a sleeper slot in every CPU's queues, not only its
+  next donor is tried if the busiest queue has no eligible thread or no
+  longer meets the threshold. The timer must not allocate (section 5's heap
+  rule), so each spawn reserves a ready slot and a sleeper slot in every CPU's queues, not only its
   home's: neither migration nor a timer tick grows either queue.
   `Cpu::reserved` counts live threads plus pending spawn reservations.
   `try_reserve` fails with `NoMemory` before `Thread::spawned`; the guard
@@ -2236,7 +2238,8 @@ threads move to idle CPUs:
   parent's mask and nice with interrupts off, along with its FPU snapshot:
   it starts on the caller's CPU if allowed, otherwise the lowest allowed
   online CPU. A running thread excluded by a new mask leaves at its next
-  switch; a blocked or sleeping thread moves only after waking.
+  switch, forced by the next timer tick even if its slice remains; a blocked
+  or sleeping thread moves only after waking.
 - **Serial-console readers:** roots and children may read on any CPU.
   `serial_in::RECEIVE`, an interrupts-off lock, serializes queue consumers
   and their UART fallback with IRQ 4's drain. The handler releases it
@@ -2253,6 +2256,8 @@ threads move to idle CPUs:
   answer runs pinned or with interrupts off, as before.
 - **Tick counts (C12):** section 8's model.
 - Tested by `ktest:lumen_kernel::sched::threads_migrate_to_idle_cpus`,
+  `ktest:lumen_kernel::sched::balancing_skips_pinned_donor_and_moves_user_roots`
+  (a pinned busiest donor cannot hide movable user roots on another CPU),
   `ktest:lumen_kernel::sched::pinned_threads_never_migrate`,
   `ktest:lumen_kernel::sched::nice_scales_slices`,
   `ktest:lumen_kernel::sched::migration_keeps_user_state`,
@@ -8595,11 +8600,13 @@ holding only locks above it.
        (two in ascending CPU order for stealing, affinity relocation from
        set_affinity/wake/kick/route_ready, or finish_switch, section 6).
        Signal locks may enclose kick; no run queue holder takes a wait
-       queue lock. serial_in::RECEIVE is a leaf taken by readiness callbacks,
-       readers and IRQ 4, released before wake/notify
-    g. Thread::name (a leaf, no allocation, no further locks; only the
+       queue lock
+    g. serial_in::RECEIVE (a leaf taken under a 10f wait-queue lock by
+       readiness callbacks, and by readers and IRQ 4; the handler releases
+       it before wake/notify)
+    h. Thread::name (a leaf, no allocation, no further locks; only the
        owner writes after construction; crash readers use try_lock)
-    h. heap -> page tables -> frame allocator (section 5);
+    i. heap -> page tables -> frame allocator (section 5);
        frame::REFS is a leaf lock, taken only to copy out its boot-reserved
        table and released before any other lock or count update
 ```
@@ -11132,6 +11139,8 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   on the allowed CPU (automatic balancing paused); a late observation
   retries rather than asserting a timing bound.
   `affinity_refuses_immutable_pins` checks kernel, idle and user-probe pins.
+  `balancing_skips_pinned_donor_and_moves_user_roots` skips a busiest queue
+  containing only pins and migrates an ordinary user root from the next donor.
   `queue_reservations_fail_and_roll_back` refuses a real queue allocation
   after an earlier queue reserved successfully, then checks both counts
   rolled back, and checks dropping a successful unpublished reservation.
