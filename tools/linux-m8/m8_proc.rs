@@ -14,6 +14,7 @@
 mod common;
 mod exec;
 mod futex;
+mod sessions;
 mod signal_waits;
 mod signals;
 mod small;
@@ -30,6 +31,8 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     let (args, n) = unsafe { common::args(argc, argv) };
     match &args[..n] {
         [_, b"fork-wait"] => fork_wait(),
+        [_, b"sessions"] => sessions::run(),
+        [_, b"sessions-exec-hold"] => sessions::exec_hold(),
         [_, b"threads"] => threads::run(),
         [_, b"thread-exhaust"] => threads::exhaust(),
         [_, b"thread-root-exec"] => threads::root(true),
@@ -535,6 +538,7 @@ fn fork_wait() -> c_int {
         ("clone-shared-resources", &clone_shared_resources),
         ("fork-inherited-state", &fork_inherited_state),
         ("rusage", &small::usage),
+        ("wait-pgrp", &sessions::wait_pgrp),
     ])
 }
 

@@ -2837,6 +2837,7 @@ def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer)
                         "small",
                         "signal_waits",
                         "threads",
+                        "sessions",
                         *M8_PROGRAMS,
                     )
                 ),

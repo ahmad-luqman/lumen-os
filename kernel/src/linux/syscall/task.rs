@@ -6,7 +6,6 @@
 //! `setsid`, `getpgid`, `getsid`.
 
 use super::at::UserPtr;
-use super::not_implemented;
 use crate::arch;
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
 use crate::linux::process::{self, ProcessClone, clone_flags};
@@ -402,24 +401,41 @@ fn write_rusage(ptr: UserPtr, ticks: [u64; 2]) -> Result<(), u32> {
     Ok(())
 }
 
-/// `setpgid(pid, pgid)` (109): M8 stub, replaced by C8 (#387).
-pub(super) fn sys_setpgid(_pid: i32, _pgid: i32) -> u64 {
-    not_implemented(general::__NR_setpgid)
+/// `setpgid(pid, pgid)` (109): move `pid` (0: caller) to group `pgid` (0: target).
+///
+/// Deviation from Linux (`kernel/sys.c`, documented in ARCHITECTURE section 8):
+/// `lumen-proc` looks processes up by pid (tgid) only, so a live non-leader
+/// tid returns `-ESRCH` (Linux's `find_task_by_vpid` finds threads and
+/// returns `-EINVAL` for non-leaders).
+pub(super) fn sys_setpgid(pid: i32, pgid: i32) -> u64 {
+    super::finish(process::setpgid(pid, pgid).map(|()| 0))
 }
 
-/// `setsid()` (112): M8 stub, replaced by C8 (#387).
+/// `getpgrp()` (111): return the caller's process group (`getpgid(0)`).
+pub(super) fn sys_getpgrp() -> u64 {
+    sys_getpgid(0)
+}
+
+/// `setsid()` (112): start a new session and group led by the caller.
+/// C9 clears `SignalState::ctty` here once controlling terminals exist.
 pub(super) fn sys_setsid() -> u64 {
-    not_implemented(general::__NR_setsid)
+    super::finish(process::setsid().map(u64::from))
 }
 
-/// `getpgid(pid)` (121): M8 stub, replaced by C8 (#387).
-pub(super) fn sys_getpgid(_pid: i32) -> u64 {
-    not_implemented(general::__NR_getpgid)
+/// `getpgid(pid)` (121): return `pid`'s process group (0: caller).
+///
+/// Deviation from Linux (`kernel/sys.c`, documented in ARCHITECTURE section 8):
+/// a live non-leader tid returns `-ESRCH` rather than the thread group's pgid.
+pub(super) fn sys_getpgid(pid: i32) -> u64 {
+    super::finish(process::getpgid(pid).map(u64::from))
 }
 
-/// `getsid(pid)` (124): M8 stub, replaced by C8 (#387).
-pub(super) fn sys_getsid(_pid: i32) -> u64 {
-    not_implemented(general::__NR_getsid)
+/// `getsid(pid)` (124): return `pid`'s session id (0: caller).
+///
+/// Deviation from Linux (`kernel/sys.c`, documented in ARCHITECTURE section 8):
+/// a live non-leader tid returns `-ESRCH` rather than the thread group's sid.
+pub(super) fn sys_getsid(pid: i32) -> u64 {
+    super::finish(process::getsid(pid).map(u64::from))
 }
 
 crate::ktest!(
@@ -587,6 +603,65 @@ crate::ktest!(
             crate::sched::with_current(|thread| thread.set_fatal_pending()).ok_or("current thread")?;
             kassert_eq!(copy_exec_args(b"/x", base, 0, 131072).err(), Some(errno::EINTR));
             Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn sessions_and_process_groups_dispatch() {
+        use super::neg_errno;
+        use crate::{kassert_eq, linux::process::in_test_process};
+        use alloc::sync::Arc;
+        in_test_process(|pid| -> Result<(), &'static str> {
+            let call = |nr: u32, rdi: u64, rsi: u64| {
+                let mut frame = SyscallFrame { rax: u64::from(nr), rdi, rsi, ..SyscallFrame::default() };
+                let _ = super::dispatch(&mut frame);
+                frame.rax
+            };
+            let high = 0xdead_beef_0000_0000u64;
+            // A root process starts as session and group leader.
+            kassert_eq!(call(general::__NR_getpgrp, 0, 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getpgid, 0, 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getsid, 0, 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getpgid, high, 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getsid, high | u64::from(pid), 0), u64::from(pid));
+            kassert_eq!(call(general::__NR_getpgid, 1, 0), 1);
+            kassert_eq!(call(general::__NR_getsid, 1, 0), 1);
+            kassert_eq!(call(general::__NR_setsid, 0, 0), neg_errno(errno::EPERM));
+            kassert_eq!(call(general::__NR_setpgid, 0, 0), neg_errno(errno::EPERM));
+            kassert_eq!(call(general::__NR_setpgid, 0, (-1i32) as u32 as u64), neg_errno(errno::EINVAL));
+            kassert_eq!(call(general::__NR_getpgid, (-1i32) as u32 as u64, 0), neg_errno(errno::ESRCH));
+            kassert_eq!(call(general::__NR_getsid, (-1i32) as u32 as u64, 0), neg_errno(errno::ESRCH));
+            // Group kill: ESRCH precedes EINVAL, including i32::MIN.
+            kassert_eq!(call(general::__NR_kill, (i32::MIN as u32) as u64, 999), neg_errno(errno::ESRCH));
+            kassert_eq!(call(general::__NR_kill, (-(pid as i32) as u32) as u64, 0), 0);
+            kassert_eq!(call(general::__NR_kill, (-(pid as i32) as u32) as u64, 999), neg_errno(errno::EINVAL));
+            kassert_eq!(call(general::__NR_kill, 0, 0), 0);
+            kassert_eq!(call(general::__NR_kill, 0, 999), neg_errno(errno::EINVAL));
+
+            // Non-leader tid: lookup returns ESRCH (documented deviation from Linux),
+            // while calls made by that thread with pid 0 resolve its process.
+            let me = current_process();
+            let extra = process::add_ktest_thread(&me)?;
+            let tid = extra.tid();
+            let checked = (|| {
+                kassert_eq!(call(general::__NR_getpgid, u64::from(tid), 0), neg_errno(errno::ESRCH));
+                kassert_eq!(call(general::__NR_getsid, u64::from(tid), 0), neg_errno(errno::ESRCH));
+                kassert_eq!(call(general::__NR_setpgid, u64::from(tid), 0), neg_errno(errno::ESRCH));
+                kassert_eq!(call(general::__NR_kill, u64::from(tid), 0), neg_errno(errno::ESRCH));
+                let swapped = crate::sched::set_current_user_thread(Some(Arc::clone(&extra)));
+                let as_extra = (|| {
+                    kassert_eq!(call(general::__NR_getpgrp, 0, 0), u64::from(pid));
+                    kassert_eq!(call(general::__NR_getpgid, 0, 0), u64::from(pid));
+                    kassert_eq!(call(general::__NR_getsid, 0, 0), u64::from(pid));
+                    Ok(())
+                })();
+                let back = crate::sched::set_current_user_thread(swapped);
+                kassert_eq!(back.is_some_and(|b| Arc::ptr_eq(&b, &extra)), true);
+                as_extra
+            })();
+            process::remove_ktest_thread(&extra);
+            checked
         })?
     }
 );

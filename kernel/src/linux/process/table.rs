@@ -104,6 +104,18 @@ impl ProcTable {
     pub(super) fn has_extra_threads(&self, pid: u32) -> bool {
         !self.tree.threads(pid).is_empty()
     }
+    pub(super) fn setsid(&mut self, caller: u32) -> Result<u32, u32> {
+        self.tree.setsid(caller).map_err(tree_errno)
+    }
+    pub(super) fn setpgid(&mut self, caller: u32, pid: i32, pgid: i32) -> Result<(), u32> {
+        self.tree.setpgid(caller, pid, pgid).map_err(tree_errno)
+    }
+    pub(super) fn getpgid(&self, caller: u32, pid: i32) -> Result<u32, u32> {
+        self.tree.getpgid(caller, pid).map_err(tree_errno)
+    }
+    pub(super) fn getsid(&self, caller: u32, pid: i32) -> Result<u32, u32> {
+        self.tree.getsid(caller, pid).map_err(tree_errno)
+    }
     #[cfg(feature = "ktest")]
     pub(super) fn is_busy(&self, tid: u32) -> bool {
         self.tree.is_busy(tid)
@@ -450,25 +462,15 @@ impl ProcTable {
             }
             return Ok(());
         }
-        let group = if pid == 0 {
-            self.tree.getpgid(caller, 0).ok()
-        } else if pid < -1 {
-            Some(pid.unsigned_abs())
+        let targets: Vec<_> = if pid == -1 {
+            self.procs.iter().filter(|&(&id, _)| id != INIT_PID && id != caller).map(|(_, p)| Arc::clone(p)).collect()
         } else {
-            None
+            let pgid = if pid == 0 { self.tree.pgid(caller).expect("live caller") } else { pid.unsigned_abs() };
+            self.tree
+                .pgrp_members(pgid)
+                .map(|id| Arc::clone(self.procs.get(&id).expect("pgrp member in PROCS")))
+                .collect()
         };
-        let mut targets = Vec::new();
-        for (&id, process) in &self.procs {
-            let matches = if pid == -1 {
-                id != INIT_PID && id != caller
-            } else {
-                self.tree.getpgid(caller, id as i32).ok() == group
-            };
-            if !matches {
-                continue;
-            }
-            targets.push(Arc::clone(process));
-        }
         if targets.is_empty() {
             return Err(errno::ESRCH);
         }
