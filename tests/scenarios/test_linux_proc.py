@@ -144,6 +144,7 @@ def test_fork_wait_and_exit_status(boot, tmp_path):
         "clone-shared-resources",
         "fork-inherited-state",
         "rusage",
+        "wait-pgrp",
     ):
         assert f"ok {check}\n" in out, out
     assert re.search(r"linux: /usr/local/bin/m8_proc exit=0 leaked_frames=0\b", out), out
@@ -386,5 +387,25 @@ def test_pthread_create_and_join(boot, tmp_path):
         )
         if attempt:
             assert int(done[1]) == 0
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_sessions_and_process_groups(boot, tmp_path):
+    """C8: setsid, setpgid, getpgid, getsid, getpgrp, kill(-pgid) and group waits."""
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    warm_up(m)
+    out = run(m, f"linux {PROC} sessions", 120)
+    assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+        "setsid-and-inheritance",
+        "setpgid-success-and-zombie",
+        "setpgid-errnos-and-exec",
+        "nonleader-tid-esrch",
+        "kill-process-group",
+        "wait-pgrp",
+    ], out
+    assert re.search(rf"linux: {PROC} exit=0 leaked_frames=0\b", out), out
+    assert "FAIL" not in out, out
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS

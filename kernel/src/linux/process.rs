@@ -1331,6 +1331,31 @@ pub fn waitid_request(idtype: i32, id: i32, options: u32) -> Result<lumen_proc::
     PROCS.lock().waitid_request(current_process().pid(), idtype, id, options)
 }
 
+/// Start a new session and process group led by the caller; returns the new sid.
+/// C9 clears `SignalState::ctty` here once controlling terminals exist.
+pub fn setsid() -> Result<u32, u32> {
+    let caller = current_process().pid();
+    PROCS.lock().setsid(caller)
+}
+
+/// Move `pid` (0: caller) into process group `pgid` (0: target's pid).
+pub fn setpgid(pid: i32, pgid: i32) -> Result<(), u32> {
+    let caller = current_process().pid();
+    PROCS.lock().setpgid(caller, pid, pgid)
+}
+
+/// Return the process group of `pid` (0: caller).
+pub fn getpgid(pid: i32) -> Result<u32, u32> {
+    let caller = current_process().pid();
+    PROCS.lock().getpgid(caller, pid)
+}
+
+/// Return the session id of `pid` (0: caller).
+pub fn getsid(pid: i32) -> Result<u32, u32> {
+    let caller = current_process().pid();
+    PROCS.lock().getsid(caller, pid)
+}
+
 /// Wait for a matching child state change; WNOHANG returns None. A reap
 /// removes both tree and process-table entries before user copyout, even
 /// when that copy faults. No process lock is held while sleeping.

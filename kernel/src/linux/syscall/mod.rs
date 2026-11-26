@@ -303,7 +303,7 @@ pub fn dispatch(frame: &mut SyscallFrame) -> SyscallReturn {
         }
         Ok(general::__NR_getppid) => task::sys_getppid(frame),
         Ok(general::__NR_getpgrp) => {
-            frame.rax = u64::from(current_process().pid());
+            frame.rax = task::sys_getpgrp();
             SyscallReturn::Sysret
         }
         Ok(general::__NR_arch_prctl) => {
