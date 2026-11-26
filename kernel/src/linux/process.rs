@@ -805,8 +805,10 @@ pub fn prepare_exec_files() -> Result<PreparedFiles, u32> {
     Ok(PreparedFiles(Arc::new(Files::prepare_exec().map_err(|e| e.to_errno())?)))
 }
 
-/// Install a prepared private table without allocation. The exclusive lease
-/// waits for open reservations to finish, with no spinlock held.
+/// Copy descriptors using reserved storage, then retire the old table.
+/// The copy does not allocate; retirement may allocate its drain vector if
+/// the last other sharer has left. No page-table or frame-allocator lock is
+/// held. The exclusive lease waits for reservations without spinlocks held.
 pub fn commit_unshare(prepared: PreparedFiles) {
     let process = current_process();
     let access = process.files_access.write();
@@ -4190,6 +4192,65 @@ fn ktest_exec() -> u64 {
     crate::user::copy_to_user(KTEST_USER_VA, b"/tmp/c3-exec\0").expect("exec path");
     hazard_call(general::__NR_execve, KTEST_USER_VA, 0, 0, 0)
 }
+
+crate::ktest!(
+    fn exec_reserves_private_files_before_teardown() {
+        use crate::{kassert, kassert_eq};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        for with_sibling in [false, true] {
+            in_test_process(move |_| {
+                let process = current_process();
+                let old_mm = process.address_space().unwrap();
+                let old_files = process.files.lock().clone().unwrap();
+                // Positive control: the same ELF, argv and env load under
+                // this threshold. Files' 1024-slot reservation is larger.
+                let exec = crate::linux::exec::Exec::from_path("/tmp/c3-exec").map_err(|_| "plan")?;
+                crate::mm::heap::refuse_from(16 * 1024);
+                let loaded = exec.load(&[b""], &[], b"/tmp/c3-exec");
+                crate::mm::heap::refuse_from(usize::MAX);
+                loaded.map_err(|_| "load below Files threshold")?.0.teardown();
+
+                let finish = Arc::new(VforkDone::new());
+                let sibling = if with_sibling {
+                    let done = Arc::clone(&finish);
+                    let (thread, parked) = ktest_sibling(move || {
+                        done.wait();
+                        record_thread_exit(UserExit::Exited(0));
+                    })?;
+                    let handle = parked.start();
+                    while handle.thread().state() != sched::State::Blocked {
+                        sched::yield_now();
+                    }
+                    Some((thread, handle))
+                } else {
+                    None
+                };
+                let users_before = old_files.users();
+                let threads_before = process.live_threads.load(Ordering::SeqCst);
+                crate::mm::heap::refuse_from(16 * 1024);
+                let ret = ktest_exec();
+                crate::mm::heap::refuse_from(usize::MAX);
+                let threads_after = process.live_threads.load(Ordering::SeqCst);
+                let sibling_killed = sibling.as_ref().is_some_and(|(_, h)| h.thread().fatal_pending());
+                // Clean up before asserting, including if a mutant ran exec.
+                finish.complete();
+                if let Some((_, handle)) = sibling {
+                    handle.join();
+                }
+                kassert_eq!(users_before, 1);
+                kassert_eq!(threads_before, 1 + usize::from(with_sibling));
+                kassert_eq!(ret as i64, -i64::from(errno::ENOMEM));
+                kassert_eq!(threads_after, threads_before);
+                kassert!(!sibling_killed);
+                kassert_eq!(process.signal.lock().exec_waiter, None);
+                kassert!(Arc::ptr_eq(&old_mm, &process.address_space().unwrap()));
+                kassert!(Arc::ptr_eq(&old_files, &process.files.lock().clone().unwrap()));
+                Ok(())
+            })??;
+        }
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn exec_unshares_files_after_a_sibling_clones_and_exits() {

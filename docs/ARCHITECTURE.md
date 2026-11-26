@@ -5246,8 +5246,8 @@ untouched):
    The segments stay copied into private frames (M7's loader), not mapped
    from the page cache: that keeps an executable's pages out of the `ext4`
    cache's 64 MiB hard limit (#344: a file-backed loader would pin about
-   32 MiB of `cc1plus` while it runs). Everything step 6 needs is
-   allocated here too: the new `exe_path` string, and an empty table for
+   32 MiB of `cc1plus` while it runs). Replacement-image and descriptor-copy
+   storage is allocated here too: the new `exe_path` string, and an empty table for
    an unshared `Files` (its 1024 slots), unconditionally. A sibling can
    clone a `CLONE_FILES` process and exit between observations of
    `files.users()` and `live_threads`; observing 1 for both separately
@@ -5257,8 +5257,10 @@ untouched):
    unshares files after ending sibling threads. Multithreaded exec succeeds;
    group exit or a competing exec refuses it with `-EAGAIN`. `prepare_exec` packages
    the new mm, identity, task name and `PreparedFiles` token into `PreparedExec`.
-6. The point of no return: C2's `commit_exec` is infallible; all storage
-   was prepared in step 5. C3 extends the single-thread boundary below:
+6. The point of no return: `commit_exec` has no recoverable error;
+   replacement-image and descriptor-copy storage was prepared in step 5.
+   Retiring the old descriptor table may still allocate, as described below.
+   C3 extends the single-thread boundary below:
    - **`de_thread` (C3).** Under `signal`: if `group_exit` or another
      `exec_waiter` is set, `-EAGAIN` (Linux's `de_thread`: a concurrent
      exec or a group exit wins). Else set `exec_waiter` to the caller's
@@ -5306,6 +5308,12 @@ untouched):
      can now create a new sharer; if the sole user is this process, no
      other process can share its table either. The exclusive `files_access`
      lease waits for reservations without spinlocks held.
+     The descriptor copy itself does not allocate. If the other sharer exits
+     between the sharing decision and `Files::leave`, exec becomes the old
+     table's last member: `FdTable::drain_all` may allocate its output vector
+     under the table's leaf lock. This is legal there because no page-table
+     or frame-allocator lock is held; retirement retains that existing
+     infallible allocation behavior rather than reporting a recoverable error.
      Then release the parent, so it cannot change the child's old shared table
      while the child is still copying or closing it.
    - Install the new space: with interrupts off, as
@@ -5321,7 +5329,8 @@ untouched):
      `finish_exec` also resets handled signals to default, keeping ignored
      dispositions, masks and pending queues, and clears the alternate stack
      and fault/frame_failure diagnostics. Reset FPU, `fs_base` and
-     `restart_block`. C2's commit is infallible: all allocations precede it.
+     `restart_block`. There is no recoverable failure after commit starts;
+     this does not imply allocation-free retirement of the old resources.
    - Timers (C13): delete the POSIX timers and drop every queued
      `SI_TIMER` signal (Linux's `posixtimer_exec`: `posixtimer_delete_timers`
      and `flush_itimer_signals`); `ITIMER_REAL` survives (an `alarm`
@@ -8725,7 +8734,8 @@ file description had one thread (M7) and becomes possible once threads,
    allocating. Membership ends before reaping can recycle the pid, and a
    new lock on this inode needs the inode lock already held. After unshare,
    locks still follow the pid into the new table; Linux keeps them with the
-   old files_struct (C3 will change the ownership key). The `EDEADLK`
+   old files_struct. This pid-keyed ownership after unshare remains a
+   documented deviation. The `EDEADLK`
    records move to the waiting thread: B8 changes lumen-vfs's
    `PosixWaitGraph` to key a record by `Waiter { tgid, tid }` and to follow,
    from a holding process, the record of its lowest-numbered waiting
@@ -11068,6 +11078,13 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
     thread remains but two processes share the table, then exec succeeds
     with a private table; its CLOEXEC close leaves the child's descriptor
     open. Storage is reserved before teardown even if initially unshared.
+  - `ktest:lumen_kernel::linux::process::exec_reserves_private_files_before_teardown`:
+    first load the same ELF under an allocation-refusal threshold below
+    the Files reservation size. Then exec with `files.users() == 1`
+    must fail with `ENOMEM`, both with one thread and with a waiting sibling;
+    the mm, Files and sibling remain intact. Restoring the pre-teardown
+    private-files shortcut fails the errno assertion rather than being
+    hidden by the late-clone test's seam.
   - `ktest:lumen_kernel::linux::process::de_thread_fatal_send_during_wait_refuses_and_clears_waiter`:
     hold sibling teardown, confirm the exec caller is waiting, and send
     it `SIGKILL`. Pause at `EXEC_WAKE_DELAY` after that wait and let the

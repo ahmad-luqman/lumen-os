@@ -173,3 +173,8 @@ tests = [
     "ktest:lumen_kernel::linux::process::de_thread_fatal_send_during_wait_refuses_and_clears_waiter",
     "cargo:lumen-proc",
 ]
+
+[[feature]]
+name = "C3 exec reserves Files copy storage even for an initially private table"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::exec_reserves_private_files_before_teardown"]
