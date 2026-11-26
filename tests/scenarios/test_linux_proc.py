@@ -187,3 +187,24 @@ def test_exec_uses_unseeded_random_fallback(boot, tmp_path):
     assert not any("AT_RANDOM:" in line for line in second.logs), second.logs
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_futex_timeouts_and_nanosleep(boot, tmp_path):
+    """C4: backing keys, queued wakes/requeues, robust recovery and time floors."""
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    out = run(m, f"linux {PROC} futex", 180)
+    assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+        "futex-errors-and-demand",
+        "futex-and-sleep-floors",
+        "futex-wakes-requeues-bitsets",
+        "futex-keys-across-fork",
+        "futex-private-file-cow",
+        "futex-robust-owner-death",
+        "futex-clear-child-tid-exit-exec",
+        "futex-robust-exec",
+    ], out
+    assert f"linux: {PROC} exit=0 " in out, out
+    assert "FAIL" not in out, out
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

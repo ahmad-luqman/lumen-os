@@ -699,6 +699,8 @@ pub struct UserThread {
     process: Arc<Process>,
     /// `set_tid_address`'s pointer (M8: `CLONE_CHILD_CLEARTID`'s too).
     clear_child_tid: AtomicU64,
+    /// The registered robust-list head, cleared at exec and exit.
+    pub(crate) robust_list: AtomicU64,
     /// Its scheduler thread's id (`sched::threads()`' id).
     kernel_thread: AtomicU64,
     /// Shared notification target: bound before a real thread becomes runnable.
@@ -713,6 +715,7 @@ impl UserThread {
             tid: AtomicU32::new(0),
             process,
             clear_child_tid: AtomicU64::new(0),
+            robust_list: AtomicU64::new(0),
             kernel_thread: AtomicU64::new(0),
             kernel_handle: Arc::new(SpinLock::new(Weak::new())),
             synthetic: false,
@@ -1022,8 +1025,8 @@ fn warn_due(last: Option<u64>, now: u64) -> bool {
 /// running thread has no Linux process (or is a kernel thread). The process
 /// must have no other thread. The design's exit steps 2 and 3, then the
 /// tree:
-/// 1. store zero to clear_child_tid if the mm has another process user
-///    (C4 adds the futex wake), then take its `Arc<UserThread>` out of scheduler state,
+/// 1. release robust futexes, then clear and wake clear_child_tid if the mm
+///    has another process user; take its `Arc<UserThread>` out of scheduler state,
 ///    and its CPU leaves the address space (`sched::detach_user_space`:
 ///    `CR3` back on the kernel's tables); complete_vfork then releases its parent;
 /// 2. in one `PROCS` hold it leaves `PROCS` (and its process's signal
@@ -1037,9 +1040,11 @@ fn warn_due(last: Option<u64>, now: u64) -> bool {
 ///    releases it; an exit the heap refuses is retried, every millisecond.
 pub fn take_current() -> Ended {
     let current = current_thread();
+    super::futex::exit_robust_list(&current);
     let clear = current.clear_child_tid();
     if clear != 0 && sched::current_address_space().is_some_and(|mm| mm.users() > 1) {
         let _ = crate::user::copy_to_user(clear, &0u32.to_ne_bytes());
+        let _ = super::futex::wake(clear, false, 1, lumen_futex::FUTEX_BITSET_MATCH_ANY);
     }
     drop(current);
     let thread = sched::set_current_user_thread(None).expect("no Linux process to take down after ring-3 exit");

@@ -431,6 +431,7 @@ dependencies = [
  "lumen-demo",
  "lumen-elf",
  "lumen-font",
+ "lumen-futex",
  "lumen-gfx",
  "lumen-heap",
  "lumen-input",

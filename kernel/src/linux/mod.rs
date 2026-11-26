@@ -7,6 +7,7 @@
 //! one canonical ABI surface.
 
 pub mod exec;
+pub mod futex;
 mod init;
 pub mod modules;
 pub mod process;

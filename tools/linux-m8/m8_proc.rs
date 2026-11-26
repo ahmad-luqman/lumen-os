@@ -13,6 +13,7 @@
 #[macro_use]
 mod common;
 mod exec;
+mod futex;
 mod signals;
 
 use core::ffi::c_int;
@@ -26,6 +27,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     let (args, n) = unsafe { common::args(argc, argv) };
     match &args[..n] {
         [_, b"fork-wait"] => fork_wait(),
+        [_, b"futex"] => futex::run(),
         [_, b"fork-exec"] => exec::run(),
         [_, b"exec-exit", ..] => exec::child_exit(),
         [_, b"exec-hold"] => exec::child_hold(),

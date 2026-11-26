@@ -1442,6 +1442,32 @@ impl AddressSpace {
         self.inner.lock().vmas.find(addr).is_some()
     }
 
+    /// Snapshot a resident shared futex's backing under Lock 1. `None`
+    /// requests a writable fault before retrying a private file's cache page.
+    pub(crate) fn futex_key(&self, addr: u64) -> Result<Option<crate::linux::futex::FutexKey>, u32> {
+        use crate::linux::futex::FutexKey;
+        let inner = self.inner.lock();
+        let vma = inner.vmas.find(addr).ok_or(errno::EFAULT)?;
+        let WalkEnd::Mapped(leaf) = paging::walk_user(self.root, VirtAddr::new(addr).ok_or(errno::EFAULT)?).end()
+        else {
+            return Err(errno::EFAULT);
+        };
+        if !leaf.user || vma.prot.is_none() {
+            return Err(errno::EFAULT);
+        }
+        let key = match vma.backing {
+            Backing::File(file) if !file.shared && vma.prot.write() && leaf.shared => return Ok(None),
+            Backing::File(file) if leaf.shared => {
+                FutexKey::File { file_id: file.file_id, offset: file.offset + addr - vma.start }
+            }
+            Backing::Anonymous { shared: true } => {
+                FutexKey::SharedFrame { frame: leaf.phys.as_u64(), offset: addr % PAGE_SIZE }
+            }
+            _ => FutexKey::Anon { space: self.root.as_u64(), uaddr: addr },
+        };
+        Ok(Some(key))
+    }
+
     /// Resolve a demand-paging `#PF` at `fault_addr` with CPU `error_code`.
     ///
     /// Must be called with interrupts enabled and `irq::depth() == 0` (step 3
