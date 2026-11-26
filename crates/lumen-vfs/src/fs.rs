@@ -165,6 +165,7 @@ pub trait VfsInode: Send + Sync {
     fn lookup(&self, name: &[u8]) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn create(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError>;
+    fn mknod(&self, name: &[u8], inode_type: InodeType, mode: u16, rdev: DevId) -> Result<Arc<dyn VfsInode>, VfsError>;
     fn unlink(&self, name: &[u8]) -> Result<(), VfsError>;
     fn rmdir(&self, name: &[u8]) -> Result<(), VfsError>;
     fn link(&self, name: &[u8], target: &Arc<dyn VfsInode>) -> Result<(), VfsError>;

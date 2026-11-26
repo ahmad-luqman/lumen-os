@@ -411,3 +411,12 @@ milestone = "M8"
 tests = [
     "ktest:lumen_kernel::linux::process::open_reservation_survives_until_install",
 ]
+
+[[feature]]
+name = "M8 `mknod`/`mknodat` creates FIFOs and empty regular files on tmpfs and ext4 (`mknod_at`, `VfsInode::mknod`), rejects unsupported types before path lookup and devfs/read-only mounts with `EROFS`, and leaves ext4 images e2fsck-clean (#386, C7)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::linux::syscall::fd::fifo_reopen_during_a_blocked_read_reaches_that_reader",
+    "scenario:test_linux_io::test_pipes_and_poll",
+]

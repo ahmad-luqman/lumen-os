@@ -30,14 +30,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use lumen_vfs::{
-    AccessMask, AtFlags, InodeType, Metadata, OpenFlags, Opened, RenameFlags, ResolveFlags, ResolvedPath, Timespec,
-    VfsError, VfsInode, link_at, mkdir_at, open_inode_guarded, readlink_at, rename_at2, resolve_path, symlink_at,
-    unlink_at,
+    AccessMask, AtFlags, DevId, InodeType, Metadata, OpenFlags, Opened, RenameFlags, ResolveFlags, ResolvedPath,
+    Timespec, VfsError, VfsInode, link_at, mkdir_at, mknod_at, open_inode_guarded, readlink_at, rename_at2,
+    resolve_path, symlink_at, unlink_at,
 };
 
 use crate::vfs::tables;
 
-use crate::linux::process::{self, FileRef};
+use crate::linux::process::{self, IoFile};
 use crate::linux::{errno, general};
 use crate::user::{CopyError, copy_cstr_from_user};
 
@@ -86,10 +86,11 @@ impl Fd {
         self.0
     }
 
-    /// The current process's open file on this descriptor (a clone), or
-    /// `EBADF`: every handler's descriptor lookup.
-    pub(super) fn file(self) -> Result<FileRef, u32> {
-        process::current_file(self.0).ok_or(errno::EBADF)
+    /// The current process's open file on this descriptor (an in-flight I/O
+    /// reference raising `KernelFile::io_refs`), or `EBADF`: every handler's
+    /// descriptor lookup.
+    pub(super) fn file(self) -> Result<IoFile, u32> {
+        process::current_io_file(self.0).ok_or(errno::EBADF)
     }
 }
 
@@ -279,6 +280,20 @@ impl Start {
     pub(super) fn mkdir(&self, path: &UserPath, mode: Mode) -> Result<Arc<dyn VfsInode>, u32> {
         let umask = process::current_umask();
         mkdir_at(tables(), self.dir(), path.as_bytes(), mode.dir_perm(), umask).map_err(VfsError::to_errno)
+    }
+
+    /// `mknod_at` from this start (`mknodat`): `mode`'s permission bits, less
+    /// the process's umask.
+    pub(super) fn mknod(
+        &self,
+        path: &UserPath,
+        inode_type: InodeType,
+        mode: Mode,
+        rdev: DevId,
+    ) -> Result<Arc<dyn VfsInode>, u32> {
+        let umask = process::current_umask();
+        mknod_at(tables(), self.dir(), path.as_bytes(), inode_type, mode.perm(), umask, rdev)
+            .map_err(VfsError::to_errno)
     }
 
     /// `unlink_at` from this start (`unlinkat`; `remove_dir` for

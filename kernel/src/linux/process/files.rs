@@ -298,7 +298,6 @@ pub struct ReservedFd {
 
 impl ReservedFd {
     /// The reserved descriptor number (not open until installed).
-    #[cfg(feature = "ktest")]
     pub fn fd(&self) -> i32 {
         self.reservation.as_ref().expect("unconsumed reservation").fd()
     }

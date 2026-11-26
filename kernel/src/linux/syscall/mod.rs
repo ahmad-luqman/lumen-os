@@ -101,7 +101,7 @@ const IO_CHUNK: usize = 512;
 /// Cap total bytes processed in a single read/write-family call (`read`,
 /// `write`, `readv`, `writev`, `pread64`, `pwrite64`) so one syscall cannot
 /// monopolize a CPU indefinitely.
-const MAX_SINGLE_IO: usize = 1024 * 1024;
+pub(crate) const MAX_SINGLE_IO: usize = 1024 * 1024;
 
 /// Default open-file rlimit advertised by M6 `prlimit64`.
 const DEFAULT_RLIMIT_NOFILE: u64 = 1024;

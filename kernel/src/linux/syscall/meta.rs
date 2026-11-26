@@ -24,7 +24,7 @@ use super::at::{self, Dirfd, Fd, Mode, UserPath, UserPtr};
 use super::fd::vfs;
 use super::finish;
 use crate::linux::errno;
-use crate::linux::process::{FileRef, swap_current_umask};
+use crate::linux::process::{IoFile, swap_current_umask};
 use crate::user::{CopyError, copy_from_user};
 use crate::vfs::tables;
 
@@ -43,7 +43,7 @@ fn lookup(dirfd: Dirfd, path: UserPtr, flags: AtFlags) -> Result<Arc<dyn VfsInod
 /// The open file on `fd` for a change through it: `-EBADF` if it isn't
 /// open or is `O_PATH` (Linux's `fdget`). Held for the change, so the
 /// inode stays open meanwhile.
-fn open_file(fd: Fd) -> Result<FileRef, u32> {
+fn open_file(fd: Fd) -> Result<IoFile, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
     Ok(file)

@@ -23,7 +23,7 @@ use lumen_vfs::{MAX_FDS, PollGuard, PollMask, PollWaker};
 use super::at::{FromReg, UserPtr, reg};
 use super::fd::current_io;
 use super::{DEFAULT_RLIMIT_NOFILE, copy_pod_from_user, copy_pod_to_user, finish};
-use crate::linux::process::{self, ConsoleIo, FileRef};
+use crate::linux::process::{self, ConsoleIo, IoFile, KernelFile};
 use crate::linux::signal::{RestartBlock, interrupted_with};
 use crate::linux::{errno, general};
 use crate::sched;
@@ -272,7 +272,7 @@ fn wait_ready(
 
 /// Read the current readiness of an open, non-`O_PATH` descriptor, subscribing
 /// `waker` when provided and pushing any returned [`PollGuard`] onto `guards`.
-fn poll_file(file: &FileRef, waker: Option<&Arc<dyn PollWaker>>, guards: &mut Vec<PollGuard>) -> PollMask {
+fn poll_file(file: &KernelFile, waker: Option<&Arc<dyn PollWaker>>, guards: &mut Vec<PollGuard>) -> PollMask {
     static WARNED_NO_GUARD: AtomicBool = AtomicBool::new(false);
     match file.inode().pollable() {
         Some(pollable) => {
@@ -459,7 +459,7 @@ fn run_poll(fds_ptr: u64, nfds: u32, timeout: WaitTimeout, restartable: bool) ->
         .collect();
 
     let polled_fds: Vec<i32> = entries.iter().map(|e| e.fd).collect();
-    let files = process::current_files(&polled_fds);
+    let files = process::current_io_files(&polled_fds);
     let has_readable_tty = entries
         .iter()
         .zip(&files)
@@ -612,7 +612,7 @@ fn run_select(
         want_r: bool,
         want_w: bool,
         want_x: bool,
-        file: FileRef,
+        file: IoFile,
     }
 
     let mut wanted_fds: Vec<i32> = Vec::new();
@@ -627,7 +627,7 @@ fn run_select(
         }
     }
 
-    let raw_files = process::current_files(&wanted_fds);
+    let raw_files = process::current_io_files(&wanted_fds);
     let mut entries = Vec::with_capacity(wanted_fds.len());
     let mut has_readable_tty = false;
     for ((fd, (want_r, want_w, want_x)), file) in wanted_fds.into_iter().zip(flags).zip(raw_files) {
@@ -1071,6 +1071,7 @@ mod ktest_pollable {
 
 crate::ktest!(
     fn poll_masks_of_each_file_kind() {
+        use super::at;
         use super::fd::{ktest_install_file, ktest_open, ktest_unlink};
         use super::mem::sys_mprotect;
         use super::neg_errno;
@@ -1142,6 +1143,44 @@ crate::ktest!(
             for (i, (_, _, want)) in cases.iter().enumerate() {
                 kassert_eq!((i, got[i]), (i, *want));
             }
+
+            // C7: pipe readiness rows (empty -> OUT only, data -> IN | OUT,
+            // closed write end with data -> IN | HUP, drained -> HUP, closed
+            // read end -> OUT | ERR).
+            let pipe_fds_va = base + 1536;
+            kassert_eq!(super::pipe::sys_pipe(UserPtr::from_reg(pipe_fds_va)), 0);
+            // SAFETY: `[i32; 2]` is 8 bytes with no padding.
+            let p1 = unsafe { copy_pod_from_user::<[i32; 2]>(pipe_fds_va) }.map_err(|_| "read pipe1")?;
+            let (pr1, pw1) = (p1[0], p1[1]);
+            write_pollfds(fds_va, &[(pr1, all_ev), (pw1, all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 2, 0), 1);
+            kassert_eq!(read_revents(fds_va, 2)?, alloc::vec![0, out_only]);
+
+            copy_to_user(base + 1568, b"ping").map_err(|_| "write pipe payload")?;
+            kassert_eq!(super::fd::sys_write(at::reg(pw1 as u64), UserPtr::from_reg(base + 1568), 4), 4);
+            write_pollfds(fds_va, &[(pr1, all_ev), (pw1, all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 2, 0), 2);
+            kassert_eq!(read_revents(fds_va, 2)?, alloc::vec![in_only, out_only]);
+
+            kassert_eq!(super::fd::sys_close(at::reg(pw1 as u64)), 0);
+            write_pollfds(fds_va, &[(pr1, all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 1, 0), 1);
+            kassert_eq!(read_revents(fds_va, 1)?[0], in_only | PollMask::HUP.bits());
+
+            kassert_eq!(super::fd::sys_read(at::reg(pr1 as u64), UserPtr::from_reg(base + 1568), 4), 4);
+            write_pollfds(fds_va, &[(pr1, all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 1, 0), 1);
+            kassert_eq!(read_revents(fds_va, 1)?[0], PollMask::HUP.bits());
+            kassert_eq!(super::fd::sys_close(at::reg(pr1 as u64)), 0);
+
+            kassert_eq!(super::pipe::sys_pipe(UserPtr::from_reg(pipe_fds_va)), 0);
+            // SAFETY: `[i32; 2]` is 8 bytes with no padding.
+            let p2 = unsafe { copy_pod_from_user::<[i32; 2]>(pipe_fds_va) }.map_err(|_| "read pipe2")?;
+            kassert_eq!(super::fd::sys_close(at::reg(p2[0] as u64)), 0);
+            write_pollfds(fds_va, &[(p2[1], all_ev)])?;
+            kassert_eq!(sys_poll(fds_va, 1, 0), 1);
+            kassert_eq!(read_revents(fds_va, 1)?[0], out_only | PollMask::ERR.bits());
+            kassert_eq!(super::fd::sys_close(at::reg(p2[1] as u64)), 0);
 
             // `sys_poll` decodes `nfds` from the low 32 bits (upper bits ignored).
             write_pollfds(fds_va, &[(reg_fd.raw(), PollMask::IN.bits())])?;
@@ -1623,6 +1662,55 @@ crate::ktest!(
 
             kassert_eq!(sys_mprotect(ro_page, 4096, u64::from(general::PROT_READ | general::PROT_WRITE)), 0);
             kassert_eq!(test_inode.subscriber_count(), 0);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn poll_wakes_on_a_pipe_write() {
+        use super::at;
+        use crate::kassert_eq;
+        use ktest_pollable::{read_revents, wait_for, write_pollfds};
+
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            let base = process::KTEST_USER_VA;
+            let pair_va = base + 512;
+            let fds_va = base + 544;
+            let buf_va = base + 608;
+
+            kassert_eq!(super::pipe::sys_pipe(UserPtr::from_reg(pair_va)), 0);
+            // SAFETY: `[i32; 2]` is 8 bytes with no padding.
+            let pair = unsafe { copy_pod_from_user::<[i32; 2]>(pair_va) }.map_err(|_| "read pipe fds")?;
+            let (r_fd, w_fd) = (pair[0], pair[1]);
+            let pipe = process::current_file(r_fd).and_then(|f| f.pipe().cloned()).ok_or("pipe object missing")?;
+
+            // 1. Blocked `poll` on an empty read end wakes when the write end writes.
+            write_pollfds(fds_va, &[(r_fd, (PollMask::IN | PollMask::RDNORM).bits())])?;
+            let waiter = process::spawn_test_thread(move |_| sys_poll(fds_va, 1, (-1i64) as u64))?;
+            wait_for(|| pipe.subscriber_count() == 1 && waiter.blocked())?;
+
+            copy_to_user(buf_va, b"wake").map_err(|_| "write payload")?;
+            kassert_eq!(super::fd::sys_write(at::reg(w_fd as u64), UserPtr::from_reg(buf_va), 4), 4);
+            kassert_eq!(waiter.join()?, 1);
+            kassert_eq!(read_revents(fds_va, 1)?[0], (PollMask::IN | PollMask::RDNORM).bits());
+            kassert_eq!(pipe.subscriber_count(), 0);
+
+            // Drain so the pipe is empty again.
+            kassert_eq!(super::fd::sys_read(at::reg(r_fd as u64), UserPtr::from_reg(buf_va), 4), 4);
+
+            // 2. Blocked `poll` on an empty read end wakes with `POLLHUP` when
+            //    the last write end closes.
+            write_pollfds(fds_va, &[(r_fd, PollMask::IN.bits())])?;
+            let hup_waiter = process::spawn_test_thread(move |_| sys_poll(fds_va, 1, (-1i64) as u64))?;
+            wait_for(|| pipe.subscriber_count() == 1 && hup_waiter.blocked())?;
+
+            kassert_eq!(super::fd::sys_close(at::reg(w_fd as u64)), 0);
+            kassert_eq!(hup_waiter.join()?, 1);
+            kassert_eq!(read_revents(fds_va, 1)?[0], PollMask::HUP.bits());
+            kassert_eq!(pipe.subscriber_count(), 0);
+
+            kassert_eq!(super::fd::sys_close(at::reg(r_fd as u64)), 0);
             Ok(())
         })?
     }

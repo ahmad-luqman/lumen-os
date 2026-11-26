@@ -7,7 +7,7 @@ import re
 
 from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
-from lumen_harness.rootfs import copy_rootfs
+from lumen_harness.rootfs import copy_rootfs, e2fsck_check
 from lumen_harness.shell import run
 
 BOOT_TIMEOUT = 60
@@ -106,3 +106,40 @@ def test_poll_and_select_on_console(boot, tmp_path):
 
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_pipes_and_poll(boot, tmp_path):
+    """M8 C7 ring-3 check of pipes, FIFOs, `dup`/`dup2`/`dup3`, `O_CLOEXEC`,
+    `SIGPIPE`, `F_SETPIPE_SZ`, `FIONREAD`, `posix_spawn`, `fork`'s `inc_fd_ref`
+    for pipes and `flock`, `mknodat` errno rows, and an ext4 FIFO checked with
+    host `e2fsck -fn`."""
+    disk = copy_rootfs(tmp_path)
+    m = boot_shell(boot, devices=Devices(blk_image=disk, rng=True))
+
+    start = len(m.output)
+    m.send_line(f"linux {M8_IO} pipes")
+
+    for check in (
+        "busybox_pipeline",
+        "pipe_buf_atomicity",
+        "eof_fionread_and_sigpipe",
+        "nonblock_and_setpipe_sz",
+        "dup_redirections",
+        "fifo_open_rules_and_poll",
+        "posix_spawn_cloexec",
+        "fork_inc_fd_ref",
+        "mknodat_and_ext4_fifo",
+    ):
+        m.expect(re.compile(rf"^ok {check}\r?$", re.MULTILINE), 30)
+
+    m.expect(rf"linux: {re.escape(M8_IO)} exit=0 leaked_frames=-?\d+\n", 20)
+    m.expect(r"lumen> ", 10)
+    assert CRASH_BEGIN not in m.output[start:]
+
+    run(m, "sync")
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+    # Confirm the ext4 FIFO created (and the second one unlinked) on the rootfs
+    # leave an e2fsck-clean ext4 image.
+    e2fsck_check(disk)

@@ -432,6 +432,13 @@ pub fn send_process_checked(pid: i32, info: Result<Option<SigInfo>, u32>, sender
     PROCS.lock().send_process(caller, pid, info, sender)
 }
 
+/// Queue a standard signal on the calling thread (`SIGPIPE` from `pipe_write`),
+/// honouring `SIG_IGN` and the thread's blocked mask (Linux `send_sig`).
+pub fn send_current_signal(sig: Signal) {
+    let me = current_thread();
+    let _ = me.process().signal.lock().send(Some(me.tid()), SigInfo::new(sig, 0), SenderClass::SiUser);
+}
+
 crate::ktest!(
     fn signal_send_refuses_unlinked_tid_and_discards_ignored_pending() {
         use crate::{kassert, kassert_eq};

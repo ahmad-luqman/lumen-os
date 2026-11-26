@@ -17,7 +17,7 @@ use super::{MAX_SINGLE_IO, finish};
 use crate::linux::errno;
 #[cfg(feature = "ktest")]
 use crate::linux::general;
-use crate::linux::process::FileRef;
+use crate::linux::process::IoFile;
 use crate::user::{copy_to_user, user_range_valid};
 use lumen_vfs::{InodeType, OpenFlags, VfsInode};
 
@@ -40,7 +40,7 @@ fn nonnegative(offset: u64) -> Result<u64, u32> {
 /// open or is `O_PATH`, `ESPIPE` if it has no position (a terminal; a FIFO
 /// or socket node, which ext4 can hold). Before the access mode's check, so
 /// a `pread64` on the write-only fd 1 is `ESPIPE`, not `EBADF`.
-fn positional_file(fd: Fd) -> Result<FileRef, u32> {
+fn positional_file(fd: Fd) -> Result<IoFile, u32> {
     let file = fd.file()?;
     file.require_non_path().map_err(vfs)?;
     if file.inode().is_tty() || matches!(file.inode().inode_type(), InodeType::Fifo | InodeType::Socket) {

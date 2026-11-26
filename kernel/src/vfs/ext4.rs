@@ -1700,12 +1700,18 @@ pub struct Ext4Inode {
     /// A listing found the directory's records and `ReadDir` disagreeing,
     /// or a malformed record, and said so (once).
     warned_bad_listing: AtomicBool,
+    /// FIFO pipe attachment slot (present iff `inode_type == InodeType::Fifo`).
+    fifo: Option<alloc::boxed::Box<crate::linux::pipe::FifoSlot>>,
     meta: SleepMutex<Ext4InodeMeta>,
     pages: SleepMutex<PageCache>,
     mappers: Mappers,
 }
 
 impl Ext4Inode {
+    /// Borrow the FIFO attachment slot when this inode is a named pipe.
+    pub(crate) fn fifo_slot(&self) -> Option<&crate::linux::pipe::FifoSlot> {
+        self.fifo.as_deref()
+    }
     /// `write_at` at `offset`, or at the end (`append`, `None`): the size is
     /// read under the same hold of `meta` (Lock 4) the write is made in.
     /// Returns where the write began and how much was written.
@@ -1813,18 +1819,21 @@ impl Ext4Inode {
             detached_symlink_target: Vec::new(),
             locks: AdvisoryLocks::new(),
         };
+        let inode_type = map_file_type(disk.file_type());
+        let fifo = (inode_type == InodeType::Fifo).then(|| alloc::boxed::Box::new(crate::linux::pipe::FifoSlot::new()));
         Arc::new(Self {
             lock_id: next_lock_id(),
             shared,
             disk_ino,
             ino: AtomicU64::new(u64::from(disk_ino)),
-            inode_type: map_file_type(disk.file_type()),
+            inode_type,
             rdev,
             open_count: AtomicU32::new(0),
             detached: AtomicBool::new(false),
             writeback_errno: AtomicU32::new(0),
             read_errno: AtomicU32::new(0),
             warned_bad_listing: AtomicBool::new(false),
+            fifo,
             meta: SleepMutex::new(meta),
             pages: SleepMutex::new(PageCache::new_ext4()),
             mappers: Mappers::new(),
@@ -4342,6 +4351,81 @@ impl VfsInode for Ext4Inode {
         })())
     }
 
+    fn mknod(
+        &self,
+        name: &[u8],
+        inode_type: InodeType,
+        mode: u16,
+        _rdev: DevId,
+    ) -> Result<Arc<dyn VfsInode>, VfsError> {
+        let (file_type, mode_type) = match inode_type {
+            InodeType::File => (FileType::Regular, InodeMode::S_IFREG),
+            InodeType::Fifo => (FileType::Fifo, InodeMode::S_IFIFO),
+            _ => return Err(VfsError::Perm),
+        };
+        let op = self.shared.writable_op("mknod")?;
+        op.end((|| -> Result<_, VfsError> {
+            if self.inode_type != InodeType::Dir {
+                return Err(VfsError::NotDir);
+            }
+            if name == b"." || name == b".." {
+                return Err(VfsError::Exist);
+            }
+            let mut meta = self.meta.lock();
+            if self.is_detached() || meta.nlink == 0 {
+                return Err(VfsError::NoEnt);
+            }
+            let dname = entry_name(name)?;
+            let now_ts = self.shared.now();
+
+            let mut inner = self.shared.state.lock();
+            let parent_disk = Inode::read(&inner.ext4, self.disk_inode_index()).map_err(map_ext4_err)?;
+            let mut parent_dir = Dir::open_inode(&inner.ext4, parent_disk).map_err(map_ext4_err)?;
+            ensure_absent(&parent_dir, dname)?;
+            ensure_create_reserve(&inner.ext4)?;
+
+            let mode = mode_type | InodeMode::from_bits_retain(mode & 0o7777);
+            let mut child_disk = new_inode(&inner.ext4, file_type, mode, now_ts).map_err(map_ext4_err)?;
+            inner.clear_nlink_bounds(child_disk.index.get());
+            // Special files must not carry EXTENTS or a non-zero i_block
+            // (e2fsck rejects them); ext4plus::create_inode sets EXTENTS and
+            // initializes an empty extent header, so clear both before linking.
+            if inode_type == InodeType::Fifo {
+                let cleared = (|| -> Result<Inode, VfsError> {
+                    child_disk.set_flags(child_disk.flags().difference(InodeFlags::EXTENTS));
+                    child_disk.write(&inner.ext4).map_err(map_ext4_err)?;
+                    let off = inner.layout.inode_disk_offset(&inner.bcache, child_disk.index.get())?;
+                    let zero = [0u8; 60];
+                    inner.bcache.write_at(off + I_BLOCK_OFFSET, &zero).map_err(|e| map_block_error(&e))?;
+                    Inode::read(&inner.ext4, child_disk.index).map_err(map_ext4_err)
+                })();
+                match cleared {
+                    Ok(disk) => child_disk = disk,
+                    Err(e) => {
+                        discard_orphan(
+                            &mut inner,
+                            self.disk_inode_index(),
+                            dname,
+                            child_disk.index,
+                            "after a failed mknod",
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+            if let Err(e) = parent_dir.link(dname, &mut child_disk) {
+                discard_orphan(&mut inner, self.disk_inode_index(), dname, child_disk.index, "after a failed mknod");
+                self.retake_dir_geometry(&mut meta, &inner.ext4);
+                return Err(map_ext4_err(e));
+            }
+            meta.take_dir_geometry(parent_dir.inode());
+            let child = inner.created_inode(child_disk, &self.shared);
+            meta.times.modified(now_ts);
+            meta.meta_dirty = true;
+            Ok(child as Arc<dyn VfsInode>)
+        })())
+    }
+
     fn mkdir(&self, name: &[u8], mode: u16) -> Result<Arc<dyn VfsInode>, VfsError> {
         let op = self.shared.writable_op("mkdir")?;
         op.end((|| -> Result<_, VfsError> {
@@ -5259,6 +5343,10 @@ impl VfsInode for Ext4Inode {
         let mut meta = self.meta.lock();
         f(&mut meta.locks);
         Ok(())
+    }
+
+    fn pollable(&self) -> Option<&dyn lumen_vfs::Pollable> {
+        self.fifo.as_deref().map(|f| f as &dyn lumen_vfs::Pollable)
     }
 
     /// For `vfs::mmap_page`.
