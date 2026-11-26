@@ -84,6 +84,26 @@ impl Files {
         Self { table: SpinLock::new(Shared { fds, members: alloc::vec![0] }), close_access: FilesAccess::new() }
     }
 
+    /// Reserve an empty exec table before the point of no return.
+    pub(super) fn prepare_exec() -> Result<Self, VfsError> {
+        let fds = FdTable::try_preallocated()?;
+        let mut members = Vec::new();
+        members.try_reserve_exact(1).map_err(|_| VfsError::NoMem)?;
+        Ok(Self { table: SpinLock::new(Shared { fds, members }), close_access: FilesAccess::new() })
+    }
+
+    /// Fill a prepared empty table without allocation, preserving open descriptions and CLOEXEC.
+    pub(super) fn copy_exec_into(&self, prepared: &Self, member: u32) {
+        let source = self.table.lock();
+        let mut target = prepared.table.lock();
+        assert!(target.members.is_empty() && target.fds.open_count() == 0);
+        for (fd, entry) in source.fds.iter_open() {
+            target.fds.insert_at(fd, Arc::clone(&entry.file), entry.cloexec).expect("preallocated slot");
+            entry.file.inc_fd_ref();
+        }
+        target.members.push(member);
+    }
+
     /// Copy open descriptors and cloexec, counting each slot for member.
     /// Reservations belong to the original table and are never inherited.
     pub(super) fn fork_copy(&self, member: u32) -> Self {
@@ -183,13 +203,12 @@ impl Files {
     }
 
     /// The processes sharing it, including reserved unlinked members.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2/C3 table unsharing
     pub fn users(&self) -> usize {
         self.table.lock().members.len()
     }
 
     /// How many descriptors are open.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // `procs_lookup_and_lifetime`
+    #[cfg(feature = "ktest")]
     pub fn open_count(&self) -> usize {
         self.table.lock().fds.open_count()
     }

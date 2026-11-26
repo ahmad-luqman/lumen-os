@@ -425,21 +425,6 @@ fn read_all_inode(inode: &Arc<dyn VfsInode>) -> Result<Vec<u8>, VfsError> {
     Ok(out)
 }
 
-/// An executable file's bytes by absolute path from `/` (symlinks
-/// followed), for `linux /path` and the interpreter its binary names:
-/// `EACCES` for anything but a regular file with an execute bit (as
-/// `execve(2)`, where root too needs one), `EFBIG` past [`READ_ALL_MAX`],
-/// `ENOMEM` when the heap can't hold it.
-/// The inode comes back with the bytes: the loader names the image's
-/// `/proc/<pid>/maps` lines after it (#255).
-pub(crate) fn read_executable(path: &str) -> Result<(Vec<u8>, Arc<dyn VfsInode>), VfsError> {
-    let inode = resolve_path_from_root(path)?;
-    if inode.inode_type() != InodeType::File || inode.stat()?.mode & 0o111 == 0 {
-        return Err(VfsError::Acces);
-    }
-    Ok((read_all_inode(&inode)?, inode))
-}
-
 /// Makes `run_dev_tmp_proc_checks`'s process fail its first check, for the
 /// ktest that it still unregisters the process.
 #[cfg(feature = "ktest")]

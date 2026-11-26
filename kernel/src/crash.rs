@@ -365,7 +365,7 @@ fn write_origin(w: &mut dyn Write, rsp: u64) {
         None if (lo..hi).contains(&rsp) => writeln!(w, "running on: the boot stack {lo:#x}..{hi:#x}"),
         None => writeln!(w, "running on: an unknown stack (rsp {rsp:#018x})"),
     };
-    // Lock-free; none before this CPU's threads are set up.
+    // Nonblocking (`try_lock`, `?` if busy); none before this CPU's threads are set up.
     if let Some((id, name)) = crate::sched::running_here() {
         let _ = writeln!(w, "thread: {name} (id {id})");
     }

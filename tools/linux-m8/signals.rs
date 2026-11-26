@@ -296,7 +296,7 @@ fn action(sig: u64, flags: u64, mask: u64) -> R {
     let a = [handler as *const () as u64, flags | RESTORER, c5_restorer as *const () as u64, mask];
     eq("sigaction", sys(SYS_RT_SIGACTION, [sig, a.as_ptr() as u64, 0, 8, 0, 0]), 0)
 }
-fn altstack() -> Result<u64, common::Fail> {
+pub(super) fn altstack() -> Result<u64, common::Fail> {
     let base = ok("mmap altstack", sys(SYS_MMAP, [0, 32768, 3, 0x22, u64::MAX, 0]))? as u64;
     let stack = [base, 0, 32768];
     eq("sigaltstack", sys(SYS_SIGALTSTACK, [stack.as_ptr() as u64, 0, 0, 0, 0, 0]), 0)?;

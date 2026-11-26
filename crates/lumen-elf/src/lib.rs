@@ -38,7 +38,7 @@ pub const SHT_SYMTAB: u32 = 2;
 /// Symbol type: function / code.
 pub const STT_FUNC: u8 = 2;
 
-pub(crate) const EHDR_SIZE: usize = 64;
+pub const EHDR_SIZE: usize = 64;
 const SHDR_SIZE: usize = 64;
 const SYM_SIZE: usize = 24;
 

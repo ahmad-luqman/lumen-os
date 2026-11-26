@@ -632,7 +632,7 @@ fn load_and_list<T>(
     let written = exe.write_at(0, image);
     let loaded = crate::linux::exec::Exec::from_path(&format!("/tmp/{name}"))
         .map_err(|_| "Exec::from_path")
-        .and_then(|e| e.load(&[b"/x"], &[], b"/x", [0; 16]).map_err(|_| "load"));
+        .and_then(|e| e.load(&[b"/x"], &[], b"/x").map_err(|_| "load"));
     let ino = exe.ino();
     let listed = loaded.map(|(space, _)| {
         let maps = space.format_maps_text();

@@ -56,6 +56,9 @@ NOT_NAMING = {
     # `Thread::new`: only `spawned` and `adopted` call it, with the name
     # they were given.
     "new": "sched.rs's Thread::new, called by spawned and adopted",
+    # `execve`'s name for the running thread, from its path (`from_path`
+    # cuts it), never a literal.
+    "set_current_name": "sched.rs's Thread::set_exec_name, called by execve with ThreadName::from_path",
 }
 # A name argument holding no literal: a name passed on by a wrapper, or one
 # taken from a table (checked when converted: `From<&str>`'s assertion).

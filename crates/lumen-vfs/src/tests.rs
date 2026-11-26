@@ -9478,3 +9478,79 @@ fn getcwd_rechecks_a_directory_removed_while_its_parent_is_read() {
 }
 
 mod hazards;
+
+#[test]
+fn named_resolution_follows_links_dotdot_and_magic_identities() {
+    let (env, fs) = setup_vfs();
+    let dir = mkdir_at(&env, None, b"/real", 0o755, 0).unwrap();
+    mkdir_at(&env, None, b"/real/sub", 0o755, 0).unwrap();
+    let (file, _) = open_inode(&env, None, b"/real/prog", OpenFlags(OpenFlags::O_CREAT), 0o755, 0).unwrap();
+    symlink_at(&env, b"/real/sub", None, b"/alias").unwrap();
+    symlink_at(&env, b"../prog", None, b"/real/sub/link").unwrap();
+    let flags = ResolveFlags { follow_final: true, ..ResolveFlags::default() };
+    for (start, path) in [(None, b"/alias/../prog".as_slice()), (None, b"/alias/link"), (Some(&dir), b"./sub/../prog")]
+    {
+        let NamedPath { resolved: found, identity } = resolve::resolve_named_path(&env, start, path, flags).unwrap();
+        assert!(Arc::ptr_eq(&found.inode, &file));
+        assert_eq!(identity.unwrap(), b"/real/prog");
+    }
+    fs.add_magic_link(&fs.root, b"fd", b"/alias/link", Arc::clone(&file));
+    fs.add_magic_link(&fs.root, b"fd_alias", b"/fd", Arc::clone(&file));
+    let NamedPath { resolved: found, identity } = resolve::resolve_named_path(&env, None, b"/fd_alias", flags).unwrap();
+    assert!(Arc::ptr_eq(&found.inode, &file));
+    assert_eq!(identity.unwrap(), b"/real/prog");
+    fs.add_magic_link(&fs.root, b"cycle", b"/cycle", Arc::clone(&file));
+    assert_eq!(
+        resolve::resolve_named_path(&env, None, b"/cycle", flags).unwrap().identity.unwrap_err(),
+        VfsError::Loop
+    );
+    let (other, _) = open_inode(&env, None, b"/other", OpenFlags(OpenFlags::O_CREAT), 0o755, 0).unwrap();
+    fs.add_magic_link(&fs.root, b"wrong", b"/real/prog", other);
+    assert_eq!(
+        resolve::resolve_named_path(&env, None, b"/wrong", flags).unwrap().identity.unwrap_err(),
+        VfsError::NoEnt
+    );
+    let _held = OpenGuard::try_new(Arc::clone(&file)).unwrap();
+    fs.add_magic_link(&fs.root, b"dir_fd", b"/real", Arc::clone(&dir));
+    fs.add_magic_link(&fs.root, b"deleted_fd", b"/dir_fd/prog (deleted)", Arc::clone(&file));
+    unlink_at(&env, None, b"/real/prog", false).unwrap();
+    assert!(file.is_detached());
+    let NamedPath { resolved: found, identity } =
+        resolve::resolve_named_path(&env, None, b"/deleted_fd", flags).unwrap();
+    assert!(Arc::ptr_eq(&found.inode, &file));
+    assert_eq!(identity.unwrap(), b"/real/prog (deleted)");
+}
+
+#[test]
+fn named_resolution_preserves_inode_when_identity_fails() {
+    let (env, fs) = setup_vfs();
+    let (file, _) = open_inode(&env, None, b"/prog", OpenFlags(OpenFlags::O_CREAT), 0o755, 0).unwrap();
+    let flags = ResolveFlags { follow_final: true, ..ResolveFlags::default() };
+    let mountpoint = mkdir_at(&env, None, b"/mnt", 0o755, 0).unwrap();
+    let foreign = MemFs::new(DevId::TMPFS, "tmpfs", false);
+    foreign.next_ino.store(file.ino(), Ordering::Relaxed);
+    env.mount(mountpoint, "/mnt", foreign).unwrap();
+    let (collision, _) = open_inode(&env, None, b"/mnt/prog", OpenFlags(OpenFlags::O_CREAT), 0o755, 0).unwrap();
+    assert_eq!(collision.ino(), file.ino());
+    assert_ne!(collision.dev_id(), file.dev_id());
+    for (name, target, error) in [
+        (b"crossdev".as_slice(), b"/mnt/prog".as_slice(), VfsError::NoEnt),
+        (b"cycle", b"/cycle", VfsError::Loop),
+        (b"renamed", b"/missing", VfsError::NoEnt),
+    ] {
+        fs.add_magic_link(&fs.root, name, target, Arc::clone(&file));
+        let ordinary = resolve_path(&env, None, name, flags).unwrap();
+        let named = resolve_named_path(&env, None, name, flags).unwrap();
+        assert!(Arc::ptr_eq(&named.resolved.inode, &ordinary.inode));
+        assert!(Arc::ptr_eq(&named.resolved.inode, &file));
+        assert_eq!(named.identity, Err(error));
+    }
+    let _held = OpenGuard::try_new(Arc::clone(&file)).unwrap();
+    fs.add_magic_link(&fs.root, b"detached_crossdev", b"/mnt/prog (deleted)", Arc::clone(&file));
+    unlink_at(&env, None, b"/prog", false).unwrap();
+    assert!(file.is_detached());
+    let ordinary = resolve_path(&env, None, b"/detached_crossdev", flags).unwrap();
+    let named = resolve_named_path(&env, None, b"/detached_crossdev", flags).unwrap();
+    assert!(Arc::ptr_eq(&named.resolved.inode, &ordinary.inode));
+    assert_eq!(named.identity, Err(VfsError::NoEnt));
+}

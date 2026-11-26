@@ -359,6 +359,27 @@ impl SignalState {
 }
 
 impl Process {
+    /// Refuse multi-threaded exec until de_thread is available, and refuse group exit.
+    pub fn check_exec(&self) -> Result<(), u32> {
+        if PROCS.lock().has_extra_threads(self.pid()) || self.signal.lock().ending() {
+            return Err(errno::EAGAIN);
+        }
+        Ok(())
+    }
+
+    /// Reset handled dispositions, the alternate stack, fault and frame-failure
+    /// diagnostics, preserving pending queues and the blocked mask.
+    pub fn exec_signals(&self, tid: u32) {
+        let mut state = self.signal.lock();
+        for action in &mut state.actions {
+            let handler = if action.handler == SIG_IGN { SIG_IGN } else { 0 };
+            *action = KernelSigaction { handler, ..KernelSigaction::default() };
+        }
+        let t = state.threads.get_mut(&tid).expect("exec's live tid");
+        t.alt_stack = AltStack::DISABLED;
+        t.fault = None;
+        t.frame_failure = None;
+    }
     /// Dequeue and choose an action in one signal hold, fatal state first.
     pub fn next_signal(&self, tid: u32) -> Delivery {
         debug_assert_eq!(tid, current_thread().tid());
@@ -509,3 +530,50 @@ fn one_thread_state() -> SignalState {
     state.add_thread(9, &owner, ThreadInit::ROOT);
     state
 }
+
+crate::ktest!(
+    fn exec_signal_reset_preserves_pending_and_refuses_threads() {
+        use crate::{kassert, kassert_eq};
+        in_test_process(|_| {
+            let me = current_thread();
+            let extra = add_ktest_thread(me.process())?;
+            let refused = me.process().check_exec();
+            remove_ktest_thread(&extra);
+            kassert_eq!(refused, Err(errno::EAGAIN));
+            kassert_eq!(me.process().check_exec(), Ok(()));
+            let mask = Blocked::new(SigSet::of(&[Signal::USR1]));
+            me.set_blocked(mask);
+            set_current_action(Signal::USR1, KernelSigaction { handler: 0x400000, ..Default::default() });
+            set_current_action(
+                Signal::USR2,
+                KernelSigaction {
+                    handler: SIG_IGN,
+                    flags: u64::from(general::SA_RESTART),
+                    mask: 1234,
+                    restorer: 0x401000,
+                },
+            );
+            send_thread(None, me.tid(), Some(SigInfo::new(Signal::USR1, 0)), SenderClass::Other).map_err(|_| "send")?;
+            send_process_checked(
+                me.process().pid() as i32,
+                Ok(Some(SigInfo::new(Signal::USR1, 0))),
+                SenderClass::Other,
+            )
+            .map_err(|_| "send shared")?;
+            me.process().exec_signals(me.tid());
+            kassert_eq!(me.blocked(), mask);
+            kassert_eq!(current_action(Signal::USR1), KernelSigaction::default());
+            kassert_eq!(current_action(Signal::USR2), KernelSigaction { handler: SIG_IGN, ..Default::default() });
+            // Install a handler again before unblocking, so delivery proves the
+            // reset preserved the queued signal without terminating this test.
+            set_current_action(Signal::USR1, KernelSigaction { handler: 0x500000, ..Default::default() });
+            me.set_blocked(Blocked::EMPTY);
+            // Both the private and shared pending entries survive.
+            kassert!(matches!(me.process().next_signal(me.tid()), Delivery::Handler(_)));
+            kassert!(matches!(me.process().next_signal(me.tid()), Delivery::Handler(_)));
+            me.process().record_exit(UserExit::Exited(0));
+            kassert_eq!(me.process().check_exec(), Err(errno::EAGAIN));
+            Ok(())
+        })?
+    }
+);

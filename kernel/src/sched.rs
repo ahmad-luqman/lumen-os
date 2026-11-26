@@ -66,10 +66,10 @@
 //!
 //! Every switch records a `switch` trace event (previous thread's id, next
 //! thread's id, the previous thread's state), and the crash report names the
-//! thread that was running (`thread: <name> (id N)`, read lock-free: a
-//! thread's name is a `ThreadName`, 16 bytes inline like Linux's `comm`,
-//! set when it is made and never changed, so reading it takes no lock and
-//! allocates nothing; the spawn functions take anything `Into<ThreadName>`,
+//! thread that was running (`thread: <name> (id N)`, with a nonblocking
+//! leaf-lock read and `?` if busy). Its `ThreadName` is 16 bytes inline,
+//! set at spawn and changed only by the owner on exec. Reading it allocates
+//! nothing; the spawn functions take anything `Into<ThreadName>`,
 //! a `&str` cut to 15 bytes). Every
 //! change to a run queue records a `runq` event in that CPU's X-ray ring
 //! (`trace::record_run_queue`), under the queue's lock ([`run_queue`]
@@ -306,8 +306,8 @@ impl UserSlot {
 /// (their reuse waits for every CPU's, `mm::tlb`) all have to be revisited.
 pub struct Thread {
     id: u64,
-    /// Set once, when it is made (the crash report reads it lock-free).
-    name: ThreadName,
+    /// Leaf lock; only this thread changes its name after construction.
+    name: SpinLock<ThreadName>,
     /// Its home CPU, the only one it runs on.
     cpu: usize,
     state: AtomicU8,
@@ -392,7 +392,7 @@ impl Thread {
     ) -> Thread {
         Thread {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            name,
+            name: SpinLock::new(name),
             cpu,
             state: AtomicU8::new(state as u8),
             rsp: SavedRsp(UnsafeCell::new(rsp)),
@@ -416,10 +416,9 @@ impl Thread {
         self.id
     }
 
-    /// Its name, as made from what it was spawned (or adopted) with (see
-    /// `ThreadName::new`).
+    /// Its current displayed name, updated by exec from the path as given.
     pub fn name(&self) -> ThreadName {
-        self.name
+        *self.name.lock()
     }
 
     pub fn state(&self) -> State {
@@ -494,7 +493,7 @@ impl Thread {
             let was = State::from_raw(was).map_or("?", State::name);
             panic!(
                 "thread {} (id {}, cpu {}) was {was}, not {}, on its way to {}",
-                self.name,
+                self.name.try_lock().map(|n| *n).unwrap_or(ThreadName::new("?")),
                 self.id,
                 self.cpu,
                 from.name(),
@@ -506,7 +505,14 @@ impl Thread {
 
 impl fmt::Debug for Thread {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} (id {}, cpu {}, {})", self.name, self.id, self.cpu, self.state().name())
+        write!(
+            f,
+            "{} (id {}, cpu {}, {})",
+            self.name.try_lock().map(|n| *n).unwrap_or(ThreadName::new("?")),
+            self.id,
+            self.cpu,
+            self.state().name()
+        )
     }
 }
 
@@ -809,6 +815,11 @@ impl BlockDelay {
 /// than ticks.
 static TICKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static IDLE_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Change only the calling thread's name after exec.
+pub fn set_current_name(name: ThreadName) {
+    with_current(|t| *t.name.lock() = name).expect("exec on a running thread");
+}
+
 /// Total context switches performed on each CPU (monotonic).
 static SWITCHES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
@@ -902,7 +913,7 @@ pub fn threads() -> Vec<ThreadInfo> {
     live.iter()
         .map(|t| ThreadInfo {
             id: t.id,
-            name: t.name,
+            name: t.name(),
             cpu: t.cpu,
             state: t.state(),
             ticks: t.ticks.load(Ordering::Relaxed),
@@ -1008,7 +1019,7 @@ pub fn current() -> Option<Arc<Thread>> {
     CPUS[arch::cpu_index()].lock().current.clone()
 }
 
-/// The running thread's id and name, for the crash report: lock-free, on
+/// The running thread's id and name, for the crash report: a nonblocking leaf-lock read on
 /// the CPU that crashed (whose current thread can't change any more). Set
 /// from when this CPU's threads are set up (`sched::init` on the boot CPU,
 /// coming online on an AP).
@@ -1016,7 +1027,7 @@ pub fn running_here() -> Option<(u64, ThreadName)> {
     let t = CURRENT[arch::cpu_index()].load(Ordering::Acquire);
     // SAFETY: a non-null `CURRENT` points into an `Arc<Thread>` that stays
     // alive while it is stored there (see `CURRENT`).
-    (!t.is_null()).then(|| unsafe { ((*t).id, (*t).name) })
+    (!t.is_null()).then(|| unsafe { ((*t).id, (*t).name.try_lock().map(|n| *n).unwrap_or(ThreadName::new("?"))) })
 }
 
 /// Total context switches performed on CPU `cpu` so far (0 for out-of-range CPU).
@@ -1100,7 +1111,6 @@ fn with_user_fpu<R>(f: impl FnOnce(&mut arch::fpu::UserFpuState) -> R) -> Option
 /// with interrupts off here.
 ///
 /// Panics if the current thread has no user state (a kernel thread).
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))] // the ktests; C4's and B3's handlers next
 pub(crate) fn set_restart_block(block: Option<RestartBlock>) {
     with_restart_block(|slot| *slot = block).expect("set_restart_block on a kernel thread");
 }
@@ -4365,6 +4375,24 @@ crate::ktest!(
         let pending = me.sigpending();
         clear_current_sigpending();
         crate::kassert!(pending);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn exec_name_reaches_crash_snapshot_without_blocking() {
+        use crate::kassert_eq;
+        let old = with_current(|t| t.name()).ok_or("thread")?;
+        set_current_name(ThreadName::new("exec-name"));
+        let name = running_here().ok_or("snapshot")?.1;
+        let busy = with_current(|t| {
+            let _held = t.name.lock();
+            running_here().map(|(_, name)| name)
+        })
+        .flatten();
+        set_current_name(old);
+        kassert_eq!(name, ThreadName::new("exec-name"));
+        kassert_eq!(busy, Some(ThreadName::new("?")));
         Ok(())
     }
 );

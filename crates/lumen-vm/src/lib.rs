@@ -42,8 +42,59 @@ pub const MMAP_TOP: u64 = 0x0000_7f00_0000_0000;
 pub const USER_STACK_TOP: u64 = 0x0000_7fff_f000_0000;
 /// Initial user stack VMA size (8 MiB, matching M6 `RLIMIT_STACK`).
 pub const USER_STACK_SIZE: u64 = 8 * 1024 * 1024;
-/// Inclusive bottom of the initial demand-paged user stack VMA.
+/// Default bottom of the user stack; each address space retains its StackSize bottom.
 pub const USER_STACK_BOTTOM: u64 = USER_STACK_TOP - USER_STACK_SIZE;
+
+/// Per-exec stack reservation and Linux argument-string budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StackSize {
+    bytes: u64,
+    arg_limit: usize,
+}
+impl StackSize {
+    /// The default 8 MiB reservation and 2 MiB argument budget.
+    pub const DEFAULT: Self = Self { bytes: USER_STACK_SIZE, arg_limit: 2 * 1024 * 1024 };
+    /// Clamp the reservation to 128 KiB..=256 MiB and round up to a page.
+    /// The argument budget uses the original limit, before page rounding.
+    pub fn from_rlimit(limit: u64) -> Self {
+        let bytes = (limit.clamp(128 * 1024, 256 * 1024 * 1024) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        Self { bytes, arg_limit: (limit / 4).clamp(128 * 1024, 6 * 1024 * 1024) as usize }
+    }
+    /// Page-rounded size of the reserved stack, excluding its guard.
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+    /// Lowest address in the stack reservation.
+    pub const fn bottom(self) -> u64 {
+        USER_STACK_TOP - self.bytes
+    }
+    /// Maximum combined string and pointer budget for exec arguments.
+    pub const fn arg_limit(self) -> usize {
+        self.arg_limit
+    }
+}
+
+#[cfg(test)]
+mod stack_size_tests {
+    use super::*;
+    #[test]
+    fn rlimit_stack_clamps_rounds_and_budgets() {
+        assert_eq!(StackSize::DEFAULT, StackSize::from_rlimit(USER_STACK_SIZE));
+        for (limit, bytes, args) in [
+            (0, 131072, 131072),
+            (131073, 135168, 131072),
+            (8 * 1024 * 1024, 8388608, 2097152),
+            (64 * 1024 * 1024, 67108864, 6291456),
+            (u64::MAX, 268435456, 6291456),
+            (2097156, 2101248, 524289),
+        ] {
+            let size = StackSize::from_rlimit(limit);
+            assert_eq!(size.bytes(), bytes);
+            assert_eq!(size.bottom(), USER_STACK_TOP - bytes);
+            assert_eq!(size.arg_limit(), args);
+        }
+    }
+}
 
 const _: () = {
     assert!(PAGE_SIZE.is_power_of_two());

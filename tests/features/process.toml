@@ -46,3 +46,51 @@ tests = ["ktest:lumen_kernel::linux::process::shared_files_close_releases_all_me
 name = "Shared Files leave waits for in-flight close lock cleanup"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::linux::process::shared_files_leave_waits_for_inflight_close"]
+
+[[feature]]
+name = "Single-threaded execve: fork CoW, shebang chains, CLOEXEC, signal inheritance, argument limits, vfork release and executables over 16 MiB"
+milestone = "M8"
+tests = ["scenario:test_linux_proc::test_fork_cow_and_exec_shebang", "cargo:lumen-elf"]
+
+[[feature]]
+name = "Exec commit rewrites registers and comm, synthesizes argv[0], preserves failed-call state, and resets signals without losing pending entries"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::syscall::task::execve_replaces_frame_and_preserves_failed_call",
+    "ktest:lumen_kernel::linux::process::signal::exec_signal_reset_preserves_pending_and_refuses_threads",
+    "cargo:lumen-vfs",
+]
+
+[[feature]]
+name = "Exec counts argument pointers without heap growth before enforcing its budget"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::syscall::task::exec_pointer_count_is_bounded_before_allocation"]
+
+[[feature]]
+name = "Exec task name has one owner and a nonblocking crash snapshot"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::sched::exec_name_reaches_crash_snapshot_without_blocking"]
+
+[[feature]]
+name = "RLIMIT_STACK reservation rounding and exec argument budget"
+milestone = "M8"
+tests = ["cargo:lumen-vm"]
+
+[[feature]]
+name = "Exec records the reached file identity; procfs executable cycles return ELOOP"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::vfs::procfs::procfs_exe_cycles_share_the_symlink_limit",
+    "scenario:test_linux_proc::test_fork_cow_and_exec_shebang",
+]
+
+[[feature]]
+name = "Exec checks ordered envp, absolute and raw-byte /proc/self/exe, exact script argv, nesting 5/6, MAX_ARG_STRLEN, reexec through exe and fd aliases, renamed fd exec and fresh AT_RANDOM"
+milestone = "M8"
+tests = ["scenario:test_linux_proc::test_fork_cow_and_exec_shebang", "scenario:test_linux_proc::test_exec_uses_unseeded_random_fallback", "cargo:lumen-vfs"]
+
+[[feature]]
+name = "Fatal signals interrupt exec while walking user argument pointers"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::syscall::task::exec_argument_walk_observes_fatal_signal"]

@@ -18,6 +18,10 @@ impl ProcTable {
     pub(super) const fn new(max_pid: u32) -> Self {
         Self { tree: ProcTree::new(max_pid), procs: BTreeMap::new(), threads: BTreeMap::new() }
     }
+    /// Record a successful single-threaded exec in the process tree.
+    pub(super) fn exec(&mut self, pid: u32) {
+        self.tree.exec(pid).expect("exec of a live process");
+    }
     pub(super) fn parent(&self, pid: u32) -> u32 {
         self.tree.parent(pid).expect("live process in tree").unwrap_or(0)
     }
@@ -30,7 +34,6 @@ impl ProcTable {
     pub(super) fn active_pids(&self) -> Vec<u32> {
         self.procs.keys().copied().filter(|&pid| pid != INIT_PID).collect()
     }
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C2's exec single-thread check
     pub(super) fn has_extra_threads(&self, pid: u32) -> bool {
         !self.tree.threads(pid).is_empty()
     }

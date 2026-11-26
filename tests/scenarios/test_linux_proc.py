@@ -148,3 +148,42 @@ def test_fork_wait_and_exit_status(boot, tmp_path):
     assert re.search(r"linux: /usr/local/bin/m8_proc exit=0 leaked_frames=0\b", out), out
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_fork_cow_and_exec_shebang(boot, tmp_path):
+    """C2: private CoW, scripts, exec state, vfork and streaming a padded ELF."""
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    out = run(m, f"linux {PROC} fork-exec", 180)
+    assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+        "fork-cow",
+        "exec-self-identity",
+        "exec-renamed-fd",
+        "exec-random-fresh",
+        "exec-shebang-state",
+        "exec-refusals",
+        "exec-relative-and-bytes",
+        "exec-nesting-limit",
+        "vfork-exec-files",
+        "exec-over-16m",
+    ], out
+    assert f"linux: {PROC} exit=0 " in out, out
+    assert "FAIL" not in out, out
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_exec_uses_unseeded_random_fallback(boot, tmp_path):
+    """Shell load and execve share an infallible AT_RANDOM policy, warning once."""
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path)), cpu="qemu64")
+    m.expect(r"lumen> ", 60)
+    warning = r"WARN  exec: AT_RANDOM: no seeded RNG; using TSC/time fallback"
+    first = run(m, f"linux {PROC} fork-exec", 180, allow=warning)
+    assert "FAIL" not in first, first
+    assert f"linux: {PROC} exit=0 " in first, first
+    assert sum("AT_RANDOM:" in line for line in first.logs) == 1, first.logs
+    second = run(m, f"linux {PROC} exec-exit", 60)
+    assert f"linux: {PROC} exit=42 leaked_frames=0" in second, second
+    assert not any("AT_RANDOM:" in line for line in second.logs), second.logs
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

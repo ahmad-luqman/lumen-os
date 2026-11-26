@@ -50,12 +50,16 @@ pub use ops::{
 };
 pub use poll::{PollGuard, PollHead, PollMask, PollWaker, Pollable};
 pub use resolve::{
-    Final, ParentTarget, ResolveFlags, ResolvedPath, check_access, compute_cwd_path, resolve_parent, resolve_path,
+    Final, NamedPath, ParentTarget, ResolveFlags, ResolvedPath, check_access, compute_cwd_path, resolve_named_path,
+    resolve_parent, resolve_path,
 };
 pub use types::{
     AccessMask, AccessMode, AtFlags, DevId, DirEntry, Escaped, Ino, InodeType, Metadata, OpenFlags, RenameFlags,
     SeekFrom, SetTime, Timespec, mode_after_chown,
 };
+
+/// Suffix on a detached open file's displayed path.
+pub const DELETED_SUFFIX: &[u8] = b" (deleted)";
 
 /// Maximum POSIX path length including NUL (`PATH_MAX`).
 pub const PATH_MAX: usize = 4096;
