@@ -65,9 +65,10 @@ def test_user_fault_kills_process_not_kernel(boot):
     ]
     for kind, vec, cr2_pat in cases:
         start = len(m.output)
+        sig = {14: 11, 6: 4, 13: 11, 3: 5, 1: 5}[vec]
         m.send_line(f"usertest {kind}")
         line = m.expect(
-            rf"usertest: fault vector={vec} \([^)]+\) error=0x[0-9a-f]+ "
+            rf"usertest: exit={128 + sig} signal={sig} vector={vec} \([^)]+\) error=0x[0-9a-f]+ "
             rf"rip=0x[0-9a-f]+ cr2={cr2_pat} deferred_lstar=(\d+) deferred_stub=(\d+)\n",
             15,
         )
@@ -93,7 +94,7 @@ def test_user_fault_kills_process_not_kernel(boot):
     start = len(m.output)
     m.send_line("usertest cve_db")
     cve_line = m.expect(
-        r"usertest: (?:fault vector=1 \(#DB debug\) error=0x0 rip=0x[0-9a-f]+ cr2=0x0 "
+        r"usertest: (?:exit=133 signal=5 vector=1 \(#DB debug\) error=0x0 rip=0x[0-9a-f]+ cr2=0x0 "
         r"deferred_lstar=(\d+) deferred_stub=\d+|exit=77 stdout=\"\")\n",
         15,
     )
@@ -121,12 +122,12 @@ def test_non_canonical_sysret_does_not_crash_kernel(boot):
     for kind in ("noncanon", "noncanon-iret"):
         start = len(m.output)
         m.send_line(f"usertest {kind}")
-        m.expect(r"usertest: non-canonical rip=0x800000000000\n", 15)
+        m.expect(r"usertest: exit=139 signal=11 non-canonical rip=0x800000000000\n", 15)
         m.expect(r"lumen> ", 10)
         chunk = m.output[start:]
         assert CRASH_BEGIN not in chunk, chunk
         warns = re.findall(
-            r"WARN  user: pid \d+: non-canonical user return rip 0x800000000000", chunk
+            r"WARN  user: pid \d+: killed by signal 11: invalid user return rip=", chunk
         )
         assert len(warns) == 1, chunk
 
@@ -491,12 +492,12 @@ def test_dynamic_musl_binary_and_dlopen(boot, tmp_path):
         m,
         f"linux {M7_TEST} sigbus /tmp/m7-bus",
         60,
-        allow=r"WARN  user: pid \d+: bus error \(SIGBUS\)",
+        allow=r"WARN  user: pid \d+: killed by signal 7: file-backed page fault",
     )
     touched = re.search(r"^m7_test: sigbus: touching (0x[0-9a-f]+) past EOF$", out, re.MULTILINE)
     assert touched, out
     bus = re.search(
-        rf"^linux: {M7_TEST} exit=135 \(bus error\) rip=0x[0-9a-f]+ "
+        rf"^linux: {M7_TEST} exit=135 signal=7 rip=0x[0-9a-f]+ "
         rf"cr2={touched.group(1)} leaked_frames=-1$",
         out,
         re.MULTILINE,

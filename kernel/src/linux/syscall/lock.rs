@@ -1482,7 +1482,7 @@ crate::ktest!(
     fn setlkw_is_interrupted_by_a_signal() {
         // A holds a write lock and an exclusive flock. B blocks in F_SETLKW,
         // then in a blocking flock; a signal raised on B's thread (B2's
-        // `raise_for_test`, before C5 delivers anything) ends each wait:
+        // `raise_for_test` without entering ring 3) ends each wait:
         // `-ERESTARTSYS` (the syscall-exit hook's to resolve), B no longer
         // counted as waiting, nothing taken (A still holds both).
         use crate::linux::signal::{ERESTARTSYS, raise_for_test};

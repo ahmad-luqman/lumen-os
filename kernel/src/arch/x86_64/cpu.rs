@@ -151,6 +151,16 @@ write_cr!(write_cr0, "cr0");
 write_cr!(write_cr3, "cr3");
 write_cr!(write_cr4, "cr4");
 
+/// Read debug status before acknowledging a debug exception.
+pub fn read_dr6() -> u64 {
+    let value;
+    // SAFETY: DR6 is readable in ring 0 and reading it changes no state.
+    unsafe {
+        asm!("mov {}, dr6", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
 /// Write debug status register `DR6` (e.g. clearing trap bits after `#DB`).
 pub fn write_dr6(v: u64) {
     // SAFETY: writing DR6 in ring 0 updates only debug status flags.

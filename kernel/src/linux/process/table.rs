@@ -1,6 +1,8 @@
 //! Process-tree ownership and atomic identity/lifetime transitions.
 
+use super::signal::ThreadInit;
 use super::*;
+use lumen_signal::pending::{SenderClass, SigInfo};
 
 /// Every process by pid and every user thread by tid, with the process
 /// tree (`PROCS`). Its methods are the only writers of its fields.
@@ -81,7 +83,7 @@ impl ProcTable {
         let process = thread.process();
         let pid = self.tree.spawn_root(RusageSlot::new(process.usage_slot)).ok()?;
         process.set_pid(pid);
-        self.insert_thread(pid, thread, Blocked::EMPTY);
+        self.insert_thread(pid, thread, ThreadInit::ROOT);
         self.insert_process(pid, process);
         Some(pid)
     }
@@ -89,9 +91,14 @@ impl ProcTable {
     /// Return the child's pid, holding the parent's signal throughout; refuse
     /// with EINTR (exiting/fatal), ERESTARTNOINTR (pending signal), or the
     /// tree's errno (EAGAIN when no pid is free).
-    pub(super) fn link_child(&mut self, parent: &UserThread, thread: &Arc<UserThread>) -> Result<u32, u32> {
+    pub(super) fn link_child(
+        &mut self,
+        parent: &UserThread,
+        thread: &Arc<UserThread>,
+        request: ProcessClone,
+    ) -> Result<u32, u32> {
         let signal = parent.process().signal.lock();
-        if parent.process().exit.lock().is_some() || sched::with_current(|t| t.fatal_pending()).unwrap_or(false) {
+        if signal.ending() || sched::with_current(|t| t.fatal_pending()).unwrap_or(false) {
             return Err(errno::EINTR);
         }
         if sched::current_sigpending() {
@@ -103,8 +110,8 @@ impl ProcTable {
         // PROCS is held and the child is unreachable until insert_process:
         // no other thread can take its signal lock while we hold the parent's.
         child.inherit_signals(&signal);
-        let blocked = signal.blocked(parent.tid());
-        self.insert_thread(pid, thread, blocked);
+        let init = signal.thread_init(parent.tid(), request);
+        self.insert_thread(pid, thread, init);
         self.insert_process(pid, child);
         Ok(pid)
     }
@@ -116,7 +123,7 @@ impl ProcTable {
     pub(super) fn link_thread(&mut self, thread: &Arc<UserThread>) -> Result<u32, lumen_proc::Error> {
         let pid = thread.process().pid();
         let tid = self.tree.add_thread(pid)?;
-        self.insert_thread(tid, thread, Blocked::EMPTY);
+        self.insert_thread(tid, thread, ThreadInit::ROOT);
         Ok(tid)
     }
 
@@ -128,9 +135,9 @@ impl ProcTable {
 
     /// Give `thread` tid `tid` and put it in `threads` and in its process's
     /// signal state (`Process::signal` under `PROCS`, section 9's order).
-    pub(super) fn insert_thread(&mut self, tid: u32, thread: &Arc<UserThread>, blocked: Blocked) {
+    pub(super) fn insert_thread(&mut self, tid: u32, thread: &Arc<UserThread>, init: ThreadInit) {
         thread.set_tid(tid);
-        thread.process().signal.lock().add_thread(tid, ThreadSignals::new(blocked));
+        thread.process().signal.lock().add_thread(tid, thread, init);
         let displaced = self.threads.insert(tid, Arc::clone(thread));
         assert!(displaced.is_none(), "tid {tid} handed out while in PROCS");
     }
@@ -252,5 +259,61 @@ impl ProcTable {
             if tid == pid { row.threads.insert(0, entry) } else { row.threads.push(entry) }
         }
         rows.into_values().collect()
+    }
+    pub(super) fn send_thread(
+        &self,
+        tgid: Option<u32>,
+        tid: u32,
+        info: Result<Option<SigInfo>, u32>,
+        sender: SenderClass,
+    ) -> Result<(), u32> {
+        let t = self.threads.get(&tid).ok_or(errno::ESRCH)?;
+        if tgid.is_some_and(|pid| pid != t.process().pid()) {
+            return Err(errno::ESRCH);
+        }
+        let mut state = t.process().signal.lock();
+        state.thread(tid).ok_or(errno::ESRCH)?;
+        if let Some(info) = info? {
+            state.send(Some(tid), info, sender)?;
+        }
+        Ok(())
+    }
+    pub(super) fn send_process(
+        &self,
+        caller: u32,
+        pid: i32,
+        info: Result<Option<SigInfo>, u32>,
+        sender: SenderClass,
+    ) -> Result<(), u32> {
+        if pid > 0 {
+            let process = self.procs.get(&(pid as u32)).ok_or(errno::ESRCH)?;
+            if let Some(info) = info? {
+                process.signal.lock().send(None, info, sender)?;
+            }
+            return Ok(());
+        }
+        let group = if pid == 0 {
+            self.tree.getpgid(caller, 0).ok()
+        } else if pid < -1 {
+            Some(pid.unsigned_abs())
+        } else {
+            None
+        };
+        let mut found = false;
+        for (&id, process) in &self.procs {
+            let matches = if pid == -1 {
+                id != INIT_PID && id != caller
+            } else {
+                self.tree.getpgid(caller, id as i32).ok() == group
+            };
+            if !matches {
+                continue;
+            }
+            found = true;
+            if let Some(info) = info? {
+                process.signal.lock().send(None, info, sender)?;
+            }
+        }
+        if found { Ok(()) } else { Err(errno::ESRCH) }
     }
 }

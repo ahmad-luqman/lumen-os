@@ -2,3 +2,28 @@
 name = "POSIX signal logic (sets, actions, x86-64 frames, sigreturn checks)"
 milestone = "M8"
 tests = ["cargo:lumen-signal"]
+
+[[feature]]
+name = "Signal delivery, alternate stacks, sigreturn and faults as signals"
+milestone = "M8"
+tests = ["scenario:test_linux_proc::test_signals_and_sigaltstack[*]", "ktest:lumen_kernel::linux::signal::frame::signal_frames_restore_registers_masks_and_restart_once", "ktest:lumen_kernel::linux::signal::frame::stack_and_simd_exceptions_map_to_signals", "ktest:lumen_kernel::linux::process::signal::signal_send_refuses_unlinked_tid_and_discards_ignored_pending", "ktest:lumen_kernel::linux::process::signal::fatal_signal_precedes_handlers_and_keeps_first_status"]
+
+[[feature]]
+name = "Forked children receive fault signals and fatal wakeups"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::fork_child_fault_is_delivered_and_reaped", "ktest:lumen_kernel::linux::process::kill_wakes_fork_child_and_wins_over_exit"]
+
+[[feature]]
+name = "Signal exit ordering and fork entry delivery"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::recorded_exit_wins_over_later_signals", "ktest:lumen_kernel::linux::process::fork_pending_signal_precedes_first_user_instruction", "ktest:lumen_kernel::linux::process::signal::forcing_without_a_fault_preserves_another_signal_diagnostic"]
+
+[[feature]]
+name = "Deferred debug traps preserve the original address across interrupt delivery"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::signal::frame::deferred_debug_trap_keeps_original_address"]
+
+[[feature]]
+name = "Deferred debug origins preserve syscall results and restart decisions"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::signal::frame::deferred_user_debug_trap_keeps_syscall_result", "ktest:lumen_kernel::linux::signal::frame::deferred_user_debug_trap_keeps_syscall_restart", "ktest:lumen_kernel::linux::signal::frame::deferred_lstar_debug_trap_reexecutes_syscall"]

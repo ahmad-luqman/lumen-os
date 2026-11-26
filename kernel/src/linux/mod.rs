@@ -381,25 +381,37 @@ pub fn command(ctx: &mut Ctx<'_>, args: &[String]) {
         Err(RunError::Run(e)) => return ctx.fail(format_args!("linux: failed to run '{name}': {e}")),
     };
 
+    let signal = exit.signal().map_or(0, |sig| sig.number());
+    let status = match exit {
+        UserExit::Exited(code) => code,
+        _ => 128 + signal as i32,
+    };
     match exit {
-        UserExit::Exited(code) => {
-            let _ = writeln!(ctx.out, "linux: {name} exit={code} leaked_frames={leaked_frames}");
+        UserExit::Exited(_) => {
+            let _ = writeln!(ctx.out, "linux: {name} exit={status} leaked_frames={leaked_frames}");
+        }
+        UserExit::Signaled(_) => {
+            let _ = writeln!(ctx.out, "linux: {name} exit={} signal={} leaked_frames={leaked_frames}", status, signal);
         }
         UserExit::Fault { vector, error_code, rip, cr2 } => {
             let _ = writeln!(
                 ctx.out,
-                "linux: {name} fault vector={vector} ({}) error={error_code:#x} rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}",
+                "linux: {name} exit={} signal={} vector={vector} ({}) error={error_code:#x} rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}",
+                status,
+                signal,
                 arch::idt::exception_name(vector),
             );
         }
         UserExit::NonCanonicalRip(rip) => {
-            let _ = writeln!(ctx.out, "linux: {name} non-canonical rip={rip:#x} leaked_frames={leaked_frames}");
+            let _ = writeln!(
+                ctx.out,
+                "linux: {name} exit={status} signal={signal} non-canonical rip={rip:#x} leaked_frames={leaked_frames}"
+            );
         }
         UserExit::BusError { rip, cr2 } => {
             let _ = writeln!(
                 ctx.out,
-                "linux: {name} exit={} (bus error) rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}",
-                UserExit::BUS_ERROR_STATUS
+                "linux: {name} exit={status} signal={signal} rip={rip:#x} cr2={cr2:#x} leaked_frames={leaked_frames}"
             );
         }
     }

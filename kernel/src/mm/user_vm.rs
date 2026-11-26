@@ -1222,6 +1222,12 @@ impl AddressSpace {
         change.current
     }
 
+    /// Whether a VMA covers an address, even when no PTE is present.
+    /// Signal faults use this to distinguish MAPERR from ACCERR.
+    pub fn contains_vma(&self, addr: u64) -> bool {
+        self.inner.lock().vmas.find(addr).is_some()
+    }
+
     /// Resolve a demand-paging `#PF` at `fault_addr` with CPU `error_code`.
     ///
     /// Must be called with interrupts enabled and `irq::depth() == 0` (step 3

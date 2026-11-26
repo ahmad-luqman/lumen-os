@@ -289,6 +289,12 @@ pub fn init_cpu() {
     }
 }
 
+/// Standard-format AVX component layout; XCR0 enables no features above AVX.
+pub fn signal_xfeature_layout() -> [lumen_signal::frame::XFeature; 1] {
+    let (size, offset, _, _) = cpuid_count(0xd, 2);
+    [lumen_signal::frame::XFeature { bit: 2, offset: offset as usize, size: size as usize }]
+}
+
 /// A user thread's 64-byte-aligned x87/SSE/AVX save area.
 ///
 /// Initialized with clean x86-64 architectural defaults (`FCW = 0x037F`,
@@ -356,10 +362,45 @@ impl UserFpuState {
         unsafe { lumen_fpu_restore(self.ptr.as_ptr(), m.stub_xcr0()) };
     }
 
+    /// Install only frame::restore's validated image, initializing every
+    /// enabled feature absent from it. The next restore cannot consume stale
+    /// extended state from the signal handler.
+    pub fn install_signal(&mut self, fp: Option<lumen_signal::frame::ValidatedFp<'_>>) {
+        use lumen_signal::frame::FpKind;
+        self.reset();
+        if let Some(fp) = fp {
+            let bytes = self.as_bytes_mut_internal();
+            bytes[..fp.bytes().len()].copy_from_slice(fp.bytes());
+            if let FpuMode::XSave { .. } = mode() {
+                let bv = match fp.kind() {
+                    FpKind::Fxsave => 3,
+                    FpKind::Xsave { xfeatures } => {
+                        u64::from_le_bytes(
+                            bytes[lumen_signal::abi::XSTATE_BV..lumen_signal::abi::XCOMP_BV].try_into().unwrap(),
+                        ) & xfeatures
+                    }
+                };
+                bytes[lumen_signal::abi::XSTATE_BV..lumen_signal::abi::XCOMP_BV].copy_from_slice(&bv.to_le_bytes());
+                bytes[lumen_signal::abi::XCOMP_BV..lumen_signal::abi::XHEADER_END].fill(0);
+            }
+        }
+        self.restore();
+    }
+
     /// x87 floating-point control word (`FCW`, offset 0).
     pub fn fcw(&self) -> u16 {
         let bytes = self.as_bytes();
         u16::from_le_bytes([bytes[FCW_OFFSET], bytes[FCW_OFFSET + 1]])
+    }
+
+    /// x87 status word, including pending exception bits.
+    pub fn fsw(&self) -> u16 {
+        u16::from_le_bytes(
+            self.as_bytes()[core::mem::offset_of!(lumen_signal::abi::FxSave, swd)
+                ..core::mem::offset_of!(lumen_signal::abi::FxSave, twd)]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// SSE control/status register (`MXCSR`, offset 24).

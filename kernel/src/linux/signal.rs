@@ -1,34 +1,19 @@
-//! The syscall-exit hook (M8's B2, ARCHITECTURE sections 6 and 8, "One
-//! interruptible, killable blocking wait"), run on syscall returns and
-//! non-IST interrupt returns to ring 3, and the restart block
-//! `restart_syscall` resumes. IST vectors are excluded. The syscall loop's
-//! later passes use `None` for the restart context, so it is resolved once.
-//!
-//! A blocking syscall's interruptible wait ends `Interrupted` when its
-//! thread has a signal to look at (`sched::Thread::sigpending`), and the
-//! handler returns a restart code (`-ERESTARTSYS`, `-ERESTARTNOINTR`,
-//! `-ERESTARTNOHAND`, `-ERESTART_RESTARTBLOCK`). None reaches user space:
-//! the hook resolves each, at the end of the syscall, with
-//! `lumen_signal::restart::decide`. Until C5 nothing is delivered, so every
-//! code is resolved as with no handler (`Handling::None`): a restart (`rax`
-//! the syscall's number, `rip` back over the 2-byte `syscall`), or for
-//! `-ERESTART_RESTARTBLOCK` `restart_syscall` (219), which resumes from the
-//! thread's [`RestartBlock`] (`-EINTR` with none, Linux's
-//! `do_no_restart_syscall`). Then, nothing being deliverable, the hook
-//! clears `sigpending` (under the process's signal lock). C5 adds delivery
-//! to the same hook: the restart decision then runs once, through
-//! `frame::build` when a handler is delivered and through `decide` when
-//! none is.
-//!
-//! The ktests raise a signal through [`raise_for_test`] (the flags and a
-//! kick, nothing queued: C5 adds the pending queues).
+//! Signal delivery on syscall, fork-entry and non-IST interrupt returns. Queue transitions
+//! are serialized by the process signal lock; frames and user copies happen
+//! after releasing it. Restart context is consumed once, never after sigreturn.
 
+use crate::linux::{general, process};
 use lumen_signal::restart::{Handling, RESTART_SYSCALL, RestartCode, RestartDecision, SyscallExit, decide};
+use lumen_signal::{Signal, pending::SigInfo};
 
 use crate::arch;
+use crate::arch::percpu::DebugCode;
 use crate::arch::syscall::SyscallFrame;
 use crate::linux::errno;
 use crate::sched;
+use crate::user::{UserFault, vector_signal};
+
+pub mod frame;
 
 /// What `restart_syscall` resumes (Linux's `struct restart_block`): set by
 /// a handler that returns `-ERESTART_RESTARTBLOCK` (a nanosleep's, a timed
@@ -67,30 +52,181 @@ pub const ERESTARTSYS: u32 = RestartCode::Sys as u32;
 /// `exit_to_user_from_interrupt`; IST vectors are excluded. Resolves a
 /// restart code in `frame.rax` only with a syscall context. Without one,
 /// registers stay unchanged, but a restart-block result drops the stored
-/// block. Then, if the thread has `sigpending`, clears it (nothing is
-/// deliverable before C5).
+/// block. Dequeues pending signals with the fatal check first, builds handler
+/// frames outside the signal lock, and clears sigpending when none remain.
 /// Callers loop while `sigpending` is set again by the time interrupts are
 /// off, passing `None` after the first pass, so the restart runs once.
-pub fn exit_to_user(frame: &mut SyscallFrame, syscall: Option<SyscallExit>) {
-    debug_assert!(
-        (arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0,
-        "the syscall-exit hook runs with interrupts on and no lock held"
-    );
-    resolve_restart(frame, decide(syscall, frame.rax, Handling::None));
-    settle_pending();
+/// Returns true when a handler rewrote the frame, requiring IRET.
+pub fn exit_to_user(frame: &mut SyscallFrame, mut syscall: Option<SyscallExit>) -> bool {
+    debug_assert!((arch::irq::enabled() || arch::irq::disabled_for_good()) && arch::irq::depth() == 0);
+    let mut rewritten = false;
+    loop {
+        let next = match process::try_current_thread() {
+            Some(t) => t.process().next_signal(t.tid()),
+            None => {
+                sched::clear_current_sigpending();
+                process::Delivery::None
+            }
+        };
+        match next {
+            process::Delivery::None => {
+                resolve_restart(frame, decide(syscall, frame.rax, Handling::None));
+                return rewritten;
+            }
+            process::Delivery::Fatal(sig, fault) => terminate(sig, fault),
+            process::Delivery::Handler(handler) => match self::frame::deliver(frame, handler, syscall) {
+                Ok(()) => {
+                    rewritten = true;
+                    syscall = None;
+                }
+                Err(failure) => force_sigsegv(Some(failure.signal), failure.reason),
+            },
+        }
+    }
 }
 
-/// The interrupt and exception return to ring 3's hook (`lumen_isr_common`,
-/// the timer's preemption included), called with interrupts off, from a
-/// non-IST vector: if the thread has `sigpending`, the hook with interrupts
-/// on, as often as it is set again before interrupts are off. No syscall
-/// context, so no register changes (C5 delivers here too).
-pub fn exit_to_user_from_interrupt() {
-    while sched::current_sigpending() {
-        arch::irq::restore(true);
-        settle_pending();
-        let _ = arch::irq::disable();
+/// Deliver pending work on any non-IST return to ring 3, including timer
+/// preemption and WAKEUP IPIs. Enters and leaves with interrupts disabled.
+pub fn exit_to_user_from_interrupt(trap: &mut arch::idt::TrapFrame) {
+    let pending_db = arch::percpu::take_pending_debug_trap();
+    if !sched::current_sigpending() && pending_db.is_none() {
+        return;
     }
+    let mut frame = self::frame::from_trap(trap);
+    arch::irq::restore(true);
+    if let Some(debug) = pending_db {
+        force_debug_trap(debug.code, debug.rip);
+    }
+    loop {
+        exit_to_user(&mut frame, None);
+        let _ = arch::irq::disable();
+        if !sched::current_sigpending() {
+            break;
+        }
+        arch::irq::restore(true);
+    }
+    frame.rflags = arch::syscall::sanitize_user_rflags(frame.rflags);
+    self::frame::to_trap(trap, &frame);
+}
+
+/// Force a synchronous standard signal on the current thread. Blocked or
+/// ignored faults become default-fatal; the return hook is always notified.
+pub fn force_fault(info: SigInfo, fault: Option<UserFault>) {
+    let me = process::current_thread();
+    me.process().force_signal(me.tid(), info, false, fault);
+}
+
+/// A failed SEGV frame resets its disposition. Other failures may be caught
+/// by an unblocked SEGV handler, for example on an alternate stack.
+pub fn force_sigsegv(failed: Option<Signal>, reason: frame::FailureReason) {
+    process::current_thread().force_frame_failure(failed, reason);
+}
+
+fn terminate(sig: Signal, fault: Option<UserFault>) -> ! {
+    let exit = fault.map(UserFault::into_exit).unwrap_or(crate::user::UserExit::Signaled(sig));
+    let (pid, is_test) = process::record_exit(exit);
+    if is_test {
+        crate::user::note_exit_status(128 + sig.number() as i32);
+    }
+    let failure = process::current_thread().take_frame_failure();
+    if let Some(failure) = failure.filter(|_| sig == Signal::SEGV) {
+        log::info!(target: "signal", "pid {pid}: could not deliver SIG{}: {}", failure.signal.number(), failure.reason);
+    } else if let Some(fault) = fault {
+        match fault {
+            UserFault::Trap { vector, error_code, rip, cr2 } => {
+                log::warn!(target: "user", "pid {pid}: killed by signal {}: trap {vector} error={error_code:#x} rip={rip:#x} cr2={cr2:#x}", sig.number())
+            }
+            UserFault::Bus { rip, cr2, error_code } => {
+                log::warn!(target: "user", "pid {pid}: killed by signal 7: file-backed page fault error={error_code:#x} rip={rip:#x} cr2={cr2:#x}")
+            }
+            UserFault::NonCanonicalRip(rip) => {
+                log::warn!(target: "user", "pid {pid}: killed by signal 11: invalid user return rip={rip:#x}")
+            }
+        }
+    }
+    // SAFETY: signal delivery runs on the current user's kernel stack; all
+    // signal/table guards and owning references have been dropped.
+    unsafe { arch::syscall::unwind_to_kernel() }
+}
+
+/// Queue a deferred debug signal using the original trap's address.
+pub fn force_debug_trap(code: DebugCode, rip: u64) {
+    force_fault(
+        SigInfo::fault(Signal::TRAP, i32::from(code.to_raw()), rip),
+        Some(UserFault::Trap { vector: 1, error_code: 0, rip, cr2: 0 }),
+    );
+}
+
+/// Translate a synchronous CPU fault after VM resolution, on the owning stack.
+pub fn exception(trap: &arch::idt::TrapFrame, cr2: u64, bus: bool, oom: bool) {
+    if let Some(debug) = arch::percpu::take_pending_debug_trap() {
+        force_debug_trap(debug.code, debug.rip);
+    }
+    let (sig, code, addr, fault) = if oom {
+        log::warn!(target: "mm", "pid {}: out of memory resolving a user page fault at cr2 {cr2:#x} (rip {:#x}); ending the process", process::current_process().pid(), trap.rip);
+        (Signal::KILL, general::SI_KERNEL as i32, 0, None)
+    } else if bus {
+        (
+            Signal::BUS,
+            general::BUS_ADRERR as i32,
+            cr2,
+            Some(UserFault::Bus { rip: trap.rip, cr2, error_code: trap.error_code }),
+        )
+    } else {
+        let Some((code, addr)) = cpu_fault(trap, cr2) else {
+            return;
+        };
+        (
+            vector_signal(trap.vector),
+            code,
+            addr,
+            Some(UserFault::Trap { vector: trap.vector, error_code: trap.error_code, rip: trap.rip, cr2 }),
+        )
+    };
+    force_fault(SigInfo::fault(sig, code, addr), fault);
+}
+fn cpu_fault(trap: &arch::idt::TrapFrame, cr2: u64) -> Option<(i32, u64)> {
+    let (code, addr) = match trap.vector {
+        0 => (general::FPE_INTDIV as i32, trap.rip),
+        1 => (general::TRAP_TRACE as i32, trap.rip),
+        6 => (general::ILL_ILLOPN as i32, trap.rip),
+        14 => (
+            if sched::current_address_space().is_some_and(|s| s.contains_vma(cr2)) {
+                general::SEGV_ACCERR
+            } else {
+                general::SEGV_MAPERR
+            } as i32,
+            cr2,
+        ),
+        16 | 19 => {
+            let fp = sched::snapshot_user_fpu().expect("user fault");
+            let status = if trap.vector == 19 {
+                let csr = fp.mxcsr();
+                (csr & !(csr >> 7)) & 0x3f
+            } else {
+                u32::from(fp.fsw() & !fp.fcw()) & 0x3f
+            };
+            (fpe_code(status)?, trap.rip)
+        }
+        17 => (general::BUS_ADRALN as i32, 0),
+        _ => (general::SI_KERNEL as i32, 0),
+    };
+    Some((code, addr))
+}
+fn fpe_code(status: u32) -> Option<i32> {
+    Some(if status & 1 != 0 {
+        general::FPE_FLTINV
+    } else if status & 4 != 0 {
+        general::FPE_FLTDIV
+    } else if status & 8 != 0 {
+        general::FPE_FLTOVF
+    } else if status & 0x12 != 0 {
+        general::FPE_FLTUND
+    } else if status & 0x20 != 0 {
+        general::FPE_FLTRES
+    } else {
+        return None;
+    } as i32)
 }
 
 /// Apply a restart decision to the frame: a restart sets `rax` and moves
@@ -100,42 +236,17 @@ pub fn exit_to_user_from_interrupt() {
 /// unless it becomes syscall 219 (Linux's `do_no_restart_syscall` reset).
 fn resolve_restart(frame: &mut SyscallFrame, decision: RestartDecision) {
     let was_restart_block = RestartCode::from_kernel_result(frame.rax as i64) == Some(RestartCode::RestartBlock);
-    let eintr = (-(errno::EINTR as i64)) as u64;
-    let keep_block = match decision {
-        RestartDecision::Unchanged => false,
-        RestartDecision::ReturnEintr => {
-            frame.rax = eintr;
-            false
-        }
-        RestartDecision::Restart { rax } => match frame.rip.checked_sub(2) {
-            Some(rip) => {
-                frame.rax = rax;
-                frame.rip = rip;
-                rax == RESTART_SYSCALL
-            }
-            None => {
-                log::error!(target: "signal", "corrupt syscall restart frame: rip {:#x} is below 2", frame.rip);
-                frame.rax = eintr;
-                false
-            }
-        },
-    };
+    let mut regs = self::frame::registers(frame);
+    let applied = decision.apply(&mut regs).is_ok();
+    if !applied {
+        log::error!(target: "signal", "corrupt syscall restart frame: rip {:#x} is below 2", frame.rip);
+        regs.rax = (-(errno::EINTR as i64)) as u64;
+    }
+    frame.rax = regs.rax;
+    frame.rip = regs.rip;
+    let keep_block = applied && matches!(decision, RestartDecision::Restart { rax: RESTART_SYSCALL });
     if was_restart_block && !keep_block {
         let _ = sched::take_restart_block();
-    }
-}
-
-/// The hook's last step: with nothing deliverable (always, before C5), the
-/// running thread's `sigpending` cleared, under its process's signal lock
-/// if it is a Linux thread (where C5's senders set it). `fatal_pending` is
-/// never cleared (C5 and C1 end such a thread here).
-fn settle_pending() {
-    if !sched::current_sigpending() {
-        return;
-    }
-    match crate::linux::process::try_current_thread() {
-        Some(thread) => crate::linux::process::settle_current_sigpending(&thread),
-        None => sched::clear_current_sigpending(),
     }
 }
 
@@ -160,8 +271,7 @@ pub fn restart_syscall() -> u64 {
     }
 }
 
-/// Ktests: raise `sig` on `thread` as a sender would before C5 queues
-/// anything: `sigpending` set (and `fatal_pending` for `SIGKILL`), then
+/// Ktests: simulate a notification without a queued signal: `sigpending` set (and `fatal_pending` for `SIGKILL`), then
 /// [`sched::kick`]. Nothing is queued, so the hook finds nothing to
 /// deliver: the signal behaves as an ignored one.
 #[cfg(feature = "ktest")]

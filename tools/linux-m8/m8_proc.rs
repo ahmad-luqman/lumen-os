@@ -4,18 +4,19 @@
 //! A `#![no_std]` dynamically linked musl x86-64 executable, built as
 //! `tools/linux-m7/`'s are (the Makefile) into `build/linux/`, which both
 //! images stage in `/usr/local/bin`. Its checks and their conventions:
-//! `common.rs` and ARCHITECTURE section 15, "M8's tests". The `fork-wait`
-//! mode checks C1's process lifecycle and clone ABI.
+//! `common.rs` and ARCHITECTURE section 15, "M8's tests". Unknown modes
+//! print usage and exit 64.
 
 #![no_std]
 #![no_main]
 
 #[macro_use]
 mod common;
+mod signals;
 
 use core::ffi::c_int;
 
-const USAGE: &str = "usage: m8_proc <mode> (fork-wait)";
+const USAGE: &str = "usage: m8_proc fork-wait|signal-spin|signals|faults|signal-bad <kind>|signal-fatal blocked|ignored|signal-hold|signal-probe <pid>|signal-wait restart|eintr|signal-kill <pid>";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
@@ -24,6 +25,16 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     let (args, n) = unsafe { common::args(argc, argv) };
     match &args[..n] {
         [_, b"fork-wait"] => fork_wait(),
+        [_, b"signal-spin"] => signals::spin(),
+        [_, b"signals"] => signals::signals(),
+        [_, b"faults"] => signals::faults(),
+        [_, b"signal-bad", kind] => signals::bad(kind),
+        [_, b"signal-fatal", kind] => signals::fatal(kind),
+        [_, b"signal-hold"] => signals::hold(),
+        [_, b"signal-probe", pid] => signals::probe(pid),
+        [_, b"signal-wait", b"restart"] => signals::wait(true),
+        [_, b"signal-wait", b"eintr"] => signals::wait(false),
+        [_, b"signal-kill", pid] => signals::kill(pid),
         _ => {
             say!("{USAGE}");
             common::USAGE_EXIT
@@ -36,6 +47,15 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
 use common::{R, eq, ok, sys};
 use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 
+const SYS_READ: u64 = 0;
+const SYS_KILL: u64 = 62;
+const SYS_FTRUNCATE: u64 = 77;
+const SYS_RT_SIGQUEUEINFO: u64 = 129;
+const SYS_SIGALTSTACK: u64 = 131;
+const SYS_TKILL: u64 = 200;
+const SYS_TGKILL: u64 = 234;
+const SYS_OPENAT: u64 = 257;
+const SYS_RT_TGSIGQUEUEINFO: u64 = 297;
 const SYS_OPEN: u64 = 2;
 const SYS_CLOSE: u64 = 3;
 const SYS_POLL: u64 = 7;

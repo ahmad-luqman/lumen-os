@@ -150,8 +150,8 @@ impl PollWaker for PollWait {
 /// Temporarily replaces the calling thread's signal mask for `ppoll` /
 /// `pselect6`, restoring it on drop on every exit path.
 ///
-/// Until C5/C6 add signal delivery and `saved_mask` (`restore_saved_sigmask_unless`),
-/// no user handler runs on syscall exit, so restoring here is exact.
+/// Handlers now run on syscall exit. Restoring this early is inexact until
+/// C6 supplies `saved_mask` (`restore_saved_sigmask_unless`) for that delivery.
 #[must_use = "dropping MaskGuard immediately restores the signal mask"]
 struct MaskGuard {
     prev: Option<Blocked>,

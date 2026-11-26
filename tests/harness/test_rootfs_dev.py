@@ -2827,7 +2827,7 @@ def test_make_rootfs_dev_rebuilds_after_a_lock_or_stager_change(tmp_path, newer)
                 "tools/ext4-signed-hash.sh",
                 "tools/alpine-packages.lock",
                 "tools/fetch-alpine-packages.sh",
-                *(f"tools/linux-m8/{n}.rs" for n in ("common", *M8_PROGRAMS)),
+                *(f"tools/linux-m8/{n}.rs" for n in ("common", "signals", *M8_PROGRAMS)),
             )
         )
         + 200
