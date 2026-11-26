@@ -37,6 +37,8 @@ mod files;
 pub(crate) use clone::{ProcessClone, clone_flags};
 mod signal;
 mod table;
+#[path = "timer.rs"]
+pub mod timer;
 
 use files::FilesAccess;
 pub use files::{Files, FsInner, FsState, ReservedFd};
@@ -627,6 +629,8 @@ impl Process {
     /// `/proc/<pid>/exe` is `ENOENT` once `mm` is gone). Each slot is
     /// emptied under its lock and released after.
     fn release_resources(&self) {
+        // A refused fork may retire an unlinked process (pid 0, no timers).
+        self.signal.lock().timers.clear(self.pid.load(Ordering::Acquire), true);
         let mm = self.mm.lock().take();
         if let Some(mm) = mm {
             mm.drop_user();

@@ -409,3 +409,24 @@ def test_sessions_and_process_groups(boot, tmp_path):
     assert "FAIL" not in out, out
     m.send_line("exit")
     assert m.wait_exit(10) == EXIT_SUCCESS
+
+
+def test_interval_and_posix_timers(boot, tmp_path):
+    """C13: interval floors, every notification, timer retirement and musl helper."""
+    m = boot("qemutest", devices=Devices(blk_image=copy_rootfs(tmp_path), rng=True))
+    m.expect(r"lumen> ", 60)
+    out = run(m, f"linux {PROC} timers", 180)
+    assert re.findall(r"^ok (.+)$", out, re.MULTILINE) == [
+        "timer-real",
+        "timer-notifications",
+        "timer-replacements",
+        "timer-overruns-ignore",
+        "timer-errors-fork",
+        "timer-exec-image",
+        "timer-exec",
+        "timer-musl-thread",
+    ], out
+    assert f"linux: {PROC} exit=0 " in out, out
+    assert "FAIL" not in out, out
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS

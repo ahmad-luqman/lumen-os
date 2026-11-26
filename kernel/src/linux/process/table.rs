@@ -4,6 +4,9 @@ use super::signal::{ThreadInit, ThreadSignals};
 use super::*;
 use lumen_signal::pending::{SenderClass, SigInfo};
 
+type SendResult = Result<Option<lumen_signal::pending::Enqueued>, u32>;
+type SendChange = Option<(lumen_proc::StateChange, lumen_proc::WaitStatus)>;
+
 /// Every process by pid and every user thread by tid, with the process
 /// tree (`PROCS`). Its methods are the only writers of its fields.
 pub(super) struct ProcTable {
@@ -489,6 +492,23 @@ impl ProcTable {
             return Ok(());
         }
         let mut state = process.signal.lock();
+        let (result, change) = self.send_locked(process, &mut state, tid, info, sender, None);
+        drop(state);
+        if let Some((change, status)) = change {
+            self.notify_change(process.pid(), change, status);
+        }
+        result.map(|_| ())
+    }
+
+    fn send_locked(
+        &mut self,
+        process: &Process,
+        state: &mut SignalState,
+        tid: Option<u32>,
+        info: SigInfo,
+        sender: SenderClass,
+        timer_instance: Option<u64>,
+    ) -> (SendResult, SendChange) {
         let change = if info.signal() == Signal::CONT && !state.ending() {
             let cancelled = state.cancel_stop(process);
             if let Some((signal, _)) = cancelled {
@@ -506,15 +526,42 @@ impl ProcTable {
         } else {
             None
         };
-        let result = state.send(tid, info, sender);
+        let result = state.send_result(tid, info, sender, timer_instance);
         if state.ending() {
             let _ = state.cancel_stop(process);
         }
+        (result, change)
+    }
+
+    /// A captured expiry checks its instance, sends and rearms in one siglock hold.
+    pub(super) fn expire_timer(&mut self, process: &Arc<Process>, id: timer::TimerId, instance: u64, now: u64) {
+        let mut state = process.signal.lock();
+        let Some(info) = timer::prepare(&mut state, id, instance, now) else { return };
+        let target = match &state.timers.get(id).expect("live timer").notify {
+            timer::TimerNotify::Process => Some(None),
+            timer::TimerNotify::None => None,
+            timer::TimerNotify::Thread(target) => self
+                .threads
+                .iter()
+                .find(|(_, t)| core::ptr::eq(Arc::as_ptr(t), target.as_ptr()))
+                .map(|(&tid, _)| Some(tid)),
+        };
+        let (result, change) = match (info, target) {
+            (Some(info), Some(tid)) => self.send_locked(
+                process,
+                &mut state,
+                tid,
+                info,
+                SenderClass::Other,
+                matches!(id, timer::TimerId::Posix(_)).then_some(instance),
+            ),
+            _ => (Ok(None), None),
+        };
+        timer::finish(process, &mut state, id, now, result);
         drop(state);
         if let Some((change, status)) = change {
             self.notify_change(process.pid(), change, status);
         }
-        result
     }
 
     pub(super) fn orphaned(&self, process: &Process) -> bool {

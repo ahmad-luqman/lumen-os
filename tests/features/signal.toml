@@ -47,3 +47,23 @@ tests = ["ktest:lumen_kernel::linux::process::signal::directed_fatal_signal_stay
 name = "Continue preserves unpublished stop events and serial reads honor signal restarts"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::linux::process::signal::continue_preserves_unpublished_stop_notifications", "ktest:lumen_kernel::linux::process::serial_read_interrupts_and_restarts_after_sigreturn"]
+
+[[feature]]
+name = "Interval and POSIX timers, notification identity, overruns and retirement"
+milestone = "M8"
+tests = ["cargo:lumen-signal", "scenario:test_linux_proc::test_interval_and_posix_timers", "ktest:lumen_kernel::linux::process::timer::timer_instances_queues_and_overruns", "ktest:lumen_kernel::linux::process::timer::timer_dead_identity_exec_and_exit_cleanup"]
+
+[[feature]]
+name = "Timer sends preserve stop/continue semantics and isolate reused creation ids"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::timer::timer_send_effects_and_creation_rollback"]
+
+[[feature]]
+name = "Timer provenance, delivery-time overruns, and disarm ABI"
+milestone = "M8"
+tests = ["cargo:lumen-signal", "ktest:lumen_kernel::linux::process::timer::user_si_timer_cannot_suppress_or_account_kernel_timer", "ktest:lumen_kernel::linux::process::timer::timer_delivery_forwards_before_worker_and_accounts_handlers", "ktest:lumen_kernel::linux::syscall::timer::timer_disarm_and_null_settime_abi"]
+
+[[feature]]
+name = "Pending timer remainder, refused one-shots, sleeping delivery and private exec cleanup"
+milestone = "M8"
+tests = ["cargo:lumen-signal", "ktest:lumen_kernel::linux::process::timer::pending_timer_remainder_preserves_delivery_accounting", "ktest:lumen_kernel::linux::process::timer::refused_oneshot_expiry_reports_loss", "ktest:lumen_kernel::linux::process::timer::sleeping_timer_waiter_accounts_overruns_on_resume", "ktest:lumen_kernel::linux::process::timer::exec_discards_private_timer_and_retains_user_siginfo"]
