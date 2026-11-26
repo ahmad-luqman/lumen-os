@@ -974,11 +974,12 @@ loaded into `CR3` when switching to one of its threads) and a VMA interval tree
       holds Lock 1 and Lock 4 together (the fault path does, Lock 1 then
       Lock 4, through `mmap_page`); a dropped page stays alive, pinned by its
       mapping, until the unmap. `invalidate_file_from` retires its leaves on
-      every CPU holding that address space (`tlb::shoot_down`, B5 below). Subsequent accesses in the
-      caller's space fault into `BusError` / `SIGBUS`, so its later file
-      growth can't split-brain against stale mapped frames; another process's
-      mappings still can until B7 ("Copy-on-write `fork` and TLB
-      shootdowns", below) reaches every space mapping the file.
+      every CPU holding that address space (`tlb::shoot_down`, B5 below).
+      Through `invalidate_file_mappings` (B7, "Copy-on-write `fork` and TLB
+      shootdowns", below), `truncate`, `ftruncate` and `openat(O_TRUNC)` call
+      `invalidate_file_from` on every address space mapping the file, so
+      subsequent accesses in any space fault into `BusError` / `SIGBUS` and
+      later file growth can't split-brain against stale mapped frames.
     - `msync(addr, len, flags)` (syscall 26) returns `0` immediately on
       `len == 0`, or a `len` within a page of 2^64 (Linux's rounding wraps
       it to 0), after validating page-aligned `addr` and valid `flags`;
@@ -1241,20 +1242,30 @@ and (future, C11: cross-CPU `fork` write-protect)
 `scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
 (section 15, "M8's tests", says what each checks).
 
-**Truncate reaching every address space (B7).** M7's
-`invalidate_file_from` works on the caller's space only. In M8 each
+**Truncate reaching every address space (B7, built).** M7's
+`invalidate_file_from` works on one space at a time. In M8 each
 mappable inode (`Ext4Inode`, `TmpfsInode`) keeps, beside its `pages:
-SleepMutex<PageCache>`, `mappers: SpinLock<Vec<Weak<AddressSpace>>>`
-(section 9's level 10c), reached as `page_cache_lock(inode)` reaches
-`pages` (a `page_cache_mappers(inode)` beside it in
-`vfs/page_cache.rs`), never under the `pages` lock. `AddressSpace::mmap_file`
-takes `self: &Arc<Self>` (B7) and registers the space when it adds the
-file's `mapped_files` entry (under Lock 1, before any fault can map a
-page of it), and the entry's removal unregisters it, dead `Weak`s pruned
-at each registration. `fork_copy` (section 8) registers the child for
-each mapped file before it copies any of that file's leaves, then reads
-the file's size and copies only leaves below it, private copies
-included; a leaf at or past it is left unmapped, so the child's access
+SleepMutex<PageCache>`, `mappers: Mappers` (an opaque wrapper in
+`mm/user_vm.rs` over `SpinLock<Vec<Weak<AddressSpace>>>`, section 9's
+level 10c), reached with `pages` through one private `mappable_parts(inode)`
+downcast in `vfs/page_cache.rs` (which derives `mappable`,
+`page_cache_lock` and `page_cache_mappers`), never under the `pages` lock.
+`Mappers` is a multiset: `register` prunes dead `Weak`s and pushes,
+`unregister_one` removes one matching entry via `Weak::ptr_eq`, and
+`snapshot` clones the list without editing it and upgrades each `Weak`
+outside the spinlock. Each `mapped_files` entry is a non-`Clone` RAII
+`Mapped { kept: KeptFile, space: Weak<AddressSpace> }`:
+`AddressSpace::mmap_file` takes `self: &Arc<Self>` and calls
+`Mapped::register` when it adds the file's `mapped_files` entry (under
+Lock 1, before any fault can map a page of it), and `Mapped::drop` calls
+`unregister_one` whenever the entry leaves (`munmap`, `MAP_FIXED`, `brk`,
+`teardown`, `Drop`, or a failed `fork_copy`'s child drop); the multiset
+prevents a late `Mapped::drop` outside Lock 1 from erasing a concurrent
+re-`mmap` of the same file. `fork_copy` (section 8) builds the child's
+`mapped_files` through `Mapped::fork_for` (registering the child for each
+mapped file under both Lock 1s) before reading the files' sizes, and
+copies only **private** leaves below EOF (page-cache leaves are never
+copied); a leaf at or past EOF is left unmapped, so the child's access
 refaults against the file (`SIGBUS` past EOF). The `mappers` lock orders
 the two: either the registration comes first and the truncate's snapshot
 holds the child, or the snapshot comes first, after the truncate set the
@@ -1262,15 +1273,19 @@ size, and the size the fork reads after registering is already the new
 one. (Linux serializes the same pair on `i_mmap_rwsem`, which
 `dup_mmap`'s VMA link and `unmap_mapping_range` both take.) A shrinking
 `truncate`, `ftruncate` or `openat(O_TRUNC)`, once the inode's truncate
-has returned and with no lock held, snapshots the list (each `Weak`
-upgraded, outside the list's lock) and calls `invalidate_file_from(file_id,
-new_size)` on each space in turn, each under its own Lock 1 with its own
-shootdown, so a page another process mapped from a stale size snapshot is
-unmapped as M7's rule unmaps the caller's (a space registered after the
-snapshot mapped nothing past the new size: a fault checks the size, and
-a fork copies only below the size it reads after registering). Tested by
-`ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space`
-and `ktest:lumen_kernel::mm::user_vm::fork_racing_a_truncate_copies_nothing_past_eof`
+has returned and with no lock held, calls `invalidate_file_mappings(inode,
+new_size)`, which snapshots the list (each `Weak` upgraded outside the
+list's lock) and calls `invalidate_file_from(file_id, new_size)` on each
+space in turn, each under its own Lock 1 with its own shootdown, so a page
+another process mapped from a stale size snapshot is unmapped as M7's rule
+unmaps the caller's (a space registered after the snapshot mapped nothing
+past the new size: a fault checks the size, and a fork copies only private
+leaves below the size it reads after registering). Tested by
+`ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space`,
+`ktest:lumen_kernel::mm::user_vm::fork_racing_a_truncate_copies_nothing_past_eof`,
+`ktest:lumen_kernel::mm::user_vm::file_vm_writable_maps_balance_through_mprotect_unmap_and_teardown`,
+and
+`ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_and_open_trunc_unmap_a_second_address_space`
 (section 15).
 
 **Faults as signals (C5).** Where M6 and M7 end the process
@@ -4311,7 +4326,7 @@ corresponding `*at(AT_FDCWD, ...)` handler):
 | 74 | `fsync(fd)` | flushes all dirty `PageCache` pages (incl. `writable_maps > 0`) and inode metadata to the filesystem, writes dirty `BlockCache` blocks, and issues `BlockDevice::flush()`; returns `0` on regular files/dirs (and detached unlinked inodes as a no-op), `-EBADF` on `O_PATH`, and `-EINVAL` on console/tty, `/dev/*`, character-device, FIFO and socket nodes and anything on procfs, as Linux (no `->fsync`); also on block-device nodes, an M7 deviation (Linux's `blkdev_fsync` syncs the device, which M7 can't open) |
 | 75 | `fdatasync(fd)` | flushes file data pages and size-changing metadata (ext4: all dirty metadata) through `BlockCache` + `BlockDevice::flush()` (same `-EBADF`/`-EINVAL` rules as `fsync`) |
 | 76 | `truncate(path, len)` | validates `len >= 0` (`-EINVAL`) before resolving `path` (following symlinks); a directory `-EISDIR`, any other non-regular file `-EINVAL`, a read-only mount `-EROFS`; then resizes as `ftruncate` does |
-| 77 | `ftruncate(fd, len)` | validates `len >= 0` and `fd` open for writing on a regular file (`-EINVAL` for `len < 0` first, `-EBADF` if closed or `O_PATH`, `-EINVAL` if not open for writing or not regular, `-EROFS` on a read-only mount, `-EFBIG` past the filesystem's largest file); the inode's truncate zeroes the partial final page's tail when `len % 4096 != 0` on shrink (or the old tail on grow), drops cached pages past `len.div_ceil(4096)` and updates `st_size` and `mtime`/`ctime`; then `invalidate_file_from` unmaps the caller's mapped PTEs past `align_up_page(len)` (section 5; the caller's space only until M8, when B7 reaches every space mapping the file) |
+| 77 | `ftruncate(fd, len)` | validates `len >= 0` and `fd` open for writing on a regular file (`-EINVAL` for `len < 0` first, `-EBADF` if closed or `O_PATH`, `-EINVAL` if not open for writing or not regular, `-EROFS` on a read-only mount, `-EFBIG` past the filesystem's largest file); the inode's truncate zeroes the partial final page's tail when `len % 4096 != 0` on shrink (or the old tail on grow), drops cached pages past `len.div_ceil(4096)` and updates `st_size` and `mtime`/`ctime`; then `invalidate_file_mappings` runs `invalidate_file_from` on every address space mapping the file to unmap PTEs past `align_up_page(len)` (section 5, B7) |
 | 79 | `getcwd(buf, size)` | returns canonical NUL-terminated path of the process's current working directory (computed/maintained across ancestor `rename`, length including NUL, `-ERANGE` if `size` too small, `-ENOENT` if cwd was unlinked / `st_nlink == 0`) |
 | 80 | `chdir(path)` | resolves `path` (following symlinks), requires directory (`-ENOTDIR`), updates process `cwd` inode and path (extracting and dropping the old `Arc<VfsInode>` outside the process's locks) |
 | 81 | `fchdir(fd)` | validates `fd` refers to an open directory (`-ENOTDIR`/`-EBADF`; `O_PATH` dirs allowed), updates process `cwd` |
@@ -4373,7 +4388,7 @@ depends on them.
 | B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended), `fork_copy_out_of_frames_rolls_back`, `fork_copy_preserves_files_images_and_private_copies` | 5, 8 |
 | B5 | the TLB shootdown IPI | B2 | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `PerCpu::loaded_space`, `tlb::shoot_down`, the shootdown warning's `HOST_TIMED` entry; `mm::tlb::shootdown_across_cpus` (its probes use B2's `read_u32_nofault`) | 5, 9 |
 | B6 | SMP migration, priorities, affinity | B5, C1 | `on_cpu`, `spawn_migratable`, `spawn_fork_child` migratable (C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
-| B7 | truncate reaching every address space | B1, B4, B5 | the inode's mappers list, `mmap_file(self: &Arc<Self>)`; `truncate_unmaps_every_address_space`, `fork_racing_a_truncate_copies_nothing_past_eof` | 5 |
+| B7 | truncate reaching every address space | B1, B4, B5 | the inode's `Mappers`, the registering `Mapped` entry, `invalidate_file_mappings`, `mmap_file(self: &Arc<Self>)`; `truncate_unmaps_every_address_space`, `fork_racing_a_truncate_copies_nothing_past_eof`, `mappers_multiset_keeps_registration_across_late_drop`, `meta_truncate_and_open_trunc_unmap_a_second_address_space`, `file_vm_writable_maps_balance_through_mprotect_unmap_and_teardown`'s mapper counts | 5 |
 | B8 | the five M8 hazards | B1 | `OpenFile::pos`, `FdTable::reserve`, `PosixWaitGraph`'s key; the hazard ktests | 8, 9 |
 | C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | B0, B1, B2, B4 | `spawn_fork_child` taking the `UserThread`, pinned to the caller's CPU (B6 makes it migratable), `Files::users` across `fork`; `test_fork_wait_and_exit_status` | 8 |
 | C2 | `execve`, single-threaded, `#!`, the streaming loader | B0, C1 | lumen-elf's header split, `ImageSource`, the stack-size parameter; `test_fork_cow_and_exec_shebang` (its single-threaded checks) | 5, 8 |
@@ -4456,7 +4471,7 @@ number, flag, errno and struct layout below from `linux-raw-sys`. In
 | 62 | `kill(pid, sig)` | `pid > 0` the process, 0 the caller's group, -1 every process but pid 1 and the caller, `< -1` the group `-pid`; nothing found `-ESRCH` before checking `sig` outside 0..=64 (`-EINVAL`); `sig` 0 only checks; `SI_USER` with the caller's pid (`SenderClass::SiUser`) | C5, C8 |
 | 72 | `fcntl(fd, cmd, arg)` | M7's, plus `F_SETPIPE_SZ` (1031: `Pipe::set_capacity` with `DEFAULT_MAX_CAPACITY`, 1 MiB, as the bound for everyone, `-EPERM` past it, a deviation for root, whom Linux lets past `pipe-max-size`; fewer bytes than are queued `-EBUSY`) and `F_GETPIPE_SZ` (1032), both `-EBADF` on anything but a pipe; `F_SETFL`'s `O_NONBLOCK` on pipes and ttys; `F_SETLKW` interrupted `-ERESTARTSYS` | B2, C7 |
 | 73 | `flock(fd, op)` | M7's; a blocking request interrupted `-ERESTARTSYS` | B2 |
-| 76, 77 | `truncate`, `ftruncate` | M7's, invalidating the mappings of every address space that maps the file (section 5) | B7 |
+| 76, 77 | `truncate`, `ftruncate` | M7's (and `openat(O_TRUNC)`), invalidating the mappings of every address space that maps the file via `invalidate_file_mappings` (section 5) | B7 |
 | 98 | `getrusage(who, usage)` | `RUSAGE_SELF` (0) the process's ticks, `RUSAGE_CHILDREN` (-1) its reaped children's, `RUSAGE_THREAD` (1) the caller's; any other `-EINVAL`; `ru_utime`/`ru_stime` from the timer interrupt's charge by the interrupted `CS` (1 ms ticks), every other field 0; `-EFAULT` | C12 |
 | 99 | `sysinfo(info)` | **moved from M10** (gcc, g++, make and vim call it: 35 census calls): `uptime` from `time::since_boot_ns`, `loads` 0, `totalram`/`freeram` from the frame allocator, `bufferram` the page cache's bytes, `sharedram`/`totalswap`/`freeswap`/`totalhigh`/`freehigh` 0, `procs` the live processes, `mem_unit` 1; `-EFAULT` | C12 |
 | 109 | `setpgid(pid, pgid)` | `ProcTree::setpgid` | C8 |
@@ -7069,12 +7084,15 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
        `[new_size % 4096 .. 4096)` of `page_index = new_size / 4096` if it
        is cached, marking it dirty for a linked `ext4` file
        (`writes_back`); then the size is set;
-    2. once it has returned, the caller's
-       `AddressSpace::invalidate_file_from`, under Lock 1, unmaps all
-       file-VMA PTEs covering `file_off >= align_up_page(new_size)` (section
-       5). The truncate syscall never holds both locks. This reaches the
-       caller's space only until M8 (`openat(O_TRUNC)` included), when B7
-       reaches every address space mapping the file (section 5).
+    2. once it has returned, `user_vm::invalidate_file_mappings` snapshots
+       the inode's `Mappers` list and calls `AddressSpace::invalidate_file_from`
+       under each registered space's Lock 1, unmapping all file-VMA PTEs
+       covering `file_off >= align_up_page(new_size)` with cross-CPU TLB
+       shootdowns (section 5, B7). The truncate syscall never holds Lock 1
+       and Lock 4 together. Debug and kernel-side truncations (`vfstest
+       truncate`, `create_truncated`, `open_kernel_file(O_TRUNC)`) skip
+       invalidation; a stale read there is not a use-after-free because the
+       pages stay pinned by their mappings.
   - Extending a file (`ftruncate` grow or `write`/`pwrite64` past `old_size`):
     if `old_size % 4096 != 0` and `page_index = old_size / 4096` is present in
     `PageCache`, zeroes `[old_size % 4096 .. 4096)` before exposing the
@@ -7121,10 +7139,10 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
   - *Truncate:* a shrink's `resize` drops the cache's own reference
     to pages past the new size and stops counting them, even if a mapping
     still holds one. The page stays alive, pinned by that mapping, until
-    section 5's truncate invalidation, run by the shrinking syscall once
-    the truncate has returned, unmaps it (section 5's rules: the syscall
-    never holds Lock 1 and Lock 4 together, the caller's space only until
-    M8, when B7 reaches every space mapping the file).
+    section 5's truncate invalidation (`invalidate_file_mappings`), run by
+    the shrinking syscall once the truncate has returned, unmaps it from
+    every registered address space mapping the file (section 5's rules: the
+    syscall never holds Lock 1 and Lock 4 together).
   - *Other inodes:* `NoDev` for directories, symlinks, and every inode of
     another filesystem (`devfs`, `procfs`); `NoEnt` for an `ext4` inode
     unlinked and not open.
@@ -7136,22 +7154,22 @@ per-inode `PageCache` holding 4 KiB `Arc<CachePage>` entries keyed by
     `MappedPage::map_writable` (below). `file_size` is a snapshot, which a
     truncate may make stale even while the fault holds Lock 1 (the truncate
     takes Lock 4 alone). A page mapped from a stale snapshot is still
-    unmapped: the shrinking syscall's `invalidate_file_from` takes Lock 1
-    after the truncate, so it runs after that fault's mapping is in place.
-    This holds for the caller's own space only until M8 (B7, section 5).
-    A private copy-on-write copy of the end page made from
+    unmapped: the shrinking syscall's `invalidate_file_mappings` runs
+    `invalidate_file_from` under each registered space's Lock 1 after the
+    truncate, so it runs after that fault's mapping is in place (B7, section
+    5). A private copy-on-write copy of the end page made from
     a stale snapshot can keep bytes past the new end (bytes a shared mapping
     stored past it).
   - *Reaching the concrete inode:* `VfsInode::as_any(&self) ->
     Option<&dyn Any>`, a default trait method returning `None`, overridden
     by `Ext4Inode` and `TmpfsInode` to return themselves. Its users are
-    `mmap_page` and `page_cache_lock` (behind `mappable` and
-    `MappedPage::copy_to_frame`), which downcast to either inode for its
-    page cache, and, since #324,
+    `mmap_page` and `mappable_parts` (behind `mappable`, `page_cache_lock`,
+    `page_cache_mappers` and `MappedPage::copy_to_frame`), which downcast to
+    either inode for its page cache and `Mappers` list, and, since #324,
     `tmpfs::quota_use`, which downcasts a mount's root inode to
     `TmpfsInode` alone for the shell's `mount`. Another cached filesystem
     that overrides it also needs its own branch in `mmap_page` and
-    `page_cache_lock`. For the page cache, a kernel-side registry was the
+    `mappable_parts`. For the page cache, a kernel-side registry was the
     alternative, but `tmpfs` has none, an unlinked (detached) file isn't
     reachable by walking a tree, and the `ext4` one costs a scan per
     fault.
@@ -10732,15 +10750,34 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   pinned thread's switch delayed by `allow_switch`). It fails on fewer
   than 4 CPUs.
 - `ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space`
-  (B7): two spaces mapping one file, the second loaded on another CPU, and
-  a third forked from one: after the truncate none reads past the new end.
+  (B7): on both tmpfs and ext4 (requires at least 2 online CPUs), two spaces
+  mapping one file (the second loaded and actively probed via
+  `read_u32_nofault` on another CPU) and a third forked from the first;
+  after `truncate` + `invalidate_file_mappings`, checks `unmapped == 5`,
+  zero stale reads and immediate faults on the remote CPU (while page 0
+  and page 1's zeroed tail stay readable), every space's page-2 leaves gone
+  and refaulting into `BusError`, the shared private CoW copy freed,
+  `writable_maps == 0`, and `mappers == 0` after teardown. Unregistration
+  across `munmap`, `MAP_FIXED` (both anonymous replacement and same-file
+  replacement keeping registration), `brk`, `teardown` and `Drop` is
+  asserted on both tmpfs and ext4 in
+  `ktest:lumen_kernel::mm::user_vm::file_vm_writable_maps_balance_through_mprotect_unmap_and_teardown`,
+  and the real `truncate`, `ftruncate` and `openat(O_TRUNC)` syscalls
+  reaching a second address space are checked by
+  `ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_and_open_trunc_unmap_a_second_address_space`.
 - `ktest:lumen_kernel::mm::user_vm::fork_racing_a_truncate_copies_nothing_past_eof`
-  (B7): a parent with private (copied) and page-cache leaves of a file
-  past the new end; the truncate's mapper snapshot is taken through a seam
-  while `fork_copy` holds the parent's Lock 1 before registering the
-  child, then the truncate finishes: the child's read past the new end is
-  a bus error, not the old page. It kills the mutant that copies leaves
-  without the size check.
+  (B7): on both tmpfs and ext4, a parent with private (copied) and
+  page-cache (writable and read-only) leaves of a file past the new end;
+  phase 1 takes the truncate's mapper snapshot through `before_register`
+  while `fork_copy` holds both Lock 1s before registering the child
+  (asserting `mappers == 1` at the truncate seam and `mappers == 2` at
+  `before_sizes`, before `file_sizes` runs), proving the child skips leaves
+  at or past the new EOF (`BusError`, not the old page, killing both the
+  missing-size-check and register-after-`file_sizes` mutants); phase 2
+  takes the snapshot through `after_precount` after registration
+  (`mappers == 2`) and after `file_sizes` saw the old size, proving the
+  snapshot reaches the child and unmaps the copied leaf once `fork_copy`
+  releases its Lock 1.
 - `scenario:test_linux_vm::test_cross_cpu_munmap_and_mprotect_shootdown`
   (C11): readers pinned to every CPU, each confirming a read first, then
   reading a page another thread unmaps or protects: each gets `SIGSEGV`

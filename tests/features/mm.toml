@@ -202,3 +202,14 @@ milestone = "M8"
 tests = [
     "ktest:lumen_kernel::mm::tlb::shootdown_across_cpus",
 ]
+
+[[feature]]
+name = "Shrinking truncate reaching every address space (#378, B7): per-inode mappers list on ext4 and tmpfs, AddressSpace::mmap_file(self: &Arc<Self>) registration and munmap/MAP_FIXED/brk/teardown/Drop unregistration, fork_copy registering before reading file sizes and omitting leaves at or past EOF, and truncate/ftruncate/openat(O_TRUNC) shooting down every mapped space across CPUs"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::mm::user_vm::truncate_unmaps_every_address_space",
+    "ktest:lumen_kernel::mm::user_vm::fork_racing_a_truncate_copies_nothing_past_eof",
+    "ktest:lumen_kernel::mm::user_vm::mappers_multiset_keeps_registration_across_late_drop",
+    "ktest:lumen_kernel::mm::user_vm::file_vm_writable_maps_balance_through_mprotect_unmap_and_teardown",
+    "ktest:lumen_kernel::linux::syscall::meta::tests::meta_truncate_and_open_trunc_unmap_a_second_address_space",
+]

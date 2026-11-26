@@ -12,10 +12,9 @@
 //! there reach devfs's setters, which keep a node's new mode, owner and
 //! times in memory and refuse `/dev` itself (#293).
 //!
-//! A truncate then unmaps the current process's mapped pages of the file
-//! past its new end (`AddressSpace::invalidate_file_from`), so a later
-//! access there is a bus error. Other processes' mappings aren't reached
-//! until M8 (issue #255).
+//! A shrinking truncate then unmaps every address space's mapped pages of
+//! the file past its new end (`user_vm::invalidate_file_mappings`, B7), so
+//! a later access there is a bus error.
 
 use alloc::sync::Arc;
 
@@ -203,16 +202,15 @@ fn length(raw: u64) -> Result<u64, u32> {
 }
 
 /// Resize `inode` (a regular file) on a writable mount (`-EROFS`) to `len`,
-/// then unmap the current process's pages of it past the new end
+/// then unmap every address space's pages of it past the new end
 /// (`super::unmap_past`). A grow finds nothing to unmap: a fault refuses a
-/// page wholly past the old end, and every shrink of the caller's
-/// (`truncate`, `ftruncate`, `openat(O_TRUNC)`) unmapped its own pages
-/// past the end it made; any leaf past the new end is cleared all the same.
+/// page wholly past the old end, and every shrink (`truncate`, `ftruncate`,
+/// `openat(O_TRUNC)`) unmapped every mapped space's pages past the end it
+/// made; any leaf past the new end is cleared all the same.
 fn resize(inode: &dyn VfsInode, len: u64) -> Result<u64, u32> {
     writable_mount(inode)?;
-    let space = super::shrinking_space();
     match inode.truncate(len) {
-        Ok(()) => super::unmap_past(&space, inode, len),
+        Ok(()) => super::unmap_past(inode, len),
         Err(e) => {
             // A truncate can fail after it shrank the file in memory (ext4's
             // errors=remount-ro, #349: `EIO` from a truncate the volume
@@ -220,7 +218,7 @@ fn resize(inode: &dyn VfsInode, len: u64) -> Result<u64, u32> {
             // below it (that would drop a private mapping's copied pages of
             // a file that didn't shrink).
             if let Ok(meta) = inode.stat() {
-                super::unmap_past(&space, inode, meta.size.max(len));
+                super::unmap_past(inode, meta.size.max(len));
             }
             return Err(vfs(e));
         }
@@ -877,6 +875,121 @@ mod tests {
                 shrink_unmaps(&f, || sys_ftruncate(fd, P + 10))
                     .inspect_err(|_| crate::ktest::diag(format_args!("ftruncate on ext4")))?;
                 kassert_eq!(sys_close(fd), 0);
+                Ok(())
+            })?
+        }
+    );
+
+    crate::ktest!(
+        fn meta_truncate_and_open_trunc_unmap_a_second_address_space() {
+            // B7: the real `truncate`, `ftruncate` and `openat(O_TRUNC)`
+            // syscalls invalidate mapped pages past the new EOF in a second
+            // address space that is not the caller's.
+            use crate::mm::user_vm::{AddressSpace, file_vm_leaf, file_vm_open};
+            use crate::vfs::page_cache::ktest_files::Ext4Volume;
+
+            fn check_second_space(
+                f: &Arc<dyn VfsInode>,
+                check_page: u64,
+                shrink: impl FnOnce() -> Result<(), &'static str>,
+            ) -> Result<(), &'static str> {
+                use crate::sched::{self, UserSpaceGuard};
+                use crate::user::copy_from_user;
+                use core::sync::atomic::{AtomicBool, Ordering};
+
+                const KEEP: &[u8; 8] = b"keep-p0!";
+                let other = Arc::new(AddressSpace::new().map_err(|_| "other AddressSpace::new")?);
+                let rw = Prot::READ | Prot::WRITE;
+                let shared = other
+                    .mmap_file(MapPlace::Hint(None), 3 * P, rw, file_vm_open(f)?, 0, Sharing::Shared)
+                    .map_err(|_| "other map shared")?;
+                let priv_va = other
+                    .mmap_file(MapPlace::Hint(None), 3 * P, rw, file_vm_open(f)?, 0, Sharing::Private)
+                    .map_err(|_| "other map priv")?;
+                let off = check_page * P;
+                kassert_eq!(other.handle_page_fault(shared + off, 1 << 1), FaultResult::Resolved);
+                kassert_eq!(other.handle_page_fault(priv_va + off, 1 << 1), FaultResult::Resolved);
+                kassert!(file_vm_leaf(&other, shared + off).is_some());
+                kassert!(file_vm_leaf(&other, priv_va + off).is_some());
+
+                // When the shrink leaves a nonzero file size (`check_page > 0`),
+                // write private page 0 and verify its leaf and bytes survive.
+                let kept_p0 = if check_page > 0 {
+                    let wrote = Arc::new(AtomicBool::new(false));
+                    let wrote_t = wrote.clone();
+                    let space_t = other.clone();
+                    sched::spawn("b7-meta-w0", move || {
+                        let _active = UserSpaceGuard::enter(space_t);
+                        wrote_t.store(copy_to_user(priv_va, KEEP).is_ok(), Ordering::Release);
+                    })
+                    .map_err(|_| "spawn write p0")?
+                    .join();
+                    kassert!(wrote.load(Ordering::Acquire));
+                    Some(file_vm_leaf(&other, priv_va).ok_or("priv p0 missing")?.phys)
+                } else {
+                    None
+                };
+
+                shrink()?;
+                for va in [shared + off, priv_va + off] {
+                    kassert!(file_vm_leaf(&other, va).is_none());
+                    kassert_eq!(other.handle_page_fault(va, 0), FaultResult::BusError);
+                }
+                if let Some(p0_phys) = kept_p0 {
+                    kassert_eq!(file_vm_leaf(&other, priv_va).map(|m| m.phys), Some(p0_phys));
+                    let ok = Arc::new(AtomicBool::new(false));
+                    let ok_t = ok.clone();
+                    let space_t = other.clone();
+                    sched::spawn("b7-meta-r0", move || {
+                        let _active = UserSpaceGuard::enter(space_t);
+                        let mut got = [0u8; 8];
+                        ok_t.store(copy_from_user(&mut got, priv_va).is_ok() && &got == KEEP, Ordering::Release);
+                    })
+                    .map_err(|_| "spawn read p0")?
+                    .join();
+                    kassert!(ok.load(Ordering::Acquire));
+                }
+                other.teardown();
+                Ok(())
+            }
+
+            process::in_test_process(|_| {
+                let data: Vec<u8> = (0..3 * P as usize).map(|i| (i % 251) as u8 | 1).collect();
+
+                // 1. `sys_truncate` on tmpfs.
+                let path = make_file(0, b"/tmp/meta-ktest-b7-trunc", &data)?;
+                let f = inode_of("/tmp/meta-ktest-b7-trunc")?;
+                check_second_space(&f, 2, || {
+                    kassert_eq!(sys_truncate(path, P + 10), 0);
+                    Ok(())
+                })
+                .inspect_err(|_| crate::ktest::diag(format_args!("sys_truncate on tmpfs")))?;
+                remove(&[b"/tmp/meta-ktest-b7-trunc"]);
+
+                // 2. `sys_ftruncate` on ext4.
+                let vol = Ext4Volume::new(203)?;
+                let f = vol.root.create(b"b7-ftrunc", 0o644).map_err(|_| "create on ext4")?;
+                kassert_eq!(f.write_at(0, &data), Ok(data.len()));
+                let fd = ktest_install(&f, b"/b7-ftrunc", OpenFlags::O_RDWR)?;
+                check_second_space(&f, 2, || {
+                    kassert_eq!(sys_ftruncate(fd, P + 10), 0);
+                    Ok(())
+                })
+                .inspect_err(|_| crate::ktest::diag(format_args!("sys_ftruncate on ext4")))?;
+                kassert_eq!(sys_close(fd), 0);
+
+                // 3. `sys_openat(O_TRUNC)` on tmpfs.
+                let path = make_file(1, b"/tmp/meta-ktest-b7-otrunc", &data)?;
+                let f = inode_of("/tmp/meta-ktest-b7-otrunc")?;
+                check_second_space(&f, 0, || {
+                    let flags = OpenFlags::from_bits(OpenFlags::O_RDWR | OpenFlags::O_TRUNC);
+                    let ret = sys_openat(Dirfd::Cwd, path, flags, at::reg(0));
+                    let fd = ktest_fd_of(ret, "openat(O_TRUNC)", b"/tmp/meta-ktest-b7-otrunc")?;
+                    kassert_eq!(sys_close(fd), 0);
+                    Ok(())
+                })
+                .inspect_err(|_| crate::ktest::diag(format_args!("sys_openat(O_TRUNC) on tmpfs")))?;
+                remove(&[b"/tmp/meta-ktest-b7-otrunc"]);
                 Ok(())
             })?
         }
