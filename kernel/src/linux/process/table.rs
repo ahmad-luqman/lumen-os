@@ -237,7 +237,15 @@ impl ProcTable {
                 counter.fetch_add(ticks, Ordering::Relaxed);
             }
         }
-        thread.process().signal.lock().remove_thread(tid);
+        let completed = {
+            let mut state = thread.process().signal.lock();
+            let completed = state.participate_stop(tid);
+            state.remove_thread(tid);
+            completed
+        };
+        if let Some(stop) = completed {
+            self.complete_stop(thread.process(), stop);
+        }
         let gone = self.threads.remove(&tid).unwrap_or_else(|| panic!("thread {tid} wasn't in PROCS"));
         assert!(Arc::ptr_eq(&gone, thread), "tid {tid} in PROCS is another thread");
         gone
@@ -269,12 +277,11 @@ impl ProcTable {
                 ExitAction::Released { child, .. } => {
                     gone.push(procs.remove(&child).expect("released process"));
                 }
-                ExitAction::Notify { parent, child, released, .. } => {
-                    procs.get(&parent).expect("live parent").child_changed();
+                ExitAction::Notify { parent, child, status, released } => {
+                    Self::notify_child(procs.get(&parent).expect("live parent"), child, status.into());
                     if released.is_some() {
                         gone.push(procs.remove(&child).expect("released zombie"));
                     }
-                    // SIGCHLD delivery is C6; the child-event wait is live now.
                 }
                 // Nothing to signal before M8's signal delivery.
                 ExitAction::HangupThenContinue { .. } => {}
@@ -346,34 +353,32 @@ impl ProcTable {
         rows.into_values().collect()
     }
     pub(super) fn send_thread(
-        &self,
+        &mut self,
         tgid: Option<u32>,
         tid: u32,
         info: Result<Option<SigInfo>, u32>,
         sender: SenderClass,
     ) -> Result<(), u32> {
-        let t = self.threads.get(&tid).ok_or(errno::ESRCH)?;
+        let t = self.threads.get(&tid).cloned().ok_or(errno::ESRCH)?;
         if tgid.is_some_and(|pid| pid != t.process().pid()) {
             return Err(errno::ESRCH);
         }
-        let mut state = t.process().signal.lock();
-        state.thread(tid).ok_or(errno::ESRCH)?;
         if let Some(info) = info? {
-            state.send(Some(tid), info, sender)?;
+            self.send_to(t.process(), Some(tid), info, sender)?;
         }
         Ok(())
     }
     pub(super) fn send_process(
-        &self,
+        &mut self,
         caller: u32,
         pid: i32,
         info: Result<Option<SigInfo>, u32>,
         sender: SenderClass,
     ) -> Result<(), u32> {
         if pid > 0 {
-            let process = self.procs.get(&(pid as u32)).ok_or(errno::ESRCH)?;
+            let process = self.procs.get(&(pid as u32)).cloned().ok_or(errno::ESRCH)?;
             if let Some(info) = info? {
-                process.signal.lock().send(None, info, sender)?;
+                self.send_to(&process, None, info, sender)?;
             }
             return Ok(());
         }
@@ -384,7 +389,7 @@ impl ProcTable {
         } else {
             None
         };
-        let mut found = false;
+        let mut targets = Vec::new();
         for (&id, process) in &self.procs {
             let matches = if pid == -1 {
                 id != INIT_PID && id != caller
@@ -394,12 +399,94 @@ impl ProcTable {
             if !matches {
                 continue;
             }
-            found = true;
-            if let Some(info) = info? {
-                process.signal.lock().send(None, info, sender)?;
+            targets.push(Arc::clone(process));
+        }
+        if targets.is_empty() {
+            return Err(errno::ESRCH);
+        }
+        if let Some(info) = info? {
+            for process in targets {
+                self.send_to(&process, None, info, sender)?;
             }
         }
-        if found { Ok(()) } else { Err(errno::ESRCH) }
+        Ok(())
+    }
+
+    /// The table hold pins identities through continue and parent notification.
+    fn send_to(&mut self, process: &Process, tid: Option<u32>, info: SigInfo, sender: SenderClass) -> Result<(), u32> {
+        // The kernel's reaper has no user thread and cannot be killed or stopped.
+        if process.pid() == INIT_PID {
+            return Ok(());
+        }
+        let mut state = process.signal.lock();
+        let change = if info.signal() == Signal::CONT && !state.ending() {
+            let cancelled = state.cancel_stop(process);
+            if let Some((signal, _)) = cancelled {
+                // The signal state may have completed (or begun) the stop
+                // before its tree publication. Materialize it only inside
+                // this PROCS hold, then replace it with the continued status.
+                // Waiters cannot see that intermediate tree state; only the
+                // CONT notification selected below is sent.
+                let _ = self.tree.stop(process.pid(), signal).expect("live continuing process");
+            }
+            self.tree
+                .cont(process.pid())
+                .ok()
+                .map(|change| (change, cancelled.map_or(lumen_proc::WaitStatus::Continued, |(_, status)| status)))
+        } else {
+            None
+        };
+        let result = state.send(tid, info, sender);
+        if state.ending() {
+            let _ = state.cancel_stop(process);
+        }
+        drop(state);
+        if let Some((change, status)) = change {
+            self.notify_change(process.pid(), change, status);
+        }
+        result
+    }
+
+    pub(super) fn start_job_stop(&self, process: &Process, tid: u32, sig: Signal) {
+        let group = self.tree.pgid(process.pid()).expect("live stop group");
+        if !self.tree.is_orphaned_pgrp(group) {
+            process.signal.lock().start_stop(tid, sig, process);
+        }
+    }
+
+    pub(super) fn complete_stop(&mut self, process: &Process, stop: super::signal::GroupStop) {
+        let state = process.signal.lock();
+        if state.ending() {
+            return;
+        }
+        let Some(signal) = state.completed_stop_signal(stop) else { return };
+        let change = self.tree.stop(process.pid(), signal).expect("live stopped process");
+        drop(state);
+        self.notify_change(process.pid(), change, lumen_proc::WaitStatus::Stopped(signal));
+    }
+
+    fn notify_change(&self, child: u32, change: lumen_proc::StateChange, status: lumen_proc::WaitStatus) {
+        if let lumen_proc::StateChange::Changed { parent: Some(parent) } = change {
+            Self::notify_child(self.procs.get(&parent).expect("live parent"), child, status);
+        }
+    }
+
+    fn notify_child(parent: &Process, child: u32, status: lumen_proc::WaitStatus) {
+        parent.child_changed();
+        let mut state = parent.signal.lock();
+        let action = state.action(Signal::CHLD);
+        if action.handler == SIG_IGN
+            || (matches!(status, lumen_proc::WaitStatus::Stopped(_) | lumen_proc::WaitStatus::Continued)
+                && action.flags & u64::from(general::SA_NOCLDSTOP) != 0)
+        {
+            return;
+        }
+        let status = status.siginfo();
+        let mut bytes = [0; 128];
+        bytes[8..12].copy_from_slice(&status.code.to_ne_bytes());
+        bytes[16..20].copy_from_slice(&child.to_ne_bytes());
+        bytes[24..28].copy_from_slice(&status.status.to_ne_bytes());
+        state.send(None, SigInfo::from_user(Signal::CHLD, bytes), SenderClass::SiUser).expect("standard SIGCHLD");
     }
 }
 

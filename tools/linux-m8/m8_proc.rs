@@ -14,6 +14,7 @@
 mod common;
 mod exec;
 mod futex;
+mod signal_waits;
 mod signals;
 mod small;
 
@@ -28,6 +29,9 @@ pub extern "C" fn main(argc: c_int, argv: *const *const u8) -> c_int {
     let (args, n) = unsafe { common::args(argc, argv) };
     match &args[..n] {
         [_, b"fork-wait"] => fork_wait(),
+        [_, b"signal-waits"] => signal_waits::run(),
+        [_, b"c6-kill", pid, sig] => signal_waits::send(pid, sig),
+        [_, b"c6-wait", kind, mode] => signal_waits::blocking(kind, *mode == b"restart"),
         [_, b"futex"] => futex::run(),
         [_, b"small-syscalls"] => small::run(),
         [_, b"small-comm"] => small::comm_child(),

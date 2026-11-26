@@ -319,23 +319,38 @@ crate::ktest!(
         use crate::{kassert, kassert_eq};
         use lumen_futex::FUTEX_BITSET_MATCH_ANY as ANY;
         in_test_process(|_| {
-            let source = key(A, true).map_err(|_| "source key")?;
             // Exercise both the one-lock and the ordered two-lock paths.
             for same_bucket in [true, false] {
-                let dest = (A + 4..A + 4096)
-                    .step_by(4)
-                    .find(|&addr| key(addr, true).is_ok_and(|k| (k.bucket() == source.bucket()) == same_bucket))
-                    .ok_or("no destination bucket")?;
+                let mut seen = [0; FUTEX_BUCKETS.len()];
+                let mut pair = None;
+                let first_bucket = key(A, true).map_err(|_| "source key")?.bucket();
+                // Any 257 distinct words contain a collision in 256 buckets;
+                // a collision with one fixed source is not guaranteed.
+                for addr in (A..=A + 4 * FUTEX_BUCKETS.len() as u64).step_by(4) {
+                    let bucket = key(addr, true).map_err(|_| "candidate key")?.bucket();
+                    if same_bucket && seen[bucket] != 0 {
+                        pair = Some((seen[bucket], addr));
+                        break;
+                    }
+                    if !same_bucket && bucket != first_bucket {
+                        pair = Some((A, addr));
+                        break;
+                    }
+                    seen[bucket] = addr;
+                }
+                let (source, dest) = pair.ok_or("no destination bucket")?;
                 let destination = key(dest, true).map_err(|_| "destination key")?;
+                let source_key = key(source, true).map_err(|_| "source key")?;
+                kassert_eq!(source_key.bucket() == destination.bucket(), same_bucket);
                 // Exercise requeue's notification before any scheduler race:
                 // woken is the condition its real blocked thread must observe.
                 let waiters: [Arc<FutexWaiter>; 2] =
-                    core::array::from_fn(|_| Arc::new(FutexWaiter::new(source.bucket())));
+                    core::array::from_fn(|_| Arc::new(FutexWaiter::new(source_key.bucket())));
                 for waiter in &waiters {
                     let node = Box::new(FutexNode::new(waiter.clone(), ANY));
-                    FUTEX_BUCKETS[source.bucket()].lock().enqueue(source, node);
+                    FUTEX_BUCKETS[source_key.bucket()].lock().enqueue(source_key, node);
                 }
-                let requeued = requeue(A, true, 1, dest, 1, Some(0));
+                let requeued = requeue(source, true, 1, dest, 1, Some(0));
                 let first_notified = waiters[0].woken.load(Ordering::Acquire);
                 let second_notified = waiters[1].woken.load(Ordering::Acquire);
                 let wake_rest = wake(dest, true, 2, ANY);
@@ -348,12 +363,12 @@ crate::ktest!(
                 kassert_eq!(wake_rest, Ok(1));
                 kassert!(waiters[1].woken.load(Ordering::Acquire));
                 let child = spawn_test_thread(move |_| {
-                    let result = wait(A, true, 0, ANY, None);
+                    let result = wait(source, true, 0, ANY, None);
                     sched::clear_current_sigpending();
                     result
                 })?;
                 kassert!(child.settle());
-                kassert_eq!(requeue(A, true, 0, dest, 1, Some(0)), Ok(1));
+                kassert_eq!(requeue(source, true, 0, dest, 1, Some(0)), Ok(1));
                 super::signal::raise_for_test(child.thread(), lumen_signal::Signal::USR1);
                 kassert_eq!(child.join()?, Err(super::signal::ERESTARTSYS));
                 kassert_eq!(FUTEX_BUCKETS[destination.bucket()].lock().count_for_key(destination), 0);

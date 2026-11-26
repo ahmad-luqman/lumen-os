@@ -1932,9 +1932,16 @@ the syscalls.
   Starting it sets `group_stop` (a new generation, and the count of
   threads still to park), marks every thread `stop_pending` (Linux's
   `JOBCTL_STOP_PENDING`) and kicks the other threads; each
-  parks on `Process::stop_wait` in a killable wait whose `ready()` reads
-  `Process::stopped`, an atomic mirror of `group_stop` written under
-  `signal`. A thread's park, or its exit (section 8, "Exit", step 2, as
+  parks on `Process::stop_wait` in a killable wait. Under `signal`, the
+  thread snapshots `Process::stop_seq` when it participates. The wait's
+  `ready()` reads `Process::stopped`, an atomic mirror of `group_stop`,
+  and `stop_seq`: it is ready if `stopped` is false or the sequence differs
+  from the snapshot. Both atomics are written under `signal`. Cancelling
+  a stop (`SIGCONT` or group exit) increments `stop_seq` before waking
+  `stop_wait`, so a `CONT` followed by a new `STOP` before the thread is
+  rescheduled still releases its previous park; it then checks and
+  participates in the new generation. A thread's park, or its exit
+  (section 8, "Exit", step 2, as
   Linux's `exit_signals` calls `task_participate_group_stop`), clears its
   mark and lowers the count, once; the one that takes the count to 0
   makes the transition under `PROCS` then `signal`, re-checking that
@@ -4732,6 +4739,7 @@ pub struct Process {
     live_threads: AtomicUsize,               // threads not yet through exit step 2
     exec_wait: WaitQueue,                    // de_thread's wait
     stopped: AtomicBool,                     // mirrors group_stop (section 6)
+    stop_seq: AtomicU64,                     // incremented on cancellation; park snapshots it under signal
     stop_wait: WaitQueue,                    // the stop park (section 6)
     child_events: WaitQueue,                 // wait4/waitid sleep here
     child_seq: AtomicU64,                    // bumped on each child state change

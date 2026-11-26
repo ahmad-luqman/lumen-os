@@ -19,6 +19,14 @@ enum GroupEnd {
     Signal(Signal),
 }
 
+/// One stop generation; a thread contributes to remaining at most once.
+#[derive(Clone, Copy)]
+pub(super) struct GroupStop {
+    generation: u64,
+    signal: Signal,
+    remaining: usize,
+}
+
 /// Initial per-thread state, copied under the parent's signal lock.
 #[derive(Clone, Copy)]
 pub(super) struct ThreadInit {
@@ -42,6 +50,8 @@ pub struct SignalState {
     /// First-wins end decision; Process::exit records its diagnostic.
     group_exit: Option<GroupEnd>,
     pub(super) rlimit_stack: lumen_vm::StackLimit,
+    group_stop: Option<GroupStop>,
+    stop_generation: u64,
 }
 
 /// One linked thread's queue slot, notification handle, mask and alternate stack.
@@ -54,6 +64,10 @@ pub struct ThreadSignals {
     synthetic: bool,
     /// Sanitized mask, never containing SIGKILL or SIGSTOP.
     blocked: Blocked,
+    real_blocked: Option<Blocked>,
+    saved_mask: Option<Blocked>,
+    stop_pending: bool,
+    stop_dequeued: bool,
     /// Validated alternate-stack configuration.
     alt_stack: AltStack,
     /// Last synchronous diagnostic; only its matching signal consumes it.
@@ -63,15 +77,19 @@ pub struct ThreadSignals {
 }
 
 impl ThreadSignals {
-    fn candidate(&self) -> ThreadCandidate {
+    fn candidate(&self, stopped: bool) -> ThreadCandidate {
         let thread = self.thread.lock().upgrade();
         ThreadCandidate {
             slot: self.slot,
             mask: self.blocked,
-            state: match thread.as_ref().map(|t| t.state()) {
-                Some(sched::State::Running) => ThreadState::Running,
-                Some(sched::State::Dead) | None => ThreadState::Exiting,
-                _ => ThreadState::Sleeping,
+            state: if stopped {
+                ThreadState::Stopped
+            } else {
+                match thread.as_ref().map(|t| t.state()) {
+                    Some(sched::State::Running) => ThreadState::Running,
+                    Some(sched::State::Dead) | None => ThreadState::Exiting,
+                    _ => ThreadState::Sleeping,
+                }
             },
             has_pending: thread.is_some_and(|t| t.sigpending()),
         }
@@ -97,6 +115,8 @@ pub enum Delivery {
     None,
     Fatal(Signal, Option<UserFault>),
     Handler(HandlerDelivery),
+    Stop(Signal),
+    Park,
 }
 
 /// A handler selected under siglock, consumed after releasing the lock.
@@ -104,6 +124,7 @@ pub struct HandlerDelivery {
     pub info: SigInfo,
     pub action: KernelSigaction,
     pub blocked: Blocked,
+    pub saved_mask: Blocked,
     pub stack: AltStack,
     pub fault: Option<UserFault>,
 }
@@ -131,6 +152,8 @@ impl SignalState {
             preferred: None,
             group_exit: None,
             rlimit_stack: lumen_vm::StackLimit::DEFAULT,
+            group_stop: None,
+            stop_generation: 0,
         }
     }
     pub fn action(&self, signal: Signal) -> KernelSigaction {
@@ -192,6 +215,10 @@ impl SignalState {
             thread: Arc::clone(&owner.kernel_handle),
             synthetic: owner.synthetic,
             blocked: init.blocked,
+            real_blocked: None,
+            saved_mask: None,
+            stop_pending: false,
+            stop_dequeued: false,
             alt_stack: init.alt_stack,
             fault: None,
             frame_failure: None,
@@ -237,6 +264,17 @@ impl SignalState {
             t.notify(false);
         }
     }
+    /// Recompute the caller's notification after consuming or masking work.
+    fn refresh_current(&self, tid: u32) {
+        let t = self.thread(tid).expect("current signal tid");
+        if !self.ending()
+            && self.group_stop.is_none()
+            && !sched::with_current(|t| t.fatal_pending()).unwrap_or(false)
+            && !self.pending.has_deliverable(t.slot, t.blocked).expect("live slot")
+        {
+            sched::clear_current_sigpending();
+        }
+    }
     fn configure_stack(&mut self, tid: u32, rsp: u64, new: Option<(u64, u64, u32)>) -> Result<AltStack, StackError> {
         let t = self.threads.get_mut(&tid).expect("current signal tid");
         let old = t.alt_stack;
@@ -246,7 +284,9 @@ impl SignalState {
         Ok(old)
     }
     fn install_context(&mut self, tid: u32, mask: Blocked, stack: AltStack) {
-        self.threads.get_mut(&tid).expect("current signal tid").alt_stack = stack;
+        let t = self.threads.get_mut(&tid).expect("current signal tid");
+        t.alt_stack = stack;
+        t.saved_mask = None;
         self.set_blocked(tid, mask);
     }
     pub(super) fn send(&mut self, tid: Option<u32>, info: SigInfo, sender: SenderClass) -> Result<(), u32> {
@@ -254,8 +294,11 @@ impl SignalState {
         let thread = tid.map(|tid| self.threads.get(&tid).ok_or(errno::ESRCH)).transpose()?;
         let directed = thread.map(|t| (t, t.blocked.contains(sig)));
         let target = thread.map_or(Target::Process, |t| Target::Thread(t.slot));
-        let keep_ignored =
-            directed.map_or_else(|| self.threads.values().all(|t| t.blocked.contains(sig)), |(_, blocked)| blocked);
+        let real_blocks = |t: &ThreadSignals| t.real_blocked.is_some_and(|b| b.contains(sig));
+        let keep_ignored = thread.map_or_else(
+            || self.threads.values().any(real_blocks) || self.threads.values().all(|t| t.blocked.contains(sig)),
+            |t| t.blocked.contains(sig) || real_blocks(t),
+        );
         if self.ending() {
             return Ok(());
         }
@@ -265,9 +308,12 @@ impl SignalState {
         }
         self.pending.enqueue(target, info, sender).map_err(|_| errno::EAGAIN)?;
         let chosen = match target {
-            Target::Thread(_) => directed,
+            // A stopped target retains even an unblocked default-fatal
+            // signal until continue; only SIGKILL may end the stop.
+            Target::Thread(_) => directed.filter(|_| sig == Signal::KILL || self.group_stop.is_none()),
             Target::Process => {
-                let candidates: Vec<_> = self.threads.values().map(ThreadSignals::candidate).collect();
+                let candidates: Vec<_> =
+                    self.threads.values().map(|t| t.candidate(self.group_stop.is_some())).collect();
                 self.preferred.and_then(|p| select_target(sig, &candidates, p).expect("live cursor")).map(|slot| {
                     let t = self.threads.values().find(|t| t.slot == slot).expect("chosen slot");
                     (t, t.blocked.contains(sig))
@@ -277,7 +323,9 @@ impl SignalState {
         if let Some((t, blocked)) = chosen {
             self.preferred = Some(t.slot);
             if !blocked {
-                if kills_by_default(self.action(sig), sig) {
+                if kills_by_default(self.action(sig), sig)
+                    && !self.threads.values().any(|t| t.real_blocked.is_some_and(|b| b.contains(sig)))
+                {
                     self.start_group_exit(sig);
                 } else {
                     t.notify(false);
@@ -330,17 +378,23 @@ impl SignalState {
                 Some(GroupEnd::Signal(signal)) => return Delivery::Fatal(signal, t.take_fault(signal)),
                 None => {}
             }
+            if self.group_stop.is_some() {
+                return Delivery::Park;
+            }
             let Some(info) = self.pending.dequeue(t.slot, t.blocked).expect("current slot") else {
                 sched::clear_current_sigpending();
                 return Delivery::None;
             };
             let sig = info.signal();
             let action = self.actions[sig.index()];
+            if action.handler == 0 && sig.default_action() == DefaultAction::Stop {
+                t.stop_dequeued = true;
+                return Delivery::Stop(sig);
+            }
             if ignored(action, sig) || action.handler == 0 {
                 if kills_by_default(action, sig) {
                     self.start_group_exit(sig);
                 }
-                // Group stop/continue delivery is supplied by C6.
                 continue;
             }
             if action.flags & u64::from(general::SA_RESETHAND) != 0 {
@@ -353,10 +407,64 @@ impl SignalState {
                 info,
                 action,
                 blocked: t.blocked,
+                saved_mask: t.saved_mask.unwrap_or(t.blocked),
                 stack: t.alt_stack,
                 fault: t.take_fault(sig),
             });
         }
+    }
+
+    /// Return the cancelled stop's signal and SIGCONT notification reason.
+    /// Completion is authoritative even before its process-tree publication.
+    pub(super) fn cancel_stop(&mut self, process: &Process) -> Option<(Signal, lumen_proc::WaitStatus)> {
+        let cancelled = self.group_stop.take().map(|stop| {
+            let status = if stop.remaining == 0 {
+                lumen_proc::WaitStatus::Continued
+            } else {
+                lumen_proc::WaitStatus::Stopped(stop.signal)
+            };
+            (stop.signal, status)
+        });
+        for t in self.threads.values_mut() {
+            t.stop_pending = false;
+            t.stop_dequeued = false;
+        }
+        process.stopped.store(false, Ordering::SeqCst);
+        process.stop_seq.fetch_add(1, Ordering::SeqCst);
+        process.stop_wait.wake_all();
+        cancelled
+    }
+
+    pub(super) fn start_stop(&mut self, tid: u32, sig: Signal, process: &Process) {
+        if self.ending() || !self.thread(tid).is_some_and(|t| t.stop_dequeued) {
+            return;
+        }
+        // C3's de_thread must also refuse a start while exec_waiter is set.
+        if self.group_stop.is_none() {
+            self.stop_generation = self.stop_generation.checked_add(1).expect("stop generation overflow");
+            self.group_stop =
+                Some(GroupStop { generation: self.stop_generation, signal: sig, remaining: self.threads.len() });
+            process.stopped.store(true, Ordering::SeqCst);
+            for t in self.threads.values_mut() {
+                t.stop_pending = true;
+                t.notify(false);
+            }
+        }
+    }
+
+    pub(super) fn participate_stop(&mut self, tid: u32) -> Option<GroupStop> {
+        let t = self.threads.get_mut(&tid).expect("live stop participant");
+        if !core::mem::take(&mut t.stop_pending) {
+            return None;
+        }
+        let stop = self.group_stop.as_mut().expect("pending stop generation");
+        stop.remaining -= 1;
+        (stop.remaining == 0).then_some(*stop)
+    }
+
+    /// A completion can publish only the signal of its still-live generation.
+    pub(super) fn completed_stop_signal(&self, stop: GroupStop) -> Option<Signal> {
+        self.group_stop.filter(|s| s.generation == stop.generation && s.remaining == 0).map(|s| s.signal)
     }
 }
 
@@ -381,11 +489,45 @@ impl Process {
         t.alt_stack = AltStack::DISABLED;
         t.fault = None;
         t.frame_failure = None;
+        t.saved_mask = None;
+        t.real_blocked = None;
     }
     /// Dequeue and choose an action in one signal hold, fatal state first.
     pub fn next_signal(&self, tid: u32) -> Delivery {
         debug_assert_eq!(tid, current_thread().tid());
-        self.signal.lock().next(tid)
+        let mut state = self.signal.lock();
+        let next = state.next(tid);
+        if matches!(next, Delivery::Stop(Signal::STOP)) {
+            state.start_stop(tid, Signal::STOP, self);
+        }
+        if state.ending() {
+            let _ = state.cancel_stop(self);
+        }
+        next
+    }
+
+    /// Job-control stops recheck the dequeue mark under PROCS then signal;
+    /// a racing continue clears it, preventing a late stop of the group.
+    pub fn start_job_stop(&self, tid: u32, sig: Signal) {
+        if sig != Signal::STOP {
+            PROCS.lock().start_job_stop(self, tid, sig);
+        }
+    }
+
+    /// Participate once, publish a completed stop, then sleep killably.
+    pub fn park_stopped(&self, tid: u32) {
+        let (completed, seen) = {
+            let mut state = self.signal.lock();
+            (state.participate_stop(tid), self.stop_seq.load(Ordering::SeqCst))
+        };
+        #[cfg(feature = "ktest")]
+        stop_publication_window(self.pid());
+        if let Some(stop) = completed {
+            PROCS.lock().complete_stop(self, stop);
+        }
+        let _ = self.stop_wait.wait_killable(None, || {
+            !self.stopped.load(Ordering::SeqCst) || self.stop_seq.load(Ordering::SeqCst) != seen
+        });
     }
     /// Force a synchronous signal on the current thread and activate its return hook.
     pub fn force_signal(&self, tid: u32, info: SigInfo, reset: bool, fault: Option<UserFault>) {
@@ -395,7 +537,81 @@ impl Process {
         self.signal.lock().force(tid, info, reset, fault);
     }
 }
+
+#[cfg(feature = "ktest")]
+struct StopPublicationPause {
+    pid: u32,
+    reached: VforkDone,
+    release: VforkDone,
+}
+
+#[cfg(feature = "ktest")]
+static STOP_PUBLICATION_PAUSE: SpinLock<Option<Arc<StopPublicationPause>>> = SpinLock::new(None);
+
+#[cfg(feature = "ktest")]
+fn stop_publication_window(pid: u32) {
+    let pause = STOP_PUBLICATION_PAUSE.lock().as_ref().filter(|p| p.pid == pid).cloned();
+    if let Some(pause) = pause {
+        pause.reached.complete();
+        pause.release.wait();
+    }
+}
+
 impl UserThread {
+    /// Save and replace the mask atomically for a signal-aware wait.
+    pub fn install_temporary_mask(&self, mask: Blocked) {
+        let mut state = self.process.signal.lock();
+        let t = state.threads.get_mut(&self.tid()).expect("current signal tid");
+        assert!(t.saved_mask.is_none(), "nested temporary signal mask");
+        t.saved_mask = Some(t.blocked);
+        state.set_blocked(self.tid(), mask);
+        state.refresh_current(self.tid());
+    }
+
+    /// Keep an interrupted wait's mask until delivery; otherwise restore it.
+    pub fn restore_saved_sigmask_unless(&self, interrupted: bool) {
+        if interrupted {
+            return;
+        }
+        let mut state = self.process.signal.lock();
+        if let Some(mask) = state.threads.get_mut(&self.tid()).expect("current signal tid").saved_mask.take() {
+            state.set_blocked(self.tid(), mask);
+        }
+    }
+
+    /// Consume a wanted signal without delivering a handler, preserving the
+    /// original mask and default-fatal dispositions throughout the wait.
+    pub fn wait_signal(&self, wanted: SigSet, deadline: Option<u64>) -> Result<SigInfo, u32> {
+        let tid = self.tid();
+        {
+            let mut state = self.process.signal.lock();
+            let t = state.thread(tid).expect("current signal tid");
+            let slot = t.slot;
+            if let Some(info) = state.pending.dequeue_wanted(slot, wanted).expect("live slot") {
+                state.refresh_current(tid);
+                return Ok(info);
+            }
+            if deadline.is_some_and(|dl| crate::time::now_ns() >= dl) {
+                return Err(errno::EAGAIN);
+            }
+            let t = state.threads.get_mut(&tid).expect("current signal tid");
+            t.real_blocked = Some(t.blocked);
+            let mask = Blocked::new(SigSet(t.blocked.set().0 & !wanted.0));
+            state.set_blocked(tid, mask);
+            state.refresh_current(tid);
+        }
+        let wake = sched::WaitQueue::new().wait_interruptible(deadline, || false);
+        let mut state = self.process.signal.lock();
+        let t = state.threads.get_mut(&tid).expect("current signal tid");
+        let slot = t.slot;
+        let mask = t.real_blocked.take().expect("signal wait mask");
+        let info = state.pending.dequeue_wanted(slot, wanted).expect("live slot");
+        state.set_blocked(tid, mask);
+        // A consumed wanted signal must not interrupt the next blocking call.
+        state.refresh_current(tid);
+        info.ok_or(if wake == sched::Wake::TimedOut { errno::EAGAIN } else { errno::EINTR })
+    }
+
     /// Queue SIGSEGV with the failed frame's diagnostic.
     pub fn force_frame_failure(&self, failed: Option<Signal>, reason: crate::linux::signal::frame::FailureReason) {
         sched::with_current(|t| t.set_sigpending());
@@ -460,6 +676,242 @@ pub fn send_current_signal(sig: Signal) {
         .send(Some(me.tid()), info, SenderClass::SiUser)
         .expect("current thread is linked and standard signals cannot exhaust the queue");
 }
+
+crate::ktest!(
+    fn continue_preserves_unpublished_stop_notifications() {
+        use crate::{kassert, kassert_eq};
+        in_test_process(|_| {
+            set_current_blocked(Blocked::new(SigSet::of(&[Signal::CHLD])));
+            for completed in [true, false] {
+                for suppress in [false, true] {
+                    set_current_action(
+                        Signal::CHLD,
+                        KernelSigaction {
+                            flags: if suppress { u64::from(general::SA_NOCLDSTOP) } else { 0 },
+                            ..Default::default()
+                        },
+                    );
+                    let after = Arc::new(VforkDone::new());
+                    let finish = Arc::new(VforkDone::new());
+                    let (resumed, end) = (Arc::clone(&after), Arc::clone(&finish));
+                    let (pid, parked) = ktest_fork_child(move || {
+                        let me = current_thread();
+                        let _ = me.process().next_signal(me.tid());
+                        me.process().park_stopped(me.tid());
+                        resumed.complete();
+                        end.wait();
+                        record_exit(UserExit::Exited(0));
+                        let _ = take_current();
+                    })?;
+                    let child = lookup(pid).ok_or("child")?;
+                    let extra = if completed { None } else { Some(add_ktest_thread(&child)?) };
+                    let pause =
+                        Arc::new(StopPublicationPause { pid, reached: VforkDone::new(), release: VforkDone::new() });
+                    *STOP_PUBLICATION_PAUSE.lock() = Some(Arc::clone(&pause));
+                    send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::STOP, 0))), SenderClass::SiUser)
+                        .map_err(|_| "stop child")?;
+                    let handle = parked.start();
+                    pause.reached.wait();
+                    let parent = current_process();
+                    let before = parent.child_seq.load(Ordering::SeqCst);
+                    let remaining = child.signal.lock().group_stop.map(|s| s.remaining);
+                    let sent =
+                        send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::CONT, 0))), SenderClass::SiUser);
+                    let seq = parent.child_seq.load(Ordering::SeqCst);
+                    let request = wait4_request(pid as i32, general::WCONTINUED | general::WNOHANG).unwrap();
+                    let report = wait_child(request);
+                    let notification =
+                        current_thread().wait_signal(SigSet::of(&[Signal::CHLD]), Some(crate::time::now_ns()));
+                    // Let the delayed completion run, then repeat CONT. Neither
+                    // may publish another event or change the consumed status.
+                    pause.release.complete();
+                    after.wait();
+                    let repeated =
+                        send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::CONT, 0))), SenderClass::SiUser);
+                    let again = wait_child(request);
+                    let seq_after = parent.child_seq.load(Ordering::SeqCst);
+                    let duplicate =
+                        current_thread().wait_signal(SigSet::of(&[Signal::CHLD]), Some(crate::time::now_ns()));
+                    *STOP_PUBLICATION_PAUSE.lock() = None;
+                    if let Some(extra) = extra {
+                        remove_ktest_thread(&extra);
+                    }
+                    finish.complete();
+                    let exit = ktest_reap(pid, handle)?;
+                    // Consume exit's separate SIGCHLD before the next fixture.
+                    let _ = current_thread().wait_signal(SigSet::of(&[Signal::CHLD]), Some(crate::time::now_ns()));
+                    kassert_eq!(exit, 0);
+                    kassert_eq!(remaining, Some(usize::from(!completed)));
+                    kassert_eq!(sent, Ok(()));
+                    kassert_eq!(seq, before + 1);
+                    let report = report.map_err(|_| "continued wait")?;
+                    kassert!(report.is_some());
+                    kassert_eq!(report.unwrap().status().word(), 0xffff);
+                    if suppress {
+                        kassert!(matches!(notification, Err(errno::EAGAIN)));
+                    } else {
+                        let info = notification.map_err(|_| "SIGCHLD missing")?;
+                        kassert_eq!(
+                            i32::from_ne_bytes(info.bytes()[8..12].try_into().unwrap()),
+                            if completed { 6 } else { 5 }
+                        );
+                        kassert_eq!(u32::from_ne_bytes(info.bytes()[16..20].try_into().unwrap()), pid);
+                        kassert_eq!(
+                            u32::from_ne_bytes(info.bytes()[24..28].try_into().unwrap()),
+                            if completed { Signal::CONT.number() } else { Signal::STOP.number() }
+                        );
+                    }
+                    kassert_eq!(repeated, Ok(()));
+                    kassert!(matches!(again, Ok(None)));
+                    kassert_eq!(seq_after, seq);
+                    kassert!(matches!(duplicate, Err(errno::EAGAIN)));
+                }
+            }
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn continue_then_stop_releases_the_previous_park() {
+        use crate::{kassert, kassert_eq};
+        in_test_process(|pid| {
+            let process = current_process();
+            let phase = Arc::new(AtomicU32::new(0));
+            let child_phase = Arc::clone(&phase);
+            let worker = spawn_test_thread(move |tid| {
+                let me = current_process();
+                let _ = sched::WaitQueue::new().wait_interruptible(None, || false);
+                child_phase.store(1, Ordering::SeqCst);
+                me.park_stopped(tid);
+                child_phase.store(2, Ordering::SeqCst);
+                if matches!(me.next_signal(tid), Delivery::Park) {
+                    me.park_stopped(tid);
+                }
+            })?;
+            worker.settle();
+            let send = |sig| send_process_checked(pid as i32, Ok(Some(SigInfo::new(sig, 0))), SenderClass::SiUser);
+            send(Signal::STOP).map_err(|_| "stop")?;
+            let first = process.next_signal(pid);
+            let _ = process.signal.lock().participate_stop(pid);
+            while phase.load(Ordering::SeqCst) == 0 || !worker.blocked() {
+                sched::yield_now();
+            }
+            // Same-CPU worker cannot observe the intermediate unstopped state.
+            let on = crate::arch::irq::disable();
+            let continued = send(Signal::CONT);
+            let stopped = send(Signal::STOP);
+            let second = process.next_signal(pid);
+            let _ = process.signal.lock().participate_stop(pid);
+            crate::arch::irq::restore(on);
+            let blocked = worker.settle();
+            let observed = phase.load(Ordering::SeqCst);
+            let remaining = process.signal.lock().group_stop.map(|s| s.remaining);
+            // Rescue either implementation before asserting so no task leaks.
+            send(Signal::CONT).map_err(|_| "final continue")?;
+            worker.join()?;
+            kassert_eq!(continued, Ok(()));
+            kassert_eq!(stopped, Ok(()));
+            kassert!(matches!(first, Delivery::Stop(Signal::STOP)));
+            kassert!(matches!(second, Delivery::Stop(Signal::STOP)));
+            kassert!(blocked);
+            kassert_eq!(observed, 2);
+            kassert_eq!(remaining, Some(0));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn stop_generations_count_once_and_continue_cancels_dequeue() {
+        use crate::{kassert, kassert_eq};
+        in_test_process(|pid| {
+            let me = current_thread();
+            let process = me.process();
+            let extra = add_ktest_thread(process)?;
+            let sent = send_thread(None, me.tid(), Some(SigInfo::new(Signal::STOP, 0)), SenderClass::SiUser);
+            let first = process.next_signal(me.tid());
+            let counted = process.signal.lock().participate_stop(me.tid());
+            let twice = process.signal.lock().participate_stop(me.tid());
+            // A departing participant completes the stop through the real
+            // unlink path; no thread may be counted twice.
+            remove_ktest_thread(&extra);
+            let stopped = PROCS.lock().ps_rows().into_iter().find(|p| p.pid == pid).unwrap().state;
+            send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::CONT, 0))), SenderClass::SiUser)
+                .map_err(|_| "continue")?;
+            kassert_eq!(sent, Ok(()));
+            kassert!(matches!(first, Delivery::Stop(Signal::STOP)));
+            kassert!(counted.is_none() && twice.is_none());
+            kassert!(matches!(stopped, ProcState::Stopped { signal: Signal::STOP, .. }));
+            kassert!(!process.stopped.load(Ordering::SeqCst));
+            kassert!(process.signal.lock().group_stop.is_none());
+            // Force the gap between a job-stop dequeue and its orphan check.
+            send_thread(None, me.tid(), Some(SigInfo::new(Signal::TSTP, 0)), SenderClass::SiUser)
+                .map_err(|_| "job stop")?;
+            kassert!(matches!(process.next_signal(me.tid()), Delivery::Stop(Signal::TSTP)));
+            send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::CONT, 0))), SenderClass::SiUser)
+                .map_err(|_| "racing continue")?;
+            process.signal.lock().start_stop(me.tid(), Signal::TSTP, process);
+            kassert!(!process.stopped.load(Ordering::SeqCst));
+            kassert!(matches!(process.next_signal(me.tid()), Delivery::None));
+            // A completion from an older generation cannot publish after cont.
+            let stale = GroupStop { generation: 1, signal: Signal::STOP, remaining: 0 };
+            PROCS.lock().complete_stop(process, stale);
+            let now = PROCS.lock().ps_rows().into_iter().find(|p| p.pid == pid).unwrap().state;
+            kassert!(matches!(now, ProcState::Continued { .. }));
+            // Delay a real G1 completion across CONT and a completed but
+            // unpublished G2. Merely testing with no live stop misses this race.
+            send_thread(None, pid, Some(SigInfo::new(Signal::STOP, 0)), SenderClass::SiUser).map_err(|_| "G1 send")?;
+            kassert!(matches!(process.next_signal(pid), Delivery::Stop(Signal::STOP)));
+            let g1 = process.signal.lock().participate_stop(pid).ok_or("G1 completion")?;
+            send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::CONT, 0))), SenderClass::SiUser)
+                .map_err(|_| "G1 continue")?;
+            send_thread(None, pid, Some(SigInfo::new(Signal::TSTP, 0)), SenderClass::SiUser).map_err(|_| "G2 send")?;
+            kassert!(matches!(process.next_signal(pid), Delivery::Stop(Signal::TSTP)));
+            // The fixture is orphaned; start under siglock to isolate the
+            // completion interleaving from the separate orphan-group policy.
+            let g2 = {
+                let mut state = process.signal.lock();
+                state.start_stop(pid, Signal::TSTP, process);
+                state.participate_stop(pid).ok_or("G2 completion")?
+            };
+            let (after_stale, after_live) = {
+                let mut table = PROCS.lock();
+                table.complete_stop(process, g1);
+                let after_stale = table.ps_rows().into_iter().find(|p| p.pid == pid).unwrap().state;
+                table.complete_stop(process, g2);
+                let after_live = table.ps_rows().into_iter().find(|p| p.pid == pid).unwrap().state;
+                (after_stale, after_live)
+            };
+            send_process_checked(pid as i32, Ok(Some(SigInfo::new(Signal::CONT, 0))), SenderClass::SiUser)
+                .map_err(|_| "G2 cleanup")?;
+            kassert!(matches!(after_stale, ProcState::Continued { .. }));
+            kassert!(matches!(after_live, ProcState::Stopped { signal: Signal::TSTP, .. }));
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn directed_fatal_signal_stays_pending_while_stopped() {
+        use crate::{kassert, kassert_eq};
+        let mut state = one_thread_state();
+        state.group_stop = Some(GroupStop { generation: 1, signal: Signal::STOP, remaining: 0 });
+        state.send(Some(9), SigInfo::new(Signal::TERM, 0), SenderClass::Other).map_err(|_| "send TERM")?;
+        kassert!(!state.ending());
+        let slot = state.thread(9).unwrap().slot;
+        kassert!(state.pending.pending(slot).unwrap().contains(Signal::TERM));
+        kassert!(matches!(state.next(9), Delivery::Park));
+        state.group_stop = None;
+        kassert!(matches!(state.next(9), Delivery::Fatal(Signal::TERM, None)));
+        kassert_eq!(state.fatal_signal(), Some(Signal::TERM));
+        let mut state = one_thread_state();
+        state.group_stop = Some(GroupStop { generation: 1, signal: Signal::STOP, remaining: 0 });
+        state.send(Some(9), SigInfo::new(Signal::KILL, 0), SenderClass::Other).map_err(|_| "send KILL")?;
+        kassert!(matches!(state.next(9), Delivery::Fatal(Signal::KILL, None)));
+        Ok(())
+    }
+);
 
 crate::ktest!(
     fn signal_send_refuses_unlinked_tid_and_discards_ignored_pending() {

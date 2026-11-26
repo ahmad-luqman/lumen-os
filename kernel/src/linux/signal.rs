@@ -69,9 +69,20 @@ pub fn exit_to_user(frame: &mut SyscallFrame, mut syscall: Option<SyscallExit>) 
         match next {
             process::Delivery::None => {
                 resolve_restart(frame, decide(syscall, frame.rax, Handling::None));
+                if let Some(t) = process::try_current_thread() {
+                    t.restore_saved_sigmask_unless(false);
+                }
                 return rewritten;
             }
             process::Delivery::Fatal(sig, fault) => terminate(sig, fault),
+            process::Delivery::Stop(sig) => {
+                let t = process::current_thread();
+                t.process().start_job_stop(t.tid(), sig);
+            }
+            process::Delivery::Park => {
+                let t = process::current_thread();
+                t.process().park_stopped(t.tid());
+            }
             process::Delivery::Handler(handler) => match self::frame::deliver(frame, handler, syscall) {
                 Ok(()) => {
                     rewritten = true;

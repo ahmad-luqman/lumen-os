@@ -790,7 +790,7 @@ fn read_into_user(io: ConsoleIo, user_buf: u64, count: u64) -> Result<usize, u32
         return Err(errno::EFAULT);
     }
     let mut kbuf = [0u8; IO_CHUNK];
-    let n = crate::linux::process::read_console(io, &mut kbuf[..want]);
+    let n = crate::linux::process::read_console_interruptible(io, &mut kbuf[..want])?;
     if n == 0 {
         return Ok(0);
     }

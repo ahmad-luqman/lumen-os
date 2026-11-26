@@ -70,7 +70,7 @@ pub fn deliver(
     delivery: process::HandlerDelivery,
     syscall: Option<lumen_signal::restart::SyscallExit>,
 ) -> Result<(), FrameFailure> {
-    let process::HandlerDelivery { info, action, blocked, stack, fault } = delivery;
+    let process::HandlerDelivery { info, action, blocked, saved_mask, stack, fault } = delivery;
     let sig = info.signal();
     let pid = process::current_process().pid();
     let fp = sched::snapshot_user_fpu().expect("signal on user thread");
@@ -88,7 +88,7 @@ pub fn deliver(
         registers: regs,
         fp: raw,
         info,
-        saved_mask: blocked,
+        saved_mask,
         blocked,
         handler: wire::Handler {
             address: action.handler,

@@ -27,3 +27,23 @@ tests = ["ktest:lumen_kernel::linux::signal::frame::deferred_debug_trap_keeps_or
 name = "Deferred debug origins preserve syscall results and restart decisions"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::linux::signal::frame::deferred_user_debug_trap_keeps_syscall_result", "ktest:lumen_kernel::linux::signal::frame::deferred_user_debug_trap_keeps_syscall_restart", "ktest:lumen_kernel::linux::signal::frame::deferred_lstar_debug_trap_reexecutes_syscall"]
+
+[[feature]]
+name = "Signal waits, syscall restarts, SIGCHLD and stop/continue"
+milestone = "M8"
+tests = ["scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait", "ktest:lumen_kernel::linux::syscall::signal::signal_waits_validate_and_consume_pending", "ktest:lumen_kernel::linux::syscall::signal::temporary_masks_survive_until_handler_and_sigreturn", "ktest:lumen_kernel::linux::process::signal::stop_generations_count_once_and_continue_cancels_dequeue"]
+
+[[feature]]
+name = "A continue followed by a new stop cannot strand the previous park"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::signal::continue_then_stop_releases_the_previous_park"]
+
+[[feature]]
+name = "Thread-directed fatal signals remain pending during a group stop"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::signal::directed_fatal_signal_stays_pending_while_stopped", "scenario:test_linux_proc::test_sigchld_and_sigint_interrupt_wait"]
+
+[[feature]]
+name = "Continue preserves unpublished stop events and serial reads honor signal restarts"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::signal::continue_preserves_unpublished_stop_notifications", "ktest:lumen_kernel::linux::process::serial_read_interrupts_and_restarts_after_sigreturn"]
