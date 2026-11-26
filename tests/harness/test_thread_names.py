@@ -42,6 +42,7 @@ NAME_ARG = {
     "spawned": 0,
     "spawn_on": 1,
     "spawn_user_on": 1,
+    "spawn_fork_child": 0,
     "spawn_test": 1,
     "spawn_ring3_on": 1,
     "spawn_with": 1,

@@ -575,7 +575,6 @@ impl AddressSpace {
 
     /// Add a process user, refusing zero so a retired space never revives.
     /// Panics on count overflow. Observer `Arc`s do not count as users.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1's process lifetime
     #[must_use = "a refused add means the space is retired; the caller must not use it"]
     pub fn add_user(&self) -> bool {
         self.users
@@ -598,8 +597,7 @@ impl AddressSpace {
         }
     }
 
-    /// Process users, excluding observer `Arc`s, for the ktests.
-    #[cfg(feature = "ktest")]
+    /// Process users, excluding observer `Arc`s (exit and the ktests).
     pub fn users(&self) -> u32 {
         self.users.load(Ordering::Acquire)
     }
@@ -670,7 +668,6 @@ impl AddressSpace {
     /// On failure the child is released outside both locks, parent private
     /// leaves may remain read-only, and newly populated shared anonymous
     /// pages stay as demand-zero-equivalent pages at count one.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1 wires fork
     pub fn fork_copy(self: &Arc<Self>) -> Result<Arc<Self>, UserVmError> {
         self.fork_copy_inner(|| {})
     }

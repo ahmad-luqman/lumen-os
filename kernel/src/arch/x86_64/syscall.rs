@@ -223,6 +223,9 @@ lumen_syscall_entry:
     swapgs
     sysretq
 1:
+# Shared IRET tail: kernel GS, interrupts off, RSP -> checked SyscallFrame;
+# a saved unwind frame is already installed in PerCpu/TSS.
+lumen_fork_iret:
     popq %r15
     popq %r14
     popq %r13
@@ -285,6 +288,32 @@ lumen_enter_ring3_call:
     iretq
     .size lumen_enter_ring3_call, . - lumen_enter_ring3_call
 
+    .globl lumen_enter_fork_call
+    .type lumen_enter_fork_call, @function
+    .balign 16
+# SysV entry: RDI -> readable 160-byte SyscallFrame, valid user selectors,
+# canonical user RIP, safe flags, child CR3, kernel GS, interrupts off.
+lumen_enter_fork_call:
+    # Save the same unwind frame as lumen_enter_ring3_call.
+    pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    subq $8, %rsp
+    movq %rdi, %r12
+    movq %rsp, %rdi
+    call lumen_set_ring3_stack
+    subq $160, %rsp
+    movq %rsp, %rdi
+    movq %r12, %rsi
+    movq $20, %rcx                 # 20 qwords = the full 160-byte SyscallFrame
+    cld
+    rep movsq
+    jmp lumen_fork_iret
+    .size lumen_enter_fork_call, . - lumen_enter_fork_call
+
     .globl lumen_user_unwind
     .type lumen_user_unwind, @function
     .balign 16
@@ -313,6 +342,7 @@ unsafe extern "C" {
     fn lumen_syscall_entry();
     fn lumen_enter_ring3_call(rip: u64, user_rsp: u64, rflags: u64);
     fn lumen_user_unwind() -> !;
+    fn lumen_enter_fork_call(frame: *const SyscallFrame);
 }
 
 /// Address of `lumen_syscall_entry` (`IA32_LSTAR`).
@@ -472,27 +502,52 @@ pub fn init_cpu() {
 /// - No other ring-3 context may already be active on this CPU.
 pub unsafe fn enter_ring3(rip: u64, user_rsp: u64, rflags: u64) {
     assert!(rip < USER_MAX, "ring-3 entry rip {rip:#x} is not below USER_MAX");
-    assert!(irq::enabled() && irq::depth() == 0, "enter_ring3 requires interrupts on and no SpinLock held");
-    assert_eq!(percpu::user_exit_rsp(), 0, "nested enter_ring3 on CPU {}", percpu::index());
-
     let sanitized = sanitize_user_rflags(rflags);
+    run_ring3(|| {
+        // SAFETY: caller supplies mapped user entry/stack, rip is checked,
+        // flags sanitized, and run_ring3 has disabled interrupts and set GS.
+        unsafe { lumen_enter_ring3_call(rip, user_rsp, sanitized) };
+    });
+}
+
+/// Run an entry trampoline with kernel GS, interrupts off and no active
+/// user context, then restore the kernel's entry bookkeeping after unwind.
+fn run_ring3(enter: impl FnOnce()) {
+    assert!(irq::enabled() && irq::depth() == 0, "ring-3 entry requires interrupts on and no SpinLock held");
+    assert_eq!(percpu::user_exit_rsp(), 0, "nested ring-3 entry on CPU {}", percpu::index());
     let were_on = irq::disable();
     percpu::set_pending_debug_trap(false);
-    // SAFETY: `IA32_KERNEL_GS_BASE` exists on every x86-64 CPU; resetting it
-    // to 0 ensures ring 3 starts with a clean user GS base after `swapgs`.
+    // SAFETY: this MSR exists on x86-64; swapgs must load a clean user GS.
     unsafe { wrmsr(percpu::IA32_KERNEL_GS_BASE, 0) };
-
-    // SAFETY: `rip < USER_MAX`, `sanitized` has user-safe RFLAGS with IF=1,
-    // interrupts are off, and the caller guarantees valid user CR3 mappings.
-    unsafe { lumen_enter_ring3_call(rip, user_rsp, sanitized) };
-
-    // Returned via `lumen_user_unwind` with interrupts off and `user_exit_rsp == 0`.
-    let cpu = percpu::index();
-    // SAFETY: interrupts are off on `cpu` and no ring-3 context is active.
-    unsafe { gdt::set_rsp0(cpu, 0) };
+    enter();
+    // The trampoline unwound with interrupts off and no active user frame.
+    // SAFETY: this CPU's TSS is ours to update with interrupts disabled.
+    unsafe { gdt::set_rsp0(percpu::index(), 0) };
     percpu::set_kernel_rsp(0);
     percpu::set_pending_debug_trap(false);
     irq::restore(were_on);
+}
+
+/// Resume a fork child's saved user registers, returning after its exit.
+///
+/// # Safety
+/// The current user address space is the child's, its identity is installed,
+/// interrupts are enabled, and no lock or other ring-3 context is active.
+pub unsafe fn enter_fork(mut frame: SyscallFrame) {
+    frame.cs = u64::from(USER_CODE);
+    frame.ss = u64::from(USER_DATA);
+    frame.rflags = sanitize_user_rflags(frame.rflags);
+    // A bad inherited return address must end the child, never cause a
+    // ring-0 #GP at iretq with user GS loaded.
+    if frame.rip >= USER_MAX {
+        crate::linux::process::record_exit(crate::user::UserExit::NonCanonicalRip(frame.rip));
+        return;
+    }
+    run_ring3(|| {
+        // SAFETY: the current space is the child's; selectors/flags and RIP
+        // are checked, and run_ring3 supplies the entry preconditions.
+        unsafe { lumen_enter_fork_call(&frame) };
+    });
 }
 
 /// Unwind directly back to the caller of [`enter_ring3`] on this CPU.

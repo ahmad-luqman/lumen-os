@@ -9,8 +9,9 @@ use super::at::UserPtr;
 use super::not_implemented;
 use crate::arch;
 use crate::arch::syscall::{SyscallFrame, SyscallReturn};
-use crate::linux::general;
+use crate::linux::process::{self, ProcessClone, clone_flags};
 use crate::linux::process::{current_process, current_thread, record_exit};
+use crate::linux::{errno, general};
 use crate::user::UserExit;
 
 /// `exit` and `exit_group` (one arm in `dispatch`).
@@ -48,31 +49,30 @@ pub(super) fn sys_set_tid_address(frame: &mut SyscallFrame) -> SyscallReturn {
     SyscallReturn::Sysret
 }
 
-/// `clone(flags, newsp, parent_tid, child_tid, tls)` (56): M8 stub, replaced by C1 (#380) and C3 (#382).
-/// Linux reads only `flags`' low 32 bits (`lower_32_bits(clone_flags)`).
-/// The frame is the parent's registers at the `syscall`, from which the
-/// child's starting ones are made.
+/// `clone` (56): the low 32 flag bits select a process clone. C3 adds threads.
 pub(super) fn sys_clone(
-    _flags: u32,
-    _newsp: UserPtr,
-    _parent_tid: UserPtr,
-    _child_tid: UserPtr,
-    _tls: u64,
-    _frame: &SyscallFrame,
+    flags: u32,
+    newsp: UserPtr,
+    parent_tid: UserPtr,
+    child_tid: UserPtr,
+    tls: u64,
+    frame: &SyscallFrame,
 ) -> u64 {
-    not_implemented(general::__NR_clone)
+    super::finish(
+        clone_flags(flags, tls).and_then(|flags| {
+            process::fork_current(flags, newsp.addr(), parent_tid.addr(), child_tid.addr(), tls, frame)
+        }),
+    )
 }
 
-/// `fork()` (57): M8 stub, replaced by C1 (#380). The frame is the
-/// parent's registers at the `syscall`, from which the child's starting
-/// ones are made.
-pub(super) fn sys_fork(_frame: &SyscallFrame) -> u64 {
-    not_implemented(general::__NR_fork)
+/// `fork()` (57): return the child's pid to its parent, zero to the child.
+pub(super) fn sys_fork(frame: &SyscallFrame) -> u64 {
+    super::finish(process::fork_current(ProcessClone::FORK, 0, 0, 0, 0, frame))
 }
 
-/// `vfork()` (58): M8 stub, replaced by C1 (#380). The frame as `fork`'s.
-pub(super) fn sys_vfork(_frame: &SyscallFrame) -> u64 {
-    not_implemented(general::__NR_vfork)
+/// `vfork()` (58): share the mm and wait killably for child exit (C2: exec).
+pub(super) fn sys_vfork(frame: &SyscallFrame) -> u64 {
+    super::finish(process::fork_current(ProcessClone::VFORK, 0, 0, 0, 0, frame))
 }
 
 /// `execve(path, argv, envp)` (59): M8 stub, replaced by C2 (#381). It
@@ -83,14 +83,69 @@ pub(super) fn sys_execve(_path: UserPtr, _argv: UserPtr, _envp: UserPtr, frame: 
     SyscallReturn::Sysret
 }
 
-/// `wait4(pid, wstatus, options, rusage)` (61): M8 stub, replaced by C1 (#380) and C6 (#385).
-pub(super) fn sys_wait4(_pid: i32, _wstatus: UserPtr, _options: u32, _rusage: UserPtr) -> u64 {
-    not_implemented(general::__NR_wait4)
+/// `wait4` (61): reap before copyout, including on EFAULT. C6 adds stop/continue events.
+pub(super) fn sys_wait4(pid: i32, wstatus: UserPtr, options: u32, rusage: UserPtr) -> u64 {
+    super::finish(wait4(pid, wstatus, options, rusage))
 }
 
-/// `waitid(idtype, id, infop, options, rusage)` (247): M8 stub, replaced by C1 (#380) and C6 (#385).
-pub(super) fn sys_waitid(_idtype: i32, _id: i32, _infop: UserPtr, _options: u32, _rusage: UserPtr) -> u64 {
-    not_implemented(general::__NR_waitid)
+fn wait4(pid: i32, wstatus: UserPtr, options: u32, rusage: UserPtr) -> Result<u64, u32> {
+    let request = process::wait4_request(pid, options)?;
+    let Some(report) = process::wait_child(request)? else {
+        return Ok(0);
+    };
+    if !wstatus.is_null() {
+        crate::user::copy_to_user(wstatus.addr(), &report.status().word().to_ne_bytes()).map_err(|_| errno::EFAULT)?;
+    }
+    write_rusage(rusage)?;
+    Ok(u64::from(report.pid()))
+}
+
+const SI_SIGNO: u64 = 0;
+const SI_ERRNO: u64 = 4;
+const SI_CODE: u64 = 8;
+const SI_PID: u64 = 16;
+const SI_UID: u64 = 20;
+const SI_STATUS: u64 = 24;
+
+/// `waitid` (247): WNOWAIT retains the zombie; no event (including errors)
+/// clears only the six child siginfo fields. C6 adds stop/continue events.
+pub(super) fn sys_waitid(idtype: i32, id: i32, infop: UserPtr, options: u32, rusage: UserPtr) -> u64 {
+    super::finish(waitid(idtype, id, infop, options, rusage))
+}
+
+fn waitid(idtype: i32, id: i32, infop: UserPtr, options: u32, rusage: UserPtr) -> Result<u64, u32> {
+    // Linux's SYSCALL_DEFINE5(waitid) writes these fields even when
+    // kernel_waitid returns an error. A bad copyout supersedes that error.
+    let result = process::waitid_request(idtype, id, options).and_then(process::wait_child);
+    let (signo, code, pid, status) = if let Ok(Some(report)) = &result {
+        write_rusage(rusage)?;
+        let status = report.status().siginfo();
+        (general::SIGCHLD, status.code as u32, report.pid(), status.status as u32)
+    } else {
+        (0, 0, 0, 0)
+    };
+    let fields = [(SI_SIGNO, signo), (SI_ERRNO, 0), (SI_CODE, code), (SI_PID, pid), (SI_UID, 0), (SI_STATUS, status)];
+    if !infop.is_null() {
+        // Linux checks the full siginfo address range but touches only these
+        // fields: inaccessible padding must not make an otherwise valid write fail.
+        let end = infop.addr().checked_add(core::mem::size_of::<general::siginfo_t>() as u64).ok_or(errno::EFAULT)?;
+        if end > crate::user::USER_MAX {
+            return Err(errno::EFAULT);
+        }
+        for (offset, value) in fields {
+            crate::user::copy_to_user(infop.addr() + offset, &value.to_ne_bytes()).map_err(|_| errno::EFAULT)?;
+        }
+    }
+    result.map(|_| 0)
+}
+
+fn write_rusage(ptr: UserPtr) -> Result<(), u32> {
+    if !ptr.is_null() {
+        // Tick accounting is C12. No other resource counters are maintained.
+        crate::user::copy_to_user(ptr.addr(), &[0; core::mem::size_of::<general::rusage>()])
+            .map_err(|_| errno::EFAULT)?;
+    }
+    Ok(())
 }
 
 /// `setpgid(pid, pgid)` (109): M8 stub, replaced by C8 (#387).

@@ -431,7 +431,6 @@ impl UserFrame {
     /// The caller holds the leaf's address-space lock, keeping its reference
     /// live, and prevents writes through private mappings before publishing
     /// another mapping of the returned reference.
-    #[cfg_attr(not(feature = "ktest"), allow(dead_code))] // C1 wires fork_copy
     pub(super) unsafe fn share_leaf(f: PhysFrame) -> Option<Self> {
         match refs().inc(f) {
             Ok(()) => Some(Self(f)),

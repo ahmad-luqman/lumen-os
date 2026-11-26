@@ -1662,6 +1662,12 @@ weakening crash reporting or `make audit`.
     return via `swapgs; sysretq` and rewritten register frames (`execve`,
     `fork` child, `rt_sigreturn`) return via `swapgs; iretq` (with
     `USER_CODE`/`USER_DATA`).
+  - **Fork RSP:** the SDM's 64-bit IRET checks the new RIP for
+    canonicality, not RSP. Do not reject a noncanonical saved RSP before
+    IRET: the scenario's stackless child publishes a marker and exits at
+    ring 3 with RSP = 1 << 63, showing the entry itself is safe. A later
+    noncanonical stack reference is `#SS(0)` per the SDM (QEMU TCG reports
+    `#GP`); that fault at first stack use is not part of this scenario.
 - **Conditional `SWAPGS` and IST protection (incl. `#DB` / CVE-2018-8897):**
   `lumen_isr_common` inspects the saved `CS` on the stack (`cs & 3 != 0`): if
   the interrupt or exception came from ring 3, it executes `swapgs` on entry
@@ -4234,13 +4240,13 @@ snapshot of the offset, which moves after only if nothing moved it
 meanwhile. An `O_APPEND` write goes through `VfsInode::append`, one chunk
 at a time (a write over 4 KiB can have another appender's data land
 between its chunks). `close` takes the entry out under the table's lock
-and, after it, releases the closing pid's POSIX record locks on the inode
-(any close) and, on the open file description's last `dec_fd_ref`, its
-`flock` locks; `take_current` does the same for every descriptor when the
-process ends, and so does `dup2`'s displacement of the slot it fills (all
-through `process::release_fd`, which wakes blocked lockers when anything
-went). `openat` reserves a slot before it opens and keeps it until
-installation (a full table is `-EMFILE` before anything is created), and
+and, after it, releases every current table member's POSIX record locks
+on the inode (any close) and, on the description's last `dec_fd_ref`, its
+`flock` locks. `dup2`/`dup3` displacement uses the same `release_fd` path.
+Exit separately sweeps the departing pid's locks before `Files::leave`;
+the last member drains FD references and flock. Both paths share
+`release_locks`, which wakes blocked lockers after releasing inode/table
+locks. `openat` reserves a slot before it opens and keeps it until installation (a full table is `-EMFILE` before anything is created), and
 `getcwd` computes the path from the cwd's inode (`compute_cwd_path`). `umask` sets the mask
 (`syscall/meta.rs`). `chdir` and `fchdir` set the cwd (its kept path
 computed from the inode too, so relative `chdir`s never grow it), and
@@ -4357,10 +4363,10 @@ depends on them.
 | B3 | the readiness interface | B0, B2 | `PollMask`, `PollWaker`, `Pollable`, `PollHead`, `VfsInode::pollable`; `poll`/`ppoll`/`select`/`pselect6` over M7's file kinds; `poll_masks_of_each_file_kind`, `poll_rechecks_after_a_wake`, `poll_resume_honours_the_saved_deadline`, `ppoll_installs_its_mask_and_writes_back_when_interrupted`, `test_poll_and_select_on_console` | 10 |
 | B4 | frame reference counts and copy-on-write | M7 done | `frame::REFS`, `frame::RefTable` (lumen-mm), `frame::alloc_user`, `AddressSpace::users`, `fork_copy`, `Backing::Anonymous { shared }`; `refcount_and_cow_split`, `mprotect_keeps_a_shared_frame_read_only`, `named_reservations_are_complete` (extended), `fork_copy_out_of_frames_rolls_back`, `fork_copy_preserves_files_images_and_private_copies` | 5, 8 |
 | B5 | the TLB shootdown IPI | B2 | vector `0x3e` (`idt::TLB_SHOOTDOWN`), `AddressSpace::active`, `PerCpu::loaded_space`, `tlb::shoot_down`, the shootdown warning's `HOST_TIMED` entry; `mm::tlb::shootdown_across_cpus` (its probes use B2's `read_u32_nofault`) | 5, 9 |
-| B6 | SMP migration, priorities, affinity | B5, C1 | `on_cpu`, `spawn_migratable`, `spawn_user_on` migratable (after C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
+| B6 | SMP migration, priorities, affinity | B5, C1 | `on_cpu`, `spawn_migratable`, `spawn_fork_child` migratable (C1 gives it the `UserThread`), `slice_ticks`; the migration and slice ktests | 6 |
 | B7 | truncate reaching every address space | B1, B4, B5 | the inode's mappers list, `mmap_file(self: &Arc<Self>)`; `truncate_unmaps_every_address_space`, `fork_racing_a_truncate_copies_nothing_past_eof` | 5 |
 | B8 | the five M8 hazards | B1 | `OpenFile::pos`, `FdTable::reserve`, `PosixWaitGraph`'s key; the hazard ktests | 8, 9 |
-| C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | B0, B1, B2, B4 | `spawn_user_on` taking the `UserThread`, pinned to the caller's CPU (B6 makes it migratable), `Files::users` across `fork`; `test_fork_wait_and_exit_status` | 8 |
+| C1 | `fork`, `vfork`, exit, zombies, `wait4`/`waitid`, reparenting | B0, B1, B2, B4 | `spawn_fork_child` taking the `UserThread`, pinned to the caller's CPU (B6 makes it migratable), `Files::users` across `fork`; `test_fork_wait_and_exit_status` | 8 |
 | C2 | `execve`, single-threaded, `#!`, the streaming loader | B0, C1 | lumen-elf's header split, `ImageSource`, the stack-size parameter; `test_fork_cow_and_exec_shebang` (its single-threaded checks) | 5, 8 |
 | C3 | threads. This issue's PR models every de_thread/timer interleaving listed here against Linux's code before implementation, as a host-tested state machine where practical. | B0, B5, B6, C1, C2, C4, C5, C6 | `clone`'s thread flags, `de_thread`, `process::EXEC_DELAY`, the tid exchange, `MAX_STACKS`; `test_pthread_create_and_join`, `clone_racing_a_group_exit_never_escapes`, `de_thread_refuses_a_racing_group_stop`, `exit_group_during_de_thread_ends_only_itself`, `exit_retargets_signals_and_completes_a_stop` | 6, 8 |
 | C4 | `futex`, robust lists, sleeps | B0, B1, B2, C1, C2 | `FutexKey`, the buckets, the `clear_child_tid` wake; `test_futex_timeouts_and_nanosleep` | 8 |
@@ -4648,6 +4654,7 @@ pub struct Process {
     pid: AtomicU32,                          // set once, in fork's PROCS hold
     mm: SpinLock<Option<Arc<AddressSpace>>>, // the process's space (procfs, fork)
     files: SpinLock<Option<Arc<Files>>>,     // CLONE_FILES shares it
+    files_access: FilesAccess,               // fd operations/reservations vs table replacement
     fs: SpinLock<Option<Arc<FsState>>>,      // cwd and umask; CLONE_FS shares it
     signal: SpinLock<SignalState>,
     live_threads: AtomicUsize,               // threads not yet through exit step 2
@@ -4656,17 +4663,21 @@ pub struct Process {
     stop_wait: WaitQueue,                    // the stop park (section 6)
     child_events: WaitQueue,                 // wait4/waitid sleep here
     child_seq: AtomicU64,                    // bumped on each child state change
-    vfork_done: Option<Arc<VforkDone>>,      // a CLONE_VFORK child's
+    vfork_done: SpinLock<Option<Arc<VforkDone>>>, // a CLONE_VFORK child's
     exe_path: SpinLock<Option<String>>,      // /proc/<pid>/exe
     usage_slot: u64,                         // its RusageSlot's value
     children_ticks: [AtomicU64; 2],          // reaped children's user, system
     console: SpinLock<ConsoleState>,         // M7's console state, until C10
     allow_test_syscalls: bool,               // usertest's test syscalls (M6)
-    exit: SpinLock<Option<UserExit>>,        // M7's end, first wins, until group_exit (C1, C3)
+    exit: SpinLock<Option<UserExit>>,        // M7's end, first wins, until group_exit (C3)
 }
 pub struct Files {
-    table: SpinLock<FdTable<FileRef>>,       // FileRef = Arc<KernelFile>
-    users: AtomicUsize,                      // processes sharing it
+    table: SpinLock<Shared>,                // slots and members, one leaf
+    close_access: FilesAccess,              // shared close versus exclusive leave
+}
+struct Shared {
+    fds: FdTable<FileRef>,                   // FileRef = Arc<KernelFile>
+    members: Vec<u32>,                      // pid, or 0 before linking
 }
 pub struct FsState { inner: SpinLock<FsInner> }  // FsInner { cwd: Cwd, umask: u16 }
 pub struct SignalState {
@@ -4696,7 +4707,7 @@ pub struct UserThread {
     process: Arc<Process>,
     clear_child_tid: AtomicU64,              // set_tid_address, CHILD_CLEARTID
     robust_list: AtomicU64,                  // set_robust_list's head (C4)
-    kernel_thread: u64,                      // its sched::Thread's id (ps, ktests)
+    kernel_thread: AtomicU64,                // its sched::Thread's id (ps, ktests)
 }
 ```
 
@@ -4711,8 +4722,8 @@ but `robust_list`); each later issue adds its own.
   context switch loads `CR3` from its `address_space`, and the `#PF` path
   reads it lock-free (`current_address_space()`). B1 adds to it
   `linux: Option<Arc<UserThread>>` (`None` for a ktest's `UserSpaceGuard`;
-  set by the thread itself when its process registers until C1's
-  `spawn_user_on` sets it at spawn, cleared by its takedown before
+  set by root threads at registration; fork children get it from C1's
+  `spawn_fork_child` at spawn, cleared by its takedown before
   `detach_user_space`; read lock-free) and the thread's restart block (B2: an
   `UnsafeCell<Option<RestartBlock>>` read and written only by its own
   thread with interrupts off, as `set_current_fs_base` writes `fs_base`),
@@ -4727,9 +4738,10 @@ but `robust_list`); each later issue adds its own.
   CPU that has claimed it through `on_cpu`
   (section 6's migration) touches the slot, and `Drop` runs when no other
   reference exists.
-- **`spawn_user_on`** (it exists) changes: C1 makes it take the
-  `Arc<UserThread>` with the address space and keep the thread on the
-  caller's CPU; B6 makes it migratable. A thread spawned before its pid or
+- **`spawn_user_on`** keeps its root-thread interface. C1 adds
+  **`spawn_fork_child`**, taking the `Arc<UserThread>`, address space and
+  TLS base, inheriting the caller's FPU state and pinning to its CPU;
+  B6 makes fork children migratable. A thread spawned before its pid or
   tid exists (`fork`, `clone` step 1) gets them through `Process::pid` and
   `UserThread::tid`, atomics stored once in the `PROCS` hold that
   allocates them, before the thread's start gate opens; nothing reads them
@@ -4759,13 +4771,24 @@ but `robust_list`); each later issue adds its own.
   `CLONE_THREAD` (`vfork`, `posix_spawn`) raises it; a process letting its
   space go (exit step 3, `execve`) lowers it, and the one that brings it
   to 0 runs `teardown` there, in process context (section 5).
-- **`Files::users`** counts the processes sharing a table (`CLONE_FILES`
-  without `CLONE_THREAD` raises it). A procfs reader of `/proc/<pid>/fd`
-  clones the `Arc<Files>` while holding Locks 0 and 2, so the last `Arc`
-  must not close anything: the process that brings `users` to 0 (exit step
-  3, `execve`'s unshare) drains the table there (`drain_all`, then
-  `process::release_fd` for each entry, outside every `SpinLock`), and the
-  last `Arc`'s drop frees memory only.
+- **`Files::users`** is the member vector's length, under the same leaf
+  spinlock as descriptor slots. `new` and `share` reserve a 0 member;
+  `Process::set_pid` calls `enrol` to replace one 0 without allocating,
+  taking the files slot and table locks separately. `fork_copy(member)`
+  starts with that member (0 for fork, the caller's pid for unshare).
+  `leave(pid)` removes exactly one member. A departing process first
+  sweeps its own POSIX locks on open inodes; the last member drains slots
+  and releases FD references/flock outside the spinlock. The last `Arc`
+  (including a procfs reader's) only frees memory and asserts no members
+  remain. Unshare copies with the caller's pid then leaves the old table;
+  it does not perform exit's pid-lock sweep. A table-wide `close_access`
+  lease spans descriptor removal through inode-lock cleanup; `leave` takes
+  it exclusively after the exit sweep. Thus a close either still scans the
+  departing pid, or removes the descriptor after the exit sweep saw it.
+  This reuses `FilesAccess` independently of the process's table-swap lease.
+  Close takes process-read then table-read; leave holds neither a shared
+  lease nor an inode lock on entry, and unshare drops its process-write
+  lease before calling leave. The last-user drain does not reacquire read.
 
 **The tables.** One kernel-wide table replaces `ACTIVE_PROCS`:
 
@@ -4942,7 +4965,9 @@ thread, the timers thread, exit); no interrupt handler sends one.
 `clone(flags, newsp, parent_tid, child_tid, tls)` (the x86-64 argument
 order: `kernel/fork.c`'s default `SYSCALL_DEFINE5(clone, ...)`), `fork()`
 (`SIGCHLD`) and `vfork()` (`CLONE_VM | CLONE_VFORK | SIGCHLD`) share one
-path. The low byte of `flags` is the exit signal (`CSIGNAL`). Checks, in
+path. Legacy `clone` reads only `lower_32_bits(clone_flags)`, as Linux's
+`SYSCALL_DEFINE5(clone)` does; high bits are ignored. The low byte is the
+exit signal (`CSIGNAL`). Checks, in
 this order, each `-EINVAL`:
 1. a flag outside the accepted set below;
 2. `CLONE_THREAD` without `CLONE_SIGHAND`, then `CLONE_SIGHAND` without
@@ -4966,7 +4991,8 @@ this order, each `-EINVAL`:
 | `CLONE_CHILD_SETTID` | the child's tid written to `child_tid` in the child's memory by the child itself, with no lock held, before it first returns to user mode (a fault ignored, as Linux's `schedule_tail`) |
 | `CLONE_CHILD_CLEARTID` | `clear_child_tid = child_tid` |
 | `CLONE_SYSVSEM`, `CLONE_DETACHED`, `CLONE_IO`, `CLONE_PTRACE`, `CLONE_UNTRACED` | accepted, no effect (no System V semaphores, no ptrace; `CLONE_DETACHED` is ignored by Linux's `clone` too) |
-| `CLONE_PARENT`, `CLONE_PIDFD`, `CLONE_NEW*`, `CLONE_NEWTIME`, `CLONE_CLEAR_SIGHAND`, `CLONE_INTO_CGROUP` | `-EINVAL` (not modelled by lumen-proc; no pidfds; namespaces are M11's; the last two are `clone3`'s) |
+| `CLONE_PARENT`, `CLONE_PIDFD`, `CLONE_NEW*`, `CLONE_NEWTIME` | `-EINVAL` (not modelled by lumen-proc; no pidfds; namespaces are M11's) |
+| `CLONE_CLEAR_SIGHAND`, `CLONE_INTO_CGROUP` | `clone3`-only flags above bit 31; they cannot reach legacy `clone` after its 32-bit mask (`clone3` stays `-ENOSYS`) |
 
 The census (#337) saw exactly two flag sets: `0x4111` (`posix_spawn`'s
 `CLONE_VM | CLONE_VFORK | SIGCHLD`) and `0x7d0f00` (`pthread_create`'s
@@ -4977,7 +5003,10 @@ census workload calls it (musl 1.2.5 doesn't), and glibc falls back to
 `scenario:test_linux_proc::test_fork_wait_and_exit_status` and
 `scenario:test_linux_proc::test_pthread_create_and_join` (section 15).
 
-**A process clone** (no `CLONE_THREAD`). Every step that can fail comes
+**A process clone** (no `CLONE_THREAD`). Capture-mode test processes
+are refused with `-ENOSYS` and an INFO log until C7/C10 give children a
+shared console; copying captured stdin and discarding child stdout is not
+supported. `ProcessClone` carries validated flags. Every step that can fail comes
 before `ProcTree::fork`, which can't be undone (lumen-proc has no
 `abort_fork`):
 1. allocate: the child's `PendingSignals::new(1, RT_QUEUE_CAP)`
@@ -4990,7 +5019,7 @@ before `ProcTree::fork`, which can't be undone (lumen-proc has no
    mappers before the registration has already set the size the copy
    stops at, B7), its `Files` and `FsState`
    copies, a `RusageSlot` value, and its kernel thread
-   (`sched::spawn_user_on(cpu, ..)`, held at a start gate;
+   (`sched::spawn_fork_child(..)`, held at a start gate;
    `MAX_STACKS`, section 6, gives `-EAGAIN`, Linux's errno for its thread
    limits). A failure frees what was made, in thread context, with no
    lock held (a failed `fork_copy` drops its child after Lock 1 is
@@ -5003,7 +5032,9 @@ before `ProcTree::fork`, which can't be undone (lumen-proc has no
    stored, and the `procs` and `threads` inserts. Since `kill(-pgid)`
    sends under `PROCS`, either the caller has the signal pending here or
    the child is already in the group. A refusal frees step 1's
-   allocations after the locks are released;
+   allocations after the locks are released. `NewProcess` owns the partially
+   filled process; `ParkedChild`, declared after it, cancels and joins before
+   `NewProcess` releases resources on a refusal;
 3. write `parent_tid`, then open the start gate.
 
 The child's `SignalState` copies the dispositions, the caller's mask and
@@ -5167,8 +5198,10 @@ untouched):
      `de_thread` holds only for a sharer; release a `vfork` parent.
    - Install the new space: with interrupts off, as
      `UserSpaceGuard::enter` does, replace the calling thread's
-     `UserThreadState::address_space` and load its root into `CR3` (the
-     `active` bits following, section 5), then store it in `Process::mm`.
+     `UserThreadState::address_space` and load its root with
+     `AddressSpace::switch_loaded` (the `active` bits following, section 5),
+     then store it in `Process::mm`, through the one writer
+     `replace_current_mm`.
      Lower the old space's `users`, tearing it down at 0 through
      `teardown`, which waits until no CPU has it loaded (section 5).
    - `ProcTree::exec(pid)`; after `de_thread`, re-check `Files::users`, as
@@ -5176,9 +5209,11 @@ untouched):
      the table into the one step 5 allocated (or allocate one now, if a
      sibling's `clone(CLONE_FILES)` raised it since; failing that, the
      process gets `SIGKILL`, past its point of no return) and install it,
-     lowering the old table's `users`,
-     and close every `cloexec` descriptor (`process::release_fd`, so their
-     POSIX locks go); reset every handled signal to `SIG_DFL` (ignored
+     lowering the old table's `users`. `unshare_current_files` holds an
+     exclusive `files_access` lease: all open reservations finish or cancel
+     before the copy/swap, and new fd operations wait until it finishes.
+     This lease is acquired without spinlocks held. Then close every `cloexec`
+     descriptor (`process::release_fd`, so their POSIX locks go); reset every handled signal to `SIG_DFL` (ignored
      ones stay ignored), keep the mask and pending signals, clear the
      alternate stack; reset the FPU state and `fs_base`.
    - Timers (C13): delete the POSIX timers and drop every queued
@@ -5212,7 +5247,10 @@ checks and errnos, lumen-proc's tests), then loop:
    child already reaped, as on Linux.
 3. `NoneReady` with `WNOHANG`: return 0; `waitid` writes 0 to `infop`'s
    `si_signo`, `si_errno`, `si_code`, `si_pid`, `si_uid` and `si_status`,
-   as Linux's `waitid` does.
+   as Linux's `waitid` does. Only those six fields are written; padding,
+   other union fields and `si_utime`/`si_stime` remain untouched. Linux's
+   `SYSCALL_DEFINE5(waitid)` also writes these zero fields on an error
+   (including `ECHILD`); copyout `EFAULT` supersedes the wait error.
 4. Otherwise `child_events.wait_interruptible(None, || child_seq changed)`;
    `Interrupted` returns `-ERESTARTSYS`.
 
@@ -8300,7 +8338,11 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     calling process's PID. None of these per-process nodes is ever in
     `DentryCache` or `InodeCache` (`cacheable()` is `false`), so each lookup
     asks `procfs` whether the process or fd still exists. Nor is `self`,
-    which names whichever process asks.
+    which names whichever process asks. Open descriptions retain numeric
+    pids, not pinned identities: after pid reuse an old `/proc/<pid>/...`
+    descriptor can observe the new process. This differs from Linux's
+    pinned `struct pid`; C1 documents the difference rather than changing
+    procfs ownership.
   - `/proc/<pid>/exe` → symlink to the executable's path as given to
     `linux /path` (e.g. `/bin/busybox`; not resolved: Linux's resolved path
     once `readlink` lands, #254).
@@ -8512,11 +8554,23 @@ file description had one thread (M7) and becomes possible once threads,
    onto it is `-EBUSY`, as Linux's `do_dup2`. `openat` reserves before it opens, so a
    full table is `-EMFILE` before an `O_CREAT` creates anything (Linux's
    `get_unused_fd_flags` comes first too).
+   C1's `ReservedFd` owns a shared `files_access` lease until install/cancel,
+   so exec/unshare's exclusive lease cannot swap its table mid-open.
+   Shared leases nest (`openat` then `with_files`); writers get no priority
+   and may starve under continuing readers. Acquire leases only in thread
+   context with interrupts enabled and no spinlock held.
 5. **`POSIX_WAITERS` and POSIX record locks were keyed by pid.** A record
    lock's owner stays the process (its tgid): Linux's owner is the
    `files_struct`, which a process's threads share; the two differ only
-   for `clone(CLONE_FILES)` without `CLONE_THREAD`, a deviation. The
-   `EDEADLK` records move to the waiting thread: B8 changes lumen-vfs's
+   for `clone(CLONE_FILES)` without `CLONE_THREAD`, a deviation. A close
+   or descriptor displacement releases every current Files member's locks
+   on that inode. While holding the inode lock, it reads the member set
+   under the table's leaf spinlock and releases each nonzero pid without
+   allocating. Membership ends before reaping can recycle the pid, and a
+   new lock on this inode needs the inode lock already held. After unshare,
+   locks still follow the pid into the new table; Linux keeps them with the
+   old files_struct (C3 will change the ownership key). The `EDEADLK`
+   records move to the waiting thread: B8 changes lumen-vfs's
    `PosixWaitGraph` to key a record by `Waiter { tgid, tid }` and to follow,
    from a holding process, the record of its lowest-numbered waiting
    thread, as Linux's `what_owner_is_waiting_for` follows the first blocked lock of
@@ -10679,7 +10733,15 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   `WNOHANG`, a zombie until reaped, an orphan's `getppid` becoming 1,
   `SIG_IGN` and `SA_NOCLDWAIT` reaping automatically (`wait` then
   `ECHILD`), a raw `clone(0x4111)` (`posix_spawn`'s flags) whose child
-  calls `_exit`, and `vfork` (C1); `rusage`'s `ru_utime` at least one tick
+  calls `_exit`, and `vfork` (C1). C1 also checks WNOWAIT, reap-before-copyout
+  faults, untouched waitid bytes and zero fields on ECHILD, inherited
+  registers/FPU/TLS/cwd/mask/dispositions, shared files/umask, TID stores
+  and clear-before-vfork-release, ignored high clone flag bits, thread-clone
+  ENOSYS, and a stackless child exiting after IRET with noncanonical RSP.
+  Adoption uses a handshake: the grandchild reads its new ppid only after the root has
+  waited for its parent. The root polls `/proc/<gpid>` until ENOENT before
+  exiting, so the scenario checks an exact leaked-frame count. Later checks:
+  `rusage`'s `ru_utime` at least one tick
   after a spinning child and `RUSAGE_CHILDREN` equal to the sum of the
   `wait4` values (C12); fatal-signal statuses, `kill(1, sig)` doing
   nothing and `kill(-1, sig)` skipping pid 1 (C6); `wait4` with `pid` 0
@@ -10687,6 +10749,23 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   orphaned by its parent's exit gets `SIGHUP` then `SIGCONT`) (C9); `exit`
   ending one thread, `exit_group` all, and `pthread_create`'s flag set
   (C3).
+- C1's kernel tests (`lumen_kernel::linux::process`):
+  `fork_refusal_releases_unlinked_resources` checks copied/shared Files and
+  mm users on refusal, capture ENOSYS, and cancellation of a parked child;
+  `fork_files_count_slots_and_skip_reservations` checks FD references,
+  cloexec and reservation exclusion; `files_unshare_waits_for_open_reservations`
+  checks install/cancel ordering against replacement;
+  `replace_mm_keeps_process_and_thread_in_agreement` checks both mm references,
+  retirement and the loaded mappings; `wait_child_interrupts_and_wakes_on_exit`
+  checks ERESTARTSYS and a blocked wait's exit wake (a rescue wake must find
+  zero waiters, making a missing wake fail cleanly);
+  `shared_files_exit_releases_its_posix_locks` checks a CLONE_FILES child's
+  F_SETLK goes away at its exit while the parent's table stays open;
+  `shared_files_close_releases_all_members_posix_locks` checks that close,
+  dup displacement and slot replacement drop the child's lock before it exits;
+  `shared_files_leave_waits_for_inflight_close` holds an inode lock to force
+  removal before the exit sweep, checks leave blocks with both members still
+  present, and checks no record lock survives after both operations finish.
 - `scenario:test_linux_proc::test_fork_cow_and_exec_shebang`: parent and
   child writing the same heap, stack and file-private (`MAP_PRIVATE`)
   page after `fork`, each seeing only its own; shared anonymous memory

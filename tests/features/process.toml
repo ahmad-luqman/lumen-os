@@ -19,3 +19,30 @@ tests = [
     "ktest:lumen_kernel::linux::syscall::signal::sigaction_and_sigprocmask_round_trip",
     "cargo:lumen-proc",
 ]
+
+[[feature]]
+name = "Process lifecycle: fork, vfork, process clone, exit, zombies, wait4/waitid and reparenting to pid 1"
+milestone = "M8"
+tests = [
+    "scenario:test_linux_proc::test_fork_wait_and_exit_status",
+    "ktest:lumen_kernel::linux::process::fork_refusal_releases_unlinked_resources",
+    "ktest:lumen_kernel::linux::process::fork_files_count_slots_and_skip_reservations",
+    "ktest:lumen_kernel::linux::process::files_unshare_waits_for_open_reservations",
+    "ktest:lumen_kernel::linux::process::replace_mm_keeps_process_and_thread_in_agreement",
+    "ktest:lumen_kernel::linux::process::wait_child_interrupts_and_wakes_on_exit",
+]
+
+[[feature]]
+name = "CLONE_FILES exit releases the departing pid's POSIX record locks"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::shared_files_exit_releases_its_posix_locks"]
+
+[[feature]]
+name = "Shared Files close releases every member's POSIX record locks"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::shared_files_close_releases_all_members_posix_locks"]
+
+[[feature]]
+name = "Shared Files leave waits for in-flight close lock cleanup"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::linux::process::shared_files_leave_waits_for_inflight_close"]
