@@ -79,9 +79,9 @@ def test_poll_and_select_on_console(boot, tmp_path):
 
     COM1 must report input by interrupt. `serial poll` requires no wait to find
     IRQ-queued input at the 100 ms safety step without a notify (`hits == 0`),
-    and all subscribers to unsubscribe on every exit. Repeat up to 20 runs:
+    and all subscribers to unsubscribe on every exit. Repeat up to `ATTEMPTS` runs:
     a run with no wake is legitimate (input can arrive before syscall entry),
-    but 20 without one fails. `woken >= 1` proves notify reached a subscriber
+    but `ATTEMPTS` without one fails. `woken >= 1` proves notify reached a subscriber
     and set `fired`, not that IRQ 4 readied the thread promptly: a dropped
     `wake_one()` with `fired` kept is still counted as woken at the safety step.
     """
@@ -101,7 +101,7 @@ def test_poll_and_select_on_console(boot, tmp_path):
             break
     else:
         raise AssertionError(
-            f"no console wait was woken by IRQ 4 in {ATTEMPTS} runs: {(hits, woken, subs)}"
+            f"no console wait was woken by IRQ 4's notify in {ATTEMPTS} runs: {(hits, woken, subs)}"
         )
 
     m.send_line("exit")
