@@ -475,6 +475,20 @@ fn timer_rearms_without_delivery_and_queue_controls_overruns() {
 
 #[test]
 fn timer_send_effects_serialize_with_exec_and_delete() {
+    for deleted in [false, true] {
+        let mut g = Group::new();
+        let mut timer = Timer::new(Notify::Process, false);
+        assert!(!g.stopping);
+        if deleted {
+            timer.replace(false);
+        }
+        timer.expire_signal(1, &mut g, Signal::STOP, false, false);
+        assert_eq!(g.stopping, !deleted, "a live SIGSTOP expiry must stop a running group");
+        assert_eq!(g.remaining, if deleted { 0 } else { g.threads.len() });
+        assert!(g.threads.iter().all(|t| t.stop_pending == !deleted));
+        g.begin_exec(2).unwrap();
+        assert!(!g.stopping);
+    }
     for signal in [Signal::CONT, Signal::STOP, Signal::KILL] {
         for deleted in [false, true] {
             for exec_first in [false, true] {

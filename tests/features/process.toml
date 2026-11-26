@@ -164,3 +164,12 @@ tests = [
     "ktest:lumen_kernel::linux::process::exit_group_during_de_thread_ends_only_itself",
     "ktest:lumen_kernel::linux::process::exit_retargets_signals_and_completes_a_stop",
 ]
+
+[[feature]]
+name = "C3 exec handles late Files sharers and fatal sends during sibling teardown"
+milestone = "M8"
+tests = [
+    "ktest:lumen_kernel::linux::process::exec_unshares_files_after_a_sibling_clones_and_exits",
+    "ktest:lumen_kernel::linux::process::de_thread_fatal_send_during_wait_refuses_and_clears_waiter",
+    "cargo:lumen-proc",
+]

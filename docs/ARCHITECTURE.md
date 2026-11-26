@@ -1922,7 +1922,9 @@ the syscalls.
   `SIGSTOP` starts the stop in that same hold. `SIGTSTP`, `SIGTTIN` and
   `SIGTTOU` first release `signal` to ask, under `PROCS`, whether the
   process group is orphaned (if so the signal is dropped, as Linux's
-  `get_signal`), and start it in a `PROCS` then `signal` hold. The hold
+  `get_signal`). They release `PROCS` before the ktest-only
+  `signal::STOP_GAP_DELAY` and then acquire `signal` separately to start
+  the stop; neither lock is held in that gap. The signal hold
   that would start it refuses, the signal consumed and nothing stopped,
   unless the thread is still `stop_dequeued` (a `SIGCONT` sent in that gap
   clears every thread's mark) and neither `group_exit` nor `exec_waiter`
@@ -5246,9 +5248,14 @@ untouched):
    cache's 64 MiB hard limit (#344: a file-backed loader would pin about
    32 MiB of `cc1plus` while it runs). Everything step 6 needs is
    allocated here too: the new `exe_path` string, and an empty table for
-   an unshared `Files` (its 1024 slots) if the table's `users` is above 1
-   now. Until C3 implements de_thread, a multithreaded or group-exiting
-   process is refused with `-EAGAIN` before commit. `prepare_exec` packages
+   an unshared `Files` (its 1024 slots), unconditionally. A sibling can
+   clone a `CLONE_FILES` process and exit between observations of
+   `files.users()` and `live_threads`; observing 1 for both separately
+   does not prove the table is private. `PreparedFiles` always reserves
+   the copy, so allocation can fail cleanly before teardown; the decision
+   to use it is made after `de_thread`, as Linux's `begin_new_exec`
+   unshares files after ending sibling threads. Multithreaded exec succeeds;
+   group exit or a competing exec refuses it with `-EAGAIN`. `prepare_exec` packages
    the new mm, identity, task name and `PreparedFiles` token into `PreparedExec`.
 6. The point of no return: C2's `commit_exec` is infallible; all storage
    was prepared in step 5. C3 extends the single-thread boundary below:
@@ -5293,10 +5300,12 @@ untouched):
      Linux's `mm_release` stores only while `mm_users > 1`, which after
      `de_thread` holds only for a sharer. Before releasing a `vfork` parent,
      `commit_unshare(PreparedFiles)` installs the private files table and
-     `finish_exec` closes its CLOEXEC descriptors. `Private` asserts
-     `users() == 1`; `Copy` uses the prepared table if still shared, otherwise
-     discards it. The exclusive `files_access` lease waits for reservations
-     without spinlocks held. C3 must revisit this with de_thread concurrency.
+     `finish_exec` closes its CLOEXEC descriptors. After `de_thread`,
+     `commit_unshare` reads `users()`: if above 1 it copies into the
+     reserved table, otherwise it drops that unused reservation. No sibling
+     can now create a new sharer; if the sole user is this process, no
+     other process can share its table either. The exclusive `files_access`
+     lease waits for reservations without spinlocks held.
      Then release the parent, so it cannot change the child's old shared table
      while the child is still copying or closing it.
    - Install the new space: with interrupts off, as
@@ -10992,9 +11001,10 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   without mapped heap growth and EFAULT after a long pointer walk;
   `exec_argument_walk_observes_fatal_signal` checks EINTR during the walk;
   `execve_replaces_frame_and_preserves_failed_call` checks script comm,
-  registers/TLS/mm/identity, including ENOMEM after loading while preparing
-  shared Files; `exec_signal_reset_preserves_pending_and_refuses_threads`
-  checks both pending queues, the mask, and thread/group-exit refusal;
+  registers/TLS/mm/identity, including ENOMEM after loading while reserving
+  Files storage; `exec_signal_reset_preserves_pending_and_refuses_threads`
+  checks both pending queues, the mask, multithreaded acceptance (despite
+  its historical name), and group-exit refusal;
   `exec_name_reaches_crash_snapshot_without_blocking` checks the shared name
   and busy-lock fallback; `exec_load_releases_heap_and_frames` checks exact
   live allocations and frames; `a_binary_the_heap_cannot_hold_is_enomem`
@@ -11025,9 +11035,9 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   (a delay knob between the clone's allocations and its hold, while
   another thread calls `exit_group`: the clone is `-EINTR` or its thread
   is killed; and `-ERESTARTNOINTR` with a `group_stop` and with an
-  `exec_waiter`), and three ktests whose `execve` stalls at
-  `process::EXEC_DELAY`, a ktest-only knob between step 5 and
-  `de_thread`'s hold:
+  `exec_waiter`), and the exec ktests below. Their ktest-only rendezvous
+  points include `process::EXEC_DELAY`, between step 5 and `de_thread`'s
+  hold, and the additional seams named in each test:
   - `ktest:lumen_kernel::linux::process::de_thread_refuses_a_racing_group_stop`:
     a sibling's `SIGTSTP` stalled in its two-hold gap (a second knob,
     `signal::STOP_GAP_DELAY`, between the orphan check and the hold that
@@ -11052,6 +11062,22 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
     unparked thread of a group stop exiting, completing the stop (the
     parent's `CLD_STOPPED`). It kills the mutants without step 2's
     retarget and without its `stop_pending` count.
+  - `ktest:lumen_kernel::linux::process::exec_unshares_files_after_a_sibling_clones_and_exits`:
+    pause descriptor preparation at `EXEC_FILES_DELAY` while a sibling
+    calls `clone(CLONE_FILES | SIGCHLD)` and exits. Confirm that one live
+    thread remains but two processes share the table, then exec succeeds
+    with a private table; its CLOEXEC close leaves the child's descriptor
+    open. Storage is reserved before teardown even if initially unshared.
+  - `ktest:lumen_kernel::linux::process::de_thread_fatal_send_during_wait_refuses_and_clears_waiter`:
+    hold sibling teardown, confirm the exec caller is waiting, and send
+    it `SIGKILL`. Pause at `EXEC_WAKE_DELAY` after that wait and let the
+    sibling exit, then check `-EAGAIN`, cleared `exec_waiter`, and the
+    unchanged mm. Removing the fatal-abort check fails the errno assertion
+    with the tid-exchange precondition still satisfied.
+  `cargo:lumen-proc`'s `timer_send_effects_serialize_with_exec_and_delete`
+  also checks a live `SIGSTOP` timer stopping a running group before exec,
+  with a stale instance leaving it running, so exec's later stop clearing
+  cannot hide a missing timer stop effect.
 - `scenario:test_linux_proc::test_futex_timeouts_and_nanosleep` (C4):
   timed waits lasting at least their timeout; wakes, requeues and bitsets,
   each looped until the expected count; private and shared ops on one

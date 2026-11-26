@@ -730,6 +730,8 @@ pub(crate) fn de_thread() -> Result<(), u32> {
     let process = caller.process();
     process.signal.lock().begin_exec(process, caller.tid())?;
     let wake = process.exec_wait.wait_killable(None, || process.live_threads.load(Ordering::SeqCst) == 1);
+    #[cfg(feature = "ktest")]
+    delay_window(&EXEC_WAKE_DELAY);
     let mut table = PROCS.lock();
     let mut state = process.signal.lock();
     assert_eq!(state.exec_waiter, Some(caller.tid()));
@@ -752,6 +754,10 @@ pub(super) struct TransitionDelay {
 
 #[cfg(feature = "ktest")]
 pub(super) static EXEC_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
+#[cfg(feature = "ktest")]
+static EXEC_WAKE_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
+#[cfg(feature = "ktest")]
+static EXEC_FILES_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
 #[cfg(feature = "ktest")]
 static CLONE_DELAY: SpinLock<Option<Arc<TransitionDelay>>> = SpinLock::new(None);
 
@@ -787,21 +793,16 @@ pub fn finish_exec() {
     process.exec_signals(current_thread().tid());
 }
 
-/// Prepared before exec commits, including storage for a sibling's late fork.
-pub enum PreparedFiles {
-    Private,
-    Copy(Arc<Files>),
-}
+/// Storage reserved before teardown, whether or not the table is shared yet.
+pub struct PreparedFiles(Arc<Files>);
 
 /// Allocate all descriptor-copy storage before replacing the address space.
 pub fn prepare_exec_files() -> Result<PreparedFiles, u32> {
-    let process = current_process();
-    let files = process.files.lock().clone().expect("live files");
-    if files.users() > 1 || process.live_threads.load(Ordering::SeqCst) > 1 {
-        Ok(PreparedFiles::Copy(Arc::new(Files::prepare_exec().map_err(|e| e.to_errno())?)))
-    } else {
-        Ok(PreparedFiles::Private)
-    }
+    #[cfg(feature = "ktest")]
+    delay_window(&EXEC_FILES_DELAY);
+    // A sibling can fork a Files sharer and exit during preparation. Only
+    // after de_thread can commit_unshare decide that no copy is needed.
+    Ok(PreparedFiles(Arc::new(Files::prepare_exec().map_err(|e| e.to_errno())?)))
 }
 
 /// Install a prepared private table without allocation. The exclusive lease
@@ -810,15 +811,11 @@ pub fn commit_unshare(prepared: PreparedFiles) {
     let process = current_process();
     let access = process.files_access.write();
     let old = process.files.lock().clone().expect("live process's files");
-    match prepared {
-        PreparedFiles::Private => assert_eq!(old.users(), 1, "single-threaded private files gained a sharer"),
-        PreparedFiles::Copy(copy) if old.users() > 1 => {
-            old.copy_exec_into(&copy, process.pid());
-            let replaced = process.files.lock().replace(copy).expect("live process's files");
-            drop(access);
-            replaced.leave(process.pid());
-        }
-        PreparedFiles::Copy(_) => {}
+    if old.users() > 1 {
+        old.copy_exec_into(&prepared.0, process.pid());
+        let replaced = process.files.lock().replace(prepared.0).expect("live process's files");
+        drop(access);
+        replaced.leave(process.pid());
     }
 }
 
@@ -4193,6 +4190,136 @@ fn ktest_exec() -> u64 {
     crate::user::copy_to_user(KTEST_USER_VA, b"/tmp/c3-exec\0").expect("exec path");
     hazard_call(general::__NR_execve, KTEST_USER_VA, 0, 0, 0)
 }
+
+crate::ktest!(
+    fn exec_unshares_files_after_a_sibling_clones_and_exits() {
+        use crate::{arch::gdt, kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        in_test_process(|pid| {
+            const CODE: u64 = 0x800000;
+            let process = current_process();
+            // The real process clone waits in pause until cleanup kills it.
+            process
+                .address_space()
+                .unwrap()
+                .map_eager_with_bytes(
+                    CODE,
+                    4096,
+                    lumen_vm::Prot::READ | lumen_vm::Prot::EXEC,
+                    &[0xb8, 34, 0, 0, 0, 0x0f, 0x05, 0xeb, 0xf7],
+                )
+                .map_err(|_| "map clone program")?;
+            with_current_console(|c| c.io = ConsoleIo::Serial);
+            let file = open_kernel_file(b"/dev/null", OpenFlags::O_RDWR, 0).map_err(|_| "open")?;
+            let fd = install_current_fd(file, true).map_err(|_| "cloexec descriptor")?;
+            let original = process.files.lock().clone().unwrap();
+            let delay = transition_delay(pid);
+            let pause = Arc::clone(&delay);
+            let cloned = Arc::new(SpinLock::new(None));
+            let out = Arc::clone(&cloned);
+            let (_, parked) = ktest_sibling(move || {
+                pause.reached.wait();
+                let request = clone_flags(general::CLONE_FILES | general::SIGCHLD, 0).unwrap();
+                let frame = crate::arch::syscall::SyscallFrame {
+                    rip: CODE,
+                    rsp: KTEST_USER_VA + KTEST_USER_LEN,
+                    cs: u64::from(gdt::USER_CODE),
+                    ss: u64::from(gdt::USER_DATA),
+                    rflags: 0x202,
+                    ..Default::default()
+                };
+                *out.lock() = Some(fork_current(request, 0, 0, 0, 0, &frame));
+                record_thread_exit(UserExit::Exited(0));
+            })?;
+            let before = (original.users(), process.live_threads.load(Ordering::SeqCst));
+            *EXEC_FILES_DELAY.lock() = Some(Arc::clone(&delay));
+            let sibling = parked.start();
+            let (p, old, pause) = (Arc::clone(&process), Arc::clone(&original), Arc::clone(&delay));
+            let changed = Arc::new(SpinLock::new(None));
+            let observed = Arc::clone(&changed);
+            let controller = sched::spawn("c3-files-race", move || {
+                sibling.join();
+                *observed.lock() = Some((old.users(), p.live_threads.load(Ordering::SeqCst)));
+                pause.release.complete();
+            })
+            .map_err(|_| "files controller")?;
+            let ret = ktest_exec();
+            controller.join();
+            *EXEC_FILES_DELAY.lock() = None;
+            let child_pid = cloned.lock().take().ok_or("clone result")?.map_err(|_| "sibling clone")? as u32;
+            let child = lookup(child_pid).ok_or("cloned child")?;
+            let private = !Arc::ptr_eq(&original, &process.files.lock().clone().unwrap());
+            let child_kept_fd = child.with_files(|t| t.get(fd).is_some());
+            let exec_closed_fd = process.with_files(|t| t.get(fd).is_none());
+            let remaining_users = original.users();
+            send_process_checked(child_pid as i32, Ok(Some(SigInfo::new(Signal::KILL, 0))), SenderClass::SiUser)
+                .map_err(|_| "kill clone")?;
+            let reaped = wait_child(wait4_request(child_pid as i32, 0).unwrap()).map_err(|_| "reap clone")?;
+            kassert_eq!(before, (1, 2));
+            kassert_eq!(*changed.lock(), Some((2, 1)));
+            kassert_eq!(ret, 0);
+            kassert!(private);
+            kassert_eq!(remaining_users, 1);
+            kassert_eq!(child_kept_fd, Some(true));
+            kassert_eq!(exec_closed_fd, Some(true));
+            kassert!(reaped.is_some());
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn de_thread_fatal_send_during_wait_refuses_and_clears_waiter() {
+        use crate::{kassert, kassert_eq};
+        use lumen_signal::pending::{SenderClass, SigInfo};
+        let _image = crate::linux::exec::ExecFixture::new("/tmp/c3-exec", &crate::mm::user_vm::build_relro_test_elf())?;
+        in_test_process(|pid| {
+            let process = current_process();
+            let old_mm = process.address_space().unwrap();
+            let caller = sched::current().unwrap();
+            let finish = Arc::new(VforkDone::new());
+            let held = Arc::clone(&finish);
+            let (_, parked) = ktest_sibling(move || {
+                // Ignore de_thread's fatal kick until the controller has
+                // observed the caller asleep and sent its own SIGKILL.
+                held.waiters.wait_until(|| held.done.load(Ordering::SeqCst));
+                record_thread_exit(UserExit::Exited(0));
+            })?;
+            let sibling = parked.start();
+            let delay = transition_delay(pid);
+            *EXEC_WAKE_DELAY.lock() = Some(Arc::clone(&delay));
+            let (p, pause) = (Arc::clone(&process), Arc::clone(&delay));
+            let result = Arc::new(SpinLock::new(None));
+            let out = Arc::clone(&result);
+            let controller = sched::spawn("c3-exec-kill", move || {
+                while p.signal.lock().exec_waiter != Some(pid) || caller.state() != sched::State::Blocked {
+                    sched::yield_now();
+                }
+                let live_at_send = p.live_threads.load(Ordering::SeqCst);
+                let sent = send_thread(Some(pid), pid, Some(SigInfo::new(Signal::KILL, 0)), SenderClass::SiUser);
+                pause.reached.wait();
+                finish.complete();
+                sibling.join();
+                // Keep the mutant's tid-exchange precondition valid: it
+                // must fail the errno assertion, not an incidental panic.
+                let live_after_exit = p.live_threads.load(Ordering::SeqCst);
+                *out.lock() = Some((live_at_send, sent, live_after_exit));
+                pause.release.complete();
+            })
+            .map_err(|_| "kill controller")?;
+            let ret = ktest_exec();
+            controller.join();
+            *EXEC_WAKE_DELAY.lock() = None;
+            kassert_eq!(*result.lock(), Some((2, Ok(()), 1)));
+            kassert_eq!(ret as i64, -i64::from(errno::EAGAIN));
+            kassert_eq!(process.signal.lock().exec_waiter, None);
+            kassert!(process.signal.lock().ending());
+            kassert!(Arc::ptr_eq(&old_mm, &process.address_space().unwrap()));
+            Ok(())
+        })?
+    }
+);
 
 crate::ktest!(
     fn clone_racing_a_group_exit_never_escapes() {
