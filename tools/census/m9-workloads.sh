@@ -5,8 +5,8 @@
 #   docker run ... -v tools/census:/census:ro -v <harness>:/harness:ro -v <out>:/out IMAGE sh /census/m9-workloads.sh
 #
 # Writes /out/<workload>.strace (one per workload), the container's facts
-# (alpine-release, kernel, packages), /out/m9-proc-net.txt (/proc/net/* probe
-# for #450) and /out/m9-census.toml (built by lumen_harness/syscalls.py).
+# (alpine-release, kernel, packages), /out/m9-proc-net.txt (/proc/(self|pid)/net
+# probe for #450) and /out/m9-census.toml (built by lumen_harness/syscalls.py).
 # Every workload talks only to local loopback servers inside the container
 # (no internet beyond installing the setup packages) and must succeed.
 set -eu
@@ -72,7 +72,7 @@ apk fetch -q -o "$W/srv/mirror/x86_64" patch
 apk index -q -o "$W/srv/mirror/x86_64/APKINDEX.tar.gz" "$W/srv/mirror/x86_64"/*.apk
 printf 'hello from census\n' >"$W/srv/hello.txt"
 
-# Start local HTTPS + HTTP + DNS (127.0.0.1:53) server outside strace; wait for bound ports.
+# Start local HTTPS + HTTP + UDP DNS (127.0.0.1:53) server outside strace; wait for bound ports.
 python3 /census/local_server.py \
     --root "$W/srv" \
     --cert "$W/ca/server.crt" \
@@ -84,6 +84,10 @@ trap 'kill "$SRV_PID" 2>/dev/null || true' EXIT
 
 i=0
 while [ ! -f "$W/ports.env" ]; do
+    if ! kill -0 "$SRV_PID" 2>/dev/null; then
+        echo "census(m9): local_server.py exited before becoming ready" >&2
+        exit 1
+    fi
     i=$((i + 1))
     if [ "$i" -ge 200 ]; then
         echo "census(m9): local_server.py did not become ready" >&2
@@ -95,7 +99,7 @@ done
 . "$W/ports.env"
 
 # Point the container resolver at our local DNS responder so `census.test`
-# resolves over UDP/TCP port 53 rather than `/etc/hosts`.
+# resolves over UDP port 53 rather than `/etc/hosts`.
 printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
 
 # 1. apk: `apk add` from our local HTTPS mirror (DNS + TLS verified against test CA).
@@ -303,13 +307,16 @@ trace busybox-ping /bin/busybox ping -c 2 -W 2 127.0.0.1 >/dev/null
 gcc -O2 -Wall -Wextra -Werror -o "$W/m9_net_bench" /census/m9_net_bench.c
 trace net-bench "$W/m9_net_bench"
 
-# Verify DNS queries went over UDP to 127.0.0.1:53 (no silent /etc/hosts fallback).
-# Under `strace -X raw`, port 53 (0x0035) is printed as `sin_port="\x00\x35"`.
-grep -Eq '(sendto|sendmsg)\(.*sin_port=("\\x00\\x35"|htons\(53\))' \
-    "$OUT/apk.strace" "$OUT/curl.strace" "$OUT/busybox-wget.strace" "$OUT/ruby-http.strace" || {
-    echo "census(m9): no UDP sendto/sendmsg to port 53 in traces (DNS not exercised)" >&2
-    exit 1
-}
+# Verify every DNS-using workload received a UDP reply from 127.0.0.1:53 (no
+# silent /etc/hosts fallback). Under `strace -X raw`, port 53 (0x0035) prints
+# as `sin_port="\x00\x35"`; musl reads replies with recvmsg, c-ares with
+# recvfrom.
+for w in apk curl busybox-wget ruby-http; do
+    grep -Eq '(recvfrom|recvmsg)\(.*sin_port="\\x00\\x35"' "$OUT/$w.strace" || {
+        echo "census(m9): $w.strace has no UDP reply from port 53 (DNS not exercised)" >&2
+        exit 1
+    }
+done
 
 # Record any /proc/net/* or /proc/<pid|self>/net/* opens seen in raw traces for #450.
 rc=0

@@ -964,7 +964,7 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   with `zig cc -target x86_64-linux-musl` into `build/libc-test/`
   (`tests.txt`, `not-built.txt`). `tools/syscall-census.sh` (`m8` or `m9`),
   `tools/census/workloads.sh` (#337), `tools/census/m9-workloads.sh`,
-  `tools/census/local_server.py` (loopback HTTP/HTTPS + UDP/TCP DNS responder
+  `tools/census/local_server.py` (loopback HTTP/HTTPS + UDP DNS responder
   for `census.test`), `tools/census/m9_net_bench.c` and
   `.github/workflows/syscall-census.yml` (#451): unattended Docker/Podman strace
   census on pinned stock Alpine 3.21 x86-64 generating `tests/linux/m8-census.toml`
@@ -1012,7 +1012,7 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `tests/conformance/libc-test-xfail.txt`, #396), and `test_smp.py`
   (incl. MT stress, #390). `tests/harness/`: harness self-tests
   (incl. `test_rootfs.py`, `test_rootfs_dev.py`, `test_libctest.py`,
-  `test_syscalls.py`, `test_ci_config.py`),
+  `test_syscalls.py`, `test_census_dns.py`, `test_ci_config.py`),
   and `test_scenario_typing.py`, a lint: a raw key in a scenario needs
   `# unconfirmed: <why>`, and lumen_harness types raw only where it
   implements it; `test_thread_names.py`, a lint: every thread name written

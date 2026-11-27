@@ -994,6 +994,10 @@ def test_m9_census_parses(tmp_path):
     with pytest.raises(CensusError, match="epoll_ctl: no events= in argument 3"):
         key_values(Call("epoll_ctl", ["12", "0x1", "9", "0x7ffe12340000"], "0", None))
 
+    # Half-printed unfinished sockopt (`ret == "?"` with only `level`) records {}.
+    [unfinished_opt] = parse_trace(["101   setsockopt(3, 0x1 <unfinished ...>"])
+    assert unfinished_opt.ret == "?" and key_values(unfinished_opt) == {}
+
     # Determinism: meta keys and trace insertion order do not change output.
     seen_rev = census(
         {

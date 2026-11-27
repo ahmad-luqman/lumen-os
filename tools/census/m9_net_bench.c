@@ -290,6 +290,7 @@ static void check_tcp_loopback(void) {
         die("shutdown");
     }
 
+    /* Delete cli (still level-triggered EPOLLOUT) so the wait below observes acc's EPOLLIN. */
     if (epoll_ctl(ep, EPOLL_CTL_DEL, cli, NULL) < 0) {
         die("epoll_ctl DEL cli");
     }

@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 Milestone = Literal["M8", "M9"]
 
@@ -468,6 +468,8 @@ def key_values(call: Call) -> dict[str, str]:
     if call.name in ("setsockopt", "getsockopt"):
         level = out.pop("level", None)
         optname = out.pop("optname", None)
+        # Drop a half-printed unfinished call (only `level` seen before
+        # `<unfinished ...>`) rather than emitting an unpaired label.
         if level is not None and optname is not None:
             out["option"] = f"{level}:{optname}"
     return out
@@ -499,13 +501,8 @@ def census(traces: dict[str, list[Call]]) -> dict[str, Seen]:
 
 
 def _sort_key(value: str) -> tuple[int, tuple[int, ...] | str]:
-    if ":" in value:
-        try:
-            return (0, tuple(int(p, 0) for p in value.split(":")))
-        except ValueError:
-            return (1, value)
     try:
-        return (0, (int(value, 0),))
+        return (0, tuple(int(p, 0) for p in value.split(":")))
     except ValueError:
         return (1, value)
 
@@ -953,8 +950,9 @@ def _probe_call(syscalls_map: dict, name: str) -> str:
 
 def report_m9(data: dict, tables: dict[str, list[str]], verbose: bool = False) -> str:
     """Compare an M9 census against the M6–M8 kernel tables and ROADMAP's
-    M9/M10 lists, surfacing M10 rows and M8 `ENOSYS_BY_DECISION` calls
-    (plus CPU-time clocks separately) seen in the census, and #450 design probes."""
+    M9/M10 lists, surfacing unplanned calls, M10 rows, M8 `ENOSYS_BY_DECISION`
+    calls (plus CPU-time clocks separately), any M8 planned calls missing from
+    `tables`, M9 planned calls, M6–M8 table hits, and #450 design probes."""
     m6_m8: set[str] = set().union(*(tables.get(m, ()) for m in ("M6", "M7", "M8")))
     rows: dict[str, list[str]] = {}
     syscalls_map = data["syscalls"]
@@ -978,6 +976,10 @@ def report_m9(data: dict, tables: dict[str, list[str]], verbose: bool = False) -
         ("M8", "M8 planned"),
         ("M9", "M9 planned"),
         ("implemented", "M6-M8 tables"),
+    )
+    known_sections = {key for key, _ in sections}
+    assert rows.keys() <= known_sections, (
+        f"unprinted M9 report sections: {sorted(rows.keys() - known_sections)}"
     )
     for key, title in sections:
         if key in rows:
@@ -1023,10 +1025,10 @@ def main(argv: list[str] | None = None) -> int:
     b = sub.add_parser("build", help="traces into the census file")
     b.add_argument("--traces", type=Path, required=True)
     b.add_argument("--meta", type=Path, required=True)
-    b.add_argument("--milestone", choices=("M8", "M9"), default="M8")
+    b.add_argument("--milestone", choices=get_args(Milestone), default="M8")
     b.add_argument("-o", "--output", type=Path, required=True)
     r = sub.add_parser("report", help="the census against the kernel's dispatch table")
-    r.add_argument("--milestone", choices=("M8", "M9"), default="M8")
+    r.add_argument("--milestone", choices=get_args(Milestone), default="M8")
     r.add_argument(
         "--census",
         type=Path,

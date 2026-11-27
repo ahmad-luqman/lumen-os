@@ -1,12 +1,12 @@
-"""Local HTTPS, HTTP and DNS server for the M9 syscall census (#451).
+"""Local HTTPS, HTTP and UDP DNS server for the M9 syscall census (#451).
 
 Runs inside the Alpine census container outside strace so traced clients
 (`apk`, `curl`, `ruby`, `busybox wget`) talk only to loopback servers with zero
 external network traffic. Binds ephemeral HTTP/HTTPS ports (dual-stack `::`
-when IPv6 is available, else `127.0.0.1` with a notice on stderr), optionally
-binds a UDP + TCP DNS responder on `127.0.0.1:<dns-port>` answering A/AAAA for
-`census.test`, and atomically writes `HTTPS_PORT`, `HTTP_PORT` (and `DNS_PORT`)
-to `--ports-file` only after every socket is listening.
+when IPv6 is available, else `127.0.0.1` with a notice on stderr), binds a UDP
+DNS responder on `127.0.0.1:<dns-port>` answering A/AAAA for `census.test`, and
+atomically writes `HTTPS_PORT` and `HTTP_PORT` to `--ports-file` only after
+every socket is ready.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import http.server
 import os
 import signal
 import socket
+import socketserver
 import ssl
 import struct
 import sys
@@ -58,7 +59,10 @@ def _make_server(
 def dns_reply(query: bytes, *, ipv6: bool = True) -> bytes | None:
     """Build an RFC 1035 DNS reply for `query`, answering `census.test` with
     A 127.0.0.1 and (when `ipv6` is true) AAAA ::1, NODATA for other types on
-    `census.test`, and NXDOMAIN for every other name."""
+    `census.test`, and NXDOMAIN for every other name.
+
+    Returns `None` on malformed or compressed queries. Answers only the first
+    question and ignores additional records (such as EDNS0 OPT pseudo-RRs)."""
     if len(query) < 12:
         return None
     txid, flags, qdcount, _an, _ns, _ar = struct.unpack("!HHHHHH", query[:12])
@@ -105,61 +109,44 @@ def dns_reply(query: bytes, *, ipv6: bool = True) -> bytes | None:
     return header + question + answer
 
 
-def _serve_dns_udp(sock: socket.socket, stop: threading.Event, ipv6: bool) -> None:
-    sock.settimeout(0.2)
-    while not stop.is_set():
+class DnsHandler(socketserver.BaseRequestHandler):
+    server: DnsUdpServer
+
+    def handle(self) -> None:
+        data, sock = self.request
+        reply = dns_reply(data, ipv6=self.server.ipv6)
+        if reply is None:
+            print(
+                f"local_server: dropped malformed DNS query ({len(data)} bytes) "
+                f"from {self.client_address}",
+                file=sys.stderr,
+            )
+            return
         try:
-            data, peer = sock.recvfrom(4096)
-        except TimeoutError:
-            continue
-        except OSError:
-            break
-        reply = dns_reply(data, ipv6=ipv6)
-        if reply is not None:
-            try:
-                sock.sendto(reply, peer)
-            except OSError:
-                pass
+            sock.sendto(reply, self.client_address)
+        except OSError as exc:
+            print(
+                f"local_server: DNS send to {self.client_address} failed: {exc}",
+                file=sys.stderr,
+            )
 
 
-def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = conn.recv(n - len(buf))
-        if not chunk:
-            return None
-        buf.extend(chunk)
-    return bytes(buf)
+class DnsUdpServer(socketserver.ThreadingUDPServer):
+    allow_reuse_address = False
+    daemon_threads = True
 
+    def __init__(self, addr: tuple[str, int], *, ipv6: bool) -> None:
+        self.ipv6 = ipv6
+        self.stopping = False
+        super().__init__(addr, DnsHandler)
 
-def _handle_dns_tcp(conn: socket.socket, ipv6: bool) -> None:
-    with conn:
-        conn.settimeout(2.0)
+    def get_request(self) -> tuple[tuple[bytes, socket.socket], tuple[str, int]]:
         try:
-            hdr = _recv_exact(conn, 2)
-            if hdr is None:
-                return
-            (length,) = struct.unpack("!H", hdr)
-            query = _recv_exact(conn, length)
-            if query is None:
-                return
-            reply = dns_reply(query, ipv6=ipv6)
-            if reply is not None:
-                conn.sendall(struct.pack("!H", len(reply)) + reply)
-        except OSError:
-            pass
-
-
-def _serve_dns_tcp(sock: socket.socket, stop: threading.Event, ipv6: bool) -> None:
-    sock.settimeout(0.2)
-    while not stop.is_set():
-        try:
-            conn, _peer = sock.accept()
-        except TimeoutError:
-            continue
-        except OSError:
-            break
-        threading.Thread(target=_handle_dns_tcp, args=(conn, ipv6), daemon=True).start()
+            return super().get_request()
+        except OSError as exc:
+            if not self.stopping:
+                print(f"local_server: DNS recv failed: {exc}", file=sys.stderr)
+            raise
 
 
 def main() -> None:
@@ -168,17 +155,22 @@ def main() -> None:
     parser.add_argument("--cert", type=Path, required=True)
     parser.add_argument("--key", type=Path, required=True)
     parser.add_argument("--ports-file", type=Path, required=True)
-    parser.add_argument("--dns-port", type=int, default=None)
+    parser.add_argument("--dns-port", type=int, default=53)
     args = parser.parse_args()
 
     handler = functools.partial(QuietHandler, directory=str(args.root))
     http_srv, http_v6 = _make_server(handler)
     https_srv, https_v6 = _make_server(handler)
+    # Only answer AAAA with ::1 when both HTTP and HTTPS bound dual-stack IPv6;
+    # on IPv4-only fallback, returning NODATA prevents clients from dialing an
+    # unbound ::1 address.
     ipv6_ready = http_v6 and https_v6
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile=str(args.cert), keyfile=str(args.key))
     https_srv.socket = ctx.wrap_socket(https_srv.socket, server_side=True)
+
+    dns_srv = DnsUdpServer(("127.0.0.1", args.dns_port), ipv6=ipv6_ready)
 
     stop = threading.Event()
 
@@ -191,48 +183,23 @@ def main() -> None:
     threads = [
         threading.Thread(target=http_srv.serve_forever, daemon=True),
         threading.Thread(target=https_srv.serve_forever, daemon=True),
+        threading.Thread(target=dns_srv.serve_forever, daemon=True),
     ]
-    dns_sockets: list[socket.socket] = []
-    dns_port_actual: int | None = None
-    if args.dns_port is not None:
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_sock.bind(("127.0.0.1", args.dns_port))
-        dns_port_actual = udp_sock.getsockname()[1]
-
-        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tcp_sock.bind(("127.0.0.1", dns_port_actual))
-        tcp_sock.listen(16)
-
-        dns_sockets.extend([udp_sock, tcp_sock])
-        threads.append(
-            threading.Thread(target=_serve_dns_udp, args=(udp_sock, stop, ipv6_ready), daemon=True)
-        )
-        threads.append(
-            threading.Thread(target=_serve_dns_tcp, args=(tcp_sock, stop, ipv6_ready), daemon=True)
-        )
-
     for t in threads:
         t.start()
 
-    lines = [
-        f"HTTPS_PORT={https_srv.server_port}",
-        f"HTTP_PORT={http_srv.server_port}",
-    ]
-    if dns_port_actual is not None:
-        lines.append(f"DNS_PORT={dns_port_actual}")
     tmp = args.ports_file.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines) + "\n")
+    tmp.write_text(f"HTTPS_PORT={https_srv.server_port}\nHTTP_PORT={http_srv.server_port}\n")
     os.replace(tmp, args.ports_file)
 
     stop.wait()
+    dns_srv.stopping = True
     http_srv.shutdown()
     https_srv.shutdown()
+    dns_srv.shutdown()
     http_srv.server_close()
     https_srv.server_close()
-    for sock in dns_sockets:
-        sock.close()
+    dns_srv.server_close()
 
 
 if __name__ == "__main__":
