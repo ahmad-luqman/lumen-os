@@ -511,7 +511,7 @@ tests = [
     "ktest:lumen_kernel::vfs::ext4::ext4_mount_directory_entry_to_free_inode_is_read_only",
     "ktest:lumen_kernel::vfs::ext4::ext4_mount_cannot_check_warns_without_fsck_advice",
     "ktest:lumen_kernel::vfs::ext4::ext4_mount_check_accepts_fault_free_workloads_without_leaks",
-    "scenario:test_alpine::test_alpine_allocation_check_has_no_leaks",
+    "scenario:test_alpine::test_alpine_allocation_check_has_no_leaks[*]",
 ]
 
 [[feature]]
