@@ -7861,10 +7861,10 @@ fixable there now, each in a PR of its own.
       any, stands): what it did went into a cache that never writes back,
       so it didn't happen on the disk, though until reboot it may show in
       memory (so lumen-vfs drops the names an unlink, rmdir or rename
-      touched from the dentry cache on a failure too, and `truncate`
-      unmaps the caller's pages past the size the file has then on a
-      failure too, never below it; an
-      `open(O_TRUNC)` that fails so doesn't). A read whose eviction met the failure is served (below), so
+      touched from the dentry cache on a failure too, and `truncate`,
+      `ftruncate` and `open(O_TRUNC)` unmap every mapping space's pages
+      past max(the size the file has then, the requested length) on a
+      failure too, `unmap_past_size_now`, #414). A read whose eviction met the failure is served (below), so
       the operation may not see the failure itself (a `link` would return
       `Ok`). When the last one ends, the latch settles (below). The VFS
       refuses every write-type path with
@@ -8367,9 +8367,16 @@ adapted code elects `Apache-2.0` per section 2; fresh code is MIT):
     `OpenGuard` it took before its last liveness check, Gate 6 above, the
     path, and the flags it checked) and `OpenFile::from_opened` takes that
     reference over (one count, never two) with those flags, which can't be
-    changed in between. `openat` must use `OpenFile::from_opened(open_inode_guarded(..)?)`
-    (`openat` does, since #254b). `OpenFile`'s access mode and `O_PATH` flag are
-    private (getters only). `open_inode` (its signature unchanged) returns
+    changed in between. `openat` must use `OpenFile::from_opened` on the
+    `Opened` from `open_inode_guarded_with_truncate_error` (`openat` does,
+    through `Start::open`: since #254b through `open_inode_guarded`, since
+    #414 through this variant). When `O_TRUNC`'s truncate fails, its
+    callback gets the opened inode, still pinned, and unmaps every address
+    space's pages past max(the size the file has now, 0), or past 0 with a
+    warning if `stat` fails, as `truncate`/`ftruncate` do on their error
+    path. `open_inode_guarded`, the variant with no callback, unmaps
+    nothing on a failed `O_TRUNC`: not for `openat`. `OpenFile`'s access
+    mode and `O_PATH` flag are private (getters only). `open_inode` (its signature unchanged) returns
     the inode with that reference given back: an
     `OpenFile::new_unchecked_flags` built from it (not for `openat`: its
     flags get none of the open's checks) takes a fresh one through
