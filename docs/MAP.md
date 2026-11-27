@@ -744,6 +744,36 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   `RawLinger`, `RawTimeval`, packed `EpollEvent`, and socket constants
   cross-checked against `linux-raw-sys`) (host-tested, incl. structured
   fuzzing).
+- `crates/lumen-unix`: `AF_UNIX` stream/datagram queues, listen backlog,
+  and ancillary data as logic, after Linux v6.12 `net/unix/af_unix.c` and
+  `net/core/sock.c` (M9, #456; ARCHITECTURE section 10): `Ancillary<F>`
+  (`Ucred`, `SCM_MAX_FD`, `drain_fds`, zero-alloc `take_fds`/`TakenFds`
+  with partial-install-safe `next_delivered` for `MSG_CTRUNC`,
+  `RecvAncillary`), `StreamPair<F>` (lazy `ByteRing` growing via
+  `NeedBuffer`/`ByteStorage`/`grow_buffer`, strict `sk_sndbuf` cap with
+  fixed `SEGMENT_OVERHEAD` (64 B) — a deliberate deviation from Linux's
+  per-skb `sndbuf / 2 - 64` chunking with overshoot, kept non-spinning by
+  partial writes — `NeedSegment`/`SegmentStorage`/`grow_segments`, Linux
+  `unix_stream_read_generic` fd/credential boundaries with required
+  `cred: Ucred` and `check_creds`, `read` vs `recv` zero-length target-1
+  semantics, `MSG_PEEK` preserving bytes/fds while clearing a pending
+  `Reset` per `sock_error`, `ShutdownHow`, `purge_recv`, `close`/
+  `close_reset`/`take_error`/`Reset`/`UndeliveredAncillary::had_unread_bytes`,
+  quarter-rule `writable`, `Readiness::err`, `in_flight_fds`,
+  `for_each_queued_fd`), `DgramQueue<F, A, S>` (message boundaries,
+  unified `Datagram<F, A, S>` with per-message `DgramPayload` and required
+  `cred: Ucred`, no receiver byte cap, `MSG_TRUNC`, `max_dgram_qlen`
+  skipped when `peer_is_sender`, `NeedSlot`/`DgramSlotStorage`/`grow_slots`,
+  `SendBudget` with Linux `used < limit` overshoot admission, `-EMSGSIZE`
+  at `sndbuf - 32`, quarter-rule `writable`, and fixed 32 B per-datagram
+  charge — a deliberate deviation from Linux's `skb->truesize` — `DgramPeer`
+  without `-EISCONN` plus `may_accept_from`, `purge`/`set_reset`/
+  `take_error`/`send_shutdown`/`close`/`DgramUndelivered`,
+  `for_each_queued_fd`), and `Listener<C>` (`clamp_backlog`/`SOMAXCONN`,
+  non-allocating `listen` via `ListenerStorage`/`grow_storage`, FIFO
+  `accept`, full-backlog `WouldBlock`, `pending`, `close`/
+  `PendingConnections`) (host-tested, incl. a Linux-loop randomized model,
+  `tests/zero_alloc.rs`, and `tests/oom.rs`).
 - `crates/lumen-proc`: the POSIX process tree as logic (M8, #341;
   ARCHITECTURE section 8): `ProcTree` (pids from 2 to a maximum, wrapping,
   never one in use as a pid, pgid or sid; `spawn_init`, `spawn_root`,
