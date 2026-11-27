@@ -14,6 +14,7 @@ from lumen_harness.crash import BEGIN as CRASH_BEGIN
 from lumen_harness.klog import unexpected_warnings
 from lumen_harness.qemu import EXIT_SUCCESS, Devices
 from lumen_harness.rootfs import (
+    BUSYBOX_EXIT,
     copy_dev_rootfs,
     copy_rootfs,
     debugfs,
@@ -415,3 +416,222 @@ exit 23
         "all-a",
         "all-b",
     }
+
+
+def _require_dev_rootfs() -> None:
+    """Skip locally when `build/alpine-dev.ext4` hasn't been built; fail on Linux CI."""
+    if not (BUILD_DIR / "alpine-dev.ext4").is_file():
+        if os.environ.get("CI") and sys.platform == "linux":
+            pytest.fail("build/alpine-dev.ext4 is missing: CI runs `make rootfs-dev` first")
+        pytest.skip("no build/alpine-dev.ext4 (run `make rootfs-dev`)")
+
+
+def test_gcc_gpp_compile_cpp_and_shared_lib(boot, tmp_path):
+    """D2: unmodified Alpine gcc/g++ and GNU make on the developer image at 512 MiB.
+
+    `make -j1` compiles a C helper object with `gcc -O2`, a C++ shared library
+    (`libthrow.so`) with `g++ -O2 -fPIC -shared`, and a C++ executable linked
+    against both with `-Wl,-rpath,.`; running it verifies normal calls and a
+    C++ `std::runtime_error` thrown and unwound with RAII destructors across
+    the `.so` boundary. `make -j1 -q` confirms targets are up to date, then
+    `make -j2` runs two recipes locked in a two-way FIFO handshake using GNU
+    make 4.4's FIFO jobserver (`--jobserver-auth=fifo:`, empty stderr), so the
+    build finishes only if both run concurrently. Afterwards `mem` confirms the
+    free-frame minimum since initialization stayed at or above 64 MiB through
+    the build (and below the post-build free count), and the synced ext4 image
+    passes `e2fsck -fn` with the build outputs present.
+    """
+    _require_dev_rootfs()
+    disk = copy_dev_rootfs(tmp_path)
+    script = tmp_path / "d2.sh"
+    script.write_text(
+        r"""set -eu
+export PATH=/bin:/usr/bin
+mkdir /d2
+cd /d2
+
+cat > helper.h <<'EOF'
+int helper_add(int a, int b);
+EOF
+
+cat > helper.c <<'EOF'
+#include "helper.h"
+int helper_add(int a, int b) { return a + b; }
+EOF
+
+cat > lib.hpp <<'EOF'
+#pragma once
+int risky(int x, int *dtor_hits);
+EOF
+
+cat > lib.cpp <<'EOF'
+#include "lib.hpp"
+#include <stdexcept>
+
+namespace {
+struct Guard {
+    int *hits;
+    ~Guard() { ++(*hits); }
+};
+}
+
+int risky(int x, int *dtor_hits) {
+    Guard g{dtor_hits};
+    if (x > 1) {
+        throw std::runtime_error("too big");
+    }
+    return x + 10;
+}
+EOF
+
+cat > main.cpp <<'EOF'
+#include "lib.hpp"
+#include <exception>
+#include <iostream>
+#include <string>
+
+extern "C" {
+#include "helper.h"
+}
+
+int main() {
+    int dtor_hits = 0;
+    int sum = helper_add(20, 22);
+    int ok = risky(1, &dtor_hits);
+    std::string msg = "uncaught";
+    try {
+        (void)risky(2, &dtor_hits);
+    } catch (const std::exception &e) {
+        msg = e.what();
+    }
+    std::cout << "c-helper=" << sum << "\n";
+    std::cout << "ok=" << ok << "\n";
+    std::cout << "caught=" << msg << "\n";
+    std::cout << "dtor=" << dtor_hits << "\n";
+    return (sum == 42 && ok == 11 && msg == "too big" && dtor_hits == 2) ? 0 : 1;
+}
+EOF
+
+cat > Makefile <<'EOF'
+.PHONY: all
+all: app
+
+helper.o: helper.c helper.h
+	gcc -O2 -Wall -Wextra -c -o $@ $<
+
+libthrow.so: lib.cpp lib.hpp
+	g++ -O2 -Wall -Wextra -fPIC -shared -o $@ $<
+
+app: main.cpp helper.o libthrow.so lib.hpp helper.h
+	g++ -O2 -Wall -Wextra -o $@ main.cpp helper.o -L. -lthrow -Wl,-rpath,.
+EOF
+
+if ! make -j1 > build.log 2>&1; then
+    cat build.log
+    exit 11
+fi
+./app
+make -j1 -q
+printf 'uptodate=ok\n'
+""",
+        encoding="utf-8",
+    )
+    j2_script = tmp_path / "d2-j2.sh"
+    j2_script.write_text(
+        r"""set -eu
+export PATH=/bin:/usr/bin
+cd /d2
+mkfifo j2.a2b j2.b2a
+
+# Two-way FIFO handshake between recipes a and b: neither can finish unless
+# GNU make 4.4 acquires its jobserver token and runs both concurrently.
+cat > Makefile.j2 <<'EOF'
+.PHONY: all a b
+all: a b
+a:
+	+printf '%s\n' "$$MAKEFLAGS" > j2.flags && printf 'from-a\n' > j2.a2b && read -r got < j2.b2a && [ "$$got" = from-b ]
+b:
+	read -r got < j2.a2b && [ "$$got" = from-a ] && printf 'from-b\n' > j2.b2a
+EOF
+
+if ! make -j2 -f Makefile.j2 > j2.out 2> j2.err; then
+    cat j2.out j2.err
+    exit 12
+fi
+rm j2.a2b j2.b2a
+if [ -s j2.err ]; then
+    printf 'j2-stderr-unexpected:\n'
+    cat j2.err
+    exit 13
+fi
+case "$(cat j2.flags)" in
+    *--jobserver-auth=fifo:*) ;;
+    *)
+        printf 'j2-no-fifo-jobserver:%s\n' "$(cat j2.flags)"
+        exit 14
+        ;;
+esac
+printf 'j2=ok\n'
+""",
+        encoding="utf-8",
+    )
+    debugfs(disk, f'write "{script}" /d2.sh', write=True)
+    debugfs(disk, f'write "{j2_script}" /d2-j2.sh', write=True)
+    m = boot("qemutest", memory="512M", devices=Devices(blk_image=disk, rng=True))
+    m.expect(PROMPT, BOOT_TIMEOUT)
+
+    # Generous outer timeout for TCG on a busy host (no timing ceilings).
+    raw = run(m, "linux /bin/busybox ash /d2.sh", 600)
+    lines = raw.splitlines()
+    done = BUSYBOX_EXIT.fullmatch(lines[-1]) if lines else None
+    assert done, f"no `linux: /bin/busybox exit=...` line last:\n{raw}"
+    assert int(done.group(1)) == 0, raw
+    assert lines[:-1] == [
+        "c-helper=42",
+        "ok=11",
+        "caught=too big",
+        "dtor=2",
+        "uptodate=ok",
+    ], raw
+    j2_done = run_busybox(m, "ash /d2-j2.sh")
+    assert j2_done.status == 0, j2_done.raw
+    assert j2_done.output.splitlines() == ["j2=ok"], j2_done.raw
+    assert CRASH_BEGIN not in m.output
+
+    mem_out = run(m, "mem")
+    low_match = re.search(
+        r"^  frames  [\d.]+ (?:[KMG]i)?B of [\d.]+ (?:[KMG]i)?B used "
+        r"\((\d+) frames of (\d+) free, 4 KiB each; low [\d.]+ (?:[KMG]i)?B, (\d+) frames\)$",
+        mem_out,
+        re.MULTILINE,
+    )
+    assert low_match, mem_out
+    free_frames, owned_frames, min_free_frames = (int(g) for g in low_match.groups())
+    assert min_free_frames < free_frames <= owned_frames, mem_out
+    assert min_free_frames * 4096 >= 64 * 1024 * 1024, (
+        f"free-frame low-water mark fell below 64 MiB: {min_free_frames} frames "
+        f"({min_free_frames * 4096 / (1024 * 1024):.1f} MiB)\n{mem_out}"
+    )
+
+    assert run(m, "sync", 60) == "sync: ok\n"
+    m.send_line("exit")
+    assert m.wait_exit(10) == EXIT_SUCCESS
+    e2fsck_check(disk)
+
+    assert {
+        "helper.o",
+        "libthrow.so",
+        "app",
+        "build.log",
+        "j2.out",
+        "j2.err",
+        "j2.flags",
+    } <= debugfs_names(disk, "/d2")
+    build_log = debugfs(disk, "cat /d2/build.log")
+    assert "gcc -O2 -Wall -Wextra -c -o helper.o helper.c" in build_log, build_log
+    assert "g++ -O2 -Wall -Wextra -fPIC -shared -o libthrow.so lib.cpp" in build_log, build_log
+    assert "g++ -O2 -Wall -Wextra -o app main.cpp helper.o -L. -lthrow -Wl,-rpath,." in build_log, (
+        build_log
+    )
+    assert debugfs(disk, "cat /d2/j2.err") == ""
+    assert "--jobserver-auth=fifo:" in debugfs(disk, "cat /d2/j2.flags")

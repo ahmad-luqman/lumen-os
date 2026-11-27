@@ -94,6 +94,17 @@ impl Reservations {
 struct State {
     frames: FrameAllocator<'static>,
     reserved: Reservations,
+    /// Lowest value `frames.free_frames()` has reached since [`init`].
+    min_free: usize,
+}
+
+impl State {
+    fn note_low_water(&mut self) {
+        let free = self.frames.free_frames();
+        if free < self.min_free {
+            self.min_free = free;
+        }
+    }
 }
 
 static STATE: SpinLock<Option<State>> = SpinLock::new(None);
@@ -308,15 +319,19 @@ pub fn init(hhdm: u64) {
     // ACPI) that can't be allocated. `reserved`-typed entries are left out:
     // most are MMIO windows (one is 12 GiB on q35), a few firmware RAM.
     let ram: u64 = entries.iter().filter(|e| is_ram(e.entry_type)).map(|e| e.length / FRAME_SIZE).sum();
-    let free = frames.free_frames() as u64;
-    let held = ram.checked_sub(free).expect("allocator owns more frames than the map has RAM");
+    let free = frames.free_frames();
+    let held = ram.checked_sub(free as u64).expect("allocator owns more frames than the map has RAM");
     info!(target: "mem", "frames: {free} usable, {held} reserved");
 
-    *STATE.lock() = Some(State { frames, reserved });
+    *STATE.lock() = Some(State { frames, reserved, min_free: free });
 }
 
 fn with_frames<R>(f: impl FnOnce(&mut FrameAllocator<'static>) -> R) -> R {
-    f(&mut STATE.lock().as_mut().expect("frame allocator used before mm::init").frames)
+    let mut guard = STATE.lock();
+    let s = guard.as_mut().expect("frame allocator used before mm::init");
+    let r = f(&mut s.frames);
+    s.note_low_water();
+    r
 }
 
 fn frame(addr: u64) -> PhysFrame {
@@ -330,11 +345,15 @@ pub struct Counts {
     pub owned: usize,
     /// Of those, free now.
     pub free: usize,
+    /// Fewest free frames observed since [`init`].
+    pub min_free: usize,
 }
 
 /// The allocator's [`Counts`] (O(1)).
 pub fn counts() -> Counts {
-    with_frames(|f| Counts { owned: f.owned_frames(), free: f.free_frames() })
+    let guard = STATE.lock();
+    let s = guard.as_ref().expect("frame allocator used before mm::init");
+    Counts { owned: s.frames.owned_frames(), free: s.frames.free_frames(), min_free: s.min_free }
 }
 
 /// Allocate one 4 KiB frame, or `None` when physical memory is exhausted.
@@ -603,6 +622,7 @@ pub fn reserve(name: &'static str, range: PhysRange) -> Result<usize, ReserveErr
         return Err(ReserveError::ListFull);
     }
     let taken = s.frames.reserve(frames).expect("checked above: no frame of the range is allocated");
+    s.note_low_water();
     match merge {
         Some(i) => {
             let r = &mut s.reserved.items[i].range;
@@ -632,6 +652,31 @@ mod checks {
 
     pub fn with_state<R>(f: impl FnOnce(&State) -> R) -> R {
         f(STATE.lock().as_ref().expect("frame allocator not initialized"))
+    }
+
+    /// Resets `min_free` to the current free count for the duration of a test
+    /// and restores the minimum across both when dropped, so tests observe
+    /// transitions even after an earlier test (like `never_returns_reserved`)
+    /// drained every frame.
+    #[must_use = "dropping the guard restores the low-water mark"]
+    pub struct LowWaterGuard(usize);
+
+    impl LowWaterGuard {
+        pub fn reset() -> Self {
+            let mut guard = STATE.lock();
+            let s = guard.as_mut().expect("frame allocator not initialized");
+            let prev = s.min_free;
+            s.min_free = s.frames.free_frames();
+            Self(prev)
+        }
+    }
+
+    impl Drop for LowWaterGuard {
+        fn drop(&mut self) {
+            let mut guard = STATE.lock();
+            let s = guard.as_mut().expect("frame allocator not initialized");
+            s.min_free = s.min_free.min(self.0);
+        }
     }
 
     pub fn is_owned(phys: u64) -> bool {
@@ -1036,9 +1081,10 @@ crate::ktest!(
         kassert_eq!(refused, Err(ReserveError::InUse(c)));
         kassert_eq!(still, (true, true)); // refusing changed nothing
         // Now all three are free. `b` is taken and named...
+        let _low_water = LowWaterGuard::reset();
         let (before, names) = (free_frames(), named());
         kassert_eq!(reserve(NAME, PhysRange::from_len(b + 8, 16)), Ok(1));
-        kassert_eq!((free_frames(), named()), (before - 1, names + 1));
+        kassert_eq!((free_frames(), named(), counts().min_free), (before - 1, names + 1, before - 1));
         kassert!(!is_owned(b));
         // ...then `a` with `b` (merging downwards), then `b` with `c` (a
         // range part reserved under the name, part free, as when a table's
@@ -1423,6 +1469,99 @@ crate::ktest!(
         }
         drop(parent);
         kassert_eq!(free_frames(), before);
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn low_water_mark_tracks_the_minimum() {
+        use self::checks::LowWaterGuard;
+        use crate::{kassert, kassert_eq};
+        let initial = counts();
+        kassert!(initial.min_free <= initial.free && initial.free <= initial.owned);
+
+        let outer = LowWaterGuard::reset();
+        let baseline = counts();
+        kassert_eq!(baseline.min_free, baseline.free);
+        let before = baseline.free;
+
+        // Single-frame allocations (alloc, alloc_zeroed, alloc_owned) and a
+        // contiguous run each pull the low-water mark down to the new minimum.
+        let a = alloc().ok_or("out of frames")?;
+        kassert_eq!(counts().free, before - 1);
+        kassert_eq!(counts().min_free, before - 1);
+
+        let b = alloc_zeroed().ok_or("out of frames")?;
+        let c = alloc_owned().ok_or("out of frames")?;
+        kassert_eq!(counts().free, before - 3);
+        kassert_eq!(counts().min_free, before - 3);
+
+        let run = alloc_contiguous(4, 1).ok_or("no 4-frame run")?;
+        kassert_eq!(counts().free, before - 7);
+        kassert_eq!(counts().min_free, before - 7);
+
+        // Freeing frames raises `free` without raising `min_free`.
+        // SAFETY: `run`, `b`, and `a` were allocated above and are no longer used.
+        kassert_eq!(unsafe { free_contiguous(run, 4) }, Ok(()));
+        kassert_eq!(counts().free, before - 3);
+        kassert_eq!(counts().min_free, before - 7);
+
+        drop(c);
+        // SAFETY: allocated above and not used since.
+        kassert_eq!(unsafe { free(b) }, Ok(()));
+        // SAFETY: allocated above and not used since.
+        kassert_eq!(unsafe { free(a) }, Ok(()));
+        kassert_eq!(counts().free, before);
+        kassert_eq!(counts().min_free, before - 7);
+
+        // A shallower dip leaves the deeper low-water mark intact.
+        let shallow = alloc_contiguous(3, 1).ok_or("no 3-frame run")?;
+        kassert_eq!(counts().free, before - 3);
+        kassert_eq!(counts().min_free, before - 7);
+        // SAFETY: `shallow` was allocated above and is not used since.
+        kassert_eq!(unsafe { free_contiguous(shallow, 3) }, Ok(()));
+        kassert_eq!(counts().free, before);
+        kassert_eq!(counts().min_free, before - 7);
+
+        // A deeper dip lowers the mark further and sticks after freeing.
+        let deep = alloc_contiguous(10, 1).ok_or("no 10-frame run")?;
+        kassert_eq!(counts().free, before - 10);
+        kassert_eq!(counts().min_free, before - 10);
+        // SAFETY: `deep` was allocated above and is not used since.
+        kassert_eq!(unsafe { free_contiguous(deep, 10) }, Ok(()));
+        kassert_eq!(counts().free, before);
+        kassert_eq!(counts().min_free, before - 10);
+
+        // A failed allocation changes neither `free` nor `min_free`.
+        kassert!(alloc_contiguous(baseline.owned + 1, 1).is_none());
+        kassert_eq!(counts().free, before);
+        kassert_eq!(counts().min_free, before - 10);
+
+        // Dropping a guard restores the earlier minimum when it was lower than
+        // what the guarded section saw...
+        let inner = LowWaterGuard::reset();
+        kassert_eq!(counts().min_free, before);
+        let dip = alloc_contiguous(3, 1).ok_or("no 3-frame run")?;
+        kassert_eq!(counts().min_free, before - 3);
+        // SAFETY: `dip` was allocated above and is not used since.
+        kassert_eq!(unsafe { free_contiguous(dip, 3) }, Ok(()));
+        drop(inner);
+        kassert_eq!(counts().min_free, before - 10);
+
+        // ...and keeps a deeper minimum made while the guard was live.
+        let inner = LowWaterGuard::reset();
+        kassert_eq!(counts().min_free, before);
+        let deeper = alloc_contiguous(12, 1).ok_or("no 12-frame run")?;
+        kassert_eq!(counts().min_free, before - 12);
+        // SAFETY: `deeper` was allocated above and is not used since.
+        kassert_eq!(unsafe { free_contiguous(deeper, 12) }, Ok(()));
+        drop(inner);
+        kassert_eq!(counts().min_free, before - 12);
+
+        // Dropping the outer guard restores the minimum since initialization
+        // (or the new deeper minimum if none was lower).
+        drop(outer);
+        kassert_eq!(counts().min_free, (before - 12).min(initial.min_free));
         Ok(())
     }
 );

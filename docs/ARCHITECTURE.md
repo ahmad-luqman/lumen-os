@@ -8945,10 +8945,14 @@ standard Linux IPC primitives:
   `ktest:lumen_kernel::linux::syscall::fd::fifo_blocking_opens_wait_for_peers_and_interrupt_detaches`,
   and `ktest:lumen_kernel::vfs::ext4::ext4_fifo_mknod_descriptor_fault_never_frees_foreign_blocks`.
   D2's scenario also runs `make -j2` on a two-rule Makefile
-  of `true` commands after its build: GNU make 4.4's jobserver FIFO
-  (`mkfifo`, then `pselect6` on its read end), with nothing on stderr (make
-  prints `jobserver mkfifo:` and an errno when `mkfifo` fails, then falls
-  back to a pipe).
+  after its build: GNU make 4.4's jobserver FIFO (`mkfifo`, then `pselect6`
+  on its read end), with nothing on stderr (make prints `jobserver mkfifo:`
+  and an errno when `mkfifo` fails, then falls back to a pipe). The two
+  recipes complete a two-way FIFO handshake (one writes a request and reads
+  the reply, the other reads and replies), so the build finishes only if
+  make runs both at once: a FIFO readiness bug that kept make to one slot
+  would hang it, where independent recipes could finish one after the
+  other.
 
 ### The readiness interface (B3), for `poll` now and `epoll` in M9
 
@@ -11493,8 +11497,8 @@ every scenario check is one `ok` line of a `tools/linux-m8` mode):
   usable, and the kernel's own memory (image, frame bitmap and reference
   counts, page tables, stacks, heap) is taken as 30 MiB: a margin of at
   least 220 MiB for the demo and at least 130 MiB for the header file
-  (both from 450 MiB). The `make -j2` step adds no compile (its rules run
-  `true`); a `-j2` build of two demo files would add about 125 MiB (a
+  (both from 450 MiB). The `make -j2` step adds no compile (its two rules only
+  exchange a FIFO handshake); a `-j2` build of two demo files would add about 125 MiB (a
   second `cc1plus`'s 84 and its own 41 MiB image copy) and still fit, but
   the gate doesn't run one. 1 GiB would be needed only for parallel builds
   of heavy files. The numbers are #344's host measurements; D2's free-frame
