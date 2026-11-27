@@ -9187,7 +9187,10 @@ pub struct PollHead<F: LockFamily> { /* subscribers behind F's level-10e spin lo
   input too. Physical VT Enter (main or keypad) is CR and Backspace is DEL
   before termios processing; their key identities survive decoding and the
   VT queue, so Ctrl-J stays LF and Ctrl-H stays BS. Serial and VT output
-  preserve the discipline's processed bytes.
+  preserve the discipline's processed bytes. VT writes collect these bytes
+  into fixed 256-byte batches, rendering on a full batch or at the end of
+  the discipline write, before releasing the tty lock. Input echo remains
+  immediate.
 - `/dev/tty` is the caller's controlling terminal (`-ENXIO` without one,
   as Linux); `/dev/console` is the console the `linux` command ran on.
   M7's `ConsoleIo` routing (`VfsInode::is_tty`) becomes the `Tty`'s;

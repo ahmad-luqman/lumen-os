@@ -24,8 +24,24 @@ use crate::user::{copy_from_user, copy_to_user};
 use crate::vfs::KernelPollHead;
 
 const BUFFER: usize = 4096;
+const VT_OUTPUT_BATCH: usize = 256;
 
 struct Ring(VecDeque<u8>, Option<ConsoleOutput>);
+
+impl Ring {
+    fn write(&mut self, ld: &mut LineDiscipline, bytes: &[u8]) -> usize {
+        if let Some(console) = &mut self.1
+            && matches!(console.io, ConsoleIo::Vt(_))
+        {
+            let mut batch = VtOutputBatch { console, bytes: [0; VT_OUTPUT_BATCH], len: 0 };
+            let consumed = ld.write(bytes, &mut batch).consumed;
+            batch.flush();
+            consumed
+        } else {
+            ld.write(bytes, self).consumed
+        }
+    }
+}
 
 impl Output for Ring {
     fn push(&mut self, bytes: &[u8]) -> bool {
@@ -430,7 +446,7 @@ impl Tty {
                     n
                 } else {
                     let TtyInner { ld, to_master, .. } = &mut *state;
-                    ld.write(&buffer[used..want], to_master).consumed
+                    to_master.write(ld, &buffer[used..want])
                 };
                 done += n;
                 used += n;
@@ -688,6 +704,42 @@ impl Tty {
 /// The VT parser retains split UTF-8 codepoints and escape sequences.
 struct ConsoleOutput {
     io: ConsoleIo,
+}
+
+/// Batch a discipline write's processed VT bytes without allocating or changing
+/// them. Flush before releasing Lock 9a; input echo keeps its immediate path.
+struct VtOutputBatch<'a> {
+    console: &'a mut ConsoleOutput,
+    bytes: [u8; VT_OUTPUT_BATCH],
+    len: usize,
+}
+
+impl VtOutputBatch<'_> {
+    fn flush(&mut self) {
+        if self.len != 0 {
+            self.console.write(&self.bytes[..self.len]);
+            self.len = 0;
+        }
+    }
+}
+
+impl Output for VtOutputBatch<'_> {
+    fn push(&mut self, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let n = bytes.len().min(self.bytes.len() - self.len);
+            self.bytes[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+            self.len += n;
+            bytes = &bytes[n..];
+            if self.len == self.bytes.len() {
+                self.flush();
+            }
+        }
+        true
+    }
+
+    fn discard(&mut self) {
+        self.len = 0;
+    }
 }
 
 impl ConsoleOutput {
@@ -1421,7 +1473,9 @@ crate::ktest!(
             crate::term::reset_view(vt.index());
             const TEXT: &[u8] = b"\x1b[2J\x1b[Hab\nX";
             copy_to_user(base, TEXT).map_err(|_| "VT output")?;
+            let renders = crate::term::tty_renders(vt.index());
             kassert_eq!(tty.write(false, base, TEXT.len() as u64, false), Ok(TEXT.len() as u64));
+            kassert_eq!(crate::term::tty_renders(vt.index()) - renders, 1);
             let view = crate::term::view_text().ok_or("VT grid")?;
             kassert_eq!(view.rows[0].as_str(), "ab");
             kassert_eq!(view.rows[1].as_str(), "  X");
@@ -1432,6 +1486,49 @@ crate::ktest!(
             }
             kassert_eq!(crate::term::view_text().ok_or("VT grid")?.rows[2].as_str(), "é");
             drop(session);
+            Ok(())
+        })?
+    }
+);
+
+crate::ktest!(
+    fn console_vt_output_batches_renders() {
+        use crate::kassert_eq;
+        process::in_test_process(|_| -> crate::ktest::TestResult {
+            let vt = process::VtId::new(1).ok_or("VT id")?;
+            let _first = crate::term::ShowFirstAfter;
+            crate::term::show(vt.index()).map_err(|_| "show VT")?;
+            let tty = console(ConsoleIo::Vt(vt)).ok_or("VT tty")?;
+            let _restore = RestoreConsole::raw(&tty);
+            let base = process::KTEST_USER_VA;
+            for len in [VT_OUTPUT_BATCH - 1, VT_OUTPUT_BATCH, VT_OUTPUT_BATCH + 1, 4 * VT_OUTPUT_BATCH + 1] {
+                crate::term::write_str_to(vt.index(), "\x1b[2J\x1b[H");
+                let mut bytes = [b'\r'; 4 * VT_OUTPUT_BATCH + 1];
+                bytes[len - 1] = b'X';
+                copy_to_user(base, &bytes[..len]).map_err(|_| "VT batch output")?;
+                let renders = crate::term::tty_renders(vt.index());
+                kassert_eq!(tty.write(false, base, len as u64, false), Ok(len as u64));
+                kassert_eq!(crate::term::tty_renders(vt.index()) - renders, len.div_ceil(VT_OUTPUT_BATCH) as u64);
+                // The final partial batch must be visible when write returns.
+                kassert_eq!(crate::term::view_text().ok_or("VT grid")?.rows[0].as_str(), "X");
+            }
+            {
+                let mut state = tty.lock.lock();
+                let mut termios = state.ld.termios();
+                termios.c_oflag = general::OPOST | general::ONLCR;
+                let _ = state.ld.set_termios(termios, Flush::Keep);
+            }
+            // CRLF expansion straddles a batch boundary: count processed bytes,
+            // not source bytes, and preserve the parser's state across batches.
+            crate::term::write_str_to(vt.index(), "\x1b[2J\x1b[H");
+            let mut bytes = [b'\r'; VT_OUTPUT_BATCH + 1];
+            bytes[VT_OUTPUT_BATCH - 1] = b'\n';
+            bytes[VT_OUTPUT_BATCH] = b'X';
+            copy_to_user(base, &bytes).map_err(|_| "VT expanded batch output")?;
+            let renders = crate::term::tty_renders(vt.index());
+            kassert_eq!(tty.write(false, base, bytes.len() as u64, false), Ok(bytes.len() as u64));
+            kassert_eq!(crate::term::tty_renders(vt.index()) - renders, 2);
+            kassert_eq!(crate::term::view_text().ok_or("VT grid")?.rows[1].as_str(), "X");
             Ok(())
         })?
     }

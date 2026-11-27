@@ -1033,9 +1033,21 @@ pub(crate) fn write_bytes_to(vt: usize, bytes: &[u8]) -> bool {
         if vt == screen.shown {
             screen.show_cursor();
             screen.render();
+            #[cfg(feature = "ktest")]
+            TTY_RENDERS[vt].fetch_add(1, Ordering::Relaxed);
         }
     })
     .is_some()
+}
+
+// Count the tty writer's render calls alone: cursor blinking and kernel logs
+// must not make a batching assertion depend on how long the host pauses.
+#[cfg(feature = "ktest")]
+static TTY_RENDERS: [core::sync::atomic::AtomicU64; VTS] = [const { core::sync::atomic::AtomicU64::new(0) }; VTS];
+
+#[cfg(feature = "ktest")]
+pub(crate) fn tty_renders(vt: usize) -> u64 {
+    TTY_RENDERS[vt].load(Ordering::Relaxed)
 }
 
 /// Write formatted text (`\n` as CR LF) to virtual terminal `vt` and draw

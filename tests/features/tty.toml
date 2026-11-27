@@ -32,3 +32,8 @@ tests = ["ktest:lumen_kernel::tty::console_vt_key_encoding_and_processed_output"
 name = "Console Ctrl-C discards deterministically queued input suffixes"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::tty::console_ctrl_c_flushes_queued_suffix"]
+
+[[feature]]
+name = "VT tty output renders once per processed-byte batch"
+milestone = "M8"
+tests = ["ktest:lumen_kernel::tty::console_vt_output_batches_renders", "ktest:lumen_kernel::tty::console_vt_key_encoding_and_processed_output"]
