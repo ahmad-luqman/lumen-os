@@ -685,6 +685,16 @@ across issues are in `ARCHITECTURE.md`; what is tested is in `STATUS.md`.
   chunks and its wake rules; `WriteStep`, `InterruptedWrite`,
   `FaultedWrite`) (host-tested, incl. no allocation outside creation and
   `set_capacity`, `tests/zero_alloc.rs`).
+- `crates/lumen-epoll`: `epoll(7)` interest sets, ready lists and nested-set
+  loop checks as logic (M9, #455; ARCHITECTURE sections 9 and 10):
+  `EpollSet<K>` (`add`, `modify`, `remove`, zero-alloc `wake` and `collect`
+  over pre-allocated slab slots with intrusive ready-list links; LT tail
+  requeue with unprocessed-remainder splice-to-front fairness, ET drop,
+  `EPOLLONESHOT` disarm/re-arm, `EPOLLEXCLUSIVE` flag rules, implicit
+  `EPOLLERR`/`EPOLLHUP`, ignored `EPOLLWAKEUP`), `LoopCheck<Id>` (cycle and
+  `EP_MAX_NESTS` = 4 depth check with refcounted duplicate edges) and `Errno`
+  / `EPOLL*` constants from `linux-raw-sys` (host-tested, incl. randomized
+  models and `tests/zero_alloc.rs`).
 - `crates/lumen-tty`: a terminal line discipline as logic, after Linux's
   n_tty (M8, #340; ARCHITECTURE section 10): `LineDiscipline` (`receive`
   each input byte: canonical editing, echo, `ISIG`'s `JobSignal`; `read`

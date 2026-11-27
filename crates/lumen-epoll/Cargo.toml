@@ -1,0 +1,12 @@
+[package]
+name = "lumen-epoll"
+description = "no_std epoll interest sets, ready lists, and nested-set loop checks for the Lumen kernel, host-tested"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+linux-raw-sys = { workspace = true }
+
+[lints]
+workspace = true
