@@ -995,11 +995,9 @@ def test_alpine_allocation_check_has_no_leaks(boot, tmp_path, dev_image, record_
         memory="512M",
         devices=Devices(blk_image=disk, rng=True),
     )
-    m.expect(
-        r"DEBUG vfs: ext4 on DevId\(1\): allocation check: \d+ us, 0 leaked blocks", BOOT_TIMEOUT
+    report = m.expect(
+        r"DEBUG vfs: ext4 on DevId\(1\): allocation check: (\d+) us, 0 leaked blocks", BOOT_TIMEOUT
     )
-    report = re.search(r"allocation check: (\d+) us, 0 leaked blocks", m.output)
-    assert report
     record_property("allocation_check_us", int(report[1]))
     m.expect(PROMPT, BOOT_TIMEOUT)
     mounts = run(m, "mount")

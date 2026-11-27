@@ -312,7 +312,8 @@ VFS_HOLDABLE_LINES = (*VFS_SWEEP_LINES, *VFS_ERRORED_LINES)
 # of every filesystem, mem's msync, meta's failed chown, an older mapping's
 # volume going read-only, the latch settling at the last operation's end,
 # the device write failing part-way through a sync (#349), and
-# ext4_allocation_corruption_keeps_the_first_failure_cause's device-first leg.
+# ext4_allocation_corruption_keeps_the_first_failure_cause's device-first leg,
+# and ext4_mount_unlink_inode_table_device_failure_is_read_only.
 VFS_ERRORED_UNGUARDED = 14
 VFS_EXACT_LINES = {
     # #355: count/ownership failures in both mapping formats, dangling
@@ -325,7 +326,8 @@ VFS_EXACT_LINES = {
     rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: inode \d+ block \d+ is mapped but free; run e2fsck -f": 2,
     rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: inode \d+ block \d+ is mapped twice; run e2fsck -f": 2,
     rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: directory inode 2 references free or out-of-range inode 11; run e2fsck -f": 2,
-    rf"WARN  vfs: ext4 on {_DEV}: cannot check allocation: allocation metadata read failed: Io; mounting read-only": 1,
+    rf"WARN  vfs: ext4 on {_DEV}: cannot check allocation: filesystem metadata block 2 read failed: Io; mounting read-only": 1,
+    rf"WARN  vfs: ext4 on {_DEV}: mounting read-only: invalid allocation metadata: volume exceeds device capacity; run e2fsck -f": 1,
     # page_quota_release_saturates_and_detached_quota_reports_nospc
     r"ERROR vfs: quota ktest \(16384 bytes\): released 20480 bytes with only 8192 reserved": 1,
     r"ERROR vfs: quota ktest \(16384 bytes\): dropped with 12289 bytes still reserved": 1,
@@ -395,6 +397,8 @@ VFS_EXACT_LINES = {
     # volume read-only after it, its own sync then writes nothing and warns
     # nothing).
     rf"WARN  vfs: fsync: ext4 {_DEV} inode \d+: block cache: block device I/O error": 2,
+    # io_sync_flushes_every_mounted_filesystem and
+    # ext4_mount_unlink_inode_table_device_failure_is_read_only, one each.
     rf"WARN  vfs: sync: ext4 {_DEV} block cache: block device I/O error": 2,
     # ext4_writes_past_the_hard_page_limit_fail: two writes refused;
     # ext4_mmap_page_hands_out_the_cached_page_filled_from_disk: a page;

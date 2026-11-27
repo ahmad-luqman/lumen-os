@@ -518,3 +518,14 @@ tests = [
 name = "Fast symlinks with an external xattr use Linux's i_blocks == acl_sectors rule for readlink and unlink; ext4plus's unreclaimed xattr is a counted harmless leak (#355 round 1)"
 milestone = "M8"
 tests = ["ktest:lumen_kernel::vfs::ext4::ext4_fast_symlink_with_xattr_reads_inline_and_unlinks_safely"]
+
+[[feature]]
+name = "Ext4 mount checks accept leaked shared-xattr references after unlink, validate each unique xattr once, decode raw inode high fields consistently, and classify capacity, directory, map and read failures (#355 round 2)"
+milestone = "M8"
+tests = [
+    "cargo:lumen-vfs",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_shared_xattr_after_unlink_remains_writable",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_volume_beyond_device_is_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_unlink_inode_table_device_failure_is_read_only",
+    "ktest:lumen_kernel::vfs::ext4::ext4_mount_check_accepts_fault_free_workloads_without_leaks",
+]

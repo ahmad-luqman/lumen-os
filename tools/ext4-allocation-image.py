@@ -1,4 +1,4 @@
-"""Build the committed mount-allocation fixture (e2fsprogs 1.47.4).
+"""Build the committed mount-allocation fixture (made with e2fsprogs 1.47.4).
 
 Run: UV_OFFLINE=1 uv run python tools/ext4-allocation-image.py
 No build invokes this script. All filesystem features, geometry, UUID,
@@ -146,6 +146,8 @@ def main() -> None:
             length = struct.unpack_from("<H", raw, off + 4)[0]
             assert length >= 8
             if raw[off + 8 : off + 8 + raw[off + 6]] == b"socket":
+                # Changing i_mode did not change the dirent's file_type:
+                # EXT4_FT_SOCK is 6, replacing write's regular-file type 1.
                 raw[off + 7] = 6
             off += length
         image.write_bytes(raw)

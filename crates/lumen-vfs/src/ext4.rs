@@ -12,7 +12,6 @@
 //! `include/linux/kdev_t.h`); the extent and block-map layouts are ext4's
 //! (`fs/ext4/ext4_extents.h`, `fs/ext4/indirect.c`).
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -84,7 +83,8 @@ pub fn time_from_disk(d: Duration) -> Timespec {
     Timespec { sec: low + (epoch << 32), nsec: i64::from(d.subsec_nanos()) }
 }
 
-/// Why [`first_block_freed`] couldn't name a block: a read failed, the map
+/// Why [`first_block_freed`] could not name a block for unlink recovery:
+/// a read or buffer allocation failed, the map
 /// doesn't parse (a bad extent header, an index block of the wrong depth),
 /// or finding its first block takes more reads than [`MAP_READS_MAX`] (a
 /// map with many empty blocks first, as a block map truncated by
@@ -150,7 +150,7 @@ pub fn first_block_freed<E>(
         read(block, buf).map_err(BlockMapError::Read)
     };
     if extents {
-        let depth = extent_header(i_block, None)?;
+        let depth = extent_header(i_block, None).ok_or(BlockMapError::Corrupt)?;
         if let Some(block) = first_extent_start(i_block, depth, block_size, &mut read_block)? {
             return Ok(Some(block));
         }
@@ -177,14 +177,14 @@ pub fn first_block_freed<E>(
 /// An extent node's header checked (its magic, its entries within its room
 /// and its room within the node's bytes, its depth at most 5, and `want`
 /// when given); its depth.
-fn extent_header<E>(node: &[u8], want: Option<u16>) -> Result<u16, BlockMapError<E>> {
+fn extent_header(node: &[u8], want: Option<u16>) -> Option<u16> {
     let (entries, max, depth) = (le16(node, 2), le16(node, 4), le16(node, 6));
     let fits = 12 + usize::from(max) * 12 <= node.len();
     let depth_ok = depth <= EXTENT_DEPTH_MAX && want.is_none_or(|w| w == depth);
     if le16(node, 0) != EXTENT_MAGIC || entries > max || !fits || !depth_ok {
-        return Err(BlockMapError::Corrupt);
+        return None;
     }
-    Ok(depth)
+    Some(depth)
 }
 
 /// Index entry `i`'s child block (`ei_leaf_lo`, `ei_leaf_hi`).
@@ -212,10 +212,10 @@ fn first_extent_start<E>(
             (start != 0 && len != 0).then_some(start)
         }));
     }
-    let mut child = vec![0u8; block_size];
+    let mut child = try_zeroed(block_size).ok_or(BlockMapError::NoMemory)?;
     for i in 0..entries {
         read(extent_index_child(node, i), &mut child)?;
-        extent_header(&child, Some(depth - 1))?;
+        extent_header(&child, Some(depth - 1)).ok_or(BlockMapError::Corrupt)?;
         if let Some(block) = first_extent_start(&child, depth - 1, block_size, read)? {
             return Ok(Some(block));
         }
@@ -231,7 +231,7 @@ fn first_mapped<E>(
     block_size: usize,
     read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), BlockMapError<E>>,
 ) -> Result<Option<u64>, BlockMapError<E>> {
-    let mut buf = vec![0u8; block_size];
+    let mut buf = try_zeroed(block_size).ok_or(BlockMapError::NoMemory)?;
     read(block, &mut buf)?;
     let mapped = buf.as_chunks::<4>().0.iter().map(|w| u64::from(u32::from_le_bytes(*w))).filter(|&b| b != 0);
     for below in mapped {
@@ -390,23 +390,34 @@ pub fn bitmap_free_count(bitmap: &[u8], bits: usize) -> Option<u64> {
     Some(bits as u64 - used - u64::from(tail))
 }
 
+/// Full-map traversal errors, separate from first-block recovery's read limit.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MapWalkError<E> {
+    Visit(E),
+    Corrupt,
+    NoMemory,
+}
+
 /// Visit every data and map block, including unwritten extents and mappings
 /// beyond EOF. For a map block, `visit` must fill the supplied buffer after
 /// checking ownership; rejecting a duplicate before reading bounds cyclic
 /// maps. Extent depth is at most five, indirect depth at most three.
+/// Used by the mount allocation checker; unlike [`first_block_freed`] used
+/// by unlink recovery, an extent with zero start or length is Corrupt.
+/// Buffer allocation failure is NoMemory; visitor errors retain their cause.
 pub fn visit_inode_blocks<E>(
     i_block: &[u8; 60],
     extents: bool,
     block_size: usize,
     mut visit: impl FnMut(u64, Option<&mut [u8]>) -> Result<(), E>,
-) -> Result<(), BlockMapError<E>> {
+) -> Result<(), MapWalkError<E>> {
     fn extents_walk<E>(
         node: &[u8],
         want: Option<u16>,
         bs: usize,
         visit: &mut impl FnMut(u64, Option<&mut [u8]>) -> Result<(), E>,
-    ) -> Result<(), BlockMapError<E>> {
-        let depth = extent_header(node, want)?;
+    ) -> Result<(), MapWalkError<E>> {
+        let depth = extent_header(node, want).ok_or(MapWalkError::Corrupt)?;
         for i in 0..usize::from(le16(node, 2)) {
             if depth == 0 {
                 let at = 12 + i * 12;
@@ -414,14 +425,14 @@ pub fn visit_inode_blocks<E>(
                 let len = if encoded > 32768 { encoded - 32768 } else { encoded };
                 let start = u64::from(le32(node, at + 8)) | (u64::from(le16(node, at + 6)) << 32);
                 if start == 0 || len == 0 {
-                    return Err(BlockMapError::Corrupt);
+                    return Err(MapWalkError::Corrupt);
                 }
                 for block in start..start + u64::from(len) {
-                    visit(block, None).map_err(BlockMapError::Read)?;
+                    visit(block, None).map_err(MapWalkError::Visit)?;
                 }
             } else {
-                let mut child = zeroed::<()>(bs).map_err(|_| BlockMapError::NoMemory)?;
-                visit(extent_index_child(node, i), Some(&mut child)).map_err(BlockMapError::Read)?;
+                let mut child = try_zeroed(bs).ok_or(MapWalkError::NoMemory)?;
+                visit(extent_index_child(node, i), Some(&mut child)).map_err(MapWalkError::Visit)?;
                 extents_walk(&child, Some(depth - 1), bs, visit)?;
             }
         }
@@ -432,22 +443,22 @@ pub fn visit_inode_blocks<E>(
         depth: u32,
         bs: usize,
         visit: &mut impl FnMut(u64, Option<&mut [u8]>) -> Result<(), E>,
-    ) -> Result<(), BlockMapError<E>> {
+    ) -> Result<(), MapWalkError<E>> {
         if block == 0 {
             return Ok(());
         }
         if depth == 0 {
-            return visit(block, None).map_err(BlockMapError::Read);
+            return visit(block, None).map_err(MapWalkError::Visit);
         }
-        let mut buf = zeroed::<()>(bs).map_err(|_| BlockMapError::NoMemory)?;
-        visit(block, Some(&mut buf)).map_err(BlockMapError::Read)?;
+        let mut buf = try_zeroed(bs).ok_or(MapWalkError::NoMemory)?;
+        visit(block, Some(&mut buf)).map_err(MapWalkError::Visit)?;
         for word in buf.as_chunks::<4>().0 {
             indirect_walk(u64::from(u32::from_le_bytes(*word)), depth - 1, bs, visit)?;
         }
         Ok(())
     }
     if !(1024..=65536).contains(&block_size) || !block_size.is_power_of_two() {
-        return Err(BlockMapError::Corrupt);
+        return Err(MapWalkError::Corrupt);
     }
     if extents {
         extents_walk(i_block, None, block_size, &mut visit)
@@ -488,26 +499,43 @@ pub enum IBlockKind {
     Blocks,
     FastSymlink,
     Special,
-    /// ext4plus refuses the filesystem feature, so seeing its inode flag
-    /// on an otherwise readable volume is inconsistent metadata.
-    InvalidInlineData,
 }
+
+/// ext4plus refuses inline-data filesystems; the inode flag cannot be parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineDataFlag;
 
 /// Shared ownership rule. `blocks` and `acl_sectors` are in 512-byte units.
 /// Special inodes with EXTENTS still reach ext4plus's map walker. Fast
 /// symlinks follow Linux's i_blocks == external-xattr-sectors rule.
-pub fn i_block_kind(mode: u16, flags: u32, blocks: u64, acl_sectors: u64) -> IBlockKind {
+/// A device's rdev must not be read as blocks: 1:3 would mean block 259.
+/// Mode type zero still counts as Blocks: reserved allocated inode slots
+/// have no type, and any pointers they contain must participate in ownership.
+pub fn i_block_kind(mode: u16, flags: u32, blocks: u64, acl_sectors: u64) -> Result<IBlockKind, InlineDataFlag> {
     if flags & INODE_INLINE_DATA != 0 {
-        IBlockKind::InvalidInlineData
+        Err(InlineDataFlag)
     } else if flags & INODE_EXTENTS != 0 {
-        IBlockKind::Blocks
+        Ok(IBlockKind::Blocks)
     } else if mode & MODE_TYPE == MODE_SYMLINK && blocks == acl_sectors {
-        IBlockKind::FastSymlink
+        Ok(IBlockKind::FastSymlink)
     } else if matches!(mode & MODE_TYPE, 0 | MODE_DIR | MODE_FILE | MODE_SYMLINK) {
-        IBlockKind::Blocks
+        Ok(IBlockKind::Blocks)
     } else {
-        IBlockKind::Special
+        Ok(IBlockKind::Special)
     }
+}
+
+fn inode_file_acl(raw: &[u8; 128], is_64bit: bool) -> u64 {
+    u64::from(le32(raw, 0x68)) | if is_64bit { u64::from(le16(raw, 0x76)) << 32 } else { 0 }
+}
+
+/// Decode the raw inode prefix identically for the mount checker and adapter.
+/// i_blocks_high and i_file_acl_high are separate u16 fields, not one u32.
+/// `block_size` is the validated filesystem block size in bytes.
+pub fn i_block_kind_raw(raw: &[u8; 128], is_64bit: bool, block_size: u64) -> Result<IBlockKind, InlineDataFlag> {
+    let blocks = u64::from(le32(raw, 0x1c)) | (u64::from(le16(raw, 0x74)) << 32);
+    let acl_sectors = if inode_file_acl(raw, is_64bit) == 0 { 0 } else { block_size / 512 };
+    i_block_kind(le16(raw, 0), le32(raw, 0x20), blocks, acl_sectors)
 }
 
 /// Linux's ext4_bg_has_super, including sparse_super2's explicit groups.
@@ -575,6 +603,7 @@ pub enum AllocationInconsistency {
     },
     InodeMap(u32),
     InlineData(u32),
+    FastSymlinkSize(u32),
     XattrHeader {
         inode: u32,
         block: u64,
@@ -593,7 +622,13 @@ pub enum AllocationError<E> {
     Inconsistent(AllocationInconsistency),
     Unsupported(&'static str),
     NoMemory,
-    Read(E),
+    Read { inode: u32, block: u64, error: E },
+}
+
+impl<E> From<AllocationInconsistency> for AllocationError<E> {
+    fn from(value: AllocationInconsistency) -> Self {
+        Self::Inconsistent(value)
+    }
 }
 
 impl core::fmt::Display for AllocationInconsistency {
@@ -634,9 +669,10 @@ impl core::fmt::Display for AllocationInconsistency {
             }
             Self::InodeMap(ino) => write!(f, "inode {ino} block map does not parse"),
             Self::InlineData(ino) => write!(f, "inode {ino} has INLINE_DATA without a supported filesystem feature"),
+            Self::FastSymlinkSize(ino) => write!(f, "inode {ino} fast symlink exceeds i_block"),
             Self::XattrHeader { inode, block } => write!(f, "inode {inode} xattr block {block} has an invalid header"),
             Self::XattrReferences { block, recorded, actual } => {
-                write!(f, "xattr block {block} refcount {recorded} != inode references {actual}")
+                write!(f, "xattr block {block} refcount {recorded} < inode references {actual}")
             }
         }
     }
@@ -647,13 +683,23 @@ impl<E: core::fmt::Debug> core::fmt::Display for AllocationError<E> {
             Self::Inconsistent(e) => write!(f, "{e}"),
             Self::Unsupported(why) => write!(f, "unsupported: {why}"),
             Self::NoMemory => write!(f, "not enough memory"),
-            Self::Read(e) => write!(f, "allocation metadata read failed: {e:?}"),
+            Self::Read { inode, block, error } => {
+                if *inode == 0 {
+                    write!(f, "filesystem metadata")?;
+                } else {
+                    write!(f, "inode {inode}")?;
+                }
+                write!(f, " block {block} read failed: {error:?}")
+            }
         }
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct AllocationReport {
+    /// Unowned allocated blocks plus distinct xattr blocks with excess
+    /// reference counts. An inflated count denotes one leaked block, even
+    /// if several references leaked; no block is counted twice.
     pub leaked_blocks: u64,
 }
 
@@ -663,10 +709,9 @@ struct AllocationGroup {
     inode_table_start: u64,
     valid_inodes: usize,
 }
-struct XattrReferences {
+struct XattrReference {
     block: u64,
-    recorded: u32,
-    actual: u32,
+    inode: u32,
 }
 
 fn bit_set(bits: &[u8], bit: usize) -> bool {
@@ -675,14 +720,11 @@ fn bit_set(bits: &[u8], bit: usize) -> bool {
 fn set_bit(bits: &mut [u8], bit: usize) {
     bits[bit / 8] |= 1 << (bit % 8);
 }
-fn clear_bit(bits: &mut [u8], bit: usize) {
-    bits[bit / 8] &= !(1 << (bit % 8));
-}
-fn zeroed<E>(len: usize) -> Result<Vec<u8>, AllocationError<E>> {
+fn try_zeroed(len: usize) -> Option<Vec<u8>> {
     let mut v = Vec::new();
-    v.try_reserve_exact(len).map_err(|_| AllocationError::NoMemory)?;
+    v.try_reserve_exact(len).ok()?;
     v.resize(len, 0);
-    Ok(v)
+    Some(v)
 }
 fn inconsistent<E>(why: &'static str) -> AllocationError<E> {
     AllocationError::Inconsistent(AllocationInconsistency::Metadata(why))
@@ -705,7 +747,7 @@ struct AllocationCheck<'a, R> {
     inode_bits: Vec<u8>,
     inode_count: u32,
     inodes_per_group: usize,
-    xattrs: Vec<XattrReferences>,
+    xattrs: Vec<XattrReference>,
 }
 
 impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
@@ -721,7 +763,7 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
     fn block_error(inode: u32, block: u64, problem: BlockProblem) -> AllocationError<E> {
         AllocationError::Inconsistent(AllocationInconsistency::Block { inode, block, problem })
     }
-    fn claim(&mut self, inode: u32, block: u64) -> Result<(), AllocationError<E>> {
+    fn check_claimable(&self, inode: u32, block: u64) -> Result<(), AllocationError<E>> {
         if block < u64::from(self.geometry.first_data_block) || block >= self.geometry.blocks_count {
             return Err(Self::block_error(inode, block, BlockProblem::OutsideVolume));
         }
@@ -731,6 +773,10 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
         if bit_set(&self.owned, block as usize) {
             return Err(Self::block_error(inode, block, BlockProblem::Duplicate));
         }
+        Ok(())
+    }
+    fn claim(&mut self, inode: u32, block: u64) -> Result<(), AllocationError<E>> {
+        self.check_claimable(inode, block)?;
         set_bit(&mut self.owned, block as usize);
         Ok(())
     }
@@ -739,32 +785,51 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
             .geometry
             .block_byte(block)
             .ok_or_else(|| Self::block_error(inode, block, BlockProblem::OutsideVolume))?;
-        (self.read)(off, buf).map_err(AllocationError::Read)
+        (self.read)(off, buf).map_err(|error| AllocationError::Read { inode, block, error })
     }
     fn xattr(&mut self, inode: u32, block: u64) -> Result<(), AllocationError<E>> {
-        match self.xattrs.binary_search_by_key(&block, |x| x.block) {
-            Ok(at) => self.xattrs[at].actual += 1, // at most s_inodes_count references
-            Err(at) => {
-                // A previous data/map/fixed-metadata owner still makes this
-                // a duplicate. Only references already in xattrs may share.
-                self.claim(inode, block)?;
-                let mut header = [0; 12];
-                self.read_block(inode, block, &mut header)?;
-                if le32(&header, 0) != XATTR_MAGIC || le32(&header, 4) == 0 || le32(&header, 8) != 1 {
-                    return Err(AllocationError::Inconsistent(AllocationInconsistency::XattrHeader { inode, block }));
-                }
-                let limit = MAX_CHECK_MEMORY / core::mem::size_of::<XattrReferences>();
-                if self.xattrs.len() >= limit {
-                    return Err(AllocationError::Unsupported("xattr reference list exceeds 64 MiB"));
-                }
-                if self.xattrs.len() == self.xattrs.capacity() {
-                    let additional = self.xattrs.capacity().max(4).min(limit - self.xattrs.len());
-                    self.xattrs.try_reserve_exact(additional).map_err(|_| AllocationError::NoMemory)?;
-                }
-                self.xattrs.insert(at, XattrReferences { block, recorded: le32(&header, 4), actual: 1 });
-            }
+        let limit = MAX_CHECK_MEMORY / core::mem::size_of::<XattrReference>();
+        if self.xattrs.len() >= limit {
+            return Err(AllocationError::Unsupported("xattr reference list exceeds 64 MiB"));
         }
+        if self.xattrs.len() == self.xattrs.capacity() {
+            let additional = self.xattrs.capacity().max(4).min(limit - self.xattrs.len());
+            self.xattrs.try_reserve_exact(additional).map_err(|_| AllocationError::NoMemory)?;
+        }
+        // Append in amortized constant time. Claim/read each distinct block
+        // only after the inode walk, so insertion order cannot be quadratic.
+        self.xattrs.push(XattrReference { block, inode });
         Ok(())
+    }
+    fn check_xattrs(&mut self) -> Result<u64, AllocationError<E>> {
+        self.xattrs.sort_unstable_by_key(|x| (x.block, x.inode));
+        let mut leaked = 0;
+        let mut start = 0;
+        while start < self.xattrs.len() {
+            let XattrReference { block, inode } = self.xattrs[start];
+            let mut end = start + 1;
+            while end < self.xattrs.len() && self.xattrs[end].block == block {
+                end += 1;
+            }
+            // At most one reference per in-use inode, bounded by s_inodes_count.
+            let actual =
+                u32::try_from(end - start).map_err(|_| AllocationError::Unsupported("too many xattr references"))?;
+            self.claim(inode, block)?;
+            let mut header = [0; 12];
+            self.read_block(inode, block, &mut header)?;
+            let recorded = le32(&header, 4);
+            if le32(&header, 0) != XATTR_MAGIC || recorded == 0 || le32(&header, 8) != 1 {
+                return Err(AllocationInconsistency::XattrHeader { inode, block }.into());
+            }
+            if recorded < actual {
+                return Err(AllocationInconsistency::XattrReferences { block, recorded, actual }.into());
+            }
+            // ext4plus unlink does not decrement h_refcount. Excess references
+            // leak this block but cannot free one that remains in use.
+            leaked += u64::from(recorded > actual);
+            start = end;
+        }
+        Ok(leaked)
     }
     fn directory(&mut self, directory: u32, block: u64, buf: &mut [u8]) -> Result<(), AllocationError<E>> {
         self.read_block(directory, block, buf)?;
@@ -776,6 +841,7 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
             }
             let inode = le32(buf, off);
             let raw_len = usize::from(le16(buf, off + 4));
+            // ext4 encodes a full 64 KiB record as either 0 or 65535.
             let len = if buf.len() == 65536 && matches!(raw_len, 0 | 65535) { 65536 } else { raw_len };
             if len < 8
                 || !len.is_multiple_of(4)
@@ -784,8 +850,9 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
             {
                 return Err(bad());
             }
-            // Htree interior blocks and unused records have inode zero;
-            // their rec_len skips the index payload without interpreting it.
+            // A dx_node has a fake inode-zero entry spanning its payload.
+            // A dx_root has real dot entries; ..'s rec_len covers its index.
+            // Linear rec_len traversal therefore skips both index payloads.
             if inode != 0 && !self.inode_in_use(inode) {
                 return Err(AllocationError::Inconsistent(AllocationInconsistency::DirectoryEntry {
                     directory,
@@ -796,23 +863,19 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
         }
         Ok(())
     }
-    fn inode(&mut self, ino: u32, raw: &[u8]) -> Result<(), AllocationError<E>> {
-        let acl =
-            u64::from(le32(raw, 0x68)) | if self.geometry.is_64bit { u64::from(le16(raw, 0x76)) << 32 } else { 0 };
+    fn inode(&mut self, ino: u32, raw: &[u8; 128]) -> Result<(), AllocationError<E>> {
+        let acl = inode_file_acl(raw, self.geometry.is_64bit);
         if acl != 0 {
             self.xattr(ino, acl)?;
         }
         let mode = le16(raw, 0);
         let flags = le32(raw, 0x20);
-        let blocks = u64::from(le32(raw, 0x1c)) | (u64::from(le16(raw, 0x74)) << 32);
-        let acl_sectors = if acl == 0 { 0 } else { self.geometry.block_size / 512 };
-        match i_block_kind(mode, flags, blocks, acl_sectors) {
-            IBlockKind::InvalidInlineData => {
-                return Err(AllocationError::Inconsistent(AllocationInconsistency::InlineData(ino)));
-            }
+        match i_block_kind_raw(raw, self.geometry.is_64bit, self.geometry.block_size)
+            .map_err(|InlineDataFlag| AllocationInconsistency::InlineData(ino))?
+        {
             IBlockKind::FastSymlink => {
                 if le32(raw, 4) > 60 || le32(raw, 0x6c) != 0 {
-                    return Err(inconsistent("fast symlink exceeds i_block"));
+                    return Err(AllocationInconsistency::FastSymlinkSize(ino).into());
                 }
                 return Ok(());
             }
@@ -820,7 +883,8 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
             IBlockKind::Blocks => {}
         }
         let directory = mode & MODE_TYPE == MODE_DIR;
-        let mut dir_buf = zeroed(if directory { self.geometry.block_size as usize } else { 0 })?;
+        let mut dir_buf = try_zeroed(if directory { self.geometry.block_size as usize } else { 0 })
+            .ok_or(AllocationError::NoMemory)?;
         let map: &[u8; 60] = raw[0x28..0x64].try_into().unwrap();
         visit_inode_blocks(map, flags & INODE_EXTENTS != 0, self.geometry.block_size as usize, |block, buf| {
             // Claim before read: cycles and repeated map nodes stop before
@@ -834,9 +898,9 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
             Ok(())
         })
         .map_err(|e| match e {
-            BlockMapError::Read(e) => e,
-            BlockMapError::NoMemory => AllocationError::NoMemory,
-            _ => AllocationError::Inconsistent(AllocationInconsistency::InodeMap(ino)),
+            MapWalkError::Visit(e) => e,
+            MapWalkError::NoMemory => AllocationError::NoMemory,
+            MapWalkError::Corrupt => AllocationInconsistency::InodeMap(ino).into(),
         })
     }
 }
@@ -847,15 +911,15 @@ impl<E, R: FnMut(u64, &mut [u8]) -> Result<(), E>> AllocationCheck<'_, R> {
 ///
 /// Working memory is two bits per volume block, ceil(ipg/8) bytes per group
 /// in one inode bitmap, fallible group records (together capped at 64 MiB),
-/// three block buffers plus at most five map blocks, and a fallible sorted
-/// xattr-reference list capped at 64 MiB. Allocation failure is NoMemory;
+/// three block buffers plus at most five map blocks, and a fallible xattr
+/// reference list capped at 64 MiB capacity (sorted once after the inode walk). Allocation failure is NoMemory;
 /// unsupported layouts/resources are distinct from proven inconsistency.
 pub fn check_allocation<E>(
     sb: &[u8; 1024],
     device_bytes: u64,
     mut read: impl FnMut(u64, &mut [u8]) -> Result<(), E>,
 ) -> Result<AllocationReport, AllocationError<E>> {
-    use AllocationError::{Inconsistent, Read, Unsupported};
+    use AllocationError::{Inconsistent, NoMemory, Read, Unsupported};
     use AllocationInconsistency::Count;
     let geometry = Geometry::from_superblock(sb).map_err(|e| Inconsistent(AllocationInconsistency::Geometry(e)))?;
     let bs = geometry.block_size as usize;
@@ -874,6 +938,7 @@ pub fn check_allocation<E>(
     if incompat & INCOMPAT_EXTERNAL_JOURNAL != 0 || le32(sb, 0xe4) != 0 {
         return Err(Unsupported("external journal"));
     }
+    // Defence in depth: the adapter already forces checksum volumes read-only.
     if ro_compat & (RO_COMPAT_GDT_CSUM | RO_COMPAT_METADATA_CSUM) != 0 {
         return Err(Unsupported("bitmap checksums/uninitialized bitmaps"));
     }
@@ -882,7 +947,7 @@ pub fn check_allocation<E>(
         return Err(inconsistent("first data block"));
     }
     let blocks = geometry.blocks_count;
-    let volume_bytes = blocks.checked_mul(bs as u64).ok_or(Unsupported("volume byte size overflows"))?;
+    let volume_bytes = blocks.checked_mul(bs as u64).ok_or_else(|| inconsistent("volume exceeds device capacity"))?;
     if volume_bytes > device_bytes {
         return Err(inconsistent("volume exceeds device capacity"));
     }
@@ -902,6 +967,9 @@ pub fn check_allocation<E>(
         return Err(inconsistent("inode geometry"));
     }
     let dsz = if geometry.is_64bit { usize::from(le16(sb, 0xfe)) } else { 32 };
+    if geometry.is_64bit && dsz > 64 && dsz <= 1024 && dsz.is_power_of_two() {
+        return Err(Unsupported("descriptor size above 64"));
+    }
     if !matches!(dsz, 32 | 64) || (geometry.is_64bit && dsz != 64) {
         return Err(inconsistent("descriptor size"));
     }
@@ -916,28 +984,29 @@ pub fn check_allocation<E>(
     let mut check = AllocationCheck {
         read: &mut read,
         geometry,
-        allocated: zeroed(bytes)?,
-        owned: zeroed(bytes)?,
-        inode_bits: zeroed(inode_bytes)?,
+        allocated: try_zeroed(bytes).ok_or(NoMemory)?,
+        owned: try_zeroed(bytes).ok_or(NoMemory)?,
+        inode_bits: try_zeroed(inode_bytes).ok_or(NoMemory)?,
         inode_count: inodes,
         inodes_per_group: ipg,
         xattrs: Vec::new(),
     };
     let mut descriptors = Vec::new();
     descriptors.try_reserve_exact(groups as usize).map_err(|_| AllocationError::NoMemory)?;
-    let mut bitmap = zeroed(bs)?;
+    let mut bitmap = try_zeroed(bs).ok_or(NoMemory)?;
     let mut free_blocks = 0;
     let mut free_inodes = 0;
     for group in 0..groups {
         let mut desc = [0; 64];
-        (check.read)((first + 1) * bs as u64 + u64::from(group) * dsz as u64, &mut desc[..dsz]).map_err(Read)?;
+        let off = (first + 1) * bs as u64 + u64::from(group) * dsz as u64;
+        (check.read)(off, &mut desc[..dsz]).map_err(|error| Read { inode: 0, block: off / bs as u64, error })?;
         let address =
             |at| u64::from(le32(&desc, at)) | if dsz == 64 { u64::from(le32(&desc, at + 32)) << 32 } else { 0 };
         let count = |at| u64::from(le16(&desc, at)) | if dsz == 64 { u64::from(le16(&desc, at + 32)) << 16 } else { 0 };
-        // Without checksum features these flags are not meaningful. Do not
-        // guess a bitmap's contents from stray uninitialized flags.
+        // Uninit flags without checksums are inconsistent (e2fsck's
+        // PR_0_GDT_UNINIT), not a request to synthesize bitmap contents.
         if le16(&desc, 0x12) & (BG_INODE_UNINIT | BG_BLOCK_UNINIT) != 0 {
-            return Err(Unsupported("uninitialized bg_flags without checksums"));
+            return Err(inconsistent("uninitialized bg_flags without checksums"));
         }
         let start = geometry.group_start(group);
         let real = (blocks - start).min(u64::from(geometry.blocks_per_group)) as usize;
@@ -1011,17 +1080,12 @@ pub fn check_allocation<E>(
     if incompat & INCOMPAT_MMP != 0 {
         check.claim(0, u64::from(le32(sb, 0x168)) | (u64::from(le32(sb, 0x16c)) << 32))?;
     }
+    // Prove reserved ranges allocated and disjoint from fixed metadata,
+    // leaving them claimable by the resize inode's map below.
     for group in 0..groups {
         if has_super(group) {
             for b in geometry.reserved_gdt(group, gdt_blocks, reserved) {
-                check.claim(0, b)?;
-            }
-        }
-    }
-    for group in 0..groups {
-        if has_super(group) {
-            for b in geometry.reserved_gdt(group, gdt_blocks, reserved) {
-                clear_bit(&mut check.owned, b as usize);
+                check.check_claimable(0, b)?;
             }
         }
     }
@@ -1033,7 +1097,7 @@ pub fn check_allocation<E>(
         let index = (RESIZE_INO - 1) as usize;
         let off = descriptors[index / ipg].inode_table_start * bs as u64 + (index % ipg * isz) as u64;
         let mut raw = [0; 128];
-        (check.read)(off, &mut raw).map_err(Read)?;
+        (check.read)(off, &mut raw).map_err(|error| Read { inode: RESIZE_INO, block: off / bs as u64, error })?;
         check.inode(RESIZE_INO, &raw)?;
     }
     for group in 0..groups {
@@ -1048,14 +1112,14 @@ pub fn check_allocation<E>(
     if compat & COMPAT_HAS_JOURNAL != 0 && !check.inode_in_use(le32(sb, 0xe0)) {
         return Err(inconsistent("journal inode is free"));
     }
-    let mut table = zeroed(bs)?;
+    let mut table = try_zeroed(bs).ok_or(NoMemory)?;
     for (group, g) in descriptors.iter().enumerate() {
         for index in (0..g.valid_inodes).step_by(bs / isz) {
             check.read_block(0, g.inode_table_start + (index * isz / bs) as u64, &mut table)?;
             for slot in 0..(bs / isz).min(g.valid_inodes - index) {
                 let ino =
                     u32::try_from(group * ipg + index + slot + 1).map_err(|_| Unsupported("inode number overflow"))?;
-                let raw = &table[slot * isz..slot * isz + 128];
+                let raw: &[u8; 128] = table[slot * isz..slot * isz + 128].try_into().unwrap();
                 if !check.inode_in_use(ino) {
                     if le16(raw, 0) != 0 && le16(raw, 0x1a) > 0 && le32(raw, 0x14) == 0 {
                         return Err(Inconsistent(AllocationInconsistency::LiveFreeInode(ino)));
@@ -1066,28 +1130,232 @@ pub fn check_allocation<E>(
             }
         }
     }
-    for x in &check.xattrs {
-        if x.recorded != x.actual {
-            return Err(Inconsistent(AllocationInconsistency::XattrReferences {
-                block: x.block,
-                recorded: x.recorded,
-                actual: x.actual,
-            }));
-        }
-    }
+    let xattr_leaks = check.check_xattrs()?;
     let leaked_blocks = (first..blocks)
         .filter(|&b| bit_set(&check.allocated, b as usize) && !bit_set(&check.owned, b as usize))
         .count() as u64;
-    Ok(AllocationReport { leaked_blocks })
+    Ok(AllocationReport { leaked_blocks: leaked_blocks + xattr_leaks })
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use alloc::vec::Vec;
 
     use super::*;
     fn block_error(inode: u32, block: u64, problem: BlockProblem) -> AllocationError<()> {
         AllocationError::Inconsistent(AllocationInconsistency::Block { inode, block, problem })
+    }
+
+    #[test]
+    fn allocation_directory_names_fit_their_own_records() {
+        let mut img = allocation_image();
+        put16(&mut img, 6 * BS + 4, 12);
+        img[6 * BS + 6] = 4; // exactly rec_len - header, not the rest of the block
+        put16(&mut img, 6 * BS + 12 + 4, (BS - 12) as u16);
+        assert_eq!(checked(&img), Ok(AllocationReport { leaked_blocks: 0 }));
+        img[6 * BS + 6] = 5;
+        assert_eq!(checked(&img), Err(AllocationInconsistency::DirectoryRecord { directory: 2, block: 6 }.into()));
+    }
+
+    #[test]
+    fn allocation_fast_symlink_size_is_bounded() {
+        let mut img = allocation_image();
+        let at = 5 * BS + 128;
+        put16(&mut img, at, MODE_SYMLINK);
+        put32(&mut img, at + 4, 59);
+        img[at + 0x28..at + 0x64].fill(b'x');
+        // The old directory block is now unowned; i_block is inline text.
+        assert_eq!(checked(&img), Ok(AllocationReport { leaked_blocks: 1 }));
+        for (low, high) in [(61, 0), (59, 1)] {
+            put32(&mut img, at + 4, low);
+            put32(&mut img, at + 0x6c, high);
+            assert_eq!(checked(&img), Err(AllocationInconsistency::FastSymlinkSize(2).into()));
+        }
+    }
+
+    #[test]
+    fn allocation_64k_directory_record_encodings_span_the_block() {
+        let bs = 65536;
+        let mut img = vec![0; 32 * bs];
+        let sb = &mut img[1024..2048];
+        put32(sb, 0, 8);
+        put32(sb, 4, 32);
+        put32(sb, 0xc, 26);
+        put32(sb, 0x10, 7);
+        put32(sb, 0x18, 6);
+        put32(sb, 0x20, 32);
+        put32(sb, 0x28, 8);
+        put32(sb, 0x4c, 1);
+        put16(sb, 0x58, 128);
+        put32(&mut img, bs, 2);
+        put32(&mut img, bs + 4, 3);
+        put32(&mut img, bs + 8, 4);
+        put16(&mut img, bs + 0xc, 26);
+        put16(&mut img, bs + 0xe, 7);
+        img[2 * bs] = 0x3f;
+        img[3 * bs] = 2;
+        put16(&mut img, 4 * bs + 128, MODE_DIR);
+        put32(&mut img, 4 * bs + 128 + 0x28, 5);
+        put32(&mut img, 5 * bs, 2);
+        img[5 * bs + 6] = 1;
+        img[5 * bs + 8] = b'.';
+        for encoded in [0, 65535] {
+            put16(&mut img, 5 * bs + 4, encoded);
+            assert_eq!(checked(&img), Ok(AllocationReport { leaked_blocks: 0 }));
+        }
+    }
+
+    #[test]
+    fn allocation_raw_i_block_decoder_separates_blocks_and_acl_high_halves() {
+        let mut raw = [0; 128];
+        put16(&mut raw, 0, MODE_SYMLINK);
+        put32(&mut raw, 0x1c, 8);
+        put16(&mut raw, 0x76, 1); // ACL >= 2^32, not i_blocks bits 48..63
+        assert_eq!(i_block_kind_raw(&raw, true, 4096), Ok(IBlockKind::FastSymlink));
+        assert_eq!(i_block_kind_raw(&raw, false, 4096), Ok(IBlockKind::Blocks));
+        put16(&mut raw, 0x74, 1);
+        assert_eq!(i_block_kind_raw(&raw, true, 4096), Ok(IBlockKind::Blocks));
+        put16(&mut raw, 0x74, 0);
+        put16(&mut raw, 0x76, 0);
+        put32(&mut raw, 0x68, 7);
+        assert_eq!(i_block_kind_raw(&raw, false, 4096), Ok(IBlockKind::FastSymlink));
+        assert_eq!(i_block_kind_raw(&raw, true, 1024), Ok(IBlockKind::Blocks));
+        put16(&mut raw, 0, 0x2000);
+        assert_eq!(i_block_kind_raw(&raw, true, 4096), Ok(IBlockKind::Special));
+        put32(&mut raw, 0x20, INODE_EXTENTS);
+        assert_eq!(i_block_kind_raw(&raw, true, 4096), Ok(IBlockKind::Blocks));
+        put32(&mut raw, 0x20, INODE_INLINE_DATA);
+        assert_eq!(i_block_kind_raw(&raw, true, 4096), Err(InlineDataFlag));
+    }
+
+    #[test]
+    fn allocation_xattr_high_half_is_an_address() {
+        let mut img = allocation_image();
+        put32(&mut img, BS + 0x60, INCOMPAT_64BIT);
+        put16(&mut img, BS + 0xfe, 64);
+        put16(&mut img, 5 * BS + 128 + 0x76, 1);
+        assert_eq!(checked(&img), Err(block_error(2, 1 << 32, BlockProblem::OutsideVolume)));
+    }
+
+    #[test]
+    fn allocation_reserved_gdt_cannot_extend_past_its_group() {
+        let mut img = allocation_image();
+        put16(&mut img, BS + 0xce, 32);
+        assert_eq!(checked(&img), Err(inconsistent("reserved GDT past group")));
+    }
+
+    #[test]
+    fn allocation_map_xattr_and_resize_read_failures_name_their_source() {
+        for kind in ["indirect", "extent", "xattr", "resize"] {
+            let mut img = allocation_image();
+            let at = 5 * BS + 128;
+            let (inode, fail_at) = if kind == "resize" {
+                allocate_test_inode(&mut img, 7);
+                put32(&mut img, BS + 0x5c, COMPAT_RESIZE_INODE);
+                (7, 5 * BS + 6 * 128)
+            } else {
+                allocate_test_block(&mut img, 7);
+                match kind {
+                    "indirect" => {
+                        put16(&mut img, at, MODE_FILE);
+                        put32(&mut img, at + 0x28 + 12 * 4, 7);
+                    }
+                    "extent" => {
+                        put32(&mut img, at + 0x20, INODE_EXTENTS);
+                        img[at + 0x28..at + 0x64].copy_from_slice(&root(1, &[index(0, 7)]));
+                        img[7 * BS..8 * BS].copy_from_slice(&extent_node(BS, 84, 0, &[]));
+                    }
+                    "xattr" => {
+                        put32(&mut img, at + 0x68, 7);
+                        put32(&mut img, 7 * BS, XATTR_MAGIC);
+                        put32(&mut img, 7 * BS + 4, 1);
+                        put32(&mut img, 7 * BS + 8, 1);
+                    }
+                    _ => unreachable!(),
+                }
+                (2, 7 * BS)
+            };
+            let result = check_allocation(img[BS..2 * BS].try_into().unwrap(), img.len() as u64, |off, buf| {
+                if off == fail_at as u64 {
+                    return Err(kind);
+                }
+                buf.copy_from_slice(&img[off as usize..off as usize + buf.len()]);
+                Ok(())
+            });
+            let error = AllocationError::Read { inode, block: (fail_at / BS) as u64, error: kind };
+            assert_eq!(result.as_ref(), Err(&error));
+            assert_eq!(
+                alloc::format!("{error}"),
+                alloc::format!("inode {inode} block {} read failed: {kind:?}", fail_at / BS)
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_size_overflow_and_descriptor_layouts_have_correct_categories() {
+        let mut img = allocation_image();
+        put32(&mut img, BS + 0x60, INCOMPAT_64BIT);
+        put16(&mut img, BS + 0xfe, 64);
+        for size in [128, 256, 512, 1024] {
+            put16(&mut img, BS + 0xfe, size);
+            assert_eq!(checked(&img), Err(AllocationError::Unsupported("descriptor size above 64")));
+        }
+        put16(&mut img, BS + 0xfe, 64);
+        put32(&mut img, BS + 4, u32::MAX);
+        put32(&mut img, BS + 0x150, u32::MAX);
+        assert_eq!(
+            check_allocation(img[BS..2 * BS].try_into().unwrap(), u64::MAX, |_, _| -> Result<(), ()> {
+                panic!("overflowing volume must not read or allocate")
+            }),
+            Err(inconsistent("volume exceeds device capacity"))
+        );
+    }
+
+    #[test]
+    fn allocation_xattr_runs_read_each_unique_header_once() {
+        let mut img = allocation_image();
+        for block in [7, 8, 9] {
+            allocate_test_block(&mut img, block);
+        }
+        img[4 * BS] = 0b111110; // inodes 2..6
+        put32(&mut img, BS + 0x10, 3);
+        put16(&mut img, 2 * BS + 0xe, 3);
+        for (index, block) in [9, 8, 9, 7, 8].into_iter().enumerate() {
+            let at = 5 * BS + (index + 1) * 128;
+            if index != 0 {
+                put16(&mut img, at, MODE_FILE);
+            }
+            put32(&mut img, at + 0x68, block);
+        }
+        for (block, count) in [(7, 1), (8, 2), (9, 2)] {
+            put32(&mut img, block * BS, XATTR_MAGIC);
+            put32(&mut img, block * BS + 4, count);
+            put32(&mut img, block * BS + 8, 1);
+        }
+        let mut reads = [0; 3];
+        let report = check_allocation(img[BS..2 * BS].try_into().unwrap(), img.len() as u64, |off, buf| {
+            if off >= (7 * BS) as u64 {
+                assert_eq!(buf.len(), 12);
+                reads[off as usize / BS - 7] += 1;
+            }
+            buf.copy_from_slice(&img[off as usize..off as usize + buf.len()]);
+            Ok::<_, ()>(())
+        });
+        assert_eq!(report, Ok(AllocationReport { leaked_blocks: 0 }));
+        assert_eq!(reads, [1, 1, 1]);
+    }
+
+    #[test]
+    fn allocation_walker_refuses_zero_extents_unlike_first_block_recovery() {
+        for entry in [extent(0, 0, 7), extent(0, 1, 0)] {
+            let map = root(0, &[entry]);
+            assert_eq!(first_block_freed(&map, true, BS, |_, _| -> Result<(), ()> { panic!("no reads") }), Ok(None));
+            assert_eq!(
+                visit_inode_blocks(&map, true, BS, |_, _| -> Result<(), ()> { panic!("no visits") }),
+                Err(MapWalkError::Corrupt)
+            );
+        }
     }
 
     #[test]
@@ -1111,10 +1379,10 @@ mod tests {
                 } else {
                     IBlockKind::Special
                 };
-                assert_eq!(i_block_kind(mode | 0o755, 0, blocks, acl), expected);
-                assert_eq!(i_block_kind(mode, INODE_EXTENTS, blocks, acl), IBlockKind::Blocks);
+                assert_eq!(i_block_kind(mode | 0o755, 0, blocks, acl), Ok(expected));
+                assert_eq!(i_block_kind(mode, INODE_EXTENTS, blocks, acl), Ok(IBlockKind::Blocks));
                 for flags in [INODE_INLINE_DATA, INODE_INLINE_DATA | INODE_EXTENTS] {
-                    assert_eq!(i_block_kind(mode, flags, blocks, acl), IBlockKind::InvalidInlineData);
+                    assert_eq!(i_block_kind(mode, flags, blocks, acl), Err(InlineDataFlag));
                 }
             }
         }
@@ -1156,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn allocation_shared_xattrs_require_exact_refcount_and_exclusive_kind() {
+    fn allocation_shared_xattrs_allow_excess_refcounts_but_refuse_undercounts_and_aliases() {
         let mut img = allocation_image();
         allocate_test_inode(&mut img, 3);
         allocate_test_block(&mut img, 7);
@@ -1166,18 +1434,17 @@ mod tests {
         put32(&mut img, 7 * BS + 4, 2);
         put32(&mut img, 7 * BS + 8, 1);
         assert_eq!(checked(&img), Ok(AllocationReport { leaked_blocks: 0 }));
-        for count in [1, 3] {
-            let mut bad = img.clone();
-            put32(&mut bad, 7 * BS + 4, count);
-            assert_eq!(
-                checked(&bad),
-                Err(AllocationError::Inconsistent(AllocationInconsistency::XattrReferences {
-                    block: 7,
-                    recorded: count,
-                    actual: 2,
-                }))
-            );
+        for count in [3, u32::MAX] {
+            let mut leaked = img.clone();
+            put32(&mut leaked, 7 * BS + 4, count);
+            assert_eq!(checked(&leaked), Ok(AllocationReport { leaked_blocks: 1 }));
         }
+        let mut bad = img.clone();
+        put32(&mut bad, 7 * BS + 4, 1);
+        assert_eq!(
+            checked(&bad),
+            Err(AllocationInconsistency::XattrReferences { block: 7, recorded: 1, actual: 2 }.into())
+        );
         for (field, value) in [(0, 0), (4, 0), (8, 2)] {
             let mut bad = img.clone();
             put32(&mut bad, 7 * BS + field, value);
@@ -1188,8 +1455,11 @@ mod tests {
         }
         for owner in [2, 3] {
             let mut bad = img.clone();
+            // Avoid a malformed directory record masking the ownership error.
+            put16(&mut bad, 5 * BS + 128, MODE_FILE);
             put32(&mut bad, 5 * BS + (owner - 1) * 128 + 0x2c, 7);
-            assert_eq!(checked(&bad), Err(block_error(owner as u32, 7, BlockProblem::Duplicate)));
+            // Deferred xattr validation names the first xattr owner.
+            assert_eq!(checked(&bad), Err(block_error(2, 7, BlockProblem::Duplicate)));
         }
         let mut bad = img;
         // Data is encountered before the first xattr reference.
@@ -1239,7 +1509,7 @@ mod tests {
 
     #[test]
     fn allocation_unsupported_layouts_and_resource_bounds_are_typed() {
-        assert_eq!(zeroed::<()>(usize::MAX), Err(AllocationError::NoMemory));
+        assert_eq!(try_zeroed(usize::MAX), None);
         let img = allocation_image();
         for (at, value, reason) in [
             (0x4c, 0, "filesystem revision"),
@@ -1260,7 +1530,7 @@ mod tests {
         for flags in [BG_INODE_UNINIT, BG_BLOCK_UNINIT, BG_INODE_UNINIT | BG_BLOCK_UNINIT] {
             let mut bad = img.clone();
             put16(&mut bad, 2 * BS + 0x12, flags);
-            assert_eq!(checked(&bad), Err(AllocationError::Unsupported("uninitialized bg_flags without checksums")));
+            assert_eq!(checked(&bad), Err(inconsistent("uninitialized bg_flags without checksums")));
         }
         let sb: &[u8; 1024] = img[BS..2 * BS].try_into().unwrap();
         assert_eq!(
@@ -1373,7 +1643,7 @@ mod tests {
                 actual: 25,
             }))
         );
-        for size in [0, 32, 128] {
+        for size in [0, 32, 65, 2048] {
             put16(&mut img, BS + 0xfe, size);
             assert_eq!(checked(&img), Err(inconsistent("descriptor size")));
         }
@@ -1449,13 +1719,13 @@ mod tests {
             }
             Ok(())
         });
-        assert_eq!(err, Err(BlockMapError::Read("duplicate")));
+        assert_eq!(err, Err(MapWalkError::Visit("duplicate")));
         assert_eq!(reads, 1);
         assert_eq!(
             visit_inode_blocks(&root(1, &[index(0, 20)]), true, BS, |_, _| Err("io")),
-            Err(BlockMapError::Read("io"))
+            Err(MapWalkError::Visit("io"))
         );
-        assert_eq!(visit_inode_blocks(&root(6, &[]), true, BS, |_, _| Ok::<_, ()>(())), Err(BlockMapError::Corrupt));
+        assert_eq!(visit_inode_blocks(&root(6, &[]), true, BS, |_, _| Ok::<_, ()>(())), Err(MapWalkError::Corrupt));
     }
 
     fn put16(img: &mut [u8], at: usize, value: u16) {
@@ -1662,7 +1932,14 @@ mod tests {
                 buf.copy_from_slice(&img[off as usize..off as usize + buf.len()]);
                 Ok(())
             });
-            assert_eq!(result, Err(AllocationError::Read(fail_at)));
+            assert_eq!(
+                result,
+                Err(AllocationError::Read {
+                    inode: if fail_at == 6 * BS { 2 } else { 0 },
+                    block: (fail_at / BS) as u64,
+                    error: fail_at
+                })
+            );
         }
         let mut bad = img.clone();
         put32(&mut bad, 5 * BS + 128 + 0x20, 0x80000);

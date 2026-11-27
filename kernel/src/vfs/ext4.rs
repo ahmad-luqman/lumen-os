@@ -936,21 +936,11 @@ fn map_file_type(ft: FileType) -> InodeType {
 
 /// Classify i_block with the same rule used before allowing a writable mount.
 fn inode_block_kind(inner: &Ext4FsInner, inode: &Inode) -> Result<lumen_vfs::ext4::IBlockKind, VfsError> {
-    let mut acl_sectors = 0;
-    if inode.file_type().is_symlink() && !inode.flags().contains(InodeFlags::EXTENTS) {
-        let off = inner.layout.inode_disk_offset(&inner.bcache, inode.index.get())?;
-        let mut acl = [0; 16];
-        inner.bcache.read_at(off + 0x68, &mut acl).map_err(|e| map_block_error(&e))?;
-        let lo = u32::from_le_bytes(acl[..4].try_into().unwrap());
-        let hi = if inner.layout.geometry.is_64bit() { u16::from_le_bytes(acl[14..16].try_into().unwrap()) } else { 0 };
-        if lo != 0 || hi != 0 {
-            acl_sectors = inner.layout.block_size() / 512;
-        }
-    }
-    match lumen_vfs::ext4::i_block_kind(inode.mode().bits(), inode.flags().bits(), inode.blocks(), acl_sectors) {
-        lumen_vfs::ext4::IBlockKind::InvalidInlineData => Err(VfsError::Io),
-        kind => Ok(kind),
-    }
+    let off = inner.layout.inode_disk_offset(&inner.bcache, inode.index.get())?;
+    let mut raw = [0; 128];
+    inner.bcache.read_at(off, &mut raw).map_err(|e| map_block_error(&e))?;
+    lumen_vfs::ext4::i_block_kind_raw(&raw, inner.layout.geometry.is_64bit(), inner.layout.block_size())
+        .map_err(|lumen_vfs::ext4::InlineDataFlag| VfsError::Io)
 }
 
 fn is_inline_symlink(inner: &Ext4FsInner, inode: &Inode) -> Result<bool, VfsError> {
@@ -10820,12 +10810,13 @@ crate::ktest!(
         kassert_eq!(&disk[off..off + 256], &before[off..off + 256]);
         kassert_eq!(disk[3 * 4096 + (ino as usize - 1) / 8] & (1 << ((ino - 1) % 8)), 0);
         kassert!(disk[2 * 4096..3 * 4096] != before[2 * 4096..3 * 4096]);
-        // The still-old directory or the still-live slot proves corruption;
-        // neither test depends on reading the stopped cache's newer bytes.
-        let report = mount_check_report(&disk);
-        kassert!(matches!(report, Err(AllocationError::Inconsistent(
-            AllocationInconsistency::DirectoryEntry { inode, .. } | AllocationInconsistency::LiveFreeInode(inode)
-        )) if inode == ino));
+        // Root (inode 2) is walked before slot 11: its stale dirent is
+        // the first inconsistency, read from the device, not the stopped cache.
+        kassert_eq!(ino, 11);
+        kassert_eq!(
+            mount_check_report(&disk),
+            Err(AllocationError::Inconsistent(AllocationInconsistency::DirectoryEntry { directory: 2, inode: 11 }))
+        );
         assert_mount_forced_ro(disk, 413, "inode")?;
         Ok(())
     }
@@ -10914,6 +10905,8 @@ crate::ktest!(
             remount_ro_checked(&m)?;
             m.root.rename(b"b", &m.root, b"c", RenameFlags(RenameFlags::EXCHANGE)).map_err(|_| "exchange")?;
             remount_ro_checked(&m)?;
+            m.root.rename(b"b", &m.root, b"c", RenameFlags::default()).map_err(|_| "rename over existing")?;
+            remount_ro_checked(&m)?;
             for (name, kind) in [(b"regular".as_slice(), InodeType::File), (b"fifo", InodeType::Fifo)] {
                 m.root.mknod(name, kind, 0o600, DevId::makedev(1, 3)).map_err(|_| "mknod")?;
                 remount_ro_checked(&m)?;
@@ -10929,6 +10922,8 @@ crate::ktest!(
             kassert_eq!(read_all(&held)?, b"still readable");
             remount_ro_checked(&m)?;
             drop(open);
+            drop(held);
+            remount_ro_checked(&m)?;
         }
         Ok(())
     }
@@ -10963,6 +10958,54 @@ crate::ktest!(
         // ext4plus does not reclaim external xattrs. Its harmless leak must
         // not turn the inline target into a bitmap free or a mount refusal.
         kassert_eq!(mount_check_report(&image(&m)?), Ok(AllocationReport { leaked_blocks: 1 }));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_shared_xattr_after_unlink_remains_writable() {
+        use self::ktest_util::*;
+        use crate::vfs::{write_u16le as w16, write_u32le as w32};
+        use crate::{kassert, kassert_eq};
+        use lumen_vfs::ext4::AllocationReport;
+        let m = mount(crate::vfs::build_minimal_ext4_image_blocks(256), 421)?;
+        let a = m.root.create(b"a", 0o644).map_err(|_| "create a")?;
+        let b = m.root.create(b"b", 0o644).map_err(|_| "create b")?;
+        let a_off = inode_offset(&m.fs, a.ino() as u32)? as usize;
+        let b_off = inode_offset(&m.fs, b.ino() as u32)? as usize;
+        let mut img = image(&m)?;
+        for off in [a_off, b_off] {
+            w32(&mut img, off + 0x1c, 8);
+            w32(&mut img, off + 0x68, 255);
+        }
+        w32(&mut img, 255 * 4096, 0xea020000);
+        w32(&mut img, 255 * 4096 + 4, 2);
+        w32(&mut img, 255 * 4096 + 8, 1);
+        set_block_bit(&mut img[2 * 4096..3 * 4096], 255, true);
+        w16(&mut img, 4096 + 0xc, 248);
+        w32(&mut img, 1024 + 0xc, 248);
+        kassert_eq!(mount_check_report(&img), Ok(AllocationReport { leaked_blocks: 0 }));
+        let m = mount(img, 422)?;
+        kassert!(!m.fs.read_only());
+        m.root.unlink(b"a").map_err(|_| "unlink shared xattr owner")?;
+        let img = image(&m)?;
+        kassert_eq!(u32::from_le_bytes(img[255 * 4096 + 4..255 * 4096 + 8].try_into().unwrap()), 2);
+        kassert_eq!(mount_check_report(&img), Ok(AllocationReport { leaked_blocks: 1 }));
+        let again = mount(img, 423)?;
+        kassert!(!again.fs.read_only());
+        let b = again.root.lookup(b"b").map_err(|_| "remaining owner")?;
+        kassert_eq!(b.write_at(0, b"still writable"), Ok(14));
+        again.fs.sync().map_err(|_| "sync remaining owner")?;
+        kassert_eq!(mount_check_report(&image(&again)?), Ok(AllocationReport { leaked_blocks: 1 }));
+        Ok(())
+    }
+);
+
+crate::ktest!(
+    fn ext4_mount_volume_beyond_device_is_read_only() {
+        let mut img = crate::vfs::build_minimal_ext4_image_blocks(256);
+        crate::vfs::write_u32le(&mut img, 1024 + 4, 257);
+        assert_mount_forced_ro(img, 424, "volume exceeds device capacity")?;
         Ok(())
     }
 );

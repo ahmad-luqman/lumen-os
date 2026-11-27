@@ -7739,7 +7739,8 @@ instead at the next writable mount (the allocation check, below).
       bitmap byte or bitmap-checksum write doubles nothing
       (`ext4_unlink_whose_failed_write_ext4plus_retried_returns_eio`,
       by the `FaultCache`). `e2fsck` recomputes the counts (read, not
-      tested).
+      tested), and the next writable mount's allocation check refuses a
+      doubled count (#355).
     - `ext4plus`'s `Extent::allocate` (`extent.rs`) retries an
       `alloc_contiguous_blocks(n)` that found no room (`NoSpace`) with one
       block fewer and gives `NoSpace` at 0; since #350 any other error (a
@@ -7944,32 +7945,38 @@ instead at the next writable mount (the allocation check, below).
       `e2fsck -f`.
     - *Checked at mount instead (#355):* since nothing on disk marks an
       errored volume, every writable mount checks the allocation state
-      before allowing writes (`lumen_vfs::ext4`'s checker over the
-      adapter's raw readers): each group's bitmap free counts against its
-      descriptor's, their sums against the superblock's, then every block
-      the in-use inodes map (extent nodes, indirect blocks at every level,
-      xattr blocks; whether an inode's `i_block` holds block numbers is one
-      rule, Linux's, shared with the adapter) and the fixed metadata
-      (superblock and backups, group descriptors, the resize inode's
-      reserved descriptors, bitmaps, inode tables, the MMP block) against
-      the block bitmap; then each inode-table slot against the inode bitmap
-      and each directory entry against it. It mounts the volume read-only
-      with one warning (`run e2fsck -f`) when it finds an inconsistency: a
+      before allowing writes (`lumen_vfs::ext4`'s checker, reading through
+      the volume's block cache): each group's bitmap free counts against
+      its descriptor's, their sums against the superblock's, then every
+      block the in-use inodes map (extent nodes, indirect blocks at every
+      level, xattr blocks; whether an inode's `i_block` holds block numbers
+      is one rule, Linux's, decoded from the raw inode and shared with the
+      adapter) and the fixed metadata (superblock and backups, group
+      descriptors, the resize inode's reserved descriptors, bitmaps, inode
+      tables, the MMP block) against the block bitmap; then each
+      inode-table slot against the inode bitmap and each directory entry
+      against it. It mounts the volume read-only with one warning
+      (`run e2fsck -f`) when it finds an inconsistency, for example: a
       count that differs from its bitmap (above it: #350's crash case), a
       mapped block that's free (#355's failed truncate after a reboot) or
-      mapped twice (a shared external xattr block is fine when its
-      `h_refcount` matches its references), an inode slot that looks live
-      (mode set, links, no `dtime`) while its bitmap bit is clear, or a
-      directory entry naming a free inode (an unlink whose writes reached
-      the device only in part), or a corrupt map. When it can't check (a
-      layout it doesn't support, such as meta_bg or an external journal,
-      a volume too large for the device or its memory limits, or a read
-      failing), it also mounts read-only, saying "cannot check allocation"
-      rather than suggesting e2fsck. Allocated blocks no inode maps (leaks)
-      are harmless and counted at `debug`. Read-only mounts skip the check.
-      It reads every bitmap and inode table and walks each in-use inode's
-      map and each directory: about 70 ms per mount on the Alpine images
-      under TCG, with no leaks.
+      mapped twice (a shared external xattr block is fine unless its
+      `h_refcount` is below its references; above them, as `ext4plus`'s
+      unlink leaves it, is a leak), an inode slot that looks live (mode
+      set, links, no `dtime`) while its bitmap bit is clear, a directory
+      entry naming a free inode (an unlink whose writes reached the device
+      only in part), a volume larger than its device, or a corrupt map.
+      When it can't check (a layout it doesn't support, such as meta_bg or
+      an external journal, a volume too large for its memory limits, or a
+      read failing), it also mounts read-only, saying "cannot check
+      allocation" rather than suggesting e2fsck. Allocated blocks no inode
+      maps (leaks) are harmless and counted at `debug`. Read-only mounts
+      skip the check. It reads every bitmap and inode table and walks each
+      in-use inode's map and each directory: measured at about 70 ms per
+      mount on both Alpine images under TCG (#446), with no leaks. Tested
+      by `cargo:lumen-vfs` (`ext4::tests::allocation_*`), the
+      `ktest:lumen_kernel::vfs::ext4::ext4_mount_*` ktests,
+      `ext4_fast_symlink_with_xattr_reads_inline_and_unlinks_safely` and
+      `scenario:test_alpine::test_alpine_allocation_check_has_no_leaks`.
     - Tested by `ktest:lumen_kernel::vfs::ext4::ext4_a_write_error_makes_the_volume_read_only`
       (a fault in `unlink`, `rename` and `rmdir`, then every write-type
       operation `EROFS`, reads working, the device's bytes unchanged
